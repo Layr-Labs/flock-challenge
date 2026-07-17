@@ -1,0 +1,57 @@
+/target
+
+# macOS Finder metadata
+.DS_Store
+**/.DS_Store
+
+# Emacs autosave files
+\#*\#
+.\#*
+
+# Stray LaTeX run output (e.g., pdflatex invoked with no file)
+*.log
+texput.*
+
+# External checkouts (for benchmarking comparisons)
+# benchmarks/setup.sh (top-level orchestrator) is trackable by default;
+# the two cloned repos are ignored except their own setup.sh.
+benchmarks/plonky3/*
+!benchmarks/plonky3/setup.sh
+benchmarks/binius64/*
+!benchmarks/binius64/setup.sh
+!benchmarks/binius64/keccak_permutations.rs
+!benchmarks/binius64/sha256_compressions.rs
+!benchmarks/binius64/blake3_compressions.rs
+!benchmarks/binius64/parallel_witness_gen.patch
+benchmarks/bench-hash-in-snark/*
+!benchmarks/bench-hash-in-snark/setup.sh
+benchmarks/spartan2/*
+!benchmarks/spartan2/setup.sh
+
+# bench_keccak.sh / bench_sha256.sh / bench_blake3.sh result caches (machine-specific timings)
+benchmarks/bench-keccak-cache/
+benchmarks/bench-sha256-cache/
+benchmarks/bench-blake3-cache/
+
+benchmarks/cache/
+
+# Claude Code runtime lock and per-machine local settings
+.claude/scheduled_tasks.lock
+.claude/settings.local.json
+
+# Agent-skill tooling (installed locally, not part of the project)
+.claude/skills/
+.agents/
+skills-lock.json
+
+# LaTeX SyncTeX artifacts, including the transient *.synctex(busy) written
+# mid-compile (the bare *.synctex.gz rules above don't cover it).
+*.synctex
+*.synctex.gz
+*.synctex(busy)
+
+# Autoresearch loop artifacts (results TSVs, verify scripts, raw bench logs)
+autoresearch/
+
+# Local working notes (review docs, scratch write-ups) — not part of the project
+docs/local/
