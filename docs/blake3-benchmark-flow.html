@@ -1,0 +1,453 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Flock BLAKE3 benchmark — review map</title>
+  <style>
+    :root {
+      --ink: #1b2420;
+      --muted: #617068;
+      --paper: #f5f1e8;
+      --panel: #fffdf8;
+      --line: #d7d0c2;
+      --green: #166447;
+      --green-pale: #e1f0e7;
+      --orange: #a64f24;
+      --orange-pale: #fae9db;
+      --blue: #315d81;
+      --blue-pale: #e6eef5;
+      --red: #922f2f;
+      --red-pale: #f7e4e1;
+      --mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+      --sans: Inter, ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      --serif: Iowan Old Style, Baskerville, Georgia, serif;
+    }
+
+    * { box-sizing: border-box; }
+    html { scroll-behavior: smooth; }
+    body {
+      margin: 0;
+      color: var(--ink);
+      background: var(--paper);
+      font: 16px/1.6 var(--sans);
+    }
+    a { color: var(--blue); text-decoration-thickness: 1px; text-underline-offset: 3px; }
+    code { font-family: var(--mono); font-size: .88em; }
+
+    header {
+      border-bottom: 1px solid var(--line);
+      background: var(--panel);
+    }
+    .hero {
+      width: min(1120px, calc(100% - 40px));
+      margin: 0 auto;
+      padding: 72px 0 58px;
+      display: grid;
+      grid-template-columns: 1.35fr .65fr;
+      gap: 52px;
+      align-items: end;
+    }
+    .eyebrow {
+      margin: 0 0 18px;
+      color: var(--orange);
+      font: 700 12px/1 var(--mono);
+      letter-spacing: .12em;
+      text-transform: uppercase;
+    }
+    h1, h2, h3 { line-height: 1.12; }
+    h1 {
+      margin: 0;
+      font: 700 clamp(42px, 7vw, 78px)/.98 var(--serif);
+      letter-spacing: -.035em;
+    }
+    .lede {
+      margin: 24px 0 0;
+      max-width: 720px;
+      color: var(--muted);
+      font-size: 20px;
+    }
+    .thesis {
+      padding: 24px;
+      border: 1px solid var(--green);
+      background: var(--green-pale);
+    }
+    .thesis strong {
+      display: block;
+      margin-bottom: 8px;
+      color: var(--green);
+      font: 700 12px/1 var(--mono);
+      letter-spacing: .1em;
+      text-transform: uppercase;
+    }
+    .thesis p { margin: 0; font: 700 22px/1.25 var(--serif); }
+
+    nav {
+      position: sticky;
+      top: 0;
+      z-index: 10;
+      overflow-x: auto;
+      border-bottom: 1px solid var(--line);
+      background: rgba(255, 253, 248, .96);
+      backdrop-filter: blur(12px);
+    }
+    nav div {
+      width: min(1120px, calc(100% - 40px));
+      margin: 0 auto;
+      display: flex;
+      gap: 26px;
+      white-space: nowrap;
+    }
+    nav a {
+      padding: 14px 0 12px;
+      color: var(--muted);
+      border-bottom: 2px solid transparent;
+      font: 650 12px/1 var(--mono);
+      text-decoration: none;
+      text-transform: uppercase;
+    }
+    nav a:hover { color: var(--ink); border-color: var(--orange); }
+
+    main { width: min(1120px, calc(100% - 40px)); margin: 0 auto; }
+    section { padding: 76px 0; border-bottom: 1px solid var(--line); }
+    .section-head {
+      display: grid;
+      grid-template-columns: 220px 1fr;
+      gap: 36px;
+      margin-bottom: 38px;
+    }
+    .section-no { color: var(--orange); font: 700 12px/1 var(--mono); letter-spacing: .1em; }
+    h2 { margin: 0; font: 700 clamp(30px, 4vw, 47px)/1.05 var(--serif); letter-spacing: -.02em; }
+    .intro { max-width: 760px; margin: 14px 0 0; color: var(--muted); font-size: 18px; }
+    h3 { margin: 0 0 12px; font: 700 22px/1.2 var(--serif); }
+    p { margin: 0 0 14px; }
+
+    .flow {
+      display: grid;
+      grid-template-columns: repeat(6, 1fr);
+      border: 1px solid var(--line);
+      background: var(--panel);
+    }
+    .flow article { min-height: 210px; padding: 22px 18px; border-right: 1px solid var(--line); }
+    .flow article:last-child { border-right: 0; }
+    .flow .n { display: block; margin-bottom: 38px; color: var(--orange); font: 700 13px/1 var(--mono); }
+    .flow h3 { font-size: 18px; }
+    .flow p { color: var(--muted); font-size: 14px; line-height: 1.45; }
+
+    .two-col { display: grid; grid-template-columns: 1fr 1fr; gap: 22px; }
+    .zone { padding: 28px; border: 1px solid; background: var(--panel); }
+    .zone.untrusted { border-color: var(--orange); background: var(--orange-pale); }
+    .zone.trusted { border-color: var(--green); background: var(--green-pale); }
+    .tag {
+      display: inline-block;
+      margin-bottom: 18px;
+      padding: 5px 8px;
+      border: 1px solid currentColor;
+      font: 700 11px/1 var(--mono);
+      letter-spacing: .08em;
+      text-transform: uppercase;
+    }
+    .untrusted .tag { color: var(--orange); }
+    .trusted .tag { color: var(--green); }
+    .zone ul, .callout ul { margin: 12px 0 0; padding-left: 20px; }
+    .zone li, .callout li { margin: 7px 0; }
+
+    .handoff {
+      position: relative;
+      margin: 28px auto;
+      width: min(720px, 100%);
+      padding: 20px;
+      border: 1px dashed var(--blue);
+      background: var(--blue-pale);
+      text-align: center;
+    }
+    .handoff code { display: block; margin-top: 5px; color: var(--blue); }
+
+    .timeline { border: 1px solid var(--line); background: var(--panel); }
+    .time-row { display: grid; grid-template-columns: 150px 1fr; border-bottom: 1px solid var(--line); }
+    .time-row:last-child { border-bottom: 0; }
+    .time-label { padding: 18px; border-right: 1px solid var(--line); font: 700 12px/1.35 var(--mono); }
+    .time-body { padding: 17px 20px; }
+    .untimed .time-label { color: var(--muted); }
+    .timed { background: var(--orange-pale); }
+    .timed .time-label { color: var(--orange); }
+    .verified { background: var(--green-pale); }
+    .verified .time-label { color: var(--green); }
+
+    table { width: 100%; border-collapse: collapse; background: var(--panel); font-size: 14px; }
+    th, td { padding: 14px 16px; border: 1px solid var(--line); text-align: left; vertical-align: top; }
+    th { color: var(--muted); background: #eee9df; font: 700 11px/1.25 var(--mono); letter-spacing: .06em; text-transform: uppercase; }
+    td:first-child { font-family: var(--mono); font-size: 12px; }
+    .yes { color: var(--green); font-weight: 700; }
+    .no { color: var(--orange); font-weight: 700; }
+
+    .callout {
+      margin-top: 28px;
+      padding: 24px 26px;
+      border-left: 5px solid var(--blue);
+      background: var(--blue-pale);
+    }
+    .callout.warn { border-color: var(--red); background: var(--red-pale); }
+    .callout strong { display: block; margin-bottom: 6px; }
+
+    .checks { display: grid; grid-template-columns: repeat(3, 1fr); gap: 16px; counter-reset: check; }
+    .check { padding: 22px; border: 1px solid var(--line); background: var(--panel); counter-increment: check; }
+    .check::before { content: counter(check, decimal-leading-zero); display: block; margin-bottom: 25px; color: var(--green); font: 700 12px/1 var(--mono); }
+    .check h3 { font-size: 18px; }
+    .check p { color: var(--muted); font-size: 14px; }
+
+    .review-order { margin: 0; padding: 0; list-style: none; counter-reset: review; }
+    .review-order li {
+      display: grid;
+      grid-template-columns: 68px 250px 1fr;
+      gap: 20px;
+      padding: 20px 0;
+      border-top: 1px solid var(--line);
+      counter-increment: review;
+    }
+    .review-order li::before { content: counter(review, decimal-leading-zero); color: var(--orange); font: 700 12px/1.5 var(--mono); }
+    .review-order a { font: 650 14px/1.5 var(--mono); }
+    .review-order span { color: var(--muted); }
+    .evidence-title { margin-top: 42px; }
+
+    footer { padding: 44px 20px 70px; color: var(--muted); text-align: center; font-size: 13px; }
+    @media (max-width: 900px) {
+      .hero, .section-head { grid-template-columns: 1fr; }
+      .flow { grid-template-columns: repeat(2, 1fr); }
+      .flow article { border-bottom: 1px solid var(--line); }
+      .two-col, .checks { grid-template-columns: 1fr; }
+    }
+    @media (max-width: 620px) {
+      .hero, main, nav div { width: min(100% - 24px, 1120px); }
+      .hero { padding-top: 48px; }
+      section { padding: 56px 0; }
+      .flow { grid-template-columns: 1fr; }
+      .flow article { min-height: 0; border-right: 0; }
+      .flow .n { margin-bottom: 18px; }
+      .time-row { grid-template-columns: 110px 1fr; }
+      .review-order li { grid-template-columns: 42px 1fr; }
+      .review-order span { grid-column: 2; }
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <div class="hero">
+      <div>
+        <p class="eyebrow">Flock · BLAKE3 · Apple Silicon</p>
+        <h1>A benchmark you can review in one sitting.</h1>
+        <p class="lede">One editable prover makes one proof. One committed verifier binary chooses the private blocks, owns the clock, checks the proof, and writes the score.</p>
+      </div>
+      <aside class="thesis">
+        <strong>The entire security argument</strong>
+        <p>The candidate never chooses the scored input and never participates in verification or scoring.</p>
+      </aside>
+    </div>
+  </header>
+
+  <nav aria-label="Page sections"><div>
+    <a href="#flow">Flow</a>
+    <a href="#trust">Trust</a>
+    <a href="#clock">Clock</a>
+    <a href="#code">Code map</a>
+    <a href="#verify">Verification</a>
+    <a href="#attacks">Failure map</a>
+    <a href="#actions">Actions</a>
+    <a href="#review">Review order</a>
+  </div></nav>
+
+  <main>
+    <section id="flow">
+      <div class="section-head"><span class="section-no">01 / FLOW</span><div>
+        <h2>Six steps, no hidden service.</h2>
+        <p class="intro">Each ranked trial starts a fresh prover process. The protected verifier binary remains in control from private-input creation through scoring.</p>
+      </div></div>
+      <div class="flow">
+        <article><span class="n">01</span><h3>Prepare</h3><p>The trusted verifier binary starts the prover inside the macOS sandbox.</p></article>
+        <article><span class="n">02</span><h3>Warm</h3><p>The prover builds setup and runs one seed-independent warm-up.</p></article>
+        <article><span class="n">03</span><h3>Challenge</h3><p>After readiness, the verifier draws a fresh 64-bit seed and starts its clock.</p></article>
+        <article><span class="n">04</span><h3>Prove</h3><p>The prover expands the private blocks, calls <code>prove_fast</code>, writes the proof, and exits.</p></article>
+        <article><span class="n">05</span><h3>Verify</h3><p>After timing stops, the binary rebuilds the same witness, checks its commitment, then verifies.</p></article>
+        <article><span class="n">06</span><h3>Score</h3><p>Only after every trial passes, the verifier writes <code>score.json</code>.</p></article>
+      </div>
+    </section>
+
+    <section id="trust">
+      <div class="section-head"><span class="section-no">02 / TRUST</span><div>
+        <h2>Broad optimization. Fixed judgment.</h2>
+        <p class="intro">The editable surface is deliberately large. Isolation comes from committing a checksum-protected judge built against a permanently pinned source tree—not from pretending shared verifier imports are safe.</p>
+      </div></div>
+      <div class="two-col">
+        <article class="zone untrusted">
+          <span class="tag">Solver editable</span>
+          <h3>Candidate prover</h3>
+          <p>Built from the dispatched submission commit.</p>
+          <ul>
+            <li><code>crates/flock-core/src/**</code></li>
+            <li><code>crates/flock-prover/src/**</code></li>
+            <li>May redesign witness generation, proving, PCS, fields, NTTs, Merkle work, and protocol internals.</li>
+          </ul>
+        </article>
+        <article class="zone trusted">
+          <span class="tag">Solver cannot edit</span>
+          <h3>Committed verifier binary</h3>
+          <p>Protected SHA-256:</p>
+          <p><code>45496ba1…00989251</code></p>
+          <ul>
+            <li>Built from reviewed source commit <code>10d7e4c…5a2e8fa0f</code></li>
+            <li>Original Flock verifier/imports retained from <code>85fc0e7…5293</code></li>
+            <li>Original Flock verifier and every import it reaches</li>
+            <li>Input generator and transcript domain</li>
+            <li>Timer, decoder, witness reconstruction, score writer</li>
+          </ul>
+        </article>
+      </div>
+      <div class="handoff"><strong>The only candidate → trusted handoff</strong><code>one versioned proof file in private scratch space</code></div>
+      <div class="callout warn">
+        <strong>Why not verify against the candidate's parent?</strong>
+        A winning submission may later become the baseline, and the editable trees contain normal verifier source. Parent-derived trust would therefore drift after promotion. The fixed reviewed source commit stays sharp across every future submission.
+      </div>
+    </section>
+
+    <section id="clock">
+      <div class="section-head"><span class="section-no">03 / CLOCK</span><div>
+        <h2>The seed crosses the boundary after the clock starts.</h2>
+        <p class="intro">Setup and warm-up are excluded, matching the intent of the upstream benchmark. Work depending on the scored input, including serialization, is included.</p>
+      </div></div>
+      <div class="timeline">
+        <div class="time-row untimed"><div class="time-label">UNTIMED</div><div class="time-body">Create fresh prover process → initialize Flock → create <code>Blake3Setup</code> → warm up with a fixed unrelated seed → write ready file.</div></div>
+        <div class="time-row timed"><div class="time-label">START CLOCK</div><div class="time-body">Verifier draws a private seed from <code>/dev/urandom</code>, records <code>Instant::now()</code>, then writes it to prover stdin. The seed compactly defines all 65,536 test blocks.</div></div>
+        <div class="time-row timed"><div class="time-label">TIMED</div><div class="time-body">Generate 65,536 inputs → generate witness → commit → prove → serialize → write proof → prover exits.</div></div>
+        <div class="time-row timed"><div class="time-label">STOP CLOCK</div><div class="time-body">The verifier observes prover exit. A forged early ready file only starts this clock too early and cannot improve the score.</div></div>
+        <div class="time-row verified"><div class="time-label">MUST PASS</div><div class="time-body">Bounded decode → trusted input and witness reconstruction → commitment equality → pristine verifier.</div></div>
+        <div class="time-row verified"><div class="time-label">WRITE SCORE</div><div class="time-body"><code>score = 65,536 / min(trial_seconds)</code>, after all three trials verify.</div></div>
+      </div>
+    </section>
+
+    <section id="code">
+      <div class="section-head"><span class="section-no">04 / CODE MAP</span><div>
+        <h2>Every benchmark function, with one job.</h2>
+        <p class="intro">This is the complete authored code path. Upstream cryptographic functions are invoked, not copied or wrapped with alternate semantics.</p>
+      </div></div>
+      <table>
+        <thead><tr><th>File / function</th><th>Single responsibility</th><th>Trust</th></tr></thead>
+        <tbody>
+          <tr><td>benchmark.json</td><td>Declare the two editable trees, commands, score path, direction, size cap, and Actions workflow.</td><td>Protected; enforced by Yukon.</td></tr>
+          <tr><td>Cargo manifests</td><td>Add separate input-helper, candidate-worker, and trusted-harness crates plus the fixed optimized candidate profile. The Flock manifests remain unchanged.</td><td>Protected.</td></tr>
+          <tr><td>common · Rng::new / next_u32</td><td>Exact SplitMix64 stream used by both sides.</td><td>Protected source; compiled into verifier binary.</td></tr>
+          <tr><td>common · generate_compressions</td><td>Expand <code>(log2_size, seed)</code> into fixed BLAKE3 compression tuples.</td><td>Protected.</td></tr>
+          <tr><td>worker · main</td><td>Parse three arguments, warm up, signal ready, read one seed, call upstream <code>prove_fast</code>, serialize, exit.</td><td>Wrapper protected; linked Flock code editable.</td></tr>
+          <tr><td>harness · main</td><td>Run N trials, select the best valid duration, calculate throughput, write results.</td><td>Trusted.</td></tr>
+          <tr><td>harness · run_trial</td><td>Own one worker lifecycle and the precise timing/verification order.</td><td>Trusted.</td></tr>
+          <tr><td>harness · worker_command</td><td>Wrap the worker with <code>sandbox-exec</code> when a profile is supplied.</td><td>Trusted.</td></tr>
+          <tr><td>harness · wait_for_ready</td><td>Poll for setup completion; fail on early exit or five-minute timeout.</td><td>Trusted.</td></tr>
+          <tr><td>harness · wait_for_exit</td><td>Poll through worker exit; stop it after fifteen minutes.</td><td>Trusted.</td></tr>
+          <tr><td>harness · stop</td><td>Kill and reap one worker on a timeout or trusted-side error.</td><td>Trusted.</td></tr>
+          <tr><td>harness · fresh_seed</td><td>Read exactly eight bytes from <code>/dev/urandom</code>.</td><td>Trusted.</td></tr>
+          <tr><td>harness · verify_proof</td><td>Check file size, rebuild trusted setup/input/witness/commitment, invoke pristine verification.</td><td>Trusted.</td></tr>
+          <tr><td>harness · deserialize_bundle</td><td>Require FLOCK magic/version/type, a 50 MiB limit, fixed integers, and no trailing bytes.</td><td>Trusted.</td></tr>
+          <tr><td>harness · write_results</td><td>Serialize typed <code>ScoreFile</code>/<code>ScoreMetrics</code> values, then write the Markdown summary.</td><td>Trusted.</td></tr>
+          <tr><td>harness · parse_args</td><td>Parse fixed positional contract and reject invalid size/thread/run values.</td><td>Trusted.</td></tr>
+          <tr><td>build-trusted-verifier.sh</td><td>Author-only recipe: check the reviewed source worktree → <code>cd</code> there and build its declared harness target → publish binary and SHA-256.</td><td>Protected; never run during ranking.</td></tr>
+          <tr><td>setup.sh</td><td>Check Apple Silicon/Xcode, bootstrap Rustup, install the exact toolchain, retry locked fetches, verify the committed binary, then build the candidate offline.</td><td>Protected and idempotent.</td></tr>
+          <tr><td>benchmark.sh</td><td>Resolve cores/paths, create sandbox profile, invoke harness, publish outputs.</td><td>Protected.</td></tr>
+          <tr><td>workflow YAML</td><td>Clean exact-SHA checkout → preflight → setup → cooldown → benchmark → upload.</td><td>Protected.</td></tr>
+        </tbody>
+      </table>
+      <div class="callout"><strong>Intentionally absent</strong>No verifier build during ranking, candidate timing, stdout protocol, log-drain thread, process-group helper, watchdog, proof-copy stage, baseline-parent resolver, or hand-written diff validator.</div>
+    </section>
+
+    <section id="verify">
+      <div class="section-head"><span class="section-no">05 / VERIFY</span><div>
+        <h2>A proof passes six independent gates.</h2>
+        <p class="intro">The protocol verifier alone does not bind this benchmark's private input. The trusted commitment reconstruction supplies that missing statement binding.</p>
+      </div></div>
+      <div class="checks">
+        <article class="check"><h3>Prover exited</h3><p>The timer does not stop on a message or partial file. It stops only after successful process exit.</p></article>
+        <article class="check"><h3>Size bounded</h3><p>The proof must be nonempty and no larger than 50 MiB before allocation and decoding.</p></article>
+        <article class="check"><h3>Format exact</h3><p>Magic, version, R1CS flavor, fixed-width encoding, and end-of-input all must match.</p></article>
+        <article class="check"><h3>Input rebuilt</h3><p>The trusted generator expands the undisclosed seed into the exact BLAKE3 tuples.</p></article>
+        <article class="check"><h3>Commitment equal</h3><p>Root and every PCS parameter must equal a fresh commitment to the pristine witness.</p></article>
+        <article class="check"><h3>Proof valid</h3><p>The immutable original <code>Blake3Setup::verify</code> runs under the fixed transcript domain.</p></article>
+      </div>
+    </section>
+
+    <section id="attacks">
+      <div class="section-head"><span class="section-no">06 / FAILURE MAP</span><div>
+        <h2>Cheating fails closed.</h2>
+        <p class="intro">The harness returns nonzero and writes no new score if any trial fails. The workflow then has no valid artifact for Yukon to accept.</p>
+      </div></div>
+      <table>
+        <thead><tr><th>Attempt or failure</th><th>What happens</th><th>Why it cannot score</th></tr></thead>
+        <tbody>
+          <tr><td>Precompute the input</td><td>Seed is created after readiness and immediately before delivery.</td><td class="yes">Input-dependent work remains timed.</td></tr>
+          <tr><td>Signal ready early</td><td>Harness starts the clock earlier.</td><td class="yes">It only makes the result slower.</td></tr>
+          <tr><td>Report fake time</td><td>Prover output is discarded.</td><td class="yes">Verifier binary owns <code>Instant</code>.</td></tr>
+          <tr><td>Write score.json</td><td>Sandbox permits writes only below scratch; score is outside it.</td><td class="yes">Harness alone writes score.</td></tr>
+          <tr><td>Use a different input</td><td>Trusted witness commitment differs.</td><td class="yes">Rejected before protocol verification.</td></tr>
+          <tr><td>Change verifier code</td><td>Candidate verifier source is never loaded by the committed binary.</td><td class="yes">Protected checksum stays unchanged.</td></tr>
+          <tr><td>Leave background writer</td><td>Seatbelt denies process creation.</td><td class="yes">No descendant survives worker exit.</td></tr>
+          <tr><td>Oversized/truncated proof</td><td>Metadata/header/strict decode fails.</td><td class="yes">No score is written.</td></tr>
+          <tr><td>Hang</td><td>Startup and run deadlines kill and reap the worker.</td><td class="yes">Trial returns an error.</td></tr>
+          <tr><td>No sandbox on ranked Mac</td><td><code>FLOCK_REQUIRE_SANDBOX=1</code> makes the script exit.</td><td class="yes">Benchmark never starts.</td></tr>
+        </tbody>
+      </table>
+    </section>
+
+    <section id="actions">
+      <div class="section-head"><span class="section-no">07 / ACTIONS</span><div>
+        <h2>GitHub executes; Yukon decides.</h2>
+        <p class="intro">The repository workflow is the production executor. Yukon validates submissions, dispatches the exact candidate, reads the score, compares it, and promotes only what was scored.</p>
+      </div></div>
+      <table>
+        <thead><tr><th>Contract item</th><th>Implementation</th><th>Status</th></tr></thead>
+        <tbody>
+          <tr><td>Trigger</td><td>Only <code>workflow_dispatch</code>; no pull-request double run.</td><td class="yes">Meets guide</td></tr>
+          <tr><td>Checkout</td><td><code>ref: ${{ github.sha }}</code>, clean exact-SHA checkout, credentials not persisted.</td><td class="yes">Meets guide</td></tr>
+          <tr><td>Commands</td><td><code>./setup.sh</code> and <code>./benchmark.sh</code> match manifest commands.</td><td class="yes">Meets guide</td></tr>
+          <tr><td>Score</td><td>Finite numeric <code>score</code> at repository-root <code>score.json</code>.</td><td class="yes">Meets guide</td></tr>
+          <tr><td>Artifact</td><td>Dedicated artifact contains the exact manifest path.</td><td class="yes">Meets guide</td></tr>
+          <tr><td>Failure</td><td>Setup/measurement/verification errors exit nonzero; no fabricated fallback score.</td><td class="yes">Meets guide</td></tr>
+          <tr><td>Editable paths</td><td>Two non-overlapping relative POSIX source directories; score remains outside.</td><td class="yes">Meets guide</td></tr>
+          <tr><td>Runner</td><td>Dedicated self-hosted Apple Silicon label <code>m5-bench</code>.</td><td class="no">Operational trust</td></tr>
+        </tbody>
+      </table>
+      <div class="callout warn"><strong>Remaining operational boundary</strong>Compiling and running native candidate code is not a VM boundary. The Mac runner should be dedicated and ephemeral where possible, with no repository secrets or unrelated credentials. Seatbelt constrains the measured worker, not the Rust compiler. <code>RAYON_NUM_THREADS</code> configures the original pool but is not a hard CPU quota, so every candidate must run alone on the same machine.</div>
+    </section>
+
+    <section id="review">
+      <div class="section-head"><span class="section-no">08 / REVIEW</span><div>
+        <h2>Suggested 20-minute review order.</h2>
+        <p class="intro">Start with policy, then trace the tiny candidate program, then spend the remaining time on the trusted trial and verification functions.</p>
+      </div></div>
+      <ol class="review-order">
+        <li><a href="../benchmark.json">benchmark.json</a><span>Confirm the only editable paths, score path, direction, commands, and workflow.</span></li>
+        <li><a href="../benchmark-tools/common/src/lib.rs">common/src/lib.rs</a><span>Confirm deterministic input generation and fixed transcript domain.</span></li>
+        <li><a href="../benchmark-tools/worker/src/main.rs">worker/src/main.rs</a><span>Read the complete untrusted wrapper: setup, warm-up, seed, prove, serialize, exit.</span></li>
+        <li><a href="../benchmark-tools/harness/src/main.rs">harness/src/main.rs</a><span>Focus on <code>run_trial</code>, <code>verify_proof</code>, and <code>deserialize_bundle</code>.</span></li>
+        <li><a href="../benchmark-tools/trusted/SHA256SUMS">trusted/SHA256SUMS</a><span>Confirm the committed arm64 verifier has the reviewed protected hash.</span></li>
+        <li><a href="../benchmark-tools/build-trusted-verifier.sh">build-trusted-verifier.sh</a><span>Confirm the author-only build pins the reviewed source commit, toolchain, and conservative CPU target.</span></li>
+        <li><a href="../setup.sh">setup.sh</a><span>Confirm prerequisite checks, TLS Rustup bootstrap, pinned toolchain, fetch retry, binary integrity, and offline candidate build.</span></li>
+        <li><a href="../benchmark.sh">benchmark.sh</a><span>Confirm score deletion, scratch-only writes, Seatbelt rules, and harness arguments.</span></li>
+        <li><a href="../.github/workflows/benchmark-blake3-mac.yml">workflow</a><span>Confirm exact SHA, Setup/Benchmark steps, fail-closed upload, and pinned Actions.</span></li>
+      </ol>
+      <h3 class="evidence-title">Local validation evidence</h3>
+      <table>
+        <thead><tr><th>Check</th><th>Observed result</th></tr></thead>
+        <tbody>
+          <tr><td>Trusted binary</td><td>1.8 MiB arm64 Mach-O; checksum and strict code-sign verification pass. Two consecutive author rebuilds produced the same SHA-256.</td></tr>
+          <tr><td>Setup bootstrap</td><td>A clean run resolved Xcode Clang, the pinned Rust toolchain, locked dependencies, and an offline candidate build; an immediate rerun completed as an up-to-date no-op.</td></tr>
+          <tr><td>Sandbox smoke</td><td>The final direct-worktree verifier completed a fresh private 2^8 trial and passed trusted verification.</td></tr>
+          <tr><td>Exact ranked run</td><td>The previous verifier layout passed three private 2^16 / 10-core trials. The final direct-worktree build is covered by the smoke test below; timing remains machine-specific.</td></tr>
+          <tr><td>Yukon parser</td><td>Production manifest and score readers accepted <code>benchmark.json</code> and <code>score.json</code>.</td></tr>
+          <tr><td>Static checks</td><td>Cargo workspace check, formatting, ShellCheck, actionlint, JSON checks, and <code>git diff --check</code> pass.</td></tr>
+          <tr><td>Browser render</td><td>Headless Chromium loaded and rendered this page at desktop width.</td></tr>
+        </tbody>
+      </table>
+      <div class="callout"><strong>Deliberate compatibility rule</strong>A solver may change the candidate's internal implementation radically, but its worker-linked code must still emit a proof in the original versioned format that commits to the original statement and verifies under the original protocol. That is the optimization contract.</div>
+    </section>
+  </main>
+
+  <footer>Flock BLAKE3 Mac benchmark · review map · generated 2026-07-17</footer>
+</body>
+</html>

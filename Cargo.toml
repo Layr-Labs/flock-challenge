@@ -1,5 +1,11 @@
 [workspace]
-members = ["crates/flock-core", "crates/flock-prover"]
+members = [
+    "crates/flock-core",
+    "crates/flock-prover",
+    "benchmark-tools/common",
+    "benchmark-tools/harness",
+    "benchmark-tools/worker",
+]
 resolver = "2"
 
 [workspace.package]
@@ -55,6 +61,12 @@ unusual_byte_groupings = "allow"
 # (samply, Instruments) at minimal compile-time cost.
 # `lto = "thin"` keeps cross-crate inlining across flock-core / flock-prover, so
 # the workspace split does not regress benchmarks.
+debug = "line-tables-only"
+lto = "thin"
+codegen-units = 1
+
+[profile.challenge]
+inherits = "release"
 debug = "line-tables-only"
 lto = "thin"
 codegen-units = 1

@@ -1,5 +1,11 @@
 /target
 
+# Challenge benchmark outputs
+/benchmark-results/
+/score.json
+/journal.md
+/.trusted-benchmark/
+
 # macOS Finder metadata
 .DS_Store
 **/.DS_Store

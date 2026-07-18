@@ -110,6 +110,22 @@ memory bandwidth, and thermal headroom on a single chip. See
 [`benchmarks/BENCHMARKS.md`](benchmarks/BENCHMARKS.md) for the full set and the
 competitor comparisons.
 
+### Ranked BLAKE3 benchmark on Apple Silicon
+
+The challenge harness scores verified BLAKE3 compression-proof throughput at a
+fixed 2^16 batch on the self-hosted `m5-bench` GitHub Actions runner. Run it
+locally with `./setup.sh && ./benchmark.sh`; Yukon dispatches the Actions
+workflow on each constructed submission commit and reads its uploaded JSON
+score. Solvers may optimize all Rust source in `flock-core` and `flock-prover`,
+but the timer, score writer, and verifier are compiled against the fixed
+original Flock commit and committed as a checksum-protected arm64 binary. It
+times the candidate prover on a fresh private block set, then regenerates the
+seeded witness commitment and checks the proof. See the visual
+[`benchmark flow`](docs/blake3-benchmark-flow.html) for the exact timing and
+trust boundaries, or
+[`docs/BLAKE3_MAC_BENCHMARK.md`](docs/BLAKE3_MAC_BENCHMARK.md) for the compact
+runner contract.
+
 ## Acknowledgments and third-party code
 
 Flock incorporates code from the projects below; see the individual file

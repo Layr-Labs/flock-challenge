@@ -1,0 +1,16 @@
+[package]
+name = "flock-benchmark-harness"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[[bin]]
+name = "flock_benchmark_harness"
+path = "src/main.rs"
+
+[dependencies]
+bincode = { workspace = true }
+flock-benchmark-common = { path = "../common" }
+flock-prover = { path = "../../crates/flock-prover" }
+serde = { workspace = true }
+serde_json = { workspace = true }
