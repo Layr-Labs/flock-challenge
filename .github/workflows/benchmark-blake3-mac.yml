@@ -13,7 +13,7 @@ concurrency:
 
 jobs:
   benchmark:
-    runs-on: [self-hosted, m5-bench]
+    runs-on: [self-hosted, m4-pro]
     timeout-minutes: 180
     env:
       BLAKE3_LOG2: "16"

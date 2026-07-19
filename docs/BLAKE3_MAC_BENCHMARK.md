@@ -17,7 +17,7 @@ GitHub Actions/Yukon handoff.
 
 ## Ranked contract
 
-- Runner: dedicated Apple Silicon runner labeled `m5-bench`
+- Runner: dedicated Apple M4 Pro runner labeled `m4-pro`
 - Work: 2^16 independent BLAKE3 compressions
 - Default Rayon threads: performance-core count
 - Score: `65,536 / best_seconds` from three trials; higher is better

@@ -409,7 +409,7 @@
           <tr><td>Artifact</td><td>Dedicated artifact contains the exact manifest path.</td><td class="yes">Meets guide</td></tr>
           <tr><td>Failure</td><td>Setup/measurement/verification errors exit nonzero; no fabricated fallback score.</td><td class="yes">Meets guide</td></tr>
           <tr><td>Editable paths</td><td>Two non-overlapping relative POSIX source directories; score remains outside.</td><td class="yes">Meets guide</td></tr>
-          <tr><td>Runner</td><td>Dedicated self-hosted Apple Silicon label <code>m5-bench</code>.</td><td class="no">Operational trust</td></tr>
+          <tr><td>Runner</td><td>Dedicated self-hosted Apple M4 Pro label <code>m4-pro</code>.</td><td class="no">Operational trust</td></tr>
         </tbody>
       </table>
       <div class="callout warn"><strong>Remaining operational boundary</strong>Compiling and running native candidate code is not a VM boundary. The Mac runner should be dedicated and ephemeral where possible, with no repository secrets or unrelated credentials. Seatbelt constrains the measured worker, not the Rust compiler. <code>RAYON_NUM_THREADS</code> configures the original pool but is not a hard CPU quota, so every candidate must run alone on the same machine.</div>
