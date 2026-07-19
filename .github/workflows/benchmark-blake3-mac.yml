@@ -38,7 +38,6 @@ jobs:
           [[ "$(uname -s)" == Darwin ]]
           [[ "$(uname -m)" == arm64 ]]
           command -v git
-          command -v rustup
           command -v shasum
           command -v codesign
           command -v sandbox-exec
