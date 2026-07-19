@@ -18,7 +18,9 @@ use serde::Serialize;
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(300);
 const RUN_TIMEOUT: Duration = Duration::from_secs(900);
 const POLL_INTERVAL: Duration = Duration::from_micros(100);
-const MAX_PROOF_BYTES: u64 = 50 * 1024 * 1024;
+// A canonical 2^16 proof is at most about 409 kB for the fixed m=30 profile.
+// Leave room for serialization variation while rejecting oversized input.
+const MAX_PROOF_BYTES: u64 = 500_000;
 
 struct Config {
     worker: PathBuf,

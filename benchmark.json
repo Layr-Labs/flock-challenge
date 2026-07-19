@@ -1,7 +1,7 @@
 {
   "schemaVersion": 1,
   "name": "flock-blake3-mac",
-  "description": "Optimize Flock's Rust prover sources for maximum BLAKE3 compression-proof throughput..",
+  "description": "Optimize Flock's Rust prover sources for maximum BLAKE3 compression-proof throughput.",
   "category": "rust",
   "direction": "+",
   "editablePaths": [

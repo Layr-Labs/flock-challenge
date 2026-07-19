@@ -54,9 +54,6 @@ jobs:
       - name: Setup benchmark
         run: ./setup.sh
 
-      - name: Cool down
-        run: sleep 30
-
       - name: Benchmark submission
         run: ./benchmark.sh
 

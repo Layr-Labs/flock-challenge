@@ -122,9 +122,8 @@ original Flock commit and committed as a checksum-protected arm64 binary. It
 times the candidate prover on a fresh private block set, then regenerates the
 seeded witness commitment and checks the proof. See the visual
 [`benchmark flow`](docs/blake3-benchmark-flow.html) for the exact timing and
-trust boundaries, or
-[`docs/BLAKE3_MAC_BENCHMARK.md`](docs/BLAKE3_MAC_BENCHMARK.md) for the compact
-runner contract.
+trust boundaries, or [`BENCHMARK.md`](BENCHMARK.md) for the benchmark,
+hardware, scoring, and security contract.
 
 ## Acknowledgments and third-party code
 
