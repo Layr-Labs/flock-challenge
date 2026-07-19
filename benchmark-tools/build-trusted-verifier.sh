@@ -5,7 +5,7 @@
 # replaces the committed verifier binary and records its new checksum.
 set -euo pipefail
 
-readonly FLOCK_COMMIT=e2b1741f7f7d3d3fac3626688e0fd5bd05830bb0
+readonly REVIEWED_COMMIT=ce00ee767b970cdd10aa815d0b44ba324f4627e5
 readonly TOOLCHAIN=1.97.0
 
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -15,16 +15,16 @@ output="${root}/benchmark-tools/trusted"
 
 # Materialize the reviewed source commit without modifying it.
 if [[ ! -d "${checkout}/.git" && ! -f "${checkout}/.git" ]]; then
-  git -C "${root}" worktree add --detach "${checkout}" "${FLOCK_COMMIT}"
+  git -C "${root}" worktree add --detach "${checkout}" "${REVIEWED_COMMIT}"
 else
   [[ -z "$(git -C "${checkout}" status --porcelain --untracked-files=all)" ]] || {
     echo "trusted checkout is not clean" >&2
     exit 1
   }
-  git -C "${checkout}" checkout --detach "${FLOCK_COMMIT}"
+  git -C "${checkout}" checkout --detach "${REVIEWED_COMMIT}"
 fi
-[[ "$(git -C "${checkout}" rev-parse HEAD)" == "${FLOCK_COMMIT}" ]] || {
-  echo "trusted checkout is not ${FLOCK_COMMIT}" >&2
+[[ "$(git -C "${checkout}" rev-parse HEAD)" == "${REVIEWED_COMMIT}" ]] || {
+  echo "trusted checkout is not ${REVIEWED_COMMIT}" >&2
   exit 1
 }
 [[ -z "$(git -C "${checkout}" status --porcelain --untracked-files=all)" ]] || {

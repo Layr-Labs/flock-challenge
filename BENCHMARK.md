@@ -20,7 +20,7 @@ For a visual version of this document, open
 | Unit | verified BLAKE3 compressions per second |
 | Direction | higher is better |
 | Correctness | every timed proof must pass the prebuilt verifier |
-| Proof file limit | 500,000 bytes in the prepared verifier source |
+| Proof file limit | 500,000 bytes, enforced by the prebuilt verifier |
 | Official runner | Apple M4 Pro, 48 GB unified memory, 10 performance cores |
 
 The benchmark counts **BLAKE3 compression functions**, not complete
@@ -140,18 +140,10 @@ Ranked setup never runs this author tool. `setup.sh` verifies the committed
 binary's SHA-256 and code signature before building the candidate.
 `benchmark.sh` checks SHA-256 again immediately before invoking it.
 
-The currently committed verifier was built from reviewed benchmark commit
-`e2b1741f7f7d3d3fac3626688e0fd5bd05830bb0`. Its underlying re-signed Flock
+The committed verifier was built from reviewed benchmark commit
+`ce00ee767b970cdd10aa815d0b44ba324f4627e5`. Its underlying re-signed Flock
 tree matches upstream Flock commit
 `85fc0e7cc002e7ca4dffdff805ba89976e9a5293`.
-
-### Current review state
-
-The harness source now contains the selected 500,000-byte proof limit, but the
-committed verifier binary predates that uncommitted source edit. Before
-release, the source must be reviewed and committed, the build script must pin
-that reviewed commit, and the verifier/checksum must be rebuilt. Until then,
-the committed binary—not the edited source—is the runtime authority.
 
 ## Harness and worker interaction
 

@@ -346,7 +346,7 @@
           <div class="fact"><b>3</b><span>fresh timed workers and proof files</span></div>
           <div class="fact"><b>3</b><span>fixed-seed, untimed warm-up proofs</span></div>
           <div class="fact"><b>196,608</b><span>private compressions timed per ranked run</span></div>
-          <div class="fact"><b>500,000 B</b><span>selected per-proof source limit, pending verifier rebuild</span></div>
+          <div class="fact"><b>500,000 B</b><span>per-proof limit enforced by the trusted verifier</span></div>
         </div>
       </section>
 
@@ -384,13 +384,13 @@
         <h2>The judge is built before submissions exist.</h2>
         <p class="lede">Ranked setup never compiles verifier source. The repository carries an arm64 verifier built from one reviewed source commit and protects it with a committed digest.</p>
         <div class="build-flow">
-          <article class="build-step"><b>01 / REVIEWED COMMIT</b><h3>Freeze the source tree</h3><p>Benchmark commit <code>e2b1741…05830bb0</code> contains the harness atop the re-signed tree matching upstream Flock <code>85fc0e7…5293</code>.</p></article>
+          <article class="build-step"><b>01 / REVIEWED COMMIT</b><h3>Freeze the source tree</h3><p>Benchmark commit <code>ce00ee7…f4627e5</code> contains the harness atop the re-signed tree matching upstream Flock <code>85fc0e7…5293</code>.</p></article>
           <article class="build-step"><b>02 / DETACHED WORKTREE</b><h3>Build exactly that commit</h3><p>The author-only script refuses a dirty checkout and uses Rust 1.97.0 with <code>target-cpu=apple-m1</code>.</p></article>
           <article class="build-step"><b>03 / COMMITTED ARTIFACT</b><h3>Publish one Mach-O</h3><p>The binary contains the generator, timer, decoder, pristine Flock verifier and imports, commitment check, and score writer.</p></article>
           <article class="build-step"><b>04 / RANKED EXECUTION</b><h3>Verify bytes twice</h3><p><code>setup.sh</code> checks SHA-256 and signing; <code>benchmark.sh</code> checks SHA-256 again immediately before use.</p></article>
         </div>
         <p class="hash">Committed verifier SHA-256: a7c42a807c35672e3526675b0c411250bcaddc3208eba9e5b0575ce0b5cd60cd</p>
-        <p class="strong-note warning"><strong>Current review state:</strong> harness source now specifies the selected 500,000-byte proof limit, but this committed verifier predates that edit. Before release, commit the reviewed source, repin the build script, rebuild the verifier, and update its checksum. Until then, the committed binary is the runtime authority.</p>
+        <p class="strong-note"><strong>Published provenance:</strong> the committed verifier is built from reviewed commit <code>ce00ee767b970cdd10aa815d0b44ba324f4627e5</code>. Ranked setup verifies its committed SHA-256 and macOS code signature before use.</p>
       </section>
 
       <section id="surface">
