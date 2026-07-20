@@ -1,4 +1,89 @@
-use crate::field::F128;
+use crate::field::{F128, F256Unreduced};
+
+/// Fold two adjacent output values while keeping both results in registers.
+/// `out_base` is measured in folded/output elements, so the four source
+/// elements begin at `2 * out_base`.
+///
+/// # Safety
+/// Requires the `aes` target feature and four in-bounds source elements.
+#[inline]
+#[target_feature(enable = "aes")]
+unsafe fn fold_two(src: &[F128], out_base: usize, r: F128) -> [F128; 2] {
+    use crate::field::gf2_128::aarch64::ghash_mul_vec2_neon;
+
+    let s = 2 * out_base;
+    let e0 = src[s];
+    let o0 = src[s + 1];
+    let e1 = src[s + 2];
+    let o1 = src[s + 3];
+    // SAFETY: this helper carries the required target feature.
+    let prod = unsafe { ghash_mul_vec2_neon([r, r], [e0 + o0, e1 + o1]) };
+    [e0 + prod[0], e1 + prod[1]]
+}
+
+/// ARM fused tail kernel: fold `a_in`/`b_in` and form the next sumcheck
+/// message without rereading the freshly written output arrays.
+///
+/// The generic ARM path first writes all folded values, then streams both
+/// output arrays again. At the benchmark's first tail round that is 64 MiB of
+/// avoidable reads. This kernel uses the same two-output PMULL fold primitive,
+/// but consumes each pair directly from registers before moving on.
+///
+/// # Safety
+/// Requires the `aes` target feature. The caller must provide
+/// `a_in.len() == b_in.len() == 2 * a_out.len()`, equal output lengths, and
+/// `eq_lo.len() * 2 == a_out.len()` with an even `eq_lo.len()`.
+#[target_feature(enable = "aes")]
+pub(crate) unsafe fn fold_and_message_neon(
+    a_in: &[F128],
+    b_in: &[F128],
+    a_out: &mut [F128],
+    b_out: &mut [F128],
+    r_fold: F128,
+    eq_lo: &[F128],
+) -> (F128, F128) {
+    debug_assert_eq!(a_in.len(), b_in.len());
+    debug_assert_eq!(a_out.len(), b_out.len());
+    debug_assert_eq!(a_in.len(), 2 * a_out.len());
+    debug_assert_eq!(a_out.len(), 2 * eq_lo.len());
+    debug_assert_eq!(eq_lo.len() & 1, 0);
+
+    let mut p1_acc = F256Unreduced::ZERO;
+    let mut pinf_acc = F256Unreduced::ZERO;
+    let mut x_lo = 0;
+    while x_lo < eq_lo.len() {
+        let o = 2 * x_lo;
+        // Two x_lo points = four adjacent folded values per witness. Keeping
+        // this at two points limits register pressure while exposing four
+        // independent two-lane fold products to the out-of-order engine.
+        let aa = unsafe { fold_two(a_in, o, r_fold) };
+        let ab = unsafe { fold_two(a_in, o + 2, r_fold) };
+        let ba = unsafe { fold_two(b_in, o, r_fold) };
+        let bb = unsafe { fold_two(b_in, o + 2, r_fold) };
+
+        a_out[o] = aa[0];
+        a_out[o + 1] = aa[1];
+        a_out[o + 2] = ab[0];
+        a_out[o + 3] = ab[1];
+        b_out[o] = ba[0];
+        b_out[o + 1] = ba[1];
+        b_out[o + 2] = bb[0];
+        b_out[o + 3] = bb[1];
+
+        let g1_a = aa[1] * ba[1];
+        let g1_b = ab[1] * bb[1];
+        let g_inf_a = (aa[0] + aa[1]) * (ba[0] + ba[1]);
+        let g_inf_b = (ab[0] + ab[1]) * (bb[0] + bb[1]);
+        p1_acc ^= eq_lo[x_lo].mul_unreduced(g1_a);
+        p1_acc ^= eq_lo[x_lo + 1].mul_unreduced(g1_b);
+        pinf_acc ^= eq_lo[x_lo].mul_unreduced(g_inf_a);
+        pinf_acc ^= eq_lo[x_lo + 1].mul_unreduced(g_inf_b);
+
+        x_lo += 2;
+    }
+
+    (p1_acc.reduce(), pinf_acc.reduce())
+}
 
 /// NEON one-row fold: 8 aligned 16-byte loads + 8 XORs, hand-unrolled for
 /// `n_chunks = 8` (the k_skip=6 protocol size). Returns the folded F128.

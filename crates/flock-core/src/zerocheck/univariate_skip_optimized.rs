@@ -96,46 +96,53 @@ pub const C_S_F8: u8 = 0x1C;
 /// The constant `C_s = φ_8(0x1C) ∈ F_{2^128}` — the relative scaling factor
 /// between this optimized output and the naive output.
 pub fn c_s_f128() -> F128 {
-    phi8(F8(C_S_F8))
+    static CACHE: OnceLock<F128> = OnceLock::new();
+    *CACHE.get_or_init(|| phi8(F8(C_S_F8)))
 }
 
 /// The three F_128 small challenges (embeddings of [`SMALL_CHAL_F8`]) — caller
 /// must place these at `r[k_skip..k_skip+3]` for the naive cross-check to
 /// produce a result related to the optimized output by exactly `C_s`.
 pub fn small_challenges_ghash() -> [F128; 3] {
-    [
-        phi8(F8(SMALL_CHAL_F8[0])),
-        phi8(F8(SMALL_CHAL_F8[1])),
-        phi8(F8(SMALL_CHAL_F8[2])),
-    ]
+    static CACHE: OnceLock<[F128; 3]> = OnceLock::new();
+    *CACHE.get_or_init(|| {
+        [
+            phi8(F8(SMALL_CHAL_F8[0])),
+            phi8(F8(SMALL_CHAL_F8[1])),
+            phi8(F8(SMALL_CHAL_F8[2])),
+        ]
+    })
 }
 
 /// The four F_128 medium challenges `β_i = γ^{2^{i-1}} / (1 + γ^{2^{i-1}})`.
 /// Caller must place these at `r[k_skip+3..k_skip+7]` for the naive
 /// cross-check.
 pub fn medium_challenges_ghash() -> [F128; 4] {
-    let g1 = F128 {
-        lo: 1u64 << 1,
-        hi: 0,
-    }; // γ^1
-    let g2 = F128 {
-        lo: 1u64 << 2,
-        hi: 0,
-    }; // γ^2
-    let g4 = F128 {
-        lo: 1u64 << 4,
-        hi: 0,
-    }; // γ^4
-    let g8 = F128 {
-        lo: 1u64 << 8,
-        hi: 0,
-    }; // γ^8
-    [
-        g1 * (F128::ONE + g1).inv(),
-        g2 * (F128::ONE + g2).inv(),
-        g4 * (F128::ONE + g4).inv(),
-        g8 * (F128::ONE + g8).inv(),
-    ]
+    static CACHE: OnceLock<[F128; 4]> = OnceLock::new();
+    *CACHE.get_or_init(|| {
+        let g1 = F128 {
+            lo: 1u64 << 1,
+            hi: 0,
+        }; // γ^1
+        let g2 = F128 {
+            lo: 1u64 << 2,
+            hi: 0,
+        }; // γ^2
+        let g4 = F128 {
+            lo: 1u64 << 4,
+            hi: 0,
+        }; // γ^4
+        let g8 = F128 {
+            lo: 1u64 << 8,
+            hi: 0,
+        }; // γ^8
+        [
+            g1 * (F128::ONE + g1).inv(),
+            g2 * (F128::ONE + g2).inv(),
+            g4 * (F128::ONE + g4).inv(),
+            g8 * (F128::ONE + g8).inv(),
+        ]
+    })
 }
 
 /// `C_2 = (1+r_2)(1+r_3)` where `r_2 = φ_8(0x53)` (= `α^2/(1+α^2)`),
@@ -151,9 +158,12 @@ pub fn medium_challenges_ghash() -> [F128; 4] {
 /// post-scale the raw bank values into canonical `s_hat_v_c` (which
 /// `ring_switch::fold_1b_rows` would produce against suffix `r[k_skip+1..m]`).
 pub fn c_2_small_f128() -> F128 {
-    let r_2 = phi8(F8(SMALL_CHAL_F8[1]));
-    let r_3 = phi8(F8(SMALL_CHAL_F8[2]));
-    (F128::ONE + r_2) * (F128::ONE + r_3)
+    static CACHE: OnceLock<F128> = OnceLock::new();
+    *CACHE.get_or_init(|| {
+        let r_2 = phi8(F8(SMALL_CHAL_F8[1]));
+        let r_3 = phi8(F8(SMALL_CHAL_F8[2]));
+        (F128::ONE + r_2) * (F128::ONE + r_3)
+    })
 }
 
 /// `α⁻¹` in F_128, as a subfield-embedded F_8 element. Used to strip the
@@ -163,7 +173,8 @@ pub fn c_2_small_f128() -> F128 {
 pub fn alpha_inv_f128() -> F128 {
     // α in F_8 = byte 0x02 (the polynomial generator). Its inverse is α^254;
     // F8::inv computes it via the standard extended Euclidean / power table.
-    phi8(F8(0x02).inv())
+    static CACHE: OnceLock<F128> = OnceLock::new();
+    *CACHE.get_or_init(|| phi8(F8(0x02).inv()))
 }
 
 /// `D = (1+γ)(1+γ^2)(1+γ^4)(1+γ^8)`; `D⁻¹` cancels the medium-eq normalization.
@@ -696,7 +707,7 @@ pub fn round1_shift_reduce_extract_c_packed_padded(
     assert_eq!(r.len(), m);
     assert_eq!(inv_table.k, k_skip);
 
-    let eq = SplitEqGhash::with_n_hi(&r[k_skip + N_INNER..], 8);
+    let eq = SplitEqGhash::new(&r[k_skip + N_INNER..]);
     let big_lo_size = 1usize << eq.n_lo;
     let hi_size = 1usize << eq.n_hi;
     let n_lo_and_inner = eq.n_lo + N_INNER;
@@ -788,7 +799,7 @@ pub fn round1_shift_reduce_extract_c_packed_padded_with_s_hat_v(
     assert_eq!(r.len(), m);
     assert_eq!(inv_table.k, k_skip);
 
-    let eq = SplitEqGhash::with_n_hi(&r[k_skip + N_INNER..], 8);
+    let eq = SplitEqGhash::new(&r[k_skip + N_INNER..]);
     let big_lo_size = 1usize << eq.n_lo;
     let hi_size = 1usize << eq.n_hi;
     let n_lo_and_inner = eq.n_lo + N_INNER;
@@ -879,7 +890,7 @@ fn round1_shift_reduce_extract_c_packed_serial(
     assert_eq!(r.len(), m);
     assert_eq!(inv_table.k, k_skip);
 
-    let eq = SplitEqGhash::with_n_hi(&r[k_skip + N_INNER..], 8);
+    let eq = SplitEqGhash::new(&r[k_skip + N_INNER..]);
     let big_lo_size = 1usize << eq.n_lo;
     let hi_size = 1usize << eq.n_hi;
     let n_lo_and_inner = eq.n_lo + N_INNER;

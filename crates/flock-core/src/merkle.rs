@@ -22,8 +22,58 @@
 
 use rayon::prelude::*;
 use sha2::{Digest, Sha256};
+use std::sync::Mutex;
 
 pub type Hash = [u8; 32];
+
+// Merkle trees are rebuilt at every commitment level and can be tens of
+// megabytes at the benchmark sizes. macOS may unmap those allocations when
+// they are dropped, making the next proof pay the same serial allocation and
+// page-fault cost even though the worker performs a mandatory warm-up proof.
+// Keep a small, size-aware pool so the warm-up also warms the Merkle working
+// set, just like `scratch` does for the much larger F128 buffers.
+static TREE_POOL: Mutex<Vec<Vec<Hash>>> = Mutex::new(Vec::new());
+const MAX_POOLED_TREES: usize = 12;
+
+fn take_tree(n: usize) -> Vec<Hash> {
+    let mut pool = TREE_POOL.lock().unwrap();
+    let best = pool
+        .iter()
+        .enumerate()
+        .filter(|(_, v)| v.capacity() >= n)
+        .min_by_key(|(_, v)| v.capacity())
+        .map(|(i, _)| i);
+    if let Some(i) = best {
+        let mut tree = pool.swap_remove(i);
+        drop(pool);
+        tree.clear();
+        // SAFETY: capacity was checked above and Hash is Copy with no Drop.
+        // `merkle_tree` writes every node before it can be read.
+        unsafe { tree.set_len(n) };
+        tree
+    } else {
+        crate::alloc_uninit_vec(n)
+    }
+}
+
+/// Return a fully-owned tree to the warm-proof pool. Contents are deliberately
+/// retained; the next builder overwrites every node.
+pub(crate) fn recycle_tree(tree: Vec<Hash>) {
+    if tree.capacity() == 0 {
+        return;
+    }
+    let mut pool = TREE_POOL.lock().unwrap();
+    pool.push(tree);
+    if pool.len() > MAX_POOLED_TREES {
+        let smallest = pool
+            .iter()
+            .enumerate()
+            .min_by_key(|(_, v)| v.capacity())
+            .map(|(i, _)| i)
+            .expect("tree pool non-empty");
+        pool.swap_remove(smallest);
+    }
+}
 
 #[cfg(any(
     all(target_arch = "aarch64", target_feature = "sha2"),
@@ -157,7 +207,7 @@ pub fn merkle_tree(data: &[u8], num_leaves: usize) -> Vec<Hash> {
     // Uninit alloc — every node is written exactly once before being read:
     // leaves at step 1, then each internal level reads the level below (which
     // was just written) and writes itself.
-    let mut tree: Vec<Hash> = crate::alloc_uninit_vec(total_nodes);
+    let mut tree: Vec<Hash> = take_tree(total_nodes);
 
     // 1. Leaves — fully parallel; 4-way interleaved SHA where available.
     #[cfg(any(
