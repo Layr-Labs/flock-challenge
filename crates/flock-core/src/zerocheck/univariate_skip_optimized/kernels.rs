@@ -130,6 +130,45 @@ pub(super) fn shift_reduce_inner_ab(
     );
 }
 
+/// Specialized honest-padding path for a 512-bit window whose useful prefix
+/// occupies exactly seven packed bytes (49 useful bits in BLAKE3's case).
+#[allow(clippy::too_many_arguments)]
+pub(super) fn shift_reduce_inner_ab_prefix_7(
+    a_packed: &[u8],
+    b_packed: &[u8],
+    inv_table: &InvNttTableByteSingleGf8,
+    chunk_byte_base: usize,
+    b_med: usize,
+    out: &mut [u8; 64],
+    a_col: &mut [F8],
+    b_col: &mut [F8],
+) {
+    #[cfg(target_arch = "aarch64")]
+    {
+        let _ = (a_col, b_col);
+        aarch64::shift_reduce_inner_ab_fused_neon_prefix_7(
+            a_packed,
+            b_packed,
+            inv_table,
+            chunk_byte_base,
+            b_med,
+            out,
+        );
+    }
+
+    #[cfg(not(target_arch = "aarch64"))]
+    shift_reduce_inner_ab(
+        a_packed,
+        b_packed,
+        inv_table,
+        chunk_byte_base,
+        b_med,
+        out,
+        a_col,
+        b_col,
+    );
+}
+
 #[allow(clippy::too_many_arguments)]
 #[inline]
 pub(super) fn accumulate_convert(

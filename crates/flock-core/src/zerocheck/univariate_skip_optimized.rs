@@ -42,7 +42,8 @@ mod kernels;
 
 #[cfg(all(test, target_arch = "aarch64"))]
 use kernels::aarch64::{
-    bit_transpose_64bytes_neon, shift_reduce_inner_ab_fused_neon, shift_reduce_inner_ab_neon,
+    bit_transpose_64bytes_neon, shift_reduce_inner_ab_fused_neon,
+    shift_reduce_inner_ab_fused_neon_prefix_7, shift_reduce_inner_ab_neon,
 };
 #[cfg(all(test, target_arch = "aarch64"))]
 use kernels::bit_transpose_64bytes_scalar;
@@ -96,46 +97,53 @@ pub const C_S_F8: u8 = 0x1C;
 /// The constant `C_s = φ_8(0x1C) ∈ F_{2^128}` — the relative scaling factor
 /// between this optimized output and the naive output.
 pub fn c_s_f128() -> F128 {
-    phi8(F8(C_S_F8))
+    static CACHE: OnceLock<F128> = OnceLock::new();
+    *CACHE.get_or_init(|| phi8(F8(C_S_F8)))
 }
 
 /// The three F_128 small challenges (embeddings of [`SMALL_CHAL_F8`]) — caller
 /// must place these at `r[k_skip..k_skip+3]` for the naive cross-check to
 /// produce a result related to the optimized output by exactly `C_s`.
 pub fn small_challenges_ghash() -> [F128; 3] {
-    [
-        phi8(F8(SMALL_CHAL_F8[0])),
-        phi8(F8(SMALL_CHAL_F8[1])),
-        phi8(F8(SMALL_CHAL_F8[2])),
-    ]
+    static CACHE: OnceLock<[F128; 3]> = OnceLock::new();
+    *CACHE.get_or_init(|| {
+        [
+            phi8(F8(SMALL_CHAL_F8[0])),
+            phi8(F8(SMALL_CHAL_F8[1])),
+            phi8(F8(SMALL_CHAL_F8[2])),
+        ]
+    })
 }
 
 /// The four F_128 medium challenges `β_i = γ^{2^{i-1}} / (1 + γ^{2^{i-1}})`.
 /// Caller must place these at `r[k_skip+3..k_skip+7]` for the naive
 /// cross-check.
 pub fn medium_challenges_ghash() -> [F128; 4] {
-    let g1 = F128 {
-        lo: 1u64 << 1,
-        hi: 0,
-    }; // γ^1
-    let g2 = F128 {
-        lo: 1u64 << 2,
-        hi: 0,
-    }; // γ^2
-    let g4 = F128 {
-        lo: 1u64 << 4,
-        hi: 0,
-    }; // γ^4
-    let g8 = F128 {
-        lo: 1u64 << 8,
-        hi: 0,
-    }; // γ^8
-    [
-        g1 * (F128::ONE + g1).inv(),
-        g2 * (F128::ONE + g2).inv(),
-        g4 * (F128::ONE + g4).inv(),
-        g8 * (F128::ONE + g8).inv(),
-    ]
+    static CACHE: OnceLock<[F128; 4]> = OnceLock::new();
+    *CACHE.get_or_init(|| {
+        let g1 = F128 {
+            lo: 1u64 << 1,
+            hi: 0,
+        }; // γ^1
+        let g2 = F128 {
+            lo: 1u64 << 2,
+            hi: 0,
+        }; // γ^2
+        let g4 = F128 {
+            lo: 1u64 << 4,
+            hi: 0,
+        }; // γ^4
+        let g8 = F128 {
+            lo: 1u64 << 8,
+            hi: 0,
+        }; // γ^8
+        [
+            g1 * (F128::ONE + g1).inv(),
+            g2 * (F128::ONE + g2).inv(),
+            g4 * (F128::ONE + g4).inv(),
+            g8 * (F128::ONE + g8).inv(),
+        ]
+    })
 }
 
 /// `C_2 = (1+r_2)(1+r_3)` where `r_2 = φ_8(0x53)` (= `α^2/(1+α^2)`),
@@ -151,9 +159,12 @@ pub fn medium_challenges_ghash() -> [F128; 4] {
 /// post-scale the raw bank values into canonical `s_hat_v_c` (which
 /// `ring_switch::fold_1b_rows` would produce against suffix `r[k_skip+1..m]`).
 pub fn c_2_small_f128() -> F128 {
-    let r_2 = phi8(F8(SMALL_CHAL_F8[1]));
-    let r_3 = phi8(F8(SMALL_CHAL_F8[2]));
-    (F128::ONE + r_2) * (F128::ONE + r_3)
+    static CACHE: OnceLock<F128> = OnceLock::new();
+    *CACHE.get_or_init(|| {
+        let r_2 = phi8(F8(SMALL_CHAL_F8[1]));
+        let r_3 = phi8(F8(SMALL_CHAL_F8[2]));
+        (F128::ONE + r_2) * (F128::ONE + r_3)
+    })
 }
 
 /// `α⁻¹` in F_128, as a subfield-embedded F_8 element. Used to strip the
@@ -163,7 +174,8 @@ pub fn c_2_small_f128() -> F128 {
 pub fn alpha_inv_f128() -> F128 {
     // α in F_8 = byte 0x02 (the polynomial generator). Its inverse is α^254;
     // F8::inv computes it via the standard extended Euclidean / power table.
-    phi8(F8(0x02).inv())
+    static CACHE: OnceLock<F128> = OnceLock::new();
+    *CACHE.get_or_init(|| phi8(F8(0x02).inv()))
 }
 
 /// `D = (1+γ)(1+γ^2)(1+γ^4)(1+γ^8)`; `D⁻¹` cancels the medium-eq normalization.
@@ -344,6 +356,7 @@ fn process_one_x_hi(
     n_lo_and_inner: usize,
     within_outer_mask: usize,
     b_med_counts: &[u8],
+    b_med_last_bytes: &[u8],
     a_packed: &[u8],
     b_packed: &[u8],
     c_packed: &[u8],
@@ -362,6 +375,7 @@ fn process_one_x_hi(
         let x_outer = x_outer_lo | (x_hi << n_lo);
         let within_hash_outer = x_outer & within_outer_mask;
         let n_b_med = b_med_counts[within_hash_outer] as usize;
+        let last_bytes = b_med_last_bytes[within_hash_outer] as usize;
         if n_b_med == 0 {
             continue;
         }
@@ -408,7 +422,7 @@ fn process_one_x_hi(
             // within_hash_outer value per [`PaddingSpec`] lands here (the
             // window straddling the useful/padding boundary), so the tighter
             // loop wins despite losing the SIMD chain unroll.
-            for b_med in 0..n_b_med {
+            for b_med in 0..n_b_med - 1 {
                 shift_reduce_inner_ab(
                     a_packed,
                     b_packed,
@@ -425,6 +439,35 @@ fn process_one_x_hi(
                     .expect("64 c-bytes per medium position");
                 bit_transpose_64bytes(c_in, &mut state.chunk_c_bytes[b_med]);
             }
+            let b_med = n_b_med - 1;
+            if last_bytes == 7 {
+                kernels::shift_reduce_inner_ab_prefix_7(
+                    a_packed,
+                    b_packed,
+                    inv_table,
+                    chunk_byte_base,
+                    b_med,
+                    &mut state.chunk_ab_bytes[b_med],
+                    &mut state.a_col,
+                    &mut state.b_col,
+                );
+            } else {
+                shift_reduce_inner_ab(
+                    a_packed,
+                    b_packed,
+                    inv_table,
+                    chunk_byte_base,
+                    b_med,
+                    &mut state.chunk_ab_bytes[b_med],
+                    &mut state.a_col,
+                    &mut state.b_col,
+                );
+            }
+            let byte_base_b = chunk_byte_base + b_med * N_CHUNKS * 8;
+            let c_in: &[u8; 64] = (&c_packed[byte_base_b..byte_base_b + 64])
+                .try_into()
+                .expect("64 c-bytes per medium position");
+            bit_transpose_64bytes(c_in, &mut state.chunk_c_bytes[b_med]);
 
             kernels::accumulate_convert(
                 &state.chunk_ab_bytes,
@@ -505,6 +548,7 @@ fn process_one_x_hi_with_s_hat_v(
     n_lo_and_inner: usize,
     within_outer_mask: usize,
     b_med_counts: &[u8],
+    b_med_last_bytes: &[u8],
     a_packed: &[u8],
     b_packed: &[u8],
     c_packed: &[u8],
@@ -524,6 +568,7 @@ fn process_one_x_hi_with_s_hat_v(
         let x_outer = x_outer_lo | (x_hi << n_lo);
         let within_hash_outer = x_outer & within_outer_mask;
         let n_b_med = b_med_counts[within_hash_outer] as usize;
+        let last_bytes = b_med_last_bytes[within_hash_outer] as usize;
         if n_b_med == 0 {
             continue;
         }
@@ -561,7 +606,7 @@ fn process_one_x_hi_with_s_hat_v(
                 &mut state.partial_c_1,
             );
         } else {
-            for b_med in 0..n_b_med {
+            for b_med in 0..n_b_med - 1 {
                 shift_reduce_inner_ab(
                     a_packed,
                     b_packed,
@@ -578,6 +623,35 @@ fn process_one_x_hi_with_s_hat_v(
                     .expect("64 c-bytes per medium position");
                 bit_transpose_64bytes(c_in, &mut state.chunk_c_bytes[b_med]);
             }
+            let b_med = n_b_med - 1;
+            if last_bytes == 7 {
+                kernels::shift_reduce_inner_ab_prefix_7(
+                    a_packed,
+                    b_packed,
+                    inv_table,
+                    chunk_byte_base,
+                    b_med,
+                    &mut state.chunk_ab_bytes[b_med],
+                    &mut state.a_col,
+                    &mut state.b_col,
+                );
+            } else {
+                shift_reduce_inner_ab(
+                    a_packed,
+                    b_packed,
+                    inv_table,
+                    chunk_byte_base,
+                    b_med,
+                    &mut state.chunk_ab_bytes[b_med],
+                    &mut state.a_col,
+                    &mut state.b_col,
+                );
+            }
+            let byte_base_b = chunk_byte_base + b_med * N_CHUNKS * 8;
+            let c_in: &[u8; 64] = (&c_packed[byte_base_b..byte_base_b + 64])
+                .try_into()
+                .expect("64 c-bytes per medium position");
+            bit_transpose_64bytes(c_in, &mut state.chunk_c_bytes[b_med]);
 
             kernels::accumulate_convert_with_s_hat_v(
                 &state.chunk_ab_bytes,
@@ -603,13 +677,15 @@ fn process_one_x_hi_with_s_hat_v(
 /// Build the `b_med_counts` table from a [`PaddingSpec`] for use by
 /// [`process_one_x_hi`].
 ///
-/// Returns `(within_outer_mask, b_med_counts)`:
+/// Returns `(within_outer_mask, b_med_counts, b_med_last_bytes)`:
 ///   - `within_outer_mask` masks `x_outer` to the bits identifying the
 ///     within-block window.
 ///   - `b_med_counts[w]` is how many of the 16 b_med 512-bit sub-windows of
 ///     window `w` we should process. Entries past the useful prefix are 0
 ///     (full skip) — kernels just `continue` past those x_outer_lo iterations.
-fn build_b_med_counts(padding: &PaddingSpec) -> (usize, Vec<u8>) {
+///   - `b_med_last_bytes[w]` is the number of packed bytes that cover the last
+///     processed sub-window's useful prefix (64 for a full sub-window).
+fn build_b_med_counts(padding: &PaddingSpec) -> (usize, Vec<u8>, Vec<u8>) {
     const STRIDE: usize = 1 << (K_SKIP + N_INNER); // 8192 bits per within-window
     const B_MED_WINDOW: usize = 1 << (K_SKIP + 3); // 512 bits per b_med
     const N_B_MED_MAX: usize = 1 << N_MEDIUM;
@@ -619,25 +695,34 @@ fn build_b_med_counts(padding: &PaddingSpec) -> (usize, Vec<u8>) {
     // incorrect, so we fall back to "no skip". All hash modules use
     // k_log ∈ {14, 15, 16}.
     if padding.k_log < K_SKIP + N_INNER {
-        return (0, vec![N_B_MED_MAX as u8]);
+        return (0, vec![N_B_MED_MAX as u8], vec![64]);
     }
     let within_outer_bits = padding.k_log - K_SKIP - N_INNER;
     let within_outer_count = 1usize << within_outer_bits;
     let within_outer_mask = within_outer_count - 1;
     let useful = padding.useful_bits_per_block;
-    let counts: Vec<u8> = (0..within_outer_count)
-        .map(|w| {
-            let block_start = w * STRIDE;
-            if block_start >= useful {
-                0u8
+    let mut counts = Vec::with_capacity(within_outer_count);
+    let mut last_bytes = Vec::with_capacity(within_outer_count);
+    for w in 0..within_outer_count {
+        let block_start = w * STRIDE;
+        if block_start >= useful {
+            counts.push(0);
+            last_bytes.push(0);
+        } else {
+            let bits_left = useful - block_start;
+            let processed = bits_left.div_ceil(B_MED_WINDOW).min(N_B_MED_MAX);
+            counts.push(processed as u8);
+            let final_bits = if bits_left >= STRIDE {
+                B_MED_WINDOW
             } else {
-                let bits_left = useful - block_start;
-                let processed = bits_left.div_ceil(B_MED_WINDOW);
-                processed.min(N_B_MED_MAX) as u8
-            }
-        })
-        .collect();
-    (within_outer_mask, counts)
+                let rem = bits_left % B_MED_WINDOW;
+                if rem == 0 { B_MED_WINDOW } else { rem }
+            };
+            let bytes = final_bits.div_ceil(8) as u8;
+            last_bytes.push(bytes);
+        }
+    }
+    (within_outer_mask, counts, last_bytes)
 }
 
 /// Packed-input variant of [`round1_shift_reduce_extract_c`]. **Parallel by
@@ -706,7 +791,7 @@ pub fn round1_shift_reduce_extract_c_packed_padded(
     let convert = convert_table();
     let eq_hi = &eq.hi;
 
-    let (within_outer_mask, b_med_counts) = build_b_med_counts(padding);
+    let (within_outer_mask, b_med_counts, b_med_last_bytes) = build_b_med_counts(padding);
 
     // Parallel fold: each worker accumulates a subset of x_hi values into its
     // own WorkerState. Reduce step combines the per-worker `local_res_*` by
@@ -721,6 +806,7 @@ pub fn round1_shift_reduce_extract_c_packed_padded(
                 n_lo_and_inner,
                 within_outer_mask,
                 &b_med_counts,
+                &b_med_last_bytes,
                 a_packed,
                 b_packed,
                 c_packed,
@@ -798,7 +884,7 @@ pub fn round1_shift_reduce_extract_c_packed_padded_with_s_hat_v(
     let convert = convert_table();
     let eq_hi = &eq.hi;
 
-    let (within_outer_mask, b_med_counts) = build_b_med_counts(padding);
+    let (within_outer_mask, b_med_counts, b_med_last_bytes) = build_b_med_counts(padding);
 
     let (res_ab, res_c_s_0, res_c_s_1) = (0..hi_size)
         .into_par_iter()
@@ -810,6 +896,7 @@ pub fn round1_shift_reduce_extract_c_packed_padded_with_s_hat_v(
                 n_lo_and_inner,
                 within_outer_mask,
                 &b_med_counts,
+                &b_med_last_bytes,
                 a_packed,
                 b_packed,
                 c_packed,
@@ -888,7 +975,8 @@ fn round1_shift_reduce_extract_c_packed_serial(
     let eq_lo_scaled: Vec<F128> = eq.lo.iter().map(|v| *v * d_inv_val).collect();
     let convert = convert_table();
 
-    let (within_outer_mask, b_med_counts) = build_b_med_counts(&PaddingSpec::dense(m));
+    let (within_outer_mask, b_med_counts, b_med_last_bytes) =
+        build_b_med_counts(&PaddingSpec::dense(m));
 
     let mut state = WorkerState::new();
     for x_hi in 0..hi_size {
@@ -898,6 +986,7 @@ fn round1_shift_reduce_extract_c_packed_serial(
             n_lo_and_inner,
             within_outer_mask,
             &b_med_counts,
+            &b_med_last_bytes,
             a_packed,
             b_packed,
             c_packed,
@@ -1305,6 +1394,39 @@ mod tests {
                 out_scalar, out_fused,
                 "fused-neon disagrees with scalar at (base={chunk_byte_base}, b_med={b_med})"
             );
+        }
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn neon_prefix_7_matches_full_zero_padded_inner() {
+        let mut rng = Rng::new(0xB1A3_15409);
+        let table = make_inv_table();
+        for _ in 0..64 {
+            let mut a_packed = [0u8; 64];
+            let mut b_packed = [0u8; 64];
+            for byte in &mut a_packed[..7] {
+                *byte = rng.next_u64() as u8;
+            }
+            for byte in &mut b_packed[..7] {
+                *byte = rng.next_u64() as u8;
+            }
+            // The 49th useful bit occupies bit 0 of byte 6.
+            a_packed[6] &= 1;
+            b_packed[6] &= 1;
+
+            let mut full = [0u8; 64];
+            let mut prefix = [0u8; 64];
+            shift_reduce_inner_ab_fused_neon(&a_packed, &b_packed, &table, 0, 0, &mut full);
+            shift_reduce_inner_ab_fused_neon_prefix_7(
+                &a_packed,
+                &b_packed,
+                &table,
+                0,
+                0,
+                &mut prefix,
+            );
+            assert_eq!(prefix, full);
         }
     }
 

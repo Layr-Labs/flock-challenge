@@ -42,6 +42,7 @@
 //! pairs are adjacent — matching the standard `fold_pair` formula in DP24.
 
 use crate::field::F128;
+use std::sync::{Arc, Mutex, OnceLock};
 
 mod kernels;
 
@@ -101,14 +102,14 @@ fn span_get(basis: &[F128], idx: usize) -> F128 {
 #[derive(Clone, Debug)]
 pub struct AdditiveNttF128 {
     /// `evals[i]` of length `ℓ − i`, the normalized subspace polynomial values.
-    evals: Vec<Vec<F128>>,
+    evals: Arc<Vec<Vec<F128>>>,
 }
 
 impl AdditiveNttF128 {
     /// Construct an NTT from an explicit F_2-basis.
     pub fn new(basis: &[F128]) -> Self {
         Self {
-            evals: generate_evals_from_subspace(basis),
+            evals: Arc::new(generate_evals_from_subspace(basis)),
         }
     }
 
@@ -116,8 +117,15 @@ impl AdditiveNttF128 {
     /// (the low 64 bits of F_{2^128} hold these basis vectors).
     pub fn standard(dim: usize) -> Self {
         assert!(dim <= 64, "standard NTT requires dim ≤ 64");
+        static CACHE: OnceLock<Mutex<Vec<Option<AdditiveNttF128>>>> = OnceLock::new();
+        let cache = CACHE.get_or_init(|| Mutex::new(vec![None; 65]));
+        if let Some(ntt) = cache.lock().unwrap()[dim].clone() {
+            return ntt;
+        }
         let basis: Vec<F128> = (0..dim).map(|i| F128::new(1u64 << i, 0)).collect();
-        Self::new(&basis)
+        let ntt = Self::new(&basis);
+        cache.lock().unwrap()[dim] = Some(ntt.clone());
+        ntt
     }
 
     pub fn log_domain_size(&self) -> usize {
@@ -344,6 +352,7 @@ impl AdditiveNttF128 {
             target_feature = "avx512f",
             target_feature = "vpclmulqdq"
         ));
+        let fused3_ok = cfg!(all(target_arch = "aarch64", target_feature = "aes"));
         let mut layer = start_layer.min(n_top);
         while layer < n_top {
             let num_blocks = 1usize << layer;
@@ -375,6 +384,29 @@ impl AdditiveNttF128 {
                     );
                 }
                 layer += 4;
+            } else if fused3_ok && layer + 2 < n_top && block_size >= 8 {
+                // Three layers are the best register/traffic tradeoff on
+                // aarch64: eight values stay live while one whole-buffer pass
+                // replaces three. A 16-value fused kernel spills on NEON.
+                let eighth = block_size >> 3;
+                for block in 0..num_blocks {
+                    let mut tw = [F128 { lo: 0, hi: 0 }; 7];
+                    tw[0] = self.twiddle(layer, block);
+                    for s in 0..2 {
+                        tw[1 + s] = self.twiddle(layer + 1, 2 * block + s);
+                    }
+                    for s in 0..4 {
+                        tw[3 + s] = self.twiddle(layer + 2, 4 * block + s);
+                    }
+                    let start = block * block_bytes;
+                    butterfly_interleaved_fused_3layer_par_rows(
+                        &mut data[start..start + block_bytes],
+                        &tw,
+                        eighth,
+                        num_ntts,
+                    );
+                }
+                layer += 3;
             } else if layer + 1 < n_top && block_size >= 4 {
                 // Fuse layers (layer, layer+1).
                 let quarter = block_size >> 2;
@@ -783,6 +815,37 @@ fn butterfly_interleaved_fused_2layer_par_rows(
             .for_each(|(((row_a, row_b), row_c), row_d)| {
                 do_one(row_a, row_b, row_c, row_d);
             });
+    }
+}
+
+/// Butterfly one top-layer block, fusing three layers `(L..L+3)` into one
+/// memory pass. `block` holds `8 * eighth` rows of `num_ntts` lanes and `t`
+/// carries the seven twiddles in breadth-first layer order.
+#[inline]
+fn butterfly_interleaved_fused_3layer_par_rows(
+    block: &mut [F128],
+    t: &[F128; 7],
+    eighth: usize,
+    num_ntts: usize,
+) {
+    use rayon::prelude::*;
+    const PARALLEL_ROW_THRESHOLD: usize = 256;
+    debug_assert_eq!(block.len(), 8 * eighth * num_ntts);
+    let base = block.as_mut_ptr() as usize;
+    if eighth < PARALLEL_ROW_THRESHOLD {
+        for r in 0..eighth {
+            // SAFETY: row group r writes eight disjoint rows of this block.
+            unsafe {
+                kernels::butterfly_fused_3layer_row(base as *mut F128, eighth, num_ntts, r, t)
+            };
+        }
+    } else {
+        (0..eighth).into_par_iter().for_each(|r| {
+            // SAFETY: distinct r values select disjoint row groups.
+            unsafe {
+                kernels::butterfly_fused_3layer_row(base as *mut F128, eighth, num_ntts, r, t)
+            };
+        });
     }
 }
 

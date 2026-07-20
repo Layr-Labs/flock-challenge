@@ -57,46 +57,61 @@ pub(crate) unsafe fn accumulate_convert_with_s_hat_v(
     partial_c_0: &mut [F128; 64],
     partial_c_1: &mut [F128; 64],
 ) {
+    use crate::field::gf2_128::aarch64::ghash_mul_vec2_neon;
     use core::arch::aarch64::*;
 
     // SAFETY: caller guarantees fixed input sizes and aarch64 provides NEON.
     unsafe {
         let convert_ptr = convert.as_ptr() as *const u8;
-        for lane in 0..64 {
-            let mut converted_ab = vdupq_n_u8(0);
-            let mut converted_c_0 = vdupq_n_u8(0);
-            let mut converted_c_1 = vdupq_n_u8(0);
+        let mut lane = 0;
+        while lane < 64 {
+            let mut converted_ab = [vdupq_n_u8(0); 2];
+            let mut converted_c_0 = [vdupq_n_u8(0); 2];
+            let mut converted_c_1 = [vdupq_n_u8(0); 2];
             for b_med in 0..n_b_med {
-                let ab = chunk_ab_bytes[b_med][lane] as usize;
-                let c = chunk_c_bytes[b_med][lane] as usize;
-                converted_ab = veorq_u8(
-                    converted_ab,
-                    vld1q_u8(convert_ptr.add((b_med * 256 + ab) * 16)),
-                );
-                converted_c_0 = veorq_u8(
-                    converted_c_0,
-                    vld1q_u8(convert_ptr.add((b_med * 256 + (c & 0x55)) * 16)),
-                );
-                converted_c_1 = veorq_u8(
-                    converted_c_1,
-                    vld1q_u8(convert_ptr.add((b_med * 256 + (c & 0xaa)) * 16)),
-                );
+                for j in 0..2 {
+                    let ab = chunk_ab_bytes[b_med][lane + j] as usize;
+                    let c = chunk_c_bytes[b_med][lane + j] as usize;
+                    converted_ab[j] = veorq_u8(
+                        converted_ab[j],
+                        vld1q_u8(convert_ptr.add((b_med * 256 + ab) * 16)),
+                    );
+                    converted_c_0[j] = veorq_u8(
+                        converted_c_0[j],
+                        vld1q_u8(convert_ptr.add((b_med * 256 + (c & 0x55)) * 16)),
+                    );
+                    converted_c_1[j] = veorq_u8(
+                        converted_c_1[j],
+                        vld1q_u8(convert_ptr.add((b_med * 256 + (c & 0xaa)) * 16)),
+                    );
+                }
             }
-            let ab = vreinterpretq_u64_u8(converted_ab);
-            let c_0 = vreinterpretq_u64_u8(converted_c_0);
-            let c_1 = vreinterpretq_u64_u8(converted_c_1);
-            partial_ab[lane] += F128 {
-                lo: vgetq_lane_u64::<0>(ab),
-                hi: vgetq_lane_u64::<1>(ab),
-            } * eq_lo_val;
-            partial_c_0[lane] += F128 {
-                lo: vgetq_lane_u64::<0>(c_0),
-                hi: vgetq_lane_u64::<1>(c_0),
-            } * eq_lo_val;
-            partial_c_1[lane] += F128 {
-                lo: vgetq_lane_u64::<0>(c_1),
-                hi: vgetq_lane_u64::<1>(c_1),
-            } * eq_lo_val;
+            let unpack = |v: uint8x16_t| {
+                let v = vreinterpretq_u64_u8(v);
+                F128 {
+                    lo: vgetq_lane_u64::<0>(v),
+                    hi: vgetq_lane_u64::<1>(v),
+                }
+            };
+            let ab = ghash_mul_vec2_neon(
+                [unpack(converted_ab[0]), unpack(converted_ab[1])],
+                [eq_lo_val; 2],
+            );
+            let c_0 = ghash_mul_vec2_neon(
+                [unpack(converted_c_0[0]), unpack(converted_c_0[1])],
+                [eq_lo_val; 2],
+            );
+            let c_1 = ghash_mul_vec2_neon(
+                [unpack(converted_c_1[0]), unpack(converted_c_1[1])],
+                [eq_lo_val; 2],
+            );
+            partial_ab[lane] += ab[0];
+            partial_ab[lane + 1] += ab[1];
+            partial_c_0[lane] += c_0[0];
+            partial_c_0[lane + 1] += c_0[1];
+            partial_c_1[lane] += c_1[0];
+            partial_c_1[lane + 1] += c_1[1];
+            lane += 2;
         }
     }
 }
@@ -325,7 +340,7 @@ unsafe fn xor_apply_byte_into_8_regs<const BH: usize, const ODD: bool>(
 /// F_8 multiply, widen-shift by K, XOR into the four `(acc_lo, acc_hi)` pairs.
 #[cfg(target_arch = "aarch64")]
 #[inline(always)]
-unsafe fn fused_apply_one_k<const K: i32>(
+unsafe fn fused_apply_one_k<const K: i32, const FULL_ROW: bool>(
     table_base: *const u8,
     a_row: *const u8,
     b_row: *const u8,
@@ -432,19 +447,21 @@ unsafe fn fused_apply_one_k<const K: i32>(
             &mut db2,
             &mut db3,
         );
-        xor_apply_byte_into_8_regs::<3, true>(
-            table_base,
-            *a_row.add(7),
-            *b_row.add(7),
-            &mut da0,
-            &mut da1,
-            &mut da2,
-            &mut da3,
-            &mut db0,
-            &mut db1,
-            &mut db2,
-            &mut db3,
-        );
+        if FULL_ROW {
+            xor_apply_byte_into_8_regs::<3, true>(
+                table_base,
+                *a_row.add(7),
+                *b_row.add(7),
+                &mut da0,
+                &mut da1,
+                &mut da2,
+                &mut da3,
+                &mut db0,
+                &mut db1,
+                &mut db2,
+                &mut db3,
+            );
+        }
 
         // F_8 multiply lane-wise (4 × 16 lanes = 64 total).
         let y0 = gf8_mul_vec16(da0, db0);
@@ -495,7 +512,7 @@ pub(crate) fn shift_reduce_inner_ab_fused_neon(
         macro_rules! do_k {
             ($k:literal) => {{
                 let off = byte_base_b + $k * N_CHUNKS;
-                fused_apply_one_k::<$k>(
+                fused_apply_one_k::<$k, true>(
                     table_base,
                     a_packed.as_ptr().add(off),
                     b_packed.as_ptr().add(off),
@@ -520,6 +537,63 @@ pub(crate) fn shift_reduce_inner_ab_fused_neon(
         do_k!(7);
 
         // Reduce 16-bit accs → 16-byte F_8 results (4 × 16 lanes).
+        let r0 = gf8_reduce_vec16(vreinterpretq_u8_u16(acc0_lo), vreinterpretq_u8_u16(acc0_hi));
+        let r1 = gf8_reduce_vec16(vreinterpretq_u8_u16(acc1_lo), vreinterpretq_u8_u16(acc1_hi));
+        let r2 = gf8_reduce_vec16(vreinterpretq_u8_u16(acc2_lo), vreinterpretq_u8_u16(acc2_hi));
+        let r3 = gf8_reduce_vec16(vreinterpretq_u8_u16(acc3_lo), vreinterpretq_u8_u16(acc3_hi));
+
+        let p = out.as_mut_ptr();
+        vst1q_u8(p, r0);
+        vst1q_u8(p.add(16), r1);
+        vst1q_u8(p.add(32), r2);
+        vst1q_u8(p.add(48), r3);
+    }
+}
+
+/// BLAKE3's last partial 512-bit window contains exactly 49 useful bits,
+/// hence seven packed bytes. All later bytes are honest zero padding. Process
+/// only K-row 0 and omit its eighth zero byte instead of running the other
+/// seven all-zero K rows through the inverse-table and GF(2^8) multiply path.
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+pub(crate) fn shift_reduce_inner_ab_fused_neon_prefix_7(
+    a_packed: &[u8],
+    b_packed: &[u8],
+    inv_table: &InvNttTableByteSingleGf8,
+    chunk_byte_base: usize,
+    b_med: usize,
+    out: &mut [u8; 64],
+) {
+    use crate::field::gf2_8::neon::gf8_reduce_vec16;
+    use core::arch::aarch64::*;
+
+    let byte_base_b = chunk_byte_base + b_med * N_CHUNKS * 8;
+    let table_base = inv_table.data_ptr();
+
+    unsafe {
+        let mut acc0_lo = vdupq_n_u16(0);
+        let mut acc0_hi = vdupq_n_u16(0);
+        let mut acc1_lo = vdupq_n_u16(0);
+        let mut acc1_hi = vdupq_n_u16(0);
+        let mut acc2_lo = vdupq_n_u16(0);
+        let mut acc2_hi = vdupq_n_u16(0);
+        let mut acc3_lo = vdupq_n_u16(0);
+        let mut acc3_hi = vdupq_n_u16(0);
+
+        fused_apply_one_k::<0, false>(
+            table_base,
+            a_packed.as_ptr().add(byte_base_b),
+            b_packed.as_ptr().add(byte_base_b),
+            &mut acc0_lo,
+            &mut acc0_hi,
+            &mut acc1_lo,
+            &mut acc1_hi,
+            &mut acc2_lo,
+            &mut acc2_hi,
+            &mut acc3_lo,
+            &mut acc3_hi,
+        );
+
         let r0 = gf8_reduce_vec16(vreinterpretq_u8_u16(acc0_lo), vreinterpretq_u8_u16(acc0_hi));
         let r1 = gf8_reduce_vec16(vreinterpretq_u8_u16(acc1_lo), vreinterpretq_u8_u16(acc1_hi));
         let r2 = gf8_reduce_vec16(vreinterpretq_u8_u16(acc2_lo), vreinterpretq_u8_u16(acc2_hi));
