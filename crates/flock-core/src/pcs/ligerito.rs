@@ -372,6 +372,27 @@ pub fn prover_config_for(
     log_batch_size: usize,
     profile: LigeritoProfile,
 ) -> Result<ProverConfig, String> {
+    use std::sync::{Mutex, OnceLock};
+
+    type ConfigKey = (usize, usize, u8);
+    static CACHE: OnceLock<Mutex<Vec<(ConfigKey, ProverConfig)>>> = OnceLock::new();
+
+    let profile_key = match profile {
+        LigeritoProfile::Fast => 0,
+        LigeritoProfile::Slim => 1,
+        LigeritoProfile::Secure => 2,
+    };
+    let key = (log_n, log_batch_size, profile_key);
+    let cache = CACHE.get_or_init(|| Mutex::new(Vec::new()));
+    if let Some(config) = cache
+        .lock()
+        .unwrap()
+        .iter()
+        .find_map(|(cached_key, config)| (*cached_key == key).then(|| config.clone()))
+    {
+        return Ok(config);
+    }
+
     let m = log_n + crate::pcs::LOG_PACKING;
     let toml = embedded_security_config(m, profile).ok_or_else(|| {
         format!(
@@ -392,6 +413,7 @@ pub fn prover_config_for(
         ));
     }
     let (pv, _) = sec.to_prover_verifier_configs()?;
+    cache.lock().unwrap().push((key, pv.clone()));
     Ok(pv)
 }
 
@@ -1647,6 +1669,14 @@ fn next_s(s: F128, s_at_root: F128) -> F128 {
 /// `sks_vks[k] = s_k(v_k)` for `k = 0..=log_n`. Length `log_n + 1`.
 /// Only depends on `log_n`, so callers cache.
 pub(crate) fn eval_sk_at_vks(log_n: usize) -> Vec<F128> {
+    use std::sync::{Mutex, OnceLock};
+
+    static CACHE: OnceLock<Mutex<Vec<Option<Vec<F128>>>>> = OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(vec![None; 65]));
+    if let Some(values) = cache.lock().unwrap()[log_n].clone() {
+        return values;
+    }
+
     let mut sks_vks = vec![F128::ZERO; log_n + 1];
     sks_vks[0] = F128::ONE;
     if log_n == 0 {
@@ -1665,7 +1695,27 @@ pub(crate) fn eval_sk_at_vks(log_n: usize) -> Vec<F128> {
         }
         cur_len -= 1;
     }
+    cache.lock().unwrap()[log_n] = Some(sks_vks.clone());
     sks_vks
+}
+
+/// Cached inverses of the standard-domain `s_k(v_k)` values. These depend
+/// only on the dimension and recur at every Ligerito level in every proof.
+fn inv_sks_vks_cached(sks_vks: &[F128]) -> Vec<F128> {
+    use std::sync::{Mutex, OnceLock};
+
+    let log_n = sks_vks.len() - 1;
+    static CACHE: OnceLock<Mutex<Vec<Option<Vec<F128>>>>> = OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(vec![None; 65]));
+    if let Some(values) = cache.lock().unwrap()[log_n].clone() {
+        return values;
+    }
+    let values: Vec<F128> = sks_vks
+        .iter()
+        .map(|&v| if v.is_zero() { F128::ZERO } else { v.inv() })
+        .collect();
+    cache.lock().unwrap()[log_n] = Some(values.clone());
+    values
 }
 
 /// Write into `basis` the **normalized** LCH novel-basis polynomials
@@ -1805,10 +1855,7 @@ pub(crate) fn induce_sumcheck_evaluate_at_residual(
         table.into_iter().take(n_queries).collect()
     };
 
-    let inv_sks_vks: Vec<F128> = sks_vks
-        .iter()
-        .map(|&v| if v.is_zero() { F128::ZERO } else { v.inv() })
-        .collect();
+    let inv_sks_vks = inv_sks_vks_cached(sks_vks);
 
     let prefix_len = ris_for_basis.len();
 
@@ -1923,10 +1970,7 @@ pub(crate) fn induce_sumcheck_poly(
     };
 
     // Precompute inv_sks_vks once across all queries and threads.
-    let inv_sks_vks: Vec<F128> = sks_vks
-        .iter()
-        .map(|&v| if v.is_zero() { F128::ZERO } else { v.inv() })
-        .collect();
+    let inv_sks_vks = inv_sks_vks_cached(sks_vks);
 
     // Per-thread chunked accumulation: each thread accumulates a partial
     // basis_poly (length n) and a partial enforced_sum, then we reduce.
@@ -2268,6 +2312,7 @@ pub(crate) struct LigeroWitness {
 impl Drop for LigeroWitness {
     fn drop(&mut self) {
         crate::scratch::give_f128(std::mem::take(&mut self.mat));
+        crate::merkle::recycle_tree(std::mem::take(&mut self.tree));
     }
 }
 
@@ -2755,6 +2800,17 @@ impl SumcheckProver {
     pub fn transcript(&self) -> &[SumcheckMessage] {
         &self.transcript
     }
+
+    /// Consume the prover after its last round, moving the residual
+    /// polynomial and transcript into the wire proof without copying either
+    /// allocation. The combined basis and any pending glue state are dead at
+    /// this point and are dropped with `self`.
+    fn into_final_parts(mut self) -> (Vec<F128>, Vec<SumcheckMessage>) {
+        (
+            std::mem::take(&mut self.f),
+            std::mem::take(&mut self.transcript),
+        )
+    }
 }
 
 // ===================================================================
@@ -3115,9 +3171,8 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
     let log_inv_rate_1 = config.log_inv_rates[1];
     let _t = std::time::Instant::now();
     let ntt_1 = AdditiveNttF128::standard(log_msg_cols_1 + log_inv_rate_1);
-    let f1 = sc_prover.f().to_vec();
     let wtns_1 = ligero_commit(
-        &f1,
+        sc_prover.f(),
         log_msg_cols_1,
         log_num_interleaved_1,
         log_inv_rate_1,
@@ -3172,11 +3227,6 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
     if trace {
         t_opens += _t.elapsed();
     }
-    let initial_proof = RecursiveProof {
-        opened_rows: opened_rows_0.clone(),
-        merkle_proof: merkle_proof_0,
-    };
-
     // Induce basis_0 from wtns_0 opens. L0 dominates the induce phase, where the
     // sparse-prefix Fᵀ-NTT path wins; the dispatcher auto-selects it (deeper
     // levels stay dense).
@@ -3194,6 +3244,10 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
     if trace {
         t_induce += _t.elapsed();
     }
+    let initial_proof = RecursiveProof {
+        opened_rows: opened_rows_0,
+        merkle_proof: merkle_proof_0,
+    };
 
     // Introduce + glue basis_0.
     let _t = std::time::Instant::now();
@@ -3234,9 +3288,8 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
         }
 
         if i == r - 1 {
-            let yr = sc_prover.f().to_vec();
-            for v in &yr {
-                challenger.observe_f128(*v);
+            for &v in sc_prover.f() {
+                challenger.observe_f128(v);
             }
             // PoW grinding for the last level before sampling its queries.
             let nonce_last = challenger.grind_pow(config.grinding_bits[i + 1] as u32);
@@ -3289,6 +3342,7 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
                     );
                 }
             }
+            let (yr, sumcheck_transcript) = sc_prover.into_final_parts();
             return LigeritoProof {
                 initial_root,
                 initial_proof,
@@ -3299,7 +3353,7 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
                     opened_rows: opened_rows_last,
                     merkle_proof: merkle_proof_last,
                 },
-                sumcheck_transcript: sc_prover.transcript().to_vec(),
+                sumcheck_transcript,
                 grinding_nonces,
                 ood_values,
                 fold_grinding_nonces,
@@ -3313,9 +3367,8 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
         let log_inv_rate_next = config.log_inv_rates[i + 2];
         let _t = std::time::Instant::now();
         let ntt_next = AdditiveNttF128::standard(log_msg_cols_next + log_inv_rate_next);
-        let f_evals = sc_prover.f().to_vec();
         let wtns_next = ligero_commit(
-            &f_evals,
+            sc_prover.f(),
             log_msg_cols_next,
             log_num_interleaved_next,
             log_inv_rate_next,
@@ -3363,11 +3416,6 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
         if trace {
             t_opens += _t.elapsed();
         }
-        recursive_proofs.push(RecursiveProof {
-            opened_rows: opened_rows_i.clone(),
-            merkle_proof: merkle_proof_i,
-        });
-
         let sks_vks_i = eval_sk_at_vks(n_next);
         let _t = std::time::Instant::now();
         let (basis_i_induced, enforced_sum_i) = induce_sumcheck_poly(
@@ -3381,6 +3429,10 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
         if trace {
             t_induce += _t.elapsed();
         }
+        recursive_proofs.push(RecursiveProof {
+            opened_rows: opened_rows_i,
+            merkle_proof: merkle_proof_i,
+        });
 
         let _t = std::time::Instant::now();
         let intro_msg_i = sc_prover.introduce_new(basis_i_induced, enforced_sum_i);

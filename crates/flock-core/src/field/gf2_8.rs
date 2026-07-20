@@ -154,47 +154,31 @@ pub mod neon {
     /// passed as `(c0, c1)`) modulo `x^8 + x^4 + x^3 + x + 1`, returning 16 reduced
     /// GF(2^8) values.
     ///
-    /// Two-stage Binius-style reduction:
-    ///   Stage 1: ch · QPLUS_RSH1 then ·2 (corrects for /x in QPLUS_RSH1)
-    ///   Stage 2: high bytes of stage-1 · QSTAR; take low bytes only.
-    ///
-    /// Constants:
-    ///   QPLUS_RSH1 = (x^8+x^4+x^3+x)/x = 0x8d
-    ///   QSTAR      = x^4+x^3+x+1       = 0x1b
+    /// Nibble-table reduction. For a raw product `cl + ch·x^8`, use
+    /// `x^8 = 0x1b` in the quotient and split `ch` into its low/high nibbles.
+    /// Two `TBL` lookups replace the previous four PMULLs, while keeping all
+    /// sixteen lanes in one vector.
     ///
     /// # Safety
     /// Uses `core::arch::aarch64` NEON intrinsics; only call on `aarch64`.
     #[inline]
     pub unsafe fn gf8_reduce_vec16(c0: uint8x16_t, c1: uint8x16_t) -> uint8x16_t {
         unsafe {
-            let q_plus_rsh1: poly8x8_t = transmute::<u64, poly8x8_t>(0x8d8d8d8d8d8d8d8d_u64);
-            let q_star: poly8x8_t = transmute::<u64, poly8x8_t>(0x1b1b1b1b1b1b1b1b_u64);
-
             let cl = vuzp1q_u8(c0, c1); // low bytes of all 16 products
             let ch = vuzp2q_u8(c0, c1); // high bytes of all 16 products
-
-            // Stage 1.
-            let t0 = vreinterpretq_u8_u16(vshlq_n_u16::<1>(vreinterpretq_u16_p16(vmull_p8(
-                transmute::<uint8x8_t, poly8x8_t>(vget_low_u8(ch)),
-                q_plus_rsh1,
-            ))));
-            let t1 = vreinterpretq_u8_u16(vshlq_n_u16::<1>(vreinterpretq_u16_p16(vmull_p8(
-                transmute::<uint8x8_t, poly8x8_t>(vget_high_u8(ch)),
-                q_plus_rsh1,
-            ))));
-
-            // Stage 2.
-            let tmp_hi = vuzp2q_u8(t0, t1);
-            let r0 = vreinterpretq_u8_u16(vreinterpretq_u16_p16(vmull_p8(
-                transmute::<uint8x8_t, poly8x8_t>(vget_low_u8(tmp_hi)),
-                q_star,
-            )));
-            let r1 = vreinterpretq_u8_u16(vreinterpretq_u16_p16(vmull_p8(
-                transmute::<uint8x8_t, poly8x8_t>(vget_high_u8(tmp_hi)),
-                q_star,
-            )));
-
-            veorq_u8(cl, vuzp1q_u8(r0, r1))
+            const RED_LO: [u8; 16] = [
+                0x00, 0x1b, 0x36, 0x2d, 0x6c, 0x77, 0x5a, 0x41, 0xd8, 0xc3, 0xee, 0xf5, 0xb4, 0xaf,
+                0x82, 0x99,
+            ];
+            const RED_HI: [u8; 16] = [
+                0x00, 0xab, 0x4d, 0xe6, 0x9a, 0x31, 0xd7, 0x7c, 0x2f, 0x84, 0x62, 0xc9, 0xb5, 0x1e,
+                0xf8, 0x53,
+            ];
+            let lo_nibble = vandq_u8(ch, vdupq_n_u8(0x0f));
+            let hi_nibble = vshrq_n_u8::<4>(ch);
+            let red_lo = vqtbl1q_u8(vld1q_u8(RED_LO.as_ptr()), lo_nibble);
+            let red_hi = vqtbl1q_u8(vld1q_u8(RED_HI.as_ptr()), hi_nibble);
+            veorq_u8(cl, veorq_u8(red_lo, red_hi))
         }
     }
 

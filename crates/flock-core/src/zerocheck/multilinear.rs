@@ -82,32 +82,58 @@ fn round2_pair_skip(padding: &PaddingSpec, k_skip: usize) -> (usize, usize) {
 // Lagrange weights for the univariate-skip fold at z.
 // ---------------------------------------------------------------------------
 
-/// Lagrange weights `L_i(z)` for `i ∈ 0..2^k_skip` at the fold point `z`.
+/// Lagrange weights over an affine `F_2` subspace of `F_8`, embedded in
+/// `F_{2^128}`. `offset=0` selects S and `offset=ell` selects Lambda.
 ///
-/// `L_i(z) = ∏_{j ≠ i} (z + φ_8(j)) / (φ_8(i) + φ_8(j))` — the standard Lagrange
-/// formula, with the nodes being the F_8 elements `0..2^k_skip` embedded into
-/// F_{2^128} via `φ_8`. Subtraction is XOR in characteristic 2.
-///
-/// O(2^{2·k_skip}) field multiplies — one-time cost.
-pub fn lagrange_weights_naive(k_skip: usize, z: F128) -> Vec<F128> {
+/// For an affine subspace the Lagrange denominator
+/// `D_i = product_{j != i}(s_i + s_j)` is independent of `i`: translation
+/// cancels in each difference, and XOR by `i` permutes the nonzero elements
+/// of the underlying linear subspace. Prefix/suffix products therefore build
+/// every numerator `product_{j != i}(z+s_j)` in O(ell) total field products,
+/// versus the former O(ell^2) products and ell inversions. The one fixed
+/// `D^-1` is cached after warm-up.
+fn lagrange_weights_affine_subspace(k_skip: usize, offset: usize, z: F128) -> Vec<F128> {
+    use std::sync::{Mutex, OnceLock};
+
     let ell = 1usize << k_skip;
     assert!(ell <= 256, "k_skip > 8 would exceed PHI_8_TABLE");
-    let mut weights = vec![F128::ZERO; ell];
-    for i in 0..ell {
-        let si = PHI_8_TABLE[i];
-        let mut num = F128::ONE;
+    assert!(offset + ell <= PHI_8_TABLE.len());
+
+    static DEN_INV: OnceLock<Mutex<[Option<F128>; 9]>> = OnceLock::new();
+    let cache = DEN_INV.get_or_init(|| Mutex::new([None; 9]));
+    let den_inv = if let Some(v) = cache.lock().unwrap()[k_skip] {
+        v
+    } else {
         let mut den = F128::ONE;
-        for j in 0..ell {
-            if j == i {
-                continue;
-            }
-            let sj = PHI_8_TABLE[j];
-            num *= z + sj;
-            den *= si + sj;
+        for &v in &PHI_8_TABLE[1..ell] {
+            den *= v;
         }
-        weights[i] = num * den.inv();
+        let v = den.inv();
+        cache.lock().unwrap()[k_skip] = Some(v);
+        v
+    };
+
+    let terms: Vec<F128> = PHI_8_TABLE[offset..offset + ell]
+        .iter()
+        .map(|&node| z + node)
+        .collect();
+    let mut weights = vec![F128::ONE; ell];
+    for i in 1..ell {
+        weights[i] = weights[i - 1] * terms[i - 1];
+    }
+    let mut suffix = F128::ONE;
+    for i in (0..ell).rev() {
+        weights[i] *= suffix * den_inv;
+        suffix *= terms[i];
     }
     weights
+}
+
+/// Lagrange weights `L_i(z)` for `i ∈ 0..2^k_skip` at the fold point `z`.
+/// The historical name is retained for API compatibility; the implementation
+/// uses the linear-time affine-subspace algorithm above.
+pub fn lagrange_weights_naive(k_skip: usize, z: F128) -> Vec<F128> {
+    lagrange_weights_affine_subspace(k_skip, 0, z)
 }
 
 /// Lagrange weights `L_i^Λ(z)` for `i ∈ 0..2^k_skip` at the fold point `z`,
@@ -119,22 +145,7 @@ pub fn lagrange_weights_naive(k_skip: usize, z: F128) -> Vec<F128> {
 pub fn lagrange_weights_lambda_naive(k_skip: usize, z: F128) -> Vec<F128> {
     let ell = 1usize << k_skip;
     assert!(2 * ell <= 256, "Λ ∪ S must fit in F_8 (need k_skip ≤ 7)");
-    let mut weights = vec![F128::ZERO; ell];
-    for i in 0..ell {
-        let si = PHI_8_TABLE[ell + i];
-        let mut num = F128::ONE;
-        let mut den = F128::ONE;
-        for j in 0..ell {
-            if j == i {
-                continue;
-            }
-            let sj = PHI_8_TABLE[ell + j];
-            num *= z + sj;
-            den *= si + sj;
-        }
-        weights[i] = num * den.inv();
-    }
-    weights
+    lagrange_weights_affine_subspace(k_skip, ell, z)
 }
 
 /// Interpolate a degree-`< 2^k_skip` polynomial at z, given its `2^k_skip`
@@ -1139,6 +1150,37 @@ mod tests {
                 for j in 0..ell {
                     let expected = if j == i { F128::ONE } else { F128::ZERO };
                     assert_eq!(weights[j], expected, "k_skip={k_skip}, z=node{i}, j={j}");
+                }
+            }
+        }
+    }
+
+    /// Cross-check the linear-time affine-subspace construction against the
+    /// definitional quadratic formula on both S and its Lambda coset.
+    #[test]
+    fn affine_lagrange_matches_quadratic_oracle() {
+        let mut rng = Rng::new(0x1A6A_4A6E);
+        for k_skip in [2usize, 3, 4, 5, 6] {
+            let ell = 1usize << k_skip;
+            for offset in [0usize, ell] {
+                for _ in 0..3 {
+                    let z = rng.f128();
+                    let fast = lagrange_weights_affine_subspace(k_skip, offset, z);
+                    let mut oracle = vec![F128::ZERO; ell];
+                    for i in 0..ell {
+                        let si = PHI_8_TABLE[offset + i];
+                        let mut num = F128::ONE;
+                        let mut den = F128::ONE;
+                        for j in 0..ell {
+                            if i != j {
+                                let sj = PHI_8_TABLE[offset + j];
+                                num *= z + sj;
+                                den *= si + sj;
+                            }
+                        }
+                        oracle[i] = num * den.inv();
+                    }
+                    assert_eq!(fast, oracle, "k_skip={k_skip}, offset={offset}");
                 }
             }
         }
