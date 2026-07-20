@@ -1,5 +1,23 @@
 use super::super::{F8, F128, InvNttTableByteSingleGf8, N_CHUNKS};
 
+/// LLVM 22 scalarizes some constant `vshlq_n_u64` expressions into lane
+/// extracts/inserts on Apple Silicon. Keep this hot bit-transpose operation as
+/// the single vector shift the source asks for.
+#[inline(always)]
+unsafe fn shlq_u64_imm<const N: i32>(
+    mut value: core::arch::aarch64::uint64x2_t,
+) -> core::arch::aarch64::uint64x2_t {
+    unsafe {
+        core::arch::asm!(
+            "shl {value:v}.2d, {value:v}.2d, #{shift}",
+            value = inout(vreg) value,
+            shift = const N,
+            options(pure, nomem, nostack),
+        );
+    }
+    value
+}
+
 #[allow(clippy::too_many_arguments)]
 #[inline(always)]
 pub(crate) unsafe fn accumulate_convert(
@@ -149,26 +167,25 @@ pub(crate) unsafe fn bit_transpose_64bytes_neon(input: &[u8; 64], output: &mut [
         let mask1 = vdupq_n_u64(0x00AA00AA00AA00AA);
         let mask2 = vdupq_n_u64(0x0000CCCC0000CCCC);
         let mask3 = vdupq_n_u64(0x00000000F0F0F0F0);
-
         // Round 1: distance 7.
         let t0 = vandq_u64(veorq_u64(y0, vshrq_n_u64::<7>(y0)), mask1);
         let t1 = vandq_u64(veorq_u64(y1, vshrq_n_u64::<7>(y1)), mask1);
         let t2 = vandq_u64(veorq_u64(y2, vshrq_n_u64::<7>(y2)), mask1);
         let t3 = vandq_u64(veorq_u64(y3, vshrq_n_u64::<7>(y3)), mask1);
-        y0 = veorq_u64(y0, veorq_u64(t0, vshlq_n_u64::<7>(t0)));
-        y1 = veorq_u64(y1, veorq_u64(t1, vshlq_n_u64::<7>(t1)));
-        y2 = veorq_u64(y2, veorq_u64(t2, vshlq_n_u64::<7>(t2)));
-        y3 = veorq_u64(y3, veorq_u64(t3, vshlq_n_u64::<7>(t3)));
+        y0 = veorq_u64(y0, veorq_u64(t0, shlq_u64_imm::<7>(t0)));
+        y1 = veorq_u64(y1, veorq_u64(t1, shlq_u64_imm::<7>(t1)));
+        y2 = veorq_u64(y2, veorq_u64(t2, shlq_u64_imm::<7>(t2)));
+        y3 = veorq_u64(y3, veorq_u64(t3, shlq_u64_imm::<7>(t3)));
 
         // Round 2: distance 14.
         let t0 = vandq_u64(veorq_u64(y0, vshrq_n_u64::<14>(y0)), mask2);
         let t1 = vandq_u64(veorq_u64(y1, vshrq_n_u64::<14>(y1)), mask2);
         let t2 = vandq_u64(veorq_u64(y2, vshrq_n_u64::<14>(y2)), mask2);
         let t3 = vandq_u64(veorq_u64(y3, vshrq_n_u64::<14>(y3)), mask2);
-        y0 = veorq_u64(y0, veorq_u64(t0, vshlq_n_u64::<14>(t0)));
-        y1 = veorq_u64(y1, veorq_u64(t1, vshlq_n_u64::<14>(t1)));
-        y2 = veorq_u64(y2, veorq_u64(t2, vshlq_n_u64::<14>(t2)));
-        y3 = veorq_u64(y3, veorq_u64(t3, vshlq_n_u64::<14>(t3)));
+        y0 = veorq_u64(y0, veorq_u64(t0, shlq_u64_imm::<14>(t0)));
+        y1 = veorq_u64(y1, veorq_u64(t1, shlq_u64_imm::<14>(t1)));
+        y2 = veorq_u64(y2, veorq_u64(t2, shlq_u64_imm::<14>(t2)));
+        y3 = veorq_u64(y3, veorq_u64(t3, shlq_u64_imm::<14>(t3)));
 
         // Round 3: distance 28.
         let t0 = vandq_u64(veorq_u64(y0, vshrq_n_u64::<28>(y0)), mask3);
