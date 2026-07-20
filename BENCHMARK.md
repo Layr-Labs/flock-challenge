@@ -146,7 +146,7 @@ binary's SHA-256 and code signature before building the candidate.
 `benchmark.sh` checks SHA-256 again immediately before invoking it.
 
 The committed verifier was built from reviewed benchmark commit
-`44844f05847e381b094bf04fb19aaec0223ce801`. Its underlying re-signed Flock
+`7a6585a20adfd5eb38814a1587a3adb9fb7e838c`. Its underlying re-signed Flock
 tree matches upstream Flock commit
 `85fc0e7cc002e7ca4dffdff805ba89976e9a5293`.
 
