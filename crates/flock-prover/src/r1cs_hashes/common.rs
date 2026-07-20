@@ -2,7 +2,7 @@
 //! modules (`sha2`, `blake3`, `keccak`). The shared `prove_fast`
 //! orchestration lives in [`crate::prover::prove_fast_from_witness`].
 
-use std::sync::{Mutex, OnceLock};
+use std::sync::OnceLock;
 
 use flock_core::bits::transpose_8_u64s_to_64_bytes;
 use flock_core::field::F128;
@@ -193,34 +193,6 @@ pub(crate) fn build_block_r1cs_with_matrices(
 // buffers (z, a, b) from one input.
 // ---------------------------------------------------------------------------
 
-// Unlike the large F128 prover buffers, the row-major lincheck stripe is a
-// byte vector. Retain one fully resident allocation across the mandatory
-// warm-up proof; the producer below overwrites every byte before it is read.
-static LINCHECK_STRIPE_POOL: Mutex<Option<Vec<u8>>> = Mutex::new(None);
-
-fn take_lincheck_stripe(n: usize) -> Vec<u8> {
-    if let Some(mut stripe) = LINCHECK_STRIPE_POOL.lock().unwrap().take()
-        && stripe.capacity() >= n
-    {
-        stripe.resize(n, 0);
-        return stripe;
-    }
-    vec![0u8; n]
-}
-
-pub(crate) fn recycle_lincheck_stripe(stripe: Vec<u8>) {
-    if stripe.capacity() == 0 {
-        return;
-    }
-    let mut pooled = LINCHECK_STRIPE_POOL.lock().unwrap();
-    if pooled
-        .as_ref()
-        .is_none_or(|current| current.capacity() < stripe.capacity())
-    {
-        *pooled = Some(stripe);
-    }
-}
-
 /// Drive the parallel chunked witness build for `n_blocks` instances padded
 /// to `2^n_blocks_log` slots. Returns `(z, a, b, z_lincheck)` packed in
 /// F128 form (z/a/b) and byte-stripe form (z_lincheck).
@@ -273,7 +245,7 @@ where
     let mut z = flock_core::scratch::take_f128(total_f128);
     let mut a = flock_core::scratch::take_f128(total_f128);
     let mut b = flock_core::scratch::take_f128(total_f128);
-    let mut z_lincheck = take_lincheck_stripe((n_total / 8) * k);
+    let mut z_lincheck = vec![0u8; (n_total / 8) * k];
 
     z.par_chunks_mut(8 * f128_per_block)
         .zip(a.par_chunks_mut(8 * f128_per_block))

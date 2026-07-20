@@ -310,48 +310,38 @@ impl Challenger for FsChallenger {
         // multi-threaded critical path. We go parallel once a single grind
         // clears the rayon dispatch break-even (~2^13 hashes); the genuinely
         // tiny deep-level grinds (2^3–2^11) stay sequential, where the serial
-        // loop beats parallel-dispatch overhead. Positive-bit PoW accepts any
-        // satisfying nonce, so parallel searches stop at the first completed
-        // match rather than coordinating to recover the globally smallest one.
+        // loop beats parallel-dispatch overhead. `find_first` returns the
+        // globally smallest satisfying nonce, so the result is identical to the
+        // sequential search (deterministic proofs) regardless of this choice.
         const PARALLEL_GRIND_MIN_HASHES: u64 = 1 << 13;
         let nonce = if bits == 0 {
             0
         } else if (1u64 << bits.min(63)) < PARALLEL_GRIND_MIN_HASHES {
             // Sequential search: try u64 nonces until
             // SHA256(state_digest || nonce_le) has `bits` leading zeros.
-            #[cfg(all(target_arch = "aarch64", target_feature = "sha2"))]
-            let nonce = if bits >= 8 {
-                let mut nonce = 0u64;
-                loop {
-                    if let Some(found) = sha256x4_find_nonce(&state_digest, nonce, bits) {
-                        break found;
-                    }
-                    nonce = nonce.wrapping_add(4);
+            let mut nonce: u64 = 0;
+            loop {
+                if sha256_has_leading_zero_bits(&state_digest, nonce, bits) {
+                    break nonce;
                 }
-            } else {
-                grind_pow_sequential(&state_digest, bits)
-            };
-            #[cfg(not(all(target_arch = "aarch64", target_feature = "sha2")))]
-            let nonce = grind_pow_sequential(&state_digest, bits);
-            nonce
+                nonce = nonce.wrapping_add(1);
+            }
         } else {
-            // Block-parallel search. The verifier checks and absorbs the exact
-            // nonce supplied by the prover, so the first completed valid batch
-            // can stop all workers immediately.
+            // Block-parallel search. Blocks are scanned in order and
+            // `find_first` returns the smallest match within a block, so the
+            // result is deterministic (the globally smallest satisfying nonce).
+            // Block ≈ 2× the expected attempts: large enough that the match
+            // usually falls inside one block (so all threads do useful
+            // pre-match work), small enough to avoid the 4× over-scan the old
+            // `+2` block caused (which left ~¾ of threads doing cancelled work).
             use rayon::prelude::*;
             let block: u64 = 1 << (bits.min(24) + 1);
             let mut start: u64 = 0;
             loop {
-                #[cfg(all(target_arch = "aarch64", target_feature = "sha2"))]
-                let found = ((start / 4)..(start.saturating_add(block) / 4))
+                if let Some(n) = (start..start.saturating_add(block))
                     .into_par_iter()
-                    .filter_map(|batch| sha256x4_find_nonce(&state_digest, batch * 4, bits))
-                    .find_any(|_| true);
-                #[cfg(not(all(target_arch = "aarch64", target_feature = "sha2")))]
-                let found = (start..start.saturating_add(block))
-                    .into_par_iter()
-                    .find_any(|&n| sha256_has_leading_zero_bits(&state_digest, n, bits));
-                if let Some(n) = found {
+                    .find_first(|&n| sha256_has_leading_zero_bits(&state_digest, n, bits))
+                {
                     break n;
                 }
                 start = start.saturating_add(block);
@@ -386,35 +376,6 @@ impl Challenger for FsChallenger {
     }
 }
 
-#[inline]
-fn grind_pow_sequential(state_digest: &[u8; 32], bits: u32) -> u64 {
-    let mut nonce: u64 = 0;
-    loop {
-        if sha256_has_leading_zero_bits(state_digest, nonce, bits) {
-            break nonce;
-        }
-        nonce = nonce.wrapping_add(1);
-    }
-}
-
-#[cfg(all(target_arch = "aarch64", target_feature = "sha2"))]
-#[inline]
-fn sha256x4_find_nonce(state_digest: &[u8; 32], first_nonce: u64, bits: u32) -> Option<u64> {
-    #[cfg(feature = "hash-count")]
-    fs_count::POW_SHA256.fetch_add(4, std::sync::atomic::Ordering::Relaxed);
-    let nonces = [
-        first_nonce,
-        first_nonce.wrapping_add(1),
-        first_nonce.wrapping_add(2),
-        first_nonce.wrapping_add(3),
-    ];
-    let hashes = crate::merkle::hash4_pow(state_digest, nonces);
-    hashes
-        .iter()
-        .position(|hash| has_leading_zero_bits(hash, bits))
-        .map(|lane| nonces[lane])
-}
-
 /// Extract a 32-byte digest from the current SHA-256 challenger state, to be
 /// used as the PoW base. Cloning + finalize gives a state-bound digest without
 /// mutating the live hasher.
@@ -436,11 +397,6 @@ fn sha256_has_leading_zero_bits(state_digest: &[u8; 32], nonce: u64, bits: u32) 
     hasher.update(state_digest);
     hasher.update(nonce.to_le_bytes());
     let h: [u8; 32] = hasher.finalize().into();
-    has_leading_zero_bits(&h, bits)
-}
-
-#[inline(always)]
-fn has_leading_zero_bits(h: &[u8; 32], bits: u32) -> bool {
     let full_bytes = (bits / 8) as usize;
     let extra = bits % 8;
     for &b in h.iter().take(full_bytes) {
@@ -457,21 +413,6 @@ fn has_leading_zero_bits(h: &[u8; 32], bits: u32) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[cfg(all(target_arch = "aarch64", target_feature = "sha2"))]
-    #[test]
-    fn sha256x4_pow_matches_sha2() {
-        let state_digest = std::array::from_fn(|i| (i as u8).wrapping_mul(17));
-        let nonces = [0, 1, 0x0123_4567_89ab_cdef, u64::MAX];
-        let actual = crate::merkle::hash4_pow(&state_digest, nonces);
-        for i in 0..4 {
-            let mut hasher = Sha256::new();
-            hasher.update(state_digest);
-            hasher.update(nonces[i].to_le_bytes());
-            let expected: [u8; 32] = hasher.finalize().into();
-            assert_eq!(actual[i], expected, "lane {i}");
-        }
-    }
 
     /// Prover-side PoW grinding produces a nonce that the verifier-side
     /// `verify_pow` accepts at the same transcript position. State binding

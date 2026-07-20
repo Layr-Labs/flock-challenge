@@ -81,22 +81,17 @@ fn generate_evals_from_subspace(basis: &[F128]) -> Vec<Vec<F128>> {
     evals
 }
 
-/// Materialize every `(layer, block)` twiddle once. Standard NTT objects are
-/// cached across the mandatory warm-up and measured proof, so this replaces
-/// each hot-path subset scan with one indexed load.
-fn generate_twiddles_from_evals(evals: &[Vec<F128>]) -> Vec<Vec<F128>> {
-    let log_d = evals.len();
-    (0..log_d)
-        .map(|layer| {
-            let basis = &evals[log_d - layer - 1][1..];
-            let mut twiddles = vec![F128::ZERO; 1usize << layer];
-            for block in 1..twiddles.len() {
-                let bit = block.trailing_zeros() as usize;
-                twiddles[block] = twiddles[block ^ (1usize << bit)] + basis[bit];
-            }
-            twiddles
-        })
-        .collect()
+/// Compute `Σ_j bit_j(idx) · basis[j]` — the `idx`-th element of the F_2-span
+/// of `basis`.
+#[inline]
+fn span_get(basis: &[F128], idx: usize) -> F128 {
+    let mut acc = F128::ZERO;
+    for (j, &b) in basis.iter().enumerate() {
+        if (idx >> j) & 1 == 1 {
+            acc += b;
+        }
+    }
+    acc
 }
 
 /// Additive NTT over F_{2^128} with the standard polynomial-basis subspace.
@@ -108,18 +103,13 @@ fn generate_twiddles_from_evals(evals: &[Vec<F128>]) -> Vec<Vec<F128>> {
 pub struct AdditiveNttF128 {
     /// `evals[i]` of length `ℓ − i`, the normalized subspace polynomial values.
     evals: Arc<Vec<Vec<F128>>>,
-    /// Exact twiddle values indexed by `[layer][block]`.
-    twiddles: Arc<Vec<Vec<F128>>>,
 }
 
 impl AdditiveNttF128 {
     /// Construct an NTT from an explicit F_2-basis.
     pub fn new(basis: &[F128]) -> Self {
-        let evals = generate_evals_from_subspace(basis);
-        let twiddles = generate_twiddles_from_evals(&evals);
         Self {
-            evals: Arc::new(evals),
-            twiddles: Arc::new(twiddles),
+            evals: Arc::new(generate_evals_from_subspace(basis)),
         }
     }
 
@@ -150,7 +140,8 @@ impl AdditiveNttF128 {
     /// (The 0-th element of the row corresponds to `Ŵ_{ℓ-l-1}(β_{ℓ-l-1}) = 1`,
     /// which is "absorbed" into the butterfly and not in the twiddle.)
     pub fn twiddle(&self, layer: usize, block: usize) -> F128 {
-        self.twiddles[layer][block]
+        let v = &self.evals[self.log_domain_size() - layer - 1];
+        span_get(&v[1..], block)
     }
 
     /// Forward additive NTT in place. `data.len()` must be `2^log_d` for some
@@ -239,9 +230,10 @@ impl AdditiveNttF128 {
     /// stale. This is semantically identical to zero-padding `msg` and running
     /// [`Self::forward_transform_interleaved`] from layer zero.
     ///
-    /// On large AArch64 rate-1/2 transforms, replication and NTT layers 1--3
-    /// are fused into one out-of-place pass. Other geometries retain the
-    /// replica-fill plus from-layer scheduler.
+    /// On large AArch64 rate-1/2 transforms, replication and early NTT layers
+    /// are fused into an out-of-place seed. Very large codewords use a staged
+    /// 8x8 tile through layer 6; smaller codewords use the layer-3 seed. Other
+    /// geometries retain the replica-fill plus from-layer scheduler.
     pub(crate) fn rs_encode_interleaved(
         &self,
         msg: &[F128],
@@ -264,6 +256,16 @@ impl AdditiveNttF128 {
 
         #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
         if log_inv_rate == 1 && log_d >= 12 {
+            // Layers 4--6 are a full-buffer fused pass only once the codeword
+            // is at least 256 MiB (2^24 field elements). Below that size they
+            // are already handled in cache-resident sub-NTTs, where the 8x8
+            // staging overhead has no bandwidth pass to remove.
+            const LAYER6_SEED_MIN_ELEMENTS: usize = 1 << 24;
+            if num_ntts == 64 && codeword.len() >= LAYER6_SEED_MIN_ELEMENTS {
+                self.seed_rate_half_layers_1_through_6(msg, codeword, num_ntts);
+                self.forward_transform_interleaved_from_layer(codeword, num_ntts, 7);
+                return;
+            }
             self.seed_rate_half_layers_1_through_3(msg, codeword, num_ntts);
             self.forward_transform_interleaved_from_layer(codeword, num_ntts, 4);
             return;
@@ -343,6 +345,101 @@ impl AdditiveNttF128 {
             }
         } else {
             (0..eighth).into_par_iter().for_each(seed_row);
+        }
+    }
+
+    /// Write the exact post-layer-6 state for a rate-1/2 encoding. For each
+    /// lane and output half, an 8x8 source tile is transformed down columns by
+    /// layers 1--3, staged transposed in a 64 KiB 32-lane scratch tile, then
+    /// transformed across rows by layers 4--6. This removes the intervening
+    /// whole-codeword pass while keeping only eight field values live per lane.
+    #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+    fn seed_rate_half_layers_1_through_6(
+        &self,
+        msg: &[F128],
+        codeword: &mut [F128],
+        num_ntts: usize,
+    ) {
+        use rayon::prelude::*;
+
+        debug_assert_eq!(codeword.len(), 2 * msg.len());
+        let msg_positions = msg.len() / num_ntts;
+        debug_assert!(msg_positions >= 64 && msg_positions.is_power_of_two());
+        let sixty_fourth = msg_positions >> 6;
+
+        let mut first_twiddles = [[F128::ZERO; 7]; 2];
+        for (block, tw) in first_twiddles.iter_mut().enumerate() {
+            tw[0] = self.twiddle(1, block);
+            for s in 0..2 {
+                tw[1 + s] = self.twiddle(2, 2 * block + s);
+            }
+            for s in 0..4 {
+                tw[3 + s] = self.twiddle(3, 4 * block + s);
+            }
+        }
+
+        let mut second_twiddles = [[F128::ZERO; 7]; 16];
+        for (block, tw) in second_twiddles.iter_mut().enumerate() {
+            tw[0] = self.twiddle(4, block);
+            for s in 0..2 {
+                tw[1 + s] = self.twiddle(5, 2 * block + s);
+            }
+            for s in 0..4 {
+                tw[3 + s] = self.twiddle(6, 4 * block + s);
+            }
+        }
+
+        for tw in [&first_twiddles[0], &second_twiddles[0]] {
+            debug_assert_eq!(tw[0], F128::ZERO);
+            debug_assert_eq!(tw[1], F128::ZERO);
+            debug_assert_eq!(tw[3], F128::ZERO);
+        }
+        let first_sparse_twiddles = [
+            first_twiddles[0][2],
+            first_twiddles[0][4],
+            first_twiddles[0][5],
+            first_twiddles[0][6],
+        ];
+        let second_sparse_twiddles = [
+            second_twiddles[0][2],
+            second_twiddles[0][4],
+            second_twiddles[0][5],
+            second_twiddles[0][6],
+        ];
+
+        // Every r owns 64 rows in each output half; disjoint ranges therefore
+        // have disjoint writes. Use four equal-cost ranges per worker to keep
+        // work stealing effective while amortizing the isolated 64 KiB scratch
+        // frame and its stack probes across hundreds of production rows.
+        // Source is shared read-only and never aliases codeword.
+        let src = msg.as_ptr() as usize;
+        let dst = codeword.as_mut_ptr() as usize;
+        let seed_range = |r_start, r_end| unsafe {
+            kernels::butterfly_fused_6layer_rows_from(
+                src as *const F128,
+                dst as *mut F128,
+                sixty_fourth,
+                num_ntts,
+                r_start,
+                r_end,
+                &first_twiddles,
+                &second_twiddles,
+                &first_sparse_twiddles,
+                &second_sparse_twiddles,
+            );
+        };
+
+        let task_count = rayon::current_num_threads()
+            .saturating_mul(4)
+            .min(sixty_fourth);
+        if task_count == 1 {
+            seed_range(0, sixty_fourth);
+        } else {
+            (0..task_count).into_par_iter().for_each(|task| {
+                let r_start = sixty_fourth * task / task_count;
+                let r_end = sixty_fourth * (task + 1) / task_count;
+                seed_range(r_start, r_end);
+            });
         }
     }
 
@@ -1230,8 +1327,9 @@ mod tests {
 
     /// The semantic RS encoder must overwrite stale output and match the
     /// definitional zero-padded full transform across rates and lane widths.
-    /// The final case crosses the ARM seeded-fusion dispatch threshold with
-    /// the production lane count.
+    /// The final case crosses the ARM layer-3 seed dispatch threshold with the
+    /// production lane count. The much larger layer-6 dispatch has its own
+    /// direct oracle below.
     #[test]
     fn rs_encode_matches_zero_padded_full_ntt() {
         let mut rng = Rng::new(0x5EED);
@@ -1290,6 +1388,40 @@ mod tests {
             assert_eq!(
                 encoded, oracle,
                 "direct seed mismatch at log_d={log_d}, num_ntts={num_ntts}, threads={threads}"
+            );
+        }
+    }
+
+    /// Exercise the cache-staged layer-6 seed independently of its large-data
+    /// dispatch gate, including serial and parallel row scheduling.
+    #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+    #[test]
+    fn rate_half_layer6_seed_matches_full_ntt() {
+        let mut rng = Rng::new(0x6A7E6);
+        for (log_d, num_ntts, threads) in
+            [(7usize, 1usize, 1usize), (8, 2, 1), (10, 8, 4), (12, 64, 4)]
+        {
+            let ntt = AdditiveNttF128::standard(log_d);
+            let codeword_len = (1usize << log_d) * num_ntts;
+            let msg_len = codeword_len >> 1;
+            let msg = rand_vec(&mut rng, msg_len);
+            let mut encoded = rand_vec(&mut rng, codeword_len);
+
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .unwrap()
+                .install(|| {
+                    ntt.seed_rate_half_layers_1_through_6(&msg, &mut encoded, num_ntts);
+                    ntt.forward_transform_interleaved_from_layer(&mut encoded, num_ntts, 7);
+                });
+
+            let mut oracle = vec![F128::ZERO; codeword_len];
+            oracle[..msg_len].copy_from_slice(&msg);
+            ntt.forward_transform_interleaved_scalar(&mut oracle, num_ntts);
+            assert_eq!(
+                encoded, oracle,
+                "layer-6 seed mismatch at log_d={log_d}, num_ntts={num_ntts}, threads={threads}"
             );
         }
     }

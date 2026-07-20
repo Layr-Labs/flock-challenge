@@ -133,6 +133,52 @@ pub(super) unsafe fn butterfly_fused_3layer_row_from_sparse(
     }
 }
 
+/// Process a range of cache-local 8x8 source tiles through two staged
+/// fused-three-layer trees, writing the exact post-layer-6 state for both
+/// rate-1/2 output halves.
+///
+/// The implementation deliberately stages a 32-lane 16x8 tile (64 KiB) while
+/// keeping at most eight transform values live per lane. This avoids the
+/// register-pressure failure of a monolithic six-layer kernel while
+/// eliminating the intervening codeword read/write pass.
+///
+/// # Safety
+/// The caller must ensure the selected 64 source rows are valid, all 128
+/// destination rows are valid, source and destination do not overlap, and
+/// concurrent calls use disjoint `r_start..r_end` ranges (and therefore
+/// disjoint writes).
+#[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+#[inline]
+#[allow(clippy::too_many_arguments)]
+pub(super) unsafe fn butterfly_fused_6layer_rows_from(
+    src: *const F128,
+    dst: *mut F128,
+    sixty_fourth: usize,
+    num_ntts: usize,
+    r_start: usize,
+    r_end: usize,
+    first_twiddles: &[[F128; 7]; 2],
+    second_twiddles: &[[F128; 7]; 16],
+    first_sparse_twiddles: &[F128; 4],
+    second_sparse_twiddles: &[F128; 4],
+) {
+    // SAFETY: forwarded caller contract.
+    unsafe {
+        portable::butterfly_fused_6layer_rows_from(
+            src,
+            dst,
+            sixty_fourth,
+            num_ntts,
+            r_start,
+            r_end,
+            first_twiddles,
+            second_twiddles,
+            first_sparse_twiddles,
+            second_sparse_twiddles,
+        )
+    }
+}
+
 /// Process one fused-four-layer row group across every interleaved NTT lane.
 ///
 /// # Safety

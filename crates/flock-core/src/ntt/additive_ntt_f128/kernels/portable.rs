@@ -188,6 +188,202 @@ pub(super) unsafe fn butterfly_fused_3layer_row_from_sparse(
     }
 }
 
+/// # Safety
+/// The caller guarantees the source/destination geometry, non-aliasing, and
+/// disjoint-write contract documented by the architecture-neutral wrapper.
+#[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+#[inline(always)]
+fn seed_layer6_butterfly(values: &mut [F128; 8], u: usize, v: usize, twiddle: F128) {
+    let new_u = values[u] + values[v] * twiddle;
+    values[v] += new_u;
+    values[u] = new_u;
+}
+
+#[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+const SEED_LAYER6_LANES: usize = 32;
+
+#[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+#[inline(always)]
+fn seed_layer6_fused_3(values: &mut [F128; 8], twiddles: &[F128; 7]) {
+    for i in 0..4 {
+        seed_layer6_butterfly(values, i, i + 4, twiddles[0]);
+    }
+    for s in 0..2 {
+        for i in 0..2 {
+            seed_layer6_butterfly(values, 4 * s + i, 4 * s + i + 2, twiddles[1 + s]);
+        }
+    }
+    for s in 0..4 {
+        seed_layer6_butterfly(values, 2 * s, 2 * s + 1, twiddles[3 + s]);
+    }
+}
+
+#[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+#[inline(always)]
+fn seed_layer6_fused_3_sparse(values: &mut [F128; 8], twiddles: &[F128; 4]) {
+    let [t_l2_right, t_l3_1, t_l3_2, t_l3_3] = *twiddles;
+
+    values[4] += values[0];
+    values[5] += values[1];
+    values[6] += values[2];
+    values[7] += values[3];
+
+    values[2] += values[0];
+    values[3] += values[1];
+    seed_layer6_butterfly(values, 4, 6, t_l2_right);
+    seed_layer6_butterfly(values, 5, 7, t_l2_right);
+
+    values[1] += values[0];
+    seed_layer6_butterfly(values, 2, 3, t_l3_1);
+    seed_layer6_butterfly(values, 4, 5, t_l3_2);
+    seed_layer6_butterfly(values, 6, 7, t_l3_3);
+}
+
+/// Fill a 32-lane 16x8 transposed post-layer-3 tile. Keeping this phase out of
+/// line forces the 64 KiB scratch to materialize instead of letting LLVM
+/// turn a larger fused expression into register spills.
+#[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+#[inline(never)]
+#[allow(clippy::too_many_arguments)]
+unsafe fn seed_layer6_stage_1_through_3(
+    src: *const F128,
+    scratch: *mut F128,
+    sixty_fourth: usize,
+    num_ntts: usize,
+    r: usize,
+    lane_base: usize,
+    lane_count: usize,
+    first_twiddles: &[[F128; 7]; 2],
+    first_sparse_twiddles: &[F128; 4],
+) {
+    for column in 0..8 {
+        for lane_in_tile in 0..lane_count {
+            let lane = lane_base + lane_in_tile;
+            let mut values = [F128::ZERO; 8];
+            for (row, value) in values.iter_mut().enumerate() {
+                let pos = (row * 8 + column) * sixty_fourth + r;
+                // SAFETY: guaranteed by the caller's tile geometry.
+                *value = unsafe { *src.add(pos * num_ntts + lane) };
+            }
+            seed_layer6_fused_3_sparse(&mut values, first_sparse_twiddles);
+            for (row, value) in values.into_iter().enumerate() {
+                let slot = (row * 8 + column) * SEED_LAYER6_LANES + lane_in_tile;
+                // SAFETY: all live-lane tile slots are distinct and valid.
+                unsafe { scratch.add(slot).write(value) };
+            }
+
+            // The second half consumes the same eight source values
+            // immediately. Reloading keeps only one 8-value tree live, and
+            // the source cache lines are hot from the sparse half above.
+            for (row, value) in values.iter_mut().enumerate() {
+                let pos = (row * 8 + column) * sixty_fourth + r;
+                // SAFETY: guaranteed by the caller's tile geometry.
+                *value = unsafe { *src.add(pos * num_ntts + lane) };
+            }
+            seed_layer6_fused_3(&mut values, &first_twiddles[1]);
+            for (row, value) in values.into_iter().enumerate() {
+                let slot = ((8 + row) * 8 + column) * SEED_LAYER6_LANES + lane_in_tile;
+                // SAFETY: all live-lane tile slots are distinct and valid.
+                unsafe { scratch.add(slot).write(value) };
+            }
+        }
+    }
+}
+
+/// Drain one 32-lane transposed tile through layers 4--6 and write every
+/// final codeword slot once. This phase is kept out of line for the same
+/// register lifetime boundary as [`seed_layer6_stage_1_through_3`].
+#[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+#[inline(never)]
+#[allow(clippy::too_many_arguments)]
+unsafe fn seed_layer6_stage_4_through_6(
+    scratch: *const F128,
+    dst: *mut F128,
+    sixty_fourth: usize,
+    num_ntts: usize,
+    r: usize,
+    lane_base: usize,
+    lane_count: usize,
+    second_twiddles: &[[F128; 7]; 16],
+    second_sparse_twiddles: &[F128; 4],
+) {
+    for global_block in 0..16 {
+        for lane_in_tile in 0..lane_count {
+            let lane = lane_base + lane_in_tile;
+            let mut values = [F128::ZERO; 8];
+            for (column, value) in values.iter_mut().enumerate() {
+                let slot = (global_block * 8 + column) * SEED_LAYER6_LANES + lane_in_tile;
+                // SAFETY: stage 1--3 initialized every live-lane scratch slot.
+                *value = unsafe { *scratch.add(slot) };
+            }
+            if global_block == 0 {
+                seed_layer6_fused_3_sparse(&mut values, second_sparse_twiddles);
+            } else {
+                seed_layer6_fused_3(&mut values, &second_twiddles[global_block]);
+            }
+            for (column, value) in values.into_iter().enumerate() {
+                let pos = (global_block * 8 + column) * sixty_fourth + r;
+                // SAFETY: guaranteed by the caller's destination geometry.
+                unsafe { *dst.add(pos * num_ntts + lane) = value };
+            }
+        }
+    }
+}
+
+#[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+// The 64 KiB scratch frame must remain an out-of-line range boundary. If
+// ThinLTO inlines it into Rayon's recursive bridge helper, each split level
+// consumes another 64 KiB and can overflow the worker's 2 MiB stack.
+#[inline(never)]
+#[allow(clippy::too_many_arguments)]
+pub(super) unsafe fn butterfly_fused_6layer_rows_from(
+    src: *const F128,
+    dst: *mut F128,
+    sixty_fourth: usize,
+    num_ntts: usize,
+    r_start: usize,
+    r_end: usize,
+    first_twiddles: &[[F128; 7]; 2],
+    second_twiddles: &[[F128; 7]; 16],
+    first_sparse_twiddles: &[F128; 4],
+    second_sparse_twiddles: &[F128; 4],
+) {
+    debug_assert!(r_start < r_end && r_end <= sixty_fourth);
+    // This scratch is intentionally uninitialized. Stage 1--3 writes every
+    // live-lane slot before stage 4--6 reads it, so no tile zero fill occurs.
+    let mut scratch = [core::mem::MaybeUninit::<F128>::uninit(); 128 * SEED_LAYER6_LANES];
+    let scratch_ptr = scratch.as_mut_ptr().cast::<F128>();
+    for r in r_start..r_end {
+        for lane_base in (0..num_ntts).step_by(SEED_LAYER6_LANES) {
+            let lane_count = (num_ntts - lane_base).min(SEED_LAYER6_LANES);
+            unsafe {
+                seed_layer6_stage_1_through_3(
+                    src,
+                    scratch_ptr,
+                    sixty_fourth,
+                    num_ntts,
+                    r,
+                    lane_base,
+                    lane_count,
+                    first_twiddles,
+                    first_sparse_twiddles,
+                );
+                seed_layer6_stage_4_through_6(
+                    scratch_ptr,
+                    dst,
+                    sixty_fourth,
+                    num_ntts,
+                    r,
+                    lane_base,
+                    lane_count,
+                    second_twiddles,
+                    second_sparse_twiddles,
+                );
+            }
+        }
+    }
+}
+
 #[inline]
 pub(super) fn butterfly_fused_4layer(values: &mut [F128; 16], twiddles: &[F128; 15]) {
     #[inline(always)]

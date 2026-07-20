@@ -345,7 +345,7 @@ mod tests {
             (12, 1, 2),
             (12, 2, 1),
             (14, 2, 3),
-            // k_code=12, 64 lanes: crosses the ARM seeded-fusion gate.
+            // k_code=12, 64 lanes: crosses the ARM layer-3 seed gate.
             (24, 1, 6),
         ] {
             let params = PcsParams {

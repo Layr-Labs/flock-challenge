@@ -112,9 +112,6 @@ const SHA256_IV: [u32; 8] = [
 #[path = "merkle/aarch64.rs"]
 mod sha256x4;
 
-#[cfg(all(target_arch = "aarch64", target_feature = "sha2"))]
-pub(crate) use sha256x4::hash4_pow;
-
 /// Four SHA-256 streams interleaved across the x86 SHA-NI pipeline.
 ///
 /// SHA-NI accelerates one stream but retains a dependent state chain. Running
