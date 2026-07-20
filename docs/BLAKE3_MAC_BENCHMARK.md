@@ -5,7 +5,7 @@ The benchmark has one untrusted process and one trusted process.
 - The **candidate prover** links the solver-editable Flock source, receives a
   fresh private block-set seed, produces one BLAKE3 proof, writes it, and exits.
 - The **trusted driver/verifier** is a committed arm64 binary built from reviewed
-  source commit `146f2f73520171a7754f87ab2983034eecb187cc`. That
+  source commit `44844f05847e381b094bf04fb19aaec0223ce801`. That
   commit retains the original Flock verifier and imports from upstream commit
   `85fc0e7cc002e7ca4dffdff805ba89976e9a5293`. It owns the private input, timer,
   verification, and score file.
@@ -59,7 +59,7 @@ signature, then builds only the candidate prover. `benchmark.sh` verifies the
 checksum again immediately before execution.
 
 Current SHA-256:
-`01a2762247bd7cb710b92e4b444eec597cf9802782fc39b8417f931fc7f7b6b9`.
+`c61a34759f69bd5863fb252ece81845440be5f9ed2c38f7f970c2ac224ca5127`.
 
 The binary is reviewable through `benchmark-tools/harness/src/main.rs`. Benchmark
 authors regenerate it—not solvers—with:

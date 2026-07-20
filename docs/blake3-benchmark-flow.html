@@ -384,13 +384,13 @@
         <h2>The judge is built before submissions exist.</h2>
         <p class="lede">Ranked setup never compiles verifier source. The repository carries an arm64 verifier built from one reviewed source commit and protects it with a committed digest.</p>
         <div class="build-flow">
-          <article class="build-step"><b>01 / REVIEWED COMMIT</b><h3>Freeze the source tree</h3><p>Benchmark commit <code>146f2f7…b187cc</code> contains the harness atop the re-signed tree matching upstream Flock <code>85fc0e7…5293</code>.</p></article>
+          <article class="build-step"><b>01 / REVIEWED COMMIT</b><h3>Freeze the source tree</h3><p>Benchmark commit <code>44844f0…3ce801</code> contains the harness atop the re-signed tree matching upstream Flock <code>85fc0e7…5293</code>.</p></article>
           <article class="build-step"><b>02 / DETACHED WORKTREE</b><h3>Build exactly that commit</h3><p>The author-only script refuses a dirty checkout and uses Rust 1.97.0 with <code>target-cpu=apple-m1</code>.</p></article>
           <article class="build-step"><b>03 / COMMITTED ARTIFACT</b><h3>Publish one Mach-O</h3><p>The binary contains the generator, timer, decoder, pristine Flock verifier and imports, commitment check, and score writer.</p></article>
           <article class="build-step"><b>04 / RANKED EXECUTION</b><h3>Verify bytes twice</h3><p><code>setup.sh</code> checks SHA-256 and signing; <code>benchmark.sh</code> checks SHA-256 again immediately before use.</p></article>
         </div>
-        <p class="hash">Committed verifier SHA-256: 01a2762247bd7cb710b92e4b444eec597cf9802782fc39b8417f931fc7f7b6b9</p>
-        <p class="strong-note"><strong>Published provenance:</strong> the committed verifier is built from reviewed commit <code>146f2f73520171a7754f87ab2983034eecb187cc</code>. Ranked setup verifies its committed SHA-256 and macOS code signature before use.</p>
+        <p class="hash">Committed verifier SHA-256: c61a34759f69bd5863fb252ece81845440be5f9ed2c38f7f970c2ac224ca5127</p>
+        <p class="strong-note"><strong>Published provenance:</strong> the committed verifier is built from reviewed commit <code>44844f05847e381b094bf04fb19aaec0223ce801</code>. Ranked setup verifies its committed SHA-256 and macOS code signature before use.</p>
       </section>
 
       <section id="surface">
