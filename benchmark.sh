@@ -4,11 +4,13 @@ set -euo pipefail
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "${root}"
 
-# Ranked defaults: 2^16 = 65,536 compressions, best of three trials.
+# Ranked defaults: 2^18 compressions, 20 verified warm-ups, then 100 measured
+# trials scored from P10 latency.
 # Environment overrides exist only for local smoke tests and diagnostics.
-log2_size="${BLAKE3_LOG2:-16}"
+log2_size="${BLAKE3_LOG2:-18}"
 threads="${BLAKE3_THREADS:-auto}"
-runs="${BLAKE3_RUNS:-3}"
+warmup_runs="${BLAKE3_WARMUP_RUNS:-20}"
+runs="${BLAKE3_RUNS:-100}"
 output_dir="${BENCHMARK_OUTPUT_DIR:-benchmark-results}"
 
 # Prefer Apple performance cores. This configures the normal Rayon pool; it is
@@ -68,7 +70,7 @@ fi
 # The trusted verifier owns the private seed, external timer, proof checking,
 # and score writing. It launches one fresh sandboxed worker per trial.
 args=("${worker}" "${scratch}" "${root}/score.json" "${output_dir}/summary.md"
-  "${log2_size}" "${threads}" "${runs}")
+  "${log2_size}" "${threads}" "${warmup_runs}" "${runs}")
 [[ -z "${sandbox_profile}" ]] || args+=("${sandbox_profile}")
 "${verifier}" "${args[@]}"
 

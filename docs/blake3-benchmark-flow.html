@@ -319,9 +319,9 @@
           <article class="protocol-step candidate"><span class="number">02 / BUILD</span><h3>Compile the worker</h3><p>Protected wrapper plus editable Flock sources become one candidate binary.</p></article>
           <article class="protocol-step candidate"><span class="number">03 / WARM</span><h3>Prepare one process</h3><p>A fresh worker creates setup, proves one fixed public warm-up, and signals ready.</p></article>
           <article class="protocol-step trusted"><span class="number">04 / CHALLENGE</span><h3>Draw and send a seed</h3><p>The verifier starts its clock, then sends a fresh 64-bit seed over stdin.</p></article>
-          <article class="protocol-step candidate"><span class="number">05 / PROVE</span><h3>Write one proof</h3><p>Generate 65,536 inputs, witness, commitment, proof, and versioned file; then exit.</p></article>
+          <article class="protocol-step candidate"><span class="number">05 / PROVE</span><h3>Write one proof</h3><p>Generate 262,144 inputs, witness, commitment, proof, and versioned file; then exit.</p></article>
           <article class="protocol-step trusted"><span class="number">06 / VERIFY</span><h3>Rebuild the statement</h3><p>Stop time, reconstruct the private witness commitment, and run pristine verification.</p></article>
-          <article class="protocol-step verified"><span class="number">07 / SCORE</span><h3>Accept all three</h3><p>Only after every trial passes, write the typed JSON score from the fastest trial.</p></article>
+          <article class="protocol-step verified"><span class="number">07 / SCORE</span><h3>Accept all 120</h3><p>Discard 20 verified machine warm-ups, take P10 latency over 100 measured trials, then write typed JSON.</p></article>
         </div>
       </section>
 
@@ -331,7 +331,7 @@
         <p class="lede">Each operation proves one raw BLAKE3 compression with a generated chaining value, one 64-byte message block, and a counter. Input generation through proof-file write and worker exit is timed.</p>
         <div class="split">
           <article class="panel">
-            <div class="panel-head"><h3>One generated operation</h3><span>65,536 per timed proof</span></div>
+            <div class="panel-head"><h3>One generated operation</h3><span>262,144 per timed proof</span></div>
             <div class="panel-body">
               <div class="tuple"><code>(cv: [u32; 8], message: [u32; 16], counter: u64, block_len: 64, flags: 11)</code></div>
               <p>A private seed expands deterministically into the complete batch. Every timed trial uses a new seed.</p>
@@ -339,13 +339,13 @@
           </article>
           <article class="panel">
             <div class="panel-head"><h3>Ranking formula</h3><span>higher is better</span></div>
-            <div class="formula"><div><code>score = 65,536 / min(trial_seconds)</code><small>verified BLAKE3 compressions per second</small></div></div>
+            <div class="formula"><div><code>score = 262,144 / P10(measured seconds)</code><small>verified BLAKE3 compressions per second</small></div></div>
           </article>
         </div>
         <div class="facts">
-          <div class="fact"><b>3</b><span>fresh timed workers and proof files</span></div>
-          <div class="fact"><b>3</b><span>fixed-seed, untimed warm-up proofs</span></div>
-          <div class="fact"><b>196,608</b><span>private compressions timed per ranked run</span></div>
+          <div class="fact"><b>20</b><span>private verified machine warm-up trials, discarded</span></div>
+          <div class="fact"><b>100</b><span>private verified trials in the P10 score</span></div>
+          <div class="fact"><b>26,214,400</b><span>private compressions in the scored population</span></div>
           <div class="fact"><b>500,000 B</b><span>per-proof limit enforced by the trusted verifier</span></div>
         </div>
       </section>
@@ -360,7 +360,7 @@
             <div class="lane-body">
               <div class="lane-node"><h3>Protected process contract</h3><p>Creates setup, runs the fixed warm-up, reads one seed, invokes <code>prove_fast</code>, serializes one proof, and exits.</p></div>
               <div class="lane-node"><h3>Editable proving implementation</h3><p>The current submission's <code>flock-core/src</code> and <code>flock-prover/src</code> are linked here.</p></div>
-              <div class="lane-node"><h3>Seatbelt confinement</h3><p>No network, no child process, and no writes outside private scratch. Environment is cleared except for threads and <code>TMPDIR</code>.</p></div>
+              <div class="lane-node"><h3>Seatbelt confinement</h3><p>No network, no child process, and no writes outside private scratch. The verifier wipes scratch between workers, preventing warm-up precomputation from persisting.</p></div>
             </div>
           </div>
           <div class="wire">
@@ -373,7 +373,7 @@
             <div class="lane-body">
               <div class="lane-node"><h3>Private input owner</h3><p>Reads 8 bytes from <code>/dev/urandom</code> after readiness and reconstructs the same compression tuples later.</p></div>
               <div class="lane-node"><h3>Clock and verdict owner</h3><p>Starts before seed delivery, stops after worker exit, then validates bytes, commitment, parameters, and proof.</p></div>
-              <div class="lane-node"><h3>Score owner</h3><p>Serializes <code>score.json</code> only after all three timed proofs verify.</p></div>
+              <div class="lane-node"><h3>Score owner</h3><p>Serializes <code>score.json</code> only after all 20 warm-up and 100 measured proofs verify.</p></div>
             </div>
           </div>
         </div>
@@ -416,7 +416,7 @@
       <section id="trial">
         <div class="section-label">One timed trial</div>
         <h2>The private seed defines the timing boundary.</h2>
-        <p class="lede">Each of the three trials gets a fresh process and seed. Verification is deliberately outside the prover score but remains mandatory.</p>
+        <p class="lede">Each of the 120 trials gets a fresh process and seed. The first 20 warm the machine; P10 over the next 100 determines the score. Verification is outside each timer but mandatory for every proof.</p>
         <div class="timeline">
           <div class="timeline-head"><div>Phase</div><div>Trusted clock</div><div>Candidate worker</div><div>Prebuilt verifier</div></div>
           <div class="timeline-row">
@@ -441,7 +441,7 @@
             <div class="phase">T3<br>CHECK</div>
             <div><span class="cell-label">Stopped</span><p>Elapsed time is captured only after successful exit.</p></div>
             <div><span class="cell-label">No further work</span><div class="blank">process exited</div></div>
-            <div class="verified-cell"><span class="cell-label">Required</span><p>Strictly decode, rebuild input/witness/commitment, compare, verify, record, and delete trial files.</p></div>
+            <div class="verified-cell"><span class="cell-label">Required</span><p>Strictly decode, rebuild input/witness/commitment, compare, verify, record, and wipe all writable scratch before the next worker.</p></div>
           </div>
         </div>
       </section>
@@ -454,7 +454,7 @@
           <article class="card"><b>01 / SUCCESSFUL EXIT</b><p>The timer stops only when the worker exits zero within the deadline. A ready message or partial file cannot stop it.</p></article>
           <article class="card"><b>02 / BOUNDED FILE</b><p>Require a nonempty proof within the trusted byte limit before allocation and decoding.</p></article>
           <article class="card"><b>03 / EXACT FORMAT</b><p>Require FLOCK magic, current version, R1CS flavor, fixed-width bincode, and no trailing bytes.</p></article>
-          <article class="card"><b>04 / REBUILT INPUT</b><p>Expand the same undisclosed seed into the exact 65,536 compression tuples.</p></article>
+          <article class="card"><b>04 / REBUILT INPUT</b><p>Expand the same undisclosed seed into the exact 262,144 compression tuples.</p></article>
           <article class="card"><b>05 / EQUAL COMMITMENT</b><p>Regenerate the pristine packed witness; require root and every PCS parameter to match.</p></article>
           <article class="card"><b>06 / PRISTINE VERIFICATION</b><p>Run compiled-in <code>Blake3Setup::verify</code> under the fixed <code>flock-bench-v0</code> transcript domain.</p></article>
         </div>
@@ -463,32 +463,36 @@
       <section id="score">
         <div class="section-label">Score file</div>
         <h2>One typed JSON object, written after all checks.</h2>
-        <p class="lede">The verifier selects the shortest of three valid durations and serializes Rust <code>ScoreFile</code> and <code>ScoreMetrics</code> values with Serde.</p>
+        <p class="lede">The verifier discards 20 verified warm-up durations, linearly interpolates P10 over 100 measured durations, and serializes Rust <code>ScoreFile</code> and <code>ScoreMetrics</code> values with Serde.</p>
         <div class="score-grid">
           <article class="panel">
             <div class="panel-head"><h3>Example ranked output</h3><span>repository-root score.json</span></div>
             <pre>{
-  <span class="cool">"score"</span>: <span class="warm">517991.6375997844</span>,
+  <span class="cool">"score"</span>: <span class="warm">490733.552609</span>,
   <span class="cool">"metrics"</span>: {
-    <span class="cool">"trial_seconds"</span>: [
-      <span class="warm">0.12862425</span>,
-      <span class="warm">0.126519417</span>,
-      <span class="warm">0.132488042</span>
-    ],
-    <span class="cool">"batch_size"</span>: <span class="warm">65536</span>,
+    <span class="cool">"warmup_trial_seconds"</span>: [<span class="warm">0.5351, 0.5344, …</span>],
+    <span class="cool">"trial_seconds"</span>: [<span class="warm">0.5338, 0.5362, …</span>],
+    <span class="cool">"p10_seconds"</span>: <span class="warm">0.5341880509</span>,
+    <span class="cool">"median_seconds"</span>: <span class="warm">0.5407</span>,
+    <span class="cool">"aggregate_compressions_per_second"</span>: <span class="warm">484000.0</span>,
+    <span class="cool">"p90_p10_latency_ratio"</span>: <span class="warm">1.028</span>,
+    <span class="cool">"batch_size"</span>: <span class="warm">262144</span>,
+    <span class="cool">"warmup_runs"</span>: <span class="warm">20</span>,
+    <span class="cool">"measured_runs"</span>: <span class="warm">100</span>,
     <span class="cool">"threads"</span>: <span class="warm">10</span>,
-    <span class="cool">"proof_bytes"</span>: <span class="warm">395595</span>,
+    <span class="cool">"proof_bytes"</span>: <span class="warm">438123</span>,
     <span class="cool">"verified"</span>: <span class="green">true</span>
   }
 }</pre>
           </article>
           <div class="metric-list">
             <div class="metric"><code>score</code><p>The only ranked value: verified BLAKE3 compressions per second. Higher is better.</p></div>
-            <div class="metric"><code>trial_seconds</code><p>External wall-clock durations for all three successful workers.</p></div>
+            <div class="metric"><code>warmup_trial_seconds</code><p>Twenty verified machine warm-ups, visible but excluded from ranking.</p></div>
+            <div class="metric"><code>trial_seconds</code><p>All 100 verified durations used to compute P10.</p></div>
             <div class="metric"><code>batch_size · threads</code><p>Fixed work count and the selected Apple performance-core pool size.</p></div>
-            <div class="metric"><code>proof_bytes</code><p>Serialized size of the fastest trial's proof. Visible, but not ranked.</p></div>
+            <div class="metric"><code>proof_bytes</code><p>Largest accepted serialized proof in the run. Visible, but not ranked.</p></div>
             <div class="metric"><code>verified</code><p>Always true when the score exists. Any failure exits nonzero and produces no replacement score.</p></div>
-            <div class="metric"><code>unit</code><p>The current schema does not duplicate <code>compressions_per_second</code> in metrics; consumers must label the scalar correctly.</p></div>
+            <div class="metric"><code>diagnostics</code><p>Median, aggregate throughput, and p90/p10 dispersion expose behavior that P10 intentionally does not rank.</p></div>
           </div>
         </div>
       </section>
@@ -536,7 +540,7 @@
       </section>
     </main>
 
-    <footer>2^16 BLAKE3 compressions per proof · 3 private timed trials · best verified throughput · prebuilt arm64 verifier · self-hosted Apple M4 Pro</footer>
+    <footer>2^18 BLAKE3 compressions per proof · 20 verified warm-ups · P10 of 100 verified trials · prebuilt arm64 verifier · self-hosted Apple M4 Pro</footer>
   </div>
 </body>
 </html>

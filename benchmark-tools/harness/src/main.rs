@@ -18,8 +18,8 @@ use serde::Serialize;
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(300);
 const RUN_TIMEOUT: Duration = Duration::from_secs(900);
 const POLL_INTERVAL: Duration = Duration::from_micros(100);
-// A canonical 2^16 proof is at most about 409 kB for the fixed m=30 profile.
-// Leave room for serialization variation while rejecting oversized input.
+const SCORE_PERCENTILE: f64 = 0.10;
+// Sampled 2^18 proofs are about 436-438 kB. Keep the reviewed 500 kB bound.
 const MAX_PROOF_BYTES: u64 = 500_000;
 
 struct Config {
@@ -29,6 +29,7 @@ struct Config {
     summary: PathBuf,
     log2_size: u32,
     threads: usize,
+    warmup_runs: usize,
     runs: usize,
     sandbox_profile: Option<PathBuf>,
 }
@@ -46,8 +47,15 @@ struct ScoreFile {
 
 #[derive(Serialize)]
 struct ScoreMetrics {
+    warmup_trial_seconds: Vec<f64>,
     trial_seconds: Vec<f64>,
+    p10_seconds: f64,
+    median_seconds: f64,
+    aggregate_compressions_per_second: f64,
+    p90_p10_latency_ratio: f64,
     batch_size: usize,
+    warmup_runs: usize,
+    measured_runs: usize,
     threads: usize,
     proof_bytes: usize,
     verified: bool,
@@ -55,33 +63,62 @@ struct ScoreMetrics {
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config = parse_args()?;
-    std::fs::create_dir_all(&config.scratch)?;
 
-    let mut trials = Vec::with_capacity(config.runs);
-    for run in 1..=config.runs {
-        trials.push(run_trial(&config, run)?);
-    }
-
-    let best = trials
-        .iter()
-        .min_by(|left, right| left.seconds.total_cmp(&right.seconds))
-        .ok_or("no benchmark trials")?;
-    if !best.seconds.is_finite() || best.seconds <= 0.0 {
-        return Err("benchmark duration must be finite and positive".into());
+    let total_runs = config
+        .warmup_runs
+        .checked_add(config.runs)
+        .ok_or("trial count overflow")?;
+    let mut warmup_trials = Vec::with_capacity(config.warmup_runs);
+    let mut measured_trials = Vec::with_capacity(config.runs);
+    for run in 1..=total_runs {
+        let trial = run_trial(&config, run)?;
+        if run <= config.warmup_runs {
+            warmup_trials.push(trial);
+        } else {
+            measured_trials.push(trial);
+        }
     }
 
     let batch_size = 1usize << config.log2_size;
-    let throughput = batch_size as f64 / best.seconds;
-    write_results(&config, &trials, best, throughput, batch_size)?;
+    let p10_seconds = percentile_seconds(&measured_trials, SCORE_PERCENTILE)?;
+    let throughput = batch_size as f64 / p10_seconds;
+    write_results(
+        &config,
+        &warmup_trials,
+        &measured_trials,
+        throughput,
+        batch_size,
+    )?;
     println!("score={throughput:.3} compressions_per_second");
     Ok(())
 }
 
+fn percentile_seconds(
+    trials: &[Trial],
+    percentile: f64,
+) -> Result<f64, Box<dyn std::error::Error>> {
+    if trials.is_empty() || !(0.0..=1.0).contains(&percentile) {
+        return Err("invalid percentile input".into());
+    }
+    let mut seconds = trials.iter().map(|trial| trial.seconds).collect::<Vec<_>>();
+    if seconds
+        .iter()
+        .any(|seconds| !seconds.is_finite() || *seconds <= 0.0)
+    {
+        return Err("trial duration must be finite and positive".into());
+    }
+    seconds.sort_by(f64::total_cmp);
+    let rank = (seconds.len() - 1) as f64 * percentile;
+    let lower = rank.floor() as usize;
+    let upper = rank.ceil() as usize;
+    let fraction = rank - lower as f64;
+    Ok(seconds[lower] + (seconds[upper] - seconds[lower]) * fraction)
+}
+
 fn run_trial(config: &Config, run: usize) -> Result<Trial, Box<dyn std::error::Error>> {
+    reset_scratch(&config.scratch)?;
     let ready = config.scratch.join(format!("run-{run}.ready"));
     let proof = config.scratch.join(format!("run-{run}.proof"));
-    let _ = std::fs::remove_file(&ready);
-    let _ = std::fs::remove_file(&proof);
 
     let mut command = worker_command(config, &ready, &proof);
     command
@@ -118,12 +155,22 @@ fn run_trial(config: &Config, run: usize) -> Result<Trial, Box<dyn std::error::E
     }
 
     let proof_bytes = verify_proof(config.log2_size, seed, &proof)?;
-    let _ = std::fs::remove_file(ready);
-    let _ = std::fs::remove_file(proof);
+    reset_scratch(&config.scratch)?;
     Ok(Trial {
         seconds,
         proof_bytes,
     })
+}
+
+fn reset_scratch(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    if path.as_os_str().is_empty() || path == Path::new("/") {
+        return Err("refusing unsafe scratch path".into());
+    }
+    if path.exists() {
+        std::fs::remove_dir_all(path)?;
+    }
+    std::fs::create_dir_all(path)?;
+    Ok(())
 }
 
 fn worker_command(config: &Config, ready: &Path, proof: &Path) -> Command {
@@ -237,18 +284,37 @@ fn deserialize_bundle(bytes: &[u8]) -> Result<R1csProofBundleLigerito, Box<dyn s
 
 fn write_results(
     config: &Config,
-    trials: &[Trial],
-    best: &Trial,
+    warmup_trials: &[Trial],
+    measured_trials: &[Trial],
     throughput: f64,
     batch_size: usize,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let best_seconds = best.seconds;
-    let proof_bytes = best.proof_bytes;
+    let p10_seconds = percentile_seconds(measured_trials, SCORE_PERCENTILE)?;
+    let median_seconds = percentile_seconds(measured_trials, 0.50)?;
+    let p90_seconds = percentile_seconds(measured_trials, 0.90)?;
+    let total_seconds = measured_trials
+        .iter()
+        .map(|trial| trial.seconds)
+        .sum::<f64>();
+    let aggregate_throughput = batch_size as f64 * measured_trials.len() as f64 / total_seconds;
+    let proof_bytes = warmup_trials
+        .iter()
+        .chain(measured_trials)
+        .map(|trial| trial.proof_bytes)
+        .max()
+        .ok_or("no verified trials")?;
     let score = ScoreFile {
         score: throughput,
         metrics: ScoreMetrics {
-            trial_seconds: trials.iter().map(|trial| trial.seconds).collect(),
+            warmup_trial_seconds: warmup_trials.iter().map(|trial| trial.seconds).collect(),
+            trial_seconds: measured_trials.iter().map(|trial| trial.seconds).collect(),
+            p10_seconds,
+            median_seconds,
+            aggregate_compressions_per_second: aggregate_throughput,
+            p90_p10_latency_ratio: p90_seconds / p10_seconds,
             batch_size,
+            warmup_runs: warmup_trials.len(),
+            measured_runs: measured_trials.len(),
             threads: config.threads,
             proof_bytes,
             verified: true,
@@ -258,26 +324,30 @@ fn write_results(
     serde_json::to_writer_pretty(&mut score_file, &score)?;
     writeln!(score_file)?;
 
-    let trial_lines = trials
-        .iter()
-        .enumerate()
-        .map(|(index, trial)| format!("- Run {}: `{:.9} s`", index + 1, trial.seconds))
-        .collect::<Vec<_>>()
-        .join("\n");
     let summary = format!(
         concat!(
             "# Flock BLAKE3 benchmark\n\n",
             "- Batch: `{batch_size}`\n- Threads: `{threads}`\n",
+            "- Warm-up trials: `{warmup_runs}` (verified, not scored)\n",
+            "- Measured trials: `{measured_runs}`\n",
             "- Score: **{throughput:.3} compressions/second**\n",
-            "- Best: `{best:.9} s`\n- Proof: `{proof_bytes}` bytes\n",
-            "- Trusted verification: `passed`\n\n## Trials\n\n{trial_lines}\n"
+            "- P10 latency: `{p10_seconds:.9} s`\n",
+            "- Median latency: `{median_seconds:.9} s`\n",
+            "- Aggregate throughput: `{aggregate_throughput:.3} compressions/second`\n",
+            "- P90/P10 latency ratio: `{dispersion:.6}`\n",
+            "- Largest proof: `{proof_bytes}` bytes\n",
+            "- Trusted verification: `passed`\n"
         ),
         batch_size = batch_size,
         threads = config.threads,
+        warmup_runs = warmup_trials.len(),
+        measured_runs = measured_trials.len(),
         throughput = throughput,
-        best = best_seconds,
+        p10_seconds = p10_seconds,
+        median_seconds = median_seconds,
+        aggregate_throughput = aggregate_throughput,
+        dispersion = p90_seconds / p10_seconds,
         proof_bytes = proof_bytes,
-        trial_lines = trial_lines,
     );
     std::fs::write(&config.summary, summary)?;
     Ok(())
@@ -291,12 +361,13 @@ fn parse_args() -> Result<Config, Box<dyn std::error::Error>> {
     let summary = args.next().ok_or("missing SUMMARY")?.into();
     let log2_size: u32 = args.next().ok_or("missing LOG2")?.parse()?;
     let threads: usize = args.next().ok_or("missing THREADS")?.parse()?;
+    let warmup_runs: usize = args.next().ok_or("missing WARMUP_RUNS")?.parse()?;
     let runs: usize = args.next().ok_or("missing RUNS")?.parse()?;
     let sandbox_profile = args.next().map(PathBuf::from);
     if args.next().is_some() || !(8..=20).contains(&log2_size) || threads == 0 || runs == 0 {
         return Err(concat!(
             "usage: flock_benchmark_harness WORKER SCRATCH SCORE SUMMARY ",
-            "LOG2 THREADS RUNS [SANDBOX_PROFILE]"
+            "LOG2 THREADS WARMUP_RUNS RUNS [SANDBOX_PROFILE]"
         )
         .into());
     }
@@ -307,7 +378,38 @@ fn parse_args() -> Result<Config, Box<dyn std::error::Error>> {
         summary,
         log2_size,
         threads,
+        warmup_runs,
         runs,
         sandbox_profile,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Trial, percentile_seconds};
+
+    fn trials(seconds: &[f64]) -> Vec<Trial> {
+        seconds
+            .iter()
+            .map(|seconds| Trial {
+                seconds: *seconds,
+                proof_bytes: 1,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn percentile_uses_linear_interpolation() {
+        let samples = trials(&[4.0, 1.0, 3.0, 2.0]);
+        assert_eq!(percentile_seconds(&samples, 0.10).unwrap(), 1.3);
+        assert_eq!(percentile_seconds(&samples, 0.50).unwrap(), 2.5);
+        assert_eq!(percentile_seconds(&samples, 0.90).unwrap(), 3.7);
+    }
+
+    #[test]
+    fn percentile_rejects_invalid_durations() {
+        assert!(percentile_seconds(&[], 0.10).is_err());
+        assert!(percentile_seconds(&trials(&[0.0]), 0.10).is_err());
+        assert!(percentile_seconds(&trials(&[f64::NAN]), 0.10).is_err());
+    }
 }

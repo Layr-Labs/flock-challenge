@@ -13,10 +13,11 @@ For a visual version of this document, open
 
 | Property | Ranked value |
 | --- | --- |
-| Work per timed proof | `2^16 = 65,536` BLAKE3 compressions |
-| Timed trials | 3, each in a fresh worker process |
-| Warm-up | 1 fixed-seed, untimed proof inside each worker |
-| Score | `65,536 / min(valid_trial_seconds)` |
+| Work per timed proof | `2^18 = 262,144` BLAKE3 compressions |
+| Machine warm-up | 20 private, verified trials discarded before scoring |
+| Measured trials | 100, each in a fresh worker process |
+| Worker warm-up | 1 fixed-seed, untimed proof inside every worker |
+| Score | `262,144 / P10(measured_trial_seconds)` |
 | Unit | verified BLAKE3 compressions per second |
 | Direction | higher is better |
 | Correctness | every timed proof must pass the prebuilt verifier |
@@ -48,10 +49,11 @@ wrapper and the trusted verifier.
 
 Each ranked run therefore performs:
 
-- 3 timed, private, serialized, and verified proofs;
-- 196,608 timed compression operations in total;
-- 3 additional fixed-seed warm-up proofs, which are neither timed nor written
-  to the score artifact.
+- 20 timed, private, serialized, and verified machine warm-up proofs whose
+  durations are recorded but excluded from scoring;
+- 100 timed, private, serialized, and verified measured proofs;
+- 26,214,400 scored compression operations in total;
+- one additional fixed-seed, untimed proof inside each of the 120 workers.
 
 ## Scoring
 
@@ -60,19 +62,21 @@ before it writes the private seed to worker stdin until the worker exits
 successfully:
 
 ```text
-trial_throughput = 65,536 / trial_seconds
-score = max(trial_throughput across 3 verified trials)
+rank_seconds = P10(measured_trial_seconds)
+score = 262,144 / rank_seconds
 ```
 
-Equivalently, the score uses the shortest verified trial. Setup, fixed-seed
+P10 uses linear interpolation at rank `(sample_count - 1) × 0.10`; for 100
+measured trials this interpolates between the tenth and eleventh sorted
+durations. Setup, fixed-seed
 warm-up, and trusted verification are outside the timed interval. Input
 generation from the private seed, witness generation, commitment, proving,
 serialization, proof-file writing, and process exit are inside it.
 
 Proof size is a reported secondary metric, not part of the ranking formula.
-At the ranked size, sampled valid proofs were approximately 394–398 kB. The
-fixed Flock profile gives a canonical structural upper bound of about 409 kB;
-500,000 bytes leaves headroom while bounding file and deserialization work.
+At the ranked size, sampled valid proofs were approximately 436–438 kB.
+500,000 bytes leaves measured headroom while bounding file and deserialization
+work.
 
 ## Official hardware and directional local results
 
@@ -86,8 +90,9 @@ Official scores run in GitHub Actions on a dedicated self-hosted Mac with:
 - Rust 1.97.0;
 - candidate builds using `-C target-cpu=native`.
 
-The validated end-to-end run used macOS 26.4 build 25E246. Its unmodified
-candidate scored approximately 517,992 verified compressions/s. This is a
+The validated stability experiment used macOS 26.4 build 25E246. Across five
+independent sessions, the unmodified candidate averaged approximately 490,734
+verified compressions/s with 0.215% run-to-run CV. This is a
 reference observation, not a guaranteed baseline: system version, thermals,
 background load, and compiler output can move absolute throughput.
 
@@ -147,7 +152,7 @@ tree matches upstream Flock commit
 
 ## Harness and worker interaction
 
-The trusted harness repeats the following sequence three times:
+The trusted harness repeats the following sequence 120 times:
 
 1. It creates private scratch paths and starts a fresh candidate worker under
    a macOS Seatbelt profile.
@@ -156,12 +161,17 @@ The trusted harness repeats the following sequence three times:
 3. Only after readiness, the harness reads 8 bytes from `/dev/urandom`.
 4. The harness starts its external clock and writes the decimal seed plus a
    newline to worker stdin.
-5. The worker expands the seed into 65,536 inputs, runs `prove_fast`,
+5. The worker expands the seed into 262,144 inputs, runs `prove_fast`,
    serializes a `R1csProofBundleLigerito`, atomically writes the proof in
    scratch, and exits.
 6. The harness stops timing after successful process exit.
 7. The harness verifies the proof using its compiled-in pristine code.
-8. It records the duration and proof size, then deletes the trial files.
+8. It records the duration and proof size, then erases and recreates the entire
+   writable scratch directory before the next worker.
+
+The first 20 complete trials warm the machine and are excluded from ranking.
+The next 100 are the measured population used for P10. Every proof in both
+groups must verify; “warm-up” never means “unchecked.”
 
 The seed line is the only request sent to the worker. The proof file is the
 only candidate-produced object consumed by the trusted verifier. Worker stdout
@@ -189,9 +199,9 @@ For every timed proof, the prebuilt verifier requires all of the following:
 This commitment reconstruction is essential. It binds an otherwise valid
 Flock protocol proof to the exact private benchmark witness.
 
-If any trial fails, the harness exits nonzero and does not write a replacement
-score. `benchmark.sh` deletes stale score files before execution, so a failed
-run cannot upload an earlier result as a new score.
+If any warm-up or measured trial fails, the harness exits nonzero and does not
+write a replacement score. `benchmark.sh` deletes stale score files before
+execution, so a failed run cannot upload an earlier result as a new score.
 
 ## Worker sandbox
 
@@ -203,6 +213,10 @@ the candidate worker under a generated Seatbelt profile. The worker:
 - cannot use the network;
 - cannot create child processes;
 - cannot write outside its private scratch directory.
+
+The trusted harness wipes scratch between workers. Candidate code therefore
+cannot move setup or precomputation from the 20 discarded machine warm-ups
+into the 100 measured processes through files.
 
 The sandbox prevents the candidate from writing `score.json` or leaving a
 descendant to finish work after the timed worker exits. It is not a complete VM
@@ -216,26 +230,30 @@ The verifier uses typed Rust structs and Serde to write repository-root
 
 ```json
 {
-  "score": 517991.6375997844,
+  "score": 490733.552609,
   "metrics": {
-    "trial_seconds": [
-      0.12862425,
-      0.126519417,
-      0.132488042
-    ],
-    "batch_size": 65536,
+    "warmup_trial_seconds": [0.5351, 0.5344],
+    "trial_seconds": [0.5338, 0.5362],
+    "p10_seconds": 0.5341880509,
+    "median_seconds": 0.5407,
+    "aggregate_compressions_per_second": 484000.0,
+    "p90_p10_latency_ratio": 1.028,
+    "batch_size": 262144,
+    "warmup_runs": 20,
+    "measured_runs": 100,
     "threads": 10,
-    "proof_bytes": 395595,
+    "proof_bytes": 438123,
     "verified": true
   }
 }
 ```
 
 `score` is a finite number measured in verified BLAKE3 compressions per
-second. The current schema does not duplicate it as
-`metrics.compressions_per_second`; user interfaces should label the scalar
-score with that unit. `proof_bytes` belongs to the fastest trial and is
-reported for visibility only.
+second. `p10_seconds` is the scored latency statistic. Aggregate throughput,
+median latency, and p90/p10 dispersion are diagnostics rather than ranking
+inputs. `proof_bytes` is the largest accepted proof in the run and is reported
+for visibility only. The arrays above are abbreviated; ranked output contains
+all 20 warm-up and 100 measured durations.
 
 GitHub Actions uploads the exact root `score.json` as the score artifact and
 uploads `benchmark-results/` separately for diagnostics. Yukon reads the score
@@ -258,16 +276,17 @@ retries, and builds the candidate offline.
 For a quick functional smoke test, lower the batch and trial count:
 
 ```bash
-BLAKE3_LOG2=8 BLAKE3_RUNS=1 ./benchmark.sh
+BLAKE3_LOG2=8 BLAKE3_WARMUP_RUNS=0 BLAKE3_RUNS=1 ./benchmark.sh
 ```
 
 Environment overrides are for local diagnostics. The GitHub Actions workflow
 sets the ranked values explicitly:
 
 ```text
-BLAKE3_LOG2=16
+BLAKE3_LOG2=18
 BLAKE3_THREADS=auto
-BLAKE3_RUNS=3
+BLAKE3_WARMUP_RUNS=20
+BLAKE3_RUNS=100
 FLOCK_REQUIRE_SANDBOX=1
 ```
 

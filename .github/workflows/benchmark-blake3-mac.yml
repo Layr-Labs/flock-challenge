@@ -16,9 +16,10 @@ jobs:
     runs-on: [self-hosted, m4-pro]
     timeout-minutes: 180
     env:
-      BLAKE3_LOG2: "16"
+      BLAKE3_LOG2: "18"
       BLAKE3_THREADS: auto
-      BLAKE3_RUNS: "3"
+      BLAKE3_WARMUP_RUNS: "20"
+      BLAKE3_RUNS: "100"
       FLOCK_REQUIRE_SANDBOX: "1"
       RUSTFLAGS: -C target-cpu=native
       RUSTUP_TOOLCHAIN: 1.97.0

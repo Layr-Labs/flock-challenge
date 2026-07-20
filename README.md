@@ -113,9 +113,10 @@ competitor comparisons.
 ### Ranked BLAKE3 benchmark on Apple Silicon
 
 The challenge harness scores verified BLAKE3 compression-proof throughput at a
-fixed 2^16 batch on the self-hosted `m4-pro` GitHub Actions runner. Run it
-locally with `./setup.sh && ./benchmark.sh`; Yukon dispatches the Actions
-workflow on each constructed submission commit and reads its uploaded JSON
+fixed 2^18 batch on the self-hosted `m4-pro` GitHub Actions runner. It verifies
+20 machine warm-up trials, then ranks `2^18 / P10(seconds)` across 100 measured
+trials. Run it locally with `./setup.sh && ./benchmark.sh`; Yukon dispatches the
+Actions workflow on each constructed submission commit and reads its uploaded JSON
 score. Solvers may optimize all Rust source in `flock-core` and `flock-prover`,
 but the timer, score writer, and verifier are compiled against the fixed
 original Flock commit and committed as a checksum-protected arm64 binary. It

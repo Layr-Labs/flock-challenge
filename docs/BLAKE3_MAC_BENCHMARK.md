@@ -18,9 +18,11 @@ GitHub Actions/Yukon handoff.
 ## Ranked contract
 
 - Runner: dedicated Apple M4 Pro runner labeled `m4-pro`
-- Work: 2^16 independent BLAKE3 compressions
+- Work: 2^18 independent BLAKE3 compressions per proof
 - Default Rayon threads: performance-core count
-- Score: `65,536 / best_seconds` from three trials; higher is better
+- Machine warm-up: 20 private, timed, verified proofs discarded from scoring
+- Measurement: 100 private, timed, verified proofs
+- Score: `262,144 / P10(measured_seconds)`; higher is better
 - Warm-up: one seed-independent `prove_fast` before each trial is ready
 - Timed interval: sending the fresh seed through prover exit, including input
   generation and serialization
@@ -28,7 +30,7 @@ GitHub Actions/Yukon handoff.
   checks the full PCS commitment, and verifies every proof
 - Toolchain: Rust 1.97.0 with `-C target-cpu=native`
 
-The private seed expands deterministically to all 65,536 test blocks. It does
+The private seed expands deterministically to all 262,144 test blocks. It does
 not enter the candidate process until the trusted binary starts the clock.
 Trusted verification runs after the timer stops and before a score is written.
 Any setup, execution, decoding, commitment, or verification failure exits
@@ -92,7 +94,7 @@ perform integrity checks and an up-to-date build without reinstalling them.
 
 ```sh
 ./setup.sh
-BLAKE3_LOG2=8 BLAKE3_THREADS=1 BLAKE3_RUNS=2 ./benchmark.sh
+BLAKE3_LOG2=8 BLAKE3_THREADS=1 BLAKE3_WARMUP_RUNS=0 BLAKE3_RUNS=2 ./benchmark.sh
 ```
 
 The ranked workflow sets `FLOCK_REQUIRE_SANDBOX=1`. Local runs warn and proceed
