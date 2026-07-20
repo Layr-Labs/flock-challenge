@@ -22,6 +22,29 @@ pub(in super::super) fn bit_transpose_64bytes_scalar(input: &[u8; 64], output: &
     }
 }
 
+/// Scalar seven-byte-prefix transpose. For input byte indices 0..7,
+/// `x_small=0`, so each output is simply one expanded bit in the corresponding
+/// `b_chunk` group; every later output is zero.
+#[inline]
+pub(in super::super) fn bit_transpose_64bytes_prefix_7_scalar(
+    input: &[u8; 64],
+    output: &mut [u8; 64],
+) {
+    for b_chunk in 0..7 {
+        let byte = input[b_chunk];
+        let base = b_chunk * 8;
+        output[base] = byte & 1;
+        output[base + 1] = (byte >> 1) & 1;
+        output[base + 2] = (byte >> 2) & 1;
+        output[base + 3] = (byte >> 3) & 1;
+        output[base + 4] = (byte >> 4) & 1;
+        output[base + 5] = (byte >> 5) & 1;
+        output[base + 6] = (byte >> 6) & 1;
+        output[base + 7] = byte >> 7;
+    }
+    output[56..].fill(0);
+}
+
 /// Scalar shift-reduce kernel and oracle for the architecture backends.
 #[allow(dead_code)]
 #[allow(clippy::too_many_arguments)]

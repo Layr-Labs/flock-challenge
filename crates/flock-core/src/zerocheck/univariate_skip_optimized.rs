@@ -467,7 +467,11 @@ fn process_one_x_hi(
             let c_in: &[u8; 64] = (&c_packed[byte_base_b..byte_base_b + 64])
                 .try_into()
                 .expect("64 c-bytes per medium position");
-            bit_transpose_64bytes(c_in, &mut state.chunk_c_bytes[b_med]);
+            if last_bytes == 7 {
+                kernels::bit_transpose_64bytes_prefix_7(c_in, &mut state.chunk_c_bytes[b_med]);
+            } else {
+                bit_transpose_64bytes(c_in, &mut state.chunk_c_bytes[b_med]);
+            }
 
             kernels::accumulate_convert(
                 &state.chunk_ab_bytes,
@@ -651,7 +655,11 @@ fn process_one_x_hi_with_s_hat_v(
             let c_in: &[u8; 64] = (&c_packed[byte_base_b..byte_base_b + 64])
                 .try_into()
                 .expect("64 c-bytes per medium position");
-            bit_transpose_64bytes(c_in, &mut state.chunk_c_bytes[b_med]);
+            if last_bytes == 7 {
+                kernels::bit_transpose_64bytes_prefix_7(c_in, &mut state.chunk_c_bytes[b_med]);
+            } else {
+                bit_transpose_64bytes(c_in, &mut state.chunk_c_bytes[b_med]);
+            }
 
             kernels::accumulate_convert_with_s_hat_v(
                 &state.chunk_ab_bytes,
@@ -1328,6 +1336,23 @@ mod tests {
                 dense_c, padded_c,
                 "C mismatch: k_log={k_log}, useful={useful_bits}, m={m}"
             );
+        }
+    }
+
+    #[test]
+    fn prefix_7_bit_transpose_matches_full_zero_padded() {
+        let mut rng = Rng::new(0xC_15409);
+        for _ in 0..64 {
+            let mut input = [0u8; 64];
+            for byte in &mut input[..7] {
+                *byte = rng.next_u64() as u8;
+            }
+            input[6] &= 1;
+            let mut full = [0u8; 64];
+            let mut prefix = [0u8; 64];
+            kernels::bit_transpose_64bytes(&input, &mut full);
+            kernels::bit_transpose_64bytes_prefix_7(&input, &mut prefix);
+            assert_eq!(prefix, full);
         }
     }
 

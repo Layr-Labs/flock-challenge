@@ -50,6 +50,13 @@ pub(super) fn bit_transpose_64bytes(input: &[u8; 64], output: &mut [u8; 64]) {
     portable::bit_transpose_64bytes_scalar(input, output);
 }
 
+/// Transpose a 64-byte row whose honest useful prefix occupies seven bytes.
+/// The remaining 57 bytes are known zero from the padding specification.
+#[inline]
+pub(super) fn bit_transpose_64bytes_prefix_7(input: &[u8; 64], output: &mut [u8; 64]) {
+    portable::bit_transpose_64bytes_prefix_7_scalar(input, output);
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(super) fn shift_reduce_inner_ab(
     a_packed: &[u8],
