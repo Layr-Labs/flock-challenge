@@ -222,6 +222,121 @@ impl AdditiveNttF128 {
         }
     }
 
+    /// Reed--Solomon encode an interleaved message into `codeword`.
+    ///
+    /// `msg` holds the non-zero coefficient prefix in position-major SoA
+    /// layout and `codeword` is larger by a power-of-two inverse-rate factor.
+    /// Every codeword slot is overwritten, so its incoming contents may be
+    /// stale. This is semantically identical to zero-padding `msg` and running
+    /// [`Self::forward_transform_interleaved`] from layer zero.
+    ///
+    /// On large AArch64 rate-1/2 transforms, replication and NTT layers 1--3
+    /// are fused into one out-of-place pass. Other geometries retain the
+    /// replica-fill plus from-layer scheduler.
+    pub(crate) fn rs_encode_interleaved(
+        &self,
+        msg: &[F128],
+        codeword: &mut [F128],
+        num_ntts: usize,
+    ) {
+        assert!(num_ntts.is_power_of_two() && num_ntts > 0);
+        assert!(!msg.is_empty());
+        assert_eq!(msg.len() % num_ntts, 0);
+        assert_eq!(codeword.len() % msg.len(), 0);
+
+        let inv_rate = codeword.len() / msg.len();
+        assert!(inv_rate.is_power_of_two() && inv_rate > 1);
+        let log_inv_rate = log2_pow2(inv_rate);
+        let n_positions = codeword.len() / num_ntts;
+        let log_d = log2_pow2(n_positions);
+        assert!(log_inv_rate <= log_d);
+        assert_eq!(msg.len() / num_ntts, 1usize << (log_d - log_inv_rate));
+        assert!(log_d <= self.log_domain_size());
+
+        #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+        if log_inv_rate == 1 && log_d >= 12 {
+            self.seed_rate_half_layers_1_through_3(msg, codeword, num_ntts);
+            self.forward_transform_interleaved_from_layer(codeword, num_ntts, 4);
+            return;
+        }
+
+        replicate_message_fill(codeword, msg);
+        self.forward_transform_interleaved_from_layer(codeword, num_ntts, log_inv_rate);
+    }
+
+    /// Write the exact post-layer-3 state for a rate-1/2 encoding directly
+    /// from its message. Layer zero turns `[msg, 0]` into `[msg, msg]`; each
+    /// half then follows its own fused three-layer twiddle tree.
+    #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+    fn seed_rate_half_layers_1_through_3(
+        &self,
+        msg: &[F128],
+        codeword: &mut [F128],
+        num_ntts: usize,
+    ) {
+        use rayon::prelude::*;
+
+        debug_assert_eq!(codeword.len(), 2 * msg.len());
+        let msg_positions = msg.len() / num_ntts;
+        debug_assert!(msg_positions >= 8 && msg_positions.is_power_of_two());
+        let eighth = msg_positions >> 3;
+
+        let mut twiddles = [[F128::ZERO; 7]; 2];
+        for (block, tw) in twiddles.iter_mut().enumerate() {
+            tw[0] = self.twiddle(1, block);
+            for s in 0..2 {
+                tw[1 + s] = self.twiddle(2, 2 * block + s);
+            }
+            for s in 0..4 {
+                tw[3 + s] = self.twiddle(3, 4 * block + s);
+            }
+        }
+        debug_assert_eq!(twiddles[0][0], F128::ZERO);
+        debug_assert_eq!(twiddles[0][1], F128::ZERO);
+        debug_assert_eq!(twiddles[0][3], F128::ZERO);
+        let sparse_twiddles = [
+            twiddles[0][2],
+            twiddles[0][4],
+            twiddles[0][5],
+            twiddles[0][6],
+        ];
+
+        // Carry addresses as integers because raw pointers are not Sync. Each
+        // r owns eight disjoint rows in each output half. Keeping the two
+        // block calls adjacent reuses their shared 8 KiB production input row
+        // group from L1 while limiting live state to eight F128 values.
+        let src = msg.as_ptr() as usize;
+        let dst = codeword.as_mut_ptr() as usize;
+        let msg_len = msg.len();
+        let seed_row = |r| unsafe {
+            kernels::butterfly_fused_3layer_row_from_sparse(
+                src as *const F128,
+                dst as *mut F128,
+                eighth,
+                num_ntts,
+                r,
+                &sparse_twiddles,
+            );
+            kernels::butterfly_fused_3layer_row_from(
+                src as *const F128,
+                (dst as *mut F128).add(msg_len),
+                eighth,
+                num_ntts,
+                r,
+                &twiddles[1],
+            );
+        };
+
+        const PARALLEL_ROW_THRESHOLD: usize = 256;
+        if eighth < PARALLEL_ROW_THRESHOLD {
+            for r in 0..eighth {
+                seed_row(r);
+            }
+        } else {
+            (0..eighth).into_par_iter().for_each(seed_row);
+        }
+    }
+
     /// Scalar reference for the interleaved forward NTT.
     pub fn forward_transform_interleaved_scalar(&self, data: &mut [F128], num_ntts: usize) {
         self.forward_transform_interleaved_scalar_from_layer(data, num_ntts, 0);
@@ -923,6 +1038,30 @@ fn log2_pow2(n: usize) -> usize {
     n.trailing_zeros() as usize
 }
 
+/// Fill `codeword` with power-of-two replicas of `msg`, the exact state after
+/// the zero-padded transform's initial copy-only layers.
+fn replicate_message_fill(codeword: &mut [F128], msg: &[F128]) {
+    use rayon::prelude::*;
+
+    let msg_len = msg.len();
+    debug_assert!(codeword.len().is_multiple_of(msg_len));
+    const COPY_CHUNK: usize = 1 << 16;
+    if msg_len >= COPY_CHUNK {
+        // Both lengths are powers of two, so chunks never cross a replica.
+        codeword
+            .par_chunks_mut(COPY_CHUNK)
+            .enumerate()
+            .for_each(|(i, dst)| {
+                let src_off = (i * COPY_CHUNK) % msg_len;
+                dst.copy_from_slice(&msg[src_off..src_off + dst.len()]);
+            });
+    } else {
+        for replica in codeword.chunks_mut(msg_len) {
+            replica.copy_from_slice(msg);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1077,6 +1216,72 @@ mod tests {
                     "interleaved mismatch at log_d={log_d}, num_ntts={num_ntts}"
                 );
             }
+        }
+    }
+
+    /// The semantic RS encoder must overwrite stale output and match the
+    /// definitional zero-padded full transform across rates and lane widths.
+    /// The final case crosses the ARM seeded-fusion dispatch threshold with
+    /// the production lane count.
+    #[test]
+    fn rs_encode_matches_zero_padded_full_ntt() {
+        let mut rng = Rng::new(0x5EED);
+        for (log_d, num_ntts, log_inv_rate) in [
+            (4usize, 1usize, 1usize),
+            (5, 2, 1),
+            (8, 8, 1),
+            (10, 8, 2),
+            (12, 64, 1),
+        ] {
+            let ntt = AdditiveNttF128::standard(log_d);
+            let codeword_len = (1usize << log_d) * num_ntts;
+            let msg_len = codeword_len >> log_inv_rate;
+            let msg = rand_vec(&mut rng, msg_len);
+
+            let mut encoded = rand_vec(&mut rng, codeword_len);
+            ntt.rs_encode_interleaved(&msg, &mut encoded, num_ntts);
+
+            let mut oracle = vec![F128::ZERO; codeword_len];
+            oracle[..msg_len].copy_from_slice(&msg);
+            ntt.forward_transform_interleaved_scalar(&mut oracle, num_ntts);
+            assert_eq!(
+                encoded, oracle,
+                "RS encoding mismatch at log_d={log_d}, num_ntts={num_ntts}, r={log_inv_rate}"
+            );
+        }
+    }
+
+    /// Exercise the direct layer-3 seed independently of its production-size
+    /// dispatch gate, including serial and parallel row scheduling.
+    #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+    #[test]
+    fn rate_half_layer3_seed_matches_full_ntt() {
+        let mut rng = Rng::new(0xD1EC7);
+        for (log_d, num_ntts, threads) in
+            [(4usize, 1usize, 1usize), (5, 2, 1), (8, 8, 1), (12, 64, 4)]
+        {
+            let ntt = AdditiveNttF128::standard(log_d);
+            let codeword_len = (1usize << log_d) * num_ntts;
+            let msg_len = codeword_len >> 1;
+            let msg = rand_vec(&mut rng, msg_len);
+            let mut encoded = rand_vec(&mut rng, codeword_len);
+
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .unwrap()
+                .install(|| {
+                    ntt.seed_rate_half_layers_1_through_3(&msg, &mut encoded, num_ntts);
+                    ntt.forward_transform_interleaved_from_layer(&mut encoded, num_ntts, 4);
+                });
+
+            let mut oracle = vec![F128::ZERO; codeword_len];
+            oracle[..msg_len].copy_from_slice(&msg);
+            ntt.forward_transform_interleaved_scalar(&mut oracle, num_ntts);
+            assert_eq!(
+                encoded, oracle,
+                "direct seed mismatch at log_d={log_d}, num_ntts={num_ntts}, threads={threads}"
+            );
         }
     }
 

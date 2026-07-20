@@ -2361,17 +2361,12 @@ pub(crate) fn ligero_commit(
     assert_eq!(poly.len(), num_interleaved * msg_cols);
     assert!(log_block_len <= ntt.log_domain_size());
 
-    // LSB-lane layout: input matches the SoA layout `data[pos * num_interleaved + lane]`
-    // directly. The first `log_inv_rate` NTT layers on the zero-padded
-    // coefficients are pure copies, so fill the matrix with 2^log_inv_rate
-    // replicas of `poly` (same write cost as copy + zero-fill) and start the
-    // transform past those layers — see `pcs::commit::replicate_message_fill`.
+    // LSB-lane input already matches the position-major SoA codeword layout.
+    // The semantic encoder owns zero-padding shortcuts and target-specific
+    // fusion while overwriting every slot of the recycled matrix.
     let codeword_len = block_len * num_interleaved;
     let mut mat = crate::scratch::take_f128(codeword_len);
-    super::commit::replicate_message_fill(&mut mat, poly);
-
-    // RS-encode every lane in one call (each lane is one independent NTT).
-    ntt.forward_transform_interleaved_from_layer(&mut mat, num_interleaved, log_inv_rate);
+    ntt.rs_encode_interleaved(poly, &mut mat, num_interleaved);
 
     // Merkle over rows. One leaf = `num_interleaved` consecutive F128 = 16·num_interleaved bytes.
     let leaf_size_bytes = num_interleaved * core::mem::size_of::<F128>();

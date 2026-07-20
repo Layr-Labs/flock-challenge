@@ -87,6 +87,107 @@ pub(super) unsafe fn butterfly_fused_3layer_row(
     }
 }
 
+/// # Safety
+/// The caller guarantees that every selected source and destination row is
+/// valid, source and destination do not overlap, and concurrent calls write
+/// disjoint destination row groups.
+#[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+pub(super) unsafe fn butterfly_fused_3layer_row_from(
+    src: *const F128,
+    dst: *mut F128,
+    eighth: usize,
+    num_ntts: usize,
+    r: usize,
+    twiddles: &[F128; 7],
+) {
+    #[inline(always)]
+    fn butterfly(values: &mut [F128; 8], u: usize, v: usize, twiddle: F128) {
+        let new_u = values[u] + values[v] * twiddle;
+        values[v] += new_u;
+        values[u] = new_u;
+    }
+
+    // SAFETY: caller supplies the pointer geometry and disjointness contract.
+    unsafe {
+        for lane in 0..num_ntts {
+            let mut values = [F128::ZERO; 8];
+            for (i, value) in values.iter_mut().enumerate() {
+                *value = *src.add((i * eighth + r) * num_ntts + lane);
+            }
+            for i in 0..4 {
+                butterfly(&mut values, i, i + 4, twiddles[0]);
+            }
+            for s in 0..2 {
+                for i in 0..2 {
+                    butterfly(&mut values, 4 * s + i, 4 * s + i + 2, twiddles[1 + s]);
+                }
+            }
+            for s in 0..4 {
+                butterfly(&mut values, 2 * s, 2 * s + 1, twiddles[3 + s]);
+            }
+            for (i, value) in values.iter().enumerate() {
+                *dst.add((i * eighth + r) * num_ntts + lane) = *value;
+            }
+        }
+    }
+}
+
+/// # Safety
+/// The caller guarantees that every selected source and destination row is
+/// valid, source and destination do not overlap, and concurrent calls write
+/// disjoint destination row groups.
+#[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+pub(super) unsafe fn butterfly_fused_3layer_row_from_sparse(
+    src: *const F128,
+    dst: *mut F128,
+    eighth: usize,
+    num_ntts: usize,
+    r: usize,
+    twiddles: &[F128; 4],
+) {
+    #[inline(always)]
+    fn butterfly(values: &mut [F128; 8], u: usize, v: usize, twiddle: F128) {
+        let new_u = values[u] + values[v] * twiddle;
+        values[v] += new_u;
+        values[u] = new_u;
+    }
+
+    // Breadth-first non-zero twiddles for block zero:
+    // [layer2-right, layer3 blocks 1, 2, 3]. The seven omitted butterflies
+    // have t=0, so `(u, v)` becomes `(u, v+u)` without a field multiply.
+    let [t_l2_right, t_l3_1, t_l3_2, t_l3_3] = *twiddles;
+    unsafe {
+        for lane in 0..num_ntts {
+            let mut values = [F128::ZERO; 8];
+            for (i, value) in values.iter_mut().enumerate() {
+                *value = *src.add((i * eighth + r) * num_ntts + lane);
+            }
+
+            // Layer 1: all four twiddles are zero.
+            values[4] += values[0];
+            values[5] += values[1];
+            values[6] += values[2];
+            values[7] += values[3];
+
+            // Layer 2: the left two butterflies have zero twiddle.
+            values[2] += values[0];
+            values[3] += values[1];
+            butterfly(&mut values, 4, 6, t_l2_right);
+            butterfly(&mut values, 5, 7, t_l2_right);
+
+            // Layer 3: only the first butterfly has zero twiddle.
+            values[1] += values[0];
+            butterfly(&mut values, 2, 3, t_l3_1);
+            butterfly(&mut values, 4, 5, t_l3_2);
+            butterfly(&mut values, 6, 7, t_l3_3);
+
+            for (i, value) in values.iter().enumerate() {
+                *dst.add((i * eighth + r) * num_ntts + lane) = *value;
+            }
+        }
+    }
+}
+
 #[inline]
 pub(super) fn butterfly_fused_4layer(values: &mut [F128; 16], twiddles: &[F128; 15]) {
     #[inline(always)]

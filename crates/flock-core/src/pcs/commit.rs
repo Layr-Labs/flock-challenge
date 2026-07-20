@@ -148,30 +148,22 @@ pub fn commit(z_packed: &[F128], params: &PcsParams) -> (Commitment, ProverData)
     let codeword_len = n_positions * num_ntts;
 
     // ---- Codeword buffer (SoA): codeword[pos * num_ntts + lane].
-    // Copy first 2^log_msg_len positions from packed witness; zero-pad the rest.
-    //
-    // At large m the codeword buffer is huge (128 MB at m=29, 512 MB at m=31).
-    // `vec![F128::ZERO; n]` would eagerly zero all 128 MB upfront, then
-    // immediately overwrite the lower half with `z_packed` — half the zero-fill
-    // is wasted. Instead allocate uninit, write each half exactly once: copy
-    // `z_packed` into the lower half, and zero-fill JUST the upper half (the
-    // RS-encoding zero coefficients that the NTT's first-layer butterfly will
-    // read). Saves ~64 MB of memory writes at m=29 (~9 ms).
+    // The semantic RS encoder overwrites every slot, so take a stale resident
+    // scratch buffer without zeroing it. This is 1 GiB at the m=32 benchmark;
+    // avoiding an eager initialization pass is material.
     let codeword = crate::scratch::take_f128(codeword_len);
     commit_into(z_packed, params, codeword)
 }
 
 /// Like [`commit`], but reuses a caller-provided codeword buffer instead of
 /// allocating its own. The buffer must have length `codeword_len`; its
-/// CONTENTS may be arbitrary (uninit/stale) — every slot is written here:
-/// `z_packed` is replicated into all `2^log_inv_rate` sub-blocks (the exact
-/// state after the first `log_inv_rate` NTT layers on `[z, 0, …, 0]`), in
-/// parallel. Buffers from [`prefault_codeword_during`] or the scratch pool
-/// are already resident, so no write faults.
+/// CONTENTS may be arbitrary (uninit/stale) — every slot is written by the RS
+/// encoder. Buffers from [`prefault_codeword_during`] or the scratch pool are
+/// already resident, so no write faults.
 pub fn commit_into(
     z_packed: &[F128],
     params: &PcsParams,
-    mut codeword: Vec<F128>,
+    codeword: Vec<F128>,
 ) -> (Commitment, ProverData) {
     params.validate();
     assert_eq!(z_packed.len(), 1usize << params.log_msg_len());
@@ -182,58 +174,24 @@ pub fn commit_into(
         "commit_into: prebuilt codeword buffer has wrong length"
     );
 
-    // RS encoding of [z, 0, …, 0] starts with `log_inv_rate` butterfly layers
-    // whose bottom inputs are all zero — each is a pure copy, so after those
-    // layers the buffer holds 2^log_inv_rate replicas of z. Write that state
-    // directly (replicating z costs the same writes as the zero-fill it
-    // replaces) and start the NTT at layer `log_inv_rate`, skipping those
-    // layers' full-buffer reads and multiplies.
-    replicate_message_fill(&mut codeword, z_packed);
-
-    finalize_commit(codeword, params)
-}
-
-/// Fill `codeword` with `2^r` replicas of `msg` (`r = log2(codeword.len() /
-/// msg.len())`) — the exact state after the first `r` forward-NTT layers on
-/// the zero-padded coefficient vector `[msg, 0, …, 0]`. Pair with
-/// `forward_transform_interleaved_from_layer(…, r)`. Every slot of `codeword`
-/// is written (input contents may be stale/uninit).
-pub(crate) fn replicate_message_fill(codeword: &mut [F128], msg: &[F128]) {
-    use rayon::prelude::*;
-    let msg_len = msg.len();
-    debug_assert!(codeword.len().is_multiple_of(msg_len));
-    const COPY_CHUNK: usize = 1 << 16;
-    if msg_len >= COPY_CHUNK {
-        // Both are powers of two, so chunks never straddle a replica boundary.
-        codeword
-            .par_chunks_mut(COPY_CHUNK)
-            .enumerate()
-            .for_each(|(i, dst)| {
-                let src_off = (i * COPY_CHUNK) % msg_len;
-                dst.copy_from_slice(&msg[src_off..src_off + dst.len()]);
-            });
-    } else {
-        for rep in codeword.chunks_mut(msg_len) {
-            rep.copy_from_slice(msg);
-        }
-    }
+    finalize_commit(codeword, z_packed, params)
 }
 
 /// Shared tail of [`commit`] / [`commit_into`]: interleaved forward additive
 /// NTT (RS-encode every lane) then the initial Merkle tree over codeword rows.
-fn finalize_commit(mut codeword: Vec<F128>, params: &PcsParams) -> (Commitment, ProverData) {
+fn finalize_commit(
+    mut codeword: Vec<F128>,
+    z_packed: &[F128],
+    params: &PcsParams,
+) -> (Commitment, ProverData) {
     let timing = std::env::var_os("FLOCK_COMMIT_TIMING").is_some();
     let t_ntt = std::time::Instant::now();
-    // ---- Interleaved forward additive NTT: 2^log_batch_size independent
-    // sub-NTTs with shared twiddles. Each sub-NTT operates on its lane of the
-    // SoA buffer. The first `log_inv_rate` layers were pre-applied by the
-    // caller's replicate-fill (commit_into), so start past them.
+    // ---- Interleaved RS encoding: 2^log_batch_size independent sub-NTTs with
+    // shared twiddles. The encoder owns the zero-padding/replication shortcut
+    // and any target-specific fusion, so this timer covers the complete
+    // logical encoding stage.
     let ntt = AdditiveNttF128::standard(params.k_code());
-    ntt.forward_transform_interleaved_from_layer(
-        &mut codeword,
-        params.num_ntts(),
-        params.log_inv_rate,
-    );
+    ntt.rs_encode_interleaved(z_packed, &mut codeword, params.num_ntts());
     if timing {
         eprintln!(
             "[commit-timing] ntt: {:.2} ms",
@@ -357,6 +315,12 @@ mod tests {
         fn bits(&mut self, n: usize) -> Vec<bool> {
             (0..n).map(|_| self.next_u64() & 1 == 1).collect()
         }
+        fn f128(&mut self) -> F128 {
+            F128 {
+                lo: self.next_u64(),
+                hi: self.next_u64(),
+            }
+        }
     }
 
     fn default_params(m: usize) -> PcsParams {
@@ -376,15 +340,23 @@ mod tests {
     fn commit_matches_full_ntt_oracle() {
         use crate::ntt::AdditiveNttF128;
         let mut rng = Rng::new(0xFEED);
-        for (m, log_inv_rate, log_batch_size) in [(10, 1, 1), (12, 1, 2), (12, 2, 1), (14, 2, 3)] {
+        for (m, log_inv_rate, log_batch_size) in [
+            (10, 1, 1),
+            (12, 1, 2),
+            (12, 2, 1),
+            (14, 2, 3),
+            // k_code=12, 64 lanes: crosses the ARM seeded-fusion gate.
+            (24, 1, 6),
+        ] {
             let params = PcsParams {
                 m,
                 log_inv_rate,
                 log_batch_size,
                 profile: Default::default(),
             };
-            let z = rng.bits(1 << m);
-            let z_packed = super::super::pack::pack_witness(&z, m);
+            let z_packed: Vec<F128> = (0..1usize << params.log_msg_len())
+                .map(|_| rng.f128())
+                .collect();
 
             let (commitment, pd) = commit(&z_packed, &params);
 

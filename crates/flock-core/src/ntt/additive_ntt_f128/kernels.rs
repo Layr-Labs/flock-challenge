@@ -89,6 +89,50 @@ pub(super) unsafe fn butterfly_fused_3layer_row(
     unsafe { portable::butterfly_fused_3layer_row(ptr, eighth, num_ntts, r, twiddles) }
 }
 
+/// Process one fused-three-layer row group from a separate source buffer.
+///
+/// # Safety
+/// The caller must ensure the eight selected source rows are valid, the eight
+/// selected destination rows are valid, and concurrent calls write disjoint
+/// destination row groups. Source and destination must not overlap.
+#[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+#[inline]
+pub(super) unsafe fn butterfly_fused_3layer_row_from(
+    src: *const F128,
+    dst: *mut F128,
+    eighth: usize,
+    num_ntts: usize,
+    r: usize,
+    twiddles: &[F128; 7],
+) {
+    // SAFETY: forwarded caller contract.
+    unsafe { portable::butterfly_fused_3layer_row_from(src, dst, eighth, num_ntts, r, twiddles) }
+}
+
+/// Process the sparse-twiddle first output block of the rate-1/2 seed.
+///
+/// Its layer-1 twiddle, left layer-2 twiddle, and left layer-3 twiddle are
+/// zero. `twiddles` contains only the four remaining non-zero tree values.
+///
+/// # Safety
+/// Same source/destination validity, non-aliasing, and disjoint-write contract
+/// as [`butterfly_fused_3layer_row_from`].
+#[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+#[inline]
+pub(super) unsafe fn butterfly_fused_3layer_row_from_sparse(
+    src: *const F128,
+    dst: *mut F128,
+    eighth: usize,
+    num_ntts: usize,
+    r: usize,
+    twiddles: &[F128; 4],
+) {
+    // SAFETY: forwarded caller contract.
+    unsafe {
+        portable::butterfly_fused_3layer_row_from_sparse(src, dst, eighth, num_ntts, r, twiddles)
+    }
+}
+
 /// Process one fused-four-layer row group across every interleaved NTT lane.
 ///
 /// # Safety
