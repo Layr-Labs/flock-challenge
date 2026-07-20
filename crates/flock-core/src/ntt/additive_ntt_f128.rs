@@ -42,6 +42,7 @@
 //! pairs are adjacent — matching the standard `fold_pair` formula in DP24.
 
 use crate::field::F128;
+use std::sync::{Arc, Mutex, OnceLock};
 
 mod kernels;
 
@@ -101,14 +102,14 @@ fn span_get(basis: &[F128], idx: usize) -> F128 {
 #[derive(Clone, Debug)]
 pub struct AdditiveNttF128 {
     /// `evals[i]` of length `ℓ − i`, the normalized subspace polynomial values.
-    evals: Vec<Vec<F128>>,
+    evals: Arc<Vec<Vec<F128>>>,
 }
 
 impl AdditiveNttF128 {
     /// Construct an NTT from an explicit F_2-basis.
     pub fn new(basis: &[F128]) -> Self {
         Self {
-            evals: generate_evals_from_subspace(basis),
+            evals: Arc::new(generate_evals_from_subspace(basis)),
         }
     }
 
@@ -116,8 +117,15 @@ impl AdditiveNttF128 {
     /// (the low 64 bits of F_{2^128} hold these basis vectors).
     pub fn standard(dim: usize) -> Self {
         assert!(dim <= 64, "standard NTT requires dim ≤ 64");
+        static CACHE: OnceLock<Mutex<Vec<Option<AdditiveNttF128>>>> = OnceLock::new();
+        let cache = CACHE.get_or_init(|| Mutex::new(vec![None; 65]));
+        if let Some(ntt) = cache.lock().unwrap()[dim].clone() {
+            return ntt;
+        }
         let basis: Vec<F128> = (0..dim).map(|i| F128::new(1u64 << i, 0)).collect();
-        Self::new(&basis)
+        let ntt = Self::new(&basis);
+        cache.lock().unwrap()[dim] = Some(ntt.clone());
+        ntt
     }
 
     pub fn log_domain_size(&self) -> usize {

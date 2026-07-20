@@ -19,6 +19,7 @@ use crate::challenger::Challenger;
 use crate::field::{F8, F128};
 use crate::ntt::{AdditiveNttGf8, InvNttTableByteSingleGf8};
 use serde::{Deserialize, Serialize};
+use std::sync::OnceLock;
 
 pub mod multilinear;
 pub mod univariate_skip;
@@ -271,9 +272,12 @@ fn prove_packed_padded_inner<C: Challenger>(
     // about this internal optimization; we restore the C_s factor here.
     let zc_timing = std::env::var_os("FLOCK_ZC_TIMING").is_some();
     let t_round1 = std::time::Instant::now();
-    let ntt_s = AdditiveNttGf8::new(k_skip, F8::ZERO);
-    let ntt_l = AdditiveNttGf8::new(k_skip, F8(1u8 << k_skip));
-    let inv_table = InvNttTableByteSingleGf8::new(&ntt_s, &ntt_l);
+    static INV_TABLE: OnceLock<InvNttTableByteSingleGf8> = OnceLock::new();
+    let inv_table = INV_TABLE.get_or_init(|| {
+        let ntt_s = AdditiveNttGf8::new(K_SKIP, F8::ZERO);
+        let ntt_l = AdditiveNttGf8::new(K_SKIP, F8(1u8 << K_SKIP));
+        InvNttTableByteSingleGf8::new(&ntt_s, &ntt_l)
+    });
     let (round1_ab_opt, round1_c_opt, s_hat_v_c) = if capture_s_hat_v_c {
         let (ab, c, s) =
             crate::zerocheck::univariate_skip_optimized::round1_shift_reduce_extract_c_packed_padded_with_s_hat_v(
@@ -283,13 +287,13 @@ fn prove_packed_padded_inner<C: Challenger>(
                 m,
                 k_skip,
                 &r,
-                &inv_table,
+                inv_table,
                 padding,
             );
         (ab, c, Some(s))
     } else {
         let (ab, c) = round1_shift_reduce_extract_c_packed_padded(
-            a_packed, b_packed, c_packed, m, k_skip, &r, &inv_table, padding,
+            a_packed, b_packed, c_packed, m, k_skip, &r, inv_table, padding,
         );
         (ab, c, None)
     };
