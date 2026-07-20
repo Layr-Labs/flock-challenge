@@ -1,0 +1,39 @@
+{
+  "version": 1,
+  "hooks": {
+    "sessionStart": [
+      {
+        "command": "sh \".yukon/hooks/yukon-trace.sh\" cursor session"
+      },
+      {
+        "command": "sh \".yukon/hooks/yukon-trace.sh\" cursor capture"
+      }
+    ],
+    "beforeShellExecution": [
+      {
+        "command": "sh \".yukon/hooks/yukon-trace.sh\" cursor session",
+        "matcher": "yukon"
+      }
+    ],
+    "beforeSubmitPrompt": [
+      {
+        "command": "sh \".yukon/hooks/yukon-trace.sh\" cursor capture"
+      }
+    ],
+    "stop": [
+      {
+        "command": "sh \".yukon/hooks/yukon-trace.sh\" cursor capture"
+      }
+    ],
+    "sessionEnd": [
+      {
+        "command": "sh \".yukon/hooks/yukon-trace.sh\" cursor capture"
+      }
+    ],
+    "subagentStop": [
+      {
+        "command": "sh \".yukon/hooks/yukon-trace.sh\" cursor capture"
+      }
+    ]
+  }
+}
