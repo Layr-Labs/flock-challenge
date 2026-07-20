@@ -120,6 +120,7 @@ pub struct ProverData {
 impl Drop for ProverData {
     fn drop(&mut self) {
         crate::scratch::give_f128(std::mem::take(&mut self.codeword));
+        crate::merkle::recycle_tree(std::mem::take(&mut self.merkle_tree));
     }
 }
 

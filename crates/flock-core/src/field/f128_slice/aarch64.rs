@@ -4,6 +4,7 @@ use crate::field::F128;
 ///
 /// # Safety
 /// Requires the `aes` target feature.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(super) unsafe fn fold_pairs(src: &[F128], base: usize, dst: &mut [F128], r: F128) {
     use crate::field::gf2_128::aarch64::ghash_mul_vec2_neon;
 
