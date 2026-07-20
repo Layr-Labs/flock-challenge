@@ -81,17 +81,22 @@ fn generate_evals_from_subspace(basis: &[F128]) -> Vec<Vec<F128>> {
     evals
 }
 
-/// Compute `Σ_j bit_j(idx) · basis[j]` — the `idx`-th element of the F_2-span
-/// of `basis`.
-#[inline]
-fn span_get(basis: &[F128], idx: usize) -> F128 {
-    let mut acc = F128::ZERO;
-    for (j, &b) in basis.iter().enumerate() {
-        if (idx >> j) & 1 == 1 {
-            acc += b;
-        }
-    }
-    acc
+/// Materialize every `(layer, block)` twiddle once. Standard NTT objects are
+/// cached across the mandatory warm-up and measured proof, so this replaces
+/// each hot-path subset scan with one indexed load.
+fn generate_twiddles_from_evals(evals: &[Vec<F128>]) -> Vec<Vec<F128>> {
+    let log_d = evals.len();
+    (0..log_d)
+        .map(|layer| {
+            let basis = &evals[log_d - layer - 1][1..];
+            let mut twiddles = vec![F128::ZERO; 1usize << layer];
+            for block in 1..twiddles.len() {
+                let bit = block.trailing_zeros() as usize;
+                twiddles[block] = twiddles[block ^ (1usize << bit)] + basis[bit];
+            }
+            twiddles
+        })
+        .collect()
 }
 
 /// Additive NTT over F_{2^128} with the standard polynomial-basis subspace.
@@ -103,13 +108,18 @@ fn span_get(basis: &[F128], idx: usize) -> F128 {
 pub struct AdditiveNttF128 {
     /// `evals[i]` of length `ℓ − i`, the normalized subspace polynomial values.
     evals: Arc<Vec<Vec<F128>>>,
+    /// Exact twiddle values indexed by `[layer][block]`.
+    twiddles: Arc<Vec<Vec<F128>>>,
 }
 
 impl AdditiveNttF128 {
     /// Construct an NTT from an explicit F_2-basis.
     pub fn new(basis: &[F128]) -> Self {
+        let evals = generate_evals_from_subspace(basis);
+        let twiddles = generate_twiddles_from_evals(&evals);
         Self {
-            evals: Arc::new(generate_evals_from_subspace(basis)),
+            evals: Arc::new(evals),
+            twiddles: Arc::new(twiddles),
         }
     }
 
@@ -140,8 +150,7 @@ impl AdditiveNttF128 {
     /// (The 0-th element of the row corresponds to `Ŵ_{ℓ-l-1}(β_{ℓ-l-1}) = 1`,
     /// which is "absorbed" into the butterfly and not in the twiddle.)
     pub fn twiddle(&self, layer: usize, block: usize) -> F128 {
-        let v = &self.evals[self.log_domain_size() - layer - 1];
-        span_get(&v[1..], block)
+        self.twiddles[layer][block]
     }
 
     /// Forward additive NTT in place. `data.len()` must be `2^log_d` for some

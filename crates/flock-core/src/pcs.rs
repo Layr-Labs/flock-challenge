@@ -33,7 +33,7 @@ pub use pack::{LOG_PACKING, pack_witness, unpack_witness};
 pub use ring_switch::{RingSwitchProof, SparseEqTensor};
 
 use crate::challenger::Challenger;
-use crate::field::F128;
+use crate::field::{F128, F256Unreduced};
 use crate::zerocheck::PaddingSpec;
 use serde::{Deserialize, Serialize};
 
@@ -314,7 +314,7 @@ fn compute_combined_basis_and_target<Ch: Challenger>(
         let b = rs_deferred[0].0.len(); // eq_lo.len(); shared across claims (same split)
         debug_assert!(b >= 2 && b.is_multiple_of(2));
         debug_assert!(rs_deferred.iter().all(|d| d.0.len() == b));
-        b_combined
+        let (u0_unreduced, u2_unreduced) = b_combined
             .par_chunks_mut(b)
             .enumerate()
             .map(|(hi, out_block)| {
@@ -334,22 +334,35 @@ fn compute_combined_basis_and_target<Ch: Challenger>(
                 }
                 // Round-0 prime over this block's pairs (b is even, base is even).
                 let base = hi * b;
-                let mut u0 = F128::ZERO;
-                let mut u2 = F128::ZERO;
+                let mut u0 = F256Unreduced::ZERO;
+                let mut u2 = F256Unreduced::ZERO;
                 for t in 0..(b / 2) {
                     let s0 = out_block[2 * t];
                     let s1 = out_block[2 * t + 1];
                     let a0 = packed_witness[base + 2 * t];
                     let a1 = packed_witness[base + 2 * t + 1];
-                    u0 += a0 * s0;
-                    u2 += (a0 + a1) * (s0 + s1);
+                    #[cfg(target_arch = "aarch64")]
+                    let products = unsafe {
+                        crate::field::gf2_128::aarch64::ghash_mul_unreduced_vec2_neon(
+                            [a0, a0 + a1],
+                            [s0, s0 + s1],
+                        )
+                    };
+                    #[cfg(not(target_arch = "aarch64"))]
+                    let products = [
+                        a0.mul_unreduced(s0),
+                        (a0 + a1).mul_unreduced(s0 + s1),
+                    ];
+                    u0 ^= products[0];
+                    u2 ^= products[1];
                 }
                 (u0, u2)
             })
             .reduce(
-                || (F128::ZERO, F128::ZERO),
-                |(x0, x2), (y0, y2)| (x0 + y0, x2 + y2),
-            )
+                || (F256Unreduced::ZERO, F256Unreduced::ZERO),
+                |(x0, x2), (y0, y2)| (x0 ^ y0, x2 ^ y2),
+            );
+        (u0_unreduced.reduce(), u2_unreduced.reduce())
     } else {
         // General path (mixed / sparse / packed-direct): materialize any
         // deferred-dense claims (parallel block fold), then the per-element

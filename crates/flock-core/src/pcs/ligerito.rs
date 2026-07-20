@@ -30,7 +30,7 @@
 //!    c. Else: commit f^{i+2}, open f^{i+1}, induce next basis, glue.
 
 use crate::challenger::Challenger;
-use crate::field::F128;
+use crate::field::{F128, F256Unreduced};
 use crate::lincheck::build_eq_table;
 use crate::merkle::{self, Hash};
 use crate::ntt::additive_ntt_f128::AdditiveNttF128;
@@ -2590,13 +2590,15 @@ unsafe fn fold_and_msg_lsb_neon_chunk(
     fc: &mut [F128],
     bc: &mut [F128],
     r: F128,
-) -> (F128, F128) {
-    use crate::field::gf2_128::aarch64::ghash_mul_vec2_neon;
+) -> (F256Unreduced, F256Unreduced) {
+    use crate::field::gf2_128::aarch64::{
+        ghash_mul_unreduced_vec2_neon, ghash_mul_vec2_neon,
+    };
 
     debug_assert_eq!(fc.len(), bc.len());
     debug_assert_eq!(fc.len() & 1, 0);
-    let mut u0 = F128::ZERO;
-    let mut u2 = F128::ZERO;
+    let mut u0 = F256Unreduced::ZERO;
+    let mut u2 = F256Unreduced::ZERO;
     let mut k = 0;
     while k < fc.len() {
         let s = 2 * (base + k);
@@ -2619,8 +2621,11 @@ unsafe fn fold_and_msg_lsb_neon_chunk(
         fc[k + 1] = f1;
         bc[k] = b0;
         bc[k + 1] = b1;
-        u0 += f0 * b0;
-        u2 += (f0 + f1) * (b0 + b1);
+        let msg_products = unsafe {
+            ghash_mul_unreduced_vec2_neon([f0, f0 + f1], [b0, b0 + b1])
+        };
+        u0 ^= msg_products[0];
+        u2 ^= msg_products[1];
         k += 2;
     }
     (u0, u2)
@@ -2688,7 +2693,7 @@ fn fold_and_msg_lsb(f: &[F128], b: &[F128], r: F128) -> (Vec<F128>, Vec<F128>, S
         crate::alloc_uninit_f128_vec(half),
         crate::alloc_uninit_f128_vec(half),
     );
-    let (u_0, u_2) = nf
+    let (u_0_unreduced, u_2_unreduced) = nf
         .par_chunks_mut(CHUNK)
         .zip(nb.par_chunks_mut(CHUNK))
         .enumerate()
@@ -2703,8 +2708,8 @@ fn fold_and_msg_lsb(f: &[F128], b: &[F128], r: F128) -> (Vec<F128>, Vec<F128>, S
             #[cfg(not(target_arch = "aarch64"))]
             let (u0, u2) = {
                 let len = fc.len();
-                let mut u0 = F128::ZERO;
-                let mut u2 = F128::ZERO;
+                let mut u0 = F256Unreduced::ZERO;
+                let mut u2 = F256Unreduced::ZERO;
                 // Fold this slice, then pair up the just-folded values for the msg.
                 crate::field::f128_slice::fold_pairs(f, base, fc, r);
                 crate::field::f128_slice::fold_pairs(b, base, bc, r);
@@ -2714,8 +2719,8 @@ fn fold_and_msg_lsb(f: &[F128], b: &[F128], r: F128) -> (Vec<F128>, Vec<F128>, S
                     let f1 = fc[k + 1];
                     let b0 = bc[k];
                     let b1 = bc[k + 1];
-                    u0 += f0 * b0;
-                    u2 += (f0 + f1) * (b0 + b1);
+                    u0 ^= f0.mul_unreduced(b0);
+                    u2 ^= (f0 + f1).mul_unreduced(b0 + b1);
                     k += 2;
                 }
                 (u0, u2)
@@ -2723,9 +2728,10 @@ fn fold_and_msg_lsb(f: &[F128], b: &[F128], r: F128) -> (Vec<F128>, Vec<F128>, S
             (u0, u2)
         })
         .reduce(
-            || (F128::ZERO, F128::ZERO),
-            |(a0, a2), (c0, c2)| (a0 + c0, a2 + c2),
+            || (F256Unreduced::ZERO, F256Unreduced::ZERO),
+            |(a0, a2), (c0, c2)| (a0 ^ c0, a2 ^ c2),
         );
+    let (u_0, u_2) = (u_0_unreduced.reduce(), u_2_unreduced.reduce());
     (nf, nb, SumcheckMessage { u_0, u_2 })
 }
 
