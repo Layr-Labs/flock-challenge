@@ -94,24 +94,34 @@ pub fn hash4_equal_len(inputs: [&[u8]; 4], out: &mut [Hash]) {
         // One extra block when rem ≤ 55, two when 56 ≤ rem ≤ 63.
         let rem = len % 64;
         let bit_len = (len as u64) * 8;
-        let n_tail = if rem < 56 { 1 } else { 2 };
-        let mut tails = [[0u8; 128]; 4];
-        for i in 0..4 {
-            tails[i][..rem].copy_from_slice(&inputs[i][len - rem..]);
-            tails[i][rem] = 0x80;
-            tails[i][n_tail * 64 - 8..n_tail * 64].copy_from_slice(&bit_len.to_be_bytes());
-        }
-        for blk in 0..n_tail {
-            compress4(
-                &mut abcd,
-                &mut efgh,
-                [
-                    tails[0].as_ptr().add(blk * 64),
-                    tails[1].as_ptr().add(blk * 64),
-                    tails[2].as_ptr().add(blk * 64),
-                    tails[3].as_ptr().add(blk * 64),
-                ],
-            );
+        if rem == 0 {
+            // Merkle leaves and internal nodes are both whole numbers of SHA
+            // blocks. Their padding is therefore identical across all four
+            // streams: build it once instead of zeroing four 128-byte tails.
+            let mut tail = [0u8; 64];
+            tail[0] = 0x80;
+            tail[56..].copy_from_slice(&bit_len.to_be_bytes());
+            compress4(&mut abcd, &mut efgh, [tail.as_ptr(); 4]);
+        } else {
+            let n_tail = if rem < 56 { 1 } else { 2 };
+            let mut tails = [[0u8; 128]; 4];
+            for i in 0..4 {
+                tails[i][..rem].copy_from_slice(&inputs[i][len - rem..]);
+                tails[i][rem] = 0x80;
+                tails[i][n_tail * 64 - 8..n_tail * 64].copy_from_slice(&bit_len.to_be_bytes());
+            }
+            for blk in 0..n_tail {
+                compress4(
+                    &mut abcd,
+                    &mut efgh,
+                    [
+                        tails[0].as_ptr().add(blk * 64),
+                        tails[1].as_ptr().add(blk * 64),
+                        tails[2].as_ptr().add(blk * 64),
+                        tails[3].as_ptr().add(blk * 64),
+                    ],
+                );
+            }
         }
 
         // Digest = big-endian a..h.

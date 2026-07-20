@@ -45,6 +45,48 @@ pub(super) fn butterfly_fused_2layer(
     }
 }
 
+/// # Safety
+/// The caller guarantees that every selected row and lane is valid and that
+/// concurrent calls use disjoint row groups.
+pub(super) unsafe fn butterfly_fused_3layer_row(
+    ptr: *mut F128,
+    eighth: usize,
+    num_ntts: usize,
+    r: usize,
+    twiddles: &[F128; 7],
+) {
+    #[inline(always)]
+    fn butterfly(values: &mut [F128; 8], u: usize, v: usize, twiddle: F128) {
+        let new_u = values[u] + values[v] * twiddle;
+        values[v] += new_u;
+        values[u] = new_u;
+    }
+
+    // SAFETY: caller supplies the pointer geometry and disjointness contract.
+    unsafe {
+        for lane in 0..num_ntts {
+            let mut values = [F128::ZERO; 8];
+            for (i, value) in values.iter_mut().enumerate() {
+                *value = *ptr.add((i * eighth + r) * num_ntts + lane);
+            }
+            for i in 0..4 {
+                butterfly(&mut values, i, i + 4, twiddles[0]);
+            }
+            for s in 0..2 {
+                for i in 0..2 {
+                    butterfly(&mut values, 4 * s + i, 4 * s + i + 2, twiddles[1 + s]);
+                }
+            }
+            for s in 0..4 {
+                butterfly(&mut values, 2 * s, 2 * s + 1, twiddles[3 + s]);
+            }
+            for (i, value) in values.iter().enumerate() {
+                *ptr.add((i * eighth + r) * num_ntts + lane) = *value;
+            }
+        }
+    }
+}
+
 #[inline]
 pub(super) fn butterfly_fused_4layer(values: &mut [F128; 16], twiddles: &[F128; 15]) {
     #[inline(always)]
