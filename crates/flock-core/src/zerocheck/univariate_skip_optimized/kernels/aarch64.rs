@@ -57,46 +57,61 @@ pub(crate) unsafe fn accumulate_convert_with_s_hat_v(
     partial_c_0: &mut [F128; 64],
     partial_c_1: &mut [F128; 64],
 ) {
+    use crate::field::gf2_128::aarch64::ghash_mul_vec2_neon;
     use core::arch::aarch64::*;
 
     // SAFETY: caller guarantees fixed input sizes and aarch64 provides NEON.
     unsafe {
         let convert_ptr = convert.as_ptr() as *const u8;
-        for lane in 0..64 {
-            let mut converted_ab = vdupq_n_u8(0);
-            let mut converted_c_0 = vdupq_n_u8(0);
-            let mut converted_c_1 = vdupq_n_u8(0);
+        let mut lane = 0;
+        while lane < 64 {
+            let mut converted_ab = [vdupq_n_u8(0); 2];
+            let mut converted_c_0 = [vdupq_n_u8(0); 2];
+            let mut converted_c_1 = [vdupq_n_u8(0); 2];
             for b_med in 0..n_b_med {
-                let ab = chunk_ab_bytes[b_med][lane] as usize;
-                let c = chunk_c_bytes[b_med][lane] as usize;
-                converted_ab = veorq_u8(
-                    converted_ab,
-                    vld1q_u8(convert_ptr.add((b_med * 256 + ab) * 16)),
-                );
-                converted_c_0 = veorq_u8(
-                    converted_c_0,
-                    vld1q_u8(convert_ptr.add((b_med * 256 + (c & 0x55)) * 16)),
-                );
-                converted_c_1 = veorq_u8(
-                    converted_c_1,
-                    vld1q_u8(convert_ptr.add((b_med * 256 + (c & 0xaa)) * 16)),
-                );
+                for j in 0..2 {
+                    let ab = chunk_ab_bytes[b_med][lane + j] as usize;
+                    let c = chunk_c_bytes[b_med][lane + j] as usize;
+                    converted_ab[j] = veorq_u8(
+                        converted_ab[j],
+                        vld1q_u8(convert_ptr.add((b_med * 256 + ab) * 16)),
+                    );
+                    converted_c_0[j] = veorq_u8(
+                        converted_c_0[j],
+                        vld1q_u8(convert_ptr.add((b_med * 256 + (c & 0x55)) * 16)),
+                    );
+                    converted_c_1[j] = veorq_u8(
+                        converted_c_1[j],
+                        vld1q_u8(convert_ptr.add((b_med * 256 + (c & 0xaa)) * 16)),
+                    );
+                }
             }
-            let ab = vreinterpretq_u64_u8(converted_ab);
-            let c_0 = vreinterpretq_u64_u8(converted_c_0);
-            let c_1 = vreinterpretq_u64_u8(converted_c_1);
-            partial_ab[lane] += F128 {
-                lo: vgetq_lane_u64::<0>(ab),
-                hi: vgetq_lane_u64::<1>(ab),
-            } * eq_lo_val;
-            partial_c_0[lane] += F128 {
-                lo: vgetq_lane_u64::<0>(c_0),
-                hi: vgetq_lane_u64::<1>(c_0),
-            } * eq_lo_val;
-            partial_c_1[lane] += F128 {
-                lo: vgetq_lane_u64::<0>(c_1),
-                hi: vgetq_lane_u64::<1>(c_1),
-            } * eq_lo_val;
+            let unpack = |v: uint8x16_t| {
+                let v = vreinterpretq_u64_u8(v);
+                F128 {
+                    lo: vgetq_lane_u64::<0>(v),
+                    hi: vgetq_lane_u64::<1>(v),
+                }
+            };
+            let ab = ghash_mul_vec2_neon(
+                [unpack(converted_ab[0]), unpack(converted_ab[1])],
+                [eq_lo_val; 2],
+            );
+            let c_0 = ghash_mul_vec2_neon(
+                [unpack(converted_c_0[0]), unpack(converted_c_0[1])],
+                [eq_lo_val; 2],
+            );
+            let c_1 = ghash_mul_vec2_neon(
+                [unpack(converted_c_1[0]), unpack(converted_c_1[1])],
+                [eq_lo_val; 2],
+            );
+            partial_ab[lane] += ab[0];
+            partial_ab[lane + 1] += ab[1];
+            partial_c_0[lane] += c_0[0];
+            partial_c_0[lane + 1] += c_0[1];
+            partial_c_1[lane] += c_1[0];
+            partial_c_1[lane + 1] += c_1[1];
+            lane += 2;
         }
     }
 }

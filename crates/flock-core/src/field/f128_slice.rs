@@ -30,6 +30,7 @@ mod x86_64;
 /// Computes `dst[t] = src[2j] * (1 + r) + src[2j + 1] * r`, where
 /// `j = base + t`. Architecture selection is resolved at compile time.
 #[inline]
+#[cfg_attr(all(target_arch = "aarch64", not(test)), allow(dead_code))]
 pub(crate) fn fold_pairs(src: &[F128], base: usize, dst: &mut [F128], r: F128) {
     assert!(
         base <= src.len() / 2 && dst.len() <= src.len() / 2 - base,
