@@ -63,6 +63,7 @@ struct ScoreMetrics {
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config = parse_args()?;
+    let batch_size = 1usize << config.log2_size;
 
     let total_runs = config
         .warmup_runs
@@ -73,13 +74,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     for run in 1..=total_runs {
         let trial = run_trial(&config, run)?;
         if run <= config.warmup_runs {
+            log_trial("warmup", run, config.warmup_runs, &trial, batch_size)?;
             warmup_trials.push(trial);
         } else {
+            log_trial(
+                "measured",
+                run - config.warmup_runs,
+                config.runs,
+                &trial,
+                batch_size,
+            )?;
             measured_trials.push(trial);
         }
     }
 
-    let batch_size = 1usize << config.log2_size;
     let p10_seconds = percentile_seconds(&measured_trials, SCORE_PERCENTILE)?;
     let throughput = batch_size as f64 / p10_seconds;
     write_results(
@@ -91,6 +99,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     )?;
     println!("score={throughput:.3} compressions_per_second");
     Ok(())
+}
+
+fn log_trial(
+    phase: &str,
+    index: usize,
+    total: usize,
+    trial: &Trial,
+    batch_size: usize,
+) -> std::io::Result<()> {
+    let throughput = batch_size as f64 / trial.seconds;
+    let mut stdout = std::io::stdout().lock();
+    writeln!(
+        stdout,
+        "{phase}_trial={index}/{total} trial_score={throughput:.3} \
+         compressions_per_second seconds={:.9} verified=true included_in_p10={}",
+        trial.seconds,
+        phase == "measured",
+    )?;
+    stdout.flush()
 }
 
 fn percentile_seconds(

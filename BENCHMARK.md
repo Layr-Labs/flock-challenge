@@ -169,6 +169,11 @@ The trusted harness repeats the following sequence 120 times:
 8. It records the duration and proof size, then erases and recreates the entire
    writable scratch directory before the next worker.
 
+After each proof passes verification, the harness immediately logs its phase,
+index, duration, and individual `batch_size / trial_seconds` throughput. A
+warm-up line is progress information only; only the measured population enters
+the final P10 score.
+
 The first 20 complete trials warm the machine and are excluded from ranking.
 The next 100 are the measured population used for P10. Every proof in both
 groups must verify; “warm-up” never means “unchecked.”

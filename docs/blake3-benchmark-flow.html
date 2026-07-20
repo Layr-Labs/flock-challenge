@@ -320,7 +320,7 @@
           <article class="protocol-step candidate"><span class="number">03 / WARM</span><h3>Prepare one process</h3><p>A fresh worker creates setup, proves one fixed public warm-up, and signals ready.</p></article>
           <article class="protocol-step trusted"><span class="number">04 / CHALLENGE</span><h3>Draw and send a seed</h3><p>The verifier starts its clock, then sends a fresh 64-bit seed over stdin.</p></article>
           <article class="protocol-step candidate"><span class="number">05 / PROVE</span><h3>Write one proof</h3><p>Generate 262,144 inputs, witness, commitment, proof, and versioned file; then exit.</p></article>
-          <article class="protocol-step trusted"><span class="number">06 / VERIFY</span><h3>Rebuild the statement</h3><p>Stop time, reconstruct the private witness commitment, and run pristine verification.</p></article>
+          <article class="protocol-step trusted"><span class="number">06 / VERIFY</span><h3>Rebuild the statement</h3><p>Stop time, reconstruct the private witness commitment, verify, then log that trial's throughput.</p></article>
           <article class="protocol-step verified"><span class="number">07 / SCORE</span><h3>Accept all 120</h3><p>Discard 20 verified machine warm-ups, take P10 latency over 100 measured trials, then write typed JSON.</p></article>
         </div>
       </section>
