@@ -696,7 +696,7 @@ pub fn round1_shift_reduce_extract_c_packed_padded(
     assert_eq!(r.len(), m);
     assert_eq!(inv_table.k, k_skip);
 
-    let eq = SplitEqGhash::new(&r[k_skip + N_INNER..]);
+    let eq = SplitEqGhash::with_n_hi(&r[k_skip + N_INNER..], 8);
     let big_lo_size = 1usize << eq.n_lo;
     let hi_size = 1usize << eq.n_hi;
     let n_lo_and_inner = eq.n_lo + N_INNER;
@@ -788,7 +788,7 @@ pub fn round1_shift_reduce_extract_c_packed_padded_with_s_hat_v(
     assert_eq!(r.len(), m);
     assert_eq!(inv_table.k, k_skip);
 
-    let eq = SplitEqGhash::new(&r[k_skip + N_INNER..]);
+    let eq = SplitEqGhash::with_n_hi(&r[k_skip + N_INNER..], 8);
     let big_lo_size = 1usize << eq.n_lo;
     let hi_size = 1usize << eq.n_hi;
     let n_lo_and_inner = eq.n_lo + N_INNER;
@@ -879,7 +879,7 @@ fn round1_shift_reduce_extract_c_packed_serial(
     assert_eq!(r.len(), m);
     assert_eq!(inv_table.k, k_skip);
 
-    let eq = SplitEqGhash::new(&r[k_skip + N_INNER..]);
+    let eq = SplitEqGhash::with_n_hi(&r[k_skip + N_INNER..], 8);
     let big_lo_size = 1usize << eq.n_lo;
     let hi_size = 1usize << eq.n_hi;
     let n_lo_and_inner = eq.n_lo + N_INNER;
