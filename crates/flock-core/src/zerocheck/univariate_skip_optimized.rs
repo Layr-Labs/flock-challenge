@@ -33,6 +33,8 @@
 use std::sync::OnceLock;
 
 use crate::field::{F8, F128, PHI_8_TABLE, mul_by_x, phi8};
+#[cfg(target_arch = "aarch64")]
+use crate::field::F256Unreduced;
 use crate::ntt::InvNttTableByteSingleGf8;
 
 use super::PaddingSpec;
@@ -77,6 +79,23 @@ const N_CHUNKS: usize = 8;
 /// Total inner-most dims absorbed by the optimization: 3 small + 4 medium.
 const N_INNER: usize = 7;
 const N_MEDIUM: usize = 4;
+
+#[cfg(target_arch = "aarch64")]
+type UrmAccumulator = F256Unreduced;
+#[cfg(not(target_arch = "aarch64"))]
+type UrmAccumulator = F128;
+
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+fn reduce_urm_accumulator(value: UrmAccumulator) -> F128 {
+    value.reduce()
+}
+
+#[cfg(not(target_arch = "aarch64"))]
+#[inline(always)]
+fn reduce_urm_accumulator(value: UrmAccumulator) -> F128 {
+    value
+}
 
 /// The three small-eq challenges (as F_8 values, then embedded via φ_8).
 /// Choosing these specific values is what makes `eq_small[K] = C_s · α^K`.
@@ -310,8 +329,8 @@ pub fn round1_shift_reduce_extract_c(
 
 // Per-worker scratch + local accumulator. ~6 KB total, stack-allocated.
 struct WorkerState {
-    partial_ab: [F128; ELL],
-    partial_c: [F128; ELL],
+    partial_ab: [UrmAccumulator; ELL],
+    partial_c: [UrmAccumulator; ELL],
     chunk_ab_bytes: [[u8; 64]; 1 << N_MEDIUM],
     chunk_c_bytes: [[u8; 64]; 1 << N_MEDIUM],
     a_col: [F8; ELL],
@@ -323,8 +342,8 @@ struct WorkerState {
 impl WorkerState {
     fn new() -> Self {
         Self {
-            partial_ab: [F128::ZERO; ELL],
-            partial_c: [F128::ZERO; ELL],
+            partial_ab: [UrmAccumulator::ZERO; ELL],
+            partial_c: [UrmAccumulator::ZERO; ELL],
             chunk_ab_bytes: [[0u8; 64]; 1 << N_MEDIUM],
             chunk_c_bytes: [[0u8; 64]; 1 << N_MEDIUM],
             a_col: [F8::ZERO; ELL],
@@ -366,8 +385,14 @@ fn process_one_x_hi(
     convert: &[F128],
     state: &mut WorkerState,
 ) {
-    state.partial_ab.iter_mut().for_each(|p| *p = F128::ZERO);
-    state.partial_c.iter_mut().for_each(|p| *p = F128::ZERO);
+    state
+        .partial_ab
+        .iter_mut()
+        .for_each(|p| *p = UrmAccumulator::ZERO);
+    state
+        .partial_c
+        .iter_mut()
+        .for_each(|p| *p = UrmAccumulator::ZERO);
 
     let n_lo = n_lo_and_inner - N_INNER;
 
@@ -483,8 +508,8 @@ fn process_one_x_hi(
 
     // Outer fold by eq_hi.
     for lane in 0..ELL {
-        state.local_res_ab[lane] += eq_hi_val * state.partial_ab[lane];
-        state.local_res_c_s[lane] += eq_hi_val * state.partial_c[lane];
+        state.local_res_ab[lane] += eq_hi_val * reduce_urm_accumulator(state.partial_ab[lane]);
+        state.local_res_c_s[lane] += eq_hi_val * reduce_urm_accumulator(state.partial_c[lane]);
     }
 }
 
@@ -508,9 +533,9 @@ fn process_one_x_hi(
 /// Identical to [`WorkerState`] except `partial_c` and `local_res_c_s` are
 /// split into bank 0 / bank 1.
 struct WorkerStateWithSHatV {
-    partial_ab: [F128; ELL],
-    partial_c_0: [F128; ELL],
-    partial_c_1: [F128; ELL],
+    partial_ab: [UrmAccumulator; ELL],
+    partial_c_0: [UrmAccumulator; ELL],
+    partial_c_1: [UrmAccumulator; ELL],
     chunk_ab_bytes: [[u8; 64]; 1 << N_MEDIUM],
     chunk_c_bytes: [[u8; 64]; 1 << N_MEDIUM],
     a_col: [F8; ELL],
@@ -523,9 +548,9 @@ struct WorkerStateWithSHatV {
 impl WorkerStateWithSHatV {
     fn new() -> Self {
         Self {
-            partial_ab: [F128::ZERO; ELL],
-            partial_c_0: [F128::ZERO; ELL],
-            partial_c_1: [F128::ZERO; ELL],
+            partial_ab: [UrmAccumulator::ZERO; ELL],
+            partial_c_0: [UrmAccumulator::ZERO; ELL],
+            partial_c_1: [UrmAccumulator::ZERO; ELL],
             chunk_ab_bytes: [[0u8; 64]; 1 << N_MEDIUM],
             chunk_c_bytes: [[0u8; 64]; 1 << N_MEDIUM],
             a_col: [F8::ZERO; ELL],
@@ -558,9 +583,18 @@ fn process_one_x_hi_with_s_hat_v(
     convert: &[F128],
     state: &mut WorkerStateWithSHatV,
 ) {
-    state.partial_ab.iter_mut().for_each(|p| *p = F128::ZERO);
-    state.partial_c_0.iter_mut().for_each(|p| *p = F128::ZERO);
-    state.partial_c_1.iter_mut().for_each(|p| *p = F128::ZERO);
+    state
+        .partial_ab
+        .iter_mut()
+        .for_each(|p| *p = UrmAccumulator::ZERO);
+    state
+        .partial_c_0
+        .iter_mut()
+        .for_each(|p| *p = UrmAccumulator::ZERO);
+    state
+        .partial_c_1
+        .iter_mut()
+        .for_each(|p| *p = UrmAccumulator::ZERO);
 
     let n_lo = n_lo_and_inner - N_INNER;
 
@@ -668,9 +702,11 @@ fn process_one_x_hi_with_s_hat_v(
 
     // Outer fold by eq_hi (per bank).
     for lane in 0..ELL {
-        state.local_res_ab[lane] += eq_hi_val * state.partial_ab[lane];
-        state.local_res_c_s_0[lane] += eq_hi_val * state.partial_c_0[lane];
-        state.local_res_c_s_1[lane] += eq_hi_val * state.partial_c_1[lane];
+        state.local_res_ab[lane] += eq_hi_val * reduce_urm_accumulator(state.partial_ab[lane]);
+        state.local_res_c_s_0[lane] +=
+            eq_hi_val * reduce_urm_accumulator(state.partial_c_0[lane]);
+        state.local_res_c_s_1[lane] +=
+            eq_hi_val * reduce_urm_accumulator(state.partial_c_1[lane]);
     }
 }
 

@@ -133,3 +133,40 @@ pub fn hash4_equal_len(inputs: [&[u8]; 4], out: &mut [Hash]) {
         }
     }
 }
+
+/// Hash four `state_digest || nonce_le` PoW candidates in one ARM SHA stream.
+/// Each 40-byte message occupies exactly one padded SHA-256 block.
+#[inline]
+pub(crate) fn hash4_pow(state_digest: &[u8; 32], nonces: [u64; 4]) -> [Hash; 4] {
+    let mut blocks = [[0u8; 64]; 4];
+    for i in 0..4 {
+        blocks[i][..32].copy_from_slice(state_digest);
+        blocks[i][32..40].copy_from_slice(&nonces[i].to_le_bytes());
+        blocks[i][40] = 0x80;
+        blocks[i][56..].copy_from_slice(&(40u64 * 8).to_be_bytes());
+    }
+
+    unsafe {
+        let mut abcd = [vld1q_u32(SHA256_IV.as_ptr()); 4];
+        let mut efgh = [vld1q_u32(SHA256_IV.as_ptr().add(4)); 4];
+        compress4(
+            &mut abcd,
+            &mut efgh,
+            [
+                blocks[0].as_ptr(),
+                blocks[1].as_ptr(),
+                blocks[2].as_ptr(),
+                blocks[3].as_ptr(),
+            ],
+        );
+
+        let mut out = [[0u8; 32]; 4];
+        for i in 0..4 {
+            let be_lo = vrev32q_u8(vreinterpretq_u8_u32(abcd[i]));
+            let be_hi = vrev32q_u8(vreinterpretq_u8_u32(efgh[i]));
+            vst1q_u8(out[i].as_mut_ptr(), be_lo);
+            vst1q_u8(out[i].as_mut_ptr().add(16), be_hi);
+        }
+        out
+    }
+}

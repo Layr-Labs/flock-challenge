@@ -247,6 +247,44 @@ pub unsafe fn ghash_mul_vec2_neon(a: [F128; 2], b: [F128; 2]) -> [F128; 2] {
     }
 }
 
+/// Batch two unreduced F128 products. This is the multiplication half of
+/// [`ghash_mul_vec2_neon`], used when callers XOR many products before a
+/// single final reduction.
+#[target_feature(enable = "aes")]
+pub unsafe fn ghash_mul_unreduced_vec2_neon(
+    a: [F128; 2],
+    b: [F128; 2],
+) -> [F256Unreduced; 2] {
+    // SAFETY: function carries the aes target feature; pmull requires it.
+    unsafe {
+        let p0_ll = pmull(a[0].lo, b[0].lo);
+        let p0_lh = pmull(a[0].lo, b[0].hi);
+        let p0_hl = pmull(a[0].hi, b[0].lo);
+        let p0_hh = pmull(a[0].hi, b[0].hi);
+        let p1_ll = pmull(a[1].lo, b[1].lo);
+        let p1_lh = pmull(a[1].lo, b[1].hi);
+        let p1_hl = pmull(a[1].hi, b[1].lo);
+        let p1_hh = pmull(a[1].hi, b[1].hi);
+
+        let c0 = veorq_u64(p0_lh, p0_hl);
+        let c1 = veorq_u64(p1_lh, p1_hl);
+        [
+            F256Unreduced {
+                r0: vgetq_lane_u64::<0>(p0_ll),
+                r1: vgetq_lane_u64::<1>(p0_ll) ^ vgetq_lane_u64::<0>(c0),
+                r2: vgetq_lane_u64::<0>(p0_hh) ^ vgetq_lane_u64::<1>(c0),
+                r3: vgetq_lane_u64::<1>(p0_hh),
+            },
+            F256Unreduced {
+                r0: vgetq_lane_u64::<0>(p1_ll),
+                r1: vgetq_lane_u64::<1>(p1_ll) ^ vgetq_lane_u64::<0>(c1),
+                r2: vgetq_lane_u64::<0>(p1_hh) ^ vgetq_lane_u64::<1>(c1),
+                r3: vgetq_lane_u64::<1>(p1_hh),
+            },
+        ]
+    }
+}
+
 /// Full 256-bit carry-less product `a · b`, no mod-p reduction. The standard
 /// middle-cross fold is baked in: r1 = ll_hi ^ cross_lo, r2 = hh_lo ^ cross_hi.
 ///

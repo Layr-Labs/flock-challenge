@@ -385,9 +385,10 @@ pub fn prove_fast_core_with_codeword<Ch: Challenger>(
         &x_ab,
         challenger,
     );
-    // The lincheck stripe copy of z is dead from here on; free it before the
-    // PCS open (2^(m-3) bytes — 64 MB at m = 29).
-    drop(z_packed_lincheck);
+    // The lincheck stripe copy of z is dead from here on. Keep its resident
+    // allocation for the next same-process proof (the benchmark's mandatory
+    // warm-up), instead of faulting 2^(m-3) fresh byte pages again.
+    crate::r1cs_hashes::common::recycle_lincheck_stripe(z_packed_lincheck);
 
     let ab = ZClaim {
         point: r1cs.ab_claim_point(lc_claim.r_inner_skip, &lc_claim.r_inner_rest, &x_ab.x_outer),
@@ -519,7 +520,7 @@ pub fn prove_fast_ligerito_timed<Ch: Challenger>(
         &x_ab,
         challenger,
     );
-    drop(z_packed_lincheck);
+    crate::r1cs_hashes::common::recycle_lincheck_stripe(z_packed_lincheck);
     let ab = ZClaim {
         point: r1cs.ab_claim_point(lc_claim.r_inner_skip, &lc_claim.r_inner_rest, &x_ab.x_outer),
         value: lc_claim.w,

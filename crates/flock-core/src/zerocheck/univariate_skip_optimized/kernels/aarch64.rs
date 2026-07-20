@@ -1,4 +1,4 @@
-use super::super::{F8, F128, InvNttTableByteSingleGf8, N_CHUNKS};
+use super::super::{F8, F128, InvNttTableByteSingleGf8, N_CHUNKS, UrmAccumulator};
 
 /// LLVM 22 scalarizes some constant `vshlq_n_u64` expressions into lane
 /// extracts/inserts on Apple Silicon. Keep this hot bit-transpose operation as
@@ -26,39 +26,53 @@ pub(crate) unsafe fn accumulate_convert(
     n_b_med: usize,
     convert: &[F128],
     eq_lo_val: F128,
-    partial_ab: &mut [F128; 64],
-    partial_c: &mut [F128; 64],
+    partial_ab: &mut [UrmAccumulator; 64],
+    partial_c: &mut [UrmAccumulator; 64],
 ) {
+    use crate::field::gf2_128::aarch64::ghash_mul_unreduced_vec2_neon;
     use core::arch::aarch64::*;
 
     // SAFETY: caller guarantees fixed input sizes and aarch64 provides NEON.
     unsafe {
         let convert_ptr = convert.as_ptr() as *const u8;
-        for lane in 0..64 {
-            let mut converted_ab = vdupq_n_u8(0);
-            let mut converted_c = vdupq_n_u8(0);
+        let mut lane = 0;
+        while lane < 64 {
+            let mut converted_ab = [vdupq_n_u8(0); 2];
+            let mut converted_c = [vdupq_n_u8(0); 2];
             for b_med in 0..n_b_med {
-                let ab = chunk_ab_bytes[b_med][lane] as usize;
-                let c = chunk_c_bytes[b_med][lane] as usize;
-                converted_ab = veorq_u8(
-                    converted_ab,
-                    vld1q_u8(convert_ptr.add((b_med * 256 + ab) * 16)),
-                );
-                converted_c = veorq_u8(
-                    converted_c,
-                    vld1q_u8(convert_ptr.add((b_med * 256 + c) * 16)),
-                );
+                for j in 0..2 {
+                    let ab = chunk_ab_bytes[b_med][lane + j] as usize;
+                    let c = chunk_c_bytes[b_med][lane + j] as usize;
+                    converted_ab[j] = veorq_u8(
+                        converted_ab[j],
+                        vld1q_u8(convert_ptr.add((b_med * 256 + ab) * 16)),
+                    );
+                    converted_c[j] = veorq_u8(
+                        converted_c[j],
+                        vld1q_u8(convert_ptr.add((b_med * 256 + c) * 16)),
+                    );
+                }
             }
-            let ab = vreinterpretq_u64_u8(converted_ab);
-            let c = vreinterpretq_u64_u8(converted_c);
-            partial_ab[lane] += F128 {
-                lo: vgetq_lane_u64::<0>(ab),
-                hi: vgetq_lane_u64::<1>(ab),
-            } * eq_lo_val;
-            partial_c[lane] += F128 {
-                lo: vgetq_lane_u64::<0>(c),
-                hi: vgetq_lane_u64::<1>(c),
-            } * eq_lo_val;
+            let unpack = |v: uint8x16_t| {
+                let v = vreinterpretq_u64_u8(v);
+                F128 {
+                    lo: vgetq_lane_u64::<0>(v),
+                    hi: vgetq_lane_u64::<1>(v),
+                }
+            };
+            let ab = ghash_mul_unreduced_vec2_neon(
+                [unpack(converted_ab[0]), unpack(converted_ab[1])],
+                [eq_lo_val; 2],
+            );
+            let c = ghash_mul_unreduced_vec2_neon(
+                [unpack(converted_c[0]), unpack(converted_c[1])],
+                [eq_lo_val; 2],
+            );
+            partial_ab[lane] ^= ab[0];
+            partial_ab[lane + 1] ^= ab[1];
+            partial_c[lane] ^= c[0];
+            partial_c[lane + 1] ^= c[1];
+            lane += 2;
         }
     }
 }
@@ -71,11 +85,11 @@ pub(crate) unsafe fn accumulate_convert_with_s_hat_v(
     n_b_med: usize,
     convert: &[F128],
     eq_lo_val: F128,
-    partial_ab: &mut [F128; 64],
-    partial_c_0: &mut [F128; 64],
-    partial_c_1: &mut [F128; 64],
+    partial_ab: &mut [UrmAccumulator; 64],
+    partial_c_0: &mut [UrmAccumulator; 64],
+    partial_c_1: &mut [UrmAccumulator; 64],
 ) {
-    use crate::field::gf2_128::aarch64::ghash_mul_vec2_neon;
+    use crate::field::gf2_128::aarch64::ghash_mul_unreduced_vec2_neon;
     use core::arch::aarch64::*;
 
     // SAFETY: caller guarantees fixed input sizes and aarch64 provides NEON.
@@ -111,24 +125,24 @@ pub(crate) unsafe fn accumulate_convert_with_s_hat_v(
                     hi: vgetq_lane_u64::<1>(v),
                 }
             };
-            let ab = ghash_mul_vec2_neon(
+            let ab = ghash_mul_unreduced_vec2_neon(
                 [unpack(converted_ab[0]), unpack(converted_ab[1])],
                 [eq_lo_val; 2],
             );
-            let c_0 = ghash_mul_vec2_neon(
+            let c_0 = ghash_mul_unreduced_vec2_neon(
                 [unpack(converted_c_0[0]), unpack(converted_c_0[1])],
                 [eq_lo_val; 2],
             );
-            let c_1 = ghash_mul_vec2_neon(
+            let c_1 = ghash_mul_unreduced_vec2_neon(
                 [unpack(converted_c_1[0]), unpack(converted_c_1[1])],
                 [eq_lo_val; 2],
             );
-            partial_ab[lane] += ab[0];
-            partial_ab[lane + 1] += ab[1];
-            partial_c_0[lane] += c_0[0];
-            partial_c_0[lane + 1] += c_0[1];
-            partial_c_1[lane] += c_1[0];
-            partial_c_1[lane + 1] += c_1[1];
+            partial_ab[lane] ^= ab[0];
+            partial_ab[lane + 1] ^= ab[1];
+            partial_c_0[lane] ^= c_0[0];
+            partial_c_0[lane + 1] ^= c_0[1];
+            partial_c_1[lane] ^= c_1[0];
+            partial_c_1[lane + 1] ^= c_1[1];
             lane += 2;
         }
     }
