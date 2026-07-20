@@ -18,7 +18,9 @@ use serde::Serialize;
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(300);
 const RUN_TIMEOUT: Duration = Duration::from_secs(900);
 const POLL_INTERVAL: Duration = Duration::from_micros(100);
-const SCORE_PERCENTILE: f64 = 0.10;
+const P10_PERCENTILE: f64 = 0.10;
+const SCORE_PERCENTILE: f64 = 0.50;
+const P90_PERCENTILE: f64 = 0.90;
 // Sampled 2^18 proofs are about 436-438 kB. Keep the reviewed 500 kB bound.
 const MAX_PROOF_BYTES: u64 = 500_000;
 
@@ -88,8 +90,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    let p10_seconds = percentile_seconds(&measured_trials, SCORE_PERCENTILE)?;
-    let throughput = batch_size as f64 / p10_seconds;
+    let median_seconds = percentile_seconds(&measured_trials, SCORE_PERCENTILE)?;
+    let throughput = batch_size as f64 / median_seconds;
     write_results(
         &config,
         &warmup_trials,
@@ -113,7 +115,7 @@ fn log_trial(
     writeln!(
         stdout,
         "{phase}_trial={index}/{total} trial_score={throughput:.3} \
-         compressions_per_second seconds={:.9} verified=true included_in_p10={}",
+         compressions_per_second seconds={:.9} verified=true included_in_score={}",
         trial.seconds,
         phase == "measured",
     )?;
@@ -316,9 +318,9 @@ fn write_results(
     throughput: f64,
     batch_size: usize,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let p10_seconds = percentile_seconds(measured_trials, SCORE_PERCENTILE)?;
-    let median_seconds = percentile_seconds(measured_trials, 0.50)?;
-    let p90_seconds = percentile_seconds(measured_trials, 0.90)?;
+    let p10_seconds = percentile_seconds(measured_trials, P10_PERCENTILE)?;
+    let median_seconds = percentile_seconds(measured_trials, SCORE_PERCENTILE)?;
+    let p90_seconds = percentile_seconds(measured_trials, P90_PERCENTILE)?;
     let total_seconds = measured_trials
         .iter()
         .map(|trial| trial.seconds)

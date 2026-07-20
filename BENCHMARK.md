@@ -17,7 +17,7 @@ For a visual version of this document, open
 | Machine warm-up | 20 private, verified trials discarded before scoring |
 | Measured trials | 100, each in a fresh worker process |
 | Worker warm-up | 1 fixed-seed, untimed proof inside every worker |
-| Score | `262,144 / P10(measured_trial_seconds)` |
+| Score | `262,144 / median(measured_trial_seconds)` |
 | Unit | verified BLAKE3 compressions per second |
 | Direction | higher is better |
 | Correctness | every timed proof must pass the prebuilt verifier |
@@ -62,13 +62,13 @@ before it writes the private seed to worker stdin until the worker exits
 successfully:
 
 ```text
-rank_seconds = P10(measured_trial_seconds)
+rank_seconds = median(measured_trial_seconds)
 score = 262,144 / rank_seconds
 ```
 
-P10 uses linear interpolation at rank `(sample_count - 1) × 0.10`; for 100
-measured trials this interpolates between the tenth and eleventh sorted
-durations. Setup, fixed-seed
+The median uses linear interpolation at rank `(sample_count - 1) × 0.50`; for
+100 measured trials this is the mean of the 50th and 51st sorted durations.
+Setup, fixed-seed
 warm-up, and trusted verification are outside the timed interval. Input
 generation from the private seed, witness generation, commitment, proving,
 serialization, proof-file writing, and process exit are inside it.
@@ -91,8 +91,8 @@ Official scores run in GitHub Actions on a dedicated self-hosted Mac with:
 - candidate builds using `-C target-cpu=native`.
 
 The validated stability experiment used macOS 26.4 build 25E246. Across five
-independent sessions, the unmodified candidate averaged approximately 490,734
-verified compressions/s with 0.215% run-to-run CV. This is a
+independent sessions, the unmodified candidate averaged approximately 483,866
+verified compressions/s with 0.539% run-to-run CV. This is a
 reference observation, not a guaranteed baseline: system version, thermals,
 background load, and compiler output can move absolute throughput.
 
@@ -172,10 +172,10 @@ The trusted harness repeats the following sequence 120 times:
 After each proof passes verification, the harness immediately logs its phase,
 index, duration, and individual `batch_size / trial_seconds` throughput. A
 warm-up line is progress information only; only the measured population enters
-the final P10 score.
+the final median score.
 
 The first 20 complete trials warm the machine and are excluded from ranking.
-The next 100 are the measured population used for P10. Every proof in both
+The next 100 are the measured population used for the median. Every proof in both
 groups must verify; “warm-up” never means “unchecked.”
 
 The seed line is the only request sent to the worker. The proof file is the
@@ -235,28 +235,28 @@ The verifier uses typed Rust structs and Serde to write repository-root
 
 ```json
 {
-  "score": 490733.552609,
+  "score": 484700.1738854293,
   "metrics": {
     "warmup_trial_seconds": [0.5351, 0.5344],
     "trial_seconds": [0.5338, 0.5362],
-    "p10_seconds": 0.5341880509,
-    "median_seconds": 0.5407,
-    "aggregate_compressions_per_second": 484000.0,
-    "p90_p10_latency_ratio": 1.028,
+    "p10_seconds": 0.5346941128,
+    "median_seconds": 0.5408374375,
+    "aggregate_compressions_per_second": 484858.3396136077,
+    "p90_p10_latency_ratio": 1.0220526782,
     "batch_size": 262144,
     "warmup_runs": 20,
     "measured_runs": 100,
     "threads": 10,
-    "proof_bytes": 438123,
+    "proof_bytes": 436107,
     "verified": true
   }
 }
 ```
 
 `score` is a finite number measured in verified BLAKE3 compressions per
-second. `p10_seconds` is the scored latency statistic. Aggregate throughput,
-median latency, and p90/p10 dispersion are diagnostics rather than ranking
-inputs. `proof_bytes` is the largest accepted proof in the run and is reported
+second. `median_seconds` is the scored latency statistic. P10 latency,
+aggregate throughput, and p90/p10 dispersion are diagnostics rather than
+ranking inputs. `proof_bytes` is the largest accepted proof in the run and is reported
 for visibility only. The arrays above are abbreviated; ranked output contains
 all 20 warm-up and 100 measured durations.
 

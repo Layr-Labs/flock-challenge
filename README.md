@@ -114,7 +114,7 @@ competitor comparisons.
 
 The challenge harness scores verified BLAKE3 compression-proof throughput at a
 fixed 2^18 batch on the self-hosted `m4-pro` GitHub Actions runner. It verifies
-20 machine warm-up trials, then ranks `2^18 / P10(seconds)` across 100 measured
+20 machine warm-up trials, then ranks `2^18 / median(seconds)` across 100 measured
 trials. Run it locally with `./setup.sh && ./benchmark.sh`; Yukon dispatches the
 Actions workflow on each constructed submission commit and reads its uploaded JSON
 score. Solvers may optimize all Rust source in `flock-core` and `flock-prover`,

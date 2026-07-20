@@ -5,7 +5,7 @@ root="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "${root}"
 
 # Ranked defaults: 2^18 compressions, 20 verified warm-ups, then 100 measured
-# trials scored from P10 latency.
+# trials scored from median latency.
 # Environment overrides exist only for local smoke tests and diagnostics.
 log2_size="${BLAKE3_LOG2:-18}"
 threads="${BLAKE3_THREADS:-auto}"

@@ -22,7 +22,7 @@ GitHub Actions/Yukon handoff.
 - Default Rayon threads: performance-core count
 - Machine warm-up: 20 private, timed, verified proofs discarded from scoring
 - Measurement: 100 private, timed, verified proofs
-- Score: `262,144 / P10(measured_seconds)`; higher is better
+- Score: `262,144 / median(measured_seconds)`; higher is better
 - Warm-up: one seed-independent `prove_fast` before each trial is ready
 - Timed interval: sending the fresh seed through prover exit, including input
   generation and serialization

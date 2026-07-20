@@ -321,7 +321,7 @@
           <article class="protocol-step trusted"><span class="number">04 / CHALLENGE</span><h3>Draw and send a seed</h3><p>The verifier starts its clock, then sends a fresh 64-bit seed over stdin.</p></article>
           <article class="protocol-step candidate"><span class="number">05 / PROVE</span><h3>Write one proof</h3><p>Generate 262,144 inputs, witness, commitment, proof, and versioned file; then exit.</p></article>
           <article class="protocol-step trusted"><span class="number">06 / VERIFY</span><h3>Rebuild the statement</h3><p>Stop time, reconstruct the private witness commitment, verify, then log that trial's throughput.</p></article>
-          <article class="protocol-step verified"><span class="number">07 / SCORE</span><h3>Accept all 120</h3><p>Discard 20 verified machine warm-ups, take P10 latency over 100 measured trials, then write typed JSON.</p></article>
+          <article class="protocol-step verified"><span class="number">07 / SCORE</span><h3>Accept all 120</h3><p>Discard 20 verified machine warm-ups, take median latency over 100 measured trials, then write typed JSON.</p></article>
         </div>
       </section>
 
@@ -339,12 +339,12 @@
           </article>
           <article class="panel">
             <div class="panel-head"><h3>Ranking formula</h3><span>higher is better</span></div>
-            <div class="formula"><div><code>score = 262,144 / P10(measured seconds)</code><small>verified BLAKE3 compressions per second</small></div></div>
+            <div class="formula"><div><code>score = 262,144 / median(measured seconds)</code><small>verified BLAKE3 compressions per second</small></div></div>
           </article>
         </div>
         <div class="facts">
           <div class="fact"><b>20</b><span>private verified machine warm-up trials, discarded</span></div>
-          <div class="fact"><b>100</b><span>private verified trials in the P10 score</span></div>
+          <div class="fact"><b>100</b><span>private verified trials in the median score</span></div>
           <div class="fact"><b>26,214,400</b><span>private compressions in the scored population</span></div>
           <div class="fact"><b>500,000 B</b><span>per-proof limit enforced by the trusted verifier</span></div>
         </div>
@@ -416,7 +416,7 @@
       <section id="trial">
         <div class="section-label">One timed trial</div>
         <h2>The private seed defines the timing boundary.</h2>
-        <p class="lede">Each of the 120 trials gets a fresh process and seed. The first 20 warm the machine; P10 over the next 100 determines the score. Verification is outside each timer but mandatory for every proof.</p>
+        <p class="lede">Each of the 120 trials gets a fresh process and seed. The first 20 warm the machine; the median of the next 100 determines the score. Verification is outside each timer but mandatory for every proof.</p>
         <div class="timeline">
           <div class="timeline-head"><div>Phase</div><div>Trusted clock</div><div>Candidate worker</div><div>Prebuilt verifier</div></div>
           <div class="timeline-row">
@@ -463,24 +463,24 @@
       <section id="score">
         <div class="section-label">Score file</div>
         <h2>One typed JSON object, written after all checks.</h2>
-        <p class="lede">The verifier discards 20 verified warm-up durations, linearly interpolates P10 over 100 measured durations, and serializes Rust <code>ScoreFile</code> and <code>ScoreMetrics</code> values with Serde.</p>
+        <p class="lede">The verifier discards 20 verified warm-up durations, takes the median of 100 measured durations, and serializes Rust <code>ScoreFile</code> and <code>ScoreMetrics</code> values with Serde.</p>
         <div class="score-grid">
           <article class="panel">
             <div class="panel-head"><h3>Example ranked output</h3><span>repository-root score.json</span></div>
             <pre>{
-  <span class="cool">"score"</span>: <span class="warm">490733.552609</span>,
+  <span class="cool">"score"</span>: <span class="warm">484700.1738854293</span>,
   <span class="cool">"metrics"</span>: {
     <span class="cool">"warmup_trial_seconds"</span>: [<span class="warm">0.5351, 0.5344, …</span>],
     <span class="cool">"trial_seconds"</span>: [<span class="warm">0.5338, 0.5362, …</span>],
-    <span class="cool">"p10_seconds"</span>: <span class="warm">0.5341880509</span>,
-    <span class="cool">"median_seconds"</span>: <span class="warm">0.5407</span>,
-    <span class="cool">"aggregate_compressions_per_second"</span>: <span class="warm">484000.0</span>,
-    <span class="cool">"p90_p10_latency_ratio"</span>: <span class="warm">1.028</span>,
+    <span class="cool">"p10_seconds"</span>: <span class="warm">0.5346941128</span>,
+    <span class="cool">"median_seconds"</span>: <span class="warm">0.5408374375</span>,
+    <span class="cool">"aggregate_compressions_per_second"</span>: <span class="warm">484858.3396136077</span>,
+    <span class="cool">"p90_p10_latency_ratio"</span>: <span class="warm">1.0220526782</span>,
     <span class="cool">"batch_size"</span>: <span class="warm">262144</span>,
     <span class="cool">"warmup_runs"</span>: <span class="warm">20</span>,
     <span class="cool">"measured_runs"</span>: <span class="warm">100</span>,
     <span class="cool">"threads"</span>: <span class="warm">10</span>,
-    <span class="cool">"proof_bytes"</span>: <span class="warm">438123</span>,
+    <span class="cool">"proof_bytes"</span>: <span class="warm">436107</span>,
     <span class="cool">"verified"</span>: <span class="green">true</span>
   }
 }</pre>
@@ -488,11 +488,11 @@
           <div class="metric-list">
             <div class="metric"><code>score</code><p>The only ranked value: verified BLAKE3 compressions per second. Higher is better.</p></div>
             <div class="metric"><code>warmup_trial_seconds</code><p>Twenty verified machine warm-ups, visible but excluded from ranking.</p></div>
-            <div class="metric"><code>trial_seconds</code><p>All 100 verified durations used to compute P10.</p></div>
+            <div class="metric"><code>trial_seconds</code><p>All 100 verified durations used to compute the median.</p></div>
             <div class="metric"><code>batch_size · threads</code><p>Fixed work count and the selected Apple performance-core pool size.</p></div>
             <div class="metric"><code>proof_bytes</code><p>Largest accepted serialized proof in the run. Visible, but not ranked.</p></div>
             <div class="metric"><code>verified</code><p>Always true when the score exists. Any failure exits nonzero and produces no replacement score.</p></div>
-            <div class="metric"><code>diagnostics</code><p>Median, aggregate throughput, and p90/p10 dispersion expose behavior that P10 intentionally does not rank.</p></div>
+            <div class="metric"><code>diagnostics</code><p>P10 latency, aggregate throughput, and p90/p10 dispersion show the distribution around the ranked median.</p></div>
           </div>
         </div>
       </section>
@@ -540,7 +540,7 @@
       </section>
     </main>
 
-    <footer>2^18 BLAKE3 compressions per proof · 20 verified warm-ups · P10 of 100 verified trials · prebuilt arm64 verifier · self-hosted Apple M4 Pro</footer>
+    <footer>2^18 BLAKE3 compressions per proof · 20 verified warm-ups · median of 100 verified trials · prebuilt arm64 verifier · self-hosted Apple M4 Pro</footer>
   </div>
 </body>
 </html>
