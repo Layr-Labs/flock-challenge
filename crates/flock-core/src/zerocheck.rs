@@ -242,8 +242,15 @@ pub fn prove_packed_padded_capture_s_hat_v_c_when_c_is_a_and_b<C: Challenger>(
     padding: &PaddingSpec,
     challenger: &mut C,
 ) -> (ZerocheckProof, ZerocheckClaim, Vec<F128>) {
-    let (proof, claim, captured) =
-        prove_packed_padded_inner(a_packed, b_packed, None, m, padding, true, challenger);
+    let (proof, claim, captured) = prove_packed_padded_inner(
+        a_packed,
+        b_packed,
+        None,
+        m,
+        padding,
+        true,
+        challenger,
+    );
     (
         proof,
         claim,
@@ -274,10 +281,7 @@ fn prove_packed_padded_inner<C: Challenger>(
     if let Some(c_packed) = c_packed {
         assert_eq!(c_packed.len(), expected_bytes);
     } else {
-        assert!(
-            capture_s_hat_v_c,
-            "C-from-AB is only implemented by the capture path"
-        );
+        assert!(capture_s_hat_v_c, "C-from-AB is only implemented by the capture path");
     }
     let n_mlv = m - k_skip;
 

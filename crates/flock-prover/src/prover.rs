@@ -33,6 +33,11 @@ use flock_core::proof::{R1csClaim, R1csProofLigerito, ZClaim, bind_statement};
 use flock_core::r1cs::BlockR1cs;
 use flock_core::zerocheck;
 
+enum FastLincheckInput {
+    Stripe(Vec<u8>),
+    BlockMajor,
+}
+
 /// Construct a multilinear `x_outer_full` of length `m − k_skip` from a
 /// QuirkyPoint: concatenate `x_inner_rest` and `x_outer`. This is the format
 /// the PCS expects (k_skip = 6 absorbed via `z_skip`; everything else is
@@ -211,6 +216,58 @@ pub fn prove_fast_ligerito_from_witness<Ch: Challenger>(
     prefaulted_codeword: Option<Vec<F128>>,
     challenger: &mut Ch,
 ) -> (R1csProofLigerito, Commitment, R1csClaim) {
+    prove_fast_ligerito_from_witness_inner(
+        r1cs,
+        pcs_params,
+        z_packed,
+        a_packed_f128,
+        b_packed_f128,
+        FastLincheckInput::Stripe(z_packed_lincheck),
+        lincheck_circuit,
+        prefaulted_codeword,
+        challenger,
+    )
+}
+
+/// Stripe-free BLAKE3 fast path. `z_packed` remains owned by the pipeline for
+/// the PCS open; lincheck borrows it in canonical block-major order only after
+/// the outer challenge is available.
+#[allow(clippy::too_many_arguments)]
+pub fn prove_fast_ligerito_from_block_major_witness<Ch: Challenger>(
+    r1cs: &BlockR1cs,
+    pcs_params: &PcsParams,
+    z_packed: Vec<F128>,
+    a_packed_f128: Vec<F128>,
+    b_packed_f128: Vec<F128>,
+    lincheck_circuit: &dyn lincheck::LincheckCircuit,
+    prefaulted_codeword: Option<Vec<F128>>,
+    challenger: &mut Ch,
+) -> (R1csProofLigerito, Commitment, R1csClaim) {
+    prove_fast_ligerito_from_witness_inner(
+        r1cs,
+        pcs_params,
+        z_packed,
+        a_packed_f128,
+        b_packed_f128,
+        FastLincheckInput::BlockMajor,
+        lincheck_circuit,
+        prefaulted_codeword,
+        challenger,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn prove_fast_ligerito_from_witness_inner<Ch: Challenger>(
+    r1cs: &BlockR1cs,
+    pcs_params: &PcsParams,
+    z_packed: Vec<F128>,
+    a_packed_f128: Vec<F128>,
+    b_packed_f128: Vec<F128>,
+    lincheck_input: FastLincheckInput,
+    lincheck_circuit: &dyn lincheck::LincheckCircuit,
+    prefaulted_codeword: Option<Vec<F128>>,
+    challenger: &mut Ch,
+) -> (R1csProofLigerito, Commitment, R1csClaim) {
     let log_n = r1cs.m - pcs::LOG_PACKING;
     let lig_config =
         pcs::ligerito::prover_config_for(log_n, pcs_params.log_batch_size, pcs_params.profile)
@@ -226,13 +283,13 @@ pub fn prove_fast_ligerito_from_witness<Ch: Challenger>(
         z_packed,
         s_hat_v_ab,
         s_hat_v_c,
-    } = prove_fast_core_with_codeword(
+    } = prove_fast_core_with_codeword_inner(
         r1cs,
         pcs_params,
         z_packed,
         a_packed_f128,
         b_packed_f128,
-        z_packed_lincheck,
+        lincheck_input,
         lincheck_circuit,
         prefaulted_codeword,
         challenger,
@@ -334,10 +391,42 @@ pub fn prove_fast_core_with_codeword<Ch: Challenger>(
     prefaulted_codeword: Option<Vec<F128>>,
     challenger: &mut Ch,
 ) -> ProveCore {
+    prove_fast_core_with_codeword_inner(
+        r1cs,
+        pcs_params,
+        z_packed,
+        a_packed_f128,
+        b_packed_f128,
+        FastLincheckInput::Stripe(z_packed_lincheck),
+        lincheck_circuit,
+        prefaulted_codeword,
+        challenger,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn prove_fast_core_with_codeword_inner<Ch: Challenger>(
+    r1cs: &BlockR1cs,
+    pcs_params: &PcsParams,
+    z_packed: Vec<F128>,
+    a_packed_f128: Vec<F128>,
+    b_packed_f128: Vec<F128>,
+    lincheck_input: FastLincheckInput,
+    lincheck_circuit: &dyn lincheck::LincheckCircuit,
+    prefaulted_codeword: Option<Vec<F128>>,
+    challenger: &mut Ch,
+) -> ProveCore {
     assert!(
         r1cs.c0_is_identity(),
         "prove_fast_core_with_codeword requires the C = I convention"
     );
+    if matches!(&lincheck_input, FastLincheckInput::BlockMajor) {
+        assert_eq!(
+            r1cs.layout,
+            flock_core::r1cs::WitnessLayout::RowMajor,
+            "direct lincheck fold requires canonical block-major z"
+        );
+    }
     let (commitment, prover_data) = match prefaulted_codeword {
         Some(buf) => pcs::commit_into(&z_packed, pcs_params, buf),
         None => pcs::commit(&z_packed, pcs_params),
@@ -374,20 +463,34 @@ pub fn prove_fast_core_with_codeword<Ch: Challenger>(
 
     // Capture lincheck's pre-sumcheck z_vec so the PCS open can derive the
     // AB-claim's `s_hat_v` from it (skips fold_1b_rows for AB).
-    let (lc_proof, lc_claim, z_vec_pre) = lincheck::prove_padded_capture_z_vec(
-        &z_packed_lincheck,
-        r1cs.m,
-        r1cs.k_log,
-        r1cs.k_skip,
-        r1cs.useful_bits,
-        lincheck_circuit,
-        &x_ab,
-        challenger,
-    );
-    // The lincheck stripe copy of z is dead from here on. Keep its resident
-    // allocation for the next same-process proof (the benchmark's mandatory
-    // warm-up), instead of faulting 2^(m-3) fresh byte pages again.
-    crate::r1cs_hashes::common::recycle_lincheck_stripe(z_packed_lincheck);
+    let (lc_proof, lc_claim, z_vec_pre) = match lincheck_input {
+        FastLincheckInput::Stripe(z_packed_lincheck) => {
+            let result = lincheck::prove_padded_capture_z_vec(
+                &z_packed_lincheck,
+                r1cs.m,
+                r1cs.k_log,
+                r1cs.k_skip,
+                r1cs.useful_bits,
+                lincheck_circuit,
+                &x_ab,
+                challenger,
+            );
+            // Keep the stripe allocation resident for unchanged stripe-based
+            // callers' next same-process proof.
+            crate::r1cs_hashes::common::recycle_lincheck_stripe(z_packed_lincheck);
+            result
+        }
+        FastLincheckInput::BlockMajor => lincheck::prove_padded_capture_z_vec_block_major(
+            &z_packed,
+            r1cs.m,
+            r1cs.k_log,
+            r1cs.k_skip,
+            r1cs.useful_bits,
+            lincheck_circuit,
+            &x_ab,
+            challenger,
+        ),
+    };
 
     let ab = ZClaim {
         point: r1cs.ab_claim_point(lc_claim.r_inner_skip, &lc_claim.r_inner_rest, &x_ab.x_outer),
@@ -457,11 +560,68 @@ pub fn prove_fast_ligerito_timed<Ch: Challenger>(
     prefaulted_codeword: Option<Vec<F128>>,
     challenger: &mut Ch,
 ) -> (R1csProofLigerito, Commitment, R1csClaim, ProvePhaseTimings) {
+    prove_fast_ligerito_timed_inner(
+        r1cs,
+        pcs_params,
+        z_packed,
+        a_packed_f128,
+        b_packed_f128,
+        FastLincheckInput::Stripe(z_packed_lincheck),
+        lincheck_circuit,
+        prefaulted_codeword,
+        challenger,
+    )
+}
+
+/// Timed counterpart of [`prove_fast_ligerito_from_block_major_witness`].
+#[allow(clippy::too_many_arguments)]
+pub fn prove_fast_ligerito_timed_from_block_major_witness<Ch: Challenger>(
+    r1cs: &BlockR1cs,
+    pcs_params: &PcsParams,
+    z_packed: Vec<F128>,
+    a_packed_f128: Vec<F128>,
+    b_packed_f128: Vec<F128>,
+    lincheck_circuit: &dyn lincheck::LincheckCircuit,
+    prefaulted_codeword: Option<Vec<F128>>,
+    challenger: &mut Ch,
+) -> (R1csProofLigerito, Commitment, R1csClaim, ProvePhaseTimings) {
+    prove_fast_ligerito_timed_inner(
+        r1cs,
+        pcs_params,
+        z_packed,
+        a_packed_f128,
+        b_packed_f128,
+        FastLincheckInput::BlockMajor,
+        lincheck_circuit,
+        prefaulted_codeword,
+        challenger,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn prove_fast_ligerito_timed_inner<Ch: Challenger>(
+    r1cs: &BlockR1cs,
+    pcs_params: &PcsParams,
+    z_packed: Vec<F128>,
+    a_packed_f128: Vec<F128>,
+    b_packed_f128: Vec<F128>,
+    lincheck_input: FastLincheckInput,
+    lincheck_circuit: &dyn lincheck::LincheckCircuit,
+    prefaulted_codeword: Option<Vec<F128>>,
+    challenger: &mut Ch,
+) -> (R1csProofLigerito, Commitment, R1csClaim, ProvePhaseTimings) {
     use std::time::Instant;
     assert!(
         r1cs.c0_is_identity(),
         "prove_fast_ligerito_timed requires the C = I convention"
     );
+    if matches!(&lincheck_input, FastLincheckInput::BlockMajor) {
+        assert_eq!(
+            r1cs.layout,
+            flock_core::r1cs::WitnessLayout::RowMajor,
+            "direct lincheck fold requires canonical block-major z"
+        );
+    }
     let mut t = ProvePhaseTimings::default();
 
     let log_n = r1cs.m - pcs::LOG_PACKING;
@@ -507,17 +667,32 @@ pub fn prove_fast_ligerito_timed<Ch: Challenger>(
 
     // --- lincheck + base-claim / s_hat_v setup ---
     let t0 = Instant::now();
-    let (lc_proof, lc_claim, z_vec_pre) = lincheck::prove_padded_capture_z_vec(
-        &z_packed_lincheck,
-        r1cs.m,
-        r1cs.k_log,
-        r1cs.k_skip,
-        r1cs.useful_bits,
-        lincheck_circuit,
-        &x_ab,
-        challenger,
-    );
-    crate::r1cs_hashes::common::recycle_lincheck_stripe(z_packed_lincheck);
+    let (lc_proof, lc_claim, z_vec_pre) = match lincheck_input {
+        FastLincheckInput::Stripe(z_packed_lincheck) => {
+            let result = lincheck::prove_padded_capture_z_vec(
+                &z_packed_lincheck,
+                r1cs.m,
+                r1cs.k_log,
+                r1cs.k_skip,
+                r1cs.useful_bits,
+                lincheck_circuit,
+                &x_ab,
+                challenger,
+            );
+            crate::r1cs_hashes::common::recycle_lincheck_stripe(z_packed_lincheck);
+            result
+        }
+        FastLincheckInput::BlockMajor => lincheck::prove_padded_capture_z_vec_block_major(
+            &z_packed,
+            r1cs.m,
+            r1cs.k_log,
+            r1cs.k_skip,
+            r1cs.useful_bits,
+            lincheck_circuit,
+            &x_ab,
+            challenger,
+        ),
+    };
     let ab = ZClaim {
         point: r1cs.ab_claim_point(lc_claim.r_inner_skip, &lc_claim.r_inner_rest, &x_ab.x_outer),
         value: lc_claim.w,

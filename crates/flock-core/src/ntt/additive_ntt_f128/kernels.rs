@@ -72,7 +72,8 @@ pub(super) fn butterfly_fused_2layer(
     portable::butterfly_fused_2layer(a, b, c, d, t_outer, t_inner_a, t_inner_b);
 }
 
-/// Process one fused-three-layer row group across every interleaved NTT lane.
+/// Process one fused-three-layer row group across the interleaved lane prefix
+/// `0..active_lanes`; the remaining lanes are left untouched.
 ///
 /// # Safety
 /// The caller must ensure the eight selected rows are valid and that
@@ -84,7 +85,9 @@ pub(super) unsafe fn butterfly_fused_3layer_row(
     num_ntts: usize,
     r: usize,
     twiddles: &[F128; 7],
+    active_lanes: usize,
 ) {
+    debug_assert!(active_lanes <= num_ntts);
     #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
     if twiddles[0].is_zero() && twiddles[1].is_zero() && twiddles[3].is_zero() {
         // Block zero of every fused pass has the seed's sparse tree shape.
@@ -99,16 +102,27 @@ pub(super) unsafe fn butterfly_fused_3layer_row(
                 num_ntts,
                 r,
                 &sparse_twiddles,
+                active_lanes,
             )
         }
         return;
     }
 
     // SAFETY: forwarded caller contract.
-    unsafe { portable::butterfly_fused_3layer_row(ptr, eighth, num_ntts, r, twiddles) }
+    unsafe {
+        portable::butterfly_fused_3layer_row(
+            ptr,
+            eighth,
+            num_ntts,
+            r,
+            twiddles,
+            active_lanes,
+        )
+    }
 }
 
-/// Process one fused-three-layer row group from a separate source buffer.
+/// Process one fused-three-layer row group from a separate source buffer for
+/// lanes `0..active_lanes`; the remaining destination lanes are untouched.
 ///
 /// # Safety
 /// The caller must ensure the eight selected source rows are valid, the eight
@@ -123,15 +137,27 @@ pub(super) unsafe fn butterfly_fused_3layer_row_from(
     num_ntts: usize,
     r: usize,
     twiddles: &[F128; 7],
+    active_lanes: usize,
 ) {
     // SAFETY: forwarded caller contract.
-    unsafe { portable::butterfly_fused_3layer_row_from(src, dst, eighth, num_ntts, r, twiddles) }
+    unsafe {
+        portable::butterfly_fused_3layer_row_from(
+            src,
+            dst,
+            eighth,
+            num_ntts,
+            r,
+            twiddles,
+            active_lanes,
+        )
+    }
 }
 
 /// Process the sparse-twiddle first output block of the rate-1/2 seed.
 ///
 /// Its layer-1 twiddle, left layer-2 twiddle, and left layer-3 twiddle are
-/// zero. `twiddles` contains only the four remaining non-zero tree values.
+/// zero. `twiddles` contains only the four remaining non-zero tree values;
+/// only lanes `0..active_lanes` are written.
 ///
 /// # Safety
 /// Same source/destination validity, non-aliasing, and disjoint-write contract
@@ -145,10 +171,73 @@ pub(super) unsafe fn butterfly_fused_3layer_row_from_sparse(
     num_ntts: usize,
     r: usize,
     twiddles: &[F128; 4],
+    active_lanes: usize,
 ) {
     // SAFETY: forwarded caller contract.
     unsafe {
-        portable::butterfly_fused_3layer_row_from_sparse(src, dst, eighth, num_ntts, r, twiddles)
+        portable::butterfly_fused_3layer_row_from_sparse(
+            src,
+            dst,
+            eighth,
+            num_ntts,
+            r,
+            twiddles,
+            active_lanes,
+        )
+    }
+}
+
+/// Zero an uncomputed lane suffix in the eight destination rows selected by
+/// one fused-three-layer row group.
+///
+/// # Safety
+/// The caller must provide valid destination geometry and exclusive access to
+/// the selected row suffixes.
+#[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+#[inline]
+pub(super) unsafe fn zero_fused_3layer_row_tail(
+    dst: *mut F128,
+    eighth: usize,
+    num_ntts: usize,
+    r: usize,
+    dense_lanes: usize,
+) {
+    debug_assert!(dense_lanes <= num_ntts);
+    unsafe {
+        for i in 0..8 {
+            std::ptr::write_bytes(
+                dst.add((i * eighth + r) * num_ntts + dense_lanes),
+                0,
+                num_ntts - dense_lanes,
+            );
+        }
+    }
+}
+
+/// Fused final three layers for an interleaved buffer with an exact zero
+/// suffix on every odd input row.
+///
+/// # Safety
+/// The caller must provide the single eight-row group at the deepest three
+/// layers and exclusive access to it.
+#[inline]
+pub(super) unsafe fn butterfly_fused_3layer_row_final_odd_zero(
+    ptr: *mut F128,
+    num_ntts: usize,
+    dense_lanes: usize,
+    twiddles: &[F128; 7],
+) {
+    debug_assert!(dense_lanes <= num_ntts);
+    // SAFETY: forwarded caller contract. The dense prefix uses the unchanged
+    // fused-3 kernel, including its sparse-twiddle dispatch.
+    unsafe {
+        butterfly_fused_3layer_row(ptr, 1, num_ntts, 0, twiddles, dense_lanes);
+        portable::butterfly_fused_3layer_row_final_odd_zero_tail(
+            ptr,
+            num_ntts,
+            dense_lanes,
+            twiddles,
+        );
     }
 }
 

@@ -191,7 +191,21 @@ fn finalize_commit(
     // and any target-specific fusion, so this timer covers the complete
     // logical encoding stage.
     let ntt = AdditiveNttF128::standard(params.k_code());
-    ntt.rs_encode_interleaved(z_packed, &mut codeword, params.num_ntts());
+    if params.log_inv_rate == 1 && params.num_ntts() == 64 {
+        // A row-major BLAKE3 block is 128 F128 coefficients. With 64 lanes it
+        // occupies two NTT rows; USEFUL_BITS=15_409 means odd-row lane 56 is
+        // partial and lanes 57..63 are exact padding zeros. The encoder checks
+        // this candidate during its fused seed, so same-shaped non-BLAKE3
+        // commits fall back exactly without a separate input scan.
+        ntt.rs_encode_interleaved_odd_row_zero_candidate(
+            z_packed,
+            &mut codeword,
+            params.num_ntts(),
+            57,
+        );
+    } else {
+        ntt.rs_encode_interleaved(z_packed, &mut codeword, params.num_ntts());
+    }
     if timing {
         eprintln!(
             "[commit-timing] ntt: {:.2} ms",

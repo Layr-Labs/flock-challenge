@@ -404,6 +404,7 @@ fn cmd_verify(args: Args) -> Result<(), String> {
             verify_ligerito_with_layout(
                 &setup.r1cs,
                 &blake3_chain::CHAIN_LAYOUT,
+                &blake3_chain::BLAKE3_LINCHECK_CIRCUIT,
                 &bundle.commitment,
                 &bundle,
                 n_log,
@@ -416,6 +417,7 @@ fn cmd_verify(args: Args) -> Result<(), String> {
             verify_ligerito_with_layout(
                 &setup.r1cs,
                 &sha2_chain::CHAIN_LAYOUT,
+                setup.r1cs.csc_lincheck_circuit(),
                 &bundle.commitment,
                 &bundle,
                 n_log,
@@ -428,6 +430,7 @@ fn cmd_verify(args: Args) -> Result<(), String> {
             verify_ligerito_with_layout(
                 &setup.r1cs,
                 &keccak_chain::CHAIN_LAYOUT,
+                setup.r1cs.csc_lincheck_circuit(),
                 &bundle.commitment,
                 &bundle,
                 n_log,
@@ -453,13 +456,13 @@ fn cmd_verify(args: Args) -> Result<(), String> {
 fn verify_ligerito_with_layout(
     r1cs: &flock_prover::r1cs::BlockR1cs,
     layout: &chain_common::ChainLayout,
+    lincheck_circuit: &dyn flock_prover::lincheck::LincheckCircuit,
     commitment: &Commitment,
     bundle: &ChainProofBundleLigerito,
     n_log: usize,
     pcs_params: &flock_prover::pcs::PcsParams,
     challenger: &mut FsChallenger,
 ) -> Result<(), chain_common::ChainVerifyError> {
-    let lc_circuit = r1cs.csc_lincheck_circuit();
     chain_common::verify_chain_ligerito_generic(
         r1cs,
         layout,
@@ -468,7 +471,7 @@ fn verify_ligerito_with_layout(
         n_log,
         &bundle.cv_0_phys,
         &bundle.cv_last_phys,
-        lc_circuit,
+        lincheck_circuit,
         pcs_params,
         challenger,
     )

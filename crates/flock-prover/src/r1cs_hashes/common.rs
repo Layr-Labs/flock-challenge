@@ -281,6 +281,73 @@ where
     )
 }
 
+/// Stripe-free sibling of [`drive_witness_packed_and_lincheck_overwrite`].
+/// Produces only canonical block-major `(z, a, b)` for callers that fold
+/// lincheck directly from `z` after the outer challenge is sampled.
+pub(crate) fn drive_witness_packed_overwrite<S: Sync, F>(
+    initial_states: &[S],
+    padding: &S,
+    n_blocks_log: usize,
+    k_log: usize,
+    per_block: F,
+) -> (Vec<F128>, Vec<F128>, Vec<F128>)
+where
+    F: Fn(&S, &mut [u64], &mut [u64], &mut [u64]) + Sync,
+{
+    use rayon::prelude::*;
+
+    let k = 1usize << k_log;
+    let f128_per_block = k / 128;
+    let n_total = 1usize << n_blocks_log;
+    assert!(initial_states.len() <= n_total);
+    assert!(
+        n_total >= 8 && n_total.is_multiple_of(8),
+        "row-major witness driver requires at least 8 block slots"
+    );
+
+    let total_f128 = n_total * f128_per_block;
+    let mut z = flock_core::scratch::take_f128(total_f128);
+    let mut a = flock_core::scratch::take_f128(total_f128);
+    let mut b = flock_core::scratch::take_f128(total_f128);
+
+    z.par_chunks_mut(8 * f128_per_block)
+        .zip(a.par_chunks_mut(8 * f128_per_block))
+        .zip(b.par_chunks_mut(8 * f128_per_block))
+        .enumerate()
+        .for_each(|(g, ((z_grp, a_grp), b_grp))| {
+            for k_in in 0..8 {
+                let global_idx = 8 * g + k_in;
+                let initial = initial_states.get(global_idx).unwrap_or(padding);
+                let z_chunk = &mut z_grp[k_in * f128_per_block..(k_in + 1) * f128_per_block];
+                let a_chunk = &mut a_grp[k_in * f128_per_block..(k_in + 1) * f128_per_block];
+                let b_chunk = &mut b_grp[k_in * f128_per_block..(k_in + 1) * f128_per_block];
+                // SAFETY: F128 is repr(C, align(16)) with two little-endian
+                // u64 fields, and the producer overwrites every destination.
+                let z_u64 = unsafe {
+                    std::slice::from_raw_parts_mut(
+                        z_chunk.as_mut_ptr() as *mut u64,
+                        z_chunk.len() * 2,
+                    )
+                };
+                let a_u64 = unsafe {
+                    std::slice::from_raw_parts_mut(
+                        a_chunk.as_mut_ptr() as *mut u64,
+                        a_chunk.len() * 2,
+                    )
+                };
+                let b_u64 = unsafe {
+                    std::slice::from_raw_parts_mut(
+                        b_chunk.as_mut_ptr() as *mut u64,
+                        b_chunk.len() * 2,
+                    )
+                };
+                per_block(initial, z_u64, a_u64, b_u64);
+            }
+        });
+
+    (z, a, b)
+}
+
 fn drive_witness_packed_and_lincheck_impl<S: Sync, F>(
     initial_states: &[S],
     padding: Option<&S>,

@@ -51,7 +51,11 @@ pub(super) fn bit_transpose_64bytes(input: &[u8; 64], output: &mut [u8; 64]) {
 }
 
 #[inline]
-pub(super) fn bit_transpose_64bytes_and(a: &[u8; 64], b: &[u8; 64], output: &mut [u8; 64]) {
+pub(super) fn bit_transpose_64bytes_and(
+    a: &[u8; 64],
+    b: &[u8; 64],
+    output: &mut [u8; 64],
+) {
     #[cfg(target_arch = "aarch64")]
     // SAFETY: aarch64 statically guarantees NEON.
     unsafe {

@@ -92,19 +92,17 @@ pub fn give_f128(v: Vec<F128>) {
     }
 }
 
-/// Pre-warm the pool for proves at witness size `2^m`: allocate and
-/// first-touch the full prove-cycle buffer set once, in parallel, then park
-/// it in the pool. Called from the per-hash Setup constructors, this moves
-/// ALL page-fault cost off the prove path — including the first prove — so
-/// proving performs no memory-management syscalls on any machine. (This is
-/// the machine-independent alternative to overlapping the faults with other
-/// work: a race between fault cost and the hiding window flips sign across
-/// machines; eliminated work doesn't.)
+/// Seed the pool for proves at witness size `2^m` before the caller's warm
+/// proof. The warm proof itself necessarily creates, fully writes, and
+/// recycles all three `2^(m-6)` buffers needed by the measured proof: the L0
+/// codeword and zerocheck's two round-2 outputs. Prewarming that size would
+/// only add an earlier full-memory pass.
 ///
-/// The set (sizes in F128s): 2^(m-6)-class — L0 codeword, zerocheck round-2
-/// a/b, open-stage codeword ping-pong ×2 → 5 buffers; 2^(m-7)-class — witness
-/// z/a/b, zerocheck tail ping-pong ×2, open-stage transients, rs_eq_ind ×2,
-/// b_combined → 11 buffers. ~1.1 GB resident at m = 29; release with
+/// The measured peak needs five `2^(m-7)` buffers (witness z/a/b plus the two
+/// zerocheck tail buffers). Seed seven because the warm proof consumes z and
+/// b_combined in AArch64 Ligerito folds without returning their original
+/// allocations to this pool; the other five remain resident for the measured
+/// proof. At m = 32 this touches 3.5 GiB here instead of 10.5 GiB. Release with
 /// [`clear`].
 pub fn prewarm_prover(m: usize) {
     use rayon::prelude::*;
@@ -112,12 +110,8 @@ pub fn prewarm_prover(m: usize) {
         return;
     }
     let small = 1usize << (m - 7);
-    let large = 1usize << (m - 6);
-    let mut bufs: Vec<Vec<F128>> = Vec::new();
-    for _ in 0..5 {
-        bufs.push(take_f128(large));
-    }
-    for _ in 0..11 {
+    let mut bufs: Vec<Vec<F128>> = Vec::with_capacity(7);
+    for _ in 0..7 {
         bufs.push(take_f128(small));
     }
     // First-touch every page of every buffer, all cores. Already-resident

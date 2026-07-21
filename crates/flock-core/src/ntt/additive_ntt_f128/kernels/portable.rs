@@ -54,6 +54,7 @@ pub(super) unsafe fn butterfly_fused_3layer_row(
     num_ntts: usize,
     r: usize,
     twiddles: &[F128; 7],
+    active_lanes: usize,
 ) {
     #[inline(always)]
     fn butterfly(values: &mut [F128; 8], u: usize, v: usize, twiddle: F128) {
@@ -62,9 +63,10 @@ pub(super) unsafe fn butterfly_fused_3layer_row(
         values[u] = new_u;
     }
 
+    debug_assert!(active_lanes <= num_ntts);
     // SAFETY: caller supplies the pointer geometry and disjointness contract.
     unsafe {
-        for lane in 0..num_ntts {
+        for lane in 0..active_lanes {
             let mut values = [F128::ZERO; 8];
             for (i, value) in values.iter_mut().enumerate() {
                 *value = *ptr.add((i * eighth + r) * num_ntts + lane);
@@ -99,6 +101,7 @@ pub(super) unsafe fn butterfly_fused_3layer_row_from(
     num_ntts: usize,
     r: usize,
     twiddles: &[F128; 7],
+    active_lanes: usize,
 ) {
     #[inline(always)]
     fn butterfly(values: &mut [F128; 8], u: usize, v: usize, twiddle: F128) {
@@ -107,9 +110,10 @@ pub(super) unsafe fn butterfly_fused_3layer_row_from(
         values[u] = new_u;
     }
 
+    debug_assert!(active_lanes <= num_ntts);
     // SAFETY: caller supplies the pointer geometry and disjointness contract.
     unsafe {
-        for lane in 0..num_ntts {
+        for lane in 0..active_lanes {
             let mut values = [F128::ZERO; 8];
             // Complete all reads for this lane before any write, which also
             // permits the exact in-place use from the block-zero fast path.
@@ -136,8 +140,8 @@ pub(super) unsafe fn butterfly_fused_3layer_row_from(
 
 /// # Safety
 /// The caller guarantees that every selected source and destination row is
-/// valid, source and destination do not overlap, and concurrent calls write
-/// disjoint destination row groups.
+/// valid, source and destination are either identical or do not overlap, and
+/// concurrent calls write disjoint destination row groups.
 #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
 pub(super) unsafe fn butterfly_fused_3layer_row_from_sparse(
     src: *const F128,
@@ -146,6 +150,7 @@ pub(super) unsafe fn butterfly_fused_3layer_row_from_sparse(
     num_ntts: usize,
     r: usize,
     twiddles: &[F128; 4],
+    active_lanes: usize,
 ) {
     #[inline(always)]
     fn butterfly(values: &mut [F128; 8], u: usize, v: usize, twiddle: F128) {
@@ -158,8 +163,9 @@ pub(super) unsafe fn butterfly_fused_3layer_row_from_sparse(
     // [layer2-right, layer3 blocks 1, 2, 3]. The seven omitted butterflies
     // have t=0, so `(u, v)` becomes `(u, v+u)` without a field multiply.
     let [t_l2_right, t_l3_1, t_l3_2, t_l3_3] = *twiddles;
+    debug_assert!(active_lanes <= num_ntts);
     unsafe {
-        for lane in 0..num_ntts {
+        for lane in 0..active_lanes {
             let mut values = [F128::ZERO; 8];
             for (i, value) in values.iter_mut().enumerate() {
                 *value = *src.add((i * eighth + r) * num_ntts + lane);
@@ -185,6 +191,55 @@ pub(super) unsafe fn butterfly_fused_3layer_row_from_sparse(
 
             for (i, value) in values.iter().enumerate() {
                 *dst.add((i * eighth + r) * num_ntts + lane) = *value;
+            }
+        }
+    }
+}
+
+/// Finish a fused three-layer group whose third layer is the deepest NTT
+/// layer. The caller has already transformed lanes `0..dense_lanes` normally.
+/// In the remaining lanes every odd input row is zero, so the first two layers
+/// operate only on rows 0, 2, 4, 6 and the final `(even, odd=0)` butterflies
+/// are exact copies with no multiplication.
+///
+/// # Safety
+/// The caller guarantees one complete eight-row group (`eighth == 1`) and
+/// valid lanes `dense_lanes..num_ntts`.
+#[inline]
+pub(super) unsafe fn butterfly_fused_3layer_row_final_odd_zero_tail(
+    ptr: *mut F128,
+    num_ntts: usize,
+    dense_lanes: usize,
+    twiddles: &[F128; 7],
+) {
+    #[inline(always)]
+    fn butterfly(values: &mut [F128; 4], u: usize, v: usize, twiddle: F128) {
+        let new_u = values[u] + values[v] * twiddle;
+        values[v] += new_u;
+        values[u] = new_u;
+    }
+
+    debug_assert!(dense_lanes <= num_ntts);
+    unsafe {
+        for lane in dense_lanes..num_ntts {
+            let mut even = [
+                *ptr.add(lane),
+                *ptr.add(2 * num_ntts + lane),
+                *ptr.add(4 * num_ntts + lane),
+                *ptr.add(6 * num_ntts + lane),
+            ];
+
+            // Layers L and L+1 preserve row parity. Their even-row trees are
+            // (0,4), (2,6), then (0,2), (4,6), respectively.
+            butterfly(&mut even, 0, 2, twiddles[0]);
+            butterfly(&mut even, 1, 3, twiddles[0]);
+            butterfly(&mut even, 0, 1, twiddles[1]);
+            butterfly(&mut even, 2, 3, twiddles[2]);
+
+            for (i, value) in even.iter().copied().enumerate() {
+                let even_row = 2 * i;
+                *ptr.add(even_row * num_ntts + lane) = value;
+                *ptr.add((even_row + 1) * num_ntts + lane) = value;
             }
         }
     }

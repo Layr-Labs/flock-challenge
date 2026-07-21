@@ -95,6 +95,7 @@ use flock_core::pcs::{Commitment, PcsParams};
 use flock_core::proof::R1csClaim;
 use flock_core::r1cs::{BlockR1cs, SparseBinaryMatrix};
 use flock_core::verifier;
+use std::sync::OnceLock;
 
 // ---------------------------------------------------------------------------
 // Public constants
@@ -632,184 +633,232 @@ pub fn build_block_r1cs(n_blocks_log: usize) -> BlockR1cs {
 }
 
 // ---------------------------------------------------------------------------
-// Lincheck circuit walker — mirrors `build_matrices`. Same structure as
-// `blake3::Blake3LincheckCircuit` but uses this module's I/O-aligned slot
-// positions (cv_bit/m_bit/etc.).
+// Lincheck reverse tape. This mirrors `build_matrices` at word granularity and
+// applies the transpose without expanding each intermediate bit into its full
+// symbolic slot support.
 // ---------------------------------------------------------------------------
 
-#[inline]
-fn scatter_add_carry_rows(
-    comb: &mut [F128],
-    alpha: F128,
-    eq_inner: &[F128],
-    x: &Word,
-    y: &Word,
-    carry_base: usize,
-) -> Word {
-    for i in 0..CARRY_BITS_PER_ADD {
-        let row = carry_base + i;
-        let e = eq_inner[row];
-        let ea = alpha * e;
-        for &slot in x.bits[i].iter() {
-            comb[slot] += ea;
-        }
-        for j in 0..i {
-            comb[carry_base + j] += ea;
-        }
-        for &slot in y.bits[i].iter() {
-            comb[slot] += e;
-        }
-        for j in 0..i {
-            comb[carry_base + j] += e;
-        }
-    }
-    Word::add_sum(x, y, carry_base)
+type WordId = usize;
+
+#[derive(Clone, Copy)]
+enum WordDef {
+    /// A committed 32-bit word at columns `base..base + 32`.
+    Leaf(usize),
+    /// A word whose set bits reference the shared constant column.
+    Const(u32),
+    /// The unslotted sum `x + y`; carry slots remain committed leaves.
+    Add {
+        x: WordId,
+        y: WordId,
+        carry_base: usize,
+    },
+    /// `rotr(x XOR y, rot)`.
+    XorRot {
+        x: WordId,
+        y: WordId,
+        rot: usize,
+    },
 }
 
-#[inline]
-fn scatter_lin_id_row(
-    comb: &mut [F128],
-    alpha: F128,
-    eq_inner: &[F128],
-    row: usize,
-    word_bits_i: &[usize],
-) {
-    let e = eq_inner[row];
-    let ea = alpha * e;
-    for &slot in word_bits_i.iter() {
-        comb[slot] += ea;
+#[derive(Clone, Copy)]
+struct RowSeed {
+    raw: WordId,
+    row_base: usize,
+}
+
+#[derive(Default)]
+struct Blake3LincheckSchedule {
+    defs: Vec<WordDef>,
+    row_seeds: Vec<RowSeed>,
+}
+
+impl Blake3LincheckSchedule {
+    fn push(&mut self, def: WordDef) -> WordId {
+        let id = self.defs.len();
+        self.defs.push(def);
+        id
     }
-    comb[Z_CONST_POS] += e;
+
+    fn leaf(&mut self, base: usize) -> WordId {
+        self.push(WordDef::Leaf(base))
+    }
+
+    fn constant(&mut self, value: u32) -> WordId {
+        self.push(WordDef::Const(value))
+    }
+
+    fn add(&mut self, x: WordId, y: WordId, carry_base: usize) -> WordId {
+        self.push(WordDef::Add { x, y, carry_base })
+    }
+
+    fn xor_rot(&mut self, x: WordId, y: WordId, rot: usize) -> WordId {
+        self.push(WordDef::XorRot { x, y, rot })
+    }
+
+    fn seed_rows(&mut self, raw: WordId, row_base: usize) {
+        self.row_seeds.push(RowSeed { raw, row_base });
+    }
+
+    /// Input rows use their committed word directly on the A side.
+    fn input_word(&mut self, base: usize) -> WordId {
+        let word = self.leaf(base);
+        self.seed_rows(word, base);
+        word
+    }
+
+    /// Seed the raw A expression for a lin-id row, then sever the graph at the
+    /// newly committed word used by all later state reads.
+    fn materialize(&mut self, raw: WordId, row_base: usize) -> WordId {
+        self.seed_rows(raw, row_base);
+        self.leaf(row_base)
+    }
+}
+
+fn build_lincheck_schedule() -> Blake3LincheckSchedule {
+    let mut schedule = Blake3LincheckSchedule::default();
+
+    let cv: [WordId; 8] =
+        std::array::from_fn(|w| schedule.input_word(cv_bit(w, 0)));
+    let msg: [WordId; 16] =
+        std::array::from_fn(|i| schedule.input_word(m_bit(i, 0)));
+    let counter_lo = schedule.input_word(T_LO_BASE);
+    let counter_hi = schedule.input_word(T_HI_BASE);
+    let block_len = schedule.input_word(BLEN_BASE);
+    let flags = schedule.input_word(FLAGS_BASE);
+    let iv: [WordId; 4] = std::array::from_fn(|i| schedule.constant(BLAKE3_IV[i]));
+
+    let mut state = [
+        cv[0], cv[1], cv[2], cv[3], cv[4], cv[5], cv[6], cv[7], iv[0], iv[1], iv[2], iv[3],
+        counter_lo, counter_hi, block_len, flags,
+    ];
+    let msg_idx = per_round_msg_idx();
+
+    for r in 0..N_ROUNDS {
+        for g_in_round in 0..N_G_PER_ROUND {
+            let g = r * N_G_PER_ROUND + g_in_round;
+            let [la, lb, lc, ld] = G_LANES[g_in_round];
+            let [mx_idx, my_idx] = msg_idx[r][g_in_round];
+            let (a, b, c, d) = (state[la], state[lb], state[lc], state[ld]);
+
+            let tmp_0 = schedule.add(a, b, g_add_carry_bit(g, ADD_TMP0, 0));
+            let a_1 = schedule.add(tmp_0, msg[mx_idx], g_add_carry_bit(g, ADD_A1, 0));
+            let d_1 = schedule.xor_rot(d, a_1, 16);
+            let c_1 = schedule.add(c, d_1, g_add_carry_bit(g, ADD_C1, 0));
+            let b_1 = schedule.xor_rot(b, c_1, 12);
+            let tmp_1 = schedule.add(a_1, b_1, g_add_carry_bit(g, ADD_TMP1, 0));
+            let a_2 = schedule.add(tmp_1, msg[my_idx], g_add_carry_bit(g, ADD_A2, 0));
+            let d_2 = schedule.xor_rot(d_1, a_2, 8);
+            let c_2 = schedule.add(c_1, d_2, g_add_carry_bit(g, ADD_C2, 0));
+
+            let b_new_raw = schedule.xor_rot(b_1, c_2, 7);
+            let b_new = schedule.materialize(b_new_raw, g_lin_bit(g, LIN_B_NEW, 0));
+            let d_new = schedule.materialize(d_2, g_lin_bit(g, LIN_D_NEW, 0));
+
+            state[la] = a_2;
+            state[lb] = b_new;
+            state[lc] = c_2;
+            state[ld] = d_new;
+        }
+    }
+
+    // Final rows seed their raw expressions only: their committed C-side
+    // outputs are never read by a later A/B expression.
+    for w in 0..8 {
+        let lo = schedule.xor_rot(state[w], state[w + 8], 0);
+        schedule.seed_rows(lo, out_lo_bit(w, 0));
+        let hi = schedule.xor_rot(state[w + 8], cv[w], 0);
+        schedule.seed_rows(hi, out_hi_bit(w, 0));
+    }
+
+    schedule
+}
+
+static BLAKE3_LINCHECK_SCHEDULE: OnceLock<Blake3LincheckSchedule> = OnceLock::new();
+
+fn lincheck_schedule() -> &'static Blake3LincheckSchedule {
+    BLAKE3_LINCHECK_SCHEDULE.get_or_init(build_lincheck_schedule)
 }
 
 pub struct Blake3LincheckCircuit;
+
+/// Shared circuit for all specialized BLAKE3 prove and verify paths.
+pub static BLAKE3_LINCHECK_CIRCUIT: Blake3LincheckCircuit = Blake3LincheckCircuit;
 
 impl flock_core::lincheck::LincheckCircuit for Blake3LincheckCircuit {
     fn n_cols(&self) -> usize {
         K
     }
 
+    fn const_pin_col(&self) -> Option<usize> {
+        Some(Z_CONST_POS)
+    }
+
     fn fold_alpha_batched(&self, alpha: F128, eq_inner: &[F128]) -> Vec<F128> {
         assert_eq!(eq_inner.len(), K, "eq_inner length must equal n_cols = K");
+        let schedule = lincheck_schedule();
         let mut comb = vec![F128::ZERO; K];
+        let mut adjoints = vec![[F128::ZERO; WORD_BITS]; schedule.defs.len()];
 
-        // Const row.
-        let e0 = eq_inner[Z_CONST_POS];
-        comb[Z_CONST_POS] += alpha * e0;
-        comb[Z_CONST_POS] += e0;
+        // Constant self-loop: A = B = [Z_CONST_POS].
+        let e_const = eq_inner[Z_CONST_POS];
+        comb[Z_CONST_POS] += alpha * e_const + e_const;
 
-        // Input self-loops for cv, m, counter, blen, flags.
-        let input_emit = |comb: &mut [F128], base: usize, len: usize| {
-            for j in 0..len {
-                let s = base + j;
-                let e = eq_inner[s];
-                comb[s] += alpha * e;
+        // Every input, materialized, and output row has A = raw expression
+        // and B = [Z_CONST_POS].
+        for seed in &schedule.row_seeds {
+            for bit in 0..WORD_BITS {
+                let e = eq_inner[seed.row_base + bit];
+                adjoints[seed.raw][bit] += alpha * e;
                 comb[Z_CONST_POS] += e;
-            }
-        };
-        input_emit(&mut comb, CV_BASE, 8 * WORD_BITS);
-        input_emit(&mut comb, M_BASE, 16 * WORD_BITS);
-        input_emit(&mut comb, T_LO_BASE, WORD_BITS);
-        input_emit(&mut comb, T_HI_BASE, WORD_BITS);
-        input_emit(&mut comb, BLEN_BASE, WORD_BITS);
-        input_emit(&mut comb, FLAGS_BASE, WORD_BITS);
-
-        let msg_idx = per_round_msg_idx();
-        let mut state: [Word; 16] = initial_lane_words();
-
-        for r in 0..N_ROUNDS {
-            for g_in_round in 0..N_G_PER_ROUND {
-                let g = r * N_G_PER_ROUND + g_in_round;
-                let [la, lb, lc, ld] = G_LANES[g_in_round];
-                let [mx_idx, my_idx] = msg_idx[r][g_in_round];
-
-                let a = state[la].clone();
-                let b = state[lb].clone();
-                let c = state[lc].clone();
-                let d = state[ld].clone();
-                let mx = Word::from_slot_base(m_bit(mx_idx, 0));
-                let my = Word::from_slot_base(m_bit(my_idx, 0));
-
-                let tmp_0 = scatter_add_carry_rows(
-                    &mut comb,
-                    alpha,
-                    eq_inner,
-                    &a,
-                    &b,
-                    g_add_carry_bit(g, ADD_TMP0, 0),
-                );
-                let a_1 = scatter_add_carry_rows(
-                    &mut comb,
-                    alpha,
-                    eq_inner,
-                    &tmp_0,
-                    &mx,
-                    g_add_carry_bit(g, ADD_A1, 0),
-                );
-                let d_1 = d.xor(&a_1).dedup().rotr(16);
-                let c_1 = scatter_add_carry_rows(
-                    &mut comb,
-                    alpha,
-                    eq_inner,
-                    &c,
-                    &d_1,
-                    g_add_carry_bit(g, ADD_C1, 0),
-                );
-                let b_1 = b.xor(&c_1).dedup().rotr(12);
-                let tmp_1 = scatter_add_carry_rows(
-                    &mut comb,
-                    alpha,
-                    eq_inner,
-                    &a_1,
-                    &b_1,
-                    g_add_carry_bit(g, ADD_TMP1, 0),
-                );
-                let a_2 = scatter_add_carry_rows(
-                    &mut comb,
-                    alpha,
-                    eq_inner,
-                    &tmp_1,
-                    &my,
-                    g_add_carry_bit(g, ADD_A2, 0),
-                );
-                let d_2 = d_1.xor(&a_2).dedup().rotr(8);
-                let c_2 = scatter_add_carry_rows(
-                    &mut comb,
-                    alpha,
-                    eq_inner,
-                    &c_1,
-                    &d_2,
-                    g_add_carry_bit(g, ADD_C2, 0),
-                );
-
-                let b_new_word = b_1.xor(&c_2).dedup().rotr(7);
-                for i in 0..WORD_BITS {
-                    let s = g_lin_bit(g, LIN_B_NEW, i);
-                    scatter_lin_id_row(&mut comb, alpha, eq_inner, s, &b_new_word.bits[i]);
-                }
-                for i in 0..WORD_BITS {
-                    let s = g_lin_bit(g, LIN_D_NEW, i);
-                    scatter_lin_id_row(&mut comb, alpha, eq_inner, s, &d_2.bits[i]);
-                }
-
-                state[la] = a_2;
-                state[lb] = Word::from_slot_base(g_lin_bit(g, LIN_B_NEW, 0));
-                state[lc] = c_2;
-                state[ld] = Word::from_slot_base(g_lin_bit(g, LIN_D_NEW, 0));
             }
         }
 
-        for w in 0..8 {
-            let lo = state[w].xor(&state[w + 8]).dedup();
-            for i in 0..WORD_BITS {
-                let s = out_lo_bit(w, i);
-                scatter_lin_id_row(&mut comb, alpha, eq_inner, s, &lo.bits[i]);
-            }
-            let cv_w = Word::from_slot_base(cv_bit(w, 0));
-            let hi = state[w + 8].xor(&cv_w).dedup();
-            for i in 0..WORD_BITS {
-                let s = out_hi_bit(w, i);
-                scatter_lin_id_row(&mut comb, alpha, eq_inner, s, &hi.bits[i]);
+        for id in (0..schedule.defs.len()).rev() {
+            let q = adjoints[id];
+            match schedule.defs[id] {
+                WordDef::Leaf(base) => {
+                    for bit in 0..WORD_BITS {
+                        comb[base + bit] += q[bit];
+                    }
+                }
+                WordDef::Const(value) => {
+                    for bit in 0..WORD_BITS {
+                        if (value >> bit) & 1 == 1 {
+                            comb[Z_CONST_POS] += q[bit];
+                        }
+                    }
+                }
+                WordDef::Add { x, y, carry_base } => {
+                    // sum[i] = x[i] + y[i] + sum_{j<i} carry[j]. The same
+                    // prior carries occur in both sides of carry row i. Walk
+                    // downward so the two suffixes are ready at carry column i.
+                    let mut suffix_q = F128::ZERO;
+                    let mut suffix_carry_rows = F128::ZERO;
+                    for bit in (0..WORD_BITS).rev() {
+                        if bit < CARRY_BITS_PER_ADD {
+                            // Carry slots are committed leaves, not tape nodes.
+                            comb[carry_base + bit] += suffix_q + suffix_carry_rows;
+
+                            let e = eq_inner[carry_base + bit];
+                            let ae = alpha * e;
+                            adjoints[x][bit] += q[bit] + ae;
+                            adjoints[y][bit] += q[bit] + e;
+                            suffix_carry_rows += ae + e;
+                        } else {
+                            adjoints[x][bit] += q[bit];
+                            adjoints[y][bit] += q[bit];
+                        }
+                        suffix_q += q[bit];
+                    }
+                }
+                WordDef::XorRot { x, y, rot } => {
+                    // out[i] = x[(i + rot) mod 32] + y[(i + rot) mod 32].
+                    for out_bit in 0..WORD_BITS {
+                        let input_bit = (out_bit + rot) % WORD_BITS;
+                        adjoints[x][input_bit] += q[out_bit];
+                        adjoints[y][input_bit] += q[out_bit];
+                    }
+                }
             }
         }
 
@@ -1219,51 +1268,20 @@ pub fn generate_witness_with_ab_packed(
     Vec<flock_core::field::F128>,
     Vec<flock_core::field::F128>,
 ) {
-    use flock_core::field::F128;
-    use rayon::prelude::*;
-    let n_total = 1usize << n_blocks_log;
-    let n_blocks = blocks.len();
-    assert!(
-        n_blocks <= n_total,
-        "{n_blocks} compressions > 2^{n_blocks_log} = {n_total} slots"
-    );
-
-    const F128_PER_BLOCK: usize = K / 128;
-    let total_f128 = n_total * F128_PER_BLOCK;
-    let mut z = vec![F128::ZERO; total_f128];
-    let mut a = vec![F128::ZERO; total_f128];
-    let mut b = vec![F128::ZERO; total_f128];
-
     // Constant-wire pin (docs/const-wire-pin.md): padding slots get a valid
     // compression of the all-zero input (constant = 1), matching
     // [`generate_witness_with_ab_packed_and_lincheck`].
     let padding: Compression = ([0u32; 8], [0u32; 16], 0u64, 0u32, 0u32);
-
-    z.par_chunks_mut(F128_PER_BLOCK)
-        .zip(a.par_chunks_mut(F128_PER_BLOCK))
-        .zip(b.par_chunks_mut(F128_PER_BLOCK))
-        .enumerate()
-        .for_each(|(idx, ((z_c, a_c), b_c))| {
-            let (cv, m, t, bl, fl) = if idx < n_blocks {
-                &blocks[idx]
-            } else {
-                &padding
-            };
-            // SAFETY: F128 is repr(C, align(16)) with LE u64 halves — same
-            // byte layout as a u64 pair.
-            let z_u64: &mut [u64] = unsafe {
-                std::slice::from_raw_parts_mut(z_c.as_mut_ptr() as *mut u64, z_c.len() * 2)
-            };
-            let a_u64: &mut [u64] = unsafe {
-                std::slice::from_raw_parts_mut(a_c.as_mut_ptr() as *mut u64, a_c.len() * 2)
-            };
-            let b_u64: &mut [u64] = unsafe {
-                std::slice::from_raw_parts_mut(b_c.as_mut_ptr() as *mut u64, b_c.len() * 2)
-            };
+    super::common::drive_witness_packed_overwrite(
+        blocks,
+        &padding,
+        n_blocks_log,
+        K_LOG,
+        |block: &Compression, z_u64, a_u64, b_u64| {
+            let (cv, m, t, bl, fl) = block;
             build_block_witness_ab_packed_into(cv, m, *t, *bl, *fl, z_u64, a_u64, b_u64);
-        });
-
-    (z, a, b)
+        },
+    )
 }
 
 /// Like [`generate_witness_with_ab_packed`] but also emits the lincheck
@@ -1382,10 +1400,7 @@ impl Blake3Setup {
         assert!(n_blocks >= 1, "n_blocks must be ≥ 1");
         let n_log = min_n_blocks_log(n_blocks);
         let r1cs = build_block_r1cs(n_log);
-        // Warm the CSC fold circuit here so its one-time build (a pass over
-        // ~21M nonzeros) stays out of the first prove/verify, and pre-fault
-        // the prove-cycle scratch buffers (see scratch::prewarm_prover).
-        r1cs.csc_lincheck_circuit();
+        // Pre-fault the prove-cycle scratch buffers (see scratch::prewarm_prover).
         flock_core::scratch::prewarm_prover(r1cs.m);
         let pcs_params = PcsParams {
             m: r1cs.m,
@@ -1447,22 +1462,41 @@ impl Blake3Setup {
         challenger: &mut Ch,
     ) -> (flock_core::proof::R1csProofLigerito, Commitment, R1csClaim) {
         assert_eq!(blocks.len(), self.n_blocks);
-        let (codeword, (z_packed, a_packed_f128, b_packed_f128, z_packed_lincheck)) =
-            flock_core::pcs::prefault_codeword_during(&self.pcs_params, || {
-                self.generate_witness_ab(blocks)
-            });
-        let lc_circuit = self.r1cs.csc_lincheck_circuit();
-        crate::prover::prove_fast_ligerito_from_witness(
-            &self.r1cs,
-            &self.pcs_params,
-            z_packed,
-            a_packed_f128,
-            b_packed_f128,
-            z_packed_lincheck,
-            lc_circuit,
-            codeword,
-            challenger,
-        )
+        match self.r1cs.layout {
+            flock_core::r1cs::WitnessLayout::RowMajor => {
+                let (codeword, (z_packed, a_packed_f128, b_packed_f128)) =
+                    flock_core::pcs::prefault_codeword_during(&self.pcs_params, || {
+                        generate_witness_with_ab_packed(blocks, self.n_blocks_log())
+                    });
+                crate::prover::prove_fast_ligerito_from_block_major_witness(
+                    &self.r1cs,
+                    &self.pcs_params,
+                    z_packed,
+                    a_packed_f128,
+                    b_packed_f128,
+                    &BLAKE3_LINCHECK_CIRCUIT,
+                    codeword,
+                    challenger,
+                )
+            }
+            flock_core::r1cs::WitnessLayout::BatchMajor => {
+                let (codeword, (z_packed, a_packed_f128, b_packed_f128, z_packed_lincheck)) =
+                    flock_core::pcs::prefault_codeword_during(&self.pcs_params, || {
+                        self.generate_witness_ab(blocks)
+                    });
+                crate::prover::prove_fast_ligerito_from_witness(
+                    &self.r1cs,
+                    &self.pcs_params,
+                    z_packed,
+                    a_packed_f128,
+                    b_packed_f128,
+                    z_packed_lincheck,
+                    &BLAKE3_LINCHECK_CIRCUIT,
+                    codeword,
+                    challenger,
+                )
+            }
+        }
     }
 
     /// [`Self::prove_fast`] with a per-phase timing breakdown of the real
@@ -1480,22 +1514,45 @@ impl Blake3Setup {
     ) {
         assert_eq!(blocks.len(), self.n_blocks);
         let t0 = std::time::Instant::now();
-        let (z_packed, a_packed_f128, b_packed_f128, z_packed_lincheck) =
-            self.generate_witness_ab(blocks);
-        let witness_s = t0.elapsed().as_secs_f64();
-        let lc_circuit = self.r1cs.csc_lincheck_circuit();
-        let (proof, commitment, claim, mut timings) = crate::prover::prove_fast_ligerito_timed(
-            &self.r1cs,
-            &self.pcs_params,
-            z_packed,
-            a_packed_f128,
-            b_packed_f128,
-            z_packed_lincheck,
-            lc_circuit,
-            None,
-            challenger,
-        );
-        timings.witness_s = witness_s;
+        let (proof, commitment, claim, timings) = match self.r1cs.layout {
+            flock_core::r1cs::WitnessLayout::RowMajor => {
+                let (z_packed, a_packed_f128, b_packed_f128) =
+                    generate_witness_with_ab_packed(blocks, self.n_blocks_log());
+                let witness_s = t0.elapsed().as_secs_f64();
+                let (proof, commitment, claim, mut timings) =
+                    crate::prover::prove_fast_ligerito_timed_from_block_major_witness(
+                        &self.r1cs,
+                        &self.pcs_params,
+                        z_packed,
+                        a_packed_f128,
+                        b_packed_f128,
+                        &BLAKE3_LINCHECK_CIRCUIT,
+                        None,
+                        challenger,
+                    );
+                timings.witness_s = witness_s;
+                (proof, commitment, claim, timings)
+            }
+            flock_core::r1cs::WitnessLayout::BatchMajor => {
+                let (z_packed, a_packed_f128, b_packed_f128, z_packed_lincheck) =
+                    self.generate_witness_ab(blocks);
+                let witness_s = t0.elapsed().as_secs_f64();
+                let (proof, commitment, claim, mut timings) =
+                    crate::prover::prove_fast_ligerito_timed(
+                        &self.r1cs,
+                        &self.pcs_params,
+                        z_packed,
+                        a_packed_f128,
+                        b_packed_f128,
+                        z_packed_lincheck,
+                        &BLAKE3_LINCHECK_CIRCUIT,
+                        None,
+                        challenger,
+                    );
+                timings.witness_s = witness_s;
+                (proof, commitment, claim, timings)
+            }
+        };
         (proof, commitment, claim, timings)
     }
 
@@ -1505,12 +1562,11 @@ impl Blake3Setup {
         proof: &flock_core::proof::R1csProofLigerito,
         challenger: &mut Ch,
     ) -> Result<R1csClaim, verifier::VerifyError> {
-        let lc_circuit = self.r1cs.csc_lincheck_circuit();
         verifier::verify_ligerito(
             &self.r1cs,
             commitment,
             proof,
-            lc_circuit,
+            &BLAKE3_LINCHECK_CIRCUIT,
             &self.pcs_params,
             challenger,
         )
@@ -1573,7 +1629,6 @@ impl Blake3Setup {
         assert_eq!(blocks.len(), self.n_blocks);
         assert_eq!(self.n_blocks, self.n_block_slots());
         let (z_packed, a_packed, b_packed, z_lincheck) = self.generate_witness_ab(blocks);
-        let lc_circuit = self.r1cs.csc_lincheck_circuit();
         super::chain_common::prove_chain_ligerito_generic(
             &self.r1cs,
             &self.pcs_params,
@@ -1582,7 +1637,7 @@ impl Blake3Setup {
             a_packed,
             b_packed,
             z_lincheck,
-            lc_circuit,
+            &BLAKE3_LINCHECK_CIRCUIT,
             challenger,
         )
     }
@@ -1599,7 +1654,6 @@ impl Blake3Setup {
         let n_log = self.n_blocks_log();
         let cv_0_phys = cv_to_phys_bits(cv_0);
         let cv_last_phys = cv_to_phys_bits(cv_last);
-        let lc_circuit = self.r1cs.csc_lincheck_circuit();
         super::chain_common::verify_chain_ligerito_generic(
             &self.r1cs,
             &CHAIN_LAYOUT,
@@ -1608,7 +1662,7 @@ impl Blake3Setup {
             n_log,
             &cv_0_phys,
             &cv_last_phys,
-            lc_circuit,
+            &BLAKE3_LINCHECK_CIRCUIT,
             &self.pcs_params,
             challenger,
         )
@@ -2033,22 +2087,26 @@ mod tests {
         }
     }
 
-    /// The fused generator produces (z, a, b) byte-identical to
-    /// `generate_witness_with_ab_packed` AND a lincheck stripe byte-identical
-    /// `Blake3LincheckCircuit` walker matches the sparse fold byte-for-byte
-    /// at random α + random eq_inner.
+    /// The reverse-tape walker matches both matrix oracles byte-for-byte at
+    /// zero, one, and random alpha, and exposes the same constant-wire pin.
     #[test]
     fn lincheck_circuit_matches_sparse() {
         use flock_core::lincheck::{LincheckCircuit, SparseMatrixCircuit};
 
         let mut rng = Rng::new(0xB1A_E3_CCA1);
         let (a_0, b_0) = build_matrices();
-        let sparse = SparseMatrixCircuit::new(&a_0, &b_0);
+        let sparse =
+            SparseMatrixCircuit::new(&a_0, &b_0).with_const_pin(Some(Z_CONST_POS));
+        let csc = flock_core::lincheck::CscCircuit::from_matrices(&a_0, &b_0)
+            .with_const_pin(Some(Z_CONST_POS));
         let walker = Blake3LincheckCircuit;
         assert_eq!(sparse.n_cols(), walker.n_cols());
+        assert_eq!(walker.const_pin_col(), Some(Z_CONST_POS));
+        assert_eq!(sparse.const_pin_col(), walker.const_pin_col());
+        assert_eq!(csc.const_pin_col(), walker.const_pin_col());
 
         let n_cols = walker.n_cols();
-        let alpha = F128 {
+        let random_alpha = F128 {
             lo: ((rng.next_u32() as u64) << 32) | rng.next_u32() as u64,
             hi: ((rng.next_u32() as u64) << 32) | rng.next_u32() as u64,
         };
@@ -2059,16 +2117,20 @@ mod tests {
             })
             .collect();
 
-        let expected = sparse.fold_alpha_batched(alpha, &eq_inner);
-        let got = walker.fold_alpha_batched(alpha, &eq_inner);
-        for c in 0..n_cols {
-            assert_eq!(expected[c], got[c], "comb mismatch at col {c}");
-        }
+        for (case, alpha) in [
+            ("zero alpha", F128::ZERO),
+            ("one alpha", F128::ONE),
+            ("random alpha", random_alpha),
+        ] {
+            let expected = sparse.fold_alpha_batched(alpha, &eq_inner);
+            let got = walker.fold_alpha_batched(alpha, &eq_inner);
+            for c in 0..n_cols {
+                assert_eq!(expected[c], got[c], "{case}: comb mismatch at col {c}");
+            }
 
-        // CSC gather (what prove_fast/verify actually use) matches too.
-        let csc = flock_core::lincheck::CscCircuit::from_matrices(&a_0, &b_0);
-        let got_csc = csc.fold_alpha_batched(alpha, &eq_inner);
-        assert_eq!(expected, got_csc, "CSC fold mismatch");
+            let got_csc = csc.fold_alpha_batched(alpha, &eq_inner);
+            assert_eq!(expected, got_csc, "{case}: CSC fold mismatch");
+        }
     }
 
     /// to `pack_z_lincheck_from_packed(z)`.
@@ -2201,8 +2263,8 @@ mod tests {
     /// Constant-wire pin (docs/const-wire-pin.md). `new(250)` has padding
     /// blocks (filled with a valid all-zero-input compression, constant = 1)
     /// so the honest proof verifies; the all-zero witness must be rejected by
-    /// the pin. (For BLAKE3 the pin lives on the R1CS-built CSC circuit, not
-    /// the walker.)
+    /// the pin. The specialized BLAKE3 walker carries the same pin as the
+    /// matrix-backed circuit.
     #[test]
     #[ignore] // Heavier — Ligerito needs m=22; run with `cargo test const_pin_all_zero_rejected -- --ignored`
     fn const_pin_all_zero_rejected() {
@@ -2239,7 +2301,6 @@ mod tests {
         b.iter_mut()
             .for_each(|v| *v = flock_core::field::F128::ZERO);
         zlc.iter_mut().for_each(|v| *v = 0);
-        let circuit = setup.r1cs.csc_lincheck_circuit();
         let mut ch_p = FsChallenger::new(b"poc");
         let (proof, commitment, _) = crate::prover::prove_fast_ligerito_from_witness(
             &setup.r1cs,
@@ -2248,7 +2309,7 @@ mod tests {
             a,
             b,
             zlc,
-            circuit,
+            &BLAKE3_LINCHECK_CIRCUIT,
             None,
             &mut ch_p,
         );

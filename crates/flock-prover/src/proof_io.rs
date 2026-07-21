@@ -161,7 +161,7 @@ impl R1csProofBundleLigerito {
         // Ranked BLAKE3 proofs are ~396 KiB. Reserving the realistic payload
         // size avoids the geometric realloc/copy ladder on the timed path;
         // smaller proof variants merely retain a modest temporary capacity.
-        let mut out = Vec::with_capacity(HEADER_LEN + 400 * 1024);
+        let mut out = Vec::with_capacity(HEADER_LEN + 500 * 1024);
         write_header(&mut out, FLAVOR_R1CS_LIGERITO);
         bincode::serialize_into(&mut out, self).expect("bincode serialize R1csProofBundleLigerito");
         out
