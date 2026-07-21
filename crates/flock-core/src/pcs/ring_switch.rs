@@ -1582,6 +1582,57 @@ fn build_fold_byte_table(eq_r_dprime: &[F128]) -> Vec<F128> {
     tables
 }
 
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+pub(crate) unsafe fn fold_one_slot_neon(elem: F128, tables_ptr: *const u8) -> F128 {
+    use core::arch::aarch64::*;
+    let lo_bytes = elem.lo.to_le_bytes();
+    let hi_bytes = elem.hi.to_le_bytes();
+
+    unsafe {
+        let l0 = vld1q_u8(tables_ptr.add(lo_bytes[0] as usize * 16));
+        let l1 = vld1q_u8(tables_ptr.add((FOLD_TABLE_SIZE + lo_bytes[1] as usize) * 16));
+        let l2 = vld1q_u8(tables_ptr.add((2 * FOLD_TABLE_SIZE + lo_bytes[2] as usize) * 16));
+        let l3 = vld1q_u8(tables_ptr.add((3 * FOLD_TABLE_SIZE + lo_bytes[3] as usize) * 16));
+        let l4 = vld1q_u8(tables_ptr.add((4 * FOLD_TABLE_SIZE + lo_bytes[4] as usize) * 16));
+        let l5 = vld1q_u8(tables_ptr.add((5 * FOLD_TABLE_SIZE + lo_bytes[5] as usize) * 16));
+        let l6 = vld1q_u8(tables_ptr.add((6 * FOLD_TABLE_SIZE + lo_bytes[6] as usize) * 16));
+        let l7 = vld1q_u8(tables_ptr.add((7 * FOLD_TABLE_SIZE + lo_bytes[7] as usize) * 16));
+        let h0 = vld1q_u8(tables_ptr.add((8 * FOLD_TABLE_SIZE + hi_bytes[0] as usize) * 16));
+        let h1 = vld1q_u8(tables_ptr.add((9 * FOLD_TABLE_SIZE + hi_bytes[1] as usize) * 16));
+        let h2 = vld1q_u8(tables_ptr.add((10 * FOLD_TABLE_SIZE + hi_bytes[2] as usize) * 16));
+        let h3 = vld1q_u8(tables_ptr.add((11 * FOLD_TABLE_SIZE + hi_bytes[3] as usize) * 16));
+        let h4 = vld1q_u8(tables_ptr.add((12 * FOLD_TABLE_SIZE + hi_bytes[4] as usize) * 16));
+        let h5 = vld1q_u8(tables_ptr.add((13 * FOLD_TABLE_SIZE + hi_bytes[5] as usize) * 16));
+        let h6 = vld1q_u8(tables_ptr.add((14 * FOLD_TABLE_SIZE + hi_bytes[6] as usize) * 16));
+        let h7 = vld1q_u8(tables_ptr.add((15 * FOLD_TABLE_SIZE + hi_bytes[7] as usize) * 16));
+
+        let p0 = veorq_u8(l0, l1);
+        let p1 = veorq_u8(l2, l3);
+        let p2 = veorq_u8(l4, l5);
+        let p3 = veorq_u8(l6, l7);
+        let p4 = veorq_u8(h0, h1);
+        let p5 = veorq_u8(h2, h3);
+        let p6 = veorq_u8(h4, h5);
+        let p7 = veorq_u8(h6, h7);
+
+        let q0 = veorq_u8(p0, p1);
+        let q1 = veorq_u8(p2, p3);
+        let q2 = veorq_u8(p4, p5);
+        let q3 = veorq_u8(p6, p7);
+
+        let r0 = veorq_u8(q0, q1);
+        let r1 = veorq_u8(q2, q3);
+
+        let res = veorq_u8(r0, r1);
+        let u = vreinterpretq_u64_u8(res);
+        F128 {
+            lo: vgetq_lane_u64::<0>(u),
+            hi: vgetq_lane_u64::<1>(u),
+        }
+    }
+}
+
 /// One folded output slot: `Σ_{k=0..16} tables[k·256 + byte_k(elem)]`, where
 /// `byte_k` are the 16 little-endian bytes of `elem`. `tables` MUST be a
 /// `build_fold_byte_table` output (length `16·256`). Tree-reduced (depth 4)

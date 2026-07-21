@@ -322,13 +322,48 @@ fn compute_combined_basis_and_target<Ch: Challenger>(
                 // `e_hi` is read once per claim per block, then swept over eq_lo.
                 for (ci, (eq_lo, eq_hi, table, _)) in rs_deferred.iter().enumerate() {
                     let e_hi = eq_hi[hi];
-                    if ci == 0 {
-                        for (slot, &lo) in out_block.iter_mut().zip(eq_lo.iter()) {
-                            *slot = ring_switch::fold_one_slot(lo * e_hi, table);
+                    #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+                    unsafe {
+                        let table_ptr = table.as_ptr() as *const u8;
+                        let mut t = 0;
+                        let n_lo = eq_lo.len();
+                        while t + 2 <= n_lo {
+                            let lo0 = eq_lo[t];
+                            let lo1 = eq_lo[t + 1];
+                            let prods = crate::field::gf2_128::aarch64::ghash_mul_vec2_neon(
+                                [lo0, lo1],
+                                [e_hi, e_hi],
+                            );
+                            let v0 = ring_switch::fold_one_slot_neon(prods[0], table_ptr);
+                            let v1 = ring_switch::fold_one_slot_neon(prods[1], table_ptr);
+                            if ci == 0 {
+                                out_block[t] = v0;
+                                out_block[t + 1] = v1;
+                            } else {
+                                out_block[t] += v0;
+                                out_block[t + 1] += v1;
+                            }
+                            t += 2;
                         }
-                    } else {
-                        for (slot, &lo) in out_block.iter_mut().zip(eq_lo.iter()) {
-                            *slot += ring_switch::fold_one_slot(lo * e_hi, table);
+                        if t < n_lo {
+                            let v = ring_switch::fold_one_slot_neon(eq_lo[t] * e_hi, table_ptr);
+                            if ci == 0 {
+                                out_block[t] = v;
+                            } else {
+                                out_block[t] += v;
+                            }
+                        }
+                    }
+                    #[cfg(not(all(target_arch = "aarch64", target_feature = "aes")))]
+                    {
+                        if ci == 0 {
+                            for (slot, &lo) in out_block.iter_mut().zip(eq_lo.iter()) {
+                                *slot = ring_switch::fold_one_slot(lo * e_hi, table);
+                            }
+                        } else {
+                            for (slot, &lo) in out_block.iter_mut().zip(eq_lo.iter()) {
+                                *slot += ring_switch::fold_one_slot(lo * e_hi, table);
+                            }
                         }
                     }
                 }

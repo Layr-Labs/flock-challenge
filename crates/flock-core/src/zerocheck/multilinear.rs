@@ -539,10 +539,16 @@ pub fn uni_skip_fold_and_round_pair_optimized_packed_padded(
                     b_chunk[x1l] = b1;
 
                     let eq_l = eq_lo[x_lo];
-                    let g1 = a1 * b1;
-                    p1_acc ^= eq_l.mul_unreduced(g1);
-                    let g_inf = (a0 + a1) * (b0 + b1);
-                    pinf_acc ^= eq_l.mul_unreduced(g_inf);
+                    let g_prods = crate::field::gf2_128::aarch64::ghash_mul_vec2_neon(
+                        [a1, a0 + a1],
+                        [b1, b0 + b1],
+                    );
+                    let eq_prods = crate::field::gf2_128::aarch64::ghash_mul_unreduced_vec2_neon(
+                        [g_prods[0], g_prods[1]],
+                        [eq_l, eq_l],
+                    );
+                    p1_acc ^= eq_prods[0];
+                    pinf_acc ^= eq_prods[1];
                 }
             }
             #[cfg(all(
