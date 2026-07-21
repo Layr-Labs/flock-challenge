@@ -247,6 +247,51 @@ pub(crate) fn drive_witness_packed_and_lincheck<S: Sync, F>(
 where
     F: Fn(&S, &mut [u64], &mut [u64], &mut [u64]) + Sync,
 {
+    drive_witness_packed_and_lincheck_impl(
+        initial_states,
+        padding,
+        n_blocks_log,
+        k_log,
+        true,
+        per_block,
+    )
+}
+
+/// Variant of [`drive_witness_packed_and_lincheck`] for a `per_block`
+/// producer that assigns every u64 in all three destination slices. Padding
+/// is mandatory so every scratch-buffer block is initialized without the
+/// driver's group-wide zero pass.
+pub(crate) fn drive_witness_packed_and_lincheck_overwrite<S: Sync, F>(
+    initial_states: &[S],
+    padding: &S,
+    n_blocks_log: usize,
+    k_log: usize,
+    per_block: F,
+) -> (Vec<F128>, Vec<F128>, Vec<F128>, Vec<u8>)
+where
+    F: Fn(&S, &mut [u64], &mut [u64], &mut [u64]) + Sync,
+{
+    drive_witness_packed_and_lincheck_impl(
+        initial_states,
+        Some(padding),
+        n_blocks_log,
+        k_log,
+        false,
+        per_block,
+    )
+}
+
+fn drive_witness_packed_and_lincheck_impl<S: Sync, F>(
+    initial_states: &[S],
+    padding: Option<&S>,
+    n_blocks_log: usize,
+    k_log: usize,
+    zero_before_build: bool,
+    per_block: F,
+) -> (Vec<F128>, Vec<F128>, Vec<F128>, Vec<u8>)
+where
+    F: Fn(&S, &mut [u64], &mut [u64], &mut [u64]) + Sync,
+{
     use rayon::prelude::*;
 
     let k = 1usize << k_log;
@@ -264,12 +309,10 @@ where
     );
 
     let total_f128 = n_total * f128_per_block;
-    // z/a/b are allocated uninitialized and zeroed *inside* the parallel loop
-    // (one memset per 8-block group), so the ~192 MB zero-fill scales with the
-    // thread count instead of running serially on the main thread before the
-    // parallel build. The per-block builders OR 1-bits into pre-zeroed words,
-    // so each group must be zeroed before its `per_block` calls. `z_lincheck`
-    // stays `vec![0u8; _]` (lazy `alloc_zeroed`/mmap — no eager memset).
+    // z/a/b come from the scratch pool without an eager serial fill. OR-based
+    // producers zero each 8-block group in the parallel loop; overwrite
+    // producers initialize every word during emission. `z_lincheck` stays
+    // `vec![0u8; _]` (lazy `alloc_zeroed`/mmap — no eager memset).
     let mut z = flock_core::scratch::take_f128(total_f128);
     let mut a = flock_core::scratch::take_f128(total_f128);
     let mut b = flock_core::scratch::take_f128(total_f128);
@@ -281,16 +324,16 @@ where
         .zip(z_lincheck.par_chunks_mut(k))
         .enumerate()
         .for_each(|(g, (((z_grp, a_grp), b_grp), stripe))| {
-            // Zero this group's z/a/b up front (parallel memset — the buffers
-            // were uninit-allocated). The per-block builder ORs 1-bits into
-            // pre-zeroed words; any slot left unbuilt (no padding block) stays
-            // zero, which the lincheck transpose below reads correctly.
-            // SAFETY: F128 is `Copy` (no Drop) and the all-zero bit pattern is
-            // the valid `F128::ZERO`, so a byte memset is a correct init.
-            unsafe {
-                std::ptr::write_bytes(z_grp.as_mut_ptr(), 0, z_grp.len());
-                std::ptr::write_bytes(a_grp.as_mut_ptr(), 0, a_grp.len());
-                std::ptr::write_bytes(b_grp.as_mut_ptr(), 0, b_grp.len());
+            if zero_before_build {
+                // OR-based producers require a zero base. Overwrite producers
+                // initialize every word themselves and skip this full pass.
+                // SAFETY: F128 is `Copy` (no Drop) and the all-zero bit pattern
+                // is the valid `F128::ZERO`.
+                unsafe {
+                    std::ptr::write_bytes(z_grp.as_mut_ptr(), 0, z_grp.len());
+                    std::ptr::write_bytes(a_grp.as_mut_ptr(), 0, a_grp.len());
+                    std::ptr::write_bytes(b_grp.as_mut_ptr(), 0, b_grp.len());
+                }
             }
             for k_in in 0..8 {
                 let global_idx = 8 * g + k_in;

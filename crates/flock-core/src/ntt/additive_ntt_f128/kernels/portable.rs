@@ -89,8 +89,8 @@ pub(super) unsafe fn butterfly_fused_3layer_row(
 
 /// # Safety
 /// The caller guarantees that every selected source and destination row is
-/// valid, source and destination do not overlap, and concurrent calls write
-/// disjoint destination row groups.
+/// valid, source and destination are either identical or do not overlap, and
+/// concurrent calls write disjoint destination row groups.
 #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
 pub(super) unsafe fn butterfly_fused_3layer_row_from(
     src: *const F128,
@@ -111,6 +111,8 @@ pub(super) unsafe fn butterfly_fused_3layer_row_from(
     unsafe {
         for lane in 0..num_ntts {
             let mut values = [F128::ZERO; 8];
+            // Complete all reads for this lane before any write, which also
+            // permits the exact in-place use from the block-zero fast path.
             for (i, value) in values.iter_mut().enumerate() {
                 *value = *src.add((i * eighth + r) * num_ntts + lane);
             }

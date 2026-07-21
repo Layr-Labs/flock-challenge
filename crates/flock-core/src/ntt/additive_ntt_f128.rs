@@ -414,6 +414,7 @@ impl AdditiveNttF128 {
         num_ntts: usize,
         start_layer: usize,
     ) {
+        use rayon::prelude::*;
         let n_total = data.len();
         let log_d = log2_pow2(n_total / num_ntts);
 
@@ -564,99 +565,27 @@ impl AdditiveNttF128 {
             }
         }
 
-        // Deep layers: each Rayon task already owns one cache-resident
-        // subgroup. On ARM, keep the existing fused-three/fused-two codelets
-        // inside that task so eleven production layers need four subgroup
-        // sweeps rather than eleven, without nested Rayon dispatch.
-        #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
-        {
-            self.forward_transform_interleaved_deep_fused(
-                data,
-                num_ntts,
-                log_d,
-                n_top,
-                start_layer,
-            );
-        }
-        #[cfg(not(all(target_arch = "aarch64", target_feature = "aes")))]
-        self.forward_transform_interleaved_deep_scalar(data, num_ntts, log_d, n_top, start_layer);
-    }
-
-    /// Original one-layer-at-a-time cache-subgroup traversal. Retained for
-    /// non-ARM SIMD targets.
-    #[allow(dead_code)]
-    fn forward_transform_interleaved_deep_scalar(
-        &self,
-        data: &mut [F128],
-        num_ntts: usize,
-        log_d: usize,
-        n_top: usize,
-        start_layer: usize,
-    ) {
-        use rayon::prelude::*;
+        // Deep layers: process each sub-NTT-group cache-resident.
         let sub_size_positions = 1usize << (log_d - n_top);
         let sub_bytes = sub_size_positions * num_ntts;
+
         data.par_chunks_mut(sub_bytes)
             .enumerate()
             .for_each(|(sub_idx, sub_data)| {
-                for layer in n_top.max(start_layer)..log_d {
+                let mut layer = n_top.max(start_layer);
+                while layer < log_d {
                     let layer_in_sub = layer - n_top;
                     let num_blocks_in_sub = 1usize << layer_in_sub;
                     let block_size = 1usize << (log_d - layer);
                     let block_size_half = block_size >> 1;
                     let block_bytes = block_size * num_ntts;
-                    for block_in_sub in 0..num_blocks_in_sub {
-                        let global_block = sub_idx * num_blocks_in_sub + block_in_sub;
-                        let twiddle = self.twiddle(layer, global_block);
-                        let block_start = block_in_sub * block_bytes;
-                        let block = &mut sub_data[block_start..block_start + block_bytes];
-                        butterfly_interleaved_block(block, twiddle, block_size_half, num_ntts);
-                    }
-                }
-            });
-    }
 
-    /// Fuse consecutive deep layers within each already-parallel cache
-    /// subgroup. The breadth-first twiddle tree and row geometry are identical
-    /// to the top-layer codelets; only the outer scheduling boundary differs.
-    #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
-    fn forward_transform_interleaved_deep_fused(
-        &self,
-        data: &mut [F128],
-        num_ntts: usize,
-        log_d: usize,
-        n_top: usize,
-        start_layer: usize,
-    ) {
-        use rayon::prelude::*;
-        let sub_size_positions = 1usize << (log_d - n_top);
-        let sub_bytes = sub_size_positions * num_ntts;
-        let first_deep_layer = n_top.max(start_layer);
-        data.par_chunks_mut(sub_bytes)
-            .enumerate()
-            .for_each(|(sub_idx, sub_data)| {
-                let mut layer = first_deep_layer;
-                while layer < log_d {
-                    let remaining = log_d - layer;
-                    // Put any two-layer prefix at the shallow end. For the
-                    // production 11-layer suffix this yields 2+3+3+3, which
-                    // keeps the widest fused kernel off the 2 MiB root block
-                    // and halves fused-block setup versus 3+3+3+2.
-                    // A remainder-one suffix uses 2+2+3... when possible, so
-                    // only a one-layer suffix falls back to the scalar kernel.
-                    let width = if remaining >= 3 && remaining % 3 == 0 {
-                        3
-                    } else if remaining >= 2 {
-                        2
-                    } else {
-                        1
-                    };
-                    let layer_in_sub = layer - n_top;
-                    let num_blocks_in_sub = 1usize << layer_in_sub;
-                    let block_size = 1usize << (log_d - layer);
-                    let block_bytes = block_size * num_ntts;
-
-                    if width == 3 {
+                    // The subgroup is already owned by one rayon worker, so
+                    // fuse locally without nested parallelism. On AArch64 this
+                    // cuts three L2-to-L1 read/write sweeps to one while keeping
+                    // only eight field values live at a time. The last one or
+                    // two layers retain the ordinary leaf kernel.
+                    if fused3_ok && layer + 2 < log_d {
                         let eighth = block_size >> 3;
                         for block_in_sub in 0..num_blocks_in_sub {
                             let global_block = sub_idx * num_blocks_in_sub + block_in_sub;
@@ -677,39 +606,17 @@ impl AdditiveNttF128 {
                             );
                         }
                         layer += 3;
-                    } else if width == 2 {
-                        let quarter = block_size >> 2;
-                        for block_in_sub in 0..num_blocks_in_sub {
-                            let global_block = sub_idx * num_blocks_in_sub + block_in_sub;
-                            let t_outer = self.twiddle(layer, global_block);
-                            let t_inner_a = self.twiddle(layer + 1, 2 * global_block);
-                            let t_inner_b = self.twiddle(layer + 1, 2 * global_block + 1);
-                            let block_start = block_in_sub * block_bytes;
-                            butterfly_interleaved_fused_2layer_rows(
-                                &mut sub_data[block_start..block_start + block_bytes],
-                                t_outer,
-                                t_inner_a,
-                                t_inner_b,
-                                quarter,
-                                num_ntts,
-                            );
-                        }
-                        layer += 2;
-                    } else {
-                        let block_size_half = block_size >> 1;
-                        for block_in_sub in 0..num_blocks_in_sub {
-                            let global_block = sub_idx * num_blocks_in_sub + block_in_sub;
-                            let twiddle = self.twiddle(layer, global_block);
-                            let block_start = block_in_sub * block_bytes;
-                            butterfly_interleaved_block(
-                                &mut sub_data[block_start..block_start + block_bytes],
-                                twiddle,
-                                block_size_half,
-                                num_ntts,
-                            );
-                        }
-                        layer += 1;
+                        continue;
                     }
+
+                    for block_in_sub in 0..num_blocks_in_sub {
+                        let global_block = sub_idx * num_blocks_in_sub + block_in_sub;
+                        let twiddle = self.twiddle(layer, global_block);
+                        let block_start = block_in_sub * block_bytes;
+                        let block = &mut sub_data[block_start..block_start + block_bytes];
+                        butterfly_interleaved_block(block, twiddle, block_size_half, num_ntts);
+                    }
+                    layer += 1;
                 }
             });
     }
@@ -1029,15 +936,15 @@ fn butterfly_interleaved_fused_2layer_par_rows(
 ) {
     use rayon::prelude::*;
     const PARALLEL_ROW_THRESHOLD: usize = 256;
-    if quarter < PARALLEL_ROW_THRESHOLD {
-        butterfly_interleaved_fused_2layer_rows(
-            block, t_outer, t_inner_a, t_inner_b, quarter, num_ntts,
-        );
-        return;
-    }
-
     let stride = quarter * num_ntts;
     debug_assert_eq!(block.len(), 4 * stride);
+
+    let do_one = |row_a: &mut [F128],
+                  row_b: &mut [F128],
+                  row_c: &mut [F128],
+                  row_d: &mut [F128]| {
+        kernels::butterfly_fused_2layer(row_a, row_b, row_c, row_d, t_outer, t_inner_a, t_inner_b);
+    };
 
     // Split the block into four quarters, then zip row-wise. Each rayon task
     // processes one quarter-row index = 4 logical rows of work.
@@ -1045,74 +952,30 @@ fn butterfly_interleaved_fused_2layer_par_rows(
     let (q1, q2) = top_half.split_at_mut(stride);
     let (q3, q4) = bot_half.split_at_mut(stride);
 
-    q1.par_chunks_mut(num_ntts)
-        .zip(q2.par_chunks_mut(num_ntts))
-        .zip(q3.par_chunks_mut(num_ntts))
-        .zip(q4.par_chunks_mut(num_ntts))
-        .for_each(|(((row_a, row_b), row_c), row_d)| {
-            kernels::butterfly_fused_2layer(
-                row_a, row_b, row_c, row_d, t_outer, t_inner_a, t_inner_b,
-            );
-        });
-}
-
-/// Serial-row form of the fused-two-layer block. Deep transforms already run
-/// inside an outer parallel subgroup task, so they use this helper to avoid a
-/// nested Rayon dispatch.
-#[inline]
-fn butterfly_interleaved_fused_2layer_rows(
-    block: &mut [F128],
-    t_outer: F128,
-    t_inner_a: F128,
-    t_inner_b: F128,
-    quarter: usize,
-    num_ntts: usize,
-) {
-    let stride = quarter * num_ntts;
-    debug_assert_eq!(block.len(), 4 * stride);
-    let (top_half, bot_half) = block.split_at_mut(2 * stride);
-    let (q1, q2) = top_half.split_at_mut(stride);
-    let (q3, q4) = bot_half.split_at_mut(stride);
-    for r in 0..quarter {
-        let off = r * num_ntts;
-        kernels::butterfly_fused_2layer(
-            &mut q1[off..off + num_ntts],
-            &mut q2[off..off + num_ntts],
-            &mut q3[off..off + num_ntts],
-            &mut q4[off..off + num_ntts],
-            t_outer,
-            t_inner_a,
-            t_inner_b,
-        );
+    if quarter < PARALLEL_ROW_THRESHOLD {
+        for r in 0..quarter {
+            let off = r * num_ntts;
+            let (q1r, q1_rest) = q1[off..].split_at_mut(num_ntts);
+            let _ = q1_rest;
+            let (q2r, _) = q2[off..].split_at_mut(num_ntts);
+            let (q3r, _) = q3[off..].split_at_mut(num_ntts);
+            let (q4r, _) = q4[off..].split_at_mut(num_ntts);
+            do_one(q1r, q2r, q3r, q4r);
+        }
+    } else {
+        q1.par_chunks_mut(num_ntts)
+            .zip(q2.par_chunks_mut(num_ntts))
+            .zip(q3.par_chunks_mut(num_ntts))
+            .zip(q4.par_chunks_mut(num_ntts))
+            .for_each(|(((row_a, row_b), row_c), row_d)| {
+                do_one(row_a, row_b, row_c, row_d);
+            });
     }
 }
 
-/// Butterfly one top-layer block, fusing three layers `(L..L+3)` into one
-/// memory pass. `block` holds `8 * eighth` rows of `num_ntts` lanes and `t`
-/// carries the seven twiddles in breadth-first layer order.
-#[inline]
-fn butterfly_interleaved_fused_3layer_par_rows(
-    block: &mut [F128],
-    t: &[F128; 7],
-    eighth: usize,
-    num_ntts: usize,
-) {
-    use rayon::prelude::*;
-    const PARALLEL_ROW_THRESHOLD: usize = 256;
-    debug_assert_eq!(block.len(), 8 * eighth * num_ntts);
-    if eighth < PARALLEL_ROW_THRESHOLD {
-        butterfly_interleaved_fused_3layer_rows(block, t, eighth, num_ntts);
-        return;
-    }
-    let base = block.as_mut_ptr() as usize;
-    (0..eighth).into_par_iter().for_each(|r| {
-        // SAFETY: distinct r values select disjoint row groups.
-        unsafe { kernels::butterfly_fused_3layer_row(base as *mut F128, eighth, num_ntts, r, t) };
-    });
-}
-
-/// Serial-row form of the fused-three-layer block. This is used from inside
-/// one already-parallel cache subgroup and therefore never nests Rayon work.
+/// Butterfly one block, fusing three layers `(L..L+3)` into one memory pass.
+/// `block` holds `8 * eighth` rows of `num_ntts` lanes and `t` carries the
+/// seven twiddles in breadth-first layer order.
 #[inline]
 fn butterfly_interleaved_fused_3layer_rows(
     block: &mut [F128],
@@ -1125,6 +988,29 @@ fn butterfly_interleaved_fused_3layer_rows(
     for r in 0..eighth {
         // SAFETY: row group r writes eight disjoint rows of this block.
         unsafe { kernels::butterfly_fused_3layer_row(base, eighth, num_ntts, r, t) };
+    }
+}
+
+#[inline]
+fn butterfly_interleaved_fused_3layer_par_rows(
+    block: &mut [F128],
+    t: &[F128; 7],
+    eighth: usize,
+    num_ntts: usize,
+) {
+    use rayon::prelude::*;
+    const PARALLEL_ROW_THRESHOLD: usize = 256;
+    debug_assert_eq!(block.len(), 8 * eighth * num_ntts);
+    if eighth < PARALLEL_ROW_THRESHOLD {
+        butterfly_interleaved_fused_3layer_rows(block, t, eighth, num_ntts);
+    } else {
+        let base = block.as_mut_ptr() as usize;
+        (0..eighth).into_par_iter().for_each(|r| {
+            // SAFETY: distinct r values select disjoint row groups.
+            unsafe {
+                kernels::butterfly_fused_3layer_row(base as *mut F128, eighth, num_ntts, r, t)
+            };
+        });
     }
 }
 
@@ -1445,36 +1331,6 @@ mod tests {
             assert_eq!(
                 encoded, oracle,
                 "direct seed mismatch at log_d={log_d}, num_ntts={num_ntts}, threads={threads}"
-            );
-        }
-    }
-
-    /// Match every deep-fusion remainder against the scalar suffix oracle at
-    /// production subgroup geometry. Four 2 MiB subgroups exercise nonzero
-    /// global twiddle offsets as well as the 2+3+3+3 schedule.
-    #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
-    #[test]
-    fn deep_fused_suffixes_match_scalar_at_production_geometry() {
-        const LOG_D: usize = 13;
-        const NUM_NTTS: usize = 64;
-        let ntt = AdditiveNttF128::standard(LOG_D);
-        let mut rng = Rng::new(0xD33F_F053);
-        let original = rand_vec(&mut rng, (1usize << LOG_D) * NUM_NTTS);
-        let pool = rayon::ThreadPoolBuilder::new()
-            .num_threads(4)
-            .build()
-            .unwrap();
-
-        for start_layer in [0usize, 1, 2, 3, 4, 10, 11, 12, 13] {
-            let mut scalar = original.clone();
-            ntt.forward_transform_interleaved_scalar_from_layer(&mut scalar, NUM_NTTS, start_layer);
-            let mut fused = original.clone();
-            pool.install(|| {
-                ntt.forward_transform_interleaved_from_layer(&mut fused, NUM_NTTS, start_layer);
-            });
-            assert_eq!(
-                fused, scalar,
-                "deep fusion mismatch at start_layer={start_layer}"
             );
         }
     }

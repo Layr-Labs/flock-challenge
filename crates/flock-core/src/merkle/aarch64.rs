@@ -2,9 +2,10 @@ use super::{Hash, SHA256_IV, SHA256_K};
 use core::arch::aarch64::*;
 
 /// One interleaved compression round over 4 independent states.
-/// `blocks[i]` must be ≥ 64 bytes; only the first 64 are consumed.
+/// With `SHARED_BLOCK`, every state consumes `blocks[0]` and reuses its message
+/// schedule. Otherwise, `blocks[i]` must be ≥ 64 bytes for every stream.
 #[inline(always)]
-unsafe fn compress4(
+unsafe fn compress4<const SHARED_BLOCK: bool>(
     abcd: &mut [uint32x4_t; 4],
     efgh: &mut [uint32x4_t; 4],
     blocks: [*const u8; 4],
@@ -14,7 +15,8 @@ unsafe fn compress4(
         let mut msg1 = [vdupq_n_u32(0); 4];
         let mut msg2 = [vdupq_n_u32(0); 4];
         let mut msg3 = [vdupq_n_u32(0); 4];
-        for i in 0..4 {
+        let streams = if SHARED_BLOCK { 1 } else { 4 };
+        for i in 0..streams {
             // SHA-256 message words are big-endian.
             msg0[i] = vreinterpretq_u32_u8(vrev32q_u8(vld1q_u8(blocks[i])));
             msg1[i] = vreinterpretq_u32_u8(vrev32q_u8(vld1q_u8(blocks[i].add(16))));
@@ -27,18 +29,33 @@ unsafe fn compress4(
         macro_rules! rounds4 {
             ($msg:expr, $ki:expr) => {{
                 let kv = vld1q_u32(SHA256_K.as_ptr().add($ki));
-                for i in 0..4 {
-                    let wk = vaddq_u32($msg[i], kv);
-                    let t = abcd[i];
-                    abcd[i] = vsha256hq_u32(abcd[i], efgh[i], wk);
-                    efgh[i] = vsha256h2q_u32(efgh[i], t, wk);
+                if SHARED_BLOCK {
+                    let wk = vaddq_u32($msg[0], kv);
+                    for i in 0..4 {
+                        let t = abcd[i];
+                        abcd[i] = vsha256hq_u32(abcd[i], efgh[i], wk);
+                        efgh[i] = vsha256h2q_u32(efgh[i], t, wk);
+                    }
+                } else {
+                    for i in 0..4 {
+                        let wk = vaddq_u32($msg[i], kv);
+                        let t = abcd[i];
+                        abcd[i] = vsha256hq_u32(abcd[i], efgh[i], wk);
+                        efgh[i] = vsha256h2q_u32(efgh[i], t, wk);
+                    }
                 }
             }};
         }
         macro_rules! sched {
             ($m0:expr, $m1:expr, $m2:expr, $m3:expr) => {
-                for i in 0..4 {
-                    $m0[i] = vsha256su1q_u32(vsha256su0q_u32($m0[i], $m1[i]), $m2[i], $m3[i]);
+                if SHARED_BLOCK {
+                    $m0[0] =
+                        vsha256su1q_u32(vsha256su0q_u32($m0[0], $m1[0]), $m2[0], $m3[0]);
+                } else {
+                    for i in 0..4 {
+                        $m0[i] =
+                            vsha256su1q_u32(vsha256su0q_u32($m0[i], $m1[i]), $m2[i], $m3[i]);
+                    }
                 }
             };
         }
@@ -78,7 +95,7 @@ pub fn hash4_equal_len(inputs: [&[u8]; 4], out: &mut [Hash]) {
         // Full 64-byte blocks.
         let n_full = len / 64;
         for blk in 0..n_full {
-            compress4(
+            compress4::<false>(
                 &mut abcd,
                 &mut efgh,
                 [
@@ -101,7 +118,7 @@ pub fn hash4_equal_len(inputs: [&[u8]; 4], out: &mut [Hash]) {
             let mut tail = [0u8; 64];
             tail[0] = 0x80;
             tail[56..].copy_from_slice(&bit_len.to_be_bytes());
-            compress4(&mut abcd, &mut efgh, [tail.as_ptr(); 4]);
+            compress4::<true>(&mut abcd, &mut efgh, [tail.as_ptr(); 4]);
         } else {
             let n_tail = if rem < 56 { 1 } else { 2 };
             let mut tails = [[0u8; 128]; 4];
@@ -111,7 +128,7 @@ pub fn hash4_equal_len(inputs: [&[u8]; 4], out: &mut [Hash]) {
                 tails[i][n_tail * 64 - 8..n_tail * 64].copy_from_slice(&bit_len.to_be_bytes());
             }
             for blk in 0..n_tail {
-                compress4(
+                compress4::<false>(
                     &mut abcd,
                     &mut efgh,
                     [
@@ -149,7 +166,7 @@ pub(crate) fn hash4_pow(state_digest: &[u8; 32], nonces: [u64; 4]) -> [Hash; 4] 
     unsafe {
         let mut abcd = [vld1q_u32(SHA256_IV.as_ptr()); 4];
         let mut efgh = [vld1q_u32(SHA256_IV.as_ptr().add(4)); 4];
-        compress4(
+        compress4::<false>(
             &mut abcd,
             &mut efgh,
             [

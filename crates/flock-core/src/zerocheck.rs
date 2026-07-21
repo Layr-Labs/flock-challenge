@@ -188,8 +188,15 @@ pub fn prove_packed_padded<C: Challenger>(
     padding: &PaddingSpec,
     challenger: &mut C,
 ) -> (ZerocheckProof, ZerocheckClaim) {
-    let (proof, claim, _) =
-        prove_packed_padded_inner(a_packed, b_packed, c_packed, m, padding, false, challenger);
+    let (proof, claim, _) = prove_packed_padded_inner(
+        a_packed,
+        b_packed,
+        Some(c_packed),
+        m,
+        padding,
+        false,
+        challenger,
+    );
     (proof, claim)
 }
 
@@ -208,8 +215,42 @@ pub fn prove_packed_padded_capture_s_hat_v_c<C: Challenger>(
     padding: &PaddingSpec,
     challenger: &mut C,
 ) -> (ZerocheckProof, ZerocheckClaim, Vec<F128>) {
-    let (proof, claim, captured) =
-        prove_packed_padded_inner(a_packed, b_packed, c_packed, m, padding, true, challenger);
+    let (proof, claim, captured) = prove_packed_padded_inner(
+        a_packed,
+        b_packed,
+        Some(c_packed),
+        m,
+        padding,
+        true,
+        challenger,
+    );
+    (
+        proof,
+        claim,
+        captured.expect("capture=true must produce s_hat_v_c"),
+    )
+}
+
+/// Honest-witness specialization of
+/// [`prove_packed_padded_capture_s_hat_v_c`]. Callers must guarantee that the
+/// omitted packed C vector equals `a_packed & b_packed` pointwise. The generic
+/// API remains available for arbitrary C inputs.
+pub fn prove_packed_padded_capture_s_hat_v_c_when_c_is_a_and_b<C: Challenger>(
+    a_packed: &[u8],
+    b_packed: &[u8],
+    m: usize,
+    padding: &PaddingSpec,
+    challenger: &mut C,
+) -> (ZerocheckProof, ZerocheckClaim, Vec<F128>) {
+    let (proof, claim, captured) = prove_packed_padded_inner(
+        a_packed,
+        b_packed,
+        None,
+        m,
+        padding,
+        true,
+        challenger,
+    );
     (
         proof,
         claim,
@@ -221,7 +262,7 @@ pub fn prove_packed_padded_capture_s_hat_v_c<C: Challenger>(
 fn prove_packed_padded_inner<C: Challenger>(
     a_packed: &[u8],
     b_packed: &[u8],
-    c_packed: &[u8],
+    c_packed: Option<&[u8]>,
     m: usize,
     padding: &PaddingSpec,
     capture_s_hat_v_c: bool,
@@ -237,7 +278,11 @@ fn prove_packed_padded_inner<C: Challenger>(
     let expected_bytes = (1usize << m) / 8;
     assert_eq!(a_packed.len(), expected_bytes);
     assert_eq!(b_packed.len(), expected_bytes);
-    assert_eq!(c_packed.len(), expected_bytes);
+    if let Some(c_packed) = c_packed {
+        assert_eq!(c_packed.len(), expected_bytes);
+    } else {
+        assert!(capture_s_hat_v_c, "C-from-AB is only implemented by the capture path");
+    }
     let n_mlv = m - k_skip;
 
     challenger.observe_label(b"flock-zerocheck-v0");
@@ -279,7 +324,7 @@ fn prove_packed_padded_inner<C: Challenger>(
         InvNttTableByteSingleGf8::new(&ntt_s, &ntt_l)
     });
     let (round1_ab_opt, round1_c_opt, s_hat_v_c) = if capture_s_hat_v_c {
-        let (ab, c, s) =
+        let (ab, c, s) = if let Some(c_packed) = c_packed {
             crate::zerocheck::univariate_skip_optimized::round1_shift_reduce_extract_c_packed_padded_with_s_hat_v(
                 a_packed,
                 b_packed,
@@ -289,9 +334,21 @@ fn prove_packed_padded_inner<C: Challenger>(
                 &r,
                 inv_table,
                 padding,
-            );
+            )
+        } else {
+            crate::zerocheck::univariate_skip_optimized::round1_shift_reduce_extract_c_packed_padded_with_s_hat_v_when_c_is_a_and_b(
+                a_packed,
+                b_packed,
+                m,
+                k_skip,
+                &r,
+                inv_table,
+                padding,
+            )
+        };
         (ab, c, Some(s))
     } else {
+        let c_packed = c_packed.expect("non-capture path requires an explicit C input");
         let (ab, c) = round1_shift_reduce_extract_c_packed_padded(
             a_packed, b_packed, c_packed, m, k_skip, &r, inv_table, padding,
         );

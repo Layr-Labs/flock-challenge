@@ -85,6 +85,25 @@ pub(super) unsafe fn butterfly_fused_3layer_row(
     r: usize,
     twiddles: &[F128; 7],
 ) {
+    #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+    if twiddles[0].is_zero() && twiddles[1].is_zero() && twiddles[3].is_zero() {
+        // Block zero of every fused pass has the seed's sparse tree shape.
+        let sparse_twiddles = [twiddles[2], twiddles[4], twiddles[5], twiddles[6]];
+        // SAFETY: the sparse kernel loads a lane's eight values before writing
+        // them, so exact source/destination overlap preserves the contract.
+        unsafe {
+            portable::butterfly_fused_3layer_row_from_sparse(
+                ptr,
+                ptr,
+                eighth,
+                num_ntts,
+                r,
+                &sparse_twiddles,
+            )
+        }
+        return;
+    }
+
     // SAFETY: forwarded caller contract.
     unsafe { portable::butterfly_fused_3layer_row(ptr, eighth, num_ntts, r, twiddles) }
 }

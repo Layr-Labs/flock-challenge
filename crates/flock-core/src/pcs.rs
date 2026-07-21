@@ -341,14 +341,14 @@ fn compute_combined_basis_and_target<Ch: Challenger>(
                     let s1 = out_block[2 * t + 1];
                     let a0 = packed_witness[base + 2 * t];
                     let a1 = packed_witness[base + 2 * t + 1];
-                    #[cfg(target_arch = "aarch64")]
+                    #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
                     let products = unsafe {
                         crate::field::gf2_128::aarch64::ghash_mul_unreduced_vec2_neon(
                             [a0, a0 + a1],
                             [s0, s0 + s1],
                         )
                     };
-                    #[cfg(not(target_arch = "aarch64"))]
+                    #[cfg(not(all(target_arch = "aarch64", target_feature = "aes")))]
                     let products = [
                         a0.mul_unreduced(s0),
                         (a0 + a1).mul_unreduced(s0 + s1),

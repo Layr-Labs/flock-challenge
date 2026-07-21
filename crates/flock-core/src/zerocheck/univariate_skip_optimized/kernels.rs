@@ -50,6 +50,22 @@ pub(super) fn bit_transpose_64bytes(input: &[u8; 64], output: &mut [u8; 64]) {
     portable::bit_transpose_64bytes_scalar(input, output);
 }
 
+#[inline]
+pub(super) fn bit_transpose_64bytes_and(
+    a: &[u8; 64],
+    b: &[u8; 64],
+    output: &mut [u8; 64],
+) {
+    #[cfg(target_arch = "aarch64")]
+    // SAFETY: aarch64 statically guarantees NEON.
+    unsafe {
+        aarch64::bit_transpose_64bytes_and_neon(a, b, output);
+    }
+
+    #[cfg(not(target_arch = "aarch64"))]
+    portable::bit_transpose_64bytes_and_scalar(a, b, output);
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(super) fn shift_reduce_inner_ab(
     a_packed: &[u8],

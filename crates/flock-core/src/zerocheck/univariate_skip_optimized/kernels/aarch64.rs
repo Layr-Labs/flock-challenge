@@ -148,22 +148,18 @@ pub(crate) unsafe fn accumulate_convert_with_s_hat_v(
     }
 }
 
-/// NEON 64-byte bit-transpose. Two-stage:
-///   1. `vqtbl4q_u8` reorders the 64 input bytes so each 8-byte group within
-///      the output is one byte-chunk's worth of `x_small=0..8` bytes.
-///   2. Three rounds of bit-swap at distances 7, 14, 28 across `uint64x2_t`
-///      lanes do the actual 8×8 bit transpose.
 #[cfg(target_arch = "aarch64")]
 #[inline(always)]
-pub(crate) unsafe fn bit_transpose_64bytes_neon(input: &[u8; 64], output: &mut [u8; 64]) {
+unsafe fn bit_transpose_4x16_neon(
+    v0: core::arch::aarch64::uint8x16_t,
+    v1: core::arch::aarch64::uint8x16_t,
+    v2: core::arch::aarch64::uint8x16_t,
+    v3: core::arch::aarch64::uint8x16_t,
+    output: &mut [u8; 64],
+) {
     use core::arch::aarch64::*;
 
     unsafe {
-        let in_ptr = input.as_ptr();
-        let v0 = vld1q_u8(in_ptr);
-        let v1 = vld1q_u8(in_ptr.add(16));
-        let v2 = vld1q_u8(in_ptr.add(32));
-        let v3 = vld1q_u8(in_ptr.add(48));
         let table = uint8x16x4_t(v0, v1, v2, v3);
 
         // vqtbl4q indexes that bring bytes belonging to byte-chunk b ∈ 0..8
@@ -216,6 +212,53 @@ pub(crate) unsafe fn bit_transpose_64bytes_neon(input: &[u8; 64], output: &mut [
         vst1q_u8(out_ptr.add(16), vreinterpretq_u8_u64(y1));
         vst1q_u8(out_ptr.add(32), vreinterpretq_u8_u64(y2));
         vst1q_u8(out_ptr.add(48), vreinterpretq_u8_u64(y3));
+    }
+}
+
+/// NEON 64-byte bit-transpose. Two-stage:
+///   1. `vqtbl4q_u8` reorders the 64 input bytes so each 8-byte group within
+///      the output is one byte-chunk's worth of `x_small=0..8` bytes.
+///   2. Three rounds of bit-swap at distances 7, 14, 28 across `uint64x2_t`
+///      lanes do the actual 8×8 bit transpose.
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+pub(crate) unsafe fn bit_transpose_64bytes_neon(input: &[u8; 64], output: &mut [u8; 64]) {
+    use core::arch::aarch64::*;
+
+    unsafe {
+        let p = input.as_ptr();
+        bit_transpose_4x16_neon(
+            vld1q_u8(p),
+            vld1q_u8(p.add(16)),
+            vld1q_u8(p.add(32)),
+            vld1q_u8(p.add(48)),
+            output,
+        );
+    }
+}
+
+/// Transpose `a & b` without materializing the 64-byte AND result. The A/B
+/// lines were just consumed by the shift-reduce kernel and should still be
+/// cache-resident on the honest-witness fast path.
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+pub(crate) unsafe fn bit_transpose_64bytes_and_neon(
+    a: &[u8; 64],
+    b: &[u8; 64],
+    output: &mut [u8; 64],
+) {
+    use core::arch::aarch64::*;
+
+    unsafe {
+        let ap = a.as_ptr();
+        let bp = b.as_ptr();
+        bit_transpose_4x16_neon(
+            vandq_u8(vld1q_u8(ap), vld1q_u8(bp)),
+            vandq_u8(vld1q_u8(ap.add(16)), vld1q_u8(bp.add(16))),
+            vandq_u8(vld1q_u8(ap.add(32)), vld1q_u8(bp.add(32))),
+            vandq_u8(vld1q_u8(ap.add(48)), vld1q_u8(bp.add(48))),
+            output,
+        );
     }
 }
 

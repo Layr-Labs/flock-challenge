@@ -88,7 +88,7 @@
 //!   are "free" witness bits. PCS-level openings at fixed indices will
 //!   eventually pin them to claimed public inputs.
 
-use super::common::{BitRecord, add_carry_parts, or_bit_at, or_u32_at_bit, xor_dedup};
+use super::common::{add_carry_parts, xor_dedup};
 use flock_core::challenger::Challenger;
 use flock_core::field::F128;
 use flock_core::pcs::{Commitment, PcsParams};
@@ -980,48 +980,131 @@ pub fn generate_witness(blocks: &[Compression], n_blocks_log: usize) -> Vec<bool
 // - Input slot:          (z, a, b, c) = (val, val, 1, val).
 // - Lin-id slot:         (z, a, b, c) = (lin_val, lin_val, 1, lin_val).
 // - Carry_aux row i:     (z, a, b, c) = (carry_aux, X⊕cin, Y⊕cin, carry_aux).
-// - Padding row:         all zero (already zero on entry).
+// - Padding row:         all zero.
 // ---------------------------------------------------------------------------
 
-/// One 32-bit ADD: returns `(sum, left, right, carry_aux)` for the caller to
-/// place into the per-G records. Sum bits are NOT materialized in this
-/// encoding (Option D).
-///
-/// **c is not written.** Since `C = I` in this R1CS, `c == z` byte-for-byte,
-/// so callers can use `z_packed` directly as the c-side input to zerocheck —
-/// no separate c buffer is needed.
-///
-/// Word-level derivation:
-/// ```text
-///   sum       = x + y (mod 2^32)
-///   cin       = sum ⊕ x ⊕ y          (since sum[i] = x[i] ⊕ y[i] ⊕ cin[i])
-///   left      = x ⊕ cin              (per-bit X ⊕ cin → operand_x of carry row)
-///   right     = y ⊕ cin              (per-bit Y ⊕ cin → operand_y of carry row)
-///   carry_aux = left ∧ right
-/// ```
-/// Bit 31 is the discarded mod-2³² carry-out and is masked off so the
-/// record push doesn't spill into the next slot.
-// Record-relative positions: carries at 31·i, lin words after all carries.
-const REC_C0: usize = 0;
-const REC_C1: usize = CARRY_BITS_PER_ADD;
-const REC_C2: usize = 2 * CARRY_BITS_PER_ADD;
-const REC_C3: usize = 3 * CARRY_BITS_PER_ADD;
-const REC_C4: usize = 4 * CARRY_BITS_PER_ADD;
-const REC_C5: usize = 5 * CARRY_BITS_PER_ADD;
-const REC_LIN0: usize = ADDS_PER_G * CARRY_BITS_PER_ADD;
-const REC_LIN1: usize = REC_LIN0 + WORD_BITS;
+/// Streaming writer for the contiguous row interval `[Z_CONST_POS,
+/// USEFUL_BITS)`. All three row values advance together, and completed u64s
+/// are assigned rather than OR'd into a pre-zeroed destination.
+struct PackedRowStream<'a> {
+    z: &'a mut [u64],
+    a: &'a mut [u64],
+    b: &'a mut [u64],
+    word_idx: usize,
+    used: usize,
+    z_word: u64,
+    a_word: u64,
+    b_word: u64,
+}
 
-/// Write a 32-bit lin-id (or input) slot: (z, a) = val, b = all-ones.
-/// **c is not written** — same `c == z` aliasing trick as above.
+impl<'a> PackedRowStream<'a> {
+    #[inline(always)]
+    fn new(
+        z: &'a mut [u64],
+        a: &'a mut [u64],
+        b: &'a mut [u64],
+        start_bit: usize,
+    ) -> Self {
+        debug_assert_eq!(start_bit & 63, 0);
+        Self {
+            z,
+            a,
+            b,
+            word_idx: start_bit >> 6,
+            used: 0,
+            z_word: 0,
+            a_word: 0,
+            b_word: 0,
+        }
+    }
+
+    #[inline(always)]
+    fn push<const WIDTH: usize>(&mut self, z: u32, a: u32, b: u32) {
+        debug_assert!(WIDTH > 0 && WIDTH <= 32);
+        let mask = if WIDTH == 32 {
+            u32::MAX
+        } else {
+            (1u32 << WIDTH) - 1
+        };
+        let z = (z & mask) as u64;
+        let a = (a & mask) as u64;
+        let b = (b & mask) as u64;
+
+        self.z_word |= z << self.used;
+        self.a_word |= a << self.used;
+        self.b_word |= b << self.used;
+
+        let remaining = 64 - self.used;
+        if WIDTH >= remaining {
+            self.z[self.word_idx] = self.z_word;
+            self.a[self.word_idx] = self.a_word;
+            self.b[self.word_idx] = self.b_word;
+            self.word_idx += 1;
+            self.used = WIDTH - remaining;
+            self.z_word = z >> remaining;
+            self.a_word = a >> remaining;
+            self.b_word = b >> remaining;
+        } else {
+            self.used += WIDTH;
+        }
+    }
+
+    #[inline(always)]
+    fn push_lin(&mut self, val: u32) {
+        self.push::<WORD_BITS>(val, val, u32::MAX);
+    }
+
+    /// Append one carry row group and return the wrapping sum. Bit 31 is
+    /// discarded by the 31-bit stream field, matching `add_carry_parts`.
+    #[inline(always)]
+    fn push_add(&mut self, x: u32, y: u32) -> u32 {
+        let (sum, left, right, carry) = add_carry_parts(x, y);
+        self.push::<CARRY_BITS_PER_ADD>(carry, left, right);
+        sum
+    }
+
+    #[inline(always)]
+    fn position(&self) -> usize {
+        self.word_idx * 64 + self.used
+    }
+
+    /// Commit the final partial word and initialize the padding suffix.
+    #[inline]
+    fn finish(mut self) {
+        if self.used != 0 {
+            self.z[self.word_idx] = self.z_word;
+            self.a[self.word_idx] = self.a_word;
+            self.b[self.word_idx] = self.b_word;
+            self.word_idx += 1;
+        }
+        self.z[self.word_idx..].fill(0);
+        self.a[self.word_idx..].fill(0);
+        self.b[self.word_idx..].fill(0);
+    }
+}
+
+/// Write an aligned eight-word lin-id region: `(z, a) = vals`, `b = 1`.
 #[inline]
-fn write_lin_word_ab_packed(bit_off: usize, val: u32, z: &mut [u64], a: &mut [u64], b: &mut [u64]) {
-    or_u32_at_bit(z, bit_off, val);
-    or_u32_at_bit(a, bit_off, val);
-    or_u32_at_bit(b, bit_off, 0xFFFF_FFFF);
+fn write_aligned_lin_words(
+    bit_off: usize,
+    vals: &[u32; 8],
+    z: &mut [u64],
+    a: &mut [u64],
+    b: &mut [u64],
+) {
+    debug_assert_eq!(bit_off & 63, 0);
+    let base = bit_off >> 6;
+    for i in 0..4 {
+        let packed = vals[2 * i] as u64 | ((vals[2 * i + 1] as u64) << 32);
+        z[base + i] = packed;
+        a[base + i] = packed;
+        b[base + i] = u64::MAX;
+    }
 }
 
 /// Build the (z, a, b) blocks for ONE compression instance, into u64 views
-/// of the F128-packed per-block storage. Buffers must be zero on entry.
+/// of the F128-packed per-block storage. Every destination word is overwritten;
+/// prior buffer contents are ignored.
 ///
 /// **No c buffer.** Since `C = I` (this is the circuit-shape R1CS), `c == z`
 /// byte-for-byte; callers use `z_packed` directly as the c-side input to
@@ -1041,24 +1124,24 @@ fn build_block_witness_ab_packed_into(
     debug_assert_eq!(a.len(), U64_PER_BLOCK);
     debug_assert_eq!(b.len(), U64_PER_BLOCK);
 
-    // Constant z[0] = 1; a/b also 1 (z[0]·z[0] = z[0]).
-    or_bit_at(z, Z_CONST_POS);
-    or_bit_at(a, Z_CONST_POS);
-    or_bit_at(b, Z_CONST_POS);
-
-    // Input rows.
     let counter_lo = counter as u32;
     let counter_hi = (counter >> 32) as u32;
-    for w in 0..8 {
-        write_lin_word_ab_packed(cv_bit(w, 0), cv[w], z, a, b);
+
+    // CV occupies an aligned region before the contiguous stream. OUT_LO is
+    // filled after the state evolution below.
+    write_aligned_lin_words(CV_BASE, cv, z, a, b);
+
+    let mut rows = PackedRowStream::new(z, a, b, Z_CONST_POS);
+    // Constant row: z = a = b = 1.
+    rows.push::<1>(1, 1, 1);
+    for &word in m {
+        rows.push_lin(word);
     }
-    for i in 0..16 {
-        write_lin_word_ab_packed(m_bit(i, 0), m[i], z, a, b);
-    }
-    write_lin_word_ab_packed(T_LO_BASE, counter_lo, z, a, b);
-    write_lin_word_ab_packed(T_HI_BASE, counter_hi, z, a, b);
-    write_lin_word_ab_packed(BLEN_BASE, block_len, z, a, b);
-    write_lin_word_ab_packed(FLAGS_BASE, flags, z, a, b);
+    rows.push_lin(counter_lo);
+    rows.push_lin(counter_hi);
+    rows.push_lin(block_len);
+    rows.push_lin(flags);
+    debug_assert_eq!(rows.position(), GS_BASE);
 
     // BLAKE3 state evolution.
     let mut state: [u32; 16] = [
@@ -1082,7 +1165,6 @@ fn build_block_witness_ab_packed_into(
     let msg_idx = per_round_msg_idx();
     for r in 0..N_ROUNDS {
         for g_in_round in 0..N_G_PER_ROUND {
-            let g = r * N_G_PER_ROUND + g_in_round;
             let [la, lb, lc, ld] = G_LANES[g_in_round];
             let [mx_i, my_i] = msg_idx[r][g_in_round];
             let mx = m[mx_i];
@@ -1093,42 +1175,19 @@ fn build_block_witness_ab_packed_into(
             let c_val = state[lc];
             let d_val = state[ld];
 
-            let mut rz = BitRecord::<4>::new();
-            let mut ra = BitRecord::<4>::new();
-            let mut rb = BitRecord::<4>::new();
-
-            macro_rules! add_into {
-                ($pos:ident, $x:expr, $y:expr) => {{
-                    let (sum, left, right, carry) = add_carry_parts($x, $y);
-                    rz.push::<$pos>(carry);
-                    ra.push::<$pos>(left);
-                    rb.push::<$pos>(right);
-                    sum
-                }};
-            }
-
-            let tmp_0 = add_into!(REC_C0, a_val, b_val);
-            let a_1 = add_into!(REC_C1, tmp_0, mx);
+            let tmp_0 = rows.push_add(a_val, b_val);
+            let a_1 = rows.push_add(tmp_0, mx);
             let d_1 = (d_val ^ a_1).rotate_right(16);
-            let c_1 = add_into!(REC_C2, c_val, d_1);
+            let c_1 = rows.push_add(c_val, d_1);
             let b_1 = (b_val ^ c_1).rotate_right(12);
-            let tmp_1 = add_into!(REC_C3, a_1, b_1);
-            let a_2 = add_into!(REC_C4, tmp_1, my);
+            let tmp_1 = rows.push_add(a_1, b_1);
+            let a_2 = rows.push_add(tmp_1, my);
             let d_2 = (d_1 ^ a_2).rotate_right(8);
-            let c_2 = add_into!(REC_C5, c_1, d_2);
+            let c_2 = rows.push_add(c_1, d_2);
             let b_new = (b_1 ^ c_2).rotate_right(7);
             let d_new = d_2;
-            rz.push::<REC_LIN0>(b_new);
-            ra.push::<REC_LIN0>(b_new);
-            rb.push::<REC_LIN0>(0xFFFF_FFFF);
-            rz.push::<REC_LIN1>(d_new);
-            ra.push::<REC_LIN1>(d_new);
-            rb.push::<REC_LIN1>(0xFFFF_FFFF);
-
-            let g_base = GS_BASE + G_STRIDE * g;
-            rz.flush(z, g_base);
-            ra.flush(a, g_base);
-            rb.flush(b, g_base);
+            rows.push_lin(b_new);
+            rows.push_lin(d_new);
 
             state[la] = a_2;
             state[lb] = b_new;
@@ -1136,14 +1195,19 @@ fn build_block_witness_ab_packed_into(
             state[ld] = d_new;
         }
     }
+    debug_assert_eq!(rows.position(), OUT_HI_BASE);
 
     // Finalization XOR rows.
+    let mut out_lo = [0u32; 8];
     for w in 0..8 {
-        let lo = state[w] ^ state[w + 8];
+        out_lo[w] = state[w] ^ state[w + 8];
         let hi = state[w + 8] ^ cv[w];
-        write_lin_word_ab_packed(out_lo_bit(w, 0), lo, z, a, b);
-        write_lin_word_ab_packed(out_hi_bit(w, 0), hi, z, a, b);
+        rows.push_lin(hi);
     }
+    debug_assert_eq!(rows.position(), USEFUL_BITS);
+    rows.finish();
+
+    write_aligned_lin_words(OUT_LO_BASE, &out_lo, z, a, b);
 }
 
 /// **The fast path.** Produces `(z, a, b)` directly as F_{2^128}-packed
@@ -1234,9 +1298,9 @@ pub fn generate_witness_with_ab_packed_and_lincheck(
     // every block. (The chain forbids padding, so this only affects the
     // standalone batch setup.)
     let padding: Compression = ([0u32; 8], [0u32; 16], 0u64, 0u32, 0u32);
-    super::common::drive_witness_packed_and_lincheck(
+    super::common::drive_witness_packed_and_lincheck_overwrite(
         blocks,
-        Some(&padding),
+        &padding,
         n_blocks_log,
         K_LOG,
         |block: &Compression, z_u64, a_u64, b_u64| {

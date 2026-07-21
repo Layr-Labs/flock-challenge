@@ -44,8 +44,9 @@ mod kernels;
 
 #[cfg(all(test, target_arch = "aarch64"))]
 use kernels::aarch64::{
-    bit_transpose_64bytes_neon, shift_reduce_inner_ab_fused_neon,
-    shift_reduce_inner_ab_fused_neon_prefix_7, shift_reduce_inner_ab_neon,
+    bit_transpose_64bytes_and_neon, bit_transpose_64bytes_neon,
+    shift_reduce_inner_ab_fused_neon, shift_reduce_inner_ab_fused_neon_prefix_7,
+    shift_reduce_inner_ab_neon,
 };
 #[cfg(all(test, target_arch = "aarch64"))]
 use kernels::bit_transpose_64bytes_scalar;
@@ -562,12 +563,38 @@ impl WorkerStateWithSHatV {
     }
 }
 
+/// Transpose one packed C window, either from the explicit generic input or
+/// from pointwise A & B for the honest-witness specialization.
+#[inline(always)]
+fn transpose_c_window<const C_IS_A_AND_B: bool>(
+    a_packed: &[u8],
+    b_packed: &[u8],
+    c_packed: &[u8],
+    byte_base: usize,
+    output: &mut [u8; 64],
+) {
+    if C_IS_A_AND_B {
+        let a: &[u8; 64] = (&a_packed[byte_base..byte_base + 64])
+            .try_into()
+            .expect("64 a-bytes per medium position");
+        let b: &[u8; 64] = (&b_packed[byte_base..byte_base + 64])
+            .try_into()
+            .expect("64 b-bytes per medium position");
+        kernels::bit_transpose_64bytes_and(a, b, output);
+    } else {
+        let c: &[u8; 64] = (&c_packed[byte_base..byte_base + 64])
+            .try_into()
+            .expect("64 c-bytes per medium position");
+        bit_transpose_64bytes(c, output);
+    }
+}
+
 /// Two-bank C variant of [`process_one_x_hi`]. AB-side and witness traffic
 /// unchanged; the only modification is the C-side inner loop now maintains
 /// `cf_c_0` and `cf_c_1` via masked convert-table lookups.
 #[inline]
 #[allow(clippy::too_many_arguments)]
-fn process_one_x_hi_with_s_hat_v(
+fn process_one_x_hi_with_s_hat_v<const C_IS_A_AND_B: bool>(
     x_hi: usize,
     big_lo_size: usize,
     n_lo_and_inner: usize,
@@ -623,10 +650,13 @@ fn process_one_x_hi_with_s_hat_v(
                     &mut state.b_col,
                 );
                 let byte_base_b = chunk_byte_base + b_med * N_CHUNKS * 8;
-                let c_in: &[u8; 64] = (&c_packed[byte_base_b..byte_base_b + 64])
-                    .try_into()
-                    .expect("64 c-bytes per medium position");
-                bit_transpose_64bytes(c_in, &mut state.chunk_c_bytes[b_med]);
+                transpose_c_window::<C_IS_A_AND_B>(
+                    a_packed,
+                    b_packed,
+                    c_packed,
+                    byte_base_b,
+                    &mut state.chunk_c_bytes[b_med],
+                );
             }
 
             kernels::accumulate_convert_with_s_hat_v(
@@ -652,10 +682,13 @@ fn process_one_x_hi_with_s_hat_v(
                     &mut state.b_col,
                 );
                 let byte_base_b = chunk_byte_base + b_med * N_CHUNKS * 8;
-                let c_in: &[u8; 64] = (&c_packed[byte_base_b..byte_base_b + 64])
-                    .try_into()
-                    .expect("64 c-bytes per medium position");
-                bit_transpose_64bytes(c_in, &mut state.chunk_c_bytes[b_med]);
+                transpose_c_window::<C_IS_A_AND_B>(
+                    a_packed,
+                    b_packed,
+                    c_packed,
+                    byte_base_b,
+                    &mut state.chunk_c_bytes[b_med],
+                );
             }
             let b_med = n_b_med - 1;
             if last_bytes == 7 {
@@ -682,10 +715,13 @@ fn process_one_x_hi_with_s_hat_v(
                 );
             }
             let byte_base_b = chunk_byte_base + b_med * N_CHUNKS * 8;
-            let c_in: &[u8; 64] = (&c_packed[byte_base_b..byte_base_b + 64])
-                .try_into()
-                .expect("64 c-bytes per medium position");
-            bit_transpose_64bytes(c_in, &mut state.chunk_c_bytes[b_med]);
+            transpose_c_window::<C_IS_A_AND_B>(
+                a_packed,
+                b_packed,
+                c_packed,
+                byte_base_b,
+                &mut state.chunk_c_bytes[b_med],
+            );
 
             kernels::accumulate_convert_with_s_hat_v(
                 &state.chunk_ab_bytes,
@@ -895,6 +931,50 @@ pub fn round1_shift_reduce_extract_c_packed_padded_with_s_hat_v(
     inv_table: &InvNttTableByteSingleGf8,
     padding: &PaddingSpec,
 ) -> (Vec<F128>, Vec<F128>, Vec<F128>) {
+    round1_shift_reduce_extract_c_packed_padded_with_s_hat_v_impl::<false>(
+        a_packed, b_packed, c_packed, m, k_skip, r, inv_table, padding,
+    )
+}
+
+/// Honest-witness specialization of
+/// [`round1_shift_reduce_extract_c_packed_padded_with_s_hat_v`]. This is valid
+/// only when the omitted packed C vector is pointwise `a_packed & b_packed`.
+/// It derives each transposed C window directly from the already-touched A/B
+/// lines and never reads a C buffer.
+pub fn round1_shift_reduce_extract_c_packed_padded_with_s_hat_v_when_c_is_a_and_b(
+    a_packed: &[u8],
+    b_packed: &[u8],
+    m: usize,
+    k_skip: usize,
+    r: &[F128],
+    inv_table: &InvNttTableByteSingleGf8,
+    padding: &PaddingSpec,
+) -> (Vec<F128>, Vec<F128>, Vec<F128>) {
+    round1_shift_reduce_extract_c_packed_padded_with_s_hat_v_impl::<true>(
+        a_packed,
+        b_packed,
+        &[],
+        m,
+        k_skip,
+        r,
+        inv_table,
+        padding,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn round1_shift_reduce_extract_c_packed_padded_with_s_hat_v_impl<
+    const C_IS_A_AND_B: bool,
+>(
+    a_packed: &[u8],
+    b_packed: &[u8],
+    c_packed: &[u8],
+    m: usize,
+    k_skip: usize,
+    r: &[F128],
+    inv_table: &InvNttTableByteSingleGf8,
+    padding: &PaddingSpec,
+) -> (Vec<F128>, Vec<F128>, Vec<F128>) {
     use rayon::prelude::*;
 
     assert_eq!(k_skip, K_SKIP, "optimized variant is k_skip=6 only");
@@ -906,7 +986,9 @@ pub fn round1_shift_reduce_extract_c_packed_padded_with_s_hat_v(
     let total_bytes = (1usize << m) / 8;
     assert_eq!(a_packed.len(), total_bytes);
     assert_eq!(b_packed.len(), total_bytes);
-    assert_eq!(c_packed.len(), total_bytes);
+    if !C_IS_A_AND_B {
+        assert_eq!(c_packed.len(), total_bytes);
+    }
     assert_eq!(r.len(), m);
     assert_eq!(inv_table.k, k_skip);
 
@@ -926,7 +1008,7 @@ pub fn round1_shift_reduce_extract_c_packed_padded_with_s_hat_v(
         .into_par_iter()
         .fold(WorkerStateWithSHatV::new, |mut state, x_hi| {
             let eq_hi_val = eq_hi[x_hi];
-            process_one_x_hi_with_s_hat_v(
+            process_one_x_hi_with_s_hat_v::<C_IS_A_AND_B>(
                 x_hi,
                 big_lo_size,
                 n_lo_and_inner,
@@ -1373,7 +1455,11 @@ mod tests {
         let mut rng = Rng::new(0xB17_BB17);
         for _ in 0..64 {
             let mut input = [0u8; 64];
+            let mut other = [0u8; 64];
             for byte in input.iter_mut() {
+                *byte = (rng.next_u64() & 0xff) as u8;
+            }
+            for byte in other.iter_mut() {
                 *byte = (rng.next_u64() & 0xff) as u8;
             }
             let mut out_scalar = [0u8; 64];
@@ -1382,6 +1468,12 @@ mod tests {
             // SAFETY: on aarch64.
             unsafe { bit_transpose_64bytes_neon(&input, &mut out_neon) };
             assert_eq!(out_scalar, out_neon, "bit_transpose disagreement");
+
+            let and_input = std::array::from_fn(|i| input[i] & other[i]);
+            bit_transpose_64bytes_scalar(&and_input, &mut out_scalar);
+            // SAFETY: on aarch64.
+            unsafe { bit_transpose_64bytes_and_neon(&input, &other, &mut out_neon) };
+            assert_eq!(out_scalar, out_neon, "AND+bit_transpose disagreement");
         }
     }
 
@@ -1635,6 +1727,56 @@ mod tests {
                 assert_eq!(t[b * 256 + v as usize], expected, "b={b}, v={v}");
             }
             g_pow = mul_by_x(g_pow);
+        }
+    }
+
+    /// Deriving C from A & B must preserve every round-1 and captured PCS
+    /// value, including BLAKE3's seven-byte boundary window.
+    #[test]
+    fn c_from_ab_specialization_matches_explicit_c() {
+        let cases = [
+            (13usize, PaddingSpec::dense(13)),
+            (
+                14usize,
+                PaddingSpec {
+                    k_log: 14,
+                    useful_bits_per_block: 15_409,
+                },
+            ),
+        ];
+
+        for (m, padding) in cases {
+            let mut rng = Rng::new(0xC_A11D_u64 + m as u64);
+            let mut a = vec![0u8; (1usize << m) / 8];
+            let mut b = vec![0u8; (1usize << m) / 8];
+            for byte in &mut a {
+                *byte = rng.next_u64() as u8;
+            }
+            for byte in &mut b {
+                *byte = rng.next_u64() as u8;
+            }
+
+            let block_bits = 1usize << padding.k_log;
+            for block in 0..1usize << (m - padding.k_log) {
+                for bit in padding.useful_bits_per_block..block_bits {
+                    let index = block * block_bits + bit;
+                    a[index / 8] &= !(1 << (index % 8));
+                    b[index / 8] &= !(1 << (index % 8));
+                }
+            }
+            let c: Vec<u8> = a.iter().zip(&b).map(|(&a, &b)| a & b).collect();
+            let outer = rng.f128_vec(m - K_SKIP - N_INNER);
+            let r = build_protocol_r(m, &outer);
+            let table = make_inv_table();
+
+            let explicit = round1_shift_reduce_extract_c_packed_padded_with_s_hat_v(
+                &a, &b, &c, m, K_SKIP, &r, &table, &padding,
+            );
+            let derived =
+                round1_shift_reduce_extract_c_packed_padded_with_s_hat_v_when_c_is_a_and_b(
+                    &a, &b, m, K_SKIP, &r, &table, &padding,
+                );
+            assert_eq!(derived, explicit, "C-from-AB mismatch at m={m}");
         }
     }
 

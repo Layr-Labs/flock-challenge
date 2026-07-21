@@ -334,6 +334,10 @@ pub fn prove_fast_core_with_codeword<Ch: Challenger>(
     prefaulted_codeword: Option<Vec<F128>>,
     challenger: &mut Ch,
 ) -> ProveCore {
+    assert!(
+        r1cs.c0_is_identity(),
+        "prove_fast_core_with_codeword requires the C = I convention"
+    );
     let (commitment, prover_data) = match prefaulted_codeword {
         Some(buf) => pcs::commit_into(&z_packed, pcs_params, buf),
         None => pcs::commit(&z_packed, pcs_params),
@@ -342,7 +346,8 @@ pub fn prove_fast_core_with_codeword<Ch: Challenger>(
 
     let padding = r1cs.padding_spec();
     let (zc_proof, zc_claim, s_hat_v_c) = {
-        // Zero-cost &[u8] views of the F128 buffers; c aliases z (C = I).
+        // These buffers come from the trusted per-hash witness generators.
+        // Their valid R1CS rows guarantee c (= z for C = I) == a & b.
         let a_packed: &[u8] = unsafe {
             std::slice::from_raw_parts(
                 a_packed_f128.as_ptr() as *const u8,
@@ -355,14 +360,8 @@ pub fn prove_fast_core_with_codeword<Ch: Challenger>(
                 b_packed_f128.len() * core::mem::size_of::<F128>(),
             )
         };
-        let c_packed: &[u8] = unsafe {
-            std::slice::from_raw_parts(
-                z_packed.as_ptr() as *const u8,
-                z_packed.len() * core::mem::size_of::<F128>(),
-            )
-        };
-        zerocheck::prove_packed_padded_capture_s_hat_v_c(
-            a_packed, b_packed, c_packed, r1cs.m, &padding, challenger,
+        zerocheck::prove_packed_padded_capture_s_hat_v_c_when_c_is_a_and_b(
+            a_packed, b_packed, r1cs.m, &padding, challenger,
         )
     };
     // Nothing downstream reads a/b (zerocheck consumed them in rounds 1–2);
@@ -459,6 +458,10 @@ pub fn prove_fast_ligerito_timed<Ch: Challenger>(
     challenger: &mut Ch,
 ) -> (R1csProofLigerito, Commitment, R1csClaim, ProvePhaseTimings) {
     use std::time::Instant;
+    assert!(
+        r1cs.c0_is_identity(),
+        "prove_fast_ligerito_timed requires the C = I convention"
+    );
     let mut t = ProvePhaseTimings::default();
 
     let log_n = r1cs.m - pcs::LOG_PACKING;
@@ -492,14 +495,8 @@ pub fn prove_fast_ligerito_timed<Ch: Challenger>(
                 b_packed_f128.len() * core::mem::size_of::<F128>(),
             )
         };
-        let c_packed: &[u8] = unsafe {
-            std::slice::from_raw_parts(
-                z_packed.as_ptr() as *const u8,
-                z_packed.len() * core::mem::size_of::<F128>(),
-            )
-        };
-        zerocheck::prove_packed_padded_capture_s_hat_v_c(
-            a_packed, b_packed, c_packed, r1cs.m, &padding, challenger,
+        zerocheck::prove_packed_padded_capture_s_hat_v_c_when_c_is_a_and_b(
+            a_packed, b_packed, r1cs.m, &padding, challenger,
         )
     };
     t.zerocheck_s = t0.elapsed().as_secs_f64();

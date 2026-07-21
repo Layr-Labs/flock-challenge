@@ -22,6 +22,26 @@ pub(in super::super) fn bit_transpose_64bytes_scalar(input: &[u8; 64], output: &
     }
 }
 
+/// Scalar oracle/fallback for transposing the pointwise AND of two inputs.
+#[allow(dead_code)]
+pub(in super::super) fn bit_transpose_64bytes_and_scalar(
+    a: &[u8; 64],
+    b: &[u8; 64],
+    output: &mut [u8; 64],
+) {
+    output.fill(0);
+    for byte_idx in 0..64 {
+        let input_byte = a[byte_idx] & b[byte_idx];
+        let x_small = byte_idx / 8;
+        let b_chunk = byte_idx % 8;
+        for t in 0..8 {
+            if (input_byte >> t) & 1 != 0 {
+                output[b_chunk * 8 + t] |= 1u8 << x_small;
+            }
+        }
+    }
+}
+
 /// Scalar shift-reduce kernel and oracle for the architecture backends.
 #[allow(dead_code)]
 #[allow(clippy::too_many_arguments)]
