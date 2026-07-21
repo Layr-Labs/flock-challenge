@@ -2252,8 +2252,53 @@ fn transpose_forward_ntt_sparse(
     }
 
     // Remaining steps s = k..log_d-1 = forward layers (log_d-1-k) .. 0, dense.
+    // Fuse three adjacent transpose layers into one buffer pass. For eight
+    // live values, each layer has four butterflies; keeping the values in
+    // registers preserves the exact M^T order while cutting three full reads
+    // and writes to one.
     let n_threads = rayon::current_num_threads().max(1);
-    for layer in (0..(log_d - k)).rev() {
+    let mut remaining = log_d - k;
+    while remaining > 0 {
+        if remaining >= 3 {
+            let high = remaining - 1;
+            let mid = high - 1;
+            let low = mid - 1;
+            let num_blocks = 1usize << low;
+            let eighth = 1usize << (log_d - low - 3);
+            let twiddles: Vec<[F128; 7]> = (0..num_blocks)
+                .map(|block| {
+                    [
+                        ntt.twiddle(high, 4 * block),
+                        ntt.twiddle(high, 4 * block + 1),
+                        ntt.twiddle(high, 4 * block + 2),
+                        ntt.twiddle(high, 4 * block + 3),
+                        ntt.twiddle(mid, 2 * block),
+                        ntt.twiddle(mid, 2 * block + 1),
+                        ntt.twiddle(low, block),
+                    ]
+                })
+                .collect();
+            let base = data.as_mut_ptr() as usize;
+            (0..num_blocks * eighth).into_par_iter().for_each(|group| {
+                let block = group / eighth;
+                let r = group % eighth;
+                // SAFETY: each (block, r) selects eight unique locations and
+                // distinct groups are disjoint.
+                unsafe {
+                    transpose_fused_3layer_group(
+                        base as *mut F128,
+                        block * 8 * eighth,
+                        eighth,
+                        r,
+                        &twiddles[block],
+                    )
+                };
+            });
+            remaining -= 3;
+            continue;
+        }
+
+        let layer = remaining - 1;
         let num_blocks = 1usize << layer;
         let block_size = 1usize << (log_d - layer);
         let bsh = block_size >> 1;
@@ -2287,8 +2332,52 @@ fn transpose_forward_ntt_sparse(
                     });
             }
         }
+        remaining -= 1;
     }
     data
+}
+
+/// Apply three consecutive transpose butterflies to one eight-value group.
+/// Twiddles are ordered as four high-layer blocks, two middle-layer blocks,
+/// then the containing low-layer block.
+///
+/// # Safety
+/// The eight addresses selected by `block_start + i*eighth + r` must be valid
+/// and exclusive to this call.
+#[inline]
+unsafe fn transpose_fused_3layer_group(
+    ptr: *mut F128,
+    block_start: usize,
+    eighth: usize,
+    r: usize,
+    twiddles: &[F128; 7],
+) {
+    #[inline(always)]
+    fn butterfly(values: &mut [F128; 8], a: usize, b: usize, twiddle: F128) {
+        let sum = values[a] + values[b];
+        values[b] += twiddle * sum;
+        values[a] = sum;
+    }
+
+    let mut values = [F128::ZERO; 8];
+    for (i, value) in values.iter_mut().enumerate() {
+        // SAFETY: upheld by the caller's address-range contract.
+        *value = unsafe { *ptr.add(block_start + i * eighth + r) };
+    }
+    for i in 0..4 {
+        butterfly(&mut values, 2 * i, 2 * i + 1, twiddles[i]);
+    }
+    butterfly(&mut values, 0, 2, twiddles[4]);
+    butterfly(&mut values, 1, 3, twiddles[4]);
+    butterfly(&mut values, 4, 6, twiddles[5]);
+    butterfly(&mut values, 5, 7, twiddles[5]);
+    for i in 0..4 {
+        butterfly(&mut values, i, i + 4, twiddles[6]);
+    }
+    for (i, value) in values.iter().enumerate() {
+        // SAFETY: upheld by the caller's address-range contract.
+        unsafe { *ptr.add(block_start + i * eighth + r) = *value };
+    }
 }
 
 // ===================================================================
@@ -2591,9 +2680,7 @@ unsafe fn fold_and_msg_lsb_neon_chunk(
     bc: &mut [F128],
     r: F128,
 ) -> (F256Unreduced, F256Unreduced) {
-    use crate::field::gf2_128::aarch64::{
-        ghash_mul_unreduced_vec2_neon, ghash_mul_vec2_neon,
-    };
+    use crate::field::gf2_128::aarch64::{ghash_mul_unreduced_vec2_neon, ghash_mul_vec2_neon};
 
     debug_assert_eq!(fc.len(), bc.len());
     debug_assert_eq!(fc.len() & 1, 0);
@@ -2621,9 +2708,7 @@ unsafe fn fold_and_msg_lsb_neon_chunk(
         fc[k + 1] = f1;
         bc[k] = b0;
         bc[k + 1] = b1;
-        let msg_products = unsafe {
-            ghash_mul_unreduced_vec2_neon([f0, f0 + f1], [b0, b0 + b1])
-        };
+        let msg_products = unsafe { ghash_mul_unreduced_vec2_neon([f0, f0 + f1], [b0, b0 + b1]) };
         u0 ^= msg_products[0];
         u2 ^= msg_products[1];
         k += 2;

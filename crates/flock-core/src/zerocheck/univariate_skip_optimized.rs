@@ -32,9 +32,9 @@
 
 use std::sync::OnceLock;
 
-use crate::field::{F8, F128, PHI_8_TABLE, mul_by_x, phi8};
 #[cfg(target_arch = "aarch64")]
 use crate::field::F256Unreduced;
+use crate::field::{F8, F128, PHI_8_TABLE, mul_by_x, phi8};
 use crate::ntt::InvNttTableByteSingleGf8;
 
 use super::PaddingSpec;
@@ -44,9 +44,8 @@ mod kernels;
 
 #[cfg(all(test, target_arch = "aarch64"))]
 use kernels::aarch64::{
-    bit_transpose_64bytes_and_neon, bit_transpose_64bytes_neon,
-    shift_reduce_inner_ab_fused_neon, shift_reduce_inner_ab_fused_neon_prefix_7,
-    shift_reduce_inner_ab_neon,
+    bit_transpose_64bytes_and_neon, bit_transpose_64bytes_neon, shift_reduce_inner_ab_fused_neon,
+    shift_reduce_inner_ab_fused_neon_prefix_7, shift_reduce_inner_ab_neon,
 };
 #[cfg(all(test, target_arch = "aarch64"))]
 use kernels::bit_transpose_64bytes_scalar;
@@ -739,10 +738,8 @@ fn process_one_x_hi_with_s_hat_v<const C_IS_A_AND_B: bool>(
     // Outer fold by eq_hi (per bank).
     for lane in 0..ELL {
         state.local_res_ab[lane] += eq_hi_val * reduce_urm_accumulator(state.partial_ab[lane]);
-        state.local_res_c_s_0[lane] +=
-            eq_hi_val * reduce_urm_accumulator(state.partial_c_0[lane]);
-        state.local_res_c_s_1[lane] +=
-            eq_hi_val * reduce_urm_accumulator(state.partial_c_1[lane]);
+        state.local_res_c_s_0[lane] += eq_hi_val * reduce_urm_accumulator(state.partial_c_0[lane]);
+        state.local_res_c_s_1[lane] += eq_hi_val * reduce_urm_accumulator(state.partial_c_1[lane]);
     }
 }
 
@@ -963,9 +960,7 @@ pub fn round1_shift_reduce_extract_c_packed_padded_with_s_hat_v_when_c_is_a_and_
 }
 
 #[allow(clippy::too_many_arguments)]
-fn round1_shift_reduce_extract_c_packed_padded_with_s_hat_v_impl<
-    const C_IS_A_AND_B: bool,
->(
+fn round1_shift_reduce_extract_c_packed_padded_with_s_hat_v_impl<const C_IS_A_AND_B: bool>(
     a_packed: &[u8],
     b_packed: &[u8],
     c_packed: &[u8],

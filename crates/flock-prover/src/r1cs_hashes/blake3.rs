@@ -999,12 +999,7 @@ struct PackedRowStream<'a> {
 
 impl<'a> PackedRowStream<'a> {
     #[inline(always)]
-    fn new(
-        z: &'a mut [u64],
-        a: &'a mut [u64],
-        b: &'a mut [u64],
-        start_bit: usize,
-    ) -> Self {
+    fn new(z: &'a mut [u64], a: &'a mut [u64], b: &'a mut [u64], start_bit: usize) -> Self {
         debug_assert_eq!(start_bit & 63, 0);
         Self {
             z,

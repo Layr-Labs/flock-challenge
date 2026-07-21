@@ -49,12 +49,10 @@ unsafe fn compress4<const SHARED_BLOCK: bool>(
         macro_rules! sched {
             ($m0:expr, $m1:expr, $m2:expr, $m3:expr) => {
                 if SHARED_BLOCK {
-                    $m0[0] =
-                        vsha256su1q_u32(vsha256su0q_u32($m0[0], $m1[0]), $m2[0], $m3[0]);
+                    $m0[0] = vsha256su1q_u32(vsha256su0q_u32($m0[0], $m1[0]), $m2[0], $m3[0]);
                 } else {
                     for i in 0..4 {
-                        $m0[i] =
-                            vsha256su1q_u32(vsha256su0q_u32($m0[i], $m1[i]), $m2[i], $m3[i]);
+                        $m0[i] = vsha256su1q_u32(vsha256su0q_u32($m0[i], $m1[i]), $m2[i], $m3[i]);
                     }
                 }
             };

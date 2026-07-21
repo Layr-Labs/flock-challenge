@@ -251,10 +251,7 @@ pub unsafe fn ghash_mul_vec2_neon(a: [F128; 2], b: [F128; 2]) -> [F128; 2] {
 /// [`ghash_mul_vec2_neon`], used when callers XOR many products before a
 /// single final reduction.
 #[target_feature(enable = "aes")]
-pub unsafe fn ghash_mul_unreduced_vec2_neon(
-    a: [F128; 2],
-    b: [F128; 2],
-) -> [F256Unreduced; 2] {
+pub unsafe fn ghash_mul_unreduced_vec2_neon(a: [F128; 2], b: [F128; 2]) -> [F256Unreduced; 2] {
     // SAFETY: function carries the aes target feature; pmull requires it.
     unsafe {
         let p0_ll = pmull(a[0].lo, b[0].lo);

@@ -349,10 +349,7 @@ fn compute_combined_basis_and_target<Ch: Challenger>(
                         )
                     };
                     #[cfg(not(all(target_arch = "aarch64", target_feature = "aes")))]
-                    let products = [
-                        a0.mul_unreduced(s0),
-                        (a0 + a1).mul_unreduced(s0 + s1),
-                    ];
+                    let products = [a0.mul_unreduced(s0), (a0 + a1).mul_unreduced(s0 + s1)];
                     u0 ^= products[0];
                     u2 ^= products[1];
                 }
