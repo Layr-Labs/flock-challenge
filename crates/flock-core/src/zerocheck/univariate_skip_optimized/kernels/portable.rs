@@ -109,6 +109,8 @@ pub(super) fn accumulate_convert_with_s_hat_v(
     chunk_c_bytes: &[[u8; 64]; 16],
     n_b_med: usize,
     convert: &[F128],
+    convert_c0: &[F128],
+    convert_c1: &[F128],
     eq_lo_val: F128,
     partial_ab: &mut [F128; 64],
     partial_c_0: &mut [F128; 64],
@@ -122,8 +124,8 @@ pub(super) fn accumulate_convert_with_s_hat_v(
             let table_base = b_med * 256;
             let c = chunk_c_bytes[b_med][lane] as usize;
             converted_ab += convert[table_base + chunk_ab_bytes[b_med][lane] as usize];
-            converted_c_0 += convert[table_base + (c & 0x55)];
-            converted_c_1 += convert[table_base + (c & 0xaa)];
+            converted_c_0 += convert_c0[table_base + c];
+            converted_c_1 += convert_c1[table_base + c];
         }
         partial_ab[lane] += converted_ab * eq_lo_val;
         partial_c_0[lane] += converted_c_0 * eq_lo_val;

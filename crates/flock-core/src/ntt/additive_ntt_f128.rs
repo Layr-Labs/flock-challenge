@@ -640,48 +640,43 @@ impl AdditiveNttF128 {
                 // aarch64: eight values stay live while one whole-buffer pass
                 // replaces three. A 16-value fused kernel spills on NEON.
                 let eighth = block_size >> 3;
-                let twiddles: Vec<[F128; 7]> = (0..num_blocks)
-                    .map(|block| {
-                        let mut tw = [F128 { lo: 0, hi: 0 }; 7];
-                        tw[0] = self.twiddle(layer, block);
-                        for s in 0..2 {
-                            tw[1 + s] = self.twiddle(layer + 1, 2 * block + s);
-                        }
-                        for s in 0..4 {
-                            tw[3 + s] = self.twiddle(layer + 2, 4 * block + s);
-                        }
-                        tw
-                    })
-                    .collect();
-                butterfly_interleaved_fused_3layer_par_blocks_rows(
-                    data,
-                    &twiddles,
-                    block_bytes,
-                    eighth,
-                    num_ntts,
-                    odd_row_dense_lanes,
-                );
+                for block in 0..num_blocks {
+                    let mut tw = [F128 { lo: 0, hi: 0 }; 7];
+                    tw[0] = self.twiddle(layer, block);
+                    for s in 0..2 {
+                        tw[1 + s] = self.twiddle(layer + 1, 2 * block + s);
+                    }
+                    for s in 0..4 {
+                        tw[3 + s] = self.twiddle(layer + 2, 4 * block + s);
+                    }
+                    let start = block * block_bytes;
+                    butterfly_interleaved_fused_3layer_par_rows(
+                        &mut data[start..start + block_bytes],
+                        &tw,
+                        eighth,
+                        num_ntts,
+                        odd_row_dense_lanes,
+                    );
+                }
                 layer += 3;
             } else if layer + 1 < n_top && block_size >= 4 {
                 // Fuse layers (layer, layer+1).
                 let quarter = block_size >> 2;
-                let twiddles: Vec<[F128; 3]> = (0..num_blocks)
-                    .map(|block| {
-                        [
-                            self.twiddle(layer, block),
-                            self.twiddle(layer + 1, 2 * block),
-                            self.twiddle(layer + 1, 2 * block + 1),
-                        ]
-                    })
-                    .collect();
-                butterfly_interleaved_fused_2layer_par_blocks_rows(
-                    data,
-                    &twiddles,
-                    block_bytes,
-                    quarter,
-                    num_ntts,
-                    odd_row_dense_lanes,
-                );
+                for block in 0..num_blocks {
+                    let t_outer = self.twiddle(layer, block);
+                    let t_inner_a = self.twiddle(layer + 1, 2 * block);
+                    let t_inner_b = self.twiddle(layer + 1, 2 * block + 1);
+                    let start = block * block_bytes;
+                    butterfly_interleaved_fused_2layer_par_rows(
+                        &mut data[start..start + block_bytes],
+                        t_outer,
+                        t_inner_a,
+                        t_inner_b,
+                        quarter,
+                        num_ntts,
+                        odd_row_dense_lanes,
+                    );
+                }
                 layer += 2;
             } else {
                 let block_size_half = block_size >> 1;
@@ -1164,69 +1159,69 @@ fn butterfly_interleaved_fused_2layer_rows(
     }
 }
 
-/// Process every `(block, row)` pair of one top fused-two-layer pass with a
-/// single Rayon drive. Twiddles are `[outer, inner_a, inner_b]` per block.
-/// The serial crossover remains per block, matching the former nested helper.
 #[inline]
-fn butterfly_interleaved_fused_2layer_par_blocks_rows(
-    data: &mut [F128],
-    twiddles: &[[F128; 3]],
-    block_bytes: usize,
+fn butterfly_interleaved_fused_2layer_par_rows(
+    block: &mut [F128],
+    t_outer: F128,
+    t_inner_a: F128,
+    t_inner_b: F128,
     quarter: usize,
     num_ntts: usize,
     odd_row_dense_lanes: Option<usize>,
 ) {
     use rayon::prelude::*;
     const PARALLEL_ROW_THRESHOLD: usize = 256;
-    debug_assert_eq!(data.len(), twiddles.len() * block_bytes);
-    debug_assert_eq!(block_bytes, 4 * quarter * num_ntts);
-    debug_assert!(odd_row_dense_lanes.is_none() || quarter.is_multiple_of(2));
-
     if quarter < PARALLEL_ROW_THRESHOLD {
-        for (block, &[t_outer, t_inner_a, t_inner_b]) in data.chunks_mut(block_bytes).zip(twiddles)
-        {
-            butterfly_interleaved_fused_2layer_rows(
-                block,
-                t_outer,
-                t_inner_a,
-                t_inner_b,
-                quarter,
-                num_ntts,
-                odd_row_dense_lanes,
-            );
-        }
+        butterfly_interleaved_fused_2layer_rows(
+            block,
+            t_outer,
+            t_inner_a,
+            t_inner_b,
+            quarter,
+            num_ntts,
+            odd_row_dense_lanes,
+        );
         return;
     }
 
-    // Integer addresses are Send + Sync. `(block, r)` is a bijection onto the
-    // old nested domain; distinct tasks own four disjoint physical rows.
-    let base = data.as_mut_ptr() as usize;
-    (0..twiddles.len() * quarter)
-        .into_par_iter()
-        .for_each(|task| {
-            let block = task / quarter;
-            let r = task % quarter;
-            let active_lanes = if r & 1 == 1 {
-                odd_row_dense_lanes.unwrap_or(num_ntts)
-            } else {
-                num_ntts
-            };
-            let block_base = unsafe { (base as *mut F128).add(block * block_bytes) };
-            let row_stride = quarter * num_ntts;
-            let row_offset = r * num_ntts;
-            let row = |offset| unsafe {
-                core::slice::from_raw_parts_mut(block_base.add(offset + row_offset), active_lanes)
-            };
-            let [t_outer, t_inner_a, t_inner_b] = twiddles[block];
-            kernels::butterfly_fused_2layer(
-                row(0),
-                row(row_stride),
-                row(2 * row_stride),
-                row(3 * row_stride),
-                t_outer,
-                t_inner_a,
-                t_inner_b,
-            );
+    let stride = quarter * num_ntts;
+    debug_assert_eq!(block.len(), 4 * stride);
+    debug_assert!(odd_row_dense_lanes.is_none() || quarter.is_multiple_of(2));
+
+    let do_one = |r: usize,
+                  row_a: &mut [F128],
+                  row_b: &mut [F128],
+                  row_c: &mut [F128],
+                  row_d: &mut [F128]| {
+        let active_lanes = if r & 1 == 1 {
+            odd_row_dense_lanes.unwrap_or(num_ntts)
+        } else {
+            num_ntts
+        };
+        kernels::butterfly_fused_2layer(
+            &mut row_a[..active_lanes],
+            &mut row_b[..active_lanes],
+            &mut row_c[..active_lanes],
+            &mut row_d[..active_lanes],
+            t_outer,
+            t_inner_a,
+            t_inner_b,
+        );
+    };
+
+    // Split the block into four quarters, then zip row-wise. Each rayon task
+    // processes one quarter-row index = 4 logical rows of work.
+    let (top_half, bot_half) = block.split_at_mut(2 * stride);
+    let (q1, q2) = top_half.split_at_mut(stride);
+    let (q3, q4) = bot_half.split_at_mut(stride);
+
+    q1.par_chunks_mut(num_ntts)
+        .zip(q2.par_chunks_mut(num_ntts))
+        .zip(q3.par_chunks_mut(num_ntts))
+        .zip(q4.par_chunks_mut(num_ntts))
+        .enumerate()
+        .for_each(|(r, (((row_a, row_b), row_c), row_d))| {
+            do_one(r, row_a, row_b, row_c, row_d);
         });
 }
 
@@ -1277,61 +1272,49 @@ fn butterfly_interleaved_fused_3layer_rows(
     }
 }
 
-/// Process every `(block, row)` pair of one top fused-three-layer pass with a
-/// single Rayon drive. Local row parity equals global parity at these stages,
-/// so structured-zero active-lane bounds are unchanged.
 #[inline]
-fn butterfly_interleaved_fused_3layer_par_blocks_rows(
-    data: &mut [F128],
-    twiddles: &[[F128; 7]],
-    block_bytes: usize,
+fn butterfly_interleaved_fused_3layer_par_rows(
+    block: &mut [F128],
+    t: &[F128; 7],
     eighth: usize,
     num_ntts: usize,
     odd_row_dense_lanes: Option<usize>,
 ) {
     use rayon::prelude::*;
     const PARALLEL_ROW_THRESHOLD: usize = 256;
-    debug_assert_eq!(data.len(), twiddles.len() * block_bytes);
-    debug_assert_eq!(block_bytes, 8 * eighth * num_ntts);
-    debug_assert!(odd_row_dense_lanes.is_none() || eighth == 1 || eighth.is_multiple_of(2));
-
+    debug_assert_eq!(block.len(), 8 * eighth * num_ntts);
+    debug_assert!(
+        odd_row_dense_lanes.is_none() || eighth == 1 || eighth.is_multiple_of(2)
+    );
     if eighth < PARALLEL_ROW_THRESHOLD {
-        for (block, twiddles) in data.chunks_mut(block_bytes).zip(twiddles) {
-            butterfly_interleaved_fused_3layer_rows(
-                block,
-                twiddles,
-                eighth,
-                num_ntts,
-                odd_row_dense_lanes,
-            );
-        }
-        return;
-    }
-
-    // Distinct flattened tasks own distinct `(block, r)` eight-row groups.
-    let base = data.as_mut_ptr() as usize;
-    (0..twiddles.len() * eighth)
-        .into_par_iter()
-        .for_each(|task| {
-            let block = task / eighth;
-            let r = task % eighth;
+        butterfly_interleaved_fused_3layer_rows(
+            block,
+            t,
+            eighth,
+            num_ntts,
+            odd_row_dense_lanes,
+        );
+    } else {
+        let base = block.as_mut_ptr() as usize;
+        (0..eighth).into_par_iter().for_each(|r| {
             let active_lanes = if r & 1 == 1 {
                 odd_row_dense_lanes.unwrap_or(num_ntts)
             } else {
                 num_ntts
             };
-            let block_base = unsafe { (base as *mut F128).add(block * block_bytes) };
+            // SAFETY: distinct r values select disjoint row groups.
             unsafe {
                 kernels::butterfly_fused_3layer_row(
-                    block_base,
+                    base as *mut F128,
                     eighth,
                     num_ntts,
                     r,
-                    &twiddles[block],
+                    t,
                     active_lanes,
                 )
             };
         });
+    }
 }
 
 /// Butterfly one block of an interleaved (SoA) buffer with shared twiddle.

@@ -84,6 +84,8 @@ pub(crate) unsafe fn accumulate_convert_with_s_hat_v(
     chunk_c_bytes: &[[u8; 64]; 16],
     n_b_med: usize,
     convert: &[F128],
+    convert_c0: &[F128],
+    convert_c1: &[F128],
     eq_lo_val: F128,
     partial_ab: &mut [UrmAccumulator; 64],
     partial_c_0: &mut [UrmAccumulator; 64],
@@ -95,26 +97,30 @@ pub(crate) unsafe fn accumulate_convert_with_s_hat_v(
     // SAFETY: caller guarantees fixed input sizes and aarch64 provides NEON.
     unsafe {
         let convert_ptr = convert.as_ptr() as *const u8;
+        let convert_c0_ptr = convert_c0.as_ptr() as *const u8;
+        let convert_c1_ptr = convert_c1.as_ptr() as *const u8;
         let mut lane = 0;
         while lane < 64 {
             let mut converted_ab = [vdupq_n_u8(0); 2];
             let mut converted_c_0 = [vdupq_n_u8(0); 2];
             let mut converted_c_1 = [vdupq_n_u8(0); 2];
             for b_med in 0..n_b_med {
+                let b_med_offset = b_med * 256;
                 for j in 0..2 {
                     let ab = chunk_ab_bytes[b_med][lane + j] as usize;
                     let c = chunk_c_bytes[b_med][lane + j] as usize;
+                    let c_off = (b_med_offset + c) * 16;
                     converted_ab[j] = veorq_u8(
                         converted_ab[j],
-                        vld1q_u8(convert_ptr.add((b_med * 256 + ab) * 16)),
+                        vld1q_u8(convert_ptr.add((b_med_offset + ab) * 16)),
                     );
                     converted_c_0[j] = veorq_u8(
                         converted_c_0[j],
-                        vld1q_u8(convert_ptr.add((b_med * 256 + (c & 0x55)) * 16)),
+                        vld1q_u8(convert_c0_ptr.add(c_off)),
                     );
                     converted_c_1[j] = veorq_u8(
                         converted_c_1[j],
-                        vld1q_u8(convert_ptr.add((b_med * 256 + (c & 0xaa)) * 16)),
+                        vld1q_u8(convert_c1_ptr.add(c_off)),
                     );
                 }
             }
@@ -617,6 +623,169 @@ pub(crate) fn shift_reduce_inner_ab_fused_neon(
         let r3 = gf8_reduce_vec16(vreinterpretq_u8_u16(acc3_lo), vreinterpretq_u8_u16(acc3_hi));
 
         let p = out.as_mut_ptr();
+        vst1q_u8(p, r0);
+        vst1q_u8(p.add(16), r1);
+        vst1q_u8(p.add(32), r2);
+        vst1q_u8(p.add(48), r3);
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+pub(crate) fn shift_reduce_and_transpose_c_fused_neon(
+    a_packed: &[u8],
+    b_packed: &[u8],
+    inv_table: &InvNttTableByteSingleGf8,
+    chunk_byte_base: usize,
+    b_med: usize,
+    out_ab: &mut [u8; 64],
+    out_c: &mut [u8; 64],
+) {
+    use crate::field::gf2_8::neon::gf8_reduce_vec16;
+    use core::arch::aarch64::*;
+
+    let byte_base_b = chunk_byte_base + b_med * N_CHUNKS * 8;
+    let table_base = inv_table.data_ptr();
+
+    unsafe {
+        let ap = a_packed.as_ptr().add(byte_base_b);
+        let bp = b_packed.as_ptr().add(byte_base_b);
+
+        let a0 = vld1q_u8(ap);
+        let a1 = vld1q_u8(ap.add(16));
+        let a2 = vld1q_u8(ap.add(32));
+        let a3 = vld1q_u8(ap.add(48));
+
+        let b0 = vld1q_u8(bp);
+        let b1 = vld1q_u8(bp.add(16));
+        let b2 = vld1q_u8(bp.add(32));
+        let b3 = vld1q_u8(bp.add(48));
+
+        bit_transpose_4x16_neon(
+            vandq_u8(a0, b0),
+            vandq_u8(a1, b1),
+            vandq_u8(a2, b2),
+            vandq_u8(a3, b3),
+            out_c,
+        );
+
+        let mut acc0_lo = vdupq_n_u16(0);
+        let mut acc0_hi = vdupq_n_u16(0);
+        let mut acc1_lo = vdupq_n_u16(0);
+        let mut acc1_hi = vdupq_n_u16(0);
+        let mut acc2_lo = vdupq_n_u16(0);
+        let mut acc2_hi = vdupq_n_u16(0);
+        let mut acc3_lo = vdupq_n_u16(0);
+        let mut acc3_hi = vdupq_n_u16(0);
+
+        macro_rules! do_k {
+            ($k:literal) => {{
+                let off = $k * N_CHUNKS;
+                fused_apply_one_k::<$k, true>(
+                    table_base,
+                    ap.add(off),
+                    bp.add(off),
+                    &mut acc0_lo,
+                    &mut acc0_hi,
+                    &mut acc1_lo,
+                    &mut acc1_hi,
+                    &mut acc2_lo,
+                    &mut acc2_hi,
+                    &mut acc3_lo,
+                    &mut acc3_hi,
+                );
+            }};
+        }
+        do_k!(0);
+        do_k!(1);
+        do_k!(2);
+        do_k!(3);
+        do_k!(4);
+        do_k!(5);
+        do_k!(6);
+        do_k!(7);
+
+        let r0 = gf8_reduce_vec16(vreinterpretq_u8_u16(acc0_lo), vreinterpretq_u8_u16(acc0_hi));
+        let r1 = gf8_reduce_vec16(vreinterpretq_u8_u16(acc1_lo), vreinterpretq_u8_u16(acc1_hi));
+        let r2 = gf8_reduce_vec16(vreinterpretq_u8_u16(acc2_lo), vreinterpretq_u8_u16(acc2_hi));
+        let r3 = gf8_reduce_vec16(vreinterpretq_u8_u16(acc3_lo), vreinterpretq_u8_u16(acc3_hi));
+
+        let p = out_ab.as_mut_ptr();
+        vst1q_u8(p, r0);
+        vst1q_u8(p.add(16), r1);
+        vst1q_u8(p.add(32), r2);
+        vst1q_u8(p.add(48), r3);
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+pub(crate) fn shift_reduce_and_transpose_c_fused_neon_prefix_7(
+    a_packed: &[u8],
+    b_packed: &[u8],
+    inv_table: &InvNttTableByteSingleGf8,
+    chunk_byte_base: usize,
+    b_med: usize,
+    out_ab: &mut [u8; 64],
+    out_c: &mut [u8; 64],
+) {
+    use crate::field::gf2_8::neon::gf8_reduce_vec16;
+    use core::arch::aarch64::*;
+
+    let byte_base_b = chunk_byte_base + b_med * N_CHUNKS * 8;
+    let table_base = inv_table.data_ptr();
+
+    unsafe {
+        let ap = a_packed.as_ptr().add(byte_base_b);
+        let bp = b_packed.as_ptr().add(byte_base_b);
+
+        let a0 = vld1q_u8(ap);
+        let a1 = vld1q_u8(ap.add(16));
+        let a2 = vld1q_u8(ap.add(32));
+        let a3 = vld1q_u8(ap.add(48));
+
+        let b0 = vld1q_u8(bp);
+        let b1 = vld1q_u8(bp.add(16));
+        let b2 = vld1q_u8(bp.add(32));
+        let b3 = vld1q_u8(bp.add(48));
+
+        bit_transpose_4x16_neon(
+            vandq_u8(a0, b0),
+            vandq_u8(a1, b1),
+            vandq_u8(a2, b2),
+            vandq_u8(a3, b3),
+            out_c,
+        );
+
+        let mut acc0_lo = vdupq_n_u16(0);
+        let mut acc0_hi = vdupq_n_u16(0);
+        let mut acc1_lo = vdupq_n_u16(0);
+        let mut acc1_hi = vdupq_n_u16(0);
+        let mut acc2_lo = vdupq_n_u16(0);
+        let mut acc2_hi = vdupq_n_u16(0);
+        let mut acc3_lo = vdupq_n_u16(0);
+        let mut acc3_hi = vdupq_n_u16(0);
+
+        fused_apply_one_k::<0, false>(
+            table_base,
+            ap,
+            bp,
+            &mut acc0_lo,
+            &mut acc0_hi,
+            &mut acc1_lo,
+            &mut acc1_hi,
+            &mut acc2_lo,
+            &mut acc2_hi,
+            &mut acc3_lo,
+            &mut acc3_hi,
+        );
+
+        let r0 = gf8_reduce_vec16(vreinterpretq_u8_u16(acc0_lo), vreinterpretq_u8_u16(acc0_hi));
+        let r1 = gf8_reduce_vec16(vreinterpretq_u8_u16(acc1_lo), vreinterpretq_u8_u16(acc1_hi));
+        let r2 = gf8_reduce_vec16(vreinterpretq_u8_u16(acc2_lo), vreinterpretq_u8_u16(acc2_hi));
+        let r3 = gf8_reduce_vec16(vreinterpretq_u8_u16(acc3_lo), vreinterpretq_u8_u16(acc3_hi));
+
+        let p = out_ab.as_mut_ptr();
         vst1q_u8(p, r0);
         vst1q_u8(p.add(16), r1);
         vst1q_u8(p.add(32), r2);

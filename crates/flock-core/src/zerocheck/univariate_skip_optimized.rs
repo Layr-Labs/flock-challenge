@@ -232,6 +232,8 @@ fn d_inv() -> F128 {
 const CONVERT_TABLE_SIZE: usize = 16 * 256;
 
 static CONVERT_TABLE_CACHE: OnceLock<Vec<F128>> = OnceLock::new();
+static CONVERT_C0_TABLE_CACHE: OnceLock<Vec<F128>> = OnceLock::new();
+static CONVERT_C1_TABLE_CACHE: OnceLock<Vec<F128>> = OnceLock::new();
 
 fn build_convert_table() -> Vec<F128> {
     let mut gamma_pow = [F128::ZERO; 16];
@@ -251,6 +253,32 @@ fn build_convert_table() -> Vec<F128> {
 
 fn convert_table() -> &'static [F128] {
     CONVERT_TABLE_CACHE.get_or_init(build_convert_table)
+}
+
+fn convert_c0_table() -> &'static [F128] {
+    CONVERT_C0_TABLE_CACHE.get_or_init(|| {
+        let convert = convert_table();
+        let mut table = vec![F128::ZERO; CONVERT_TABLE_SIZE];
+        for b in 0..16 {
+            for v in 0..256 {
+                table[b * 256 + v] = convert[b * 256 + (v & 0x55)];
+            }
+        }
+        table
+    })
+}
+
+fn convert_c1_table() -> &'static [F128] {
+    CONVERT_C1_TABLE_CACHE.get_or_init(|| {
+        let convert = convert_table();
+        let mut table = vec![F128::ZERO; CONVERT_TABLE_SIZE];
+        for b in 0..16 {
+            for v in 0..256 {
+                table[b * 256 + v] = convert[b * 256 + (v & 0xaa)];
+            }
+        }
+        table
+    })
 }
 
 #[inline]
@@ -592,8 +620,101 @@ fn transpose_c_window<const C_IS_A_AND_B: bool>(
 /// Two-bank C variant of [`process_one_x_hi`]. AB-side and witness traffic
 /// unchanged; the only modification is the C-side inner loop now maintains
 /// `cf_c_0` and `cf_c_1` via masked convert-table lookups.
-#[inline]
 #[allow(clippy::too_many_arguments)]
+#[inline(always)]
+fn shift_reduce_and_transpose_c<const C_IS_A_AND_B: bool>(
+    a_packed: &[u8],
+    b_packed: &[u8],
+    c_packed: &[u8],
+    inv_table: &InvNttTableByteSingleGf8,
+    chunk_byte_base: usize,
+    b_med: usize,
+    out_ab: &mut [u8; 64],
+    out_c: &mut [u8; 64],
+    a_col: &mut [F8],
+    b_col: &mut [F8],
+) {
+    #[cfg(target_arch = "aarch64")]
+    if C_IS_A_AND_B {
+        kernels::aarch64::shift_reduce_and_transpose_c_fused_neon(
+            a_packed,
+            b_packed,
+            inv_table,
+            chunk_byte_base,
+            b_med,
+            out_ab,
+            out_c,
+        );
+        return;
+    }
+
+    shift_reduce_inner_ab(
+        a_packed,
+        b_packed,
+        inv_table,
+        chunk_byte_base,
+        b_med,
+        out_ab,
+        a_col,
+        b_col,
+    );
+    let byte_base_b = chunk_byte_base + b_med * N_CHUNKS * 8;
+    transpose_c_window::<C_IS_A_AND_B>(
+        a_packed,
+        b_packed,
+        c_packed,
+        byte_base_b,
+        out_c,
+    );
+}
+
+#[inline(always)]
+fn shift_reduce_and_transpose_c_prefix_7<const C_IS_A_AND_B: bool>(
+    a_packed: &[u8],
+    b_packed: &[u8],
+    c_packed: &[u8],
+    inv_table: &InvNttTableByteSingleGf8,
+    chunk_byte_base: usize,
+    b_med: usize,
+    out_ab: &mut [u8; 64],
+    out_c: &mut [u8; 64],
+    a_col: &mut [F8],
+    b_col: &mut [F8],
+) {
+    #[cfg(target_arch = "aarch64")]
+    if C_IS_A_AND_B {
+        kernels::aarch64::shift_reduce_and_transpose_c_fused_neon_prefix_7(
+            a_packed,
+            b_packed,
+            inv_table,
+            chunk_byte_base,
+            b_med,
+            out_ab,
+            out_c,
+        );
+        return;
+    }
+
+    kernels::shift_reduce_inner_ab_prefix_7(
+        a_packed,
+        b_packed,
+        inv_table,
+        chunk_byte_base,
+        b_med,
+        out_ab,
+        a_col,
+        b_col,
+    );
+    let byte_base_b = chunk_byte_base + b_med * N_CHUNKS * 8;
+    transpose_c_window::<C_IS_A_AND_B>(
+        a_packed,
+        b_packed,
+        c_packed,
+        byte_base_b,
+        out_c,
+    );
+}
+
 fn process_one_x_hi_with_s_hat_v<const C_IS_A_AND_B: bool>(
     x_hi: usize,
     big_lo_size: usize,
@@ -608,6 +729,8 @@ fn process_one_x_hi_with_s_hat_v<const C_IS_A_AND_B: bool>(
     eq_lo_scaled: &[F128],
     eq_hi_val: F128,
     convert: &[F128],
+    convert_c0: &[F128],
+    convert_c1: &[F128],
     state: &mut WorkerStateWithSHatV,
 ) {
     state
@@ -639,23 +762,17 @@ fn process_one_x_hi_with_s_hat_v<const C_IS_A_AND_B: bool>(
 
         if n_b_med == (1 << N_MEDIUM) {
             for b_med in 0..(1 << N_MEDIUM) {
-                shift_reduce_inner_ab(
+                shift_reduce_and_transpose_c::<C_IS_A_AND_B>(
                     a_packed,
                     b_packed,
+                    c_packed,
                     inv_table,
                     chunk_byte_base,
                     b_med,
                     &mut state.chunk_ab_bytes[b_med],
+                    &mut state.chunk_c_bytes[b_med],
                     &mut state.a_col,
                     &mut state.b_col,
-                );
-                let byte_base_b = chunk_byte_base + b_med * N_CHUNKS * 8;
-                transpose_c_window::<C_IS_A_AND_B>(
-                    a_packed,
-                    b_packed,
-                    c_packed,
-                    byte_base_b,
-                    &mut state.chunk_c_bytes[b_med],
                 );
             }
 
@@ -664,6 +781,8 @@ fn process_one_x_hi_with_s_hat_v<const C_IS_A_AND_B: bool>(
                 &state.chunk_c_bytes,
                 1 << N_MEDIUM,
                 convert,
+                convert_c0,
+                convert_c1,
                 eq_lo_val,
                 &mut state.partial_ab,
                 &mut state.partial_c_0,
@@ -671,63 +790,55 @@ fn process_one_x_hi_with_s_hat_v<const C_IS_A_AND_B: bool>(
             );
         } else {
             for b_med in 0..n_b_med - 1 {
-                shift_reduce_inner_ab(
+                shift_reduce_and_transpose_c::<C_IS_A_AND_B>(
                     a_packed,
                     b_packed,
+                    c_packed,
                     inv_table,
                     chunk_byte_base,
                     b_med,
                     &mut state.chunk_ab_bytes[b_med],
+                    &mut state.chunk_c_bytes[b_med],
                     &mut state.a_col,
                     &mut state.b_col,
-                );
-                let byte_base_b = chunk_byte_base + b_med * N_CHUNKS * 8;
-                transpose_c_window::<C_IS_A_AND_B>(
-                    a_packed,
-                    b_packed,
-                    c_packed,
-                    byte_base_b,
-                    &mut state.chunk_c_bytes[b_med],
                 );
             }
             let b_med = n_b_med - 1;
             if last_bytes == 7 {
-                kernels::shift_reduce_inner_ab_prefix_7(
+                shift_reduce_and_transpose_c_prefix_7::<C_IS_A_AND_B>(
                     a_packed,
                     b_packed,
+                    c_packed,
                     inv_table,
                     chunk_byte_base,
                     b_med,
                     &mut state.chunk_ab_bytes[b_med],
+                    &mut state.chunk_c_bytes[b_med],
                     &mut state.a_col,
                     &mut state.b_col,
                 );
             } else {
-                shift_reduce_inner_ab(
+                shift_reduce_and_transpose_c::<C_IS_A_AND_B>(
                     a_packed,
                     b_packed,
+                    c_packed,
                     inv_table,
                     chunk_byte_base,
                     b_med,
                     &mut state.chunk_ab_bytes[b_med],
+                    &mut state.chunk_c_bytes[b_med],
                     &mut state.a_col,
                     &mut state.b_col,
                 );
             }
-            let byte_base_b = chunk_byte_base + b_med * N_CHUNKS * 8;
-            transpose_c_window::<C_IS_A_AND_B>(
-                a_packed,
-                b_packed,
-                c_packed,
-                byte_base_b,
-                &mut state.chunk_c_bytes[b_med],
-            );
 
             kernels::accumulate_convert_with_s_hat_v(
                 &state.chunk_ab_bytes,
                 &state.chunk_c_bytes,
                 n_b_med,
                 convert,
+                convert_c0,
+                convert_c1,
                 eq_lo_val,
                 &mut state.partial_ab,
                 &mut state.partial_c_0,
@@ -998,6 +1109,8 @@ fn round1_shift_reduce_extract_c_packed_padded_with_s_hat_v_impl<
     let d_inv_val = d_inv();
     let eq_lo_scaled: Vec<F128> = eq.lo.iter().map(|v| *v * d_inv_val).collect();
     let convert = convert_table();
+    let convert_c0 = convert_c0_table();
+    let convert_c1 = convert_c1_table();
     let eq_hi = &eq.hi;
 
     let (within_outer_mask, b_med_counts, b_med_last_bytes) = build_b_med_counts(padding);
@@ -1020,6 +1133,8 @@ fn round1_shift_reduce_extract_c_packed_padded_with_s_hat_v_impl<
                 &eq_lo_scaled,
                 eq_hi_val,
                 convert,
+                convert_c0,
+                convert_c1,
                 &mut state,
             );
             state
