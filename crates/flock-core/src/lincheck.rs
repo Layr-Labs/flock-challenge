@@ -448,6 +448,7 @@ pub enum VerifyError {
 /// Standard "doubling-in-half" construction: `O(2^d)` F128 muls, no
 /// inversions. Indexing is LSB-first — `bit_j(i)` is the `j`-th LSB of `i`.
 pub fn build_eq_table(point: &[F128]) -> Vec<F128> {
+    use rayon::prelude::*;
     let d = point.len();
     let mut out: Vec<F128> = Vec::with_capacity(1usize << d);
     out.push(F128::ONE);
@@ -455,15 +456,30 @@ pub fn build_eq_table(point: &[F128]) -> Vec<F128> {
         let r_j = point[j];
         let one_plus_r_j = F128::ONE + r_j;
         let len = 1usize << j;
-        out.resize(2 * len, F128::ZERO);
+        // Grow without zero-filling: both halves are fully overwritten below.
+        out.reserve_exact(len);
+        // SAFETY: the loop writes out[0..len) (in place) and out[len..2·len)
+        // before returning; every exposed slot is initialized on exit.
+        unsafe { out.set_len(2 * len) };
         // For each existing entry i ∈ [0, len), produce two children:
         //   out[i]       *= (1 + r_j)     ← new bit_j = 0
         //   out[i + len]  = out[i] * r_j  ← new bit_j = 1
-        // Forward iteration is safe: the [i] and [i+len] slots are disjoint.
-        for i in 0..len {
-            let v = out[i];
-            out[i + len] = v * r_j;
-            out[i] = v * one_plus_r_j;
+        let (lo, hi) = out.split_at_mut(len);
+        if len >= 4096 {
+            lo.par_iter_mut()
+                .zip(hi.par_iter_mut())
+                .with_min_len(1024)
+                .for_each(|(l, h)| {
+                    let v = *l;
+                    *h = v * r_j;
+                    *l = v * one_plus_r_j;
+                });
+        } else {
+            for i in 0..len {
+                let v = lo[i];
+                hi[i] = v * r_j;
+                lo[i] = v * one_plus_r_j;
+            }
         }
     }
     out
@@ -960,28 +976,34 @@ fn sparse_row_fold_alpha_batched(
 /// `(Σ c_hi·z_hi, Σ (c_hi+c_lo)·(z_hi+z_lo))` over the top-bit split. The
 /// `len()` of `c` and `z` is even; `half = len/2`.
 fn sumcheck_round_eval_par(c: &[F128], z: &[F128]) -> (F128, F128) {
+    use crate::field::F256Unreduced;
     use rayon::prelude::*;
     let half = c.len() / 2;
     debug_assert_eq!(z.len(), c.len());
     let (clo, chi) = c.split_at(half);
     let (zlo, zhi) = z.split_at(half);
     if half < SUMCHECK_PAR_THRESHOLD {
-        let mut e1 = F128::ZERO;
-        let mut einf = F128::ZERO;
+        let mut e1 = F256Unreduced::ZERO;
+        let mut einf = F256Unreduced::ZERO;
         for i in 0..half {
-            e1 += chi[i] * zhi[i];
-            einf += (chi[i] + clo[i]) * (zhi[i] + zlo[i]);
+            e1 ^= chi[i].mul_unreduced(zhi[i]);
+            einf ^= (chi[i] + clo[i]).mul_unreduced(zhi[i] + zlo[i]);
         }
-        return (e1, einf);
+        return (e1.reduce(), einf.reduce());
     }
-    (0..half)
+    let (e1, einf) = (0..half)
         .into_par_iter()
         .map(|i| {
-            let e1_i = chi[i] * zhi[i];
-            let einf_i = (chi[i] + clo[i]) * (zhi[i] + zlo[i]);
-            (e1_i, einf_i)
+            (
+                chi[i].mul_unreduced(zhi[i]),
+                (chi[i] + clo[i]).mul_unreduced(zhi[i] + zlo[i]),
+            )
         })
-        .reduce(|| (F128::ZERO, F128::ZERO), |a, b| (a.0 + b.0, a.1 + b.1))
+        .reduce(
+            || (F256Unreduced::ZERO, F256Unreduced::ZERO),
+            |a, b| (a.0 ^ b.0, a.1 ^ b.1),
+        );
+    (e1.reduce(), einf.reduce())
 }
 
 /// Bind the top remaining variable of `v` at challenge `r`: `v[i] ← v[i] +
@@ -1051,8 +1073,9 @@ fn sumcheck_bind_both_and_eval_next(
     let (zq2, zq3) = z_hi.split_at(half2);
 
     let (e1, einf) = if half2 < SUMCHECK_PAR_THRESHOLD {
-        let mut e1 = F128::ZERO;
-        let mut einf = F128::ZERO;
+        use crate::field::F256Unreduced;
+        let mut e1 = F256Unreduced::ZERO;
+        let mut einf = F256Unreduced::ZERO;
         for i in 0..half2 {
             let lo = cq0[i] + r * (cq2[i] + cq0[i]);
             let hi = cq1[i] + r * (cq3[i] + cq1[i]);
@@ -1062,12 +1085,14 @@ fn sumcheck_bind_both_and_eval_next(
             cq1[i] = hi;
             zq0[i] = zlo;
             zq1[i] = zhi;
-            e1 += hi * zhi;
-            einf += (hi + lo) * (zhi + zlo);
+            e1 ^= hi.mul_unreduced(zhi);
+            einf ^= (hi + lo).mul_unreduced(zhi + zlo);
         }
-        (e1, einf)
+        (e1.reduce(), einf.reduce())
     } else {
-        cq0.par_iter_mut()
+        use crate::field::F256Unreduced;
+        let (e1, einf) = cq0
+            .par_iter_mut()
             .zip(cq1.par_iter_mut())
             .zip(cq2.par_iter())
             .zip(cq3.par_iter())
@@ -1084,9 +1109,13 @@ fn sumcheck_bind_both_and_eval_next(
                 *c1 = hi;
                 *z0 = zlo;
                 *z1 = zhi;
-                (hi * zhi, (hi + lo) * (zhi + zlo))
+                (hi.mul_unreduced(zhi), (hi + lo).mul_unreduced(zhi + zlo))
             })
-            .reduce(|| (F128::ZERO, F128::ZERO), |a, b| (a.0 + b.0, a.1 + b.1))
+            .reduce(
+                || (F256Unreduced::ZERO, F256Unreduced::ZERO),
+                |a, b| (a.0 ^ b.0, a.1 ^ b.1),
+            );
+        (e1.reduce(), einf.reduce())
     };
 
     comb.truncate(half);

@@ -2549,17 +2549,20 @@ fn round_msg_lsb(f: &[F128], b: &[F128]) -> SumcheckMessage {
     const PAR_THRESHOLD: usize = 4096;
     let half = n / 2;
     if half < PAR_THRESHOLD {
-        let mut u_0 = F128::ZERO;
-        let mut u_2 = F128::ZERO;
+        let mut u_0 = F256Unreduced::ZERO;
+        let mut u_2 = F256Unreduced::ZERO;
         for j in 0..half {
             let f0 = f[2 * j];
             let f1 = f[2 * j + 1];
             let b0 = b[2 * j];
             let b1 = b[2 * j + 1];
-            u_0 += f0 * b0;
-            u_2 += (f0 + f1) * (b0 + b1);
+            u_0 ^= f0.mul_unreduced(b0);
+            u_2 ^= (f0 + f1).mul_unreduced(b0 + b1);
         }
-        return SumcheckMessage { u_0, u_2 };
+        return SumcheckMessage {
+            u_0: u_0.reduce(),
+            u_2: u_2.reduce(),
+        };
     }
 
     let (u_0, u_2) = (0..half)
@@ -2570,13 +2573,16 @@ fn round_msg_lsb(f: &[F128], b: &[F128]) -> SumcheckMessage {
             let f1 = f[2 * j + 1];
             let b0 = b[2 * j];
             let b1 = b[2 * j + 1];
-            (f0 * b0, (f0 + f1) * (b0 + b1))
+            (f0.mul_unreduced(b0), (f0 + f1).mul_unreduced(b0 + b1))
         })
         .reduce(
-            || (F128::ZERO, F128::ZERO),
-            |(a0, a2), (b0, b2)| (a0 + b0, a2 + b2),
+            || (F256Unreduced::ZERO, F256Unreduced::ZERO),
+            |(a0, a2), (b0, b2)| (a0 ^ b0, a2 ^ b2),
         );
-    SumcheckMessage { u_0, u_2 }
+    SumcheckMessage {
+        u_0: u_0.reduce(),
+        u_2: u_2.reduce(),
+    }
 }
 
 /// Fused round message + full inner product: returns `round_msg_lsb(f, b)`
@@ -2598,24 +2604,38 @@ fn round_msg_and_eval_lsb(f: &[F128], b: &[F128]) -> (SumcheckMessage, F128) {
 
     const PAR_THRESHOLD: usize = 4096;
     let half = n / 2;
-    let term = |j: usize| -> (F128, F128, F128) {
+    // (u_0, u_2, y=f0·b0+f1·b1) as unreduced products; one final reduction.
+    let term = |j: usize| -> (F256Unreduced, F256Unreduced, F256Unreduced) {
         let f0 = f[2 * j];
         let f1 = f[2 * j + 1];
         let b0 = b[2 * j];
         let b1 = b[2 * j + 1];
-        let e0 = f0 * b0;
-        // (u_0 term, u_2 term, y term = f0·b0 + f1·b1).
-        (e0, (f0 + f1) * (b0 + b1), e0 + f1 * b1)
+        let e0 = f0.mul_unreduced(b0);
+        (
+            e0,
+            (f0 + f1).mul_unreduced(b0 + b1),
+            e0 ^ f1.mul_unreduced(b1),
+        )
     };
     if half < PAR_THRESHOLD {
-        let (mut u_0, mut u_2, mut y) = (F128::ZERO, F128::ZERO, F128::ZERO);
+        let (mut u_0, mut u_2, mut y) = (
+            F256Unreduced::ZERO,
+            F256Unreduced::ZERO,
+            F256Unreduced::ZERO,
+        );
         for j in 0..half {
             let (a0, a2, ay) = term(j);
-            u_0 += a0;
-            u_2 += a2;
-            y += ay;
+            u_0 ^= a0;
+            u_2 ^= a2;
+            y ^= ay;
         }
-        return (SumcheckMessage { u_0, u_2 }, y);
+        return (
+            SumcheckMessage {
+                u_0: u_0.reduce(),
+                u_2: u_2.reduce(),
+            },
+            y.reduce(),
+        );
     }
 
     let (u_0, u_2, y) = (0..half)
@@ -2623,10 +2643,22 @@ fn round_msg_and_eval_lsb(f: &[F128], b: &[F128]) -> (SumcheckMessage, F128) {
         .with_min_len(PAR_THRESHOLD / 4)
         .map(term)
         .reduce(
-            || (F128::ZERO, F128::ZERO, F128::ZERO),
-            |(a0, a2, ay), (b0, b2, by)| (a0 + b0, a2 + b2, ay + by),
+            || {
+                (
+                    F256Unreduced::ZERO,
+                    F256Unreduced::ZERO,
+                    F256Unreduced::ZERO,
+                )
+            },
+            |(a0, a2, ay), (b0, b2, by)| (a0 ^ b0, a2 ^ b2, ay ^ by),
         );
-    (SumcheckMessage { u_0, u_2 }, y)
+    (
+        SumcheckMessage {
+            u_0: u_0.reduce(),
+            u_2: u_2.reduce(),
+        },
+        y.reduce(),
+    )
 }
 
 /// Partially evaluate `evals` at LSB variable = `r`, in place. Halves length.
