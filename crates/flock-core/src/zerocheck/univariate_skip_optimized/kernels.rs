@@ -146,6 +146,59 @@ pub(super) fn shift_reduce_inner_ab(
     );
 }
 
+/// Honest-witness AArch64 fast path: consume one 64-byte A/B window once,
+/// producing both the shift-reduced AB column and the bit-transpose of A&B.
+/// The portable fallback preserves the same outputs but uses the existing
+/// independent kernels.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn shift_reduce_inner_ab_and_transpose_c(
+    a_packed: &[u8],
+    b_packed: &[u8],
+    inv_table: &InvNttTableByteSingleGf8,
+    chunk_byte_base: usize,
+    b_med: usize,
+    out_ab: &mut [u8; 64],
+    out_c: &mut [u8; 64],
+    a_col: &mut [F8],
+    b_col: &mut [F8],
+) {
+    #[cfg(target_arch = "aarch64")]
+    {
+        let _ = (a_col, b_col);
+        aarch64::shift_reduce_inner_ab_and_transpose_c_fused_neon(
+            a_packed,
+            b_packed,
+            inv_table,
+            chunk_byte_base,
+            b_med,
+            out_ab,
+            out_c,
+        );
+    }
+
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        shift_reduce_inner_ab(
+            a_packed,
+            b_packed,
+            inv_table,
+            chunk_byte_base,
+            b_med,
+            out_ab,
+            a_col,
+            b_col,
+        );
+        let byte_base_b = chunk_byte_base + b_med * super::N_CHUNKS * 8;
+        let a: &[u8; 64] = (&a_packed[byte_base_b..byte_base_b + 64])
+            .try_into()
+            .expect("64 a-bytes per medium position");
+        let b: &[u8; 64] = (&b_packed[byte_base_b..byte_base_b + 64])
+            .try_into()
+            .expect("64 b-bytes per medium position");
+        bit_transpose_64bytes_and(a, b, out_c);
+    }
+}
+
 /// Specialized honest-padding path for a 512-bit window whose useful prefix
 /// occupies exactly seven packed bytes (49 useful bits in BLAKE3's case).
 #[allow(clippy::too_many_arguments)]
@@ -183,6 +236,58 @@ pub(super) fn shift_reduce_inner_ab_prefix_7(
         a_col,
         b_col,
     );
+}
+
+/// Honest-padding counterpart of
+/// [`shift_reduce_inner_ab_and_transpose_c`]. Only the first seven source
+/// bytes are useful; all remaining C input bits are known zero.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn shift_reduce_inner_ab_and_transpose_c_prefix_7(
+    a_packed: &[u8],
+    b_packed: &[u8],
+    inv_table: &InvNttTableByteSingleGf8,
+    chunk_byte_base: usize,
+    b_med: usize,
+    out_ab: &mut [u8; 64],
+    out_c: &mut [u8; 64],
+    a_col: &mut [F8],
+    b_col: &mut [F8],
+) {
+    #[cfg(target_arch = "aarch64")]
+    {
+        let _ = (a_col, b_col);
+        aarch64::shift_reduce_inner_ab_and_transpose_c_fused_neon_prefix_7(
+            a_packed,
+            b_packed,
+            inv_table,
+            chunk_byte_base,
+            b_med,
+            out_ab,
+            out_c,
+        );
+    }
+
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        shift_reduce_inner_ab_prefix_7(
+            a_packed,
+            b_packed,
+            inv_table,
+            chunk_byte_base,
+            b_med,
+            out_ab,
+            a_col,
+            b_col,
+        );
+        let byte_base_b = chunk_byte_base + b_med * super::N_CHUNKS * 8;
+        let a: &[u8; 64] = (&a_packed[byte_base_b..byte_base_b + 64])
+            .try_into()
+            .expect("64 a-bytes per medium position");
+        let b: &[u8; 64] = (&b_packed[byte_base_b..byte_base_b + 64])
+            .try_into()
+            .expect("64 b-bytes per medium position");
+        bit_transpose_64bytes_and(a, b, out_c);
+    }
 }
 
 #[allow(clippy::too_many_arguments)]

@@ -414,10 +414,16 @@ unsafe fn xor_apply_byte_into_8_regs<const BH: usize, const ODD: bool>(
 /// F_8 multiply, widen-shift by K, XOR into the four `(acc_lo, acc_hi)` pairs.
 #[cfg(target_arch = "aarch64")]
 #[inline(always)]
+fn packed_byte<const B: usize>(word: u64) -> u8 {
+    (word >> (B * 8)) as u8
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
 unsafe fn fused_apply_one_k<const K: i32, const FULL_ROW: bool>(
     table_base: *const u8,
-    a_row: *const u8,
-    b_row: *const u8,
+    a_row: u64,
+    b_row: u64,
     acc0_lo: &mut core::arch::aarch64::uint16x8_t,
     acc0_hi: &mut core::arch::aarch64::uint16x8_t,
     acc1_lo: &mut core::arch::aarch64::uint16x8_t,
@@ -431,8 +437,8 @@ unsafe fn fused_apply_one_k<const K: i32, const FULL_ROW: bool>(
     use core::arch::aarch64::*;
     unsafe {
         // b = 0: identity permutation — plain load of the 4 chunks.
-        let ra0 = table_base.add(*a_row as usize * 64);
-        let rb0 = table_base.add(*b_row as usize * 64);
+        let ra0 = table_base.add(packed_byte::<0>(a_row) as usize * 64);
+        let rb0 = table_base.add(packed_byte::<0>(b_row) as usize * 64);
         let mut da0 = vld1q_u8(ra0);
         let mut da1 = vld1q_u8(ra0.add(16));
         let mut da2 = vld1q_u8(ra0.add(32));
@@ -445,8 +451,8 @@ unsafe fn fused_apply_one_k<const K: i32, const FULL_ROW: bool>(
         // b = 1..7: XOR with table row[bytes[b]], permuted per (BH, ODD).
         xor_apply_byte_into_8_regs::<0, true>(
             table_base,
-            *a_row.add(1),
-            *b_row.add(1),
+            packed_byte::<1>(a_row),
+            packed_byte::<1>(b_row),
             &mut da0,
             &mut da1,
             &mut da2,
@@ -458,8 +464,8 @@ unsafe fn fused_apply_one_k<const K: i32, const FULL_ROW: bool>(
         );
         xor_apply_byte_into_8_regs::<1, false>(
             table_base,
-            *a_row.add(2),
-            *b_row.add(2),
+            packed_byte::<2>(a_row),
+            packed_byte::<2>(b_row),
             &mut da0,
             &mut da1,
             &mut da2,
@@ -471,8 +477,8 @@ unsafe fn fused_apply_one_k<const K: i32, const FULL_ROW: bool>(
         );
         xor_apply_byte_into_8_regs::<1, true>(
             table_base,
-            *a_row.add(3),
-            *b_row.add(3),
+            packed_byte::<3>(a_row),
+            packed_byte::<3>(b_row),
             &mut da0,
             &mut da1,
             &mut da2,
@@ -484,8 +490,8 @@ unsafe fn fused_apply_one_k<const K: i32, const FULL_ROW: bool>(
         );
         xor_apply_byte_into_8_regs::<2, false>(
             table_base,
-            *a_row.add(4),
-            *b_row.add(4),
+            packed_byte::<4>(a_row),
+            packed_byte::<4>(b_row),
             &mut da0,
             &mut da1,
             &mut da2,
@@ -497,8 +503,8 @@ unsafe fn fused_apply_one_k<const K: i32, const FULL_ROW: bool>(
         );
         xor_apply_byte_into_8_regs::<2, true>(
             table_base,
-            *a_row.add(5),
-            *b_row.add(5),
+            packed_byte::<5>(a_row),
+            packed_byte::<5>(b_row),
             &mut da0,
             &mut da1,
             &mut da2,
@@ -510,8 +516,8 @@ unsafe fn fused_apply_one_k<const K: i32, const FULL_ROW: bool>(
         );
         xor_apply_byte_into_8_regs::<3, false>(
             table_base,
-            *a_row.add(6),
-            *b_row.add(6),
+            packed_byte::<6>(a_row),
+            packed_byte::<6>(b_row),
             &mut da0,
             &mut da1,
             &mut da2,
@@ -524,8 +530,8 @@ unsafe fn fused_apply_one_k<const K: i32, const FULL_ROW: bool>(
         if FULL_ROW {
             xor_apply_byte_into_8_regs::<3, true>(
                 table_base,
-                *a_row.add(7),
-                *b_row.add(7),
+                packed_byte::<7>(a_row),
+                packed_byte::<7>(b_row),
                 &mut da0,
                 &mut da1,
                 &mut da2,
@@ -565,6 +571,54 @@ pub(crate) fn shift_reduce_inner_ab_fused_neon(
     b_med: usize,
     out: &mut [u8; 64],
 ) {
+    unsafe {
+        shift_reduce_inner_ab_fused_neon_impl::<false>(
+            a_packed,
+            b_packed,
+            inv_table,
+            chunk_byte_base,
+            b_med,
+            out,
+            core::ptr::null_mut(),
+        );
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+pub(crate) fn shift_reduce_inner_ab_and_transpose_c_fused_neon(
+    a_packed: &[u8],
+    b_packed: &[u8],
+    inv_table: &InvNttTableByteSingleGf8,
+    chunk_byte_base: usize,
+    b_med: usize,
+    out_ab: &mut [u8; 64],
+    out_c: &mut [u8; 64],
+) {
+    unsafe {
+        shift_reduce_inner_ab_fused_neon_impl::<true>(
+            a_packed,
+            b_packed,
+            inv_table,
+            chunk_byte_base,
+            b_med,
+            out_ab,
+            out_c.as_mut_ptr(),
+        );
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn shift_reduce_inner_ab_fused_neon_impl<const CAPTURE_C: bool>(
+    a_packed: &[u8],
+    b_packed: &[u8],
+    inv_table: &InvNttTableByteSingleGf8,
+    chunk_byte_base: usize,
+    b_med: usize,
+    out: &mut [u8; 64],
+    out_c: *mut u8,
+) {
     use crate::field::gf2_8::neon::gf8_reduce_vec16;
     use core::arch::aarch64::*;
 
@@ -586,10 +640,25 @@ pub(crate) fn shift_reduce_inner_ab_fused_neon(
         macro_rules! do_k {
             ($k:literal) => {{
                 let off = byte_base_b + $k * N_CHUNKS;
+                let a_row = u64::from_le(
+                    (a_packed.as_ptr().add(off) as *const u64).read_unaligned(),
+                );
+                let b_row = u64::from_le(
+                    (b_packed.as_ptr().add(off) as *const u64).read_unaligned(),
+                );
+                if CAPTURE_C {
+                    (out_c.add($k * N_CHUNKS) as *mut u64)
+                        .write_unaligned((a_row & b_row).to_le());
+                    // Keep the derived row store adjacent to its sole A/B
+                    // loads. Otherwise LLVM retains all sixteen source words
+                    // across the eight enormous table-apply expansions and
+                    // grows the hot kernel's callee-save frame.
+                    core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
+                }
                 fused_apply_one_k::<$k, true>(
                     table_base,
-                    a_packed.as_ptr().add(off),
-                    b_packed.as_ptr().add(off),
+                    a_row,
+                    b_row,
                     &mut acc0_lo,
                     &mut acc0_hi,
                     &mut acc1_lo,
@@ -621,6 +690,15 @@ pub(crate) fn shift_reduce_inner_ab_fused_neon(
         vst1q_u8(p.add(16), r1);
         vst1q_u8(p.add(32), r2);
         vst1q_u8(p.add(48), r3);
+
+        if CAPTURE_C {
+            let c0 = vld1q_u8(out_c);
+            let c1 = vld1q_u8(out_c.add(16));
+            let c2 = vld1q_u8(out_c.add(32));
+            let c3 = vld1q_u8(out_c.add(48));
+            let out_c_array = &mut *(out_c as *mut [u8; 64]);
+            bit_transpose_4x16_neon(c0, c1, c2, c3, out_c_array);
+        }
     }
 }
 
@@ -638,6 +716,54 @@ pub(crate) fn shift_reduce_inner_ab_fused_neon_prefix_7(
     b_med: usize,
     out: &mut [u8; 64],
 ) {
+    unsafe {
+        shift_reduce_inner_ab_fused_neon_prefix_7_impl::<false>(
+            a_packed,
+            b_packed,
+            inv_table,
+            chunk_byte_base,
+            b_med,
+            out,
+            core::ptr::null_mut(),
+        );
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+pub(crate) fn shift_reduce_inner_ab_and_transpose_c_fused_neon_prefix_7(
+    a_packed: &[u8],
+    b_packed: &[u8],
+    inv_table: &InvNttTableByteSingleGf8,
+    chunk_byte_base: usize,
+    b_med: usize,
+    out_ab: &mut [u8; 64],
+    out_c: &mut [u8; 64],
+) {
+    unsafe {
+        shift_reduce_inner_ab_fused_neon_prefix_7_impl::<true>(
+            a_packed,
+            b_packed,
+            inv_table,
+            chunk_byte_base,
+            b_med,
+            out_ab,
+            out_c.as_mut_ptr(),
+        );
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn shift_reduce_inner_ab_fused_neon_prefix_7_impl<const CAPTURE_C: bool>(
+    a_packed: &[u8],
+    b_packed: &[u8],
+    inv_table: &InvNttTableByteSingleGf8,
+    chunk_byte_base: usize,
+    b_med: usize,
+    out: &mut [u8; 64],
+    out_c: *mut u8,
+) {
     use crate::field::gf2_8::neon::gf8_reduce_vec16;
     use core::arch::aarch64::*;
 
@@ -654,10 +780,24 @@ pub(crate) fn shift_reduce_inner_ab_fused_neon_prefix_7(
         let mut acc3_lo = vdupq_n_u16(0);
         let mut acc3_hi = vdupq_n_u16(0);
 
+        let a_row = u64::from_le(
+            (a_packed.as_ptr().add(byte_base_b) as *const u64).read_unaligned(),
+        );
+        let b_row = u64::from_le(
+            (b_packed.as_ptr().add(byte_base_b) as *const u64).read_unaligned(),
+        );
+        if CAPTURE_C {
+            let zero = vdupq_n_u8(0);
+            vst1q_u8(out_c, zero);
+            vst1q_u8(out_c.add(16), zero);
+            vst1q_u8(out_c.add(32), zero);
+            vst1q_u8(out_c.add(48), zero);
+            (out_c as *mut u64).write_unaligned((a_row & b_row).to_le());
+        }
         fused_apply_one_k::<0, false>(
             table_base,
-            a_packed.as_ptr().add(byte_base_b),
-            b_packed.as_ptr().add(byte_base_b),
+            a_row,
+            b_row,
             &mut acc0_lo,
             &mut acc0_hi,
             &mut acc1_lo,
@@ -678,5 +818,14 @@ pub(crate) fn shift_reduce_inner_ab_fused_neon_prefix_7(
         vst1q_u8(p.add(16), r1);
         vst1q_u8(p.add(32), r2);
         vst1q_u8(p.add(48), r3);
+
+        if CAPTURE_C {
+            let c0 = vld1q_u8(out_c);
+            let c1 = vld1q_u8(out_c.add(16));
+            let c2 = vld1q_u8(out_c.add(32));
+            let c3 = vld1q_u8(out_c.add(48));
+            let out_c_array = &mut *(out_c as *mut [u8; 64]);
+            bit_transpose_4x16_neon(c0, c1, c2, c3, out_c_array);
+        }
     }
 }
