@@ -2244,20 +2244,63 @@ fn transpose_forward_ntt_sparse(
         })
         .collect();
 
-    // Densify (active windows only; the rest stay zero, which is the correct
-    // post-step-(k-1) state for an all-zero window).
+    // Densify. When at least three dense layers remain, finish those layers
+    // while materializing each active eight-window group. Entirely-zero groups
+    // remain zero without executing 3 * 2^(k+2) useless field products. This
+    // also avoids writing the sparse windows only to reread them immediately.
     let mut data = vec![F128::ZERO; n];
-    for (w, buf) in processed {
-        data[(w << k)..((w + 1) << k)].copy_from_slice(&buf);
+    let mut remaining = log_d - k;
+    if remaining >= 3 {
+        let num_windows = 1usize << (log_d - k);
+        let mut window_bufs: Vec<Option<Vec<F128>>> = (0..num_windows).map(|_| None).collect();
+        let mut active_blocks = Vec::with_capacity(processed.len());
+        for (w, buf) in processed {
+            active_blocks.push(w >> 3);
+            window_bufs[w] = Some(buf);
+        }
+        active_blocks.sort_unstable();
+        active_blocks.dedup();
+
+        let high = remaining - 1;
+        let mid = high - 1;
+        let low = mid - 1;
+        let window_size = 1usize << k;
+        let base = data.as_mut_ptr() as usize;
+        active_blocks.into_par_iter().for_each(|block| {
+            let twiddles = [
+                ntt.twiddle(high, 4 * block),
+                ntt.twiddle(high, 4 * block + 1),
+                ntt.twiddle(high, 4 * block + 2),
+                ntt.twiddle(high, 4 * block + 3),
+                ntt.twiddle(mid, 2 * block),
+                ntt.twiddle(mid, 2 * block + 1),
+                ntt.twiddle(low, block),
+            ];
+            let sources: [Option<&[F128]>; 8] =
+                std::array::from_fn(|i| window_bufs[8 * block + i].as_ref().map(Vec::as_slice));
+            for r in 0..window_size {
+                let mut values =
+                    std::array::from_fn(|i| sources[i].map_or(F128::ZERO, |source| source[r]));
+                transpose_fused_3layer_values(&mut values, &twiddles);
+                for (i, value) in values.iter().enumerate() {
+                    // SAFETY: each active block is unique and owns its full
+                    // eight-window output group.
+                    unsafe { *(base as *mut F128).add((8 * block + i) * window_size + r) = *value };
+                }
+            }
+        });
+        remaining -= 3;
+    } else {
+        for (w, buf) in processed {
+            data[(w << k)..((w + 1) << k)].copy_from_slice(&buf);
+        }
     }
 
-    // Remaining steps s = k..log_d-1 = forward layers (log_d-1-k) .. 0, dense.
-    // Fuse three adjacent transpose layers into one buffer pass. For eight
-    // live values, each layer has four butterflies; keeping the values in
-    // registers preserves the exact M^T order while cutting three full reads
-    // and writes to one.
+    // Remaining steps s = k..log_d-1 = forward layers (log_d-1-k) .. 0,
+    // dense. Fuse three adjacent layers into one buffer pass. For eight live
+    // values, each layer has four butterflies; keeping values in registers
+    // preserves the exact M^T order while replacing three full passes with one.
     let n_threads = rayon::current_num_threads().max(1);
-    let mut remaining = log_d - k;
     while remaining > 0 {
         if remaining >= 3 {
             let high = remaining - 1;
@@ -2352,6 +2395,20 @@ unsafe fn transpose_fused_3layer_group(
     r: usize,
     twiddles: &[F128; 7],
 ) {
+    let mut values = [F128::ZERO; 8];
+    for (i, value) in values.iter_mut().enumerate() {
+        // SAFETY: upheld by the caller's address-range contract.
+        *value = unsafe { *ptr.add(block_start + i * eighth + r) };
+    }
+    transpose_fused_3layer_values(&mut values, twiddles);
+    for (i, value) in values.iter().enumerate() {
+        // SAFETY: upheld by the caller's address-range contract.
+        unsafe { *ptr.add(block_start + i * eighth + r) = *value };
+    }
+}
+
+#[inline(always)]
+fn transpose_fused_3layer_values(values: &mut [F128; 8], twiddles: &[F128; 7]) {
     #[inline(always)]
     fn butterfly(values: &mut [F128; 8], a: usize, b: usize, twiddle: F128) {
         let sum = values[a] + values[b];
@@ -2359,24 +2416,15 @@ unsafe fn transpose_fused_3layer_group(
         values[a] = sum;
     }
 
-    let mut values = [F128::ZERO; 8];
-    for (i, value) in values.iter_mut().enumerate() {
-        // SAFETY: upheld by the caller's address-range contract.
-        *value = unsafe { *ptr.add(block_start + i * eighth + r) };
-    }
     for i in 0..4 {
-        butterfly(&mut values, 2 * i, 2 * i + 1, twiddles[i]);
+        butterfly(values, 2 * i, 2 * i + 1, twiddles[i]);
     }
-    butterfly(&mut values, 0, 2, twiddles[4]);
-    butterfly(&mut values, 1, 3, twiddles[4]);
-    butterfly(&mut values, 4, 6, twiddles[5]);
-    butterfly(&mut values, 5, 7, twiddles[5]);
+    butterfly(values, 0, 2, twiddles[4]);
+    butterfly(values, 1, 3, twiddles[4]);
+    butterfly(values, 4, 6, twiddles[5]);
+    butterfly(values, 5, 7, twiddles[5]);
     for i in 0..4 {
-        butterfly(&mut values, i, i + 4, twiddles[6]);
-    }
-    for (i, value) in values.iter().enumerate() {
-        // SAFETY: upheld by the caller's address-range contract.
-        unsafe { *ptr.add(block_start + i * eighth + r) = *value };
+        butterfly(values, i, i + 4, twiddles[6]);
     }
 }
 
