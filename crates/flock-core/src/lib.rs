@@ -44,24 +44,37 @@ pub mod zerocheck;
 /// code runs (rayon's global pool is set on first use; if it's already
 /// created, this call is a no-op).
 ///
-/// Respects `RAYON_NUM_THREADS` — if that env var is set, this function
-/// does nothing (so explicit user configuration always wins).
+/// Respects `RAYON_NUM_THREADS` — if that env var is set, this function does
+/// not replace the configured pool size. An explicitly enabled Apple Merkle
+/// sidecar may still initialize that pool and prewarm its persistent helpers.
 ///
 /// Returns the number of threads the pool was configured with, or `None`
 /// if no change was made (either because the env var was set or because
 /// rayon was already initialized).
 pub fn init_perf_thread_pool() -> Option<usize> {
     if std::env::var("RAYON_NUM_THREADS").is_ok() {
+        // Asking Rayon for the configured pool shape initializes its global
+        // registry from the explicit environment. The sidecar then validates
+        // that shape against topology obtained with in-process sysctlbyname.
+        // In particular, do not call `perf_core_count()` here: its legacy
+        // best-effort child `sysctl` is denied by the ranked Seatbelt.
+        merkle::init_ecore_sidecar_if_enabled();
         return None;
     }
     let n = perf_core_count();
-    match rayon::ThreadPoolBuilder::new()
+    let configured = match rayon::ThreadPoolBuilder::new()
         .num_threads(n)
         .build_global()
     {
         Ok(()) => Some(n),
         Err(_) => None, // pool already built
-    }
+    };
+    // Candidate-only Apple SHA helpers are process-lifetime and must be fully
+    // spawned/prewarmed before the first Merkle job. The helper also rejects
+    // a pre-existing default pool that spills onto E cores. With its strict
+    // env switch off this is a no-op on every target.
+    merkle::init_ecore_sidecar_if_enabled();
+    configured
 }
 
 /// Allocate a `Vec<T>` of length `n` whose contents are NOT zero-initialized.

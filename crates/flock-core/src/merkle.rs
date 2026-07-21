@@ -115,6 +115,12 @@ mod sha256x4;
 #[cfg(all(target_arch = "aarch64", target_feature = "sha2"))]
 pub(crate) use sha256x4::hash4_pow;
 
+/// Persistent background-QoS SHA workers for wide Merkle levels. This module
+/// is Apple-only; every other target retains the legacy Rayon implementation.
+#[cfg(all(target_os = "macos", target_arch = "aarch64", target_feature = "sha2"))]
+#[path = "merkle/ecore_sidecar.rs"]
+mod ecore_sidecar;
+
 /// Four SHA-256 streams interleaved across the x86 SHA-NI pipeline.
 ///
 /// SHA-NI accelerates one stream but retains a dependent state chain. Running
@@ -123,6 +129,119 @@ pub(crate) use sha256x4::hash4_pow;
 #[cfg(all(target_arch = "x86_64", target_feature = "sha"))]
 #[path = "merkle/x86_64.rs"]
 mod sha256x4;
+
+const SERIAL_LEVEL_NODES: usize = 1024;
+
+fn strict_env_enabled(name: &str) -> bool {
+    std::env::var(name).is_ok_and(|value| {
+        matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "on"
+        )
+    })
+}
+
+/// Production defaults to the supported Apple sidecar. An explicit false
+/// value remains a same-binary diagnostic kill switch; malformed/non-Unicode
+/// values fail closed instead of silently enabling background workers.
+fn default_enabled_env(name: &str) -> bool {
+    match std::env::var(name) {
+        Ok(value) => matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "on"
+        ),
+        Err(std::env::VarError::NotPresent) => true,
+        Err(std::env::VarError::NotUnicode(_)) => false,
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64", target_feature = "sha2"))]
+fn ecore_sidecar_enabled() -> bool {
+    default_enabled_env("FLOCK_MERKLE_ECORE_SIDECAR") && ecore_sidecar::pool_shape_is_supported()
+}
+
+#[cfg(not(all(target_os = "macos", target_arch = "aarch64", target_feature = "sha2")))]
+fn ecore_sidecar_enabled() -> bool {
+    false
+}
+
+/// Spawn and SHA-prewarm the process-lifetime sidecar during normal prover
+/// initialization. On supported Apple topology this is default-on; an
+/// explicit false switch and all non-Apple targets remain strict no-ops.
+pub(crate) fn init_ecore_sidecar_if_enabled() {
+    #[cfg(all(target_os = "macos", target_arch = "aarch64", target_feature = "sha2"))]
+    if ecore_sidecar_enabled() {
+        let initialized = ecore_sidecar::init();
+        if strict_env_enabled("FLOCK_MERKLE_ECORE_TRACE") {
+            static TRACE_INIT: std::sync::Once = std::sync::Once::new();
+            TRACE_INIT.call_once(|| {
+                eprintln!(
+                    "[merkle-ecore-init] initialized={initialized} rayon_workers={} qos={:?}",
+                    rayon::current_num_threads(),
+                    ecore_sidecar::qos_diagnostics()
+                );
+            });
+        }
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64", target_feature = "sha2"))]
+fn try_hash_quads_with_ecore(
+    enabled: bool,
+    label: &str,
+    input: &[u8],
+    message_len: usize,
+    output: &mut [Hash],
+) -> bool {
+    if !enabled || output.len() <= SERIAL_LEVEL_NODES || !output.len().is_multiple_of(4) {
+        return false;
+    }
+    let Some(stats) = ecore_sidecar::run(input, message_len, output) else {
+        return false;
+    };
+    if strict_env_enabled("FLOCK_MERKLE_ECORE_TRACE") {
+        let first_claim_us = stats
+            .first_ecore_claim_ns
+            .map_or(-1.0, |ns| ns as f64 / 1e3);
+        let worker_first_claim_us = stats
+            .worker_first_claim_ns
+            .map(|ns| ns.map(|ns| ns as f64 / 1e3));
+        let worker_last_finish_us = stats
+            .worker_last_finish_ns
+            .map(|ns| ns.map(|ns| ns as f64 / 1e3));
+        eprintln!(
+            "[merkle-ecore] phase={label} messages={} message_len={message_len} first_claim_us={first_claim_us:.3} tail_us={:.3} e_tiles={} p_tiles={} tile_quads={} completion_owner={} override_attempted={} override_started={} override_start_failures={} override_end_failures={} worker_first_claim_us={worker_first_claim_us:?} worker_last_finish_us={worker_last_finish_us:?} worker_tiles={:?}",
+            output.len(),
+            stats.ecore_tail_ns as f64 / 1e3,
+            stats.ecore_tiles,
+            stats.pcore_tiles,
+            stats.tile_quads,
+            if stats.completion_owner_is_ecore {
+                "E"
+            } else {
+                "P"
+            },
+            stats.qos_override_attempted,
+            stats.qos_override_started,
+            stats.qos_override_start_failures,
+            stats.qos_override_end_failures,
+            stats.worker_tiles,
+        );
+    }
+    true
+}
+
+#[cfg(not(all(target_os = "macos", target_arch = "aarch64", target_feature = "sha2")))]
+#[inline]
+fn try_hash_quads_with_ecore(
+    _enabled: bool,
+    _label: &str,
+    _input: &[u8],
+    _message_len: usize,
+    _output: &mut [Hash],
+) -> bool {
+    false
+}
 
 /// Global SHA-256 call/compression counters, enabled with
 /// `--features hash-count` (e.g. by `benches/verifier_hash_count.rs`).
@@ -195,6 +314,10 @@ pub fn merkle_root(data: &[u8], num_leaves: usize) -> Hash {
 /// Compute the full Merkle tree (flat layout, see module docs) for `data`
 /// split into `num_leaves` equal-sized leaves.
 pub fn merkle_tree(data: &[u8], num_leaves: usize) -> Vec<Hash> {
+    merkle_tree_impl(data, num_leaves, ecore_sidecar_enabled())
+}
+
+fn merkle_tree_impl(data: &[u8], num_leaves: usize, use_ecore_sidecar: bool) -> Vec<Hash> {
     assert!(
         num_leaves.is_power_of_two() && num_leaves > 0,
         "num_leaves must be power of 2"
@@ -204,7 +327,6 @@ pub fn merkle_tree(data: &[u8], num_leaves: usize) -> Vec<Hash> {
         0,
         "data length must be a multiple of num_leaves"
     );
-
     let leaf_size = data.len() / num_leaves;
     let total_nodes = 2 * num_leaves - 1;
     // Uninit alloc — every node is written exactly once before being read:
@@ -218,33 +340,46 @@ pub fn merkle_tree(data: &[u8], num_leaves: usize) -> Vec<Hash> {
         all(target_arch = "x86_64", target_feature = "sha")
     ))]
     {
-        tree[..num_leaves]
-            .par_chunks_mut(4)
-            .zip(data.par_chunks(4 * leaf_size))
-            .for_each(|(outs, leaves)| {
-                if outs.len() == 4 {
-                    #[cfg(feature = "hash-count")]
-                    {
-                        use std::sync::atomic::Ordering::Relaxed;
-                        hash_count::LEAF_CALLS.fetch_add(4, Relaxed);
-                        hash_count::LEAF_COMPRESSIONS
-                            .fetch_add(4 * hash_count::sha256_blocks(leaf_size), Relaxed);
+        let leaves_out = &mut tree[..num_leaves];
+        if try_hash_quads_with_ecore(use_ecore_sidecar, "leaves", data, leaf_size, leaves_out) {
+            #[cfg(feature = "hash-count")]
+            {
+                use std::sync::atomic::Ordering::Relaxed;
+                hash_count::LEAF_CALLS.fetch_add(num_leaves as u64, Relaxed);
+                hash_count::LEAF_COMPRESSIONS.fetch_add(
+                    num_leaves as u64 * hash_count::sha256_blocks(leaf_size),
+                    Relaxed,
+                );
+            }
+        } else {
+            leaves_out
+                .par_chunks_mut(4)
+                .zip(data.par_chunks(4 * leaf_size))
+                .for_each(|(outs, leaves)| {
+                    if outs.len() == 4 {
+                        #[cfg(feature = "hash-count")]
+                        {
+                            use std::sync::atomic::Ordering::Relaxed;
+                            hash_count::LEAF_CALLS.fetch_add(4, Relaxed);
+                            hash_count::LEAF_COMPRESSIONS
+                                .fetch_add(4 * hash_count::sha256_blocks(leaf_size), Relaxed);
+                        }
+                        sha256x4::hash4_equal_len(
+                            [
+                                &leaves[..leaf_size],
+                                &leaves[leaf_size..2 * leaf_size],
+                                &leaves[2 * leaf_size..3 * leaf_size],
+                                &leaves[3 * leaf_size..],
+                            ],
+                            outs,
+                        );
+                    } else {
+                        for (out, leaf) in outs.iter_mut().zip(leaves.chunks(leaf_size)) {
+                            *out = hash_leaf(leaf);
+                        }
                     }
-                    sha256x4::hash4_equal_len(
-                        [
-                            &leaves[..leaf_size],
-                            &leaves[leaf_size..2 * leaf_size],
-                            &leaves[2 * leaf_size..3 * leaf_size],
-                            &leaves[3 * leaf_size..],
-                        ],
-                        outs,
-                    );
-                } else {
-                    for (out, leaf) in outs.iter_mut().zip(leaves.chunks(leaf_size)) {
-                        *out = hash_leaf(leaf);
-                    }
-                }
-            });
+                });
+        }
     }
     #[cfg(not(any(
         all(target_arch = "aarch64", target_feature = "sha2"),
@@ -301,7 +436,6 @@ pub fn merkle_tree(data: &[u8], num_leaves: usize) -> Vec<Hash> {
             // SHA-x4 tasks), so a rayon dispatch per level costs more than the
             // hashing itself (~3× at the top of a 2^18 tree). Hash them serially
             // — still 4-way SIMD — and only fan out the wide lower levels.
-            const SERIAL_LEVEL_NODES: usize = 1024;
             if write.len() <= SERIAL_LEVEL_NODES {
                 for (outs, children) in write.chunks_mut(4).zip(read_bytes.chunks(256)) {
                     hash_quad(outs, children);
@@ -607,6 +741,214 @@ mod tests {
             let seq = merkle_tree_sequential(&data, n_leaves);
             assert_eq!(par, seq, "n_leaves={n_leaves} leaf_size={leaf_size}");
         }
+    }
+
+    /// Exact production-tree gate for the persistent Apple E-core queue.
+    /// Each case exercises one shared leaf job. Every internal level retains
+    /// the legacy parallel/serial schedule, including the serial upper levels
+    /// at 1024 nodes and below.
+    #[cfg(all(target_os = "macos", target_arch = "aarch64", target_feature = "sha2"))]
+    #[test]
+    fn ecore_sidecar_matches_legacy_tree_proofs_and_counts() {
+        let _serial = ecore_sidecar::test_serial_guard();
+        let Some(performance_cores) = ecore_sidecar::performance_core_count() else {
+            return;
+        };
+        let rayon_workers = performance_cores.min(10);
+        if rayon_workers < 2 {
+            return;
+        }
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(rayon_workers)
+            .build()
+            .unwrap();
+        let initialized = ecore_sidecar::init();
+        let qos = ecore_sidecar::qos_diagnostics();
+        assert!(initialized, "sidecar topology and QoS gate: qos={qos:?}");
+        assert_eq!(
+            qos.map(|qos| qos.classes),
+            Some([0x09; 4]),
+            "all persistent helpers must retain background QoS"
+        );
+
+        for &(n_leaves, leaf_size) in &[
+            (131_072usize, 64usize),
+            (65_536usize, 128usize),
+            (8_192usize, 1024usize),
+        ] {
+            let data = random_data(n_leaves, leaf_size, 0xEC0E_0000 + leaf_size as u64);
+
+            #[cfg(feature = "hash-count")]
+            hash_count::reset();
+            let legacy = pool.install(|| merkle_tree_impl(&data, n_leaves, false));
+            #[cfg(feature = "hash-count")]
+            let legacy_counts = hash_count::snapshot();
+
+            let submissions_before = ecore_sidecar::submission_count();
+            #[cfg(feature = "hash-count")]
+            hash_count::reset();
+            let candidate = pool.install(|| merkle_tree_impl(&data, n_leaves, true));
+            #[cfg(feature = "hash-count")]
+            let candidate_counts = hash_count::snapshot();
+            assert_eq!(
+                ecore_sidecar::submission_count() - submissions_before,
+                1,
+                "the first causal integration uses only the leaf level"
+            );
+
+            let sequential = merkle_tree_sequential(&data, n_leaves);
+            assert_eq!(legacy, sequential, "legacy oracle at leaf_size={leaf_size}");
+            assert_eq!(
+                candidate, legacy,
+                "sidecar tree bytes at leaf_size={leaf_size}"
+            );
+            #[cfg(feature = "hash-count")]
+            assert_eq!(
+                candidate_counts, legacy_counts,
+                "hash counts at leaf_size={leaf_size}"
+            );
+
+            for &position in &[0usize, 1, n_leaves / 2 - 1, n_leaves - 1] {
+                assert_eq!(
+                    merkle_proof(&candidate, n_leaves, position),
+                    merkle_proof(&legacy, n_leaves, position),
+                    "path bytes at leaf_size={leaf_size}, position={position}"
+                );
+            }
+            let positions = [0usize, 1, 17, n_leaves / 2 - 1, n_leaves / 2, n_leaves - 1];
+            assert_eq!(
+                merkle_multi_proof(&candidate, n_leaves, &positions),
+                merkle_multi_proof(&legacy, n_leaves, &positions),
+                "multiproof bytes at leaf_size={leaf_size}"
+            );
+
+            // Once initialized, forcing the disabled branch still submits no
+            // work and remains byte-identical to the untouched legacy path.
+            let submissions_before_off = ecore_sidecar::submission_count();
+            let off_again = pool.install(|| merkle_tree_impl(&data, n_leaves, false));
+            assert_eq!(off_again, legacy);
+            assert_eq!(
+                ecore_sidecar::submission_count(),
+                submissions_before_off,
+                "disabled path must not touch the sidecar"
+            );
+        }
+    }
+
+    /// Force one helper to retain an irrevocably claimed tile until the P drain
+    /// reaches the documented QoS-override rescue. This is a protocol test, not
+    /// a scheduler benchmark: it deterministically proves that override tokens
+    /// are started before the wait, ended after completion, and do not alter
+    /// the resulting tree.
+    #[cfg(all(target_os = "macos", target_arch = "aarch64", target_feature = "sha2"))]
+    #[test]
+    fn ecore_sidecar_override_releases_delayed_claim() {
+        let _serial = ecore_sidecar::test_serial_guard();
+        let Some(performance_cores) = ecore_sidecar::performance_core_count() else {
+            return;
+        };
+        let rayon_workers = performance_cores.min(10);
+        if rayon_workers < 2 {
+            return;
+        }
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(rayon_workers)
+            .build()
+            .unwrap();
+        assert!(
+            ecore_sidecar::init(),
+            "sidecar QoS and override capability gate"
+        );
+
+        // 128 SHA tiles at ten P workers leaves eight helper-eligible tiles,
+        // enough for the hook to establish ownership before P drainers proceed.
+        let n_leaves = 32_768usize;
+        let leaf_size = 64usize;
+        let data = random_data(n_leaves, leaf_size, 0xEC0E_0A11);
+        let legacy = pool.install(|| merkle_tree_impl(&data, n_leaves, false));
+        let hook = ecore_sidecar::install_delayed_claim_hook();
+        let submissions_before = ecore_sidecar::submission_count();
+        let candidate = pool.install(|| merkle_tree_impl(&data, n_leaves, true));
+
+        assert_eq!(candidate, legacy, "override-rescued tree bytes");
+        assert_eq!(
+            ecore_sidecar::submission_count() - submissions_before,
+            1,
+            "the delayed job must use the sidecar"
+        );
+        assert_eq!(
+            hook.snapshot(),
+            (true, true, false),
+            "helper claimed, rescue ran, and neither side timed out"
+        );
+        assert!(
+            ecore_sidecar::init(),
+            "all runtime override starts/ends succeeded and sidecar stayed healthy"
+        );
+    }
+
+    /// Pause one caller immediately after it acquires the process-global
+    /// sidecar submission lock, then run a second caller to completion. This
+    /// deterministically covers the non-blocking concurrent fallback and the
+    /// following sidecar generation without depending on scheduler timing.
+    #[cfg(all(target_os = "macos", target_arch = "aarch64", target_feature = "sha2"))]
+    #[test]
+    fn ecore_sidecar_concurrent_call_falls_back_without_aba() {
+        let _serial = ecore_sidecar::test_serial_guard();
+        let Some(performance_cores) = ecore_sidecar::performance_core_count() else {
+            return;
+        };
+        let rayon_workers = performance_cores.min(10);
+        if rayon_workers < 2 {
+            return;
+        }
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(rayon_workers)
+            .build()
+            .unwrap();
+        assert!(
+            ecore_sidecar::init(),
+            "sidecar QoS and override capability gate"
+        );
+
+        let n_leaves = 32_768usize;
+        let leaf_size = 64usize;
+        let data = random_data(n_leaves, leaf_size, 0xEC0E_C011);
+        let legacy = pool.install(|| merkle_tree_impl(&data, n_leaves, false));
+        let hook = ecore_sidecar::install_concurrent_submit_hook();
+        let submissions_before = ecore_sidecar::submission_count();
+
+        let (submitted, fallback) = std::thread::scope(|scope| {
+            let owner = scope.spawn(|| pool.install(|| merkle_tree_impl(&data, n_leaves, true)));
+            let owner_ready = hook.wait_for_owner();
+            let fallback = pool.install(|| merkle_tree_impl(&data, n_leaves, true));
+            assert_eq!(
+                ecore_sidecar::submission_count(),
+                submissions_before,
+                "fallback finished without publishing while the owner remained paused"
+            );
+            hook.release_owner();
+            let submitted = owner.join().expect("sidecar owner thread");
+            assert!(owner_ready, "sidecar owner reached the test rendezvous");
+            (submitted, fallback)
+        });
+
+        assert_eq!(submitted, legacy, "sidecar owner's tree bytes");
+        assert_eq!(fallback, legacy, "concurrent legacy fallback tree bytes");
+        assert_eq!(
+            ecore_sidecar::submission_count() - submissions_before,
+            1,
+            "exactly one concurrent caller may publish a sidecar generation"
+        );
+        assert_eq!(
+            hook.snapshot(),
+            (true, true, false),
+            "owner held and released the lock without rendezvous timeout"
+        );
+        assert!(
+            ecore_sidecar::init(),
+            "the completed generation left the sidecar healthy"
+        );
     }
 
     #[test]
