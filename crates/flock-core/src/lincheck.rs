@@ -448,6 +448,7 @@ pub enum VerifyError {
 /// Standard "doubling-in-half" construction: `O(2^d)` F128 muls, no
 /// inversions. Indexing is LSB-first — `bit_j(i)` is the `j`-th LSB of `i`.
 pub fn build_eq_table(point: &[F128]) -> Vec<F128> {
+    use rayon::prelude::*;
     let d = point.len();
     let mut out: Vec<F128> = Vec::with_capacity(1usize << d);
     out.push(F128::ONE);
@@ -455,15 +456,33 @@ pub fn build_eq_table(point: &[F128]) -> Vec<F128> {
         let r_j = point[j];
         let one_plus_r_j = F128::ONE + r_j;
         let len = 1usize << j;
-        out.resize(2 * len, F128::ZERO);
+        // Grow without zero-filling: both halves are fully overwritten below
+        // before the table is read. The previous `resize(2*len, ZERO)` filled
+        // the new half with zeros that were immediately overwritten — pure
+        // cache-polluting waste on the larger levels.
+        out.reserve_exact(len);
+        // SAFETY: the loop writes out[0..len) (in place) and out[len..2·len)
+        // before returning; every exposed slot is initialized on exit.
+        unsafe { out.set_len(2 * len) };
         // For each existing entry i ∈ [0, len), produce two children:
         //   out[i]       *= (1 + r_j)     ← new bit_j = 0
         //   out[i + len]  = out[i] * r_j  ← new bit_j = 1
-        // Forward iteration is safe: the [i] and [i+len] slots are disjoint.
-        for i in 0..len {
-            let v = out[i];
-            out[i + len] = v * r_j;
-            out[i] = v * one_plus_r_j;
+        let (lo, hi) = out.split_at_mut(len);
+        if len >= 4096 {
+            lo.par_iter_mut()
+                .zip(hi.par_iter_mut())
+                .with_min_len(1024)
+                .for_each(|(l, h)| {
+                    let v = *l;
+                    *h = v * r_j;
+                    *l = v * one_plus_r_j;
+                });
+        } else {
+            for i in 0..len {
+                let v = lo[i];
+                hi[i] = v * r_j;
+                lo[i] = v * one_plus_r_j;
+            }
         }
     }
     out
