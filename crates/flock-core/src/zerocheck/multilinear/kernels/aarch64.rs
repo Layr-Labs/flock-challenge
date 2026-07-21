@@ -1,5 +1,28 @@
 use crate::field::{F128, F256Unreduced};
 
+/// Non-temporal store of two adjacent `F128` values via `stnp`. Bypasses the
+/// read-for-ownership fetch on write-allocate, which is pure waste for the
+/// streaming tail outputs (only read once, next round, sequentially) at the
+/// large early rounds whose `a_out`/`b_out` exceed the caches.
+#[inline(always)]
+#[cfg(target_arch = "aarch64")]
+unsafe fn stnp_pair(a: F128, b: F128, dst: *mut F128) {
+    use core::arch::aarch64::uint8x16_t;
+    // SAFETY: F128 and uint8x16_t are both 16-byte, 16-byte-aligned POD; the
+    // reinterpret is a bit-level view with no UB.
+    let av: uint8x16_t = unsafe { core::mem::transmute(a) };
+    let bv: uint8x16_t = unsafe { core::mem::transmute(b) };
+    unsafe {
+        std::arch::asm!(
+            "stnp {a:q}, {b:q}, [{dst}]",
+            a = in(vreg) av,
+            b = in(vreg) bv,
+            dst = in(reg) dst,
+            options(nostack, preserves_flags),
+        );
+    }
+}
+
 /// Fold two adjacent output values while keeping both results in registers.
 /// `out_base` is measured in folded/output elements, so the four source
 /// elements begin at `2 * out_base`.
@@ -29,6 +52,12 @@ unsafe fn fold_two(src: &[F128], out_base: usize, r: F128) -> [F128; 2] {
 /// avoidable reads. This kernel uses the same two-output PMULL fold primitive,
 /// but consumes each pair directly from registers before moving on.
 ///
+/// When `a_out` is large enough to exceed the caches (the early tail rounds),
+/// the folded outputs are written with non-temporal `stnp` stores: the next
+/// round reads them once, sequentially, so the write-allocate RFO fetch is
+/// pure waste. Small rounds keep regular stores so the data stays hot for the
+/// immediate next-round read.
+///
 /// # Safety
 /// Requires the `aes` target feature. The caller must provide
 /// `a_in.len() == b_in.len() == 2 * a_out.len()`, equal output lengths, and
@@ -48,6 +77,13 @@ pub(crate) unsafe fn fold_and_message_neon(
     debug_assert_eq!(a_out.len(), 2 * eq_lo.len());
     debug_assert_eq!(eq_lo.len() & 1, 0);
 
+    // Non-temporal stores only when the output is larger than the L2: below
+    // that, regular stores keep the next round's read cache-hot.
+    #[cfg(target_arch = "aarch64")]
+    let use_nt = a_out.len() * core::mem::size_of::<F128>() >= (1 << 21); // >= 2 MiB
+    #[cfg(not(target_arch = "aarch64"))]
+    let use_nt = false;
+
     let mut p1_acc = F256Unreduced::ZERO;
     let mut pinf_acc = F256Unreduced::ZERO;
     let mut x_lo = 0;
@@ -61,14 +97,26 @@ pub(crate) unsafe fn fold_and_message_neon(
         let ba = unsafe { fold_two(b_in, o, r_fold) };
         let bb = unsafe { fold_two(b_in, o + 2, r_fold) };
 
-        a_out[o] = aa[0];
-        a_out[o + 1] = aa[1];
-        a_out[o + 2] = ab[0];
-        a_out[o + 3] = ab[1];
-        b_out[o] = ba[0];
-        b_out[o + 1] = ba[1];
-        b_out[o + 2] = bb[0];
-        b_out[o + 3] = bb[1];
+        if use_nt {
+            #[cfg(target_arch = "aarch64")]
+            unsafe {
+                let ap = a_out.as_mut_ptr().add(o);
+                let bp = b_out.as_mut_ptr().add(o);
+                stnp_pair(aa[0], aa[1], ap);
+                stnp_pair(ab[0], ab[1], ap.add(2));
+                stnp_pair(ba[0], ba[1], bp);
+                stnp_pair(bb[0], bb[1], bp.add(2));
+            }
+        } else {
+            a_out[o] = aa[0];
+            a_out[o + 1] = aa[1];
+            a_out[o + 2] = ab[0];
+            a_out[o + 3] = ab[1];
+            b_out[o] = ba[0];
+            b_out[o + 1] = ba[1];
+            b_out[o + 2] = bb[0];
+            b_out[o + 3] = bb[1];
+        }
 
         let g1_a = aa[1] * ba[1];
         let g1_b = ab[1] * bb[1];
