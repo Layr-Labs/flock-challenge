@@ -530,6 +530,98 @@ impl AdditiveNttF128 {
         );
     }
 
+    /// Apply the exact production deep-layer schedule for one 2 MiB subgroup
+    /// of the `log_d=20`, 64-lane structured encoding. The fused groups and
+    /// twiddles are identical to the generic breadth-first loop below; only
+    /// their independent child order changes so a 512 KiB child remains hot
+    /// through its 64 KiB and 8 KiB descendants.
+    #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+    #[inline]
+    fn forward_transform_interleaved_depth_first_log20x64_subgroup(
+        &self,
+        data: &mut [F128],
+        sub_idx: usize,
+    ) {
+        const LOG_D: usize = 20;
+        const NUM_NTTS: usize = 64;
+        const DENSE_LANES: usize = 57;
+        const ROOT_LAYER: usize = 9;
+
+        debug_assert_eq!(data.len(), (1usize << (LOG_D - ROOT_LAYER)) * NUM_NTTS);
+
+        // The leading fused-2 pass is the unique layer-9 block owned by this
+        // subgroup. Its four outputs are independent 512 KiB children.
+        let root_rows = 1usize << (LOG_D - ROOT_LAYER);
+        butterfly_interleaved_fused_2layer_rows(
+            data,
+            self.twiddle(ROOT_LAYER, sub_idx),
+            self.twiddle(ROOT_LAYER + 1, 2 * sub_idx),
+            self.twiddle(ROOT_LAYER + 1, 2 * sub_idx + 1),
+            root_rows >> 2,
+            NUM_NTTS,
+            Some(DENSE_LANES),
+        );
+
+        const CHILD_512K_LEN: usize = (1usize << (LOG_D - 11)) * NUM_NTTS;
+        const CHILD_64K_LEN: usize = (1usize << (LOG_D - 14)) * NUM_NTTS;
+        const CHILD_8K_LEN: usize = (1usize << (LOG_D - 17)) * NUM_NTTS;
+
+        for child_512k in 0..4 {
+            let block_11 = sub_idx * 4 + child_512k;
+            let start_512k = child_512k * CHILD_512K_LEN;
+            let data_512k = &mut data[start_512k..start_512k + CHILD_512K_LEN];
+            self.forward_transform_interleaved_fused_3_log20x64(data_512k, 11, block_11);
+
+            for child_64k in 0..8 {
+                let block_14 = block_11 * 8 + child_64k;
+                let start_64k = child_64k * CHILD_64K_LEN;
+                let data_64k = &mut data_512k[start_64k..start_64k + CHILD_64K_LEN];
+                self.forward_transform_interleaved_fused_3_log20x64(data_64k, 14, block_14);
+
+                for child_8k in 0..8 {
+                    let block_17 = block_14 * 8 + child_8k;
+                    let start_8k = child_8k * CHILD_8K_LEN;
+                    self.forward_transform_interleaved_fused_3_log20x64(
+                        &mut data_64k[start_8k..start_8k + CHILD_8K_LEN],
+                        17,
+                        block_17,
+                    );
+                }
+            }
+        }
+    }
+
+    #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+    #[inline]
+    fn forward_transform_interleaved_fused_3_log20x64(
+        &self,
+        block: &mut [F128],
+        layer: usize,
+        global_block: usize,
+    ) {
+        const LOG_D: usize = 20;
+        const NUM_NTTS: usize = 64;
+        const DENSE_LANES: usize = 57;
+
+        let block_rows = 1usize << (LOG_D - layer);
+        debug_assert_eq!(block.len(), block_rows * NUM_NTTS);
+        let mut twiddles = [F128::ZERO; 7];
+        twiddles[0] = self.twiddle(layer, global_block);
+        for s in 0..2 {
+            twiddles[1 + s] = self.twiddle(layer + 1, 2 * global_block + s);
+        }
+        for s in 0..4 {
+            twiddles[3 + s] = self.twiddle(layer + 2, 4 * global_block + s);
+        }
+        butterfly_interleaved_fused_3layer_rows(
+            block,
+            &twiddles,
+            block_rows >> 3,
+            NUM_NTTS,
+            Some(DENSE_LANES),
+        );
+    }
+
     #[cfg(any(
         all(target_arch = "aarch64", target_feature = "aes"),
         all(target_arch = "x86_64", target_feature = "pclmulqdq"),
@@ -707,6 +799,19 @@ impl AdditiveNttF128 {
         data.par_chunks_mut(sub_bytes)
             .enumerate()
             .for_each(|(sub_idx, sub_data)| {
+                #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+                if log_d == 20
+                    && num_ntts == 64
+                    && n_top == 9
+                    && start_layer == 4
+                    && odd_row_dense_lanes == Some(57)
+                {
+                    self.forward_transform_interleaved_depth_first_log20x64_subgroup(
+                        sub_data, sub_idx,
+                    );
+                    return;
+                }
+
                 let mut layer = n_top.max(start_layer);
                 while layer < log_d {
                     let layer_in_sub = layer - n_top;
@@ -1492,6 +1597,78 @@ mod tests {
 
     fn rand_vec(rng: &mut Rng, n: usize) -> Vec<F128> {
         (0..n).map(|_| rng.f128()).collect()
+    }
+
+    #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+    fn apply_log20x64_breadth_first_reference(
+        ntt: &AdditiveNttF128,
+        data: &mut [F128],
+        sub_idx: usize,
+    ) {
+        const LOG_D: usize = 20;
+        const ROOT_LAYER: usize = 9;
+        const NUM_NTTS: usize = 64;
+        const DENSE_LANES: usize = 57;
+
+        let mut layer = ROOT_LAYER;
+        while layer < LOG_D {
+            let num_blocks = 1usize << (layer - ROOT_LAYER);
+            let block_rows = 1usize << (LOG_D - layer);
+            let block_len = block_rows * NUM_NTTS;
+            let remaining = LOG_D - layer;
+            let width = if remaining >= 3 && remaining % 3 == 0 {
+                3
+            } else {
+                2
+            };
+            for local_block in 0..num_blocks {
+                let global_block = sub_idx * num_blocks + local_block;
+                let start = local_block * block_len;
+                let block = &mut data[start..start + block_len];
+                if width == 2 {
+                    butterfly_interleaved_fused_2layer_rows(
+                        block,
+                        ntt.twiddle(layer, global_block),
+                        ntt.twiddle(layer + 1, 2 * global_block),
+                        ntt.twiddle(layer + 1, 2 * global_block + 1),
+                        block_rows >> 2,
+                        NUM_NTTS,
+                        Some(DENSE_LANES),
+                    );
+                } else {
+                    ntt.forward_transform_interleaved_fused_3_log20x64(block, layer, global_block);
+                }
+            }
+            layer += width;
+        }
+    }
+
+    #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+    #[test]
+    fn depth_first_log20x64_subgroup_matches_breadth_first() {
+        const LOG_D: usize = 20;
+        const ROOT_LAYER: usize = 9;
+        const NUM_NTTS: usize = 64;
+        const DENSE_LANES: usize = 57;
+
+        let len = (1usize << (LOG_D - ROOT_LAYER)) * NUM_NTTS;
+        let mut rng = Rng::new(0xD3F7_2F15);
+        let mut original = rand_vec(&mut rng, len);
+        for row in (1..(len / NUM_NTTS)).step_by(2) {
+            original[row * NUM_NTTS + DENSE_LANES..(row + 1) * NUM_NTTS].fill(F128::ZERO);
+        }
+
+        let ntt = AdditiveNttF128::standard(LOG_D);
+        for sub_idx in [0, 173, 511] {
+            let mut breadth_first = original.clone();
+            let mut depth_first = original.clone();
+            apply_log20x64_breadth_first_reference(&ntt, &mut breadth_first, sub_idx);
+            ntt.forward_transform_interleaved_depth_first_log20x64_subgroup(
+                &mut depth_first,
+                sub_idx,
+            );
+            assert_eq!(depth_first, breadth_first, "sub_idx={sub_idx}");
+        }
     }
 
     #[test]
