@@ -185,6 +185,30 @@ pub(crate) fn init_ecore_sidecar_if_enabled() {
     }
 }
 
+/// Execute independent indexed tasks on the already-initialized Apple P/E
+/// sidecar. Returns `false` without executing a task when the topology,
+/// environment, QoS validation, or sidecar reservation is unavailable.
+///
+/// # Safety
+///
+/// `context_addr` must stay live until this synchronous call returns.
+/// `process_task` must map distinct indices to disjoint mutable state and must
+/// not unwind.
+#[cfg(all(target_os = "macos", target_arch = "aarch64", target_feature = "sha2"))]
+pub(crate) unsafe fn try_run_indexed_with_ecore(
+    context_addr: usize,
+    process_task: unsafe fn(context_addr: usize, task: usize),
+    n_tasks: usize,
+    allow_ecores: bool,
+) -> bool {
+    if !ecore_sidecar_enabled() {
+        return false;
+    }
+    // SAFETY: forwarded contract is identical to this function's contract.
+    unsafe { ecore_sidecar::run_indexed(context_addr, process_task, n_tasks, allow_ecores) }
+        .is_some()
+}
+
 #[cfg(all(target_os = "macos", target_arch = "aarch64", target_feature = "sha2"))]
 fn try_hash_quads_with_ecore(
     enabled: bool,
@@ -688,6 +712,9 @@ pub fn verify_merkle_multi_proof(
 mod tests {
     use super::*;
 
+    #[cfg(all(target_os = "macos", target_arch = "aarch64", target_feature = "sha2"))]
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
     #[test]
     fn two_leaves_matches_hand_computation() {
         // Two 8-byte leaves: [0,1,2,3,4,5,6,7] and [8,9,10,11,12,13,14,15].
@@ -948,6 +975,66 @@ mod tests {
         assert!(
             ecore_sidecar::init(),
             "the completed generation left the sidecar healthy"
+        );
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64", target_feature = "sha2"))]
+    struct IndexedTestContext {
+        slots_addr: usize,
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64", target_feature = "sha2"))]
+    unsafe fn mark_indexed_test_task(context_addr: usize, task: usize) {
+        // SAFETY: the synchronous test call keeps the context and its 512
+        // atomic slots alive; every admitted task index is in that range.
+        let context = unsafe { &*(context_addr as *const IndexedTestContext) };
+        let slot = unsafe { &*((context.slots_addr as *const AtomicUsize).add(task)) };
+        slot.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// The generic indexed path used by the NTT must preserve the sidecar's
+    /// exact-once cursor law independently of SHA message geometry.
+    #[cfg(all(target_os = "macos", target_arch = "aarch64", target_feature = "sha2"))]
+    #[test]
+    fn ecore_sidecar_indexed_tasks_are_exactly_once() {
+        let _serial = ecore_sidecar::test_serial_guard();
+        let Some(performance_cores) = ecore_sidecar::performance_core_count() else {
+            return;
+        };
+        let rayon_workers = performance_cores.min(10);
+        if rayon_workers < 2 {
+            return;
+        }
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(rayon_workers)
+            .build()
+            .unwrap();
+        assert!(ecore_sidecar::init(), "sidecar QoS capability gate");
+
+        let slots: Vec<AtomicUsize> = (0..512).map(|_| AtomicUsize::new(0)).collect();
+        let context = IndexedTestContext {
+            slots_addr: slots.as_ptr() as usize,
+        };
+        let submissions_before = ecore_sidecar::submission_count();
+        let submitted = pool.install(|| unsafe {
+            try_run_indexed_with_ecore(
+                &context as *const IndexedTestContext as usize,
+                mark_indexed_test_task,
+                slots.len(),
+                true,
+            )
+        });
+        assert!(submitted, "indexed work must use the initialized sidecar");
+        assert_eq!(
+            ecore_sidecar::submission_count() - submissions_before,
+            1,
+            "one indexed call publishes one generation"
+        );
+        assert!(
+            slots
+                .iter()
+                .all(|slot| slot.load(Ordering::Relaxed) == 1),
+            "every indexed task must execute exactly once"
         );
     }
 

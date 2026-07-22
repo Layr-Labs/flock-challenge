@@ -112,6 +112,71 @@ pub struct AdditiveNttF128 {
     twiddles: Arc<Vec<Vec<F128>>>,
 }
 
+#[cfg(all(
+    target_os = "macos",
+    target_arch = "aarch64",
+    target_feature = "aes",
+    target_feature = "sha2",
+))]
+const NTT_ECORE_TASKS: usize = 1 << 9;
+#[cfg(all(
+    target_os = "macos",
+    target_arch = "aarch64",
+    target_feature = "aes",
+    target_feature = "sha2",
+))]
+const NTT_ECORE_SUB_ELEMENTS: usize = (1 << (20 - 9)) * 64;
+
+#[cfg(all(
+    target_os = "macos",
+    target_arch = "aarch64",
+    target_feature = "aes",
+    target_feature = "sha2",
+))]
+struct NttEcoreContext {
+    ntt_addr: usize,
+    data_addr: usize,
+}
+
+#[cfg(all(
+    target_os = "macos",
+    target_arch = "aarch64",
+    target_feature = "aes",
+    target_feature = "sha2",
+))]
+unsafe fn process_ntt_ecore_task(context_addr: usize, sub_idx: usize) {
+    // SAFETY: the synchronous sidecar call keeps the NTT, context, and full
+    // data buffer alive. Its atomic cursor assigns every 2 MiB subgroup to
+    // exactly one worker, so the reconstructed mutable slices are disjoint.
+    let context = unsafe { &*(context_addr as *const NttEcoreContext) };
+    let ntt = unsafe { &*(context.ntt_addr as *const AdditiveNttF128) };
+    let sub_data = unsafe {
+        core::slice::from_raw_parts_mut(
+            (context.data_addr as *mut F128).add(sub_idx * NTT_ECORE_SUB_ELEMENTS),
+            NTT_ECORE_SUB_ELEMENTS,
+        )
+    };
+    ntt.forward_transform_interleaved_depth_first_log20x64_subgroup(sub_data, sub_idx);
+}
+
+#[cfg(all(
+    target_os = "macos",
+    target_arch = "aarch64",
+    target_feature = "aes",
+    target_feature = "sha2",
+))]
+fn ntt_ecore_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| match std::env::var("FLOCK_NTT_ECORE_MODE") {
+        Ok(value) => matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "on" | "cooperative" | "p+e"
+        ),
+        Err(std::env::VarError::NotPresent) => true,
+        Err(std::env::VarError::NotUnicode(_)) => false,
+    })
+}
+
 impl AdditiveNttF128 {
     /// Construct an NTT from an explicit F_2-basis.
     pub fn new(basis: &[F128]) -> Self {
@@ -795,6 +860,44 @@ impl AdditiveNttF128 {
         // Deep layers: process each sub-NTT-group cache-resident.
         let sub_size_positions = 1usize << (log_d - n_top);
         let sub_bytes = sub_size_positions * num_ntts;
+
+        #[cfg(all(
+            target_os = "macos",
+            target_arch = "aarch64",
+            target_feature = "aes",
+            target_feature = "sha2",
+        ))]
+        if ntt_ecore_enabled()
+            && log_d == 20
+            && num_ntts == 64
+            && n_top == 9
+            && start_layer == 4
+            && odd_row_dense_lanes == Some(57)
+            && sub_bytes == NTT_ECORE_SUB_ELEMENTS
+            && data.len() == NTT_ECORE_TASKS * NTT_ECORE_SUB_ELEMENTS
+            && rayon::current_num_threads() == 10
+        {
+            let context = NttEcoreContext {
+                ntt_addr: self as *const Self as usize,
+                data_addr: data.as_mut_ptr() as usize,
+            };
+            // SAFETY:
+            // - the exact production geometry contains 512 disjoint 2 MiB
+            //   subgroups, and task `i` maps only to subgroup `i`;
+            // - `self`, `context`, and `data` outlive this synchronous call;
+            // - a failed sidecar reservation executes no task, so the normal
+            //   Rayon fallback below still owns the untouched deep layers.
+            if unsafe {
+                crate::merkle::try_run_indexed_with_ecore(
+                    &context as *const NttEcoreContext as usize,
+                    process_ntt_ecore_task,
+                    NTT_ECORE_TASKS,
+                    true,
+                )
+            } {
+                return;
+            }
+        }
 
         data.par_chunks_mut(sub_bytes)
             .enumerate()

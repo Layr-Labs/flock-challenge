@@ -19,6 +19,17 @@ const USER_INITIATED_QOS_CLASS: u32 = 0x19;
 const TARGET_COMPRESSIONS_PER_TILE: usize = 1024;
 const P_ONLY_RESERVE_TILES_PER_WORKER: usize = 12;
 
+type IndexedTaskFn = unsafe fn(context_addr: usize, task: usize);
+
+#[derive(Clone, Copy)]
+enum JobWork {
+    Sha,
+    Indexed {
+        context_addr: usize,
+        process_task: IndexedTaskFn,
+    },
+}
+
 unsafe extern "C" {
     fn pthread_self() -> *mut c_void;
     fn pthread_set_qos_class_self_np(qos_class: u32, relative_priority: i32) -> i32;
@@ -224,6 +235,7 @@ impl ConcurrentSubmitHook {
 }
 
 struct Job {
+    work: JobWork,
     input_addr: usize,
     output_addr: usize,
     message_len: usize,
@@ -270,6 +282,7 @@ impl Job {
         let ecore_tile_limit = n_tiles.saturating_sub(p_only_reserve);
 
         Self {
+            work: JobWork::Sha,
             input_addr: input.as_ptr() as usize,
             output_addr: output.as_mut_ptr() as usize,
             message_len,
@@ -279,6 +292,52 @@ impl Job {
             ecore_tile_limit,
             next_tile: AtomicUsize::new(0),
             remaining_tiles: AtomicUsize::new(n_tiles),
+            first_ecore_claim_ns: AtomicU64::new(0),
+            ecore_tiles: AtomicUsize::new(0),
+            pcore_tiles: AtomicUsize::new(0),
+            completion_owner: AtomicUsize::new(0),
+            completed: AtomicBool::new(false),
+            worker_first_claim_ns: std::array::from_fn(|_| AtomicU64::new(0)),
+            worker_last_finish_ns: std::array::from_fn(|_| AtomicU64::new(0)),
+            worker_tiles: std::array::from_fn(|_| AtomicUsize::new(0)),
+            published: OnceLock::new(),
+            done_lock: Mutex::new(()),
+            done: Condvar::new(),
+            #[cfg(test)]
+            delayed_claim_hook,
+        }
+    }
+
+    fn new_indexed(
+        context_addr: usize,
+        process_task: IndexedTaskFn,
+        n_tasks: usize,
+        allow_ecores: bool,
+        #[cfg(test)] delayed_claim_hook: Option<Arc<DelayedClaimHook>>,
+    ) -> Self {
+        assert_ne!(context_addr, 0);
+        assert!(n_tasks > 0);
+        let p_only_reserve = P_ONLY_RESERVE_TILES_PER_WORKER * rayon::current_num_threads().max(1);
+        let ecore_tile_limit = if allow_ecores {
+            n_tasks.saturating_sub(p_only_reserve)
+        } else {
+            0
+        };
+
+        Self {
+            work: JobWork::Indexed {
+                context_addr,
+                process_task,
+            },
+            input_addr: 0,
+            output_addr: 0,
+            message_len: 0,
+            n_quads: 0,
+            tile_quads: 1,
+            n_tiles: n_tasks,
+            ecore_tile_limit,
+            next_tile: AtomicUsize::new(0),
+            remaining_tiles: AtomicUsize::new(n_tasks),
             first_ecore_claim_ns: AtomicU64::new(0),
             ecore_tiles: AtomicUsize::new(0),
             pcore_tiles: AtomicUsize::new(0),
@@ -410,6 +469,18 @@ impl Job {
 
     #[inline]
     fn process_tile(&self, tile: usize) {
+        if let JobWork::Indexed {
+            context_addr,
+            process_task,
+        } = self.work
+        {
+            // SAFETY: the synchronous indexed submitter keeps the context
+            // alive, and every cursor value names a disjoint mutable task.
+            unsafe { process_task(context_addr, tile) };
+            return;
+        }
+
+        debug_assert!(matches!(self.work, JobWork::Sha));
         let quad_start = tile * self.tile_quads;
         let quad_end = (quad_start + self.tile_quads).min(self.n_quads);
         for quad in quad_start..quad_end {
@@ -688,6 +759,43 @@ impl Sidecar {
             #[cfg(test)]
             delayed_claim_hook,
         ));
+        Some(self.execute_job(job))
+    }
+
+    fn run_indexed(
+        &self,
+        context_addr: usize,
+        process_task: IndexedTaskFn,
+        n_tasks: usize,
+        allow_ecores: bool,
+    ) -> Option<RunStats> {
+        if !self.healthy.load(Ordering::Acquire) {
+            return None;
+        }
+        // Indexed and SHA jobs share one process-lifetime worker reservation.
+        // A concurrent caller falls back instead of waiting on stack-borrowed
+        // indexed state from another generation.
+        let Ok(_submit) = self.submit.try_lock() else {
+            return None;
+        };
+        #[cfg(test)]
+        if let Some(hook) = self.concurrent_submit_hook.lock().unwrap().take() {
+            hook.hold_submit_owner();
+        }
+        #[cfg(test)]
+        let delayed_claim_hook = self.delayed_claim_hook.lock().unwrap().take();
+        let job = Arc::new(Job::new_indexed(
+            context_addr,
+            process_task,
+            n_tasks,
+            allow_ecores,
+            #[cfg(test)]
+            delayed_claim_hook,
+        ));
+        Some(self.execute_job(job))
+    }
+
+    fn execute_job(&self, job: Arc<Job>) -> RunStats {
         self.submissions.fetch_add(1, Ordering::Relaxed);
 
         {
@@ -713,7 +821,20 @@ impl Sidecar {
 
         // Give each Rayon worker one long-lived drainer. The P and E workers
         // then share only `next_tile`; no static fraction or suffix exists.
-        rayon::broadcast(|_| job.drain(None));
+        match job.work {
+            JobWork::Sha => rayon::broadcast(|_| job.drain(None)),
+            JobWork::Indexed { .. } => rayon::broadcast(|_| {
+                // An indexed callback borrows stack-owned context via a raw
+                // address. Once any task is published to helpers, unwinding a
+                // P drainer could release that context while it remains in use.
+                // Match the process-lifetime helper policy and fail-stop.
+                if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| job.drain(None)))
+                    .is_err()
+                {
+                    std::process::abort();
+                }
+            }),
+        };
 
         let pcore_done = Instant::now();
         for _ in 0..256 {
@@ -770,7 +891,7 @@ impl Sidecar {
         }
 
         let first = job.first_ecore_claim_ns.load(Ordering::Relaxed);
-        Some(RunStats {
+        RunStats {
             first_ecore_claim_ns: (first != 0).then_some(first),
             ecore_tail_ns,
             ecore_tiles: job.ecore_tiles.load(Ordering::Relaxed),
@@ -790,7 +911,7 @@ impl Sidecar {
             qos_override_started,
             qos_override_start_failures,
             qos_override_end_failures,
-        })
+        }
     }
 }
 
@@ -881,6 +1002,27 @@ pub(super) fn run(input: &[u8], message_len: usize, output: &mut [Hash]) -> Opti
     let sidecar = initialized_sidecar()?;
     valid_qos(sidecar).then_some(())?;
     sidecar.run(input, message_len, output)
+}
+
+/// Run a synchronous indexed job on the shared P/E worker reservation.
+///
+/// # Safety
+///
+/// `context_addr` must remain valid until this call returns. `process_task`
+/// must accept every index in `0..n_tasks`; concurrent distinct indices must
+/// touch disjoint mutable state, and the callback must not unwind.
+pub(super) unsafe fn run_indexed(
+    context_addr: usize,
+    process_task: IndexedTaskFn,
+    n_tasks: usize,
+    allow_ecores: bool,
+) -> Option<RunStats> {
+    if !pool_shape_is_supported() {
+        return None;
+    }
+    let sidecar = initialized_sidecar()?;
+    valid_qos(sidecar).then_some(())?;
+    sidecar.run_indexed(context_addr, process_task, n_tasks, allow_ecores)
 }
 
 pub(super) fn qos_diagnostics() -> Option<QosDiagnostics> {
