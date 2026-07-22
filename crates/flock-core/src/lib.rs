@@ -59,6 +59,10 @@ pub fn init_perf_thread_pool() -> Option<usize> {
         // In particular, do not call `perf_core_count()` here: its legacy
         // best-effort child `sysctl` is denied by the ranked Seatbelt.
         merkle::init_ecore_sidecar_if_enabled();
+        // The ranked harness sets RAYON_NUM_THREADS explicitly. Prebuild the
+        // Metal pipeline here as well so its Objective-C/Metal initialization
+        // remains outside every warmup and measured proof.
+        merkle::init_metal_hybrid_if_enabled();
         return None;
     }
     let n = perf_core_count();
@@ -74,6 +78,11 @@ pub fn init_perf_thread_pool() -> Option<usize> {
     // a pre-existing default pool that spills onto E cores. With its strict
     // env switch off this is a no-op on every target.
     merkle::init_ecore_sidecar_if_enabled();
+    // The fixed no-copy Metal L0 candidate defaults on for supported Apple
+    // builds, with an explicit false kill switch and exact-shape guard. Build
+    // its process-lifetime pipeline before the first proof so setup, not a
+    // timed proof, owns Objective-C/Metal initialization.
+    merkle::init_metal_hybrid_if_enabled();
     configured
 }
 

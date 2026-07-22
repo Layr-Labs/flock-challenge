@@ -121,6 +121,11 @@ pub(crate) use sha256x4::hash4_pow;
 #[path = "merkle/ecore_sidecar.rs"]
 mod ecore_sidecar;
 
+/// Exact-shape, no-copy Metal suffix for the production L0 leaf level.
+#[cfg(all(target_os = "macos", target_arch = "aarch64", target_feature = "sha2"))]
+#[path = "merkle/metal_hybrid.rs"]
+mod metal_hybrid;
+
 /// Four SHA-256 streams interleaved across the x86 SHA-NI pipeline.
 ///
 /// SHA-NI accelerates one stream but retains a dependent state chain. Running
@@ -165,6 +170,34 @@ fn ecore_sidecar_enabled() -> bool {
     false
 }
 
+#[cfg(all(target_os = "macos", target_arch = "aarch64", target_feature = "sha2"))]
+fn metal_hybrid_enabled() -> bool {
+    #[cfg(feature = "hash-count")]
+    match METAL_HYBRID_BENCH_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed) {
+        0 => return false,
+        1 => return true,
+        _ => {}
+    }
+    default_enabled_env("FLOCK_MERKLE_METAL_HYBRID")
+}
+
+#[cfg(not(all(target_os = "macos", target_arch = "aarch64", target_feature = "sha2")))]
+fn metal_hybrid_enabled() -> bool {
+    false
+}
+
+/// Same-binary backend selector for deterministic proof harnesses. The
+/// ranked production binary does not compile this diagnostic override.
+#[cfg(feature = "hash-count")]
+static METAL_HYBRID_BENCH_OVERRIDE: std::sync::atomic::AtomicI8 =
+    std::sync::atomic::AtomicI8::new(-1);
+
+#[cfg(feature = "hash-count")]
+#[doc(hidden)]
+pub fn set_metal_hybrid_bench_enabled(enabled: bool) {
+    METAL_HYBRID_BENCH_OVERRIDE.store(i8::from(enabled), std::sync::atomic::Ordering::Relaxed);
+}
+
 /// Spawn and SHA-prewarm the process-lifetime sidecar during normal prover
 /// initialization. On supported Apple topology this is default-on; an
 /// explicit false switch and all non-Apple targets remain strict no-ops.
@@ -183,6 +216,41 @@ pub(crate) fn init_ecore_sidecar_if_enabled() {
             });
         }
     }
+}
+
+/// Build and retain the exact metallib pipeline before the first proof. The
+/// Apple candidate defaults on, retains an explicit false kill switch, and is
+/// still restricted to its exact L0 geometry. Initialization failure is fatal:
+/// there is no copied-buffer or silently different CPU fallback when enabled.
+pub(crate) fn init_metal_hybrid_if_enabled() {
+    #[cfg(all(target_os = "macos", target_arch = "aarch64", target_feature = "sha2"))]
+    if metal_hybrid_enabled() {
+        metal_hybrid::init()
+            .unwrap_or_else(|error| panic!("Metal L0 hybrid initialization failed: {error}"));
+    }
+}
+
+#[cfg(all(
+    feature = "hash-count",
+    target_os = "macos",
+    target_arch = "aarch64",
+    target_feature = "sha2"
+))]
+#[doc(hidden)]
+pub use metal_hybrid::HybridStats as MetalHybridTelemetry;
+
+/// Take the one exact-L0 Metal record produced by the preceding proof. This
+/// exists only in hash-count diagnostic binaries and moves the record without
+/// touching production timing or ownership paths.
+#[cfg(all(
+    feature = "hash-count",
+    target_os = "macos",
+    target_arch = "aarch64",
+    target_feature = "sha2"
+))]
+#[doc(hidden)]
+pub fn take_metal_hybrid_bench_telemetry() -> Option<MetalHybridTelemetry> {
+    metal_hybrid::take_test_stats()
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64", target_feature = "sha2"))]
@@ -301,6 +369,60 @@ pub fn hash_pair(left: &Hash, right: &Hash) -> Hash {
     h.finalize().into()
 }
 
+#[cfg(any(
+    all(target_arch = "aarch64", target_feature = "sha2"),
+    all(target_arch = "x86_64", target_feature = "sha")
+))]
+fn hash_leaf_range_cpu(
+    use_ecore_sidecar: bool,
+    label: &str,
+    data: &[u8],
+    leaf_size: usize,
+    output: &mut [Hash],
+) {
+    debug_assert_eq!(data.len(), output.len() * leaf_size);
+    if try_hash_quads_with_ecore(use_ecore_sidecar, label, data, leaf_size, output) {
+        #[cfg(feature = "hash-count")]
+        {
+            use std::sync::atomic::Ordering::Relaxed;
+            hash_count::LEAF_CALLS.fetch_add(output.len() as u64, Relaxed);
+            hash_count::LEAF_COMPRESSIONS.fetch_add(
+                output.len() as u64 * hash_count::sha256_blocks(leaf_size),
+                Relaxed,
+            );
+        }
+        return;
+    }
+
+    output
+        .par_chunks_mut(4)
+        .zip(data.par_chunks(4 * leaf_size))
+        .for_each(|(outs, leaves)| {
+            if outs.len() == 4 {
+                #[cfg(feature = "hash-count")]
+                {
+                    use std::sync::atomic::Ordering::Relaxed;
+                    hash_count::LEAF_CALLS.fetch_add(4, Relaxed);
+                    hash_count::LEAF_COMPRESSIONS
+                        .fetch_add(4 * hash_count::sha256_blocks(leaf_size), Relaxed);
+                }
+                sha256x4::hash4_equal_len(
+                    [
+                        &leaves[..leaf_size],
+                        &leaves[leaf_size..2 * leaf_size],
+                        &leaves[2 * leaf_size..3 * leaf_size],
+                        &leaves[3 * leaf_size..],
+                    ],
+                    outs,
+                );
+            } else {
+                for (out, leaf) in outs.iter_mut().zip(leaves.chunks(leaf_size)) {
+                    *out = hash_leaf(leaf);
+                }
+            }
+        });
+}
+
 /// Compute the Merkle root of `data` split into `num_leaves` equal-sized leaves.
 ///
 /// Multi-threaded via rayon. `num_leaves` must be a power of two and divide
@@ -318,6 +440,17 @@ pub fn merkle_tree(data: &[u8], num_leaves: usize) -> Vec<Hash> {
 }
 
 fn merkle_tree_impl(data: &[u8], num_leaves: usize, use_ecore_sidecar: bool) -> Vec<Hash> {
+    merkle_tree_impl_options(data, num_leaves, use_ecore_sidecar, metal_hybrid_enabled())
+}
+
+fn merkle_tree_impl_options(
+    data: &[u8],
+    num_leaves: usize,
+    use_ecore_sidecar: bool,
+    use_metal_hybrid: bool,
+) -> Vec<Hash> {
+    #[cfg(not(all(target_os = "macos", target_arch = "aarch64", target_feature = "sha2")))]
+    let _ = use_metal_hybrid;
     assert!(
         num_leaves.is_power_of_two() && num_leaves > 0,
         "num_leaves must be power of 2"
@@ -341,45 +474,44 @@ fn merkle_tree_impl(data: &[u8], num_leaves: usize, use_ecore_sidecar: bool) -> 
     ))]
     {
         let leaves_out = &mut tree[..num_leaves];
-        if try_hash_quads_with_ecore(use_ecore_sidecar, "leaves", data, leaf_size, leaves_out) {
+        #[cfg(all(target_os = "macos", target_arch = "aarch64", target_feature = "sha2"))]
+        if use_metal_hybrid && metal_hybrid::matches_exact_l0(data, leaf_size, leaves_out) {
+            let input_split = metal_hybrid::CPU_LEAVES * leaf_size;
+            let (cpu_data, gpu_data) = data.split_at(input_split);
+            let (cpu_output, gpu_output) = leaves_out.split_at_mut(metal_hybrid::CPU_LEAVES);
+
+            // Submit first. The retained no-copy buffers borrow only the GPU
+            // suffix while the CPU/sidecar hashes the disjoint 9/16 prefix.
+            let flight = metal_hybrid::submit(gpu_data, gpu_output)
+                .unwrap_or_else(|error| panic!("Metal L0 suffix submission failed: {error}"));
+            hash_leaf_range_cpu(
+                use_ecore_sidecar,
+                "leaves-cpu-prefix-9of16",
+                cpu_data,
+                leaf_size,
+                cpu_output,
+            );
+            let stats = flight
+                .finish()
+                .unwrap_or_else(|error| panic!("Metal L0 suffix completion failed: {error}"));
+
             #[cfg(feature = "hash-count")]
             {
                 use std::sync::atomic::Ordering::Relaxed;
-                hash_count::LEAF_CALLS.fetch_add(num_leaves as u64, Relaxed);
+                hash_count::LEAF_CALLS.fetch_add(metal_hybrid::GPU_LEAVES as u64, Relaxed);
                 hash_count::LEAF_COMPRESSIONS.fetch_add(
-                    num_leaves as u64 * hash_count::sha256_blocks(leaf_size),
+                    metal_hybrid::GPU_LEAVES as u64
+                        * hash_count::sha256_blocks(metal_hybrid::LEAF_BYTES),
                     Relaxed,
                 );
             }
+            metal_hybrid::trace(stats);
         } else {
-            leaves_out
-                .par_chunks_mut(4)
-                .zip(data.par_chunks(4 * leaf_size))
-                .for_each(|(outs, leaves)| {
-                    if outs.len() == 4 {
-                        #[cfg(feature = "hash-count")]
-                        {
-                            use std::sync::atomic::Ordering::Relaxed;
-                            hash_count::LEAF_CALLS.fetch_add(4, Relaxed);
-                            hash_count::LEAF_COMPRESSIONS
-                                .fetch_add(4 * hash_count::sha256_blocks(leaf_size), Relaxed);
-                        }
-                        sha256x4::hash4_equal_len(
-                            [
-                                &leaves[..leaf_size],
-                                &leaves[leaf_size..2 * leaf_size],
-                                &leaves[2 * leaf_size..3 * leaf_size],
-                                &leaves[3 * leaf_size..],
-                            ],
-                            outs,
-                        );
-                    } else {
-                        for (out, leaf) in outs.iter_mut().zip(leaves.chunks(leaf_size)) {
-                            *out = hash_leaf(leaf);
-                        }
-                    }
-                });
+            hash_leaf_range_cpu(use_ecore_sidecar, "leaves", data, leaf_size, leaves_out);
         }
+
+        #[cfg(not(all(target_os = "macos", target_arch = "aarch64", target_feature = "sha2")))]
+        hash_leaf_range_cpu(use_ecore_sidecar, "leaves", data, leaf_size, leaves_out);
     }
     #[cfg(not(any(
         all(target_arch = "aarch64", target_feature = "sha2"),
@@ -741,6 +873,221 @@ mod tests {
             let seq = merkle_tree_sequential(&data, n_leaves);
             assert_eq!(par, seq, "n_leaves={n_leaves} leaf_size={leaf_size}");
         }
+    }
+
+    /// One untimed exact-shape integration gate. It compares every L0 digest
+    /// and every parent node against the unchanged all-CPU implementation;
+    /// the Metal bridge separately emits the VM/no-copy/dispatch evidence.
+    #[cfg(all(target_os = "macos", target_arch = "aarch64", target_feature = "sha2"))]
+    #[test]
+    #[ignore = "allocates and hashes the exact 1 GiB production L0 shape"]
+    fn metal_hybrid_exact_l0_and_tree_match_cpu() {
+        if !strict_env_enabled("FLOCK_MERKLE_METAL_HYBRID_EXACT_TEST") {
+            eprintln!(
+                "skipped: set FLOCK_MERKLE_METAL_HYBRID_EXACT_TEST=1 for the exact-shape gate"
+            );
+            return;
+        }
+        use rayon::prelude::*;
+
+        let mut data = vec![0u8; metal_hybrid::TOTAL_LEAVES * metal_hybrid::LEAF_BYTES];
+        data.par_chunks_mut(metal_hybrid::LEAF_BYTES)
+            .enumerate()
+            .for_each(|(leaf_index, leaf)| {
+                let index = (leaf_index as u64).to_le_bytes();
+                let inverse = (!(leaf_index as u64)).to_be_bytes();
+                leaf[..8].copy_from_slice(&index);
+                leaf[8..16].copy_from_slice(&inverse);
+            });
+
+        let workers = crate::perf_core_count_cached().clamp(2, 10);
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(workers)
+            .build()
+            .unwrap();
+        let cpu = pool
+            .install(|| merkle_tree_impl_options(&data, metal_hybrid::TOTAL_LEAVES, false, false));
+        let candidate = pool
+            .install(|| merkle_tree_impl_options(&data, metal_hybrid::TOTAL_LEAVES, false, true));
+
+        if let Some((index, (actual, expected))) = candidate[..metal_hybrid::TOTAL_LEAVES]
+            .iter()
+            .zip(&cpu[..metal_hybrid::TOTAL_LEAVES])
+            .enumerate()
+            .find(|(_, (actual, expected))| actual != expected)
+        {
+            panic!("Metal L0 mismatch at leaf {index}: actual={actual:?}, expected={expected:?}");
+        }
+        if let Some((index, (actual, expected))) = candidate
+            .iter()
+            .zip(&cpu)
+            .enumerate()
+            .find(|(_, (actual, expected))| actual != expected)
+        {
+            panic!("Metal tree mismatch at node {index}: actual={actual:?}, expected={expected:?}");
+        }
+
+        // SAFETY: both completed builders initialized every Copy node.
+        let tree_bytes = unsafe {
+            core::slice::from_raw_parts(
+                candidate.as_ptr().cast::<u8>(),
+                candidate.len() * core::mem::size_of::<Hash>(),
+            )
+        };
+        eprintln!(
+            "[merkle-metal-correctness] input_bytes={} leaves_compared={} nodes_compared={} workers={} tree_blake3={} root={:02x?}",
+            data.len(),
+            metal_hybrid::TOTAL_LEAVES,
+            candidate.len(),
+            workers,
+            blake3::hash(tree_bytes),
+            candidate.last().unwrap(),
+        );
+    }
+
+    /// Focused same-binary paired harness for the fixed exact-m32 split.
+    /// A=all CPU (including the production E-core sidecar), B=hybrid. The
+    /// single input allocation and two warmed tree allocations are reused for
+    /// all ten alternating pairs. This is ignored and separately env-gated so
+    /// normal tests can never turn into a measurement run.
+    #[cfg(all(target_os = "macos", target_arch = "aarch64", target_feature = "sha2"))]
+    #[test]
+    #[ignore = "focused exact-m32 ten-pair CPU/hybrid harness"]
+    fn metal_hybrid_exact_m32_paired_10_harness() {
+        if !strict_env_enabled("FLOCK_MERKLE_METAL_HYBRID_PAIRED_10") {
+            eprintln!("skipped: set FLOCK_MERKLE_METAL_HYBRID_PAIRED_10=1 for the paired harness");
+            return;
+        }
+        assert!(
+            !strict_env_enabled("FLOCK_MERKLE_METAL_HYBRID_TRACE"),
+            "leave FLOCK_MERKLE_METAL_HYBRID_TRACE unset: the harness emits captured telemetry after each timer"
+        );
+        assert!(
+            !strict_env_enabled("FLOCK_MERKLE_ECORE_TRACE"),
+            "leave FLOCK_MERKLE_ECORE_TRACE unset during paired timing"
+        );
+        use rayon::prelude::*;
+
+        let _sidecar_serial = ecore_sidecar::test_serial_guard();
+        TREE_POOL.lock().unwrap().clear();
+        assert!(metal_hybrid::take_test_stats().is_none());
+
+        // The exact 1 GiB codeword is allocated once. Per-leaf headers make
+        // every message distinct while the remaining bytes stay zero.
+        let mut data = vec![0u8; metal_hybrid::TOTAL_LEAVES * metal_hybrid::LEAF_BYTES];
+        data.par_chunks_mut(metal_hybrid::LEAF_BYTES)
+            .enumerate()
+            .for_each(|(leaf_index, leaf)| {
+                let index = (leaf_index as u64).to_le_bytes();
+                let inverse = (!(leaf_index as u64)).to_be_bytes();
+                leaf[..8].copy_from_slice(&index);
+                leaf[8..16].copy_from_slice(&inverse);
+            });
+        let input_pointer = data.as_ptr();
+
+        let workers = crate::perf_core_count_cached().clamp(2, 10);
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(workers)
+            .build()
+            .unwrap();
+        let use_ecore_sidecar = pool.install(|| {
+            let enabled = ecore_sidecar_enabled();
+            if enabled {
+                assert!(ecore_sidecar::init(), "production E-core sidecar init");
+            }
+            enabled
+        });
+        assert!(
+            use_ecore_sidecar,
+            "paired harness requires the production P/E-core topology"
+        );
+
+        let assert_equal = |cpu: &[Hash], hybrid: &[Hash], label: &str| {
+            assert_eq!(cpu.len(), hybrid.len(), "{label}: tree lengths");
+            assert_eq!(cpu.last(), hybrid.last(), "{label}: root bytes");
+            if let Some((index, (cpu_node, hybrid_node))) = cpu
+                .iter()
+                .zip(hybrid)
+                .enumerate()
+                .find(|(_, (cpu_node, hybrid_node))| cpu_node != hybrid_node)
+            {
+                panic!(
+                    "{label}: tree mismatch at node {index}: cpu={cpu_node:?}, hybrid={hybrid_node:?}"
+                );
+            }
+        };
+        let build = |use_metal_hybrid: bool| {
+            let start = std::time::Instant::now();
+            let tree = pool.install(|| {
+                merkle_tree_impl_options(
+                    &data,
+                    metal_hybrid::TOTAL_LEAVES,
+                    use_ecore_sidecar,
+                    use_metal_hybrid,
+                )
+            });
+            (tree, start.elapsed())
+        };
+
+        // One untimed warmup of each arm creates exactly two tree buffers and
+        // initializes Metal, the sidecar, payload pages, and parent levels.
+        let (warm_cpu, _) = build(false);
+        let (warm_hybrid, _) = build(true);
+        assert_equal(&warm_cpu, &warm_hybrid, "warmup");
+        let mut warmed_tree_pointers = [warm_cpu.as_ptr() as usize, warm_hybrid.as_ptr() as usize];
+        warmed_tree_pointers.sort_unstable();
+        let warm_stats =
+            metal_hybrid::take_test_stats().expect("one hybrid telemetry record in warmup");
+        metal_hybrid::emit_test_trace(&warm_stats);
+        recycle_tree(warm_cpu);
+        recycle_tree(warm_hybrid);
+        assert_eq!(TREE_POOL.lock().unwrap().len(), 2, "two warmed trees");
+
+        let mut cpu_ms = [0.0f64; 10];
+        let mut hybrid_ms = [0.0f64; 10];
+        for pair in 0..10 {
+            let ((cpu_tree, cpu_elapsed), (hybrid_tree, hybrid_elapsed), order) = if pair % 2 == 0 {
+                let cpu = build(false);
+                let hybrid = build(true);
+                (cpu, hybrid, "AB")
+            } else {
+                let hybrid = build(true);
+                let cpu = build(false);
+                (cpu, hybrid, "BA")
+            };
+
+            let stats = metal_hybrid::take_test_stats()
+                .unwrap_or_else(|| panic!("pair {pair}: missing hybrid telemetry record"));
+            metal_hybrid::emit_test_trace(&stats);
+            assert_equal(&cpu_tree, &hybrid_tree, &format!("pair {pair}"));
+            let mut pair_tree_pointers =
+                [cpu_tree.as_ptr() as usize, hybrid_tree.as_ptr() as usize];
+            pair_tree_pointers.sort_unstable();
+            assert_eq!(
+                pair_tree_pointers, warmed_tree_pointers,
+                "pair {pair}: timed arms must reuse only the two warmed tree allocations"
+            );
+
+            cpu_ms[pair] = cpu_elapsed.as_secs_f64() * 1.0e3;
+            hybrid_ms[pair] = hybrid_elapsed.as_secs_f64() * 1.0e3;
+            eprintln!(
+                "[merkle-metal-pair] pair={} order={} A=cpu B=hybrid cpu_full_tree_ms={:.6} hybrid_full_tree_ms={:.6} root={:02x?}",
+                pair + 1,
+                order,
+                cpu_ms[pair],
+                hybrid_ms[pair],
+                cpu_tree.last().unwrap(),
+            );
+            recycle_tree(cpu_tree);
+            recycle_tree(hybrid_tree);
+        }
+
+        assert_eq!(data.as_ptr(), input_pointer, "one stable input allocation");
+        assert_eq!(TREE_POOL.lock().unwrap().len(), 2, "two recycled trees");
+        eprintln!(
+            "[merkle-metal-paired-summary] pairs=10 workers={} ecore={} input_pointer={:#x} warmed_tree_pointers={:#x?} cpu_full_tree_ms={cpu_ms:?} hybrid_full_tree_ms={hybrid_ms:?}",
+            workers, use_ecore_sidecar, input_pointer as usize, warmed_tree_pointers,
+        );
     }
 
     /// Exact production-tree gate for the persistent Apple E-core queue.

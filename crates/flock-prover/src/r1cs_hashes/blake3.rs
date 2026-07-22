@@ -2232,6 +2232,333 @@ mod tests {
         assert_eq!(claim_p, claim_v);
     }
 
+    /// Corrected three-pair exact-m32 full-proof holdout for the fixed 7/16
+    /// CPU/Metal Merkle split. Cross-run proof bytes and terminal transcript
+    /// state are deliberately diagnostic only: positive-bit PoW uses Rayon's
+    /// `find_any`, so two honest runs may absorb different valid nonces. The
+    /// semantic gates are exact L0/tree equality (tested in `merkle`), equal
+    /// commitment roots/public claims, and independent verifier acceptance.
+    #[cfg(all(
+        feature = "hash-count",
+        target_os = "macos",
+        target_arch = "aarch64",
+        target_feature = "sha2"
+    ))]
+    #[test]
+    #[ignore = "one-shot exact-m32 CPU/Metal full-proof holdout"]
+    fn metal_hybrid_exact_m32_three_pair_holdout() {
+        use crate::proof_io::R1csProofBundleLigerito;
+        use crate::prover::ProvePhaseTimings;
+        use flock_core::challenger::{FsChallenger, fs_count};
+        use flock_core::merkle::{
+            MetalHybridTelemetry, hash_count, set_metal_hybrid_bench_enabled,
+            take_metal_hybrid_bench_telemetry,
+        };
+        use flock_core::proof::R1csClaim;
+
+        let holdout_enabled =
+            std::env::var("FLOCK_METAL_HYBRID_PROOF_HOLDOUT").is_ok_and(|value| {
+                matches!(
+                    value.trim().to_ascii_lowercase().as_str(),
+                    "1" | "true" | "on"
+                )
+            });
+        if !holdout_enabled {
+            eprintln!("skipped: set FLOCK_METAL_HYBRID_PROOF_HOLDOUT=1 for the frozen holdout");
+            return;
+        }
+        assert!(
+            std::env::var("FLOCK_MERKLE_METAL_HYBRID_TRACE").is_err(),
+            "leave Metal trace unset: holdout emits moved telemetry after timing"
+        );
+        assert!(
+            std::env::var("FLOCK_MERKLE_ECORE_TRACE").is_err(),
+            "leave E-core trace unset during holdout timing"
+        );
+
+        #[derive(Clone, Debug, PartialEq, Eq)]
+        struct HashSnapshot {
+            merkle: (u64, u64, u64),
+            fs: (u64, u64),
+            absorbed_bytes: u64,
+        }
+
+        struct ArmRun {
+            total_ms: f64,
+            phases: ProvePhaseTimings,
+            verify_ms: f64,
+            bundle_bytes: Vec<u8>,
+            bundle_digest: [u8; 32],
+            root: [u8; 32],
+            output: R1csClaim,
+            prove_hashes: HashSnapshot,
+            verify_hashes: HashSnapshot,
+            telemetry: Option<MetalHybridTelemetry>,
+        }
+
+        fn reset_hashes() {
+            hash_count::reset();
+            fs_count::reset();
+        }
+
+        fn snapshot_hashes(challenger: &FsChallenger) -> HashSnapshot {
+            HashSnapshot {
+                merkle: hash_count::snapshot(),
+                fs: fs_count::snapshot(),
+                absorbed_bytes: challenger.absorbed_bytes(),
+            }
+        }
+
+        fn phase_ms(t: &ProvePhaseTimings) -> [f64; 5] {
+            [
+                t.witness_s * 1.0e3,
+                t.commit_s * 1.0e3,
+                t.zerocheck_s * 1.0e3,
+                t.lincheck_s * 1.0e3,
+                t.open_s * 1.0e3,
+            ]
+        }
+
+        fn assert_semantics(reference: &ArmRun, actual: &ArmRun, label: &str) {
+            assert_eq!(actual.root, reference.root, "{label}: Merkle root");
+            assert_eq!(actual.output, reference.output, "{label}: public output");
+        }
+
+        fn assert_metal_gate(telemetry: &MetalHybridTelemetry, label: &str) {
+            let ranges = telemetry.dispatch_global_ranges();
+            assert_eq!(
+                telemetry.input_segment_count(),
+                4,
+                "{label}: input VM segments"
+            );
+            assert_eq!(
+                telemetry.output_segment_count(),
+                1,
+                "{label}: output VM segments"
+            );
+            assert_eq!(
+                telemetry.input_buffer_attempts(),
+                4,
+                "{label}: input no-copy attempts"
+            );
+            assert_eq!(
+                telemetry.output_buffer_attempts(),
+                1,
+                "{label}: output no-copy attempts"
+            );
+            assert_eq!(
+                telemetry.no_copy_identity_checks(),
+                15,
+                "{label}: no-copy identity checks"
+            );
+            assert_eq!(
+                ranges,
+                vec![
+                    (589_824, 655_360),
+                    (655_360, 786_432),
+                    (786_432, 917_504),
+                    (917_504, 1_048_576),
+                ],
+                "{label}: four exact Metal dispatches"
+            );
+            assert_eq!(
+                telemetry.command_status(),
+                4,
+                "{label}: completed command status"
+            );
+            // The join need not be perfectly CPU-hidden on every machine: GPU
+            // throughput and host contention vary independently.  The join
+            // tail remains recorded below; paired end-to-end proof time is the
+            // performance gate.
+        }
+
+        let _ = flock_core::init_perf_thread_pool();
+        let n_blocks = 1usize << 18;
+        let setup = Blake3Setup::new(n_blocks);
+        assert_eq!(setup.m(), 32, "exact m32 setup");
+        let mut rng = Rng::new(0xC0FF_EE32_7A16_0003);
+        let blocks: Vec<Compression> = (0..n_blocks)
+            .map(|_| {
+                let cv: [u32; 8] = std::array::from_fn(|_| rng.next_u32());
+                let m: [u32; 16] = std::array::from_fn(|_| rng.next_u32());
+                (cv, m, rng.next_u32() as u64, 64u32, 11u32)
+            })
+            .collect();
+        const DOMAIN: &[u8] = b"flock-metal-holdout-v0";
+
+        let run_arm = |hybrid: bool| -> ArmRun {
+            set_metal_hybrid_bench_enabled(hybrid);
+            assert!(
+                take_metal_hybrid_bench_telemetry().is_none(),
+                "stale Metal telemetry before arm"
+            );
+            reset_hashes();
+            let mut ch_p = FsChallenger::new(DOMAIN);
+            let start = std::time::Instant::now();
+            let (proof, commitment, output, phases) = setup.prove_fast_timed(&blocks, &mut ch_p);
+            let total_ms = start.elapsed().as_secs_f64() * 1.0e3;
+            let prove_hashes = snapshot_hashes(&ch_p);
+            let telemetry = take_metal_hybrid_bench_telemetry();
+            if hybrid {
+                assert!(
+                    telemetry.is_some(),
+                    "hybrid proof emitted no exact-L0 telemetry"
+                );
+            } else {
+                assert!(telemetry.is_none(), "CPU proof emitted Metal telemetry");
+            }
+
+            reset_hashes();
+            let mut ch_v = FsChallenger::new(DOMAIN);
+            let verify_start = std::time::Instant::now();
+            let verified_output = setup
+                .verify(&commitment, &proof, &mut ch_v)
+                .unwrap_or_else(|error| panic!("verifier rejected holdout proof: {error:?}"));
+            let verify_ms = verify_start.elapsed().as_secs_f64() * 1.0e3;
+            let verify_hashes = snapshot_hashes(&ch_v);
+            assert_eq!(verified_output, output, "prover/verifier public output");
+
+            let root = commitment.root;
+            let bundle_bytes = R1csProofBundleLigerito { commitment, proof }.to_bytes();
+            let bundle_digest = *::blake3::hash(&bundle_bytes).as_bytes();
+            ArmRun {
+                total_ms,
+                phases,
+                verify_ms,
+                bundle_bytes,
+                bundle_digest,
+                root,
+                output,
+                prove_hashes,
+                verify_hashes,
+                telemetry,
+            }
+        };
+
+        // Both backends, all scratch/codeword/tree pools, and the verifier are
+        // initialized by an untimed exact-proof warmup before holdout data.
+        let warm_cpu = run_arm(false);
+        let warm_hybrid = run_arm(true);
+        assert_semantics(&warm_cpu, &warm_hybrid, "warmup CPU/hybrid");
+        assert_metal_gate(
+            warm_hybrid.telemetry.as_ref().unwrap(),
+            "warmup hybrid telemetry",
+        );
+
+        let mut gains_ms = [0.0f64; 3];
+        let mut downstream_regressions_ms = [0.0f64; 3];
+        for pair in 0..3 {
+            let (cpu, hybrid, order) = if pair % 2 == 0 {
+                (run_arm(false), run_arm(true), "AB")
+            } else {
+                let hybrid = run_arm(true);
+                let cpu = run_arm(false);
+                (cpu, hybrid, "BA")
+            };
+            let label = format!("pair {} {order}", pair + 1);
+            assert_semantics(&warm_cpu, &cpu, &format!("{label} CPU/reference"));
+            assert_semantics(&warm_cpu, &hybrid, &format!("{label} hybrid/reference"));
+            let telemetry = hybrid.telemetry.as_ref().unwrap();
+            assert_metal_gate(telemetry, &format!("{label} hybrid telemetry"));
+
+            gains_ms[pair] = cpu.total_ms - hybrid.total_ms;
+            // Preregistered non-Merkle gate: every timed phase except PCS
+            // commit, whose L0 Merkle construction is the treatment itself.
+            let cpu_downstream = (cpu.phases.witness_s
+                + cpu.phases.zerocheck_s
+                + cpu.phases.lincheck_s
+                + cpu.phases.open_s)
+                * 1.0e3;
+            let hybrid_downstream = (hybrid.phases.witness_s
+                + hybrid.phases.zerocheck_s
+                + hybrid.phases.lincheck_s
+                + hybrid.phases.open_s)
+                * 1.0e3;
+            downstream_regressions_ms[pair] = hybrid_downstream - cpu_downstream;
+            assert!(
+                gains_ms[pair] > 0.0,
+                "{label}: hybrid did not win: cpu={:.6} ms hybrid={:.6} ms",
+                cpu.total_ms,
+                hybrid.total_ms,
+            );
+
+            let cpu_phase = phase_ms(&cpu.phases);
+            let hybrid_phase = phase_ms(&hybrid.phases);
+            eprintln!(
+                "[metal-proof-arm] pair={} order={} arm=cpu total_ms={:.6} witness_ms={:.6} commit_ms={:.6} zerocheck_ms={:.6} lincheck_ms={:.6} open_ms={:.6} phase_sum_ms={:.6} downstream_non_merkle_ms={:.6} verify_ms={:.6} proof_bytes={} proof_blake3={:02x?} prove_hashes={:?} verify_hashes={:?}",
+                pair + 1,
+                order,
+                cpu.total_ms,
+                cpu_phase[0],
+                cpu_phase[1],
+                cpu_phase[2],
+                cpu_phase[3],
+                cpu_phase[4],
+                cpu_phase.iter().sum::<f64>(),
+                cpu_downstream,
+                cpu.verify_ms,
+                cpu.bundle_bytes.len(),
+                cpu.bundle_digest,
+                cpu.prove_hashes,
+                cpu.verify_hashes,
+            );
+            eprintln!(
+                "[metal-proof-arm] pair={} order={} arm=hybrid total_ms={:.6} witness_ms={:.6} commit_ms={:.6} zerocheck_ms={:.6} lincheck_ms={:.6} open_ms={:.6} phase_sum_ms={:.6} downstream_non_merkle_ms={:.6} verify_ms={:.6} proof_bytes={} proof_blake3={:02x?} prove_hashes={:?} verify_hashes={:?}",
+                pair + 1,
+                order,
+                hybrid.total_ms,
+                hybrid_phase[0],
+                hybrid_phase[1],
+                hybrid_phase[2],
+                hybrid_phase[3],
+                hybrid_phase[4],
+                hybrid_phase.iter().sum::<f64>(),
+                hybrid_downstream,
+                hybrid.verify_ms,
+                hybrid.bundle_bytes.len(),
+                hybrid.bundle_digest,
+                hybrid.prove_hashes,
+                hybrid.verify_hashes,
+            );
+            eprintln!(
+                "[metal-proof-telemetry] pair={} dispatches={:?} status={} no_copy_checks={} commit_to_gpu_start_ms={:.6} gpu_ms={:.6} gpu_finish_before_barrier_ms={:.6} terminal_wait_ms={:.6}",
+                pair + 1,
+                telemetry.dispatch_global_ranges(),
+                telemetry.command_status(),
+                telemetry.no_copy_identity_checks(),
+                (telemetry.gpu_start_seconds() - telemetry.commit_host_seconds()) * 1.0e3,
+                (telemetry.gpu_end_seconds() - telemetry.gpu_start_seconds()) * 1.0e3,
+                (telemetry.cpu_barrier_host_seconds() - telemetry.gpu_end_seconds()) * 1.0e3,
+                telemetry.terminal_wait_nanoseconds() as f64 / 1.0e6,
+            );
+            eprintln!(
+                "[metal-proof-pair] pair={} order={} total_gain_ms={:.6} downstream_non_merkle_regression_ms={:.6}",
+                pair + 1,
+                order,
+                gains_ms[pair],
+                downstream_regressions_ms[pair],
+            );
+        }
+
+        let mut sorted_gains = gains_ms;
+        sorted_gains.sort_by(f64::total_cmp);
+        let paired_median_gain_ms = sorted_gains[1];
+        let mut sorted_downstream = downstream_regressions_ms;
+        sorted_downstream.sort_by(f64::total_cmp);
+        let paired_median_downstream_regression_ms = sorted_downstream[1];
+        assert!(
+            paired_median_gain_ms >= 4.0,
+            "paired-median total gain {paired_median_gain_ms:.6} ms is below 4 ms"
+        );
+        assert!(
+            paired_median_downstream_regression_ms <= 1.0,
+            "paired-median downstream non-Merkle regression {paired_median_downstream_regression_ms:.6} ms exceeds 1 ms"
+        );
+        eprintln!(
+            "[metal-proof-holdout] pairs=3 wins=3 gains_ms={gains_ms:?} paired_median_gain_ms={paired_median_gain_ms:.6} downstream_non_merkle_regressions_ms={downstream_regressions_ms:?} paired_median_downstream_non_merkle_regression_ms={paired_median_downstream_regression_ms:.6}"
+        );
+    }
+
     /// Generic (matrix-driven) Ligerito prove produces a byte-identical
     /// proof to the specialized `prove_fast` — pins that the generic path
     /// (bool trace → pack → apply → prove) and the fused path agree.
