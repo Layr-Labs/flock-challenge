@@ -693,6 +693,178 @@ fn transpose_8_f128s_to_128_bytes(lanes: &[F128; 8], out: &mut [u8]) {
     crate::bits::transpose_8_u64s_to_64_bytes(&hi, out_hi);
 }
 
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn lincheck_shlq_u64_imm<const N: i32>(
+    mut value: core::arch::aarch64::uint64x2_t,
+) -> core::arch::aarch64::uint64x2_t {
+    unsafe {
+        core::arch::asm!(
+            "shl {value:v}.2d, {value:v}.2d, #{shift}",
+            value = inout(vreg) value,
+            shift = const N,
+            options(pure, nomem, nostack),
+        );
+    }
+    value
+}
+
+/// Register-bounded form of the existing 64-byte NEON bit transpose.
+/// Processing two output Q registers at a time retains two independent chains
+/// while preventing LLVM from keeping all four chains live across all three
+/// bit-swap rounds.
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn transpose_8_u64s_to_64_bytes_lowreg(lanes: &[u64; 8], out: &mut [u8; 64]) {
+    use core::arch::aarch64::*;
+
+    unsafe {
+        const IDX0: [u8; 16] = [0, 8, 16, 24, 32, 40, 48, 56, 1, 9, 17, 25, 33, 41, 49, 57];
+        const IDX1: [u8; 16] = [2, 10, 18, 26, 34, 42, 50, 58, 3, 11, 19, 27, 35, 43, 51, 59];
+        const IDX2: [u8; 16] = [4, 12, 20, 28, 36, 44, 52, 60, 5, 13, 21, 29, 37, 45, 53, 61];
+        const IDX3: [u8; 16] = [6, 14, 22, 30, 38, 46, 54, 62, 7, 15, 23, 31, 39, 47, 55, 63];
+
+        let input = lanes.as_ptr() as *const u8;
+        let table = uint8x16x4_t(
+            vld1q_u8(input),
+            vld1q_u8(input.add(16)),
+            vld1q_u8(input.add(32)),
+            vld1q_u8(input.add(48)),
+        );
+        let mask1 = vdupq_n_u64(0x00AA_00AA_00AA_00AA);
+        let mask2 = vdupq_n_u64(0x0000_CCCC_0000_CCCC);
+        let mask3 = vdupq_n_u64(0x0000_0000_F0F0_F0F0);
+
+        macro_rules! swap_pair {
+            ($y0:ident, $y1:ident, $mask:ident, $shift:literal) => {{
+                let t0 = vandq_u64(veorq_u64($y0, vshrq_n_u64::<$shift>($y0)), $mask);
+                let t1 = vandq_u64(veorq_u64($y1, vshrq_n_u64::<$shift>($y1)), $mask);
+                $y0 = veorq_u64($y0, veorq_u64(t0, lincheck_shlq_u64_imm::<$shift>(t0)));
+                $y1 = veorq_u64($y1, veorq_u64(t1, lincheck_shlq_u64_imm::<$shift>(t1)));
+            }};
+        }
+        macro_rules! swap_pair_round3 {
+            ($y0:ident, $y1:ident, $mask:ident) => {{
+                let t0 = vandq_u64(veorq_u64($y0, vshrq_n_u64::<28>($y0)), $mask);
+                let t1 = vandq_u64(veorq_u64($y1, vshrq_n_u64::<28>($y1)), $mask);
+                $y0 = veorq_u64($y0, veorq_u64(t0, vshlq_n_u64::<28>(t0)));
+                $y1 = veorq_u64($y1, veorq_u64(t1, vshlq_n_u64::<28>(t1)));
+            }};
+        }
+
+        let mut y0 = vreinterpretq_u64_u8(vqtbl4q_u8(table, vld1q_u8(IDX0.as_ptr())));
+        let mut y1 = vreinterpretq_u64_u8(vqtbl4q_u8(table, vld1q_u8(IDX1.as_ptr())));
+        swap_pair!(y0, y1, mask1, 7);
+        swap_pair!(y0, y1, mask2, 14);
+        swap_pair_round3!(y0, y1, mask3);
+        let out_ptr = out.as_mut_ptr();
+        vst1q_u8(out_ptr, vreinterpretq_u8_u64(y0));
+        vst1q_u8(out_ptr.add(16), vreinterpretq_u8_u64(y1));
+
+        std::sync::atomic::compiler_fence(std::sync::atomic::Ordering::SeqCst);
+
+        let mut y2 = vreinterpretq_u64_u8(vqtbl4q_u8(table, vld1q_u8(IDX2.as_ptr())));
+        let mut y3 = vreinterpretq_u64_u8(vqtbl4q_u8(table, vld1q_u8(IDX3.as_ptr())));
+        swap_pair!(y2, y3, mask1, 7);
+        swap_pair!(y2, y3, mask2, 14);
+        swap_pair_round3!(y2, y3, mask3);
+        vst1q_u8(out_ptr.add(32), vreinterpretq_u8_u64(y2));
+        vst1q_u8(out_ptr.add(48), vreinterpretq_u8_u64(y3));
+    }
+}
+
+/// Fixed-geometry raw leaf for one full direct-fold q-group.
+///
+/// This performs exactly the existing eight 8xF128 transposes followed by the
+/// existing eight-table XOR accumulation into 128 adjacent partial outputs.
+/// Its fixed pointer contract keeps generic slice/tile metadata out of the hot
+/// transpose and gather loops.
+///
+/// # Safety
+///
+/// - `z_tile_q` must address the q-th F128 of the first outer block in a full
+///   tile of 64 blocks; each adjacent block is `block_stride` F128s away.
+/// - `tables` must address eight adjacent 256-entry F128 sum tables.
+/// - `scratch` must address 8 * 128 writable bytes.
+/// - `partial` must address 128 initialized, writable F128 values.
+#[cfg(target_arch = "aarch64")]
+#[inline(never)]
+unsafe fn fold_block_major_full8x128_raw(
+    z_tile_q: *const F128,
+    block_stride: usize,
+    tables: *const F128,
+    scratch: *mut u8,
+    partial: *mut F128,
+) {
+    unsafe {
+        let mut t = 0usize;
+        while t < DIRECT_FOLD_TILE_STRIPES {
+            let base = z_tile_q.add(t * 8 * block_stride);
+            let words = base.cast::<u64>();
+            let word_stride = 2 * block_stride;
+            let lo = [
+                words.read(),
+                words.add(word_stride).read(),
+                words.add(2 * word_stride).read(),
+                words.add(3 * word_stride).read(),
+                words.add(4 * word_stride).read(),
+                words.add(5 * word_stride).read(),
+                words.add(6 * word_stride).read(),
+                words.add(7 * word_stride).read(),
+            ];
+            let out_lo = &mut *(scratch.add(t * 128) as *mut [u8; 64]);
+            transpose_8_u64s_to_64_bytes_lowreg(&lo, out_lo);
+
+            // Prevent LLVM from modulo-scheduling the independent high-half
+            // transpose before the low-half stores. Keeping each half's live
+            // range self-contained avoids forcing vector temporaries into the
+            // callee-saved register bank.
+            std::sync::atomic::compiler_fence(std::sync::atomic::Ordering::SeqCst);
+
+            let hi_words = words.add(1);
+            let hi = [
+                hi_words.read(),
+                hi_words.add(word_stride).read(),
+                hi_words.add(2 * word_stride).read(),
+                hi_words.add(3 * word_stride).read(),
+                hi_words.add(4 * word_stride).read(),
+                hi_words.add(5 * word_stride).read(),
+                hi_words.add(6 * word_stride).read(),
+                hi_words.add(7 * word_stride).read(),
+            ];
+            let out_hi = &mut *(scratch.add(t * 128 + 64) as *mut [u8; 64]);
+            transpose_8_u64s_to_64_bytes_lowreg(&hi, out_hi);
+            t += 1;
+        }
+
+        let mut b = 0usize;
+        while b < 128 {
+            let mut acc = partial.add(b).read();
+
+            let i0 = scratch.add(b).read() as usize;
+            let i1 = scratch.add(128 + b).read() as usize;
+            let i2 = scratch.add(2 * 128 + b).read() as usize;
+            let i3 = scratch.add(3 * 128 + b).read() as usize;
+            let i4 = scratch.add(4 * 128 + b).read() as usize;
+            let i5 = scratch.add(5 * 128 + b).read() as usize;
+            let i6 = scratch.add(6 * 128 + b).read() as usize;
+            let i7 = scratch.add(7 * 128 + b).read() as usize;
+
+            acc += tables.add(i0).read();
+            acc += tables.add(256 + i1).read();
+            acc += tables.add(2 * 256 + i2).read();
+            acc += tables.add(3 * 256 + i3).read();
+            acc += tables.add(4 * 256 + i4).read();
+            acc += tables.add(5 * 256 + i5).read();
+            acc += tables.add(6 * 256 + i6).read();
+            acc += tables.add(7 * 256 + i7).read();
+
+            partial.add(b).write(acc);
+            b += 1;
+        }
+    }
+}
+
 /// Direct partial fold from the canonical block-major F128 witness packing.
 /// This avoids materializing the equally-sized byte-stripe copy used by
 /// [`partial_fold_packed_z_fast`].
@@ -775,6 +947,26 @@ pub fn partial_fold_packed_z_block_major_padded(
                 for q in 0..useful_chunks {
                     let inner_base = q * 128;
                     let chunk_bits = (useful_bits - inner_base).min(128);
+
+                    #[cfg(target_arch = "aarch64")]
+                    if tile_stripes == DIRECT_FOLD_TILE_STRIPES && chunk_bits == 128 {
+                        let first_outer = 8 * stripe_base;
+                        // SAFETY: the checked full-tile/full-q predicate and
+                        // function geometry provide 64 complete source blocks,
+                        // eight complete tables, 1,024 scratch bytes, and 128
+                        // initialized partial outputs.
+                        unsafe {
+                            fold_block_major_full8x128_raw(
+                                z_packed.as_ptr().add(first_outer * chunks_per_block + q),
+                                chunks_per_block,
+                                tables.as_ptr(),
+                                transposed.as_mut_ptr(),
+                                partial.as_mut_ptr().add(inner_base),
+                            );
+                        }
+                        continue;
+                    }
+
                     for t in 0..tile_stripes {
                         let outer_base = 8 * (stripe_base + t);
                         let lanes: [F128; 8] = std::array::from_fn(|r| {
@@ -2035,6 +2227,65 @@ mod tests {
                 &eq_outer,
             );
             assert_eq!(want, got, "m={m} k_log={k_log} useful={useful_bits}");
+        }
+    }
+
+    /// The fixed full-eight-stripe/full-128-column AArch64 leaf is exactly the
+    /// generic transpose/gather oracle with poisoned scratch and partial state.
+    /// [`partial_fold_block_major_matches_stripe`] independently covers the
+    /// production dispatch across dense and padded end-to-end geometries.
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn partial_fold_block_major_raw_full_tile_matches_generic() {
+        // Exercise the raw pointer contract directly with varying strides,
+        // q offsets, and random/zero/one source families.
+        for &(stride, q, source_kind, seed) in &[
+            (1usize, 0usize, 0u8, 0x6A09_E667_F3BC_C909),
+            (3, 2, 0, 0xBB67_AE85_84CA_A73B),
+            (2, 1, 1, 0x3C6E_F372_FE94_F82B),
+            (4, 3, 2, 0xA54F_F53A_5F1D_36F1),
+        ] {
+            let mut rng = Rng::new(seed);
+            let mut z = rng.f128_vec(64 * stride);
+            match source_kind {
+                0 => {}
+                1 => z.fill(F128::ZERO),
+                2 => z.fill(F128 {
+                    lo: u64::MAX,
+                    hi: u64::MAX,
+                }),
+                _ => unreachable!(),
+            }
+            let tables = rng.f128_vec(DIRECT_FOLD_TILE_STRIPES * 256);
+            let initial = rng.f128_vec(128);
+
+            let mut want_scratch = [0xA5u8; DIRECT_FOLD_TILE_STRIPES * 128];
+            for t in 0..DIRECT_FOLD_TILE_STRIPES {
+                let lanes: [F128; 8] = std::array::from_fn(|r| z[(8 * t + r) * stride + q]);
+                transpose_8_f128s_to_128_bytes(&lanes, &mut want_scratch[t * 128..(t + 1) * 128]);
+            }
+            let mut want_partial = initial.clone();
+            for b in 0..128 {
+                for t in 0..DIRECT_FOLD_TILE_STRIPES {
+                    want_partial[b] += tables[t * 256 + want_scratch[t * 128 + b] as usize];
+                }
+            }
+
+            let mut got_scratch = [0x3Cu8; DIRECT_FOLD_TILE_STRIPES * 128];
+            let mut got_partial = initial;
+            // SAFETY: this test allocates the exact 64-source, 2,048-table,
+            // 1,024-scratch, and 128-partial regions required by the leaf.
+            unsafe {
+                fold_block_major_full8x128_raw(
+                    z.as_ptr().add(q),
+                    stride,
+                    tables.as_ptr(),
+                    got_scratch.as_mut_ptr(),
+                    got_partial.as_mut_ptr(),
+                );
+            }
+            assert_eq!(got_scratch, want_scratch, "stride={stride} q={q}");
+            assert_eq!(got_partial, want_partial, "stride={stride} q={q}");
         }
     }
 
