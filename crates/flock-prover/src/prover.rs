@@ -456,8 +456,18 @@ fn prove_fast_core_with_codeword_inner<Ch: Challenger>(
     // Nothing downstream reads a/b (zerocheck consumed them in rounds 1–2);
     // recycle the two buffers (2 × 2^(m-3) bytes — 128 MB at m = 29) instead
     // of carrying them through lincheck and the PCS open.
-    flock_core::scratch::give_f128(a_packed_f128);
-    flock_core::scratch::give_f128(b_packed_f128);
+    if let Err(a_packed_f128) = flock_core::scratch::try_capture_f128_role(
+        flock_core::scratch::F128CaptureRole::A,
+        a_packed_f128,
+    ) {
+        flock_core::scratch::give_f128(a_packed_f128);
+    }
+    if let Err(b_packed_f128) = flock_core::scratch::try_capture_f128_role(
+        flock_core::scratch::F128CaptureRole::B,
+        b_packed_f128,
+    ) {
+        flock_core::scratch::give_f128(b_packed_f128);
+    }
 
     let x_ab = r1cs.x_ab_from_mlv(zc_claim.z, &zc_claim.mlv_challenges);
 

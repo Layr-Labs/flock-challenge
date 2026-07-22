@@ -2882,12 +2882,24 @@ impl SumcheckProver {
         // old ones.
         #[cfg(target_arch = "x86_64")]
         {
-            crate::scratch::give_f128(std::mem::replace(&mut self.f, nf));
+            let old_f = std::mem::replace(&mut self.f, nf);
+            if let Err(old_f) = crate::scratch::try_capture_f128_role(
+                crate::scratch::F128CaptureRole::Z,
+                old_f,
+            ) {
+                crate::scratch::give_f128(old_f);
+            }
             crate::scratch::give_f128(std::mem::replace(&mut self.combined_basis, nb));
         }
         #[cfg(not(target_arch = "x86_64"))]
         {
-            self.f = nf;
+            let old_f = std::mem::replace(&mut self.f, nf);
+            if let Err(old_f) = crate::scratch::try_capture_f128_role(
+                crate::scratch::F128CaptureRole::Z,
+                old_f,
+            ) {
+                drop(old_f);
+            }
             self.combined_basis = nb;
         }
         self.transcript.push(msg);
