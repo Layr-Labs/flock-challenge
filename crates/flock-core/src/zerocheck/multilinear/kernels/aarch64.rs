@@ -85,6 +85,86 @@ pub(crate) unsafe fn fold_and_message_neon(
     (p1_acc.reduce(), pinf_acc.reduce())
 }
 
+/// Raw-pointer leaf for one round-2 `x_hi` chunk at the protocol-fixed
+/// `k_skip = 6` / eight-table-chunk geometry.
+///
+/// The caller advances every pointer to the beginning of one Rayon chunk.
+/// Keeping this loop in a noinline leaf prevents the closure's slice and
+/// capture state from occupying registers across the table-lookup and GHASH
+/// dependency chains.
+///
+/// # Safety
+/// Requires the `aes` target feature and all of the following:
+///
+/// - `table_data` addresses at least `8 * 256 * size_of::<F128>()` bytes;
+/// - `a_packed` and `b_packed` each address `2 * lo_size * 8` bytes;
+/// - `a_out` and `b_out` each address `2 * lo_size` writable `F128`s;
+/// - `eq_lo` addresses `lo_size` initialized `F128`s;
+/// - `pair_idx_base + lo_size` does not overflow `usize`.
+#[allow(clippy::too_many_arguments)]
+#[inline(never)]
+#[target_feature(enable = "aes")]
+pub(crate) unsafe fn round2_chunk_raw_neon(
+    table_data: *const u8,
+    a_packed: *const u8,
+    b_packed: *const u8,
+    a_out: *mut F128,
+    b_out: *mut F128,
+    eq_lo: *const F128,
+    lo_size: usize,
+    pair_idx_base: usize,
+    pair_in_block_mask: usize,
+    useful_pairs_inclusive: usize,
+) -> (F128, F128) {
+    unsafe {
+        let mut p1_acc = F256Unreduced::ZERO;
+        let mut pinf_acc = F256Unreduced::ZERO;
+
+        let mut a_src = a_packed;
+        let mut b_src = b_packed;
+        let mut a_dst = a_out;
+        let mut b_dst = b_out;
+        let mut eq_ptr = eq_lo;
+        let mut pair_idx = pair_idx_base;
+        let mut remaining = lo_size;
+
+        while remaining != 0 {
+            if (pair_idx & pair_in_block_mask) >= useful_pairs_inclusive {
+                a_dst.write(F128::ZERO);
+                a_dst.add(1).write(F128::ZERO);
+                b_dst.write(F128::ZERO);
+                b_dst.add(1).write(F128::ZERO);
+            } else {
+                let a0 = fold_one_row_neon_unchecked_8(table_data, a_src);
+                let b0 = fold_one_row_neon_unchecked_8(table_data, b_src);
+                let a1 = fold_one_row_neon_unchecked_8(table_data, a_src.add(8));
+                let b1 = fold_one_row_neon_unchecked_8(table_data, b_src.add(8));
+
+                a_dst.write(a0);
+                a_dst.add(1).write(a1);
+                b_dst.write(b0);
+                b_dst.add(1).write(b1);
+
+                let eq_l = eq_ptr.read();
+                let g1 = a1 * b1;
+                p1_acc ^= eq_l.mul_unreduced(g1);
+                let g_inf = (a0 + a1) * (b0 + b1);
+                pinf_acc ^= eq_l.mul_unreduced(g_inf);
+            }
+
+            a_src = a_src.add(16);
+            b_src = b_src.add(16);
+            a_dst = a_dst.add(2);
+            b_dst = b_dst.add(2);
+            eq_ptr = eq_ptr.add(1);
+            pair_idx += 1;
+            remaining -= 1;
+        }
+
+        (p1_acc.reduce(), pinf_acc.reduce())
+    }
+}
+
 /// NEON one-row fold: 8 aligned 16-byte loads + 8 XORs, hand-unrolled for
 /// `n_chunks = 8` (the k_skip=6 protocol size). Returns the folded F128.
 ///

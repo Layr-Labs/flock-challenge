@@ -33,20 +33,24 @@
 //! Verifier reconstructs `G(0)` from the running claim via
 //! `current_claim = (1+r_now)·G(0) + r_now·G(1)`.
 
+#[cfg(any(test, not(target_arch = "aarch64")))]
+use crate::field::F256Unreduced;
 #[cfg(all(
     target_arch = "x86_64",
     target_feature = "avx512f",
     target_feature = "vpclmulqdq"
 ))]
 use crate::field::gf2_128::x86_64::{WideGhashX4, f128x4_loadu, f128x4_set, ghash_mul_x4};
-use crate::field::{F128, F256Unreduced, PHI_8_TABLE};
+use crate::field::{F128, PHI_8_TABLE};
 use crate::zerocheck::PaddingSpec;
 use crate::zerocheck::univariate_skip::{SplitEqGhash, build_eq, pack_bits};
 
 mod kernels;
 
+#[cfg(all(test, target_arch = "aarch64"))]
+use kernels::aarch64::fold_one_row_neon_unchecked_8;
 #[cfg(target_arch = "aarch64")]
-use kernels::aarch64::{fold_and_message_neon, fold_one_row_neon_unchecked_8};
+use kernels::aarch64::{fold_and_message_neon, round2_chunk_raw_neon};
 #[cfg(all(
     target_arch = "x86_64",
     target_feature = "avx512f",
@@ -502,49 +506,28 @@ pub fn uni_skip_fold_and_round_pair_optimized_packed_padded(
         .zip(b_folded.par_chunks_mut(chunk_size))
         .enumerate()
         .map(|(x_hi, (a_chunk, b_chunk))| {
+            #[cfg(not(target_arch = "aarch64"))]
             let mut p1_acc = F256Unreduced::ZERO;
+            #[cfg(not(target_arch = "aarch64"))]
             let mut pinf_acc = F256Unreduced::ZERO;
             let pair_idx_base = x_hi * lo_size;
 
             #[cfg(target_arch = "aarch64")]
-            unsafe {
-                let table_ptr = table.data.as_ptr() as *const u8;
-                let a_pkt_ptr = a_packed.as_ptr();
-                let b_pkt_ptr = b_packed.as_ptr();
+            let (p1, pinf) = unsafe {
                 let base = x_hi * chunk_size;
-
-                for x_lo in 0..lo_size {
-                    let x0l = 2 * x_lo;
-                    let x1l = x0l + 1;
-                    if ((pair_idx_base + x_lo) & pair_in_block_mask) >= useful_pairs_inclusive {
-                        // Padding hole: write zero (a_folded/b_folded were alloc'd
-                        // uninit, so we have to write every slot we don't fold into).
-                        a_chunk[x0l] = F128::ZERO;
-                        a_chunk[x1l] = F128::ZERO;
-                        b_chunk[x0l] = F128::ZERO;
-                        b_chunk[x1l] = F128::ZERO;
-                        continue;
-                    }
-                    let x0g = base + 2 * x_lo;
-                    let x1g = x0g + 1;
-
-                    let a0 = fold_one_row_neon_unchecked_8(table_ptr, a_pkt_ptr.add(x0g * 8));
-                    let b0 = fold_one_row_neon_unchecked_8(table_ptr, b_pkt_ptr.add(x0g * 8));
-                    let a1 = fold_one_row_neon_unchecked_8(table_ptr, a_pkt_ptr.add(x1g * 8));
-                    let b1 = fold_one_row_neon_unchecked_8(table_ptr, b_pkt_ptr.add(x1g * 8));
-
-                    a_chunk[x0l] = a0;
-                    a_chunk[x1l] = a1;
-                    b_chunk[x0l] = b0;
-                    b_chunk[x1l] = b1;
-
-                    let eq_l = eq_lo[x_lo];
-                    let g1 = a1 * b1;
-                    p1_acc ^= eq_l.mul_unreduced(g1);
-                    let g_inf = (a0 + a1) * (b0 + b1);
-                    pinf_acc ^= eq_l.mul_unreduced(g_inf);
-                }
-            }
+                round2_chunk_raw_neon(
+                    table.data.as_ptr() as *const u8,
+                    a_packed.as_ptr().add(base * 8),
+                    b_packed.as_ptr().add(base * 8),
+                    a_chunk.as_mut_ptr(),
+                    b_chunk.as_mut_ptr(),
+                    eq_lo.as_ptr(),
+                    lo_size,
+                    pair_idx_base,
+                    pair_in_block_mask,
+                    useful_pairs_inclusive,
+                )
+            };
             #[cfg(all(
                 target_arch = "x86_64",
                 target_feature = "avx512f",
@@ -681,8 +664,8 @@ pub fn uni_skip_fold_and_round_pair_optimized_packed_padded(
                 }
             }
 
-            let p1 = p1_acc.reduce();
-            let pinf = pinf_acc.reduce();
+            #[cfg(not(target_arch = "aarch64"))]
+            let (p1, pinf) = (p1_acc.reduce(), pinf_acc.reduce());
             let eq_h = eq_hi[x_hi];
             (eq_h * p1, eq_h * pinf)
         })
@@ -1537,6 +1520,58 @@ mod tests {
             assert_eq!(par.2, ser.2, "msg_1 mismatch at m={m}");
             assert_eq!(par.3, ser.3, "msg_inf mismatch at m={m}");
         }
+    }
+
+    /// The production AArch64 round-2 leaf matches the scalar serial oracle
+    /// for the honestly padded BLAKE3 geometry used by the prover.
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn aarch64_round2_production_leaf_matches_serial_padded() {
+        const M: usize = 21;
+        const K_SKIP: usize = 6;
+        const K_LOG: usize = 14;
+        const USEFUL_BITS: usize = 15_409;
+
+        let mut rng = Rng::new(0x5232_5F50_524F_4400);
+        let mut a = rng.bits(1usize << M);
+        let mut b = rng.bits(1usize << M);
+        let block_size = 1usize << K_LOG;
+        for block in 0..(1usize << (M - K_LOG)) {
+            let padding_start = block * block_size + USEFUL_BITS;
+            let padding_end = (block + 1) * block_size;
+            a[padding_start..padding_end].fill(false);
+            b[padding_start..padding_end].fill(false);
+        }
+
+        let a_packed = pack_bits(&a);
+        let b_packed = pack_bits(&b);
+        let challenges = rng.f128_vec(M - K_SKIP);
+        let table = UniSkipFoldTable::new(K_SKIP, rng.f128());
+        let production = uni_skip_fold_and_round_pair_optimized_packed_padded(
+            &a_packed,
+            &b_packed,
+            M,
+            K_SKIP,
+            &table,
+            &challenges,
+            &PaddingSpec {
+                k_log: K_LOG,
+                useful_bits_per_block: USEFUL_BITS,
+            },
+        );
+        let serial = uni_skip_fold_and_round_pair_optimized_packed_serial(
+            &a_packed,
+            &b_packed,
+            M,
+            K_SKIP,
+            &table,
+            &challenges,
+        );
+
+        assert_eq!(production.0, serial.0, "A output mismatch");
+        assert_eq!(production.1, serial.1, "B output mismatch");
+        assert_eq!(production.2, serial.2, "message-1 mismatch");
+        assert_eq!(production.3, serial.3, "message-inf mismatch");
     }
 
     /// **Padding skip is byte-identical to the dense round-2 kernel.** Builds
