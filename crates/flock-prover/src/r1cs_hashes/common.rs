@@ -2,6 +2,7 @@
 //! modules (`sha2`, `blake3`, `keccak`). The shared `prove_fast`
 //! orchestration lives in [`crate::prover::prove_fast_from_witness`].
 
+use std::mem::MaybeUninit;
 use std::sync::{Mutex, OnceLock};
 
 use flock_core::bits::transpose_8_u64s_to_64_bytes;
@@ -258,10 +259,15 @@ where
 }
 
 /// Variant of [`drive_witness_packed_and_lincheck`] for a `per_block`
-/// producer that assigns every u64 in all three destination slices. Padding
-/// is mandatory so every scratch-buffer block is initialized without the
-/// driver's group-wide zero pass.
-pub(crate) fn drive_witness_packed_and_lincheck_overwrite<S: Sync, F>(
+/// producer that initializes every `MaybeUninit<u64>` in all three destination
+/// slices. Padding is mandatory so every scratch-buffer block is initialized
+/// without the driver's group-wide zero pass.
+///
+/// # Safety
+///
+/// `per_block` must initialize every element of all three destination slices
+/// before returning. If it panics, the uninitialized owner is dropped safely.
+pub(crate) unsafe fn drive_witness_packed_and_lincheck_overwrite<S: Sync, F>(
     initial_states: &[S],
     padding: &S,
     n_blocks_log: usize,
@@ -269,22 +275,29 @@ pub(crate) fn drive_witness_packed_and_lincheck_overwrite<S: Sync, F>(
     per_block: F,
 ) -> (Vec<F128>, Vec<F128>, Vec<F128>, Vec<u8>)
 where
-    F: Fn(&S, &mut [u64], &mut [u64], &mut [u64]) + Sync,
+    F: Fn(&S, &mut [MaybeUninit<u64>], &mut [MaybeUninit<u64>], &mut [MaybeUninit<u64>]) + Sync,
 {
-    drive_witness_packed_and_lincheck_impl(
-        initial_states,
-        Some(padding),
-        n_blocks_log,
-        k_log,
-        false,
-        per_block,
-    )
+    // SAFETY: forwarded caller contract.
+    unsafe {
+        drive_witness_packed_and_lincheck_overwrite_impl(
+            initial_states,
+            padding,
+            n_blocks_log,
+            k_log,
+            per_block,
+        )
+    }
 }
 
 /// Stripe-free sibling of [`drive_witness_packed_and_lincheck_overwrite`].
 /// Produces only canonical block-major `(z, a, b)` for callers that fold
 /// lincheck directly from `z` after the outer challenge is sampled.
-pub(crate) fn drive_witness_packed_overwrite<S: Sync, F>(
+///
+/// # Safety
+///
+/// `per_block` must initialize every element of all three destination slices
+/// before returning. If it panics, the uninitialized owner is dropped safely.
+pub(crate) unsafe fn drive_witness_packed_overwrite<S: Sync, F>(
     initial_states: &[S],
     padding: &S,
     n_blocks_log: usize,
@@ -292,7 +305,7 @@ pub(crate) fn drive_witness_packed_overwrite<S: Sync, F>(
     per_block: F,
 ) -> (Vec<F128>, Vec<F128>, Vec<F128>)
 where
-    F: Fn(&S, &mut [u64], &mut [u64], &mut [u64]) + Sync,
+    F: Fn(&S, &mut [MaybeUninit<u64>], &mut [MaybeUninit<u64>], &mut [MaybeUninit<u64>]) + Sync,
 {
     use rayon::prelude::*;
 
@@ -306,13 +319,14 @@ where
     );
 
     let total_f128 = n_total * f128_per_block;
-    let mut z = flock_core::scratch::take_f128(total_f128);
-    let mut a = flock_core::scratch::take_f128(total_f128);
-    let mut b = flock_core::scratch::take_f128(total_f128);
+    let mut z = flock_core::scratch::take_f128_overwrite(total_f128);
+    let mut a = flock_core::scratch::take_f128_overwrite(total_f128);
+    let mut b = flock_core::scratch::take_f128_overwrite(total_f128);
 
-    z.par_chunks_mut(8 * f128_per_block)
-        .zip(a.par_chunks_mut(8 * f128_per_block))
-        .zip(b.par_chunks_mut(8 * f128_per_block))
+    z.as_mut_slice()
+        .par_chunks_mut(8 * f128_per_block)
+        .zip(a.as_mut_slice().par_chunks_mut(8 * f128_per_block))
+        .zip(b.as_mut_slice().par_chunks_mut(8 * f128_per_block))
         .enumerate()
         .for_each(|(g, ((z_grp, a_grp), b_grp))| {
             for k_in in 0..8 {
@@ -321,31 +335,118 @@ where
                 let z_chunk = &mut z_grp[k_in * f128_per_block..(k_in + 1) * f128_per_block];
                 let a_chunk = &mut a_grp[k_in * f128_per_block..(k_in + 1) * f128_per_block];
                 let b_chunk = &mut b_grp[k_in * f128_per_block..(k_in + 1) * f128_per_block];
-                // SAFETY: F128 is repr(C, align(16)) with two little-endian
-                // u64 fields, and the producer overwrites every destination.
-                let z_u64 = unsafe {
-                    std::slice::from_raw_parts_mut(
-                        z_chunk.as_mut_ptr() as *mut u64,
-                        z_chunk.len() * 2,
-                    )
-                };
-                let a_u64 = unsafe {
-                    std::slice::from_raw_parts_mut(
-                        a_chunk.as_mut_ptr() as *mut u64,
-                        a_chunk.len() * 2,
-                    )
-                };
-                let b_u64 = unsafe {
-                    std::slice::from_raw_parts_mut(
-                        b_chunk.as_mut_ptr() as *mut u64,
-                        b_chunk.len() * 2,
-                    )
-                };
+                let z_u64 = f128_overwrite_words(z_chunk);
+                let a_u64 = f128_overwrite_words(a_chunk);
+                let b_u64 = f128_overwrite_words(b_chunk);
                 per_block(initial, z_u64, a_u64, b_u64);
             }
         });
 
+    // SAFETY: every one of the n_total blocks, including padding blocks, was
+    // completely overwritten before the joined Rayon traversal returned.
+    let z = unsafe { z.assume_init() };
+    let a = unsafe { a.assume_init() };
+    let b = unsafe { b.assume_init() };
     (z, a, b)
+}
+
+const _: () = {
+    assert!(std::mem::size_of::<F128>() == 2 * std::mem::size_of::<u64>());
+    assert!(std::mem::align_of::<F128>() == 16);
+    assert!(std::mem::offset_of!(F128, lo) == 0);
+    assert!(std::mem::offset_of!(F128, hi) == std::mem::size_of::<u64>());
+};
+
+/// Reborrow an uninitialized F128 output block as its two-u64 representation.
+/// Unlike `&mut [u64]`, this reference is valid before the producer writes it.
+#[inline(always)]
+fn f128_overwrite_words(values: &mut [MaybeUninit<F128>]) -> &mut [MaybeUninit<u64>] {
+    // SAFETY: F128 is repr(C, align(16)) with exactly two u64 fields, and
+    // MaybeUninit<T> has T's layout. The output slice retains the input's
+    // exclusive borrow and spans exactly the same allocation bytes.
+    unsafe {
+        std::slice::from_raw_parts_mut(
+            values.as_mut_ptr().cast::<MaybeUninit<u64>>(),
+            values.len() * 2,
+        )
+    }
+}
+
+unsafe fn drive_witness_packed_and_lincheck_overwrite_impl<S: Sync, F>(
+    initial_states: &[S],
+    padding: &S,
+    n_blocks_log: usize,
+    k_log: usize,
+    per_block: F,
+) -> (Vec<F128>, Vec<F128>, Vec<F128>, Vec<u8>)
+where
+    F: Fn(&S, &mut [MaybeUninit<u64>], &mut [MaybeUninit<u64>], &mut [MaybeUninit<u64>]) + Sync,
+{
+    use rayon::prelude::*;
+
+    let k = 1usize << k_log;
+    let f128_per_block = k / 128;
+    let u64_per_block = k / 64;
+    let n_total = 1usize << n_blocks_log;
+    assert!(initial_states.len() <= n_total);
+    assert!(
+        n_total >= 8 && n_total.is_multiple_of(8),
+        "lincheck stripe layout requires n_total ≥ 8 and divisible by 8"
+    );
+
+    let total_f128 = n_total * f128_per_block;
+    let mut z = flock_core::scratch::take_f128_overwrite(total_f128);
+    let mut a = flock_core::scratch::take_f128_overwrite(total_f128);
+    let mut b = flock_core::scratch::take_f128_overwrite(total_f128);
+    let mut z_lincheck = take_lincheck_stripe((n_total / 8) * k);
+
+    z.as_mut_slice()
+        .par_chunks_mut(8 * f128_per_block)
+        .zip(a.as_mut_slice().par_chunks_mut(8 * f128_per_block))
+        .zip(b.as_mut_slice().par_chunks_mut(8 * f128_per_block))
+        .zip(z_lincheck.par_chunks_mut(k))
+        .enumerate()
+        .for_each(|(g, (((z_grp, a_grp), b_grp), stripe))| {
+            for k_in in 0..8 {
+                let global_idx = 8 * g + k_in;
+                let initial = initial_states.get(global_idx).unwrap_or(padding);
+                let z_chunk = &mut z_grp[k_in * f128_per_block..(k_in + 1) * f128_per_block];
+                let a_chunk = &mut a_grp[k_in * f128_per_block..(k_in + 1) * f128_per_block];
+                let b_chunk = &mut b_grp[k_in * f128_per_block..(k_in + 1) * f128_per_block];
+                per_block(
+                    initial,
+                    f128_overwrite_words(z_chunk),
+                    f128_overwrite_words(a_chunk),
+                    f128_overwrite_words(b_chunk),
+                );
+            }
+
+            // All eight z blocks are initialized above, so reading their u64
+            // representation for the stripe transpose is now valid.
+            let z_u64_all: &[u64] = unsafe {
+                std::slice::from_raw_parts(z_grp.as_ptr().cast::<u64>(), z_grp.len() * 2)
+            };
+            for i in 0..u64_per_block {
+                let lanes: [u64; 8] = [
+                    z_u64_all[i],
+                    z_u64_all[u64_per_block + i],
+                    z_u64_all[2 * u64_per_block + i],
+                    z_u64_all[3 * u64_per_block + i],
+                    z_u64_all[4 * u64_per_block + i],
+                    z_u64_all[5 * u64_per_block + i],
+                    z_u64_all[6 * u64_per_block + i],
+                    z_u64_all[7 * u64_per_block + i],
+                ];
+                transpose_8_u64s_to_64_bytes(&lanes, &mut stripe[i * 64..i * 64 + 64]);
+            }
+        });
+
+    // SAFETY: all n_total blocks, including padding blocks, were completely
+    // overwritten before the joined Rayon traversal returned.
+    let z = unsafe { z.assume_init() };
+    let a = unsafe { a.assume_init() };
+    let b = unsafe { b.assume_init() };
+    (z, a, b, z_lincheck)
 }
 
 fn drive_witness_packed_and_lincheck_impl<S: Sync, F>(

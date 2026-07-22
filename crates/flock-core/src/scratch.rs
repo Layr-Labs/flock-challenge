@@ -18,6 +18,7 @@
 //! e.g. after the last prove of a batch.
 
 use crate::field::F128;
+use std::mem::{ManuallyDrop, MaybeUninit};
 use std::sync::Mutex;
 
 static POOL: Mutex<Vec<Vec<F128>>> = Mutex::new(Vec::new());
@@ -46,11 +47,7 @@ pub fn take_f128(n: usize) -> Vec<F128> {
     crate::alloc_uninit_vec(n)
 }
 
-/// Pool-only variant of [`take_f128`]: returns `None` instead of falling
-/// back to a fresh allocation. Lets callers branch on warm-vs-cold (e.g.
-/// the commit prefault skips its page-touch thread when the pool can
-/// supply an already-resident buffer).
-pub(crate) fn try_take_f128(n: usize) -> Option<Vec<F128>> {
+fn take_pooled_f128(n: usize) -> Option<Vec<F128>> {
     let mut pool = POOL.lock().unwrap();
     let mut best: Option<usize> = None;
     for (i, v) in pool.iter().enumerate() {
@@ -58,9 +55,15 @@ pub(crate) fn try_take_f128(n: usize) -> Option<Vec<F128>> {
             best = Some(i);
         }
     }
-    if let Some(i) = best {
-        let mut v = pool.swap_remove(i);
-        drop(pool);
+    best.map(|i| pool.swap_remove(i))
+}
+
+/// Pool-only variant of [`take_f128`]: returns `None` instead of falling
+/// back to a fresh allocation. Lets callers branch on warm-vs-cold (e.g.
+/// the commit prefault skips its page-touch thread when the pool can
+/// supply an already-resident buffer).
+pub(crate) fn try_take_f128(n: usize) -> Option<Vec<F128>> {
+    if let Some(mut v) = take_pooled_f128(n) {
         v.clear();
         // SAFETY: capacity ≥ n was checked above; F128: Copy (no Drop), so
         // exposing uninit/stale elements is sound to *hold* — the caller
@@ -69,6 +72,53 @@ pub(crate) fn try_take_f128(n: usize) -> Option<Vec<F128>> {
         return Some(v);
     }
     None
+}
+
+/// Exclusive owner for a pooled `F128` allocation while an overwrite producer
+/// initializes it. Its slice is typed as `MaybeUninit`, so partitioning and
+/// handing out disjoint mutable blocks is valid before any values are written.
+pub struct F128OverwriteBuffer {
+    buf: Vec<MaybeUninit<F128>>,
+}
+
+impl F128OverwriteBuffer {
+    pub fn as_mut_slice(&mut self) -> &mut [MaybeUninit<F128>] {
+        &mut self.buf
+    }
+
+    /// Convert the completed overwrite allocation back to `Vec<F128>`.
+    ///
+    /// # Safety
+    ///
+    /// Every element of `self` must have been fully initialized.
+    pub unsafe fn assume_init(self) -> Vec<F128> {
+        let mut buf = ManuallyDrop::new(self.buf);
+        // SAFETY: guaranteed by the caller. `MaybeUninit<F128>` has the same
+        // layout as `F128`, and the allocation metadata is preserved exactly.
+        unsafe { Vec::from_raw_parts(buf.as_mut_ptr().cast::<F128>(), buf.len(), buf.capacity()) }
+    }
+}
+
+/// Take an uninitialized length-`n` overwrite allocation without ever forming
+/// a `Vec<F128>` or `&mut [F128]` over its unwritten elements. Pooled storage is
+/// reused without clearing its bytes; fresh storage is allocation-only.
+pub fn take_f128_overwrite(n: usize) -> F128OverwriteBuffer {
+    let mut pooled = take_pooled_f128(n).unwrap_or_else(|| Vec::with_capacity(n));
+    pooled.clear();
+    let mut pooled = ManuallyDrop::new(pooled);
+    // SAFETY: `MaybeUninit<F128>` has the same layout as `F128`; length zero
+    // avoids asserting anything about prior contents. Setting the new length
+    // is valid because uninitialized bytes are valid `MaybeUninit` values and
+    // the selected/allotted capacity is at least n.
+    let mut buf = unsafe {
+        Vec::from_raw_parts(
+            pooled.as_mut_ptr().cast::<MaybeUninit<F128>>(),
+            0,
+            pooled.capacity(),
+        )
+    };
+    unsafe { buf.set_len(n) };
+    F128OverwriteBuffer { buf }
 }
 
 /// Return a buffer to the pool for reuse. When the pool is full, the
@@ -136,8 +186,11 @@ pub fn clear() {
 mod tests {
     use super::*;
 
+    static TEST_LOCK: Mutex<()> = Mutex::new(());
+
     #[test]
     fn take_reuses_given_buffer() {
+        let _serial = TEST_LOCK.lock().unwrap();
         clear();
         let mut v = take_f128(1024);
         for slot in v.iter_mut() {
@@ -153,7 +206,55 @@ mod tests {
     }
 
     #[test]
+    fn overwrite_owner_reuses_without_exposing_uninitialized_f128() {
+        let _serial = TEST_LOCK.lock().unwrap();
+        clear();
+        let mut out = take_f128_overwrite(1024);
+        let ptr = out.as_mut_slice().as_mut_ptr();
+        for slot in out.as_mut_slice() {
+            slot.write(F128 { lo: 17, hi: 23 });
+        }
+        // SAFETY: every element was initialized by the loop above.
+        let initialized = unsafe { out.assume_init() };
+        assert!(
+            initialized
+                .iter()
+                .all(|&slot| slot == (F128 { lo: 17, hi: 23 }))
+        );
+        give_f128(initialized);
+
+        let mut reused = take_f128_overwrite(512);
+        assert_eq!(reused.as_mut_slice().as_mut_ptr(), ptr);
+        for slot in reused.as_mut_slice() {
+            slot.write(F128 { lo: 29, hi: 31 });
+        }
+        // SAFETY: every element was initialized by the loop above.
+        let initialized = unsafe { reused.assume_init() };
+        assert!(
+            initialized
+                .iter()
+                .all(|&slot| slot == (F128 { lo: 29, hi: 31 }))
+        );
+        clear();
+    }
+
+    #[test]
+    fn partial_overwrite_owner_drops_without_entering_pool() {
+        let _serial = TEST_LOCK.lock().unwrap();
+        clear();
+        let result = std::panic::catch_unwind(|| {
+            let mut out = take_f128_overwrite(1024);
+            out.as_mut_slice()[0].write(F128 { lo: 37, hi: 41 });
+            panic!("simulated overwrite producer panic");
+        });
+        assert!(result.is_err());
+        assert!(POOL.lock().unwrap().is_empty());
+        clear();
+    }
+
+    #[test]
     fn pool_is_bounded() {
+        let _serial = TEST_LOCK.lock().unwrap();
         clear();
         for _ in 0..(MAX_POOLED + 4) {
             give_f128(take_f128(16));

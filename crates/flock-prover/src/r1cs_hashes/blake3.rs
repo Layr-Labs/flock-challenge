@@ -95,6 +95,7 @@ use flock_core::pcs::{Commitment, PcsParams};
 use flock_core::proof::R1csClaim;
 use flock_core::r1cs::{BlockR1cs, SparseBinaryMatrix};
 use flock_core::verifier;
+use std::mem::MaybeUninit;
 use std::sync::OnceLock;
 
 // ---------------------------------------------------------------------------
@@ -1032,13 +1033,15 @@ pub fn generate_witness(blocks: &[Compression], n_blocks_log: usize) -> Vec<bool
 // - Padding row:         all zero.
 // ---------------------------------------------------------------------------
 
+const U64_PER_BLOCK: usize = K / 64;
+
 /// Streaming writer for the contiguous row interval `[Z_CONST_POS,
 /// USEFUL_BITS)`. All three row values advance together, and completed u64s
 /// are assigned rather than OR'd into a pre-zeroed destination.
 struct PackedRowStream<'a> {
-    z: &'a mut [u64],
-    a: &'a mut [u64],
-    b: &'a mut [u64],
+    z: &'a mut [MaybeUninit<u64>; U64_PER_BLOCK],
+    a: &'a mut [MaybeUninit<u64>; U64_PER_BLOCK],
+    b: &'a mut [MaybeUninit<u64>; U64_PER_BLOCK],
     word_idx: usize,
     used: usize,
     z_word: u64,
@@ -1048,7 +1051,12 @@ struct PackedRowStream<'a> {
 
 impl<'a> PackedRowStream<'a> {
     #[inline(always)]
-    fn new(z: &'a mut [u64], a: &'a mut [u64], b: &'a mut [u64], start_bit: usize) -> Self {
+    fn new(
+        z: &'a mut [MaybeUninit<u64>; U64_PER_BLOCK],
+        a: &'a mut [MaybeUninit<u64>; U64_PER_BLOCK],
+        b: &'a mut [MaybeUninit<u64>; U64_PER_BLOCK],
+        start_bit: usize,
+    ) -> Self {
         debug_assert_eq!(start_bit & 63, 0);
         Self {
             z,
@@ -1080,9 +1088,17 @@ impl<'a> PackedRowStream<'a> {
 
         let remaining = 64 - self.used;
         if WIDTH >= remaining {
-            self.z[self.word_idx] = self.z_word;
-            self.a[self.word_idx] = self.a_word;
-            self.b[self.word_idx] = self.b_word;
+            debug_assert!(self.word_idx < U64_PER_BLOCK);
+            // SAFETY: this private stream is constructed at Z_CONST_POS and
+            // receives the fixed builder sequence ending at USEFUL_BITS. Its
+            // full-word commits are therefore exactly words 8..=239; finish()
+            // handles partial word 240 and tail words 241..=255. References to
+            // the exact 256-word MaybeUninit arrays are valid before writing.
+            unsafe {
+                self.z.get_unchecked_mut(self.word_idx).write(self.z_word);
+                self.a.get_unchecked_mut(self.word_idx).write(self.a_word);
+                self.b.get_unchecked_mut(self.word_idx).write(self.b_word);
+            }
             self.word_idx += 1;
             self.used = WIDTH - remaining;
             self.z_word = z >> remaining;
@@ -1116,14 +1132,14 @@ impl<'a> PackedRowStream<'a> {
     #[inline]
     fn finish(mut self) {
         if self.used != 0 {
-            self.z[self.word_idx] = self.z_word;
-            self.a[self.word_idx] = self.a_word;
-            self.b[self.word_idx] = self.b_word;
+            self.z[self.word_idx].write(self.z_word);
+            self.a[self.word_idx].write(self.a_word);
+            self.b[self.word_idx].write(self.b_word);
             self.word_idx += 1;
         }
-        self.z[self.word_idx..].fill(0);
-        self.a[self.word_idx..].fill(0);
-        self.b[self.word_idx..].fill(0);
+        self.z[self.word_idx..].fill(MaybeUninit::new(0));
+        self.a[self.word_idx..].fill(MaybeUninit::new(0));
+        self.b[self.word_idx..].fill(MaybeUninit::new(0));
     }
 }
 
@@ -1132,17 +1148,17 @@ impl<'a> PackedRowStream<'a> {
 fn write_aligned_lin_words(
     bit_off: usize,
     vals: &[u32; 8],
-    z: &mut [u64],
-    a: &mut [u64],
-    b: &mut [u64],
+    z: &mut [MaybeUninit<u64>],
+    a: &mut [MaybeUninit<u64>],
+    b: &mut [MaybeUninit<u64>],
 ) {
     debug_assert_eq!(bit_off & 63, 0);
     let base = bit_off >> 6;
     for i in 0..4 {
         let packed = vals[2 * i] as u64 | ((vals[2 * i + 1] as u64) << 32);
-        z[base + i] = packed;
-        a[base + i] = packed;
-        b[base + i] = u64::MAX;
+        z[base + i].write(packed);
+        a[base + i].write(packed);
+        b[base + i].write(u64::MAX);
     }
 }
 
@@ -1159,14 +1175,19 @@ fn build_block_witness_ab_packed_into(
     counter: u64,
     block_len: u32,
     flags: u32,
-    z: &mut [u64],
-    a: &mut [u64],
-    b: &mut [u64],
+    z: &mut [MaybeUninit<u64>],
+    a: &mut [MaybeUninit<u64>],
+    b: &mut [MaybeUninit<u64>],
 ) {
-    const U64_PER_BLOCK: usize = K / 64;
-    debug_assert_eq!(z.len(), U64_PER_BLOCK);
-    debug_assert_eq!(a.len(), U64_PER_BLOCK);
-    debug_assert_eq!(b.len(), U64_PER_BLOCK);
+    let z: &mut [MaybeUninit<u64>; U64_PER_BLOCK] = z
+        .try_into()
+        .expect("z block must contain exactly 256 u64 words");
+    let a: &mut [MaybeUninit<u64>; U64_PER_BLOCK] = a
+        .try_into()
+        .expect("a block must contain exactly 256 u64 words");
+    let b: &mut [MaybeUninit<u64>; U64_PER_BLOCK] = b
+        .try_into()
+        .expect("b block must contain exactly 256 u64 words");
 
     let counter_lo = counter as u32;
     let counter_hi = (counter >> 32) as u32;
@@ -1272,16 +1293,21 @@ pub fn generate_witness_with_ab_packed(
     // compression of the all-zero input (constant = 1), matching
     // [`generate_witness_with_ab_packed_and_lincheck`].
     let padding: Compression = ([0u32; 8], [0u32; 16], 0u64, 0u32, 0u32);
-    super::common::drive_witness_packed_overwrite(
-        blocks,
-        &padding,
-        n_blocks_log,
-        K_LOG,
-        |block: &Compression, z_u64, a_u64, b_u64| {
-            let (cv, m, t, bl, fl) = block;
-            build_block_witness_ab_packed_into(cv, m, *t, *bl, *fl, z_u64, a_u64, b_u64);
-        },
-    )
+    // SAFETY: the builder writes CV words 0..=3, OUT_LO words 4..=7,
+    // stream words 8..=240, and zero tail words 241..=255 for z/a/b. The
+    // driver invokes it for every real and padding block before assume_init.
+    unsafe {
+        super::common::drive_witness_packed_overwrite(
+            blocks,
+            &padding,
+            n_blocks_log,
+            K_LOG,
+            |block: &Compression, z_u64, a_u64, b_u64| {
+                let (cv, m, t, bl, fl) = block;
+                build_block_witness_ab_packed_into(cv, m, *t, *bl, *fl, z_u64, a_u64, b_u64);
+            },
+        )
+    }
 }
 
 /// Like [`generate_witness_with_ab_packed`] but also emits the lincheck
@@ -1311,16 +1337,21 @@ pub fn generate_witness_with_ab_packed_and_lincheck(
     // every block. (The chain forbids padding, so this only affects the
     // standalone batch setup.)
     let padding: Compression = ([0u32; 8], [0u32; 16], 0u64, 0u32, 0u32);
-    super::common::drive_witness_packed_and_lincheck_overwrite(
-        blocks,
-        &padding,
-        n_blocks_log,
-        K_LOG,
-        |block: &Compression, z_u64, a_u64, b_u64| {
-            let (cv, m, t, bl, fl) = block;
-            build_block_witness_ab_packed_into(cv, m, *t, *bl, *fl, z_u64, a_u64, b_u64);
-        },
-    )
+    // SAFETY: the builder writes CV words 0..=3, OUT_LO words 4..=7,
+    // stream words 8..=240, and zero tail words 241..=255 for z/a/b. The
+    // driver invokes it for every real and padding block before assume_init.
+    unsafe {
+        super::common::drive_witness_packed_and_lincheck_overwrite(
+            blocks,
+            &padding,
+            n_blocks_log,
+            K_LOG,
+            |block: &Compression, z_u64, a_u64, b_u64| {
+                let (cv, m, t, bl, fl) = block;
+                build_block_witness_ab_packed_into(cv, m, *t, *bl, *fl, z_u64, a_u64, b_u64);
+            },
+        )
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1946,6 +1977,243 @@ mod tests {
         assert!(USEFUL_BITS <= K);
         assert_eq!(CV_BASE % SLOT_BITS, 0);
         assert_eq!(OUT_LO_BASE % SLOT_BITS, 0);
+    }
+
+    fn push_zero_and_record_commit<const WIDTH: usize>(
+        rows: &mut PackedRowStream<'_>,
+        commits: &mut Vec<usize>,
+    ) {
+        let before = rows.word_idx;
+        rows.push::<WIDTH>(0, 0, 0);
+        if rows.word_idx != before {
+            assert_eq!(rows.word_idx, before + 1);
+            commits.push(before);
+        }
+    }
+
+    unsafe fn assume_init_u64_slice(values: &[MaybeUninit<u64>]) -> &[u64] {
+        // SAFETY: guaranteed by the caller; MaybeUninit<u64> has u64's layout.
+        unsafe { std::slice::from_raw_parts(values.as_ptr().cast::<u64>(), values.len()) }
+    }
+
+    /// Locks down the cursor proof used by the three unchecked stores in
+    /// `PackedRowStream::push`: the fixed builder sequence can only commit
+    /// complete words 8 through 239.
+    #[test]
+    fn packed_row_stream_cursor_invariants() {
+        assert_eq!(U64_PER_BLOCK, 256);
+        assert_eq!((Z_CONST_POS >> 6, Z_CONST_POS & 63), (8, 0));
+        assert_eq!((GS_BASE >> 6, GS_BASE & 63), (18, 1));
+        assert_eq!((OUT_HI_BASE >> 6, OUT_HI_BASE & 63), (236, 49));
+        assert_eq!((USEFUL_BITS >> 6, USEFUL_BITS & 63), (240, 49));
+
+        let poison = 0xD6D6_D6D6_D6D6_D6D6;
+        let mut z = [MaybeUninit::new(poison); U64_PER_BLOCK];
+        let mut a = [MaybeUninit::new(poison); U64_PER_BLOCK];
+        let mut b = [MaybeUninit::new(poison); U64_PER_BLOCK];
+        let mut rows = PackedRowStream::new(&mut z, &mut a, &mut b, Z_CONST_POS);
+        let mut commits = Vec::new();
+
+        push_zero_and_record_commit::<1>(&mut rows, &mut commits);
+        for _ in 0..20 {
+            push_zero_and_record_commit::<WORD_BITS>(&mut rows, &mut commits);
+        }
+        assert_eq!(rows.position(), GS_BASE);
+        assert_eq!(commits, (8..18).collect::<Vec<_>>());
+
+        let commits_before_g = commits.len();
+        for _ in 0..N_G {
+            for _ in 0..6 {
+                push_zero_and_record_commit::<CARRY_BITS_PER_ADD>(&mut rows, &mut commits);
+            }
+            for _ in 0..2 {
+                push_zero_and_record_commit::<WORD_BITS>(&mut rows, &mut commits);
+            }
+        }
+        assert_eq!(rows.position(), OUT_HI_BASE);
+        assert_eq!(commits.len() - commits_before_g, 218);
+        assert_eq!(&commits[commits_before_g..], (18..236).collect::<Vec<_>>());
+
+        for _ in 0..8 {
+            push_zero_and_record_commit::<WORD_BITS>(&mut rows, &mut commits);
+        }
+        assert_eq!(rows.position(), USEFUL_BITS);
+        assert_eq!(rows.word_idx, 240);
+        assert_eq!(rows.used, 49);
+        assert_eq!(commits, (8..240).collect::<Vec<_>>());
+        rows.finish();
+
+        // SAFETY: every slot began initialized; the stream overwrote 8..=255.
+        let z = unsafe { assume_init_u64_slice(&z) };
+        let a = unsafe { assume_init_u64_slice(&a) };
+        let b = unsafe { assume_init_u64_slice(&b) };
+        assert!(z[..8].iter().all(|&word| word == poison));
+        assert!(a[..8].iter().all(|&word| word == poison));
+        assert!(b[..8].iter().all(|&word| word == poison));
+        assert!(z[8..].iter().all(|&word| word == 0));
+        assert!(a[8..].iter().all(|&word| word == 0));
+        assert!(b[8..].iter().all(|&word| word == 0));
+    }
+
+    fn pack_bool_block(bits: &[bool]) -> [u64; U64_PER_BLOCK] {
+        assert_eq!(bits.len(), K);
+        std::array::from_fn(|word_idx| {
+            let mut word = 0u64;
+            for bit in 0..64 {
+                word |= u64::from(bits[word_idx * 64 + bit]) << bit;
+            }
+            word
+        })
+    }
+
+    fn apply_matrix_packed(matrix: &SparseBinaryMatrix, z: &[bool]) -> [u64; U64_PER_BLOCK] {
+        assert_eq!(matrix.num_rows, K);
+        assert_eq!(matrix.num_cols, K);
+        assert_eq!(z.len(), K);
+        let mut packed = [0u64; U64_PER_BLOCK];
+        for (row_idx, cols) in matrix.rows.iter().enumerate() {
+            let value = cols.iter().fold(false, |acc, &col| acc ^ z[col]);
+            packed[row_idx >> 6] |= u64::from(value) << (row_idx & 63);
+        }
+        packed
+    }
+
+    fn assert_packed_builder_matches_reference(
+        label: &str,
+        cv: &[u32; 8],
+        m: &[u32; 16],
+        counter: u64,
+        block_len: u32,
+        flags: u32,
+        a_matrix: &SparseBinaryMatrix,
+        b_matrix: &SparseBinaryMatrix,
+    ) {
+        const Z_POISON: u64 = 0xA55A_3CC3_6996_F00F;
+        const A_POISON: u64 = 0x1BAD_C0DE_D15C_A11A;
+        const B_POISON: u64 = 0xBADC_0FFE_E0DD_F00D;
+
+        let mut z_storage = [MaybeUninit::new(Z_POISON); U64_PER_BLOCK + 2];
+        let mut a_storage = [MaybeUninit::new(A_POISON); U64_PER_BLOCK + 2];
+        let mut b_storage = [MaybeUninit::new(B_POISON); U64_PER_BLOCK + 2];
+        build_block_witness_ab_packed_into(
+            cv,
+            m,
+            counter,
+            block_len,
+            flags,
+            &mut z_storage[1..U64_PER_BLOCK + 1],
+            &mut a_storage[1..U64_PER_BLOCK + 1],
+            &mut b_storage[1..U64_PER_BLOCK + 1],
+        );
+
+        // SAFETY: every element began initialized with its role poison. A
+        // missed builder write therefore yields a differential mismatch rather
+        // than making this test's read undefined.
+        let z_storage = unsafe { assume_init_u64_slice(&z_storage) };
+        let a_storage = unsafe { assume_init_u64_slice(&a_storage) };
+        let b_storage = unsafe { assume_init_u64_slice(&b_storage) };
+        assert_eq!(z_storage[0], Z_POISON, "z prefix redzone: {label}");
+        assert_eq!(
+            z_storage[U64_PER_BLOCK + 1],
+            Z_POISON,
+            "z suffix redzone: {label}"
+        );
+        assert_eq!(a_storage[0], A_POISON, "a prefix redzone: {label}");
+        assert_eq!(
+            a_storage[U64_PER_BLOCK + 1],
+            A_POISON,
+            "a suffix redzone: {label}"
+        );
+        assert_eq!(b_storage[0], B_POISON, "b prefix redzone: {label}");
+        assert_eq!(
+            b_storage[U64_PER_BLOCK + 1],
+            B_POISON,
+            "b suffix redzone: {label}"
+        );
+
+        let z_bool = build_block_witness(cv, m, counter, block_len, flags);
+        let z_reference = pack_bool_block(&z_bool);
+        let a_reference = apply_matrix_packed(a_matrix, &z_bool);
+        let b_reference = apply_matrix_packed(b_matrix, &z_bool);
+        assert_eq!(
+            &z_storage[1..U64_PER_BLOCK + 1],
+            z_reference.as_slice(),
+            "z mismatch: {label}"
+        );
+        assert_eq!(
+            &a_storage[1..U64_PER_BLOCK + 1],
+            a_reference.as_slice(),
+            "a mismatch: {label}"
+        );
+        assert_eq!(
+            &b_storage[1..U64_PER_BLOCK + 1],
+            b_reference.as_slice(),
+            "b mismatch: {label}"
+        );
+    }
+
+    /// Differentially checks poisoned exact-array destinations against the
+    /// boolean witness and sparse-matrix oracles, with guards around every
+    /// destination slice. Covers boundary values and deterministic random data.
+    #[test]
+    fn packed_builder_exact_array_redzones_and_differential() {
+        let (a_matrix, b_matrix) = build_matrices();
+
+        let alternating_cv =
+            std::array::from_fn(|i| if i & 1 == 0 { 0xAAAA_AAAA } else { 0x5555_5555 });
+        let alternating_m =
+            std::array::from_fn(|i| if i & 1 == 0 { 0x5555_5555 } else { 0xAAAA_AAAA });
+        let edges = [
+            ("all-zero", [0u32; 8], [0u32; 16], 0u64, 0u32, 0u32),
+            (
+                "all-one",
+                [u32::MAX; 8],
+                [u32::MAX; 16],
+                u64::MAX,
+                u32::MAX,
+                u32::MAX,
+            ),
+            (
+                "alternating",
+                alternating_cv,
+                alternating_m,
+                0xAAAA_AAAA_5555_5555,
+                64,
+                CHUNK_START | CHUNK_END | ROOT,
+            ),
+            (
+                "single-high-bits",
+                std::array::from_fn(|i| 1u32 << (31 - i)),
+                std::array::from_fn(|i| 1u32 << (31 - i)),
+                1u64 << 63,
+                1u32 << 31,
+                1u32 << 31,
+            ),
+        ];
+        for (label, cv, m, counter, block_len, flags) in edges {
+            assert_packed_builder_matches_reference(
+                label, &cv, &m, counter, block_len, flags, &a_matrix, &b_matrix,
+            );
+        }
+
+        let mut rng = Rng::new(0xE9E9_B352_256A_11CE);
+        for case_idx in 0..16 {
+            let cv = std::array::from_fn(|_| rng.next_u32());
+            let m = std::array::from_fn(|_| rng.next_u32());
+            let counter = (u64::from(rng.next_u32()) << 32) | u64::from(rng.next_u32());
+            let block_len = rng.next_u32();
+            let flags = rng.next_u32();
+            assert_packed_builder_matches_reference(
+                &format!("random-{case_idx}"),
+                &cv,
+                &m,
+                counter,
+                block_len,
+                flags,
+                &a_matrix,
+                &b_matrix,
+            );
+        }
     }
 
     /// Reference compression matches the `blake3` crate for empty input
