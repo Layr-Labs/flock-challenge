@@ -1454,7 +1454,9 @@ mod tests {
         // fold_and_compute requires lo_size ≥ 2 in SplitEqGhash. eq is over
         // r_next[1..] (size log_n − 2); with MAX_N_HI = 7, n_lo ≥ 1 needs
         // eq size ≥ 8 ⇒ log_n ≥ 10. Smaller cases use the unfused path.
-        for &log_n in &[10usize, 11, 12] {
+        // Cover every tail shape through and beyond the SME2 threshold:
+        // lo_size = 2^(log_n-9), so log_n=15/16 straddles 64/128.
+        for log_n in 10usize..=18 {
             let n = 1usize << log_n;
             let a: Vec<F128> = (0..n).map(|_| rng.f128()).collect();
             let b: Vec<F128> = (0..n).map(|_| rng.f128()).collect();
