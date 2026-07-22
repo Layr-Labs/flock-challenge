@@ -307,27 +307,45 @@ pub fn blake3_compress(
     state
 }
 
-/// `per_round_msg_idx()[r][g] = (mx_idx, my_idx)` for round `r`, G index `g`
-/// — i.e., `PERM^r [G_MSG_IDX[g]]`.
-fn per_round_msg_idx() -> [[[usize; 2]; N_G_PER_ROUND]; N_ROUNDS] {
-    let mut perm = [0usize; 16];
-    for i in 0..16 {
-        perm[i] = i;
+type MessageIndexSchedule = [[[u8; 2]; N_G_PER_ROUND]; N_ROUNDS];
+
+/// Build `PER_ROUND_MSG_IDX[r][g] = PERM^r[G_MSG_IDX[g]]` at compile time.
+///
+/// Indices are in `0..16`, so a compact `u8` table is sufficient. Keeping the
+/// result in a `static` (rather than returning a by-value array) prevents the
+/// per-compression witness builder from materializing and initializing the old
+/// 896-byte `usize` schedule on its stack.
+const fn build_message_index_schedule() -> MessageIndexSchedule {
+    let mut perm = [0u8; 16];
+    let mut i = 0;
+    while i < 16 {
+        perm[i] = i as u8;
+        i += 1;
     }
-    let mut out = [[[0usize; 2]; N_G_PER_ROUND]; N_ROUNDS];
-    for r in 0..N_ROUNDS {
-        for g in 0..N_G_PER_ROUND {
+
+    let mut out = [[[0u8; 2]; N_G_PER_ROUND]; N_ROUNDS];
+    let mut r = 0;
+    while r < N_ROUNDS {
+        let mut g = 0;
+        while g < N_G_PER_ROUND {
             out[r][g][0] = perm[G_MSG_IDX[g][0]];
             out[r][g][1] = perm[G_MSG_IDX[g][1]];
+            g += 1;
         }
-        let mut next = [0usize; 16];
-        for i in 0..16 {
+
+        let mut next = [0u8; 16];
+        i = 0;
+        while i < 16 {
             next[i] = perm[MSG_PERMUTATION[i]];
+            i += 1;
         }
         perm = next;
+        r += 1;
     }
     out
 }
+
+static PER_ROUND_MSG_IDX: MessageIndexSchedule = build_message_index_schedule();
 
 // ---------------------------------------------------------------------------
 // Lin_func cascade — per-bit lists of slot indices XOR'd to evaluate one bit.
@@ -490,7 +508,7 @@ pub fn build_matrices() -> (SparseBinaryMatrix, SparseBinaryMatrix) {
     input_emit(BLEN_BASE, WORD_BITS);
     input_emit(FLAGS_BASE, WORD_BITS);
 
-    let msg_idx = per_round_msg_idx();
+    let msg_idx = &PER_ROUND_MSG_IDX;
     let mut state: [Word; 16] = initial_lane_words();
 
     for r in 0..N_ROUNDS {
@@ -505,8 +523,8 @@ pub fn build_matrices() -> (SparseBinaryMatrix, SparseBinaryMatrix) {
             let b = state[lb].clone();
             let c = state[lc].clone();
             let d = state[ld].clone();
-            let mx = Word::from_slot_base(m_bit(mx_idx, 0));
-            let my = Word::from_slot_base(m_bit(my_idx, 0));
+            let mx = Word::from_slot_base(m_bit(mx_idx as usize, 0));
+            let my = Word::from_slot_base(m_bit(my_idx as usize, 0));
 
             // tmp_0 = a + b
             let tmp_0 = write_add_carry_rows(
@@ -731,7 +749,7 @@ fn build_lincheck_schedule() -> Blake3LincheckSchedule {
         cv[0], cv[1], cv[2], cv[3], cv[4], cv[5], cv[6], cv[7], iv[0], iv[1], iv[2], iv[3],
         counter_lo, counter_hi, block_len, flags,
     ];
-    let msg_idx = per_round_msg_idx();
+    let msg_idx = &PER_ROUND_MSG_IDX;
 
     for r in 0..N_ROUNDS {
         for g_in_round in 0..N_G_PER_ROUND {
@@ -741,12 +759,12 @@ fn build_lincheck_schedule() -> Blake3LincheckSchedule {
             let (a, b, c, d) = (state[la], state[lb], state[lc], state[ld]);
 
             let tmp_0 = schedule.add(a, b, g_add_carry_bit(g, ADD_TMP0, 0));
-            let a_1 = schedule.add(tmp_0, msg[mx_idx], g_add_carry_bit(g, ADD_A1, 0));
+            let a_1 = schedule.add(tmp_0, msg[mx_idx as usize], g_add_carry_bit(g, ADD_A1, 0));
             let d_1 = schedule.xor_rot(d, a_1, 16);
             let c_1 = schedule.add(c, d_1, g_add_carry_bit(g, ADD_C1, 0));
             let b_1 = schedule.xor_rot(b, c_1, 12);
             let tmp_1 = schedule.add(a_1, b_1, g_add_carry_bit(g, ADD_TMP1, 0));
-            let a_2 = schedule.add(tmp_1, msg[my_idx], g_add_carry_bit(g, ADD_A2, 0));
+            let a_2 = schedule.add(tmp_1, msg[my_idx as usize], g_add_carry_bit(g, ADD_A2, 0));
             let d_2 = schedule.xor_rot(d_1, a_2, 8);
             let c_2 = schedule.add(c_1, d_2, g_add_carry_bit(g, ADD_C2, 0));
 
@@ -940,15 +958,15 @@ pub fn build_block_witness(
         block_len,
         flags,
     ];
-    let msg_idx = per_round_msg_idx();
+    let msg_idx = &PER_ROUND_MSG_IDX;
 
     for r in 0..N_ROUNDS {
         for g_in_round in 0..N_G_PER_ROUND {
             let g = r * N_G_PER_ROUND + g_in_round;
             let [la, lb, lc, ld] = G_LANES[g_in_round];
             let [mx_i, my_i] = msg_idx[r][g_in_round];
-            let mx = m[mx_i];
-            let my = m[my_i];
+            let mx = m[mx_i as usize];
+            let my = m[my_i as usize];
 
             let a = state[la];
             let b = state[lb];
@@ -1206,13 +1224,13 @@ fn build_block_witness_ab_packed_into(
         block_len,
         flags,
     ];
-    let msg_idx = per_round_msg_idx();
+    let msg_idx = &PER_ROUND_MSG_IDX;
     for r in 0..N_ROUNDS {
         for g_in_round in 0..N_G_PER_ROUND {
             let [la, lb, lc, ld] = G_LANES[g_in_round];
             let [mx_i, my_i] = msg_idx[r][g_in_round];
-            let mx = m[mx_i];
-            let my = m[my_i];
+            let mx = m[mx_i as usize];
+            let my = m[my_i as usize];
 
             let a_val = state[la];
             let b_val = state[lb];
@@ -1770,14 +1788,14 @@ fn build_group_batch_major(
         block_len,
         flags,
     ];
-    let msg_idx = per_round_msg_idx();
+    let msg_idx = &PER_ROUND_MSG_IDX;
     for r in 0..N_ROUNDS {
         for g_in_round in 0..N_G_PER_ROUND {
             let g = r * N_G_PER_ROUND + g_in_round;
             let [la, lb, lc, ld] = G_LANES[g_in_round];
             let [mx_i, my_i] = msg_idx[r][g_in_round];
-            let mx = m[mx_i];
-            let my = m[my_i];
+            let mx = m[mx_i as usize];
+            let my = m[my_i as usize];
 
             let a_val = state[la];
             let b_val = state[lb];
@@ -1859,6 +1877,31 @@ mod tests {
     const CHUNK_START: u32 = 1 << 0;
     const CHUNK_END: u32 = 1 << 1;
     const ROOT: u32 = 1 << 3;
+
+    /// The compact static schedule must remain byte-for-byte equivalent to the
+    /// former runtime `usize` construction for every round and G invocation.
+    #[test]
+    fn compact_message_index_schedule_matches_runtime_reference() {
+        let mut perm = [0usize; 16];
+        for (i, slot) in perm.iter_mut().enumerate() {
+            *slot = i;
+        }
+        let mut expected = [[[0u8; 2]; N_G_PER_ROUND]; N_ROUNDS];
+        for round in &mut expected {
+            for g in 0..N_G_PER_ROUND {
+                round[g][0] = perm[G_MSG_IDX[g][0]] as u8;
+                round[g][1] = perm[G_MSG_IDX[g][1]] as u8;
+            }
+            let mut next = [0usize; 16];
+            for i in 0..16 {
+                next[i] = perm[MSG_PERMUTATION[i]];
+            }
+            perm = next;
+        }
+
+        assert_eq!(PER_ROUND_MSG_IDX, expected);
+        assert_eq!(std::mem::size_of_val(&PER_ROUND_MSG_IDX), 112);
+    }
 
     /// Batch-major witness equality vs the row-major driver (word-transpose
     /// + identical stripe), incl. padding slots via a non-power-of-two count.
