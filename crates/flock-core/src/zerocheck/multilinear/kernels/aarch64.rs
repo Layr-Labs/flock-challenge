@@ -1,5 +1,33 @@
 use crate::field::{F128, F256Unreduced};
 
+/// Explicit C layout matching the promoted Rust leaf's hidden result pointer:
+/// the leaf stores `p1` at byte 0 and `pinf` at byte 16.
+#[cfg(target_vendor = "apple")]
+#[repr(C)]
+struct Round2ChunkOutput {
+    p1: F128,
+    pinf: F128,
+}
+
+#[cfg(target_vendor = "apple")]
+#[allow(clippy::too_many_arguments)]
+#[unsafe(naked)]
+unsafe extern "C" fn round2_chunk_raw_neon(
+    _output: *mut Round2ChunkOutput,
+    _table_data: *const u8,
+    _a_packed: *const u8,
+    _b_packed: *const u8,
+    _a_out: *mut F128,
+    _b_out: *mut F128,
+    _eq_lo: *const F128,
+    _lo_size: usize,
+    _pair_idx_base: usize,
+    _pair_in_block_mask: usize,
+    _useful_pairs_inclusive: usize,
+) {
+    core::arch::naked_asm!(include_str!("round2_chunk_raw_neon_fused.S"));
+}
+
 /// Fold two adjacent output values while keeping both results in registers.
 /// `out_base` is measured in folded/output elements, so the four source
 /// elements begin at `2 * out_base`.
@@ -102,9 +130,10 @@ pub(crate) unsafe fn fold_and_message_neon(
 /// - `eq_lo` addresses `lo_size` initialized `F128`s;
 /// - `pair_idx_base + lo_size` does not overflow `usize`.
 #[allow(clippy::too_many_arguments)]
+#[cfg_attr(target_vendor = "apple", allow(dead_code))]
 #[inline(never)]
 #[target_feature(enable = "aes")]
-pub(crate) unsafe fn round2_chunk_raw_neon(
+pub(crate) unsafe fn round2_chunk_raw_neon_baseline(
     table_data: *const u8,
     a_packed: *const u8,
     b_packed: *const u8,
@@ -162,6 +191,50 @@ pub(crate) unsafe fn round2_chunk_raw_neon(
         }
 
         (p1_acc.reduce(), pinf_acc.reduce())
+    }
+}
+
+/// Apple-only byte-frozen clone of [`round2_chunk_raw_neon_baseline`].
+///
+/// Its two GHASH windows differ only in physical SIMD register fields, making
+/// all six adjacent PMULL/PMULL2-to-EOR pairs satisfy Apple's destructive-
+/// destination issue-fusion condition. The external symbol deliberately takes
+/// an explicit output pointer so its C ABI exactly matches the hidden-result
+/// layout observed for the promoted Rust leaf.
+///
+/// # Safety
+/// The requirements are identical to [`round2_chunk_raw_neon_baseline`].
+#[cfg(target_vendor = "apple")]
+#[inline(always)]
+pub(crate) unsafe fn round2_chunk_raw_neon_fused(
+    table_data: *const u8,
+    a_packed: *const u8,
+    b_packed: *const u8,
+    a_out: *mut F128,
+    b_out: *mut F128,
+    eq_lo: *const F128,
+    lo_size: usize,
+    pair_idx_base: usize,
+    pair_in_block_mask: usize,
+    useful_pairs_inclusive: usize,
+) -> (F128, F128) {
+    let mut output = core::mem::MaybeUninit::<Round2ChunkOutput>::uninit();
+    unsafe {
+        round2_chunk_raw_neon(
+            output.as_mut_ptr(),
+            table_data,
+            a_packed,
+            b_packed,
+            a_out,
+            b_out,
+            eq_lo,
+            lo_size,
+            pair_idx_base,
+            pair_in_block_mask,
+            useful_pairs_inclusive,
+        );
+        let output = output.assume_init();
+        (output.p1, output.pinf)
     }
 }
 

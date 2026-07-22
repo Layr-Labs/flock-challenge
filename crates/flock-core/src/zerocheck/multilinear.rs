@@ -49,8 +49,16 @@ mod kernels;
 
 #[cfg(all(test, target_arch = "aarch64"))]
 use kernels::aarch64::fold_one_row_neon_unchecked_8;
-#[cfg(target_arch = "aarch64")]
-use kernels::aarch64::{fold_and_message_neon, round2_chunk_raw_neon};
+#[cfg(all(test, target_arch = "aarch64", target_vendor = "apple"))]
+use kernels::aarch64::round2_chunk_raw_neon_baseline;
+#[cfg(all(target_arch = "aarch64", not(target_vendor = "apple")))]
+use kernels::aarch64::{
+    fold_and_message_neon, round2_chunk_raw_neon_baseline as round2_chunk_raw_neon,
+};
+#[cfg(all(target_arch = "aarch64", target_vendor = "apple"))]
+use kernels::aarch64::{
+    fold_and_message_neon, round2_chunk_raw_neon_fused as round2_chunk_raw_neon,
+};
 #[cfg(all(
     target_arch = "x86_64",
     target_feature = "avx512f",
@@ -1572,6 +1580,187 @@ mod tests {
         assert_eq!(production.1, serial.1, "B output mismatch");
         assert_eq!(production.2, serial.2, "message-1 mismatch");
         assert_eq!(production.3, serial.3, "message-inf mismatch");
+    }
+
+    /// The byte-frozen Apple leaf is bit-exact against the promoted Rust leaf
+    /// across dense, odd, honestly padded, boundary-crossing, and wrapped
+    /// pair-index geometries. Poisoned interiors and independent canaries prove
+    /// that both useful and padding slots are fully overwritten without an
+    /// out-of-bounds write.
+    #[cfg(all(target_arch = "aarch64", target_vendor = "apple"))]
+    #[test]
+    fn aarch64_round2_pmull_fused_leaf_matches_promoted_raw() {
+        const K_SKIP: usize = 6;
+        const PAIR_MASK: usize = 127;
+        const USEFUL_PAIRS: usize = 121;
+        const POISON: F128 = F128 {
+            lo: 0xDEAD_BEEF_CAFE_BABE,
+            hi: 0x0123_4567_89AB_CDEF,
+        };
+        const LEFT_CANARY: F128 = F128 {
+            lo: 0x1111_2222_3333_4444,
+            hi: 0x5555_6666_7777_8888,
+        };
+        const RIGHT_CANARY: F128 = F128 {
+            lo: 0x9999_AAAA_BBBB_CCCC,
+            hi: 0xDDDD_EEEE_FFFF_0000,
+        };
+
+        let mut rng = Rng::new(0x5232_5F50_4D55_4C4C);
+        let table_points = [
+            F128::ZERO,
+            F128::ONE,
+            F128 {
+                lo: u64::MAX,
+                hi: u64::MAX,
+            },
+            F128 {
+                lo: 0x0123_4567_89AB_CDEF,
+                hi: 0xFEDC_BA98_7654_3210,
+            },
+            rng.f128(),
+        ];
+        let cases = [
+            (0usize, 0usize, 0usize, usize::MAX),
+            (1, 0, 0, usize::MAX),
+            (2, 0, 0, usize::MAX),
+            (3, 0, 0, usize::MAX),
+            (8, 0, 0, usize::MAX),
+            (64, 0, 0, usize::MAX),
+            (9, 119, PAIR_MASK, USEFUL_PAIRS),
+            (9, 121, PAIR_MASK, USEFUL_PAIRS),
+            (17, 127, PAIR_MASK, USEFUL_PAIRS),
+            (256, 128, PAIR_MASK, USEFUL_PAIRS),
+        ];
+
+        for (eq_pattern, &table_point) in table_points.iter().enumerate() {
+            let table = UniSkipFoldTable::new(K_SKIP, table_point);
+            for input_pattern in 0..5usize {
+                for &(lo_size, pair_base, mask, useful) in &cases {
+                    let mut a_packed = vec![0u8; 16 * lo_size];
+                    let mut b_packed = vec![0u8; 16 * lo_size];
+                    match input_pattern {
+                        0 => {}
+                        1 => {
+                            a_packed.fill(0xFF);
+                            b_packed.fill(0xFF);
+                        }
+                        2 => {
+                            for i in 0..a_packed.len() {
+                                a_packed[i] = if i & 1 == 0 { 0xAA } else { 0x55 };
+                                b_packed[i] = if i & 1 == 0 { 0x55 } else { 0xAA };
+                            }
+                        }
+                        3 => {
+                            for i in 0..a_packed.len() {
+                                a_packed[i] = (i as u8).wrapping_mul(0x9D);
+                                b_packed[i] = (!(i as u8)).wrapping_mul(0xA7);
+                            }
+                        }
+                        _ => {
+                            for byte in &mut a_packed {
+                                *byte = rng.next_u64() as u8;
+                            }
+                            for byte in &mut b_packed {
+                                *byte = rng.next_u64() as u8;
+                            }
+                        }
+                    }
+
+                    let mut eq_lo = vec![F128::ZERO; lo_size];
+                    for (i, value) in eq_lo.iter_mut().enumerate() {
+                        *value = match eq_pattern {
+                            0 => F128::ZERO,
+                            1 => F128::ONE,
+                            2 => F128 {
+                                lo: u64::MAX,
+                                hi: u64::MAX,
+                            },
+                            3 => F128 {
+                                lo: (i as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15),
+                                hi: (!(i as u64)).rotate_left(17),
+                            },
+                            _ => rng.f128(),
+                        };
+                    }
+
+                    let mut baseline_a = vec![POISON; 2 * lo_size + 2];
+                    let mut baseline_b = vec![POISON; 2 * lo_size + 2];
+                    let mut candidate_a = vec![POISON; 2 * lo_size + 2];
+                    let mut candidate_b = vec![POISON; 2 * lo_size + 2];
+                    for output in [
+                        &mut baseline_a,
+                        &mut baseline_b,
+                        &mut candidate_a,
+                        &mut candidate_b,
+                    ] {
+                        output[0] = LEFT_CANARY;
+                        output[2 * lo_size + 1] = RIGHT_CANARY;
+                    }
+
+                    let baseline = unsafe {
+                        round2_chunk_raw_neon_baseline(
+                            table.data.as_ptr() as *const u8,
+                            a_packed.as_ptr(),
+                            b_packed.as_ptr(),
+                            baseline_a.as_mut_ptr().add(1),
+                            baseline_b.as_mut_ptr().add(1),
+                            eq_lo.as_ptr(),
+                            lo_size,
+                            pair_base,
+                            mask,
+                            useful,
+                        )
+                    };
+                    let candidate = unsafe {
+                        round2_chunk_raw_neon(
+                            table.data.as_ptr() as *const u8,
+                            a_packed.as_ptr(),
+                            b_packed.as_ptr(),
+                            candidate_a.as_mut_ptr().add(1),
+                            candidate_b.as_mut_ptr().add(1),
+                            eq_lo.as_ptr(),
+                            lo_size,
+                            pair_base,
+                            mask,
+                            useful,
+                        )
+                    };
+
+                    let context = format!(
+                        "eq={eq_pattern}, input={input_pattern}, lo={lo_size}, base={pair_base}"
+                    );
+                    assert_eq!(candidate_a, baseline_a, "A mismatch: {context}");
+                    assert_eq!(candidate_b, baseline_b, "B mismatch: {context}");
+                    assert_eq!(candidate.0, baseline.0, "message-1 mismatch: {context}");
+                    assert_eq!(candidate.1, baseline.1, "message-inf mismatch: {context}");
+                    assert_eq!(candidate_a[0], LEFT_CANARY, "left A canary: {context}");
+                    assert_eq!(candidate_b[0], LEFT_CANARY, "left B canary: {context}");
+                    assert_eq!(
+                        candidate_a[2 * lo_size + 1],
+                        RIGHT_CANARY,
+                        "right A canary: {context}"
+                    );
+                    assert_eq!(
+                        candidate_b[2 * lo_size + 1],
+                        RIGHT_CANARY,
+                        "right B canary: {context}"
+                    );
+                    assert!(
+                        candidate_a[1..1 + 2 * lo_size]
+                            .iter()
+                            .all(|&value| value != POISON),
+                        "A poison retained: {context}"
+                    );
+                    assert!(
+                        candidate_b[1..1 + 2 * lo_size]
+                            .iter()
+                            .all(|&value| value != POISON),
+                        "B poison retained: {context}"
+                    );
+                }
+            }
+        }
     }
 
     /// **Padding skip is byte-identical to the dense round-2 kernel.** Builds

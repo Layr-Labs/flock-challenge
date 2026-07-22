@@ -2258,6 +2258,27 @@ mod tests {
             bincode::serialize(&proof_g).unwrap(),
             "generic and fused Ligerito proofs must be byte-identical"
         );
+        let tail_f = ch_f.sample_f128_vec(4);
+        let tail_g = ch_g.sample_f128_vec(4);
+        assert_eq!(tail_f, tail_g, "prover challenger continuation differs");
+
+        let mut ch_v = FsChallenger::new(b"flock-blake3-gvf");
+        let claim_v = setup
+            .verify(&commit_f, &proof_f, &mut ch_v)
+            .unwrap_or_else(|error| panic!("pristine proof rejected: {error:?}"));
+        assert_eq!(claim_f, claim_v, "pristine verifier claim differs");
+        let tail_v = ch_v.sample_f128_vec(4);
+
+        let mut ch_v_again = FsChallenger::new(b"flock-blake3-gvf");
+        let claim_v_again = setup
+            .verify(&commit_g, &proof_g, &mut ch_v_again)
+            .unwrap_or_else(|error| panic!("second pristine proof rejected: {error:?}"));
+        assert_eq!(claim_v, claim_v_again, "verifier claims differ");
+        assert_eq!(
+            tail_v,
+            ch_v_again.sample_f128_vec(4),
+            "verifier challenger continuation differs"
+        );
     }
 
     /// Constant-wire pin (docs/const-wire-pin.md). `new(250)` has padding
