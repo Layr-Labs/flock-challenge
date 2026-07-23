@@ -120,11 +120,16 @@ Actions workflow on each constructed submission commit and reads its uploaded JS
 score. Solvers may optimize all Rust source in `flock-core` and `flock-prover`,
 but the timer, score writer, and verifier are compiled against the fixed
 original Flock commit and committed as a checksum-protected arm64 binary. It
-times the candidate prover on a fresh private block set, then regenerates the
-seeded witness commitment and checks the proof. See the visual
+times from delivery of a fresh private block-set seed through a bounded,
+no-symlink copy of the published proof. It then reaps the worker, regenerates
+the seeded witness commitment, and verifies the captured bytes. See the visual
 [`benchmark flow`](docs/blake3-benchmark-flow.html) for the exact timing and
 trust boundaries, or [`BENCHMARK.md`](BENCHMARK.md) for the benchmark,
 hardware, scoring, and security contract.
+
+After the initial `./setup.sh`, iterative local development needs only
+`./benchmark.sh`: it rebuilds the current candidate with the locked offline
+challenge profile before starting the trusted timer.
 
 ## Acknowledgments and third-party code
 

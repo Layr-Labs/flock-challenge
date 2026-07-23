@@ -5,7 +5,7 @@
 # replaces the committed verifier binary and records its new checksum.
 set -euo pipefail
 
-readonly REVIEWED_COMMIT=7a6585a20adfd5eb38814a1587a3adb9fb7e838c
+readonly REVIEWED_COMMIT=6b033a9c45eb2256b9322b218e87855b5f041a3f
 readonly TOOLCHAIN=1.97.0
 
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"

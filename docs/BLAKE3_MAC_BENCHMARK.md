@@ -5,7 +5,7 @@ The benchmark has one untrusted process and one trusted process.
 - The **candidate prover** links the solver-editable Flock source, receives a
   fresh private block-set seed, produces one BLAKE3 proof, writes it, and exits.
 - The **trusted driver/verifier** is a committed arm64 binary built from reviewed
-  source commit `7a6585a20adfd5eb38814a1587a3adb9fb7e838c`. That
+  source commit `6b033a9c45eb2256b9322b218e87855b5f041a3f`. That
   commit retains the original Flock verifier and imports from upstream commit
   `85fc0e7cc002e7ca4dffdff805ba89976e9a5293`. It owns the private input, timer,
   verification, and score file.
@@ -24,17 +24,23 @@ GitHub Actions/Yukon handoff.
 - Measurement: 100 private, timed, verified proofs
 - Score: `262,144 / median(measured_seconds)`; higher is better
 - Warm-up: one seed-independent `prove_fast` before each trial is ready
-- Timed interval: sending the fresh seed through prover exit, including input
-  generation and serialization
+- Timed interval: sending the fresh seed through safe capture of the published
+  proof bytes, including input generation, serialization, file publication,
+  and the trusted bounded read
 - Correctness: the fixed trusted code reconstructs the input and witness,
   checks the full PCS commitment, and verifies every proof
 - Toolchain: Rust 1.97.0 with `-C target-cpu=native`
 
 The private seed expands deterministically to all 262,144 test blocks. It does
 not enter the candidate process until the trusted binary starts the clock.
-Trusted verification runs after the timer stops and before a score is written.
-Any setup, execution, decoding, commitment, or verification failure exits
-nonzero without inventing a score.
+The protected worker wrapper publishes only by writing a temporary proof and
+renaming it onto the final path; it does not rely on solver-editable file I/O.
+After opening the final path without following symlinks, requiring a regular
+file, and making a bounded copy whose length remains stable, the harness stops
+the timer and kills/reaps the worker. Trusted decoding and verification then
+run on that immutable copy before a score is written. Any setup, execution,
+capture, decoding, commitment, or verification failure exits nonzero without
+inventing a score.
 
 ## Editable surface
 
@@ -59,7 +65,7 @@ signature, then builds only the candidate prover. `benchmark.sh` verifies the
 checksum again immediately before execution.
 
 Current SHA-256:
-`da17e8a6795e4aa16e760efaf332b6489da5b0ff0dc440382e2e522c7f438c36`.
+`210f268a50c8d9c0779b0df76e742117494f62e2672be6aacda738729cf87d5e`.
 
 The binary is reviewable through `benchmark-tools/harness/src/main.rs`. Benchmark
 authors regenerate it—not solvers—with:
@@ -93,9 +99,17 @@ perform integrity checks and an up-to-date build without reinstalling them.
 ## Local smoke test
 
 ```sh
+# First run only:
 ./setup.sh
+
+# Rebuild the current prover, then run:
 BLAKE3_LOG2=8 BLAKE3_THREADS=1 BLAKE3_WARMUP_RUNS=0 BLAKE3_RUNS=2 ./benchmark.sh
 ```
+
+`benchmark.sh` performs a locked, offline candidate rebuild before invoking the
+trusted verifier. Cargo reuses unchanged artifacts, and compilation is never
+inside a trial timer. Run `setup.sh` again only when toolchain, dependency, or
+machine prerequisites need repair.
 
 The ranked workflow sets `FLOCK_REQUIRE_SANDBOX=1`. Local runs warn and proceed
 without Seatbelt when `sandbox-exec` is unavailable.
