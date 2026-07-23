@@ -3,8 +3,8 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta name="description" content="How the Flock BLAKE3 prover benchmark measures, isolates, verifies, and scores submissions.">
-  <title>Flock BLAKE3 benchmark — measurement and security</title>
+  <meta name="description" content="snark.fast">
+  <title>snark.fast</title>
   <style>
     :root {
       --canvas: #e9eff2;
@@ -319,8 +319,8 @@
           <article class="protocol-step candidate"><span class="number">02 / BUILD</span><h3>Compile the worker</h3><p>Protected wrapper plus editable Flock sources become one candidate binary.</p></article>
           <article class="protocol-step candidate"><span class="number">03 / WARM</span><h3>Prepare one process</h3><p>A fresh worker creates setup, proves one fixed public warm-up, and signals ready.</p></article>
           <article class="protocol-step trusted"><span class="number">04 / CHALLENGE</span><h3>Draw and send a seed</h3><p>The verifier starts its clock, then sends a fresh 64-bit seed over stdin.</p></article>
-          <article class="protocol-step candidate"><span class="number">05 / PROVE</span><h3>Write one proof</h3><p>Generate 262,144 inputs, witness, commitment, proof, and versioned file; then exit.</p></article>
-          <article class="protocol-step trusted"><span class="number">06 / VERIFY</span><h3>Rebuild the statement</h3><p>Stop time, reconstruct the private witness commitment, verify, then log that trial's throughput.</p></article>
+          <article class="protocol-step candidate"><span class="number">05 / PROVE</span><h3>Publish one proof</h3><p>Generate 262,144 inputs, witness, commitment, proof, and a completed versioned file.</p></article>
+          <article class="protocol-step trusted"><span class="number">06 / VERIFY</span><h3>Capture, stop, check</h3><p>Safely copy the proof, stop time, reap the worker, reconstruct the private witness commitment, and verify.</p></article>
           <article class="protocol-step verified"><span class="number">07 / SCORE</span><h3>Accept all 120</h3><p>Discard 20 verified machine warm-ups, take median latency over 100 measured trials, then write typed JSON.</p></article>
         </div>
       </section>
@@ -328,7 +328,7 @@
       <section id="measure">
         <div class="section-label">What is measured</div>
         <h2>BLAKE3 compression proofs, not whole-message hashes.</h2>
-        <p class="lede">Each operation proves one raw BLAKE3 compression with a generated chaining value, one 64-byte message block, and a counter. Input generation through proof-file write and worker exit is timed.</p>
+        <p class="lede">Each operation proves one raw BLAKE3 compression with a generated chaining value, one 64-byte message block, and a counter. Input generation through trusted capture of the published proof bytes is timed.</p>
         <div class="split">
           <article class="panel">
             <div class="panel-head"><h3>One generated operation</h3><span>262,144 per timed proof</span></div>
@@ -358,7 +358,7 @@
           <div class="lane candidate">
             <div class="lane-head">Candidate worker</div>
             <div class="lane-body">
-              <div class="lane-node"><h3>Protected process contract</h3><p>Creates setup, runs the fixed warm-up, reads one seed, invokes <code>prove_fast</code>, serializes one proof, and exits.</p></div>
+              <div class="lane-node"><h3>Protected process contract</h3><p>Creates setup, runs the fixed warm-up, reads one seed, invokes <code>prove_fast</code>, then writes and renames one temporary proof.</p></div>
               <div class="lane-node"><h3>Editable proving implementation</h3><p>The current submission's <code>flock-core/src</code> and <code>flock-prover/src</code> are linked here.</p></div>
               <div class="lane-node"><h3>Seatbelt confinement</h3><p>No network, no child process, and no writes outside private scratch. The verifier wipes scratch between workers, preventing warm-up precomputation from persisting.</p></div>
             </div>
@@ -372,7 +372,7 @@
             <div class="lane-head">Prebuilt verifier</div>
             <div class="lane-body">
               <div class="lane-node"><h3>Private input owner</h3><p>Reads 8 bytes from <code>/dev/urandom</code> after readiness and reconstructs the same compression tuples later.</p></div>
-              <div class="lane-node"><h3>Clock and verdict owner</h3><p>Starts before seed delivery, stops after worker exit, then validates bytes, commitment, parameters, and proof.</p></div>
+              <div class="lane-node"><h3>Clock and verdict owner</h3><p>Starts before seed delivery; safely copies the published proof; stops; reaps the worker; then validates the captured bytes.</p></div>
               <div class="lane-node"><h3>Score owner</h3><p>Serializes <code>score.json</code> only after all 20 warm-up and 100 measured proofs verify.</p></div>
             </div>
           </div>
@@ -433,15 +433,21 @@
           </div>
           <div class="timeline-row">
             <div class="phase">T2<br>PROVE</div>
-            <div class="timed-cell"><span class="cell-label">Running</span><p>External wall time continues until process exit.</p></div>
-            <div class="timed-cell"><span class="cell-label">All scored work</span><p>Generate inputs and witness; commit; prove; serialize; atomically write proof; exit.</p></div>
-            <div><span class="cell-label">Deadline</span><p>Kill and reap if seed-dependent work exceeds fifteen minutes.</p></div>
+            <div class="timed-cell"><span class="cell-label">Running</span><p>External wall time continues until the completed proof is captured.</p></div>
+            <div class="timed-cell"><span class="cell-label">Candidate work</span><p>Generate inputs and witness; commit; prove; serialize; protected wrapper writes a temporary file and renames it onto the final path.</p></div>
+            <div><span class="cell-label">Deadline</span><p>Poll the final path; fail if no proof is published within fifteen minutes.</p></div>
           </div>
           <div class="timeline-row">
-            <div class="phase">T3<br>CHECK</div>
-            <div><span class="cell-label">Stopped</span><p>Elapsed time is captured only after successful exit.</p></div>
-            <div><span class="cell-label">No further work</span><div class="blank">process exited</div></div>
-            <div class="verified-cell"><span class="cell-label">Required</span><p>Strictly decode, rebuild input/witness/commitment, compare, verify, record, and wipe all writable scratch before the next worker.</p></div>
+            <div class="phase">T3<br>CAPTURE</div>
+            <div class="timed-cell"><span class="cell-label">Stop last</span><p>Stop only after the bounded proof copy is in trusted memory.</p></div>
+            <div><span class="cell-label">Final path</span><p>The candidate cannot stop time with stdout, a timestamp, a symlink, or a special file.</p></div>
+            <div class="timed-cell"><span class="cell-label">Safe snapshot</span><p>Open without following symlinks; require a regular, nonempty file; copy at most 500,000 stable bytes.</p></div>
+          </div>
+          <div class="timeline-row">
+            <div class="phase">T4<br>VERIFY</div>
+            <div><span class="cell-label">Stopped</span><p>Worker teardown and cryptographic verification are not scored.</p></div>
+            <div><span class="cell-label">Terminated</span><p>Kill and reap the untrusted process before verification.</p></div>
+            <div class="verified-cell"><span class="cell-label">Required</span><p>Strictly decode the captured bytes, rebuild input/witness/commitment, compare, verify, record, and wipe scratch.</p></div>
           </div>
         </div>
       </section>
@@ -451,9 +457,9 @@
         <h2>A valid protocol proof must also bind the private witness.</h2>
         <p class="lede">The trusted commitment reconstruction is the benchmark-specific correctness check. It prevents a solver from proving a cheaper or unrelated statement.</p>
         <div class="cards">
-          <article class="card"><b>01 / SUCCESSFUL EXIT</b><p>The timer stops only when the worker exits zero within the deadline. A ready message or partial file cannot stop it.</p></article>
-          <article class="card"><b>02 / BOUNDED FILE</b><p>Require a nonempty proof within the trusted byte limit before allocation and decoding.</p></article>
-          <article class="card"><b>03 / EXACT FORMAT</b><p>Require FLOCK magic, current version, R1CS flavor, fixed-width bincode, and no trailing bytes.</p></article>
+          <article class="card"><b>01 / TIMELY PUBLICATION</b><p>A final proof must appear within fifteen minutes. Readiness, stdout, and worker-reported timestamps cannot stop the clock.</p></article>
+          <article class="card"><b>02 / SAFE CAPTURE</b><p>Do not follow symlinks; require a regular, nonempty file; copy at most 500,000 bytes and require its length to remain stable.</p></article>
+          <article class="card"><b>03 / EXACT FORMAT</b><p>After reaping the worker, decode only the trusted copy: FLOCK magic, current version, R1CS flavor, fixed-width bincode, and no trailing bytes.</p></article>
           <article class="card"><b>04 / REBUILT INPUT</b><p>Expand the same undisclosed seed into the exact 262,144 compression tuples.</p></article>
           <article class="card"><b>05 / EQUAL COMMITMENT</b><p>Regenerate the pristine packed witness; require root and every PCS parameter to match.</p></article>
           <article class="card"><b>06 / PRISTINE VERIFICATION</b><p>Run compiled-in <code>Blake3Setup::verify</code> under the fixed <code>flock-bench-v0</code> transcript domain.</p></article>
@@ -514,7 +520,7 @@
         <div class="failure-grid" style="margin-top:22px">
           <article class="failure-card"><b>FAKE TIME OR SCORE</b><p>Worker output is ignored, the external verifier owns <code>Instant</code>, and Seatbelt prevents writes to root <code>score.json</code>.</p></article>
           <article class="failure-card"><b>CHEAPER STATEMENT</b><p>Trusted input and witness reconstruction makes a different seed, input, root, or PCS profile fail before protocol acceptance.</p></article>
-          <article class="failure-card"><b>BACKGROUND WRITER</b><p>Seatbelt denies child processes; the timer waits for worker exit and no descendant may finish afterward.</p></article>
+          <article class="failure-card"><b>BACKGROUND WRITER</b><p>Seatbelt denies child processes. Once proof bytes are captured, the harness stops time and kills/reaps the worker before verification.</p></article>
           <article class="failure-card"><b>STALE RESULT</b><p><code>benchmark.sh</code> removes previous scores before execution. A failed run has no valid new score artifact.</p></article>
           <article class="failure-card"><b>VERIFIER REPLACEMENT</b><p>The checksum-pinned binary contains its own verifier imports and never loads candidate crate code.</p></article>
           <article class="failure-card"><b>HOST BOUNDARY</b><p>Seatbelt constrains the measured worker, not an entire VM. The dedicated runner must contain no unrelated secrets or workloads.</p></article>

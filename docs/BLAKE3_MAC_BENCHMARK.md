@@ -24,17 +24,23 @@ GitHub Actions/Yukon handoff.
 - Measurement: 100 private, timed, verified proofs
 - Score: `262,144 / median(measured_seconds)`; higher is better
 - Warm-up: one seed-independent `prove_fast` before each trial is ready
-- Timed interval: sending the fresh seed through prover exit, including input
-  generation and serialization
+- Timed interval: sending the fresh seed through safe capture of the published
+  proof bytes, including input generation, serialization, file publication,
+  and the trusted bounded read
 - Correctness: the fixed trusted code reconstructs the input and witness,
   checks the full PCS commitment, and verifies every proof
 - Toolchain: Rust 1.97.0 with `-C target-cpu=native`
 
 The private seed expands deterministically to all 262,144 test blocks. It does
 not enter the candidate process until the trusted binary starts the clock.
-Trusted verification runs after the timer stops and before a score is written.
-Any setup, execution, decoding, commitment, or verification failure exits
-nonzero without inventing a score.
+The protected worker wrapper publishes only by writing a temporary proof and
+renaming it onto the final path; it does not rely on solver-editable file I/O.
+After opening the final path without following symlinks, requiring a regular
+file, and making a bounded copy whose length remains stable, the harness stops
+the timer and kills/reaps the worker. Trusted decoding and verification then
+run on that immutable copy before a score is written. Any setup, execution,
+capture, decoding, commitment, or verification failure exits nonzero without
+inventing a score.
 
 ## Editable surface
 

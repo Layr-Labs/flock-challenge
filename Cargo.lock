@@ -160,6 +160,7 @@ dependencies = [
  "bincode",
  "flock-benchmark-common",
  "flock-prover",
+ "libc",
  "serde",
  "serde_json",
 ]
