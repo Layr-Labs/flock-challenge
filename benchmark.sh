@@ -37,6 +37,11 @@ verifier="${root}/benchmark-tools/trusted/flock_benchmark_verifier"
 # run. Cargo's artifact cache makes an unchanged build fast. This locked,
 # offline build is outside the trusted harness and every measured interval;
 # setup.sh remains the one-time prerequisite/toolchain/dependency installer.
+# GitHub Actions starts each step in a fresh shell, so load the Rustup path
+# here instead of relying on setup.sh's shell environment to survive.
+cargo_env="${CARGO_HOME:-${HOME}/.cargo}/env"
+# shellcheck disable=SC1090 # Rustup writes this file outside the repository.
+[[ ! -f "${cargo_env}" ]] || . "${cargo_env}"
 command -v cargo >/dev/null 2>&1 || {
   echo "cargo is missing; run ./setup.sh" >&2
   exit 1
