@@ -58,8 +58,8 @@ Each ranked run therefore performs:
 ## Scoring
 
 For each trial, the trusted harness measures wall-clock time from immediately
-before it writes the private seed to worker stdin until the worker exits
-successfully:
+before it writes the private seed to worker stdin until it has safely copied
+the published proof into trusted memory:
 
 ```text
 rank_seconds = median(measured_trial_seconds)
@@ -68,10 +68,10 @@ score = 262,144 / rank_seconds
 
 The median uses linear interpolation at rank `(sample_count - 1) × 0.50`; for
 100 measured trials this is the mean of the 50th and 51st sorted durations.
-Setup, fixed-seed
-warm-up, and trusted verification are outside the timed interval. Input
-generation from the private seed, witness generation, commitment, proving,
-serialization, proof-file writing, and process exit are inside it.
+Setup, the fixed-seed warm-up, worker teardown, and trusted verification are
+outside the timed interval. Input generation from the private seed, witness
+generation, commitment, proving, serialization, proof-file publication, and
+the trusted bounded read are inside it.
 
 Proof size is a reported secondary metric, not part of the ranking formula.
 At the ranked size, sampled valid proofs were approximately 436–438 kB.
@@ -146,7 +146,7 @@ binary's SHA-256 and code signature before building the candidate.
 `benchmark.sh` checks SHA-256 again immediately before invoking it.
 
 The committed verifier was built from reviewed benchmark commit
-`7a6585a20adfd5eb38814a1587a3adb9fb7e838c`. Its underlying re-signed Flock
+`6b033a9c45eb2256b9322b218e87855b5f041a3f`. Its underlying re-signed Flock
 tree matches upstream Flock commit
 `85fc0e7cc002e7ca4dffdff805ba89976e9a5293`.
 
@@ -162,10 +162,14 @@ The trusted harness repeats the following sequence 120 times:
 4. The harness starts its external clock and writes the decimal seed plus a
    newline to worker stdin.
 5. The worker expands the seed into 262,144 inputs, runs `prove_fast`,
-   serializes a `R1csProofBundleLigerito`, atomically writes the proof in
-   scratch, and exits.
-6. The harness stops timing after successful process exit.
-7. The harness verifies the proof using its compiled-in pristine code.
+   serializes a `R1csProofBundleLigerito`, writes a temporary file, and
+   atomically renames it onto the final scratch path. This publication step is
+   implemented in the protected wrapper rather than solver-editable Flock code.
+6. The harness opens that path without following symlinks, requires a regular
+   file, copies at most 500,000 bytes into trusted memory, and confirms that
+   its length stayed stable. It stops timing only after that capture completes.
+7. The harness kills and reaps the worker, then verifies the captured bytes
+   using its compiled-in pristine code.
 8. It records the duration and proof size, then erases and recreates the entire
    writable scratch directory before the next worker.
 
@@ -182,23 +186,27 @@ The seed line is the only request sent to the worker. The proof file is the
 only candidate-produced object consumed by the trusted verifier. Worker stdout
 and stderr are discarded and cannot report time or score.
 
-Startup has a 5-minute deadline. Seed-dependent proving has a 15-minute
-deadline. Timeout and trusted-side errors kill and reap the worker.
+Startup has a 5-minute deadline. Seed-dependent proof publication has a
+15-minute deadline. Timeout and trusted-side errors kill and reap the worker.
 
 ## Final verification
 
 For every timed proof, the prebuilt verifier requires all of the following:
 
-1. The worker exited successfully before the deadline.
-2. The proof file is nonempty and below the trusted byte limit.
-3. The file has the exact FLOCK magic, current version, and R1CS flavor.
-4. Fixed-width bincode decoding consumes the complete file with no trailing
+1. A final proof appears before the deadline.
+2. The final path can be opened without following a symlink and is a regular
+   file.
+3. Its nonempty contents fit within the trusted byte limit and have a stable
+   length while the harness copies them into trusted memory.
+4. The captured bytes have the exact FLOCK magic, current version, and R1CS
+   flavor.
+5. Fixed-width bincode decoding consumes the complete capture with no trailing
    bytes.
-5. The verifier independently reconstructs the private compression inputs.
-6. It generates the pristine packed witness and commits to it.
-7. The submitted commitment root and every PCS parameter match that trusted
+6. The verifier independently reconstructs the private compression inputs.
+7. It generates the pristine packed witness and commits to it.
+8. The submitted commitment root and every PCS parameter match that trusted
    commitment.
-8. `Blake3Setup::verify` accepts the proof under the fixed
+9. `Blake3Setup::verify` accepts the proof under the fixed
    `flock-bench-v0` Fiat–Shamir domain.
 
 This commitment reconstruction is essential. It binds an otherwise valid
@@ -224,9 +232,10 @@ cannot move setup or precomputation from the 20 discarded machine warm-ups
 into the 100 measured processes through files.
 
 The sandbox prevents the candidate from writing `score.json` or leaving a
-descendant to finish work after the timed worker exits. It is not a complete VM
-boundary. The self-hosted runner must remain dedicated and should contain no
-unrelated secrets or credentials.
+descendant behind. After capturing the proof, the harness kills and reaps the
+worker before verification. It is not a complete VM boundary. The self-hosted
+runner must remain dedicated and should contain no unrelated secrets or
+credentials.
 
 ## Score file
 

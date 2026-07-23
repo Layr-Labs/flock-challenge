@@ -3,7 +3,7 @@ use std::io::{self, BufRead};
 
 use flock_benchmark_common::{DOMAIN, generate_compressions};
 use flock_prover::challenger::FsChallenger;
-use flock_prover::proof_io::{R1csProofBundleLigerito, write_bytes_to_file};
+use flock_prover::proof_io::R1csProofBundleLigerito;
 use flock_prover::r1cs_hashes::blake3::Blake3Setup;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -37,6 +37,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut challenger = FsChallenger::new(DOMAIN);
     let (proof, commitment, _) = setup.prove_fast(&blocks, &mut challenger);
     let bundle = R1csProofBundleLigerito { commitment, proof };
-    write_bytes_to_file(proof_path, &bundle.to_bytes())?;
+    let temporary_proof_path = format!("{proof_path}.tmp");
+    std::fs::write(&temporary_proof_path, bundle.to_bytes())?;
+    std::fs::rename(temporary_proof_path, proof_path)?;
     Ok(())
 }

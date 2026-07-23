@@ -1,9 +1,10 @@
 //! Trusted driver, verifier, timer, and score writer for the BLAKE3 challenge.
 
-use std::fs::File;
+use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, ExitStatus, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -177,13 +178,19 @@ fn run_trial(config: &Config, run: usize) -> Result<Trial, Box<dyn std::error::E
         stop(&mut child);
         return Err(error.into());
     }
-    let status = wait_for_exit(&mut child, RUN_TIMEOUT)?;
+    let captured_proof = match wait_for_proof(&mut child, &proof, RUN_TIMEOUT) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            stop(&mut child);
+            return Err(error);
+        }
+    };
     let seconds = start.elapsed().as_secs_f64();
-    if !status.success() {
-        return Err(format!("run {run}: worker exited with {status}").into());
-    }
 
-    let proof_bytes = verify_proof(config.log2_size, seed, &proof)?;
+    // Proof availability, rather than process teardown, is the scored boundary.
+    // Reap the untrusted worker before verifying the immutable trusted copy.
+    stop(&mut child);
+    let proof_bytes = verify_proof(config.log2_size, seed, &captured_proof)?;
     reset_scratch(&config.scratch)?;
     Ok(Trial {
         seconds,
@@ -234,21 +241,66 @@ fn wait_for_ready(child: &mut Child, ready: &Path) -> Result<(), Box<dyn std::er
     }
 }
 
-fn wait_for_exit(
+fn wait_for_proof(
     child: &mut Child,
+    proof: &Path,
     timeout: Duration,
-) -> Result<ExitStatus, Box<dyn std::error::Error>> {
+) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
     let deadline = Instant::now() + timeout;
     loop {
+        if let Some(bytes) = capture_proof_if_ready(proof)? {
+            return Ok(bytes);
+        }
         if let Some(status) = child.try_wait()? {
-            return Ok(status);
+            // The rename and process exit may become observable in either
+            // order, so make one final capture attempt before rejecting.
+            return capture_proof_if_ready(proof)?.ok_or_else(|| {
+                format!("worker exited before publishing a proof with {status}").into()
+            });
         }
         if Instant::now() >= deadline {
-            stop(child);
-            return Err("worker timed out".into());
+            return Err("worker proof timed out".into());
         }
         thread::sleep(POLL_INTERVAL);
     }
+}
+
+fn capture_proof_if_ready(path: &Path) -> Result<Option<Vec<u8>>, Box<dyn std::error::Error>> {
+    let mut file = match OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW)
+        .open(path)
+    {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(format!("cannot open final proof: {error}").into()),
+    };
+
+    let initial = file.metadata()?;
+    if !initial.file_type().is_file() {
+        return Err("final proof path is not a regular file".into());
+    }
+    if initial.len() == 0 || initial.len() > MAX_PROOF_BYTES {
+        return Err(format!("proof size {} is outside the allowed range", initial.len()).into());
+    }
+
+    let mut bytes = Vec::with_capacity(initial.len() as usize);
+    (&mut file)
+        .take(MAX_PROOF_BYTES + 1)
+        .read_to_end(&mut bytes)?;
+    if bytes.is_empty() || bytes.len() as u64 > MAX_PROOF_BYTES {
+        return Err(format!(
+            "captured proof size {} is outside the allowed range",
+            bytes.len()
+        )
+        .into());
+    }
+
+    let final_metadata = file.metadata()?;
+    if final_metadata.len() != initial.len() || final_metadata.len() != bytes.len() as u64 {
+        return Err("proof file changed while the trusted harness captured it".into());
+    }
+    Ok(Some(bytes))
 }
 
 fn stop(child: &mut Child) {
@@ -265,15 +317,13 @@ fn fresh_seed() -> Result<u64, Box<dyn std::error::Error>> {
 fn verify_proof(
     log2_size: u32,
     seed: u64,
-    path: &Path,
+    bytes: &[u8],
 ) -> Result<usize, Box<dyn std::error::Error>> {
-    let metadata = std::fs::metadata(path)?;
-    if metadata.len() == 0 || metadata.len() > MAX_PROOF_BYTES {
-        return Err(format!("proof size {} is outside the allowed range", metadata.len()).into());
+    if bytes.is_empty() || bytes.len() as u64 > MAX_PROOF_BYTES {
+        return Err(format!("proof size {} is outside the allowed range", bytes.len()).into());
     }
 
-    let bytes = std::fs::read(path)?;
-    let bundle = deserialize_bundle(&bytes)?;
+    let bundle = deserialize_bundle(bytes)?;
     let setup = Blake3Setup::new(1usize << log2_size);
     let blocks = generate_compressions(log2_size, seed);
     let witness = setup.generate_witness_packed(&blocks);
@@ -415,7 +465,40 @@ fn parse_args() -> Result<Config, Box<dyn std::error::Error>> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Trial, percentile_seconds};
+    use std::path::PathBuf;
+    use std::process::{Command, Stdio};
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::{Duration, Instant};
+
+    use super::{
+        MAX_PROOF_BYTES, Trial, capture_proof_if_ready, percentile_seconds, stop, wait_for_proof,
+    };
+
+    static NEXT_TEMP_DIR: AtomicU64 = AtomicU64::new(0);
+
+    struct TempDir(PathBuf);
+
+    impl TempDir {
+        fn new() -> Self {
+            let sequence = NEXT_TEMP_DIR.fetch_add(1, Ordering::Relaxed);
+            let path = std::env::temp_dir().join(format!(
+                "flock-harness-test-{}-{sequence}",
+                std::process::id()
+            ));
+            std::fs::create_dir(&path).unwrap();
+            Self(path)
+        }
+
+        fn join(&self, name: &str) -> PathBuf {
+            self.0.join(name)
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
 
     fn trials(seconds: &[f64]) -> Vec<Trial> {
         seconds
@@ -440,5 +523,80 @@ mod tests {
         assert!(percentile_seconds(&[], 0.10).is_err());
         assert!(percentile_seconds(&trials(&[0.0]), 0.10).is_err());
         assert!(percentile_seconds(&trials(&[f64::NAN]), 0.10).is_err());
+    }
+
+    #[test]
+    fn proof_capture_waits_for_publication_then_copies_bytes() {
+        let temp = TempDir::new();
+        let proof = temp.join("proof");
+        assert!(capture_proof_if_ready(&proof).unwrap().is_none());
+
+        std::fs::write(&proof, b"complete proof").unwrap();
+        assert_eq!(
+            capture_proof_if_ready(&proof).unwrap(),
+            Some(b"complete proof".to_vec())
+        );
+    }
+
+    #[test]
+    fn proof_capture_rejects_empty_and_oversized_files() {
+        let temp = TempDir::new();
+        let proof = temp.join("proof");
+
+        std::fs::write(&proof, []).unwrap();
+        assert!(capture_proof_if_ready(&proof).is_err());
+
+        std::fs::File::create(&proof)
+            .unwrap()
+            .set_len(MAX_PROOF_BYTES + 1)
+            .unwrap();
+        assert!(capture_proof_if_ready(&proof).is_err());
+    }
+
+    #[test]
+    fn proof_capture_rejects_symlinks_and_non_files() {
+        use std::os::unix::fs::symlink;
+
+        let temp = TempDir::new();
+        let target = temp.join("target");
+        let link = temp.join("link");
+        std::fs::write(&target, b"proof").unwrap();
+        symlink(&target, &link).unwrap();
+
+        assert!(capture_proof_if_ready(&link).is_err());
+        assert!(capture_proof_if_ready(&temp.0).is_err());
+    }
+
+    #[test]
+    fn proof_publisher_helper() {
+        let Some(path) = std::env::var_os("FLOCK_TEST_PROOF_PATH") else {
+            return;
+        };
+        let temporary = PathBuf::from(&path).with_extension("tmp");
+        std::fs::write(&temporary, b"published proof").unwrap();
+        std::fs::rename(temporary, path).unwrap();
+        std::thread::sleep(Duration::from_secs(10));
+    }
+
+    #[test]
+    fn proof_publication_does_not_wait_for_worker_exit() {
+        let temp = TempDir::new();
+        let proof = temp.join("proof");
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "tests::proof_publisher_helper"])
+            .env("FLOCK_TEST_PROOF_PATH", &proof)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+
+        let start = Instant::now();
+        let bytes = wait_for_proof(&mut child, &proof, Duration::from_secs(5)).unwrap();
+        let elapsed = start.elapsed();
+
+        assert_eq!(bytes, b"published proof");
+        assert!(elapsed < Duration::from_secs(2));
+        assert!(child.try_wait().unwrap().is_none());
+        stop(&mut child);
     }
 }
