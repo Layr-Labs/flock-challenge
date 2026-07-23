@@ -20,18 +20,38 @@ if [[ "${threads}" == auto ]]; then
   [[ -n "${threads}" ]] || threads="$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 1)"
 fi
 
-# The worker links solver-editable source. The verifier is the committed,
-# solver-protected binary; verify its exact bytes again immediately before use.
+# The verifier is the committed, solver-protected binary. Verify its exact
+# bytes before doing any candidate work.
 worker="${root}/target/challenge-candidate/challenge/flock-benchmark-worker"
 verifier="${root}/benchmark-tools/trusted/flock_benchmark_verifier"
-[[ -x "${worker}" && -x "${verifier}" ]] || {
-  echo "benchmark binaries are missing; run ./setup.sh" >&2
+[[ -x "${verifier}" ]] || {
+  echo "trusted verifier is missing; run ./setup.sh" >&2
   exit 1
 }
 (
   cd "${root}/benchmark-tools/trusted"
   shasum -a 256 -c SHA256SUMS
 )
+
+# Rebuild the candidate from the current solver-editable source before every
+# run. Cargo's artifact cache makes an unchanged build fast. This locked,
+# offline build is outside the trusted harness and every measured interval;
+# setup.sh remains the one-time prerequisite/toolchain/dependency installer.
+command -v cargo >/dev/null 2>&1 || {
+  echo "cargo is missing; run ./setup.sh" >&2
+  exit 1
+}
+toolchain="${RUSTUP_TOOLCHAIN:-1.97.0}"
+CARGO_INCREMENTAL=0 CARGO_NET_OFFLINE=true \
+RUSTFLAGS="${RUSTFLAGS:--C target-cpu=native}" \
+  cargo "+${toolchain}" build --locked --offline --profile challenge \
+    --manifest-path "${root}/Cargo.toml" \
+    --target-dir "${root}/target/challenge-candidate" \
+    -p flock-benchmark-worker
+[[ -x "${worker}" ]] || {
+  echo "candidate worker build produced no executable" >&2
+  exit 1
+}
 
 # Canonicalize the output path before embedding it in the Seatbelt profile.
 # Remove stale scores first so a failed run can never upload an earlier result.
@@ -77,5 +97,6 @@ args=("${worker}" "${scratch}" "${root}/score.json" "${output_dir}/summary.md"
 # Reaching here means every timed proof passed pristine verification.
 # Keep the root score for Yukon and copy it into the diagnostic artifact.
 cp score.json "${output_dir}/score.json"
+# shellcheck disable=SC2016 # Backticks are literal Markdown; %s receives the SHA.
 printf -- '- Candidate commit: `%s`\n' "$(git rev-parse HEAD)" >> "${output_dir}/summary.md"
 cat "${output_dir}/summary.md"

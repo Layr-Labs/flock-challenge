@@ -127,6 +127,10 @@ the seeded witness commitment, and verifies the captured bytes. See the visual
 trust boundaries, or [`BENCHMARK.md`](BENCHMARK.md) for the benchmark,
 hardware, scoring, and security contract.
 
+After the initial `./setup.sh`, iterative local development needs only
+`./benchmark.sh`: it rebuilds the current candidate with the locked offline
+challenge profile before starting the trusted timer.
+
 ## Acknowledgments and third-party code
 
 Flock incorporates code from the projects below; see the individual file

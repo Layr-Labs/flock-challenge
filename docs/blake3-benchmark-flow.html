@@ -514,7 +514,7 @@
           </article>
           <article class="panel">
             <div class="panel-head"><h3>Local Apple Silicon</h3><span>directional</span></div>
-            <div class="panel-body"><ul><li><code>./setup.sh</code> checks arm64 macOS, Xcode Clang, Rust, checksum, and signing</li><li><code>./benchmark.sh</code> uses local performance cores</li><li>Compare changes only on the same quiet machine</li><li>The official M4 Pro result remains the ranked result</li></ul></div>
+            <div class="panel-body"><ul><li><code>./setup.sh</code> checks arm64 macOS, Xcode Clang, Rust, checksum, and signing</li><li><code>./benchmark.sh</code> rebuilds the current candidate offline, then uses local performance cores</li><li>Compilation finishes before the trusted harness starts any timer</li><li>Compare changes only on the same quiet machine; the official M4 Pro result remains authoritative</li></ul></div>
           </article>
         </div>
         <div class="failure-grid" style="margin-top:22px">

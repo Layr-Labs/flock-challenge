@@ -99,9 +99,17 @@ perform integrity checks and an up-to-date build without reinstalling them.
 ## Local smoke test
 
 ```sh
+# First run only:
 ./setup.sh
+
+# Rebuild the current prover, then run:
 BLAKE3_LOG2=8 BLAKE3_THREADS=1 BLAKE3_WARMUP_RUNS=0 BLAKE3_RUNS=2 ./benchmark.sh
 ```
+
+`benchmark.sh` performs a locked, offline candidate rebuild before invoking the
+trusted verifier. Cargo reuses unchanged artifacts, and compilation is never
+inside a trial timer. Run `setup.sh` again only when toolchain, dependency, or
+machine prerequisites need repair.
 
 The ranked workflow sets `FLOCK_REQUIRE_SANDBOX=1`. Local runs warn and proceed
 without Seatbelt when `sandbox-exec` is unavailable.

@@ -279,13 +279,20 @@ submission commit it dispatched.
 On an Apple Silicon Mac:
 
 ```bash
+# First run only:
 ./setup.sh
+
+# After every prover edit:
 ./benchmark.sh
 ```
 
 `setup.sh` checks macOS/arm64 prerequisites, installs or selects the pinned
 Rust toolchain, verifies the trusted binary, fetches locked dependencies with
-retries, and builds the candidate offline.
+retries, and builds the candidate offline. On every invocation,
+`benchmark.sh` performs the same locked, offline candidate build before it
+starts the trusted harness. Cargo reuses unchanged artifacts, while edits under
+the solver surface are guaranteed to reach the executed worker. Compilation is
+outside every measured interval.
 
 For a quick functional smoke test, lower the batch and trial count:
 
