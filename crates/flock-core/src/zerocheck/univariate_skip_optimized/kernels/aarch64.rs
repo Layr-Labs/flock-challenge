@@ -360,8 +360,13 @@ pub(crate) fn shift_reduce_inner_ab_neon(
 
 #[cfg(target_arch = "aarch64")]
 #[inline(always)]
-unsafe fn xor_apply_byte_into_8_regs<const BH: usize, const ODD: bool>(
+unsafe fn xor_apply_byte_into_8_regs<
+    const BH: usize,
+    const ODD: bool,
+    const USE_PRE_SWAPPED: bool,
+>(
     table_base: *const u8,
+    half_swapped_table_base: *const u8,
     a_byte: u8,
     b_byte: u8,
     da0: &mut core::arch::aarch64::uint8x16_t,
@@ -375,8 +380,13 @@ unsafe fn xor_apply_byte_into_8_regs<const BH: usize, const ODD: bool>(
 ) {
     use core::arch::aarch64::*;
     unsafe {
-        let ra = table_base.add(a_byte as usize * 64);
-        let rb = table_base.add(b_byte as usize * 64);
+        let selected_table = if USE_PRE_SWAPPED && ODD {
+            half_swapped_table_base
+        } else {
+            table_base
+        };
+        let ra = selected_table.add(a_byte as usize * 64);
+        let rb = selected_table.add(b_byte as usize * 64);
         let va0 = vld1q_u8(ra.add((0 ^ BH) * 16));
         let va1 = vld1q_u8(ra.add((1 ^ BH) * 16));
         let va2 = vld1q_u8(ra.add((2 ^ BH) * 16));
@@ -385,7 +395,7 @@ unsafe fn xor_apply_byte_into_8_regs<const BH: usize, const ODD: bool>(
         let vb1 = vld1q_u8(rb.add((1 ^ BH) * 16));
         let vb2 = vld1q_u8(rb.add((2 ^ BH) * 16));
         let vb3 = vld1q_u8(rb.add((3 ^ BH) * 16));
-        let (va0, va1, va2, va3, vb0, vb1, vb2, vb3) = if ODD {
+        let (va0, va1, va2, va3, vb0, vb1, vb2, vb3) = if ODD && !USE_PRE_SWAPPED {
             (
                 vextq_u8::<8>(va0, va0),
                 vextq_u8::<8>(va1, va1),
@@ -420,8 +430,9 @@ fn packed_byte<const B: usize>(word: u64) -> u8 {
 
 #[cfg(target_arch = "aarch64")]
 #[inline(always)]
-unsafe fn fused_apply_one_k<const K: i32, const FULL_ROW: bool>(
+unsafe fn fused_apply_one_k<const K: i32, const FULL_ROW: bool, const USE_PRE_SWAPPED: bool>(
     table_base: *const u8,
+    half_swapped_table_base: *const u8,
     a_row: u64,
     b_row: u64,
     acc0_lo: &mut core::arch::aarch64::uint16x8_t,
@@ -449,8 +460,9 @@ unsafe fn fused_apply_one_k<const K: i32, const FULL_ROW: bool>(
         let mut db3 = vld1q_u8(rb0.add(48));
 
         // b = 1..7: XOR with table row[bytes[b]], permuted per (BH, ODD).
-        xor_apply_byte_into_8_regs::<0, true>(
+        xor_apply_byte_into_8_regs::<0, true, USE_PRE_SWAPPED>(
             table_base,
+            half_swapped_table_base,
             packed_byte::<1>(a_row),
             packed_byte::<1>(b_row),
             &mut da0,
@@ -462,8 +474,9 @@ unsafe fn fused_apply_one_k<const K: i32, const FULL_ROW: bool>(
             &mut db2,
             &mut db3,
         );
-        xor_apply_byte_into_8_regs::<1, false>(
+        xor_apply_byte_into_8_regs::<1, false, USE_PRE_SWAPPED>(
             table_base,
+            half_swapped_table_base,
             packed_byte::<2>(a_row),
             packed_byte::<2>(b_row),
             &mut da0,
@@ -475,8 +488,9 @@ unsafe fn fused_apply_one_k<const K: i32, const FULL_ROW: bool>(
             &mut db2,
             &mut db3,
         );
-        xor_apply_byte_into_8_regs::<1, true>(
+        xor_apply_byte_into_8_regs::<1, true, USE_PRE_SWAPPED>(
             table_base,
+            half_swapped_table_base,
             packed_byte::<3>(a_row),
             packed_byte::<3>(b_row),
             &mut da0,
@@ -488,8 +502,9 @@ unsafe fn fused_apply_one_k<const K: i32, const FULL_ROW: bool>(
             &mut db2,
             &mut db3,
         );
-        xor_apply_byte_into_8_regs::<2, false>(
+        xor_apply_byte_into_8_regs::<2, false, USE_PRE_SWAPPED>(
             table_base,
+            half_swapped_table_base,
             packed_byte::<4>(a_row),
             packed_byte::<4>(b_row),
             &mut da0,
@@ -501,8 +516,9 @@ unsafe fn fused_apply_one_k<const K: i32, const FULL_ROW: bool>(
             &mut db2,
             &mut db3,
         );
-        xor_apply_byte_into_8_regs::<2, true>(
+        xor_apply_byte_into_8_regs::<2, true, USE_PRE_SWAPPED>(
             table_base,
+            half_swapped_table_base,
             packed_byte::<5>(a_row),
             packed_byte::<5>(b_row),
             &mut da0,
@@ -514,8 +530,9 @@ unsafe fn fused_apply_one_k<const K: i32, const FULL_ROW: bool>(
             &mut db2,
             &mut db3,
         );
-        xor_apply_byte_into_8_regs::<3, false>(
+        xor_apply_byte_into_8_regs::<3, false, USE_PRE_SWAPPED>(
             table_base,
+            half_swapped_table_base,
             packed_byte::<6>(a_row),
             packed_byte::<6>(b_row),
             &mut da0,
@@ -528,8 +545,9 @@ unsafe fn fused_apply_one_k<const K: i32, const FULL_ROW: bool>(
             &mut db3,
         );
         if FULL_ROW {
-            xor_apply_byte_into_8_regs::<3, true>(
+            xor_apply_byte_into_8_regs::<3, true, USE_PRE_SWAPPED>(
                 table_base,
+                half_swapped_table_base,
                 packed_byte::<7>(a_row),
                 packed_byte::<7>(b_row),
                 &mut da0,
@@ -572,7 +590,7 @@ pub(crate) fn shift_reduce_inner_ab_fused_neon(
     out: &mut [u8; 64],
 ) {
     unsafe {
-        shift_reduce_inner_ab_fused_neon_impl::<false>(
+        shift_reduce_inner_ab_fused_neon_impl::<false, true>(
             a_packed,
             b_packed,
             inv_table,
@@ -596,7 +614,7 @@ pub(crate) fn shift_reduce_inner_ab_and_transpose_c_fused_neon(
     out_c: &mut [u8; 64],
 ) {
     unsafe {
-        shift_reduce_inner_ab_fused_neon_impl::<true>(
+        shift_reduce_inner_ab_fused_neon_impl::<true, true>(
             a_packed,
             b_packed,
             inv_table,
@@ -610,7 +628,10 @@ pub(crate) fn shift_reduce_inner_ab_and_transpose_c_fused_neon(
 
 #[cfg(target_arch = "aarch64")]
 #[inline(always)]
-unsafe fn shift_reduce_inner_ab_fused_neon_impl<const CAPTURE_C: bool>(
+unsafe fn shift_reduce_inner_ab_fused_neon_impl<
+    const CAPTURE_C: bool,
+    const USE_PRE_SWAPPED: bool,
+>(
     a_packed: &[u8],
     b_packed: &[u8],
     inv_table: &InvNttTableByteSingleGf8,
@@ -624,6 +645,7 @@ unsafe fn shift_reduce_inner_ab_fused_neon_impl<const CAPTURE_C: bool>(
 
     let byte_base_b = chunk_byte_base + b_med * N_CHUNKS * 8;
     let table_base = inv_table.data_ptr();
+    let half_swapped_table_base = inv_table.half_swapped_data_ptr();
 
     unsafe {
         let mut acc0_lo = vdupq_n_u16(0);
@@ -655,8 +677,9 @@ unsafe fn shift_reduce_inner_ab_fused_neon_impl<const CAPTURE_C: bool>(
                     // grows the hot kernel's callee-save frame.
                     core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
                 }
-                fused_apply_one_k::<$k, true>(
+                fused_apply_one_k::<$k, true, USE_PRE_SWAPPED>(
                     table_base,
+                    half_swapped_table_base,
                     a_row,
                     b_row,
                     &mut acc0_lo,
@@ -717,7 +740,7 @@ pub(crate) fn shift_reduce_inner_ab_fused_neon_prefix_7(
     out: &mut [u8; 64],
 ) {
     unsafe {
-        shift_reduce_inner_ab_fused_neon_prefix_7_impl::<false>(
+        shift_reduce_inner_ab_fused_neon_prefix_7_impl::<false, true>(
             a_packed,
             b_packed,
             inv_table,
@@ -741,7 +764,7 @@ pub(crate) fn shift_reduce_inner_ab_and_transpose_c_fused_neon_prefix_7(
     out_c: &mut [u8; 64],
 ) {
     unsafe {
-        shift_reduce_inner_ab_fused_neon_prefix_7_impl::<true>(
+        shift_reduce_inner_ab_fused_neon_prefix_7_impl::<true, true>(
             a_packed,
             b_packed,
             inv_table,
@@ -755,7 +778,10 @@ pub(crate) fn shift_reduce_inner_ab_and_transpose_c_fused_neon_prefix_7(
 
 #[cfg(target_arch = "aarch64")]
 #[inline(always)]
-unsafe fn shift_reduce_inner_ab_fused_neon_prefix_7_impl<const CAPTURE_C: bool>(
+unsafe fn shift_reduce_inner_ab_fused_neon_prefix_7_impl<
+    const CAPTURE_C: bool,
+    const USE_PRE_SWAPPED: bool,
+>(
     a_packed: &[u8],
     b_packed: &[u8],
     inv_table: &InvNttTableByteSingleGf8,
@@ -769,6 +795,7 @@ unsafe fn shift_reduce_inner_ab_fused_neon_prefix_7_impl<const CAPTURE_C: bool>(
 
     let byte_base_b = chunk_byte_base + b_med * N_CHUNKS * 8;
     let table_base = inv_table.data_ptr();
+    let half_swapped_table_base = inv_table.half_swapped_data_ptr();
 
     unsafe {
         let mut acc0_lo = vdupq_n_u16(0);
@@ -794,8 +821,9 @@ unsafe fn shift_reduce_inner_ab_fused_neon_prefix_7_impl<const CAPTURE_C: bool>(
             vst1q_u8(out_c.add(48), zero);
             (out_c as *mut u64).write_unaligned((a_row & b_row).to_le());
         }
-        fused_apply_one_k::<0, false>(
+        fused_apply_one_k::<0, false, USE_PRE_SWAPPED>(
             table_base,
+            half_swapped_table_base,
             a_row,
             b_row,
             &mut acc0_lo,

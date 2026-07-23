@@ -56,7 +56,13 @@ impl InvNttTableByteSingleGf8 {
         // straddles two cache lines.
         const TABLE_ALIGNMENT: usize = 64;
         let table_len = 256 * ell;
-        let mut data = vec![F8::ZERO; table_len + TABLE_ALIGNMENT - 1];
+        // AArch64's fused URM leaf reads odd byte positions with the two
+        // 8-byte halves of each vector exchanged. Keep that exact permutation
+        // as a second image so the hot path can load it directly instead of
+        // executing one EXT per vector. Other architectures retain the
+        // original footprint.
+        let table_images = if cfg!(target_arch = "aarch64") { 2 } else { 1 };
+        let mut data = vec![F8::ZERO; table_images * table_len + TABLE_ALIGNMENT - 1];
         let data_offset = (TABLE_ALIGNMENT - (data.as_ptr() as usize & (TABLE_ALIGNMENT - 1)))
             & (TABLE_ALIGNMENT - 1);
         let table = &mut data[data_offset..data_offset + table_len];
@@ -94,6 +100,21 @@ impl InvNttTableByteSingleGf8 {
             }
         }
 
+        #[cfg(target_arch = "aarch64")]
+        {
+            let swapped_start = data_offset + table_len;
+            let (original_storage, swapped_storage) = data.split_at_mut(swapped_start);
+            let original = &original_storage[data_offset..data_offset + table_len];
+            let swapped = &mut swapped_storage[..table_len];
+            for (source, target) in original
+                .chunks_exact(16)
+                .zip(swapped.chunks_exact_mut(16))
+            {
+                target[..8].copy_from_slice(&source[8..]);
+                target[8..].copy_from_slice(&source[..8]);
+            }
+        }
+
         Self {
             k,
             ell,
@@ -111,6 +132,22 @@ impl InvNttTableByteSingleGf8 {
         // SAFETY: `data_offset` selects a position within the over-allocated
         // buffer and the allocation cannot move while borrowed through self.
         unsafe { self.data.as_ptr().add(self.data_offset) as *const u8 }
+    }
+
+    /// Raw pointer to an AArch64-only image in which every 16-byte chunk has
+    /// its two 8-byte halves exchanged. The image has the same row/chunk
+    /// layout as [`Self::data_ptr`].
+    #[cfg(target_arch = "aarch64")]
+    #[inline]
+    pub fn half_swapped_data_ptr(&self) -> *const u8 {
+        debug_assert!(self.ell >= 16);
+        // SAFETY: AArch64 construction appends one complete logical table
+        // immediately after the original image in the same allocation.
+        unsafe {
+            self.data
+                .as_ptr()
+                .add(self.data_offset + 256 * self.ell) as *const u8
+        }
     }
 
     #[inline]
@@ -406,6 +443,32 @@ mod tests {
             let ntt_l = AdditiveNttGf8::new(k, F8(1u8 << k));
             let table = InvNttTableByteSingleGf8::new(&ntt_s, &ntt_l);
             assert_eq!(table.data_ptr() as usize % 64, 0, "k={k}");
+        }
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn half_swapped_storage_is_exhaustively_exact() {
+        for k in 4..=7 {
+            let ntt_s = AdditiveNttGf8::new(k, F8::ZERO);
+            let ntt_l = AdditiveNttGf8::new(k, F8(1u8 << k));
+            let table = InvNttTableByteSingleGf8::new(&ntt_s, &ntt_l);
+            assert_eq!(table.half_swapped_data_ptr() as usize % 64, 0, "k={k}");
+
+            let len = 256 * table.ell;
+            // SAFETY: both pointers expose complete `len`-byte images owned
+            // by `table` for the duration of this test.
+            let original = unsafe { core::slice::from_raw_parts(table.data_ptr(), len) };
+            let swapped =
+                unsafe { core::slice::from_raw_parts(table.half_swapped_data_ptr(), len) };
+            for (chunk_index, (source, target)) in original
+                .chunks_exact(16)
+                .zip(swapped.chunks_exact(16))
+                .enumerate()
+            {
+                assert_eq!(&target[..8], &source[8..], "k={k}, chunk={chunk_index}");
+                assert_eq!(&target[8..], &source[..8], "k={k}, chunk={chunk_index}");
+            }
         }
     }
 
