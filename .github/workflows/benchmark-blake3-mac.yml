@@ -1,5 +1,4 @@
 name: BLAKE3 Mac Benchmark
-run-name: BLAKE3 Mac Benchmark
 
 on:
   workflow_dispatch:
