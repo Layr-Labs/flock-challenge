@@ -104,7 +104,7 @@ args=("${worker}" "${scratch}" "${root}/score.json" "${output_dir}/summary.md"
 "${verifier}" "${args[@]}"
 
 # Reaching here means every timed proof passed pristine verification.
-# Keep the root score for Yukon and copy it into the diagnostic artifact.
+# Keep the root score for Hilbert and copy it into the diagnostic artifact.
 cp score.json "${output_dir}/score.json"
 # shellcheck disable=SC2016 # Backticks are literal Markdown; %s receives the SHA.
 printf -- '- Candidate commit: `%s`\n' "$(git rev-parse HEAD)" >> "${output_dir}/summary.md"

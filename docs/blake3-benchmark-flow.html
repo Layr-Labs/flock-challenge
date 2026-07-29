@@ -284,7 +284,7 @@
     <header>
       <div class="eyebrow">Flock BLAKE3 benchmark · implementation review map</div>
       <h1>Private input. Editable prover. Fixed verifier.</h1>
-      <p class="deck">The benchmark times a submission-built Flock prover on fresh BLAKE3 compression inputs. A prebuilt verifier reconstructs the same witness, checks the proof, and writes the only score Yukon accepts.</p>
+      <p class="deck">The benchmark times a submission-built Flock prover on fresh BLAKE3 compression inputs. A prebuilt verifier reconstructs the same witness, checks the proof, and writes the only score Hilbert accepts.</p>
       <div class="thesis">
         <strong>Ranked invariant</strong>
         <p>The candidate may change the proving implementation, but it does not choose the scored input, measure its own time, load code into the trusted verifier, or write <code>score.json</code>.</p>
@@ -396,7 +396,7 @@
       <section id="surface">
         <div class="section-label">Optimization surface</div>
         <h2>Broad prover freedom; protected measurement.</h2>
-        <p class="lede">Yukon constructs candidates from only the two relative paths declared in <code>benchmark.json</code>. Everything else comes from the trusted baseline.</p>
+        <p class="lede">Hilbert constructs candidates from only the two relative paths declared in <code>benchmark.json</code>. Everything else comes from the trusted baseline.</p>
         <div class="table-wrap">
           <table>
             <thead><tr><th>Path or component</th><th>What it controls</th><th>Status</th></tr></thead>
@@ -407,7 +407,7 @@
               <tr><td>Harness source and binary</td><td>Random seed, timer, deadlines, decoding, witness reconstruction, verification, and score types.</td><td class="protected">Protected</td></tr>
               <tr><td>Cargo manifests and lockfile</td><td>Crate graph, dependencies, build targets, and optimized challenge profile.</td><td class="protected">Protected</td></tr>
               <tr><td>Scripts, workflow, manifest</td><td>Setup, sandbox, runner selection, commands, artifacts, editable paths, and score location.</td><td class="protected">Protected</td></tr>
-              <tr><td><code>score.json</code></td><td>Yukon's root score artifact, generated outside both editable directories.</td><td class="protected">Verifier-written</td></tr>
+              <tr><td><code>score.json</code></td><td>Hilbert's root score artifact, generated outside both editable directories.</td><td class="protected">Verifier-written</td></tr>
             </tbody>
           </table>
         </div>
@@ -532,8 +532,8 @@
         <h2>Read the benchmark-specific contract in ten files.</h2>
         <p class="lede">Start with policy and the worker boundary, then review the trusted lifecycle and verifier provenance. Upstream Flock cryptography sits beneath this small authored path.</p>
         <ol class="review-list">
-          <li><a href="../BENCHMARK.md">BENCHMARK.md</a><span>Textual measurement, hardware, scoring, and security contract.</span></li>
-          <li><a href="../benchmark.json">benchmark.json</a><span>Yukon editable paths, commands, direction, score path, and workflow.</span></li>
+          <li><a href="../README.md">README.md</a><span>Textual measurement, hardware, scoring, and security contract.</span></li>
+          <li><a href="../benchmark.json">benchmark.json</a><span>Hilbert editable paths, commands, direction, score path, and workflow.</span></li>
           <li><a href="../benchmark-tools/common/src/lib.rs">common/src/lib.rs</a><span>Seed expansion and the fixed transcript domain.</span></li>
           <li><a href="../benchmark-tools/worker/src/main.rs">worker/src/main.rs</a><span>Complete protected wrapper around candidate proving code.</span></li>
           <li><a href="../benchmark-tools/harness/src/main.rs">harness/src/main.rs</a><span>Private seed, lifecycle, timing, strict verification, and score types.</span></li>

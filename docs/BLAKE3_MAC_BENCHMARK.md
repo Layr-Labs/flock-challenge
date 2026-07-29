@@ -13,7 +13,7 @@ The benchmark has one untrusted process and one trusted process.
 The complete visual review is
 [blake3-benchmark-flow.html](blake3-benchmark-flow.html). It includes the
 timing boundary, trust boundary, function inventory, failure behavior, and the
-GitHub Actions/Yukon handoff.
+GitHub Actions/Hilbert handoff.
 
 ## Ranked contract
 
@@ -114,9 +114,9 @@ machine prerequisites need repair.
 The ranked workflow sets `FLOCK_REQUIRE_SANDBOX=1`. Local runs warn and proceed
 without Seatbelt when `sandbox-exec` is unavailable.
 
-## GitHub Actions and Yukon
+## GitHub Actions and Hilbert
 
-The workflow follows Yukon's `github-actions-benchmark-author-guide.md`:
+The workflow follows Hilbert's `github-actions-benchmark-author-guide.md`:
 
 - `workflow_dispatch` is the only trigger;
 - checkout uses the exact `${{ github.sha }}` from a clean checkout;
@@ -124,11 +124,11 @@ The workflow follows Yukon's `github-actions-benchmark-author-guide.md`:
 - the exact root `score.json` is uploaded even though diagnostics are separate;
 - failures do not produce a trusted score.
 
-Yukon constructs the candidate commit from the current baseline by replacing
+Hilbert constructs the candidate commit from the current baseline by replacing
 only `editablePaths`, dispatches this workflow, reads the score artifact, and
 promotes only the exact scored commit. Do not manually merge submission PRs.
 
-Install the matching Yukon GitHub App before import:
+Install the matching Hilbert GitHub App before import:
 
 - development: <https://github.com/apps/yukon-eigen/installations/new>
 - production: <https://github.com/apps/yukon-autoresearch/installations/new>
