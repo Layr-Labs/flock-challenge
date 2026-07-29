@@ -506,15 +506,15 @@
       <section id="hardware">
         <div class="section-label">Hardware and operational security</div>
         <h2>Official throughput belongs to one runner class.</h2>
-        <p class="lede">Local Apple Silicon runs are useful for correctness and directional feedback. Absolute ranking comes from the dedicated M4 Pro because chip configuration, compiler output, thermals, and background load affect throughput.</p>
+        <p class="lede">Local Apple Silicon runs are useful for correctness and directional feedback. Absolute ranking comes from the dedicated M3 Max because chip configuration, compiler output, thermals, and background load affect throughput.</p>
         <div class="split">
           <article class="panel">
             <div class="panel-head"><h3>Official GitHub runner</h3><span>authoritative</span></div>
-            <div class="panel-body"><ul><li>Apple M4 Pro, 48 GB unified memory</li><li>10 performance cores selected by default</li><li>arm64 macOS; validated run: 26.4 build 25E246</li><li>Rust 1.97.0; candidate <code>target-cpu=native</code></li><li>Self-hosted label <code>m4-pro</code>; one benchmark at a time</li></ul></div>
+            <div class="panel-body"><ul><li>14-core Apple M3 Max, 36 GB unified memory</li><li>10 performance cores selected by default</li><li>arm64 macOS</li><li>Rust 1.97.0; candidate <code>target-cpu=native</code></li><li>Self-hosted label <code>m3-max-36gb</code>; one benchmark at a time</li></ul></div>
           </article>
           <article class="panel">
             <div class="panel-head"><h3>Local Apple Silicon</h3><span>directional</span></div>
-            <div class="panel-body"><ul><li><code>./setup.sh</code> checks arm64 macOS, Xcode Clang, Rust, checksum, and signing</li><li><code>./benchmark.sh</code> rebuilds the current candidate offline, then uses local performance cores</li><li>Compilation finishes before the trusted harness starts any timer</li><li>Compare changes only on the same quiet machine; the official M4 Pro result remains authoritative</li></ul></div>
+            <div class="panel-body"><ul><li><code>./setup.sh</code> checks arm64 macOS, Xcode Clang, Rust, checksum, and signing</li><li><code>./benchmark.sh</code> rebuilds the current candidate offline, then uses local performance cores</li><li>Compilation finishes before the trusted harness starts any timer</li><li>Compare changes only on the same quiet machine; the official M3 Max result remains authoritative</li></ul></div>
           </article>
         </div>
         <div class="failure-grid" style="margin-top:22px">
@@ -541,12 +541,12 @@
           <li><a href="../benchmark-tools/trusted/SHA256SUMS">trusted/SHA256SUMS</a><span>Exact committed verifier digest.</span></li>
           <li><a href="../setup.sh">setup.sh</a><span>Machine checks, dependencies, verifier integrity, and offline candidate build.</span></li>
           <li><a href="../benchmark.sh">benchmark.sh</a><span>Core selection, stale-score removal, Seatbelt profile, and verifier invocation.</span></li>
-          <li><a href="../.github/workflows/benchmark-blake3-mac.yml">GitHub workflow</a><span>Exact-SHA checkout, M4 Pro routing, ranked values, and score artifact.</span></li>
+          <li><a href="../.github/workflows/benchmark-blake3-mac.yml">GitHub workflow</a><span>Exact-SHA checkout, M3 Max routing, ranked values, and score artifact.</span></li>
         </ol>
       </section>
     </main>
 
-    <footer>2^18 BLAKE3 compressions per proof · 20 verified warm-ups · median of 100 verified trials · prebuilt arm64 verifier · self-hosted Apple M4 Pro</footer>
+    <footer>2^18 BLAKE3 compressions per proof · 20 verified warm-ups · median of 100 verified trials · prebuilt arm64 verifier · self-hosted Apple M3 Max</footer>
   </div>
 </body>
 </html>

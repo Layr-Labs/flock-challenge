@@ -22,7 +22,7 @@ For a visual version of this document, open
 | Direction | higher is better |
 | Correctness | every timed proof must pass the prebuilt verifier |
 | Proof file limit | 500,000 bytes, enforced by the prebuilt verifier |
-| Official runner | Apple M4 Pro, 48 GB unified memory, 10 performance cores |
+| Official runner | Apple M3 Max, 36 GB unified memory, 10 performance cores |
 
 The benchmark counts **BLAKE3 compression functions**, not complete
 whole-message BLAKE3 hashes. The distinction matters when presenting the
@@ -90,7 +90,7 @@ Silicon Mac and record its score:
 
 Use that result as your local baseline, then compare every optimization against
 it on the same quiet machine. The official ranked benchmark runs on a dedicated
-Apple M4 Pro with 48 GB of unified memory, so its absolute score will differ
+Apple M3 Max with 36 GB of unified memory, so its absolute score will differ
 from results on other Macs. Local before-and-after measurements are still the
 fastest way to determine whether a change is directionally useful before
 submitting it for official scoring.
@@ -99,23 +99,25 @@ submitting it for official scoring.
 
 Official scores run in GitHub Actions on a dedicated self-hosted Mac with:
 
-- Apple M4 Pro;
-- 48 GB unified memory;
+- Apple M3 Max with 14 CPU cores;
+- 36 GB unified memory;
 - 10 performance cores used by the default thread selection;
 - arm64 macOS;
-- runner label `m4-pro`;
+- runner label `m3-max-36gb`;
 - Rust 1.97.0;
 - candidate builds using `-C target-cpu=native`.
 
-The validated stability experiment used macOS 26.4 build 25E246. Across five
-independent sessions, the unmodified candidate averaged approximately 483,866
-verified compressions/s with 0.539% run-to-run CV. This is a
-reference observation, not a guaranteed baseline: system version, thermals,
-background load, and compiler output can move absolute throughput.
+The previous M4 Pro runner's validated stability experiment used macOS 26.4
+build 25E246. Across five independent sessions, the unmodified candidate
+averaged approximately 483,866 verified compressions/s with 0.539% run-to-run
+CV. This is a historical reference observation and is not comparable to scores
+from the M3 Max runner. Establish a fresh baseline after the hardware migration;
+system version, thermals, background load, and compiler output can move
+absolute throughput.
 
 Local runs on another Apple Silicon Mac are useful for correctness and
 directional optimization feedback. Compare performance changes on the same
-quiet machine. Only the official M4 Pro runner determines the ranked score.
+quiet machine. Only the official M3 Max runner determines the ranked score.
 
 ## Editable surface
 
@@ -340,7 +342,7 @@ The production workflow is
 5. publishes the Markdown summary;
 6. uploads root `score.json` and a separate diagnostics artifact.
 
-The workflow runs on `[self-hosted, m4-pro]`. Hilbert owns submission archive
+The workflow runs on `[self-hosted, m3-max-36gb]`. Hilbert owns submission archive
 validation, editable-path enforcement, candidate commit construction, workflow
 dispatch, score comparison, and promotion. The GitHub pull request remains the
 durable record of the candidate diff, workflow run, and result.

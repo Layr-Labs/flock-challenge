@@ -17,7 +17,7 @@ GitHub Actions/Hilbert handoff.
 
 ## Ranked contract
 
-- Runner: dedicated Apple M4 Pro runner labeled `m4-pro`
+- Runner: dedicated 14-core Apple M3 Max with 36 GB memory, labeled `m3-max-36gb`
 - Work: 2^18 independent BLAKE3 compressions per proof
 - Default Rayon threads: performance-core count
 - Machine warm-up: 20 private, timed, verified proofs discarded from scoring
