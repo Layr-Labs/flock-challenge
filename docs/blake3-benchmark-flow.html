@@ -1,0 +1,552 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="snark.fast">
+  <title>snark.fast</title>
+  <style>
+    :root {
+      --canvas: #e9eff2;
+      --paper: #fbfcfd;
+      --ink: #172536;
+      --muted: #5d6c79;
+      --line: #b9c6ce;
+      --line-soft: #dce4e8;
+      --candidate: #9a5b18;
+      --candidate-soft: #fff0d8;
+      --trusted: #28599a;
+      --trusted-soft: #e4edfb;
+      --verified: #237448;
+      --verified-soft: #e2f2e8;
+      --danger: #a13d32;
+      --danger-soft: #f8e7e4;
+      --display: Charter, "Iowan Old Style", Georgia, serif;
+      --body: "Avenir Next", Avenir, "Segoe UI", Helvetica, Arial, sans-serif;
+      --mono: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+    }
+
+    * { box-sizing: border-box; }
+    html { scroll-behavior: smooth; }
+    body {
+      margin: 0;
+      color: var(--ink);
+      background: var(--canvas);
+      font-family: var(--body);
+      line-height: 1.55;
+    }
+    code, pre { font-family: var(--mono); }
+    code { font-size: .9em; }
+    a { color: inherit; }
+    p { text-wrap: pretty; }
+    .page {
+      width: min(1480px, 100%);
+      min-height: 100vh;
+      margin: 0 auto;
+      background: var(--paper);
+      box-shadow: 0 0 0 1px rgba(23, 37, 54, .05);
+    }
+
+    header { padding: clamp(50px, 7vw, 96px) clamp(24px, 6vw, 88px) 58px; border-bottom: 1px solid var(--line); }
+    .eyebrow, .section-label, .micro-label {
+      color: var(--trusted);
+      font: 700 11px/1.2 var(--mono);
+      letter-spacing: .13em;
+      text-transform: uppercase;
+    }
+    h1 {
+      max-width: 1040px;
+      margin: 22px 0 20px;
+      font: 500 clamp(48px, 7.2vw, 100px)/.94 var(--display);
+      letter-spacing: -.05em;
+    }
+    .deck { max-width: 920px; margin: 0; color: var(--muted); font-size: clamp(18px, 2vw, 24px); }
+    .thesis {
+      display: grid;
+      grid-template-columns: 170px 1fr;
+      gap: 22px;
+      max-width: 1050px;
+      margin-top: 42px;
+      padding-top: 22px;
+      border-top: 2px solid var(--ink);
+    }
+    .thesis strong { color: var(--trusted); font-family: var(--mono); }
+    .thesis p { margin: 0; font-size: 17px; }
+
+    nav {
+      position: sticky;
+      top: 0;
+      z-index: 10;
+      display: flex;
+      overflow-x: auto;
+      border-bottom: 1px solid var(--line);
+      background: rgba(251, 252, 253, .95);
+      backdrop-filter: blur(10px);
+    }
+    nav a {
+      flex: none;
+      padding: 14px 17px;
+      border-right: 1px solid var(--line-soft);
+      color: var(--muted);
+      font: 700 10px/1 var(--mono);
+      letter-spacing: .07em;
+      text-decoration: none;
+      text-transform: uppercase;
+    }
+    nav a:hover, nav a:focus-visible { color: var(--trusted); background: var(--trusted-soft); outline: 0; }
+
+    main { padding: 0 clamp(20px, 5vw, 72px) 100px; }
+    section { padding-top: 74px; scroll-margin-top: 48px; }
+    section + section { margin-top: 74px; border-top: 1px solid var(--line); }
+    h2 {
+      max-width: 980px;
+      margin: 12px 0 0;
+      font: 500 clamp(36px, 5vw, 68px)/1 var(--display);
+      letter-spacing: -.035em;
+    }
+    h3 { margin: 0; font-size: 18px; line-height: 1.3; }
+    .lede { max-width: 920px; margin: 18px 0 34px; color: var(--muted); font-size: 18px; }
+    .note { color: var(--muted); font-size: 13px; }
+    .strong-note { margin: 22px 0 0; padding: 16px 18px; border-left: 5px solid var(--trusted); background: var(--trusted-soft); font-size: 14px; }
+    .strong-note.warning { border-color: var(--danger); background: var(--danger-soft); }
+
+    .legend { display: flex; flex-wrap: wrap; gap: 10px 20px; margin: 26px 0; }
+    .legend span { display: inline-flex; align-items: center; gap: 8px; color: var(--muted); font-size: 12px; }
+    .dot { width: 9px; height: 9px; border-radius: 50%; background: currentColor; }
+    .candidate-color { color: var(--candidate); }
+    .trusted-color { color: var(--trusted); }
+    .verified-color { color: var(--verified); }
+
+    .protocol { display: grid; grid-template-columns: repeat(7, 1fr); border: 1px solid var(--line); background: white; }
+    .protocol-step { position: relative; min-width: 0; min-height: 220px; padding: 22px 17px; border-right: 1px solid var(--line); }
+    .protocol-step:last-child { border-right: 0; }
+    .protocol-step::before { position: absolute; inset: 0 0 auto; height: 5px; content: ""; background: currentColor; }
+    .protocol-step:not(:last-child)::after {
+      position: absolute;
+      z-index: 2;
+      top: 82px;
+      right: -14px;
+      display: grid;
+      width: 27px;
+      height: 27px;
+      place-items: center;
+      border: 1px solid var(--line);
+      border-radius: 50%;
+      content: "→";
+      color: var(--ink);
+      background: white;
+      font-family: var(--mono);
+    }
+    .protocol-step .number { display: block; margin: 8px 0 34px; color: var(--muted); font: 700 10px/1 var(--mono); }
+    .protocol-step p { margin: 10px 0 0; color: var(--muted); font-size: 13px; }
+    .protocol-step.candidate { color: var(--candidate); }
+    .protocol-step.trusted { color: var(--trusted); }
+    .protocol-step.verified { color: var(--verified); }
+    .protocol-step h3 { color: var(--ink); }
+
+    .split { display: grid; grid-template-columns: 1fr 1fr; gap: 22px; }
+    .panel { min-width: 0; border: 1px solid var(--line); background: white; }
+    .panel-head { display: flex; justify-content: space-between; align-items: center; gap: 16px; padding: 15px 18px; border-bottom: 1px solid var(--line); }
+    .panel-head span { color: var(--muted); font: 700 10px/1 var(--mono); letter-spacing: .08em; text-transform: uppercase; }
+    .panel-body { padding: 20px; }
+    .panel-body > :first-child { margin-top: 0; }
+    .panel-body > :last-child { margin-bottom: 0; }
+    pre { margin: 0; overflow: auto; padding: 18px; color: #dce8f2; background: #142535; font-size: 12px; line-height: 1.62; tab-size: 2; }
+    .warm { color: #f2c87e; }
+    .cool { color: #82d8d1; }
+    .green { color: #91d3a8; }
+    .formula { display: grid; min-height: 218px; place-items: center; padding: 26px; background: #eef3f5; text-align: center; }
+    .formula code { font-size: clamp(20px, 3vw, 32px); font-weight: 700; }
+    .formula small { display: block; margin-top: 12px; color: var(--muted); }
+    .tuple { padding: 15px; border-left: 5px solid var(--candidate); background: var(--candidate-soft); font-size: 13px; }
+
+    .facts { display: grid; grid-template-columns: repeat(4, 1fr); margin-top: 18px; border: 1px solid var(--line); background: white; }
+    .fact { padding: 17px; border-right: 1px solid var(--line); }
+    .fact:last-child { border-right: 0; }
+    .fact b { display: block; margin-bottom: 5px; font: 700 20px/1.2 var(--mono); }
+    .fact span { color: var(--muted); font-size: 12px; }
+
+    .boundary { display: grid; grid-template-columns: 1fr 180px 1fr; border: 1px solid var(--line); background: white; }
+    .lane { min-width: 0; }
+    .lane-head { padding: 15px 18px; color: white; font: 700 11px/1 var(--mono); letter-spacing: .1em; text-transform: uppercase; }
+    .lane.candidate .lane-head { background: var(--candidate); }
+    .lane.trusted .lane-head { background: var(--trusted); }
+    .lane-body { padding: 20px; }
+    .lane-node { min-height: 96px; padding: 16px; border: 1px solid var(--line-soft); background: var(--paper); }
+    .lane-node + .lane-node { margin-top: 14px; }
+    .lane-node p { margin: 7px 0 0; color: var(--muted); font-size: 13px; }
+    .wire { display: grid; align-content: center; gap: 34px; padding: 20px 12px; border-inline: 1px solid var(--line); background: #eef3f5; }
+    .wire-message { position: relative; padding: 12px 7px; border: 1px solid var(--line); background: white; font: 700 10px/1.45 var(--mono); text-align: center; }
+    .wire-message.left::before { content: "←"; margin-right: 5px; color: var(--trusted); }
+    .wire-message.right::after { content: "→"; margin-left: 5px; color: var(--candidate); }
+    .wire small { color: var(--muted); font: 10px/1.4 var(--body); text-align: center; }
+
+    .build-flow { display: grid; grid-template-columns: repeat(4, 1fr); border: 1px solid var(--line); background: white; }
+    .build-step { position: relative; min-height: 190px; padding: 20px; border-right: 1px solid var(--line); }
+    .build-step:last-child { border-right: 0; }
+    .build-step:not(:last-child)::after { position: absolute; z-index: 2; top: 68px; right: -13px; width: 26px; content: "→"; color: var(--trusted); background: white; font: 700 19px/1 var(--mono); text-align: center; }
+    .build-step b { display: block; margin: 6px 0 30px; color: var(--trusted); font: 700 10px/1.3 var(--mono); letter-spacing: .06em; }
+    .build-step p { margin: 8px 0 0; color: var(--muted); font-size: 13px; }
+    .hash { overflow-wrap: anywhere; font: 11px/1.6 var(--mono); }
+
+    .table-wrap { overflow-x: auto; border: 1px solid var(--line); background: white; }
+    table { width: 100%; border-collapse: collapse; font-size: 14px; }
+    th, td { padding: 14px 16px; border-right: 1px solid var(--line); border-bottom: 1px solid var(--line); text-align: left; vertical-align: top; }
+    th:last-child, td:last-child { border-right: 0; }
+    tbody tr:last-child td { border-bottom: 0; }
+    th { color: var(--muted); background: #eef3f5; font: 700 10px/1.35 var(--mono); letter-spacing: .08em; text-transform: uppercase; }
+    td:first-child { font-weight: 700; }
+    .editable { color: var(--candidate); font-weight: 700; }
+    .protected { color: var(--trusted); font-weight: 700; }
+
+    .timeline { border: 1px solid var(--line); background: white; }
+    .timeline-head, .timeline-row { display: grid; grid-template-columns: 100px .85fr 1.25fr 1.2fr; }
+    .timeline-head > div { padding: 12px 15px; border-right: 1px solid var(--line); color: var(--muted); background: #eef3f5; font: 700 10px/1.2 var(--mono); letter-spacing: .08em; text-transform: uppercase; }
+    .timeline-head > div:last-child { border-right: 0; }
+    .timeline-row { min-height: 128px; border-top: 1px solid var(--line); }
+    .timeline-row > div { min-width: 0; padding: 16px; border-right: 1px solid var(--line-soft); }
+    .timeline-row > div:last-child { border-right: 0; }
+    .phase { color: var(--trusted); font: 700 11px/1.5 var(--mono); }
+    .cell-label { display: block; margin-bottom: 8px; color: var(--muted); font: 700 9px/1.2 var(--mono); letter-spacing: .07em; text-transform: uppercase; }
+    .timeline-row p { margin: 0; color: var(--muted); font-size: 13px; }
+    .blank { display: grid; min-height: 72px; place-items: center; color: var(--muted); font: 11px/1.4 var(--mono); text-align: center; }
+    .timed-cell { background: var(--candidate-soft); }
+    .verified-cell { background: var(--verified-soft); }
+
+    .cards { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; }
+    .card { min-height: 168px; padding: 18px; border: 1px solid var(--line); background: white; }
+    .card b { display: block; margin-bottom: 12px; color: var(--verified); font: 700 10px/1.35 var(--mono); letter-spacing: .05em; }
+    .card p { margin: 0; color: var(--muted); font-size: 13px; }
+
+    .score-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 22px; }
+    .metric-list { border: 1px solid var(--line); background: white; }
+    .metric { padding: 14px 17px; border-bottom: 1px solid var(--line-soft); }
+    .metric:last-child { border-bottom: 0; }
+    .metric code { display: block; margin-bottom: 4px; color: var(--trusted); font-weight: 700; }
+    .metric p { margin: 0; color: var(--muted); font-size: 13px; }
+
+    .failure-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; }
+    .failure-card { min-height: 165px; padding: 18px; border: 1px solid var(--line); background: white; }
+    .failure-card b { display: block; margin-bottom: 10px; color: var(--danger); font: 700 10px/1.35 var(--mono); letter-spacing: .05em; }
+    .failure-card p { margin: 0; color: var(--muted); font-size: 13px; }
+
+    .review-list { margin: 0; padding: 0; list-style: none; counter-reset: review; border: 1px solid var(--line); background: white; }
+    .review-list li { display: grid; grid-template-columns: 48px 260px 1fr; gap: 18px; padding: 16px; border-bottom: 1px solid var(--line-soft); counter-increment: review; }
+    .review-list li:last-child { border-bottom: 0; }
+    .review-list li::before { content: counter(review, decimal-leading-zero); color: var(--trusted); font: 700 10px/1.6 var(--mono); }
+    .review-list a { color: var(--trusted); font: 700 12px/1.5 var(--mono); }
+    .review-list span { color: var(--muted); font-size: 13px; }
+
+    footer { padding: 30px clamp(20px, 5vw, 72px); border-top: 1px solid var(--line); color: var(--muted); font: 11px/1.6 var(--mono); }
+
+    @media (max-width: 1180px) {
+      .protocol { grid-template-columns: repeat(4, 1fr); }
+      .protocol-step:nth-child(4) { border-right: 0; }
+      .protocol-step:nth-child(-n + 4) { border-bottom: 1px solid var(--line); }
+      .protocol-step::after { display: none; }
+      .facts { grid-template-columns: repeat(2, 1fr); }
+      .fact:nth-child(2) { border-right: 0; }
+      .fact:nth-child(-n + 2) { border-bottom: 1px solid var(--line); }
+    }
+    @media (max-width: 900px) {
+      .split, .score-grid { grid-template-columns: 1fr; }
+      .boundary { grid-template-columns: 1fr; }
+      .wire { grid-template-columns: 1fr 1fr; border-inline: 0; border-block: 1px solid var(--line); }
+      .wire small { grid-column: 1 / -1; }
+      .build-flow { grid-template-columns: 1fr 1fr; }
+      .build-step:nth-child(2) { border-right: 0; }
+      .build-step:nth-child(-n + 2) { border-bottom: 1px solid var(--line); }
+      .build-step::after { display: none; }
+      .timeline-head { display: none; }
+      .timeline-row { grid-template-columns: 90px 1fr; }
+      .timeline-row > div:nth-child(2n) { border-right: 0; }
+      .timeline-row > div:nth-child(n + 3) { border-top: 1px solid var(--line-soft); }
+      .cards, .failure-grid { grid-template-columns: 1fr 1fr; }
+    }
+    @media (max-width: 620px) {
+      .thesis { grid-template-columns: 1fr; }
+      .protocol, .facts, .build-flow, .cards, .failure-grid { grid-template-columns: 1fr; }
+      .protocol-step, .fact, .build-step { min-height: 0; border-right: 0; border-bottom: 1px solid var(--line); }
+      .protocol-step:last-child, .fact:last-child, .build-step:last-child { border-bottom: 0; }
+      .wire { grid-template-columns: 1fr; }
+      .wire small { grid-column: auto; }
+      .timeline-row { grid-template-columns: 1fr; }
+      .timeline-row > div { border-right: 0; border-top: 1px solid var(--line-soft); }
+      .timeline-row > div:first-child { border-top: 0; }
+      .review-list li { grid-template-columns: 34px 1fr; }
+      .review-list span { grid-column: 2; }
+    }
+    @media (prefers-reduced-motion: reduce) { html { scroll-behavior: auto; } }
+  </style>
+</head>
+<body>
+  <div class="page">
+    <header>
+      <div class="eyebrow">Flock BLAKE3 benchmark · implementation review map</div>
+      <h1>Private input. Editable prover. Fixed verifier.</h1>
+      <p class="deck">The benchmark times a submission-built Flock prover on fresh BLAKE3 compression inputs. A prebuilt verifier reconstructs the same witness, checks the proof, and writes the only score Yukon accepts.</p>
+      <div class="thesis">
+        <strong>Ranked invariant</strong>
+        <p>The candidate may change the proving implementation, but it does not choose the scored input, measure its own time, load code into the trusted verifier, or write <code>score.json</code>.</p>
+      </div>
+    </header>
+
+    <nav aria-label="Benchmark sections">
+      <a href="#summary">Protocol</a>
+      <a href="#measure">Measurement</a>
+      <a href="#boundary">Boundary</a>
+      <a href="#prebuild">Prebuild</a>
+      <a href="#surface">Editable surface</a>
+      <a href="#trial">Timing</a>
+      <a href="#verify">Verification</a>
+      <a href="#score">Score</a>
+      <a href="#hardware">Hardware</a>
+      <a href="#review">Review</a>
+    </nav>
+
+    <main>
+      <section id="summary">
+        <div class="section-label">The ranked protocol</div>
+        <h2>Seven ordered moves from checkout to score.</h2>
+        <p class="lede">GitHub Actions executes one exact submission commit. The trusted verifier owns every transition that affects the private challenge, wall-clock duration, proof verdict, or score.</p>
+        <div class="legend" aria-label="Diagram legend">
+          <span><i class="dot candidate-color"></i> candidate proving work</span>
+          <span><i class="dot trusted-color"></i> trusted control</span>
+          <span><i class="dot verified-color"></i> accepted result</span>
+        </div>
+        <div class="protocol">
+          <article class="protocol-step trusted"><span class="number">01 / CHECKOUT</span><h3>Load the exact SHA</h3><p>Actions checks out the dispatched commit cleanly with credentials disabled.</p></article>
+          <article class="protocol-step candidate"><span class="number">02 / BUILD</span><h3>Compile the worker</h3><p>Protected wrapper plus editable Flock sources become one candidate binary.</p></article>
+          <article class="protocol-step candidate"><span class="number">03 / WARM</span><h3>Prepare one process</h3><p>A fresh worker creates setup, proves one fixed public warm-up, and signals ready.</p></article>
+          <article class="protocol-step trusted"><span class="number">04 / CHALLENGE</span><h3>Draw and send a seed</h3><p>The verifier starts its clock, then sends a fresh 64-bit seed over stdin.</p></article>
+          <article class="protocol-step candidate"><span class="number">05 / PROVE</span><h3>Publish one proof</h3><p>Generate 262,144 inputs, witness, commitment, proof, and a completed versioned file.</p></article>
+          <article class="protocol-step trusted"><span class="number">06 / VERIFY</span><h3>Capture, stop, check</h3><p>Safely copy the proof, stop time, reap the worker, reconstruct the private witness commitment, and verify.</p></article>
+          <article class="protocol-step verified"><span class="number">07 / SCORE</span><h3>Accept all 120</h3><p>Discard 20 verified machine warm-ups, take median latency over 100 measured trials, then write typed JSON.</p></article>
+        </div>
+      </section>
+
+      <section id="measure">
+        <div class="section-label">What is measured</div>
+        <h2>BLAKE3 compression proofs, not whole-message hashes.</h2>
+        <p class="lede">Each operation proves one raw BLAKE3 compression with a generated chaining value, one 64-byte message block, and a counter. Input generation through trusted capture of the published proof bytes is timed.</p>
+        <div class="split">
+          <article class="panel">
+            <div class="panel-head"><h3>One generated operation</h3><span>262,144 per timed proof</span></div>
+            <div class="panel-body">
+              <div class="tuple"><code>(cv: [u32; 8], message: [u32; 16], counter: u64, block_len: 64, flags: 11)</code></div>
+              <p>A private seed expands deterministically into the complete batch. Every timed trial uses a new seed.</p>
+            </div>
+          </article>
+          <article class="panel">
+            <div class="panel-head"><h3>Ranking formula</h3><span>higher is better</span></div>
+            <div class="formula"><div><code>score = 262,144 / median(measured seconds)</code><small>verified BLAKE3 compressions per second</small></div></div>
+          </article>
+        </div>
+        <div class="facts">
+          <div class="fact"><b>20</b><span>private verified machine warm-up trials, discarded</span></div>
+          <div class="fact"><b>100</b><span>private verified trials in the median score</span></div>
+          <div class="fact"><b>26,214,400</b><span>private compressions in the scored population</span></div>
+          <div class="fact"><b>500,000 B</b><span>per-proof limit enforced by the trusted verifier</span></div>
+        </div>
+      </section>
+
+      <section id="boundary">
+        <div class="section-label">Harness and worker boundary</div>
+        <h2>Two binaries exchange one request and one artifact.</h2>
+        <p class="lede">The candidate worker and prebuilt verifier are separate processes with separate compiled code. Candidate Flock imports never become verifier imports.</p>
+        <div class="boundary">
+          <div class="lane candidate">
+            <div class="lane-head">Candidate worker</div>
+            <div class="lane-body">
+              <div class="lane-node"><h3>Protected process contract</h3><p>Creates setup, runs the fixed warm-up, reads one seed, invokes <code>prove_fast</code>, then writes and renames one temporary proof.</p></div>
+              <div class="lane-node"><h3>Editable proving implementation</h3><p>The current submission's <code>flock-core/src</code> and <code>flock-prover/src</code> are linked here.</p></div>
+              <div class="lane-node"><h3>Seatbelt confinement</h3><p>No network, no child process, and no writes outside private scratch. The verifier wipes scratch between workers, preventing warm-up precomputation from persisting.</p></div>
+            </div>
+          </div>
+          <div class="wire">
+            <div class="wire-message left">private seed<br>stdin line</div>
+            <div class="wire-message right">versioned proof<br>scratch file</div>
+            <small>Worker stdout and stderr are discarded. Neither carries time or score.</small>
+          </div>
+          <div class="lane trusted">
+            <div class="lane-head">Prebuilt verifier</div>
+            <div class="lane-body">
+              <div class="lane-node"><h3>Private input owner</h3><p>Reads 8 bytes from <code>/dev/urandom</code> after readiness and reconstructs the same compression tuples later.</p></div>
+              <div class="lane-node"><h3>Clock and verdict owner</h3><p>Starts before seed delivery; safely copies the published proof; stops; reaps the worker; then validates the captured bytes.</p></div>
+              <div class="lane-node"><h3>Score owner</h3><p>Serializes <code>score.json</code> only after all 20 warm-up and 100 measured proofs verify.</p></div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <section id="prebuild">
+        <div class="section-label">Trusted verifier provenance</div>
+        <h2>The judge is built before submissions exist.</h2>
+        <p class="lede">Ranked setup never compiles verifier source. The repository carries an arm64 verifier built from one reviewed source commit and protects it with a committed digest.</p>
+        <div class="build-flow">
+          <article class="build-step"><b>01 / REVIEWED COMMIT</b><h3>Freeze the source tree</h3><p>Benchmark commit <code>6b033a9…f041a3</code> contains the harness atop the re-signed tree matching upstream Flock <code>85fc0e7…5293</code>.</p></article>
+          <article class="build-step"><b>02 / DETACHED WORKTREE</b><h3>Build exactly that commit</h3><p>The author-only script refuses a dirty checkout and uses Rust 1.97.0 with <code>target-cpu=apple-m1</code>.</p></article>
+          <article class="build-step"><b>03 / COMMITTED ARTIFACT</b><h3>Publish one Mach-O</h3><p>The binary contains the generator, timer, decoder, pristine Flock verifier and imports, commitment check, and score writer.</p></article>
+          <article class="build-step"><b>04 / RANKED EXECUTION</b><h3>Verify bytes twice</h3><p><code>setup.sh</code> checks SHA-256 and signing; <code>benchmark.sh</code> checks SHA-256 again immediately before use.</p></article>
+        </div>
+        <p class="hash">Committed verifier SHA-256: 210f268a50c8d9c0779b0df76e742117494f62e2672be6aacda738729cf87d5e</p>
+        <p class="strong-note"><strong>Published provenance:</strong> the committed verifier is built from reviewed commit <code>6b033a9c45eb2256b9322b218e87855b5f041a3f</code>. Ranked setup verifies its committed SHA-256 and macOS code signature before use.</p>
+      </section>
+
+      <section id="surface">
+        <div class="section-label">Optimization surface</div>
+        <h2>Broad prover freedom; protected measurement.</h2>
+        <p class="lede">Yukon constructs candidates from only the two relative paths declared in <code>benchmark.json</code>. Everything else comes from the trusted baseline.</p>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>Path or component</th><th>What it controls</th><th>Status</th></tr></thead>
+            <tbody>
+              <tr><td><code>crates/flock-core/src/**</code></td><td>Fields, NTTs, PCS, R1CS, Merkle work, transcript/protocol implementation, memory behavior, and architecture kernels linked into the worker.</td><td class="editable">Editable</td></tr>
+              <tr><td><code>crates/flock-prover/src/**</code></td><td>BLAKE3 witness generation, R1CS implementation, proving orchestration, layouts, and prover-specific optimization.</td><td class="editable">Editable</td></tr>
+              <tr><td>Worker wrapper</td><td>Warm-up, ready signal, stdin contract, proof serialization, and exit behavior.</td><td class="protected">Protected</td></tr>
+              <tr><td>Harness source and binary</td><td>Random seed, timer, deadlines, decoding, witness reconstruction, verification, and score types.</td><td class="protected">Protected</td></tr>
+              <tr><td>Cargo manifests and lockfile</td><td>Crate graph, dependencies, build targets, and optimized challenge profile.</td><td class="protected">Protected</td></tr>
+              <tr><td>Scripts, workflow, manifest</td><td>Setup, sandbox, runner selection, commands, artifacts, editable paths, and score location.</td><td class="protected">Protected</td></tr>
+              <tr><td><code>score.json</code></td><td>Yukon's root score artifact, generated outside both editable directories.</td><td class="protected">Verifier-written</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+      <section id="trial">
+        <div class="section-label">One timed trial</div>
+        <h2>The private seed defines the timing boundary.</h2>
+        <p class="lede">Each of the 120 trials gets a fresh process and seed. The first 20 warm the machine; the median of the next 100 determines the score. Verification is outside each timer but mandatory for every proof.</p>
+        <div class="timeline">
+          <div class="timeline-head"><div>Phase</div><div>Trusted clock</div><div>Candidate worker</div><div>Prebuilt verifier</div></div>
+          <div class="timeline-row">
+            <div class="phase">T0<br>PREPARE</div>
+            <div><span class="cell-label">Untimed</span><p>No input-dependent measurement yet.</p></div>
+            <div><span class="cell-label">Fresh process</span><p>Create <code>Blake3Setup</code>, compute a fixed-seed warm-up proof, write ready.</p></div>
+            <div><span class="cell-label">Wait</span><p>Poll ready; fail on early exit or after five minutes.</p></div>
+          </div>
+          <div class="timeline-row">
+            <div class="phase">T1<br>CHALLENGE</div>
+            <div class="timed-cell"><span class="cell-label">Start first</span><p>Record <code>Instant::now()</code> before writing the seed.</p></div>
+            <div class="timed-cell"><span class="cell-label">stdin</span><p>Receive one decimal 64-bit seed plus newline.</p></div>
+            <div><span class="cell-label">Private randomness</span><p>Read exactly 8 bytes from <code>/dev/urandom</code>.</p></div>
+          </div>
+          <div class="timeline-row">
+            <div class="phase">T2<br>PROVE</div>
+            <div class="timed-cell"><span class="cell-label">Running</span><p>External wall time continues until the completed proof is captured.</p></div>
+            <div class="timed-cell"><span class="cell-label">Candidate work</span><p>Generate inputs and witness; commit; prove; serialize; protected wrapper writes a temporary file and renames it onto the final path.</p></div>
+            <div><span class="cell-label">Deadline</span><p>Poll the final path; fail if no proof is published within fifteen minutes.</p></div>
+          </div>
+          <div class="timeline-row">
+            <div class="phase">T3<br>CAPTURE</div>
+            <div class="timed-cell"><span class="cell-label">Stop last</span><p>Stop only after the bounded proof copy is in trusted memory.</p></div>
+            <div><span class="cell-label">Final path</span><p>The candidate cannot stop time with stdout, a timestamp, a symlink, or a special file.</p></div>
+            <div class="timed-cell"><span class="cell-label">Safe snapshot</span><p>Open without following symlinks; require a regular, nonempty file; copy at most 500,000 stable bytes.</p></div>
+          </div>
+          <div class="timeline-row">
+            <div class="phase">T4<br>VERIFY</div>
+            <div><span class="cell-label">Stopped</span><p>Worker teardown and cryptographic verification are not scored.</p></div>
+            <div><span class="cell-label">Terminated</span><p>Kill and reap the untrusted process before verification.</p></div>
+            <div class="verified-cell"><span class="cell-label">Required</span><p>Strictly decode the captured bytes, rebuild input/witness/commitment, compare, verify, record, and wipe scratch.</p></div>
+          </div>
+        </div>
+      </section>
+
+      <section id="verify">
+        <div class="section-label">Final proof check</div>
+        <h2>A valid protocol proof must also bind the private witness.</h2>
+        <p class="lede">The trusted commitment reconstruction is the benchmark-specific correctness check. It prevents a solver from proving a cheaper or unrelated statement.</p>
+        <div class="cards">
+          <article class="card"><b>01 / TIMELY PUBLICATION</b><p>A final proof must appear within fifteen minutes. Readiness, stdout, and worker-reported timestamps cannot stop the clock.</p></article>
+          <article class="card"><b>02 / SAFE CAPTURE</b><p>Do not follow symlinks; require a regular, nonempty file; copy at most 500,000 bytes and require its length to remain stable.</p></article>
+          <article class="card"><b>03 / EXACT FORMAT</b><p>After reaping the worker, decode only the trusted copy: FLOCK magic, current version, R1CS flavor, fixed-width bincode, and no trailing bytes.</p></article>
+          <article class="card"><b>04 / REBUILT INPUT</b><p>Expand the same undisclosed seed into the exact 262,144 compression tuples.</p></article>
+          <article class="card"><b>05 / EQUAL COMMITMENT</b><p>Regenerate the pristine packed witness; require root and every PCS parameter to match.</p></article>
+          <article class="card"><b>06 / PRISTINE VERIFICATION</b><p>Run compiled-in <code>Blake3Setup::verify</code> under the fixed <code>flock-bench-v0</code> transcript domain.</p></article>
+        </div>
+      </section>
+
+      <section id="score">
+        <div class="section-label">Score file</div>
+        <h2>One typed JSON object, written after all checks.</h2>
+        <p class="lede">The verifier discards 20 verified warm-up durations, takes the median of 100 measured durations, and serializes Rust <code>ScoreFile</code> and <code>ScoreMetrics</code> values with Serde.</p>
+        <div class="score-grid">
+          <article class="panel">
+            <div class="panel-head"><h3>Example ranked output</h3><span>repository-root score.json</span></div>
+            <pre>{
+  <span class="cool">"score"</span>: <span class="warm">484700.1738854293</span>,
+  <span class="cool">"metrics"</span>: {
+    <span class="cool">"warmup_trial_seconds"</span>: [<span class="warm">0.5351, 0.5344, …</span>],
+    <span class="cool">"trial_seconds"</span>: [<span class="warm">0.5338, 0.5362, …</span>],
+    <span class="cool">"p10_seconds"</span>: <span class="warm">0.5346941128</span>,
+    <span class="cool">"median_seconds"</span>: <span class="warm">0.5408374375</span>,
+    <span class="cool">"aggregate_compressions_per_second"</span>: <span class="warm">484858.3396136077</span>,
+    <span class="cool">"p90_p10_latency_ratio"</span>: <span class="warm">1.0220526782</span>,
+    <span class="cool">"batch_size"</span>: <span class="warm">262144</span>,
+    <span class="cool">"warmup_runs"</span>: <span class="warm">20</span>,
+    <span class="cool">"measured_runs"</span>: <span class="warm">100</span>,
+    <span class="cool">"threads"</span>: <span class="warm">10</span>,
+    <span class="cool">"proof_bytes"</span>: <span class="warm">436107</span>,
+    <span class="cool">"verified"</span>: <span class="green">true</span>
+  }
+}</pre>
+          </article>
+          <div class="metric-list">
+            <div class="metric"><code>score</code><p>The only ranked value: verified BLAKE3 compressions per second. Higher is better.</p></div>
+            <div class="metric"><code>warmup_trial_seconds</code><p>Twenty verified machine warm-ups, visible but excluded from ranking.</p></div>
+            <div class="metric"><code>trial_seconds</code><p>All 100 verified durations used to compute the median.</p></div>
+            <div class="metric"><code>batch_size · threads</code><p>Fixed work count and the selected Apple performance-core pool size.</p></div>
+            <div class="metric"><code>proof_bytes</code><p>Largest accepted serialized proof in the run. Visible, but not ranked.</p></div>
+            <div class="metric"><code>verified</code><p>Always true when the score exists. Any failure exits nonzero and produces no replacement score.</p></div>
+            <div class="metric"><code>diagnostics</code><p>P10 latency, aggregate throughput, and p90/p10 dispersion show the distribution around the ranked median.</p></div>
+          </div>
+        </div>
+      </section>
+
+      <section id="hardware">
+        <div class="section-label">Hardware and operational security</div>
+        <h2>Official throughput belongs to one runner class.</h2>
+        <p class="lede">Local Apple Silicon runs are useful for correctness and directional feedback. Absolute ranking comes from the dedicated M4 Pro because chip configuration, compiler output, thermals, and background load affect throughput.</p>
+        <div class="split">
+          <article class="panel">
+            <div class="panel-head"><h3>Official GitHub runner</h3><span>authoritative</span></div>
+            <div class="panel-body"><ul><li>Apple M4 Pro, 48 GB unified memory</li><li>10 performance cores selected by default</li><li>arm64 macOS; validated run: 26.4 build 25E246</li><li>Rust 1.97.0; candidate <code>target-cpu=native</code></li><li>Self-hosted label <code>m4-pro</code>; one benchmark at a time</li></ul></div>
+          </article>
+          <article class="panel">
+            <div class="panel-head"><h3>Local Apple Silicon</h3><span>directional</span></div>
+            <div class="panel-body"><ul><li><code>./setup.sh</code> checks arm64 macOS, Xcode Clang, Rust, checksum, and signing</li><li><code>./benchmark.sh</code> rebuilds the current candidate offline, then uses local performance cores</li><li>Compilation finishes before the trusted harness starts any timer</li><li>Compare changes only on the same quiet machine; the official M4 Pro result remains authoritative</li></ul></div>
+          </article>
+        </div>
+        <div class="failure-grid" style="margin-top:22px">
+          <article class="failure-card"><b>FAKE TIME OR SCORE</b><p>Worker output is ignored, the external verifier owns <code>Instant</code>, and Seatbelt prevents writes to root <code>score.json</code>.</p></article>
+          <article class="failure-card"><b>CHEAPER STATEMENT</b><p>Trusted input and witness reconstruction makes a different seed, input, root, or PCS profile fail before protocol acceptance.</p></article>
+          <article class="failure-card"><b>BACKGROUND WRITER</b><p>Seatbelt denies child processes. Once proof bytes are captured, the harness stops time and kills/reaps the worker before verification.</p></article>
+          <article class="failure-card"><b>STALE RESULT</b><p><code>benchmark.sh</code> removes previous scores before execution. A failed run has no valid new score artifact.</p></article>
+          <article class="failure-card"><b>VERIFIER REPLACEMENT</b><p>The checksum-pinned binary contains its own verifier imports and never loads candidate crate code.</p></article>
+          <article class="failure-card"><b>HOST BOUNDARY</b><p>Seatbelt constrains the measured worker, not an entire VM. The dedicated runner must contain no unrelated secrets or workloads.</p></article>
+        </div>
+      </section>
+
+      <section id="review">
+        <div class="section-label">Review path</div>
+        <h2>Read the benchmark-specific contract in ten files.</h2>
+        <p class="lede">Start with policy and the worker boundary, then review the trusted lifecycle and verifier provenance. Upstream Flock cryptography sits beneath this small authored path.</p>
+        <ol class="review-list">
+          <li><a href="../BENCHMARK.md">BENCHMARK.md</a><span>Textual measurement, hardware, scoring, and security contract.</span></li>
+          <li><a href="../benchmark.json">benchmark.json</a><span>Yukon editable paths, commands, direction, score path, and workflow.</span></li>
+          <li><a href="../benchmark-tools/common/src/lib.rs">common/src/lib.rs</a><span>Seed expansion and the fixed transcript domain.</span></li>
+          <li><a href="../benchmark-tools/worker/src/main.rs">worker/src/main.rs</a><span>Complete protected wrapper around candidate proving code.</span></li>
+          <li><a href="../benchmark-tools/harness/src/main.rs">harness/src/main.rs</a><span>Private seed, lifecycle, timing, strict verification, and score types.</span></li>
+          <li><a href="../benchmark-tools/build-trusted-verifier.sh">build-trusted-verifier.sh</a><span>Pinned author-only build and artifact publication.</span></li>
+          <li><a href="../benchmark-tools/trusted/SHA256SUMS">trusted/SHA256SUMS</a><span>Exact committed verifier digest.</span></li>
+          <li><a href="../setup.sh">setup.sh</a><span>Machine checks, dependencies, verifier integrity, and offline candidate build.</span></li>
+          <li><a href="../benchmark.sh">benchmark.sh</a><span>Core selection, stale-score removal, Seatbelt profile, and verifier invocation.</span></li>
+          <li><a href="../.github/workflows/benchmark-blake3-mac.yml">GitHub workflow</a><span>Exact-SHA checkout, M4 Pro routing, ranked values, and score artifact.</span></li>
+        </ol>
+      </section>
+    </main>
+
+    <footer>2^18 BLAKE3 compressions per proof · 20 verified warm-ups · median of 100 verified trials · prebuilt arm64 verifier · self-hosted Apple M4 Pro</footer>
+  </div>
+</body>
+</html>
