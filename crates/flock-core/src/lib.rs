@@ -74,9 +74,9 @@ fn set_prover_thread_qos() {
     unsafe extern "C" {
         fn pthread_set_qos_class_self_np(qos_class: u32, relative_priority: i32) -> i32;
     }
-    // QOS_CLASS_USER_INITIATED: explicit user work that should finish promptly.
+    // QOS_CLASS_USER_INTERACTIVE (0x21): highest priority interactive work on macOS.
     unsafe {
-        let _ = pthread_set_qos_class_self_np(0x19, 0);
+        let _ = pthread_set_qos_class_self_np(0x21, 0);
     }
 }
 

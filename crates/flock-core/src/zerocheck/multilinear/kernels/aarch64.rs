@@ -118,13 +118,15 @@ unsafe fn fold_row_q(
     use core::arch::aarch64::*;
     unsafe {
         const STRIDE: usize = 256 * 16;
-        let mut acc = vreinterpretq_u64_u8(vld1q_u8(table_data.add((*bytes_ptr) as usize * 16)));
-        for chunk in 1..8 {
-            let entry = table_data.add(
-                chunk * STRIDE + (*bytes_ptr.add(chunk)) as usize * core::mem::size_of::<F128>(),
-            );
-            acc = veorq_u64(acc, vreinterpretq_u64_u8(vld1q_u8(entry)));
-        }
+        let indices = u64::from_le(bytes_ptr.cast::<u64>().read_unaligned());
+        let mut acc = vreinterpretq_u64_u8(vld1q_u8(table_data.add((indices as u8) as usize * 16)));
+        acc = veorq_u64(acc, vreinterpretq_u64_u8(vld1q_u8(table_data.add(1 * STRIDE + ((indices >> 8) as u8) as usize * 16))));
+        acc = veorq_u64(acc, vreinterpretq_u64_u8(vld1q_u8(table_data.add(2 * STRIDE + ((indices >> 16) as u8) as usize * 16))));
+        acc = veorq_u64(acc, vreinterpretq_u64_u8(vld1q_u8(table_data.add(3 * STRIDE + ((indices >> 24) as u8) as usize * 16))));
+        acc = veorq_u64(acc, vreinterpretq_u64_u8(vld1q_u8(table_data.add(4 * STRIDE + ((indices >> 32) as u8) as usize * 16))));
+        acc = veorq_u64(acc, vreinterpretq_u64_u8(vld1q_u8(table_data.add(5 * STRIDE + ((indices >> 40) as u8) as usize * 16))));
+        acc = veorq_u64(acc, vreinterpretq_u64_u8(vld1q_u8(table_data.add(6 * STRIDE + ((indices >> 48) as u8) as usize * 16))));
+        acc = veorq_u64(acc, vreinterpretq_u64_u8(vld1q_u8(table_data.add(7 * STRIDE + (indices >> 56) as usize * 16))));
         acc
     }
 }
@@ -154,13 +156,109 @@ pub(crate) unsafe fn fold_round2_chunk_neon_unchecked_8(
         let mut p1_acc = WideNeon { lo: zero, hi: zero };
         let mut pinf_acc = WideNeon { lo: zero, hi: zero };
 
-        for x_lo in 0..lo_size {
+        let mut x_lo = 0;
+        while x_lo + 2 <= lo_size {
+            let out0 = 2 * x_lo;
+            let out1 = 2 * (x_lo + 1);
+
+            let skip0 = ((pair_idx_base + x_lo) & pair_in_block_mask) >= useful_pairs_inclusive;
+            let skip1 = ((pair_idx_base + x_lo + 1) & pair_in_block_mask) >= useful_pairs_inclusive;
+
+            if skip0 && skip1 {
+                vst1q_u64(a_out.add(out0).cast::<u64>(), zero);
+                vst1q_u64(a_out.add(out0 + 1).cast::<u64>(), zero);
+                vst1q_u64(b_out.add(out0).cast::<u64>(), zero);
+                vst1q_u64(b_out.add(out0 + 1).cast::<u64>(), zero);
+
+                vst1q_u64(a_out.add(out1).cast::<u64>(), zero);
+                vst1q_u64(a_out.add(out1 + 1).cast::<u64>(), zero);
+                vst1q_u64(b_out.add(out1).cast::<u64>(), zero);
+                vst1q_u64(b_out.add(out1 + 1).cast::<u64>(), zero);
+                x_lo += 2;
+                continue;
+            }
+
+            let a0_0; let b0_0; let a1_0; let b1_0;
+            if skip0 {
+                a0_0 = zero; a1_0 = zero; b0_0 = zero; b1_0 = zero;
+                vst1q_u64(a_out.add(out0).cast::<u64>(), zero);
+                vst1q_u64(a_out.add(out0 + 1).cast::<u64>(), zero);
+                vst1q_u64(b_out.add(out0).cast::<u64>(), zero);
+                vst1q_u64(b_out.add(out0 + 1).cast::<u64>(), zero);
+            } else {
+                let row0 = 2 * x_lo;
+                let row1 = row0 + 1;
+                a0_0 = fold_row_q(table_data, a_packed.add(row0 * 8));
+                b0_0 = fold_row_q(table_data, b_packed.add(row0 * 8));
+                a1_0 = fold_row_q(table_data, a_packed.add(row1 * 8));
+                b1_0 = fold_row_q(table_data, b_packed.add(row1 * 8));
+
+                vst1q_u64(a_out.add(out0).cast::<u64>(), a0_0);
+                vst1q_u64(a_out.add(out0 + 1).cast::<u64>(), a1_0);
+                vst1q_u64(b_out.add(out0).cast::<u64>(), b0_0);
+                vst1q_u64(b_out.add(out0 + 1).cast::<u64>(), b1_0);
+            }
+
+            let a0_1; let b0_1; let a1_1; let b1_1;
+            if skip1 {
+                a0_1 = zero; a1_1 = zero; b0_1 = zero; b1_1 = zero;
+                vst1q_u64(a_out.add(out1).cast::<u64>(), zero);
+                vst1q_u64(a_out.add(out1 + 1).cast::<u64>(), zero);
+                vst1q_u64(b_out.add(out1).cast::<u64>(), zero);
+                vst1q_u64(b_out.add(out1 + 1).cast::<u64>(), zero);
+            } else {
+                let row0 = 2 * (x_lo + 1);
+                let row1 = row0 + 1;
+                a0_1 = fold_row_q(table_data, a_packed.add(row0 * 8));
+                b0_1 = fold_row_q(table_data, b_packed.add(row0 * 8));
+                a1_1 = fold_row_q(table_data, a_packed.add(row1 * 8));
+                b1_1 = fold_row_q(table_data, b_packed.add(row1 * 8));
+
+                vst1q_u64(a_out.add(out1).cast::<u64>(), a0_1);
+                vst1q_u64(a_out.add(out1 + 1).cast::<u64>(), a1_1);
+                vst1q_u64(b_out.add(out1).cast::<u64>(), b0_1);
+                vst1q_u64(b_out.add(out1 + 1).cast::<u64>(), b1_1);
+            }
+
+            let f_a1_0 = core::mem::transmute::<uint64x2_t, F128>(a1_0);
+            let f_b1_0 = core::mem::transmute::<uint64x2_t, F128>(b1_0);
+            let f_a1_1 = core::mem::transmute::<uint64x2_t, F128>(a1_1);
+            let f_b1_1 = core::mem::transmute::<uint64x2_t, F128>(b1_1);
+
+            let f_sum_a0 = core::mem::transmute::<uint64x2_t, F128>(veorq_u64(a0_0, a1_0));
+            let f_sum_b0 = core::mem::transmute::<uint64x2_t, F128>(veorq_u64(b0_0, b1_0));
+            let f_sum_a1 = core::mem::transmute::<uint64x2_t, F128>(veorq_u64(a0_1, a1_1));
+            let f_sum_b1 = core::mem::transmute::<uint64x2_t, F128>(veorq_u64(b0_1, b1_1));
+
+            use crate::field::gf2_128::aarch64::ghash_mul_vec2_neon;
+            let g1_pair = ghash_mul_vec2_neon([f_a1_0, f_a1_1], [f_b1_0, f_b1_1]);
+            let ginf_pair = ghash_mul_vec2_neon([f_sum_a0, f_sum_a1], [f_sum_b0, f_sum_b1]);
+
+            let g1_0 = core::mem::transmute::<F128, uint64x2_t>(g1_pair[0]);
+            let g1_1 = core::mem::transmute::<F128, uint64x2_t>(g1_pair[1]);
+            let ginf_0 = core::mem::transmute::<F128, uint64x2_t>(ginf_pair[0]);
+            let ginf_1 = core::mem::transmute::<F128, uint64x2_t>(ginf_pair[1]);
+
+            let eq_l0 = vld1q_u64(eq_lo.add(x_lo).cast::<u64>());
+            let eq_l1 = vld1q_u64(eq_lo.add(x_lo + 1).cast::<u64>());
+
+            wide_xor(&mut p1_acc, mul_unreduced_q(eq_l0, g1_0));
+            wide_xor(&mut pinf_acc, mul_unreduced_q(eq_l0, ginf_0));
+
+            wide_xor(&mut p1_acc, mul_unreduced_q(eq_l1, g1_1));
+            wide_xor(&mut pinf_acc, mul_unreduced_q(eq_l1, ginf_1));
+
+            x_lo += 2;
+        }
+
+        while x_lo < lo_size {
             let out = 2 * x_lo;
             if ((pair_idx_base + x_lo) & pair_in_block_mask) >= useful_pairs_inclusive {
                 vst1q_u64(a_out.add(out).cast::<u64>(), zero);
                 vst1q_u64(a_out.add(out + 1).cast::<u64>(), zero);
                 vst1q_u64(b_out.add(out).cast::<u64>(), zero);
                 vst1q_u64(b_out.add(out + 1).cast::<u64>(), zero);
+                x_lo += 1;
                 continue;
             }
 
@@ -181,6 +279,7 @@ pub(crate) unsafe fn fold_round2_chunk_neon_unchecked_8(
             let eq_l = vld1q_u64(eq_lo.add(x_lo).cast::<u64>());
             wide_xor(&mut p1_acc, mul_unreduced_q(eq_l, g1));
             wide_xor(&mut pinf_acc, mul_unreduced_q(eq_l, g_inf));
+            x_lo += 1;
         }
 
         (
@@ -208,34 +307,35 @@ pub(crate) unsafe fn fold_one_row_neon_unchecked_8(
     use core::arch::aarch64::*;
     unsafe {
         const STRIDE: usize = 256 * 16;
-        let mut acc = vld1q_u8(table_data.add((*bytes_ptr) as usize * 16));
+        let indices = u64::from_le(bytes_ptr.cast::<u64>().read_unaligned());
+        let mut acc = vld1q_u8(table_data.add((indices as u8) as usize * 16));
         acc = veorq_u8(
             acc,
-            vld1q_u8(table_data.add(1 * STRIDE + (*bytes_ptr.add(1)) as usize * 16)),
+            vld1q_u8(table_data.add(1 * STRIDE + ((indices >> 8) as u8) as usize * 16)),
         );
         acc = veorq_u8(
             acc,
-            vld1q_u8(table_data.add(2 * STRIDE + (*bytes_ptr.add(2)) as usize * 16)),
+            vld1q_u8(table_data.add(2 * STRIDE + ((indices >> 16) as u8) as usize * 16)),
         );
         acc = veorq_u8(
             acc,
-            vld1q_u8(table_data.add(3 * STRIDE + (*bytes_ptr.add(3)) as usize * 16)),
+            vld1q_u8(table_data.add(3 * STRIDE + ((indices >> 24) as u8) as usize * 16)),
         );
         acc = veorq_u8(
             acc,
-            vld1q_u8(table_data.add(4 * STRIDE + (*bytes_ptr.add(4)) as usize * 16)),
+            vld1q_u8(table_data.add(4 * STRIDE + ((indices >> 32) as u8) as usize * 16)),
         );
         acc = veorq_u8(
             acc,
-            vld1q_u8(table_data.add(5 * STRIDE + (*bytes_ptr.add(5)) as usize * 16)),
+            vld1q_u8(table_data.add(5 * STRIDE + ((indices >> 40) as u8) as usize * 16)),
         );
         acc = veorq_u8(
             acc,
-            vld1q_u8(table_data.add(6 * STRIDE + (*bytes_ptr.add(6)) as usize * 16)),
+            vld1q_u8(table_data.add(6 * STRIDE + ((indices >> 48) as u8) as usize * 16)),
         );
         acc = veorq_u8(
             acc,
-            vld1q_u8(table_data.add(7 * STRIDE + (*bytes_ptr.add(7)) as usize * 16)),
+            vld1q_u8(table_data.add(7 * STRIDE + (indices >> 56) as usize * 16)),
         );
         let acc_u64 = vreinterpretq_u64_u8(acc);
         F128 {
@@ -252,7 +352,8 @@ pub(crate) unsafe fn fold_one_row_neon_unchecked_8(
 /// accumulated removes that full output readback while preserving the exact
 /// canonical output tables for the next round.
 #[cfg(target_arch = "aarch64")]
-pub(crate) fn fold_and_message_aarch64(
+#[target_feature(enable = "aes")]
+pub(crate) unsafe fn fold_and_message_aarch64(
     a_in: &[F128],
     b_in: &[F128],
     a_out: &mut [F128],
@@ -260,6 +361,8 @@ pub(crate) fn fold_and_message_aarch64(
     r_fold: F128,
     eq_lo: &[F128],
 ) -> (F128, F128) {
+    use crate::field::gf2_128::aarch64::ghash_mul_vec2_neon;
+
     debug_assert_eq!(a_in.len(), 2 * a_out.len());
     debug_assert_eq!(b_in.len(), 2 * b_out.len());
     debug_assert_eq!(a_out.len(), 2 * eq_lo.len());
@@ -280,19 +383,32 @@ pub(crate) fn fold_and_message_aarch64(
         let b_even_1 = b_in[i + 2];
         let b_odd_1 = b_in[i + 3];
 
-        let a0 = a_even_0 + r_fold * (a_even_0 + a_odd_0);
-        let a1 = a_even_1 + r_fold * (a_even_1 + a_odd_1);
-        let b0 = b_even_0 + r_fold * (b_even_0 + b_odd_0);
-        let b1 = b_even_1 + r_fold * (b_even_1 + b_odd_1);
+        let a_sum_0 = a_even_0 + a_odd_0;
+        let a_sum_1 = a_even_1 + a_odd_1;
+        let b_sum_0 = b_even_0 + b_odd_0;
+        let b_sum_1 = b_even_1 + b_odd_1;
+
+        let a_prods = unsafe { ghash_mul_vec2_neon([r_fold, r_fold], [a_sum_0, a_sum_1]) };
+        let b_prods = unsafe { ghash_mul_vec2_neon([r_fold, r_fold], [b_sum_0, b_sum_1]) };
+
+        let a0 = a_even_0 + a_prods[0];
+        let a1 = a_even_1 + a_prods[1];
+        let b0 = b_even_0 + b_prods[0];
+        let b1 = b_even_1 + b_prods[1];
 
         a_out[o] = a0;
         a_out[o + 1] = a1;
         b_out[o] = b0;
         b_out[o + 1] = b1;
 
-        p1_acc ^= eq_l.mul_unreduced(a1 * b1);
-        pinf_acc ^= eq_l.mul_unreduced((a0 + a1) * (b0 + b1));
+        let g1_and_ginf = unsafe { ghash_mul_vec2_neon([a1, a0 + a1], [b1, b0 + b1]) };
+        let g1 = g1_and_ginf[0];
+        let g_inf = g1_and_ginf[1];
+
+        p1_acc ^= eq_l.mul_unreduced(g1);
+        pinf_acc ^= eq_l.mul_unreduced(g_inf);
     }
 
     (p1_acc.reduce(), pinf_acc.reduce())
 }
+

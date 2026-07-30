@@ -828,7 +828,7 @@ pub fn fold_and_compute_round_pair_into(
                 unsafe { fold_and_message_x86_avx512(a_in, b_in, a_out, b_out, r_fold, eq_lo) };
 
             #[cfg(target_arch = "aarch64")]
-            let (p1, pinf) = fold_and_message_aarch64(a_in, b_in, a_out, b_out, r_fold, eq_lo);
+            let (p1, pinf) = unsafe { fold_and_message_aarch64(a_in, b_in, a_out, b_out, r_fold, eq_lo) };
 
             #[cfg(not(any(
                 target_arch = "aarch64",
