@@ -249,32 +249,73 @@ impl<'a> LincheckCircuit for SparseMatrixCircuit<'a> {
 pub struct CscCircuit {
     n_cols: usize,
     a_col_ptr: Vec<u32>,
-    a_rows: Vec<u32>,
     b_col_ptr: Vec<u32>,
-    b_rows: Vec<u32>,
+    rows: CscRows,
     /// Constant-wire pin column (see [`LincheckCircuit::const_pin_col`]).
     const_pin: Option<usize>,
 }
 
+/// Row indices use the narrowest lossless representation. Both matrices have
+/// the same row count, so selecting one shared variant also keeps the
+/// `fold_alpha_batched` hot loop monomorphic after a single outer match.
+#[derive(Clone)]
+enum CscRows {
+    U16 { a: Vec<u16>, b: Vec<u16> },
+    U32 { a: Vec<u32>, b: Vec<u32> },
+}
+
+trait CscRowIndex: Copy + Send + Sync {
+    fn from_usize(value: usize) -> Self;
+    fn to_usize(self) -> usize;
+}
+
+impl CscRowIndex for u16 {
+    #[inline(always)]
+    fn from_usize(value: usize) -> Self {
+        u16::try_from(value).expect("CSC row index exceeds u16")
+    }
+
+    #[inline(always)]
+    fn to_usize(self) -> usize {
+        self as usize
+    }
+}
+
+impl CscRowIndex for u32 {
+    #[inline(always)]
+    fn from_usize(value: usize) -> Self {
+        u32::try_from(value).expect("CSC row index exceeds u32")
+    }
+
+    #[inline(always)]
+    fn to_usize(self) -> usize {
+        self as usize
+    }
+}
+
 /// Flatten one sparse matrix into CSC arrays: rows with a 1 in column `c` are
 /// `rows_flat[col_ptr[c] as usize .. col_ptr[c+1] as usize]`.
-fn csc_from_rows(m: &SparseBinaryMatrix) -> (Vec<u32>, Vec<u32>) {
+fn csc_from_rows<I: CscRowIndex + Default>(m: &SparseBinaryMatrix) -> (Vec<u32>, Vec<I>) {
     assert!(m.num_rows <= u32::MAX as usize);
     assert!(m.num_cols <= u32::MAX as usize);
     let mut col_ptr = vec![0u32; m.num_cols + 1];
     for row in &m.rows {
         for &c in row {
-            col_ptr[c + 1] += 1;
+            col_ptr[c + 1] = col_ptr[c + 1]
+                .checked_add(1)
+                .expect("CSC nonzero count exceeds u32");
         }
     }
     for c in 0..m.num_cols {
-        col_ptr[c + 1] += col_ptr[c];
+        col_ptr[c + 1] = col_ptr[c + 1]
+            .checked_add(col_ptr[c])
+            .expect("CSC nonzero count exceeds u32");
     }
     let mut next = col_ptr.clone();
-    let mut rows_flat = vec![0u32; *col_ptr.last().unwrap() as usize];
+    let mut rows_flat = vec![I::default(); *col_ptr.last().unwrap() as usize];
     for (r, row) in m.rows.iter().enumerate() {
         for &c in row {
-            rows_flat[next[c] as usize] = r as u32;
+            rows_flat[next[c] as usize] = I::from_usize(r);
             next[c] += 1;
         }
     }
@@ -286,9 +327,25 @@ impl std::fmt::Debug for CscCircuit {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("CscCircuit")
             .field("n_cols", &self.n_cols)
-            .field("nnz_a", &self.a_rows.len())
-            .field("nnz_b", &self.b_rows.len())
+            .field("nnz_a", &self.rows.a_len())
+            .field("nnz_b", &self.rows.b_len())
             .finish()
+    }
+}
+
+impl CscRows {
+    fn a_len(&self) -> usize {
+        match self {
+            Self::U16 { a, .. } => a.len(),
+            Self::U32 { a, .. } => a.len(),
+        }
+    }
+
+    fn b_len(&self) -> usize {
+        match self {
+            Self::U16 { b, .. } => b.len(),
+            Self::U32 { b, .. } => b.len(),
+        }
     }
 }
 
@@ -296,14 +353,26 @@ impl CscCircuit {
     pub fn from_matrices(a_0: &SparseBinaryMatrix, b_0: &SparseBinaryMatrix) -> Self {
         assert_eq!(a_0.num_rows, b_0.num_rows);
         assert_eq!(a_0.num_cols, b_0.num_cols);
-        let (a_col_ptr, a_rows) = csc_from_rows(a_0);
-        let (b_col_ptr, b_rows) = csc_from_rows(b_0);
+        assert_eq!(a_0.num_rows, a_0.rows.len());
+        assert_eq!(b_0.num_rows, b_0.rows.len());
+        assert!(
+            a_0.num_rows <= a_0.num_cols,
+            "lincheck row indices must fit the inner equality table"
+        );
+        let (a_col_ptr, b_col_ptr, rows) = if a_0.num_rows <= u16::MAX as usize + 1 {
+            let (a_col_ptr, a) = csc_from_rows::<u16>(a_0);
+            let (b_col_ptr, b) = csc_from_rows::<u16>(b_0);
+            (a_col_ptr, b_col_ptr, CscRows::U16 { a, b })
+        } else {
+            let (a_col_ptr, a) = csc_from_rows::<u32>(a_0);
+            let (b_col_ptr, b) = csc_from_rows::<u32>(b_0);
+            (a_col_ptr, b_col_ptr, CscRows::U32 { a, b })
+        };
         Self {
             n_cols: a_0.num_cols,
             a_col_ptr,
-            a_rows,
             b_col_ptr,
-            b_rows,
+            rows,
             const_pin: None,
         }
     }
@@ -313,26 +382,27 @@ impl CscCircuit {
         self.const_pin = const_pin;
         self
     }
-}
 
-impl LincheckCircuit for CscCircuit {
-    fn n_cols(&self) -> usize {
-        self.n_cols
-    }
-    fn const_pin_col(&self) -> Option<usize> {
-        self.const_pin
-    }
-    fn fold_alpha_batched(&self, alpha: F128, eq_inner: &[F128]) -> Vec<F128> {
+    fn fold_typed<I: CscRowIndex>(
+        &self,
+        alpha: F128,
+        eq_inner: &[F128],
+        a_rows: &[I],
+        b_rows: &[I],
+    ) -> Vec<F128> {
         use rayon::prelude::*;
-        assert_eq!(eq_inner.len(), self.n_cols);
         let one_col = |c: usize| {
             let mut sa = F128::ZERO;
-            for &r in &self.a_rows[self.a_col_ptr[c] as usize..self.a_col_ptr[c + 1] as usize] {
-                sa += eq_inner[r as usize];
+            for &r in &a_rows[self.a_col_ptr[c] as usize..self.a_col_ptr[c + 1] as usize] {
+                // `from_matrices` requires `num_rows <= num_cols` and records
+                // only enumerated row indices, while the caller asserted
+                // `eq_inner.len() == n_cols`.
+                sa += unsafe { *eq_inner.get_unchecked(r.to_usize()) };
             }
             let mut sb = F128::ZERO;
-            for &r in &self.b_rows[self.b_col_ptr[c] as usize..self.b_col_ptr[c + 1] as usize] {
-                sb += eq_inner[r as usize];
+            for &r in &b_rows[self.b_col_ptr[c] as usize..self.b_col_ptr[c + 1] as usize] {
+                // Same construction invariant as the A rows above.
+                sb += unsafe { *eq_inner.get_unchecked(r.to_usize()) };
             }
             alpha * sa + sb
         };
@@ -344,6 +414,22 @@ impl LincheckCircuit for CscCircuit {
             .enumerate()
             .for_each(|(c, slot)| *slot = one_col(c));
         out
+    }
+}
+
+impl LincheckCircuit for CscCircuit {
+    fn n_cols(&self) -> usize {
+        self.n_cols
+    }
+    fn const_pin_col(&self) -> Option<usize> {
+        self.const_pin
+    }
+    fn fold_alpha_batched(&self, alpha: F128, eq_inner: &[F128]) -> Vec<F128> {
+        assert_eq!(eq_inner.len(), self.n_cols);
+        match &self.rows {
+            CscRows::U16 { a, b } => self.fold_typed(alpha, eq_inner, a, b),
+            CscRows::U32 { a, b } => self.fold_typed(alpha, eq_inner, a, b),
+        }
     }
 }
 
@@ -1615,6 +1701,37 @@ mod tests {
             z_skip: rng.f128(),
             x_inner_rest: rng.f128_vec(k_log - k_skip),
             x_outer: rng.f128_vec(m - k_log),
+        }
+    }
+
+    #[test]
+    fn csc_row_width_boundary_and_fallback_match_sparse() {
+        for &(n_rows, expect_u16) in &[(u16::MAX as usize + 1, true), (1 << 16 | 1, false)] {
+            let mut a_rows = vec![Vec::new(); n_rows];
+            let mut b_rows = vec![Vec::new(); n_rows];
+            a_rows[0].push(0);
+            a_rows[n_rows - 1].push(0);
+            b_rows[n_rows - 1].push(1);
+            let a = SparseBinaryMatrix {
+                num_rows: n_rows,
+                num_cols: n_rows,
+                rows: a_rows,
+            };
+            let b = SparseBinaryMatrix {
+                num_rows: n_rows,
+                num_cols: n_rows,
+                rows: b_rows,
+            };
+            let csc = CscCircuit::from_matrices(&a, &b);
+            assert_eq!(matches!(csc.rows, CscRows::U16 { .. }), expect_u16);
+
+            let alpha = F128 { lo: 3, hi: 5 };
+            let last = F128 { lo: 7, hi: 11 };
+            let mut eq = vec![F128::ZERO; n_rows];
+            eq[0] = F128::ONE;
+            eq[n_rows - 1] = last;
+            let expected = sparse_row_fold_alpha_batched(alpha, &a, &b, &eq);
+            assert_eq!(csc.fold_alpha_batched(alpha, &eq), expected);
         }
     }
 
