@@ -1,5 +1,18 @@
 use super::super::{F8, F128, InvNttTableByteSingleGf8, N_CHUNKS};
 
+/// Four-lane convert-table fold.
+///
+/// Mirrors [`accumulate_convert_with_s_hat_v`]: four lanes are processed
+/// together so eight independent gather/XOR chains (4 lanes × 2 banks) are in
+/// flight, versus the single chain the previous one-lane-at-a-time loop
+/// exposed. Each convert-table gather is an L1-resident dependent load whose
+/// latency the one-chain form could not hide; the profiled gather and ALU arms
+/// overlap only ~59%, so the win is overlap, not fewer operations.
+///
+/// Bit-exactness: each lane keeps its own accumulator and still XORs exactly
+/// the same table rows in the same `b_med` order, then is scaled by the same
+/// `eq_lo_val` and added into the same `partial_*` slot. Only the interleaving
+/// between independent lanes changes, so every accumulator is bit-identical.
 #[allow(clippy::too_many_arguments)]
 #[inline(always)]
 pub(crate) unsafe fn accumulate_convert(
@@ -16,35 +29,84 @@ pub(crate) unsafe fn accumulate_convert(
     // SAFETY: caller guarantees fixed input sizes and aarch64 provides NEON.
     unsafe {
         let convert_ptr = convert.as_ptr() as *const u8;
-        for lane in 0..64 {
-            let mut converted_ab = vdupq_n_u8(0);
-            let mut converted_c = vdupq_n_u8(0);
+        for lane in (0..64).step_by(4) {
+            // 8 live accumulator q-registers (4 lanes × 2 banks) leave ample
+            // headroom in the 32-register file for the gathers in flight and
+            // their address temporaries, so nothing spills.
+            let mut ab0 = vdupq_n_u8(0);
+            let mut ab1 = vdupq_n_u8(0);
+            let mut ab2 = vdupq_n_u8(0);
+            let mut ab3 = vdupq_n_u8(0);
+            let mut c0 = vdupq_n_u8(0);
+            let mut c1 = vdupq_n_u8(0);
+            let mut c2 = vdupq_n_u8(0);
+            let mut c3 = vdupq_n_u8(0);
             for b_med in 0..n_b_med {
-                let ab = chunk_ab_bytes[b_med][lane] as usize;
-                let c = chunk_c_bytes[b_med][lane] as usize;
-                converted_ab = veorq_u8(
-                    converted_ab,
-                    vld1q_u8(convert_ptr.add((b_med * 256 + ab) * 16)),
-                );
-                converted_c = veorq_u8(
-                    converted_c,
-                    vld1q_u8(convert_ptr.add((b_med * 256 + c) * 16)),
-                );
+                let table = convert_ptr.add(b_med * 256 * 16);
+                let a0 = chunk_ab_bytes[b_med][lane] as usize;
+                let a1 = chunk_ab_bytes[b_med][lane + 1] as usize;
+                let a2 = chunk_ab_bytes[b_med][lane + 2] as usize;
+                let a3 = chunk_ab_bytes[b_med][lane + 3] as usize;
+                let v0 = chunk_c_bytes[b_med][lane] as usize;
+                let v1 = chunk_c_bytes[b_med][lane + 1] as usize;
+                let v2 = chunk_c_bytes[b_med][lane + 2] as usize;
+                let v3 = chunk_c_bytes[b_med][lane + 3] as usize;
+                ab0 = veorq_u8(ab0, vld1q_u8(table.add(a0 * 16)));
+                ab1 = veorq_u8(ab1, vld1q_u8(table.add(a1 * 16)));
+                ab2 = veorq_u8(ab2, vld1q_u8(table.add(a2 * 16)));
+                ab3 = veorq_u8(ab3, vld1q_u8(table.add(a3 * 16)));
+                c0 = veorq_u8(c0, vld1q_u8(table.add(v0 * 16)));
+                c1 = veorq_u8(c1, vld1q_u8(table.add(v1 * 16)));
+                c2 = veorq_u8(c2, vld1q_u8(table.add(v2 * 16)));
+                c3 = veorq_u8(c3, vld1q_u8(table.add(v3 * 16)));
             }
-            let ab = vreinterpretq_u64_u8(converted_ab);
-            let c = vreinterpretq_u64_u8(converted_c);
-            partial_ab[lane] += F128 {
-                lo: vgetq_lane_u64::<0>(ab),
-                hi: vgetq_lane_u64::<1>(ab),
-            } * eq_lo_val;
-            partial_c[lane] += F128 {
-                lo: vgetq_lane_u64::<0>(c),
-                hi: vgetq_lane_u64::<1>(c),
-            } * eq_lo_val;
+
+            macro_rules! drain_lane {
+                ($offset:literal, $ab:ident, $c:ident) => {{
+                    let ab = vreinterpretq_u64_u8($ab);
+                    let c = vreinterpretq_u64_u8($c);
+                    partial_ab[lane + $offset] += F128 {
+                        lo: vgetq_lane_u64::<0>(ab),
+                        hi: vgetq_lane_u64::<1>(ab),
+                    } * eq_lo_val;
+                    partial_c[lane + $offset] += F128 {
+                        lo: vgetq_lane_u64::<0>(c),
+                        hi: vgetq_lane_u64::<1>(c),
+                    } * eq_lo_val;
+                }};
+            }
+            drain_lane!(0, ab0, c0);
+            drain_lane!(1, ab1, c1);
+            drain_lane!(2, ab2, c2);
+            drain_lane!(3, ab3, c3);
         }
     }
 }
 
+/// Two-bank convert fold, with the C-side gathers halved by `b_med` pairing.
+///
+/// The two C banks select `c & 0x55` and `c & 0xaa`, so each index carries only
+/// 4 live bits while spending a full 256-row lookup — the C side runs at half
+/// its addressing capacity, while the AB side consumes all 8 bits and is
+/// incompressible. Pairing two adjacent `b_med` into one lookup per bank
+/// therefore removes 4 of the 12 gathers per `b_med` per 4-lane group (the C
+/// side goes 8 → 4) at the cost of a few non-dependent integer ops per index.
+///
+/// `m0` / `m1` are [`super::super::paired_c_tables`], laid out `p * 256 + i`.
+/// For pair `p` covering `b_med = 2p, 2p+1`, with
+/// `i0 = (c_2p & 0x55) | ((c_2p1 << 1) & 0xaa)`:
+/// ```text
+/// m0[p][i0] == T_2p[c_2p & 0x55] ^ T_2p1[c_2p1 & 0x55]
+/// ```
+/// which is exactly the two bank-0 terms the unpaired loop XORs across those
+/// `b_med`, and symmetrically for bank 1. The banks never mix, so
+/// `partial_c_0` and `partial_c_1` stay separate. This is an identity, not an
+/// approximation: it follows from `convert` being F2-linear in its index bits
+/// (verified exhaustively by `convert_table_index_linear`), so the result is
+/// bit-identical to the unpaired fold.
+///
+/// An odd trailing `b_med` (only reachable on the padded boundary window) falls
+/// back to the unpaired path.
 #[allow(clippy::too_many_arguments)]
 #[inline(always)]
 pub(crate) unsafe fn accumulate_convert_with_s_hat_v(
@@ -52,6 +114,8 @@ pub(crate) unsafe fn accumulate_convert_with_s_hat_v(
     chunk_c_bytes: &[[u8; 64]; 16],
     n_b_med: usize,
     convert: &[F128],
+    m0: &[F128],
+    m1: &[F128],
     eq_lo_val: F128,
     partial_ab: &mut [F128; 64],
     partial_c_0: &mut [F128; 64],
@@ -59,12 +123,23 @@ pub(crate) unsafe fn accumulate_convert_with_s_hat_v(
 ) {
     use core::arch::aarch64::*;
 
+    debug_assert!(n_b_med <= 16);
+    debug_assert_eq!(convert.len(), 16 * 256);
+    debug_assert_eq!(m0.len(), 8 * 256);
+    debug_assert_eq!(m1.len(), 8 * 256);
+
     // SAFETY: caller guarantees fixed input sizes and aarch64 provides NEON.
+    // Every table offset below is a `u8` index scaled by the 16-byte row size,
+    // bounded by the debug-asserted table lengths: `b_med < 16` selects one of
+    // 16 convert blocks, and `p < 8` one of 8 paired blocks.
     unsafe {
         let convert_ptr = convert.as_ptr() as *const u8;
+        let m0_ptr = m0.as_ptr() as *const u8;
+        let m1_ptr = m1.as_ptr() as *const u8;
+        let n_pairs = n_b_med / 2;
         for lane in (0..64).step_by(4) {
-            // Four independent lanes expose enough lookup-level parallelism
-            // to hide the convert table's load latency.
+            // 12 live accumulator q-registers (4 lanes × 3 banks); the paired
+            // loop adds only address temporaries, so nothing spills.
             let mut ab0 = vdupq_n_u8(0);
             let mut ab1 = vdupq_n_u8(0);
             let mut ab2 = vdupq_n_u8(0);
@@ -77,7 +152,62 @@ pub(crate) unsafe fn accumulate_convert_with_s_hat_v(
             let mut c11 = vdupq_n_u8(0);
             let mut c12 = vdupq_n_u8(0);
             let mut c13 = vdupq_n_u8(0);
-            for b_med in 0..n_b_med {
+
+            for p in 0..n_pairs {
+                let (b_even, b_odd) = (2 * p, 2 * p + 1);
+                let t_even = convert_ptr.add(b_even * 256 * 16);
+                let t_odd = convert_ptr.add(b_odd * 256 * 16);
+                let q0 = m0_ptr.add(p * 256 * 16);
+                let q1 = m1_ptr.add(p * 256 * 16);
+
+                // AB side: unchanged, one gather per lane per b_med.
+                let e0 = chunk_ab_bytes[b_even][lane] as usize;
+                let e1 = chunk_ab_bytes[b_even][lane + 1] as usize;
+                let e2 = chunk_ab_bytes[b_even][lane + 2] as usize;
+                let e3 = chunk_ab_bytes[b_even][lane + 3] as usize;
+                let o0 = chunk_ab_bytes[b_odd][lane] as usize;
+                let o1 = chunk_ab_bytes[b_odd][lane + 1] as usize;
+                let o2 = chunk_ab_bytes[b_odd][lane + 2] as usize;
+                let o3 = chunk_ab_bytes[b_odd][lane + 3] as usize;
+                ab0 = veorq_u8(ab0, vld1q_u8(t_even.add(e0 * 16)));
+                ab1 = veorq_u8(ab1, vld1q_u8(t_even.add(e1 * 16)));
+                ab2 = veorq_u8(ab2, vld1q_u8(t_even.add(e2 * 16)));
+                ab3 = veorq_u8(ab3, vld1q_u8(t_even.add(e3 * 16)));
+                ab0 = veorq_u8(ab0, vld1q_u8(t_odd.add(o0 * 16)));
+                ab1 = veorq_u8(ab1, vld1q_u8(t_odd.add(o1 * 16)));
+                ab2 = veorq_u8(ab2, vld1q_u8(t_odd.add(o2 * 16)));
+                ab3 = veorq_u8(ab3, vld1q_u8(t_odd.add(o3 * 16)));
+
+                // C side: one gather per bank per lane now covers BOTH b_med.
+                let ce0 = chunk_c_bytes[b_even][lane] as usize;
+                let ce1 = chunk_c_bytes[b_even][lane + 1] as usize;
+                let ce2 = chunk_c_bytes[b_even][lane + 2] as usize;
+                let ce3 = chunk_c_bytes[b_even][lane + 3] as usize;
+                let co0 = chunk_c_bytes[b_odd][lane] as usize;
+                let co1 = chunk_c_bytes[b_odd][lane + 1] as usize;
+                let co2 = chunk_c_bytes[b_odd][lane + 2] as usize;
+                let co3 = chunk_c_bytes[b_odd][lane + 3] as usize;
+                let j0 = (ce0 & 0x55) | ((co0 << 1) & 0xaa);
+                let j1 = (ce1 & 0x55) | ((co1 << 1) & 0xaa);
+                let j2 = (ce2 & 0x55) | ((co2 << 1) & 0xaa);
+                let j3 = (ce3 & 0x55) | ((co3 << 1) & 0xaa);
+                let k0 = (ce0 & 0xaa) | ((co0 >> 1) & 0x55);
+                let k1 = (ce1 & 0xaa) | ((co1 >> 1) & 0x55);
+                let k2 = (ce2 & 0xaa) | ((co2 >> 1) & 0x55);
+                let k3 = (ce3 & 0xaa) | ((co3 >> 1) & 0x55);
+                c00 = veorq_u8(c00, vld1q_u8(q0.add(j0 * 16)));
+                c01 = veorq_u8(c01, vld1q_u8(q0.add(j1 * 16)));
+                c02 = veorq_u8(c02, vld1q_u8(q0.add(j2 * 16)));
+                c03 = veorq_u8(c03, vld1q_u8(q0.add(j3 * 16)));
+                c10 = veorq_u8(c10, vld1q_u8(q1.add(k0 * 16)));
+                c11 = veorq_u8(c11, vld1q_u8(q1.add(k1 * 16)));
+                c12 = veorq_u8(c12, vld1q_u8(q1.add(k2 * 16)));
+                c13 = veorq_u8(c13, vld1q_u8(q1.add(k3 * 16)));
+            }
+
+            // Odd trailing b_med: unpaired fallback.
+            if n_b_med & 1 == 1 {
+                let b_med = n_b_med - 1;
                 let table = convert_ptr.add(b_med * 256 * 16);
                 let a0 = chunk_ab_bytes[b_med][lane] as usize;
                 let a1 = chunk_ab_bytes[b_med][lane + 1] as usize;

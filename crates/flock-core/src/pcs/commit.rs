@@ -201,15 +201,14 @@ pub fn commit(z_packed: &[F128], params: &PcsParams) -> (Commitment, ProverData)
 
 /// Like [`commit`], but reuses a caller-provided codeword buffer instead of
 /// allocating its own. The buffer must have length `codeword_len`; its
-/// CONTENTS may be arbitrary (uninit/stale) — every slot is written here:
-/// `z_packed` is replicated into all `2^log_inv_rate` sub-blocks (the exact
-/// state after the first `log_inv_rate` NTT layers on `[z, 0, …, 0]`), in
-/// parallel. Buffers from [`prefault_codeword_during`] or the scratch pool
-/// are already resident, so no write faults.
+/// CONTENTS may be arbitrary (uninit/stale) — every slot is written by either
+/// the narrow rate-1 fused initializer or the existing replica-fill fallback.
+/// Buffers from [`prefault_codeword_during`] or the scratch pool are already
+/// resident, so no write faults are needed first.
 pub fn commit_into(
     z_packed: &[F128],
     params: &PcsParams,
-    mut codeword: Vec<F128>,
+    codeword: Vec<F128>,
 ) -> (Commitment, ProverData) {
     params.validate();
     assert_eq!(z_packed.len(), 1usize << params.log_msg_len());
@@ -220,15 +219,11 @@ pub fn commit_into(
         "commit_into: prebuilt codeword buffer has wrong length"
     );
 
-    // RS encoding of [z, 0, …, 0] starts with `log_inv_rate` butterfly layers
-    // whose bottom inputs are all zero — each is a pure copy, so after those
-    // layers the buffer holds 2^log_inv_rate replicas of z. Write that state
-    // directly (replicating z costs the same writes as the zero-fill it
-    // replaces) and start the NTT at layer `log_inv_rate`, skipping those
-    // layers' full-buffer reads and multiplies.
-    replicate_message_fill(&mut codeword, z_packed);
+    // Encoding, including initialization of every codeword slot, is performed
+    // in `finalize_commit` so its timer covers the same full operation on both
+    // the fused and fallback paths.
 
-    finalize_commit(codeword, params)
+    finalize_commit(codeword, z_packed, params)
 }
 
 /// Fill `codeword` with `2^r` replicas of `msg` (`r = log2(codeword.len() /
@@ -259,23 +254,38 @@ pub(crate) fn replicate_message_fill(codeword: &mut [F128], msg: &[F128]) {
 
 /// Shared tail of [`commit`] / [`commit_into`]: interleaved forward additive
 /// NTT (RS-encode every lane) then the initial Merkle tree over codeword rows.
-fn finalize_commit(mut codeword: Vec<F128>, params: &PcsParams) -> (Commitment, ProverData) {
+fn finalize_commit(
+    mut codeword: Vec<F128>,
+    z_packed: &[F128],
+    params: &PcsParams,
+) -> (Commitment, ProverData) {
     let timing = std::env::var_os("FLOCK_COMMIT_TIMING").is_some();
-    let t_ntt = std::time::Instant::now();
+    let t_encode = std::time::Instant::now();
     // ---- Interleaved forward additive NTT: 2^log_batch_size independent
-    // sub-NTTs with shared twiddles. Each sub-NTT operates on its lane of the
-    // SoA buffer. The first `log_inv_rate` layers were pre-applied by the
-    // caller's replicate-fill (commit_into), so start past them.
+    // sub-NTTs with shared twiddles. Rate 1 on Apple AArch64+PMULL and a large
+    // top-layer geometry writes the exact post-layer-2 state directly from the
+    // message, then resumes the unchanged scheduler at layer 3. In particular,
+    // it never materializes the standalone post-layer-0 replica buffer.
+    //
+    // Keep the old path explicit: every noneligible shape still replica-fills
+    // the first `log_inv_rate` layers and resumes at that layer.
     let ntt = AdditiveNttF128::standard(params.k_code());
-    ntt.forward_transform_interleaved_from_layer(
-        &mut codeword,
-        params.num_ntts(),
-        params.log_inv_rate,
-    );
+    let start_layer = if params.log_inv_rate == 1
+        && ntt.try_initialize_interleaved_rate1_fused_2layer(
+            &mut codeword,
+            z_packed,
+            params.num_ntts(),
+        ) {
+        3
+    } else {
+        replicate_message_fill(&mut codeword, z_packed);
+        params.log_inv_rate
+    };
+    ntt.forward_transform_interleaved_from_layer(&mut codeword, params.num_ntts(), start_layer);
     if timing {
         eprintln!(
-            "[commit-timing] ntt: {:.2} ms",
-            t_ntt.elapsed().as_secs_f64() * 1e3
+            "[commit-timing] encode: {:.2} ms",
+            t_encode.elapsed().as_secs_f64() * 1e3
         );
     }
     let t_merkle = std::time::Instant::now();

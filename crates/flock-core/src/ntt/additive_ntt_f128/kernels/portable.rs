@@ -10,6 +10,8 @@ pub(super) fn butterfly_row_pair(top: &mut [F128], bot: &mut [F128], twiddle: F1
     }
 }
 
+/// Reachable from the dispatcher only off the NEON path; kept compiled under
+/// `test` so the aarch64 kernels can be differentially tested against it.
 #[allow(clippy::too_many_arguments)]
 #[inline]
 pub(super) fn butterfly_fused_2layer(
@@ -42,6 +44,47 @@ pub(super) fn butterfly_fused_2layer(
         b[lane] = xb;
         c[lane] = xc;
         d[lane] = xd;
+    }
+}
+
+/// Out-of-place form of [`butterfly_fused_2layer`]. The arithmetic and
+/// operation order intentionally match the in-place kernel exactly.
+#[allow(clippy::too_many_arguments)]
+#[inline]
+pub(super) fn butterfly_fused_2layer_out_of_place(
+    src_a: &[F128],
+    src_b: &[F128],
+    src_c: &[F128],
+    src_d: &[F128],
+    dst_a: &mut [F128],
+    dst_b: &mut [F128],
+    dst_c: &mut [F128],
+    dst_d: &mut [F128],
+    t_outer: F128,
+    t_inner_a: F128,
+    t_inner_b: F128,
+) {
+    for lane in 0..src_a.len() {
+        let mut xa = src_a[lane];
+        let mut xb = src_b[lane];
+        let mut xc = src_c[lane];
+        let mut xd = src_d[lane];
+        let na = xa + xc * t_outer;
+        xc += na;
+        xa = na;
+        let nb = xb + xd * t_outer;
+        xd += nb;
+        xb = nb;
+        let na2 = xa + xb * t_inner_a;
+        xb += na2;
+        xa = na2;
+        let nc2 = xc + xd * t_inner_b;
+        xd += nc2;
+        xc = nc2;
+        dst_a[lane] = xa;
+        dst_b[lane] = xb;
+        dst_c[lane] = xc;
+        dst_d[lane] = xd;
     }
 }
 

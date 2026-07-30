@@ -280,6 +280,75 @@ impl AdditiveNttF128 {
         }
     }
 
+    /// Try to materialize the exact post-layer-2 state for a rate-1 encoding
+    /// directly from the message. On the supported Apple/PMULL large-domain
+    /// geometry this replaces replica-fill plus the layer-1 and layer-2
+    /// sweeps; all other geometries return `false` without touching `dst`.
+    ///
+    /// `message` is the lower half of the conceptual coefficient vector
+    /// `[message, 0]`. Layer 0 would copy it into both halves. Instead, each
+    /// half is produced directly by one out-of-place fused layer-1/layer-2
+    /// pass, keeping exactly four source and four destination row streams
+    /// live. A `true` result must be continued at layer 3.
+    pub(crate) fn try_initialize_interleaved_rate1_fused_2layer(
+        &self,
+        dst: &mut [F128],
+        message: &[F128],
+        num_ntts: usize,
+    ) -> bool {
+        if !cfg!(all(
+            target_arch = "aarch64",
+            target_os = "macos",
+            target_feature = "aes"
+        )) {
+            return false;
+        }
+        if num_ntts == 0
+            || !num_ntts.is_power_of_two()
+            || message.len().checked_mul(2) != Some(dst.len())
+            || dst.len() % num_ntts != 0
+            || message.len() % num_ntts != 0
+        {
+            return false;
+        }
+        let rows = dst.len() / num_ntts;
+        // The out-of-place row pass is intended only for top-layer,
+        // bandwidth-bound geometry. At 2^11 rows each of its four source
+        // quarters has the existing parallel-row threshold of 256 rows.
+        if !rows.is_power_of_two() || rows < (1 << 11) || log2_pow2(rows) > self.log_domain_size() {
+            return false;
+        }
+
+        self.initialize_interleaved_rate1_fused_2layer(dst, message, num_ntts);
+        true
+    }
+
+    fn initialize_interleaved_rate1_fused_2layer(
+        &self,
+        dst: &mut [F128],
+        message: &[F128],
+        num_ntts: usize,
+    ) {
+        let quarter = message.len() / (4 * num_ntts);
+        let (dst_block_0, dst_block_1) = dst.split_at_mut(message.len());
+
+        // Sequential by destination block on purpose: running both together
+        // would turn four source + four destination streams into four source
+        // + eight destination streams and recreate the cache-pressure failure
+        // this initializer is designed to avoid.
+        for (block, block_dst) in [dst_block_0, dst_block_1].into_iter().enumerate() {
+            butterfly_interleaved_fused_2layer_out_of_place_par_rows(
+                message,
+                block_dst,
+                self.twiddle(1, block),
+                self.twiddle(2, 2 * block),
+                self.twiddle(2, 2 * block + 1),
+                quarter,
+                num_ntts,
+            );
+        }
+    }
+
     /// Scalar reference for the interleaved forward NTT.
     pub fn forward_transform_interleaved_scalar(&self, data: &mut [F128], num_ntts: usize) {
         self.forward_transform_interleaved_scalar_from_layer(data, num_ntts, 0);
@@ -882,6 +951,70 @@ fn butterfly_interleaved_fused_2layer_par_rows(
     }
 }
 
+/// Out-of-place fused layer-1/layer-2 pass over one destination block.
+/// Exactly four immutable source rows and four disjoint destination rows are
+/// live in each iteration; the source block may be reused by a later call.
+#[inline]
+fn butterfly_interleaved_fused_2layer_out_of_place_par_rows(
+    src: &[F128],
+    dst: &mut [F128],
+    t_outer: F128,
+    t_inner_a: F128,
+    t_inner_b: F128,
+    quarter: usize,
+    num_ntts: usize,
+) {
+    use rayon::prelude::*;
+    const PARALLEL_ROW_THRESHOLD: usize = 256;
+    let stride = quarter * num_ntts;
+    debug_assert_eq!(src.len(), 4 * stride);
+    debug_assert_eq!(dst.len(), 4 * stride);
+
+    let (src_top, src_bot) = src.split_at(2 * stride);
+    let (src_a, src_b) = src_top.split_at(stride);
+    let (src_c, src_d) = src_bot.split_at(stride);
+    let (dst_top, dst_bot) = dst.split_at_mut(2 * stride);
+    let (dst_a, dst_b) = dst_top.split_at_mut(stride);
+    let (dst_c, dst_d) = dst_bot.split_at_mut(stride);
+
+    if quarter < PARALLEL_ROW_THRESHOLD {
+        for row in 0..quarter {
+            let offset = row * num_ntts;
+            kernels::butterfly_fused_2layer_out_of_place(
+                &src_a[offset..offset + num_ntts],
+                &src_b[offset..offset + num_ntts],
+                &src_c[offset..offset + num_ntts],
+                &src_d[offset..offset + num_ntts],
+                &mut dst_a[offset..offset + num_ntts],
+                &mut dst_b[offset..offset + num_ntts],
+                &mut dst_c[offset..offset + num_ntts],
+                &mut dst_d[offset..offset + num_ntts],
+                t_outer,
+                t_inner_a,
+                t_inner_b,
+            );
+        }
+    } else {
+        src_a
+            .par_chunks(num_ntts)
+            .zip(src_b.par_chunks(num_ntts))
+            .zip(src_c.par_chunks(num_ntts))
+            .zip(src_d.par_chunks(num_ntts))
+            .zip(dst_a.par_chunks_mut(num_ntts))
+            .zip(dst_b.par_chunks_mut(num_ntts))
+            .zip(dst_c.par_chunks_mut(num_ntts))
+            .zip(dst_d.par_chunks_mut(num_ntts))
+            .for_each(
+                |(((((((src_a, src_b), src_c), src_d), dst_a), dst_b), dst_c), dst_d)| {
+                    kernels::butterfly_fused_2layer_out_of_place(
+                        src_a, src_b, src_c, src_d, dst_a, dst_b, dst_c, dst_d, t_outer, t_inner_a,
+                        t_inner_b,
+                    );
+                },
+            );
+    }
+}
+
 /// Butterfly one block of an interleaved (SoA) buffer with shared twiddle.
 ///
 /// `block` has length `(2 * block_size_half) * num_ntts` and is laid out as
@@ -1022,6 +1155,91 @@ mod tests {
 
     fn rand_vec(rng: &mut Rng, n: usize) -> Vec<F128> {
         (0..n).map(|_| rng.f128()).collect()
+    }
+
+    fn apply_interleaved_scalar_layer(
+        ntt: &AdditiveNttF128,
+        data: &mut [F128],
+        num_ntts: usize,
+        layer: usize,
+    ) {
+        let log_d = log2_pow2(data.len() / num_ntts);
+        let block_size = 1usize << (log_d - layer);
+        let half = block_size >> 1;
+        for block in 0..(1usize << layer) {
+            let twiddle = ntt.twiddle(layer, block);
+            let start = block * block_size * num_ntts;
+            for row in 0..half {
+                for lane in 0..num_ntts {
+                    let top = start + row * num_ntts + lane;
+                    let bot = top + half * num_ntts;
+                    let v = data[bot];
+                    let new_u = data[top] + v * twiddle;
+                    data[top] = new_u;
+                    data[bot] = v + new_u;
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn rate1_fused_2layer_initializer_matches_independent_oracles() {
+        let log_d = 11usize;
+        let num_ntts = 4usize;
+        let ntt = AdditiveNttF128::standard(log_d);
+        let mut rng = Rng::new(0x5212_005);
+        let message = rand_vec(&mut rng, (1usize << (log_d - 1)) * num_ntts);
+
+        // Independent post-layer-0 state, followed by ordinary scalar layers
+        // 1 and 2. This does not call either fused kernel.
+        let mut post_layer_2 = vec![F128::ZERO; message.len() * 2];
+        post_layer_2[..message.len()].copy_from_slice(&message);
+        post_layer_2[message.len()..].copy_from_slice(&message);
+        apply_interleaved_scalar_layer(&ntt, &mut post_layer_2, num_ntts, 1);
+        apply_interleaved_scalar_layer(&ntt, &mut post_layer_2, num_ntts, 2);
+
+        // Force the arithmetic path independently of the production target
+        // gate, then verify both its intermediate invariant and continuation.
+        let mut forced = vec![F128::ZERO; message.len() * 2];
+        ntt.initialize_interleaved_rate1_fused_2layer(&mut forced, &message, num_ntts);
+        assert_eq!(forced, post_layer_2, "post-layer-2 state mismatch");
+
+        let mut completed = forced;
+        ntt.forward_transform_interleaved_from_layer(&mut completed, num_ntts, 3);
+        let mut full_oracle = vec![F128::ZERO; message.len() * 2];
+        full_oracle[..message.len()].copy_from_slice(&message);
+        ntt.forward_transform_interleaved_scalar(&mut full_oracle, num_ntts);
+        assert_eq!(completed, full_oracle, "layer-3 continuation mismatch");
+
+        let mut dispatched = vec![F128::ZERO; message.len() * 2];
+        let took =
+            ntt.try_initialize_interleaved_rate1_fused_2layer(&mut dispatched, &message, num_ntts);
+        assert_eq!(
+            took,
+            cfg!(all(
+                target_arch = "aarch64",
+                target_os = "macos",
+                target_feature = "aes"
+            )),
+            "eligible geometry target dispatch mismatch"
+        );
+        if took {
+            assert_eq!(dispatched, post_layer_2);
+        }
+    }
+
+    #[test]
+    fn rate1_fused_2layer_noneligible_shape_does_not_write() {
+        let log_d = 10usize;
+        let num_ntts = 2usize;
+        let ntt = AdditiveNttF128::standard(log_d);
+        let mut rng = Rng::new(0xFA11_BACC);
+        let message = rand_vec(&mut rng, (1usize << (log_d - 1)) * num_ntts);
+        let mut dst = rand_vec(&mut rng, message.len() * 2);
+        let before = dst.clone();
+
+        assert!(!ntt.try_initialize_interleaved_rate1_fused_2layer(&mut dst, &message, num_ntts,));
+        assert_eq!(dst, before, "fallback probe modified destination");
     }
 
     /// The parallel interleaved transform — whose top layers use the radix-8
