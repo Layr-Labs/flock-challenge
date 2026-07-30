@@ -29,18 +29,34 @@ use crate::ntt::{AdditiveNttGf8, InvNttTableByteSingleGf8};
 /// `table[x] = ∏_i ((1 + r_i) · (1 ⊕ bit_i(x)) + r_i · bit_i(x))` for `x ∈ {0,1}^n`,
 /// where `n = r.len()`. Standard in-place power-of-two doubling.
 pub fn build_eq(r: &[F128]) -> Vec<F128> {
+    use rayon::prelude::*;
+
     let n = r.len();
     // Uninit alloc — same invariant as `build_eq_parallel` in ring_switch:
     // every slot in t[0..2^n] is written exactly once before any read.
     let mut t = crate::alloc_uninit_f128_vec(1usize << n);
     t[0] = F128::ONE;
+    const PAR_THRESHOLD: usize = 1 << 12;
     for i in 0..n {
         let r_i = r[i];
-        let one_minus_r = F128::ONE + r_i;
-        // Iterate downward so we read t[x] before overwriting it as t[x | (1<<i)].
-        for x in (0..(1usize << i)).rev() {
-            t[x | (1 << i)] = t[x] * r_i;
-            t[x] *= one_minus_r;
+        let half = 1usize << i;
+        let (lo, rest) = t.split_at_mut(half);
+        let hi = &mut rest[..half];
+        let build_pair = |lo_x: &mut F128, hi_x: &mut F128| {
+            let v = *lo_x;
+            let vr = v * r_i;
+            *hi_x = vr;
+            // v * (1 + r_i) = v + v * r_i in characteristic two.
+            *lo_x = v + vr;
+        };
+        if half < PAR_THRESHOLD {
+            lo.iter_mut()
+                .zip(hi.iter_mut())
+                .for_each(|(lo_x, hi_x)| build_pair(lo_x, hi_x));
+        } else {
+            lo.par_iter_mut()
+                .zip(hi.par_iter_mut())
+                .for_each(|(lo_x, hi_x)| build_pair(lo_x, hi_x));
         }
     }
     t

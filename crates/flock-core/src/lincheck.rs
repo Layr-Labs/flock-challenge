@@ -448,22 +448,38 @@ pub enum VerifyError {
 /// Standard "doubling-in-half" construction: `O(2^d)` F128 muls, no
 /// inversions. Indexing is LSB-first — `bit_j(i)` is the `j`-th LSB of `i`.
 pub fn build_eq_table(point: &[F128]) -> Vec<F128> {
+    use rayon::prelude::*;
+
     let d = point.len();
-    let mut out: Vec<F128> = Vec::with_capacity(1usize << d);
-    out.push(F128::ONE);
+    // Every slot is written by the level that first exposes it before it can
+    // be read at a later level.
+    let mut out = crate::alloc_uninit_f128_vec(1usize << d);
+    out[0] = F128::ONE;
+    const PAR_THRESHOLD: usize = 1 << 12;
     for j in 0..d {
         let r_j = point[j];
-        let one_plus_r_j = F128::ONE + r_j;
         let len = 1usize << j;
-        out.resize(2 * len, F128::ZERO);
+        let (lo, rest) = out.split_at_mut(len);
+        let hi = &mut rest[..len];
         // For each existing entry i ∈ [0, len), produce two children:
-        //   out[i]       *= (1 + r_j)     ← new bit_j = 0
-        //   out[i + len]  = out[i] * r_j  ← new bit_j = 1
-        // Forward iteration is safe: the [i] and [i+len] slots are disjoint.
-        for i in 0..len {
-            let v = out[i];
-            out[i + len] = v * r_j;
-            out[i] = v * one_plus_r_j;
+        //   hi[i] = v * r_j              ← new bit_j = 1
+        //   lo[i] = v * (1 + r_j)
+        //         = v + hi[i]             ← new bit_j = 0
+        // The distributive identity saves one field multiplication per pair.
+        let build_pair = |lo_i: &mut F128, hi_i: &mut F128| {
+            let v = *lo_i;
+            let vr = v * r_j;
+            *hi_i = vr;
+            *lo_i = v + vr;
+        };
+        if len < PAR_THRESHOLD {
+            lo.iter_mut()
+                .zip(hi.iter_mut())
+                .for_each(|(lo_i, hi_i)| build_pair(lo_i, hi_i));
+        } else {
+            lo.par_iter_mut()
+                .zip(hi.par_iter_mut())
+                .for_each(|(lo_i, hi_i)| build_pair(lo_i, hi_i));
         }
     }
     out
