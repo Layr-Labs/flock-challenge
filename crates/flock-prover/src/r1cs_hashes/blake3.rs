@@ -1583,7 +1583,7 @@ impl Blake3Setup {
 // `common::drive_witness_batch_major`.
 // ---------------------------------------------------------------------------
 
-use super::common::{BM_V, BmRow, or_bit_row, or_u32_row};
+use super::common::{BM_V, BmRow, or_bit_row};
 
 #[inline(always)]
 fn bm_xor_rotr(x: &[u32; BM_V], y: &[u32; BM_V], r: u32) -> [u32; BM_V] {
@@ -1598,9 +1598,19 @@ struct BmRows<'a> {
 
 #[inline(always)]
 fn bm_write_lin(rows: &mut BmRows<'_>, bit: usize, vals: &[u32; BM_V]) {
-    or_u32_row(rows.z, bit, vals);
-    or_u32_row(rows.a, bit, vals);
-    or_u32_row(rows.b, bit, &[0xFFFF_FFFF; BM_V]);
+    let word = bit >> 6;
+    let shift = bit & 63;
+    for (j, &value) in vals.iter().enumerate() {
+        let value = value as u64;
+        rows.z[word][j] |= value << shift;
+        rows.a[word][j] |= value << shift;
+        rows.b[word][j] |= (u32::MAX as u64) << shift;
+        if shift > 32 {
+            rows.z[word + 1][j] |= value >> (64 - shift);
+            rows.a[word + 1][j] |= value >> (64 - shift);
+            rows.b[word + 1][j] |= (u32::MAX as u64) >> (64 - shift);
+        }
+    }
 }
 
 #[inline(always)]
