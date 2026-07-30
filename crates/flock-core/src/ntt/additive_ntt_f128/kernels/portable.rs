@@ -45,6 +45,9 @@ pub(super) fn butterfly_fused_2layer(
     }
 }
 
+// Used by the portable row kernel and as the x86 lane tail; the NEON row
+// kernel is fully vectorised over lanes and has no scalar tail.
+#[cfg(not(all(target_arch = "aarch64", target_feature = "aes")))]
 #[inline]
 pub(super) fn butterfly_fused_4layer(values: &mut [F128; 16], twiddles: &[F128; 15]) {
     #[inline(always)]
@@ -75,10 +78,13 @@ pub(super) fn butterfly_fused_4layer(values: &mut [F128; 16], twiddles: &[F128; 
 /// # Safety
 /// The caller guarantees that every selected row and lane is valid and that
 /// concurrent calls use disjoint row groups.
-#[cfg(not(all(
-    target_arch = "x86_64",
-    target_feature = "avx512f",
-    target_feature = "vpclmulqdq"
+#[cfg(not(any(
+    all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
+    ),
+    all(target_arch = "aarch64", target_feature = "aes")
 )))]
 pub(super) unsafe fn butterfly_fused_4layer_row(
     ptr: *mut F128,

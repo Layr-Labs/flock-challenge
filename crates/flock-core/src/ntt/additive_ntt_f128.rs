@@ -401,14 +401,17 @@ impl AdditiveNttF128 {
         // quarter-row; layer L butterflies (a,c) and (b,d) (distance =
         // block_size/2), layer L+1 butterflies (a,b) and (c,d) (distance =
         // block_size/4).
-        // Fuse FOUR layers per pass only where a SIMD fused-4 kernel exists
-        // (x86 AVX-512). On other targets the 16-point kernel falls back to
-        // scalar, which is slower than the NEON fused-2 path — so keep fused-2
-        // there. NEON fused-4 is a future addition.
-        let fused4_ok = cfg!(all(
-            target_arch = "x86_64",
-            target_feature = "avx512f",
-            target_feature = "vpclmulqdq"
+        // Fuse FOUR layers per pass wherever a SIMD 16-point kernel exists
+        // (x86 AVX-512, aarch64 NEON+PMULL). On other targets the kernel falls
+        // back to scalar, which is slower than the fused-2 path — so keep
+        // fused-2 there.
+        let fused4_ok = cfg!(any(
+            all(
+                target_arch = "x86_64",
+                target_feature = "avx512f",
+                target_feature = "vpclmulqdq"
+            ),
+            all(target_arch = "aarch64", target_feature = "aes")
         ));
         let mut layer = start_layer.min(n_top);
         while layer < n_top {

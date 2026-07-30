@@ -96,10 +96,20 @@ pub(super) unsafe fn butterfly_fused_4layer_row(
         x86_64::butterfly_fused_4layer_row(ptr, sixteenth, num_ntts, r, twiddles);
     }
 
-    #[cfg(not(all(
-        target_arch = "x86_64",
-        target_feature = "avx512f",
-        target_feature = "vpclmulqdq"
+    #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+    // SAFETY: the cfg gate guarantees PMULL through the aes feature; the
+    // caller owns the row geometry and disjointness contract.
+    unsafe {
+        aarch64::butterfly_fused_4layer_row(ptr, sixteenth, num_ntts, r, twiddles);
+    }
+
+    #[cfg(not(any(
+        all(
+            target_arch = "x86_64",
+            target_feature = "avx512f",
+            target_feature = "vpclmulqdq"
+        ),
+        all(target_arch = "aarch64", target_feature = "aes")
     )))]
     // SAFETY: forwarded caller contract.
     unsafe {
