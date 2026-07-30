@@ -404,19 +404,49 @@ impl AdditiveNttF128 {
         // Fuse FOUR layers per pass only where a SIMD fused-4 kernel exists
         // (x86 AVX-512). On other targets the 16-point kernel falls back to
         // scalar, which is slower than the NEON fused-2 path — so keep fused-2
-        // there. NEON fused-4 is a future addition.
+        // there.
+        //
+        // Radix-16 is unavailable on NEON for a cache reason as well as a
+        // missing kernel: its 16 concurrently-live row streams all alias into
+        // one L1 set (every row-group stride here is a multiple of the
+        // set-repeat period) and so demand 16 ways against an 8-way L1D.
+        // Radix-8 is the widest fusion that fits — 8 streams, 8 ways — and it
+        // still halves the number of full-buffer sweeps versus fused-2.
         let fused4_ok = cfg!(all(
             target_arch = "x86_64",
             target_feature = "avx512f",
             target_feature = "vpclmulqdq"
         ));
+        let fused3_ok = !fused4_ok;
         let mut layer = start_layer.min(n_top);
         while layer < n_top {
             let num_blocks = 1usize << layer;
             let block_size = 1usize << (log_d - layer);
             let block_bytes = block_size * num_ntts;
 
-            if fused4_ok && layer + 3 < n_top && block_size >= 16 {
+            if fused3_ok && layer + 2 < n_top && block_size >= 8 {
+                // Fuse three layers (layer..layer+3): one read+write per block
+                // instead of three. Each block contributes an 8-point butterfly.
+                let eighth = block_size >> 3;
+                for block in 0..num_blocks {
+                    let mut tw = [F128 { lo: 0, hi: 0 }; 7];
+                    tw[0] = self.twiddle(layer, block);
+                    for s in 0..2 {
+                        tw[1 + s] = self.twiddle(layer + 1, 2 * block + s);
+                    }
+                    for s in 0..4 {
+                        tw[3 + s] = self.twiddle(layer + 2, 4 * block + s);
+                    }
+                    let start = block * block_bytes;
+                    butterfly_interleaved_fused_3layer_par_rows(
+                        &mut data[start..start + block_bytes],
+                        &tw,
+                        eighth,
+                        num_ntts,
+                    );
+                }
+                layer += 3;
+            } else if fused4_ok && layer + 3 < n_top && block_size >= 16 {
                 // Fuse four layers (layer..layer+4): one read+write per block
                 // instead of four. Each block contributes a 16-point butterfly.
                 let sixteenth = block_size >> 4;
@@ -883,6 +913,46 @@ fn butterfly_interleaved_block(
     }
 }
 
+/// Butterfly one top-layer block, fusing three layers `(L..L+3)`. `block`
+/// holds `8 * eighth` rows of `num_ntts` lanes; `t` carries the 7 twiddles for
+/// the sub-butterflies. Parallel over row groups.
+///
+/// Sits between the fused-2 and fused-4 variants for a cache reason rather
+/// than an arithmetic one: the row-group stride is a multiple of the L1
+/// set-repeat period at these shapes, so the N concurrently-live row streams
+/// all land in one set and demand N ways. Radix-8 is the widest fusion an
+/// 8-way L1D admits.
+#[inline]
+fn butterfly_interleaved_fused_3layer_par_rows(
+    block: &mut [F128],
+    t: &[F128; 7],
+    eighth: usize,
+    num_ntts: usize,
+) {
+    use rayon::prelude::*;
+    const PARALLEL_ROW_THRESHOLD: usize = 256;
+    debug_assert_eq!(block.len(), 8 * eighth * num_ntts);
+    // Carry the base as `usize` (Send+Sync) so rayon's per-`r` closure can hold
+    // it without a raw-pointer `Sync` shim. Each `r` writes the disjoint rows
+    // `{i*eighth + r : i ∈ 0..8}`, so concurrent writes never alias.
+    let base = block.as_mut_ptr() as usize;
+    if eighth < PARALLEL_ROW_THRESHOLD {
+        for r in 0..eighth {
+            // SAFETY: row group r writes disjoint rows of this block.
+            unsafe {
+                kernels::butterfly_fused_3layer_row(base as *mut F128, eighth, num_ntts, r, t)
+            };
+        }
+    } else {
+        (0..eighth).into_par_iter().for_each(|r| {
+            // SAFETY: distinct r → disjoint row groups → no aliasing.
+            unsafe {
+                kernels::butterfly_fused_3layer_row(base as *mut F128, eighth, num_ntts, r, t)
+            };
+        });
+    }
+}
+
 /// Butterfly one top-layer block, fusing four layers `(L..L+4)`. `block` holds
 /// `16 * sixteenth` rows of `num_ntts` lanes; `t` carries the 15 twiddles for
 /// the sub-butterflies (see module comment above). Parallel over row groups.
@@ -952,6 +1022,54 @@ mod tests {
 
     fn rand_vec(rng: &mut Rng, n: usize) -> Vec<F128> {
         (0..n).map(|_| rng.f128()).collect()
+    }
+
+    /// The parallel interleaved transform — whose top layers use the radix-8
+    /// fusion on non-AVX-512 targets — must agree bit-for-bit with the scalar
+    /// reference, which applies every layer as its own separate sweep.
+    ///
+    /// This is the regression guard for the layer-fusion arithmetic: a radix-8
+    /// butterfly reassociates three layers' worth of work into one pass over
+    /// the block, so an error in the twiddle indexing or the sub-butterfly
+    /// order shows up here as a mismatch rather than as a wrong proof much
+    /// later. `log_d` is swept across the deep-phase split so the top-layer
+    /// loop actually reaches the radix-8 arm (it needs `layer + 2 < n_top`),
+    /// and `start_layer = 1` covers the RS-encode entry the PCS commit uses.
+    #[cfg(any(
+        all(target_arch = "aarch64", target_feature = "aes"),
+        all(target_arch = "x86_64", target_feature = "pclmulqdq"),
+    ))]
+    #[test]
+    fn fused_top_layers_match_scalar_reference() {
+        let mut rng = Rng::new(0x3F30);
+        let mut exercised = false;
+        for log_d in [12usize, 13, 14, 15, 16] {
+            for num_ntts in [2usize, 8, 64] {
+                let ntt = AdditiveNttF128::standard(log_d);
+                let src = rand_vec(&mut rng, (1usize << log_d) * num_ntts);
+                for start_layer in [0usize, 1] {
+                    let mut want = src.clone();
+                    ntt.forward_transform_interleaved_scalar_from_layer(
+                        &mut want,
+                        num_ntts,
+                        start_layer,
+                    );
+                    let mut got = src.clone();
+                    ntt.forward_transform_interleaved_parallel_from_layer(
+                        &mut got,
+                        num_ntts,
+                        start_layer,
+                    );
+                    assert_eq!(
+                        got, want,
+                        "fused top layers diverged from scalar at log_d={log_d} \
+                         num_ntts={num_ntts} start_layer={start_layer}"
+                    );
+                    exercised |= got != src;
+                }
+            }
+        }
+        assert!(exercised, "test never transformed anything");
     }
 
     #[test]

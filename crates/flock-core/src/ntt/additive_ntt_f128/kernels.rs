@@ -107,6 +107,25 @@ pub(super) unsafe fn butterfly_fused_4layer_row(
     }
 }
 
+/// Process one fused-three-layer row group across every interleaved NTT lane.
+///
+/// # Safety
+/// The caller must ensure the 8 row slices selected by `r` are valid and
+/// disjoint from any row group being processed concurrently.
+#[inline]
+pub(super) unsafe fn butterfly_fused_3layer_row(
+    ptr: *mut F128,
+    eighth: usize,
+    num_ntts: usize,
+    r: usize,
+    twiddles: &[F128; 7],
+) {
+    // SAFETY: forwarded caller contract.
+    unsafe {
+        portable::butterfly_fused_3layer_row(ptr, eighth, num_ntts, r, twiddles);
+    }
+}
+
 #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
 #[inline]
 pub(super) unsafe fn butterfly_neon_block(chunk: &mut [F128], twiddle: F128, half: usize) {
