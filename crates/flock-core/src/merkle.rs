@@ -99,6 +99,13 @@ mod sha256x4;
 #[path = "merkle/x86_64.rs"]
 mod sha256x4;
 
+/// Three independent four-lane NEON states interleaved round-by-round for the
+/// ranked 1 KiB BLAKE3 leaf shape. Apple-only generated assembly; every other
+/// target retains the upstream `blake3::platform::hash_many` path.
+#[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+#[path = "merkle/blake3_neon12.rs"]
+mod blake3_neon12;
+
 /// Global Merkle hash call/compression counters, enabled with
 /// `--features hash-count` (e.g. by `benches/verifier_hash_count.rs`).
 /// Relaxed atomics — exact totals, no ordering guarantees across threads.
@@ -356,6 +363,21 @@ fn blake3_hash_many<const N: usize>(
 /// `16 << log_batch_size` bytes. Returns `false` for any other size, leaving
 /// the caller to hash leaves one at a time.
 fn blake3_hash_many_leaves(data: &[u8], leaf_size: usize, out: &mut [Hash]) -> bool {
+    #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+    if leaf_size == 1024 {
+        let done = blake3_neon12::hash_complete_groups(data, out);
+        if done < out.len() {
+            blake3_hash_many::<1024>(
+                &data[done * 1024..],
+                &mut out[done..],
+                0,
+                BLAKE3_CHUNK_START,
+                BLAKE3_CHUNK_END,
+            );
+        }
+        return true;
+    }
+
     macro_rules! dispatch {
         ($($n:literal),+ $(,)?) => {
             match leaf_size {
