@@ -30,7 +30,7 @@
 //!    c. Else: commit f^{i+2}, open f^{i+1}, induce next basis, glue.
 
 use crate::challenger::Challenger;
-use crate::field::F128;
+use crate::field::{F128, F256Unreduced};
 use crate::lincheck::build_eq_table;
 use crate::merkle::{self, Hash, HashKind};
 use crate::ntt::additive_ntt_f128::AdditiveNttF128;
@@ -2447,7 +2447,8 @@ impl RoundQuad {
 }
 
 /// Compute `(u_0, u_2)` for `u(X) = Σ_x f(X, x) · b(X, x)` where `X` is the
-/// LSB variable. Parallel reduction across pair indices.
+/// LSB variable. Parallel reduction across pair indices, with GHASH reduction
+/// deferred until after the full dot product.
 ///
 /// Uses a SINGLE combined basis poly. (Previously took `&[Vec<F128>]` and
 /// summed at every pair index; collapsing to one basis happens at glue time.)
@@ -2460,34 +2461,45 @@ fn round_msg_lsb(f: &[F128], b: &[F128]) -> SumcheckMessage {
     const PAR_THRESHOLD: usize = 4096;
     let half = n / 2;
     if half < PAR_THRESHOLD {
-        let mut u_0 = F128::ZERO;
-        let mut u_2 = F128::ZERO;
+        let mut u_0 = F256Unreduced::ZERO;
+        let mut u_2 = F256Unreduced::ZERO;
         for j in 0..half {
             let f0 = f[2 * j];
             let f1 = f[2 * j + 1];
             let b0 = b[2 * j];
             let b1 = b[2 * j + 1];
-            u_0 += f0 * b0;
-            u_2 += (f0 + f1) * (b0 + b1);
+            u_0 ^= f0.mul_unreduced(b0);
+            u_2 ^= (f0 + f1).mul_unreduced(b0 + b1);
         }
-        return SumcheckMessage { u_0, u_2 };
+        return SumcheckMessage {
+            u_0: u_0.reduce(),
+            u_2: u_2.reduce(),
+        };
     }
 
     let (u_0, u_2) = (0..half)
         .into_par_iter()
         .with_min_len(PAR_THRESHOLD / 4)
-        .map(|j| {
-            let f0 = f[2 * j];
-            let f1 = f[2 * j + 1];
-            let b0 = b[2 * j];
-            let b1 = b[2 * j + 1];
-            (f0 * b0, (f0 + f1) * (b0 + b1))
-        })
+        .fold(
+            || (F256Unreduced::ZERO, F256Unreduced::ZERO),
+            |(mut u_0, mut u_2), j| {
+                let f0 = f[2 * j];
+                let f1 = f[2 * j + 1];
+                let b0 = b[2 * j];
+                let b1 = b[2 * j + 1];
+                u_0 ^= f0.mul_unreduced(b0);
+                u_2 ^= (f0 + f1).mul_unreduced(b0 + b1);
+                (u_0, u_2)
+            },
+        )
         .reduce(
-            || (F128::ZERO, F128::ZERO),
-            |(a0, a2), (b0, b2)| (a0 + b0, a2 + b2),
+            || (F256Unreduced::ZERO, F256Unreduced::ZERO),
+            |(a0, a2), (b0, b2)| (a0 ^ b0, a2 ^ b2),
         );
-    SumcheckMessage { u_0, u_2 }
+    SumcheckMessage {
+        u_0: u_0.reduce(),
+        u_2: u_2.reduce(),
+    }
 }
 
 /// Fused round message + full inner product: returns `round_msg_lsb(f, b)`
@@ -2499,8 +2511,8 @@ fn round_msg_lsb(f: &[F128], b: &[F128]) -> SumcheckMessage {
 /// 2^n witness; this collapses them into one (the phase is memory-bandwidth
 /// bound, so a saved pass is a near-proportional win). The `u_0` term `f0·b0`
 /// is shared between the message and the eval, so `y` costs one extra mul per
-/// pair. Bit-identical to the unfused path: F128 sums are exact and order-
-/// independent, so `y == mle_eval_inline(f, z)`.
+/// pair. Reduction is deferred across all three dot products; GHASH reduction
+/// is F2-linear, so the results are bit-identical to the unfused path.
 fn round_msg_and_eval_lsb(f: &[F128], b: &[F128]) -> (SumcheckMessage, F128) {
     use rayon::prelude::*;
     let n = f.len();
@@ -2509,35 +2521,44 @@ fn round_msg_and_eval_lsb(f: &[F128], b: &[F128]) -> (SumcheckMessage, F128) {
 
     const PAR_THRESHOLD: usize = 4096;
     let half = n / 2;
-    let term = |j: usize| -> (F128, F128, F128) {
+    let accumulate = |(mut u_0, mut u_2, mut y): (F256Unreduced, F256Unreduced, F256Unreduced),
+                      j: usize| {
         let f0 = f[2 * j];
         let f1 = f[2 * j + 1];
         let b0 = b[2 * j];
         let b1 = b[2 * j + 1];
-        let e0 = f0 * b0;
-        // (u_0 term, u_2 term, y term = f0·b0 + f1·b1).
-        (e0, (f0 + f1) * (b0 + b1), e0 + f1 * b1)
+        let e0 = f0.mul_unreduced(b0);
+        u_0 ^= e0;
+        u_2 ^= (f0 + f1).mul_unreduced(b0 + b1);
+        y ^= e0;
+        y ^= f1.mul_unreduced(b1);
+        (u_0, u_2, y)
     };
-    if half < PAR_THRESHOLD {
-        let (mut u_0, mut u_2, mut y) = (F128::ZERO, F128::ZERO, F128::ZERO);
-        for j in 0..half {
-            let (a0, a2, ay) = term(j);
-            u_0 += a0;
-            u_2 += a2;
-            y += ay;
-        }
-        return (SumcheckMessage { u_0, u_2 }, y);
-    }
-
-    let (u_0, u_2, y) = (0..half)
-        .into_par_iter()
-        .with_min_len(PAR_THRESHOLD / 4)
-        .map(term)
-        .reduce(
-            || (F128::ZERO, F128::ZERO, F128::ZERO),
-            |(a0, a2, ay), (b0, b2, by)| (a0 + b0, a2 + b2, ay + by),
-        );
-    (SumcheckMessage { u_0, u_2 }, y)
+    let zero = || {
+        (
+            F256Unreduced::ZERO,
+            F256Unreduced::ZERO,
+            F256Unreduced::ZERO,
+        )
+    };
+    let (u_0, u_2, y) = if half < PAR_THRESHOLD {
+        (0..half).fold(zero(), accumulate)
+    } else {
+        (0..half)
+            .into_par_iter()
+            .with_min_len(PAR_THRESHOLD / 4)
+            .fold(zero, accumulate)
+            .reduce(zero, |(a0, a2, ay), (b0, b2, by)| {
+                (a0 ^ b0, a2 ^ b2, ay ^ by)
+            })
+    };
+    (
+        SumcheckMessage {
+            u_0: u_0.reduce(),
+            u_2: u_2.reduce(),
+        },
+        y.reduce(),
+    )
 }
 
 /// Partially evaluate `evals` at LSB variable = `r`, in place. Halves length.
@@ -2601,19 +2622,26 @@ fn fold_and_msg_lsb(f: &[F128], b: &[F128], r: F128) -> (Vec<F128>, Vec<F128>, S
             nf.push(f[2 * j] * one_plus_r + f[2 * j + 1] * r);
             nb.push(b[2 * j] * one_plus_r + b[2 * j + 1] * r);
         }
-        let mut u_0 = F128::ZERO;
-        let mut u_2 = F128::ZERO;
+        let mut u_0 = F256Unreduced::ZERO;
+        let mut u_2 = F256Unreduced::ZERO;
         let mut k = 0;
         while k + 1 < half {
             let f0 = nf[k];
             let f1 = nf[k + 1];
             let b0 = nb[k];
             let b1 = nb[k + 1];
-            u_0 += f0 * b0;
-            u_2 += (f0 + f1) * (b0 + b1);
+            u_0 ^= f0.mul_unreduced(b0);
+            u_2 ^= (f0 + f1).mul_unreduced(b0 + b1);
             k += 2;
         }
-        return (nf, nb, SumcheckMessage { u_0, u_2 });
+        return (
+            nf,
+            nb,
+            SumcheckMessage {
+                u_0: u_0.reduce(),
+                u_2: u_2.reduce(),
+            },
+        );
     }
 
     // Parallel path: `half` is a power of two ≥ PAR_THRESHOLD and CHUNK is a
@@ -2642,8 +2670,8 @@ fn fold_and_msg_lsb(f: &[F128], b: &[F128], r: F128) -> (Vec<F128>, Vec<F128>, S
         .map(|(ci, (fc, bc))| {
             let base = ci * CHUNK;
             let len = fc.len();
-            let mut u0 = F128::ZERO;
-            let mut u2 = F128::ZERO;
+            let mut u0 = F256Unreduced::ZERO;
+            let mut u2 = F256Unreduced::ZERO;
             // Fold this slice, then pair up the just-folded values for the msg.
             crate::field::f128_slice::fold_pairs(f, base, fc, r);
             crate::field::f128_slice::fold_pairs(b, base, bc, r);
@@ -2653,17 +2681,24 @@ fn fold_and_msg_lsb(f: &[F128], b: &[F128], r: F128) -> (Vec<F128>, Vec<F128>, S
                 let f1 = fc[k + 1];
                 let b0 = bc[k];
                 let b1 = bc[k + 1];
-                u0 += f0 * b0;
-                u2 += (f0 + f1) * (b0 + b1);
+                u0 ^= f0.mul_unreduced(b0);
+                u2 ^= (f0 + f1).mul_unreduced(b0 + b1);
                 k += 2;
             }
             (u0, u2)
         })
         .reduce(
-            || (F128::ZERO, F128::ZERO),
-            |(a0, a2), (c0, c2)| (a0 + c0, a2 + c2),
+            || (F256Unreduced::ZERO, F256Unreduced::ZERO),
+            |(a0, a2), (c0, c2)| (a0 ^ c0, a2 ^ c2),
         );
-    (nf, nb, SumcheckMessage { u_0, u_2 })
+    (
+        nf,
+        nb,
+        SumcheckMessage {
+            u_0: u_0.reduce(),
+            u_2: u_2.reduce(),
+        },
+    )
 }
 
 pub struct SumcheckProver {

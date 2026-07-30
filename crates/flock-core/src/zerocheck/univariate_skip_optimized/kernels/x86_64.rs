@@ -140,8 +140,8 @@ pub(crate) unsafe fn shift_reduce_inner_ab_x86_avx512(
 }
 /// x86 AVX-512 convert-table fold for the two-bank C path. Table lookups stay
 /// scalar because their byte-selected addresses are irregular, while four
-/// lanes of each resulting F128 accumulator are multiplied by `eq_lo_val` in
-/// one VPCLMULQDQ batch before being XORed into the worker partials.
+/// lanes of each resulting F128 accumulator are widened by a three-CLMUL
+/// Karatsuba batch and XORed into the unreduced worker partials.
 #[cfg(all(
     target_arch = "x86_64",
     target_feature = "avx512f",
@@ -154,11 +154,11 @@ pub(crate) unsafe fn accumulate_convert_with_s_hat_v_x86_avx512(
     n_b_med: usize,
     convert: &[F128],
     eq_lo_val: F128,
-    partial_ab: &mut [F128; ELL],
-    partial_c_0: &mut [F128; ELL],
-    partial_c_1: &mut [F128; ELL],
+    partial_ab: &mut [crate::field::F256Unreduced; ELL],
+    partial_c_0: &mut [crate::field::F256Unreduced; ELL],
+    partial_c_1: &mut [crate::field::F256Unreduced; ELL],
 ) {
-    use crate::field::gf2_128::x86_64::{f128x4_set, ghash_mul_x4};
+    use crate::field::gf2_128::x86_64::f128x4_set;
     use core::arch::x86_64::*;
     debug_assert!(n_b_med <= 1 << N_MEDIUM);
     debug_assert_eq!(ELL % 4, 0);
@@ -168,6 +168,7 @@ pub(crate) unsafe fn accumulate_convert_with_s_hat_v_x86_avx512(
     // 16*256-entry table. The cfg gate supplies both required target features.
     unsafe {
         let eq = f128x4_set(eq_lo_val, eq_lo_val, eq_lo_val, eq_lo_val);
+        let eq_mix = _mm512_xor_si512(eq, _mm512_shuffle_epi32::<0x4e>(eq));
         for lane in (0..ELL).step_by(4) {
             let mut cf_ab = [F128::ZERO; 4];
             let mut cf_c_0 = [F128::ZERO; 4];
@@ -183,27 +184,34 @@ pub(crate) unsafe fn accumulate_convert_with_s_hat_v_x86_avx512(
                 }
             }
 
-            let scaled_ab = ghash_mul_x4(f128x4_set(cf_ab[0], cf_ab[1], cf_ab[2], cf_ab[3]), eq);
-            let scaled_c_0 =
-                ghash_mul_x4(f128x4_set(cf_c_0[0], cf_c_0[1], cf_c_0[2], cf_c_0[3]), eq);
-            let scaled_c_1 =
-                ghash_mul_x4(f128x4_set(cf_c_1[0], cf_c_1[1], cf_c_1[2], cf_c_1[3]), eq);
-
-            let ab_ptr = partial_ab.as_mut_ptr().add(lane) as *mut __m512i;
-            let c0_ptr = partial_c_0.as_mut_ptr().add(lane) as *mut __m512i;
-            let c1_ptr = partial_c_1.as_mut_ptr().add(lane) as *mut __m512i;
-            _mm512_storeu_si512(
-                ab_ptr,
-                _mm512_xor_si512(_mm512_loadu_si512(ab_ptr), scaled_ab),
-            );
-            _mm512_storeu_si512(
-                c0_ptr,
-                _mm512_xor_si512(_mm512_loadu_si512(c0_ptr), scaled_c_0),
-            );
-            _mm512_storeu_si512(
-                c1_ptr,
-                _mm512_xor_si512(_mm512_loadu_si512(c1_ptr), scaled_c_1),
-            );
+            macro_rules! accumulate_wide {
+                ($values:ident, $partials:ident) => {{
+                    let x = f128x4_set($values[0], $values[1], $values[2], $values[3]);
+                    let lo = _mm512_clmulepi64_epi128::<0x00>(x, eq);
+                    let hi = _mm512_clmulepi64_epi128::<0x11>(x, eq);
+                    let x_mix = _mm512_xor_si512(x, _mm512_shuffle_epi32::<0x4e>(x));
+                    let mid = _mm512_xor_si512(
+                        _mm512_clmulepi64_epi128::<0x00>(x_mix, eq_mix),
+                        _mm512_xor_si512(lo, hi),
+                    );
+                    let mut lo_words = [0u64; 8];
+                    let mut hi_words = [0u64; 8];
+                    let mut mid_words = [0u64; 8];
+                    _mm512_storeu_si512(lo_words.as_mut_ptr().cast(), lo);
+                    _mm512_storeu_si512(hi_words.as_mut_ptr().cast(), hi);
+                    _mm512_storeu_si512(mid_words.as_mut_ptr().cast(), mid);
+                    for j in 0..4 {
+                        let partial = &mut $partials[lane + j];
+                        partial.r0 ^= lo_words[2 * j];
+                        partial.r1 ^= lo_words[2 * j + 1] ^ mid_words[2 * j];
+                        partial.r2 ^= hi_words[2 * j] ^ mid_words[2 * j + 1];
+                        partial.r3 ^= hi_words[2 * j + 1];
+                    }
+                }};
+            }
+            accumulate_wide!(cf_ab, partial_ab);
+            accumulate_wide!(cf_c_0, partial_c_0);
+            accumulate_wide!(cf_c_1, partial_c_1);
         }
     }
 }

@@ -1,5 +1,14 @@
 #[cfg(not(target_arch = "aarch64"))]
 use super::super::F128;
+#[cfg(not(any(
+    target_arch = "aarch64",
+    all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
+    )
+)))]
+use super::super::F256Unreduced;
 use super::super::{F8, InvNttTableByteSingleGf8, N_CHUNKS};
 use crate::field::gf2_8::gf8_reduce;
 
@@ -90,9 +99,9 @@ pub(super) fn accumulate_convert_with_s_hat_v(
     n_b_med: usize,
     convert: &[F128],
     eq_lo_val: F128,
-    partial_ab: &mut [F128; 64],
-    partial_c_0: &mut [F128; 64],
-    partial_c_1: &mut [F128; 64],
+    partial_ab: &mut [F256Unreduced; 64],
+    partial_c_0: &mut [F256Unreduced; 64],
+    partial_c_1: &mut [F256Unreduced; 64],
 ) {
     for lane in 0..64 {
         let mut converted_ab = F128::ZERO;
@@ -105,8 +114,8 @@ pub(super) fn accumulate_convert_with_s_hat_v(
             converted_c_0 += convert[table_base + (c & 0x55)];
             converted_c_1 += convert[table_base + (c & 0xaa)];
         }
-        partial_ab[lane] += converted_ab * eq_lo_val;
-        partial_c_0[lane] += converted_c_0 * eq_lo_val;
-        partial_c_1[lane] += converted_c_1 * eq_lo_val;
+        partial_ab[lane] ^= converted_ab.mul_unreduced(eq_lo_val);
+        partial_c_0[lane] ^= converted_c_0.mul_unreduced(eq_lo_val);
+        partial_c_1[lane] ^= converted_c_1.mul_unreduced(eq_lo_val);
     }
 }

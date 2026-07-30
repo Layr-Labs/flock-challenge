@@ -166,8 +166,8 @@ pub unsafe fn ghash_mul_karatsuba_barrett(a: F128, b: F128) -> F128 {
     }
 }
 
-/// 256-bit unreduced schoolbook product, for XOR-accumulation then one
-/// deferred `reduce()`. Port of `aarch64::ghash_mul_unreduced_neon`.
+/// 256-bit unreduced three-CLMUL Karatsuba product, for XOR-accumulation then
+/// one deferred `reduce()`. Port of `aarch64::ghash_mul_unreduced_neon`.
 ///
 /// # Safety
 /// Requires `pclmulqdq` and `sse4.1`, as declared by the target-feature
@@ -177,11 +177,10 @@ pub unsafe fn ghash_mul_unreduced_x86(a: F128, b: F128) -> F256Unreduced {
     // SAFETY: function carries the required target features.
     unsafe {
         let p_ll = pmull(a.lo, b.lo);
-        let p_lh = pmull(a.lo, b.hi);
-        let p_hl = pmull(a.hi, b.lo);
         let p_hh = pmull(a.hi, b.hi);
+        let p_mix = pmull(a.lo ^ a.hi, b.lo ^ b.hi);
 
-        let cross = _mm_xor_si128(p_lh, p_hl);
+        let cross = _mm_xor_si128(_mm_xor_si128(p_mix, p_ll), p_hh);
         let cr_lo = lane0(cross);
         let cr_hi = lane1(cross);
 

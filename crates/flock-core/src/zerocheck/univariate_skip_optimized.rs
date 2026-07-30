@@ -32,7 +32,7 @@
 
 use std::sync::OnceLock;
 
-use crate::field::{F8, F128, PHI_8_TABLE, mul_by_x, phi8};
+use crate::field::{F8, F128, F256Unreduced, PHI_8_TABLE, mul_by_x, phi8};
 use crate::ntt::InvNttTableByteSingleGf8;
 
 use super::PaddingSpec;
@@ -465,9 +465,9 @@ fn process_one_x_hi(
 /// Identical to [`WorkerState`] except `partial_c` and `local_res_c_s` are
 /// split into bank 0 / bank 1.
 struct WorkerStateWithSHatV {
-    partial_ab: [F128; ELL],
-    partial_c_0: [F128; ELL],
-    partial_c_1: [F128; ELL],
+    partial_ab: [F256Unreduced; ELL],
+    partial_c_0: [F256Unreduced; ELL],
+    partial_c_1: [F256Unreduced; ELL],
     chunk_ab_bytes: [[u8; 64]; 1 << N_MEDIUM],
     chunk_c_bytes: [[u8; 64]; 1 << N_MEDIUM],
     a_col: [F8; ELL],
@@ -480,9 +480,9 @@ struct WorkerStateWithSHatV {
 impl WorkerStateWithSHatV {
     fn new() -> Self {
         Self {
-            partial_ab: [F128::ZERO; ELL],
-            partial_c_0: [F128::ZERO; ELL],
-            partial_c_1: [F128::ZERO; ELL],
+            partial_ab: [F256Unreduced::ZERO; ELL],
+            partial_c_0: [F256Unreduced::ZERO; ELL],
+            partial_c_1: [F256Unreduced::ZERO; ELL],
             chunk_ab_bytes: [[0u8; 64]; 1 << N_MEDIUM],
             chunk_c_bytes: [[0u8; 64]; 1 << N_MEDIUM],
             a_col: [F8::ZERO; ELL],
@@ -514,9 +514,18 @@ fn process_one_x_hi_with_s_hat_v(
     convert: &[F128],
     state: &mut WorkerStateWithSHatV,
 ) {
-    state.partial_ab.iter_mut().for_each(|p| *p = F128::ZERO);
-    state.partial_c_0.iter_mut().for_each(|p| *p = F128::ZERO);
-    state.partial_c_1.iter_mut().for_each(|p| *p = F128::ZERO);
+    state
+        .partial_ab
+        .iter_mut()
+        .for_each(|p| *p = F256Unreduced::ZERO);
+    state
+        .partial_c_0
+        .iter_mut()
+        .for_each(|p| *p = F256Unreduced::ZERO);
+    state
+        .partial_c_1
+        .iter_mut()
+        .for_each(|p| *p = F256Unreduced::ZERO);
 
     let n_lo = n_lo_and_inner - N_INNER;
 
@@ -592,11 +601,13 @@ fn process_one_x_hi_with_s_hat_v(
         }
     }
 
-    // Outer fold by eq_hi (per bank).
+    // Reduce each inner dot product once, then perform the outer eq_hi fold.
+    // This replaces one field reduction per x_outer_lo product with one per
+    // lane and bank; reduction is F2-linear, so the result is identical.
     for lane in 0..ELL {
-        state.local_res_ab[lane] += eq_hi_val * state.partial_ab[lane];
-        state.local_res_c_s_0[lane] += eq_hi_val * state.partial_c_0[lane];
-        state.local_res_c_s_1[lane] += eq_hi_val * state.partial_c_1[lane];
+        state.local_res_ab[lane] += eq_hi_val * state.partial_ab[lane].reduce();
+        state.local_res_c_s_0[lane] += eq_hi_val * state.partial_c_0[lane].reduce();
+        state.local_res_c_s_1[lane] += eq_hi_val * state.partial_c_1[lane].reduce();
     }
 }
 
