@@ -128,6 +128,105 @@ pub(crate) unsafe fn accumulate_convert_with_s_hat_v(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
+#[inline(always)]
+pub(crate) unsafe fn accumulate_convert_with_linear_b_med_and_s_hat_v(
+    chunk_ab_bytes: &[[u8; 64]; 16],
+    chunk_c_bytes: &[[u8; 64]; 16],
+    n_b_med: usize,
+    linear_b_med_mask: u16,
+    convert: &[F128],
+    eq_lo_val: F128,
+    partial_ab: &mut [F128; 64],
+    partial_ab_linear_s: &mut [F128; 64],
+    partial_c_0: &mut [F128; 64],
+    partial_c_1: &mut [F128; 64],
+) {
+    use core::arch::aarch64::*;
+
+    // SAFETY: caller guarantees fixed input sizes and aarch64 provides NEON.
+    unsafe {
+        let convert_ptr = convert.as_ptr() as *const u8;
+        for lane in (0..64).step_by(4) {
+            let mut ab0 = vdupq_n_u8(0);
+            let mut ab1 = vdupq_n_u8(0);
+            let mut ab2 = vdupq_n_u8(0);
+            let mut ab3 = vdupq_n_u8(0);
+            let mut linear0 = vdupq_n_u8(0);
+            let mut linear1 = vdupq_n_u8(0);
+            let mut linear2 = vdupq_n_u8(0);
+            let mut linear3 = vdupq_n_u8(0);
+            let mut c00 = vdupq_n_u8(0);
+            let mut c01 = vdupq_n_u8(0);
+            let mut c02 = vdupq_n_u8(0);
+            let mut c03 = vdupq_n_u8(0);
+            let mut c10 = vdupq_n_u8(0);
+            let mut c11 = vdupq_n_u8(0);
+            let mut c12 = vdupq_n_u8(0);
+            let mut c13 = vdupq_n_u8(0);
+            for b_med in 0..n_b_med {
+                let table = convert_ptr.add(b_med * 256 * 16);
+                let c0 = chunk_c_bytes[b_med][lane] as usize;
+                let c1 = chunk_c_bytes[b_med][lane + 1] as usize;
+                let c2 = chunk_c_bytes[b_med][lane + 2] as usize;
+                let c3 = chunk_c_bytes[b_med][lane + 3] as usize;
+                if linear_b_med_mask & (1 << b_med) != 0 {
+                    linear0 = veorq_u8(linear0, vld1q_u8(table.add(c0 * 16)));
+                    linear1 = veorq_u8(linear1, vld1q_u8(table.add(c1 * 16)));
+                    linear2 = veorq_u8(linear2, vld1q_u8(table.add(c2 * 16)));
+                    linear3 = veorq_u8(linear3, vld1q_u8(table.add(c3 * 16)));
+                } else {
+                    let a0 = chunk_ab_bytes[b_med][lane] as usize;
+                    let a1 = chunk_ab_bytes[b_med][lane + 1] as usize;
+                    let a2 = chunk_ab_bytes[b_med][lane + 2] as usize;
+                    let a3 = chunk_ab_bytes[b_med][lane + 3] as usize;
+                    ab0 = veorq_u8(ab0, vld1q_u8(table.add(a0 * 16)));
+                    ab1 = veorq_u8(ab1, vld1q_u8(table.add(a1 * 16)));
+                    ab2 = veorq_u8(ab2, vld1q_u8(table.add(a2 * 16)));
+                    ab3 = veorq_u8(ab3, vld1q_u8(table.add(a3 * 16)));
+                }
+                c00 = veorq_u8(c00, vld1q_u8(table.add((c0 & 0x55) * 16)));
+                c01 = veorq_u8(c01, vld1q_u8(table.add((c1 & 0x55) * 16)));
+                c02 = veorq_u8(c02, vld1q_u8(table.add((c2 & 0x55) * 16)));
+                c03 = veorq_u8(c03, vld1q_u8(table.add((c3 & 0x55) * 16)));
+                c10 = veorq_u8(c10, vld1q_u8(table.add((c0 & 0xaa) * 16)));
+                c11 = veorq_u8(c11, vld1q_u8(table.add((c1 & 0xaa) * 16)));
+                c12 = veorq_u8(c12, vld1q_u8(table.add((c2 & 0xaa) * 16)));
+                c13 = veorq_u8(c13, vld1q_u8(table.add((c3 & 0xaa) * 16)));
+            }
+
+            macro_rules! drain_lane {
+                ($offset:literal, $ab:ident, $linear:ident, $c0:ident, $c1:ident) => {{
+                    let ab = vreinterpretq_u64_u8($ab);
+                    let linear = vreinterpretq_u64_u8($linear);
+                    let c0 = vreinterpretq_u64_u8($c0);
+                    let c1 = vreinterpretq_u64_u8($c1);
+                    partial_ab[lane + $offset] += F128 {
+                        lo: vgetq_lane_u64::<0>(ab),
+                        hi: vgetq_lane_u64::<1>(ab),
+                    } * eq_lo_val;
+                    partial_ab_linear_s[lane + $offset] += F128 {
+                        lo: vgetq_lane_u64::<0>(linear),
+                        hi: vgetq_lane_u64::<1>(linear),
+                    } * eq_lo_val;
+                    partial_c_0[lane + $offset] += F128 {
+                        lo: vgetq_lane_u64::<0>(c0),
+                        hi: vgetq_lane_u64::<1>(c0),
+                    } * eq_lo_val;
+                    partial_c_1[lane + $offset] += F128 {
+                        lo: vgetq_lane_u64::<0>(c1),
+                        hi: vgetq_lane_u64::<1>(c1),
+                    } * eq_lo_val;
+                }};
+            }
+            drain_lane!(0, ab0, linear0, c00, c10);
+            drain_lane!(1, ab1, linear1, c01, c11);
+            drain_lane!(2, ab2, linear2, c02, c12);
+            drain_lane!(3, ab3, linear3, c03, c13);
+        }
+    }
+}
+
 /// NEON 64-byte bit-transpose. Two-stage:
 ///   1. `vqtbl4q_u8` reorders the 64 input bytes so each 8-byte group within
 ///      the output is one byte-chunk's worth of `x_small=0..8` bytes.
