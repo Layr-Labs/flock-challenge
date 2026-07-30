@@ -118,10 +118,11 @@ unsafe fn fold_row_q(
     use core::arch::aarch64::*;
     unsafe {
         const STRIDE: usize = 256 * 16;
-        let mut acc = vreinterpretq_u64_u8(vld1q_u8(table_data.add((*bytes_ptr) as usize * 16)));
+        let indices = u64::from_le(bytes_ptr.cast::<u64>().read_unaligned());
+        let mut acc = vreinterpretq_u64_u8(vld1q_u8(table_data.add((indices as u8) as usize * 16)));
         for chunk in 1..8 {
             let entry = table_data.add(
-                chunk * STRIDE + (*bytes_ptr.add(chunk)) as usize * core::mem::size_of::<F128>(),
+                chunk * STRIDE + ((indices >> (chunk * 8)) as u8) as usize * core::mem::size_of::<F128>(),
             );
             acc = veorq_u64(acc, vreinterpretq_u64_u8(vld1q_u8(entry)));
         }
@@ -208,34 +209,35 @@ pub(crate) unsafe fn fold_one_row_neon_unchecked_8(
     use core::arch::aarch64::*;
     unsafe {
         const STRIDE: usize = 256 * 16;
-        let mut acc = vld1q_u8(table_data.add((*bytes_ptr) as usize * 16));
+        let indices = u64::from_le(bytes_ptr.cast::<u64>().read_unaligned());
+        let mut acc = vld1q_u8(table_data.add((indices as u8) as usize * 16));
         acc = veorq_u8(
             acc,
-            vld1q_u8(table_data.add(1 * STRIDE + (*bytes_ptr.add(1)) as usize * 16)),
+            vld1q_u8(table_data.add(1 * STRIDE + ((indices >> 8) as u8) as usize * 16)),
         );
         acc = veorq_u8(
             acc,
-            vld1q_u8(table_data.add(2 * STRIDE + (*bytes_ptr.add(2)) as usize * 16)),
+            vld1q_u8(table_data.add(2 * STRIDE + ((indices >> 16) as u8) as usize * 16)),
         );
         acc = veorq_u8(
             acc,
-            vld1q_u8(table_data.add(3 * STRIDE + (*bytes_ptr.add(3)) as usize * 16)),
+            vld1q_u8(table_data.add(3 * STRIDE + ((indices >> 24) as u8) as usize * 16)),
         );
         acc = veorq_u8(
             acc,
-            vld1q_u8(table_data.add(4 * STRIDE + (*bytes_ptr.add(4)) as usize * 16)),
+            vld1q_u8(table_data.add(4 * STRIDE + ((indices >> 32) as u8) as usize * 16)),
         );
         acc = veorq_u8(
             acc,
-            vld1q_u8(table_data.add(5 * STRIDE + (*bytes_ptr.add(5)) as usize * 16)),
+            vld1q_u8(table_data.add(5 * STRIDE + ((indices >> 40) as u8) as usize * 16)),
         );
         acc = veorq_u8(
             acc,
-            vld1q_u8(table_data.add(6 * STRIDE + (*bytes_ptr.add(6)) as usize * 16)),
+            vld1q_u8(table_data.add(6 * STRIDE + ((indices >> 48) as u8) as usize * 16)),
         );
         acc = veorq_u8(
             acc,
-            vld1q_u8(table_data.add(7 * STRIDE + (*bytes_ptr.add(7)) as usize * 16)),
+            vld1q_u8(table_data.add(7 * STRIDE + (indices >> 56) as usize * 16)),
         );
         let acc_u64 = vreinterpretq_u64_u8(acc);
         F128 {
