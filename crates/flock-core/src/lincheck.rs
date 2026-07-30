@@ -131,6 +131,7 @@ pub use kernels::partial_fold_packed_z_x86_tiled_padded;
 pub use kernels::{
     partial_fold_packed_z_neon_iblock_padded, partial_fold_packed_z_neon_oblock_padded,
     partial_fold_packed_z_neon_single, partial_fold_packed_z_neon_single_padded,
+    partial_fold_rowmajor_neon_oblock_padded,
 };
 
 /// Bench-only A/B toggle: when set, [`partial_fold_packed_z_best`] uses the legacy
@@ -249,32 +250,73 @@ impl<'a> LincheckCircuit for SparseMatrixCircuit<'a> {
 pub struct CscCircuit {
     n_cols: usize,
     a_col_ptr: Vec<u32>,
-    a_rows: Vec<u32>,
     b_col_ptr: Vec<u32>,
-    b_rows: Vec<u32>,
+    rows: CscRows,
     /// Constant-wire pin column (see [`LincheckCircuit::const_pin_col`]).
     const_pin: Option<usize>,
 }
 
+/// Row indices use the narrowest lossless representation. Both matrices have
+/// the same row count, so selecting one shared variant also keeps the
+/// `fold_alpha_batched` hot loop monomorphic after a single outer match.
+#[derive(Clone)]
+enum CscRows {
+    U16 { a: Vec<u16>, b: Vec<u16> },
+    U32 { a: Vec<u32>, b: Vec<u32> },
+}
+
+trait CscRowIndex: Copy + Send + Sync {
+    fn from_usize(value: usize) -> Self;
+    fn to_usize(self) -> usize;
+}
+
+impl CscRowIndex for u16 {
+    #[inline(always)]
+    fn from_usize(value: usize) -> Self {
+        u16::try_from(value).expect("CSC row index exceeds u16")
+    }
+
+    #[inline(always)]
+    fn to_usize(self) -> usize {
+        self as usize
+    }
+}
+
+impl CscRowIndex for u32 {
+    #[inline(always)]
+    fn from_usize(value: usize) -> Self {
+        u32::try_from(value).expect("CSC row index exceeds u32")
+    }
+
+    #[inline(always)]
+    fn to_usize(self) -> usize {
+        self as usize
+    }
+}
+
 /// Flatten one sparse matrix into CSC arrays: rows with a 1 in column `c` are
 /// `rows_flat[col_ptr[c] as usize .. col_ptr[c+1] as usize]`.
-fn csc_from_rows(m: &SparseBinaryMatrix) -> (Vec<u32>, Vec<u32>) {
+fn csc_from_rows<I: CscRowIndex + Default>(m: &SparseBinaryMatrix) -> (Vec<u32>, Vec<I>) {
     assert!(m.num_rows <= u32::MAX as usize);
     assert!(m.num_cols <= u32::MAX as usize);
     let mut col_ptr = vec![0u32; m.num_cols + 1];
     for row in &m.rows {
         for &c in row {
-            col_ptr[c + 1] += 1;
+            col_ptr[c + 1] = col_ptr[c + 1]
+                .checked_add(1)
+                .expect("CSC nonzero count exceeds u32");
         }
     }
     for c in 0..m.num_cols {
-        col_ptr[c + 1] += col_ptr[c];
+        col_ptr[c + 1] = col_ptr[c + 1]
+            .checked_add(col_ptr[c])
+            .expect("CSC nonzero count exceeds u32");
     }
     let mut next = col_ptr.clone();
-    let mut rows_flat = vec![0u32; *col_ptr.last().unwrap() as usize];
+    let mut rows_flat = vec![I::default(); *col_ptr.last().unwrap() as usize];
     for (r, row) in m.rows.iter().enumerate() {
         for &c in row {
-            rows_flat[next[c] as usize] = r as u32;
+            rows_flat[next[c] as usize] = I::from_usize(r);
             next[c] += 1;
         }
     }
@@ -286,9 +328,25 @@ impl std::fmt::Debug for CscCircuit {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("CscCircuit")
             .field("n_cols", &self.n_cols)
-            .field("nnz_a", &self.a_rows.len())
-            .field("nnz_b", &self.b_rows.len())
+            .field("nnz_a", &self.rows.a_len())
+            .field("nnz_b", &self.rows.b_len())
             .finish()
+    }
+}
+
+impl CscRows {
+    fn a_len(&self) -> usize {
+        match self {
+            Self::U16 { a, .. } => a.len(),
+            Self::U32 { a, .. } => a.len(),
+        }
+    }
+
+    fn b_len(&self) -> usize {
+        match self {
+            Self::U16 { b, .. } => b.len(),
+            Self::U32 { b, .. } => b.len(),
+        }
     }
 }
 
@@ -296,14 +354,26 @@ impl CscCircuit {
     pub fn from_matrices(a_0: &SparseBinaryMatrix, b_0: &SparseBinaryMatrix) -> Self {
         assert_eq!(a_0.num_rows, b_0.num_rows);
         assert_eq!(a_0.num_cols, b_0.num_cols);
-        let (a_col_ptr, a_rows) = csc_from_rows(a_0);
-        let (b_col_ptr, b_rows) = csc_from_rows(b_0);
+        assert_eq!(a_0.num_rows, a_0.rows.len());
+        assert_eq!(b_0.num_rows, b_0.rows.len());
+        assert!(
+            a_0.num_rows <= a_0.num_cols,
+            "lincheck row indices must fit the inner equality table"
+        );
+        let (a_col_ptr, b_col_ptr, rows) = if a_0.num_rows <= u16::MAX as usize + 1 {
+            let (a_col_ptr, a) = csc_from_rows::<u16>(a_0);
+            let (b_col_ptr, b) = csc_from_rows::<u16>(b_0);
+            (a_col_ptr, b_col_ptr, CscRows::U16 { a, b })
+        } else {
+            let (a_col_ptr, a) = csc_from_rows::<u32>(a_0);
+            let (b_col_ptr, b) = csc_from_rows::<u32>(b_0);
+            (a_col_ptr, b_col_ptr, CscRows::U32 { a, b })
+        };
         Self {
             n_cols: a_0.num_cols,
             a_col_ptr,
-            a_rows,
             b_col_ptr,
-            b_rows,
+            rows,
             const_pin: None,
         }
     }
@@ -313,26 +383,27 @@ impl CscCircuit {
         self.const_pin = const_pin;
         self
     }
-}
 
-impl LincheckCircuit for CscCircuit {
-    fn n_cols(&self) -> usize {
-        self.n_cols
-    }
-    fn const_pin_col(&self) -> Option<usize> {
-        self.const_pin
-    }
-    fn fold_alpha_batched(&self, alpha: F128, eq_inner: &[F128]) -> Vec<F128> {
+    fn fold_typed<I: CscRowIndex>(
+        &self,
+        alpha: F128,
+        eq_inner: &[F128],
+        a_rows: &[I],
+        b_rows: &[I],
+    ) -> Vec<F128> {
         use rayon::prelude::*;
-        assert_eq!(eq_inner.len(), self.n_cols);
         let one_col = |c: usize| {
             let mut sa = F128::ZERO;
-            for &r in &self.a_rows[self.a_col_ptr[c] as usize..self.a_col_ptr[c + 1] as usize] {
-                sa += eq_inner[r as usize];
+            for &r in &a_rows[self.a_col_ptr[c] as usize..self.a_col_ptr[c + 1] as usize] {
+                // `from_matrices` requires `num_rows <= num_cols` and records
+                // only enumerated row indices, while the caller asserted
+                // `eq_inner.len() == n_cols`.
+                sa += unsafe { *eq_inner.get_unchecked(r.to_usize()) };
             }
             let mut sb = F128::ZERO;
-            for &r in &self.b_rows[self.b_col_ptr[c] as usize..self.b_col_ptr[c + 1] as usize] {
-                sb += eq_inner[r as usize];
+            for &r in &b_rows[self.b_col_ptr[c] as usize..self.b_col_ptr[c + 1] as usize] {
+                // Same construction invariant as the A rows above.
+                sb += unsafe { *eq_inner.get_unchecked(r.to_usize()) };
             }
             alpha * sa + sb
         };
@@ -344,6 +415,22 @@ impl LincheckCircuit for CscCircuit {
             .enumerate()
             .for_each(|(c, slot)| *slot = one_col(c));
         out
+    }
+}
+
+impl LincheckCircuit for CscCircuit {
+    fn n_cols(&self) -> usize {
+        self.n_cols
+    }
+    fn const_pin_col(&self) -> Option<usize> {
+        self.const_pin
+    }
+    fn fold_alpha_batched(&self, alpha: F128, eq_inner: &[F128]) -> Vec<F128> {
+        assert_eq!(eq_inner.len(), self.n_cols);
+        match &self.rows {
+            CscRows::U16 { a, b } => self.fold_typed(alpha, eq_inner, a, b),
+            CscRows::U32 { a, b } => self.fold_typed(alpha, eq_inner, a, b),
+        }
     }
 }
 
@@ -612,6 +699,70 @@ pub fn partial_fold_packed_z_fast(
 ) -> Vec<F128> {
     let k = 1usize << k_log;
     partial_fold_packed_z_fast_padded(z_packed, m, k_log, k, eq_outer)
+}
+
+/// Partial-fold a canonical row-major F128-packed witness directly, avoiding
+/// the full-size lincheck byte-stripe allocation.
+///
+/// This has the same mathematical output as [`partial_fold_packed_z`]. The
+/// stripe representation is only an optimization for batching eight Boolean
+/// outer rows; it is not transcript data. On AArch64 the production path
+/// transposes one 64-row tile at a time into a 512-byte scratch buffer and
+/// immediately consumes it. The portable fallback uses the same delayed
+/// transpose one stripe at a time.
+pub fn partial_fold_rowmajor_padded(
+    z_packed: &[F128],
+    m: usize,
+    k_log: usize,
+    useful_bits: usize,
+    eq_outer: &[F128],
+) -> Vec<F128> {
+    let n_log = m - k_log;
+    let k = 1usize << k_log;
+    let n_outer = 1usize << n_log;
+    assert_eq!(z_packed.len(), (1usize << m) / 128);
+    assert_eq!(eq_outer.len(), n_outer);
+    assert!(n_log >= 3, "need at least eight outer rows");
+    assert!(useful_bits <= k);
+
+    #[cfg(target_arch = "aarch64")]
+    if n_log_ok_for_tile(m, k_log, NEON_TILE_T) && k_log >= 6 {
+        return partial_fold_rowmajor_neon_oblock_padded(z_packed, m, k_log, useful_bits, eq_outer);
+    }
+
+    use crate::bits::transpose_8_u64s_to_64_bytes;
+    let z_words: &[u64] =
+        unsafe { std::slice::from_raw_parts(z_packed.as_ptr().cast::<u64>(), z_packed.len() * 2) };
+    let mut out = vec![F128::ZERO; k];
+    let mut table = vec![F128::ZERO; 256];
+    let mut stripe = [0u8; 64];
+    for outer_base in (0..n_outer).step_by(8) {
+        build_sum_table(&eq_outer[outer_base..outer_base + 8], &mut table);
+        for word in 0..useful_bits.div_ceil(64) {
+            let lanes: [u64; 8] = std::array::from_fn(|lane| {
+                // A row is u64-aligned in the production geometry (`k >= 64`),
+                // but tiny portable test geometries may pack several rows into
+                // one word. Load a 64-bit window at the actual row bit offset
+                // so this fallback remains correct for every power-of-two `k`.
+                let bit_offset = (outer_base + lane) * k + word * 64;
+                let word_index = bit_offset / 64;
+                let shift = bit_offset % 64;
+                let low = z_words[word_index] >> shift;
+                if shift == 0 {
+                    low
+                } else {
+                    low | (z_words.get(word_index + 1).copied().unwrap_or(0) << (64 - shift))
+                }
+            });
+            transpose_8_u64s_to_64_bytes(&lanes, &mut stripe);
+            let inner_base = word * 64;
+            let take = useful_bits.saturating_sub(inner_base).min(64);
+            for i in 0..take {
+                out[inner_base + i] += table[stripe[i] as usize];
+            }
+        }
+    }
+    out
 }
 
 /// Padding-aware variant of [`partial_fold_packed_z_fast`]. Skips rows
@@ -1167,7 +1318,7 @@ pub fn prove_padded<Ch: Challenger>(
     challenger: &mut Ch,
 ) -> (LincheckProof, LincheckClaim) {
     let (proof, claim, _) = prove_padded_inner(
-        z_packed,
+        PartialFoldSource::Stripe(z_packed),
         m,
         k_log,
         k_skip,
@@ -1200,7 +1351,7 @@ pub fn prove_padded_capture_z_vec<Ch: Challenger>(
     challenger: &mut Ch,
 ) -> (LincheckProof, LincheckClaim, Vec<F128>) {
     let (proof, claim, captured) = prove_padded_inner(
-        z_packed,
+        PartialFoldSource::Stripe(z_packed),
         m,
         k_log,
         k_skip,
@@ -1217,9 +1368,46 @@ pub fn prove_padded_capture_z_vec<Ch: Challenger>(
     )
 }
 
+/// Row-major sibling of [`prove_padded_capture_z_vec`]. It derives the same
+/// lincheck vector directly from the canonical committed witness and avoids
+/// materializing the witness-sized byte stripe.
+pub fn prove_padded_capture_z_vec_rowmajor<Ch: Challenger>(
+    z_packed: &[F128],
+    m: usize,
+    k_log: usize,
+    k_skip: usize,
+    useful_bits: usize,
+    circuit: &dyn LincheckCircuit,
+    x_ab: &QuirkyPoint,
+    challenger: &mut Ch,
+) -> (LincheckProof, LincheckClaim, Vec<F128>) {
+    let (proof, claim, captured) = prove_padded_inner(
+        PartialFoldSource::RowMajor(z_packed),
+        m,
+        k_log,
+        k_skip,
+        useful_bits,
+        circuit,
+        x_ab,
+        true,
+        challenger,
+    );
+    (
+        proof,
+        claim,
+        captured.expect("capture=true must produce z_vec"),
+    )
+}
+
+#[derive(Clone, Copy)]
+enum PartialFoldSource<'a> {
+    Stripe(&'a [u8]),
+    RowMajor(&'a [F128]),
+}
+
 #[allow(clippy::too_many_arguments)]
 fn prove_padded_inner<Ch: Challenger>(
-    z_packed: &[u8],
+    z_source: PartialFoldSource<'_>,
     m: usize,
     k_log: usize,
     k_skip: usize,
@@ -1294,7 +1482,14 @@ fn prove_padded_inner<Ch: Challenger>(
         None
     };
     let eq_x_outer = build_eq_table(&x_ab.x_outer);
-    let mut z_vec = partial_fold_packed_z_best(z_packed, m, k_log, useful_bits, &eq_x_outer);
+    let mut z_vec = match z_source {
+        PartialFoldSource::Stripe(z_packed) => {
+            partial_fold_packed_z_best(z_packed, m, k_log, useful_bits, &eq_x_outer)
+        }
+        PartialFoldSource::RowMajor(z_packed) => {
+            partial_fold_rowmajor_padded(z_packed, m, k_log, useful_bits, &eq_x_outer)
+        }
+    };
     if let Some(t) = t {
         eprintln!(
             "[lc] {:<26} {:>7.2} ms",
@@ -1618,6 +1813,37 @@ mod tests {
         }
     }
 
+    #[test]
+    fn csc_row_width_boundary_and_fallback_match_sparse() {
+        for &(n_rows, expect_u16) in &[(u16::MAX as usize + 1, true), (1 << 16 | 1, false)] {
+            let mut a_rows = vec![Vec::new(); n_rows];
+            let mut b_rows = vec![Vec::new(); n_rows];
+            a_rows[0].push(0);
+            a_rows[n_rows - 1].push(0);
+            b_rows[n_rows - 1].push(1);
+            let a = SparseBinaryMatrix {
+                num_rows: n_rows,
+                num_cols: n_rows,
+                rows: a_rows,
+            };
+            let b = SparseBinaryMatrix {
+                num_rows: n_rows,
+                num_cols: n_rows,
+                rows: b_rows,
+            };
+            let csc = CscCircuit::from_matrices(&a, &b);
+            assert_eq!(matches!(csc.rows, CscRows::U16 { .. }), expect_u16);
+
+            let alpha = F128 { lo: 3, hi: 5 };
+            let last = F128 { lo: 7, hi: 11 };
+            let mut eq = vec![F128::ZERO; n_rows];
+            eq[0] = F128::ONE;
+            eq[n_rows - 1] = last;
+            let expected = sparse_row_fold_alpha_batched(alpha, &a, &b, &eq);
+            assert_eq!(csc.fold_alpha_batched(alpha, &eq), expected);
+        }
+    }
+
     /// "Quirky MLE evaluation" of a Boolean vector `f` at a quirky point.
     ///
     /// `ã(z_skip, x_inner_rest, x_outer) = Σ_i  f[i] · L_{i_skip}(z_skip)
@@ -1808,6 +2034,46 @@ mod tests {
             let serial = partial_fold_packed_z(&z_packed, m, k_log, &eq);
             let fast = partial_fold_packed_z_fast(&z_packed, m, k_log, &eq);
             assert_eq!(serial, fast, "at m={m}, k_log={k_log}");
+        }
+    }
+
+    /// Delayed row-major transposition is exactly equivalent to consuming the
+    /// materialized lincheck stripe, including a non-byte-aligned useful tail.
+    #[test]
+    fn partial_fold_rowmajor_matches_stripe() {
+        for &(m, k_log, useful_bits) in &[
+            (10usize, 5usize, 29usize),
+            (16usize, 8usize, 253usize),
+            (20, 14, 15_409),
+        ] {
+            let mut rng = Rng::new(0x51EA_0000 + m as u64);
+            let k = 1usize << k_log;
+            let n_outer = 1usize << (m - k_log);
+            let mut z = rng.bits(1usize << m);
+            for outer in 0..n_outer {
+                z[outer * k + useful_bits..(outer + 1) * k].fill(false);
+            }
+
+            let stripe = pack_z_lincheck(&z, m, k_log);
+            let mut rowmajor = vec![F128::ZERO; (1usize << m) / 128];
+            for (bit, is_set) in z.iter().copied().enumerate() {
+                if is_set {
+                    let word = &mut rowmajor[bit / 128];
+                    let local = bit % 128;
+                    if local < 64 {
+                        word.lo |= 1u64 << local;
+                    } else {
+                        word.hi |= 1u64 << (local - 64);
+                    }
+                }
+            }
+
+            let point = rng.f128_vec(m - k_log);
+            let eq_outer = build_eq_table(&point);
+            let expected =
+                partial_fold_packed_z_fast_padded(&stripe, m, k_log, useful_bits, &eq_outer);
+            let got = partial_fold_rowmajor_padded(&rowmajor, m, k_log, useful_bits, &eq_outer);
+            assert_eq!(got, expected, "m={m}, k_log={k_log}, useful={useful_bits}");
         }
     }
 

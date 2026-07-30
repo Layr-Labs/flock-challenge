@@ -1,5 +1,124 @@
 use super::super::{F128, NEON_TILE_T, build_sum_table};
 
+/// Partial-fold a canonical row-major F128-packed witness without first
+/// materializing lincheck's byte-stripe copy.
+///
+/// A tile covers `TILE_T * 8` outer rows. For each 64-bit inner-word we load
+/// the corresponding word from those rows, transpose each group of eight
+/// words into 64 lookup indices, and immediately consume the transient bytes
+/// with the same register-tiled lookup kernel as the materialized-stripe path.
+/// The transient tile is only `TILE_T * 64` bytes and never reaches DRAM.
+#[cfg(target_arch = "aarch64")]
+pub fn partial_fold_rowmajor_neon_oblock_padded(
+    z_packed: &[F128],
+    m: usize,
+    k_log: usize,
+    useful_bits: usize,
+    eq_outer: &[F128],
+) -> Vec<F128> {
+    use crate::bits::transpose_8_u64s_to_64_bytes;
+    use rayon::prelude::*;
+
+    const TILE_T: usize = NEON_TILE_T;
+    const BLOCK_K: usize = 8;
+    const WORD_BITS: usize = 64;
+    const OUTER_PER_STRIPE: usize = 8;
+
+    let n_log = m - k_log;
+    let k = 1usize << k_log;
+    let n_outer = 1usize << n_log;
+    assert_eq!(z_packed.len(), (1usize << m) / 128);
+    assert_eq!(eq_outer.len(), n_outer);
+    assert!(n_log >= 3 + TILE_T.trailing_zeros() as usize);
+    assert!(
+        k_log >= 6,
+        "row-major streaming consumes complete u64 words"
+    );
+    assert!(useful_bits <= k);
+
+    let n_stripes = n_outer / OUTER_PER_STRIPE;
+    assert_eq!(n_stripes % TILE_T, 0);
+    let n_tiles = n_stripes / TILE_T;
+    let useful = (useful_bits.div_ceil(BLOCK_K) * BLOCK_K).min(k);
+    if useful == 0 {
+        return vec![F128::ZERO; k];
+    }
+    let useful_words = useful_bits.div_ceil(WORD_BITS);
+    let words_per_outer = k / WORD_BITS;
+    let z_words: &[u64] =
+        unsafe { std::slice::from_raw_parts(z_packed.as_ptr().cast::<u64>(), z_packed.len() * 2) };
+
+    let p = rayon::current_num_threads().max(1);
+    let tiles_per_worker = n_tiles.div_ceil(p);
+    let n_workers = n_tiles.div_ceil(tiles_per_worker);
+    let mut partials = vec![F128::ZERO; n_workers * k];
+
+    partials
+        .par_chunks_mut(k)
+        .enumerate()
+        .for_each(|(worker, partial)| {
+            let tile_lo = worker * tiles_per_worker;
+            let tile_hi = ((worker + 1) * tiles_per_worker).min(n_tiles);
+            let mut tables = vec![F128::ZERO; TILE_T * 256];
+            let mut stripes = [0u8; TILE_T * WORD_BITS];
+
+            for tile in tile_lo..tile_hi {
+                let stripe_base = tile * TILE_T;
+                for t in 0..TILE_T {
+                    let eq_off = OUTER_PER_STRIPE * (stripe_base + t);
+                    build_sum_table(
+                        &eq_outer[eq_off..eq_off + OUTER_PER_STRIPE],
+                        &mut tables[t * 256..(t + 1) * 256],
+                    );
+                }
+
+                let outer_base = tile * TILE_T * OUTER_PER_STRIPE;
+                let tables_ptr = tables.as_ptr().cast::<u8>();
+                for word in 0..useful_words {
+                    for t in 0..TILE_T {
+                        let group_base = outer_base + t * OUTER_PER_STRIPE;
+                        let lanes: [u64; OUTER_PER_STRIPE] = std::array::from_fn(|lane| {
+                            z_words[(group_base + lane) * words_per_outer + word]
+                        });
+                        transpose_8_u64s_to_64_bytes(
+                            &lanes,
+                            &mut stripes[t * WORD_BITS..(t + 1) * WORD_BITS],
+                        );
+                    }
+
+                    let inner_base = word * WORD_BITS;
+                    let inner_hi = useful.min(inner_base + WORD_BITS);
+                    let mut inner = inner_base;
+                    while inner < inner_hi {
+                        unsafe {
+                            process_block_neon_single::<TILE_T>(
+                                stripes.as_ptr(),
+                                WORD_BITS,
+                                inner - inner_base,
+                                tables_ptr,
+                                partial.as_mut_ptr().add(inner),
+                            );
+                        }
+                        inner += BLOCK_K;
+                    }
+                }
+            }
+        });
+
+    let band = k.div_ceil(p).max(1024);
+    let mut out = vec![F128::ZERO; k];
+    out.par_chunks_mut(band).enumerate().for_each(|(bi, dst)| {
+        let lo = bi * band;
+        for worker in 0..n_workers {
+            let src = &partials[worker * k + lo..worker * k + lo + dst.len()];
+            for (o, s) in dst.iter_mut().zip(src) {
+                *o += *s;
+            }
+        }
+    });
+    out
+}
+
 /// Single-matrix partial fold with **tiled + NEON-register accumulators**.
 /// Keeps `BLOCK_K = 8` accumulators in NEON registers across a `NEON_TILE_T`
 /// stripe sweep — no per-byte accumulator LD/ST. Hand-rolled aarch64
