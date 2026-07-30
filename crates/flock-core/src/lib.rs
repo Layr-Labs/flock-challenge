@@ -51,6 +51,11 @@ pub mod zerocheck;
 /// Returns the number of threads the pool was configured with, or `None`
 /// if no change was made because Rayon was already initialized.
 pub fn init_perf_thread_pool() -> Option<usize> {
+    // The initiating thread performs transcript work, orchestration, small
+    // serial kernels, and final serialization between parallel regions. Give
+    // it the same latency-sensitive policy as the Rayon workers while setup is
+    // still outside the protected proof timer.
+    set_prover_thread_qos();
     let n = std::env::var("RAYON_NUM_THREADS")
         .ok()
         .and_then(|s| s.parse::<usize>().ok())

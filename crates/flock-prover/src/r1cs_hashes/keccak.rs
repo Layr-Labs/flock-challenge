@@ -657,6 +657,8 @@ pub fn generate_witness_with_ab_packed_and_lincheck(
         Some(&padding),
         n_keccaks_log,
         K_LOG,
+        true,
+        K,
         build_chain_witness_ab_packed_into,
     )
 }

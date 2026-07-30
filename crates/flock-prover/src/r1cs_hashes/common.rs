@@ -45,11 +45,6 @@ impl<const NW: usize> BitRecord<NW> {
         Self { w: [0u64; NW] }
     }
 
-    #[inline(always)]
-    pub(crate) fn words(&self) -> &[u64; NW] {
-        &self.w
-    }
-
     /// OR a (pre-masked) value into record bits `[POS, POS + width)`.
     /// `POS` is const so the straddle branch and shifts fold at compile time.
     #[inline(always)]
@@ -75,6 +70,11 @@ impl<const NW: usize> BitRecord<NW> {
             spill = (self.w[j] >> 1) >> (63 - s);
         }
         buf[bi + NW] |= spill;
+    }
+
+    #[inline(always)]
+    pub(crate) fn words(&self) -> &[u64; NW] {
+        &self.w
     }
 }
 
@@ -219,49 +219,8 @@ pub(crate) fn drive_witness_packed_and_lincheck<S: Sync, F>(
     padding: Option<&S>,
     n_blocks_log: usize,
     k_log: usize,
-    per_block: F,
-) -> (Vec<F128>, Vec<F128>, Vec<F128>, Vec<u8>)
-where
-    F: Fn(&S, &mut [u64], &mut [u64], &mut [u64]) + Sync,
-{
-    drive_witness_packed_and_lincheck_impl::<false, S, F>(
-        initial_states,
-        padding,
-        n_blocks_log,
-        k_log,
-        per_block,
-    )
-}
-
-/// Full-write variant of [`drive_witness_packed_and_lincheck`]. It skips the
-/// group zero pass, so `per_block` MUST overwrite every word of all three
-/// buffers before returning. Padding is mandatory: this ensures the callback
-/// runs for every allocated slot, including the tail of a non-power-of-two
-/// input batch.
-pub(crate) fn drive_witness_packed_and_lincheck_full_write<S: Sync, F>(
-    initial_states: &[S],
-    padding: &S,
-    n_blocks_log: usize,
-    k_log: usize,
-    per_block: F,
-) -> (Vec<F128>, Vec<F128>, Vec<F128>, Vec<u8>)
-where
-    F: Fn(&S, &mut [u64], &mut [u64], &mut [u64]) + Sync,
-{
-    drive_witness_packed_and_lincheck_impl::<true, S, F>(
-        initial_states,
-        Some(padding),
-        n_blocks_log,
-        k_log,
-        per_block,
-    )
-}
-
-fn drive_witness_packed_and_lincheck_impl<const PER_BLOCK_FULLY_WRITES: bool, S: Sync, F>(
-    initial_states: &[S],
-    padding: Option<&S>,
-    n_blocks_log: usize,
-    k_log: usize,
+    clear_before_build: bool,
+    stripe_useful_bits: usize,
     per_block: F,
 ) -> (Vec<F128>, Vec<F128>, Vec<F128>, Vec<u8>)
 where
@@ -282,16 +241,19 @@ where
         n_total >= 8 && n_total.is_multiple_of(8),
         "lincheck stripe layout requires n_total ≥ 8 and divisible by 8"
     );
+    assert!(stripe_useful_bits <= k);
     assert!(
-        !PER_BLOCK_FULLY_WRITES || padding.is_some(),
-        "full-write witness generation requires a padding block"
+        clear_before_build || padding.is_some(),
+        "a full-overwrite witness builder requires a padding block"
     );
 
     let total_f128 = n_total * f128_per_block;
-    // z/a/b are allocated uninitialized. Ordinary OR-based builders zero each
-    // 8-block group inside the parallel loop; full-write builders initialize
-    // every word directly and skip that pass. `z_lincheck` stays
-    // `vec![0u8; _]` (lazy `alloc_zeroed`/mmap — no eager memset).
+    // z/a/b are allocated uninitialized and zeroed *inside* the parallel loop
+    // (one memset per 8-block group), so the ~192 MB zero-fill scales with the
+    // thread count instead of running serially on the main thread before the
+    // parallel build. The per-block builders OR 1-bits into pre-zeroed words,
+    // so each group must be zeroed before its `per_block` calls. `z_lincheck`
+    // stays `vec![0u8; _]` (lazy `alloc_zeroed`/mmap — no eager memset).
     let mut z = flock_core::scratch::take_f128(total_f128);
     let mut a = flock_core::scratch::take_f128(total_f128);
     let mut b = flock_core::scratch::take_f128(total_f128);
@@ -303,13 +265,11 @@ where
         .zip(z_lincheck.par_chunks_mut(k))
         .enumerate()
         .for_each(|(g, (((z_grp, a_grp), b_grp), stripe))| {
-            // Ordinary per-block builders OR 1-bits into pre-zeroed words; any
-            // slot left unbuilt (no padding block) stays zero, which the
-            // lincheck transpose below reads correctly. Full-write builders
-            // skip this pass and must initialize every word themselves.
-            // SAFETY: F128 is `Copy` (no Drop) and the all-zero bit pattern is
-            // the valid `F128::ZERO`, so a byte memset is a correct init.
-            if !PER_BLOCK_FULLY_WRITES {
+            if clear_before_build {
+                // OR-based builders require a clean destination. Full-write
+                // builders skip this pass and initialize every output word.
+                // SAFETY: F128 is `Copy` (no Drop) and the all-zero bit
+                // pattern is the valid `F128::ZERO`.
                 unsafe {
                     std::ptr::write_bytes(z_grp.as_mut_ptr(), 0, z_grp.len());
                     std::ptr::write_bytes(a_grp.as_mut_ptr(), 0, a_grp.len());
@@ -358,7 +318,7 @@ where
             let z_u64_all: &[u64] = unsafe {
                 std::slice::from_raw_parts(z_grp.as_ptr() as *const u64, z_grp.len() * 2)
             };
-            for i in 0..u64_per_block {
+            for i in 0..stripe_useful_bits.div_ceil(64) {
                 let lanes: [u64; 8] = [
                     z_u64_all[0 * u64_per_block + i],
                     z_u64_all[u64_per_block + i],
