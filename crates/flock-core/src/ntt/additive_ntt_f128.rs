@@ -255,6 +255,32 @@ impl AdditiveNttF128 {
         num_ntts: usize,
         start_layer: usize,
     ) {
+        self.forward_transform_interleaved_from_layer_with_subgroup_callback(
+            data,
+            num_ntts,
+            start_layer,
+            |_, _| {},
+        );
+    }
+
+    /// Variant of [`Self::forward_transform_interleaved_from_layer`] that
+    /// invokes `on_complete(subgroup_index, subgroup)` exactly once for each
+    /// cache-blocked subgroup, immediately after all of its NTT layers have
+    /// completed. Callbacks may run in parallel, but their subgroup slices are
+    /// disjoint and ordered contiguously by `subgroup_index`.
+    ///
+    /// This lets a consumer such as Merkle leaf hashing use final codeword rows
+    /// while they are still cache-hot, without changing the materialized
+    /// codeword. Small/scalar transforms invoke the callback once for all data.
+    pub(crate) fn forward_transform_interleaved_from_layer_with_subgroup_callback<F>(
+        &self,
+        data: &mut [F128],
+        num_ntts: usize,
+        start_layer: usize,
+        on_complete: F,
+    ) where
+        F: Fn(usize, &[F128]) + Sync,
+    {
         assert!(num_ntts.is_power_of_two() && num_ntts > 0);
         let n_total = data.len();
         assert_eq!(n_total % num_ntts, 0);
@@ -269,7 +295,12 @@ impl AdditiveNttF128 {
             all(target_arch = "x86_64", target_feature = "pclmulqdq"),
         ))]
         {
-            self.forward_transform_interleaved_parallel_from_layer(data, num_ntts, start_layer);
+            self.forward_transform_interleaved_parallel_from_layer_with_subgroup_callback(
+                data,
+                num_ntts,
+                start_layer,
+                &on_complete,
+            );
         }
         #[cfg(not(any(
             all(target_arch = "aarch64", target_feature = "aes"),
@@ -277,6 +308,7 @@ impl AdditiveNttF128 {
         )))]
         {
             self.forward_transform_interleaved_scalar_from_layer(data, num_ntts, start_layer);
+            on_complete(0, data);
         }
     }
 
@@ -348,6 +380,27 @@ impl AdditiveNttF128 {
         num_ntts: usize,
         start_layer: usize,
     ) {
+        self.forward_transform_interleaved_parallel_from_layer_with_subgroup_callback(
+            data,
+            num_ntts,
+            start_layer,
+            &|_, _| {},
+        );
+    }
+
+    #[cfg(any(
+        all(target_arch = "aarch64", target_feature = "aes"),
+        all(target_arch = "x86_64", target_feature = "pclmulqdq"),
+    ))]
+    fn forward_transform_interleaved_parallel_from_layer_with_subgroup_callback<F>(
+        &self,
+        data: &mut [F128],
+        num_ntts: usize,
+        start_layer: usize,
+        on_complete: &F,
+    ) where
+        F: Fn(usize, &[F128]) + Sync,
+    {
         use rayon::prelude::*;
         let n_total = data.len();
         let log_d = log2_pow2(n_total / num_ntts);
@@ -387,6 +440,7 @@ impl AdditiveNttF128 {
         };
         if n_top == 0 || log_d < 8 {
             self.forward_transform_interleaved_scalar_from_layer(data, num_ntts, start_layer);
+            on_complete(0, data);
             return;
         }
 
@@ -497,6 +551,7 @@ impl AdditiveNttF128 {
                         butterfly_interleaved_block(block, twiddle, block_size_half, num_ntts);
                     }
                 }
+                on_complete(sub_idx, sub_data);
             });
     }
 

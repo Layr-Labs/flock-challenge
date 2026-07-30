@@ -2365,19 +2365,17 @@ pub(crate) fn ligero_commit(
     let mut mat = crate::scratch::take_f128(codeword_len);
     super::commit::replicate_message_fill(&mut mat, poly);
 
-    // RS-encode every lane in one call (each lane is one independent NTT).
-    ntt.forward_transform_interleaved_from_layer(&mut mat, num_interleaved, log_inv_rate);
-
-    // Merkle over rows. One leaf = `num_interleaved` consecutive F128 = 16·num_interleaved bytes.
-    let leaf_size_bytes = num_interleaved * core::mem::size_of::<F128>();
-    let data_bytes: &[u8] = unsafe {
-        core::slice::from_raw_parts(
-            mat.as_ptr() as *const u8,
-            mat.len() * core::mem::size_of::<F128>(),
-        )
-    };
-    debug_assert_eq!(data_bytes.len(), block_len * leaf_size_bytes);
-    let tree = merkle::merkle_tree(data_bytes, block_len, kind);
+    // RS-encode every lane, hashing final row groups and their low Merkle
+    // subtrees as soon as the last NTT layer completes.
+    let (tree, completed_parent_levels) = super::commit::transform_and_hash_leaves(
+        ntt,
+        &mut mat,
+        num_interleaved,
+        log_inv_rate,
+        kind,
+    );
+    let tree =
+        merkle::finish_tree_from_hashed_level(tree, block_len, completed_parent_levels, kind);
 
     LigeroWitness {
         mat,

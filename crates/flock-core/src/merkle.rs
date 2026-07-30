@@ -440,6 +440,51 @@ fn hash_leaves(data: &[u8], leaf_size: usize, out: &mut [Hash], kind: HashKind) 
     }
 }
 
+/// Hash a contiguous leaf run on the current worker, retaining the same SIMD
+/// batching as [`hash_leaves`] but without launching nested Rayon work.
+pub(crate) fn hash_leaves_serial(data: &[u8], leaf_size: usize, out: &mut [Hash], kind: HashKind) {
+    debug_assert_eq!(data.len(), leaf_size * out.len());
+    #[cfg(feature = "hash-count")]
+    {
+        use std::sync::atomic::Ordering::Relaxed;
+        hash_count::LEAF_CALLS.fetch_add(out.len() as u64, Relaxed);
+        hash_count::LEAF_COMPRESSIONS.fetch_add(
+            out.len() as u64 * hash_count::blocks(kind, leaf_size),
+            Relaxed,
+        );
+    }
+    match kind {
+        HashKind::Blake3 if blake3_leaf_size_is_batchable(leaf_size) => {
+            let dispatched = blake3_hash_many_leaves(data, leaf_size, out);
+            debug_assert!(dispatched);
+        }
+        HashKind::Blake3 => {
+            for (o, leaf) in out.iter_mut().zip(data.chunks(leaf_size)) {
+                *o = blake3_leaf_cv(leaf);
+            }
+        }
+        HashKind::Sha256 => {
+            for (outs, leaves) in out.chunks_mut(4).zip(data.chunks(4 * leaf_size)) {
+                if outs.len() == 4 {
+                    sha256_hash4(
+                        [
+                            &leaves[..leaf_size],
+                            &leaves[leaf_size..2 * leaf_size],
+                            &leaves[2 * leaf_size..3 * leaf_size],
+                            &leaves[3 * leaf_size..],
+                        ],
+                        outs,
+                    );
+                } else {
+                    for (out, leaf) in outs.iter_mut().zip(leaves.chunks(leaf_size)) {
+                        *out = Sha256::digest(leaf).into();
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// Nodes per rayon task in the batched BLAKE3 paths: enough to amortize task
 /// dispatch over many `hash_many` calls, small enough to stay cache-resident.
 const BLAKE3_GROUP: usize = 1024;
@@ -509,6 +554,43 @@ fn hash_pairs_level(read: &[Hash], write: &mut [Hash], kind: HashKind) {
     }
 }
 
+/// Current-worker form of [`hash_pairs_level`], retaining SHA4/BLAKE3 SIMD
+/// batching without spawning nested Rayon work.
+pub(crate) fn hash_pairs_level_serial(read: &[Hash], write: &mut [Hash], kind: HashKind) {
+    debug_assert_eq!(read.len(), 2 * write.len());
+    #[cfg(feature = "hash-count")]
+    hash_count::PAIR_CALLS.fetch_add(write.len() as u64, std::sync::atomic::Ordering::Relaxed);
+    let read_bytes: &[u8] =
+        unsafe { core::slice::from_raw_parts(read.as_ptr() as *const u8, read.len() * 32) };
+    match kind {
+        HashKind::Blake3 => blake3_hash_many_parents(read_bytes, write),
+        HashKind::Sha256 => {
+            for (outs, children) in write.chunks_mut(4).zip(read_bytes.chunks(256)) {
+                if outs.len() == 4 {
+                    sha256_hash4(
+                        [
+                            &children[..64],
+                            &children[64..128],
+                            &children[128..192],
+                            &children[192..256],
+                        ],
+                        outs,
+                    );
+                } else {
+                    for (i, out) in outs.iter_mut().enumerate() {
+                        let left: &Hash = children[i * 64..i * 64 + 32].try_into().unwrap();
+                        let right: &Hash = children[i * 64 + 32..i * 64 + 64].try_into().unwrap();
+                        let mut h = Sha256::new();
+                        h.update(left);
+                        h.update(right);
+                        *out = h.finalize().into();
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// Compute the Merkle root of `data` split into `num_leaves` equal-sized leaves.
 ///
 /// Multi-threaded via rayon. `num_leaves` must be a power of two and divide
@@ -542,9 +624,40 @@ pub fn merkle_tree(data: &[u8], num_leaves: usize, kind: HashKind) -> Vec<Hash> 
     // 1. Leaves — fully parallel, SIMD-batched across leaves where possible.
     hash_leaves(data, leaf_size, &mut tree[..num_leaves], kind);
 
-    // 2. Internal levels — parallel within a level, sequential across levels.
+    finish_tree_from_hashed_leaves(tree, num_leaves, kind)
+}
+
+/// Fill every internal level of a flat Merkle tree whose leaf prefix is
+/// already initialized.
+pub(crate) fn finish_tree_from_hashed_leaves(
+    tree: Vec<Hash>,
+    num_leaves: usize,
+    kind: HashKind,
+) -> Vec<Hash> {
+    finish_tree_from_hashed_level(tree, num_leaves, 0, kind)
+}
+
+/// Finish a flat tree whose leaf level plus `completed_parent_levels`
+/// consecutive parent levels are already initialized.
+pub(crate) fn finish_tree_from_hashed_level(
+    mut tree: Vec<Hash>,
+    num_leaves: usize,
+    completed_parent_levels: usize,
+    kind: HashKind,
+) -> Vec<Hash> {
+    assert!(num_leaves.is_power_of_two() && num_leaves > 0);
+    assert_eq!(tree.len(), 2 * num_leaves - 1);
+    assert!(completed_parent_levels <= num_leaves.trailing_zeros() as usize);
+
+    // Advance past levels already produced by cache-local subtrees.
     let mut read_start = 0usize;
     let mut read_len = num_leaves;
+    for _ in 0..completed_parent_levels {
+        read_start += read_len;
+        read_len >>= 1;
+    }
+
+    // Remaining internal levels.
     while read_len > 1 {
         let next_len = read_len >> 1;
         // Split the buffer at the end of the current level so we get two

@@ -257,6 +257,88 @@ pub(crate) fn replicate_message_fill(codeword: &mut [F128], msg: &[F128]) {
     }
 }
 
+/// Finish an interleaved NTT and hash each completed cache subgroup directly
+/// into a flat Merkle tree. Each subgroup also builds its first few disjoint
+/// parent levels while the leaf hashes remain hot. Returns the tree allocation
+/// and the number of initialized parent levels.
+pub(crate) fn transform_and_hash_leaves(
+    ntt: &AdditiveNttF128,
+    data: &mut [F128],
+    num_ntts: usize,
+    start_layer: usize,
+    kind: HashKind,
+) -> (Vec<Hash>, usize) {
+    assert!(num_ntts.is_power_of_two() && num_ntts > 0);
+    assert!(data.len().is_multiple_of(num_ntts));
+    let num_leaves = data.len() / num_ntts;
+    let leaf_size = num_ntts * core::mem::size_of::<F128>();
+    let mut tree: Vec<Hash> = crate::alloc_uninit_vec(2 * num_leaves - 1);
+    let tree_addr = tree.as_mut_ptr() as usize;
+    let completed_levels = std::sync::atomic::AtomicUsize::new(0);
+
+    ntt.forward_transform_interleaved_from_layer_with_subgroup_callback(
+        data,
+        num_ntts,
+        start_layer,
+        |subgroup_idx, subgroup| {
+            debug_assert!(subgroup.len().is_multiple_of(num_ntts));
+            let subgroup_leaves = subgroup.len() / num_ntts;
+            let leaf_start = subgroup_idx * subgroup_leaves;
+            let subgroup_bytes = unsafe {
+                core::slice::from_raw_parts(
+                    subgroup.as_ptr() as *const u8,
+                    core::mem::size_of_val(subgroup),
+                )
+            };
+            // SAFETY: callbacks own disjoint, contiguous subgroup ranges and
+            // therefore disjoint leaf ranges in the stable tree allocation.
+            let leaf_out = unsafe {
+                core::slice::from_raw_parts_mut(
+                    (tree_addr as *mut Hash).add(leaf_start),
+                    subgroup_leaves,
+                )
+            };
+            merkle::hash_leaves_serial(subgroup_bytes, leaf_size, leaf_out, kind);
+
+            const LOCAL_PARENT_LEVELS: usize = 4;
+            let local_levels = LOCAL_PARENT_LEVELS.min(subgroup_leaves.trailing_zeros() as usize);
+            let mut global_start = 0usize;
+            let mut global_len = num_leaves;
+            let mut local_offset = leaf_start;
+            let mut local_len = subgroup_leaves;
+            for _ in 0..local_levels {
+                let next_global_start = global_start + global_len;
+                let next_local_offset = local_offset >> 1;
+                let next_local_len = local_len >> 1;
+                // SAFETY: tree levels are disjoint, and aligned subgroups own
+                // disjoint ranges within every locally completed level.
+                let (read, write) = unsafe {
+                    let read = core::slice::from_raw_parts(
+                        (tree_addr as *const Hash).add(global_start + local_offset),
+                        local_len,
+                    );
+                    let write = core::slice::from_raw_parts_mut(
+                        (tree_addr as *mut Hash).add(next_global_start + next_local_offset),
+                        next_local_len,
+                    );
+                    (read, write)
+                };
+                merkle::hash_pairs_level_serial(read, write, kind);
+                global_start = next_global_start;
+                global_len >>= 1;
+                local_offset = next_local_offset;
+                local_len = next_local_len;
+            }
+            completed_levels.store(local_levels, std::sync::atomic::Ordering::Relaxed);
+        },
+    );
+
+    (
+        tree,
+        completed_levels.load(std::sync::atomic::Ordering::Relaxed),
+    )
+}
+
 /// Shared tail of [`commit`] / [`commit_into`]: interleaved forward additive
 /// NTT (RS-encode every lane) then the initial Merkle tree over codeword rows.
 fn finalize_commit(mut codeword: Vec<F128>, params: &PcsParams) -> (Commitment, ProverData) {
@@ -267,33 +349,29 @@ fn finalize_commit(mut codeword: Vec<F128>, params: &PcsParams) -> (Commitment, 
     // SoA buffer. The first `log_inv_rate` layers were pre-applied by the
     // caller's replicate-fill (commit_into), so start past them.
     let ntt = AdditiveNttF128::standard(params.k_code());
-    ntt.forward_transform_interleaved_from_layer(
+    let (merkle_tree, completed_parent_levels) = transform_and_hash_leaves(
+        &ntt,
         &mut codeword,
         params.num_ntts(),
         params.log_inv_rate,
+        params.merkle_hash,
     );
     if timing {
         eprintln!(
-            "[commit-timing] ntt: {:.2} ms",
+            "[commit-timing] ntt + cache-hot leaves: {:.2} ms",
             t_ntt.elapsed().as_secs_f64() * 1e3
         );
     }
     let t_merkle = std::time::Instant::now();
 
-    // ---- Merkle commitment: one leaf per codeword position = num_ntts F128.
-    // Zero-copy: cast the codeword Vec<F128> directly to &[u8]. F128 is
-    // repr(C, align(16)) with two u64s laid out little-endian — same bytes
-    // as the explicit lo.to_le_bytes() + hi.to_le_bytes() serialization.
-    let codeword_bytes: &[u8] = unsafe {
-        core::slice::from_raw_parts(
-            codeword.as_ptr() as *const u8,
-            codeword.len() * core::mem::size_of::<F128>(),
-        )
-    };
-    // Initial tree: one leaf per codeword position, each containing the
-    // row-batch lanes (num_ntts F_{2^128} values = 2^log_batch_size). This is
-    // Ligerito's L0 commitment.
-    let merkle_tree = merkle::merkle_tree(codeword_bytes, params.n_leaves(), params.merkle_hash);
+    // Leaves and four low parent levels were produced by their final NTT
+    // subgroup. Complete only the upper tree here.
+    let merkle_tree = merkle::finish_tree_from_hashed_level(
+        merkle_tree,
+        params.n_leaves(),
+        completed_parent_levels,
+        params.merkle_hash,
+    );
     let root = *merkle_tree.last().expect("merkle tree non-empty");
     if timing {
         eprintln!(
@@ -445,39 +523,42 @@ mod tests {
         use crate::ntt::AdditiveNttF128;
         let mut rng = Rng::new(0xFEED);
         for (m, log_inv_rate, log_batch_size) in [(10, 1, 1), (12, 1, 2), (12, 2, 1), (14, 2, 3)] {
-            let params = PcsParams {
-                m,
-                log_inv_rate,
-                log_batch_size,
-                profile: Default::default(),
-                merkle_hash: Default::default(),
-            };
             let z = rng.bits(1 << m);
             let z_packed = super::super::pack::pack_witness(&z, m);
 
-            let (commitment, pd) = commit(&z_packed, &params);
+            for merkle_hash in [HashKind::Sha256, HashKind::Blake3] {
+                let params = PcsParams {
+                    m,
+                    log_inv_rate,
+                    log_batch_size,
+                    profile: Default::default(),
+                    merkle_hash,
+                };
 
-            // Oracle: explicit [z, 0, …, 0] coefficients, full NTT from layer 0.
-            let mut oracle = vec![F128::ZERO; params.codeword_len_f128()];
-            oracle[..z_packed.len()].copy_from_slice(&z_packed);
-            let ntt = AdditiveNttF128::standard(params.k_code());
-            ntt.forward_transform_interleaved(&mut oracle, params.num_ntts());
+                let (commitment, pd) = commit(&z_packed, &params);
 
-            assert_eq!(
-                pd.codeword, oracle,
-                "codeword mismatch at m={m} r={log_inv_rate}"
-            );
-            let oracle_bytes: &[u8] = unsafe {
-                core::slice::from_raw_parts(oracle.as_ptr() as *const u8, oracle.len() * 16)
-            };
-            let oracle_root =
-                *crate::merkle::merkle_tree(oracle_bytes, params.n_leaves(), params.merkle_hash)
-                    .last()
-                    .unwrap();
-            assert_eq!(
-                commitment.root, oracle_root,
-                "root mismatch at m={m} r={log_inv_rate}"
-            );
+                // Oracle: explicit [z, 0, …, 0] coefficients, full NTT from layer 0.
+                let mut oracle = vec![F128::ZERO; params.codeword_len_f128()];
+                oracle[..z_packed.len()].copy_from_slice(&z_packed);
+                let ntt = AdditiveNttF128::standard(params.k_code());
+                ntt.forward_transform_interleaved(&mut oracle, params.num_ntts());
+
+                assert_eq!(
+                    pd.codeword, oracle,
+                    "codeword mismatch at m={m} r={log_inv_rate} hash={merkle_hash:?}"
+                );
+                let oracle_bytes: &[u8] = unsafe {
+                    core::slice::from_raw_parts(oracle.as_ptr() as *const u8, oracle.len() * 16)
+                };
+                let oracle_root =
+                    *crate::merkle::merkle_tree(oracle_bytes, params.n_leaves(), merkle_hash)
+                        .last()
+                        .unwrap();
+                assert_eq!(
+                    commitment.root, oracle_root,
+                    "root mismatch at m={m} r={log_inv_rate} hash={merkle_hash:?}"
+                );
+            }
         }
     }
 
