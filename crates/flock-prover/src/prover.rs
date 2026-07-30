@@ -210,6 +210,61 @@ pub fn prove_fast_ligerito_from_witness<Ch: Challenger>(
     prefaulted_codeword: Option<Vec<F128>>,
     challenger: &mut Ch,
 ) -> (R1csProofLigerito, Commitment, R1csClaim) {
+    prove_fast_ligerito_from_witness_impl(
+        r1cs,
+        pcs_params,
+        z_packed,
+        a_packed_f128,
+        b_packed_f128,
+        z_packed_lincheck,
+        lincheck_circuit,
+        prefaulted_codeword,
+        false,
+        challenger,
+    )
+}
+
+/// Fast-path entrypoint when witness generation already filled the warm
+/// rate-1/2 codeword buffer with both replicas of `z_packed`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn prove_fast_ligerito_from_prefilled_witness<Ch: Challenger>(
+    r1cs: &BlockR1cs,
+    pcs_params: &PcsParams,
+    z_packed: Vec<F128>,
+    a_packed_f128: Vec<F128>,
+    b_packed_f128: Vec<F128>,
+    z_packed_lincheck: Vec<u8>,
+    lincheck_circuit: &dyn lincheck::LincheckCircuit,
+    prefilled_codeword: Vec<F128>,
+    challenger: &mut Ch,
+) -> (R1csProofLigerito, Commitment, R1csClaim) {
+    prove_fast_ligerito_from_witness_impl(
+        r1cs,
+        pcs_params,
+        z_packed,
+        a_packed_f128,
+        b_packed_f128,
+        z_packed_lincheck,
+        lincheck_circuit,
+        Some(prefilled_codeword),
+        true,
+        challenger,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn prove_fast_ligerito_from_witness_impl<Ch: Challenger>(
+    r1cs: &BlockR1cs,
+    pcs_params: &PcsParams,
+    z_packed: Vec<F128>,
+    a_packed_f128: Vec<F128>,
+    b_packed_f128: Vec<F128>,
+    z_packed_lincheck: Vec<u8>,
+    lincheck_circuit: &dyn lincheck::LincheckCircuit,
+    prefaulted_codeword: Option<Vec<F128>>,
+    codeword_prefilled: bool,
+    challenger: &mut Ch,
+) -> (R1csProofLigerito, Commitment, R1csClaim) {
     let lig_config = pcs_params
         .ligerito_prover_config()
         .expect("Ligerito default config; bump m for tiny instances");
@@ -224,7 +279,7 @@ pub fn prove_fast_ligerito_from_witness<Ch: Challenger>(
         z_packed,
         s_hat_v_ab,
         s_hat_v_c,
-    } = prove_fast_core_with_codeword(
+    } = prove_fast_core_with_codeword_impl(
         r1cs,
         pcs_params,
         z_packed,
@@ -233,6 +288,7 @@ pub fn prove_fast_ligerito_from_witness<Ch: Challenger>(
         z_packed_lincheck,
         lincheck_circuit,
         prefaulted_codeword,
+        codeword_prefilled,
         challenger,
     );
 
@@ -332,9 +388,38 @@ pub fn prove_fast_core_with_codeword<Ch: Challenger>(
     prefaulted_codeword: Option<Vec<F128>>,
     challenger: &mut Ch,
 ) -> ProveCore {
-    let (commitment, prover_data) = match prefaulted_codeword {
-        Some(buf) => pcs::commit_into(&z_packed, pcs_params, buf),
-        None => pcs::commit(&z_packed, pcs_params),
+    prove_fast_core_with_codeword_impl(
+        r1cs,
+        pcs_params,
+        z_packed,
+        a_packed_f128,
+        b_packed_f128,
+        z_packed_lincheck,
+        lincheck_circuit,
+        prefaulted_codeword,
+        false,
+        challenger,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn prove_fast_core_with_codeword_impl<Ch: Challenger>(
+    r1cs: &BlockR1cs,
+    pcs_params: &PcsParams,
+    z_packed: Vec<F128>,
+    a_packed_f128: Vec<F128>,
+    b_packed_f128: Vec<F128>,
+    z_packed_lincheck: Vec<u8>,
+    lincheck_circuit: &dyn lincheck::LincheckCircuit,
+    prefaulted_codeword: Option<Vec<F128>>,
+    codeword_prefilled: bool,
+    challenger: &mut Ch,
+) -> ProveCore {
+    let (commitment, prover_data) = match (prefaulted_codeword, codeword_prefilled) {
+        (Some(buf), true) => pcs::commit_prefilled(pcs_params, buf),
+        (Some(buf), false) => pcs::commit_into(&z_packed, pcs_params, buf),
+        (None, false) => pcs::commit(&z_packed, pcs_params),
+        (None, true) => unreachable!("a prefilled commit requires a codeword buffer"),
     };
     bind_statement(challenger, r1cs, &commitment);
 

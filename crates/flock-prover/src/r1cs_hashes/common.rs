@@ -8,6 +8,11 @@ use flock_core::bits::transpose_8_u64s_to_64_bytes;
 use flock_core::field::F128;
 use flock_core::r1cs::{BlockR1cs, SparseBinaryMatrix, WitnessLayout};
 
+#[derive(Clone, Copy)]
+struct F128SendPtr(*mut F128);
+unsafe impl Send for F128SendPtr {}
+unsafe impl Sync for F128SendPtr {}
+
 /// OR the low 32 bits of `val` into `buf` starting at bit-offset `bit_off`.
 /// Handles u64 straddling when `bit_off % 64 > 32`.
 #[inline(always)]
@@ -198,7 +203,9 @@ pub(crate) fn build_block_r1cs_with_matrices(
 /// F128 form (z/a/b) and byte-stripe form (z_lincheck).
 ///
 /// `per_block(initial, z_u64, a_u64, b_u64)` populates one block's worth of
-/// `(z, a, b)` data — 3 zero-initialized `u64`-buffers of length `K / 64`.
+/// `(z, a, b)` data in 3 `u64` buffers of length `K / 64`. With
+/// `CLEAR_GROUPS = true` they are zero-initialized for OR-based builders.
+/// With `CLEAR_GROUPS = false`, the builder must assign every word itself.
 /// `K` is derived from `k_log`. `initial_states.len()` may be less than
 /// `2^n_blocks_log`.
 ///
@@ -209,11 +216,13 @@ pub(crate) fn build_block_r1cs_with_matrices(
 ///   that pin a constant wire need this so the constant column is all-ones
 ///   across *every* batched instance (see `docs/const-wire-pin.md`); for keccak
 ///   the padding input is the all-zero state, whose witness is `keccak_f(0)`.
-pub(crate) fn drive_witness_packed_and_lincheck<S: Sync, F>(
+pub(crate) fn drive_witness_packed_and_lincheck<const CLEAR_GROUPS: bool, S: Sync, F>(
     initial_states: &[S],
     padding: Option<&S>,
     n_blocks_log: usize,
     k_log: usize,
+    useful_bits: usize,
+    z_replicas: Option<&mut [F128]>,
     per_block: F,
 ) -> (Vec<F128>, Vec<F128>, Vec<F128>, Vec<u8>)
 where
@@ -224,6 +233,8 @@ where
     let k = 1usize << k_log;
     let f128_per_block = k / 128;
     let u64_per_block = k / 64;
+    let useful_u64_per_block = useful_bits.div_ceil(64);
+    assert!(useful_bits <= k);
     let n_total = 1usize << n_blocks_log;
     let n_blocks = initial_states.len();
     assert!(
@@ -234,18 +245,28 @@ where
         n_total >= 8 && n_total.is_multiple_of(8),
         "lincheck stripe layout requires n_total ≥ 8 and divisible by 8"
     );
+    assert!(
+        CLEAR_GROUPS || padding.is_some() || n_blocks == n_total,
+        "a single-write witness builder must initialize every padded slot"
+    );
 
     let total_f128 = n_total * f128_per_block;
-    // z/a/b are allocated uninitialized and zeroed *inside* the parallel loop
-    // (one memset per 8-block group), so the ~192 MB zero-fill scales with the
-    // thread count instead of running serially on the main thread before the
-    // parallel build. The per-block builders OR 1-bits into pre-zeroed words,
-    // so each group must be zeroed before its `per_block` calls. `z_lincheck`
-    // stays `vec![0u8; _]` (lazy `alloc_zeroed`/mmap — no eager memset).
+    // z/a/b are allocated uninitialized. OR-based builders zero them inside
+    // the parallel loop; complete single-write builders initialize every word
+    // themselves. `z_lincheck` stays `vec![0u8; _]` (lazy
+    // `alloc_zeroed`/mmap — no eager serial memset).
     let mut z = flock_core::scratch::take_f128(total_f128);
     let mut a = flock_core::scratch::take_f128(total_f128);
     let mut b = flock_core::scratch::take_f128(total_f128);
     let mut z_lincheck = vec![0u8; (n_total / 8) * k];
+    let replica_ptr = z_replicas.map(|replicas| {
+        assert_eq!(
+            replicas.len(),
+            2 * total_f128,
+            "the Fast BLAKE3 path expects rate-1/2 codeword replication"
+        );
+        F128SendPtr(replicas.as_mut_ptr())
+    });
 
     z.par_chunks_mut(8 * f128_per_block)
         .zip(a.par_chunks_mut(8 * f128_per_block))
@@ -253,16 +274,17 @@ where
         .zip(z_lincheck.par_chunks_mut(k))
         .enumerate()
         .for_each(|(g, (((z_grp, a_grp), b_grp), stripe))| {
-            // Zero this group's z/a/b up front (parallel memset — the buffers
-            // were uninit-allocated). The per-block builder ORs 1-bits into
-            // pre-zeroed words; any slot left unbuilt (no padding block) stays
-            // zero, which the lincheck transpose below reads correctly.
+            // OR-based builders need a parallel memset because the scratch
+            // buffers are stale/uninitialized. The BLAKE3 stream builder
+            // assigns every word and skips this pass.
             // SAFETY: F128 is `Copy` (no Drop) and the all-zero bit pattern is
             // the valid `F128::ZERO`, so a byte memset is a correct init.
-            unsafe {
-                std::ptr::write_bytes(z_grp.as_mut_ptr(), 0, z_grp.len());
-                std::ptr::write_bytes(a_grp.as_mut_ptr(), 0, a_grp.len());
-                std::ptr::write_bytes(b_grp.as_mut_ptr(), 0, b_grp.len());
+            if CLEAR_GROUPS {
+                unsafe {
+                    std::ptr::write_bytes(z_grp.as_mut_ptr(), 0, z_grp.len());
+                    std::ptr::write_bytes(a_grp.as_mut_ptr(), 0, a_grp.len());
+                    std::ptr::write_bytes(b_grp.as_mut_ptr(), 0, b_grp.len());
+                }
             }
             for k_in in 0..8 {
                 let global_idx = 8 * g + k_in;
@@ -302,11 +324,28 @@ where
                 per_block(init, z_u64, a_u64, b_u64);
             }
 
-            // Bit-transpose 8 z chunks into the lincheck stripe.
+            if let Some(dst) = replica_ptr {
+                let offset = g * z_grp.len();
+                // SAFETY: groups own disjoint source and destination ranges;
+                // the two replicas are disjoint and exactly `total_f128` long.
+                unsafe {
+                    std::ptr::copy_nonoverlapping(z_grp.as_ptr(), dst.0.add(offset), z_grp.len());
+                    std::ptr::copy_nonoverlapping(
+                        z_grp.as_ptr(),
+                        dst.0.add(total_f128 + offset),
+                        z_grp.len(),
+                    );
+                }
+            }
+
+            // Bit-transpose the useful prefix of 8 z chunks into the lincheck
+            // stripe. Rows beyond `useful_bits` are protocol padding and the
+            // zero-allocated stripe already contains their canonical value, so
+            // avoid reading and rewriting those fully padded 64-bit rows.
             let z_u64_all: &[u64] = unsafe {
                 std::slice::from_raw_parts(z_grp.as_ptr() as *const u64, z_grp.len() * 2)
             };
-            for i in 0..u64_per_block {
+            for i in 0..useful_u64_per_block {
                 let lanes: [u64; 8] = [
                     z_u64_all[0 * u64_per_block + i],
                     z_u64_all[u64_per_block + i],

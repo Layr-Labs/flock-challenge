@@ -231,6 +231,20 @@ pub fn commit_into(
     finalize_commit(codeword, params)
 }
 
+/// Commit a codeword whose `log_inv_rate` replicated-message prefix state has
+/// already been filled by the witness producer. This is the same state
+/// [`commit_into`] creates immediately before [`finalize_commit`].
+pub fn commit_prefilled(params: &PcsParams, codeword: Vec<F128>) -> (Commitment, ProverData) {
+    params.validate();
+    let codeword_len = params.n_positions() * params.num_ntts();
+    assert_eq!(
+        codeword.len(),
+        codeword_len,
+        "commit_prefilled: prebuilt codeword buffer has wrong length"
+    );
+    finalize_commit(codeword, params)
+}
+
 /// Fill `codeword` with `2^r` replicas of `msg` (`r = log2(codeword.len() /
 /// msg.len())`) — the exact state after the first `r` forward-NTT layers on
 /// the zero-padded coefficient vector `[msg, 0, …, 0]`. Pair with
@@ -373,6 +387,40 @@ pub fn prefault_codeword_during<R>(
         });
         let r = generate();
         (Some(h.join().unwrap()), r)
+    })
+}
+
+/// Variant of [`prefault_codeword_during`] that hands a warm pooled codeword
+/// buffer to `generate`, allowing the witness producer to fill the replicated
+/// message state while its source rows are still cache-hot.
+///
+/// The middle return value is `true` exactly when `generate` received a
+/// buffer and filled it. On the cold path the background thread still
+/// pre-faults independently, so `generate` receives `None` and the caller
+/// must use [`commit_into`].
+pub fn prefault_codeword_during_fill<R>(
+    params: &PcsParams,
+    generate: impl FnOnce(Option<&mut [F128]>) -> R,
+) -> (Option<Vec<F128>>, bool, R) {
+    if rayon::current_num_threads() <= 1 || std::env::var_os("FLOCK_NO_PREFAULT").is_some() {
+        return (None, false, generate(None));
+    }
+    let codeword_len = params.n_positions() * params.num_ntts();
+    if let Some(mut buf) = crate::scratch::try_take_f128(codeword_len) {
+        let r = generate(Some(&mut buf));
+        return (Some(buf), true, r);
+    }
+    std::thread::scope(|s| {
+        let h = s.spawn(move || {
+            set_background_qos();
+            let mut buf: Vec<F128> = crate::alloc_uninit_f128_vec(codeword_len);
+            unsafe {
+                std::ptr::write_bytes(buf.as_mut_ptr(), 0u8, codeword_len);
+            }
+            buf
+        });
+        let r = generate(None);
+        (Some(h.join().unwrap()), false, r)
     })
 }
 

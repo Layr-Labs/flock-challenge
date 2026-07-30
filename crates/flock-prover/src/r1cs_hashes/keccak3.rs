@@ -277,11 +277,13 @@ pub fn generate_witness_with_ab_packed_and_lincheck(
     // already pads its missing sub-keccaks.
     let padding: [State; N_SUB] = [zero; N_SUB];
 
-    super::common::drive_witness_packed_and_lincheck(
+    super::common::drive_witness_packed_and_lincheck::<true, _, _>(
         &triples,
         Some(&padding),
         n_blocks_log,
         K_LOG,
+        USEFUL_BITS,
+        None,
         build_block_witness_into,
     )
 }
