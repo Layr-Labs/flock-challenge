@@ -27,8 +27,8 @@ pub mod univariate_skip_deg4_optimized;
 pub mod univariate_skip_optimized;
 
 use multilinear::{
-    UniSkipFoldTable, fold_and_compute_round_pair_into, fold_in_place_pair,
-    interpolate_at_z_combined, interpolate_at_z_on_lambda, round_pair_naive,
+    UniSkipFoldTable, fold_and_compute_round_pair_into, fold_and_compute_round_pair_into_padded,
+    fold_in_place_pair, interpolate_at_z_combined, interpolate_at_z_on_lambda, round_pair_naive,
     uni_skip_fold_and_round_pair_optimized_packed_padded,
 };
 use univariate_skip_optimized::{
@@ -365,6 +365,8 @@ fn prove_packed_padded_inner<C: Challenger>(
     // two persistent buffers. Scratch capacity = N/2 (the largest fused
     // output); only needed when the first round is actually fused.
     let n_in = a_mlv.len();
+    let block_size_after_round2 = 1usize << padding.k_log.saturating_sub(k_skip);
+    let useful_after_round2 = padding.useful_bits_per_block.div_ceil(1usize << k_skip);
     let (mut a_nxt, mut b_nxt) = if n_in >= 1024 {
         (
             crate::scratch::take_f128(n_in / 2),
@@ -386,14 +388,29 @@ fn prove_packed_padded_inner<C: Challenger>(
 
         let (m1, mi) = if log_n_before >= 10 {
             let half = a_mlv.len() / 2;
-            let (m1, mi) = fold_and_compute_round_pair_into(
-                &a_mlv,
-                &b_mlv,
-                &mut a_nxt[..half],
-                &mut b_nxt[..half],
-                rho_prev,
-                &r_next,
-            );
+            let output_block_size = block_size_after_round2 >> (i + 1);
+            let useful_outputs = useful_after_round2.div_ceil(1usize << (i + 1));
+            let (m1, mi) = if output_block_size >= 2 && useful_outputs < output_block_size {
+                fold_and_compute_round_pair_into_padded(
+                    &a_mlv,
+                    &b_mlv,
+                    &mut a_nxt[..half],
+                    &mut b_nxt[..half],
+                    rho_prev,
+                    &r_next,
+                    output_block_size,
+                    useful_outputs,
+                )
+            } else {
+                fold_and_compute_round_pair_into(
+                    &a_mlv,
+                    &b_mlv,
+                    &mut a_nxt[..half],
+                    &mut b_nxt[..half],
+                    rho_prev,
+                    &r_next,
+                )
+            };
             // Swap current <-> scratch, then shrink the new current to the
             // folded size. The old (larger) buffer becomes scratch; we only
             // ever write its leading `half` slots next round, so its stale

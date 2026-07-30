@@ -48,7 +48,9 @@ mod kernels;
 #[cfg(all(target_arch = "aarch64", test))]
 use kernels::aarch64::fold_one_row_neon_unchecked_8;
 #[cfg(target_arch = "aarch64")]
-use kernels::aarch64::{fold_and_message_aarch64, fold_round2_chunk_neon_unchecked_8};
+use kernels::aarch64::{
+    fold_and_message_aarch64, fold_and_message_aarch64_padded, fold_round2_chunk_neon_unchecked_8,
+};
 #[cfg(all(
     target_arch = "x86_64",
     target_feature = "avx512f",
@@ -786,6 +788,46 @@ pub fn fold_and_compute_round_pair_into(
     r_fold: F128,
     r_next: &[F128],
 ) -> (F128, F128) {
+    fold_and_compute_round_pair_into_impl(a, b, a_out, b_out, r_fold, r_next, None)
+}
+
+/// Padding-aware form of [`fold_and_compute_round_pair_into`]. The current
+/// output is divided into `output_block_size`-element blocks whose
+/// `[useful_outputs..]` suffix is known to be zero.
+#[allow(clippy::too_many_arguments)]
+pub fn fold_and_compute_round_pair_into_padded(
+    a: &[F128],
+    b: &[F128],
+    a_out: &mut [F128],
+    b_out: &mut [F128],
+    r_fold: F128,
+    r_next: &[F128],
+    output_block_size: usize,
+    useful_outputs: usize,
+) -> (F128, F128) {
+    assert!(output_block_size.is_power_of_two() && output_block_size >= 2);
+    assert!(useful_outputs < output_block_size);
+    fold_and_compute_round_pair_into_impl(
+        a,
+        b,
+        a_out,
+        b_out,
+        r_fold,
+        r_next,
+        Some((output_block_size, useful_outputs)),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn fold_and_compute_round_pair_into_impl(
+    a: &[F128],
+    b: &[F128],
+    a_out: &mut [F128],
+    b_out: &mut [F128],
+    r_fold: F128,
+    r_next: &[F128],
+    _padding: Option<(usize, usize)>,
+) -> (F128, F128) {
     use rayon::prelude::*;
 
     let n = a.len();
@@ -828,7 +870,20 @@ pub fn fold_and_compute_round_pair_into(
                 unsafe { fold_and_message_x86_avx512(a_in, b_in, a_out, b_out, r_fold, eq_lo) };
 
             #[cfg(target_arch = "aarch64")]
-            let (p1, pinf) = fold_and_message_aarch64(a_in, b_in, a_out, b_out, r_fold, eq_lo);
+            let (p1, pinf) = if let Some((output_block_size, useful_outputs)) = _padding {
+                fold_and_message_aarch64_padded(
+                    a_in,
+                    b_in,
+                    a_out,
+                    b_out,
+                    r_fold,
+                    eq_lo,
+                    output_block_size,
+                    useful_outputs,
+                )
+            } else {
+                fold_and_message_aarch64(a_in, b_in, a_out, b_out, r_fold, eq_lo)
+            };
 
             #[cfg(not(any(
                 target_arch = "aarch64",
@@ -1278,6 +1333,48 @@ mod tests {
             };
             assert_eq!(scalar, neon, "fold mismatch bytes={bytes:02x?}");
         }
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn padded_tail_aarch64_matches_dense() {
+        let mut rng = Rng::new(0x9b05_688c);
+        let output_block_size = 16;
+        let useful_inputs = 13;
+        let useful_outputs = useful_inputs.div_ceil(2);
+        let num_blocks = 4;
+        let output_len = num_blocks * output_block_size;
+        let input_block_size = 2 * output_block_size;
+        let mut a = rng.f128_vec(2 * output_len);
+        let mut b = rng.f128_vec(2 * output_len);
+        for block in 0..num_blocks {
+            let start = block * input_block_size + useful_inputs;
+            let end = (block + 1) * input_block_size;
+            a[start..end].fill(F128::ZERO);
+            b[start..end].fill(F128::ZERO);
+        }
+        let r_fold = rng.f128();
+        let eq_lo = rng.f128_vec(output_len / 2);
+        let mut dense_a = vec![F128::ZERO; output_len];
+        let mut dense_b = vec![F128::ZERO; output_len];
+        let mut padded_a = vec![F128::ZERO; output_len];
+        let mut padded_b = vec![F128::ZERO; output_len];
+
+        let dense = fold_and_message_aarch64(&a, &b, &mut dense_a, &mut dense_b, r_fold, &eq_lo);
+        let padded = fold_and_message_aarch64_padded(
+            &a,
+            &b,
+            &mut padded_a,
+            &mut padded_b,
+            r_fold,
+            &eq_lo,
+            output_block_size,
+            useful_outputs,
+        );
+
+        assert_eq!(padded_a, dense_a);
+        assert_eq!(padded_b, dense_b);
+        assert_eq!(padded, dense);
     }
 
     /// Four-row x86 lookup fold matches four independent scalar folds.

@@ -296,3 +296,93 @@ pub(crate) fn fold_and_message_aarch64(
 
     (p1_acc.reduce(), pinf_acc.reduce())
 }
+
+/// Padding-aware form of [`fold_and_message_aarch64`].
+///
+/// Each output block has a useful prefix and a known-zero suffix. Full output
+/// pairs use the dense kernel algebra, an optional odd boundary computes only
+/// its useful first output, and the remaining suffix is written as zero
+/// without reading or multiplying its zero inputs.
+#[cfg(target_arch = "aarch64")]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn fold_and_message_aarch64_padded(
+    a_in: &[F128],
+    b_in: &[F128],
+    a_out: &mut [F128],
+    b_out: &mut [F128],
+    r_fold: F128,
+    eq_lo: &[F128],
+    output_block_size: usize,
+    useful_outputs: usize,
+) -> (F128, F128) {
+    debug_assert_eq!(a_in.len(), 2 * a_out.len());
+    debug_assert_eq!(b_in.len(), 2 * b_out.len());
+    debug_assert_eq!(a_out.len(), 2 * eq_lo.len());
+    debug_assert!(output_block_size.is_power_of_two());
+    debug_assert!(output_block_size >= 2);
+    debug_assert!(useful_outputs < output_block_size);
+    debug_assert_eq!(a_out.len() % output_block_size, 0);
+
+    let pairs_per_block = output_block_size / 2;
+    let full_pairs = useful_outputs / 2;
+    let has_mixed_pair = useful_outputs % 2 == 1;
+    let mut p1_acc = F256Unreduced::ZERO;
+    let mut pinf_acc = F256Unreduced::ZERO;
+
+    for pair_block in (0..eq_lo.len()).step_by(pairs_per_block) {
+        for pair_in_block in 0..full_pairs {
+            let x_lo = pair_block + pair_in_block;
+            let i = 4 * x_lo;
+            let o = 2 * x_lo;
+            let eq_l = eq_lo[x_lo];
+
+            let a_even_0 = a_in[i];
+            let a_odd_0 = a_in[i + 1];
+            let a_even_1 = a_in[i + 2];
+            let a_odd_1 = a_in[i + 3];
+            let b_even_0 = b_in[i];
+            let b_odd_0 = b_in[i + 1];
+            let b_even_1 = b_in[i + 2];
+            let b_odd_1 = b_in[i + 3];
+
+            let a0 = a_even_0 + r_fold * (a_even_0 + a_odd_0);
+            let a1 = a_even_1 + r_fold * (a_even_1 + a_odd_1);
+            let b0 = b_even_0 + r_fold * (b_even_0 + b_odd_0);
+            let b1 = b_even_1 + r_fold * (b_even_1 + b_odd_1);
+
+            a_out[o] = a0;
+            a_out[o + 1] = a1;
+            b_out[o] = b0;
+            b_out[o + 1] = b1;
+            p1_acc ^= eq_l.mul_unreduced(a1 * b1);
+            pinf_acc ^= eq_l.mul_unreduced((a0 + a1) * (b0 + b1));
+        }
+
+        if has_mixed_pair {
+            let x_lo = pair_block + full_pairs;
+            let i = 4 * x_lo;
+            let o = 2 * x_lo;
+            let a_even = a_in[i];
+            let a_odd = a_in[i + 1];
+            let b_even = b_in[i];
+            let b_odd = b_in[i + 1];
+            let a0 = a_even + r_fold * (a_even + a_odd);
+            let b0 = b_even + r_fold * (b_even + b_odd);
+
+            a_out[o] = a0;
+            a_out[o + 1] = F128::ZERO;
+            b_out[o] = b0;
+            b_out[o + 1] = F128::ZERO;
+            // The second folded value is zero, so G(1)=0 and
+            // G(∞)=(a0+0)(b0+0)=a0*b0.
+            pinf_acc ^= eq_lo[x_lo].mul_unreduced(a0 * b0);
+        }
+
+        let output_start = 2 * pair_block + useful_outputs;
+        let output_end = 2 * pair_block + output_block_size;
+        a_out[output_start..output_end].fill(F128::ZERO);
+        b_out[output_start..output_end].fill(F128::ZERO);
+    }
+
+    (p1_acc.reduce(), pinf_acc.reduce())
+}
