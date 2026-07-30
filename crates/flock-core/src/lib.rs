@@ -51,37 +51,60 @@ pub mod zerocheck;
 /// Returns the number of threads the pool was configured with, or `None`
 /// if no change was made because Rayon was already initialized.
 pub fn init_perf_thread_pool() -> Option<usize> {
-    let n = std::env::var("RAYON_NUM_THREADS")
+    // Respect an explicit RAYON_NUM_THREADS thread count, but still build the
+    // pool ourselves: rayon's lazy env-driven init would skip the QoS
+    // start-handler below.
+    let n = match std::env::var("RAYON_NUM_THREADS")
         .ok()
-        .and_then(|s| s.parse::<usize>().ok())
+        .and_then(|v| v.parse::<usize>().ok())
         .filter(|&n| n > 0)
-        .unwrap_or_else(perf_core_count);
-    match rayon::ThreadPoolBuilder::new()
-        .num_threads(n)
-        .start_handler(|_| set_prover_thread_qos())
-        .build_global()
     {
+        Some(n) => n,
+        None => perf_core_count(),
+    };
+    // Tag the calling thread and every pool worker as user-interactive QoS.
+    // A worker process launched from a background service (e.g. a CI runner
+    // daemon) inherits that service's QoS ceiling, and macOS then steers its
+    // threads toward efficiency cores and lower clocks. Explicitly claiming
+    // interactive QoS restores full P-core scheduling; on an interactive
+    // shell it is a no-op. FLOCK_NO_QOS disables the tagging for A/B runs.
+    let qos = std::env::var_os("FLOCK_NO_QOS").is_none();
+    if qos {
+        set_performance_qos();
+    }
+    let mut builder = rayon::ThreadPoolBuilder::new().num_threads(n);
+    if qos {
+        builder = builder.start_handler(|_| set_performance_qos());
+    }
+    match builder.build_global() {
         Ok(()) => Some(n),
         Err(_) => None, // pool already built
     }
 }
 
-/// Mark Rayon prover workers as latency-sensitive on macOS. A bare Rayon pool
-/// inherits default QoS, which lets sustained jobs drift onto efficiency cores
-/// even when the pool was deliberately sized to the performance-core count.
+/// Tag the current thread as user-interactive QoS. On macOS the scheduler
+/// then prefers performance cores and full clocks for this thread even when
+/// the process was spawned from a background-QoS service. No-op elsewhere.
+///
+/// Applied to BOTH the calling thread and (via the start handler above) every
+/// pool worker: the caller runs the serial timed segments — private-input
+/// expansion, transcript work between parallel phases, proof serialization
+/// and publication — which a worker-only handler leaves at inherited QoS.
+/// USER_INTERACTIVE (0x21) sits one scheduling band above the USER_INITIATED
+/// (0x19) tag the previous frontier used.
 #[cfg(target_os = "macos")]
-fn set_prover_thread_qos() {
+fn set_performance_qos() {
+    // QOS_CLASS_USER_INTERACTIVE = 0x21. Declared inline to avoid a libc
+    // dependency (same pattern as the commit prefault's background tag).
     unsafe extern "C" {
         fn pthread_set_qos_class_self_np(qos_class: u32, relative_priority: i32) -> i32;
     }
-    // QOS_CLASS_USER_INITIATED: explicit user work that should finish promptly.
     unsafe {
-        let _ = pthread_set_qos_class_self_np(0x19, 0);
+        let _ = pthread_set_qos_class_self_np(0x21, 0);
     }
 }
-
 #[cfg(not(target_os = "macos"))]
-fn set_prover_thread_qos() {}
+fn set_performance_qos() {}
 
 /// Allocate a `Vec<T>` of length `n` whose contents are NOT zero-initialized.
 /// Caller MUST write every slot before reading it.

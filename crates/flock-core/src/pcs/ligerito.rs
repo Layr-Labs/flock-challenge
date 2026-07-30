@@ -2635,6 +2635,14 @@ fn fold_and_msg_lsb(f: &[F128], b: &[F128], r: F128) -> (Vec<F128>, Vec<F128>, S
         crate::alloc_uninit_f128_vec(half),
         crate::alloc_uninit_f128_vec(half),
     );
+    // NT gate: the folded buffers are next read only after this message is
+    // absorbed and the next fold challenge sampled (a Fiat–Shamir barrier),
+    // so at ≥64 MB per output the fused kernel streams its stores past the
+    // cache (message from registers, no readback) and skips their
+    // read-for-ownership traffic.
+    #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+    let nt_stores = half >= crate::field::f128_slice::NT_STORE_MIN_F128
+        && std::env::var_os("FLOCK_NO_NT_LIG").is_none();
     let (u_0, u_2) = nf
         .par_chunks_mut(CHUNK)
         .zip(nb.par_chunks_mut(CHUNK))
@@ -2642,6 +2650,20 @@ fn fold_and_msg_lsb(f: &[F128], b: &[F128], r: F128) -> (Vec<F128>, Vec<F128>, S
         .map(|(ci, (fc, bc))| {
             let base = ci * CHUNK;
             let len = fc.len();
+            #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+            if nt_stores {
+                // SAFETY: chunk geometry supplies two inputs per output; the
+                // chunks are even-length and start at even global indices.
+                return unsafe {
+                    crate::field::f128_slice::fold_pairs_msg_nt(
+                        &f[2 * base..2 * (base + len)],
+                        &b[2 * base..2 * (base + len)],
+                        fc,
+                        bc,
+                        r,
+                    )
+                };
+            }
             let mut u0 = F128::ZERO;
             let mut u2 = F128::ZERO;
             // Fold this slice, then pair up the just-folded values for the msg.
