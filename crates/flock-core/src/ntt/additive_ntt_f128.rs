@@ -41,6 +41,8 @@
 //! FRI fold processes layers in **reverse** (deepest first), at which level
 //! pairs are adjacent — matching the standard `fold_pair` formula in DP24.
 
+use std::sync::{Arc, OnceLock};
+
 use crate::field::F128;
 
 mod kernels;
@@ -93,6 +95,55 @@ fn span_get(basis: &[F128], idx: usize) -> F128 {
     acc
 }
 
+/// Largest domain whose complete breadth-first twiddle tree is cached.
+/// A size-2^20 domain uses just under 16 MiB; larger domains keep the compact
+/// allocation-free fallback.
+const MAX_PRECOMPUTED_TWIDDLE_LOG: usize = 20;
+
+fn precompute_twiddles(evals: &[Vec<F128>]) -> Option<Vec<F128>> {
+    let log_d = evals.len();
+    if log_d > MAX_PRECOMPUTED_TWIDDLE_LOG {
+        return None;
+    }
+
+    let mut twiddles = Vec::with_capacity((1usize << log_d) - 1);
+    for layer in 0..log_d {
+        let layer_start = twiddles.len();
+        let eval_row = &evals[log_d - layer - 1];
+        debug_assert_eq!(eval_row.len(), layer + 1);
+        twiddles.push(F128::ZERO);
+        for (bit, &basis_value) in eval_row[1..].iter().enumerate() {
+            let half = 1usize << bit;
+            for block in 0..half {
+                twiddles.push(twiddles[layer_start + block] + basis_value);
+            }
+        }
+        debug_assert_eq!(twiddles.len() - layer_start, 1usize << layer);
+    }
+    Some(twiddles)
+}
+
+/// Share immutable standard-basis tables across all NTT objects. The worker's
+/// mandatory untimed proof initializes these before measured requests.
+fn cached_standard_twiddles(dim: usize, evals: &[Vec<F128>]) -> Option<Arc<[F128]>> {
+    if dim > MAX_PRECOMPUTED_TWIDDLE_LOG {
+        return None;
+    }
+    static TABLES: OnceLock<[OnceLock<Arc<[F128]>>; MAX_PRECOMPUTED_TWIDDLE_LOG + 1]> =
+        OnceLock::new();
+    let tables = TABLES.get_or_init(|| std::array::from_fn(|_| OnceLock::new()));
+    Some(
+        tables[dim]
+            .get_or_init(|| {
+                Arc::from(
+                    precompute_twiddles(evals)
+                        .expect("standard production domain should fit twiddle cache"),
+                )
+            })
+            .clone(),
+    )
+}
+
 /// Additive NTT over F_{2^128} with the standard polynomial-basis subspace.
 ///
 /// The basis is `{1, x, x², …, x^(ℓ-1)}` in F_{2^128} = F_2[x]/(GHASH-poly).
@@ -102,13 +153,18 @@ fn span_get(basis: &[F128], idx: usize) -> F128 {
 pub struct AdditiveNttF128 {
     /// `evals[i]` of length `ℓ − i`, the normalized subspace polynomial values.
     evals: Vec<Vec<F128>>,
+    /// Breadth-first table: layer `l` starts at `2^l - 1`.
+    precomputed_twiddles: Option<Arc<[F128]>>,
 }
 
 impl AdditiveNttF128 {
     /// Construct an NTT from an explicit F_2-basis.
     pub fn new(basis: &[F128]) -> Self {
+        let evals = generate_evals_from_subspace(basis);
+        let precomputed_twiddles = precompute_twiddles(&evals).map(Arc::from);
         Self {
-            evals: generate_evals_from_subspace(basis),
+            evals,
+            precomputed_twiddles,
         }
     }
 
@@ -117,7 +173,12 @@ impl AdditiveNttF128 {
     pub fn standard(dim: usize) -> Self {
         assert!(dim <= 64, "standard NTT requires dim ≤ 64");
         let basis: Vec<F128> = (0..dim).map(|i| F128::new(1u64 << i, 0)).collect();
-        Self::new(&basis)
+        let evals = generate_evals_from_subspace(&basis);
+        let precomputed_twiddles = cached_standard_twiddles(dim, &evals);
+        Self {
+            evals,
+            precomputed_twiddles,
+        }
     }
 
     pub fn log_domain_size(&self) -> usize {
@@ -132,6 +193,11 @@ impl AdditiveNttF128 {
     /// (The 0-th element of the row corresponds to `Ŵ_{ℓ-l-1}(β_{ℓ-l-1}) = 1`,
     /// which is "absorbed" into the butterfly and not in the twiddle.)
     pub fn twiddle(&self, layer: usize, block: usize) -> F128 {
+        debug_assert!(layer < self.log_domain_size());
+        debug_assert!(block < 1usize << layer);
+        if let Some(twiddles) = &self.precomputed_twiddles {
+            return twiddles[(1usize << layer) - 1 + block];
+        }
         let v = &self.evals[self.log_domain_size() - layer - 1];
         span_get(&v[1..], block)
     }
@@ -960,6 +1026,41 @@ mod tests {
         // twiddle(0, 0) = 0 (no bits set in block index 0).
         let ntt = AdditiveNttF128::standard(4);
         assert_eq!(ntt.twiddle(0, 0), F128::ZERO);
+    }
+
+    #[test]
+    fn precomputed_twiddles_match_span_reference_and_cap() {
+        for log_d in [1usize, 2, 5, 8, 12] {
+            let ntt = AdditiveNttF128::standard(log_d);
+            let table = ntt
+                .precomputed_twiddles
+                .as_ref()
+                .expect("production-size domain should cache twiddles");
+            assert_eq!(table.len(), (1usize << log_d) - 1);
+            for layer in 0..log_d {
+                let eval_row = &ntt.evals[log_d - layer - 1];
+                for block in 0..(1usize << layer) {
+                    assert_eq!(ntt.twiddle(layer, block), span_get(&eval_row[1..], block));
+                }
+            }
+        }
+
+        let cached_a = AdditiveNttF128::standard(8);
+        let cached_b = AdditiveNttF128::standard(8);
+        assert!(Arc::ptr_eq(
+            cached_a.precomputed_twiddles.as_ref().unwrap(),
+            cached_b.precomputed_twiddles.as_ref().unwrap()
+        ));
+
+        let fallback = AdditiveNttF128::standard(MAX_PRECOMPUTED_TWIDDLE_LOG + 1);
+        assert!(fallback.precomputed_twiddles.is_none());
+        let layer = MAX_PRECOMPUTED_TWIDDLE_LOG;
+        let block = (1usize << layer) - 1;
+        let eval_row = &fallback.evals[fallback.log_domain_size() - layer - 1];
+        assert_eq!(
+            fallback.twiddle(layer, block),
+            span_get(&eval_row[1..], block)
+        );
     }
 
     /// At layer log_d - 1 (deepest, where FRI starts), pairs are adjacent.
