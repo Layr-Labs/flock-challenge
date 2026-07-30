@@ -70,7 +70,7 @@ pub fn init_perf_thread_pool() -> Option<usize> {
 /// inherits default QoS, which lets sustained jobs drift onto efficiency cores
 /// even when the pool was deliberately sized to the performance-core count.
 #[cfg(target_os = "macos")]
-fn set_prover_thread_qos() {
+pub(crate) fn set_prover_thread_qos() {
     unsafe extern "C" {
         fn pthread_set_qos_class_self_np(qos_class: u32, relative_priority: i32) -> i32;
     }
@@ -81,7 +81,7 @@ fn set_prover_thread_qos() {
 }
 
 #[cfg(not(target_os = "macos"))]
-fn set_prover_thread_qos() {}
+pub(crate) fn set_prover_thread_qos() {}
 
 /// Allocate a `Vec<T>` of length `n` whose contents are NOT zero-initialized.
 /// Caller MUST write every slot before reading it.
@@ -142,14 +142,31 @@ pub(crate) fn perf_core_count_cached() -> usize {
 fn perf_core_count() -> usize {
     #[cfg(target_os = "macos")]
     {
-        if let Ok(out) = std::process::Command::new("sysctl")
-            .args(["-n", "hw.perflevel0.physicalcpu"])
-            .output()
-            && let Ok(s) = std::str::from_utf8(&out.stdout)
-            && let Ok(n) = s.trim().parse::<usize>()
-            && n > 0
-        {
-            return n;
+        unsafe extern "C" {
+            fn sysctlbyname(
+                name: *const std::ffi::c_char,
+                oldp: *mut std::ffi::c_void,
+                oldlenp: *mut usize,
+                newp: *mut std::ffi::c_void,
+                newlen: usize,
+            ) -> std::ffi::c_int;
+        }
+
+        let mut n = 0_i32;
+        let mut len = std::mem::size_of_val(&n);
+        // Query in-process: the ranked macOS sandbox forbids spawning the
+        // `sysctl` executable but permits this read-only kernel query.
+        let status = unsafe {
+            sysctlbyname(
+                c"hw.perflevel0.physicalcpu".as_ptr(),
+                (&mut n as *mut i32).cast(),
+                &mut len,
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        if status == 0 && len == std::mem::size_of_val(&n) && n > 0 {
+            return n as usize;
         }
     }
     #[cfg(target_os = "linux")]

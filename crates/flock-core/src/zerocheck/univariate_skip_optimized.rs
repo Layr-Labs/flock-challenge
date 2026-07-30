@@ -477,6 +477,44 @@ struct WorkerStateWithSHatV {
     local_res_c_s_1: [F128; ELL],
 }
 
+/// Run the ranked round-one URM on all Apple-silicon cores when the caller's
+/// global Rayon pool is the homogeneous performance-core pool.
+///
+/// Round one exposes hundreds of equal-sized `x_hi` jobs and Rayon's dynamic
+/// work stealing can therefore use efficiency cores without assigning them a
+/// fixed shard that becomes a barrier straggler. The worker's untimed warm
+/// proof initializes this private pool before scored work. Explicit thread
+/// overrides (including single-thread probes) retain the global pool.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn install_round1_all_core<R: Send>(work: impl FnOnce() -> R + Send) -> R {
+    use std::sync::OnceLock;
+
+    let performance_threads = crate::perf_core_count_cached();
+    let current_threads = rayon::current_num_threads();
+    let all_threads = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(current_threads);
+
+    if current_threads != performance_threads || all_threads <= current_threads {
+        return work();
+    }
+
+    static POOL: OnceLock<rayon::ThreadPool> = OnceLock::new();
+    let pool = POOL.get_or_init(|| {
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(all_threads)
+            .start_handler(|_| crate::set_prover_thread_qos())
+            .build()
+            .expect("build all-core round-one pool")
+    });
+    pool.install(work)
+}
+
+#[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+fn install_round1_all_core<R: Send>(work: impl FnOnce() -> R + Send) -> R {
+    work()
+}
+
 impl WorkerStateWithSHatV {
     fn new() -> Self {
         Self {
@@ -800,39 +838,41 @@ pub fn round1_shift_reduce_extract_c_packed_padded_with_s_hat_v(
 
     let (within_outer_mask, b_med_counts) = build_b_med_counts(padding);
 
-    let (res_ab, res_c_s_0, res_c_s_1) = (0..hi_size)
-        .into_par_iter()
-        .fold(WorkerStateWithSHatV::new, |mut state, x_hi| {
-            let eq_hi_val = eq_hi[x_hi];
-            process_one_x_hi_with_s_hat_v(
-                x_hi,
-                big_lo_size,
-                n_lo_and_inner,
-                within_outer_mask,
-                &b_med_counts,
-                a_packed,
-                b_packed,
-                c_packed,
-                inv_table,
-                &eq_lo_scaled,
-                eq_hi_val,
-                convert,
-                &mut state,
-            );
-            state
-        })
-        .map(|s| (s.local_res_ab, s.local_res_c_s_0, s.local_res_c_s_1))
-        .reduce(
-            || ([F128::ZERO; ELL], [F128::ZERO; ELL], [F128::ZERO; ELL]),
-            |(mut ab1, mut c0_1, mut c1_1), (ab2, c0_2, c1_2)| {
-                for i in 0..ELL {
-                    ab1[i] += ab2[i];
-                    c0_1[i] += c0_2[i];
-                    c1_1[i] += c1_2[i];
-                }
-                (ab1, c0_1, c1_1)
-            },
-        );
+    let (res_ab, res_c_s_0, res_c_s_1) = install_round1_all_core(|| {
+        (0..hi_size)
+            .into_par_iter()
+            .fold(WorkerStateWithSHatV::new, |mut state, x_hi| {
+                let eq_hi_val = eq_hi[x_hi];
+                process_one_x_hi_with_s_hat_v(
+                    x_hi,
+                    big_lo_size,
+                    n_lo_and_inner,
+                    within_outer_mask,
+                    &b_med_counts,
+                    a_packed,
+                    b_packed,
+                    c_packed,
+                    inv_table,
+                    &eq_lo_scaled,
+                    eq_hi_val,
+                    convert,
+                    &mut state,
+                );
+                state
+            })
+            .map(|s| (s.local_res_ab, s.local_res_c_s_0, s.local_res_c_s_1))
+            .reduce(
+                || ([F128::ZERO; ELL], [F128::ZERO; ELL], [F128::ZERO; ELL]),
+                |(mut ab1, mut c0_1, mut c1_1), (ab2, c0_2, c1_2)| {
+                    for i in 0..ELL {
+                        ab1[i] += ab2[i];
+                        c0_1[i] += c0_2[i];
+                        c1_1[i] += c1_2[i];
+                    }
+                    (ab1, c0_1, c1_1)
+                },
+            )
+    });
 
     // Wire output: bank_0 + bank_1 reconstructs the original `res_c_s` (by
     // F_2-linearity of φ_8 over the masked-byte sum).
