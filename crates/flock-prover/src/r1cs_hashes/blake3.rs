@@ -1583,7 +1583,7 @@ impl Blake3Setup {
 // `common::drive_witness_batch_major`.
 // ---------------------------------------------------------------------------
 
-use super::common::{BM_V, BmRow, add_carry_parts_v, or_bit_row, or_u32_row};
+use super::common::{BM_V, BmRow, or_bit_row, or_u32_row};
 
 #[inline(always)]
 fn bm_xor_rotr(x: &[u32; BM_V], y: &[u32; BM_V], r: u32) -> [u32; BM_V] {
@@ -1610,10 +1610,25 @@ fn bm_add_inline(
     y: &[u32; BM_V],
     carry_bit: usize,
 ) -> [u32; BM_V] {
-    let (sum, left, right, carry) = add_carry_parts_v(x, y);
-    or_u32_row(rows.z, carry_bit, &carry);
-    or_u32_row(rows.a, carry_bit, &left);
-    or_u32_row(rows.b, carry_bit, &right);
+    const MASK_LO31: u32 = 0x7FFF_FFFF;
+    let word = carry_bit >> 6;
+    let shift = carry_bit & 63;
+    let mut sum = [0u32; BM_V];
+    for j in 0..BM_V {
+        let s = x[j].wrapping_add(y[j]);
+        let cin = s ^ x[j] ^ y[j];
+        let left = (x[j] ^ cin) & MASK_LO31;
+        let right = (y[j] ^ cin) & MASK_LO31;
+        sum[j] = s;
+        rows.z[word][j] |= ((left & right) as u64) << shift;
+        rows.a[word][j] |= (left as u64) << shift;
+        rows.b[word][j] |= (right as u64) << shift;
+        if shift > 32 {
+            rows.z[word + 1][j] |= ((left & right) as u64) >> (64 - shift);
+            rows.a[word + 1][j] |= (left as u64) >> (64 - shift);
+            rows.b[word + 1][j] |= (right as u64) >> (64 - shift);
+        }
+    }
     sum
 }
 
