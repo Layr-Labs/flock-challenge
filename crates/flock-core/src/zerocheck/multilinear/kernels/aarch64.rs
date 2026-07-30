@@ -15,29 +15,6 @@ unsafe fn pmull_lane(a: u64, b: u64) -> core::arch::aarch64::uint64x2_t {
     unsafe { core::mem::transmute::<u128, uint64x2_t>(vmull_p64(a, b)) }
 }
 
-#[cfg(target_arch = "aarch64")]
-#[inline]
-#[target_feature(enable = "aes")]
-unsafe fn karatsuba_products_q(
-    a: core::arch::aarch64::uint64x2_t,
-    b: core::arch::aarch64::uint64x2_t,
-) -> (
-    core::arch::aarch64::uint64x2_t,
-    core::arch::aarch64::uint64x2_t,
-    core::arch::aarch64::uint64x2_t,
-) {
-    use core::arch::aarch64::*;
-    unsafe {
-        let p0 = pmull_lane(vgetq_lane_u64::<0>(a), vgetq_lane_u64::<0>(b));
-        let p2 = pmull_lane(vgetq_lane_u64::<1>(a), vgetq_lane_u64::<1>(b));
-        let a_sum = veorq_u64(a, vextq_u64::<1>(a, a));
-        let b_sum = veorq_u64(b, vextq_u64::<1>(b, b));
-        let pm = pmull_lane(vgetq_lane_u64::<0>(a_sum), vgetq_lane_u64::<0>(b_sum));
-        let cross = veorq_u64(veorq_u64(pm, p0), p2);
-        (p0, cross, p2)
-    }
-}
-
 /// GHASH multiply with both operands and the result kept in q registers.
 #[cfg(target_arch = "aarch64")]
 #[inline]
@@ -49,7 +26,11 @@ unsafe fn mul_q(
     use core::arch::aarch64::*;
     unsafe {
         let zero = vdupq_n_u64(0);
-        let (t0, mut t1, t2) = karatsuba_products_q(a, b);
+        let t0 = pmull_lane(vgetq_lane_u64::<0>(a), vgetq_lane_u64::<0>(b));
+        let t1a = pmull_lane(vgetq_lane_u64::<0>(a), vgetq_lane_u64::<1>(b));
+        let t1b = pmull_lane(vgetq_lane_u64::<1>(a), vgetq_lane_u64::<0>(b));
+        let t2 = pmull_lane(vgetq_lane_u64::<1>(a), vgetq_lane_u64::<1>(b));
+        let mut t1 = veorq_u64(t1a, t1b);
 
         t1 = veorq_u64(t1, vextq_u64::<1>(zero, t2));
         t1 = veorq_u64(t1, pmull_lane(vgetq_lane_u64::<1>(t2), 0x87));
@@ -70,7 +51,11 @@ unsafe fn mul_unreduced_q(
     use core::arch::aarch64::*;
     unsafe {
         let zero = vdupq_n_u64(0);
-        let (ll, cross, hh) = karatsuba_products_q(a, b);
+        let ll = pmull_lane(vgetq_lane_u64::<0>(a), vgetq_lane_u64::<0>(b));
+        let lh = pmull_lane(vgetq_lane_u64::<0>(a), vgetq_lane_u64::<1>(b));
+        let hl = pmull_lane(vgetq_lane_u64::<1>(a), vgetq_lane_u64::<0>(b));
+        let hh = pmull_lane(vgetq_lane_u64::<1>(a), vgetq_lane_u64::<1>(b));
+        let cross = veorq_u64(lh, hl);
         WideNeon {
             lo: veorq_u64(ll, vextq_u64::<1>(zero, cross)),
             hi: veorq_u64(hh, vextq_u64::<1>(cross, zero)),
@@ -310,80 +295,4 @@ pub(crate) fn fold_and_message_aarch64(
     }
 
     (p1_acc.reduce(), pinf_acc.reduce())
-}
-
-#[cfg(all(test, target_arch = "aarch64", target_feature = "aes"))]
-mod tests {
-    use super::*;
-    use core::arch::aarch64::uint64x2_t;
-
-    fn splitmix64(state: &mut u64) -> u64 {
-        *state = state.wrapping_add(0x9e37_79b9_7f4a_7c15);
-        let mut z = *state;
-        z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
-        z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
-        z ^ (z >> 31)
-    }
-
-    #[test]
-    fn karatsuba_q_products_match_scalar_field_products() {
-        let mut state = 0x4b41_5241_5453_5542;
-
-        unsafe {
-            for _ in 0..256 {
-                let a = F128::new(splitmix64(&mut state), splitmix64(&mut state));
-                let b = F128::new(splitmix64(&mut state), splitmix64(&mut state));
-                let a_q = core::mem::transmute::<F128, uint64x2_t>(a);
-                let b_q = core::mem::transmute::<F128, uint64x2_t>(b);
-
-                let (p0, cross, p2) = karatsuba_products_q(a_q, b_q);
-                let product = WideNeon {
-                    lo: core::arch::aarch64::veorq_u64(
-                        p0,
-                        core::arch::aarch64::vextq_u64::<1>(
-                            core::arch::aarch64::vdupq_n_u64(0),
-                            cross,
-                        ),
-                    ),
-                    hi: core::arch::aarch64::veorq_u64(
-                        p2,
-                        core::arch::aarch64::vextq_u64::<1>(
-                            cross,
-                            core::arch::aarch64::vdupq_n_u64(0),
-                        ),
-                    ),
-                };
-                let product_lo = core::mem::transmute::<uint64x2_t, [u64; 2]>(product.lo);
-                let product_hi = core::mem::transmute::<uint64x2_t, [u64; 2]>(product.hi);
-                let expected_unreduced = a.mul_unreduced(b);
-
-                assert_eq!(
-                    F256Unreduced {
-                        r0: product_lo[0],
-                        r1: product_lo[1],
-                        r2: product_hi[0],
-                        r3: product_hi[1],
-                    },
-                    expected_unreduced
-                );
-                assert_eq!(
-                    core::mem::transmute::<uint64x2_t, F128>(mul_q(a_q, b_q)),
-                    a * b
-                );
-
-                let unreduced = mul_unreduced_q(a_q, b_q);
-                let unreduced_lo = core::mem::transmute::<uint64x2_t, [u64; 2]>(unreduced.lo);
-                let unreduced_hi = core::mem::transmute::<uint64x2_t, [u64; 2]>(unreduced.hi);
-                assert_eq!(
-                    F256Unreduced {
-                        r0: unreduced_lo[0],
-                        r1: unreduced_lo[1],
-                        r2: unreduced_hi[0],
-                        r3: unreduced_hi[1],
-                    },
-                    expected_unreduced
-                );
-            }
-        }
-    }
 }

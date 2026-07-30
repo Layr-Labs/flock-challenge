@@ -1201,6 +1201,8 @@ pub fn generate_witness_with_ab_packed_and_lincheck(
         Some(&padding),
         n_blocks_log,
         K_LOG,
+        true,
+        K,
         |comp: &([u32; 8], [u32; 16]), z_u64, a_u64, b_u64| {
             let (h_in, m) = comp;
             build_block_ab_packed_into(h_in, m, z_u64, a_u64, b_u64);

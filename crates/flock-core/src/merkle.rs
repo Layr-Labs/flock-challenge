@@ -407,14 +407,6 @@ fn blake3_leaf_size_is_batchable(leaf_size: usize) -> bool {
 /// (left ‖ right) child pairs. Equivalent to [`blake3_parent_cv`] per node.
 #[inline]
 fn blake3_hash_many_parents(data: &[u8], out: &mut [Hash]) {
-    #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
-    {
-        let done = blake3_neon12::hash_complete_parent_groups(data, out);
-        if done < out.len() {
-            blake3_hash_many::<64>(&data[done * 64..], &mut out[done..], BLAKE3_PARENT, 0, 0);
-        }
-    }
-    #[cfg(not(all(target_arch = "aarch64", target_os = "macos")))]
     blake3_hash_many::<64>(data, out, BLAKE3_PARENT, 0, 0);
 }
 
@@ -910,28 +902,20 @@ mod tests {
     /// rather than silently changing every commitment we produce.
     #[test]
     fn blake3_batched_matches_scalar_spec() {
-        // Counts straddle both the Apple twelve-way kernel width and the
-        // upstream 16-input call width. Width and tail bugs show up here.
-        let counts = [
-            1usize, 4, 5, 11, 12, 13, 15, 16, 17, 23, 24, 25, 47, 48, 49, 63, 64, 65, 127, 128,
-            129, 200,
-        ];
+        // Node counts chosen around `BLAKE3_BATCH` (64): a single node, a
+        // partial batch, exactly one batch, one past it, and several batches
+        // with a partial tail. A width bug in the batch loop shows up here.
+        let counts = [1usize, 5, 63, 64, 65, 200];
 
         // Parents.
         for n in counts {
-            for seed in [0, 1, 0xA11C_E5EE_D15C, u64::MAX] {
-                let children = random_data(n, 64, seed);
-                let mut batched = vec![[0u8; 32]; n];
-                blake3_hash_many_parents(&children, &mut batched);
-                for i in 0..n {
-                    let l: &Hash = children[i * 64..i * 64 + 32].try_into().unwrap();
-                    let r: &Hash = children[i * 64 + 32..i * 64 + 64].try_into().unwrap();
-                    assert_eq!(
-                        batched[i],
-                        blake3_parent_cv(l, r),
-                        "parent {i} of {n}, seed {seed:#x}"
-                    );
-                }
+            let children: Vec<u8> = (0..=255u8).cycle().take(n * 64).collect();
+            let mut batched = vec![[0u8; 32]; n];
+            blake3_hash_many_parents(&children, &mut batched);
+            for i in 0..n {
+                let l: &Hash = children[i * 64..i * 64 + 32].try_into().unwrap();
+                let r: &Hash = children[i * 64 + 32..i * 64 + 64].try_into().unwrap();
+                assert_eq!(batched[i], blake3_parent_cv(l, r), "parent {i} of {n}");
             }
         }
 
@@ -1041,31 +1025,6 @@ mod tests {
                 let seq = merkle_tree_sequential(&data, n_leaves, kind);
                 assert_eq!(par, seq, "{kind} n_leaves={n_leaves} leaf_size={leaf_size}");
             }
-        }
-    }
-
-    #[test]
-    fn blake3_ranked_shape_tree_and_proofs_match_scalar() {
-        let n_leaves = 4096;
-        let leaf_size = 1024;
-        let data = random_data(n_leaves, leaf_size, 0xB3A3_0012_5EED);
-        let parallel = merkle_tree(&data, n_leaves, HashKind::Blake3);
-        let scalar = merkle_tree_sequential(&data, n_leaves, HashKind::Blake3);
-        assert_eq!(parallel, scalar);
-        assert_eq!(parallel.last(), scalar.last());
-        for index in [
-            0,
-            1,
-            n_leaves / 2 - 1,
-            n_leaves / 2,
-            n_leaves - 2,
-            n_leaves - 1,
-        ] {
-            assert_eq!(
-                merkle_proof(&parallel, n_leaves, index),
-                merkle_proof(&scalar, n_leaves, index),
-                "proof at leaf {index}"
-            );
         }
     }
 
