@@ -51,6 +51,17 @@ pub mod zerocheck;
 /// Returns the number of threads the pool was configured with, or `None`
 /// if no change was made because Rayon was already initialized.
 pub fn init_perf_thread_pool() -> Option<usize> {
+    // Tag the CALLING thread at the same QoS tier as the pool workers. The
+    // start_handler below only ever runs on Rayon workers, but the timed
+    // serial segments — seed expansion into the compression batch, the
+    // Fiat–Shamir transcript glue between every parallel phase, proof
+    // serialization, and file publication — all execute on this thread. If
+    // the host process inherits a depressed QoS ceiling, an untagged main
+    // thread leaves exactly those serial spans slow while the workers run
+    // promptly. Tier stays 0x19 (USER_INITIATED): raising the tier to 0x21
+    // was measured as a regression; main-thread *coverage* at the existing
+    // tier is the variable that was never isolated.
+    set_prover_thread_qos();
     let n = std::env::var("RAYON_NUM_THREADS")
         .ok()
         .and_then(|s| s.parse::<usize>().ok())
