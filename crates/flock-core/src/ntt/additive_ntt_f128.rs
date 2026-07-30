@@ -144,6 +144,68 @@ fn cached_standard_twiddles(dim: usize, evals: &[Vec<F128>]) -> Option<Arc<[F128
     )
 }
 
+/// Complete the last radix-8 group for the ranked Apple-silicon L0 commit.
+///
+/// The generic 2 MiB cache split selects `n_top = 9` for the production shape
+/// (`log_d = 20`, 64 interleaved lanes, rate-layer entry at layer 1). That
+/// leaves layers 7 and 8 in a fused-2 pass and starts the 2 MiB sub-transforms
+/// at layer 9. Raising the split by one lets the already-selected third top
+/// pass fuse layers 7, 8, and 9 together, so it removes one full 1 GiB
+/// codeword read/write without adding another top pass.
+///
+/// Keep this keyed to the ranked shape: recursive Ligerito commits and other
+/// transform geometries retain the cache policy that was tuned for them.
+#[inline]
+fn fusion_aware_interleaved_n_top(
+    log_d: usize,
+    num_ntts: usize,
+    start_layer: usize,
+    n_top: usize,
+) -> usize {
+    let ranked_apple_l0 = cfg!(all(
+        target_os = "macos",
+        target_arch = "aarch64",
+        target_feature = "aes"
+    )) && log_d == 20
+        && num_ntts == 64
+        && start_layer == 1
+        && n_top == 9;
+    if ranked_apple_l0 { 10 } else { n_top }
+}
+
+/// Whether to fuse the ranked L0 commit's ten cache-resident tail layers in
+/// pairs. Keep this as narrow as [`fusion_aware_interleaved_n_top`]: smaller
+/// recursive commits retain their independently tuned single-layer tail.
+#[inline]
+fn use_ranked_deep_pair_fusion(
+    log_d: usize,
+    num_ntts: usize,
+    start_layer: usize,
+    n_top: usize,
+) -> bool {
+    cfg!(all(
+        target_os = "macos",
+        target_arch = "aarch64",
+        target_feature = "aes"
+    )) && log_d == 20
+        && num_ntts == 64
+        && start_layer == 1
+        && n_top == 10
+}
+
+/// The zero-root radix-8 kernel is currently scored only for the ranked L0
+/// transform. Keep recursive and diagnostic commits on their prior kernel so
+/// this candidate has one production scope and one transfer story.
+#[inline]
+fn use_ranked_zero_root_fusion(
+    log_d: usize,
+    num_ntts: usize,
+    start_layer: usize,
+    n_top: usize,
+) -> bool {
+    use_ranked_deep_pair_fusion(log_d, num_ntts, start_layer, n_top)
+}
+
 /// Additive NTT over F_{2^128} with the standard polynomial-basis subspace.
 ///
 /// The basis is `{1, x, x², …, x^(ℓ-1)}` in F_{2^128} = F_2[x]/(GHASH-poly).
@@ -385,6 +447,7 @@ impl AdditiveNttF128 {
         } else {
             cache_n_top
         };
+        let n_top = fusion_aware_interleaved_n_top(log_d, num_ntts, start_layer, n_top);
         if n_top == 0 || log_d < 8 {
             self.forward_transform_interleaved_scalar_from_layer(data, num_ntts, start_layer);
             return;
@@ -418,6 +481,7 @@ impl AdditiveNttF128 {
             target_feature = "vpclmulqdq"
         ));
         let fused3_ok = !fused4_ok;
+        let zero_root_fused3 = use_ranked_zero_root_fusion(log_d, num_ntts, start_layer, n_top);
         let mut layer = start_layer.min(n_top);
         while layer < n_top {
             let num_blocks = 1usize << layer;
@@ -438,12 +502,21 @@ impl AdditiveNttF128 {
                         tw[3 + s] = self.twiddle(layer + 2, 4 * block + s);
                     }
                     let start = block * block_bytes;
-                    butterfly_interleaved_fused_3layer_par_rows(
-                        &mut data[start..start + block_bytes],
-                        &tw,
-                        eighth,
-                        num_ntts,
-                    );
+                    if block == 0 && zero_root_fused3 {
+                        butterfly_interleaved_fused_3layer_par_rows::<true>(
+                            &mut data[start..start + block_bytes],
+                            &tw,
+                            eighth,
+                            num_ntts,
+                        );
+                    } else {
+                        butterfly_interleaved_fused_3layer_par_rows::<false>(
+                            &mut data[start..start + block_bytes],
+                            &tw,
+                            eighth,
+                            num_ntts,
+                        );
+                    }
                 }
                 layer += 3;
             } else if fused4_ok && layer + 3 < n_top && block_size >= 16 {
@@ -505,6 +578,14 @@ impl AdditiveNttF128 {
             }
         }
 
+        // Ranked L0: layers 10..20 form five exact pairs. Fuse each pair inside
+        // the existing outer chunk job so every row is loaded/stored once per
+        // two layers and no nested Rayon region is created.
+        if use_ranked_deep_pair_fusion(log_d, num_ntts, start_layer, n_top) {
+            self.forward_transform_interleaved_deep_fused_pairs(data, num_ntts, n_top, log_d);
+            return;
+        }
+
         // Deep layers: process each sub-NTT-group cache-resident.
         let sub_size_positions = 1usize << (log_d - n_top);
         let sub_bytes = sub_size_positions * num_ntts;
@@ -525,6 +606,76 @@ impl AdditiveNttF128 {
                         let block_start = block_in_sub * block_bytes;
                         let block = &mut sub_data[block_start..block_start + block_bytes];
                         butterfly_interleaved_block(block, twiddle, block_size_half, num_ntts);
+                    }
+                }
+            });
+    }
+
+    /// Finish layers `n_top..log_d` two at a time inside independent
+    /// cache-resident sub-NTTs. The outer `par_chunks_mut` is the only Rayon
+    /// boundary; block and row work inside each chunk is deliberately serial.
+    fn forward_transform_interleaved_deep_fused_pairs(
+        &self,
+        data: &mut [F128],
+        num_ntts: usize,
+        n_top: usize,
+        log_d: usize,
+    ) {
+        use rayon::prelude::*;
+
+        debug_assert!(n_top <= log_d);
+        debug_assert_eq!(data.len(), (1usize << log_d) * num_ntts);
+        let sub_size_positions = 1usize << (log_d - n_top);
+        let sub_elems = sub_size_positions * num_ntts;
+
+        data.par_chunks_mut(sub_elems)
+            .enumerate()
+            .for_each(|(sub_idx, sub_data)| {
+                let mut layer = n_top;
+                while layer + 1 < log_d {
+                    let layer_in_sub = layer - n_top;
+                    let num_blocks_in_sub = 1usize << layer_in_sub;
+                    let block_size_positions = 1usize << (log_d - layer);
+                    let quarter = block_size_positions >> 2;
+                    let block_elems = block_size_positions * num_ntts;
+
+                    for block_in_sub in 0..num_blocks_in_sub {
+                        let global_block = sub_idx * num_blocks_in_sub + block_in_sub;
+                        let t_outer = self.twiddle(layer, global_block);
+                        let t_inner_a = self.twiddle(layer + 1, 2 * global_block);
+                        let t_inner_b = self.twiddle(layer + 1, 2 * global_block + 1);
+                        let block_start = block_in_sub * block_elems;
+                        butterfly_interleaved_fused_2layer_rows_seq(
+                            &mut sub_data[block_start..block_start + block_elems],
+                            t_outer,
+                            t_inner_a,
+                            t_inner_b,
+                            quarter,
+                            num_ntts,
+                        );
+                    }
+                    layer += 2;
+                }
+
+                // The ranked path has ten deep layers and therefore no tail.
+                // Retaining the scalar single-layer tail makes this helper a
+                // compact exact-test fixture for odd layer counts as well.
+                if layer < log_d {
+                    let layer_in_sub = layer - n_top;
+                    let num_blocks_in_sub = 1usize << layer_in_sub;
+                    let block_size_positions = 1usize << (log_d - layer);
+                    let block_size_half = block_size_positions >> 1;
+                    let block_elems = block_size_positions * num_ntts;
+                    for block_in_sub in 0..num_blocks_in_sub {
+                        let global_block = sub_idx * num_blocks_in_sub + block_in_sub;
+                        let twiddle = self.twiddle(layer, global_block);
+                        let block_start = block_in_sub * block_elems;
+                        butterfly_interleaved_block(
+                            &mut sub_data[block_start..block_start + block_elems],
+                            twiddle,
+                            block_size_half,
+                            num_ntts,
+                        );
                     }
                 }
             });
@@ -882,6 +1033,35 @@ fn butterfly_interleaved_fused_2layer_par_rows(
     }
 }
 
+/// Sequential counterpart of [`butterfly_interleaved_fused_2layer_par_rows`].
+/// Used from inside the deep phase's outer Rayon jobs: adding row-level Rayon
+/// here would create a nested fork/join for every 1 MiB subtree.
+#[inline]
+fn butterfly_interleaved_fused_2layer_rows_seq(
+    block: &mut [F128],
+    t_outer: F128,
+    t_inner_a: F128,
+    t_inner_b: F128,
+    quarter: usize,
+    num_ntts: usize,
+) {
+    let stride = quarter * num_ntts;
+    debug_assert!(num_ntts > 0);
+    debug_assert_eq!(block.len(), 4 * stride);
+
+    let (top_half, bot_half) = block.split_at_mut(2 * stride);
+    let (q1, q2) = top_half.split_at_mut(stride);
+    let (q3, q4) = bot_half.split_at_mut(stride);
+    for (((row_a, row_b), row_c), row_d) in q1
+        .chunks_exact_mut(num_ntts)
+        .zip(q2.chunks_exact_mut(num_ntts))
+        .zip(q3.chunks_exact_mut(num_ntts))
+        .zip(q4.chunks_exact_mut(num_ntts))
+    {
+        kernels::butterfly_fused_2layer(row_a, row_b, row_c, row_d, t_outer, t_inner_a, t_inner_b);
+    }
+}
+
 /// Butterfly one block of an interleaved (SoA) buffer with shared twiddle.
 ///
 /// `block` has length `(2 * block_size_half) * num_ntts` and is laid out as
@@ -923,7 +1103,7 @@ fn butterfly_interleaved_block(
 /// all land in one set and demand N ways. Radix-8 is the widest fusion an
 /// 8-way L1D admits.
 #[inline]
-fn butterfly_interleaved_fused_3layer_par_rows(
+fn butterfly_interleaved_fused_3layer_par_rows<const ZERO_ROOT: bool>(
     block: &mut [F128],
     t: &[F128; 7],
     eighth: usize,
@@ -932,6 +1112,11 @@ fn butterfly_interleaved_fused_3layer_par_rows(
     use rayon::prelude::*;
     const PARALLEL_ROW_THRESHOLD: usize = 256;
     debug_assert_eq!(block.len(), 8 * eighth * num_ntts);
+    if ZERO_ROOT {
+        debug_assert_eq!(t[0], F128::ZERO);
+        debug_assert_eq!(t[1], F128::ZERO);
+        debug_assert_eq!(t[3], F128::ZERO);
+    }
     // Carry the base as `usize` (Send+Sync) so rayon's per-`r` closure can hold
     // it without a raw-pointer `Sync` shim. Each `r` writes the disjoint rows
     // `{i*eighth + r : i ∈ 0..8}`, so concurrent writes never alias.
@@ -940,14 +1125,34 @@ fn butterfly_interleaved_fused_3layer_par_rows(
         for r in 0..eighth {
             // SAFETY: row group r writes disjoint rows of this block.
             unsafe {
-                kernels::butterfly_fused_3layer_row(base as *mut F128, eighth, num_ntts, r, t)
+                if ZERO_ROOT {
+                    kernels::butterfly_fused_3layer_zero_root_row(
+                        base as *mut F128,
+                        eighth,
+                        num_ntts,
+                        r,
+                        t,
+                    )
+                } else {
+                    kernels::butterfly_fused_3layer_row(base as *mut F128, eighth, num_ntts, r, t)
+                }
             };
         }
     } else {
         (0..eighth).into_par_iter().for_each(|r| {
             // SAFETY: distinct r → disjoint row groups → no aliasing.
             unsafe {
-                kernels::butterfly_fused_3layer_row(base as *mut F128, eighth, num_ntts, r, t)
+                if ZERO_ROOT {
+                    kernels::butterfly_fused_3layer_zero_root_row(
+                        base as *mut F128,
+                        eighth,
+                        num_ntts,
+                        r,
+                        t,
+                    )
+                } else {
+                    kernels::butterfly_fused_3layer_row(base as *mut F128, eighth, num_ntts, r, t)
+                }
             };
         });
     }
@@ -1024,6 +1229,168 @@ mod tests {
         (0..n).map(|_| rng.f128()).collect()
     }
 
+    fn scalar_fused_3layer_block(
+        block: &mut [F128],
+        twiddles: &[F128; 7],
+        eighth: usize,
+        num_ntts: usize,
+    ) {
+        let rows = 8 * eighth;
+        assert_eq!(block.len(), rows * num_ntts);
+        for stage in 0..3 {
+            let num_subblocks = 1usize << stage;
+            let subblock_rows = rows >> stage;
+            let half = subblock_rows >> 1;
+            let twiddle_offset = (1usize << stage) - 1;
+            for subblock in 0..num_subblocks {
+                let twiddle = twiddles[twiddle_offset + subblock];
+                let start = subblock * subblock_rows * num_ntts;
+                for row in 0..half {
+                    let top = start + row * num_ntts;
+                    let bot = top + half * num_ntts;
+                    for lane in 0..num_ntts {
+                        let v = block[bot + lane];
+                        let new_u = block[top + lane] + v * twiddle;
+                        block[top + lane] = new_u;
+                        block[bot + lane] = v + new_u;
+                    }
+                }
+            }
+        }
+    }
+
+    /// The sequential deep helper must equal two ordinary layer sweeps for
+    /// every row/lane geometry used by the ranked tail, including its final
+    /// one-row quarter.
+    #[test]
+    fn fused2_sequential_rows_match_two_single_layers() {
+        let mut rng = Rng::new(0xDEE2_F05E_20A5_0001);
+        for (quarter, num_ntts) in [(1usize, 64usize), (4, 8), (64, 2), (256, 2)] {
+            for iteration in 0..3 {
+                let t_outer = rng.f128();
+                let t_inner_a = rng.f128();
+                let t_inner_b = rng.f128();
+                let source = rand_vec(&mut rng, 4 * quarter * num_ntts);
+
+                let mut want = source.clone();
+                butterfly_interleaved_block(&mut want, t_outer, 2 * quarter, num_ntts);
+                let half_elems = 2 * quarter * num_ntts;
+                let (top, bot) = want.split_at_mut(half_elems);
+                butterfly_interleaved_block(top, t_inner_a, quarter, num_ntts);
+                butterfly_interleaved_block(bot, t_inner_b, quarter, num_ntts);
+
+                let mut got = source;
+                butterfly_interleaved_fused_2layer_rows_seq(
+                    &mut got, t_outer, t_inner_a, t_inner_b, quarter, num_ntts,
+                );
+                assert_eq!(
+                    got, want,
+                    "fused-2 sequential mismatch at quarter={quarter} \
+                     num_ntts={num_ntts} iteration={iteration}"
+                );
+            }
+        }
+    }
+
+    /// Exercise five fused deep pairs with the ranked 1024-position subtree
+    /// geometry, but only two interleaved lanes so the fixture stays small.
+    /// The scalar oracle applies the same ten layers as separate sweeps and
+    /// therefore catches both child-twiddle and global-block indexing errors.
+    #[test]
+    fn five_deep_fused_pairs_match_scalar_reference() {
+        const LOG_D: usize = 12;
+        const N_TOP: usize = 2;
+        const NUM_NTTS: usize = 2;
+
+        let mut rng = Rng::new(0xDEE2_F05E_20A5_0002);
+        let ntt = AdditiveNttF128::standard(LOG_D);
+        for iteration in 0..3 {
+            let source = rand_vec(&mut rng, (1usize << LOG_D) * NUM_NTTS);
+            let mut want = source.clone();
+            ntt.forward_transform_interleaved_scalar_from_layer(&mut want, NUM_NTTS, N_TOP);
+
+            let mut got = source;
+            ntt.forward_transform_interleaved_deep_fused_pairs(&mut got, NUM_NTTS, N_TOP, LOG_D);
+            assert_eq!(got, want, "five-pair mismatch at iteration={iteration}");
+        }
+    }
+
+    /// Only the ranked macOS/AArch64 L0 transform may use the new tail
+    /// schedule; all recursive, diagnostic, and cross-platform shapes retain
+    /// the existing single-layer deep loop.
+    #[test]
+    fn ranked_deep_pair_fusion_gate_is_narrow() {
+        let enabled_here = cfg!(all(
+            target_os = "macos",
+            target_arch = "aarch64",
+            target_feature = "aes"
+        ));
+        assert_eq!(use_ranked_deep_pair_fusion(20, 64, 1, 10), enabled_here);
+        assert!(!use_ranked_deep_pair_fusion(19, 64, 1, 10));
+        assert!(!use_ranked_deep_pair_fusion(20, 8, 1, 10));
+        assert!(!use_ranked_deep_pair_fusion(20, 64, 0, 10));
+        assert!(!use_ranked_deep_pair_fusion(20, 64, 1, 9));
+        assert_eq!(use_ranked_zero_root_fusion(20, 64, 1, 10), enabled_here);
+        assert!(!use_ranked_zero_root_fusion(19, 64, 1, 10));
+        assert!(!use_ranked_zero_root_fusion(20, 8, 1, 10));
+        assert!(!use_ranked_zero_root_fusion(20, 64, 0, 10));
+        assert!(!use_ranked_zero_root_fusion(20, 64, 1, 9));
+    }
+
+    /// Exercise the block-zero specialization and the ordinary nonzero-block
+    /// path against an independent layer-by-layer scalar oracle. The two
+    /// shapes straddle the row-parallel dispatch threshold.
+    #[test]
+    fn fused3_zero_root_and_nonzero_blocks_match_scalar() {
+        const LAYER: usize = 2;
+        const NUM_NTTS: usize = 8;
+
+        let mut rng = Rng::new(0x20E2_07AD_D171_E000);
+        for log_d in [10usize, 13] {
+            let ntt = AdditiveNttF128::standard(log_d);
+            let block_size = 1usize << (log_d - LAYER);
+            let eighth = block_size >> 3;
+            for iteration in 0..3 {
+                for block_index in [0usize, 1, 3] {
+                    let mut twiddles = [F128::ZERO; 7];
+                    twiddles[0] = ntt.twiddle(LAYER, block_index);
+                    for s in 0..2 {
+                        twiddles[1 + s] = ntt.twiddle(LAYER + 1, 2 * block_index + s);
+                    }
+                    for s in 0..4 {
+                        twiddles[3 + s] = ntt.twiddle(LAYER + 2, 4 * block_index + s);
+                    }
+
+                    let source = rand_vec(&mut rng, block_size * NUM_NTTS);
+                    let mut want = source.clone();
+                    scalar_fused_3layer_block(&mut want, &twiddles, eighth, NUM_NTTS);
+                    let mut got = source.clone();
+                    if block_index == 0 {
+                        assert_eq!(twiddles[0], F128::ZERO);
+                        assert_eq!(twiddles[1], F128::ZERO);
+                        assert_eq!(twiddles[3], F128::ZERO);
+                        butterfly_interleaved_fused_3layer_par_rows::<true>(
+                            &mut got, &twiddles, eighth, NUM_NTTS,
+                        );
+                        // The omitted stream-zero stores are valid only because
+                        // this whole row stream is mathematically unchanged.
+                        let stream_len = eighth * NUM_NTTS;
+                        assert_eq!(&got[..stream_len], &source[..stream_len]);
+                    } else {
+                        butterfly_interleaved_fused_3layer_par_rows::<false>(
+                            &mut got, &twiddles, eighth, NUM_NTTS,
+                        );
+                    }
+                    assert_eq!(
+                        got, want,
+                        "radix-8 block mismatch at log_d={log_d} iteration={iteration} \
+                         block={block_index}"
+                    );
+                }
+            }
+        }
+    }
+
     /// The parallel interleaved transform — whose top layers use the radix-8
     /// fusion on non-AVX-512 targets — must agree bit-for-bit with the scalar
     /// reference, which applies every layer as its own separate sweep.
@@ -1070,6 +1437,77 @@ mod tests {
             }
         }
         assert!(exercised, "test never transformed anything");
+    }
+
+    /// The ranked split extension must produce three consecutive radix-8
+    /// groups (layers 1..10) that are exactly equivalent to applying those
+    /// nine layers one at a time. Use a small domain here: the butterfly and
+    /// twiddle geometry is identical, while the real 64-lane/log-20 buffer is
+    /// 1 GiB and is inappropriate for a unit test.
+    #[cfg(all(target_os = "macos", target_arch = "aarch64", target_feature = "aes"))]
+    #[test]
+    fn fusion_aware_three_radix8_groups_match_scalar_reference() {
+        const LOG_D: usize = 12;
+        const NUM_NTTS: usize = 2;
+        const START_LAYER: usize = 1;
+        const N_TOP: usize = 10;
+
+        let mut rng = Rng::new(0xF051_0A8E);
+        let ntt = AdditiveNttF128::standard(LOG_D);
+        let src = rand_vec(&mut rng, (1usize << LOG_D) * NUM_NTTS);
+
+        let mut want = src.clone();
+        ntt.forward_transform_interleaved_scalar_from_layer(&mut want, NUM_NTTS, START_LAYER);
+
+        let mut got = src;
+        let mut layer = START_LAYER;
+        while layer < N_TOP {
+            let num_blocks = 1usize << layer;
+            let block_size = 1usize << (LOG_D - layer);
+            let block_elems = block_size * NUM_NTTS;
+            let eighth = block_size >> 3;
+            for block in 0..num_blocks {
+                let mut tw = [F128::ZERO; 7];
+                tw[0] = ntt.twiddle(layer, block);
+                for s in 0..2 {
+                    tw[1 + s] = ntt.twiddle(layer + 1, 2 * block + s);
+                }
+                for s in 0..4 {
+                    tw[3 + s] = ntt.twiddle(layer + 2, 4 * block + s);
+                }
+                let start = block * block_elems;
+                if block == 0 {
+                    butterfly_interleaved_fused_3layer_par_rows::<true>(
+                        &mut got[start..start + block_elems],
+                        &tw,
+                        eighth,
+                        NUM_NTTS,
+                    );
+                } else {
+                    butterfly_interleaved_fused_3layer_par_rows::<false>(
+                        &mut got[start..start + block_elems],
+                        &tw,
+                        eighth,
+                        NUM_NTTS,
+                    );
+                }
+            }
+            layer += 3;
+        }
+        debug_assert_eq!(layer, N_TOP);
+
+        // The production scheduler hands layers N_TOP..LOG_D to the deep
+        // cache-resident phase. The scalar tail is the exact same arithmetic.
+        ntt.forward_transform_interleaved_scalar_from_layer(&mut got, NUM_NTTS, N_TOP);
+        assert_eq!(got, want);
+
+        // Guard the narrowly-scoped production policy independently of the
+        // smaller arithmetic fixture above.
+        assert_eq!(fusion_aware_interleaved_n_top(20, 64, 1, 9), 10);
+        assert_eq!(fusion_aware_interleaved_n_top(19, 64, 1, 9), 9);
+        assert_eq!(fusion_aware_interleaved_n_top(20, 8, 1, 9), 9);
+        assert_eq!(fusion_aware_interleaved_n_top(20, 64, 0, 9), 9);
+        assert_eq!(fusion_aware_interleaved_n_top(20, 64, 1, 8), 8);
     }
 
     #[test]

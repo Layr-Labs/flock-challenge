@@ -73,6 +73,45 @@ pub(super) fn butterfly_fused_3layer(values: &mut [F128; 8], twiddles: &[F128; 7
     }
 }
 
+/// Fused three-layer butterfly for the root block, whose left-spine
+/// twiddles are identically zero: `twiddles[0] == twiddles[1] ==
+/// twiddles[3] == 0`.
+///
+/// A zero-twiddle forward butterfly maps `(u, v)` to `(u, v + u)`, so the
+/// seven butterflies on that spine need only XORs. The remaining five use
+/// the ordinary field multiply. In particular, `values[0]` is unchanged by
+/// all three layers.
+#[inline]
+pub(super) fn butterfly_fused_3layer_zero_root(values: &mut [F128; 8], twiddles: &[F128; 7]) {
+    #[inline(always)]
+    fn butterfly(values: &mut [F128; 8], u: usize, v: usize, twiddle: F128) {
+        let new_u = values[u] + values[v] * twiddle;
+        values[v] += new_u;
+        values[u] = new_u;
+    }
+
+    // Layer L, t[0] = 0: four XOR-only butterflies.
+    for i in 0..4 {
+        let u = values[i];
+        values[i + 4] += u;
+    }
+
+    // Layer L+1. The top-half twiddle t[1] is zero; t[2] is general.
+    for i in 0..2 {
+        let u = values[i];
+        values[i + 2] += u;
+    }
+    butterfly(values, 4, 6, twiddles[2]);
+    butterfly(values, 5, 7, twiddles[2]);
+
+    // Layer L+2. The first quarter's twiddle t[3] is zero.
+    let u = values[0];
+    values[1] += u;
+    butterfly(values, 2, 3, twiddles[4]);
+    butterfly(values, 4, 5, twiddles[5]);
+    butterfly(values, 6, 7, twiddles[6]);
+}
+
 /// Process one fused-three-layer row group across every interleaved lane.
 ///
 /// Eight row streams at stride `eighth * num_ntts` elements. Every such
@@ -99,6 +138,38 @@ pub(super) unsafe fn butterfly_fused_3layer_row(
             }
             butterfly_fused_3layer(&mut values, twiddles);
             for (i, value) in values.iter().enumerate() {
+                *ptr.add((i * eighth + r) * num_ntts + lane) = *value;
+            }
+        }
+    }
+}
+
+/// Root-block specialization of [`butterfly_fused_3layer_row`].
+///
+/// The caller additionally guarantees that `twiddles[0]`, `twiddles[1]`, and
+/// `twiddles[3]` are zero. Row stream zero is not written back because the
+/// specialized butterfly proves it is unchanged.
+///
+/// # Safety
+/// The caller guarantees that every selected row and lane is valid and that
+/// concurrent calls use disjoint row groups.
+pub(super) unsafe fn butterfly_fused_3layer_zero_root_row(
+    ptr: *mut F128,
+    eighth: usize,
+    num_ntts: usize,
+    r: usize,
+    twiddles: &[F128; 7],
+) {
+    // SAFETY: caller supplies the pointer geometry and disjointness contract.
+    unsafe {
+        for lane in 0..num_ntts {
+            let mut values = [F128::ZERO; 8];
+            for (i, value) in values.iter_mut().enumerate() {
+                *value = *ptr.add((i * eighth + r) * num_ntts + lane);
+            }
+            butterfly_fused_3layer_zero_root(&mut values, twiddles);
+            // values[0] is unchanged, so leave its cache line clean.
+            for (i, value) in values.iter().enumerate().skip(1) {
                 *ptr.add((i * eighth + r) * num_ntts + lane) = *value;
             }
         }

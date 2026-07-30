@@ -126,6 +126,25 @@ pub(super) unsafe fn butterfly_fused_3layer_row(
     }
 }
 
+/// Root-block specialization of [`butterfly_fused_3layer_row`].
+///
+/// # Safety
+/// In addition to the ordinary row-geometry contract, the caller must ensure
+/// that twiddles 0, 1, and 3 are zero.
+#[inline]
+pub(super) unsafe fn butterfly_fused_3layer_zero_root_row(
+    ptr: *mut F128,
+    eighth: usize,
+    num_ntts: usize,
+    r: usize,
+    twiddles: &[F128; 7],
+) {
+    // SAFETY: forwarded caller contract.
+    unsafe {
+        portable::butterfly_fused_3layer_zero_root_row(ptr, eighth, num_ntts, r, twiddles);
+    }
+}
+
 #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
 #[inline]
 pub(super) unsafe fn butterfly_neon_block(chunk: &mut [F128], twiddle: F128, half: usize) {
