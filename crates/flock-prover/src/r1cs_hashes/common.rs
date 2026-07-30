@@ -71,6 +71,11 @@ impl<const NW: usize> BitRecord<NW> {
         }
         buf[bi + NW] |= spill;
     }
+
+    #[inline(always)]
+    pub(crate) fn words(&self) -> &[u64; NW] {
+        &self.w
+    }
 }
 
 /// One 32-bit ADD's witness parts: `(sum, left, right, carry_aux)` with
@@ -214,6 +219,8 @@ pub(crate) fn drive_witness_packed_and_lincheck<S: Sync, F>(
     padding: Option<&S>,
     n_blocks_log: usize,
     k_log: usize,
+    clear_before_build: bool,
+    stripe_useful_bits: usize,
     per_block: F,
 ) -> (Vec<F128>, Vec<F128>, Vec<F128>, Vec<u8>)
 where
@@ -234,6 +241,11 @@ where
         n_total >= 8 && n_total.is_multiple_of(8),
         "lincheck stripe layout requires n_total ≥ 8 and divisible by 8"
     );
+    assert!(stripe_useful_bits <= k);
+    assert!(
+        clear_before_build || padding.is_some(),
+        "a full-overwrite witness builder requires a padding block"
+    );
 
     let total_f128 = n_total * f128_per_block;
     // z/a/b are allocated uninitialized and zeroed *inside* the parallel loop
@@ -253,16 +265,16 @@ where
         .zip(z_lincheck.par_chunks_mut(k))
         .enumerate()
         .for_each(|(g, (((z_grp, a_grp), b_grp), stripe))| {
-            // Zero this group's z/a/b up front (parallel memset — the buffers
-            // were uninit-allocated). The per-block builder ORs 1-bits into
-            // pre-zeroed words; any slot left unbuilt (no padding block) stays
-            // zero, which the lincheck transpose below reads correctly.
-            // SAFETY: F128 is `Copy` (no Drop) and the all-zero bit pattern is
-            // the valid `F128::ZERO`, so a byte memset is a correct init.
-            unsafe {
-                std::ptr::write_bytes(z_grp.as_mut_ptr(), 0, z_grp.len());
-                std::ptr::write_bytes(a_grp.as_mut_ptr(), 0, a_grp.len());
-                std::ptr::write_bytes(b_grp.as_mut_ptr(), 0, b_grp.len());
+            if clear_before_build {
+                // OR-based builders require a clean destination. Full-write
+                // builders skip this pass and initialize every output word.
+                // SAFETY: F128 is `Copy` (no Drop) and the all-zero bit
+                // pattern is the valid `F128::ZERO`.
+                unsafe {
+                    std::ptr::write_bytes(z_grp.as_mut_ptr(), 0, z_grp.len());
+                    std::ptr::write_bytes(a_grp.as_mut_ptr(), 0, a_grp.len());
+                    std::ptr::write_bytes(b_grp.as_mut_ptr(), 0, b_grp.len());
+                }
             }
             for k_in in 0..8 {
                 let global_idx = 8 * g + k_in;
@@ -306,7 +318,7 @@ where
             let z_u64_all: &[u64] = unsafe {
                 std::slice::from_raw_parts(z_grp.as_ptr() as *const u64, z_grp.len() * 2)
             };
-            for i in 0..u64_per_block {
+            for i in 0..stripe_useful_bits.div_ceil(64) {
                 let lanes: [u64; 8] = [
                     z_u64_all[0 * u64_per_block + i],
                     z_u64_all[u64_per_block + i],

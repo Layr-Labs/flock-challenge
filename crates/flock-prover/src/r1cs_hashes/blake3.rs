@@ -88,7 +88,7 @@
 //!   are "free" witness bits. PCS-level openings at fixed indices will
 //!   eventually pin them to claimed public inputs.
 
-use super::common::{BitRecord, add_carry_parts, or_bit_at, or_u32_at_bit, xor_dedup};
+use super::common::{BitRecord, add_carry_parts, xor_dedup};
 use flock_core::challenger::Challenger;
 use flock_core::field::F128;
 use flock_core::pcs::{Commitment, PcsParams};
@@ -1024,13 +1024,88 @@ const REC_C5: usize = 5 * CARRY_BITS_PER_ADD;
 const REC_LIN0: usize = ADDS_PER_G * CARRY_BITS_PER_ADD;
 const REC_LIN1: usize = REC_LIN0 + WORD_BITS;
 
-/// Write a 32-bit lin-id (or input) slot: (z, a) = val, b = all-ones.
-/// **c is not written** — same `c == z` aliasing trick as above.
-#[inline]
-fn write_lin_word_ab_packed(bit_off: usize, val: u32, z: &mut [u64], a: &mut [u64], b: &mut [u64]) {
-    or_u32_at_bit(z, bit_off, val);
-    or_u32_at_bit(a, bit_off, val);
-    or_u32_at_bit(b, bit_off, 0xFFFF_FFFF);
+/// Sequential bit packer that initializes each destination word exactly once.
+///
+/// BLAKE3's useful witness region is a fixed stream after the two aligned
+/// chaining-value slots. Keeping the partial word in a register avoids both
+/// the full-buffer clear and the read-modify-write chain used by shifted ORs.
+struct SingleWriteBits<'a> {
+    dst: &'a mut [u64],
+    word: usize,
+    pending: u64,
+    used: usize,
+}
+
+impl<'a> SingleWriteBits<'a> {
+    #[inline(always)]
+    fn new(dst: &'a mut [u64], start_word: usize) -> Self {
+        Self {
+            dst,
+            word: start_word,
+            pending: 0,
+            used: 0,
+        }
+    }
+
+    #[inline(always)]
+    fn bit_position(&self) -> usize {
+        self.word * 64 + self.used
+    }
+
+    /// Append fewer than 64 low bits of `value`.
+    #[inline(always)]
+    fn push_bits(&mut self, value: u64, width: usize) {
+        debug_assert!(width > 0 && width < 64);
+        debug_assert_eq!(value >> width, 0);
+        let space = 64 - self.used;
+        if width < space {
+            self.pending |= value << self.used;
+            self.used += width;
+        } else {
+            self.dst[self.word] = self.pending | (value << self.used);
+            self.word += 1;
+            if width == space {
+                self.pending = 0;
+                self.used = 0;
+            } else {
+                self.pending = value >> space;
+                self.used = width - space;
+            }
+        }
+    }
+
+    /// Append a complete word while retaining the stream's current bit phase.
+    #[inline(always)]
+    fn push_word(&mut self, value: u64) {
+        if self.used == 0 {
+            self.dst[self.word] = value;
+            self.word += 1;
+        } else {
+            self.dst[self.word] = self.pending | (value << self.used);
+            self.word += 1;
+            self.pending = value >> (64 - self.used);
+        }
+    }
+
+    /// Append one packed G record (6×31 carry bits followed by 2×32 words).
+    #[inline(always)]
+    fn push_g_record(&mut self, record: &BitRecord<4>) {
+        let words = record.words();
+        self.push_word(words[0]);
+        self.push_word(words[1]);
+        self.push_word(words[2]);
+        debug_assert_eq!(words[3] >> 58, 0);
+        self.push_bits(words[3], 58);
+    }
+
+    #[inline(always)]
+    fn finish(mut self) {
+        if self.used != 0 {
+            self.dst[self.word] = self.pending;
+            self.word += 1;
+        }
+        self.dst[self.word..].fill(0);
+    }
 }
 
 /// Build the (z, a, b) blocks for ONE compression instance, into u64 views
@@ -1054,24 +1129,46 @@ fn build_block_witness_ab_packed_into(
     debug_assert_eq!(a.len(), U64_PER_BLOCK);
     debug_assert_eq!(b.len(), U64_PER_BLOCK);
 
-    // Constant z[0] = 1; a/b also 1 (z[0]·z[0] = z[0]).
-    or_bit_at(z, Z_CONST_POS);
-    or_bit_at(a, Z_CONST_POS);
-    or_bit_at(b, Z_CONST_POS);
-
-    // Input rows.
     let counter_lo = counter as u32;
     let counter_hi = (counter >> 32) as u32;
-    for w in 0..8 {
-        write_lin_word_ab_packed(cv_bit(w, 0), cv[w], z, a, b);
+
+    // The CV and out_lo slots are independently aligned. Initialize CV now;
+    // out_lo is written after the compression produces it.
+    for i in 0..4 {
+        let word = cv[2 * i] as u64 | ((cv[2 * i + 1] as u64) << 32);
+        z[i] = word;
+        a[i] = word;
+        b[i] = u64::MAX;
     }
-    for i in 0..16 {
-        write_lin_word_ab_packed(m_bit(i, 0), m[i], z, a, b);
+
+    debug_assert_eq!(Z_CONST_POS % 64, 0);
+    let mut wz = SingleWriteBits::new(z, Z_CONST_POS / 64);
+    let mut wa = SingleWriteBits::new(a, Z_CONST_POS / 64);
+    let mut wb = SingleWriteBits::new(b, Z_CONST_POS / 64);
+
+    // Constant-one row, then the contiguous message/counter/length/flags
+    // input region. Input and lin-id rows have (z, a, b) = (v, v, 1).
+    wz.push_bits(1, 1);
+    wa.push_bits(1, 1);
+    wb.push_bits(1, 1);
+    macro_rules! push_lin {
+        ($value:expr) => {{
+            let value = $value;
+            wz.push_bits(value as u64, WORD_BITS);
+            wa.push_bits(value as u64, WORD_BITS);
+            wb.push_bits(u32::MAX as u64, WORD_BITS);
+        }};
     }
-    write_lin_word_ab_packed(T_LO_BASE, counter_lo, z, a, b);
-    write_lin_word_ab_packed(T_HI_BASE, counter_hi, z, a, b);
-    write_lin_word_ab_packed(BLEN_BASE, block_len, z, a, b);
-    write_lin_word_ab_packed(FLAGS_BASE, flags, z, a, b);
+    for &word in m {
+        push_lin!(word);
+    }
+    push_lin!(counter_lo);
+    push_lin!(counter_hi);
+    push_lin!(block_len);
+    push_lin!(flags);
+    debug_assert_eq!(wz.bit_position(), GS_BASE);
+    debug_assert_eq!(wa.bit_position(), GS_BASE);
+    debug_assert_eq!(wb.bit_position(), GS_BASE);
 
     // BLAKE3 state evolution.
     let mut state: [u32; 16] = [
@@ -1095,7 +1192,6 @@ fn build_block_witness_ab_packed_into(
     let msg_idx = &PER_ROUND_MSG_IDX;
     for r in 0..N_ROUNDS {
         for g_in_round in 0..N_G_PER_ROUND {
-            let g = r * N_G_PER_ROUND + g_in_round;
             let [la, lb, lc, ld] = G_LANES[g_in_round];
             let [mx_i, my_i] = msg_idx[r][g_in_round];
             let mx = m[mx_i];
@@ -1138,10 +1234,9 @@ fn build_block_witness_ab_packed_into(
             ra.push::<REC_LIN1>(d_new);
             rb.push::<REC_LIN1>(0xFFFF_FFFF);
 
-            let g_base = GS_BASE + G_STRIDE * g;
-            rz.flush(z, g_base);
-            ra.flush(a, g_base);
-            rb.flush(b, g_base);
+            wz.push_g_record(&rz);
+            wa.push_g_record(&ra);
+            wb.push_g_record(&rb);
 
             state[la] = a_2;
             state[lb] = b_new;
@@ -1150,12 +1245,30 @@ fn build_block_witness_ab_packed_into(
         }
     }
 
-    // Finalization XOR rows.
+    debug_assert_eq!(wz.bit_position(), OUT_HI_BASE);
+    debug_assert_eq!(wa.bit_position(), OUT_HI_BASE);
+    debug_assert_eq!(wb.bit_position(), OUT_HI_BASE);
+
+    // Finalization rows. out_hi continues the stream; out_lo fills the
+    // aligned slot deliberately skipped above.
+    let mut out_lo = [0u32; 8];
     for w in 0..8 {
-        let lo = state[w] ^ state[w + 8];
+        out_lo[w] = state[w] ^ state[w + 8];
         let hi = state[w + 8] ^ cv[w];
-        write_lin_word_ab_packed(out_lo_bit(w, 0), lo, z, a, b);
-        write_lin_word_ab_packed(out_hi_bit(w, 0), hi, z, a, b);
+        push_lin!(hi);
+    }
+    debug_assert_eq!(wz.bit_position(), USEFUL_BITS);
+    debug_assert_eq!(wa.bit_position(), USEFUL_BITS);
+    debug_assert_eq!(wb.bit_position(), USEFUL_BITS);
+    wz.finish();
+    wa.finish();
+    wb.finish();
+
+    for i in 0..4 {
+        let word = out_lo[2 * i] as u64 | ((out_lo[2 * i + 1] as u64) << 32);
+        z[4 + i] = word;
+        a[4 + i] = word;
+        b[4 + i] = u64::MAX;
     }
 }
 
@@ -1220,6 +1333,54 @@ pub fn generate_witness_with_ab_packed(
     (z, a, b)
 }
 
+/// Scored row-major witness path: the single-write block builder initializes
+/// pooled z/a/b storage directly and omits lincheck's witness-sized stripe.
+/// Lincheck later folds the canonical row-major `z` in place.
+fn generate_witness_with_ab_packed_row_major(
+    blocks: &[Compression],
+    n_blocks_log: usize,
+) -> (Vec<F128>, Vec<F128>, Vec<F128>) {
+    use rayon::prelude::*;
+
+    const F128_PER_BLOCK: usize = K / 128;
+    let n_total = 1usize << n_blocks_log;
+    assert!(blocks.len() <= n_total);
+    let total_f128 = n_total * F128_PER_BLOCK;
+    let mut z = flock_core::scratch::take_f128(total_f128);
+    let mut a = flock_core::scratch::take_f128(total_f128);
+    let mut b = flock_core::scratch::take_f128(total_f128);
+    let padding: Compression = ([0u32; 8], [0u32; 16], 0u64, 0u32, 0u32);
+
+    z.par_chunks_mut(8 * F128_PER_BLOCK)
+        .zip(a.par_chunks_mut(8 * F128_PER_BLOCK))
+        .zip(b.par_chunks_mut(8 * F128_PER_BLOCK))
+        .enumerate()
+        .for_each(|(group, ((z_group, a_group), b_group))| {
+            for lane in 0..8 {
+                let block_idx = group * 8 + lane;
+                let (cv, m, t, bl, fl) = blocks.get(block_idx).unwrap_or(&padding);
+                let lo = lane * F128_PER_BLOCK;
+                let hi = lo + F128_PER_BLOCK;
+                let z_chunk = &mut z_group[lo..hi];
+                let a_chunk = &mut a_group[lo..hi];
+                let b_chunk = &mut b_group[lo..hi];
+                // SAFETY: F128 is repr(C) with two consecutive u64 halves.
+                let z_u64 = unsafe {
+                    std::slice::from_raw_parts_mut(z_chunk.as_mut_ptr() as *mut u64, K / 64)
+                };
+                let a_u64 = unsafe {
+                    std::slice::from_raw_parts_mut(a_chunk.as_mut_ptr() as *mut u64, K / 64)
+                };
+                let b_u64 = unsafe {
+                    std::slice::from_raw_parts_mut(b_chunk.as_mut_ptr() as *mut u64, K / 64)
+                };
+                build_block_witness_ab_packed_into(cv, m, *t, *bl, *fl, z_u64, a_u64, b_u64);
+            }
+        });
+
+    (z, a, b)
+}
+
 /// Like [`generate_witness_with_ab_packed`] but also emits the lincheck
 /// byte-stripe layout in the same parallel pass. Replaces the separate
 /// `pack_z_lincheck_from_packed` call entirely.
@@ -1252,6 +1413,8 @@ pub fn generate_witness_with_ab_packed_and_lincheck(
         Some(&padding),
         n_blocks_log,
         K_LOG,
+        false,
+        USEFUL_BITS,
         |block: &Compression, z_u64, a_u64, b_u64| {
             let (cv, m, t, bl, fl) = block;
             build_block_witness_ab_packed_into(cv, m, *t, *bl, *fl, z_u64, a_u64, b_u64);
@@ -1402,22 +1565,42 @@ impl Blake3Setup {
         challenger: &mut Ch,
     ) -> (flock_core::proof::R1csProofLigerito, Commitment, R1csClaim) {
         assert_eq!(blocks.len(), self.n_blocks);
-        let (codeword, (z_packed, a_packed_f128, b_packed_f128, z_packed_lincheck)) =
-            flock_core::pcs::prefault_codeword_during(&self.pcs_params, || {
-                self.generate_witness_ab(blocks)
-            });
         let lc_circuit = self.r1cs.csc_lincheck_circuit();
-        crate::prover::prove_fast_ligerito_from_witness(
-            &self.r1cs,
-            &self.pcs_params,
-            z_packed,
-            a_packed_f128,
-            b_packed_f128,
-            z_packed_lincheck,
-            lc_circuit,
-            codeword,
-            challenger,
-        )
+        match self.r1cs.layout {
+            flock_core::r1cs::WitnessLayout::RowMajor => {
+                let (codeword, (z_packed, a_packed_f128, b_packed_f128)) =
+                    flock_core::pcs::prefault_codeword_during(&self.pcs_params, || {
+                        generate_witness_with_ab_packed_row_major(blocks, self.n_blocks_log())
+                    });
+                crate::prover::prove_fast_ligerito_from_row_major_witness(
+                    &self.r1cs,
+                    &self.pcs_params,
+                    z_packed,
+                    a_packed_f128,
+                    b_packed_f128,
+                    lc_circuit,
+                    codeword,
+                    challenger,
+                )
+            }
+            flock_core::r1cs::WitnessLayout::BatchMajor => {
+                let (codeword, (z_packed, a_packed_f128, b_packed_f128, stripe)) =
+                    flock_core::pcs::prefault_codeword_during(&self.pcs_params, || {
+                        self.generate_witness_ab(blocks)
+                    });
+                crate::prover::prove_fast_ligerito_from_witness(
+                    &self.r1cs,
+                    &self.pcs_params,
+                    z_packed,
+                    a_packed_f128,
+                    b_packed_f128,
+                    stripe,
+                    lc_circuit,
+                    codeword,
+                    challenger,
+                )
+            }
+        }
     }
 
     /// [`Self::prove_fast`] with a per-phase timing breakdown of the real
@@ -1435,22 +1618,44 @@ impl Blake3Setup {
     ) {
         assert_eq!(blocks.len(), self.n_blocks);
         let t0 = std::time::Instant::now();
-        let (z_packed, a_packed_f128, b_packed_f128, z_packed_lincheck) =
-            self.generate_witness_ab(blocks);
-        let witness_s = t0.elapsed().as_secs_f64();
         let lc_circuit = self.r1cs.csc_lincheck_circuit();
-        let (proof, commitment, claim, mut timings) = crate::prover::prove_fast_ligerito_timed(
-            &self.r1cs,
-            &self.pcs_params,
-            z_packed,
-            a_packed_f128,
-            b_packed_f128,
-            z_packed_lincheck,
-            lc_circuit,
-            None,
-            challenger,
-        );
-        timings.witness_s = witness_s;
+        let (proof, commitment, claim, timings) = match self.r1cs.layout {
+            flock_core::r1cs::WitnessLayout::RowMajor => {
+                let (z_packed, a_packed_f128, b_packed_f128) =
+                    generate_witness_with_ab_packed_row_major(blocks, self.n_blocks_log());
+                let witness_s = t0.elapsed().as_secs_f64();
+                let mut result = crate::prover::prove_fast_ligerito_timed_row_major(
+                    &self.r1cs,
+                    &self.pcs_params,
+                    z_packed,
+                    a_packed_f128,
+                    b_packed_f128,
+                    lc_circuit,
+                    None,
+                    challenger,
+                );
+                result.3.witness_s = witness_s;
+                result
+            }
+            flock_core::r1cs::WitnessLayout::BatchMajor => {
+                let (z_packed, a_packed_f128, b_packed_f128, stripe) =
+                    self.generate_witness_ab(blocks);
+                let witness_s = t0.elapsed().as_secs_f64();
+                let mut result = crate::prover::prove_fast_ligerito_timed(
+                    &self.r1cs,
+                    &self.pcs_params,
+                    z_packed,
+                    a_packed_f128,
+                    b_packed_f128,
+                    stripe,
+                    lc_circuit,
+                    None,
+                    challenger,
+                );
+                result.3.witness_s = witness_s;
+                result
+            }
+        };
         (proof, commitment, claim, timings)
     }
 
