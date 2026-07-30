@@ -45,8 +45,10 @@ use crate::zerocheck::univariate_skip::{SplitEqGhash, build_eq, pack_bits};
 
 mod kernels;
 
-#[cfg(target_arch = "aarch64")]
+#[cfg(all(target_arch = "aarch64", test))]
 use kernels::aarch64::fold_one_row_neon_unchecked_8;
+#[cfg(target_arch = "aarch64")]
+use kernels::aarch64::{fold_and_message_aarch64, fold_round2_chunk_neon_unchecked_8};
 #[cfg(all(
     target_arch = "x86_64",
     target_feature = "avx512f",
@@ -501,38 +503,30 @@ pub fn uni_skip_fold_and_round_pair_optimized_packed_padded(
                 let a_pkt_ptr = a_packed.as_ptr();
                 let b_pkt_ptr = b_packed.as_ptr();
                 let base = x_hi * chunk_size;
-
-                for x_lo in 0..lo_size {
-                    let x0l = 2 * x_lo;
-                    let x1l = x0l + 1;
-                    if ((pair_idx_base + x_lo) & pair_in_block_mask) >= useful_pairs_inclusive {
-                        // Padding hole: write zero (a_folded/b_folded were alloc'd
-                        // uninit, so we have to write every slot we don't fold into).
-                        a_chunk[x0l] = F128::ZERO;
-                        a_chunk[x1l] = F128::ZERO;
-                        b_chunk[x0l] = F128::ZERO;
-                        b_chunk[x1l] = F128::ZERO;
-                        continue;
-                    }
-                    let x0g = base + 2 * x_lo;
-                    let x1g = x0g + 1;
-
-                    let a0 = fold_one_row_neon_unchecked_8(table_ptr, a_pkt_ptr.add(x0g * 8));
-                    let b0 = fold_one_row_neon_unchecked_8(table_ptr, b_pkt_ptr.add(x0g * 8));
-                    let a1 = fold_one_row_neon_unchecked_8(table_ptr, a_pkt_ptr.add(x1g * 8));
-                    let b1 = fold_one_row_neon_unchecked_8(table_ptr, b_pkt_ptr.add(x1g * 8));
-
-                    a_chunk[x0l] = a0;
-                    a_chunk[x1l] = a1;
-                    b_chunk[x0l] = b0;
-                    b_chunk[x1l] = b1;
-
-                    let eq_l = eq_lo[x_lo];
-                    let g1 = a1 * b1;
-                    p1_acc ^= eq_l.mul_unreduced(g1);
-                    let g_inf = (a0 + a1) * (b0 + b1);
-                    pinf_acc ^= eq_l.mul_unreduced(g_inf);
-                }
+                let (p1, pinf) = fold_round2_chunk_neon_unchecked_8(
+                    table_ptr,
+                    a_pkt_ptr.add(base * 8),
+                    b_pkt_ptr.add(base * 8),
+                    a_chunk.as_mut_ptr(),
+                    b_chunk.as_mut_ptr(),
+                    eq_lo.as_ptr(),
+                    lo_size,
+                    pair_idx_base,
+                    pair_in_block_mask,
+                    useful_pairs_inclusive,
+                );
+                p1_acc ^= F256Unreduced {
+                    r0: p1.lo,
+                    r1: p1.hi,
+                    r2: 0,
+                    r3: 0,
+                };
+                pinf_acc ^= F256Unreduced {
+                    r0: pinf.lo,
+                    r1: pinf.hi,
+                    r2: 0,
+                    r3: 0,
+                };
             }
             #[cfg(all(
                 target_arch = "x86_64",
@@ -833,10 +827,16 @@ pub fn fold_and_compute_round_pair_into(
             let (p1, pinf) =
                 unsafe { fold_and_message_x86_avx512(a_in, b_in, a_out, b_out, r_fold, eq_lo) };
 
-            #[cfg(not(all(
-                target_arch = "x86_64",
-                target_feature = "avx512f",
-                target_feature = "vpclmulqdq"
+            #[cfg(target_arch = "aarch64")]
+            let (p1, pinf) = fold_and_message_aarch64(a_in, b_in, a_out, b_out, r_fold, eq_lo);
+
+            #[cfg(not(any(
+                target_arch = "aarch64",
+                all(
+                    target_arch = "x86_64",
+                    target_feature = "avx512f",
+                    target_feature = "vpclmulqdq"
+                )
             )))]
             let (p1, pinf) = {
                 // Fold a_in→a_out and b_in→b_out at r_fold. The field layer
