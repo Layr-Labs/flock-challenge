@@ -282,6 +282,8 @@ pub fn generate_witness_with_ab_packed_and_lincheck(
         Some(&padding),
         n_blocks_log,
         K_LOG,
+        true,
+        K,
         build_block_witness_into,
     )
 }
