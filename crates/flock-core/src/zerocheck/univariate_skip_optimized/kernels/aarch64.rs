@@ -341,10 +341,17 @@ unsafe fn xor_apply_byte_into_8_regs<const BH: usize, const ODD: bool>(
 }
 
 /// Process one K-row: 8 byte positions of `a` and `b` via the inv_NTT table,
-/// F_8 multiply, widen-shift by K, XOR into the four `(acc_lo, acc_hi)` pairs.
+/// F_8 multiply, shift by K, XOR into the four `(acc_lo, acc_hi)` pairs.
+///
+/// All K-rows accumulate **unreduced** 16-bit polynomial products (reduction
+/// mod q is a ring homomorphism, so one final reduce is exact). For K ≥ 2 the
+/// shifted product overflows 16 bits; the overflowed high bits (≤ 6 per lane)
+/// are packed byte-wise into the per-chunk `ov` bank and folded back by the
+/// caller as `ov · (x^16 mod q)`. `KINV` must equal `16 - K` (passed
+/// explicitly because generic const expressions are unavailable).
 #[cfg(target_arch = "aarch64")]
 #[inline(always)]
-unsafe fn fused_apply_one_k<const K: i32>(
+unsafe fn fused_apply_one_k<const K: i32, const KINV: i32>(
     table_base: *const u8,
     half_swapped_table_base: *const u8,
     a_row: *const u8,
@@ -357,13 +364,23 @@ unsafe fn fused_apply_one_k<const K: i32>(
     acc2_hi: &mut core::arch::aarch64::uint16x8_t,
     acc3_lo: &mut core::arch::aarch64::uint16x8_t,
     acc3_hi: &mut core::arch::aarch64::uint16x8_t,
+    ov0: &mut core::arch::aarch64::uint8x16_t,
+    ov1: &mut core::arch::aarch64::uint8x16_t,
+    ov2: &mut core::arch::aarch64::uint8x16_t,
+    ov3: &mut core::arch::aarch64::uint8x16_t,
 ) {
-    use crate::field::gf2_8::neon::gf8_mul_vec16;
     use core::arch::aarch64::*;
     unsafe {
+        // The 8 index bytes per operand are consecutive; one 8-byte load plus
+        // shift extraction replaces eight scalar byte loads, freeing load-port
+        // slots that otherwise compete with the table's q-register loads.
+        // (`byte_base_b` is a multiple of 8, so these are aligned reads.)
+        let a_bits = (a_row as *const u64).read_unaligned();
+        let b_bits = (b_row as *const u64).read_unaligned();
+
         // b = 0: identity permutation — plain load of the 4 chunks.
-        let ra0 = table_base.add(*a_row as usize * 64);
-        let rb0 = table_base.add(*b_row as usize * 64);
+        let ra0 = table_base.add((a_bits & 0xff) as usize * 64);
+        let rb0 = table_base.add((b_bits & 0xff) as usize * 64);
         let mut da0 = vld1q_u8(ra0);
         let mut da1 = vld1q_u8(ra0.add(16));
         let mut da2 = vld1q_u8(ra0.add(32));
@@ -377,8 +394,8 @@ unsafe fn fused_apply_one_k<const K: i32>(
         xor_apply_byte_into_8_regs::<0, true>(
             table_base,
             half_swapped_table_base,
-            *a_row.add(1),
-            *b_row.add(1),
+            ((a_bits >> 8) & 0xff) as u8,
+            ((b_bits >> 8) & 0xff) as u8,
             &mut da0,
             &mut da1,
             &mut da2,
@@ -391,8 +408,8 @@ unsafe fn fused_apply_one_k<const K: i32>(
         xor_apply_byte_into_8_regs::<1, false>(
             table_base,
             half_swapped_table_base,
-            *a_row.add(2),
-            *b_row.add(2),
+            ((a_bits >> 16) & 0xff) as u8,
+            ((b_bits >> 16) & 0xff) as u8,
             &mut da0,
             &mut da1,
             &mut da2,
@@ -405,8 +422,8 @@ unsafe fn fused_apply_one_k<const K: i32>(
         xor_apply_byte_into_8_regs::<1, true>(
             table_base,
             half_swapped_table_base,
-            *a_row.add(3),
-            *b_row.add(3),
+            ((a_bits >> 24) & 0xff) as u8,
+            ((b_bits >> 24) & 0xff) as u8,
             &mut da0,
             &mut da1,
             &mut da2,
@@ -419,8 +436,8 @@ unsafe fn fused_apply_one_k<const K: i32>(
         xor_apply_byte_into_8_regs::<2, false>(
             table_base,
             half_swapped_table_base,
-            *a_row.add(4),
-            *b_row.add(4),
+            ((a_bits >> 32) & 0xff) as u8,
+            ((b_bits >> 32) & 0xff) as u8,
             &mut da0,
             &mut da1,
             &mut da2,
@@ -433,8 +450,8 @@ unsafe fn fused_apply_one_k<const K: i32>(
         xor_apply_byte_into_8_regs::<2, true>(
             table_base,
             half_swapped_table_base,
-            *a_row.add(5),
-            *b_row.add(5),
+            ((a_bits >> 40) & 0xff) as u8,
+            ((b_bits >> 40) & 0xff) as u8,
             &mut da0,
             &mut da1,
             &mut da2,
@@ -447,8 +464,8 @@ unsafe fn fused_apply_one_k<const K: i32>(
         xor_apply_byte_into_8_regs::<3, false>(
             table_base,
             half_swapped_table_base,
-            *a_row.add(6),
-            *b_row.add(6),
+            ((a_bits >> 48) & 0xff) as u8,
+            ((b_bits >> 48) & 0xff) as u8,
             &mut da0,
             &mut da1,
             &mut da2,
@@ -461,8 +478,8 @@ unsafe fn fused_apply_one_k<const K: i32>(
         xor_apply_byte_into_8_regs::<3, true>(
             table_base,
             half_swapped_table_base,
-            *a_row.add(7),
-            *b_row.add(7),
+            (a_bits >> 56) as u8,
+            (b_bits >> 56) as u8,
             &mut da0,
             &mut da1,
             &mut da2,
@@ -473,21 +490,74 @@ unsafe fn fused_apply_one_k<const K: i32>(
             &mut db3,
         );
 
-        // F_8 multiply lane-wise (4 × 16 lanes = 64 total).
-        let y0 = gf8_mul_vec16(da0, db0);
-        let y1 = gf8_mul_vec16(da1, db1);
-        let y2 = gf8_mul_vec16(da2, db2);
-        let y3 = gf8_mul_vec16(da3, db3);
+        use crate::field::gf2_8::neon::gf8_mul_vec16_unreduced;
+        let (c0_lo, c0_hi) = gf8_mul_vec16_unreduced(da0, db0);
+        let (c1_lo, c1_hi) = gf8_mul_vec16_unreduced(da1, db1);
+        let (c2_lo, c2_hi) = gf8_mul_vec16_unreduced(da2, db2);
+        let (c3_lo, c3_hi) = gf8_mul_vec16_unreduced(da3, db3);
 
-        // Widen-shift by K, XOR into the 16-bit accumulators.
-        *acc0_lo = veorq_u16(*acc0_lo, vshll_n_u8::<K>(vget_low_u8(y0)));
-        *acc0_hi = veorq_u16(*acc0_hi, vshll_n_u8::<K>(vget_high_u8(y0)));
-        *acc1_lo = veorq_u16(*acc1_lo, vshll_n_u8::<K>(vget_low_u8(y1)));
-        *acc1_hi = veorq_u16(*acc1_hi, vshll_n_u8::<K>(vget_high_u8(y1)));
-        *acc2_lo = veorq_u16(*acc2_lo, vshll_n_u8::<K>(vget_low_u8(y2)));
-        *acc2_hi = veorq_u16(*acc2_hi, vshll_n_u8::<K>(vget_high_u8(y2)));
-        *acc3_lo = veorq_u16(*acc3_lo, vshll_n_u8::<K>(vget_low_u8(y3)));
-        *acc3_hi = veorq_u16(*acc3_hi, vshll_n_u8::<K>(vget_high_u8(y3)));
+        // Main bank: low 16 bits of each shifted product.
+        *acc0_lo = veorq_u16(*acc0_lo, vshlq_n_u16::<K>(c0_lo));
+        *acc0_hi = veorq_u16(*acc0_hi, vshlq_n_u16::<K>(c0_hi));
+        *acc1_lo = veorq_u16(*acc1_lo, vshlq_n_u16::<K>(c1_lo));
+        *acc1_hi = veorq_u16(*acc1_hi, vshlq_n_u16::<K>(c1_hi));
+        *acc2_lo = veorq_u16(*acc2_lo, vshlq_n_u16::<K>(c2_lo));
+        *acc2_hi = veorq_u16(*acc2_hi, vshlq_n_u16::<K>(c2_hi));
+        *acc3_lo = veorq_u16(*acc3_lo, vshlq_n_u16::<K>(c3_lo));
+        *acc3_hi = veorq_u16(*acc3_hi, vshlq_n_u16::<K>(c3_hi));
+
+        if K >= 2 {
+            // Overflow bank: bits ≥ 16 of P << K, i.e. P >> (16-K), at most
+            // K-1 ≤ 6 bits per lane. uzp1 keeps the low byte of each u16
+            // lane, packing both halves of a chunk into one u8x16 register.
+            let o0 = vuzp1q_u8(
+                vreinterpretq_u8_u16(vshrq_n_u16::<KINV>(c0_lo)),
+                vreinterpretq_u8_u16(vshrq_n_u16::<KINV>(c0_hi)),
+            );
+            let o1 = vuzp1q_u8(
+                vreinterpretq_u8_u16(vshrq_n_u16::<KINV>(c1_lo)),
+                vreinterpretq_u8_u16(vshrq_n_u16::<KINV>(c1_hi)),
+            );
+            let o2 = vuzp1q_u8(
+                vreinterpretq_u8_u16(vshrq_n_u16::<KINV>(c2_lo)),
+                vreinterpretq_u8_u16(vshrq_n_u16::<KINV>(c2_hi)),
+            );
+            let o3 = vuzp1q_u8(
+                vreinterpretq_u8_u16(vshrq_n_u16::<KINV>(c3_lo)),
+                vreinterpretq_u8_u16(vshrq_n_u16::<KINV>(c3_hi)),
+            );
+            *ov0 = veorq_u8(*ov0, o0);
+            *ov1 = veorq_u8(*ov1, o1);
+            *ov2 = veorq_u8(*ov2, o2);
+            *ov3 = veorq_u8(*ov3, o3);
+        }
+    }
+}
+
+/// Fold one packed overflow bank back into a reduced chunk: computes
+/// `red(x^16 · ov)` and XORs it into `r`. In this field (q = 0x11B),
+/// `x^16 ≡ 0x5E (mod q)`, so the fold is one carry-less multiply by the
+/// constant 0x5E followed by the standard 16→8-bit reduction.
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn fold_overflow_x16(
+    r: core::arch::aarch64::uint8x16_t,
+    ov: core::arch::aarch64::uint8x16_t,
+) -> core::arch::aarch64::uint8x16_t {
+    use crate::field::gf2_8::neon::gf8_reduce_vec16;
+    use core::arch::aarch64::*;
+    use core::mem::transmute;
+    unsafe {
+        let x16: poly8x8_t = transmute::<u64, poly8x8_t>(0x5e5e5e5e5e5e5e5e_u64);
+        let t0 = vreinterpretq_u8_p16(vmull_p8(
+            transmute::<uint8x8_t, poly8x8_t>(vget_low_u8(ov)),
+            x16,
+        ));
+        let t1 = vreinterpretq_u8_p16(vmull_p8(
+            transmute::<uint8x8_t, poly8x8_t>(vget_high_u8(ov)),
+            x16,
+        ));
+        veorq_u8(r, gf8_reduce_vec16(t0, t1))
     }
 }
 
@@ -517,13 +587,18 @@ pub(crate) fn shift_reduce_inner_ab_fused_neon(
         let mut acc2_hi = vdupq_n_u16(0);
         let mut acc3_lo = vdupq_n_u16(0);
         let mut acc3_hi = vdupq_n_u16(0);
+        // Packed per-chunk overflow banks for the K >= 2 unreduced products.
+        let mut ov0 = vdupq_n_u8(0);
+        let mut ov1 = vdupq_n_u8(0);
+        let mut ov2 = vdupq_n_u8(0);
+        let mut ov3 = vdupq_n_u8(0);
 
         // 8 K-iterations — each consumes N_CHUNKS = 8 packed witness bytes
         // for `a` and `b`. K is a const generic so `vshll_n_u8::<K>` specializes.
         macro_rules! do_k {
-            ($k:literal) => {{
+            ($k:literal, $kinv:literal) => {{
                 let off = byte_base_b + $k * N_CHUNKS;
-                fused_apply_one_k::<$k>(
+                fused_apply_one_k::<$k, $kinv>(
                     table_base,
                     half_swapped_table_base,
                     a_packed.as_ptr().add(off),
@@ -536,23 +611,33 @@ pub(crate) fn shift_reduce_inner_ab_fused_neon(
                     &mut acc2_hi,
                     &mut acc3_lo,
                     &mut acc3_hi,
+                    &mut ov0,
+                    &mut ov1,
+                    &mut ov2,
+                    &mut ov3,
                 );
             }};
         }
-        do_k!(0);
-        do_k!(1);
-        do_k!(2);
-        do_k!(3);
-        do_k!(4);
-        do_k!(5);
-        do_k!(6);
-        do_k!(7);
+        do_k!(0, 16);
+        do_k!(1, 15);
+        do_k!(2, 14);
+        do_k!(3, 13);
+        do_k!(4, 12);
+        do_k!(5, 11);
+        do_k!(6, 10);
+        do_k!(7, 9);
 
         // Reduce 16-bit accs → 16-byte F_8 results (4 × 16 lanes).
         let r0 = gf8_reduce_vec16(vreinterpretq_u8_u16(acc0_lo), vreinterpretq_u8_u16(acc0_hi));
         let r1 = gf8_reduce_vec16(vreinterpretq_u8_u16(acc1_lo), vreinterpretq_u8_u16(acc1_hi));
         let r2 = gf8_reduce_vec16(vreinterpretq_u8_u16(acc2_lo), vreinterpretq_u8_u16(acc2_hi));
         let r3 = gf8_reduce_vec16(vreinterpretq_u8_u16(acc3_lo), vreinterpretq_u8_u16(acc3_hi));
+
+        // Fold the packed x^16-overflow banks back in (red is linear).
+        let r0 = fold_overflow_x16(r0, ov0);
+        let r1 = fold_overflow_x16(r1, ov1);
+        let r2 = fold_overflow_x16(r2, ov2);
+        let r3 = fold_overflow_x16(r3, ov3);
 
         let p = out.as_mut_ptr();
         vst1q_u8(p, r0);

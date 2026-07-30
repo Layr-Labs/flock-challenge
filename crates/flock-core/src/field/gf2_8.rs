@@ -216,6 +216,34 @@ pub mod neon {
             gf8_reduce_vec16(c0, c1)
         }
     }
+
+    /// Lane-wise carry-less 8×8 multiply with **no reduction**: returns the
+    /// raw 16-bit polynomial products (degree ≤ 14) for lanes 0–7 and 8–15.
+    ///
+    /// Because reduction mod q is a ring homomorphism, a caller may XOR these
+    /// into a 16-bit accumulator (optionally shifted while the degree stays
+    /// ≤ 15) and run [`gf8_reduce_vec16`] once at the end.
+    ///
+    /// # Safety
+    /// NEON is statically available on aarch64; caller upholds no additional
+    /// invariants.
+    #[inline(always)]
+    pub unsafe fn gf8_mul_vec16_unreduced(
+        a: uint8x16_t,
+        b: uint8x16_t,
+    ) -> (uint16x8_t, uint16x8_t) {
+        unsafe {
+            let c0 = vreinterpretq_u16_p16(vmull_p8(
+                transmute::<uint8x8_t, poly8x8_t>(vget_low_u8(a)),
+                transmute::<uint8x8_t, poly8x8_t>(vget_low_u8(b)),
+            ));
+            let c1 = vreinterpretq_u16_p16(vmull_p8(
+                transmute::<uint8x8_t, poly8x8_t>(vget_high_u8(a)),
+                transmute::<uint8x8_t, poly8x8_t>(vget_high_u8(b)),
+            ));
+            (c0, c1)
+        }
+    }
 }
 
 #[cfg(test)]
