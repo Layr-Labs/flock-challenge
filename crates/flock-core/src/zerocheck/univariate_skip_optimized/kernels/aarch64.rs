@@ -298,11 +298,18 @@ pub(crate) fn shift_reduce_inner_ab_neon(
 
 #[cfg(target_arch = "aarch64")]
 #[inline(always)]
+fn byte_from_word<const BYTE: u32>(word: u64) -> usize {
+    debug_assert!(BYTE < 8);
+    ((word >> (BYTE * 8)) & 0xff) as usize
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
 unsafe fn xor_apply_byte_into_8_regs<const BH: usize, const ODD: bool>(
     table_base: *const u8,
     half_swapped_table_base: *const u8,
-    a_byte: u8,
-    b_byte: u8,
+    a_byte: usize,
+    b_byte: usize,
     da0: &mut core::arch::aarch64::uint8x16_t,
     da1: &mut core::arch::aarch64::uint8x16_t,
     da2: &mut core::arch::aarch64::uint8x16_t,
@@ -319,8 +326,8 @@ unsafe fn xor_apply_byte_into_8_regs<const BH: usize, const ODD: bool>(
         } else {
             table_base
         };
-        let ra = selected_table.add(a_byte as usize * 64);
-        let rb = selected_table.add(b_byte as usize * 64);
+        let ra = selected_table.add(a_byte * 64);
+        let rb = selected_table.add(b_byte * 64);
         let va0 = vld1q_u8(ra.add((0 ^ BH) * 16));
         let va1 = vld1q_u8(ra.add((1 ^ BH) * 16));
         let va2 = vld1q_u8(ra.add((2 ^ BH) * 16));
@@ -361,9 +368,12 @@ unsafe fn fused_apply_one_k<const K: i32>(
     use crate::field::gf2_8::neon::gf8_mul_vec16;
     use core::arch::aarch64::*;
     unsafe {
+        let a_word = u64::from_le(core::ptr::read_unaligned(a_row.cast::<u64>()));
+        let b_word = u64::from_le(core::ptr::read_unaligned(b_row.cast::<u64>()));
+
         // b = 0: identity permutation — plain load of the 4 chunks.
-        let ra0 = table_base.add(*a_row as usize * 64);
-        let rb0 = table_base.add(*b_row as usize * 64);
+        let ra0 = table_base.add(byte_from_word::<0>(a_word) * 64);
+        let rb0 = table_base.add(byte_from_word::<0>(b_word) * 64);
         let mut da0 = vld1q_u8(ra0);
         let mut da1 = vld1q_u8(ra0.add(16));
         let mut da2 = vld1q_u8(ra0.add(32));
@@ -377,8 +387,8 @@ unsafe fn fused_apply_one_k<const K: i32>(
         xor_apply_byte_into_8_regs::<0, true>(
             table_base,
             half_swapped_table_base,
-            *a_row.add(1),
-            *b_row.add(1),
+            byte_from_word::<1>(a_word),
+            byte_from_word::<1>(b_word),
             &mut da0,
             &mut da1,
             &mut da2,
@@ -391,8 +401,8 @@ unsafe fn fused_apply_one_k<const K: i32>(
         xor_apply_byte_into_8_regs::<1, false>(
             table_base,
             half_swapped_table_base,
-            *a_row.add(2),
-            *b_row.add(2),
+            byte_from_word::<2>(a_word),
+            byte_from_word::<2>(b_word),
             &mut da0,
             &mut da1,
             &mut da2,
@@ -405,8 +415,8 @@ unsafe fn fused_apply_one_k<const K: i32>(
         xor_apply_byte_into_8_regs::<1, true>(
             table_base,
             half_swapped_table_base,
-            *a_row.add(3),
-            *b_row.add(3),
+            byte_from_word::<3>(a_word),
+            byte_from_word::<3>(b_word),
             &mut da0,
             &mut da1,
             &mut da2,
@@ -419,8 +429,8 @@ unsafe fn fused_apply_one_k<const K: i32>(
         xor_apply_byte_into_8_regs::<2, false>(
             table_base,
             half_swapped_table_base,
-            *a_row.add(4),
-            *b_row.add(4),
+            byte_from_word::<4>(a_word),
+            byte_from_word::<4>(b_word),
             &mut da0,
             &mut da1,
             &mut da2,
@@ -433,8 +443,8 @@ unsafe fn fused_apply_one_k<const K: i32>(
         xor_apply_byte_into_8_regs::<2, true>(
             table_base,
             half_swapped_table_base,
-            *a_row.add(5),
-            *b_row.add(5),
+            byte_from_word::<5>(a_word),
+            byte_from_word::<5>(b_word),
             &mut da0,
             &mut da1,
             &mut da2,
@@ -447,8 +457,8 @@ unsafe fn fused_apply_one_k<const K: i32>(
         xor_apply_byte_into_8_regs::<3, false>(
             table_base,
             half_swapped_table_base,
-            *a_row.add(6),
-            *b_row.add(6),
+            byte_from_word::<6>(a_word),
+            byte_from_word::<6>(b_word),
             &mut da0,
             &mut da1,
             &mut da2,
@@ -461,8 +471,8 @@ unsafe fn fused_apply_one_k<const K: i32>(
         xor_apply_byte_into_8_regs::<3, true>(
             table_base,
             half_swapped_table_base,
-            *a_row.add(7),
-            *b_row.add(7),
+            byte_from_word::<7>(a_word),
+            byte_from_word::<7>(b_word),
             &mut da0,
             &mut da1,
             &mut da2,
