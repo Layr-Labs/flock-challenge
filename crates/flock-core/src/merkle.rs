@@ -561,6 +561,61 @@ pub fn merkle_tree(data: &[u8], num_leaves: usize, kind: HashKind) -> Vec<Hash> 
     // was just written) and writes itself.
     let mut tree: Vec<Hash> = crate::alloc_uninit_vec(total_nodes);
 
+    #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+    if kind == HashKind::Blake3
+        && leaf_size == 1024
+        && num_leaves >= (1 << 17)
+        && let Some(pool) = all_core_blake3_pool()
+    {
+        pool.install(|| fill_merkle_tree(data, num_leaves, leaf_size, kind, &mut tree));
+        return tree;
+    }
+
+    fill_merkle_tree(data, num_leaves, leaf_size, kind, &mut tree);
+    tree
+}
+
+#[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+fn all_core_blake3_pool() -> Option<&'static rayon::ThreadPool> {
+    use std::sync::OnceLock;
+
+    // The main prover pool deliberately excludes efficiency cores: NTT and
+    // sumcheck kernels have synchronization barriers where a slow worker can
+    // hold up every P-core. The ranked 1 KiB BLAKE3 tree is different. Its
+    // leaf and parent work is split into many independent chunks, so Rayon's
+    // work stealing lets E-cores contribute without owning a fixed shard.
+    //
+    // Every benchmark worker builds one fixed-seed proof before accepting the
+    // timed seed. That warm-up initializes this pool and spawns its threads
+    // outside the scored interval.
+    static POOL: OnceLock<Option<rayon::ThreadPool>> = OnceLock::new();
+    POOL.get_or_init(|| {
+        // Apple silicon has no SMT, so available parallelism is the physical
+        // P+E core count. If the process is constrained to the existing pool
+        // size, retain the ordinary path without creating another pool.
+        let all_cores = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or_else(|_| rayon::current_num_threads());
+        if all_cores <= rayon::current_num_threads() {
+            return None;
+        }
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(all_cores)
+            .thread_name(|i| format!("flock-blake3-{i}"))
+            .start_handler(|_| crate::set_prover_thread_qos())
+            .build()
+            .ok()
+    })
+    .as_ref()
+}
+
+fn fill_merkle_tree(
+    data: &[u8],
+    num_leaves: usize,
+    leaf_size: usize,
+    kind: HashKind,
+    tree: &mut [Hash],
+) {
     // 1. Leaves — fully parallel, SIMD-batched across leaves where possible.
     hash_leaves(data, leaf_size, &mut tree[..num_leaves], kind);
 
@@ -579,8 +634,6 @@ pub fn merkle_tree(data: &[u8], num_leaves: usize, kind: HashKind) -> Vec<Hash> 
         read_start += read_len;
         read_len = next_len;
     }
-
-    tree
 }
 
 /// Sequential (single-threaded) version of [`merkle_tree`]. Used for
