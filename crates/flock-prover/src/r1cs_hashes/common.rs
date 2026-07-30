@@ -58,6 +58,11 @@ impl<const NW: usize> BitRecord<NW> {
         }
     }
 
+    #[inline(always)]
+    pub(crate) fn words(&self) -> &[u64; NW] {
+        &self.w
+    }
+
     /// OR the record into `buf` starting at bit `base_bit`.
     #[inline(always)]
     pub(crate) fn flush(&self, buf: &mut [u64], base_bit: usize) {
@@ -219,6 +224,62 @@ pub(crate) fn drive_witness_packed_and_lincheck<S: Sync, F>(
 where
     F: Fn(&S, &mut [u64], &mut [u64], &mut [u64]) + Sync,
 {
+    // SAFETY: PREZERO initializes every output word before `per_block` can
+    // read or modify it.
+    unsafe {
+        drive_witness_packed_and_lincheck_impl::<true, S, F>(
+            initial_states,
+            padding,
+            n_blocks_log,
+            k_log,
+            per_block,
+        )
+    }
+}
+
+/// Full-overwrite variant of [`drive_witness_packed_and_lincheck`].
+///
+/// # Safety
+///
+/// `per_block` must not read any output element before assigning it, must
+/// assign every `u64` in all three output slices, and every padded slot must
+/// invoke it. Otherwise stale scratch contents may be observed or propagated.
+pub(crate) unsafe fn drive_witness_packed_and_lincheck_overwrite<S: Sync, F>(
+    initial_states: &[S],
+    padding: Option<&S>,
+    n_blocks_log: usize,
+    k_log: usize,
+    per_block: F,
+) -> (Vec<F128>, Vec<F128>, Vec<F128>, Vec<u8>)
+where
+    F: Fn(&S, &mut [u64], &mut [u64], &mut [u64]) + Sync,
+{
+    // SAFETY: forwarded from this function's caller contract.
+    unsafe {
+        drive_witness_packed_and_lincheck_impl::<false, S, F>(
+            initial_states,
+            padding,
+            n_blocks_log,
+            k_log,
+            per_block,
+        )
+    }
+}
+
+/// # Safety
+///
+/// When `PREZERO` is false, `per_block` must not read before writing and must
+/// initialize every word in every output slice before the group is transposed.
+unsafe fn drive_witness_packed_and_lincheck_impl<const PREZERO: bool, S: Sync, F>(
+    initial_states: &[S],
+    padding: Option<&S>,
+    n_blocks_log: usize,
+    k_log: usize,
+    per_block: F,
+) -> (Vec<F128>, Vec<F128>, Vec<F128>, Vec<u8>)
+where
+    F: Fn(&S, &mut [u64], &mut [u64], &mut [u64]) + Sync,
+{
     use rayon::prelude::*;
 
     let k = 1usize << k_log;
@@ -234,13 +295,17 @@ where
         n_total >= 8 && n_total.is_multiple_of(8),
         "lincheck stripe layout requires n_total ≥ 8 and divisible by 8"
     );
+    if !PREZERO {
+        assert!(
+            padding.is_some() || n_blocks == n_total,
+            "full-overwrite mode requires every padded slot to invoke per_block"
+        );
+    }
 
     let total_f128 = n_total * f128_per_block;
-    // z/a/b are allocated uninitialized and zeroed *inside* the parallel loop
-    // (one memset per 8-block group), so the ~192 MB zero-fill scales with the
-    // thread count instead of running serially on the main thread before the
-    // parallel build. The per-block builders OR 1-bits into pre-zeroed words,
-    // so each group must be zeroed before its `per_block` calls. `z_lincheck`
+    // z/a/b come from the scratch pool without an initialization guarantee.
+    // PREZERO builders receive parallel-zeroed groups and may OR into them;
+    // full-overwrite builders initialize every word themselves. `z_lincheck`
     // stays `vec![0u8; _]` (lazy `alloc_zeroed`/mmap — no eager memset).
     let mut z = flock_core::scratch::take_f128(total_f128);
     let mut a = flock_core::scratch::take_f128(total_f128);
@@ -253,16 +318,16 @@ where
         .zip(z_lincheck.par_chunks_mut(k))
         .enumerate()
         .for_each(|(g, (((z_grp, a_grp), b_grp), stripe))| {
-            // Zero this group's z/a/b up front (parallel memset — the buffers
-            // were uninit-allocated). The per-block builder ORs 1-bits into
-            // pre-zeroed words; any slot left unbuilt (no padding block) stays
-            // zero, which the lincheck transpose below reads correctly.
-            // SAFETY: F128 is `Copy` (no Drop) and the all-zero bit pattern is
-            // the valid `F128::ZERO`, so a byte memset is a correct init.
-            unsafe {
-                std::ptr::write_bytes(z_grp.as_mut_ptr(), 0, z_grp.len());
-                std::ptr::write_bytes(a_grp.as_mut_ptr(), 0, a_grp.len());
-                std::ptr::write_bytes(b_grp.as_mut_ptr(), 0, b_grp.len());
+            // PREZERO builders OR into zeroed words; any unbuilt padding slot
+            // stays zero. Full-overwrite builders instead assign every word.
+            if PREZERO {
+                // SAFETY: F128 is `Copy` (no Drop) and the all-zero bit pattern
+                // is the valid `F128::ZERO`.
+                unsafe {
+                    std::ptr::write_bytes(z_grp.as_mut_ptr(), 0, z_grp.len());
+                    std::ptr::write_bytes(a_grp.as_mut_ptr(), 0, a_grp.len());
+                    std::ptr::write_bytes(b_grp.as_mut_ptr(), 0, b_grp.len());
+                }
             }
             for k_in in 0..8 {
                 let global_idx = 8 * g + k_in;

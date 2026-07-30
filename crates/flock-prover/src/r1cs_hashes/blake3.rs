@@ -88,7 +88,7 @@
 //!   are "free" witness bits. PCS-level openings at fixed indices will
 //!   eventually pin them to claimed public inputs.
 
-use super::common::{BitRecord, add_carry_parts, or_bit_at, or_u32_at_bit, xor_dedup};
+use super::common::{BitRecord, add_carry_parts, xor_dedup};
 use flock_core::challenger::Challenger;
 use flock_core::field::F128;
 use flock_core::pcs::{Commitment, PcsParams};
@@ -993,7 +993,7 @@ pub fn generate_witness(blocks: &[Compression], n_blocks_log: usize) -> Vec<bool
 // - Input slot:          (z, a, b, c) = (val, val, 1, val).
 // - Lin-id slot:         (z, a, b, c) = (lin_val, lin_val, 1, lin_val).
 // - Carry_aux row i:     (z, a, b, c) = (carry_aux, X⊕cin, Y⊕cin, carry_aux).
-// - Padding row:         all zero (already zero on entry).
+// - Padding row:         all zero (explicitly written by finalization).
 // ---------------------------------------------------------------------------
 
 /// One 32-bit ADD: returns `(sum, left, right, carry_aux)` for the caller to
@@ -1024,17 +1024,123 @@ const REC_C5: usize = 5 * CARRY_BITS_PER_ADD;
 const REC_LIN0: usize = ADDS_PER_G * CARRY_BITS_PER_ADD;
 const REC_LIN1: usize = REC_LIN0 + WORD_BITS;
 
-/// Write a 32-bit lin-id (or input) slot: (z, a) = val, b = all-ones.
-/// **c is not written** — same `c == z` aliasing trick as above.
-#[inline]
-fn write_lin_word_ab_packed(bit_off: usize, val: u32, z: &mut [u64], a: &mut [u64], b: &mut [u64]) {
-    or_u32_at_bit(z, bit_off, val);
-    or_u32_at_bit(a, bit_off, val);
-    or_u32_at_bit(b, bit_off, 0xFFFF_FFFF);
+/// Synchronized writer for the three dense BLAKE3 bodies at block word 8.
+/// Completed words are assigned exactly once; the pending values hold the
+/// unfinished suffix shared at one bit position.
+struct DenseWriters<'a> {
+    z: &'a mut [u64],
+    a: &'a mut [u64],
+    b: &'a mut [u64],
+    next: usize,
+    pending_z: u64,
+    pending_a: u64,
+    pending_b: u64,
+    used: usize,
+}
+
+impl<'a> DenseWriters<'a> {
+    #[inline(always)]
+    fn new(z: &'a mut [u64], a: &'a mut [u64], b: &'a mut [u64]) -> Self {
+        Self {
+            z,
+            a,
+            b,
+            next: 0,
+            pending_z: 1, // Constant wire at absolute bit 512.
+            pending_a: 1,
+            pending_b: 1,
+            used: 1,
+        }
+    }
+
+    #[inline(always)]
+    fn push_lin(&mut self, value: u32) {
+        let s = self.used;
+        let value = value as u64;
+        let ones = u32::MAX as u64;
+        self.pending_z |= value << s;
+        self.pending_a |= value << s;
+        self.pending_b |= ones << s;
+        if s + 32 >= 64 {
+            self.z[self.next] = self.pending_z;
+            self.a[self.next] = self.pending_a;
+            self.b[self.next] = self.pending_b;
+            self.next += 1;
+            self.pending_z = value >> (64 - s);
+            self.pending_a = value >> (64 - s);
+            self.pending_b = ones >> (64 - s);
+            self.used = s + 32 - 64;
+        } else {
+            self.used = s + 32;
+        }
+    }
+
+    #[inline(always)]
+    fn append_g(&mut self, rz: &[u64; 4], ra: &[u64; 4], rb: &[u64; 4]) {
+        const LAST_BITS: usize = G_STRIDE - 3 * 64;
+        const LAST_MASK: u64 = (1u64 << LAST_BITS) - 1;
+
+        let s = self.used;
+        if s == 0 {
+            self.z[self.next..self.next + 3].copy_from_slice(&rz[..3]);
+            self.a[self.next..self.next + 3].copy_from_slice(&ra[..3]);
+            self.b[self.next..self.next + 3].copy_from_slice(&rb[..3]);
+            self.next += 3;
+            self.pending_z = rz[3] & LAST_MASK;
+            self.pending_a = ra[3] & LAST_MASK;
+            self.pending_b = rb[3] & LAST_MASK;
+            self.used = LAST_BITS;
+            return;
+        }
+
+        for j in 0..3 {
+            self.z[self.next] = self.pending_z | (rz[j] << s);
+            self.a[self.next] = self.pending_a | (ra[j] << s);
+            self.b[self.next] = self.pending_b | (rb[j] << s);
+            self.next += 1;
+            self.pending_z = rz[j] >> (64 - s);
+            self.pending_a = ra[j] >> (64 - s);
+            self.pending_b = rb[j] >> (64 - s);
+        }
+
+        let last_z = rz[3] & LAST_MASK;
+        let last_a = ra[3] & LAST_MASK;
+        let last_b = rb[3] & LAST_MASK;
+        self.pending_z |= last_z << s;
+        self.pending_a |= last_a << s;
+        self.pending_b |= last_b << s;
+        let total = s + LAST_BITS;
+        if total >= 64 {
+            self.z[self.next] = self.pending_z;
+            self.a[self.next] = self.pending_a;
+            self.b[self.next] = self.pending_b;
+            self.next += 1;
+            self.pending_z = last_z >> (64 - s);
+            self.pending_a = last_a >> (64 - s);
+            self.pending_b = last_b >> (64 - s);
+            self.used = total - 64;
+        } else {
+            self.used = total;
+        }
+    }
+
+    #[inline(always)]
+    fn finish_zero_tail(mut self) {
+        debug_assert_eq!(self.used, USEFUL_BITS % 64);
+        self.z[self.next] = self.pending_z;
+        self.a[self.next] = self.pending_a;
+        self.b[self.next] = self.pending_b;
+        self.next += 1;
+        debug_assert_eq!(self.next, USEFUL_BITS.div_ceil(64) - 8);
+        self.z[self.next..].fill(0);
+        self.a[self.next..].fill(0);
+        self.b[self.next..].fill(0);
+    }
 }
 
 /// Build the (z, a, b) blocks for ONE compression instance, into u64 views
-/// of the F128-packed per-block storage. Buffers must be zero on entry.
+/// of the F128-packed per-block storage. Incoming contents are ignored: every
+/// word is assigned, including the zero-padding suffix.
 ///
 /// **No c buffer.** Since `C = I` (this is the circuit-shape R1CS), `c == z`
 /// byte-for-byte; callers use `z_packed` directly as the c-side input to
@@ -1054,24 +1160,32 @@ fn build_block_witness_ab_packed_into(
     debug_assert_eq!(a.len(), U64_PER_BLOCK);
     debug_assert_eq!(b.len(), U64_PER_BLOCK);
 
-    // Constant z[0] = 1; a/b also 1 (z[0]·z[0] = z[0]).
-    or_bit_at(z, Z_CONST_POS);
-    or_bit_at(a, Z_CONST_POS);
-    or_bit_at(b, Z_CONST_POS);
+    let (z_io, z_body) = z.split_at_mut(8);
+    let (a_io, a_body) = a.split_at_mut(8);
+    let (b_io, b_body) = b.split_at_mut(8);
 
-    // Input rows.
+    // CV occupies the first four words. The next four are reserved for
+    // out_lo, which is known only after the compression finishes.
+    for i in 0..4 {
+        let pair = cv[2 * i] as u64 | ((cv[2 * i + 1] as u64) << 32);
+        z_io[i] = pair;
+        a_io[i] = pair;
+    }
+    b_io.fill(u64::MAX);
+
+    // From the constant wire onward the layout is gap-free, so write three
+    // synchronized streams instead of OR-ing into pre-zeroed buffers.
+    let mut writers = DenseWriters::new(z_body, a_body, b_body);
+
     let counter_lo = counter as u32;
     let counter_hi = (counter >> 32) as u32;
-    for w in 0..8 {
-        write_lin_word_ab_packed(cv_bit(w, 0), cv[w], z, a, b);
+    for &word in m {
+        writers.push_lin(word);
     }
-    for i in 0..16 {
-        write_lin_word_ab_packed(m_bit(i, 0), m[i], z, a, b);
-    }
-    write_lin_word_ab_packed(T_LO_BASE, counter_lo, z, a, b);
-    write_lin_word_ab_packed(T_HI_BASE, counter_hi, z, a, b);
-    write_lin_word_ab_packed(BLEN_BASE, block_len, z, a, b);
-    write_lin_word_ab_packed(FLAGS_BASE, flags, z, a, b);
+    writers.push_lin(counter_lo);
+    writers.push_lin(counter_hi);
+    writers.push_lin(block_len);
+    writers.push_lin(flags);
 
     // BLAKE3 state evolution.
     let mut state: [u32; 16] = [
@@ -1095,7 +1209,6 @@ fn build_block_witness_ab_packed_into(
     let msg_idx = &PER_ROUND_MSG_IDX;
     for r in 0..N_ROUNDS {
         for g_in_round in 0..N_G_PER_ROUND {
-            let g = r * N_G_PER_ROUND + g_in_round;
             let [la, lb, lc, ld] = G_LANES[g_in_round];
             let [mx_i, my_i] = msg_idx[r][g_in_round];
             let mx = m[mx_i];
@@ -1138,10 +1251,7 @@ fn build_block_witness_ab_packed_into(
             ra.push::<REC_LIN1>(d_new);
             rb.push::<REC_LIN1>(0xFFFF_FFFF);
 
-            let g_base = GS_BASE + G_STRIDE * g;
-            rz.flush(z, g_base);
-            ra.flush(a, g_base);
-            rb.flush(b, g_base);
+            writers.append_g(rz.words(), ra.words(), rb.words());
 
             state[la] = a_2;
             state[lb] = b_new;
@@ -1151,11 +1261,20 @@ fn build_block_witness_ab_packed_into(
     }
 
     // Finalization XOR rows.
+    let mut out_lo = [0u32; 8];
     for w in 0..8 {
         let lo = state[w] ^ state[w + 8];
         let hi = state[w + 8] ^ cv[w];
-        write_lin_word_ab_packed(out_lo_bit(w, 0), lo, z, a, b);
-        write_lin_word_ab_packed(out_hi_bit(w, 0), hi, z, a, b);
+        out_lo[w] = lo;
+        writers.push_lin(hi);
+    }
+
+    writers.finish_zero_tail();
+
+    for i in 0..4 {
+        let pair = out_lo[2 * i] as u64 | ((out_lo[2 * i + 1] as u64) << 32);
+        z_io[4 + i] = pair;
+        a_io[4 + i] = pair;
     }
 }
 
@@ -1247,16 +1366,20 @@ pub fn generate_witness_with_ab_packed_and_lincheck(
     // every block. (The chain forbids padding, so this only affects the
     // standalone batch setup.)
     let padding: Compression = ([0u32; 8], [0u32; 16], 0u64, 0u32, 0u32);
-    super::common::drive_witness_packed_and_lincheck(
-        blocks,
-        Some(&padding),
-        n_blocks_log,
-        K_LOG,
-        |block: &Compression, z_u64, a_u64, b_u64| {
-            let (cv, m, t, bl, fl) = block;
-            build_block_witness_ab_packed_into(cv, m, *t, *bl, *fl, z_u64, a_u64, b_u64);
-        },
-    )
+    // SAFETY: the BLAKE3 builder assigns all 256 words of z/a/b, including
+    // the zero tail, and `Some(&padding)` ensures every padded slot invokes it.
+    unsafe {
+        super::common::drive_witness_packed_and_lincheck_overwrite(
+            blocks,
+            Some(&padding),
+            n_blocks_log,
+            K_LOG,
+            |block: &Compression, z_u64, a_u64, b_u64| {
+                let (cv, m, t, bl, fl) = block;
+                build_block_witness_ab_packed_into(cv, m, *t, *bl, *fl, z_u64, a_u64, b_u64);
+            },
+        )
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1971,6 +2094,63 @@ mod tests {
             !r1cs.satisfies(&z),
             "tampered carry bit should violate R1CS"
         );
+    }
+
+    /// The full-overwrite builder must not retain any incoming scratch bits,
+    /// including the partial final useful word and whole-word padding tail.
+    #[test]
+    fn block_packer_overwrites_poison_and_zeroes_tail() {
+        const WORDS: usize = K / 64;
+        let cv = [
+            0x0123_4567,
+            0x89ab_cdef,
+            0xfedc_ba98,
+            0x7654_3210,
+            0x0f0f_f0f0,
+            0xa5a5_5a5a,
+            0x1357_9bdf,
+            0x2468_ace0,
+        ];
+        let m = std::array::from_fn(|i| (i as u32).wrapping_mul(0x9e37_79b9));
+        let args = (&cv, &m, 0xfedc_ba98_7654_3210, 64, 0x1f);
+
+        let mut z_zero = vec![0; WORDS];
+        let mut a_zero = vec![0; WORDS];
+        let mut b_zero = vec![0; WORDS];
+        build_block_witness_ab_packed_into(
+            args.0,
+            args.1,
+            args.2,
+            args.3,
+            args.4,
+            &mut z_zero,
+            &mut a_zero,
+            &mut b_zero,
+        );
+
+        let mut z_poison = vec![u64::MAX; WORDS];
+        let mut a_poison = vec![0xaaaa_5555_ffff_0000; WORDS];
+        let mut b_poison = vec![0x0123_4567_89ab_cdef; WORDS];
+        build_block_witness_ab_packed_into(
+            args.0,
+            args.1,
+            args.2,
+            args.3,
+            args.4,
+            &mut z_poison,
+            &mut a_poison,
+            &mut b_poison,
+        );
+
+        assert_eq!(z_poison, z_zero);
+        assert_eq!(a_poison, a_zero);
+        assert_eq!(b_poison, b_zero);
+        let last_useful_word = USEFUL_BITS / 64;
+        let useful_bits_in_last_word = USEFUL_BITS % 64;
+        for buf in [&z_zero, &a_zero, &b_zero] {
+            assert_eq!(buf[last_useful_word] >> useful_bits_in_last_word, 0);
+            assert!(buf[last_useful_word + 1..].iter().all(|&word| word == 0));
+        }
     }
 
     /// `generate_witness_with_ab_packed` agrees with the matrix-vector
