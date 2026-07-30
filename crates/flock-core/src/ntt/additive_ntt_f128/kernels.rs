@@ -72,6 +72,35 @@ pub(super) fn butterfly_fused_2layer(
     portable::butterfly_fused_2layer(a, b, c, d, t_outer, t_inner_a, t_inner_b);
 }
 
+/// Apply two forward layers from four immutable source rows into four
+/// disjoint destination rows. Source and destination must not overlap.
+#[allow(clippy::too_many_arguments)]
+#[inline]
+pub(super) fn butterfly_fused_2layer_out_of_place(
+    src_a: &[F128],
+    src_b: &[F128],
+    src_c: &[F128],
+    src_d: &[F128],
+    dst_a: &mut [F128],
+    dst_b: &mut [F128],
+    dst_c: &mut [F128],
+    dst_d: &mut [F128],
+    t_outer: F128,
+    t_inner_a: F128,
+    t_inner_b: F128,
+) {
+    debug_assert_eq!(src_a.len(), src_b.len());
+    debug_assert_eq!(src_a.len(), src_c.len());
+    debug_assert_eq!(src_a.len(), src_d.len());
+    debug_assert_eq!(src_a.len(), dst_a.len());
+    debug_assert_eq!(src_a.len(), dst_b.len());
+    debug_assert_eq!(src_a.len(), dst_c.len());
+    debug_assert_eq!(src_a.len(), dst_d.len());
+    portable::butterfly_fused_2layer_out_of_place(
+        src_a, src_b, src_c, src_d, dst_a, dst_b, dst_c, dst_d, t_outer, t_inner_a, t_inner_b,
+    );
+}
+
 /// Process one fused-four-layer row group across every interleaved NTT lane.
 ///
 /// # Safety
