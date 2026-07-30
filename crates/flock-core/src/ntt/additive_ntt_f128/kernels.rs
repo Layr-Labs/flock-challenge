@@ -72,6 +72,31 @@ pub(super) fn butterfly_fused_2layer(
     portable::butterfly_fused_2layer(a, b, c, d, t_outer, t_inner_a, t_inner_b);
 }
 
+/// Out-of-place fused-2 (radix-4) butterfly: reads four immutable source
+/// rows, writes four destination rows. Same arithmetic as
+/// [`butterfly_fused_2layer`]; see the portable implementation for the
+/// stream-count rationale.
+#[allow(clippy::too_many_arguments)]
+#[inline]
+pub(super) fn butterfly_fused_2layer_oop(
+    sa: &[F128],
+    sb: &[F128],
+    sc: &[F128],
+    sd: &[F128],
+    da: &mut [F128],
+    db: &mut [F128],
+    dc: &mut [F128],
+    dd: &mut [F128],
+    t_outer: F128,
+    t_inner_a: F128,
+    t_inner_b: F128,
+) {
+    debug_assert_eq!(sa.len(), da.len());
+    portable::butterfly_fused_2layer_oop(
+        sa, sb, sc, sd, da, db, dc, dd, t_outer, t_inner_a, t_inner_b,
+    );
+}
+
 /// Process one fused-four-layer row group across every interleaved NTT lane.
 ///
 /// # Safety

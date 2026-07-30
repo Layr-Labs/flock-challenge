@@ -222,10 +222,36 @@ pub fn commit_into(
 
     // RS encoding of [z, 0, …, 0] starts with `log_inv_rate` butterfly layers
     // whose bottom inputs are all zero — each is a pure copy, so after those
-    // layers the buffer holds 2^log_inv_rate replicas of z. Write that state
-    // directly (replicating z costs the same writes as the zero-fill it
-    // replaces) and start the NTT at layer `log_inv_rate`, skipping those
-    // layers' full-buffer reads and multiplies.
+    // layers the buffer holds 2^log_inv_rate replicas of z.
+    //
+    // At rate 1 (the ranked shape), go one step further: fuse the replica
+    // fill with NTT layers 1–2 in a single out-of-place radix-4 pass that
+    // reads the message and writes the post-layer-2 codeword directly. This
+    // removes the separate full-codeword fill write plus the first in-place
+    // sweep's reread (~1.5 GiB of DRAM traffic at m=32), and the remaining
+    // top layers still pack into whole fused-3 passes. Output is
+    // element-identical to the replicate + from-layer path (tested).
+    if params.log_inv_rate == 1 {
+        let timing = std::env::var_os("FLOCK_COMMIT_TIMING").is_some();
+        let t_ntt = std::time::Instant::now();
+        let ntt = AdditiveNttF128::standard(params.k_code());
+        ntt.forward_transform_interleaved_rate1_fused(
+            z_packed,
+            &mut codeword,
+            params.num_ntts(),
+        );
+        if timing {
+            eprintln!(
+                "[commit-timing] ntt: {:.2} ms",
+                t_ntt.elapsed().as_secs_f64() * 1e3
+            );
+        }
+        return commit_tail(codeword, params);
+    }
+
+    // Other rates: write the replica state directly (replicating z costs the
+    // same writes as the zero-fill it replaces) and start the NTT at layer
+    // `log_inv_rate`, skipping those layers' full-buffer reads and multiplies.
     replicate_message_fill(&mut codeword, z_packed);
 
     finalize_commit(codeword, params)
@@ -278,6 +304,12 @@ fn finalize_commit(mut codeword: Vec<F128>, params: &PcsParams) -> (Commitment, 
             t_ntt.elapsed().as_secs_f64() * 1e3
         );
     }
+    commit_tail(codeword, params)
+}
+
+/// Merkle tree + commitment assembly over a fully RS-encoded codeword.
+fn commit_tail(codeword: Vec<F128>, params: &PcsParams) -> (Commitment, ProverData) {
+    let timing = std::env::var_os("FLOCK_COMMIT_TIMING").is_some();
     let t_merkle = std::time::Instant::now();
 
     // ---- Merkle commitment: one leaf per codeword position = num_ntts F128.

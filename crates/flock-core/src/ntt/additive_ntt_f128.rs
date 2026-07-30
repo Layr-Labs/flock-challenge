@@ -280,6 +280,113 @@ impl AdditiveNttF128 {
         }
     }
 
+    /// Rate-1 fused RS encode: composes replica-fill with NTT layers 1–2.
+    ///
+    /// At `log_inv_rate = 1` the state after layer 0 is two replicas of the
+    /// message (the degenerate copy layer), and the *separate* replica-fill +
+    /// first in-place sweep costs a full extra write+read of the codeword.
+    /// This entry instead reads the four quarter-rows of each replica's
+    /// radix-4 group **directly from the immutable message** and writes the
+    /// post-layer-2 state straight into `codeword`, then continues the
+    /// unchanged scheduler at layer 3.
+    ///
+    /// Traffic at ranked m=32 (1 GiB codeword): replica fill (1 GiB write)
+    /// plus the fused-3 first pass (1 GiB read + 1 GiB write over layers 1–3)
+    /// becomes one out-of-place pass (message read + 1 GiB write) — and the
+    /// remaining top layers 3..n_top pack into whole fused-3 passes at both
+    /// the ranked (n_top−3 = 6) and probe shapes. Stream count stays at
+    /// 4 source + 4 destination = 8, inside the 8-way L1D budget that makes
+    /// out-of-place radix-8 regress.
+    ///
+    /// Output is element-for-element identical to
+    /// `replicate_message_fill` + `forward_transform_interleaved_from_layer(…, 1)`;
+    /// see `fused_rate1_encode_matches_replicate_path`.
+    pub fn forward_transform_interleaved_rate1_fused(
+        &self,
+        msg: &[F128],
+        codeword: &mut [F128],
+        num_ntts: usize,
+    ) {
+        use rayon::prelude::*;
+        assert!(num_ntts.is_power_of_two() && num_ntts > 0);
+        let n_total = codeword.len();
+        assert_eq!(n_total, 2 * msg.len(), "rate-1 fused encode needs 2x replication");
+        assert_eq!(n_total % num_ntts, 0);
+        let log_d = log2_pow2(n_total / num_ntts);
+        assert!(log_d <= self.log_domain_size());
+
+        // Tiny domains: no room for layers 1–2 below layer count 3, and no
+        // benefit — take the plain replicate + from-layer-1 path.
+        if log_d < 3 {
+            for rep in codeword.chunks_mut(msg.len()) {
+                rep.copy_from_slice(msg);
+            }
+            self.forward_transform_interleaved_from_layer(codeword, num_ntts, 1);
+            return;
+        }
+
+        // Layers 1–2, out of place. Layer 1 has two blocks — one per replica,
+        // and each replica's content is the message itself — so block b reads
+        // msg and writes replica b with twiddles (t(1,b); t(2,2b), t(2,2b+1)).
+        let rep_len = msg.len();
+        let quarter = (rep_len / num_ntts) >> 2;
+        let stride = quarter * num_ntts;
+        let (rep0, rep1) = codeword.split_at_mut(rep_len);
+        const PARALLEL_ROW_THRESHOLD: usize = 256;
+        for (b, rep) in [rep0, rep1].into_iter().enumerate() {
+            let t_outer = self.twiddle(1, b);
+            let t_inner_a = self.twiddle(2, 2 * b);
+            let t_inner_b = self.twiddle(2, 2 * b + 1);
+            let (sa, s_rest) = msg.split_at(stride);
+            let (sb, s_rest) = s_rest.split_at(stride);
+            let (sc, sd) = s_rest.split_at(stride);
+            let (da_q, d_rest) = rep.split_at_mut(stride);
+            let (db_q, d_rest) = d_rest.split_at_mut(stride);
+            let (dc_q, dd_q) = d_rest.split_at_mut(stride);
+            let do_row = |r: usize,
+                          da: &mut [F128],
+                          db: &mut [F128],
+                          dc: &mut [F128],
+                          dd: &mut [F128]| {
+                let off = r * num_ntts;
+                kernels::butterfly_fused_2layer_oop(
+                    &sa[off..off + num_ntts],
+                    &sb[off..off + num_ntts],
+                    &sc[off..off + num_ntts],
+                    &sd[off..off + num_ntts],
+                    da,
+                    db,
+                    dc,
+                    dd,
+                    t_outer,
+                    t_inner_a,
+                    t_inner_b,
+                );
+            };
+            if quarter < PARALLEL_ROW_THRESHOLD {
+                for (r, ((da, db), (dc, dd))) in da_q
+                    .chunks_mut(num_ntts)
+                    .zip(db_q.chunks_mut(num_ntts))
+                    .zip(dc_q.chunks_mut(num_ntts).zip(dd_q.chunks_mut(num_ntts)))
+                    .enumerate()
+                {
+                    do_row(r, da, db, dc, dd);
+                }
+            } else {
+                da_q.par_chunks_mut(num_ntts)
+                    .zip(db_q.par_chunks_mut(num_ntts))
+                    .zip(dc_q.par_chunks_mut(num_ntts).zip(dd_q.par_chunks_mut(num_ntts)))
+                    .enumerate()
+                    .for_each(|(r, ((da, db), (dc, dd)))| {
+                        do_row(r, da, db, dc, dd);
+                    });
+            }
+        }
+
+        // Continue the unchanged scheduler past the two pre-applied layers.
+        self.forward_transform_interleaved_from_layer(codeword, num_ntts, 3);
+    }
+
     /// Scalar reference for the interleaved forward NTT.
     pub fn forward_transform_interleaved_scalar(&self, data: &mut [F128], num_ntts: usize) {
         self.forward_transform_interleaved_scalar_from_layer(data, num_ntts, 0);
@@ -1243,6 +1350,36 @@ mod tests {
         all(target_arch = "aarch64", target_feature = "aes"),
         all(target_arch = "x86_64", target_feature = "pclmulqdq")
     ))]
+    #[test]
+    fn fused_rate1_encode_matches_replicate_path() {
+        // Oracle: replicate-fill + from_layer(1) (the incumbent commit path).
+        // Sweep small and large log_d (crossing the parallel/scalar and
+        // fused-3 scheduling boundaries) and several interleave widths,
+        // including the tiny-domain fallback (log_d < 3).
+        let mut rng = Rng::new(0xF05);
+        for log_d in [2usize, 3, 5, 8, 10, 13, 15] {
+            for &num_ntts in &[1usize, 4, 64] {
+                let ntt = AdditiveNttF128::standard(log_d);
+                let n_total = (1 << log_d) * num_ntts;
+                let msg = rand_vec(&mut rng, n_total / 2);
+
+                let mut oracle = vec![F128 { lo: 0, hi: 0 }; n_total];
+                for rep in oracle.chunks_mut(msg.len()) {
+                    rep.copy_from_slice(&msg);
+                }
+                ntt.forward_transform_interleaved_from_layer(&mut oracle, num_ntts, 1);
+
+                let mut fused = vec![F128 { lo: 0, hi: 0 }; n_total];
+                ntt.forward_transform_interleaved_rate1_fused(&msg, &mut fused, num_ntts);
+
+                assert_eq!(
+                    fused, oracle,
+                    "fused rate-1 encode mismatch at log_d={log_d}, num_ntts={num_ntts}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn interleaved_parallel_matches_scalar() {
         let mut rng = Rng::new(0xCC2);

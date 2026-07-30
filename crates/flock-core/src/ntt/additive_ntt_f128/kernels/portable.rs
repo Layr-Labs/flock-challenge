@@ -10,6 +10,51 @@ pub(super) fn butterfly_row_pair(top: &mut [F128], bot: &mut [F128], twiddle: F1
     }
 }
 
+/// Out-of-place [`butterfly_fused_2layer`]: identical radix-4 arithmetic, but
+/// reads the four rows from an immutable source and writes the results to a
+/// separate destination. Used by the rate-1 fused RS-encode initializer, which
+/// composes replica-fill with NTT layers 1–2 in a single pass (4 source + 4
+/// destination streams — within the 8-way L1D budget that excludes radix-8
+/// out-of-place).
+#[allow(clippy::too_many_arguments)]
+#[inline]
+pub(super) fn butterfly_fused_2layer_oop(
+    sa: &[F128],
+    sb: &[F128],
+    sc: &[F128],
+    sd: &[F128],
+    da: &mut [F128],
+    db: &mut [F128],
+    dc: &mut [F128],
+    dd: &mut [F128],
+    t_outer: F128,
+    t_inner_a: F128,
+    t_inner_b: F128,
+) {
+    for lane in 0..sa.len() {
+        let mut xa = sa[lane];
+        let mut xb = sb[lane];
+        let mut xc = sc[lane];
+        let mut xd = sd[lane];
+        let na = xa + xc * t_outer;
+        xc += na;
+        xa = na;
+        let nb = xb + xd * t_outer;
+        xd += nb;
+        xb = nb;
+        let na2 = xa + xb * t_inner_a;
+        xb += na2;
+        xa = na2;
+        let nc2 = xc + xd * t_inner_b;
+        xd += nc2;
+        xc = nc2;
+        da[lane] = xa;
+        db[lane] = xb;
+        dc[lane] = xc;
+        dd[lane] = xd;
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 #[inline]
 pub(super) fn butterfly_fused_2layer(
