@@ -120,6 +120,14 @@ pub(super) unsafe fn butterfly_fused_3layer_row(
     r: usize,
     twiddles: &[F128; 7],
 ) {
+    #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+    // SAFETY: target features are guaranteed by cfg; the caller owns the row
+    // geometry and disjointness contract.
+    unsafe {
+        aarch64::butterfly_fused_3layer_row(ptr, eighth, num_ntts, r, twiddles);
+    }
+
+    #[cfg(not(all(target_arch = "aarch64", target_feature = "aes")))]
     // SAFETY: forwarded caller contract.
     unsafe {
         portable::butterfly_fused_3layer_row(ptr, eighth, num_ntts, r, twiddles);

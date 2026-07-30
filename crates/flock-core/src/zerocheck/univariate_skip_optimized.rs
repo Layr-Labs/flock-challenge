@@ -466,6 +466,7 @@ fn process_one_x_hi(
 /// split into bank 0 / bank 1.
 struct WorkerStateWithSHatV {
     partial_ab: [F128; ELL],
+    partial_ab_linear_s: [F128; ELL],
     partial_c_0: [F128; ELL],
     partial_c_1: [F128; ELL],
     chunk_ab_bytes: [[u8; 64]; 1 << N_MEDIUM],
@@ -473,6 +474,7 @@ struct WorkerStateWithSHatV {
     a_col: [F8; ELL],
     b_col: [F8; ELL],
     local_res_ab: [F128; ELL],
+    local_res_ab_linear_s: [F128; ELL],
     local_res_c_s_0: [F128; ELL],
     local_res_c_s_1: [F128; ELL],
 }
@@ -481,6 +483,7 @@ impl WorkerStateWithSHatV {
     fn new() -> Self {
         Self {
             partial_ab: [F128::ZERO; ELL],
+            partial_ab_linear_s: [F128::ZERO; ELL],
             partial_c_0: [F128::ZERO; ELL],
             partial_c_1: [F128::ZERO; ELL],
             chunk_ab_bytes: [[0u8; 64]; 1 << N_MEDIUM],
@@ -488,10 +491,24 @@ impl WorkerStateWithSHatV {
             a_col: [F8::ZERO; ELL],
             b_col: [F8::ZERO; ELL],
             local_res_ab: [F128::ZERO; ELL],
+            local_res_ab_linear_s: [F128::ZERO; ELL],
             local_res_c_s_0: [F128::ZERO; ELL],
             local_res_c_s_1: [F128::ZERO; ELL],
         }
     }
+}
+
+/// Return the 16-bit mask of affine `b_med` windows for one 8192-row outer
+/// window. Each set bit identifies 512 consecutive rows where B is the
+/// constant-one wire and therefore A*B=C.
+#[inline(always)]
+fn linear_b_med_mask(windows: [u64; 2], within_hash_outer: usize) -> u16 {
+    let bit_offset = within_hash_outer * (1 << N_MEDIUM);
+    let word = bit_offset / 64;
+    if word >= windows.len() {
+        return 0;
+    }
+    ((windows[word] >> (bit_offset % 64)) & 0xffff) as u16
 }
 
 /// Two-bank C variant of [`process_one_x_hi`]. AB-side and witness traffic
@@ -512,9 +529,14 @@ fn process_one_x_hi_with_s_hat_v(
     eq_lo_scaled: &[F128],
     eq_hi_val: F128,
     convert: &[F128],
+    linear_b_med_windows: [u64; 2],
     state: &mut WorkerStateWithSHatV,
 ) {
     state.partial_ab.iter_mut().for_each(|p| *p = F128::ZERO);
+    state
+        .partial_ab_linear_s
+        .iter_mut()
+        .for_each(|p| *p = F128::ZERO);
     state.partial_c_0.iter_mut().for_each(|p| *p = F128::ZERO);
     state.partial_c_1.iter_mut().for_each(|p| *p = F128::ZERO);
 
@@ -530,19 +552,22 @@ fn process_one_x_hi_with_s_hat_v(
 
         let chunk_byte_base = ((x_outer_lo << N_INNER) | (x_hi << n_lo_and_inner)) * N_CHUNKS;
         let eq_lo_val = eq_lo_scaled[x_outer_lo];
+        let linear_mask = linear_b_med_mask(linear_b_med_windows, within_hash_outer);
 
         if n_b_med == (1 << N_MEDIUM) {
             for b_med in 0..(1 << N_MEDIUM) {
-                shift_reduce_inner_ab(
-                    a_packed,
-                    b_packed,
-                    inv_table,
-                    chunk_byte_base,
-                    b_med,
-                    &mut state.chunk_ab_bytes[b_med],
-                    &mut state.a_col,
-                    &mut state.b_col,
-                );
+                if linear_mask & (1 << b_med) == 0 {
+                    shift_reduce_inner_ab(
+                        a_packed,
+                        b_packed,
+                        inv_table,
+                        chunk_byte_base,
+                        b_med,
+                        &mut state.chunk_ab_bytes[b_med],
+                        &mut state.a_col,
+                        &mut state.b_col,
+                    );
+                }
                 let byte_base_b = chunk_byte_base + b_med * N_CHUNKS * 8;
                 let c_in: &[u8; 64] = (&c_packed[byte_base_b..byte_base_b + 64])
                     .try_into()
@@ -550,28 +575,45 @@ fn process_one_x_hi_with_s_hat_v(
                 bit_transpose_64bytes(c_in, &mut state.chunk_c_bytes[b_med]);
             }
 
-            kernels::accumulate_convert_with_s_hat_v(
-                &state.chunk_ab_bytes,
-                &state.chunk_c_bytes,
-                1 << N_MEDIUM,
-                convert,
-                eq_lo_val,
-                &mut state.partial_ab,
-                &mut state.partial_c_0,
-                &mut state.partial_c_1,
-            );
+            if linear_mask != 0 {
+                kernels::accumulate_convert_with_linear_b_med_and_s_hat_v(
+                    &state.chunk_ab_bytes,
+                    &state.chunk_c_bytes,
+                    1 << N_MEDIUM,
+                    linear_mask,
+                    convert,
+                    eq_lo_val,
+                    &mut state.partial_ab,
+                    &mut state.partial_ab_linear_s,
+                    &mut state.partial_c_0,
+                    &mut state.partial_c_1,
+                );
+            } else {
+                kernels::accumulate_convert_with_s_hat_v(
+                    &state.chunk_ab_bytes,
+                    &state.chunk_c_bytes,
+                    1 << N_MEDIUM,
+                    convert,
+                    eq_lo_val,
+                    &mut state.partial_ab,
+                    &mut state.partial_c_0,
+                    &mut state.partial_c_1,
+                );
+            }
         } else {
             for b_med in 0..n_b_med {
-                shift_reduce_inner_ab(
-                    a_packed,
-                    b_packed,
-                    inv_table,
-                    chunk_byte_base,
-                    b_med,
-                    &mut state.chunk_ab_bytes[b_med],
-                    &mut state.a_col,
-                    &mut state.b_col,
-                );
+                if linear_mask & (1 << b_med) == 0 {
+                    shift_reduce_inner_ab(
+                        a_packed,
+                        b_packed,
+                        inv_table,
+                        chunk_byte_base,
+                        b_med,
+                        &mut state.chunk_ab_bytes[b_med],
+                        &mut state.a_col,
+                        &mut state.b_col,
+                    );
+                }
                 let byte_base_b = chunk_byte_base + b_med * N_CHUNKS * 8;
                 let c_in: &[u8; 64] = (&c_packed[byte_base_b..byte_base_b + 64])
                     .try_into()
@@ -579,22 +621,39 @@ fn process_one_x_hi_with_s_hat_v(
                 bit_transpose_64bytes(c_in, &mut state.chunk_c_bytes[b_med]);
             }
 
-            kernels::accumulate_convert_with_s_hat_v(
-                &state.chunk_ab_bytes,
-                &state.chunk_c_bytes,
-                n_b_med,
-                convert,
-                eq_lo_val,
-                &mut state.partial_ab,
-                &mut state.partial_c_0,
-                &mut state.partial_c_1,
-            );
+            let active_linear_mask = linear_mask & ((1u16 << n_b_med) - 1);
+            if active_linear_mask != 0 {
+                kernels::accumulate_convert_with_linear_b_med_and_s_hat_v(
+                    &state.chunk_ab_bytes,
+                    &state.chunk_c_bytes,
+                    n_b_med,
+                    active_linear_mask,
+                    convert,
+                    eq_lo_val,
+                    &mut state.partial_ab,
+                    &mut state.partial_ab_linear_s,
+                    &mut state.partial_c_0,
+                    &mut state.partial_c_1,
+                );
+            } else {
+                kernels::accumulate_convert_with_s_hat_v(
+                    &state.chunk_ab_bytes,
+                    &state.chunk_c_bytes,
+                    n_b_med,
+                    convert,
+                    eq_lo_val,
+                    &mut state.partial_ab,
+                    &mut state.partial_c_0,
+                    &mut state.partial_c_1,
+                );
+            }
         }
     }
 
     // Outer fold by eq_hi (per bank).
     for lane in 0..ELL {
         state.local_res_ab[lane] += eq_hi_val * state.partial_ab[lane];
+        state.local_res_ab_linear_s[lane] += eq_hi_val * state.partial_ab_linear_s[lane];
         state.local_res_c_s_0[lane] += eq_hi_val * state.partial_c_0[lane];
         state.local_res_c_s_1[lane] += eq_hi_val * state.partial_c_1[lane];
     }
@@ -773,6 +832,26 @@ pub fn round1_shift_reduce_extract_c_packed_padded_with_s_hat_v(
     inv_table: &InvNttTableByteSingleGf8,
     padding: &PaddingSpec,
 ) -> (Vec<F128>, Vec<F128>, Vec<F128>) {
+    round1_shift_reduce_extract_c_packed_padded_with_s_hat_v_linear(
+        a_packed, b_packed, c_packed, m, k_skip, r, inv_table, padding, [0; 2],
+    )
+}
+
+/// Prover-only affine specialization of
+/// [`round1_shift_reduce_extract_c_packed_padded_with_s_hat_v`]. The mask is
+/// derived from the bound R1CS matrices, never from witness data.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn round1_shift_reduce_extract_c_packed_padded_with_s_hat_v_linear(
+    a_packed: &[u8],
+    b_packed: &[u8],
+    c_packed: &[u8],
+    m: usize,
+    k_skip: usize,
+    r: &[F128],
+    inv_table: &InvNttTableByteSingleGf8,
+    padding: &PaddingSpec,
+    linear_b_med_windows: [u64; 2],
+) -> (Vec<F128>, Vec<F128>, Vec<F128>) {
     use rayon::prelude::*;
 
     assert_eq!(k_skip, K_SKIP, "optimized variant is k_skip=6 only");
@@ -799,8 +878,7 @@ pub fn round1_shift_reduce_extract_c_packed_padded_with_s_hat_v(
     let eq_hi = &eq.hi;
 
     let (within_outer_mask, b_med_counts) = build_b_med_counts(padding);
-
-    let (res_ab, res_c_s_0, res_c_s_1) = (0..hi_size)
+    let (mut res_ab, res_ab_linear_s, res_c_s_0, res_c_s_1) = (0..hi_size)
         .into_par_iter()
         .fold(WorkerStateWithSHatV::new, |mut state, x_hi| {
             let eq_hi_val = eq_hi[x_hi];
@@ -817,22 +895,48 @@ pub fn round1_shift_reduce_extract_c_packed_padded_with_s_hat_v(
                 &eq_lo_scaled,
                 eq_hi_val,
                 convert,
+                linear_b_med_windows,
                 &mut state,
             );
             state
         })
-        .map(|s| (s.local_res_ab, s.local_res_c_s_0, s.local_res_c_s_1))
+        .map(|s| {
+            (
+                s.local_res_ab,
+                s.local_res_ab_linear_s,
+                s.local_res_c_s_0,
+                s.local_res_c_s_1,
+            )
+        })
         .reduce(
-            || ([F128::ZERO; ELL], [F128::ZERO; ELL], [F128::ZERO; ELL]),
-            |(mut ab1, mut c0_1, mut c1_1), (ab2, c0_2, c1_2)| {
+            || {
+                (
+                    [F128::ZERO; ELL],
+                    [F128::ZERO; ELL],
+                    [F128::ZERO; ELL],
+                    [F128::ZERO; ELL],
+                )
+            },
+            |(mut ab1, mut ab_linear1, mut c0_1, mut c1_1), (ab2, ab_linear2, c0_2, c1_2)| {
                 for i in 0..ELL {
                     ab1[i] += ab2[i];
+                    ab_linear1[i] += ab_linear2[i];
                     c0_1[i] += c0_2[i];
                     c1_1[i] += c1_2[i];
                 }
-                (ab1, c0_1, c1_1)
+                (ab1, ab_linear1, c0_1, c1_1)
             },
         );
+
+    // Generic AB contributions are already in the L domain. Linear-column
+    // contributions were accumulated from raw C values in S and need the
+    // same one-time lift as the wire C contribution.
+    if linear_b_med_windows != [0; 2] {
+        let res_ab_linear = ntt_extend_f128_vec_ghash(&res_ab_linear_s, inv_table);
+        for lane in 0..ELL {
+            res_ab[lane] += res_ab_linear[lane];
+        }
+    }
 
     // Wire output: bank_0 + bank_1 reconstructs the original `res_c_s` (by
     // F_2-linearity of φ_8 over the masked-byte sum).

@@ -187,8 +187,9 @@ pub fn prove_packed_padded<C: Challenger>(
     padding: &PaddingSpec,
     challenger: &mut C,
 ) -> (ZerocheckProof, ZerocheckClaim) {
-    let (proof, claim, _) =
-        prove_packed_padded_inner(a_packed, b_packed, c_packed, m, padding, false, challenger);
+    let (proof, claim, _) = prove_packed_padded_inner(
+        a_packed, b_packed, c_packed, m, padding, [0; 2], false, challenger,
+    );
     (proof, claim)
 }
 
@@ -207,8 +208,35 @@ pub fn prove_packed_padded_capture_s_hat_v_c<C: Challenger>(
     padding: &PaddingSpec,
     challenger: &mut C,
 ) -> (ZerocheckProof, ZerocheckClaim, Vec<F128>) {
-    let (proof, claim, captured) =
-        prove_packed_padded_inner(a_packed, b_packed, c_packed, m, padding, true, challenger);
+    prove_packed_padded_capture_s_hat_v_c_linear(
+        a_packed, b_packed, c_packed, m, padding, [0; 2], challenger,
+    )
+}
+
+/// Prover-only affine specialization of
+/// [`prove_packed_padded_capture_s_hat_v_c`]. `linear_b_med_windows` is
+/// derived from the statement's R1CS matrices and leaves the wire transcript
+/// byte-identical.
+#[allow(clippy::too_many_arguments)]
+pub fn prove_packed_padded_capture_s_hat_v_c_linear<C: Challenger>(
+    a_packed: &[u8],
+    b_packed: &[u8],
+    c_packed: &[u8],
+    m: usize,
+    padding: &PaddingSpec,
+    linear_b_med_windows: [u64; 2],
+    challenger: &mut C,
+) -> (ZerocheckProof, ZerocheckClaim, Vec<F128>) {
+    let (proof, claim, captured) = prove_packed_padded_inner(
+        a_packed,
+        b_packed,
+        c_packed,
+        m,
+        padding,
+        linear_b_med_windows,
+        true,
+        challenger,
+    );
     (
         proof,
         claim,
@@ -223,6 +251,7 @@ fn prove_packed_padded_inner<C: Challenger>(
     c_packed: &[u8],
     m: usize,
     padding: &PaddingSpec,
+    linear_b_med_windows: [u64; 2],
     capture_s_hat_v_c: bool,
     challenger: &mut C,
 ) -> (ZerocheckProof, ZerocheckClaim, Option<Vec<F128>>) {
@@ -276,7 +305,7 @@ fn prove_packed_padded_inner<C: Challenger>(
     let inv_table = InvNttTableByteSingleGf8::new(&ntt_s, &ntt_l);
     let (round1_ab_opt, round1_c_opt, s_hat_v_c) = if capture_s_hat_v_c {
         let (ab, c, s) =
-            crate::zerocheck::univariate_skip_optimized::round1_shift_reduce_extract_c_packed_padded_with_s_hat_v(
+            crate::zerocheck::univariate_skip_optimized::round1_shift_reduce_extract_c_packed_padded_with_s_hat_v_linear(
                 a_packed,
                 b_packed,
                 c_packed,
@@ -285,6 +314,7 @@ fn prove_packed_padded_inner<C: Challenger>(
                 &r,
                 &inv_table,
                 padding,
+                linear_b_med_windows,
             );
         (ab, c, Some(s))
     } else {

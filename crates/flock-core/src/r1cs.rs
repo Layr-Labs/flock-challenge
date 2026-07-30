@@ -238,6 +238,32 @@ impl BlockR1cs {
         }
     }
 
+    /// Row-major 512-row windows whose B rows are all the pinned constant-one
+    /// wire. With C=I, satisfying witnesses have A=C on these windows, so the
+    /// zerocheck prover can reuse C instead of transforming and multiplying
+    /// A/B. The mask is prover-only metadata and does not alter the statement.
+    pub fn linear_b_med_windows(&self) -> [u64; 2] {
+        let mut windows = [0u64; 2];
+        let Some(const_pin) = self.const_pin else {
+            return windows;
+        };
+        if self.layout != WitnessLayout::RowMajor || !self.c0_is_identity() {
+            return windows;
+        }
+        for window in 0..(self.k() / 512).min(128) {
+            let start = window * 512;
+            let end = start + 512;
+            if end <= self.useful_bits
+                && self.b_0.rows[start..end]
+                    .iter()
+                    .all(|row| row.as_slice() == [const_pin])
+            {
+                windows[window / 64] |= 1u64 << (window % 64);
+            }
+        }
+        windows
+    }
+
     /// Lincheck's **semantic** quirky point from the zerocheck claim: split
     /// the address-ordered `mlv_challenges` into (inner-rest, outer=batch)
     /// coordinates. RowMajor address order is `[inner-rest | batch]`;

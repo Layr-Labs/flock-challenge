@@ -52,6 +52,7 @@ pub(super) fn butterfly_fused_2layer(
 /// (shared by all 4 pairs), `[1..3]` layer L+1 (one per half), `[3..7]`
 /// layer L+2 (one per quarter).
 #[inline]
+#[cfg(not(all(target_arch = "aarch64", target_feature = "aes")))]
 pub(super) fn butterfly_fused_3layer(values: &mut [F128; 8], twiddles: &[F128; 7]) {
     #[inline(always)]
     fn butterfly(values: &mut [F128; 8], u: usize, v: usize, twiddle: F128) {
@@ -83,6 +84,7 @@ pub(super) fn butterfly_fused_3layer(values: &mut [F128; 8], twiddles: &[F128; 7
 /// # Safety
 /// The caller guarantees that every selected row and lane is valid and that
 /// concurrent calls use disjoint row groups.
+#[cfg(not(all(target_arch = "aarch64", target_feature = "aes")))]
 pub(super) unsafe fn butterfly_fused_3layer_row(
     ptr: *mut F128,
     eighth: usize,
