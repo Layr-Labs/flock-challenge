@@ -348,6 +348,30 @@ impl AdditiveNttF128 {
         num_ntts: usize,
         start_layer: usize,
     ) {
+        self.forward_transform_interleaved_parallel_from_layer_with(
+            data,
+            num_ntts,
+            start_layer,
+            |_, _| {},
+        );
+    }
+
+    /// As [`Self::forward_transform_interleaved_parallel_from_layer`], with a
+    /// callback invoked as soon as each cache-resident output subgroup is
+    /// complete. This lets consumers use the output while it is still hot.
+    #[cfg(any(
+        all(target_arch = "aarch64", target_feature = "aes"),
+        all(target_arch = "x86_64", target_feature = "pclmulqdq"),
+    ))]
+    pub(crate) fn forward_transform_interleaved_parallel_from_layer_with<F>(
+        &self,
+        data: &mut [F128],
+        num_ntts: usize,
+        start_layer: usize,
+        consume: F,
+    ) where
+        F: Fn(usize, &[F128]) + Sync,
+    {
         use rayon::prelude::*;
         let n_total = data.len();
         let log_d = log2_pow2(n_total / num_ntts);
@@ -387,6 +411,7 @@ impl AdditiveNttF128 {
         };
         if n_top == 0 || log_d < 8 {
             self.forward_transform_interleaved_scalar_from_layer(data, num_ntts, start_layer);
+            consume(0, data);
             return;
         }
 
@@ -527,6 +552,7 @@ impl AdditiveNttF128 {
                         butterfly_interleaved_block(block, twiddle, block_size_half, num_ntts);
                     }
                 }
+                consume(sub_idx, sub_data);
             });
     }
 

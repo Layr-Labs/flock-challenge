@@ -462,6 +462,58 @@ fn hash_leaves(data: &[u8], leaf_size: usize, out: &mut [Hash], kind: HashKind) 
     }
 }
 
+/// Hash one already-partitioned run of leaves without creating Rayon work.
+///
+/// The BLAKE3 path remains SIMD-batched across the whole run; this entry point
+/// is for callers that are themselves inside a parallel cache-subgroup task.
+pub(crate) fn hash_leaves_serial_batched(
+    data: &[u8],
+    leaf_size: usize,
+    out: &mut [Hash],
+    kind: HashKind,
+) {
+    debug_assert_eq!(data.len(), leaf_size * out.len());
+    #[cfg(feature = "hash-count")]
+    {
+        use std::sync::atomic::Ordering::Relaxed;
+        hash_count::LEAF_CALLS.fetch_add(out.len() as u64, Relaxed);
+        hash_count::LEAF_COMPRESSIONS.fetch_add(
+            out.len() as u64 * hash_count::blocks(kind, leaf_size),
+            Relaxed,
+        );
+    }
+    match kind {
+        HashKind::Blake3 if blake3_leaf_size_is_batchable(leaf_size) => {
+            let dispatched = blake3_hash_many_leaves(data, leaf_size, out);
+            debug_assert!(dispatched);
+        }
+        HashKind::Blake3 => {
+            for (o, leaf) in out.iter_mut().zip(data.chunks(leaf_size)) {
+                *o = blake3_leaf_cv(leaf);
+            }
+        }
+        HashKind::Sha256 => {
+            for (outs, leaves) in out.chunks_mut(4).zip(data.chunks(4 * leaf_size)) {
+                if outs.len() == 4 {
+                    sha256_hash4(
+                        [
+                            &leaves[..leaf_size],
+                            &leaves[leaf_size..2 * leaf_size],
+                            &leaves[2 * leaf_size..3 * leaf_size],
+                            &leaves[3 * leaf_size..],
+                        ],
+                        outs,
+                    );
+                } else {
+                    for (out, leaf) in outs.iter_mut().zip(leaves.chunks(leaf_size)) {
+                        *out = Sha256::digest(leaf).into();
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// Nodes per rayon task in the batched BLAKE3 paths: enough to amortize task
 /// dispatch over many `hash_many` calls, small enough to stay cache-resident.
 const BLAKE3_GROUP: usize = 1024;
@@ -529,6 +581,117 @@ fn hash_pairs_level(read: &[Hash], write: &mut [Hash], kind: HashKind) {
             }
         }
     }
+}
+
+/// Single-task version of [`hash_pairs_level`], retaining SIMD batching while
+/// avoiding nested Rayon scheduling inside an NTT cache-subgroup task.
+fn hash_pairs_level_serial_batched(read: &[Hash], write: &mut [Hash], kind: HashKind) {
+    debug_assert_eq!(read.len(), 2 * write.len());
+    #[cfg(feature = "hash-count")]
+    hash_count::PAIR_CALLS.fetch_add(write.len() as u64, std::sync::atomic::Ordering::Relaxed);
+    let read_bytes: &[u8] =
+        unsafe { core::slice::from_raw_parts(read.as_ptr() as *const u8, read.len() * 32) };
+    match kind {
+        HashKind::Blake3 => blake3_hash_many_parents(read_bytes, write),
+        HashKind::Sha256 => {
+            for (outs, children) in write.chunks_mut(4).zip(read_bytes.chunks(256)) {
+                if outs.len() == 4 {
+                    sha256_hash4(
+                        [
+                            &children[..64],
+                            &children[64..128],
+                            &children[128..192],
+                            &children[192..256],
+                        ],
+                        outs,
+                    );
+                } else {
+                    for (i, out) in outs.iter_mut().enumerate() {
+                        let l: &Hash = children[i * 64..i * 64 + 32].try_into().unwrap();
+                        let r: &Hash = children[i * 64 + 32..i * 64 + 64].try_into().unwrap();
+                        let mut h = Sha256::new();
+                        h.update(l);
+                        h.update(r);
+                        *out = h.finalize().into();
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[inline]
+fn flat_level_start(num_leaves: usize, depth: usize) -> usize {
+    if depth == 0 {
+        0
+    } else {
+        2 * num_leaves - (num_leaves >> (depth - 1))
+    }
+}
+
+/// Hash a cache-hot aligned leaf subgroup and immediately materialize every
+/// internal level through its subgroup root in the canonical flat-tree slots.
+///
+/// # Safety
+///
+/// `tree` must point to `2 * num_leaves - 1` writable hashes. Concurrent calls
+/// must use disjoint aligned subgroups of the same tree. The leaf input must
+/// remain valid for this call.
+pub(crate) unsafe fn hash_subtree_serial_batched(
+    data: &[u8],
+    leaf_size: usize,
+    tree: *mut Hash,
+    num_leaves: usize,
+    leaf_start: usize,
+    subtree_leaves: usize,
+    kind: HashKind,
+) {
+    debug_assert!(num_leaves.is_power_of_two());
+    debug_assert!(subtree_leaves.is_power_of_two());
+    debug_assert!(subtree_leaves <= num_leaves);
+    debug_assert_eq!(leaf_start % subtree_leaves, 0);
+    debug_assert!(leaf_start + subtree_leaves <= num_leaves);
+    debug_assert_eq!(data.len(), leaf_size * subtree_leaves);
+
+    let leaves = unsafe { core::slice::from_raw_parts_mut(tree.add(leaf_start), subtree_leaves) };
+    hash_leaves_serial_batched(data, leaf_size, leaves, kind);
+
+    let subtree_depth = subtree_leaves.trailing_zeros() as usize;
+    for depth in 0..subtree_depth {
+        let read_len = subtree_leaves >> depth;
+        let read_offset = flat_level_start(num_leaves, depth) + (leaf_start >> depth);
+        let write_offset = flat_level_start(num_leaves, depth + 1) + (leaf_start >> (depth + 1));
+        let read = unsafe { core::slice::from_raw_parts(tree.add(read_offset), read_len) };
+        let write =
+            unsafe { core::slice::from_raw_parts_mut(tree.add(write_offset), read_len >> 1) };
+        hash_pairs_level_serial_batched(read, write, kind);
+    }
+}
+
+/// Finish only the levels above already-populated, equal-size subtree roots.
+pub(crate) fn finish_merkle_tree_above_subtrees(
+    mut tree: Vec<Hash>,
+    num_leaves: usize,
+    subtree_leaves: usize,
+    kind: HashKind,
+) -> Vec<Hash> {
+    debug_assert_eq!(tree.len(), 2 * num_leaves - 1);
+    debug_assert!(num_leaves.is_power_of_two());
+    debug_assert!(subtree_leaves.is_power_of_two());
+    debug_assert!(subtree_leaves <= num_leaves);
+
+    let depth = subtree_leaves.trailing_zeros() as usize;
+    let mut read_start = flat_level_start(num_leaves, depth);
+    let mut read_len = num_leaves / subtree_leaves;
+    while read_len > 1 {
+        let next_len = read_len >> 1;
+        let (read, rest) = tree[read_start..].split_at_mut(read_len);
+        let write = &mut rest[..next_len];
+        hash_pairs_level(read, write, kind);
+        read_start += read_len;
+        read_len = next_len;
+    }
+    tree
 }
 
 /// Compute the Merkle root of `data` split into `num_leaves` equal-sized leaves.
@@ -833,6 +996,36 @@ mod tests {
             assert_eq!(tree[0], h0, "{kind}");
             assert_eq!(tree[1], h1, "{kind}");
             assert_eq!(tree[2], root, "{kind}");
+        }
+    }
+
+    #[test]
+    fn cache_subtrees_match_canonical_flat_tree() {
+        let num_leaves = 64;
+        let subtree_leaves = 8;
+        let leaf_size = 128;
+        let data: Vec<u8> = (0..=255u8).cycle().take(num_leaves * leaf_size).collect();
+
+        for kind in KINDS {
+            let expected = merkle_tree(&data, num_leaves, kind);
+            let mut got: Vec<Hash> = crate::alloc_uninit_vec(2 * num_leaves - 1);
+            for leaf_start in (0..num_leaves).step_by(subtree_leaves) {
+                let start = leaf_start * leaf_size;
+                let end = start + subtree_leaves * leaf_size;
+                unsafe {
+                    hash_subtree_serial_batched(
+                        &data[start..end],
+                        leaf_size,
+                        got.as_mut_ptr(),
+                        num_leaves,
+                        leaf_start,
+                        subtree_leaves,
+                        kind,
+                    );
+                }
+            }
+            let got = finish_merkle_tree_above_subtrees(got, num_leaves, subtree_leaves, kind);
+            assert_eq!(got, expected, "{kind}");
         }
     }
 

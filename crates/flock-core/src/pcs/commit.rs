@@ -267,37 +267,93 @@ fn finalize_commit(mut codeword: Vec<F128>, params: &PcsParams) -> (Commitment, 
     // SoA buffer. The first `log_inv_rate` layers were pre-applied by the
     // caller's replicate-fill (commit_into), so start past them.
     let ntt = AdditiveNttF128::standard(params.k_code());
-    ntt.forward_transform_interleaved_from_layer(
-        &mut codeword,
-        params.num_ntts(),
-        params.log_inv_rate,
-    );
+    #[cfg(any(
+        all(target_arch = "aarch64", target_feature = "aes"),
+        all(target_arch = "x86_64", target_feature = "pclmulqdq"),
+    ))]
+    let merkle_tree = {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let num_leaves = params.n_leaves();
+        let total_nodes = 2 * num_leaves - 1;
+        let mut tree: Vec<Hash> = crate::alloc_uninit_vec(total_nodes);
+        let tree_addr = tree.as_mut_ptr() as usize;
+        let num_ntts = params.num_ntts();
+        let leaf_size = params.leaf_size_bytes();
+        let subtree_leaves = AtomicUsize::new(0);
+
+        ntt.forward_transform_interleaved_parallel_from_layer_with(
+            &mut codeword,
+            num_ntts,
+            params.log_inv_rate,
+            |sub_idx, sub_data| {
+                let n = sub_data.len() / num_ntts;
+                subtree_leaves.store(n, Ordering::Relaxed);
+                let bytes = unsafe {
+                    core::slice::from_raw_parts(
+                        sub_data.as_ptr() as *const u8,
+                        sub_data.len() * core::mem::size_of::<F128>(),
+                    )
+                };
+                // SAFETY: NTT subgroups are aligned and disjoint. Their nodes
+                // remain disjoint at every level through each subgroup root.
+                unsafe {
+                    merkle::hash_subtree_serial_batched(
+                        bytes,
+                        leaf_size,
+                        tree_addr as *mut Hash,
+                        num_leaves,
+                        sub_idx * n,
+                        n,
+                        params.merkle_hash,
+                    );
+                }
+            },
+        );
+
+        let subtree_leaves = subtree_leaves.load(Ordering::Relaxed);
+        debug_assert!(subtree_leaves > 0);
+        merkle::finish_merkle_tree_above_subtrees(
+            tree,
+            num_leaves,
+            subtree_leaves,
+            params.merkle_hash,
+        )
+    };
+    #[cfg(not(any(
+        all(target_arch = "aarch64", target_feature = "aes"),
+        all(target_arch = "x86_64", target_feature = "pclmulqdq"),
+    )))]
+    let merkle_tree = {
+        ntt.forward_transform_interleaved_from_layer(
+            &mut codeword,
+            params.num_ntts(),
+            params.log_inv_rate,
+        );
+        let codeword_bytes: &[u8] = unsafe {
+            core::slice::from_raw_parts(
+                codeword.as_ptr() as *const u8,
+                codeword.len() * core::mem::size_of::<F128>(),
+            )
+        };
+        merkle::merkle_tree(codeword_bytes, params.n_leaves(), params.merkle_hash)
+    };
     if timing {
         eprintln!(
-            "[commit-timing] ntt: {:.2} ms",
+            "[commit-timing] ntt + cache-hot merkle subtrees: {:.2} ms",
             t_ntt.elapsed().as_secs_f64() * 1e3
         );
     }
     let t_merkle = std::time::Instant::now();
 
-    // ---- Merkle commitment: one leaf per codeword position = num_ntts F128.
-    // Zero-copy: cast the codeword Vec<F128> directly to &[u8]. F128 is
-    // repr(C, align(16)) with two u64s laid out little-endian — same bytes
-    // as the explicit lo.to_le_bytes() + hi.to_le_bytes() serialization.
-    let codeword_bytes: &[u8] = unsafe {
-        core::slice::from_raw_parts(
-            codeword.as_ptr() as *const u8,
-            codeword.len() * core::mem::size_of::<F128>(),
-        )
-    };
-    // Initial tree: one leaf per codeword position, each containing the
-    // row-batch lanes (num_ntts F_{2^128} values = 2^log_batch_size). This is
-    // Ligerito's L0 commitment.
-    let merkle_tree = merkle::merkle_tree(codeword_bytes, params.n_leaves(), params.merkle_hash);
+    // The NTT callback populated every cache-local subtree directly in the
+    // canonical flat tree; only the upper levels above those roots were built
+    // after the callbacks joined. Non-accelerated targets use the standard
+    // whole-tree builder above.
     let root = *merkle_tree.last().expect("merkle tree non-empty");
     if timing {
         eprintln!(
-            "[commit-timing] merkle: {:.2} ms",
+            "[commit-timing] merkle root extraction: {:.2} ms",
             t_merkle.elapsed().as_secs_f64() * 1e3
         );
     }
@@ -479,6 +535,28 @@ mod tests {
                 "root mismatch at m={m} r={log_inv_rate}"
             );
         }
+    }
+
+    #[test]
+    fn cache_subgroup_commit_matches_standard_flat_tree() {
+        let mut rng = Rng::new(0x5AB7_2EE5);
+        let mut params = default_params(24);
+        params.log_batch_size = 5;
+        params.merkle_hash = HashKind::Blake3;
+        let z_packed: Vec<F128> = (0..1usize << params.log_msg_len())
+            .map(|_| F128 {
+                lo: rng.next_u64(),
+                hi: rng.next_u64(),
+            })
+            .collect();
+
+        let (_, pd) = commit(&z_packed, &params);
+        let codeword_bytes = unsafe {
+            core::slice::from_raw_parts(pd.codeword.as_ptr() as *const u8, pd.codeword.len() * 16)
+        };
+        let expected =
+            crate::merkle::merkle_tree(codeword_bytes, params.n_leaves(), params.merkle_hash);
+        assert_eq!(pd.merkle_tree, expected);
     }
 
     #[test]
