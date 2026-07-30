@@ -207,7 +207,7 @@ pub fn prove_fast_ligerito_from_witness<Ch: Challenger>(
     b_packed_f128: Vec<F128>,
     z_packed_lincheck: Vec<u8>,
     lincheck_circuit: &dyn lincheck::LincheckCircuit,
-    prefaulted_codeword: Option<Vec<F128>>,
+    prefaulted_codeword: pcs::CodewordBuf,
     challenger: &mut Ch,
 ) -> (R1csProofLigerito, Commitment, R1csClaim) {
     let lig_config = pcs_params
@@ -310,16 +310,14 @@ pub fn prove_fast_core<Ch: Challenger>(
         b_packed_f128,
         z_packed_lincheck,
         lincheck_circuit,
-        None,
+        pcs::CodewordBuf::None,
         challenger,
     )
 }
 
-/// [`prove_fast_core`] with an optional pre-faulted codeword buffer (see
-/// [`pcs::prefault_codeword_during`]). When `Some`, the commit reuses it via
-/// [`pcs::commit_into`] instead of allocating — the alloc was already done,
-/// overlapped with witness generation. When `None`, behaves exactly like
-/// [`prove_fast_core`] (commit allocates inline).
+/// [`prove_fast_core`] with the codeword buffer from
+/// [`pcs::prefault_codeword_during`], which also carries whether the witness
+/// generator already replicate-filled it. See [`pcs::CodewordBuf`].
 #[allow(clippy::too_many_arguments)]
 pub fn prove_fast_core_with_codeword<Ch: Challenger>(
     r1cs: &BlockR1cs,
@@ -329,13 +327,10 @@ pub fn prove_fast_core_with_codeword<Ch: Challenger>(
     b_packed_f128: Vec<F128>,
     z_packed_lincheck: Vec<u8>,
     lincheck_circuit: &dyn lincheck::LincheckCircuit,
-    prefaulted_codeword: Option<Vec<F128>>,
+    prefaulted_codeword: pcs::CodewordBuf,
     challenger: &mut Ch,
 ) -> ProveCore {
-    let (commitment, prover_data) = match prefaulted_codeword {
-        Some(buf) => pcs::commit_into(&z_packed, pcs_params, buf),
-        None => pcs::commit(&z_packed, pcs_params),
-    };
+    let (commitment, prover_data) = prefaulted_codeword.commit(&z_packed, pcs_params);
     bind_statement(challenger, r1cs, &commitment);
 
     let padding = r1cs.padding_spec();
@@ -452,7 +447,7 @@ pub fn prove_fast_ligerito_timed<Ch: Challenger>(
     b_packed_f128: Vec<F128>,
     z_packed_lincheck: Vec<u8>,
     lincheck_circuit: &dyn lincheck::LincheckCircuit,
-    prefaulted_codeword: Option<Vec<F128>>,
+    prefaulted_codeword: pcs::CodewordBuf,
     challenger: &mut Ch,
 ) -> (R1csProofLigerito, Commitment, R1csClaim, ProvePhaseTimings) {
     use std::time::Instant;
@@ -464,10 +459,7 @@ pub fn prove_fast_ligerito_timed<Ch: Challenger>(
 
     // --- PCS commit ---
     let t0 = Instant::now();
-    let (commitment, prover_data) = match prefaulted_codeword {
-        Some(buf) => pcs::commit_into(&z_packed, pcs_params, buf),
-        None => pcs::commit(&z_packed, pcs_params),
-    };
+    let (commitment, prover_data) = prefaulted_codeword.commit(&z_packed, pcs_params);
     t.commit_s = t0.elapsed().as_secs_f64();
     bind_statement(challenger, r1cs, &commitment);
 

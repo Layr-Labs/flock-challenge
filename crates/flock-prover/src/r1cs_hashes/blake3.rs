@@ -1242,6 +1242,22 @@ pub fn generate_witness_with_ab_packed_and_lincheck(
     Vec<flock_core::field::F128>,
     Vec<u8>,
 ) {
+    generate_witness_with_ab_packed_and_lincheck_into(blocks, n_blocks_log, None)
+}
+
+/// [`generate_witness_with_ab_packed_and_lincheck`] that also replicate-fills
+/// the PCS commit `codeword` from inside the witness loop — see
+/// `common::drive_witness_packed_and_lincheck`.
+pub fn generate_witness_with_ab_packed_and_lincheck_into(
+    blocks: &[Compression],
+    n_blocks_log: usize,
+    codeword: Option<&mut [flock_core::field::F128]>,
+) -> (
+    Vec<flock_core::field::F128>,
+    Vec<flock_core::field::F128>,
+    Vec<flock_core::field::F128>,
+    Vec<u8>,
+) {
     // Constant-wire pin (docs/const-wire-pin.md): fill padding blocks with a
     // valid compression (of the all-zero input) so the constant cell is 1 in
     // every block. (The chain forbids padding, so this only affects the
@@ -1252,6 +1268,7 @@ pub fn generate_witness_with_ab_packed_and_lincheck(
         Some(&padding),
         n_blocks_log,
         K_LOG,
+        codeword,
         |block: &Compression, z_u64, a_u64, b_u64| {
             let (cv, m, t, bl, fl) = block;
             build_block_witness_ab_packed_into(cv, m, *t, *bl, *fl, z_u64, a_u64, b_u64);
@@ -1285,6 +1302,40 @@ impl Blake3Setup {
     }
 
     /// Fast-path witness generation dispatched on the r1cs's witness layout.
+    /// Returns `true` when it replicate-filled `codeword` (only the row-major
+    /// producer does; batch-major leaves it to commit).
+    fn generate_witness_ab_into(
+        &self,
+        blocks: &[Compression],
+        codeword: Option<&mut [flock_core::field::F128]>,
+    ) -> (
+        (
+            Vec<flock_core::field::F128>,
+            Vec<flock_core::field::F128>,
+            Vec<flock_core::field::F128>,
+            Vec<u8>,
+        ),
+        bool,
+    ) {
+        match self.r1cs.layout {
+            flock_core::r1cs::WitnessLayout::RowMajor => {
+                let filled = codeword.is_some();
+                (
+                    generate_witness_with_ab_packed_and_lincheck_into(
+                        blocks,
+                        self.n_blocks_log(),
+                        codeword,
+                    ),
+                    filled,
+                )
+            }
+            flock_core::r1cs::WitnessLayout::BatchMajor => {
+                (generate_witness_batch_major(blocks, self.n_blocks_log()), false)
+            }
+        }
+    }
+
+    /// Fast-path witness generation dispatched on the r1cs's witness layout.
     fn generate_witness_ab(
         &self,
         blocks: &[Compression],
@@ -1294,14 +1345,7 @@ impl Blake3Setup {
         Vec<flock_core::field::F128>,
         Vec<u8>,
     ) {
-        match self.r1cs.layout {
-            flock_core::r1cs::WitnessLayout::RowMajor => {
-                generate_witness_with_ab_packed_and_lincheck(blocks, self.n_blocks_log())
-            }
-            flock_core::r1cs::WitnessLayout::BatchMajor => {
-                generate_witness_batch_major(blocks, self.n_blocks_log())
-            }
-        }
+        self.generate_witness_ab_into(blocks, None).0
     }
 
     pub fn new(n_blocks: usize) -> Self {
@@ -1402,10 +1446,11 @@ impl Blake3Setup {
         challenger: &mut Ch,
     ) -> (flock_core::proof::R1csProofLigerito, Commitment, R1csClaim) {
         assert_eq!(blocks.len(), self.n_blocks);
-        let (codeword, (z_packed, a_packed_f128, b_packed_f128, z_packed_lincheck)) =
-            flock_core::pcs::prefault_codeword_during(&self.pcs_params, || {
-                self.generate_witness_ab(blocks)
+        let (codeword, ((z_packed, a_packed_f128, b_packed_f128, z_packed_lincheck), filled)) =
+            flock_core::pcs::prefault_codeword_during(&self.pcs_params, |cw| {
+                self.generate_witness_ab_into(blocks, cw)
             });
+        let codeword = if filled { codeword } else { codeword.demote() };
         let lc_circuit = self.r1cs.csc_lincheck_circuit();
         crate::prover::prove_fast_ligerito_from_witness(
             &self.r1cs,
@@ -1447,7 +1492,7 @@ impl Blake3Setup {
             b_packed_f128,
             z_packed_lincheck,
             lc_circuit,
-            None,
+            flock_core::pcs::CodewordBuf::None,
             challenger,
         );
         timings.witness_s = witness_s;
@@ -2219,7 +2264,7 @@ mod tests {
             b,
             zlc,
             circuit,
-            None,
+            flock_core::pcs::CodewordBuf::None,
             &mut ch_p,
         );
         let mut ch_v = FsChallenger::new(b"poc");

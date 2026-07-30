@@ -1191,6 +1191,22 @@ pub fn generate_witness_with_ab_packed_and_lincheck(
     Vec<flock_core::field::F128>,
     Vec<u8>,
 ) {
+    generate_witness_with_ab_packed_and_lincheck_into(compressions, n_blocks_log, None)
+}
+
+/// [`generate_witness_with_ab_packed_and_lincheck`] that also replicate-fills
+/// the PCS commit `codeword` from inside the witness loop — see
+/// `common::drive_witness_packed_and_lincheck`.
+pub fn generate_witness_with_ab_packed_and_lincheck_into(
+    compressions: &[([u32; 8], [u32; 16])],
+    n_blocks_log: usize,
+    codeword: Option<&mut [flock_core::field::F128]>,
+) -> (
+    Vec<flock_core::field::F128>,
+    Vec<flock_core::field::F128>,
+    Vec<flock_core::field::F128>,
+    Vec<u8>,
+) {
     // Constant-wire pin (docs/const-wire-pin.md): fill padding blocks with a
     // valid compression (of the all-zero input) so the constant cell is 1 in
     // every block. (The chain forbids padding, so this only affects the
@@ -1201,6 +1217,7 @@ pub fn generate_witness_with_ab_packed_and_lincheck(
         Some(&padding),
         n_blocks_log,
         K_LOG,
+        codeword,
         |comp: &([u32; 8], [u32; 16]), z_u64, a_u64, b_u64| {
             let (h_in, m) = comp;
             build_block_ab_packed_into(h_in, m, z_u64, a_u64, b_u64);
@@ -1263,6 +1280,41 @@ impl Sha256HybridSetup {
     }
 
     /// Fast-path witness generation dispatched on the r1cs's witness layout.
+    /// Returns `true` when it replicate-filled `codeword` (only the row-major
+    /// producer does; batch-major leaves it to commit).
+    fn generate_witness_ab_into(
+        &self,
+        compressions: &[([u32; 8], [u32; 16])],
+        codeword: Option<&mut [flock_core::field::F128]>,
+    ) -> (
+        (
+            Vec<flock_core::field::F128>,
+            Vec<flock_core::field::F128>,
+            Vec<flock_core::field::F128>,
+            Vec<u8>,
+        ),
+        bool,
+    ) {
+        match self.r1cs.layout {
+            flock_core::r1cs::WitnessLayout::RowMajor => {
+                let filled = codeword.is_some();
+                (
+                    generate_witness_with_ab_packed_and_lincheck_into(
+                        compressions,
+                        self.n_blocks_log(),
+                        codeword,
+                    ),
+                    filled,
+                )
+            }
+            flock_core::r1cs::WitnessLayout::BatchMajor => (
+                generate_witness_batch_major(compressions, self.n_blocks_log()),
+                false,
+            ),
+        }
+    }
+
+    /// Fast-path witness generation dispatched on the r1cs's witness layout.
     fn generate_witness_ab(
         &self,
         compressions: &[([u32; 8], [u32; 16])],
@@ -1272,14 +1324,7 @@ impl Sha256HybridSetup {
         Vec<flock_core::field::F128>,
         Vec<u8>,
     ) {
-        match self.r1cs.layout {
-            flock_core::r1cs::WitnessLayout::RowMajor => {
-                generate_witness_with_ab_packed_and_lincheck(compressions, self.n_blocks_log())
-            }
-            flock_core::r1cs::WitnessLayout::BatchMajor => {
-                generate_witness_batch_major(compressions, self.n_blocks_log())
-            }
-        }
+        self.generate_witness_ab_into(compressions, None).0
     }
 
     pub fn with_log_inv_rate(n_compressions: usize, log_inv_rate: usize) -> Self {
@@ -1384,13 +1429,15 @@ impl Sha256HybridSetup {
         flock_core::proof::R1csClaim,
     ) {
         assert_eq!(compressions.len(), self.n_compressions);
-        // Pre-fault the commit codeword buffer on a background (E-core) thread
-        // while witness generation runs on the perf cores; gated so
-        // RAYON_NUM_THREADS=1 stays truly serial (no extra thread).
-        let (codeword, (z_packed, a_packed_f128, b_packed_f128, z_packed_lincheck)) =
-            flock_core::pcs::prefault_codeword_during(&self.pcs_params, || {
-                self.generate_witness_ab(compressions)
+        // Obtain the commit codeword buffer overlapped with witness generation
+        // (warm: filled in-loop by the witness build; cold: pre-faulted on a
+        // background E-core thread); gated so RAYON_NUM_THREADS=1 stays truly
+        // serial (no extra thread).
+        let (codeword, ((z_packed, a_packed_f128, b_packed_f128, z_packed_lincheck), filled)) =
+            flock_core::pcs::prefault_codeword_during(&self.pcs_params, |cw| {
+                self.generate_witness_ab_into(compressions, cw)
             });
+        let codeword = if filled { codeword } else { codeword.demote() };
         crate::prover::prove_fast_ligerito_from_witness(
             &self.r1cs,
             &self.pcs_params,
@@ -1431,7 +1478,7 @@ impl Sha256HybridSetup {
             b_packed_f128,
             z_packed_lincheck,
             lc_circuit,
-            None,
+            flock_core::pcs::CodewordBuf::None,
             challenger,
         );
         timings.witness_s = witness_s;
@@ -2328,7 +2375,7 @@ mod tests {
             b,
             zlc,
             circuit,
-            None,
+            flock_core::pcs::CodewordBuf::None,
             &mut ch_p,
         );
         let mut ch_v = FsChallenger::new(b"poc");

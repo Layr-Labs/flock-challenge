@@ -255,6 +255,17 @@ pub fn generate_witness_with_ab_packed_and_lincheck(
     initial_states: &[State],
     n_blocks_log: usize,
 ) -> (Vec<F128>, Vec<F128>, Vec<F128>, Vec<u8>) {
+    generate_witness_with_ab_packed_and_lincheck_into(initial_states, n_blocks_log, None)
+}
+
+/// [`generate_witness_with_ab_packed_and_lincheck`] that also replicate-fills
+/// the PCS commit `codeword` from inside the witness loop — see
+/// `common::drive_witness_packed_and_lincheck`.
+pub fn generate_witness_with_ab_packed_and_lincheck_into(
+    initial_states: &[State],
+    n_blocks_log: usize,
+    codeword: Option<&mut [F128]>,
+) -> (Vec<F128>, Vec<F128>, Vec<F128>, Vec<u8>) {
     let n_blocks = initial_states.len().div_ceil(N_SUB);
     let zero: State = [false; STATE_BITS];
     let triples: Vec<[State; N_SUB]> = (0..n_blocks)
@@ -282,6 +293,7 @@ pub fn generate_witness_with_ab_packed_and_lincheck(
         Some(&padding),
         n_blocks_log,
         K_LOG,
+        codeword,
         build_block_witness_into,
     )
 }
@@ -559,8 +571,12 @@ impl KeccakSetup {
     ) -> (flock_core::proof::R1csProofLigerito, Commitment, R1csClaim) {
         assert_eq!(initial_states.len(), self.n_keccaks);
         let (codeword, (z_packed, a_packed_f128, b_packed_f128, z_packed_lincheck)) =
-            flock_core::pcs::prefault_codeword_during(&self.pcs_params, || {
-                generate_witness_with_ab_packed_and_lincheck(initial_states, self.n_blocks_log())
+            flock_core::pcs::prefault_codeword_during(&self.pcs_params, |cw| {
+                generate_witness_with_ab_packed_and_lincheck_into(
+                    initial_states,
+                    self.n_blocks_log(),
+                    cw,
+                )
             });
         crate::prover::prove_fast_ligerito_from_witness(
             &self.r1cs,
@@ -617,7 +633,7 @@ impl KeccakSetup {
             b_packed_f128,
             z_packed_lincheck,
             &KeccakLincheckCircuit,
-            None,
+            flock_core::pcs::CodewordBuf::None,
             challenger,
         );
         timings.witness_s = witness_s;
@@ -937,7 +953,7 @@ mod tests {
             b,
             zlc,
             &KeccakLincheckCircuit,
-            None,
+            flock_core::pcs::CodewordBuf::None,
             &mut ch_p,
         );
 

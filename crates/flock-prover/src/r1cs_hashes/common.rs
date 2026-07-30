@@ -183,6 +183,23 @@ pub(crate) fn build_block_r1cs_with_matrices(
     }
 }
 
+/// Shared raw handle to the PCS commit codeword while the parallel witness
+/// loop fills it. The codeword is `n_reps` back-to-back replicas of `z`
+/// (`msg_len` elements each); witness group `g` writes only the slots
+/// `r * msg_len + g * grp_len .. + grp_len` for each `r`. Those ranges are
+/// pairwise disjoint across groups, so every thread has exclusive access to
+/// the slots it touches — rayon just cannot see that through an index
+/// computation, hence the pointer.
+#[derive(Clone, Copy)]
+struct CodewordReplicas {
+    ptr: *mut F128,
+    msg_len: usize,
+    n_reps: usize,
+}
+// SAFETY: see the disjointness argument above.
+unsafe impl Send for CodewordReplicas {}
+unsafe impl Sync for CodewordReplicas {}
+
 // ---------------------------------------------------------------------------
 // Generic witness packing driver.
 //
@@ -209,11 +226,20 @@ pub(crate) fn build_block_r1cs_with_matrices(
 ///   that pin a constant wire need this so the constant column is all-ones
 ///   across *every* batched instance (see `docs/const-wire-pin.md`); for keccak
 ///   the padding input is the all-zero state, whose witness is `keccak_f(0)`.
+///
+/// `codeword`, when supplied, is the PCS commit buffer (length a power-of-two
+/// multiple of `z.len()`). Each group's slice of `z` is copied into that
+/// group's slot in every one of the `codeword.len() / z.len()` replicas, right
+/// after the group is built and while it is still hot in L1. That is exactly
+/// the state `pcs::commit_prefilled` expects (the post-`log_inv_rate`-layer
+/// NTT state), and it lets commit skip `replicate_message_fill` — a full
+/// re-read of `z` (512 MB at m=32) from DRAM.
 pub(crate) fn drive_witness_packed_and_lincheck<S: Sync, F>(
     initial_states: &[S],
     padding: Option<&S>,
     n_blocks_log: usize,
     k_log: usize,
+    codeword: Option<&mut [F128]>,
     per_block: F,
 ) -> (Vec<F128>, Vec<F128>, Vec<F128>, Vec<u8>)
 where
@@ -246,6 +272,18 @@ where
     let mut a = flock_core::scratch::take_f128(total_f128);
     let mut b = flock_core::scratch::take_f128(total_f128);
     let mut z_lincheck = vec![0u8; (n_total / 8) * k];
+    let replicas = codeword.map(|cw| {
+        assert!(
+            cw.len() >= total_f128 && cw.len().is_multiple_of(total_f128),
+            "codeword length {} is not a whole multiple of the witness length {total_f128}",
+            cw.len()
+        );
+        CodewordReplicas {
+            ptr: cw.as_mut_ptr(),
+            msg_len: total_f128,
+            n_reps: cw.len() / total_f128,
+        }
+    });
 
     z.par_chunks_mut(8 * f128_per_block)
         .zip(a.par_chunks_mut(8 * f128_per_block))
@@ -318,6 +356,28 @@ where
                     z_u64_all[7 * u64_per_block + i],
                 ];
                 transpose_8_u64s_to_64_bytes(&lanes, &mut stripe[i * 64..i * 64 + 64]);
+            }
+
+            // Publish this group into its slot in every codeword replica while
+            // z_grp is still L1-hot (the builders just wrote it and the
+            // transpose above just re-read it). Doing it here rather than in
+            // `replicate_message_fill` deletes a full DRAM re-read of z.
+            if let Some(cw) = replicas {
+                let grp_len = z_grp.len();
+                let off = g * grp_len;
+                for r in 0..cw.n_reps {
+                    // SAFETY: `off + grp_len <= msg_len` because the chunks
+                    // tile `z` exactly, and `r < n_reps`, so the destination
+                    // lies inside the codeword and is disjoint from every
+                    // other group's and replica's destination.
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(
+                            z_grp.as_ptr(),
+                            cw.ptr.add(r * cw.msg_len + off),
+                            grp_len,
+                        );
+                    }
+                }
             }
         });
 

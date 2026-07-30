@@ -231,6 +231,28 @@ pub fn commit_into(
     finalize_commit(codeword, params)
 }
 
+/// Like [`commit_into`], but the caller has ALREADY written the replicate-fill
+/// state into `codeword`: all `2^log_inv_rate` replicas of the packed witness,
+/// back to back. That is the exact buffer state [`commit_into`] produces at
+/// line one, so this is `commit_into` minus `replicate_message_fill`.
+///
+/// The prover fills it inside the witness loop, where each group is still hot
+/// in L1 — the codeword writes cost the same either way, but doing them there
+/// deletes the separate full re-read of the witness (512 MB at m = 32) that
+/// `replicate_message_fill` would otherwise pay from DRAM. Legal because no
+/// challenger interaction occurs between witness generation and the commit
+/// (`bind_statement` runs strictly after), so the fill cannot observe a
+/// value the Fiat-Shamir transcript has not yet fixed.
+pub fn commit_prefilled(params: &PcsParams, codeword: Vec<F128>) -> (Commitment, ProverData) {
+    params.validate();
+    assert_eq!(
+        codeword.len(),
+        params.n_positions() * params.num_ntts(),
+        "commit_prefilled: codeword buffer has wrong length"
+    );
+    finalize_commit(codeword, params)
+}
+
 /// Fill `codeword` with `2^r` replicas of `msg` (`r = log2(codeword.len() /
 /// msg.len())`) — the exact state after the first `r` forward-NTT layers on
 /// the zero-padded coefficient vector `[msg, 0, …, 0]`. Pair with
@@ -331,37 +353,88 @@ fn set_background_qos() {
 #[cfg(not(target_os = "macos"))]
 fn set_background_qos() {}
 
-/// Allocate + zero-fill (pre-fault) the codeword buffer that [`commit_into`]
-/// will consume, on a background-QoS (E-core) thread, **while** `gen` runs on
-/// the caller's performance threads. Returns `(Some(buf), gen_result)`.
+/// Outcome of [`prefault_codeword_during`]: the commit's codeword buffer plus
+/// how much of the work has already been done to it.
+pub enum CodewordBuf {
+    /// The buffer was available *before* witness generation and the generator
+    /// filled it with the `2^log_inv_rate` replicas. Commit skips
+    /// `replicate_message_fill` entirely — see [`commit_prefilled`].
+    Prefilled(Vec<F128>),
+    /// The buffer was produced *concurrently* with witness generation (cold
+    /// path), so the generator never saw it. Commit still replicate-fills.
+    Raw(Vec<F128>),
+    /// No buffer: commit allocates inline.
+    None,
+}
+
+impl CodewordBuf {
+    /// Commit `z_packed` through whichever entry point this buffer's state
+    /// calls for.
+    pub fn commit(self, z_packed: &[F128], params: &PcsParams) -> (Commitment, ProverData) {
+        match self {
+            CodewordBuf::Prefilled(cw) => commit_prefilled(params, cw),
+            CodewordBuf::Raw(cw) => commit_into(z_packed, params, cw),
+            CodewordBuf::None => commit(z_packed, params),
+        }
+    }
+
+    /// Downgrade [`CodewordBuf::Prefilled`] to [`CodewordBuf::Raw`]: the
+    /// generator was offered the buffer but did not fill it, so commit must
+    /// replicate-fill after all. Witness producers that don't implement the
+    /// in-loop fill (e.g. the batch-major layout) return this.
+    pub fn demote(self) -> Self {
+        match self {
+            CodewordBuf::Prefilled(cw) => CodewordBuf::Raw(cw),
+            other => other,
+        }
+    }
+}
+
+/// Obtain the codeword buffer that the commit will consume, overlapping its
+/// cost with `generate` (the witness build) on the caller's threads.
 ///
-/// The codeword alloc is page-fault-bound (first-touch of a fresh 64–512 MB
-/// buffer) and scales ~1.0×, so overlapping it with witness generation hides it
-/// almost entirely (measured ~99% at m=29 — see `benches/ecore_offload_probe`).
+/// Two regimes, both hidden behind [`CodewordBuf`]:
+///
+/// - **Warm** (a pooled buffer is already resident — the normal case, since
+///   `scratch::prewarm_prover` parks one at Setup time): the buffer is handed
+///   to `generate` as `Some(&mut …)`, which MUST leave it holding the
+///   `2^log_inv_rate` replicas of the packed witness. Writing them from inside
+///   the witness loop, while each group is still hot in L1, costs the same
+///   stores as `replicate_message_fill` but deletes its full re-read of the
+///   witness from DRAM (512 MB at m = 32).
+/// - **Cold** (nothing pooled): the buffer is allocated and first-touched on a
+///   background-QoS (E-core) thread while `generate` runs, so `generate` is
+///   passed `None` and commit replicate-fills as before. The alloc is
+///   page-fault-bound and scales ~1.0×, so overlapping hides it almost
+///   entirely (measured ~99% at m=29 — see `benches/ecore_offload_probe`).
 ///
 /// **Gated for honest single-threaded behavior:** when the rayon pool has ≤ 1
-/// thread (i.e. `RAYON_NUM_THREADS=1`), this spawns **zero** OS threads — it
-/// runs `gen` and returns `None`, leaving [`commit`] to allocate inline. The
-/// whole offload is therefore invisible to truly-serial runs.
+/// thread (i.e. `RAYON_NUM_THREADS=1`), this spawns **zero** OS threads and
+/// takes no pooled buffer — it runs `generate(None)` and returns
+/// [`CodewordBuf::None`], leaving [`commit`] to allocate inline. The whole
+/// offload is therefore invisible to truly-serial runs.
 pub fn prefault_codeword_during<R>(
     params: &PcsParams,
-    generate: impl FnOnce() -> R,
-) -> (Option<Vec<F128>>, R) {
+    generate: impl FnOnce(Option<&mut [F128]>) -> R,
+) -> (CodewordBuf, R) {
     if rayon::current_num_threads() <= 1 || std::env::var_os("FLOCK_NO_PREFAULT").is_some() {
         // Truly single-threaded (or explicitly disabled): no extra OS thread;
         // commit allocates inline. FLOCK_NO_PREFAULT lets benchmarks A/B the
         // offload and keeps fixed-thread-count sweeps honest.
-        return (None, generate());
+        return (CodewordBuf::None, generate(None));
     }
     let codeword_len = params.n_positions() * params.num_ntts();
-    // Warm path: a pooled buffer is already resident — there is nothing to
-    // pre-fault, and commit_into writes every slot itself. Skip the thread.
-    if let Some(buf) = crate::scratch::try_take_f128(codeword_len) {
-        return (Some(buf), generate());
+    // Warm path: a pooled buffer is already resident, so there is nothing to
+    // pre-fault and nothing to overlap — hand it straight to the generator,
+    // which fills it in place.
+    if let Some(mut buf) = crate::scratch::try_take_f128(codeword_len) {
+        let r = generate(Some(&mut buf));
+        return (CodewordBuf::Prefilled(buf), r);
     }
     // Cold path: allocate + first-touch on a background-QoS thread, hidden
-    // under witness generation. (commit_into rewrites all slots, so the
-    // zero values themselves don't matter — the page faults do.)
+    // under witness generation. The buffer does not exist yet when `generate`
+    // starts, so it cannot be prefilled; commit replicate-fills it. (The zero
+    // values themselves don't matter — the page faults do.)
     std::thread::scope(|s| {
         let h = s.spawn(move || {
             set_background_qos();
@@ -371,8 +444,8 @@ pub fn prefault_codeword_during<R>(
             }
             buf
         });
-        let r = generate();
-        (Some(h.join().unwrap()), r)
+        let r = generate(None);
+        (CodewordBuf::Raw(h.join().unwrap()), r)
     })
 }
 

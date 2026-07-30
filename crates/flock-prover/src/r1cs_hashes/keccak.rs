@@ -647,6 +647,17 @@ pub fn generate_witness_with_ab_packed_and_lincheck(
     initial_states: &[State],
     n_keccaks_log: usize,
 ) -> (Vec<F128>, Vec<F128>, Vec<F128>, Vec<u8>) {
+    generate_witness_with_ab_packed_and_lincheck_into(initial_states, n_keccaks_log, None)
+}
+
+/// [`generate_witness_with_ab_packed_and_lincheck`] that also replicate-fills
+/// the PCS commit `codeword` from inside the witness loop — see
+/// `common::drive_witness_packed_and_lincheck`.
+pub fn generate_witness_with_ab_packed_and_lincheck_into(
+    initial_states: &[State],
+    n_keccaks_log: usize,
+    codeword: Option<&mut [F128]>,
+) -> (Vec<F128>, Vec<F128>, Vec<F128>, Vec<u8>) {
     // Constant-wire pin (docs/const-wire-pin.md): fill padding blocks with a
     // valid keccak_f(0) computation so the constant cell is 1 in every block.
     // (The chain forbids padding — `prove_chain` asserts no padding — so this is
@@ -657,6 +668,7 @@ pub fn generate_witness_with_ab_packed_and_lincheck(
         Some(&padding),
         n_keccaks_log,
         K_LOG,
+        codeword,
         build_chain_witness_ab_packed_into,
     )
 }
@@ -926,19 +938,39 @@ impl KeccakSetup {
         s
     }
 
+    /// Witness generation dispatched on the r1cs's witness layout. Returns
+    /// `true` when it replicate-filled `codeword` (only the row-major producer
+    /// does; batch-major leaves it to commit).
+    fn generate_witness_into(
+        &self,
+        initial_states: &[State],
+        codeword: Option<&mut [F128]>,
+    ) -> ((Vec<F128>, Vec<F128>, Vec<F128>, Vec<u8>), bool) {
+        match self.r1cs.layout {
+            flock_core::r1cs::WitnessLayout::RowMajor => {
+                let filled = codeword.is_some();
+                (
+                    generate_witness_with_ab_packed_and_lincheck_into(
+                        initial_states,
+                        self.n_keccaks_log(),
+                        codeword,
+                    ),
+                    filled,
+                )
+            }
+            flock_core::r1cs::WitnessLayout::BatchMajor => (
+                generate_witness_batch_major(initial_states, self.n_keccaks_log()),
+                false,
+            ),
+        }
+    }
+
     /// Witness generation dispatched on the r1cs's witness layout.
     fn generate_witness(
         &self,
         initial_states: &[State],
     ) -> (Vec<F128>, Vec<F128>, Vec<F128>, Vec<u8>) {
-        match self.r1cs.layout {
-            flock_core::r1cs::WitnessLayout::RowMajor => {
-                generate_witness_with_ab_packed_and_lincheck(initial_states, self.n_keccaks_log())
-            }
-            flock_core::r1cs::WitnessLayout::BatchMajor => {
-                generate_witness_batch_major(initial_states, self.n_keccaks_log())
-            }
-        }
+        self.generate_witness_into(initial_states, None).0
     }
 
     pub fn m(&self) -> usize {
@@ -959,10 +991,11 @@ impl KeccakSetup {
         challenger: &mut Ch,
     ) -> (flock_core::proof::R1csProofLigerito, Commitment, R1csClaim) {
         assert_eq!(initial_states.len(), self.n_keccaks);
-        let (codeword, (z_packed, a_packed_f128, b_packed_f128, z_packed_lincheck)) =
-            flock_core::pcs::prefault_codeword_during(&self.pcs_params, || {
-                self.generate_witness(initial_states)
+        let (codeword, ((z_packed, a_packed_f128, b_packed_f128, z_packed_lincheck), filled)) =
+            flock_core::pcs::prefault_codeword_during(&self.pcs_params, |cw| {
+                self.generate_witness_into(initial_states, cw)
             });
+        let codeword = if filled { codeword } else { codeword.demote() };
         crate::prover::prove_fast_ligerito_from_witness(
             &self.r1cs,
             &self.pcs_params,
@@ -1772,7 +1805,7 @@ mod tests {
             b,
             zlc,
             &KeccakLincheckCircuit,
-            None,
+            flock_core::pcs::CodewordBuf::None,
             &mut ch_p,
         );
         let mut ch_v = FsChallenger::new(b"poc");
