@@ -410,6 +410,14 @@ impl AdditiveNttF128 {
             target_feature = "avx512f",
             target_feature = "vpclmulqdq"
         ));
+        // The scalar-per-lane eight-value kernel saves top-layer memory
+        // sweeps, but its register pressure loses on cache-resident recursive
+        // transforms. Restrict it to buffers at least 128 MiB: the ranked
+        // initial/L0 transforms are 1 GiB, while recursive levels stay on the
+        // promoted fused-two path.
+        const FUSED3_MIN_F128: usize = 1 << 23;
+        let fused3_ok = cfg!(all(target_arch = "aarch64", target_feature = "aes"))
+            && n_total >= FUSED3_MIN_F128;
         let mut layer = start_layer.min(n_top);
         while layer < n_top {
             let num_blocks = 1usize << layer;
@@ -441,6 +449,30 @@ impl AdditiveNttF128 {
                     );
                 }
                 layer += 4;
+            } else if fused3_ok && layer + 2 < n_top && block_size >= 8 {
+                // Fuse three layers (layer..layer+3). Eight live values fit
+                // the AArch64 register budget, unlike the scalar 16-value
+                // fused-four fallback, and replace two top-buffer sweeps with
+                // one relative to fused-two plus a single layer.
+                let eighth = block_size >> 3;
+                for block in 0..num_blocks {
+                    let mut tw = [F128::ZERO; 7];
+                    tw[0] = self.twiddle(layer, block);
+                    for s in 0..2 {
+                        tw[1 + s] = self.twiddle(layer + 1, 2 * block + s);
+                    }
+                    for s in 0..4 {
+                        tw[3 + s] = self.twiddle(layer + 2, 4 * block + s);
+                    }
+                    let start = block * block_bytes;
+                    butterfly_interleaved_fused_3layer_par_rows(
+                        &mut data[start..start + block_bytes],
+                        &tw,
+                        eighth,
+                        num_ntts,
+                    );
+                }
+                layer += 3;
             } else if layer + 1 < n_top && block_size >= 4 {
                 // Fuse layers (layer, layer+1).
                 let quarter = block_size >> 2;
@@ -849,6 +881,37 @@ fn butterfly_interleaved_fused_2layer_par_rows(
             .for_each(|(((row_a, row_b), row_c), row_d)| {
                 do_one(row_a, row_b, row_c, row_d);
             });
+    }
+}
+
+/// Butterfly one top-layer block, fusing three layers `(L..L+3)`. `block`
+/// holds `8 * eighth` rows of `num_ntts` lanes; `t` carries the seven
+/// sub-butterfly twiddles. Parallel over disjoint row groups.
+#[inline]
+fn butterfly_interleaved_fused_3layer_par_rows(
+    block: &mut [F128],
+    t: &[F128; 7],
+    eighth: usize,
+    num_ntts: usize,
+) {
+    use rayon::prelude::*;
+    const PARALLEL_ROW_THRESHOLD: usize = 256;
+    debug_assert_eq!(block.len(), 8 * eighth * num_ntts);
+    let base = block.as_mut_ptr() as usize;
+    if eighth < PARALLEL_ROW_THRESHOLD {
+        for r in 0..eighth {
+            // SAFETY: row group r writes eight disjoint rows of this block.
+            unsafe {
+                kernels::butterfly_fused_3layer_row(base as *mut F128, eighth, num_ntts, r, t)
+            };
+        }
+    } else {
+        (0..eighth).into_par_iter().for_each(|r| {
+            // SAFETY: distinct r values select disjoint row groups.
+            unsafe {
+                kernels::butterfly_fused_3layer_row(base as *mut F128, eighth, num_ntts, r, t)
+            };
+        });
     }
 }
 

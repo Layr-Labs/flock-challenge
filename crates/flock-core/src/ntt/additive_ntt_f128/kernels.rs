@@ -72,6 +72,23 @@ pub(super) fn butterfly_fused_2layer(
     portable::butterfly_fused_2layer(a, b, c, d, t_outer, t_inner_a, t_inner_b);
 }
 
+/// Process one fused-three-layer row group across every interleaved NTT lane.
+///
+/// # Safety
+/// The caller must ensure the eight row slices selected by `r` are valid and
+/// disjoint from any row group being processed concurrently.
+#[inline]
+pub(super) unsafe fn butterfly_fused_3layer_row(
+    ptr: *mut F128,
+    eighth: usize,
+    num_ntts: usize,
+    r: usize,
+    twiddles: &[F128; 7],
+) {
+    // SAFETY: forwarded caller contract.
+    unsafe { portable::butterfly_fused_3layer_row(ptr, eighth, num_ntts, r, twiddles) }
+}
+
 /// Process one fused-four-layer row group across every interleaved NTT lane.
 ///
 /// # Safety
