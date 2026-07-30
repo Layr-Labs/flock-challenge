@@ -306,27 +306,40 @@ pub fn blake3_compress(
     state
 }
 
-/// `per_round_msg_idx()[r][g] = (mx_idx, my_idx)` for round `r`, G index `g`
-/// — i.e., `PERM^r [G_MSG_IDX[g]]`.
-fn per_round_msg_idx() -> [[[usize; 2]; N_G_PER_ROUND]; N_ROUNDS] {
+/// Build `PER_ROUND_MSG_IDX[r][g] = (mx_idx, my_idx)` for round `r`, G index
+/// `g` — i.e., `PERM^r [G_MSG_IDX[g]]`.
+const fn build_per_round_msg_idx() -> [[[usize; 2]; N_G_PER_ROUND]; N_ROUNDS] {
     let mut perm = [0usize; 16];
-    for i in 0..16 {
+    let mut i = 0;
+    while i < 16 {
         perm[i] = i;
+        i += 1;
     }
     let mut out = [[[0usize; 2]; N_G_PER_ROUND]; N_ROUNDS];
-    for r in 0..N_ROUNDS {
-        for g in 0..N_G_PER_ROUND {
+    let mut r = 0;
+    while r < N_ROUNDS {
+        let mut g = 0;
+        while g < N_G_PER_ROUND {
             out[r][g][0] = perm[G_MSG_IDX[g][0]];
             out[r][g][1] = perm[G_MSG_IDX[g][1]];
+            g += 1;
         }
         let mut next = [0usize; 16];
-        for i in 0..16 {
+        i = 0;
+        while i < 16 {
             next[i] = perm[MSG_PERMUTATION[i]];
+            i += 1;
         }
         perm = next;
+        r += 1;
     }
     out
 }
+
+/// The BLAKE3 message schedule is input-independent. Keeping it in static
+/// storage avoids rebuilding and copying 112 `usize` indices for every
+/// compression during witness generation.
+const PER_ROUND_MSG_IDX: [[[usize; 2]; N_G_PER_ROUND]; N_ROUNDS] = build_per_round_msg_idx();
 
 // ---------------------------------------------------------------------------
 // Lin_func cascade — per-bit lists of slot indices XOR'd to evaluate one bit.
@@ -489,7 +502,7 @@ pub fn build_matrices() -> (SparseBinaryMatrix, SparseBinaryMatrix) {
     input_emit(BLEN_BASE, WORD_BITS);
     input_emit(FLAGS_BASE, WORD_BITS);
 
-    let msg_idx = per_round_msg_idx();
+    let msg_idx = &PER_ROUND_MSG_IDX;
     let mut state: [Word; 16] = initial_lane_words();
 
     for r in 0..N_ROUNDS {
@@ -714,7 +727,7 @@ impl flock_core::lincheck::LincheckCircuit for Blake3LincheckCircuit {
         input_emit(&mut comb, BLEN_BASE, WORD_BITS);
         input_emit(&mut comb, FLAGS_BASE, WORD_BITS);
 
-        let msg_idx = per_round_msg_idx();
+        let msg_idx = &PER_ROUND_MSG_IDX;
         let mut state: [Word; 16] = initial_lane_words();
 
         for r in 0..N_ROUNDS {
@@ -891,7 +904,7 @@ pub fn build_block_witness(
         block_len,
         flags,
     ];
-    let msg_idx = per_round_msg_idx();
+    let msg_idx = &PER_ROUND_MSG_IDX;
 
     for r in 0..N_ROUNDS {
         for g_in_round in 0..N_G_PER_ROUND {
@@ -1079,7 +1092,7 @@ fn build_block_witness_ab_packed_into(
         block_len,
         flags,
     ];
-    let msg_idx = per_round_msg_idx();
+    let msg_idx = &PER_ROUND_MSG_IDX;
     for r in 0..N_ROUNDS {
         for g_in_round in 0..N_G_PER_ROUND {
             let g = r * N_G_PER_ROUND + g_in_round;
@@ -1658,7 +1671,7 @@ fn build_group_batch_major(
         block_len,
         flags,
     ];
-    let msg_idx = per_round_msg_idx();
+    let msg_idx = &PER_ROUND_MSG_IDX;
     for r in 0..N_ROUNDS {
         for g_in_round in 0..N_G_PER_ROUND {
             let g = r * N_G_PER_ROUND + g_in_round;
