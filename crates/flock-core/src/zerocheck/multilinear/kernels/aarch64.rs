@@ -118,11 +118,14 @@ unsafe fn fold_row_q(
     use core::arch::aarch64::*;
     unsafe {
         const STRIDE: usize = 256 * 16;
-        let mut acc = vreinterpretq_u64_u8(vld1q_u8(table_data.add((*bytes_ptr) as usize * 16)));
+        // All eight table indices are consecutive. Keep them in one scalar
+        // register so the lookup stream issues one source load rather than
+        // eight LDRBs competing with the eight 128-bit table gathers.
+        let indices = u64::from_le(bytes_ptr.cast::<u64>().read_unaligned());
+        let mut acc = vreinterpretq_u64_u8(vld1q_u8(table_data.add((indices as u8) as usize * 16)));
         for chunk in 1..8 {
-            let entry = table_data.add(
-                chunk * STRIDE + (*bytes_ptr.add(chunk)) as usize * core::mem::size_of::<F128>(),
-            );
+            let index = ((indices >> (chunk * 8)) as u8) as usize;
+            let entry = table_data.add(chunk * STRIDE + index * core::mem::size_of::<F128>());
             acc = veorq_u64(acc, vreinterpretq_u64_u8(vld1q_u8(entry)));
         }
         acc
