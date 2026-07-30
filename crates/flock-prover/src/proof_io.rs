@@ -88,6 +88,12 @@ const FLAVOR_CHAIN_LIGERITO: u8 = 3;
 /// Header size = 5-byte magic + 1-byte version + 1-byte flavor.
 const HEADER_LEN: usize = 7;
 
+/// Production Ligerito proofs are typically a few hundred KiB. Reserving that
+/// range up front avoids repeatedly growing and copying the output buffer while
+/// bincode streams the proof into it; unusually large bundles still grow
+/// normally.
+const BUNDLE_CAPACITY_HINT: usize = 512 * 1024;
+
 /// Errors from `from_bytes` / `read_from_file`.
 #[derive(Debug)]
 pub enum DeserializeError {
@@ -158,7 +164,7 @@ pub struct ChainProofBundleLigerito {
 
 impl R1csProofBundleLigerito {
     pub fn to_bytes(&self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(HEADER_LEN + 1024);
+        let mut out = Vec::with_capacity(BUNDLE_CAPACITY_HINT);
         write_header(&mut out, FLAVOR_R1CS_LIGERITO);
         bincode::serialize_into(&mut out, self).expect("bincode serialize R1csProofBundleLigerito");
         out
@@ -171,7 +177,7 @@ impl R1csProofBundleLigerito {
 
 impl ChainProofBundleLigerito {
     pub fn to_bytes(&self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(HEADER_LEN + 1024);
+        let mut out = Vec::with_capacity(BUNDLE_CAPACITY_HINT);
         write_header(&mut out, FLAVOR_CHAIN_LIGERITO);
         bincode::serialize_into(&mut out, self)
             .expect("bincode serialize ChainProofBundleLigerito");

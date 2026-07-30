@@ -286,17 +286,17 @@ impl AdditiveNttF128 {
         let n_total = data.len();
         let log_d = log2_pow2(n_total / num_ntts);
 
-        // Target sub-group size = 2 MB total bytes. Each position is
+        // Target sub-group size = 4 MiB total bytes. Each position is
         // `num_ntts × 16` bytes, so positions per sub-group =
-        // 2^21 / (num_ntts · 16). With num_ntts=1: 2^17 positions. With
-        // num_ntts=32: 2^12 positions. (Without this scaling, sub-groups at
+        // 2^22 / (num_ntts · 16). With num_ntts=1: 2^18 positions. With
+        // num_ntts=32: 2^13 positions. (Without this scaling, sub-groups at
         // num_ntts=32 would be 64 MB and overflow L2 cache.)
-        const TARGET_SUBGROUP_LOG_BYTES: usize = 21;
+        const TARGET_SUBGROUP_LOG_BYTES: usize = 22;
         let log_bytes_per_position = 4 + log2_pow2(num_ntts);
         let target_log_positions = TARGET_SUBGROUP_LOG_BYTES.saturating_sub(log_bytes_per_position);
         let cache_n_top = log_d.saturating_sub(target_log_positions);
 
-        // Parallelism floor. The cache heuristic keeps each sub-NTT ~2 MB, but
+        // Parallelism floor. The cache heuristic keeps each sub-NTT ~4 MiB, but
         // for a mid-size transform whose whole codeword already fits that
         // budget it yields `cache_n_top == 0` and the transform runs fully
         // serial — e.g. the recursive Ligerito commits (~1 ms of NTT each,
@@ -344,6 +344,7 @@ impl AdditiveNttF128 {
             target_feature = "avx512f",
             target_feature = "vpclmulqdq"
         ));
+        let fused3_ok = cfg!(all(target_arch = "aarch64", target_feature = "aes"));
         let mut layer = start_layer.min(n_top);
         while layer < n_top {
             let num_blocks = 1usize << layer;
@@ -375,6 +376,30 @@ impl AdditiveNttF128 {
                     );
                 }
                 layer += 4;
+            } else if fused3_ok && layer + 2 < n_top && block_size >= 8 {
+                // Fuse three layers on NEON targets. Eight live rows fit in
+                // the architectural vector-register file without the spilling
+                // seen in the 16-row portable four-layer kernel, while still
+                // eliminating two full-buffer read/write passes.
+                let eighth = block_size >> 3;
+                for block in 0..num_blocks {
+                    let mut tw = [F128 { lo: 0, hi: 0 }; 7];
+                    tw[0] = self.twiddle(layer, block);
+                    for s in 0..2 {
+                        tw[1 + s] = self.twiddle(layer + 1, 2 * block + s);
+                    }
+                    for s in 0..4 {
+                        tw[3 + s] = self.twiddle(layer + 2, 4 * block + s);
+                    }
+                    let start = block * block_bytes;
+                    butterfly_interleaved_fused_3layer_par_rows(
+                        &mut data[start..start + block_bytes],
+                        &tw,
+                        eighth,
+                        num_ntts,
+                    );
+                }
+                layer += 3;
             } else if layer + 1 < n_top && block_size >= 4 {
                 // Fuse layers (layer, layer+1).
                 let quarter = block_size >> 2;
@@ -814,6 +839,37 @@ fn butterfly_interleaved_block(
             &mut bot[o..o + num_ntts],
             twiddle,
         );
+    }
+}
+
+/// Butterfly one top-layer block, fusing three layers `(L..L+3)`. Eight
+/// participating rows are loaded and stored once; row groups are disjoint and
+/// therefore safe to distribute across rayon workers.
+#[inline]
+fn butterfly_interleaved_fused_3layer_par_rows(
+    block: &mut [F128],
+    t: &[F128; 7],
+    eighth: usize,
+    num_ntts: usize,
+) {
+    use rayon::prelude::*;
+    const PARALLEL_ROW_THRESHOLD: usize = 256;
+    debug_assert_eq!(block.len(), 8 * eighth * num_ntts);
+    let base = block.as_mut_ptr() as usize;
+    if eighth < PARALLEL_ROW_THRESHOLD {
+        for r in 0..eighth {
+            // SAFETY: row group r writes disjoint rows of this block.
+            unsafe {
+                kernels::butterfly_fused_3layer_row(base as *mut F128, eighth, num_ntts, r, t)
+            };
+        }
+    } else {
+        (0..eighth).into_par_iter().for_each(|r| {
+            // SAFETY: distinct r values select disjoint row groups.
+            unsafe {
+                kernels::butterfly_fused_3layer_row(base as *mut F128, eighth, num_ntts, r, t)
+            };
+        });
     }
 }
 

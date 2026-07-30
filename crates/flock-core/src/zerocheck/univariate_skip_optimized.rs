@@ -494,6 +494,52 @@ impl WorkerStateWithSHatV {
     }
 }
 
+/// Process a compile-time-known number of medium windows. BLAKE3's padded
+/// second half-block always has 15 useful windows; specializing that common
+/// case lets LLVM fully unroll both the witness transform and convert-table
+/// accumulation instead of carrying a dynamic loop bound through the hot
+/// kernel.
+#[inline(always)]
+fn process_b_med_with_s_hat_v<const N_B_MED: usize>(
+    a_packed: &[u8],
+    b_packed: &[u8],
+    c_packed: &[u8],
+    inv_table: &InvNttTableByteSingleGf8,
+    chunk_byte_base: usize,
+    convert: &[F128],
+    eq_lo_val: F128,
+    state: &mut WorkerStateWithSHatV,
+) {
+    for b_med in 0..N_B_MED {
+        shift_reduce_inner_ab(
+            a_packed,
+            b_packed,
+            inv_table,
+            chunk_byte_base,
+            b_med,
+            &mut state.chunk_ab_bytes[b_med],
+            &mut state.a_col,
+            &mut state.b_col,
+        );
+        let byte_base_b = chunk_byte_base + b_med * N_CHUNKS * 8;
+        let c_in: &[u8; 64] = (&c_packed[byte_base_b..byte_base_b + 64])
+            .try_into()
+            .expect("64 c-bytes per medium position");
+        bit_transpose_64bytes(c_in, &mut state.chunk_c_bytes[b_med]);
+    }
+
+    kernels::accumulate_convert_with_s_hat_v(
+        &state.chunk_ab_bytes,
+        &state.chunk_c_bytes,
+        N_B_MED,
+        convert,
+        eq_lo_val,
+        &mut state.partial_ab,
+        &mut state.partial_c_0,
+        &mut state.partial_c_1,
+    );
+}
+
 /// Two-bank C variant of [`process_one_x_hi`]. AB-side and witness traffic
 /// unchanged; the only modification is the C-side inner loop now maintains
 /// `cf_c_0` and `cf_c_1` via masked convert-table lookups.
@@ -532,33 +578,26 @@ fn process_one_x_hi_with_s_hat_v(
         let eq_lo_val = eq_lo_scaled[x_outer_lo];
 
         if n_b_med == (1 << N_MEDIUM) {
-            for b_med in 0..(1 << N_MEDIUM) {
-                shift_reduce_inner_ab(
-                    a_packed,
-                    b_packed,
-                    inv_table,
-                    chunk_byte_base,
-                    b_med,
-                    &mut state.chunk_ab_bytes[b_med],
-                    &mut state.a_col,
-                    &mut state.b_col,
-                );
-                let byte_base_b = chunk_byte_base + b_med * N_CHUNKS * 8;
-                let c_in: &[u8; 64] = (&c_packed[byte_base_b..byte_base_b + 64])
-                    .try_into()
-                    .expect("64 c-bytes per medium position");
-                bit_transpose_64bytes(c_in, &mut state.chunk_c_bytes[b_med]);
-            }
-
-            kernels::accumulate_convert_with_s_hat_v(
-                &state.chunk_ab_bytes,
-                &state.chunk_c_bytes,
-                1 << N_MEDIUM,
+            process_b_med_with_s_hat_v::<16>(
+                a_packed,
+                b_packed,
+                c_packed,
+                inv_table,
+                chunk_byte_base,
                 convert,
                 eq_lo_val,
-                &mut state.partial_ab,
-                &mut state.partial_c_0,
-                &mut state.partial_c_1,
+                state,
+            );
+        } else if n_b_med == 15 {
+            process_b_med_with_s_hat_v::<15>(
+                a_packed,
+                b_packed,
+                c_packed,
+                inv_table,
+                chunk_byte_base,
+                convert,
+                eq_lo_val,
+                state,
             );
         } else {
             for b_med in 0..n_b_med {
