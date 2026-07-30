@@ -226,6 +226,109 @@ pub fn bit_transpose_64bytes(input: &[u8; 64], output: &mut [u8; 64]) {
     kernels::bit_transpose_64bytes(input, output);
 }
 
+/// Challenge-independent AB half of the optimized round-1 kernel.
+///
+/// The storage has exactly the same byte length and block layout as either
+/// packed input: every `(x_outer, b_med)` consumes one 64-byte A block and one
+/// 64-byte B block and produces one 64-byte transformed block. Keeping this
+/// in a separate scratch allocation is intentional: round 2 still needs the
+/// original A and B tables after the round-1 transcript challenge is sampled.
+pub struct Round1AbInner {
+    storage: Vec<F128>,
+}
+
+impl Round1AbInner {
+    #[inline]
+    fn as_bytes(&self) -> &[u8] {
+        unsafe {
+            core::slice::from_raw_parts(
+                self.storage.as_ptr() as *const u8,
+                self.storage.len() * core::mem::size_of::<F128>(),
+            )
+        }
+    }
+
+    /// Resident scratch bytes retained until the challenge-weighted finish.
+    pub fn len_bytes(&self) -> usize {
+        self.storage.len() * core::mem::size_of::<F128>()
+    }
+}
+
+impl Drop for Round1AbInner {
+    fn drop(&mut self) {
+        crate::scratch::give_f128(core::mem::take(&mut self.storage));
+    }
+}
+
+/// Precompute the challenge-independent inverse-NTT/product/shift-reduce AB
+/// transform. The result can be produced before the commitment root is
+/// available and consumed later by
+/// [`round1_shift_reduce_extract_c_packed_padded_with_precomputed_ab`].
+pub fn precompute_round1_ab_inner_packed_padded(
+    a_packed: &[u8],
+    b_packed: &[u8],
+    m: usize,
+    k_skip: usize,
+    inv_table: &InvNttTableByteSingleGf8,
+    padding: &PaddingSpec,
+) -> Round1AbInner {
+    use rayon::prelude::*;
+
+    assert_eq!(k_skip, K_SKIP, "optimized variant is k_skip=6 only");
+    assert!(
+        m >= k_skip + N_INNER,
+        "m must be ≥ k_skip + N_INNER ({}) for the shift_reduce optimization",
+        k_skip + N_INNER
+    );
+    let total_bytes = (1usize << m) / 8;
+    assert_eq!(a_packed.len(), total_bytes);
+    assert_eq!(b_packed.len(), total_bytes);
+    assert_eq!(inv_table.k, k_skip);
+    assert_eq!(total_bytes % core::mem::size_of::<F128>(), 0);
+
+    let (within_outer_mask, b_med_counts) = build_b_med_counts(padding);
+    const OUTER_BYTES: usize = (1 << N_MEDIUM) * 64;
+    debug_assert_eq!(OUTER_BYTES, (1 << N_INNER) * N_CHUNKS);
+
+    // Reuse an A-sized resident F128 allocation from the prover scratch pool.
+    // Treating it as bytes is valid because every byte is written below before
+    // the storage is read (including explicit zero writes for padding holes).
+    let mut storage = crate::scratch::take_f128(total_bytes / core::mem::size_of::<F128>());
+    let out_bytes: &mut [u8] =
+        unsafe { core::slice::from_raw_parts_mut(storage.as_mut_ptr() as *mut u8, total_bytes) };
+
+    out_bytes
+        .par_chunks_mut(OUTER_BYTES)
+        .enumerate()
+        .for_each_init(
+            || ([F8::ZERO; ELL], [F8::ZERO; ELL]),
+            |(a_col, b_col), (x_outer, out_outer)| {
+                let within_hash_outer = x_outer & within_outer_mask;
+                let n_b_med = b_med_counts[within_hash_outer] as usize;
+                let chunk_byte_base = x_outer * OUTER_BYTES;
+
+                for b_med in 0..n_b_med {
+                    let dst: &mut [u8; 64] = (&mut out_outer[b_med * 64..(b_med + 1) * 64])
+                        .try_into()
+                        .expect("one transformed b_med block");
+                    shift_reduce_inner_ab(
+                        a_packed,
+                        b_packed,
+                        inv_table,
+                        chunk_byte_base,
+                        b_med,
+                        dst,
+                        a_col,
+                        b_col,
+                    );
+                }
+                out_outer[n_b_med * 64..].fill(0);
+            },
+        );
+
+    Round1AbInner { storage }
+}
+
 // ---------------------------------------------------------------------------
 // Shift_reduce inner kernel (AB only — extract_c handles C separately).
 //
@@ -600,6 +703,69 @@ fn process_one_x_hi_with_s_hat_v(
     }
 }
 
+/// Challenge-weighted half of [`process_one_x_hi_with_s_hat_v`] when the AB
+/// shift-reduce blocks were produced earlier. C remains live and is handled
+/// exactly as in the fused path so wire output and `s_hat_v_c` stay identical.
+#[inline]
+#[allow(clippy::too_many_arguments)]
+fn process_one_x_hi_with_precomputed_ab(
+    x_hi: usize,
+    big_lo_size: usize,
+    n_lo_and_inner: usize,
+    within_outer_mask: usize,
+    b_med_counts: &[u8],
+    ab_inner: &[u8],
+    c_packed: &[u8],
+    eq_lo_scaled: &[F128],
+    eq_hi_val: F128,
+    convert: &[F128],
+    state: &mut WorkerStateWithSHatV,
+) {
+    state.partial_ab.iter_mut().for_each(|p| *p = F128::ZERO);
+    state.partial_c_0.iter_mut().for_each(|p| *p = F128::ZERO);
+    state.partial_c_1.iter_mut().for_each(|p| *p = F128::ZERO);
+
+    let n_lo = n_lo_and_inner - N_INNER;
+
+    for x_outer_lo in 0..big_lo_size {
+        let x_outer = x_outer_lo | (x_hi << n_lo);
+        let within_hash_outer = x_outer & within_outer_mask;
+        let n_b_med = b_med_counts[within_hash_outer] as usize;
+        if n_b_med == 0 {
+            continue;
+        }
+
+        let chunk_byte_base = ((x_outer_lo << N_INNER) | (x_hi << n_lo_and_inner)) * N_CHUNKS;
+        let eq_lo_val = eq_lo_scaled[x_outer_lo];
+
+        for b_med in 0..n_b_med {
+            let byte_base_b = chunk_byte_base + b_med * N_CHUNKS * 8;
+            state.chunk_ab_bytes[b_med].copy_from_slice(&ab_inner[byte_base_b..byte_base_b + 64]);
+            let c_in: &[u8; 64] = (&c_packed[byte_base_b..byte_base_b + 64])
+                .try_into()
+                .expect("64 c-bytes per medium position");
+            bit_transpose_64bytes(c_in, &mut state.chunk_c_bytes[b_med]);
+        }
+
+        kernels::accumulate_convert_with_s_hat_v(
+            &state.chunk_ab_bytes,
+            &state.chunk_c_bytes,
+            n_b_med,
+            convert,
+            eq_lo_val,
+            &mut state.partial_ab,
+            &mut state.partial_c_0,
+            &mut state.partial_c_1,
+        );
+    }
+
+    for lane in 0..ELL {
+        state.local_res_ab[lane] += eq_hi_val * state.partial_ab[lane];
+        state.local_res_c_s_0[lane] += eq_hi_val * state.partial_c_0[lane];
+        state.local_res_c_s_1[lane] += eq_hi_val * state.partial_c_1[lane];
+    }
+}
+
 /// Build the `b_med_counts` table from a [`PaddingSpec`] for use by
 /// [`process_one_x_hi`].
 ///
@@ -847,6 +1013,93 @@ pub fn round1_shift_reduce_extract_c_packed_padded_with_s_hat_v(
     let c_2 = c_2_small_f128();
     let alpha_inv = alpha_inv_f128();
     let c_2_alpha_inv = c_2 * alpha_inv;
+    let mut s_hat_v_c = vec![F128::ZERO; 2 * ELL];
+    for lane in 0..ELL {
+        s_hat_v_c[lane] = c_2 * res_c_s_0[lane];
+        s_hat_v_c[ELL + lane] = c_2_alpha_inv * res_c_s_1[lane];
+    }
+
+    (res_ab.to_vec(), res_c_lifted, s_hat_v_c)
+}
+
+/// Challenge-weighted completion of round 1 using AB blocks returned by
+/// [`precompute_round1_ab_inner_packed_padded`]. This is byte-identical to
+/// [`round1_shift_reduce_extract_c_packed_padded_with_s_hat_v`], while keeping
+/// the original A and B packed buffers available for zerocheck round 2.
+pub fn round1_shift_reduce_extract_c_packed_padded_with_precomputed_ab(
+    ab_inner: &Round1AbInner,
+    c_packed: &[u8],
+    m: usize,
+    k_skip: usize,
+    r: &[F128],
+    inv_table: &InvNttTableByteSingleGf8,
+    padding: &PaddingSpec,
+) -> (Vec<F128>, Vec<F128>, Vec<F128>) {
+    use rayon::prelude::*;
+
+    assert_eq!(k_skip, K_SKIP, "optimized variant is k_skip=6 only");
+    assert!(
+        m >= k_skip + N_INNER,
+        "m must be ≥ k_skip + N_INNER ({}) for the shift_reduce optimization",
+        k_skip + N_INNER
+    );
+    let total_bytes = (1usize << m) / 8;
+    assert_eq!(ab_inner.len_bytes(), total_bytes);
+    assert_eq!(c_packed.len(), total_bytes);
+    assert_eq!(r.len(), m);
+    assert_eq!(inv_table.k, k_skip);
+
+    let eq = SplitEqGhash::new(&r[k_skip + N_INNER..]);
+    let big_lo_size = 1usize << eq.n_lo;
+    let hi_size = 1usize << eq.n_hi;
+    let n_lo_and_inner = eq.n_lo + N_INNER;
+
+    let d_inv_val = d_inv();
+    let eq_lo_scaled: Vec<F128> = eq.lo.iter().map(|v| *v * d_inv_val).collect();
+    let convert = convert_table();
+    let eq_hi = &eq.hi;
+    let (within_outer_mask, b_med_counts) = build_b_med_counts(padding);
+    let ab_inner_bytes = ab_inner.as_bytes();
+
+    let (res_ab, res_c_s_0, res_c_s_1) = (0..hi_size)
+        .into_par_iter()
+        .fold(WorkerStateWithSHatV::new, |mut state, x_hi| {
+            process_one_x_hi_with_precomputed_ab(
+                x_hi,
+                big_lo_size,
+                n_lo_and_inner,
+                within_outer_mask,
+                &b_med_counts,
+                ab_inner_bytes,
+                c_packed,
+                &eq_lo_scaled,
+                eq_hi[x_hi],
+                convert,
+                &mut state,
+            );
+            state
+        })
+        .map(|s| (s.local_res_ab, s.local_res_c_s_0, s.local_res_c_s_1))
+        .reduce(
+            || ([F128::ZERO; ELL], [F128::ZERO; ELL], [F128::ZERO; ELL]),
+            |(mut ab1, mut c0_1, mut c1_1), (ab2, c0_2, c1_2)| {
+                for i in 0..ELL {
+                    ab1[i] += ab2[i];
+                    c0_1[i] += c0_2[i];
+                    c1_1[i] += c1_2[i];
+                }
+                (ab1, c0_1, c1_1)
+            },
+        );
+
+    let mut res_c_s_combined = [F128::ZERO; ELL];
+    for i in 0..ELL {
+        res_c_s_combined[i] = res_c_s_0[i] + res_c_s_1[i];
+    }
+    let res_c_lifted = ntt_extend_f128_vec_ghash(&res_c_s_combined, inv_table);
+
+    let c_2 = c_2_small_f128();
+    let c_2_alpha_inv = c_2 * alpha_inv_f128();
     let mut s_hat_v_c = vec![F128::ZERO; 2 * ELL];
     for lane in 0..ELL {
         s_hat_v_c[lane] = c_2 * res_c_s_0[lane];
@@ -1551,6 +1804,42 @@ mod tests {
                 got_s_hat_v, oracle_s_hat_v,
                 "s_hat_v_c mismatch vs scalar oracle at m={m}"
             );
+        }
+    }
+
+    /// Splitting the challenge-independent AB transform from the later eq
+    /// fold must not change any round-1 wire value or the captured C opening
+    /// helper. Cover the smallest three legal dimensions so both unsplit and
+    /// split eq-table shapes are exercised cheaply.
+    #[test]
+    fn precomputed_ab_matches_fused_at_m13_through_m15() {
+        for &m in &[13usize, 14, 15] {
+            let mut rng = Rng::new(0xAB00_0000_u64.wrapping_add(m as u64));
+            let a = pack_bits(&rng.bits(1 << m));
+            let b = pack_bits(&rng.bits(1 << m));
+            let c = pack_bits(&rng.bits(1 << m));
+            let outer = rng.f128_vec(m - K_SKIP - N_INNER);
+            let r = build_protocol_r(m, &outer);
+            let inv_table = make_inv_table();
+            let padding = PaddingSpec::dense(m);
+
+            let expected = round1_shift_reduce_extract_c_packed_padded_with_s_hat_v(
+                &a, &b, &c, m, K_SKIP, &r, &inv_table, &padding,
+            );
+            let precomputed =
+                precompute_round1_ab_inner_packed_padded(&a, &b, m, K_SKIP, &inv_table, &padding);
+            assert_eq!(precomputed.len_bytes(), a.len());
+            let got = round1_shift_reduce_extract_c_packed_padded_with_precomputed_ab(
+                &precomputed,
+                &c,
+                m,
+                K_SKIP,
+                &r,
+                &inv_table,
+                &padding,
+            );
+
+            assert_eq!(got, expected, "split round-1 mismatch at m={m}");
         }
     }
 }

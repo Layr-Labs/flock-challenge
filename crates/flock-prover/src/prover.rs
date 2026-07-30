@@ -26,7 +26,7 @@
 //! ```
 
 use flock_core::challenger::Challenger;
-use flock_core::field::F128;
+use flock_core::field::{F8, F128};
 use flock_core::lincheck::{self, QuirkyPoint, pack_z_lincheck_from_packed};
 use flock_core::pcs::{self, Commitment, PcsParams};
 use flock_core::proof::{R1csClaim, R1csProofLigerito, ZClaim, bind_statement};
@@ -290,6 +290,48 @@ pub struct ProveCore {
     pub s_hat_v_c: Vec<F128>,
 }
 
+/// Build the witness commitment and the challenge-independent half of
+/// zerocheck round 1 on the same fixed Rayon pool. A/B are only borrowed:
+/// their original packed values remain live for zerocheck round 2.
+fn commit_with_round1_ab_precompute(
+    z_packed: &[F128],
+    a_packed_f128: &[F128],
+    b_packed_f128: &[F128],
+    pcs_params: &PcsParams,
+    padding: &zerocheck::PaddingSpec,
+    prefaulted_codeword: Option<Vec<F128>>,
+) -> (
+    (Commitment, pcs::ProverData),
+    zerocheck::univariate_skip_optimized::Round1AbInner,
+) {
+    let as_bytes = |v: &[F128]| -> &[u8] {
+        unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, std::mem::size_of_val(v)) }
+    };
+    let a_packed = as_bytes(a_packed_f128);
+    let b_packed = as_bytes(b_packed_f128);
+    let k_skip = zerocheck::K_SKIP;
+    let ntt_s = flock_core::ntt::AdditiveNttGf8::new(k_skip, F8::ZERO);
+    let ntt_l = flock_core::ntt::AdditiveNttGf8::new(k_skip, F8(1u8 << k_skip));
+    let inv_table = flock_core::ntt::InvNttTableByteSingleGf8::new(&ntt_s, &ntt_l);
+
+    rayon::join(
+        || match prefaulted_codeword {
+            Some(buf) => pcs::commit_into(z_packed, pcs_params, buf),
+            None => pcs::commit(z_packed, pcs_params),
+        },
+        || {
+            zerocheck::univariate_skip_optimized::precompute_round1_ab_inner_packed_padded(
+                a_packed,
+                b_packed,
+                pcs_params.m,
+                k_skip,
+                &inv_table,
+                padding,
+            )
+        },
+    )
+}
+
 /// Run commit → bind → zerocheck → lincheck and build the base claims, stopping
 /// just before the PCS open. See [`ProveCore`].
 pub fn prove_fast_core<Ch: Challenger>(
@@ -332,13 +374,17 @@ pub fn prove_fast_core_with_codeword<Ch: Challenger>(
     prefaulted_codeword: Option<Vec<F128>>,
     challenger: &mut Ch,
 ) -> ProveCore {
-    let (commitment, prover_data) = match prefaulted_codeword {
-        Some(buf) => pcs::commit_into(&z_packed, pcs_params, buf),
-        None => pcs::commit(&z_packed, pcs_params),
-    };
+    let padding = r1cs.padding_spec();
+    let ((commitment, prover_data), ab_inner) = commit_with_round1_ab_precompute(
+        &z_packed,
+        &a_packed_f128,
+        &b_packed_f128,
+        pcs_params,
+        &padding,
+        prefaulted_codeword,
+    );
     bind_statement(challenger, r1cs, &commitment);
 
-    let padding = r1cs.padding_spec();
     let (zc_proof, zc_claim, s_hat_v_c) = {
         // Zero-cost &[u8] views of the F128 buffers; c aliases z (C = I).
         let a_packed: &[u8] = unsafe {
@@ -359,8 +405,8 @@ pub fn prove_fast_core_with_codeword<Ch: Challenger>(
                 z_packed.len() * core::mem::size_of::<F128>(),
             )
         };
-        zerocheck::prove_packed_padded_capture_s_hat_v_c(
-            a_packed, b_packed, c_packed, r1cs.m, &padding, challenger,
+        zerocheck::prove_packed_padded_capture_s_hat_v_c_with_precomputed_ab(
+            a_packed, b_packed, c_packed, r1cs.m, &padding, ab_inner, challenger,
         )
     };
     // Nothing downstream reads a/b (zerocheck consumed them in rounds 1–2);
@@ -462,16 +508,20 @@ pub fn prove_fast_ligerito_timed<Ch: Challenger>(
         .ligerito_prover_config()
         .expect("Ligerito default config; bump m for tiny instances");
 
-    // --- PCS commit ---
+    let padding = r1cs.padding_spec();
+
+    // --- PCS commit + challenge-independent zerocheck AB preprocessing ---
     let t0 = Instant::now();
-    let (commitment, prover_data) = match prefaulted_codeword {
-        Some(buf) => pcs::commit_into(&z_packed, pcs_params, buf),
-        None => pcs::commit(&z_packed, pcs_params),
-    };
+    let ((commitment, prover_data), ab_inner) = commit_with_round1_ab_precompute(
+        &z_packed,
+        &a_packed_f128,
+        &b_packed_f128,
+        pcs_params,
+        &padding,
+        prefaulted_codeword,
+    );
     t.commit_s = t0.elapsed().as_secs_f64();
     bind_statement(challenger, r1cs, &commitment);
-
-    let padding = r1cs.padding_spec();
 
     // --- zerocheck ---
     let t0 = Instant::now();
@@ -494,8 +544,8 @@ pub fn prove_fast_ligerito_timed<Ch: Challenger>(
                 z_packed.len() * core::mem::size_of::<F128>(),
             )
         };
-        zerocheck::prove_packed_padded_capture_s_hat_v_c(
-            a_packed, b_packed, c_packed, r1cs.m, &padding, challenger,
+        zerocheck::prove_packed_padded_capture_s_hat_v_c_with_precomputed_ab(
+            a_packed, b_packed, c_packed, r1cs.m, &padding, ab_inner, challenger,
         )
     };
     t.zerocheck_s = t0.elapsed().as_secs_f64();
