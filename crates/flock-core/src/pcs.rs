@@ -314,10 +314,56 @@ fn compute_combined_basis_and_target<Ch: Challenger>(
         let b = rs_deferred[0].0.len(); // eq_lo.len(); shared across claims (same split)
         debug_assert!(b >= 2 && b.is_multiple_of(2));
         debug_assert!(rs_deferred.iter().all(|d| d.0.len() == b));
+        // NT gate: b_combined is written once here and next read only inside
+        // the Ligerito round loop, after the round-0 prime is absorbed and the
+        // first fold challenge sampled (a Fiat–Shamir barrier). At ≥64 MB the
+        // slot-major variant below accumulates every claim and the round-0
+        // prime from register copies, so the stores can bypass the cache and
+        // skip their read-for-ownership traffic.
+        #[cfg(target_arch = "aarch64")]
+        let nt_stores = l >= crate::field::f128_slice::NT_STORE_MIN_F128
+            && rs_deferred.len() <= 8
+            && std::env::var_os("FLOCK_NO_NT_BC").is_none();
         b_combined
             .par_chunks_mut(b)
             .enumerate()
             .map(|(hi, out_block)| {
+                #[cfg(target_arch = "aarch64")]
+                if nt_stores {
+                    // Slot-pair-major: sum all claims' contributions for one
+                    // output pair in registers, stream the pair out with a
+                    // 32 B stnp, and fold the pair straight into the round-0
+                    // prime — nothing reloads the written lines. Value-equal
+                    // to the claim-major write/add loops below (the per-slot
+                    // claim sum and the prime accumulate in the same order).
+                    let mut e_his = [F128::ZERO; 8];
+                    for (ci, (_, eq_hi, _, _)) in rs_deferred.iter().enumerate() {
+                        e_his[ci] = eq_hi[hi];
+                    }
+                    let base = hi * b;
+                    let out_ptr = out_block.as_mut_ptr();
+                    let mut u0 = F128::ZERO;
+                    let mut u2 = F128::ZERO;
+                    for t in 0..(b / 2) {
+                        let mut s0 = F128::ZERO;
+                        let mut s1 = F128::ZERO;
+                        for (ci, (eq_lo, _, table, _)) in rs_deferred.iter().enumerate() {
+                            let e_hi = e_his[ci];
+                            s0 += ring_switch::fold_one_slot(eq_lo[2 * t] * e_hi, table);
+                            s1 += ring_switch::fold_one_slot(eq_lo[2 * t + 1] * e_hi, table);
+                        }
+                        // SAFETY: 2t + 1 < b = out_block.len(), so the pair
+                        // is in range; blocks start at even element offsets.
+                        unsafe {
+                            crate::field::f128_slice::nt_store_pair(out_ptr.add(2 * t), s0, s1);
+                        }
+                        let a0 = packed_witness[base + 2 * t];
+                        let a1 = packed_witness[base + 2 * t + 1];
+                        u0 += a0 * s0;
+                        u2 += (a0 + a1) * (s0 + s1);
+                    }
+                    return (u0, u2);
+                }
                 // Accumulate each claim's block: first claim writes, rest add.
                 // `e_hi` is read once per claim per block, then swept over eq_lo.
                 for (ci, (eq_lo, eq_hi, table, _)) in rs_deferred.iter().enumerate() {

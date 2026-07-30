@@ -47,6 +47,8 @@ mod kernels;
 
 #[cfg(target_arch = "aarch64")]
 use kernels::aarch64::fold_one_row_neon_unchecked_8;
+#[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+use kernels::aarch64::fold_and_message_neon_nt;
 #[cfg(all(
     target_arch = "x86_64",
     target_feature = "avx512f",
@@ -484,6 +486,15 @@ pub fn uni_skip_fold_and_round_pair_optimized_packed_padded(
     let eq_lo = &eq.lo;
     let (pair_in_block_mask, useful_pairs_inclusive) = round2_pair_skip(padding, k_skip);
 
+    // NT gate: the two fold outputs are written once here and next read only
+    // after the round-2 message is absorbed and ρ_1 sampled — a Fiat–Shamir
+    // barrier — so at ≥64 MB per buffer the stores can bypass the cache and
+    // skip their read-for-ownership traffic (2·n_out·16 B saved DRAM reads).
+    // The message needs no readback: it is computed from the register copies.
+    #[cfg(target_arch = "aarch64")]
+    let nt_stores = n_out >= crate::field::f128_slice::NT_STORE_MIN_F128
+        && std::env::var_os("FLOCK_NO_NT_R2").is_none();
+
     // Parallel: each worker writes one disjoint chunk of a_folded/b_folded
     // and returns its (sum1, sum_inf) contribution. Reduce by F128 XOR.
     let (sum1, sum_inf) = a_folded
@@ -497,9 +508,12 @@ pub fn uni_skip_fold_and_round_pair_optimized_packed_padded(
 
             #[cfg(target_arch = "aarch64")]
             unsafe {
+                use crate::field::f128_slice::nt_store_pair;
                 let table_ptr = table.data.as_ptr() as *const u8;
                 let a_pkt_ptr = a_packed.as_ptr();
                 let b_pkt_ptr = b_packed.as_ptr();
+                let a_out_ptr = a_chunk.as_mut_ptr();
+                let b_out_ptr = b_chunk.as_mut_ptr();
                 let base = x_hi * chunk_size;
 
                 for x_lo in 0..lo_size {
@@ -508,10 +522,15 @@ pub fn uni_skip_fold_and_round_pair_optimized_packed_padded(
                     if ((pair_idx_base + x_lo) & pair_in_block_mask) >= useful_pairs_inclusive {
                         // Padding hole: write zero (a_folded/b_folded were alloc'd
                         // uninit, so we have to write every slot we don't fold into).
-                        a_chunk[x0l] = F128::ZERO;
-                        a_chunk[x1l] = F128::ZERO;
-                        b_chunk[x0l] = F128::ZERO;
-                        b_chunk[x1l] = F128::ZERO;
+                        if nt_stores {
+                            nt_store_pair(a_out_ptr.add(x0l), F128::ZERO, F128::ZERO);
+                            nt_store_pair(b_out_ptr.add(x0l), F128::ZERO, F128::ZERO);
+                        } else {
+                            a_chunk[x0l] = F128::ZERO;
+                            a_chunk[x1l] = F128::ZERO;
+                            b_chunk[x0l] = F128::ZERO;
+                            b_chunk[x1l] = F128::ZERO;
+                        }
                         continue;
                     }
                     let x0g = base + 2 * x_lo;
@@ -522,10 +541,17 @@ pub fn uni_skip_fold_and_round_pair_optimized_packed_padded(
                     let a1 = fold_one_row_neon_unchecked_8(table_ptr, a_pkt_ptr.add(x1g * 8));
                     let b1 = fold_one_row_neon_unchecked_8(table_ptr, b_pkt_ptr.add(x1g * 8));
 
-                    a_chunk[x0l] = a0;
-                    a_chunk[x1l] = a1;
-                    b_chunk[x0l] = b0;
-                    b_chunk[x1l] = b1;
+                    if nt_stores {
+                        // 32 B stnp per buffer; the message below uses the
+                        // register copies, so nothing reloads these lines.
+                        nt_store_pair(a_out_ptr.add(x0l), a0, a1);
+                        nt_store_pair(b_out_ptr.add(x0l), b0, b1);
+                    } else {
+                        a_chunk[x0l] = a0;
+                        a_chunk[x1l] = a1;
+                        b_chunk[x0l] = b0;
+                        b_chunk[x1l] = b1;
+                    }
 
                     let eq_l = eq_lo[x_lo];
                     let g1 = a1 * b1;
@@ -815,6 +841,15 @@ pub fn fold_and_compute_round_pair_into(
     let eq_lo = &eq.lo;
     let eq_hi = &eq.hi;
 
+    // NT gate: the folded output is next read only after this round's message
+    // is absorbed and the next ρ sampled (a Fiat–Shamir barrier), so at
+    // ≥64 MB per buffer the fused kernel can stream its stores past the cache
+    // and skip their read-for-ownership traffic. The message is computed from
+    // register copies inside the fused kernel, so nothing reloads the output.
+    #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+    let nt_stores = half >= crate::field::f128_slice::NT_STORE_MIN_F128
+        && std::env::var_os("FLOCK_NO_NT_TAIL").is_none();
+
     let (sum1, sum_inf) = a_out
         .par_chunks_mut(chunk_out)
         .zip(b_out.par_chunks_mut(chunk_out))
@@ -833,12 +868,62 @@ pub fn fold_and_compute_round_pair_into(
             let (p1, pinf) =
                 unsafe { fold_and_message_x86_avx512(a_in, b_in, a_out, b_out, r_fold, eq_lo) };
 
-            #[cfg(not(all(
-                target_arch = "x86_64",
-                target_feature = "avx512f",
-                target_feature = "vpclmulqdq"
+            #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+            let (p1, pinf) = if nt_stores {
+                // SAFETY: chunk geometry supplies two inputs per output and
+                // two outputs per eq_lo value; aes per the cfg gate.
+                let (p1_acc, pinf_acc) = unsafe {
+                    fold_and_message_neon_nt(a_in, b_in, a_out, b_out, r_fold, eq_lo)
+                };
+                (p1_acc.reduce(), pinf_acc.reduce())
+            } else {
+                fold_and_message_readback(a_in, b_in, a_out, b_out, r_fold, eq_lo)
+            };
+
+            #[cfg(not(any(
+                all(
+                    target_arch = "x86_64",
+                    target_feature = "avx512f",
+                    target_feature = "vpclmulqdq"
+                ),
+                all(target_arch = "aarch64", target_feature = "aes")
             )))]
-            let (p1, pinf) = {
+            let (p1, pinf) =
+                fold_and_message_readback(a_in, b_in, a_out, b_out, r_fold, eq_lo);
+
+            let eq_h = eq_hi[x_hi];
+            (eq_h * p1, eq_h * pinf)
+        })
+        .reduce(
+            || (F128::ZERO, F128::ZERO),
+            |(s1, sinf), (c1, cinf)| (s1 + c1, sinf + cinf),
+        );
+
+    (r_next[0] * sum1, sum_inf)
+}
+
+/// Portable per-worker tail-round body: fold both buffers via
+/// [`crate::field::f128_slice::fold_pairs`], then build the message terms by
+/// reading back the just-folded (cache-hot) output. Extracted from
+/// [`fold_and_compute_round_pair_into`] so the aarch64 NT path can fall back
+/// to it below the size gate; behavior is byte-identical to the original
+/// inline block.
+#[cfg(not(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "vpclmulqdq"
+)))]
+fn fold_and_message_readback(
+    a_in: &[F128],
+    b_in: &[F128],
+    a_out: &mut [F128],
+    b_out: &mut [F128],
+    r_fold: F128,
+    eq_lo: &[F128],
+) -> (F128, F128) {
+    let lo_size = eq_lo.len();
+    {
+        let (p1, pinf) = {
                 // Fold a_in→a_out and b_in→b_out at r_fold. The field layer
                 // selects the architecture kernel; this loop only consumes
                 // the resulting values to build the message.
@@ -982,15 +1067,8 @@ pub fn fold_and_compute_round_pair_into(
                 let pinf = pinf_acc.reduce();
                 (p1, pinf)
             };
-            let eq_h = eq_hi[x_hi];
-            (eq_h * p1, eq_h * pinf)
-        })
-        .reduce(
-            || (F128::ZERO, F128::ZERO),
-            |(s1, sinf), (c1, cinf)| (s1 + c1, sinf + cinf),
-        );
-
-    (r_next[0] * sum1, sum_inf)
+        (p1, pinf)
+    }
 }
 
 /// Serial reference — identical I/O contract to

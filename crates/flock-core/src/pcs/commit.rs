@@ -241,14 +241,43 @@ pub(crate) fn replicate_message_fill(codeword: &mut [F128], msg: &[F128]) {
     let msg_len = msg.len();
     debug_assert!(codeword.len().is_multiple_of(msg_len));
     const COPY_CHUNK: usize = 1 << 16;
+    // NT gate: at ≥64 MB the buffer dwarfs the LLC, so by the time the NTT's
+    // first layer reads any given line the copy has long evicted it — the
+    // stores can stream past the cache and skip ~codeword-size RFO reads.
+    // (Only the copy's cache-sized tail loses residency; a rounding error at
+    // this size.) FLOCK_NO_NT_FILL disables for A/B runs.
+    #[cfg(target_arch = "aarch64")]
+    let nt = codeword.len() >= crate::field::f128_slice::NT_STORE_MIN_F128
+        && std::env::var_os("FLOCK_NO_NT_FILL").is_none();
     if msg_len >= COPY_CHUNK {
-        // Both are powers of two, so chunks never straddle a replica boundary.
+        // Both are powers of two, so chunks never straddle a replica boundary
+        // (and every chunk is exactly COPY_CHUNK, an even count).
         codeword
             .par_chunks_mut(COPY_CHUNK)
             .enumerate()
             .for_each(|(i, dst)| {
                 let src_off = (i * COPY_CHUNK) % msg_len;
-                dst.copy_from_slice(&msg[src_off..src_off + dst.len()]);
+                let src = &msg[src_off..src_off + dst.len()];
+                #[cfg(target_arch = "aarch64")]
+                if nt {
+                    // SAFETY: dst.len() == src.len() is even; k+1 stays in
+                    // bounds; chunks start 32-byte-aligned (COPY_CHUNK even,
+                    // pool buffers page-aligned).
+                    unsafe {
+                        let d = dst.as_mut_ptr();
+                        let mut k = 0;
+                        while k + 2 <= dst.len() {
+                            crate::field::f128_slice::nt_store_pair(
+                                d.add(k),
+                                *src.get_unchecked(k),
+                                *src.get_unchecked(k + 1),
+                            );
+                            k += 2;
+                        }
+                    }
+                    return;
+                }
+                dst.copy_from_slice(src);
             });
     } else {
         for rep in codeword.chunks_mut(msg_len) {
