@@ -1196,7 +1196,7 @@ pub fn generate_witness_with_ab_packed_and_lincheck(
     // every block. (The chain forbids padding, so this only affects the
     // standalone batch setup.)
     let padding: ([u32; 8], [u32; 16]) = ([0u32; 8], [0u32; 16]);
-    super::common::drive_witness_packed_and_lincheck(
+    super::common::drive_witness_packed_and_lincheck::<true, _, _>(
         compressions,
         Some(&padding),
         n_blocks_log,

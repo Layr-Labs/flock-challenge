@@ -373,16 +373,29 @@ pub fn prove_fast_core_with_codeword<Ch: Challenger>(
 
     // Capture lincheck's pre-sumcheck z_vec so the PCS open can derive the
     // AB-claim's `s_hat_v` from it (skips fold_1b_rows for AB).
-    let (lc_proof, lc_claim, z_vec_pre) = lincheck::prove_padded_capture_z_vec(
-        &z_packed_lincheck,
-        r1cs.m,
-        r1cs.k_log,
-        r1cs.k_skip,
-        r1cs.useful_bits,
-        lincheck_circuit,
-        &x_ab,
-        challenger,
-    );
+    let (lc_proof, lc_claim, z_vec_pre) = if z_packed_lincheck.is_empty() {
+        lincheck::prove_padded_capture_z_vec_from_row_major(
+            &z_packed,
+            r1cs.m,
+            r1cs.k_log,
+            r1cs.k_skip,
+            r1cs.useful_bits,
+            lincheck_circuit,
+            &x_ab,
+            challenger,
+        )
+    } else {
+        lincheck::prove_padded_capture_z_vec(
+            &z_packed_lincheck,
+            r1cs.m,
+            r1cs.k_log,
+            r1cs.k_skip,
+            r1cs.useful_bits,
+            lincheck_circuit,
+            &x_ab,
+            challenger,
+        )
+    };
     // The lincheck stripe copy of z is dead from here on; free it before the
     // PCS open (2^(m-3) bytes — 64 MB at m = 29).
     drop(z_packed_lincheck);

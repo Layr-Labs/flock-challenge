@@ -652,7 +652,7 @@ pub fn generate_witness_with_ab_packed_and_lincheck(
     // (The chain forbids padding — `prove_chain` asserts no padding — so this is
     // a no-op there and only affects the standalone batch setup.)
     let padding: State = [false; STATE_BITS];
-    super::common::drive_witness_packed_and_lincheck(
+    super::common::drive_witness_packed_and_lincheck::<true, _, _>(
         initial_states,
         Some(&padding),
         n_keccaks_log,

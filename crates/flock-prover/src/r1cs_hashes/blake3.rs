@@ -1242,12 +1242,24 @@ pub fn generate_witness_with_ab_packed_and_lincheck(
     Vec<flock_core::field::F128>,
     Vec<u8>,
 ) {
+    generate_witness_with_ab_packed_maybe_lincheck::<true>(blocks, n_blocks_log)
+}
+
+fn generate_witness_with_ab_packed_maybe_lincheck<const BUILD_LINCHECK: bool>(
+    blocks: &[Compression],
+    n_blocks_log: usize,
+) -> (
+    Vec<flock_core::field::F128>,
+    Vec<flock_core::field::F128>,
+    Vec<flock_core::field::F128>,
+    Vec<u8>,
+) {
     // Constant-wire pin (docs/const-wire-pin.md): fill padding blocks with a
     // valid compression (of the all-zero input) so the constant cell is 1 in
     // every block. (The chain forbids padding, so this only affects the
     // standalone batch setup.)
     let padding: Compression = ([0u32; 8], [0u32; 16], 0u64, 0u32, 0u32);
-    super::common::drive_witness_packed_and_lincheck(
+    super::common::drive_witness_packed_and_lincheck::<BUILD_LINCHECK, _, _>(
         blocks,
         Some(&padding),
         n_blocks_log,
@@ -1404,7 +1416,15 @@ impl Blake3Setup {
         assert_eq!(blocks.len(), self.n_blocks);
         let (codeword, (z_packed, a_packed_f128, b_packed_f128, z_packed_lincheck)) =
             flock_core::pcs::prefault_codeword_during(&self.pcs_params, || {
-                self.generate_witness_ab(blocks)
+                match self.r1cs.layout {
+                    flock_core::r1cs::WitnessLayout::RowMajor => {
+                        generate_witness_with_ab_packed_maybe_lincheck::<false>(
+                            blocks,
+                            self.n_blocks_log(),
+                        )
+                    }
+                    flock_core::r1cs::WitnessLayout::BatchMajor => self.generate_witness_ab(blocks),
+                }
             });
         let lc_circuit = self.r1cs.csc_lincheck_circuit();
         crate::prover::prove_fast_ligerito_from_witness(

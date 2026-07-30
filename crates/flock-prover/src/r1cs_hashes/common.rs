@@ -209,7 +209,7 @@ pub(crate) fn build_block_r1cs_with_matrices(
 ///   that pin a constant wire need this so the constant column is all-ones
 ///   across *every* batched instance (see `docs/const-wire-pin.md`); for keccak
 ///   the padding input is the all-zero state, whose witness is `keccak_f(0)`.
-pub(crate) fn drive_witness_packed_and_lincheck<S: Sync, F>(
+pub(crate) fn drive_witness_packed_and_lincheck<const BUILD_LINCHECK: bool, S: Sync, F>(
     initial_states: &[S],
     padding: Option<&S>,
     n_blocks_log: usize,
@@ -245,18 +245,22 @@ where
     let mut z = flock_core::scratch::take_f128(total_f128);
     let mut a = flock_core::scratch::take_f128(total_f128);
     let mut b = flock_core::scratch::take_f128(total_f128);
-    let mut z_lincheck = vec![0u8; (n_total / 8) * k];
+    let mut z_lincheck = if BUILD_LINCHECK {
+        vec![0u8; (n_total / 8) * k]
+    } else {
+        Vec::new()
+    };
+    let lincheck_ptr = z_lincheck.as_mut_ptr() as usize;
 
     z.par_chunks_mut(8 * f128_per_block)
         .zip(a.par_chunks_mut(8 * f128_per_block))
         .zip(b.par_chunks_mut(8 * f128_per_block))
-        .zip(z_lincheck.par_chunks_mut(k))
         .enumerate()
-        .for_each(|(g, (((z_grp, a_grp), b_grp), stripe))| {
+        .for_each(|(g, ((z_grp, a_grp), b_grp))| {
             // Zero this group's z/a/b up front (parallel memset — the buffers
             // were uninit-allocated). The per-block builder ORs 1-bits into
             // pre-zeroed words; any slot left unbuilt (no padding block) stays
-            // zero, which the lincheck transpose below reads correctly.
+            // zero.
             // SAFETY: F128 is `Copy` (no Drop) and the all-zero bit pattern is
             // the valid `F128::ZERO`, so a byte memset is a correct init.
             unsafe {
@@ -302,22 +306,29 @@ where
                 per_block(init, z_u64, a_u64, b_u64);
             }
 
-            // Bit-transpose 8 z chunks into the lincheck stripe.
-            let z_u64_all: &[u64] = unsafe {
-                std::slice::from_raw_parts(z_grp.as_ptr() as *const u64, z_grp.len() * 2)
-            };
-            for i in 0..u64_per_block {
-                let lanes: [u64; 8] = [
-                    z_u64_all[0 * u64_per_block + i],
-                    z_u64_all[u64_per_block + i],
-                    z_u64_all[2 * u64_per_block + i],
-                    z_u64_all[3 * u64_per_block + i],
-                    z_u64_all[4 * u64_per_block + i],
-                    z_u64_all[5 * u64_per_block + i],
-                    z_u64_all[6 * u64_per_block + i],
-                    z_u64_all[7 * u64_per_block + i],
-                ];
-                transpose_8_u64s_to_64_bytes(&lanes, &mut stripe[i * 64..i * 64 + 64]);
+            if BUILD_LINCHECK {
+                // SAFETY: group `g` owns the disjoint k-byte stripe at this
+                // address, and BUILD_LINCHECK allocated all n_total/8 stripes.
+                let stripe = unsafe {
+                    std::slice::from_raw_parts_mut((lincheck_ptr as *mut u8).add(g * k), k)
+                };
+                // Bit-transpose 8 z chunks into the lincheck stripe.
+                let z_u64_all: &[u64] = unsafe {
+                    std::slice::from_raw_parts(z_grp.as_ptr() as *const u64, z_grp.len() * 2)
+                };
+                for i in 0..u64_per_block {
+                    let lanes: [u64; 8] = [
+                        z_u64_all[i],
+                        z_u64_all[u64_per_block + i],
+                        z_u64_all[2 * u64_per_block + i],
+                        z_u64_all[3 * u64_per_block + i],
+                        z_u64_all[4 * u64_per_block + i],
+                        z_u64_all[5 * u64_per_block + i],
+                        z_u64_all[6 * u64_per_block + i],
+                        z_u64_all[7 * u64_per_block + i],
+                    ];
+                    transpose_8_u64s_to_64_bytes(&lanes, &mut stripe[i * 64..i * 64 + 64]);
+                }
             }
         });
 

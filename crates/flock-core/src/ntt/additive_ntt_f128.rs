@@ -428,23 +428,20 @@ impl AdditiveNttF128 {
                 // Fuse three layers (layer..layer+3): one read+write per block
                 // instead of three. Each block contributes an 8-point butterfly.
                 let eighth = block_size >> 3;
-                for block in 0..num_blocks {
-                    let mut tw = [F128 { lo: 0, hi: 0 }; 7];
-                    tw[0] = self.twiddle(layer, block);
-                    for s in 0..2 {
-                        tw[1 + s] = self.twiddle(layer + 1, 2 * block + s);
-                    }
-                    for s in 0..4 {
-                        tw[3 + s] = self.twiddle(layer + 2, 4 * block + s);
-                    }
-                    let start = block * block_bytes;
-                    butterfly_interleaved_fused_3layer_par_rows(
-                        &mut data[start..start + block_bytes],
-                        &tw,
-                        eighth,
-                        num_ntts,
-                    );
-                }
+                let twiddles: Vec<[F128; 7]> = (0..num_blocks)
+                    .map(|block| {
+                        let mut tw = [F128 { lo: 0, hi: 0 }; 7];
+                        tw[0] = self.twiddle(layer, block);
+                        for s in 0..2 {
+                            tw[1 + s] = self.twiddle(layer + 1, 2 * block + s);
+                        }
+                        for s in 0..4 {
+                            tw[3 + s] = self.twiddle(layer + 2, 4 * block + s);
+                        }
+                        tw
+                    })
+                    .collect();
+                butterfly_interleaved_fused_3layer_all_blocks(data, &twiddles, eighth, num_ntts);
                 layer += 3;
             } else if fused4_ok && layer + 3 < n_top && block_size >= 16 {
                 // Fuse four layers (layer..layer+4): one read+write per block
@@ -474,20 +471,16 @@ impl AdditiveNttF128 {
             } else if layer + 1 < n_top && block_size >= 4 {
                 // Fuse layers (layer, layer+1).
                 let quarter = block_size >> 2;
-                for block in 0..num_blocks {
-                    let t_outer = self.twiddle(layer, block);
-                    let t_inner_a = self.twiddle(layer + 1, 2 * block);
-                    let t_inner_b = self.twiddle(layer + 1, 2 * block + 1);
-                    let start = block * block_bytes;
-                    butterfly_interleaved_fused_2layer_par_rows(
-                        &mut data[start..start + block_bytes],
-                        t_outer,
-                        t_inner_a,
-                        t_inner_b,
-                        quarter,
-                        num_ntts,
-                    );
-                }
+                let twiddles: Vec<[F128; 3]> = (0..num_blocks)
+                    .map(|block| {
+                        [
+                            self.twiddle(layer, block),
+                            self.twiddle(layer + 1, 2 * block),
+                            self.twiddle(layer + 1, 2 * block + 1),
+                        ]
+                    })
+                    .collect();
+                butterfly_interleaved_fused_2layer_all_blocks(data, &twiddles, quarter, num_ntts);
                 layer += 2;
             } else {
                 let block_size_half = block_size >> 1;
@@ -823,62 +816,56 @@ fn butterfly_interleaved_block_par_rows(
         });
 }
 
-/// Fused 2-layer butterfly: combines layer L (twiddle `t_outer`, shared by
-/// the whole outer block) with layer L+1 (twiddles `t_inner_a` for the top
-/// half, `t_inner_b` for the bottom half). Reads each row of the outer
-/// block once and writes once — halving memory traffic vs running the two
-/// layers as separate sweeps.
-///
-/// `block` has length `4 * quarter * num_ntts` (= one layer-L block of
-/// `4*quarter` rows). For each `r ∈ 0..quarter`, four rows participate:
-/// `a=r`, `b=r+quarter`, `c=r+2*quarter`, `d=r+3*quarter`. Layer L
-/// butterflies `(a,c)` and `(b,d)`; layer L+1 then butterflies `(a,b)` (in
-/// the new top sub-block) and `(c,d)` (in the new bottom sub-block).
+/// Fused 2-layer butterfly over every block in one Rayon region. Flattening
+/// `(block, quarter-row)` avoids one blocking dispatch per block at the deep
+/// end of the top phase while preserving the barrier after the fused pass.
 #[inline]
-fn butterfly_interleaved_fused_2layer_par_rows(
-    block: &mut [F128],
-    t_outer: F128,
-    t_inner_a: F128,
-    t_inner_b: F128,
+fn butterfly_interleaved_fused_2layer_all_blocks(
+    data: &mut [F128],
+    twiddles: &[[F128; 3]],
     quarter: usize,
     num_ntts: usize,
 ) {
     use rayon::prelude::*;
     const PARALLEL_ROW_THRESHOLD: usize = 256;
-    let stride = quarter * num_ntts;
-    debug_assert_eq!(block.len(), 4 * stride);
+    let num_blocks = twiddles.len();
+    let block_len = 4 * quarter * num_ntts;
+    debug_assert_eq!(data.len(), num_blocks * block_len);
+    let base = data.as_mut_ptr() as usize;
 
-    let do_one = |row_a: &mut [F128],
-                  row_b: &mut [F128],
-                  row_c: &mut [F128],
-                  row_d: &mut [F128]| {
-        kernels::butterfly_fused_2layer(row_a, row_b, row_c, row_d, t_outer, t_inner_a, t_inner_b);
+    let do_one = |block: usize, r: usize| {
+        let [t_outer, t_inner_a, t_inner_b] = twiddles[block];
+        let block_base = block * block_len;
+        // SAFETY: each `(block, r)` owns four distinct rows, and unique
+        // flattened indices never overlap.
+        unsafe {
+            let row = |q: usize| {
+                std::slice::from_raw_parts_mut(
+                    (base as *mut F128).add(block_base + (q * quarter + r) * num_ntts),
+                    num_ntts,
+                )
+            };
+            kernels::butterfly_fused_2layer(
+                row(0),
+                row(1),
+                row(2),
+                row(3),
+                t_outer,
+                t_inner_a,
+                t_inner_b,
+            );
+        }
     };
 
-    // Split the block into four quarters, then zip row-wise. Each rayon task
-    // processes one quarter-row index = 4 logical rows of work.
-    let (top_half, bot_half) = block.split_at_mut(2 * stride);
-    let (q1, q2) = top_half.split_at_mut(stride);
-    let (q3, q4) = bot_half.split_at_mut(stride);
-
-    if quarter < PARALLEL_ROW_THRESHOLD {
-        for r in 0..quarter {
-            let off = r * num_ntts;
-            let (q1r, q1_rest) = q1[off..].split_at_mut(num_ntts);
-            let _ = q1_rest;
-            let (q2r, _) = q2[off..].split_at_mut(num_ntts);
-            let (q3r, _) = q3[off..].split_at_mut(num_ntts);
-            let (q4r, _) = q4[off..].split_at_mut(num_ntts);
-            do_one(q1r, q2r, q3r, q4r);
+    let total_groups = num_blocks * quarter;
+    if total_groups < PARALLEL_ROW_THRESHOLD {
+        for group in 0..total_groups {
+            do_one(group / quarter, group % quarter);
         }
     } else {
-        q1.par_chunks_mut(num_ntts)
-            .zip(q2.par_chunks_mut(num_ntts))
-            .zip(q3.par_chunks_mut(num_ntts))
-            .zip(q4.par_chunks_mut(num_ntts))
-            .for_each(|(((row_a, row_b), row_c), row_d)| {
-                do_one(row_a, row_b, row_c, row_d);
-            });
+        (0..total_groups).into_par_iter().for_each(|group| {
+            do_one(group / quarter, group % quarter);
+        });
     }
 }
 
@@ -913,42 +900,47 @@ fn butterfly_interleaved_block(
     }
 }
 
-/// Butterfly one top-layer block, fusing three layers `(L..L+3)`. `block`
-/// holds `8 * eighth` rows of `num_ntts` lanes; `t` carries the 7 twiddles for
-/// the sub-butterflies. Parallel over row groups.
-///
-/// Sits between the fused-2 and fused-4 variants for a cache reason rather
-/// than an arithmetic one: the row-group stride is a multiple of the L1
-/// set-repeat period at these shapes, so the N concurrently-live row streams
-/// all land in one set and demand N ways. Radix-8 is the widest fusion an
-/// 8-way L1D admits.
+/// Butterfly all top-layer blocks for a fused three-layer pass in one Rayon
+/// region. Radix-8 remains the widest fusion suitable for an 8-way L1D; only
+/// the dispatch geometry changes.
 #[inline]
-fn butterfly_interleaved_fused_3layer_par_rows(
-    block: &mut [F128],
-    t: &[F128; 7],
+fn butterfly_interleaved_fused_3layer_all_blocks(
+    data: &mut [F128],
+    twiddles: &[[F128; 7]],
     eighth: usize,
     num_ntts: usize,
 ) {
     use rayon::prelude::*;
     const PARALLEL_ROW_THRESHOLD: usize = 256;
-    debug_assert_eq!(block.len(), 8 * eighth * num_ntts);
-    // Carry the base as `usize` (Send+Sync) so rayon's per-`r` closure can hold
-    // it without a raw-pointer `Sync` shim. Each `r` writes the disjoint rows
-    // `{i*eighth + r : i ∈ 0..8}`, so concurrent writes never alias.
-    let base = block.as_mut_ptr() as usize;
-    if eighth < PARALLEL_ROW_THRESHOLD {
-        for r in 0..eighth {
-            // SAFETY: row group r writes disjoint rows of this block.
-            unsafe {
-                kernels::butterfly_fused_3layer_row(base as *mut F128, eighth, num_ntts, r, t)
-            };
+    let num_blocks = twiddles.len();
+    let block_len = 8 * eighth * num_ntts;
+    debug_assert_eq!(data.len(), num_blocks * block_len);
+    let base = data.as_mut_ptr() as usize;
+    let total_groups = num_blocks * eighth;
+
+    let do_one = |group: usize| {
+        let block = group / eighth;
+        let r = group % eighth;
+        // SAFETY: each flattened `(block, r)` writes a disjoint eight-row
+        // group within its block.
+        unsafe {
+            kernels::butterfly_fused_3layer_row(
+                (base as *mut F128).add(block * block_len),
+                eighth,
+                num_ntts,
+                r,
+                &twiddles[block],
+            )
+        };
+    };
+
+    if total_groups < PARALLEL_ROW_THRESHOLD {
+        for group in 0..total_groups {
+            do_one(group);
         }
     } else {
-        (0..eighth).into_par_iter().for_each(|r| {
-            // SAFETY: distinct r → disjoint row groups → no aliasing.
-            unsafe {
-                kernels::butterfly_fused_3layer_row(base as *mut F128, eighth, num_ntts, r, t)
-            };
+        (0..total_groups).into_par_iter().for_each(|group| {
+            do_one(group);
         });
     }
 }
