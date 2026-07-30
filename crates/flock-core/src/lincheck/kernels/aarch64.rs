@@ -1,6 +1,4 @@
-use super::super::{F128, build_sum_table};
-
-const NEON_TILE_T: usize = 8;
+use super::super::{F128, NEON_TILE_T, build_sum_table};
 
 /// Single-matrix partial fold with **tiled + NEON-register accumulators**.
 /// Keeps `BLOCK_K = 8` accumulators in NEON registers across a `NEON_TILE_T`
@@ -31,10 +29,19 @@ pub fn partial_fold_packed_z_neon_single_padded(
     useful_bits: usize,
     eq_outer: &[F128],
 ) -> Vec<F128> {
-    use rayon::prelude::*;
-    use std::arch::aarch64::*;
+    single_padded_tiled::<NEON_TILE_T>(z_packed, m, k_log, useful_bits, eq_outer)
+}
 
-    const TILE_T: usize = NEON_TILE_T;
+#[cfg(target_arch = "aarch64")]
+fn single_padded_tiled<const TILE_T: usize>(
+    z_packed: &[u8],
+    m: usize,
+    k_log: usize,
+    useful_bits: usize,
+    eq_outer: &[F128],
+) -> Vec<F128> {
+    use rayon::prelude::*;
+
     const BLOCK_K: usize = 8;
 
     let n_log = m - k_log;
@@ -68,7 +75,7 @@ pub fn partial_fold_packed_z_neon_single_padded(
             || vec![F128::ZERO; k],
             |mut out, (chunk_idx, chunk_bytes)| {
                 let tile_start = chunk_idx * tiles_per_chunk;
-                // TILE_T × 256 F128 = 32 KB tables. L1 resident.
+                // TILE_T × 256 F128 tables. L1 resident.
                 let mut tables = vec![F128::ZERO; TILE_T * 256];
 
                 let n_tiles_in_chunk = chunk_bytes.len() / (TILE_T * k);
@@ -91,7 +98,7 @@ pub fn partial_fold_packed_z_neon_single_padded(
                     for block_idx in 0..n_blocks {
                         let bs = block_idx * BLOCK_K;
                         unsafe {
-                            process_block_neon_single(
+                            process_block_neon_single::<TILE_T>(
                                 tile_bytes_ptr,
                                 k,
                                 bs,
@@ -101,8 +108,6 @@ pub fn partial_fold_packed_z_neon_single_padded(
                         }
                     }
                 }
-                // Suppress unused variable warning when not aarch64
-                let _ = unsafe { vdupq_n_u8(0) };
                 out
             },
         )
@@ -117,26 +122,31 @@ pub fn partial_fold_packed_z_neon_single_padded(
         )
 }
 
-/// Single-matrix NEON inner kernel — sweep TILE_T=8 stripes of a stripe-tile
+/// Single-matrix NEON inner kernel — sweep `TILE_T` stripes of a stripe-tile
 /// for one BLOCK_K=8 block of i_inner positions, keeping all 8 accumulators
 /// in NEON Q-registers.
 ///
+/// The 8 z index bytes for a stripe are consecutive, so they are fetched with
+/// **one** 8-byte scalar load and shifted out of the register rather than with
+/// eight `LDRB`s: the gather already issues one 128-bit table load per index,
+/// and a second load per index would nearly double this kernel's load-port
+/// pressure for data that is already in a register.
+///
 /// # Safety
-/// - `tile_bytes_ptr` must point to at least `TILE_T * k` bytes.
+/// - `row_ptr` must point to at least `(TILE_T - 1) * row_stride + bs + 8` bytes.
 /// - `tables_ptr` must point to at least `TILE_T * 256 * 16` bytes.
 /// - `out_ptr` must point to at least 8 F128 (128 bytes) of mutable storage.
 #[cfg(target_arch = "aarch64")]
 #[inline(never)]
 #[allow(unsafe_op_in_unsafe_fn)]
-unsafe fn process_block_neon_single(
-    tile_bytes_ptr: *const u8,
-    k: usize,
+unsafe fn process_block_neon_single<const TILE_T: usize>(
+    row_ptr: *const u8,
+    row_stride: usize,
     bs: usize,
     tables_ptr: *const u8,
     out_ptr: *mut F128,
 ) {
     use std::arch::aarch64::*;
-    const TILE_T: usize = NEON_TILE_T;
 
     let o = out_ptr as *mut u8;
 
@@ -150,17 +160,20 @@ unsafe fn process_block_neon_single(
     let mut a7 = vld1q_u8(o.add(112));
 
     for t in 0..TILE_T {
-        let stripe_ptr = tile_bytes_ptr.add(t * k + bs);
+        let stripe_ptr = row_ptr.add(t * row_stride + bs);
         let ta = tables_ptr.add(t * 256 * 16);
 
-        let i0 = *stripe_ptr as usize;
-        let i1 = *stripe_ptr.add(1) as usize;
-        let i2 = *stripe_ptr.add(2) as usize;
-        let i3 = *stripe_ptr.add(3) as usize;
-        let i4 = *stripe_ptr.add(4) as usize;
-        let i5 = *stripe_ptr.add(5) as usize;
-        let i6 = *stripe_ptr.add(6) as usize;
-        let i7 = *stripe_ptr.add(7) as usize;
+        // One unaligned 8-byte load replaces eight LDRBs.
+        let w = (stripe_ptr as *const u64).read_unaligned();
+
+        let i0 = (w & 0xff) as usize;
+        let i1 = ((w >> 8) & 0xff) as usize;
+        let i2 = ((w >> 16) & 0xff) as usize;
+        let i3 = ((w >> 24) & 0xff) as usize;
+        let i4 = ((w >> 32) & 0xff) as usize;
+        let i5 = ((w >> 40) & 0xff) as usize;
+        let i6 = ((w >> 48) & 0xff) as usize;
+        let i7 = (w >> 56) as usize;
 
         a0 = veorq_u8(a0, vld1q_u8(ta.add(i0 * 16)));
         a1 = veorq_u8(a1, vld1q_u8(ta.add(i1 * 16)));
@@ -208,9 +221,19 @@ pub fn partial_fold_packed_z_neon_iblock_padded(
     useful_bits: usize,
     eq_outer: &[F128],
 ) -> Vec<F128> {
+    iblock_padded_tiled::<NEON_TILE_T>(z_packed, m, k_log, useful_bits, eq_outer)
+}
+
+#[cfg(target_arch = "aarch64")]
+fn iblock_padded_tiled<const TILE_T: usize>(
+    z_packed: &[u8],
+    m: usize,
+    k_log: usize,
+    useful_bits: usize,
+    eq_outer: &[F128],
+) -> Vec<F128> {
     use rayon::prelude::*;
 
-    const TILE_T: usize = NEON_TILE_T;
     const BLOCK_K: usize = 8;
 
     let n_log = m - k_log;
@@ -264,7 +287,7 @@ pub fn partial_fold_packed_z_neon_iblock_padded(
         .for_each(|(ci, out_slice)| {
             let i_base = ci * i_chunk;
             let n_block = out_slice.len() / BLOCK_K;
-            // TILE_T × 256 F128 = 32 KB tables, L1-resident, rebuilt per tile.
+            // TILE_T × 256 F128 tables, L1-resident, rebuilt per tile.
             let mut tables = vec![F128::ZERO; TILE_T * 256];
             for tile in 0..n_tiles {
                 let stripe_base = tile * TILE_T;
@@ -282,7 +305,7 @@ pub fn partial_fold_packed_z_neon_iblock_padded(
                 for b in 0..n_block {
                     let i = b * BLOCK_K;
                     unsafe {
-                        process_block_neon_single(
+                        process_block_neon_single::<TILE_T>(
                             z_base,
                             k,
                             i,
@@ -322,9 +345,19 @@ pub fn partial_fold_packed_z_neon_oblock_padded(
     useful_bits: usize,
     eq_outer: &[F128],
 ) -> Vec<F128> {
+    oblock_padded_tiled::<NEON_TILE_T>(z_packed, m, k_log, useful_bits, eq_outer)
+}
+
+#[cfg(target_arch = "aarch64")]
+pub(crate) fn oblock_padded_tiled<const TILE_T: usize>(
+    z_packed: &[u8],
+    m: usize,
+    k_log: usize,
+    useful_bits: usize,
+    eq_outer: &[F128],
+) -> Vec<F128> {
     use rayon::prelude::*;
 
-    const TILE_T: usize = NEON_TILE_T;
     const BLOCK_K: usize = 8;
 
     let n_log = m - k_log;
@@ -363,7 +396,7 @@ pub fn partial_fold_packed_z_neon_oblock_padded(
         .for_each(|(w, partial)| {
             let tile_lo = w * tiles_per_worker;
             let tile_hi = ((w + 1) * tiles_per_worker).min(n_tiles);
-            // TILE_T × 256 F128 = 32 KB tables, L1-resident, built once per tile.
+            // TILE_T × 256 F128 tables, L1-resident, built once per tile.
             let mut tables = vec![F128::ZERO; TILE_T * 256];
             for tile in tile_lo..tile_hi {
                 let stripe_base = tile * TILE_T;
@@ -379,7 +412,7 @@ pub fn partial_fold_packed_z_neon_oblock_padded(
                 let mut bs = 0usize;
                 while bs < useful {
                     unsafe {
-                        process_block_neon_single(
+                        process_block_neon_single::<TILE_T>(
                             z_base,
                             k,
                             bs,
@@ -392,14 +425,26 @@ pub fn partial_fold_packed_z_neon_oblock_padded(
             }
         });
 
-    // XOR-reduce the per-worker partials: parallel over columns, sequential over
-    // workers so each 256 KB partial is streamed once (cache-friendly).
-    let (first, rest) = partials.split_at(k);
-    let mut out = first.to_vec();
-    for chunk in rest.chunks(k) {
-        out.par_iter_mut()
-            .zip(chunk.par_iter())
-            .for_each(|(o, s)| *o += *s);
-    }
+    // XOR-reduce the per-worker partials in ONE parallel pass over column bands:
+    // each worker owns a band of the output and XORs it across all `n_workers`
+    // partials, so the band lands in registers/L1 once and is written once.
+    //
+    // The obvious alternative — fold one partial at a time with a parallel
+    // `zip` per partial — costs `n_workers - 1` separate parallel regions, each
+    // a full read-modify-write of the 256 KB accumulator plus a rayon barrier.
+    // That is `n_workers - 1` accumulator reads and writes (≈2.5× the traffic
+    // here) and 9 barriers instead of 1 at `n_workers = 10`; measured ≈0.7 ms
+    // of the fold at m=32, k_log=14.
+    let band = k.div_ceil(rayon::current_num_threads().max(1)).max(1024);
+    let mut out = vec![F128::ZERO; k];
+    out.par_chunks_mut(band).enumerate().for_each(|(bi, dst)| {
+        let lo = bi * band;
+        for w in 0..n_workers {
+            let src = &partials[w * k + lo..w * k + lo + dst.len()];
+            for (o, s) in dst.iter_mut().zip(src.iter()) {
+                *o += *s;
+            }
+        }
+    });
     out
 }

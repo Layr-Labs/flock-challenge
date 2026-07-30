@@ -660,7 +660,12 @@ pub fn partial_fold_packed_z_fast_padded(
 /// Larger ⇒ the length-`k` accumulator is re-streamed fewer times
 /// (`n_stripes / NEON_TILE_T`), but the per-tile sum tables grow
 /// `NEON_TILE_T × 4 KB` and must stay L1-resident.
-const NEON_TILE_T: usize = 8;
+///
+/// **Single source of truth.** The dispatch gate ([`n_log_ok_for_tile`]) and
+/// the kernels' actual tiling factor MUST agree — the kernels take `TILE_T`
+/// as a const generic and the public entry points instantiate them with this
+/// constant, so the pairing is correct by construction.
+pub(crate) const NEON_TILE_T: usize = 8;
 
 /// Dispatch helper: pick the fastest single-matrix partial fold available
 /// for the given (m, k_log). Threads `useful_bits` through so the kernel
