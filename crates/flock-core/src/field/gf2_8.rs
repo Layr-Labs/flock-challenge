@@ -150,51 +150,51 @@ pub mod neon {
     use core::arch::aarch64::*;
     use core::mem::transmute;
 
+    /// Fold the coefficients at degrees 8..15 below degree 8 modulo the AES
+    /// polynomial, for 16 high bytes in parallel.
+    ///
+    /// The tables contain the subset sums of:
+    /// - x^8..x^11 mod p = 0x1b, 0x36, 0x6c, 0xd8
+    /// - x^12..x^15 mod p = 0xab, 0x4d, 0x9a, 0x2f
+    ///
+    /// # Safety
+    /// Uses `core::arch::aarch64` NEON intrinsics; only call on `aarch64`.
+    #[inline]
+    pub(crate) unsafe fn gf8_fold_high_bytes_vec16(ch: uint8x16_t) -> uint8x16_t {
+        const RED_LO: [u8; 16] = [
+            0x00, 0x1b, 0x36, 0x2d, 0x6c, 0x77, 0x5a, 0x41, 0xd8, 0xc3, 0xee, 0xf5, 0xb4, 0xaf,
+            0x82, 0x99,
+        ];
+        const RED_HI: [u8; 16] = [
+            0x00, 0xab, 0x4d, 0xe6, 0x9a, 0x31, 0xd7, 0x7c, 0x2f, 0x84, 0x62, 0xc9, 0xb5, 0x1e,
+            0xf8, 0x53,
+        ];
+
+        unsafe {
+            let lo_nibble = vandq_u8(ch, vdupq_n_u8(0x0f));
+            let hi_nibble = vshrq_n_u8::<4>(ch);
+            let red_lo = vld1q_u8(RED_LO.as_ptr());
+            let red_hi = vld1q_u8(RED_HI.as_ptr());
+            veorq_u8(vqtbl1q_u8(red_lo, lo_nibble), vqtbl1q_u8(red_hi, hi_nibble))
+        }
+    }
+
     /// Reduce 16 polynomial products (in interleaved layout `[lo0,hi0, lo1,hi1, ...]`,
     /// passed as `(c0, c1)`) modulo `x^8 + x^4 + x^3 + x + 1`, returning 16 reduced
     /// GF(2^8) values.
     ///
-    /// Two-stage Binius-style reduction:
-    ///   Stage 1: ch · QPLUS_RSH1 then ·2 (corrects for /x in QPLUS_RSH1)
-    ///   Stage 2: high bytes of stage-1 · QSTAR; take low bytes only.
-    ///
-    /// Constants:
-    ///   QPLUS_RSH1 = (x^8+x^4+x^3+x)/x = 0x8d
-    ///   QSTAR      = x^4+x^3+x+1       = 0x1b
+    /// The low byte is already reduced. The high byte is split into nibbles,
+    /// folded through two 16-entry tables, and XORed with the low byte.
     ///
     /// # Safety
     /// Uses `core::arch::aarch64` NEON intrinsics; only call on `aarch64`.
     #[inline]
     pub unsafe fn gf8_reduce_vec16(c0: uint8x16_t, c1: uint8x16_t) -> uint8x16_t {
         unsafe {
-            let q_plus_rsh1: poly8x8_t = transmute::<u64, poly8x8_t>(0x8d8d8d8d8d8d8d8d_u64);
-            let q_star: poly8x8_t = transmute::<u64, poly8x8_t>(0x1b1b1b1b1b1b1b1b_u64);
-
             let cl = vuzp1q_u8(c0, c1); // low bytes of all 16 products
             let ch = vuzp2q_u8(c0, c1); // high bytes of all 16 products
 
-            // Stage 1.
-            let t0 = vreinterpretq_u8_u16(vshlq_n_u16::<1>(vreinterpretq_u16_p16(vmull_p8(
-                transmute::<uint8x8_t, poly8x8_t>(vget_low_u8(ch)),
-                q_plus_rsh1,
-            ))));
-            let t1 = vreinterpretq_u8_u16(vshlq_n_u16::<1>(vreinterpretq_u16_p16(vmull_p8(
-                transmute::<uint8x8_t, poly8x8_t>(vget_high_u8(ch)),
-                q_plus_rsh1,
-            ))));
-
-            // Stage 2.
-            let tmp_hi = vuzp2q_u8(t0, t1);
-            let r0 = vreinterpretq_u8_u16(vreinterpretq_u16_p16(vmull_p8(
-                transmute::<uint8x8_t, poly8x8_t>(vget_low_u8(tmp_hi)),
-                q_star,
-            )));
-            let r1 = vreinterpretq_u8_u16(vreinterpretq_u16_p16(vmull_p8(
-                transmute::<uint8x8_t, poly8x8_t>(vget_high_u8(tmp_hi)),
-                q_star,
-            )));
-
-            veorq_u8(cl, vuzp1q_u8(r0, r1))
+            veorq_u8(cl, gf8_fold_high_bytes_vec16(ch))
         }
     }
 
@@ -355,6 +355,34 @@ mod tests {
             };
             let result: [u8; 16] = unsafe { transmute(result_vec) };
             assert_eq!(result, expected, "a={:02x?}, b={:02x?}", a_arr, b_arr);
+        }
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn neon_gf8_nibble_fold_matches_scalar_exhaustive() {
+        use core::arch::aarch64::*;
+        use core::mem::transmute;
+
+        for base in (0u16..=255).step_by(16) {
+            let mut high = [0u8; 16];
+            let mut expected = [0u8; 16];
+            for lane in 0..16 {
+                high[lane] = (base + lane as u16) as u8;
+                expected[lane] = gf8_reduce((high[lane] as u16) << 8);
+            }
+
+            let folded = unsafe {
+                let high = vld1q_u8(high.as_ptr());
+                neon::gf8_fold_high_bytes_vec16(high)
+            };
+            let actual: [u8; 16] = unsafe { transmute(folded) };
+            assert_eq!(
+                actual,
+                expected,
+                "high bytes {base:#04x}..={:#04x}",
+                base + 15
+            );
         }
     }
 
