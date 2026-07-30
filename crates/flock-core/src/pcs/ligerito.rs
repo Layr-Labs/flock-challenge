@@ -2641,23 +2641,7 @@ fn fold_and_msg_lsb(f: &[F128], b: &[F128], r: F128) -> (Vec<F128>, Vec<F128>, S
         .enumerate()
         .map(|(ci, (fc, bc))| {
             let base = ci * CHUNK;
-            let len = fc.len();
-            let mut u0 = F128::ZERO;
-            let mut u2 = F128::ZERO;
-            // Fold this slice, then pair up the just-folded values for the msg.
-            crate::field::f128_slice::fold_pairs(f, base, fc, r);
-            crate::field::f128_slice::fold_pairs(b, base, bc, r);
-            let mut k = 0;
-            while k + 1 < len {
-                let f0 = fc[k];
-                let f1 = fc[k + 1];
-                let b0 = bc[k];
-                let b1 = bc[k + 1];
-                u0 += f0 * b0;
-                u2 += (f0 + f1) * (b0 + b1);
-                k += 2;
-            }
-            (u0, u2)
+            crate::field::f128_slice::fold_pairs_and_message(f, b, base, fc, bc, r)
         })
         .reduce(
             || (F128::ZERO, F128::ZERO),
@@ -4994,6 +4978,32 @@ pub fn recursive_verifier<Ch: Challenger>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parallel_fold_and_message_matches_separate_oracle() {
+        let mut state = 0xa409_3822_299f_31d0_u64;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            F128::new(state, state.rotate_left(31))
+        };
+        // `half == 4096` selects the chunked production path.
+        let f: Vec<F128> = (0..8192).map(|_| next()).collect();
+        let b: Vec<F128> = (0..8192).map(|_| next()).collect();
+        let r = next();
+        let mut expected_f = f.clone();
+        let mut expected_b = b.clone();
+        partial_eval_lsb_one(&mut expected_f, r);
+        partial_eval_lsb_one(&mut expected_b, r);
+        let expected_message = round_msg_lsb(&expected_f, &expected_b);
+
+        let (actual_f, actual_b, actual_message) = fold_and_msg_lsb(&f, &b, r);
+
+        assert_eq!(actual_f, expected_f);
+        assert_eq!(actual_b, expected_b);
+        assert_eq!(actual_message, expected_message);
+    }
 
     /// Worked example: `LigeritoSecurityConfig` for BLAKE3 m=29 at rate 1/2.
     /// Paper-compatible m=29 fast example, mechanically derived in the
