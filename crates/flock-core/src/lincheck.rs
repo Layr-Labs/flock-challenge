@@ -249,16 +249,53 @@ impl<'a> LincheckCircuit for SparseMatrixCircuit<'a> {
 pub struct CscCircuit {
     n_cols: usize,
     a_col_ptr: Vec<u32>,
-    a_rows: Vec<u32>,
+    a_rows: CscRows,
     b_col_ptr: Vec<u32>,
-    b_rows: Vec<u32>,
+    b_rows: CscRows,
     /// Constant-wire pin column (see [`LincheckCircuit::const_pin_col`]).
     const_pin: Option<usize>,
 }
 
+/// Row indices compacted to the narrowest lossless setup-time representation.
+/// Hash circuits have at most 2^16 rows, so their warmed CSC stream uses u16;
+/// the u32 fallback preserves the general circuit API.
+#[derive(Clone)]
+enum CscRows {
+    U16(Vec<u16>),
+    U32(Vec<u32>),
+}
+
+impl CscRows {
+    #[inline]
+    fn len(&self) -> usize {
+        match self {
+            Self::U16(rows) => rows.len(),
+            Self::U32(rows) => rows.len(),
+        }
+    }
+
+    #[inline]
+    fn sum_eq(&self, start: usize, end: usize, eq_inner: &[F128]) -> F128 {
+        let mut sum = F128::ZERO;
+        match self {
+            Self::U16(rows) => {
+                for &r in &rows[start..end] {
+                    sum += eq_inner[r as usize];
+                }
+            }
+            Self::U32(rows) => {
+                for &r in &rows[start..end] {
+                    sum += eq_inner[r as usize];
+                }
+            }
+        }
+        sum
+    }
+}
+
 /// Flatten one sparse matrix into CSC arrays: rows with a 1 in column `c` are
 /// `rows_flat[col_ptr[c] as usize .. col_ptr[c+1] as usize]`.
-fn csc_from_rows(m: &SparseBinaryMatrix) -> (Vec<u32>, Vec<u32>) {
+fn csc_from_rows(m: &SparseBinaryMatrix) -> (Vec<u32>, CscRows) {
     assert!(m.num_rows <= u32::MAX as usize);
     assert!(m.num_cols <= u32::MAX as usize);
     let mut col_ptr = vec![0u32; m.num_cols + 1];
@@ -271,13 +308,26 @@ fn csc_from_rows(m: &SparseBinaryMatrix) -> (Vec<u32>, Vec<u32>) {
         col_ptr[c + 1] += col_ptr[c];
     }
     let mut next = col_ptr.clone();
-    let mut rows_flat = vec![0u32; *col_ptr.last().unwrap() as usize];
-    for (r, row) in m.rows.iter().enumerate() {
-        for &c in row {
-            rows_flat[next[c] as usize] = r as u32;
-            next[c] += 1;
+    let nnz = *col_ptr.last().unwrap() as usize;
+    let rows_flat = if m.num_rows <= u16::MAX as usize + 1 {
+        let mut rows = vec![0u16; nnz];
+        for (r, row) in m.rows.iter().enumerate() {
+            for &c in row {
+                rows[next[c] as usize] = r as u16;
+                next[c] += 1;
+            }
         }
-    }
+        CscRows::U16(rows)
+    } else {
+        let mut rows = vec![0u32; nnz];
+        for (r, row) in m.rows.iter().enumerate() {
+            for &c in row {
+                rows[next[c] as usize] = r as u32;
+                next[c] += 1;
+            }
+        }
+        CscRows::U32(rows)
+    };
     (col_ptr, rows_flat)
 }
 
@@ -326,14 +376,16 @@ impl LincheckCircuit for CscCircuit {
         use rayon::prelude::*;
         assert_eq!(eq_inner.len(), self.n_cols);
         let one_col = |c: usize| {
-            let mut sa = F128::ZERO;
-            for &r in &self.a_rows[self.a_col_ptr[c] as usize..self.a_col_ptr[c + 1] as usize] {
-                sa += eq_inner[r as usize];
-            }
-            let mut sb = F128::ZERO;
-            for &r in &self.b_rows[self.b_col_ptr[c] as usize..self.b_col_ptr[c + 1] as usize] {
-                sb += eq_inner[r as usize];
-            }
+            let sa = self.a_rows.sum_eq(
+                self.a_col_ptr[c] as usize,
+                self.a_col_ptr[c + 1] as usize,
+                eq_inner,
+            );
+            let sb = self.b_rows.sum_eq(
+                self.b_col_ptr[c] as usize,
+                self.b_col_ptr[c + 1] as usize,
+                eq_inner,
+            );
             alpha * sa + sb
         };
         if self.n_cols < SUMCHECK_PAR_THRESHOLD {
@@ -1763,6 +1815,24 @@ mod tests {
             }
         }
         assert_eq!(got, expected);
+    }
+
+    #[test]
+    fn compact_csc_fold_matches_sparse_fold() {
+        let mut rng = Rng::new(0xC5C0_16);
+        let k = 64;
+        let a = random_sparse_matrix(k, 5 * k, &mut rng);
+        let b = random_sparse_matrix(k, 7 * k, &mut rng);
+        let eq_inner = rng.f128_vec(k);
+        let alpha = rng.f128();
+
+        let csc = CscCircuit::from_matrices(&a, &b);
+        assert!(matches!(csc.a_rows, CscRows::U16(_)));
+        assert!(matches!(csc.b_rows, CscRows::U16(_)));
+        assert_eq!(
+            csc.fold_alpha_batched(alpha, &eq_inner),
+            sparse_row_fold_alpha_batched(alpha, &a, &b, &eq_inner),
+        );
     }
 
     /// `partial_fold_packed_z` matches the direct sum.
