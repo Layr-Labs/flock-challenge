@@ -56,11 +56,7 @@ impl InvNttTableByteSingleGf8 {
         // straddles two cache lines.
         const TABLE_ALIGNMENT: usize = 64;
         let table_len = 256 * ell;
-        // Odd byte positions need each vector's two 8-byte halves exchanged.
-        // Keep that permutation as a second AArch64 image so the URM leaf can
-        // load it directly instead of executing an EXT for every vector.
-        let table_images = if cfg!(target_arch = "aarch64") { 2 } else { 1 };
-        let mut data = vec![F8::ZERO; table_images * table_len + TABLE_ALIGNMENT - 1];
+        let mut data = vec![F8::ZERO; table_len + TABLE_ALIGNMENT - 1];
         let data_offset = (TABLE_ALIGNMENT - (data.as_ptr() as usize & (TABLE_ALIGNMENT - 1)))
             & (TABLE_ALIGNMENT - 1);
         let table = &mut data[data_offset..data_offset + table_len];
@@ -88,25 +84,13 @@ impl InvNttTableByteSingleGf8 {
             if (w & (w - 1)) == 0 {
                 continue; // skip powers of 2 (already written)
             }
-            let lo_bit = w & w.wrapping_neg();
+            let lo_bit = w.isolate_lowest_one();
             let parent = w ^ lo_bit;
             // Borrow-checker friendly: read parent + bit_v slices, then write entry.
             let (parent_off, bit_off, entry_off) = (parent * ell, lo_bit * ell, w * ell);
             for i in 0..ell {
                 let v = table[parent_off + i] + table[bit_off + i];
                 table[entry_off + i] = v;
-            }
-        }
-
-        #[cfg(target_arch = "aarch64")]
-        {
-            let swapped_start = data_offset + table_len;
-            let (original_storage, swapped_storage) = data.split_at_mut(swapped_start);
-            let original = &original_storage[data_offset..data_offset + table_len];
-            let swapped = &mut swapped_storage[..table_len];
-            for (source, target) in original.chunks_exact(16).zip(swapped.chunks_exact_mut(16)) {
-                target[..8].copy_from_slice(&source[8..]);
-                target[8..].copy_from_slice(&source[..8]);
             }
         }
 
@@ -127,15 +111,6 @@ impl InvNttTableByteSingleGf8 {
         // SAFETY: `data_offset` selects a position within the over-allocated
         // buffer and the allocation cannot move while borrowed through self.
         unsafe { self.data.as_ptr().add(self.data_offset) as *const u8 }
-    }
-
-    /// AArch64-only table image with each 16-byte chunk half-swapped.
-    #[cfg(target_arch = "aarch64")]
-    #[inline]
-    pub fn half_swapped_data_ptr(&self) -> *const u8 {
-        debug_assert!(self.ell >= 16);
-        // SAFETY: construction appends one complete logical table image.
-        unsafe { self.data.as_ptr().add(self.data_offset + 256 * self.ell) as *const u8 }
     }
 
     #[inline]
@@ -431,25 +406,6 @@ mod tests {
             let ntt_l = AdditiveNttGf8::new(k, F8(1u8 << k));
             let table = InvNttTableByteSingleGf8::new(&ntt_s, &ntt_l);
             assert_eq!(table.data_ptr() as usize % 64, 0, "k={k}");
-        }
-    }
-
-    #[cfg(target_arch = "aarch64")]
-    #[test]
-    fn half_swapped_storage_is_exhaustively_exact() {
-        for k in 4..=7 {
-            let ntt_s = AdditiveNttGf8::new(k, F8::ZERO);
-            let ntt_l = AdditiveNttGf8::new(k, F8(1u8 << k));
-            let table = InvNttTableByteSingleGf8::new(&ntt_s, &ntt_l);
-            let len = 256 * table.ell;
-            // SAFETY: both pointers expose complete images owned by `table`.
-            let original = unsafe { core::slice::from_raw_parts(table.data_ptr(), len) };
-            let swapped =
-                unsafe { core::slice::from_raw_parts(table.half_swapped_data_ptr(), len) };
-            for (source, target) in original.chunks_exact(16).zip(swapped.chunks_exact(16)) {
-                assert_eq!(&target[..8], &source[8..]);
-                assert_eq!(&target[8..], &source[..8]);
-            }
         }
     }
 

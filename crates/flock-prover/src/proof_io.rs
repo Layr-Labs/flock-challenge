@@ -158,7 +158,13 @@ pub struct ChainProofBundleLigerito {
 
 impl R1csProofBundleLigerito {
     pub fn to_bytes(&self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(HEADER_LEN + 1024);
+        // Exact-size preallocation: at the ranked shape the payload is
+        // ~437 kB, and growing from a 1 KiB seed re-copies the buffer ~9
+        // times on the timed serialization path. `serialized_size` is a
+        // cheap counting pass; the emitted bytes are unchanged.
+        let payload_len =
+            bincode::serialized_size(self).expect("bincode size R1csProofBundleLigerito") as usize;
+        let mut out = Vec::with_capacity(HEADER_LEN + payload_len);
         write_header(&mut out, FLAVOR_R1CS_LIGERITO);
         bincode::serialize_into(&mut out, self).expect("bincode serialize R1csProofBundleLigerito");
         out

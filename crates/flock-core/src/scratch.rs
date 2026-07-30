@@ -1,4 +1,5 @@
-//! Process-global pool for the prover's large transient `F128` buffers.
+//! Process-global pools for the prover's large transient `F128` and byte
+//! buffers.
 //!
 //! Each prove allocates, faults in, and frees several 64–128 MB vectors
 //! (the RS codeword, the round-2 fold outputs, the multilinear tail's
@@ -21,6 +22,7 @@ use crate::field::F128;
 use std::sync::Mutex;
 
 static POOL: Mutex<Vec<Vec<F128>>> = Mutex::new(Vec::new());
+static U8_POOL: Mutex<Vec<Vec<u8>>> = Mutex::new(Vec::new());
 
 /// Max buffers retained. The m=29 prove cycle gives ~18 distinct buffers:
 /// witness z/a/b, the L0 codeword, zerocheck's 2 fold outputs + 2 ping-pong
@@ -32,6 +34,11 @@ static POOL: Mutex<Vec<Vec<F128>>> = Mutex::new(Vec::new());
 /// the page reuse it would otherwise get from the freed early-phase
 /// buffers) — measured as a +24% open_batch regression on M4 before this.
 const MAX_POOLED: usize = 24;
+
+/// Only one lincheck byte stripe is live per prove. Retaining the largest
+/// returned stripe is enough for sequential proves without letting concurrent
+/// or mixed-size workloads park multiple multi-hundred-MiB byte buffers.
+const MAX_U8_POOLED: usize = 1;
 
 /// Take a length-`n` `F128` vector, preferring a pooled buffer (smallest
 /// capacity ≥ `n`); falls back to a fresh uninitialized allocation.
@@ -92,6 +99,50 @@ pub fn give_f128(v: Vec<F128>) {
     }
 }
 
+/// Take a length-`n` byte vector, preferring the smallest pooled buffer whose
+/// capacity is at least `n`; otherwise allocate a zeroed vector.
+///
+/// A recycled buffer contains initialized but stale bytes. Callers that use it
+/// for witness data must overwrite the full logical length before reading it.
+pub fn take_u8(n: usize) -> Vec<u8> {
+    let mut pool = U8_POOL.lock().unwrap();
+    let mut best: Option<usize> = None;
+    for (i, v) in pool.iter().enumerate() {
+        if v.capacity() >= n && best.is_none_or(|b| v.capacity() < pool[b].capacity()) {
+            best = Some(i);
+        }
+    }
+    if let Some(i) = best {
+        let mut v = pool.swap_remove(i);
+        drop(pool);
+        // `resize` initializes any tail when a shorter vector with sufficient
+        // spare capacity was returned by another caller.
+        v.resize(n, 0);
+        return v;
+    }
+    drop(pool);
+    vec![0; n]
+}
+
+/// Return a byte buffer for reuse. The byte pool retains only its largest
+/// buffer because one lincheck stripe is live at a time in the normal prover.
+pub fn give_u8(v: Vec<u8>) {
+    if v.capacity() == 0 {
+        return;
+    }
+    let mut pool = U8_POOL.lock().unwrap();
+    pool.push(v);
+    if pool.len() > MAX_U8_POOLED {
+        let smallest = pool
+            .iter()
+            .enumerate()
+            .min_by_key(|(_, v)| v.capacity())
+            .map(|(i, _)| i)
+            .expect("u8 pool non-empty");
+        pool.swap_remove(smallest);
+    }
+}
+
 /// Pre-warm the pool for proves at witness size `2^m`: allocate and
 /// first-touch the full prove-cycle buffer set once, in parallel, then park
 /// it in the pool. Called from the per-hash Setup constructors, this moves
@@ -136,14 +187,18 @@ pub fn prewarm_prover(m: usize) {
 /// Release every pooled buffer back to the OS.
 pub fn clear() {
     POOL.lock().unwrap().clear();
+    U8_POOL.lock().unwrap().clear();
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    static TEST_LOCK: Mutex<()> = Mutex::new(());
+
     #[test]
     fn take_reuses_given_buffer() {
+        let _guard = TEST_LOCK.lock().unwrap();
         clear();
         let mut v = take_f128(1024);
         for slot in v.iter_mut() {
@@ -160,11 +215,39 @@ mod tests {
 
     #[test]
     fn pool_is_bounded() {
+        let _guard = TEST_LOCK.lock().unwrap();
         clear();
         for _ in 0..(MAX_POOLED + 4) {
             give_f128(take_f128(16));
         }
         assert!(POOL.lock().unwrap().len() <= MAX_POOLED);
+        clear();
+    }
+
+    #[test]
+    fn u8_pool_reuses_and_keeps_only_largest_buffer() {
+        let _guard = TEST_LOCK.lock().unwrap();
+        clear();
+
+        let mut v = take_u8(1024);
+        v.fill(0xA5);
+        let ptr = v.as_ptr();
+        give_u8(v);
+
+        let v = take_u8(512);
+        assert_eq!(v.as_ptr(), ptr);
+        assert_eq!(v.len(), 512);
+        give_u8(v);
+
+        let v = take_u8(768);
+        assert_eq!(v.as_ptr(), ptr);
+        assert!(v[..512].iter().all(|&byte| byte == 0xA5));
+        assert!(v[512..].iter().all(|&byte| byte == 0));
+        give_u8(v);
+
+        give_u8(take_u8(2048));
+        assert_eq!(U8_POOL.lock().unwrap().len(), MAX_U8_POOLED);
+        assert!(U8_POOL.lock().unwrap()[0].capacity() >= 2048);
         clear();
     }
 }

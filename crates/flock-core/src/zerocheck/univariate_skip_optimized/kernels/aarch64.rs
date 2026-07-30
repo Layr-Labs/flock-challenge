@@ -62,68 +62,41 @@ pub(crate) unsafe fn accumulate_convert_with_s_hat_v(
     // SAFETY: caller guarantees fixed input sizes and aarch64 provides NEON.
     unsafe {
         let convert_ptr = convert.as_ptr() as *const u8;
-        for lane in (0..64).step_by(4) {
-            // Four independent lanes expose enough lookup-level parallelism
-            // to hide the convert table's load latency.
-            let mut ab0 = vdupq_n_u8(0);
-            let mut ab1 = vdupq_n_u8(0);
-            let mut ab2 = vdupq_n_u8(0);
-            let mut ab3 = vdupq_n_u8(0);
-            let mut c00 = vdupq_n_u8(0);
-            let mut c01 = vdupq_n_u8(0);
-            let mut c02 = vdupq_n_u8(0);
-            let mut c03 = vdupq_n_u8(0);
-            let mut c10 = vdupq_n_u8(0);
-            let mut c11 = vdupq_n_u8(0);
-            let mut c12 = vdupq_n_u8(0);
-            let mut c13 = vdupq_n_u8(0);
+        for lane in 0..64 {
+            let mut converted_ab = vdupq_n_u8(0);
+            let mut converted_c_0 = vdupq_n_u8(0);
+            let mut converted_c_1 = vdupq_n_u8(0);
             for b_med in 0..n_b_med {
-                let table = convert_ptr.add(b_med * 256 * 16);
-                let a0 = chunk_ab_bytes[b_med][lane] as usize;
-                let a1 = chunk_ab_bytes[b_med][lane + 1] as usize;
-                let a2 = chunk_ab_bytes[b_med][lane + 2] as usize;
-                let a3 = chunk_ab_bytes[b_med][lane + 3] as usize;
-                let c0 = chunk_c_bytes[b_med][lane] as usize;
-                let c1 = chunk_c_bytes[b_med][lane + 1] as usize;
-                let c2 = chunk_c_bytes[b_med][lane + 2] as usize;
-                let c3 = chunk_c_bytes[b_med][lane + 3] as usize;
-                ab0 = veorq_u8(ab0, vld1q_u8(table.add(a0 * 16)));
-                ab1 = veorq_u8(ab1, vld1q_u8(table.add(a1 * 16)));
-                ab2 = veorq_u8(ab2, vld1q_u8(table.add(a2 * 16)));
-                ab3 = veorq_u8(ab3, vld1q_u8(table.add(a3 * 16)));
-                c00 = veorq_u8(c00, vld1q_u8(table.add((c0 & 0x55) * 16)));
-                c01 = veorq_u8(c01, vld1q_u8(table.add((c1 & 0x55) * 16)));
-                c02 = veorq_u8(c02, vld1q_u8(table.add((c2 & 0x55) * 16)));
-                c03 = veorq_u8(c03, vld1q_u8(table.add((c3 & 0x55) * 16)));
-                c10 = veorq_u8(c10, vld1q_u8(table.add((c0 & 0xaa) * 16)));
-                c11 = veorq_u8(c11, vld1q_u8(table.add((c1 & 0xaa) * 16)));
-                c12 = veorq_u8(c12, vld1q_u8(table.add((c2 & 0xaa) * 16)));
-                c13 = veorq_u8(c13, vld1q_u8(table.add((c3 & 0xaa) * 16)));
+                let ab = chunk_ab_bytes[b_med][lane] as usize;
+                let c = chunk_c_bytes[b_med][lane] as usize;
+                converted_ab = veorq_u8(
+                    converted_ab,
+                    vld1q_u8(convert_ptr.add((b_med * 256 + ab) * 16)),
+                );
+                converted_c_0 = veorq_u8(
+                    converted_c_0,
+                    vld1q_u8(convert_ptr.add((b_med * 256 + (c & 0x55)) * 16)),
+                );
+                converted_c_1 = veorq_u8(
+                    converted_c_1,
+                    vld1q_u8(convert_ptr.add((b_med * 256 + (c & 0xaa)) * 16)),
+                );
             }
-
-            macro_rules! drain_lane {
-                ($offset:literal, $ab:ident, $c0:ident, $c1:ident) => {{
-                    let ab = vreinterpretq_u64_u8($ab);
-                    let c0 = vreinterpretq_u64_u8($c0);
-                    let c1 = vreinterpretq_u64_u8($c1);
-                    partial_ab[lane + $offset] += F128 {
-                        lo: vgetq_lane_u64::<0>(ab),
-                        hi: vgetq_lane_u64::<1>(ab),
-                    } * eq_lo_val;
-                    partial_c_0[lane + $offset] += F128 {
-                        lo: vgetq_lane_u64::<0>(c0),
-                        hi: vgetq_lane_u64::<1>(c0),
-                    } * eq_lo_val;
-                    partial_c_1[lane + $offset] += F128 {
-                        lo: vgetq_lane_u64::<0>(c1),
-                        hi: vgetq_lane_u64::<1>(c1),
-                    } * eq_lo_val;
-                }};
-            }
-            drain_lane!(0, ab0, c00, c10);
-            drain_lane!(1, ab1, c01, c11);
-            drain_lane!(2, ab2, c02, c12);
-            drain_lane!(3, ab3, c03, c13);
+            let ab = vreinterpretq_u64_u8(converted_ab);
+            let c_0 = vreinterpretq_u64_u8(converted_c_0);
+            let c_1 = vreinterpretq_u64_u8(converted_c_1);
+            partial_ab[lane] += F128 {
+                lo: vgetq_lane_u64::<0>(ab),
+                hi: vgetq_lane_u64::<1>(ab),
+            } * eq_lo_val;
+            partial_c_0[lane] += F128 {
+                lo: vgetq_lane_u64::<0>(c_0),
+                hi: vgetq_lane_u64::<1>(c_0),
+            } * eq_lo_val;
+            partial_c_1[lane] += F128 {
+                lo: vgetq_lane_u64::<0>(c_1),
+                hi: vgetq_lane_u64::<1>(c_1),
+            } * eq_lo_val;
         }
     }
 }
@@ -300,7 +273,6 @@ pub(crate) fn shift_reduce_inner_ab_neon(
 #[inline(always)]
 unsafe fn xor_apply_byte_into_8_regs<const BH: usize, const ODD: bool>(
     table_base: *const u8,
-    half_swapped_table_base: *const u8,
     a_byte: u8,
     b_byte: u8,
     da0: &mut core::arch::aarch64::uint8x16_t,
@@ -314,13 +286,8 @@ unsafe fn xor_apply_byte_into_8_regs<const BH: usize, const ODD: bool>(
 ) {
     use core::arch::aarch64::*;
     unsafe {
-        let selected_table = if ODD {
-            half_swapped_table_base
-        } else {
-            table_base
-        };
-        let ra = selected_table.add(a_byte as usize * 64);
-        let rb = selected_table.add(b_byte as usize * 64);
+        let ra = table_base.add(a_byte as usize * 64);
+        let rb = table_base.add(b_byte as usize * 64);
         let va0 = vld1q_u8(ra.add((0 ^ BH) * 16));
         let va1 = vld1q_u8(ra.add((1 ^ BH) * 16));
         let va2 = vld1q_u8(ra.add((2 ^ BH) * 16));
@@ -329,6 +296,20 @@ unsafe fn xor_apply_byte_into_8_regs<const BH: usize, const ODD: bool>(
         let vb1 = vld1q_u8(rb.add((1 ^ BH) * 16));
         let vb2 = vld1q_u8(rb.add((2 ^ BH) * 16));
         let vb3 = vld1q_u8(rb.add((3 ^ BH) * 16));
+        let (va0, va1, va2, va3, vb0, vb1, vb2, vb3) = if ODD {
+            (
+                vextq_u8::<8>(va0, va0),
+                vextq_u8::<8>(va1, va1),
+                vextq_u8::<8>(va2, va2),
+                vextq_u8::<8>(va3, va3),
+                vextq_u8::<8>(vb0, vb0),
+                vextq_u8::<8>(vb1, vb1),
+                vextq_u8::<8>(vb2, vb2),
+                vextq_u8::<8>(vb3, vb3),
+            )
+        } else {
+            (va0, va1, va2, va3, vb0, vb1, vb2, vb3)
+        };
         *da0 = veorq_u8(*da0, va0);
         *da1 = veorq_u8(*da1, va1);
         *da2 = veorq_u8(*da2, va2);
@@ -346,7 +327,6 @@ unsafe fn xor_apply_byte_into_8_regs<const BH: usize, const ODD: bool>(
 #[inline(always)]
 unsafe fn fused_apply_one_k<const K: i32>(
     table_base: *const u8,
-    half_swapped_table_base: *const u8,
     a_row: *const u8,
     b_row: *const u8,
     acc0_lo: &mut core::arch::aarch64::uint16x8_t,
@@ -376,7 +356,6 @@ unsafe fn fused_apply_one_k<const K: i32>(
         // b = 1..7: XOR with table row[bytes[b]], permuted per (BH, ODD).
         xor_apply_byte_into_8_regs::<0, true>(
             table_base,
-            half_swapped_table_base,
             *a_row.add(1),
             *b_row.add(1),
             &mut da0,
@@ -390,7 +369,6 @@ unsafe fn fused_apply_one_k<const K: i32>(
         );
         xor_apply_byte_into_8_regs::<1, false>(
             table_base,
-            half_swapped_table_base,
             *a_row.add(2),
             *b_row.add(2),
             &mut da0,
@@ -404,7 +382,6 @@ unsafe fn fused_apply_one_k<const K: i32>(
         );
         xor_apply_byte_into_8_regs::<1, true>(
             table_base,
-            half_swapped_table_base,
             *a_row.add(3),
             *b_row.add(3),
             &mut da0,
@@ -418,7 +395,6 @@ unsafe fn fused_apply_one_k<const K: i32>(
         );
         xor_apply_byte_into_8_regs::<2, false>(
             table_base,
-            half_swapped_table_base,
             *a_row.add(4),
             *b_row.add(4),
             &mut da0,
@@ -432,7 +408,6 @@ unsafe fn fused_apply_one_k<const K: i32>(
         );
         xor_apply_byte_into_8_regs::<2, true>(
             table_base,
-            half_swapped_table_base,
             *a_row.add(5),
             *b_row.add(5),
             &mut da0,
@@ -446,7 +421,6 @@ unsafe fn fused_apply_one_k<const K: i32>(
         );
         xor_apply_byte_into_8_regs::<3, false>(
             table_base,
-            half_swapped_table_base,
             *a_row.add(6),
             *b_row.add(6),
             &mut da0,
@@ -460,7 +434,6 @@ unsafe fn fused_apply_one_k<const K: i32>(
         );
         xor_apply_byte_into_8_regs::<3, true>(
             table_base,
-            half_swapped_table_base,
             *a_row.add(7),
             *b_row.add(7),
             &mut da0,
@@ -506,7 +479,6 @@ pub(crate) fn shift_reduce_inner_ab_fused_neon(
 
     let byte_base_b = chunk_byte_base + b_med * N_CHUNKS * 8;
     let table_base = inv_table.data_ptr();
-    let half_swapped_table_base = inv_table.half_swapped_data_ptr();
 
     unsafe {
         let mut acc0_lo = vdupq_n_u16(0);
@@ -525,7 +497,6 @@ pub(crate) fn shift_reduce_inner_ab_fused_neon(
                 let off = byte_base_b + $k * N_CHUNKS;
                 fused_apply_one_k::<$k>(
                     table_base,
-                    half_swapped_table_base,
                     a_packed.as_ptr().add(off),
                     b_packed.as_ptr().add(off),
                     &mut acc0_lo,

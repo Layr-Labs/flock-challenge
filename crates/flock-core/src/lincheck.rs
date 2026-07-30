@@ -448,38 +448,22 @@ pub enum VerifyError {
 /// Standard "doubling-in-half" construction: `O(2^d)` F128 muls, no
 /// inversions. Indexing is LSB-first — `bit_j(i)` is the `j`-th LSB of `i`.
 pub fn build_eq_table(point: &[F128]) -> Vec<F128> {
-    use rayon::prelude::*;
-
     let d = point.len();
-    // Every slot is written by the level that first exposes it before it can
-    // be read at a later level.
-    let mut out = crate::alloc_uninit_f128_vec(1usize << d);
-    out[0] = F128::ONE;
-    const PAR_THRESHOLD: usize = 1 << 12;
+    let mut out: Vec<F128> = Vec::with_capacity(1usize << d);
+    out.push(F128::ONE);
     for j in 0..d {
         let r_j = point[j];
+        let one_plus_r_j = F128::ONE + r_j;
         let len = 1usize << j;
-        let (lo, rest) = out.split_at_mut(len);
-        let hi = &mut rest[..len];
+        out.resize(2 * len, F128::ZERO);
         // For each existing entry i ∈ [0, len), produce two children:
-        //   hi[i] = v * r_j              ← new bit_j = 1
-        //   lo[i] = v * (1 + r_j)
-        //         = v + hi[i]             ← new bit_j = 0
-        // The distributive identity saves one field multiplication per pair.
-        let build_pair = |lo_i: &mut F128, hi_i: &mut F128| {
-            let v = *lo_i;
-            let vr = v * r_j;
-            *hi_i = vr;
-            *lo_i = v + vr;
-        };
-        if len < PAR_THRESHOLD {
-            lo.iter_mut()
-                .zip(hi.iter_mut())
-                .for_each(|(lo_i, hi_i)| build_pair(lo_i, hi_i));
-        } else {
-            lo.par_iter_mut()
-                .zip(hi.par_iter_mut())
-                .for_each(|(lo_i, hi_i)| build_pair(lo_i, hi_i));
+        //   out[i]       *= (1 + r_j)     ← new bit_j = 0
+        //   out[i + len]  = out[i] * r_j  ← new bit_j = 1
+        // Forward iteration is safe: the [i] and [i+len] slots are disjoint.
+        for i in 0..len {
+            let v = out[i];
+            out[i + len] = v * r_j;
+            out[i] = v * one_plus_r_j;
         }
     }
     out
@@ -676,12 +660,7 @@ pub fn partial_fold_packed_z_fast_padded(
 /// Larger ⇒ the length-`k` accumulator is re-streamed fewer times
 /// (`n_stripes / NEON_TILE_T`), but the per-tile sum tables grow
 /// `NEON_TILE_T × 4 KB` and must stay L1-resident.
-///
-/// **Single source of truth.** The dispatch gate ([`n_log_ok_for_tile`]) and
-/// the kernels' actual tiling factor MUST agree — the kernels take `TILE_T`
-/// as a const generic and the public entry points instantiate them with this
-/// constant, so the pairing is correct by construction.
-pub(crate) const NEON_TILE_T: usize = 8;
+const NEON_TILE_T: usize = 8;
 
 /// Dispatch helper: pick the fastest single-matrix partial fold available
 /// for the given (m, k_log). Threads `useful_bits` through so the kernel

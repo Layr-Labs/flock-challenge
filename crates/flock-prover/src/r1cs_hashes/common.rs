@@ -240,12 +240,15 @@ where
     // (one memset per 8-block group), so the ~192 MB zero-fill scales with the
     // thread count instead of running serially on the main thread before the
     // parallel build. The per-block builders OR 1-bits into pre-zeroed words,
-    // so each group must be zeroed before its `per_block` calls. `z_lincheck`
-    // stays `vec![0u8; _]` (lazy `alloc_zeroed`/mmap — no eager memset).
+    // so each group must be zeroed before its `per_block` calls.
     let mut z = flock_core::scratch::take_f128(total_f128);
     let mut a = flock_core::scratch::take_f128(total_f128);
     let mut b = flock_core::scratch::take_f128(total_f128);
-    let mut z_lincheck = vec![0u8; (n_total / 8) * k];
+    // Reuse the previous prove's resident byte stripe from a bounded pool.
+    // The parallel zip covers all n_total/8 stripes and the transpose loop
+    // writes u64_per_block * 64 == k bytes in every stripe before the vector
+    // is returned or read, so stale contents never affect the witness.
+    let mut z_lincheck = flock_core::scratch::take_u8((n_total / 8) * k);
 
     z.par_chunks_mut(8 * f128_per_block)
         .zip(a.par_chunks_mut(8 * f128_per_block))
