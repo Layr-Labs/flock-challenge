@@ -136,8 +136,14 @@ pub fn prove_ligerito<Ch: Challenger>(
     let z_packed_lincheck = pack_z_lincheck_from_packed(&z_packed, r1cs.m, r1cs.k_log);
 
     let padding = r1cs.padding_spec();
-    let (zc_proof, zc_claim, s_hat_v_c) = zerocheck::prove_packed_padded_capture_s_hat_v_c(
-        a_packed, b_packed, c_packed, r1cs.m, &padding, challenger,
+    let (zc_proof, zc_claim, s_hat_v_c) = zerocheck::prove_packed_padded_capture_s_hat_v_c_linear(
+        a_packed,
+        b_packed,
+        c_packed,
+        r1cs.m,
+        &padding,
+        r1cs.linear_b_med_windows(),
+        challenger,
     );
 
     let x_ab = r1cs.x_ab_from_mlv(zc_claim.z, &zc_claim.mlv_challenges);
@@ -359,8 +365,14 @@ pub fn prove_fast_core_with_codeword<Ch: Challenger>(
                 z_packed.len() * core::mem::size_of::<F128>(),
             )
         };
-        zerocheck::prove_packed_padded_capture_s_hat_v_c(
-            a_packed, b_packed, c_packed, r1cs.m, &padding, challenger,
+        zerocheck::prove_packed_padded_capture_s_hat_v_c_linear(
+            a_packed,
+            b_packed,
+            c_packed,
+            r1cs.m,
+            &padding,
+            r1cs.linear_b_med_windows(),
+            challenger,
         )
     };
     // Nothing downstream reads a/b (zerocheck consumed them in rounds 1–2);
@@ -494,8 +506,14 @@ pub fn prove_fast_ligerito_timed<Ch: Challenger>(
                 z_packed.len() * core::mem::size_of::<F128>(),
             )
         };
-        zerocheck::prove_packed_padded_capture_s_hat_v_c(
-            a_packed, b_packed, c_packed, r1cs.m, &padding, challenger,
+        zerocheck::prove_packed_padded_capture_s_hat_v_c_linear(
+            a_packed,
+            b_packed,
+            c_packed,
+            r1cs.m,
+            &padding,
+            r1cs.linear_b_med_windows(),
+            challenger,
         )
     };
     t.zerocheck_s = t0.elapsed().as_secs_f64();

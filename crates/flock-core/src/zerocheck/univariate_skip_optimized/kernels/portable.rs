@@ -110,3 +110,40 @@ pub(super) fn accumulate_convert_with_s_hat_v(
         partial_c_1[lane] += converted_c_1 * eq_lo_val;
     }
 }
+
+#[allow(clippy::too_many_arguments)]
+#[cfg(not(target_arch = "aarch64"))]
+pub(super) fn accumulate_convert_with_linear_b_med_and_s_hat_v(
+    chunk_ab_bytes: &[[u8; 64]; 16],
+    chunk_c_bytes: &[[u8; 64]; 16],
+    n_b_med: usize,
+    linear_b_med_mask: u16,
+    convert: &[F128],
+    eq_lo_val: F128,
+    partial_ab: &mut [F128; 64],
+    partial_ab_linear_s: &mut [F128; 64],
+    partial_c_0: &mut [F128; 64],
+    partial_c_1: &mut [F128; 64],
+) {
+    for lane in 0..64 {
+        let mut converted_ab = F128::ZERO;
+        let mut converted_ab_linear_s = F128::ZERO;
+        let mut converted_c_0 = F128::ZERO;
+        let mut converted_c_1 = F128::ZERO;
+        for b_med in 0..n_b_med {
+            let table_base = b_med * 256;
+            let c = chunk_c_bytes[b_med][lane] as usize;
+            if linear_b_med_mask & (1 << b_med) != 0 {
+                converted_ab_linear_s += convert[table_base + c];
+            } else {
+                converted_ab += convert[table_base + chunk_ab_bytes[b_med][lane] as usize];
+            }
+            converted_c_0 += convert[table_base + (c & 0x55)];
+            converted_c_1 += convert[table_base + (c & 0xaa)];
+        }
+        partial_ab[lane] += converted_ab * eq_lo_val;
+        partial_ab_linear_s[lane] += converted_ab_linear_s * eq_lo_val;
+        partial_c_0[lane] += converted_c_0 * eq_lo_val;
+        partial_c_1[lane] += converted_c_1 * eq_lo_val;
+    }
+}

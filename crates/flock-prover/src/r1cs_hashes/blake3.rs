@@ -1957,6 +1957,15 @@ mod tests {
     }
 
     #[test]
+    fn padding_marks_constant_b_windows() {
+        let r1cs = build_block_r1cs(6);
+        let windows = r1cs.linear_b_med_windows();
+
+        assert_eq!(windows[0].count_ones() + windows[1].count_ones(), 2);
+        assert_eq!(windows, [0b11, 0]);
+    }
+
+    #[test]
     fn mutated_witness_fails() {
         let mut rng = Rng::new(0xBEEF_F00D);
         let cv: [u32; 8] = std::array::from_fn(|_| rng.next_u32());

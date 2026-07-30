@@ -235,3 +235,50 @@ pub(super) fn accumulate_convert_with_s_hat_v(
         partial_c_1,
     );
 }
+
+#[allow(clippy::too_many_arguments)]
+#[inline]
+pub(super) fn accumulate_convert_with_linear_b_med_and_s_hat_v(
+    chunk_ab_bytes: &[[u8; 64]; 16],
+    chunk_c_bytes: &[[u8; 64]; 16],
+    n_b_med: usize,
+    linear_b_med_mask: u16,
+    convert: &[super::F128],
+    eq_lo_val: super::F128,
+    partial_ab: &mut [super::F128; 64],
+    partial_ab_linear_s: &mut [super::F128; 64],
+    partial_c_0: &mut [super::F128; 64],
+    partial_c_1: &mut [super::F128; 64],
+) {
+    #[cfg(target_arch = "aarch64")]
+    // SAFETY: aarch64 statically guarantees NEON and the fixed arrays cover
+    // all table-selected loads.
+    unsafe {
+        aarch64::accumulate_convert_with_linear_b_med_and_s_hat_v(
+            chunk_ab_bytes,
+            chunk_c_bytes,
+            n_b_med,
+            linear_b_med_mask,
+            convert,
+            eq_lo_val,
+            partial_ab,
+            partial_ab_linear_s,
+            partial_c_0,
+            partial_c_1,
+        );
+    }
+
+    #[cfg(not(target_arch = "aarch64"))]
+    portable::accumulate_convert_with_linear_b_med_and_s_hat_v(
+        chunk_ab_bytes,
+        chunk_c_bytes,
+        n_b_med,
+        linear_b_med_mask,
+        convert,
+        eq_lo_val,
+        partial_ab,
+        partial_ab_linear_s,
+        partial_c_0,
+        partial_c_1,
+    );
+}
