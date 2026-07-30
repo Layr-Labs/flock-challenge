@@ -154,6 +154,24 @@ pub struct ProverData {
     pub merkle_tree: Vec<Hash>,
 }
 
+#[derive(Clone, Copy)]
+struct SendHashPtr(*mut Hash);
+
+// SAFETY: the wrapper is used only to give parallel NTT finish callbacks
+// disjoint leaf-hash ranges, one range per uniquely indexed NTT chunk.
+unsafe impl Send for SendHashPtr {}
+unsafe impl Sync for SendHashPtr {}
+
+impl SendHashPtr {
+    /// # Safety
+    /// The caller must keep the backing allocation live and guarantee that
+    /// concurrent calls use disjoint, in-bounds ranges.
+    unsafe fn slice_mut(self, offset: usize, len: usize) -> &'static mut [Hash] {
+        // SAFETY: upheld by the caller as described above.
+        unsafe { core::slice::from_raw_parts_mut(self.0.add(offset), len) }
+    }
+}
+
 // Recycle the codeword buffer (the prover's largest single allocation —
 // 128 MB at m = 29) through the scratch pool instead of unmapping it.
 impl Drop for ProverData {
@@ -262,42 +280,61 @@ pub(crate) fn replicate_message_fill(codeword: &mut [F128], msg: &[F128]) {
 fn finalize_commit(mut codeword: Vec<F128>, params: &PcsParams) -> (Commitment, ProverData) {
     let timing = std::env::var_os("FLOCK_COMMIT_TIMING").is_some();
     let t_ntt = std::time::Instant::now();
+    let leaf_size = params.leaf_size_bytes();
+    let num_leaves = params.n_leaves();
+    let total_nodes = 2 * num_leaves - 1;
+    let mut leaves = Vec::<Hash>::with_capacity(total_nodes);
+    // SAFETY: Hash is Copy and has no destructor. Each leaf slot is written by
+    // exactly one joined finish callback before the vector is read.
+    unsafe {
+        leaves.set_len(num_leaves);
+    }
+    let leaf_ptr = SendHashPtr(leaves.as_mut_ptr());
     // ---- Interleaved forward additive NTT: 2^log_batch_size independent
     // sub-NTTs with shared twiddles. Each sub-NTT operates on its lane of the
     // SoA buffer. The first `log_inv_rate` layers were pre-applied by the
-    // caller's replicate-fill (commit_into), so start past them.
+    // caller's replicate-fill (commit_into), so start past them. Hash each
+    // completed cache-resident deep chunk before it leaves the worker's cache;
+    // this avoids a separate full-codeword leaf scan after the NTT.
     let ntt = AdditiveNttF128::standard(params.k_code());
-    ntt.forward_transform_interleaved_from_layer(
+    ntt.forward_transform_interleaved_from_layer_with_finish(
         &mut codeword,
         params.num_ntts(),
         params.log_inv_rate,
+        |chunk_idx, chunk| {
+            // SAFETY: F128 is repr(C) with two contiguous u64 fields and no
+            // padding, so this is the same byte view used by the old full scan.
+            let bytes = unsafe {
+                core::slice::from_raw_parts(
+                    chunk.as_ptr() as *const u8,
+                    std::mem::size_of_val(chunk),
+                )
+            };
+            let chunk_leaves = bytes.len() / leaf_size;
+            let leaf_offset = chunk_idx * chunk_leaves;
+            debug_assert!(leaf_offset + chunk_leaves <= num_leaves);
+            // SAFETY: NTT chunk indices are unique, all chunks have equal
+            // power-of-two length, and the NTT call joins before `leaves` is
+            // used, so these in-bounds output ranges are disjoint and live.
+            let out = unsafe { leaf_ptr.slice_mut(leaf_offset, chunk_leaves) };
+            merkle::hash_leaves_chunk_into(bytes, leaf_size, out, params.merkle_hash);
+        },
     );
     if timing {
         eprintln!(
-            "[commit-timing] ntt: {:.2} ms",
+            "[commit-timing] ntt + leaf hash: {:.2} ms",
             t_ntt.elapsed().as_secs_f64() * 1e3
         );
     }
     let t_merkle = std::time::Instant::now();
 
-    // ---- Merkle commitment: one leaf per codeword position = num_ntts F128.
-    // Zero-copy: cast the codeword Vec<F128> directly to &[u8]. F128 is
-    // repr(C, align(16)) with two u64s laid out little-endian — same bytes
-    // as the explicit lo.to_le_bytes() + hi.to_le_bytes() serialization.
-    let codeword_bytes: &[u8] = unsafe {
-        core::slice::from_raw_parts(
-            codeword.as_ptr() as *const u8,
-            codeword.len() * core::mem::size_of::<F128>(),
-        )
-    };
-    // Initial tree: one leaf per codeword position, each containing the
-    // row-batch lanes (num_ntts F_{2^128} values = 2^log_batch_size). This is
-    // Ligerito's L0 commitment.
-    let merkle_tree = merkle::merkle_tree(codeword_bytes, params.n_leaves(), params.merkle_hash);
+    // ---- Merkle parents. Leaf hashes already occupy their final flat-tree
+    // ranges; extend into the reserved tail for parent levels.
+    let merkle_tree = merkle::merkle_tree_from_leaves(leaves, params.merkle_hash);
     let root = *merkle_tree.last().expect("merkle tree non-empty");
     if timing {
         eprintln!(
-            "[commit-timing] merkle: {:.2} ms",
+            "[commit-timing] merkle parents: {:.2} ms",
             t_merkle.elapsed().as_secs_f64() * 1e3
         );
     }

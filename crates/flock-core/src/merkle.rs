@@ -462,6 +462,59 @@ fn hash_leaves(data: &[u8], leaf_size: usize, out: &mut [Hash], kind: HashKind) 
     }
 }
 
+/// Hash one cache-resident run of equal-sized leaves without a nested Rayon
+/// dispatch. The caller is expected to provide outer parallelism.
+pub(crate) fn hash_leaves_chunk_into(
+    data: &[u8],
+    leaf_size: usize,
+    out: &mut [Hash],
+    kind: HashKind,
+) {
+    assert!(leaf_size > 0);
+    assert_eq!(data.len(), out.len() * leaf_size);
+
+    #[cfg(feature = "hash-count")]
+    {
+        use std::sync::atomic::Ordering::Relaxed;
+        hash_count::LEAF_CALLS.fetch_add(out.len() as u64, Relaxed);
+        hash_count::LEAF_COMPRESSIONS.fetch_add(
+            out.len() as u64 * hash_count::blocks(kind, leaf_size),
+            Relaxed,
+        );
+    }
+
+    match kind {
+        HashKind::Blake3 if blake3_leaf_size_is_batchable(leaf_size) => {
+            let batched = blake3_hash_many_leaves(data, leaf_size, out);
+            debug_assert!(batched);
+        }
+        HashKind::Blake3 => {
+            for (hash, leaf) in out.iter_mut().zip(data.chunks(leaf_size)) {
+                *hash = blake3_leaf_cv(leaf);
+            }
+        }
+        HashKind::Sha256 => {
+            for (outs, leaves) in out.chunks_mut(4).zip(data.chunks(4 * leaf_size)) {
+                if outs.len() == 4 {
+                    sha256_hash4(
+                        [
+                            &leaves[..leaf_size],
+                            &leaves[leaf_size..2 * leaf_size],
+                            &leaves[2 * leaf_size..3 * leaf_size],
+                            &leaves[3 * leaf_size..],
+                        ],
+                        outs,
+                    );
+                } else {
+                    for (out, leaf) in outs.iter_mut().zip(leaves.chunks(leaf_size)) {
+                        *out = Sha256::digest(leaf).into();
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// Nodes per rayon task in the batched BLAKE3 paths: enough to amortize task
 /// dispatch over many `hash_many` calls, small enough to stay cache-resident.
 const BLAKE3_GROUP: usize = 1024;
@@ -565,6 +618,33 @@ pub fn merkle_tree(data: &[u8], num_leaves: usize, kind: HashKind) -> Vec<Hash> 
     hash_leaves(data, leaf_size, &mut tree[..num_leaves], kind);
 
     // 2. Internal levels — parallel within a level, sequential across levels.
+    hash_parent_levels(&mut tree, num_leaves, kind);
+    tree
+}
+
+/// Build a full flat Merkle tree from leaf hashes already computed in order.
+///
+/// If `leaves` has spare capacity for the complete tree, this reuses its
+/// allocation and writes internal nodes into the uninitialized tail.
+pub(crate) fn merkle_tree_from_leaves(mut leaves: Vec<Hash>, kind: HashKind) -> Vec<Hash> {
+    let num_leaves = leaves.len();
+    assert!(
+        num_leaves.is_power_of_two() && num_leaves > 0,
+        "num_leaves must be power of 2"
+    );
+    let total_nodes = 2 * num_leaves - 1;
+    leaves.reserve_exact(total_nodes - num_leaves);
+    // SAFETY: Hash is Copy and has no destructor. Every newly exposed slot is
+    // written by `hash_parent_levels` before it is read.
+    unsafe {
+        leaves.set_len(total_nodes);
+    }
+    hash_parent_levels(&mut leaves, num_leaves, kind);
+    leaves
+}
+
+fn hash_parent_levels(tree: &mut [Hash], num_leaves: usize, kind: HashKind) {
+    debug_assert_eq!(tree.len(), 2 * num_leaves - 1);
     let mut read_start = 0usize;
     let mut read_len = num_leaves;
     while read_len > 1 {
@@ -579,8 +659,6 @@ pub fn merkle_tree(data: &[u8], num_leaves: usize, kind: HashKind) -> Vec<Hash> 
         read_start += read_len;
         read_len = next_len;
     }
-
-    tree
 }
 
 /// Sequential (single-threaded) version of [`merkle_tree`]. Used for
@@ -817,6 +895,38 @@ mod tests {
     /// multi-proof logic is hash-agnostic, so anything true of one must hold
     /// for the other.
     const KINDS: [HashKind; 2] = [HashKind::Sha256, HashKind::Blake3];
+
+    #[test]
+    fn chunked_prehashed_tree_matches_direct_tree() {
+        let num_leaves = 32;
+        let leaf_size = 1024;
+        let data: Vec<u8> = (0..num_leaves * leaf_size)
+            .map(|i| (i as u8).wrapping_mul(29).wrapping_add(17))
+            .collect();
+
+        for kind in KINDS {
+            let expected = merkle_tree(&data, num_leaves, kind);
+            let mut leaves = Vec::<Hash>::with_capacity(2 * num_leaves - 1);
+            // SAFETY: all leaf slots are filled by the four chunk calls below
+            // before the vector is read.
+            unsafe {
+                leaves.set_len(num_leaves);
+            }
+            for chunk_idx in 0..4 {
+                let leaf_start = chunk_idx * 8;
+                let byte_start = leaf_start * leaf_size;
+                hash_leaves_chunk_into(
+                    &data[byte_start..byte_start + 8 * leaf_size],
+                    leaf_size,
+                    &mut leaves[leaf_start..leaf_start + 8],
+                    kind,
+                );
+            }
+
+            let actual = merkle_tree_from_leaves(leaves, kind);
+            assert_eq!(actual, expected, "{kind}");
+        }
+    }
 
     #[test]
     fn two_leaves_matches_hand_computation() {

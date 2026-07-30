@@ -280,6 +280,50 @@ impl AdditiveNttF128 {
         }
     }
 
+    /// Forward interleaved NTT and invoke `finish` once for each cache-resident
+    /// deep-layer chunk immediately after that chunk is complete.
+    ///
+    /// The callback observes disjoint chunks in position order, but calls may
+    /// run concurrently. On scalar targets it is called once with the complete
+    /// transformed buffer.
+    pub(crate) fn forward_transform_interleaved_from_layer_with_finish<F>(
+        &self,
+        data: &mut [F128],
+        num_ntts: usize,
+        start_layer: usize,
+        finish: F,
+    ) where
+        F: Fn(usize, &[F128]) + Sync,
+    {
+        assert!(num_ntts.is_power_of_two() && num_ntts > 0);
+        let n_total = data.len();
+        assert_eq!(n_total % num_ntts, 0);
+        let log_d = log2_pow2(n_total / num_ntts);
+        assert!(log_d <= self.log_domain_size());
+        assert!(start_layer <= log_d);
+
+        #[cfg(any(
+            all(target_arch = "aarch64", target_feature = "aes"),
+            all(target_arch = "x86_64", target_feature = "pclmulqdq"),
+        ))]
+        {
+            self.forward_transform_interleaved_parallel_from_layer_with_finish(
+                data,
+                num_ntts,
+                start_layer,
+                finish,
+            );
+        }
+        #[cfg(not(any(
+            all(target_arch = "aarch64", target_feature = "aes"),
+            all(target_arch = "x86_64", target_feature = "pclmulqdq"),
+        )))]
+        {
+            self.forward_transform_interleaved_scalar_from_layer(data, num_ntts, start_layer);
+            finish(0, data);
+        }
+    }
+
     /// Scalar reference for the interleaved forward NTT.
     pub fn forward_transform_interleaved_scalar(&self, data: &mut [F128], num_ntts: usize) {
         self.forward_transform_interleaved_scalar_from_layer(data, num_ntts, 0);
@@ -348,6 +392,27 @@ impl AdditiveNttF128 {
         num_ntts: usize,
         start_layer: usize,
     ) {
+        self.forward_transform_interleaved_parallel_from_layer_with_finish(
+            data,
+            num_ntts,
+            start_layer,
+            |_, _| {},
+        );
+    }
+
+    #[cfg(any(
+        all(target_arch = "aarch64", target_feature = "aes"),
+        all(target_arch = "x86_64", target_feature = "pclmulqdq"),
+    ))]
+    fn forward_transform_interleaved_parallel_from_layer_with_finish<F>(
+        &self,
+        data: &mut [F128],
+        num_ntts: usize,
+        start_layer: usize,
+        finish: F,
+    ) where
+        F: Fn(usize, &[F128]) + Sync,
+    {
         use rayon::prelude::*;
         let n_total = data.len();
         let log_d = log2_pow2(n_total / num_ntts);
@@ -387,6 +452,7 @@ impl AdditiveNttF128 {
         };
         if n_top == 0 || log_d < 8 {
             self.forward_transform_interleaved_scalar_from_layer(data, num_ntts, start_layer);
+            finish(0, data);
             return;
         }
 
@@ -527,6 +593,7 @@ impl AdditiveNttF128 {
                         butterfly_interleaved_block(block, twiddle, block_size_half, num_ntts);
                     }
                 }
+                finish(sub_idx, sub_data);
             });
     }
 
@@ -999,6 +1066,7 @@ fn log2_pow2(n: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
 
     struct Rng(u64);
     impl Rng {
@@ -1022,6 +1090,45 @@ mod tests {
 
     fn rand_vec(rng: &mut Rng, n: usize) -> Vec<F128> {
         (0..n).map(|_| rng.f128()).collect()
+    }
+
+    #[cfg(any(
+        all(target_arch = "aarch64", target_feature = "aes"),
+        all(target_arch = "x86_64", target_feature = "pclmulqdq"),
+    ))]
+    #[test]
+    fn finish_callback_covers_transformed_chunks_in_order() {
+        let mut rng = Rng::new(0x510e_527f);
+        let log_d = 12;
+        let num_ntts = 8;
+        let ntt = AdditiveNttF128::standard(log_d);
+        let mut data = rand_vec(&mut rng, (1usize << log_d) * num_ntts);
+        let snapshots = Mutex::new(Vec::<(usize, Vec<F128>)>::new());
+
+        ntt.forward_transform_interleaved_from_layer_with_finish(
+            &mut data,
+            num_ntts,
+            1,
+            |chunk_idx, chunk| {
+                snapshots.lock().unwrap().push((chunk_idx, chunk.to_vec()));
+            },
+        );
+
+        let mut snapshots = snapshots.into_inner().unwrap();
+        snapshots.sort_unstable_by_key(|(chunk_idx, _)| *chunk_idx);
+        assert!(
+            snapshots.len() > 1,
+            "test geometry did not reach the cache-blocked deep phase"
+        );
+        let rebuilt: Vec<F128> = snapshots
+            .into_iter()
+            .enumerate()
+            .flat_map(|(expected_idx, (chunk_idx, chunk))| {
+                assert_eq!(chunk_idx, expected_idx);
+                chunk
+            })
+            .collect();
+        assert_eq!(rebuilt, data);
     }
 
     /// The parallel interleaved transform — whose top layers use the radix-8
