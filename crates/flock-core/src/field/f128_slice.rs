@@ -91,6 +91,29 @@ pub(crate) fn fold_two_and_msg(
     unsafe { aarch64::fold_two_and_msg(f, b, base, nf, nb, r) }
 }
 
+/// AArch64 fused kernel for two consecutive Ligerito folds plus the direct
+/// and one-round-lookahead messages. The lookahead lets the prover preserve
+/// Fiat-Shamir order without materializing the intermediate half-sized state.
+#[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+#[inline]
+pub(crate) fn fold2_two_and_msgs(
+    f: &[F128],
+    b: &[F128],
+    base: usize,
+    wf: &mut [F128],
+    wb: &mut [F128],
+    r_a: F128,
+    r_b: F128,
+) -> (F128, F128, [F128; 6]) {
+    assert_eq!(f.len(), b.len());
+    assert_eq!(wf.len(), wb.len());
+    assert!(base.is_multiple_of(4));
+    assert!(wf.len().is_multiple_of(4));
+    assert!(4 * (base + wf.len()) <= f.len());
+    // SAFETY: cfg supplies PMULL; the checks establish bounds and alignment.
+    unsafe { aarch64::fold2_two_and_msgs(f, b, base, wf, wb, r_a, r_b) }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

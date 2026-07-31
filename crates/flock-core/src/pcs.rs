@@ -137,6 +137,7 @@ pub fn open_batch_mixed_ligerito_with_precomputed_s_hat_v<Ch: Challenger>(
         padding,
         challenger,
         trace,
+        ligerito::ranked_fold2_enabled(packed_witness.len(), lig_config.initial_k),
     );
 
     let t = std::time::Instant::now();
@@ -148,6 +149,7 @@ pub fn open_batch_mixed_ligerito_with_precomputed_s_hat_v<Ch: Challenger>(
         &prover_data.codeword,
         &prover_data.merkle_tree,
         combined.round0_prime,
+        combined.round1_lookahead,
         challenger,
     );
     if trace {
@@ -175,6 +177,58 @@ struct CombinedClaim {
     /// Round-0 sumcheck `(u_0, u_2)` prime over `packed_witness · b_combined`,
     /// consumed by `recursive_prover_with_basis_precomputed_round0`.
     round0_prime: (F128, F128),
+    /// Round-1 message as two quadratics in the first fold challenge. Present
+    /// only for the exact ranked two-challenge cadence.
+    round1_lookahead: Option<[F128; 6]>,
+}
+
+/// Compute the ordinary round-zero message and the following message as two
+/// quadratics in the first challenge. The latter lets the ranked prover sample
+/// its second challenge before binding the first, so both binds share one pass.
+#[inline]
+fn round0_and_round1_lookahead(witness: &[F128], basis: &[F128]) -> ((F128, F128), [F128; 6]) {
+    assert_eq!(witness.len(), basis.len());
+    assert!(witness.len().is_multiple_of(4));
+    let mut u0 = F128::ZERO;
+    let mut u2 = F128::ZERO;
+    let mut c = [F128::ZERO; 6];
+    for i in (0..witness.len()).step_by(4) {
+        let a0 = witness[i];
+        let a1 = witness[i + 1];
+        let a2 = witness[i + 2];
+        let a3 = witness[i + 3];
+        let b0 = basis[i];
+        let b1 = basis[i + 1];
+        let b2 = basis[i + 2];
+        let b3 = basis[i + 3];
+        let sa0 = a0 + a1;
+        let sb0 = b0 + b1;
+        let sa1 = a2 + a3;
+        let sb1 = b2 + b3;
+        let p_even0 = a0 * b0;
+        let p_sum0 = sa0 * sb0;
+        u0 += p_even0 + a2 * b2;
+        u2 += p_sum0 + sa1 * sb1;
+        c[0] += p_even0;
+        // Karatsuba cross term: a0*sb0 + b0*sa0 equals
+        // a1*b1 + (a0*b0) + (sa0*sb0). The endpoint products are already
+        // live for c0/c2, so this costs one product instead of two.
+        c[1] += a1 * b1 + p_even0 + p_sum0;
+        c[2] += p_sum0;
+        let e_a = a0 + a2;
+        let e_b = b0 + b2;
+        let se_a = sa0 + sa1;
+        let se_b = sb0 + sb1;
+        let p_even = e_a * e_b;
+        let p_sum = se_a * se_b;
+        // Same identity for the even/odd grouped pair. Here the complementary
+        // endpoint is (a1+a3, b1+b3).
+        let p_odd = (se_a + e_a) * (se_b + e_b);
+        c[3] += p_even;
+        c[4] += p_odd + p_even + p_sum;
+        c[5] += p_sum;
+    }
+    ((u0, u2), c)
 }
 
 /// Exact ranked shape for the heterogeneous combined-basis queue. The gate is
@@ -233,6 +287,47 @@ where
         })
 }
 
+/// Lookahead-bearing sibling of [`run_hetero_open_combine_blocks`]. Kept
+/// separate so `FLOCK_NO_LIG_FOLD2` executes the frontier's exact pair-only
+/// allocation, worker closure, and reduction path.
+fn run_hetero_open_combine_blocks_lookahead<S, I, F>(
+    out: &mut [F128],
+    block_len: usize,
+    init: I,
+    fold_block: F,
+) -> (F128, F128, [F128; 6])
+where
+    I: Fn() -> S + Sync,
+    F: Fn(&mut S, usize, &mut [F128]) -> (F128, F128, [F128; 6]) + Sync,
+{
+    assert!(block_len > 0 && out.len().is_multiple_of(block_len));
+    let n_blocks = out.len() / block_len;
+    let mut partials = vec![(F128::ZERO, F128::ZERO, [F128::ZERO; 6]); n_blocks];
+    let out_base = crate::epool::SyncPtr(out.as_mut_ptr());
+    let partials_base = crate::epool::SyncPtr(partials.as_mut_ptr());
+    crate::epool::run_hetero_chunks_stateful(n_blocks, init, |state, block| {
+        // SAFETY: as above, each claimed queue index owns one disjoint output
+        // block and one partial slot until the synchronous two-pool join.
+        unsafe {
+            let out_block =
+                core::slice::from_raw_parts_mut(out_base.ptr().add(block * block_len), block_len);
+            partials_base
+                .ptr()
+                .add(block)
+                .write(fold_block(state, block, out_block));
+        }
+    });
+    partials.into_iter().fold(
+        (F128::ZERO, F128::ZERO, [F128::ZERO; 6]),
+        |(x0, x2, mut xc), (y0, y2, yc)| {
+            for (x, y) in xc.iter_mut().zip(yc) {
+                *x += y;
+            }
+            (x0 + y0, x2 + y2, xc)
+        },
+    )
+}
+
 /// Runs ring_switch over RS claims, observes packed-direct claim values +
 /// samples their gammas, then builds `b_combined` (the γ-weighted linear
 /// combination of all `rs_eq_ind`s and `eq_ind`s) and `target_combined`.
@@ -247,6 +342,7 @@ fn compute_combined_basis_and_target<Ch: Challenger>(
     padding: &PaddingSpec,
     challenger: &mut Ch,
     trace: bool,
+    enable_fold2: bool,
 ) -> CombinedClaim {
     let n_rs = x_outers.len();
     let n_pd = packed_direct.len();
@@ -371,7 +467,8 @@ fn compute_combined_basis_and_target<Ch: Challenger>(
     let use_fast =
         !rs_deferred.is_empty() && rs_deferred.len() == rs_results.len() && pd_dense.is_empty();
 
-    let (mut round0_u0, mut round0_u2) = if use_fast {
+    let want_round1_lookahead = use_fast && enable_fold2;
+    let (mut round0_u0, mut round0_u2, round1_lookahead) = if use_fast {
         let b = rs_deferred[0].0.len(); // eq_lo.len(); shared across claims (same split)
         debug_assert!(b >= 2 && b.is_multiple_of(2));
         debug_assert!(rs_deferred.iter().all(|d| d.0.len() == b));
@@ -390,7 +487,7 @@ fn compute_combined_basis_and_target<Ch: Challenger>(
         // sweep: the table build wouldn't amortize below ~2^12 slots.
         const COMPOSE_MIN_BLOCK: usize = 1 << 12;
         let composed = b >= COMPOSE_MIN_BLOCK;
-        let fold_block = |ctable: &mut Vec<F128>, hi: usize, out_block: &mut [F128]| {
+        let fill_block = |ctable: &mut Vec<F128>, hi: usize, out_block: &mut [F128]| {
             // Accumulate each claim's block: first claim writes, rest add.
             // `e_hi` is folded into the composed table once per claim per
             // block, then swept over eq_lo with no per-slot multiply.
@@ -417,6 +514,9 @@ fn compute_combined_basis_and_target<Ch: Challenger>(
                     }
                 }
             }
+        };
+        let fold_pair_block = |ctable: &mut Vec<F128>, hi: usize, out_block: &mut [F128]| {
+            fill_block(ctable, hi, out_block);
             // Round-0 prime over this block's pairs (b is even, base is even).
             // Keep this separate from the last claim's streaming store: the
             // pairwise stepping variant is slower even though it removes a pass.
@@ -433,6 +533,14 @@ fn compute_combined_basis_and_target<Ch: Challenger>(
             }
             (u0, u2)
         };
+        let fold_lookahead_block = |ctable: &mut Vec<F128>, hi: usize, out_block: &mut [F128]| {
+            fill_block(ctable, hi, out_block);
+            let base = hi * b;
+            debug_assert!(b.is_multiple_of(4));
+            let ((u0, u2), lookahead) =
+                round0_and_round1_lookahead(&packed_witness[base..base + b], out_block);
+            (u0, u2, lookahead)
+        };
         let init_ctable = || {
             if composed {
                 vec![F128::ZERO; ring_switch::FOLD_TABLE_LEN]
@@ -441,30 +549,56 @@ fn compute_combined_basis_and_target<Ch: Challenger>(
             }
         };
 
-        if use_ranked_hetero_open_combine(l, b, n_rs, n_pd) {
-            // The 10 P-core Rayon workers and four utility-QoS E-core workers
-            // drain one shared queue. Each worker keeps one private 64 KiB
-            // composed table across all of its claims; an E-core can hold the
-            // join behind by at most one 512 KiB block.
-            run_hetero_open_combine_blocks(
-                &mut b_combined,
-                b,
-                init_ctable,
-                |ctable, hi, out_block| fold_block(ctable, hi, out_block),
-            )
-        } else {
-            // Exact opt-out/general schedule: retain Rayon `map_init`, including
-            // its folder-local composed-table reuse and parallel reduction.
-            b_combined
-                .par_chunks_mut(b)
-                .enumerate()
-                .map_init(init_ctable, |ctable, (hi, out_block)| {
-                    fold_block(ctable, hi, out_block)
-                })
-                .reduce(
-                    || (F128::ZERO, F128::ZERO),
-                    |(x0, x2), (y0, y2)| (x0 + y0, x2 + y2),
+        let ranked_hetero = use_ranked_hetero_open_combine(l, b, n_rs, n_pd);
+        if want_round1_lookahead {
+            let fast = if ranked_hetero {
+                run_hetero_open_combine_blocks_lookahead(
+                    &mut b_combined,
+                    b,
+                    init_ctable,
+                    |ctable, hi, out_block| fold_lookahead_block(ctable, hi, out_block),
                 )
+            } else {
+                b_combined
+                    .par_chunks_mut(b)
+                    .enumerate()
+                    .map_init(init_ctable, |ctable, (hi, out_block)| {
+                        fold_lookahead_block(ctable, hi, out_block)
+                    })
+                    .reduce(
+                        || (F128::ZERO, F128::ZERO, [F128::ZERO; 6]),
+                        |(x0, x2, mut xc), (y0, y2, yc)| {
+                            for (x, y) in xc.iter_mut().zip(yc) {
+                                *x += y;
+                            }
+                            (x0 + y0, x2 + y2, xc)
+                        },
+                    )
+            };
+            (fast.0, fast.1, Some(fast.2))
+        } else {
+            // Exact opt-out: retain the frontier's pair-only worker payload,
+            // allocation, map_init ownership, and reduction.
+            let fast = if ranked_hetero {
+                run_hetero_open_combine_blocks(
+                    &mut b_combined,
+                    b,
+                    init_ctable,
+                    |ctable, hi, out_block| fold_pair_block(ctable, hi, out_block),
+                )
+            } else {
+                b_combined
+                    .par_chunks_mut(b)
+                    .enumerate()
+                    .map_init(init_ctable, |ctable, (hi, out_block)| {
+                        fold_pair_block(ctable, hi, out_block)
+                    })
+                    .reduce(
+                        || (F128::ZERO, F128::ZERO),
+                        |(x0, x2), (y0, y2)| (x0 + y0, x2 + y2),
+                    )
+            };
+            (fast.0, fast.1, None)
         }
     } else {
         // General path (mixed / sparse / packed-direct): materialize any
@@ -511,8 +645,9 @@ fn compute_combined_basis_and_target<Ch: Challenger>(
         for v in materialized {
             crate::scratch::give_f128(v);
         }
-        prime
+        (prime.0, prime.1, None)
     };
+    let mut round1_lookahead = round1_lookahead;
     let fold_ms = t_fold.elapsed().as_secs_f64() * 1e3;
     let t_sparse = std::time::Instant::now();
     let mut adjust_prime_for_delta = |idx: usize, delta: F128| {
@@ -526,6 +661,7 @@ fn compute_combined_basis_and_target<Ch: Challenger>(
     };
     for (_, output) in rs_results.iter() {
         if let ring_switch::RsEqInd::Sparse { entries, .. } = &output.rs_eq_ind {
+            round1_lookahead = None;
             for &(idx, val) in entries {
                 b_combined[idx] += val;
                 adjust_prime_for_delta(idx, val);
@@ -534,6 +670,7 @@ fn compute_combined_basis_and_target<Ch: Challenger>(
     }
     for (pd, g) in packed_direct.iter().zip(gammas_pd.iter()) {
         if let DirectEqInd::Sparse(eq) = &pd.eq_ind {
+            round1_lookahead = None;
             // Scatter-add the sparse claim and fold its round-0 prime
             // contribution in the SAME pass (O(live positions)), instead of a
             // full O(L) re-pass over b_combined. The prime is linear in
@@ -572,6 +709,7 @@ fn compute_combined_basis_and_target<Ch: Challenger>(
         b_combined,
         target_combined,
         round0_prime: (round0_u0, round0_u2),
+        round1_lookahead,
     }
 }
 
@@ -906,6 +1044,44 @@ mod tests {
         }
         assert_eq!(got, expected);
         assert_eq!(got_uv, expected_uv);
+    }
+
+    #[test]
+    fn round1_lookahead_matches_materialized_fold() {
+        let mut rng = Rng::new(0xF01D_2001);
+        for log_n in [4usize, 9, 13] {
+            let n = 1usize << log_n;
+            let witness: Vec<F128> = (0..n).map(|_| rng.f128()).collect();
+            let basis: Vec<F128> = (0..n).map(|_| rng.f128()).collect();
+            let r = rng.f128();
+            let ((u0, u2), c) = round0_and_round1_lookahead(&witness, &basis);
+
+            let mut oracle0 = (F128::ZERO, F128::ZERO);
+            for i in (0..n).step_by(2) {
+                oracle0.0 += witness[i] * basis[i];
+                oracle0.1 += (witness[i] + witness[i + 1]) * (basis[i] + basis[i + 1]);
+            }
+            assert_eq!((u0, u2), oracle0, "round zero at log_n={log_n}");
+
+            let one_plus_r = F128::ONE + r;
+            let folded_witness: Vec<F128> = witness
+                .chunks_exact(2)
+                .map(|p| p[0] * one_plus_r + p[1] * r)
+                .collect();
+            let folded_basis: Vec<F128> = basis
+                .chunks_exact(2)
+                .map(|p| p[0] * one_plus_r + p[1] * r)
+                .collect();
+            let mut oracle1 = (F128::ZERO, F128::ZERO);
+            for i in (0..folded_witness.len()).step_by(2) {
+                oracle1.0 += folded_witness[i] * folded_basis[i];
+                oracle1.1 += (folded_witness[i] + folded_witness[i + 1])
+                    * (folded_basis[i] + folded_basis[i + 1]);
+            }
+            let r2 = r * r;
+            let evaluated = (c[0] + c[1] * r + c[2] * r2, c[3] + c[4] * r + c[5] * r2);
+            assert_eq!(evaluated, oracle1, "round one at log_n={log_n}");
+        }
     }
 
     fn zhat_skip_reference(z: &[bool], m: usize, z_skip: F128, x_outer: &[F128]) -> F128 {
