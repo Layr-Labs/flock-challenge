@@ -2254,12 +2254,6 @@ pub struct RingSwitchBatchOutput {
     pub rs_eq_ind: RsEqInd,
     pub sumcheck_claim: F128,
     pub(crate) direct_fold2: Option<DirectFold2Factors>,
-    /// Ranked deferred-C: the ordinary claim's direct-fold2 factor bundle
-    /// (same shape as [`DirectFold2Factors`] but `products` zeroed — C's
-    /// round-0/1 message contribution comes from pcs's combine sweep, not
-    /// from `messages_from_direct_products`). Lets pcs skip materializing
-    /// `b_combined` and fold C 4:1 directly at materialize time.
-    pub(crate) deferred_c_fold2: Option<DirectFold2Factors>,
 }
 
 /// Sparse-or-dense representation of `rs_eq_ind`. All variants here have γ_k
@@ -2578,14 +2572,7 @@ pub fn prove_batched_padded_with_precomputed<Ch: Challenger>(
     let dense_splits: Vec<(Vec<F128>, Vec<F128>)> = if use_split {
         dense_suffixes
             .iter()
-            .enumerate()
-            .map(|(d, s)| {
-                if has_precomputed(dense_to_orig[d]) {
-                    (Vec::new(), Vec::new())
-                } else {
-                    build_eq_split(s, split_n_lo(s.len()))
-                }
-            })
+            .map(|s| build_eq_split(s, split_n_lo(s.len())))
             .collect()
     } else {
         Vec::new()
@@ -2749,17 +2736,6 @@ pub fn prove_batched_padded_with_precomputed<Ch: Challenger>(
     // fold output is γ_k · B_k directly. pcs combine just adds.
     let gammas_rs: Vec<F128> = (0..n).map(|_| challenger.sample_f128()).collect();
 
-    // Deferred-C precondition: the exact ranked open shape — two dense split
-    // claims at L = 2^25 where claim 0 is four-bank (AB) and claim 1 is
-    // ordinary (C). Anything else keeps the incumbent outputs untouched.
-    let has_quad: Vec<bool> = work.iter().map(|w| w.s_hat_v_quad.is_some()).collect();
-    let deferred_c_enabled = n == 2
-        && l == (1usize << 25)
-        && use_split
-        && has_quad[0]
-        && !has_quad[1]
-        && std::env::var_os("FLOCK_NO_OPEN_DEFERRED_C").is_none();
-
     let results: Vec<(RingSwitchProof, RingSwitchBatchOutput)> = work
         .into_iter()
         .zip(gammas_rs.iter())
@@ -2796,29 +2772,6 @@ pub fn prove_batched_padded_with_precomputed<Ch: Challenger>(
                         low_eq,
                         table: table.clone(),
                         products,
-                    })
-                }
-                _ => None,
-            };
-            // Mirrors the AB bundle above minus `products` (zeroed): C's
-            // message contribution flows through pcs's combine sweep.
-            let deferred_c_fold2 = match kinds[i] {
-                Kind::Dense(d)
-                    if deferred_c_enabled && i == 1 && dense_suffixes[d].len() >= 2 =>
-                {
-                    let suffix = dense_suffixes[d];
-                    let low_eq: [F128; 4] = build_eq(&suffix[..2])
-                        .try_into()
-                        .expect("two-coordinate eq has four entries");
-                    let tail = &suffix[2..];
-                    let (eq_lo, eq_hi) =
-                        build_eq_split(tail, deferred_split_n_lo(tail.len()));
-                    Some(DirectFold2Factors {
-                        eq_lo,
-                        eq_hi,
-                        low_eq,
-                        table: table.clone(),
-                        products: [F128::ZERO; 16],
                     })
                 }
                 _ => None,
@@ -2864,7 +2817,6 @@ pub fn prove_batched_padded_with_precomputed<Ch: Challenger>(
                     rs_eq_ind,
                     sumcheck_claim: w.sumcheck_claim,
                     direct_fold2,
-                    deferred_c_fold2,
                 },
             )
         })

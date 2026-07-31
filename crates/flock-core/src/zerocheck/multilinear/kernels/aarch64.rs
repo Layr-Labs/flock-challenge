@@ -551,53 +551,13 @@ pub(crate) fn fold_and_message_aarch64(
     b_out: &mut [F128],
     r_fold: F128,
     eq_lo: &[F128],
-    nt_stores: bool,
 ) -> (F128, F128) {
-    // `nt_stores` is decided once per round by the driver (round output past
-    // LLC size ⇒ ping-pong writes not read until the next barrier ⇒ `stnp`
-    // elides the write-allocate RFO reads; small rounds keep normal stores so
-    // LLC-resident outputs stay hot). Per-chunk callers must not decide this
-    // from their sub-slice length.
-    if nt_stores {
-        fold_and_message_body::<true>(a_in, b_in, a_out, b_out, r_fold, eq_lo)
-    } else {
-        fold_and_message_body::<false>(a_in, b_in, a_out, b_out, r_fold, eq_lo)
-    }
-}
-
-#[inline(always)]
-fn fold_and_message_body<const NT: bool>(
-    a_in: &[F128],
-    b_in: &[F128],
-    a_out: &mut [F128],
-    b_out: &mut [F128],
-    r_fold: F128,
-    eq_lo: &[F128],
-) -> (F128, F128) {
-    use core::arch::aarch64::uint64x2_t;
-
     debug_assert_eq!(a_in.len(), 2 * a_out.len());
     debug_assert_eq!(b_in.len(), 2 * b_out.len());
     debug_assert_eq!(a_out.len(), 2 * eq_lo.len());
 
-    #[inline(always)]
-    unsafe fn store_pair_nt(dst: *mut F128, x: uint64x2_t, y: uint64x2_t) {
-        unsafe {
-            core::arch::asm!(
-                "stnp {x:q}, {y:q}, [{dst}]",
-                dst = in(reg) dst,
-                x = in(vreg) x,
-                y = in(vreg) y,
-                options(nostack, preserves_flags),
-            );
-        }
-    }
-
     let mut p1_acc = F256Unreduced::ZERO;
     let mut pinf_acc = F256Unreduced::ZERO;
-
-    let a_out_ptr = a_out.as_mut_ptr();
-    let b_out_ptr = b_out.as_mut_ptr();
 
     for (x_lo, &eq_l) in eq_lo.iter().enumerate() {
         let i = 4 * x_lo;
@@ -617,29 +577,10 @@ fn fold_and_message_body<const NT: bool>(
         let b0 = b_even_0 + r_fold * (b_even_0 + b_odd_0);
         let b1 = b_even_1 + r_fold * (b_even_1 + b_odd_1);
 
-        if NT {
-            // SAFETY: `o + 1 < a_out.len()` by the len contract above; F128
-            // is repr(C, align(16)) two u64s, bit-compatible with uint64x2_t;
-            // each 32-byte pair store is 16-byte aligned and lands in this
-            // iteration's disjoint output slots.
-            unsafe {
-                store_pair_nt(
-                    a_out_ptr.add(o),
-                    core::mem::transmute::<F128, uint64x2_t>(a0),
-                    core::mem::transmute::<F128, uint64x2_t>(a1),
-                );
-                store_pair_nt(
-                    b_out_ptr.add(o),
-                    core::mem::transmute::<F128, uint64x2_t>(b0),
-                    core::mem::transmute::<F128, uint64x2_t>(b1),
-                );
-            }
-        } else {
-            a_out[o] = a0;
-            a_out[o + 1] = a1;
-            b_out[o] = b0;
-            b_out[o + 1] = b1;
-        }
+        a_out[o] = a0;
+        a_out[o + 1] = a1;
+        b_out[o] = b0;
+        b_out[o + 1] = b1;
 
         p1_acc ^= eq_l.mul_unreduced(a1 * b1);
         pinf_acc ^= eq_l.mul_unreduced((a0 + a1) * (b0 + b1));

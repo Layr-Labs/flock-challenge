@@ -1668,14 +1668,31 @@ impl Blake3Setup {
         Vec<flock_core::field::F128>,
         Vec<u8>,
     ) {
-        match self.r1cs.layout {
+        let timing = std::env::var_os("FLOCK_WITNESS_TIMING").is_some();
+        let t0 = timing.then(std::time::Instant::now);
+        let witness = match self.r1cs.layout {
             flock_core::r1cs::WitnessLayout::RowMajor => {
                 generate_witness_with_ab_packed_and_lincheck(blocks, self.n_blocks_log())
             }
             flock_core::r1cs::WitnessLayout::BatchMajor => {
                 generate_witness_batch_major(blocks, self.n_blocks_log())
             }
+        };
+        if let Some(t0) = t0 {
+            let (z, a, b, lincheck) = &witness;
+            eprintln!(
+                "[witness] generate={:.2} ms output_mib={:.2} z={} a={} b={} lincheck={}",
+                t0.elapsed().as_secs_f64() * 1e3,
+                ((z.len() + a.len() + b.len()) * std::mem::size_of::<F128>()
+                    + lincheck.len()) as f64
+                    / (1024.0 * 1024.0),
+                z.len(),
+                a.len(),
+                b.len(),
+                lincheck.len(),
+            );
         }
+        witness
     }
 
     /// The benchmark's exact row-major rate-1/2 geometry. Other sizes, rates,

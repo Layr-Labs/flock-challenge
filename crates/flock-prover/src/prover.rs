@@ -394,25 +394,67 @@ fn commit_with_round1_ab_precompute(
     debug_assert_eq!(k_skip, 6, "ranked protocol fixes k_skip=6");
     let inv_table = flock_core::ntt::InvNttTableByteSingleGf8::cached_standard_k6();
 
-    rayon::join(
-        || match commit_codeword {
-            CommitCodeword::Allocate => pcs::commit(z_packed, pcs_params),
-            CommitCodeword::NeedsReplication(buf) => pcs::commit_into(z_packed, pcs_params, buf),
-            CommitCodeword::Preinitialized(buf) => {
-                pcs::commit_preinitialized(z_packed, buf, pcs_params)
-            }
-        },
-        || {
-            zerocheck::univariate_skip_optimized::precompute_round1_ab_inner_packed_padded(
-                a_packed,
-                b_packed,
-                pcs_params.m,
-                k_skip,
-                inv_table,
-                padding,
-            )
-        },
-    )
+    // Optional join-arm split (stderr): phase `commit_s` is wall(max of arms),
+    // so FLOCK_COMMIT_TIMING alone cannot attribute the phase gap.
+    let join_timing = std::env::var_os("FLOCK_JOIN_TIMING").is_some();
+    if join_timing {
+        let t_join = std::time::Instant::now();
+        let ((pcs, pcs_ms), (ab, ab_ms)) = rayon::join(
+            || {
+                let t0 = std::time::Instant::now();
+                let r = match commit_codeword {
+                    CommitCodeword::Allocate => pcs::commit(z_packed, pcs_params),
+                    CommitCodeword::NeedsReplication(buf) => {
+                        pcs::commit_into(z_packed, pcs_params, buf)
+                    }
+                    CommitCodeword::Preinitialized(buf) => {
+                        pcs::commit_preinitialized(z_packed, buf, pcs_params)
+                    }
+                };
+                (r, t0.elapsed().as_secs_f64() * 1e3)
+            },
+            || {
+                let t0 = std::time::Instant::now();
+                let r = zerocheck::univariate_skip_optimized::precompute_round1_ab_inner_packed_padded(
+                    a_packed,
+                    b_packed,
+                    pcs_params.m,
+                    k_skip,
+                    inv_table,
+                    padding,
+                );
+                (r, t0.elapsed().as_secs_f64() * 1e3)
+            },
+        );
+        let wall_ms = t_join.elapsed().as_secs_f64() * 1e3;
+        let slower = if pcs_ms >= ab_ms { "pcs" } else { "ab" };
+        eprintln!(
+            "[join-timing] pcs_commit: {pcs_ms:.2} ms | ab_precompute: {ab_ms:.2} ms | join_wall: {wall_ms:.2} ms | bottleneck={slower}"
+        );
+        (pcs, ab)
+    } else {
+        rayon::join(
+            || match commit_codeword {
+                CommitCodeword::Allocate => pcs::commit(z_packed, pcs_params),
+                CommitCodeword::NeedsReplication(buf) => {
+                    pcs::commit_into(z_packed, pcs_params, buf)
+                }
+                CommitCodeword::Preinitialized(buf) => {
+                    pcs::commit_preinitialized(z_packed, buf, pcs_params)
+                }
+            },
+            || {
+                zerocheck::univariate_skip_optimized::precompute_round1_ab_inner_packed_padded(
+                    a_packed,
+                    b_packed,
+                    pcs_params.m,
+                    k_skip,
+                    inv_table,
+                    padding,
+                )
+            },
+        )
+    }
 }
 
 /// Run commit → bind → zerocheck → lincheck and build the base claims, stopping
@@ -675,12 +717,19 @@ fn prove_fast_ligerito_timed_with_commit_codeword<Ch: Challenger>(
 ) -> (R1csProofLigerito, Commitment, R1csClaim, ProvePhaseTimings) {
     use std::time::Instant;
     let mut t = ProvePhaseTimings::default();
+    // The five public phase clocks intentionally surround the heavy kernels,
+    // but leave a few setup/transcript/materialization gaps between them.
+    // Opt-in telemetry keeps those gaps visible without perturbing ordinary
+    // proving or changing the benchmark-facing timing API.
+    let glue_timing = std::env::var_os("FLOCK_GLUE_TIMING").is_some();
+    let setup_t0 = glue_timing.then(Instant::now);
 
     let lig_config = pcs_params
         .ligerito_prover_config()
         .expect("Ligerito default config; bump m for tiny instances");
 
     let padding = r1cs.padding_spec();
+    let setup_ms = setup_t0.map_or(0.0, |t0| t0.elapsed().as_secs_f64() * 1e3);
 
     // --- PCS commit + challenge-independent zerocheck AB preprocessing ---
     let t0 = Instant::now();
@@ -693,7 +742,9 @@ fn prove_fast_ligerito_timed_with_commit_codeword<Ch: Challenger>(
         commit_codeword,
     );
     t.commit_s = t0.elapsed().as_secs_f64();
+    let bind_t0 = glue_timing.then(Instant::now);
     bind_statement(challenger, r1cs, &commitment);
+    let bind_ms = bind_t0.map_or(0.0, |t0| t0.elapsed().as_secs_f64() * 1e3);
 
     // --- zerocheck ---
     let t0 = Instant::now();
@@ -721,10 +772,12 @@ fn prove_fast_ligerito_timed_with_commit_codeword<Ch: Challenger>(
         )
     };
     t.zerocheck_s = t0.elapsed().as_secs_f64();
+    let post_zc_t0 = glue_timing.then(Instant::now);
     flock_core::scratch::give_f128(a_packed_f128);
     flock_core::scratch::give_f128(b_packed_f128);
 
     let x_ab = r1cs.x_ab_from_mlv(zc_claim.z, &zc_claim.mlv_challenges);
+    let post_zc_ms = post_zc_t0.map_or(0.0, |t0| t0.elapsed().as_secs_f64() * 1e3);
 
     // --- lincheck + base-claim / s_hat_v setup ---
     let t0 = Instant::now();
@@ -778,11 +831,19 @@ fn prove_fast_ligerito_timed_with_commit_codeword<Ch: Challenger>(
     );
     t.open_s = t0.elapsed().as_secs_f64();
 
+    let materialize_t0 = glue_timing.then(Instant::now);
     let proof = R1csProofLigerito {
         zerocheck: zc_proof,
         lincheck: lc_proof,
         pcs_open,
     };
     let claim = R1csClaim { ab, c };
+    if let Some(t0) = materialize_t0 {
+        let materialize_ms = t0.elapsed().as_secs_f64() * 1e3;
+        eprintln!(
+            "[glue-timing] setup={setup_ms:.3} ms | bind_statement={bind_ms:.3} ms | post_zc={post_zc_ms:.3} ms | materialize={materialize_ms:.3} ms | total={:.3} ms",
+            setup_ms + bind_ms + post_zc_ms + materialize_ms,
+        );
+    }
     (proof, commitment, claim, t)
 }

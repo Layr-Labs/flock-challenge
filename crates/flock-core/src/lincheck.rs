@@ -1296,19 +1296,17 @@ fn prove_padded_inner<Ch: Challenger>(
     //    consistency checks v_a, v_b into a single sumcheck.
     let alpha = challenger.sample_f128();
 
-    // 1b. Constant-wire pin challenge β. There are no transcript observes
-    // between the α and β samples, so sampling it now is byte-identical to
-    // the serial path and makes the two independent computations below safe
-    // to overlap.
-    let beta_pin: Option<(usize, F128)> = circuit
+    // 2–3. The α-comb and the partial outer fold are independent once α has
+    // been sampled. The constant-wire β is also independent of both (there
+    // are no challenger observations between α and β), so sample it now and
+    // overlap the cache-resident circuit walk with the bandwidth-bound stripe
+    // fold. Sampling β before the pure computations is transcript-exact: the
+    // challenger state is unchanged between the two sample calls in the
+    // original serial schedule.
+    let beta = circuit
         .const_pin_col()
-        .map(|col| (col, challenger.sample_f128()));
-
-    // Build the circuit comb and the packed-witness partial fold concurrently.
-    // The former is compute/cache-resident while the latter is bandwidth
-    // dominated. FLOCK_NO_LINCHECK_JOIN restores the exact serial scheduling
-    // for same-binary A/B measurement.
-    let comb_branch = || {
+        .map(|_| challenger.sample_f128());
+    let build_comb = || {
         let t = if trace {
             Some(std::time::Instant::now())
         } else {
@@ -1335,12 +1333,12 @@ fn prove_padded_inner<Ch: Challenger>(
                 t.elapsed().as_secs_f64() * 1e3
             );
         }
-        if let Some((col, beta)) = beta_pin {
-            comb_vec[col] += beta;
+        if let Some(col) = circuit.const_pin_col() {
+            comb_vec[col] += beta.expect("const pin sampled before comb");
         }
         comb_vec
     };
-    let z_branch = || {
+    let build_z = || {
         let t = if trace {
             Some(std::time::Instant::now())
         } else {
@@ -1358,9 +1356,9 @@ fn prove_padded_inner<Ch: Challenger>(
         z_vec
     };
     let (mut comb_vec, mut z_vec) = if std::env::var_os("FLOCK_NO_LINCHECK_JOIN").is_some() {
-        (comb_branch(), z_branch())
+        (build_comb(), build_z())
     } else {
-        rayon::join(comb_branch, z_branch)
+        rayon::join(build_comb, build_z)
     };
     // 3b. Optional capture: clone the pre-sumcheck z_vec for downstream reuse
     //     (PCS open's AB-claim s_hat_v skipping fold_1b_rows). Only pay the

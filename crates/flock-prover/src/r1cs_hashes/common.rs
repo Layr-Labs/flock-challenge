@@ -345,6 +345,8 @@ where
     );
 
     let total_f128 = n_total * f128_per_block;
+    let timing = std::env::var_os("FLOCK_WITNESS_TIMING").is_some();
+    let alloc_start = timing.then(std::time::Instant::now);
     assert_eq!(
         rate2_codeword.is_some(),
         EMIT_RATE2_CODEWORD,
@@ -369,12 +371,13 @@ where
     let mut a = flock_core::scratch::take_f128(total_f128);
     let mut b = flock_core::scratch::take_f128(total_f128);
     let mut z_lincheck = flock_core::scratch::take_u8((n_total / 8) * k);
+    let alloc_elapsed = alloc_start.map(|start| start.elapsed());
+    let fill_start = timing.then(std::time::Instant::now);
 
     z.par_chunks_mut(8 * f128_per_block)
         .zip(a.par_chunks_mut(8 * f128_per_block))
         .zip(b.par_chunks_mut(8 * f128_per_block))
         .zip(z_lincheck.par_chunks_mut(k))
-        .with_max_len(256)
         .enumerate()
         .for_each(|(g, (((z_grp, a_grp), b_grp), stripe))| {
             // Ordinary per-block builders OR 1-bits into pre-zeroed words; any
@@ -473,6 +476,19 @@ where
                 }
             }
         });
+
+    if let Some(fill_start) = fill_start {
+        let fill_s = fill_start.elapsed().as_secs_f64();
+        let output_bytes =
+            3 * total_f128 * std::mem::size_of::<F128>() + z_lincheck.len();
+        eprintln!(
+            "[witness-driver] alloc={:.2} ms fill={:.2} ms output_mib={:.2} fill_gib_s={:.2}",
+            alloc_elapsed.expect("timed allocation").as_secs_f64() * 1e3,
+            fill_s * 1e3,
+            output_bytes as f64 / (1024.0 * 1024.0),
+            output_bytes as f64 / fill_s / (1024.0 * 1024.0 * 1024.0),
+        );
+    }
 
     (z, a, b, z_lincheck)
 }
