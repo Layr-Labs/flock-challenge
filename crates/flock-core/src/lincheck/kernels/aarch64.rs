@@ -1,4 +1,5 @@
 use super::super::{F128, NEON_TILE_T, build_sum_table};
+use crate::bits::transpose_8_u64s_to_64_bytes;
 
 // The SHA3 extension includes EOR3; retain the two-EOR form for generic
 // AArch64 builds that do not enable it.
@@ -411,6 +412,27 @@ pub fn partial_fold_packed_z_neon_oblock_padded(
     oblock_padded_tiled::<NEON_TILE_T>(z_packed, m, k_log, useful_bits, eq_outer)
 }
 
+/// Outer-partitioned partial fold from the commitment's row-major packed z.
+/// Each owned outer stripe reads one u64 from each of its eight consecutive
+/// blocks, reconstructs the legacy stripe's 64 bytes locally, and immediately
+/// feeds the same table-lookup accumulator kernel.
+#[cfg(target_arch = "aarch64")]
+pub fn partial_fold_row_major_z_neon_oblock_padded(
+    z_row_major: &[F128],
+    m: usize,
+    k_log: usize,
+    useful_bits: usize,
+    eq_outer: &[F128],
+) -> Vec<F128> {
+    row_major_oblock_padded_tiled::<NEON_TILE_T>(
+        z_row_major,
+        m,
+        k_log,
+        useful_bits,
+        eq_outer,
+    )
+}
+
 #[cfg(target_arch = "aarch64")]
 pub(crate) fn oblock_padded_tiled<const TILE_T: usize>(
     z_packed: &[u8],
@@ -446,63 +468,47 @@ pub(crate) fn oblock_padded_tiled<const TILE_T: usize>(
         return vec![F128::ZERO; k];
     }
 
-    // Contiguous tile claims drained through the two-pool chunk queue (the
-    // shape promoted across zerocheck rounds 1–2, the top-NTT passes, and
-    // Merkle hashing). This fold is the right side of the queue's selection
-    // rule: it is load-port/L1-gather bound (≈38 GB/s at the ranked shape),
-    // not DRAM-bound, so efficiency-core claims add real throughput instead
-    // of join-tail latency, and there is exactly one join per prove. Each
-    // claim owns a contiguous tile band, builds each of its tile tables
-    // exactly once (the property that makes oblock beat iblock), and
-    // accumulates into its own private length-k partial. The partial backing
-    // is allocated uninitialized: every claim zeroes exactly its own slot
-    // before its first accumulate, so there is no up-front 16 MiB fault pass
-    // and first-touch lands on whichever core does the work.
-    const TILES_PER_CLAIM: usize = 64;
-    let n_claims = n_tiles.div_ceil(TILES_PER_CLAIM);
-    let mut partials = crate::alloc_uninit_f128_vec(n_claims * k);
-    let partials_base = crate::epool::SyncPtr(partials.as_mut_ptr());
-    crate::epool::run_hetero_chunks(n_claims, |c| {
-        let tile_lo = c * TILES_PER_CLAIM;
-        let tile_hi = ((c + 1) * TILES_PER_CLAIM).min(n_tiles);
-        // SAFETY: the queue hands out each claim index exactly once; claim
-        // `c` exclusively owns `partials[c·k .. (c+1)·k]`, which it fully
-        // zero-initializes below before any read. The queue join publishes
-        // all writes before the reduction reads them.
-        let partial = unsafe { std::slice::from_raw_parts_mut(partials_base.ptr().add(c * k), k) };
-        // SAFETY: F128 is Copy and all-zero bytes are valid F128::ZERO.
-        unsafe {
-            std::ptr::write_bytes(partial.as_mut_ptr(), 0, k);
-        }
-        // TILE_T × 256 F128 tables, L1-resident, built once per tile.
-        let mut tables = vec![F128::ZERO; TILE_T * 256];
-        for tile in tile_lo..tile_hi {
-            let stripe_base = tile * TILE_T;
-            for t in 0..TILE_T {
-                let eq_off = 8 * (stripe_base + t);
-                build_sum_table(
-                    &eq_outer[eq_off..eq_off + 8],
-                    &mut tables[t * 256..(t + 1) * 256],
-                );
-            }
-            let tables_ptr = tables.as_ptr() as *const u8;
-            let z_base = unsafe { z_packed.as_ptr().add(stripe_base * k) };
-            let mut bs = 0usize;
-            while bs < useful {
-                unsafe {
-                    process_block_neon_single::<TILE_T>(
-                        z_base,
-                        k,
-                        bs,
-                        tables_ptr,
-                        partial.as_mut_ptr().add(bs),
+    // One private length-k partial per worker; workers own contiguous tile bands,
+    // so each tile's sum-tables are built exactly once (not once per worker).
+    let p = rayon::current_num_threads().max(1);
+    let tiles_per_worker = n_tiles.div_ceil(p);
+    let n_workers = n_tiles.div_ceil(tiles_per_worker); // ≤ p, every band non-empty
+
+    let mut partials = vec![F128::ZERO; n_workers * k];
+    partials
+        .par_chunks_mut(k)
+        .enumerate()
+        .for_each(|(w, partial)| {
+            let tile_lo = w * tiles_per_worker;
+            let tile_hi = ((w + 1) * tiles_per_worker).min(n_tiles);
+            // TILE_T × 256 F128 tables, L1-resident, built once per tile.
+            let mut tables = vec![F128::ZERO; TILE_T * 256];
+            for tile in tile_lo..tile_hi {
+                let stripe_base = tile * TILE_T;
+                for t in 0..TILE_T {
+                    let eq_off = 8 * (stripe_base + t);
+                    build_sum_table(
+                        &eq_outer[eq_off..eq_off + 8],
+                        &mut tables[t * 256..(t + 1) * 256],
                     );
                 }
-                bs += BLOCK_K;
+                let tables_ptr = tables.as_ptr() as *const u8;
+                let z_base = unsafe { z_packed.as_ptr().add(stripe_base * k) };
+                let mut bs = 0usize;
+                while bs < useful {
+                    unsafe {
+                        process_block_neon_single::<TILE_T>(
+                            z_base,
+                            k,
+                            bs,
+                            tables_ptr,
+                            partial.as_mut_ptr().add(bs),
+                        );
+                    }
+                    bs += BLOCK_K;
+                }
             }
-        }
-    });
-    let n_workers = n_claims;
+        });
 
     // XOR-reduce the per-worker partials in ONE parallel pass over column bands:
     // each worker owns a band of the output and XORs it across all `n_workers`
@@ -514,6 +520,117 @@ pub(crate) fn oblock_padded_tiled<const TILE_T: usize>(
     // That is `n_workers - 1` accumulator reads and writes (≈2.5× the traffic
     // here) and 9 barriers instead of 1 at `n_workers = 10`; measured ≈0.7 ms
     // of the fold at m=32, k_log=14.
+    let band = k.div_ceil(rayon::current_num_threads().max(1)).max(1024);
+    let mut out = vec![F128::ZERO; k];
+    out.par_chunks_mut(band).enumerate().for_each(|(bi, dst)| {
+        let lo = bi * band;
+        for w in 0..n_workers {
+            let src = &partials[w * k + lo..w * k + lo + dst.len()];
+            for (o, s) in dst.iter_mut().zip(src.iter()) {
+                *o += *s;
+            }
+        }
+    });
+    out
+}
+
+#[cfg(target_arch = "aarch64")]
+fn row_major_oblock_padded_tiled<const TILE_T: usize>(
+    z_row_major: &[F128],
+    m: usize,
+    k_log: usize,
+    useful_bits: usize,
+    eq_outer: &[F128],
+) -> Vec<F128> {
+    use rayon::prelude::*;
+
+    const BLOCK_K: usize = 8;
+
+    let n_log = m - k_log;
+    let k = 1usize << k_log;
+    let n_outer = 1usize << n_log;
+    assert_eq!(z_row_major.len(), (1usize << m) / 128);
+    assert_eq!(eq_outer.len(), n_outer);
+    assert!(
+        n_log >= 3 + TILE_T.trailing_zeros() as usize,
+        "need n_outer ≥ 8·TILE_T stripes"
+    );
+    assert!(k_log >= 6, "row-major transpose needs k ≥ 64");
+    assert!(useful_bits <= k);
+    let n_stripes = n_outer / 8;
+    assert_eq!(n_stripes % TILE_T, 0);
+    let n_tiles = n_stripes / TILE_T;
+    let useful = (useful_bits.div_ceil(BLOCK_K) * BLOCK_K).min(k);
+    if useful == 0 {
+        return vec![F128::ZERO; k];
+    }
+
+    let z_u64 = unsafe {
+        std::slice::from_raw_parts(z_row_major.as_ptr() as *const u64, z_row_major.len() * 2)
+    };
+    let u64_per_block = k / 64;
+    let useful_words = useful.div_ceil(64);
+    let p = rayon::current_num_threads().max(1);
+    let tiles_per_worker = n_tiles.div_ceil(p);
+    let n_workers = n_tiles.div_ceil(tiles_per_worker);
+
+    let mut partials = vec![F128::ZERO; n_workers * k];
+    partials
+        .par_chunks_mut(k)
+        .enumerate()
+        .for_each(|(w, partial)| {
+            let tile_lo = w * tiles_per_worker;
+            let tile_hi = ((w + 1) * tiles_per_worker).min(n_tiles);
+            let mut tables = vec![F128::ZERO; TILE_T * 256];
+            // At TILE_T=8 this is 512 bytes. It replaces, rather than caches,
+            // the corresponding fragments of the 512 MiB global stripe.
+            let mut stripe_fragments = [[0u8; 64]; TILE_T];
+            for tile in tile_lo..tile_hi {
+                let stripe_base = tile * TILE_T;
+                for t in 0..TILE_T {
+                    let eq_off = 8 * (stripe_base + t);
+                    build_sum_table(
+                        &eq_outer[eq_off..eq_off + 8],
+                        &mut tables[t * 256..(t + 1) * 256],
+                    );
+                }
+                let tables_ptr = tables.as_ptr() as *const u8;
+                for word in 0..useful_words {
+                    for (t, fragment) in stripe_fragments.iter_mut().enumerate() {
+                        let outer0 = 8 * (stripe_base + t);
+                        let lanes = [
+                            z_u64[outer0 * u64_per_block + word],
+                            z_u64[(outer0 + 1) * u64_per_block + word],
+                            z_u64[(outer0 + 2) * u64_per_block + word],
+                            z_u64[(outer0 + 3) * u64_per_block + word],
+                            z_u64[(outer0 + 4) * u64_per_block + word],
+                            z_u64[(outer0 + 5) * u64_per_block + word],
+                            z_u64[(outer0 + 6) * u64_per_block + word],
+                            z_u64[(outer0 + 7) * u64_per_block + word],
+                        ];
+                        transpose_8_u64s_to_64_bytes(&lanes, fragment);
+                    }
+
+                    let word_base = word * 64;
+                    let word_end = useful.min(word_base + 64);
+                    let mut bs = word_base;
+                    while bs < word_end {
+                        unsafe {
+                            process_block_neon_single::<TILE_T>(
+                                stripe_fragments.as_ptr() as *const u8,
+                                64,
+                                bs - word_base,
+                                tables_ptr,
+                                partial.as_mut_ptr().add(bs),
+                            );
+                        }
+                        bs += BLOCK_K;
+                    }
+                }
+            }
+        });
+
+    // Match the stripe kernel's deterministic worker-index reduction exactly.
     let band = k.div_ceil(rayon::current_num_threads().max(1)).max(1024);
     let mut out = vec![F128::ZERO; k];
     out.par_chunks_mut(band).enumerate().for_each(|(bi, dst)| {

@@ -2,7 +2,7 @@
 //! modules (`sha2`, `blake3`, `keccak`). The shared `prove_fast`
 //! orchestration lives in [`crate::prover::prove_fast_from_witness`].
 
-use std::sync::OnceLock;
+use std::sync::{LazyLock, OnceLock};
 
 use flock_core::bits::transpose_8_u64s_to_64_bytes;
 use flock_core::field::F128;
@@ -231,6 +231,7 @@ where
         k_log,
         1usize << k_log,
         None,
+        true,
         per_block,
     )
 }
@@ -258,6 +259,7 @@ where
         k_log,
         useful_bits,
         None,
+        true,
         per_block,
     )
 }
@@ -275,6 +277,26 @@ impl Rate2CodewordPtr {
         self.0
     }
 }
+
+#[derive(Clone, Copy)]
+struct LincheckStripePtr(*mut u8);
+// SAFETY: when the stripe is enabled, group `g` exclusively owns
+// `stripe[g * k..(g + 1) * k]`. The parallel iterator joins before the
+// original vector is used again.
+unsafe impl Send for LincheckStripePtr {}
+unsafe impl Sync for LincheckStripePtr {}
+impl LincheckStripePtr {
+    fn get(self) -> *mut u8 {
+        self.0
+    }
+}
+
+/// Exact A/B control for the ranked row-major BLAKE3 path. The default avoids
+/// the full lincheck stripe; setting `FLOCK_RANKED_LINCHECK_STRIPE` before the
+/// first witness build restores the legacy allocation/write/read path for the
+/// lifetime of the process.
+static RANKED_BLAKE3_LEGACY_LINCHECK_STRIPE: LazyLock<bool> =
+    LazyLock::new(|| std::env::var_os("FLOCK_RANKED_LINCHECK_STRIPE").is_some());
 
 /// Full-write row-major witness driver that also emits the exact rate-1/2
 /// pre-NTT codeword `[z, z]`. Each worker copies its completed `z` group into
@@ -295,6 +317,13 @@ pub(crate) fn drive_witness_packed_and_lincheck_full_write_with_rate2_codeword<S
 where
     F: Fn(&S, &mut [u64], &mut [u64], &mut [u64]) + Sync,
 {
+    // This specialization is used only by the exact ranked BLAKE3 rate-1/2
+    // path. Other shapes and architectures retain the stripe. An empty fourth
+    // buffer tells the prover to fold the still-live row-major z directly.
+    let emit_lincheck_stripe = !cfg!(target_arch = "aarch64")
+        || n_blocks_log != 18
+        || k_log != 14
+        || *RANKED_BLAKE3_LEGACY_LINCHECK_STRIPE;
     drive_witness_packed_and_lincheck_impl::<true, true, S, F>(
         initial_states,
         Some(padding),
@@ -302,6 +331,7 @@ where
         k_log,
         useful_bits,
         Some(codeword),
+        emit_lincheck_stripe,
         per_block,
     )
 }
@@ -318,6 +348,7 @@ fn drive_witness_packed_and_lincheck_impl<
     k_log: usize,
     stripe_useful_bits: usize,
     rate2_codeword: Option<&mut [F128]>,
+    emit_lincheck_stripe: bool,
     per_block: F,
 ) -> (Vec<F128>, Vec<F128>, Vec<F128>, Vec<u8>)
 where
@@ -360,22 +391,25 @@ where
     });
     // z/a/b are allocated uninitialized. Ordinary OR-based builders zero each
     // 8-block group inside the parallel loop; full-write builders initialize
-    // every word directly and skip that pass. `z_lincheck` comes from the
-    // scratch byte pool (UNINITIALIZED, possibly stale): the transpose below
-    // writes every byte of every group before anything reads it, and the
-    // caller returns it via `scratch::give_u8` after lincheck so the next
-    // prove reuses resident pages instead of re-faulting 2^(m-3) bytes.
+    // every word directly and skip that pass. The generic/legacy path takes an
+    // uninitialized stripe from the byte pool and overwrites every byte. The
+    // ranked row-major candidate allocates no stripe; lincheck reconstructs
+    // each 64-byte stripe fragment in bounded worker-local storage.
     let mut z = flock_core::scratch::take_f128(total_f128);
     let mut a = flock_core::scratch::take_f128(total_f128);
     let mut b = flock_core::scratch::take_f128(total_f128);
-    let mut z_lincheck = flock_core::scratch::take_u8((n_total / 8) * k);
+    let mut z_lincheck = if emit_lincheck_stripe {
+        flock_core::scratch::take_u8((n_total / 8) * k)
+    } else {
+        Vec::new()
+    };
+    let z_lincheck_ptr = LincheckStripePtr(z_lincheck.as_mut_ptr());
 
     z.par_chunks_mut(8 * f128_per_block)
         .zip(a.par_chunks_mut(8 * f128_per_block))
         .zip(b.par_chunks_mut(8 * f128_per_block))
-        .zip(z_lincheck.par_chunks_mut(k))
         .enumerate()
-        .for_each(|(g, (((z_grp, a_grp), b_grp), stripe))| {
+        .for_each(|(g, ((z_grp, a_grp), b_grp))| {
             // Ordinary per-block builders OR 1-bits into pre-zeroed words; any
             // slot left unbuilt (no padding block) stays zero, which the
             // lincheck transpose below reads correctly. Full-write builders
@@ -427,25 +461,34 @@ where
                 per_block(init, z_u64, a_u64, b_u64);
             }
 
-            // Bit-transpose 8 z chunks into the lincheck stripe.
-            let z_u64_all: &[u64] = unsafe {
-                std::slice::from_raw_parts(z_grp.as_ptr() as *const u64, z_grp.len() * 2)
-            };
-            let useful_words = stripe_useful_bits.div_ceil(64);
-            for i in 0..useful_words {
-                let lanes: [u64; 8] = [
-                    z_u64_all[0 * u64_per_block + i],
-                    z_u64_all[u64_per_block + i],
-                    z_u64_all[2 * u64_per_block + i],
-                    z_u64_all[3 * u64_per_block + i],
-                    z_u64_all[4 * u64_per_block + i],
-                    z_u64_all[5 * u64_per_block + i],
-                    z_u64_all[6 * u64_per_block + i],
-                    z_u64_all[7 * u64_per_block + i],
-                ];
-                transpose_8_u64s_to_64_bytes(&lanes, &mut stripe[i * 64..i * 64 + 64]);
+            if emit_lincheck_stripe {
+                // SAFETY: group g owns exactly this k-byte stripe and every
+                // group is disjoint. The vector has `(n_total / 8) * k` bytes.
+                let stripe = unsafe {
+                    std::slice::from_raw_parts_mut(z_lincheck_ptr.get().add(g * k), k)
+                };
+                let z_u64_all: &[u64] = unsafe {
+                    std::slice::from_raw_parts(z_grp.as_ptr() as *const u64, z_grp.len() * 2)
+                };
+                let useful_words = stripe_useful_bits.div_ceil(64);
+                for i in 0..useful_words {
+                    let lanes: [u64; 8] = [
+                        z_u64_all[i],
+                        z_u64_all[u64_per_block + i],
+                        z_u64_all[2 * u64_per_block + i],
+                        z_u64_all[3 * u64_per_block + i],
+                        z_u64_all[4 * u64_per_block + i],
+                        z_u64_all[5 * u64_per_block + i],
+                        z_u64_all[6 * u64_per_block + i],
+                        z_u64_all[7 * u64_per_block + i],
+                    ];
+                    transpose_8_u64s_to_64_bytes(
+                        &lanes,
+                        &mut stripe[i * 64..i * 64 + 64],
+                    );
+                }
+                stripe[useful_words * 64..].fill(0);
             }
-            stripe[useful_words * 64..].fill(0);
 
             if EMIT_RATE2_CODEWORD {
                 let codeword =

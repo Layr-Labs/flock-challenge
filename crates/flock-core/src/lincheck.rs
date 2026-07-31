@@ -131,6 +131,7 @@ pub use kernels::partial_fold_packed_z_x86_tiled_padded;
 pub use kernels::{
     partial_fold_packed_z_neon_iblock_padded, partial_fold_packed_z_neon_oblock_padded,
     partial_fold_packed_z_neon_single, partial_fold_packed_z_neon_single_padded,
+    partial_fold_row_major_z_neon_oblock_padded,
 };
 
 /// Bench-only A/B toggle: when set, [`partial_fold_packed_z_best`] uses the legacy
@@ -1166,6 +1167,11 @@ fn sumcheck_bind_both_and_eval_next(
 }
 
 // ---------------------------------------------------------------------------
+enum LincheckZ<'a> {
+    Stripe(&'a [u8]),
+    RowMajor(&'a [F128]),
+}
+
 // API
 // ---------------------------------------------------------------------------
 
@@ -1217,7 +1223,7 @@ pub fn prove_padded<Ch: Challenger>(
     challenger: &mut Ch,
 ) -> (LincheckProof, LincheckClaim) {
     let (proof, claim, _) = prove_padded_inner(
-        z_packed,
+        LincheckZ::Stripe(z_packed),
         m,
         k_log,
         k_skip,
@@ -1250,7 +1256,40 @@ pub fn prove_padded_capture_z_vec<Ch: Challenger>(
     challenger: &mut Ch,
 ) -> (LincheckProof, LincheckClaim, Vec<F128>) {
     let (proof, claim, captured) = prove_padded_inner(
-        z_packed,
+        LincheckZ::Stripe(z_packed),
+        m,
+        k_log,
+        k_skip,
+        useful_bits,
+        circuit,
+        x_ab,
+        true,
+        challenger,
+    );
+    (
+        proof,
+        claim,
+        captured.expect("capture=true must produce z_vec"),
+    )
+}
+
+/// Ranked row-major counterpart of [`prove_padded_capture_z_vec`]. The packed
+/// commitment witness stays live through lincheck; the AArch64 outer workers
+/// reconstruct one 64-byte stripe fragment at a time instead of reading a
+/// second full witness layout.
+#[allow(clippy::too_many_arguments)]
+pub fn prove_padded_capture_z_vec_row_major<Ch: Challenger>(
+    z_row_major: &[F128],
+    m: usize,
+    k_log: usize,
+    k_skip: usize,
+    useful_bits: usize,
+    circuit: &dyn LincheckCircuit,
+    x_ab: &QuirkyPoint,
+    challenger: &mut Ch,
+) -> (LincheckProof, LincheckClaim, Vec<F128>) {
+    let (proof, claim, captured) = prove_padded_inner(
+        LincheckZ::RowMajor(z_row_major),
         m,
         k_log,
         k_skip,
@@ -1269,7 +1308,7 @@ pub fn prove_padded_capture_z_vec<Ch: Challenger>(
 
 #[allow(clippy::too_many_arguments)]
 fn prove_padded_inner<Ch: Challenger>(
-    z_packed: &[u8],
+    z: LincheckZ<'_>,
     m: usize,
     k_log: usize,
     k_skip: usize,
@@ -1344,7 +1383,28 @@ fn prove_padded_inner<Ch: Challenger>(
         None
     };
     let eq_x_outer = build_eq_table(&x_ab.x_outer);
-    let mut z_vec = partial_fold_packed_z_best(z_packed, m, k_log, useful_bits, &eq_x_outer);
+    let mut z_vec = match z {
+        LincheckZ::Stripe(z_packed) => {
+            partial_fold_packed_z_best(z_packed, m, k_log, useful_bits, &eq_x_outer)
+        }
+        LincheckZ::RowMajor(z_row_major) => {
+            #[cfg(target_arch = "aarch64")]
+            {
+                partial_fold_row_major_z_neon_oblock_padded(
+                    z_row_major,
+                    m,
+                    k_log,
+                    useful_bits,
+                    &eq_x_outer,
+                )
+            }
+            #[cfg(not(target_arch = "aarch64"))]
+            {
+                let _ = z_row_major;
+                unreachable!("row-major lincheck is enabled only on AArch64")
+            }
+        }
+    };
     if let Some(t) = t {
         eprintln!(
             "[lc] {:<26} {:>7.2} ms",
@@ -1937,6 +1997,55 @@ mod tests {
             let got =
                 partial_fold_packed_z_neon_oblock_padded(&z_packed, m, k_log, useful_bits, &eq);
             assert_eq!(want, got, "m={m} k_log={k_log} useful={useful_bits}");
+        }
+    }
+
+    /// The ranked direct-row-major kernel reconstructs every legacy stripe
+    /// byte before lookup. Keep k_log=14 (the production block mapping) while
+    /// using only 64 outer blocks so the oracle remains cheap.
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn partial_fold_row_major_matches_legacy_stripe_k14() {
+        const K_LOG: usize = 14;
+        const K: usize = 1 << K_LOG;
+        const N_LOG: usize = 6;
+        const M: usize = K_LOG + N_LOG;
+
+        for &useful_bits in &[K, 15_409] {
+            let mut rng = Rng::new(0x51_72_1E + useful_bits as u64);
+            let mut z = rng.bits(1 << M);
+            if useful_bits < K {
+                for block in z.chunks_mut(K) {
+                    block[useful_bits..].fill(false);
+                }
+            }
+
+            let z_row_major = crate::pcs::pack_witness(&z, M);
+            let z_stripe = pack_z_lincheck(&z, M, K_LOG);
+            let eq_outer = build_eq_table(&rng.f128_vec(N_LOG));
+            let legacy = partial_fold_packed_z_neon_oblock_padded(
+                &z_stripe,
+                M,
+                K_LOG,
+                useful_bits,
+                &eq_outer,
+            );
+            let direct = partial_fold_row_major_z_neon_oblock_padded(
+                &z_row_major,
+                M,
+                K_LOG,
+                useful_bits,
+                &eq_outer,
+            );
+
+            assert_eq!(legacy.len(), K);
+            assert_eq!(direct.len(), K);
+            for i_inner in 0..K {
+                assert_eq!(
+                    direct[i_inner], legacy[i_inner],
+                    "i_inner={i_inner} useful_bits={useful_bits}"
+                );
+            }
         }
     }
 

@@ -518,21 +518,33 @@ fn prove_fast_core_with_commit_codeword<Ch: Challenger>(
     let x_ab = r1cs.x_ab_from_mlv(zc_claim.z, &zc_claim.mlv_challenges);
 
     // Capture lincheck's pre-sumcheck z_vec so the PCS open can derive the
-    // AB-claim's `s_hat_v` from it (skips fold_1b_rows for AB).
-    let (lc_proof, lc_claim, z_vec_pre) = lincheck::prove_padded_capture_z_vec(
-        &z_packed_lincheck,
-        r1cs.m,
-        r1cs.k_log,
-        r1cs.k_skip,
-        r1cs.useful_bits,
-        lincheck_circuit,
-        &x_ab,
-        challenger,
-    );
-    // The lincheck stripe copy of z is dead from here on; return it to the
-    // scratch byte pool before the PCS open (2^(m-3) bytes — 512 MB at
-    // m = 32) so the next prove reuses its resident pages.
-    flock_core::scratch::give_u8(z_packed_lincheck);
+    // AB-claim's `s_hat_v` from it. The ranked candidate passes the still-live
+    // commitment witness directly; generic/non-ranked callers keep the stripe.
+    let (lc_proof, lc_claim, z_vec_pre) = if z_packed_lincheck.is_empty() {
+        lincheck::prove_padded_capture_z_vec_row_major(
+            &z_packed,
+            r1cs.m,
+            r1cs.k_log,
+            r1cs.k_skip,
+            r1cs.useful_bits,
+            lincheck_circuit,
+            &x_ab,
+            challenger,
+        )
+    } else {
+        let result = lincheck::prove_padded_capture_z_vec(
+            &z_packed_lincheck,
+            r1cs.m,
+            r1cs.k_log,
+            r1cs.k_skip,
+            r1cs.useful_bits,
+            lincheck_circuit,
+            &x_ab,
+            challenger,
+        );
+        flock_core::scratch::give_u8(z_packed_lincheck);
+        result
+    };
 
     let ab = ZClaim {
         point: r1cs.ab_claim_point(lc_claim.r_inner_skip, &lc_claim.r_inner_rest, &x_ab.x_outer),
@@ -711,17 +723,31 @@ fn prove_fast_ligerito_timed_with_commit_codeword<Ch: Challenger>(
 
     // --- lincheck + base-claim / s_hat_v setup ---
     let t0 = Instant::now();
-    let (lc_proof, lc_claim, z_vec_pre) = lincheck::prove_padded_capture_z_vec(
-        &z_packed_lincheck,
-        r1cs.m,
-        r1cs.k_log,
-        r1cs.k_skip,
-        r1cs.useful_bits,
-        lincheck_circuit,
-        &x_ab,
-        challenger,
-    );
-    flock_core::scratch::give_u8(z_packed_lincheck);
+    let (lc_proof, lc_claim, z_vec_pre) = if z_packed_lincheck.is_empty() {
+        lincheck::prove_padded_capture_z_vec_row_major(
+            &z_packed,
+            r1cs.m,
+            r1cs.k_log,
+            r1cs.k_skip,
+            r1cs.useful_bits,
+            lincheck_circuit,
+            &x_ab,
+            challenger,
+        )
+    } else {
+        let result = lincheck::prove_padded_capture_z_vec(
+            &z_packed_lincheck,
+            r1cs.m,
+            r1cs.k_log,
+            r1cs.k_skip,
+            r1cs.useful_bits,
+            lincheck_circuit,
+            &x_ab,
+            challenger,
+        );
+        flock_core::scratch::give_u8(z_packed_lincheck);
+        result
+    };
     let ab = ZClaim {
         point: r1cs.ab_claim_point(lc_claim.r_inner_skip, &lc_claim.r_inner_rest, &x_ab.x_outer),
         value: lc_claim.w,
