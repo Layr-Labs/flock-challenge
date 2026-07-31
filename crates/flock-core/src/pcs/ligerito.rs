@@ -2977,115 +2977,138 @@ fn materialize_direct_ab_fold2(
     let fuse_init = direct_ab_fuse_init_enabled();
     let mut folded_f = crate::scratch::take_f128(out_len);
     let mut folded_b = crate::scratch::take_f128(out_len);
-    let stats = folded_b
-        .par_chunks_mut(block_len)
-        .zip(folded_f.par_chunks_mut(block_len))
-        .enumerate()
-        .map_init(
-            || vec![F128::ZERO; super::ring_switch::FOLD_TABLE_LEN],
-            |scratch, (block, (b_out, f_out))| {
-                let start = 4 * block * block_len;
-                let f_in = &packed_witness[start..start + 4 * block_len];
-                let b_in: &[F128] = if has_ordinary {
-                    &ordinary_basis[start..start + 4 * block_len]
-                } else {
-                    &[]
-                };
-                let fold4 = |input: &[F128], slot: usize| {
-                    let a0 = input[4 * slot];
-                    let a1 = input[4 * slot + 1];
-                    let a2 = input[4 * slot + 2];
-                    let a3 = input[4 * slot + 3];
-                    let low = a0 + r0 * (a0 + a1);
-                    let high = a2 + r0 * (a2 + a3);
-                    low + r1 * (low + high)
-                };
+    let fold_block = |scratch: &mut Vec<F128>,
+                      block: usize,
+                      b_out: &mut [F128],
+                      f_out: &mut [F128]| {
+        let start = 4 * block * block_len;
+        let f_in = &packed_witness[start..start + 4 * block_len];
+        let b_in: &[F128] = if has_ordinary {
+            &ordinary_basis[start..start + 4 * block_len]
+        } else {
+            &[]
+        };
+        let fold4 = |input: &[F128], slot: usize| {
+            let a0 = input[4 * slot];
+            let a1 = input[4 * slot + 1];
+            let a2 = input[4 * slot + 2];
+            let a3 = input[4 * slot + 3];
+            let low = a0 + r0 * (a0 + a1);
+            let high = a2 + r0 * (a2 + a3);
+            low + r1 * (low + high)
+        };
 
-                if fuse_init {
-                    // First direct claim initializes; remaining claims add.
-                    // Fuse claim-0 with ordinary-basis fold4 so each b_out
-                    // slot is written once when there is a single claim
-                    // (the ranked AB-only shape).
-                    let (first_claim, rest_claims) =
-                        claims.split_first().expect("nonempty claims");
-                    let (first_table, rest_tables) =
-                        direct_tables.split_first().expect("nonempty tables");
-                    super::ring_switch::compose_fold_byte_table_into(
-                        first_claim.eq_hi[block],
-                        first_table,
-                        scratch,
-                    );
-                    if has_ordinary {
-                        for slot in 0..block_len {
-                            let direct = super::ring_switch::fold_one_slot(
-                                first_claim.eq_lo[slot],
-                                scratch,
-                            );
-                            f_out[slot] = fold4(f_in, slot);
-                            b_out[slot] = direct + fold4(b_in, slot);
-                        }
-                    } else {
-                        for slot in 0..block_len {
-                            f_out[slot] = fold4(f_in, slot);
-                            b_out[slot] = super::ring_switch::fold_one_slot(
-                                first_claim.eq_lo[slot],
-                                scratch,
-                            );
-                        }
-                    }
-                    for (claim, direct_table) in rest_claims.iter().zip(rest_tables.iter()) {
-                        super::ring_switch::compose_fold_byte_table_into(
-                            claim.eq_hi[block],
-                            direct_table,
-                            scratch,
-                        );
-                        for (slot, out) in b_out.iter_mut().enumerate() {
-                            *out += super::ring_switch::fold_one_slot(
-                                claim.eq_lo[slot],
-                                scratch,
-                            );
-                        }
-                    }
-                } else {
-                    // Frontier control: zero-fill, sum all direct claims, then
-                    // add ordinary-basis fold4.
-                    b_out.fill(F128::ZERO);
-                    for (claim, direct_table) in claims.iter().zip(direct_tables.iter()) {
-                        super::ring_switch::compose_fold_byte_table_into(
-                            claim.eq_hi[block],
-                            direct_table,
-                            scratch,
-                        );
-                        for (slot, out) in b_out.iter_mut().enumerate() {
-                            *out += super::ring_switch::fold_one_slot(
-                                claim.eq_lo[slot],
-                                scratch,
-                            );
-                        }
-                    }
-                    if has_ordinary {
-                        for slot in 0..block_len {
-                            f_out[slot] = fold4(f_in, slot);
-                            b_out[slot] += fold4(b_in, slot);
-                        }
-                    } else {
-                        for slot in 0..block_len {
-                            f_out[slot] = fold4(f_in, slot);
-                        }
-                    }
+        if fuse_init {
+            let (first_claim, rest_claims) = claims.split_first().expect("nonempty claims");
+            let (first_table, rest_tables) =
+                direct_tables.split_first().expect("nonempty tables");
+            super::ring_switch::compose_fold_byte_table_into(
+                first_claim.eq_hi[block],
+                first_table,
+                scratch,
+            );
+            if has_ordinary {
+                for slot in 0..block_len {
+                    let direct =
+                        super::ring_switch::fold_one_slot(first_claim.eq_lo[slot], scratch);
+                    f_out[slot] = fold4(f_in, slot);
+                    b_out[slot] = direct + fold4(b_in, slot);
                 }
-                super::round0_and_round1_lookahead(f_out, b_out)
-            },
-        )
-        .reduce(
-            || ((F128::ZERO, F128::ZERO), [F128::ZERO; 6]),
-            |((x0, x2), mut xc), ((y0, y2), yc)| {
-                for (x, y) in xc.iter_mut().zip(yc) {
-                    *x += y;
+            } else {
+                for slot in 0..block_len {
+                    f_out[slot] = fold4(f_in, slot);
+                    b_out[slot] =
+                        super::ring_switch::fold_one_slot(first_claim.eq_lo[slot], scratch);
                 }
-                ((x0 + y0, x2 + y2), xc)
+            }
+            for (claim, direct_table) in rest_claims.iter().zip(rest_tables.iter()) {
+                super::ring_switch::compose_fold_byte_table_into(
+                    claim.eq_hi[block],
+                    direct_table,
+                    scratch,
+                );
+                for (slot, out) in b_out.iter_mut().enumerate() {
+                    *out += super::ring_switch::fold_one_slot(claim.eq_lo[slot], scratch);
+                }
+            }
+        } else {
+            b_out.fill(F128::ZERO);
+            for (claim, direct_table) in claims.iter().zip(direct_tables.iter()) {
+                super::ring_switch::compose_fold_byte_table_into(
+                    claim.eq_hi[block],
+                    direct_table,
+                    scratch,
+                );
+                for (slot, out) in b_out.iter_mut().enumerate() {
+                    *out += super::ring_switch::fold_one_slot(claim.eq_lo[slot], scratch);
+                }
+            }
+            if has_ordinary {
+                for slot in 0..block_len {
+                    f_out[slot] = fold4(f_in, slot);
+                    b_out[slot] += fold4(b_in, slot);
+                }
+            } else {
+                for slot in 0..block_len {
+                    f_out[slot] = fold4(f_in, slot);
+                }
+            }
+        }
+        super::round0_and_round1_lookahead(f_out, b_out)
+    };
+    let zero_stats = || ((F128::ZERO, F128::ZERO), [F128::ZERO; 6]);
+    let reduce_stats = |((x0, x2), mut xc): ((F128, F128), [F128; 6]),
+                        ((y0, y2), yc): ((F128, F128), [F128; 6])| {
+        for (x, y) in xc.iter_mut().zip(yc) {
+            *x += y;
+        }
+        ((x0 + y0, x2 + y2), xc)
+    };
+    let use_hetero = out_len == (1usize << 23)
+        && block_len == (1usize << 15)
+        && claims.len() == 2
+        && !has_ordinary
+        && fuse_init
+        && std::env::var_os("FLOCK_NO_DIRECT_AB_HETERO").is_none()
+        && crate::epool::epool().is_some();
+    let stats = if use_hetero {
+        let n_blocks = out_len / block_len;
+        let mut partials = vec![zero_stats(); n_blocks];
+        let f_base = crate::epool::SyncPtr(folded_f.as_mut_ptr());
+        let b_base = crate::epool::SyncPtr(folded_b.as_mut_ptr());
+        let partials_base = crate::epool::SyncPtr(partials.as_mut_ptr());
+        // Each queue index owns one disjoint output block and partial slot;
+        // the synchronous P/E join publishes all writes before reduction.
+        crate::epool::run_hetero_chunks_stateful(
+            n_blocks,
+            || vec![F128::ZERO; super::ring_switch::FOLD_TABLE_LEN],
+            |scratch, block| unsafe {
+                let f_out = core::slice::from_raw_parts_mut(
+                    f_base.ptr().add(block * block_len),
+                    block_len,
+                );
+                let b_out = core::slice::from_raw_parts_mut(
+                    b_base.ptr().add(block * block_len),
+                    block_len,
+                );
+                partials_base
+                    .ptr()
+                    .add(block)
+                    .write(fold_block(scratch, block, b_out, f_out));
             },
         );
+        partials.into_iter().fold(zero_stats(), reduce_stats)
+    } else {
+        folded_b
+            .par_chunks_mut(block_len)
+            .zip(folded_f.par_chunks_mut(block_len))
+            .enumerate()
+            .map_init(
+                || vec![F128::ZERO; super::ring_switch::FOLD_TABLE_LEN],
+                |scratch, (block, (b_out, f_out))| fold_block(scratch, block, b_out, f_out),
+            )
+            .reduce(zero_stats, reduce_stats)
+    };
     crate::scratch::give_f128(packed_witness);
     crate::scratch::give_f128(ordinary_basis);
     (
