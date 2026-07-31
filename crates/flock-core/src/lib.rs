@@ -33,6 +33,14 @@ pub mod scratch;
 pub mod verifier;
 pub mod zerocheck;
 
+#[doc(hidden)]
+pub fn run_heterogeneous_chunks<F>(n_chunks: usize, f: F)
+where
+    F: Fn(usize) + Sync,
+{
+    epool::run_hetero_chunks(n_chunks, f);
+}
+
 /// Configure rayon's global thread pool to use only performance cores on
 /// Apple silicon (excluding efficiency cores).
 ///

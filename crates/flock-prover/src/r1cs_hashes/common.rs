@@ -263,15 +263,13 @@ where
 }
 
 #[derive(Clone, Copy)]
-struct Rate2CodewordPtr(*mut F128);
-// SAFETY: the only use is the indexed group writer below. Each group owns
-// disjoint ranges in both replicas, and the parallel iterator joins before the
-// original mutable codeword borrow becomes usable again.
-unsafe impl Send for Rate2CodewordPtr {}
-unsafe impl Sync for Rate2CodewordPtr {}
-impl Rate2CodewordPtr {
-    /// Avoid closure field-capture turning this back into a bare non-Send ptr.
-    fn get(self) -> *mut F128 {
+struct GroupPtr<T>(*mut T);
+// SAFETY: group workers derive disjoint ranges before dereferencing; the
+// heterogeneous queue joins before the backing allocation is read or freed.
+unsafe impl<T> Send for GroupPtr<T> {}
+unsafe impl<T> Sync for GroupPtr<T> {}
+impl<T> GroupPtr<T> {
+    fn get(self) -> *mut T {
         self.0
     }
 }
@@ -356,7 +354,7 @@ where
             2 * total_f128,
             "rate-1/2 codeword must contain exactly two packed-witness replicas"
         );
-        Rate2CodewordPtr(codeword.as_mut_ptr())
+        GroupPtr(codeword.as_mut_ptr())
     });
     // z/a/b are allocated uninitialized. Ordinary OR-based builders zero each
     // 8-block group inside the parallel loop; full-write builders initialize
@@ -370,109 +368,111 @@ where
     let mut b = flock_core::scratch::take_f128(total_f128);
     let mut z_lincheck = flock_core::scratch::take_u8((n_total / 8) * k);
 
-    z.par_chunks_mut(8 * f128_per_block)
-        .zip(a.par_chunks_mut(8 * f128_per_block))
-        .zip(b.par_chunks_mut(8 * f128_per_block))
-        .zip(z_lincheck.par_chunks_mut(k))
-        .with_max_len(256)
-        .enumerate()
-        .for_each(|(g, (((z_grp, a_grp), b_grp), stripe))| {
-            // Ordinary per-block builders OR 1-bits into pre-zeroed words; any
-            // slot left unbuilt (no padding block) stays zero, which the
-            // lincheck transpose below reads correctly. Full-write builders
-            // skip this pass and must initialize every word themselves.
-            // SAFETY: F128 is `Copy` (no Drop) and the all-zero bit pattern is
-            // the valid `F128::ZERO`, so a byte memset is a correct init.
-            if !PER_BLOCK_FULLY_WRITES {
-                unsafe {
-                    std::ptr::write_bytes(z_grp.as_mut_ptr(), 0, z_grp.len());
-                    std::ptr::write_bytes(a_grp.as_mut_ptr(), 0, a_grp.len());
-                    std::ptr::write_bytes(b_grp.as_mut_ptr(), 0, b_grp.len());
-                }
+    let z_base = GroupPtr(z.as_mut_ptr());
+    let a_base = GroupPtr(a.as_mut_ptr());
+    let b_base = GroupPtr(b.as_mut_ptr());
+    let stripe_base = GroupPtr(z_lincheck.as_mut_ptr());
+    let group_f128 = 8 * f128_per_block;
+    let build_group = |g| {
+        // SAFETY: queue index g uniquely owns these four group ranges.
+        let (z_grp, a_grp, b_grp, stripe) = unsafe {
+            (
+                std::slice::from_raw_parts_mut(z_base.get().add(g * group_f128), group_f128),
+                std::slice::from_raw_parts_mut(a_base.get().add(g * group_f128), group_f128),
+                std::slice::from_raw_parts_mut(b_base.get().add(g * group_f128), group_f128),
+                std::slice::from_raw_parts_mut(stripe_base.get().add(g * k), k),
+            )
+        };
+        // Ordinary per-block builders OR 1-bits into pre-zeroed words; any
+        // slot left unbuilt (no padding block) stays zero, which the
+        // lincheck transpose below reads correctly. Full-write builders
+        // skip this pass and must initialize every word themselves.
+        // SAFETY: F128 is `Copy` (no Drop) and the all-zero bit pattern is
+        // the valid `F128::ZERO`, so a byte memset is a correct init.
+        if !PER_BLOCK_FULLY_WRITES {
+            unsafe {
+                std::ptr::write_bytes(z_grp.as_mut_ptr(), 0, z_grp.len());
+                std::ptr::write_bytes(a_grp.as_mut_ptr(), 0, a_grp.len());
+                std::ptr::write_bytes(b_grp.as_mut_ptr(), 0, b_grp.len());
             }
-            for k_in in 0..8 {
-                let global_idx = 8 * g + k_in;
-                let init: &S = if global_idx < n_blocks {
-                    &initial_states[global_idx]
-                } else if let Some(p) = padding {
-                    // Fill the padding slot with a real block so its constant
-                    // wire is set (see `padding` docs above).
-                    p
-                } else {
-                    // No padding block — leave this slot zero.
-                    continue;
-                };
-                let z_chunk = &mut z_grp[k_in * f128_per_block..(k_in + 1) * f128_per_block];
-                let a_chunk = &mut a_grp[k_in * f128_per_block..(k_in + 1) * f128_per_block];
-                let b_chunk = &mut b_grp[k_in * f128_per_block..(k_in + 1) * f128_per_block];
-                // SAFETY: F128 is `repr(C, align(16))` with two `u64` fields in
-                // LE order — same byte layout as a u64 pair.
-                let z_u64: &mut [u64] = unsafe {
-                    std::slice::from_raw_parts_mut(
-                        z_chunk.as_mut_ptr() as *mut u64,
-                        z_chunk.len() * 2,
-                    )
-                };
-                let a_u64: &mut [u64] = unsafe {
-                    std::slice::from_raw_parts_mut(
-                        a_chunk.as_mut_ptr() as *mut u64,
-                        a_chunk.len() * 2,
-                    )
-                };
-                let b_u64: &mut [u64] = unsafe {
-                    std::slice::from_raw_parts_mut(
-                        b_chunk.as_mut_ptr() as *mut u64,
-                        b_chunk.len() * 2,
-                    )
-                };
-                per_block(init, z_u64, a_u64, b_u64);
-            }
-
-            // Bit-transpose 8 z chunks into the lincheck stripe.
-            let z_u64_all: &[u64] = unsafe {
-                std::slice::from_raw_parts(z_grp.as_ptr() as *const u64, z_grp.len() * 2)
+        }
+        for k_in in 0..8 {
+            let global_idx = 8 * g + k_in;
+            let init: &S = if global_idx < n_blocks {
+                &initial_states[global_idx]
+            } else if let Some(p) = padding {
+                // Fill the padding slot with a real block so its constant
+                // wire is set (see `padding` docs above).
+                p
+            } else {
+                // No padding block — leave this slot zero.
+                continue;
             };
-            let useful_words = stripe_useful_bits.div_ceil(64);
-            for i in 0..useful_words {
-                let lanes: [u64; 8] = [
-                    z_u64_all[0 * u64_per_block + i],
-                    z_u64_all[u64_per_block + i],
-                    z_u64_all[2 * u64_per_block + i],
-                    z_u64_all[3 * u64_per_block + i],
-                    z_u64_all[4 * u64_per_block + i],
-                    z_u64_all[5 * u64_per_block + i],
-                    z_u64_all[6 * u64_per_block + i],
-                    z_u64_all[7 * u64_per_block + i],
-                ];
-                transpose_8_u64s_to_64_bytes(&lanes, &mut stripe[i * 64..i * 64 + 64]);
-            }
-            stripe[useful_words * 64..].fill(0);
+            let z_chunk = &mut z_grp[k_in * f128_per_block..(k_in + 1) * f128_per_block];
+            let a_chunk = &mut a_grp[k_in * f128_per_block..(k_in + 1) * f128_per_block];
+            let b_chunk = &mut b_grp[k_in * f128_per_block..(k_in + 1) * f128_per_block];
+            // SAFETY: F128 is `repr(C, align(16))` with two `u64` fields in
+            // LE order — same byte layout as a u64 pair.
+            let z_u64: &mut [u64] = unsafe {
+                std::slice::from_raw_parts_mut(z_chunk.as_mut_ptr() as *mut u64, z_chunk.len() * 2)
+            };
+            let a_u64: &mut [u64] = unsafe {
+                std::slice::from_raw_parts_mut(a_chunk.as_mut_ptr() as *mut u64, a_chunk.len() * 2)
+            };
+            let b_u64: &mut [u64] = unsafe {
+                std::slice::from_raw_parts_mut(b_chunk.as_mut_ptr() as *mut u64, b_chunk.len() * 2)
+            };
+            per_block(init, z_u64, a_u64, b_u64);
+        }
 
-            if EMIT_RATE2_CODEWORD {
-                let codeword =
-                    rate2_codeword.expect("rate-1/2 driver specialization requires a codeword");
-                let elem_offset = g * z_grp.len();
-                // SAFETY: group `g` owns `z[elem_offset..elem_offset+len]`.
-                // The same group exclusively owns those offsets in each of the
-                // two codeword replicas. Groups are disjoint, cover all of z,
-                // and the parallel iterator joins before `codeword` is used
-                // again. Both source and destinations are in bounds and do not
-                // overlap.
-                unsafe {
-                    let dst = codeword.get();
-                    std::ptr::copy_nonoverlapping(
-                        z_grp.as_ptr(),
-                        dst.add(elem_offset),
-                        z_grp.len(),
-                    );
-                    std::ptr::copy_nonoverlapping(
-                        z_grp.as_ptr(),
-                        dst.add(total_f128 + elem_offset),
-                        z_grp.len(),
-                    );
-                }
+        // Bit-transpose 8 z chunks into the lincheck stripe.
+        let z_u64_all: &[u64] =
+            unsafe { std::slice::from_raw_parts(z_grp.as_ptr() as *const u64, z_grp.len() * 2) };
+        let useful_words = stripe_useful_bits.div_ceil(64);
+        for i in 0..useful_words {
+            let lanes: [u64; 8] = [
+                z_u64_all[0 * u64_per_block + i],
+                z_u64_all[u64_per_block + i],
+                z_u64_all[2 * u64_per_block + i],
+                z_u64_all[3 * u64_per_block + i],
+                z_u64_all[4 * u64_per_block + i],
+                z_u64_all[5 * u64_per_block + i],
+                z_u64_all[6 * u64_per_block + i],
+                z_u64_all[7 * u64_per_block + i],
+            ];
+            transpose_8_u64s_to_64_bytes(&lanes, &mut stripe[i * 64..i * 64 + 64]);
+        }
+        stripe[useful_words * 64..].fill(0);
+
+        if EMIT_RATE2_CODEWORD {
+            let codeword =
+                rate2_codeword.expect("rate-1/2 driver specialization requires a codeword");
+            let elem_offset = g * z_grp.len();
+            // SAFETY: group `g` owns `z[elem_offset..elem_offset+len]`.
+            // The same group exclusively owns those offsets in each of the
+            // two codeword replicas. Groups are disjoint, cover all of z,
+            // and the parallel iterator joins before `codeword` is used
+            // again. Both source and destinations are in bounds and do not
+            // overlap.
+            unsafe {
+                let dst = codeword.get();
+                std::ptr::copy_nonoverlapping(z_grp.as_ptr(), dst.add(elem_offset), z_grp.len());
+                std::ptr::copy_nonoverlapping(
+                    z_grp.as_ptr(),
+                    dst.add(total_f128 + elem_offset),
+                    z_grp.len(),
+                );
             }
-        });
+        }
+    };
+    if std::env::var_os("FLOCK_WITNESS_P_ONLY").is_some() {
+        (0..n_total / 8)
+            .into_par_iter()
+            .with_max_len(256)
+            .for_each(build_group);
+    } else {
+        flock_core::run_heterogeneous_chunks(n_total / 8, build_group);
+    }
 
     (z, a, b, z_lincheck)
 }
