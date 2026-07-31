@@ -194,6 +194,139 @@ pub(super) unsafe fn butterfly_fused_3layer_row(
     }
 }
 
+/// One transposed-forward butterfly, fully in q registers:
+/// `s = a + b; a' = s; b' = t·s + b`.
+#[inline(always)]
+unsafe fn transpose_butterfly_q(
+    a: core::arch::aarch64::uint64x2_t,
+    b: core::arch::aarch64::uint64x2_t,
+    t: core::arch::aarch64::uint64x2_t,
+) -> (
+    core::arch::aarch64::uint64x2_t,
+    core::arch::aarch64::uint64x2_t,
+) {
+    use core::arch::aarch64::*;
+    unsafe {
+        let sum = veorq_u64(a, b);
+        (sum, veorq_u64(mul_q(t, sum), b))
+    }
+}
+
+/// Vector-resident radix-8 kernel for three reverse layers of the transposed
+/// forward NTT used by Ligerito basis induction.
+///
+/// # Safety
+/// `base + i*eighth` must be valid for `i = 0..8`. Concurrent callers must
+/// own disjoint eight-position row groups.
+#[target_feature(enable = "aes")]
+pub(super) unsafe fn transpose_fused_3layer_row(
+    ptr: *mut F128,
+    base: usize,
+    eighth: usize,
+    twiddles: &[F128; 7],
+) {
+    use core::arch::aarch64::*;
+    unsafe {
+        let t: [uint64x2_t; 7] = core::array::from_fn(|i| {
+            vld1q_u64((&raw const twiddles[i]).cast::<u64>())
+        });
+        let mut v: [uint64x2_t; 8] = core::array::from_fn(|i| {
+            vld1q_u64(ptr.add(base + i * eighth).cast::<u64>())
+        });
+
+        // Transpose order is deepest to root: adjacent pairs first.
+        for pair in 0..4 {
+            let (a, b) = transpose_butterfly_q(
+                v[2 * pair],
+                v[2 * pair + 1],
+                t[3 + pair],
+            );
+            v[2 * pair] = a;
+            v[2 * pair + 1] = b;
+        }
+        for half in 0..2 {
+            let (a, b) = transpose_butterfly_q(v[4 * half], v[4 * half + 2], t[1 + half]);
+            v[4 * half] = a;
+            v[4 * half + 2] = b;
+            let (a, b) =
+                transpose_butterfly_q(v[4 * half + 1], v[4 * half + 3], t[1 + half]);
+            v[4 * half + 1] = a;
+            v[4 * half + 3] = b;
+        }
+        for i in 0..4 {
+            let (a, b) = transpose_butterfly_q(v[i], v[i + 4], t[0]);
+            v[i] = a;
+            v[i + 4] = b;
+        }
+
+        for (i, value) in v.iter().enumerate() {
+            vst1q_u64(ptr.add(base + i * eighth).cast::<u64>(), *value);
+        }
+    }
+}
+
+/// Zero-root specialization of [`transpose_fused_3layer_row`].
+///
+/// Twiddles 0, 1, and 3 are zero for block zero. In the transposed butterfly,
+/// `t = 0` means `a' = a + b; b' = b`, eliminating seven of the twelve
+/// field multiplications in this radix-8 group.
+///
+/// # Safety
+/// As [`transpose_fused_3layer_row`], and the caller additionally guarantees
+/// `twiddles[0] == twiddles[1] == twiddles[3] == 0`.
+#[target_feature(enable = "aes")]
+pub(super) unsafe fn transpose_fused_3layer_zero_root_row(
+    ptr: *mut F128,
+    base: usize,
+    eighth: usize,
+    twiddles: &[F128; 7],
+) {
+    use core::arch::aarch64::*;
+    unsafe {
+        debug_assert_eq!(twiddles[0], F128::ZERO);
+        debug_assert_eq!(twiddles[1], F128::ZERO);
+        debug_assert_eq!(twiddles[3], F128::ZERO);
+
+        let t2 = vld1q_u64((&raw const twiddles[2]).cast::<u64>());
+        let t4 = vld1q_u64((&raw const twiddles[4]).cast::<u64>());
+        let t5 = vld1q_u64((&raw const twiddles[5]).cast::<u64>());
+        let t6 = vld1q_u64((&raw const twiddles[6]).cast::<u64>());
+        let mut v: [uint64x2_t; 8] =
+            core::array::from_fn(|i| vld1q_u64(ptr.add(base + i * eighth).cast::<u64>()));
+
+        // Deepest layer: first pair has t[3] = 0.
+        v[0] = veorq_u64(v[0], v[1]);
+        let (a, b) = transpose_butterfly_q(v[2], v[3], t4);
+        v[2] = a;
+        v[3] = b;
+        let (a, b) = transpose_butterfly_q(v[4], v[5], t5);
+        v[4] = a;
+        v[5] = b;
+        let (a, b) = transpose_butterfly_q(v[6], v[7], t6);
+        v[6] = a;
+        v[7] = b;
+
+        // Middle layer: top half has t[1] = 0; bottom half uses t[2].
+        v[0] = veorq_u64(v[0], v[2]);
+        v[1] = veorq_u64(v[1], v[3]);
+        let (a, b) = transpose_butterfly_q(v[4], v[6], t2);
+        v[4] = a;
+        v[6] = b;
+        let (a, b) = transpose_butterfly_q(v[5], v[7], t2);
+        v[5] = a;
+        v[7] = b;
+
+        // Root layer: t[0] = 0 for all four butterflies.
+        for i in 0..4 {
+            v[i] = veorq_u64(v[i], v[i + 4]);
+        }
+
+        for (i, value) in v.iter().enumerate() {
+            vst1q_u64(ptr.add(base + i * eighth).cast::<u64>(), *value);
+        }
+    }
+}
+
 /// Vector-resident twin of `portable::butterfly_fused_3layer_zero_root_row`.
 ///
 /// Twiddles 0, 1 and 3 are zero on the root spine, so those butterflies are

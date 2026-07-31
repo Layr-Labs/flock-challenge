@@ -2064,10 +2064,16 @@ fn transpose_forward_ntt_fused_3layer(
             tw
         })
         .collect();
+    debug_assert_eq!(twiddles[0][0], F128::ZERO);
+    debug_assert_eq!(twiddles[0][1], F128::ZERO);
+    debug_assert_eq!(twiddles[0][3], F128::ZERO);
 
     // Flatten `(block, row)` into one Rayon range. This keeps all cores busy
     // even for the final few large blocks without opening nested parallel
     // regions, which caused long-tail scheduler stalls in this phase.
+    #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+    let use_vector_resident =
+        crate::ntt::additive_ntt_f128::transpose_vector_resident_rows();
     let data_ptr = data.as_mut_ptr() as usize;
     (0..num_blocks * eighth).into_par_iter().for_each(|job| {
         // `eighth` is always a power of two. Spell out the quotient/remainder
@@ -2075,11 +2081,31 @@ fn transpose_forward_ntt_fused_3layer(
         let block = job >> eighth_log;
         let row = job & row_mask;
         let base = block * block_size + row;
-        let mut values = [F128::ZERO; 8];
         // SAFETY: each `(block,row)` owns the eight distinct positions
         // `base + i*eighth`, and different jobs never overlap.
         unsafe {
             let ptr = data_ptr as *mut F128;
+            #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+            if use_vector_resident {
+                if block == 0 {
+                    crate::ntt::additive_ntt_f128::
+                        transpose_fused_3layer_zero_root_vector_resident(
+                            ptr,
+                            base,
+                            eighth,
+                            &twiddles[block],
+                        );
+                } else {
+                    crate::ntt::additive_ntt_f128::transpose_fused_3layer_vector_resident(
+                        ptr,
+                        base,
+                        eighth,
+                        &twiddles[block],
+                    );
+                }
+                return;
+            }
+            let mut values = [F128::ZERO; 8];
             for (i, value) in values.iter_mut().enumerate() {
                 *value = *ptr.add(base + i * eighth);
             }

@@ -47,6 +47,52 @@ use crate::field::F128;
 
 mod kernels;
 
+/// Whether the transpose-only AArch64 radix-8 kernel is active.
+///
+/// This has a separate opt-out from the promoted ordinary NTT row kernels so
+/// the ranked harness can compare this candidate in the same binary without
+/// disabling any optimization already present in the frontier.
+#[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+#[inline]
+pub(crate) fn transpose_vector_resident_rows() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("FLOCK_NO_TRANSPOSE_NTT_NEON").is_none())
+}
+
+/// Run one transpose-only vector-resident radix-8 row group.
+///
+/// # Safety
+/// The caller must uphold [`kernels::transpose_fused_3layer_row`]'s row
+/// geometry and disjointness contract.
+#[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+#[inline]
+pub(crate) unsafe fn transpose_fused_3layer_vector_resident(
+    ptr: *mut F128,
+    base: usize,
+    eighth: usize,
+    twiddles: &[F128; 7],
+) {
+    // SAFETY: forwarded caller contract.
+    unsafe { kernels::transpose_fused_3layer_row(ptr, base, eighth, twiddles) }
+}
+
+/// Run block zero with the transpose-only zero-twiddle specialization.
+///
+/// # Safety
+/// The caller must uphold the ordinary row contract and ensure twiddles 0, 1,
+/// and 3 are zero.
+#[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+#[inline]
+pub(crate) unsafe fn transpose_fused_3layer_zero_root_vector_resident(
+    ptr: *mut F128,
+    base: usize,
+    eighth: usize,
+    twiddles: &[F128; 7],
+) {
+    // SAFETY: forwarded caller contract.
+    unsafe { kernels::transpose_fused_3layer_zero_root_row(ptr, base, eighth, twiddles) }
+}
+
 /// Compute the normalized subspace-polynomial evaluation table.
 ///
 /// Returns `evals` where `evals[i] = [Ŵ_i(β_i), Ŵ_i(β_{i+1}), …, Ŵ_i(β_{ℓ-1})]`.

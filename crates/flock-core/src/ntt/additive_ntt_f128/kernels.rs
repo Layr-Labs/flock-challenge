@@ -173,6 +173,42 @@ pub(super) unsafe fn butterfly_fused_3layer_row(
     }
 }
 
+/// Process one transposed-forward fused-three-layer row group.
+///
+/// # Safety
+/// The caller must ensure `base + i * eighth` is valid for `i = 0..8`, and
+/// that concurrent callers own disjoint row groups.
+#[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+#[inline]
+pub(super) unsafe fn transpose_fused_3layer_row(
+    ptr: *mut F128,
+    base: usize,
+    eighth: usize,
+    twiddles: &[F128; 7],
+) {
+    // SAFETY: forwarded caller contract; the cfg gate supplies `aes`.
+    unsafe { aarch64::transpose_fused_3layer_row(ptr, base, eighth, twiddles) }
+}
+
+/// Process block zero with the transpose-specific zero-twiddle kernel.
+///
+/// # Safety
+/// In addition to [`transpose_fused_3layer_row`]'s contract, the caller must
+/// ensure twiddles 0, 1, and 3 are zero.
+#[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+#[inline]
+pub(super) unsafe fn transpose_fused_3layer_zero_root_row(
+    ptr: *mut F128,
+    base: usize,
+    eighth: usize,
+    twiddles: &[F128; 7],
+) {
+    // SAFETY: forwarded caller contract; the cfg gate supplies `aes`.
+    unsafe {
+        aarch64::transpose_fused_3layer_zero_root_row(ptr, base, eighth, twiddles)
+    }
+}
+
 /// Whether the AArch64 vector-resident radix-8 row kernels are used.
 ///
 /// `FLOCK_NO_NTT_NEON_ROWS=1` restores the portable `F128`-typed chain in the
@@ -277,6 +313,122 @@ mod aarch64_row_tests {
             tw[3] = F128::ZERO;
         }
         (buf, tw)
+    }
+
+    #[inline(always)]
+    fn transpose_butterfly(values: &mut [F128; 8], a: usize, b: usize, twiddle: F128) {
+        let sum = values[a] + values[b];
+        values[a] = sum;
+        values[b] = twiddle * sum + values[b];
+    }
+
+    fn transpose_fused_3layer_reference(
+        data: &mut [F128],
+        base: usize,
+        eighth: usize,
+        twiddles: &[F128; 7],
+    ) {
+        let mut values: [F128; 8] =
+            core::array::from_fn(|i| data[base + i * eighth]);
+        for pair in 0..4 {
+            transpose_butterfly(
+                &mut values,
+                2 * pair,
+                2 * pair + 1,
+                twiddles[3 + pair],
+            );
+        }
+        for half in 0..2 {
+            transpose_butterfly(
+                &mut values,
+                4 * half,
+                4 * half + 2,
+                twiddles[1 + half],
+            );
+            transpose_butterfly(
+                &mut values,
+                4 * half + 1,
+                4 * half + 3,
+                twiddles[1 + half],
+            );
+        }
+        for i in 0..4 {
+            transpose_butterfly(&mut values, i, i + 4, twiddles[0]);
+        }
+        for (i, value) in values.into_iter().enumerate() {
+            data[base + i * eighth] = value;
+        }
+    }
+
+    /// The transpose-specific vector-resident radix-8 kernel must be
+    /// bit-identical to its scalar chain for both contiguous and strided rows.
+    #[test]
+    fn neon_transpose_fused_3layer_matches_reference() {
+        let mut state = 0x5452_414E_5350_4F53;
+        for &eighth in &[1usize, 2, 3, 8, 64, 257] {
+            let base: Vec<F128> = (0..8 * eighth)
+                .map(|_| rand_f128(&mut state))
+                .collect();
+            let twiddles: [F128; 7] =
+                core::array::from_fn(|_| rand_f128(&mut state));
+
+            let mut want = base.clone();
+            for row in 0..eighth {
+                transpose_fused_3layer_reference(&mut want, row, eighth, &twiddles);
+            }
+
+            let mut got = base;
+            for row in 0..eighth {
+                // SAFETY: the buffer contains all eight `eighth`-wide rows.
+                unsafe {
+                    aarch64::transpose_fused_3layer_row(
+                        got.as_mut_ptr(),
+                        row,
+                        eighth,
+                        &twiddles,
+                    );
+                }
+            }
+
+            assert_eq!(got, want, "transpose row mismatch at eighth={eighth}");
+        }
+    }
+
+    /// The block-zero specialization must match the same scalar reference
+    /// while exercising every strided row in each geometry.
+    #[test]
+    fn neon_transpose_fused_3layer_zero_root_matches_reference() {
+        let mut state = 0x5452_5A45_524F_4F54;
+        for &eighth in &[1usize, 2, 3, 8, 64, 257] {
+            let base: Vec<F128> = (0..8 * eighth)
+                .map(|_| rand_f128(&mut state))
+                .collect();
+            let mut twiddles: [F128; 7] =
+                core::array::from_fn(|_| rand_f128(&mut state));
+            twiddles[0] = F128::ZERO;
+            twiddles[1] = F128::ZERO;
+            twiddles[3] = F128::ZERO;
+
+            let mut want = base.clone();
+            for row in 0..eighth {
+                transpose_fused_3layer_reference(&mut want, row, eighth, &twiddles);
+            }
+
+            let mut got = base;
+            for row in 0..eighth {
+                // SAFETY: geometry is valid and required twiddles are zero.
+                unsafe {
+                    aarch64::transpose_fused_3layer_zero_root_row(
+                        got.as_mut_ptr(),
+                        row,
+                        eighth,
+                        &twiddles,
+                    );
+                }
+            }
+
+            assert_eq!(got, want, "zero-root mismatch at eighth={eighth}");
+        }
     }
 
     /// The vector-resident radix-8 row kernel must be **bit-identical** to the
