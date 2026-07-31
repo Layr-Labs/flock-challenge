@@ -152,6 +152,64 @@ where
     run_chunks_with_helper_stateful(n_chunks, &init, &f, epool());
 }
 
+/// Cooperative variant of [`run_hetero_chunks`] for jobs that run **inside an
+/// overlapped region** (e.g. one branch of the commit/AB `rayon::join`).
+///
+/// The plain queue's main-pool side spawns one greedy drain-loop per worker;
+/// a worker that picks one up holds it until the queue is empty. Standalone
+/// that is ideal, but under a `join` it starves the sibling branch and can
+/// serialize the overlap. Here the main-pool side instead submits **one rayon
+/// task per claim** (`with_max_len(1)`), so the scheduler interleaves these
+/// claims with the sibling branch's tasks exactly as it interleaves the
+/// current `par_chunks` — while the efficiency-core broadcast drains the same
+/// atomic queue greedily from the side. A main-pool task whose claim finds
+/// the queue already exhausted is a no-op.
+///
+/// Same output contract as [`run_hetero_chunks`]: each chunk index runs
+/// exactly once; `f(i)` must write only chunk `i`'s disjoint range. With a
+/// single-threaded main pool the queue runs inline in order and spawns
+/// nothing.
+pub(crate) fn run_hetero_chunks_cooperative<F>(n_chunks: usize, f: F)
+where
+    F: Fn(usize) + Sync,
+{
+    if n_chunks == 0 {
+        return;
+    }
+    if rayon::current_num_threads() <= 1 {
+        for i in 0..n_chunks {
+            f(i);
+        }
+        return;
+    }
+    let next = AtomicUsize::new(0);
+    let drain_main = || {
+        (0..n_chunks).into_par_iter().with_max_len(1).for_each(|_| {
+            let i = next.fetch_add(1, Ordering::Relaxed);
+            if i < n_chunks {
+                f(i);
+            }
+        });
+    };
+    match epool().filter(|_| n_chunks >= EPOOL_MIN_CHUNKS) {
+        Some(ep) => std::thread::scope(|s| {
+            s.spawn(|| {
+                ep.broadcast(|_| {
+                    loop {
+                        let i = next.fetch_add(1, Ordering::Relaxed);
+                        if i >= n_chunks {
+                            break;
+                        }
+                        f(i);
+                    }
+                })
+            });
+            drain_main();
+        }),
+        None => drain_main(),
+    }
+}
+
 /// [`run_hetero_chunks`] with an explicit helper pool, so tests can exercise
 /// the two-pool queue on hosts without efficiency cores.
 pub(crate) fn run_chunks_with_helper<F>(n_chunks: usize, f: &F, helper: Option<&rayon::ThreadPool>)
