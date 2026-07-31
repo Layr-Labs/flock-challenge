@@ -226,6 +226,20 @@ fn use_ranked_low_twiddle_final_pair(log_d: usize, num_ntts: usize, n_top: usize
         && std::env::var_os("FLOCK_NO_NTT_LOW_TWIDDLE_FINAL").is_none()
 }
 
+/// In the standard dimension-20 basis, exactly one quarter of layer-16
+/// parents have low-limb-only twiddles for both layer-17 children. Keep this
+/// mixed specialization tied to the ranked deep-transform geometry.
+#[inline]
+fn use_ranked_low_inner_twiddle_pair(log_d: usize, num_ntts: usize, n_top: usize) -> bool {
+    cfg!(all(
+        target_os = "macos",
+        target_arch = "aarch64",
+        target_feature = "aes"
+    )) && log_d == 20
+        && num_ntts == 64
+        && n_top == 10
+}
+
 /// The zero-root radix-8 kernel is currently scored only for the ranked L0
 /// transform. Keep recursive and diagnostic commits on their prior kernel so
 /// this candidate has one production scope and one transfer story.
@@ -897,6 +911,7 @@ impl AdditiveNttF128 {
         let sub_elems = sub_size_positions * num_ntts;
         let low_twiddle_final_pair =
             use_ranked_low_twiddle_final_pair(log_d, num_ntts, n_top);
+        let low_inner_twiddle_pair = use_ranked_low_inner_twiddle_pair(log_d, num_ntts, n_top);
 
         data.par_chunks_mut(sub_elems)
             .enumerate()
@@ -920,6 +935,19 @@ impl AdditiveNttF128 {
                             debug_assert_eq!(t_inner_a.hi, 0);
                             debug_assert_eq!(t_inner_b.hi, 0);
                             butterfly_interleaved_fused_2layer_low_twiddles_rows_seq(
+                                &mut sub_data[block_start..block_start + block_elems],
+                                t_outer,
+                                t_inner_a,
+                                t_inner_b,
+                                quarter,
+                                num_ntts,
+                            );
+                        } else if low_inner_twiddle_pair
+                            && layer == 16
+                            && t_inner_a.hi == 0
+                            && t_inner_b.hi == 0
+                        {
+                            butterfly_interleaved_fused_2layer_low_inner_twiddles_rows_seq(
                                 &mut sub_data[block_start..block_start + block_elems],
                                 t_outer,
                                 t_inner_a,
@@ -1379,6 +1407,37 @@ fn butterfly_interleaved_fused_2layer_low_twiddles_rows_seq(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
+#[inline]
+fn butterfly_interleaved_fused_2layer_low_inner_twiddles_rows_seq(
+    block: &mut [F128],
+    t_outer: F128,
+    t_inner_a: F128,
+    t_inner_b: F128,
+    quarter: usize,
+    num_ntts: usize,
+) {
+    let stride = quarter * num_ntts;
+    debug_assert!(num_ntts > 0);
+    debug_assert_eq!(block.len(), 4 * stride);
+    debug_assert_eq!(t_inner_a.hi, 0);
+    debug_assert_eq!(t_inner_b.hi, 0);
+
+    let (top_half, bot_half) = block.split_at_mut(2 * stride);
+    let (q1, q2) = top_half.split_at_mut(stride);
+    let (q3, q4) = bot_half.split_at_mut(stride);
+    for (((row_a, row_b), row_c), row_d) in q1
+        .chunks_exact_mut(num_ntts)
+        .zip(q2.chunks_exact_mut(num_ntts))
+        .zip(q3.chunks_exact_mut(num_ntts))
+        .zip(q4.chunks_exact_mut(num_ntts))
+    {
+        kernels::butterfly_fused_2layer_low_inner_twiddles(
+            row_a, row_b, row_c, row_d, t_outer, t_inner_a, t_inner_b,
+        );
+    }
+}
+
 /// Butterfly one block of an interleaved (SoA) buffer with shared twiddle.
 ///
 /// `block` has length `(2 * block_size_half) * num_ntts` and is laid out as
@@ -1756,6 +1815,109 @@ mod tests {
                      num_ntts={num_ntts} iteration={iteration}"
                 );
             }
+        }
+    }
+
+    /// Random oracle for the mixed fused-pair kernel: outer twiddles retain
+    /// all 128 bits while both inner twiddles satisfy the low-limb contract.
+    #[test]
+    fn fused2_low_inner_twiddles_match_generic() {
+        let mut rng = Rng::new(0x10F1_1AAE_20A5_0001);
+        for iteration in 0..10_000 {
+            let num_ntts = [1usize, 2, 8, 64][iteration & 3];
+            let t_outer = rng.f128();
+            let t_inner_a = F128::new(rng.next_u64(), 0);
+            let t_inner_b = F128::new(rng.next_u64(), 0);
+            let source = rand_vec(&mut rng, 4 * num_ntts);
+
+            let mut want = source.clone();
+            butterfly_interleaved_fused_2layer_rows_seq(
+                &mut want, t_outer, t_inner_a, t_inner_b, 1, num_ntts,
+            );
+            let mut got = source;
+            butterfly_interleaved_fused_2layer_low_inner_twiddles_rows_seq(
+                &mut got, t_outer, t_inner_a, t_inner_b, 1, num_ntts,
+            );
+            assert_eq!(got, want, "mixed fused-2 mismatch at iteration={iteration}");
+        }
+    }
+
+    /// Exhaust the exact production layer-16 parents. The low-inner shape is
+    /// all-or-nothing and covers exactly one quarter of the 65,536 parents.
+    #[test]
+    fn standard_dim20_layer16_has_quarter_low_inner_pairs() {
+        let ntt = AdditiveNttF128::standard(20);
+        let mut both_low = 0usize;
+        let mut one_low = 0usize;
+        for parent in 0..(1usize << 16) {
+            let a_low = ntt.twiddle(17, 2 * parent).hi == 0;
+            let b_low = ntt.twiddle(17, 2 * parent + 1).hi == 0;
+            match (a_low, b_low) {
+                (true, true) => both_low += 1,
+                (true, false) | (false, true) => one_low += 1,
+                (false, false) => {}
+            }
+        }
+        assert_eq!(both_low, 1usize << 14);
+        assert_eq!(one_low, 0);
+        assert!(use_ranked_low_inner_twiddle_pair(20, 64, 10));
+        assert!(!use_ranked_low_inner_twiddle_pair(19, 64, 10));
+        assert!(!use_ranked_low_inner_twiddle_pair(20, 32, 10));
+        assert!(!use_ranked_low_inner_twiddle_pair(20, 64, 9));
+    }
+
+    /// Same-process arithmetic proxy for one ranked layer-16 affected block
+    /// population: 65,536 calls × 64 lanes = 4,194,304 lane groups.
+    #[test]
+    #[ignore]
+    fn fused2_low_inner_arithmetic_ab() {
+        use std::hint::black_box;
+        use std::time::{Duration, Instant};
+
+        const CALLS: usize = 65_536;
+        const LANES: usize = 64;
+
+        fn measure(mixed: bool, seed: u64) -> (Duration, F128) {
+            let mut rng = Rng::new(seed);
+            let t_outer = black_box(rng.f128());
+            let t_inner_a = black_box(F128::new(rng.next_u64(), 0));
+            let t_inner_b = black_box(F128::new(rng.next_u64(), 0));
+            let mut data = rand_vec(&mut rng, 4 * LANES);
+            let start = Instant::now();
+            for _ in 0..CALLS {
+                if mixed {
+                    butterfly_interleaved_fused_2layer_low_inner_twiddles_rows_seq(
+                        black_box(&mut data),
+                        t_outer,
+                        t_inner_a,
+                        t_inner_b,
+                        1,
+                        LANES,
+                    );
+                } else {
+                    butterfly_interleaved_fused_2layer_rows_seq(
+                        black_box(&mut data),
+                        t_outer,
+                        t_inner_a,
+                        t_inner_b,
+                        1,
+                        LANES,
+                    );
+                }
+            }
+            (start.elapsed(), black_box(data[0]))
+        }
+
+        for (round, order) in [[false, true], [true, false], [false, true], [true, false]]
+            .into_iter()
+            .enumerate()
+        {
+            let (first_t, first_sum) = measure(order[0], 0xABBA_1000 + round as u64);
+            let (second_t, second_sum) = measure(order[1], 0xABBA_2000 + round as u64);
+            println!(
+                "round={round} first_mixed={} first={first_t:?} second_mixed={} second={second_t:?} checks={first_sum:?}/{second_sum:?}",
+                order[0], order[1]
+            );
         }
     }
 

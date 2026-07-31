@@ -1,5 +1,59 @@
 use crate::field::F128;
 
+/// Fused two-layer butterfly specialized for low-limb-only inner twiddles.
+/// The two outer products retain the generic Binius multiplier; the two inner
+/// products are issued together with the four-PMULL low-constant helper.
+///
+/// # Safety
+/// Requires the `aes` target feature.
+#[allow(clippy::too_many_arguments)]
+#[target_feature(enable = "aes")]
+#[inline]
+pub(super) unsafe fn butterfly_fused_2layer_low_inner_twiddles(
+    a: &mut [F128],
+    b: &mut [F128],
+    c: &mut [F128],
+    d: &mut [F128],
+    t_outer: F128,
+    t_inner_a: F128,
+    t_inner_b: F128,
+) {
+    use crate::field::gf2_128::aarch64::ghash_mul_low_constants_vec2_neon;
+
+    debug_assert_eq!(a.len(), b.len());
+    debug_assert_eq!(a.len(), c.len());
+    debug_assert_eq!(a.len(), d.len());
+    debug_assert_eq!(t_inner_a.hi, 0);
+    debug_assert_eq!(t_inner_b.hi, 0);
+
+    for lane in 0..a.len() {
+        let mut xa = a[lane];
+        let mut xb = b[lane];
+        let mut xc = c[lane];
+        let mut xd = d[lane];
+
+        let na = xa + xc * t_outer;
+        xc += na;
+        xa = na;
+        let nb = xb + xd * t_outer;
+        xd += nb;
+        xb = nb;
+
+        // SAFETY: this function carries aes and both constants have zero high
+        // limbs by the ranked gate and assertions above.
+        let inner = unsafe { ghash_mul_low_constants_vec2_neon([t_inner_a, t_inner_b], [xb, xd]) };
+        xa += inner[0];
+        xb += xa;
+        xc += inner[1];
+        xd += xc;
+
+        a[lane] = xa;
+        b[lane] = xb;
+        c[lane] = xc;
+        d[lane] = xd;
+    }
+}
+
 /// Fused two-layer butterfly specialized for three low-limb-only twiddles.
 /// Two products are issued together at each stage, using four PMULLs instead
 /// of twelve for the pair under the generic Binius field multiplier.
