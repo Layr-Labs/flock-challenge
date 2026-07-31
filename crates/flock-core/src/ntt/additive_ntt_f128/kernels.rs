@@ -72,6 +72,41 @@ pub(super) fn butterfly_fused_2layer(
     portable::butterfly_fused_2layer(a, b, c, d, t_outer, t_inner_a, t_inner_b);
 }
 
+/// Vector-resident AArch64 fused-pair kernel used by the cache-resident deep
+/// transform. Other targets, and the same-binary opt-out, retain the incumbent
+/// portable chain.
+#[allow(clippy::too_many_arguments)]
+#[inline]
+pub(super) fn butterfly_fused_2layer_vector_resident(
+    a: &mut [F128],
+    b: &mut [F128],
+    c: &mut [F128],
+    d: &mut [F128],
+    t_outer: F128,
+    t_inner_a: F128,
+    t_inner_b: F128,
+) {
+    #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+    unsafe {
+        if vector_resident_pair_rows() {
+            aarch64::butterfly_fused_2layer_vector_resident(
+                a, b, c, d, t_outer, t_inner_a, t_inner_b,
+            );
+            return;
+        }
+    }
+
+    portable::butterfly_fused_2layer(a, b, c, d, t_outer, t_inner_a, t_inner_b);
+}
+
+#[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+#[inline]
+fn vector_resident_pair_rows() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("FLOCK_NO_NTT_NEON_PAIR_ROWS").is_none())
+}
+
 /// AArch64 specialization for a fused pair whose three twiddles all have a
 /// zero high limb. Other targets retain the ordinary field-multiply kernel.
 #[allow(clippy::too_many_arguments)]
@@ -248,6 +283,38 @@ mod aarch64_row_tests {
         F128 {
             lo: splitmix(state),
             hi: splitmix(state),
+        }
+    }
+
+    #[test]
+    fn neon_fused_2layer_vector_resident_matches_portable() {
+        let mut state = 0x4E54_545F_5041_4952;
+        for lanes in [1usize, 2, 5, 16, 64] {
+            for iteration in 0..8 {
+                let mut a: Vec<F128> = (0..lanes).map(|_| rand_f128(&mut state)).collect();
+                let mut b: Vec<F128> = (0..lanes).map(|_| rand_f128(&mut state)).collect();
+                let mut c: Vec<F128> = (0..lanes).map(|_| rand_f128(&mut state)).collect();
+                let mut d: Vec<F128> = (0..lanes).map(|_| rand_f128(&mut state)).collect();
+                let tw = [
+                    rand_f128(&mut state),
+                    rand_f128(&mut state),
+                    rand_f128(&mut state),
+                ];
+                let (mut wa, mut wb, mut wc, mut wd) = (a.clone(), b.clone(), c.clone(), d.clone());
+                portable::butterfly_fused_2layer(
+                    &mut wa, &mut wb, &mut wc, &mut wd, tw[0], tw[1], tw[2],
+                );
+                unsafe {
+                    aarch64::butterfly_fused_2layer_vector_resident(
+                        &mut a, &mut b, &mut c, &mut d, tw[0], tw[1], tw[2],
+                    );
+                }
+                assert_eq!(
+                    (a, b, c, d),
+                    (wa, wb, wc, wd),
+                    "lanes={lanes} iteration={iteration}"
+                );
+            }
         }
     }
 
