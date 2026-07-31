@@ -236,6 +236,110 @@ unsafe fn fold_four_row_codes_q(
     }
 }
 
+/// Fold four packed rows through six 10-bit banks and one four-bit tail bank.
+/// The table is 96.25 KiB rather than the incumbent 32 KiB byte table, but
+/// remains in the L1-sized regime while removing one indexed load per row.
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn fold_four_row_codes_group10_q(
+    table_data: *const u8,
+    row0: u64,
+    row1: u64,
+    row2: u64,
+    row3: u64,
+) -> (
+    core::arch::aarch64::uint64x2_t,
+    core::arch::aarch64::uint64x2_t,
+    core::arch::aarch64::uint64x2_t,
+    core::arch::aarch64::uint64x2_t,
+) {
+    use core::arch::aarch64::*;
+    unsafe {
+        const FULL_STRIDE: usize = (1 << 10) * core::mem::size_of::<F128>();
+        const TAIL_OFFSET: usize = 6 * FULL_STRIDE;
+        let load = |row: u64, shift: u32, offset: usize, mask: u64| {
+            let index = ((row >> shift) & mask) as usize;
+            vld1q_u64(
+                table_data
+                    .add(offset + index * core::mem::size_of::<F128>())
+                    .cast::<u64>(),
+            )
+        };
+
+        // Keep all four independent row streams live.  The three XOR3 stages
+        // each consume two more groups, matching the incumbent's dependency
+        // depth while reducing the total load count from eight to seven.
+        let mut acc0 = load(row0, 0, 0, 0x3ff);
+        let mut acc1 = load(row1, 0, 0, 0x3ff);
+        let mut acc2 = load(row2, 0, 0, 0x3ff);
+        let mut acc3 = load(row3, 0, 0, 0x3ff);
+
+        acc0 = xor3_u64(
+            acc0,
+            load(row0, 10, FULL_STRIDE, 0x3ff),
+            load(row0, 20, 2 * FULL_STRIDE, 0x3ff),
+        );
+        acc1 = xor3_u64(
+            acc1,
+            load(row1, 10, FULL_STRIDE, 0x3ff),
+            load(row1, 20, 2 * FULL_STRIDE, 0x3ff),
+        );
+        acc2 = xor3_u64(
+            acc2,
+            load(row2, 10, FULL_STRIDE, 0x3ff),
+            load(row2, 20, 2 * FULL_STRIDE, 0x3ff),
+        );
+        acc3 = xor3_u64(
+            acc3,
+            load(row3, 10, FULL_STRIDE, 0x3ff),
+            load(row3, 20, 2 * FULL_STRIDE, 0x3ff),
+        );
+
+        acc0 = xor3_u64(
+            acc0,
+            load(row0, 30, 3 * FULL_STRIDE, 0x3ff),
+            load(row0, 40, 4 * FULL_STRIDE, 0x3ff),
+        );
+        acc1 = xor3_u64(
+            acc1,
+            load(row1, 30, 3 * FULL_STRIDE, 0x3ff),
+            load(row1, 40, 4 * FULL_STRIDE, 0x3ff),
+        );
+        acc2 = xor3_u64(
+            acc2,
+            load(row2, 30, 3 * FULL_STRIDE, 0x3ff),
+            load(row2, 40, 4 * FULL_STRIDE, 0x3ff),
+        );
+        acc3 = xor3_u64(
+            acc3,
+            load(row3, 30, 3 * FULL_STRIDE, 0x3ff),
+            load(row3, 40, 4 * FULL_STRIDE, 0x3ff),
+        );
+
+        acc0 = xor3_u64(
+            acc0,
+            load(row0, 50, 5 * FULL_STRIDE, 0x3ff),
+            load(row0, 60, TAIL_OFFSET, 0x0f),
+        );
+        acc1 = xor3_u64(
+            acc1,
+            load(row1, 50, 5 * FULL_STRIDE, 0x3ff),
+            load(row1, 60, TAIL_OFFSET, 0x0f),
+        );
+        acc2 = xor3_u64(
+            acc2,
+            load(row2, 50, 5 * FULL_STRIDE, 0x3ff),
+            load(row2, 60, TAIL_OFFSET, 0x0f),
+        );
+        acc3 = xor3_u64(
+            acc3,
+            load(row3, 50, 5 * FULL_STRIDE, 0x3ff),
+            load(row3, 60, TAIL_OFFSET, 0x0f),
+        );
+        (acc0, acc1, acc2, acc3)
+    }
+}
+
 /// Complete q-register-native round-two worker chunk. Four folded rows stay in
 /// vector registers through output stores, reduced GHASH products, and the
 /// eq-weighted unreduced accumulators; only the two final chunk sums cross back
@@ -443,6 +547,89 @@ pub(crate) unsafe fn fold_compact_chunk_neon_unchecked_8(
             let b1_code = u64::from_le(core::ptr::read_unaligned(delta.add(24).cast::<u64>()));
             let (a0_delta, a1_delta, b0_delta, b1_delta) = fold_four_row_codes_q(
                 scaled_table,
+                a0_code,
+                a1_code,
+                b0_code,
+                b1_code,
+            );
+            let a0 = veorq_u64(
+                vld1q_u64(anchors.add(2 * out).cast::<u64>()),
+                a0_delta,
+            );
+            let a1 = veorq_u64(
+                vld1q_u64(anchors.add(2 * (out + 1)).cast::<u64>()),
+                a1_delta,
+            );
+            let b0 = veorq_u64(
+                vld1q_u64(anchors.add(2 * out + 1).cast::<u64>()),
+                b0_delta,
+            );
+            let b1 = veorq_u64(
+                vld1q_u64(anchors.add(2 * (out + 1) + 1).cast::<u64>()),
+                b1_delta,
+            );
+
+            store_pair_nt(a_out.add(out), a0, a1);
+            store_pair_nt(b_out.add(out), b0, b1);
+
+            let g1 = mul_q(a1, b1);
+            let g_inf = mul_q(veorq_u64(a0, a1), veorq_u64(b0, b1));
+            let eq_l = vld1q_u64(eq_lo.add(x_lo).cast::<u64>());
+            wide_xor(&mut p1_acc, mul_unreduced_q(eq_l, g1));
+            wide_xor(&mut pinf_acc, mul_unreduced_q(eq_l, g_inf));
+        }
+
+        (
+            core::mem::transmute::<uint64x2_t, F128>(reduce_wide_q(p1_acc)),
+            core::mem::transmute::<uint64x2_t, F128>(reduce_wide_q(pinf_acc)),
+        )
+    }
+}
+
+/// L1-oriented ten-bit-table counterpart of
+/// [`fold_compact_chunk_neon_unchecked_8`].  It has identical algebra and
+/// output ownership; only the exact table decomposition changes from eight
+/// byte lookups to six 10-bit lookups plus one four-bit tail lookup per row.
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "aes")]
+pub(crate) unsafe fn fold_compact_chunk_neon_unchecked_10(
+    scaled_group10_table: *const u8,
+    anchors: *const F128,
+    deltas: *const u8,
+    a_out: *mut F128,
+    b_out: *mut F128,
+    eq_lo: *const F128,
+    lo_size: usize,
+) -> (F128, F128) {
+    use core::arch::aarch64::*;
+
+    #[inline(always)]
+    unsafe fn store_pair_nt(dst: *mut F128, x: uint64x2_t, y: uint64x2_t) {
+        unsafe {
+            core::arch::asm!(
+                "stnp {x:q}, {y:q}, [{dst}]",
+                dst = in(reg) dst,
+                x = in(vreg) x,
+                y = in(vreg) y,
+                options(nostack, preserves_flags),
+            );
+        }
+    }
+
+    unsafe {
+        let zero = vdupq_n_u64(0);
+        let mut p1_acc = WideNeon { lo: zero, hi: zero };
+        let mut pinf_acc = WideNeon { lo: zero, hi: zero };
+
+        for x_lo in 0..lo_size {
+            let out = 2 * x_lo;
+            let delta = deltas.add(out * 16);
+            let a0_code = u64::from_le(core::ptr::read_unaligned(delta.cast::<u64>()));
+            let b0_code = u64::from_le(core::ptr::read_unaligned(delta.add(8).cast::<u64>()));
+            let a1_code = u64::from_le(core::ptr::read_unaligned(delta.add(16).cast::<u64>()));
+            let b1_code = u64::from_le(core::ptr::read_unaligned(delta.add(24).cast::<u64>()));
+            let (a0_delta, a1_delta, b0_delta, b1_delta) = fold_four_row_codes_group10_q(
+                scaled_group10_table,
                 a0_code,
                 a1_code,
                 b0_code,

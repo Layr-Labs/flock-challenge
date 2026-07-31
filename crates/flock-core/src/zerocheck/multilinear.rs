@@ -50,7 +50,8 @@ mod kernels;
 use kernels::aarch64::fold_one_row_neon_unchecked_8;
 #[cfg(target_arch = "aarch64")]
 use kernels::aarch64::{
-    fold_and_message_aarch64, fold_compact_chunk_neon_unchecked_8,
+    fold_and_message_aarch64, fold_compact_chunk_neon_unchecked_10,
+    fold_compact_chunk_neon_unchecked_8,
     fold_round2_chunk_neon_unchecked_8, fold_round2_compact_chunk_neon_unchecked_8,
 };
 #[cfg(all(
@@ -427,6 +428,55 @@ impl UniSkipFoldTable {
         }
         scaled
     }
+
+    /// Regroup a challenge-scaled byte table into six 10-bit banks plus one
+    /// four-bit tail bank.  The 6,160 `F128` entries occupy 96.25 KiB: small
+    /// enough to target the M3 performance-core L1 while eliminating one of
+    /// the eight lookup chains needed by each packed 64-bit row.
+    #[cfg(any(target_arch = "aarch64", test))]
+    fn scaled_group10_from_scaled(&self, scaled: &[F128]) -> Vec<F128> {
+        const FULL_GROUPS: usize = 6;
+        const FULL_BITS: usize = 10;
+        const FULL_ENTRIES: usize = 1 << FULL_BITS;
+        const TAIL_BITS: usize = 4;
+        const TAIL_ENTRIES: usize = 1 << TAIL_BITS;
+
+        assert_eq!(self.n_chunks, 8);
+        assert_eq!(scaled.len(), self.n_chunks * 256);
+        let mut grouped = crate::scratch::take_f128(FULL_GROUPS * FULL_ENTRIES + TAIL_ENTRIES);
+
+        for group in 0..=FULL_GROUPS {
+            let (bit_start, n_bits, entries, offset) = if group < FULL_GROUPS {
+                (
+                    group * FULL_BITS,
+                    FULL_BITS,
+                    FULL_ENTRIES,
+                    group * FULL_ENTRIES,
+                )
+            } else {
+                (
+                    FULL_GROUPS * FULL_BITS,
+                    TAIL_BITS,
+                    TAIL_ENTRIES,
+                    FULL_GROUPS * FULL_ENTRIES,
+                )
+            };
+            let bank = &mut grouped[offset..offset + entries];
+            bank[0] = F128::ZERO;
+            for bit in 0..n_bits {
+                let source_bit = bit_start + bit;
+                bank[1 << bit] = scaled[(source_bit / 8) * 256 + (1 << (source_bit % 8))];
+            }
+            for value in 3..entries {
+                if value.is_power_of_two() {
+                    continue;
+                }
+                let low_bit = value & value.wrapping_neg();
+                bank[value] = bank[value ^ low_bit] + bank[low_bit];
+            }
+        }
+        grouped
+    }
 }
 
 /// Local split for compact production/reconstruction; intentionally
@@ -442,6 +492,15 @@ impl UniSkipFoldTable {
 /// local constant makes 10/11/12 straightforward to screen without changing
 /// the schedule-tuned global split.
 const COMPACT_RECONSTRUCTION_N_HI: usize = 11;
+
+/// The ten-bit table is an L1-oriented ranked-only experiment.  It is not
+/// useful on the compact test shapes, where its setup cannot amortize.
+#[cfg(all(target_arch = "aarch64", not(test)))]
+const COMPACT_GROUP10_MIN_ROWS: usize = 1 << 20;
+
+// Let the existing compact end-to-end oracle execute the AArch64 kernel.
+#[cfg(all(target_arch = "aarch64", test))]
+const COMPACT_GROUP10_MIN_ROWS: usize = 1;
 
 /// Compact materialization of the first multilinear level.
 ///
@@ -674,6 +733,12 @@ pub fn fold_compact_and_compute_round_pair(
     // Compose the sampled challenge into the resident 32 KiB byte table once.
     // Linearity makes each later row reconstruction lookup/XOR-only.
     let scaled_table = table.scaled_linear(r_fold);
+    // Six 10-bit banks plus a four-bit tail are 96.25 KiB, unlike the
+    // rejected 4 MiB 16-bit table.  This keeps the lookup currency in the
+    // L1-sized regime while removing one dependency per packed row.
+    #[cfg(target_arch = "aarch64")]
+    let scaled_group10_table = (n >= COMPACT_GROUP10_MIN_ROWS)
+        .then(|| table.scaled_group10_from_scaled(&scaled_table));
 
     let eq = SplitEqGhash::with_n_hi(&r_next[1..], COMPACT_RECONSTRUCTION_N_HI);
     let lo_size = 1usize << eq.n_lo;
@@ -703,15 +768,27 @@ pub fn fold_compact_and_compute_round_pair(
 
             #[cfg(target_arch = "aarch64")]
             let (p1, pinf) = unsafe {
-                fold_compact_chunk_neon_unchecked_8(
-                    scaled_table.as_ptr().cast::<u8>(),
-                    compact.anchors.as_ptr().add(2 * base),
-                    compact.deltas.as_ptr().add(2 * base * table.n_chunks),
-                    a_out.as_mut_ptr(),
-                    b_out.as_mut_ptr(),
-                    eq_lo.as_ptr(),
-                    lo_size,
-                )
+                if let Some(group10) = scaled_group10_table.as_ref() {
+                    fold_compact_chunk_neon_unchecked_10(
+                        group10.as_ptr().cast::<u8>(),
+                        compact.anchors.as_ptr().add(2 * base),
+                        compact.deltas.as_ptr().add(2 * base * table.n_chunks),
+                        a_out.as_mut_ptr(),
+                        b_out.as_mut_ptr(),
+                        eq_lo.as_ptr(),
+                        lo_size,
+                    )
+                } else {
+                    fold_compact_chunk_neon_unchecked_8(
+                        scaled_table.as_ptr().cast::<u8>(),
+                        compact.anchors.as_ptr().add(2 * base),
+                        compact.deltas.as_ptr().add(2 * base * table.n_chunks),
+                        a_out.as_mut_ptr(),
+                        b_out.as_mut_ptr(),
+                        eq_lo.as_ptr(),
+                        lo_size,
+                    )
+                }
             };
 
             #[cfg(not(target_arch = "aarch64"))]
@@ -756,6 +833,11 @@ pub fn fold_compact_and_compute_round_pair(
         .fold((F128::ZERO, F128::ZERO), |(s1, sinf), &(c1, cinf)| {
             (s1 + c1, sinf + cinf)
         });
+
+    #[cfg(target_arch = "aarch64")]
+    if let Some(group10) = scaled_group10_table {
+        crate::scratch::give_f128(group10);
+    }
 
     (a_out, b_out, r_next[0] * sum1, sum_inf)
 }
@@ -1935,6 +2017,72 @@ mod tests {
             crate::scratch::give_f128(legacy_a);
             crate::scratch::give_f128(legacy_b);
             crate::scratch::clear();
+        }
+    }
+
+    /// The ten-bit banks are an exact regrouping of the scaled byte basis.
+    /// Exhaust every index in all six full banks and the tail, then compare
+    /// complete packed-row folds on adversarial bit patterns.
+    #[test]
+    fn compact_group10_table_matches_byte_table_exhaustively() {
+        let table = UniSkipFoldTable::new(
+            6,
+            F128 {
+                lo: 0x8a63_1f04_d7be_259c,
+                hi: 0x34e9_ba71_0c5d_f268,
+            },
+        );
+        for rho in [
+            F128::ZERO,
+            F128 {
+                lo: 0x7f24_98cd_16a3_5be0,
+                hi: 0xc051_2de8_79b4_063a,
+            },
+        ] {
+            let scaled = table.scaled_linear(rho);
+            let grouped = table.scaled_group10_from_scaled(&scaled);
+            for group in 0..7 {
+                let (bit_start, n_bits, entries, offset) = if group < 6 {
+                    (group * 10, 10, 1 << 10, group * (1 << 10))
+                } else {
+                    (60, 4, 1 << 4, 6 * (1 << 10))
+                };
+                for index in 0..entries {
+                    let mut expected = F128::ZERO;
+                    for bit in 0..n_bits {
+                        if (index >> bit) & 1 != 0 {
+                            let source_bit = bit_start + bit;
+                            expected += scaled
+                                [(source_bit / 8) * 256 + (1 << (source_bit % 8))];
+                        }
+                    }
+                    assert_eq!(
+                        grouped[offset + index],
+                        expected,
+                        "group={group}, index={index:#05x}"
+                    );
+                }
+            }
+
+            for row in [
+                0u64,
+                u64::MAX,
+                0x0123_4567_89ab_cdef,
+                0xfedc_ba98_7654_3210,
+            ] {
+                let mut byte_fold = F128::ZERO;
+                for byte in 0..8 {
+                    byte_fold += scaled[byte * 256 + ((row >> (8 * byte)) & 0xff) as usize];
+                }
+                let mut group_fold = F128::ZERO;
+                for group in 0..6 {
+                    let index = ((row >> (10 * group)) & 0x3ff) as usize;
+                    group_fold += grouped[group * (1 << 10) + index];
+                }
+                group_fold += grouped[6 * (1 << 10) + ((row >> 60) & 0x0f) as usize];
+                assert_eq!(group_fold, byte_fold, "row={row:#018x}");
+            }
+            crate::scratch::give_f128(grouped);
         }
     }
 
