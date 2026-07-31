@@ -778,3 +778,121 @@ pub(super) unsafe fn butterfly_fused_2layer(
         }
     }
 }
+
+/// One radix-8 fused-three-layer sweep that reads eight row streams from
+/// `src` and writes eight row streams to `dst`, each stream stepping by its
+/// own row stride. Same register chain, same butterfly order, and the same
+/// seven twiddles as [`butterfly_fused_3layer_row_with_q`]; only the source
+/// and destination geometries are decoupled.
+///
+/// # Safety
+/// Both geometries valid for eight rows of `num_ntts` lanes; `dst` rows are
+/// owned exclusively by this call.
+#[target_feature(enable = "aes")]
+unsafe fn radix8_rows_from_to_q(
+    src: *const F128,
+    src_step: usize,
+    dst: *mut F128,
+    dst_step: usize,
+    num_ntts: usize,
+    t: &[core::arch::aarch64::uint64x2_t; 7],
+) {
+    use core::arch::aarch64::*;
+    unsafe {
+        for lane in 0..num_ntts {
+            let s = src.add(lane);
+            let mut v: [uint64x2_t; 8] =
+                core::array::from_fn(|j| vld1q_u64(s.add(j * src_step).cast::<u64>()));
+
+            // Layer L: stride 4, shared twiddle t[0].
+            for i in 0..4 {
+                let (a, b) = butterfly_q(v[i], v[i + 4], t[0]);
+                v[i] = a;
+                v[i + 4] = b;
+            }
+            // Layer L+1: stride 2, twiddles t[1], t[2] per half.
+            for s2 in 0..2 {
+                for i in 0..2 {
+                    let (u, w) = (4 * s2 + i, 4 * s2 + i + 2);
+                    let (a, b) = butterfly_q(v[u], v[w], t[1 + s2]);
+                    v[u] = a;
+                    v[w] = b;
+                }
+            }
+            // Layer L+2: stride 1, twiddles t[3..7] per quarter.
+            for s2 in 0..4 {
+                let (a, b) = butterfly_q(v[2 * s2], v[2 * s2 + 1], t[3 + s2]);
+                v[2 * s2] = a;
+                v[2 * s2 + 1] = b;
+            }
+
+            let d = dst.add(lane);
+            for (j, value) in v.iter().enumerate() {
+                vst1q_u64(d.add(j * dst_step).cast::<u64>(), *value);
+            }
+        }
+    }
+}
+
+/// Vector-resident twin of `portable::butterfly_fused_6layer_staged_rows`.
+///
+/// Fuses six top layers of one outer block into a single codeword read and a
+/// single codeword write by staging the intermediate 64-row group in an
+/// L1-resident tile instead of a second full-buffer round trip. See the
+/// portable form for the row-group algebra; the arithmetic, butterfly order
+/// and twiddles are unchanged, so the result is bit-identical to the two
+/// in-place radix-8 passes it replaces.
+///
+/// # Safety
+/// Same contract as the portable form: valid block geometry for `64 * k`
+/// positions of `num_ntts` lanes, a private writable `tile` of
+/// `64 * num_ntts` elements, and disjoint row ranges across concurrent calls.
+#[target_feature(enable = "aes")]
+#[allow(clippy::too_many_arguments)]
+pub(super) unsafe fn butterfly_fused_6layer_staged_rows(
+    block: *mut F128,
+    k: usize,
+    num_ntts: usize,
+    row_start: usize,
+    row_end: usize,
+    tile: *mut F128,
+    t_lo: &[F128; 7],
+    t_hi: &[[F128; 7]; 8],
+) {
+    use core::arch::aarch64::*;
+    unsafe {
+        let lo: [uint64x2_t; 7] =
+            core::array::from_fn(|i| vld1q_u64((&raw const t_lo[i]).cast::<u64>()));
+        let hi: [[uint64x2_t; 7]; 8] = core::array::from_fn(|g| {
+            core::array::from_fn(|i| vld1q_u64((&raw const t_hi[g][i]).cast::<u64>()))
+        });
+
+        let block_step = k * num_ntts;
+        for r in row_start..row_end {
+            // Layers L..L+3: eight streams `8 * k` positions apart — the
+            // geometry of the layer-`L` in-place pass — into the tile.
+            for i0 in 0..8 {
+                radix8_rows_from_to_q(
+                    block.add((i0 * k + r) * num_ntts),
+                    8 * block_step,
+                    tile.add(i0 * num_ntts),
+                    8 * num_ntts,
+                    num_ntts,
+                    &lo,
+                );
+            }
+            // Layers L+3..L+6: contiguous tile rows out to eight streams `k`
+            // positions apart — the geometry of the layer-`L+3` in-place pass.
+            for g in 0..8 {
+                radix8_rows_from_to_q(
+                    tile.add(8 * g * num_ntts),
+                    num_ntts,
+                    block.add((8 * g * k + r) * num_ntts),
+                    block_step,
+                    num_ntts,
+                    &hi[g],
+                );
+            }
+        }
+    }
+}

@@ -272,3 +272,74 @@ pub(super) unsafe fn butterfly_fused_4layer_row(
         }
     }
 }
+
+/// Portable twin of the staged radix-64 six-layer top pass.
+///
+/// Fuses layers `L..L+6` of one outer block into a single read and a single
+/// write of that block. The block holds `64 * k` positions; row group `r`
+/// owns the 64 positions `{ i * k + r : i ∈ 0..64 }`, and every butterfly in
+/// layers `L..L+6` has a stride that is a multiple of `k` positions, so the
+/// group is closed under all six layers.
+///
+/// The six layers are evaluated as two radix-8 sweeps over that group:
+/// layers `L..L+3` read the block and write the 64-row staging `tile`, and
+/// layers `L+3..L+6` read the tile and write the block. The tile is
+/// `64 * num_ntts` elements (64 KiB at the ranked shape) and stays resident,
+/// so the middle round trip that a second full-buffer pass would have paid to
+/// DRAM is paid to L1 instead.
+///
+/// Sub-pass one's eight row streams sit `8 * k` positions apart — the same
+/// geometry the layer-`L` in-place pass already used — and sub-pass two's
+/// eight destination streams sit `k` positions apart, the geometry of the
+/// layer-`L+3` in-place pass. Neither sweep changes the arithmetic, the
+/// butterfly order, or the twiddles, so the output is bit-identical to the
+/// two passes it replaces.
+///
+/// # Safety
+/// The caller guarantees the block geometry is valid for `64 * k` positions
+/// of `num_ntts` lanes, that `tile` is writable for `64 * num_ntts` elements
+/// and is private to this call, and that concurrent calls own disjoint row
+/// ranges.
+#[allow(clippy::too_many_arguments)]
+pub(super) unsafe fn butterfly_fused_6layer_staged_rows(
+    block: *mut F128,
+    k: usize,
+    num_ntts: usize,
+    row_start: usize,
+    row_end: usize,
+    tile: *mut F128,
+    t_lo: &[F128; 7],
+    t_hi: &[[F128; 7]; 8],
+) {
+    // SAFETY: caller supplies the pointer geometry and disjointness contract.
+    unsafe {
+        for r in row_start..row_end {
+            // Layers L..L+3: gather from the block, scatter into the tile.
+            for i0 in 0..8 {
+                for lane in 0..num_ntts {
+                    let mut values = [F128::ZERO; 8];
+                    for (j, value) in values.iter_mut().enumerate() {
+                        *value = *block.add(((i0 + 8 * j) * k + r) * num_ntts + lane);
+                    }
+                    butterfly_fused_3layer(&mut values, t_lo);
+                    for (j, value) in values.iter().enumerate() {
+                        *tile.add((i0 + 8 * j) * num_ntts + lane) = *value;
+                    }
+                }
+            }
+            // Layers L+3..L+6: gather from the tile, scatter into the block.
+            for g in 0..8 {
+                for lane in 0..num_ntts {
+                    let mut values = [F128::ZERO; 8];
+                    for (j, value) in values.iter_mut().enumerate() {
+                        *value = *tile.add((8 * g + j) * num_ntts + lane);
+                    }
+                    butterfly_fused_3layer(&mut values, &t_hi[g]);
+                    for (j, value) in values.iter().enumerate() {
+                        *block.add(((8 * g + j) * k + r) * num_ntts + lane) = *value;
+                    }
+                }
+            }
+        }
+    }
+}

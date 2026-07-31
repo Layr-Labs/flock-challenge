@@ -198,6 +198,49 @@ pub(super) unsafe fn butterfly_fused_3layer_rows(
     }
 }
 
+/// Staged radix-64 six-layer top pass over one outer block's row range.
+///
+/// Replaces two consecutive in-place fused-three-layer full-buffer passes
+/// with one read and one write of the block, staging the intermediate 64-row
+/// group in an L1-resident `tile` of `64 * num_ntts` elements. Bit-identical
+/// to the two passes it replaces; see the portable form for the row-group
+/// algebra and the twiddle layout.
+///
+/// # Safety
+/// Block geometry valid for `64 * k` positions of `num_ntts` lanes, `tile`
+/// writable for `64 * num_ntts` elements and private to this call, and
+/// disjoint row ranges across concurrent calls.
+#[inline]
+#[allow(clippy::too_many_arguments)]
+pub(super) unsafe fn butterfly_fused_6layer_staged_rows(
+    block: *mut F128,
+    k: usize,
+    num_ntts: usize,
+    row_start: usize,
+    row_end: usize,
+    tile: *mut F128,
+    t_lo: &[F128; 7],
+    t_hi: &[[F128; 7]; 8],
+) {
+    #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+    // SAFETY: forwarded caller contract; the cfg gate supplies `aes`.
+    unsafe {
+        if vector_resident_rows() {
+            aarch64::butterfly_fused_6layer_staged_rows(
+                block, k, num_ntts, row_start, row_end, tile, t_lo, t_hi,
+            );
+            return;
+        }
+    }
+
+    // SAFETY: forwarded caller contract.
+    unsafe {
+        portable::butterfly_fused_6layer_staged_rows(
+            block, k, num_ntts, row_start, row_end, tile, t_lo, t_hi,
+        );
+    }
+}
+
 /// Whether the AArch64 vector-resident radix-8 row kernels are used.
 ///
 /// `FLOCK_NO_NTT_NEON_ROWS=1` restores the portable `F128`-typed chain in the
