@@ -35,6 +35,7 @@ use crate::lincheck::build_eq_table;
 use crate::merkle::{self, Hash, HashKind};
 use crate::ntt::additive_ntt_f128::AdditiveNttF128;
 use serde::{Deserialize, Serialize};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 // ===================================================================
 // Config
@@ -2831,6 +2832,11 @@ fn eval_lookahead(c: &[F128; 6], rho: F128) -> SumcheckMessage {
     }
 }
 
+/// Exact performance/debug opt-out for deferred OOD glue.  The ranked path
+/// leaves this false; tests and causal A/B workers may force the eager
+/// frontier behavior without changing the transcript or proof format.
+pub static DISABLE_OOD_GLUE_FUSION: AtomicBool = AtomicBool::new(false);
+
 pub struct SumcheckProver {
     f: Vec<F128>,
     /// Single combined basis poly. After every `glue(β)`, the introduced
@@ -2850,6 +2856,10 @@ pub struct SumcheckProver {
     t_r: F128,
     transcript: Vec<SumcheckMessage>,
     pending_glue: Option<(Vec<F128>, F128)>,
+    /// One OOD basis whose transcript challenge and target contribution are
+    /// already bound, but whose pointwise update is delayed until the induced
+    /// basis arrives.  `combined_basis` has no consumer in between.
+    deferred_glue: Option<(Vec<F128>, F128)>,
 }
 
 impl SumcheckProver {
@@ -2877,6 +2887,7 @@ impl SumcheckProver {
             t_r: h1,
             transcript: Vec::new(),
             pending_glue: None,
+            deferred_glue: None,
         };
         let msg = round_msg_lsb(&inst.f, &inst.combined_basis);
         inst.transcript.push(msg);
@@ -2905,12 +2916,15 @@ impl SumcheckProver {
             t_r: h1,
             transcript: Vec::new(),
             pending_glue: None,
+            deferred_glue: None,
         };
         inst.transcript.push(first_msg);
         (inst, first_msg)
     }
 
     pub fn fold(&mut self, r: F128) -> SumcheckMessage {
+        debug_assert!(self.pending_glue.is_none(), "fold across pending glue");
+        debug_assert!(self.deferred_glue.is_none(), "fold across deferred glue");
         // Fused: fold f and combined_basis at r AND build the next-round
         // message in one parallel pass (was three passes), writing the halved
         // outputs into the persistent ping-pong spares and swapping them in.
@@ -2939,6 +2953,7 @@ impl SumcheckProver {
     /// scratch ping-pong allocation.
     fn fold2(&mut self, r_a: F128, r_b: F128) -> (SumcheckMessage, [F128; 6]) {
         debug_assert!(self.pending_glue.is_none(), "fold2 across pending glue");
+        debug_assert!(self.deferred_glue.is_none(), "fold2 across deferred glue");
         let (msg, coeffs) = fold2_and_msgs_lsb(
             &self.f,
             &self.combined_basis,
@@ -2957,6 +2972,7 @@ impl SumcheckProver {
     /// (u_0, u_2) for `Σ_x f(x) · b_new(x)` at the current dim.
     pub fn introduce_new(&mut self, b_new: Vec<F128>, h_new: F128) -> SumcheckMessage {
         assert_eq!(b_new.len(), self.f.len());
+        assert!(self.pending_glue.is_none(), "introduce across pending glue");
         let msg = round_msg_lsb(&self.f, &b_new);
         self.transcript.push(msg);
         self.pending_glue = Some((b_new, h_new));
@@ -2971,6 +2987,7 @@ impl SumcheckProver {
     /// `h_new` then `(u_0, u_2)`, exactly as the unfused path does.
     pub fn introduce_new_with_eval(&mut self, b_new: Vec<F128>) -> (SumcheckMessage, F128) {
         assert_eq!(b_new.len(), self.f.len());
+        assert!(self.pending_glue.is_none(), "introduce across pending glue");
         let (msg, h_new) = round_msg_and_eval_lsb(&self.f, &b_new);
         self.transcript.push(msg);
         self.pending_glue = Some((b_new, h_new));
@@ -2981,6 +2998,10 @@ impl SumcheckProver {
     /// `combined_basis[j] += α · b_new[j]` (pointwise), `T_r += α · h_new`.
     pub fn glue(&mut self, alpha: F128) {
         use rayon::prelude::*;
+        assert!(
+            self.deferred_glue.is_none(),
+            "eager glue across deferred glue"
+        );
         let (b_new, h_new) = self
             .pending_glue
             .take()
@@ -2997,6 +3018,65 @@ impl SumcheckProver {
                 .zip(b_new.par_iter())
                 .with_min_len(PAR_THRESHOLD / 4)
                 .for_each(|(acc, &v)| *acc += alpha * v);
+        }
+        self.t_r += alpha * h_new;
+    }
+
+    /// Bind the pending OOD claim now, but delay its pointwise basis update.
+    /// Between an OOD introduction and the following induced-basis
+    /// introduction, the prover commits/opens codewords and computes a fresh
+    /// round message using only `f` and that fresh basis; it never reads
+    /// `combined_basis`.  Keeping the OOD basis therefore removes one full
+    /// read-modify-write pass without changing any transcript operation.
+    fn defer_glue(&mut self, alpha: F128) {
+        let (b_new, h_new) = self
+            .pending_glue
+            .take()
+            .expect("defer_glue without introduce_new");
+        assert!(self.deferred_glue.is_none(), "two deferred glues");
+        assert_eq!(b_new.len(), self.combined_basis.len());
+        // Preserve the eager path's target-update point and operation order.
+        self.t_r += alpha * h_new;
+        self.deferred_glue = Some((b_new, alpha));
+    }
+
+    /// Apply the deferred OOD basis and current induced basis in one pass.
+    /// The two additions remain separate and ordered exactly as in two calls
+    /// to `glue`, so this is bit-identical even without relying on algebraic
+    /// reassociation.
+    fn glue_with_deferred(&mut self, alpha: F128) {
+        use rayon::prelude::*;
+        let (b_new, h_new) = self
+            .pending_glue
+            .take()
+            .expect("glue_with_deferred without introduce_new");
+        let (b_deferred, alpha_deferred) = self
+            .deferred_glue
+            .take()
+            .expect("glue_with_deferred without deferred OOD glue");
+        assert_eq!(b_deferred.len(), self.combined_basis.len());
+        assert_eq!(b_new.len(), self.combined_basis.len());
+        const PAR_THRESHOLD: usize = 4096;
+        if self.combined_basis.len() < PAR_THRESHOLD {
+            for ((acc, &old), &new) in self
+                .combined_basis
+                .iter_mut()
+                .zip(b_deferred.iter())
+                .zip(b_new.iter())
+            {
+                *acc += alpha_deferred * old;
+                *acc += alpha * new;
+            }
+        } else {
+            self.combined_basis
+                .par_iter_mut()
+                .zip(b_deferred.par_iter())
+                .zip(b_new.par_iter())
+                .with_min_len(PAR_THRESHOLD / 4)
+                .for_each(|((acc, &old), &new)| {
+                    *acc += alpha_deferred * old;
+                    *acc += alpha * new;
+                });
         }
         self.t_r += alpha * h_new;
     }
@@ -3338,6 +3418,8 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
     let fold_bits =
         |lvl: usize| -> u32 { config.fold_grinding_bits.get(lvl).copied().unwrap_or(0) as u32 };
     let ood_count = |lvl: usize| -> usize { config.ood_samples.get(lvl).copied().unwrap_or(0) };
+    let fuse_ood_glue = !DISABLE_OOD_GLUE_FUSION.load(Ordering::Relaxed)
+        && std::env::var_os("FLOCK_NO_OOD_GLUE_FUSION").is_none();
 
     let _t = std::time::Instant::now();
     let (mut sc_prover, start_msg) = match first_msg {
@@ -3441,9 +3523,11 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
     // value, and folds the claim `Σ_x f1(x)·eq(z,x) = y` into the running
     // sumcheck (introduce + glue). Binds the prover to a single codeword of
     // the interleaved list before any of L0's queries are drawn.
+    let mut deferred_ood_1 = false;
     {
         let _t = std::time::Instant::now();
-        for _ in 0..ood_count(1) {
+        let samples = ood_count(1);
+        for sample in 0..samples {
             let z = challenger.sample_f128_vec(n1);
             // Build eq(z, ·) once and fuse the MLE eval `y = f̂1(z)` into the
             // introduce round message (single pass over f1 + eq_z), instead of
@@ -3455,7 +3539,12 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
             challenger.observe_f128(intro.u_0);
             challenger.observe_f128(intro.u_2);
             let beta = challenger.sample_f128();
-            sc_prover.glue(beta);
+            if fuse_ood_glue && sample + 1 == samples {
+                sc_prover.defer_glue(beta);
+                deferred_ood_1 = true;
+            } else {
+                sc_prover.glue(beta);
+            }
         }
         if trace {
             t_ood += _t.elapsed();
@@ -3512,7 +3601,11 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
     challenger.observe_f128(intro_msg_0.u_0);
     challenger.observe_f128(intro_msg_0.u_2);
     let beta_0 = challenger.sample_f128();
-    sc_prover.glue(beta_0);
+    if deferred_ood_1 {
+        sc_prover.glue_with_deferred(beta_0);
+    } else {
+        sc_prover.glue(beta_0);
+    }
     if trace {
         t_intro_glue += _t.elapsed();
     }
@@ -3641,9 +3734,11 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
         recursive_roots.push(root_next);
 
         // OOD binding for the L_{i+2} commit (same as the L1 block above).
+        let mut deferred_ood_i = false;
         {
             let _t = std::time::Instant::now();
-            for _ in 0..ood_count(i + 2) {
+            let samples = ood_count(i + 2);
+            for sample in 0..samples {
                 let z = challenger.sample_f128_vec(n_next);
                 let eq_z = build_eq_table(&z);
                 let (intro, y) = sc_prover.introduce_new_with_eval(eq_z);
@@ -3652,7 +3747,12 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
                 challenger.observe_f128(intro.u_0);
                 challenger.observe_f128(intro.u_2);
                 let beta = challenger.sample_f128();
-                sc_prover.glue(beta);
+                if fuse_ood_glue && sample + 1 == samples {
+                    sc_prover.defer_glue(beta);
+                    deferred_ood_i = true;
+                } else {
+                    sc_prover.glue(beta);
+                }
             }
             if trace {
                 t_ood += _t.elapsed();
@@ -3713,7 +3813,11 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
         challenger.observe_f128(intro_msg_i.u_0);
         challenger.observe_f128(intro_msg_i.u_2);
         let beta_i = challenger.sample_f128();
-        sc_prover.glue(beta_i);
+        if deferred_ood_i {
+            sc_prover.glue_with_deferred(beta_i);
+        } else {
+            sc_prover.glue(beta_i);
+        }
         if trace {
             t_intro_glue += _t.elapsed();
         }
@@ -5336,6 +5440,67 @@ mod tests {
     }
 
     use super::*;
+
+    /// The production methods must match two eager glues slot-for-slot at all
+    /// five ranked dimensions, including target and transcript state.
+    #[test]
+    fn ood_glue_fusion_matches_eager_ranked_shapes() {
+        fn values(n: usize, salt: u64) -> Vec<F128> {
+            (0..n)
+                .map(|i| {
+                    let x = (i as u64)
+                        .wrapping_add(salt)
+                        .wrapping_mul(0x9E37_79B9_7F4A_7C15);
+                    F128 {
+                        lo: x ^ x.rotate_left(17),
+                        hi: x.rotate_left(31) ^ salt,
+                    }
+                })
+                .collect()
+        }
+
+        for log_n in [19usize, 16, 13, 10, 7] {
+            let n = 1usize << log_n;
+            let f = values(n, 0x10);
+            let initial = values(n, 0x20);
+            let ood = values(n, 0x30);
+            let induced = values(n, 0x40);
+            let target = F128 { lo: 0x51, hi: 0x52 };
+            let h_ood = F128 { lo: 0x61, hi: 0x62 };
+            let h_induced = F128 { lo: 0x71, hi: 0x72 };
+            let alpha_ood = F128 { lo: 0x81, hi: 0x82 };
+            let alpha_induced = F128 { lo: 0x91, hi: 0x92 };
+
+            let (mut eager, eager_start) = SumcheckProver::new(f.clone(), initial.clone(), target);
+            let (mut fused, fused_start) = SumcheckProver::new(f, initial, target);
+            assert_eq!(eager_start, fused_start);
+
+            let eager_ood_msg = eager.introduce_new(ood.clone(), h_ood);
+            eager.glue(alpha_ood);
+            let eager_induced_msg = eager.introduce_new(induced.clone(), h_induced);
+            eager.glue(alpha_induced);
+
+            let fused_ood_msg = fused.introduce_new(ood, h_ood);
+            fused.defer_glue(alpha_ood);
+            let fused_induced_msg = fused.introduce_new(induced, h_induced);
+            fused.glue_with_deferred(alpha_induced);
+
+            assert_eq!(eager_ood_msg, fused_ood_msg, "OOD message at 2^{log_n}");
+            assert_eq!(
+                eager_induced_msg, fused_induced_msg,
+                "induced message at 2^{log_n}"
+            );
+            assert_eq!(
+                eager.combined_basis, fused.combined_basis,
+                "combined_basis at 2^{log_n}"
+            );
+            assert_eq!(eager.t_r, fused.t_r, "t_r at 2^{log_n}");
+            assert_eq!(
+                eager.transcript, fused.transcript,
+                "transcript at 2^{log_n}"
+            );
+        }
+    }
 
     /// Worked example: `LigeritoSecurityConfig` for BLAKE3 m=29 at rate 1/2.
     /// Paper-compatible m=29 fast example, mechanically derived in the
@@ -7219,6 +7384,28 @@ mod tests {
             &wtns_0.mat,
             &wtns_0.tree,
             &mut p_ch,
+        );
+
+        // Atomic opt-out must reproduce the optimized proof byte-for-byte for
+        // the same fixed witness and Fiat-Shamir domain.  This config has two
+        // OOD samples at both levels, so it also checks that only the last OOD
+        // basis is deferred while earlier samples stay eager.
+        let old_opt_out = DISABLE_OOD_GLUE_FUSION.swap(true, Ordering::SeqCst);
+        let mut eager_ch = crate::challenger::FsChallenger::new(b"ood-test");
+        let eager_proof = recursive_prover_with_basis(
+            &p_cfg,
+            poly.clone(),
+            b.clone(),
+            target,
+            &wtns_0.mat,
+            &wtns_0.tree,
+            &mut eager_ch,
+        );
+        DISABLE_OOD_GLUE_FUSION.store(old_opt_out, Ordering::SeqCst);
+        assert_eq!(
+            bincode::serialize(&proof).expect("serialize fused proof"),
+            bincode::serialize(&eager_proof).expect("serialize eager proof"),
+            "deferred and eager OOD glue proofs differ"
         );
 
         // Sanity: the new proof fields are populated.
