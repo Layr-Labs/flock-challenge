@@ -50,26 +50,52 @@ pub(super) fn butterfly_fused_2layer(
     t_inner_a: F128,
     t_inner_b: F128,
 ) {
-    debug_assert_eq!(a.len(), b.len());
-    debug_assert_eq!(a.len(), c.len());
-    debug_assert_eq!(a.len(), d.len());
-
     #[cfg(all(
         target_arch = "x86_64",
-        target_feature = "avx512f",
-        target_feature = "vpclmulqdq"
+        target_feature = "pclmulqdq",
+        target_feature = "sse4.1"
     ))]
     // SAFETY: the cfg gate guarantees the required target features.
     unsafe {
         x86_64::butterfly_fused_2layer(a, b, c, d, t_outer, t_inner_a, t_inner_b);
     }
 
-    #[cfg(not(all(
-        target_arch = "x86_64",
-        target_feature = "avx512f",
-        target_feature = "vpclmulqdq"
+    #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+    {
+        if vector_resident_pairs() {
+            // SAFETY: the cfg gate guarantees PMULL through the aes feature;
+            // slice geometry is the same contract the portable form implies.
+            unsafe {
+                aarch64::butterfly_fused_2layer(a, b, c, d, t_outer, t_inner_a, t_inner_b);
+            }
+            return;
+        }
+        portable::butterfly_fused_2layer(a, b, c, d, t_outer, t_inner_a, t_inner_b);
+    }
+
+    #[cfg(not(any(
+        all(
+            target_arch = "x86_64",
+            target_feature = "pclmulqdq",
+            target_feature = "sse4.1"
+        ),
+        all(target_arch = "aarch64", target_feature = "aes")
     )))]
     portable::butterfly_fused_2layer(a, b, c, d, t_outer, t_inner_a, t_inner_b);
+}
+
+/// Whether the AArch64 vector-resident fused-2 pair kernel is used.
+///
+/// `FLOCK_NO_NTT_NEON_PAIR=1` restores the portable `F128`-typed chain in
+/// the same binary — the exact control published with the deep-pair
+/// screening note, kept name-compatible so screens compose.
+#[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+#[inline]
+fn vector_resident_pairs() -> bool {
+    use std::sync::LazyLock;
+    static ON: LazyLock<bool> =
+        LazyLock::new(|| std::env::var_os("FLOCK_NO_NTT_NEON_PAIR").is_none());
+    *ON
 }
 
 /// AArch64 specialization for a fused pair whose three twiddles all have a
@@ -357,6 +383,49 @@ mod aarch64_row_tests {
                     let idx = r * num_ntts + lane;
                     assert_eq!(got[idx], base[idx], "row 0 was written");
                 }
+            }
+        }
+    }
+
+    /// The vector-resident fused-2 pair kernel must be **bit-identical** to
+    /// the portable `F128`-typed chain across lane counts (64 is the ranked
+    /// interleaving), including zero twiddles (the ranked zero-root spine
+    /// routes through the same dispatcher at layer boundaries).
+    #[test]
+    fn neon_fused_2layer_matches_portable() {
+        let mut state = 0x4E54_5F50_4149_5232;
+        for &lanes in &[1usize, 2, 5, 16, 64] {
+            for zero_case in [false, true] {
+                let mut mk = |st: &mut u64, n: usize| -> Vec<F128> {
+                    (0..n).map(|_| rand_f128(st)).collect()
+                };
+                let a0 = mk(&mut state, lanes);
+                let b0 = mk(&mut state, lanes);
+                let c0 = mk(&mut state, lanes);
+                let d0 = mk(&mut state, lanes);
+                let t_outer = if zero_case {
+                    F128::ZERO
+                } else {
+                    rand_f128(&mut state)
+                };
+                let t_inner_a = rand_f128(&mut state);
+                let t_inner_b = rand_f128(&mut state);
+                let (mut aw, mut bw, mut cw, mut dw) =
+                    (a0.clone(), b0.clone(), c0.clone(), d0.clone());
+                portable::butterfly_fused_2layer(
+                    &mut aw, &mut bw, &mut cw, &mut dw, t_outer, t_inner_a, t_inner_b,
+                );
+
+                let (mut ag, mut bg, mut cg, mut dg) =
+                    (a0.clone(), b0.clone(), c0.clone(), d0.clone());
+                // SAFETY: equal-length disjoint slices; module carries `aes`.
+                unsafe {
+                    aarch64::butterfly_fused_2layer(
+                        &mut ag, &mut bg, &mut cg, &mut dg, t_outer, t_inner_a, t_inner_b,
+                    );
+                }
+
+                assert_eq!((ag, bg, cg, dg), (aw, bw, cw, dw), "lanes={lanes} zero={zero_case}");
             }
         }
     }

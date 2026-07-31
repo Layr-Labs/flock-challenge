@@ -194,6 +194,52 @@ pub(super) unsafe fn butterfly_fused_3layer_row(
     }
 }
 
+/// Vector-resident twin of `portable::butterfly_fused_2layer`.
+///
+/// Same movement-elimination treatment as [`butterfly_fused_3layer_row`]:
+/// all four lane values and both butterfly stages stay in `uint64x2_t`, so
+/// none of the portable chain's GPR↔NEON repacks or scalar `eor`s are
+/// emitted. PMULL count is unchanged (four `mul_q` per lane) — the deletion
+/// is purely the inter-domain movement the promoted radix-8 row treatment
+/// removed one region up.
+///
+/// # Safety
+/// Caller guarantees the four slices are equal-length, disjoint, and valid —
+/// the same contract the portable form's shape implies.
+#[target_feature(enable = "aes")]
+pub(super) unsafe fn butterfly_fused_2layer(
+    a: &mut [F128],
+    b: &mut [F128],
+    c: &mut [F128],
+    d: &mut [F128],
+    t_outer: F128,
+    t_inner_a: F128,
+    t_inner_b: F128,
+) {
+    use core::arch::aarch64::*;
+    unsafe {
+        let to = vld1q_u64((&raw const t_outer).cast::<u64>());
+        let tia = vld1q_u64((&raw const t_inner_a).cast::<u64>());
+        let tib = vld1q_u64((&raw const t_inner_b).cast::<u64>());
+        for lane in 0..a.len() {
+            let xa = vld1q_u64(a.as_ptr().add(lane).cast::<u64>());
+            let xb = vld1q_u64(b.as_ptr().add(lane).cast::<u64>());
+            let xc = vld1q_u64(c.as_ptr().add(lane).cast::<u64>());
+            let xd = vld1q_u64(d.as_ptr().add(lane).cast::<u64>());
+
+            let (na, nc) = butterfly_q(xa, xc, to);
+            let (nb, nd) = butterfly_q(xb, xd, to);
+            let (fa, fb) = butterfly_q(na, nb, tia);
+            let (fc, fd) = butterfly_q(nc, nd, tib);
+
+            vst1q_u64(a.as_mut_ptr().add(lane).cast::<u64>(), fa);
+            vst1q_u64(b.as_mut_ptr().add(lane).cast::<u64>(), fb);
+            vst1q_u64(c.as_mut_ptr().add(lane).cast::<u64>(), fc);
+            vst1q_u64(d.as_mut_ptr().add(lane).cast::<u64>(), fd);
+        }
+    }
+}
+
 /// Vector-resident twin of `portable::butterfly_fused_3layer_zero_root_row`.
 ///
 /// Twiddles 0, 1 and 3 are zero on the root spine, so those butterflies are
