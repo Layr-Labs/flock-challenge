@@ -1568,28 +1568,28 @@ fn butterfly_interleaved_fused_3layer_all_blocks_hetero(
         let row_start = tile * ROWS_PER_TILE;
         let row_end = (row_start + ROWS_PER_TILE).min(eighth);
         let block_base = unsafe { base.ptr().add(block * block_elems) };
-        for row in row_start..row_end {
-            // SAFETY: each queue index maps to one disjoint `(block, row)`
-            // tile. Rows within a tile are serial and all derived addresses
-            // are in the validated block range.
-            unsafe {
-                if block == 0 {
-                    kernels::butterfly_fused_3layer_zero_root_row(
-                        block_base,
-                        eighth,
-                        num_ntts,
-                        row,
-                        &twiddles[block],
-                    )
-                } else {
-                    kernels::butterfly_fused_3layer_row(
-                        block_base,
-                        eighth,
-                        num_ntts,
-                        row,
-                        &twiddles[block],
-                    )
-                }
+        // SAFETY: each queue index maps to one disjoint `(block, row)` tile;
+        // the tile helper keeps its shared twiddles live across the serial
+        // rows and writes only within the validated block range.
+        unsafe {
+            if block == 0 {
+                kernels::butterfly_fused_3layer_zero_root_rows(
+                    block_base,
+                    eighth,
+                    num_ntts,
+                    row_start,
+                    row_end,
+                    &twiddles[block],
+                )
+            } else {
+                kernels::butterfly_fused_3layer_rows(
+                    block_base,
+                    eighth,
+                    num_ntts,
+                    row_start,
+                    row_end,
+                    &twiddles[block],
+                )
             }
         }
     });
