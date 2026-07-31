@@ -2101,6 +2101,84 @@ fn transpose_forward_ntt_fused_3layer(
     });
 }
 
+/// Apply the final three transpose layers while materializing only the low
+/// half of the result. This is the `layer == 0` specialization of
+/// [`transpose_forward_ntt_fused_3layer`]. The induction path immediately
+/// discards the high half for rate two, so its four root butterflies only
+/// need their top outputs (`a + b`); the bottom multiply and store are dead.
+fn transpose_forward_ntt_fused_3layer_low_half(
+    ntt: &AdditiveNttF128,
+    data: &mut [F128],
+    log_d: usize,
+) {
+    use rayon::prelude::*;
+
+    #[inline(always)]
+    fn butterfly(values: &mut [F128; 8], a: usize, b: usize, twiddle: F128) {
+        let sum = values[a] + values[b];
+        values[a] = sum;
+        values[b] = twiddle * sum + values[b];
+    }
+
+    debug_assert!(log_d >= 3);
+    debug_assert_eq!(data.len(), 1usize << log_d);
+    let eighth = data.len() >> 3;
+    let layer_1_twiddles = [ntt.twiddle(1, 0), ntt.twiddle(1, 1)];
+    let layer_2_twiddles = [
+        ntt.twiddle(2, 0),
+        ntt.twiddle(2, 1),
+        ntt.twiddle(2, 2),
+        ntt.twiddle(2, 3),
+    ];
+
+    let data_ptr = data.as_mut_ptr() as usize;
+    (0..eighth).into_par_iter().for_each(|row| {
+        let mut values = [F128::ZERO; 8];
+        // SAFETY: each row owns the eight distinct positions
+        // `row + i*eighth`, and different rows never overlap. Every input is
+        // loaded before this job writes its four retained output positions.
+        unsafe {
+            let ptr = data_ptr as *mut F128;
+            for (i, value) in values.iter_mut().enumerate() {
+                *value = *ptr.add(row + i * eighth);
+            }
+            for pair in 0..4 {
+                butterfly(
+                    &mut values,
+                    2 * pair,
+                    2 * pair + 1,
+                    layer_2_twiddles[pair],
+                );
+            }
+            for half in 0..2 {
+                butterfly(
+                    &mut values,
+                    4 * half,
+                    4 * half + 2,
+                    layer_1_twiddles[half],
+                );
+                butterfly(
+                    &mut values,
+                    4 * half + 1,
+                    4 * half + 3,
+                    layer_1_twiddles[half],
+                );
+            }
+            for i in 0..4 {
+                *ptr.add(row + i * eighth) = values[i] + values[i + 4];
+            }
+        }
+    });
+}
+
+/// `FLOCK_NO_INDUCE_NTT_LOW_HALF=1` restores the full final transpose pass
+/// followed by truncation, allowing a same-binary performance control.
+fn induce_ntt_low_half_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("FLOCK_NO_INDUCE_NTT_LOW_HALF").is_none())
+}
+
 /// Transposed forward additive NTT, `Fᵀ`, in place over `2^log_d` coefficients.
 /// Forward butterfly is `M=[[1,t],[1,t+1]]`; transpose `Mᵀ=[[1,1],[t,t+1]]` is
 /// `s=a+b; top=s; bot=t·s+b`, applied in **reverse** layer order. (Baseline:
@@ -2198,7 +2276,13 @@ pub(crate) fn induce_sumcheck_poly_via_ntt(
         c
     } else {
         let ntt = AdditiveNttF128::standard(log_block);
-        transpose_forward_ntt_sparse(&ntt, queries, &alpha_pows, log_block)
+        transpose_forward_ntt_sparse(
+            &ntt,
+            queries,
+            &alpha_pows,
+            log_block,
+            log_inv_rate == 1 && induce_ntt_low_half_enabled(),
+        )
     };
     coeffs.truncate(n);
     (coeffs, enforced_sum)
@@ -2264,6 +2348,7 @@ fn transpose_forward_ntt_sparse(
     positions: &[usize],
     values: &[F128],
     log_d: usize,
+    keep_low_half: bool,
 ) -> Vec<F128> {
     use rayon::prelude::*;
     use std::collections::HashMap;
@@ -2278,6 +2363,9 @@ fn transpose_forward_ntt_sparse(
         }
         if log_d > 0 {
             transpose_forward_ntt(ntt, &mut data, log_d);
+        }
+        if keep_low_half {
+            data.truncate(n >> 1);
         }
         return data;
     }
@@ -2331,7 +2419,11 @@ fn transpose_forward_ntt_sparse(
     let mut remaining = log_d - k;
     while remaining >= 3 {
         let layer = remaining - 3;
-        transpose_forward_ntt_fused_3layer(ntt, &mut data, log_d, layer);
+        if keep_low_half && layer == 0 {
+            transpose_forward_ntt_fused_3layer_low_half(ntt, &mut data, log_d);
+        } else {
+            transpose_forward_ntt_fused_3layer(ntt, &mut data, log_d, layer);
+        }
         remaining -= 3;
     }
     for layer in (0..remaining).rev() {
@@ -2368,6 +2460,9 @@ fn transpose_forward_ntt_sparse(
                     });
             }
         }
+    }
+    if keep_low_half {
+        data.truncate(n >> 1);
     }
     data
 }
@@ -6553,9 +6648,67 @@ mod tests {
                     dense[p] += v;
                 }
                 transpose_forward_ntt(&ntt, &mut dense, log_d);
-                let sparse = transpose_forward_ntt_sparse(&ntt, &positions, &values, log_d);
+                let sparse =
+                    transpose_forward_ntt_sparse(&ntt, &positions, &values, log_d, false);
                 assert_eq!(sparse, dense, "log_d={log_d}, nq={nq}");
             }
+        }
+    }
+
+    /// The rate-two induction specialization must produce exactly the prefix
+    /// of the full fused root pass, including the ranked `log_d = 20` shape.
+    #[test]
+    fn transpose_fused_root_low_half_matches_full_prefix() {
+        use crate::challenger::Challenger;
+
+        for &log_d in &[3usize, 14, 20] {
+            let mut challenger =
+                crate::challenger::RandomChallenger::new(0x10A0_4A1F ^ log_d as u64);
+            let mut expected = challenger.sample_f128_vec(1usize << log_d);
+            let mut actual = expected.clone();
+            let ntt = AdditiveNttF128::standard(log_d);
+
+            transpose_forward_ntt_fused_3layer(&ntt, &mut expected, log_d, 0);
+            transpose_forward_ntt_fused_3layer_low_half(&ntt, &mut actual, log_d);
+
+            assert_eq!(
+                &actual[..actual.len() / 2],
+                &expected[..expected.len() / 2],
+                "log_d={log_d}"
+            );
+        }
+    }
+
+    /// Exercise the whole sparse-prefix path with the final fused root pruned,
+    /// once at a small oracle-friendly size and once at the ranked size.
+    #[test]
+    fn transpose_sparse_low_half_matches_dense_prefix() {
+        use crate::challenger::Challenger;
+
+        for &log_d in &[14usize, 20] {
+            let n = 1usize << log_d;
+            let mut challenger =
+                crate::challenger::RandomChallenger::new(0x5A45_E1F0 ^ log_d as u64);
+            let ntt = AdditiveNttF128::standard(log_d);
+            let mut positions = Vec::with_capacity(218);
+            let mut values = Vec::with_capacity(218);
+            while positions.len() < 218 {
+                let position = (challenger.sample_f128().lo as usize) % n;
+                if !positions.contains(&position) {
+                    positions.push(position);
+                    values.push(challenger.sample_f128());
+                }
+            }
+
+            let mut dense = vec![F128::ZERO; n];
+            for (&position, &value) in positions.iter().zip(&values) {
+                dense[position] += value;
+            }
+            transpose_forward_ntt(&ntt, &mut dense, log_d);
+
+            let low_half =
+                transpose_forward_ntt_sparse(&ntt, &positions, &values, log_d, true);
+            assert_eq!(low_half.as_slice(), &dense[..n / 2], "log_d={log_d}");
         }
     }
 
