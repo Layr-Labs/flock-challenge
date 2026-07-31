@@ -2028,6 +2028,64 @@ pub(crate) fn induce_sumcheck_poly(
     (basis_poly, enforced_sum)
 }
 
+#[inline(always)]
+fn transpose_forward_ntt_butterfly(values: &mut [F128; 8], a: usize, b: usize, twiddle: F128) {
+    let sum = values[a] + values[b];
+    values[a] = sum;
+    values[b] = twiddle * sum + values[b];
+}
+
+#[inline(always)]
+fn transpose_forward_ntt_3layer_row(values: &mut [F128; 8], twiddles: &[F128; 7]) {
+    for pair in 0..4 {
+        transpose_forward_ntt_butterfly(values, 2 * pair, 2 * pair + 1, twiddles[3 + pair]);
+    }
+    for half in 0..2 {
+        transpose_forward_ntt_butterfly(values, 4 * half, 4 * half + 2, twiddles[1 + half]);
+        transpose_forward_ntt_butterfly(values, 4 * half + 1, 4 * half + 3, twiddles[1 + half]);
+    }
+    for i in 0..4 {
+        transpose_forward_ntt_butterfly(values, i, i + 4, twiddles[0]);
+    }
+}
+
+/// Sparse-input counterpart of [`transpose_forward_ntt_3layer_row`]. A
+/// butterfly whose two source windows are inactive consumes two zeros and can
+/// be omitted. Activity spreads to both outputs after every executed
+/// butterfly, so the mask tracks exactly which later butterflies are needed.
+#[inline(always)]
+fn transpose_forward_ntt_sparse_3layer_row(
+    values: &mut [F128; 8],
+    twiddles: &[F128; 7],
+    input_mask: u8,
+) {
+    if input_mask == u8::MAX {
+        transpose_forward_ntt_3layer_row(values, twiddles);
+        return;
+    }
+
+    let mut active_mask = input_mask;
+    for pair in 0..4 {
+        let pair_mask = 0b11 << (2 * pair);
+        if active_mask & pair_mask != 0 {
+            transpose_forward_ntt_butterfly(values, 2 * pair, 2 * pair + 1, twiddles[3 + pair]);
+            active_mask |= pair_mask;
+        }
+    }
+    for half in 0..2 {
+        let half_mask = 0b1111 << (4 * half);
+        if active_mask & half_mask != 0 {
+            transpose_forward_ntt_butterfly(values, 4 * half, 4 * half + 2, twiddles[1 + half]);
+            transpose_forward_ntt_butterfly(values, 4 * half + 1, 4 * half + 3, twiddles[1 + half]);
+            active_mask |= half_mask;
+        }
+    }
+    debug_assert_ne!(active_mask, 0);
+    for i in 0..4 {
+        transpose_forward_ntt_butterfly(values, i, i + 4, twiddles[0]);
+    }
+}
+
 /// Apply three consecutive transpose layers in one read/write pass. `layer`
 /// is the lowest (root-most) of the three; the transpose executes forward
 /// layers `layer+2`, `layer+1`, then `layer`.
@@ -2038,13 +2096,6 @@ fn transpose_forward_ntt_fused_3layer(
     layer: usize,
 ) {
     use rayon::prelude::*;
-
-    #[inline(always)]
-    fn butterfly(values: &mut [F128; 8], a: usize, b: usize, twiddle: F128) {
-        let sum = values[a] + values[b];
-        values[a] = sum;
-        values[b] = twiddle * sum + values[b];
-    }
 
     let num_blocks = 1usize << layer;
     let block_size = 1usize << (log_d - layer);
@@ -2084,16 +2135,7 @@ fn transpose_forward_ntt_fused_3layer(
                 *value = *ptr.add(base + i * eighth);
             }
             let tw = &twiddles[block];
-            for pair in 0..4 {
-                butterfly(&mut values, 2 * pair, 2 * pair + 1, tw[3 + pair]);
-            }
-            for half in 0..2 {
-                butterfly(&mut values, 4 * half, 4 * half + 2, tw[1 + half]);
-                butterfly(&mut values, 4 * half + 1, 4 * half + 3, tw[1 + half]);
-            }
-            for i in 0..4 {
-                butterfly(&mut values, i, i + 4, tw[0]);
-            }
+            transpose_forward_ntt_3layer_row(&mut values, tw);
             for (i, &value) in values.iter().enumerate() {
                 *ptr.add(base + i * eighth) = value;
             }
@@ -2389,6 +2431,98 @@ fn densify_active_windows(
     data
 }
 
+#[derive(Clone, Copy)]
+struct SparseFusedBlock {
+    sources: [usize; 8],
+    twiddles: [F128; 7],
+    active_mask: u8,
+}
+
+/// Materialize the sparse prefix directly through the first radix-8 dense
+/// suffix pass. At the prefix boundary, that pass consumes exactly eight
+/// adjacent sparse windows per block. Loading those windows from the compact
+/// arena (and synthesizing inactive windows as zero) avoids writing the dense
+/// domain once only to read it back immediately.
+fn densify_through_first_fused_suffix(
+    ntt: &AdditiveNttF128,
+    arena: &[F128],
+    groups: &[ActiveWindow],
+    log_d: usize,
+    prefix_k: usize,
+) -> Vec<F128> {
+    use rayon::prelude::*;
+
+    const INACTIVE: usize = usize::MAX;
+    let n = 1usize << log_d;
+    let window_len = 1usize << prefix_k;
+    let remaining = log_d - prefix_k;
+    debug_assert!(remaining >= 3);
+    let layer = remaining - 3;
+    let num_blocks = 1usize << layer;
+    let block_size = window_len << 3;
+
+    let mut blocks: Vec<SparseFusedBlock> = (0..num_blocks)
+        .map(|block| {
+            let mut twiddles = [F128::ZERO; 7];
+            twiddles[0] = ntt.twiddle(layer, block);
+            for s in 0..2 {
+                twiddles[1 + s] = ntt.twiddle(layer + 1, 2 * block + s);
+            }
+            for s in 0..4 {
+                twiddles[3 + s] = ntt.twiddle(layer + 2, 4 * block + s);
+            }
+            SparseFusedBlock {
+                sources: [INACTIVE; 8],
+                twiddles,
+                active_mask: 0,
+            }
+        })
+        .collect();
+    for (arena_index, group) in groups.iter().enumerate() {
+        let block = &mut blocks[group.window_index >> 3];
+        let window_in_block = group.window_index & 7;
+        block.sources[window_in_block] = arena_index;
+        block.active_mask |= 1 << window_in_block;
+    }
+
+    let mut data: Vec<F128> = crate::alloc_uninit_vec(n);
+    let arena_ptr = arena.as_ptr() as usize;
+    let data_ptr = data.as_mut_ptr() as usize;
+    (0..num_blocks).into_par_iter().for_each(|block_index| {
+        let block = &blocks[block_index];
+        // SAFETY: each job owns one complete, disjoint destination block.
+        // Inactive blocks are initialized to the all-zero representation
+        // of `F128`. Active blocks write each of their eight windows row by
+        // row. Together the jobs cover the allocation exactly once, while
+        // the compact source arena remains immutable.
+        unsafe {
+            let source = arena_ptr as *const F128;
+            let destination = (data_ptr as *mut F128).add(block_index * block_size);
+            if block.active_mask == 0 {
+                std::ptr::write_bytes(destination, 0, block_size);
+                return;
+            }
+            for row in 0..window_len {
+                let mut values = [F128::ZERO; 8];
+                for (value, &arena_index) in values.iter_mut().zip(&block.sources) {
+                    if arena_index != INACTIVE {
+                        *value = *source.add(arena_index * window_len + row);
+                    }
+                }
+                transpose_forward_ntt_sparse_3layer_row(
+                    &mut values,
+                    &block.twiddles,
+                    block.active_mask,
+                );
+                for (i, &value) in values.iter().enumerate() {
+                    *destination.add(row + i * window_len) = value;
+                }
+            }
+        }
+    });
+    data
+}
+
 fn transpose_forward_ntt_dense_suffix(
     ntt: &AdditiveNttF128,
     data: &mut [F128],
@@ -2475,9 +2609,19 @@ fn transpose_forward_ntt_sparse(
 
     transform_active_windows(ntt, &mut arena, &groups, k, log_d);
 
-    let mut data = densify_active_windows(&arena, &groups, log_d, k);
+    static FUSED_DENSIFY_ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let use_fused_densify = *FUSED_DENSIFY_ENABLED
+        .get_or_init(|| std::env::var_os("FLOCK_NO_INDUCE_FUSED_DENSIFY").is_none());
+    let (mut data, completed_prefix) = if use_fused_densify {
+        (
+            densify_through_first_fused_suffix(ntt, &arena, &groups, log_d, k),
+            k + 3,
+        )
+    } else {
+        (densify_active_windows(&arena, &groups, log_d, k), k)
+    };
 
-    transpose_forward_ntt_dense_suffix(ntt, &mut data, log_d, k);
+    transpose_forward_ntt_dense_suffix(ntt, &mut data, log_d, completed_prefix);
     data
 }
 
@@ -6857,6 +7001,34 @@ mod tests {
             transpose_forward_ntt(&ntt, &mut actual, log_d);
 
             assert_eq!(actual, expected, "log_d={log_d}");
+        }
+    }
+
+    /// Every nonempty sparse-window mask must produce the same radix-8 row as
+    /// the generic kernel when inactive input lanes are zero.
+    #[test]
+    fn transpose_sparse_fused_row_matches_generic_for_all_masks() {
+        use crate::challenger::Challenger;
+
+        let mut challenger = crate::challenger::RandomChallenger::new(0x5A12_5E88);
+        for input_mask in 1u8..=u8::MAX {
+            for _ in 0..4 {
+                let mut sparse = [F128::ZERO; 8];
+                for (lane, value) in sparse.iter_mut().enumerate() {
+                    if input_mask & (1 << lane) != 0 {
+                        *value = challenger.sample_f128();
+                    }
+                }
+                let twiddles: [F128; 7] = std::array::from_fn(|_| challenger.sample_f128());
+                let mut generic = sparse;
+                transpose_forward_ntt_3layer_row(&mut generic, &twiddles);
+                transpose_forward_ntt_sparse_3layer_row(
+                    &mut sparse,
+                    &twiddles,
+                    input_mask,
+                );
+                assert_eq!(sparse, generic, "input_mask={input_mask:#010b}");
+            }
         }
     }
 
