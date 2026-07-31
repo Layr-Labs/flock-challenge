@@ -233,11 +233,16 @@ pub fn commit_into(
     // full replica store here and halving that pass's loads. Every other
     // shape writes the replica state and starts the NTT at `log_inv_rate`.
     if ranked_from_message_supported(params, &codeword, z_packed) {
-        return finalize_commit_impl(codeword, params, Some(z_packed));
+        return finalize_commit_impl(
+            codeword,
+            params,
+            params.log_inv_rate,
+            Some(z_packed),
+        );
     }
     replicate_message_fill(&mut codeword, z_packed);
 
-    finalize_commit(codeword, params)
+    finalize_commit(codeword, params, params.log_inv_rate)
 }
 
 /// Whether the ranked rate-1/2 commit will fuse the replicate-fill into the
@@ -288,7 +293,31 @@ pub fn commit_preinitialized(
         codeword_len,
         "commit_preinitialized: codeword buffer has wrong length"
     );
-    finalize_commit(codeword, params)
+    finalize_commit(codeword, params, params.log_inv_rate)
+}
+
+/// Commit from the exact state after the ranked rate-1/2 transform's first
+/// radix-8 group (layers 1 through 3 after the trivial copy layer).
+///
+/// This is an internal producer/consumer seam for the ranked witness driver.
+/// Every codeword element must already equal the ordinary transform at layer
+/// 4; all verifier-facing layout and remaining NTT/Merkle work are unchanged.
+#[doc(hidden)]
+pub fn commit_post_radix8_preinitialized(
+    z_packed: &[F128],
+    codeword: Vec<F128>,
+    params: &PcsParams,
+) -> (Commitment, ProverData) {
+    params.validate();
+    assert_eq!(z_packed.len(), 1usize << params.log_msg_len());
+    assert_eq!(params.log_inv_rate, 1);
+    let codeword_len = params.n_positions() * params.num_ntts();
+    assert_eq!(
+        codeword.len(),
+        codeword_len,
+        "commit_post_radix8_preinitialized: codeword buffer has wrong length"
+    );
+    finalize_commit(codeword, params, 4)
 }
 
 /// Process CPU (user+system) in ms for `FLOCK_COMMIT_TIMING` diagnostics.
@@ -388,6 +417,7 @@ fn ranked_ntt_with_pipelined_leaves(
     ntt: &AdditiveNttF128,
     codeword: &mut [F128],
     params: &PcsParams,
+    start_layer: usize,
     tree: &mut [Hash],
     helper: &rayon::ThreadPool,
     from_message: Option<&[F128]>,
@@ -481,17 +511,17 @@ fn ranked_ntt_with_pipelined_leaves(
                 msg,
                 codeword,
                 num_ntts,
-                params.log_inv_rate,
+                start_layer,
             ),
             None => ntt.forward_transform_interleaved_ranked_top_from_layer(
                 codeword,
                 num_ntts,
-                params.log_inv_rate,
+                start_layer,
             ),
         }
     } else if let Some(msg) = from_message {
         // Gate mismatch fallback: materialize the replica state the ordinary
-        // way; the unsplit transform below starts at `log_inv_rate`.
+        // way; the unsplit transform below starts at `start_layer`.
         replicate_message_fill(codeword, msg);
     }
 
@@ -522,14 +552,14 @@ fn ranked_ntt_with_pipelined_leaves(
             ntt.forward_transform_interleaved_ranked_deep_and_then(
                 codeword,
                 num_ntts,
-                params.log_inv_rate,
+                start_layer,
                 finish_chunk,
             );
         } else {
             ntt.forward_transform_interleaved_from_layer_and_then(
                 codeword,
                 num_ntts,
-                params.log_inv_rate,
+                start_layer,
                 finish_chunk,
             );
         }
@@ -555,8 +585,12 @@ fn ranked_ntt_with_pipelined_leaves(
 
 /// Shared tail of [`commit`] / [`commit_into`]: interleaved forward additive
 /// NTT (RS-encode every lane) then the initial Merkle tree over codeword rows.
-fn finalize_commit(codeword: Vec<F128>, params: &PcsParams) -> (Commitment, ProverData) {
-    finalize_commit_impl(codeword, params, None)
+fn finalize_commit(
+    codeword: Vec<F128>,
+    params: &PcsParams,
+    start_layer: usize,
+) -> (Commitment, ProverData) {
+    finalize_commit_impl(codeword, params, start_layer, None)
 }
 
 /// [`finalize_commit`] with an optional unmaterialized rate-1/2 message: when
@@ -567,6 +601,7 @@ fn finalize_commit(codeword: Vec<F128>, params: &PcsParams) -> (Commitment, Prov
 fn finalize_commit_impl(
     mut codeword: Vec<F128>,
     params: &PcsParams,
+    start_layer: usize,
     from_message: Option<&[F128]>,
 ) -> (Commitment, ProverData) {
     let helper = if use_ranked_ntt_merkle_leaf_pipeline(params) && rayon::current_num_threads() > 1
@@ -599,6 +634,7 @@ fn finalize_commit_impl(
             &ntt,
             &mut codeword,
             params,
+            start_layer,
             tree,
             helper,
             from_message,
@@ -612,7 +648,7 @@ fn finalize_commit_impl(
         ntt.forward_transform_interleaved_from_layer(
             &mut codeword,
             params.num_ntts(),
-            params.log_inv_rate,
+            start_layer,
         );
     }
     if timing {
@@ -883,6 +919,7 @@ mod tests {
             &ntt,
             &mut got_codeword,
             &params,
+            params.log_inv_rate,
             &mut got_tree,
             &helper,
             None,

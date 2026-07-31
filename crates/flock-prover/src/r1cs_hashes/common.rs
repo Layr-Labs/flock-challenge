@@ -276,6 +276,214 @@ impl Rate2CodewordPtr {
     }
 }
 
+#[derive(Clone, Copy)]
+struct WitnessTilePtr<T>(*mut T);
+// SAFETY: instances are only shared by the indexed tile driver below. Its
+// mapping gives every tile disjoint z/a/b/stripe groups and disjoint codeword
+// row ranges, and the Rayon region joins before the backing Vecs are reused.
+unsafe impl<T> Send for WitnessTilePtr<T> {}
+unsafe impl<T> Sync for WitnessTilePtr<T> {}
+impl<T> WitnessTilePtr<T> {
+    #[inline]
+    fn get(self) -> *mut T {
+        self.0
+    }
+}
+
+/// The exact two-block radix-8 transform immediately following the trivial
+/// rate-1/2 copy layer. A witness tile owns all eight widely-spaced message
+/// rows needed by the transform, so it can publish the post-layer-3 codeword
+/// before those rows leave cache instead of first writing `[z, z]`.
+struct Rate2PostRadix8Plan {
+    ntt: flock_core::ntt::AdditiveNttF128,
+    message_len: usize,
+    message_positions: usize,
+    eighth: usize,
+    num_ntts: usize,
+}
+
+impl Rate2PostRadix8Plan {
+    fn new(message_len: usize, num_ntts: usize) -> Self {
+        assert!(num_ntts.is_power_of_two() && num_ntts >= 2);
+        assert_eq!(message_len % num_ntts, 0);
+        let message_positions = message_len / num_ntts;
+        assert!(message_positions.is_power_of_two() && message_positions >= 8);
+        let log_d = (2 * message_positions).trailing_zeros() as usize;
+        let ntt = flock_core::ntt::AdditiveNttF128::standard(log_d);
+        Self {
+            ntt,
+            message_len,
+            message_positions,
+            eighth: message_positions / 8,
+            num_ntts,
+        }
+    }
+
+    /// Write the post-layer-3 codeword rows in `row_start..row_end`.
+    ///
+    /// # Safety
+    /// `message` addresses `message_len` initialized elements and `codeword`
+    /// addresses `2 * message_len` writable elements. Concurrent calls must
+    /// use disjoint row ranges. The caller must have initialized every source
+    /// row selected by this range before entering the method.
+    unsafe fn write_rows(
+        &self,
+        message: *const F128,
+        codeword: *mut F128,
+        row_start: usize,
+        row_end: usize,
+    ) {
+        debug_assert!(row_start <= row_end && row_end <= self.eighth);
+        debug_assert_eq!(self.message_positions, 8 * self.eighth);
+        debug_assert!(self.num_ntts <= 64);
+        unsafe {
+            self.ntt
+                .forward_transform_interleaved_rate2_radix8_rows_from_message(
+                    message,
+                    codeword,
+                    self.message_len,
+                    self.num_ntts,
+                    row_start,
+                    row_end,
+                );
+        }
+    }
+}
+
+/// Ranked full-write witness driver arranged in 64-compression tiles. A tile
+/// owns eight ordinary contiguous witness groups (so their lincheck stripes
+/// remain cache-local) and, orthogonally, sixteen consecutive radix rows (so
+/// it can publish the rate-1/2 post-radix codeword without a replica buffer).
+pub(crate) fn drive_witness_packed_and_lincheck_full_write_with_post_radix8_codeword<S: Sync, F>(
+    initial_states: &[S],
+    padding: &S,
+    n_blocks_log: usize,
+    k_log: usize,
+    useful_bits: usize,
+    codeword: &mut [F128],
+    per_block: F,
+) -> (Vec<F128>, Vec<F128>, Vec<F128>, Vec<u8>)
+where
+    F: Fn(&S, &mut [u64], &mut [u64], &mut [u64]) + Sync,
+{
+    use rayon::prelude::*;
+
+    let k = 1usize << k_log;
+    let f128_per_block = k / 128;
+    let u64_per_block = k / 64;
+    let n_total = 1usize << n_blocks_log;
+    let n_blocks = initial_states.len();
+    assert!(n_total >= 64 && n_total.is_multiple_of(64));
+    assert!(useful_bits <= k);
+    assert!(n_blocks <= n_total);
+    // Each compression contributes exactly two 64-lane message positions.
+    const NUM_NTTS: usize = 64;
+    assert_eq!(f128_per_block, 2 * NUM_NTTS);
+    let total_f128 = n_total * f128_per_block;
+    assert_eq!(codeword.len(), 2 * total_f128);
+    let plan = Rate2PostRadix8Plan::new(total_f128, NUM_NTTS);
+    let task_count = n_total / 64;
+
+    let mut z = flock_core::scratch::take_f128(total_f128);
+    let mut a = flock_core::scratch::take_f128(total_f128);
+    let mut b = flock_core::scratch::take_f128(total_f128);
+    let mut z_lincheck = flock_core::scratch::take_u8((n_total / 8) * k);
+    let z_ptr = WitnessTilePtr(z.as_mut_ptr());
+    let a_ptr = WitnessTilePtr(a.as_mut_ptr());
+    let b_ptr = WitnessTilePtr(b.as_mut_ptr());
+    let stripe_ptr = WitnessTilePtr(z_lincheck.as_mut_ptr());
+    let codeword_ptr = WitnessTilePtr(codeword.as_mut_ptr());
+
+    let process_task = |task| {
+        // Band `band` contributes one contiguous eight-compression group.
+        // Across all eight bands these are precisely the source blocks for
+        // radix families `8*task..8*task+8`.
+        for band in 0..8 {
+            let group = band * task_count + task;
+            let global_base = 8 * group;
+            let elem_offset = global_base * f128_per_block;
+            let stripe_offset = group * k;
+            // SAFETY: `(band, task)` maps bijectively to an ordinary
+            // witness group. Every group owns disjoint z/a/b/stripe ranges.
+            let (z_grp, a_grp, b_grp, stripe) = unsafe {
+                (
+                    core::slice::from_raw_parts_mut(
+                        z_ptr.get().add(elem_offset),
+                        8 * f128_per_block,
+                    ),
+                    core::slice::from_raw_parts_mut(
+                        a_ptr.get().add(elem_offset),
+                        8 * f128_per_block,
+                    ),
+                    core::slice::from_raw_parts_mut(
+                        b_ptr.get().add(elem_offset),
+                        8 * f128_per_block,
+                    ),
+                    core::slice::from_raw_parts_mut(stripe_ptr.get().add(stripe_offset), k),
+                )
+            };
+
+            for k_in in 0..8 {
+                let global_idx = global_base + k_in;
+                let init = if global_idx < n_blocks {
+                    &initial_states[global_idx]
+                } else {
+                    padding
+                };
+                let range = k_in * f128_per_block..(k_in + 1) * f128_per_block;
+                let z_chunk = &mut z_grp[range.clone()];
+                let a_chunk = &mut a_grp[range.clone()];
+                let b_chunk = &mut b_grp[range];
+                let z_u64 = unsafe {
+                    core::slice::from_raw_parts_mut(
+                        z_chunk.as_mut_ptr().cast::<u64>(),
+                        z_chunk.len() * 2,
+                    )
+                };
+                let a_u64 = unsafe {
+                    core::slice::from_raw_parts_mut(
+                        a_chunk.as_mut_ptr().cast::<u64>(),
+                        a_chunk.len() * 2,
+                    )
+                };
+                let b_u64 = unsafe {
+                    core::slice::from_raw_parts_mut(
+                        b_chunk.as_mut_ptr().cast::<u64>(),
+                        b_chunk.len() * 2,
+                    )
+                };
+                per_block(init, z_u64, a_u64, b_u64);
+            }
+
+            let z_u64_all = unsafe {
+                core::slice::from_raw_parts(z_grp.as_ptr().cast::<u64>(), z_grp.len() * 2)
+            };
+            let useful_words = useful_bits.div_ceil(64);
+            for i in 0..useful_words {
+                let lanes = std::array::from_fn(|lane| z_u64_all[lane * u64_per_block + i]);
+                transpose_8_u64s_to_64_bytes(&lanes, &mut stripe[i * 64..i * 64 + 64]);
+            }
+            stripe[useful_words * 64..].fill(0);
+        }
+
+        // SAFETY: task owns rows `[16*task, 16*(task+1))`; its eight
+        // witness groups above initialized exactly the selected sources.
+        unsafe {
+            plan.write_rows(z_ptr.get(), codeword_ptr.get(), 16 * task, 16 * (task + 1));
+        }
+    };
+    // This phase publishes about 2.6 GiB across z/a/b, the lincheck stripe,
+    // and the codeword. Keep that saturated store stream on the performance
+    // cluster; utility-QoS helpers contend for the shared fabric and slow the
+    // primary workers on the ranked M3 Max.
+    (0..task_count)
+        .into_par_iter()
+        .with_max_len(8)
+        .for_each(process_task);
+
+    (z, a, b, z_lincheck)
+}
+
 /// Full-write row-major witness driver that also emits the exact rate-1/2
 /// pre-NTT codeword `[z, z]`. Each worker copies its completed `z` group into
 /// the two disjoint replica ranges while that group is still cache-resident.
