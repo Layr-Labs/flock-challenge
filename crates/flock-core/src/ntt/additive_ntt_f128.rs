@@ -1696,6 +1696,97 @@ mod tests {
         }
     }
 
+    #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+    #[test]
+    fn neon_fused3_row_matches_portable() {
+        let mut rng = Rng::new(0xB3_0000_0000_0001);
+        for (eighth, num_ntts) in [(1usize, 1usize), (3, 8), (7, 64)] {
+            for iteration in 0..3 {
+                let mut twiddles = [F128::ZERO; 7];
+                for twiddle in &mut twiddles {
+                    *twiddle = rng.f128();
+                }
+                let source = rand_vec(&mut rng, 8 * eighth * num_ntts);
+                let mut neon = source.clone();
+                let mut portable = source;
+                for r in 0..eighth {
+                    unsafe {
+                        kernels::butterfly_fused_3layer_row(
+                            neon.as_mut_ptr(), eighth, num_ntts, r, &twiddles,
+                        );
+                        kernels::portable_butterfly_fused_3layer_row(
+                            portable.as_mut_ptr(), eighth, num_ntts, r, &twiddles,
+                        );
+                    }
+                }
+                assert_eq!(neon, portable, "eighth={eighth} num_ntts={num_ntts} iteration={iteration}");
+            }
+        }
+    }
+
+    #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+    #[test]
+    fn neon_fused3_zero_root_row_matches_portable() {
+        let mut rng = Rng::new(0xB3_0000_0000_0002);
+        for (eighth, num_ntts) in [(1usize, 1usize), (3, 8), (7, 64)] {
+            for iteration in 0..3 {
+                let mut twiddles = [F128::ZERO; 7];
+                for index in [2usize, 4, 5, 6] {
+                    twiddles[index] = rng.f128();
+                }
+                let source = rand_vec(&mut rng, 8 * eighth * num_ntts);
+                let mut neon = source.clone();
+                let mut portable = source;
+                for r in 0..eighth {
+                    unsafe {
+                        kernels::butterfly_fused_3layer_zero_root_row(
+                            neon.as_mut_ptr(), eighth, num_ntts, r, &twiddles,
+                        );
+                        kernels::portable_butterfly_fused_3layer_zero_root_row(
+                            portable.as_mut_ptr(), eighth, num_ntts, r, &twiddles,
+                        );
+                    }
+                }
+                assert_eq!(neon, portable, "eighth={eighth} num_ntts={num_ntts} iteration={iteration}");
+            }
+        }
+    }
+
+    #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+    #[test]
+    fn neon_fused2_row_matches_portable() {
+        let mut rng = Rng::new(0xB2_0000_0000_0001);
+        for num_ntts in [1usize, 8, 64] {
+            for iteration in 0..3 {
+                let outer = rng.f128();
+                let inner_a = rng.f128();
+                let inner_b = rng.f128();
+                let source = rand_vec(&mut rng, 4 * num_ntts);
+                let mut neon = source.clone();
+                let mut portable = source;
+                let (neon_a, neon_rest) = neon.split_at_mut(num_ntts);
+                let (neon_b, neon_rest) = neon_rest.split_at_mut(num_ntts);
+                let (neon_c, neon_d) = neon_rest.split_at_mut(num_ntts);
+                kernels::butterfly_fused_2layer(
+                    neon_a, neon_b, neon_c, neon_d, outer, inner_a, inner_b,
+                );
+                let (portable_a, portable_rest) = portable.split_at_mut(num_ntts);
+                let (portable_b, portable_rest) = portable_rest.split_at_mut(num_ntts);
+                let (portable_c, portable_d) = portable_rest.split_at_mut(num_ntts);
+                kernels::portable_butterfly_fused_2layer(
+                    portable_a,
+                    portable_b,
+                    portable_c,
+                    portable_d,
+                    outer,
+                    inner_a,
+                    inner_b,
+                );
+                assert_eq!(neon, portable, "num_ntts={num_ntts} iteration={iteration}");
+            }
+        }
+    }
+
     /// The sequential deep helper must equal two ordinary layer sweeps for
     /// every row/lane geometry used by the ranked tail, including its final
     /// one-row quarter.

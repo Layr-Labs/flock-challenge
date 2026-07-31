@@ -54,6 +54,12 @@ pub(super) fn butterfly_fused_2layer(
     debug_assert_eq!(a.len(), c.len());
     debug_assert_eq!(a.len(), d.len());
 
+    #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+    // SAFETY: the cfg gate guarantees PMULL through the aes feature.
+    unsafe {
+        aarch64::butterfly_fused_2layer(a, b, c, d, t_outer, t_inner_a, t_inner_b);
+    }
+
     #[cfg(all(
         target_arch = "x86_64",
         target_feature = "avx512f",
@@ -64,11 +70,14 @@ pub(super) fn butterfly_fused_2layer(
         x86_64::butterfly_fused_2layer(a, b, c, d, t_outer, t_inner_a, t_inner_b);
     }
 
-    #[cfg(not(all(
-        target_arch = "x86_64",
-        target_feature = "avx512f",
-        target_feature = "vpclmulqdq"
-    )))]
+    #[cfg(all(
+        not(all(target_arch = "aarch64", target_feature = "aes")),
+        not(all(
+            target_arch = "x86_64",
+            target_feature = "avx512f",
+            target_feature = "vpclmulqdq"
+        ))
+    ))]
     portable::butterfly_fused_2layer(a, b, c, d, t_outer, t_inner_a, t_inner_b);
 }
 
@@ -149,6 +158,13 @@ pub(super) unsafe fn butterfly_fused_3layer_row(
     r: usize,
     twiddles: &[F128; 7],
 ) {
+    #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+    // SAFETY: the cfg gate guarantees PMULL through the aes feature.
+    unsafe {
+        aarch64::butterfly_fused_3layer_row(ptr, eighth, num_ntts, r, twiddles);
+    }
+
+    #[cfg(not(all(target_arch = "aarch64", target_feature = "aes")))]
     // SAFETY: forwarded caller contract.
     unsafe {
         portable::butterfly_fused_3layer_row(ptr, eighth, num_ntts, r, twiddles);
@@ -168,6 +184,13 @@ pub(super) unsafe fn butterfly_fused_3layer_zero_root_row(
     r: usize,
     twiddles: &[F128; 7],
 ) {
+    #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+    // SAFETY: the cfg gate guarantees PMULL through the aes feature.
+    unsafe {
+        aarch64::butterfly_fused_3layer_zero_root_row(ptr, eighth, num_ntts, r, twiddles);
+    }
+
+    #[cfg(not(all(target_arch = "aarch64", target_feature = "aes")))]
     // SAFETY: forwarded caller contract.
     unsafe {
         portable::butterfly_fused_3layer_zero_root_row(ptr, eighth, num_ntts, r, twiddles);
@@ -198,4 +221,40 @@ pub(super) unsafe fn butterfly_neon_block_pair(
 pub(super) unsafe fn butterfly_neon_block_pair_chunk(chunk: &mut [F128], t_a: F128, t_b: F128) {
     // SAFETY: the cfg gate guarantees PMULL through the aes feature.
     unsafe { aarch64::butterfly_block_pair(chunk, t_a, t_b) }
+}
+
+#[cfg(test)]
+pub(super) unsafe fn portable_butterfly_fused_3layer_row(
+    ptr: *mut F128,
+    eighth: usize,
+    num_ntts: usize,
+    r: usize,
+    twiddles: &[F128; 7],
+) {
+    unsafe { portable::butterfly_fused_3layer_row(ptr, eighth, num_ntts, r, twiddles) }
+}
+
+#[cfg(test)]
+pub(super) unsafe fn portable_butterfly_fused_3layer_zero_root_row(
+    ptr: *mut F128,
+    eighth: usize,
+    num_ntts: usize,
+    r: usize,
+    twiddles: &[F128; 7],
+) {
+    unsafe { portable::butterfly_fused_3layer_zero_root_row(ptr, eighth, num_ntts, r, twiddles) }
+}
+
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+pub(super) fn portable_butterfly_fused_2layer(
+    a: &mut [F128],
+    b: &mut [F128],
+    c: &mut [F128],
+    d: &mut [F128],
+    t_outer: F128,
+    t_inner_a: F128,
+    t_inner_b: F128,
+) {
+    portable::butterfly_fused_2layer(a, b, c, d, t_outer, t_inner_a, t_inner_b);
 }
