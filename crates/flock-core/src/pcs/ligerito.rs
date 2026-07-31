@@ -2311,14 +2311,11 @@ impl Drop for LigeroWitness {
 }
 
 // SumcheckProver owns the two witness-sized polynomials of the open (the
-// packed witness `f` and the γ-combined basis) plus the fold ping-pong
-// spares — recycle all four on drop.
+// packed witness `f` and the γ-combined basis) — recycle both on drop.
 impl Drop for SumcheckProver {
     fn drop(&mut self) {
         crate::scratch::give_f128(std::mem::take(&mut self.f));
         crate::scratch::give_f128(std::mem::take(&mut self.combined_basis));
-        crate::scratch::give_f128(std::mem::take(&mut self.spare_f));
-        crate::scratch::give_f128(std::mem::take(&mut self.spare_b));
     }
 }
 
@@ -2545,7 +2542,7 @@ fn round_msg_and_eval_lsb(f: &[F128], b: &[F128]) -> (SumcheckMessage, F128) {
 
 /// Partially evaluate `evals` at LSB variable = `r`, in place. Halves length.
 /// Parallel for large arrays. Test oracle for the fused fold below; the
-/// production path uses `fold_and_msg_lsb_into` instead.
+/// production path uses `fold_and_msg_lsb` instead.
 #[cfg(test)]
 fn partial_eval_lsb_one(evals: &mut Vec<F128>, r: F128) {
     use rayon::prelude::*;
@@ -2586,40 +2583,23 @@ fn partial_eval_lsb_one(evals: &mut Vec<F128>, r: F128) {
 /// still in registers. One fork-join instead of three, and ~⅓ less memory
 /// traffic (the folded arrays are not re-read to build the message).
 ///
-/// Computes `next_msg = round_msg_lsb(folded_f, folded_b)`, bit-identical to
-/// the unfused sequence.
-///
-/// Writes into caller-provided buffers (each must have capacity >=
-/// `f.len() / 2`; length is set to `f.len() / 2`). Lets [`SumcheckProver`]
-/// ping-pong between two persistent buffer pairs instead of allocating,
-/// faulting, and unmapping a fresh pair every round.
-fn fold_and_msg_lsb_into(
-    f: &[F128],
-    b: &[F128],
-    r: F128,
-    nf: &mut Vec<F128>,
-    nb: &mut Vec<F128>,
-) -> SumcheckMessage {
+/// Returns `(folded_f, folded_b, next_msg)` where `next_msg = round_msg_lsb
+/// (folded_f, folded_b)`. Bit-identical to the unfused sequence.
+fn fold_and_msg_lsb(f: &[F128], b: &[F128], r: F128) -> (Vec<F128>, Vec<F128>, SumcheckMessage) {
     use rayon::prelude::*;
     let n = f.len();
     debug_assert!(n.is_power_of_two() && n >= 2);
     debug_assert_eq!(b.len(), n);
     let half = n / 2;
-    debug_assert!(nf.capacity() >= half && nb.capacity() >= half);
-    // SAFETY: capacities were checked above; F128: Copy (no Drop), so
-    // exposing uninit/stale elements is sound to *hold* — every slot is
-    // written below before anything reads it.
-    unsafe {
-        nf.set_len(half);
-        nb.set_len(half);
-    }
     let one_plus_r = F128::ONE + r;
 
     const PAR_THRESHOLD: usize = 4096;
     if half < PAR_THRESHOLD {
+        let mut nf = Vec::with_capacity(half);
+        let mut nb = Vec::with_capacity(half);
         for j in 0..half {
-            nf[j] = f[2 * j] * one_plus_r + f[2 * j + 1] * r;
-            nb[j] = b[2 * j] * one_plus_r + b[2 * j + 1] * r;
+            nf.push(f[2 * j] * one_plus_r + f[2 * j + 1] * r);
+            nb.push(b[2 * j] * one_plus_r + b[2 * j + 1] * r);
         }
         let mut u_0 = F128::ZERO;
         let mut u_2 = F128::ZERO;
@@ -2633,13 +2613,28 @@ fn fold_and_msg_lsb_into(
             u_2 += (f0 + f1) * (b0 + b1);
             k += 2;
         }
-        return SumcheckMessage { u_0, u_2 };
+        return (nf, nb, SumcheckMessage { u_0, u_2 });
     }
 
     // Parallel path: `half` is a power of two ≥ PAR_THRESHOLD and CHUNK is a
     // power of two, so every chunk has even length and starts at an even
     // global index — message pairs (2k, 2k+1) never straddle a chunk boundary.
     const CHUNK: usize = 2048;
+    // On x86_64, pull the fold outputs from the prewarmed scratch pool (the
+    // prover gives the previous round's buffers back in `SumcheckProver::fold`),
+    // so the initial sumcheck reuses resident pages instead of faulting ~128 MB
+    // of fresh memory every round. On aarch64 this pooling measured slower, so
+    // there we allocate fresh each round.
+    #[cfg(target_arch = "x86_64")]
+    let (mut nf, mut nb) = (
+        crate::scratch::take_f128(half),
+        crate::scratch::take_f128(half),
+    );
+    #[cfg(not(target_arch = "x86_64"))]
+    let (mut nf, mut nb) = (
+        crate::alloc_uninit_f128_vec(half),
+        crate::alloc_uninit_f128_vec(half),
+    );
     let (u_0, u_2) = nf
         .par_chunks_mut(CHUNK)
         .zip(nb.par_chunks_mut(CHUNK))
@@ -2668,7 +2663,7 @@ fn fold_and_msg_lsb_into(
             || (F128::ZERO, F128::ZERO),
             |(a0, a2), (c0, c2)| (a0 + c0, a2 + c2),
         );
-    SumcheckMessage { u_0, u_2 }
+    (nf, nb, SumcheckMessage { u_0, u_2 })
 }
 
 pub struct SumcheckProver {
@@ -2678,42 +2673,17 @@ pub struct SumcheckProver {
     /// keeps fold cost O(1 + 1) = (f + combined_basis) regardless of how
     /// many recursive intro/glue pairs have happened.
     combined_basis: Vec<F128>,
-    /// Ping-pong spares for [`Self::fold`]: each fold writes the halved
-    /// outputs into the spares (capacity >= current length / 2) and swaps
-    /// them in, so the ladder touches one resident page set per prove instead
-    /// of allocating, faulting, and unmapping a fresh buffer pair per round
-    /// (~1 GiB of churn across the ranked recursive open). Taken from the
-    /// scratch pool at construction and returned on drop, so the worker's
-    /// timed prove reuses the pages its warm-up prove faulted in.
-    spare_f: Vec<F128>,
-    spare_b: Vec<F128>,
     t_r: F128,
     transcript: Vec<SumcheckMessage>,
     pending_glue: Option<(Vec<F128>, F128)>,
 }
 
 impl SumcheckProver {
-    /// Ping-pong spare of capacity >= `f.len() / 2`; an empty Vec when the
-    /// prover is degenerate (len < 2), so `take_f128(0)` can never steal a
-    /// large pooled buffer.
-    fn new_spare(len: usize) -> Vec<F128> {
-        let half = len / 2;
-        if half == 0 {
-            Vec::new()
-        } else {
-            crate::scratch::take_f128(half)
-        }
-    }
-
     pub fn new(f: Vec<F128>, b1: Vec<F128>, h1: F128) -> (Self, SumcheckMessage) {
         assert_eq!(f.len(), b1.len());
-        let spare_f = Self::new_spare(f.len());
-        let spare_b = Self::new_spare(f.len());
         let mut inst = Self {
             f,
             combined_basis: b1,
-            spare_f,
-            spare_b,
             t_r: h1,
             transcript: Vec::new(),
             pending_glue: None,
@@ -2735,13 +2705,9 @@ impl SumcheckProver {
         first_msg: SumcheckMessage,
     ) -> (Self, SumcheckMessage) {
         assert_eq!(f.len(), b1.len());
-        let spare_f = Self::new_spare(f.len());
-        let spare_b = Self::new_spare(f.len());
         let mut inst = Self {
             f,
             combined_basis: b1,
-            spare_f,
-            spare_b,
             t_r: h1,
             transcript: Vec::new(),
             pending_glue: None,
@@ -2752,18 +2718,24 @@ impl SumcheckProver {
 
     pub fn fold(&mut self, r: F128) -> SumcheckMessage {
         // Fused: fold f and combined_basis at r AND build the next-round
-        // message in one parallel pass (was three passes), writing the halved
-        // outputs into the persistent ping-pong spares and swapping them in.
-        // See [`fold_and_msg_lsb_into`].
-        let msg = fold_and_msg_lsb_into(
-            &self.f,
-            &self.combined_basis,
-            r,
-            &mut self.spare_f,
-            &mut self.spare_b,
-        );
-        std::mem::swap(&mut self.f, &mut self.spare_f);
-        std::mem::swap(&mut self.combined_basis, &mut self.spare_b);
+        // message in one parallel pass (was three passes). See
+        // [`fold_and_msg_lsb`].
+        let (nf, nb, msg) = fold_and_msg_lsb(&self.f, &self.combined_basis, r);
+        // On x86_64, recycle the just-consumed buffers into the scratch pool
+        // (same ownership as the Drop impl) so the next round's
+        // `fold_and_msg_lsb` takes resident pages. aarch64 measured slower with
+        // this pooling, so there we just move the new buffers in and drop the
+        // old ones.
+        #[cfg(target_arch = "x86_64")]
+        {
+            crate::scratch::give_f128(std::mem::replace(&mut self.f, nf));
+            crate::scratch::give_f128(std::mem::replace(&mut self.combined_basis, nb));
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            self.f = nf;
+            self.combined_basis = nb;
+        }
         self.transcript.push(msg);
         msg
     }
