@@ -63,10 +63,16 @@ pub(super) fn shift_reduce_inner_ab(
     check_all_ones: bool,
     check_single_k0: bool,
     const_one_mask: u8,
+    bstatic_w: usize,
 ) {
+    #[cfg(not(target_arch = "aarch64"))]
+    let _ = bstatic_w;
     #[cfg(target_arch = "aarch64")]
     {
         let _ = (a_col, b_col);
+        static BSTATIC_LEGACY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let legacy = *BSTATIC_LEGACY
+            .get_or_init(|| std::env::var_os("FLOCK_ZC_BSTATIC_LEGACY").is_some());
         aarch64::shift_reduce_inner_ab_fused_neon_checked(
             a_packed,
             b_packed,
@@ -77,6 +83,7 @@ pub(super) fn shift_reduce_inner_ab(
             check_all_ones,
             check_single_k0,
             const_one_mask,
+            if legacy { usize::MAX } else { bstatic_w },
         );
     }
 

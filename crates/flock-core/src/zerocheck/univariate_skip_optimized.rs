@@ -42,8 +42,9 @@ mod kernels;
 
 #[cfg(all(test, target_arch = "aarch64"))]
 use kernels::aarch64::{
-    bit_transpose_64bytes_neon, shift_reduce_inner_ab_fused_neon,
-    shift_reduce_inner_ab_fused_neon_checked, shift_reduce_inner_ab_neon,
+    BSTATIC_MASKS, bit_transpose_64bytes_neon, shift_reduce_inner_ab_bstatic,
+    shift_reduce_inner_ab_fused_neon, shift_reduce_inner_ab_fused_neon_checked,
+    shift_reduce_inner_ab_neon,
 };
 #[cfg(all(test, target_arch = "aarch64"))]
 use kernels::bit_transpose_64bytes_scalar;
@@ -388,6 +389,11 @@ pub fn precompute_round1_ab_inner_packed_padded(
                         } else {
                             0
                         },
+                        if blake3_static_layout {
+                            within_hash_outer
+                        } else {
+                            usize::MAX
+                        },
                     );
                 }
                 out_outer[n_b_med * 64..].fill(0);
@@ -409,6 +415,14 @@ pub fn precompute_round1_ab_inner_packed_padded(
 // Output `out[lane]` is the F_8 representative of Σ_K x^K · y_K[lane] mod p.
 // ---------------------------------------------------------------------------
 
+/// The static-b plan constants are generated for the BLAKE3 padding shape
+/// (two 8192-bit windows per block: 16 + 15 processed b_med positions). Any
+/// other shape passes `usize::MAX` and runs the incumbent kernels.
+fn bstatic_plan_applies(within_outer_mask: usize, b_med_counts: &[u8]) -> bool {
+    within_outer_mask == 1 && b_med_counts == [16, 15]
+}
+
+#[allow(clippy::too_many_arguments)]
 fn shift_reduce_inner_ab(
     a_packed: &[u8],
     b_packed: &[u8],
@@ -421,6 +435,7 @@ fn shift_reduce_inner_ab(
     check_all_ones: bool,
     check_single_k0: bool,
     const_one_mask: u8,
+    bstatic_w: usize,
 ) {
     kernels::shift_reduce_inner_ab(
         a_packed,
@@ -434,6 +449,7 @@ fn shift_reduce_inner_ab(
         check_all_ones,
         check_single_k0,
         const_one_mask,
+        bstatic_w,
     );
 }
 
@@ -566,6 +582,11 @@ fn process_one_x_hi(
                     true,
                     true,
                     0,
+                    if bstatic_plan_applies(within_outer_mask, b_med_counts) {
+                        within_hash_outer
+                    } else {
+                        usize::MAX
+                    },
                 );
                 let byte_base_b = chunk_byte_base + b_med * N_CHUNKS * 8;
                 let c_in: &[u8; 64] = (&c_packed[byte_base_b..byte_base_b + 64])
@@ -601,6 +622,11 @@ fn process_one_x_hi(
                     true,
                     true,
                     0,
+                    if bstatic_plan_applies(within_outer_mask, b_med_counts) {
+                        within_hash_outer
+                    } else {
+                        usize::MAX
+                    },
                 );
                 let byte_base_b = chunk_byte_base + b_med * N_CHUNKS * 8;
                 let c_in: &[u8; 64] = (&c_packed[byte_base_b..byte_base_b + 64])
@@ -729,6 +755,11 @@ fn process_one_x_hi_with_s_hat_v(
                     true,
                     true,
                     0,
+                    if bstatic_plan_applies(within_outer_mask, b_med_counts) {
+                        within_hash_outer
+                    } else {
+                        usize::MAX
+                    },
                 );
                 let byte_base_b = chunk_byte_base + b_med * N_CHUNKS * 8;
                 let c_in: &[u8; 64] = (&c_packed[byte_base_b..byte_base_b + 64])
@@ -762,6 +793,11 @@ fn process_one_x_hi_with_s_hat_v(
                     true,
                     true,
                     0,
+                    if bstatic_plan_applies(within_outer_mask, b_med_counts) {
+                        within_hash_outer
+                    } else {
+                        usize::MAX
+                    },
                 );
                 let byte_base_b = chunk_byte_base + b_med * N_CHUNKS * 8;
                 let c_in: &[u8; 64] = (&c_packed[byte_base_b..byte_base_b + 64])
@@ -1604,6 +1640,96 @@ mod tests {
         }
     }
 
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn bstatic_matches_scalar_oracle() {
+        // The static-b fast paths must be byte-identical to the scalar oracle
+        // in all three regimes: guards passing (crafted static bytes), guards
+        // failing (fully random b), and a single flipped static byte (per-K
+        // fallback).
+        let mut rng = Rng::new(0xB57A71C);
+        let table = make_inv_table();
+        let m = 14; // one hash block: two 1024-byte outer windows
+        let a_bits = rng.bits(1 << m);
+        let a_packed = pack_bits(&a_bits);
+        let total_bytes = a_packed.len();
+        assert_eq!(total_bytes, 2048);
+
+        let mut a_col = vec![F8::ZERO; ELL];
+        let mut b_col = vec![F8::ZERO; ELL];
+
+        // Regime 1: b crafted so every static-plan guard passes.
+        let mut b_crafted = pack_bits(&rng.bits(1 << m));
+        for x_outer in 0..2usize {
+            let w = x_outer & 1;
+            let n_b_med = if w == 0 { 16 } else { 15 };
+            for b_med in 0..n_b_med {
+                for k in 0..8 {
+                    let (mask, expected) = BSTATIC_MASKS[w * 16 + b_med][k];
+                    let off = x_outer * 1024 + b_med * 64 + k * 8;
+                    let cur = u64::from_le_bytes(b_crafted[off..off + 8].try_into().unwrap());
+                    let word = (cur & !mask) | expected;
+                    b_crafted[off..off + 8].copy_from_slice(&word.to_le_bytes());
+                }
+            }
+        }
+        // Regime 3: one static byte flipped in one word per block.
+        let mut b_flipped = b_crafted.clone();
+        for x_outer in 0..2usize {
+            let w = x_outer & 1;
+            let n_b_med = if w == 0 { 16 } else { 15 };
+            for b_med in 0..n_b_med {
+                for k in 0..8 {
+                    let (mask, _) = BSTATIC_MASKS[w * 16 + b_med][k];
+                    if mask != 0 {
+                        let j = mask.trailing_zeros() as usize / 8;
+                        b_flipped[x_outer * 1024 + b_med * 64 + k * 8 + j] ^= 0x5a;
+                        break;
+                    }
+                }
+            }
+        }
+        let b_random = pack_bits(&rng.bits(1 << m));
+
+        for (regime, b_packed) in [(1, &b_crafted), (2, &b_random), (3, &b_flipped)] {
+            for x_outer in 0..2usize {
+                let w = x_outer & 1;
+                let n_b_med = if w == 0 { 16 } else { 15 };
+                let chunk_byte_base = x_outer * 1024;
+                for b_med in 0..n_b_med {
+                    let mut out_scalar = [0u8; 64];
+                    let mut out_bstatic = [0u8; 64];
+                    shift_reduce_inner_ab_scalar(
+                        &a_packed,
+                        b_packed,
+                        &table,
+                        chunk_byte_base,
+                        b_med,
+                        &mut out_scalar,
+                        &mut a_col,
+                        &mut b_col,
+                    );
+                    let handled = shift_reduce_inner_ab_bstatic(
+                        &a_packed,
+                        b_packed,
+                        &table,
+                        chunk_byte_base,
+                        b_med,
+                        w,
+                        &mut out_bstatic,
+                    );
+                    if handled {
+                        assert_eq!(
+                            out_scalar, out_bstatic,
+                            "bstatic disagrees with scalar (regime {regime}, w={w}, b_med={b_med})"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
     #[cfg(target_arch = "aarch64")]
     #[test]
     fn neon_bit_transpose_matches_scalar() {
@@ -1696,7 +1822,7 @@ mod tests {
                 &a_packed, &b_mixed, &table, 0, 0, &mut want, &mut a_col, &mut b_col,
             );
             shift_reduce_inner_ab_fused_neon_checked(
-                &a_packed, &b_mixed, &table, 0, 0, &mut got, false, false, mask,
+                &a_packed, &b_mixed, &table, 0, 0, &mut got, false, false, mask, usize::MAX,
             );
             assert_eq!(got, want, "mixed const-one mask {mask:#04x}");
         }
