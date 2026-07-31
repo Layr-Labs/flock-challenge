@@ -188,16 +188,8 @@ pub struct SplitEqGhash {
 }
 
 impl SplitEqGhash {
-    /// Cap on the hi half size. The original C++ default was 7 (128 chunks),
-    /// which with a 10-thread ranked pool yields a 2-wave rayon schedule
-    /// (128 → 16 jobs of 8 after four binary splits). Raising to 9 gives
-    /// 512 chunks / ~51 per thread and is bit-identical: the lo/hi split is
-    /// an exact tensor factorisation, XOR is associative, and deferred
-    /// reduction is F2-linear so regrouping across different chunk boundaries
-    /// is exact. The hi table grows from 2 KB to 8 KB (still register-friendly
-    /// as an outer product over 512 F128s); the lo table shrinks 4× and stays
-    /// more L2-resident across the ~120 ms of zerocheck that use this split.
-    pub const MAX_N_HI: usize = 9;
+    /// C++-default cap on the hi half size — keeps outer F128 muls cheap.
+    pub const MAX_N_HI: usize = 7;
 
     pub fn new(r: &[F128]) -> Self {
         let n = r.len();

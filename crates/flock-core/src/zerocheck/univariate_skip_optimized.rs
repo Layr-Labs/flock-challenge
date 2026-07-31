@@ -30,7 +30,7 @@
 //!
 //! This variant is hardcoded for `k_skip = 6` (ell=64, n_chunks=8, N_INNER=7).
 
-use std::sync::{LazyLock, OnceLock};
+use std::sync::OnceLock;
 
 use crate::field::{F8, F128, PHI_8_TABLE, mul_by_x, phi8};
 use crate::ntt::InvNttTableByteSingleGf8;
@@ -221,49 +221,6 @@ fn convert_table() -> &'static [F128] {
     CONVERT_TABLE_CACHE.get_or_init(build_convert_table)
 }
 
-// ---------------------------------------------------------------------------
-// Paired c-bank convert tables (aarch64 gather-halving).
-//
-// The two C banks select `c & 0x55` and `c & 0xaa`, so each carries only 4
-// live index bits while spending a full 256-row lookup. Two adjacent `b_med`
-// can therefore share ONE lookup per bank if their 4-bit fields are placed in
-// disjoint bit positions — a shift, not a bit-gather.
-//
-// For pair `p` covering `b_med = 2p, 2p+1`:
-//     i0 = (c_2p & 0x55) | ((c_2p1 << 1) & 0xaa)
-//     i1 = (c_2p & 0xaa) | ((c_2p1 >> 1) & 0x55)
-//     M0_p[x] = T_2p[x & 0x55] ^ T_2p1[(x & 0xaa) >> 1]
-//     M1_p[y] = T_2p[y & 0xaa] ^ T_2p1[(y & 0x55) << 1]
-// so `M0_p[i0] == T_2p[c_2p & 0x55] ^ T_2p1[c_2p1 & 0x55]`, exactly the two
-// bank-0 terms the per-`b_med` loop would XOR, and likewise for bank 1. The
-// masks recover each operand because the second term of `i0` sets only odd
-// bits and the first only even ones.
-//
-// Correctness rests on `convert` being F2-linear in its index bits,
-// `T_b[u ^ v] == T_b[u] ^ T_b[v]`, which holds because φ_8 is an F2-linear
-// embedding and scaling by the constant γ^b is F2-linear. Verified
-// exhaustively by `convert_table_index_linear` over all 16·256·256 triples.
-//
-// 8 pairs × 2 banks × 256 × 16 B = 64 KiB, on top of the 64 KiB base table.
-// ---------------------------------------------------------------------------
-
-const PAIRED_C_TABLE_SIZE: usize = 8 * 256;
-
-/// `(bank0, bank1)` paired tables, indexed `p * 256 + i`.
-static PAIRED_C_TABLES: LazyLock<(Vec<F128>, Vec<F128>)> = LazyLock::new(|| {
-    let base = convert_table();
-    let mut m0 = vec![F128::ZERO; PAIRED_C_TABLE_SIZE];
-    let mut m1 = vec![F128::ZERO; PAIRED_C_TABLE_SIZE];
-    for p in 0..8 {
-        let (even, odd) = (2 * p * 256, (2 * p + 1) * 256);
-        for x in 0..256 {
-            m0[p * 256 + x] = base[even + (x & 0x55)] + base[odd + ((x & 0xaa) >> 1)];
-            m1[p * 256 + x] = base[even + (x & 0xaa)] + base[odd + ((x & 0x55) << 1)];
-        }
-    }
-    (m0, m1)
-});
-
 #[inline]
 pub fn bit_transpose_64bytes(input: &[u8; 64], output: &mut [u8; 64]) {
     kernels::bit_transpose_64bytes(input, output);
@@ -315,8 +272,6 @@ pub fn precompute_round1_ab_inner_packed_padded(
     inv_table: &InvNttTableByteSingleGf8,
     padding: &PaddingSpec,
 ) -> Round1AbInner {
-    use rayon::prelude::*;
-
     assert_eq!(k_skip, K_SKIP, "optimized variant is k_skip=6 only");
     assert!(
         m >= k_skip + N_INNER,
@@ -331,6 +286,10 @@ pub fn precompute_round1_ab_inner_packed_padded(
 
     let (within_outer_mask, b_med_counts) = build_b_med_counts(padding);
     const OUTER_BYTES: usize = (1 << N_MEDIUM) * 64;
+    /// x_outer blocks per queue chunk (see `epool`): 128 KiB of output per
+    /// chunk — well under a millisecond even on an efficiency core — while
+    /// one atomic claim per 128 blocks stays far below dispatch noise.
+    const ROUND1_QUEUE_OUTERS: usize = 128;
     debug_assert_eq!(OUTER_BYTES, (1 << N_INNER) * N_CHUNKS);
 
     // Reuse an A-sized resident F128 allocation from the prover scratch pool.
@@ -340,34 +299,52 @@ pub fn precompute_round1_ab_inner_packed_padded(
     let out_bytes: &mut [u8] =
         unsafe { core::slice::from_raw_parts_mut(storage.as_mut_ptr() as *mut u8, total_bytes) };
 
-    out_bytes
-        .par_chunks_mut(OUTER_BYTES)
-        .enumerate()
-        .for_each_init(
-            || ([F8::ZERO; ELL], [F8::ZERO; ELL]),
-            |(a_col, b_col), (x_outer, out_outer)| {
-                let within_hash_outer = x_outer & within_outer_mask;
-                let n_b_med = b_med_counts[within_hash_outer] as usize;
-                let chunk_byte_base = x_outer * OUTER_BYTES;
+    // Chunk-queue dispatch (see `epool`): x_outer blocks are drained from a
+    // shared atomic queue by the main rayon pool plus the efficiency-core
+    // helper pool when present. Block `x_outer` writes only its own disjoint
+    // `OUTER_BYTES` range, so the output is byte-identical to the static
+    // rayon split regardless of which pool claims which block.
+    let n_outer = out_bytes.len().div_ceil(OUTER_BYTES);
+    let total_out = out_bytes.len();
+    let out_base = crate::epool::SyncPtr(out_bytes.as_mut_ptr());
+    crate::epool::run_hetero_chunks(n_outer.div_ceil(ROUND1_QUEUE_OUTERS), |chunk| {
+        let start = chunk * ROUND1_QUEUE_OUTERS;
+        let end = (start + ROUND1_QUEUE_OUTERS).min(n_outer);
+        let (mut a_col, mut b_col) = ([F8::ZERO; ELL], [F8::ZERO; ELL]);
+        for x_outer in start..end {
+            let byte_start = x_outer * OUTER_BYTES;
+            let byte_end = (byte_start + OUTER_BYTES).min(total_out);
+            // SAFETY: the queue hands out each `chunk` exactly once and
+            // distinct x_outer blocks cover pairwise-disjoint in-bounds byte
+            // ranges, so each iteration holds the only `&mut` into its range.
+            let out_outer = unsafe {
+                core::slice::from_raw_parts_mut(
+                    out_base.ptr().add(byte_start),
+                    byte_end - byte_start,
+                )
+            };
+            let within_hash_outer = x_outer & within_outer_mask;
+            let n_b_med = b_med_counts[within_hash_outer] as usize;
+            let chunk_byte_base = x_outer * OUTER_BYTES;
 
-                for b_med in 0..n_b_med {
-                    let dst: &mut [u8; 64] = (&mut out_outer[b_med * 64..(b_med + 1) * 64])
-                        .try_into()
-                        .expect("one transformed b_med block");
-                    shift_reduce_inner_ab(
-                        a_packed,
-                        b_packed,
-                        inv_table,
-                        chunk_byte_base,
-                        b_med,
-                        dst,
-                        a_col,
-                        b_col,
-                    );
-                }
-                out_outer[n_b_med * 64..].fill(0);
-            },
-        );
+            for b_med in 0..n_b_med {
+                let dst: &mut [u8; 64] = (&mut out_outer[b_med * 64..(b_med + 1) * 64])
+                    .try_into()
+                    .expect("one transformed b_med block");
+                shift_reduce_inner_ab(
+                    a_packed,
+                    b_packed,
+                    inv_table,
+                    chunk_byte_base,
+                    b_med,
+                    dst,
+                    &mut a_col,
+                    &mut b_col,
+                );
+            }
+            out_outer[n_b_med * 64..].fill(0);
+        }
+    });
 
     Round1AbInner { storage }
 }
@@ -658,7 +635,6 @@ fn process_one_x_hi_with_s_hat_v(
     eq_lo_scaled: &[F128],
     eq_hi_val: F128,
     convert: &[F128],
-    paired_c: &(Vec<F128>, Vec<F128>),
     state: &mut WorkerStateWithSHatV,
 ) {
     state.partial_ab.iter_mut().for_each(|p| *p = F128::ZERO);
@@ -702,7 +678,6 @@ fn process_one_x_hi_with_s_hat_v(
                 &state.chunk_c_bytes,
                 1 << N_MEDIUM,
                 convert,
-                paired_c,
                 eq_lo_val,
                 &mut state.partial_ab,
                 &mut state.partial_c_0,
@@ -732,7 +707,6 @@ fn process_one_x_hi_with_s_hat_v(
                 &state.chunk_c_bytes,
                 n_b_med,
                 convert,
-                paired_c,
                 eq_lo_val,
                 &mut state.partial_ab,
                 &mut state.partial_c_0,
@@ -765,7 +739,6 @@ fn process_one_x_hi_with_precomputed_ab(
     eq_lo_scaled: &[F128],
     eq_hi_val: F128,
     convert: &[F128],
-    paired_c: &(Vec<F128>, Vec<F128>),
     state: &mut WorkerStateWithSHatV,
 ) {
     state.partial_ab.iter_mut().for_each(|p| *p = F128::ZERO);
@@ -799,7 +772,6 @@ fn process_one_x_hi_with_precomputed_ab(
             &state.chunk_c_bytes,
             n_b_med,
             convert,
-            paired_c,
             eq_lo_val,
             &mut state.partial_ab,
             &mut state.partial_c_0,
@@ -1010,7 +982,6 @@ pub fn round1_shift_reduce_extract_c_packed_padded_with_s_hat_v(
     let d_inv_val = d_inv();
     let eq_lo_scaled: Vec<F128> = eq.lo.iter().map(|v| *v * d_inv_val).collect();
     let convert = convert_table();
-    let paired_c = &*PAIRED_C_TABLES;
     let eq_hi = &eq.hi;
 
     let (within_outer_mask, b_med_counts) = build_b_med_counts(padding);
@@ -1032,7 +1003,6 @@ pub fn round1_shift_reduce_extract_c_packed_padded_with_s_hat_v(
                 &eq_lo_scaled,
                 eq_hi_val,
                 convert,
-                paired_c,
                 &mut state,
             );
             state
@@ -1107,7 +1077,6 @@ pub fn round1_shift_reduce_extract_c_packed_padded_with_precomputed_ab(
     let d_inv_val = d_inv();
     let eq_lo_scaled: Vec<F128> = eq.lo.iter().map(|v| *v * d_inv_val).collect();
     let convert = convert_table();
-    let paired_c = &*PAIRED_C_TABLES;
     let eq_hi = &eq.hi;
     let (within_outer_mask, b_med_counts) = build_b_med_counts(padding);
     let ab_inner_bytes = ab_inner.as_bytes();
@@ -1126,7 +1095,6 @@ pub fn round1_shift_reduce_extract_c_packed_padded_with_precomputed_ab(
                 &eq_lo_scaled,
                 eq_hi[x_hi],
                 convert,
-                paired_c,
                 &mut state,
             );
             state
@@ -1892,231 +1860,6 @@ mod tests {
             );
 
             assert_eq!(got, expected, "split round-1 mismatch at m={m}");
-        }
-    }
-
-    /// Scalar oracle for the convert-table fold, written independently of the
-    /// NEON kernels: plain `F128` adds and muls, one lane at a time. Mirrors
-    /// the non-aarch64 `kernels::portable::accumulate_convert`, which is
-    /// `cfg`-compiled away on this target and so cannot be called here.
-    #[cfg(target_arch = "aarch64")]
-    fn accumulate_convert_oracle(
-        chunk_ab_bytes: &[[u8; 64]; 1 << N_MEDIUM],
-        chunk_c_bytes: &[[u8; 64]; 1 << N_MEDIUM],
-        n_b_med: usize,
-        convert: &[F128],
-        eq_lo_val: F128,
-        partial_ab: &mut [F128; ELL],
-        partial_c: &mut [F128; ELL],
-    ) {
-        for lane in 0..ELL {
-            let mut cf_ab = F128::ZERO;
-            let mut cf_c = F128::ZERO;
-            for b_med in 0..n_b_med {
-                let base = b_med * 256;
-                cf_ab += convert[base + chunk_ab_bytes[b_med][lane] as usize];
-                cf_c += convert[base + chunk_c_bytes[b_med][lane] as usize];
-            }
-            partial_ab[lane] += cf_ab * eq_lo_val;
-            partial_c[lane] += cf_c * eq_lo_val;
-        }
-    }
-
-    /// Two-bank oracle, same construction as [`accumulate_convert_oracle`].
-    #[cfg(target_arch = "aarch64")]
-    fn accumulate_convert_with_s_hat_v_oracle(
-        chunk_ab_bytes: &[[u8; 64]; 1 << N_MEDIUM],
-        chunk_c_bytes: &[[u8; 64]; 1 << N_MEDIUM],
-        n_b_med: usize,
-        convert: &[F128],
-        eq_lo_val: F128,
-        partial_ab: &mut [F128; ELL],
-        partial_c_0: &mut [F128; ELL],
-        partial_c_1: &mut [F128; ELL],
-    ) {
-        for lane in 0..ELL {
-            let mut cf_ab = F128::ZERO;
-            let mut cf_c_0 = F128::ZERO;
-            let mut cf_c_1 = F128::ZERO;
-            for b_med in 0..n_b_med {
-                let base = b_med * 256;
-                let v_c = chunk_c_bytes[b_med][lane] as usize;
-                cf_ab += convert[base + chunk_ab_bytes[b_med][lane] as usize];
-                cf_c_0 += convert[base + (v_c & 0x55)];
-                cf_c_1 += convert[base + (v_c & 0xaa)];
-            }
-            partial_ab[lane] += cf_ab * eq_lo_val;
-            partial_c_0[lane] += cf_c_0 * eq_lo_val;
-            partial_c_1[lane] += cf_c_1 * eq_lo_val;
-        }
-    }
-
-    /// The 4-lane-wide NEON convert fold must be **bit-identical** to the
-    /// one-lane-at-a-time scalar oracle, for every `n_b_med` the caller can
-    /// pass (0..=16, covering both the unrolled full path and the boundary
-    /// window) and starting from non-zero partials, so that the `+=`
-    /// accumulation semantics are exercised rather than plain assignment.
-    #[cfg(target_arch = "aarch64")]
-    #[test]
-    fn neon_accumulate_convert_matches_scalar_oracle() {
-        let convert = convert_table();
-        let mut rng = Rng::new(0xACC_C0FFEE);
-
-        for n_b_med in 0..=(1 << N_MEDIUM) {
-            let mut chunk_ab = [[0u8; 64]; 1 << N_MEDIUM];
-            let mut chunk_c = [[0u8; 64]; 1 << N_MEDIUM];
-            for b_med in 0..(1 << N_MEDIUM) {
-                for lane in 0..ELL {
-                    chunk_ab[b_med][lane] = (rng.next_u64() & 0xff) as u8;
-                    chunk_c[b_med][lane] = (rng.next_u64() & 0xff) as u8;
-                }
-            }
-            let eq_lo_val = rng.f128();
-
-            // Non-zero, and different per lane, so a dropped or misrouted
-            // accumulation cannot coincidentally match.
-            let seed_ab: [F128; ELL] = core::array::from_fn(|_| rng.f128());
-            let seed_c: [F128; ELL] = core::array::from_fn(|_| rng.f128());
-
-            let (mut got_ab, mut got_c) = (seed_ab, seed_c);
-            // SAFETY: aarch64 target; arrays are the exact sizes the kernel
-            // indexes, and `convert` is the full 16*256-entry table.
-            unsafe {
-                kernels::aarch64::accumulate_convert(
-                    &chunk_ab,
-                    &chunk_c,
-                    n_b_med,
-                    convert,
-                    eq_lo_val,
-                    &mut got_ab,
-                    &mut got_c,
-                );
-            }
-
-            let (mut want_ab, mut want_c) = (seed_ab, seed_c);
-            accumulate_convert_oracle(
-                &chunk_ab,
-                &chunk_c,
-                n_b_med,
-                convert,
-                eq_lo_val,
-                &mut want_ab,
-                &mut want_c,
-            );
-
-            assert_eq!(got_ab, want_ab, "partial_ab mismatch at n_b_med={n_b_med}");
-            assert_eq!(got_c, want_c, "partial_c mismatch at n_b_med={n_b_med}");
-        }
-    }
-
-    /// The gather-halving kernel is only bit-exact because `convert` is
-    /// **F2-linear in its index bits**: `T_b[u ^ v] == T_b[u] ^ T_b[v]`. That
-    /// is what lets one paired lookup stand in for two per-`b_med` lookups.
-    /// Checked exhaustively over every `(b, u, v)` — 16·256·256 triples.
-    #[test]
-    fn convert_table_index_linear() {
-        let t = convert_table();
-        for b in 0..16 {
-            let block = &t[b * 256..(b + 1) * 256];
-            assert_eq!(block[0], F128::ZERO, "T_{b}[0] must be zero");
-            for u in 0..256usize {
-                for v in 0..256usize {
-                    assert_eq!(
-                        block[u ^ v],
-                        block[u] + block[v],
-                        "index-linearity failed at b={b}, u={u}, v={v}"
-                    );
-                }
-            }
-        }
-    }
-
-    /// The paired tables must reproduce, in one lookup, exactly the two
-    /// per-`b_med` bank terms they replace — for every pair and every pair of
-    /// input bytes. This is the identity the kernel's correctness rests on.
-    #[test]
-    fn paired_c_tables_reproduce_both_banks() {
-        let base = convert_table();
-        let (m0, m1) = &*PAIRED_C_TABLES;
-        for p in 0..8 {
-            let (even, odd) = (2 * p * 256, (2 * p + 1) * 256);
-            for ce in 0..256usize {
-                for co in 0..256usize {
-                    let i0 = (ce & 0x55) | ((co << 1) & 0xaa);
-                    let i1 = (ce & 0xaa) | ((co >> 1) & 0x55);
-                    assert_eq!(
-                        m0[p * 256 + i0],
-                        base[even + (ce & 0x55)] + base[odd + (co & 0x55)],
-                        "bank0 pair p={p}, ce={ce}, co={co}"
-                    );
-                    assert_eq!(
-                        m1[p * 256 + i1],
-                        base[even + (ce & 0xaa)] + base[odd + (co & 0xaa)],
-                        "bank1 pair p={p}, ce={ce}, co={co}"
-                    );
-                }
-            }
-        }
-    }
-
-    /// Same contract for the two-bank variant — this is the kernel the prover
-    /// actually runs (`prove_packed_padded_capture_s_hat_v_c` always sets
-    /// `capture = true`), so it gets the same bit-exactness guard.
-    #[cfg(target_arch = "aarch64")]
-    #[test]
-    fn neon_accumulate_convert_with_s_hat_v_matches_scalar_oracle() {
-        let convert = convert_table();
-        let mut rng = Rng::new(0x5A17_C0DE);
-
-        for n_b_med in 0..=(1 << N_MEDIUM) {
-            let mut chunk_ab = [[0u8; 64]; 1 << N_MEDIUM];
-            let mut chunk_c = [[0u8; 64]; 1 << N_MEDIUM];
-            for b_med in 0..(1 << N_MEDIUM) {
-                for lane in 0..ELL {
-                    chunk_ab[b_med][lane] = (rng.next_u64() & 0xff) as u8;
-                    chunk_c[b_med][lane] = (rng.next_u64() & 0xff) as u8;
-                }
-            }
-            let eq_lo_val = rng.f128();
-
-            let seed_ab: [F128; ELL] = core::array::from_fn(|_| rng.f128());
-            let seed_c0: [F128; ELL] = core::array::from_fn(|_| rng.f128());
-            let seed_c1: [F128; ELL] = core::array::from_fn(|_| rng.f128());
-
-            let (mut got_ab, mut got_c0, mut got_c1) = (seed_ab, seed_c0, seed_c1);
-            // SAFETY: aarch64 target; arrays are the exact sizes the kernel
-            // indexes, and `convert` is the full 16*256-entry table.
-            unsafe {
-                let paired_c = &*PAIRED_C_TABLES;
-                kernels::aarch64::accumulate_convert_with_s_hat_v(
-                    &chunk_ab,
-                    &chunk_c,
-                    n_b_med,
-                    convert,
-                    &paired_c.0,
-                    &paired_c.1,
-                    eq_lo_val,
-                    &mut got_ab,
-                    &mut got_c0,
-                    &mut got_c1,
-                );
-            }
-
-            let (mut want_ab, mut want_c0, mut want_c1) = (seed_ab, seed_c0, seed_c1);
-            accumulate_convert_with_s_hat_v_oracle(
-                &chunk_ab,
-                &chunk_c,
-                n_b_med,
-                convert,
-                eq_lo_val,
-                &mut want_ab,
-                &mut want_c0,
-                &mut want_c1,
-            );
-
-            assert_eq!(got_ab, want_ab, "partial_ab mismatch at n_b_med={n_b_med}");
-            assert_eq!(got_c0, want_c0, "partial_c_0 mismatch at n_b_med={n_b_med}");
-            assert_eq!(got_c1, want_c1, "partial_c_1 mismatch at n_b_med={n_b_med}");
         }
     }
 }

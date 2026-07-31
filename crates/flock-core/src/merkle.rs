@@ -461,9 +461,25 @@ fn hash_leaves(data: &[u8], leaf_size: usize, out: &mut [Hash], kind: HashKind) 
             .zip(data.par_chunks(leaf_size))
             .for_each(|(o, leaf)| *o = blake3_leaf_cv(leaf)),
         HashKind::Sha256 => {
-            out.par_chunks_mut(4)
-                .zip(data.par_chunks(4 * leaf_size))
-                .for_each(|(outs, leaves)| {
+            // Same chunk-queue dispatch as the batched BLAKE3 arm above, so
+            // the efficiency-core helper pool (when present) drains leaves
+            // alongside the main pool — see `epool`. Chunk `i` writes only
+            // `out[i*C..(i+1)*C]`, so output is byte-identical to the static
+            // rayon split regardless of which pool claims which chunk.
+            let n = out.len();
+            let out_base = crate::epool::SyncPtr(out.as_mut_ptr());
+            crate::epool::run_hetero_chunks(n.div_ceil(SHA256_LEAF_QUEUE_CHUNK), |i| {
+                let start = i * SHA256_LEAF_QUEUE_CHUNK;
+                let end = (start + SHA256_LEAF_QUEUE_CHUNK).min(n);
+                // SAFETY: `Hash` is `[u8; 32]` (Copy, no padding); the queue
+                // hands out each `i` exactly once and the `[start, end)`
+                // ranges are pairwise disjoint and in-bounds (`end <= n`),
+                // so each closure holds the only `&mut` into its range.
+                let outs = unsafe {
+                    core::slice::from_raw_parts_mut(out_base.ptr().add(start), end - start)
+                };
+                let leaves = &data[start * leaf_size..end * leaf_size];
+                for (outs, leaves) in outs.chunks_mut(4).zip(leaves.chunks(4 * leaf_size)) {
                     if outs.len() == 4 {
                         sha256_hash4(
                             [
@@ -479,34 +495,15 @@ fn hash_leaves(data: &[u8], leaf_size: usize, out: &mut [Hash], kind: HashKind) 
                             *out = Sha256::digest(leaf).into();
                         }
                     }
-                });
+                }
+            });
         }
     }
 }
 
-/// Hash one already-partitioned run of ranked 1 KiB BLAKE3 leaves without
-/// starting another Rayon/E-core scheduling region.
-///
-/// The ranked NTT-to-Merkle pipeline calls this from jobs that are themselves
-/// distributed across the P-core pool or handed to the existing E-core helper
-/// pool. Keeping this helper scheduling-free avoids a nested barrier per 1 MiB
-/// finalized NTT subtree while preserving the exact twelve-way leaf kernel and
-/// hash-count semantics used by [`hash_leaves`].
-pub(crate) fn hash_ranked_blake3_leaf_chunk(data: &[u8], out: &mut [Hash]) {
-    const LEAF_SIZE: usize = 1024;
-    assert_eq!(data.len(), out.len() * LEAF_SIZE);
-    #[cfg(feature = "hash-count")]
-    {
-        use std::sync::atomic::Ordering::Relaxed;
-        hash_count::LEAF_CALLS.fetch_add(out.len() as u64, Relaxed);
-        hash_count::LEAF_COMPRESSIONS.fetch_add(
-            out.len() as u64 * hash_count::blocks(HashKind::Blake3, LEAF_SIZE),
-            Relaxed,
-        );
-    }
-    let batched = blake3_hash_many_leaves(data, LEAF_SIZE, out);
-    assert!(batched, "ranked 1 KiB leaves must use the batched kernel");
-}
+/// Nodes per rayon task in the batched BLAKE3 paths: enough to amortize task
+/// dispatch over many `hash_many` calls, small enough to stay cache-resident.
+const BLAKE3_GROUP: usize = 1024;
 
 /// Leaves per queue chunk in the batched BLAKE3 leaf path (see `epool`).
 /// A multiple of 12 so every full chunk runs entirely through the twelve-way
@@ -516,15 +513,17 @@ pub(crate) fn hash_ranked_blake3_leaf_chunk(data: &[u8], out: &mut [Hash]) {
 /// atomic claim per 240 leaves stays far below dispatch noise.
 const BLAKE3_LEAF_QUEUE_CHUNK: usize = 240;
 
-/// Parents per queue chunk in the batched BLAKE3 parent path (see `epool`).
-/// Must be a multiple of 12 so every full group runs entirely through the
-/// twelve-way parent kernel (`hash_complete_parent_groups`) with no 4-wide
-/// tail. The previous static-rayon group size of 1024 = 12·85 + 4 dropped a
-/// 4-node remainder onto the slower path in *every* task; 1020 = 12·85
-/// eliminates that remainder. A full chunk is 1020 nodes × 64 B of children
-/// ≈ 64 KiB of input — one atomic claim amortises cleanly and an E-core tail
-/// is still sub-millisecond.
-const BLAKE3_PARENT_QUEUE_CHUNK: usize = 1020;
+/// Leaves per queue chunk in the SHA-256 leaf path (see `epool`). A multiple
+/// of 4 so full chunks run entirely through the four-wide kernel. At the
+/// ranked initial-tree shape (512-byte leaves) a chunk is 128 KiB of input —
+/// a sub-millisecond worst-case tail on an efficiency core — while an atomic
+/// claim per 256 leaves stays far below dispatch noise.
+const SHA256_LEAF_QUEUE_CHUNK: usize = 256;
+
+/// Internal-level nodes per queue chunk in the SHA-256 pair path (see
+/// `epool`). A multiple of 4 for the four-wide kernel; 64 KiB of children
+/// read per chunk.
+const SHA256_PAIR_QUEUE_CHUNK: usize = 1024;
 
 /// Hash one internal level: `write[i] = hash_pair(read[2i], read[2i+1])`.
 ///
@@ -532,8 +531,7 @@ const BLAKE3_PARENT_QUEUE_CHUNK: usize = 1020;
 /// read them zero-copy. Small upper levels can't fill the cores, so a rayon
 /// dispatch per level costs more than the hashing itself (~3× at the top of a
 /// 2^18 tree); those are hashed serially — still SIMD-batched — and only the
-/// wide lower levels fan out through the same efficiency-core-aware chunk
-/// queue the leaf path uses.
+/// wide lower levels fan out.
 fn hash_pairs_level(read: &[Hash], write: &mut [Hash], kind: HashKind) {
     #[cfg(feature = "hash-count")]
     hash_count::PAIR_CALLS.fetch_add(write.len() as u64, std::sync::atomic::Ordering::Relaxed);
@@ -549,34 +547,10 @@ fn hash_pairs_level(read: &[Hash], write: &mut [Hash], kind: HashKind) {
             if serial {
                 blake3_hash_many_parents(read_bytes, write);
             } else {
-                // Chunk-queue dispatch so the efficiency-core helper pool can
-                // drain parent nodes alongside the main pool — same contract
-                // as the leaf path. Chunk `i` writes only
-                // `write[i*C..(i+1)*C]`, so output is byte-identical to a
-                // static rayon split regardless of claim order.
-                let n = write.len();
-                let out_base = crate::epool::SyncPtr(write.as_mut_ptr());
-                let read_base = read_bytes.as_ptr() as usize;
-                crate::epool::run_hetero_chunks(n.div_ceil(BLAKE3_PARENT_QUEUE_CHUNK), |i| {
-                    let start = i * BLAKE3_PARENT_QUEUE_CHUNK;
-                    let end = (start + BLAKE3_PARENT_QUEUE_CHUNK).min(n);
-                    // SAFETY: `Hash` is `[u8; 32]` (Copy, no padding); the
-                    // queue hands out each `i` exactly once and the
-                    // `[start, end)` ranges are pairwise disjoint and
-                    // in-bounds, so each closure holds the only `&mut` into
-                    // its output range. The read side is immutable for the
-                    // whole level.
-                    let outs = unsafe {
-                        core::slice::from_raw_parts_mut(out_base.ptr().add(start), end - start)
-                    };
-                    let children = unsafe {
-                        core::slice::from_raw_parts(
-                            (read_base as *const u8).add(start * 64),
-                            (end - start) * 64,
-                        )
-                    };
-                    blake3_hash_many_parents(children, outs);
-                });
+                write
+                    .par_chunks_mut(BLAKE3_GROUP)
+                    .zip(read_bytes.par_chunks(BLAKE3_GROUP * 64))
+                    .for_each(|(outs, children)| blake3_hash_many_parents(children, outs));
             }
         }
         HashKind::Sha256 => {
@@ -607,10 +581,28 @@ fn hash_pairs_level(read: &[Hash], write: &mut [Hash], kind: HashKind) {
                     hash_quad(outs, children);
                 }
             } else {
-                write
-                    .par_chunks_mut(4)
-                    .zip(read_bytes.par_chunks(256))
-                    .for_each(|(outs, children)| hash_quad(outs, children));
+                // Chunk-queue dispatch so the efficiency-core helper pool
+                // (when present) drains nodes alongside the main pool — see
+                // `epool`. Byte-identical to the static split: chunk `i`
+                // writes only its own disjoint node range.
+                let n = write.len();
+                let write_base = crate::epool::SyncPtr(write.as_mut_ptr());
+                crate::epool::run_hetero_chunks(n.div_ceil(SHA256_PAIR_QUEUE_CHUNK), |i| {
+                    let start = i * SHA256_PAIR_QUEUE_CHUNK;
+                    let end = (start + SHA256_PAIR_QUEUE_CHUNK).min(n);
+                    // SAFETY: `Hash` is `[u8; 32]` (Copy, no padding); the
+                    // queue hands out each `i` exactly once and the
+                    // `[start, end)` ranges are pairwise disjoint and
+                    // in-bounds, so each closure holds the only `&mut` into
+                    // its range. `read_bytes` is a shared borrow.
+                    let outs = unsafe {
+                        core::slice::from_raw_parts_mut(write_base.ptr().add(start), end - start)
+                    };
+                    let children = &read_bytes[start * 64..end * 64];
+                    for (outs, children) in outs.chunks_mut(4).zip(children.chunks(256)) {
+                        hash_quad(outs, children);
+                    }
+                });
             }
         }
     }
@@ -649,21 +641,7 @@ pub fn merkle_tree(data: &[u8], num_leaves: usize, kind: HashKind) -> Vec<Hash> 
     // 1. Leaves — fully parallel, SIMD-batched across leaves where possible.
     hash_leaves(data, leaf_size, &mut tree[..num_leaves], kind);
 
-    merkle_tree_from_prehashed_leaves(tree, num_leaves, kind)
-}
-
-/// Complete a flat tree whose first `num_leaves` slots already contain leaf
-/// hashes. The vector must have the normal `2*num_leaves-1` allocation; every
-/// remaining slot is written level-by-level before it is read.
-pub(crate) fn merkle_tree_from_prehashed_leaves(
-    mut tree: Vec<Hash>,
-    num_leaves: usize,
-    kind: HashKind,
-) -> Vec<Hash> {
-    assert!(num_leaves.is_power_of_two() && num_leaves > 0);
-    assert_eq!(tree.len(), 2 * num_leaves - 1);
-
-    // Internal levels — parallel within a level, sequential across levels.
+    // 2. Internal levels — parallel within a level, sequential across levels.
     let mut read_start = 0usize;
     let mut read_len = num_leaves;
     while read_len > 1 {
@@ -1342,25 +1320,6 @@ mod tests {
             );
             assert_eq!(expect, got, "n={n} leaf_size={leaf_size}");
         }
-    }
-
-    #[test]
-    fn ranked_leaf_chunks_then_parents_match_regular_tree() {
-        const N_LEAVES: usize = 256;
-        const LEAF_SIZE: usize = 1024;
-        const CHUNK_LEAVES: usize = 64;
-
-        let data = random_data(N_LEAVES, LEAF_SIZE, 0xCA5E_10CA_1B1A_0E03);
-        let expect = merkle_tree(&data, N_LEAVES, HashKind::Blake3);
-        let mut got: Vec<Hash> = crate::alloc_uninit_vec(2 * N_LEAVES - 1);
-        for (input, output) in data
-            .chunks(CHUNK_LEAVES * LEAF_SIZE)
-            .zip(got[..N_LEAVES].chunks_mut(CHUNK_LEAVES))
-        {
-            hash_ranked_blake3_leaf_chunk(input, output);
-        }
-        let got = merkle_tree_from_prehashed_leaves(got, N_LEAVES, HashKind::Blake3);
-        assert_eq!(got, expect);
     }
 
     #[test]

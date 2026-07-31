@@ -267,8 +267,6 @@ fn drive_witness_packed_and_lincheck_impl<const PER_BLOCK_FULLY_WRITES: bool, S:
 where
     F: Fn(&S, &mut [u64], &mut [u64], &mut [u64]) + Sync,
 {
-    use rayon::prelude::*;
-
     let k = 1usize << k_log;
     let f128_per_block = k / 128;
     let u64_per_block = k / 64;
@@ -290,22 +288,48 @@ where
     let total_f128 = n_total * f128_per_block;
     // z/a/b are allocated uninitialized. Ordinary OR-based builders zero each
     // 8-block group inside the parallel loop; full-write builders initialize
-    // every word directly and skip that pass. `z_lincheck` comes from the
-    // scratch byte pool (UNINITIALIZED, possibly stale): the transpose below
-    // writes every byte of every group before anything reads it, and the
-    // caller returns it via `scratch::give_u8` after lincheck so the next
-    // prove reuses resident pages instead of re-faulting 2^(m-3) bytes.
+    // every word directly and skip that pass. `z_lincheck` stays
+    // `vec![0u8; _]` (lazy `alloc_zeroed`/mmap — no eager memset).
     let mut z = flock_core::scratch::take_f128(total_f128);
     let mut a = flock_core::scratch::take_f128(total_f128);
     let mut b = flock_core::scratch::take_f128(total_f128);
-    let mut z_lincheck = flock_core::scratch::take_u8((n_total / 8) * k);
+    let mut z_lincheck = vec![0u8; (n_total / 8) * k];
 
-    z.par_chunks_mut(8 * f128_per_block)
-        .zip(a.par_chunks_mut(8 * f128_per_block))
-        .zip(b.par_chunks_mut(8 * f128_per_block))
-        .zip(z_lincheck.par_chunks_mut(k))
-        .enumerate()
-        .for_each(|(g, (((z_grp, a_grp), b_grp), stripe))| {
+    // Chunk-queue dispatch (see `flock_core::epool`): 8-block groups are
+    // drained from a shared atomic queue by the main rayon pool plus the
+    // efficiency-core helper pool when present. Group `g` writes only its own
+    // disjoint slices of z/a/b/z_lincheck, so output is byte-identical to a
+    // static rayon split regardless of which pool claims which group.
+    let n_groups = n_total / 8;
+    let z_base = flock_core::epool::SyncPtr(z.as_mut_ptr());
+    let a_base = flock_core::epool::SyncPtr(a.as_mut_ptr());
+    let b_base = flock_core::epool::SyncPtr(b.as_mut_ptr());
+    let stripe_base = flock_core::epool::SyncPtr(z_lincheck.as_mut_ptr());
+    flock_core::epool::run_hetero_chunks(n_groups.div_ceil(WITNESS_QUEUE_GROUPS), |chunk| {
+        let g_start = chunk * WITNESS_QUEUE_GROUPS;
+        let g_end = (g_start + WITNESS_QUEUE_GROUPS).min(n_groups);
+        for g in g_start..g_end {
+            // SAFETY: `F128` and `u8` are Copy with no padding; the queue
+            // hands out each `chunk` exactly once and distinct groups cover
+            // pairwise-disjoint in-bounds ranges of all four buffers, so each
+            // iteration holds the only `&mut` into its ranges.
+            let (z_grp, a_grp, b_grp, stripe) = unsafe {
+                (
+                    std::slice::from_raw_parts_mut(
+                        z_base.ptr().add(g * 8 * f128_per_block),
+                        8 * f128_per_block,
+                    ),
+                    std::slice::from_raw_parts_mut(
+                        a_base.ptr().add(g * 8 * f128_per_block),
+                        8 * f128_per_block,
+                    ),
+                    std::slice::from_raw_parts_mut(
+                        b_base.ptr().add(g * 8 * f128_per_block),
+                        8 * f128_per_block,
+                    ),
+                    std::slice::from_raw_parts_mut(stripe_base.ptr().add(g * k), k),
+                )
+            };
             // Ordinary per-block builders OR 1-bits into pre-zeroed words; any
             // slot left unbuilt (no padding block) stays zero, which the
             // lincheck transpose below reads correctly. Full-write builders
@@ -374,10 +398,17 @@ where
                 ];
                 transpose_8_u64s_to_64_bytes(&lanes, &mut stripe[i * 64..i * 64 + 64]);
             }
-        });
+        }
+    });
 
     (z, a, b, z_lincheck)
 }
+
+/// 8-block groups per queue chunk in the witness build (see
+/// `flock_core::epool`). At the ranked shape a chunk is 32 blocks ≈ 200 µs of
+/// single-core work — a short worst-case efficiency-core tail — while one
+/// atomic claim per chunk stays far below dispatch noise.
+const WITNESS_QUEUE_GROUPS: usize = 4;
 
 /// Sort `v` and remove pairs of duplicates (GF(2) cancellation). Keeps R1CS
 /// rows in canonical (sorted, square-free) form.

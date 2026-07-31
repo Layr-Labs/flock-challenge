@@ -317,34 +317,6 @@ impl AdditiveNttF128 {
         num_ntts: usize,
         start_layer: usize,
     ) {
-        self.forward_transform_interleaved_from_layer_and_then(
-            data,
-            num_ntts,
-            start_layer,
-            |_, _| {},
-        );
-    }
-
-    /// Variant of [`Self::forward_transform_interleaved_from_layer`] that calls
-    /// `finish_chunk(offset, chunk)` exactly once for every disjoint finalized
-    /// cache chunk. `offset` is in `F128` elements from the start of `data`.
-    ///
-    /// The callback runs inside the existing deep-transform Rayon job, before
-    /// that worker moves to another chunk. Once a callback begins, the
-    /// transform never reads or writes that chunk again; callers may therefore
-    /// hand the finalized range to another worker before the callback returns.
-    /// This lets the PCS hash codeword leaves while their 1 MiB ranked subtree
-    /// is still cache-resident, without changing transform ordering or adding
-    /// another parallel region.
-    pub(crate) fn forward_transform_interleaved_from_layer_and_then<F>(
-        &self,
-        data: &mut [F128],
-        num_ntts: usize,
-        start_layer: usize,
-        finish_chunk: F,
-    ) where
-        F: Fn(usize, &[F128]) + Sync + Send,
-    {
         assert!(num_ntts.is_power_of_two() && num_ntts > 0);
         let n_total = data.len();
         assert_eq!(n_total % num_ntts, 0);
@@ -359,12 +331,7 @@ impl AdditiveNttF128 {
             all(target_arch = "x86_64", target_feature = "pclmulqdq"),
         ))]
         {
-            self.forward_transform_interleaved_parallel_from_layer_and_then(
-                data,
-                num_ntts,
-                start_layer,
-                &finish_chunk,
-            );
+            self.forward_transform_interleaved_parallel_from_layer(data, num_ntts, start_layer);
         }
         #[cfg(not(any(
             all(target_arch = "aarch64", target_feature = "aes"),
@@ -372,7 +339,6 @@ impl AdditiveNttF128 {
         )))]
         {
             self.forward_transform_interleaved_scalar_from_layer(data, num_ntts, start_layer);
-            finish_chunk(0, data);
         }
     }
 
@@ -444,28 +410,6 @@ impl AdditiveNttF128 {
         num_ntts: usize,
         start_layer: usize,
     ) {
-        self.forward_transform_interleaved_parallel_from_layer_and_then(
-            data,
-            num_ntts,
-            start_layer,
-            &|_, _| {},
-        );
-    }
-
-    #[cfg(any(
-        all(target_arch = "aarch64", target_feature = "aes"),
-        all(target_arch = "x86_64", target_feature = "pclmulqdq"),
-    ))]
-    fn forward_transform_interleaved_parallel_from_layer_and_then<F>(
-        &self,
-        data: &mut [F128],
-        num_ntts: usize,
-        start_layer: usize,
-        finish_chunk: &F,
-    ) where
-        F: Fn(usize, &[F128]) + Sync + Send,
-    {
-        use rayon::prelude::*;
         let n_total = data.len();
         let log_d = log2_pow2(n_total / num_ntts);
 
@@ -505,7 +449,6 @@ impl AdditiveNttF128 {
         let n_top = fusion_aware_interleaved_n_top(log_d, num_ntts, start_layer, n_top);
         if n_top == 0 || log_d < 8 {
             self.forward_transform_interleaved_scalar_from_layer(data, num_ntts, start_layer);
-            finish_chunk(0, data);
             return;
         }
 
@@ -638,13 +581,7 @@ impl AdditiveNttF128 {
         // the existing outer chunk job so every row is loaded/stored once per
         // two layers and no nested Rayon region is created.
         if use_ranked_deep_pair_fusion(log_d, num_ntts, start_layer, n_top) {
-            self.forward_transform_interleaved_deep_fused_pairs_and_then(
-                data,
-                num_ntts,
-                n_top,
-                log_d,
-                finish_chunk,
-            );
+            self.forward_transform_interleaved_deep_fused_pairs(data, num_ntts, n_top, log_d);
             return;
         }
 
@@ -652,9 +589,22 @@ impl AdditiveNttF128 {
         let sub_size_positions = 1usize << (log_d - n_top);
         let sub_bytes = sub_size_positions * num_ntts;
 
-        data.par_chunks_mut(sub_bytes)
-            .enumerate()
-            .for_each(|(sub_idx, sub_data)| {
+        // Chunk-queue dispatch (see `epool`): sub-NTTs are independent and
+        // cache-resident, so the efficiency-core helper pool (when present)
+        // drains them alongside the main pool. Sub-NTT `sub_idx` writes only
+        // its own disjoint range, so output is byte-identical to the static
+        // rayon split regardless of which pool claims which sub-NTT.
+        let n_subs = data.len().div_ceil(sub_bytes);
+        let data_len = data.len();
+        let data_base = crate::epool::SyncPtr(data.as_mut_ptr());
+        crate::epool::run_hetero_chunks(n_subs, |sub_idx| {
+            let start = sub_idx * sub_bytes;
+            let end = (start + sub_bytes).min(data_len);
+            // SAFETY: the queue hands out each `sub_idx` exactly once and
+            // distinct sub-NTTs cover pairwise-disjoint in-bounds ranges.
+            let sub_data =
+                unsafe { core::slice::from_raw_parts_mut(data_base.ptr().add(start), end - start) };
+            {
                 for layer in n_top.max(start_layer)..log_d {
                     let layer_in_sub = layer - n_top;
                     let num_blocks_in_sub = 1usize << layer_in_sub;
@@ -670,14 +620,13 @@ impl AdditiveNttF128 {
                         butterfly_interleaved_block(block, twiddle, block_size_half, num_ntts);
                     }
                 }
-                finish_chunk(sub_idx * sub_bytes, sub_data);
-            });
+            }
+        });
     }
 
     /// Finish layers `n_top..log_d` two at a time inside independent
     /// cache-resident sub-NTTs. The outer `par_chunks_mut` is the only Rayon
     /// boundary; block and row work inside each chunk is deliberately serial.
-    #[cfg(test)]
     fn forward_transform_interleaved_deep_fused_pairs(
         &self,
         data: &mut [F128],
@@ -685,35 +634,26 @@ impl AdditiveNttF128 {
         n_top: usize,
         log_d: usize,
     ) {
-        self.forward_transform_interleaved_deep_fused_pairs_and_then(
-            data,
-            num_ntts,
-            n_top,
-            log_d,
-            &|_, _| {},
-        );
-    }
-
-    fn forward_transform_interleaved_deep_fused_pairs_and_then<F>(
-        &self,
-        data: &mut [F128],
-        num_ntts: usize,
-        n_top: usize,
-        log_d: usize,
-        finish_chunk: &F,
-    ) where
-        F: Fn(usize, &[F128]) + Sync + Send,
-    {
-        use rayon::prelude::*;
-
         debug_assert!(n_top <= log_d);
         debug_assert_eq!(data.len(), (1usize << log_d) * num_ntts);
         let sub_size_positions = 1usize << (log_d - n_top);
         let sub_elems = sub_size_positions * num_ntts;
 
-        data.par_chunks_mut(sub_elems)
-            .enumerate()
-            .for_each(|(sub_idx, sub_data)| {
+        // Chunk-queue dispatch (see `epool`): sub-NTTs are independent and
+        // cache-resident, so the efficiency-core helper pool (when present)
+        // drains them alongside the main pool. Byte-identical output: each
+        // sub-NTT writes only its own disjoint range.
+        let n_subs = data.len().div_ceil(sub_elems);
+        let data_len = data.len();
+        let data_base = crate::epool::SyncPtr(data.as_mut_ptr());
+        crate::epool::run_hetero_chunks(n_subs, |sub_idx| {
+            let start = sub_idx * sub_elems;
+            let end = (start + sub_elems).min(data_len);
+            // SAFETY: the queue hands out each `sub_idx` exactly once and
+            // distinct sub-NTTs cover pairwise-disjoint in-bounds ranges.
+            let sub_data =
+                unsafe { core::slice::from_raw_parts_mut(data_base.ptr().add(start), end - start) };
+            {
                 let mut layer = n_top;
                 while layer + 1 < log_d {
                     let layer_in_sub = layer - n_top;
@@ -761,8 +701,8 @@ impl AdditiveNttF128 {
                         );
                     }
                 }
-                finish_chunk(sub_idx * sub_elems, sub_data);
-            });
+            }
+        });
     }
 
     /// Scalar reference implementation. Used as the test oracle and on
@@ -1193,7 +1133,6 @@ fn butterfly_interleaved_fused_3layer_par_rows<const ZERO_ROOT: bool>(
     eighth: usize,
     num_ntts: usize,
 ) {
-    use rayon::prelude::*;
     const PARALLEL_ROW_THRESHOLD: usize = 256;
     debug_assert_eq!(block.len(), 8 * eighth * num_ntts);
     if ZERO_ROOT {
@@ -1223,24 +1162,44 @@ fn butterfly_interleaved_fused_3layer_par_rows<const ZERO_ROOT: bool>(
             };
         }
     } else {
-        (0..eighth).into_par_iter().for_each(|r| {
-            // SAFETY: distinct r → disjoint row groups → no aliasing.
-            unsafe {
-                if ZERO_ROOT {
-                    kernels::butterfly_fused_3layer_zero_root_row(
-                        base as *mut F128,
-                        eighth,
-                        num_ntts,
-                        r,
-                        t,
-                    )
-                } else {
-                    kernels::butterfly_fused_3layer_row(base as *mut F128, eighth, num_ntts, r, t)
-                }
-            };
+        // Chunk-queue dispatch (see `epool`): row groups are independent, so
+        // the efficiency-core helper pool (when present) drains them
+        // alongside the main pool. Byte-identical output: each row group
+        // writes only its own disjoint rows.
+        crate::epool::run_hetero_chunks(eighth.div_ceil(NTT_ROW_QUEUE_GROUPS), |chunk| {
+            let start = chunk * NTT_ROW_QUEUE_GROUPS;
+            let end = (start + NTT_ROW_QUEUE_GROUPS).min(eighth);
+            for r in start..end {
+                // SAFETY: distinct r → disjoint row groups → no aliasing.
+                unsafe {
+                    if ZERO_ROOT {
+                        kernels::butterfly_fused_3layer_zero_root_row(
+                            base as *mut F128,
+                            eighth,
+                            num_ntts,
+                            r,
+                            t,
+                        )
+                    } else {
+                        kernels::butterfly_fused_3layer_row(
+                            base as *mut F128,
+                            eighth,
+                            num_ntts,
+                            r,
+                            t,
+                        )
+                    }
+                };
+            }
         });
     }
 }
+
+/// Row groups per queue chunk in the fused top-layer passes (see `epool`).
+/// At the ranked shape one row group touches 8 (or 16) rows of 32 lanes —
+/// a few KiB — so 64 groups per chunk keeps the worst-case efficiency-core
+/// tail well under a millisecond while amortizing the atomic claim.
+const NTT_ROW_QUEUE_GROUPS: usize = 64;
 
 /// Butterfly one top-layer block, fusing four layers `(L..L+4)`. `block` holds
 /// `16 * sixteenth` rows of `num_ntts` lanes; `t` carries the 15 twiddles for
@@ -1252,7 +1211,6 @@ fn butterfly_interleaved_fused_4layer_par_rows(
     sixteenth: usize,
     num_ntts: usize,
 ) {
-    use rayon::prelude::*;
     const PARALLEL_ROW_THRESHOLD: usize = 256;
     debug_assert_eq!(block.len(), 16 * sixteenth * num_ntts);
     // Carry the base as `usize` (Send+Sync) so rayon's per-`r` closure can hold
@@ -1267,11 +1225,22 @@ fn butterfly_interleaved_fused_4layer_par_rows(
             };
         }
     } else {
-        (0..sixteenth).into_par_iter().for_each(|r| {
-            // SAFETY: distinct r → disjoint row groups → no aliasing.
-            unsafe {
-                kernels::butterfly_fused_4layer_row(base as *mut F128, sixteenth, num_ntts, r, t)
-            };
+        // Chunk-queue dispatch (see `epool`); same shape as the 3-layer pass.
+        crate::epool::run_hetero_chunks(sixteenth.div_ceil(NTT_ROW_QUEUE_GROUPS), |chunk| {
+            let start = chunk * NTT_ROW_QUEUE_GROUPS;
+            let end = (start + NTT_ROW_QUEUE_GROUPS).min(sixteenth);
+            for r in start..end {
+                // SAFETY: distinct r → disjoint row groups → no aliasing.
+                unsafe {
+                    kernels::butterfly_fused_4layer_row(
+                        base as *mut F128,
+                        sixteenth,
+                        num_ntts,
+                        r,
+                        t,
+                    )
+                };
+            }
         });
     }
 }
@@ -1397,42 +1366,6 @@ mod tests {
             ntt.forward_transform_interleaved_deep_fused_pairs(&mut got, NUM_NTTS, N_TOP, LOG_D);
             assert_eq!(got, want, "five-pair mismatch at iteration={iteration}");
         }
-    }
-
-    /// Every finalized-chunk callback must observe the final transform bytes,
-    /// exactly once and at the advertised global element offset.
-    #[test]
-    fn interleaved_chunk_finish_observes_complete_transform() {
-        const LOG_D: usize = 12;
-        const NUM_NTTS: usize = 2;
-        const START_LAYER: usize = 1;
-
-        let mut rng = Rng::new(0xCACE_10CA_1F1E_0001);
-        let ntt = AdditiveNttF128::standard(LOG_D);
-        let source = rand_vec(&mut rng, (1usize << LOG_D) * NUM_NTTS);
-        let mut want = source.clone();
-        ntt.forward_transform_interleaved_from_layer(&mut want, NUM_NTTS, START_LAYER);
-
-        let observed =
-            std::sync::Mutex::new((vec![F128::ZERO; source.len()], vec![0u8; source.len()]));
-        let mut got = source;
-        ntt.forward_transform_interleaved_from_layer_and_then(
-            &mut got,
-            NUM_NTTS,
-            START_LAYER,
-            |offset, chunk| {
-                let mut observed = observed.lock().unwrap();
-                observed.0[offset..offset + chunk.len()].copy_from_slice(chunk);
-                for count in &mut observed.1[offset..offset + chunk.len()] {
-                    *count += 1;
-                }
-            },
-        );
-
-        assert_eq!(got, want);
-        let observed = observed.into_inner().unwrap();
-        assert_eq!(observed.0, want);
-        assert!(observed.1.iter().all(|&count| count == 1));
     }
 
     /// Only the ranked macOS/AArch64 L0 transform may use the new tail

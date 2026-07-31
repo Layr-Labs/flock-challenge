@@ -16,11 +16,10 @@
 //! - a separate lazily-built pool of `hw.perflevel1.logicalcpu` threads at
 //!   `QOS_CLASS_UTILITY` (the scheduler places these on E-cores while the
 //!   higher-QoS main workers own the P-cores);
-//! - ordinary phases hand work to it through [`run_hetero_chunks`], a shared
-//!   atomic chunk queue drained by both pools. The ranked NTT-to-Merkle path
-//!   instead streams finalized cache chunks through its own bounded queue so
-//!   leaf hashing can overlap the transform. In both shapes an E-core owns at
-//!   most one tail chunk when the main pool finishes.
+//! - work is only ever handed to it through [`run_hetero_chunks`], a shared
+//!   atomic chunk queue drained by both pools. An E-core can never gate a
+//!   barrier: if it is slow it simply claims fewer chunks, and the worst-case
+//!   tail exposure is one chunk of work on one E-core.
 //!
 //! Output is byte-identical by construction: chunk `i` covers a fixed range
 //! and is processed by the same function regardless of which pool claims it.
@@ -128,7 +127,7 @@ const EPOOL_MIN_CHUNKS: usize = 16;
 /// depend on which thread or pool runs it. Chunk-claim order is
 /// nondeterministic; callers get deterministic *output* by making `f(i)`
 /// write only to chunk `i`'s disjoint range.
-pub(crate) fn run_hetero_chunks<F>(n_chunks: usize, f: F)
+pub fn run_hetero_chunks<F>(n_chunks: usize, f: F)
 where
     F: Fn(usize) + Sync,
 {
@@ -187,26 +186,24 @@ where
 /// `Send + Sync` wrapper for a raw base pointer shared across the two pools.
 ///
 /// # Safety contract (caller's)
-/// Every use must derive pairwise-disjoint ranges per chunk index. Mutable
-/// ranges must have one owner, and immutable producer/consumer ranges must not
-/// be published until their final write is synchronized with the reader. The
-/// queue handing out each index exactly once establishes ownership; individual
-/// call sites establish any required happens-before edge.
+/// Every use must write through disjoint ranges per chunk index — the same
+/// invariant `par_chunks_mut` enforces statically, held here by the queue
+/// handing out each index exactly once.
 #[derive(Clone, Copy)]
-pub(crate) struct SyncPtr<T>(pub(crate) *mut T);
+pub struct SyncPtr<T>(pub *mut T);
 
 impl<T> SyncPtr<T> {
     /// The wrapped base pointer. A method call uses the whole receiver, so
     /// closures capture the `Sync` wrapper rather than (via edition-2021+
     /// precise capture) the bare non-`Sync` pointer field.
     #[inline]
-    pub(crate) fn ptr(self) -> *mut T {
+    pub fn ptr(self) -> *mut T {
         self.0
     }
 }
 
-// SAFETY: SyncPtr is only a capability to derive ranges under the ownership
-// and synchronization contract above; each caller upholds that contract.
+// SAFETY: SyncPtr is only a capability to *derive* disjoint `&mut` ranges per
+// chunk; disjointness is upheld by the caller per the contract above.
 unsafe impl<T> Send for SyncPtr<T> {}
 unsafe impl<T> Sync for SyncPtr<T> {}
 
