@@ -787,9 +787,9 @@ impl AdditiveNttF128 {
     {
         use rayon::prelude::*;
 
-        // Ranked L0: layers 10..20 form five exact pairs. Fuse each pair inside
-        // the existing outer chunk job so every row is loaded/stored once per
-        // two layers and no nested Rayon region is created.
+        // Ranked L0: layers 10..20 finish inside cache-resident chunks —
+        // radix-8 sweeps then exact fused-2 pairs (3+3+2+2), all inside the
+        // existing outer chunk job so no nested Rayon region is created.
         if use_ranked_deep_pair_fusion(log_d, num_ntts, start_layer, n_top) {
             self.forward_transform_interleaved_deep_fused_pairs_and_then(
                 data,
@@ -827,9 +827,11 @@ impl AdditiveNttF128 {
             });
     }
 
-    /// Finish layers `n_top..log_d` two at a time inside independent
-    /// cache-resident sub-NTTs. The outer `par_chunks_mut` is the only Rayon
-    /// boundary; block and row work inside each chunk is deliberately serial.
+    /// Finish layers `n_top..log_d` inside independent cache-resident
+    /// sub-NTTs — radix-8 sweeps down to a four-layer remainder, then exact
+    /// fused-2 pairs (see `forward_transform_interleaved_deep_fused_pairs_and_then`).
+    /// The outer `par_chunks_mut` is the only Rayon boundary; block and row
+    /// work inside each chunk is deliberately serial.
     #[cfg(test)]
     fn forward_transform_interleaved_deep_fused_pairs(
         &self,
@@ -863,11 +865,44 @@ impl AdditiveNttF128 {
         debug_assert_eq!(data.len(), (1usize << log_d) * num_ntts);
         let sub_size_positions = 1usize << (log_d - n_top);
         let sub_elems = sub_size_positions * num_ntts;
+        // Radix-8 tail: run fused-3 sweeps while more than a four-layer
+        // remainder is left, then finish on the exact fused-2 pairs (ranked
+        // ten layers = 3+3+2+2 — four chunk sweeps instead of five). Skipping
+        // fused-3 at a four-layer remainder avoids a single-layer tail.
+        // `FLOCK_NO_DEEP_FUSED3` restores the pairs-only schedule for A/B.
+        let fused3_tail = std::env::var_os("FLOCK_NO_DEEP_FUSED3").is_none();
 
         data.par_chunks_mut(sub_elems)
             .enumerate()
             .for_each(|(sub_idx, sub_data)| {
                 let mut layer = n_top;
+                while fused3_tail && log_d - layer >= 3 && log_d - layer != 4 {
+                    let layer_in_sub = layer - n_top;
+                    let num_blocks_in_sub = 1usize << layer_in_sub;
+                    let block_size_positions = 1usize << (log_d - layer);
+                    let eighth = block_size_positions >> 3;
+                    let block_elems = block_size_positions * num_ntts;
+
+                    for block_in_sub in 0..num_blocks_in_sub {
+                        let global_block = sub_idx * num_blocks_in_sub + block_in_sub;
+                        let mut tw = [F128 { lo: 0, hi: 0 }; 7];
+                        tw[0] = self.twiddle(layer, global_block);
+                        for s in 0..2 {
+                            tw[1 + s] = self.twiddle(layer + 1, 2 * global_block + s);
+                        }
+                        for s in 0..4 {
+                            tw[3 + s] = self.twiddle(layer + 2, 4 * global_block + s);
+                        }
+                        let block_start = block_in_sub * block_elems;
+                        butterfly_interleaved_fused_3layer_rows_seq(
+                            &mut sub_data[block_start..block_start + block_elems],
+                            &tw,
+                            eighth,
+                            num_ntts,
+                        );
+                    }
+                    layer += 3;
+                }
                 while layer + 1 < log_d {
                     let layer_in_sub = layer - n_top;
                     let num_blocks_in_sub = 1usize << layer_in_sub;
@@ -1296,6 +1331,25 @@ fn butterfly_interleaved_fused_2layer_rows_seq(
         .zip(q4.chunks_exact_mut(num_ntts))
     {
         kernels::butterfly_fused_2layer(row_a, row_b, row_c, row_d, t_outer, t_inner_a, t_inner_b);
+    }
+}
+
+/// Sequential fused-three-layer sweep over one block: the deep-phase
+/// counterpart of [`butterfly_interleaved_fused_3layer_par_rows`]. Serial on
+/// purpose — it runs inside the deep phase's outer Rayon jobs, where
+/// row-level Rayon would nest a fork/join per subtree.
+#[inline]
+fn butterfly_interleaved_fused_3layer_rows_seq(
+    block: &mut [F128],
+    t: &[F128; 7],
+    eighth: usize,
+    num_ntts: usize,
+) {
+    debug_assert_eq!(block.len(), 8 * eighth * num_ntts);
+    let base = block.as_mut_ptr();
+    for r in 0..eighth {
+        // SAFETY: row group r touches disjoint rows of this exclusive block.
+        unsafe { kernels::butterfly_fused_3layer_row(base, eighth, num_ntts, r, t) };
     }
 }
 
@@ -1788,6 +1842,33 @@ mod tests {
         assert!(!is_ranked_top_hetero_fused3_pass(20, 8, 1, 10, 4));
         assert!(!is_ranked_top_hetero_fused3_pass(20, 64, 0, 10, 4));
         assert!(!is_ranked_top_hetero_fused3_pass(20, 64, 1, 9, 4));
+    }
+
+    /// The radix-8 deep tail (ranked ten layers = 3+3+2+2; nine = 3+3+3;
+    /// eight = 3+3+2; seven = 3+2+2) must equal the same layers applied one
+    /// at a time by the scalar oracle, including global-block twiddle
+    /// indexing across sub-NTT chunks.
+    #[test]
+    fn deep_fused3_tail_matches_scalar_reference() {
+        const LOG_D: usize = 12;
+        const NUM_NTTS: usize = 2;
+        let mut rng = Rng::new(0xDEE3_F05E_20A5_0003);
+        let ntt = AdditiveNttF128::standard(LOG_D);
+        for n_top in [2usize, 3, 4, 5] {
+            for iteration in 0..2 {
+                let source = rand_vec(&mut rng, (1usize << LOG_D) * NUM_NTTS);
+                let mut want = source.clone();
+                ntt.forward_transform_interleaved_scalar_from_layer(&mut want, NUM_NTTS, n_top);
+                let mut got = source;
+                ntt.forward_transform_interleaved_deep_fused_pairs(
+                    &mut got, NUM_NTTS, n_top, LOG_D,
+                );
+                assert!(
+                    got == want,
+                    "fused3 deep tail mismatch at n_top={n_top} iteration={iteration}"
+                );
+            }
+        }
     }
 
     /// Exercise the block-zero specialization and the ordinary nonzero-block
