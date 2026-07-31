@@ -210,6 +210,47 @@ fn use_ranked_deep_pair_fusion(
         && n_top == 10
 }
 
+/// Whether the ranked deep transform sweeps three layers at a time.
+///
+/// The deep layers run inside a cache-resident sub-NTT, so their cost is
+/// re-reads of that subtree, not DRAM: ten layers in five fused pairs load and
+/// store each row five times. `kernels::butterfly_fused_3layer_rows` is the
+/// same radix-8 row kernel the three top passes already use and applies while
+/// a block is at least eight positions wide, so layers 10..16 fuse three at a
+/// time and only 16..20 stay paired — four sweeps instead of five, one whole
+/// subtree pass of L1/L2 traffic removed, with the promoted low-twiddle final
+/// pair untouched.
+///
+/// Read once per process; the ranked harness sets its environment before the
+/// worker starts. `FLOCK_NO_NTT_DEEP_TRIPLE=1` restores the exact five-pair
+/// schedule in the same binary, so a candidate/control pair differs only in
+/// this dispatch.
+/// Whether the deep sweep starting at `layer` consumes three layers rather
+/// than two: the radix-8 row kernel needs a block at least eight positions
+/// wide, and the `reserved_tail` layers at the end belong to the low-twiddle
+/// final pair.
+///
+/// At the ranked shape (`log_d = 20`, `n_top = 10`, reserved tail 2) this
+/// yields the partition 10-12, 13-15, 16-17, 18-19: four sweeps for ten
+/// layers, with the final pair intact.
+#[inline]
+fn deep_sweep_takes_three(
+    layer: usize,
+    log_d: usize,
+    block_size_positions: usize,
+    reserved_tail: usize,
+    triple: bool,
+) -> bool {
+    triple && block_size_positions >= 8 && layer + 3 <= log_d.saturating_sub(reserved_tail)
+}
+
+#[inline]
+fn deep_triple_fusion_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("FLOCK_NO_NTT_DEEP_TRIPLE").is_none())
+}
+
 /// The standard dimension-20 basis has low-limb-only twiddles throughout the
 /// final two layers. This permits a two-PMULL product on AArch64 instead of the
 /// generic six-PMULL field multiply. Keep the dispatch tied to the exact
@@ -925,15 +966,17 @@ impl AdditiveNttF128 {
     {
         use rayon::prelude::*;
 
-        // Ranked L0: layers 10..20 form five exact pairs. Fuse each pair inside
-        // the existing outer chunk job so every row is loaded/stored once per
-        // two layers and no nested Rayon region is created.
+        // Ranked L0: fuse the ten deep layers inside the existing outer chunk
+        // job so no nested Rayon region is created. Layers 10..16 go three at a
+        // time on the radix-8 row kernel and 16..20 stay in pairs, so the
+        // cache-resident subtree is swept four times instead of five.
         if use_ranked_deep_pair_fusion(log_d, num_ntts, start_layer, n_top) {
             self.forward_transform_interleaved_deep_fused_pairs_and_then(
                 data,
                 num_ntts,
                 n_top,
                 log_d,
+                deep_triple_fusion_enabled(),
                 finish_chunk,
             );
             return;
@@ -975,22 +1018,26 @@ impl AdditiveNttF128 {
         num_ntts: usize,
         n_top: usize,
         log_d: usize,
+        triple: bool,
     ) {
         self.forward_transform_interleaved_deep_fused_pairs_and_then(
             data,
             num_ntts,
             n_top,
             log_d,
+            triple,
             &|_, _| {},
         );
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn forward_transform_interleaved_deep_fused_pairs_and_then<F>(
         &self,
         data: &mut [F128],
         num_ntts: usize,
         n_top: usize,
         log_d: usize,
+        triple: bool,
         finish_chunk: &F,
     ) where
         F: Fn(usize, &[F128]) + Sync + Send,
@@ -1001,8 +1048,12 @@ impl AdditiveNttF128 {
         debug_assert_eq!(data.len(), (1usize << log_d) * num_ntts);
         let sub_size_positions = 1usize << (log_d - n_top);
         let sub_elems = sub_size_positions * num_ntts;
-        let low_twiddle_final_pair =
-            use_ranked_low_twiddle_final_pair(log_d, num_ntts, n_top);
+        let low_twiddle_final_pair = use_ranked_low_twiddle_final_pair(log_d, num_ntts, n_top);
+
+        // The low-twiddle final pair is a promoted two-PMULL specialization of
+        // the last two layers, so those layers stay reserved for it; the triple
+        // step only consumes layers before them.
+        let reserved_tail = if low_twiddle_final_pair { 2 } else { 0 };
 
         data.par_chunks_mut(sub_elems)
             .enumerate()
@@ -1014,6 +1065,48 @@ impl AdditiveNttF128 {
                     let block_size_positions = 1usize << (log_d - layer);
                     let quarter = block_size_positions >> 2;
                     let block_elems = block_size_positions * num_ntts;
+
+                    // Three layers per sweep wherever the block is still wide
+                    // enough for a radix-8 row group and the reserved tail is
+                    // not encroached. Same kernel the top passes use.
+                    if deep_sweep_takes_three(
+                        layer,
+                        log_d,
+                        block_size_positions,
+                        reserved_tail,
+                        triple,
+                    ) {
+                        let eighth = block_size_positions >> 3;
+                        for block_in_sub in 0..num_blocks_in_sub {
+                            let global_block = sub_idx * num_blocks_in_sub + block_in_sub;
+                            let mut tw = [F128::ZERO; 7];
+                            tw[0] = self.twiddle(layer, global_block);
+                            for s in 0..2 {
+                                tw[1 + s] = self.twiddle(layer + 1, 2 * global_block + s);
+                            }
+                            for s in 0..4 {
+                                tw[3 + s] = self.twiddle(layer + 2, 4 * global_block + s);
+                            }
+                            let block_start = block_in_sub * block_elems;
+                            let block = &mut sub_data[block_start..block_start + block_elems];
+                            debug_assert_eq!(block.len(), 8 * eighth * num_ntts);
+                            // SAFETY: the row range covers exactly this block's
+                            // eight streams, the block is a disjoint slice of
+                            // this chunk, and chunks are owned by one worker.
+                            unsafe {
+                                kernels::butterfly_fused_3layer_rows(
+                                    block.as_mut_ptr(),
+                                    eighth,
+                                    num_ntts,
+                                    0,
+                                    eighth,
+                                    &tw,
+                                );
+                            }
+                        }
+                        layer += 3;
+                        continue;
+                    }
 
                     for block_in_sub in 0..num_blocks_in_sub {
                         let global_block = sub_idx * num_blocks_in_sub + block_in_sub;
@@ -1882,12 +1975,16 @@ mod tests {
         assert!(!use_ranked_low_twiddle_final_pair(20, 64, 9));
     }
 
-    /// Exercise five fused deep pairs with the ranked 1024-position subtree
+    /// Exercise the fused deep schedule with the ranked 1024-position subtree
     /// geometry, but only two interleaved lanes so the fixture stays small.
     /// The scalar oracle applies the same ten layers as separate sweeps and
     /// therefore catches both child-twiddle and global-block indexing errors.
+    ///
+    /// Both schedules are checked: `triple = false` is the incumbent five-pair
+    /// sweep, `triple = true` is the radix-8 step that replaces the leading
+    /// pairs. They must agree with the oracle and therefore with each other.
     #[test]
-    fn five_deep_fused_pairs_match_scalar_reference() {
+    fn deep_fused_schedules_match_scalar_reference() {
         const LOG_D: usize = 12;
         const N_TOP: usize = 2;
         const NUM_NTTS: usize = 2;
@@ -1899,9 +1996,104 @@ mod tests {
             let mut want = source.clone();
             ntt.forward_transform_interleaved_scalar_from_layer(&mut want, NUM_NTTS, N_TOP);
 
-            let mut got = source;
-            ntt.forward_transform_interleaved_deep_fused_pairs(&mut got, NUM_NTTS, N_TOP, LOG_D);
-            assert_eq!(got, want, "five-pair mismatch at iteration={iteration}");
+            for triple in [false, true] {
+                let mut got = source.clone();
+                ntt.forward_transform_interleaved_deep_fused_pairs(
+                    &mut got, NUM_NTTS, N_TOP, LOG_D, triple,
+                );
+                assert_eq!(
+                    got, want,
+                    "mismatch at iteration={iteration} triple={triple}"
+                );
+            }
+        }
+    }
+
+    /// The ranked ten deep layers must partition as 3+3+2+2 — four subtree
+    /// sweeps instead of five, with the promoted low-twiddle final pair still
+    /// reaching layers 18 and 19. This is the whole point of the change and is
+    /// checked here because the ranked geometry itself is unreachable off the
+    /// Apple target.
+    #[test]
+    fn ranked_deep_schedule_is_three_three_two_two() {
+        const LOG_D: usize = 20;
+        const N_TOP: usize = 10;
+        const RESERVED_TAIL: usize = 2;
+
+        let mut schedule = Vec::new();
+        let mut layer = N_TOP;
+        while layer + 1 < LOG_D {
+            let block_size_positions = 1usize << (LOG_D - layer);
+            let step = if deep_sweep_takes_three(
+                layer,
+                LOG_D,
+                block_size_positions,
+                RESERVED_TAIL,
+                true,
+            ) {
+                3
+            } else {
+                2
+            };
+            schedule.push((layer, step));
+            layer += step;
+        }
+        assert_eq!(
+            layer, LOG_D,
+            "the ranked deep layers must be fully consumed"
+        );
+        assert_eq!(schedule, vec![(10, 3), (13, 3), (16, 2), (18, 2)]);
+        // The final pair — the one the low-twiddle kernel specializes — is
+        // still a pair starting at `log_d - 2`.
+        assert_eq!(schedule.last(), Some(&(LOG_D - 2, 2)));
+
+        // With the killswitch the incumbent five-pair schedule returns.
+        let mut layer = N_TOP;
+        let mut pairs = 0;
+        while layer + 1 < LOG_D {
+            assert!(!deep_sweep_takes_three(
+                layer,
+                LOG_D,
+                1usize << (LOG_D - layer),
+                RESERVED_TAIL,
+                false,
+            ));
+            pairs += 1;
+            layer += 2;
+        }
+        assert_eq!(pairs, 5);
+    }
+
+    /// Odd and narrow deep-layer counts must still land on the oracle: the
+    /// triple step has to decline when a block is under eight positions wide
+    /// and the pair loop plus single-layer tail has to finish the remainder.
+    #[test]
+    fn deep_triple_fusion_handles_narrow_and_odd_tails() {
+        for &(log_d, n_top, num_ntts) in &[
+            (12usize, 2usize, 2usize),
+            (12, 3, 4),
+            (11, 2, 2),
+            (10, 1, 8),
+            (9, 5, 2),
+            (8, 7, 4),
+        ] {
+            let mut rng = Rng::new(0x0DD7_A115 ^ ((log_d * 71 + n_top * 7 + num_ntts) as u64));
+            let ntt = AdditiveNttF128::standard(log_d);
+            let source = rand_vec(&mut rng, (1usize << log_d) * num_ntts);
+
+            let mut want = source.clone();
+            ntt.forward_transform_interleaved_scalar_from_layer(&mut want, num_ntts, n_top);
+
+            for triple in [false, true] {
+                let mut got = source.clone();
+                ntt.forward_transform_interleaved_deep_fused_pairs(
+                    &mut got, num_ntts, n_top, log_d, triple,
+                );
+                assert_eq!(
+                    got, want,
+                    "mismatch at log_d={log_d} n_top={n_top} num_ntts={num_ntts} triple={triple}"
+                );
+            }
         }
     }
 
