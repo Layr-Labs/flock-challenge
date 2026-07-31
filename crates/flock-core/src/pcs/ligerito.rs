@@ -2647,6 +2647,60 @@ fn fold_and_msg_lsb_into(
         return SumcheckMessage { u_0, u_2 };
     }
 
+    // Large L0 folds drain through the hetero queue: this multiplier-bound
+    // streaming region runs while the leaf receivers are long finished, so
+    // the four efficiency cores are otherwise idle for the whole recursive
+    // open (same selection rule as the promoted zerocheck / lincheck / top-NTT
+    // conversions: compute-bound region → E-cores pay). Claims are coarse —
+    // `HETERO_CLAIM_OUT` outputs ≈ 512 KB of stores across nf+nb — so every
+    // worker keeps long sequential runs through both output streams, and the
+    // join tail is bounded by one claim. Each claim owns its disjoint output
+    // ranges and one message-partial slot; F128 addition is XOR, so the slot
+    // reduction is order-independent and the result stays bit-identical to
+    // the Rayon reduce.
+    #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+    {
+        const HETERO_CLAIM_OUT: usize = 1 << 14;
+        const HETERO_MIN_HALF: usize = 1 << 18;
+        if half >= HETERO_MIN_HALF && std::env::var_os("FLOCK_NO_LIG_FOLD_EPOOL").is_none() {
+            let n_claims = half / HETERO_CLAIM_OUT;
+            let mut partials: Vec<(F128, F128)> = vec![(F128::ZERO, F128::ZERO); n_claims];
+            let nf_base = crate::epool::SyncPtr(nf.as_mut_ptr());
+            let nb_base = crate::epool::SyncPtr(nb.as_mut_ptr());
+            let partials_base = crate::epool::SyncPtr(partials.as_mut_ptr());
+            crate::epool::run_hetero_chunks(n_claims, |claim| {
+                let base = claim * HETERO_CLAIM_OUT;
+                // SAFETY: the queue hands out each claim exactly once; claim
+                // `claim` exclusively owns nf/nb[base..base+CLAIM_OUT] and
+                // partials[claim]. The queue's completion join publishes all
+                // writes before the reduction below reads them.
+                let (fc, bc) = unsafe {
+                    (
+                        std::slice::from_raw_parts_mut(
+                            nf_base.ptr().add(base),
+                            HETERO_CLAIM_OUT,
+                        ),
+                        std::slice::from_raw_parts_mut(
+                            nb_base.ptr().add(base),
+                            HETERO_CLAIM_OUT,
+                        ),
+                    )
+                };
+                let msg = crate::field::f128_slice::fold_two_and_msg(f, b, base, fc, bc, r);
+                // SAFETY: exclusive owner of partials[claim] (see above).
+                unsafe {
+                    *partials_base.ptr().add(claim) = msg;
+                }
+            });
+            let (u_0, u_2) = partials
+                .iter()
+                .fold((F128::ZERO, F128::ZERO), |(a0, a2), &(c0, c2)| {
+                    (a0 + c0, a2 + c2)
+                });
+            return SumcheckMessage { u_0, u_2 };
+        }
+    }
+
     // Parallel path: `half` is a power of two ≥ PAR_THRESHOLD and CHUNK is a
     // power of two, so every chunk has even length and starts at an even
     // global index — message pairs (2k, 2k+1) never straddle a chunk boundary.
@@ -2730,6 +2784,66 @@ fn fold2_and_msgs_lsb(
     //     coeff of rc^2: (wf0+wf1)*(wb0+wb1)
     //   u2_D likewise over sums-of-adjacent-x, which reduce to the same three
     //   bilinear forms on (wf0+wf2.., wf1+wf3..) groupings handled below.
+    // Same hetero-queue drain as `fold_and_msg_lsb_into`: the fold2 pass is
+    // the single largest multiplier-bound sweep of the recursive open (it
+    // consumes the full L0 f/b pair), and the efficiency cores are idle for
+    // its whole window. Coarse claims keep sequential output streams; each
+    // claim owns disjoint wf/wb ranges plus one partial slot, and the XOR
+    // reduction is order-independent — bit-identical to the Rayon reduce.
+    #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+    {
+        const HETERO_CLAIM_OUT: usize = 1 << 14;
+        const HETERO_MIN_QUARTER: usize = 1 << 18;
+        if quarter >= HETERO_MIN_QUARTER && std::env::var_os("FLOCK_NO_LIG_FOLD_EPOOL").is_none() {
+            type Partial = (F128, F128, [F128; 6]);
+            let zero: Partial = (F128::ZERO, F128::ZERO, [F128::ZERO; 6]);
+            let n_claims = quarter / HETERO_CLAIM_OUT;
+            let mut partials: Vec<Partial> = vec![zero; n_claims];
+            let wf_base = crate::epool::SyncPtr(wf.as_mut_ptr());
+            let wb_base = crate::epool::SyncPtr(wb.as_mut_ptr());
+            let partials_base = crate::epool::SyncPtr(partials.as_mut_ptr());
+            crate::epool::run_hetero_chunks(n_claims, |claim| {
+                let base = claim * HETERO_CLAIM_OUT;
+                // SAFETY: the queue hands out each claim exactly once; claim
+                // `claim` exclusively owns wf/wb[base..base+CLAIM_OUT] and
+                // partials[claim]. The queue's completion join publishes all
+                // writes before the reduction below reads them.
+                let (wfc, wbc) = unsafe {
+                    (
+                        std::slice::from_raw_parts_mut(
+                            wf_base.ptr().add(base),
+                            HETERO_CLAIM_OUT,
+                        ),
+                        std::slice::from_raw_parts_mut(
+                            wb_base.ptr().add(base),
+                            HETERO_CLAIM_OUT,
+                        ),
+                    )
+                };
+                let out =
+                    crate::field::f128_slice::fold2_two_and_msgs(f, b, base, wfc, wbc, r_a, r_b);
+                // SAFETY: exclusive owner of partials[claim] (see above).
+                unsafe {
+                    *partials_base.ptr().add(claim) = out;
+                }
+            });
+            let acc = partials.iter().fold(zero, |(a0, a2, ac), &(b0, b2, bc)| {
+                let mut c = ac;
+                for (x, y) in c.iter_mut().zip(bc.iter()) {
+                    *x += *y;
+                }
+                (a0 + b0, a2 + b2, c)
+            });
+            return (
+                SumcheckMessage {
+                    u_0: acc.0,
+                    u_2: acc.1,
+                },
+                acc.2,
+            );
+        }
+    }
+
     const CHUNK: usize = 2048; // outputs per chunk; 8 inputs per output pair
     let acc = wf
         .par_chunks_mut(CHUNK)
