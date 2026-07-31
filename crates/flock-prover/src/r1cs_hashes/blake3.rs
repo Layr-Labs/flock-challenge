@@ -1564,26 +1564,28 @@ pub fn generate_witness_with_ab_packed_and_lincheck(
     Vec<flock_core::field::F128>,
     Vec<u8>,
 ) {
-    generate_witness_with_ab_packed_and_lincheck_impl(blocks, n_blocks_log, None)
+    generate_witness_with_ab_packed_and_lincheck_impl(blocks, n_blocks_log, None, false)
 }
 
 fn generate_witness_with_ab_packed_and_lincheck_rate2_codeword(
     blocks: &[Compression],
     n_blocks_log: usize,
     codeword: &mut [flock_core::field::F128],
+    use_hetero: bool,
 ) -> (
     Vec<flock_core::field::F128>,
     Vec<flock_core::field::F128>,
     Vec<flock_core::field::F128>,
     Vec<u8>,
 ) {
-    generate_witness_with_ab_packed_and_lincheck_impl(blocks, n_blocks_log, Some(codeword))
+    generate_witness_with_ab_packed_and_lincheck_impl(blocks, n_blocks_log, Some(codeword), use_hetero)
 }
 
 fn generate_witness_with_ab_packed_and_lincheck_impl(
     blocks: &[Compression],
     n_blocks_log: usize,
     rate2_codeword: Option<&mut [flock_core::field::F128]>,
+    use_hetero: bool,
 ) -> (
     Vec<flock_core::field::F128>,
     Vec<flock_core::field::F128>,
@@ -1607,7 +1609,11 @@ fn generate_witness_with_ab_packed_and_lincheck_impl(
         };
     match rate2_codeword {
         Some(codeword) => {
-            super::common::drive_witness_packed_and_lincheck_full_write_with_rate2_codeword(
+            (if use_hetero {
+                super::common::drive_witness_packed_and_lincheck_full_write_with_rate2_codeword_hetero
+            } else {
+                super::common::drive_witness_packed_and_lincheck_full_write_with_rate2_codeword
+            })(
                 blocks,
                 &padding,
                 n_blocks_log,
@@ -1697,6 +1703,14 @@ impl Blake3Setup {
             && std::env::var_os("FLOCK_NO_HOT_CODEWORD").is_none()
     }
 
+    #[inline]
+    fn use_ranked_witness_epool(&self) -> bool {
+        self.use_ranked_rate2_hot_codeword()
+            && flock_core::prover_support::helper_pool_available()
+            && rayon::current_num_threads() > 1
+            && std::env::var_os("FLOCK_NO_WITNESS_EPOOL").is_none()
+    }
+
     /// Select the reverse transpose only for the promoted benchmark geometry.
     /// `FLOCK_NO_BLAKE3_REVERSE_LINCHECK=1` is the exact CSC A/B control.
     #[inline]
@@ -1742,6 +1756,7 @@ impl Blake3Setup {
             blocks,
             self.n_blocks_log(),
             &mut codeword,
+            self.use_ranked_witness_epool(),
         );
         (codeword, witness)
     }
@@ -2659,6 +2674,7 @@ mod tests {
             &blocks,
             setup.n_blocks_log(),
             &mut hot_codeword,
+            false,
         );
 
         let mut filled_codeword =
@@ -2754,6 +2770,7 @@ mod tests {
             &blocks,
             RANKED_N_BLOCKS_LOG,
             &mut hot_codeword,
+            false,
         );
         assert_eq!(z.len(), RANKED_MSG_LEN);
         drop(a);
@@ -3107,5 +3124,53 @@ mod chain_e2e_tests {
                 .verify_chain(&comm, &proof, &cv0, &cv_last, &mut chv)
                 .is_err()
         );
+    }
+
+    #[cfg(not(all(target_os = "macos", target_arch = "aarch64", target_feature = "aes")))]
+    #[test]
+    fn witness_epool_flag_is_inert_off_ranked_macos() {
+        use flock_core::challenger::FsChallenger;
+        for seed in [0xA001_u64, 0xA002_u64] {
+            let setup = Blake3Setup::new(256);
+            let blocks: Vec<Compression> = (0..256).map(|i| {
+                ([seed as u32 ^ i as u32; 8], [(seed >> 16) as u32 ^ i as u32; 16], 0, 64, 11)
+            }).collect();
+            let mut left = FsChallenger::new(b"flock-witness-epool-inert");
+            let (p0, c0, claim0) = setup.prove_fast(&blocks, &mut left);
+            unsafe { std::env::set_var("FLOCK_NO_WITNESS_EPOOL", "1") };
+            let mut right = FsChallenger::new(b"flock-witness-epool-inert");
+            let (p1, c1, claim1) = setup.prove_fast(&blocks, &mut right);
+            unsafe { std::env::remove_var("FLOCK_NO_WITNESS_EPOOL") };
+            assert_eq!(claim0, claim1);
+            assert_eq!(
+                crate::proof_io::R1csProofBundleLigerito { commitment: c0, proof: p0 }.to_bytes(),
+                crate::proof_io::R1csProofBundleLigerito { commitment: c1, proof: p1 }.to_bytes(),
+            );
+        }
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64", target_feature = "aes"))]
+    #[test]
+    #[ignore = "on-device heterogeneous witness proof-byte sweep"]
+    fn ranked_witness_epool_proof_is_byte_identical() {
+        use flock_core::challenger::FsChallenger;
+        for seed in [0xB301_u64, 0xB302_u64, 0xB303_u64] {
+            let mut setup = Blake3Setup::new(1 << 18);
+            setup.pcs_params.merkle_hash = HashKind::Blake3;
+            assert!(setup.use_ranked_witness_epool());
+            let blocks: Vec<Compression> = (0..(1 << 18)).map(|i| {
+                ([seed as u32 ^ i as u32; 8], [(seed >> 16) as u32 ^ i as u32; 16], 0, 64, 11)
+            }).collect();
+            let mut ch0 = FsChallenger::new(b"flock-witness-epool-matrix");
+            let (p0, c0, _) = setup.prove_fast(&blocks, &mut ch0);
+            unsafe { std::env::set_var("FLOCK_NO_WITNESS_EPOOL", "1") };
+            let mut ch1 = FsChallenger::new(b"flock-witness-epool-matrix");
+            let (p1, c1, _) = setup.prove_fast(&blocks, &mut ch1);
+            unsafe { std::env::remove_var("FLOCK_NO_WITNESS_EPOOL") };
+            assert_eq!(
+                crate::proof_io::R1csProofBundleLigerito { commitment: c0, proof: p0 }.to_bytes(),
+                crate::proof_io::R1csProofBundleLigerito { commitment: c1, proof: p1 }.to_bytes(),
+            );
+        }
     }
 }
