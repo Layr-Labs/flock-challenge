@@ -97,6 +97,10 @@ use flock_core::proof::R1csClaim;
 use flock_core::r1cs::{BlockR1cs, SparseBinaryMatrix};
 use flock_core::verifier;
 
+#[cfg(target_arch = "aarch64")]
+#[path = "blake3_lockstep_aarch64.rs"]
+mod blake3_lockstep_aarch64;
+
 // ---------------------------------------------------------------------------
 // Public constants
 // ---------------------------------------------------------------------------
@@ -1564,26 +1568,83 @@ pub fn generate_witness_with_ab_packed_and_lincheck(
     Vec<flock_core::field::F128>,
     Vec<u8>,
 ) {
-    generate_witness_with_ab_packed_and_lincheck_impl(blocks, n_blocks_log, None)
+    generate_witness_with_ab_packed_and_lincheck_impl(
+        blocks,
+        n_blocks_log,
+        None,
+        false,
+        WitnessBuilderMode::Auto,
+        #[cfg(test)]
+        None,
+    )
 }
 
 fn generate_witness_with_ab_packed_and_lincheck_rate2_codeword(
     blocks: &[Compression],
     n_blocks_log: usize,
     codeword: &mut [flock_core::field::F128],
+    use_hetero: bool,
 ) -> (
     Vec<flock_core::field::F128>,
     Vec<flock_core::field::F128>,
     Vec<flock_core::field::F128>,
     Vec<u8>,
 ) {
-    generate_witness_with_ab_packed_and_lincheck_impl(blocks, n_blocks_log, Some(codeword))
+    generate_witness_with_ab_packed_and_lincheck_impl(
+        blocks,
+        n_blocks_log,
+        Some(codeword),
+        use_hetero,
+        WitnessBuilderMode::Auto,
+        #[cfg(test)]
+        None,
+    )
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum WitnessBuilderMode {
+    Auto,
+    #[cfg(test)]
+    Scalar,
+    #[cfg(test)]
+    V4,
+}
+
+#[inline]
+fn witness_lockstep_enabled(mode: WitnessBuilderMode) -> bool {
+    #[cfg(target_arch = "aarch64")]
+    {
+        match mode {
+            WitnessBuilderMode::Auto => {
+                std::env::var_os("FLOCK_NO_WITNESS_LOCKSTEP").is_none()
+            }
+            #[cfg(test)]
+            WitnessBuilderMode::Scalar => false,
+            #[cfg(test)]
+            WitnessBuilderMode::V4 => true,
+        }
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        let _ = mode;
+        false
+    }
+}
+
+#[cfg(test)]
+#[derive(Default)]
+struct WitnessDispatchCounters {
+    v4_calls: std::sync::atomic::AtomicUsize,
+    scalar_calls: std::sync::atomic::AtomicUsize,
 }
 
 fn generate_witness_with_ab_packed_and_lincheck_impl(
     blocks: &[Compression],
     n_blocks_log: usize,
     rate2_codeword: Option<&mut [flock_core::field::F128]>,
+    use_hetero: bool,
+    mode: WitnessBuilderMode,
+    #[cfg(test)] dispatch_counters: Option<&WitnessDispatchCounters>,
 ) -> (
     Vec<flock_core::field::F128>,
     Vec<flock_core::field::F128>,
@@ -1602,12 +1663,94 @@ fn generate_witness_with_ab_packed_and_lincheck_impl(
     };
     let per_block =
         |block: &Compression, z_u64: &mut [u64], a_u64: &mut [u64], b_u64: &mut [u64]| {
+            #[cfg(test)]
+            if let Some(counters) = dispatch_counters {
+                counters
+                    .scalar_calls
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
             let (cv, m, t, bl, fl) = block;
             build_block_witness_ab_stream_into(cv, m, *t, *bl, *fl, z_u64, a_u64, b_u64);
         };
+
+    #[cfg(target_arch = "aarch64")]
+    if witness_lockstep_enabled(mode) {
+        let per_group = |inputs: [&Compression; 8],
+                         z_u64: &mut [u64],
+                         a_u64: &mut [u64],
+                         b_u64: &mut [u64]| {
+            const WORDS_PER_BLOCK: usize = K / 64;
+            debug_assert_eq!(z_u64.len(), 8 * WORDS_PER_BLOCK);
+            debug_assert_eq!(a_u64.len(), 8 * WORDS_PER_BLOCK);
+            debug_assert_eq!(b_u64.len(), 8 * WORDS_PER_BLOCK);
+            let first: [Compression; 4] = std::array::from_fn(|lane| *inputs[lane]);
+            let second: [Compression; 4] = std::array::from_fn(|lane| *inputs[lane + 4]);
+            unsafe {
+                #[cfg(test)]
+                if let Some(counters) = dispatch_counters {
+                    counters
+                        .v4_calls
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+                blake3_lockstep_aarch64::flock_blake3_witness_group4_neon(
+                    first.as_ptr(),
+                    z_u64.as_mut_ptr(),
+                    a_u64.as_mut_ptr(),
+                    b_u64.as_mut_ptr(),
+                );
+
+                #[cfg(test)]
+                if let Some(counters) = dispatch_counters {
+                    counters
+                        .v4_calls
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+                blake3_lockstep_aarch64::flock_blake3_witness_group4_neon(
+                    second.as_ptr(),
+                    z_u64.as_mut_ptr().add(4 * WORDS_PER_BLOCK),
+                    a_u64.as_mut_ptr().add(4 * WORDS_PER_BLOCK),
+                    b_u64.as_mut_ptr().add(4 * WORDS_PER_BLOCK),
+                );
+            }
+        };
+
+        return match rate2_codeword {
+            Some(codeword) => {
+                (if use_hetero {
+                    super::common::drive_witness_packed_and_lincheck_full_write_group_with_rate2_codeword_hetero
+                } else {
+                    super::common::drive_witness_packed_and_lincheck_full_write_group_with_rate2_codeword
+                })(
+                    blocks,
+                    &padding,
+                    n_blocks_log,
+                    K_LOG,
+                    stripe_useful_bits,
+                    codeword,
+                    per_block,
+                    per_group,
+                )
+            }
+            None => super::common::drive_witness_packed_and_lincheck_full_write_group(
+                blocks,
+                &padding,
+                n_blocks_log,
+                K_LOG,
+                stripe_useful_bits,
+                per_block,
+                per_group,
+            ),
+        };
+    }
+
+    let _ = mode;
     match rate2_codeword {
         Some(codeword) => {
-            super::common::drive_witness_packed_and_lincheck_full_write_with_rate2_codeword(
+            (if use_hetero {
+                super::common::drive_witness_packed_and_lincheck_full_write_with_rate2_codeword_hetero
+            } else {
+                super::common::drive_witness_packed_and_lincheck_full_write_with_rate2_codeword
+            })(
                 blocks,
                 &padding,
                 n_blocks_log,
@@ -1697,6 +1840,14 @@ impl Blake3Setup {
             && std::env::var_os("FLOCK_NO_HOT_CODEWORD").is_none()
     }
 
+    #[inline]
+    fn use_ranked_witness_epool(&self) -> bool {
+        self.use_ranked_rate2_hot_codeword()
+            && flock_core::prover_support::helper_pool_available()
+            && rayon::current_num_threads() > 1
+            && std::env::var_os("FLOCK_NO_WITNESS_EPOOL").is_none()
+    }
+
     /// Select the reverse transpose only for the promoted benchmark geometry.
     /// `FLOCK_NO_BLAKE3_REVERSE_LINCHECK=1` is the exact CSC A/B control.
     #[inline]
@@ -1742,6 +1893,7 @@ impl Blake3Setup {
             blocks,
             self.n_blocks_log(),
             &mut codeword,
+            self.use_ranked_witness_epool(),
         );
         (codeword, witness)
     }
@@ -2616,6 +2768,382 @@ mod tests {
         }
     }
 
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn lockstep_v4_lane_oracle_matches_scalar_with_poisoned_outputs() {
+        const WORDS: usize = K / 64;
+        const POISON: u64 = 0xD6E8_FEB8_6659_FD93;
+
+        fn field(words: &[u64; WORDS], bit: usize, width: usize) -> u64 {
+            debug_assert!(width <= 32);
+            let word = bit >> 6;
+            let shift = bit & 63;
+            let mut value = words[word] >> shift;
+            if shift + width > 64 {
+                value |= words[word + 1] << (64 - shift);
+            }
+            value & ((1u64 << width) - 1)
+        }
+
+        let mut rng = Rng::new(0x4E45_4F4E_4C41_4E45);
+        for case in 0..8u32 {
+            let inputs: [Compression; 4] = std::array::from_fn(|lane| {
+                let lane_tag = (lane as u32 + 1).wrapping_mul(0x1111_1111) ^ case;
+                let cv =
+                    std::array::from_fn(|w| rng.next_u32() ^ lane_tag.rotate_left((w * 3) as u32));
+                let m = std::array::from_fn(|w| {
+                    rng.next_u32()
+                        ^ lane_tag.rotate_right((w * 5) as u32)
+                        ^ (w as u32).wrapping_mul(0x9E37_79B9)
+                });
+                let counter = ((rng.next_u32() as u64) << 32) | (rng.next_u32() ^ lane_tag) as u64;
+                (cv, m, counter, 64 ^ lane_tag, 11 ^ lane_tag.rotate_left(7))
+            });
+
+            let mut z = [[POISON; WORDS]; 4];
+            let mut a = [[POISON; WORDS]; 4];
+            let mut b = [[POISON; WORDS]; 4];
+            unsafe {
+                blake3_lockstep_aarch64::flock_blake3_witness_group4_neon(
+                    inputs.as_ptr(),
+                    z.as_mut_ptr().cast::<u64>(),
+                    a.as_mut_ptr().cast::<u64>(),
+                    b.as_mut_ptr().cast::<u64>(),
+                );
+            }
+
+            for lane in 0..4 {
+                let (cv, m, counter, block_len, flags) = &inputs[lane];
+                let mut z_ref = [POISON; WORDS];
+                let mut a_ref = [POISON; WORDS];
+                let mut b_ref = [POISON; WORDS];
+                build_block_witness_ab_stream_into(
+                    cv, m, *counter, *block_len, *flags, &mut z_ref, &mut a_ref, &mut b_ref,
+                );
+
+                for g in 0..N_G {
+                    for add in 0..ADDS_PER_G {
+                        let bit = g_add_carry_bit(g, add, 0);
+                        assert_eq!(
+                            field(&z[lane], bit, 31),
+                            field(&z_ref, bit, 31),
+                            "z carry case={case} lane={lane} g={g} add={add}"
+                        );
+                        assert_eq!(
+                            field(&a[lane], bit, 31),
+                            field(&a_ref, bit, 31),
+                            "a carry case={case} lane={lane} g={g} add={add}"
+                        );
+                        assert_eq!(
+                            field(&b[lane], bit, 31),
+                            field(&b_ref, bit, 31),
+                            "b carry case={case} lane={lane} g={g} add={add}"
+                        );
+                    }
+                    for lin in 0..LIN_WORDS_PER_G {
+                        let bit = g_lin_bit(g, lin, 0);
+                        assert_eq!(
+                            field(&z[lane], bit, 32),
+                            field(&z_ref, bit, 32),
+                            "z lin case={case} lane={lane} g={g} lin={lin}"
+                        );
+                        assert_eq!(
+                            field(&a[lane], bit, 32),
+                            field(&a_ref, bit, 32),
+                            "a lin case={case} lane={lane} g={g} lin={lin}"
+                        );
+                        assert_eq!(
+                            field(&b[lane], bit, 32),
+                            field(&b_ref, bit, 32),
+                            "b lin case={case} lane={lane} g={g} lin={lin}"
+                        );
+                    }
+                }
+
+                assert_eq!(z[lane], z_ref, "full z case={case} lane={lane}");
+                assert_eq!(a[lane], a_ref, "full a case={case} lane={lane}");
+                assert_eq!(b[lane], b_ref, "full b case={case} lane={lane}");
+                for word in 0..WORDS {
+                    assert_eq!(z[lane][word], a[lane][word] & b[lane][word]);
+                }
+            }
+        }
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn lockstep_v4_driver_matches_scalar_with_exact_dispatch_counts() {
+        use std::sync::atomic::Ordering;
+
+        type Witness = (Vec<F128>, Vec<F128>, Vec<F128>, Vec<u8>);
+
+        fn run(
+            blocks: &[Compression],
+            n_blocks_log: usize,
+            use_hetero: bool,
+            mode: WitnessBuilderMode,
+        ) -> (Witness, Vec<F128>, usize, usize) {
+            let n_total = 1usize << n_blocks_log;
+            let poison = F128 {
+                lo: 0xD6E8_FEB8_6659_FD93,
+                hi: 0xA5A3_58D3_51AA_7E13,
+            };
+            let mut codeword = vec![poison; 2 * n_total * (K / 128)];
+            let counters = WitnessDispatchCounters::default();
+            let witness = generate_witness_with_ab_packed_and_lincheck_impl(
+                blocks,
+                n_blocks_log,
+                Some(&mut codeword),
+                use_hetero,
+                mode,
+                Some(&counters),
+            );
+            (
+                witness,
+                codeword,
+                counters.v4_calls.load(Ordering::Relaxed),
+                counters.scalar_calls.load(Ordering::Relaxed),
+            )
+        }
+
+        for &n_blocks in &[1usize, 2, 3, 5, 7, 8, 9, 13, 15, 16, 17] {
+            let n_blocks_log = min_n_blocks_log(n_blocks).max(3);
+            let n_groups = (1usize << n_blocks_log) / 8;
+            let mut rng = Rng::new(0x5634_4452_4956_4552 ^ n_blocks as u64);
+            let blocks: Vec<Compression> = (0..n_blocks)
+                .map(|index| {
+                    let lane_tag = (index as u32 + 1).wrapping_mul(0x9E37_79B9);
+                    let cv = std::array::from_fn(|word| {
+                        rng.next_u32() ^ lane_tag.rotate_left((3 * word) as u32)
+                    });
+                    let message = std::array::from_fn(|word| {
+                        rng.next_u32()
+                            ^ lane_tag.rotate_right((5 * word) as u32)
+                            ^ word as u32
+                    });
+                    (
+                        cv,
+                        message,
+                        ((rng.next_u32() as u64) << 32) | rng.next_u32() as u64,
+                        64 ^ lane_tag,
+                        11 ^ lane_tag.rotate_left(7),
+                    )
+                })
+                .collect();
+
+            for use_hetero in [false, true] {
+                let (scalar, scalar_codeword, scalar_v4_calls, scalar_calls) = run(
+                    &blocks,
+                    n_blocks_log,
+                    use_hetero,
+                    WitnessBuilderMode::Scalar,
+                );
+                assert_eq!(scalar_v4_calls, 0);
+                assert_eq!(scalar_calls, 8 * n_groups);
+
+                let (candidate, candidate_codeword, candidate_v4_calls, candidate_scalar_calls) =
+                    run(
+                        &blocks,
+                        n_blocks_log,
+                        use_hetero,
+                        WitnessBuilderMode::V4,
+                    );
+                assert_eq!(candidate_v4_calls, 2 * n_groups);
+                assert_eq!(candidate_scalar_calls, 0);
+                assert_eq!(candidate.0, scalar.0, "z n_blocks={n_blocks}");
+                assert_eq!(candidate.1, scalar.1, "a n_blocks={n_blocks}");
+                assert_eq!(candidate.2, scalar.2, "b n_blocks={n_blocks}");
+                assert_eq!(candidate.3, scalar.3, "stripe n_blocks={n_blocks}");
+                assert_eq!(candidate_codeword, scalar_codeword);
+
+                let z_len = candidate.0.len();
+                assert_eq!(&candidate_codeword[..z_len], candidate.0.as_slice());
+                assert_eq!(&candidate_codeword[z_len..], candidate.0.as_slice());
+                let tail = USEFUL_BITS.div_ceil(64) * 64;
+                for stripe in candidate.3.chunks_exact(K) {
+                    assert!(stripe[tail..].iter().all(|&byte| byte == 0));
+                }
+            }
+        }
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn lockstep_v4_proof_bytes_match_scalar_for_three_seeds() {
+        use flock_core::challenger::FsChallenger;
+        use std::ffi::OsString;
+        use std::sync::Mutex;
+
+        static ENV_LOCK: Mutex<()> = Mutex::new(());
+        struct RestoreEnv(Option<OsString>);
+        impl Drop for RestoreEnv {
+            fn drop(&mut self) {
+                unsafe {
+                    if let Some(value) = self.0.take() {
+                        std::env::set_var("FLOCK_NO_WITNESS_LOCKSTEP", value);
+                    } else {
+                        std::env::remove_var("FLOCK_NO_WITNESS_LOCKSTEP");
+                    }
+                }
+            }
+        }
+
+        let _lock = ENV_LOCK.lock().unwrap();
+        let _restore = RestoreEnv(std::env::var_os("FLOCK_NO_WITNESS_LOCKSTEP"));
+        let setup = Blake3Setup::new(256);
+
+        for seed in [0x5634_5052_4F4F_4601, 0x5634_5052_4F4F_4602, 0x5634_5052_4F4F_4603] {
+            let mut rng = Rng::new(seed);
+            let blocks: Vec<Compression> = (0..setup.n_blocks)
+                .map(|index| {
+                    let tag = (index as u32 + 1).wrapping_mul(0x9E37_79B9);
+                    (
+                        std::array::from_fn(|word| {
+                            rng.next_u32() ^ tag.rotate_left((word * 3) as u32)
+                        }),
+                        std::array::from_fn(|word| {
+                            rng.next_u32() ^ tag.rotate_right((word * 5) as u32)
+                        }),
+                        ((rng.next_u32() as u64) << 32) | rng.next_u32() as u64,
+                        64,
+                        11,
+                    )
+                })
+                .collect();
+
+            unsafe { std::env::remove_var("FLOCK_NO_WITNESS_LOCKSTEP") };
+            assert!(witness_lockstep_enabled(WitnessBuilderMode::Auto));
+            let mut candidate_challenger = FsChallenger::new(b"flock-lockstep-proof-v0");
+            let (candidate_proof, candidate_commitment, candidate_claim) =
+                setup.prove_fast(&blocks, &mut candidate_challenger);
+            let candidate_bytes = crate::proof_io::R1csProofBundleLigerito {
+                commitment: candidate_commitment,
+                proof: candidate_proof,
+            }
+            .to_bytes();
+
+            unsafe { std::env::set_var("FLOCK_NO_WITNESS_LOCKSTEP", "1") };
+            assert!(!witness_lockstep_enabled(WitnessBuilderMode::Auto));
+            let mut scalar_challenger = FsChallenger::new(b"flock-lockstep-proof-v0");
+            let (scalar_proof, scalar_commitment, scalar_claim) =
+                setup.prove_fast(&blocks, &mut scalar_challenger);
+            let scalar_bytes = crate::proof_io::R1csProofBundleLigerito {
+                commitment: scalar_commitment,
+                proof: scalar_proof,
+            }
+            .to_bytes();
+
+            assert_eq!(candidate_claim, scalar_claim, "claim seed={seed:#x}");
+            assert_eq!(candidate_bytes, scalar_bytes, "proof seed={seed:#x}");
+            let bundle =
+                crate::proof_io::R1csProofBundleLigerito::from_bytes(&candidate_bytes).unwrap();
+            let mut verifier = FsChallenger::new(b"flock-lockstep-proof-v0");
+            let verified = setup
+                .verify(&bundle.commitment, &bundle.proof, &mut verifier)
+                .expect("lockstep proof must verify through the unchanged verifier");
+            assert_eq!(verified, candidate_claim, "verified claim seed={seed:#x}");
+        }
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    #[ignore = "on-device 64K-block Scalar/V4 alternating performance probe"]
+    fn lockstep_v4_alternating_performance_probe() {
+        use std::hint::black_box;
+        use std::time::{Duration, Instant};
+
+        const N_BLOCKS: usize = 64 * 1024;
+        const N_BLOCKS_LOG: usize = 16;
+        const WARMUPS_PER_MODE: usize = 2;
+        const MEASURED_PAIRS: usize = 9;
+
+        assert_eq!(std::env::var("RAYON_NUM_THREADS").as_deref(), Ok("1"));
+        assert_eq!(rayon::current_num_threads(), 1);
+
+        let mut rng = Rng::new(0x5634_5045_5246_5052);
+        let blocks: Vec<Compression> = (0..N_BLOCKS)
+            .map(|index| {
+                let tag = (index as u32 + 1).wrapping_mul(0x9E37_79B9);
+                (
+                    std::array::from_fn(|word| rng.next_u32() ^ tag.rotate_left(word as u32)),
+                    std::array::from_fn(|word| {
+                        rng.next_u32() ^ tag.rotate_right((word * 3) as u32)
+                    }),
+                    ((rng.next_u32() as u64) << 32) | rng.next_u32() as u64,
+                    64,
+                    11,
+                )
+            })
+            .collect();
+
+        let run = |mode| {
+            let start = Instant::now();
+            let (z, a, b, stripe) = generate_witness_with_ab_packed_and_lincheck_impl(
+                &blocks,
+                N_BLOCKS_LOG,
+                None,
+                false,
+                mode,
+                None,
+            );
+            let elapsed = start.elapsed();
+            black_box((z.len(), a.len(), b.len(), stripe.len()));
+            flock_core::scratch::give_f128(z);
+            flock_core::scratch::give_f128(a);
+            flock_core::scratch::give_f128(b);
+            flock_core::scratch::give_u8(stripe);
+            elapsed
+        };
+
+        for _ in 0..WARMUPS_PER_MODE {
+            black_box(run(WitnessBuilderMode::Scalar));
+            black_box(run(WitnessBuilderMode::V4));
+        }
+
+        let mut scalar_samples = Vec::with_capacity(MEASURED_PAIRS);
+        let mut v4_samples = Vec::with_capacity(MEASURED_PAIRS);
+        let mut paired_deltas = Vec::with_capacity(MEASURED_PAIRS);
+        for pair in 0..MEASURED_PAIRS {
+            let (scalar, v4) = if pair.is_multiple_of(2) {
+                let scalar = run(WitnessBuilderMode::Scalar);
+                let v4 = run(WitnessBuilderMode::V4);
+                (scalar, v4)
+            } else {
+                let v4 = run(WitnessBuilderMode::V4);
+                let scalar = run(WitnessBuilderMode::Scalar);
+                (scalar, v4)
+            };
+            let delta_pct = 100.0 * (v4.as_secs_f64() - scalar.as_secs_f64())
+                / scalar.as_secs_f64();
+            println!(
+                "pair={pair} scalar_ms={:.3} v4_ms={:.3} delta_ms={:.3} delta_pct={delta_pct:.3}",
+                scalar.as_secs_f64() * 1_000.0,
+                v4.as_secs_f64() * 1_000.0,
+                (v4.as_secs_f64() - scalar.as_secs_f64()) * 1_000.0,
+            );
+            scalar_samples.push(scalar);
+            v4_samples.push(v4);
+            paired_deltas.push(delta_pct);
+        }
+
+        fn percentile_duration(mut values: Vec<Duration>, numerator: usize) -> Duration {
+            values.sort_unstable();
+            values[(values.len() * numerator).div_ceil(10) - 1]
+        }
+        fn percentile_f64(mut values: Vec<f64>, numerator: usize) -> f64 {
+            values.sort_by(|left, right| left.total_cmp(right));
+            values[(values.len() * numerator).div_ceil(10) - 1]
+        }
+
+        println!(
+            "summary paired_delta_median_pct={:.3} paired_delta_p90_pct={:.3} scalar_p90_ms={:.3} v4_p90_ms={:.3}",
+            percentile_f64(paired_deltas.clone(), 5),
+            percentile_f64(paired_deltas, 9),
+            percentile_duration(scalar_samples, 9).as_secs_f64() * 1_000.0,
+            percentile_duration(v4_samples, 9).as_secs_f64() * 1_000.0,
+        );
+    }
+
     /// The fused generator produces (z, a, b) byte-identical to
     /// `generate_witness_with_ab_packed` AND a lincheck stripe byte-identical
     /// `Blake3LincheckCircuit` walker matches the sparse fold byte-for-byte
@@ -2703,6 +3231,7 @@ mod tests {
             &blocks,
             setup.n_blocks_log(),
             &mut hot_codeword,
+            false,
         );
 
         let mut filled_codeword =
@@ -2798,6 +3327,7 @@ mod tests {
             &blocks,
             RANKED_N_BLOCKS_LOG,
             &mut hot_codeword,
+            false,
         );
         assert_eq!(z.len(), RANKED_MSG_LEN);
         drop(a);
@@ -3151,5 +3681,52 @@ mod chain_e2e_tests {
                 .verify_chain(&comm, &proof, &cv0, &cv_last, &mut chv)
                 .is_err()
         );
+    }
+
+    #[cfg(not(all(target_os = "macos", target_arch = "aarch64", target_feature = "aes")))]
+    #[test]
+    fn witness_epool_flag_is_inert_off_ranked_macos() {
+        use flock_core::challenger::FsChallenger;
+        for seed in [0xA001_u64, 0xA002_u64] {
+            let setup = Blake3Setup::new(256);
+            let blocks: Vec<Compression> = (0..256).map(|i| {
+                ([seed as u32 ^ i as u32; 8], [(seed >> 16) as u32 ^ i as u32; 16], 0, 64, 11)
+            }).collect();
+            let mut left = FsChallenger::new(b"flock-witness-epool-inert");
+            let (p0, c0, claim0) = setup.prove_fast(&blocks, &mut left);
+            unsafe { std::env::set_var("FLOCK_NO_WITNESS_EPOOL", "1") };
+            let mut right = FsChallenger::new(b"flock-witness-epool-inert");
+            let (p1, c1, claim1) = setup.prove_fast(&blocks, &mut right);
+            unsafe { std::env::remove_var("FLOCK_NO_WITNESS_EPOOL") };
+            assert_eq!(claim0, claim1);
+            assert_eq!(
+                crate::proof_io::R1csProofBundleLigerito { commitment: c0, proof: p0 }.to_bytes(),
+                crate::proof_io::R1csProofBundleLigerito { commitment: c1, proof: p1 }.to_bytes(),
+            );
+        }
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64", target_feature = "aes"))]
+    #[test]
+    #[ignore = "on-device heterogeneous witness proof-byte sweep"]
+    fn ranked_witness_epool_proof_is_byte_identical() {
+        use flock_core::challenger::FsChallenger;
+        for seed in [0xB301_u64, 0xB302_u64, 0xB303_u64] {
+            let setup = Blake3Setup::new(1 << 18);
+            assert!(setup.use_ranked_witness_epool());
+            let blocks: Vec<Compression> = (0..(1 << 18)).map(|i| {
+                ([seed as u32 ^ i as u32; 8], [(seed >> 16) as u32 ^ i as u32; 16], 0, 64, 11)
+            }).collect();
+            let mut ch0 = FsChallenger::new(b"flock-witness-epool-matrix");
+            let (p0, c0, _) = setup.prove_fast(&blocks, &mut ch0);
+            unsafe { std::env::set_var("FLOCK_NO_WITNESS_EPOOL", "1") };
+            let mut ch1 = FsChallenger::new(b"flock-witness-epool-matrix");
+            let (p1, c1, _) = setup.prove_fast(&blocks, &mut ch1);
+            unsafe { std::env::remove_var("FLOCK_NO_WITNESS_EPOOL") };
+            assert_eq!(
+                crate::proof_io::R1csProofBundleLigerito { commitment: c0, proof: p0 }.to_bytes(),
+                crate::proof_io::R1csProofBundleLigerito { commitment: c1, proof: p1 }.to_bytes(),
+            );
+        }
     }
 }

@@ -8,6 +8,31 @@ use flock_core::bits::transpose_8_u64s_to_64_bytes;
 use flock_core::field::F128;
 use flock_core::r1cs::{BlockR1cs, SparseBinaryMatrix, WitnessLayout};
 
+/// Eight-compression groups per heterogeneous queue claim.  This deliberately
+/// bounds an E-core tail while keeping queue overhead coarse-grained.
+pub(crate) const WITNESS_GROUPS_PER_CLAIM: usize = 8;
+#[cfg(test)]
+pub(crate) static HETERO_WITNESS_CLAIMS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// Raw base pointer used only by the range-claim scheduler below.
+#[derive(Clone, Copy)]
+struct WitnessPtr<T>(*mut T);
+// SAFETY: `process_group` derives a range solely from its globally unique
+// group index; the scheduler's scoped queue join completes before the
+// original mutable owners are reused.
+unsafe impl<T> Send for WitnessPtr<T> {}
+unsafe impl<T> Sync for WitnessPtr<T> {}
+impl<T> WitnessPtr<T> {
+    fn get(self) -> *mut T { self.0 }
+}
+
+enum WitnessScheduler<'a> {
+    Rayon,
+    HeteroDefault,
+    HeteroWithHelper(Option<&'a rayon::ThreadPool>),
+}
+
 /// OR the low 32 bits of `val` into `buf` starting at bit-offset `bit_off`.
 /// Handles u64 straddling when `bit_off % 64 > 32`.
 #[inline(always)]
@@ -232,6 +257,8 @@ where
         1usize << k_log,
         None,
         per_block,
+        None,
+        WitnessScheduler::Rayon,
     )
 }
 
@@ -259,14 +286,46 @@ where
         useful_bits,
         None,
         per_block,
+        None,
+        WitnessScheduler::Rayon,
+    )
+}
+
+/// Full-write variant whose callback owns one complete eight-block group.
+/// Padding is mandatory, so `inputs` always contains eight real references;
+/// trailing lanes point at `padding`. The callback must overwrite every word
+/// in all three group buffers before returning.
+pub(crate) fn drive_witness_packed_and_lincheck_full_write_group<S: Sync, F, G>(
+    initial_states: &[S],
+    padding: &S,
+    n_blocks_log: usize,
+    k_log: usize,
+    useful_bits: usize,
+    per_block: F,
+    per_group: G,
+) -> (Vec<F128>, Vec<F128>, Vec<F128>, Vec<u8>)
+where
+    F: Fn(&S, &mut [u64], &mut [u64], &mut [u64]) + Sync,
+    G: Fn([&S; 8], &mut [u64], &mut [u64], &mut [u64]) + Sync,
+{
+    drive_witness_packed_and_lincheck_impl::<true, false, S, F>(
+        initial_states,
+        Some(padding),
+        n_blocks_log,
+        k_log,
+        useful_bits,
+        None,
+        per_block,
+        Some(&per_group),
+        WitnessScheduler::Rayon,
     )
 }
 
 #[derive(Clone, Copy)]
 struct Rate2CodewordPtr(*mut F128);
-// SAFETY: the only use is the indexed group writer below. Each group owns
-// disjoint ranges in both replicas, and the parallel iterator joins before the
-// original mutable codeword borrow becomes usable again.
+// SAFETY: the indexed group writer owns disjoint ranges in both replicas. A
+// group belongs to exactly one claim, and the queue's scoped join completes
+// before the original mutable codeword borrow becomes usable again.
 unsafe impl Send for Rate2CodewordPtr {}
 unsafe impl Sync for Rate2CodewordPtr {}
 impl Rate2CodewordPtr {
@@ -303,6 +362,88 @@ where
         useful_bits,
         Some(codeword),
         per_block,
+        None,
+        WitnessScheduler::Rayon,
+    )
+}
+
+/// Group-callback counterpart of
+/// [`drive_witness_packed_and_lincheck_full_write_with_rate2_codeword`].
+pub(crate) fn drive_witness_packed_and_lincheck_full_write_group_with_rate2_codeword<
+    S: Sync,
+    F,
+    G,
+>(
+    initial_states: &[S],
+    padding: &S,
+    n_blocks_log: usize,
+    k_log: usize,
+    useful_bits: usize,
+    codeword: &mut [F128],
+    per_block: F,
+    per_group: G,
+) -> (Vec<F128>, Vec<F128>, Vec<F128>, Vec<u8>)
+where
+    F: Fn(&S, &mut [u64], &mut [u64], &mut [u64]) + Sync,
+    G: Fn([&S; 8], &mut [u64], &mut [u64], &mut [u64]) + Sync,
+{
+    drive_witness_packed_and_lincheck_impl::<true, true, S, F>(
+        initial_states,
+        Some(padding),
+        n_blocks_log,
+        k_log,
+        useful_bits,
+        Some(codeword),
+        per_block,
+        Some(&per_group),
+        WitnessScheduler::Rayon,
+    )
+}
+
+/// Ranked-hot specialization. Unlike the ordinary shared driver, this may
+/// schedule coarse group ranges through the heterogenous prover-support
+/// facade. All other hash callers keep the Rayon implementation below.
+pub(crate) fn drive_witness_packed_and_lincheck_full_write_with_rate2_codeword_hetero<S: Sync, F>(
+    initial_states: &[S], padding: &S, n_blocks_log: usize, k_log: usize,
+    useful_bits: usize, codeword: &mut [F128], per_block: F,
+) -> (Vec<F128>, Vec<F128>, Vec<F128>, Vec<u8>)
+where F: Fn(&S, &mut [u64], &mut [u64], &mut [u64]) + Sync {
+    drive_witness_packed_and_lincheck_impl::<true, true, S, F>(
+        initial_states, Some(padding), n_blocks_log, k_log, useful_bits,
+        Some(codeword), per_block, None, WitnessScheduler::HeteroDefault,
+    )
+}
+
+/// Heterogeneous-scheduler counterpart of
+/// [`drive_witness_packed_and_lincheck_full_write_group_with_rate2_codeword`].
+pub(crate) fn drive_witness_packed_and_lincheck_full_write_group_with_rate2_codeword_hetero<
+    S: Sync,
+    F,
+    G,
+>(
+    initial_states: &[S], padding: &S, n_blocks_log: usize, k_log: usize,
+    useful_bits: usize, codeword: &mut [F128], per_block: F, per_group: G,
+) -> (Vec<F128>, Vec<F128>, Vec<F128>, Vec<u8>)
+where
+    F: Fn(&S, &mut [u64], &mut [u64], &mut [u64]) + Sync,
+    G: Fn([&S; 8], &mut [u64], &mut [u64], &mut [u64]) + Sync,
+{
+    drive_witness_packed_and_lincheck_impl::<true, true, S, F>(
+        initial_states, Some(padding), n_blocks_log, k_log, useful_bits,
+        Some(codeword), per_block, Some(&per_group), WitnessScheduler::HeteroDefault,
+    )
+}
+
+#[cfg(test)]
+fn drive_witness_packed_and_lincheck_full_write_with_rate2_codeword_hetero_with_helper<S: Sync, F>(
+    initial_states: &[S], padding: &S, n_blocks_log: usize, k_log: usize,
+    useful_bits: usize, codeword: &mut [F128], per_block: F,
+    helper: Option<&rayon::ThreadPool>,
+) -> (Vec<F128>, Vec<F128>, Vec<F128>, Vec<u8>)
+where F: Fn(&S, &mut [u64], &mut [u64], &mut [u64]) + Sync {
+    drive_witness_packed_and_lincheck_impl::<true, true, S, F>(
+        initial_states, Some(padding), n_blocks_log, k_log, useful_bits,
+        Some(codeword), per_block, None, WitnessScheduler::HeteroWithHelper(helper),
     )
 }
 
@@ -319,6 +460,10 @@ fn drive_witness_packed_and_lincheck_impl<
     stripe_useful_bits: usize,
     rate2_codeword: Option<&mut [F128]>,
     per_block: F,
+    per_group: Option<
+        &(dyn Fn([&S; 8], &mut [u64], &mut [u64], &mut [u64]) + Sync),
+    >,
+    scheduler: WitnessScheduler<'_>,
 ) -> (Vec<F128>, Vec<F128>, Vec<F128>, Vec<u8>)
 where
     F: Fn(&S, &mut [u64], &mut [u64], &mut [u64]) + Sync,
@@ -342,6 +487,10 @@ where
     assert!(
         !PER_BLOCK_FULLY_WRITES || padding.is_some(),
         "full-write witness generation requires a padding block"
+    );
+    assert!(
+        per_group.is_none() || (PER_BLOCK_FULLY_WRITES && padding.is_some()),
+        "group witness generation requires full writes and a padding block"
     );
 
     let total_f128 = n_total * f128_per_block;
@@ -370,13 +519,9 @@ where
     let mut b = flock_core::scratch::take_f128(total_f128);
     let mut z_lincheck = flock_core::scratch::take_u8((n_total / 8) * k);
 
-    z.par_chunks_mut(8 * f128_per_block)
-        .zip(a.par_chunks_mut(8 * f128_per_block))
-        .zip(b.par_chunks_mut(8 * f128_per_block))
-        .zip(z_lincheck.par_chunks_mut(k))
-        .with_max_len(256)
-        .enumerate()
-        .for_each(|(g, (((z_grp, a_grp), b_grp), stripe))| {
+    let process_group = |g: usize, z_grp: &mut [F128], a_grp: &mut [F128], b_grp: &mut [F128], stripe: &mut [u8]| {
+        // The body is deliberately shared verbatim by the legacy Rayon and
+        // range-claim schedulers; `g` is always the GLOBAL group index.
             // Ordinary per-block builders OR 1-bits into pre-zeroed words; any
             // slot left unbuilt (no padding block) stays zero, which the
             // lincheck transpose below reads correctly. Full-write builders
@@ -390,42 +535,77 @@ where
                     std::ptr::write_bytes(b_grp.as_mut_ptr(), 0, b_grp.len());
                 }
             }
-            for k_in in 0..8 {
-                let global_idx = 8 * g + k_in;
-                let init: &S = if global_idx < n_blocks {
-                    &initial_states[global_idx]
-                } else if let Some(p) = padding {
-                    // Fill the padding slot with a real block so its constant
-                    // wire is set (see `padding` docs above).
-                    p
-                } else {
-                    // No padding block — leave this slot zero.
-                    continue;
-                };
-                let z_chunk = &mut z_grp[k_in * f128_per_block..(k_in + 1) * f128_per_block];
-                let a_chunk = &mut a_grp[k_in * f128_per_block..(k_in + 1) * f128_per_block];
-                let b_chunk = &mut b_grp[k_in * f128_per_block..(k_in + 1) * f128_per_block];
+            if let Some(per_group) = per_group {
+                let group_inputs: [&S; 8] = std::array::from_fn(|k_in| {
+                    let global_idx = 8 * g + k_in;
+                    if global_idx < n_blocks {
+                        &initial_states[global_idx]
+                    } else {
+                        padding.expect("group witness generation requires padding")
+                    }
+                });
                 // SAFETY: F128 is `repr(C, align(16))` with two `u64` fields in
                 // LE order — same byte layout as a u64 pair.
-                let z_u64: &mut [u64] = unsafe {
+                let z_u64 = unsafe {
                     std::slice::from_raw_parts_mut(
-                        z_chunk.as_mut_ptr() as *mut u64,
-                        z_chunk.len() * 2,
+                        z_grp.as_mut_ptr() as *mut u64,
+                        z_grp.len() * 2,
                     )
                 };
-                let a_u64: &mut [u64] = unsafe {
+                let a_u64 = unsafe {
                     std::slice::from_raw_parts_mut(
-                        a_chunk.as_mut_ptr() as *mut u64,
-                        a_chunk.len() * 2,
+                        a_grp.as_mut_ptr() as *mut u64,
+                        a_grp.len() * 2,
                     )
                 };
-                let b_u64: &mut [u64] = unsafe {
+                let b_u64 = unsafe {
                     std::slice::from_raw_parts_mut(
-                        b_chunk.as_mut_ptr() as *mut u64,
-                        b_chunk.len() * 2,
+                        b_grp.as_mut_ptr() as *mut u64,
+                        b_grp.len() * 2,
                     )
                 };
-                per_block(init, z_u64, a_u64, b_u64);
+                per_group(group_inputs, z_u64, a_u64, b_u64);
+            } else {
+                for k_in in 0..8 {
+                    let global_idx = 8 * g + k_in;
+                    let init: &S = if global_idx < n_blocks {
+                        &initial_states[global_idx]
+                    } else if let Some(p) = padding {
+                        // Fill the padding slot with a real block so its constant
+                        // wire is set (see `padding` docs above).
+                        p
+                    } else {
+                        // No padding block — leave this slot zero.
+                        continue;
+                    };
+                    let z_chunk =
+                        &mut z_grp[k_in * f128_per_block..(k_in + 1) * f128_per_block];
+                    let a_chunk =
+                        &mut a_grp[k_in * f128_per_block..(k_in + 1) * f128_per_block];
+                    let b_chunk =
+                        &mut b_grp[k_in * f128_per_block..(k_in + 1) * f128_per_block];
+                    // SAFETY: F128 is `repr(C, align(16))` with two `u64` fields in
+                    // LE order — same byte layout as a u64 pair.
+                    let z_u64: &mut [u64] = unsafe {
+                        std::slice::from_raw_parts_mut(
+                            z_chunk.as_mut_ptr() as *mut u64,
+                            z_chunk.len() * 2,
+                        )
+                    };
+                    let a_u64: &mut [u64] = unsafe {
+                        std::slice::from_raw_parts_mut(
+                            a_chunk.as_mut_ptr() as *mut u64,
+                            a_chunk.len() * 2,
+                        )
+                    };
+                    let b_u64: &mut [u64] = unsafe {
+                        std::slice::from_raw_parts_mut(
+                            b_chunk.as_mut_ptr() as *mut u64,
+                            b_chunk.len() * 2,
+                        )
+                    };
+                    per_block(init, z_u64, a_u64, b_u64);
+                }
             }
 
             // Bit-transpose 8 z chunks into the lincheck stripe.
@@ -454,10 +634,10 @@ where
                 let elem_offset = g * z_grp.len();
                 // SAFETY: group `g` owns `z[elem_offset..elem_offset+len]`.
                 // The same group exclusively owns those offsets in each of the
-                // two codeword replicas. Groups are disjoint, cover all of z,
-                // and the parallel iterator joins before `codeword` is used
-                // again. Both source and destinations are in bounds and do not
-                // overlap.
+                // two codeword replicas. Claim-to-range ownership makes groups
+                // disjoint and exhaustive; the scoped queue join completes
+                // before `codeword` is used again. Both source and destinations
+                // are in bounds and do not overlap.
                 unsafe {
                     let dst = codeword.get();
                     std::ptr::copy_nonoverlapping(
@@ -472,7 +652,49 @@ where
                     );
                 }
             }
-        });
+    };
+
+    if !matches!(scheduler, WitnessScheduler::Rayon) {
+        let n_groups = n_total / 8;
+        let z_ptr = WitnessPtr(z.as_mut_ptr());
+        let a_ptr = WitnessPtr(a.as_mut_ptr());
+        let b_ptr = WitnessPtr(b.as_mut_ptr());
+        let stripe_ptr = WitnessPtr(z_lincheck.as_mut_ptr());
+        let groups_per_claim = WITNESS_GROUPS_PER_CLAIM;
+        let n_claims = n_groups.div_ceil(groups_per_claim);
+        // SAFETY: claim c owns global groups [c*N, min((c+1)*N,n_groups)).
+        // Those ranges are in bounds, pairwise disjoint, and exhaustive. Each
+        // group derives only its own z/a/b/stripe/codeword ranges. The facade's
+        // scoped queue join (not its relaxed claim counter) publishes all
+        // writes before these original mutable vectors are returned/reused.
+        let run_claim = |c: usize| unsafe {
+            #[cfg(test)]
+            HETERO_WITNESS_CLAIMS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let start = c * groups_per_claim;
+            let end = (start + groups_per_claim).min(n_groups);
+            for g in start..end {
+                let group_f128 = 8 * f128_per_block;
+                let z_grp = std::slice::from_raw_parts_mut(z_ptr.get().add(g * group_f128), group_f128);
+                let a_grp = std::slice::from_raw_parts_mut(a_ptr.get().add(g * group_f128), group_f128);
+                let b_grp = std::slice::from_raw_parts_mut(b_ptr.get().add(g * group_f128), group_f128);
+                let stripe = std::slice::from_raw_parts_mut(stripe_ptr.get().add(g * k), k);
+                process_group(g, z_grp, a_grp, b_grp, stripe);
+            }
+        };
+        match scheduler {
+            WitnessScheduler::HeteroDefault => flock_core::prover_support::run_hetero_chunks(n_claims, run_claim),
+            WitnessScheduler::HeteroWithHelper(helper) => flock_core::prover_support::run_hetero_chunks_with_helper(n_claims, &run_claim, helper),
+            WitnessScheduler::Rayon => unreachable!(),
+        }
+    } else {
+        z.par_chunks_mut(8 * f128_per_block)
+            .zip(a.par_chunks_mut(8 * f128_per_block))
+            .zip(b.par_chunks_mut(8 * f128_per_block))
+            .zip(z_lincheck.par_chunks_mut(k))
+            .with_max_len(256)
+            .enumerate()
+            .for_each(|(g, (((z_grp, a_grp), b_grp), stripe))| process_group(g, z_grp, a_grp, b_grp, stripe));
+    }
 
     (z, a, b, z_lincheck)
 }
@@ -730,4 +952,57 @@ where
     );
 
     (z, a, b, stripe)
+}
+
+#[cfg(test)]
+mod hetero_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn range_claim_driver_matches_rayon_and_executes_every_input_once() {
+        // 128 blocks = 16 groups = two N=8 claims, crossing the helper
+        // engagement threshold while remaining small enough for a unit test.
+        let inputs: Vec<usize> = (0..128).collect();
+        let counts: Vec<AtomicUsize> = (0..128).map(|_| AtomicUsize::new(0)).collect();
+        let build = |i: &usize, z: &mut [u64], a: &mut [u64], b: &mut [u64]| {
+            counts[*i].fetch_add(1, Ordering::Relaxed);
+            z.fill(*i as u64);
+            a.fill(!(*i as u64));
+            b.fill(u64::MAX);
+        };
+        let mut codeword = vec![F128::ZERO; 2 * 128];
+        HETERO_WITNESS_CLAIMS.store(0, Ordering::Relaxed);
+        let hetero = drive_witness_packed_and_lincheck_full_write_with_rate2_codeword_hetero(
+            &inputs, &0, 7, 7, 64, &mut codeword, build,
+        );
+        assert_eq!(HETERO_WITNESS_CLAIMS.load(Ordering::Relaxed), 2);
+        assert!(counts.iter().all(|c| c.load(Ordering::Relaxed) == 1));
+        assert_eq!(&codeword[..128], &hetero.0);
+        assert_eq!(&codeword[128..], &hetero.0);
+        let mut rayon_codeword = vec![F128::ZERO; 2 * 128];
+        let rayon = drive_witness_packed_and_lincheck_full_write_with_rate2_codeword(
+            &inputs, &0, 7, 7, 64, &mut rayon_codeword,
+            |i, z, a, b| { z.fill(*i as u64); a.fill(!(*i as u64)); b.fill(u64::MAX); },
+        );
+        assert_eq!(hetero, rayon);
+        assert_eq!(codeword, rayon_codeword);
+        for width in [1, 2, 4] {
+            let helper = rayon::ThreadPoolBuilder::new().num_threads(width).build().unwrap();
+            let forced_counts: Vec<AtomicUsize> =
+                (0..128).map(|_| AtomicUsize::new(0)).collect();
+            let mut forced_codeword = vec![F128::ZERO; 2 * 128];
+            let forced = drive_witness_packed_and_lincheck_full_write_with_rate2_codeword_hetero_with_helper(
+                &inputs, &0, 7, 7, 64, &mut forced_codeword,
+                |i, z, a, b| {
+                    forced_counts[*i].fetch_add(1, Ordering::Relaxed);
+                    z.fill(*i as u64); a.fill(!(*i as u64)); b.fill(u64::MAX);
+                },
+                Some(&helper),
+            );
+            assert!(forced_counts.iter().all(|c| c.load(Ordering::Relaxed) == 1));
+            assert_eq!(forced, rayon, "helper width {width}");
+            assert_eq!(forced_codeword, rayon_codeword, "helper width {width}");
+        }
+    }
 }
