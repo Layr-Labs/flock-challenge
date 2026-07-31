@@ -145,6 +145,30 @@ pub(super) unsafe fn butterfly_fused_3layer_zero_root_row(
     }
 }
 
+/// Initialize one fused-three-layer destination row group from a distinct
+/// source block.
+///
+/// # Safety
+/// The caller must ensure the eight source and destination rows selected by
+/// `r` are valid, that source and destination do not overlap, and that
+/// concurrent calls write disjoint destination row groups.
+#[inline]
+pub(super) unsafe fn butterfly_fused_3layer_from_source_row<const ZERO_ROOT: bool>(
+    src: *const F128,
+    dst: *mut F128,
+    eighth: usize,
+    num_ntts: usize,
+    r: usize,
+    twiddles: &[F128; 7],
+) {
+    // SAFETY: forwarded caller contract.
+    unsafe {
+        portable::butterfly_fused_3layer_from_source_row::<ZERO_ROOT>(
+            src, dst, eighth, num_ntts, r, twiddles,
+        );
+    }
+}
+
 #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
 #[inline]
 pub(super) unsafe fn butterfly_neon_block(chunk: &mut [F128], twiddle: F128, half: usize) {

@@ -255,6 +255,35 @@ pub fn commit_preinitialized(
     finalize_commit(codeword, params)
 }
 
+/// Ranked rate-1/2 commit that treats `[z_packed, z_packed]` as a virtual
+/// post-layer-1 input. The first nontrivial radix-8 group initializes the
+/// caller-provided scratch codeword directly, avoiding a separate 1 GiB
+/// replica write at the benchmark geometry.
+///
+/// The optimization is deliberately exact-shape-only. Diagnostic environment
+/// switches, unsupported targets, and non-ranked execution fall back to the
+/// ordinary replica-fill path before reading the codeword.
+pub fn commit_ranked_rate2_virtual_input(
+    z_packed: &[F128],
+    params: &PcsParams,
+    mut codeword: Vec<F128>,
+) -> (Commitment, ProverData) {
+    params.validate();
+    assert_eq!(z_packed.len(), 1usize << params.log_msg_len());
+    let codeword_len = params.n_positions() * params.num_ntts();
+    assert_eq!(
+        codeword.len(),
+        codeword_len,
+        "commit_ranked_rate2_virtual_input: codeword buffer has wrong length"
+    );
+
+    if !use_ranked_rate2_virtual_input(params) {
+        replicate_message_fill(&mut codeword, z_packed);
+        return finalize_commit(codeword, params);
+    }
+    finalize_commit_with_virtual_rate2_message(codeword, params, Some(z_packed))
+}
+
 /// Fill `codeword` with `2^r` replicas of `msg` (`r = log2(codeword.len() /
 /// msg.len())`) — the exact state after the first `r` forward-NTT layers on
 /// the zero-padded coefficient vector `[msg, 0, …, 0]`. Pair with
@@ -304,6 +333,16 @@ fn use_ranked_ntt_merkle_leaf_pipeline(params: &PcsParams) -> bool {
         && std::env::var_os("FLOCK_NO_NTT_MERKLE_PIPELINE").is_none()
 }
 
+#[inline]
+fn use_ranked_rate2_virtual_input(params: &PcsParams) -> bool {
+    use_ranked_ntt_merkle_leaf_pipeline(params)
+        && rayon::current_num_threads() > 1
+        && crate::epool::epool().is_some()
+        && std::env::var_os("FLOCK_NO_RATE2_VIRTUAL_INIT").is_none()
+        && std::env::var_os("FLOCK_NO_NTT_TOP_EPOOL").is_none()
+        && std::env::var_os("FLOCK_NTT_BLOCK_REGIONS").is_none()
+}
+
 #[derive(Clone, Copy)]
 struct RankedLeafJob {
     elem_offset: usize,
@@ -319,6 +358,7 @@ struct RankedLeafJob {
 fn ranked_ntt_with_pipelined_leaves(
     ntt: &AdditiveNttF128,
     codeword: &mut [F128],
+    virtual_rate2_message: Option<&[F128]>,
     params: &PcsParams,
     leaves: &mut [Hash],
     helper: &rayon::ThreadPool,
@@ -371,10 +411,24 @@ fn ranked_ntt_with_pipelined_leaves(
         && std::env::var_os("FLOCK_NO_NTT_TOP_EPOOL").is_none()
         && std::env::var_os("FLOCK_NTT_BLOCK_REGIONS").is_none();
     if split_ranked_top {
-        ntt.forward_transform_interleaved_ranked_top_from_layer(
-            codeword,
-            num_ntts,
-            params.log_inv_rate,
+        if let Some(message) = virtual_rate2_message {
+            ntt.forward_transform_interleaved_ranked_top_from_rate2_message(
+                message,
+                codeword,
+                num_ntts,
+                params.log_inv_rate,
+            );
+        } else {
+            ntt.forward_transform_interleaved_ranked_top_from_layer(
+                codeword,
+                num_ntts,
+                params.log_inv_rate,
+            );
+        }
+    } else {
+        assert!(
+            virtual_rate2_message.is_none(),
+            "virtual rate-2 input requires the ranked split-top pipeline"
         );
     }
 
@@ -437,7 +491,15 @@ fn ranked_ntt_with_pipelined_leaves(
 
 /// Shared tail of [`commit`] / [`commit_into`]: interleaved forward additive
 /// NTT (RS-encode every lane) then the initial Merkle tree over codeword rows.
-fn finalize_commit(mut codeword: Vec<F128>, params: &PcsParams) -> (Commitment, ProverData) {
+fn finalize_commit(codeword: Vec<F128>, params: &PcsParams) -> (Commitment, ProverData) {
+    finalize_commit_with_virtual_rate2_message(codeword, params, None)
+}
+
+fn finalize_commit_with_virtual_rate2_message(
+    mut codeword: Vec<F128>,
+    params: &PcsParams,
+    virtual_rate2_message: Option<&[F128]>,
+) -> (Commitment, ProverData) {
     let helper = if use_ranked_ntt_merkle_leaf_pipeline(params) && rayon::current_num_threads() > 1
     {
         crate::epool::epool()
@@ -465,11 +527,16 @@ fn finalize_commit(mut codeword: Vec<F128>, params: &PcsParams) -> (Commitment, 
         ranked_ntt_with_pipelined_leaves(
             &ntt,
             &mut codeword,
+            virtual_rate2_message,
             params,
             &mut tree[..params.n_leaves()],
             helper,
         );
     } else {
+        assert!(
+            virtual_rate2_message.is_none(),
+            "virtual rate-2 input requires the ranked NTT-to-Merkle pipeline"
+        );
         ntt.forward_transform_interleaved_from_layer(
             &mut codeword,
             params.num_ntts(),
@@ -739,6 +806,7 @@ mod tests {
         ranked_ntt_with_pipelined_leaves(
             &ntt,
             &mut got_codeword,
+            None,
             &params,
             &mut got_tree[..params.n_leaves()],
             &helper,

@@ -176,6 +176,40 @@ pub(super) unsafe fn butterfly_fused_3layer_zero_root_row(
     }
 }
 
+/// Source-to-destination counterpart of the in-place fused-three-layer row
+/// kernels. Unlike the zero-root in-place specialization, this writes stream
+/// zero too because the destination starts with arbitrary scratch contents.
+///
+/// # Safety
+/// The caller guarantees valid source/destination row geometry, non-overlap,
+/// and disjoint destination groups across concurrent calls.
+pub(super) unsafe fn butterfly_fused_3layer_from_source_row<const ZERO_ROOT: bool>(
+    src: *const F128,
+    dst: *mut F128,
+    eighth: usize,
+    num_ntts: usize,
+    r: usize,
+    twiddles: &[F128; 7],
+) {
+    // SAFETY: caller supplies the pointer geometry and disjointness contract.
+    unsafe {
+        for lane in 0..num_ntts {
+            let mut values = [F128::ZERO; 8];
+            for (i, value) in values.iter_mut().enumerate() {
+                *value = *src.add((i * eighth + r) * num_ntts + lane);
+            }
+            if ZERO_ROOT {
+                butterfly_fused_3layer_zero_root(&mut values, twiddles);
+            } else {
+                butterfly_fused_3layer(&mut values, twiddles);
+            }
+            for (i, value) in values.iter().enumerate() {
+                *dst.add((i * eighth + r) * num_ntts + lane) = *value;
+            }
+        }
+    }
+}
+
 #[inline]
 pub(super) fn butterfly_fused_4layer(values: &mut [F128; 16], twiddles: &[F128; 15]) {
     #[inline(always)]
