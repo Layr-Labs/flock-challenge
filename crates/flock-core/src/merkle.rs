@@ -540,6 +540,15 @@ pub(crate) fn hash_ranked_blake3_leaf_chunk(data: &[u8], out: &mut [Hash]) {
     assert!(batched, "ranked 1 KiB leaves must use the batched kernel");
 }
 
+/// Hash one scheduling-free run of BLAKE3 parent nodes. Ranked NTT completion
+/// jobs use this after hashing their cache-hot leaves; the run is deliberately
+/// capped at the serial cutoff so it cannot open a nested Rayon/E-core region.
+pub(crate) fn hash_ranked_blake3_parent_chunk(read: &[Hash], write: &mut [Hash]) {
+    assert_eq!(read.len(), 2 * write.len());
+    assert!(write.len() <= 1024);
+    hash_pairs_level(read, write, HashKind::Blake3);
+}
+
 /// Leaves per queue chunk in the batched BLAKE3 leaf path (see `epool`).
 /// A multiple of 12 so every full chunk runs entirely through the twelve-way
 /// kernel with no per-chunk tail; small enough (240 KiB of input at the
@@ -688,16 +697,35 @@ pub fn merkle_tree(data: &[u8], num_leaves: usize, kind: HashKind) -> Vec<Hash> 
 /// hashes. The vector must have the normal `2*num_leaves-1` allocation; every
 /// remaining slot is written level-by-level before it is read.
 pub(crate) fn merkle_tree_from_prehashed_leaves(
-    mut tree: Vec<Hash>,
+    tree: Vec<Hash>,
     num_leaves: usize,
     kind: HashKind,
 ) -> Vec<Hash> {
+    merkle_tree_from_prehashed_level(tree, num_leaves, kind, 0)
+}
+
+/// Complete a flat tree whose leaf level and the first
+/// `prehashed_parent_levels` internal levels are already initialized.
+///
+/// The ranked NTT pipeline builds aligned local subtrees while their leaves
+/// are cache-hot, then calls this helper to finish only the small shared top.
+pub(crate) fn merkle_tree_from_prehashed_level(
+    mut tree: Vec<Hash>,
+    num_leaves: usize,
+    kind: HashKind,
+    prehashed_parent_levels: usize,
+) -> Vec<Hash> {
     assert!(num_leaves.is_power_of_two() && num_leaves > 0);
     assert_eq!(tree.len(), 2 * num_leaves - 1);
+    assert!(prehashed_parent_levels <= num_leaves.trailing_zeros() as usize);
 
     // Internal levels — parallel within a level, sequential across levels.
     let mut read_start = 0usize;
     let mut read_len = num_leaves;
+    for _ in 0..prehashed_parent_levels {
+        read_start += read_len;
+        read_len >>= 1;
+    }
     while read_len > 1 {
         let next_len = read_len >> 1;
         // Split the buffer at the end of the current level so we get two

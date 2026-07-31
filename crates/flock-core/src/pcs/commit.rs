@@ -320,24 +320,36 @@ fn ranked_ntt_with_pipelined_leaves(
     ntt: &AdditiveNttF128,
     codeword: &mut [F128],
     params: &PcsParams,
-    leaves: &mut [Hash],
+    tree: &mut [Hash],
     helper: &rayon::ThreadPool,
-) {
+) -> usize {
     use rayon::prelude::*;
     use std::sync::Mutex;
     use std::sync::mpsc::{TrySendError, sync_channel};
 
     let num_ntts = params.num_ntts();
-    debug_assert_eq!(num_ntts, 64);
-    debug_assert_eq!(leaves.len(), codeword.len() / num_ntts);
+    assert_eq!(num_ntts, 64);
+    let num_leaves = codeword.len() / num_ntts;
+    assert_eq!(tree.len(), 2 * num_leaves - 1);
+    // Stop at four roots (128 contiguous bytes) per 1,024-leaf job. These eight
+    // local levels cover 1,020 of each subtree's 1,023 parent nodes while
+    // leaving the shared top for the level-wide builder.
+    const LOCAL_PARENT_LEVELS: usize = 8;
+    let local_parent_levels = if std::env::var_os("FLOCK_NO_MERKLE_SUBTREE_PARENTS").is_some() {
+        0
+    } else {
+        LOCAL_PARENT_LEVELS
+    };
     let codeword_base = crate::epool::SyncPtr(codeword.as_mut_ptr());
-    let leaves_base = crate::epool::SyncPtr(leaves.as_mut_ptr());
+    let tree_base = crate::epool::SyncPtr(tree.as_mut_ptr());
 
     let hash_job = |job: RankedLeafJob| {
-        debug_assert_eq!(job.elem_offset % num_ntts, 0);
-        debug_assert_eq!(job.elem_len % num_ntts, 0);
+        assert_eq!(job.elem_offset % num_ntts, 0);
+        assert_eq!(job.elem_len % num_ntts, 0);
         let leaf_start = job.elem_offset / num_ntts;
         let leaf_len = job.elem_len / num_ntts;
+        assert_eq!(leaf_start % (1 << local_parent_levels), 0);
+        assert_eq!(leaf_len % (1 << local_parent_levels), 0);
         // SAFETY: the NTT publishes a job only after the corresponding mutable
         // subtree is finalized and never touched again. Every subtree is
         // published exactly once; offsets are disjoint and cover the codeword,
@@ -351,8 +363,32 @@ fn ranked_ntt_with_pipelined_leaves(
                 elems.as_ptr().cast::<u8>(),
                 core::mem::size_of_val(elems),
             );
-            let outs = core::slice::from_raw_parts_mut(leaves_base.ptr().add(leaf_start), leaf_len);
+            let outs = core::slice::from_raw_parts_mut(tree_base.ptr().add(leaf_start), leaf_len);
             merkle::hash_ranked_blake3_leaf_chunk(bytes, outs);
+
+            // Build the aligned local subtree while its leaf range is still
+            // hot. At every level, different jobs own disjoint read and write
+            // ranges. Only the small shared top remains after the job barrier.
+            let mut read_level_start = 0usize;
+            let mut read_level_len = num_leaves;
+            let mut local_start = leaf_start;
+            let mut local_len = leaf_len;
+            for _ in 0..local_parent_levels {
+                let write_level_start = read_level_start + read_level_len;
+                let write_start = write_level_start + (local_start >> 1);
+                let write_len = local_len >> 1;
+                let read = core::slice::from_raw_parts(
+                    tree_base.ptr().add(read_level_start + local_start),
+                    local_len,
+                );
+                let write =
+                    core::slice::from_raw_parts_mut(tree_base.ptr().add(write_start), write_len);
+                merkle::hash_ranked_blake3_parent_chunk(read, write);
+                read_level_start = write_level_start;
+                read_level_len >>= 1;
+                local_start >>= 1;
+                local_len >>= 1;
+            }
         }
     };
 
@@ -433,6 +469,7 @@ fn ranked_ntt_with_pipelined_leaves(
             .join()
             .expect("ranked NTT-to-Merkle helper manager panicked");
     });
+    local_parent_levels
 }
 
 /// Shared tail of [`commit`] / [`commit_into`]: interleaved forward additive
@@ -456,17 +493,18 @@ fn finalize_commit(mut codeword: Vec<F128>, params: &PcsParams) -> (Commitment, 
     });
     let timing = std::env::var_os("FLOCK_COMMIT_TIMING").is_some();
     let t_ntt = std::time::Instant::now();
+    let mut prehashed_parent_levels = 0usize;
     // ---- Interleaved forward additive NTT: 2^log_batch_size independent
     // sub-NTTs with shared twiddles. Each sub-NTT operates on its lane of the
     // SoA buffer. The first `log_inv_rate` layers were pre-applied by the
     // caller's replicate-fill (commit_into), so start past them.
     let ntt = AdditiveNttF128::standard(params.k_code());
     if let (Some(helper), Some(tree)) = (helper, prehashed_tree.as_mut()) {
-        ranked_ntt_with_pipelined_leaves(
+        prehashed_parent_levels = ranked_ntt_with_pipelined_leaves(
             &ntt,
             &mut codeword,
             params,
-            &mut tree[..params.n_leaves()],
+            tree,
             helper,
         );
     } else {
@@ -493,7 +531,12 @@ fn finalize_commit(mut codeword: Vec<F128>, params: &PcsParams) -> (Commitment, 
     // row-batch lanes (num_ntts F_{2^128} values = 2^log_batch_size). This is
     // Ligerito's L0 commitment.
     let merkle_tree = if let Some(tree) = prehashed_tree {
-        merkle::merkle_tree_from_prehashed_leaves(tree, params.n_leaves(), params.merkle_hash)
+        merkle::merkle_tree_from_prehashed_level(
+            tree,
+            params.n_leaves(),
+            params.merkle_hash,
+            prehashed_parent_levels,
+        )
     } else {
         // Zero-copy: F128 is repr(C, align(16)) with two u64s laid out
         // little-endian, matching the canonical leaf serialization.
@@ -736,17 +779,18 @@ mod tests {
             .unwrap();
         let mut got_codeword = source;
         let mut got_tree = vec![[0u8; 32]; 2 * params.n_leaves() - 1];
-        ranked_ntt_with_pipelined_leaves(
+        let prehashed_parent_levels = ranked_ntt_with_pipelined_leaves(
             &ntt,
             &mut got_codeword,
             &params,
-            &mut got_tree[..params.n_leaves()],
+            &mut got_tree,
             &helper,
         );
-        let got_tree = merkle::merkle_tree_from_prehashed_leaves(
+        let got_tree = merkle::merkle_tree_from_prehashed_level(
             got_tree,
             params.n_leaves(),
             HashKind::Blake3,
+            prehashed_parent_levels,
         );
 
         assert_eq!(got_codeword, expect_codeword);
