@@ -15,7 +15,7 @@ pub mod inv_table;
 pub mod inv_table_deg4;
 pub mod parallel_f128;
 pub use additive_ntt_f128::AdditiveNttF128;
-pub use inv_table::InvNttTableByteSingleGf8;
+pub use inv_table::{InvNttTableByteSingleGf8, cached_skip_table};
 pub use inv_table_deg4::InvNttTableSToV8Gf8;
 pub use parallel_f128::ParallelNttF128;
 

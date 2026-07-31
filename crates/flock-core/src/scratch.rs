@@ -222,6 +222,62 @@ pub fn give_u8(v: Vec<u8>) {
     }
 }
 
+// Merkle-tree node buffers (L0's 64 MiB flat tree at the ranked shape plus
+// one smaller tree per recursive Ligerito level). Same motivation as the
+// pools above: the allocator munmaps these on free, so without pooling every
+// prove re-pays ~16k soft faults on first touch plus a single-threaded unmap
+// on drop. Contents are NOT cleared; every consumer writes each node before
+// the root is read (write-before-read contract as for [`take_f128`]).
+
+static POOL_HASH: Mutex<Vec<Vec<crate::merkle::Hash>>> = Mutex::new(Vec::new());
+
+/// L0 tree + ~3 recursive-level trees, with headroom for one warm spare.
+const MAX_POOLED_HASH: usize = 6;
+
+/// Take a length-`n` `Hash` vector, preferring a pooled buffer (smallest
+/// capacity >= `n`); falls back to a fresh uninitialized allocation.
+/// Contents are UNINITIALIZED in both cases (write-before-read contract,
+/// same as [`take_f128`]).
+pub fn take_hash(n: usize) -> Vec<crate::merkle::Hash> {
+    {
+        let mut pool = POOL_HASH.lock().unwrap();
+        let mut best: Option<usize> = None;
+        for (i, v) in pool.iter().enumerate() {
+            if v.capacity() >= n && best.is_none_or(|b| v.capacity() < pool[b].capacity()) {
+                best = Some(i);
+            }
+        }
+        if let Some(i) = best {
+            let mut v = pool.swap_remove(i);
+            // SAFETY: capacity >= n was checked above; Hash = [u8; 32] is
+            // Copy (no Drop), so holding stale bytes is sound — the caller
+            // upholds write-before-read per this function's contract.
+            unsafe { v.set_len(n) };
+            return v;
+        }
+    }
+    crate::alloc_uninit_vec(n)
+}
+
+/// Return a `Hash` buffer to the pool for reuse (smallest-first eviction
+/// when full, same policy as the other pools).
+pub fn give_hash(v: Vec<crate::merkle::Hash>) {
+    if v.capacity() == 0 {
+        return;
+    }
+    let mut pool = POOL_HASH.lock().unwrap();
+    pool.push(v);
+    if pool.len() > MAX_POOLED_HASH {
+        let smallest = pool
+            .iter()
+            .enumerate()
+            .min_by_key(|(_, v)| v.capacity())
+            .map(|(i, _)| i)
+            .expect("pool non-empty");
+        pool.swap_remove(smallest);
+    }
+}
+
 /// Byte-addressable scratch that retains the allocation's original element
 /// type, alignment, and deallocation layout.
 ///
