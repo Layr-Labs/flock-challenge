@@ -199,6 +199,7 @@ pub fn prove_ligerito<Ch: Challenger>(
 /// `generate_witness_with_ab_packed_and_lincheck` and runs commit → zerocheck
 /// → lincheck → PCS-open. Uses the c-aliasing trick (`C = I` → `c == z`
 /// byte-for-byte). Used by per-hash modules' `prove_fast_ligerito` methods.
+#[allow(clippy::too_many_arguments)]
 pub fn prove_fast_ligerito_from_witness<Ch: Challenger>(
     r1cs: &BlockR1cs,
     pcs_params: &PcsParams,
@@ -208,6 +209,63 @@ pub fn prove_fast_ligerito_from_witness<Ch: Challenger>(
     z_packed_lincheck: Vec<u8>,
     lincheck_circuit: &dyn lincheck::LincheckCircuit,
     prefaulted_codeword: Option<Vec<F128>>,
+    challenger: &mut Ch,
+) -> (R1csProofLigerito, Commitment, R1csClaim) {
+    let commit_codeword = match prefaulted_codeword {
+        Some(codeword) => CommitCodeword::NeedsReplication(codeword),
+        None => CommitCodeword::Allocate,
+    };
+    prove_fast_ligerito_from_witness_with_commit_codeword(
+        r1cs,
+        pcs_params,
+        z_packed,
+        a_packed_f128,
+        b_packed_f128,
+        z_packed_lincheck,
+        lincheck_circuit,
+        commit_codeword,
+        challenger,
+    )
+}
+
+/// Ranked row-major counterpart of [`prove_fast_ligerito_from_witness`].
+/// `codeword` already contains the post-trivial-layer state, so commit starts
+/// directly at the remaining NTT layers.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn prove_fast_ligerito_from_preinitialized_codeword<Ch: Challenger>(
+    r1cs: &BlockR1cs,
+    pcs_params: &PcsParams,
+    z_packed: Vec<F128>,
+    a_packed_f128: Vec<F128>,
+    b_packed_f128: Vec<F128>,
+    z_packed_lincheck: Vec<u8>,
+    lincheck_circuit: &dyn lincheck::LincheckCircuit,
+    codeword: Vec<F128>,
+    challenger: &mut Ch,
+) -> (R1csProofLigerito, Commitment, R1csClaim) {
+    prove_fast_ligerito_from_witness_with_commit_codeword(
+        r1cs,
+        pcs_params,
+        z_packed,
+        a_packed_f128,
+        b_packed_f128,
+        z_packed_lincheck,
+        lincheck_circuit,
+        CommitCodeword::Preinitialized(codeword),
+        challenger,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn prove_fast_ligerito_from_witness_with_commit_codeword<Ch: Challenger>(
+    r1cs: &BlockR1cs,
+    pcs_params: &PcsParams,
+    z_packed: Vec<F128>,
+    a_packed_f128: Vec<F128>,
+    b_packed_f128: Vec<F128>,
+    z_packed_lincheck: Vec<u8>,
+    lincheck_circuit: &dyn lincheck::LincheckCircuit,
+    commit_codeword: CommitCodeword,
     challenger: &mut Ch,
 ) -> (R1csProofLigerito, Commitment, R1csClaim) {
     let lig_config = pcs_params
@@ -224,7 +282,7 @@ pub fn prove_fast_ligerito_from_witness<Ch: Challenger>(
         z_packed,
         s_hat_v_ab,
         s_hat_v_c,
-    } = prove_fast_core_with_codeword(
+    } = prove_fast_core_with_commit_codeword(
         r1cs,
         pcs_params,
         z_packed,
@@ -232,7 +290,7 @@ pub fn prove_fast_ligerito_from_witness<Ch: Challenger>(
         b_packed_f128,
         z_packed_lincheck,
         lincheck_circuit,
-        prefaulted_codeword,
+        commit_codeword,
         challenger,
     );
 
@@ -290,6 +348,16 @@ pub struct ProveCore {
     pub s_hat_v_c: Vec<F128>,
 }
 
+/// Ownership and initialization state of the commit codeword buffer.
+///
+/// Keeping these states distinct prevents the ranked path from accidentally
+/// replicating the witness over a buffer its witness workers already filled.
+enum CommitCodeword {
+    Allocate,
+    NeedsReplication(Vec<F128>),
+    Preinitialized(Vec<F128>),
+}
+
 /// Build the witness commitment and the challenge-independent half of
 /// zerocheck round 1 on the same fixed Rayon pool. A/B are only borrowed:
 /// their original packed values remain live for zerocheck round 2.
@@ -299,7 +367,7 @@ fn commit_with_round1_ab_precompute(
     b_packed_f128: &[F128],
     pcs_params: &PcsParams,
     padding: &zerocheck::PaddingSpec,
-    prefaulted_codeword: Option<Vec<F128>>,
+    commit_codeword: CommitCodeword,
 ) -> (
     (Commitment, pcs::ProverData),
     zerocheck::univariate_skip_optimized::Round1AbInner,
@@ -315,9 +383,12 @@ fn commit_with_round1_ab_precompute(
     let inv_table = flock_core::ntt::InvNttTableByteSingleGf8::new(&ntt_s, &ntt_l);
 
     rayon::join(
-        || match prefaulted_codeword {
-            Some(buf) => pcs::commit_into(z_packed, pcs_params, buf),
-            None => pcs::commit(z_packed, pcs_params),
+        || match commit_codeword {
+            CommitCodeword::Allocate => pcs::commit(z_packed, pcs_params),
+            CommitCodeword::NeedsReplication(buf) => pcs::commit_into(z_packed, pcs_params, buf),
+            CommitCodeword::Preinitialized(buf) => {
+                pcs::commit_preinitialized(z_packed, buf, pcs_params)
+            }
         },
         || {
             zerocheck::univariate_skip_optimized::precompute_round1_ab_inner_packed_padded(
@@ -344,7 +415,7 @@ pub fn prove_fast_core<Ch: Challenger>(
     lincheck_circuit: &dyn lincheck::LincheckCircuit,
     challenger: &mut Ch,
 ) -> ProveCore {
-    prove_fast_core_with_codeword(
+    prove_fast_core_with_commit_codeword(
         r1cs,
         pcs_params,
         z_packed,
@@ -352,7 +423,7 @@ pub fn prove_fast_core<Ch: Challenger>(
         b_packed_f128,
         z_packed_lincheck,
         lincheck_circuit,
-        None,
+        CommitCodeword::Allocate,
         challenger,
     )
 }
@@ -374,6 +445,35 @@ pub fn prove_fast_core_with_codeword<Ch: Challenger>(
     prefaulted_codeword: Option<Vec<F128>>,
     challenger: &mut Ch,
 ) -> ProveCore {
+    let commit_codeword = match prefaulted_codeword {
+        Some(codeword) => CommitCodeword::NeedsReplication(codeword),
+        None => CommitCodeword::Allocate,
+    };
+    prove_fast_core_with_commit_codeword(
+        r1cs,
+        pcs_params,
+        z_packed,
+        a_packed_f128,
+        b_packed_f128,
+        z_packed_lincheck,
+        lincheck_circuit,
+        commit_codeword,
+        challenger,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn prove_fast_core_with_commit_codeword<Ch: Challenger>(
+    r1cs: &BlockR1cs,
+    pcs_params: &PcsParams,
+    z_packed: Vec<F128>,
+    a_packed_f128: Vec<F128>,
+    b_packed_f128: Vec<F128>,
+    z_packed_lincheck: Vec<u8>,
+    lincheck_circuit: &dyn lincheck::LincheckCircuit,
+    commit_codeword: CommitCodeword,
+    challenger: &mut Ch,
+) -> ProveCore {
     let padding = r1cs.padding_spec();
     let ((commitment, prover_data), ab_inner) = commit_with_round1_ab_precompute(
         &z_packed,
@@ -381,7 +481,7 @@ pub fn prove_fast_core_with_codeword<Ch: Challenger>(
         &b_packed_f128,
         pcs_params,
         &padding,
-        prefaulted_codeword,
+        commit_codeword,
     );
     bind_statement(challenger, r1cs, &commitment);
 
@@ -502,6 +602,60 @@ pub fn prove_fast_ligerito_timed<Ch: Challenger>(
     prefaulted_codeword: Option<Vec<F128>>,
     challenger: &mut Ch,
 ) -> (R1csProofLigerito, Commitment, R1csClaim, ProvePhaseTimings) {
+    let commit_codeword = match prefaulted_codeword {
+        Some(codeword) => CommitCodeword::NeedsReplication(codeword),
+        None => CommitCodeword::Allocate,
+    };
+    prove_fast_ligerito_timed_with_commit_codeword(
+        r1cs,
+        pcs_params,
+        z_packed,
+        a_packed_f128,
+        b_packed_f128,
+        z_packed_lincheck,
+        lincheck_circuit,
+        commit_codeword,
+        challenger,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn prove_fast_ligerito_timed_from_preinitialized_codeword<Ch: Challenger>(
+    r1cs: &BlockR1cs,
+    pcs_params: &PcsParams,
+    z_packed: Vec<F128>,
+    a_packed_f128: Vec<F128>,
+    b_packed_f128: Vec<F128>,
+    z_packed_lincheck: Vec<u8>,
+    lincheck_circuit: &dyn lincheck::LincheckCircuit,
+    codeword: Vec<F128>,
+    challenger: &mut Ch,
+) -> (R1csProofLigerito, Commitment, R1csClaim, ProvePhaseTimings) {
+    prove_fast_ligerito_timed_with_commit_codeword(
+        r1cs,
+        pcs_params,
+        z_packed,
+        a_packed_f128,
+        b_packed_f128,
+        z_packed_lincheck,
+        lincheck_circuit,
+        CommitCodeword::Preinitialized(codeword),
+        challenger,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn prove_fast_ligerito_timed_with_commit_codeword<Ch: Challenger>(
+    r1cs: &BlockR1cs,
+    pcs_params: &PcsParams,
+    z_packed: Vec<F128>,
+    a_packed_f128: Vec<F128>,
+    b_packed_f128: Vec<F128>,
+    z_packed_lincheck: Vec<u8>,
+    lincheck_circuit: &dyn lincheck::LincheckCircuit,
+    commit_codeword: CommitCodeword,
+    challenger: &mut Ch,
+) -> (R1csProofLigerito, Commitment, R1csClaim, ProvePhaseTimings) {
     use std::time::Instant;
     let mut t = ProvePhaseTimings::default();
 
@@ -519,7 +673,7 @@ pub fn prove_fast_ligerito_timed<Ch: Challenger>(
         &b_packed_f128,
         pcs_params,
         &padding,
-        prefaulted_codeword,
+        commit_codeword,
     );
     t.commit_s = t0.elapsed().as_secs_f64();
     bind_statement(challenger, r1cs, &commitment);

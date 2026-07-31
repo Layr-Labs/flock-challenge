@@ -231,12 +231,37 @@ pub fn commit_into(
     finalize_commit(codeword, params)
 }
 
+/// Commit from a codeword whose first `log_inv_rate` trivial NTT layers have
+/// already been applied.
+///
+/// The caller must initialize every element to the same state produced by
+/// [`replicate_message_fill`] before calling this function. This entry point is
+/// used when a witness producer writes those replicas directly while its input
+/// rows are still cache-resident; unlike [`commit_into`], it performs no
+/// witness-to-codeword fill and begins with the remaining NTT layers.
+pub fn commit_preinitialized(
+    z_packed: &[F128],
+    codeword: Vec<F128>,
+    params: &PcsParams,
+) -> (Commitment, ProverData) {
+    params.validate();
+    assert_eq!(z_packed.len(), 1usize << params.log_msg_len());
+    let codeword_len = params.n_positions() * params.num_ntts();
+    assert_eq!(
+        codeword.len(),
+        codeword_len,
+        "commit_preinitialized: codeword buffer has wrong length"
+    );
+    finalize_commit(codeword, params)
+}
+
 /// Fill `codeword` with `2^r` replicas of `msg` (`r = log2(codeword.len() /
 /// msg.len())`) — the exact state after the first `r` forward-NTT layers on
 /// the zero-padded coefficient vector `[msg, 0, …, 0]`. Pair with
 /// `forward_transform_interleaved_from_layer(…, r)`. Every slot of `codeword`
 /// is written (input contents may be stale/uninit).
-pub(crate) fn replicate_message_fill(codeword: &mut [F128], msg: &[F128]) {
+#[doc(hidden)]
+pub fn replicate_message_fill(codeword: &mut [F128], msg: &[F128]) {
     use rayon::prelude::*;
     let msg_len = msg.len();
     debug_assert!(codeword.len().is_multiple_of(msg_len));

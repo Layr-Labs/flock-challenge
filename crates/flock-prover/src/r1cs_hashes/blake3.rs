@@ -91,6 +91,7 @@
 use super::common::{BitRecord, add_carry_parts, or_bit_at, or_u32_at_bit, xor_dedup};
 use flock_core::challenger::Challenger;
 use flock_core::field::F128;
+use flock_core::merkle::HashKind;
 use flock_core::pcs::{Commitment, PcsParams};
 use flock_core::proof::R1csClaim;
 use flock_core::r1cs::{BlockR1cs, SparseBinaryMatrix};
@@ -1481,6 +1482,32 @@ pub fn generate_witness_with_ab_packed_and_lincheck(
     Vec<flock_core::field::F128>,
     Vec<u8>,
 ) {
+    generate_witness_with_ab_packed_and_lincheck_impl(blocks, n_blocks_log, None)
+}
+
+fn generate_witness_with_ab_packed_and_lincheck_rate2_codeword(
+    blocks: &[Compression],
+    n_blocks_log: usize,
+    codeword: &mut [flock_core::field::F128],
+) -> (
+    Vec<flock_core::field::F128>,
+    Vec<flock_core::field::F128>,
+    Vec<flock_core::field::F128>,
+    Vec<u8>,
+) {
+    generate_witness_with_ab_packed_and_lincheck_impl(blocks, n_blocks_log, Some(codeword))
+}
+
+fn generate_witness_with_ab_packed_and_lincheck_impl(
+    blocks: &[Compression],
+    n_blocks_log: usize,
+    rate2_codeword: Option<&mut [flock_core::field::F128]>,
+) -> (
+    Vec<flock_core::field::F128>,
+    Vec<flock_core::field::F128>,
+    Vec<flock_core::field::F128>,
+    Vec<u8>,
+) {
     // Constant-wire pin (docs/const-wire-pin.md): fill padding blocks with a
     // valid compression (of the all-zero input) so the constant cell is 1 in
     // every block. (The chain forbids padding, so this only affects the
@@ -1491,17 +1518,32 @@ pub fn generate_witness_with_ab_packed_and_lincheck(
     } else {
         USEFUL_BITS
     };
-    super::common::drive_witness_packed_and_lincheck_full_write(
-        blocks,
-        &padding,
-        n_blocks_log,
-        K_LOG,
-        stripe_useful_bits,
-        |block: &Compression, z_u64, a_u64, b_u64| {
+    let per_block =
+        |block: &Compression, z_u64: &mut [u64], a_u64: &mut [u64], b_u64: &mut [u64]| {
             let (cv, m, t, bl, fl) = block;
             build_block_witness_ab_stream_into(cv, m, *t, *bl, *fl, z_u64, a_u64, b_u64);
-        },
-    )
+        };
+    match rate2_codeword {
+        Some(codeword) => {
+            super::common::drive_witness_packed_and_lincheck_full_write_with_rate2_codeword(
+                blocks,
+                &padding,
+                n_blocks_log,
+                K_LOG,
+                stripe_useful_bits,
+                codeword,
+                per_block,
+            )
+        }
+        None => super::common::drive_witness_packed_and_lincheck_full_write(
+            blocks,
+            &padding,
+            n_blocks_log,
+            K_LOG,
+            stripe_useful_bits,
+            per_block,
+        ),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1547,6 +1589,43 @@ impl Blake3Setup {
                 generate_witness_batch_major(blocks, self.n_blocks_log())
             }
         }
+    }
+
+    /// The benchmark's exact row-major rate-1/2 geometry. Other sizes, rates,
+    /// profiles, hashes, layouts, targets, and explicit A/B runs retain the
+    /// existing prefault-plus-replicate path.
+    #[inline]
+    fn use_ranked_rate2_hot_codeword(&self) -> bool {
+        cfg!(all(
+            target_os = "macos",
+            target_arch = "aarch64",
+            target_feature = "aes"
+        )) && self.r1cs.layout == flock_core::r1cs::WitnessLayout::RowMajor
+            && self.r1cs.m == self.pcs_params.m
+            && self.pcs_params.m == 32
+            && self.pcs_params.log_inv_rate == 1
+            && self.pcs_params.log_batch_size == 6
+            && self.pcs_params.profile == flock_core::pcs::ligerito::LigeritoProfile::Fast
+            && self.pcs_params.merkle_hash == HashKind::Blake3
+            && std::env::var_os("FLOCK_NO_HOT_CODEWORD").is_none()
+    }
+
+    /// Take the codeword before witness generation, then let row workers write
+    /// both rate-1/2 replicas. On the timed proof this normally comes from the
+    /// warm proof's resident scratch pool; on a cold miss, these P-core writes
+    /// perform the first touch without racing a prefault thread.
+    fn generate_witness_ab_with_rate2_codeword(
+        &self,
+        blocks: &[Compression],
+    ) -> (Vec<F128>, (Vec<F128>, Vec<F128>, Vec<F128>, Vec<u8>)) {
+        debug_assert!(self.use_ranked_rate2_hot_codeword());
+        let mut codeword = flock_core::scratch::take_f128(self.pcs_params.codeword_len_f128());
+        let witness = generate_witness_with_ab_packed_and_lincheck_rate2_codeword(
+            blocks,
+            self.n_blocks_log(),
+            &mut codeword,
+        );
+        (codeword, witness)
     }
 
     pub fn new(n_blocks: usize) -> Self {
@@ -1647,6 +1726,22 @@ impl Blake3Setup {
         challenger: &mut Ch,
     ) -> (flock_core::proof::R1csProofLigerito, Commitment, R1csClaim) {
         assert_eq!(blocks.len(), self.n_blocks);
+        if self.use_ranked_rate2_hot_codeword() {
+            let (codeword, (z_packed, a_packed_f128, b_packed_f128, z_packed_lincheck)) =
+                self.generate_witness_ab_with_rate2_codeword(blocks);
+            let lc_circuit = self.r1cs.csc_lincheck_circuit();
+            return crate::prover::prove_fast_ligerito_from_preinitialized_codeword(
+                &self.r1cs,
+                &self.pcs_params,
+                z_packed,
+                a_packed_f128,
+                b_packed_f128,
+                z_packed_lincheck,
+                lc_circuit,
+                codeword,
+                challenger,
+            );
+        }
         let (codeword, (z_packed, a_packed_f128, b_packed_f128, z_packed_lincheck)) =
             flock_core::pcs::prefault_codeword_during(&self.pcs_params, || {
                 self.generate_witness_ab(blocks)
@@ -1680,21 +1775,41 @@ impl Blake3Setup {
     ) {
         assert_eq!(blocks.len(), self.n_blocks);
         let t0 = std::time::Instant::now();
-        let (z_packed, a_packed_f128, b_packed_f128, z_packed_lincheck) =
-            self.generate_witness_ab(blocks);
+        let (codeword, (z_packed, a_packed_f128, b_packed_f128, z_packed_lincheck)) =
+            if self.use_ranked_rate2_hot_codeword() {
+                let (codeword, witness) = self.generate_witness_ab_with_rate2_codeword(blocks);
+                (Some(codeword), witness)
+            } else {
+                (None, self.generate_witness_ab(blocks))
+            };
         let witness_s = t0.elapsed().as_secs_f64();
         let lc_circuit = self.r1cs.csc_lincheck_circuit();
-        let (proof, commitment, claim, mut timings) = crate::prover::prove_fast_ligerito_timed(
-            &self.r1cs,
-            &self.pcs_params,
-            z_packed,
-            a_packed_f128,
-            b_packed_f128,
-            z_packed_lincheck,
-            lc_circuit,
-            None,
-            challenger,
-        );
+        let (proof, commitment, claim, mut timings) = match codeword {
+            Some(codeword) => {
+                crate::prover::prove_fast_ligerito_timed_from_preinitialized_codeword(
+                    &self.r1cs,
+                    &self.pcs_params,
+                    z_packed,
+                    a_packed_f128,
+                    b_packed_f128,
+                    z_packed_lincheck,
+                    lc_circuit,
+                    codeword,
+                    challenger,
+                )
+            }
+            None => crate::prover::prove_fast_ligerito_timed(
+                &self.r1cs,
+                &self.pcs_params,
+                z_packed,
+                a_packed_f128,
+                b_packed_f128,
+                z_packed_lincheck,
+                lc_circuit,
+                None,
+                challenger,
+            ),
+        };
         timings.witness_s = witness_s;
         (proof, commitment, claim, timings)
     }
@@ -2344,6 +2459,188 @@ mod tests {
                 "lincheck stripe mismatch at n_blocks={n_blocks}"
             );
         }
+    }
+
+    #[test]
+    fn preinitialized_codeword_matches_fill_and_proof_roundtrips() {
+        use flock_core::challenger::FsChallenger;
+
+        let setup = Blake3Setup::new(256);
+        let mut rng = Rng::new(0xC0DE_20AD);
+        let blocks: Vec<Compression> = (0..setup.n_blocks)
+            .map(|_| {
+                let cv = std::array::from_fn(|_| rng.next_u32());
+                let m = std::array::from_fn(|_| rng.next_u32());
+                (cv, m, rng.next_u32() as u64, 64, 11)
+            })
+            .collect();
+
+        let mut hot_codeword = flock_core::scratch::take_f128(setup.pcs_params.codeword_len_f128());
+        let (z, a, b, z_lincheck) = generate_witness_with_ab_packed_and_lincheck_rate2_codeword(
+            &blocks,
+            setup.n_blocks_log(),
+            &mut hot_codeword,
+        );
+
+        let mut filled_codeword =
+            flock_core::scratch::take_f128(setup.pcs_params.codeword_len_f128());
+        flock_core::pcs::commit::replicate_message_fill(&mut filled_codeword, &z);
+        let as_bytes = |values: &[F128]| unsafe {
+            std::slice::from_raw_parts(values.as_ptr().cast::<u8>(), std::mem::size_of_val(values))
+        };
+        assert_eq!(
+            as_bytes(&hot_codeword),
+            as_bytes(&filled_codeword),
+            "hot-row codeword differs from replicate_message_fill"
+        );
+        flock_core::scratch::give_f128(filled_codeword);
+
+        let (z_fill, a_fill, b_fill, z_lincheck_fill) =
+            (z.clone(), a.clone(), b.clone(), z_lincheck.clone());
+        let circuit = setup.r1cs.csc_lincheck_circuit();
+
+        let mut hot_challenger = FsChallenger::new(b"flock-hot-codeword");
+        let (hot_proof, hot_commitment, hot_claim) =
+            crate::prover::prove_fast_ligerito_from_preinitialized_codeword(
+                &setup.r1cs,
+                &setup.pcs_params,
+                z,
+                a,
+                b,
+                z_lincheck,
+                circuit,
+                hot_codeword,
+                &mut hot_challenger,
+            );
+
+        let mut fill_challenger = FsChallenger::new(b"flock-hot-codeword");
+        let (fill_proof, fill_commitment, fill_claim) =
+            crate::prover::prove_fast_ligerito_from_witness(
+                &setup.r1cs,
+                &setup.pcs_params,
+                z_fill,
+                a_fill,
+                b_fill,
+                z_lincheck_fill,
+                circuit,
+                None,
+                &mut fill_challenger,
+            );
+
+        assert_eq!(hot_commitment.root, fill_commitment.root);
+        assert_eq!(hot_claim, fill_claim);
+        let hot_bytes = crate::proof_io::R1csProofBundleLigerito {
+            commitment: hot_commitment.clone(),
+            proof: hot_proof.clone(),
+        }
+        .to_bytes();
+        let fill_bytes = crate::proof_io::R1csProofBundleLigerito {
+            commitment: fill_commitment,
+            proof: fill_proof,
+        }
+        .to_bytes();
+        assert_eq!(
+            hot_bytes, fill_bytes,
+            "preinitialized and replicate-fill proofs must be byte-identical"
+        );
+
+        let roundtrip = crate::proof_io::R1csProofBundleLigerito::from_bytes(&hot_bytes).unwrap();
+        let mut verifier = FsChallenger::new(b"flock-hot-codeword");
+        let verified = setup
+            .verify(&roundtrip.commitment, &roundtrip.proof, &mut verifier)
+            .expect("preinitialized-codeword proof must verify");
+        assert_eq!(verified, hot_claim);
+    }
+
+    /// Exact ranked allocation shape: m=32 gives a 512 MiB packed witness and
+    /// a 1 GiB rate-1/2 codeword. Kept ignored in ordinary suites because the
+    /// byte-for-byte oracle intentionally holds two 1 GiB codewords at once.
+    #[test]
+    #[ignore = "ranked-shape test needs roughly 4 GiB of working memory"]
+    fn ranked_shape_hot_codeword_matches_replicate_message_fill() {
+        const RANKED_N_BLOCKS_LOG: usize = 18;
+        const RANKED_M: usize = K_LOG + RANKED_N_BLOCKS_LOG;
+        const RANKED_MSG_LEN: usize = 1 << (RANKED_M - flock_core::pcs::LOG_PACKING);
+
+        let mut rng = Rng::new(0x7260_19C0_DE);
+        let blocks: Vec<Compression> = (0..(1usize << RANKED_N_BLOCKS_LOG))
+            .map(|_| {
+                let cv = std::array::from_fn(|_| rng.next_u32());
+                let m = std::array::from_fn(|_| rng.next_u32());
+                (cv, m, rng.next_u32() as u64, 64, 11)
+            })
+            .collect();
+        let mut hot_codeword = flock_core::scratch::take_f128(2 * RANKED_MSG_LEN);
+        let (z, a, b, stripe) = generate_witness_with_ab_packed_and_lincheck_rate2_codeword(
+            &blocks,
+            RANKED_N_BLOCKS_LOG,
+            &mut hot_codeword,
+        );
+        assert_eq!(z.len(), RANKED_MSG_LEN);
+        drop(a);
+        drop(b);
+        drop(stripe);
+        drop(blocks);
+
+        let mut filled_codeword = flock_core::scratch::take_f128(2 * RANKED_MSG_LEN);
+        flock_core::pcs::commit::replicate_message_fill(&mut filled_codeword, &z);
+        let hot_bytes = unsafe {
+            std::slice::from_raw_parts(
+                hot_codeword.as_ptr().cast::<u8>(),
+                std::mem::size_of_val(hot_codeword.as_slice()),
+            )
+        };
+        let filled_bytes = unsafe {
+            std::slice::from_raw_parts(
+                filled_codeword.as_ptr().cast::<u8>(),
+                std::mem::size_of_val(filled_codeword.as_slice()),
+            )
+        };
+        assert!(
+            hot_bytes == filled_bytes,
+            "ranked hot-row codeword differs from replicate_message_fill"
+        );
+    }
+
+    /// One-proof ranked canary without the benchmark's timing loops.
+    #[test]
+    #[ignore = "ranked canary constructs and verifies one full m=32 proof"]
+    fn ranked_blake3_proof_canary() {
+        use flock_core::challenger::FsChallenger;
+
+        const RANKED_N_BLOCKS: usize = 1 << 18;
+        const EXPECTED_PROOF_BYTES: usize = 437_551;
+        let mut setup = Blake3Setup::new(RANKED_N_BLOCKS);
+        setup.pcs_params.merkle_hash = HashKind::Blake3;
+        assert!(
+            setup.use_ranked_rate2_hot_codeword(),
+            "canary must exercise the ranked hot-codeword gate"
+        );
+
+        // Match `benches/blake3_proof.rs`'s deterministic run-0 input exactly.
+        let mut rng = Rng::new(0xC0FFEE_BEEF ^ RANKED_N_BLOCKS as u64);
+        let blocks: Vec<Compression> = (0..RANKED_N_BLOCKS)
+            .map(|_| {
+                let cv = std::array::from_fn(|_| rng.next_u32());
+                let m = std::array::from_fn(|_| rng.next_u32());
+                (cv, m, rng.next_u32() as u64, 64, 11)
+            })
+            .collect();
+
+        let mut prover = FsChallenger::with_hash(b"flock-bench-v0", HashKind::Blake3);
+        let (proof, commitment, claim) = setup.prove_fast(&blocks, &mut prover);
+        let proof_bytes = crate::proof_io::R1csProofBundleLigerito {
+            commitment: commitment.clone(),
+            proof: proof.clone(),
+        }
+        .to_bytes();
+        assert_eq!(proof_bytes.len(), EXPECTED_PROOF_BYTES);
+
+        let mut verifier = FsChallenger::with_hash(b"flock-bench-v0", HashKind::Blake3);
+        let verified = setup
+            .verify(&commitment, &proof, &mut verifier)
+            .expect("ranked preinitialized-codeword proof must verify");
+        assert_eq!(verified, claim);
     }
 
     /// Full prove→verify round-trip through the Ligerito PCS for EACH named
