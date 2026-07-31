@@ -144,6 +144,23 @@ fn cached_standard_twiddles(dim: usize, evals: &[Vec<F128>]) -> Option<Arc<[F128
     )
 }
 
+/// Cache the much smaller normalized evaluation triangles as well. Standard
+/// NTT objects are constructed repeatedly by the recursive PCS, and rebuilding
+/// these rows otherwise repeats field inversions and multiplications even when
+/// the large twiddle table is already resident from the untimed warm proof.
+/// Clone into the original nested-`Vec` representation so transform object
+/// layout and hot-loop dereferencing remain unchanged.
+fn cached_standard_evals(dim: usize) -> Vec<Vec<F128>> {
+    static TABLES: OnceLock<[OnceLock<Vec<Vec<F128>>>; 65]> = OnceLock::new();
+    let tables = TABLES.get_or_init(|| std::array::from_fn(|_| OnceLock::new()));
+    tables[dim]
+        .get_or_init(|| {
+            let basis: Vec<F128> = (0..dim).map(|i| F128::new(1u64 << i, 0)).collect();
+            generate_evals_from_subspace(&basis)
+        })
+        .clone()
+}
+
 /// Complete the last radix-8 group for the ranked Apple-silicon L0 commit.
 ///
 /// The generic 2 MiB cache split selects `n_top = 9` for the production shape
@@ -271,8 +288,7 @@ impl AdditiveNttF128 {
     /// (the low 64 bits of F_{2^128} hold these basis vectors).
     pub fn standard(dim: usize) -> Self {
         assert!(dim <= 64, "standard NTT requires dim ≤ 64");
-        let basis: Vec<F128> = (0..dim).map(|i| F128::new(1u64 << i, 0)).collect();
-        let evals = generate_evals_from_subspace(&basis);
+        let evals = cached_standard_evals(dim);
         let precomputed_twiddles = cached_standard_twiddles(dim, &evals);
         Self {
             evals,
