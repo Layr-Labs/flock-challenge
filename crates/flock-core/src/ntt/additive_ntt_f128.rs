@@ -185,14 +185,16 @@ fn fusion_aware_interleaved_n_top(
         target_feature = "aes"
     )) && log_d == 20
         && num_ntts == 64
-        && start_layer == 1
+        && matches!(start_layer, 1 | 4)
         && n_top == 9;
     if ranked_apple_l0 { 10 } else { n_top }
 }
 
 /// Whether to fuse the ranked L0 commit's ten cache-resident tail layers in
-/// pairs. Keep this as narrow as [`fusion_aware_interleaved_n_top`]: smaller
-/// recursive commits retain their independently tuned single-layer tail.
+/// pairs. The ranked witness producer may enter after layers 1--3, so layer 4
+/// is the equivalent continuation of the same transform. Keep both entries as
+/// narrow as [`fusion_aware_interleaved_n_top`]: smaller recursive commits
+/// retain their independently tuned single-layer tail.
 #[inline]
 fn use_ranked_deep_pair_fusion(
     log_d: usize,
@@ -206,7 +208,7 @@ fn use_ranked_deep_pair_fusion(
         target_feature = "aes"
     )) && log_d == 20
         && num_ntts == 64
-        && start_layer == 1
+        && matches!(start_layer, 1 | 4)
         && n_top == 10
 }
 
@@ -353,6 +355,69 @@ impl AdditiveNttF128 {
     /// `num_ntts` F_{2^128} elements).
     pub fn forward_transform_interleaved(&self, data: &mut [F128], num_ntts: usize) {
         self.forward_transform_interleaved_from_layer(data, num_ntts, 0);
+    }
+
+    /// Apply the rate-1/2 layer-1--3 dual-output kernel to a source row range.
+    /// This hidden workspace seam lets a producer publish disjoint codeword
+    /// rows while their message rows are still cache-hot, using exactly the
+    /// same arithmetic and staged-store kernel as the ordinary ranked pass.
+    ///
+    /// # Safety
+    /// `message` addresses `message_len` initialized elements and `codeword`
+    /// addresses `2 * message_len` writable elements. Concurrent calls must
+    /// use disjoint row ranges, and all pointers must satisfy the alignment
+    /// contract of `F128`.
+    #[doc(hidden)]
+    pub unsafe fn forward_transform_interleaved_rate2_radix8_rows_from_message(
+        &self,
+        message: *const F128,
+        codeword: *mut F128,
+        message_len: usize,
+        num_ntts: usize,
+        row_start: usize,
+        row_end: usize,
+    ) {
+        assert!(num_ntts.is_power_of_two() && num_ntts >= 2);
+        assert_eq!(message_len % num_ntts, 0);
+        let message_positions = message_len / num_ntts;
+        assert!(message_positions.is_power_of_two() && message_positions >= 8);
+        assert_eq!(
+            self.log_domain_size(),
+            (2 * message_positions).trailing_zeros() as usize
+        );
+        let eighth = message_positions / 8;
+        assert!(row_start <= row_end && row_end <= eighth);
+        let block_twiddles = |block: usize| {
+            let mut tw = [F128::ZERO; 7];
+            tw[0] = self.twiddle(1, block);
+            for subblock in 0..2 {
+                tw[1 + subblock] = self.twiddle(2, 2 * block + subblock);
+            }
+            for subblock in 0..4 {
+                tw[3 + subblock] = self.twiddle(3, 4 * block + subblock);
+            }
+            tw
+        };
+        let root_twiddles = block_twiddles(0);
+        debug_assert_eq!(root_twiddles[0], F128::ZERO);
+        debug_assert_eq!(root_twiddles[1], F128::ZERO);
+        debug_assert_eq!(root_twiddles[3], F128::ZERO);
+        let sibling_twiddles = block_twiddles(1);
+        unsafe {
+            let sibling = codeword.add(message_len);
+            for row in row_start..row_end {
+                kernels::butterfly_fused_3layer_dual_from_src_row(
+                    message,
+                    codeword,
+                    sibling,
+                    eighth,
+                    num_ntts,
+                    row,
+                    &root_twiddles,
+                    &sibling_twiddles,
+                );
+            }
+        }
     }
 
     /// Forward interleaved NTT starting at `start_layer`, assuming the first
@@ -2000,11 +2065,13 @@ mod tests {
             target_feature = "aes"
         ));
         assert_eq!(use_ranked_deep_pair_fusion(20, 64, 1, 10), enabled_here);
+        assert_eq!(use_ranked_deep_pair_fusion(20, 64, 4, 10), enabled_here);
         assert!(!use_ranked_deep_pair_fusion(19, 64, 1, 10));
         assert!(!use_ranked_deep_pair_fusion(20, 8, 1, 10));
         assert!(!use_ranked_deep_pair_fusion(20, 64, 0, 10));
         assert!(!use_ranked_deep_pair_fusion(20, 64, 1, 9));
         assert_eq!(use_ranked_zero_root_fusion(20, 64, 1, 10), enabled_here);
+        assert_eq!(use_ranked_zero_root_fusion(20, 64, 4, 10), enabled_here);
         assert!(!use_ranked_zero_root_fusion(19, 64, 1, 10));
         assert!(!use_ranked_zero_root_fusion(20, 8, 1, 10));
         assert!(!use_ranked_zero_root_fusion(20, 64, 0, 10));
@@ -2016,6 +2083,13 @@ mod tests {
                 enabled_here
             );
         }
+        for layer in [4, 7] {
+            assert_eq!(
+                is_ranked_top_hetero_fused3_pass(20, 64, 4, 10, layer),
+                enabled_here
+            );
+        }
+        assert!(!is_ranked_top_hetero_fused3_pass(20, 64, 4, 10, 1));
         assert!(!is_ranked_top_hetero_fused3_pass(20, 64, 1, 10, 2));
         assert!(!is_ranked_top_hetero_fused3_pass(19, 64, 1, 10, 4));
         assert!(!is_ranked_top_hetero_fused3_pass(20, 8, 1, 10, 4));

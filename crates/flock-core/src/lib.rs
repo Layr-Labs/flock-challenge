@@ -33,6 +33,17 @@ pub mod scratch;
 pub mod verifier;
 pub mod zerocheck;
 
+/// Drain independent ranked work from the performance-core Rayon pool and the
+/// separate efficiency-core helper pool. This is a hidden workspace seam for
+/// producer pipelines whose chunks have no cross-chunk dependencies.
+#[doc(hidden)]
+pub fn run_ranked_heterogeneous_chunks<F>(n_chunks: usize, f: F)
+where
+    F: Fn(usize) + Sync,
+{
+    epool::run_hetero_chunks(n_chunks, f);
+}
+
 /// Configure rayon's global thread pool to use only performance cores on
 /// Apple silicon (excluding efficiency cores).
 ///
