@@ -2600,7 +2600,6 @@ fn fold_and_msg_lsb_into(
     nf: &mut Vec<F128>,
     nb: &mut Vec<F128>,
 ) -> SumcheckMessage {
-    use rayon::prelude::*;
     let n = f.len();
     debug_assert!(n.is_power_of_two() && n >= 2);
     debug_assert_eq!(b.len(), n);
@@ -2639,43 +2638,65 @@ fn fold_and_msg_lsb_into(
     // Parallel path: `half` is a power of two ≥ PAR_THRESHOLD and CHUNK is a
     // power of two, so every chunk has even length and starts at an even
     // global index — message pairs (2k, 2k+1) never straddle a chunk boundary.
+    //
+    // Hetero-queue drain (the shape promoted across the zerocheck compact
+    // rounds and Merkle hashing): chunk `ci` owns the disjoint output ranges
+    // `nf/nb[ci·CHUNK ..]` and its own partial slot; F128 addition is XOR so
+    // the index-ordered reduction equals the old rayon reduce. The fold
+    // kernel is tableless streaming, so the otherwise-idle efficiency
+    // cluster contributes its own fabric bandwidth; sub-floor rounds (< 16
+    // chunks) stay on the main pool via the queue's engagement floor.
     const CHUNK: usize = 2048;
-    let (u_0, u_2) = nf
-        .par_chunks_mut(CHUNK)
-        .zip(nb.par_chunks_mut(CHUNK))
-        .enumerate()
-        .map(|(ci, (fc, bc))| {
-            let base = ci * CHUNK;
-            #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
-            {
-                return crate::field::f128_slice::fold_two_and_msg(f, b, base, fc, bc, r);
-            }
+    let n_chunks = half.div_ceil(CHUNK);
+    let mut partials: Vec<(F128, F128)> = vec![(F128::ZERO, F128::ZERO); n_chunks];
+    let nf_base = crate::epool::SyncPtr(nf.as_mut_ptr());
+    let nb_base = crate::epool::SyncPtr(nb.as_mut_ptr());
+    let partials_base = crate::epool::SyncPtr(partials.as_mut_ptr());
+    crate::epool::run_hetero_chunks(n_chunks, |ci| {
+        let base = ci * CHUNK;
+        let len = CHUNK.min(half - base);
+        // SAFETY: exclusive per-chunk ownership of the `[base, base+len)`
+        // output ranges and the per-`ci` partial slot; the queue hands out
+        // each index exactly once and its join publishes worker writes
+        // before the caller reads them.
+        let (fc, bc) = unsafe {
+            (
+                std::slice::from_raw_parts_mut(nf_base.ptr().add(base), len),
+                std::slice::from_raw_parts_mut(nb_base.ptr().add(base), len),
+            )
+        };
+        #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+        let part = crate::field::f128_slice::fold_two_and_msg(f, b, base, fc, bc, r);
 
-            #[cfg(not(all(target_arch = "aarch64", target_feature = "aes")))]
-            {
-                let len = fc.len();
-                let mut u0 = F128::ZERO;
-                let mut u2 = F128::ZERO;
-                // Fold this slice, then pair up the just-folded values for the msg.
-                crate::field::f128_slice::fold_pairs(f, base, fc, r);
-                crate::field::f128_slice::fold_pairs(b, base, bc, r);
-                let mut k = 0;
-                while k + 1 < len {
-                    let f0 = fc[k];
-                    let f1 = fc[k + 1];
-                    let b0 = bc[k];
-                    let b1 = bc[k + 1];
-                    u0 += f0 * b0;
-                    u2 += (f0 + f1) * (b0 + b1);
-                    k += 2;
-                }
-                (u0, u2)
+        #[cfg(not(all(target_arch = "aarch64", target_feature = "aes")))]
+        let part = {
+            let mut u0 = F128::ZERO;
+            let mut u2 = F128::ZERO;
+            // Fold this slice, then pair up the just-folded values for the msg.
+            crate::field::f128_slice::fold_pairs(f, base, fc, r);
+            crate::field::f128_slice::fold_pairs(b, base, bc, r);
+            let mut k = 0;
+            while k + 1 < len {
+                let f0 = fc[k];
+                let f1 = fc[k + 1];
+                let b0 = bc[k];
+                let b1 = bc[k + 1];
+                u0 += f0 * b0;
+                u2 += (f0 + f1) * (b0 + b1);
+                k += 2;
             }
-        })
-        .reduce(
-            || (F128::ZERO, F128::ZERO),
-            |(a0, a2), (c0, c2)| (a0 + c0, a2 + c2),
-        );
+            (u0, u2)
+        };
+        // SAFETY: exclusive owner of partials[ci] (see above).
+        unsafe {
+            *partials_base.ptr().add(ci) = part;
+        }
+    });
+    let (u_0, u_2) = partials
+        .iter()
+        .fold((F128::ZERO, F128::ZERO), |(a0, a2), &(c0, c2)| {
+            (a0 + c0, a2 + c2)
+        });
     SumcheckMessage { u_0, u_2 }
 }
 
@@ -3213,9 +3234,13 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
     let log_inv_rate_1 = config.log_inv_rates[1];
     let _t = std::time::Instant::now();
     let ntt_1 = AdditiveNttF128::standard(log_msg_cols_1 + log_inv_rate_1);
-    let f1 = sc_prover.f().to_vec();
+    // Borrow the folded evaluations directly: `ligero_commit` copies its
+    // input into its own scratch codeword (`replicate_message_fill`), so the
+    // previous `sc_prover.f().to_vec()` materialized a second 2^(n1) copy
+    // (8 MiB at the ranked shape) on the timed path only to drop it after
+    // the commit.
     let wtns_1 = ligero_commit(
-        &f1,
+        sc_prover.f(),
         log_msg_cols_1,
         log_num_interleaved_1,
         log_inv_rate_1,
@@ -3271,11 +3296,6 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
     if trace {
         t_opens += _t.elapsed();
     }
-    let initial_proof = RecursiveProof {
-        opened_rows: opened_rows_0.clone(),
-        merkle_proof: merkle_proof_0,
-    };
-
     // Induce basis_0 from wtns_0 opens. L0 dominates the induce phase, where the
     // sparse-prefix Fᵀ-NTT path wins; the dispatcher auto-selects it (deeper
     // levels stay dense).
@@ -3293,6 +3313,14 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
     if trace {
         t_induce += _t.elapsed();
     }
+
+    // Built after the induce so the opened rows move into the proof instead
+    // of being cloned (218 row Vecs at the ranked shape); the rows are dead
+    // to the prover past `induce_sumcheck_poly_auto`.
+    let initial_proof = RecursiveProof {
+        opened_rows: opened_rows_0,
+        merkle_proof: merkle_proof_0,
+    };
 
     // Introduce + glue basis_0.
     let _t = std::time::Instant::now();
@@ -3412,9 +3440,9 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
         let log_inv_rate_next = config.log_inv_rates[i + 2];
         let _t = std::time::Instant::now();
         let ntt_next = AdditiveNttF128::standard(log_msg_cols_next + log_inv_rate_next);
-        let f_evals = sc_prover.f().to_vec();
+        // Same borrow-instead-of-copy as the wtns_1 commit above.
         let wtns_next = ligero_commit(
-            &f_evals,
+            sc_prover.f(),
             log_msg_cols_next,
             log_num_interleaved_next,
             log_inv_rate_next,
@@ -3463,11 +3491,6 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
         if trace {
             t_opens += _t.elapsed();
         }
-        recursive_proofs.push(RecursiveProof {
-            opened_rows: opened_rows_i.clone(),
-            merkle_proof: merkle_proof_i,
-        });
-
         let sks_vks_i = eval_sk_at_vks(n_next);
         let _t = std::time::Instant::now();
         let (basis_i_induced, enforced_sum_i) =
@@ -3493,6 +3516,13 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
         if trace {
             t_induce += _t.elapsed();
         }
+
+        // Pushed after the induce so the opened rows move instead of being
+        // cloned; they are dead to the prover past the induce call.
+        recursive_proofs.push(RecursiveProof {
+            opened_rows: opened_rows_i,
+            merkle_proof: merkle_proof_i,
+        });
 
         let _t = std::time::Instant::now();
         let intro_msg_i = sc_prover.introduce_new(basis_i_induced, enforced_sum_i);

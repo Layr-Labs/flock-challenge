@@ -276,6 +276,22 @@ impl Rate2CodewordPtr {
     }
 }
 
+/// Raw base pointer shared across the two-pool witness queue. Same contract
+/// as [`Rate2CodewordPtr`]: every claim derives pairwise-disjoint ranges from
+/// its claim index, and the queue join publishes worker writes before the
+/// owning `Vec`s are read.
+#[derive(Clone, Copy)]
+struct RawMut<T>(*mut T);
+// SAFETY: only used under the disjoint-range contract above.
+unsafe impl<T> Send for RawMut<T> {}
+unsafe impl<T> Sync for RawMut<T> {}
+impl<T> RawMut<T> {
+    /// Avoid closure field-capture turning this back into a bare non-Send ptr.
+    fn get(self) -> *mut T {
+        self.0
+    }
+}
+
 /// Full-write row-major witness driver that also emits the exact rate-1/2
 /// pre-NTT codeword `[z, z]`. Each worker copies its completed `z` group into
 /// the two disjoint replica ranges while that group is still cache-resident.
@@ -370,12 +386,40 @@ where
     let mut b = flock_core::scratch::take_f128(total_f128);
     let mut z_lincheck = flock_core::scratch::take_u8((n_total / 8) * k);
 
-    z.par_chunks_mut(8 * f128_per_block)
-        .zip(a.par_chunks_mut(8 * f128_per_block))
-        .zip(b.par_chunks_mut(8 * f128_per_block))
-        .zip(z_lincheck.par_chunks_mut(k))
-        .enumerate()
-        .for_each(|(g, (((z_grp, a_grp), b_grp), stripe))| {
+    // Two-pool drain over fixed claim ranges (the shape promoted across the
+    // zerocheck compact rounds, the top-NTT passes, and Merkle hashing): a
+    // claim owns GROUPS_PER_CLAIM consecutive 8-block groups, i.e. disjoint
+    // ranges of z/a/b/stripe and of both codeword replicas, derived from the
+    // claim index alone. Trace building is tableless compute + streaming
+    // stores, so the otherwise-idle efficiency cluster contributes its own
+    // fabric bandwidth; the queue's engagement floor keeps tiny test shapes
+    // on the main pool, and the join bounds the tail at one claim on one
+    // efficiency core (~64 groups).
+    let group_elems = 8 * f128_per_block;
+    let n_groups = n_total / 8;
+    const GROUPS_PER_CLAIM: usize = 64;
+    let n_claims = n_groups.div_ceil(GROUPS_PER_CLAIM);
+    let z_base = RawMut(z.as_mut_ptr());
+    let a_base = RawMut(a.as_mut_ptr());
+    let b_base = RawMut(b.as_mut_ptr());
+    let stripe_base = RawMut(z_lincheck.as_mut_ptr());
+    flock_core::run_hetero_chunks(n_claims, |claim| {
+        let g_start = claim * GROUPS_PER_CLAIM;
+        let g_end = (g_start + GROUPS_PER_CLAIM).min(n_groups);
+        for g in g_start..g_end {
+            // SAFETY: group `g` belongs to exactly one claim; the derived
+            // z/a/b/stripe ranges are pairwise disjoint across groups and in
+            // bounds, so this claim holds the only `&mut` into them. The
+            // queue join publishes all writes before the caller reads the
+            // owning `Vec`s.
+            let (z_grp, a_grp, b_grp, stripe) = unsafe {
+                (
+                    std::slice::from_raw_parts_mut(z_base.get().add(g * group_elems), group_elems),
+                    std::slice::from_raw_parts_mut(a_base.get().add(g * group_elems), group_elems),
+                    std::slice::from_raw_parts_mut(b_base.get().add(g * group_elems), group_elems),
+                    std::slice::from_raw_parts_mut(stripe_base.get().add(g * k), k),
+                )
+            };
             // Ordinary per-block builders OR 1-bits into pre-zeroed words; any
             // slot left unbuilt (no padding block) stays zero, which the
             // lincheck transpose below reads correctly. Full-write builders
@@ -471,7 +515,8 @@ where
                     );
                 }
             }
-        });
+        }
+    });
 
     (z, a, b, z_lincheck)
 }

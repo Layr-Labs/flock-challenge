@@ -20,6 +20,9 @@
 pub mod bits;
 pub mod challenger;
 pub(crate) mod epool;
+/// Heterogeneous P/E chunk-queue drain, re-exported for the prover crate's
+/// witness driver (same contract as every in-crate call site — see `epool`).
+pub use epool::run_hetero_chunks;
 pub mod field;
 pub mod hash;
 pub mod lincheck;
