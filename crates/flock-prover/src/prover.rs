@@ -382,6 +382,31 @@ fn commit_with_round1_ab_precompute(
     let ntt_l = flock_core::ntt::AdditiveNttGf8::new(k_skip, F8(1u8 << k_skip));
     let inv_table = flock_core::ntt::InvNttTableByteSingleGf8::new(&ntt_s, &ntt_l);
 
+    // Ranked path: donate the AB claims into the commit's own layer-1
+    // heterogeneous tile queue, so the whole commit/AB window drains as one
+    // union claim space (see `precompute_round1_ab_inner_donating` for why
+    // two separate queues in this window are anti-additive). The `rayon::join`
+    // form below remains as the diagnostic control (`FLOCK_NO_AB_UNION=1`;
+    // add `FLOCK_NO_AB_EPOOL=1` to reproduce the pre-union frontier exactly).
+    if matches!(commit_codeword, CommitCodeword::Preinitialized(_))
+        && std::env::var_os("FLOCK_NO_AB_UNION").is_none()
+    {
+        return zerocheck::univariate_skip_optimized::precompute_round1_ab_inner_donating(
+            a_packed,
+            b_packed,
+            pcs_params.m,
+            k_skip,
+            &inv_table,
+            padding,
+            || match commit_codeword {
+                CommitCodeword::Preinitialized(buf) => {
+                    pcs::commit_preinitialized(z_packed, buf, pcs_params)
+                }
+                _ => unreachable!("gated on Preinitialized above"),
+            },
+        );
+    }
+
     rayon::join(
         || match commit_codeword {
             CommitCodeword::Allocate => pcs::commit(z_packed, pcs_params),

@@ -120,6 +120,64 @@ pub(crate) fn epool() -> Option<&'static rayon::ThreadPool> {
 /// Ligerito levels) drain faster than the cross-pool kickoff amortizes.
 const EPOOL_MIN_CHUNKS: usize = 16;
 
+/// Only a queue at least this large may absorb registered extra work — it
+/// must be one of the big ranked passes, not a small helper job.
+const EXTRA_WORK_MIN_HOST_CHUNKS: usize = 256;
+
+/// Scoped side-channel that lets one caller donate an extra claim set to the
+/// next large heterogeneous queue, so both are drained as ONE union by both
+/// pools (single broadcast, no serialization between coordinators).
+///
+/// Motivation, measured the expensive way: draining the layer-1 NTT tiles and
+/// the round-1 AB precompute through two *separate* queues in the same
+/// commit/AB window is officially anti-additive — each E worker must finish
+/// the first broadcast's whole queue before starting the second, and the
+/// second scope blocks joining its broadcast, chaining the AB branch behind
+/// the NTT drain. The union makes the window one claim space.
+struct ExtraWork {
+    n: usize,
+    /// Type-erased borrowed closure. SAFETY: only dereferenced while the
+    /// registering [`with_extra_work`] frame is live — the slot is cleared
+    /// before that frame returns, and any queue that takes the slot completes
+    /// every extra claim before returning, which happens inside that frame's
+    /// dynamic extent.
+    f: *const (dyn Fn(usize) + Sync),
+}
+unsafe impl Send for ExtraWork {}
+
+static EXTRA_WORK: std::sync::Mutex<Option<ExtraWork>> = std::sync::Mutex::new(None);
+
+/// Register `f_extra(0..n_extra)` as donor work for the duration of `body`.
+/// Returns `(body_result, consumed)`; when `consumed` is false no queue
+/// absorbed the work and the caller must run it itself.
+pub(crate) fn with_extra_work<R>(
+    n_extra: usize,
+    f_extra: &(dyn Fn(usize) + Sync),
+    body: impl FnOnce() -> R,
+) -> (R, bool) {
+    if n_extra == 0 {
+        return (body(), true);
+    }
+    // SAFETY: see `ExtraWork.f` — the transmute only widens the lifetime for
+    // storage; every dereference happens within `body`'s dynamic extent and
+    // the slot is cleared below before this frame returns.
+    let erased: *const (dyn Fn(usize) + Sync) = unsafe {
+        core::mem::transmute::<&(dyn Fn(usize) + Sync), &'static (dyn Fn(usize) + Sync)>(f_extra)
+    };
+    *EXTRA_WORK.lock().unwrap() = Some(ExtraWork { n: n_extra, f: erased });
+    let out = body();
+    let leftover = EXTRA_WORK.lock().unwrap().take();
+    (out, leftover.is_none())
+}
+
+/// Claim the registered extra work if this queue is large enough to host it.
+fn take_extra_work(n_chunks: usize) -> Option<ExtraWork> {
+    if n_chunks < EXTRA_WORK_MIN_HOST_CHUNKS {
+        return None;
+    }
+    EXTRA_WORK.lock().unwrap().take()
+}
+
 /// Process chunks `0..n_chunks` exactly once each, in parallel, drawing from
 /// a shared atomic queue drained by the main rayon pool plus (when present
 /// and the job is large enough) the efficiency-core helper pool.
@@ -132,7 +190,88 @@ pub(crate) fn run_hetero_chunks<F>(n_chunks: usize, f: F)
 where
     F: Fn(usize) + Sync,
 {
-    run_chunks_with_helper(n_chunks, &f, epool());
+    match take_extra_work(n_chunks) {
+        Some(extra) => {
+            // SAFETY: within the registering frame's extent (see ExtraWork).
+            let ef = unsafe { &*extra.f };
+            let total = n_chunks + extra.n;
+            // Proportional (Bresenham) interleave of host and donor claims.
+            // The two workloads use complementary resources (the ranked host
+            // pass streams DRAM; the donor AB claims are L1-lookup-bound), so
+            // mixing them preserves the concurrency the old `rayon::join`
+            // provided — strictly phased ranges would first saturate
+            // bandwidth with cores stalling, then saturate load ports with
+            // bandwidth idle.
+            let union = |i: usize| {
+                let e_before = i * extra.n / total;
+                if (i + 1) * extra.n / total > e_before {
+                    ef(e_before);
+                } else {
+                    f(i - e_before);
+                }
+            };
+            run_chunks_with_helper(total, &union, epool());
+        }
+        None => run_chunks_with_helper(n_chunks, &f, epool()),
+    }
+}
+
+/// Cooperative variant of [`run_hetero_chunks`] for jobs that run **inside an
+/// overlapped region** (e.g. one branch of the commit/AB `rayon::join`).
+///
+/// The plain queue's main-pool side spawns one greedy drain-loop per worker;
+/// a worker that picks one up holds it until the queue is empty. Standalone
+/// that is ideal, but under a `join` it starves the sibling branch and can
+/// serialize the overlap. Here the main-pool side instead submits **one rayon
+/// task per claim** (`with_max_len(1)`), so the scheduler interleaves these
+/// claims with the sibling branch's tasks exactly as it interleaves the
+/// current `par_chunks` — while the efficiency-core broadcast drains the same
+/// atomic queue greedily from the side. A main-pool task whose claim finds
+/// the queue already exhausted is a no-op.
+///
+/// Same output contract as [`run_hetero_chunks`]: each chunk index runs
+/// exactly once; `f(i)` must write only chunk `i`'s disjoint range. With a
+/// single-threaded main pool the queue runs inline in order and spawns
+/// nothing.
+pub(crate) fn run_hetero_chunks_cooperative<F>(n_chunks: usize, f: F)
+where
+    F: Fn(usize) + Sync,
+{
+    if n_chunks == 0 {
+        return;
+    }
+    if rayon::current_num_threads() <= 1 {
+        for i in 0..n_chunks {
+            f(i);
+        }
+        return;
+    }
+    let next = AtomicUsize::new(0);
+    let drain_main = || {
+        (0..n_chunks).into_par_iter().with_max_len(1).for_each(|_| {
+            let i = next.fetch_add(1, Ordering::Relaxed);
+            if i < n_chunks {
+                f(i);
+            }
+        });
+    };
+    match epool().filter(|_| n_chunks >= EPOOL_MIN_CHUNKS) {
+        Some(ep) => std::thread::scope(|s| {
+            s.spawn(|| {
+                ep.broadcast(|_| {
+                    loop {
+                        let i = next.fetch_add(1, Ordering::Relaxed);
+                        if i >= n_chunks {
+                            break;
+                        }
+                        f(i);
+                    }
+                })
+            });
+            drain_main();
+        }),
+        None => drain_main(),
+    }
 }
 
 /// Stateful sibling of [`run_hetero_chunks`]. Each queue-draining worker
