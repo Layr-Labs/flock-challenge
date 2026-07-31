@@ -261,10 +261,6 @@ pub(super) unsafe fn butterfly_fused_3layer_dual_from_src_row(
 
         let off = r * num_ntts;
         let step = eighth * num_ntts;
-        // The store flavor is process-constant. Resolve the diagnostic
-        // killswitch once per row group rather than re-reading the OnceLock
-        // for every destination pair in the burst loop below.
-        let use_nt_bursts = nt_bursts();
         for lane in 0..num_ntts {
             let src_base = src.add(off + lane);
             let loaded: [uint64x2_t; 8] =
@@ -345,7 +341,7 @@ pub(super) unsafe fn butterfly_fused_3layer_dual_from_src_row(
             while lane < num_ntts {
                 let x = vld1q_u64(s0.add(lane).cast::<u64>());
                 let y = vld1q_u64(s0.add(lane + 1).cast::<u64>());
-                if use_nt_bursts {
+                if nt_bursts() {
                     store_pair_nt(d0.add(lane), x, y);
                 } else {
                     vst1q_u64(d0.add(lane).cast::<u64>(), x);
@@ -353,7 +349,7 @@ pub(super) unsafe fn butterfly_fused_3layer_dual_from_src_row(
                 }
                 let x = vld1q_u64(s1.add(lane).cast::<u64>());
                 let y = vld1q_u64(s1.add(lane + 1).cast::<u64>());
-                if use_nt_bursts {
+                if nt_bursts() {
                     store_pair_nt(d1.add(lane), x, y);
                 } else {
                     vst1q_u64(d1.add(lane).cast::<u64>(), x);
