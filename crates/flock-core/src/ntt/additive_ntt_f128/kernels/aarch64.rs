@@ -262,6 +262,104 @@ pub(super) unsafe fn butterfly_fused_3layer_zero_root_row(
     }
 }
 
+/// Vector-resident twin of `portable::butterfly_fused_3layer_pass1_from_message_row`.
+///
+/// Loads the eight source rows once from `msg`, runs the zero-root network
+/// into `out0` (block 0 — all eight rows stored, since the destination is
+/// uninitialized) and the generic network into `out1` (block 1). One source
+/// read serves both rate-1/2 codeword halves.
+///
+/// # Safety
+/// As [`butterfly_fused_3layer_row`] for all three buffers, and the caller
+/// guarantees `tw0[0] == tw0[1] == tw0[3] == 0`.
+#[target_feature(enable = "aes")]
+pub(super) unsafe fn butterfly_fused_3layer_pass1_from_message_row(
+    msg: *const F128,
+    out0: *mut F128,
+    out1: *mut F128,
+    eighth: usize,
+    num_ntts: usize,
+    r: usize,
+    tw0: &[F128; 7],
+    tw1: &[F128; 7],
+) {
+    use core::arch::aarch64::*;
+    unsafe {
+        debug_assert_eq!(tw0[0], F128::ZERO);
+        debug_assert_eq!(tw0[1], F128::ZERO);
+        debug_assert_eq!(tw0[3], F128::ZERO);
+
+        let z_t2 = vld1q_u64((&raw const tw0[2]).cast::<u64>());
+        let z_t4 = vld1q_u64((&raw const tw0[4]).cast::<u64>());
+        let z_t5 = vld1q_u64((&raw const tw0[5]).cast::<u64>());
+        let z_t6 = vld1q_u64((&raw const tw0[6]).cast::<u64>());
+        let g_t: [uint64x2_t; 7] =
+            core::array::from_fn(|i| vld1q_u64((&raw const tw1[i]).cast::<u64>()));
+
+        for lane in 0..num_ntts {
+            let off = r * num_ntts + lane;
+            let step = eighth * num_ntts;
+
+            let src: [uint64x2_t; 8] =
+                core::array::from_fn(|i| vld1q_u64(msg.add(off + i * step).cast::<u64>()));
+
+            // Block 0: zero-root network (t0 = t1 = t3 = 0).
+            let mut v = src;
+            for i in 0..4 {
+                v[i + 4] = butterfly_zero_q(v[i], v[i + 4]);
+            }
+            for i in 0..2 {
+                v[i + 2] = butterfly_zero_q(v[i], v[i + 2]);
+            }
+            let (a, b) = butterfly_q(v[4], v[6], z_t2);
+            v[4] = a;
+            v[6] = b;
+            let (a, b) = butterfly_q(v[5], v[7], z_t2);
+            v[5] = a;
+            v[7] = b;
+            v[1] = butterfly_zero_q(v[0], v[1]);
+            let (a, b) = butterfly_q(v[2], v[3], z_t4);
+            v[2] = a;
+            v[3] = b;
+            let (a, b) = butterfly_q(v[4], v[5], z_t5);
+            v[4] = a;
+            v[5] = b;
+            let (a, b) = butterfly_q(v[6], v[7], z_t6);
+            v[6] = a;
+            v[7] = b;
+            let out0_base = out0.add(off);
+            for (i, value) in v.iter().enumerate() {
+                vst1q_u64(out0_base.add(i * step).cast::<u64>(), *value);
+            }
+
+            // Block 1: generic network on the same source values.
+            let mut v = src;
+            for i in 0..4 {
+                let (a, b) = butterfly_q(v[i], v[i + 4], g_t[0]);
+                v[i] = a;
+                v[i + 4] = b;
+            }
+            for s in 0..2 {
+                for i in 0..2 {
+                    let (u, w) = (4 * s + i, 4 * s + i + 2);
+                    let (a, b) = butterfly_q(v[u], v[w], g_t[1 + s]);
+                    v[u] = a;
+                    v[w] = b;
+                }
+            }
+            for s in 0..4 {
+                let (a, b) = butterfly_q(v[2 * s], v[2 * s + 1], g_t[3 + s]);
+                v[2 * s] = a;
+                v[2 * s + 1] = b;
+            }
+            let out1_base = out1.add(off);
+            for (i, value) in v.iter().enumerate() {
+                vst1q_u64(out1_base.add(i * step).cast::<u64>(), *value);
+            }
+        }
+    }
+}
+
 /// Fused two-layer butterfly specialized for three low-limb-only twiddles.
 /// Two products are issued together at each stage, using four PMULLs instead
 /// of twelve for the pair under the generic Binius field multiplier.
