@@ -50,7 +50,8 @@ mod kernels;
 use kernels::aarch64::fold_one_row_neon_unchecked_8;
 #[cfg(target_arch = "aarch64")]
 use kernels::aarch64::{
-    fold_and_message_aarch64, fold_compact_chunk_neon_unchecked_8,
+    fold_and_message_aarch64, fold_compact_chunk_neon_unchecked_16,
+    fold_compact_chunk_neon_unchecked_8,
     fold_round2_chunk_neon_unchecked_8, fold_round2_compact_chunk_neon_unchecked_8,
 };
 #[cfg(all(
@@ -427,6 +428,42 @@ impl UniSkipFoldTable {
         }
         scaled
     }
+
+    /// Pair adjacent byte banks of a challenge-scaled table into four
+    /// 16-bit-indexed banks.  For a little-endian packed word `w`, bank `j`
+    /// stores exactly
+    ///
+    /// `scaled[2j][w & 0xff] + scaled[2j + 1][w >> 8]`.
+    ///
+    /// The compact first-tail kernel consumes four packed rows at once.  At
+    /// the ranked geometry this changes each row reconstruction from eight
+    /// byte-table loads to four pair-table loads.  The 4 MiB table is too
+    /// large for L1 but fits comfortably in the M3 performance-cluster L2;
+    /// keep it strictly on the large production shape so smaller proof tests
+    /// do not pay its construction cost.
+    #[cfg(any(target_arch = "aarch64", test))]
+    fn scaled_pair16_from_scaled(&self, scaled: &[F128]) -> Vec<F128> {
+        const BANKS: usize = 4;
+        const ENTRIES: usize = 1 << 16;
+
+        assert_eq!(self.n_chunks, BANKS * 2);
+        assert_eq!(scaled.len(), self.n_chunks * 256);
+
+        let mut paired = crate::scratch::take_f128(BANKS * ENTRIES);
+        for bank in 0..BANKS {
+            let low = &scaled[(2 * bank) * 256..(2 * bank + 1) * 256];
+            let high = &scaled[(2 * bank + 1) * 256..(2 * bank + 2) * 256];
+            let out = &mut paired[bank * ENTRIES..(bank + 1) * ENTRIES];
+            for high_byte in 0..256 {
+                let high_term = high[high_byte];
+                let row = &mut out[high_byte << 8..(high_byte + 1) << 8];
+                for low_byte in 0..256 {
+                    row[low_byte] = low[low_byte] + high_term;
+                }
+            }
+        }
+        paired
+    }
 }
 
 /// Local split for compact production/reconstruction; intentionally
@@ -442,6 +479,17 @@ impl UniSkipFoldTable {
 /// local constant makes 10/11/12 straightforward to screen without changing
 /// the schedule-tuned global split.
 const COMPACT_RECONSTRUCTION_N_HI: usize = 11;
+
+/// The ranked BLAKE3 proof has `compact.len() == 2^25`.  Below this threshold
+/// the 4 MiB pair table's setup is a worse trade than removing four lookups
+/// from a short reconstruction, so retain the incumbent 32 KiB byte table.
+#[cfg(all(target_arch = "aarch64", not(test)))]
+const COMPACT_PAIR16_MIN_ROWS: usize = 1 << 20;
+
+// The compact oracle below is intentionally small.  Exercise the AArch64
+// pair-table kernel there too, while keeping the production threshold above.
+#[cfg(all(target_arch = "aarch64", test))]
+const COMPACT_PAIR16_MIN_ROWS: usize = 1;
 
 /// Compact materialization of the first multilinear level.
 ///
@@ -674,6 +722,13 @@ pub fn fold_compact_and_compute_round_pair(
     // Compose the sampled challenge into the resident 32 KiB byte table once.
     // Linearity makes each later row reconstruction lookup/XOR-only.
     let scaled_table = table.scaled_linear(r_fold);
+    // On the ranked shape, pair adjacent byte banks into a 4 MiB table.  This
+    // is an exact linear regrouping: the lookup value for every packed row is
+    // unchanged, but the AArch64 hot kernel issues four 16-bit-indexed loads
+    // instead of eight byte-indexed loads per row.
+    #[cfg(target_arch = "aarch64")]
+    let scaled_pair16_table = (n >= COMPACT_PAIR16_MIN_ROWS)
+        .then(|| table.scaled_pair16_from_scaled(&scaled_table));
 
     let eq = SplitEqGhash::with_n_hi(&r_next[1..], COMPACT_RECONSTRUCTION_N_HI);
     let lo_size = 1usize << eq.n_lo;
@@ -703,15 +758,27 @@ pub fn fold_compact_and_compute_round_pair(
 
             #[cfg(target_arch = "aarch64")]
             let (p1, pinf) = unsafe {
-                fold_compact_chunk_neon_unchecked_8(
-                    scaled_table.as_ptr().cast::<u8>(),
-                    compact.anchors.as_ptr().add(2 * base),
-                    compact.deltas.as_ptr().add(2 * base * table.n_chunks),
-                    a_out.as_mut_ptr(),
-                    b_out.as_mut_ptr(),
-                    eq_lo.as_ptr(),
-                    lo_size,
-                )
+                if let Some(pair16) = scaled_pair16_table.as_ref() {
+                    fold_compact_chunk_neon_unchecked_16(
+                        pair16.as_ptr().cast::<u8>(),
+                        compact.anchors.as_ptr().add(2 * base),
+                        compact.deltas.as_ptr().add(2 * base * table.n_chunks),
+                        a_out.as_mut_ptr(),
+                        b_out.as_mut_ptr(),
+                        eq_lo.as_ptr(),
+                        lo_size,
+                    )
+                } else {
+                    fold_compact_chunk_neon_unchecked_8(
+                        scaled_table.as_ptr().cast::<u8>(),
+                        compact.anchors.as_ptr().add(2 * base),
+                        compact.deltas.as_ptr().add(2 * base * table.n_chunks),
+                        a_out.as_mut_ptr(),
+                        b_out.as_mut_ptr(),
+                        eq_lo.as_ptr(),
+                        lo_size,
+                    )
+                }
             };
 
             #[cfg(not(target_arch = "aarch64"))]
@@ -756,6 +823,14 @@ pub fn fold_compact_and_compute_round_pair(
         .fold((F128::ZERO, F128::ZERO), |(s1, sinf), &(c1, cinf)| {
             (s1 + c1, sinf + cinf)
         });
+
+    // The paired table is a transient, fully initialized F128 allocation.
+    // Returning it lets the untimed warm proof supply its resident pages to
+    // every measured proof in the same worker process.
+    #[cfg(target_arch = "aarch64")]
+    if let Some(pair16) = scaled_pair16_table {
+        crate::scratch::give_f128(pair16);
+    }
 
     (a_out, b_out, r_next[0] * sum1, sum_inf)
 }
@@ -1935,6 +2010,42 @@ mod tests {
             crate::scratch::give_f128(legacy_a);
             crate::scratch::give_f128(legacy_b);
             crate::scratch::clear();
+        }
+    }
+
+    /// The ranked-only paired table is a pure regrouping of the incumbent
+    /// eight byte banks.  Check every one of the 65,536 little-endian indices
+    /// in every bank for both a degenerate and a nontrivial fold challenge.
+    /// This is deliberately independent of the AArch64 kernel so the table
+    /// identity is covered on every development architecture.
+    #[test]
+    fn compact_pair16_table_matches_byte_table_exhaustively() {
+        let table = UniSkipFoldTable::new(
+            6,
+            F128 {
+                lo: 0x2fd5_6b3a_41ce_9087,
+                hi: 0x9a7c_e218_0b64_5df1,
+            },
+        );
+        for rho in [
+            F128::ZERO,
+            F128 {
+                lo: 0x6b54_3e12_a9cd_780f,
+                hi: 0x1d28_f063_b7e4_95ca,
+            },
+        ] {
+            let scaled = table.scaled_linear(rho);
+            let paired = table.scaled_pair16_from_scaled(&scaled);
+            for bank in 0..4 {
+                let low = &scaled[(2 * bank) * 256..(2 * bank + 1) * 256];
+                let high = &scaled[(2 * bank + 1) * 256..(2 * bank + 2) * 256];
+                let wide = &paired[bank * (1 << 16)..(bank + 1) * (1 << 16)];
+                for index in 0..(1 << 16) {
+                    let expected = low[index & 0xff] + high[index >> 8];
+                    assert_eq!(wide[index], expected, "bank={bank}, index={index:#06x}");
+                }
+            }
+            crate::scratch::give_f128(paired);
         }
     }
 
