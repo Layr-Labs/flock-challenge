@@ -3470,14 +3470,26 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
 
         let sks_vks_i = eval_sk_at_vks(n_next);
         let _t = std::time::Instant::now();
-        let (basis_i_induced, enforced_sum_i) = induce_sumcheck_poly(
-            n_next,
-            &sks_vks_i,
-            &opened_rows_i,
-            &level_rs,
-            &queries_i,
-            &alpha_i,
-        );
+        let (basis_i_induced, enforced_sum_i) =
+            if n_next == 16 && config.log_inv_rates[i + 1] == 2 && queries_i.len() == 106 {
+                induce_sumcheck_poly_via_ntt(
+                    n_next,
+                    config.log_inv_rates[i + 1],
+                    &opened_rows_i,
+                    &level_rs,
+                    &queries_i,
+                    &alpha_i,
+                )
+            } else {
+                induce_sumcheck_poly(
+                    n_next,
+                    &sks_vks_i,
+                    &opened_rows_i,
+                    &level_rs,
+                    &queries_i,
+                    &alpha_i,
+                )
+            };
         if trace {
             t_induce += _t.elapsed();
         }
