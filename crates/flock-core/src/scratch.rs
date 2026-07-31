@@ -107,11 +107,17 @@ pub fn give_f128(v: Vec<F128>) {
 /// work: a race between fault cost and the hiding window flips sign across
 /// machines; eliminated work doesn't.)
 ///
-/// The set (sizes in F128s): 2^(m-6)-class — L0 codeword, zerocheck round-2
-/// a/b, open-stage codeword ping-pong ×2 → 5 buffers; 2^(m-7)-class — witness
-/// z/a/b, zerocheck tail ping-pong ×2, open-stage transients, rs_eq_ind ×2,
-/// b_combined → 11 buffers. ~1.1 GB resident at m = 29; release with
-/// [`clear`].
+/// The parked set was re-derived for the ranked m = 32 shape by measuring
+/// actual pool misses with prewarm disabled: the prove's high-water is 2
+/// buffers of the 2^(m-6) class (the L0 codeword and one zerocheck round-2
+/// output; the second round-2 buffer reuses the first's pool slot) and 5 of
+/// the 2^(m-7) class (witness z/a/b, tail ping-pong, open transients). Park
+/// 3 + 6 for margin. The old counts (5 + 11) were derived for m = 29 and
+/// parked ~10.5 GiB at m = 32 — more than double the prove's working set,
+/// pure extra resident pressure on the 36 GB ranked runner; ~6 GiB here.
+/// The pool self-heals regardless: any buffer the prove needs beyond the
+/// parked set is allocated once (during the worker's untimed warm-up proof)
+/// and recycled thereafter. Release with [`clear`].
 pub fn prewarm_prover(m: usize) {
     use rayon::prelude::*;
     if m < 7 {
@@ -120,10 +126,10 @@ pub fn prewarm_prover(m: usize) {
     let small = 1usize << (m - 7);
     let large = 1usize << (m - 6);
     let mut bufs: Vec<Vec<F128>> = Vec::new();
-    for _ in 0..5 {
+    for _ in 0..3 {
         bufs.push(take_f128(large));
     }
-    for _ in 0..11 {
+    for _ in 0..6 {
         bufs.push(take_f128(small));
     }
     // First-touch every page of every buffer, all cores. Already-resident
