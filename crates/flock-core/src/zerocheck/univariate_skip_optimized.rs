@@ -282,10 +282,24 @@ pub struct Round1AbInner {
 
 impl Round1AbInner {
     #[inline]
-    fn as_bytes(&self) -> &[u8] {
+    pub fn as_bytes(&self) -> &[u8] {
         unsafe {
             core::slice::from_raw_parts(
                 self.storage.as_ptr() as *const u8,
+                self.storage.len() * core::mem::size_of::<F128>(),
+            )
+        }
+    }
+
+    /// Mutable byte view used by witness producers that initialize disjoint
+    /// ranges in parallel. Every byte must be written before the transform is
+    /// consumed; [`Round1AbInnerRangeFiller::fill_range`] provides that
+    /// full-write contract.
+    #[inline]
+    pub fn as_bytes_mut(&mut self) -> &mut [u8] {
+        unsafe {
+            core::slice::from_raw_parts_mut(
+                self.storage.as_mut_ptr() as *mut u8,
                 self.storage.len() * core::mem::size_of::<F128>(),
             )
         }
@@ -306,6 +320,122 @@ impl Round1AbInner {
 impl Drop for Round1AbInner {
     fn drop(&mut self) {
         crate::scratch::give_f128(core::mem::take(&mut self.storage));
+    }
+}
+
+/// One challenge-independent AB output chunk: 16 medium positions × 64 bytes.
+pub const ROUND1_AB_OUTER_BYTES: usize = (1 << N_MEDIUM) * 64;
+
+/// Allocate the resident challenge-independent AB transform without touching
+/// its recycled contents. A witness producer must fully initialize it with
+/// [`Round1AbInnerRangeFiller`] before it is consumed.
+pub fn allocate_round1_ab_inner_packed(m: usize, k_skip: usize) -> Round1AbInner {
+    assert_eq!(k_skip, K_SKIP, "optimized variant is k_skip=6 only");
+    assert!(
+        m >= k_skip + N_INNER,
+        "m must be ≥ k_skip + N_INNER ({}) for the shift_reduce optimization",
+        k_skip + N_INNER
+    );
+    let total_bytes = (1usize << m) / 8;
+    assert_eq!(total_bytes % core::mem::size_of::<F128>(), 0);
+    Round1AbInner {
+        storage: crate::scratch::take_f128(total_bytes / core::mem::size_of::<F128>()),
+    }
+}
+
+/// Reusable, transcript-independent range filler for [`Round1AbInner`].
+///
+/// Construction depends only on the fixed inverse table, `k_skip = 6`, and
+/// the public padding shape. `fill_range` then reads corresponding A/B byte
+/// ranges and fully writes their AB-inner output range. This split lets a
+/// witness driver run the transform immediately after each disjoint A/B group
+/// is produced, while those source lines are still cache-resident.
+pub struct Round1AbInnerRangeFiller<'a> {
+    inv_table: &'a InvNttTableByteSingleGf8,
+    within_outer_mask: usize,
+    b_med_counts: Vec<u8>,
+}
+
+impl<'a> Round1AbInnerRangeFiller<'a> {
+    pub fn new(
+        k_skip: usize,
+        inv_table: &'a InvNttTableByteSingleGf8,
+        padding: &PaddingSpec,
+    ) -> Self {
+        assert_eq!(k_skip, K_SKIP, "optimized variant is k_skip=6 only");
+        assert_eq!(inv_table.k, k_skip);
+        let (within_outer_mask, b_med_counts) = build_b_med_counts(padding);
+        Self {
+            inv_table,
+            within_outer_mask,
+            b_med_counts,
+        }
+    }
+
+    /// Fill consecutive outer chunks beginning at global `x_outer_start`.
+    ///
+    /// `a_range`, `b_range`, and `out_range` must be corresponding,
+    /// `ROUND1_AB_OUTER_BYTES`-aligned ranges. Padding holes are explicitly
+    /// zeroed, so recycled output storage is fully initialized.
+    pub fn fill_range(
+        &self,
+        x_outer_start: usize,
+        a_range: &[u8],
+        b_range: &[u8],
+        out_range: &mut [u8],
+    ) {
+        let mut a_col = [F8::ZERO; ELL];
+        let mut b_col = [F8::ZERO; ELL];
+        self.fill_range_with_scratch(
+            x_outer_start,
+            a_range,
+            b_range,
+            out_range,
+            &mut a_col,
+            &mut b_col,
+        );
+    }
+
+    fn fill_range_with_scratch(
+        &self,
+        x_outer_start: usize,
+        a_range: &[u8],
+        b_range: &[u8],
+        out_range: &mut [u8],
+        a_col: &mut [F8; ELL],
+        b_col: &mut [F8; ELL],
+    ) {
+        assert_eq!(a_range.len(), b_range.len());
+        assert_eq!(a_range.len(), out_range.len());
+        assert_eq!(a_range.len() % ROUND1_AB_OUTER_BYTES, 0);
+
+        for (outer_in_range, ((a_outer, b_outer), out_outer)) in a_range
+            .chunks_exact(ROUND1_AB_OUTER_BYTES)
+            .zip(b_range.chunks_exact(ROUND1_AB_OUTER_BYTES))
+            .zip(out_range.chunks_exact_mut(ROUND1_AB_OUTER_BYTES))
+            .enumerate()
+        {
+            let x_outer = x_outer_start + outer_in_range;
+            let within_hash_outer = x_outer & self.within_outer_mask;
+            let n_b_med = self.b_med_counts[within_hash_outer] as usize;
+
+            for b_med in 0..n_b_med {
+                let dst: &mut [u8; 64] = (&mut out_outer[b_med * 64..(b_med + 1) * 64])
+                    .try_into()
+                    .expect("one transformed b_med block");
+                shift_reduce_inner_ab(
+                    a_outer,
+                    b_outer,
+                    self.inv_table,
+                    0,
+                    b_med,
+                    dst,
+                    a_col,
+                    b_col,
+                );
+            }
+            out_outer[n_b_med * 64..].fill(0);
+        }
     }
 }
 
@@ -335,47 +465,29 @@ pub fn precompute_round1_ab_inner_packed_padded(
     assert_eq!(inv_table.k, k_skip);
     assert_eq!(total_bytes % core::mem::size_of::<F128>(), 0);
 
-    let (within_outer_mask, b_med_counts) = build_b_med_counts(padding);
-    const OUTER_BYTES: usize = (1 << N_MEDIUM) * 64;
-    debug_assert_eq!(OUTER_BYTES, (1 << N_INNER) * N_CHUNKS);
+    debug_assert_eq!(
+        ROUND1_AB_OUTER_BYTES,
+        (1 << N_INNER) * N_CHUNKS
+    );
+    let filler = Round1AbInnerRangeFiller::new(k_skip, inv_table, padding);
+    let mut ab_inner = allocate_round1_ab_inner_packed(m, k_skip);
 
-    // Reuse an A-sized resident F128 allocation from the prover scratch pool.
-    // Treating it as bytes is valid because every byte is written below before
-    // the storage is read (including explicit zero writes for padding holes).
-    let mut storage = crate::scratch::take_f128(total_bytes / core::mem::size_of::<F128>());
-    let out_bytes: &mut [u8] =
-        unsafe { core::slice::from_raw_parts_mut(storage.as_mut_ptr() as *mut u8, total_bytes) };
-
-    out_bytes
-        .par_chunks_mut(OUTER_BYTES)
+    ab_inner
+        .as_bytes_mut()
+        .par_chunks_mut(ROUND1_AB_OUTER_BYTES)
+        .zip(a_packed.par_chunks(ROUND1_AB_OUTER_BYTES))
+        .zip(b_packed.par_chunks(ROUND1_AB_OUTER_BYTES))
         .enumerate()
         .for_each_init(
             || ([F8::ZERO; ELL], [F8::ZERO; ELL]),
-            |(a_col, b_col), (x_outer, out_outer)| {
-                let within_hash_outer = x_outer & within_outer_mask;
-                let n_b_med = b_med_counts[within_hash_outer] as usize;
-                let chunk_byte_base = x_outer * OUTER_BYTES;
-
-                for b_med in 0..n_b_med {
-                    let dst: &mut [u8; 64] = (&mut out_outer[b_med * 64..(b_med + 1) * 64])
-                        .try_into()
-                        .expect("one transformed b_med block");
-                    shift_reduce_inner_ab(
-                        a_packed,
-                        b_packed,
-                        inv_table,
-                        chunk_byte_base,
-                        b_med,
-                        dst,
-                        a_col,
-                        b_col,
-                    );
-                }
-                out_outer[n_b_med * 64..].fill(0);
+            |(a_col, b_col), (x_outer, ((out_outer, a_outer), b_outer))| {
+                filler.fill_range_with_scratch(
+                    x_outer, a_outer, b_outer, out_outer, a_col, b_col,
+                );
             },
         );
 
-    Round1AbInner { storage }
+    ab_inner
 }
 
 // ---------------------------------------------------------------------------

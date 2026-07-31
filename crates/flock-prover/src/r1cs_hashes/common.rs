@@ -224,14 +224,16 @@ pub(crate) fn drive_witness_packed_and_lincheck<S: Sync, F>(
 where
     F: Fn(&S, &mut [u64], &mut [u64], &mut [u64]) + Sync,
 {
-    drive_witness_packed_and_lincheck_impl::<false, false, S, F>(
+    drive_witness_packed_and_lincheck_impl::<false, false, false, S, F, _>(
         initial_states,
         padding,
         n_blocks_log,
         k_log,
         1usize << k_log,
         None,
+        None,
         per_block,
+        |_, _, _, _| {},
     )
 }
 
@@ -251,14 +253,16 @@ pub(crate) fn drive_witness_packed_and_lincheck_full_write<S: Sync, F>(
 where
     F: Fn(&S, &mut [u64], &mut [u64], &mut [u64]) + Sync,
 {
-    drive_witness_packed_and_lincheck_impl::<true, false, S, F>(
+    drive_witness_packed_and_lincheck_impl::<true, false, false, S, F, _>(
         initial_states,
         Some(padding),
         n_blocks_log,
         k_log,
         useful_bits,
         None,
+        None,
         per_block,
+        |_, _, _, _| {},
     )
 }
 
@@ -272,6 +276,18 @@ unsafe impl Sync for Rate2CodewordPtr {}
 impl Rate2CodewordPtr {
     /// Avoid closure field-capture turning this back into a bare non-Send ptr.
     fn get(self) -> *mut F128 {
+        self.0
+    }
+}
+
+#[derive(Clone, Copy)]
+struct GroupOutputPtr(*mut u8);
+// SAFETY: the indexed group writer below gives each parallel group exactly
+// one disjoint output range and joins before the mutable borrow can be reused.
+unsafe impl Send for GroupOutputPtr {}
+unsafe impl Sync for GroupOutputPtr {}
+impl GroupOutputPtr {
+    fn get(self) -> *mut u8 {
         self.0
     }
 }
@@ -295,22 +311,68 @@ pub(crate) fn drive_witness_packed_and_lincheck_full_write_with_rate2_codeword<S
 where
     F: Fn(&S, &mut [u64], &mut [u64], &mut [u64]) + Sync,
 {
-    drive_witness_packed_and_lincheck_impl::<true, true, S, F>(
+    drive_witness_packed_and_lincheck_impl::<true, true, false, S, F, _>(
         initial_states,
         Some(padding),
         n_blocks_log,
         k_log,
         useful_bits,
         Some(codeword),
+        None,
         per_block,
+        |_, _, _, _| {},
+    )
+}
+
+/// Ranked sibling of
+/// [`drive_witness_packed_and_lincheck_full_write_with_rate2_codeword`] with
+/// one additional full-write output range per eight-block group.
+///
+/// `per_group(g, a_group, b_group, output_group)` runs immediately after all
+/// eight A/B blocks are produced and before the z-only transpose/codeword
+/// work. `group_output` must contain exactly one `group_output_bytes` range
+/// per group; those ranges are disjoint even though groups run in parallel.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn drive_witness_packed_and_lincheck_full_write_with_rate2_codeword_and_group_output<
+    S: Sync,
+    F,
+    G,
+>(
+    initial_states: &[S],
+    padding: &S,
+    n_blocks_log: usize,
+    k_log: usize,
+    useful_bits: usize,
+    codeword: &mut [F128],
+    group_output: &mut [u8],
+    group_output_bytes: usize,
+    per_block: F,
+    per_group: G,
+) -> (Vec<F128>, Vec<F128>, Vec<F128>, Vec<u8>)
+where
+    F: Fn(&S, &mut [u64], &mut [u64], &mut [u64]) + Sync,
+    G: Fn(usize, &[F128], &[F128], &mut [u8]) + Sync,
+{
+    drive_witness_packed_and_lincheck_impl::<true, true, true, S, F, G>(
+        initial_states,
+        Some(padding),
+        n_blocks_log,
+        k_log,
+        useful_bits,
+        Some(codeword),
+        Some((group_output, group_output_bytes)),
+        per_block,
+        per_group,
     )
 }
 
 fn drive_witness_packed_and_lincheck_impl<
     const PER_BLOCK_FULLY_WRITES: bool,
     const EMIT_RATE2_CODEWORD: bool,
+    const EMIT_GROUP_OUTPUT: bool,
     S: Sync,
     F,
+    G,
 >(
     initial_states: &[S],
     padding: Option<&S>,
@@ -318,10 +380,13 @@ fn drive_witness_packed_and_lincheck_impl<
     k_log: usize,
     stripe_useful_bits: usize,
     rate2_codeword: Option<&mut [F128]>,
+    group_output: Option<(&mut [u8], usize)>,
     per_block: F,
+    per_group: G,
 ) -> (Vec<F128>, Vec<F128>, Vec<F128>, Vec<u8>)
 where
     F: Fn(&S, &mut [u64], &mut [u64], &mut [u64]) + Sync,
+    G: Fn(usize, &[F128], &[F128], &mut [u8]) + Sync,
 {
     use rayon::prelude::*;
 
@@ -357,6 +422,21 @@ where
             "rate-1/2 codeword must contain exactly two packed-witness replicas"
         );
         Rate2CodewordPtr(codeword.as_mut_ptr())
+    });
+    assert_eq!(
+        group_output.is_some(),
+        EMIT_GROUP_OUTPUT,
+        "group-output presence must match the driver specialization"
+    );
+    let n_groups = n_total / 8;
+    let group_output = group_output.map(|(output, bytes_per_group)| {
+        assert!(bytes_per_group > 0, "group output ranges must be non-empty");
+        assert_eq!(
+            output.len(),
+            n_groups * bytes_per_group,
+            "group output must contain one exact range per eight-block group"
+        );
+        (GroupOutputPtr(output.as_mut_ptr()), bytes_per_group)
     });
     // z/a/b are allocated uninitialized. Ordinary OR-based builders zero each
     // 8-block group inside the parallel loop; full-write builders initialize
@@ -425,6 +505,23 @@ where
                     )
                 };
                 per_block(init, z_u64, a_u64, b_u64);
+            }
+
+            if EMIT_GROUP_OUTPUT {
+                let (output, bytes_per_group) =
+                    group_output.expect("group-output specialization requires output storage");
+                // SAFETY: group g owns exactly
+                // `[g*bytes_per_group, (g+1)*bytes_per_group)`. Parallel
+                // groups have distinct g values, the asserted total length
+                // covers every range, and the iterator joins before the
+                // caller can use the original mutable output borrow again.
+                let output_group = unsafe {
+                    std::slice::from_raw_parts_mut(
+                        output.get().add(g * bytes_per_group),
+                        bytes_per_group,
+                    )
+                };
+                per_group(g, a_grp, b_grp, output_group);
             }
 
             // Bit-transpose 8 z chunks into the lincheck stripe.

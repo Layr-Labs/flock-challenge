@@ -2032,6 +2032,7 @@ pub(crate) fn induce_sumcheck_poly(
 /// Forward butterfly is `M=[[1,t],[1,t+1]]`; transpose `Mᵀ=[[1,1],[t,t+1]]` is
 /// `s=a+b; top=s; bot=t·s+b`, applied in **reverse** layer order. (Baseline:
 /// one parallel sweep per layer.)
+#[cfg_attr(not(test), allow(dead_code))]
 fn transpose_forward_ntt(ntt: &AdditiveNttF128, data: &mut [F128], log_d: usize) {
     use rayon::prelude::*;
     debug_assert_eq!(data.len(), 1usize << log_d);
@@ -2110,7 +2111,7 @@ pub(crate) fn induce_sumcheck_poly_via_ntt(
         enforced_sum += dot * alpha_pows[i];
     }
 
-    let mut coeffs = if log_block == 0 {
+    let coeffs = if log_block == 0 {
         let mut c = vec![F128::ZERO; block_len];
         for i in 0..n_queries {
             c[queries[i]] += alpha_pows[i];
@@ -2118,9 +2119,15 @@ pub(crate) fn induce_sumcheck_poly_via_ntt(
         c
     } else {
         let ntt = AdditiveNttF128::standard(log_block);
-        transpose_forward_ntt_sparse(&ntt, queries, &alpha_pows, log_block)
+        transpose_forward_ntt_sparse_prefix(
+            &ntt,
+            queries,
+            &alpha_pows,
+            log_block,
+            log_msg_cols,
+        )
     };
-    coeffs.truncate(n);
+    debug_assert_eq!(coeffs.len(), n);
     (coeffs, enforced_sum)
 }
 
@@ -2179,76 +2186,105 @@ pub(crate) fn induce_sumcheck_poly_auto(
 /// contain a nonzero (a dense `2^k` transpose each), densify, then run the
 /// remaining steps as full dense sweeps. Output is identical to
 /// `transpose_forward_ntt` applied to the scattered input.
+#[cfg_attr(not(test), allow(dead_code))]
 fn transpose_forward_ntt_sparse(
     ntt: &AdditiveNttF128,
     positions: &[usize],
     values: &[F128],
     log_d: usize,
 ) -> Vec<F128> {
+    transpose_forward_ntt_sparse_prefix(ntt, positions, values, log_d, log_d)
+}
+
+/// Prefix-producing sparse transpose. It runs the same sparse-window stages
+/// and all dense layers that can affect the retained prefix, then evaluates
+/// only the top-output branches of the final `log_d - log_keep` layers.
+///
+/// For rate 2 this skips the bottom output of layer 0. For rate 4 it keeps the
+/// top half of each layer-1 block and combines only those retained quarters at
+/// layer 0. A transposed forward butterfly's top output is always `a + b`, so
+/// these pruned branches do not depend on the omitted twiddle products.
+fn transpose_forward_ntt_sparse_prefix(
+    ntt: &AdditiveNttF128,
+    positions: &[usize],
+    values: &[F128],
+    log_d: usize,
+    log_keep: usize,
+) -> Vec<F128> {
     use rayon::prelude::*;
     use std::collections::HashMap;
+    assert_eq!(positions.len(), values.len());
+    assert!(log_keep <= log_d);
     let n = 1usize << log_d;
-    // No prefix for small domains — just scatter + full dense transpose.
-    let k = if log_d >= 12 { 8usize.min(log_d) } else { 0 };
+    let pruned_layers = log_d - log_keep;
+    // Small domains scatter directly before the dense layers. At larger
+    // domains, cap sparse-window work at log_keep so all pruned layers remain
+    // in the dense tail and can be removed without irrelevant branches.
+    let k = if log_d >= 12 {
+        8usize.min(log_keep)
+    } else {
+        0
+    };
 
-    if k == 0 {
+    let mut data = if k == 0 {
         let mut data = vec![F128::ZERO; n];
         for (&p, &v) in positions.iter().zip(values) {
+            assert!(p < n);
             data[p] += v;
         }
-        if log_d > 0 {
-            transpose_forward_ntt(ntt, &mut data, log_d);
+        data
+    } else {
+        let wmask = (1usize << k) - 1;
+        // Group nonzeros into 2^k windows.
+        let mut windows: HashMap<usize, Vec<F128>> = HashMap::new();
+        for (&p, &v) in positions.iter().zip(values) {
+            assert!(p < n);
+            let buf = windows
+                .entry(p >> k)
+                .or_insert_with(|| vec![F128::ZERO; 1 << k]);
+            buf[p & wmask] += v;
         }
-        return data;
-    }
 
-    let wmask = (1usize << k) - 1;
-    // Group nonzeros into 2^k windows.
-    let mut windows: HashMap<usize, Vec<F128>> = HashMap::new();
-    for (&p, &v) in positions.iter().zip(values) {
-        let buf = windows
-            .entry(p >> k)
-            .or_insert_with(|| vec![F128::ZERO; 1 << k]);
-        buf[p & wmask] += v;
-    }
-
-    // Steps s = 0..k-1 within each active window, in parallel (windows disjoint).
-    let win_vec: Vec<(usize, Vec<F128>)> = windows.into_iter().collect();
-    let processed: Vec<(usize, Vec<F128>)> = win_vec
-        .into_par_iter()
-        .map(|(w, mut buf)| {
-            for s in 0..k {
-                let layer = log_d - 1 - s;
-                let bsh = 1usize << s; // pairing distance
-                let block_size = bsh << 1;
-                let nblocks = (1usize << k) / block_size;
-                for jb in 0..nblocks {
-                    // global block index = ((w<<k) + jb*block_size) >> (s+1).
-                    let t = ntt.twiddle(layer, (w << (k - s - 1)) + jb);
-                    let base = jb * block_size;
-                    for r in 0..bsh {
-                        let a = buf[base + r];
-                        let b = buf[base + r + bsh];
-                        let sab = a + b;
-                        buf[base + r] = sab;
-                        buf[base + r + bsh] = t * sab + b;
+        // Steps s = 0..k-1 within each active window, in parallel (windows disjoint).
+        let win_vec: Vec<(usize, Vec<F128>)> = windows.into_iter().collect();
+        let processed: Vec<(usize, Vec<F128>)> = win_vec
+            .into_par_iter()
+            .map(|(w, mut buf)| {
+                for s in 0..k {
+                    let layer = log_d - 1 - s;
+                    let bsh = 1usize << s; // pairing distance
+                    let block_size = bsh << 1;
+                    let nblocks = (1usize << k) / block_size;
+                    for jb in 0..nblocks {
+                        // global block index = ((w<<k) + jb*block_size) >> (s+1).
+                        let t = ntt.twiddle(layer, (w << (k - s - 1)) + jb);
+                        let base = jb * block_size;
+                        for r in 0..bsh {
+                            let a = buf[base + r];
+                            let b = buf[base + r + bsh];
+                            let sab = a + b;
+                            buf[base + r] = sab;
+                            buf[base + r + bsh] = t * sab + b;
+                        }
                     }
                 }
-            }
-            (w, buf)
-        })
-        .collect();
+                (w, buf)
+            })
+            .collect();
 
-    // Densify (active windows only; the rest stay zero, which is the correct
-    // post-step-(k-1) state for an all-zero window).
-    let mut data = vec![F128::ZERO; n];
-    for (w, buf) in processed {
-        data[(w << k)..((w + 1) << k)].copy_from_slice(&buf);
-    }
+        // Densify (active windows only; the rest stay zero, which is the
+        // correct post-step-(k-1) state for an all-zero window).
+        let mut data = vec![F128::ZERO; n];
+        for (w, buf) in processed {
+            data[(w << k)..((w + 1) << k)].copy_from_slice(&buf);
+        }
+        data
+    };
 
-    // Remaining steps s = k..log_d-1 = forward layers (log_d-1-k) .. 0, dense.
+    // Remaining non-pruned steps s = k..log_keep-1, i.e. forward layers
+    // `log_d-1-k .. pruned_layers`, are still full dense sweeps.
     let n_threads = rayon::current_num_threads().max(1);
-    for layer in (0..(log_d - k)).rev() {
+    for layer in (pruned_layers..(log_d - k)).rev() {
         let num_blocks = 1usize << layer;
         let block_size = 1usize << (log_d - layer);
         let bsh = block_size >> 1;
@@ -2283,7 +2319,77 @@ fn transpose_forward_ntt_sparse(
             }
         }
     }
-    data
+
+    retain_transpose_top_prefix(data, pruned_layers)
+}
+
+/// Evaluate only the top outputs of the remaining transpose layers.
+fn retain_transpose_top_prefix(mut data: Vec<F128>, pruned_layers: usize) -> Vec<F128> {
+    use rayon::prelude::*;
+
+    match pruned_layers {
+        0 => data,
+        1 => {
+            let keep = data.len() >> 1;
+            let (top, bot) = data.split_at_mut(keep);
+            top.par_iter_mut()
+                .zip(bot.par_iter())
+                .for_each(|(a, &b)| *a += b);
+            data.truncate(keep);
+            data
+        }
+        2 => {
+            let quarter = data.len() >> 2;
+            let (half0, half1) = data.split_at_mut(2 * quarter);
+            // Layer 1: retain only the top half of each of its two blocks.
+            rayon::join(
+                || {
+                    let (top, bot) = half0.split_at_mut(quarter);
+                    top.par_iter_mut()
+                        .zip(bot.par_iter())
+                        .for_each(|(a, &b)| *a += b);
+                },
+                || {
+                    let (top, bot) = half1.split_at_mut(quarter);
+                    top.par_iter_mut()
+                        .zip(bot.par_iter())
+                        .for_each(|(a, &b)| *a += b);
+                },
+            );
+            // Layer 0: only its first quarter is retained.
+            let (quarter0, tail) = data.split_at_mut(quarter);
+            let quarter2 = &tail[quarter..2 * quarter];
+            quarter0
+                .par_iter_mut()
+                .zip(quarter2.par_iter())
+                .for_each(|(a, &b)| *a += b);
+            data.truncate(quarter);
+            data
+        }
+        _ => {
+            // Non-ranked rates remain correct. Compact top outputs after each
+            // layer; ranked rate-2/rate-4 paths use the allocation-free arms.
+            let mut current = data;
+            for layer in (0..pruned_layers).rev() {
+                let num_blocks = 1usize << layer;
+                let source_block_len = current.len() / num_blocks;
+                let output_block_len = source_block_len >> 1;
+                let mut next = vec![F128::ZERO; current.len() >> 1];
+                next.par_chunks_mut(output_block_len)
+                    .enumerate()
+                    .for_each(|(block, output)| {
+                        let source =
+                            &current[block * source_block_len..(block + 1) * source_block_len];
+                        let (top, bot) = source.split_at(output_block_len);
+                        for ((dst, &a), &b) in output.iter_mut().zip(top).zip(bot) {
+                            *dst = a + b;
+                        }
+                    });
+                current = next;
+            }
+            current
+        }
+    }
 }
 
 // ===================================================================
@@ -5797,6 +5903,10 @@ mod tests {
             (4usize, 1usize, 0usize, 6usize),
             (3, 1, 2, 5),
             (6, 2, 3, 30),
+            // Ranked L0: rate 2, domain 2^20, retained prefix 2^19.
+            (19, 1, 0, 7),
+            // Ranked recursive induce: rate 4, domain 2^18, prefix 2^16.
+            (16, 2, 0, 9),
             (10, 1, 6, 218),
             (8, 3, 3, 71),
             (5, 5, 3, 43),
@@ -5872,6 +5982,41 @@ mod tests {
                 let sparse = transpose_forward_ntt_sparse(&ntt, &positions, &values, log_d);
                 assert_eq!(sparse, dense, "log_d={log_d}, nq={nq}");
             }
+        }
+    }
+
+    /// Prefix pruning must match a full sparse transpose followed by
+    /// truncation for the ranked rate-2 and rate-4 geometries.
+    #[test]
+    fn transpose_sparse_prefix_matches_full_ranked_shapes() {
+        use crate::challenger::Challenger;
+
+        for &(log_d, log_keep, nq) in &[(20usize, 19usize, 43usize), (18, 16, 43)] {
+            let n = 1usize << log_d;
+            let mut ch = crate::challenger::RandomChallenger::new(
+                0x5A25_E000 ^ ((log_d << 8) | log_keep) as u64,
+            );
+            let ntt = AdditiveNttF128::standard(log_d);
+            let mut positions = Vec::with_capacity(nq);
+            let mut values = Vec::with_capacity(nq);
+            while positions.len() < nq {
+                let p = (ch.sample_f128().lo as usize) % n;
+                if !positions.contains(&p) {
+                    positions.push(p);
+                    values.push(ch.sample_f128());
+                }
+            }
+
+            let mut full = vec![F128::ZERO; n];
+            for (&p, &v) in positions.iter().zip(&values) {
+                full[p] += v;
+            }
+            transpose_forward_ntt(&ntt, &mut full, log_d);
+            full.truncate(1usize << log_keep);
+
+            let prefix =
+                transpose_forward_ntt_sparse_prefix(&ntt, &positions, &values, log_d, log_keep);
+            assert_eq!(prefix, full, "log_d={log_d}, log_keep={log_keep}");
         }
     }
 
