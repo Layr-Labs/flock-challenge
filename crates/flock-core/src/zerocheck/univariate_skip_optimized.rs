@@ -346,34 +346,70 @@ pub fn precompute_round1_ab_inner_packed_padded(
     let out_bytes: &mut [u8] =
         unsafe { core::slice::from_raw_parts_mut(storage.as_mut_ptr() as *mut u8, total_bytes) };
 
-    out_bytes
-        .par_chunks_mut(OUTER_BYTES)
-        .enumerate()
-        .for_each_init(
-            || ([F8::ZERO; ELL], [F8::ZERO; ELL]),
-            |(a_col, b_col), (x_outer, out_outer)| {
-                let within_hash_outer = x_outer & within_outer_mask;
-                let n_b_med = b_med_counts[within_hash_outer] as usize;
-                let chunk_byte_base = x_outer * OUTER_BYTES;
+    let process_outer = |x_outer: usize,
+                         out_outer: &mut [u8],
+                         a_col: &mut [F8; ELL],
+                         b_col: &mut [F8; ELL]| {
+        let within_hash_outer = x_outer & within_outer_mask;
+        let n_b_med = b_med_counts[within_hash_outer] as usize;
+        let chunk_byte_base = x_outer * OUTER_BYTES;
 
-                for b_med in 0..n_b_med {
-                    let dst: &mut [u8; 64] = (&mut out_outer[b_med * 64..(b_med + 1) * 64])
-                        .try_into()
-                        .expect("one transformed b_med block");
-                    shift_reduce_inner_ab(
-                        a_packed,
-                        b_packed,
-                        inv_table,
-                        chunk_byte_base,
-                        b_med,
-                        dst,
-                        a_col,
-                        b_col,
-                    );
-                }
-                out_outer[n_b_med * 64..].fill(0);
-            },
-        );
+        for b_med in 0..n_b_med {
+            let dst: &mut [u8; 64] = (&mut out_outer[b_med * 64..(b_med + 1) * 64])
+                .try_into()
+                .expect("one transformed b_med block");
+            shift_reduce_inner_ab(
+                a_packed,
+                b_packed,
+                inv_table,
+                chunk_byte_base,
+                b_med,
+                dst,
+                a_col,
+                b_col,
+            );
+        }
+        out_outer[n_b_med * 64..].fill(0);
+    };
+
+    // Round-1 AB precompute runs in the sibling branch of the commit/AB
+    // rayon::join. Use fine-grained main-pool claims so this branch keeps
+    // yielding workers to commit, while the helper pool contributes its
+    // otherwise-idle efficiency cores. Disable for an exact plain-rayon
+    // control comparison.
+    const EPOOL_OUTERS_PER_CLAIM: usize = 64;
+    let n_outers = total_bytes / OUTER_BYTES;
+    if std::env::var_os("FLOCK_NO_AB_EPOOL").is_none() {
+        let out_base = crate::epool::SyncPtr(out_bytes.as_mut_ptr());
+        let n_claims = n_outers.div_ceil(EPOOL_OUTERS_PER_CLAIM);
+        crate::epool::run_hetero_chunks_cooperative(n_claims, |claim| {
+            let lo = claim * EPOOL_OUTERS_PER_CLAIM;
+            let hi = (lo + EPOOL_OUTERS_PER_CLAIM).min(n_outers);
+            let mut a_col = [F8::ZERO; ELL];
+            let mut b_col = [F8::ZERO; ELL];
+            for x_outer in lo..hi {
+                // SAFETY: claims cover disjoint OUTER_BYTES ranges and each
+                // claim is run exactly once before the queue join returns.
+                let out_outer = unsafe {
+                    core::slice::from_raw_parts_mut(
+                        out_base.ptr().add(x_outer * OUTER_BYTES),
+                        OUTER_BYTES,
+                    )
+                };
+                process_outer(x_outer, out_outer, &mut a_col, &mut b_col);
+            }
+        });
+    } else {
+        out_bytes
+            .par_chunks_mut(OUTER_BYTES)
+            .enumerate()
+            .for_each_init(
+                || ([F8::ZERO; ELL], [F8::ZERO; ELL]),
+                |(a_col, b_col), (x_outer, out_outer)| {
+                    process_outer(x_outer, out_outer, a_col, b_col);
+                },
+            );
+    }
 
     Round1AbInner { storage }
 }
