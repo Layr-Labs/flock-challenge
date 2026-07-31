@@ -206,10 +206,12 @@ fn use_ranked_zero_root_fusion(
     use_ranked_deep_pair_fusion(log_d, num_ntts, start_layer, n_top)
 }
 
-/// The two ranked radix-8 passes whose independent blocks are numerous enough
-/// to share with the efficiency-core pool. Layer 1 has only two blocks and
-/// overlaps the concurrently-running round-1 AB precompute, so it deliberately
-/// retains the existing flattened Rayon row dispatch.
+/// The three ranked radix-8 passes share fixed one-MiB row tiles with the
+/// efficiency-core pool. Layer 1 has only two outer blocks, but flattening
+/// `(block, row-tile)` still exposes the same 1024 claims as layers 4 and 7.
+/// It overlaps the concurrently-running round-1 AB precompute on the main
+/// Rayon pool; the separate helper pool is otherwise idle until these queues
+/// finish and the deep-transform leaf receivers start.
 #[inline]
 fn is_ranked_top_hetero_fused3_pass(
     log_d: usize,
@@ -218,7 +220,7 @@ fn is_ranked_top_hetero_fused3_pass(
     n_top: usize,
     layer: usize,
 ) -> bool {
-    use_ranked_deep_pair_fusion(log_d, num_ntts, start_layer, n_top) && matches!(layer, 4 | 7)
+    use_ranked_deep_pair_fusion(log_d, num_ntts, start_layer, n_top) && matches!(layer, 1 | 4 | 7)
 }
 
 const INTERLEAVED_PHASE_ALL: u8 = 0;
@@ -400,8 +402,8 @@ impl AdditiveNttF128 {
 
     /// Apply only the ranked L0 transform's three top radix-8 passes. The PCS
     /// leaf pipeline uses this split entry point before occupying the E-core
-    /// pool with blocking leaf receivers, leaving that pool available to the
-    /// layer-4 and layer-7 heterogeneous queues.
+    /// pool with blocking leaf receivers, leaving that pool available to all
+    /// three heterogeneous top-pass queues.
     #[inline]
     pub(crate) fn forward_transform_interleaved_ranked_top_from_layer(
         &self,
@@ -1455,13 +1457,13 @@ fn butterfly_interleaved_fused_3layer_all_blocks_par_rows(
 /// serially, avoiding a nested Rayon region when the claim is executed on an
 /// efficiency core.
 ///
-/// At the exact 1 GiB ranked codeword, layer 4 exposes 16 × 64 MiB blocks and
-/// layer 7 exposes 128 × 8 MiB blocks. A 128-row tile touches 1 MiB of input
-/// in either pass, producing 1024 uniform claims per pass. Both passes still
-/// read and write the codeword exactly once; the queue only lets otherwise-idle
-/// E cores claim some of that fixed traffic and arithmetic. The shared atomic
-/// queue bounds the heterogeneous tail to one 1 MiB tile per worker rather
-/// than one potentially-slow 64 MiB block.
+/// At the exact 1 GiB ranked codeword, layers 1, 4, and 7 expose respectively
+/// 2 × 512 MiB, 16 × 64 MiB, and 128 × 8 MiB blocks. A 128-row tile touches
+/// 1 MiB of input in every pass, producing 1024 uniform claims per pass. Every
+/// pass still reads and writes the codeword exactly once; the queue only lets
+/// otherwise-idle E cores claim some of that fixed traffic and arithmetic.
+/// The shared atomic queue bounds the heterogeneous tail to one 1 MiB tile per
+/// worker rather than one potentially-slow outer block.
 #[inline]
 fn butterfly_interleaved_fused_3layer_all_blocks_hetero(
     data: &mut [F128],
@@ -1775,15 +1777,13 @@ mod tests {
         assert!(!use_ranked_zero_root_fusion(20, 64, 0, 10));
         assert!(!use_ranked_zero_root_fusion(20, 64, 1, 9));
 
-        assert_eq!(
-            is_ranked_top_hetero_fused3_pass(20, 64, 1, 10, 4),
-            enabled_here
-        );
-        assert_eq!(
-            is_ranked_top_hetero_fused3_pass(20, 64, 1, 10, 7),
-            enabled_here
-        );
-        assert!(!is_ranked_top_hetero_fused3_pass(20, 64, 1, 10, 1));
+        for layer in [1, 4, 7] {
+            assert_eq!(
+                is_ranked_top_hetero_fused3_pass(20, 64, 1, 10, layer),
+                enabled_here
+            );
+        }
+        assert!(!is_ranked_top_hetero_fused3_pass(20, 64, 1, 10, 2));
         assert!(!is_ranked_top_hetero_fused3_pass(19, 64, 1, 10, 4));
         assert!(!is_ranked_top_hetero_fused3_pass(20, 8, 1, 10, 4));
         assert!(!is_ranked_top_hetero_fused3_pass(20, 64, 0, 10, 4));
@@ -1895,8 +1895,8 @@ mod tests {
 
     /// The ranked heterogeneous dispatcher flattens `(block, row-tile)` queue
     /// claims rather than individual `(block, row)` Rayon jobs. Exercise the
-    /// exact 16- and 128-block pass shapes (including multiple tiles per block)
-    /// at a reduced domain size and compare against the independent
+    /// exact 2-, 16-, and 128-block pass shapes (including multiple tiles per
+    /// block) at a reduced domain size and compare against the independent
     /// layer-by-layer scalar butterfly oracle.
     #[test]
     fn ranked_top_hetero_blocks_match_scalar_oracle() {
@@ -1905,7 +1905,7 @@ mod tests {
 
         let ntt = AdditiveNttF128::standard(LOG_D);
         let mut rng = Rng::new(0xEC0E_70B0_10C5);
-        for layer in [4usize, 7] {
+        for layer in [1usize, 4, 7] {
             let num_blocks = 1usize << layer;
             let block_size = 1usize << (LOG_D - layer);
             let eighth = block_size >> 3;
