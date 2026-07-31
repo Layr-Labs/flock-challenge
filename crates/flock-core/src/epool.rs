@@ -249,6 +249,55 @@ pub(crate) fn run_chunks_with_helper_stateful<S, I, F>(
     }
 }
 
+/// Cooperative variant of [`run_hetero_chunks`] for regions that run
+/// CONCURRENTLY with other main-pool work (e.g. inside a `rayon::join`
+/// branch): instead of pinning one queue-drain task per main worker, it
+/// submits one rayon task per claim (`with_max_len(1)` over `n_chunks`), so
+/// the sibling join branch keeps its fair share of the main pool while the
+/// efficiency helpers drain the same atomic queue. Restored from promoted
+/// submission `41df8458` (+3.02%), which was silently dropped by later
+/// frontier rebases.
+pub(crate) fn run_hetero_chunks_cooperative<F>(n_chunks: usize, f: F)
+where
+    F: Fn(usize) + Sync,
+{
+    if n_chunks == 0 {
+        return;
+    }
+    if rayon::current_num_threads() <= 1 {
+        for i in 0..n_chunks {
+            f(i);
+        }
+        return;
+    }
+    let next = AtomicUsize::new(0);
+    let drain_main = || {
+        (0..n_chunks).into_par_iter().with_max_len(1).for_each(|_| {
+            let i = next.fetch_add(1, Ordering::Relaxed);
+            if i < n_chunks {
+                f(i);
+            }
+        });
+    };
+    match epool().filter(|_| n_chunks >= EPOOL_MIN_CHUNKS) {
+        Some(ep) => std::thread::scope(|s| {
+            s.spawn(|| {
+                ep.broadcast(|_| {
+                    loop {
+                        let i = next.fetch_add(1, Ordering::Relaxed);
+                        if i >= n_chunks {
+                            break;
+                        }
+                        f(i);
+                    }
+                })
+            });
+            drain_main();
+        }),
+        None => drain_main(),
+    }
+}
+
 /// `Send + Sync` wrapper for a raw base pointer shared across the two pools.
 ///
 /// # Safety contract (caller's)
