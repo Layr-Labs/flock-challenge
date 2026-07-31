@@ -587,6 +587,92 @@ fn has_leading_zero_bits(h: &[u8], bits: u32) -> bool {
     true
 }
 
+/// SHA-256 of the fixed 40-byte PoW pre-image
+/// `state_digest || nonce_le`, using its single padded compression block.
+///
+/// The generic `Sha256::digest` path has to construct/update/finalize a digest
+/// object for every nonce. Grinding knows the message length at compile time,
+/// so build the sole block directly and call the crate's hardware-selected raw
+/// compression function. This is byte-identical to `Sha256::digest` but removes
+/// per-candidate digest state and padding work from the ranked SHA-256 grind.
+#[inline]
+fn sha256_pow_hash(state_digest: &[u8; 32], nonce: u64) -> [u8; 32] {
+    use sha2::digest::generic_array::GenericArray;
+
+    const IV: [u32; 8] = [
+        0x6a09_e667,
+        0xbb67_ae85,
+        0x3c6e_f372,
+        0xa54f_f53a,
+        0x510e_527f,
+        0x9b05_688c,
+        0x1f83_d9ab,
+        0x5be0_cd19,
+    ];
+    const MESSAGE_BITS: u64 = 40 * 8;
+
+    let mut block = GenericArray::default();
+    block[..32].copy_from_slice(state_digest);
+    block[32..40].copy_from_slice(&nonce.to_le_bytes());
+    block[40] = 0x80;
+    block[56..64].copy_from_slice(&MESSAGE_BITS.to_be_bytes());
+
+    let mut state = IV;
+    sha2::compress256(&mut state, core::slice::from_ref(&block));
+    let mut out = [0u8; 32];
+    for (word, bytes) in state.iter().zip(out.as_chunks_mut::<4>().0) {
+        *bytes = word.to_be_bytes();
+    }
+    out
+}
+
+/// Smallest nonce in `start .. start + len` satisfying the SHA-256 PoW.
+///
+/// Build the constant 32-byte state prefix and fixed SHA-256 padding once per
+/// scan; only the nonce field changes in the hot loop. Calling
+/// [`sha256_pow_hash`] remains the scalar specification used by verification.
+#[inline]
+fn sha256_pow_scan(state_digest: &[u8; 32], start: u64, len: u64, bits: u32) -> Option<u64> {
+    use sha2::digest::generic_array::GenericArray;
+
+    const IV: [u32; 8] = [
+        0x6a09_e667,
+        0xbb67_ae85,
+        0x3c6e_f372,
+        0xa54f_f53a,
+        0x510e_527f,
+        0x9b05_688c,
+        0x1f83_d9ab,
+        0x5be0_cd19,
+    ];
+
+    let mut block = GenericArray::default();
+    block[..32].copy_from_slice(state_digest);
+    block[40] = 0x80;
+    block[56..64].copy_from_slice(&(40u64 * 8).to_be_bytes());
+    let end = start.saturating_add(len);
+    for nonce in start..end {
+        block[32..40].copy_from_slice(&nonce.to_le_bytes());
+        let mut state = IV;
+        sha2::compress256(&mut state, core::slice::from_ref(&block));
+        // Leading digest bits are the big-endian leading bits of state[0].
+        // Current profiles need at most 19 bits; retain a generic fallback.
+        let matches = if bits <= 32 {
+            state[0].leading_zeros() >= bits
+        } else {
+            let mut out = [0u8; 32];
+            for (word, bytes) in state.iter().zip(out.as_chunks_mut::<4>().0) {
+                *bytes = word.to_be_bytes();
+            }
+            has_leading_zero_bits(&out, bits)
+        };
+        if matches {
+            return Some(nonce);
+        }
+    }
+    None
+}
+
 /// Check whether `H(pre-image(state_digest, nonce))` has at least `bits`
 /// leading zero bits, under the transcript's own hash `kind`.
 ///
@@ -605,10 +691,7 @@ fn pow_has_leading_zero_bits(
     fs_count::POW_SHA256.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     match kind {
         HashKind::Sha256 => {
-            let mut pre = [0u8; 40];
-            pre[..32].copy_from_slice(state_digest);
-            pre[32..].copy_from_slice(&nonce.to_le_bytes());
-            let h: [u8; 32] = Sha256::digest(pre).into();
+            let h = sha256_pow_hash(state_digest, nonce);
             has_leading_zero_bits(&h, bits)
         }
         HashKind::Blake3 => {
@@ -633,40 +716,16 @@ fn pow_has_leading_zero_bits(
 /// penalty; the kernel-level probe resolves it.)
 const BLAKE3_POW_BATCH: usize = 48;
 
-/// Whether `FLOCK_NO_GRIND_REG=1` disables the register-resident grind
-/// kernel (kill switch; restores the generic batched scan).
-#[cfg(all(target_arch = "aarch64", target_os = "macos"))]
-fn grind_reg_disabled() -> bool {
-    static DISABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *DISABLED.get_or_init(|| std::env::var("FLOCK_NO_GRIND_REG").is_ok_and(|v| v == "1"))
-}
-
 /// Smallest nonce in `start .. start + len` whose BLAKE3 PoW hash has `bits`
 /// leading zeros, or `None`.
 ///
-/// On Apple AArch64 with `1 <= bits <= 32` (every grind the protocol
-/// configures) this dispatches to the register-resident specialization
-/// [`crate::merkle::blake3_pow_scan_reg`], which keeps the fixed
-/// `state_digest` words, the precomputed nonce-independent round work, and
-/// the IV constants in NEON registers across attempts and injects only the
-/// 8 changing nonce bytes per attempt — byte-exact against `blake3::hash`,
-/// held to the generic path by `grind_reg_scan_matches_generic`. Kill
-/// switch: `FLOCK_NO_GRIND_REG=1`.
+/// Batches the independent nonce hashes through the twelve-way kernel on
+/// Apple AArch64 (upstream `hash_many` tail and fallback) via
+/// [`crate::merkle::blake3_hash_many_pow`]. A 64-byte pre-image is a
+/// whole-block single chunk hashed with `CHUNK_START | CHUNK_END | ROOT` —
+/// so this agrees with `blake3::hash` on every nonce, which
+/// `blake3_batched_pow_matches_scalar` asserts.
 fn blake3_pow_scan(state_digest: &[u8; 32], start: u64, len: u64, bits: u32) -> Option<u64> {
-    #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
-    if (1..=32).contains(&bits) && !grind_reg_disabled() {
-        return crate::merkle::blake3_pow_scan_reg(state_digest, start, len, bits);
-    }
-    blake3_pow_scan_generic(state_digest, start, len, bits)
-}
-
-/// The generic batched scan: materializes each 64-byte pre-image and hashes
-/// batches through the twelve-way kernel on Apple AArch64 (upstream
-/// `hash_many` tail and fallback) via [`crate::merkle::blake3_hash_many_pow`].
-/// A 64-byte pre-image is a whole-block single chunk hashed with
-/// `CHUNK_START | CHUNK_END | ROOT` — so this agrees with `blake3::hash` on
-/// every nonce, which `blake3_batched_pow_matches_scalar` asserts.
-fn blake3_pow_scan_generic(state_digest: &[u8; 32], start: u64, len: u64, bits: u32) -> Option<u64> {
     // The 32-byte state prefix is constant across the whole scan; only the
     // 8 nonce bytes change per lane.
     let mut pre = [[0u8; 64]; BLAKE3_POW_BATCH];
@@ -718,8 +777,7 @@ fn pow_scan(
 ) -> Option<u64> {
     match kind {
         HashKind::Blake3 => blake3_pow_scan(state_digest, start, len, bits),
-        HashKind::Sha256 => (start..start.saturating_add(len))
-            .find(|&n| pow_has_leading_zero_bits(state_digest, n, bits, kind)),
+        HashKind::Sha256 => sha256_pow_scan(state_digest, start, len, bits),
     }
 }
 
@@ -784,6 +842,22 @@ mod tests {
                 for _ in 0..4 {
                     assert_eq!(prover.sample_f128(), verifier.sample_f128());
                 }
+            }
+        }
+    }
+
+    /// The direct fixed-block SHA-256 compressor must remain exactly equal to
+    /// the digest API that defines the protocol's 40-byte PoW pre-image.
+    #[test]
+    fn sha256_pow_hash_matches_digest_spec() {
+        for state_byte in [0u8, 1, 0x5a, 0xff] {
+            let state = [state_byte; 32];
+            for nonce in [0u64, 1, 255, 256, 1_000_000, u64::MAX] {
+                let mut pre = [0u8; 40];
+                pre[..32].copy_from_slice(&state);
+                pre[32..].copy_from_slice(&nonce.to_le_bytes());
+                let expected: [u8; 32] = Sha256::digest(pre).into();
+                assert_eq!(sha256_pow_hash(&state, nonce), expected);
             }
         }
     }
@@ -919,158 +993,21 @@ mod tests {
                 // `bits = 0` makes every nonce a match, so the scan must return
                 // `start` — and the per-lane hashes are all exercised below.
                 assert_eq!(
-                    blake3_pow_scan_generic(&state, start, len, 0),
+                    blake3_pow_scan(&state, start, len, 0),
                     Some(start),
                     "start={start} len={len}"
                 );
-                // Compare the scans (generic and dispatching) against a scalar
-                // sweep at a threshold low enough to hit but high enough to
-                // skip some nonces.
+                // Compare the scan against a scalar sweep at a threshold low
+                // enough to hit but high enough to skip some nonces.
                 let want = (start..start + len)
                     .find(|&n| pow_has_leading_zero_bits(&state, n, 6, HashKind::Blake3));
                 assert_eq!(
-                    blake3_pow_scan_generic(&state, start, len, 6),
+                    blake3_pow_scan(&state, start, len, 6),
                     want,
                     "start={start} len={len}"
                 );
-                assert_eq!(
-                    blake3_pow_scan(&state, start, len, 6),
-                    want,
-                    "dispatch start={start} len={len}"
-                );
             }
         }
-    }
-
-    /// The register-resident grind scan must agree with the generic batched
-    /// scan — same match/no-match, same (smallest) nonce — for random
-    /// digests, every bits value it dispatches on, ragged range shapes, and
-    /// ranges crossing the 12-lane group and 32-bit nonce boundaries. The
-    /// generic path is itself held to `blake3::hash` by
-    /// `blake3_batched_pow_matches_scalar`, so equality here pins the
-    /// specialized kernel to the byte-exact spec.
-    #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
-    #[test]
-    fn grind_reg_scan_matches_generic() {
-        let mut seed = 0x1234_5678_9ABC_DEF0u64;
-        let mut digest = [0u8; 32];
-        for case in 0..24 {
-            for b in digest.iter_mut() {
-                *b = (splitmix64(&mut seed) & 0xFF) as u8;
-            }
-            for bits in [1u32, 2, 6, 8, 13, 19, 24, 32] {
-                for (start, len) in [
-                    (0u64, 1u64),
-                    (0, 11),
-                    (0, 12),
-                    (0, 13),
-                    (7, 500),
-                    (1_000_000, 960),
-                    (u32::MAX as u64 - 30, 60), // nonce-lo carry inside a group
-                ] {
-                    let want = blake3_pow_scan_generic(&digest, start, len, bits);
-                    let got = crate::merkle::blake3_pow_scan_reg(&digest, start, len, bits);
-                    assert_eq!(
-                        got, want,
-                        "case={case} bits={bits} start={start} len={len}"
-                    );
-                }
-            }
-            // Exhaustive predicate agreement on a low threshold: walk ALL
-            // matches in a range (not just the first) by resuming past each.
-            let bits = 4;
-            let (mut a, mut b) = (0u64, 0u64);
-            let end = 2048u64;
-            loop {
-                let want = blake3_pow_scan_generic(&digest, a, end - a, bits);
-                let got = crate::merkle::blake3_pow_scan_reg(&digest, b, end - b, bits);
-                assert_eq!(got, want, "case={case} resume a={a} b={b}");
-                match want {
-                    Some(n) if n + 1 < end => {
-                        a = n + 1;
-                        b = n + 1;
-                    }
-                    _ => break,
-                }
-            }
-        }
-    }
-
-    /// Fixed-seed transcripts must grind to the identical nonce under the
-    /// dispatching scan (register-resident kernel on Apple AArch64) as the
-    /// sequential generic oracle — proof bytes depend on the exact nonce.
-    #[test]
-    fn grind_reg_selects_identical_nonces_fixed_seeds() {
-        for seed in [424242u64, 777, 1, 0xDEAD_BEEF] {
-            for bits in [6u32, 14, 16] {
-                let mut ch = FsChallenger::with_hash(b"grind-reg-fixed", HashKind::Blake3);
-                ch.observe_bytes(&seed.to_le_bytes());
-                let digest = ch.state_digest();
-                let nonce = ch.grind_pow(bits);
-                let mut start = 0u64;
-                let expect = loop {
-                    if let Some(n) = blake3_pow_scan_generic(&digest, start, 4096, bits) {
-                        break n;
-                    }
-                    start += 4096;
-                };
-                assert_eq!(nonce, expect, "seed={seed} bits={bits}");
-            }
-        }
-    }
-
-    /// Paired micro-probe (not a correctness gate): generic batched scan vs
-    /// the register-resident kernel on the same digest set with no early
-    /// exit. Pure compute, single-threaded, no scheduling. Run with
-    /// `cargo test -p flock-core --release --lib -- --ignored --nocapture grind_reg_speed`.
-    #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
-    #[test]
-    #[ignore]
-    fn grind_reg_speed_probe() {
-        const N: u64 = 1 << 19;
-        const REPS: usize = 21;
-        let mut seed = 0xC0FF_EE00_D15E_A5Edu64;
-        let mut digests = Vec::new();
-        while digests.len() < 4 {
-            let mut d = [0u8; 32];
-            for b in d.iter_mut() {
-                *b = (splitmix64(&mut seed) & 0xFF) as u8;
-            }
-            // bits=32: a match in [0, N) has probability N/2^32 ≈ 0.012 per
-            // digest; skip any digest that would early-exit either arm.
-            if blake3_pow_scan_generic(&d, 0, N, 32).is_none() {
-                digests.push(d);
-            }
-        }
-        let mut probe = |f: &dyn Fn(&[u8; 32]) -> Option<u64>| -> (f64, f64) {
-            let mut times = Vec::with_capacity(REPS);
-            for _ in 0..REPS {
-                let t = std::time::Instant::now();
-                for d in &digests {
-                    assert_eq!(f(d), None);
-                }
-                times.push(t.elapsed().as_secs_f64() * 1e3);
-            }
-            times.sort_by(f64::total_cmp);
-            (times[0], times[REPS / 2])
-        };
-        // Warm up + interleave-fair: measure generic, reg, then generic again
-        // to expose drift.
-        let (gen_min, gen_med) = probe(&|d| blake3_pow_scan_generic(d, 0, N, 32));
-        let (reg_min, reg_med) =
-            probe(&|d| crate::merkle::blake3_pow_scan_reg(d, 0, N, 32));
-        let (gen2_min, gen2_med) = probe(&|d| blake3_pow_scan_generic(d, 0, N, 32));
-        let hashes = (N as f64) * digests.len() as f64;
-        eprintln!(
-            "grind probe over {hashes:.0} hashes/iter, {REPS} reps:\n\
-             generic  min {gen_min:.2} ms  med {gen_med:.2} ms  ({:.2} ns/hash min)\n\
-             reg      min {reg_min:.2} ms  med {reg_med:.2} ms  ({:.2} ns/hash min)\n\
-             generic2 min {gen2_min:.2} ms  med {gen2_med:.2} ms\n\
-             speedup (min/min vs first generic): {:.3}x",
-            gen_min * 1e6 / hashes,
-            reg_min * 1e6 / hashes,
-            gen_min / reg_min,
-        );
     }
 
     /// Timing probe (not a correctness gate): upstream 4-lane `hash_many`

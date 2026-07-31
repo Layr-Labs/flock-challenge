@@ -236,51 +236,6 @@ unsafe fn fold_four_row_codes_q(
     }
 }
 
-/// Two-row variant of [`fold_four_row_codes_q`] for the degenerate-pair path
-/// (the two b rows are skipped, so only the a rows need folding).
-#[cfg(target_arch = "aarch64")]
-#[inline(always)]
-unsafe fn fold_two_row_codes_q(
-    table_data: *const u8,
-    row0: u64,
-    row1: u64,
-) -> (
-    core::arch::aarch64::uint64x2_t,
-    core::arch::aarch64::uint64x2_t,
-) {
-    use core::arch::aarch64::*;
-    unsafe {
-        const STRIDE: usize = 256 * 16;
-        let load = |row: u64, chunk: usize| {
-            let shift = 8 * chunk;
-            let offset = chunk * STRIDE;
-            let index = ((row >> shift) & 0xff) as usize;
-            vld1q_u64(
-                table_data
-                    .add(offset + index * core::mem::size_of::<F128>())
-                    .cast::<u64>(),
-            )
-        };
-        let mut acc0 = load(row0, 0);
-        let mut acc1 = load(row1, 0);
-        for chunk in (1..7).step_by(2) {
-            acc0 = xor3_u64(acc0, load(row0, chunk), load(row0, chunk + 1));
-            acc1 = xor3_u64(acc1, load(row1, chunk), load(row1, chunk + 1));
-        }
-        acc0 = veorq_u64(acc0, load(row0, 7));
-        acc1 = veorq_u64(acc1, load(row1, 7));
-        (acc0, acc1)
-    }
-}
-
-/// Returns `true` iff a 128-bit vector is all-zero.
-#[cfg(target_arch = "aarch64")]
-#[inline(always)]
-unsafe fn is_zero_q(v: core::arch::aarch64::uint64x2_t) -> bool {
-    use core::arch::aarch64::*;
-    unsafe { vmaxvq_u32(vreinterpretq_u32_u64(v)) == 0 }
-}
-
 /// Complete q-register-native round-two worker chunk. Four folded rows stay in
 /// vector registers through output stores, reduced GHASH products, and the
 /// eq-weighted unreduced accumulators; only the two final chunk sums cross back
@@ -364,15 +319,6 @@ pub(crate) unsafe fn fold_round2_chunk_neon_unchecked_8(
 /// The later challenge-specialized fold reconstructs
 /// `anchor + rho * fold(delta)` from this 24-byte-per-polynomial
 /// representation, instead of materializing both 16-byte folded rows.
-///
-/// `degen` enables the b≡1 chunk-class degeneration: when both b row codes of
-/// a pair are all-ones (statically true for the input/output/const regions of
-/// the BLAKE3 block R1CS — 11 of 121 useful pairs per block), both b folds
-/// equal `Σ_i L_i(z) = 1`, so the 16 b-table lookups are skipped, the b
-/// anchor is the precomputed all-ones fold, `G(∞)`'s `(b0 + b1)` factor
-/// vanishes (that mul chain is skipped), and — when the all-ones fold is
-/// bit-exactly `F128::ONE` (partition of unity; always in practice) —
-/// `a1 · b1` degenerates to `a1`. Value-forced, therefore bit-exact.
 #[cfg(target_arch = "aarch64")]
 #[target_feature(enable = "aes")]
 pub(crate) unsafe fn fold_round2_compact_chunk_neon_unchecked_8(
@@ -386,7 +332,6 @@ pub(crate) unsafe fn fold_round2_compact_chunk_neon_unchecked_8(
     pair_idx_base: usize,
     pair_in_block_mask: usize,
     useful_pairs_inclusive: usize,
-    degen: bool,
 ) -> (F128, F128) {
     use core::arch::aarch64::*;
 
@@ -412,17 +357,6 @@ pub(crate) unsafe fn fold_round2_compact_chunk_neon_unchecked_8(
         let mut p1_acc = WideNeon { lo: zero, hi: zero };
         let mut pinf_acc = WideNeon { lo: zero, hi: zero };
 
-        // Fold of the all-ones row code = Σ_i L_i(z) — exactly the XOR the
-        // per-pair path would compute, so storing it as the b anchor is
-        // bit-identical. Partition of unity makes it F128::ONE; the `a1·b1 →
-        // a1` shortcut is additionally gated on that being bit-exact.
-        let ones_bytes = [0xFFu8; 8];
-        let b_ones = fold_row_q(table_data, ones_bytes.as_ptr());
-        let ones_is_one = is_zero_q(veorq_u64(
-            b_ones,
-            core::mem::transmute::<F128, uint64x2_t>(F128::ONE),
-        ));
-
         for x_lo in 0..lo_size {
             if ((pair_idx_base + x_lo) & pair_in_block_mask) >= useful_pairs_inclusive {
                 store_anchor_pair_nt(anchors.add(2 * x_lo), zero, zero);
@@ -440,22 +374,6 @@ pub(crate) unsafe fn fold_round2_compact_chunk_neon_unchecked_8(
             let a1_code = u64::from_le(core::ptr::read_unaligned(a1_ptr.cast::<u64>()));
             let b0_code = u64::from_le(core::ptr::read_unaligned(b0_ptr.cast::<u64>()));
             let b1_code = u64::from_le(core::ptr::read_unaligned(b1_ptr.cast::<u64>()));
-
-            if degen && (b0_code & b1_code) == u64::MAX {
-                // b ≡ 1 pair: b0 = b1 = fold(all-ones) = 1. Skip the 16
-                // b-table lookups; `b0 + b1 = 0` zeroes the G(∞) term.
-                let (a0, a1) = fold_two_row_codes_q(table_data, a0_code, a1_code);
-                store_anchor_pair_nt(anchors.add(2 * x_lo), a0, b_ones);
-                let delta_pair =
-                    core::mem::transmute::<[u64; 2], uint64x2_t>([a0_code ^ a1_code, 0]);
-                vst1q_u64(deltas.add(x_lo * 16).cast::<u64>(), delta_pair);
-
-                let g1 = if ones_is_one { a1 } else { mul_q(a1, b_ones) };
-                let eq_l = vld1q_u64(eq_lo.add(x_lo).cast::<u64>());
-                wide_xor(&mut p1_acc, mul_unreduced_q(eq_l, g1));
-                continue;
-            }
-
             let (a0, a1, b0, b1) =
                 fold_four_row_codes_q(table_data, a0_code, a1_code, b0_code, b1_code);
 
@@ -479,285 +397,12 @@ pub(crate) unsafe fn fold_round2_compact_chunk_neon_unchecked_8(
     }
 }
 
-/// XOR of the `L` table entries for byte lanes `lane0..lane0 + L` of `code`.
-/// One 16-byte L1 load per lane; the tree shape matches `fold_row_q` so the
-/// full-width (`L = 8`, `lane0 = 0`) case is instruction-equivalent.
-#[cfg(target_arch = "aarch64")]
-#[inline(always)]
-unsafe fn lookup_lanes_q<const L: usize>(
-    table_data: *const u8,
-    code: u64,
-    lane0: usize,
-) -> core::arch::aarch64::uint64x2_t {
-    use core::arch::aarch64::*;
-    unsafe {
-        const STRIDE: usize = 256 * 16;
-        let load = |j: usize| {
-            let lane = lane0 + j;
-            let index = ((code >> (8 * lane)) & 0xff) as usize;
-            vld1q_u64(
-                table_data
-                    .add(lane * STRIDE + index * core::mem::size_of::<F128>())
-                    .cast::<u64>(),
-            )
-        };
-        let mut acc = load(0);
-        let mut j = 1;
-        while j + 1 < L {
-            acc = xor3_u64(acc, load(j), load(j + 1));
-            j += 2;
-        }
-        if j < L {
-            acc = veorq_u64(acc, load(j));
-        }
-        acc
-    }
-}
-
-/// Pairs per tile for the byte-lane-outer streaming kernels. Accumulator
-/// footprint is `4 × 16 B × STREAM_TILE_PAIRS` (8 KiB) plus the row codes
-/// (4 KiB) — L1-resident alongside the active 4·L KiB of table rows.
-#[cfg(target_arch = "aarch64")]
-const STREAM_TILE_PAIRS: usize = 128;
-
-/// Byte-lane-outer streaming variant of
-/// [`fold_round2_compact_chunk_neon_unchecked_8`]. Identical outputs (XOR
-/// reassociation only). `L` byte lanes are consumed per pass; each tile of
-/// [`STREAM_TILE_PAIRS`] pairs keeps its four fold accumulators in an
-/// L1-resident stack array, re-reading the packed row codes once per pass.
-#[cfg(target_arch = "aarch64")]
-#[target_feature(enable = "aes")]
-pub(crate) unsafe fn fold_round2_compact_stream_chunk_neon<const L: usize>(
-    table_data: *const u8,
-    a_packed: *const u8,
-    b_packed: *const u8,
-    anchors: *mut F128,
-    deltas: *mut u8,
-    eq_lo: *const F128,
-    lo_size: usize,
-    pair_idx_base: usize,
-    pair_in_block_mask: usize,
-    useful_pairs_inclusive: usize,
-) -> (F128, F128) {
-    use core::arch::aarch64::*;
-
-    #[inline(always)]
-    unsafe fn store_anchor_pair_nt(dst: *mut F128, a: uint64x2_t, b: uint64x2_t) {
-        unsafe {
-            core::arch::asm!(
-                "stnp {a:q}, {b:q}, [{dst}]",
-                dst = in(reg) dst,
-                a = in(vreg) a,
-                b = in(vreg) b,
-                options(nostack, preserves_flags),
-            );
-        }
-    }
-
-    debug_assert!(L == 1 || L == 2 || L == 4 || L == 8);
-    let n_passes = 8 / L;
-
-    unsafe {
-        let zero = vdupq_n_u64(0);
-        let mut p1_acc = WideNeon { lo: zero, hi: zero };
-        let mut pinf_acc = WideNeon { lo: zero, hi: zero };
-        // Per-tile fold accumulators: [a0, a1, b0, b1] per pair.
-        let mut acc = [[zero; 4]; STREAM_TILE_PAIRS];
-
-        let mut t0 = 0usize;
-        while t0 < lo_size {
-            let tlen = STREAM_TILE_PAIRS.min(lo_size - t0);
-
-            for pass in 0..n_passes {
-                let lane0 = pass * L;
-                for i in 0..tlen {
-                    let x_lo = t0 + i;
-                    if ((pair_idx_base + x_lo) & pair_in_block_mask) >= useful_pairs_inclusive {
-                        if pass == 0 {
-                            store_anchor_pair_nt(anchors.add(2 * x_lo), zero, zero);
-                            vst1q_u64(deltas.add(x_lo * 16).cast::<u64>(), zero);
-                            acc[i] = [zero; 4];
-                        }
-                        continue;
-                    }
-                    let row0 = 2 * x_lo;
-                    let a0_code =
-                        u64::from_le(core::ptr::read_unaligned(a_packed.add(row0 * 8).cast()));
-                    let a1_code = u64::from_le(core::ptr::read_unaligned(
-                        a_packed.add((row0 + 1) * 8).cast(),
-                    ));
-                    let b0_code =
-                        u64::from_le(core::ptr::read_unaligned(b_packed.add(row0 * 8).cast()));
-                    let b1_code = u64::from_le(core::ptr::read_unaligned(
-                        b_packed.add((row0 + 1) * 8).cast(),
-                    ));
-
-                    let va0 = lookup_lanes_q::<L>(table_data, a0_code, lane0);
-                    let va1 = lookup_lanes_q::<L>(table_data, a1_code, lane0);
-                    let vb0 = lookup_lanes_q::<L>(table_data, b0_code, lane0);
-                    let vb1 = lookup_lanes_q::<L>(table_data, b1_code, lane0);
-
-                    if pass == 0 {
-                        acc[i] = [va0, va1, vb0, vb1];
-                        let delta_pair = core::mem::transmute::<[u64; 2], uint64x2_t>([
-                            a0_code ^ a1_code,
-                            b0_code ^ b1_code,
-                        ]);
-                        vst1q_u64(deltas.add(x_lo * 16).cast::<u64>(), delta_pair);
-                    } else {
-                        acc[i][0] = veorq_u64(acc[i][0], va0);
-                        acc[i][1] = veorq_u64(acc[i][1], va1);
-                        acc[i][2] = veorq_u64(acc[i][2], vb0);
-                        acc[i][3] = veorq_u64(acc[i][3], vb1);
-                    }
-                }
-            }
-
-            // Finalize the tile: anchor stores + round message.
-            for i in 0..tlen {
-                let x_lo = t0 + i;
-                if ((pair_idx_base + x_lo) & pair_in_block_mask) >= useful_pairs_inclusive {
-                    continue;
-                }
-                let [a0, a1, b0, b1] = acc[i];
-                store_anchor_pair_nt(anchors.add(2 * x_lo), a0, b0);
-                let g1 = mul_q(a1, b1);
-                let g_inf = mul_q(veorq_u64(a0, a1), veorq_u64(b0, b1));
-                let eq_l = vld1q_u64(eq_lo.add(x_lo).cast::<u64>());
-                wide_xor(&mut p1_acc, mul_unreduced_q(eq_l, g1));
-                wide_xor(&mut pinf_acc, mul_unreduced_q(eq_l, g_inf));
-            }
-
-            t0 += tlen;
-        }
-
-        (
-            core::mem::transmute::<uint64x2_t, F128>(reduce_wide_q(p1_acc)),
-            core::mem::transmute::<uint64x2_t, F128>(reduce_wide_q(pinf_acc)),
-        )
-    }
-}
-
-/// Byte-lane-outer streaming variant of [`fold_compact_chunk_neon_unchecked_8`]
-/// (compact reconstruction). Identical outputs; same tile/pass schedule as
-/// [`fold_round2_compact_stream_chunk_neon`].
-#[cfg(target_arch = "aarch64")]
-#[target_feature(enable = "aes")]
-pub(crate) unsafe fn fold_compact_stream_chunk_neon<const L: usize>(
-    scaled_table: *const u8,
-    anchors: *const F128,
-    deltas: *const u8,
-    a_out: *mut F128,
-    b_out: *mut F128,
-    eq_lo: *const F128,
-    lo_size: usize,
-) -> (F128, F128) {
-    use core::arch::aarch64::*;
-
-    #[inline(always)]
-    unsafe fn store_pair_nt(dst: *mut F128, x: uint64x2_t, y: uint64x2_t) {
-        unsafe {
-            core::arch::asm!(
-                "stnp {x:q}, {y:q}, [{dst}]",
-                dst = in(reg) dst,
-                x = in(vreg) x,
-                y = in(vreg) y,
-                options(nostack, preserves_flags),
-            );
-        }
-    }
-
-    debug_assert!(L == 1 || L == 2 || L == 4 || L == 8);
-    let n_passes = 8 / L;
-
-    unsafe {
-        let zero = vdupq_n_u64(0);
-        let mut p1_acc = WideNeon { lo: zero, hi: zero };
-        let mut pinf_acc = WideNeon { lo: zero, hi: zero };
-        // Per-tile delta-fold accumulators: [a0, a1, b0, b1] per pair.
-        let mut acc = [[zero; 4]; STREAM_TILE_PAIRS];
-
-        let mut t0 = 0usize;
-        while t0 < lo_size {
-            let tlen = STREAM_TILE_PAIRS.min(lo_size - t0);
-
-            for pass in 0..n_passes {
-                let lane0 = pass * L;
-                for i in 0..tlen {
-                    let x_lo = t0 + i;
-                    let out = 2 * x_lo;
-                    let delta = deltas.add(out * 16);
-                    let a0_code = u64::from_le(core::ptr::read_unaligned(delta.cast::<u64>()));
-                    let b0_code =
-                        u64::from_le(core::ptr::read_unaligned(delta.add(8).cast::<u64>()));
-                    let a1_code =
-                        u64::from_le(core::ptr::read_unaligned(delta.add(16).cast::<u64>()));
-                    let b1_code =
-                        u64::from_le(core::ptr::read_unaligned(delta.add(24).cast::<u64>()));
-
-                    let va0 = lookup_lanes_q::<L>(scaled_table, a0_code, lane0);
-                    let va1 = lookup_lanes_q::<L>(scaled_table, a1_code, lane0);
-                    let vb0 = lookup_lanes_q::<L>(scaled_table, b0_code, lane0);
-                    let vb1 = lookup_lanes_q::<L>(scaled_table, b1_code, lane0);
-
-                    if pass == 0 {
-                        acc[i] = [va0, va1, vb0, vb1];
-                    } else {
-                        acc[i][0] = veorq_u64(acc[i][0], va0);
-                        acc[i][1] = veorq_u64(acc[i][1], va1);
-                        acc[i][2] = veorq_u64(acc[i][2], vb0);
-                        acc[i][3] = veorq_u64(acc[i][3], vb1);
-                    }
-                }
-            }
-
-            // Finalize: add anchors, store outputs, accumulate the message.
-            for i in 0..tlen {
-                let x_lo = t0 + i;
-                let out = 2 * x_lo;
-                let a0 = veorq_u64(vld1q_u64(anchors.add(2 * out).cast::<u64>()), acc[i][0]);
-                let a1 = veorq_u64(
-                    vld1q_u64(anchors.add(2 * (out + 1)).cast::<u64>()),
-                    acc[i][1],
-                );
-                let b0 = veorq_u64(vld1q_u64(anchors.add(2 * out + 1).cast::<u64>()), acc[i][2]);
-                let b1 = veorq_u64(
-                    vld1q_u64(anchors.add(2 * (out + 1) + 1).cast::<u64>()),
-                    acc[i][3],
-                );
-
-                store_pair_nt(a_out.add(out), a0, a1);
-                store_pair_nt(b_out.add(out), b0, b1);
-
-                let g1 = mul_q(a1, b1);
-                let g_inf = mul_q(veorq_u64(a0, a1), veorq_u64(b0, b1));
-                let eq_l = vld1q_u64(eq_lo.add(x_lo).cast::<u64>());
-                wide_xor(&mut p1_acc, mul_unreduced_q(eq_l, g1));
-                wide_xor(&mut pinf_acc, mul_unreduced_q(eq_l, g_inf));
-            }
-
-            t0 += tlen;
-        }
-
-        (
-            core::mem::transmute::<uint64x2_t, F128>(reduce_wide_q(p1_acc)),
-            core::mem::transmute::<uint64x2_t, F128>(reduce_wide_q(pinf_acc)),
-        )
-    }
-}
-
 /// Reconstruct one compact round-two level at the sampled challenge and form
 /// the next sumcheck message. `scaled_table` is the univariate fold table with
 /// every entry multiplied by that challenge, so reconstruction needs only
 /// cache-resident table loads and XORs:
 ///
 /// `folded = anchor + scaled_table_fold(packed_row0 XOR packed_row1)`.
-///
-/// `degen` enables the b≡1 chunk-class degeneration: pairs whose two b delta
-/// codes are both zero reconstruct `b = anchor` with no b-table lookups; the
-/// value-forced shortcuts (`b0 + b1 = 0` ⇒ skip the `G(∞)` mul chain,
-/// `b1 = 1` ⇒ `a1·b1 = a1`) are additionally gated on the loaded anchor
-/// values, so they are bit-exact by construction.
 #[cfg(target_arch = "aarch64")]
 #[target_feature(enable = "aes")]
 pub(crate) unsafe fn fold_compact_chunk_neon_unchecked_8(
@@ -768,7 +413,6 @@ pub(crate) unsafe fn fold_compact_chunk_neon_unchecked_8(
     b_out: *mut F128,
     eq_lo: *const F128,
     lo_size: usize,
-    degen: bool,
 ) -> (F128, F128) {
     use core::arch::aarch64::*;
 
@@ -790,8 +434,6 @@ pub(crate) unsafe fn fold_compact_chunk_neon_unchecked_8(
         let mut p1_acc = WideNeon { lo: zero, hi: zero };
         let mut pinf_acc = WideNeon { lo: zero, hi: zero };
 
-        let one_q = core::mem::transmute::<F128, uint64x2_t>(F128::ONE);
-
         for x_lo in 0..lo_size {
             let out = 2 * x_lo;
             let delta = deltas.add(out * 16);
@@ -799,36 +441,6 @@ pub(crate) unsafe fn fold_compact_chunk_neon_unchecked_8(
             let b0_code = u64::from_le(core::ptr::read_unaligned(delta.add(8).cast::<u64>()));
             let a1_code = u64::from_le(core::ptr::read_unaligned(delta.add(16).cast::<u64>()));
             let b1_code = u64::from_le(core::ptr::read_unaligned(delta.add(24).cast::<u64>()));
-
-            if degen && (b0_code | b1_code) == 0 {
-                // Zero b deltas: b rows fold to zero (table entry 0 is zero),
-                // so b = anchor with no lookups. On the static b≡1 mass both
-                // anchors are 1: G(∞)'s (b0 + b1) factor vanishes and
-                // a1·b1 = a1; both shortcuts are value-gated below.
-                let (a0_delta, a1_delta) = fold_two_row_codes_q(scaled_table, a0_code, a1_code);
-                let a0 = veorq_u64(vld1q_u64(anchors.add(2 * out).cast::<u64>()), a0_delta);
-                let a1 = veorq_u64(vld1q_u64(anchors.add(2 * (out + 1)).cast::<u64>()), a1_delta);
-                let b0 = vld1q_u64(anchors.add(2 * out + 1).cast::<u64>());
-                let b1 = vld1q_u64(anchors.add(2 * (out + 1) + 1).cast::<u64>());
-
-                store_pair_nt(a_out.add(out), a0, a1);
-                store_pair_nt(b_out.add(out), b0, b1);
-
-                let eq_l = vld1q_u64(eq_lo.add(x_lo).cast::<u64>());
-                let g1 = if is_zero_q(veorq_u64(b1, one_q)) {
-                    a1
-                } else {
-                    mul_q(a1, b1)
-                };
-                wide_xor(&mut p1_acc, mul_unreduced_q(eq_l, g1));
-                let b_sum = veorq_u64(b0, b1);
-                if !is_zero_q(b_sum) {
-                    let g_inf = mul_q(veorq_u64(a0, a1), b_sum);
-                    wide_xor(&mut pinf_acc, mul_unreduced_q(eq_l, g_inf));
-                }
-                continue;
-            }
-
             let (a0_delta, a1_delta, b0_delta, b1_delta) = fold_four_row_codes_q(
                 scaled_table,
                 a0_code,

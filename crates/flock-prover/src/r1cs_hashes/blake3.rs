@@ -1841,44 +1841,7 @@ impl Blake3Setup {
     }
 
     /// Ligerito-backend prove. Requires m ≥ ~21.
-    ///
-    /// The ranked benchmark worker calls this exactly twice per process: an
-    /// untimed fixed-seed warm-up, then the timed proof (submissions ship
-    /// only `crates/*/src`, so per-trial hooks must live here, not in the
-    /// worker binary). Around the underlying prove this wrapper:
-    ///
-    /// - after the first (warm-up) call: serializes the warm-up bundle once
-    ///   so the timed `to_bytes` allocation is warm (`FLOCK_NO_SER_WARM=1`
-    ///   restores discard-only), then starts the pool keepalive nudger for
-    ///   the ready→seed handshake (`FLOCK_NO_EPOOL_KEEPALIVE=1` kills);
-    /// - at the start of the second (timed) call: flips the nudger to
-    ///   proving mode, so the main pool is never nudged mid-proof.
-    ///
-    /// Neither hook touches challenger or prover state; proof bytes are
-    /// identical by construction.
     pub fn prove_fast<Ch: Challenger>(
-        &self,
-        blocks: &[Compression],
-        challenger: &mut Ch,
-    ) -> (flock_core::proof::R1csProofLigerito, Commitment, R1csClaim) {
-        use std::sync::atomic::{AtomicUsize, Ordering};
-        static PROVE_FAST_CALLS: AtomicUsize = AtomicUsize::new(0);
-        let call = PROVE_FAST_CALLS.fetch_add(1, Ordering::Relaxed);
-        // Keepalive nudger removed: ranked submission 51a3127 measured the
-        // stack containing it at −1.4% vs base (outside the ±0.3% band) —
-        // mid-proof pool nudging contends with the leaf pipeline's claims,
-        // the same contention class as the measured hetero-widening losses.
-        // The warm publish below and the spawn-free kickoff stay: their
-        // mechanisms are contention-free.
-        let (proof, commitment, claim) = self.prove_fast_inner(blocks, challenger);
-        if call == 0 {
-            let (proof, commitment) = warm_publish_path(proof, commitment);
-            return (proof, commitment, claim);
-        }
-        (proof, commitment, claim)
-    }
-
-    fn prove_fast_inner<Ch: Challenger>(
         &self,
         blocks: &[Compression],
         challenger: &mut Ch,
@@ -1988,27 +1951,6 @@ impl Blake3Setup {
             challenger,
         )
     }
-}
-
-/// Serialize the warm-up proof bundle once and discard the bytes, so the
-/// timed proof's `to_bytes` (~450 KiB) is served from a warm allocation
-/// (warm malloc size class) instead of a fresh mmap + soft-fault inside the
-/// scored interval, which only ends when the proof file is visible to the
-/// harness. Ownership round-trips through the bundle struct — no clones,
-/// proof bytes untouched.
-///
-/// Kill switch: `FLOCK_NO_SER_WARM=1` restores the discard-only warm-up.
-fn warm_publish_path(
-    proof: flock_core::proof::R1csProofLigerito,
-    commitment: Commitment,
-) -> (flock_core::proof::R1csProofLigerito, Commitment) {
-    if std::env::var_os("FLOCK_NO_SER_WARM").is_some() {
-        return (proof, commitment);
-    }
-    let bundle = crate::proof_io::R1csProofBundleLigerito { commitment, proof };
-    std::hint::black_box(bundle.to_bytes());
-    let crate::proof_io::R1csProofBundleLigerito { commitment, proof } = bundle;
-    (proof, commitment)
 }
 
 // ---------------------------------------------------------------------------
