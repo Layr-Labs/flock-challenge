@@ -141,17 +141,34 @@ pub fn open_batch_mixed_ligerito_with_precomputed_s_hat_v<Ch: Challenger>(
     );
 
     let t = std::time::Instant::now();
-    let ligerito_proof = ligerito::recursive_prover_with_basis_precomputed_round0(
-        lig_config,
-        packed_witness,
-        combined.b_combined,
-        combined.target_combined,
-        &prover_data.codeword,
-        &prover_data.merkle_tree,
-        combined.round0_prime,
-        combined.round1_lookahead,
-        challenger,
-    );
+    let ligerito_proof = if let Some(direct) = combined.direct_fold2 {
+        ligerito::recursive_prover_with_basis_direct_ab_fold2(
+            lig_config,
+            packed_witness,
+            combined.b_combined,
+            direct,
+            combined.target_combined,
+            &prover_data.codeword,
+            &prover_data.merkle_tree,
+            combined.round0_prime,
+            combined
+                .round1_lookahead
+                .expect("direct AB fold2 requires round-1 lookahead"),
+            challenger,
+        )
+    } else {
+        ligerito::recursive_prover_with_basis_precomputed_round0(
+            lig_config,
+            packed_witness,
+            combined.b_combined,
+            combined.target_combined,
+            &prover_data.codeword,
+            &prover_data.merkle_tree,
+            combined.round0_prime,
+            combined.round1_lookahead,
+            challenger,
+        )
+    };
     if trace {
         eprintln!(
             "  [open_batch] ligerito::recursive_prover_with_basis: {:6.2} ms",
@@ -180,6 +197,9 @@ struct CombinedClaim {
     /// Round-1 message as two quadratics in the first fold challenge. Present
     /// only for the exact ranked two-challenge cadence.
     round1_lookahead: Option<[F128; 6]>,
+    /// AB sufficient statistics for direct materialization after rounds 0/1.
+    /// `b_combined` still contains every ordinary claim (currently C).
+    direct_fold2: Option<Vec<ring_switch::DirectFold2Factors>>,
 }
 
 /// Compute the ordinary round-zero message and the following message as two
@@ -229,6 +249,39 @@ fn round0_and_round1_lookahead(witness: &[F128], basis: &[F128]) -> ((F128, F128
         c[5] += p_sum;
     }
     ((u0, u2), c)
+}
+fn messages_from_direct_products(
+    products: &[ring_switch::DirectFold2Factors],
+) -> ((F128, F128), [F128; 6]) {
+    let mut h = [F128::ZERO; 16];
+    for claim in products {
+        for (out, value) in h.iter_mut().zip(claim.products) {
+            *out += value;
+        }
+    }
+    let at = |e: usize, d: usize| h[4 * e + d];
+    let block_sum = |es: &[usize], ds: &[usize]| {
+        let mut sum = F128::ZERO;
+        for &e in es {
+            for &d in ds {
+                sum += at(e, d);
+            }
+        }
+        sum
+    };
+    let round0 = (
+        at(0, 0) + at(2, 2),
+        block_sum(&[0, 1], &[0, 1]) + block_sum(&[2, 3], &[2, 3]),
+    );
+    let lookahead = [
+        at(0, 0),
+        at(0, 1) + at(1, 0),
+        block_sum(&[0, 1], &[0, 1]),
+        block_sum(&[0, 2], &[0, 2]),
+        block_sum(&[0, 2], &[1, 3]) + block_sum(&[1, 3], &[0, 2]),
+        block_sum(&[0, 1, 2, 3], &[0, 1, 2, 3]),
+    ];
+    (round0, lookahead)
 }
 
 /// Exact ranked shape for the heterogeneous combined-basis queue. The gate is
@@ -328,6 +381,19 @@ where
     )
 }
 
+#[inline]
+fn direct_ab_claim_mix_supported(
+    rs_results: &[(RingSwitchProof, ring_switch::RingSwitchBatchOutput)],
+) -> bool {
+    matches!(
+        rs_results,
+        [(_, ab), (_, c)]
+            if ab.direct_fold2.is_some()
+                && c.direct_fold2.is_none()
+                && matches!(&c.rs_eq_ind, ring_switch::RsEqInd::DeferredDense { .. })
+    )
+}
+
 /// Runs ring_switch over RS claims, observes packed-direct claim values +
 /// samples their gammas, then builds `b_combined` (the γ-weighted linear
 /// combination of all `rs_eq_ind`s and `eq_ind`s) and `target_combined`.
@@ -357,7 +423,7 @@ fn compute_combined_basis_and_target<Ch: Challenger>(
 
     // 1. Ring-switching for all x_outers.
     let t = std::time::Instant::now();
-    let (rs_results, gammas_rs): (
+    let (mut rs_results, gammas_rs): (
         Vec<(RingSwitchProof, ring_switch::RingSwitchBatchOutput)>,
         Vec<F128>,
     ) = if n_rs > 0 {
@@ -407,12 +473,39 @@ fn compute_combined_basis_and_target<Ch: Challenger>(
     for (pd, g) in packed_direct.iter().zip(gammas_pd.iter()) {
         target_combined += *g * pd.value;
     }
+    // The ranked direct path is deliberately AB-only: claim 0 supplies the
+    // four-bank sufficient statistic, while claim 1 (C) remains on the exact
+    // incumbent basis path. The opt-out restores the ordinary implementation.
+    let use_direct_ab = enable_fold2
+        && l == (1usize << 25)
+        && n_rs == 2
+        && n_pd == 0
+        && std::env::var_os("FLOCK_NO_OPEN_DIRECT_AB").is_none()
+        && direct_ab_claim_mix_supported(&rs_results);
+    let direct_fold2 = if use_direct_ab {
+        Some(vec![
+            rs_results[0]
+                .1
+                .direct_fold2
+                .take()
+                .expect("direct AB gate checked claim zero"),
+        ])
+    } else {
+        None
+    };
+    let direct_count = if direct_fold2.is_some() { 1 } else { 0 };
 
     let rs_baked: Vec<&[F128]> = rs_results
         .iter()
-        .filter_map(|(_, o)| match &o.rs_eq_ind {
-            ring_switch::RsEqInd::Dense(v) => Some(v.as_slice()),
-            _ => None,
+        .enumerate()
+        .filter_map(|(index, (_, output))| {
+            if use_direct_ab && index == 0 {
+                return None;
+            }
+            match &output.rs_eq_ind {
+                ring_switch::RsEqInd::Dense(values) => Some(values.as_slice()),
+                _ => None,
+            }
         })
         .collect();
     // Deferred-dense claims (fused fast path): the per-claim `γ_k·B_k` buffer
@@ -421,18 +514,24 @@ fn compute_combined_basis_and_target<Ch: Challenger>(
     // claim. Carries (eq_lo, eq_hi, γ-baked table, log₂ B).
     let rs_deferred: Vec<(&[F128], &[F128], &[F128], usize)> = rs_results
         .iter()
-        .filter_map(|(_, o)| match &o.rs_eq_ind {
-            ring_switch::RsEqInd::DeferredDense {
-                eq_lo,
-                eq_hi,
-                table,
-            } => Some((
-                eq_lo.as_slice(),
-                eq_hi.as_slice(),
-                table.as_slice(),
-                eq_lo.len().trailing_zeros() as usize,
-            )),
-            _ => None,
+        .enumerate()
+        .filter_map(|(index, (_, output))| {
+            if use_direct_ab && index == 0 {
+                return None;
+            }
+            match &output.rs_eq_ind {
+                ring_switch::RsEqInd::DeferredDense {
+                    eq_lo,
+                    eq_hi,
+                    table,
+                } => Some((
+                    eq_lo.as_slice(),
+                    eq_hi.as_slice(),
+                    table.as_slice(),
+                    eq_lo.len().trailing_zeros() as usize,
+                )),
+                _ => None,
+            }
         })
         .collect();
     let pd_dense: Vec<(&[F128], F128)> = packed_direct
@@ -464,8 +563,9 @@ fn compute_combined_basis_and_target<Ch: Challenger>(
     // incremental round-0 prime adjustment), so they only require
     // `pd_dense.is_empty()`, not `packed_direct.is_empty()`. This keeps the two
     // big ab/c claims on the fused fold instead of materializing them.
-    let use_fast =
-        !rs_deferred.is_empty() && rs_deferred.len() == rs_results.len() && pd_dense.is_empty();
+    let use_fast = !rs_deferred.is_empty()
+        && rs_deferred.len() + direct_count == rs_results.len()
+        && pd_dense.is_empty();
 
     let want_round1_lookahead = use_fast && enable_fold2;
     let (mut round0_u0, mut round0_u2, round1_lookahead) = if use_fast {
@@ -648,6 +748,17 @@ fn compute_combined_basis_and_target<Ch: Challenger>(
         (prime.0, prime.1, None)
     };
     let mut round1_lookahead = round1_lookahead;
+    if let Some(direct) = direct_fold2.as_ref() {
+        let (direct_round0, direct_lookahead) = messages_from_direct_products(direct);
+        round0_u0 += direct_round0.0;
+        round0_u2 += direct_round0.1;
+        let combined_lookahead = round1_lookahead
+            .as_mut()
+            .expect("direct AB gate requires ordinary C lookahead");
+        for (out, value) in combined_lookahead.iter_mut().zip(direct_lookahead) {
+            *out += value;
+        }
+    }
     let fold_ms = t_fold.elapsed().as_secs_f64() * 1e3;
     let t_sparse = std::time::Instant::now();
     let mut adjust_prime_for_delta = |idx: usize, delta: F128| {
@@ -710,6 +821,7 @@ fn compute_combined_basis_and_target<Ch: Challenger>(
         target_combined,
         round0_prime: (round0_u0, round0_u2),
         round1_lookahead,
+        direct_fold2,
     }
 }
 
@@ -997,6 +1109,77 @@ mod tests {
         assert!(!is_ranked_hetero_open_combine_shape(1 << 25, 1 << 15, 1, 0));
         assert!(!is_ranked_hetero_open_combine_shape(1 << 25, 1 << 15, 2, 1));
     }
+    #[test]
+    fn direct_ab_gate_rejects_sparse_c_without_consuming_ab_state() {
+        let direct = || ring_switch::DirectFold2Factors {
+            eq_lo: Vec::new(),
+            eq_hi: Vec::new(),
+            low_eq: [F128::ZERO; 4],
+            table: Vec::new(),
+            products: [F128::ZERO; 16],
+        };
+        let proof = || RingSwitchProof {
+            s_hat_v: Vec::new(),
+        };
+        let sparse_c = vec![
+            (
+                proof(),
+                ring_switch::RingSwitchBatchOutput {
+                    rs_eq_ind: ring_switch::RsEqInd::DeferredDense {
+                        eq_lo: vec![F128::ONE],
+                        eq_hi: vec![F128::ONE],
+                        table: Vec::new(),
+                    },
+                    sumcheck_claim: F128::ZERO,
+                    direct_fold2: Some(direct()),
+                },
+            ),
+            (
+                proof(),
+                ring_switch::RingSwitchBatchOutput {
+                    rs_eq_ind: ring_switch::RsEqInd::Sparse {
+                        len: 1,
+                        entries: Vec::new(),
+                    },
+                    sumcheck_claim: F128::ZERO,
+                    direct_fold2: None,
+                },
+            ),
+        ];
+        assert!(!direct_ab_claim_mix_supported(&sparse_c));
+        assert!(
+            sparse_c[0].1.direct_fold2.is_some(),
+            "fallback must leave AB state untouched for the ordinary transcript"
+        );
+
+        let ordinary_c = vec![
+            (
+                proof(),
+                ring_switch::RingSwitchBatchOutput {
+                    rs_eq_ind: ring_switch::RsEqInd::DeferredDense {
+                        eq_lo: vec![F128::ONE],
+                        eq_hi: vec![F128::ONE],
+                        table: Vec::new(),
+                    },
+                    sumcheck_claim: F128::ZERO,
+                    direct_fold2: Some(direct()),
+                },
+            ),
+            (
+                proof(),
+                ring_switch::RingSwitchBatchOutput {
+                    rs_eq_ind: ring_switch::RsEqInd::DeferredDense {
+                        eq_lo: vec![F128::ONE],
+                        eq_hi: vec![F128::ONE],
+                        table: Vec::new(),
+                    },
+                    sumcheck_claim: F128::ZERO,
+                    direct_fold2: None,
+                },
+            ),
+        ];
+        assert!(direct_ab_claim_mix_supported(&ordinary_c));
+    }
 
     /// Compact ownership/reduction oracle for the production stateful block
     /// dispatcher. It uses the same 64 KiB private-state size as the ranked
@@ -1082,6 +1265,32 @@ mod tests {
             let evaluated = (c[0] + c[1] * r + c[2] * r2, c[3] + c[4] * r + c[5] * r2);
             assert_eq!(evaluated, oracle1, "round one at log_n={log_n}");
         }
+    }
+    #[test]
+    fn direct_products_reproduce_round0_and_lookahead() {
+        let mut rng = Rng::new(0xD1CE_0002);
+        let mut witness = [F128::ZERO; 4];
+        let mut basis = [F128::ZERO; 4];
+        for value in witness.iter_mut().chain(basis.iter_mut()) {
+            *value = rng.f128();
+        }
+        let mut products = [F128::ZERO; 16];
+        for e in 0..4 {
+            for d in 0..4 {
+                products[4 * e + d] = witness[e] * basis[d];
+            }
+        }
+        let factors = ring_switch::DirectFold2Factors {
+            eq_lo: Vec::new(),
+            eq_hi: Vec::new(),
+            low_eq: [F128::ZERO; 4],
+            table: Vec::new(),
+            products,
+        };
+        assert_eq!(
+            messages_from_direct_products(&[factors]),
+            round0_and_round1_lookahead(&witness, &basis),
+        );
     }
 
     fn zhat_skip_reference(z: &[bool], m: usize, z_skip: F128, x_outer: &[F128]) -> F128 {
