@@ -64,15 +64,6 @@ pub(super) fn butterfly_fused_2layer(
         x86_64::butterfly_fused_2layer(a, b, c, d, t_outer, t_inner_a, t_inner_b);
     }
 
-    #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
-    // SAFETY: the cfg gate supplies `aes`; slice lengths are asserted above.
-    unsafe {
-        if vector_resident_rows() {
-            aarch64::butterfly_fused_2layer(a, b, c, d, t_outer, t_inner_a, t_inner_b);
-            return;
-        }
-    }
-
     #[cfg(not(all(
         target_arch = "x86_64",
         target_feature = "avx512f",
@@ -366,44 +357,6 @@ mod aarch64_row_tests {
                     let idx = r * num_ntts + lane;
                     assert_eq!(got[idx], base[idx], "row 0 was written");
                 }
-            }
-        }
-    }
-
-    /// The vector-resident deep fused-pair kernel must be **bit-identical**
-    /// to the portable `F128`-typed chain across the row widths the ranked
-    /// deep transform uses (`num_ntts = 64` rows) plus narrow/odd widths.
-    #[test]
-    fn neon_fused_2layer_matches_portable() {
-        let mut state = 0x4645_5350_4149_5232;
-        for &width in &[1usize, 2, 5, 16, 64, 96] {
-            for _ in 0..4 {
-                let mut mk = |n: usize| -> Vec<F128> {
-                    (0..n).map(|_| rand_f128(&mut state)).collect()
-                };
-                let (a0, b0, c0, d0) = (mk(width), mk(width), mk(width), mk(width));
-                let t_outer = rand_f128(&mut state);
-                let t_inner_a = rand_f128(&mut state);
-                let t_inner_b = rand_f128(&mut state);
-
-                let (mut wa, mut wb, mut wc, mut wd) =
-                    (a0.clone(), b0.clone(), c0.clone(), d0.clone());
-                portable::butterfly_fused_2layer(
-                    &mut wa, &mut wb, &mut wc, &mut wd, t_outer, t_inner_a, t_inner_b,
-                );
-
-                let (mut ga, mut gb, mut gc, mut gd) = (a0, b0, c0, d0);
-                // SAFETY: this module carries `aes` via cfg; equal lengths.
-                unsafe {
-                    aarch64::butterfly_fused_2layer(
-                        &mut ga, &mut gb, &mut gc, &mut gd, t_outer, t_inner_a, t_inner_b,
-                    );
-                }
-
-                assert_eq!(ga, wa, "row a mismatch at width={width}");
-                assert_eq!(gb, wb, "row b mismatch at width={width}");
-                assert_eq!(gc, wc, "row c mismatch at width={width}");
-                assert_eq!(gd, wd, "row d mismatch at width={width}");
             }
         }
     }
