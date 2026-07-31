@@ -2764,6 +2764,18 @@ pub fn prove_batched_padded_with_precomputed<Ch: Challenger>(
     // transcript work above is complete), so run the two openings' table and
     // split builds in parallel instead of serially at ~2 active threads.
     // Indexed parallel collect preserves output order — bit-identical.
+    // Within a claim, the fold2-factor bundle (quad products + its
+    // `build_eq_split`) and the `rs_eq_ind` build (its own `build_eq_split` /
+    // fold) are independent once `table` is built — join them so a claim's
+    // tail runs its two serial chains concurrently instead of back-to-back
+    // (the AB claim dominates its par_iter lane; the join halves that lane's
+    // critical path). Outputs are assembled in the same positions —
+    // bit-identical. `FLOCK_NO_RS_TAIL_JOIN=1` restores the sequential order.
+    let tail_join_enabled = {
+        use std::sync::OnceLock;
+        static ENABLED: OnceLock<bool> = OnceLock::new();
+        *ENABLED.get_or_init(|| std::env::var_os("FLOCK_NO_RS_TAIL_JOIN").is_none())
+    };
     let results: Vec<(RingSwitchProof, RingSwitchBatchOutput)> = {
         use rayon::prelude::*;
         work.into_par_iter()
@@ -2773,6 +2785,10 @@ pub fn prove_batched_padded_with_precomputed<Ch: Challenger>(
             let scaled_eq_r_dprime: Vec<F128> =
                 w.eq_r_dprime.iter().map(|value| g * *value).collect();
             let table = build_fold_byte_table(&scaled_eq_r_dprime);
+            // The rs_eq_ind branch consumes a table of its own so the two join
+            // arms don't contend over ownership; a 32 KiB clone, value-equal.
+            let table_for_eq_ind = table.clone();
+            let build_fold2_bundles = || {
             let direct_fold2 = match (kinds[i], w.s_hat_v_quad.as_deref()) {
                 (Kind::Dense(d), Some(quad)) if use_split && dense_suffixes[d].len() >= 2 => {
                     let suffix = dense_suffixes[d];
@@ -2828,7 +2844,9 @@ pub fn prove_batched_padded_with_precomputed<Ch: Challenger>(
                 }
                 _ => None,
             };
-            let rs_eq_ind = match kinds[i] {
+                (direct_fold2, deferred_c_fold2)
+            };
+            let build_rs_eq_ind = || match kinds[i] {
                 Kind::Dense(d) => {
                     if use_split {
                         // Defer the fold: carry split factors + the γ-baked byte
@@ -2852,7 +2870,7 @@ pub fn prove_batched_padded_with_precomputed<Ch: Challenger>(
                         RsEqInd::DeferredDense {
                             eq_lo,
                             eq_hi,
-                            table,
+                            table: table_for_eq_ind,
                         }
                     } else {
                         RsEqInd::Dense(fold_b128_elems(&dense_tensors[d], &scaled_eq_r_dprime))
@@ -2863,6 +2881,11 @@ pub fn prove_batched_padded_with_precomputed<Ch: Challenger>(
                     entries: fold_b128_elems_sparse_pairs(&sparse_supports[s], &scaled_eq_r_dprime),
                 },
             };
+                let ((direct_fold2, deferred_c_fold2), rs_eq_ind) = if tail_join_enabled {
+                    rayon::join(build_fold2_bundles, build_rs_eq_ind)
+                } else {
+                    (build_fold2_bundles(), build_rs_eq_ind())
+                };
                 (
                     RingSwitchProof { s_hat_v: w.s_hat_v },
                     RingSwitchBatchOutput {

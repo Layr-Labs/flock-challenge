@@ -861,7 +861,10 @@ pub fn merkle_multi_proof(tree: &[Hash], num_leaves: usize, positions: &[usize])
     active.dedup();
     debug_assert!(active.iter().all(|&p| p < num_leaves));
 
-    let mut proof = Vec::new();
+    // Phase 1 — index-only level walk (cheap arithmetic, no tree reads):
+    // record, in emission order, the tree index of every sibling hash the
+    // proof needs. Identical traversal to the incumbent single-pass loop.
+    let mut emit: Vec<usize> = Vec::new();
     let mut level_start = 0usize;
     let mut level_len = num_leaves;
 
@@ -877,7 +880,7 @@ pub fn merkle_multi_proof(tree: &[Hash], num_leaves: usize, positions: &[usize])
                 i += 2;
             } else {
                 // Sibling not in active set; emit it.
-                proof.push(tree[level_start + (p ^ 1)]);
+                emit.push(level_start + (p ^ 1));
                 i += 1;
             }
             next.push(p >> 1);
@@ -890,7 +893,27 @@ pub fn merkle_multi_proof(tree: &[Hash], num_leaves: usize, positions: &[usize])
         level_len >>= 1;
     }
 
-    proof
+    // Phase 2 — gather. The emitted nodes are scattered across a tree that is
+    // DRAM-cold at ranked sizes (the L0 tree is ~2^22 hashes), so the serial
+    // gather is a ~one-cache-miss-per-node latency chain on one thread while
+    // the rest of the pool idles between transcript rounds. An indexed
+    // parallel gather issues those independent misses concurrently and the
+    // order-preserving collect keeps the proof byte-identical (same emission
+    // list, same order). Small proofs stay serial: rayon dispatch would cost
+    // more than the handful of loads. `FLOCK_NO_PAR_MULTIPROOF=1` restores
+    // the serial gather everywhere.
+    const PAR_GATHER_MIN: usize = 512;
+    let par_enabled = emit.len() >= PAR_GATHER_MIN && {
+        use std::sync::OnceLock;
+        static ENABLED: OnceLock<bool> = OnceLock::new();
+        *ENABLED.get_or_init(|| std::env::var_os("FLOCK_NO_PAR_MULTIPROOF").is_none())
+    };
+    if par_enabled {
+        use rayon::prelude::*;
+        emit.par_iter().map(|&idx| tree[idx]).collect()
+    } else {
+        emit.iter().map(|&idx| tree[idx]).collect()
+    }
 }
 
 /// Verify a Merkle multi-proof produced by [`merkle_multi_proof`].
