@@ -1577,6 +1577,28 @@ const FOLD_N_BYTES: usize = 16;
 /// Entries per byte-lookup table.
 const FOLD_TABLE_SIZE: usize = 256;
 
+// The SHA3 extension includes EOR3; retain the two-EOR form for generic
+// AArch64 builds that do not enable it.
+#[cfg(target_feature = "sha3")]
+#[inline(always)]
+fn xor3_f128(a: F128, b: F128, c: F128) -> F128 {
+    unsafe {
+        core::mem::transmute::<core::arch::aarch64::uint64x2_t, F128>(
+            core::arch::aarch64::veor3q_u64(
+                core::mem::transmute::<F128, core::arch::aarch64::uint64x2_t>(a),
+                core::mem::transmute::<F128, core::arch::aarch64::uint64x2_t>(b),
+                core::mem::transmute::<F128, core::arch::aarch64::uint64x2_t>(c),
+            ),
+        )
+    }
+}
+
+#[cfg(not(target_feature = "sha3"))]
+#[inline(always)]
+fn xor3_f128(a: F128, b: F128, c: F128) -> F128 {
+    a + (b + c)
+}
+
 /// Build the 16×256 byte-lookup table the fold indexes: `table[k·256 + v]` =
 /// `Σ_{bit b set in v} eq_r_dprime[k·8 + b]`. For the ring-switch fold,
 /// `eq_r_dprime` already has γ_k baked in, so the table carries γ too.
@@ -1639,16 +1661,11 @@ pub(crate) fn fold_one_slot(elem: F128, tables: &[F128]) -> F128 {
     let p5 = h2 + h3;
     let p6 = h4 + h5;
     let p7 = h6 + h7;
-    // Level 2.
-    let q0 = p0 + p1;
-    let q1 = p2 + p3;
-    let q2 = p4 + p5;
-    let q3 = p6 + p7;
-    // Level 3.
-    let r0 = q0 + q1;
-    let r1 = q2 + q3;
-    // Level 4.
-    r0 + r1
+    // Levels 2–3: three-input nodes reduce the 16-load tree from depth 4 to 3.
+    let q0 = xor3_f128(p0, p1, p2);
+    let q1 = xor3_f128(p3, p4, p5);
+    let q2 = p6 + p7;
+    xor3_f128(q0, q1, q2)
 }
 
 /// Total length of a fold byte table (`build_fold_byte_table` output).
