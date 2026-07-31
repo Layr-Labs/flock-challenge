@@ -14,19 +14,9 @@
 
 pub use flock_core::*;
 
+pub mod bench_input;
 pub mod chain;
 pub mod merkle_path;
 pub mod proof_io;
 pub mod prover;
 pub mod r1cs_hashes;
-#[cfg(all(target_os = "macos", not(test)))]
-pub mod recycle_alloc;
-
-/// Process-wide recycling allocator (see [`recycle_alloc`]). Declared in the
-/// library so every binary linking `flock_prover` — including the benchmark
-/// worker — gets warm large-block reuse between the untimed warm-up prove
-/// and the timed prove. Disabled under `cfg(test)` so unit tests run on the
-/// stock allocator.
-#[cfg(all(target_os = "macos", not(test)))]
-#[global_allocator]
-static RECYCLE_ALLOC: recycle_alloc::RecycleAlloc = recycle_alloc::RecycleAlloc;

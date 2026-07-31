@@ -43,6 +43,7 @@ use crate::field::{F128, F256Unreduced, PHI_8_TABLE};
 use crate::scratch::ScratchBytes;
 use crate::zerocheck::PaddingSpec;
 use crate::zerocheck::univariate_skip::{SplitEqGhash, build_eq, pack_bits};
+use std::sync::OnceLock;
 
 mod kernels;
 
@@ -116,6 +117,65 @@ pub fn lagrange_weights_naive(k_skip: usize, z: F128) -> Vec<F128> {
     weights
 }
 
+const FAST_LAGRANGE_K_SKIP: usize = 6;
+const FAST_LAGRANGE_ELL: usize = 1 << FAST_LAGRANGE_K_SKIP;
+
+#[inline]
+fn fast_lagrange_k6_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("FLOCK_NO_FAST_LAGRANGE_K6").is_none())
+}
+
+/// The Lagrange denominator is identical at every node of the 64-element
+/// additive subspace, and also on any of its affine cosets. Cache its inverse
+/// once per process.
+fn lagrange_k6_denominator_inv() -> F128 {
+    static DEN_INV: OnceLock<F128> = OnceLock::new();
+    *DEN_INV.get_or_init(|| {
+        let denominator = PHI_8_TABLE[1..FAST_LAGRANGE_ELL]
+            .iter()
+            .copied()
+            .fold(F128::ONE, |acc, value| acc * value);
+        assert!(
+            !denominator.is_zero(),
+            "k=6 Lagrange domain must be distinct"
+        );
+        denominator.inv()
+    })
+}
+
+/// Linear-time Lagrange weights on either the k=6 S domain (`offset = 0`) or
+/// its Λ coset (`offset = 64`). Prefix/suffix products avoid division by
+/// `z + s_i`, so this remains valid when `z` is itself a domain node.
+fn lagrange_weights_k6(z: F128, offset: usize) -> Vec<F128> {
+    debug_assert!(offset + FAST_LAGRANGE_ELL <= PHI_8_TABLE.len());
+
+    let mut prefix = [F128::ONE; FAST_LAGRANGE_ELL + 1];
+    prefix[0] = lagrange_k6_denominator_inv();
+    for i in 0..FAST_LAGRANGE_ELL {
+        prefix[i + 1] = prefix[i] * (z + PHI_8_TABLE[offset + i]);
+    }
+
+    let mut weights = vec![F128::ZERO; FAST_LAGRANGE_ELL];
+    let mut suffix = F128::ONE;
+    for i in (0..FAST_LAGRANGE_ELL).rev() {
+        weights[i] = prefix[i] * suffix;
+        suffix *= z + PHI_8_TABLE[offset + i];
+    }
+    weights
+}
+
+/// Lagrange weights on the S domain. The protocol-fixed k=6 path uses shared
+/// denominators plus prefix/suffix products, reducing each construction from
+/// quadratic work and 64 inversions to linear work with no warm inversions.
+pub fn lagrange_weights(k_skip: usize, z: F128) -> Vec<F128> {
+    if k_skip == FAST_LAGRANGE_K_SKIP && fast_lagrange_k6_enabled() {
+        lagrange_weights_k6(z, 0)
+    } else {
+        lagrange_weights_naive(k_skip, z)
+    }
+}
+
 /// Lagrange weights `L_i^Λ(z)` for `i ∈ 0..2^k_skip` at the fold point `z`,
 /// where the nodes are the **extension domain** `Λ = {2^k_skip, …, 2^(k_skip+1) − 1}`
 /// embedded via `φ_8` (offset by `2^k_skip` from the S-domain nodes).
@@ -143,6 +203,16 @@ pub fn lagrange_weights_lambda_naive(k_skip: usize, z: F128) -> Vec<F128> {
     weights
 }
 
+/// Lagrange weights on the Λ extension domain. For k=6, Λ is an affine coset
+/// of S and therefore shares the same cached node-difference denominator.
+pub fn lagrange_weights_lambda(k_skip: usize, z: F128) -> Vec<F128> {
+    if k_skip == FAST_LAGRANGE_K_SKIP && fast_lagrange_k6_enabled() {
+        lagrange_weights_k6(z, FAST_LAGRANGE_ELL)
+    } else {
+        lagrange_weights_lambda_naive(k_skip, z)
+    }
+}
+
 /// Interpolate a degree-`< 2^k_skip` polynomial at z, given its `2^k_skip`
 /// evaluations on Λ. Returns `Σ_i L_i^Λ(z) · values[i]`.
 ///
@@ -152,7 +222,7 @@ pub fn lagrange_weights_lambda_naive(k_skip: usize, z: F128) -> Vec<F128> {
 pub fn interpolate_at_z_on_lambda(values: &[F128], k_skip: usize, z: F128) -> F128 {
     let ell = 1usize << k_skip;
     assert_eq!(values.len(), ell);
-    let weights = lagrange_weights_lambda_naive(k_skip, z);
+    let weights = lagrange_weights_lambda(k_skip, z);
     let mut acc = F128::ZERO;
     for i in 0..ell {
         acc += weights[i] * values[i];
@@ -356,7 +426,7 @@ pub fn uni_skip_fold_and_round_pair_naive(
 ///
 ///   `data[j * 256 + v] = Σ_{b : bit b of v set} weights[8j + b]`
 ///
-/// where `weights = lagrange_weights_naive(k_skip, z)`. Built incrementally by
+/// where `weights = lagrange_weights(k_skip, z)`. Built incrementally by
 /// XOR-composition over the set bits of `v` (one XOR per non-power-of-2 entry).
 ///
 /// Per-row fold then becomes one table lookup + XOR per byte (n_chunks lookups
@@ -372,7 +442,7 @@ impl UniSkipFoldTable {
         let ell = 1usize << k_skip;
         assert_eq!(ell % 8, 0, "k_skip must be ≥ 3 (need ell divisible by 8)");
         let n_chunks = ell / 8;
-        let weights = lagrange_weights_naive(k_skip, z);
+        let weights = lagrange_weights(k_skip, z);
 
         let mut data = vec![F128::ZERO; n_chunks * 256];
         for j in 0..n_chunks {
@@ -1496,6 +1566,30 @@ mod tests {
                 for j in 0..ell {
                     let expected = if j == i { F128::ONE } else { F128::ZERO };
                     assert_eq!(weights[j], expected, "k_skip={k_skip}, z=node{i}, j={j}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn fast_lagrange_k6_matches_naive_on_s_and_lambda() {
+        let mut rng = Rng::new(0x1A6A_6E00);
+        for offset in [0, FAST_LAGRANGE_ELL] {
+            for _ in 0..8 {
+                let z = rng.f128();
+                let expected = if offset == 0 {
+                    lagrange_weights_naive(FAST_LAGRANGE_K_SKIP, z)
+                } else {
+                    lagrange_weights_lambda_naive(FAST_LAGRANGE_K_SKIP, z)
+                };
+                assert_eq!(lagrange_weights_k6(z, offset), expected);
+            }
+
+            for i in 0..FAST_LAGRANGE_ELL {
+                let weights = lagrange_weights_k6(PHI_8_TABLE[offset + i], offset);
+                for (j, &weight) in weights.iter().enumerate() {
+                    let expected = if i == j { F128::ONE } else { F128::ZERO };
+                    assert_eq!(weight, expected, "offset={offset}, node={i}, weight={j}");
                 }
             }
         }

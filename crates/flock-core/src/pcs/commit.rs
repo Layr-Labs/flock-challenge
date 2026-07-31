@@ -155,10 +155,12 @@ pub struct ProverData {
 }
 
 // Recycle the codeword buffer (the prover's largest single allocation —
-// 128 MB at m = 29) through the scratch pool instead of unmapping it.
+// 128 MB at m = 29) and the flat Merkle tree (64 MiB at the ranked m = 32)
+// through the scratch pools instead of unmapping them.
 impl Drop for ProverData {
     fn drop(&mut self) {
         crate::scratch::give_f128(std::mem::take(&mut self.codeword));
+        crate::scratch::give_hash(std::mem::take(&mut self.merkle_tree));
     }
 }
 
@@ -322,7 +324,6 @@ fn ranked_ntt_with_pipelined_leaves(
     params: &PcsParams,
     tree: &mut [Hash],
     helper: &rayon::ThreadPool,
-    pass1_msg: Option<&[F128]>,
 ) -> usize {
     use rayon::prelude::*;
     use std::sync::Mutex;
@@ -408,25 +409,11 @@ fn ranked_ntt_with_pipelined_leaves(
         && std::env::var_os("FLOCK_NO_NTT_TOP_EPOOL").is_none()
         && std::env::var_os("FLOCK_NTT_BLOCK_REGIONS").is_none();
     if split_ranked_top {
-        match pass1_msg {
-            // Codeword arrives uninitialized: the first radix-8 pass reads the
-            // packed message directly and writes every codeword element.
-            Some(msg) => ntt.forward_transform_interleaved_ranked_top_from_message(
-                msg,
-                codeword,
-                num_ntts,
-                params.log_inv_rate,
-            ),
-            None => ntt.forward_transform_interleaved_ranked_top_from_layer(
-                codeword,
-                num_ntts,
-                params.log_inv_rate,
-            ),
-        }
-    } else if let Some(msg) = pass1_msg {
-        // The top split is disabled; restore the replica precondition the
-        // unsplit transform expects.
-        replicate_message_fill(codeword, msg);
+        ntt.forward_transform_interleaved_ranked_top_from_layer(
+            codeword,
+            num_ntts,
+            params.log_inv_rate,
+        );
     }
 
     std::thread::scope(|scope| {
@@ -487,49 +474,9 @@ fn ranked_ntt_with_pipelined_leaves(
     local_parent_levels
 }
 
-/// Commit from the packed message and an **uninitialized** codeword buffer:
-/// the ranked top NTT's first radix-8 pass reads `z_packed` directly and
-/// writes every codeword element, so the rate-1/2 replica copies are never
-/// materialized (neither by the caller nor here). Falls back to
-/// [`replicate_message_fill`] + the ordinary path whenever the ranked top
-/// split is unavailable, or under `FLOCK_NO_NTT_PASS1_FROM_Z=1` (the exact
-/// A/B control).
-pub fn commit_from_message_hot(
-    z_packed: &[F128],
-    mut codeword: Vec<F128>,
-    params: &PcsParams,
-) -> (Commitment, ProverData) {
-    params.validate();
-    assert_eq!(z_packed.len(), 1usize << params.log_msg_len());
-    let codeword_len = params.n_positions() * params.num_ntts();
-    assert_eq!(
-        codeword.len(),
-        codeword_len,
-        "commit_from_message_hot: codeword buffer has wrong length"
-    );
-    if std::env::var_os("FLOCK_NO_NTT_PASS1_FROM_Z").is_none() {
-        finalize_commit_from(codeword, params, Some(z_packed))
-    } else {
-        replicate_message_fill(&mut codeword, z_packed);
-        finalize_commit(codeword, params)
-    }
-}
-
 /// Shared tail of [`commit`] / [`commit_into`]: interleaved forward additive
 /// NTT (RS-encode every lane) then the initial Merkle tree over codeword rows.
-fn finalize_commit(codeword: Vec<F128>, params: &PcsParams) -> (Commitment, ProverData) {
-    finalize_commit_from(codeword, params, None)
-}
-
-/// [`finalize_commit`] with an optional message source for the ranked top
-/// NTT's first pass (see [`commit_from_message_hot`]). With `Some(msg)` the
-/// codeword may be entirely uninitialized; every fallback branch restores the
-/// replica precondition before running the unsplit transform.
-fn finalize_commit_from(
-    mut codeword: Vec<F128>,
-    params: &PcsParams,
-    pass1_msg: Option<&[F128]>,
-) -> (Commitment, ProverData) {
+fn finalize_commit(mut codeword: Vec<F128>, params: &PcsParams) -> (Commitment, ProverData) {
     let helper = if use_ranked_ntt_merkle_leaf_pipeline(params) && rayon::current_num_threads() > 1
     {
         crate::epool::epool()
@@ -544,7 +491,7 @@ fn finalize_commit_from(
         // advances allocation lifetime but does not raise the commit's final
         // codeword+tree peak alongside the retained prover scratch pools.
         let total_nodes = 2 * params.n_leaves() - 1;
-        crate::alloc_uninit_vec::<Hash>(total_nodes)
+        crate::scratch::take_hash(total_nodes)
     });
     let timing = std::env::var_os("FLOCK_COMMIT_TIMING").is_some();
     let t_ntt = std::time::Instant::now();
@@ -561,14 +508,8 @@ fn finalize_commit_from(
             params,
             tree,
             helper,
-            pass1_msg,
         );
     } else {
-        if let Some(msg) = pass1_msg {
-            // No pipelined-leaves path: restore the replica precondition the
-            // unsplit transform expects before running it.
-            replicate_message_fill(&mut codeword, msg);
-        }
         ntt.forward_transform_interleaved_from_layer(
             &mut codeword,
             params.num_ntts(),
@@ -846,7 +787,6 @@ mod tests {
             &params,
             &mut got_tree,
             &helper,
-            None,
         );
         let got_tree = merkle::merkle_tree_from_prehashed_level(
             got_tree,

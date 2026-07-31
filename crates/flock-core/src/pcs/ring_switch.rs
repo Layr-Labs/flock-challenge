@@ -27,7 +27,7 @@
 //! `ν_φ8(i_skip)(z_skip)` are not tensor-factorizable.
 //!
 //! Resolution: replace the verifier's claim check with **direct** Lagrange
-//! weights (computed via [`lagrange_weights_naive`]); every other component of
+//! weights (computed via [`lagrange_weights`]); every other component of
 //! the reduction (`s_hat_v`, `s_hat_u`, BaseFold target `T`, `rs_eq_ind`) is
 //! independent of the prefix and stays identical to Binius.
 //!
@@ -61,7 +61,7 @@ use crate::bits::transpose_8x8_bits;
 use crate::challenger::Challenger;
 use crate::field::F128;
 use crate::zerocheck::PaddingSpec;
-use crate::zerocheck::multilinear::lagrange_weights_naive;
+use crate::zerocheck::multilinear::lagrange_weights;
 use crate::zerocheck::univariate_skip::build_eq;
 use serde::{Deserialize, Serialize};
 
@@ -137,7 +137,7 @@ impl ChunkPadding {
 /// bit (a standard multilinear coord).
 pub fn build_claim_weights(z_skip: F128, x_outer_0: F128) -> Vec<F128> {
     const K_SKIP: usize = 6;
-    let lambda = lagrange_weights_naive(K_SKIP, z_skip); // length 64
+    let lambda = lagrange_weights(K_SKIP, z_skip); // length 64
     debug_assert_eq!(lambda.len(), 1 << K_SKIP);
 
     let eq_lo = F128::ONE + x_outer_0; // eq(x_outer_0, 0)
@@ -2569,22 +2569,10 @@ pub fn prove_batched_padded_with_precomputed<Ch: Challenger>(
     //    back to the materialized tensor + the legacy multi-fold.
     let use_split = l.is_multiple_of(16);
     let t = std::time::Instant::now();
-    // `dense_splits[d]` is only ever read by the fold_1b_rows dispatch below,
-    // and only for claims without a precomputed s_hat_v. The deferred-fold
-    // path later re-splits coarse (`deferred_split_n_lo`) on purpose, so
-    // building balanced splits for precomputed claims is pure dead work —
-    // skip them (empty placeholders keep the `d` indexing intact).
     let dense_splits: Vec<(Vec<F128>, Vec<F128>)> = if use_split {
         dense_suffixes
             .iter()
-            .enumerate()
-            .map(|(d, s)| {
-                if has_precomputed(dense_to_orig[d]) {
-                    (Vec::new(), Vec::new())
-                } else {
-                    build_eq_split(s, split_n_lo(s.len()))
-                }
-            })
+            .map(|s| build_eq_split(s, split_n_lo(s.len())))
             .collect()
     } else {
         Vec::new()
@@ -3206,7 +3194,7 @@ mod tests {
         assert_eq!(z.len(), 1 << m);
         assert_eq!(x_outer.len(), m - K_SKIP);
 
-        let lambda = lagrange_weights_naive(K_SKIP, z_skip); // 64 weights
+        let lambda = crate::zerocheck::multilinear::lagrange_weights_naive(K_SKIP, z_skip);
         let eq_outer = build_eq(x_outer); // 2^(m-6) values
 
         // Index convention: z[i] for i ∈ 0..2^m, with low k_skip bits = i_skip and
