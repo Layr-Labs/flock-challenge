@@ -404,3 +404,56 @@ pub(super) unsafe fn butterfly_block_pair(chunk: &mut [F128], t_a: F128, t_b: F1
     chunk[2] = new_u_b;
     chunk[3] = new_v_b;
 }
+
+/// Vector-resident twin of `portable::butterfly_fused_2layer` — the deep
+/// fused-pair chain held in q registers end to end.
+///
+/// The four generic deep pairs of the ranked L0 transform (layers 10..18)
+/// run the portable `F128`-typed chain: four `ghash_mul_binius` calls per
+/// lane, each repacking its NEON accumulator into `{ lo, hi }`, with every
+/// butterfly `+` done as scalar `u64` XOR pairs — the same
+/// register-file shuttling the fused-3-layer row kernels above eliminate
+/// for the top passes. Here the four row values and every intermediate stay
+/// in `uint64x2_t` across both layers; values enter and leave vector
+/// registers exactly once per lane. Same multiplies, same butterfly order,
+/// bit-identical output.
+///
+/// # Safety
+/// Same contract as the portable form; caller guarantees equal slice
+/// lengths (asserted upstream) and the `aes` target feature.
+#[target_feature(enable = "aes")]
+#[allow(clippy::too_many_arguments)]
+pub(super) unsafe fn butterfly_fused_2layer(
+    a: &mut [F128],
+    b: &mut [F128],
+    c: &mut [F128],
+    d: &mut [F128],
+    t_outer: F128,
+    t_inner_a: F128,
+    t_inner_b: F128,
+) {
+    use core::arch::aarch64::*;
+    unsafe {
+        let to = vld1q_u64((&raw const t_outer).cast::<u64>());
+        let ta = vld1q_u64((&raw const t_inner_a).cast::<u64>());
+        let tb = vld1q_u64((&raw const t_inner_b).cast::<u64>());
+        for lane in 0..a.len() {
+            let xa = vld1q_u64((&raw const a[lane]).cast::<u64>());
+            let xb = vld1q_u64((&raw const b[lane]).cast::<u64>());
+            let xc = vld1q_u64((&raw const c[lane]).cast::<u64>());
+            let xd = vld1q_u64((&raw const d[lane]).cast::<u64>());
+
+            // Layer L: (a,c) and (b,d) share t_outer.
+            let (na, nc) = butterfly_q(xa, xc, to);
+            let (nb, nd) = butterfly_q(xb, xd, to);
+            // Layer L+1: (a,b) under t_inner_a, (c,d) under t_inner_b.
+            let (fa, fb) = butterfly_q(na, nb, ta);
+            let (fc, fd) = butterfly_q(nc, nd, tb);
+
+            vst1q_u64((&raw mut a[lane]).cast::<u64>(), fa);
+            vst1q_u64((&raw mut b[lane]).cast::<u64>(), fb);
+            vst1q_u64((&raw mut c[lane]).cast::<u64>(), fc);
+            vst1q_u64((&raw mut d[lane]).cast::<u64>(), fd);
+        }
+    }
+}
