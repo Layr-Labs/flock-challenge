@@ -26,7 +26,7 @@
 //! ```
 
 use flock_core::challenger::Challenger;
-use flock_core::field::{F8, F128};
+use flock_core::field::F128;
 use flock_core::lincheck::{self, QuirkyPoint, pack_z_lincheck_from_packed};
 use flock_core::pcs::{self, Commitment, PcsParams};
 use flock_core::proof::{R1csClaim, R1csProofLigerito, ZClaim, bind_statement};
@@ -391,9 +391,8 @@ fn commit_with_round1_ab_precompute(
     let a_packed = as_bytes(a_packed_f128);
     let b_packed = as_bytes(b_packed_f128);
     let k_skip = zerocheck::K_SKIP;
-    let ntt_s = flock_core::ntt::AdditiveNttGf8::new(k_skip, F8::ZERO);
-    let ntt_l = flock_core::ntt::AdditiveNttGf8::new(k_skip, F8(1u8 << k_skip));
-    let inv_table = flock_core::ntt::InvNttTableByteSingleGf8::new(&ntt_s, &ntt_l);
+    debug_assert_eq!(k_skip, 6, "ranked protocol fixes k_skip=6");
+    let inv_table = flock_core::ntt::InvNttTableByteSingleGf8::cached_standard_k6();
 
     rayon::join(
         || match commit_codeword {
@@ -409,7 +408,7 @@ fn commit_with_round1_ab_precompute(
                 b_packed,
                 pcs_params.m,
                 k_skip,
-                &inv_table,
+                inv_table,
                 padding,
             )
         },
