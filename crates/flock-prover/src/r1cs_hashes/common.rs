@@ -82,14 +82,19 @@ impl<const NW: usize> BitRecord<NW> {
 /// `left/right/carry_aux` masked to the low 31 bits (bit 31 is the discarded
 /// mod-2³² carry-out; the carry slot is 31 bits wide).
 #[inline(always)]
-pub(crate) fn add_carry_parts(x: u32, y: u32) -> (u32, u32, u32, u32) {
+pub(crate) fn add_carry_parts_no_aux(x: u32, y: u32) -> (u32, u32, u32) {
     let sum = x.wrapping_add(y);
     let cin = sum ^ x ^ y;
     const MASK_LO31: u32 = 0x7FFF_FFFF;
     let left = (x ^ cin) & MASK_LO31;
     let right = (y ^ cin) & MASK_LO31;
-    let carry_aux = left & right;
-    (sum, left, right, carry_aux)
+    (sum, left, right)
+}
+
+#[inline(always)]
+pub(crate) fn add_carry_parts(x: u32, y: u32) -> (u32, u32, u32, u32) {
+    let (sum, left, right) = add_carry_parts_no_aux(x, y);
+    (sum, left, right, left & right)
 }
 
 // ---------------------------------------------------------------------------

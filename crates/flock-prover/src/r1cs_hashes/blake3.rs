@@ -88,7 +88,7 @@
 //!   are "free" witness bits. PCS-level openings at fixed indices will
 //!   eventually pin them to claimed public inputs.
 
-use super::common::{BitRecord, add_carry_parts, or_bit_at, or_u32_at_bit, xor_dedup};
+use super::common::{BitRecord, add_carry_parts, add_carry_parts_no_aux, or_bit_at, or_u32_at_bit, xor_dedup};
 use flock_core::challenger::Challenger;
 use flock_core::field::F128;
 use flock_core::merkle::HashKind;
@@ -1199,11 +1199,9 @@ impl<'a> PackedWordWriter<'a> {
 #[inline(always)]
 fn stream_lin_word(
     value: u32,
-    z: &mut PackedWordWriter<'_>,
     a: &mut PackedWordWriter<'_>,
     b: &mut PackedWordWriter<'_>,
 ) {
-    z.push(value as u64, 32);
     a.push(value as u64, 32);
     b.push(u32::MAX as u64, 32);
 }
@@ -1354,35 +1352,32 @@ fn build_block_witness_ab_stream_into(
     debug_assert_eq!(a.len(), U64_PER_BLOCK);
     debug_assert_eq!(b.len(), U64_PER_BLOCK);
 
-    let mut wz = PackedWordWriter::new(z);
     let mut wa = PackedWordWriter::new(a);
     let mut wb = PackedWordWriter::new(b);
 
     // Layout prefix: cv, then the aligned out_lo slot whose value is not known
     // until after the seven rounds.
     for &value in cv {
-        stream_lin_word(value, &mut wz, &mut wa, &mut wb);
+        stream_lin_word(value, &mut wa, &mut wb);
     }
     for _ in 0..8 {
-        wz.push(0, 32);
         wa.push(0, 32);
         wb.push(0, 32);
     }
 
     // Constant pin, message, counter, length, and flags are contiguous.
-    wz.push(1, 1);
     wa.push(1, 1);
     wb.push(1, 1);
     for &value in m {
-        stream_lin_word(value, &mut wz, &mut wa, &mut wb);
+        stream_lin_word(value, &mut wa, &mut wb);
     }
     let counter_lo = counter as u32;
     let counter_hi = (counter >> 32) as u32;
-    stream_lin_word(counter_lo, &mut wz, &mut wa, &mut wb);
-    stream_lin_word(counter_hi, &mut wz, &mut wa, &mut wb);
-    stream_lin_word(block_len, &mut wz, &mut wa, &mut wb);
-    stream_lin_word(flags, &mut wz, &mut wa, &mut wb);
-    debug_assert_eq!(wz.position(), GS_BASE);
+    stream_lin_word(counter_lo, &mut wa, &mut wb);
+    stream_lin_word(counter_hi, &mut wa, &mut wb);
+    stream_lin_word(block_len, &mut wa, &mut wb);
+    stream_lin_word(flags, &mut wa, &mut wb);
+    debug_assert_eq!(wa.position(), GS_BASE);
 
     let mut state: [u32; 16] = [
         cv[0],
@@ -1415,14 +1410,12 @@ fn build_block_witness_ab_stream_into(
             let c_val = state[lc];
             let d_val = state[ld];
 
-            let mut rz = BitRecord::<4>::new();
             let mut ra = BitRecord::<4>::new();
             let mut rb = BitRecord::<4>::new();
 
             macro_rules! add_into_stream {
                 ($pos:ident, $x:expr, $y:expr) => {{
-                    let (sum, left, right, carry) = add_carry_parts($x, $y);
-                    rz.push::<$pos>(carry);
+                    let (sum, left, right) = add_carry_parts_no_aux($x, $y);
                     ra.push::<$pos>(left);
                     rb.push::<$pos>(right);
                     sum
@@ -1440,14 +1433,11 @@ fn build_block_witness_ab_stream_into(
             let c_2 = add_into_stream!(REC_C5, c_1, d_2);
             let b_new = (b_1 ^ c_2).rotate_right(7);
             let d_new = d_2;
-            rz.push::<REC_LIN0>(b_new);
             ra.push::<REC_LIN0>(b_new);
             rb.push::<REC_LIN0>(u32::MAX);
-            rz.push::<REC_LIN1>(d_new);
             ra.push::<REC_LIN1>(d_new);
             rb.push::<REC_LIN1>(u32::MAX);
 
-            wz.push_record(&rz, G_STRIDE);
             wa.push_record(&ra, G_STRIDE);
             wb.push_record(&rb, G_STRIDE);
 
@@ -1457,15 +1447,14 @@ fn build_block_witness_ab_stream_into(
             state[ld] = d_new;
         }
     }
-    debug_assert_eq!(wz.position(), OUT_HI_BASE);
+    debug_assert_eq!(wa.position(), OUT_HI_BASE);
 
     let out_lo: [u32; 8] = std::array::from_fn(|w| state[w] ^ state[w + 8]);
     for w in 0..8 {
-        stream_lin_word(state[w + 8] ^ cv[w], &mut wz, &mut wa, &mut wb);
+        stream_lin_word(state[w + 8] ^ cv[w], &mut wa, &mut wb);
     }
-    debug_assert_eq!(wz.position(), USEFUL_BITS);
+    debug_assert_eq!(wa.position(), USEFUL_BITS);
 
-    wz.finish();
     wa.finish();
     wb.finish();
 
@@ -1475,9 +1464,12 @@ fn build_block_witness_ab_stream_into(
     debug_assert_eq!(OUT_LO_BASE % 64, 0);
     for i in 0..4 {
         let value = (out_lo[2 * i] as u64) | ((out_lo[2 * i + 1] as u64) << 32);
-        z[OUT_LO_WORD + i] = value;
         a[OUT_LO_WORD + i] = value;
         b[OUT_LO_WORD + i] = u64::MAX;
+    }
+
+    for i in 0..U64_PER_BLOCK {
+        z[i] = a[i] & b[i];
     }
 }
 
@@ -2511,6 +2503,13 @@ mod tests {
             assert_eq!(z, z_ref);
             assert_eq!(a, a_ref);
             assert_eq!(b, b_ref);
+            for bit in USEFUL_BITS..K {
+                let word = bit / 64;
+                let mask = 1u64 << (bit % 64);
+                assert_eq!(z[word] & mask, 0, "z tail bit {bit} was not zero");
+                assert_eq!(a[word] & mask, 0, "a tail bit {bit} was not zero");
+                assert_eq!(b[word] & mask, 0, "b tail bit {bit} was not zero");
+            }
         }
     }
 
@@ -2556,7 +2555,7 @@ mod tests {
     #[test]
     fn fused_lincheck_matches_separate() {
         use flock_core::lincheck::pack_z_lincheck_from_packed;
-        for &n_blocks in &[1usize, 4, 8, 13] {
+        for &n_blocks in &[1usize, 7, 8, 9, 13] {
             let n_log = min_n_blocks_log(n_blocks).max(3);
             let r1cs = build_block_r1cs(n_log);
             let mut rng = Rng::new(0xABCD_EF00 + n_blocks as u64);
@@ -2580,6 +2579,29 @@ mod tests {
                 "lincheck stripe mismatch at n_blocks={n_blocks}"
             );
         }
+    }
+
+    #[test]
+    fn rate2_codeword_replicas_match_derived_z() {
+        let n_blocks = 13;
+        let n_log = min_n_blocks_log(n_blocks).max(3);
+        let mut rng = Rng::new(0x2A7E_000D);
+        let blocks: Vec<Compression> = (0..n_blocks)
+            .map(|_| {
+                let cv = std::array::from_fn(|_| rng.next_u32());
+                let m = std::array::from_fn(|_| rng.next_u32());
+                (cv, m, rng.next_u32() as u64, 64, 11)
+            })
+            .collect();
+        let z_len = (1usize << n_log) * K / 128;
+        let mut codeword = vec![F128::ZERO; 2 * z_len];
+        let (z, _, _, _) = generate_witness_with_ab_packed_and_lincheck_rate2_codeword(
+            &blocks,
+            n_log,
+            &mut codeword,
+        );
+        assert_eq!(codeword[..z_len], z);
+        assert_eq!(codeword[z_len..], z);
     }
 
     #[test]
@@ -2840,25 +2862,40 @@ mod tests {
     fn prove_ligerito_generic_matches_prove_fast() {
         use flock_core::challenger::FsChallenger;
         let setup = Blake3Setup::new(256);
-        let mut rng = Rng::new(0xb1a_63112);
-        let blocks: Vec<Compression> = (0..256)
-            .map(|_| {
-                let cv: [u32; 8] = std::array::from_fn(|_| rng.next_u32());
-                let m: [u32; 16] = std::array::from_fn(|_| rng.next_u32());
-                (cv, m, 0u64, 64u32, 11u32)
-            })
-            .collect();
-        let mut ch_f = FsChallenger::new(b"flock-blake3-gvf");
-        let (proof_f, commit_f, claim_f) = setup.prove_fast(&blocks, &mut ch_f);
-        let mut ch_g = FsChallenger::new(b"flock-blake3-gvf");
-        let (proof_g, commit_g, claim_g) = setup.prove_ligerito(&blocks, &mut ch_g);
-        assert_eq!(commit_f.root, commit_g.root);
-        assert_eq!(claim_f, claim_g);
-        assert_eq!(
-            bincode::serialize(&proof_f).unwrap(),
-            bincode::serialize(&proof_g).unwrap(),
-            "generic and fused Ligerito proofs must be byte-identical"
-        );
+        for seed in [0xb1a_63112, 0xb1a_63113, 0xb1a_63114] {
+            let mut rng = Rng::new(seed);
+            let blocks: Vec<Compression> = (0..256)
+                .map(|_| {
+                    let cv: [u32; 8] = std::array::from_fn(|_| rng.next_u32());
+                    let m: [u32; 16] = std::array::from_fn(|_| rng.next_u32());
+                    (cv, m, 0u64, 64u32, 11u32)
+                })
+                .collect();
+            let mut ch_f = FsChallenger::new(b"flock-blake3-gvf");
+            let (proof_f, commit_f, claim_f) = setup.prove_fast(&blocks, &mut ch_f);
+            let mut ch_g = FsChallenger::new(b"flock-blake3-gvf");
+            let (proof_g, commit_g, claim_g) = setup.prove_ligerito(&blocks, &mut ch_g);
+            assert_eq!(commit_f.root, commit_g.root, "seed {seed}");
+            assert_eq!(claim_f, claim_g, "seed {seed}");
+            let fast_bytes = crate::proof_io::R1csProofBundleLigerito {
+                commitment: commit_f.clone(),
+                proof: proof_f,
+            }
+            .to_bytes();
+            let generic_bytes = crate::proof_io::R1csProofBundleLigerito {
+                commitment: commit_g,
+                proof: proof_g,
+            }
+            .to_bytes();
+            assert_eq!(fast_bytes, generic_bytes, "proof bytes differ for seed {seed}");
+            let bundle = crate::proof_io::R1csProofBundleLigerito::from_bytes(&fast_bytes).unwrap();
+            let mut verifier = FsChallenger::new(b"flock-blake3-gvf");
+            assert_eq!(
+                setup.verify(&bundle.commitment, &bundle.proof, &mut verifier).unwrap(),
+                claim_f,
+                "verifier claim differs for seed {seed}"
+            );
+        }
     }
 
     /// Constant-wire pin (docs/const-wire-pin.md). `new(250)` has padding
