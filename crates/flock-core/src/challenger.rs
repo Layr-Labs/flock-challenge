@@ -428,19 +428,49 @@ impl Challenger for FsChallenger {
                 // smallest nonce. A later chunk cannot hold a smaller nonce, so
                 // this is exactly the globally smallest — identical to the
                 // sequential search, which is what keeps proofs deterministic.
-                let found = (0..n_chunks)
-                    .into_par_iter()
-                    .map(|c| {
-                        pow_scan(
-                            &state_digest,
-                            start.saturating_add(c * GRIND_CHUNK),
-                            GRIND_CHUNK,
-                            bits,
-                            kind,
-                        )
-                    })
-                    .find_first(|r| r.is_some())
-                    .flatten();
+                let found = if cfg!(all(target_os = "macos", target_arch = "aarch64"))
+                    && kind == HashKind::Blake3
+                {
+                    // The main Rayon pool deliberately occupies only P-cores.
+                    // During a grind the utility-QoS E-core pool is otherwise
+                    // idle, and nonce chunks have no cross-chunk dependencies.
+                    // Let both pools claim chunks from one atomic queue. Keep
+                    // the smallest match in a second atomic: chunks beginning
+                    // at/after it can stop, while every earlier claimed chunk
+                    // completes before the queue barrier returns. The result
+                    // is therefore the same globally smallest nonce as
+                    // `find_first`, independent of scheduling.
+                    use std::sync::atomic::{AtomicU64, Ordering};
+                    let best = AtomicU64::new(u64::MAX);
+                    crate::epool::run_hetero_chunks(n_chunks as usize, |c| {
+                        let chunk_start =
+                            start.saturating_add((c as u64).saturating_mul(GRIND_CHUNK));
+                        if chunk_start >= best.load(Ordering::Relaxed) {
+                            return;
+                        }
+                        if let Some(nonce) =
+                            pow_scan(&state_digest, chunk_start, GRIND_CHUNK, bits, kind)
+                        {
+                            best.fetch_min(nonce, Ordering::Relaxed);
+                        }
+                    });
+                    let nonce = best.load(Ordering::Relaxed);
+                    (nonce != u64::MAX).then_some(nonce)
+                } else {
+                    (0..n_chunks)
+                        .into_par_iter()
+                        .map(|c| {
+                            pow_scan(
+                                &state_digest,
+                                start.saturating_add(c * GRIND_CHUNK),
+                                GRIND_CHUNK,
+                                bits,
+                                kind,
+                            )
+                        })
+                        .find_first(|r| r.is_some())
+                        .flatten()
+                };
                 if let Some(n) = found {
                     break n;
                 }
