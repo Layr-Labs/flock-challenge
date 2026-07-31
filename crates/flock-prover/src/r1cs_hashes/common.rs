@@ -433,20 +433,71 @@ where
                 std::slice::from_raw_parts(z_grp.as_ptr() as *const u64, z_grp.len() * 2)
             };
             let useful_words = stripe_useful_bits.div_ceil(64);
-            for i in 0..useful_words {
-                let lanes: [u64; 8] = [
-                    z_u64_all[0 * u64_per_block + i],
-                    z_u64_all[u64_per_block + i],
-                    z_u64_all[2 * u64_per_block + i],
-                    z_u64_all[3 * u64_per_block + i],
-                    z_u64_all[4 * u64_per_block + i],
-                    z_u64_all[5 * u64_per_block + i],
-                    z_u64_all[6 * u64_per_block + i],
-                    z_u64_all[7 * u64_per_block + i],
-                ];
-                transpose_8_u64s_to_64_bytes(&lanes, &mut stripe[i * 64..i * 64 + 64]);
+            let stripe_nt = cfg!(target_arch = "aarch64")
+                && stripe.as_ptr() as usize % 128 == 0
+                && stripe.len() % 128 == 0;
+            if stripe_nt {
+                // The stripe is cold DRAM first consumed in the lincheck
+                // phase, long after this group's lines are evicted. Stage
+                // pairs of 64-byte transposes (zero-padded past
+                // `useful_words`) in one L1 line and publish with the same
+                // `stnp` no-write-allocate hint the witness a/b writers use,
+                // skipping the read-for-ownership per destination line.
+                // Bytes are identical to the plain loop + tail fill.
+                let mut stage = [0u64; 16];
+                let total_words = stripe.len() / 64;
+                let mut i = 0;
+                while i < total_words {
+                    for half in 0..2 {
+                        let idx = i + half;
+                        // SAFETY: `stage` is 128 bytes; `half*64..+64` is in
+                        // bounds and this raw view is dropped before the
+                        // `stage.as_ptr()` read below.
+                        let dst: &mut [u8] = unsafe {
+                            std::slice::from_raw_parts_mut(
+                                (stage.as_mut_ptr() as *mut u8).add(half * 64),
+                                64,
+                            )
+                        };
+                        if idx < useful_words {
+                            let lanes: [u64; 8] = [
+                                z_u64_all[0 * u64_per_block + idx],
+                                z_u64_all[u64_per_block + idx],
+                                z_u64_all[2 * u64_per_block + idx],
+                                z_u64_all[3 * u64_per_block + idx],
+                                z_u64_all[4 * u64_per_block + idx],
+                                z_u64_all[5 * u64_per_block + idx],
+                                z_u64_all[6 * u64_per_block + idx],
+                                z_u64_all[7 * u64_per_block + idx],
+                            ];
+                            transpose_8_u64s_to_64_bytes(&lanes, dst);
+                        } else {
+                            dst.fill(0);
+                        }
+                    }
+                    // SAFETY: alignment and length checked by `stripe_nt`;
+                    // `i + 2 <= total_words` keeps the 128-byte row in bounds.
+                    unsafe {
+                        nt_store_row(stage.as_ptr(), stripe.as_mut_ptr().add(i * 64) as *mut u64);
+                    }
+                    i += 2;
+                }
+            } else {
+                for i in 0..useful_words {
+                    let lanes: [u64; 8] = [
+                        z_u64_all[0 * u64_per_block + i],
+                        z_u64_all[u64_per_block + i],
+                        z_u64_all[2 * u64_per_block + i],
+                        z_u64_all[3 * u64_per_block + i],
+                        z_u64_all[4 * u64_per_block + i],
+                        z_u64_all[5 * u64_per_block + i],
+                        z_u64_all[6 * u64_per_block + i],
+                        z_u64_all[7 * u64_per_block + i],
+                    ];
+                    transpose_8_u64s_to_64_bytes(&lanes, &mut stripe[i * 64..i * 64 + 64]);
+                }
+                stripe[useful_words * 64..].fill(0);
             }
-            stripe[useful_words * 64..].fill(0);
 
             if EMIT_RATE2_CODEWORD {
                 let codeword =

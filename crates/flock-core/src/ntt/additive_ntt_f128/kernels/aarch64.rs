@@ -139,16 +139,25 @@ unsafe fn butterfly_zero_q(
     unsafe { core::arch::aarch64::veorq_u64(v, u) }
 }
 
+/// Vector-resident twin of `portable::butterfly_fused_3layer_row`.
+///
+/// # Safety
+/// Same contract as the portable form: the caller guarantees every selected
+/// row and lane is valid and that concurrent calls own disjoint row groups.
 #[target_feature(enable = "aes")]
-unsafe fn butterfly_fused_3layer_row_with_q(
+pub(super) unsafe fn butterfly_fused_3layer_row(
     ptr: *mut F128,
     eighth: usize,
     num_ntts: usize,
     r: usize,
-    t: &[core::arch::aarch64::uint64x2_t; 7],
+    twiddles: &[F128; 7],
 ) {
     use core::arch::aarch64::*;
     unsafe {
+        let t: [uint64x2_t; 7] = core::array::from_fn(|i| {
+            vld1q_u64((&raw const twiddles[i]).cast::<u64>())
+        });
+
         for lane in 0..num_ntts {
             let base = ptr.add(r * num_ntts + lane);
             let step = eighth * num_ntts;
@@ -185,48 +194,6 @@ unsafe fn butterfly_fused_3layer_row_with_q(
     }
 }
 
-/// Vector-resident twin of `portable::butterfly_fused_3layer_row`.
-///
-/// # Safety
-/// Same contract as the portable form: the caller guarantees every selected
-/// row and lane is valid and that concurrent calls own disjoint row groups.
-#[target_feature(enable = "aes")]
-pub(super) unsafe fn butterfly_fused_3layer_row(
-    ptr: *mut F128,
-    eighth: usize,
-    num_ntts: usize,
-    r: usize,
-    twiddles: &[F128; 7],
-) {
-    use core::arch::aarch64::*;
-    unsafe {
-        let t: [uint64x2_t; 7] =
-            core::array::from_fn(|i| vld1q_u64((&raw const twiddles[i]).cast::<u64>()));
-        butterfly_fused_3layer_row_with_q(ptr, eighth, num_ntts, r, &t);
-    }
-}
-
-/// Process a contiguous tile of row groups while keeping the seven twiddles
-/// in vector registers across the tile.
-#[target_feature(enable = "aes")]
-pub(super) unsafe fn butterfly_fused_3layer_rows(
-    ptr: *mut F128,
-    eighth: usize,
-    num_ntts: usize,
-    row_start: usize,
-    row_end: usize,
-    twiddles: &[F128; 7],
-) {
-    use core::arch::aarch64::*;
-    unsafe {
-        let t: [uint64x2_t; 7] =
-            core::array::from_fn(|i| vld1q_u64((&raw const twiddles[i]).cast::<u64>()));
-        for r in row_start..row_end {
-            butterfly_fused_3layer_row_with_q(ptr, eighth, num_ntts, r, &t);
-        }
-    }
-}
-
 /// Vector-resident twin of `portable::butterfly_fused_3layer_zero_root_row`.
 ///
 /// Twiddles 0, 1 and 3 are zero on the root spine, so those butterflies are
@@ -236,18 +203,24 @@ pub(super) unsafe fn butterfly_fused_3layer_rows(
 /// As [`butterfly_fused_3layer_row`], and the caller additionally guarantees
 /// `twiddles[0] == twiddles[1] == twiddles[3] == 0`.
 #[target_feature(enable = "aes")]
-unsafe fn butterfly_fused_3layer_zero_root_row_with_q(
+pub(super) unsafe fn butterfly_fused_3layer_zero_root_row(
     ptr: *mut F128,
     eighth: usize,
     num_ntts: usize,
     r: usize,
-    t2: core::arch::aarch64::uint64x2_t,
-    t4: core::arch::aarch64::uint64x2_t,
-    t5: core::arch::aarch64::uint64x2_t,
-    t6: core::arch::aarch64::uint64x2_t,
+    twiddles: &[F128; 7],
 ) {
     use core::arch::aarch64::*;
     unsafe {
+        debug_assert_eq!(twiddles[0], F128::ZERO);
+        debug_assert_eq!(twiddles[1], F128::ZERO);
+        debug_assert_eq!(twiddles[3], F128::ZERO);
+
+        let t2 = vld1q_u64((&raw const twiddles[2]).cast::<u64>());
+        let t4 = vld1q_u64((&raw const twiddles[4]).cast::<u64>());
+        let t5 = vld1q_u64((&raw const twiddles[5]).cast::<u64>());
+        let t6 = vld1q_u64((&raw const twiddles[6]).cast::<u64>());
+
         for lane in 0..num_ntts {
             let base = ptr.add(r * num_ntts + lane);
             let step = eighth * num_ntts;
@@ -285,55 +258,6 @@ unsafe fn butterfly_fused_3layer_zero_root_row_with_q(
             for (i, value) in v.iter().enumerate().skip(1) {
                 vst1q_u64(base.add(i * step).cast::<u64>(), *value);
             }
-        }
-    }
-}
-
-#[target_feature(enable = "aes")]
-pub(super) unsafe fn butterfly_fused_3layer_zero_root_row(
-    ptr: *mut F128,
-    eighth: usize,
-    num_ntts: usize,
-    r: usize,
-    twiddles: &[F128; 7],
-) {
-    use core::arch::aarch64::*;
-    unsafe {
-        debug_assert_eq!(twiddles[0], F128::ZERO);
-        debug_assert_eq!(twiddles[1], F128::ZERO);
-        debug_assert_eq!(twiddles[3], F128::ZERO);
-        let t2 = vld1q_u64((&raw const twiddles[2]).cast::<u64>());
-        let t4 = vld1q_u64((&raw const twiddles[4]).cast::<u64>());
-        let t5 = vld1q_u64((&raw const twiddles[5]).cast::<u64>());
-        let t6 = vld1q_u64((&raw const twiddles[6]).cast::<u64>());
-        butterfly_fused_3layer_zero_root_row_with_q(
-            ptr, eighth, num_ntts, r, t2, t4, t5, t6,
-        );
-    }
-}
-
-#[target_feature(enable = "aes")]
-pub(super) unsafe fn butterfly_fused_3layer_zero_root_rows(
-    ptr: *mut F128,
-    eighth: usize,
-    num_ntts: usize,
-    row_start: usize,
-    row_end: usize,
-    twiddles: &[F128; 7],
-) {
-    use core::arch::aarch64::*;
-    unsafe {
-        debug_assert_eq!(twiddles[0], F128::ZERO);
-        debug_assert_eq!(twiddles[1], F128::ZERO);
-        debug_assert_eq!(twiddles[3], F128::ZERO);
-        let t2 = vld1q_u64((&raw const twiddles[2]).cast::<u64>());
-        let t4 = vld1q_u64((&raw const twiddles[4]).cast::<u64>());
-        let t5 = vld1q_u64((&raw const twiddles[5]).cast::<u64>());
-        let t6 = vld1q_u64((&raw const twiddles[6]).cast::<u64>());
-        for r in row_start..row_end {
-            butterfly_fused_3layer_zero_root_row_with_q(
-                ptr, eighth, num_ntts, r, t2, t4, t5, t6,
-            );
         }
     }
 }

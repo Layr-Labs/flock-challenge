@@ -1124,17 +1124,64 @@ struct PackedWordWriter<'a> {
     word: usize,
     pending: u64,
     used: usize,
+    /// 128-byte staging row for non-temporal publication. The a/b
+    /// destinations are cold DRAM not consumed until the round-1 precompute
+    /// in the commit window, so ordinary stores pay a read-for-ownership on
+    /// every line; staging one cache line in L1 and flushing it with `stnp`
+    /// (same best-effort no-write-allocate hint the ranked NTT first pass
+    /// uses) skips that read. Values and layout are bit-identical — only the
+    /// store hint changes.
+    #[cfg(target_arch = "aarch64")]
+    stage: [u64; 16],
+    #[cfg(target_arch = "aarch64")]
+    nt: bool,
 }
 
 impl<'a> PackedWordWriter<'a> {
+    /// `want_nt`: request non-temporal publication. Only correct for streams
+    /// whose destination is NOT re-read while cache-hot — a/b qualify; z
+    /// does NOT (the lincheck stripe transpose and the rate-2 codeword
+    /// emission re-read it group-locally right after it is written).
     #[inline(always)]
-    fn new(out: &'a mut [u64]) -> Self {
+    fn new(out: &'a mut [u64], want_nt: bool) -> Self {
+        #[cfg(target_arch = "aarch64")]
+        let nt = want_nt && out.as_ptr() as usize % 128 == 0 && out.len() % 16 == 0;
+        #[cfg(not(target_arch = "aarch64"))]
+        let _ = want_nt;
         Self {
             out,
             word: 0,
             pending: 0,
             used: 0,
+            #[cfg(target_arch = "aarch64")]
+            stage: [0u64; 16],
+            #[cfg(target_arch = "aarch64")]
+            nt,
         }
+    }
+
+    /// Publish one complete u64 at the current word position.
+    #[inline(always)]
+    fn emit(&mut self, value: u64) {
+        #[cfg(target_arch = "aarch64")]
+        if self.nt {
+            self.stage[self.word % 16] = value;
+            self.word += 1;
+            if self.word % 16 == 0 {
+                // SAFETY: `nt` guarantees a 128-byte-aligned base and a
+                // length that is a multiple of 16, and `word ≤ len` by the
+                // writer contract, so the 16-word row is in bounds.
+                unsafe {
+                    crate::r1cs_hashes::common::nt_store_row(
+                        self.stage.as_ptr(),
+                        self.out.as_mut_ptr().add(self.word - 16),
+                    );
+                }
+            }
+            return;
+        }
+        self.out[self.word] = value;
+        self.word += 1;
     }
 
     #[inline(always)]
@@ -1146,8 +1193,7 @@ impl<'a> PackedWordWriter<'a> {
             value & ((1u64 << width) - 1)
         };
         if self.used == 0 && width == 64 {
-            self.out[self.word] = value;
-            self.word += 1;
+            self.emit(value);
             return;
         }
         let room = 64 - self.used;
@@ -1155,8 +1201,7 @@ impl<'a> PackedWordWriter<'a> {
             self.pending |= value << self.used;
             self.used += width;
         } else {
-            self.out[self.word] = self.pending | (value << self.used);
-            self.word += 1;
+            self.emit(self.pending | (value << self.used));
             if width == room {
                 self.pending = 0;
                 self.used = 0;
@@ -1189,10 +1234,15 @@ impl<'a> PackedWordWriter<'a> {
     #[inline]
     fn finish(mut self) {
         if self.used != 0 {
-            self.out[self.word] = self.pending;
-            self.word += 1;
+            let pending = self.pending;
+            self.emit(pending);
         }
-        self.out[self.word..].fill(0);
+        // Zero-pad through the end of the block so every staged row is
+        // complete and the full-write contract holds (len % 16 == 0 on the
+        // NT path, so the final row always flushes).
+        while self.word < self.out.len() {
+            self.emit(0);
+        }
     }
 }
 
@@ -1354,9 +1404,9 @@ fn build_block_witness_ab_stream_into(
     debug_assert_eq!(a.len(), U64_PER_BLOCK);
     debug_assert_eq!(b.len(), U64_PER_BLOCK);
 
-    let mut wz = PackedWordWriter::new(z);
-    let mut wa = PackedWordWriter::new(a);
-    let mut wb = PackedWordWriter::new(b);
+    let mut wz = PackedWordWriter::new(z, false);
+    let mut wa = PackedWordWriter::new(a, true);
+    let mut wb = PackedWordWriter::new(b, true);
 
     // Layout prefix: cv, then the aligned out_lo slot whose value is not known
     // until after the seven rounds.

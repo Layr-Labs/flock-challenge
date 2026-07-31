@@ -173,31 +173,6 @@ pub(super) unsafe fn butterfly_fused_3layer_row(
     }
 }
 
-#[inline]
-pub(super) unsafe fn butterfly_fused_3layer_rows(
-    ptr: *mut F128,
-    eighth: usize,
-    num_ntts: usize,
-    row_start: usize,
-    row_end: usize,
-    twiddles: &[F128; 7],
-) {
-    #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
-    unsafe {
-        if vector_resident_rows() {
-            aarch64::butterfly_fused_3layer_rows(
-                ptr, eighth, num_ntts, row_start, row_end, twiddles,
-            );
-            return;
-        }
-    }
-    unsafe {
-        for r in row_start..row_end {
-            portable::butterfly_fused_3layer_row(ptr, eighth, num_ntts, r, twiddles);
-        }
-    }
-}
-
 /// Whether the AArch64 vector-resident radix-8 row kernels are used.
 ///
 /// `FLOCK_NO_NTT_NEON_ROWS=1` restores the portable `F128`-typed chain in the
@@ -237,33 +212,6 @@ pub(super) unsafe fn butterfly_fused_3layer_zero_root_row(
     // SAFETY: forwarded caller contract.
     unsafe {
         portable::butterfly_fused_3layer_zero_root_row(ptr, eighth, num_ntts, r, twiddles);
-    }
-}
-
-#[inline]
-pub(super) unsafe fn butterfly_fused_3layer_zero_root_rows(
-    ptr: *mut F128,
-    eighth: usize,
-    num_ntts: usize,
-    row_start: usize,
-    row_end: usize,
-    twiddles: &[F128; 7],
-) {
-    #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
-    unsafe {
-        if vector_resident_rows() {
-            aarch64::butterfly_fused_3layer_zero_root_rows(
-                ptr, eighth, num_ntts, row_start, row_end, twiddles,
-            );
-            return;
-        }
-    }
-    unsafe {
-        for r in row_start..row_end {
-            portable::butterfly_fused_3layer_zero_root_row(
-                ptr, eighth, num_ntts, r, twiddles,
-            );
-        }
     }
 }
 

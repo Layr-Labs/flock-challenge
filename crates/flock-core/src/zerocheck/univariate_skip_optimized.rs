@@ -346,18 +346,27 @@ pub fn precompute_round1_ab_inner_packed_padded(
     let out_bytes: &mut [u8] =
         unsafe { core::slice::from_raw_parts_mut(storage.as_mut_ptr() as *mut u8, total_bytes) };
 
+    // The transformed blocks are cold DRAM first consumed by the zerocheck
+    // completion, a full phase after this commit-overlapped precompute runs.
+    // Build each x_outer's 1 KiB chunk in an L1 staging buffer and publish it
+    // with `stnp` (the same best-effort no-write-allocate hint the ranked NTT
+    // first pass and the round-2 fold producers use), skipping the
+    // read-for-ownership on every destination line. Bytes are identical.
+    let nt_ok = cfg!(target_arch = "aarch64") && out_bytes.as_ptr() as usize % 128 == 0;
+
     out_bytes
         .par_chunks_mut(OUTER_BYTES)
         .enumerate()
         .for_each_init(
-            || ([F8::ZERO; ELL], [F8::ZERO; ELL]),
-            |(a_col, b_col), (x_outer, out_outer)| {
+            || ([F8::ZERO; ELL], [F8::ZERO; ELL], [0u8; OUTER_BYTES]),
+            |(a_col, b_col, stage), (x_outer, out_outer)| {
                 let within_hash_outer = x_outer & within_outer_mask;
                 let n_b_med = b_med_counts[within_hash_outer] as usize;
                 let chunk_byte_base = x_outer * OUTER_BYTES;
 
+                let target: &mut [u8] = if nt_ok { &mut stage[..] } else { out_outer };
                 for b_med in 0..n_b_med {
-                    let dst: &mut [u8; 64] = (&mut out_outer[b_med * 64..(b_med + 1) * 64])
+                    let dst: &mut [u8; 64] = (&mut target[b_med * 64..(b_med + 1) * 64])
                         .try_into()
                         .expect("one transformed b_med block");
                     shift_reduce_inner_ab(
@@ -371,11 +380,51 @@ pub fn precompute_round1_ab_inner_packed_padded(
                         b_col,
                     );
                 }
-                out_outer[n_b_med * 64..].fill(0);
+                target[n_b_med * 64..].fill(0);
+
+                #[cfg(target_arch = "aarch64")]
+                if nt_ok {
+                    debug_assert_eq!(OUTER_BYTES % 128, 0);
+                    for row in 0..OUTER_BYTES / 128 {
+                        // SAFETY: `nt_ok` checked the 128-byte base alignment
+                        // and chunks are OUTER_BYTES-strided, so every row is
+                        // aligned and in bounds; stage is fully written above.
+                        unsafe {
+                            nt_store_row_128(
+                                stage.as_ptr().add(row * 128),
+                                out_outer.as_mut_ptr().add(row * 128),
+                            );
+                        }
+                    }
+                }
             },
         );
 
     Round1AbInner { storage }
+}
+
+/// Non-temporal 128-byte row publication (4× `ldp`/`stnp` q-register pairs).
+/// Same best-effort no-write-allocate hint used by the ranked NTT first pass.
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn nt_store_row_128(src: *const u8, dst: *mut u8) {
+    // SAFETY: caller guarantees 128 readable bytes at `src` and 128 writable
+    // bytes at `dst`.
+    unsafe {
+        core::arch::asm!(
+            "ldp {t0:q}, {t1:q}, [{s}]",
+            "stnp {t0:q}, {t1:q}, [{d}]",
+            "ldp {t0:q}, {t1:q}, [{s}, #32]",
+            "stnp {t0:q}, {t1:q}, [{d}, #32]",
+            "ldp {t0:q}, {t1:q}, [{s}, #64]",
+            "stnp {t0:q}, {t1:q}, [{d}, #64]",
+            "ldp {t0:q}, {t1:q}, [{s}, #96]",
+            "stnp {t0:q}, {t1:q}, [{d}, #96]",
+            s = in(reg) src, d = in(reg) dst,
+            t0 = out(vreg) _, t1 = out(vreg) _,
+            options(nostack),
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
