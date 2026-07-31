@@ -319,16 +319,20 @@ fn compute_combined_basis_and_target<Ch: Challenger>(
             .enumerate()
             .map(|(hi, out_block)| {
                 // Accumulate each claim's block: first claim writes, rest add.
-                // `e_hi` is read once per claim per block, then swept over eq_lo.
+                // `e_hi` is read once per claim per block, then swept over
+                // eq_lo with a per-block composite table: the slot's field
+                // multiply is absorbed into the table by F2-linearity
+                // (`fold_one_slot(lo · e_hi, table) == fold_one_slot(lo,
+                // composite)`), so the sweep does pure lookups + XORs.
                 for (ci, (eq_lo, eq_hi, table, _)) in rs_deferred.iter().enumerate() {
-                    let e_hi = eq_hi[hi];
+                    let composite = ring_switch::build_composite_fold_table(eq_hi[hi], table);
                     if ci == 0 {
                         for (slot, &lo) in out_block.iter_mut().zip(eq_lo.iter()) {
-                            *slot = ring_switch::fold_one_slot(lo * e_hi, table);
+                            *slot = ring_switch::fold_one_slot(lo, &composite);
                         }
                     } else {
                         for (slot, &lo) in out_block.iter_mut().zip(eq_lo.iter()) {
-                            *slot += ring_switch::fold_one_slot(lo * e_hi, table);
+                            *slot += ring_switch::fold_one_slot(lo, &composite);
                         }
                     }
                 }

@@ -356,6 +356,18 @@ pub fn split_n_lo(n: usize) -> usize {
     (n / 2).clamp(4, n)
 }
 
+/// Split width for dense claims whose `rs_eq_ind` is deferred into the pcs
+/// combine (the `RsEqInd::DeferredDense` fast path). The combine sweeps each
+/// `e_hi` block with a per-block composite table from
+/// [`build_composite_fold_table`] — 64 KiB and ~a microsecond to build — so
+/// the block must be large enough to amortize it: `n_lo = 17` gives 131,072
+/// slots per block (~256 blocks at the ranked suffix length instead of
+/// ~4096), while keeping the `eq_lo` factor at 2 MiB (L2-resident). Falls
+/// back to the balanced split for small suffixes.
+pub fn split_n_lo_deferred(n: usize) -> usize {
+    if n >= 17 { 17 } else { split_n_lo(n) }
+}
+
 /// Build the 16-entry subset-sum lookup table over 4 F128 elements.
 ///
 /// `sums[mask]` = `Σ_{k=0..4 : bit_k(mask) = 1} elems[k]` for `mask ∈ 0..16`.
@@ -1636,6 +1648,42 @@ pub(crate) fn fold_one_slot(elem: F128, tables: &[F128]) -> F128 {
     r0 + r1
 }
 
+/// Composite per-`e_hi` fold table: `out[k·256 + v] = fold_one_slot(B_{k,v}
+/// · e_hi, base)`, where `B_{k,v}` is the F128 whose k-th little-endian byte
+/// is `v`. The map `x ↦ fold_one_slot(x · e_hi, base)` is F2-linear in `x`
+/// (multiply-by-constant and the byte-table XOR are both F2-linear), so
+/// `fold_one_slot(x · e_hi, base) == fold_one_slot(x, out)` for every `x`:
+/// the combine loop then needs zero field multiplications per slot.
+///
+/// Build cost: 128 `fold_one_slot` evaluations + 127 `mul_by_x` (shift+XOR,
+/// no PMULL) for the basis images `Φ(e_hi · x^t)`, then 16 × 255 XORs for the
+/// subset expansions — versus one full F128 multiply per folded slot without
+/// the table. Amortizes once the block swept with `e_hi` has more than a few
+/// hundred slots.
+pub(crate) fn build_composite_fold_table(e_hi: F128, base: &[F128]) -> Vec<F128> {
+    debug_assert_eq!(base.len(), FOLD_N_BYTES * FOLD_TABLE_SIZE);
+    // Basis images Φ(e_hi · x^t) for t in 0..128. e_hi · x^(t+1) =
+    // mul_by_x(e_hi · x^t), and byte `k` bit `j` of the argument corresponds
+    // to x^(8k + j) in the polynomial basis.
+    let mut basis = [F128::ZERO; 128];
+    let mut w = e_hi;
+    for b in basis.iter_mut() {
+        *b = fold_one_slot(w, base);
+        w = crate::field::mul_by_x(w);
+    }
+    let mut out = crate::alloc_uninit_f128_vec(FOLD_N_BYTES * FOLD_TABLE_SIZE);
+    for k in 0..FOLD_N_BYTES {
+        let tab = &mut out[k * FOLD_TABLE_SIZE..(k + 1) * FOLD_TABLE_SIZE];
+        tab[0] = F128::ZERO;
+        for v in 1..FOLD_TABLE_SIZE {
+            // v = (v & (v − 1)) ⊕ 2^trailing_zeros(v): one XOR per entry.
+            let j = v.trailing_zeros() as usize;
+            tab[v] = tab[v & (v - 1)] + basis[8 * k + j];
+        }
+    }
+    out
+}
+
 /// Per-output-index value of a [`RsEqInd::DeferredDense`] fold (the value the
 /// materialized `fold_b128_elems_split` would store at position `j`):
 /// `fold_one_slot(eq_lo[j & (B−1)] · eq_hi[j >> log2 B], table)`, `B = eq_lo.len()`.
@@ -2374,7 +2422,7 @@ pub fn prove_batched_padded_with_precomputed<Ch: Challenger>(
     let dense_splits: Vec<(Vec<F128>, Vec<F128>)> = if use_split {
         dense_suffixes
             .iter()
-            .map(|s| build_eq_split(s, split_n_lo(s.len())))
+            .map(|s| build_eq_split(s, split_n_lo_deferred(s.len())))
             .collect()
     } else {
         Vec::new()
@@ -3236,6 +3284,27 @@ mod tests {
                 reference,
                 "fold_1b_rows_split mismatch at split_n_lo: m={m}"
             );
+        }
+    }
+
+    /// The composite `e_hi` table must reproduce `fold_one_slot(lo · e_hi,
+    /// table)` exactly for arbitrary `lo`, `e_hi`, and base tables.
+    #[test]
+    fn composite_fold_table_matches_mul_then_fold() {
+        let mut rng = Rng::new(0xC0B1_217E_0000_0001);
+        for _ in 0..4 {
+            let eq_r_dprime: Vec<F128> = (0..128).map(|_| rng.f128()).collect();
+            let base = build_fold_byte_table(&eq_r_dprime);
+            let e_hi = rng.f128();
+            let composite = build_composite_fold_table(e_hi, &base);
+            for _ in 0..64 {
+                let lo = rng.f128();
+                assert_eq!(
+                    fold_one_slot(lo * e_hi, &base),
+                    fold_one_slot(lo, &composite),
+                    "composite table mismatch"
+                );
+            }
         }
     }
 

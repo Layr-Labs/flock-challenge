@@ -2303,10 +2303,12 @@ pub(crate) struct LigeroWitness {
 }
 
 // Recycle the codeword matrix (128 MB for L1 at m=29) through the scratch
-// pool when a level's witness is replaced/dropped.
+// pool when a level's witness is replaced/dropped; the level's Merkle tree
+// goes back to the tree pool.
 impl Drop for LigeroWitness {
     fn drop(&mut self) {
         crate::scratch::give_f128(std::mem::take(&mut self.mat));
+        crate::merkle::give_tree(std::mem::take(&mut self.tree));
     }
 }
 

@@ -155,10 +155,12 @@ pub struct ProverData {
 }
 
 // Recycle the codeword buffer (the prover's largest single allocation —
-// 128 MB at m = 29) through the scratch pool instead of unmapping it.
+// 128 MB at m = 29) through the scratch pool instead of unmapping it; the
+// Merkle tree (64 MiB at the ranked m = 32) goes back to the tree pool.
 impl Drop for ProverData {
     fn drop(&mut self) {
         crate::scratch::give_f128(std::mem::take(&mut self.codeword));
+        crate::merkle::give_tree(std::mem::take(&mut self.merkle_tree));
     }
 }
 
@@ -257,152 +259,9 @@ pub(crate) fn replicate_message_fill(codeword: &mut [F128], msg: &[F128]) {
     }
 }
 
-/// Exact ranked geometry for the cache-local NTT-to-Merkle leaf pipeline.
-/// Alternate hashes, profiles, rates, and recursive commits retain the existing
-/// independently scheduled transform and leaf pass.
-#[inline]
-fn is_ranked_ntt_merkle_leaf_pipeline_shape(params: &PcsParams) -> bool {
-    cfg!(all(
-        target_os = "macos",
-        target_arch = "aarch64",
-        target_feature = "aes"
-    )) && params.m == 32
-        && params.log_inv_rate == 1
-        && params.log_batch_size == 6
-        && params.profile == crate::pcs::ligerito::LigeritoProfile::Fast
-        && params.merkle_hash == HashKind::Blake3
-}
-
-#[inline]
-fn use_ranked_ntt_merkle_leaf_pipeline(params: &PcsParams) -> bool {
-    is_ranked_ntt_merkle_leaf_pipeline_shape(params)
-        && std::env::var_os("FLOCK_NO_NTT_MERKLE_PIPELINE").is_none()
-}
-
-#[derive(Clone, Copy)]
-struct RankedLeafJob {
-    elem_offset: usize,
-    elem_len: usize,
-}
-
-/// Finish the ranked NTT and hash each finalized 1 MiB subtree before it goes
-/// cold. P-core transform jobs offer leaf work to a bounded queue drained by
-/// the existing utility-QoS E-core pool; when that queue is full they hash the
-/// just-finished subtree inline. Thus the main NTT never waits for queue space,
-/// the helper pool retains the frontier's extra leaf throughput, and at most a
-/// small L2-sized window of completed codeword data awaits hashing.
-fn ranked_ntt_with_pipelined_leaves(
-    ntt: &AdditiveNttF128,
-    codeword: &mut [F128],
-    params: &PcsParams,
-    leaves: &mut [Hash],
-    helper: &rayon::ThreadPool,
-) {
-    use rayon::prelude::*;
-    use std::sync::Mutex;
-    use std::sync::mpsc::{TrySendError, sync_channel};
-
-    let num_ntts = params.num_ntts();
-    debug_assert_eq!(num_ntts, 64);
-    debug_assert_eq!(leaves.len(), codeword.len() / num_ntts);
-    let codeword_base = crate::epool::SyncPtr(codeword.as_mut_ptr());
-    let leaves_base = crate::epool::SyncPtr(leaves.as_mut_ptr());
-
-    let hash_job = |job: RankedLeafJob| {
-        debug_assert_eq!(job.elem_offset % num_ntts, 0);
-        debug_assert_eq!(job.elem_len % num_ntts, 0);
-        let leaf_start = job.elem_offset / num_ntts;
-        let leaf_len = job.elem_len / num_ntts;
-        // SAFETY: the NTT publishes a job only after the corresponding mutable
-        // subtree is finalized and never touched again. Every subtree is
-        // published exactly once; offsets are disjoint and cover the codeword,
-        // so both the immutable input ranges and mutable leaf-output ranges are
-        // pairwise disjoint and in bounds. Channel send/receive synchronizes the
-        // completed NTT writes before a helper worker reads them.
-        unsafe {
-            let elems =
-                core::slice::from_raw_parts(codeword_base.ptr().add(job.elem_offset), job.elem_len);
-            let bytes = core::slice::from_raw_parts(
-                elems.as_ptr().cast::<u8>(),
-                core::mem::size_of_val(elems),
-            );
-            let outs = core::slice::from_raw_parts_mut(leaves_base.ptr().add(leaf_start), leaf_len);
-            merkle::hash_ranked_blake3_leaf_chunk(bytes, outs);
-        }
-    };
-
-    // Two queued subtrees per helper keep all four E-cores fed while bounding
-    // not-yet-hashed input to 8 MiB on the ranked 4-E-core host.
-    let queue_capacity = (2 * helper.current_num_threads()).max(1);
-    let (sender, receiver) = sync_channel::<RankedLeafJob>(queue_capacity);
-    let receiver = Mutex::new(receiver);
-
-    std::thread::scope(|scope| {
-        let helper_manager = scope.spawn(|| {
-            helper.broadcast(|_| {
-                loop {
-                    let job = receiver.lock().unwrap().recv();
-                    match job {
-                        Ok(job) => hash_job(job),
-                        Err(_) => break,
-                    }
-                }
-            });
-        });
-
-        ntt.forward_transform_interleaved_from_layer_and_then(
-            codeword,
-            num_ntts,
-            params.log_inv_rate,
-            |elem_offset, chunk| {
-                let job = RankedLeafJob {
-                    elem_offset,
-                    elem_len: chunk.len(),
-                };
-                match sender.try_send(job) {
-                    Ok(()) => {}
-                    Err(TrySendError::Full(job) | TrySendError::Disconnected(job)) => hash_job(job),
-                }
-            },
-        );
-        drop(sender);
-
-        // No more jobs can arrive. Pull any bounded queue tail away from the
-        // E-cores and let the full main pool finish it while already-claimed E
-        // jobs complete concurrently.
-        let mut tail = Vec::with_capacity(queue_capacity);
-        {
-            let receiver = receiver.lock().unwrap();
-            while let Ok(job) = receiver.try_recv() {
-                tail.push(job);
-            }
-        }
-        tail.into_par_iter().for_each(|job| hash_job(job));
-        helper_manager
-            .join()
-            .expect("ranked NTT-to-Merkle helper manager panicked");
-    });
-}
-
 /// Shared tail of [`commit`] / [`commit_into`]: interleaved forward additive
 /// NTT (RS-encode every lane) then the initial Merkle tree over codeword rows.
 fn finalize_commit(mut codeword: Vec<F128>, params: &PcsParams) -> (Commitment, ProverData) {
-    let helper = if use_ranked_ntt_merkle_leaf_pipeline(params) && rayon::current_num_threads() > 1
-    {
-        crate::epool::epool()
-    } else {
-        None
-    };
-    let pipelined_leaves = helper.is_some();
-    let mut prehashed_tree = helper.map(|_| {
-        // Ranked: 64 MiB flat tree. Allocation is uninitialized, so only the
-        // 32 MiB leaf prefix is page-touched during the NTT; the internal half
-        // remains untouched until the normal parent-level build below. This
-        // advances allocation lifetime but does not raise the commit's final
-        // codeword+tree peak alongside the retained prover scratch pools.
-        let total_nodes = 2 * params.n_leaves() - 1;
-        crate::alloc_uninit_vec::<Hash>(total_nodes)
-    });
     let timing = std::env::var_os("FLOCK_COMMIT_TIMING").is_some();
     let t_ntt = std::time::Instant::now();
     // ---- Interleaved forward additive NTT: 2^log_batch_size independent
@@ -410,59 +269,37 @@ fn finalize_commit(mut codeword: Vec<F128>, params: &PcsParams) -> (Commitment, 
     // SoA buffer. The first `log_inv_rate` layers were pre-applied by the
     // caller's replicate-fill (commit_into), so start past them.
     let ntt = AdditiveNttF128::standard(params.k_code());
-    if let (Some(helper), Some(tree)) = (helper, prehashed_tree.as_mut()) {
-        ranked_ntt_with_pipelined_leaves(
-            &ntt,
-            &mut codeword,
-            params,
-            &mut tree[..params.n_leaves()],
-            helper,
-        );
-    } else {
-        ntt.forward_transform_interleaved_from_layer(
-            &mut codeword,
-            params.num_ntts(),
-            params.log_inv_rate,
-        );
-    }
+    ntt.forward_transform_interleaved_from_layer(
+        &mut codeword,
+        params.num_ntts(),
+        params.log_inv_rate,
+    );
     if timing {
-        let phase = if pipelined_leaves {
-            "ntt+merkle-leaves"
-        } else {
-            "ntt"
-        };
         eprintln!(
-            "[commit-timing] {phase}: {:.2} ms",
+            "[commit-timing] ntt: {:.2} ms",
             t_ntt.elapsed().as_secs_f64() * 1e3
         );
     }
     let t_merkle = std::time::Instant::now();
 
+    // ---- Merkle commitment: one leaf per codeword position = num_ntts F128.
+    // Zero-copy: cast the codeword Vec<F128> directly to &[u8]. F128 is
+    // repr(C, align(16)) with two u64s laid out little-endian — same bytes
+    // as the explicit lo.to_le_bytes() + hi.to_le_bytes() serialization.
+    let codeword_bytes: &[u8] = unsafe {
+        core::slice::from_raw_parts(
+            codeword.as_ptr() as *const u8,
+            codeword.len() * core::mem::size_of::<F128>(),
+        )
+    };
     // Initial tree: one leaf per codeword position, each containing the
     // row-batch lanes (num_ntts F_{2^128} values = 2^log_batch_size). This is
     // Ligerito's L0 commitment.
-    let merkle_tree = if let Some(tree) = prehashed_tree {
-        merkle::merkle_tree_from_prehashed_leaves(tree, params.n_leaves(), params.merkle_hash)
-    } else {
-        // Zero-copy: F128 is repr(C, align(16)) with two u64s laid out
-        // little-endian, matching the canonical leaf serialization.
-        let codeword_bytes: &[u8] = unsafe {
-            core::slice::from_raw_parts(
-                codeword.as_ptr() as *const u8,
-                codeword.len() * core::mem::size_of::<F128>(),
-            )
-        };
-        merkle::merkle_tree(codeword_bytes, params.n_leaves(), params.merkle_hash)
-    };
+    let merkle_tree = merkle::merkle_tree(codeword_bytes, params.n_leaves(), params.merkle_hash);
     let root = *merkle_tree.last().expect("merkle tree non-empty");
     if timing {
-        let phase = if pipelined_leaves {
-            "merkle-parents"
-        } else {
-            "merkle"
-        };
         eprintln!(
-            "[commit-timing] {phase}: {:.2} ms",
+            "[commit-timing] merkle: {:.2} ms",
             t_merkle.elapsed().as_secs_f64() * 1e3
         );
     }
@@ -560,12 +397,6 @@ mod tests {
         fn bits(&mut self, n: usize) -> Vec<bool> {
             (0..n).map(|_| self.next_u64() & 1 == 1).collect()
         }
-        fn f128(&mut self) -> F128 {
-            F128 {
-                lo: self.next_u64(),
-                hi: self.next_u64(),
-            }
-        }
     }
 
     /// The Ligerito configs derived from `PcsParams` must carry the params'
@@ -605,101 +436,6 @@ mod tests {
             profile: Default::default(),
             merkle_hash: Default::default(),
         }
-    }
-
-    #[test]
-    fn ranked_ntt_merkle_pipeline_gate_is_narrow() {
-        let params = PcsParams {
-            m: 32,
-            log_inv_rate: 1,
-            log_batch_size: 6,
-            profile: crate::pcs::ligerito::LigeritoProfile::Fast,
-            merkle_hash: HashKind::Blake3,
-        };
-        let enabled_here = cfg!(all(
-            target_os = "macos",
-            target_arch = "aarch64",
-            target_feature = "aes"
-        ));
-        assert_eq!(
-            is_ranked_ntt_merkle_leaf_pipeline_shape(&params),
-            enabled_here
-        );
-
-        let mut changed = params.clone();
-        changed.m = 31;
-        assert!(!is_ranked_ntt_merkle_leaf_pipeline_shape(&changed));
-        let mut changed = params.clone();
-        changed.log_inv_rate = 2;
-        assert!(!is_ranked_ntt_merkle_leaf_pipeline_shape(&changed));
-        let mut changed = params.clone();
-        changed.log_batch_size = 5;
-        assert!(!is_ranked_ntt_merkle_leaf_pipeline_shape(&changed));
-        let mut changed = params.clone();
-        changed.profile = crate::pcs::ligerito::LigeritoProfile::Secure;
-        assert!(!is_ranked_ntt_merkle_leaf_pipeline_shape(&changed));
-        let mut changed = params;
-        changed.merkle_hash = HashKind::Sha256;
-        assert!(!is_ranked_ntt_merkle_leaf_pipeline_shape(&changed));
-    }
-
-    #[test]
-    fn pipelined_ntt_leaves_match_separate_oracle() {
-        // log_d=12 is large enough to split into multiple finalized chunks on
-        // ordinary test hosts. This exercises concurrent helper receives,
-        // bounded-queue overflow to inline hashing, and the post-NTT tail
-        // drain, rather than only the scalar one-callback fallback.
-        let params = PcsParams {
-            m: 24,
-            log_inv_rate: 1,
-            log_batch_size: 6,
-            profile: crate::pcs::ligerito::LigeritoProfile::Fast,
-            merkle_hash: HashKind::Blake3,
-        };
-        let mut rng = Rng::new(0xCA5E_10CA_C011_1701);
-        let message: Vec<F128> = (0..1usize << params.log_msg_len())
-            .map(|_| rng.f128())
-            .collect();
-
-        let mut source = vec![F128::ZERO; params.codeword_len_f128()];
-        replicate_message_fill(&mut source, &message);
-        let ntt = AdditiveNttF128::standard(params.k_code());
-
-        let mut expect_codeword = source.clone();
-        ntt.forward_transform_interleaved_from_layer(
-            &mut expect_codeword,
-            params.num_ntts(),
-            params.log_inv_rate,
-        );
-        let expect_bytes = unsafe {
-            core::slice::from_raw_parts(
-                expect_codeword.as_ptr().cast::<u8>(),
-                core::mem::size_of_val(expect_codeword.as_slice()),
-            )
-        };
-        let expect_tree = merkle::merkle_tree(expect_bytes, params.n_leaves(), HashKind::Blake3);
-
-        let helper = rayon::ThreadPoolBuilder::new()
-            .num_threads(2)
-            .build()
-            .unwrap();
-        let mut got_codeword = source;
-        let mut got_tree = vec![[0u8; 32]; 2 * params.n_leaves() - 1];
-        ranked_ntt_with_pipelined_leaves(
-            &ntt,
-            &mut got_codeword,
-            &params,
-            &mut got_tree[..params.n_leaves()],
-            &helper,
-        );
-        let got_tree = merkle::merkle_tree_from_prehashed_leaves(
-            got_tree,
-            params.n_leaves(),
-            HashKind::Blake3,
-        );
-
-        assert_eq!(got_codeword, expect_codeword);
-        assert_eq!(got_tree, expect_tree);
     }
 
     /// The replicate-fill + start-at-layer-`log_inv_rate` fast path must be
