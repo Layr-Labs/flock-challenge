@@ -69,6 +69,11 @@ use kernels::x86_64::shift_reduce_inner_ab_x86_sse;
 // Protocol constants — fixed by the optimization design.
 // ---------------------------------------------------------------------------
 
+/// GPU∥CPU split of the round-1 x_hi loop (runtime-dlopen'd Metal; bit-exact
+/// scalar-oracle semantics; falls back to CPU on any failure).
+#[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+mod gpu_split;
+
 /// Number of variables folded in round 1 for the shift_reduce variant.
 pub const K_SKIP: usize = 6;
 const ELL: usize = 64;
@@ -1021,40 +1026,110 @@ pub fn round1_shift_reduce_extract_c_packed_padded_with_s_hat_v(
 
     let (within_outer_mask, b_med_counts) = build_b_med_counts(padding);
 
-    let (res_ab, res_c_s_0, res_c_s_1) = (0..hi_size)
-        .into_par_iter()
-        .fold(WorkerStateWithSHatV::new, |mut state, x_hi| {
-            let eq_hi_val = eq_hi[x_hi];
-            process_one_x_hi_with_s_hat_v(
-                x_hi,
-                big_lo_size,
-                n_lo_and_inner,
-                within_outer_mask,
-                &b_med_counts,
-                a_packed,
-                b_packed,
-                c_packed,
-                inv_table,
-                &eq_lo_scaled,
-                eq_hi_val,
-                convert,
-                paired_c,
-                &mut state,
-            );
-            state
-        })
-        .map(|s| (s.local_res_ab, s.local_res_c_s_0, s.local_res_c_s_1))
-        .reduce(
-            || ([F128::ZERO; ELL], [F128::ZERO; ELL], [F128::ZERO; ELL]),
-            |(mut ab1, mut c0_1, mut c1_1), (ab2, c0_2, c1_2)| {
+    // GPU∥CPU split: submit a trailing x_hi range to the GPU asynchronously,
+    // process the rest on the CPU pool, then merge. F128 addition is XOR, so
+    // the partition is bit-identical to the all-CPU computation. `None`
+    // (no GPU / setup failure / range too small) means the CPU runs 0..hi_size
+    // exactly as before.
+    #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+    let gpu_job = {
+        let inv_bytes = unsafe {
+            core::slice::from_raw_parts(inv_table.data_ptr(), 256 * (1usize << k_skip))
+        };
+        gpu_split::Round1GpuJob::submit(
+            a_packed,
+            b_packed,
+            c_packed,
+            inv_bytes,
+            convert,
+            &eq_lo_scaled,
+            &b_med_counts,
+            within_outer_mask,
+            hi_size,
+            eq.n_lo,
+            n_lo_and_inner,
+            N_INNER,
+            N_CHUNKS,
+        )
+    };
+    #[cfg(not(all(target_arch = "aarch64", target_os = "macos")))]
+    let gpu_job: Option<core::convert::Infallible> = None;
+
+    let cpu_hi_end = match &gpu_job {
+        Some(job) => {
+            #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+            {
+                job.gpu_hi_start
+            }
+            #[cfg(not(all(target_arch = "aarch64", target_os = "macos")))]
+            {
+                match *job {}
+            }
+        }
+        None => hi_size,
+    };
+
+    let run_cpu_range = |range: std::ops::Range<usize>| {
+        range
+            .into_par_iter()
+            .fold(WorkerStateWithSHatV::new, |mut state, x_hi| {
+                let eq_hi_val = eq_hi[x_hi];
+                process_one_x_hi_with_s_hat_v(
+                    x_hi,
+                    big_lo_size,
+                    n_lo_and_inner,
+                    within_outer_mask,
+                    &b_med_counts,
+                    a_packed,
+                    b_packed,
+                    c_packed,
+                    inv_table,
+                    &eq_lo_scaled,
+                    eq_hi_val,
+                    convert,
+                    paired_c,
+                    &mut state,
+                );
+                state
+            })
+            .map(|s| (s.local_res_ab, s.local_res_c_s_0, s.local_res_c_s_1))
+            .reduce(
+                || ([F128::ZERO; ELL], [F128::ZERO; ELL], [F128::ZERO; ELL]),
+                |(mut ab1, mut c0_1, mut c1_1), (ab2, c0_2, c1_2)| {
+                    for i in 0..ELL {
+                        ab1[i] += ab2[i];
+                        c0_1[i] += c0_2[i];
+                        c1_1[i] += c1_2[i];
+                    }
+                    (ab1, c0_1, c1_1)
+                },
+            )
+    };
+
+    let (mut res_ab, mut res_c_s_0, mut res_c_s_1) = run_cpu_range(0..cpu_hi_end);
+
+    #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+    if let Some(job) = gpu_job {
+        let gpu_hi_start = job.gpu_hi_start;
+        match job.finish(eq_hi) {
+            Some((gab, gc0, gc1)) => {
                 for i in 0..ELL {
-                    ab1[i] += ab2[i];
-                    c0_1[i] += c0_2[i];
-                    c1_1[i] += c1_2[i];
+                    res_ab[i] += gab[i];
+                    res_c_s_0[i] += gc0[i];
+                    res_c_s_1[i] += gc1[i];
                 }
-                (ab1, c0_1, c1_1)
-            },
-        );
+            }
+            None => {
+                // GPU fault: recompute its range on the CPU. Costs time only.
+                let (fab, fc0, fc1) = run_cpu_range(gpu_hi_start..hi_size);
+                for i in 0..ELL {
+                    res_ab[i] += fab[i];
+                    res_c_s_0[i] += fc0[i];
+                    res_c_s_1[i] += fc1[i];
+                }
+            }
+        }
+    }
 
     // Wire output: bank_0 + bank_1 reconstructs the original `res_c_s` (by
     // F_2-linearity of φ_8 over the masked-byte sum).

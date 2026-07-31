@@ -107,6 +107,18 @@ mod sha256x4;
 #[path = "merkle/blake3_neon_apple.rs"]
 mod blake3_neon_apple;
 
+/// Runtime-dlopen'd Metal offload for whole-level BLAKE3 leaf/parent hashing.
+/// Byte-identical digests; every call falls back to the CPU path on any
+/// failure. See the module docs for the trust/fallback contract.
+#[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+#[path = "merkle/gpu_metal.rs"]
+mod gpu_metal;
+
+/// Async GPU leaf stream for the ranked NTT→Merkle pipeline (see
+/// [`gpu_metal::LeafStream`]); `None` when no usable GPU is present.
+#[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+pub(crate) use gpu_metal::LeafStream as GpuLeafStream;
+
 /// Global Merkle hash call/compression counters, enabled with
 /// `--features hash-count` (e.g. by `benches/verifier_hash_count.rs`).
 /// Relaxed atomics — exact totals, no ordering guarantees across threads.
@@ -466,6 +478,16 @@ fn hash_leaves(data: &[u8], leaf_size: usize, out: &mut [Hash], kind: HashKind) 
             Relaxed,
         );
     }
+    // Whole-level GPU dispatch: one command buffer replaces the entire CPU
+    // fanout below. Only taken for the ranked 1 KiB-leaf shape and only when
+    // the level is large enough to clear the dispatch floor; a `false` return
+    // (no GPU, too small, any failure) falls through to the identical CPU
+    // path.
+    #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+    if kind == HashKind::Blake3 && leaf_size == 1024 && gpu_metal::hash_leaves_1024(data, out) {
+        return;
+    }
+
     match kind {
         HashKind::Blake3 if blake3_leaf_size_is_batchable(leaf_size) => {
             // Chunk-queue dispatch instead of a static rayon split so the
@@ -580,6 +602,16 @@ fn hash_pairs_level(read: &[Hash], write: &mut [Hash], kind: HashKind) {
         HashKind::Blake3 => {
             if serial {
                 blake3_hash_many_parents(read_bytes, write);
+            } else if {
+                // Whole-level GPU dispatch; `false` (no GPU / too small /
+                // failure) falls through to the CPU chunk queue below.
+                #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+                let taken = gpu_metal::hash_parents(read_bytes, write);
+                #[cfg(not(all(target_arch = "aarch64", target_os = "macos")))]
+                let taken = false;
+                taken
+            } {
+                // Level fully hashed on the GPU.
             } else {
                 // Chunk-queue dispatch so the efficiency-core helper pool can
                 // drain parent nodes alongside the main pool — same contract

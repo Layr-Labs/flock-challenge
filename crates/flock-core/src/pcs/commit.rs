@@ -356,6 +356,50 @@ fn ranked_ntt_with_pipelined_leaves(
         }
     };
 
+    // GPU leaf stream — measured SLOWER than the E-core pipeline at the
+    // ranked shape (per-command-buffer overhead on 1024-leaf jobs, plus the
+    // E-cores it idles already hide this hashing behind the NTT), so it is
+    // opt-in for experiments only and never fires in the ranked worker's
+    // cleared environment.
+    #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+    if std::env::var_os("FLOCK_GPU_LEAFSTREAM").is_some_and(|v| v == "1") {
+        let codeword_bytes_len = codeword.len() * core::mem::size_of::<F128>();
+        if let Some(stream) = merkle::GpuLeafStream::new(
+            codeword_base.ptr() as *const u8,
+            codeword_bytes_len,
+            leaves_base.ptr(),
+            leaves.len(),
+        ) {
+            let n_leaves_total = leaves.len();
+            ntt.forward_transform_interleaved_from_layer_and_then(
+                codeword,
+                num_ntts,
+                params.log_inv_rate,
+                |elem_offset, chunk| {
+                    debug_assert_eq!(elem_offset % num_ntts, 0);
+                    debug_assert_eq!(chunk.len() % num_ntts, 0);
+                    stream.submit(elem_offset / num_ntts, chunk.len() / num_ntts);
+                },
+            );
+            if stream.finish() {
+                return;
+            }
+            // Safety net: unspecified leaf contents after a GPU fault —
+            // rehash every leaf from the (final, immutable) codeword.
+            let leaves = unsafe {
+                core::slice::from_raw_parts_mut(leaves_base.ptr(), n_leaves_total)
+            };
+            let codeword_bytes = unsafe {
+                core::slice::from_raw_parts(codeword_base.ptr() as *const u8, codeword_bytes_len)
+            };
+            leaves
+                .par_chunks_mut(1024)
+                .zip(codeword_bytes.par_chunks(1024 * 1024))
+                .for_each(|(outs, bytes)| merkle::hash_ranked_blake3_leaf_chunk(bytes, outs));
+            return;
+        }
+    }
+
     // Two queued subtrees per helper keep all four E-cores fed while bounding
     // not-yet-hashed input to 8 MiB on the ranked 4-E-core host.
     let queue_capacity = (2 * helper.current_num_threads()).max(1);
