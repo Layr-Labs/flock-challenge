@@ -5,7 +5,7 @@ use crate::field::F128;
 /// # Safety
 /// Requires the `aes` target feature.
 pub(super) unsafe fn fold_pairs(src: &[F128], base: usize, dst: &mut [F128], r: F128) {
-    use crate::field::gf2_128::aarch64::ghash_mul_const_vec2_neon;
+    use crate::field::gf2_128::aarch64::ghash_mul_vec2_neon;
 
     let lanes = dst.len() & !1;
     let mut t = 0;
@@ -23,10 +23,8 @@ pub(super) unsafe fn fold_pairs(src: &[F128], base: usize, dst: &mut [F128], r: 
             lo: e1.lo ^ o1.lo,
             hi: e1.hi ^ o1.hi,
         };
-        // Constant-multiplier Karatsuba: 6 PMULL for the two products
-        // instead of 8 schoolbook (PMULL is the scarce resource).
         // SAFETY: caller guarantees the aes target feature.
-        let prod = unsafe { ghash_mul_const_vec2_neon(r, [x0, x1]) };
+        let prod = unsafe { ghash_mul_vec2_neon([r, r], [x0, x1]) };
         dst[t] = F128 {
             lo: e0.lo ^ prod[0].lo,
             hi: e0.hi ^ prod[0].hi,

@@ -99,12 +99,13 @@ mod sha256x4;
 #[path = "merkle/x86_64.rs"]
 mod sha256x4;
 
-/// Three independent four-lane NEON states interleaved round-by-round for the
-/// ranked 1 KiB BLAKE3 leaf shape. Apple-only generated assembly; every other
-/// target retains the upstream `blake3::platform::hash_many` path.
+/// Apple AArch64 BLAKE3 kernels specialized for the ranked Merkle geometry.
+/// The 1 KiB leaf path interleaves two four-lane states round-by-round, while
+/// parent nodes use three four-lane states. Every other target retains the
+/// upstream `blake3::platform::hash_many` path.
 #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
-#[path = "merkle/blake3_neon12.rs"]
-mod blake3_neon12;
+#[path = "merkle/blake3_neon_apple.rs"]
+mod blake3_neon_apple;
 
 /// Global Merkle hash call/compression counters, enabled with
 /// `--features hash-count` (e.g. by `benches/verifier_hash_count.rs`).
@@ -287,7 +288,6 @@ const BLAKE3_IV: [u32; 8] = [
 const BLAKE3_CHUNK_START: u8 = 1;
 const BLAKE3_CHUNK_END: u8 = 2;
 const BLAKE3_PARENT: u8 = 4;
-const BLAKE3_ROOT: u8 = 8;
 
 /// Cached SIMD platform. `Platform::detect()` is cheap but not free, and the
 /// tree build reaches the batched path once per [`BLAKE3_BATCH`] nodes.
@@ -366,7 +366,7 @@ fn blake3_hash_many<const N: usize>(
 fn blake3_hash_many_leaves(data: &[u8], leaf_size: usize, out: &mut [Hash]) -> bool {
     #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
     if leaf_size == 1024 {
-        let done = blake3_neon12::hash_complete_groups(data, out);
+        let done = blake3_neon_apple::hash_complete_groups(data, out);
         if done < out.len() {
             blake3_hash_many::<1024>(
                 &data[done * 1024..],
@@ -410,43 +410,13 @@ fn blake3_leaf_size_is_batchable(leaf_size: usize) -> bool {
 fn blake3_hash_many_parents(data: &[u8], out: &mut [Hash]) {
     #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
     {
-        let done = blake3_neon12::hash_complete_parent_groups(data, out);
+        let done = blake3_neon_apple::hash_complete_parent_groups(data, out);
         if done < out.len() {
             blake3_hash_many::<64>(&data[done * 64..], &mut out[done..], BLAKE3_PARENT, 0, 0);
         }
     }
     #[cfg(not(all(target_arch = "aarch64", target_os = "macos")))]
     blake3_hash_many::<64>(data, out, BLAKE3_PARENT, 0, 0);
-}
-
-/// Batched BLAKE3 PoW grind blocks: `data` is `out.len()` contiguous
-/// 64-byte single-chunk pre-images, hashed with `CHUNK_START | CHUNK_END |
-/// ROOT` — byte-identical to `blake3::hash` on each block. Uses the
-/// twelve-way kernel on Apple AArch64, upstream `hash_many` elsewhere and
-/// for the tail.
-#[inline]
-pub(crate) fn blake3_hash_many_pow(data: &[u8], out: &mut [Hash]) {
-    #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
-    {
-        let done = blake3_neon12::hash_complete_pow_groups(data, out);
-        if done < out.len() {
-            blake3_hash_many::<64>(
-                &data[done * 64..],
-                &mut out[done..],
-                0,
-                BLAKE3_CHUNK_START,
-                BLAKE3_CHUNK_END | BLAKE3_ROOT,
-            );
-        }
-    }
-    #[cfg(not(all(target_arch = "aarch64", target_os = "macos")))]
-    blake3_hash_many::<64>(
-        data,
-        out,
-        0,
-        BLAKE3_CHUNK_START,
-        BLAKE3_CHUNK_END | BLAKE3_ROOT,
-    );
 }
 
 /// Hash a run of `out.len()` equal-size leaves from `data` under `kind`.

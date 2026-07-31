@@ -1,25 +1,26 @@
-//! Twelve-leaf BLAKE3 chunk kernel for Apple AArch64.
+//! Eight-leaf BLAKE3 chunk kernel for Apple AArch64.
 //!
 //! Upstream BLAKE3's NEON `hash_many` hashes four 1 KiB chunks through all
 //! sixteen dependent compression blocks before starting the next four. The
-//! generated kernel below keeps three independent four-lane states in flight
+//! generated kernel below keeps two independent four-lane states in flight
 //! and rotates between them after every BLAKE3 round. This exposes enough
-//! independent add/xor/rotate chains to fill Apple P-core execution slots.
+//! independent add/xor/rotate chains to fill Apple P-core execution slots
+//! while fitting substantially more of the compression state in registers.
 //!
 //! The assembly is compiler-generated from the same BLAKE3 1.8.5 NEON
 //! primitives linked by this crate, with `-O3 -mcpu=apple-m3`. It fixes the
-//! exact Merkle-leaf contract used here: twelve contiguous 1024-byte unkeyed
+//! exact Merkle-leaf contract used here: eight contiguous 1024-byte unkeyed
 //! chunks, counter zero, `CHUNK_START | CHUNK_END`, 32 output bytes each.
 
 use core::arch::aarch64::*;
 
-core::arch::global_asm!(include_str!("blake3_neon12_macos.S"), options(raw));
+core::arch::global_asm!(include_str!("blake3_neon8_macos.S"), options(raw));
 
 unsafe extern "C" {
-    fn flock_blake3_hash12_neon_1024(data: *const u8, out: *mut u8, groups: usize);
+    fn flock_blake3_hash8_neon_1024(data: *const u8, out: *mut u8, groups: usize);
 }
 
-/// Hash as many complete groups of twelve 1 KiB leaves as fit in `out`.
+/// Hash as many complete groups of eight 1 KiB leaves as fit in `out`.
 ///
 /// Returns the number of leaves written. The caller handles the tail through
 /// upstream `hash_many`, which also makes arbitrary Rayon partition sizes
@@ -27,20 +28,20 @@ unsafe extern "C" {
 #[inline]
 pub(super) fn hash_complete_groups(data: &[u8], out: &mut [[u8; 32]]) -> usize {
     debug_assert_eq!(data.len(), out.len() * 1024);
-    let groups = out.len() / 12;
+    let groups = out.len() / 8;
     if groups == 0 {
         return 0;
     }
 
-    // SAFETY: each group consumes exactly 12 * 1024 initialized bytes and
-    // writes exactly 12 * 32 bytes. `groups` is floor(out.len() / 12), and
+    // SAFETY: each group consumes exactly 8 * 1024 initialized bytes and
+    // writes exactly 8 * 32 bytes. `groups` is floor(out.len() / 8), and
     // the debug assertion records the data/output correspondence established
     // by the Merkle caller. The kernel is compiled only for Apple AArch64,
     // where NEON is mandatory.
     unsafe {
-        flock_blake3_hash12_neon_1024(data.as_ptr(), out.as_mut_ptr().cast(), groups);
+        flock_blake3_hash8_neon_1024(data.as_ptr(), out.as_mut_ptr().cast(), groups);
     }
-    groups * 12
+    groups * 8
 }
 
 const IV: [u32; 8] = [
@@ -197,22 +198,6 @@ unsafe fn round3(
 /// remain on upstream `hash_many`, so arbitrary Rayon partitions are safe.
 #[inline]
 pub(super) fn hash_complete_parent_groups(data: &[u8], out: &mut [[u8; 32]]) -> usize {
-    hash_complete_groups_flags(data, out, 4)
-}
-
-/// Twelve-way PoW grind blocks: 64-byte single-chunk pre-images with
-/// `CHUNK_START | CHUNK_END | ROOT` (11) instead of the Merkle `PARENT`
-/// flag (4) — the same layout, IV, counter-zero, and 32-byte output
-/// contract as [`hash_complete_parent_groups`], so each output agrees with
-/// `blake3::hash` on the same 64-byte pre-image.
-pub(crate) fn hash_complete_pow_groups(data: &[u8], out: &mut [[u8; 32]]) -> usize {
-    hash_complete_groups_flags(data, out, 11)
-}
-
-/// Shared driver: hash complete groups of twelve contiguous 64-byte blocks
-/// with the given BLAKE3 domain `flags`. Returns the number of outputs
-/// written; the caller handles the tail through upstream `hash_many`.
-fn hash_complete_groups_flags(data: &[u8], out: &mut [[u8; 32]], flags: u32) -> usize {
     debug_assert_eq!(data.len(), out.len() * 64);
     let groups = out.len() / 12;
     if groups == 0 {
@@ -247,7 +232,7 @@ fn hash_complete_groups_flags(data: &[u8], out: &mut [[u8; 32]], flags: u32) -> 
             zero,
             zero,
             vdupq_n_u32(64),
-            vdupq_n_u32(flags),
+            vdupq_n_u32(4),
         ];
         for group in 0..groups {
             let input = data.as_ptr().add(group * 12 * 64);
