@@ -110,3 +110,47 @@ pub(super) fn accumulate_convert_with_s_hat_v(
         partial_c_1[lane] += converted_c_1 * eq_lo_val;
     }
 }
+
+#[allow(clippy::too_many_arguments)]
+#[cfg(not(target_arch = "aarch64"))]
+pub(super) fn accumulate_convert_with_s_hat_v_quad(
+    chunk_ab_bytes: &[[u8; 64]; 16],
+    chunk_c_bytes: &[[u8; 64]; 16],
+    n_b_med: usize,
+    convert: &[F128],
+    c_quad_tables: &[F128],
+    eq_lo_val: F128,
+    partial_ab: &mut [F128; 64],
+    partial_c: &mut [[F128; 64]; 8],
+) {
+    use crate::bits::transpose_8x8_bits;
+
+    debug_assert!(n_b_med <= 16);
+    debug_assert_eq!(c_quad_tables.len(), 8 * 2 * 256);
+    for lane in 0..64 {
+        let mut converted_ab = F128::ZERO;
+        for b_med in 0..n_b_med {
+            converted_ab +=
+                convert[b_med * 256 + chunk_ab_bytes[b_med][lane] as usize];
+        }
+        partial_ab[lane] += converted_ab * eq_lo_val;
+
+        let packed_group = |base: usize| {
+            let mut bytes = [0u8; 8];
+            for (j, byte) in bytes.iter_mut().enumerate() {
+                if base + j < n_b_med {
+                    *byte = chunk_c_bytes[base + j][lane];
+                }
+            }
+            transpose_8x8_bits(u64::from_le_bytes(bytes)).to_le_bytes()
+        };
+        let lo = packed_group(0);
+        let hi = packed_group(8);
+        for k in 0..8 {
+            let table_base = k * 2 * 256;
+            let converted = c_quad_tables[table_base + lo[k] as usize]
+                + c_quad_tables[table_base + 256 + hi[k] as usize];
+            partial_c[k][lane] += converted * eq_lo_val;
+        }
+    }
+}

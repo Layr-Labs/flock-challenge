@@ -264,6 +264,44 @@ static PAIRED_C_TABLES: LazyLock<(Vec<F128>, Vec<F128>)> = LazyLock::new(|| {
     (m0, m1)
 });
 
+// ---------------------------------------------------------------------------
+// Eight-bank C tables for the ranked direct-C opening.
+//
+// The ordinary capture keeps only small bit K[0] and folds K[1..3] at the
+// two friendly challenges.  Direct fold2 needs those latter two bits as
+// explicit banks.  For each small-bit K and each group of eight medium rows,
+// this table folds the medium weights selected by an 8-bit column mask:
+//
+//   M[K,g,x] = sum_j T[8g+j, (((x >> j) & 1) << K)].
+//
+// At runtime an 8x8 transpose of eight C bytes produces all eight x masks.
+// Thus the quad capture still performs only 2 table gathers per K (16 total)
+// per lane, rather than 16 gathers for each of eight banks.
+// ---------------------------------------------------------------------------
+
+const C_QUAD_BANKS: usize = 8;
+const C_QUAD_GROUPS: usize = 2;
+const C_QUAD_TABLE_SIZE: usize = C_QUAD_BANKS * C_QUAD_GROUPS * 256;
+
+static C_QUAD_TABLES: LazyLock<Vec<F128>> = LazyLock::new(|| {
+    let base = convert_table();
+    let mut out = vec![F128::ZERO; C_QUAD_TABLE_SIZE];
+    for k in 0..C_QUAD_BANKS {
+        for group in 0..C_QUAD_GROUPS {
+            let table = &mut out[(k * C_QUAD_GROUPS + group) * 256
+                ..(k * C_QUAD_GROUPS + group + 1) * 256];
+            for (mask, value) in table.iter_mut().enumerate() {
+                for j in 0..8 {
+                    if (mask >> j) & 1 == 1 {
+                        *value += base[(8 * group + j) * 256 + (1 << k)];
+                    }
+                }
+            }
+        }
+    }
+    out
+});
+
 #[inline]
 pub fn bit_transpose_64bytes(input: &[u8; 64], output: &mut [u8; 64]) {
     kernels::bit_transpose_64bytes(input, output);
@@ -820,6 +858,169 @@ fn process_one_x_hi_with_precomputed_ab(
     }
 }
 
+type CQuadBanks = [[F128; ELL]; C_QUAD_BANKS];
+
+/// Ranked C capture retaining all three friendly small bits.  Bit K[0]
+/// remains inside the 128-entry ring-switch prefix; K[1] and K[2] become the
+/// four direct-fold2 banks.
+struct WorkerStateWithSHatVQuad {
+    partial_ab: [F128; ELL],
+    partial_c: CQuadBanks,
+    chunk_ab_bytes: [[u8; 64]; 1 << N_MEDIUM],
+    chunk_c_bytes: [[u8; 64]; 1 << N_MEDIUM],
+    a_col: [F8; ELL],
+    b_col: [F8; ELL],
+    local_res_ab: [F128; ELL],
+    local_res_c_s: CQuadBanks,
+}
+
+impl WorkerStateWithSHatVQuad {
+    fn new() -> Self {
+        Self {
+            partial_ab: [F128::ZERO; ELL],
+            partial_c: [[F128::ZERO; ELL]; C_QUAD_BANKS],
+            chunk_ab_bytes: [[0u8; 64]; 1 << N_MEDIUM],
+            chunk_c_bytes: [[0u8; 64]; 1 << N_MEDIUM],
+            a_col: [F8::ZERO; ELL],
+            b_col: [F8::ZERO; ELL],
+            local_res_ab: [F128::ZERO; ELL],
+            local_res_c_s: [[F128::ZERO; ELL]; C_QUAD_BANKS],
+        }
+    }
+}
+
+#[inline]
+fn finish_quad_outer(state: &mut WorkerStateWithSHatVQuad, eq_hi_val: F128) {
+    for lane in 0..ELL {
+        state.local_res_ab[lane] += eq_hi_val * state.partial_ab[lane];
+        for k in 0..C_QUAD_BANKS {
+            state.local_res_c_s[k][lane] += eq_hi_val * state.partial_c[k][lane];
+        }
+    }
+}
+
+/// Fused AB + eight-bank C variant used only by the ranked direct-C path.
+#[inline]
+#[allow(clippy::too_many_arguments)]
+fn process_one_x_hi_with_s_hat_v_quad(
+    x_hi: usize,
+    big_lo_size: usize,
+    n_lo_and_inner: usize,
+    within_outer_mask: usize,
+    b_med_counts: &[u8],
+    a_packed: &[u8],
+    b_packed: &[u8],
+    c_packed: &[u8],
+    inv_table: &InvNttTableByteSingleGf8,
+    eq_lo_scaled: &[F128],
+    eq_hi_val: F128,
+    convert: &[F128],
+    state: &mut WorkerStateWithSHatVQuad,
+) {
+    state.partial_ab.fill(F128::ZERO);
+    for bank in &mut state.partial_c {
+        bank.fill(F128::ZERO);
+    }
+
+    let n_lo = n_lo_and_inner - N_INNER;
+    for x_outer_lo in 0..big_lo_size {
+        let x_outer = x_outer_lo | (x_hi << n_lo);
+        let within_hash_outer = x_outer & within_outer_mask;
+        let n_b_med = b_med_counts[within_hash_outer] as usize;
+        if n_b_med == 0 {
+            continue;
+        }
+
+        let chunk_byte_base = ((x_outer_lo << N_INNER) | (x_hi << n_lo_and_inner)) * N_CHUNKS;
+        let eq_lo_val = eq_lo_scaled[x_outer_lo];
+        for b_med in 0..n_b_med {
+            shift_reduce_inner_ab(
+                a_packed,
+                b_packed,
+                inv_table,
+                chunk_byte_base,
+                b_med,
+                &mut state.chunk_ab_bytes[b_med],
+                &mut state.a_col,
+                &mut state.b_col,
+            );
+            let byte_base_b = chunk_byte_base + b_med * N_CHUNKS * 8;
+            let c_in: &[u8; 64] = (&c_packed[byte_base_b..byte_base_b + 64])
+                .try_into()
+                .expect("64 c-bytes per medium position");
+            bit_transpose_64bytes(c_in, &mut state.chunk_c_bytes[b_med]);
+        }
+
+        kernels::accumulate_convert_with_s_hat_v_quad(
+            &state.chunk_ab_bytes,
+            &state.chunk_c_bytes,
+            n_b_med,
+            convert,
+            &C_QUAD_TABLES,
+            eq_lo_val,
+            &mut state.partial_ab,
+            &mut state.partial_c,
+        );
+    }
+    finish_quad_outer(state, eq_hi_val);
+}
+
+/// Precomputed-AB counterpart of [`process_one_x_hi_with_s_hat_v_quad`].
+#[inline]
+#[allow(clippy::too_many_arguments)]
+fn process_one_x_hi_with_precomputed_ab_quad(
+    x_hi: usize,
+    big_lo_size: usize,
+    n_lo_and_inner: usize,
+    within_outer_mask: usize,
+    b_med_counts: &[u8],
+    ab_inner: &[u8],
+    c_packed: &[u8],
+    eq_lo_scaled: &[F128],
+    eq_hi_val: F128,
+    convert: &[F128],
+    state: &mut WorkerStateWithSHatVQuad,
+) {
+    state.partial_ab.fill(F128::ZERO);
+    for bank in &mut state.partial_c {
+        bank.fill(F128::ZERO);
+    }
+
+    let n_lo = n_lo_and_inner - N_INNER;
+    for x_outer_lo in 0..big_lo_size {
+        let x_outer = x_outer_lo | (x_hi << n_lo);
+        let within_hash_outer = x_outer & within_outer_mask;
+        let n_b_med = b_med_counts[within_hash_outer] as usize;
+        if n_b_med == 0 {
+            continue;
+        }
+
+        let chunk_byte_base = ((x_outer_lo << N_INNER) | (x_hi << n_lo_and_inner)) * N_CHUNKS;
+        let eq_lo_val = eq_lo_scaled[x_outer_lo];
+        for b_med in 0..n_b_med {
+            let byte_base_b = chunk_byte_base + b_med * N_CHUNKS * 8;
+            state.chunk_ab_bytes[b_med]
+                .copy_from_slice(&ab_inner[byte_base_b..byte_base_b + 64]);
+            let c_in: &[u8; 64] = (&c_packed[byte_base_b..byte_base_b + 64])
+                .try_into()
+                .expect("64 c-bytes per medium position");
+            bit_transpose_64bytes(c_in, &mut state.chunk_c_bytes[b_med]);
+        }
+
+        kernels::accumulate_convert_with_s_hat_v_quad(
+            &state.chunk_ab_bytes,
+            &state.chunk_c_bytes,
+            n_b_med,
+            convert,
+            &C_QUAD_TABLES,
+            eq_lo_val,
+            &mut state.partial_ab,
+            &mut state.partial_c,
+        );
+    }
+    finish_quad_outer(state, eq_hi_val);
+}
+
 /// Build the `b_med_counts` table from a [`PaddingSpec`] for use by
 /// [`process_one_x_hi`].
 ///
@@ -1078,6 +1279,114 @@ pub fn round1_shift_reduce_extract_c_packed_padded_with_s_hat_v(
     (res_ab.to_vec(), res_c_lifted, s_hat_v_c)
 }
 
+/// Ranked variant of
+/// [`round1_shift_reduce_extract_c_packed_padded_with_s_hat_v`] that retains
+/// the next two small C coordinates instead of folding them at their friendly
+/// challenges. The returned statistic has four consecutive 128-entry banks,
+/// exactly the layout accepted by ring-switch's direct-fold2 precompute.
+/// Collapsing those banks at `r[k_skip+1..k_skip+3]` is byte-identical to the
+/// ordinary 128-entry `s_hat_v_c`; round-1 wire values are unchanged.
+pub fn round1_shift_reduce_extract_c_packed_padded_with_s_hat_v_quad(
+    a_packed: &[u8],
+    b_packed: &[u8],
+    c_packed: &[u8],
+    m: usize,
+    k_skip: usize,
+    r: &[F128],
+    inv_table: &InvNttTableByteSingleGf8,
+    padding: &PaddingSpec,
+) -> (Vec<F128>, Vec<F128>, Vec<F128>) {
+    use rayon::prelude::*;
+
+    assert_eq!(k_skip, K_SKIP, "optimized variant is k_skip=6 only");
+    assert!(m >= k_skip + N_INNER);
+    let total_bytes = (1usize << m) / 8;
+    assert_eq!(a_packed.len(), total_bytes);
+    assert_eq!(b_packed.len(), total_bytes);
+    assert_eq!(c_packed.len(), total_bytes);
+    assert_eq!(r.len(), m);
+    assert_eq!(inv_table.k, k_skip);
+
+    let eq = SplitEqGhash::new(&r[k_skip + N_INNER..]);
+    let big_lo_size = 1usize << eq.n_lo;
+    let hi_size = 1usize << eq.n_hi;
+    let n_lo_and_inner = eq.n_lo + N_INNER;
+    let d_inv_val = d_inv();
+    let eq_lo_scaled: Vec<F128> = eq.lo.iter().map(|v| *v * d_inv_val).collect();
+    let convert = convert_table();
+    let eq_hi = &eq.hi;
+    let (within_outer_mask, b_med_counts) = build_b_med_counts(padding);
+
+    let (res_ab, res_c_s) = (0..hi_size)
+        .into_par_iter()
+        .fold(WorkerStateWithSHatVQuad::new, |mut state, x_hi| {
+            process_one_x_hi_with_s_hat_v_quad(
+                x_hi,
+                big_lo_size,
+                n_lo_and_inner,
+                within_outer_mask,
+                &b_med_counts,
+                a_packed,
+                b_packed,
+                c_packed,
+                inv_table,
+                &eq_lo_scaled,
+                eq_hi[x_hi],
+                convert,
+                &mut state,
+            );
+            state
+        })
+        .map(|state| (state.local_res_ab, state.local_res_c_s))
+        .reduce(
+            || ([F128::ZERO; ELL], [[F128::ZERO; ELL]; C_QUAD_BANKS]),
+            |(mut ab1, mut c1), (ab2, c2)| {
+                for lane in 0..ELL {
+                    ab1[lane] += ab2[lane];
+                    for k in 0..C_QUAD_BANKS {
+                        c1[k][lane] += c2[k][lane];
+                    }
+                }
+                (ab1, c1)
+            },
+        );
+
+    finish_s_hat_v_c_quad(res_ab, res_c_s, inv_table)
+}
+
+fn finish_s_hat_v_c_quad(
+    res_ab: [F128; ELL],
+    res_c_s: CQuadBanks,
+    inv_table: &InvNttTableByteSingleGf8,
+) -> (Vec<F128>, Vec<F128>, Vec<F128>) {
+    let mut res_c_s_combined = [F128::ZERO; ELL];
+    for bank in &res_c_s {
+        for lane in 0..ELL {
+            res_c_s_combined[lane] += bank[lane];
+        }
+    }
+    let res_c_lifted = ntt_extend_f128_vec_ghash(&res_c_s_combined, inv_table);
+
+    let alpha_inv = alpha_inv_f128();
+    let mut alpha_inv_pow = [F128::ONE; C_QUAD_BANKS];
+    for k in 1..C_QUAD_BANKS {
+        alpha_inv_pow[k] = alpha_inv_pow[k - 1] * alpha_inv;
+    }
+    let n_packed = 2 * ELL;
+    let mut s_hat_v_c_quad = vec![F128::ZERO; 4 * n_packed];
+    for k in 0..C_QUAD_BANKS {
+        let b0 = k & 1;
+        let q = k >> 1;
+        let out = &mut s_hat_v_c_quad[q * n_packed + b0 * ELL
+            ..q * n_packed + (b0 + 1) * ELL];
+        for lane in 0..ELL {
+            out[lane] = alpha_inv_pow[k] * res_c_s[k][lane];
+        }
+    }
+
+    (res_ab.to_vec(), res_c_lifted, s_hat_v_c_quad)
+}
+
 /// Challenge-weighted completion of round 1 using AB blocks returned by
 /// [`precompute_round1_ab_inner_packed_padded`]. This is byte-identical to
 /// [`round1_shift_reduce_extract_c_packed_padded_with_s_hat_v`], while keeping
@@ -1179,6 +1488,81 @@ pub fn round1_shift_reduce_extract_c_packed_padded_with_precomputed_ab(
     }
 
     (res_ab.to_vec(), res_c_lifted, s_hat_v_c)
+}
+
+/// Precomputed-AB counterpart of
+/// [`round1_shift_reduce_extract_c_packed_padded_with_s_hat_v_quad`].
+pub fn round1_shift_reduce_extract_c_packed_padded_with_precomputed_ab_quad(
+    ab_inner: &Round1AbInner,
+    c_packed: &[u8],
+    m: usize,
+    k_skip: usize,
+    r: &[F128],
+    inv_table: &InvNttTableByteSingleGf8,
+    padding: &PaddingSpec,
+) -> (Vec<F128>, Vec<F128>, Vec<F128>) {
+    assert_eq!(k_skip, K_SKIP, "optimized variant is k_skip=6 only");
+    assert!(m >= k_skip + N_INNER);
+    let total_bytes = (1usize << m) / 8;
+    assert_eq!(ab_inner.len_bytes(), total_bytes);
+    assert_eq!(c_packed.len(), total_bytes);
+    assert_eq!(r.len(), m);
+    assert_eq!(inv_table.k, k_skip);
+
+    let eq = SplitEqGhash::new(&r[k_skip + N_INNER..]);
+    let big_lo_size = 1usize << eq.n_lo;
+    let hi_size = 1usize << eq.n_hi;
+    let n_lo_and_inner = eq.n_lo + N_INNER;
+    let d_inv_val = d_inv();
+    let eq_lo_scaled: Vec<F128> = eq.lo.iter().map(|v| *v * d_inv_val).collect();
+    let convert = convert_table();
+    let eq_hi = &eq.hi;
+    let (within_outer_mask, b_med_counts) = build_b_med_counts(padding);
+    let ab_inner_bytes = ab_inner.as_bytes();
+
+    let mut partials: Vec<([F128; ELL], CQuadBanks)> = vec![
+        (
+            [F128::ZERO; ELL],
+            [[F128::ZERO; ELL]; C_QUAD_BANKS],
+        );
+        hi_size
+    ];
+    let partials_base = crate::epool::SyncPtr(partials.as_mut_ptr());
+    crate::epool::run_hetero_chunks(hi_size, |x_hi| {
+        let mut state = WorkerStateWithSHatVQuad::new();
+        process_one_x_hi_with_precomputed_ab_quad(
+            x_hi,
+            big_lo_size,
+            n_lo_and_inner,
+            within_outer_mask,
+            &b_med_counts,
+            ab_inner_bytes,
+            c_packed,
+            &eq_lo_scaled,
+            eq_hi[x_hi],
+            convert,
+            &mut state,
+        );
+        // SAFETY: each queue index is unique and the completion join publishes
+        // every write before the deterministic serial reduction below.
+        unsafe {
+            *partials_base.ptr().add(x_hi) = (state.local_res_ab, state.local_res_c_s);
+        }
+    });
+
+    let (res_ab, res_c_s) = partials.into_iter().fold(
+        ([F128::ZERO; ELL], [[F128::ZERO; ELL]; C_QUAD_BANKS]),
+        |(mut ab1, mut c1), (ab2, c2)| {
+            for lane in 0..ELL {
+                ab1[lane] += ab2[lane];
+                for k in 0..C_QUAD_BANKS {
+                    c1[k][lane] += c2[k][lane];
+                }
+            }
+            (ab1, c1)
+        },
+    );
+    finish_s_hat_v_c_quad(res_ab, res_c_s, inv_table)
 }
 
 /// Serial reference — same I/O as [`round1_shift_reduce_extract_c_packed`],
@@ -1805,12 +2189,84 @@ mod tests {
         }
     }
 
+    #[test]
+    fn c_quad_tables_match_medium_fold_definition() {
+        let convert = convert_table();
+        for k in 0..C_QUAD_BANKS {
+            for group in 0..C_QUAD_GROUPS {
+                for mask in 0..256usize {
+                    let mut want = F128::ZERO;
+                    for j in 0..8 {
+                        if (mask >> j) & 1 == 1 {
+                            want += convert[(8 * group + j) * 256 + (1 << k)];
+                        }
+                    }
+                    let got = C_QUAD_TABLES[(k * C_QUAD_GROUPS + group) * 256 + mask];
+                    assert_eq!(got, want, "k={k}, group={group}, mask={mask:#04x}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn c_quad_kernel_matches_scalar_for_all_medium_counts() {
+        let mut rng = Rng::new(0xC0AD_BA5E);
+        let chunk_ab: [[u8; 64]; 1 << N_MEDIUM] =
+            core::array::from_fn(|_| core::array::from_fn(|_| rng.next_u64() as u8));
+        let chunk_c: [[u8; 64]; 1 << N_MEDIUM] =
+            core::array::from_fn(|_| core::array::from_fn(|_| rng.next_u64() as u8));
+        let convert = convert_table();
+
+        for n_b_med in 0..=(1 << N_MEDIUM) {
+            let eq_lo = rng.f128();
+            let seed_ab: [F128; ELL] = core::array::from_fn(|_| rng.f128());
+            let seed_c: [[F128; ELL]; C_QUAD_BANKS] =
+                core::array::from_fn(|_| core::array::from_fn(|_| rng.f128()));
+            let mut want_ab = seed_ab;
+            let mut want_c = seed_c;
+            for lane in 0..ELL {
+                let mut ab = F128::ZERO;
+                let mut c = [F128::ZERO; C_QUAD_BANKS];
+                for b_med in 0..n_b_med {
+                    let base = b_med * 256;
+                    ab += convert[base + chunk_ab[b_med][lane] as usize];
+                    let byte = chunk_c[b_med][lane];
+                    for (k, value) in c.iter_mut().enumerate() {
+                        let bit = ((byte >> k) & 1) as usize;
+                        *value += convert[base + (bit << k)];
+                    }
+                }
+                want_ab[lane] += ab * eq_lo;
+                for k in 0..C_QUAD_BANKS {
+                    want_c[k][lane] += c[k] * eq_lo;
+                }
+            }
+
+            let mut got_ab = seed_ab;
+            let mut got_c = seed_c;
+            kernels::accumulate_convert_with_s_hat_v_quad(
+                &chunk_ab,
+                &chunk_c,
+                n_b_med,
+                convert,
+                &C_QUAD_TABLES,
+                eq_lo,
+                &mut got_ab,
+                &mut got_c,
+            );
+            assert_eq!(got_ab, want_ab, "AB n_b_med={n_b_med}");
+            assert_eq!(got_c, want_c, "C n_b_med={n_b_med}");
+        }
+    }
+
     /// The two-bank fusion variant produces `(res_ab, res_c_lifted)` that
     /// matches the existing optimized output, AND a `s_hat_v_c` that matches
     /// the scalar-oracle's canonical form.
     #[test]
     fn fusion_matches_existing_and_scalar_oracle() {
-        use crate::zerocheck::univariate_skip::round1_extract_c_packed_with_s_hat_v;
+        use crate::zerocheck::univariate_skip::{
+            build_eq, round1_extract_c_packed_with_s_hat_v,
+        };
 
         for &m in &[13usize, 14, 15] {
             let mut rng = Rng::new(0xF00D_u64.wrapping_add(m as u64));
@@ -1876,6 +2332,54 @@ mod tests {
                 got_s_hat_v, oracle_s_hat_v,
                 "s_hat_v_c mismatch vs scalar oracle at m={m}"
             );
+
+            let (quad_ab, quad_c, quad) =
+                round1_shift_reduce_extract_c_packed_padded_with_s_hat_v_quad(
+                    &a,
+                    &b,
+                    &c,
+                    m,
+                    K_SKIP,
+                    &r,
+                    &inv_table,
+                    &PaddingSpec::dense(m),
+                );
+            assert_eq!(quad_ab, ref_ab, "quad res_ab mismatch at m={m}");
+            assert_eq!(quad_c, ref_c, "quad res_c mismatch at m={m}");
+            assert_eq!(quad.len(), 4 * 2 * ELL, "quad length at m={m}");
+
+            // Exact transcript identity: ring-switch collapses these banks at
+            // the first two suffix coordinates before observing s_hat_v.
+            let low_eq = build_eq(&r[K_SKIP + 1..K_SKIP + 3]);
+            let mut collapsed = vec![F128::ZERO; 2 * ELL];
+            for q in 0..4 {
+                for lane in 0..2 * ELL {
+                    collapsed[lane] += low_eq[q] * quad[q * 2 * ELL + lane];
+                }
+            }
+            assert_eq!(collapsed, got_s_hat_v, "quad collapse mismatch at m={m}");
+
+            // Independent bank oracle: retain packed-slot bits K[1:3] by
+            // striding the packed witness and fold only the remaining suffix.
+            let c_elems: Vec<F128> = c
+                .chunks_exact(16)
+                .map(|bytes| {
+                    F128::new(
+                        u64::from_le_bytes(bytes[..8].try_into().unwrap()),
+                        u64::from_le_bytes(bytes[8..].try_into().unwrap()),
+                    )
+                })
+                .collect();
+            let high_eq = build_eq(&r[K_SKIP + 3..]);
+            for q in 0..4 {
+                let bank_elems: Vec<F128> = c_elems.iter().skip(q).step_by(4).copied().collect();
+                let want = crate::pcs::ring_switch::fold_1b_rows_naive(&bank_elems, &high_eq);
+                assert_eq!(
+                    &quad[q * 2 * ELL..(q + 1) * 2 * ELL],
+                    want.as_slice(),
+                    "quad bank mismatch at m={m}, q={q}"
+                );
+            }
         }
     }
 
@@ -1913,6 +2417,25 @@ mod tests {
             );
 
             assert_eq!(got, expected, "split round-1 mismatch at m={m}");
+
+            let expected_quad =
+                round1_shift_reduce_extract_c_packed_padded_with_s_hat_v_quad(
+                    &a, &b, &c, m, K_SKIP, &r, &inv_table, &padding,
+                );
+            let precomputed_quad = precompute_round1_ab_inner_packed_padded(
+                &a, &b, m, K_SKIP, &inv_table, &padding,
+            );
+            let got_quad =
+                round1_shift_reduce_extract_c_packed_padded_with_precomputed_ab_quad(
+                    &precomputed_quad,
+                    &c,
+                    m,
+                    K_SKIP,
+                    &r,
+                    &inv_table,
+                    &padding,
+                );
+            assert_eq!(got_quad, expected_quad, "split quad mismatch at m={m}");
         }
     }
 

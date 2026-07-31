@@ -41,6 +41,14 @@ fn ranked_direct_ab_precompute_enabled(r1cs: &BlockR1cs) -> bool {
         && std::env::var_os("FLOCK_NO_LIG_FOLD2").is_none()
 }
 
+#[inline]
+fn ranked_direct_c_precompute_enabled(r1cs: &BlockR1cs) -> bool {
+    ranked_direct_ab_precompute_enabled(r1cs)
+        && std::env::var_os("FLOCK_NO_OPEN_DIRECT_C").is_none()
+        && std::env::var_os("FLOCK_NO_OPEN_DEFERRED_C").is_none()
+        && std::env::var_os("FLOCK_NO_HETERO_OPEN_COMBINE").is_none()
+}
+
 /// Construct a multilinear `x_outer_full` of length `m − k_skip` from a
 /// QuirkyPoint: concatenate `x_inner_rest` and `x_outer`. This is the format
 /// the PCS expects (k_skip = 6 absorbed via `z_skip`; everything else is
@@ -144,9 +152,15 @@ pub fn prove_ligerito<Ch: Challenger>(
     let z_packed_lincheck = pack_z_lincheck_from_packed(&z_packed, r1cs.m, r1cs.k_log);
 
     let padding = r1cs.padding_spec();
-    let (zc_proof, zc_claim, s_hat_v_c) = zerocheck::prove_packed_padded_capture_s_hat_v_c(
-        a_packed, b_packed, c_packed, r1cs.m, &padding, challenger,
-    );
+    let (zc_proof, zc_claim, s_hat_v_c) = if ranked_direct_c_precompute_enabled(r1cs) {
+        zerocheck::prove_packed_padded_capture_s_hat_v_c_quad(
+            a_packed, b_packed, c_packed, r1cs.m, &padding, challenger,
+        )
+    } else {
+        zerocheck::prove_packed_padded_capture_s_hat_v_c(
+            a_packed, b_packed, c_packed, r1cs.m, &padding, challenger,
+        )
+    };
 
     let x_ab = r1cs.x_ab_from_mlv(zc_claim.z, &zc_claim.mlv_challenges);
 
@@ -517,9 +531,15 @@ fn prove_fast_core_with_commit_codeword<Ch: Challenger>(
                 z_packed.len() * core::mem::size_of::<F128>(),
             )
         };
-        zerocheck::prove_packed_padded_capture_s_hat_v_c_with_precomputed_ab(
-            a_packed, b_packed, c_packed, r1cs.m, &padding, ab_inner, challenger,
-        )
+        if ranked_direct_c_precompute_enabled(r1cs) {
+            zerocheck::prove_packed_padded_capture_s_hat_v_c_quad_with_precomputed_ab(
+                a_packed, b_packed, c_packed, r1cs.m, &padding, ab_inner, challenger,
+            )
+        } else {
+            zerocheck::prove_packed_padded_capture_s_hat_v_c_with_precomputed_ab(
+                a_packed, b_packed, c_packed, r1cs.m, &padding, ab_inner, challenger,
+            )
+        }
     };
     // Nothing downstream reads a/b (zerocheck consumed them in rounds 1–2);
     // recycle the two buffers (2 × 2^(m-3) bytes — 128 MB at m = 29) instead
@@ -716,9 +736,15 @@ fn prove_fast_ligerito_timed_with_commit_codeword<Ch: Challenger>(
                 z_packed.len() * core::mem::size_of::<F128>(),
             )
         };
-        zerocheck::prove_packed_padded_capture_s_hat_v_c_with_precomputed_ab(
-            a_packed, b_packed, c_packed, r1cs.m, &padding, ab_inner, challenger,
-        )
+        if ranked_direct_c_precompute_enabled(r1cs) {
+            zerocheck::prove_packed_padded_capture_s_hat_v_c_quad_with_precomputed_ab(
+                a_packed, b_packed, c_packed, r1cs.m, &padding, ab_inner, challenger,
+            )
+        } else {
+            zerocheck::prove_packed_padded_capture_s_hat_v_c_with_precomputed_ab(
+                a_packed, b_packed, c_packed, r1cs.m, &padding, ab_inner, challenger,
+            )
+        }
     };
     t.zerocheck_s = t0.elapsed().as_secs_f64();
     flock_core::scratch::give_f128(a_packed_f128);

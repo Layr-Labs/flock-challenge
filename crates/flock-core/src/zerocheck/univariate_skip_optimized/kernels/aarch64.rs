@@ -376,6 +376,96 @@ pub(crate) unsafe fn accumulate_convert_with_s_hat_v(
     }
 }
 
+/// Four-lane ranked C-quad fold.  Eight C bytes are transposed into the eight
+/// small-bit selector masks, then each bank performs two gathers (one per
+/// group of eight medium rows).  Banks are drained one at a time so the
+/// 8-bank result does not spill the 32-register NEON file.
+#[allow(clippy::too_many_arguments)]
+#[inline(always)]
+pub(crate) unsafe fn accumulate_convert_with_s_hat_v_quad(
+    chunk_ab_bytes: &[[u8; 64]; 16],
+    chunk_c_bytes: &[[u8; 64]; 16],
+    n_b_med: usize,
+    convert: &[F128],
+    c_quad_tables: &[F128],
+    eq_lo_val: F128,
+    partial_ab: &mut [F128; 64],
+    partial_c: &mut [[F128; 64]; 8],
+) {
+    use crate::bits::transpose_8x8_bits;
+
+    debug_assert!(n_b_med <= 16);
+    debug_assert_eq!(convert.len(), 16 * 256);
+    debug_assert_eq!(c_quad_tables.len(), 8 * 2 * 256);
+
+    // SAFETY: the caller supplies the fixed array/table shapes asserted
+    // above. All dynamic table indices are bytes and therefore < 256.
+    unsafe {
+        for lane in (0..64).step_by(4) {
+            let mut ab = [F128::ZERO; 4];
+            for b_med in 0..n_b_med {
+                let table = &convert[b_med * 256..(b_med + 1) * 256];
+                for offset in 0..4 {
+                    ab[offset] += table[chunk_ab_bytes[b_med][lane + offset] as usize];
+                }
+            }
+            let ab01 = mul_const_pair(eq_lo_val, ab[0], ab[1]);
+            let ab23 = mul_const_pair(eq_lo_val, ab[2], ab[3]);
+            partial_ab[lane] += ab01[0];
+            partial_ab[lane + 1] += ab01[1];
+            partial_ab[lane + 2] += ab23[0];
+            partial_ab[lane + 3] += ab23[1];
+
+            let mut indices_lo = [[0u8; 8]; 4];
+            let mut indices_hi = [[0u8; 8]; 4];
+            for offset in 0..4 {
+                let mut rows_lo = [0u8; 8];
+                let mut rows_hi = [0u8; 8];
+                for j in 0..8 {
+                    if j < n_b_med {
+                        rows_lo[j] = chunk_c_bytes[j][lane + offset];
+                    }
+                    if 8 + j < n_b_med {
+                        rows_hi[j] = chunk_c_bytes[8 + j][lane + offset];
+                    }
+                }
+                indices_lo[offset] =
+                    transpose_8x8_bits(u64::from_le_bytes(rows_lo)).to_le_bytes();
+                indices_hi[offset] =
+                    transpose_8x8_bits(u64::from_le_bytes(rows_hi)).to_le_bytes();
+            }
+
+            for k in 0..8 {
+                let table_lo = &c_quad_tables[(k * 2) * 256..(k * 2 + 1) * 256];
+                let table_hi = &c_quad_tables[(k * 2 + 1) * 256..(k * 2 + 2) * 256];
+                let converted = std::array::from_fn::<F128, 4, _>(|offset| {
+                    table_lo[indices_lo[offset][k] as usize]
+                        + table_hi[indices_hi[offset][k] as usize]
+                });
+                let c01 = mul_const_pair(eq_lo_val, converted[0], converted[1]);
+                let c23 = mul_const_pair(eq_lo_val, converted[2], converted[3]);
+                partial_c[k][lane] += c01[0];
+                partial_c[k][lane + 1] += c01[1];
+                partial_c[k][lane + 2] += c23[0];
+                partial_c[k][lane + 3] += c23[1];
+            }
+        }
+    }
+}
+
+#[inline(always)]
+unsafe fn mul_const_pair(c: F128, x0: F128, x1: F128) -> [F128; 2] {
+    #[cfg(target_feature = "aes")]
+    {
+        // SAFETY: this branch is compiled only when PMULL/AES is available.
+        unsafe { crate::field::gf2_128::aarch64::ghash_mul_const_vec2_neon(c, [x0, x1]) }
+    }
+    #[cfg(not(target_feature = "aes"))]
+    {
+        [c * x0, c * x1]
+    }
+}
+
 // The SHA3 extension includes EOR3; retain the two-EOR form for generic
 // AArch64 builds that do not enable it.
 #[cfg(target_feature = "sha3")]

@@ -250,3 +250,44 @@ pub(super) fn accumulate_convert_with_s_hat_v(
         partial_c_1,
     );
 }
+
+#[allow(clippy::too_many_arguments)]
+#[inline]
+pub(super) fn accumulate_convert_with_s_hat_v_quad(
+    chunk_ab_bytes: &[[u8; 64]; 16],
+    chunk_c_bytes: &[[u8; 64]; 16],
+    n_b_med: usize,
+    convert: &[super::F128],
+    c_quad_tables: &[super::F128],
+    eq_lo_val: super::F128,
+    partial_ab: &mut [super::F128; 64],
+    partial_c: &mut [[super::F128; 64]; 8],
+) {
+    #[cfg(target_arch = "aarch64")]
+    // SAFETY: aarch64 statically guarantees NEON; the fixed input/table
+    // shapes cover every indexed load in the four-lane kernel.
+    unsafe {
+        aarch64::accumulate_convert_with_s_hat_v_quad(
+            chunk_ab_bytes,
+            chunk_c_bytes,
+            n_b_med,
+            convert,
+            c_quad_tables,
+            eq_lo_val,
+            partial_ab,
+            partial_c,
+        );
+    }
+
+    #[cfg(not(target_arch = "aarch64"))]
+    portable::accumulate_convert_with_s_hat_v_quad(
+        chunk_ab_bytes,
+        chunk_c_bytes,
+        n_b_med,
+        convert,
+        c_quad_tables,
+        eq_lo_val,
+        partial_ab,
+        partial_c,
+    );
+}
