@@ -1981,8 +1981,13 @@ pub(crate) fn induce_sumcheck_poly(
                 return (vec![F128::ZERO; n], F128::ZERO);
             }
             let mut accum_basis = vec![F128::ZERO; n];
-            // Per-thread scratch reused across this chunk's queries.
-            let mut local_basis = vec![F128::ZERO; n];
+            // Per-thread scratch reused across this chunk's queries. Uninit is
+            // sound here: `evaluate_scaled_basis_inplace` writes every slot
+            // before any read — `basis[0] = alpha`, then each doubling level
+            // writes `[2^k, 2^{k+1})` from the already-written lower half —
+            // the same write-before-read contract as `alloc_uninit_vec`'s
+            // other callers. Deletes one length-n memset per worker per call.
+            let mut local_basis = crate::alloc_uninit_f128_vec(n);
             let mut sks_at_x = vec![F128::ZERO; log_msg_cols.max(1)];
             let mut local_sum = F128::ZERO;
 
@@ -2180,15 +2185,31 @@ pub(crate) fn induce_sumcheck_poly_via_ntt(
         table.into_iter().take(n_queries).collect()
     };
 
-    let mut enforced_sum = F128::ZERO;
-    for i in 0..n_queries {
+    // Parallel per-query dot products, mirroring the dense variant's
+    // per-thread accumulation. Every term is independent and F128 addition
+    // is XOR (associative, commutative), so the parallel reduction is
+    // bit-identical to the serial fold regardless of association. This loop
+    // is the NTT variant's only serial stretch — n_queries · row_len
+    // multiplies on one worker while the rest of the pool idles between the
+    // per-level opens and the transpose.
+    const PAR_QUERY_THRESHOLD: usize = 32;
+    let query_term = |i: usize| -> F128 {
         let dot: F128 = opened_rows[i]
             .iter()
             .zip(eq.iter())
             .map(|(&r, &e)| r * e)
             .fold(F128::ZERO, |a, v| a + v);
-        enforced_sum += dot * alpha_pows[i];
-    }
+        dot * alpha_pows[i]
+    };
+    let enforced_sum = if n_queries >= PAR_QUERY_THRESHOLD {
+        use rayon::prelude::*;
+        (0..n_queries)
+            .into_par_iter()
+            .map(query_term)
+            .reduce(|| F128::ZERO, |a, b| a + b)
+    } else {
+        (0..n_queries).map(query_term).fold(F128::ZERO, |a, b| a + b)
+    };
 
     let mut coeffs = if log_block == 0 {
         let mut c = vec![F128::ZERO; block_len];
@@ -4010,7 +4031,12 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
     let queries_0 = sample_distinct_queries(challenger, l0_block_len, num_queries_0);
     let alpha_0 = challenger.sample_f128_vec(ceil_log2(num_queries_0));
     let _t = std::time::Instant::now();
-    let opened_rows_0: Vec<Vec<F128>> = queries_0.iter().map(|&q| l0_row(q).to_vec()).collect();
+    let opened_rows_0: Vec<Vec<F128>> = {
+        use rayon::prelude::*;
+        // Indexed parallel collect is order-preserving: bit-identical to
+        // the serial map; each row copy is independent of the challenger.
+        queries_0.par_iter().map(|&q| l0_row(q).to_vec()).collect()
+    };
     let merkle_proof_0 = merkle_multi_proof_for(l0_tree, l0_block_len, &queries_0);
     if trace {
         t_opens += _t.elapsed();
@@ -4091,10 +4117,14 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
             let queries_last =
                 sample_distinct_queries(challenger, wtns_prev.block_len, num_queries_last);
             let _t = std::time::Instant::now();
-            let opened_rows_last: Vec<Vec<F128>> = queries_last
-                .iter()
-                .map(|&q| wtns_prev.row(q).to_vec())
-                .collect();
+            let opened_rows_last: Vec<Vec<F128>> = {
+                use rayon::prelude::*;
+                // Order-preserving parallel collect — bit-identical.
+                queries_last
+                    .par_iter()
+                    .map(|&q| wtns_prev.row(q).to_vec())
+                    .collect()
+            };
             let merkle_proof_last =
                 merkle_multi_proof_for(&wtns_prev.tree, wtns_prev.block_len, &queries_last);
             if trace {
@@ -4201,10 +4231,14 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
         let queries_i = sample_distinct_queries(challenger, wtns_prev.block_len, num_queries_i);
         let alpha_i = challenger.sample_f128_vec(ceil_log2(num_queries_i));
         let _t = std::time::Instant::now();
-        let opened_rows_i: Vec<Vec<F128>> = queries_i
-            .iter()
-            .map(|&q| wtns_prev.row(q).to_vec())
-            .collect();
+        let opened_rows_i: Vec<Vec<F128>> = {
+            use rayon::prelude::*;
+            // Order-preserving parallel collect — bit-identical.
+            queries_i
+                .par_iter()
+                .map(|&q| wtns_prev.row(q).to_vec())
+                .collect()
+        };
         let merkle_proof_i =
             merkle_multi_proof_for(&wtns_prev.tree, wtns_prev.block_len, &queries_i);
         if trace {
@@ -5323,7 +5357,11 @@ fn recursive_prover_inner<Ch: Challenger>(
     let queries_0 = sample_distinct_queries(challenger, wtns_0.block_len, num_queries_0);
     let alpha_0 = challenger.sample_f128_vec(ceil_log2(num_queries_0));
     let t = std::time::Instant::now();
-    let opened_rows_0: Vec<Vec<F128>> = queries_0.iter().map(|&q| wtns_0.row(q).to_vec()).collect();
+    let opened_rows_0: Vec<Vec<F128>> = {
+        use rayon::prelude::*;
+        // Order-preserving parallel collect — bit-identical (see above).
+        queries_0.par_iter().map(|&q| wtns_0.row(q).to_vec()).collect()
+    };
     let merkle_proof_0 = merkle_multi_proof_for(&wtns_0.tree, wtns_0.block_len, &queries_0);
     t_opens += t.elapsed();
     let initial_proof = RecursiveProof {
@@ -5396,10 +5434,14 @@ fn recursive_prover_inner<Ch: Challenger>(
             let num_queries_last = udr_queries(config.log_inv_rates[i + 1]);
             let queries_last =
                 sample_distinct_queries(challenger, wtns_prev.block_len, num_queries_last);
-            let opened_rows_last: Vec<Vec<F128>> = queries_last
-                .iter()
-                .map(|&q| wtns_prev.row(q).to_vec())
-                .collect();
+            let opened_rows_last: Vec<Vec<F128>> = {
+                use rayon::prelude::*;
+                // Order-preserving parallel collect — bit-identical.
+                queries_last
+                    .par_iter()
+                    .map(|&q| wtns_prev.row(q).to_vec())
+                    .collect()
+            };
             let merkle_proof_last =
                 merkle_multi_proof_for(&wtns_prev.tree, wtns_prev.block_len, &queries_last);
             return LigeritoProof {
@@ -5453,10 +5495,14 @@ fn recursive_prover_inner<Ch: Challenger>(
         let queries_i = sample_distinct_queries(challenger, wtns_prev.block_len, num_queries_i);
         let alpha_i = challenger.sample_f128_vec(ceil_log2(num_queries_i));
         let t = std::time::Instant::now();
-        let opened_rows_i: Vec<Vec<F128>> = queries_i
-            .iter()
-            .map(|&q| wtns_prev.row(q).to_vec())
-            .collect();
+        let opened_rows_i: Vec<Vec<F128>> = {
+            use rayon::prelude::*;
+            // Order-preserving parallel collect — bit-identical.
+            queries_i
+                .par_iter()
+                .map(|&q| wtns_prev.row(q).to_vec())
+                .collect()
+        };
         let merkle_proof_i =
             merkle_multi_proof_for(&wtns_prev.tree, wtns_prev.block_len, &queries_i);
         t_opens += t.elapsed();
