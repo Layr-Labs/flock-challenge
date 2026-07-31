@@ -303,6 +303,19 @@ fn use_ranked_hetero_open_combine(l: usize, b: usize, n_rs: usize, n_pd: usize) 
         && crate::epool::epool().is_some()
 }
 
+/// Keep the deferred-C scratch and message scan inside the efficiency-core L1
+/// working set. The ranked block is 32 KiB F128 elements; a 1 KiB tile is
+/// 16 KiB, leaving room for the composed byte table and the worker's other
+/// live state. The environment switch is intentionally separate from
+/// `FLOCK_NO_OPEN_DEFERRED_C`: it restores the full-block deferred-C path for
+/// a clean A/B comparison without disabling deferred C altogether.
+const DEFERRED_C_L1_TILE_LEN: usize = 1 << 10;
+
+#[inline]
+fn deferred_c_l1_tiles_enabled() -> bool {
+    std::env::var_os("FLOCK_NO_OPEN_DEFERRED_C_L1_TILES").is_none()
+}
+
 /// Drain fixed-size output blocks through the stateful P/E queue and reduce
 /// one `(u0, u2)` partial per block after the synchronous join. `fold_block`
 /// owns the complete output block for its queue index; `init` supplies private
@@ -413,6 +426,64 @@ where
                     .ptr()
                     .add(block)
                     .write(fold_block(state, block, scratch));
+            }
+        },
+    );
+    partials.into_iter().fold(
+        (F128::ZERO, F128::ZERO, [F128::ZERO; 6]),
+        |(x0, x2, mut xc), (y0, y2, yc)| {
+            for (x, y) in xc.iter_mut().zip(yc) {
+                *x += y;
+            }
+            (x0 + y0, x2 + y2, xc)
+        },
+    )
+}
+
+/// Deferred-C sibling that gives each queue worker one small reusable tile
+/// instead of a full block-sized scratch buffer. `fold_tile` receives the
+/// block index and tile offset; it must fully rewrite `scratch[..tile_len]`
+/// and return the message contribution for that tile. Tile contributions are
+/// reduced in the same block order as the full-block path.
+fn run_hetero_open_combine_scratch_tiled_lookahead<S, I, F>(
+    n_blocks: usize,
+    block_len: usize,
+    tile_len: usize,
+    init: I,
+    fold_tile: F,
+) -> (F128, F128, [F128; 6])
+where
+    I: Fn() -> S + Sync,
+    F: Fn(&mut S, usize, usize, &mut [F128]) -> (F128, F128, [F128; 6]) + Sync,
+{
+    assert!(block_len > 0 && n_blocks > 0);
+    assert!(tile_len > 0 && tile_len.is_multiple_of(4));
+    let scratch_len = tile_len.min(block_len);
+    let mut partials = vec![(F128::ZERO, F128::ZERO, [F128::ZERO; 6]); n_blocks];
+    let partials_base = crate::epool::SyncPtr(partials.as_mut_ptr());
+    crate::epool::run_hetero_chunks_stateful(
+        n_blocks,
+        || (init(), vec![F128::ZERO; scratch_len]),
+        |(state, scratch), block| {
+            let mut block_partial = (F128::ZERO, F128::ZERO, [F128::ZERO; 6]);
+            for tile_start in (0..block_len).step_by(tile_len) {
+                let tile_end = (tile_start + tile_len).min(block_len);
+                let (u0, u2, coeffs) = fold_tile(
+                    state,
+                    block,
+                    tile_start,
+                    &mut scratch[..tile_end - tile_start],
+                );
+                block_partial.0 += u0;
+                block_partial.1 += u2;
+                for (out, value) in block_partial.2.iter_mut().zip(coeffs) {
+                    *out += value;
+                }
+            }
+            // SAFETY: queue index `block` is claimed exactly once; it owns
+            // one partial slot until the synchronous two-pool join.
+            unsafe {
+                partials_base.ptr().add(block).write(block_partial);
             }
         },
     );
@@ -662,36 +733,39 @@ fn compute_combined_basis_and_target<Ch: Challenger>(
         // sweep: the table build wouldn't amortize below ~2^12 slots.
         const COMPOSE_MIN_BLOCK: usize = 1 << 12;
         let composed = b >= COMPOSE_MIN_BLOCK;
-        let fill_block = |ctable: &mut Vec<F128>, hi: usize, out_block: &mut [F128]| {
-            // Accumulate each claim's block: first claim writes, rest add.
-            // `e_hi` is folded into the composed table once per claim per
-            // block, then swept over eq_lo with no per-slot multiply.
-            for (ci, (eq_lo, eq_hi, table, _)) in rs_deferred.iter().enumerate() {
-                let e_hi = eq_hi[hi];
-                if composed {
-                    ring_switch::compose_fold_byte_table_into(e_hi, table, ctable);
-                    if ci == 0 {
+        let fill_block =
+            |ctable: &mut Vec<F128>, hi: usize, slot_start: usize, out_block: &mut [F128]| {
+                let slot_end = slot_start + out_block.len();
+                // Accumulate each claim's block: first claim writes, rest add.
+                // `e_hi` is folded into the composed table once per claim per
+                // block, then swept over eq_lo with no per-slot multiply.
+                for (ci, (eq_lo, eq_hi, table, _)) in rs_deferred.iter().enumerate() {
+                    let e_hi = eq_hi[hi];
+                    let eq_lo = &eq_lo[slot_start..slot_end];
+                    if composed {
+                        ring_switch::compose_fold_byte_table_into(e_hi, table, ctable);
+                        if ci == 0 {
+                            for (slot, &lo) in out_block.iter_mut().zip(eq_lo.iter()) {
+                                *slot = ring_switch::fold_one_slot(lo, ctable);
+                            }
+                        } else {
+                            for (slot, &lo) in out_block.iter_mut().zip(eq_lo.iter()) {
+                                *slot += ring_switch::fold_one_slot(lo, ctable);
+                            }
+                        }
+                    } else if ci == 0 {
                         for (slot, &lo) in out_block.iter_mut().zip(eq_lo.iter()) {
-                            *slot = ring_switch::fold_one_slot(lo, ctable);
+                            *slot = ring_switch::fold_one_slot(lo * e_hi, table);
                         }
                     } else {
                         for (slot, &lo) in out_block.iter_mut().zip(eq_lo.iter()) {
-                            *slot += ring_switch::fold_one_slot(lo, ctable);
+                            *slot += ring_switch::fold_one_slot(lo * e_hi, table);
                         }
                     }
-                } else if ci == 0 {
-                    for (slot, &lo) in out_block.iter_mut().zip(eq_lo.iter()) {
-                        *slot = ring_switch::fold_one_slot(lo * e_hi, table);
-                    }
-                } else {
-                    for (slot, &lo) in out_block.iter_mut().zip(eq_lo.iter()) {
-                        *slot += ring_switch::fold_one_slot(lo * e_hi, table);
-                    }
                 }
-            }
-        };
+            };
         let fold_pair_block = |ctable: &mut Vec<F128>, hi: usize, out_block: &mut [F128]| {
-            fill_block(ctable, hi, out_block);
+            fill_block(ctable, hi, 0, out_block);
             // Round-0 prime over this block's pairs (b is even, base is even).
             // Keep this separate from the last claim's streaming store: the
             // pairwise stepping variant is slower even though it removes a pass.
@@ -709,13 +783,36 @@ fn compute_combined_basis_and_target<Ch: Challenger>(
             (u0, u2)
         };
         let fold_lookahead_block = |ctable: &mut Vec<F128>, hi: usize, out_block: &mut [F128]| {
-            fill_block(ctable, hi, out_block);
+            fill_block(ctable, hi, 0, out_block);
             let base = hi * b;
             debug_assert!(b.is_multiple_of(4));
             let ((u0, u2), lookahead) =
                 round0_and_round1_lookahead(&packed_witness[base..base + b], out_block);
             (u0, u2, lookahead)
         };
+        let fold_deferred_lookahead_tile =
+            |ctable: &mut Vec<F128>, hi: usize, tile_start: usize, out_tile: &mut [F128]| {
+                debug_assert!(deferred_c_l1_tiles_enabled());
+                debug_assert!(composed);
+                debug_assert_eq!(rs_deferred.len(), 1);
+                let (eq_lo, eq_hi, table, _) = rs_deferred[0];
+                if tile_start == 0 {
+                    // The ranked deferred-C shape has only C left in the
+                    // deferred sweep. Compose it once per block and reuse
+                    // the table for every L1-sized tile.
+                    ring_switch::compose_fold_byte_table_into(eq_hi[hi], table, ctable);
+                }
+                let slot_end = tile_start + out_tile.len();
+                for (slot, &lo) in out_tile.iter_mut().zip(eq_lo[tile_start..slot_end].iter()) {
+                    *slot = ring_switch::fold_one_slot(lo, ctable);
+                }
+                let base = hi * b + tile_start;
+                let ((u0, u2), lookahead) = round0_and_round1_lookahead(
+                    &packed_witness[base..base + out_tile.len()],
+                    out_tile,
+                );
+                (u0, u2, lookahead)
+            };
         let init_ctable = || {
             if composed {
                 vec![F128::ZERO; ring_switch::FOLD_TABLE_LEN]
@@ -726,10 +823,23 @@ fn compute_combined_basis_and_target<Ch: Challenger>(
 
         let ranked_hetero = use_ranked_hetero_open_combine(l, b, n_rs, n_pd);
         if want_round1_lookahead {
-            let fast = if deferred_c.is_some() {
-                run_hetero_open_combine_scratch_lookahead(l / b, b, init_ctable, |ctable, hi, out_block| {
-                    fold_lookahead_block(ctable, hi, out_block)
-                })
+            let fast = if deferred_c.is_some() && deferred_c_l1_tiles_enabled() {
+                run_hetero_open_combine_scratch_tiled_lookahead(
+                    l / b,
+                    b,
+                    DEFERRED_C_L1_TILE_LEN,
+                    init_ctable,
+                    |ctable, hi, tile_start, out_tile| {
+                        fold_deferred_lookahead_tile(ctable, hi, tile_start, out_tile)
+                    },
+                )
+            } else if deferred_c.is_some() {
+                run_hetero_open_combine_scratch_lookahead(
+                    l / b,
+                    b,
+                    init_ctable,
+                    |ctable, hi, out_block| fold_lookahead_block(ctable, hi, out_block),
+                )
             } else if ranked_hetero {
                 run_hetero_open_combine_blocks_lookahead(
                     &mut b_combined,
@@ -1320,6 +1430,46 @@ mod tests {
         }
         assert_eq!(got, expected);
         assert_eq!(got_uv, expected_uv);
+    }
+
+    #[test]
+    fn hetero_open_combine_tiled_scratch_matches_full_block() {
+        const N_BLOCKS: usize = 4;
+        const BLOCK_LEN: usize = 1 << 12;
+        const TILE_LEN: usize = 1 << 10;
+        let full = run_hetero_open_combine_scratch_lookahead(
+            N_BLOCKS,
+            BLOCK_LEN,
+            || (),
+            |_, block, scratch| {
+                for (offset, slot) in scratch.iter_mut().enumerate() {
+                    *slot = F128::new(
+                        (block as u64).wrapping_mul(0x1000) ^ offset as u64,
+                        (offset as u64).rotate_left(17),
+                    );
+                }
+                let ((u0, u2), coeffs) = round0_and_round1_lookahead(scratch, scratch);
+                (u0, u2, coeffs)
+            },
+        );
+        let tiled = run_hetero_open_combine_scratch_tiled_lookahead(
+            N_BLOCKS,
+            BLOCK_LEN,
+            TILE_LEN,
+            || (),
+            |_, block, tile_start, scratch| {
+                for (offset, slot) in scratch.iter_mut().enumerate() {
+                    let absolute = tile_start + offset;
+                    *slot = F128::new(
+                        (block as u64).wrapping_mul(0x1000) ^ absolute as u64,
+                        (absolute as u64).rotate_left(17),
+                    );
+                }
+                let ((u0, u2), coeffs) = round0_and_round1_lookahead(scratch, scratch);
+                (u0, u2, coeffs)
+            },
+        );
+        assert_eq!(tiled, full);
     }
 
     #[test]

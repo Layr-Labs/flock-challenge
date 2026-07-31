@@ -2973,11 +2973,7 @@ fn materialize_direct_ab_fold2(
     let direct_tables: Vec<Vec<F128>> = claims
         .iter()
         .map(|claim| {
-            super::ring_switch::build_direct_fold2_table(
-                &claim.low_eq,
-                &fold_weight,
-                &claim.table,
-            )
+            super::ring_switch::build_direct_fold2_table(&claim.low_eq, &fold_weight, &claim.table)
         })
         .collect();
 
@@ -2989,6 +2985,10 @@ fn materialize_direct_ab_fold2(
     }));
 
     let fuse_init = direct_ab_fuse_init_enabled();
+    let deferred_c_l1_tiled = !has_ordinary
+        && claims.len() == 2
+        && claims[1].products == [F128::ZERO; 16]
+        && super::deferred_c_l1_tiles_enabled();
     let mut folded_f = crate::scratch::take_f128(out_len);
     let mut folded_b = crate::scratch::take_f128(out_len);
     let stats = folded_b
@@ -3015,13 +3015,71 @@ fn materialize_direct_ab_fold2(
                     low + r1 * (low + high)
                 };
 
-                if fuse_init {
+                if deferred_c_l1_tiled {
+                    // Deferred-C's two direct claims are the ranked AB+C
+                    // shape. Compose AB once, write f and the AB contribution
+                    // in L1-sized tiles, then compose C into the same table
+                    // and add/scan one tile at a time. This keeps the hot
+                    // fold4 + table lookup + message pass in a small cache
+                    // footprint while preserving the full folded outputs.
+                    let (ab_claim, rest_claims) = claims
+                        .split_first()
+                        .expect("deferred-C tiled path needs AB claim");
+                    let c_claim = rest_claims
+                        .first()
+                        .expect("deferred-C tiled path needs C claim");
+                    let (ab_table, rest_tables) = direct_tables
+                        .split_first()
+                        .expect("deferred-C tiled path needs AB table");
+                    let c_table = rest_tables
+                        .first()
+                        .expect("deferred-C tiled path needs C table");
+                    assert_eq!(c_claim.products, [F128::ZERO; 16]);
+                    assert!(block_len.is_multiple_of(4));
+
+                    super::ring_switch::compose_fold_byte_table_into(
+                        ab_claim.eq_hi[block],
+                        ab_table,
+                        scratch,
+                    );
+                    for tile_start in (0..block_len).step_by(super::DEFERRED_C_L1_TILE_LEN) {
+                        let tile_end = (tile_start + super::DEFERRED_C_L1_TILE_LEN).min(block_len);
+                        for slot in tile_start..tile_end {
+                            f_out[slot] = fold4(f_in, slot);
+                            b_out[slot] =
+                                super::ring_switch::fold_one_slot(ab_claim.eq_lo[slot], scratch);
+                        }
+                    }
+
+                    super::ring_switch::compose_fold_byte_table_into(
+                        c_claim.eq_hi[block],
+                        c_table,
+                        scratch,
+                    );
+                    let mut tiled_stats = ((F128::ZERO, F128::ZERO), [F128::ZERO; 6]);
+                    for tile_start in (0..block_len).step_by(super::DEFERRED_C_L1_TILE_LEN) {
+                        let tile_end = (tile_start + super::DEFERRED_C_L1_TILE_LEN).min(block_len);
+                        for slot in tile_start..tile_end {
+                            b_out[slot] +=
+                                super::ring_switch::fold_one_slot(c_claim.eq_lo[slot], scratch);
+                        }
+                        let ((u0, u2), coeffs) = super::round0_and_round1_lookahead(
+                            &f_out[tile_start..tile_end],
+                            &b_out[tile_start..tile_end],
+                        );
+                        tiled_stats.0.0 += u0;
+                        tiled_stats.0.1 += u2;
+                        for (out, value) in tiled_stats.1.iter_mut().zip(coeffs) {
+                            *out += value;
+                        }
+                    }
+                    tiled_stats
+                } else if fuse_init {
                     // First direct claim initializes; remaining claims add.
                     // Fuse claim-0 with ordinary-basis fold4 so each b_out
                     // slot is written once when there is a single claim
                     // (the ranked AB-only shape).
-                    let (first_claim, rest_claims) =
-                        claims.split_first().expect("nonempty claims");
+                    let (first_claim, rest_claims) = claims.split_first().expect("nonempty claims");
                     let (first_table, rest_tables) =
                         direct_tables.split_first().expect("nonempty tables");
                     super::ring_switch::compose_fold_byte_table_into(
@@ -3031,20 +3089,16 @@ fn materialize_direct_ab_fold2(
                     );
                     if has_ordinary {
                         for slot in 0..block_len {
-                            let direct = super::ring_switch::fold_one_slot(
-                                first_claim.eq_lo[slot],
-                                scratch,
-                            );
+                            let direct =
+                                super::ring_switch::fold_one_slot(first_claim.eq_lo[slot], scratch);
                             f_out[slot] = fold4(f_in, slot);
                             b_out[slot] = direct + fold4(b_in, slot);
                         }
                     } else {
                         for slot in 0..block_len {
                             f_out[slot] = fold4(f_in, slot);
-                            b_out[slot] = super::ring_switch::fold_one_slot(
-                                first_claim.eq_lo[slot],
-                                scratch,
-                            );
+                            b_out[slot] =
+                                super::ring_switch::fold_one_slot(first_claim.eq_lo[slot], scratch);
                         }
                     }
                     for (claim, direct_table) in rest_claims.iter().zip(rest_tables.iter()) {
@@ -3054,12 +3108,10 @@ fn materialize_direct_ab_fold2(
                             scratch,
                         );
                         for (slot, out) in b_out.iter_mut().enumerate() {
-                            *out += super::ring_switch::fold_one_slot(
-                                claim.eq_lo[slot],
-                                scratch,
-                            );
+                            *out += super::ring_switch::fold_one_slot(claim.eq_lo[slot], scratch);
                         }
                     }
+                    super::round0_and_round1_lookahead(f_out, b_out)
                 } else {
                     // Frontier control: zero-fill, sum all direct claims, then
                     // add ordinary-basis fold4.
@@ -3071,10 +3123,7 @@ fn materialize_direct_ab_fold2(
                             scratch,
                         );
                         for (slot, out) in b_out.iter_mut().enumerate() {
-                            *out += super::ring_switch::fold_one_slot(
-                                claim.eq_lo[slot],
-                                scratch,
-                            );
+                            *out += super::ring_switch::fold_one_slot(claim.eq_lo[slot], scratch);
                         }
                     }
                     if has_ordinary {
@@ -3087,8 +3136,8 @@ fn materialize_direct_ab_fold2(
                             f_out[slot] = fold4(f_in, slot);
                         }
                     }
+                    super::round0_and_round1_lookahead(f_out, b_out)
                 }
-                super::round0_and_round1_lookahead(f_out, b_out)
             },
         )
         .reduce(
@@ -5782,6 +5831,83 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn deferred_c_l1_tiled_materialization_matches_dense_reference() {
+        let mut state = 0xC0DE_CAFE_u64;
+        let mut random = || {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            F128::new(state, state.rotate_left(17))
+        };
+        const BLOCK_LEN: usize = 2 << 10;
+        let r0 = random();
+        let r1 = random();
+        let fold_weight = [
+            (F128::ONE + r0) * (F128::ONE + r1),
+            r0 * (F128::ONE + r1),
+            (F128::ONE + r0) * r1,
+            r0 * r1,
+        ];
+        let f: Vec<F128> = (0..4 * BLOCK_LEN).map(|_| random()).collect();
+        let mut make_claim = |zero_products: bool| {
+            let low_eq = [random(), random(), random(), random()];
+            let base = super::super::ring_switch::build_fold_byte_table(
+                &(0..(1usize << crate::pcs::LOG_PACKING))
+                    .map(|_| random())
+                    .collect::<Vec<_>>(),
+            );
+            let eq_lo: Vec<F128> = (0..BLOCK_LEN).map(|_| random()).collect();
+            let eq_hi = vec![F128::ONE];
+            super::super::ring_switch::DirectFold2Factors {
+                eq_lo,
+                eq_hi,
+                low_eq,
+                table: base,
+                products: if zero_products {
+                    [F128::ZERO; 16]
+                } else {
+                    [random(); 16]
+                },
+            }
+        };
+        let ab = make_claim(false);
+        let c = make_claim(true);
+        let ab_table = super::super::ring_switch::build_direct_fold2_table(
+            &ab.low_eq,
+            &fold_weight,
+            &ab.table,
+        );
+        let c_table =
+            super::super::ring_switch::build_direct_fold2_table(&c.low_eq, &fold_weight, &c.table);
+        let (got_f, got_b, got_msg, got_coeffs) = super::materialize_direct_ab_fold2(
+            f.clone(),
+            Vec::new(),
+            &[ab.clone(), c.clone()],
+            r0,
+            r1,
+        );
+
+        let mut want_f = vec![F128::ZERO; BLOCK_LEN];
+        let mut want_b = vec![F128::ZERO; BLOCK_LEN];
+        for slot in 0..BLOCK_LEN {
+            let a0 = f[4 * slot];
+            let a1 = f[4 * slot + 1];
+            let a2 = f[4 * slot + 2];
+            let a3 = f[4 * slot + 3];
+            let low = a0 + r0 * (a0 + a1);
+            let high = a2 + r0 * (a2 + a3);
+            want_f[slot] = low + r1 * (low + high);
+            want_b[slot] = super::super::ring_switch::fold_one_slot(ab.eq_lo[slot], &ab_table)
+                + super::super::ring_switch::fold_one_slot(c.eq_lo[slot], &c_table);
+        }
+        let (want_msg, want_coeffs) = super::super::round0_and_round1_lookahead(&want_f, &want_b);
+        assert_eq!(got_f, want_f);
+        assert_eq!(got_b, want_b);
+        assert_eq!((got_msg.u_0, got_msg.u_2), want_msg);
+        assert_eq!(got_coeffs, want_coeffs);
+    }
 
     /// Worked example: `LigeritoSecurityConfig` for BLAKE3 m=29 at rate 1/2.
     /// Paper-compatible m=29 fast example, mechanically derived in the
