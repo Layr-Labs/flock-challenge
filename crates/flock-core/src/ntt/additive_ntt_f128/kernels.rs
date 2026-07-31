@@ -149,33 +149,10 @@ pub(super) unsafe fn butterfly_fused_3layer_row(
     r: usize,
     twiddles: &[F128; 7],
 ) {
-    #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
-    // SAFETY: forwarded caller contract; the cfg gate supplies `aes`.
-    unsafe {
-        if vector_resident_rows() {
-            aarch64::butterfly_fused_3layer_row(ptr, eighth, num_ntts, r, twiddles);
-            return;
-        }
-    }
-
     // SAFETY: forwarded caller contract.
     unsafe {
         portable::butterfly_fused_3layer_row(ptr, eighth, num_ntts, r, twiddles);
     }
-}
-
-/// Whether the AArch64 vector-resident radix-8 row kernels are used.
-///
-/// `FLOCK_NO_NTT_NEON_ROWS=1` restores the portable `F128`-typed chain in the
-/// same binary, so a candidate/control pair differs only in this dispatch —
-/// not in compilation or source revision. Read once per process; the ranked
-/// harness sets its environment before the worker starts.
-#[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
-#[inline]
-fn vector_resident_rows() -> bool {
-    use std::sync::OnceLock;
-    static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("FLOCK_NO_NTT_NEON_ROWS").is_none())
 }
 
 /// Root-block specialization of [`butterfly_fused_3layer_row`].
@@ -191,15 +168,6 @@ pub(super) unsafe fn butterfly_fused_3layer_zero_root_row(
     r: usize,
     twiddles: &[F128; 7],
 ) {
-    #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
-    // SAFETY: forwarded caller contract; the cfg gate supplies `aes`.
-    unsafe {
-        if vector_resident_rows() {
-            aarch64::butterfly_fused_3layer_zero_root_row(ptr, eighth, num_ntts, r, twiddles);
-            return;
-        }
-    }
-
     // SAFETY: forwarded caller contract.
     unsafe {
         portable::butterfly_fused_3layer_zero_root_row(ptr, eighth, num_ntts, r, twiddles);
@@ -230,134 +198,4 @@ pub(super) unsafe fn butterfly_neon_block_pair(
 pub(super) unsafe fn butterfly_neon_block_pair_chunk(chunk: &mut [F128], t_a: F128, t_b: F128) {
     // SAFETY: the cfg gate guarantees PMULL through the aes feature.
     unsafe { aarch64::butterfly_block_pair(chunk, t_a, t_b) }
-}
-
-#[cfg(all(test, target_arch = "aarch64", target_feature = "aes"))]
-mod aarch64_row_tests {
-    use super::*;
-
-    fn splitmix(state: &mut u64) -> u64 {
-        *state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
-        let mut z = *state;
-        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-        z ^ (z >> 31)
-    }
-
-    fn rand_f128(state: &mut u64) -> F128 {
-        F128 {
-            lo: splitmix(state),
-            hi: splitmix(state),
-        }
-    }
-
-    /// Build a random row-group buffer plus twiddles for one geometry.
-    fn fixture(
-        state: &mut u64,
-        eighth: usize,
-        num_ntts: usize,
-        zero_root: bool,
-    ) -> (Vec<F128>, [F128; 7]) {
-        let buf: Vec<F128> = (0..8 * eighth * num_ntts)
-            .map(|_| rand_f128(state))
-            .collect();
-        let mut tw: [F128; 7] = core::array::from_fn(|_| rand_f128(state));
-        if zero_root {
-            tw[0] = F128::ZERO;
-            tw[1] = F128::ZERO;
-            tw[3] = F128::ZERO;
-        }
-        (buf, tw)
-    }
-
-    /// The vector-resident radix-8 row kernel must be **bit-identical** to the
-    /// portable `F128`-typed chain across the row geometries the ranked
-    /// transform uses (`num_ntts = 64` is the ranked interleaving). Both run
-    /// on identical random input; every word of all eight row streams is
-    /// compared.
-    #[test]
-    fn neon_fused_3layer_row_matches_portable() {
-        let mut state = 0x4E54_5F52_4F57_5300;
-        for &(eighth, num_ntts) in &[(1usize, 1usize), (1, 64), (2, 64), (4, 16), (3, 5)] {
-            for r in 0..eighth.min(2) {
-                let (base, tw) = fixture(&mut state, eighth, num_ntts, false);
-
-                let mut want = base.clone();
-                // SAFETY: buffer is 8 * eighth * num_ntts long and r < eighth.
-                unsafe {
-                    portable::butterfly_fused_3layer_row(
-                        want.as_mut_ptr(),
-                        eighth,
-                        num_ntts,
-                        r,
-                        &tw,
-                    );
-                }
-
-                let mut got = base.clone();
-                // SAFETY: same geometry; this module carries `aes` via cfg.
-                unsafe {
-                    aarch64::butterfly_fused_3layer_row(
-                        got.as_mut_ptr(),
-                        eighth,
-                        num_ntts,
-                        r,
-                        &tw,
-                    );
-                }
-
-                assert_eq!(
-                    got, want,
-                    "fused3 row mismatch at eighth={eighth} num_ntts={num_ntts} r={r}"
-                );
-            }
-        }
-    }
-
-    /// Same equivalence for the zero-root spine specialization, including its
-    /// claim that row stream zero is left untouched.
-    #[test]
-    fn neon_fused_3layer_zero_root_row_matches_portable() {
-        let mut state = 0x5A45_524F_524F_4F54;
-        for &(eighth, num_ntts) in &[(1usize, 1usize), (1, 64), (2, 64), (4, 16), (3, 5)] {
-            for r in 0..eighth.min(2) {
-                let (base, tw) = fixture(&mut state, eighth, num_ntts, true);
-
-                let mut want = base.clone();
-                // SAFETY: geometry as above; twiddles 0/1/3 are zero.
-                unsafe {
-                    portable::butterfly_fused_3layer_zero_root_row(
-                        want.as_mut_ptr(),
-                        eighth,
-                        num_ntts,
-                        r,
-                        &tw,
-                    );
-                }
-
-                let mut got = base.clone();
-                // SAFETY: geometry as above; twiddles 0/1/3 are zero.
-                unsafe {
-                    aarch64::butterfly_fused_3layer_zero_root_row(
-                        got.as_mut_ptr(),
-                        eighth,
-                        num_ntts,
-                        r,
-                        &tw,
-                    );
-                }
-
-                assert_eq!(
-                    got, want,
-                    "zero-root row mismatch at eighth={eighth} num_ntts={num_ntts} r={r}"
-                );
-
-                // Row stream zero must be unchanged by either implementation.
-                for lane in 0..num_ntts {
-                    let idx = r * num_ntts + lane;
-                    assert_eq!(got[idx], base[idx], "row 0 was written");
-                }
-            }
-        }
-    }
 }

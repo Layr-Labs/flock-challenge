@@ -111,6 +111,25 @@ unsafe fn transpose_parent4(base: *const u8, out: &mut [uint32x4_t; 16]) {
     }
 }
 
+/// Transpose one 64-byte block from each of four consecutive 128-byte leaves.
+#[inline(always)]
+unsafe fn transpose_leaf128_block4(base: *const u8, block: usize, out: &mut [uint32x4_t; 16]) {
+    unsafe {
+        let block_offset = block * 64;
+        for word_vec in 0..4 {
+            let word_offset = block_offset + word_vec * 16;
+            let mut rows = [
+                vreinterpretq_u32_u8(vld1q_u8(base.add(word_offset))),
+                vreinterpretq_u32_u8(vld1q_u8(base.add(128 + word_offset))),
+                vreinterpretq_u32_u8(vld1q_u8(base.add(256 + word_offset))),
+                vreinterpretq_u32_u8(vld1q_u8(base.add(384 + word_offset))),
+            ];
+            transpose4(&mut rows);
+            out[word_vec * 4..word_vec * 4 + 4].copy_from_slice(&rows);
+        }
+    }
+}
+
 #[inline(always)]
 unsafe fn store_cv4(state: &mut [uint32x4_t; 16], out: *mut u8) {
     unsafe {
@@ -190,6 +209,126 @@ unsafe fn round3(
     g3!(1, 6, 11, 12, schedule[10], schedule[11]);
     g3!(2, 7, 8, 13, schedule[12], schedule[13]);
     g3!(3, 4, 9, 14, schedule[14], schedule[15]);
+}
+
+/// Hash complete groups of twelve contiguous 128-byte single-chunk leaves.
+/// Three independent four-lane states are interleaved round-by-round for each
+/// of the two compression blocks. The caller handles any tail through the
+/// upstream `hash_many` implementation.
+#[inline]
+pub(super) fn hash_complete_leaf128_groups(data: &[u8], out: &mut [[u8; 32]]) -> usize {
+    debug_assert_eq!(data.len(), out.len() * 128);
+    let groups = out.len() / 12;
+    if groups == 0 {
+        return 0;
+    }
+
+    unsafe {
+        let zero = vdupq_n_u32(0);
+        let iv = [
+            vdupq_n_u32(IV[0]),
+            vdupq_n_u32(IV[1]),
+            vdupq_n_u32(IV[2]),
+            vdupq_n_u32(IV[3]),
+            vdupq_n_u32(IV[4]),
+            vdupq_n_u32(IV[5]),
+            vdupq_n_u32(IV[6]),
+            vdupq_n_u32(IV[7]),
+        ];
+        let block_len = vdupq_n_u32(64);
+        let first_init = [
+            iv[0],
+            iv[1],
+            iv[2],
+            iv[3],
+            iv[4],
+            iv[5],
+            iv[6],
+            iv[7],
+            iv[0],
+            iv[1],
+            iv[2],
+            iv[3],
+            zero,
+            zero,
+            block_len,
+            vdupq_n_u32(1), // CHUNK_START
+        ];
+
+        for group in 0..groups {
+            let input = data.as_ptr().add(group * 12 * 128);
+            let mut m0 = [zero; 16];
+            let mut m1 = [zero; 16];
+            let mut m2 = [zero; 16];
+            transpose_leaf128_block4(input, 0, &mut m0);
+            transpose_leaf128_block4(input.add(4 * 128), 0, &mut m1);
+            transpose_leaf128_block4(input.add(8 * 128), 0, &mut m2);
+
+            let mut v0 = first_init;
+            let mut v1 = first_init;
+            let mut v2 = first_init;
+            for schedule in &MSG_SCHEDULE {
+                round3(&mut v0, &mut v1, &mut v2, &m0, &m1, &m2, schedule);
+            }
+
+            let cv0 = [
+                veorq_u32(v0[0], v0[8]),
+                veorq_u32(v0[1], v0[9]),
+                veorq_u32(v0[2], v0[10]),
+                veorq_u32(v0[3], v0[11]),
+                veorq_u32(v0[4], v0[12]),
+                veorq_u32(v0[5], v0[13]),
+                veorq_u32(v0[6], v0[14]),
+                veorq_u32(v0[7], v0[15]),
+            ];
+            let cv1 = [
+                veorq_u32(v1[0], v1[8]),
+                veorq_u32(v1[1], v1[9]),
+                veorq_u32(v1[2], v1[10]),
+                veorq_u32(v1[3], v1[11]),
+                veorq_u32(v1[4], v1[12]),
+                veorq_u32(v1[5], v1[13]),
+                veorq_u32(v1[6], v1[14]),
+                veorq_u32(v1[7], v1[15]),
+            ];
+            let cv2 = [
+                veorq_u32(v2[0], v2[8]),
+                veorq_u32(v2[1], v2[9]),
+                veorq_u32(v2[2], v2[10]),
+                veorq_u32(v2[3], v2[11]),
+                veorq_u32(v2[4], v2[12]),
+                veorq_u32(v2[5], v2[13]),
+                veorq_u32(v2[6], v2[14]),
+                veorq_u32(v2[7], v2[15]),
+            ];
+
+            transpose_leaf128_block4(input, 1, &mut m0);
+            transpose_leaf128_block4(input.add(4 * 128), 1, &mut m1);
+            transpose_leaf128_block4(input.add(8 * 128), 1, &mut m2);
+            let end_flags = vdupq_n_u32(2); // CHUNK_END
+            v0 = [
+                cv0[0], cv0[1], cv0[2], cv0[3], cv0[4], cv0[5], cv0[6], cv0[7], iv[0], iv[1],
+                iv[2], iv[3], zero, zero, block_len, end_flags,
+            ];
+            v1 = [
+                cv1[0], cv1[1], cv1[2], cv1[3], cv1[4], cv1[5], cv1[6], cv1[7], iv[0], iv[1],
+                iv[2], iv[3], zero, zero, block_len, end_flags,
+            ];
+            v2 = [
+                cv2[0], cv2[1], cv2[2], cv2[3], cv2[4], cv2[5], cv2[6], cv2[7], iv[0], iv[1],
+                iv[2], iv[3], zero, zero, block_len, end_flags,
+            ];
+            for schedule in &MSG_SCHEDULE {
+                round3(&mut v0, &mut v1, &mut v2, &m0, &m1, &m2, schedule);
+            }
+
+            let output = out.as_mut_ptr().cast::<u8>().add(group * 12 * 32);
+            store_cv4(&mut v0, output);
+            store_cv4(&mut v1, output.add(4 * 32));
+            store_cv4(&mut v2, output.add(8 * 32));
+        }
+    }
+    groups * 12
 }
 
 /// Hash complete groups of twelve contiguous 64-byte BLAKE3 parent blocks.

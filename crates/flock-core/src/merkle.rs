@@ -366,6 +366,21 @@ fn blake3_hash_many<const N: usize>(
 /// the caller to hash leaves one at a time.
 fn blake3_hash_many_leaves(data: &[u8], leaf_size: usize, out: &mut [Hash]) -> bool {
     #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+    if leaf_size == 128 && std::env::var_os("FLOCK_NO_LEAF128_TWELVE").is_none() {
+        let done = blake3_neon_apple::hash_complete_leaf128_groups(data, out);
+        if done < out.len() {
+            blake3_hash_many::<128>(
+                &data[done * 128..],
+                &mut out[done..],
+                0,
+                BLAKE3_CHUNK_START,
+                BLAKE3_CHUNK_END,
+            );
+        }
+        return true;
+    }
+
+    #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
     if leaf_size == 1024 {
         let done = blake3_neon_apple::hash_complete_groups(data, out);
         if done < out.len() {
