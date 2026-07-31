@@ -946,15 +946,29 @@ pub(crate) fn fold_and_message_aarch64(
     // elides the write-allocate RFO reads; small rounds keep normal stores so
     // LLC-resident outputs stay hot). Per-chunk callers must not decide this
     // from their sub-slice length.
-    if nt_stores {
-        fold_and_message_body::<true>(a_in, b_in, a_out, b_out, r_fold, eq_lo)
+    // The fold multiplier is shared by the two adjacent outputs.  The
+    // lane-paired constant kernel computes both reduced products with six
+    // PMULLs instead of the scalar path's six per product.  Keep an exact
+    // same-binary escape hatch for target-side A/B measurements and for
+    // diagnosing any microarchitectural interaction with the tail stores.
+    let vec2_fold = {
+        use std::sync::OnceLock;
+        static ENABLED: OnceLock<bool> = OnceLock::new();
+        *ENABLED.get_or_init(|| std::env::var_os("FLOCK_NO_ZC_VEC2_FOLD").is_none())
+    };
+    if nt_stores && vec2_fold {
+        fold_and_message_body::<true, true>(a_in, b_in, a_out, b_out, r_fold, eq_lo)
+    } else if nt_stores {
+        fold_and_message_body::<true, false>(a_in, b_in, a_out, b_out, r_fold, eq_lo)
+    } else if vec2_fold {
+        fold_and_message_body::<false, true>(a_in, b_in, a_out, b_out, r_fold, eq_lo)
     } else {
-        fold_and_message_body::<false>(a_in, b_in, a_out, b_out, r_fold, eq_lo)
+        fold_and_message_body::<false, false>(a_in, b_in, a_out, b_out, r_fold, eq_lo)
     }
 }
 
 #[inline(always)]
-fn fold_and_message_body<const NT: bool>(
+fn fold_and_message_body<const NT: bool, const VEC2_FOLD: bool>(
     a_in: &[F128],
     b_in: &[F128],
     a_out: &mut [F128],
@@ -1000,10 +1014,20 @@ fn fold_and_message_body<const NT: bool>(
         let b_even_1 = b_in[i + 2];
         let b_odd_1 = b_in[i + 3];
 
-        let a0 = a_even_0 + r_fold * (a_even_0 + a_odd_0);
-        let a1 = a_even_1 + r_fold * (a_even_1 + a_odd_1);
-        let b0 = b_even_0 + r_fold * (b_even_0 + b_odd_0);
-        let b1 = b_even_1 + r_fold * (b_even_1 + b_odd_1);
+        let (a0, a1) = fold_two_with_shared_multiplier::<VEC2_FOLD>(
+            r_fold,
+            a_even_0,
+            a_odd_0,
+            a_even_1,
+            a_odd_1,
+        );
+        let (b0, b1) = fold_two_with_shared_multiplier::<VEC2_FOLD>(
+            r_fold,
+            b_even_0,
+            b_odd_0,
+            b_even_1,
+            b_odd_1,
+        );
 
         if NT {
             // SAFETY: `o + 1 < a_out.len()` by the len contract above; F128
@@ -1034,6 +1058,37 @@ fn fold_and_message_body<const NT: bool>(
     }
 
     (p1_acc.reduce(), pinf_acc.reduce())
+}
+
+/// Fold two adjacent pairs with the same challenge.  On AArch64+AES the
+/// lane-paired GHASH helper shares the constant's Karatsuba products and
+/// reduces both outputs together; on generic AArch64 builds the exact scalar
+/// expression remains available.  `VEC2` is a const so the disabled branch is
+/// removed from the ranked kernel rather than tested per pair.
+#[inline(always)]
+fn fold_two_with_shared_multiplier<const VEC2: bool>(
+    challenge: F128,
+    even0: F128,
+    odd0: F128,
+    even1: F128,
+    odd1: F128,
+) -> (F128, F128) {
+    #[cfg(target_feature = "aes")]
+    if VEC2 {
+        // SAFETY: this branch is compiled only when the target provides AES /
+        // PMULL, which is the contract of the lane-paired helper.
+        unsafe {
+            let products = crate::field::gf2_128::aarch64::ghash_mul_const_vec2_neon(
+                challenge,
+                [even0 + odd0, even1 + odd1],
+            );
+            return (even0 + products[0], even1 + products[1]);
+        }
+    }
+    (
+        even0 + challenge * (even0 + odd0),
+        even1 + challenge * (even1 + odd1),
+    )
 }
 
 #[cfg(all(test, target_arch = "aarch64", target_feature = "aes"))]
@@ -1108,6 +1163,26 @@ mod tests {
                     expected_unreduced
                 );
             }
+        }
+    }
+
+    #[test]
+    fn shared_multiplier_fold_matches_scalar_fold() {
+        let mut state = 0x5348_4152_4544_324f;
+        for _ in 0..256 {
+            let mut next = || F128::new(splitmix64(&mut state), splitmix64(&mut state));
+            let challenge = next();
+            let even0 = next();
+            let odd0 = next();
+            let even1 = next();
+            let odd1 = next();
+            let scalar = fold_two_with_shared_multiplier::<false>(
+                challenge, even0, odd0, even1, odd1,
+            );
+            let paired = fold_two_with_shared_multiplier::<true>(
+                challenge, even0, odd0, even1, odd1,
+            );
+            assert_eq!(paired, scalar);
         }
     }
 }
