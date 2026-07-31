@@ -2830,9 +2830,26 @@ fn eval_lookahead(c: &[F128; 6], rho: F128) -> SumcheckMessage {
         u_2: c[3] + c[4] * rho + c[5] * r2,
     }
 }
+/// Whether the fused first-claim + ordinary-basis fold4 initialization is
+/// enabled for [`materialize_direct_ab_fold2`].
+///
+/// `FLOCK_NO_DIRECT_AB_FUSE_INIT=1` restores the frontier's
+/// zero-fill → sum-claims → `+= fold4(C)` sequence in the same binary.
+fn direct_ab_fuse_init_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("FLOCK_NO_DIRECT_AB_FUSE_INIT").is_none())
+}
+
 /// Materialize the combined sumcheck state only after its first two folds.
 /// `ordinary_basis` contains the incumbent C contribution; `claims` contains
 /// the AB contribution in sufficient-stat form. Both are γ-baked.
+///
+/// Ranked shape has exactly one direct claim (AB). The default path therefore
+/// fuses that claim's contribution with the ordinary-basis fold4 into a
+/// single assignment per output slot — deleting the full L/4 zero-fill pass
+/// and the subsequent read-modify-write of `b_out` that used to add fold4(C).
+/// Algebra: `0 + D_0 + … + D_n + fold4(C)` becomes `D_0 + fold4(C) + D_1 + …`.
 fn materialize_direct_ab_fold2(
     packed_witness: Vec<F128>,
     ordinary_basis: Vec<F128>,
@@ -2868,6 +2885,7 @@ fn materialize_direct_ab_fold2(
         claim.eq_lo.len() == block_len && claim.eq_hi.len() * block_len == out_len
     }));
 
+    let fuse_init = direct_ab_fuse_init_enabled();
     let mut folded_f = crate::scratch::take_f128(out_len);
     let mut folded_b = crate::scratch::take_f128(out_len);
     let stats = folded_b
@@ -2877,34 +2895,75 @@ fn materialize_direct_ab_fold2(
         .map_init(
             || vec![F128::ZERO; super::ring_switch::FOLD_TABLE_LEN],
             |scratch, (block, (b_out, f_out))| {
-                b_out.fill(F128::ZERO);
-                for (claim, direct_table) in claims.iter().zip(direct_tables.iter()) {
-                    super::ring_switch::compose_fold_byte_table_into(
-                        claim.eq_hi[block],
-                        direct_table,
-                        scratch,
-                    );
-                    for (slot, out) in b_out.iter_mut().enumerate() {
-                        *out +=
-                            super::ring_switch::fold_one_slot(claim.eq_lo[slot], scratch);
-                    }
-                }
-
                 let start = 4 * block * block_len;
                 let f_in = &packed_witness[start..start + 4 * block_len];
                 let b_in = &ordinary_basis[start..start + 4 * block_len];
-                for slot in 0..block_len {
-                    let fold4 = |input: &[F128]| {
-                        let a0 = input[4 * slot];
-                        let a1 = input[4 * slot + 1];
-                        let a2 = input[4 * slot + 2];
-                        let a3 = input[4 * slot + 3];
-                        let low = a0 + r0 * (a0 + a1);
-                        let high = a2 + r0 * (a2 + a3);
-                        low + r1 * (low + high)
-                    };
-                    f_out[slot] = fold4(f_in);
-                    b_out[slot] += fold4(b_in);
+                let fold4 = |input: &[F128], slot: usize| {
+                    let a0 = input[4 * slot];
+                    let a1 = input[4 * slot + 1];
+                    let a2 = input[4 * slot + 2];
+                    let a3 = input[4 * slot + 3];
+                    let low = a0 + r0 * (a0 + a1);
+                    let high = a2 + r0 * (a2 + a3);
+                    low + r1 * (low + high)
+                };
+
+                if fuse_init {
+                    // First direct claim initializes; remaining claims add.
+                    // Fuse claim-0 with ordinary-basis fold4 so each b_out
+                    // slot is written once when there is a single claim
+                    // (the ranked AB-only shape).
+                    let (first_claim, rest_claims) =
+                        claims.split_first().expect("nonempty claims");
+                    let (first_table, rest_tables) =
+                        direct_tables.split_first().expect("nonempty tables");
+                    super::ring_switch::compose_fold_byte_table_into(
+                        first_claim.eq_hi[block],
+                        first_table,
+                        scratch,
+                    );
+                    for slot in 0..block_len {
+                        let direct = super::ring_switch::fold_one_slot(
+                            first_claim.eq_lo[slot],
+                            scratch,
+                        );
+                        f_out[slot] = fold4(f_in, slot);
+                        b_out[slot] = direct + fold4(b_in, slot);
+                    }
+                    for (claim, direct_table) in rest_claims.iter().zip(rest_tables.iter()) {
+                        super::ring_switch::compose_fold_byte_table_into(
+                            claim.eq_hi[block],
+                            direct_table,
+                            scratch,
+                        );
+                        for (slot, out) in b_out.iter_mut().enumerate() {
+                            *out += super::ring_switch::fold_one_slot(
+                                claim.eq_lo[slot],
+                                scratch,
+                            );
+                        }
+                    }
+                } else {
+                    // Frontier control: zero-fill, sum all direct claims, then
+                    // add ordinary-basis fold4.
+                    b_out.fill(F128::ZERO);
+                    for (claim, direct_table) in claims.iter().zip(direct_tables.iter()) {
+                        super::ring_switch::compose_fold_byte_table_into(
+                            claim.eq_hi[block],
+                            direct_table,
+                            scratch,
+                        );
+                        for (slot, out) in b_out.iter_mut().enumerate() {
+                            *out += super::ring_switch::fold_one_slot(
+                                claim.eq_lo[slot],
+                                scratch,
+                            );
+                        }
+                    }
+                    for slot in 0..block_len {
+                        f_out[slot] = fold4(f_in, slot);
+                        b_out[slot] += fold4(b_in, slot);
+                    }
                 }
                 super::round0_and_round1_lookahead(f_out, b_out)
             },
