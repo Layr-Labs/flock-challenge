@@ -144,6 +144,21 @@ fn cached_standard_twiddles(dim: usize, evals: &[Vec<F128>]) -> Option<Arc<[F128
     )
 }
 
+/// Share the much smaller normalized evaluation triangles as well. Standard
+/// NTT objects are constructed repeatedly by the recursive PCS, and rebuilding
+/// these rows otherwise repeats field inversions and multiplications even when
+/// the large twiddle table is already resident from the untimed warm proof.
+fn cached_standard_evals(dim: usize) -> Arc<[Vec<F128>]> {
+    static TABLES: OnceLock<[OnceLock<Arc<[Vec<F128>]>>; 65]> = OnceLock::new();
+    let tables = TABLES.get_or_init(|| std::array::from_fn(|_| OnceLock::new()));
+    tables[dim]
+        .get_or_init(|| {
+            let basis: Vec<F128> = (0..dim).map(|i| F128::new(1u64 << i, 0)).collect();
+            Arc::from(generate_evals_from_subspace(&basis))
+        })
+        .clone()
+}
+
 /// Complete the last radix-8 group for the ranked Apple-silicon L0 commit.
 ///
 /// The generic 2 MiB cache split selects `n_top = 9` for the production shape
@@ -251,7 +266,7 @@ const INTERLEAVED_PHASE_DEEP_ONLY: u8 = 2;
 #[derive(Clone, Debug)]
 pub struct AdditiveNttF128 {
     /// `evals[i]` of length `ℓ − i`, the normalized subspace polynomial values.
-    evals: Vec<Vec<F128>>,
+    evals: Arc<[Vec<F128>]>,
     /// Breadth-first table: layer `l` starts at `2^l - 1`.
     precomputed_twiddles: Option<Arc<[F128]>>,
 }
@@ -259,7 +274,7 @@ pub struct AdditiveNttF128 {
 impl AdditiveNttF128 {
     /// Construct an NTT from an explicit F_2-basis.
     pub fn new(basis: &[F128]) -> Self {
-        let evals = generate_evals_from_subspace(basis);
+        let evals: Arc<[Vec<F128>]> = Arc::from(generate_evals_from_subspace(basis));
         let precomputed_twiddles = precompute_twiddles(&evals).map(Arc::from);
         Self {
             evals,
@@ -271,8 +286,7 @@ impl AdditiveNttF128 {
     /// (the low 64 bits of F_{2^128} hold these basis vectors).
     pub fn standard(dim: usize) -> Self {
         assert!(dim <= 64, "standard NTT requires dim ≤ 64");
-        let basis: Vec<F128> = (0..dim).map(|i| F128::new(1u64 << i, 0)).collect();
-        let evals = generate_evals_from_subspace(&basis);
+        let evals = cached_standard_evals(dim);
         let precomputed_twiddles = cached_standard_twiddles(dim, &evals);
         Self {
             evals,
