@@ -2320,22 +2320,11 @@ fn transpose_forward_ntt_sparse(
         .collect();
 
     // Densify (active windows only; the rest stay zero, which is the correct
-    // post-step-(k-1) state for an all-zero window). Initialize the dense
-    // buffer window-by-window in parallel — zero-fill inactive windows,
-    // copy active ones — instead of a single-threaded whole-domain memset
-    // followed by a serial copy pass.
-    let n_windows = n >> k;
-    let mut window_bufs: Vec<Option<Vec<F128>>> = (0..n_windows).map(|_| None).collect();
+    // post-step-(k-1) state for an all-zero window).
+    let mut data = vec![F128::ZERO; n];
     for (w, buf) in processed {
-        window_bufs[w] = Some(buf);
+        data[(w << k)..((w + 1) << k)].copy_from_slice(&buf);
     }
-    let mut data = crate::alloc_uninit_vec(n);
-    data.par_chunks_mut(1 << k)
-        .zip(window_bufs.par_iter())
-        .for_each(|(chunk, buf)| match buf {
-            Some(b) => chunk.copy_from_slice(b),
-            None => chunk.fill(F128::ZERO),
-        });
 
     // Remaining steps s = k..log_d-1 = forward layers (log_d-1-k) .. 0, dense.
     let n_threads = rayon::current_num_threads().max(1);

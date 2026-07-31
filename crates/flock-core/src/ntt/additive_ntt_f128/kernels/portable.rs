@@ -176,50 +176,6 @@ pub(super) unsafe fn butterfly_fused_3layer_zero_root_row(
     }
 }
 
-/// Pass-1-from-message row: load the eight source rows once from `msg`, then
-/// write the zero-root (block 0) outputs to `out0` and the generic (block 1)
-/// outputs to `out1`. Used by the ranked L0 commit to run the first radix-8
-/// pass directly from the packed message: after the trivial rate-1/2 layer,
-/// both codeword halves hold the same replica of `msg`, so one source read
-/// serves both blocks and the replica copies are never materialized.
-///
-/// Unlike the in-place zero-root kernel, row stream 0 of `out0` IS written
-/// (the destination is uninitialized; the unchanged value still has to land).
-///
-/// # Safety
-/// The caller guarantees every selected row and lane is valid in all three
-/// buffers and that concurrent calls use disjoint row groups. `tw0[0]`,
-/// `tw0[1]`, and `tw0[3]` must be zero.
-pub(super) unsafe fn butterfly_fused_3layer_pass1_from_message_row(
-    msg: *const F128,
-    out0: *mut F128,
-    out1: *mut F128,
-    eighth: usize,
-    num_ntts: usize,
-    r: usize,
-    tw0: &[F128; 7],
-    tw1: &[F128; 7],
-) {
-    // SAFETY: caller supplies the pointer geometry and disjointness contract.
-    unsafe {
-        for lane in 0..num_ntts {
-            let mut values = [F128::ZERO; 8];
-            for (i, value) in values.iter_mut().enumerate() {
-                *value = *msg.add((i * eighth + r) * num_ntts + lane);
-            }
-            let mut zero_root = values;
-            butterfly_fused_3layer_zero_root(&mut zero_root, tw0);
-            for (i, value) in zero_root.iter().enumerate() {
-                *out0.add((i * eighth + r) * num_ntts + lane) = *value;
-            }
-            butterfly_fused_3layer(&mut values, tw1);
-            for (i, value) in values.iter().enumerate() {
-                *out1.add((i * eighth + r) * num_ntts + lane) = *value;
-            }
-        }
-    }
-}
-
 #[inline]
 pub(super) fn butterfly_fused_4layer(values: &mut [F128; 16], twiddles: &[F128; 15]) {
     #[inline(always)]

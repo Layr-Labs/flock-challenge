@@ -1158,6 +1158,20 @@ pub fn fold_and_compute_round_pair_into(
     let lo_size = 1usize << eq.n_lo;
     let hi_size = 1usize << eq.n_hi;
     assert!(lo_size >= 2, "fold_and_compute requires lo_size ≥ 2");
+    // Rounds whose outputs are past LLC size write ping-pong buffers that are
+    // not read until the next round's barrier and cannot stay cache-resident;
+    // ordinary stores only add write-allocate (RFO) read traffic. Route those
+    // rounds through the kernel's `stnp` arm (the same best-effort hint the
+    // round-2 producer uses); LLC-resident later rounds keep normal stores so
+    // their outputs stay hot for the next round. 2^22 F128 = 64 MiB per array.
+    #[cfg(target_arch = "aarch64")]
+    let nt_stores = {
+        use std::sync::OnceLock;
+        static NT_ENABLED: OnceLock<bool> = OnceLock::new();
+        half >= (1usize << 22)
+            && *NT_ENABLED
+                .get_or_init(|| std::env::var_os("FLOCK_ZC_NT_LEGACY").is_none())
+    };
     // Total non-bound multilinear vars is log_n - 1; eq covers log_n - 2 of those.
     assert_eq!(lo_size * hi_size * 2, half);
 
@@ -1185,7 +1199,8 @@ pub fn fold_and_compute_round_pair_into(
                 unsafe { fold_and_message_x86_avx512(a_in, b_in, a_out, b_out, r_fold, eq_lo) };
 
             #[cfg(target_arch = "aarch64")]
-            let (p1, pinf) = fold_and_message_aarch64(a_in, b_in, a_out, b_out, r_fold, eq_lo);
+            let (p1, pinf) =
+                fold_and_message_aarch64(a_in, b_in, a_out, b_out, r_fold, eq_lo, nt_stores);
 
             #[cfg(not(any(
                 target_arch = "aarch64",
