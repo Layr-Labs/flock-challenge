@@ -2841,9 +2841,13 @@ fn materialize_direct_ab_fold2(
     r1: F128,
 ) -> (Vec<F128>, Vec<F128>, SumcheckMessage, [F128; 6]) {
     use rayon::prelude::*;
+    use std::sync::OnceLock;
 
     assert!(!claims.is_empty());
     assert_eq!(ordinary_basis.len(), packed_witness.len());
+    static ASSIGN_FIRST: OnceLock<bool> = OnceLock::new();
+    let assign_first = *ASSIGN_FIRST
+        .get_or_init(|| std::env::var_os("FLOCK_NO_DIRECT_AB_ASSIGN_FIRST").is_none());
     let fold_weight = [
         (F128::ONE + r0) * (F128::ONE + r1),
         r0 * (F128::ONE + r1),
@@ -2877,16 +2881,25 @@ fn materialize_direct_ab_fold2(
         .map_init(
             || vec![F128::ZERO; super::ring_switch::FOLD_TABLE_LEN],
             |scratch, (block, (b_out, f_out))| {
-                b_out.fill(F128::ZERO);
-                for (claim, direct_table) in claims.iter().zip(direct_tables.iter()) {
+                if !assign_first {
+                    b_out.fill(F128::ZERO);
+                }
+                for (claim_index, (claim, direct_table)) in
+                    claims.iter().zip(direct_tables.iter()).enumerate()
+                {
                     super::ring_switch::compose_fold_byte_table_into(
                         claim.eq_hi[block],
                         direct_table,
                         scratch,
                     );
                     for (slot, out) in b_out.iter_mut().enumerate() {
-                        *out +=
+                        let value =
                             super::ring_switch::fold_one_slot(claim.eq_lo[slot], scratch);
+                        if assign_first && claim_index == 0 {
+                            *out = value;
+                        } else {
+                            *out += value;
+                        }
                     }
                 }
 
