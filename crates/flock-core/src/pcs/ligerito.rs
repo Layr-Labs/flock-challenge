@@ -4010,15 +4010,30 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
     let queries_0 = sample_distinct_queries(challenger, l0_block_len, num_queries_0);
     let alpha_0 = challenger.sample_f128_vec(ceil_log2(num_queries_0));
     let _t = std::time::Instant::now();
-    let opened_rows_0: Vec<Vec<F128>> = queries_0.iter().map(|&q| l0_row(q).to_vec()).collect();
-    let merkle_proof_0 = merkle_multi_proof_for(l0_tree, l0_block_len, &queries_0);
+    // Open rows, multi-proof, and sk-table are mutually independent once
+    // queries_0 / n1 are known. Nested rayon is fine: outer join + inner
+    // par_iter both use the global pool.
+    let ((opened_rows_0, merkle_proof_0), sks_vks_n1) = rayon::join(
+        || {
+            rayon::join(
+                || {
+                    use rayon::prelude::*;
+                    queries_0
+                        .par_iter()
+                        .map(|&q| l0_row(q).to_vec())
+                        .collect::<Vec<_>>()
+                },
+                || merkle_multi_proof_for(l0_tree, l0_block_len, &queries_0),
+            )
+        },
+        || eval_sk_at_vks(n1),
+    );
     if trace {
         t_opens += _t.elapsed();
     }
     // Induce basis_0 from wtns_0 opens. L0 dominates the induce phase, where the
     // sparse-prefix Fᵀ-NTT path wins; the dispatcher auto-selects it (deeper
     // levels stay dense).
-    let sks_vks_n1 = eval_sk_at_vks(n1);
     let _t = std::time::Instant::now();
     let (basis_0_induced, enforced_sum_0) = induce_sumcheck_poly_auto(
         n1,
@@ -5323,16 +5338,24 @@ fn recursive_prover_inner<Ch: Challenger>(
     let queries_0 = sample_distinct_queries(challenger, wtns_0.block_len, num_queries_0);
     let alpha_0 = challenger.sample_f128_vec(ceil_log2(num_queries_0));
     let t = std::time::Instant::now();
-    let opened_rows_0: Vec<Vec<F128>> = queries_0.iter().map(|&q| wtns_0.row(q).to_vec()).collect();
-    let merkle_proof_0 = merkle_multi_proof_for(&wtns_0.tree, wtns_0.block_len, &queries_0);
+    let ((opened_rows_0, merkle_proof_0), sks_vks_n1) = rayon::join(
+        || {
+            rayon::join(
+                || {
+                    use rayon::prelude::*;
+                    queries_0
+                        .par_iter()
+                        .map(|&q| wtns_0.row(q).to_vec())
+                        .collect::<Vec<_>>()
+                },
+                || merkle_multi_proof_for(&wtns_0.tree, wtns_0.block_len, &queries_0),
+            )
+        },
+        || eval_sk_at_vks(n1),
+    );
     t_opens += t.elapsed();
-    let initial_proof = RecursiveProof {
-        opened_rows: opened_rows_0.clone(),
-        merkle_proof: merkle_proof_0,
-    };
 
     // ---- Induce basis from wtns_0 opens ----
-    let sks_vks_n1 = eval_sk_at_vks(n1);
     let t = std::time::Instant::now();
     let (basis_0_induced, enforced_sum_0) = induce_sumcheck_poly_auto(
         n1,
@@ -5344,6 +5367,11 @@ fn recursive_prover_inner<Ch: Challenger>(
         &alpha_0,
     );
     t_induce += t.elapsed();
+    // Move rows into the proof after induce — no full-row clone.
+    let initial_proof = RecursiveProof {
+        opened_rows: opened_rows_0,
+        merkle_proof: merkle_proof_0,
+    };
 
     // ---- Start sumcheck: f¹ · eq(z[initial_k..], ·) = claimed_value ----
     let eq_z_residual = build_eq_table(&eval_point[initial_k..]);
