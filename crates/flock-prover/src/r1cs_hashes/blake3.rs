@@ -1848,6 +1848,30 @@ impl Blake3Setup {
     ) -> (flock_core::proof::R1csProofLigerito, Commitment, R1csClaim) {
         assert_eq!(blocks.len(), self.n_blocks);
         if self.use_ranked_rate2_hot_codeword() {
+            // From-message commit: the layer-1 NTT pass synthesizes both
+            // rate-1/2 replicas straight from z_packed, so the witness
+            // driver skips its ~1 GiB of replica stores entirely. The
+            // codeword scratch stays stale until that pass writes it.
+            // `FLOCK_NO_NTT_FROM_MSG=1` restores the hot-codeword replicate
+            // path below as the exact A/B control.
+            if flock_core::pcs::use_ranked_from_message_commit(&self.pcs_params) {
+                let codeword =
+                    flock_core::scratch::take_f128(self.pcs_params.codeword_len_f128());
+                let (z_packed, a_packed_f128, b_packed_f128, z_packed_lincheck) =
+                    self.generate_witness_ab(blocks);
+                let lc_circuit = self.lincheck_circuit();
+                return crate::prover::prove_fast_ligerito_from_witness(
+                    &self.r1cs,
+                    &self.pcs_params,
+                    z_packed,
+                    a_packed_f128,
+                    b_packed_f128,
+                    z_packed_lincheck,
+                    lc_circuit,
+                    Some(codeword),
+                    challenger,
+                );
+            }
             let (codeword, (z_packed, a_packed_f128, b_packed_f128, z_packed_lincheck)) =
                 self.generate_witness_ab_with_rate2_codeword(blocks);
             let lc_circuit = self.lincheck_circuit();
@@ -1896,8 +1920,14 @@ impl Blake3Setup {
     ) {
         assert_eq!(blocks.len(), self.n_blocks);
         let t0 = std::time::Instant::now();
+        let from_message = self.use_ranked_rate2_hot_codeword()
+            && flock_core::pcs::use_ranked_from_message_commit(&self.pcs_params);
         let (codeword, (z_packed, a_packed_f128, b_packed_f128, z_packed_lincheck)) =
-            if self.use_ranked_rate2_hot_codeword() {
+            if from_message {
+                let codeword =
+                    flock_core::scratch::take_f128(self.pcs_params.codeword_len_f128());
+                (Some(codeword), self.generate_witness_ab(blocks))
+            } else if self.use_ranked_rate2_hot_codeword() {
                 let (codeword, witness) = self.generate_witness_ab_with_rate2_codeword(blocks);
                 (Some(codeword), witness)
             } else {
@@ -1906,6 +1936,20 @@ impl Blake3Setup {
         let witness_s = t0.elapsed().as_secs_f64();
         let lc_circuit = self.lincheck_circuit();
         let (proof, commitment, claim, mut timings) = match codeword {
+            // From-message: the buffer is stale scratch — route through the
+            // NeedsReplication path, whose commit_into fuses (or falls back
+            // to an explicit replicate-fill).
+            Some(codeword) if from_message => crate::prover::prove_fast_ligerito_timed(
+                &self.r1cs,
+                &self.pcs_params,
+                z_packed,
+                a_packed_f128,
+                b_packed_f128,
+                z_packed_lincheck,
+                lc_circuit,
+                Some(codeword),
+                challenger,
+            ),
             Some(codeword) => {
                 crate::prover::prove_fast_ligerito_timed_from_preinitialized_codeword(
                     &self.r1cs,
