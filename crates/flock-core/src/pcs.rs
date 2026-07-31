@@ -177,6 +177,62 @@ struct CombinedClaim {
     round0_prime: (F128, F128),
 }
 
+/// Exact ranked shape for the heterogeneous combined-basis queue. The gate is
+/// deliberately narrower than the algebraic fast path: two ring-switched
+/// BLAKE3 claims, no packed-direct claim, 2^25 packed slots split into 2^15
+/// slot blocks (1024 independent 512 KiB jobs).
+#[inline]
+fn is_ranked_hetero_open_combine_shape(l: usize, b: usize, n_rs: usize, n_pd: usize) -> bool {
+    l == (1usize << 25) && b == (1usize << 15) && n_rs == 2 && n_pd == 0
+}
+
+#[inline]
+fn use_ranked_hetero_open_combine(l: usize, b: usize, n_rs: usize, n_pd: usize) -> bool {
+    cfg!(all(target_os = "macos", target_arch = "aarch64"))
+        && is_ranked_hetero_open_combine_shape(l, b, n_rs, n_pd)
+        && std::env::var_os("FLOCK_NO_HETERO_OPEN_COMBINE").is_none()
+        && crate::epool::epool().is_some()
+}
+
+/// Drain fixed-size output blocks through the stateful P/E queue and reduce
+/// one `(u0, u2)` partial per block after the synchronous join. `fold_block`
+/// owns the complete output block for its queue index; `init` supplies private
+/// worker scratch that persists across all blocks claimed by that worker.
+fn run_hetero_open_combine_blocks<S, I, F>(
+    out: &mut [F128],
+    block_len: usize,
+    init: I,
+    fold_block: F,
+) -> (F128, F128)
+where
+    I: Fn() -> S + Sync,
+    F: Fn(&mut S, usize, &mut [F128]) -> (F128, F128) + Sync,
+{
+    assert!(block_len > 0 && out.len().is_multiple_of(block_len));
+    let n_blocks = out.len() / block_len;
+    let mut partials = vec![(F128::ZERO, F128::ZERO); n_blocks];
+    let out_base = crate::epool::SyncPtr(out.as_mut_ptr());
+    let partials_base = crate::epool::SyncPtr(partials.as_mut_ptr());
+    crate::epool::run_hetero_chunks_stateful(n_blocks, init, |state, block| {
+        // SAFETY: queue index `block` is claimed exactly once. It owns disjoint
+        // output `[block*block_len, (block+1)*block_len)` and one partial slot;
+        // the synchronous two-pool join publishes both before reduce.
+        unsafe {
+            let out_block =
+                core::slice::from_raw_parts_mut(out_base.ptr().add(block * block_len), block_len);
+            partials_base
+                .ptr()
+                .add(block)
+                .write(fold_block(state, block, out_block));
+        }
+    });
+    partials
+        .into_iter()
+        .fold((F128::ZERO, F128::ZERO), |(x0, x2), (y0, y2)| {
+            (x0 + y0, x2 + y2)
+        })
+}
+
 /// Runs ring_switch over RS claims, observes packed-direct claim values +
 /// samples their gammas, then builds `b_combined` (the γ-weighted linear
 /// combination of all `rs_eq_ind`s and `eq_ind`s) and `target_combined`.
@@ -334,66 +390,82 @@ fn compute_combined_basis_and_target<Ch: Challenger>(
         // sweep: the table build wouldn't amortize below ~2^12 slots.
         const COMPOSE_MIN_BLOCK: usize = 1 << 12;
         let composed = b >= COMPOSE_MIN_BLOCK;
-        b_combined
-            .par_chunks_mut(b)
-            .enumerate()
-            .map_init(
-                || {
-                    if composed {
-                        vec![F128::ZERO; ring_switch::FOLD_TABLE_LEN]
+        let fold_block = |ctable: &mut Vec<F128>, hi: usize, out_block: &mut [F128]| {
+            // Accumulate each claim's block: first claim writes, rest add.
+            // `e_hi` is folded into the composed table once per claim per
+            // block, then swept over eq_lo with no per-slot multiply.
+            for (ci, (eq_lo, eq_hi, table, _)) in rs_deferred.iter().enumerate() {
+                let e_hi = eq_hi[hi];
+                if composed {
+                    ring_switch::compose_fold_byte_table_into(e_hi, table, ctable);
+                    if ci == 0 {
+                        for (slot, &lo) in out_block.iter_mut().zip(eq_lo.iter()) {
+                            *slot = ring_switch::fold_one_slot(lo, ctable);
+                        }
                     } else {
-                        Vec::new()
-                    }
-                },
-                |ctable, (hi, out_block)| {
-                    // Accumulate each claim's block: first claim writes, rest add.
-                    // `e_hi` is folded into the composed table once per claim per
-                    // block, then swept over eq_lo with no per-slot multiply.
-                    for (ci, (eq_lo, eq_hi, table, _)) in rs_deferred.iter().enumerate() {
-                        let e_hi = eq_hi[hi];
-                        if composed {
-                            ring_switch::compose_fold_byte_table_into(e_hi, table, ctable);
-                            if ci == 0 {
-                                for (slot, &lo) in out_block.iter_mut().zip(eq_lo.iter()) {
-                                    *slot = ring_switch::fold_one_slot(lo, ctable);
-                                }
-                            } else {
-                                for (slot, &lo) in out_block.iter_mut().zip(eq_lo.iter()) {
-                                    *slot += ring_switch::fold_one_slot(lo, ctable);
-                                }
-                            }
-                        } else if ci == 0 {
-                            for (slot, &lo) in out_block.iter_mut().zip(eq_lo.iter()) {
-                                *slot = ring_switch::fold_one_slot(lo * e_hi, table);
-                            }
-                        } else {
-                            for (slot, &lo) in out_block.iter_mut().zip(eq_lo.iter()) {
-                                *slot += ring_switch::fold_one_slot(lo * e_hi, table);
-                            }
+                        for (slot, &lo) in out_block.iter_mut().zip(eq_lo.iter()) {
+                            *slot += ring_switch::fold_one_slot(lo, ctable);
                         }
                     }
-                    // Round-0 prime over this block's pairs (b is even, base is
-                    // even). Separate pass over the L2-resident block — fusing it
-                    // into the last claim's sweep measured slower (pairwise
-                    // stepping breaks the streaming store pattern).
-                    let base = hi * b;
-                    let mut u0 = F128::ZERO;
-                    let mut u2 = F128::ZERO;
-                    for t in 0..(b / 2) {
-                        let s0 = out_block[2 * t];
-                        let s1 = out_block[2 * t + 1];
-                        let a0 = packed_witness[base + 2 * t];
-                        let a1 = packed_witness[base + 2 * t + 1];
-                        u0 += a0 * s0;
-                        u2 += (a0 + a1) * (s0 + s1);
+                } else if ci == 0 {
+                    for (slot, &lo) in out_block.iter_mut().zip(eq_lo.iter()) {
+                        *slot = ring_switch::fold_one_slot(lo * e_hi, table);
                     }
-                    (u0, u2)
-                },
+                } else {
+                    for (slot, &lo) in out_block.iter_mut().zip(eq_lo.iter()) {
+                        *slot += ring_switch::fold_one_slot(lo * e_hi, table);
+                    }
+                }
+            }
+            // Round-0 prime over this block's pairs (b is even, base is even).
+            // Keep this separate from the last claim's streaming store: the
+            // pairwise stepping variant is slower even though it removes a pass.
+            let base = hi * b;
+            let mut u0 = F128::ZERO;
+            let mut u2 = F128::ZERO;
+            for t in 0..(b / 2) {
+                let s0 = out_block[2 * t];
+                let s1 = out_block[2 * t + 1];
+                let a0 = packed_witness[base + 2 * t];
+                let a1 = packed_witness[base + 2 * t + 1];
+                u0 += a0 * s0;
+                u2 += (a0 + a1) * (s0 + s1);
+            }
+            (u0, u2)
+        };
+        let init_ctable = || {
+            if composed {
+                vec![F128::ZERO; ring_switch::FOLD_TABLE_LEN]
+            } else {
+                Vec::new()
+            }
+        };
+
+        if use_ranked_hetero_open_combine(l, b, n_rs, n_pd) {
+            // The 10 P-core Rayon workers and four utility-QoS E-core workers
+            // drain one shared queue. Each worker keeps one private 64 KiB
+            // composed table across all of its claims; an E-core can hold the
+            // join behind by at most one 512 KiB block.
+            run_hetero_open_combine_blocks(
+                &mut b_combined,
+                b,
+                init_ctable,
+                |ctable, hi, out_block| fold_block(ctable, hi, out_block),
             )
-            .reduce(
-                || (F128::ZERO, F128::ZERO),
-                |(x0, x2), (y0, y2)| (x0 + y0, x2 + y2),
-            )
+        } else {
+            // Exact opt-out/general schedule: retain Rayon `map_init`, including
+            // its folder-local composed-table reuse and parallel reduction.
+            b_combined
+                .par_chunks_mut(b)
+                .enumerate()
+                .map_init(init_ctable, |ctable, (hi, out_block)| {
+                    fold_block(ctable, hi, out_block)
+                })
+                .reduce(
+                    || (F128::ZERO, F128::ZERO),
+                    |(x0, x2), (y0, y2)| (x0 + y0, x2 + y2),
+                )
+        }
     } else {
         // General path (mixed / sparse / packed-direct): materialize any
         // deferred-dense claims (parallel block fold), then the per-element
@@ -777,6 +849,63 @@ mod tests {
                 hi: self.next_u64(),
             }
         }
+    }
+
+    #[test]
+    fn ranked_hetero_open_combine_shape_gate_is_narrow() {
+        assert!(is_ranked_hetero_open_combine_shape(1 << 25, 1 << 15, 2, 0));
+        assert!(!is_ranked_hetero_open_combine_shape(1 << 24, 1 << 15, 2, 0));
+        assert!(!is_ranked_hetero_open_combine_shape(1 << 25, 1 << 14, 2, 0));
+        assert!(!is_ranked_hetero_open_combine_shape(1 << 25, 1 << 15, 1, 0));
+        assert!(!is_ranked_hetero_open_combine_shape(1 << 25, 1 << 15, 2, 1));
+    }
+
+    /// Compact ownership/reduction oracle for the production stateful block
+    /// dispatcher. It uses the same 64 KiB private-state size as the ranked
+    /// composed table while keeping the output small enough for an ordinary
+    /// unit test.
+    #[test]
+    fn hetero_open_combine_block_dispatch_matches_serial() {
+        const N_BLOCKS: usize = 256;
+        const BLOCK_LEN: usize = 32;
+        let mut got = vec![F128::ZERO; N_BLOCKS * BLOCK_LEN];
+        let got_uv = run_hetero_open_combine_blocks(
+            &mut got,
+            BLOCK_LEN,
+            || vec![F128::ZERO; ring_switch::FOLD_TABLE_LEN],
+            |scratch, block, out_block| {
+                scratch[0] = F128::new(block as u64 ^ 0xA55A, (block as u64) << 32);
+                let mut u0 = F128::ZERO;
+                let mut u2 = F128::ZERO;
+                for (offset, slot) in out_block.iter_mut().enumerate() {
+                    *slot = scratch[0] + F128::new(offset as u64, offset as u64 * 3);
+                    if offset.is_multiple_of(2) {
+                        u0 += *slot;
+                    }
+                    u2 += *slot;
+                }
+                (u0, u2)
+            },
+        );
+
+        let mut expected = vec![F128::ZERO; got.len()];
+        let mut expected_uv = (F128::ZERO, F128::ZERO);
+        for (block, out_block) in expected.chunks_mut(BLOCK_LEN).enumerate() {
+            let seed = F128::new(block as u64 ^ 0xA55A, (block as u64) << 32);
+            let mut u0 = F128::ZERO;
+            let mut u2 = F128::ZERO;
+            for (offset, slot) in out_block.iter_mut().enumerate() {
+                *slot = seed + F128::new(offset as u64, offset as u64 * 3);
+                if offset.is_multiple_of(2) {
+                    u0 += *slot;
+                }
+                u2 += *slot;
+            }
+            expected_uv.0 += u0;
+            expected_uv.1 += u2;
+        }
+        assert_eq!(got, expected);
+        assert_eq!(got_uv, expected_uv);
     }
 
     fn zhat_skip_reference(z: &[bool], m: usize, z_skip: F128, x_outer: &[F128]) -> F128 {
