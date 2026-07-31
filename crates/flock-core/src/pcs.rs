@@ -33,7 +33,7 @@ pub use pack::{LOG_PACKING, pack_witness, unpack_witness};
 pub use ring_switch::{RingSwitchProof, SparseEqTensor};
 
 use crate::challenger::Challenger;
-use crate::field::F128;
+use crate::field::{F128, gf2_128::F128ProductAccumulator};
 use crate::zerocheck::PaddingSpec;
 use serde::{Deserialize, Serialize};
 
@@ -376,17 +376,17 @@ fn compute_combined_basis_and_target<Ch: Challenger>(
                     // into the last claim's sweep measured slower (pairwise
                     // stepping breaks the streaming store pattern).
                     let base = hi * b;
-                    let mut u0 = F128::ZERO;
-                    let mut u2 = F128::ZERO;
+                    let mut u0 = F128ProductAccumulator::ZERO;
+                    let mut u2 = F128ProductAccumulator::ZERO;
                     for t in 0..(b / 2) {
                         let s0 = out_block[2 * t];
                         let s1 = out_block[2 * t + 1];
                         let a0 = packed_witness[base + 2 * t];
                         let a1 = packed_witness[base + 2 * t + 1];
-                        u0 += a0 * s0;
-                        u2 += (a0 + a1) * (s0 + s1);
+                        u0.add_product(a0, s0);
+                        u2.add_product(a0 + a1, s0 + s1);
                     }
-                    (u0, u2)
+                    (u0.finish(), u2.finish())
                 },
             )
             .reduce(

@@ -30,7 +30,7 @@
 //!    c. Else: commit f^{i+2}, open f^{i+1}, induce next basis, glue.
 
 use crate::challenger::Challenger;
-use crate::field::F128;
+use crate::field::{F128, gf2_128::F128ProductAccumulator};
 use crate::lincheck::build_eq_table;
 use crate::merkle::{self, Hash, HashKind};
 use crate::ntt::additive_ntt_f128::AdditiveNttF128;
@@ -2647,8 +2647,8 @@ fn fold_and_msg_lsb_into(
         .map(|(ci, (fc, bc))| {
             let base = ci * CHUNK;
             let len = fc.len();
-            let mut u0 = F128::ZERO;
-            let mut u2 = F128::ZERO;
+            let mut u0 = F128ProductAccumulator::ZERO;
+            let mut u2 = F128ProductAccumulator::ZERO;
             // Fold this slice, then pair up the just-folded values for the msg.
             crate::field::f128_slice::fold_pairs(f, base, fc, r);
             crate::field::f128_slice::fold_pairs(b, base, bc, r);
@@ -2658,11 +2658,11 @@ fn fold_and_msg_lsb_into(
                 let f1 = fc[k + 1];
                 let b0 = bc[k];
                 let b1 = bc[k + 1];
-                u0 += f0 * b0;
-                u2 += (f0 + f1) * (b0 + b1);
+                u0.add_product(f0, b0);
+                u2.add_product(f0 + f1, b0 + b1);
                 k += 2;
             }
-            (u0, u2)
+            (u0.finish(), u2.finish())
         })
         .reduce(
             || (F128::ZERO, F128::ZERO),

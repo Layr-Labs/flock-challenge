@@ -258,15 +258,16 @@ pub unsafe fn ghash_mul_unreduced_neon(a: F128, b: F128) -> F256Unreduced {
     // SAFETY: function carries the aes target feature.
     unsafe {
         let p_ll = pmull(a.lo, b.lo);
-        let p_lh = pmull(a.lo, b.hi);
-        let p_hl = pmull(a.hi, b.lo);
         let p_hh = pmull(a.hi, b.hi);
+        // Karatsuba recovers the middle coefficient from a third product,
+        // deleting one PMULL from every deferred inner-product term.
+        let p_sum = pmull(a.lo ^ a.hi, b.lo ^ b.hi);
+        let cross = veorq_u64(p_sum, veorq_u64(p_ll, p_hh));
 
         let ll_lo = vgetq_lane_u64::<0>(p_ll);
         let ll_hi = vgetq_lane_u64::<1>(p_ll);
         let hh_lo = vgetq_lane_u64::<0>(p_hh);
         let hh_hi = vgetq_lane_u64::<1>(p_hh);
-        let cross = veorq_u64(p_lh, p_hl);
         let cr_lo = vgetq_lane_u64::<0>(cross);
         let cr_hi = vgetq_lane_u64::<1>(cross);
 

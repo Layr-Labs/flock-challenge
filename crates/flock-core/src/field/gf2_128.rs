@@ -182,6 +182,50 @@ impl BitXorAssign for F256Unreduced {
     }
 }
 
+/// Accumulates an inner product using the target's preferred reduction
+/// schedule. Apple Silicon keeps products unreduced until a parallel chunk
+/// drains; other targets preserve the ordinary reduced-product path.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct F128ProductAccumulator {
+    #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+    wide: F256Unreduced,
+    #[cfg(not(all(target_arch = "aarch64", target_feature = "aes")))]
+    reduced: F128,
+}
+
+impl F128ProductAccumulator {
+    pub(crate) const ZERO: Self = Self {
+        #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+        wide: F256Unreduced::ZERO,
+        #[cfg(not(all(target_arch = "aarch64", target_feature = "aes")))]
+        reduced: F128::ZERO,
+    };
+
+    #[inline(always)]
+    pub(crate) fn add_product(&mut self, lhs: F128, rhs: F128) {
+        #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+        {
+            self.wide ^= lhs.mul_unreduced(rhs);
+        }
+        #[cfg(not(all(target_arch = "aarch64", target_feature = "aes")))]
+        {
+            self.reduced += lhs * rhs;
+        }
+    }
+
+    #[inline]
+    pub(crate) fn finish(self) -> F128 {
+        #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+        {
+            self.wide.reduce()
+        }
+        #[cfg(not(all(target_arch = "aarch64", target_feature = "aes")))]
+        {
+            self.reduced
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Reduction mod p = x^128 + x^7 + x^2 + x + 1. Works on any target.
 // ---------------------------------------------------------------------------
