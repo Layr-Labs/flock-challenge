@@ -1116,9 +1116,7 @@ fn write_lin_word_ab_packed(bit_off: usize, val: u32, z: &mut [u64], a: &mut [u6
     or_u32_at_bit(b, bit_off, 0xFFFF_FFFF);
 }
 
-/// Sequential full-word writer for one packed block. Unlike the generic
-/// OR-based helpers, this never reads the destination and initializes every
-/// word, allowing the outer driver to skip its 1.5-GiB ranked zero pass.
+/// Sequential full-word writer retained for the exact scalar fallback.
 struct PackedWordWriter<'a> {
     out: &'a mut [u64],
     word: usize,
@@ -1196,16 +1194,293 @@ impl<'a> PackedWordWriter<'a> {
     }
 }
 
+trait PackedAbWriter {
+    fn push(&mut self, z: u64, a: u64, b: u64, width: usize);
+    fn push_g_record(
+        &mut self,
+        z: &BitRecord<4>,
+        a: &BitRecord<4>,
+        b: &BitRecord<4>,
+    );
+    fn position(&self) -> usize;
+    fn overwrite_out_lo(&mut self, out_lo: &[u32; 8]);
+    fn finish(self);
+}
+
+/// Compatibility adapter preserving the original three independent generic
+/// packing state machines for the same-binary control.
+struct ScalarPackedAbWriter<'a> {
+    z: PackedWordWriter<'a>,
+    a: PackedWordWriter<'a>,
+    b: PackedWordWriter<'a>,
+}
+
+impl<'a> ScalarPackedAbWriter<'a> {
+    #[inline(always)]
+    fn new(z: &'a mut [u64], a: &'a mut [u64], b: &'a mut [u64]) -> Self {
+        Self {
+            z: PackedWordWriter::new(z),
+            a: PackedWordWriter::new(a),
+            b: PackedWordWriter::new(b),
+        }
+    }
+}
+
+impl PackedAbWriter for ScalarPackedAbWriter<'_> {
+    #[inline(always)]
+    fn push(&mut self, z: u64, a: u64, b: u64, width: usize) {
+        self.z.push(z, width);
+        self.a.push(a, width);
+        self.b.push(b, width);
+    }
+
+    #[inline(always)]
+    fn push_g_record(
+        &mut self,
+        z: &BitRecord<4>,
+        a: &BitRecord<4>,
+        b: &BitRecord<4>,
+    ) {
+        self.z.push_record(z, G_STRIDE);
+        self.a.push_record(a, G_STRIDE);
+        self.b.push_record(b, G_STRIDE);
+    }
+
+    #[inline(always)]
+    fn position(&self) -> usize {
+        debug_assert_eq!(self.z.position(), self.a.position());
+        debug_assert_eq!(self.z.position(), self.b.position());
+        self.z.position()
+    }
+
+    #[inline(always)]
+    fn overwrite_out_lo(&mut self, out_lo: &[u32; 8]) {
+        const OUT_LO_WORD: usize = OUT_LO_BASE / 64;
+        for i in 0..4 {
+            let value = (out_lo[2 * i] as u64) | ((out_lo[2 * i + 1] as u64) << 32);
+            self.z.out[OUT_LO_WORD + i] = value;
+            self.a.out[OUT_LO_WORD + i] = value;
+            self.b.out[OUT_LO_WORD + i] = u64::MAX;
+        }
+    }
+
+    #[inline]
+    fn finish(self) {
+        self.z.finish();
+        self.a.finish();
+        self.b.finish();
+    }
+}
+
+/// One synchronized state machine for `(z, a, b)`, including a direct
+/// fixed-250-bit G append. Raw pointers avoid repeating bounds/address work
+/// after construction proves three disjoint full-block buffers.
+struct PackedTripleWriter<'a> {
+    z: *mut u64,
+    a: *mut u64,
+    b: *mut u64,
+    word: usize,
+    pending_z: u64,
+    pending_a: u64,
+    pending_b: u64,
+    used: usize,
+    _borrow: std::marker::PhantomData<&'a mut [u64]>,
+}
+
+impl<'a> PackedTripleWriter<'a> {
+    /// # Safety
+    ///
+    /// Each slice must contain exactly `K / 64` words. The three mutable
+    /// slices must be disjoint for `'a`.
+    #[inline(always)]
+    unsafe fn new_unchecked(
+        z: &'a mut [u64],
+        a: &'a mut [u64],
+        b: &'a mut [u64],
+    ) -> Self {
+        Self {
+            z: z.as_mut_ptr(),
+            a: a.as_mut_ptr(),
+            b: b.as_mut_ptr(),
+            word: 0,
+            pending_z: 0,
+            pending_a: 0,
+            pending_b: 0,
+            used: 0,
+            _borrow: std::marker::PhantomData,
+        }
+    }
+
+    #[inline(always)]
+    fn store_at(&mut self, word: usize, z: u64, a: u64, b: u64) {
+        debug_assert!(word < K / 64);
+        // SAFETY: `new_unchecked` establishes three disjoint K/64-word
+        // allocations; fixed stream positions remain below USEFUL_BITS < K.
+        unsafe {
+            self.z.add(word).write(z);
+            self.a.add(word).write(a);
+            self.b.add(word).write(b);
+        }
+    }
+
+    #[inline(always)]
+    fn store_word(&mut self, z: u64, a: u64, b: u64) {
+        self.store_at(self.word, z, a, b);
+        self.word += 1;
+    }
+
+    #[inline(always)]
+    fn push_triple(&mut self, mut z: u64, mut a: u64, mut b: u64, width: usize) {
+        debug_assert!((1..=64).contains(&width));
+        if width != 64 {
+            let mask = (1u64 << width) - 1;
+            z &= mask;
+            a &= mask;
+            b &= mask;
+        }
+        if self.used == 0 && width == 64 {
+            self.store_word(z, a, b);
+            return;
+        }
+        let room = 64 - self.used;
+        if width < room {
+            self.pending_z |= z << self.used;
+            self.pending_a |= a << self.used;
+            self.pending_b |= b << self.used;
+            self.used += width;
+        } else {
+            self.store_word(
+                self.pending_z | (z << self.used),
+                self.pending_a | (a << self.used),
+                self.pending_b | (b << self.used),
+            );
+            if width == room {
+                self.pending_z = 0;
+                self.pending_a = 0;
+                self.pending_b = 0;
+                self.used = 0;
+            } else {
+                self.pending_z = z >> room;
+                self.pending_a = a >> room;
+                self.pending_b = b >> room;
+                self.used = width - room;
+            }
+        }
+    }
+
+    /// Append all three fixed 250-bit G records with one shared offset and one
+    /// tail decision. The shift cycle is odd and never aligned.
+    #[inline(always)]
+    fn push_g_record_fixed(
+        &mut self,
+        z: &BitRecord<4>,
+        a: &BitRecord<4>,
+        b: &BitRecord<4>,
+    ) {
+        const LAST_WIDTH: usize = G_STRIDE - 3 * 64;
+        const LAST_MASK: u64 = (1u64 << LAST_WIDTH) - 1;
+
+        let shift = self.used;
+        debug_assert!(shift != 0 && shift & 1 == 1);
+        let right_shift = 64 - shift;
+        let z = z.words();
+        let a = a.words();
+        let b = b.words();
+        let z3 = z[3] & LAST_MASK;
+        let a3 = a[3] & LAST_MASK;
+        let b3 = b[3] & LAST_MASK;
+        let base = self.word;
+
+        self.store_at(
+            base,
+            self.pending_z | (z[0] << shift),
+            self.pending_a | (a[0] << shift),
+            self.pending_b | (b[0] << shift),
+        );
+        self.store_at(
+            base + 1,
+            (z[0] >> right_shift) | (z[1] << shift),
+            (a[0] >> right_shift) | (a[1] << shift),
+            (b[0] >> right_shift) | (b[1] << shift),
+        );
+        self.store_at(
+            base + 2,
+            (z[1] >> right_shift) | (z[2] << shift),
+            (a[1] >> right_shift) | (a[2] << shift),
+            (b[1] >> right_shift) | (b[2] << shift),
+        );
+        let tail_z = (z[2] >> right_shift) | (z3 << shift);
+        let tail_a = (a[2] >> right_shift) | (a3 << shift);
+        let tail_b = (b[2] >> right_shift) | (b3 << shift);
+        self.word = base + 3;
+
+        if shift >= 7 {
+            self.store_word(tail_z, tail_a, tail_b);
+            self.pending_z = z3 >> right_shift;
+            self.pending_a = a3 >> right_shift;
+            self.pending_b = b3 >> right_shift;
+            self.used = shift - 6;
+        } else {
+            self.pending_z = tail_z;
+            self.pending_a = tail_a;
+            self.pending_b = tail_b;
+            self.used = shift + LAST_WIDTH;
+        }
+    }
+}
+
+impl PackedAbWriter for PackedTripleWriter<'_> {
+    #[inline(always)]
+    fn push(&mut self, z: u64, a: u64, b: u64, width: usize) {
+        self.push_triple(z, a, b, width);
+    }
+
+    #[inline(always)]
+    fn push_g_record(
+        &mut self,
+        z: &BitRecord<4>,
+        a: &BitRecord<4>,
+        b: &BitRecord<4>,
+    ) {
+        self.push_g_record_fixed(z, a, b);
+    }
+
+    #[inline(always)]
+    fn position(&self) -> usize {
+        self.word * 64 + self.used
+    }
+
+    #[inline(always)]
+    fn overwrite_out_lo(&mut self, out_lo: &[u32; 8]) {
+        const OUT_LO_WORD: usize = OUT_LO_BASE / 64;
+        debug_assert_eq!(OUT_LO_BASE % 64, 0);
+        for i in 0..4 {
+            let value = (out_lo[2 * i] as u64) | ((out_lo[2 * i + 1] as u64) << 32);
+            self.store_at(OUT_LO_WORD + i, value, value, u64::MAX);
+        }
+    }
+
+    #[inline]
+    fn finish(mut self) {
+        const U64_PER_BLOCK: usize = K / 64;
+        if self.used != 0 {
+            self.store_word(self.pending_z, self.pending_a, self.pending_b);
+        }
+        debug_assert!(self.word <= U64_PER_BLOCK);
+        let remaining = U64_PER_BLOCK - self.word;
+        // SAFETY: `word..U64_PER_BLOCK` is the unwritten tail of each
+        // allocation established by `new_unchecked`.
+        unsafe {
+            self.z.add(self.word).write_bytes(0, remaining);
+            self.a.add(self.word).write_bytes(0, remaining);
+            self.b.add(self.word).write_bytes(0, remaining);
+        }
+    }
+}
+
 #[inline(always)]
-fn stream_lin_word(
-    value: u32,
-    z: &mut PackedWordWriter<'_>,
-    a: &mut PackedWordWriter<'_>,
-    b: &mut PackedWordWriter<'_>,
-) {
-    z.push(value as u64, 32);
-    a.push(value as u64, 32);
-    b.push(u32::MAX as u64, 32);
+fn stream_lin_word<W: PackedAbWriter>(value: u32, writer: &mut W) {
+    writer.push(value as u64, value as u64, u32::MAX as u64, 32);
 }
 
 /// Build the (z, a, b) blocks for ONE compression instance, into u64 views
@@ -1350,39 +1625,70 @@ fn build_block_witness_ab_stream_into(
     b: &mut [u64],
 ) {
     const U64_PER_BLOCK: usize = K / 64;
-    debug_assert_eq!(z.len(), U64_PER_BLOCK);
-    debug_assert_eq!(a.len(), U64_PER_BLOCK);
-    debug_assert_eq!(b.len(), U64_PER_BLOCK);
+    assert!(
+        z.len() == U64_PER_BLOCK
+            && a.len() == U64_PER_BLOCK
+            && b.len() == U64_PER_BLOCK,
+        "BLAKE3 packed blocks must each contain exactly {U64_PER_BLOCK} u64s"
+    );
+    // SAFETY: the single capacity check plus simultaneous mutable borrows prove
+    // the constructor's bounds and disjointness requirements.
+    let writer = unsafe { PackedTripleWriter::new_unchecked(z, a, b) };
+    build_block_witness_ab_stream_impl(cv, m, counter, block_len, flags, writer);
+}
 
-    let mut wz = PackedWordWriter::new(z);
-    let mut wa = PackedWordWriter::new(a);
-    let mut wb = PackedWordWriter::new(b);
+fn build_block_witness_ab_stream_scalar_into(
+    cv: &[u32; 8],
+    m: &[u32; 16],
+    counter: u64,
+    block_len: u32,
+    flags: u32,
+    z: &mut [u64],
+    a: &mut [u64],
+    b: &mut [u64],
+) {
+    const U64_PER_BLOCK: usize = K / 64;
+    assert!(
+        z.len() == U64_PER_BLOCK
+            && a.len() == U64_PER_BLOCK
+            && b.len() == U64_PER_BLOCK,
+        "BLAKE3 packed blocks must each contain exactly {U64_PER_BLOCK} u64s"
+    );
+    let writer = ScalarPackedAbWriter::new(z, a, b);
+    build_block_witness_ab_stream_impl(cv, m, counter, block_len, flags, writer);
+}
+
+#[inline(always)]
+fn build_block_witness_ab_stream_impl<W: PackedAbWriter>(
+    cv: &[u32; 8],
+    m: &[u32; 16],
+    counter: u64,
+    block_len: u32,
+    flags: u32,
+    mut writer: W,
+) {
 
     // Layout prefix: cv, then the aligned out_lo slot whose value is not known
     // until after the seven rounds.
     for &value in cv {
-        stream_lin_word(value, &mut wz, &mut wa, &mut wb);
+        stream_lin_word(value, &mut writer);
     }
     for _ in 0..8 {
-        wz.push(0, 32);
-        wa.push(0, 32);
-        wb.push(0, 32);
+        writer.push(0, 0, 0, 32);
     }
 
     // Constant pin, message, counter, length, and flags are contiguous.
-    wz.push(1, 1);
-    wa.push(1, 1);
-    wb.push(1, 1);
+    writer.push(1, 1, 1, 1);
     for &value in m {
-        stream_lin_word(value, &mut wz, &mut wa, &mut wb);
+        stream_lin_word(value, &mut writer);
     }
     let counter_lo = counter as u32;
     let counter_hi = (counter >> 32) as u32;
-    stream_lin_word(counter_lo, &mut wz, &mut wa, &mut wb);
-    stream_lin_word(counter_hi, &mut wz, &mut wa, &mut wb);
-    stream_lin_word(block_len, &mut wz, &mut wa, &mut wb);
-    stream_lin_word(flags, &mut wz, &mut wa, &mut wb);
-    debug_assert_eq!(wz.position(), GS_BASE);
+    stream_lin_word(counter_lo, &mut writer);
+    stream_lin_word(counter_hi, &mut writer);
+    stream_lin_word(block_len, &mut writer);
+    stream_lin_word(flags, &mut writer);
+    debug_assert_eq!(writer.position(), GS_BASE);
 
     let mut state: [u32; 16] = [
         cv[0],
@@ -1447,9 +1753,7 @@ fn build_block_witness_ab_stream_into(
             ra.push::<REC_LIN1>(d_new);
             rb.push::<REC_LIN1>(u32::MAX);
 
-            wz.push_record(&rz, G_STRIDE);
-            wa.push_record(&ra, G_STRIDE);
-            wb.push_record(&rb, G_STRIDE);
+            writer.push_g_record(&rz, &ra, &rb);
 
             state[la] = a_2;
             state[lb] = b_new;
@@ -1457,28 +1761,46 @@ fn build_block_witness_ab_stream_into(
             state[ld] = d_new;
         }
     }
-    debug_assert_eq!(wz.position(), OUT_HI_BASE);
+    debug_assert_eq!(writer.position(), OUT_HI_BASE);
 
     let out_lo: [u32; 8] = std::array::from_fn(|w| state[w] ^ state[w + 8]);
     for w in 0..8 {
-        stream_lin_word(state[w + 8] ^ cv[w], &mut wz, &mut wa, &mut wb);
+        stream_lin_word(state[w + 8] ^ cv[w], &mut writer);
     }
-    debug_assert_eq!(wz.position(), USEFUL_BITS);
-
-    wz.finish();
-    wa.finish();
-    wb.finish();
+    debug_assert_eq!(writer.position(), USEFUL_BITS);
 
     // OUT_LO_BASE is 256-bit aligned, so the four reserved words can be
     // replaced without touching neighboring rows.
-    const OUT_LO_WORD: usize = OUT_LO_BASE / 64;
-    debug_assert_eq!(OUT_LO_BASE % 64, 0);
-    for i in 0..4 {
-        let value = (out_lo[2 * i] as u64) | ((out_lo[2 * i + 1] as u64) << 32);
-        z[OUT_LO_WORD + i] = value;
-        a[OUT_LO_WORD + i] = value;
-        b[OUT_LO_WORD + i] = u64::MAX;
-    }
+    writer.overwrite_out_lo(&out_lo);
+    writer.finish();
+}
+
+type PackedBlockWriterFn = fn(
+    &[u32; 8],
+    &[u32; 16],
+    u64,
+    u32,
+    u32,
+    &mut [u64],
+    &mut [u64],
+    &mut [u64],
+);
+
+/// Restrict the fixed triple-record experiment to the promoted m=32 row-major
+/// geometry on the ranked target. `FLOCK_NO_BLAKE3_FIXED_G_WRITER=1` selects
+/// the original three generic writers in the same binary.
+#[inline]
+fn use_ranked_fixed_g_writer(n_blocks_log: usize) -> bool {
+    const RANKED_N_BLOCKS_LOG: usize = 32 - K_LOG;
+    static ENABLED: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        std::env::var_os("FLOCK_NO_BLAKE3_FIXED_G_WRITER").is_none()
+    });
+    cfg!(all(
+        target_os = "macos",
+        target_arch = "aarch64",
+        target_feature = "aes"
+    )) && n_blocks_log == RANKED_N_BLOCKS_LOG
+        && *ENABLED
 }
 
 /// **The fast path.** Produces `(z, a, b)` directly as F_{2^128}-packed
@@ -1600,10 +1922,15 @@ fn generate_witness_with_ab_packed_and_lincheck_impl(
     } else {
         USEFUL_BITS
     };
+    let build_block: PackedBlockWriterFn = if use_ranked_fixed_g_writer(n_blocks_log) {
+        build_block_witness_ab_stream_into
+    } else {
+        build_block_witness_ab_stream_scalar_into
+    };
     let per_block =
-        |block: &Compression, z_u64: &mut [u64], a_u64: &mut [u64], b_u64: &mut [u64]| {
+        move |block: &Compression, z_u64: &mut [u64], a_u64: &mut [u64], b_u64: &mut [u64]| {
             let (cv, m, t, bl, fl) = block;
-            build_block_witness_ab_stream_into(cv, m, *t, *bl, *fl, z_u64, a_u64, b_u64);
+            build_block(cv, m, *t, *bl, *fl, z_u64, a_u64, b_u64);
         };
     match rate2_codeword {
         Some(codeword) => {
@@ -2512,6 +2839,131 @@ mod tests {
             assert_eq!(a, a_ref);
             assert_eq!(b, b_ref);
         }
+    }
+
+    #[test]
+    fn fixed_triple_g_writer_matches_three_generic_writers_for_full_shift_cycle() {
+        fn random_g_record(rng: &mut Rng) -> BitRecord<4> {
+            let mut record = BitRecord::<4>::new();
+            record.push::<0>(rng.next_u32());
+            record.push::<32>(rng.next_u32());
+            record.push::<64>(rng.next_u32());
+            record.push::<96>(rng.next_u32());
+            record.push::<128>(rng.next_u32());
+            record.push::<160>(rng.next_u32());
+            record.push::<192>(rng.next_u32());
+            record.push::<224>(rng.next_u32() & ((1u32 << 26) - 1));
+            record
+        }
+
+        fn random_u64(rng: &mut Rng) -> u64 {
+            ((rng.next_u32() as u64) << 32) | rng.next_u32() as u64
+        }
+
+        let mut rng = Rng::new(0xF1_E0_250);
+
+        // G_STRIDE advances by -6 mod 64 from GS_BASE's offset 1, visiting
+        // every odd offset exactly once per 32-record cycle.
+        for offset in (1..64).step_by(2) {
+            for _ in 0..8 {
+                let rz = random_g_record(&mut rng);
+                let ra = random_g_record(&mut rng);
+                let rb = random_g_record(&mut rng);
+                let mask = (1u64 << offset) - 1;
+                let seed_z = random_u64(&mut rng) & mask;
+                let seed_a = random_u64(&mut rng) & mask;
+                let seed_b = random_u64(&mut rng) & mask;
+                let mut scalar_z = [u64::MAX; K / 64];
+                let mut scalar_a = [u64::MAX; K / 64];
+                let mut scalar_b = [u64::MAX; K / 64];
+                let mut triple_z = [u64::MAX; K / 64];
+                let mut triple_a = [u64::MAX; K / 64];
+                let mut triple_b = [u64::MAX; K / 64];
+                let mut scalar =
+                    ScalarPackedAbWriter::new(&mut scalar_z, &mut scalar_a, &mut scalar_b);
+                // SAFETY: the six arrays are distinct and have exact block capacity.
+                let mut triple = unsafe {
+                    PackedTripleWriter::new_unchecked(
+                        &mut triple_z,
+                        &mut triple_a,
+                        &mut triple_b,
+                    )
+                };
+                scalar.push(seed_z, seed_a, seed_b, offset);
+                triple.push_triple(seed_z, seed_a, seed_b, offset);
+
+                scalar.push_g_record(&rz, &ra, &rb);
+                triple.push_g_record_fixed(&rz, &ra, &rb);
+                assert_eq!(triple.position(), scalar.position(), "offset {offset}");
+                assert_eq!(triple.word, scalar.z.word, "offset {offset}");
+                assert_eq!(triple.pending_z, scalar.z.pending, "offset {offset}");
+                assert_eq!(triple.pending_a, scalar.a.pending, "offset {offset}");
+                assert_eq!(triple.pending_b, scalar.b.pending, "offset {offset}");
+                assert_eq!(triple.used, scalar.z.used, "offset {offset}");
+                // SAFETY: constructor capacity and `triple.word` bound these views.
+                unsafe {
+                    assert_eq!(
+                        std::slice::from_raw_parts(triple.z, triple.word),
+                        &scalar.z.out[..scalar.z.word],
+                        "z offset {offset}"
+                    );
+                    assert_eq!(
+                        std::slice::from_raw_parts(triple.a, triple.word),
+                        &scalar.a.out[..scalar.a.word],
+                        "a offset {offset}"
+                    );
+                    assert_eq!(
+                        std::slice::from_raw_parts(triple.b, triple.word),
+                        &scalar.b.out[..scalar.b.word],
+                        "b offset {offset}"
+                    );
+                }
+
+                scalar.finish();
+                triple.finish();
+                assert_eq!(triple_z, scalar_z, "z offset {offset}");
+                assert_eq!(triple_a, scalar_a, "a offset {offset}");
+                assert_eq!(triple_b, scalar_b, "b offset {offset}");
+            }
+        }
+
+        // Exercise two complete cycles so each append consumes the previous
+        // append's pending triple.
+        let mut scalar_z = [u64::MAX; K / 64];
+        let mut scalar_a = [u64::MAX; K / 64];
+        let mut scalar_b = [u64::MAX; K / 64];
+        let mut triple_z = [u64::MAX; K / 64];
+        let mut triple_a = [u64::MAX; K / 64];
+        let mut triple_b = [u64::MAX; K / 64];
+        let mut scalar = ScalarPackedAbWriter::new(&mut scalar_z, &mut scalar_a, &mut scalar_b);
+        // SAFETY: the six arrays are distinct and have exact block capacity.
+        let mut triple = unsafe {
+            PackedTripleWriter::new_unchecked(&mut triple_z, &mut triple_a, &mut triple_b)
+        };
+        scalar.push(1, 0, 1, GS_BASE % 64);
+        triple.push_triple(1, 0, 1, GS_BASE % 64);
+        for record_idx in 0..64 {
+            let rz = random_g_record(&mut rng);
+            let ra = random_g_record(&mut rng);
+            let rb = random_g_record(&mut rng);
+            scalar.push_g_record(&rz, &ra, &rb);
+            triple.push_g_record_fixed(&rz, &ra, &rb);
+            assert_eq!(
+                triple.position(),
+                scalar.position(),
+                "record {record_idx}"
+            );
+            assert_eq!(triple.word, scalar.z.word, "record {record_idx}");
+            assert_eq!(triple.pending_z, scalar.z.pending, "record {record_idx}");
+            assert_eq!(triple.pending_a, scalar.a.pending, "record {record_idx}");
+            assert_eq!(triple.pending_b, scalar.b.pending, "record {record_idx}");
+            assert_eq!(triple.used, scalar.z.used, "record {record_idx}");
+        }
+        scalar.finish();
+        triple.finish();
+        assert_eq!(triple_z, scalar_z);
+        assert_eq!(triple_a, scalar_a);
+        assert_eq!(triple_b, scalar_b);
     }
 
     /// The fused generator produces (z, a, b) byte-identical to
