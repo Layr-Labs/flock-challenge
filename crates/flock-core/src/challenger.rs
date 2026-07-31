@@ -396,7 +396,13 @@ impl Challenger for FsChallenger {
         // task dispatch and to let the BLAKE3 batch run many `hash_many` calls
         // per task, small enough to keep cancellation granular once an earlier
         // task has found a match.
-        const GRIND_CHUNK: u64 = 1 << 10;
+        // Twenty complete 48-nonce BLAKE3 batches: no ragged SIMD batch at a
+        // chunk boundary, while remaining close to the proven 1 Ki nonce
+        // scheduling granularity. SHA-256 retains its established chunk.
+        let grind_chunk = match kind {
+            HashKind::Blake3 => 960,
+            HashKind::Sha256 => 1 << 10,
+        };
         let nonce = if bits == 0 {
             0
         } else if (1u64 << bits.min(63)) < PARALLEL_GRIND_MIN_HASHES {
@@ -405,10 +411,10 @@ impl Challenger for FsChallenger {
             // given, so scanning blocks in order yields the globally smallest.
             let mut start: u64 = 0;
             loop {
-                if let Some(n) = pow_scan(&state_digest, start, GRIND_CHUNK, bits, kind) {
+                if let Some(n) = pow_scan(&state_digest, start, grind_chunk, bits, kind) {
                     break n;
                 }
-                start = start.saturating_add(GRIND_CHUNK);
+                start = start.saturating_add(grind_chunk);
             }
         } else {
             // Block-parallel search. Blocks are scanned in order and each task
@@ -420,7 +426,7 @@ impl Challenger for FsChallenger {
             // `+2` block caused (which left ~¾ of threads doing cancelled work).
             use rayon::prelude::*;
             let block: u64 = 1 << (bits.min(24) + 1);
-            let n_chunks = block.div_ceil(GRIND_CHUNK);
+            let n_chunks = block.div_ceil(grind_chunk);
             let mut start: u64 = 0;
             loop {
                 // `find_first` takes the earliest *chunk* that yields a match
@@ -433,8 +439,8 @@ impl Challenger for FsChallenger {
                     .map(|c| {
                         pow_scan(
                             &state_digest,
-                            start.saturating_add(c * GRIND_CHUNK),
-                            GRIND_CHUNK,
+                            start.saturating_add(c * grind_chunk),
+                            grind_chunk,
                             bits,
                             kind,
                         )
@@ -556,12 +562,11 @@ fn pow_has_leading_zero_bits(
 
 /// Nonces hashed per `hash_many` call in the BLAKE3 grind.
 ///
-/// Must clear the widest `simd_degree` (16, under AVX-512) so the batch fills
-/// the machine's vector; 32 leaves headroom and keeps the buffers (2 KiB of
-/// pre-images + 1 KiB of digests) stack-resident. Swept 1/4/8/16/32/64 on an
-/// M4 Max: 1 is ~2.2× slower at 17 bits, everything from 4 up is within noise
-/// of each other.
-const BLAKE3_POW_BATCH: usize = 32;
+/// A common multiple of the Apple twelve-way kernel and AVX-512's 16-lane
+/// SIMD degree. This avoids the 8-lane fallback tail that a 32-nonce batch
+/// leaves after two complete Apple groups. The 3 KiB pre-image and 1.5 KiB
+/// digest buffers remain stack-resident.
+const BLAKE3_POW_BATCH: usize = 48;
 
 /// Smallest nonce in `start .. start + len` whose BLAKE3 PoW hash has `bits`
 /// leading zeros, or `None`.
