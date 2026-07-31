@@ -20,6 +20,40 @@
 pub mod bits;
 pub mod challenger;
 pub(crate) mod epool;
+/// Narrow prover-only access to the heterogeneous helper queue. This is not a
+/// general epool API; protocol code must keep its chunk ownership local.
+#[doc(hidden)]
+pub mod prover_support {
+    /// Whether the platform supplied an efficiency-core helper pool.
+    #[inline]
+    pub fn helper_pool_available() -> bool {
+        super::epool::epool().is_some()
+    }
+
+    /// Drain deterministic chunk claims using the main Rayon pool and, when
+    /// available, the helper pool. The call returns only after both drainers
+    /// have joined.
+    #[inline]
+    pub fn run_hetero_chunks<F>(n_chunks: usize, f: F)
+    where
+        F: Fn(usize) + Sync,
+    {
+        super::epool::run_hetero_chunks(n_chunks, f);
+    }
+
+    /// Explicit-helper variant for prover tests on hosts without E-cores.
+    #[doc(hidden)]
+    #[inline]
+    pub fn run_hetero_chunks_with_helper<F>(
+        n_chunks: usize,
+        f: &F,
+        helper: Option<&rayon::ThreadPool>,
+    ) where
+        F: Fn(usize) + Sync,
+    {
+        super::epool::run_chunks_with_helper(n_chunks, f, helper);
+    }
+}
 pub mod field;
 pub mod hash;
 pub mod lincheck;
