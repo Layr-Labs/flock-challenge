@@ -320,36 +320,25 @@ fn ranked_ntt_with_pipelined_leaves(
     ntt: &AdditiveNttF128,
     codeword: &mut [F128],
     params: &PcsParams,
-    tree: &mut [Hash],
+    leaves: &mut [Hash],
     helper: &rayon::ThreadPool,
-) -> usize {
+    pass1_msg: Option<&[F128]>,
+) {
     use rayon::prelude::*;
     use std::sync::Mutex;
     use std::sync::mpsc::{TrySendError, sync_channel};
 
     let num_ntts = params.num_ntts();
-    assert_eq!(num_ntts, 64);
-    let num_leaves = codeword.len() / num_ntts;
-    assert_eq!(tree.len(), 2 * num_leaves - 1);
-    // Stop at four roots (128 contiguous bytes) per 1,024-leaf job. These eight
-    // local levels cover 1,020 of each subtree's 1,023 parent nodes while
-    // leaving the shared top for the level-wide builder.
-    const LOCAL_PARENT_LEVELS: usize = 8;
-    let local_parent_levels = if std::env::var_os("FLOCK_NO_MERKLE_SUBTREE_PARENTS").is_some() {
-        0
-    } else {
-        LOCAL_PARENT_LEVELS
-    };
+    debug_assert_eq!(num_ntts, 64);
+    debug_assert_eq!(leaves.len(), codeword.len() / num_ntts);
     let codeword_base = crate::epool::SyncPtr(codeword.as_mut_ptr());
-    let tree_base = crate::epool::SyncPtr(tree.as_mut_ptr());
+    let leaves_base = crate::epool::SyncPtr(leaves.as_mut_ptr());
 
     let hash_job = |job: RankedLeafJob| {
-        assert_eq!(job.elem_offset % num_ntts, 0);
-        assert_eq!(job.elem_len % num_ntts, 0);
+        debug_assert_eq!(job.elem_offset % num_ntts, 0);
+        debug_assert_eq!(job.elem_len % num_ntts, 0);
         let leaf_start = job.elem_offset / num_ntts;
         let leaf_len = job.elem_len / num_ntts;
-        assert_eq!(leaf_start % (1 << local_parent_levels), 0);
-        assert_eq!(leaf_len % (1 << local_parent_levels), 0);
         // SAFETY: the NTT publishes a job only after the corresponding mutable
         // subtree is finalized and never touched again. Every subtree is
         // published exactly once; offsets are disjoint and cover the codeword,
@@ -363,32 +352,8 @@ fn ranked_ntt_with_pipelined_leaves(
                 elems.as_ptr().cast::<u8>(),
                 core::mem::size_of_val(elems),
             );
-            let outs = core::slice::from_raw_parts_mut(tree_base.ptr().add(leaf_start), leaf_len);
+            let outs = core::slice::from_raw_parts_mut(leaves_base.ptr().add(leaf_start), leaf_len);
             merkle::hash_ranked_blake3_leaf_chunk(bytes, outs);
-
-            // Build the aligned local subtree while its leaf range is still
-            // hot. At every level, different jobs own disjoint read and write
-            // ranges. Only the small shared top remains after the job barrier.
-            let mut read_level_start = 0usize;
-            let mut read_level_len = num_leaves;
-            let mut local_start = leaf_start;
-            let mut local_len = leaf_len;
-            for _ in 0..local_parent_levels {
-                let write_level_start = read_level_start + read_level_len;
-                let write_start = write_level_start + (local_start >> 1);
-                let write_len = local_len >> 1;
-                let read = core::slice::from_raw_parts(
-                    tree_base.ptr().add(read_level_start + local_start),
-                    local_len,
-                );
-                let write =
-                    core::slice::from_raw_parts_mut(tree_base.ptr().add(write_start), write_len);
-                merkle::hash_ranked_blake3_parent_chunk(read, write);
-                read_level_start = write_level_start;
-                read_level_len >>= 1;
-                local_start >>= 1;
-                local_len >>= 1;
-            }
         }
     };
 
@@ -407,11 +372,25 @@ fn ranked_ntt_with_pipelined_leaves(
         && std::env::var_os("FLOCK_NO_NTT_TOP_EPOOL").is_none()
         && std::env::var_os("FLOCK_NTT_BLOCK_REGIONS").is_none();
     if split_ranked_top {
-        ntt.forward_transform_interleaved_ranked_top_from_layer(
-            codeword,
-            num_ntts,
-            params.log_inv_rate,
-        );
+        match pass1_msg {
+            // Codeword arrives uninitialized: the first radix-8 pass reads the
+            // packed message directly and writes every codeword element.
+            Some(msg) => ntt.forward_transform_interleaved_ranked_top_from_message(
+                msg,
+                codeword,
+                num_ntts,
+                params.log_inv_rate,
+            ),
+            None => ntt.forward_transform_interleaved_ranked_top_from_layer(
+                codeword,
+                num_ntts,
+                params.log_inv_rate,
+            ),
+        }
+    } else if let Some(msg) = pass1_msg {
+        // The top split is disabled; restore the replica precondition the
+        // unsplit transform expects.
+        replicate_message_fill(codeword, msg);
     }
 
     std::thread::scope(|scope| {
@@ -469,12 +448,51 @@ fn ranked_ntt_with_pipelined_leaves(
             .join()
             .expect("ranked NTT-to-Merkle helper manager panicked");
     });
-    local_parent_levels
+}
+
+/// Commit from the packed message and an **uninitialized** codeword buffer:
+/// the ranked top NTT's first radix-8 pass reads `z_packed` directly and
+/// writes every codeword element, so the rate-1/2 replica copies are never
+/// materialized (neither by the caller nor here). Falls back to
+/// [`replicate_message_fill`] + the ordinary path whenever the ranked top
+/// split is unavailable, or under `FLOCK_NO_NTT_PASS1_FROM_Z=1` (the exact
+/// A/B control).
+pub fn commit_from_message_hot(
+    z_packed: &[F128],
+    mut codeword: Vec<F128>,
+    params: &PcsParams,
+) -> (Commitment, ProverData) {
+    params.validate();
+    assert_eq!(z_packed.len(), 1usize << params.log_msg_len());
+    let codeword_len = params.n_positions() * params.num_ntts();
+    assert_eq!(
+        codeword.len(),
+        codeword_len,
+        "commit_from_message_hot: codeword buffer has wrong length"
+    );
+    if std::env::var_os("FLOCK_NO_NTT_PASS1_FROM_Z").is_none() {
+        finalize_commit_from(codeword, params, Some(z_packed))
+    } else {
+        replicate_message_fill(&mut codeword, z_packed);
+        finalize_commit(codeword, params)
+    }
 }
 
 /// Shared tail of [`commit`] / [`commit_into`]: interleaved forward additive
 /// NTT (RS-encode every lane) then the initial Merkle tree over codeword rows.
-fn finalize_commit(mut codeword: Vec<F128>, params: &PcsParams) -> (Commitment, ProverData) {
+fn finalize_commit(codeword: Vec<F128>, params: &PcsParams) -> (Commitment, ProverData) {
+    finalize_commit_from(codeword, params, None)
+}
+
+/// [`finalize_commit`] with an optional message source for the ranked top
+/// NTT's first pass (see [`commit_from_message_hot`]). With `Some(msg)` the
+/// codeword may be entirely uninitialized; every fallback branch restores the
+/// replica precondition before running the unsplit transform.
+fn finalize_commit_from(
+    mut codeword: Vec<F128>,
+    params: &PcsParams,
+    pass1_msg: Option<&[F128]>,
+) -> (Commitment, ProverData) {
     let helper = if use_ranked_ntt_merkle_leaf_pipeline(params) && rayon::current_num_threads() > 1
     {
         crate::epool::epool()
@@ -493,21 +511,26 @@ fn finalize_commit(mut codeword: Vec<F128>, params: &PcsParams) -> (Commitment, 
     });
     let timing = std::env::var_os("FLOCK_COMMIT_TIMING").is_some();
     let t_ntt = std::time::Instant::now();
-    let mut prehashed_parent_levels = 0usize;
     // ---- Interleaved forward additive NTT: 2^log_batch_size independent
     // sub-NTTs with shared twiddles. Each sub-NTT operates on its lane of the
     // SoA buffer. The first `log_inv_rate` layers were pre-applied by the
     // caller's replicate-fill (commit_into), so start past them.
     let ntt = AdditiveNttF128::standard(params.k_code());
     if let (Some(helper), Some(tree)) = (helper, prehashed_tree.as_mut()) {
-        prehashed_parent_levels = ranked_ntt_with_pipelined_leaves(
+        ranked_ntt_with_pipelined_leaves(
             &ntt,
             &mut codeword,
             params,
-            tree,
+            &mut tree[..params.n_leaves()],
             helper,
+            pass1_msg,
         );
     } else {
+        if let Some(msg) = pass1_msg {
+            // No pipelined-leaves path: restore the replica precondition the
+            // unsplit transform expects before running it.
+            replicate_message_fill(&mut codeword, msg);
+        }
         ntt.forward_transform_interleaved_from_layer(
             &mut codeword,
             params.num_ntts(),
@@ -531,12 +554,7 @@ fn finalize_commit(mut codeword: Vec<F128>, params: &PcsParams) -> (Commitment, 
     // row-batch lanes (num_ntts F_{2^128} values = 2^log_batch_size). This is
     // Ligerito's L0 commitment.
     let merkle_tree = if let Some(tree) = prehashed_tree {
-        merkle::merkle_tree_from_prehashed_level(
-            tree,
-            params.n_leaves(),
-            params.merkle_hash,
-            prehashed_parent_levels,
-        )
+        merkle::merkle_tree_from_prehashed_leaves(tree, params.n_leaves(), params.merkle_hash)
     } else {
         // Zero-copy: F128 is repr(C, align(16)) with two u64s laid out
         // little-endian, matching the canonical leaf serialization.
@@ -779,18 +797,18 @@ mod tests {
             .unwrap();
         let mut got_codeword = source;
         let mut got_tree = vec![[0u8; 32]; 2 * params.n_leaves() - 1];
-        let prehashed_parent_levels = ranked_ntt_with_pipelined_leaves(
+        ranked_ntt_with_pipelined_leaves(
             &ntt,
             &mut got_codeword,
             &params,
-            &mut got_tree,
+            &mut got_tree[..params.n_leaves()],
             &helper,
+            None,
         );
-        let got_tree = merkle::merkle_tree_from_prehashed_level(
+        let got_tree = merkle::merkle_tree_from_prehashed_leaves(
             got_tree,
             params.n_leaves(),
             HashKind::Blake3,
-            prehashed_parent_levels,
         );
 
         assert_eq!(got_codeword, expect_codeword);

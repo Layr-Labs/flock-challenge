@@ -1728,6 +1728,19 @@ impl Blake3Setup {
         }
     }
 
+    /// On top of the ranked rate-2 geometry, start the commit NTT's first
+    /// radix-8 pass directly from `z_packed`: the witness workers skip the
+    /// two 512 MiB replica stores entirely and the commit's first pass reads
+    /// the message once for both codeword halves.
+    /// `FLOCK_NO_NTT_PASS1_FROM_Z=1` is the exact A/B control (it restores
+    /// the replicate-fill path inside `commit_from_message_hot`; this gate
+    /// also honors it so the witness-side stores return in the same run).
+    #[inline]
+    fn use_ranked_pass1_from_z(&self) -> bool {
+        self.use_ranked_rate2_hot_codeword()
+            && std::env::var_os("FLOCK_NO_NTT_PASS1_FROM_Z").is_none()
+    }
+
     /// Take the codeword before witness generation, then let row workers write
     /// both rate-1/2 replicas. On the timed proof this normally comes from the
     /// warm proof's resident scratch pool; on a cold miss, these P-core writes
@@ -1847,6 +1860,25 @@ impl Blake3Setup {
         challenger: &mut Ch,
     ) -> (flock_core::proof::R1csProofLigerito, Commitment, R1csClaim) {
         assert_eq!(blocks.len(), self.n_blocks);
+        if self.use_ranked_pass1_from_z() {
+            // Uninitialized (pool-warm) codeword; witness gen writes no
+            // replicas and the commit's first NTT pass reads z directly.
+            let codeword = flock_core::scratch::take_f128(self.pcs_params.codeword_len_f128());
+            let (z_packed, a_packed_f128, b_packed_f128, z_packed_lincheck) =
+                self.generate_witness_ab(blocks);
+            let lc_circuit = self.lincheck_circuit();
+            return crate::prover::prove_fast_ligerito_from_message_codeword(
+                &self.r1cs,
+                &self.pcs_params,
+                z_packed,
+                a_packed_f128,
+                b_packed_f128,
+                z_packed_lincheck,
+                lc_circuit,
+                codeword,
+                challenger,
+            );
+        }
         if self.use_ranked_rate2_hot_codeword() {
             let (codeword, (z_packed, a_packed_f128, b_packed_f128, z_packed_lincheck)) =
                 self.generate_witness_ab_with_rate2_codeword(blocks);

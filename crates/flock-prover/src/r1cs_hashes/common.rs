@@ -370,10 +370,12 @@ where
     let mut b = flock_core::scratch::take_f128(total_f128);
     let mut z_lincheck = flock_core::scratch::take_u8((n_total / 8) * k);
 
+    let wit_t0 = std::env::var_os("FLOCK_WIT_TIMING").map(|_| std::time::Instant::now());
     z.par_chunks_mut(8 * f128_per_block)
         .zip(a.par_chunks_mut(8 * f128_per_block))
         .zip(b.par_chunks_mut(8 * f128_per_block))
         .zip(z_lincheck.par_chunks_mut(k))
+        .with_max_len(256)
         .enumerate()
         .for_each(|(g, (((z_grp, a_grp), b_grp), stripe))| {
             // Ordinary per-block builders OR 1-bits into pre-zeroed words; any
@@ -472,6 +474,9 @@ where
                 }
             }
         });
+    if let Some(t0) = wit_t0 {
+        eprintln!("[wit] parallel witness region: {:.3} ms", t0.elapsed().as_secs_f64() * 1e3);
+    }
 
     (z, a, b, z_lincheck)
 }
