@@ -1166,6 +1166,49 @@ pub fn fold_and_compute_round_pair_into(
     let eq_lo = &eq.lo;
     let eq_hi = &eq.hi;
 
+    // Ranked AArch64 path: drain the per-`x_hi` chunks through the shared
+    // heterogeneous queue so the otherwise-idle efficiency cores contribute
+    // during the multilinear tail (`FLOCK_NO_ZC_TAIL_EPOOL=1` restores the
+    // plain main-pool schedule). Byte-identical output either way: each
+    // chunk is written by exactly one worker and the eq_hi-scaled partial
+    // sums reduce in fixed chunk order (F128 addition is exact XOR).
+    #[cfg(target_arch = "aarch64")]
+    if std::env::var_os("FLOCK_NO_ZC_TAIL_EPOOL").is_none() {
+        let mut partials: Vec<(F128, F128)> = vec![(F128::ZERO, F128::ZERO); hi_size];
+        let a_out_base = crate::epool::SyncPtr(a_out.as_mut_ptr());
+        let b_out_base = crate::epool::SyncPtr(b_out.as_mut_ptr());
+        let partials_base = crate::epool::SyncPtr(partials.as_mut_ptr());
+        crate::epool::run_hetero_chunks(hi_size, |x_hi| {
+            // SAFETY: chunk `x_hi` exclusively owns its `chunk_out` output
+            // ranges and `partials[x_hi]`; the queue join publishes writes.
+            let (ac, bc) = unsafe {
+                (
+                    std::slice::from_raw_parts_mut(
+                        a_out_base.ptr().add(x_hi * chunk_out),
+                        chunk_out,
+                    ),
+                    std::slice::from_raw_parts_mut(
+                        b_out_base.ptr().add(x_hi * chunk_out),
+                        chunk_out,
+                    ),
+                )
+            };
+            let a_in = &a[x_hi * chunk_in..(x_hi + 1) * chunk_in];
+            let b_in = &b[x_hi * chunk_in..(x_hi + 1) * chunk_in];
+            let (p1, pinf) = fold_and_message_aarch64(a_in, b_in, ac, bc, r_fold, eq_lo);
+            let eq_h = eq_hi[x_hi];
+            unsafe {
+                *partials_base.ptr().add(x_hi) = (eq_h * p1, eq_h * pinf);
+            }
+        });
+        let (sum1, sum_inf) = partials
+            .iter()
+            .fold((F128::ZERO, F128::ZERO), |(s1, sinf), &(c1, cinf)| {
+                (s1 + c1, sinf + cinf)
+            });
+        return (r_next[0] * sum1, sum_inf);
+    }
+
     let (sum1, sum_inf) = a_out
         .par_chunks_mut(chunk_out)
         .zip(b_out.par_chunks_mut(chunk_out))
