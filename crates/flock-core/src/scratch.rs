@@ -160,6 +160,82 @@ pub fn prewarm_prover(m: usize) {
 pub fn clear() {
     POOL.lock().unwrap().clear();
     POOL_U8.lock().unwrap().clear();
+    POOL_HASH.lock().unwrap().clear();
+}
+
+// ---------------------------------------------------------------------------
+// Hash-buffer pool (Merkle trees: L0 ≈ 64 MiB at ranked m=32, plus recursive
+// Ligerito levels). Same munmap / soft-fault pathology as the F128 pool: the
+// flat tree is allocated every prove, fully written, then dropped when
+// `ProverData` / `LigeroWitness` go out of scope — a single-threaded unmap
+// inside the timed window and ~16k soft faults on the next prove. Contents
+// are NOT cleared; callers write every node before reading (leaf then parent
+// levels). `FLOCK_NO_HASH_POOL=1` disables pooling so the same binary can A/B
+// against fresh `alloc_uninit_vec` trees.
+
+/// 32-byte Merkle digest; matches [`crate::merkle::Hash`] without importing
+/// that module (avoids a scratch↔merkle edge).
+pub type PooledHash = [u8; 32];
+
+static POOL_HASH: Mutex<Vec<Vec<PooledHash>>> = Mutex::new(Vec::new());
+
+/// L0 tree + a few recursive-level trees + spare. Keep small: each ranked L0
+/// buffer is 64 MiB.
+const MAX_POOLED_HASH: usize = 6;
+
+fn hash_pool_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("FLOCK_NO_HASH_POOL").is_none())
+}
+
+/// Take a length-`n` hash vector, preferring a pooled buffer (smallest
+/// capacity ≥ `n`); falls back to a fresh uninitialized allocation.
+/// Contents are UNINITIALIZED (write-before-read), same as [`take_f128`].
+pub fn take_hash(n: usize) -> Vec<PooledHash> {
+    if hash_pool_enabled() {
+        if let Some(v) = try_take_hash(n) {
+            return v;
+        }
+    }
+    crate::alloc_uninit_vec(n)
+}
+
+fn try_take_hash(n: usize) -> Option<Vec<PooledHash>> {
+    let mut pool = POOL_HASH.lock().unwrap();
+    let mut best: Option<usize> = None;
+    for (i, v) in pool.iter().enumerate() {
+        if v.capacity() >= n && best.is_none_or(|b| v.capacity() < pool[b].capacity()) {
+            best = Some(i);
+        }
+    }
+    if let Some(i) = best {
+        let mut v = pool.swap_remove(i);
+        drop(pool);
+        v.clear();
+        // SAFETY: capacity ≥ n; PooledHash is Copy, write-before-read contract.
+        unsafe { v.set_len(n) };
+        return Some(v);
+    }
+    None
+}
+
+/// Return a hash buffer to the pool (smallest-first eviction when full).
+pub fn give_hash(v: Vec<PooledHash>) {
+    if v.capacity() == 0 || !hash_pool_enabled() {
+        return;
+    }
+    let mut pool = POOL_HASH.lock().unwrap();
+    pool.push(v);
+    if pool.len() > MAX_POOLED_HASH {
+        let smallest = pool
+            .iter()
+            .enumerate()
+            .min_by_key(|(_, v)| v.capacity())
+            .map(|(i, _)| i)
+            .expect("pool non-empty");
+        pool.swap_remove(smallest);
+    }
 }
 
 // ---------------------------------------------------------------------------

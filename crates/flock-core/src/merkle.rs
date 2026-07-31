@@ -673,10 +673,11 @@ pub fn merkle_tree(data: &[u8], num_leaves: usize, kind: HashKind) -> Vec<Hash> 
 
     let leaf_size = data.len() / num_leaves;
     let total_nodes = 2 * num_leaves - 1;
-    // Uninit alloc — every node is written exactly once before being read:
-    // leaves at step 1, then each internal level reads the level below (which
-    // was just written) and writes itself.
-    let mut tree: Vec<Hash> = crate::alloc_uninit_vec(total_nodes);
+    // Prefer the process-global hash pool (warm-up prove faults the ranked
+    // 64 MiB L0 tree once; timed proves reuse it). Every node is still
+    // written exactly once before being read: leaves at step 1, then each
+    // internal level reads the level below and writes itself.
+    let mut tree: Vec<Hash> = crate::scratch::take_hash(total_nodes);
 
     // 1. Leaves — fully parallel, SIMD-batched across leaves where possible.
     hash_leaves(data, leaf_size, &mut tree[..num_leaves], kind);
@@ -722,7 +723,7 @@ pub fn merkle_tree_sequential(data: &[u8], num_leaves: usize, kind: HashKind) ->
 
     let leaf_size = data.len() / num_leaves;
     let total_nodes = 2 * num_leaves - 1;
-    let mut tree: Vec<Hash> = crate::alloc_uninit_vec(total_nodes);
+    let mut tree: Vec<Hash> = crate::scratch::take_hash(total_nodes);
 
     for (i, leaf) in data.chunks(leaf_size).enumerate() {
         tree[i] = hash_leaf(leaf, kind);
