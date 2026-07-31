@@ -185,6 +185,182 @@ unsafe fn butterfly_fused_3layer_row_with_q(
     }
 }
 
+/// Vector-resident rate-1/2 first-pass row kernel with staged streaming
+/// stores. Loads the radix-8 row group from `src` once, evaluates both
+/// layer-1 blocks' fused-3 butterflies on those registers (zero-root set for
+/// `dst0`, general set for `dst1`), staging all outputs in two L1-resident
+/// stack tiles, then emits every destination row's lane run as one
+/// contiguous `stnp` burst.
+///
+/// The staging exists for the store microarchitecture, not the arithmetic:
+/// per-lane scatter stores interleave sixteen 16 B streams spaced 64 MiB
+/// apart, which defeats the streaming-store detector and pays a full RFO
+/// read on ~1 GiB of destination lines (measured −4% end-to-end, note
+/// `516b4da`). Sequential 1 KiB non-temporal bursts per row restore the
+/// fill-like store behavior the replicate path enjoyed.
+///
+/// # Safety
+/// Row/lane geometry valid for all three pointers, disjoint row groups
+/// across concurrent calls, `num_ntts ≤ 64`, 16 B-aligned destinations, and
+/// `t_zero[0] == t_zero[1] == t_zero[3] == 0`.
+#[target_feature(enable = "aes")]
+#[allow(clippy::too_many_arguments)]
+pub(super) unsafe fn butterfly_fused_3layer_dual_from_src_row(
+    src: *const F128,
+    dst0: *mut F128,
+    dst1: *mut F128,
+    eighth: usize,
+    num_ntts: usize,
+    r: usize,
+    t_zero: &[F128; 7],
+    t_gen: &[F128; 7],
+) {
+    use core::arch::aarch64::*;
+
+    #[inline(always)]
+    fn nt_bursts() -> bool {
+        use std::sync::OnceLock;
+        static ON: OnceLock<bool> = OnceLock::new();
+        // Diagnostics toggle while pricing the burst store flavor:
+        // FLOCK_FROM_MSG_PLAIN_ST=1 uses ordinary vector stores.
+        *ON.get_or_init(|| std::env::var_os("FLOCK_FROM_MSG_PLAIN_ST").is_none())
+    }
+
+    #[inline(always)]
+    unsafe fn store_pair_nt(dst: *mut F128, x: uint64x2_t, y: uint64x2_t) {
+        // Best-effort non-temporal pair hint; same idiom as the zerocheck
+        // fold kernels' `stnp` arm.
+        unsafe {
+            core::arch::asm!(
+                "stnp {x:q}, {y:q}, [{dst}]",
+                dst = in(reg) dst,
+                x = in(vreg) x,
+                y = in(vreg) y,
+                options(nostack, preserves_flags),
+            );
+        }
+    }
+
+    unsafe {
+        debug_assert_eq!(t_zero[0], F128::ZERO);
+        debug_assert_eq!(t_zero[1], F128::ZERO);
+        debug_assert_eq!(t_zero[3], F128::ZERO);
+        debug_assert!(num_ntts <= 64 && num_ntts.is_multiple_of(2));
+
+        let z2 = vld1q_u64((&raw const t_zero[2]).cast::<u64>());
+        let z4 = vld1q_u64((&raw const t_zero[4]).cast::<u64>());
+        let z5 = vld1q_u64((&raw const t_zero[5]).cast::<u64>());
+        let z6 = vld1q_u64((&raw const t_zero[6]).cast::<u64>());
+        let g: [uint64x2_t; 7] =
+            core::array::from_fn(|i| vld1q_u64((&raw const t_gen[i]).cast::<u64>()));
+
+        // Two 8 KiB staging tiles (8 rows × ≤64 lanes × 16 B): L1-resident,
+        // written per lane, read back once for the sequential row bursts.
+        let mut stage0 = [F128 { lo: 0, hi: 0 }; 512];
+        let mut stage1 = [F128 { lo: 0, hi: 0 }; 512];
+
+        let off = r * num_ntts;
+        let step = eighth * num_ntts;
+        for lane in 0..num_ntts {
+            let src_base = src.add(off + lane);
+            let loaded: [uint64x2_t; 8] =
+                core::array::from_fn(|i| vld1q_u64(src_base.add(i * step).cast::<u64>()));
+
+            // Block 0: zero-root chain (mirrors
+            // `butterfly_fused_3layer_zero_root_row`, but keeps v[0]).
+            {
+                let mut v = loaded;
+                for i in 0..4 {
+                    v[i + 4] = butterfly_zero_q(v[i], v[i + 4]);
+                }
+                for i in 0..2 {
+                    v[i + 2] = butterfly_zero_q(v[i], v[i + 2]);
+                }
+                let (a, b) = butterfly_q(v[4], v[6], z2);
+                v[4] = a;
+                v[6] = b;
+                let (a, b) = butterfly_q(v[5], v[7], z2);
+                v[5] = a;
+                v[7] = b;
+                v[1] = butterfly_zero_q(v[0], v[1]);
+                let (a, b) = butterfly_q(v[2], v[3], z4);
+                v[2] = a;
+                v[3] = b;
+                let (a, b) = butterfly_q(v[4], v[5], z5);
+                v[4] = a;
+                v[5] = b;
+                let (a, b) = butterfly_q(v[6], v[7], z6);
+                v[6] = a;
+                v[7] = b;
+                for (i, value) in v.iter().enumerate() {
+                    vst1q_u64(
+                        stage0.as_mut_ptr().add(i * num_ntts + lane).cast::<u64>(),
+                        *value,
+                    );
+                }
+            }
+
+            // Block 1: general chain (mirrors `butterfly_fused_3layer_row`).
+            {
+                let mut v = loaded;
+                for i in 0..4 {
+                    let (a, b) = butterfly_q(v[i], v[i + 4], g[0]);
+                    v[i] = a;
+                    v[i + 4] = b;
+                }
+                for s in 0..2 {
+                    for i in 0..2 {
+                        let (u, w) = (4 * s + i, 4 * s + i + 2);
+                        let (a, b) = butterfly_q(v[u], v[w], g[1 + s]);
+                        v[u] = a;
+                        v[w] = b;
+                    }
+                }
+                for s in 0..4 {
+                    let (a, b) = butterfly_q(v[2 * s], v[2 * s + 1], g[3 + s]);
+                    v[2 * s] = a;
+                    v[2 * s + 1] = b;
+                }
+                for (i, value) in v.iter().enumerate() {
+                    vst1q_u64(
+                        stage1.as_mut_ptr().add(i * num_ntts + lane).cast::<u64>(),
+                        *value,
+                    );
+                }
+            }
+        }
+
+        // Emit each destination row's full lane run as one sequential
+        // non-temporal burst (num_ntts/2 store-pairs of 32 B each).
+        for i in 0..8 {
+            let s0 = stage0.as_ptr().add(i * num_ntts);
+            let s1 = stage1.as_ptr().add(i * num_ntts);
+            let d0 = dst0.add(off + i * step);
+            let d1 = dst1.add(off + i * step);
+            let mut lane = 0;
+            while lane < num_ntts {
+                let x = vld1q_u64(s0.add(lane).cast::<u64>());
+                let y = vld1q_u64(s0.add(lane + 1).cast::<u64>());
+                if nt_bursts() {
+                    store_pair_nt(d0.add(lane), x, y);
+                } else {
+                    vst1q_u64(d0.add(lane).cast::<u64>(), x);
+                    vst1q_u64(d0.add(lane + 1).cast::<u64>(), y);
+                }
+                let x = vld1q_u64(s1.add(lane).cast::<u64>());
+                let y = vld1q_u64(s1.add(lane + 1).cast::<u64>());
+                if nt_bursts() {
+                    store_pair_nt(d1.add(lane), x, y);
+                } else {
+                    vst1q_u64(d1.add(lane).cast::<u64>(), x);
+                    vst1q_u64(d1.add(lane + 1).cast::<u64>(), y);
+                }
+                lane += 2;
+            }
+        }
+    }
+}
+
 /// Vector-resident twin of `portable::butterfly_fused_3layer_row`.
 ///
 /// # Safety

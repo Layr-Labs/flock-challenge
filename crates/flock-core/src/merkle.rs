@@ -1710,3 +1710,64 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+mod leaf_kernel_bench {
+    // Diagnostics-only microbench: single-thread ns/compression of the
+    // 8-wide NEON leaf kernel on L2-resident data. Run with:
+    //   cargo test --profile challenge -p flock-core --lib \
+    //     leaf_kernel_bench -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn leaf_kernel_single_thread_ns_per_compression() {
+        const LEAVES: usize = 4096; // 4 MiB input, fits M-series L2
+        let data: Vec<u8> = (0..LEAVES * 1024).map(|i| (i * 31 % 251) as u8).collect();
+        let mut out = vec![[0u8; 32]; LEAVES];
+        // warm
+        for _ in 0..3 {
+            super::blake3_neon_apple::hash_complete_groups(&data, &mut out);
+        }
+        let mut best = f64::INFINITY;
+        for _ in 0..21 {
+            let t = std::time::Instant::now();
+            let done = super::blake3_neon_apple::hash_complete_groups(&data, &mut out);
+            let dt = t.elapsed().as_secs_f64();
+            assert_eq!(done, LEAVES);
+            best = best.min(dt);
+        }
+        let comps = (LEAVES * 16) as f64;
+        println!(
+            "leaf kernel: {:.2} ns/compression, {:.2} GB/s ({} leaves, min of 21)",
+            best * 1e9 / comps,
+            (LEAVES * 1024) as f64 / best / 1e9,
+            LEAVES
+        );
+        std::hint::black_box(&out);
+    }
+}
+
+#[cfg(test)]
+mod leaf_pass_bench {
+    // Diagnostics-only: full merkle_tree wall on a ranked-shape 512 MiB
+    // codeword, main pool + epool, min of N. Mirrors the unfused commit pass.
+    #[test]
+    #[ignore]
+    fn merkle_tree_ranked_shape_wall() {
+        const LEAVES: usize = 1 << 19; // 512 MiB
+        let data: Vec<u8> = vec![0xA5u8; LEAVES * 1024];
+        // warm
+        let mut tree = super::merkle_tree(&data, LEAVES, super::HashKind::Blake3);
+        let mut best = f64::INFINITY;
+        for _ in 0..9 {
+            let t = std::time::Instant::now();
+            tree = super::merkle_tree(&data, LEAVES, super::HashKind::Blake3);
+            best = best.min(t.elapsed().as_secs_f64());
+        }
+        println!(
+            "merkle_tree 512MiB: {:.2} ms min, {:.2} GB/s",
+            best * 1e3,
+            (LEAVES * 1024) as f64 / best / 1e9
+        );
+        std::hint::black_box(&mut tree);
+    }
+}

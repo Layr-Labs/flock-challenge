@@ -226,9 +226,45 @@ pub fn commit_into(
     // directly (replicating z costs the same writes as the zero-fill it
     // replaces) and start the NTT at layer `log_inv_rate`, skipping those
     // layers' full-buffer reads and multiplies.
+    //
+    // Ranked rate-1/2 exception: the split top pass can synthesize both
+    // replicas from `z_packed` directly (see
+    // `forward_transform_interleaved_ranked_top_from_message`), deleting one
+    // full replica store here and halving that pass's loads. Every other
+    // shape writes the replica state and starts the NTT at `log_inv_rate`.
+    if ranked_from_message_supported(params, &codeword, z_packed) {
+        return finalize_commit_impl(codeword, params, Some(z_packed));
+    }
     replicate_message_fill(&mut codeword, z_packed);
 
     finalize_commit(codeword, params)
+}
+
+/// Whether the ranked rate-1/2 commit will fuse the replicate-fill into the
+/// first NTT top pass (see
+/// `forward_transform_interleaved_ranked_top_from_message`). Mirrors every
+/// condition under which `finalize_commit` actually reaches the split ranked
+/// top; witness producers use this to decide whether writing the replica
+/// state themselves is still worthwhile. `FLOCK_NO_NTT_FROM_MSG=1` is the
+/// exact A/B control restoring the hot-codeword replicate path.
+pub fn use_ranked_from_message_commit(params: &PcsParams) -> bool {
+    use_ranked_ntt_merkle_leaf_pipeline(params)
+        && crate::epool::epool().is_some()
+        && rayon::current_num_threads() > 1
+        && params.log_inv_rate == 1
+        && std::env::var_os("FLOCK_NO_NTT_TOP_EPOOL").is_none()
+        && std::env::var_os("FLOCK_NTT_BLOCK_REGIONS").is_none()
+        && std::env::var_os("FLOCK_NO_NTT_FROM_MSG").is_none()
+}
+
+/// [`use_ranked_from_message_commit`] plus the buffer-geometry check
+/// [`commit_into`] needs before taking the fused path.
+fn ranked_from_message_supported(
+    params: &PcsParams,
+    codeword: &[F128],
+    z_packed: &[F128],
+) -> bool {
+    use_ranked_from_message_commit(params) && codeword.len() == 2 * z_packed.len()
 }
 
 /// Commit from a codeword whose first `log_inv_rate` trivial NTT layers have
@@ -253,6 +289,38 @@ pub fn commit_preinitialized(
         "commit_preinitialized: codeword buffer has wrong length"
     );
     finalize_commit(codeword, params)
+}
+
+/// Process CPU (user+system) in ms for `FLOCK_COMMIT_TIMING` diagnostics.
+/// Direct `getrusage(RUSAGE_SELF)`; diagnostics-only, 0.0 off macOS.
+pub(crate) fn commit_cpu_ms() -> f64 {
+    #[cfg(target_os = "macos")]
+    {
+        #[repr(C)]
+        struct Timeval {
+            sec: i64,
+            usec: i32,
+        }
+        #[repr(C)]
+        struct Rusage {
+            utime: Timeval,
+            stime: Timeval,
+            other: [i64; 14],
+        }
+        unsafe extern "C" {
+            fn getrusage(who: i32, usage: *mut Rusage) -> i32;
+        }
+        let mut ru = Rusage {
+            utime: Timeval { sec: 0, usec: 0 },
+            stime: Timeval { sec: 0, usec: 0 },
+            other: [0; 14],
+        };
+        if unsafe { getrusage(0, &mut ru) } == 0 {
+            return (ru.utime.sec + ru.stime.sec) as f64 * 1e3
+                + (ru.utime.usec + ru.stime.usec) as f64 * 1e-3;
+        }
+    }
+    0.0
 }
 
 /// Fill `codeword` with `2^r` replicas of `msg` (`r = log2(codeword.len() /
@@ -322,6 +390,7 @@ fn ranked_ntt_with_pipelined_leaves(
     params: &PcsParams,
     tree: &mut [Hash],
     helper: &rayon::ThreadPool,
+    from_message: Option<&[F128]>,
 ) -> usize {
     use rayon::prelude::*;
     use std::sync::Mutex;
@@ -407,11 +476,23 @@ fn ranked_ntt_with_pipelined_leaves(
         && std::env::var_os("FLOCK_NO_NTT_TOP_EPOOL").is_none()
         && std::env::var_os("FLOCK_NTT_BLOCK_REGIONS").is_none();
     if split_ranked_top {
-        ntt.forward_transform_interleaved_ranked_top_from_layer(
-            codeword,
-            num_ntts,
-            params.log_inv_rate,
-        );
+        match from_message {
+            Some(msg) => ntt.forward_transform_interleaved_ranked_top_from_message(
+                msg,
+                codeword,
+                num_ntts,
+                params.log_inv_rate,
+            ),
+            None => ntt.forward_transform_interleaved_ranked_top_from_layer(
+                codeword,
+                num_ntts,
+                params.log_inv_rate,
+            ),
+        }
+    } else if let Some(msg) = from_message {
+        // Gate mismatch fallback: materialize the replica state the ordinary
+        // way; the unsplit transform below starts at `log_inv_rate`.
+        replicate_message_fill(codeword, msg);
     }
 
     std::thread::scope(|scope| {
@@ -474,7 +555,20 @@ fn ranked_ntt_with_pipelined_leaves(
 
 /// Shared tail of [`commit`] / [`commit_into`]: interleaved forward additive
 /// NTT (RS-encode every lane) then the initial Merkle tree over codeword rows.
-fn finalize_commit(mut codeword: Vec<F128>, params: &PcsParams) -> (Commitment, ProverData) {
+fn finalize_commit(codeword: Vec<F128>, params: &PcsParams) -> (Commitment, ProverData) {
+    finalize_commit_impl(codeword, params, None)
+}
+
+/// [`finalize_commit`] with an optional unmaterialized rate-1/2 message: when
+/// `from_message` is `Some(z)`, `codeword` holds arbitrary stale bytes and
+/// the ranked split top pass synthesizes both replicas from `z` directly
+/// (gate: [`ranked_from_message_supported`]). Paths that cannot fuse fall
+/// back to an explicit [`replicate_message_fill`] first.
+fn finalize_commit_impl(
+    mut codeword: Vec<F128>,
+    params: &PcsParams,
+    from_message: Option<&[F128]>,
+) -> (Commitment, ProverData) {
     let helper = if use_ranked_ntt_merkle_leaf_pipeline(params) && rayon::current_num_threads() > 1
     {
         crate::epool::epool()
@@ -492,6 +586,7 @@ fn finalize_commit(mut codeword: Vec<F128>, params: &PcsParams) -> (Commitment, 
         crate::alloc_uninit_vec::<Hash>(total_nodes)
     });
     let timing = std::env::var_os("FLOCK_COMMIT_TIMING").is_some();
+    let cpu_ntt0 = timing.then(commit_cpu_ms);
     let t_ntt = std::time::Instant::now();
     let mut prehashed_parent_levels = 0usize;
     // ---- Interleaved forward additive NTT: 2^log_batch_size independent
@@ -506,8 +601,14 @@ fn finalize_commit(mut codeword: Vec<F128>, params: &PcsParams) -> (Commitment, 
             params,
             tree,
             helper,
+            from_message,
         );
     } else {
+        // No pipeline → no split ranked top; materialize the replicas the
+        // ordinary way before the full transform.
+        if let Some(msg) = from_message {
+            replicate_message_fill(&mut codeword, msg);
+        }
         ntt.forward_transform_interleaved_from_layer(
             &mut codeword,
             params.num_ntts(),
@@ -520,11 +621,11 @@ fn finalize_commit(mut codeword: Vec<F128>, params: &PcsParams) -> (Commitment, 
         } else {
             "ntt"
         };
-        eprintln!(
-            "[commit-timing] {phase}: {:.2} ms",
-            t_ntt.elapsed().as_secs_f64() * 1e3
-        );
+        let wall = t_ntt.elapsed().as_secs_f64() * 1e3;
+        let cpu = commit_cpu_ms() - cpu_ntt0.unwrap_or(0.0);
+        eprintln!("[commit-timing] {phase}: {wall:.2} ms cpu={cpu:.1}");
     }
+    let cpu_merkle0 = timing.then(commit_cpu_ms);
     let t_merkle = std::time::Instant::now();
 
     // Initial tree: one leaf per codeword position, each containing the
@@ -555,10 +656,9 @@ fn finalize_commit(mut codeword: Vec<F128>, params: &PcsParams) -> (Commitment, 
         } else {
             "merkle"
         };
-        eprintln!(
-            "[commit-timing] {phase}: {:.2} ms",
-            t_merkle.elapsed().as_secs_f64() * 1e3
-        );
+        let wall = t_merkle.elapsed().as_secs_f64() * 1e3;
+        let cpu = commit_cpu_ms() - cpu_merkle0.unwrap_or(0.0);
+        eprintln!("[commit-timing] {phase}: {wall:.2} ms cpu={cpu:.1}");
     }
 
     (
@@ -785,6 +885,7 @@ mod tests {
             &params,
             &mut got_tree,
             &helper,
+            None,
         );
         let got_tree = merkle::merkle_tree_from_prehashed_level(
             got_tree,

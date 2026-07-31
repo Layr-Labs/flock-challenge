@@ -303,6 +303,7 @@ fn prove_packed_padded_inner<C: Challenger>(
     // must be in "naive" convention so the verifier doesn't need to know
     // about this internal optimization; we restore the C_s factor here.
     let zc_timing = std::env::var_os("FLOCK_ZC_TIMING").is_some();
+    let cpu_r1 = crate::pcs::commit::commit_cpu_ms();
     let t_round1 = std::time::Instant::now();
     debug_assert_eq!(k_skip, 6, "ranked protocol fixes k_skip=6");
     let inv_table = InvNttTableByteSingleGf8::cached_standard_k6();
@@ -351,8 +352,9 @@ fn prove_packed_padded_inner<C: Challenger>(
     let round1_c: Vec<F128> = round1_c_opt.iter().map(|x| c_s * *x).collect();
     if zc_timing {
         eprintln!(
-            "[zc-timing] round1 URM: {:.2} ms",
-            t_round1.elapsed().as_secs_f64() * 1e3
+            "[zc-timing] round1 URM: {:.2} ms cpu={:.1}",
+            t_round1.elapsed().as_secs_f64() * 1e3,
+            crate::pcs::commit::commit_cpu_ms() - cpu_r1
         );
     }
 
@@ -375,6 +377,7 @@ fn prove_packed_padded_inner<C: Challenger>(
     // Convention A wrapping: pass `mlv_arg[0] = ONE` so the function's output
     // `mlv_arg[0] · G(1)` becomes the bare `G(1)` we send on the wire. The
     // verifier samples ρ_1 after observing this message.
+    let cpu_r2 = crate::pcs::commit::commit_cpu_ms();
     let t_round2 = std::time::Instant::now();
     let fold_table = UniSkipFoldTable::new(k_skip, z);
     let mut mlv_arg = vec![F128::ONE; n_mlv];
@@ -392,10 +395,12 @@ fn prove_packed_padded_inner<C: Challenger>(
 
     if zc_timing {
         eprintln!(
-            "[zc-timing] round2 fused fold: {:.2} ms",
-            t_round2.elapsed().as_secs_f64() * 1e3
+            "[zc-timing] round2 fused fold: {:.2} ms cpu={:.1}",
+            t_round2.elapsed().as_secs_f64() * 1e3,
+            crate::pcs::commit::commit_cpu_ms() - cpu_r2
         );
     }
+    let cpu_tail = crate::pcs::commit::commit_cpu_ms();
     let t_tail = std::time::Instant::now();
     let mut multilinear_msgs = Vec::with_capacity(n_mlv);
     multilinear_msgs.push((msg_1, msg_inf));
@@ -516,8 +521,9 @@ fn prove_packed_padded_inner<C: Challenger>(
 
     if zc_timing {
         eprintln!(
-            "[zc-timing] rounds 3+ tail: {:.2} ms",
-            t_tail.elapsed().as_secs_f64() * 1e3
+            "[zc-timing] rounds 3+ tail: {:.2} ms cpu={:.1}",
+            t_tail.elapsed().as_secs_f64() * 1e3,
+            crate::pcs::commit::commit_cpu_ms() - cpu_tail
         );
     }
 

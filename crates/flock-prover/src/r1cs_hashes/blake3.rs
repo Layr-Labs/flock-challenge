@@ -1884,9 +1884,53 @@ impl Blake3Setup {
         challenger: &mut Ch,
     ) -> (flock_core::proof::R1csProofLigerito, Commitment, R1csClaim) {
         assert_eq!(blocks.len(), self.n_blocks);
+        let phase_timing = std::env::var_os("FLOCK_PHASE_TIMING").is_some();
         if self.use_ranked_rate2_hot_codeword() {
+            // From-message commit: the layer-1 NTT pass synthesizes both
+            // rate-1/2 replicas straight from z_packed, so the witness
+            // driver skips its ~1 GiB of replica stores entirely. The
+            // codeword scratch stays stale until that pass writes it.
+            // `FLOCK_NO_NTT_FROM_MSG=1` restores the hot-codeword replicate
+            // path below as the exact A/B control.
+            if flock_core::pcs::use_ranked_from_message_commit(&self.pcs_params) {
+                let codeword = flock_core::scratch::take_f128(self.pcs_params.codeword_len_f128());
+                let cpu_wit = phase_timing.then(crate::prover::process_cpu_ms);
+                let t_wit = std::time::Instant::now();
+                let (z_packed, a_packed_f128, b_packed_f128, z_packed_lincheck) =
+                    self.generate_witness_ab(blocks);
+                if phase_timing {
+                    let wall = t_wit.elapsed().as_secs_f64() * 1e3;
+                    let cpu = crate::prover::process_cpu_ms() - cpu_wit.unwrap_or(0.0);
+                    eprintln!(
+                        "[phase-timing] witgen (from-msg): {wall:.2} ms cpu={cpu:.1} util={:.1}",
+                        cpu / wall
+                    );
+                }
+                let lc_circuit = self.lincheck_circuit();
+                return crate::prover::prove_fast_ligerito_from_witness(
+                    &self.r1cs,
+                    &self.pcs_params,
+                    z_packed,
+                    a_packed_f128,
+                    b_packed_f128,
+                    z_packed_lincheck,
+                    lc_circuit,
+                    Some(codeword),
+                    challenger,
+                );
+            }
+            let cpu_wit = phase_timing.then(crate::prover::process_cpu_ms);
+            let t_wit = std::time::Instant::now();
             let (codeword, (z_packed, a_packed_f128, b_packed_f128, z_packed_lincheck)) =
                 self.generate_witness_ab_with_rate2_codeword(blocks);
+            if phase_timing {
+                let wall = t_wit.elapsed().as_secs_f64() * 1e3;
+                let cpu = crate::prover::process_cpu_ms() - cpu_wit.unwrap_or(0.0);
+                eprintln!(
+                    "[phase-timing] witgen+hot-codeword: {wall:.2} ms cpu={cpu:.1} util={:.1}",
+                    cpu / wall
+                );
+            }
             let lc_circuit = self.lincheck_circuit();
             return crate::prover::prove_fast_ligerito_from_preinitialized_codeword(
                 &self.r1cs,

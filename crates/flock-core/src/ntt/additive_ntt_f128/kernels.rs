@@ -212,6 +212,46 @@ fn vector_resident_rows() -> bool {
     *ON.get_or_init(|| std::env::var_os("FLOCK_NO_NTT_NEON_ROWS").is_none())
 }
 
+/// Rate-1/2 first-pass row kernel: one load of the radix-8 row group from
+/// `src`, two fused-3 evaluations — zero-root set to `dst0`, general set to
+/// `dst1`. The AArch64 arm stages outputs in L1 and emits each destination
+/// row as a sequential `stnp` burst; see that kernel's doc for why.
+///
+/// # Safety
+/// Row/lane geometry valid for all three pointers, disjoint row groups
+/// across concurrent calls, `num_ntts ≤ 64` even, and
+/// `t_zero[0] == t_zero[1] == t_zero[3] == 0`.
+#[inline]
+#[allow(clippy::too_many_arguments)]
+pub(super) unsafe fn butterfly_fused_3layer_dual_from_src_row(
+    src: *const F128,
+    dst0: *mut F128,
+    dst1: *mut F128,
+    eighth: usize,
+    num_ntts: usize,
+    r: usize,
+    t_zero: &[F128; 7],
+    t_gen: &[F128; 7],
+) {
+    #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+    // SAFETY: forwarded caller contract; the cfg gate supplies `aes`.
+    unsafe {
+        if vector_resident_rows() {
+            aarch64::butterfly_fused_3layer_dual_from_src_row(
+                src, dst0, dst1, eighth, num_ntts, r, t_zero, t_gen,
+            );
+            return;
+        }
+    }
+
+    // SAFETY: forwarded caller contract.
+    unsafe {
+        portable::butterfly_fused_3layer_dual_from_src_row(
+            src, dst0, dst1, eighth, num_ntts, r, t_zero, t_gen,
+        );
+    }
+}
+
 /// Root-block specialization of [`butterfly_fused_3layer_row`].
 ///
 /// # Safety
