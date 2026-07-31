@@ -119,7 +119,7 @@
 use crate::challenger::Challenger;
 use crate::field::F128;
 use crate::r1cs::SparseBinaryMatrix;
-use crate::zerocheck::multilinear::lagrange_weights_naive;
+use crate::zerocheck::multilinear::lagrange_weights;
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::AtomicBool;
 
@@ -918,7 +918,7 @@ pub fn pack_z_lincheck_from_packed(
 pub fn build_quirky_eq_table(z_skip: F128, x_inner_rest: &[F128], k_skip: usize) -> Vec<F128> {
     let ell_skip = 1usize << k_skip;
     let ell_rest = 1usize << x_inner_rest.len();
-    let lambda_skip = lagrange_weights_naive(k_skip, z_skip);
+    let lambda_skip = lagrange_weights(k_skip, z_skip);
     let eq_rest = build_eq_table(x_inner_rest);
     let total = ell_skip * ell_rest;
     let mut out = Vec::with_capacity(total);
@@ -1415,7 +1415,7 @@ fn prove_padded_inner<Ch: Challenger>(
     // 8. Output claim's value: φ8 Lagrange combination of z_partial at z_skip.
     //    Equals ẑ_φ8(z_skip, r_rest, x_outer) when z_partial is honest; the
     //    PCS catches mismatches downstream.
-    let lambda = lagrange_weights_naive(k_skip, r_inner_skip);
+    let lambda = lagrange_weights(k_skip, r_inner_skip);
     let w = inner_product(&lambda, &z_partial);
 
     // 9. Convert sumcheck challenges to LSB-first `x_inner_rest` order. The
@@ -1586,11 +1586,11 @@ pub fn verify<Ch: Challenger>(
     //    Equals ẑ_φ8(z_skip, r_rest, x_outer) when z_partial is honest;
     //    PCS catches mismatches downstream.
     let t = std::time::Instant::now();
-    let lambda = lagrange_weights_naive(k_skip, r_inner_skip);
+    let lambda = lagrange_weights(k_skip, r_inner_skip);
     let w = inner_product(&lambda, &proof.z_partial);
     if trace {
         eprintln!(
-            "        [lcv] final consistency + lagrange_weights_naive: {}",
+            "        [lcv] final consistency + lagrange_weights: {}",
             fmt(t.elapsed().as_secs_f64())
         );
     }
