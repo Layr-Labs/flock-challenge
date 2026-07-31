@@ -269,6 +269,35 @@ pub(crate) fn prove_fast_ligerito_from_preinitialized_codeword<Ch: Challenger>(
     )
 }
 
+/// Ranked row-major counterpart of [`prove_fast_ligerito_from_witness`] with
+/// an **uninitialized** codeword buffer: the commit's first NTT pass reads
+/// `z_packed` directly, so neither the witness generator nor the commit ever
+/// materializes the rate-1/2 replica copies.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn prove_fast_ligerito_from_message_codeword<Ch: Challenger>(
+    r1cs: &BlockR1cs,
+    pcs_params: &PcsParams,
+    z_packed: Vec<F128>,
+    a_packed_f128: Vec<F128>,
+    b_packed_f128: Vec<F128>,
+    z_packed_lincheck: Vec<u8>,
+    lincheck_circuit: &dyn lincheck::LincheckCircuit,
+    codeword: Vec<F128>,
+    challenger: &mut Ch,
+) -> (R1csProofLigerito, Commitment, R1csClaim) {
+    prove_fast_ligerito_from_witness_with_commit_codeword(
+        r1cs,
+        pcs_params,
+        z_packed,
+        a_packed_f128,
+        b_packed_f128,
+        z_packed_lincheck,
+        lincheck_circuit,
+        CommitCodeword::MessageHot(codeword),
+        challenger,
+    )
+}
+
 #[allow(clippy::too_many_arguments)]
 fn prove_fast_ligerito_from_witness_with_commit_codeword<Ch: Challenger>(
     r1cs: &BlockR1cs,
@@ -369,6 +398,10 @@ enum CommitCodeword {
     Allocate,
     NeedsReplication(Vec<F128>),
     Preinitialized(Vec<F128>),
+    /// Uninitialized buffer; the ranked commit's first NTT pass reads the
+    /// packed message directly and writes every codeword element (the
+    /// rate-1/2 replicas are never materialized by anyone).
+    MessageHot(Vec<F128>),
 }
 
 /// Build the witness commitment and the challenge-independent half of
@@ -400,6 +433,9 @@ fn commit_with_round1_ab_precompute(
             CommitCodeword::NeedsReplication(buf) => pcs::commit_into(z_packed, pcs_params, buf),
             CommitCodeword::Preinitialized(buf) => {
                 pcs::commit_preinitialized(z_packed, buf, pcs_params)
+            }
+            CommitCodeword::MessageHot(buf) => {
+                pcs::commit_from_message_hot(z_packed, buf, pcs_params)
             }
         },
         || {
@@ -657,6 +693,32 @@ pub(crate) fn prove_fast_ligerito_timed_from_preinitialized_codeword<Ch: Challen
         z_packed_lincheck,
         lincheck_circuit,
         CommitCodeword::Preinitialized(codeword),
+        challenger,
+    )
+}
+
+/// Timed counterpart of [`prove_fast_ligerito_from_message_codeword`].
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn prove_fast_ligerito_timed_from_message_codeword<Ch: Challenger>(
+    r1cs: &BlockR1cs,
+    pcs_params: &PcsParams,
+    z_packed: Vec<F128>,
+    a_packed_f128: Vec<F128>,
+    b_packed_f128: Vec<F128>,
+    z_packed_lincheck: Vec<u8>,
+    lincheck_circuit: &dyn lincheck::LincheckCircuit,
+    codeword: Vec<F128>,
+    challenger: &mut Ch,
+) -> (R1csProofLigerito, Commitment, R1csClaim, ProvePhaseTimings) {
+    prove_fast_ligerito_timed_with_commit_codeword(
+        r1cs,
+        pcs_params,
+        z_packed,
+        a_packed_f128,
+        b_packed_f128,
+        z_packed_lincheck,
+        lincheck_circuit,
+        CommitCodeword::MessageHot(codeword),
         challenger,
     )
 }
