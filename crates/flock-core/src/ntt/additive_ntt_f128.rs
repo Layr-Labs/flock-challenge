@@ -363,6 +363,7 @@ impl AdditiveNttF128 {
                 data,
                 num_ntts,
                 start_layer,
+                None,
                 &finish_chunk,
             );
         }
@@ -374,6 +375,40 @@ impl AdditiveNttF128 {
             self.forward_transform_interleaved_scalar_from_layer(data, num_ntts, start_layer);
             finish_chunk(0, data);
         }
+    }
+
+    /// [`Self::forward_transform_interleaved_from_layer_and_then`] with a
+    /// **virtually replicated** first pass: `data`'s contents are IGNORED and
+    /// may be uninitialized. Both layer-`start_layer` blocks read `src` (the
+    /// message, i.e. what every replica of the RS-encoded `[msg, 0, …]`
+    /// buffer holds after the skipped copy layers) and the first fused pass
+    /// writes every slot of `data`. Callers replace `replicate_message_fill`
+    /// + `from_layer` with this single call, deleting the materializing copy.
+    ///
+    /// Only supported for the shape where the first executed pass is the
+    /// NEON fused-3 pass and `data.len() == 2 * src.len()` (checked).
+    #[cfg(any(
+        all(target_arch = "aarch64", target_feature = "aes"),
+        all(target_arch = "x86_64", target_feature = "pclmulqdq"),
+    ))]
+    pub(crate) fn forward_transform_interleaved_from_layer_replicated_and_then<F>(
+        &self,
+        src: &[F128],
+        data: &mut [F128],
+        num_ntts: usize,
+        start_layer: usize,
+        finish_chunk: F,
+    ) where
+        F: Fn(usize, &[F128]) + Sync + Send,
+    {
+        assert_eq!(data.len(), 2 * src.len());
+        self.forward_transform_interleaved_parallel_from_layer_and_then(
+            data,
+            num_ntts,
+            start_layer,
+            Some(src),
+            &finish_chunk,
+        );
     }
 
     /// Scalar reference for the interleaved forward NTT.
@@ -448,6 +483,7 @@ impl AdditiveNttF128 {
             data,
             num_ntts,
             start_layer,
+            None,
             &|_, _| {},
         );
     }
@@ -461,6 +497,7 @@ impl AdditiveNttF128 {
         data: &mut [F128],
         num_ntts: usize,
         start_layer: usize,
+        first_pass_src: Option<&[F128]>,
         finish_chunk: &F,
     ) where
         F: Fn(usize, &[F128]) + Sync + Send,
@@ -504,6 +541,10 @@ impl AdditiveNttF128 {
         };
         let n_top = fusion_aware_interleaved_n_top(log_d, num_ntts, start_layer, n_top);
         if n_top == 0 || log_d < 8 {
+            assert!(
+                first_pass_src.is_none(),
+                "virtually replicated first pass requires the parallel top-layer path"
+            );
             self.forward_transform_interleaved_scalar_from_layer(data, num_ntts, start_layer);
             finish_chunk(0, data);
             return;
@@ -538,6 +579,15 @@ impl AdditiveNttF128 {
         ));
         let fused3_ok = !fused4_ok;
         let zero_root_fused3 = use_ranked_zero_root_fusion(log_d, num_ntts, start_layer, n_top);
+        if first_pass_src.is_some() {
+            // The replicated first pass is only implemented for the fused-3
+            // branch; anything else would read `data`'s (uninitialized)
+            // contents. Fail loudly rather than corrupt.
+            assert!(
+                fused3_ok && start_layer + 2 < n_top && (1usize << (log_d - start_layer)) >= 8,
+                "virtually replicated first pass requires the fused-3 top path"
+            );
+        }
         let mut layer = start_layer.min(n_top);
         while layer < n_top {
             let num_blocks = 1usize << layer;
@@ -547,6 +597,27 @@ impl AdditiveNttF128 {
             if fused3_ok && layer + 2 < n_top && block_size >= 8 {
                 // Fuse three layers (layer..layer+3): one read+write per block
                 // instead of three. Each block contributes an 8-point butterfly.
+                //
+                // Virtually replicated first pass: when `first_pass_src` is
+                // set and this is the first executed pass, every block reads
+                // the SAME message buffer instead of its own (identical)
+                // replica in `data` — the materializing replicate copy never
+                // happened and `data` may be uninitialized. Requires each
+                // block to have exactly the message's shape.
+                let from_src = if layer == start_layer {
+                    if let Some(src) = first_pass_src {
+                        assert_eq!(
+                            src.len(),
+                            block_bytes,
+                            "replicated first pass: block shape must equal the message shape"
+                        );
+                        Some(src)
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
                 let eighth = block_size >> 3;
                 let block_twiddles = |block: usize| {
                     let mut tw = [F128 { lo: 0, hi: 0 }; 7];
@@ -561,27 +632,49 @@ impl AdditiveNttF128 {
                 };
                 if zero_root_fused3 && std::env::var_os("FLOCK_NTT_BLOCK_REGIONS").is_none() {
                     let twiddles: Vec<[F128; 7]> = (0..num_blocks).map(block_twiddles).collect();
-                    butterfly_interleaved_fused_3layer_all_blocks_par_rows(
-                        data, &twiddles, eighth, num_ntts,
-                    );
+                    match from_src {
+                        Some(src) => butterfly_interleaved_fused_3layer_all_blocks_par_rows_src(
+                            src, data, &twiddles, eighth, num_ntts,
+                        ),
+                        None => butterfly_interleaved_fused_3layer_all_blocks_par_rows(
+                            data, &twiddles, eighth, num_ntts,
+                        ),
+                    }
                 } else {
                     for block in 0..num_blocks {
                         let tw = block_twiddles(block);
                         let start = block * block_bytes;
-                        if block == 0 && zero_root_fused3 {
-                            butterfly_interleaved_fused_3layer_par_rows::<true>(
+                        match (from_src, block == 0 && zero_root_fused3) {
+                            (Some(src), true) => {
+                                butterfly_interleaved_fused_3layer_par_rows_src::<true>(
+                                    src,
+                                    &mut data[start..start + block_bytes],
+                                    &tw,
+                                    eighth,
+                                    num_ntts,
+                                )
+                            }
+                            (Some(src), false) => {
+                                butterfly_interleaved_fused_3layer_par_rows_src::<false>(
+                                    src,
+                                    &mut data[start..start + block_bytes],
+                                    &tw,
+                                    eighth,
+                                    num_ntts,
+                                )
+                            }
+                            (None, true) => butterfly_interleaved_fused_3layer_par_rows::<true>(
                                 &mut data[start..start + block_bytes],
                                 &tw,
                                 eighth,
                                 num_ntts,
-                            );
-                        } else {
-                            butterfly_interleaved_fused_3layer_par_rows::<false>(
+                            ),
+                            (None, false) => butterfly_interleaved_fused_3layer_par_rows::<false>(
                                 &mut data[start..start + block_bytes],
                                 &tw,
                                 eighth,
                                 num_ntts,
-                            );
+                            ),
                         }
                     }
                 }
@@ -1198,6 +1291,63 @@ fn butterfly_interleaved_block(
 /// all land in one set and demand N ways. Radix-8 is the widest fusion an
 /// 8-way L1D admits.
 #[inline]
+/// Source→destination mirror of [`butterfly_interleaved_fused_3layer_par_rows`]
+/// for the virtually-replicated first pass: reads every row group from `src`
+/// (the message buffer, shared by both layer-1 replica blocks) and writes the
+/// transformed rows into this block's half of the codeword. `dst` may be
+/// uninitialized — every slot is written.
+fn butterfly_interleaved_fused_3layer_par_rows_src<const ZERO_ROOT: bool>(
+    src: &[F128],
+    dst: &mut [F128],
+    t: &[F128; 7],
+    eighth: usize,
+    num_ntts: usize,
+) {
+    use rayon::prelude::*;
+    const PARALLEL_ROW_THRESHOLD: usize = 256;
+    debug_assert_eq!(dst.len(), 8 * eighth * num_ntts);
+    debug_assert_eq!(src.len(), dst.len());
+    if ZERO_ROOT {
+        debug_assert_eq!(t[0], F128::ZERO);
+        debug_assert_eq!(t[1], F128::ZERO);
+        debug_assert_eq!(t[3], F128::ZERO);
+    }
+    let src_base = src.as_ptr() as usize;
+    let dst_base = dst.as_mut_ptr() as usize;
+    let run = |r: usize| {
+        // SAFETY: row group r reads disjoint src rows and writes disjoint dst
+        // rows of this block; src/dst are distinct buffers.
+        unsafe {
+            if ZERO_ROOT {
+                kernels::butterfly_fused_3layer_zero_root_row_src(
+                    src_base as *const F128,
+                    dst_base as *mut F128,
+                    eighth,
+                    num_ntts,
+                    r,
+                    t,
+                )
+            } else {
+                kernels::butterfly_fused_3layer_row_src(
+                    src_base as *const F128,
+                    dst_base as *mut F128,
+                    eighth,
+                    num_ntts,
+                    r,
+                    t,
+                )
+            }
+        }
+    };
+    if eighth < PARALLEL_ROW_THRESHOLD {
+        for r in 0..eighth {
+            run(r);
+        }
+    } else {
+        (0..eighth).into_par_iter().for_each(run);
+    }
+}
+
 fn butterfly_interleaved_fused_3layer_par_rows<const ZERO_ROOT: bool>(
     block: &mut [F128],
     t: &[F128; 7],
@@ -1261,6 +1411,65 @@ fn butterfly_interleaved_fused_3layer_par_rows<const ZERO_ROOT: bool>(
 /// `(block, row)` jobs are disjoint. Flattening retains the exact radix-8
 /// kernels and work order within each row while using one barrier per group.
 #[inline]
+/// Source→destination mirror of
+/// [`butterfly_interleaved_fused_3layer_all_blocks_par_rows`] for the
+/// virtually replicated first pass: every block reads the SAME message
+/// buffer (`src`, one block's shape) and writes its own block of `data`,
+/// which may be uninitialized — every slot is written, including block
+/// zero's row stream 0.
+fn butterfly_interleaved_fused_3layer_all_blocks_par_rows_src(
+    src: &[F128],
+    data: &mut [F128],
+    twiddles: &[[F128; 7]],
+    eighth: usize,
+    num_ntts: usize,
+) {
+    use rayon::prelude::*;
+
+    let num_blocks = twiddles.len();
+    let block_elems = 8 * eighth * num_ntts;
+    debug_assert_eq!(data.len(), num_blocks * block_elems);
+    debug_assert_eq!(src.len(), block_elems);
+    debug_assert!(eighth.is_power_of_two());
+    debug_assert_eq!(twiddles[0][0], F128::ZERO);
+    debug_assert_eq!(twiddles[0][1], F128::ZERO);
+    debug_assert_eq!(twiddles[0][3], F128::ZERO);
+
+    let src_base = src.as_ptr() as usize;
+    let dst_base = data.as_mut_ptr() as usize;
+    let eighth_log = eighth.trailing_zeros() as usize;
+    let eighth_mask = eighth - 1;
+    (0..num_blocks * eighth).into_par_iter().for_each(|job| {
+        let block = job >> eighth_log;
+        let row = job & eighth_mask;
+        let block_dst = unsafe { (dst_base as *mut F128).add(block * block_elems) };
+        // SAFETY: each job writes one disjoint eight-row group within one
+        // block; all jobs read the shared immutable `src`. Block zero has the
+        // three zero roots required by the ranked specialization.
+        unsafe {
+            if block == 0 {
+                kernels::butterfly_fused_3layer_zero_root_row_src(
+                    src_base as *const F128,
+                    block_dst,
+                    eighth,
+                    num_ntts,
+                    row,
+                    &twiddles[block],
+                )
+            } else {
+                kernels::butterfly_fused_3layer_row_src(
+                    src_base as *const F128,
+                    block_dst,
+                    eighth,
+                    num_ntts,
+                    row,
+                    &twiddles[block],
+                )
+            }
+        }
+    });
+}
+
 fn butterfly_interleaved_fused_3layer_all_blocks_par_rows(
     data: &mut [F128],
     twiddles: &[[F128; 7]],

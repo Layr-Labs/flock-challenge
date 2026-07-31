@@ -145,6 +145,47 @@ pub(super) unsafe fn butterfly_fused_3layer_zero_root_row(
     }
 }
 
+/// Source→destination [`butterfly_fused_3layer_row`] (virtually-replicated
+/// first pass).
+///
+/// # Safety
+/// Row geometry valid for both buffers, `src`/`dst` disjoint, concurrent
+/// calls on disjoint `dst` row groups.
+#[inline]
+pub(super) unsafe fn butterfly_fused_3layer_row_src(
+    src: *const F128,
+    dst: *mut F128,
+    eighth: usize,
+    num_ntts: usize,
+    r: usize,
+    twiddles: &[F128; 7],
+) {
+    // SAFETY: forwarded caller contract.
+    unsafe {
+        portable::butterfly_fused_3layer_row_src(src, dst, eighth, num_ntts, r, twiddles);
+    }
+}
+
+/// Source→destination [`butterfly_fused_3layer_zero_root_row`]. Writes every
+/// row (dst may be uninitialized).
+///
+/// # Safety
+/// Same as [`butterfly_fused_3layer_row_src`], plus twiddles 0, 1, 3 zero.
+#[inline]
+pub(super) unsafe fn butterfly_fused_3layer_zero_root_row_src(
+    src: *const F128,
+    dst: *mut F128,
+    eighth: usize,
+    num_ntts: usize,
+    r: usize,
+    twiddles: &[F128; 7],
+) {
+    // SAFETY: forwarded caller contract.
+    unsafe {
+        portable::butterfly_fused_3layer_zero_root_row_src(src, dst, eighth, num_ntts, r, twiddles);
+    }
+}
+
 #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
 #[inline]
 pub(super) unsafe fn butterfly_neon_block(chunk: &mut [F128], twiddle: F128, half: usize) {
