@@ -675,8 +675,6 @@ pub fn partial_fold_packed_z_fast_padded(
     useful_bits: usize,
     eq_outer: &[F128],
 ) -> Vec<F128> {
-    use rayon::prelude::*;
-
     let n_log = m - k_log;
     let k = 1usize << k_log;
     let n_outer = 1usize << n_log;
@@ -687,6 +685,7 @@ pub fn partial_fold_packed_z_fast_padded(
     let n_stripes = n_outer / 8;
 
     let stripes_per_chunk = (n_stripes / 256).max(1);
+    use rayon::prelude::*;
     let bytes_per_chunk = stripes_per_chunk * k;
 
     // fold(): one length-k accumulator per WORKER rather than per chunk —
@@ -862,7 +861,6 @@ pub fn pack_z_lincheck_from_packed(
     m: usize,
     k_log: usize,
 ) -> Vec<u8> {
-    use rayon::prelude::*;
     let k = 1usize << k_log;
     let n_total = 1usize << m;
     assert_eq!(z_packed_f128.len(), n_total / 128);
@@ -875,29 +873,37 @@ pub fn pack_z_lincheck_from_packed(
     let mut z_packed: Vec<u8> = crate::alloc_uninit_vec(n_total / 8);
     // Each stripe (byte_idx) writes a disjoint k-byte chunk — process them in
     // parallel. Inside one stripe, k independent output bytes.
-    z_packed
-        .par_chunks_mut(k)
-        .enumerate()
-        .for_each(|(byte_idx, chunk)| {
-            for i_inner in 0..k {
-                let mut byte = 0u8;
-                for r in 0..8 {
-                    let i_outer = 8 * byte_idx + r;
-                    let logical_idx = i_inner + i_outer * k;
-                    let f128_idx = logical_idx / 128;
-                    let local_bit = logical_idx % 128;
-                    let bit = if local_bit < 64 {
-                        (z_packed_f128[f128_idx].lo >> local_bit) & 1 == 1
-                    } else {
-                        (z_packed_f128[f128_idx].hi >> (local_bit - 64)) & 1 == 1
-                    };
-                    if bit {
-                        byte |= 1u8 << r;
-                    }
+    // Hetero-queue drain (same contract as the promoted zerocheck
+    // conversions): pure bit-extraction compute over disjoint stripes with
+    // no reduction — the ideal shape for the efficiency-core queue. Each
+    // chunk writes only its own k-byte stripe; output is bit-identical by
+    // construction.
+    let stripes = z_packed.len() / k;
+    let z_base = crate::epool::SyncPtr(z_packed.as_mut_ptr());
+    crate::epool::run_hetero_chunks(stripes, |byte_idx| {
+        // SAFETY: the queue hands out each stripe exactly once; stripe
+        // byte_idx exclusively owns z_packed[byte_idx*k..][..k]; the queue's
+        // completion join publishes the writes before the caller reads.
+        let chunk = unsafe { std::slice::from_raw_parts_mut(z_base.ptr().add(byte_idx * k), k) };
+        for i_inner in 0..k {
+            let mut byte = 0u8;
+            for r in 0..8 {
+                let i_outer = 8 * byte_idx + r;
+                let logical_idx = i_inner + i_outer * k;
+                let f128_idx = logical_idx / 128;
+                let local_bit = logical_idx % 128;
+                let bit = if local_bit < 64 {
+                    (z_packed_f128[f128_idx].lo >> local_bit) & 1 == 1
+                } else {
+                    (z_packed_f128[f128_idx].hi >> (local_bit - 64)) & 1 == 1
+                };
+                if bit {
+                    byte |= 1u8 << r;
                 }
-                chunk[i_inner] = byte;
             }
-        });
+            chunk[i_inner] = byte;
+        }
+    });
     z_packed
 }
 
