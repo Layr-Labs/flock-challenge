@@ -16,8 +16,7 @@
 //! shape-corrupted ones.
 
 use crate::challenger::Challenger;
-use crate::field::{F8, F128};
-use crate::ntt::{AdditiveNttGf8, InvNttTableByteSingleGf8};
+use crate::field::F128;
 use serde::{Deserialize, Serialize};
 
 pub mod multilinear;
@@ -30,6 +29,7 @@ use multilinear::{
     UniSkipFoldTable, fold_and_compute_round_pair_into, fold_compact_and_compute_round_pair,
     fold_in_place_pair, interpolate_at_z_combined, interpolate_at_z_on_lambda, round_pair_naive,
     uni_skip_fold_and_round_pair_compact_padded_with_deltas,
+    uni_skip_fold_direct_and_compute_round_pair, uni_skip_round_pair_message_only_padded,
 };
 use univariate_skip_optimized::{
     c_s_f128, medium_challenges_ghash, round1_shift_reduce_extract_c_packed_padded,
@@ -248,6 +248,15 @@ pub fn prove_packed_padded_capture_s_hat_v_c_with_precomputed_ab<C: Challenger>(
     )
 }
 
+/// Env gate for the rounds-2/3 tail strategy. When `FLOCK_ZC_R23_LEGACY` is
+/// set (any value), round 2 materializes the compact anchors+deltas
+/// intermediate and round 3 reconstructs from it (the legacy path). When
+/// unset (default), round 2 is message-only and round 3 folds directly from
+/// the packed inputs. Both paths produce bit-identical transcripts/proofs.
+fn r23_legacy_from_env() -> bool {
+    std::env::var_os("FLOCK_ZC_R23_LEGACY").is_some()
+}
+
 #[allow(clippy::too_many_arguments)]
 fn prove_packed_padded_inner<C: Challenger>(
     a_packed: &[u8],
@@ -257,6 +266,31 @@ fn prove_packed_padded_inner<C: Challenger>(
     padding: &PaddingSpec,
     capture_s_hat_v_c: bool,
     precomputed_ab: Option<univariate_skip_optimized::Round1AbInner>,
+    challenger: &mut C,
+) -> (ZerocheckProof, ZerocheckClaim, Option<Vec<F128>>) {
+    prove_packed_padded_inner_mode(
+        a_packed,
+        b_packed,
+        c_packed,
+        m,
+        padding,
+        capture_s_hat_v_c,
+        precomputed_ab,
+        r23_legacy_from_env(),
+        challenger,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn prove_packed_padded_inner_mode<C: Challenger>(
+    a_packed: &[u8],
+    b_packed: &[u8],
+    c_packed: &[u8],
+    m: usize,
+    padding: &PaddingSpec,
+    capture_s_hat_v_c: bool,
+    precomputed_ab: Option<univariate_skip_optimized::Round1AbInner>,
+    r23_legacy: bool,
     challenger: &mut C,
 ) -> (ZerocheckProof, ZerocheckClaim, Option<Vec<F128>>) {
     let k_skip = K_SKIP;
@@ -304,9 +338,7 @@ fn prove_packed_padded_inner<C: Challenger>(
     // about this internal optimization; we restore the C_s factor here.
     let zc_timing = std::env::var_os("FLOCK_ZC_TIMING").is_some();
     let t_round1 = std::time::Instant::now();
-    let ntt_s = AdditiveNttGf8::new(k_skip, F8::ZERO);
-    let ntt_l = AdditiveNttGf8::new(k_skip, F8(1u8 << k_skip));
-    let inv_table = InvNttTableByteSingleGf8::new(&ntt_s, &ntt_l);
+    let inv_table = crate::ntt::inv_table::cached_skip_table(k_skip);
     let (round1_ab_opt, round1_c_opt, s_hat_v_c) = if let Some(ab_inner) = precomputed_ab.as_ref() {
         assert!(
             capture_s_hat_v_c,
@@ -380,16 +412,35 @@ fn prove_packed_padded_inner<C: Challenger>(
     let fold_table = UniSkipFoldTable::new(k_skip, z);
     let mut mlv_arg = vec![F128::ONE; n_mlv];
     mlv_arg[1..].copy_from_slice(&r[k_skip + 1..]);
-    let (compact_mlv, msg_1, msg_inf) = uni_skip_fold_and_round_pair_compact_padded_with_deltas(
-        a_packed,
-        b_packed,
-        m,
-        k_skip,
-        &fold_table,
-        &mlv_arg,
-        padding,
-        compact_deltas,
-    );
+    let (compact_mlv, msg_1, msg_inf) = if r23_legacy {
+        let (compact, m1, mi) = uni_skip_fold_and_round_pair_compact_padded_with_deltas(
+            a_packed,
+            b_packed,
+            m,
+            k_skip,
+            &fold_table,
+            &mlv_arg,
+            padding,
+            compact_deltas,
+        );
+        (Some(compact), m1, mi)
+    } else {
+        // Direct mode never materializes anchors/deltas; return the round-1
+        // storage donation to the byte scratch pool unused.
+        if let Some(donated) = compact_deltas {
+            donated.recycle();
+        }
+        let (m1, mi) = uni_skip_round_pair_message_only_padded(
+            a_packed,
+            b_packed,
+            m,
+            k_skip,
+            &fold_table,
+            &mlv_arg,
+            padding,
+        );
+        (None, m1, mi)
+    };
 
     if zc_timing {
         eprintln!(
@@ -421,9 +472,31 @@ fn prove_packed_padded_inner<C: Challenger>(
     // post-fold tables expected by all subsequent rounds.
     let mut first_r_next = vec![F128::ONE; n_mlv - 1];
     first_r_next[1..].copy_from_slice(&r[k_skip + 2..]);
-    let (mut a_mlv, mut b_mlv, first_m1, first_mi) =
-        fold_compact_and_compute_round_pair(&compact_mlv, &fold_table, mlv_rhos[0], &first_r_next);
-    compact_mlv.recycle();
+    let (mut a_mlv, mut b_mlv, first_m1, first_mi) = match compact_mlv {
+        Some(compact) => {
+            let out = fold_compact_and_compute_round_pair(
+                &compact,
+                &fold_table,
+                mlv_rhos[0],
+                &first_r_next,
+            );
+            compact.recycle();
+            out
+        }
+        // Direct: reconstruct the post-ρ1 tables straight from the packed
+        // inputs with two challenge-composed 32 KiB tables; bit-identical
+        // values and message (see `uni_skip_fold_direct_and_compute_round_pair`).
+        None => uni_skip_fold_direct_and_compute_round_pair(
+            a_packed,
+            b_packed,
+            m,
+            k_skip,
+            &fold_table,
+            mlv_rhos[0],
+            &first_r_next,
+            padding,
+        ),
+    };
     multilinear_msgs.push((first_m1, first_mi));
     challenger.observe_f128(first_m1);
     challenger.observe_f128(first_mi);
@@ -1115,6 +1188,65 @@ mod tests {
                 verify(m, &bad, &mut ch).is_err(),
                 "msg_1 tamper round {idx} ACCEPTED"
             );
+        }
+    }
+
+    /// **A/B oracle: the direct rounds-2/3 path (no anchors/deltas) produces a
+    /// proof and claim bit-identical to the legacy compact path** — for the
+    /// full zerocheck prove on random honest witnesses, at small dense m and
+    /// at a padded shape. Both proofs must also verify.
+    #[test]
+    fn r23_direct_matches_legacy_prove() {
+        // (m, Some((k_log, useful_bits))) — None means dense.
+        let cases: &[(usize, Option<(usize, usize)>)] = &[
+            (13, None),
+            (14, None),
+            (16, None),
+            (14, Some((10, 700))),
+            (15, Some((11, 1_900))),
+        ];
+        for &(m, pad) in cases {
+            let mut rng = Rng::new(0x2323_D1EC ^ (m as u64) << 4);
+            let mut a = rng.bits(1 << m);
+            let mut b = rng.bits(1 << m);
+            let padding = match pad {
+                None => PaddingSpec::dense(m),
+                Some((k_log, useful_bits)) => {
+                    let block_size = 1usize << k_log;
+                    for blk in 0..(1usize << (m - k_log)) {
+                        a[blk * block_size + useful_bits..(blk + 1) * block_size].fill(false);
+                        b[blk * block_size + useful_bits..(blk + 1) * block_size].fill(false);
+                    }
+                    PaddingSpec {
+                        k_log,
+                        useful_bits_per_block: useful_bits,
+                    }
+                }
+            };
+            let c: Vec<bool> = a.iter().zip(&b).map(|(x, y)| *x & *y).collect();
+            let (a_p, b_p, c_p) = pack_abc(&a, &b, &c);
+
+            let mut ch_legacy = FsChallenger::new(b"flock-test-v0");
+            let (proof_legacy, claim_legacy, _) = prove_packed_padded_inner_mode(
+                &a_p, &b_p, &c_p, m, &padding, false, None, true, &mut ch_legacy,
+            );
+            let mut ch_direct = FsChallenger::new(b"flock-test-v0");
+            let (proof_direct, claim_direct, _) = prove_packed_padded_inner_mode(
+                &a_p, &b_p, &c_p, m, &padding, false, None, false, &mut ch_direct,
+            );
+
+            assert_eq!(
+                proof_legacy, proof_direct,
+                "proof mismatch at m={m}, pad={pad:?}"
+            );
+            assert_eq!(
+                claim_legacy, claim_direct,
+                "claim mismatch at m={m}, pad={pad:?}"
+            );
+
+            let mut ch_verify = FsChallenger::new(b"flock-test-v0");
+            verify(m, &proof_direct, &mut ch_verify)
+                .unwrap_or_else(|e| panic!("direct proof rejected at m={m}, pad={pad:?}: {e:?}"));
         }
     }
 

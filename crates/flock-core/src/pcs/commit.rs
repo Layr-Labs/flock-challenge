@@ -159,6 +159,7 @@ pub struct ProverData {
 impl Drop for ProverData {
     fn drop(&mut self) {
         crate::scratch::give_f128(std::mem::take(&mut self.codeword));
+        crate::scratch::give_hash(std::mem::take(&mut self.merkle_tree));
     }
 }
 
@@ -452,7 +453,7 @@ fn finalize_commit(mut codeword: Vec<F128>, params: &PcsParams) -> (Commitment, 
         // advances allocation lifetime but does not raise the commit's final
         // codeword+tree peak alongside the retained prover scratch pools.
         let total_nodes = 2 * params.n_leaves() - 1;
-        crate::alloc_uninit_vec::<Hash>(total_nodes)
+        crate::scratch::take_hash(total_nodes)
     });
     let timing = std::env::var_os("FLOCK_COMMIT_TIMING").is_some();
     let t_ntt = std::time::Instant::now();

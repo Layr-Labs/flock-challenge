@@ -381,6 +381,37 @@ pub fn prover_config_for(
     log_batch_size: usize,
     profile: LigeritoProfile,
 ) -> Result<ProverConfig, String> {
+    // The config is a pure function of (log_n, log_batch_size, profile) —
+    // a TOML parse plus a per-level float soundness sweep. It sits on the
+    // timed path of every prove (first statement before commit), so cache
+    // the result; the warm-up proof pays the one-time cost.
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+    static CACHE: Mutex<Option<HashMap<(usize, usize, &'static str), ProverConfig>>> =
+        Mutex::new(None);
+    let key = (log_n, log_batch_size, profile.as_str());
+    if let Some(cfg) = CACHE
+        .lock()
+        .unwrap()
+        .as_ref()
+        .and_then(|m| m.get(&key).cloned())
+    {
+        return Ok(cfg);
+    }
+    let computed = prover_config_for_uncached(log_n, log_batch_size, profile)?;
+    CACHE
+        .lock()
+        .unwrap()
+        .get_or_insert_with(HashMap::new)
+        .insert(key, computed.clone());
+    Ok(computed)
+}
+
+fn prover_config_for_uncached(
+    log_n: usize,
+    log_batch_size: usize,
+    profile: LigeritoProfile,
+) -> Result<ProverConfig, String> {
     let m = log_n + crate::pcs::LOG_PACKING;
     let toml = embedded_security_config(m, profile).ok_or_else(|| {
         format!(

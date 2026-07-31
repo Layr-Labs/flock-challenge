@@ -397,6 +397,200 @@ pub(crate) unsafe fn fold_round2_compact_chunk_neon_unchecked_8(
     }
 }
 
+/// Message-only round-two worker: identical arithmetic to
+/// [`fold_round2_compact_chunk_neon_unchecked_8`] but with ZERO stores — no
+/// anchors, no deltas, no folded rows. Used by the direct round-3 path, which
+/// re-reads the packed inputs instead of a materialized intermediate.
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "aes")]
+pub(crate) unsafe fn round2_message_chunk_neon_unchecked_8(
+    table_data: *const u8,
+    a_packed: *const u8,
+    b_packed: *const u8,
+    eq_lo: *const F128,
+    lo_size: usize,
+    pair_idx_base: usize,
+    pair_in_block_mask: usize,
+    useful_pairs_inclusive: usize,
+) -> (F128, F128) {
+    use core::arch::aarch64::*;
+
+    unsafe {
+        let zero = vdupq_n_u64(0);
+        let mut p1_acc = WideNeon { lo: zero, hi: zero };
+        let mut pinf_acc = WideNeon { lo: zero, hi: zero };
+
+        for x_lo in 0..lo_size {
+            if ((pair_idx_base + x_lo) & pair_in_block_mask) >= useful_pairs_inclusive {
+                continue;
+            }
+
+            let row0 = 2 * x_lo;
+            let row1 = row0 + 1;
+            let a0_code = u64::from_le(core::ptr::read_unaligned(
+                a_packed.add(row0 * 8).cast::<u64>(),
+            ));
+            let a1_code = u64::from_le(core::ptr::read_unaligned(
+                a_packed.add(row1 * 8).cast::<u64>(),
+            ));
+            let b0_code = u64::from_le(core::ptr::read_unaligned(
+                b_packed.add(row0 * 8).cast::<u64>(),
+            ));
+            let b1_code = u64::from_le(core::ptr::read_unaligned(
+                b_packed.add(row1 * 8).cast::<u64>(),
+            ));
+            let (a0, a1, b0, b1) =
+                fold_four_row_codes_q(table_data, a0_code, a1_code, b0_code, b1_code);
+
+            let g1 = mul_q(a1, b1);
+            let g_inf = mul_q(veorq_u64(a0, a1), veorq_u64(b0, b1));
+            let eq_l = vld1q_u64(eq_lo.add(x_lo).cast::<u64>());
+            wide_xor(&mut p1_acc, mul_unreduced_q(eq_l, g1));
+            wide_xor(&mut pinf_acc, mul_unreduced_q(eq_l, g_inf));
+        }
+
+        (
+            core::mem::transmute::<uint64x2_t, F128>(reduce_wide_q(p1_acc)),
+            core::mem::transmute::<uint64x2_t, F128>(reduce_wide_q(pinf_acc)),
+        )
+    }
+}
+
+/// Direct round-3 worker: fold one output level straight from the ORIGINAL
+/// packed rows using two challenge-composed byte tables, and form the next
+/// sumcheck message. For output index `k` (rows `2k`, `2k+1`):
+///
+/// `out[k] = fold_U(row_{2k}) + fold_V(row_{2k+1})`
+///
+/// with `U = (1+rho)·T` and `V = rho·T`. By XOR-linearity of the byte-table
+/// fold this equals the compact path's `anchor + rho-scaled fold(delta)`
+/// bit-for-bit, without ever materializing anchors or deltas.
+///
+/// `out_idx_base` is the global output index of this chunk's first output;
+/// the padding predicate is per OUTPUT index (= round-2 pair index), so a
+/// mixed boundary pair computes only its useful lane and never reads the
+/// packed rows of a fully-padded pair (matching the legacy skip exactly).
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "aes")]
+pub(crate) unsafe fn fold_direct_chunk_neon_unchecked_8(
+    table_u: *const u8,
+    table_v: *const u8,
+    a_packed: *const u8,
+    b_packed: *const u8,
+    a_out: *mut F128,
+    b_out: *mut F128,
+    eq_lo: *const F128,
+    lo_size: usize,
+    out_idx_base: usize,
+    pair_in_block_mask: usize,
+    useful_pairs_inclusive: usize,
+) -> (F128, F128) {
+    use core::arch::aarch64::*;
+
+    #[inline(always)]
+    unsafe fn store_pair_nt(dst: *mut F128, x: uint64x2_t, y: uint64x2_t) {
+        // Same non-temporal pair hint as the round-two producer: the two
+        // output tables are not consumed until the producer barrier, so
+        // ordinary stores would only add write-allocate traffic and evict
+        // the two 32 KiB fold tables.
+        unsafe {
+            core::arch::asm!(
+                "stnp {x:q}, {y:q}, [{dst}]",
+                dst = in(reg) dst,
+                x = in(vreg) x,
+                y = in(vreg) y,
+                options(nostack, preserves_flags),
+            );
+        }
+    }
+
+    unsafe {
+        let zero = vdupq_n_u64(0);
+        let mut p1_acc = WideNeon { lo: zero, hi: zero };
+        let mut pinf_acc = WideNeon { lo: zero, hi: zero };
+
+        for x_lo in 0..lo_size {
+            let out = 2 * x_lo;
+            let i0 = out_idx_base + out;
+            let skip0 = (i0 & pair_in_block_mask) >= useful_pairs_inclusive;
+            let skip1 = ((i0 + 1) & pair_in_block_mask) >= useful_pairs_inclusive;
+            if skip0 && skip1 {
+                store_pair_nt(a_out.add(out), zero, zero);
+                store_pair_nt(b_out.add(out), zero, zero);
+                continue;
+            }
+
+            // Chunk-local rows for outputs (out, out+1): 4 consecutive rows
+            // of 8 bytes each, starting at row 2·out.
+            let a_rows = a_packed.add(out * 16);
+            let b_rows = b_packed.add(out * 16);
+
+            let (a0, a1, b0, b1);
+            if !skip0 && !skip1 {
+                let a_r0 = u64::from_le(core::ptr::read_unaligned(a_rows.cast::<u64>()));
+                let a_r1 = u64::from_le(core::ptr::read_unaligned(a_rows.add(8).cast::<u64>()));
+                let a_r2 = u64::from_le(core::ptr::read_unaligned(a_rows.add(16).cast::<u64>()));
+                let a_r3 = u64::from_le(core::ptr::read_unaligned(a_rows.add(24).cast::<u64>()));
+                let b_r0 = u64::from_le(core::ptr::read_unaligned(b_rows.cast::<u64>()));
+                let b_r1 = u64::from_le(core::ptr::read_unaligned(b_rows.add(8).cast::<u64>()));
+                let b_r2 = u64::from_le(core::ptr::read_unaligned(b_rows.add(16).cast::<u64>()));
+                let b_r3 = u64::from_le(core::ptr::read_unaligned(b_rows.add(24).cast::<u64>()));
+                let (a0u, a1u, b0u, b1u) =
+                    fold_four_row_codes_q(table_u, a_r0, a_r2, b_r0, b_r2);
+                let (a0v, a1v, b0v, b1v) =
+                    fold_four_row_codes_q(table_v, a_r1, a_r3, b_r1, b_r3);
+                a0 = veorq_u64(a0u, a0v);
+                a1 = veorq_u64(a1u, a1v);
+                b0 = veorq_u64(b0u, b0v);
+                b1 = veorq_u64(b1u, b1v);
+            } else {
+                // Mixed boundary pair (at most one per padded block): compute
+                // only the useful lane, never touching fully-padded rows.
+                if skip0 {
+                    a0 = zero;
+                    b0 = zero;
+                } else {
+                    a0 = veorq_u64(
+                        fold_row_q(table_u, a_rows),
+                        fold_row_q(table_v, a_rows.add(8)),
+                    );
+                    b0 = veorq_u64(
+                        fold_row_q(table_u, b_rows),
+                        fold_row_q(table_v, b_rows.add(8)),
+                    );
+                }
+                if skip1 {
+                    a1 = zero;
+                    b1 = zero;
+                } else {
+                    a1 = veorq_u64(
+                        fold_row_q(table_u, a_rows.add(16)),
+                        fold_row_q(table_v, a_rows.add(24)),
+                    );
+                    b1 = veorq_u64(
+                        fold_row_q(table_u, b_rows.add(16)),
+                        fold_row_q(table_v, b_rows.add(24)),
+                    );
+                }
+            }
+
+            store_pair_nt(a_out.add(out), a0, a1);
+            store_pair_nt(b_out.add(out), b0, b1);
+
+            let g1 = mul_q(a1, b1);
+            let g_inf = mul_q(veorq_u64(a0, a1), veorq_u64(b0, b1));
+            let eq_l = vld1q_u64(eq_lo.add(x_lo).cast::<u64>());
+            wide_xor(&mut p1_acc, mul_unreduced_q(eq_l, g1));
+            wide_xor(&mut pinf_acc, mul_unreduced_q(eq_l, g_inf));
+        }
+
+        (
+            core::mem::transmute::<uint64x2_t, F128>(reduce_wide_q(p1_acc)),
+            core::mem::transmute::<uint64x2_t, F128>(reduce_wide_q(pinf_acc)),
+        )
+    }
+}
+
 /// Reconstruct one compact round-two level at the sampled challenge and form
 /// the next sumcheck message. `scaled_table` is the univariate fold table with
 /// every entry multiplied by that challenge, so reconstruction needs only

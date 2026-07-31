@@ -36,6 +36,24 @@ pub struct InvNttTableByteSingleGf8 {
     data_offset: usize,
 }
 
+/// Cached standard `(k_skip)` table for the univariate-skip round-1 pair
+/// `ntt_S = AdditiveNttGf8(k, 0)`, `ntt_L = AdditiveNttGf8(k, 1 << k)` — the
+/// only shape the prover ever builds, and a pure function of `k`. Built twice
+/// per prove without this (commit window + zerocheck window); the warm-up
+/// proof pays the one-time cost instead.
+pub fn cached_skip_table(k_skip: usize) -> &'static InvNttTableByteSingleGf8 {
+    use std::sync::OnceLock;
+    const MAX_K: usize = 8;
+    static TABLES: [OnceLock<InvNttTableByteSingleGf8>; MAX_K + 1] =
+        [const { OnceLock::new() }; MAX_K + 1];
+    assert!(k_skip >= 3 && k_skip <= MAX_K, "unsupported k_skip");
+    TABLES[k_skip].get_or_init(|| {
+        let ntt_s = AdditiveNttGf8::new(k_skip, F8::ZERO);
+        let ntt_l = AdditiveNttGf8::new(k_skip, F8(1u8 << k_skip));
+        InvNttTableByteSingleGf8::new(&ntt_s, &ntt_l)
+    })
+}
+
 impl InvNttTableByteSingleGf8 {
     /// Build the table given the two NTT instances: `ntt_S` over the input
     /// domain, `ntt_L` over the output (extension) domain. Both must have the
