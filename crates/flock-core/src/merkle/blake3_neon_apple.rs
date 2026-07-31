@@ -274,3 +274,145 @@ fn hash_complete_groups_flags(data: &[u8], out: &mut [[u8; 32]], flags: u32) -> 
     }
     groups * 12
 }
+
+/// [`transpose_parent4`] generalized to messages `stride` bytes apart: load
+/// one 64-byte block from each of four lanes at `base`, `base + stride`,
+/// `base + 2·stride`, `base + 3·stride` and transpose into sixteen
+/// word-across-lanes vectors. `stride` is always a literal at the call site,
+/// so the address arithmetic constant-folds exactly like the parent path.
+#[inline(always)]
+unsafe fn transpose_stride4(base: *const u8, stride: usize, out: &mut [uint32x4_t; 16]) {
+    unsafe {
+        for word_vec in 0..4 {
+            let word_offset = word_vec * 16;
+            let mut rows = [
+                vreinterpretq_u32_u8(vld1q_u8(base.add(word_offset))),
+                vreinterpretq_u32_u8(vld1q_u8(base.add(stride + word_offset))),
+                vreinterpretq_u32_u8(vld1q_u8(base.add(2 * stride + word_offset))),
+                vreinterpretq_u32_u8(vld1q_u8(base.add(3 * stride + word_offset))),
+            ];
+            transpose4(&mut rows);
+            out[word_vec * 4..word_vec * 4 + 4].copy_from_slice(&rows);
+        }
+    }
+}
+
+/// Rebuild a compression state for the next block of the same chunk: rows
+/// 0..8 take the chaining value `v[i] ^ v[i+8]` of the block just
+/// compressed, rows 8..12 the IV, counter stays zero, `block_len` 64, and
+/// `flags` selects the new block's domain bits.
+#[inline(always)]
+unsafe fn chain_state(
+    v: &[uint32x4_t; 16],
+    iv: &[uint32x4_t; 8],
+    zero: uint32x4_t,
+    flags: uint32x4_t,
+) -> [uint32x4_t; 16] {
+    unsafe {
+        [
+            veorq_u32(v[0], v[8]),
+            veorq_u32(v[1], v[9]),
+            veorq_u32(v[2], v[10]),
+            veorq_u32(v[3], v[11]),
+            veorq_u32(v[4], v[12]),
+            veorq_u32(v[5], v[13]),
+            veorq_u32(v[6], v[14]),
+            veorq_u32(v[7], v[15]),
+            iv[0],
+            iv[1],
+            iv[2],
+            iv[3],
+            zero,
+            zero,
+            vdupq_n_u32(64),
+            flags,
+        ]
+    }
+}
+
+/// Hash complete groups of twelve contiguous 128-byte leaves.
+///
+/// Each leaf is a single two-block chunk: block 0 compressed from the IV
+/// with `CHUNK_START` (1), block 1 chained through the block-0 CV with
+/// `CHUNK_END` (2), counter zero throughout, 32-byte non-root CV out —
+/// byte-identical to `blake3_leaf_cv` on the same 128 bytes. Twelve leaves
+/// run as three interleaved four-lane states, exactly the ILP shape of
+/// [`hash_complete_parent_groups`], with two sequential compressions per
+/// leaf. Tails remain on upstream `hash_many`, so arbitrary Rayon
+/// partitions are safe.
+pub(super) fn hash_complete_leaf128_groups(data: &[u8], out: &mut [[u8; 32]]) -> usize {
+    debug_assert_eq!(data.len(), out.len() * 128);
+    let groups = out.len() / 12;
+    if groups == 0 {
+        return 0;
+    }
+
+    unsafe {
+        let zero = vdupq_n_u32(0);
+        let iv = [
+            vdupq_n_u32(IV[0]),
+            vdupq_n_u32(IV[1]),
+            vdupq_n_u32(IV[2]),
+            vdupq_n_u32(IV[3]),
+            vdupq_n_u32(IV[4]),
+            vdupq_n_u32(IV[5]),
+            vdupq_n_u32(IV[6]),
+            vdupq_n_u32(IV[7]),
+        ];
+        // Block 0 of a fresh chunk: CV = IV, counter zero, block_len 64,
+        // CHUNK_START.
+        let init = [
+            iv[0],
+            iv[1],
+            iv[2],
+            iv[3],
+            iv[4],
+            iv[5],
+            iv[6],
+            iv[7],
+            iv[0],
+            iv[1],
+            iv[2],
+            iv[3],
+            zero,
+            zero,
+            vdupq_n_u32(64),
+            vdupq_n_u32(1),
+        ];
+        for group in 0..groups {
+            let input = data.as_ptr().add(group * 12 * 128);
+            let mut m0 = [zero; 16];
+            let mut m1 = [zero; 16];
+            let mut m2 = [zero; 16];
+            transpose_stride4(input, 128, &mut m0);
+            transpose_stride4(input.add(4 * 128), 128, &mut m1);
+            transpose_stride4(input.add(8 * 128), 128, &mut m2);
+
+            let mut v0 = init;
+            let mut v1 = init;
+            let mut v2 = init;
+            for schedule in &MSG_SCHEDULE {
+                round3(&mut v0, &mut v1, &mut v2, &m0, &m1, &m2, schedule);
+            }
+
+            // Chain the block-0 CVs into block 1, flagged CHUNK_END.
+            let flags_end = vdupq_n_u32(2);
+            let mut v0 = chain_state(&v0, &iv, zero, flags_end);
+            let mut v1 = chain_state(&v1, &iv, zero, flags_end);
+            let mut v2 = chain_state(&v2, &iv, zero, flags_end);
+
+            transpose_stride4(input.add(64), 128, &mut m0);
+            transpose_stride4(input.add(4 * 128 + 64), 128, &mut m1);
+            transpose_stride4(input.add(8 * 128 + 64), 128, &mut m2);
+            for schedule in &MSG_SCHEDULE {
+                round3(&mut v0, &mut v1, &mut v2, &m0, &m1, &m2, schedule);
+            }
+
+            let output = out.as_mut_ptr().cast::<u8>().add(group * 12 * 32);
+            store_cv4(&mut v0, output);
+            store_cv4(&mut v1, output.add(4 * 32));
+            store_cv4(&mut v2, output.add(8 * 32));
+        }
+    }
+    groups * 12
+}

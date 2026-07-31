@@ -58,6 +58,68 @@ pub(super) unsafe fn butterfly_fused_2layer_low_twiddles(
     }
 }
 
+/// Fused two-layer butterfly for a pair whose outer twiddle is generic but
+/// whose two inner twiddles have tiny high limbs (`hi < 32`).
+///
+/// The outer stage batches its two shared-constant products with the vec2
+/// Karatsuba (6 PMULL); the inner stage batches its two tiny-hi products
+/// with the truncated-reduction schoolbook (8 PMULL). 14 PMULL per lane for
+/// the pair versus 24 under the generic Binius field multiplier.
+///
+/// # Safety
+/// Requires the `aes` target feature.
+#[allow(clippy::too_many_arguments)]
+#[target_feature(enable = "aes")]
+#[inline]
+pub(super) unsafe fn butterfly_fused_2layer_tiny_hi_inner(
+    a: &mut [F128],
+    b: &mut [F128],
+    c: &mut [F128],
+    d: &mut [F128],
+    t_outer: F128,
+    t_inner_a: F128,
+    t_inner_b: F128,
+) {
+    use crate::field::gf2_128::aarch64::{
+        ghash_mul_const_vec2_neon, ghash_mul_tiny_hi_constants_vec2_neon,
+    };
+
+    debug_assert_eq!(a.len(), b.len());
+    debug_assert_eq!(a.len(), c.len());
+    debug_assert_eq!(a.len(), d.len());
+    debug_assert!(t_inner_a.hi < 32);
+    debug_assert!(t_inner_b.hi < 32);
+
+    for lane in 0..a.len() {
+        let mut xa = a[lane];
+        let mut xb = b[lane];
+        let mut xc = c[lane];
+        let mut xd = d[lane];
+
+        // SAFETY: this function carries aes; the outer constant is generic.
+        let outer = unsafe { ghash_mul_const_vec2_neon(t_outer, [xc, xd]) };
+        xa += outer[0];
+        xc += xa;
+        xb += outer[1];
+        xd += xb;
+
+        // SAFETY: this function carries aes and both inner constants have
+        // tiny high limbs by the ranked gate and assertions above.
+        let inner = unsafe {
+            ghash_mul_tiny_hi_constants_vec2_neon([t_inner_a, t_inner_b], [xb, xd])
+        };
+        xa += inner[0];
+        xb += xa;
+        xc += inner[1];
+        xd += xc;
+
+        a[lane] = xa;
+        b[lane] = xb;
+        c[lane] = xc;
+        d[lane] = xd;
+    }
+}
+
 /// Process two butterflies at a time within a block sharing one twiddle.
 ///
 /// # Safety

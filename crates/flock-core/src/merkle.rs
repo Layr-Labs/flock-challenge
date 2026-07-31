@@ -380,6 +380,26 @@ fn blake3_hash_many_leaves(data: &[u8], leaf_size: usize, out: &mut [Hash]) -> b
         return true;
     }
 
+    // Recursive Ligerito commit levels use 128-byte leaves (two-block single
+    // chunks). Complete groups of twelve go through the interleaved
+    // three-state NEON kernel; the tail — and the whole run under the
+    // `FLOCK_NO_LEAF128_TWELVE` kill-switch — stays on upstream `hash_many`,
+    // which is the pre-existing 4-wide path below.
+    #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+    if leaf_size == 128 && std::env::var_os("FLOCK_NO_LEAF128_TWELVE").is_none() {
+        let done = blake3_neon_apple::hash_complete_leaf128_groups(data, out);
+        if done < out.len() {
+            blake3_hash_many::<128>(
+                &data[done * 128..],
+                &mut out[done..],
+                0,
+                BLAKE3_CHUNK_START,
+                BLAKE3_CHUNK_END,
+            );
+        }
+        return true;
+    }
+
     macro_rules! dispatch {
         ($($n:literal),+ $(,)?) => {
             match leaf_size {
@@ -1072,6 +1092,25 @@ mod tests {
                         batched[i],
                         blake3_leaf_cv(&data[i * leaf_size..(i + 1) * leaf_size]),
                         "leaf {i} of {n} at size {leaf_size}"
+                    );
+                }
+            }
+        }
+
+        // 128-byte leaves through the twelve-way two-block kernel: random
+        // data (the cyclic pattern above repeats across lanes), with counts
+        // straddling the group-of-12 boundary so both the interleaved kernel
+        // and the upstream 4-wide tail are exercised in one call.
+        for n in [11usize, 12, 13, 24, 25] {
+            for seed in [0, 1, 0xA11C_E5EE_D15C, u64::MAX] {
+                let data = random_data(n, 128, seed);
+                let mut batched = vec![[0u8; 32]; n];
+                assert!(blake3_hash_many_leaves(&data, 128, &mut batched));
+                for i in 0..n {
+                    assert_eq!(
+                        batched[i],
+                        blake3_leaf_cv(&data[i * 128..(i + 1) * 128]),
+                        "128-byte leaf {i} of {n}, seed {seed:#x}"
                     );
                 }
             }
