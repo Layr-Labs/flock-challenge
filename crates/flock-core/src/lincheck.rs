@@ -451,6 +451,17 @@ pub struct LincheckClaim {
     pub w: F128,
 }
 
+/// Lincheck intermediate retained for the PCS AB opening.
+///
+/// The generic form is the full pre-sumcheck `z_vec`. The ranked direct-fold2
+/// form is the same vector after its high coordinates have already been bound
+/// by lincheck, leaving the four 128-element banks the opening consumes.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PcsZCapture {
+    PreSumcheck(Vec<F128>),
+    DirectAbQuad(Vec<F128>),
+}
+
 /// Reasons the verifier may reject.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum VerifyError {
@@ -1230,7 +1241,7 @@ pub fn prove_padded<Ch: Challenger>(
         useful_bits,
         circuit,
         x_ab,
-        false,
+        ZCaptureMode::None,
         challenger,
     );
     (proof, claim)
@@ -1263,14 +1274,72 @@ pub fn prove_padded_capture_z_vec<Ch: Challenger>(
         useful_bits,
         circuit,
         x_ab,
-        true,
+        ZCaptureMode::PreSumcheck,
         challenger,
     );
     (
         proof,
         claim,
-        captured.expect("capture=true must produce z_vec"),
+        match captured.expect("pre-sumcheck capture must produce z_vec") {
+            PcsZCapture::PreSumcheck(z_vec) => z_vec,
+            PcsZCapture::DirectAbQuad(_) => unreachable!("requested pre-sumcheck capture"),
+        },
     )
+}
+
+/// Capture the lincheck intermediate needed by the PCS AB opening.
+///
+/// When `direct_ab_quad` is false this is the ordinary pre-sumcheck `z_vec`.
+/// When true, lincheck retains the 512-element state after binding every high
+/// coordinate above the two direct-fold2 bank coordinates. This state is
+/// already exactly `s_hat_v_quad`; reusing it deletes the later eq-table fold.
+pub fn prove_padded_capture_pcs_z<Ch: Challenger>(
+    z_packed: &[u8],
+    m: usize,
+    k_log: usize,
+    k_skip: usize,
+    useful_bits: usize,
+    circuit: &dyn LincheckCircuit,
+    x_ab: &QuirkyPoint,
+    direct_ab_quad: bool,
+    challenger: &mut Ch,
+) -> (LincheckProof, LincheckClaim, PcsZCapture) {
+    let capture_mode = if direct_ab_quad {
+        assert!(
+            k_log >= crate::pcs::LOG_PACKING + 2,
+            "direct AB quad capture needs two bank coordinates"
+        );
+        assert!(
+            k_skip <= crate::pcs::LOG_PACKING + 2,
+            "lincheck must bind every coordinate above the direct AB banks"
+        );
+        ZCaptureMode::DirectAbQuad
+    } else {
+        ZCaptureMode::PreSumcheck
+    };
+    let (proof, claim, captured) = prove_padded_inner(
+        z_packed,
+        m,
+        k_log,
+        k_skip,
+        useful_bits,
+        circuit,
+        x_ab,
+        capture_mode,
+        challenger,
+    );
+    (
+        proof,
+        claim,
+        captured.expect("PCS capture mode must produce an intermediate"),
+    )
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ZCaptureMode {
+    None,
+    PreSumcheck,
+    DirectAbQuad,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1282,9 +1351,9 @@ fn prove_padded_inner<Ch: Challenger>(
     useful_bits: usize,
     circuit: &dyn LincheckCircuit,
     x_ab: &QuirkyPoint,
-    capture_z_vec: bool,
+    capture_mode: ZCaptureMode,
     challenger: &mut Ch,
-) -> (LincheckProof, LincheckClaim, Option<Vec<F128>>) {
+) -> (LincheckProof, LincheckClaim, Option<PcsZCapture>) {
     let k = 1usize << k_log;
     let n_log = m - k_log;
     assert!(m >= k_log);
@@ -1368,14 +1437,18 @@ fn prove_padded_inner<Ch: Challenger>(
     } else {
         rayon::join(comb_branch, z_branch)
     };
-    // 3b. Optional capture: clone the pre-sumcheck z_vec for downstream reuse
-    //     (PCS open's AB-claim s_hat_v skipping fold_1b_rows). Only pay the
-    //     clone when explicitly requested.
-    let captured_z_vec: Option<Vec<F128>> = if capture_z_vec {
-        Some(z_vec.clone())
-    } else {
-        None
+    // 3b. Optional capture for downstream PCS reuse. The generic path clones
+    //     the full pre-sumcheck vector. The ranked direct-fold2 path waits
+    //     until lincheck itself has bound every coordinate above the two bank
+    //     coordinates, then clones only the resulting four 128-element banks.
+    let quad_capture_rounds = k_log.saturating_sub(crate::pcs::LOG_PACKING + 2);
+    let mut captured_z = match capture_mode {
+        ZCaptureMode::None | ZCaptureMode::DirectAbQuad => None,
+        ZCaptureMode::PreSumcheck => Some(PcsZCapture::PreSumcheck(z_vec.clone())),
     };
+    if capture_mode == ZCaptureMode::DirectAbQuad && quad_capture_rounds == 0 {
+        captured_z = Some(PcsZCapture::DirectAbQuad(z_vec.clone()));
+    }
     let t_sumcheck_start = if trace {
         Some(std::time::Instant::now())
     } else {
@@ -1409,6 +1482,12 @@ fn prove_padded_inner<Ch: Challenger>(
                 // Final round: just fold; z_vec collapses to z_partial.
                 sumcheck_bind_top_in_place_par(&mut comb_vec, r);
                 sumcheck_bind_top_in_place_par(&mut z_vec, r);
+            }
+            if capture_mode == ZCaptureMode::DirectAbQuad
+                && t + 1 == quad_capture_rounds
+            {
+                assert_eq!(z_vec.len(), 4 * (1usize << crate::pcs::LOG_PACKING));
+                captured_z = Some(PcsZCapture::DirectAbQuad(z_vec.clone()));
             }
         }
     }
@@ -1448,7 +1527,7 @@ fn prove_padded_inner<Ch: Challenger>(
         r_inner_rest,
         w,
     };
-    (proof, claim, captured_z_vec)
+    (proof, claim, captured_z)
 }
 
 /// Verify a lincheck proof. Walks the challenger in lockstep with `prove`,
@@ -2243,6 +2322,87 @@ mod tests {
                 "verify did not reject {label}: got {res:?}"
             );
         }
+    }
+
+    #[test]
+    fn direct_ab_quad_checkpoint_matches_full_vector_fold() {
+        const K_LOG: usize = 14;
+        let mut rng = Rng::new(0xAB_C0DE_512);
+        let z_vec = rng.f128_vec(1 << K_LOG);
+        let bank_point = rng.f128_vec(2);
+        let high_point = rng.f128_vec(K_LOG - crate::pcs::LOG_PACKING - 2);
+
+        let mut checkpoint = z_vec.clone();
+        for &challenge in high_point.iter().rev() {
+            sumcheck_bind_top_in_place_par(&mut checkpoint, challenge);
+        }
+        assert_eq!(checkpoint.len(), 4 * (1usize << crate::pcs::LOG_PACKING));
+
+        let mut inner_rest_tail = bank_point;
+        inner_rest_tail.extend_from_slice(&high_point);
+        let expected = crate::pcs::ring_switch::s_hat_v_quad_from_z_vec(
+            &z_vec,
+            &inner_rest_tail,
+        );
+        assert_eq!(checkpoint, expected);
+    }
+
+    #[test]
+    fn pcs_quad_checkpoint_preserves_lincheck_transcript() {
+        const M: usize = 14;
+        const K_LOG: usize = 11;
+        const K_SKIP: usize = 6;
+        let k = 1usize << K_LOG;
+        let mut rng = Rng::new(0x51A7_CAFE);
+        let a_0 = random_sparse_matrix(k, 2 * k, &mut rng);
+        let b_0 = random_sparse_matrix(k, 2 * k, &mut rng);
+        let z = rng.bits(1 << M);
+        let z_packed = pack_z_lincheck(&z, M, K_LOG);
+        let x_ab = random_quirky_point(M, K_LOG, K_SKIP, &mut rng);
+        let circuit = SparseMatrixCircuit::new(&a_0, &b_0);
+
+        let mut pre_challenger = FsChallenger::new(b"flock-lincheck-checkpoint-test");
+        let (pre_proof, pre_claim, pre_z) = prove_padded_capture_z_vec(
+            &z_packed,
+            M,
+            K_LOG,
+            K_SKIP,
+            k,
+            &circuit,
+            &x_ab,
+            &mut pre_challenger,
+        );
+
+        let mut checkpoint_challenger = FsChallenger::new(b"flock-lincheck-checkpoint-test");
+        let (checkpoint_proof, checkpoint_claim, capture) = prove_padded_capture_pcs_z(
+            &z_packed,
+            M,
+            K_LOG,
+            K_SKIP,
+            k,
+            &circuit,
+            &x_ab,
+            true,
+            &mut checkpoint_challenger,
+        );
+
+        assert_eq!(checkpoint_proof, pre_proof);
+        assert_eq!(checkpoint_claim, pre_claim);
+        assert_eq!(
+            checkpoint_challenger.sample_f128(),
+            pre_challenger.sample_f128(),
+            "checkpoint capture changed the transcript"
+        );
+
+        let checkpoint = match capture {
+            PcsZCapture::DirectAbQuad(checkpoint) => checkpoint,
+            PcsZCapture::PreSumcheck(_) => panic!("requested direct AB checkpoint"),
+        };
+        let expected = crate::pcs::ring_switch::s_hat_v_quad_from_z_vec(
+            &pre_z,
+            &pre_claim.r_inner_rest[1..],
+        );
+        assert_eq!(checkpoint, expected);
     }
 
     /// Verify must reject shape errors.
