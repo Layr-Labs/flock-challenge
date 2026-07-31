@@ -1,4 +1,4 @@
-use super::{F8, InvNttTableByteSingleGf8};
+use super::{InvNttTableByteSingleGf8, F8};
 
 mod portable;
 
@@ -60,17 +60,12 @@ pub(super) fn shift_reduce_inner_ab(
     out: &mut [u8; 64],
     a_col: &mut [F8],
     b_col: &mut [F8],
+    check_all_ones: bool,
+    check_single_k0: bool,
 ) {
     #[cfg(target_arch = "aarch64")]
     {
         let _ = (a_col, b_col);
-        // EXPERIMENT (seam-urm): V1 = ntt(all-ones), protocol-fixed.
-        static V1: std::sync::OnceLock<[u8; 64]> = std::sync::OnceLock::new();
-        let v1 = V1.get_or_init(|| {
-            let mut f = [F8::ZERO; 64];
-            inv_table.apply(&[0xffu8; 8], &mut f);
-            core::array::from_fn(|i| f[i].0)
-        });
         aarch64::shift_reduce_inner_ab_fused_neon_checked(
             a_packed,
             b_packed,
@@ -78,7 +73,8 @@ pub(super) fn shift_reduce_inner_ab(
             chunk_byte_base,
             b_med,
             out,
-            v1,
+            check_all_ones,
+            check_single_k0,
         );
     }
 
@@ -89,7 +85,7 @@ pub(super) fn shift_reduce_inner_ab(
         target_feature = "avx512bw"
     ))]
     {
-        let _ = (a_col, b_col);
+        let _ = (a_col, b_col, check_all_ones, check_single_k0);
         // SAFETY: all required target features are enabled at compile time.
         unsafe {
             x86_64::shift_reduce_inner_ab_x86_avx512(
@@ -110,6 +106,7 @@ pub(super) fn shift_reduce_inner_ab(
     ))]
     // SAFETY: gfni is enabled at compile time; SSE2 is baseline on x86_64.
     unsafe {
+        let _ = (check_all_ones, check_single_k0);
         x86_64::shift_reduce_inner_ab_x86_sse(
             a_packed,
             b_packed,
@@ -126,16 +123,19 @@ pub(super) fn shift_reduce_inner_ab(
         target_arch = "aarch64",
         all(target_arch = "x86_64", target_feature = "gfni")
     )))]
-    portable::shift_reduce_inner_ab_scalar(
-        a_packed,
-        b_packed,
-        inv_table,
-        chunk_byte_base,
-        b_med,
-        out,
-        a_col,
-        b_col,
-    );
+    {
+        let _ = (check_all_ones, check_single_k0);
+        portable::shift_reduce_inner_ab_scalar(
+            a_packed,
+            b_packed,
+            inv_table,
+            chunk_byte_base,
+            b_med,
+            out,
+            a_col,
+            b_col,
+        );
+    }
 }
 
 #[allow(clippy::too_many_arguments)]

@@ -336,6 +336,12 @@ pub fn precompute_round1_ab_inner_packed_padded(
     assert_eq!(total_bytes % core::mem::size_of::<F128>(), 0);
 
     let (within_outer_mask, b_med_counts) = build_b_med_counts(padding);
+    // The BLAKE3 R1CS has two 8192-bit windows per 16384-bit block. Static
+    // all-ones B rows occur only at b_med 0/1 of the first window, while the
+    // single-K0 tail occurs only at the final b_med of the second window.
+    // Restrict the runtime sniffing to those three candidates; all other
+    // blocks can enter the generic kernel without first rereading B.
+    let blake3_static_layout = padding.k_log == 14 && padding.useful_bits_per_block == 15_409;
     const OUTER_BYTES: usize = (1 << N_MEDIUM) * 64;
     debug_assert_eq!(OUTER_BYTES, (1 << N_INNER) * N_CHUNKS);
 
@@ -369,6 +375,8 @@ pub fn precompute_round1_ab_inner_packed_padded(
                         dst,
                         a_col,
                         b_col,
+                        !blake3_static_layout || (within_hash_outer == 0 && b_med < 2),
+                        !blake3_static_layout || (within_hash_outer == 1 && b_med + 1 == n_b_med),
                     );
                 }
                 out_outer[n_b_med * 64..].fill(0);
@@ -399,6 +407,8 @@ fn shift_reduce_inner_ab(
     out: &mut [u8; 64],
     a_col: &mut [F8],
     b_col: &mut [F8],
+    check_all_ones: bool,
+    check_single_k0: bool,
 ) {
     kernels::shift_reduce_inner_ab(
         a_packed,
@@ -409,6 +419,8 @@ fn shift_reduce_inner_ab(
         out,
         a_col,
         b_col,
+        check_all_ones,
+        check_single_k0,
     );
 }
 
@@ -538,6 +550,8 @@ fn process_one_x_hi(
                     &mut state.chunk_ab_bytes[b_med],
                     &mut state.a_col,
                     &mut state.b_col,
+                    true,
+                    true,
                 );
                 let byte_base_b = chunk_byte_base + b_med * N_CHUNKS * 8;
                 let c_in: &[u8; 64] = (&c_packed[byte_base_b..byte_base_b + 64])
@@ -570,6 +584,8 @@ fn process_one_x_hi(
                     &mut state.chunk_ab_bytes[b_med],
                     &mut state.a_col,
                     &mut state.b_col,
+                    true,
+                    true,
                 );
                 let byte_base_b = chunk_byte_base + b_med * N_CHUNKS * 8;
                 let c_in: &[u8; 64] = (&c_packed[byte_base_b..byte_base_b + 64])
@@ -695,6 +711,8 @@ fn process_one_x_hi_with_s_hat_v(
                     &mut state.chunk_ab_bytes[b_med],
                     &mut state.a_col,
                     &mut state.b_col,
+                    true,
+                    true,
                 );
                 let byte_base_b = chunk_byte_base + b_med * N_CHUNKS * 8;
                 let c_in: &[u8; 64] = (&c_packed[byte_base_b..byte_base_b + 64])
@@ -725,6 +743,8 @@ fn process_one_x_hi_with_s_hat_v(
                     &mut state.chunk_ab_bytes[b_med],
                     &mut state.a_col,
                     &mut state.b_col,
+                    true,
+                    true,
                 );
                 let byte_base_b = chunk_byte_base + b_med * N_CHUNKS * 8;
                 let c_in: &[u8; 64] = (&c_packed[byte_base_b..byte_base_b + 64])
