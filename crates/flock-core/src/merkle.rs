@@ -420,6 +420,12 @@ fn blake3_hash_many_parents(data: &[u8], out: &mut [Hash]) {
     blake3_hash_many::<64>(data, out, BLAKE3_PARENT, 0, 0);
 }
 
+/// Register-resident BLAKE3 PoW nonce scan (Apple AArch64): smallest nonce in
+/// `start .. start + len` whose grind hash has `bits` (1..=32) leading zero
+/// bits. See `blake3_neon_apple::pow_scan_reg`.
+#[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+pub(crate) use blake3_neon_apple::pow_scan_reg as blake3_pow_scan_reg;
+
 /// Batched BLAKE3 PoW grind blocks: `data` is `out.len()` contiguous
 /// 64-byte single-chunk pre-images, hashed with `CHUNK_START | CHUNK_END |
 /// ROOT` — byte-identical to `blake3::hash` on each block. Uses the

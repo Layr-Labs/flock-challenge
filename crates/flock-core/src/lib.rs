@@ -75,6 +75,14 @@ pub fn init_perf_thread_pool() -> Option<usize> {
     }
 }
 
+/// Start the benchmark worker's pool keepalive nudger; see
+/// [`epool::keepalive_start`]. Intended to be called once, right before the
+/// worker signals readiness for the timed seed. Disabled by
+/// `FLOCK_NO_EPOOL_KEEPALIVE=1`.
+
+/// Flip the keepalive nudger to proving mode (helper pool only); see
+/// [`epool::keepalive_proving`]. Call as soon as the timed seed arrives.
+
 /// Mark Rayon prover workers as latency-sensitive on macOS. A bare Rayon pool
 /// inherits default QoS, which lets sustained jobs drift onto efficiency cores
 /// even when the pool was deliberately sized to the performance-core count.
