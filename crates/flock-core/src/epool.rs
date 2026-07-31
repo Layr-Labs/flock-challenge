@@ -128,7 +128,9 @@ const EPOOL_MIN_CHUNKS: usize = 16;
 /// depend on which thread or pool runs it. Chunk-claim order is
 /// nondeterministic; callers get deterministic *output* by making `f(i)`
 /// write only to chunk `i`'s disjoint range.
-pub(crate) fn run_hetero_chunks<F>(n_chunks: usize, f: F)
+/// `pub` (not `pub(crate)`): the witness driver in `flock-prover` drains its
+/// per-group build/transpose/copy loop through this same queue.
+pub fn run_hetero_chunks<F>(n_chunks: usize, f: F)
 where
     F: Fn(usize) + Sync,
 {

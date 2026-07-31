@@ -323,8 +323,6 @@ fn drive_witness_packed_and_lincheck_impl<
 where
     F: Fn(&S, &mut [u64], &mut [u64], &mut [u64]) + Sync,
 {
-    use rayon::prelude::*;
-
     let k = 1usize << k_log;
     let f128_per_block = k / 128;
     let u64_per_block = k / 64;
@@ -370,12 +368,45 @@ where
     let mut b = flock_core::scratch::take_f128(total_f128);
     let mut z_lincheck = flock_core::scratch::take_u8((n_total / 8) * k);
 
-    z.par_chunks_mut(8 * f128_per_block)
-        .zip(a.par_chunks_mut(8 * f128_per_block))
-        .zip(b.par_chunks_mut(8 * f128_per_block))
-        .zip(z_lincheck.par_chunks_mut(k))
-        .enumerate()
-        .for_each(|(g, (((z_grp, a_grp), b_grp), stripe))| {
+    // Drain the per-group build/transpose/copy loop through the shared
+    // heterogeneous chunk queue instead of an equal-band rayon split, so the
+    // efficiency cores contribute to the one substantial phase that still ran
+    // P-only. The group work is the queue's proven profile — per-block witness
+    // building and the 8×64 bit-transpose are compute/store work on disjoint
+    // ranges, and chunk `c` writes only its own slices, so output bytes are
+    // identical regardless of which pool claims a chunk. Groups are batched
+    // GROUPS_PER_CHUNK at a time to keep each worker's writes streaming in
+    // ~256 KiB runs rather than scattered 16 KiB singles.
+    const GROUPS_PER_CHUNK: usize = 16;
+    let n_groups = n_total / 8;
+    let n_chunks = n_groups.div_ceil(GROUPS_PER_CHUNK);
+    let z_base = SendPtr(z.as_mut_ptr() as *mut u64);
+    let a_base = SendPtr(a.as_mut_ptr() as *mut u64);
+    let b_base = SendPtr(b.as_mut_ptr() as *mut u64);
+    let stripe_base = SendPtr(z_lincheck.as_mut_ptr() as *mut u64);
+    flock_core::epool::run_hetero_chunks(n_chunks, |c| {
+        let g_hi = ((c + 1) * GROUPS_PER_CHUNK).min(n_groups);
+        for g in c * GROUPS_PER_CHUNK..g_hi {
+            // SAFETY: the queue hands out each chunk index exactly once and
+            // groups are disjoint, in-bounds slices of buffers that outlive
+            // the queue join; nothing else touches them while it runs.
+            let (z_grp, a_grp, b_grp, stripe) = unsafe {
+                (
+                    std::slice::from_raw_parts_mut(
+                        (z_base.get() as *mut F128).add(g * 8 * f128_per_block),
+                        8 * f128_per_block,
+                    ),
+                    std::slice::from_raw_parts_mut(
+                        (a_base.get() as *mut F128).add(g * 8 * f128_per_block),
+                        8 * f128_per_block,
+                    ),
+                    std::slice::from_raw_parts_mut(
+                        (b_base.get() as *mut F128).add(g * 8 * f128_per_block),
+                        8 * f128_per_block,
+                    ),
+                    std::slice::from_raw_parts_mut((stripe_base.get() as *mut u8).add(g * k), k),
+                )
+            };
             // Ordinary per-block builders OR 1-bits into pre-zeroed words; any
             // slot left unbuilt (no padding block) stays zero, which the
             // lincheck transpose below reads correctly. Full-write builders
@@ -471,7 +502,8 @@ where
                     );
                 }
             }
-        });
+        }
+    });
 
     (z, a, b, z_lincheck)
 }
