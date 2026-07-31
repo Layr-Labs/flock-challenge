@@ -110,3 +110,48 @@ pub(super) fn accumulate_convert_with_s_hat_v(
         partial_c_1[lane] += converted_c_1 * eq_lo_val;
     }
 }
+
+#[allow(clippy::too_many_arguments)]
+#[cfg(not(target_arch = "aarch64"))]
+pub(super) fn accumulate_convert_with_s_hat_v_factored(
+    chunk_ab_bytes: &[[u8; 64]; 16],
+    chunk_c_bytes: &[[u8; 64]; 16],
+    n_b_med: usize,
+    convert: &[F128],
+    paired_c_0: &[F128],
+    paired_c_1: &[F128],
+    partial_ab: &mut [F128; 64],
+    partial_c_0: &mut [F128; 64],
+    partial_c_1: &mut [F128; 64],
+) {
+    for lane in 0..64 {
+        let mut converted_ab = F128::ZERO;
+        let mut converted_c_0 = F128::ZERO;
+        let mut converted_c_1 = F128::ZERO;
+        for pair in 0..(n_b_med / 2) {
+            let even = 2 * pair;
+            let odd = even + 1;
+            let table_even = even * 256;
+            let table_odd = odd * 256;
+            converted_ab += convert[table_even + chunk_ab_bytes[even][lane] as usize];
+            converted_ab += convert[table_odd + chunk_ab_bytes[odd][lane] as usize];
+            let even_c = chunk_c_bytes[even][lane] as usize;
+            let odd_c = chunk_c_bytes[odd][lane] as usize;
+            let paired = pair * 256;
+            converted_c_0 += paired_c_0[paired + ((even_c & 0x55) | ((odd_c << 1) & 0xaa))];
+            converted_c_1 += paired_c_1[paired + ((even_c & 0xaa) | ((odd_c >> 1) & 0x55))];
+        }
+        if n_b_med & 1 == 1 {
+            let b_med = n_b_med - 1;
+            let table_base = b_med * 256;
+            let ab = chunk_ab_bytes[b_med][lane] as usize;
+            let c = chunk_c_bytes[b_med][lane] as usize;
+            converted_ab += convert[table_base + ab];
+            converted_c_0 += convert[table_base + (c & 0x55)];
+            converted_c_1 += convert[table_base + (c & 0xaa)];
+        }
+        partial_ab[lane] += converted_ab;
+        partial_c_0[lane] += converted_c_0;
+        partial_c_1[lane] += converted_c_1;
+    }
+}

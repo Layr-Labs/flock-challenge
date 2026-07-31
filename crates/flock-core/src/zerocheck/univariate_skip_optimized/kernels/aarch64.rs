@@ -160,7 +160,7 @@ pub(crate) unsafe fn accumulate_convert(
 /// back to the unpaired path.
 #[allow(clippy::too_many_arguments)]
 #[inline(always)]
-pub(crate) unsafe fn accumulate_convert_with_s_hat_v(
+unsafe fn accumulate_convert_with_s_hat_v_inner<const SCALE: bool>(
     chunk_ab_bytes: &[[u8; 64]; 16],
     chunk_c_bytes: &[[u8; 64]; 16],
     n_b_med: usize,
@@ -354,18 +354,27 @@ pub(crate) unsafe fn accumulate_convert_with_s_hat_v(
                     let ab = vreinterpretq_u64_u8($ab);
                     let c0 = vreinterpretq_u64_u8($c0);
                     let c1 = vreinterpretq_u64_u8($c1);
-                    partial_ab[lane + $offset] += F128 {
+                    let ab_value = F128 {
                         lo: vgetq_lane_u64::<0>(ab),
                         hi: vgetq_lane_u64::<1>(ab),
-                    } * eq_lo_val;
-                    partial_c_0[lane + $offset] += F128 {
+                    };
+                    let c0_value = F128 {
                         lo: vgetq_lane_u64::<0>(c0),
                         hi: vgetq_lane_u64::<1>(c0),
-                    } * eq_lo_val;
-                    partial_c_1[lane + $offset] += F128 {
+                    };
+                    let c1_value = F128 {
                         lo: vgetq_lane_u64::<0>(c1),
                         hi: vgetq_lane_u64::<1>(c1),
-                    } * eq_lo_val;
+                    };
+                    if SCALE {
+                        partial_ab[lane + $offset] += ab_value * eq_lo_val;
+                        partial_c_0[lane + $offset] += c0_value * eq_lo_val;
+                        partial_c_1[lane + $offset] += c1_value * eq_lo_val;
+                    } else {
+                        partial_ab[lane + $offset] += ab_value;
+                        partial_c_0[lane + $offset] += c0_value;
+                        partial_c_1[lane + $offset] += c1_value;
+                    }
                 }};
             }
             drain_lane!(0, ab0, c00, c10);
@@ -373,6 +382,65 @@ pub(crate) unsafe fn accumulate_convert_with_s_hat_v(
             drain_lane!(2, ab2, c02, c12);
             drain_lane!(3, ab3, c03, c13);
         }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+#[inline(always)]
+pub(crate) unsafe fn accumulate_convert_with_s_hat_v(
+    chunk_ab_bytes: &[[u8; 64]; 16],
+    chunk_c_bytes: &[[u8; 64]; 16],
+    n_b_med: usize,
+    convert: &[F128],
+    m0: &[F128],
+    m1: &[F128],
+    eq_lo_val: F128,
+    partial_ab: &mut [F128; 64],
+    partial_c_0: &mut [F128; 64],
+    partial_c_1: &mut [F128; 64],
+) {
+    unsafe {
+        accumulate_convert_with_s_hat_v_inner::<true>(
+            chunk_ab_bytes,
+            chunk_c_bytes,
+            n_b_med,
+            convert,
+            m0,
+            m1,
+            eq_lo_val,
+            partial_ab,
+            partial_c_0,
+            partial_c_1,
+        );
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+#[inline(always)]
+pub(crate) unsafe fn accumulate_convert_with_s_hat_v_factored(
+    chunk_ab_bytes: &[[u8; 64]; 16],
+    chunk_c_bytes: &[[u8; 64]; 16],
+    n_b_med: usize,
+    convert: &[F128],
+    m0: &[F128],
+    m1: &[F128],
+    partial_ab: &mut [F128; 64],
+    partial_c_0: &mut [F128; 64],
+    partial_c_1: &mut [F128; 64],
+) {
+    unsafe {
+        accumulate_convert_with_s_hat_v_inner::<false>(
+            chunk_ab_bytes,
+            chunk_c_bytes,
+            n_b_med,
+            convert,
+            m0,
+            m1,
+            F128::ONE,
+            partial_ab,
+            partial_c_0,
+            partial_c_1,
+        );
     }
 }
 

@@ -221,6 +221,52 @@ fn convert_table() -> &'static [F128] {
     CONVERT_TABLE_CACHE.get_or_init(build_convert_table)
 }
 
+/// Build the challenge-weighted conversion tables for one low equality value.
+/// `convert[b][v] * eq_lo` is F₂-linear in the byte index `v`, so only the
+/// eight one-bit images need a general F128 multiplication. The remaining
+/// byte entries are subset XORs and the fifteen gamma rows are generated with
+/// the cheap `mul_by_x` recurrence. The paired C tables use the same linearity
+/// identities as [`PAIRED_C_TABLES`].
+fn build_eq_factored_convert_tables(
+    eq_lo: F128,
+    convert: &[F128],
+    factored: &mut [F128],
+    paired_c_0: &mut [F128],
+    paired_c_1: &mut [F128],
+) {
+    debug_assert_eq!(convert.len(), CONVERT_TABLE_SIZE);
+    debug_assert_eq!(factored.len(), CONVERT_TABLE_SIZE);
+    debug_assert_eq!(paired_c_0.len(), PAIRED_C_TABLE_SIZE);
+    debug_assert_eq!(paired_c_1.len(), PAIRED_C_TABLE_SIZE);
+
+    factored[..256].fill(F128::ZERO);
+    for bit in 0..8 {
+        factored[1usize << bit] = convert[1usize << bit] * eq_lo;
+    }
+    for value in 1usize..256 {
+        let low = value & (value - 1);
+        let bit = value.trailing_zeros() as usize;
+        factored[value] = factored[low] + factored[1usize << bit];
+    }
+    for bank in 1..16 {
+        let prev = (bank - 1) * 256;
+        let dst = bank * 256;
+        for value in 0..256 {
+            factored[dst + value] = mul_by_x(factored[prev + value]);
+        }
+    }
+
+    for pair in 0..8 {
+        let (even, odd) = (2 * pair, 2 * pair + 1);
+        for value in 0..256 {
+            paired_c_0[pair * 256 + value] =
+                factored[even * 256 + (value & 0x55)] + factored[odd * 256 + ((value & 0xaa) >> 1)];
+            paired_c_1[pair * 256 + value] =
+                factored[even * 256 + (value & 0xaa)] + factored[odd * 256 + ((value & 0x55) << 1)];
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Paired c-bank convert tables (aarch64 gather-halving).
 //
@@ -646,6 +692,37 @@ impl WorkerStateWithSHatV {
     }
 }
 
+/// State for the equality-factorized precomputed-AB finish. The traversal is
+/// low-major so one eq-weighted conversion table is reused across every
+/// high-half index. The three high-index partial banks are the only large
+/// private state; all table construction is XOR/shift work after eight field
+/// products per low index.
+struct FactoredWorkerStateWithSHatV {
+    partial_ab: Vec<[F128; ELL]>,
+    partial_c_0: Vec<[F128; ELL]>,
+    partial_c_1: Vec<[F128; ELL]>,
+    chunk_ab_bytes: [[u8; 64]; 1 << N_MEDIUM],
+    chunk_c_bytes: [[u8; 64]; 1 << N_MEDIUM],
+    factored_convert: Vec<F128>,
+    paired_c_0: Vec<F128>,
+    paired_c_1: Vec<F128>,
+}
+
+impl FactoredWorkerStateWithSHatV {
+    fn new(hi_size: usize) -> Self {
+        Self {
+            partial_ab: vec![[F128::ZERO; ELL]; hi_size],
+            partial_c_0: vec![[F128::ZERO; ELL]; hi_size],
+            partial_c_1: vec![[F128::ZERO; ELL]; hi_size],
+            chunk_ab_bytes: [[0u8; 64]; 1 << N_MEDIUM],
+            chunk_c_bytes: [[0u8; 64]; 1 << N_MEDIUM],
+            factored_convert: vec![F128::ZERO; CONVERT_TABLE_SIZE],
+            paired_c_0: vec![F128::ZERO; PAIRED_C_TABLE_SIZE],
+            paired_c_1: vec![F128::ZERO; PAIRED_C_TABLE_SIZE],
+        }
+    }
+}
+
 /// Two-bank C variant of [`process_one_x_hi`]. AB-side and witness traffic
 /// unchanged; the only modification is the C-side inner loop now maintains
 /// `cf_c_0` and `cf_c_1` via masked convert-table lookups.
@@ -820,6 +897,64 @@ fn process_one_x_hi_with_precomputed_ab(
     }
 }
 
+/// Low-major counterpart of [`process_one_x_hi_with_precomputed_ab`]. Build
+/// the eq-weighted conversion table once for this `x_outer_lo`, then reuse it
+/// while walking every `x_hi`. This removes the per-lane equality multiply from
+/// the hot byte-table drain at the cost of a strided packed-input traversal.
+#[inline]
+#[allow(clippy::too_many_arguments)]
+fn process_one_x_lo_with_precomputed_ab_factored(
+    x_outer_lo: usize,
+    hi_size: usize,
+    n_lo_and_inner: usize,
+    within_outer_mask: usize,
+    b_med_counts: &[u8],
+    ab_inner: &[u8],
+    c_packed: &[u8],
+    eq_lo_val: F128,
+    convert: &[F128],
+    state: &mut FactoredWorkerStateWithSHatV,
+) {
+    build_eq_factored_convert_tables(
+        eq_lo_val,
+        convert,
+        &mut state.factored_convert,
+        &mut state.paired_c_0,
+        &mut state.paired_c_1,
+    );
+    let n_lo = n_lo_and_inner - N_INNER;
+
+    for x_hi in 0..hi_size {
+        let x_outer = x_outer_lo | (x_hi << n_lo);
+        let within_hash_outer = x_outer & within_outer_mask;
+        let n_b_med = b_med_counts[within_hash_outer] as usize;
+        if n_b_med == 0 {
+            continue;
+        }
+
+        let chunk_byte_base = ((x_outer_lo << N_INNER) | (x_hi << n_lo_and_inner)) * N_CHUNKS;
+        for b_med in 0..n_b_med {
+            let byte_base_b = chunk_byte_base + b_med * N_CHUNKS * 8;
+            state.chunk_ab_bytes[b_med].copy_from_slice(&ab_inner[byte_base_b..byte_base_b + 64]);
+            let c_in: &[u8; 64] = (&c_packed[byte_base_b..byte_base_b + 64])
+                .try_into()
+                .expect("64 c-bytes per medium position");
+            bit_transpose_64bytes(c_in, &mut state.chunk_c_bytes[b_med]);
+        }
+
+        kernels::accumulate_convert_with_s_hat_v_factored(
+            &state.chunk_ab_bytes,
+            &state.chunk_c_bytes,
+            n_b_med,
+            &state.factored_convert,
+            (&state.paired_c_0, &state.paired_c_1),
+            &mut state.partial_ab[x_hi],
+            &mut state.partial_c_0[x_hi],
+            &mut state.partial_c_1[x_hi],
+        );
+    }
+}
+
 /// Build the `b_med_counts` table from a [`PaddingSpec`] for use by
 /// [`process_one_x_hi`].
 ///
@@ -858,6 +993,13 @@ fn build_b_med_counts(padding: &PaddingSpec) -> (usize, Vec<u8>) {
         })
         .collect();
     (within_outer_mask, counts)
+}
+
+#[inline]
+fn eq_factorized_round1_enabled(m: usize) -> bool {
+    cfg!(all(target_os = "macos", target_arch = "aarch64"))
+        && m >= 32
+        && std::env::var_os("FLOCK_ZC_NO_EQ_FACTOR").is_none()
 }
 
 /// Packed-input variant of [`round1_shift_reduce_extract_c`]. **Parallel by
@@ -1091,6 +1233,8 @@ pub fn round1_shift_reduce_extract_c_packed_padded_with_precomputed_ab(
     inv_table: &InvNttTableByteSingleGf8,
     padding: &PaddingSpec,
 ) -> (Vec<F128>, Vec<F128>, Vec<F128>) {
+    use rayon::prelude::*;
+
     assert_eq!(k_skip, K_SKIP, "optimized variant is k_skip=6 only");
     assert!(
         m >= k_skip + N_INNER,
@@ -1116,53 +1260,107 @@ pub fn round1_shift_reduce_extract_c_packed_padded_with_precomputed_ab(
     let (within_outer_mask, b_med_counts) = build_b_med_counts(padding);
     let ab_inner_bytes = ab_inner.as_bytes();
 
-    // The challenge-independent AB transform finishes while the commitment is
-    // still running. Its challenge-weighted completion is therefore a live
-    // prover phase, and each x_hi is independent. Drain those chunks through
-    // the shared P/E-core queue without changing the hot conversion kernel.
-    // A fixed per-index partial keeps the nondeterministic claim order out of
-    // the output; the final operation is XOR, so serial reduction is exact.
-    let mut partials: Vec<([F128; ELL], [F128; ELL], [F128; ELL])> =
-        vec![([F128::ZERO; ELL], [F128::ZERO; ELL], [F128::ZERO; ELL],); hi_size];
-    let partials_base = crate::epool::SyncPtr(partials.as_mut_ptr());
-    crate::epool::run_hetero_chunks(hi_size, |x_hi| {
-        let mut state = WorkerStateWithSHatV::new();
-        process_one_x_hi_with_precomputed_ab(
-            x_hi,
-            big_lo_size,
-            n_lo_and_inner,
-            within_outer_mask,
-            &b_med_counts,
-            ab_inner_bytes,
-            c_packed,
-            &eq_lo_scaled,
-            eq_hi[x_hi],
-            convert,
-            paired_c,
-            &mut state,
-        );
-        // SAFETY: the queue hands out each x_hi exactly once, so this task is
-        // the exclusive owner of partials[x_hi]. The queue's completion join
-        // publishes every write before the reduction below reads the vector.
-        unsafe {
-            *partials_base.ptr().add(x_hi) = (
-                state.local_res_ab,
-                state.local_res_c_s_0,
-                state.local_res_c_s_1,
+    let (res_ab, res_c_s_0, res_c_s_1) = if eq_factorized_round1_enabled(m) {
+        // Equality-factorized path for the active AArch64 precomputed-AB
+        // composition. Parallelize over x_outer_lo so each worker builds one
+        // eq-weighted conversion table and reuses it across all x_hi values.
+        // The high-half partial banks are reduced only after the strided input
+        // walk, avoiding an equality multiply in every conversion-table drain.
+        (0..big_lo_size)
+            .into_par_iter()
+            .fold(
+                || FactoredWorkerStateWithSHatV::new(hi_size),
+                |mut state, x_outer_lo| {
+                    process_one_x_lo_with_precomputed_ab_factored(
+                        x_outer_lo,
+                        hi_size,
+                        n_lo_and_inner,
+                        within_outer_mask,
+                        &b_med_counts,
+                        ab_inner_bytes,
+                        c_packed,
+                        eq_lo_scaled[x_outer_lo],
+                        convert,
+                        &mut state,
+                    );
+                    state
+                },
+            )
+            .map(|state| {
+                let mut local_res_ab = [F128::ZERO; ELL];
+                let mut local_res_c_s_0 = [F128::ZERO; ELL];
+                let mut local_res_c_s_1 = [F128::ZERO; ELL];
+                for x_hi in 0..hi_size {
+                    let eq_hi_val = eq_hi[x_hi];
+                    for lane in 0..ELL {
+                        local_res_ab[lane] += eq_hi_val * state.partial_ab[x_hi][lane];
+                        local_res_c_s_0[lane] += eq_hi_val * state.partial_c_0[x_hi][lane];
+                        local_res_c_s_1[lane] += eq_hi_val * state.partial_c_1[x_hi][lane];
+                    }
+                }
+                (local_res_ab, local_res_c_s_0, local_res_c_s_1)
+            })
+            .reduce(
+                || ([F128::ZERO; ELL], [F128::ZERO; ELL], [F128::ZERO; ELL]),
+                |(mut ab1, mut c0_1, mut c1_1), (ab2, c0_2, c1_2)| {
+                    for i in 0..ELL {
+                        ab1[i] += ab2[i];
+                        c0_1[i] += c0_2[i];
+                        c1_1[i] += c1_2[i];
+                    }
+                    (ab1, c0_1, c1_1)
+                },
+            )
+    } else {
+        // The existing x_hi-major path remains the exact default on portable
+        // targets and behind the opt-out gate on AArch64.
+        // The challenge-independent AB transform finishes while the
+        // commitment is still running. Each x_hi is independent, so a fixed
+        // per-index partial keeps the nondeterministic queue order out of the
+        // output; the final operation is XOR, so serial reduction is exact.
+        let mut partials: Vec<([F128; ELL], [F128; ELL], [F128; ELL])> =
+            vec![([F128::ZERO; ELL], [F128::ZERO; ELL], [F128::ZERO; ELL],); hi_size];
+        let partials_base = crate::epool::SyncPtr(partials.as_mut_ptr());
+        crate::epool::run_hetero_chunks(hi_size, |x_hi| {
+            let mut state = WorkerStateWithSHatV::new();
+            process_one_x_hi_with_precomputed_ab(
+                x_hi,
+                big_lo_size,
+                n_lo_and_inner,
+                within_outer_mask,
+                &b_med_counts,
+                ab_inner_bytes,
+                c_packed,
+                &eq_lo_scaled,
+                eq_hi[x_hi],
+                convert,
+                paired_c,
+                &mut state,
             );
-        }
-    });
-    let (res_ab, res_c_s_0, res_c_s_1) = partials.into_iter().fold(
-        ([F128::ZERO; ELL], [F128::ZERO; ELL], [F128::ZERO; ELL]),
-        |(mut ab1, mut c0_1, mut c1_1), (ab2, c0_2, c1_2)| {
-            for i in 0..ELL {
-                ab1[i] += ab2[i];
-                c0_1[i] += c0_2[i];
-                c1_1[i] += c1_2[i];
+            // SAFETY: the queue hands out each x_hi exactly once, so this task
+            // is the exclusive owner of partials[x_hi]. The queue's completion
+            // join publishes every write before the reduction below reads the
+            // vector.
+            unsafe {
+                *partials_base.ptr().add(x_hi) = (
+                    state.local_res_ab,
+                    state.local_res_c_s_0,
+                    state.local_res_c_s_1,
+                );
             }
-            (ab1, c0_1, c1_1)
-        },
-    );
+        });
+        partials.into_iter().fold(
+            ([F128::ZERO; ELL], [F128::ZERO; ELL], [F128::ZERO; ELL]),
+            |(mut ab1, mut c0_1, mut c1_1), (ab2, c0_2, c1_2)| {
+                for i in 0..ELL {
+                    ab1[i] += ab2[i];
+                    c0_1[i] += c0_2[i];
+                    c1_1[i] += c1_2[i];
+                }
+                (ab1, c0_1, c1_1)
+            },
+        )
+    };
 
     let mut res_c_s_combined = [F128::ZERO; ELL];
     for i in 0..ELL {
@@ -1805,6 +2003,123 @@ mod tests {
         }
     }
 
+    #[test]
+    fn eq_factored_convert_tables_match_scaled_tables() {
+        let convert = convert_table();
+        let (base_c_0, base_c_1) = &*PAIRED_C_TABLES;
+        let mut factored = vec![F128::ZERO; CONVERT_TABLE_SIZE];
+        let mut paired_c_0 = vec![F128::ZERO; PAIRED_C_TABLE_SIZE];
+        let mut paired_c_1 = vec![F128::ZERO; PAIRED_C_TABLE_SIZE];
+
+        for eq_lo in [
+            F128::ONE,
+            F128 {
+                lo: 0x1234,
+                hi: 0x5678,
+            },
+        ] {
+            build_eq_factored_convert_tables(
+                eq_lo,
+                convert,
+                &mut factored,
+                &mut paired_c_0,
+                &mut paired_c_1,
+            );
+            for (index, &value) in factored.iter().enumerate() {
+                assert_eq!(
+                    value,
+                    convert[index] * eq_lo,
+                    "factored convert mismatch at index={index}"
+                );
+            }
+            for (index, &value) in paired_c_0.iter().enumerate() {
+                assert_eq!(
+                    value,
+                    base_c_0[index] * eq_lo,
+                    "factored paired C bank 0 mismatch at index={index}"
+                );
+            }
+            for (index, &value) in paired_c_1.iter().enumerate() {
+                assert_eq!(
+                    value,
+                    base_c_1[index] * eq_lo,
+                    "factored paired C bank 1 mismatch at index={index}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn factored_convert_kernel_matches_scaled_kernel() {
+        let convert = convert_table();
+        let paired_c = &*PAIRED_C_TABLES;
+        let mut rng = Rng::new(0xFAC7_0123);
+        let mut chunk_ab = [[0u8; 64]; 1 << N_MEDIUM];
+        let mut chunk_c = [[0u8; 64]; 1 << N_MEDIUM];
+        for b_med in 0..(1 << N_MEDIUM) {
+            for lane in 0..ELL {
+                chunk_ab[b_med][lane] = (rng.next_u64() & 0xff) as u8;
+                chunk_c[b_med][lane] = (rng.next_u64() & 0xff) as u8;
+            }
+        }
+
+        let eq_lo = rng.f128();
+        let mut factored = vec![F128::ZERO; CONVERT_TABLE_SIZE];
+        let mut factored_c_0 = vec![F128::ZERO; PAIRED_C_TABLE_SIZE];
+        let mut factored_c_1 = vec![F128::ZERO; PAIRED_C_TABLE_SIZE];
+        build_eq_factored_convert_tables(
+            eq_lo,
+            convert,
+            &mut factored,
+            &mut factored_c_0,
+            &mut factored_c_1,
+        );
+
+        let seed_ab: [F128; ELL] = core::array::from_fn(|_| rng.f128());
+        let seed_c_0: [F128; ELL] = core::array::from_fn(|_| rng.f128());
+        let seed_c_1: [F128; ELL] = core::array::from_fn(|_| rng.f128());
+        for n_b_med in 0..=(1 << N_MEDIUM) {
+            let (mut scaled_ab, mut scaled_c_0, mut scaled_c_1) = (seed_ab, seed_c_0, seed_c_1);
+            kernels::accumulate_convert_with_s_hat_v(
+                &chunk_ab,
+                &chunk_c,
+                n_b_med,
+                convert,
+                paired_c,
+                eq_lo,
+                &mut scaled_ab,
+                &mut scaled_c_0,
+                &mut scaled_c_1,
+            );
+
+            let (mut factored_ab, mut factored_c_0_out, mut factored_c_1_out) =
+                (seed_ab, seed_c_0, seed_c_1);
+            kernels::accumulate_convert_with_s_hat_v_factored(
+                &chunk_ab,
+                &chunk_c,
+                n_b_med,
+                &factored,
+                (&factored_c_0, &factored_c_1),
+                &mut factored_ab,
+                &mut factored_c_0_out,
+                &mut factored_c_1_out,
+            );
+
+            assert_eq!(
+                factored_ab, scaled_ab,
+                "factored AB mismatch at n_b_med={n_b_med}"
+            );
+            assert_eq!(
+                factored_c_0_out, scaled_c_0,
+                "factored C bank 0 mismatch at n_b_med={n_b_med}"
+            );
+            assert_eq!(
+                factored_c_1_out, scaled_c_1,
+                "factored C bank 1 mismatch at n_b_med={n_b_med}"
+            );
+        }
+    }
+
     /// The two-bank fusion variant produces `(res_ab, res_c_lifted)` that
     /// matches the existing optimized output, AND a `s_hat_v_c` that matches
     /// the scalar-oracle's canonical form.
@@ -1913,6 +2228,89 @@ mod tests {
             );
 
             assert_eq!(got, expected, "split round-1 mismatch at m={m}");
+        }
+    }
+
+    /// Exercise the low-major equality-factorized traversal directly on the
+    /// host, where the production gate is intentionally disabled. This keeps
+    /// the full precomputed-AB composition covered even though the target
+    /// timing path is only enabled for the ranked Apple Silicon build.
+    #[test]
+    fn factorized_precomputed_traversal_matches_hi_major_at_m13_through_m17() {
+        for m in 13usize..=17 {
+            let mut rng = Rng::new(0xFA_C7_0000_u64.wrapping_add(m as u64));
+            let a = pack_bits(&rng.bits(1 << m));
+            let b = pack_bits(&rng.bits(1 << m));
+            let c = pack_bits(&rng.bits(1 << m));
+            let outer = rng.f128_vec(m - K_SKIP - N_INNER);
+            let r = build_protocol_r(m, &outer);
+            let inv_table = make_inv_table();
+            let padding = PaddingSpec::dense(m);
+            let precomputed =
+                precompute_round1_ab_inner_packed_padded(&a, &b, m, K_SKIP, &inv_table, &padding);
+            let expected = round1_shift_reduce_extract_c_packed_padded_with_precomputed_ab(
+                &precomputed,
+                &c,
+                m,
+                K_SKIP,
+                &r,
+                &inv_table,
+                &padding,
+            );
+
+            let eq = SplitEqGhash::new(&r[K_SKIP + N_INNER..]);
+            let big_lo_size = 1usize << eq.n_lo;
+            let hi_size = 1usize << eq.n_hi;
+            let n_lo_and_inner = eq.n_lo + N_INNER;
+            let eq_lo_scaled: Vec<F128> = eq.lo.iter().map(|v| *v * d_inv()).collect();
+            let convert = convert_table();
+            let (within_outer_mask, b_med_counts) = build_b_med_counts(&padding);
+            let mut state = FactoredWorkerStateWithSHatV::new(hi_size);
+            for x_outer_lo in 0..big_lo_size {
+                process_one_x_lo_with_precomputed_ab_factored(
+                    x_outer_lo,
+                    hi_size,
+                    n_lo_and_inner,
+                    within_outer_mask,
+                    &b_med_counts,
+                    precomputed.as_bytes(),
+                    &c,
+                    eq_lo_scaled[x_outer_lo],
+                    convert,
+                    &mut state,
+                );
+            }
+
+            let mut res_ab = [F128::ZERO; ELL];
+            let mut res_c_s_0 = [F128::ZERO; ELL];
+            let mut res_c_s_1 = [F128::ZERO; ELL];
+            for x_hi in 0..hi_size {
+                let eq_hi_val = eq.hi[x_hi];
+                for lane in 0..ELL {
+                    res_ab[lane] += eq_hi_val * state.partial_ab[x_hi][lane];
+                    res_c_s_0[lane] += eq_hi_val * state.partial_c_0[x_hi][lane];
+                    res_c_s_1[lane] += eq_hi_val * state.partial_c_1[x_hi][lane];
+                }
+            }
+
+            let mut res_c_s_combined = [F128::ZERO; ELL];
+            for lane in 0..ELL {
+                res_c_s_combined[lane] = res_c_s_0[lane] + res_c_s_1[lane];
+            }
+            let res_c_lifted = ntt_extend_f128_vec_ghash(&res_c_s_combined, &inv_table);
+            let c_2 = c_2_small_f128();
+            let c_2_alpha_inv = c_2 * alpha_inv_f128();
+            let mut s_hat_v_c = vec![F128::ZERO; 2 * ELL];
+            for lane in 0..ELL {
+                s_hat_v_c[lane] = c_2 * res_c_s_0[lane];
+                s_hat_v_c[ELL + lane] = c_2_alpha_inv * res_c_s_1[lane];
+            }
+
+            assert_eq!(
+                (res_ab.to_vec(), res_c_lifted, s_hat_v_c),
+                expected,
+                "factorized traversal mismatch at m={m}"
+            );
         }
     }
 
