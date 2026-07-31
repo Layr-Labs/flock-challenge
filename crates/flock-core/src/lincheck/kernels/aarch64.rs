@@ -448,3 +448,113 @@ pub(crate) fn oblock_padded_tiled<const TILE_T: usize>(
     });
     out
 }
+
+/// Row-major sibling of the outer-partitioned stripe fold. Each worker reads
+/// 64 consecutive canonical witness blocks per tile, transposes one 64-bit
+/// inner word into a 512-byte stack buffer, and immediately feeds the existing
+/// eight-register NEON lookup kernel.
+#[cfg(target_arch = "aarch64")]
+pub fn partial_fold_row_major_neon_oblock_padded(
+    z_row_major: &[F128],
+    m: usize,
+    k_log: usize,
+    useful_bits: usize,
+    eq_outer: &[F128],
+) -> Vec<F128> {
+    use crate::bits::transpose_8_u64s_to_64_bytes;
+    use rayon::prelude::*;
+
+    const TILE_T: usize = NEON_TILE_T;
+    const BLOCKS_PER_STRIPE: usize = 8;
+    const BLOCKS_PER_TILE: usize = TILE_T * BLOCKS_PER_STRIPE;
+    const BLOCK_K: usize = 8;
+
+    let n_log = m - k_log;
+    let k = 1usize << k_log;
+    let n_outer = 1usize << n_log;
+    assert_eq!(z_row_major.len(), 1usize << (m - 7));
+    assert_eq!(eq_outer.len(), n_outer);
+    assert!(k_log >= 7);
+    assert!(useful_bits <= k);
+    let n_stripes = n_outer / BLOCKS_PER_STRIPE;
+    assert_eq!(n_stripes % TILE_T, 0);
+    let n_tiles = n_stripes / TILE_T;
+    let useful = (useful_bits.div_ceil(BLOCK_K) * BLOCK_K).min(k);
+    if useful == 0 {
+        return vec![F128::ZERO; k];
+    }
+
+    let words_per_block = k / 64;
+    let useful_words = useful_bits.div_ceil(64);
+    // SAFETY: F128 is repr(C) with two consecutive u64 halves.
+    let z_words = unsafe {
+        std::slice::from_raw_parts(z_row_major.as_ptr() as *const u64, z_row_major.len() * 2)
+    };
+
+    let p = rayon::current_num_threads().max(1);
+    let tiles_per_worker = n_tiles.div_ceil(p);
+    let n_workers = n_tiles.div_ceil(tiles_per_worker);
+    let mut partials = vec![F128::ZERO; n_workers * k];
+    partials
+        .par_chunks_mut(k)
+        .enumerate()
+        .for_each(|(worker, partial)| {
+            let tile_lo = worker * tiles_per_worker;
+            let tile_hi = ((worker + 1) * tiles_per_worker).min(n_tiles);
+            let mut tables = vec![F128::ZERO; TILE_T * 256];
+            let mut transposed = [[0u8; 64]; TILE_T];
+
+            for tile in tile_lo..tile_hi {
+                for t in 0..TILE_T {
+                    let eq_off = tile * BLOCKS_PER_TILE + t * BLOCKS_PER_STRIPE;
+                    build_sum_table(
+                        &eq_outer[eq_off..eq_off + BLOCKS_PER_STRIPE],
+                        &mut tables[t * 256..(t + 1) * 256],
+                    );
+                }
+                let tables_ptr = tables.as_ptr() as *const u8;
+                let tile_block = tile * BLOCKS_PER_TILE;
+
+                for word_idx in 0..useful_words {
+                    for t in 0..TILE_T {
+                        let stripe_block = tile_block + t * BLOCKS_PER_STRIPE;
+                        let lanes: [u64; BLOCKS_PER_STRIPE] = std::array::from_fn(|lane| {
+                            z_words[(stripe_block + lane) * words_per_block + word_idx]
+                        });
+                        transpose_8_u64s_to_64_bytes(&lanes, &mut transposed[t]);
+                    }
+
+                    let inner_base = word_idx * 64;
+                    let n_inner = (useful - inner_base).min(64);
+                    let mut bs = 0usize;
+                    while bs < n_inner {
+                        unsafe {
+                            process_block_neon_single::<TILE_T>(
+                                transposed.as_ptr() as *const u8,
+                                64,
+                                bs,
+                                tables_ptr,
+                                partial.as_mut_ptr().add(inner_base + bs),
+                            );
+                        }
+                        bs += BLOCK_K;
+                    }
+                }
+            }
+        });
+
+    let band = k.div_ceil(rayon::current_num_threads().max(1)).max(1024);
+    let mut out = vec![F128::ZERO; k];
+    out.par_chunks_mut(band)
+        .enumerate()
+        .for_each(|(band_idx, dst)| {
+            let lo = band_idx * band;
+            for worker in 0..n_workers {
+                let src = &partials[worker * k + lo..worker * k + lo + dst.len()];
+                for (o, s) in dst.iter_mut().zip(src.iter()) {
+                    *o += *s;
+                }
+            }
+        });
+    out
+}

@@ -1459,6 +1459,53 @@ pub fn generate_witness_with_ab_packed(
     (z, a, b)
 }
 
+/// Protected row-major witness path using c576's promoted full-word writer,
+/// without producing lincheck's persistent byte stripe.
+fn generate_witness_with_ab_packed_row_major(
+    blocks: &[Compression],
+    n_blocks_log: usize,
+) -> (Vec<F128>, Vec<F128>, Vec<F128>) {
+    use rayon::prelude::*;
+
+    const F128_PER_BLOCK: usize = K / 128;
+    let n_total = 1usize << n_blocks_log;
+    assert!(blocks.len() <= n_total);
+    let total_f128 = n_total * F128_PER_BLOCK;
+    let mut z = flock_core::scratch::take_f128(total_f128);
+    let mut a = flock_core::scratch::take_f128(total_f128);
+    let mut b = flock_core::scratch::take_f128(total_f128);
+    let padding: Compression = ([0u32; 8], [0u32; 16], 0u64, 0u32, 0u32);
+
+    z.par_chunks_mut(8 * F128_PER_BLOCK)
+        .zip(a.par_chunks_mut(8 * F128_PER_BLOCK))
+        .zip(b.par_chunks_mut(8 * F128_PER_BLOCK))
+        .enumerate()
+        .for_each(|(group, ((z_group, a_group), b_group))| {
+            for lane in 0..8 {
+                let block_idx = group * 8 + lane;
+                let (cv, m, t, bl, fl) = blocks.get(block_idx).unwrap_or(&padding);
+                let lo = lane * F128_PER_BLOCK;
+                let hi = lo + F128_PER_BLOCK;
+                let z_chunk = &mut z_group[lo..hi];
+                let a_chunk = &mut a_group[lo..hi];
+                let b_chunk = &mut b_group[lo..hi];
+                // SAFETY: F128 is repr(C) with two consecutive u64 halves.
+                let z_u64 = unsafe {
+                    std::slice::from_raw_parts_mut(z_chunk.as_mut_ptr() as *mut u64, K / 64)
+                };
+                let a_u64 = unsafe {
+                    std::slice::from_raw_parts_mut(a_chunk.as_mut_ptr() as *mut u64, K / 64)
+                };
+                let b_u64 = unsafe {
+                    std::slice::from_raw_parts_mut(b_chunk.as_mut_ptr() as *mut u64, K / 64)
+                };
+                build_block_witness_ab_stream_into(cv, m, *t, *bl, *fl, z_u64, a_u64, b_u64);
+            }
+        });
+
+    (z, a, b)
+}
+
 /// Like [`generate_witness_with_ab_packed`] but also emits the lincheck
 /// byte-stripe layout in the same parallel pass. Replaces the separate
 /// `pack_z_lincheck_from_packed` call entirely.
@@ -1641,22 +1688,42 @@ impl Blake3Setup {
         challenger: &mut Ch,
     ) -> (flock_core::proof::R1csProofLigerito, Commitment, R1csClaim) {
         assert_eq!(blocks.len(), self.n_blocks);
-        let (codeword, (z_packed, a_packed_f128, b_packed_f128, z_packed_lincheck)) =
-            flock_core::pcs::prefault_codeword_during(&self.pcs_params, || {
-                self.generate_witness_ab(blocks)
-            });
         let lc_circuit = self.r1cs.csc_lincheck_circuit();
-        crate::prover::prove_fast_ligerito_from_witness(
-            &self.r1cs,
-            &self.pcs_params,
-            z_packed,
-            a_packed_f128,
-            b_packed_f128,
-            z_packed_lincheck,
-            lc_circuit,
-            codeword,
-            challenger,
-        )
+        match self.r1cs.layout {
+            flock_core::r1cs::WitnessLayout::RowMajor => {
+                let (codeword, (z_packed, a_packed_f128, b_packed_f128)) =
+                    flock_core::pcs::prefault_codeword_during(&self.pcs_params, || {
+                        generate_witness_with_ab_packed_row_major(blocks, self.n_blocks_log())
+                    });
+                crate::prover::prove_fast_ligerito_from_row_major_witness(
+                    &self.r1cs,
+                    &self.pcs_params,
+                    z_packed,
+                    a_packed_f128,
+                    b_packed_f128,
+                    lc_circuit,
+                    codeword,
+                    challenger,
+                )
+            }
+            flock_core::r1cs::WitnessLayout::BatchMajor => {
+                let (codeword, (z_packed, a_packed_f128, b_packed_f128, stripe)) =
+                    flock_core::pcs::prefault_codeword_during(&self.pcs_params, || {
+                        self.generate_witness_ab(blocks)
+                    });
+                crate::prover::prove_fast_ligerito_from_witness(
+                    &self.r1cs,
+                    &self.pcs_params,
+                    z_packed,
+                    a_packed_f128,
+                    b_packed_f128,
+                    stripe,
+                    lc_circuit,
+                    codeword,
+                    challenger,
+                )
+            }
+        }
     }
 
     /// [`Self::prove_fast`] with a per-phase timing breakdown of the real
@@ -1674,22 +1741,44 @@ impl Blake3Setup {
     ) {
         assert_eq!(blocks.len(), self.n_blocks);
         let t0 = std::time::Instant::now();
-        let (z_packed, a_packed_f128, b_packed_f128, z_packed_lincheck) =
-            self.generate_witness_ab(blocks);
-        let witness_s = t0.elapsed().as_secs_f64();
         let lc_circuit = self.r1cs.csc_lincheck_circuit();
-        let (proof, commitment, claim, mut timings) = crate::prover::prove_fast_ligerito_timed(
-            &self.r1cs,
-            &self.pcs_params,
-            z_packed,
-            a_packed_f128,
-            b_packed_f128,
-            z_packed_lincheck,
-            lc_circuit,
-            None,
-            challenger,
-        );
-        timings.witness_s = witness_s;
+        let (proof, commitment, claim, timings) = match self.r1cs.layout {
+            flock_core::r1cs::WitnessLayout::RowMajor => {
+                let (z_packed, a_packed_f128, b_packed_f128) =
+                    generate_witness_with_ab_packed_row_major(blocks, self.n_blocks_log());
+                let witness_s = t0.elapsed().as_secs_f64();
+                let mut result = crate::prover::prove_fast_ligerito_timed_row_major(
+                    &self.r1cs,
+                    &self.pcs_params,
+                    z_packed,
+                    a_packed_f128,
+                    b_packed_f128,
+                    lc_circuit,
+                    None,
+                    challenger,
+                );
+                result.3.witness_s = witness_s;
+                result
+            }
+            flock_core::r1cs::WitnessLayout::BatchMajor => {
+                let (z_packed, a_packed_f128, b_packed_f128, stripe) =
+                    self.generate_witness_ab(blocks);
+                let witness_s = t0.elapsed().as_secs_f64();
+                let mut result = crate::prover::prove_fast_ligerito_timed(
+                    &self.r1cs,
+                    &self.pcs_params,
+                    z_packed,
+                    a_packed_f128,
+                    b_packed_f128,
+                    stripe,
+                    lc_circuit,
+                    None,
+                    challenger,
+                );
+                result.3.witness_s = witness_s;
+                result
+            }
+        };
         (proof, commitment, claim, timings)
     }
 
