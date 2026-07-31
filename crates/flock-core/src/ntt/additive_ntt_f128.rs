@@ -173,11 +173,19 @@ fn fusion_aware_interleaved_n_top(
     if ranked_apple_l0 { 10 } else { n_top }
 }
 
-/// Whether to fuse the ranked L0 commit's ten cache-resident tail layers in
-/// pairs. Keep this as narrow as [`fusion_aware_interleaved_n_top`]: smaller
-/// recursive commits retain their independently tuned single-layer tail.
+/// Whether to fuse the ranked L0 commit's ten cache-resident tail layers as
+/// `2+2+3+3`. Keep this as narrow as [`fusion_aware_interleaved_n_top`]:
+/// smaller recursive commits retain their independently tuned single-layer
+/// tail.
+///
+/// The two radix-8 groups deliberately come last. At the ranked row width,
+/// starting radix-8 at layers 10 and 13 spaces its eight live streams by
+/// 128 KiB and 16 KiB respectively, mapping all eight to one L1D set. Layers
+/// 14 and 17 instead use 8 KiB and 1 KiB strides, spreading the streams over
+/// two and eight sets. This retains the one-pass saving without consuming all
+/// eight ways of one set.
 #[inline]
-fn use_ranked_deep_pair_fusion(
+fn use_ranked_deep_late_radix8_fusion(
     log_d: usize,
     num_ntts: usize,
     start_layer: usize,
@@ -203,7 +211,7 @@ fn use_ranked_zero_root_fusion(
     start_layer: usize,
     n_top: usize,
 ) -> bool {
-    use_ranked_deep_pair_fusion(log_d, num_ntts, start_layer, n_top)
+    use_ranked_deep_late_radix8_fusion(log_d, num_ntts, start_layer, n_top)
 }
 
 /// Additive NTT over F_{2^128} with the standard polynomial-basis subspace.
@@ -645,11 +653,12 @@ impl AdditiveNttF128 {
             }
         }
 
-        // Ranked L0: layers 10..20 form five exact pairs. Fuse each pair inside
-        // the existing outer chunk job so every row is loaded/stored once per
-        // two layers and no nested Rayon region is created.
-        if use_ranked_deep_pair_fusion(log_d, num_ntts, start_layer, n_top) {
-            self.forward_transform_interleaved_deep_fused_pairs_and_then(
+        // Ranked L0: retain radix-4 for the first four cache-resident layers,
+        // then use two set-friendly radix-8 groups for the final six. The
+        // resulting 2+2+3+3 schedule removes one complete 1 GiB subtree sweep
+        // versus five pairs without introducing a nested Rayon region.
+        if use_ranked_deep_late_radix8_fusion(log_d, num_ntts, start_layer, n_top) {
+            self.forward_transform_interleaved_deep_late_radix8_and_then(
                 data,
                 num_ntts,
                 n_top,
@@ -685,18 +694,18 @@ impl AdditiveNttF128 {
             });
     }
 
-    /// Finish layers `n_top..log_d` two at a time inside independent
-    /// cache-resident sub-NTTs. The outer `par_chunks_mut` is the only Rayon
-    /// boundary; block and row work inside each chunk is deliberately serial.
+    /// Finish the ranked ten-layer cache-resident tail as `2+2+3+3`. The outer
+    /// `par_chunks_mut` is the only Rayon boundary; block and row work inside
+    /// each chunk is deliberately serial.
     #[cfg(test)]
-    fn forward_transform_interleaved_deep_fused_pairs(
+    fn forward_transform_interleaved_deep_late_radix8(
         &self,
         data: &mut [F128],
         num_ntts: usize,
         n_top: usize,
         log_d: usize,
     ) {
-        self.forward_transform_interleaved_deep_fused_pairs_and_then(
+        self.forward_transform_interleaved_deep_late_radix8_and_then(
             data,
             num_ntts,
             n_top,
@@ -705,7 +714,7 @@ impl AdditiveNttF128 {
         );
     }
 
-    fn forward_transform_interleaved_deep_fused_pairs_and_then<F>(
+    fn forward_transform_interleaved_deep_late_radix8_and_then<F>(
         &self,
         data: &mut [F128],
         num_ntts: usize,
@@ -718,6 +727,7 @@ impl AdditiveNttF128 {
         use rayon::prelude::*;
 
         debug_assert!(n_top <= log_d);
+        debug_assert_eq!(log_d - n_top, 10);
         debug_assert_eq!(data.len(), (1usize << log_d) * num_ntts);
         let sub_size_positions = 1usize << (log_d - n_top);
         let sub_elems = sub_size_positions * num_ntts;
@@ -726,7 +736,11 @@ impl AdditiveNttF128 {
             .enumerate()
             .for_each(|(sub_idx, sub_data)| {
                 let mut layer = n_top;
-                while layer + 1 < log_d {
+
+                // The first two passes keep four live row streams. At the
+                // ranked geometry an eight-stream group here would stride by
+                // 128 KiB, then 16 KiB, putting all streams in one L1D set.
+                for _ in 0..2 {
                     let layer_in_sub = layer - n_top;
                     let num_blocks_in_sub = 1usize << layer_in_sub;
                     let block_size_positions = 1usize << (log_d - layer);
@@ -751,27 +765,37 @@ impl AdditiveNttF128 {
                     layer += 2;
                 }
 
-                // The ranked path has ten deep layers and therefore no tail.
-                // Retaining the scalar single-layer tail makes this helper a
-                // compact exact-test fixture for odd layer counts as well.
-                if layer < log_d {
+                // Once layer 14 is reached, radix-8 stream strides are 8 KiB
+                // and then 1 KiB. These distribute over two and eight L1D
+                // sets, so the wider kernel can safely remove one full pass.
+                for _ in 0..2 {
                     let layer_in_sub = layer - n_top;
                     let num_blocks_in_sub = 1usize << layer_in_sub;
                     let block_size_positions = 1usize << (log_d - layer);
-                    let block_size_half = block_size_positions >> 1;
+                    let eighth = block_size_positions >> 3;
                     let block_elems = block_size_positions * num_ntts;
+
                     for block_in_sub in 0..num_blocks_in_sub {
                         let global_block = sub_idx * num_blocks_in_sub + block_in_sub;
-                        let twiddle = self.twiddle(layer, global_block);
+                        let mut twiddles = [F128::ZERO; 7];
+                        twiddles[0] = self.twiddle(layer, global_block);
+                        for child in 0..2 {
+                            twiddles[1 + child] = self.twiddle(layer + 1, 2 * global_block + child);
+                        }
+                        for child in 0..4 {
+                            twiddles[3 + child] = self.twiddle(layer + 2, 4 * global_block + child);
+                        }
                         let block_start = block_in_sub * block_elems;
-                        butterfly_interleaved_block(
+                        butterfly_interleaved_fused_3layer_rows_seq(
                             &mut sub_data[block_start..block_start + block_elems],
-                            twiddle,
-                            block_size_half,
+                            &twiddles,
+                            eighth,
                             num_ntts,
                         );
                     }
+                    layer += 3;
                 }
+                debug_assert_eq!(layer, log_d);
                 finish_chunk(sub_idx * sub_elems, sub_data);
             });
     }
@@ -1157,6 +1181,26 @@ fn butterfly_interleaved_fused_2layer_rows_seq(
     }
 }
 
+/// Sequential radix-8 counterpart used inside one already-parallel deep
+/// subtree job. Production invokes this only after four deep layers have
+/// reduced the stream stride enough to avoid eight-way same-set pressure.
+#[inline]
+fn butterfly_interleaved_fused_3layer_rows_seq(
+    block: &mut [F128],
+    twiddles: &[F128; 7],
+    eighth: usize,
+    num_ntts: usize,
+) {
+    debug_assert!(num_ntts > 0);
+    debug_assert_eq!(block.len(), 8 * eighth * num_ntts);
+    let base = block.as_mut_ptr();
+    for row in 0..eighth {
+        // SAFETY: this loop is serial within an exclusively borrowed block;
+        // each row selects a distinct group of eight in-bounds rows.
+        unsafe { kernels::butterfly_fused_3layer_row(base, eighth, num_ntts, row, twiddles) };
+    }
+}
+
 /// Butterfly one block of an interleaved (SoA) buffer with shared twiddle.
 ///
 /// `block` has length `(2 * block_size_half) * num_ntts` and is laid out as
@@ -1443,12 +1487,12 @@ mod tests {
         }
     }
 
-    /// Exercise five fused deep pairs with the ranked 1024-position subtree
+    /// Exercise the ranked `2+2+3+3` schedule with its 1024-position subtree
     /// geometry, but only two interleaved lanes so the fixture stays small.
     /// The scalar oracle applies the same ten layers as separate sweeps and
     /// therefore catches both child-twiddle and global-block indexing errors.
     #[test]
-    fn five_deep_fused_pairs_match_scalar_reference() {
+    fn deep_late_radix8_matches_scalar_reference() {
         const LOG_D: usize = 12;
         const N_TOP: usize = 2;
         const NUM_NTTS: usize = 2;
@@ -1461,8 +1505,8 @@ mod tests {
             ntt.forward_transform_interleaved_scalar_from_layer(&mut want, NUM_NTTS, N_TOP);
 
             let mut got = source;
-            ntt.forward_transform_interleaved_deep_fused_pairs(&mut got, NUM_NTTS, N_TOP, LOG_D);
-            assert_eq!(got, want, "five-pair mismatch at iteration={iteration}");
+            ntt.forward_transform_interleaved_deep_late_radix8(&mut got, NUM_NTTS, N_TOP, LOG_D);
+            assert_eq!(got, want, "late-radix8 mismatch at iteration={iteration}");
         }
     }
 
@@ -1506,17 +1550,20 @@ mod tests {
     /// schedule; all recursive, diagnostic, and cross-platform shapes retain
     /// the existing single-layer deep loop.
     #[test]
-    fn ranked_deep_pair_fusion_gate_is_narrow() {
+    fn ranked_deep_late_radix8_fusion_gate_is_narrow() {
         let enabled_here = cfg!(all(
             target_os = "macos",
             target_arch = "aarch64",
             target_feature = "aes"
         ));
-        assert_eq!(use_ranked_deep_pair_fusion(20, 64, 1, 10), enabled_here);
-        assert!(!use_ranked_deep_pair_fusion(19, 64, 1, 10));
-        assert!(!use_ranked_deep_pair_fusion(20, 8, 1, 10));
-        assert!(!use_ranked_deep_pair_fusion(20, 64, 0, 10));
-        assert!(!use_ranked_deep_pair_fusion(20, 64, 1, 9));
+        assert_eq!(
+            use_ranked_deep_late_radix8_fusion(20, 64, 1, 10),
+            enabled_here
+        );
+        assert!(!use_ranked_deep_late_radix8_fusion(19, 64, 1, 10));
+        assert!(!use_ranked_deep_late_radix8_fusion(20, 8, 1, 10));
+        assert!(!use_ranked_deep_late_radix8_fusion(20, 64, 0, 10));
+        assert!(!use_ranked_deep_late_radix8_fusion(20, 64, 1, 9));
         assert_eq!(use_ranked_zero_root_fusion(20, 64, 1, 10), enabled_here);
         assert!(!use_ranked_zero_root_fusion(19, 64, 1, 10));
         assert!(!use_ranked_zero_root_fusion(20, 8, 1, 10));
