@@ -2003,7 +2003,7 @@ mod tests {
             // SAFETY: aarch64 target; arrays are the exact sizes the kernel
             // indexes, and `convert` is the full 16*256-entry table.
             unsafe {
-                kernels::aarch64::accumulate_convert(
+                kernels::aarch64::accumulate_convert::<0>(
                     &chunk_ab,
                     &chunk_c,
                     n_b_med,
@@ -2109,7 +2109,7 @@ mod tests {
             // indexes, and `convert` is the full 16*256-entry table.
             unsafe {
                 let paired_c = &*PAIRED_C_TABLES;
-                kernels::aarch64::accumulate_convert_with_s_hat_v(
+                kernels::aarch64::accumulate_convert_with_s_hat_v::<0>(
                     &chunk_ab,
                     &chunk_c,
                     n_b_med,

@@ -145,15 +145,35 @@ pub(super) fn accumulate_convert(
     // SAFETY: aarch64 statically guarantees NEON and the fixed arrays cover
     // all table-selected loads.
     unsafe {
-        aarch64::accumulate_convert(
-            chunk_ab_bytes,
-            chunk_c_bytes,
-            n_b_med,
-            convert,
-            eq_lo_val,
-            partial_ab,
-            partial_c,
-        );
+        match n_b_med {
+            15 => aarch64::accumulate_convert::<15>(
+                chunk_ab_bytes,
+                chunk_c_bytes,
+                n_b_med,
+                convert,
+                eq_lo_val,
+                partial_ab,
+                partial_c,
+            ),
+            16 => aarch64::accumulate_convert::<16>(
+                chunk_ab_bytes,
+                chunk_c_bytes,
+                n_b_med,
+                convert,
+                eq_lo_val,
+                partial_ab,
+                partial_c,
+            ),
+            _ => aarch64::accumulate_convert::<0>(
+                chunk_ab_bytes,
+                chunk_c_bytes,
+                n_b_med,
+                convert,
+                eq_lo_val,
+                partial_ab,
+                partial_c,
+            ),
+        }
     }
 
     #[cfg(not(target_arch = "aarch64"))]
@@ -185,18 +205,44 @@ pub(super) fn accumulate_convert_with_s_hat_v(
     // SAFETY: aarch64 statically guarantees NEON and the fixed arrays cover
     // all table-selected loads.
     unsafe {
-        aarch64::accumulate_convert_with_s_hat_v(
-            chunk_ab_bytes,
-            chunk_c_bytes,
-            n_b_med,
-            convert,
-            &paired_c.0,
-            &paired_c.1,
-            eq_lo_val,
-            partial_ab,
-            partial_c_0,
-            partial_c_1,
-        );
+        match n_b_med {
+            15 => aarch64::accumulate_convert_with_s_hat_v::<15>(
+                chunk_ab_bytes,
+                chunk_c_bytes,
+                n_b_med,
+                convert,
+                &paired_c.0,
+                &paired_c.1,
+                eq_lo_val,
+                partial_ab,
+                partial_c_0,
+                partial_c_1,
+            ),
+            16 => aarch64::accumulate_convert_with_s_hat_v::<16>(
+                chunk_ab_bytes,
+                chunk_c_bytes,
+                n_b_med,
+                convert,
+                &paired_c.0,
+                &paired_c.1,
+                eq_lo_val,
+                partial_ab,
+                partial_c_0,
+                partial_c_1,
+            ),
+            _ => aarch64::accumulate_convert_with_s_hat_v::<0>(
+                chunk_ab_bytes,
+                chunk_c_bytes,
+                n_b_med,
+                convert,
+                &paired_c.0,
+                &paired_c.1,
+                eq_lo_val,
+                partial_ab,
+                partial_c_0,
+                partial_c_1,
+            ),
+        }
     }
 
     #[cfg(all(

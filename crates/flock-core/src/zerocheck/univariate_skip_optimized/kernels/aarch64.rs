@@ -15,7 +15,7 @@ use super::super::{F8, F128, InvNttTableByteSingleGf8, N_CHUNKS};
 /// between independent lanes changes, so every accumulator is bit-identical.
 #[allow(clippy::too_many_arguments)]
 #[inline(always)]
-pub(crate) unsafe fn accumulate_convert(
+pub(crate) unsafe fn accumulate_convert<const FIXED_N_B_MED: usize>(
     chunk_ab_bytes: &[[u8; 64]; 16],
     chunk_c_bytes: &[[u8; 64]; 16],
     n_b_med: usize,
@@ -25,6 +25,16 @@ pub(crate) unsafe fn accumulate_convert(
     partial_c: &mut [F128; 64],
 ) {
     use core::arch::aarch64::*;
+
+    // `FIXED_N_B_MED = 15/16` is selected by the outer dispatcher for the
+    // ranked BLAKE3 shape. Keeping the runtime form as `FIXED_N_B_MED = 0`
+    // preserves the generic path for other padding geometries while letting
+    // LLVM constant-fold the loop bounds and odd-tail branch in the hot case.
+    let n_b_med = if FIXED_N_B_MED == 0 {
+        n_b_med
+    } else {
+        FIXED_N_B_MED
+    };
 
     // SAFETY: caller guarantees fixed input sizes and aarch64 provides NEON.
     unsafe {
@@ -160,7 +170,7 @@ pub(crate) unsafe fn accumulate_convert(
 /// back to the unpaired path.
 #[allow(clippy::too_many_arguments)]
 #[inline(always)]
-pub(crate) unsafe fn accumulate_convert_with_s_hat_v(
+pub(crate) unsafe fn accumulate_convert_with_s_hat_v<const FIXED_N_B_MED: usize>(
     chunk_ab_bytes: &[[u8; 64]; 16],
     chunk_c_bytes: &[[u8; 64]; 16],
     n_b_med: usize,
@@ -173,6 +183,14 @@ pub(crate) unsafe fn accumulate_convert_with_s_hat_v(
     partial_c_1: &mut [F128; 64],
 ) {
     use core::arch::aarch64::*;
+
+    // See `accumulate_convert`: zero means the fully dynamic compatibility
+    // path; 15/16 are the only ranked padding counts.
+    let n_b_med = if FIXED_N_B_MED == 0 {
+        n_b_med
+    } else {
+        FIXED_N_B_MED
+    };
 
     debug_assert!(n_b_med <= 16);
     debug_assert_eq!(convert.len(), 16 * 256);
