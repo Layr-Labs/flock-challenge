@@ -233,6 +233,84 @@ where
         })
 }
 
+/// Below this block size the composed-table build does not amortize, and the
+/// deferred sweep keeps the direct per-slot multiply. Tiny test shapes land
+/// here; the ranked geometry (`b = 2^15`) is far above it.
+const COMPOSE_MIN_BLOCK: usize = 1 << 12;
+
+/// One block of the fused deferred-dense sweep: writes the γ-weighted
+/// combination of every [`ring_switch::RsEqInd::DeferredDense`] claim into
+/// `out_block` and returns that block's round-0 sumcheck prime `(u_0, u_2)`
+/// over `packed_witness · out_block`.
+///
+/// Composed-table sweep. `fold_one_slot(·, T)` is F₂-linear, so the
+/// per-slot map `lo ↦ fold_one_slot(lo·e_hi, T)` collapses into ONE
+/// per-claim-per-block byte table (`compose_fold_byte_table_into`),
+/// deleting the per-slot field multiply from the L-sized sweep —
+/// 1 GF mul × L × n_claims of counted work — for a per-block table
+/// build (~4.3k ops) amortized over b slots. Bit-identical: the
+/// composed table encodes exactly the same F₂-linear map (see the
+/// helper's docs). One 64 KiB table is live per thread at a time
+/// (claims composed and swept sequentially — table reused in place),
+/// preserving the claim-sequential L1 footprint.
+///
+/// A free function rather than a closure so the differential test can drive
+/// the shipping body itself: both schedules below (hetero queue and the Rayon
+/// `map_init` fallback) call exactly this, so the test cannot drift from
+/// production.
+#[inline]
+fn fold_deferred_block(
+    rs_deferred: &[(&[F128], &[F128], &[F128], usize)],
+    packed_witness: &[F128],
+    composed: bool,
+    b: usize,
+    ctable: &mut Vec<F128>,
+    hi: usize,
+    out_block: &mut [F128],
+) -> (F128, F128) {
+    // Accumulate each claim's block: first claim writes, rest add.
+    // `e_hi` is folded into the composed table once per claim per
+    // block, then swept over eq_lo with no per-slot multiply.
+    for (ci, (eq_lo, eq_hi, table, _)) in rs_deferred.iter().enumerate() {
+        let e_hi = eq_hi[hi];
+        if composed {
+            ring_switch::compose_fold_byte_table_into(e_hi, table, ctable);
+            if ci == 0 {
+                for (slot, &lo) in out_block.iter_mut().zip(eq_lo.iter()) {
+                    *slot = ring_switch::fold_one_slot(lo, ctable);
+                }
+            } else {
+                for (slot, &lo) in out_block.iter_mut().zip(eq_lo.iter()) {
+                    *slot += ring_switch::fold_one_slot(lo, ctable);
+                }
+            }
+        } else if ci == 0 {
+            for (slot, &lo) in out_block.iter_mut().zip(eq_lo.iter()) {
+                *slot = ring_switch::fold_one_slot(lo * e_hi, table);
+            }
+        } else {
+            for (slot, &lo) in out_block.iter_mut().zip(eq_lo.iter()) {
+                *slot += ring_switch::fold_one_slot(lo * e_hi, table);
+            }
+        }
+    }
+    // Round-0 prime over this block's pairs (b is even, base is even).
+    // Keep this separate from the last claim's streaming store: the
+    // pairwise stepping variant is slower even though it removes a pass.
+    let base = hi * b;
+    let mut u0 = F128::ZERO;
+    let mut u2 = F128::ZERO;
+    for t in 0..(b / 2) {
+        let s0 = out_block[2 * t];
+        let s1 = out_block[2 * t + 1];
+        let a0 = packed_witness[base + 2 * t];
+        let a1 = packed_witness[base + 2 * t + 1];
+        u0 += a0 * s0;
+        u2 += (a0 + a1) * (s0 + s1);
+    }
+    (u0, u2)
+}
+
 /// Runs ring_switch over RS claims, observes packed-direct claim values +
 /// samples their gammas, then builds `b_combined` (the γ-weighted linear
 /// combination of all `rs_eq_ind`s and `eq_ind`s) and `target_combined`.
@@ -375,63 +453,21 @@ fn compute_combined_basis_and_target<Ch: Challenger>(
         let b = rs_deferred[0].0.len(); // eq_lo.len(); shared across claims (same split)
         debug_assert!(b >= 2 && b.is_multiple_of(2));
         debug_assert!(rs_deferred.iter().all(|d| d.0.len() == b));
-        // Composed-table sweep. `fold_one_slot(·, T)` is F₂-linear, so the
-        // per-slot map `lo ↦ fold_one_slot(lo·e_hi, T)` collapses into ONE
-        // per-claim-per-block byte table (`compose_fold_byte_table_into`),
-        // deleting the per-slot field multiply from the L-sized sweep —
-        // 1 GF mul × L × n_claims of counted work — for a per-block table
-        // build (~4.3k ops) amortized over b slots. Bit-identical: the
-        // composed table encodes exactly the same F₂-linear map (see the
-        // helper's docs). One 64 KiB table is live per thread at a time
-        // (claims composed and swept sequentially — table reused in place),
-        // preserving the claim-sequential L1 footprint.
-        //
-        // Small blocks (tiny test shapes) keep the direct slot-multiply
-        // sweep: the table build wouldn't amortize below ~2^12 slots.
-        const COMPOSE_MIN_BLOCK: usize = 1 << 12;
+        // The per-block sweep body lives in [`fold_deferred_block`]; see its
+        // docs for the composed-table argument. Small blocks (tiny test
+        // shapes) keep the direct slot-multiply sweep: the table build
+        // wouldn't amortize below `COMPOSE_MIN_BLOCK` slots.
         let composed = b >= COMPOSE_MIN_BLOCK;
         let fold_block = |ctable: &mut Vec<F128>, hi: usize, out_block: &mut [F128]| {
-            // Accumulate each claim's block: first claim writes, rest add.
-            // `e_hi` is folded into the composed table once per claim per
-            // block, then swept over eq_lo with no per-slot multiply.
-            for (ci, (eq_lo, eq_hi, table, _)) in rs_deferred.iter().enumerate() {
-                let e_hi = eq_hi[hi];
-                if composed {
-                    ring_switch::compose_fold_byte_table_into(e_hi, table, ctable);
-                    if ci == 0 {
-                        for (slot, &lo) in out_block.iter_mut().zip(eq_lo.iter()) {
-                            *slot = ring_switch::fold_one_slot(lo, ctable);
-                        }
-                    } else {
-                        for (slot, &lo) in out_block.iter_mut().zip(eq_lo.iter()) {
-                            *slot += ring_switch::fold_one_slot(lo, ctable);
-                        }
-                    }
-                } else if ci == 0 {
-                    for (slot, &lo) in out_block.iter_mut().zip(eq_lo.iter()) {
-                        *slot = ring_switch::fold_one_slot(lo * e_hi, table);
-                    }
-                } else {
-                    for (slot, &lo) in out_block.iter_mut().zip(eq_lo.iter()) {
-                        *slot += ring_switch::fold_one_slot(lo * e_hi, table);
-                    }
-                }
-            }
-            // Round-0 prime over this block's pairs (b is even, base is even).
-            // Keep this separate from the last claim's streaming store: the
-            // pairwise stepping variant is slower even though it removes a pass.
-            let base = hi * b;
-            let mut u0 = F128::ZERO;
-            let mut u2 = F128::ZERO;
-            for t in 0..(b / 2) {
-                let s0 = out_block[2 * t];
-                let s1 = out_block[2 * t + 1];
-                let a0 = packed_witness[base + 2 * t];
-                let a1 = packed_witness[base + 2 * t + 1];
-                u0 += a0 * s0;
-                u2 += (a0 + a1) * (s0 + s1);
-            }
-            (u0, u2)
+            fold_deferred_block(
+                &rs_deferred,
+                packed_witness,
+                composed,
+                b,
+                ctable,
+                hi,
+                out_block,
+            )
         };
         let init_ctable = || {
             if composed {
@@ -864,6 +900,12 @@ mod tests {
     /// dispatcher. It uses the same 64 KiB private-state size as the ranked
     /// composed table while keeping the output small enough for an ordinary
     /// unit test.
+    ///
+    /// This covers the PLUMBING only — its `fold_block` is synthetic and never
+    /// touches `compose_fold_byte_table_into` or `fold_one_slot`. The sweep
+    /// ALGEBRA is covered by
+    /// [`deferred_sweep_algebra_matches_naive_reference`] below. Keep both:
+    /// neither subsumes the other.
     #[test]
     fn hetero_open_combine_block_dispatch_matches_serial() {
         const N_BLOCKS: usize = 256;
@@ -906,6 +948,130 @@ mod tests {
         }
         assert_eq!(got, expected);
         assert_eq!(got_uv, expected_uv);
+    }
+
+    /// [`fold_deferred_block`] — the shipping sweep body — is bit-exact
+    /// against a naive serial reference, for both the composed-table path
+    /// (`b >= COMPOSE_MIN_BLOCK`) and the direct slot-multiply path, and for
+    /// one and two claims.
+    ///
+    /// Complementary to
+    /// [`hetero_open_combine_block_dispatch_matches_serial`] above: that one
+    /// validates block ownership and reduction with a synthetic body, this one
+    /// validates the field algebra of the real body. A wrong `eq_hi` index, a
+    /// claim-accumulation order slip, or a `ci == 0` write-vs-accumulate mixup
+    /// passes the dispatcher test and fails this one.
+    ///
+    /// Driven THROUGH [`run_hetero_open_combine_blocks`] so the real two-pool
+    /// drain is exercised as well; the queue's chunk-claim order is
+    /// nondeterministic, so every scheduling must produce exactly the
+    /// reference bits.
+    #[test]
+    fn deferred_sweep_algebra_matches_naive_reference() {
+        let mut rng = Rng::new(0xA5F0_1234);
+        // (log2 b, log2 n_blocks): a composed-path shape, and a small
+        // direct-path shape below `COMPOSE_MIN_BLOCK`.
+        for &(log_b, log_blocks) in &[(12usize, 5usize), (5, 3)] {
+            for n_claims in 1..=2 {
+                let b = 1usize << log_b;
+                let n_blocks = 1usize << log_blocks;
+                let l = b * n_blocks;
+
+                // `table[k·256 + v] = Σ_{bit set in v} scaled[k·8 + bit]` —
+                // the same subset-sum layout `fold_one_slot` indexes, with γ
+                // baked into `scaled` exactly as ring_switch does.
+                // Built inline because `ring_switch::build_fold_byte_table` is
+                // private.
+                let claims: Vec<(Vec<F128>, Vec<F128>, Vec<F128>)> = (0..n_claims)
+                    .map(|_| {
+                        let eq_lo: Vec<F128> = (0..b).map(|_| rng.f128()).collect();
+                        let eq_hi: Vec<F128> = (0..n_blocks).map(|_| rng.f128()).collect();
+                        let scaled: Vec<F128> =
+                            (0..(1usize << LOG_PACKING)).map(|_| rng.f128()).collect();
+                        let mut table = vec![F128::ZERO; ring_switch::FOLD_TABLE_LEN];
+                        for k in 0..(ring_switch::FOLD_TABLE_LEN / 256) {
+                            for v in 0..256usize {
+                                let mut acc = F128::ZERO;
+                                for bit in 0..8 {
+                                    if (v >> bit) & 1 == 1 {
+                                        acc += scaled[k * 8 + bit];
+                                    }
+                                }
+                                table[k * 256 + v] = acc;
+                            }
+                        }
+                        (eq_lo, eq_hi, table)
+                    })
+                    .collect();
+                let rs_deferred: Vec<(&[F128], &[F128], &[F128], usize)> = claims
+                    .iter()
+                    .map(|(lo, hi, t)| (lo.as_slice(), hi.as_slice(), t.as_slice(), log_b))
+                    .collect();
+                let packed_witness: Vec<F128> = (0..l).map(|_| rng.f128()).collect();
+
+                // Naive serial reference: per output slot, sum every claim's
+                // `fold_one_slot(eq_lo·eq_hi, table)`; then the round-0 prime
+                // over consecutive pairs, in index order.
+                let mut want = vec![F128::ZERO; l];
+                for (j, slot) in want.iter_mut().enumerate() {
+                    for (eq_lo, eq_hi, table) in claims.iter() {
+                        *slot +=
+                            ring_switch::fold_one_slot(eq_lo[j % b] * eq_hi[j / b], table.as_slice());
+                    }
+                }
+                let (mut want_u0, mut want_u2) = (F128::ZERO, F128::ZERO);
+                for t in 0..(l / 2) {
+                    let (s0, s1) = (want[2 * t], want[2 * t + 1]);
+                    let (a0, a1) = (packed_witness[2 * t], packed_witness[2 * t + 1]);
+                    want_u0 += a0 * s0;
+                    want_u2 += (a0 + a1) * (s0 + s1);
+                }
+
+                // POISON, not zeros. Production allocates `b_combined` from
+                // `crate::scratch::take_f128`, which hands back pooled memory
+                // via `set_len` over stale contents (see scratch.rs's
+                // write-before-read contract) — so the first claim's `ci == 0`
+                // branch genuinely writes (`=`) over garbage, and that `=` is
+                // load-bearing. F128 addition is XOR with ZERO as identity, so
+                // over a zero-filled buffer `*slot = x` and `*slot += x` are
+                // indistinguishable and the write-vs-accumulate branch would be
+                // untested no matter what this test asserted.
+                let mut got: Vec<F128> = (0..l).map(|_| rng.f128()).collect();
+                let composed = b >= COMPOSE_MIN_BLOCK;
+                let (u0, u2) = run_hetero_open_combine_blocks(
+                    &mut got,
+                    b,
+                    || {
+                        if composed {
+                            vec![F128::ZERO; ring_switch::FOLD_TABLE_LEN]
+                        } else {
+                            Vec::new()
+                        }
+                    },
+                    |ctable, hi, out_block| {
+                        fold_deferred_block(
+                            &rs_deferred,
+                            &packed_witness,
+                            composed,
+                            b,
+                            ctable,
+                            hi,
+                            out_block,
+                        )
+                    },
+                );
+
+                assert_eq!(
+                    got, want,
+                    "b_combined mismatch (b=2^{log_b}, {n_claims} claims)"
+                );
+                assert_eq!(
+                    (u0, u2),
+                    (want_u0, want_u2),
+                    "round-0 prime mismatch (b=2^{log_b}, {n_claims} claims)"
+                );
+            }
+        }
     }
 
     fn zhat_skip_reference(z: &[bool], m: usize, z_skip: F128, x_outer: &[F128]) -> F128 {
