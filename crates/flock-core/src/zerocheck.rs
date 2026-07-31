@@ -27,9 +27,9 @@ pub mod univariate_skip_deg4_optimized;
 pub mod univariate_skip_optimized;
 
 use multilinear::{
-    UniSkipFoldTable, fold_and_compute_round_pair_into, fold_compact_and_compute_round_pair,
-    fold_in_place_pair, interpolate_at_z_combined, interpolate_at_z_on_lambda, round_pair_naive,
-    uni_skip_fold_and_round_pair_compact_padded_with_deltas,
+    UniSkipFoldTable, fold_and_compute_round_pair_into, fold_in_place_pair,
+    interpolate_at_z_combined, interpolate_at_z_on_lambda, round_pair_naive,
+    uni_skip_fold_and_round_pair_optimized_packed_padded,
 };
 use univariate_skip_optimized::{
     c_s_f128, medium_challenges_ghash, round1_shift_reduce_extract_c_packed_padded,
@@ -342,11 +342,9 @@ fn prove_packed_padded_inner<C: Challenger>(
         );
         (ab, c, None)
     };
-    // The A-sized transform is dead after the round-1 message. Its byte length
-    // exactly matches compact round two's delta storage, so retain its F128
-    // allocation/layout and donate it instead of taking a fresh Vec<u8>.
-    let compact_deltas =
-        precomputed_ab.map(univariate_skip_optimized::Round1AbInner::into_scratch_bytes);
+    // The A-sized transform is dead after the round-1 message and can return
+    // to the scratch pool before the much larger round-2 fold allocations.
+    drop(precomputed_ab);
     let c_s = c_s_f128();
     let round1_ab: Vec<F128> = round1_ab_opt.iter().map(|x| c_s * *x).collect();
     let round1_c: Vec<F128> = round1_c_opt.iter().map(|x| c_s * *x).collect();
@@ -380,16 +378,16 @@ fn prove_packed_padded_inner<C: Challenger>(
     let fold_table = UniSkipFoldTable::new(k_skip, z);
     let mut mlv_arg = vec![F128::ONE; n_mlv];
     mlv_arg[1..].copy_from_slice(&r[k_skip + 1..]);
-    let (compact_mlv, msg_1, msg_inf) = uni_skip_fold_and_round_pair_compact_padded_with_deltas(
-        a_packed,
-        b_packed,
-        m,
-        k_skip,
-        &fold_table,
-        &mlv_arg,
-        padding,
-        compact_deltas,
-    );
+    let (mut a_mlv, mut b_mlv, msg_1, msg_inf) =
+        uni_skip_fold_and_round_pair_optimized_packed_padded(
+            a_packed,
+            b_packed,
+            m,
+            k_skip,
+            &fold_table,
+            &mlv_arg,
+            padding,
+        );
 
     if zc_timing {
         eprintln!(
@@ -408,28 +406,14 @@ fn prove_packed_padded_inner<C: Challenger>(
     // ---- 7. Rounds 3..(n_mlv + 1) — AB only (c is done) ----
     //
     // Iter i: fold (a, b) at ρ_{i+1}, compute round (i+3) message, sample
-    // ρ_{i+2}. Use the fused parallel path while log_n ≥ 15; below that the
-    // 12..14 are structurally valid but open a fixed 128-chunk Rayon region
-    // over too little work; below 12, SplitEqGhash cannot form lo_size ≥ 2
-    // under MAX_N_HI = 9 at all. Fall back to fold_in_place_pair +
-    // round_pair_naive for this serial tail.
+    // ρ_{i+2}. Use the fused parallel path while log_n ≥ 12; below that the
+    // SplitEqGhash inner can't form lo_size ≥ 2 under MAX_N_HI = 9
+    // (eq covers log_n−2 vars, so n_lo = (log_n−2)−9 needs log_n ≥ 12),
+    // and even with the old cap the 10..13 rounds open a 128-chunk rayon
+    // region over tiny work — a net loss. Fall back to fold_in_place_pair
+    // + round_pair_naive for the serial tail.
     //
-    // The first challenge is applied directly to round two's compact
-    // anchor+packed-delta representation.  Composing rho into the 32 KiB byte
-    // table removes the two field multiplications per output that the generic
-    // pair fold would require, while materializing exactly the ordinary
-    // post-fold tables expected by all subsequent rounds.
-    let mut first_r_next = vec![F128::ONE; n_mlv - 1];
-    first_r_next[1..].copy_from_slice(&r[k_skip + 2..]);
-    let (mut a_mlv, mut b_mlv, first_m1, first_mi) =
-        fold_compact_and_compute_round_pair(&compact_mlv, &fold_table, mlv_rhos[0], &first_r_next);
-    compact_mlv.recycle();
-    multilinear_msgs.push((first_m1, first_mi));
-    challenger.observe_f128(first_m1);
-    challenger.observe_f128(first_mi);
-    mlv_rhos.push(challenger.sample_f128());
-
-    // Ping-pong scratch buffers for the remaining fused path: each fused round folds
+    // Ping-pong scratch buffers for the fused path: each fused round folds
     // (a_mlv, b_mlv) of size N into size N/2. Rather than allocating — and,
     // worse, `munmap`-ing, which is single-threaded and caps the tail's
     // parallel speedup — a fresh 64 MB buffer per round, we alternate between
@@ -445,7 +429,7 @@ fn prove_packed_padded_inner<C: Challenger>(
         (Vec::new(), Vec::new())
     };
 
-    for i in 1..(n_mlv - 1) {
+    for i in 0..(n_mlv - 1) {
         let rho_prev = mlv_rhos[i];
         let log_n_before = a_mlv.len().trailing_zeros() as usize;
 
@@ -455,7 +439,7 @@ fn prove_packed_padded_inner<C: Challenger>(
         let mut r_next = vec![F128::ONE; log_n_before - 1];
         r_next[1..].copy_from_slice(&r[k_skip + i + 2..]);
 
-        let (m1, mi) = if log_n_before >= 15 {
+        let (m1, mi) = if log_n_before >= 12 {
             let half = a_mlv.len() / 2;
             let (m1, mi) = fold_and_compute_round_pair_into(
                 &a_mlv,

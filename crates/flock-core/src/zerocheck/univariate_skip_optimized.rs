@@ -295,12 +295,6 @@ impl Round1AbInner {
     pub fn len_bytes(&self) -> usize {
         self.storage.len() * core::mem::size_of::<F128>()
     }
-
-    /// Donate the now-dead transform to a byte-oriented scratch consumer
-    /// without changing the allocation's element type or deallocation layout.
-    pub(crate) fn into_scratch_bytes(mut self) -> crate::scratch::ScratchBytes {
-        crate::scratch::ScratchBytes::from_initialized_f128(core::mem::take(&mut self.storage))
-    }
 }
 
 impl Drop for Round1AbInner {
@@ -1091,6 +1085,8 @@ pub fn round1_shift_reduce_extract_c_packed_padded_with_precomputed_ab(
     inv_table: &InvNttTableByteSingleGf8,
     padding: &PaddingSpec,
 ) -> (Vec<F128>, Vec<F128>, Vec<F128>) {
+    use rayon::prelude::*;
+
     assert_eq!(k_skip, K_SKIP, "optimized variant is k_skip=6 only");
     assert!(
         m >= k_skip + N_INNER,
@@ -1116,53 +1112,37 @@ pub fn round1_shift_reduce_extract_c_packed_padded_with_precomputed_ab(
     let (within_outer_mask, b_med_counts) = build_b_med_counts(padding);
     let ab_inner_bytes = ab_inner.as_bytes();
 
-    // The challenge-independent AB transform finishes while the commitment is
-    // still running. Its challenge-weighted completion is therefore a live
-    // prover phase, and each x_hi is independent. Drain those chunks through
-    // the shared P/E-core queue without changing the hot conversion kernel.
-    // A fixed per-index partial keeps the nondeterministic claim order out of
-    // the output; the final operation is XOR, so serial reduction is exact.
-    let mut partials: Vec<([F128; ELL], [F128; ELL], [F128; ELL])> =
-        vec![([F128::ZERO; ELL], [F128::ZERO; ELL], [F128::ZERO; ELL],); hi_size];
-    let partials_base = crate::epool::SyncPtr(partials.as_mut_ptr());
-    crate::epool::run_hetero_chunks(hi_size, |x_hi| {
-        let mut state = WorkerStateWithSHatV::new();
-        process_one_x_hi_with_precomputed_ab(
-            x_hi,
-            big_lo_size,
-            n_lo_and_inner,
-            within_outer_mask,
-            &b_med_counts,
-            ab_inner_bytes,
-            c_packed,
-            &eq_lo_scaled,
-            eq_hi[x_hi],
-            convert,
-            paired_c,
-            &mut state,
-        );
-        // SAFETY: the queue hands out each x_hi exactly once, so this task is
-        // the exclusive owner of partials[x_hi]. The queue's completion join
-        // publishes every write before the reduction below reads the vector.
-        unsafe {
-            *partials_base.ptr().add(x_hi) = (
-                state.local_res_ab,
-                state.local_res_c_s_0,
-                state.local_res_c_s_1,
+    let (res_ab, res_c_s_0, res_c_s_1) = (0..hi_size)
+        .into_par_iter()
+        .fold(WorkerStateWithSHatV::new, |mut state, x_hi| {
+            process_one_x_hi_with_precomputed_ab(
+                x_hi,
+                big_lo_size,
+                n_lo_and_inner,
+                within_outer_mask,
+                &b_med_counts,
+                ab_inner_bytes,
+                c_packed,
+                &eq_lo_scaled,
+                eq_hi[x_hi],
+                convert,
+                paired_c,
+                &mut state,
             );
-        }
-    });
-    let (res_ab, res_c_s_0, res_c_s_1) = partials.into_iter().fold(
-        ([F128::ZERO; ELL], [F128::ZERO; ELL], [F128::ZERO; ELL]),
-        |(mut ab1, mut c0_1, mut c1_1), (ab2, c0_2, c1_2)| {
-            for i in 0..ELL {
-                ab1[i] += ab2[i];
-                c0_1[i] += c0_2[i];
-                c1_1[i] += c1_2[i];
-            }
-            (ab1, c0_1, c1_1)
-        },
-    );
+            state
+        })
+        .map(|s| (s.local_res_ab, s.local_res_c_s_0, s.local_res_c_s_1))
+        .reduce(
+            || ([F128::ZERO; ELL], [F128::ZERO; ELL], [F128::ZERO; ELL]),
+            |(mut ab1, mut c0_1, mut c1_1), (ab2, c0_2, c1_2)| {
+                for i in 0..ELL {
+                    ab1[i] += ab2[i];
+                    c0_1[i] += c0_2[i];
+                    c1_1[i] += c1_2[i];
+                }
+                (ab1, c0_1, c1_1)
+            },
+        );
 
     let mut res_c_s_combined = [F128::ZERO; ELL];
     for i in 0..ELL {
@@ -1881,12 +1861,11 @@ mod tests {
 
     /// Splitting the challenge-independent AB transform from the later eq
     /// fold must not change any round-1 wire value or the captured C opening
-    /// helper. Cover m=13 through the first dimension that reaches the
-    /// heterogeneous queue's 16-chunk engagement threshold, so both unsplit
-    /// and split eq-table shapes plus the two-pool schedule are exercised.
+    /// helper. Cover the smallest three legal dimensions so both unsplit and
+    /// split eq-table shapes are exercised cheaply.
     #[test]
-    fn precomputed_ab_matches_fused_at_m13_through_m17() {
-        for m in 13usize..=17 {
+    fn precomputed_ab_matches_fused_at_m13_through_m15() {
+        for &m in &[13usize, 14, 15] {
             let mut rng = Rng::new(0xAB00_0000_u64.wrapping_add(m as u64));
             let a = pack_bits(&rng.bits(1 << m));
             let b = pack_bits(&rng.bits(1 << m));

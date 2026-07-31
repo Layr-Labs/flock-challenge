@@ -91,7 +91,6 @@
 use super::common::{BitRecord, add_carry_parts, or_bit_at, or_u32_at_bit, xor_dedup};
 use flock_core::challenger::Challenger;
 use flock_core::field::F128;
-use flock_core::merkle::HashKind;
 use flock_core::pcs::{Commitment, PcsParams};
 use flock_core::proof::R1csClaim;
 use flock_core::r1cs::{BlockR1cs, SparseBinaryMatrix};
@@ -651,154 +650,50 @@ pub fn build_block_r1cs(n_blocks_log: usize) -> BlockR1cs {
 // positions (cv_bit/m_bit/etc.).
 // ---------------------------------------------------------------------------
 
-/// One node in the compact linear-expression DAG used by the reverse
-/// transpose.  Unlike [`Word`], this never expands an intermediate into its
-/// (potentially very large) set of source columns.
-#[derive(Clone, Copy)]
-enum ReverseWordOp {
-    Leaf(usize),
-    Constant(u32),
-    Add {
-        x: usize,
-        y: usize,
-        carry_base: usize,
-    },
-    XorRot {
-        x: usize,
-        y: usize,
-        rotation: usize,
-    },
-}
-
-/// Reverse-mode evaluator for `alpha * A_0^T * eq + B_0^T * eq`.
-///
-/// Each logical 32-bit value is a DAG node.  Row weights are first attached
-/// to the values read by carry and lin-id rows, then one reverse sweep moves
-/// those weights to witness columns.  This makes work proportional to the
-/// BLAKE3 dependency graph rather than to the ~21M entries in its expanded
-/// sparse matrices.
-struct ReverseTranspose<'a> {
+#[inline]
+fn scatter_add_carry_rows(
+    comb: &mut [F128],
     alpha: F128,
-    eq_inner: &'a [F128],
-    ops: Vec<ReverseWordOp>,
-    adjoints: Vec<[F128; WORD_BITS]>,
-    comb: Vec<F128>,
+    eq_inner: &[F128],
+    x: &Word,
+    y: &Word,
+    carry_base: usize,
+) -> Word {
+    for i in 0..CARRY_BITS_PER_ADD {
+        let row = carry_base + i;
+        let e = eq_inner[row];
+        let ea = alpha * e;
+        for &slot in x.bits[i].iter() {
+            comb[slot] += ea;
+        }
+        for j in 0..i {
+            comb[carry_base + j] += ea;
+        }
+        for &slot in y.bits[i].iter() {
+            comb[slot] += e;
+        }
+        for j in 0..i {
+            comb[carry_base + j] += e;
+        }
+    }
+    Word::add_sum(x, y, carry_base)
 }
 
-impl<'a> ReverseTranspose<'a> {
-    fn new(alpha: F128, eq_inner: &'a [F128]) -> Self {
-        Self {
-            alpha,
-            eq_inner,
-            ops: Vec::with_capacity(32 + 12 * N_G + 16),
-            adjoints: Vec::with_capacity(32 + 12 * N_G + 16),
-            comb: vec![F128::ZERO; K],
-        }
+#[inline]
+fn scatter_lin_id_row(
+    comb: &mut [F128],
+    alpha: F128,
+    eq_inner: &[F128],
+    row: usize,
+    word_bits_i: &[usize],
+) {
+    let e = eq_inner[row];
+    let ea = alpha * e;
+    for &slot in word_bits_i.iter() {
+        comb[slot] += ea;
     }
-
-    #[inline]
-    fn push(&mut self, op: ReverseWordOp) -> usize {
-        let id = self.ops.len();
-        self.ops.push(op);
-        self.adjoints.push([F128::ZERO; WORD_BITS]);
-        id
-    }
-
-    #[inline]
-    fn leaf(&mut self, base: usize) -> usize {
-        self.push(ReverseWordOp::Leaf(base))
-    }
-
-    #[inline]
-    fn constant(&mut self, value: u32) -> usize {
-        self.push(ReverseWordOp::Constant(value))
-    }
-
-    #[inline]
-    fn xor_rot(&mut self, x: usize, y: usize, rotation: usize) -> usize {
-        self.push(ReverseWordOp::XorRot {
-            x,
-            y,
-            rotation,
-        })
-    }
-
-    /// Register one carry-only addition and all 31 nonlinear rows that define
-    /// its carry columns.
-    #[inline]
-    fn add(&mut self, x: usize, y: usize, carry_base: usize) -> usize {
-        let out = self.push(ReverseWordOp::Add { x, y, carry_base });
-
-        // Row i reads x[i] in A, y[i] in B, and carry[0..i] in both.
-        // Accumulating the latter backwards turns the triangular row walk into
-        // one suffix scan over the 31 carry columns.
-        let alpha_plus_one = self.alpha + F128::ONE;
-        let mut suffix = F128::ZERO;
-        for i in (0..CARRY_BITS_PER_ADD).rev() {
-            self.comb[carry_base + i] += suffix;
-            let e = self.eq_inner[carry_base + i];
-            self.adjoints[x][i] += self.alpha * e;
-            self.adjoints[y][i] += e;
-            suffix += alpha_plus_one * e;
-        }
-        out
-    }
-
-    /// Attach the A-side weight of a lin-id row to its defining expression;
-    /// its B-side is the constant-one column.
-    #[inline]
-    fn seed_lin_row(&mut self, value: usize, bit: usize, row: usize) {
-        let e = self.eq_inner[row];
-        self.adjoints[value][bit] += self.alpha * e;
-        self.comb[Z_CONST_POS] += e;
-    }
-
-    fn finish(mut self) -> Vec<F128> {
-        for id in (0..self.ops.len()).rev() {
-            // F128 is Copy, so taking this 32-lane value avoids aliasing the
-            // current node while predecessor adjoints are updated.
-            let q = self.adjoints[id];
-            match self.ops[id] {
-                ReverseWordOp::Leaf(base) => {
-                    for (i, value) in q.into_iter().enumerate() {
-                        self.comb[base + i] += value;
-                    }
-                }
-                ReverseWordOp::Constant(value) => {
-                    for (i, weight) in q.into_iter().enumerate() {
-                        if (value >> i) & 1 == 1 {
-                            self.comb[Z_CONST_POS] += weight;
-                        }
-                    }
-                }
-                ReverseWordOp::XorRot { x, y, rotation } => {
-                    for (i, weight) in q.into_iter().enumerate() {
-                        let source_bit = (i + rotation) % WORD_BITS;
-                        self.adjoints[x][source_bit] += weight;
-                        self.adjoints[y][source_bit] += weight;
-                    }
-                }
-                ReverseWordOp::Add { x, y, carry_base } => {
-                    // sum[i] = x[i] + y[i] + carry[0] + ... + carry[i-1].
-                    // The reverse of the carry prefix is another suffix scan.
-                    let mut suffix = F128::ZERO;
-                    for i in (0..WORD_BITS).rev() {
-                        if i < CARRY_BITS_PER_ADD {
-                            self.comb[carry_base + i] += suffix;
-                        }
-                        let weight = q[i];
-                        self.adjoints[x][i] += weight;
-                        self.adjoints[y][i] += weight;
-                        suffix += weight;
-                    }
-                }
-            }
-        }
-        self.comb
-    }
+    comb[Z_CONST_POS] += e;
 }
-
-
 
 pub struct Blake3LincheckCircuit;
 
@@ -809,107 +704,129 @@ impl flock_core::lincheck::LincheckCircuit for Blake3LincheckCircuit {
 
     fn fold_alpha_batched(&self, alpha: F128, eq_inner: &[F128]) -> Vec<F128> {
         assert_eq!(eq_inner.len(), K, "eq_inner length must equal n_cols = K");
-        let mut reverse = ReverseTranspose::new(alpha, eq_inner);
+        let mut comb = vec![F128::ZERO; K];
 
-        // Rows whose A side is the input itself and whose B side is one.
+        // Const row.
         let e0 = eq_inner[Z_CONST_POS];
-        reverse.comb[Z_CONST_POS] += alpha * e0 + e0;
-        let input_emit = |reverse: &mut ReverseTranspose<'_>, base: usize, len: usize| {
-            for s in base..base + len {
-                let e = reverse.eq_inner[s];
-                reverse.comb[s] += reverse.alpha * e;
-                reverse.comb[Z_CONST_POS] += e;
+        comb[Z_CONST_POS] += alpha * e0;
+        comb[Z_CONST_POS] += e0;
+
+        // Input self-loops for cv, m, counter, blen, flags.
+        let input_emit = |comb: &mut [F128], base: usize, len: usize| {
+            for j in 0..len {
+                let s = base + j;
+                let e = eq_inner[s];
+                comb[s] += alpha * e;
+                comb[Z_CONST_POS] += e;
             }
         };
-        input_emit(&mut reverse, CV_BASE, 8 * WORD_BITS);
-        input_emit(&mut reverse, M_BASE, 16 * WORD_BITS);
-        input_emit(&mut reverse, T_LO_BASE, WORD_BITS);
-        input_emit(&mut reverse, T_HI_BASE, WORD_BITS);
-        input_emit(&mut reverse, BLEN_BASE, WORD_BITS);
-        input_emit(&mut reverse, FLAGS_BASE, WORD_BITS);
+        input_emit(&mut comb, CV_BASE, 8 * WORD_BITS);
+        input_emit(&mut comb, M_BASE, 16 * WORD_BITS);
+        input_emit(&mut comb, T_LO_BASE, WORD_BITS);
+        input_emit(&mut comb, T_HI_BASE, WORD_BITS);
+        input_emit(&mut comb, BLEN_BASE, WORD_BITS);
+        input_emit(&mut comb, FLAGS_BASE, WORD_BITS);
 
-        // Unique source nodes preserve matrix column order.  Message words are
-        // shared across every scheduled use, while each materialized b/d word
-        // below gets a fresh leaf at its exact G-block offset.
-        let cv: [usize; 8] = std::array::from_fn(|w| reverse.leaf(cv_bit(w, 0)));
-        let messages: [usize; 16] = std::array::from_fn(|w| reverse.leaf(m_bit(w, 0)));
-        let mut state: [usize; 16] = [
-            cv[0],
-            cv[1],
-            cv[2],
-            cv[3],
-            cv[4],
-            cv[5],
-            cv[6],
-            cv[7],
-            reverse.constant(BLAKE3_IV[0]),
-            reverse.constant(BLAKE3_IV[1]),
-            reverse.constant(BLAKE3_IV[2]),
-            reverse.constant(BLAKE3_IV[3]),
-            reverse.leaf(T_LO_BASE),
-            reverse.leaf(T_HI_BASE),
-            reverse.leaf(BLEN_BASE),
-            reverse.leaf(FLAGS_BASE),
-        ];
+        let msg_idx = &PER_ROUND_MSG_IDX;
+        let mut state: [Word; 16] = initial_lane_words();
 
         for r in 0..N_ROUNDS {
             for g_in_round in 0..N_G_PER_ROUND {
                 let g = r * N_G_PER_ROUND + g_in_round;
                 let [la, lb, lc, ld] = G_LANES[g_in_round];
-                let [mx_idx, my_idx] = PER_ROUND_MSG_IDX[r][g_in_round];
-                let [a, b, c, d] = [state[la], state[lb], state[lc], state[ld]];
+                let [mx_idx, my_idx] = msg_idx[r][g_in_round];
 
-                let tmp_0 =
-                    reverse.add(a, b, g_add_carry_bit(g, ADD_TMP0, 0));
-                let a_1 = reverse.add(
-                    tmp_0,
-                    messages[mx_idx],
+                let a = state[la].clone();
+                let b = state[lb].clone();
+                let c = state[lc].clone();
+                let d = state[ld].clone();
+                let mx = Word::from_slot_base(m_bit(mx_idx, 0));
+                let my = Word::from_slot_base(m_bit(my_idx, 0));
+
+                let tmp_0 = scatter_add_carry_rows(
+                    &mut comb,
+                    alpha,
+                    eq_inner,
+                    &a,
+                    &b,
+                    g_add_carry_bit(g, ADD_TMP0, 0),
+                );
+                let a_1 = scatter_add_carry_rows(
+                    &mut comb,
+                    alpha,
+                    eq_inner,
+                    &tmp_0,
+                    &mx,
                     g_add_carry_bit(g, ADD_A1, 0),
                 );
-                let d_1 = reverse.xor_rot(d, a_1, 16);
-                let c_1 =
-                    reverse.add(c, d_1, g_add_carry_bit(g, ADD_C1, 0));
-                let b_1 = reverse.xor_rot(b, c_1, 12);
-                let tmp_1 =
-                    reverse.add(a_1, b_1, g_add_carry_bit(g, ADD_TMP1, 0));
-                let a_2 = reverse.add(
-                    tmp_1,
-                    messages[my_idx],
+                let d_1 = d.xor(&a_1).dedup().rotr(16);
+                let c_1 = scatter_add_carry_rows(
+                    &mut comb,
+                    alpha,
+                    eq_inner,
+                    &c,
+                    &d_1,
+                    g_add_carry_bit(g, ADD_C1, 0),
+                );
+                let b_1 = b.xor(&c_1).dedup().rotr(12);
+                let tmp_1 = scatter_add_carry_rows(
+                    &mut comb,
+                    alpha,
+                    eq_inner,
+                    &a_1,
+                    &b_1,
+                    g_add_carry_bit(g, ADD_TMP1, 0),
+                );
+                let a_2 = scatter_add_carry_rows(
+                    &mut comb,
+                    alpha,
+                    eq_inner,
+                    &tmp_1,
+                    &my,
                     g_add_carry_bit(g, ADD_A2, 0),
                 );
-                let d_2 = reverse.xor_rot(d_1, a_2, 8);
-                let c_2 =
-                    reverse.add(c_1, d_2, g_add_carry_bit(g, ADD_C2, 0));
+                let d_2 = d_1.xor(&a_2).dedup().rotr(8);
+                let c_2 = scatter_add_carry_rows(
+                    &mut comb,
+                    alpha,
+                    eq_inner,
+                    &c_1,
+                    &d_2,
+                    g_add_carry_bit(g, ADD_C2, 0),
+                );
 
-                let b_new = reverse.xor_rot(b_1, c_2, 7);
+                let b_new_word = b_1.xor(&c_2).dedup().rotr(7);
                 for i in 0..WORD_BITS {
-                    reverse.seed_lin_row(b_new, i, g_lin_bit(g, LIN_B_NEW, i));
-                    reverse.seed_lin_row(d_2, i, g_lin_bit(g, LIN_D_NEW, i));
+                    let s = g_lin_bit(g, LIN_B_NEW, i);
+                    scatter_lin_id_row(&mut comb, alpha, eq_inner, s, &b_new_word.bits[i]);
+                }
+                for i in 0..WORD_BITS {
+                    let s = g_lin_bit(g, LIN_D_NEW, i);
+                    scatter_lin_id_row(&mut comb, alpha, eq_inner, s, &d_2.bits[i]);
                 }
 
                 state[la] = a_2;
-                state[lb] = reverse.leaf(g_lin_bit(g, LIN_B_NEW, 0));
+                state[lb] = Word::from_slot_base(g_lin_bit(g, LIN_B_NEW, 0));
                 state[lc] = c_2;
-                state[ld] = reverse.leaf(g_lin_bit(g, LIN_D_NEW, 0));
+                state[ld] = Word::from_slot_base(g_lin_bit(g, LIN_D_NEW, 0));
             }
         }
 
-        // Finalization lin-id rows.  These nodes are seeded in physical output
-        // coordinate order, exactly as build_matrices writes the rows.
         for w in 0..8 {
-            let lo = reverse.xor_rot(state[w], state[w + 8], 0);
-            let hi = reverse.xor_rot(state[w + 8], cv[w], 0);
+            let lo = state[w].xor(&state[w + 8]).dedup();
             for i in 0..WORD_BITS {
-                reverse.seed_lin_row(lo, i, out_lo_bit(w, i));
-                reverse.seed_lin_row(hi, i, out_hi_bit(w, i));
+                let s = out_lo_bit(w, i);
+                scatter_lin_id_row(&mut comb, alpha, eq_inner, s, &lo.bits[i]);
+            }
+            let cv_w = Word::from_slot_base(cv_bit(w, 0));
+            let hi = state[w + 8].xor(&cv_w).dedup();
+            for i in 0..WORD_BITS {
+                let s = out_hi_bit(w, i);
+                scatter_lin_id_row(&mut comb, alpha, eq_inner, s, &hi.bits[i]);
             }
         }
 
-        reverse.finish()
-    }
-
-    fn const_pin_col(&self) -> Option<usize> {
-        Some(Z_CONST_POS)
+        comb
     }
 }
 
@@ -1564,68 +1481,21 @@ pub fn generate_witness_with_ab_packed_and_lincheck(
     Vec<flock_core::field::F128>,
     Vec<u8>,
 ) {
-    generate_witness_with_ab_packed_and_lincheck_impl(blocks, n_blocks_log, None)
-}
-
-fn generate_witness_with_ab_packed_and_lincheck_rate2_codeword(
-    blocks: &[Compression],
-    n_blocks_log: usize,
-    codeword: &mut [flock_core::field::F128],
-) -> (
-    Vec<flock_core::field::F128>,
-    Vec<flock_core::field::F128>,
-    Vec<flock_core::field::F128>,
-    Vec<u8>,
-) {
-    generate_witness_with_ab_packed_and_lincheck_impl(blocks, n_blocks_log, Some(codeword))
-}
-
-fn generate_witness_with_ab_packed_and_lincheck_impl(
-    blocks: &[Compression],
-    n_blocks_log: usize,
-    rate2_codeword: Option<&mut [flock_core::field::F128]>,
-) -> (
-    Vec<flock_core::field::F128>,
-    Vec<flock_core::field::F128>,
-    Vec<flock_core::field::F128>,
-    Vec<u8>,
-) {
     // Constant-wire pin (docs/const-wire-pin.md): fill padding blocks with a
     // valid compression (of the all-zero input) so the constant cell is 1 in
     // every block. (The chain forbids padding, so this only affects the
     // standalone batch setup.)
     let padding: Compression = ([0u32; 8], [0u32; 16], 0u64, 0u32, 0u32);
-    let stripe_useful_bits = if std::env::var_os("FLOCK_FULL_STRIPE").is_some() {
-        K
-    } else {
-        USEFUL_BITS
-    };
-    let per_block =
-        |block: &Compression, z_u64: &mut [u64], a_u64: &mut [u64], b_u64: &mut [u64]| {
+    super::common::drive_witness_packed_and_lincheck_full_write(
+        blocks,
+        &padding,
+        n_blocks_log,
+        K_LOG,
+        |block: &Compression, z_u64, a_u64, b_u64| {
             let (cv, m, t, bl, fl) = block;
             build_block_witness_ab_stream_into(cv, m, *t, *bl, *fl, z_u64, a_u64, b_u64);
-        };
-    match rate2_codeword {
-        Some(codeword) => {
-            super::common::drive_witness_packed_and_lincheck_full_write_with_rate2_codeword(
-                blocks,
-                &padding,
-                n_blocks_log,
-                K_LOG,
-                stripe_useful_bits,
-                codeword,
-                per_block,
-            )
-        }
-        None => super::common::drive_witness_packed_and_lincheck_full_write(
-            blocks,
-            &padding,
-            n_blocks_log,
-            K_LOG,
-            stripe_useful_bits,
-            per_block,
-        ),
-    }
+        },
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -1641,8 +1511,6 @@ pub struct Blake3Setup {
     pub pcs_params: PcsParams,
 }
 
-static RANKED_BLAKE3_LINCHECK: Blake3LincheckCircuit = Blake3LincheckCircuit;
-
 impl Blake3Setup {
     /// Build a setup for `n_blocks` BLAKE3 compressions with PCS
     /// `log_inv_rate = 1`.
@@ -1652,9 +1520,6 @@ impl Blake3Setup {
     pub fn new_batch_major(n_blocks: usize) -> Self {
         let mut s = Self::new(n_blocks);
         s.r1cs.layout = flock_core::r1cs::WitnessLayout::BatchMajor;
-        // Batch-major is outside the recognized reverse-transpose shape.
-        // Preserve the old eager CSC construction for this explicit fallback.
-        s.r1cs.csc_lincheck_circuit();
         s
     }
 
@@ -1676,74 +1541,6 @@ impl Blake3Setup {
                 generate_witness_batch_major(blocks, self.n_blocks_log())
             }
         }
-    }
-
-    /// The benchmark's exact row-major rate-1/2 geometry. Other sizes, rates,
-    /// profiles, hashes, layouts, targets, and explicit A/B runs retain the
-    /// existing prefault-plus-replicate path.
-    #[inline]
-    fn use_ranked_rate2_hot_codeword(&self) -> bool {
-        cfg!(all(
-            target_os = "macos",
-            target_arch = "aarch64",
-            target_feature = "aes"
-        )) && self.r1cs.layout == flock_core::r1cs::WitnessLayout::RowMajor
-            && self.r1cs.m == self.pcs_params.m
-            && self.pcs_params.m == 32
-            && self.pcs_params.log_inv_rate == 1
-            && self.pcs_params.log_batch_size == 6
-            && self.pcs_params.profile == flock_core::pcs::ligerito::LigeritoProfile::Fast
-            && self.pcs_params.merkle_hash == HashKind::Blake3
-            && std::env::var_os("FLOCK_NO_HOT_CODEWORD").is_none()
-    }
-
-    /// Select the reverse transpose only for the promoted benchmark geometry.
-    /// `FLOCK_NO_BLAKE3_REVERSE_LINCHECK=1` is the exact CSC A/B control.
-    #[inline]
-    fn use_ranked_reverse_lincheck(&self) -> bool {
-        self.r1cs.layout == flock_core::r1cs::WitnessLayout::RowMajor
-            && self.r1cs.m == 32
-            && self.r1cs.m == self.pcs_params.m
-            && self.r1cs.k_log == K_LOG
-            && self.r1cs.k_skip == K_SKIP
-            && self.r1cs.useful_bits == USEFUL_BITS
-            && self.r1cs.const_pin == Some(Z_CONST_POS)
-            && self.r1cs.a_0.num_rows == K
-            && self.r1cs.a_0.num_cols == K
-            && self.r1cs.b_0.num_rows == K
-            && self.r1cs.b_0.num_cols == K
-            && self.pcs_params.log_inv_rate == 1
-            && self.pcs_params.log_batch_size == 6
-            && self.pcs_params.profile
-                == flock_core::pcs::ligerito::LigeritoProfile::Fast
-            && std::env::var_os("FLOCK_NO_BLAKE3_REVERSE_LINCHECK").is_none()
-    }
-
-    #[inline]
-    fn lincheck_circuit(&self) -> &dyn flock_core::lincheck::LincheckCircuit {
-        if self.use_ranked_reverse_lincheck() {
-            &RANKED_BLAKE3_LINCHECK
-        } else {
-            self.r1cs.csc_lincheck_circuit()
-        }
-    }
-
-    /// Take the codeword before witness generation, then let row workers write
-    /// both rate-1/2 replicas. On the timed proof this normally comes from the
-    /// warm proof's resident scratch pool; on a cold miss, these P-core writes
-    /// perform the first touch without racing a prefault thread.
-    fn generate_witness_ab_with_rate2_codeword(
-        &self,
-        blocks: &[Compression],
-    ) -> (Vec<F128>, (Vec<F128>, Vec<F128>, Vec<F128>, Vec<u8>)) {
-        debug_assert!(self.use_ranked_rate2_hot_codeword());
-        let mut codeword = flock_core::scratch::take_f128(self.pcs_params.codeword_len_f128());
-        let witness = generate_witness_with_ab_packed_and_lincheck_rate2_codeword(
-            blocks,
-            self.n_blocks_log(),
-            &mut codeword,
-        );
-        (codeword, witness)
     }
 
     pub fn new(n_blocks: usize) -> Self {
@@ -1778,6 +1575,11 @@ impl Blake3Setup {
         assert!(n_blocks >= 1, "n_blocks must be ≥ 1");
         let n_log = min_n_blocks_log(n_blocks);
         let r1cs = build_block_r1cs(n_log);
+        // Warm the CSC fold circuit here so its one-time build (a pass over
+        // ~21M nonzeros) stays out of the first prove/verify, and pre-fault
+        // the prove-cycle scratch buffers (see scratch::prewarm_prover).
+        r1cs.csc_lincheck_circuit();
+        flock_core::scratch::prewarm_prover(r1cs.m);
         let pcs_params = PcsParams {
             m: r1cs.m,
             log_inv_rate,
@@ -1785,19 +1587,11 @@ impl Blake3Setup {
             profile,
             merkle_hash: Default::default(),
         };
-        let setup = Self {
+        Self {
             n_blocks,
             r1cs,
             pcs_params,
-        };
-        // Non-ranked shapes retain the eager CSC build, keeping its one-time
-        // transpose outside the first proof.  The ranked shape never allocates
-        // or walks the ~21M-entry CSC unless its runtime control requests it.
-        if !setup.use_ranked_reverse_lincheck() {
-            setup.r1cs.csc_lincheck_circuit();
         }
-        flock_core::scratch::prewarm_prover(setup.r1cs.m);
-        setup
     }
 
     pub fn m(&self) -> usize {
@@ -1847,27 +1641,11 @@ impl Blake3Setup {
         challenger: &mut Ch,
     ) -> (flock_core::proof::R1csProofLigerito, Commitment, R1csClaim) {
         assert_eq!(blocks.len(), self.n_blocks);
-        if self.use_ranked_rate2_hot_codeword() {
-            let (codeword, (z_packed, a_packed_f128, b_packed_f128, z_packed_lincheck)) =
-                self.generate_witness_ab_with_rate2_codeword(blocks);
-            let lc_circuit = self.lincheck_circuit();
-            return crate::prover::prove_fast_ligerito_from_preinitialized_codeword(
-                &self.r1cs,
-                &self.pcs_params,
-                z_packed,
-                a_packed_f128,
-                b_packed_f128,
-                z_packed_lincheck,
-                lc_circuit,
-                codeword,
-                challenger,
-            );
-        }
         let (codeword, (z_packed, a_packed_f128, b_packed_f128, z_packed_lincheck)) =
             flock_core::pcs::prefault_codeword_during(&self.pcs_params, || {
                 self.generate_witness_ab(blocks)
             });
-        let lc_circuit = self.lincheck_circuit();
+        let lc_circuit = self.r1cs.csc_lincheck_circuit();
         crate::prover::prove_fast_ligerito_from_witness(
             &self.r1cs,
             &self.pcs_params,
@@ -1896,41 +1674,21 @@ impl Blake3Setup {
     ) {
         assert_eq!(blocks.len(), self.n_blocks);
         let t0 = std::time::Instant::now();
-        let (codeword, (z_packed, a_packed_f128, b_packed_f128, z_packed_lincheck)) =
-            if self.use_ranked_rate2_hot_codeword() {
-                let (codeword, witness) = self.generate_witness_ab_with_rate2_codeword(blocks);
-                (Some(codeword), witness)
-            } else {
-                (None, self.generate_witness_ab(blocks))
-            };
+        let (z_packed, a_packed_f128, b_packed_f128, z_packed_lincheck) =
+            self.generate_witness_ab(blocks);
         let witness_s = t0.elapsed().as_secs_f64();
-        let lc_circuit = self.lincheck_circuit();
-        let (proof, commitment, claim, mut timings) = match codeword {
-            Some(codeword) => {
-                crate::prover::prove_fast_ligerito_timed_from_preinitialized_codeword(
-                    &self.r1cs,
-                    &self.pcs_params,
-                    z_packed,
-                    a_packed_f128,
-                    b_packed_f128,
-                    z_packed_lincheck,
-                    lc_circuit,
-                    codeword,
-                    challenger,
-                )
-            }
-            None => crate::prover::prove_fast_ligerito_timed(
-                &self.r1cs,
-                &self.pcs_params,
-                z_packed,
-                a_packed_f128,
-                b_packed_f128,
-                z_packed_lincheck,
-                lc_circuit,
-                None,
-                challenger,
-            ),
-        };
+        let lc_circuit = self.r1cs.csc_lincheck_circuit();
+        let (proof, commitment, claim, mut timings) = crate::prover::prove_fast_ligerito_timed(
+            &self.r1cs,
+            &self.pcs_params,
+            z_packed,
+            a_packed_f128,
+            b_packed_f128,
+            z_packed_lincheck,
+            lc_circuit,
+            None,
+            challenger,
+        );
         timings.witness_s = witness_s;
         (proof, commitment, claim, timings)
     }
@@ -1941,7 +1699,7 @@ impl Blake3Setup {
         proof: &flock_core::proof::R1csProofLigerito,
         challenger: &mut Ch,
     ) -> Result<R1csClaim, verifier::VerifyError> {
-        let lc_circuit = self.lincheck_circuit();
+        let lc_circuit = self.r1cs.csc_lincheck_circuit();
         verifier::verify_ligerito(
             &self.r1cs,
             commitment,
@@ -2580,188 +2338,6 @@ mod tests {
                 "lincheck stripe mismatch at n_blocks={n_blocks}"
             );
         }
-    }
-
-    #[test]
-    fn preinitialized_codeword_matches_fill_and_proof_roundtrips() {
-        use flock_core::challenger::FsChallenger;
-
-        let setup = Blake3Setup::new(256);
-        let mut rng = Rng::new(0xC0DE_20AD);
-        let blocks: Vec<Compression> = (0..setup.n_blocks)
-            .map(|_| {
-                let cv = std::array::from_fn(|_| rng.next_u32());
-                let m = std::array::from_fn(|_| rng.next_u32());
-                (cv, m, rng.next_u32() as u64, 64, 11)
-            })
-            .collect();
-
-        let mut hot_codeword = flock_core::scratch::take_f128(setup.pcs_params.codeword_len_f128());
-        let (z, a, b, z_lincheck) = generate_witness_with_ab_packed_and_lincheck_rate2_codeword(
-            &blocks,
-            setup.n_blocks_log(),
-            &mut hot_codeword,
-        );
-
-        let mut filled_codeword =
-            flock_core::scratch::take_f128(setup.pcs_params.codeword_len_f128());
-        flock_core::pcs::commit::replicate_message_fill(&mut filled_codeword, &z);
-        let as_bytes = |values: &[F128]| unsafe {
-            std::slice::from_raw_parts(values.as_ptr().cast::<u8>(), std::mem::size_of_val(values))
-        };
-        assert_eq!(
-            as_bytes(&hot_codeword),
-            as_bytes(&filled_codeword),
-            "hot-row codeword differs from replicate_message_fill"
-        );
-        flock_core::scratch::give_f128(filled_codeword);
-
-        let (z_fill, a_fill, b_fill, z_lincheck_fill) =
-            (z.clone(), a.clone(), b.clone(), z_lincheck.clone());
-        let circuit = setup.r1cs.csc_lincheck_circuit();
-
-        let mut hot_challenger = FsChallenger::new(b"flock-hot-codeword");
-        let (hot_proof, hot_commitment, hot_claim) =
-            crate::prover::prove_fast_ligerito_from_preinitialized_codeword(
-                &setup.r1cs,
-                &setup.pcs_params,
-                z,
-                a,
-                b,
-                z_lincheck,
-                circuit,
-                hot_codeword,
-                &mut hot_challenger,
-            );
-
-        let mut fill_challenger = FsChallenger::new(b"flock-hot-codeword");
-        let (fill_proof, fill_commitment, fill_claim) =
-            crate::prover::prove_fast_ligerito_from_witness(
-                &setup.r1cs,
-                &setup.pcs_params,
-                z_fill,
-                a_fill,
-                b_fill,
-                z_lincheck_fill,
-                circuit,
-                None,
-                &mut fill_challenger,
-            );
-
-        assert_eq!(hot_commitment.root, fill_commitment.root);
-        assert_eq!(hot_claim, fill_claim);
-        let hot_bytes = crate::proof_io::R1csProofBundleLigerito {
-            commitment: hot_commitment.clone(),
-            proof: hot_proof.clone(),
-        }
-        .to_bytes();
-        let fill_bytes = crate::proof_io::R1csProofBundleLigerito {
-            commitment: fill_commitment,
-            proof: fill_proof,
-        }
-        .to_bytes();
-        assert_eq!(
-            hot_bytes, fill_bytes,
-            "preinitialized and replicate-fill proofs must be byte-identical"
-        );
-
-        let roundtrip = crate::proof_io::R1csProofBundleLigerito::from_bytes(&hot_bytes).unwrap();
-        let mut verifier = FsChallenger::new(b"flock-hot-codeword");
-        let verified = setup
-            .verify(&roundtrip.commitment, &roundtrip.proof, &mut verifier)
-            .expect("preinitialized-codeword proof must verify");
-        assert_eq!(verified, hot_claim);
-    }
-
-    /// Exact ranked allocation shape: m=32 gives a 512 MiB packed witness and
-    /// a 1 GiB rate-1/2 codeword. Kept ignored in ordinary suites because the
-    /// byte-for-byte oracle intentionally holds two 1 GiB codewords at once.
-    #[test]
-    #[ignore = "ranked-shape test needs roughly 4 GiB of working memory"]
-    fn ranked_shape_hot_codeword_matches_replicate_message_fill() {
-        const RANKED_N_BLOCKS_LOG: usize = 18;
-        const RANKED_M: usize = K_LOG + RANKED_N_BLOCKS_LOG;
-        const RANKED_MSG_LEN: usize = 1 << (RANKED_M - flock_core::pcs::LOG_PACKING);
-
-        let mut rng = Rng::new(0x7260_19C0_DE);
-        let blocks: Vec<Compression> = (0..(1usize << RANKED_N_BLOCKS_LOG))
-            .map(|_| {
-                let cv = std::array::from_fn(|_| rng.next_u32());
-                let m = std::array::from_fn(|_| rng.next_u32());
-                (cv, m, rng.next_u32() as u64, 64, 11)
-            })
-            .collect();
-        let mut hot_codeword = flock_core::scratch::take_f128(2 * RANKED_MSG_LEN);
-        let (z, a, b, stripe) = generate_witness_with_ab_packed_and_lincheck_rate2_codeword(
-            &blocks,
-            RANKED_N_BLOCKS_LOG,
-            &mut hot_codeword,
-        );
-        assert_eq!(z.len(), RANKED_MSG_LEN);
-        drop(a);
-        drop(b);
-        drop(stripe);
-        drop(blocks);
-
-        let mut filled_codeword = flock_core::scratch::take_f128(2 * RANKED_MSG_LEN);
-        flock_core::pcs::commit::replicate_message_fill(&mut filled_codeword, &z);
-        let hot_bytes = unsafe {
-            std::slice::from_raw_parts(
-                hot_codeword.as_ptr().cast::<u8>(),
-                std::mem::size_of_val(hot_codeword.as_slice()),
-            )
-        };
-        let filled_bytes = unsafe {
-            std::slice::from_raw_parts(
-                filled_codeword.as_ptr().cast::<u8>(),
-                std::mem::size_of_val(filled_codeword.as_slice()),
-            )
-        };
-        assert!(
-            hot_bytes == filled_bytes,
-            "ranked hot-row codeword differs from replicate_message_fill"
-        );
-    }
-
-    /// One-proof ranked canary without the benchmark's timing loops.
-    #[test]
-    #[ignore = "ranked canary constructs and verifies one full m=32 proof"]
-    fn ranked_blake3_proof_canary() {
-        use flock_core::challenger::FsChallenger;
-
-        const RANKED_N_BLOCKS: usize = 1 << 18;
-        const EXPECTED_PROOF_BYTES: usize = 437_551;
-        let mut setup = Blake3Setup::new(RANKED_N_BLOCKS);
-        setup.pcs_params.merkle_hash = HashKind::Blake3;
-        assert!(
-            setup.use_ranked_rate2_hot_codeword(),
-            "canary must exercise the ranked hot-codeword gate"
-        );
-
-        // Match `benches/blake3_proof.rs`'s deterministic run-0 input exactly.
-        let mut rng = Rng::new(0xC0FFEE_BEEF ^ RANKED_N_BLOCKS as u64);
-        let blocks: Vec<Compression> = (0..RANKED_N_BLOCKS)
-            .map(|_| {
-                let cv = std::array::from_fn(|_| rng.next_u32());
-                let m = std::array::from_fn(|_| rng.next_u32());
-                (cv, m, rng.next_u32() as u64, 64, 11)
-            })
-            .collect();
-
-        let mut prover = FsChallenger::with_hash(b"flock-bench-v0", HashKind::Blake3);
-        let (proof, commitment, claim) = setup.prove_fast(&blocks, &mut prover);
-        let proof_bytes = crate::proof_io::R1csProofBundleLigerito {
-            commitment: commitment.clone(),
-            proof: proof.clone(),
-        }
-        .to_bytes();
-        assert_eq!(proof_bytes.len(), EXPECTED_PROOF_BYTES);
-
-        let mut verifier = FsChallenger::with_hash(b"flock-bench-v0", HashKind::Blake3);
-        let verified = setup
-            .verify(&commitment, &proof, &mut verifier)
-            .expect("ranked preinitialized-codeword proof must verify");
-        assert_eq!(verified, claim);
     }
 
     /// Full prove→verify round-trip through the Ligerito PCS for EACH named

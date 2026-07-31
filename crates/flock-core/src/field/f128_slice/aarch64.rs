@@ -8,20 +8,6 @@ struct WideNeon {
     hi: uint64x2_t,
 }
 
-// The SHA3 extension includes EOR3; retain the two-EOR form for generic
-// AArch64 builds that do not enable it.
-#[cfg(target_feature = "sha3")]
-#[inline(always)]
-unsafe fn xor3_u64(a: uint64x2_t, b: uint64x2_t, c: uint64x2_t) -> uint64x2_t {
-    unsafe { veor3q_u64(a, b, c) }
-}
-
-#[cfg(not(target_feature = "sha3"))]
-#[inline(always)]
-unsafe fn xor3_u64(a: uint64x2_t, b: uint64x2_t, c: uint64x2_t) -> uint64x2_t {
-    unsafe { veorq_u64(a, veorq_u64(b, c)) }
-}
-
 #[inline]
 #[target_feature(enable = "aes")]
 unsafe fn pmull(a: u64, b: u64) -> uint64x2_t {
@@ -49,8 +35,8 @@ unsafe fn mul_const_vec2(r: uint64x2_t, x0: uint64x2_t, x1: uint64x2_t) -> [uint
         let p1_ll = pmull(vgetq_lane_u64::<0>(x1), r_lo);
         let p1_hh = pmull(vgetq_lane_u64::<1>(x1), r_hi);
         let p1_mm = pmull(vgetq_lane_u64::<0>(x1_mid), vgetq_lane_u64::<0>(r_mid));
-        let c0 = xor3_u64(p0_mm, p0_ll, p0_hh);
-        let c1 = xor3_u64(p1_mm, p1_ll, p1_hh);
+        let c0 = veorq_u64(veorq_u64(p0_mm, p0_ll), p0_hh);
+        let c1 = veorq_u64(veorq_u64(p1_mm, p1_ll), p1_hh);
 
         // Pack product 0/1 into lanes and reduce both together.
         let r0 = vzip1q_u64(p0_ll, p1_ll);
@@ -64,19 +50,17 @@ unsafe fn mul_const_vec2(r: uint64x2_t, x0: uint64x2_t, x1: uint64x2_t) -> [uint
         let s2_hi = veorq_u64(vshlq_n_u64::<2>(r3), vshrq_n_u64::<62>(r2));
         let s7_lo = vshlq_n_u64::<7>(r2);
         let s7_hi = veorq_u64(vshlq_n_u64::<7>(r3), vshrq_n_u64::<57>(r2));
-        let t_lo = xor3_u64(r2, s1_lo, veorq_u64(s2_lo, s7_lo));
-        let t_hi = xor3_u64(r3, s1_hi, veorq_u64(s2_hi, s7_hi));
-        let overflow = xor3_u64(
-            vshrq_n_u64::<63>(r3),
-            vshrq_n_u64::<62>(r3),
+        let t_lo = veorq_u64(veorq_u64(r2, s1_lo), veorq_u64(s2_lo, s7_lo));
+        let t_hi = veorq_u64(veorq_u64(r3, s1_hi), veorq_u64(s2_hi, s7_hi));
+        let overflow = veorq_u64(
+            veorq_u64(vshrq_n_u64::<63>(r3), vshrq_n_u64::<62>(r3)),
             vshrq_n_u64::<57>(r3),
         );
-        let correction = xor3_u64(
-            overflow,
-            vshlq_n_u64::<1>(overflow),
+        let correction = veorq_u64(
+            veorq_u64(overflow, vshlq_n_u64::<1>(overflow)),
             veorq_u64(vshlq_n_u64::<2>(overflow), vshlq_n_u64::<7>(overflow)),
         );
-        let out_lo = xor3_u64(r0, t_lo, correction);
+        let out_lo = veorq_u64(veorq_u64(r0, t_lo), correction);
         let out_hi = veorq_u64(r1, t_hi);
         [vzip1q_u64(out_lo, out_hi), vzip2q_u64(out_lo, out_hi)]
     }
@@ -91,7 +75,7 @@ unsafe fn mul_unreduced(a: uint64x2_t, b: uint64x2_t) -> WideNeon {
         let a_mid = veorq_u64(a, vextq_u64::<1>(a, a));
         let b_mid = veorq_u64(b, vextq_u64::<1>(b, b));
         let middle = pmull(vgetq_lane_u64::<0>(a_mid), vgetq_lane_u64::<0>(b_mid));
-        let cross = xor3_u64(middle, ll, hh);
+        let cross = veorq_u64(veorq_u64(middle, ll), hh);
         let zero = vdupq_n_u64(0);
         WideNeon {
             lo: veorq_u64(ll, vextq_u64::<1>(zero, cross)),
@@ -125,19 +109,17 @@ unsafe fn reduce_wide(value: WideNeon) -> uint64x2_t {
             vshlq_n_u64::<7>(high),
             vextq_u64::<1>(zero, vshrq_n_u64::<57>(high)),
         );
-        let folded = xor3_u64(high, shift1, veorq_u64(shift2, shift7));
+        let folded = veorq_u64(veorq_u64(high, shift1), veorq_u64(shift2, shift7));
         let high_word = vextq_u64::<1>(high, zero);
-        let overflow = xor3_u64(
-            vshrq_n_u64::<63>(high_word),
-            vshrq_n_u64::<62>(high_word),
+        let overflow = veorq_u64(
+            veorq_u64(vshrq_n_u64::<63>(high_word), vshrq_n_u64::<62>(high_word)),
             vshrq_n_u64::<57>(high_word),
         );
-        let correction = xor3_u64(
-            overflow,
-            vshlq_n_u64::<1>(overflow),
+        let correction = veorq_u64(
+            veorq_u64(overflow, vshlq_n_u64::<1>(overflow)),
             veorq_u64(vshlq_n_u64::<2>(overflow), vshlq_n_u64::<7>(overflow)),
         );
-        xor3_u64(value.lo, folded, correction)
+        veorq_u64(value.lo, veorq_u64(folded, correction))
     }
 }
 
@@ -242,111 +224,5 @@ pub(super) unsafe fn fold_two_and_msg(
             transmute::<uint64x2_t, F128>(reduce_wide(u0)),
             transmute::<uint64x2_t, F128>(reduce_wide(u2)),
         )
-    }
-}
-/// Ticket-14 NEON: two-challenge fused fold. Per output group of 4, loads 16
-/// source pairs per polynomial, binds `r_a` then `r_b` entirely in registers,
-/// stores 4 outputs per polynomial, and accumulates the direct message plus
-/// the 6 lookahead coefficients. Product reuse: the direct message's first
-/// u_0/u_2 terms are identical to lookahead c0/c2, so each is computed once.
-///
-/// # Safety
-/// Caller guarantees PMULL and: `f.len() == b.len()`, `wf.len() == wb.len()`,
-/// `wf.len() % 4 == 0`, `base % 4 == 0`, and `4 * (base + wf.len()) <= f.len()`.
-pub(super) unsafe fn fold2_two_and_msgs(
-    f: &[F128],
-    b: &[F128],
-    base: usize,
-    wf: &mut [F128],
-    wb: &mut [F128],
-    r_a: F128,
-    r_b: F128,
-) -> (F128, F128, [F128; 6]) {
-    unsafe {
-        let zero = vdupq_n_u64(0);
-        let ra_q = transmute::<F128, uint64x2_t>(r_a);
-        let rb_q = transmute::<F128, uint64x2_t>(r_b);
-        // Accumulators: a_u0a = c0 (also u_0 term 1), a_u0b = u_0 term 2,
-        // a_u2a = c2 (also u_2 term 1), a_u2b = u_2 term 2. a_c1/a_c4
-        // hold the complementary endpoint products for Karatsuba recovery;
-        // a_c3/a_c5 hold the other lookahead endpoint products.
-        let mut a_u0a = WideNeon { lo: zero, hi: zero };
-        let mut a_u0b = WideNeon { lo: zero, hi: zero };
-        let mut a_u2a = WideNeon { lo: zero, hi: zero };
-        let mut a_u2b = WideNeon { lo: zero, hi: zero };
-        let mut a_c1 = WideNeon { lo: zero, hi: zero };
-        let mut a_c3 = WideNeon { lo: zero, hi: zero };
-        let mut a_c4 = WideNeon { lo: zero, hi: zero };
-        let mut a_c5 = WideNeon { lo: zero, hi: zero };
-
-        let mut w_regs_f = [zero; 4];
-        let mut w_regs_b = [zero; 4];
-        let mut t = 0;
-        while t < wf.len() {
-            for q in 0..4 {
-                let src = 4 * (base + t + q);
-                let fe0 = vld1q_u64(f.as_ptr().add(src).cast::<u64>());
-                let fo0 = vld1q_u64(f.as_ptr().add(src + 1).cast::<u64>());
-                let fe1 = vld1q_u64(f.as_ptr().add(src + 2).cast::<u64>());
-                let fo1 = vld1q_u64(f.as_ptr().add(src + 3).cast::<u64>());
-                let be0 = vld1q_u64(b.as_ptr().add(src).cast::<u64>());
-                let bo0 = vld1q_u64(b.as_ptr().add(src + 1).cast::<u64>());
-                let be1 = vld1q_u64(b.as_ptr().add(src + 2).cast::<u64>());
-                let bo1 = vld1q_u64(b.as_ptr().add(src + 3).cast::<u64>());
-
-                // First bind at r_a: v = even ^ r_a*(even^odd), two v per poly.
-                let pf = mul_const_vec2(ra_q, veorq_u64(fe0, fo0), veorq_u64(fe1, fo1));
-                let vf0 = veorq_u64(fe0, pf[0]);
-                let vf1 = veorq_u64(fe1, pf[1]);
-                let pb = mul_const_vec2(ra_q, veorq_u64(be0, bo0), veorq_u64(be1, bo1));
-                let vb0 = veorq_u64(be0, pb[0]);
-                let vb1 = veorq_u64(be1, pb[1]);
-
-                // Second bind at r_b, both polynomials in one paired multiply.
-                let pw = mul_const_vec2(rb_q, veorq_u64(vf0, vf1), veorq_u64(vb0, vb1));
-                let wq_f = veorq_u64(vf0, pw[0]);
-                let wq_b = veorq_u64(vb0, pw[1]);
-                vst1q_u64(wf.as_mut_ptr().add(t + q).cast::<u64>(), wq_f);
-                vst1q_u64(wb.as_mut_ptr().add(t + q).cast::<u64>(), wq_b);
-                w_regs_f[q] = wq_f;
-                w_regs_b[q] = wq_b;
-            }
-            // Direct message over pairs (w0,w1), (w2,w3); lookahead over the
-            // quad. Shared products accumulated once.
-            let s0f = veorq_u64(w_regs_f[0], w_regs_f[1]);
-            let s0b = veorq_u64(w_regs_b[0], w_regs_b[1]);
-            let s1f = veorq_u64(w_regs_f[2], w_regs_f[3]);
-            let s1b = veorq_u64(w_regs_b[2], w_regs_b[3]);
-            xor_wide(&mut a_u0a, mul_unreduced(w_regs_f[0], w_regs_b[0])); // = c0 + u0 term
-            xor_wide(&mut a_u0b, mul_unreduced(w_regs_f[2], w_regs_b[2]));
-            xor_wide(&mut a_u2a, mul_unreduced(s0f, s0b)); // = c2 + u2 term
-            xor_wide(&mut a_u2b, mul_unreduced(s1f, s1b));
-            // c1's cross term is recovered after reduction as
-            // w1f*w1b ^ c0 ^ c2: one product instead of the direct two.
-            xor_wide(&mut a_c1, mul_unreduced(w_regs_f[1], w_regs_b[1]));
-            // e = w0 + w2, o = w1 + w3, se = e + o
-            let e_f = veorq_u64(w_regs_f[0], w_regs_f[2]);
-            let o_f = veorq_u64(w_regs_f[1], w_regs_f[3]);
-            let e_b = veorq_u64(w_regs_b[0], w_regs_b[2]);
-            let o_b = veorq_u64(w_regs_b[1], w_regs_b[3]);
-            let se_f = veorq_u64(e_f, o_f);
-            let se_b = veorq_u64(e_b, o_b);
-            xor_wide(&mut a_c3, mul_unreduced(e_f, e_b));
-            // c4 uses the same Karatsuba identity with the odd aggregate as
-            // the complementary endpoint.
-            xor_wide(&mut a_c4, mul_unreduced(o_f, o_b));
-            xor_wide(&mut a_c5, mul_unreduced(se_f, se_b));
-            t += 4;
-        }
-        let red = |w: WideNeon| transmute::<uint64x2_t, F128>(reduce_wide(w));
-        let c0 = red(a_u0a);
-        let c2v = red(a_u2a);
-        let c1 = red(a_c1) + c0 + c2v;
-        let c3 = red(a_c3);
-        let c5 = red(a_c5);
-        let c4 = red(a_c4) + c3 + c5;
-        let u_0 = c0 + red(a_u0b);
-        let u_2 = c2v + red(a_u2b);
-        (u_0, u_2, [c0, c1, c2v, c3, c4, c5])
     }
 }

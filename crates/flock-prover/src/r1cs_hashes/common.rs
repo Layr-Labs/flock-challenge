@@ -224,13 +224,11 @@ pub(crate) fn drive_witness_packed_and_lincheck<S: Sync, F>(
 where
     F: Fn(&S, &mut [u64], &mut [u64], &mut [u64]) + Sync,
 {
-    drive_witness_packed_and_lincheck_impl::<false, false, S, F>(
+    drive_witness_packed_and_lincheck_impl::<false, S, F>(
         initial_states,
         padding,
         n_blocks_log,
         k_log,
-        1usize << k_log,
-        None,
         per_block,
     )
 }
@@ -245,79 +243,25 @@ pub(crate) fn drive_witness_packed_and_lincheck_full_write<S: Sync, F>(
     padding: &S,
     n_blocks_log: usize,
     k_log: usize,
-    useful_bits: usize,
     per_block: F,
 ) -> (Vec<F128>, Vec<F128>, Vec<F128>, Vec<u8>)
 where
     F: Fn(&S, &mut [u64], &mut [u64], &mut [u64]) + Sync,
 {
-    drive_witness_packed_and_lincheck_impl::<true, false, S, F>(
+    drive_witness_packed_and_lincheck_impl::<true, S, F>(
         initial_states,
         Some(padding),
         n_blocks_log,
         k_log,
-        useful_bits,
-        None,
         per_block,
     )
 }
 
-#[derive(Clone, Copy)]
-struct Rate2CodewordPtr(*mut F128);
-// SAFETY: the only use is the indexed group writer below. Each group owns
-// disjoint ranges in both replicas, and the parallel iterator joins before the
-// original mutable codeword borrow becomes usable again.
-unsafe impl Send for Rate2CodewordPtr {}
-unsafe impl Sync for Rate2CodewordPtr {}
-impl Rate2CodewordPtr {
-    /// Avoid closure field-capture turning this back into a bare non-Send ptr.
-    fn get(self) -> *mut F128 {
-        self.0
-    }
-}
-
-/// Full-write row-major witness driver that also emits the exact rate-1/2
-/// pre-NTT codeword `[z, z]`. Each worker copies its completed `z` group into
-/// the two disjoint replica ranges while that group is still cache-resident.
-///
-/// `codeword` must have exactly twice the packed-witness length. As with the
-/// scratch buffers allocated by the driver, its old contents may be stale:
-/// every element is overwritten before this function returns.
-pub(crate) fn drive_witness_packed_and_lincheck_full_write_with_rate2_codeword<S: Sync, F>(
-    initial_states: &[S],
-    padding: &S,
-    n_blocks_log: usize,
-    k_log: usize,
-    useful_bits: usize,
-    codeword: &mut [F128],
-    per_block: F,
-) -> (Vec<F128>, Vec<F128>, Vec<F128>, Vec<u8>)
-where
-    F: Fn(&S, &mut [u64], &mut [u64], &mut [u64]) + Sync,
-{
-    drive_witness_packed_and_lincheck_impl::<true, true, S, F>(
-        initial_states,
-        Some(padding),
-        n_blocks_log,
-        k_log,
-        useful_bits,
-        Some(codeword),
-        per_block,
-    )
-}
-
-fn drive_witness_packed_and_lincheck_impl<
-    const PER_BLOCK_FULLY_WRITES: bool,
-    const EMIT_RATE2_CODEWORD: bool,
-    S: Sync,
-    F,
->(
+fn drive_witness_packed_and_lincheck_impl<const PER_BLOCK_FULLY_WRITES: bool, S: Sync, F>(
     initial_states: &[S],
     padding: Option<&S>,
     n_blocks_log: usize,
     k_log: usize,
-    stripe_useful_bits: usize,
-    rate2_codeword: Option<&mut [F128]>,
     per_block: F,
 ) -> (Vec<F128>, Vec<F128>, Vec<F128>, Vec<u8>)
 where
@@ -330,7 +274,6 @@ where
     let u64_per_block = k / 64;
     let n_total = 1usize << n_blocks_log;
     let n_blocks = initial_states.len();
-    assert!(stripe_useful_bits <= k);
     assert!(
         n_blocks <= n_total,
         "{n_blocks} blocks > 2^{n_blocks_log} = {n_total} slots"
@@ -345,19 +288,6 @@ where
     );
 
     let total_f128 = n_total * f128_per_block;
-    assert_eq!(
-        rate2_codeword.is_some(),
-        EMIT_RATE2_CODEWORD,
-        "rate-1/2 codeword presence must match the driver specialization"
-    );
-    let rate2_codeword = rate2_codeword.map(|codeword| {
-        assert_eq!(
-            codeword.len(),
-            2 * total_f128,
-            "rate-1/2 codeword must contain exactly two packed-witness replicas"
-        );
-        Rate2CodewordPtr(codeword.as_mut_ptr())
-    });
     // z/a/b are allocated uninitialized. Ordinary OR-based builders zero each
     // 8-block group inside the parallel loop; full-write builders initialize
     // every word directly and skip that pass. `z_lincheck` comes from the
@@ -431,8 +361,7 @@ where
             let z_u64_all: &[u64] = unsafe {
                 std::slice::from_raw_parts(z_grp.as_ptr() as *const u64, z_grp.len() * 2)
             };
-            let useful_words = stripe_useful_bits.div_ceil(64);
-            for i in 0..useful_words {
+            for i in 0..u64_per_block {
                 let lanes: [u64; 8] = [
                     z_u64_all[0 * u64_per_block + i],
                     z_u64_all[u64_per_block + i],
@@ -444,32 +373,6 @@ where
                     z_u64_all[7 * u64_per_block + i],
                 ];
                 transpose_8_u64s_to_64_bytes(&lanes, &mut stripe[i * 64..i * 64 + 64]);
-            }
-            stripe[useful_words * 64..].fill(0);
-
-            if EMIT_RATE2_CODEWORD {
-                let codeword =
-                    rate2_codeword.expect("rate-1/2 driver specialization requires a codeword");
-                let elem_offset = g * z_grp.len();
-                // SAFETY: group `g` owns `z[elem_offset..elem_offset+len]`.
-                // The same group exclusively owns those offsets in each of the
-                // two codeword replicas. Groups are disjoint, cover all of z,
-                // and the parallel iterator joins before `codeword` is used
-                // again. Both source and destinations are in bounds and do not
-                // overlap.
-                unsafe {
-                    let dst = codeword.get();
-                    std::ptr::copy_nonoverlapping(
-                        z_grp.as_ptr(),
-                        dst.add(elem_offset),
-                        z_grp.len(),
-                    );
-                    std::ptr::copy_nonoverlapping(
-                        z_grp.as_ptr(),
-                        dst.add(total_f128 + elem_offset),
-                        z_grp.len(),
-                    );
-                }
             }
         });
 

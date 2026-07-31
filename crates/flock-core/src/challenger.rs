@@ -395,13 +395,8 @@ impl Challenger for FsChallenger {
         // Nonces per rayon task in the parallel search. Large enough to amortize
         // task dispatch and to let the BLAKE3 batch run many `hash_many` calls
         // per task, small enough to keep cancellation granular once an earlier
-        // task has found a match. 960 = 20 full 48-nonce batches, so a chunk
-        // has no ragged tail batch on the twelve-way kernel; the block math
-        // below uses `div_ceil`/saturating adds and requires no power of two.
-        // Chunk partition does not affect the emitted nonce: chunks are
-        // scanned/`find_first`ed in ascending order and each returns its
-        // smallest match, so the result stays the globally smallest.
-        const GRIND_CHUNK: u64 = 960;
+        // task has found a match.
+        const GRIND_CHUNK: u64 = 1 << 10;
         let nonce = if bits == 0 {
             0
         } else if (1u64 << bits.min(63)) < PARALLEL_GRIND_MIN_HASHES {
@@ -416,97 +411,38 @@ impl Challenger for FsChallenger {
                 start = start.saturating_add(GRIND_CHUNK);
             }
         } else {
-            // Two-pool block-parallel search. Blocks are scanned in order;
-            // within a block, the main Rayon workers AND the efficiency-core
-            // helper pool (when present) claim ascending chunks from one
-            // shared atomic counter — the same heterogeneous shape as
-            // `epool::run_hetero_chunks`, but with an early-exit bound so
-            // workers stop claiming chunks that can no longer contain the
-            // smallest match. The grind is pure batched BLAKE3 compute with
-            // no per-chunk tables or bandwidth pressure, i.e. the friendliest
-            // work in the prover for efficiency cores, and every ≥2^13-hash
-            // grind sits on the opening's critical path while the helper pool
-            // is otherwise parked.
-            //
-            // Determinism: the emitted nonce is re-derived after the join as
-            // the match in the lowest-indexed chunk that has one. The counter
-            // hands out indices in ascending order, a worker never abandons a
-            // chunk it has claimed, and a chunk below the final bound with a
-            // match would have lowered the bound below itself — contradiction.
-            // So every chunk below the winning one was fully scanned with no
-            // match, and the result is exactly the globally smallest nonce,
-            // byte-identical to the sequential search.
-            //
+            // Block-parallel search. Blocks are scanned in order and each task
+            // returns the smallest match within its chunk, so the result is
+            // deterministic (the globally smallest satisfying nonce).
             // Block ≈ 2× the expected attempts: large enough that the match
             // usually falls inside one block (so all threads do useful
             // pre-match work), small enough to avoid the 4× over-scan the old
             // `+2` block caused (which left ~¾ of threads doing cancelled work).
             use rayon::prelude::*;
-            use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-            const PENDING: u64 = u64::MAX;
-            const NO_MATCH: u64 = u64::MAX - 1;
             let block: u64 = 1 << (bits.min(24) + 1);
-            let n_chunks = usize::try_from(block.div_ceil(GRIND_CHUNK)).expect("chunk count");
+            let n_chunks = block.div_ceil(GRIND_CHUNK);
             let mut start: u64 = 0;
-            'blocks: loop {
-                let results: Vec<AtomicU64> =
-                    (0..n_chunks).map(|_| AtomicU64::new(PENDING)).collect();
-                let next = AtomicUsize::new(0);
-                // Lowest chunk index known to hold a match. Chunks at or past
-                // it cannot supply the answer; Relaxed is enough because the
-                // bound only prunes work — correctness comes from `results`
-                // plus the joins below.
-                let bound = AtomicUsize::new(n_chunks);
-                let worker = || {
-                    loop {
-                        let c = next.fetch_add(1, Ordering::Relaxed);
-                        if c >= n_chunks || c >= bound.load(Ordering::Relaxed) {
-                            break;
-                        }
-                        match pow_scan(
+            loop {
+                // `find_first` takes the earliest *chunk* that yields a match
+                // and cancels the rest; within a chunk `pow_scan` returns the
+                // smallest nonce. A later chunk cannot hold a smaller nonce, so
+                // this is exactly the globally smallest — identical to the
+                // sequential search, which is what keeps proofs deterministic.
+                let found = (0..n_chunks)
+                    .into_par_iter()
+                    .map(|c| {
+                        pow_scan(
                             &state_digest,
-                            start.saturating_add(c as u64 * GRIND_CHUNK),
+                            start.saturating_add(c * GRIND_CHUNK),
                             GRIND_CHUNK,
                             bits,
                             kind,
-                        ) {
-                            Some(n) => {
-                                results[c].store(n, Ordering::Release);
-                                bound.fetch_min(c, Ordering::Relaxed);
-                            }
-                            None => results[c].store(NO_MATCH, Ordering::Release),
-                        }
-                    }
-                };
-                let main_threads = rayon::current_num_threads();
-                let drain_main = || {
-                    (0..main_threads)
-                        .into_par_iter()
-                        .with_max_len(1)
-                        .for_each(|_| worker());
-                };
-                // Mirror the epool engagement floor: tiny blocks drain faster
-                // than the cross-pool kickoff amortizes.
-                const GRIND_EPOOL_MIN_CHUNKS: usize = 16;
-                match crate::epool::epool()
-                    .filter(|_| main_threads > 1 && n_chunks >= GRIND_EPOOL_MIN_CHUNKS)
-                {
-                    Some(ep) => std::thread::scope(|s| {
-                        // The scoped thread parks in `broadcast` while the
-                        // E-workers drain; the scope join bounds the tail wait
-                        // at one chunk on one efficiency core.
-                        s.spawn(|| ep.broadcast(|_| worker()));
-                        drain_main();
-                    }),
-                    None => drain_main(),
-                }
-                // Both pools joined (Release stores in `results` are
-                // synchronized by the joins). Take the lowest-chunk match.
-                for r in &results {
-                    match r.load(Ordering::Acquire) {
-                        PENDING | NO_MATCH => continue,
-                        n => break 'blocks n,
-                    }
+                        )
+                    })
+                    .find_first(|r| r.is_some())
+                    .flatten();
+                if let Some(n) = found {
+                    break n;
                 }
                 start = start.saturating_add(block);
             }
@@ -621,17 +557,11 @@ fn pow_has_leading_zero_bits(
 /// Nonces hashed per `hash_many` call in the BLAKE3 grind.
 ///
 /// Must clear the widest `simd_degree` (16, under AVX-512) so the batch fills
-/// the machine's vector. 48 = 4·12 = 3·16 is the smallest batch that is a
-/// multiple of BOTH the Apple AArch64 twelve-way kernel's group size and the
-/// AVX-512 simd_degree: at 32, every batch on the ranked path split into 24
-/// hashes through the twelve-way kernel plus 8 through the ~2.1×-slower
-/// upstream 4-lane tail (25% of all grind hashes on the slow path, a ~1.28×
-/// effective penalty measured by `grind_speed_probe`); at 48 every full batch
-/// runs entirely twelve-way. Buffers grow to 3 KiB of pre-images + 1.5 KiB
-/// of digests — still stack-resident. (The earlier 1/4/8/16/32/64 sweep on an
-/// M4 Max used a criterion harness whose noise floor exceeded the tail
-/// penalty; the kernel-level probe resolves it.)
-const BLAKE3_POW_BATCH: usize = 48;
+/// the machine's vector; 32 leaves headroom and keeps the buffers (2 KiB of
+/// pre-images + 1 KiB of digests) stack-resident. Swept 1/4/8/16/32/64 on an
+/// M4 Max: 1 is ~2.2× slower at 17 bits, everything from 4 up is within noise
+/// of each other.
+const BLAKE3_POW_BATCH: usize = 32;
 
 /// Smallest nonce in `start .. start + len` whose BLAKE3 PoW hash has `bits`
 /// leading zeros, or `None`.
@@ -707,33 +637,6 @@ mod tests {
     /// the tagging, absorption order and duplex structure are shared, and
     /// only the primitive differs.
     const KINDS: [HashKind; 2] = [HashKind::Sha256, HashKind::Blake3];
-
-    /// The two-pool early-exit grind must emit exactly the smallest
-    /// satisfying nonce — proof bytes depend on it. The oracle is the
-    /// library's own `pow_scan` over ascending blocks, which is the
-    /// sequential search's definition of "globally smallest". bits = 14
-    /// crosses both the parallel threshold (2^13 expected hashes) and, on
-    /// hosts with a helper pool, the grind's epool engagement floor, so this
-    /// exercises the heterogeneous claim/bound/re-derive path end to end.
-    #[test]
-    fn grind_two_pool_matches_sequential_scan_smallest() {
-        for kind in KINDS {
-            let mut ch = FsChallenger::with_hash(b"grind-2pool-test", kind);
-            ch.observe_label(b"flock-grind-2pool");
-            ch.observe_bytes(b"determinism probe");
-            let digest = ch.state_digest();
-            let bits = 14;
-            let nonce = ch.grind_pow(bits);
-            let mut block_start = 0u64;
-            let expect = loop {
-                if let Some(n) = pow_scan(&digest, block_start, 4096, bits, kind) {
-                    break n;
-                }
-                block_start += 4096;
-            };
-            assert_eq!(nonce, expect, "kind={kind:?}");
-        }
-    }
 
     /// Prover-side PoW grinding produces a nonce that the verifier-side
     /// `verify_pow` accepts at the same transcript position. State binding

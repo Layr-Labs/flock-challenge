@@ -144,23 +144,6 @@ fn cached_standard_twiddles(dim: usize, evals: &[Vec<F128>]) -> Option<Arc<[F128
     )
 }
 
-/// Cache the much smaller normalized evaluation triangles as well. Standard
-/// NTT objects are constructed repeatedly by the recursive PCS, and rebuilding
-/// these rows otherwise repeats field inversions and multiplications even when
-/// the large twiddle table is already resident from the untimed warm proof.
-/// Clone into the original nested-`Vec` representation so transform object
-/// layout and hot-loop dereferencing remain unchanged.
-fn cached_standard_evals(dim: usize) -> Vec<Vec<F128>> {
-    static TABLES: OnceLock<[OnceLock<Vec<Vec<F128>>>; 65]> = OnceLock::new();
-    let tables = TABLES.get_or_init(|| std::array::from_fn(|_| OnceLock::new()));
-    tables[dim]
-        .get_or_init(|| {
-            let basis: Vec<F128> = (0..dim).map(|i| F128::new(1u64 << i, 0)).collect();
-            generate_evals_from_subspace(&basis)
-        })
-        .clone()
-}
-
 /// Complete the last radix-8 group for the ranked Apple-silicon L0 commit.
 ///
 /// The generic 2 MiB cache split selects `n_top = 9` for the production shape
@@ -210,22 +193,6 @@ fn use_ranked_deep_pair_fusion(
         && n_top == 10
 }
 
-/// The standard dimension-20 basis has low-limb-only twiddles throughout the
-/// final two layers. This permits a two-PMULL product on AArch64 instead of the
-/// generic six-PMULL field multiply. Keep the dispatch tied to the exact
-/// ranked deep-transform geometry.
-#[inline]
-fn use_ranked_low_twiddle_final_pair(log_d: usize, num_ntts: usize, n_top: usize) -> bool {
-    cfg!(all(
-        target_os = "macos",
-        target_arch = "aarch64",
-        target_feature = "aes"
-    )) && log_d == 20
-        && num_ntts == 64
-        && n_top == 10
-        && std::env::var_os("FLOCK_NO_NTT_LOW_TWIDDLE_FINAL").is_none()
-}
-
 /// The zero-root radix-8 kernel is currently scored only for the ranked L0
 /// transform. Keep recursive and diagnostic commits on their prior kernel so
 /// this candidate has one production scope and one transfer story.
@@ -238,27 +205,6 @@ fn use_ranked_zero_root_fusion(
 ) -> bool {
     use_ranked_deep_pair_fusion(log_d, num_ntts, start_layer, n_top)
 }
-
-/// The three ranked radix-8 passes share fixed one-MiB row tiles with the
-/// efficiency-core pool. Layer 1 has only two outer blocks, but flattening
-/// `(block, row-tile)` still exposes the same 1024 claims as layers 4 and 7.
-/// It overlaps the concurrently-running round-1 AB precompute on the main
-/// Rayon pool; the separate helper pool is otherwise idle until these queues
-/// finish and the deep-transform leaf receivers start.
-#[inline]
-fn is_ranked_top_hetero_fused3_pass(
-    log_d: usize,
-    num_ntts: usize,
-    start_layer: usize,
-    n_top: usize,
-    layer: usize,
-) -> bool {
-    use_ranked_deep_pair_fusion(log_d, num_ntts, start_layer, n_top) && matches!(layer, 1 | 4 | 7)
-}
-
-const INTERLEAVED_PHASE_ALL: u8 = 0;
-const INTERLEAVED_PHASE_TOP_ONLY: u8 = 1;
-const INTERLEAVED_PHASE_DEEP_ONLY: u8 = 2;
 
 /// Additive NTT over F_{2^128} with the standard polynomial-basis subspace.
 ///
@@ -288,7 +234,8 @@ impl AdditiveNttF128 {
     /// (the low 64 bits of F_{2^128} hold these basis vectors).
     pub fn standard(dim: usize) -> Self {
         assert!(dim <= 64, "standard NTT requires dim ≤ 64");
-        let evals = cached_standard_evals(dim);
+        let basis: Vec<F128> = (0..dim).map(|i| F128::new(1u64 << i, 0)).collect();
+        let evals = generate_evals_from_subspace(&basis);
         let precomputed_twiddles = cached_standard_twiddles(dim, &evals);
         Self {
             evals,
@@ -412,10 +359,7 @@ impl AdditiveNttF128 {
             all(target_arch = "x86_64", target_feature = "pclmulqdq"),
         ))]
         {
-            self.forward_transform_interleaved_parallel_from_layer_and_then::<
-                INTERLEAVED_PHASE_ALL,
-                _,
-            >(
+            self.forward_transform_interleaved_parallel_from_layer_and_then(
                 data,
                 num_ntts,
                 start_layer,
@@ -430,73 +374,6 @@ impl AdditiveNttF128 {
             self.forward_transform_interleaved_scalar_from_layer(data, num_ntts, start_layer);
             finish_chunk(0, data);
         }
-    }
-
-    /// Apply only the ranked L0 transform's three top radix-8 passes. The PCS
-    /// leaf pipeline uses this split entry point before occupying the E-core
-    /// pool with blocking leaf receivers, leaving that pool available to all
-    /// three heterogeneous top-pass queues.
-    #[inline]
-    pub(crate) fn forward_transform_interleaved_ranked_top_from_layer(
-        &self,
-        data: &mut [F128],
-        num_ntts: usize,
-        start_layer: usize,
-    ) {
-        let log_d = log2_pow2(data.len() / num_ntts);
-        assert!(use_ranked_deep_pair_fusion(
-            log_d,
-            num_ntts,
-            start_layer,
-            10
-        ));
-        #[cfg(any(
-            all(target_arch = "aarch64", target_feature = "aes"),
-            all(target_arch = "x86_64", target_feature = "pclmulqdq"),
-        ))]
-        self.forward_transform_interleaved_parallel_from_layer_and_then::<
-            INTERLEAVED_PHASE_TOP_ONLY,
-            _,
-        >(data, num_ntts, start_layer, &|_, _| {});
-        #[cfg(not(any(
-            all(target_arch = "aarch64", target_feature = "aes"),
-            all(target_arch = "x86_64", target_feature = "pclmulqdq"),
-        )))]
-        unreachable!("ranked top split requires a hardware NTT target");
-    }
-
-    /// Finish the ranked L0 transform's five cache-local deep pairs and invoke
-    /// `finish_chunk` exactly as the unsplit transform does.
-    #[inline]
-    pub(crate) fn forward_transform_interleaved_ranked_deep_and_then<F>(
-        &self,
-        data: &mut [F128],
-        num_ntts: usize,
-        start_layer: usize,
-        finish_chunk: F,
-    ) where
-        F: Fn(usize, &[F128]) + Sync + Send,
-    {
-        let log_d = log2_pow2(data.len() / num_ntts);
-        assert!(use_ranked_deep_pair_fusion(
-            log_d,
-            num_ntts,
-            start_layer,
-            10
-        ));
-        #[cfg(any(
-            all(target_arch = "aarch64", target_feature = "aes"),
-            all(target_arch = "x86_64", target_feature = "pclmulqdq"),
-        ))]
-        self.forward_transform_interleaved_parallel_from_layer_and_then::<
-            INTERLEAVED_PHASE_DEEP_ONLY,
-            _,
-        >(data, num_ntts, start_layer, &finish_chunk);
-        #[cfg(not(any(
-            all(target_arch = "aarch64", target_feature = "aes"),
-            all(target_arch = "x86_64", target_feature = "pclmulqdq"),
-        )))]
-        unreachable!("ranked deep split requires a hardware NTT target");
     }
 
     /// Scalar reference for the interleaved forward NTT.
@@ -567,10 +444,7 @@ impl AdditiveNttF128 {
         num_ntts: usize,
         start_layer: usize,
     ) {
-        self.forward_transform_interleaved_parallel_from_layer_and_then::<
-            INTERLEAVED_PHASE_ALL,
-            _,
-        >(
+        self.forward_transform_interleaved_parallel_from_layer_and_then(
             data,
             num_ntts,
             start_layer,
@@ -582,7 +456,7 @@ impl AdditiveNttF128 {
         all(target_arch = "aarch64", target_feature = "aes"),
         all(target_arch = "x86_64", target_feature = "pclmulqdq"),
     ))]
-    fn forward_transform_interleaved_parallel_from_layer_and_then<const PHASE: u8, F>(
+    fn forward_transform_interleaved_parallel_from_layer_and_then<F>(
         &self,
         data: &mut [F128],
         num_ntts: usize,
@@ -591,7 +465,7 @@ impl AdditiveNttF128 {
     ) where
         F: Fn(usize, &[F128]) + Sync + Send,
     {
-        debug_assert!(PHASE <= INTERLEAVED_PHASE_DEEP_ONLY);
+        use rayon::prelude::*;
         let n_total = data.len();
         let log_d = log2_pow2(n_total / num_ntts);
 
@@ -630,21 +504,8 @@ impl AdditiveNttF128 {
         };
         let n_top = fusion_aware_interleaved_n_top(log_d, num_ntts, start_layer, n_top);
         if n_top == 0 || log_d < 8 {
-            debug_assert_eq!(PHASE, INTERLEAVED_PHASE_ALL);
             self.forward_transform_interleaved_scalar_from_layer(data, num_ntts, start_layer);
             finish_chunk(0, data);
-            return;
-        }
-
-        if PHASE == INTERLEAVED_PHASE_DEEP_ONLY {
-            self.forward_transform_interleaved_deep_from_layer_and_then(
-                data,
-                num_ntts,
-                start_layer,
-                n_top,
-                log_d,
-                finish_chunk,
-            );
             return;
         }
 
@@ -687,7 +548,7 @@ impl AdditiveNttF128 {
                 // Fuse three layers (layer..layer+3): one read+write per block
                 // instead of three. Each block contributes an 8-point butterfly.
                 let eighth = block_size >> 3;
-                let block_twiddles = |block: usize| {
+                for block in 0..num_blocks {
                     let mut tw = [F128 { lo: 0, hi: 0 }; 7];
                     tw[0] = self.twiddle(layer, block);
                     for s in 0..2 {
@@ -696,40 +557,21 @@ impl AdditiveNttF128 {
                     for s in 0..4 {
                         tw[3 + s] = self.twiddle(layer + 2, 4 * block + s);
                     }
-                    tw
-                };
-                if zero_root_fused3 && std::env::var_os("FLOCK_NTT_BLOCK_REGIONS").is_none() {
-                    let twiddles: Vec<[F128; 7]> = (0..num_blocks).map(block_twiddles).collect();
-                    if is_ranked_top_hetero_fused3_pass(log_d, num_ntts, start_layer, n_top, layer)
-                        && std::env::var_os("FLOCK_NO_NTT_TOP_EPOOL").is_none()
-                    {
-                        butterfly_interleaved_fused_3layer_all_blocks_hetero(
-                            data, &twiddles, eighth, num_ntts,
+                    let start = block * block_bytes;
+                    if block == 0 && zero_root_fused3 {
+                        butterfly_interleaved_fused_3layer_par_rows::<true>(
+                            &mut data[start..start + block_bytes],
+                            &tw,
+                            eighth,
+                            num_ntts,
                         );
                     } else {
-                        butterfly_interleaved_fused_3layer_all_blocks_par_rows(
-                            data, &twiddles, eighth, num_ntts,
+                        butterfly_interleaved_fused_3layer_par_rows::<false>(
+                            &mut data[start..start + block_bytes],
+                            &tw,
+                            eighth,
+                            num_ntts,
                         );
-                    }
-                } else {
-                    for block in 0..num_blocks {
-                        let tw = block_twiddles(block);
-                        let start = block * block_bytes;
-                        if block == 0 && zero_root_fused3 {
-                            butterfly_interleaved_fused_3layer_par_rows::<true>(
-                                &mut data[start..start + block_bytes],
-                                &tw,
-                                eighth,
-                                num_ntts,
-                            );
-                        } else {
-                            butterfly_interleaved_fused_3layer_par_rows::<false>(
-                                &mut data[start..start + block_bytes],
-                                &tw,
-                                eighth,
-                                num_ntts,
-                            );
-                        }
                     }
                 }
                 layer += 3;
@@ -791,33 +633,6 @@ impl AdditiveNttF128 {
                 layer += 1;
             }
         }
-        if PHASE == INTERLEAVED_PHASE_TOP_ONLY {
-            return;
-        }
-
-        self.forward_transform_interleaved_deep_from_layer_and_then(
-            data,
-            num_ntts,
-            start_layer,
-            n_top,
-            log_d,
-            finish_chunk,
-        );
-    }
-
-    #[inline(always)]
-    fn forward_transform_interleaved_deep_from_layer_and_then<F>(
-        &self,
-        data: &mut [F128],
-        num_ntts: usize,
-        start_layer: usize,
-        n_top: usize,
-        log_d: usize,
-        finish_chunk: &F,
-    ) where
-        F: Fn(usize, &[F128]) + Sync + Send,
-    {
-        use rayon::prelude::*;
 
         // Ranked L0: layers 10..20 form five exact pairs. Fuse each pair inside
         // the existing outer chunk job so every row is loaded/stored once per
@@ -895,8 +710,6 @@ impl AdditiveNttF128 {
         debug_assert_eq!(data.len(), (1usize << log_d) * num_ntts);
         let sub_size_positions = 1usize << (log_d - n_top);
         let sub_elems = sub_size_positions * num_ntts;
-        let low_twiddle_final_pair =
-            use_ranked_low_twiddle_final_pair(log_d, num_ntts, n_top);
 
         data.par_chunks_mut(sub_elems)
             .enumerate()
@@ -915,28 +728,14 @@ impl AdditiveNttF128 {
                         let t_inner_a = self.twiddle(layer + 1, 2 * global_block);
                         let t_inner_b = self.twiddle(layer + 1, 2 * global_block + 1);
                         let block_start = block_in_sub * block_elems;
-                        if low_twiddle_final_pair && layer + 2 == log_d {
-                            debug_assert_eq!(t_outer.hi, 0);
-                            debug_assert_eq!(t_inner_a.hi, 0);
-                            debug_assert_eq!(t_inner_b.hi, 0);
-                            butterfly_interleaved_fused_2layer_low_twiddles_rows_seq(
-                                &mut sub_data[block_start..block_start + block_elems],
-                                t_outer,
-                                t_inner_a,
-                                t_inner_b,
-                                quarter,
-                                num_ntts,
-                            );
-                        } else {
-                            butterfly_interleaved_fused_2layer_rows_seq(
-                                &mut sub_data[block_start..block_start + block_elems],
-                                t_outer,
-                                t_inner_a,
-                                t_inner_b,
-                                quarter,
-                                num_ntts,
-                            );
-                        }
+                        butterfly_interleaved_fused_2layer_rows_seq(
+                            &mut sub_data[block_start..block_start + block_elems],
+                            t_outer,
+                            t_inner_a,
+                            t_inner_b,
+                            quarter,
+                            num_ntts,
+                        );
                     }
                     layer += 2;
                 }
@@ -1347,38 +1146,6 @@ fn butterfly_interleaved_fused_2layer_rows_seq(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-#[inline]
-fn butterfly_interleaved_fused_2layer_low_twiddles_rows_seq(
-    block: &mut [F128],
-    t_outer: F128,
-    t_inner_a: F128,
-    t_inner_b: F128,
-    quarter: usize,
-    num_ntts: usize,
-) {
-    let stride = quarter * num_ntts;
-    debug_assert!(num_ntts > 0);
-    debug_assert_eq!(block.len(), 4 * stride);
-    debug_assert_eq!(t_outer.hi, 0);
-    debug_assert_eq!(t_inner_a.hi, 0);
-    debug_assert_eq!(t_inner_b.hi, 0);
-
-    let (top_half, bot_half) = block.split_at_mut(2 * stride);
-    let (q1, q2) = top_half.split_at_mut(stride);
-    let (q3, q4) = bot_half.split_at_mut(stride);
-    for (((row_a, row_b), row_c), row_d) in q1
-        .chunks_exact_mut(num_ntts)
-        .zip(q2.chunks_exact_mut(num_ntts))
-        .zip(q3.chunks_exact_mut(num_ntts))
-        .zip(q4.chunks_exact_mut(num_ntts))
-    {
-        kernels::butterfly_fused_2layer_low_twiddles(
-            row_a, row_b, row_c, row_d, t_outer, t_inner_a, t_inner_b,
-        );
-    }
-}
-
 /// Butterfly one block of an interleaved (SoA) buffer with shared twiddle.
 ///
 /// `block` has length `(2 * block_size_half) * num_ntts` and is laid out as
@@ -1473,126 +1240,6 @@ fn butterfly_interleaved_fused_3layer_par_rows<const ZERO_ROOT: bool>(
             };
         });
     }
-}
-
-/// Ranked sibling of [`butterfly_interleaved_fused_3layer_par_rows`] that
-/// flattens every block and row group in one indexed Rayon region.
-///
-/// The ranked top groups contain 2, 16, then 128 blocks. Opening a blocking
-/// region per block creates 146 sequential fork/join barriers even though all
-/// `(block, row)` jobs are disjoint. Flattening retains the exact radix-8
-/// kernels and work order within each row while using one barrier per group.
-#[inline]
-fn butterfly_interleaved_fused_3layer_all_blocks_par_rows(
-    data: &mut [F128],
-    twiddles: &[[F128; 7]],
-    eighth: usize,
-    num_ntts: usize,
-) {
-    use rayon::prelude::*;
-
-    let num_blocks = twiddles.len();
-    let block_elems = 8 * eighth * num_ntts;
-    debug_assert_eq!(data.len(), num_blocks * block_elems);
-    debug_assert!(eighth.is_power_of_two());
-    debug_assert_eq!(twiddles[0][0], F128::ZERO);
-    debug_assert_eq!(twiddles[0][1], F128::ZERO);
-    debug_assert_eq!(twiddles[0][3], F128::ZERO);
-
-    let base = data.as_mut_ptr() as usize;
-    let eighth_log = eighth.trailing_zeros() as usize;
-    let eighth_mask = eighth - 1;
-    (0..num_blocks * eighth).into_par_iter().for_each(|job| {
-        let block = job >> eighth_log;
-        let row = job & eighth_mask;
-        let block_base = unsafe { (base as *mut F128).add(block * block_elems) };
-        // SAFETY: each job maps to one disjoint eight-row group within one
-        // block. Block zero has the three zero roots required by the ranked
-        // specialization; every other block uses the generic radix-8 kernel.
-        unsafe {
-            if block == 0 {
-                kernels::butterfly_fused_3layer_zero_root_row(
-                    block_base,
-                    eighth,
-                    num_ntts,
-                    row,
-                    &twiddles[block],
-                )
-            } else {
-                kernels::butterfly_fused_3layer_row(
-                    block_base,
-                    eighth,
-                    num_ntts,
-                    row,
-                    &twiddles[block],
-                )
-            }
-        }
-    });
-}
-
-/// Ranked block/tile-queue sibling of
-/// [`butterfly_interleaved_fused_3layer_all_blocks_par_rows`]. Each queue
-/// claim owns a fixed row tile within one block and processes those rows
-/// serially, avoiding a nested Rayon region when the claim is executed on an
-/// efficiency core.
-///
-/// At the exact 1 GiB ranked codeword, layers 1, 4, and 7 expose respectively
-/// 2 × 512 MiB, 16 × 64 MiB, and 128 × 8 MiB blocks. A 128-row tile touches
-/// 1 MiB of input in every pass, producing 1024 uniform claims per pass. Every
-/// pass still reads and writes the codeword exactly once; the queue only lets
-/// otherwise-idle E cores claim some of that fixed traffic and arithmetic.
-/// The shared atomic queue bounds the heterogeneous tail to one 1 MiB tile per
-/// worker rather than one potentially-slow outer block.
-#[inline]
-fn butterfly_interleaved_fused_3layer_all_blocks_hetero(
-    data: &mut [F128],
-    twiddles: &[[F128; 7]],
-    eighth: usize,
-    num_ntts: usize,
-) {
-    let num_blocks = twiddles.len();
-    let block_elems = 8 * eighth * num_ntts;
-    debug_assert_eq!(data.len(), num_blocks * block_elems);
-    debug_assert!(eighth.is_power_of_two());
-    debug_assert_eq!(twiddles[0][0], F128::ZERO);
-    debug_assert_eq!(twiddles[0][1], F128::ZERO);
-    debug_assert_eq!(twiddles[0][3], F128::ZERO);
-
-    const ROWS_PER_TILE: usize = 128;
-    let tiles_per_block = eighth.div_ceil(ROWS_PER_TILE);
-    let base = crate::epool::SyncPtr(data.as_mut_ptr());
-    crate::epool::run_hetero_chunks(num_blocks * tiles_per_block, |job| {
-        let block = job / tiles_per_block;
-        let tile = job % tiles_per_block;
-        let row_start = tile * ROWS_PER_TILE;
-        let row_end = (row_start + ROWS_PER_TILE).min(eighth);
-        let block_base = unsafe { base.ptr().add(block * block_elems) };
-        for row in row_start..row_end {
-            // SAFETY: each queue index maps to one disjoint `(block, row)`
-            // tile. Rows within a tile are serial and all derived addresses
-            // are in the validated block range.
-            unsafe {
-                if block == 0 {
-                    kernels::butterfly_fused_3layer_zero_root_row(
-                        block_base,
-                        eighth,
-                        num_ntts,
-                        row,
-                        &twiddles[block],
-                    )
-                } else {
-                    kernels::butterfly_fused_3layer_row(
-                        block_base,
-                        eighth,
-                        num_ntts,
-                        row,
-                        &twiddles[block],
-                    )
-                }
-            }
-        }
-    });
 }
 
 /// Butterfly one top-layer block, fusing four layers `(L..L+4)`. `block` holds
@@ -1729,56 +1376,6 @@ mod tests {
         }
     }
 
-    /// The low-twiddle AArch64 kernel is algebraically identical to the
-    /// generic fused pair for every lane geometry used by the ranked final
-    /// pair.
-    #[test]
-    fn fused2_low_twiddles_match_generic() {
-        let mut rng = Rng::new(0x10F1_7A11_20A5_0001);
-        for (quarter, num_ntts) in [(1usize, 64usize), (4, 8), (64, 2)] {
-            for iteration in 0..4 {
-                let t_outer = F128::new(rng.next_u64(), 0);
-                let t_inner_a = F128::new(rng.next_u64(), 0);
-                let t_inner_b = F128::new(rng.next_u64(), 0);
-                let source = rand_vec(&mut rng, 4 * quarter * num_ntts);
-
-                let mut want = source.clone();
-                butterfly_interleaved_fused_2layer_rows_seq(
-                    &mut want, t_outer, t_inner_a, t_inner_b, quarter, num_ntts,
-                );
-                let mut got = source;
-                butterfly_interleaved_fused_2layer_low_twiddles_rows_seq(
-                    &mut got, t_outer, t_inner_a, t_inner_b, quarter, num_ntts,
-                );
-                assert_eq!(
-                    got, want,
-                    "low-twiddle fused-2 mismatch at quarter={quarter} \
-                     num_ntts={num_ntts} iteration={iteration}"
-                );
-            }
-        }
-    }
-
-    /// Exhaust the exact production tables used by layers 18 and 19. This is
-    /// the invariant that makes the ranked narrow dispatch sound.
-    #[test]
-    fn standard_dim20_final_pair_twiddles_have_zero_high_limbs() {
-        let ntt = AdditiveNttF128::standard(20);
-        for layer in 18..20 {
-            for block in 0..(1usize << layer) {
-                assert_eq!(
-                    ntt.twiddle(layer, block).hi,
-                    0,
-                    "nonzero high limb at layer={layer} block={block}"
-                );
-            }
-        }
-        assert!(use_ranked_low_twiddle_final_pair(20, 64, 10));
-        assert!(!use_ranked_low_twiddle_final_pair(19, 64, 10));
-        assert!(!use_ranked_low_twiddle_final_pair(20, 32, 10));
-        assert!(!use_ranked_low_twiddle_final_pair(20, 64, 9));
-    }
-
     /// Exercise five fused deep pairs with the ranked 1024-position subtree
     /// geometry, but only two interleaved lanes so the fixture stays small.
     /// The scalar oracle applies the same ten layers as separate sweeps and
@@ -1838,54 +1435,6 @@ mod tests {
         assert!(observed.1.iter().all(|&count| count == 1));
     }
 
-    /// Splitting at the existing top/deep boundary must be byte-identical to
-    /// the ordinary one-call transform, and callbacks must remain exclusively
-    /// attached to finalized deep chunks.
-    #[cfg(any(
-        all(target_arch = "aarch64", target_feature = "aes"),
-        all(target_arch = "x86_64", target_feature = "pclmulqdq"),
-    ))]
-    #[test]
-    fn interleaved_top_deep_phase_split_matches_full_transform() {
-        use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
-
-        const LOG_D: usize = 16;
-        const NUM_NTTS: usize = 8;
-        const START_LAYER: usize = 1;
-
-        let mut rng = Rng::new(0x5F11_7B0A_DA7A);
-        let ntt = AdditiveNttF128::standard(LOG_D);
-        let source = rand_vec(&mut rng, (1usize << LOG_D) * NUM_NTTS);
-        let mut expected = source.clone();
-        ntt.forward_transform_interleaved_from_layer(&mut expected, NUM_NTTS, START_LAYER);
-
-        let top_callbacks = AtomicUsize::new(0);
-        let mut got = source;
-        ntt.forward_transform_interleaved_parallel_from_layer_and_then::<
-            INTERLEAVED_PHASE_TOP_ONLY,
-            _,
-        >(&mut got, NUM_NTTS, START_LAYER, &|_, _| {
-            top_callbacks.fetch_add(1, Relaxed);
-        });
-        assert_eq!(top_callbacks.load(Relaxed), 0);
-
-        let observed = std::sync::Mutex::new((vec![F128::ZERO; got.len()], vec![0u8; got.len()]));
-        ntt.forward_transform_interleaved_parallel_from_layer_and_then::<
-            INTERLEAVED_PHASE_DEEP_ONLY,
-            _,
-        >(&mut got, NUM_NTTS, START_LAYER, &|offset, chunk| {
-            let mut observed = observed.lock().unwrap();
-            observed.0[offset..offset + chunk.len()].copy_from_slice(chunk);
-            for count in &mut observed.1[offset..offset + chunk.len()] {
-                *count += 1;
-            }
-        });
-        assert_eq!(got, expected);
-        let observed = observed.into_inner().unwrap();
-        assert_eq!(observed.0, expected);
-        assert!(observed.1.iter().all(|&count| count == 1));
-    }
-
     /// Only the ranked macOS/AArch64 L0 transform may use the new tail
     /// schedule; all recursive, diagnostic, and cross-platform shapes retain
     /// the existing single-layer deep loop.
@@ -1906,18 +1455,6 @@ mod tests {
         assert!(!use_ranked_zero_root_fusion(20, 8, 1, 10));
         assert!(!use_ranked_zero_root_fusion(20, 64, 0, 10));
         assert!(!use_ranked_zero_root_fusion(20, 64, 1, 9));
-
-        for layer in [1, 4, 7] {
-            assert_eq!(
-                is_ranked_top_hetero_fused3_pass(20, 64, 1, 10, layer),
-                enabled_here
-            );
-        }
-        assert!(!is_ranked_top_hetero_fused3_pass(20, 64, 1, 10, 2));
-        assert!(!is_ranked_top_hetero_fused3_pass(19, 64, 1, 10, 4));
-        assert!(!is_ranked_top_hetero_fused3_pass(20, 8, 1, 10, 4));
-        assert!(!is_ranked_top_hetero_fused3_pass(20, 64, 0, 10, 4));
-        assert!(!is_ranked_top_hetero_fused3_pass(20, 64, 1, 9, 4));
     }
 
     /// Exercise the block-zero specialization and the ordinary nonzero-block
@@ -1971,108 +1508,6 @@ mod tests {
                     );
                 }
             }
-        }
-    }
-
-    #[test]
-    fn fused3_flattened_blocks_match_per_block_regions() {
-        const LOG_D: usize = 10;
-        const LAYER: usize = 2;
-        const NUM_NTTS: usize = 8;
-
-        let ntt = AdditiveNttF128::standard(LOG_D);
-        let num_blocks = 1usize << LAYER;
-        let block_size = 1usize << (LOG_D - LAYER);
-        let eighth = block_size >> 3;
-        let block_elems = block_size * NUM_NTTS;
-        let mut twiddles = Vec::with_capacity(num_blocks);
-        for block in 0..num_blocks {
-            let mut tw = [F128::ZERO; 7];
-            tw[0] = ntt.twiddle(LAYER, block);
-            for s in 0..2 {
-                tw[1 + s] = ntt.twiddle(LAYER + 1, 2 * block + s);
-            }
-            for s in 0..4 {
-                tw[3 + s] = ntt.twiddle(LAYER + 2, 4 * block + s);
-            }
-            twiddles.push(tw);
-        }
-
-        let mut rng = Rng::new(0xF1A7_7EED_20E2_0001);
-        for iteration in 0..3 {
-            let source = rand_vec(&mut rng, (1usize << LOG_D) * NUM_NTTS);
-            let mut expected = source.clone();
-            for (block, tw) in twiddles.iter().enumerate() {
-                let block_data = &mut expected[block * block_elems..(block + 1) * block_elems];
-                if block == 0 {
-                    butterfly_interleaved_fused_3layer_par_rows::<true>(
-                        block_data, tw, eighth, NUM_NTTS,
-                    );
-                } else {
-                    butterfly_interleaved_fused_3layer_par_rows::<false>(
-                        block_data, tw, eighth, NUM_NTTS,
-                    );
-                }
-            }
-
-            let mut got = source;
-            butterfly_interleaved_fused_3layer_all_blocks_par_rows(
-                &mut got, &twiddles, eighth, NUM_NTTS,
-            );
-            assert_eq!(got, expected, "iteration={iteration}");
-        }
-    }
-
-    /// The ranked heterogeneous dispatcher flattens `(block, row-tile)` queue
-    /// claims rather than individual `(block, row)` Rayon jobs. Exercise the
-    /// exact 2-, 16-, and 128-block pass shapes (including multiple tiles per
-    /// block) at a reduced domain size and compare against the independent
-    /// layer-by-layer scalar butterfly oracle.
-    #[test]
-    fn ranked_top_hetero_blocks_match_scalar_oracle() {
-        const LOG_D: usize = 15;
-        const NUM_NTTS: usize = 2;
-
-        let ntt = AdditiveNttF128::standard(LOG_D);
-        let mut rng = Rng::new(0xEC0E_70B0_10C5);
-        for layer in [1usize, 4, 7] {
-            let num_blocks = 1usize << layer;
-            let block_size = 1usize << (LOG_D - layer);
-            let eighth = block_size >> 3;
-            let block_elems = block_size * NUM_NTTS;
-            let twiddles: Vec<[F128; 7]> = (0..num_blocks)
-                .map(|block| {
-                    let mut tw = [F128::ZERO; 7];
-                    tw[0] = ntt.twiddle(layer, block);
-                    for s in 0..2 {
-                        tw[1 + s] = ntt.twiddle(layer + 1, 2 * block + s);
-                    }
-                    for s in 0..4 {
-                        tw[3 + s] = ntt.twiddle(layer + 2, 4 * block + s);
-                    }
-                    tw
-                })
-                .collect();
-
-            let source = rand_vec(&mut rng, (1usize << LOG_D) * NUM_NTTS);
-            let mut expected = source.clone();
-            for (block, tw) in twiddles.iter().enumerate() {
-                scalar_fused_3layer_block(
-                    &mut expected[block * block_elems..(block + 1) * block_elems],
-                    tw,
-                    eighth,
-                    NUM_NTTS,
-                );
-            }
-
-            let mut got = source;
-            butterfly_interleaved_fused_3layer_all_blocks_hetero(
-                &mut got, &twiddles, eighth, NUM_NTTS,
-            );
-            assert_eq!(
-                got, expected,
-                "heterogeneous pass mismatch at layer={layer}"
-            );
         }
     }
 

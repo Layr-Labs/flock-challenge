@@ -1,27 +1,5 @@
 use super::super::{F128, NEON_TILE_T, build_sum_table};
 
-// The SHA3 extension includes EOR3; retain the two-EOR form for generic
-// AArch64 builds that do not enable it.
-#[cfg(target_feature = "sha3")]
-#[inline(always)]
-unsafe fn xor3_u8(
-    a: core::arch::aarch64::uint8x16_t,
-    b: core::arch::aarch64::uint8x16_t,
-    c: core::arch::aarch64::uint8x16_t,
-) -> core::arch::aarch64::uint8x16_t {
-    unsafe { core::arch::aarch64::veor3q_u8(a, b, c) }
-}
-
-#[cfg(not(target_feature = "sha3"))]
-#[inline(always)]
-unsafe fn xor3_u8(
-    a: core::arch::aarch64::uint8x16_t,
-    b: core::arch::aarch64::uint8x16_t,
-    c: core::arch::aarch64::uint8x16_t,
-) -> core::arch::aarch64::uint8x16_t {
-    unsafe { core::arch::aarch64::veorq_u8(a, core::arch::aarch64::veorq_u8(b, c)) }
-}
-
 /// Single-matrix partial fold with **tiled + NEON-register accumulators**.
 /// Keeps `BLOCK_K = 8` accumulators in NEON registers across a `NEON_TILE_T`
 /// stripe sweep — no per-byte accumulator LD/ST. Hand-rolled aarch64
@@ -181,71 +159,30 @@ unsafe fn process_block_neon_single<const TILE_T: usize>(
     let mut a6 = vld1q_u8(o.add(96));
     let mut a7 = vld1q_u8(o.add(112));
 
-    let mut t = 0;
-    while t + 1 < TILE_T {
-        let stripe0 = row_ptr.add(t * row_stride + bs);
-        let stripe1 = row_ptr.add((t + 1) * row_stride + bs);
-        let table0 = tables_ptr.add(t * 256 * 16);
-        let table1 = tables_ptr.add((t + 1) * 256 * 16);
+    for t in 0..TILE_T {
+        let stripe_ptr = row_ptr.add(t * row_stride + bs);
+        let ta = tables_ptr.add(t * 256 * 16);
 
-        // One unaligned 8-byte load per stripe replaces eight LDRBs.
-        let w0 = (stripe0 as *const u64).read_unaligned();
-        let w1 = (stripe1 as *const u64).read_unaligned();
+        // One unaligned 8-byte load replaces eight LDRBs.
+        let w = (stripe_ptr as *const u64).read_unaligned();
 
-        a0 = xor3_u8(
-            a0,
-            vld1q_u8(table0.add((w0 & 0xff) as usize * 16)),
-            vld1q_u8(table1.add((w1 & 0xff) as usize * 16)),
-        );
-        a1 = xor3_u8(
-            a1,
-            vld1q_u8(table0.add(((w0 >> 8) & 0xff) as usize * 16)),
-            vld1q_u8(table1.add(((w1 >> 8) & 0xff) as usize * 16)),
-        );
-        a2 = xor3_u8(
-            a2,
-            vld1q_u8(table0.add(((w0 >> 16) & 0xff) as usize * 16)),
-            vld1q_u8(table1.add(((w1 >> 16) & 0xff) as usize * 16)),
-        );
-        a3 = xor3_u8(
-            a3,
-            vld1q_u8(table0.add(((w0 >> 24) & 0xff) as usize * 16)),
-            vld1q_u8(table1.add(((w1 >> 24) & 0xff) as usize * 16)),
-        );
-        a4 = xor3_u8(
-            a4,
-            vld1q_u8(table0.add(((w0 >> 32) & 0xff) as usize * 16)),
-            vld1q_u8(table1.add(((w1 >> 32) & 0xff) as usize * 16)),
-        );
-        a5 = xor3_u8(
-            a5,
-            vld1q_u8(table0.add(((w0 >> 40) & 0xff) as usize * 16)),
-            vld1q_u8(table1.add(((w1 >> 40) & 0xff) as usize * 16)),
-        );
-        a6 = xor3_u8(
-            a6,
-            vld1q_u8(table0.add(((w0 >> 48) & 0xff) as usize * 16)),
-            vld1q_u8(table1.add(((w1 >> 48) & 0xff) as usize * 16)),
-        );
-        a7 = xor3_u8(
-            a7,
-            vld1q_u8(table0.add((w0 >> 56) as usize * 16)),
-            vld1q_u8(table1.add((w1 >> 56) as usize * 16)),
-        );
-        t += 2;
-    }
-    if t < TILE_T {
-        let stripe = row_ptr.add(t * row_stride + bs);
-        let table = tables_ptr.add(t * 256 * 16);
-        let w = (stripe as *const u64).read_unaligned();
-        a0 = veorq_u8(a0, vld1q_u8(table.add((w & 0xff) as usize * 16)));
-        a1 = veorq_u8(a1, vld1q_u8(table.add(((w >> 8) & 0xff) as usize * 16)));
-        a2 = veorq_u8(a2, vld1q_u8(table.add(((w >> 16) & 0xff) as usize * 16)));
-        a3 = veorq_u8(a3, vld1q_u8(table.add(((w >> 24) & 0xff) as usize * 16)));
-        a4 = veorq_u8(a4, vld1q_u8(table.add(((w >> 32) & 0xff) as usize * 16)));
-        a5 = veorq_u8(a5, vld1q_u8(table.add(((w >> 40) & 0xff) as usize * 16)));
-        a6 = veorq_u8(a6, vld1q_u8(table.add(((w >> 48) & 0xff) as usize * 16)));
-        a7 = veorq_u8(a7, vld1q_u8(table.add((w >> 56) as usize * 16)));
+        let i0 = (w & 0xff) as usize;
+        let i1 = ((w >> 8) & 0xff) as usize;
+        let i2 = ((w >> 16) & 0xff) as usize;
+        let i3 = ((w >> 24) & 0xff) as usize;
+        let i4 = ((w >> 32) & 0xff) as usize;
+        let i5 = ((w >> 40) & 0xff) as usize;
+        let i6 = ((w >> 48) & 0xff) as usize;
+        let i7 = (w >> 56) as usize;
+
+        a0 = veorq_u8(a0, vld1q_u8(ta.add(i0 * 16)));
+        a1 = veorq_u8(a1, vld1q_u8(ta.add(i1 * 16)));
+        a2 = veorq_u8(a2, vld1q_u8(ta.add(i2 * 16)));
+        a3 = veorq_u8(a3, vld1q_u8(ta.add(i3 * 16)));
+        a4 = veorq_u8(a4, vld1q_u8(ta.add(i4 * 16)));
+        a5 = veorq_u8(a5, vld1q_u8(ta.add(i5 * 16)));
+        a6 = veorq_u8(a6, vld1q_u8(ta.add(i6 * 16)));
+        a7 = veorq_u8(a7, vld1q_u8(ta.add(i7 * 16)));
     }
 
     vst1q_u8(o, a0);
@@ -446,63 +383,47 @@ pub(crate) fn oblock_padded_tiled<const TILE_T: usize>(
         return vec![F128::ZERO; k];
     }
 
-    // Contiguous tile claims drained through the two-pool chunk queue (the
-    // shape promoted across zerocheck rounds 1–2, the top-NTT passes, and
-    // Merkle hashing). This fold is the right side of the queue's selection
-    // rule: it is load-port/L1-gather bound (≈38 GB/s at the ranked shape),
-    // not DRAM-bound, so efficiency-core claims add real throughput instead
-    // of join-tail latency, and there is exactly one join per prove. Each
-    // claim owns a contiguous tile band, builds each of its tile tables
-    // exactly once (the property that makes oblock beat iblock), and
-    // accumulates into its own private length-k partial. The partial backing
-    // is allocated uninitialized: every claim zeroes exactly its own slot
-    // before its first accumulate, so there is no up-front 16 MiB fault pass
-    // and first-touch lands on whichever core does the work.
-    const TILES_PER_CLAIM: usize = 64;
-    let n_claims = n_tiles.div_ceil(TILES_PER_CLAIM);
-    let mut partials = crate::alloc_uninit_f128_vec(n_claims * k);
-    let partials_base = crate::epool::SyncPtr(partials.as_mut_ptr());
-    crate::epool::run_hetero_chunks(n_claims, |c| {
-        let tile_lo = c * TILES_PER_CLAIM;
-        let tile_hi = ((c + 1) * TILES_PER_CLAIM).min(n_tiles);
-        // SAFETY: the queue hands out each claim index exactly once; claim
-        // `c` exclusively owns `partials[c·k .. (c+1)·k]`, which it fully
-        // zero-initializes below before any read. The queue join publishes
-        // all writes before the reduction reads them.
-        let partial = unsafe { std::slice::from_raw_parts_mut(partials_base.ptr().add(c * k), k) };
-        // SAFETY: F128 is Copy and all-zero bytes are valid F128::ZERO.
-        unsafe {
-            std::ptr::write_bytes(partial.as_mut_ptr(), 0, k);
-        }
-        // TILE_T × 256 F128 tables, L1-resident, built once per tile.
-        let mut tables = vec![F128::ZERO; TILE_T * 256];
-        for tile in tile_lo..tile_hi {
-            let stripe_base = tile * TILE_T;
-            for t in 0..TILE_T {
-                let eq_off = 8 * (stripe_base + t);
-                build_sum_table(
-                    &eq_outer[eq_off..eq_off + 8],
-                    &mut tables[t * 256..(t + 1) * 256],
-                );
-            }
-            let tables_ptr = tables.as_ptr() as *const u8;
-            let z_base = unsafe { z_packed.as_ptr().add(stripe_base * k) };
-            let mut bs = 0usize;
-            while bs < useful {
-                unsafe {
-                    process_block_neon_single::<TILE_T>(
-                        z_base,
-                        k,
-                        bs,
-                        tables_ptr,
-                        partial.as_mut_ptr().add(bs),
+    // One private length-k partial per worker; workers own contiguous tile bands,
+    // so each tile's sum-tables are built exactly once (not once per worker).
+    let p = rayon::current_num_threads().max(1);
+    let tiles_per_worker = n_tiles.div_ceil(p);
+    let n_workers = n_tiles.div_ceil(tiles_per_worker); // ≤ p, every band non-empty
+
+    let mut partials = vec![F128::ZERO; n_workers * k];
+    partials
+        .par_chunks_mut(k)
+        .enumerate()
+        .for_each(|(w, partial)| {
+            let tile_lo = w * tiles_per_worker;
+            let tile_hi = ((w + 1) * tiles_per_worker).min(n_tiles);
+            // TILE_T × 256 F128 tables, L1-resident, built once per tile.
+            let mut tables = vec![F128::ZERO; TILE_T * 256];
+            for tile in tile_lo..tile_hi {
+                let stripe_base = tile * TILE_T;
+                for t in 0..TILE_T {
+                    let eq_off = 8 * (stripe_base + t);
+                    build_sum_table(
+                        &eq_outer[eq_off..eq_off + 8],
+                        &mut tables[t * 256..(t + 1) * 256],
                     );
                 }
-                bs += BLOCK_K;
+                let tables_ptr = tables.as_ptr() as *const u8;
+                let z_base = unsafe { z_packed.as_ptr().add(stripe_base * k) };
+                let mut bs = 0usize;
+                while bs < useful {
+                    unsafe {
+                        process_block_neon_single::<TILE_T>(
+                            z_base,
+                            k,
+                            bs,
+                            tables_ptr,
+                            partial.as_mut_ptr().add(bs),
+                        );
+                    }
+                    bs += BLOCK_K;
+                }
             }
-        }
-    });
-    let n_workers = n_claims;
+        });
 
     // XOR-reduce the per-worker partials in ONE parallel pass over column bands:
     // each worker owns a band of the output and XORs it across all `n_workers`
