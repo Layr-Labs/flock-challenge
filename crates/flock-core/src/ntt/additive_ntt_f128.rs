@@ -317,6 +317,34 @@ impl AdditiveNttF128 {
         num_ntts: usize,
         start_layer: usize,
     ) {
+        self.forward_transform_interleaved_from_layer_and_then(
+            data,
+            num_ntts,
+            start_layer,
+            |_, _| {},
+        );
+    }
+
+    /// Variant of [`Self::forward_transform_interleaved_from_layer`] that calls
+    /// `finish_chunk(offset, chunk)` exactly once for every disjoint finalized
+    /// cache chunk. `offset` is in `F128` elements from the start of `data`.
+    ///
+    /// The callback runs inside the existing deep-transform Rayon job, before
+    /// that worker moves to another chunk. Once a callback begins, the
+    /// transform never reads or writes that chunk again; callers may therefore
+    /// hand the finalized range to another worker before the callback returns.
+    /// This lets the PCS hash codeword leaves while their 1 MiB ranked subtree
+    /// is still cache-resident, without changing transform ordering or adding
+    /// another parallel region.
+    pub(crate) fn forward_transform_interleaved_from_layer_and_then<F>(
+        &self,
+        data: &mut [F128],
+        num_ntts: usize,
+        start_layer: usize,
+        finish_chunk: F,
+    ) where
+        F: Fn(usize, &[F128]) + Sync + Send,
+    {
         assert!(num_ntts.is_power_of_two() && num_ntts > 0);
         let n_total = data.len();
         assert_eq!(n_total % num_ntts, 0);
@@ -331,7 +359,12 @@ impl AdditiveNttF128 {
             all(target_arch = "x86_64", target_feature = "pclmulqdq"),
         ))]
         {
-            self.forward_transform_interleaved_parallel_from_layer(data, num_ntts, start_layer);
+            self.forward_transform_interleaved_parallel_from_layer_and_then(
+                data,
+                num_ntts,
+                start_layer,
+                &finish_chunk,
+            );
         }
         #[cfg(not(any(
             all(target_arch = "aarch64", target_feature = "aes"),
@@ -339,6 +372,7 @@ impl AdditiveNttF128 {
         )))]
         {
             self.forward_transform_interleaved_scalar_from_layer(data, num_ntts, start_layer);
+            finish_chunk(0, data);
         }
     }
 
@@ -410,6 +444,27 @@ impl AdditiveNttF128 {
         num_ntts: usize,
         start_layer: usize,
     ) {
+        self.forward_transform_interleaved_parallel_from_layer_and_then(
+            data,
+            num_ntts,
+            start_layer,
+            &|_, _| {},
+        );
+    }
+
+    #[cfg(any(
+        all(target_arch = "aarch64", target_feature = "aes"),
+        all(target_arch = "x86_64", target_feature = "pclmulqdq"),
+    ))]
+    fn forward_transform_interleaved_parallel_from_layer_and_then<F>(
+        &self,
+        data: &mut [F128],
+        num_ntts: usize,
+        start_layer: usize,
+        finish_chunk: &F,
+    ) where
+        F: Fn(usize, &[F128]) + Sync + Send,
+    {
         use rayon::prelude::*;
         let n_total = data.len();
         let log_d = log2_pow2(n_total / num_ntts);
@@ -450,6 +505,7 @@ impl AdditiveNttF128 {
         let n_top = fusion_aware_interleaved_n_top(log_d, num_ntts, start_layer, n_top);
         if n_top == 0 || log_d < 8 {
             self.forward_transform_interleaved_scalar_from_layer(data, num_ntts, start_layer);
+            finish_chunk(0, data);
             return;
         }
 
@@ -582,7 +638,13 @@ impl AdditiveNttF128 {
         // the existing outer chunk job so every row is loaded/stored once per
         // two layers and no nested Rayon region is created.
         if use_ranked_deep_pair_fusion(log_d, num_ntts, start_layer, n_top) {
-            self.forward_transform_interleaved_deep_fused_pairs(data, num_ntts, n_top, log_d);
+            self.forward_transform_interleaved_deep_fused_pairs_and_then(
+                data,
+                num_ntts,
+                n_top,
+                log_d,
+                finish_chunk,
+            );
             return;
         }
 
@@ -608,12 +670,14 @@ impl AdditiveNttF128 {
                         butterfly_interleaved_block(block, twiddle, block_size_half, num_ntts);
                     }
                 }
+                finish_chunk(sub_idx * sub_bytes, sub_data);
             });
     }
 
     /// Finish layers `n_top..log_d` two at a time inside independent
     /// cache-resident sub-NTTs. The outer `par_chunks_mut` is the only Rayon
     /// boundary; block and row work inside each chunk is deliberately serial.
+    #[cfg(test)]
     fn forward_transform_interleaved_deep_fused_pairs(
         &self,
         data: &mut [F128],
@@ -621,6 +685,25 @@ impl AdditiveNttF128 {
         n_top: usize,
         log_d: usize,
     ) {
+        self.forward_transform_interleaved_deep_fused_pairs_and_then(
+            data,
+            num_ntts,
+            n_top,
+            log_d,
+            &|_, _| {},
+        );
+    }
+
+    fn forward_transform_interleaved_deep_fused_pairs_and_then<F>(
+        &self,
+        data: &mut [F128],
+        num_ntts: usize,
+        n_top: usize,
+        log_d: usize,
+        finish_chunk: &F,
+    ) where
+        F: Fn(usize, &[F128]) + Sync + Send,
+    {
         use rayon::prelude::*;
 
         debug_assert!(n_top <= log_d);
@@ -678,6 +761,7 @@ impl AdditiveNttF128 {
                         );
                     }
                 }
+                finish_chunk(sub_idx * sub_elems, sub_data);
             });
     }
 
@@ -1313,6 +1397,42 @@ mod tests {
             ntt.forward_transform_interleaved_deep_fused_pairs(&mut got, NUM_NTTS, N_TOP, LOG_D);
             assert_eq!(got, want, "five-pair mismatch at iteration={iteration}");
         }
+    }
+
+    /// Every finalized-chunk callback must observe the final transform bytes,
+    /// exactly once and at the advertised global element offset.
+    #[test]
+    fn interleaved_chunk_finish_observes_complete_transform() {
+        const LOG_D: usize = 12;
+        const NUM_NTTS: usize = 2;
+        const START_LAYER: usize = 1;
+
+        let mut rng = Rng::new(0xCACE_10CA_1F1E_0001);
+        let ntt = AdditiveNttF128::standard(LOG_D);
+        let source = rand_vec(&mut rng, (1usize << LOG_D) * NUM_NTTS);
+        let mut want = source.clone();
+        ntt.forward_transform_interleaved_from_layer(&mut want, NUM_NTTS, START_LAYER);
+
+        let observed =
+            std::sync::Mutex::new((vec![F128::ZERO; source.len()], vec![0u8; source.len()]));
+        let mut got = source;
+        ntt.forward_transform_interleaved_from_layer_and_then(
+            &mut got,
+            NUM_NTTS,
+            START_LAYER,
+            |offset, chunk| {
+                let mut observed = observed.lock().unwrap();
+                observed.0[offset..offset + chunk.len()].copy_from_slice(chunk);
+                for count in &mut observed.1[offset..offset + chunk.len()] {
+                    *count += 1;
+                }
+            },
+        );
+
+        assert_eq!(got, want);
+        let observed = observed.into_inner().unwrap();
+        assert_eq!(observed.0, want);
+        assert!(observed.1.iter().all(|&count| count == 1));
     }
 
     /// Only the ranked macOS/AArch64 L0 transform may use the new tail
