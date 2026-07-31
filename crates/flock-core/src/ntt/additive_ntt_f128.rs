@@ -465,6 +465,104 @@ impl AdditiveNttF128 {
         unreachable!("ranked top split requires a hardware NTT target");
     }
 
+    /// Ranked top passes with the rate-1/2 replicate-fill fused into the
+    /// first pass: both layer-1 blocks' pre-state is the same message `msg`
+    /// (`replicate_message_fill` is exactly the pre-applied layer 0), so the
+    /// layer-1 fused-3 pass loads each radix-8 row group from `msg` once and
+    /// writes both blocks' results — the message is never materialized into
+    /// the codeword, deleting one full replica store from the producer and
+    /// halving this pass's loads. Layers 4 and 7 then run the exact in-place
+    /// hetero passes of [`Self::forward_transform_interleaved_ranked_top_from_layer`].
+    ///
+    /// Every codeword element is written by the layer-1 pass, so `data` may
+    /// hold arbitrary stale bytes on entry. Only the exact ranked L0 shape is
+    /// supported (asserted); callers outside it must replicate-fill and use
+    /// the ordinary transform.
+    pub(crate) fn forward_transform_interleaved_ranked_top_from_message(
+        &self,
+        msg: &[F128],
+        data: &mut [F128],
+        num_ntts: usize,
+        start_layer: usize,
+    ) {
+        let log_d = log2_pow2(data.len() / num_ntts);
+        assert!(use_ranked_deep_pair_fusion(log_d, num_ntts, start_layer, 10));
+        assert_eq!(start_layer, 1, "from-message fusion is a rate-1/2 layer-1 pass");
+        assert_eq!(data.len(), 2 * msg.len());
+
+        let n_top = 10usize;
+        let block_twiddles = |layer: usize, block: usize| {
+            let mut tw = [F128 { lo: 0, hi: 0 }; 7];
+            tw[0] = self.twiddle(layer, block);
+            for s in 0..2 {
+                tw[1 + s] = self.twiddle(layer + 1, 2 * block + s);
+            }
+            for s in 0..4 {
+                tw[3 + s] = self.twiddle(layer + 2, 4 * block + s);
+            }
+            tw
+        };
+
+        // Layer-1 fused-3 pass from the message: 2 blocks, identical input.
+        {
+            let block_size = 1usize << (log_d - 1);
+            let eighth = block_size >> 3;
+            debug_assert_eq!(msg.len(), block_size * num_ntts);
+            let t_zero = block_twiddles(1, 0);
+            let t_gen = block_twiddles(1, 1);
+            debug_assert_eq!(t_zero[0], F128::ZERO);
+            debug_assert_eq!(t_zero[1], F128::ZERO);
+            debug_assert_eq!(t_zero[3], F128::ZERO);
+
+            const ROWS_PER_TILE: usize = 128;
+            let tiles = eighth.div_ceil(ROWS_PER_TILE);
+            let block_elems = 8 * eighth * num_ntts;
+            let src = msg.as_ptr() as usize;
+            let dst = crate::epool::SyncPtr(data.as_mut_ptr());
+            crate::epool::run_hetero_chunks(tiles, |tile| {
+                let row_start = tile * ROWS_PER_TILE;
+                let row_end = (row_start + ROWS_PER_TILE).min(eighth);
+                let dst0 = dst.ptr();
+                // SAFETY: each queue index owns one disjoint row tile; the
+                // two destination blocks are disjoint halves of `data`, and
+                // every derived address is inside the validated geometry.
+                // `msg` is only read.
+                unsafe {
+                    let dst1 = dst0.add(block_elems);
+                    for row in row_start..row_end {
+                        kernels::butterfly_fused_3layer_dual_from_src_row(
+                            src as *const F128,
+                            dst0,
+                            dst1,
+                            eighth,
+                            num_ntts,
+                            row,
+                            &t_zero,
+                            &t_gen,
+                        );
+                    }
+                }
+            });
+        }
+
+        // Layers 4 and 7: exact in-place ranked hetero passes.
+        for layer in [4usize, 7] {
+            let num_blocks = 1usize << layer;
+            let block_size = 1usize << (log_d - layer);
+            let eighth = block_size >> 3;
+            debug_assert!(is_ranked_top_hetero_fused3_pass(
+                log_d,
+                num_ntts,
+                start_layer,
+                n_top,
+                layer
+            ));
+            let twiddles: Vec<[F128; 7]> =
+                (0..num_blocks).map(|b| block_twiddles(layer, b)).collect();
+            butterfly_interleaved_fused_3layer_all_blocks_hetero(data, &twiddles, eighth, num_ntts);
+        }
+    }
+
     /// Finish the ranked L0 transform's five cache-local deep pairs and invoke
     /// `finish_chunk` exactly as the unsplit transform does.
     #[inline]

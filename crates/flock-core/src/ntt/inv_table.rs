@@ -37,6 +37,31 @@ pub struct InvNttTableByteSingleGf8 {
 }
 
 impl InvNttTableByteSingleGf8 {
+    /// The standard prover table for `k` (input domain S at β=0, output
+    /// domain Λ at β=2^k), built once per process and shared. The table is
+    /// a pure function of `k`; the ranked prover previously rebuilt it —
+    /// two `AdditiveNttGf8` constructions plus the 8 NTT round-trips and
+    /// both table images — twice per proof (commit-side round-1 precompute
+    /// and zerocheck), once on the serial path in front of the
+    /// commit/precompute join. Supported for `k ∈ 3..=7`; other `k` (tests
+    /// only) should construct directly via [`Self::new`].
+    pub fn cached_standard(k: usize) -> &'static InvNttTableByteSingleGf8 {
+        use std::sync::OnceLock;
+        const K_MIN: usize = 3;
+        const SLOTS: usize = 5; // k ∈ 3..=7
+        static CACHE: [OnceLock<InvNttTableByteSingleGf8>; SLOTS] =
+            [const { OnceLock::new() }; SLOTS];
+        assert!(
+            (K_MIN..K_MIN + SLOTS).contains(&k),
+            "cached_standard supports k in 3..=7, got {k}"
+        );
+        CACHE[k - K_MIN].get_or_init(|| {
+            let ntt_s = AdditiveNttGf8::new(k, F8::ZERO);
+            let ntt_l = AdditiveNttGf8::new(k, F8(1u8 << k));
+            InvNttTableByteSingleGf8::new(&ntt_s, &ntt_l)
+        })
+    }
+
     /// Build the table given the two NTT instances: `ntt_S` over the input
     /// domain, `ntt_L` over the output (extension) domain. Both must have the
     /// same `k`.

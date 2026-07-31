@@ -262,6 +262,111 @@ pub(super) unsafe fn butterfly_fused_3layer_zero_root_row(
     }
 }
 
+/// Vector-resident twin of `portable::butterfly_fused_3layer_dual_from_src_row`.
+///
+/// Loads the radix-8 row group from `src` once, keeps it in q registers, and
+/// evaluates both layer-1 blocks' fused-3 butterflies on those registers: the
+/// zero-root set to `dst0`, the general set to `dst1`. All eight rows are
+/// stored to both destinations (they hold stale bytes, unlike the in-place
+/// kernels' own prior state).
+///
+/// # Safety
+/// As [`butterfly_fused_3layer_row`] for all three pointers, plus
+/// `t_zero[0] == t_zero[1] == t_zero[3] == 0`.
+#[target_feature(enable = "aes")]
+#[allow(clippy::too_many_arguments)]
+pub(super) unsafe fn butterfly_fused_3layer_dual_from_src_row(
+    src: *const F128,
+    dst0: *mut F128,
+    dst1: *mut F128,
+    eighth: usize,
+    num_ntts: usize,
+    r: usize,
+    t_zero: &[F128; 7],
+    t_gen: &[F128; 7],
+) {
+    use core::arch::aarch64::*;
+    unsafe {
+        debug_assert_eq!(t_zero[0], F128::ZERO);
+        debug_assert_eq!(t_zero[1], F128::ZERO);
+        debug_assert_eq!(t_zero[3], F128::ZERO);
+
+        let z2 = vld1q_u64((&raw const t_zero[2]).cast::<u64>());
+        let z4 = vld1q_u64((&raw const t_zero[4]).cast::<u64>());
+        let z5 = vld1q_u64((&raw const t_zero[5]).cast::<u64>());
+        let z6 = vld1q_u64((&raw const t_zero[6]).cast::<u64>());
+        let g: [uint64x2_t; 7] =
+            core::array::from_fn(|i| vld1q_u64((&raw const t_gen[i]).cast::<u64>()));
+
+        for lane in 0..num_ntts {
+            let off = r * num_ntts + lane;
+            let step = eighth * num_ntts;
+            let src_base = src.add(off);
+            let loaded: [uint64x2_t; 8] =
+                core::array::from_fn(|i| vld1q_u64(src_base.add(i * step).cast::<u64>()));
+
+            // Block 0: zero-root chain (mirrors
+            // `butterfly_fused_3layer_zero_root_row`, but stores v[0] too).
+            {
+                let mut v = loaded;
+                for i in 0..4 {
+                    v[i + 4] = butterfly_zero_q(v[i], v[i + 4]);
+                }
+                for i in 0..2 {
+                    v[i + 2] = butterfly_zero_q(v[i], v[i + 2]);
+                }
+                let (a, b) = butterfly_q(v[4], v[6], z2);
+                v[4] = a;
+                v[6] = b;
+                let (a, b) = butterfly_q(v[5], v[7], z2);
+                v[5] = a;
+                v[7] = b;
+                v[1] = butterfly_zero_q(v[0], v[1]);
+                let (a, b) = butterfly_q(v[2], v[3], z4);
+                v[2] = a;
+                v[3] = b;
+                let (a, b) = butterfly_q(v[4], v[5], z5);
+                v[4] = a;
+                v[5] = b;
+                let (a, b) = butterfly_q(v[6], v[7], z6);
+                v[6] = a;
+                v[7] = b;
+                let dst_base = dst0.add(off);
+                for (i, value) in v.iter().enumerate() {
+                    vst1q_u64(dst_base.add(i * step).cast::<u64>(), *value);
+                }
+            }
+
+            // Block 1: general chain (mirrors `butterfly_fused_3layer_row`).
+            {
+                let mut v = loaded;
+                for i in 0..4 {
+                    let (a, b) = butterfly_q(v[i], v[i + 4], g[0]);
+                    v[i] = a;
+                    v[i + 4] = b;
+                }
+                for s in 0..2 {
+                    for i in 0..2 {
+                        let (u, w) = (4 * s + i, 4 * s + i + 2);
+                        let (a, b) = butterfly_q(v[u], v[w], g[1 + s]);
+                        v[u] = a;
+                        v[w] = b;
+                    }
+                }
+                for s in 0..4 {
+                    let (a, b) = butterfly_q(v[2 * s], v[2 * s + 1], g[3 + s]);
+                    v[2 * s] = a;
+                    v[2 * s + 1] = b;
+                }
+                let dst_base = dst1.add(off);
+                for (i, value) in v.iter().enumerate() {
+                    vst1q_u64(dst_base.add(i * step).cast::<u64>(), *value);
+                }
+            }
+        }
+    }
+}
+
 /// Fused two-layer butterfly specialized for three low-limb-only twiddles.
 /// Two products are issued together at each stage, using four PMULLs instead
 /// of twelve for the pair under the generic Binius field multiplier.
