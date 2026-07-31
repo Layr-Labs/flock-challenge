@@ -14,6 +14,12 @@
 
 pub use flock_core::*;
 
+mod recycling_allocator;
+
+#[global_allocator]
+static GLOBAL_ALLOCATOR: recycling_allocator::RecyclingAllocator =
+    recycling_allocator::RecyclingAllocator;
+
 pub mod chain;
 pub mod merkle_path;
 pub mod proof_io;
