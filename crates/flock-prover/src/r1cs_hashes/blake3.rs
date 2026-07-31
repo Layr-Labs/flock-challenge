@@ -797,9 +797,6 @@ impl<'a> ReverseTranspose<'a> {
         self.comb
     }
 }
-
-
-
 pub struct Blake3LincheckCircuit;
 
 impl flock_core::lincheck::LincheckCircuit for Blake3LincheckCircuit {
@@ -1692,7 +1689,8 @@ impl Blake3Setup {
             && self.pcs_params.m == 32
             && self.pcs_params.log_inv_rate == 1
             && self.pcs_params.log_batch_size == 6
-            && self.pcs_params.profile == flock_core::pcs::ligerito::LigeritoProfile::Fast
+            && self.pcs_params.profile
+                == flock_core::pcs::ligerito::LigeritoProfile::Fast
             && self.pcs_params.merkle_hash == HashKind::Blake3
             && std::env::var_os("FLOCK_NO_HOT_CODEWORD").is_none()
     }
@@ -1714,8 +1712,7 @@ impl Blake3Setup {
             && self.r1cs.b_0.num_cols == K
             && self.pcs_params.log_inv_rate == 1
             && self.pcs_params.log_batch_size == 6
-            && self.pcs_params.profile
-                == flock_core::pcs::ligerito::LigeritoProfile::Fast
+            && self.pcs_params.profile == flock_core::pcs::ligerito::LigeritoProfile::Fast
             && std::env::var_os("FLOCK_NO_BLAKE3_REVERSE_LINCHECK").is_none()
     }
 
@@ -2762,6 +2759,97 @@ mod tests {
             .verify(&commitment, &proof, &mut verifier)
             .expect("ranked preinitialized-codeword proof must verify");
         assert_eq!(verified, claim);
+    }
+
+    /// Full ranked `prove_fast` bundle A/B matrix for the two lincheck
+    /// scheduling controls and both ranked circuit implementations. This must
+    /// run in a single-test process because it temporarily changes process
+    /// environment variables and peaks at several GiB of working memory.
+    #[test]
+    #[ignore = "ranked matrix needs several GiB; run with --ignored --test-threads=1"]
+    fn ranked_prove_fast_lincheck_join_matrix_is_byte_identical() {
+        use flock_core::challenger::FsChallenger;
+
+        const RANKED_N_BLOCKS: usize = 1 << 18;
+        const SEEDS: [u64; 2] = [0x1C_0000_0001, 0x1C_0000_0002];
+        const LC_JOIN: &str = "FLOCK_NO_LC_JOIN";
+        const REVERSE: &str = "FLOCK_NO_BLAKE3_REVERSE_LINCHECK";
+
+        struct EnvRestore {
+            name: &'static str,
+            previous: Option<std::ffi::OsString>,
+        }
+        impl EnvRestore {
+            fn set(name: &'static str, value: Option<&str>) -> Self {
+                let previous = std::env::var_os(name);
+                // SAFETY: this ignored test is documented and invoked with one
+                // test thread, so no concurrent Rust code observes these vars.
+                unsafe {
+                    match value {
+                        Some(value) => std::env::set_var(name, value),
+                        None => std::env::remove_var(name),
+                    }
+                }
+                Self { name, previous }
+            }
+        }
+        impl Drop for EnvRestore {
+            fn drop(&mut self) {
+                // SAFETY: paired with `set`; this test runs single-threaded.
+                unsafe {
+                    match &self.previous {
+                        Some(value) => std::env::set_var(self.name, value),
+                        None => std::env::remove_var(self.name),
+                    }
+                }
+            }
+        }
+
+        let blocks_by_seed: Vec<Vec<Compression>> = SEEDS
+            .iter()
+            .map(|&seed| {
+                let mut rng = Rng::new(seed);
+                (0..RANKED_N_BLOCKS)
+                    .map(|_| {
+                        let cv = std::array::from_fn(|_| rng.next_u32());
+                        let m = std::array::from_fn(|_| rng.next_u32());
+                        (cv, m, rng.next_u32() as u64, 64, 11)
+                    })
+                    .collect()
+            })
+            .collect();
+
+        for reverse_disabled in [false, true] {
+            let _reverse = EnvRestore::set(REVERSE, reverse_disabled.then_some("1"));
+            let mut setup = Blake3Setup::new(RANKED_N_BLOCKS);
+            setup.pcs_params.merkle_hash = HashKind::Blake3;
+            assert_eq!(
+                setup.use_ranked_reverse_lincheck(),
+                !reverse_disabled,
+                "reverse gate mismatch for FLOCK_NO_BLAKE3_REVERSE_LINCHECK={reverse_disabled}"
+            );
+
+            for (seed, blocks) in SEEDS.iter().copied().zip(&blocks_by_seed) {
+                let serial_bytes = {
+                    let _serial = EnvRestore::set(LC_JOIN, Some("1"));
+                    let mut challenger =
+                        FsChallenger::with_hash(b"flock-lc-join-matrix", HashKind::Blake3);
+                    let (proof, commitment, _) = setup.prove_fast(blocks, &mut challenger);
+                    crate::proof_io::R1csProofBundleLigerito { commitment, proof }.to_bytes()
+                };
+                let joined_bytes = {
+                    let _joined = EnvRestore::set(LC_JOIN, None);
+                    let mut challenger =
+                        FsChallenger::with_hash(b"flock-lc-join-matrix", HashKind::Blake3);
+                    let (proof, commitment, _) = setup.prove_fast(blocks, &mut challenger);
+                    crate::proof_io::R1csProofBundleLigerito { commitment, proof }.to_bytes()
+                };
+                assert_eq!(
+                    serial_bytes, joined_bytes,
+                    "proof bundle differs for seed {seed}, FLOCK_NO_BLAKE3_REVERSE_LINCHECK={reverse_disabled}"
+                );
+            }
+        }
     }
 
     /// Full prove→verify round-trip through the Ligerito PCS for EACH named

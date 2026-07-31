@@ -272,20 +272,44 @@ impl CscRowIndices {
 
     #[inline(always)]
     fn fold_range(&self, start: usize, end: usize, eq_inner: &[F128]) -> F128 {
-        let mut sum = F128::ZERO;
         match self {
             Self::U16(rows) => {
-                for &row in &rows[start..end] {
-                    sum += eq_inner[row as usize];
+                let rows = &rows[start..end];
+                let (mut sum0, mut sum1, mut sum2, mut sum3) =
+                    (F128::ZERO, F128::ZERO, F128::ZERO, F128::ZERO);
+                let mut i = 0;
+                while i + 4 <= rows.len() {
+                    sum0 += eq_inner[rows[i] as usize];
+                    sum1 += eq_inner[rows[i + 1] as usize];
+                    sum2 += eq_inner[rows[i + 2] as usize];
+                    sum3 += eq_inner[rows[i + 3] as usize];
+                    i += 4;
                 }
+                while i < rows.len() {
+                    sum0 += eq_inner[rows[i] as usize];
+                    i += 1;
+                }
+                sum0 + sum1 + sum2 + sum3
             }
             Self::U32(rows) => {
-                for &row in &rows[start..end] {
-                    sum += eq_inner[row as usize];
+                let rows = &rows[start..end];
+                let (mut sum0, mut sum1, mut sum2, mut sum3) =
+                    (F128::ZERO, F128::ZERO, F128::ZERO, F128::ZERO);
+                let mut i = 0;
+                while i + 4 <= rows.len() {
+                    sum0 += eq_inner[rows[i] as usize];
+                    sum1 += eq_inner[rows[i + 1] as usize];
+                    sum2 += eq_inner[rows[i + 2] as usize];
+                    sum3 += eq_inner[rows[i + 3] as usize];
+                    i += 4;
                 }
+                while i < rows.len() {
+                    sum0 += eq_inner[rows[i] as usize];
+                    i += 1;
+                }
+                sum0 + sum1 + sum2 + sum3
             }
         }
-        sum
     }
 }
 
@@ -1267,6 +1291,20 @@ pub fn prove_padded_capture_z_vec<Ch: Challenger>(
     )
 }
 
+/// Exact ranked BLAKE3 lincheck geometry. This is deliberately a shape-only
+/// gate: the prover-level matrix test pins proof-byte identity for both the
+/// reverse-walker and CSC circuit modes. Smaller and diagnostic shapes retain
+/// the frontier serial composition so their scheduling remains unchanged.
+#[inline]
+fn is_ranked_lincheck_join_shape(
+    m: usize,
+    k_log: usize,
+    k_skip: usize,
+    useful_bits: usize,
+) -> bool {
+    m == 32 && k_log == 14 && k_skip == 6 && useful_bits == 15_409
+}
+
 #[allow(clippy::too_many_arguments)]
 fn prove_padded_inner<Ch: Challenger>(
     z_packed: &[u8],
@@ -1277,6 +1315,33 @@ fn prove_padded_inner<Ch: Challenger>(
     circuit: &dyn LincheckCircuit,
     x_ab: &QuirkyPoint,
     capture_z_vec: bool,
+    challenger: &mut Ch,
+) -> (LincheckProof, LincheckClaim, Option<Vec<F128>>) {
+    prove_padded_inner_impl(
+        z_packed,
+        m,
+        k_log,
+        k_skip,
+        useful_bits,
+        circuit,
+        x_ab,
+        capture_z_vec,
+        false,
+        challenger,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn prove_padded_inner_impl<Ch: Challenger>(
+    z_packed: &[u8],
+    m: usize,
+    k_log: usize,
+    k_skip: usize,
+    useful_bits: usize,
+    circuit: &dyn LincheckCircuit,
+    x_ab: &QuirkyPoint,
+    capture_z_vec: bool,
+    force_join: bool,
     challenger: &mut Ch,
 ) -> (LincheckProof, LincheckClaim, Option<Vec<F128>>) {
     let k = 1usize << k_log;
@@ -1296,62 +1361,96 @@ fn prove_padded_inner<Ch: Challenger>(
     //    consistency checks v_a, v_b into a single sumcheck.
     let alpha = challenger.sample_f128();
 
+    // No transcript observation interleaves α and β, so sampling β here
+    // preserves the label → α → β transcript order while the folds run.
+    let const_pin_col = circuit.const_pin_col();
+    let beta = const_pin_col.map(|_| challenger.sample_f128());
+
     // 2. Build the α-batched comb_vec via the circuit's per-block fold. For
     //    the sparse-matrix default this is the fused single-pass row-fold;
     //    per-hash circuit walkers compute the same `comb_vec` directly from
     //    the constraint graph.
-    let t = if trace {
-        Some(std::time::Instant::now())
-    } else {
-        None
-    };
-    let eq_inner = build_quirky_eq_table(x_ab.z_skip, &x_ab.x_inner_rest, k_skip);
-    if let Some(t) = t {
-        eprintln!(
-            "[lc] {:<26} {:>7.2} ms",
-            "build_quirky_eq",
-            t.elapsed().as_secs_f64() * 1e3
+    let use_join = (force_join || is_ranked_lincheck_join_shape(m, k_log, k_skip, useful_bits))
+        && rayon::current_num_threads() > 1
+        && std::env::var_os("FLOCK_NO_LC_JOIN").is_none();
+    let (mut comb_vec, mut z_vec) = if use_join {
+        let t = if trace {
+            Some(std::time::Instant::now())
+        } else {
+            None
+        };
+        let result = rayon::join(
+            || {
+                let eq_inner = build_quirky_eq_table(x_ab.z_skip, &x_ab.x_inner_rest, k_skip);
+                circuit.fold_alpha_batched(alpha, &eq_inner)
+            },
+            || {
+                let eq_x_outer = build_eq_table(&x_ab.x_outer);
+                partial_fold_packed_z_best(z_packed, m, k_log, useful_bits, &eq_x_outer)
+            },
         );
-    }
-    let t = if trace {
-        Some(std::time::Instant::now())
+        if let Some(t) = t {
+            eprintln!(
+                "[lc] {:<26} {:>7.2} ms",
+                "joined_folds",
+                t.elapsed().as_secs_f64() * 1e3
+            );
+        }
+        result
     } else {
-        None
+        let t = if trace {
+            Some(std::time::Instant::now())
+        } else {
+            None
+        };
+        let eq_inner = build_quirky_eq_table(x_ab.z_skip, &x_ab.x_inner_rest, k_skip);
+        if let Some(t) = t {
+            eprintln!(
+                "[lc] {:<26} {:>7.2} ms",
+                "build_quirky_eq",
+                t.elapsed().as_secs_f64() * 1e3
+            );
+        }
+        let t = if trace {
+            Some(std::time::Instant::now())
+        } else {
+            None
+        };
+        let comb_vec = circuit.fold_alpha_batched(alpha, &eq_inner);
+        if let Some(t) = t {
+            eprintln!(
+                "[lc] {:<26} {:>7.2} ms",
+                "fold_alpha_batched",
+                t.elapsed().as_secs_f64() * 1e3
+            );
+        }
+        let t = if trace {
+            Some(std::time::Instant::now())
+        } else {
+            None
+        };
+        let eq_x_outer = build_eq_table(&x_ab.x_outer);
+        let z_vec = partial_fold_packed_z_best(z_packed, m, k_log, useful_bits, &eq_x_outer);
+        if let Some(t) = t {
+            eprintln!(
+                "[lc] {:<26} {:>7.2} ms",
+                "partial_fold_z",
+                t.elapsed().as_secs_f64() * 1e3
+            );
+        }
+        (comb_vec, z_vec)
     };
-    let mut comb_vec = circuit.fold_alpha_batched(alpha, &eq_inner);
-    if let Some(t) = t {
-        eprintln!(
-            "[lc] {:<26} {:>7.2} ms",
-            "fold_alpha_batched",
-            t.elapsed().as_secs_f64() * 1e3
-        );
-    }
-
     // 2b. Constant-wire pin. Fold β·eq(j*, ·) into the comb so the same sumcheck
     //     also proves z_vec[j*] = 1 (the all-ones constant column). Since j* is a
     //     boolean index, eq(j*, ·) is the one-hot vector and this is a single
     //     entry update. β is sampled after α; the verifier mirrors both. See
     //     docs/const-wire-pin.md.
-    if let Some(col) = circuit.const_pin_col() {
-        let beta = challenger.sample_f128();
+    if let Some(col) = const_pin_col {
+        let beta = beta.expect("β is sampled when the constant-wire pin is present");
         comb_vec[col] += beta;
     }
 
     // 3. Partial fold of z at the shared outer half (length-k F128 vector).
-    let t = if trace {
-        Some(std::time::Instant::now())
-    } else {
-        None
-    };
-    let eq_x_outer = build_eq_table(&x_ab.x_outer);
-    let mut z_vec = partial_fold_packed_z_best(z_packed, m, k_log, useful_bits, &eq_x_outer);
-    if let Some(t) = t {
-        eprintln!(
-            "[lc] {:<26} {:>7.2} ms",
-            "partial_fold_z",
-            t.elapsed().as_secs_f64() * 1e3
-        );
-    }
     // 3b. Optional capture: clone the pre-sumcheck z_vec for downstream reuse
     //     (PCS open's AB-claim s_hat_v skipping fold_1b_rows). Only pay the
     //     clone when explicitly requested.
@@ -1640,6 +1739,98 @@ mod tests {
         }
         fn bits(&mut self, n: usize) -> Vec<bool> {
             (0..n).map(|_| self.next_u64() & 1 == 1).collect()
+        }
+    }
+
+    #[test]
+    fn csc_fold_range_four_accumulators_matches_serial_for_u16_and_u32() {
+        for seed in 0..8 {
+            let mut rng = Rng::new(0x4acc_0000 + seed);
+            let eq_inner = rng.f128_vec(32);
+            for &len in &[0usize, 1, 2, 3, 4, 5, 7, 9, 15, 16, 17] {
+                let rows_u16: Vec<u16> = (0..len)
+                    .map(|_| (rng.next_u64() as usize % eq_inner.len()) as u16)
+                    .collect();
+                let rows_u32: Vec<u32> = rows_u16.iter().map(|&row| row as u32).collect();
+                for &(start, end) in &[(0, len), (0, len.min(1)), (len / 2, len)] {
+                    let expected = rows_u16[start..end]
+                        .iter()
+                        .fold(F128::ZERO, |sum, &row| sum + eq_inner[row as usize]);
+                    assert_eq!(
+                        CscRowIndices::U16(rows_u16.clone()).fold_range(start, end, &eq_inner),
+                        expected,
+                        "u16 seed={seed} len={len} range={start}..{end}"
+                    );
+                    assert_eq!(
+                        CscRowIndices::U32(rows_u32.clone()).fold_range(start, end, &eq_inner),
+                        expected,
+                        "u32 seed={seed} len={len} range={start}..{end}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn ranked_lincheck_join_shape_gate_is_narrow() {
+        assert!(is_ranked_lincheck_join_shape(32, 14, 6, 15_409));
+        assert!(!is_ranked_lincheck_join_shape(31, 14, 6, 15_409));
+        assert!(!is_ranked_lincheck_join_shape(32, 13, 6, 15_409));
+        assert!(!is_ranked_lincheck_join_shape(32, 14, 5, 15_409));
+        assert!(!is_ranked_lincheck_join_shape(32, 14, 6, 15_408));
+    }
+
+    #[test]
+    fn joined_lincheck_path_matches_serial_full_proof_bytes_for_three_seeds() {
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(2)
+            .build()
+            .unwrap();
+        for seed in 0..3 {
+            let mut rng = Rng::new(0x1c_1010_0000 + seed);
+            let (m, k_log, k_skip) = (10, 4, 2);
+            let k = 1 << k_log;
+            let a_0 = random_sparse_matrix(k, k * 4, &mut rng);
+            let b_0 = random_sparse_matrix(k, k * 4, &mut rng);
+            let circuit = SparseMatrixCircuit::new(&a_0, &b_0);
+            let z_packed = pack_z_lincheck(&rng.bits(1 << m), m, k_log);
+            let x_ab = random_quirky_point(m, k_log, k_skip, &mut rng);
+
+            let mut serial_challenger = FsChallenger::new(b"flock-lincheck-join-test");
+            let serial = prove_padded_inner_impl(
+                &z_packed,
+                m,
+                k_log,
+                k_skip,
+                k,
+                &circuit,
+                &x_ab,
+                false,
+                false,
+                &mut serial_challenger,
+            );
+            let mut joined_challenger = FsChallenger::new(b"flock-lincheck-join-test");
+            let joined = pool.install(|| {
+                prove_padded_inner_impl(
+                    &z_packed,
+                    m,
+                    k_log,
+                    k_skip,
+                    k,
+                    &circuit,
+                    &x_ab,
+                    false,
+                    true,
+                    &mut joined_challenger,
+                )
+            });
+
+            assert_eq!(serial.1, joined.1, "claim differs for seed {seed}");
+            assert_eq!(
+                bincode::serialize(&serial.0).unwrap(),
+                bincode::serialize(&joined.0).unwrap(),
+                "proof bytes differ for seed {seed}"
+            );
         }
     }
 
@@ -2268,9 +2459,7 @@ mod tests {
             x_outer: x_ab.x_outer.clone(),
         };
         assert!(matches!(
-            verify(
-                m, k_log, k_skip, &circuit, &bad_x_ab, v_a, v_b, &proof, &mut ch
-            ),
+            verify(m, k_log, k_skip, &circuit, &bad_x_ab, v_a, v_b, &proof, &mut ch),
             Err(VerifyError::BadInnerRestLength { .. })
         ));
 
