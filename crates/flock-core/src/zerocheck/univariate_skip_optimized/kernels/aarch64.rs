@@ -41,75 +41,24 @@ pub(crate) unsafe fn accumulate_convert(
             let mut c1 = vdupq_n_u8(0);
             let mut c2 = vdupq_n_u8(0);
             let mut c3 = vdupq_n_u8(0);
-            for pair in 0..n_b_med / 2 {
-                let b0 = 2 * pair;
-                let b1 = b0 + 1;
-                let table0 = convert_ptr.add(b0 * 256 * 16);
-                let table1 = convert_ptr.add(b1 * 256 * 16);
-                let ab_word0 =
-                    (chunk_ab_bytes[b0].as_ptr().add(lane) as *const u32).read_unaligned() as usize;
-                let ab_word1 =
-                    (chunk_ab_bytes[b1].as_ptr().add(lane) as *const u32).read_unaligned() as usize;
-                let c_word0 =
-                    (chunk_c_bytes[b0].as_ptr().add(lane) as *const u32).read_unaligned() as usize;
-                let c_word1 =
-                    (chunk_c_bytes[b1].as_ptr().add(lane) as *const u32).read_unaligned() as usize;
-                ab0 = xor3_u8(
-                    ab0,
-                    vld1q_u8(table0.add((ab_word0 & 0xff) * 16)),
-                    vld1q_u8(table1.add((ab_word1 & 0xff) * 16)),
-                );
-                ab1 = xor3_u8(
-                    ab1,
-                    vld1q_u8(table0.add(((ab_word0 >> 8) & 0xff) * 16)),
-                    vld1q_u8(table1.add(((ab_word1 >> 8) & 0xff) * 16)),
-                );
-                ab2 = xor3_u8(
-                    ab2,
-                    vld1q_u8(table0.add(((ab_word0 >> 16) & 0xff) * 16)),
-                    vld1q_u8(table1.add(((ab_word1 >> 16) & 0xff) * 16)),
-                );
-                ab3 = xor3_u8(
-                    ab3,
-                    vld1q_u8(table0.add((ab_word0 >> 24) * 16)),
-                    vld1q_u8(table1.add((ab_word1 >> 24) * 16)),
-                );
-                c0 = xor3_u8(
-                    c0,
-                    vld1q_u8(table0.add((c_word0 & 0xff) * 16)),
-                    vld1q_u8(table1.add((c_word1 & 0xff) * 16)),
-                );
-                c1 = xor3_u8(
-                    c1,
-                    vld1q_u8(table0.add(((c_word0 >> 8) & 0xff) * 16)),
-                    vld1q_u8(table1.add(((c_word1 >> 8) & 0xff) * 16)),
-                );
-                c2 = xor3_u8(
-                    c2,
-                    vld1q_u8(table0.add(((c_word0 >> 16) & 0xff) * 16)),
-                    vld1q_u8(table1.add(((c_word1 >> 16) & 0xff) * 16)),
-                );
-                c3 = xor3_u8(
-                    c3,
-                    vld1q_u8(table0.add((c_word0 >> 24) * 16)),
-                    vld1q_u8(table1.add((c_word1 >> 24) * 16)),
-                );
-            }
-            if n_b_med & 1 == 1 {
-                let b_med = n_b_med - 1;
+            for b_med in 0..n_b_med {
                 let table = convert_ptr.add(b_med * 256 * 16);
-                let ab_word = (chunk_ab_bytes[b_med].as_ptr().add(lane) as *const u32)
-                    .read_unaligned() as usize;
-                let c_word = (chunk_c_bytes[b_med].as_ptr().add(lane) as *const u32)
-                    .read_unaligned() as usize;
-                ab0 = veorq_u8(ab0, vld1q_u8(table.add((ab_word & 0xff) * 16)));
-                ab1 = veorq_u8(ab1, vld1q_u8(table.add(((ab_word >> 8) & 0xff) * 16)));
-                ab2 = veorq_u8(ab2, vld1q_u8(table.add(((ab_word >> 16) & 0xff) * 16)));
-                ab3 = veorq_u8(ab3, vld1q_u8(table.add((ab_word >> 24) * 16)));
-                c0 = veorq_u8(c0, vld1q_u8(table.add((c_word & 0xff) * 16)));
-                c1 = veorq_u8(c1, vld1q_u8(table.add(((c_word >> 8) & 0xff) * 16)));
-                c2 = veorq_u8(c2, vld1q_u8(table.add(((c_word >> 16) & 0xff) * 16)));
-                c3 = veorq_u8(c3, vld1q_u8(table.add((c_word >> 24) * 16)));
+                let a0 = chunk_ab_bytes[b_med][lane] as usize;
+                let a1 = chunk_ab_bytes[b_med][lane + 1] as usize;
+                let a2 = chunk_ab_bytes[b_med][lane + 2] as usize;
+                let a3 = chunk_ab_bytes[b_med][lane + 3] as usize;
+                let v0 = chunk_c_bytes[b_med][lane] as usize;
+                let v1 = chunk_c_bytes[b_med][lane + 1] as usize;
+                let v2 = chunk_c_bytes[b_med][lane + 2] as usize;
+                let v3 = chunk_c_bytes[b_med][lane + 3] as usize;
+                ab0 = veorq_u8(ab0, vld1q_u8(table.add(a0 * 16)));
+                ab1 = veorq_u8(ab1, vld1q_u8(table.add(a1 * 16)));
+                ab2 = veorq_u8(ab2, vld1q_u8(table.add(a2 * 16)));
+                ab3 = veorq_u8(ab3, vld1q_u8(table.add(a3 * 16)));
+                c0 = veorq_u8(c0, vld1q_u8(table.add(v0 * 16)));
+                c1 = veorq_u8(c1, vld1q_u8(table.add(v1 * 16)));
+                c2 = veorq_u8(c2, vld1q_u8(table.add(v2 * 16)));
+                c3 = veorq_u8(c3, vld1q_u8(table.add(v3 * 16)));
             }
 
             macro_rules! drain_lane {
@@ -204,131 +153,81 @@ pub(crate) unsafe fn accumulate_convert_with_s_hat_v(
             let mut c12 = vdupq_n_u8(0);
             let mut c13 = vdupq_n_u8(0);
 
-            macro_rules! gather_pair {
-                ($p:expr) => {{
-                    let p = $p;
-                    let (b_even, b_odd) = (2 * p, 2 * p + 1);
-                    let t_even = convert_ptr.add(b_even * 256 * 16);
-                    let t_odd = convert_ptr.add(b_odd * 256 * 16);
-                    let q0 = m0_ptr.add(p * 256 * 16);
-                    let q1 = m1_ptr.add(p * 256 * 16);
+            for p in 0..n_pairs {
+                let (b_even, b_odd) = (2 * p, 2 * p + 1);
+                let t_even = convert_ptr.add(b_even * 256 * 16);
+                let t_odd = convert_ptr.add(b_odd * 256 * 16);
+                let q0 = m0_ptr.add(p * 256 * 16);
+                let q1 = m1_ptr.add(p * 256 * 16);
 
-                    // One u32 load per (side, b_med) covers the 4 adjacent
-                    // lanes; each extracted byte addresses the same table row
-                    // as the original byte-load form.
-                    let we = (chunk_ab_bytes[b_even].as_ptr().add(lane) as *const u32)
-                        .read_unaligned() as usize;
-                    let wo = (chunk_ab_bytes[b_odd].as_ptr().add(lane) as *const u32)
-                        .read_unaligned() as usize;
-                    let e0 = we & 0xff;
-                    let e1 = (we >> 8) & 0xff;
-                    let e2 = (we >> 16) & 0xff;
-                    let e3 = we >> 24;
-                    let o0 = wo & 0xff;
-                    let o1 = (wo >> 8) & 0xff;
-                    let o2 = (wo >> 16) & 0xff;
-                    let o3 = wo >> 24;
-                    ab0 = xor3_u8(
-                        ab0,
-                        vld1q_u8(t_even.add(e0 * 16)),
-                        vld1q_u8(t_odd.add(o0 * 16)),
-                    );
-                    ab1 = xor3_u8(
-                        ab1,
-                        vld1q_u8(t_even.add(e1 * 16)),
-                        vld1q_u8(t_odd.add(o1 * 16)),
-                    );
-                    ab2 = xor3_u8(
-                        ab2,
-                        vld1q_u8(t_even.add(e2 * 16)),
-                        vld1q_u8(t_odd.add(o2 * 16)),
-                    );
-                    ab3 = xor3_u8(
-                        ab3,
-                        vld1q_u8(t_even.add(e3 * 16)),
-                        vld1q_u8(t_odd.add(o3 * 16)),
-                    );
+                // Index traffic: one u32 load per (side, b_med) covers the 4
+                // adjacent lanes, replacing 16 single-byte loads per iteration
+                // with 4 word loads. The dependent q-gathers already keep the
+                // load ports saturated, so shrinking the index loads' port
+                // pressure removes counted work. Little-endian byte k of the
+                // word is exactly `chunk_*[b][lane + k]`, so every extracted
+                // index — and every gather it addresses — is bit-identical to
+                // the byte-load form.
+                let we = (chunk_ab_bytes[b_even].as_ptr().add(lane) as *const u32)
+                    .read_unaligned() as usize;
+                let wo = (chunk_ab_bytes[b_odd].as_ptr().add(lane) as *const u32)
+                    .read_unaligned() as usize;
+                let e0 = we & 0xff;
+                let e1 = (we >> 8) & 0xff;
+                let e2 = (we >> 16) & 0xff;
+                let e3 = we >> 24;
+                let o0 = wo & 0xff;
+                let o1 = (wo >> 8) & 0xff;
+                let o2 = (wo >> 16) & 0xff;
+                let o3 = wo >> 24;
+                ab0 = veorq_u8(ab0, vld1q_u8(t_even.add(e0 * 16)));
+                ab1 = veorq_u8(ab1, vld1q_u8(t_even.add(e1 * 16)));
+                ab2 = veorq_u8(ab2, vld1q_u8(t_even.add(e2 * 16)));
+                ab3 = veorq_u8(ab3, vld1q_u8(t_even.add(e3 * 16)));
+                ab0 = veorq_u8(ab0, vld1q_u8(t_odd.add(o0 * 16)));
+                ab1 = veorq_u8(ab1, vld1q_u8(t_odd.add(o1 * 16)));
+                ab2 = veorq_u8(ab2, vld1q_u8(t_odd.add(o2 * 16)));
+                ab3 = veorq_u8(ab3, vld1q_u8(t_odd.add(o3 * 16)));
 
-                    // The pairing masks distribute over the word; one
-                    // mask/shift sequence builds all 4 lanes' j and k.
-                    let ce = (chunk_c_bytes[b_even].as_ptr().add(lane) as *const u32)
-                        .read_unaligned() as usize;
-                    let co = (chunk_c_bytes[b_odd].as_ptr().add(lane) as *const u32)
-                        .read_unaligned() as usize;
-                    let jw = (ce & 0x5555_5555) | ((co << 1) & 0xaaaa_aaaa);
-                    let kw = (ce & 0xaaaa_aaaa) | ((co >> 1) & 0x5555_5555);
-                    (q0, q1, jw, kw)
-                }};
-            }
-
-            // Two adjacent paired-C rows feed one EOR3 per bank/lane. The AB
-            // side already folds each pair's even/odd rows in one EOR3.
-            let mut p = 0;
-            while p + 1 < n_pairs {
-                let (q00, q10, jw0, kw0) = gather_pair!(p);
-                let (q01, q11, jw1, kw1) = gather_pair!(p + 1);
-                c00 = xor3_u8(
-                    c00,
-                    vld1q_u8(q00.add((jw0 & 0xff) * 16)),
-                    vld1q_u8(q01.add((jw1 & 0xff) * 16)),
-                );
-                c01 = xor3_u8(
-                    c01,
-                    vld1q_u8(q00.add(((jw0 >> 8) & 0xff) * 16)),
-                    vld1q_u8(q01.add(((jw1 >> 8) & 0xff) * 16)),
-                );
-                c02 = xor3_u8(
-                    c02,
-                    vld1q_u8(q00.add(((jw0 >> 16) & 0xff) * 16)),
-                    vld1q_u8(q01.add(((jw1 >> 16) & 0xff) * 16)),
-                );
-                c03 = xor3_u8(
-                    c03,
-                    vld1q_u8(q00.add((jw0 >> 24) * 16)),
-                    vld1q_u8(q01.add((jw1 >> 24) * 16)),
-                );
-                c10 = xor3_u8(
-                    c10,
-                    vld1q_u8(q10.add((kw0 & 0xff) * 16)),
-                    vld1q_u8(q11.add((kw1 & 0xff) * 16)),
-                );
-                c11 = xor3_u8(
-                    c11,
-                    vld1q_u8(q10.add(((kw0 >> 8) & 0xff) * 16)),
-                    vld1q_u8(q11.add(((kw1 >> 8) & 0xff) * 16)),
-                );
-                c12 = xor3_u8(
-                    c12,
-                    vld1q_u8(q10.add(((kw0 >> 16) & 0xff) * 16)),
-                    vld1q_u8(q11.add(((kw1 >> 16) & 0xff) * 16)),
-                );
-                c13 = xor3_u8(
-                    c13,
-                    vld1q_u8(q10.add((kw0 >> 24) * 16)),
-                    vld1q_u8(q11.add((kw1 >> 24) * 16)),
-                );
-                p += 2;
-            }
-            if p < n_pairs {
-                let (q0, q1, jw, kw) = gather_pair!(p);
-                c00 = veorq_u8(c00, vld1q_u8(q0.add((jw & 0xff) * 16)));
-                c01 = veorq_u8(c01, vld1q_u8(q0.add(((jw >> 8) & 0xff) * 16)));
-                c02 = veorq_u8(c02, vld1q_u8(q0.add(((jw >> 16) & 0xff) * 16)));
-                c03 = veorq_u8(c03, vld1q_u8(q0.add((jw >> 24) * 16)));
-                c10 = veorq_u8(c10, vld1q_u8(q1.add((kw & 0xff) * 16)));
-                c11 = veorq_u8(c11, vld1q_u8(q1.add(((kw >> 8) & 0xff) * 16)));
-                c12 = veorq_u8(c12, vld1q_u8(q1.add(((kw >> 16) & 0xff) * 16)));
-                c13 = veorq_u8(c13, vld1q_u8(q1.add((kw >> 24) * 16)));
+                // C side: the pairing masks distribute over the word, so one
+                // mask/shift sequence builds all 4 lanes' j (and k) at once.
+                // Per byte this is the same `(ce & 0x55) | ((co << 1) & 0xaa)`
+                // as the scalar form: the `<< 1` cannot carry across a byte
+                // boundary because a bit at even position 2i moves to odd
+                // position 2i+1 of the SAME byte (bit 7 is masked out by
+                // 0xaa's byte pattern before it could wrap).
+                let ce = (chunk_c_bytes[b_even].as_ptr().add(lane) as *const u32)
+                    .read_unaligned() as usize;
+                let co = (chunk_c_bytes[b_odd].as_ptr().add(lane) as *const u32)
+                    .read_unaligned() as usize;
+                let jw = (ce & 0x5555_5555) | ((co << 1) & 0xaaaa_aaaa);
+                let kw = (ce & 0xaaaa_aaaa) | ((co >> 1) & 0x5555_5555);
+                let j0 = jw & 0xff;
+                let j1 = (jw >> 8) & 0xff;
+                let j2 = (jw >> 16) & 0xff;
+                let j3 = jw >> 24;
+                let k0 = kw & 0xff;
+                let k1 = (kw >> 8) & 0xff;
+                let k2 = (kw >> 16) & 0xff;
+                let k3 = kw >> 24;
+                c00 = veorq_u8(c00, vld1q_u8(q0.add(j0 * 16)));
+                c01 = veorq_u8(c01, vld1q_u8(q0.add(j1 * 16)));
+                c02 = veorq_u8(c02, vld1q_u8(q0.add(j2 * 16)));
+                c03 = veorq_u8(c03, vld1q_u8(q0.add(j3 * 16)));
+                c10 = veorq_u8(c10, vld1q_u8(q1.add(k0 * 16)));
+                c11 = veorq_u8(c11, vld1q_u8(q1.add(k1 * 16)));
+                c12 = veorq_u8(c12, vld1q_u8(q1.add(k2 * 16)));
+                c13 = veorq_u8(c13, vld1q_u8(q1.add(k3 * 16)));
             }
 
             // Odd trailing b_med: unpaired fallback.
             if n_b_med & 1 == 1 {
                 let b_med = n_b_med - 1;
                 let table = convert_ptr.add(b_med * 256 * 16);
-                let wa = (chunk_ab_bytes[b_med].as_ptr().add(lane) as *const u32).read_unaligned()
-                    as usize;
-                let wc = (chunk_c_bytes[b_med].as_ptr().add(lane) as *const u32).read_unaligned()
-                    as usize;
+                let wa = (chunk_ab_bytes[b_med].as_ptr().add(lane) as *const u32)
+                    .read_unaligned() as usize;
+                let wc = (chunk_c_bytes[b_med].as_ptr().add(lane) as *const u32)
+                    .read_unaligned() as usize;
                 let a0 = wa & 0xff;
                 let a1 = (wa >> 8) & 0xff;
                 let a2 = (wa >> 16) & 0xff;
@@ -396,28 +295,6 @@ unsafe fn xor3_u64(
     c: core::arch::aarch64::uint64x2_t,
 ) -> core::arch::aarch64::uint64x2_t {
     unsafe { core::arch::aarch64::veorq_u64(a, core::arch::aarch64::veorq_u64(b, c)) }
-}
-
-// The SHA3 extension includes EOR3; retain the two-EOR form for generic
-// AArch64 builds that do not enable it.
-#[cfg(target_feature = "sha3")]
-#[inline(always)]
-unsafe fn xor3_u8(
-    a: core::arch::aarch64::uint8x16_t,
-    b: core::arch::aarch64::uint8x16_t,
-    c: core::arch::aarch64::uint8x16_t,
-) -> core::arch::aarch64::uint8x16_t {
-    unsafe { core::arch::aarch64::veor3q_u8(a, b, c) }
-}
-
-#[cfg(not(target_feature = "sha3"))]
-#[inline(always)]
-unsafe fn xor3_u8(
-    a: core::arch::aarch64::uint8x16_t,
-    b: core::arch::aarch64::uint8x16_t,
-    c: core::arch::aarch64::uint8x16_t,
-) -> core::arch::aarch64::uint8x16_t {
-    unsafe { core::arch::aarch64::veorq_u8(a, core::arch::aarch64::veorq_u8(b, c)) }
 }
 
 /// NEON 64-byte bit-transpose. Two-stage:
@@ -639,88 +516,6 @@ unsafe fn xor_apply_byte_into_8_regs<const BH: usize, const ODD: bool>(
     }
 }
 
-#[cfg(target_arch = "aarch64")]
-#[inline(always)]
-unsafe fn xor_apply_byte_pair_into_8_regs<
-    const BH0: usize,
-    const ODD0: bool,
-    const BH1: usize,
-    const ODD1: bool,
->(
-    table_base: *const u8,
-    half_swapped_table_base: *const u8,
-    a_byte0: usize,
-    b_byte0: usize,
-    a_byte1: usize,
-    b_byte1: usize,
-    da0: &mut core::arch::aarch64::uint8x16_t,
-    da1: &mut core::arch::aarch64::uint8x16_t,
-    da2: &mut core::arch::aarch64::uint8x16_t,
-    da3: &mut core::arch::aarch64::uint8x16_t,
-    db0: &mut core::arch::aarch64::uint8x16_t,
-    db1: &mut core::arch::aarch64::uint8x16_t,
-    db2: &mut core::arch::aarch64::uint8x16_t,
-    db3: &mut core::arch::aarch64::uint8x16_t,
-) {
-    use core::arch::aarch64::*;
-    unsafe {
-        let table0 = if ODD0 {
-            half_swapped_table_base
-        } else {
-            table_base
-        };
-        let table1 = if ODD1 {
-            half_swapped_table_base
-        } else {
-            table_base
-        };
-        let ra0 = table0.add(a_byte0 * 64);
-        let rb0 = table0.add(b_byte0 * 64);
-        let ra1 = table1.add(a_byte1 * 64);
-        let rb1 = table1.add(b_byte1 * 64);
-        *da0 = xor3_u8(
-            *da0,
-            vld1q_u8(ra0.add((0 ^ BH0) * 16)),
-            vld1q_u8(ra1.add((0 ^ BH1) * 16)),
-        );
-        *da1 = xor3_u8(
-            *da1,
-            vld1q_u8(ra0.add((1 ^ BH0) * 16)),
-            vld1q_u8(ra1.add((1 ^ BH1) * 16)),
-        );
-        *da2 = xor3_u8(
-            *da2,
-            vld1q_u8(ra0.add((2 ^ BH0) * 16)),
-            vld1q_u8(ra1.add((2 ^ BH1) * 16)),
-        );
-        *da3 = xor3_u8(
-            *da3,
-            vld1q_u8(ra0.add((3 ^ BH0) * 16)),
-            vld1q_u8(ra1.add((3 ^ BH1) * 16)),
-        );
-        *db0 = xor3_u8(
-            *db0,
-            vld1q_u8(rb0.add((0 ^ BH0) * 16)),
-            vld1q_u8(rb1.add((0 ^ BH1) * 16)),
-        );
-        *db1 = xor3_u8(
-            *db1,
-            vld1q_u8(rb0.add((1 ^ BH0) * 16)),
-            vld1q_u8(rb1.add((1 ^ BH1) * 16)),
-        );
-        *db2 = xor3_u8(
-            *db2,
-            vld1q_u8(rb0.add((2 ^ BH0) * 16)),
-            vld1q_u8(rb1.add((2 ^ BH1) * 16)),
-        );
-        *db3 = xor3_u8(
-            *db3,
-            vld1q_u8(rb0.add((3 ^ BH0) * 16)),
-            vld1q_u8(rb1.add((3 ^ BH1) * 16)),
-        );
-    }
-}
-
 /// Process one K-row: 8 byte positions of `a` and `b` via the inv_NTT table,
 /// F_8 multiply, widen-shift by K, XOR into the four `(acc_lo, acc_hi)` pairs.
 #[cfg(target_arch = "aarch64")]
@@ -757,12 +552,24 @@ unsafe fn fused_apply_one_k<const K: i32>(
         let mut db2 = vld1q_u8(rb0.add(32));
         let mut db3 = vld1q_u8(rb0.add(48));
 
-        // b = 1..6: consume two table rows per EOR3, permuted per (BH, ODD).
-        xor_apply_byte_pair_into_8_regs::<0, true, 1, false>(
+        // b = 1..7: XOR with table row[bytes[b]], permuted per (BH, ODD).
+        xor_apply_byte_into_8_regs::<0, true>(
             table_base,
             half_swapped_table_base,
             byte_from_word::<1>(a_word),
             byte_from_word::<1>(b_word),
+            &mut da0,
+            &mut da1,
+            &mut da2,
+            &mut da3,
+            &mut db0,
+            &mut db1,
+            &mut db2,
+            &mut db3,
+        );
+        xor_apply_byte_into_8_regs::<1, false>(
+            table_base,
+            half_swapped_table_base,
             byte_from_word::<2>(a_word),
             byte_from_word::<2>(b_word),
             &mut da0,
@@ -774,11 +581,23 @@ unsafe fn fused_apply_one_k<const K: i32>(
             &mut db2,
             &mut db3,
         );
-        xor_apply_byte_pair_into_8_regs::<1, true, 2, false>(
+        xor_apply_byte_into_8_regs::<1, true>(
             table_base,
             half_swapped_table_base,
             byte_from_word::<3>(a_word),
             byte_from_word::<3>(b_word),
+            &mut da0,
+            &mut da1,
+            &mut da2,
+            &mut da3,
+            &mut db0,
+            &mut db1,
+            &mut db2,
+            &mut db3,
+        );
+        xor_apply_byte_into_8_regs::<2, false>(
+            table_base,
+            half_swapped_table_base,
             byte_from_word::<4>(a_word),
             byte_from_word::<4>(b_word),
             &mut da0,
@@ -790,11 +609,23 @@ unsafe fn fused_apply_one_k<const K: i32>(
             &mut db2,
             &mut db3,
         );
-        xor_apply_byte_pair_into_8_regs::<2, true, 3, false>(
+        xor_apply_byte_into_8_regs::<2, true>(
             table_base,
             half_swapped_table_base,
             byte_from_word::<5>(a_word),
             byte_from_word::<5>(b_word),
+            &mut da0,
+            &mut da1,
+            &mut da2,
+            &mut da3,
+            &mut db0,
+            &mut db1,
+            &mut db2,
+            &mut db3,
+        );
+        xor_apply_byte_into_8_regs::<3, false>(
+            table_base,
+            half_swapped_table_base,
             byte_from_word::<6>(a_word),
             byte_from_word::<6>(b_word),
             &mut da0,
@@ -806,7 +637,6 @@ unsafe fn fused_apply_one_k<const K: i32>(
             &mut db2,
             &mut db3,
         );
-        // b = 7: one trailing row.
         xor_apply_byte_into_8_regs::<3, true>(
             table_base,
             half_swapped_table_base,

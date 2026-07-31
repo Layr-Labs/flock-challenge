@@ -8,20 +8,6 @@ struct WideNeon {
     hi: uint64x2_t,
 }
 
-// The SHA3 extension includes EOR3; retain the two-EOR form for generic
-// AArch64 builds that do not enable it.
-#[cfg(target_feature = "sha3")]
-#[inline(always)]
-unsafe fn xor3_u64(a: uint64x2_t, b: uint64x2_t, c: uint64x2_t) -> uint64x2_t {
-    unsafe { veor3q_u64(a, b, c) }
-}
-
-#[cfg(not(target_feature = "sha3"))]
-#[inline(always)]
-unsafe fn xor3_u64(a: uint64x2_t, b: uint64x2_t, c: uint64x2_t) -> uint64x2_t {
-    unsafe { veorq_u64(a, veorq_u64(b, c)) }
-}
-
 #[inline]
 #[target_feature(enable = "aes")]
 unsafe fn pmull(a: u64, b: u64) -> uint64x2_t {
@@ -49,8 +35,8 @@ unsafe fn mul_const_vec2(r: uint64x2_t, x0: uint64x2_t, x1: uint64x2_t) -> [uint
         let p1_ll = pmull(vgetq_lane_u64::<0>(x1), r_lo);
         let p1_hh = pmull(vgetq_lane_u64::<1>(x1), r_hi);
         let p1_mm = pmull(vgetq_lane_u64::<0>(x1_mid), vgetq_lane_u64::<0>(r_mid));
-        let c0 = xor3_u64(p0_mm, p0_ll, p0_hh);
-        let c1 = xor3_u64(p1_mm, p1_ll, p1_hh);
+        let c0 = veorq_u64(veorq_u64(p0_mm, p0_ll), p0_hh);
+        let c1 = veorq_u64(veorq_u64(p1_mm, p1_ll), p1_hh);
 
         // Pack product 0/1 into lanes and reduce both together.
         let r0 = vzip1q_u64(p0_ll, p1_ll);
@@ -64,19 +50,17 @@ unsafe fn mul_const_vec2(r: uint64x2_t, x0: uint64x2_t, x1: uint64x2_t) -> [uint
         let s2_hi = veorq_u64(vshlq_n_u64::<2>(r3), vshrq_n_u64::<62>(r2));
         let s7_lo = vshlq_n_u64::<7>(r2);
         let s7_hi = veorq_u64(vshlq_n_u64::<7>(r3), vshrq_n_u64::<57>(r2));
-        let t_lo = xor3_u64(r2, s1_lo, veorq_u64(s2_lo, s7_lo));
-        let t_hi = xor3_u64(r3, s1_hi, veorq_u64(s2_hi, s7_hi));
-        let overflow = xor3_u64(
-            vshrq_n_u64::<63>(r3),
-            vshrq_n_u64::<62>(r3),
+        let t_lo = veorq_u64(veorq_u64(r2, s1_lo), veorq_u64(s2_lo, s7_lo));
+        let t_hi = veorq_u64(veorq_u64(r3, s1_hi), veorq_u64(s2_hi, s7_hi));
+        let overflow = veorq_u64(
+            veorq_u64(vshrq_n_u64::<63>(r3), vshrq_n_u64::<62>(r3)),
             vshrq_n_u64::<57>(r3),
         );
-        let correction = xor3_u64(
-            overflow,
-            vshlq_n_u64::<1>(overflow),
+        let correction = veorq_u64(
+            veorq_u64(overflow, vshlq_n_u64::<1>(overflow)),
             veorq_u64(vshlq_n_u64::<2>(overflow), vshlq_n_u64::<7>(overflow)),
         );
-        let out_lo = xor3_u64(r0, t_lo, correction);
+        let out_lo = veorq_u64(veorq_u64(r0, t_lo), correction);
         let out_hi = veorq_u64(r1, t_hi);
         [vzip1q_u64(out_lo, out_hi), vzip2q_u64(out_lo, out_hi)]
     }
@@ -91,7 +75,7 @@ unsafe fn mul_unreduced(a: uint64x2_t, b: uint64x2_t) -> WideNeon {
         let a_mid = veorq_u64(a, vextq_u64::<1>(a, a));
         let b_mid = veorq_u64(b, vextq_u64::<1>(b, b));
         let middle = pmull(vgetq_lane_u64::<0>(a_mid), vgetq_lane_u64::<0>(b_mid));
-        let cross = xor3_u64(middle, ll, hh);
+        let cross = veorq_u64(veorq_u64(middle, ll), hh);
         let zero = vdupq_n_u64(0);
         WideNeon {
             lo: veorq_u64(ll, vextq_u64::<1>(zero, cross)),
@@ -125,19 +109,17 @@ unsafe fn reduce_wide(value: WideNeon) -> uint64x2_t {
             vshlq_n_u64::<7>(high),
             vextq_u64::<1>(zero, vshrq_n_u64::<57>(high)),
         );
-        let folded = xor3_u64(high, shift1, veorq_u64(shift2, shift7));
+        let folded = veorq_u64(veorq_u64(high, shift1), veorq_u64(shift2, shift7));
         let high_word = vextq_u64::<1>(high, zero);
-        let overflow = xor3_u64(
-            vshrq_n_u64::<63>(high_word),
-            vshrq_n_u64::<62>(high_word),
+        let overflow = veorq_u64(
+            veorq_u64(vshrq_n_u64::<63>(high_word), vshrq_n_u64::<62>(high_word)),
             vshrq_n_u64::<57>(high_word),
         );
-        let correction = xor3_u64(
-            overflow,
-            vshlq_n_u64::<1>(overflow),
+        let correction = veorq_u64(
+            veorq_u64(overflow, vshlq_n_u64::<1>(overflow)),
             veorq_u64(vshlq_n_u64::<2>(overflow), vshlq_n_u64::<7>(overflow)),
         );
-        xor3_u64(value.lo, folded, correction)
+        veorq_u64(value.lo, veorq_u64(folded, correction))
     }
 }
 

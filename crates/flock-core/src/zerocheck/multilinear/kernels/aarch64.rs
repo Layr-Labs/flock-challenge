@@ -7,28 +7,6 @@ struct WideNeon {
     hi: core::arch::aarch64::uint64x2_t,
 }
 
-// The SHA3 extension includes EOR3; retain the two-EOR form for generic
-// AArch64 builds that do not enable it.
-#[cfg(target_feature = "sha3")]
-#[inline(always)]
-unsafe fn xor3_u64(
-    a: core::arch::aarch64::uint64x2_t,
-    b: core::arch::aarch64::uint64x2_t,
-    c: core::arch::aarch64::uint64x2_t,
-) -> core::arch::aarch64::uint64x2_t {
-    unsafe { core::arch::aarch64::veor3q_u64(a, b, c) }
-}
-
-#[cfg(not(target_feature = "sha3"))]
-#[inline(always)]
-unsafe fn xor3_u64(
-    a: core::arch::aarch64::uint64x2_t,
-    b: core::arch::aarch64::uint64x2_t,
-    c: core::arch::aarch64::uint64x2_t,
-) -> core::arch::aarch64::uint64x2_t {
-    unsafe { core::arch::aarch64::veorq_u64(a, core::arch::aarch64::veorq_u64(b, c)) }
-}
-
 #[cfg(target_arch = "aarch64")]
 #[inline]
 #[target_feature(enable = "aes")]
@@ -55,7 +33,7 @@ unsafe fn karatsuba_products_q(
         let a_sum = veorq_u64(a, vextq_u64::<1>(a, a));
         let b_sum = veorq_u64(b, vextq_u64::<1>(b, b));
         let pm = pmull_lane(vgetq_lane_u64::<0>(a_sum), vgetq_lane_u64::<0>(b_sum));
-        let cross = xor3_u64(pm, p0, p2);
+        let cross = veorq_u64(veorq_u64(pm, p0), p2);
         (p0, cross, p2)
     }
 }
@@ -73,17 +51,12 @@ unsafe fn mul_q(
         let zero = vdupq_n_u64(0);
         let (t0, mut t1, t2) = karatsuba_products_q(a, b);
 
-        t1 = xor3_u64(
-            t1,
-            vextq_u64::<1>(zero, t2),
-            pmull_lane(vgetq_lane_u64::<1>(t2), 0x87),
-        );
+        t1 = veorq_u64(t1, vextq_u64::<1>(zero, t2));
+        t1 = veorq_u64(t1, pmull_lane(vgetq_lane_u64::<1>(t2), 0x87));
 
-        xor3_u64(
-            t0,
-            vextq_u64::<1>(zero, t1),
-            pmull_lane(vgetq_lane_u64::<1>(t1), 0x87),
-        )
+        let mut out = veorq_u64(t0, vextq_u64::<1>(zero, t1));
+        out = veorq_u64(out, pmull_lane(vgetq_lane_u64::<1>(t1), 0x87));
+        out
     }
 }
 
@@ -134,22 +107,20 @@ unsafe fn reduce_wide_q(value: WideNeon) -> core::arch::aarch64::uint64x2_t {
             vshlq_n_u64::<7>(hi),
             vextq_u64::<1>(zero, vshrq_n_u64::<57>(hi)),
         );
-        let folded = xor3_u64(hi, shift1, veorq_u64(shift2, shift7));
+        let folded = veorq_u64(veorq_u64(hi, shift1), veorq_u64(shift2, shift7));
 
         // Only r3 (the high lane) can overflow the 128-bit fold. Move it to
         // the low lane so the correction lands in result coefficient 0.
         let r3 = vextq_u64::<1>(hi, zero);
-        let ov = xor3_u64(
-            vshrq_n_u64::<63>(r3),
-            vshrq_n_u64::<62>(r3),
+        let ov = veorq_u64(
+            veorq_u64(vshrq_n_u64::<63>(r3), vshrq_n_u64::<62>(r3)),
             vshrq_n_u64::<57>(r3),
         );
-        let corr = xor3_u64(
-            ov,
-            vshlq_n_u64::<1>(ov),
+        let corr = veorq_u64(
+            veorq_u64(ov, vshlq_n_u64::<1>(ov)),
             veorq_u64(vshlq_n_u64::<2>(ov), vshlq_n_u64::<7>(ov)),
         );
-        xor3_u64(value.lo, folded, corr)
+        veorq_u64(value.lo, veorq_u64(folded, corr))
     }
 }
 
@@ -162,26 +133,14 @@ unsafe fn fold_row_q(
     use core::arch::aarch64::*;
     unsafe {
         const STRIDE: usize = 256 * 16;
-        let entry = |chunk: usize| {
-            table_data.add(
+        let mut acc = vreinterpretq_u64_u8(vld1q_u8(table_data.add((*bytes_ptr) as usize * 16)));
+        for chunk in 1..8 {
+            let entry = table_data.add(
                 chunk * STRIDE + (*bytes_ptr.add(chunk)) as usize * core::mem::size_of::<F128>(),
-            )
-        };
-        let a = xor3_u64(
-            vreinterpretq_u64_u8(vld1q_u8(entry(0))),
-            vreinterpretq_u64_u8(vld1q_u8(entry(1))),
-            vreinterpretq_u64_u8(vld1q_u8(entry(2))),
-        );
-        let b = xor3_u64(
-            vreinterpretq_u64_u8(vld1q_u8(entry(3))),
-            vreinterpretq_u64_u8(vld1q_u8(entry(4))),
-            vreinterpretq_u64_u8(vld1q_u8(entry(5))),
-        );
-        let c = veorq_u64(
-            vreinterpretq_u64_u8(vld1q_u8(entry(6))),
-            vreinterpretq_u64_u8(vld1q_u8(entry(7))),
-        );
-        xor3_u64(a, b, c)
+            );
+            acc = veorq_u64(acc, vreinterpretq_u64_u8(vld1q_u8(entry)));
+        }
+        acc
     }
 }
 
@@ -205,33 +164,50 @@ unsafe fn fold_four_row_codes_q(
     use core::arch::aarch64::*;
     unsafe {
         const STRIDE: usize = 256 * 16;
-        let load = |row: u64, chunk: usize| {
+        let mut acc0 = vdupq_n_u64(0);
+        let mut acc1 = vdupq_n_u64(0);
+        let mut acc2 = vdupq_n_u64(0);
+        let mut acc3 = vdupq_n_u64(0);
+        for chunk in 0..8 {
             let shift = 8 * chunk;
             let offset = chunk * STRIDE;
-            let index = ((row >> shift) & 0xff) as usize;
-            vld1q_u64(
-                table_data
-                    .add(offset + index * core::mem::size_of::<F128>())
-                    .cast::<u64>(),
-            )
-        };
-
-        // Retain the four independent row streams while consuming two new
-        // table rows per dependent accumulator update.
-        let mut acc0 = load(row0, 0);
-        let mut acc1 = load(row1, 0);
-        let mut acc2 = load(row2, 0);
-        let mut acc3 = load(row3, 0);
-        for chunk in (1..7).step_by(2) {
-            acc0 = xor3_u64(acc0, load(row0, chunk), load(row0, chunk + 1));
-            acc1 = xor3_u64(acc1, load(row1, chunk), load(row1, chunk + 1));
-            acc2 = xor3_u64(acc2, load(row2, chunk), load(row2, chunk + 1));
-            acc3 = xor3_u64(acc3, load(row3, chunk), load(row3, chunk + 1));
+            let index0 = ((row0 >> shift) & 0xff) as usize;
+            let index1 = ((row1 >> shift) & 0xff) as usize;
+            let index2 = ((row2 >> shift) & 0xff) as usize;
+            let index3 = ((row3 >> shift) & 0xff) as usize;
+            acc0 = veorq_u64(
+                acc0,
+                vld1q_u64(
+                    table_data
+                        .add(offset + index0 * core::mem::size_of::<F128>())
+                        .cast::<u64>(),
+                ),
+            );
+            acc1 = veorq_u64(
+                acc1,
+                vld1q_u64(
+                    table_data
+                        .add(offset + index1 * core::mem::size_of::<F128>())
+                        .cast::<u64>(),
+                ),
+            );
+            acc2 = veorq_u64(
+                acc2,
+                vld1q_u64(
+                    table_data
+                        .add(offset + index2 * core::mem::size_of::<F128>())
+                        .cast::<u64>(),
+                ),
+            );
+            acc3 = veorq_u64(
+                acc3,
+                vld1q_u64(
+                    table_data
+                        .add(offset + index3 * core::mem::size_of::<F128>())
+                        .cast::<u64>(),
+                ),
+            );
         }
-        acc0 = veorq_u64(acc0, load(row0, 7));
-        acc1 = veorq_u64(acc1, load(row1, 7));
-        acc2 = veorq_u64(acc2, load(row2, 7));
-        acc3 = veorq_u64(acc3, load(row3, 7));
         (acc0, acc1, acc2, acc3)
     }
 }
