@@ -436,11 +436,25 @@ fn hash_leaves(data: &[u8], leaf_size: usize, out: &mut [Hash], kind: HashKind) 
     }
     match kind {
         HashKind::Blake3 if blake3_leaf_size_is_batchable(leaf_size) => {
-            out.par_chunks_mut(BLAKE3_GROUP)
-                .zip(data.par_chunks(BLAKE3_GROUP * leaf_size))
-                .for_each(|(outs, leaves)| {
-                    blake3_hash_many_leaves(leaves, leaf_size, outs);
-                });
+            // Chunk-queue dispatch instead of a static rayon split so the
+            // efficiency-core helper pool (when present) can drain leaves
+            // alongside the main pool — see `epool`. Chunk `i` writes only
+            // `out[i*C..(i+1)*C]`, so output is byte-identical to the static
+            // split regardless of which pool claims which chunk.
+            let n = out.len();
+            let out_base = crate::epool::SyncPtr(out.as_mut_ptr());
+            crate::epool::run_hetero_chunks(n.div_ceil(BLAKE3_LEAF_QUEUE_CHUNK), |i| {
+                let start = i * BLAKE3_LEAF_QUEUE_CHUNK;
+                let end = (start + BLAKE3_LEAF_QUEUE_CHUNK).min(n);
+                // SAFETY: `Hash` is `[u8; 32]` (Copy, no padding); the queue
+                // hands out each `i` exactly once and the `[start, end)`
+                // ranges are pairwise disjoint and in-bounds (`end <= n`),
+                // so each closure holds the only `&mut` into its range.
+                let outs = unsafe {
+                    core::slice::from_raw_parts_mut(out_base.ptr().add(start), end - start)
+                };
+                blake3_hash_many_leaves(&data[start * leaf_size..end * leaf_size], leaf_size, outs);
+            });
         }
         HashKind::Blake3 => out
             .par_iter_mut()
@@ -473,6 +487,14 @@ fn hash_leaves(data: &[u8], leaf_size: usize, out: &mut [Hash], kind: HashKind) 
 /// Nodes per rayon task in the batched BLAKE3 paths: enough to amortize task
 /// dispatch over many `hash_many` calls, small enough to stay cache-resident.
 const BLAKE3_GROUP: usize = 1024;
+
+/// Leaves per queue chunk in the batched BLAKE3 leaf path (see `epool`).
+/// A multiple of 12 so every full chunk runs entirely through the twelve-way
+/// kernel with no per-chunk tail; small enough (240 KiB of input at the
+/// ranked 1 KiB leaves) that the worst-case tail wait — the last chunk
+/// claimed by an efficiency core — is a fraction of a millisecond, while an
+/// atomic claim per 240 leaves stays far below dispatch noise.
+const BLAKE3_LEAF_QUEUE_CHUNK: usize = 240;
 
 /// Hash one internal level: `write[i] = hash_pair(read[2i], read[2i+1])`.
 ///
@@ -1203,6 +1225,54 @@ mod tests {
             *b = ((z >> 33) & 0xff) as u8;
         }
         data
+    }
+
+    /// The hetero chunk-queue leaf dispatch, driven with a forced helper
+    /// pool through the exact production closure shape, is byte-identical to
+    /// the main-pool-only path (which `blake3_batched_matches_scalar_spec`
+    /// ties to the scalar specification). Covers chunk-boundary counts and
+    /// jobs on both sides of the helper-engagement threshold.
+    #[test]
+    fn blake3_leaf_queue_with_helper_matches_plain() {
+        let helper = rayon::ThreadPoolBuilder::new()
+            .num_threads(3)
+            .build()
+            .unwrap();
+        for (n, leaf_size) in [
+            (1usize, 1024usize),
+            (239, 1024),
+            (240, 64),
+            (241, 512),
+            (4096, 1024),
+            (5000, 128),
+        ] {
+            let data = random_data(n, leaf_size, 0xE0C0_4E57);
+            let mut expect = vec![[0u8; 32]; n];
+            hash_leaves(&data, leaf_size, &mut expect, HashKind::Blake3);
+
+            let mut got = vec![[0u8; 32]; n];
+            let out_base = crate::epool::SyncPtr(got.as_mut_ptr());
+            let data_ref = data.as_slice();
+            crate::epool::run_chunks_with_helper(
+                n.div_ceil(BLAKE3_LEAF_QUEUE_CHUNK),
+                &|i| {
+                    let start = i * BLAKE3_LEAF_QUEUE_CHUNK;
+                    let end = (start + BLAKE3_LEAF_QUEUE_CHUNK).min(n);
+                    // SAFETY: same contract as the production call site —
+                    // disjoint in-bounds ranges, each chunk claimed once.
+                    let outs = unsafe {
+                        core::slice::from_raw_parts_mut(out_base.ptr().add(start), end - start)
+                    };
+                    blake3_hash_many_leaves(
+                        &data_ref[start * leaf_size..end * leaf_size],
+                        leaf_size,
+                        outs,
+                    );
+                },
+                Some(&helper),
+            );
+            assert_eq!(expect, got, "n={n} leaf_size={leaf_size}");
+        }
     }
 
     #[test]
