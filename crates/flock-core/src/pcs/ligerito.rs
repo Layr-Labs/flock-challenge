@@ -2204,6 +2204,44 @@ pub(crate) fn induce_sumcheck_poly_via_ntt(
     (coeffs, enforced_sum)
 }
 
+/// Whether the sparse transpose-NTT induction wins for this shape.
+#[inline]
+fn induce_sumcheck_poly_uses_ntt(
+    log_msg_cols: usize,
+    log_inv_rate: usize,
+    n_queries: usize,
+) -> bool {
+    let log_block = log_msg_cols + log_inv_rate;
+    log_msg_cols >= 12 && n_queries > 4 * (1usize << log_inv_rate) * log_block.max(1)
+}
+
+/// The ranked induction NTT's output buffer is returned through a dedicated
+/// scratch handoff after its one use as an introduced sumcheck basis. Keep a
+/// switch for same-binary A/B work without making normal configurations pay a
+/// branch in their hot loops.
+#[inline]
+fn induced_basis_buffer_pool_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("FLOCK_NO_INDUCED_BASIS_POOL").is_none())
+}
+
+/// Take the L0 induction buffer without stealing a much larger resident
+/// allocation from another phase. The warm proof seeds this exact 16 MiB class;
+/// before that happens, allocating a fresh small buffer is preferable to
+/// consuming a 256 MiB+ sumcheck spare for an 8–16 MiB calculation.
+fn take_induced_basis_buffer(n: usize) -> Vec<F128> {
+    if induced_basis_buffer_pool_enabled() {
+        if let Some(buffer) = crate::scratch::try_take_f128(n) {
+            if buffer.capacity() <= n.saturating_mul(2) {
+                return buffer;
+            }
+            crate::scratch::give_f128(buffer);
+        }
+    }
+    crate::alloc_uninit_vec(n)
+}
+
 /// Cost-based dispatch between the dense [`induce_sumcheck_poly`] and the
 /// sparse-NTT [`induce_sumcheck_poly_via_ntt`].
 ///
@@ -2228,10 +2266,7 @@ pub(crate) fn induce_sumcheck_poly_auto(
     queries: &[usize],
     alpha: &[F128],
 ) -> (Vec<F128>, F128) {
-    let log_block = log_msg_cols + log_inv_rate;
-    let use_ntt =
-        log_msg_cols >= 12 && queries.len() > 4 * (1usize << log_inv_rate) * log_block.max(1);
-    if use_ntt {
+    if induce_sumcheck_poly_uses_ntt(log_msg_cols, log_inv_rate, queries.len()) {
         induce_sumcheck_poly_via_ntt(
             log_msg_cols,
             log_inv_rate,
@@ -2321,7 +2356,15 @@ fn transpose_forward_ntt_sparse(
 
     // Densify (active windows only; the rest stay zero, which is the correct
     // post-step-(k-1) state for an all-zero window).
-    let mut data = vec![F128::ZERO; n];
+    // The ranked L0 induction has a 2^20-element work buffer (16 MiB) here.
+    // The sparse NTT returns its low half as the introduced sumcheck basis;
+    // `glue_induced_buffer` below returns that original allocation after the
+    // basis is consumed. Reusing it moves its allocation, page faults, and
+    // eventual unmap into the worker's untimed warm proof. The full buffer
+    // must still be zeroed because only active sparse-prefix windows are
+    // copied below.
+    let mut data = take_induced_basis_buffer(n);
+    data.fill(F128::ZERO);
     for (w, buf) in processed {
         data[(w << k)..((w + 1) << k)].copy_from_slice(&buf);
     }
@@ -3239,9 +3282,10 @@ impl SumcheckProver {
         (msg, h_new)
     }
 
-    /// Combine the introduced basis into `combined_basis` with separation α.
+    /// Combine the introduced basis into `combined_basis` with separation α,
+    /// returning the now-dead basis buffer to its caller.
     /// `combined_basis[j] += α · b_new[j]` (pointwise), `T_r += α · h_new`.
-    pub fn glue(&mut self, alpha: F128) {
+    fn glue_take_basis(&mut self, alpha: F128) -> Vec<F128> {
         use rayon::prelude::*;
         let (b_new, h_new) = self
             .pending_glue
@@ -3261,6 +3305,20 @@ impl SumcheckProver {
                 .for_each(|(acc, &v)| *acc += alpha * v);
         }
         self.t_r += alpha * h_new;
+        b_new
+    }
+
+    /// Combine the introduced basis into `combined_basis` with separation α.
+    /// `combined_basis[j] += α · b_new[j]` (pointwise), `T_r += α · h_new`.
+    pub fn glue(&mut self, alpha: F128) {
+        drop(self.glue_take_basis(alpha));
+    }
+
+    /// [`Self::glue`] for an introduced basis that came from the prover's
+    /// scratch pool. Returning it after the pointwise combine lets the next
+    /// proof reuse its already-resident backing allocation.
+    fn glue_induced_buffer(&mut self, alpha: F128) {
+        crate::scratch::give_f128(self.glue_take_basis(alpha));
     }
 
     pub fn f(&self) -> &[F128] {
@@ -3830,6 +3888,8 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
     // levels stay dense).
     let sks_vks_n1 = eval_sk_at_vks(n1);
     let _t = std::time::Instant::now();
+    let recycle_induced_basis = induced_basis_buffer_pool_enabled()
+        && induce_sumcheck_poly_uses_ntt(n1, log_inv_rate_0, queries_0.len());
     let (basis_0_induced, enforced_sum_0) = induce_sumcheck_poly_auto(
         n1,
         log_inv_rate_0,
@@ -3857,7 +3917,11 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
     challenger.observe_f128(intro_msg_0.u_0);
     challenger.observe_f128(intro_msg_0.u_2);
     let beta_0 = challenger.sample_f128();
-    sc_prover.glue(beta_0);
+    if recycle_induced_basis {
+        sc_prover.glue_induced_buffer(beta_0);
+    } else {
+        sc_prover.glue(beta_0);
+    }
     if trace {
         t_intro_glue += _t.elapsed();
     }
@@ -6337,7 +6401,10 @@ mod tests {
             .fold(F128::ZERO, |a, v| a + v);
         prover.introduce_new(b2_folded.clone(), h2_folded);
         let alpha = ch.sample_f128();
-        prover.glue(alpha);
+        // Exercise the same recycle-after-glue handoff used by the ranked
+        // sparse induced basis. It must be transcript/state identical to the
+        // ordinary glue path.
+        prover.glue_induced_buffer(alpha);
 
         // Continue folding to length 2 residual: n total fold-vars used, but
         // we've already used 1 (r0). One more r_last is the verifier's final.
