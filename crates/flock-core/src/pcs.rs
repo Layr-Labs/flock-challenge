@@ -334,66 +334,94 @@ fn compute_combined_basis_and_target<Ch: Challenger>(
         // sweep: the table build wouldn't amortize below ~2^12 slots.
         const COMPOSE_MIN_BLOCK: usize = 1 << 12;
         let composed = b >= COMPOSE_MIN_BLOCK;
-        b_combined
-            .par_chunks_mut(b)
-            .enumerate()
-            .map_init(
-                || {
+        // Chunk-queue dispatch instead of a static rayon split so the
+        // efficiency-core helper pool (when present) can drain blocks
+        // alongside the main pool — see `epool`. Block `hi` writes only
+        // `b_combined[hi·b..(hi+1)·b]` and its own partial slot, so output is
+        // byte-identical to the static split regardless of which pool claims
+        // which block (F128 addition is XOR, so the index-ordered partial
+        // reduction below is also order-independent).
+        let n_blocks = l.div_ceil(b);
+        let out_base = crate::epool::SyncPtr(b_combined.as_mut_ptr());
+        let mut partials: Vec<(F128, F128)> = vec![(F128::ZERO, F128::ZERO); n_blocks];
+        let partials_base = crate::epool::SyncPtr(partials.as_mut_ptr());
+        // One live compose table per worker thread (main pool, helper pool, or
+        // the caller), reused across blocks and claims — the queue-compatible
+        // replacement for the previous per-rayon-thread `map_init` buffer.
+        // `compose_fold_byte_table_into` overwrites every entry, so reuse
+        // (including across proofs) cannot leak state between blocks.
+        thread_local! {
+            static CTABLE: std::cell::RefCell<Vec<F128>> =
+                const { std::cell::RefCell::new(Vec::new()) };
+        }
+        crate::epool::run_hetero_chunks(n_blocks, |hi| {
+            let len = b.min(l - hi * b);
+            // SAFETY: the queue hands out each `hi` exactly once; the
+            // `[hi·b, hi·b+len)` output ranges and the per-`hi` partial slots
+            // are pairwise disjoint and in bounds, so this closure holds the
+            // only `&mut` into either range. `run_hetero_chunks` returns only
+            // after every chunk completes, which synchronizes these writes
+            // with the caller's reads below.
+            let out_block =
+                unsafe { core::slice::from_raw_parts_mut(out_base.ptr().add(hi * b), len) };
+            CTABLE.with(|ct| {
+                let mut ct = ct.borrow_mut();
+                if composed && ct.len() != ring_switch::FOLD_TABLE_LEN {
+                    ct.resize(ring_switch::FOLD_TABLE_LEN, F128::ZERO);
+                }
+                let ctable = &mut ct[..];
+                // Accumulate each claim's block: first claim writes, rest add.
+                // `e_hi` is folded into the composed table once per claim per
+                // block, then swept over eq_lo with no per-slot multiply.
+                for (ci, (eq_lo, eq_hi, table, _)) in rs_deferred.iter().enumerate() {
+                    let e_hi = eq_hi[hi];
                     if composed {
-                        vec![F128::ZERO; ring_switch::FOLD_TABLE_LEN]
-                    } else {
-                        Vec::new()
-                    }
-                },
-                |ctable, (hi, out_block)| {
-                    // Accumulate each claim's block: first claim writes, rest add.
-                    // `e_hi` is folded into the composed table once per claim per
-                    // block, then swept over eq_lo with no per-slot multiply.
-                    for (ci, (eq_lo, eq_hi, table, _)) in rs_deferred.iter().enumerate() {
-                        let e_hi = eq_hi[hi];
-                        if composed {
-                            ring_switch::compose_fold_byte_table_into(e_hi, table, ctable);
-                            if ci == 0 {
-                                for (slot, &lo) in out_block.iter_mut().zip(eq_lo.iter()) {
-                                    *slot = ring_switch::fold_one_slot(lo, ctable);
-                                }
-                            } else {
-                                for (slot, &lo) in out_block.iter_mut().zip(eq_lo.iter()) {
-                                    *slot += ring_switch::fold_one_slot(lo, ctable);
-                                }
-                            }
-                        } else if ci == 0 {
+                        ring_switch::compose_fold_byte_table_into(e_hi, table, ctable);
+                        if ci == 0 {
                             for (slot, &lo) in out_block.iter_mut().zip(eq_lo.iter()) {
-                                *slot = ring_switch::fold_one_slot(lo * e_hi, table);
+                                *slot = ring_switch::fold_one_slot(lo, ctable);
                             }
                         } else {
                             for (slot, &lo) in out_block.iter_mut().zip(eq_lo.iter()) {
-                                *slot += ring_switch::fold_one_slot(lo * e_hi, table);
+                                *slot += ring_switch::fold_one_slot(lo, ctable);
                             }
                         }
+                    } else if ci == 0 {
+                        for (slot, &lo) in out_block.iter_mut().zip(eq_lo.iter()) {
+                            *slot = ring_switch::fold_one_slot(lo * e_hi, table);
+                        }
+                    } else {
+                        for (slot, &lo) in out_block.iter_mut().zip(eq_lo.iter()) {
+                            *slot += ring_switch::fold_one_slot(lo * e_hi, table);
+                        }
                     }
-                    // Round-0 prime over this block's pairs (b is even, base is
-                    // even). Separate pass over the L2-resident block — fusing it
-                    // into the last claim's sweep measured slower (pairwise
-                    // stepping breaks the streaming store pattern).
-                    let base = hi * b;
-                    let mut u0 = F128::ZERO;
-                    let mut u2 = F128::ZERO;
-                    for t in 0..(b / 2) {
-                        let s0 = out_block[2 * t];
-                        let s1 = out_block[2 * t + 1];
-                        let a0 = packed_witness[base + 2 * t];
-                        let a1 = packed_witness[base + 2 * t + 1];
-                        u0 += a0 * s0;
-                        u2 += (a0 + a1) * (s0 + s1);
-                    }
-                    (u0, u2)
-                },
-            )
-            .reduce(
-                || (F128::ZERO, F128::ZERO),
-                |(x0, x2), (y0, y2)| (x0 + y0, x2 + y2),
-            )
+                }
+            });
+            // Round-0 prime over this block's pairs (b is even, base is
+            // even). Separate pass over the L2-resident block — fusing it
+            // into the last claim's sweep measured slower (pairwise
+            // stepping breaks the streaming store pattern).
+            let base = hi * b;
+            let mut u0 = F128::ZERO;
+            let mut u2 = F128::ZERO;
+            for t in 0..(len / 2) {
+                let s0 = out_block[2 * t];
+                let s1 = out_block[2 * t + 1];
+                let a0 = packed_witness[base + 2 * t];
+                let a1 = packed_witness[base + 2 * t + 1];
+                u0 += a0 * s0;
+                u2 += (a0 + a1) * (s0 + s1);
+            }
+            // SAFETY: disjoint per-`hi` slot; see the ownership comment above.
+            unsafe { *partials_base.ptr().add(hi) = (u0, u2) };
+        });
+        let mut u0 = F128::ZERO;
+        let mut u2 = F128::ZERO;
+        for &(p0, p2) in partials.iter() {
+            u0 += p0;
+            u2 += p2;
+        }
+        (u0, u2)
     } else {
         // General path (mixed / sparse / packed-direct): materialize any
         // deferred-dense claims (parallel block fold), then the per-element
