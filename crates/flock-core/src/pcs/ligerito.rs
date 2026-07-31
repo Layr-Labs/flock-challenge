@@ -3109,7 +3109,8 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
     assert_eq!(l0_codeword.len(), block_len_0 * num_interleaved_0);
     assert_eq!(l0_tree.len(), 2 * block_len_0 - 1);
 
-    let trace = std::env::var("LIG_PROVE_TRACE").is_ok();
+    let trace =
+        std::env::var("LIG_PROVE_TRACE").is_ok() || std::env::var_os("FLOCK_OPEN_TIMING").is_some();
     let mut t_init_sumcheck = std::time::Duration::ZERO;
     let mut t_commits = std::time::Duration::ZERO;
     let mut t_opens = std::time::Duration::ZERO;
@@ -3158,6 +3159,7 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
     challenger.observe_f128(start_msg.u_2);
 
     let mut r_lane_fold = Vec::with_capacity(initial_k);
+    let mut t_grind0 = std::time::Duration::ZERO;
     for j in 0..initial_k {
         // Fold-challenge grinding: the L0 proximity-gap bad event lives on
         // each of these lane-fold challenges, so each one is individually
@@ -3170,16 +3172,29 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
         // Derived from fold_grinding_bits + round index; not stored.
         let bits = fold_bits(0).saturating_sub(j as u32);
         if bits > 0 {
+            let _tg = std::time::Instant::now();
             fold_grinding_nonces.push(challenger.grind_pow(bits));
+            t_grind0 += _tg.elapsed();
         }
         let r = challenger.sample_f128();
+        let _tf = std::time::Instant::now();
         let msg = sc_prover.fold(r);
+        if trace {
+            eprintln!(
+                "    [init-fold] round {j}: fold {:.2} ms",
+                _tf.elapsed().as_secs_f64() * 1e3
+            );
+        }
         challenger.observe_f128(msg.u_0);
         challenger.observe_f128(msg.u_2);
         r_lane_fold.push(r);
     }
     if trace {
         t_init_sumcheck += _t.elapsed();
+        eprintln!(
+            "    [init-fold] initial_k={initial_k}, grind total {:.2} ms",
+            t_grind0.as_secs_f64() * 1e3
+        );
     }
 
     // Commit f^1 = folded packed witness as wtns_1.

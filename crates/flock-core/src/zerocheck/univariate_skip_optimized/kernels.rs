@@ -175,6 +175,7 @@ pub(super) fn accumulate_convert_with_s_hat_v(
     chunk_c_bytes: &[[u8; 64]; 16],
     n_b_med: usize,
     convert: &[super::F128],
+    paired_c: &(Vec<super::F128>, Vec<super::F128>),
     eq_lo_val: super::F128,
     partial_ab: &mut [super::F128; 64],
     partial_c_0: &mut [super::F128; 64],
@@ -189,6 +190,8 @@ pub(super) fn accumulate_convert_with_s_hat_v(
             chunk_c_bytes,
             n_b_med,
             convert,
+            &paired_c.0,
+            &paired_c.1,
             eq_lo_val,
             partial_ab,
             partial_c_0,
@@ -204,6 +207,7 @@ pub(super) fn accumulate_convert_with_s_hat_v(
     // SAFETY: the cfg gate guarantees the SIMD features and the fixed arrays
     // cover every four-lane load/store.
     unsafe {
+        let _ = paired_c;
         x86_64::accumulate_convert_with_s_hat_v_x86_avx512(
             chunk_ab_bytes,
             chunk_c_bytes,
@@ -216,6 +220,17 @@ pub(super) fn accumulate_convert_with_s_hat_v(
         );
     }
 
+    #[cfg(not(any(
+        target_arch = "aarch64",
+        all(
+            target_arch = "x86_64",
+            target_feature = "avx512f",
+            target_feature = "vpclmulqdq"
+        )
+    )))]
+    {
+        let _ = paired_c;
+    }
     #[cfg(not(any(
         target_arch = "aarch64",
         all(
