@@ -2849,7 +2849,7 @@ pub struct SumcheckProver {
     spare_b: Vec<F128>,
     t_r: F128,
     transcript: Vec<SumcheckMessage>,
-    pending_glue: Option<(Vec<F128>, F128)>,
+    pending_glue: Option<(Vec<F128>, F128, bool)>,
 }
 
 impl SumcheckProver {
@@ -2959,7 +2959,7 @@ impl SumcheckProver {
         assert_eq!(b_new.len(), self.f.len());
         let msg = round_msg_lsb(&self.f, &b_new);
         self.transcript.push(msg);
-        self.pending_glue = Some((b_new, h_new));
+        self.pending_glue = Some((b_new, h_new, false));
         msg
     }
 
@@ -2970,10 +2970,26 @@ impl SumcheckProver {
     /// fold over `f`. Transcript-identical: the caller observes the returned
     /// `h_new` then `(u_0, u_2)`, exactly as the unfused path does.
     pub fn introduce_new_with_eval(&mut self, b_new: Vec<F128>) -> (SumcheckMessage, F128) {
+        self.introduce_new_with_eval_inner(b_new, false)
+    }
+
+    /// Scratch-backed OOD-table variant. The basis is dead after the
+    /// following [`Self::glue`], which returns its allocation to the prover
+    /// pool instead of unmapping it. This makes the worker warm proof retain
+    /// the ranked OOD table's pages for the timed proof.
+    fn introduce_recycled_with_eval(&mut self, b_new: Vec<F128>) -> (SumcheckMessage, F128) {
+        self.introduce_new_with_eval_inner(b_new, true)
+    }
+
+    fn introduce_new_with_eval_inner(
+        &mut self,
+        b_new: Vec<F128>,
+        recycle_after_glue: bool,
+    ) -> (SumcheckMessage, F128) {
         assert_eq!(b_new.len(), self.f.len());
         let (msg, h_new) = round_msg_and_eval_lsb(&self.f, &b_new);
         self.transcript.push(msg);
-        self.pending_glue = Some((b_new, h_new));
+        self.pending_glue = Some((b_new, h_new, recycle_after_glue));
         (msg, h_new)
     }
 
@@ -2981,7 +2997,7 @@ impl SumcheckProver {
     /// `combined_basis[j] += α · b_new[j]` (pointwise), `T_r += α · h_new`.
     pub fn glue(&mut self, alpha: F128) {
         use rayon::prelude::*;
-        let (b_new, h_new) = self
+        let (b_new, h_new, recycle_after_glue) = self
             .pending_glue
             .take()
             .expect("glue without introduce_new");
@@ -2999,6 +3015,9 @@ impl SumcheckProver {
                 .for_each(|(acc, &v)| *acc += alpha * v);
         }
         self.t_r += alpha * h_new;
+        if recycle_after_glue {
+            crate::scratch::give_f128(b_new);
+        }
     }
 
     pub fn f(&self) -> &[F128] {
@@ -3232,6 +3251,7 @@ pub fn recursive_prover_with_basis<Ch: Challenger>(
         l0_tree,
         None,
         None,
+        true,
         challenger,
     )
 }
@@ -3265,6 +3285,7 @@ pub fn recursive_prover_with_basis_precomputed_round0<Ch: Challenger>(
             u_2: round0_uv.1,
         }),
         round1_lookahead,
+        true,
         challenger,
     )
 }
@@ -3279,6 +3300,7 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
     l0_tree: &[Hash],
     first_msg: Option<SumcheckMessage>,
     round1_lookahead: Option<[F128; 6]>,
+    recycle_ood_eq: bool,
     challenger: &mut Ch,
 ) -> LigeritoProof {
     let log_n = packed_witness.len().trailing_zeros() as usize;
@@ -3440,7 +3462,10 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
     // extension at a random transcript point z ∈ F^{n1}, sends the claimed
     // value, and folds the claim `Σ_x f1(x)·eq(z,x) = y` into the running
     // sumcheck (introduce + glue). Binds the prover to a single codeword of
-    // the interleaved list before any of L0's queries are drawn.
+    // the interleaved list before any of L0's queries are drawn. At the ranked
+    // m=32 Fast shape, L1..L5 build exactly five transient tables of dimensions
+    // 19,16,13,10,7: 599,168 F128 values / 9,586,688 backing bytes per proof.
+    // Scratch ownership keeps those pages resident from the worker warm proof.
     {
         let _t = std::time::Instant::now();
         for _ in 0..ood_count(1) {
@@ -3448,8 +3473,16 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
             // Build eq(z, ·) once and fuse the MLE eval `y = f̂1(z)` into the
             // introduce round message (single pass over f1 + eq_z), instead of
             // a separate `mle_eval_inline` fold.
-            let eq_z = build_eq_table(&z);
-            let (intro, y) = sc_prover.introduce_new_with_eval(eq_z);
+            let eq_z = if recycle_ood_eq {
+                crate::lincheck::build_eq_table_scratch(&z)
+            } else {
+                build_eq_table(&z)
+            };
+            let (intro, y) = if recycle_ood_eq {
+                sc_prover.introduce_recycled_with_eval(eq_z)
+            } else {
+                sc_prover.introduce_new_with_eval(eq_z)
+            };
             challenger.observe_f128(y);
             ood_values.push(y);
             challenger.observe_f128(intro.u_0);
@@ -3645,8 +3678,16 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
             let _t = std::time::Instant::now();
             for _ in 0..ood_count(i + 2) {
                 let z = challenger.sample_f128_vec(n_next);
-                let eq_z = build_eq_table(&z);
-                let (intro, y) = sc_prover.introduce_new_with_eval(eq_z);
+                let eq_z = if recycle_ood_eq {
+                    crate::lincheck::build_eq_table_scratch(&z)
+                } else {
+                    build_eq_table(&z)
+                };
+                let (intro, y) = if recycle_ood_eq {
+                    sc_prover.introduce_recycled_with_eval(eq_z)
+                } else {
+                    sc_prover.introduce_new_with_eval(eq_z)
+                };
                 challenger.observe_f128(y);
                 ood_values.push(y);
                 challenger.observe_f128(intro.u_0);
@@ -7178,7 +7219,9 @@ mod tests {
     /// config (explicit OOD samples at L1/L2, a few fold-grind bits at every
     /// level) round-trips through BOTH the dense and succinct verifiers, and
     /// tampering with either an OOD value or a fold-grinding nonce makes both
-    /// reject. Exercises every new prover/verifier code path.
+    /// reject. Also pins exact bincode bytes between ordinary and scratch-
+    /// recycled OOD equality-table storage: allocation provenance cannot
+    /// affect the Fiat-Shamir transcript or serialized proof.
     #[test]
     fn ligerito_ood_and_fold_grinding_roundtrip_and_tamper() {
         use crate::challenger::Challenger;
@@ -7219,6 +7262,25 @@ mod tests {
             &wtns_0.mat,
             &wtns_0.tree,
             &mut p_ch,
+        );
+
+        let mut baseline_ch = crate::challenger::FsChallenger::new(b"ood-test");
+        let baseline = recursive_prover_with_basis_impl(
+            &p_cfg,
+            poly.clone(),
+            b.clone(),
+            target,
+            &wtns_0.mat,
+            &wtns_0.tree,
+            None,
+            None,
+            false,
+            &mut baseline_ch,
+        );
+        assert_eq!(
+            bincode::serialize(&proof).expect("serialize scratch-backed proof"),
+            bincode::serialize(&baseline).expect("serialize baseline proof"),
+            "scratch recycling must preserve exact proof bytes",
         );
 
         // Sanity: the new proof fields are populated.

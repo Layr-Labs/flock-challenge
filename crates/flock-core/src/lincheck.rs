@@ -498,12 +498,26 @@ pub enum VerifyError {
 /// Standard "doubling-in-half" construction: `O(2^d)` F128 muls, no
 /// inversions. Indexing is LSB-first — `bit_j(i)` is the `j`-th LSB of `i`.
 pub fn build_eq_table(point: &[F128]) -> Vec<F128> {
+    build_eq_table_into(point, crate::alloc_uninit_f128_vec(1usize << point.len()))
+}
+
+/// Scratch-backed sibling of [`build_eq_table`] for transient prover tables.
+///
+/// The returned vector must eventually be returned with
+/// [`crate::scratch::give_f128`]. Contents from the pool are stale, but the
+/// doubling construction below overwrites every exposed slot before reading
+/// it, exactly matching [`build_eq_table`]'s uninitialized-storage contract.
+pub(crate) fn build_eq_table_scratch(point: &[F128]) -> Vec<F128> {
+    build_eq_table_into(point, crate::scratch::take_f128(1usize << point.len()))
+}
+
+fn build_eq_table_into(point: &[F128], mut out: Vec<F128>) -> Vec<F128> {
     use rayon::prelude::*;
 
     let d = point.len();
+    debug_assert_eq!(out.len(), 1usize << d);
     // Every slot is written by the level that first exposes it before it can
     // be read at a later level.
-    let mut out = crate::alloc_uninit_f128_vec(1usize << d);
     out[0] = F128::ONE;
     const PAR_THRESHOLD: usize = 1 << 12;
     for j in 0..d {
