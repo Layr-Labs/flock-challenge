@@ -42,8 +42,7 @@ mod kernels;
 
 #[cfg(all(test, target_arch = "aarch64"))]
 use kernels::aarch64::{
-    bit_transpose_64bytes_neon, shift_reduce_inner_ab_fused_neon,
-    shift_reduce_inner_ab_fused_neon_checked, shift_reduce_inner_ab_neon,
+    bit_transpose_64bytes_neon, shift_reduce_inner_ab_fused_neon, shift_reduce_inner_ab_neon,
 };
 #[cfg(all(test, target_arch = "aarch64"))]
 use kernels::bit_transpose_64bytes_scalar;
@@ -337,11 +336,11 @@ pub fn precompute_round1_ab_inner_packed_padded(
     assert_eq!(total_bytes % core::mem::size_of::<F128>(), 0);
 
     let (within_outer_mask, b_med_counts) = build_b_med_counts(padding);
-    // The BLAKE3 R1CS has two 8192-bit windows per 16384-bit block. Besides
-    // the full all-ones B rows at b_med 0/1 and the single-K0 tail, two mixed
-    // rows have fixed one-valued K subsets: K0..1 at first-window b_med 2 and
-    // K4..7 at second-window b_med 13. Restrict runtime sniffing to these five
-    // candidates; every other block enters the generic kernel directly.
+    // The BLAKE3 R1CS has two 8192-bit windows per 16384-bit block. Static
+    // all-ones B rows occur only at b_med 0/1 of the first window, while the
+    // single-K0 tail occurs only at the final b_med of the second window.
+    // Restrict the runtime sniffing to those three candidates; all other
+    // blocks can enter the generic kernel without first rereading B.
     let blake3_static_layout = padding.k_log == 14 && padding.useful_bits_per_block == 15_409;
     const OUTER_BYTES: usize = (1 << N_MEDIUM) * 64;
     debug_assert_eq!(OUTER_BYTES, (1 << N_INNER) * N_CHUNKS);
@@ -378,16 +377,6 @@ pub fn precompute_round1_ab_inner_packed_padded(
                         b_col,
                         !blake3_static_layout || (within_hash_outer == 0 && b_med < 2),
                         !blake3_static_layout || (within_hash_outer == 1 && b_med + 1 == n_b_med),
-                        if blake3_static_layout && within_hash_outer == 0 && b_med == 2 {
-                            0x03
-                        } else if blake3_static_layout
-                            && within_hash_outer == 1
-                            && b_med + 2 == n_b_med
-                        {
-                            0xf0
-                        } else {
-                            0
-                        },
                     );
                 }
                 out_outer[n_b_med * 64..].fill(0);
@@ -420,7 +409,6 @@ fn shift_reduce_inner_ab(
     b_col: &mut [F8],
     check_all_ones: bool,
     check_single_k0: bool,
-    const_one_mask: u8,
 ) {
     kernels::shift_reduce_inner_ab(
         a_packed,
@@ -433,7 +421,6 @@ fn shift_reduce_inner_ab(
         b_col,
         check_all_ones,
         check_single_k0,
-        const_one_mask,
     );
 }
 
@@ -565,7 +552,6 @@ fn process_one_x_hi(
                     &mut state.b_col,
                     true,
                     true,
-                    0,
                 );
                 let byte_base_b = chunk_byte_base + b_med * N_CHUNKS * 8;
                 let c_in: &[u8; 64] = (&c_packed[byte_base_b..byte_base_b + 64])
@@ -600,7 +586,6 @@ fn process_one_x_hi(
                     &mut state.b_col,
                     true,
                     true,
-                    0,
                 );
                 let byte_base_b = chunk_byte_base + b_med * N_CHUNKS * 8;
                 let c_in: &[u8; 64] = (&c_packed[byte_base_b..byte_base_b + 64])
@@ -728,7 +713,6 @@ fn process_one_x_hi_with_s_hat_v(
                     &mut state.b_col,
                     true,
                     true,
-                    0,
                 );
                 let byte_base_b = chunk_byte_base + b_med * N_CHUNKS * 8;
                 let c_in: &[u8; 64] = (&c_packed[byte_base_b..byte_base_b + 64])
@@ -761,7 +745,6 @@ fn process_one_x_hi_with_s_hat_v(
                     &mut state.b_col,
                     true,
                     true,
-                    0,
                 );
                 let byte_base_b = chunk_byte_base + b_med * N_CHUNKS * 8;
                 let c_in: &[u8; 64] = (&c_packed[byte_base_b..byte_base_b + 64])
@@ -1667,38 +1650,6 @@ mod tests {
                 out_scalar, out_fused,
                 "fused-neon disagrees with scalar at (base={chunk_byte_base}, b_med={b_med})"
             );
-        }
-    }
-
-    #[cfg(target_arch = "aarch64")]
-    #[test]
-    fn neon_mixed_const_one_inner_matches_scalar_inner() {
-        let mut rng = Rng::new(0xC057_01E5);
-        let m = 14;
-        let table = make_inv_table();
-        let a_bits = rng.bits(1 << m);
-        let b_bits = rng.bits(1 << m);
-        let a_packed = super::super::univariate_skip::pack_bits(&a_bits);
-        let b_packed = super::super::univariate_skip::pack_bits(&b_bits);
-
-        for mask in [0x03u8, 0xf0] {
-            let mut b_mixed = b_packed.clone();
-            for k in 0..8 {
-                if mask & (1 << k) != 0 {
-                    b_mixed[k * N_CHUNKS..(k + 1) * N_CHUNKS].fill(u8::MAX);
-                }
-            }
-            let mut a_col = [F8::ZERO; ELL];
-            let mut b_col = [F8::ZERO; ELL];
-            let mut want = [0u8; 64];
-            let mut got = [0u8; 64];
-            shift_reduce_inner_ab_scalar(
-                &a_packed, &b_mixed, &table, 0, 0, &mut want, &mut a_col, &mut b_col,
-            );
-            shift_reduce_inner_ab_fused_neon_checked(
-                &a_packed, &b_mixed, &table, 0, 0, &mut got, false, false, mask,
-            );
-            assert_eq!(got, want, "mixed const-one mask {mask:#04x}");
         }
     }
 
