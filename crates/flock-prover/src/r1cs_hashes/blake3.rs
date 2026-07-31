@@ -97,6 +97,9 @@ use flock_core::proof::R1csClaim;
 use flock_core::r1cs::{BlockR1cs, SparseBinaryMatrix};
 use flock_core::verifier;
 
+#[cfg(target_arch = "aarch64")]
+mod witness_g4_aarch64;
+
 // ---------------------------------------------------------------------------
 // Public constants
 // ---------------------------------------------------------------------------
@@ -1600,16 +1603,82 @@ fn generate_witness_with_ab_packed_and_lincheck_impl(
     } else {
         USEFUL_BITS
     };
-    let per_block =
-        |block: &Compression, z_u64: &mut [u64], a_u64: &mut [u64], b_u64: &mut [u64]| {
+
+    #[cfg(target_arch = "aarch64")]
+    if use_ranked_g4_witness(blocks.len(), n_blocks_log, rate2_codeword.is_some()) {
+        return drive_blake3_witness(
+            blocks,
+            &padding,
+            n_blocks_log,
+            stripe_useful_bits,
+            rate2_codeword,
+            |block, z_u64, a_u64, b_u64| {
+                let (cv, m, t, bl, fl) = block;
+                witness_g4_aarch64::build_block_witness_ab_stream_into(
+                    cv, m, *t, *bl, *fl, z_u64, a_u64, b_u64,
+                );
+            },
+        );
+    }
+
+    drive_blake3_witness(
+        blocks,
+        &padding,
+        n_blocks_log,
+        stripe_useful_bits,
+        rate2_codeword,
+        |block, z_u64, a_u64, b_u64| {
             let (cv, m, t, bl, fl) = block;
             build_block_witness_ab_stream_into(cv, m, *t, *bl, *fl, z_u64, a_u64, b_u64);
-        };
+        },
+    )
+}
+
+#[inline]
+#[cfg(target_arch = "aarch64")]
+fn use_ranked_g4_witness(
+    n_blocks: usize,
+    n_blocks_log: usize,
+    has_rate2_codeword: bool,
+) -> bool {
+    #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+    {
+        static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        n_blocks_log == 18
+            && n_blocks == 1usize << n_blocks_log
+            && has_rate2_codeword
+            && *ENABLED.get_or_init(|| {
+                std::env::var_os("FLOCK_NO_BLAKE3_G4_WITNESS").is_none()
+            })
+    }
+    #[cfg(not(all(target_arch = "aarch64", target_os = "macos")))]
+    {
+        let _ = (n_blocks, n_blocks_log, has_rate2_codeword);
+        false
+    }
+}
+
+fn drive_blake3_witness<F>(
+    blocks: &[Compression],
+    padding: &Compression,
+    n_blocks_log: usize,
+    stripe_useful_bits: usize,
+    rate2_codeword: Option<&mut [flock_core::field::F128]>,
+    per_block: F,
+) -> (
+    Vec<flock_core::field::F128>,
+    Vec<flock_core::field::F128>,
+    Vec<flock_core::field::F128>,
+    Vec<u8>,
+)
+where
+    F: Fn(&Compression, &mut [u64], &mut [u64], &mut [u64]) + Sync,
+{
     match rate2_codeword {
         Some(codeword) => {
             super::common::drive_witness_packed_and_lincheck_full_write_with_rate2_codeword(
                 blocks,
-                &padding,
+                padding,
                 n_blocks_log,
                 K_LOG,
                 stripe_useful_bits,
@@ -1619,7 +1688,7 @@ fn generate_witness_with_ab_packed_and_lincheck_impl(
         }
         None => super::common::drive_witness_packed_and_lincheck_full_write(
             blocks,
-            &padding,
+            padding,
             n_blocks_log,
             K_LOG,
             stripe_useful_bits,
@@ -2569,6 +2638,109 @@ mod tests {
             assert_eq!(z, z_ref);
             assert_eq!(a, a_ref);
             assert_eq!(b, b_ref);
+        }
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn g4_streaming_block_fully_overwrites_and_matches_scalar() {
+        const WORDS: usize = K / 64;
+        let mut rng = Rng::new(0x4734_AA64_51D0_0D1E);
+        for iteration in 0..48 {
+            let cv: [u32; 8] = if iteration == 0 {
+                [0; 8]
+            } else if iteration == 1 {
+                [u32::MAX; 8]
+            } else {
+                std::array::from_fn(|_| rng.next_u32())
+            };
+            let m: [u32; 16] = if iteration == 0 {
+                [0; 16]
+            } else if iteration == 1 {
+                [u32::MAX; 16]
+            } else {
+                std::array::from_fn(|_| rng.next_u32())
+            };
+            let counter = ((rng.next_u32() as u64) << 32) | rng.next_u32() as u64;
+            let block_len = rng.next_u32();
+            let flags = rng.next_u32();
+
+            let mut z_ref = [u64::MAX; WORDS];
+            let mut a_ref = [u64::MAX; WORDS];
+            let mut b_ref = [u64::MAX; WORDS];
+            build_block_witness_ab_stream_into(
+                &cv, &m, counter, block_len, flags, &mut z_ref, &mut a_ref, &mut b_ref,
+            );
+
+            let mut z = [u64::MAX; WORDS];
+            let mut a = [u64::MAX; WORDS];
+            let mut b = [u64::MAX; WORDS];
+            witness_g4_aarch64::build_block_witness_ab_stream_into(
+                &cv, &m, counter, block_len, flags, &mut z, &mut a, &mut b,
+            );
+            assert_eq!(z, z_ref, "z mismatch at iteration {iteration}");
+            assert_eq!(a, a_ref, "A mismatch at iteration {iteration}");
+            assert_eq!(b, b_ref, "B mismatch at iteration {iteration}");
+        }
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn g4_driver_matches_scalar_across_group_boundaries() {
+        for &n_blocks in &[1usize, 7, 8, 9, 13] {
+            let n_log = min_n_blocks_log(n_blocks).max(3);
+            let mut rng = Rng::new(0x4734_DA1E_0000 + n_blocks as u64);
+            let blocks: Vec<Compression> = (0..n_blocks)
+                .map(|_| {
+                    let cv = std::array::from_fn(|_| rng.next_u32());
+                    let message = std::array::from_fn(|_| rng.next_u32());
+                    (
+                        cv,
+                        message,
+                        ((rng.next_u32() as u64) << 32) | rng.next_u32() as u64,
+                        rng.next_u32(),
+                        rng.next_u32(),
+                    )
+                })
+                .collect();
+            let expected = generate_witness_with_ab_packed_and_lincheck(&blocks, n_log);
+            let padding: Compression = ([0; 8], [0; 16], 0, 0, 0);
+            let got = crate::r1cs_hashes::common::drive_witness_packed_and_lincheck_full_write(
+                &blocks,
+                &padding,
+                n_log,
+                K_LOG,
+                USEFUL_BITS,
+                |block, z, a, b| {
+                    let (cv, message, counter, block_len, flags) = block;
+                    witness_g4_aarch64::build_block_witness_ab_stream_into(
+                        cv, message, *counter, *block_len, *flags, z, a, b,
+                    );
+                },
+            );
+            assert_eq!(got, expected, "driver mismatch at n_blocks={n_blocks}");
+
+            if n_blocks == 13 {
+                let mut codeword = vec![F128::ZERO; 2 * got.0.len()];
+                let with_codeword =
+                    crate::r1cs_hashes::common::drive_witness_packed_and_lincheck_full_write_with_rate2_codeword(
+                        &blocks,
+                        &padding,
+                        n_log,
+                        K_LOG,
+                        USEFUL_BITS,
+                        &mut codeword,
+                        |block, z, a, b| {
+                            let (cv, message, counter, block_len, flags) = block;
+                            witness_g4_aarch64::build_block_witness_ab_stream_into(
+                                cv, message, *counter, *block_len, *flags, z, a, b,
+                            );
+                        },
+                    );
+                assert_eq!(with_codeword, expected);
+                assert_eq!(&codeword[..got.0.len()], got.0.as_slice());
+                assert_eq!(&codeword[got.0.len()..], got.0.as_slice());
+            }
         }
     }
 
