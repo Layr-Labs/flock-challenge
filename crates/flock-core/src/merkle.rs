@@ -508,10 +508,6 @@ pub(crate) fn hash_ranked_blake3_leaf_chunk(data: &[u8], out: &mut [Hash]) {
     assert!(batched, "ranked 1 KiB leaves must use the batched kernel");
 }
 
-/// Nodes per rayon task in the batched BLAKE3 paths: enough to amortize task
-/// dispatch over many `hash_many` calls, small enough to stay cache-resident.
-const BLAKE3_GROUP: usize = 1024;
-
 /// Leaves per queue chunk in the batched BLAKE3 leaf path (see `epool`).
 /// A multiple of 12 so every full chunk runs entirely through the twelve-way
 /// kernel with no per-chunk tail; small enough (240 KiB of input at the
@@ -520,13 +516,24 @@ const BLAKE3_GROUP: usize = 1024;
 /// atomic claim per 240 leaves stays far below dispatch noise.
 const BLAKE3_LEAF_QUEUE_CHUNK: usize = 240;
 
+/// Parents per queue chunk in the batched BLAKE3 parent path (see `epool`).
+/// Must be a multiple of 12 so every full group runs entirely through the
+/// twelve-way parent kernel (`hash_complete_parent_groups`) with no 4-wide
+/// tail. The previous static-rayon group size of 1024 = 12·85 + 4 dropped a
+/// 4-node remainder onto the slower path in *every* task; 1020 = 12·85
+/// eliminates that remainder. A full chunk is 1020 nodes × 64 B of children
+/// ≈ 64 KiB of input — one atomic claim amortises cleanly and an E-core tail
+/// is still sub-millisecond.
+const BLAKE3_PARENT_QUEUE_CHUNK: usize = 1020;
+
 /// Hash one internal level: `write[i] = hash_pair(read[2i], read[2i+1])`.
 ///
 /// Children are contiguous 64-byte spans of the level below, so both hashes
 /// read them zero-copy. Small upper levels can't fill the cores, so a rayon
 /// dispatch per level costs more than the hashing itself (~3× at the top of a
 /// 2^18 tree); those are hashed serially — still SIMD-batched — and only the
-/// wide lower levels fan out.
+/// wide lower levels fan out through the same efficiency-core-aware chunk
+/// queue the leaf path uses.
 fn hash_pairs_level(read: &[Hash], write: &mut [Hash], kind: HashKind) {
     #[cfg(feature = "hash-count")]
     hash_count::PAIR_CALLS.fetch_add(write.len() as u64, std::sync::atomic::Ordering::Relaxed);
@@ -542,10 +549,34 @@ fn hash_pairs_level(read: &[Hash], write: &mut [Hash], kind: HashKind) {
             if serial {
                 blake3_hash_many_parents(read_bytes, write);
             } else {
-                write
-                    .par_chunks_mut(BLAKE3_GROUP)
-                    .zip(read_bytes.par_chunks(BLAKE3_GROUP * 64))
-                    .for_each(|(outs, children)| blake3_hash_many_parents(children, outs));
+                // Chunk-queue dispatch so the efficiency-core helper pool can
+                // drain parent nodes alongside the main pool — same contract
+                // as the leaf path. Chunk `i` writes only
+                // `write[i*C..(i+1)*C]`, so output is byte-identical to a
+                // static rayon split regardless of claim order.
+                let n = write.len();
+                let out_base = crate::epool::SyncPtr(write.as_mut_ptr());
+                let read_base = read_bytes.as_ptr() as usize;
+                crate::epool::run_hetero_chunks(n.div_ceil(BLAKE3_PARENT_QUEUE_CHUNK), |i| {
+                    let start = i * BLAKE3_PARENT_QUEUE_CHUNK;
+                    let end = (start + BLAKE3_PARENT_QUEUE_CHUNK).min(n);
+                    // SAFETY: `Hash` is `[u8; 32]` (Copy, no padding); the
+                    // queue hands out each `i` exactly once and the
+                    // `[start, end)` ranges are pairwise disjoint and
+                    // in-bounds, so each closure holds the only `&mut` into
+                    // its output range. The read side is immutable for the
+                    // whole level.
+                    let outs = unsafe {
+                        core::slice::from_raw_parts_mut(out_base.ptr().add(start), end - start)
+                    };
+                    let children = unsafe {
+                        core::slice::from_raw_parts(
+                            (read_base as *const u8).add(start * 64),
+                            (end - start) * 64,
+                        )
+                    };
+                    blake3_hash_many_parents(children, outs);
+                });
             }
         }
         HashKind::Sha256 => {

@@ -1418,9 +1418,9 @@ mod tests {
     fn fused_round_matches_unfused() {
         let mut rng = Rng::new(310);
         // fold_and_compute requires lo_size ≥ 2 in SplitEqGhash. eq is over
-        // r_next[1..] (size log_n − 2); with MAX_N_HI = 7, n_lo ≥ 1 needs
-        // eq size ≥ 8 ⇒ log_n ≥ 10. Smaller cases use the unfused path.
-        for &log_n in &[10usize, 11, 12] {
+        // r_next[1..] (size log_n − 2); with MAX_N_HI = 9, n_lo ≥ 1 needs
+        // eq size ≥ 10 ⇒ log_n ≥ 12. Smaller cases use the unfused path.
+        for &log_n in &[12usize, 13, 14] {
             let n = 1usize << log_n;
             let a: Vec<F128> = (0..n).map(|_| rng.f128()).collect();
             let b: Vec<F128> = (0..n).map(|_| rng.f128()).collect();
