@@ -1,5 +1,27 @@
 use super::super::{F128, NEON_TILE_T, build_sum_table};
 
+// The SHA3 extension includes EOR3; retain the two-EOR form for generic
+// AArch64 builds that do not enable it.
+#[cfg(target_feature = "sha3")]
+#[inline(always)]
+unsafe fn xor3_u8(
+    a: core::arch::aarch64::uint8x16_t,
+    b: core::arch::aarch64::uint8x16_t,
+    c: core::arch::aarch64::uint8x16_t,
+) -> core::arch::aarch64::uint8x16_t {
+    unsafe { core::arch::aarch64::veor3q_u8(a, b, c) }
+}
+
+#[cfg(not(target_feature = "sha3"))]
+#[inline(always)]
+unsafe fn xor3_u8(
+    a: core::arch::aarch64::uint8x16_t,
+    b: core::arch::aarch64::uint8x16_t,
+    c: core::arch::aarch64::uint8x16_t,
+) -> core::arch::aarch64::uint8x16_t {
+    unsafe { core::arch::aarch64::veorq_u8(a, core::arch::aarch64::veorq_u8(b, c)) }
+}
+
 /// Single-matrix partial fold with **tiled + NEON-register accumulators**.
 /// Keeps `BLOCK_K = 8` accumulators in NEON registers across a `NEON_TILE_T`
 /// stripe sweep — no per-byte accumulator LD/ST. Hand-rolled aarch64
@@ -159,30 +181,71 @@ unsafe fn process_block_neon_single<const TILE_T: usize>(
     let mut a6 = vld1q_u8(o.add(96));
     let mut a7 = vld1q_u8(o.add(112));
 
-    for t in 0..TILE_T {
-        let stripe_ptr = row_ptr.add(t * row_stride + bs);
-        let ta = tables_ptr.add(t * 256 * 16);
+    let mut t = 0;
+    while t + 1 < TILE_T {
+        let stripe0 = row_ptr.add(t * row_stride + bs);
+        let stripe1 = row_ptr.add((t + 1) * row_stride + bs);
+        let table0 = tables_ptr.add(t * 256 * 16);
+        let table1 = tables_ptr.add((t + 1) * 256 * 16);
 
-        // One unaligned 8-byte load replaces eight LDRBs.
-        let w = (stripe_ptr as *const u64).read_unaligned();
+        // One unaligned 8-byte load per stripe replaces eight LDRBs.
+        let w0 = (stripe0 as *const u64).read_unaligned();
+        let w1 = (stripe1 as *const u64).read_unaligned();
 
-        let i0 = (w & 0xff) as usize;
-        let i1 = ((w >> 8) & 0xff) as usize;
-        let i2 = ((w >> 16) & 0xff) as usize;
-        let i3 = ((w >> 24) & 0xff) as usize;
-        let i4 = ((w >> 32) & 0xff) as usize;
-        let i5 = ((w >> 40) & 0xff) as usize;
-        let i6 = ((w >> 48) & 0xff) as usize;
-        let i7 = (w >> 56) as usize;
-
-        a0 = veorq_u8(a0, vld1q_u8(ta.add(i0 * 16)));
-        a1 = veorq_u8(a1, vld1q_u8(ta.add(i1 * 16)));
-        a2 = veorq_u8(a2, vld1q_u8(ta.add(i2 * 16)));
-        a3 = veorq_u8(a3, vld1q_u8(ta.add(i3 * 16)));
-        a4 = veorq_u8(a4, vld1q_u8(ta.add(i4 * 16)));
-        a5 = veorq_u8(a5, vld1q_u8(ta.add(i5 * 16)));
-        a6 = veorq_u8(a6, vld1q_u8(ta.add(i6 * 16)));
-        a7 = veorq_u8(a7, vld1q_u8(ta.add(i7 * 16)));
+        a0 = xor3_u8(
+            a0,
+            vld1q_u8(table0.add((w0 & 0xff) as usize * 16)),
+            vld1q_u8(table1.add((w1 & 0xff) as usize * 16)),
+        );
+        a1 = xor3_u8(
+            a1,
+            vld1q_u8(table0.add(((w0 >> 8) & 0xff) as usize * 16)),
+            vld1q_u8(table1.add(((w1 >> 8) & 0xff) as usize * 16)),
+        );
+        a2 = xor3_u8(
+            a2,
+            vld1q_u8(table0.add(((w0 >> 16) & 0xff) as usize * 16)),
+            vld1q_u8(table1.add(((w1 >> 16) & 0xff) as usize * 16)),
+        );
+        a3 = xor3_u8(
+            a3,
+            vld1q_u8(table0.add(((w0 >> 24) & 0xff) as usize * 16)),
+            vld1q_u8(table1.add(((w1 >> 24) & 0xff) as usize * 16)),
+        );
+        a4 = xor3_u8(
+            a4,
+            vld1q_u8(table0.add(((w0 >> 32) & 0xff) as usize * 16)),
+            vld1q_u8(table1.add(((w1 >> 32) & 0xff) as usize * 16)),
+        );
+        a5 = xor3_u8(
+            a5,
+            vld1q_u8(table0.add(((w0 >> 40) & 0xff) as usize * 16)),
+            vld1q_u8(table1.add(((w1 >> 40) & 0xff) as usize * 16)),
+        );
+        a6 = xor3_u8(
+            a6,
+            vld1q_u8(table0.add(((w0 >> 48) & 0xff) as usize * 16)),
+            vld1q_u8(table1.add(((w1 >> 48) & 0xff) as usize * 16)),
+        );
+        a7 = xor3_u8(
+            a7,
+            vld1q_u8(table0.add((w0 >> 56) as usize * 16)),
+            vld1q_u8(table1.add((w1 >> 56) as usize * 16)),
+        );
+        t += 2;
+    }
+    if t < TILE_T {
+        let stripe = row_ptr.add(t * row_stride + bs);
+        let table = tables_ptr.add(t * 256 * 16);
+        let w = (stripe as *const u64).read_unaligned();
+        a0 = veorq_u8(a0, vld1q_u8(table.add((w & 0xff) as usize * 16)));
+        a1 = veorq_u8(a1, vld1q_u8(table.add(((w >> 8) & 0xff) as usize * 16)));
+        a2 = veorq_u8(a2, vld1q_u8(table.add(((w >> 16) & 0xff) as usize * 16)));
+        a3 = veorq_u8(a3, vld1q_u8(table.add(((w >> 24) & 0xff) as usize * 16)));
+        a4 = veorq_u8(a4, vld1q_u8(table.add(((w >> 32) & 0xff) as usize * 16)));
+        a5 = veorq_u8(a5, vld1q_u8(table.add(((w >> 40) & 0xff) as usize * 16)));
+        a6 = veorq_u8(a6, vld1q_u8(table.add(((w >> 48) & 0xff) as usize * 16)));
+        a7 = veorq_u8(a7, vld1q_u8(table.add((w >> 56) as usize * 16)));
     }
 
     vst1q_u8(o, a0);
