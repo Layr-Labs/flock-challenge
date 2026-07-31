@@ -406,12 +406,12 @@ fn prove_packed_padded_inner<C: Challenger>(
     // ---- 7. Rounds 3..(n_mlv + 1) — AB only (c is done) ----
     //
     // Iter i: fold (a, b) at ρ_{i+1}, compute round (i+3) message, sample
-    // ρ_{i+2}. Use the fused parallel path while log_n ≥ 12; below that the
-    // SplitEqGhash inner can't form lo_size ≥ 2 under MAX_N_HI = 9
-    // (eq covers log_n−2 vars, so n_lo = (log_n−2)−9 needs log_n ≥ 12),
-    // and even with the old cap the 10..13 rounds open a 128-chunk rayon
-    // region over tiny work — a net loss. Fall back to fold_in_place_pair
-    // + round_pair_naive for the serial tail.
+    // ρ_{i+2}. Use the fused parallel path while log_n ≥ 15. At log_n 12–14,
+    // SplitEqGhash still opens 512 tiny Rayon jobs (lo_size 2, 4, and 8), so
+    // dispatch dominates the small amount of arithmetic. The direct serial
+    // fold + round pair is faster for those three exact geometries; from
+    // log_n=15 onward, the fused path amortizes dispatch and wins. Fall back
+    // to fold_in_place_pair + round_pair_naive for the serial tail.
     //
     // Ping-pong scratch buffers for the fused path: each fused round folds
     // (a_mlv, b_mlv) of size N into size N/2. Rather than allocating — and,
@@ -439,7 +439,7 @@ fn prove_packed_padded_inner<C: Challenger>(
         let mut r_next = vec![F128::ONE; log_n_before - 1];
         r_next[1..].copy_from_slice(&r[k_skip + i + 2..]);
 
-        let (m1, mi) = if log_n_before >= 12 {
+        let (m1, mi) = if log_n_before >= 15 {
             let half = a_mlv.len() / 2;
             let (m1, mi) = fold_and_compute_round_pair_into(
                 &a_mlv,
