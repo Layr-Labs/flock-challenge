@@ -209,9 +209,10 @@ fn use_ranked_zero_root_fusion(
 /// The three ranked radix-8 passes share fixed one-MiB row tiles with the
 /// efficiency-core pool. Layer 1 has only two outer blocks, but flattening
 /// `(block, row-tile)` still exposes the same 1024 claims as layers 4 and 7.
-/// It overlaps the concurrently-running round-1 AB precompute on the main
-/// Rayon pool; the separate helper pool is otherwise idle until these queues
-/// finish and the deep-transform leaf receivers start.
+/// It overlaps the concurrently-running round-1 AB precompute on both pools:
+/// both sides use cooperative main-pool tasks, while Rayon's helper broadcast
+/// queues serialize the two producer drains per E-worker. The blocking leaf
+/// receivers still start only after every top pass returns.
 #[inline]
 fn is_ranked_top_hetero_fused3_pass(
     log_d: usize,
@@ -672,7 +673,11 @@ impl AdditiveNttF128 {
                         && std::env::var_os("FLOCK_NO_NTT_TOP_EPOOL").is_none()
                     {
                         butterfly_interleaved_fused_3layer_all_blocks_hetero(
-                            data, &twiddles, eighth, num_ntts,
+                            data,
+                            &twiddles,
+                            eighth,
+                            num_ntts,
+                            layer == 1,
                         );
                     } else {
                         butterfly_interleaved_fused_3layer_all_blocks_par_rows(
@@ -1470,6 +1475,7 @@ fn butterfly_interleaved_fused_3layer_all_blocks_hetero(
     twiddles: &[[F128; 7]],
     eighth: usize,
     num_ntts: usize,
+    cooperative_main: bool,
 ) {
     let num_blocks = twiddles.len();
     let block_elems = 8 * eighth * num_ntts;
@@ -1482,7 +1488,7 @@ fn butterfly_interleaved_fused_3layer_all_blocks_hetero(
     const ROWS_PER_TILE: usize = 128;
     let tiles_per_block = eighth.div_ceil(ROWS_PER_TILE);
     let base = crate::epool::SyncPtr(data.as_mut_ptr());
-    crate::epool::run_hetero_chunks(num_blocks * tiles_per_block, |job| {
+    let process_tile = |job: usize| {
         let block = job / tiles_per_block;
         let tile = job % tiles_per_block;
         let row_start = tile * ROWS_PER_TILE;
@@ -1512,7 +1518,17 @@ fn butterfly_interleaved_fused_3layer_all_blocks_hetero(
                 }
             }
         }
-    });
+    };
+    let n_tiles = num_blocks * tiles_per_block;
+    if cooperative_main {
+        // Layer 1 overlaps the AB precompute inside the commit join. Exposing
+        // one Rayon task per tile prevents this branch's queue from pinning
+        // main-pool workers in greedy loops and preserves the original
+        // overlap. Layers 4/7 retain the lower-overhead standalone drain.
+        crate::epool::run_hetero_chunks_cooperative(n_tiles, process_tile);
+    } else {
+        crate::epool::run_hetero_chunks(n_tiles, process_tile);
+    }
 }
 
 /// Butterfly one top-layer block, fusing four layers `(L..L+4)`. `block` holds
@@ -1937,7 +1953,11 @@ mod tests {
 
             let mut got = source;
             butterfly_interleaved_fused_3layer_all_blocks_hetero(
-                &mut got, &twiddles, eighth, NUM_NTTS,
+                &mut got,
+                &twiddles,
+                eighth,
+                NUM_NTTS,
+                layer == 1,
             );
             assert_eq!(
                 got, expected,
