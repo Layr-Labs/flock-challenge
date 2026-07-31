@@ -321,6 +321,68 @@ pub unsafe fn ghash_mul_low_constants_vec2_neon(
     }
 }
 
+/// Batch multiply two arbitrary values by constants whose high limbs fit in
+/// five bits.  The schoolbook products are still required, but the high-high
+/// products then have degree at most 67.  Consequently `r3` has at most four
+/// live bits and the first GHASH fold cannot overflow a second time.
+///
+/// # Safety
+/// Requires the `aes` target feature, and both constant high limbs must be
+/// smaller than 32.
+#[target_feature(enable = "aes")]
+#[inline]
+pub unsafe fn ghash_mul_tiny_high_constants_vec2_neon(
+    constants: [F128; 2],
+    values: [F128; 2],
+) -> [F128; 2] {
+    debug_assert!(constants[0].hi < 32);
+    debug_assert!(constants[1].hi < 32);
+
+    // SAFETY: function carries the aes target feature; pmull requires it.
+    unsafe {
+        let p0_ll = pmull(values[0].lo, constants[0].lo);
+        let p0_lh = pmull(values[0].lo, constants[0].hi);
+        let p0_hl = pmull(values[0].hi, constants[0].lo);
+        let p0_hh = pmull(values[0].hi, constants[0].hi);
+        let p1_ll = pmull(values[1].lo, constants[1].lo);
+        let p1_lh = pmull(values[1].lo, constants[1].hi);
+        let p1_hl = pmull(values[1].hi, constants[1].lo);
+        let p1_hh = pmull(values[1].hi, constants[1].hi);
+
+        let c0 = veorq_u64(p0_lh, p0_hl);
+        let c1 = veorq_u64(p1_lh, p1_hl);
+        let r0 = vzip1q_u64(p0_ll, p1_ll);
+        let r1 = veorq_u64(vzip2q_u64(p0_ll, p1_ll), vzip1q_u64(c0, c1));
+        let r2 = veorq_u64(vzip1q_u64(p0_hh, p1_hh), vzip2q_u64(c0, c1));
+        let r3 = vzip2q_u64(p0_hh, p1_hh);
+
+        // Fold (r2,r3) by x^128 = x^7 + x^2 + x + 1.  Since r3 < 2^4,
+        // all of r3 << {1,2,7} remains inside this word, so the generic
+        // reduction's overflow/correction stage is identically zero.
+        let s1_lo = vshlq_n_u64::<1>(r2);
+        let s1_hi = veorq_u64(vshlq_n_u64::<1>(r3), vshrq_n_u64::<63>(r2));
+        let s2_lo = vshlq_n_u64::<2>(r2);
+        let s2_hi = veorq_u64(vshlq_n_u64::<2>(r3), vshrq_n_u64::<62>(r2));
+        let s7_lo = vshlq_n_u64::<7>(r2);
+        let s7_hi = veorq_u64(vshlq_n_u64::<7>(r3), vshrq_n_u64::<57>(r2));
+        let folded_lo = xor3_u64(r2, s1_lo, veorq_u64(s2_lo, s7_lo));
+        let folded_hi = xor3_u64(r3, s1_hi, veorq_u64(s2_hi, s7_hi));
+        let out_lo = veorq_u64(r0, folded_lo);
+        let out_hi = veorq_u64(r1, folded_hi);
+
+        [
+            F128 {
+                lo: vgetq_lane_u64::<0>(out_lo),
+                hi: vgetq_lane_u64::<0>(out_hi),
+            },
+            F128 {
+                lo: vgetq_lane_u64::<1>(out_lo),
+                hi: vgetq_lane_u64::<1>(out_hi),
+            },
+        ]
+    }
+}
+
 /// Batch multiply 2× F128 by a SHARED constant `c`, Karatsuba variant of
 /// [`ghash_mul_vec2_neon`]: 6 PMULL instead of 8 (3 per product), reusing
 /// the same lane-paired vectorised GHASH reduction. PMULL is the scarce

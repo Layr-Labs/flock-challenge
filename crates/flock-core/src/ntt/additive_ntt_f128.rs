@@ -226,6 +226,21 @@ fn use_ranked_low_twiddle_final_pair(log_d: usize, num_ntts: usize, n_top: usize
         && std::env::var_os("FLOCK_NO_NTT_LOW_TWIDDLE_FINAL").is_none()
 }
 
+/// The dimension-20 standard basis has five-bit high limbs throughout layer
+/// 17. This trims the preceding fused pair while retaining the generic outer
+/// layer-16 multiplication.
+#[inline]
+fn use_ranked_tiny_inner_twiddle_pair(log_d: usize, num_ntts: usize, n_top: usize) -> bool {
+    cfg!(all(
+        target_os = "macos",
+        target_arch = "aarch64",
+        target_feature = "aes"
+    )) && log_d == 20
+        && num_ntts == 64
+        && n_top == 10
+        && std::env::var_os("FLOCK_NO_NTT_TINY_INNER_PAIR").is_none()
+}
+
 /// The zero-root radix-8 kernel is currently scored only for the ranked L0
 /// transform. Keep recursive and diagnostic commits on their prior kernel so
 /// this candidate has one production scope and one transfer story.
@@ -895,8 +910,8 @@ impl AdditiveNttF128 {
         debug_assert_eq!(data.len(), (1usize << log_d) * num_ntts);
         let sub_size_positions = 1usize << (log_d - n_top);
         let sub_elems = sub_size_positions * num_ntts;
-        let low_twiddle_final_pair =
-            use_ranked_low_twiddle_final_pair(log_d, num_ntts, n_top);
+        let low_twiddle_final_pair = use_ranked_low_twiddle_final_pair(log_d, num_ntts, n_top);
+        let tiny_inner_twiddle_pair = use_ranked_tiny_inner_twiddle_pair(log_d, num_ntts, n_top);
 
         data.par_chunks_mut(sub_elems)
             .enumerate()
@@ -915,7 +930,18 @@ impl AdditiveNttF128 {
                         let t_inner_a = self.twiddle(layer + 1, 2 * global_block);
                         let t_inner_b = self.twiddle(layer + 1, 2 * global_block + 1);
                         let block_start = block_in_sub * block_elems;
-                        if low_twiddle_final_pair && layer + 2 == log_d {
+                        if tiny_inner_twiddle_pair && layer + 4 == log_d {
+                            debug_assert!(t_inner_a.hi < 32);
+                            debug_assert!(t_inner_b.hi < 32);
+                            butterfly_interleaved_fused_2layer_tiny_inner_twiddles_rows_seq(
+                                &mut sub_data[block_start..block_start + block_elems],
+                                t_outer,
+                                t_inner_a,
+                                t_inner_b,
+                                quarter,
+                                num_ntts,
+                            );
+                        } else if low_twiddle_final_pair && layer + 2 == log_d {
                             debug_assert_eq!(t_outer.hi, 0);
                             debug_assert_eq!(t_inner_a.hi, 0);
                             debug_assert_eq!(t_inner_b.hi, 0);
@@ -1379,6 +1405,37 @@ fn butterfly_interleaved_fused_2layer_low_twiddles_rows_seq(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
+#[inline]
+fn butterfly_interleaved_fused_2layer_tiny_inner_twiddles_rows_seq(
+    block: &mut [F128],
+    t_outer: F128,
+    t_inner_a: F128,
+    t_inner_b: F128,
+    quarter: usize,
+    num_ntts: usize,
+) {
+    let stride = quarter * num_ntts;
+    debug_assert!(num_ntts > 0);
+    debug_assert_eq!(block.len(), 4 * stride);
+    debug_assert!(t_inner_a.hi < 32);
+    debug_assert!(t_inner_b.hi < 32);
+
+    let (top_half, bot_half) = block.split_at_mut(2 * stride);
+    let (q1, q2) = top_half.split_at_mut(stride);
+    let (q3, q4) = bot_half.split_at_mut(stride);
+    for (((row_a, row_b), row_c), row_d) in q1
+        .chunks_exact_mut(num_ntts)
+        .zip(q2.chunks_exact_mut(num_ntts))
+        .zip(q3.chunks_exact_mut(num_ntts))
+        .zip(q4.chunks_exact_mut(num_ntts))
+    {
+        kernels::butterfly_fused_2layer_tiny_inner_twiddles(
+            row_a, row_b, row_c, row_d, t_outer, t_inner_a, t_inner_b,
+        );
+    }
+}
+
 /// Butterfly one block of an interleaved (SoA) buffer with shared twiddle.
 ///
 /// `block` has length `(2 * block_size_half) * num_ntts` and is laid out as
@@ -1757,6 +1814,52 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// The layer-(16,17) specialization must agree with the generic fused
+    /// pair for arbitrary outer twiddles and every allowed inner high limb.
+    #[test]
+    fn fused2_tiny_inner_twiddles_match_generic() {
+        let mut rng = Rng::new(0x16_17_0000_0005);
+        for (quarter, num_ntts) in [(1usize, 64usize), (4, 8), (64, 2)] {
+            for iteration in 0..8 {
+                let t_outer = F128::new(rng.next_u64(), rng.next_u64());
+                let tiny_hi = (iteration & 31) as u64;
+                let t_inner_a = F128::new(rng.next_u64(), tiny_hi);
+                let t_inner_b = F128::new(rng.next_u64(), 31 - tiny_hi);
+                let source = rand_vec(&mut rng, 4 * quarter * num_ntts);
+
+                let mut want = source.clone();
+                butterfly_interleaved_fused_2layer_rows_seq(
+                    &mut want, t_outer, t_inner_a, t_inner_b, quarter, num_ntts,
+                );
+                let mut got = source;
+                butterfly_interleaved_fused_2layer_tiny_inner_twiddles_rows_seq(
+                    &mut got, t_outer, t_inner_a, t_inner_b, quarter, num_ntts,
+                );
+                assert_eq!(
+                    got, want,
+                    "tiny-inner fused-2 mismatch at quarter={quarter} \
+                     num_ntts={num_ntts} iteration={iteration}"
+                );
+            }
+        }
+    }
+
+    /// Exhaust the production layer-17 table behind the narrow dispatch.
+    #[test]
+    fn standard_dim20_layer17_twiddles_have_five_bit_high_limbs() {
+        let ntt = AdditiveNttF128::standard(20);
+        for block in 0..(1usize << 17) {
+            assert!(
+                ntt.twiddle(17, block).hi < 32,
+                "large high limb at layer=17 block={block}"
+            );
+        }
+        assert!(use_ranked_tiny_inner_twiddle_pair(20, 64, 10));
+        assert!(!use_ranked_tiny_inner_twiddle_pair(19, 64, 10));
+        assert!(!use_ranked_tiny_inner_twiddle_pair(20, 32, 10));
+        assert!(!use_ranked_tiny_inner_twiddle_pair(20, 64, 9));
     }
 
     /// Exhaust the exact production tables used by layers 18 and 19. This is

@@ -1,5 +1,58 @@
 use crate::field::F128;
 
+/// Fused pair for the ranked layers (16,17): the outer twiddle is arbitrary,
+/// while both inner twiddles have five-bit high limbs.
+///
+/// # Safety
+/// Requires the `aes` target feature.
+#[allow(clippy::too_many_arguments)]
+#[target_feature(enable = "aes")]
+#[inline]
+pub(super) unsafe fn butterfly_fused_2layer_tiny_inner_twiddles(
+    a: &mut [F128],
+    b: &mut [F128],
+    c: &mut [F128],
+    d: &mut [F128],
+    t_outer: F128,
+    t_inner_a: F128,
+    t_inner_b: F128,
+) {
+    use crate::field::gf2_128::aarch64::{
+        ghash_mul_const_vec2_neon, ghash_mul_tiny_high_constants_vec2_neon,
+    };
+
+    debug_assert_eq!(a.len(), b.len());
+    debug_assert_eq!(a.len(), c.len());
+    debug_assert_eq!(a.len(), d.len());
+    debug_assert!(t_inner_a.hi < 32);
+    debug_assert!(t_inner_b.hi < 32);
+
+    for lane in 0..a.len() {
+        let mut xa = a[lane];
+        let mut xb = b[lane];
+        let mut xc = c[lane];
+        let mut xd = d[lane];
+
+        let outer = unsafe { ghash_mul_const_vec2_neon(t_outer, [xc, xd]) };
+        xa += outer[0];
+        xc += xa;
+        xb += outer[1];
+        xd += xb;
+
+        let inner =
+            unsafe { ghash_mul_tiny_high_constants_vec2_neon([t_inner_a, t_inner_b], [xb, xd]) };
+        xa += inner[0];
+        xb += xa;
+        xc += inner[1];
+        xd += xc;
+
+        a[lane] = xa;
+        b[lane] = xb;
+        c[lane] = xc;
+        d[lane] = xd;
+    }
+}
+
 /// Fused two-layer butterfly specialized for three low-limb-only twiddles.
 /// Two products are issued together at each stage, using four PMULLs instead
 /// of twelve for the pair under the generic Binius field multiplier.
@@ -35,17 +88,13 @@ pub(super) unsafe fn butterfly_fused_2layer_low_twiddles(
 
         // SAFETY: this function carries aes and all constants have zero high
         // limbs by the ranked gate and assertions above.
-        let outer = unsafe {
-            ghash_mul_low_constants_vec2_neon([t_outer, t_outer], [xc, xd])
-        };
+        let outer = unsafe { ghash_mul_low_constants_vec2_neon([t_outer, t_outer], [xc, xd]) };
         xa += outer[0];
         xc += xa;
         xb += outer[1];
         xd += xb;
 
-        let inner = unsafe {
-            ghash_mul_low_constants_vec2_neon([t_inner_a, t_inner_b], [xb, xd])
-        };
+        let inner = unsafe { ghash_mul_low_constants_vec2_neon([t_inner_a, t_inner_b], [xb, xd]) };
         xa += inner[0];
         xb += xa;
         xc += inner[1];

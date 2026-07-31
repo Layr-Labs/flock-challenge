@@ -478,6 +478,27 @@ mod tests {
         }
     }
 
+    /// The shortened reduction is valid throughout the complete five-bit
+    /// high-limb range used by the dimension-20 layer-17 twiddle table.
+    #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+    #[test]
+    fn tiny_high_constant_vec2_matches_scalar() {
+        let mut rng = Rng::new(0x17_0000_0005);
+        for hi0 in 0..32 {
+            for hi1 in 0..32 {
+                let constants = [
+                    F128::new(rng.next_u64(), hi0),
+                    F128::new(rng.next_u64(), hi1),
+                ];
+                let values = [rng.next_f128(), rng.next_f128()];
+                let got =
+                    unsafe { aarch64::ghash_mul_tiny_high_constants_vec2_neon(constants, values) };
+                assert_eq!(got[0], software::ghash_mul(constants[0], values[0]));
+                assert_eq!(got[1], software::ghash_mul(constants[1], values[1]));
+            }
+        }
+    }
+
     #[cfg(all(target_arch = "x86_64", target_feature = "pclmulqdq"))]
     #[test]
     fn all_x86_variants_agree() {
