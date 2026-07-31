@@ -155,8 +155,7 @@ pub struct ProverData {
 }
 
 // Recycle the codeword buffer (the prover's largest single allocation —
-// 128 MB at m = 29) and the flat Merkle tree (64 MiB at the ranked m = 32)
-// through the scratch pools instead of unmapping them.
+// 128 MB at m = 29) through the scratch pool instead of unmapping it.
 impl Drop for ProverData {
     fn drop(&mut self) {
         crate::scratch::give_f128(std::mem::take(&mut self.codeword));

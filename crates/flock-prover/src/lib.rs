@@ -14,7 +14,6 @@
 
 pub use flock_core::*;
 
-pub mod bench_input;
 pub mod chain;
 pub mod merkle_path;
 pub mod proof_io;

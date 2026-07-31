@@ -682,10 +682,10 @@ pub fn merkle_tree(data: &[u8], num_leaves: usize, kind: HashKind) -> Vec<Hash> 
 
     let leaf_size = data.len() / num_leaves;
     let total_nodes = 2 * num_leaves - 1;
-    // Pool-served uninit storage — every node is written exactly once before
-    // being read: leaves at step 1, then each internal level reads the level
-    // below (which was just written) and writes itself.
-    let mut tree: Vec<Hash> = crate::scratch::take_hash(total_nodes);
+    // Uninit alloc — every node is written exactly once before being read:
+    // leaves at step 1, then each internal level reads the level below (which
+    // was just written) and writes itself.
+    let mut tree: Vec<Hash> = crate::alloc_uninit_vec(total_nodes);
 
     // 1. Leaves — fully parallel, SIMD-batched across leaves where possible.
     hash_leaves(data, leaf_size, &mut tree[..num_leaves], kind);

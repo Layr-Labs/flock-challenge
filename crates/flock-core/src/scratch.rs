@@ -19,7 +19,7 @@
 
 use crate::field::F128;
 use core::ops::{Deref, DerefMut};
-use std::sync::{Mutex, OnceLock};
+use std::sync::Mutex;
 
 static POOL: Mutex<Vec<Vec<F128>>> = Mutex::new(Vec::new());
 
@@ -160,79 +160,6 @@ pub fn prewarm_prover(m: usize) {
 pub fn clear() {
     POOL.lock().unwrap().clear();
     POOL_U8.lock().unwrap().clear();
-    POOL_HASH.lock().unwrap().clear();
-}
-
-// ---------------------------------------------------------------------------
-// Merkle-node pool (`Vec<Hash>` flat trees).
-//
-// Every prove builds one 64 MiB L0 tree (2·n_leaves−1 hashes at the ranked
-// m = 32 shape) plus a geometric ladder of smaller recursive-level trees, all
-// previously via fresh `alloc_uninit_vec` — so each TIMED proof re-paid
-// ~4k soft page faults (16 KiB pages) on first touch and a single-threaded
-// munmap on drop. Pooling them mirrors the F128 pool: the warm-up proof
-// faults the pages once, the timed proof reuses resident memory.
-// Contents are NOT cleared; the same write-before-read contract applies
-// (every tree node is written before it is read — see `merkle_tree`).
-//
-// Opt-out: `FLOCK_NO_TREE_POOL=1` restores the old fresh-alloc behavior
-// (take falls back to `alloc_uninit_vec`, give drops). Allocation source
-// cannot change proof bytes; the gate exists for A/B measurement.
-
-static POOL_HASH: Mutex<Vec<Vec<crate::merkle::Hash>>> = Mutex::new(Vec::new());
-
-/// L0 tree + recursive-level trees ≈ 5 live classes per prove.
-const MAX_POOLED_HASH: usize = 8;
-
-fn tree_pool_enabled() -> bool {
-    static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("FLOCK_NO_TREE_POOL").is_none())
-}
-
-/// Take a length-`n` `Vec<Hash>`, preferring a pooled buffer (smallest
-/// capacity ≥ `n`); falls back to a fresh uninitialized allocation.
-/// Contents are UNINITIALIZED either way (write-before-read contract,
-/// same as [`take_f128`]).
-pub(crate) fn take_hash(n: usize) -> Vec<crate::merkle::Hash> {
-    if tree_pool_enabled() {
-        let mut pool = POOL_HASH.lock().unwrap();
-        let mut best: Option<usize> = None;
-        for (i, v) in pool.iter().enumerate() {
-            if v.capacity() >= n && best.is_none_or(|b| v.capacity() < pool[b].capacity()) {
-                best = Some(i);
-            }
-        }
-        if let Some(i) = best {
-            let mut v = pool.swap_remove(i);
-            drop(pool);
-            v.clear();
-            // SAFETY: capacity ≥ n was checked above; Hash = [u8; 32] is Copy
-            // (no Drop), so holding stale/uninit elements is sound — the
-            // caller upholds write-before-read per this function's contract.
-            unsafe { v.set_len(n) };
-            return v;
-        }
-    }
-    crate::alloc_uninit_vec(n)
-}
-
-/// Return a Merkle-node buffer to the pool for reuse (smallest-first
-/// eviction when full, same policy as the F128 pool).
-pub(crate) fn give_hash(v: Vec<crate::merkle::Hash>) {
-    if !tree_pool_enabled() || v.capacity() == 0 {
-        return;
-    }
-    let mut pool = POOL_HASH.lock().unwrap();
-    pool.push(v);
-    if pool.len() > MAX_POOLED_HASH {
-        let smallest = pool
-            .iter()
-            .enumerate()
-            .min_by_key(|(_, v)| v.capacity())
-            .map(|(i, _)| i)
-            .expect("pool non-empty");
-        pool.swap_remove(smallest);
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -285,6 +212,62 @@ pub fn give_u8(v: Vec<u8>) {
     let mut pool = POOL_U8.lock().unwrap();
     pool.push(v);
     if pool.len() > MAX_POOLED_U8 {
+        let smallest = pool
+            .iter()
+            .enumerate()
+            .min_by_key(|(_, v)| v.capacity())
+            .map(|(i, _)| i)
+            .expect("pool non-empty");
+        pool.swap_remove(smallest);
+    }
+}
+
+// Merkle-tree node buffers (L0's 64 MiB flat tree at the ranked shape plus
+// one smaller tree per recursive Ligerito level). Same motivation as the
+// pools above: the allocator munmaps these on free, so without pooling every
+// prove re-pays ~16k soft faults on first touch plus a single-threaded unmap
+// on drop. Contents are NOT cleared; every consumer writes each node before
+// the root is read (write-before-read contract as for [`take_f128`]).
+
+static POOL_HASH: Mutex<Vec<Vec<crate::merkle::Hash>>> = Mutex::new(Vec::new());
+
+/// L0 tree + ~3 recursive-level trees, with headroom for one warm spare.
+const MAX_POOLED_HASH: usize = 6;
+
+/// Take a length-`n` `Hash` vector, preferring a pooled buffer (smallest
+/// capacity >= `n`); falls back to a fresh uninitialized allocation.
+/// Contents are UNINITIALIZED in both cases (write-before-read contract,
+/// same as [`take_f128`]).
+pub fn take_hash(n: usize) -> Vec<crate::merkle::Hash> {
+    {
+        let mut pool = POOL_HASH.lock().unwrap();
+        let mut best: Option<usize> = None;
+        for (i, v) in pool.iter().enumerate() {
+            if v.capacity() >= n && best.is_none_or(|b| v.capacity() < pool[b].capacity()) {
+                best = Some(i);
+            }
+        }
+        if let Some(i) = best {
+            let mut v = pool.swap_remove(i);
+            // SAFETY: capacity >= n was checked above; Hash = [u8; 32] is
+            // Copy (no Drop), so holding stale bytes is sound — the caller
+            // upholds write-before-read per this function's contract.
+            unsafe { v.set_len(n) };
+            return v;
+        }
+    }
+    crate::alloc_uninit_vec(n)
+}
+
+/// Return a `Hash` buffer to the pool for reuse (smallest-first eviction
+/// when full, same policy as the other pools).
+pub fn give_hash(v: Vec<crate::merkle::Hash>) {
+    if v.capacity() == 0 {
+        return;
+    }
+    let mut pool = POOL_HASH.lock().unwrap();
+    pool.push(v);
+    if pool.len() > MAX_POOLED_HASH {
         let smallest = pool
             .iter()
             .enumerate()
