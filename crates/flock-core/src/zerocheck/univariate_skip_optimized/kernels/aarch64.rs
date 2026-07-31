@@ -1,4 +1,4 @@
-use super::super::{F8, F128, InvNttTableByteSingleGf8, N_CHUNKS};
+use super::super::{F8, F128, F256Unreduced, InvNttTableByteSingleGf8, N_CHUNKS};
 
 /// Four-lane convert-table fold.
 ///
@@ -100,10 +100,14 @@ pub(crate) unsafe fn accumulate_convert(
 /// ```
 /// which is exactly the two bank-0 terms the unpaired loop XORs across those
 /// `b_med`, and symmetrically for bank 1. The banks never mix, so
-/// `partial_c_0` and `partial_c_1` stay separate. This is an identity, not an
-/// approximation: it follows from `convert` being F2-linear in its index bits
-/// (verified exhaustively by `convert_table_index_linear`), so the result is
-/// bit-identical to the unpaired fold.
+/// `partial_c_0` and `partial_c_1` stay separate.
+///
+/// The drained convert values are multiplied by the caller's combined
+/// `eq_lo * eq_hi` weight without reduction. Their full 256-bit products are
+/// XORed into worker-lifetime accumulators and reduced once after all assigned
+/// outer positions. Both transformations are identities: table pairing
+/// follows from `convert` being F2-linear in its index bits, and GHASH
+/// reduction commutes with XOR.
 ///
 /// An odd trailing `b_med` (only reachable on the padded boundary window) falls
 /// back to the unpaired path.
@@ -116,10 +120,10 @@ pub(crate) unsafe fn accumulate_convert_with_s_hat_v(
     convert: &[F128],
     m0: &[F128],
     m1: &[F128],
-    eq_lo_val: F128,
-    partial_ab: &mut [F128; 64],
-    partial_c_0: &mut [F128; 64],
-    partial_c_1: &mut [F128; 64],
+    eq_weight: F128,
+    partial_ab: &mut [F256Unreduced; 64],
+    partial_c_0: &mut [F256Unreduced; 64],
+    partial_c_1: &mut [F256Unreduced; 64],
 ) {
     use core::arch::aarch64::*;
 
@@ -168,10 +172,10 @@ pub(crate) unsafe fn accumulate_convert_with_s_hat_v(
                 // word is exactly `chunk_*[b][lane + k]`, so every extracted
                 // index — and every gather it addresses — is bit-identical to
                 // the byte-load form.
-                let we = (chunk_ab_bytes[b_even].as_ptr().add(lane) as *const u32)
-                    .read_unaligned() as usize;
-                let wo = (chunk_ab_bytes[b_odd].as_ptr().add(lane) as *const u32)
-                    .read_unaligned() as usize;
+                let we = (chunk_ab_bytes[b_even].as_ptr().add(lane) as *const u32).read_unaligned()
+                    as usize;
+                let wo = (chunk_ab_bytes[b_odd].as_ptr().add(lane) as *const u32).read_unaligned()
+                    as usize;
                 let e0 = we & 0xff;
                 let e1 = (we >> 8) & 0xff;
                 let e2 = (we >> 16) & 0xff;
@@ -196,10 +200,10 @@ pub(crate) unsafe fn accumulate_convert_with_s_hat_v(
                 // boundary because a bit at even position 2i moves to odd
                 // position 2i+1 of the SAME byte (bit 7 is masked out by
                 // 0xaa's byte pattern before it could wrap).
-                let ce = (chunk_c_bytes[b_even].as_ptr().add(lane) as *const u32)
-                    .read_unaligned() as usize;
-                let co = (chunk_c_bytes[b_odd].as_ptr().add(lane) as *const u32)
-                    .read_unaligned() as usize;
+                let ce = (chunk_c_bytes[b_even].as_ptr().add(lane) as *const u32).read_unaligned()
+                    as usize;
+                let co = (chunk_c_bytes[b_odd].as_ptr().add(lane) as *const u32).read_unaligned()
+                    as usize;
                 let jw = (ce & 0x5555_5555) | ((co << 1) & 0xaaaa_aaaa);
                 let kw = (ce & 0xaaaa_aaaa) | ((co >> 1) & 0x5555_5555);
                 let j0 = jw & 0xff;
@@ -224,10 +228,10 @@ pub(crate) unsafe fn accumulate_convert_with_s_hat_v(
             if n_b_med & 1 == 1 {
                 let b_med = n_b_med - 1;
                 let table = convert_ptr.add(b_med * 256 * 16);
-                let wa = (chunk_ab_bytes[b_med].as_ptr().add(lane) as *const u32)
-                    .read_unaligned() as usize;
-                let wc = (chunk_c_bytes[b_med].as_ptr().add(lane) as *const u32)
-                    .read_unaligned() as usize;
+                let wa = (chunk_ab_bytes[b_med].as_ptr().add(lane) as *const u32).read_unaligned()
+                    as usize;
+                let wc = (chunk_c_bytes[b_med].as_ptr().add(lane) as *const u32).read_unaligned()
+                    as usize;
                 let a0 = wa & 0xff;
                 let a1 = (wa >> 8) & 0xff;
                 let a2 = (wa >> 16) & 0xff;
@@ -253,18 +257,21 @@ pub(crate) unsafe fn accumulate_convert_with_s_hat_v(
                     let ab = vreinterpretq_u64_u8($ab);
                     let c0 = vreinterpretq_u64_u8($c0);
                     let c1 = vreinterpretq_u64_u8($c1);
-                    partial_ab[lane + $offset] += F128 {
+                    partial_ab[lane + $offset] ^= F128 {
                         lo: vgetq_lane_u64::<0>(ab),
                         hi: vgetq_lane_u64::<1>(ab),
-                    } * eq_lo_val;
-                    partial_c_0[lane + $offset] += F128 {
+                    }
+                    .mul_unreduced(eq_weight);
+                    partial_c_0[lane + $offset] ^= F128 {
                         lo: vgetq_lane_u64::<0>(c0),
                         hi: vgetq_lane_u64::<1>(c0),
-                    } * eq_lo_val;
-                    partial_c_1[lane + $offset] += F128 {
+                    }
+                    .mul_unreduced(eq_weight);
+                    partial_c_1[lane + $offset] ^= F128 {
                         lo: vgetq_lane_u64::<0>(c1),
                         hi: vgetq_lane_u64::<1>(c1),
-                    } * eq_lo_val;
+                    }
+                    .mul_unreduced(eq_weight);
                 }};
             }
             drain_lane!(0, ab0, c00, c10);

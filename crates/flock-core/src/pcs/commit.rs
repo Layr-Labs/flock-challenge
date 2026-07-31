@@ -220,15 +220,35 @@ pub fn commit_into(
         "commit_into: prebuilt codeword buffer has wrong length"
     );
 
-    // RS encoding of [z, 0, …, 0] starts with `log_inv_rate` butterfly layers
-    // whose bottom inputs are all zero — each is a pure copy, so after those
-    // layers the buffer holds 2^log_inv_rate replicas of z. Write that state
-    // directly (replicating z costs the same writes as the zero-fill it
-    // replaces) and start the NTT at layer `log_inv_rate`, skipping those
-    // layers' full-buffer reads and multiplies.
-    replicate_message_fill(&mut codeword, z_packed);
+    let timing = std::env::var_os("FLOCK_COMMIT_TIMING").is_some();
+    let t_init = std::time::Instant::now();
+    let ntt = AdditiveNttF128::standard(params.k_code());
+    let start_layer = if use_direct_rate2_fused_init(params) {
+        // Rate 1/2 gives two identical post-layer-1 message replicas. Produce
+        // both blocks' post-radix-8 state directly from z, eliminating the
+        // intermediate 1 GiB replicated write plus its immediate NTT reread.
+        ntt.initialize_interleaved_rate2_fused3(&mut codeword, z_packed, params.num_ntts());
+        4
+    } else {
+        // RS encoding of [z, 0, …, 0] starts with `log_inv_rate` butterfly
+        // layers whose bottom inputs are all zero — each is a pure copy, so
+        // after those layers the buffer holds 2^log_inv_rate replicas of z.
+        replicate_message_fill(&mut codeword, z_packed);
+        params.log_inv_rate
+    };
+    if timing {
+        let phase = if start_layer == 4 {
+            "direct-rate2-radix8-init"
+        } else {
+            "replicate-fill"
+        };
+        eprintln!(
+            "[commit-timing] {phase}: {:.2} ms",
+            t_init.elapsed().as_secs_f64() * 1e3
+        );
+    }
 
-    finalize_commit(codeword, params)
+    finalize_commit(codeword, params, &ntt, start_layer)
 }
 
 /// Fill `codeword` with `2^r` replicas of `msg` (`r = log2(codeword.len() /
@@ -255,6 +275,23 @@ pub(crate) fn replicate_message_fill(codeword: &mut [F128], msg: &[F128]) {
             rep.copy_from_slice(msg);
         }
     }
+}
+
+/// Production geometry plus the m=30 contract-faithful local proxy. Other
+/// rates, hashes, profiles, and interleaving widths retain replicate-fill.
+#[inline]
+fn is_direct_rate2_fused_init_shape(params: &PcsParams) -> bool {
+    matches!(params.m, 30 | 32)
+        && params.log_inv_rate == 1
+        && params.log_batch_size == 6
+        && params.profile == crate::pcs::ligerito::LigeritoProfile::Fast
+        && params.merkle_hash == HashKind::Blake3
+}
+
+#[inline]
+fn use_direct_rate2_fused_init(params: &PcsParams) -> bool {
+    is_direct_rate2_fused_init_shape(params)
+        && std::env::var_os("FLOCK_NO_DIRECT_NTT_INIT").is_none()
 }
 
 /// Exact ranked geometry for the cache-local NTT-to-Merkle leaf pipeline.
@@ -295,6 +332,7 @@ fn ranked_ntt_with_pipelined_leaves(
     ntt: &AdditiveNttF128,
     codeword: &mut [F128],
     params: &PcsParams,
+    start_layer: usize,
     leaves: &mut [Hash],
     helper: &rayon::ThreadPool,
 ) {
@@ -353,7 +391,7 @@ fn ranked_ntt_with_pipelined_leaves(
         ntt.forward_transform_interleaved_from_layer_and_then(
             codeword,
             num_ntts,
-            params.log_inv_rate,
+            start_layer,
             |elem_offset, chunk| {
                 let job = RankedLeafJob {
                     elem_offset,
@@ -386,7 +424,12 @@ fn ranked_ntt_with_pipelined_leaves(
 
 /// Shared tail of [`commit`] / [`commit_into`]: interleaved forward additive
 /// NTT (RS-encode every lane) then the initial Merkle tree over codeword rows.
-fn finalize_commit(mut codeword: Vec<F128>, params: &PcsParams) -> (Commitment, ProverData) {
+fn finalize_commit(
+    mut codeword: Vec<F128>,
+    params: &PcsParams,
+    ntt: &AdditiveNttF128,
+    start_layer: usize,
+) -> (Commitment, ProverData) {
     let helper = if use_ranked_ntt_merkle_leaf_pipeline(params) && rayon::current_num_threads() > 1
     {
         crate::epool::epool()
@@ -407,23 +450,20 @@ fn finalize_commit(mut codeword: Vec<F128>, params: &PcsParams) -> (Commitment, 
     let t_ntt = std::time::Instant::now();
     // ---- Interleaved forward additive NTT: 2^log_batch_size independent
     // sub-NTTs with shared twiddles. Each sub-NTT operates on its lane of the
-    // SoA buffer. The first `log_inv_rate` layers were pre-applied by the
-    // caller's replicate-fill (commit_into), so start past them.
-    let ntt = AdditiveNttF128::standard(params.k_code());
+    // SoA buffer. The caller has already produced the exact state at
+    // `start_layer`, either with replicate-fill or the direct rate-2 radix-8
+    // initializer, so continue from there.
     if let (Some(helper), Some(tree)) = (helper, prehashed_tree.as_mut()) {
         ranked_ntt_with_pipelined_leaves(
-            &ntt,
+            ntt,
             &mut codeword,
             params,
+            start_layer,
             &mut tree[..params.n_leaves()],
             helper,
         );
     } else {
-        ntt.forward_transform_interleaved_from_layer(
-            &mut codeword,
-            params.num_ntts(),
-            params.log_inv_rate,
-        );
+        ntt.forward_transform_interleaved_from_layer(&mut codeword, params.num_ntts(), start_layer);
     }
     if timing {
         let phase = if pipelined_leaves {
@@ -689,6 +729,7 @@ mod tests {
             &ntt,
             &mut got_codeword,
             &params,
+            params.log_inv_rate,
             &mut got_tree[..params.n_leaves()],
             &helper,
         );
@@ -700,6 +741,37 @@ mod tests {
 
         assert_eq!(got_codeword, expect_codeword);
         assert_eq!(got_tree, expect_tree);
+    }
+
+    #[test]
+    fn direct_rate2_fused_init_gate_is_narrow() {
+        let params = PcsParams {
+            m: 32,
+            log_inv_rate: 1,
+            log_batch_size: 6,
+            profile: crate::pcs::ligerito::LigeritoProfile::Fast,
+            merkle_hash: HashKind::Blake3,
+        };
+        assert!(is_direct_rate2_fused_init_shape(&params));
+
+        let mut proxy = params.clone();
+        proxy.m = 30;
+        assert!(is_direct_rate2_fused_init_shape(&proxy));
+        proxy.m = 31;
+        assert!(!is_direct_rate2_fused_init_shape(&proxy));
+
+        let mut changed = params.clone();
+        changed.log_inv_rate = 2;
+        assert!(!is_direct_rate2_fused_init_shape(&changed));
+        let mut changed = params.clone();
+        changed.log_batch_size = 5;
+        assert!(!is_direct_rate2_fused_init_shape(&changed));
+        let mut changed = params.clone();
+        changed.profile = crate::pcs::ligerito::LigeritoProfile::Secure;
+        assert!(!is_direct_rate2_fused_init_shape(&changed));
+        let mut changed = params;
+        changed.merkle_hash = HashKind::Sha256;
+        assert!(!is_direct_rate2_fused_init_shape(&changed));
     }
 
     /// The replicate-fill + start-at-layer-`log_inv_rate` fast path must be

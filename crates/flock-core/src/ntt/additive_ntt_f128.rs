@@ -168,7 +168,7 @@ fn fusion_aware_interleaved_n_top(
         target_feature = "aes"
     )) && log_d == 20
         && num_ntts == 64
-        && start_layer == 1
+        && matches!(start_layer, 1 | 4)
         && n_top == 9;
     if ranked_apple_l0 { 10 } else { n_top }
 }
@@ -189,7 +189,7 @@ fn use_ranked_deep_pair_fusion(
         target_feature = "aes"
     )) && log_d == 20
         && num_ntts == 64
-        && start_layer == 1
+        && matches!(start_layer, 1 | 4)
         && n_top == 10
 }
 
@@ -300,6 +300,70 @@ impl AdditiveNttF128 {
     /// `num_ntts` F_{2^128} elements).
     pub fn forward_transform_interleaved(&self, data: &mut [F128], num_ntts: usize) {
         self.forward_transform_interleaved_from_layer(data, num_ntts, 0);
+    }
+
+    /// Initialize a rate-1/2 interleaved codeword directly at the state after
+    /// NTT layers 1, 2, and 3.
+    ///
+    /// Ordinarily the caller writes two complete replicas of `message`, then
+    /// the first radix-8 group rereads and rewrites the whole codeword. Both
+    /// halves start from the same message, so this out-of-place initializer
+    /// loads each source row group once, applies the block-zero and block-one
+    /// radix-8 transforms in registers, and writes only their final outputs.
+    /// The returned state must be continued with
+    /// [`Self::forward_transform_interleaved_from_layer`] at layer 4.
+    pub(crate) fn initialize_interleaved_rate2_fused3(
+        &self,
+        codeword: &mut [F128],
+        message: &[F128],
+        num_ntts: usize,
+    ) {
+        use rayon::prelude::*;
+
+        assert!(num_ntts.is_power_of_two() && num_ntts > 0);
+        assert_eq!(codeword.len(), 2 * message.len());
+        assert_eq!(message.len() % num_ntts, 0);
+        let message_positions = message.len() / num_ntts;
+        assert!(message_positions.is_power_of_two() && message_positions >= 8);
+        let log_d = log2_pow2(2 * message_positions);
+        assert!(log_d <= self.log_domain_size() && log_d >= 4);
+
+        let twiddles = |block: usize| {
+            let mut tw = [F128::ZERO; 7];
+            tw[0] = self.twiddle(1, block);
+            for s in 0..2 {
+                tw[1 + s] = self.twiddle(2, 2 * block + s);
+            }
+            for s in 0..4 {
+                tw[3 + s] = self.twiddle(3, 4 * block + s);
+            }
+            tw
+        };
+        let root_twiddles = twiddles(0);
+        let sibling_twiddles = twiddles(1);
+        debug_assert_eq!(root_twiddles[0], F128::ZERO);
+        debug_assert_eq!(root_twiddles[1], F128::ZERO);
+        debug_assert_eq!(root_twiddles[3], F128::ZERO);
+
+        let eighth = message_positions >> 3;
+        let src = message.as_ptr() as usize;
+        let dst = codeword.as_mut_ptr() as usize;
+        (0..eighth).into_par_iter().with_min_len(256).for_each(|r| {
+            // SAFETY: each r writes a distinct row from every one of the 16
+            // output streams. The immutable message allocation is separate
+            // from the caller-owned mutable codeword.
+            unsafe {
+                kernels::initialize_rate2_fused_3layer_row(
+                    src as *const F128,
+                    dst as *mut F128,
+                    eighth,
+                    num_ntts,
+                    r,
+                    &root_twiddles,
+                    &sibling_twiddles,
+                );
+            }
+        });
     }
 
     /// Forward interleaved NTT starting at `start_layer`, assuming the first
@@ -1435,6 +1499,52 @@ mod tests {
         assert!(observed.1.iter().all(|&count| count == 1));
     }
 
+    /// The rate-1/2 direct initializer must equal a definitional replicated
+    /// buffer after ordinary layers 1, 2, and 3, then remain equal through the
+    /// rest of the transform.
+    #[test]
+    fn direct_rate2_fused3_init_matches_replicated_layers() {
+        let mut rng = Rng::new(0xD1EC_7A7E_2000_0001);
+        for (log_d, num_ntts) in [(7usize, 2usize), (10, 8), (12, 64)] {
+            let ntt = AdditiveNttF128::standard(log_d);
+            let message = rand_vec(&mut rng, (1usize << (log_d - 1)) * num_ntts);
+
+            let mut want = vec![F128::ZERO; 2 * message.len()];
+            want[..message.len()].copy_from_slice(&message);
+            want[message.len()..].copy_from_slice(&message);
+            for layer in 1..4 {
+                let num_blocks = 1usize << layer;
+                let block_size = 1usize << (log_d - layer);
+                let half = block_size >> 1;
+                let block_elems = block_size * num_ntts;
+                for block in 0..num_blocks {
+                    let twiddle = ntt.twiddle(layer, block);
+                    let start = block * block_elems;
+                    butterfly_interleaved_block(
+                        &mut want[start..start + block_elems],
+                        twiddle,
+                        half,
+                        num_ntts,
+                    );
+                }
+            }
+
+            let mut got = vec![F128::ZERO; 2 * message.len()];
+            ntt.initialize_interleaved_rate2_fused3(&mut got, &message, num_ntts);
+            assert_eq!(
+                got, want,
+                "post-layer-4 state mismatch at log_d={log_d} num_ntts={num_ntts}"
+            );
+
+            ntt.forward_transform_interleaved_scalar_from_layer(&mut want, num_ntts, 4);
+            ntt.forward_transform_interleaved_from_layer(&mut got, num_ntts, 4);
+            assert_eq!(
+                got, want,
+                "final codeword mismatch at log_d={log_d} num_ntts={num_ntts}"
+            );
+        }
+    }
+
     /// Only the ranked macOS/AArch64 L0 transform may use the new tail
     /// schedule; all recursive, diagnostic, and cross-platform shapes retain
     /// the existing single-layer deep loop.
@@ -1446,11 +1556,13 @@ mod tests {
             target_feature = "aes"
         ));
         assert_eq!(use_ranked_deep_pair_fusion(20, 64, 1, 10), enabled_here);
+        assert_eq!(use_ranked_deep_pair_fusion(20, 64, 4, 10), enabled_here);
         assert!(!use_ranked_deep_pair_fusion(19, 64, 1, 10));
         assert!(!use_ranked_deep_pair_fusion(20, 8, 1, 10));
         assert!(!use_ranked_deep_pair_fusion(20, 64, 0, 10));
         assert!(!use_ranked_deep_pair_fusion(20, 64, 1, 9));
         assert_eq!(use_ranked_zero_root_fusion(20, 64, 1, 10), enabled_here);
+        assert_eq!(use_ranked_zero_root_fusion(20, 64, 4, 10), enabled_here);
         assert!(!use_ranked_zero_root_fusion(19, 64, 1, 10));
         assert!(!use_ranked_zero_root_fusion(20, 8, 1, 10));
         assert!(!use_ranked_zero_root_fusion(20, 64, 0, 10));
@@ -1624,6 +1736,7 @@ mod tests {
         // Guard the narrowly-scoped production policy independently of the
         // smaller arithmetic fixture above.
         assert_eq!(fusion_aware_interleaved_n_top(20, 64, 1, 9), 10);
+        assert_eq!(fusion_aware_interleaved_n_top(20, 64, 4, 9), 10);
         assert_eq!(fusion_aware_interleaved_n_top(19, 64, 1, 9), 9);
         assert_eq!(fusion_aware_interleaved_n_top(20, 8, 1, 9), 9);
         assert_eq!(fusion_aware_interleaved_n_top(20, 64, 0, 9), 9);

@@ -32,6 +32,8 @@
 
 use std::sync::{LazyLock, OnceLock};
 
+#[cfg(target_arch = "aarch64")]
+use crate::field::F256Unreduced;
 use crate::field::{F8, F128, PHI_8_TABLE, mul_by_x, phi8};
 use crate::ntt::InvNttTableByteSingleGf8;
 
@@ -76,6 +78,15 @@ const N_CHUNKS: usize = 8;
 /// Total inner-most dims absorbed by the optimization: 3 small + 4 medium.
 const N_INNER: usize = 7;
 const N_MEDIUM: usize = 4;
+
+// On AArch64 the scored round-1 path carries the convert-table products in
+// their full 256-bit polynomial form across every outer position assigned to
+// a Rayon worker. Reduction is F2-linear, so one reduction at worker drain is
+// exactly equivalent to reducing every product before XOR accumulation.
+#[cfg(target_arch = "aarch64")]
+type Round1Accumulator = F256Unreduced;
+#[cfg(not(target_arch = "aarch64"))]
+type Round1Accumulator = F128;
 
 /// The three small-eq challenges (as F_8 values, then embedded via φ_8).
 /// Choosing these specific values is what makes `eq_small[K] = C_s · α^K`.
@@ -602,18 +613,19 @@ fn process_one_x_hi(
 // By F_2-linearity of φ_8, `PHI_8(v) == PHI_8(v & 0x55) + PHI_8(v & 0xAA)`,
 // so summing the two banks reconstructs the original `cf_c` → wire `res_c_s`.
 //
-// Per chunk-lane-b_med, this costs +1 `vld1q_u8` + +1 `veorq_u8`. Everything
-// else (shift_reduce_inner_ab, bit_transpose, partial_ab/c fold, eq_hi
-// outer fold) is unchanged.
+// Per chunk-lane-b_med, this costs +1 `vld1q_u8` + +1 `veorq_u8`.
 // ---------------------------------------------------------------------------
 
 /// Per-worker scratch + local accumulator for the two-bank C variant.
-/// Identical to [`WorkerState`] except `partial_c` and `local_res_c_s` are
-/// split into bank 0 / bank 1.
+///
+/// AArch64 uses `partial_*` as worker-lifetime unreduced accumulators. Other
+/// targets retain the per-`x_hi` reduced partials and `local_res_*` high fold.
+/// Keeping that distinction behind [`Round1Accumulator`] leaves the portable
+/// and x86 schedules unchanged.
 struct WorkerStateWithSHatV {
-    partial_ab: [F128; ELL],
-    partial_c_0: [F128; ELL],
-    partial_c_1: [F128; ELL],
+    partial_ab: [Round1Accumulator; ELL],
+    partial_c_0: [Round1Accumulator; ELL],
+    partial_c_1: [Round1Accumulator; ELL],
     chunk_ab_bytes: [[u8; 64]; 1 << N_MEDIUM],
     chunk_c_bytes: [[u8; 64]; 1 << N_MEDIUM],
     a_col: [F8; ELL],
@@ -626,9 +638,9 @@ struct WorkerStateWithSHatV {
 impl WorkerStateWithSHatV {
     fn new() -> Self {
         Self {
-            partial_ab: [F128::ZERO; ELL],
-            partial_c_0: [F128::ZERO; ELL],
-            partial_c_1: [F128::ZERO; ELL],
+            partial_ab: [Round1Accumulator::ZERO; ELL],
+            partial_c_0: [Round1Accumulator::ZERO; ELL],
+            partial_c_1: [Round1Accumulator::ZERO; ELL],
             chunk_ab_bytes: [[0u8; 64]; 1 << N_MEDIUM],
             chunk_c_bytes: [[0u8; 64]; 1 << N_MEDIUM],
             a_col: [F8::ZERO; ELL],
@@ -637,6 +649,30 @@ impl WorkerStateWithSHatV {
             local_res_c_s_0: [F128::ZERO; ELL],
             local_res_c_s_1: [F128::ZERO; ELL],
         }
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    fn into_results(mut self) -> ([F128; ELL], [F128; ELL], [F128; ELL]) {
+        for lane in 0..ELL {
+            self.local_res_ab[lane] += self.partial_ab[lane].reduce();
+            self.local_res_c_s_0[lane] += self.partial_c_0[lane].reduce();
+            self.local_res_c_s_1[lane] += self.partial_c_1[lane].reduce();
+        }
+
+        (
+            self.local_res_ab,
+            self.local_res_c_s_0,
+            self.local_res_c_s_1,
+        )
+    }
+
+    #[cfg(not(target_arch = "aarch64"))]
+    fn into_results(self) -> ([F128; ELL], [F128; ELL], [F128; ELL]) {
+        (
+            self.local_res_ab,
+            self.local_res_c_s_0,
+            self.local_res_c_s_1,
+        )
     }
 }
 
@@ -661,8 +697,11 @@ fn process_one_x_hi_with_s_hat_v(
     paired_c: &(Vec<F128>, Vec<F128>),
     state: &mut WorkerStateWithSHatV,
 ) {
+    #[cfg(not(target_arch = "aarch64"))]
     state.partial_ab.iter_mut().for_each(|p| *p = F128::ZERO);
+    #[cfg(not(target_arch = "aarch64"))]
     state.partial_c_0.iter_mut().for_each(|p| *p = F128::ZERO);
+    #[cfg(not(target_arch = "aarch64"))]
     state.partial_c_1.iter_mut().for_each(|p| *p = F128::ZERO);
 
     let n_lo = n_lo_and_inner - N_INNER;
@@ -677,6 +716,10 @@ fn process_one_x_hi_with_s_hat_v(
 
         let chunk_byte_base = ((x_outer_lo << N_INNER) | (x_hi << n_lo_and_inner)) * N_CHUNKS;
         let eq_lo_val = eq_lo_scaled[x_outer_lo];
+        #[cfg(target_arch = "aarch64")]
+        let eq_weight = eq_lo_val * eq_hi_val;
+        #[cfg(not(target_arch = "aarch64"))]
+        let eq_weight = eq_lo_val;
 
         if n_b_med == (1 << N_MEDIUM) {
             for b_med in 0..(1 << N_MEDIUM) {
@@ -703,7 +746,7 @@ fn process_one_x_hi_with_s_hat_v(
                 1 << N_MEDIUM,
                 convert,
                 paired_c,
-                eq_lo_val,
+                eq_weight,
                 &mut state.partial_ab,
                 &mut state.partial_c_0,
                 &mut state.partial_c_1,
@@ -733,7 +776,7 @@ fn process_one_x_hi_with_s_hat_v(
                 n_b_med,
                 convert,
                 paired_c,
-                eq_lo_val,
+                eq_weight,
                 &mut state.partial_ab,
                 &mut state.partial_c_0,
                 &mut state.partial_c_1,
@@ -741,7 +784,11 @@ fn process_one_x_hi_with_s_hat_v(
         }
     }
 
-    // Outer fold by eq_hi (per bank).
+    // The portable path forms one partial per x_hi and applies its high
+    // equality factor here. AArch64 has already combined eq_lo*eq_hi once per
+    // outer position and accumulated unreduced products directly across every
+    // x_hi assigned to this worker.
+    #[cfg(not(target_arch = "aarch64"))]
     for lane in 0..ELL {
         state.local_res_ab[lane] += eq_hi_val * state.partial_ab[lane];
         state.local_res_c_s_0[lane] += eq_hi_val * state.partial_c_0[lane];
@@ -768,8 +815,11 @@ fn process_one_x_hi_with_precomputed_ab(
     paired_c: &(Vec<F128>, Vec<F128>),
     state: &mut WorkerStateWithSHatV,
 ) {
+    #[cfg(not(target_arch = "aarch64"))]
     state.partial_ab.iter_mut().for_each(|p| *p = F128::ZERO);
+    #[cfg(not(target_arch = "aarch64"))]
     state.partial_c_0.iter_mut().for_each(|p| *p = F128::ZERO);
+    #[cfg(not(target_arch = "aarch64"))]
     state.partial_c_1.iter_mut().for_each(|p| *p = F128::ZERO);
 
     let n_lo = n_lo_and_inner - N_INNER;
@@ -784,6 +834,10 @@ fn process_one_x_hi_with_precomputed_ab(
 
         let chunk_byte_base = ((x_outer_lo << N_INNER) | (x_hi << n_lo_and_inner)) * N_CHUNKS;
         let eq_lo_val = eq_lo_scaled[x_outer_lo];
+        #[cfg(target_arch = "aarch64")]
+        let eq_weight = eq_lo_val * eq_hi_val;
+        #[cfg(not(target_arch = "aarch64"))]
+        let eq_weight = eq_lo_val;
 
         for b_med in 0..n_b_med {
             let byte_base_b = chunk_byte_base + b_med * N_CHUNKS * 8;
@@ -800,13 +854,14 @@ fn process_one_x_hi_with_precomputed_ab(
             n_b_med,
             convert,
             paired_c,
-            eq_lo_val,
+            eq_weight,
             &mut state.partial_ab,
             &mut state.partial_c_0,
             &mut state.partial_c_1,
         );
     }
 
+    #[cfg(not(target_arch = "aarch64"))]
     for lane in 0..ELL {
         state.local_res_ab[lane] += eq_hi_val * state.partial_ab[lane];
         state.local_res_c_s_0[lane] += eq_hi_val * state.partial_c_0[lane];
@@ -1037,7 +1092,7 @@ pub fn round1_shift_reduce_extract_c_packed_padded_with_s_hat_v(
             );
             state
         })
-        .map(|s| (s.local_res_ab, s.local_res_c_s_0, s.local_res_c_s_1))
+        .map(WorkerStateWithSHatV::into_results)
         .reduce(
             || ([F128::ZERO; ELL], [F128::ZERO; ELL], [F128::ZERO; ELL]),
             |(mut ab1, mut c0_1, mut c1_1), (ab2, c0_2, c1_2)| {
@@ -1131,7 +1186,7 @@ pub fn round1_shift_reduce_extract_c_packed_padded_with_precomputed_ab(
             );
             state
         })
-        .map(|s| (s.local_res_ab, s.local_res_c_s_0, s.local_res_c_s_1))
+        .map(WorkerStateWithSHatV::into_results)
         .reduce(
             || ([F128::ZERO; ELL], [F128::ZERO; ELL], [F128::ZERO; ELL]),
             |(mut ab1, mut c0_1, mut c1_1), (ab2, c0_2, c1_2)| {
@@ -1221,6 +1276,7 @@ fn round1_shift_reduce_extract_c_packed_serial(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::field::F256Unreduced;
     use crate::ntt::AdditiveNttGf8;
     use crate::zerocheck::univariate_skip::round1_naive;
 
@@ -1309,6 +1365,36 @@ mod tests {
         fn f128_vec(&mut self, n: usize) -> Vec<F128> {
             (0..n).map(|_| self.f128()).collect()
         }
+    }
+
+    /// AArch64's worker-wide accumulator combines `eq_lo * eq_hi` before the
+    /// convert value and defers every product reduction until worker drain.
+    /// This must equal the original two-stage low fold followed by high fold.
+    #[test]
+    fn deferred_worker_fold_matches_split_equality_reduction() {
+        const LANES: usize = 7;
+        let mut rng = Rng::new(0xD3F3_22ED_0ACC);
+        let eq_lo = core::array::from_fn::<_, 11, _>(|_| rng.f128());
+        let eq_hi = core::array::from_fn::<_, 5, _>(|_| rng.f128());
+        let mut direct = [F128::ZERO; LANES];
+        let mut deferred = [F256Unreduced::ZERO; LANES];
+
+        for &hi in &eq_hi {
+            let mut low = [F128::ZERO; LANES];
+            for &lo in &eq_lo {
+                let combined = lo * hi;
+                for lane in 0..LANES {
+                    let converted = rng.f128();
+                    low[lane] += converted * lo;
+                    deferred[lane] ^= converted.mul_unreduced(combined);
+                }
+            }
+            for lane in 0..LANES {
+                direct[lane] += low[lane] * hi;
+            }
+        }
+
+        assert_eq!(deferred.map(F256Unreduced::reduce), direct);
     }
 
     /// Build the full `r` vector with the protocol-fixed constants in the
@@ -2083,7 +2169,16 @@ mod tests {
             let seed_c0: [F128; ELL] = core::array::from_fn(|_| rng.f128());
             let seed_c1: [F128; ELL] = core::array::from_fn(|_| rng.f128());
 
-            let (mut got_ab, mut got_c0, mut got_c1) = (seed_ab, seed_c0, seed_c1);
+            let to_wide = |seed: [F128; ELL]| {
+                seed.map(|value| F256Unreduced {
+                    r0: value.lo,
+                    r1: value.hi,
+                    r2: 0,
+                    r3: 0,
+                })
+            };
+            let (mut got_ab, mut got_c0, mut got_c1) =
+                (to_wide(seed_ab), to_wide(seed_c0), to_wide(seed_c1));
             // SAFETY: aarch64 target; arrays are the exact sizes the kernel
             // indexes, and `convert` is the full 16*256-entry table.
             unsafe {
@@ -2101,6 +2196,9 @@ mod tests {
                     &mut got_c1,
                 );
             }
+            let got_ab = got_ab.map(F256Unreduced::reduce);
+            let got_c0 = got_c0.map(F256Unreduced::reduce);
+            let got_c1 = got_c1.map(F256Unreduced::reduce);
 
             let (mut want_ab, mut want_c0, mut want_c1) = (seed_ab, seed_c0, seed_c1);
             accumulate_convert_with_s_hat_v_oracle(

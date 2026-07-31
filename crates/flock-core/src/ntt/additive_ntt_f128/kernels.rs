@@ -145,6 +145,37 @@ pub(super) unsafe fn butterfly_fused_3layer_zero_root_row(
     }
 }
 
+/// Read one radix-8 row group from a rate-1/2 message and write the two
+/// independently transformed copies directly into the post-layer-4 codeword.
+///
+/// # Safety
+/// The caller must ensure that all eight source rows and all sixteen
+/// destination rows selected by `r` are valid. Concurrent calls must use
+/// distinct `r` values, and `src` must not alias `dst`.
+#[inline]
+pub(super) unsafe fn initialize_rate2_fused_3layer_row(
+    src: *const F128,
+    dst: *mut F128,
+    eighth: usize,
+    num_ntts: usize,
+    r: usize,
+    root_twiddles: &[F128; 7],
+    sibling_twiddles: &[F128; 7],
+) {
+    // SAFETY: forwarded caller contract.
+    unsafe {
+        portable::initialize_rate2_fused_3layer_row(
+            src,
+            dst,
+            eighth,
+            num_ntts,
+            r,
+            root_twiddles,
+            sibling_twiddles,
+        );
+    }
+}
+
 #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
 #[inline]
 pub(super) unsafe fn butterfly_neon_block(chunk: &mut [F128], twiddle: F128, half: usize) {

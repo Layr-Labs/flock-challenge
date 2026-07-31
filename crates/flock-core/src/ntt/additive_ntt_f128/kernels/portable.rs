@@ -176,6 +176,43 @@ pub(super) unsafe fn butterfly_fused_3layer_zero_root_row(
     }
 }
 
+/// Out-of-place rate-1/2 initializer for one row group.
+///
+/// The two codeword halves begin as identical message replicas. Apply the
+/// radix-8 group for NTT block zero and block one from one set of source loads,
+/// then write the exact state after layers 1, 2, and 3. Unlike the in-place
+/// root specialization, every root output is written because `dst` contains
+/// arbitrary pooled data.
+pub(super) unsafe fn initialize_rate2_fused_3layer_row(
+    src: *const F128,
+    dst: *mut F128,
+    eighth: usize,
+    num_ntts: usize,
+    r: usize,
+    root_twiddles: &[F128; 7],
+    sibling_twiddles: &[F128; 7],
+) {
+    let block_elems = 8 * eighth * num_ntts;
+    // SAFETY: caller supplies valid, non-aliasing pointer geometry and
+    // disjoint destination row groups.
+    unsafe {
+        for lane in 0..num_ntts {
+            let mut root = [F128::ZERO; 8];
+            for (i, value) in root.iter_mut().enumerate() {
+                *value = *src.add((i * eighth + r) * num_ntts + lane);
+            }
+            let mut sibling = root;
+            butterfly_fused_3layer_zero_root(&mut root, root_twiddles);
+            butterfly_fused_3layer(&mut sibling, sibling_twiddles);
+            for i in 0..8 {
+                let offset = (i * eighth + r) * num_ntts + lane;
+                *dst.add(offset) = root[i];
+                *dst.add(block_elems + offset) = sibling[i];
+            }
+        }
+    }
+}
+
 #[inline]
 pub(super) fn butterfly_fused_4layer(values: &mut [F128; 16], twiddles: &[F128; 15]) {
     #[inline(always)]
