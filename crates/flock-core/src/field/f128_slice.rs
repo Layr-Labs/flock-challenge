@@ -104,7 +104,6 @@ pub(crate) fn fold2_two_and_msgs(
     wb: &mut [F128],
     r_a: F128,
     r_b: F128,
-    nt_stores: bool,
 ) -> (F128, F128, [F128; 6]) {
     assert_eq!(f.len(), b.len());
     assert_eq!(wf.len(), wb.len());
@@ -112,7 +111,7 @@ pub(crate) fn fold2_two_and_msgs(
     assert!(wf.len().is_multiple_of(4));
     assert!(4 * (base + wf.len()) <= f.len());
     // SAFETY: cfg supplies PMULL; the checks establish bounds and alignment.
-    unsafe { aarch64::fold2_two_and_msgs(f, b, base, wf, wb, r_a, r_b, nt_stores) }
+    unsafe { aarch64::fold2_two_and_msgs(f, b, base, wf, wb, r_a, r_b) }
 }
 
 #[cfg(test)]
@@ -145,39 +144,6 @@ mod tests {
         fold_pairs(&src, 3, &mut actual, r);
 
         assert_eq!(actual, expected);
-    }
-
-    /// The `nt_stores` arm of the fold2 kernel is size-gated to beyond-LLC
-    /// rounds in production and therefore unreachable at test sizes — force
-    /// it here and require bit-identical outputs vs the normal-store arm.
-    #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
-    #[test]
-    fn fold2_nt_store_arm_matches_normal_stores() {
-        let mut state = 0x0932_2284_e49c_db2d_u64;
-        let mut next = || {
-            state ^= state << 13;
-            state ^= state >> 7;
-            state ^= state << 17;
-            state
-        };
-        for trial in 0..32 {
-            let n_out = 4 * (1 + (trial % 7)); // multiples of 4, incl. multi-group
-            let f: Vec<F128> = (0..8 * n_out).map(|_| F128::new(next(), next())).collect();
-            let b: Vec<F128> = (0..8 * n_out).map(|_| F128::new(next(), next())).collect();
-            let r_a = F128::new(next(), next());
-            let r_b = F128::new(next(), next());
-            let mut wf_normal = vec![F128::ZERO; n_out];
-            let mut wb_normal = vec![F128::ZERO; n_out];
-            let mut wf_nt = vec![F128::ZERO; n_out];
-            let mut wb_nt = vec![F128::ZERO; n_out];
-            let (u0_n, u2_n, c_n) =
-                fold2_two_and_msgs(&f, &b, 0, &mut wf_normal, &mut wb_normal, r_a, r_b, false);
-            let (u0_t, u2_t, c_t) =
-                fold2_two_and_msgs(&f, &b, 0, &mut wf_nt, &mut wb_nt, r_a, r_b, true);
-            assert_eq!(wf_normal, wf_nt, "wf trial={trial}");
-            assert_eq!(wb_normal, wb_nt, "wb trial={trial}");
-            assert_eq!((u0_n, u2_n, c_n), (u0_t, u2_t, c_t), "msgs trial={trial}");
-        }
     }
 
     #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
