@@ -273,6 +273,81 @@ unsafe fn fold_two_row_codes_q(
     }
 }
 
+/// Fold packed rows through four adjacent-byte-pair banks. Each bank has
+/// `2^16` F128 entries and therefore combines two ordinary byte lookups into
+/// one L2-sized lookup. The table is laid out as four consecutive banks.
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn fold_four_row_codes_u16_q(
+    table_data: *const u8,
+    row0: u64,
+    row1: u64,
+    row2: u64,
+    row3: u64,
+) -> (
+    core::arch::aarch64::uint64x2_t,
+    core::arch::aarch64::uint64x2_t,
+    core::arch::aarch64::uint64x2_t,
+    core::arch::aarch64::uint64x2_t,
+) {
+    use core::arch::aarch64::*;
+    unsafe {
+        const STRIDE: usize = (1 << 16) * 16;
+        let load = |row: u64, bank: usize| {
+            let index = ((row >> (16 * bank)) & 0xffff) as usize;
+            vld1q_u64(
+                table_data
+                    .add(bank * STRIDE + index * core::mem::size_of::<F128>())
+                    .cast::<u64>(),
+            )
+        };
+        let mut acc0 = load(row0, 0);
+        let mut acc1 = load(row1, 0);
+        let mut acc2 = load(row2, 0);
+        let mut acc3 = load(row3, 0);
+        acc0 = xor3_u64(acc0, load(row0, 1), load(row0, 2));
+        acc1 = xor3_u64(acc1, load(row1, 1), load(row1, 2));
+        acc2 = xor3_u64(acc2, load(row2, 1), load(row2, 2));
+        acc3 = xor3_u64(acc3, load(row3, 1), load(row3, 2));
+        acc0 = veorq_u64(acc0, load(row0, 3));
+        acc1 = veorq_u64(acc1, load(row1, 3));
+        acc2 = veorq_u64(acc2, load(row2, 3));
+        acc3 = veorq_u64(acc3, load(row3, 3));
+        (acc0, acc1, acc2, acc3)
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn fold_two_row_codes_u16_q(
+    table_data: *const u8,
+    row0: u64,
+    row1: u64,
+) -> (
+    core::arch::aarch64::uint64x2_t,
+    core::arch::aarch64::uint64x2_t,
+) {
+    use core::arch::aarch64::*;
+    unsafe {
+        const STRIDE: usize = (1 << 16) * 16;
+        let load = |row: u64, bank: usize| {
+            let index = ((row >> (16 * bank)) & 0xffff) as usize;
+            vld1q_u64(
+                table_data
+                    .add(bank * STRIDE + index * core::mem::size_of::<F128>())
+                    .cast::<u64>(),
+            )
+        };
+        let mut acc0 = load(row0, 0);
+        let mut acc1 = load(row1, 0);
+        acc0 = xor3_u64(acc0, load(row0, 1), load(row0, 2));
+        acc1 = xor3_u64(acc1, load(row1, 1), load(row1, 2));
+        acc0 = veorq_u64(acc0, load(row0, 3));
+        acc1 = veorq_u64(acc1, load(row1, 3));
+        (acc0, acc1)
+    }
+}
+
 /// Returns `true` iff a 128-bit vector is all-zero.
 #[cfg(target_arch = "aarch64")]
 #[inline(always)]
@@ -377,6 +452,7 @@ pub(crate) unsafe fn fold_round2_chunk_neon_unchecked_8(
 #[target_feature(enable = "aes")]
 pub(crate) unsafe fn fold_round2_compact_chunk_neon_unchecked_8(
     table_data: *const u8,
+    table_u16_data: *const u8,
     a_packed: *const u8,
     b_packed: *const u8,
     anchors: *mut F128,
@@ -387,6 +463,7 @@ pub(crate) unsafe fn fold_round2_compact_chunk_neon_unchecked_8(
     pair_in_block_mask: usize,
     useful_pairs_inclusive: usize,
     degen: bool,
+    use_u16: bool,
 ) -> (F128, F128) {
     use core::arch::aarch64::*;
 
@@ -444,7 +521,11 @@ pub(crate) unsafe fn fold_round2_compact_chunk_neon_unchecked_8(
             if degen && (b0_code & b1_code) == u64::MAX {
                 // b ≡ 1 pair: b0 = b1 = fold(all-ones) = 1. Skip the 16
                 // b-table lookups; `b0 + b1 = 0` zeroes the G(∞) term.
-                let (a0, a1) = fold_two_row_codes_q(table_data, a0_code, a1_code);
+                let (a0, a1) = if use_u16 {
+                    fold_two_row_codes_u16_q(table_u16_data, a0_code, a1_code)
+                } else {
+                    fold_two_row_codes_q(table_data, a0_code, a1_code)
+                };
                 store_anchor_pair_nt(anchors.add(2 * x_lo), a0, b_ones);
                 let delta_pair =
                     core::mem::transmute::<[u64; 2], uint64x2_t>([a0_code ^ a1_code, 0]);
@@ -456,8 +537,17 @@ pub(crate) unsafe fn fold_round2_compact_chunk_neon_unchecked_8(
                 continue;
             }
 
-            let (a0, a1, b0, b1) =
-                fold_four_row_codes_q(table_data, a0_code, a1_code, b0_code, b1_code);
+            let (a0, a1, b0, b1) = if use_u16 {
+                fold_four_row_codes_u16_q(
+                    table_u16_data,
+                    a0_code,
+                    a1_code,
+                    b0_code,
+                    b1_code,
+                )
+            } else {
+                fold_four_row_codes_q(table_data, a0_code, a1_code, b0_code, b1_code)
+            };
 
             store_anchor_pair_nt(anchors.add(2 * x_lo), a0, b0);
             let da = a0_code ^ a1_code;
@@ -762,6 +852,7 @@ pub(crate) unsafe fn fold_compact_stream_chunk_neon<const L: usize>(
 #[target_feature(enable = "aes")]
 pub(crate) unsafe fn fold_compact_chunk_neon_unchecked_8(
     scaled_table: *const u8,
+    scaled_table_u16: *const u8,
     anchors: *const F128,
     deltas: *const u8,
     a_out: *mut F128,
@@ -769,6 +860,7 @@ pub(crate) unsafe fn fold_compact_chunk_neon_unchecked_8(
     eq_lo: *const F128,
     lo_size: usize,
     degen: bool,
+    use_u16: bool,
 ) -> (F128, F128) {
     use core::arch::aarch64::*;
 
@@ -805,7 +897,11 @@ pub(crate) unsafe fn fold_compact_chunk_neon_unchecked_8(
                 // so b = anchor with no lookups. On the static b≡1 mass both
                 // anchors are 1: G(∞)'s (b0 + b1) factor vanishes and
                 // a1·b1 = a1; both shortcuts are value-gated below.
-                let (a0_delta, a1_delta) = fold_two_row_codes_q(scaled_table, a0_code, a1_code);
+                let (a0_delta, a1_delta) = if use_u16 {
+                    fold_two_row_codes_u16_q(scaled_table_u16, a0_code, a1_code)
+                } else {
+                    fold_two_row_codes_q(scaled_table, a0_code, a1_code)
+                };
                 let a0 = veorq_u64(vld1q_u64(anchors.add(2 * out).cast::<u64>()), a0_delta);
                 let a1 = veorq_u64(vld1q_u64(anchors.add(2 * (out + 1)).cast::<u64>()), a1_delta);
                 let b0 = vld1q_u64(anchors.add(2 * out + 1).cast::<u64>());
@@ -829,13 +925,17 @@ pub(crate) unsafe fn fold_compact_chunk_neon_unchecked_8(
                 continue;
             }
 
-            let (a0_delta, a1_delta, b0_delta, b1_delta) = fold_four_row_codes_q(
-                scaled_table,
-                a0_code,
-                a1_code,
-                b0_code,
-                b1_code,
-            );
+            let (a0_delta, a1_delta, b0_delta, b1_delta) = if use_u16 {
+                fold_four_row_codes_u16_q(
+                    scaled_table_u16,
+                    a0_code,
+                    a1_code,
+                    b0_code,
+                    b1_code,
+                )
+            } else {
+                fold_four_row_codes_q(scaled_table, a0_code, a1_code, b0_code, b1_code)
+            };
             let a0 = veorq_u64(
                 vld1q_u64(anchors.add(2 * out).cast::<u64>()),
                 a0_delta,

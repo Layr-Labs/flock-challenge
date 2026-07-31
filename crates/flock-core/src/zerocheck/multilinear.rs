@@ -416,6 +416,16 @@ impl UniSkipFoldTable {
         acc
     }
 
+    /// Build a four-bank table indexed by adjacent byte pairs. Each bank is
+    /// `2^16` F128 entries, so a packed row folds with four indexed loads
+    /// instead of eight byte-table loads. The ranked AArch64 probe keeps this
+    /// representation opt-in because its 4 MiB aggregate footprint trades L2
+    /// residency against half as many address-dependent lookups.
+    #[cfg(any(target_arch = "aarch64", test))]
+    pub(crate) fn data_u16(&self) -> Vec<F128> {
+        data_u16_from_byte_table(&self.data, self.n_chunks)
+    }
+
     /// Return `rho * T_z` using XOR-linearity of every byte bank. Only the 64
     /// one-hot basis entries require field multiplication; all other entries
     /// are rebuilt by XOR instead of performing 2,048 independent products.
@@ -437,6 +447,32 @@ impl UniSkipFoldTable {
         }
         scaled
     }
+}
+
+#[cfg(any(target_arch = "aarch64", test))]
+fn data_u16_from_byte_table(data: &[F128], n_chunks: usize) -> Vec<F128> {
+    assert_eq!(n_chunks, 8);
+    assert_eq!(data.len(), n_chunks * 256);
+    const BANK_SIZE: usize = 1 << 16;
+    let mut wide = vec![F128::ZERO; 4 * BANK_SIZE];
+    for bank in 0..4 {
+        let lo_base = (2 * bank) * 256;
+        let hi_base = lo_base + 256;
+        let out_base = bank * BANK_SIZE;
+        for index in 0..BANK_SIZE {
+            wide[out_base + index] =
+                data[lo_base + (index & 0xff)] + data[hi_base + (index >> 8)];
+        }
+    }
+    wide
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline]
+fn use_u16_fold_table(m: usize) -> bool {
+    cfg!(target_os = "macos")
+        && m == 32
+        && std::env::var_os("FLOCK_NO_ZC_U16_TABLE").is_none()
 }
 
 /// Local split for compact production/reconstruction; intentionally
@@ -566,6 +602,14 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_with_deltas(
     let (pair_in_block_mask, useful_pairs_inclusive) = round2_pair_skip(padding, k_skip);
     #[cfg(target_arch = "aarch64")]
     let degen = r2_degen_enabled();
+    #[cfg(target_arch = "aarch64")]
+    let use_u16 = use_u16_fold_table(m);
+    #[cfg(target_arch = "aarch64")]
+    let table_u16 = if use_u16 {
+        Some(table.data_u16())
+    } else {
+        None
+    };
 
     // Chunks drain through the hetero queue so the idle efficiency cores add
     // throughput without an equal-band barrier penalty (see `epool`). Each
@@ -599,8 +643,12 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_with_deltas(
 
             #[cfg(target_arch = "aarch64")]
             let (p1, pinf) = unsafe {
+                let table_u16_ptr = table_u16.as_ref().map_or(std::ptr::null(), |wide| {
+                    wide.as_ptr().cast::<u8>()
+                });
                 fold_round2_compact_chunk_neon_unchecked_8(
                     table.data.as_ptr().cast::<u8>(),
+                    table_u16_ptr,
                     a_packed.as_ptr().add(row_base * n_chunks),
                     b_packed.as_ptr().add(row_base * n_chunks),
                     anchors.as_mut_ptr(),
@@ -611,6 +659,7 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_with_deltas(
                     pair_in_block_mask,
                     useful_pairs_inclusive,
                     degen,
+                    use_u16,
                 )
             };
 
@@ -885,6 +934,14 @@ pub fn fold_compact_and_compute_round_pair(
     // Compose the sampled challenge into the resident 32 KiB byte table once.
     // Linearity makes each later row reconstruction lookup/XOR-only.
     let scaled_table = table.scaled_linear(r_fold);
+    #[cfg(target_arch = "aarch64")]
+    let use_u16 = use_u16_fold_table(n.trailing_zeros() as usize + 7);
+    #[cfg(target_arch = "aarch64")]
+    let scaled_table_u16 = if use_u16 {
+        Some(data_u16_from_byte_table(&scaled_table, table.n_chunks))
+    } else {
+        None
+    };
 
     let eq = SplitEqGhash::with_n_hi(&r_next[1..], COMPACT_RECONSTRUCTION_N_HI);
     let lo_size = 1usize << eq.n_lo;
@@ -916,8 +973,13 @@ pub fn fold_compact_and_compute_round_pair(
 
             #[cfg(target_arch = "aarch64")]
             let (p1, pinf) = unsafe {
+                let scaled_table_u16_ptr =
+                    scaled_table_u16.as_ref().map_or(std::ptr::null(), |wide| {
+                        wide.as_ptr().cast::<u8>()
+                    });
                 fold_compact_chunk_neon_unchecked_8(
                     scaled_table.as_ptr().cast::<u8>(),
+                    scaled_table_u16_ptr,
                     compact.anchors.as_ptr().add(2 * base),
                     compact.deltas.as_ptr().add(2 * base * table.n_chunks),
                     a_out.as_mut_ptr(),
@@ -925,6 +987,7 @@ pub fn fold_compact_and_compute_round_pair(
                     eq_lo.as_ptr(),
                     lo_size,
                     degen,
+                    use_u16,
                 )
             };
 
@@ -2315,6 +2378,31 @@ mod tests {
             let via_table =
                 table.fold_one_row(&a_packed[x_rest * n_chunks..(x_rest + 1) * n_chunks]);
             assert_eq!(via_table, direct, "x_rest={x_rest}");
+        }
+    }
+
+    /// The adjacent-byte-pair table must be exactly the XOR-composed byte
+    /// table for every bank/index, so the AArch64 four-lookup path cannot
+    /// change the folded row value.
+    #[test]
+    fn fold_table_u16_matches_byte_table() {
+        let mut rng = Rng::new(0x16_16_16);
+        let table = UniSkipFoldTable::new(6, rng.f128());
+        let wide = table.data_u16();
+        assert_eq!(wide.len(), 4 * (1usize << 16));
+
+        for _ in 0..256 {
+            let mut row = [0u8; 8];
+            for byte in &mut row {
+                *byte = rng.next_u64() as u8;
+            }
+            let byte_fold = table.fold_one_row(&row);
+            let mut wide_fold = F128::ZERO;
+            for bank in 0..4 {
+                let index = u16::from_le_bytes([row[2 * bank], row[2 * bank + 1]]) as usize;
+                wide_fold += wide[bank * (1usize << 16) + index];
+            }
+            assert_eq!(wide_fold, byte_fold);
         }
     }
 
