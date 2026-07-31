@@ -243,7 +243,9 @@ pub fn prove_fast_ligerito_from_witness<Ch: Challenger>(
 
 /// Ranked row-major counterpart of [`prove_fast_ligerito_from_witness`].
 /// `codeword` already contains the post-trivial-layer state, so commit starts
-/// directly at the remaining NTT layers.
+/// directly at the remaining NTT layers. With `first_replica_only` the
+/// witness producer wrote only the codeword's first half; the commit's first
+/// NTT pass synthesizes (or, off the ranked path, copies) the second replica.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn prove_fast_ligerito_from_preinitialized_codeword<Ch: Challenger>(
     r1cs: &BlockR1cs,
@@ -254,8 +256,14 @@ pub(crate) fn prove_fast_ligerito_from_preinitialized_codeword<Ch: Challenger>(
     z_packed_lincheck: Vec<u8>,
     lincheck_circuit: &dyn lincheck::LincheckCircuit,
     codeword: Vec<F128>,
+    first_replica_only: bool,
     challenger: &mut Ch,
 ) -> (R1csProofLigerito, Commitment, R1csClaim) {
+    let commit_codeword = if first_replica_only {
+        CommitCodeword::PreinitializedFirstReplica(codeword)
+    } else {
+        CommitCodeword::Preinitialized(codeword)
+    };
     prove_fast_ligerito_from_witness_with_commit_codeword(
         r1cs,
         pcs_params,
@@ -264,7 +272,7 @@ pub(crate) fn prove_fast_ligerito_from_preinitialized_codeword<Ch: Challenger>(
         b_packed_f128,
         z_packed_lincheck,
         lincheck_circuit,
-        CommitCodeword::Preinitialized(codeword),
+        commit_codeword,
         challenger,
     )
 }
@@ -369,6 +377,10 @@ enum CommitCodeword {
     Allocate,
     NeedsReplication(Vec<F128>),
     Preinitialized(Vec<F128>),
+    /// Rate-1/2 buffer whose FIRST half holds the packed-witness replica and
+    /// whose second half is unwritten; the commit's first NTT pass
+    /// synthesizes (or, off the ranked path, copies) replica B.
+    PreinitializedFirstReplica(Vec<F128>),
 }
 
 /// Build the witness commitment and the challenge-independent half of
@@ -401,6 +413,9 @@ fn commit_with_round1_ab_precompute(
             CommitCodeword::NeedsReplication(buf) => pcs::commit_into(z_packed, pcs_params, buf),
             CommitCodeword::Preinitialized(buf) => {
                 pcs::commit_preinitialized(z_packed, buf, pcs_params)
+            }
+            CommitCodeword::PreinitializedFirstReplica(buf) => {
+                pcs::commit_preinitialized_first_replica(z_packed, buf, pcs_params)
             }
         },
         || {
@@ -647,8 +662,14 @@ pub(crate) fn prove_fast_ligerito_timed_from_preinitialized_codeword<Ch: Challen
     z_packed_lincheck: Vec<u8>,
     lincheck_circuit: &dyn lincheck::LincheckCircuit,
     codeword: Vec<F128>,
+    first_replica_only: bool,
     challenger: &mut Ch,
 ) -> (R1csProofLigerito, Commitment, R1csClaim, ProvePhaseTimings) {
+    let commit_codeword = if first_replica_only {
+        CommitCodeword::PreinitializedFirstReplica(codeword)
+    } else {
+        CommitCodeword::Preinitialized(codeword)
+    };
     prove_fast_ligerito_timed_with_commit_codeword(
         r1cs,
         pcs_params,
@@ -657,7 +678,7 @@ pub(crate) fn prove_fast_ligerito_timed_from_preinitialized_codeword<Ch: Challen
         b_packed_f128,
         z_packed_lincheck,
         lincheck_circuit,
-        CommitCodeword::Preinitialized(codeword),
+        commit_codeword,
         challenger,
     )
 }

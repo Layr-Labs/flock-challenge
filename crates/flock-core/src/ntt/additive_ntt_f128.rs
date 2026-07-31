@@ -259,6 +259,11 @@ fn is_ranked_top_hetero_fused3_pass(
 const INTERLEAVED_PHASE_ALL: u8 = 0;
 const INTERLEAVED_PHASE_TOP_ONLY: u8 = 1;
 const INTERLEAVED_PHASE_DEEP_ONLY: u8 = 2;
+/// Top passes only, with the first radix-8 pass synthesizing layer-1 block 1
+/// from block 0 (rate-1/2 codeword whose replica B the producer left
+/// unwritten). Only reachable through the ranked-shape entry that verifies
+/// the hetero gates and falls back to a replica copy otherwise.
+const INTERLEAVED_PHASE_TOP_SYNTH_FIRST: u8 = 3;
 
 /// Additive NTT over F_{2^128} with the standard polynomial-basis subspace.
 ///
@@ -465,6 +470,52 @@ impl AdditiveNttF128 {
         unreachable!("ranked top split requires a hardware NTT target");
     }
 
+    /// Ranked top passes for a rate-1/2 codeword whose SECOND replica is
+    /// declared unwritten: the first radix-8 pass gathers each row group once
+    /// from replica A (layer-1 block 0) and butterflies it into both blocks,
+    /// so the producer never stores replica B and the pass reads half as much.
+    ///
+    /// Total on every path: when any gate the synth pass needs fails (shape,
+    /// env overrides), replica B is first materialized by a parallel copy and
+    /// the ordinary top passes run — the output is identical either way.
+    pub(crate) fn forward_transform_interleaved_ranked_top_from_layer_first_replica(
+        &self,
+        data: &mut [F128],
+        num_ntts: usize,
+        start_layer: usize,
+    ) {
+        let log_d = log2_pow2(data.len() / num_ntts);
+        assert!(use_ranked_deep_pair_fusion(
+            log_d,
+            num_ntts,
+            start_layer,
+            10
+        ));
+        let synth_ok = is_ranked_top_hetero_fused3_pass(log_d, num_ntts, start_layer, 10, 1)
+            && start_layer == 1
+            && std::env::var_os("FLOCK_NO_NTT_TOP_EPOOL").is_none()
+            && std::env::var_os("FLOCK_NTT_BLOCK_REGIONS").is_none()
+            && std::env::var_os("FLOCK_NO_NTT_REPLICA_SYNTH").is_none();
+        if !synth_ok {
+            materialize_second_replica(data);
+            self.forward_transform_interleaved_ranked_top_from_layer(data, num_ntts, start_layer);
+            return;
+        }
+        #[cfg(any(
+            all(target_arch = "aarch64", target_feature = "aes"),
+            all(target_arch = "x86_64", target_feature = "pclmulqdq"),
+        ))]
+        self.forward_transform_interleaved_parallel_from_layer_and_then::<
+            INTERLEAVED_PHASE_TOP_SYNTH_FIRST,
+            _,
+        >(data, num_ntts, start_layer, &|_, _| {});
+        #[cfg(not(any(
+            all(target_arch = "aarch64", target_feature = "aes"),
+            all(target_arch = "x86_64", target_feature = "pclmulqdq"),
+        )))]
+        unreachable!("ranked top split requires a hardware NTT target");
+    }
+
     /// Finish the ranked L0 transform's five cache-local deep pairs and invoke
     /// `finish_chunk` exactly as the unsplit transform does.
     #[inline]
@@ -591,7 +642,7 @@ impl AdditiveNttF128 {
     ) where
         F: Fn(usize, &[F128]) + Sync + Send,
     {
-        debug_assert!(PHASE <= INTERLEAVED_PHASE_DEEP_ONLY);
+        debug_assert!(PHASE <= INTERLEAVED_PHASE_TOP_SYNTH_FIRST);
         let n_total = data.len();
         let log_d = log2_pow2(n_total / num_ntts);
 
@@ -700,8 +751,26 @@ impl AdditiveNttF128 {
                 };
                 if zero_root_fused3 && std::env::var_os("FLOCK_NTT_BLOCK_REGIONS").is_none() {
                     let twiddles: Vec<[F128; 7]> = (0..num_blocks).map(block_twiddles).collect();
-                    if is_ranked_top_hetero_fused3_pass(log_d, num_ntts, start_layer, n_top, layer)
-                        && std::env::var_os("FLOCK_NO_NTT_TOP_EPOOL").is_none()
+                    if PHASE == INTERLEAVED_PHASE_TOP_SYNTH_FIRST && layer == start_layer {
+                        // Entry gate guarantees this is the ranked two-block
+                        // first pass with replica B unwritten: each row group
+                        // is gathered once from block 0 and butterflied into
+                        // both blocks.
+                        debug_assert_eq!(num_blocks, 2);
+                        butterfly_interleaved_fused_3layer_replica_synth_hetero(
+                            data,
+                            &twiddles[0],
+                            &twiddles[1],
+                            eighth,
+                            num_ntts,
+                        );
+                    } else if is_ranked_top_hetero_fused3_pass(
+                        log_d,
+                        num_ntts,
+                        start_layer,
+                        n_top,
+                        layer,
+                    ) && std::env::var_os("FLOCK_NO_NTT_TOP_EPOOL").is_none()
                     {
                         butterfly_interleaved_fused_3layer_all_blocks_hetero(
                             data, &twiddles, eighth, num_ntts,
@@ -791,7 +860,7 @@ impl AdditiveNttF128 {
                 layer += 1;
             }
         }
-        if PHASE == INTERLEAVED_PHASE_TOP_ONLY {
+        if PHASE == INTERLEAVED_PHASE_TOP_ONLY || PHASE == INTERLEAVED_PHASE_TOP_SYNTH_FIRST {
             return;
         }
 
@@ -1526,6 +1595,75 @@ fn butterfly_interleaved_fused_3layer_all_blocks_par_rows(
                     row,
                     &twiddles[block],
                 )
+            }
+        }
+    });
+}
+
+/// Copy a rate-1/2 codeword's first replica over its (unwritten) second half.
+/// Fallback for the first-replica commit path when the synthesizing first
+/// pass cannot run; restores the exact pre-existing full-replication state.
+fn materialize_second_replica(data: &mut [F128]) {
+    use rayon::prelude::*;
+    let half = data.len() / 2;
+    let (src, dst) = data.split_at_mut(half);
+    const COPY_CHUNK: usize = 1 << 16;
+    dst.par_chunks_mut(COPY_CHUNK)
+        .enumerate()
+        .for_each(|(i, chunk)| {
+            let off = i * COPY_CHUNK;
+            chunk.copy_from_slice(&src[off..off + chunk.len()]);
+        });
+}
+
+/// Replica-synthesizing variant of the ranked FIRST radix-8 pass. The two
+/// layer-1 blocks of the rate-1/2 codeword hold identical replicas, and the
+/// producer left replica B (block 1) unwritten. Each 8-row group is therefore
+/// gathered once from block 0: the rows are first copied — still cache-hot —
+/// onto block 1's mirrored rows, then the two existing radix-8 row kernels
+/// run per block (zero-root in place on block 0, general on block 1). Block
+/// 1's copy-write and kernel rewrite coalesce in cache, so DRAM traffic per
+/// group is one 8-row read plus two 8-row writebacks — half the reads of the
+/// two-block pass — while the arithmetic stays on the promoted kernels.
+///
+/// Same 128-row claim tiling and hetero-queue drain as
+/// [`butterfly_interleaved_fused_3layer_all_blocks_hetero`].
+fn butterfly_interleaved_fused_3layer_replica_synth_hetero(
+    data: &mut [F128],
+    tw0: &[F128; 7],
+    tw1: &[F128; 7],
+    eighth: usize,
+    num_ntts: usize,
+) {
+    let block_elems = 8 * eighth * num_ntts;
+    debug_assert_eq!(data.len(), 2 * block_elems);
+    debug_assert!(eighth.is_power_of_two());
+    debug_assert_eq!(tw0[0], F128::ZERO);
+    debug_assert_eq!(tw0[1], F128::ZERO);
+    debug_assert_eq!(tw0[3], F128::ZERO);
+
+    const ROWS_PER_TILE: usize = 128;
+    let n_tiles = eighth.div_ceil(ROWS_PER_TILE);
+    let base = crate::epool::SyncPtr(data.as_mut_ptr());
+    crate::epool::run_hetero_chunks(n_tiles, |tile| {
+        let row_start = tile * ROWS_PER_TILE;
+        let row_end = (row_start + ROWS_PER_TILE).min(eighth);
+        let block0 = base.ptr();
+        // SAFETY: block 1 begins exactly one block past block 0 within the
+        // validated 2-block buffer.
+        let block1 = unsafe { base.ptr().add(block_elems) };
+        for r in row_start..row_end {
+            // SAFETY: each queue index maps to one disjoint row tile; a row
+            // group owns its 8 block-0 rows (read+write) and the mirrored 8
+            // block-1 rows (write-only). All derived addresses are in bounds
+            // and the queue hands out each tile exactly once.
+            unsafe {
+                for i in 0..8 {
+                    let off = (i * eighth + r) * num_ntts;
+                    std::ptr::copy_nonoverlapping(block0.add(off), block1.add(off), num_ntts);
+                }
+                kernels::butterfly_fused_3layer_zero_root_row(block0, eighth, num_ntts, r, tw0);
+                kernels::butterfly_fused_3layer_row(block1, eighth, num_ntts, r, tw1);
             }
         }
     });

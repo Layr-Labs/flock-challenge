@@ -255,6 +255,34 @@ pub fn commit_preinitialized(
     finalize_commit(codeword, params)
 }
 
+/// [`commit_preinitialized`] for a rate-1/2 codeword whose SECOND replica the
+/// caller deliberately left unwritten: only elements `[0, len/2)` hold the
+/// packed-witness copy; the upper half is stale. On the exact ranked path the
+/// first radix-8 NTT pass synthesizes layer-1 block 1 directly from block 0
+/// (see `forward_transform_interleaved_ranked_top_from_layer_first_replica`),
+/// eliminating the producer's 512 MB duplicate store and this pass's
+/// duplicate read. On every other path the replica is first materialized by
+/// a parallel copy — the commitment is identical either way.
+pub fn commit_preinitialized_first_replica(
+    z_packed: &[F128],
+    codeword: Vec<F128>,
+    params: &PcsParams,
+) -> (Commitment, ProverData) {
+    params.validate();
+    assert_eq!(z_packed.len(), 1usize << params.log_msg_len());
+    assert_eq!(
+        params.log_inv_rate, 1,
+        "first-replica commit requires a rate-1/2 codeword"
+    );
+    let codeword_len = params.n_positions() * params.num_ntts();
+    assert_eq!(
+        codeword.len(),
+        codeword_len,
+        "commit_preinitialized_first_replica: codeword buffer has wrong length"
+    );
+    finalize_commit_impl(codeword, params, true)
+}
+
 /// Fill `codeword` with `2^r` replicas of `msg` (`r = log2(codeword.len() /
 /// msg.len())`) — the exact state after the first `r` forward-NTT layers on
 /// the zero-padded coefficient vector `[msg, 0, …, 0]`. Pair with
@@ -310,6 +338,22 @@ struct RankedLeafJob {
     elem_len: usize,
 }
 
+/// Copy a rate-1/2 codeword's first replica over its (unwritten) second half —
+/// the fallback that restores full replication whenever the synthesizing
+/// first NTT pass is unavailable on a first-replica commit.
+fn materialize_codeword_second_replica(codeword: &mut [F128]) {
+    use rayon::prelude::*;
+    let half = codeword.len() / 2;
+    let (src, dst) = codeword.split_at_mut(half);
+    const COPY_CHUNK: usize = 1 << 16;
+    dst.par_chunks_mut(COPY_CHUNK)
+        .enumerate()
+        .for_each(|(i, chunk)| {
+            let off = i * COPY_CHUNK;
+            chunk.copy_from_slice(&src[off..off + chunk.len()]);
+        });
+}
+
 /// Finish the ranked NTT and hash each finalized 1 MiB subtree before it goes
 /// cold. P-core transform jobs offer leaf work to a bounded queue drained by
 /// the existing utility-QoS E-core pool; when that queue is full they hash the
@@ -322,6 +366,7 @@ fn ranked_ntt_with_pipelined_leaves(
     params: &PcsParams,
     leaves: &mut [Hash],
     helper: &rayon::ThreadPool,
+    first_replica_only: bool,
 ) {
     use rayon::prelude::*;
     use std::sync::Mutex;
@@ -371,11 +416,26 @@ fn ranked_ntt_with_pipelined_leaves(
         && std::env::var_os("FLOCK_NO_NTT_TOP_EPOOL").is_none()
         && std::env::var_os("FLOCK_NTT_BLOCK_REGIONS").is_none();
     if split_ranked_top {
-        ntt.forward_transform_interleaved_ranked_top_from_layer(
-            codeword,
-            num_ntts,
-            params.log_inv_rate,
-        );
+        if first_replica_only {
+            // Replica B is unwritten: the first radix-8 pass gathers each row
+            // group once from replica A and writes both blocks (falls back to
+            // a materializing copy internally if any synth gate fails).
+            ntt.forward_transform_interleaved_ranked_top_from_layer_first_replica(
+                codeword,
+                num_ntts,
+                params.log_inv_rate,
+            );
+        } else {
+            ntt.forward_transform_interleaved_ranked_top_from_layer(
+                codeword,
+                num_ntts,
+                params.log_inv_rate,
+            );
+        }
+    } else if first_replica_only {
+        // The split top path is disabled; restore the full-replication state
+        // the unsplit transform expects.
+        materialize_codeword_second_replica(codeword);
     }
 
     std::thread::scope(|scope| {
@@ -437,7 +497,19 @@ fn ranked_ntt_with_pipelined_leaves(
 
 /// Shared tail of [`commit`] / [`commit_into`]: interleaved forward additive
 /// NTT (RS-encode every lane) then the initial Merkle tree over codeword rows.
-fn finalize_commit(mut codeword: Vec<F128>, params: &PcsParams) -> (Commitment, ProverData) {
+fn finalize_commit(codeword: Vec<F128>, params: &PcsParams) -> (Commitment, ProverData) {
+    finalize_commit_impl(codeword, params, false)
+}
+
+/// [`finalize_commit`] with the first-replica-only contract: when
+/// `first_replica_only` is set the caller wrote only the codeword's first
+/// half; whichever transform path runs below either synthesizes block 1 from
+/// block 0 (exact ranked pipeline) or first materializes the copy.
+fn finalize_commit_impl(
+    mut codeword: Vec<F128>,
+    params: &PcsParams,
+    first_replica_only: bool,
+) -> (Commitment, ProverData) {
     let helper = if use_ranked_ntt_merkle_leaf_pipeline(params) && rayon::current_num_threads() > 1
     {
         crate::epool::epool()
@@ -468,8 +540,14 @@ fn finalize_commit(mut codeword: Vec<F128>, params: &PcsParams) -> (Commitment, 
             params,
             &mut tree[..params.n_leaves()],
             helper,
+            first_replica_only,
         );
     } else {
+        if first_replica_only {
+            // Non-pipelined fallback path: restore the full-replication state
+            // the generic transform expects before encoding.
+            materialize_codeword_second_replica(&mut codeword);
+        }
         ntt.forward_transform_interleaved_from_layer(
             &mut codeword,
             params.num_ntts(),
@@ -742,6 +820,7 @@ mod tests {
             &params,
             &mut got_tree[..params.n_leaves()],
             &helper,
+            false,
         );
         let got_tree = merkle::merkle_tree_from_prehashed_leaves(
             got_tree,

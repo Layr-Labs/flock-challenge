@@ -1860,6 +1860,7 @@ impl Blake3Setup {
                 z_packed_lincheck,
                 lc_circuit,
                 codeword,
+                true,
                 challenger,
             );
         }
@@ -1916,6 +1917,7 @@ impl Blake3Setup {
                     z_packed_lincheck,
                     lc_circuit,
                     codeword,
+                    true,
                     challenger,
                 )
             }
@@ -2609,10 +2611,14 @@ mod tests {
         let as_bytes = |values: &[F128]| unsafe {
             std::slice::from_raw_parts(values.as_ptr().cast::<u8>(), std::mem::size_of_val(values))
         };
+        // First-replica contract: the witness writes only the message replica
+        // (the codeword's first half); replica B is synthesized or copied by
+        // the commit. Only the first half is comparable here.
+        let half = hot_codeword.len() / 2;
         assert_eq!(
-            as_bytes(&hot_codeword),
-            as_bytes(&filled_codeword),
-            "hot-row codeword differs from replicate_message_fill"
+            as_bytes(&hot_codeword[..half]),
+            as_bytes(&filled_codeword[..half]),
+            "hot-row first replica differs from replicate_message_fill"
         );
         flock_core::scratch::give_f128(filled_codeword);
 
@@ -2631,6 +2637,7 @@ mod tests {
                 z_lincheck,
                 circuit,
                 hot_codeword,
+                true,
                 &mut hot_challenger,
             );
 

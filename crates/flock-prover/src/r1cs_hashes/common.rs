@@ -451,22 +451,20 @@ where
                 let codeword =
                     rate2_codeword.expect("rate-1/2 driver specialization requires a codeword");
                 let elem_offset = g * z_grp.len();
-                // SAFETY: group `g` owns `z[elem_offset..elem_offset+len]`.
-                // The same group exclusively owns those offsets in each of the
-                // two codeword replicas. Groups are disjoint, cover all of z,
-                // and the parallel iterator joins before `codeword` is used
-                // again. Both source and destinations are in bounds and do not
-                // overlap.
+                // First-replica contract: only the message replica (the
+                // codeword's first half) is written here; replica B is
+                // synthesized by the commit's first NTT pass (or materialized
+                // by its fallback copy), saving one full duplicate store per
+                // proof. SAFETY: group `g` owns `z[elem_offset..len]` and the
+                // same offsets of the first replica; groups are disjoint,
+                // cover all of z, and the parallel iterator joins before
+                // `codeword` is used again. Source and destination are in
+                // bounds and do not overlap.
                 unsafe {
                     let dst = codeword.get();
                     std::ptr::copy_nonoverlapping(
                         z_grp.as_ptr(),
                         dst.add(elem_offset),
-                        z_grp.len(),
-                    );
-                    std::ptr::copy_nonoverlapping(
-                        z_grp.as_ptr(),
-                        dst.add(total_f128 + elem_offset),
                         z_grp.len(),
                     );
                 }
