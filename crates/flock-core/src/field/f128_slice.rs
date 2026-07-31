@@ -91,6 +91,47 @@ pub(crate) fn fold_two_and_msg(
     unsafe { aarch64::fold_two_and_msg(f, b, base, nf, nb, r) }
 }
 
+/// Ticket-14: safe wrapper for the two-challenge fused fold NEON kernel.
+#[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+#[inline]
+pub(crate) fn fold2_two_and_msgs(
+    f: &[F128],
+    b: &[F128],
+    base: usize,
+    wf: &mut [F128],
+    wb: &mut [F128],
+    r_a: F128,
+    r_b: F128,
+) -> (F128, F128, [F128; 6]) {
+    assert_eq!(f.len(), b.len());
+    assert_eq!(wf.len(), wb.len());
+    assert!(base.is_multiple_of(4));
+    assert!(wf.len().is_multiple_of(4));
+    assert!(4 * (base + wf.len()) <= f.len());
+    // SAFETY: cfg gate supplies PMULL; bounds established above.
+    unsafe { aarch64::fold2_two_and_msgs(f, b, base, wf, wb, r_a, r_b) }
+}
+
+/// Ticket-14: safe wrapper for the bootstrap fold-with-lookahead NEON kernel.
+#[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+#[inline]
+pub(crate) fn fold1_two_and_lookahead(
+    f: &[F128],
+    b: &[F128],
+    base: usize,
+    nf: &mut [F128],
+    nb: &mut [F128],
+    r: F128,
+) -> (F128, F128, [F128; 6]) {
+    assert_eq!(f.len(), b.len());
+    assert_eq!(nf.len(), nb.len());
+    assert!(base.is_multiple_of(4));
+    assert!(nf.len().is_multiple_of(4));
+    assert!(2 * (base + nf.len()) <= f.len());
+    // SAFETY: cfg gate supplies PMULL; bounds established above.
+    unsafe { aarch64::fold1_two_and_lookahead(f, b, base, nf, nb, r) }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -148,6 +148,7 @@ pub fn open_batch_mixed_ligerito_with_precomputed_s_hat_v<Ch: Challenger>(
         &prover_data.codeword,
         &prover_data.merkle_tree,
         combined.round0_prime,
+        combined.round1_lookahead,
         challenger,
     );
     if trace {
@@ -175,6 +176,10 @@ struct CombinedClaim {
     /// Round-0 sumcheck `(u_0, u_2)` prime over `packed_witness · b_combined`,
     /// consumed by `recursive_prover_with_basis_precomputed_round0`.
     round0_prime: (F128, F128),
+    /// Ticket-14 stage 2: round-1 message lookahead coefficients (degree-2 in
+    /// rho_0), accumulated in the same combine pass. `None` when the general
+    /// or sparse paths ran (coefficients unavailable/invalidated).
+    round1_lookahead: Option<[F128; 6]>,
 }
 
 /// Runs ring_switch over RS claims, observes packed-direct claim values +
@@ -315,7 +320,7 @@ fn compute_combined_basis_and_target<Ch: Challenger>(
     let use_fast =
         !rs_deferred.is_empty() && rs_deferred.len() == rs_results.len() && pd_dense.is_empty();
 
-    let (mut round0_u0, mut round0_u2) = if use_fast {
+    let (mut round0_u0, mut round0_u2, round1_lookahead) = if use_fast {
         let b = rs_deferred[0].0.len(); // eq_lo.len(); shared across claims (same split)
         debug_assert!(b >= 2 && b.is_multiple_of(2));
         debug_assert!(rs_deferred.iter().all(|d| d.0.len() == b));
@@ -334,7 +339,7 @@ fn compute_combined_basis_and_target<Ch: Challenger>(
         // sweep: the table build wouldn't amortize below ~2^12 slots.
         const COMPOSE_MIN_BLOCK: usize = 1 << 12;
         let composed = b >= COMPOSE_MIN_BLOCK;
-        b_combined
+        let fast = b_combined
             .par_chunks_mut(b)
             .enumerate()
             .map_init(
@@ -379,21 +384,69 @@ fn compute_combined_basis_and_target<Ch: Challenger>(
                     let base = hi * b;
                     let mut u0 = F128::ZERO;
                     let mut u2 = F128::ZERO;
-                    for t in 0..(b / 2) {
-                        let s0 = out_block[2 * t];
-                        let s1 = out_block[2 * t + 1];
-                        let a0 = packed_witness[base + 2 * t];
-                        let a1 = packed_witness[base + 2 * t + 1];
-                        u0 += a0 * s0;
-                        u2 += (a0 + a1) * (s0 + s1);
+                    // Ticket-14 stage 2: while the block is L2-resident, also
+                    // accumulate the round-1 message's lookahead coefficients
+                    // (degree-2 in the not-yet-sampled rho_0). Reuse: the even-
+                    // pair halves of u0/u2 are exactly coefficient terms c0/c2,
+                    // so the lookahead costs 6 extra multiplies per quad and no
+                    // extra bytes. See `ligerito::eval_lookahead` for the basis.
+                    let mut c = [F128::ZERO; 6];
+                    debug_assert!(b.is_multiple_of(4) || b < 4);
+                    if b.is_multiple_of(4) {
+                        for t in 0..(b / 4) {
+                            let s0 = out_block[4 * t];
+                            let s1 = out_block[4 * t + 1];
+                            let s2 = out_block[4 * t + 2];
+                            let s3 = out_block[4 * t + 3];
+                            let a0 = packed_witness[base + 4 * t];
+                            let a1 = packed_witness[base + 4 * t + 1];
+                            let a2 = packed_witness[base + 4 * t + 2];
+                            let a3 = packed_witness[base + 4 * t + 3];
+                            let sa0 = a0 + a1;
+                            let ss0 = s0 + s1;
+                            let sa1 = a2 + a3;
+                            let ss1 = s2 + s3;
+                            let p_even0 = a0 * s0; // u0 term AND c0
+                            let p_sum0 = sa0 * ss0; // u2 term AND c2
+                            u0 += p_even0 + a2 * s2;
+                            u2 += p_sum0 + sa1 * ss1;
+                            c[0] += p_even0;
+                            c[1] += a0 * ss0 + s0 * sa0;
+                            c[2] += p_sum0;
+                            let e_a = a0 + a2;
+                            let e_s = s0 + s2;
+                            let se_a = sa0 + sa1;
+                            let se_s = ss0 + ss1;
+                            c[3] += e_a * e_s;
+                            c[4] += e_a * se_s + e_s * se_a;
+                            c[5] += se_a * se_s;
+                        }
+                    } else {
+                        for t in 0..(b / 2) {
+                            let s0 = out_block[2 * t];
+                            let s1 = out_block[2 * t + 1];
+                            let a0 = packed_witness[base + 2 * t];
+                            let a1 = packed_witness[base + 2 * t + 1];
+                            u0 += a0 * s0;
+                            u2 += (a0 + a1) * (s0 + s1);
+                        }
                     }
-                    (u0, u2)
+                    (u0, u2, c)
                 },
             )
             .reduce(
-                || (F128::ZERO, F128::ZERO),
-                |(x0, x2), (y0, y2)| (x0 + y0, x2 + y2),
-            )
+                || (F128::ZERO, F128::ZERO, [F128::ZERO; 6]),
+                |(x0, x2, xc), (y0, y2, yc)| {
+                    let mut c = xc;
+                    for (a, b) in c.iter_mut().zip(yc.iter()) {
+                        *a += *b;
+                    }
+                    (x0 + y0, x2 + y2, c)
+                },
+            );
+        // Coefficients are only complete when every block ran the quad loop.
+        let la = if b.is_multiple_of(4) { Some(fast.2) } else { None };
+        (fast.0, fast.1, la)
     } else {
         // General path (mixed / sparse / packed-direct): materialize any
         // deferred-dense claims (parallel block fold), then the per-element
@@ -439,8 +492,11 @@ fn compute_combined_basis_and_target<Ch: Challenger>(
         for v in materialized {
             crate::scratch::give_f128(v);
         }
-        prime
+        (prime.0, prime.1, None)
     };
+    // Ticket-14 stage 2: any post-hoc sparse adjustment mutates b_combined
+    // after the lookahead coefficients were accumulated, invalidating them.
+    let mut round1_lookahead = round1_lookahead;
     let fold_ms = t_fold.elapsed().as_secs_f64() * 1e3;
     let t_sparse = std::time::Instant::now();
     let mut adjust_prime_for_delta = |idx: usize, delta: F128| {
@@ -454,6 +510,7 @@ fn compute_combined_basis_and_target<Ch: Challenger>(
     };
     for (_, output) in rs_results.iter() {
         if let ring_switch::RsEqInd::Sparse { entries, .. } = &output.rs_eq_ind {
+            round1_lookahead = None;
             for &(idx, val) in entries {
                 b_combined[idx] += val;
                 adjust_prime_for_delta(idx, val);
@@ -467,6 +524,7 @@ fn compute_combined_basis_and_target<Ch: Challenger>(
             // full O(L) re-pass over b_combined. The prime is linear in
             // b_combined, so the delta from scattering `g·eq` equals
             // Σ adjust_prime_for_delta(idx, g·val) over the live positions.
+            round1_lookahead = None;
             let (du0, du2) = sparse_scatter_add_parallel(&mut b_combined, packed_witness, eq, *g);
             round0_u0 += du0;
             round0_u2 += du2;
@@ -500,6 +558,7 @@ fn compute_combined_basis_and_target<Ch: Challenger>(
         b_combined,
         target_combined,
         round0_prime: (round0_u0, round0_u2),
+        round1_lookahead,
     }
 }
 
