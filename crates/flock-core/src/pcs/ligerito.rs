@@ -2335,6 +2335,128 @@ impl LigeroWitness {
     }
 }
 
+#[inline]
+fn use_recursive_ntt_merkle_leaf_pipeline(
+    log_msg_cols: usize,
+    log_num_interleaved: usize,
+    log_inv_rate: usize,
+    kind: HashKind,
+) -> bool {
+    cfg!(all(
+        target_os = "macos",
+        target_arch = "aarch64",
+        target_feature = "aes"
+    )) && kind == HashKind::Blake3
+        // The ranked m=32 fast-profile L1 commitment. Its transform finishes
+        // in sixteen independent 2 MiB chunks, enough to amortize cross-pool
+        // dispatch while the smaller recursive levels are deliberately left
+        // on the ordinary path.
+        && log_msg_cols == 16
+        && log_num_interleaved == 3
+        && log_inv_rate == 2
+        && rayon::current_num_threads() > 1
+        && std::env::var_os("FLOCK_NO_RECURSIVE_NTT_MERKLE_PIPELINE").is_none()
+}
+
+#[derive(Clone, Copy)]
+struct RecursiveLeafJob {
+    elem_offset: usize,
+    elem_len: usize,
+}
+
+/// Stream finalized L1 NTT chunks to the idle efficiency cores for BLAKE3
+/// leaf hashing. The P-core transform never waits for queue space: a full or
+/// disconnected queue hashes the just-finished cache-resident chunk inline.
+fn recursive_ntt_with_pipelined_leaves(
+    ntt: &AdditiveNttF128,
+    mat: &mut [F128],
+    num_interleaved: usize,
+    log_inv_rate: usize,
+    leaves: &mut [Hash],
+    helper: &rayon::ThreadPool,
+) {
+    use rayon::prelude::*;
+    use std::sync::Mutex;
+    use std::sync::mpsc::{TrySendError, sync_channel};
+
+    const LEAF_SIZE: usize = 8 * core::mem::size_of::<F128>();
+    debug_assert_eq!(num_interleaved, 8);
+    debug_assert_eq!(leaves.len(), mat.len() / num_interleaved);
+    let mat_base = crate::epool::SyncPtr(mat.as_mut_ptr());
+    let leaves_base = crate::epool::SyncPtr(leaves.as_mut_ptr());
+
+    let hash_job = |job: RecursiveLeafJob| {
+        debug_assert_eq!(job.elem_offset % num_interleaved, 0);
+        debug_assert_eq!(job.elem_len % num_interleaved, 0);
+        let leaf_start = job.elem_offset / num_interleaved;
+        let leaf_len = job.elem_len / num_interleaved;
+        // SAFETY: the NTT publishes a chunk only after its final write and
+        // never touches it again. Published chunks are pairwise disjoint and
+        // cover the matrix exactly once. Channel synchronization makes those
+        // writes visible before a helper reads the chunk; leaf output ranges
+        // are derived from the same disjoint offsets.
+        unsafe {
+            let elems =
+                core::slice::from_raw_parts(mat_base.ptr().add(job.elem_offset), job.elem_len);
+            let bytes = core::slice::from_raw_parts(
+                elems.as_ptr().cast::<u8>(),
+                core::mem::size_of_val(elems),
+            );
+            let outs = core::slice::from_raw_parts_mut(leaves_base.ptr().add(leaf_start), leaf_len);
+            merkle::hash_blake3_leaf_chunk(bytes, LEAF_SIZE, outs);
+        }
+    };
+
+    let queue_capacity = (2 * helper.current_num_threads()).max(1);
+    let (sender, receiver) = sync_channel::<RecursiveLeafJob>(queue_capacity);
+    let receiver = Mutex::new(receiver);
+
+    std::thread::scope(|scope| {
+        let helper_manager = scope.spawn(|| {
+            helper.broadcast(|_| {
+                loop {
+                    let job = receiver.lock().unwrap().recv();
+                    match job {
+                        Ok(job) => hash_job(job),
+                        Err(_) => break,
+                    }
+                }
+            });
+        });
+
+        ntt.forward_transform_interleaved_from_layer_and_then(
+            mat,
+            num_interleaved,
+            log_inv_rate,
+            |elem_offset, chunk| {
+                let job = RecursiveLeafJob {
+                    elem_offset,
+                    elem_len: chunk.len(),
+                };
+                match sender.try_send(job) {
+                    Ok(()) => {}
+                    Err(TrySendError::Full(job) | TrySendError::Disconnected(job)) => hash_job(job),
+                }
+            },
+        );
+        drop(sender);
+
+        // Move any unclaimed bounded tail onto the main pool while E-core jobs
+        // already in flight finish concurrently.
+        let mut tail = Vec::with_capacity(queue_capacity);
+        {
+            let receiver = receiver.lock().unwrap();
+            while let Ok(job) = receiver.try_recv() {
+                tail.push(job);
+            }
+        }
+        tail.into_par_iter().for_each(hash_job);
+        helper_manager
+            .join()
+            .expect("recursive NTT-to-Merkle helper manager panicked");
+    });
+}
+
 /// Reshape `poly` (length `num_interleaved · msg_cols`) into a
 /// `block_len × num_interleaved` SoA matrix, RS-encode each lane via the
 /// LCH additive NTT (non-systematic: pad message with zeros to `block_len`,
@@ -2368,19 +2490,47 @@ pub(crate) fn ligero_commit(
     let mut mat = crate::scratch::take_f128(codeword_len);
     super::commit::replicate_message_fill(&mut mat, poly);
 
-    // RS-encode every lane in one call (each lane is one independent NTT).
-    ntt.forward_transform_interleaved_from_layer(&mut mat, num_interleaved, log_inv_rate);
-
-    // Merkle over rows. One leaf = `num_interleaved` consecutive F128 = 16·num_interleaved bytes.
-    let leaf_size_bytes = num_interleaved * core::mem::size_of::<F128>();
-    let data_bytes: &[u8] = unsafe {
-        core::slice::from_raw_parts(
-            mat.as_ptr() as *const u8,
-            mat.len() * core::mem::size_of::<F128>(),
-        )
+    let helper = if use_recursive_ntt_merkle_leaf_pipeline(
+        log_msg_cols,
+        log_num_interleaved,
+        log_inv_rate,
+        kind,
+    ) {
+        crate::epool::epool()
+    } else {
+        None
     };
-    debug_assert_eq!(data_bytes.len(), block_len * leaf_size_bytes);
-    let tree = merkle::merkle_tree(data_bytes, block_len, kind);
+    let mut prehashed_tree = helper.map(|_| crate::alloc_uninit_vec::<Hash>(2 * block_len - 1));
+
+    // RS-encode every lane in one call (each lane is one independent NTT).
+    if let (Some(helper), Some(tree)) = (helper, prehashed_tree.as_mut()) {
+        recursive_ntt_with_pipelined_leaves(
+            ntt,
+            &mut mat,
+            num_interleaved,
+            log_inv_rate,
+            &mut tree[..block_len],
+            helper,
+        );
+    } else {
+        ntt.forward_transform_interleaved_from_layer(&mut mat, num_interleaved, log_inv_rate);
+    }
+
+    let tree = if let Some(tree) = prehashed_tree {
+        merkle::merkle_tree_from_prehashed_leaves(tree, block_len, kind)
+    } else {
+        // Merkle over rows. One leaf = `num_interleaved` consecutive F128 =
+        // 16·num_interleaved bytes.
+        let leaf_size_bytes = num_interleaved * core::mem::size_of::<F128>();
+        let data_bytes: &[u8] = unsafe {
+            core::slice::from_raw_parts(
+                mat.as_ptr() as *const u8,
+                mat.len() * core::mem::size_of::<F128>(),
+            )
+        };
+        debug_assert_eq!(data_bytes.len(), block_len * leaf_size_bytes);
+        merkle::merkle_tree(data_bytes, block_len, kind)
+    };
 
     LigeroWitness {
         mat,
@@ -3470,14 +3620,26 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
 
         let sks_vks_i = eval_sk_at_vks(n_next);
         let _t = std::time::Instant::now();
-        let (basis_i_induced, enforced_sum_i) = induce_sumcheck_poly(
-            n_next,
-            &sks_vks_i,
-            &opened_rows_i,
-            &level_rs,
-            &queries_i,
-            &alpha_i,
-        );
+        let (basis_i_induced, enforced_sum_i) =
+            if n_next == 16 && config.log_inv_rates[i + 1] == 2 && queries_i.len() == 106 {
+                induce_sumcheck_poly_via_ntt(
+                    n_next,
+                    config.log_inv_rates[i + 1],
+                    &opened_rows_i,
+                    &level_rs,
+                    &queries_i,
+                    &alpha_i,
+                )
+            } else {
+                induce_sumcheck_poly(
+                    n_next,
+                    &sks_vks_i,
+                    &opened_rows_i,
+                    &level_rs,
+                    &queries_i,
+                    &alpha_i,
+                )
+            };
         if trace {
             t_induce += _t.elapsed();
         }

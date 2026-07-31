@@ -516,28 +516,36 @@ fn hash_leaves(data: &[u8], leaf_size: usize, out: &mut [Hash], kind: HashKind) 
     }
 }
 
-/// Hash one already-partitioned run of ranked 1 KiB BLAKE3 leaves without
+/// Hash one already-partitioned run of equal-size BLAKE3 leaves without
 /// starting another Rayon/E-core scheduling region.
 ///
-/// The ranked NTT-to-Merkle pipeline calls this from jobs that are themselves
-/// distributed across the P-core pool or handed to the existing E-core helper
-/// pool. Keeping this helper scheduling-free avoids a nested barrier per 1 MiB
-/// finalized NTT subtree while preserving the exact twelve-way leaf kernel and
-/// hash-count semantics used by [`hash_leaves`].
-pub(crate) fn hash_ranked_blake3_leaf_chunk(data: &[u8], out: &mut [Hash]) {
-    const LEAF_SIZE: usize = 1024;
-    assert_eq!(data.len(), out.len() * LEAF_SIZE);
+/// NTT-to-Merkle pipelines call this from jobs that are themselves distributed
+/// across the P-core pool or handed to the existing E-core helper pool. Keeping
+/// this helper scheduling-free avoids a nested barrier per finalized NTT
+/// subtree while preserving the batched leaf kernel and hash-count semantics
+/// used by [`hash_leaves`].
+pub(crate) fn hash_blake3_leaf_chunk(data: &[u8], leaf_size: usize, out: &mut [Hash]) {
+    assert_eq!(data.len(), out.len() * leaf_size);
     #[cfg(feature = "hash-count")]
     {
         use std::sync::atomic::Ordering::Relaxed;
         hash_count::LEAF_CALLS.fetch_add(out.len() as u64, Relaxed);
         hash_count::LEAF_COMPRESSIONS.fetch_add(
-            out.len() as u64 * hash_count::blocks(HashKind::Blake3, LEAF_SIZE),
+            out.len() as u64 * hash_count::blocks(HashKind::Blake3, leaf_size),
             Relaxed,
         );
     }
-    let batched = blake3_hash_many_leaves(data, LEAF_SIZE, out);
-    assert!(batched, "ranked 1 KiB leaves must use the batched kernel");
+    let batched = blake3_hash_many_leaves(data, leaf_size, out);
+    assert!(
+        batched,
+        "pipelined BLAKE3 leaves must use the batched kernel"
+    );
+}
+
+/// Ranked 1 KiB specialization retained for the main commitment pipeline.
+#[inline]
+pub(crate) fn hash_ranked_blake3_leaf_chunk(data: &[u8], out: &mut [Hash]) {
+    hash_blake3_leaf_chunk(data, 1024, out);
 }
 
 /// Leaves per queue chunk in the batched BLAKE3 leaf path (see `epool`).
