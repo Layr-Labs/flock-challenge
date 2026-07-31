@@ -465,6 +465,50 @@ impl AdditiveNttF128 {
         unreachable!("ranked top split requires a hardware NTT target");
     }
 
+    /// Initialize the ranked rate-1/2 codeword directly from its message and
+    /// apply all three cache-streaming top radix-8 groups.
+    ///
+    /// A rate-1/2 commit normally materializes `[message, message]`, the exact
+    /// post-layer-1 state, before starting the transform at layer 1. This entry
+    /// point initializes each layer-1 destination tile from that virtual
+    /// duplicate, immediately applies layers 1..4 in place while the tile is
+    /// resident, then resumes the frontier scheduler at layer 4.
+    #[inline]
+    pub(crate) fn forward_transform_interleaved_ranked_top_from_rate2_message(
+        &self,
+        message: &[F128],
+        data: &mut [F128],
+        num_ntts: usize,
+        start_layer: usize,
+    ) {
+        let log_d = log2_pow2(data.len() / num_ntts);
+        assert!(use_ranked_deep_pair_fusion(
+            log_d,
+            num_ntts,
+            start_layer,
+            10
+        ));
+        assert_eq!(start_layer, 1);
+        assert_eq!(data.len(), 2 * message.len());
+
+        #[cfg(any(
+            all(target_arch = "aarch64", target_feature = "aes"),
+            all(target_arch = "x86_64", target_feature = "pclmulqdq"),
+        ))]
+        {
+            initialize_rate2_fused_3layer_from_message(self, message, data, num_ntts, start_layer);
+            self.forward_transform_interleaved_parallel_from_layer_and_then_with_top_start::<
+                INTERLEAVED_PHASE_TOP_ONLY,
+                _,
+            >(data, num_ntts, start_layer, start_layer + 3, &|_, _| {});
+        }
+        #[cfg(not(any(
+            all(target_arch = "aarch64", target_feature = "aes"),
+            all(target_arch = "x86_64", target_feature = "pclmulqdq"),
+        )))]
+        unreachable!("ranked virtual-input top split requires a hardware NTT target");
+    }
+
     /// Finish the ranked L0 transform's five cache-local deep pairs and invoke
     /// `finish_chunk` exactly as the unsplit transform does.
     #[inline]
@@ -591,9 +635,37 @@ impl AdditiveNttF128 {
     ) where
         F: Fn(usize, &[F128]) + Sync + Send,
     {
+        self.forward_transform_interleaved_parallel_from_layer_and_then_with_top_start::<PHASE, F>(
+            data,
+            num_ntts,
+            start_layer,
+            start_layer,
+            finish_chunk,
+        );
+    }
+
+    #[cfg(any(
+        all(target_arch = "aarch64", target_feature = "aes"),
+        all(target_arch = "x86_64", target_feature = "pclmulqdq"),
+    ))]
+    fn forward_transform_interleaved_parallel_from_layer_and_then_with_top_start<
+        const PHASE: u8,
+        F,
+    >(
+        &self,
+        data: &mut [F128],
+        num_ntts: usize,
+        start_layer: usize,
+        top_start_layer: usize,
+        finish_chunk: &F,
+    ) where
+        F: Fn(usize, &[F128]) + Sync + Send,
+    {
         debug_assert!(PHASE <= INTERLEAVED_PHASE_DEEP_ONLY);
         let n_total = data.len();
         let log_d = log2_pow2(n_total / num_ntts);
+        assert!(top_start_layer >= start_layer);
+        assert!(top_start_layer <= log_d);
 
         // Target sub-group size = 2 MB total bytes. Each position is
         // `num_ntts × 16` bytes, so positions per sub-group =
@@ -677,7 +749,7 @@ impl AdditiveNttF128 {
         ));
         let fused3_ok = !fused4_ok;
         let zero_root_fused3 = use_ranked_zero_root_fusion(log_d, num_ntts, start_layer, n_top);
-        let mut layer = start_layer.min(n_top);
+        let mut layer = top_start_layer.min(n_top);
         while layer < n_top {
             let num_blocks = 1usize << layer;
             let block_size = 1usize << (log_d - layer);
@@ -1410,6 +1482,111 @@ fn butterfly_interleaved_block(
     }
 }
 
+/// Initialize the two layer-1 blocks of a rate-1/2 transform from their shared
+/// message in 1 MiB claims. Each claim first performs eight sequential bulk
+/// row copies, then immediately runs the existing in-place radix-8 kernel on
+/// the copied tile. This avoids the rejected source+destination 16-stream hot
+/// loop while retaining the frontier's exact heterogeneous claim geometry.
+fn initialize_rate2_fused_3layer_from_message(
+    ntt: &AdditiveNttF128,
+    message: &[F128],
+    data: &mut [F128],
+    num_ntts: usize,
+    start_layer: usize,
+) {
+    assert_eq!(start_layer, 1);
+    assert!(num_ntts.is_power_of_two() && num_ntts > 0);
+    assert_eq!(data.len(), 2 * message.len());
+    assert_eq!(data.len() % num_ntts, 0);
+    let log_d = log2_pow2(data.len() / num_ntts);
+    let block_size = 1usize << (log_d - start_layer);
+    let block_elems = block_size * num_ntts;
+    let eighth = block_size >> 3;
+    assert_eq!(message.len(), block_elems);
+    assert!(eighth > 0 && eighth.is_power_of_two());
+
+    let twiddles: [[F128; 7]; 2] = std::array::from_fn(|block| {
+        let mut tw = [F128::ZERO; 7];
+        tw[0] = ntt.twiddle(start_layer, block);
+        for s in 0..2 {
+            tw[1 + s] = ntt.twiddle(start_layer + 1, 2 * block + s);
+        }
+        for s in 0..4 {
+            tw[3 + s] = ntt.twiddle(start_layer + 2, 4 * block + s);
+        }
+        tw
+    });
+    debug_assert_eq!(twiddles[0][0], F128::ZERO);
+    debug_assert_eq!(twiddles[0][1], F128::ZERO);
+    debug_assert_eq!(twiddles[0][3], F128::ZERO);
+
+    const ROWS_PER_TILE: usize = 128;
+    let tiles_per_block = eighth.div_ceil(ROWS_PER_TILE);
+    let src = crate::epool::SyncPtr(message.as_ptr().cast_mut());
+    let dst = crate::epool::SyncPtr(data.as_mut_ptr());
+    crate::epool::run_hetero_chunks(2 * tiles_per_block, |job| {
+        let block = job / tiles_per_block;
+        let tile = job % tiles_per_block;
+        let row_start = tile * ROWS_PER_TILE;
+        let row_end = (row_start + ROWS_PER_TILE).min(eighth);
+        // SAFETY: every queue claim owns all eight destination stream runs for
+        // its unique `(block, row_start..row_end)` tile. The immutable message
+        // does not overlap `data`; the in-place pass begins after all eight
+        // copies in this claim have completed.
+        unsafe {
+            copy_then_fused3_tile(
+                src.ptr(),
+                dst.ptr().add(block * block_elems),
+                eighth,
+                num_ntts,
+                row_start,
+                row_end,
+                &twiddles[block],
+                block == 0,
+            );
+        }
+    });
+}
+
+/// Copy all eight source stream runs before invoking the unchanged in-place
+/// fused-three-layer row kernel. Kept out of line so dynamic-sized copies stay
+/// bulk `memcpy` operations instead of being interleaved with PMULL loads and
+/// destination stores.
+#[inline(never)]
+unsafe fn copy_then_fused3_tile(
+    source: *const F128,
+    destination: *mut F128,
+    eighth: usize,
+    num_ntts: usize,
+    row_start: usize,
+    row_end: usize,
+    twiddles: &[F128; 7],
+    zero_root: bool,
+) {
+    let run_elems = (row_end - row_start) * num_ntts;
+    unsafe {
+        for stream in 0..8 {
+            let offset = (stream * eighth + row_start) * num_ntts;
+            core::ptr::copy_nonoverlapping(source.add(offset), destination.add(offset), run_elems);
+        }
+        if zero_root {
+            for row in row_start..row_end {
+                kernels::butterfly_fused_3layer_zero_root_row(
+                    destination,
+                    eighth,
+                    num_ntts,
+                    row,
+                    twiddles,
+                );
+            }
+        } else {
+            for row in row_start..row_end {
+                kernels::butterfly_fused_3layer_row(destination, eighth, num_ntts, row, twiddles);
+            }
+        }
+    }
+}
+
 /// Butterfly one top-layer block, fusing three layers `(L..L+3)`. `block`
 /// holds `8 * eighth` rows of `num_ntts` lanes; `t` carries the 7 twiddles for
 /// the sub-butterflies. Parallel over row groups.
@@ -2021,6 +2198,99 @@ mod tests {
             );
             assert_eq!(got, expected, "iteration={iteration}");
         }
+    }
+
+    #[test]
+    fn rate2_staged_fused3_initializer_matches_materialized_duplicate() {
+        const LOG_D: usize = 10;
+        const START_LAYER: usize = 1;
+        const NUM_NTTS: usize = 8;
+        let ntt = AdditiveNttF128::standard(LOG_D);
+        let mut rng = Rng::new(0xA17E_2000_F053);
+        let message = rand_vec(&mut rng, (1usize << (LOG_D - 1)) * NUM_NTTS);
+        let twiddles: [[F128; 7]; 2] = std::array::from_fn(|block| {
+            let mut tw = [F128::ZERO; 7];
+            tw[0] = ntt.twiddle(START_LAYER, block);
+            for s in 0..2 {
+                tw[1 + s] = ntt.twiddle(START_LAYER + 1, 2 * block + s);
+            }
+            for s in 0..4 {
+                tw[3 + s] = ntt.twiddle(START_LAYER + 2, 4 * block + s);
+            }
+            tw
+        });
+        let mut expected = Vec::with_capacity(2 * message.len());
+        expected.extend_from_slice(&message);
+        expected.extend_from_slice(&message);
+        let eighth = (1usize << (LOG_D - START_LAYER)) >> 3;
+        butterfly_interleaved_fused_3layer_all_blocks_par_rows(
+            &mut expected,
+            &twiddles,
+            eighth,
+            NUM_NTTS,
+        );
+        let stale = F128 { lo: !0, hi: !0 };
+        let mut got = vec![stale; 2 * message.len()];
+        initialize_rate2_fused_3layer_from_message(&ntt, &message, &mut got, NUM_NTTS, START_LAYER);
+        assert_eq!(got, expected);
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64", target_feature = "aes"))]
+    #[test]
+    #[ignore = "exact ranked oracle needs roughly 2.5 GiB and a full radix-8 pass"]
+    fn ranked_rate2_staged_fused3_initializer_matches_materialized_duplicate() {
+        use rayon::prelude::*;
+        const LOG_D: usize = 20;
+        const START_LAYER: usize = 1;
+        const NUM_NTTS: usize = 64;
+        const MESSAGE_LEN: usize = (1usize << (LOG_D - 1)) * NUM_NTTS;
+        let ntt = AdditiveNttF128::standard(LOG_D);
+        let message: Vec<F128> = (0..MESSAGE_LEN)
+            .into_par_iter()
+            .map(|i| {
+                let x = (i as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+                F128 {
+                    lo: x ^ 0xA17E_2000_F053_0001,
+                    hi: x.rotate_left(29) ^ 0xC0DE_CAFE_51A7_E002,
+                }
+            })
+            .collect();
+        let twiddles: [[F128; 7]; 2] = std::array::from_fn(|block| {
+            let mut tw = [F128::ZERO; 7];
+            tw[0] = ntt.twiddle(START_LAYER, block);
+            for s in 0..2 {
+                tw[1 + s] = ntt.twiddle(START_LAYER + 1, 2 * block + s);
+            }
+            for s in 0..4 {
+                tw[3 + s] = ntt.twiddle(START_LAYER + 2, 4 * block + s);
+            }
+            tw
+        });
+        let mut expected = crate::alloc_uninit_vec::<F128>(2 * MESSAGE_LEN);
+        expected[..MESSAGE_LEN]
+            .par_chunks_mut(1 << 16)
+            .enumerate()
+            .for_each(|(chunk, dst)| {
+                let start = chunk * (1 << 16);
+                dst.copy_from_slice(&message[start..start + dst.len()]);
+            });
+        expected[MESSAGE_LEN..]
+            .par_chunks_mut(1 << 16)
+            .enumerate()
+            .for_each(|(chunk, dst)| {
+                let start = chunk * (1 << 16);
+                dst.copy_from_slice(&message[start..start + dst.len()]);
+            });
+        let eighth = (1usize << (LOG_D - START_LAYER)) >> 3;
+        butterfly_interleaved_fused_3layer_all_blocks_par_rows(
+            &mut expected,
+            &twiddles,
+            eighth,
+            NUM_NTTS,
+        );
+        let mut got = crate::alloc_uninit_vec::<F128>(2 * MESSAGE_LEN);
+        initialize_rate2_fused_3layer_from_message(&ntt, &message, &mut got, NUM_NTTS, START_LAYER);
+        assert_eq!(got, expected);
     }
 
     /// The ranked heterogeneous dispatcher flattens `(block, row-tile)` queue

@@ -1697,6 +1697,16 @@ impl Blake3Setup {
             && std::env::var_os("FLOCK_NO_HOT_CODEWORD").is_none()
     }
 
+    #[inline]
+    fn use_ranked_rate2_virtual_input(&self) -> bool {
+        self.use_ranked_rate2_hot_codeword()
+            && rayon::current_num_threads() > 1
+            && std::env::var_os("FLOCK_NO_RATE2_VIRTUAL_INIT").is_none()
+            && std::env::var_os("FLOCK_NO_NTT_MERKLE_PIPELINE").is_none()
+            && std::env::var_os("FLOCK_NO_NTT_TOP_EPOOL").is_none()
+            && std::env::var_os("FLOCK_NTT_BLOCK_REGIONS").is_none()
+    }
+
     /// Select the reverse transpose only for the promoted benchmark geometry.
     /// `FLOCK_NO_BLAKE3_REVERSE_LINCHECK=1` is the exact CSC A/B control.
     #[inline]
@@ -1847,6 +1857,23 @@ impl Blake3Setup {
         challenger: &mut Ch,
     ) -> (flock_core::proof::R1csProofLigerito, Commitment, R1csClaim) {
         assert_eq!(blocks.len(), self.n_blocks);
+        if self.use_ranked_rate2_virtual_input() {
+            let (z_packed, a_packed_f128, b_packed_f128, z_packed_lincheck) =
+                self.generate_witness_ab(blocks);
+            let codeword = flock_core::scratch::take_f128(self.pcs_params.codeword_len_f128());
+            let lc_circuit = self.lincheck_circuit();
+            return crate::prover::prove_fast_ligerito_from_virtual_rate2_codeword(
+                &self.r1cs,
+                &self.pcs_params,
+                z_packed,
+                a_packed_f128,
+                b_packed_f128,
+                z_packed_lincheck,
+                lc_circuit,
+                codeword,
+                challenger,
+            );
+        }
         if self.use_ranked_rate2_hot_codeword() {
             let (codeword, (z_packed, a_packed_f128, b_packed_f128, z_packed_lincheck)) =
                 self.generate_witness_ab_with_rate2_codeword(blocks);
@@ -1896,6 +1923,27 @@ impl Blake3Setup {
     ) {
         assert_eq!(blocks.len(), self.n_blocks);
         let t0 = std::time::Instant::now();
+        if self.use_ranked_rate2_virtual_input() {
+            let (z_packed, a_packed_f128, b_packed_f128, z_packed_lincheck) =
+                self.generate_witness_ab(blocks);
+            let codeword = flock_core::scratch::take_f128(self.pcs_params.codeword_len_f128());
+            let witness_s = t0.elapsed().as_secs_f64();
+            let lc_circuit = self.lincheck_circuit();
+            let (proof, commitment, claim, mut timings) =
+                crate::prover::prove_fast_ligerito_timed_from_virtual_rate2_codeword(
+                    &self.r1cs,
+                    &self.pcs_params,
+                    z_packed,
+                    a_packed_f128,
+                    b_packed_f128,
+                    z_packed_lincheck,
+                    lc_circuit,
+                    codeword,
+                    challenger,
+                );
+            timings.witness_s = witness_s;
+            return (proof, commitment, claim, timings);
+        }
         let (codeword, (z_packed, a_packed_f128, b_packed_f128, z_packed_lincheck)) =
             if self.use_ranked_rate2_hot_codeword() {
                 let (codeword, witness) = self.generate_witness_ab_with_rate2_codeword(blocks);
@@ -2721,6 +2769,77 @@ mod tests {
             hot_bytes == filled_bytes,
             "ranked hot-row codeword differs from replicate_message_fill"
         );
+    }
+
+    /// Fixed-seed complete-proof equality between the promoted hot-witness
+    /// materialization and the staged virtual-rate2 initializer. Run alone:
+    /// `cargo test ranked_staged_and_hot_proofs_are_byte_identical --release -- --ignored --test-threads=1`.
+    #[test]
+    #[ignore = "two full m=32 proofs; correctness gate, not a timing probe"]
+    fn ranked_staged_and_hot_proofs_are_byte_identical() {
+        use flock_core::challenger::FsChallenger;
+
+        const RANKED_N_BLOCKS: usize = 1 << 18;
+        let mut setup = Blake3Setup::new(RANKED_N_BLOCKS);
+        setup.pcs_params.merkle_hash = HashKind::Blake3;
+        assert!(setup.use_ranked_rate2_hot_codeword());
+        assert!(setup.use_ranked_reverse_lincheck());
+
+        let mut rng = Rng::new(0xC0FFEE_BEEF ^ RANKED_N_BLOCKS as u64);
+        let blocks: Vec<Compression> = (0..RANKED_N_BLOCKS)
+            .map(|_| {
+                let cv = std::array::from_fn(|_| rng.next_u32());
+                let m = std::array::from_fn(|_| rng.next_u32());
+                (cv, m, rng.next_u32() as u64, 64, 11)
+            })
+            .collect();
+        let circuit = setup.lincheck_circuit();
+
+        let (z, a, b, stripe) = setup.generate_witness_ab(&blocks);
+        let scratch = flock_core::scratch::take_f128(setup.pcs_params.codeword_len_f128());
+        let mut staged_ch = FsChallenger::with_hash(b"flock-bench-v0", HashKind::Blake3);
+        let (staged_proof, staged_commitment, staged_claim) =
+            crate::prover::prove_fast_ligerito_from_virtual_rate2_codeword(
+                &setup.r1cs,
+                &setup.pcs_params,
+                z,
+                a,
+                b,
+                stripe,
+                circuit,
+                scratch,
+                &mut staged_ch,
+            );
+
+        let (hot_codeword, (z, a, b, stripe)) =
+            setup.generate_witness_ab_with_rate2_codeword(&blocks);
+        let mut hot_ch = FsChallenger::with_hash(b"flock-bench-v0", HashKind::Blake3);
+        let (hot_proof, hot_commitment, hot_claim) =
+            crate::prover::prove_fast_ligerito_from_preinitialized_codeword(
+                &setup.r1cs,
+                &setup.pcs_params,
+                z,
+                a,
+                b,
+                stripe,
+                circuit,
+                hot_codeword,
+                &mut hot_ch,
+            );
+
+        assert_eq!(staged_commitment.root, hot_commitment.root);
+        assert_eq!(staged_claim, hot_claim);
+        let staged_bytes = crate::proof_io::R1csProofBundleLigerito {
+            commitment: staged_commitment,
+            proof: staged_proof,
+        }
+        .to_bytes();
+        let hot_bytes = crate::proof_io::R1csProofBundleLigerito {
+            commitment: hot_commitment,
+            proof: hot_proof,
+        }
+        .to_bytes();
+        assert_eq!(staged_bytes, hot_bytes);
     }
 
     /// One-proof ranked canary without the benchmark's timing loops.
