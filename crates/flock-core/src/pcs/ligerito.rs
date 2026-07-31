@@ -2032,6 +2032,7 @@ pub(crate) fn induce_sumcheck_poly(
 /// Forward butterfly is `M=[[1,t],[1,t+1]]`; transpose `Mᵀ=[[1,1],[t,t+1]]` is
 /// `s=a+b; top=s; bot=t·s+b`, applied in **reverse** layer order. (Baseline:
 /// one parallel sweep per layer.)
+#[cfg(test)]
 fn transpose_forward_ntt(ntt: &AdditiveNttF128, data: &mut [F128], log_d: usize) {
     use rayon::prelude::*;
     debug_assert_eq!(data.len(), 1usize << log_d);
@@ -2118,7 +2119,7 @@ pub(crate) fn induce_sumcheck_poly_via_ntt(
         c
     } else {
         let ntt = AdditiveNttF128::standard(log_block);
-        transpose_forward_ntt_sparse(&ntt, queries, &alpha_pows, log_block)
+        transpose_forward_ntt_sparse(&ntt, queries, &alpha_pows, log_block, log_msg_cols)
     };
     coeffs.truncate(n);
     (coeffs, enforced_sum)
@@ -2176,29 +2177,40 @@ pub(crate) fn induce_sumcheck_poly_auto(
 /// has only `positions.len()` nonzeros and that the first `k` transpose steps
 /// (forward layers `log_d-1 .. log_d-k`, pairing distances `1 .. 2^(k-1)`) mix
 /// only **within** `2^k`-aligned windows. We process just the windows that
-/// contain a nonzero (a dense `2^k` transpose each), densify, then run the
-/// remaining steps as full dense sweeps. Output is identical to
-/// `transpose_forward_ntt` applied to the scattered input.
+/// contain a nonzero (a dense `2^k` transpose each), then densify.
+///
+/// Only the low `2^retained_log_d` outputs are returned. In each of the final
+/// `log_d - retained_log_d` transpose layers, a retained output uses only the
+/// top butterfly result `a + b`; the twiddle-scaled bottom result cannot feed a
+/// retained index in any later layer. Those dead bottom values are not
+/// materialized. Passing `retained_log_d == log_d` is the full-output oracle.
 fn transpose_forward_ntt_sparse(
     ntt: &AdditiveNttF128,
     positions: &[usize],
     values: &[F128],
     log_d: usize,
+    retained_log_d: usize,
 ) -> Vec<F128> {
     use rayon::prelude::*;
     use std::collections::HashMap;
+    assert!(retained_log_d <= log_d);
     let n = 1usize << log_d;
-    // No prefix for small domains — just scatter + full dense transpose.
-    let k = if log_d >= 12 { 8usize.min(log_d) } else { 0 };
+    // No prefix for small domains — just scatter + full dense transpose. The
+    // prefix and retained-output suffix must be disjoint; cap the prefix by
+    // the number of output-index bits that remain live.
+    let k = if log_d >= 12 {
+        8usize.min(retained_log_d)
+    } else {
+        0
+    };
 
     if k == 0 {
         let mut data = vec![F128::ZERO; n];
         for (&p, &v) in positions.iter().zip(values) {
             data[p] += v;
         }
-        if log_d > 0 {
-            transpose_forward_ntt(ntt, &mut data, log_d);
-        }
+        finish_transpose_retained(ntt, &mut data, log_d, 0, retained_log_d);
+        data.truncate(1usize << retained_log_d);
         return data;
     }
 
@@ -2246,9 +2258,39 @@ fn transpose_forward_ntt_sparse(
         data[(w << k)..((w + 1) << k)].copy_from_slice(&buf);
     }
 
-    // Remaining steps s = k..log_d-1 = forward layers (log_d-1-k) .. 0, dense.
+    // Finish the remaining layers, pruning bottom outputs once only the low
+    // retained region can still reach the caller.
+    finish_transpose_retained(ntt, &mut data, log_d, k, retained_log_d);
+    data.truncate(1usize << retained_log_d);
+    data
+}
+
+/// Finish a reverse-layer transpose after `completed_top_steps` high layers.
+/// Full butterflies run down to the first prunable layer. The final layers
+/// write only the live top segment of each block, whose length stays exactly
+/// `2^retained_log_d` while the number of live blocks halves each round.
+fn finish_transpose_retained(
+    ntt: &AdditiveNttF128,
+    data: &mut [F128],
+    log_d: usize,
+    completed_top_steps: usize,
+    retained_log_d: usize,
+) {
+    use rayon::prelude::*;
+    debug_assert_eq!(data.len(), 1usize << log_d);
+    debug_assert!(retained_log_d <= log_d);
+    let remaining_layer_end = log_d - completed_top_steps;
+    let pruned_layers = log_d - retained_log_d;
+    // The caller caps the sparse prefix so these independently proven regions
+    // cannot overlap.
+    debug_assert!(
+        pruned_layers <= remaining_layer_end,
+        "retained suffix overlaps sparse transpose prefix"
+    );
+
+    // Remaining unpruned steps: full forward-transpose butterflies.
     let n_threads = rayon::current_num_threads().max(1);
-    for layer in (0..(log_d - k)).rev() {
+    for layer in (pruned_layers..remaining_layer_end).rev() {
         let num_blocks = 1usize << layer;
         let block_size = 1usize << (log_d - layer);
         let bsh = block_size >> 1;
@@ -2283,7 +2325,36 @@ fn transpose_forward_ntt_sparse(
             }
         }
     }
-    data
+
+    // Induction invariant before layer `layer`: in every block of size
+    // `2^(log_d-layer)`, only its first `live_len` values can reach the final
+    // low output range. A transpose butterfly's top is exactly `a+b`, so the
+    // bottom `t*(a+b)+b` is dead. After writing those tops, adjacent live
+    // segments become the two inputs to the next lower layer.
+    let live_len = 1usize << retained_log_d;
+    for layer in (0..pruned_layers).rev() {
+        let num_blocks = 1usize << layer;
+        let block_size = 1usize << (log_d - layer);
+        let bsh = block_size >> 1;
+        debug_assert!(live_len <= bsh);
+        if num_blocks >= n_threads {
+            data.par_chunks_mut(block_size).for_each(|chunk| {
+                let (top, bot) = chunk.split_at_mut(bsh);
+                for (a_ref, &b) in top[..live_len].iter_mut().zip(bot[..live_len].iter()) {
+                    *a_ref += b;
+                }
+            });
+        } else {
+            for block in 0..num_blocks {
+                let chunk = &mut data[block * block_size..(block + 1) * block_size];
+                let (top, bot) = chunk.split_at_mut(bsh);
+                top[..live_len]
+                    .par_iter_mut()
+                    .zip(bot[..live_len].par_iter())
+                    .for_each(|(a_ref, &b)| *a_ref += b);
+            }
+        }
+    }
 }
 
 // ===================================================================
@@ -6408,9 +6479,38 @@ mod tests {
                     dense[p] += v;
                 }
                 transpose_forward_ntt(&ntt, &mut dense, log_d);
-                let sparse = transpose_forward_ntt_sparse(&ntt, &positions, &values, log_d);
+                let sparse = transpose_forward_ntt_sparse(&ntt, &positions, &values, log_d, log_d);
                 assert_eq!(sparse, dense, "log_d={log_d}, nq={nq}");
             }
+        }
+    }
+
+    /// The pruned suffix must return exactly the retained prefix of the full
+    /// transpose for the two ranked NTT shapes (rate 1 and rate 2).
+    #[test]
+    fn transpose_sparse_retained_suffix_matches_full_ranked_rates() {
+        use crate::challenger::Challenger;
+        for (shape, &(log_msg, rate, num_queries)) in [(19usize, 1usize, 218usize), (16, 2, 106)]
+            .iter()
+            .enumerate()
+        {
+            let log_d = log_msg + rate;
+            let n = 1usize << log_d;
+            let mut ch = crate::challenger::RandomChallenger::new(0x5A17 ^ shape as u64);
+            let mut positions = Vec::with_capacity(num_queries);
+            let mut values = Vec::with_capacity(num_queries);
+            while positions.len() < num_queries {
+                let p = (ch.sample_f128().lo as usize) % n;
+                if !positions.contains(&p) {
+                    positions.push(p);
+                    values.push(ch.sample_f128());
+                }
+            }
+
+            let ntt = AdditiveNttF128::standard(log_d);
+            let full = transpose_forward_ntt_sparse(&ntt, &positions, &values, log_d, log_d);
+            let retained = transpose_forward_ntt_sparse(&ntt, &positions, &values, log_d, log_msg);
+            assert_eq!(retained, full[..1usize << log_msg], "shape={shape}");
         }
     }
 
