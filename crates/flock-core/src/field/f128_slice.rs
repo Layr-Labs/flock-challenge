@@ -25,22 +25,6 @@ mod aarch64;
 ))]
 mod x86_64;
 
-/// AArch64 deferred-reduction kernel for the ranked opening lookahead scan.
-/// The caller retains the scalar implementation as the portable and exact
-/// same-binary fallback.
-#[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
-#[inline]
-pub(crate) fn round0_and_round1_lookahead(
-    witness: &[F128],
-    basis: &[F128],
-) -> ((F128, F128), [F128; 6]) {
-    assert_eq!(witness.len(), basis.len());
-    assert!(witness.len().is_multiple_of(4));
-    // SAFETY: the cfg gate supplies PMULL through `aes`; the checks above are
-    // the complete slice-shape contract of the architecture kernel.
-    unsafe { aarch64::round0_and_round1_lookahead(witness, basis) }
-}
-
 /// Fold adjacent pairs from `src` into `dst`, starting at pair `base`.
 ///
 /// Computes `dst[t] = src[2j] * (1 + r) + src[2j + 1] * r`, where
