@@ -2646,23 +2646,31 @@ fn fold_and_msg_lsb_into(
         .enumerate()
         .map(|(ci, (fc, bc))| {
             let base = ci * CHUNK;
-            let len = fc.len();
-            let mut u0 = F128::ZERO;
-            let mut u2 = F128::ZERO;
-            // Fold this slice, then pair up the just-folded values for the msg.
-            crate::field::f128_slice::fold_pairs(f, base, fc, r);
-            crate::field::f128_slice::fold_pairs(b, base, bc, r);
-            let mut k = 0;
-            while k + 1 < len {
-                let f0 = fc[k];
-                let f1 = fc[k + 1];
-                let b0 = bc[k];
-                let b1 = bc[k + 1];
-                u0 += f0 * b0;
-                u2 += (f0 + f1) * (b0 + b1);
-                k += 2;
+            #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+            {
+                return crate::field::f128_slice::fold_two_and_msg(f, b, base, fc, bc, r);
             }
-            (u0, u2)
+
+            #[cfg(not(all(target_arch = "aarch64", target_feature = "aes")))]
+            {
+                let len = fc.len();
+                let mut u0 = F128::ZERO;
+                let mut u2 = F128::ZERO;
+                // Fold this slice, then pair up the just-folded values for the msg.
+                crate::field::f128_slice::fold_pairs(f, base, fc, r);
+                crate::field::f128_slice::fold_pairs(b, base, bc, r);
+                let mut k = 0;
+                while k + 1 < len {
+                    let f0 = fc[k];
+                    let f1 = fc[k + 1];
+                    let b0 = bc[k];
+                    let b1 = bc[k + 1];
+                    u0 += f0 * b0;
+                    u2 += (f0 + f1) * (b0 + b1);
+                    k += 2;
+                }
+                (u0, u2)
+            }
         })
         .reduce(
             || (F128::ZERO, F128::ZERO),
