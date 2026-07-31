@@ -2180,15 +2180,31 @@ pub(crate) fn induce_sumcheck_poly_via_ntt(
         table.into_iter().take(n_queries).collect()
     };
 
-    let mut enforced_sum = F128::ZERO;
-    for i in 0..n_queries {
+    // Parallel per-query dot products, mirroring the dense variant's
+    // per-thread accumulation. Every term is independent and F128 addition
+    // is XOR (associative, commutative), so the parallel reduction is
+    // bit-identical to the serial fold regardless of association. This loop
+    // is the NTT variant's only serial stretch — n_queries · row_len
+    // multiplies on one worker while the rest of the pool idles between the
+    // per-level opens and the transpose.
+    const PAR_QUERY_THRESHOLD: usize = 32;
+    let query_term = |i: usize| -> F128 {
         let dot: F128 = opened_rows[i]
             .iter()
             .zip(eq.iter())
             .map(|(&r, &e)| r * e)
             .fold(F128::ZERO, |a, v| a + v);
-        enforced_sum += dot * alpha_pows[i];
-    }
+        dot * alpha_pows[i]
+    };
+    let enforced_sum = if n_queries >= PAR_QUERY_THRESHOLD {
+        use rayon::prelude::*;
+        (0..n_queries)
+            .into_par_iter()
+            .map(query_term)
+            .reduce(|| F128::ZERO, |a, b| a + b)
+    } else {
+        (0..n_queries).map(query_term).fold(F128::ZERO, |a, b| a + b)
+    };
 
     let mut coeffs = if log_block == 0 {
         let mut c = vec![F128::ZERO; block_len];
