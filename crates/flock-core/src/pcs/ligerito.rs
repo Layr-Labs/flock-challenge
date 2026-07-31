@@ -2817,6 +2817,18 @@ fn fold2_and_msgs_lsb(
     //   u2_D likewise over sums-of-adjacent-x, which reduce to the same three
     //   bilinear forms on (wf0+wf2.., wf1+wf3..) groupings handled below.
     const CHUNK: usize = 2048; // outputs per chunk; 8 inputs per output pair
+    // Fold pairs whose w outputs are past LLC size write ping-pong state not
+    // read until the next fold pair's barrier; `stnp` elides the
+    // write-allocate RFO reads there (same driver-decided policy as the
+    // zerocheck tail's NT rounds). 2^21 F128 = 32 MiB per polynomial (both polynomials together exceed LLC).
+    #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+    let nt_stores = {
+        use std::sync::OnceLock;
+        static NT_ENABLED: OnceLock<bool> = OnceLock::new();
+        quarter >= (1usize << 21)
+            && *NT_ENABLED
+                .get_or_init(|| std::env::var_os("FLOCK_LIG_NT_LEGACY").is_none())
+    };
     let acc = wf
         .par_chunks_mut(CHUNK)
         .zip(wb.par_chunks_mut(CHUNK))
@@ -2825,8 +2837,9 @@ fn fold2_and_msgs_lsb(
             let base = ci * CHUNK; // output index base
             #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
             {
-                let (u0, u2, c) =
-                    crate::field::f128_slice::fold2_two_and_msgs(f, b, base, wfc, wbc, r_a, r_b);
+                let (u0, u2, c) = crate::field::f128_slice::fold2_two_and_msgs(
+                    f, b, base, wfc, wbc, r_a, r_b, nt_stores,
+                );
                 return (u0, u2, c);
             }
             #[cfg(not(all(target_arch = "aarch64", target_feature = "aes")))]
@@ -2929,9 +2942,7 @@ fn direct_ab_fuse_init_enabled() -> bool {
 
 /// Materialize the combined sumcheck state only after its first two folds.
 /// `ordinary_basis` contains the incumbent C contribution; `claims` contains
-/// the AB contribution in sufficient-stat form. Both are γ-baked. Deferred-C
-/// mode instead passes `ordinary_basis` EMPTY and C as a second direct claim,
-/// so there is no fold4 over a materialized basis at all.
+/// the AB contribution in sufficient-stat form. Both are γ-baked.
 ///
 /// Ranked shape has exactly one direct claim (AB). The default path therefore
 /// fuses that claim's contribution with the ordinary-basis fold4 into a
@@ -2948,8 +2959,7 @@ fn materialize_direct_ab_fold2(
     use rayon::prelude::*;
 
     assert!(!claims.is_empty());
-    let has_ordinary = !ordinary_basis.is_empty();
-    assert!(!has_ordinary || ordinary_basis.len() == packed_witness.len());
+    assert_eq!(ordinary_basis.len(), packed_witness.len());
     let fold_weight = [
         (F128::ONE + r0) * (F128::ONE + r1),
         r0 * (F128::ONE + r1),
@@ -2986,11 +2996,7 @@ fn materialize_direct_ab_fold2(
             |scratch, (block, (b_out, f_out))| {
                 let start = 4 * block * block_len;
                 let f_in = &packed_witness[start..start + 4 * block_len];
-                let b_in: &[F128] = if has_ordinary {
-                    &ordinary_basis[start..start + 4 * block_len]
-                } else {
-                    &[]
-                };
+                let b_in = &ordinary_basis[start..start + 4 * block_len];
                 let fold4 = |input: &[F128], slot: usize| {
                     let a0 = input[4 * slot];
                     let a1 = input[4 * slot + 1];
@@ -3015,23 +3021,13 @@ fn materialize_direct_ab_fold2(
                         first_table,
                         scratch,
                     );
-                    if has_ordinary {
-                        for slot in 0..block_len {
-                            let direct = super::ring_switch::fold_one_slot(
-                                first_claim.eq_lo[slot],
-                                scratch,
-                            );
-                            f_out[slot] = fold4(f_in, slot);
-                            b_out[slot] = direct + fold4(b_in, slot);
-                        }
-                    } else {
-                        for slot in 0..block_len {
-                            f_out[slot] = fold4(f_in, slot);
-                            b_out[slot] = super::ring_switch::fold_one_slot(
-                                first_claim.eq_lo[slot],
-                                scratch,
-                            );
-                        }
+                    for slot in 0..block_len {
+                        let direct = super::ring_switch::fold_one_slot(
+                            first_claim.eq_lo[slot],
+                            scratch,
+                        );
+                        f_out[slot] = fold4(f_in, slot);
+                        b_out[slot] = direct + fold4(b_in, slot);
                     }
                     for (claim, direct_table) in rest_claims.iter().zip(rest_tables.iter()) {
                         super::ring_switch::compose_fold_byte_table_into(
@@ -3063,15 +3059,9 @@ fn materialize_direct_ab_fold2(
                             );
                         }
                     }
-                    if has_ordinary {
-                        for slot in 0..block_len {
-                            f_out[slot] = fold4(f_in, slot);
-                            b_out[slot] += fold4(b_in, slot);
-                        }
-                    } else {
-                        for slot in 0..block_len {
-                            f_out[slot] = fold4(f_in, slot);
-                        }
+                    for slot in 0..block_len {
+                        f_out[slot] = fold4(f_in, slot);
+                        b_out[slot] += fold4(b_in, slot);
                     }
                 }
                 super::round0_and_round1_lookahead(f_out, b_out)
@@ -3607,11 +3597,7 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
     let initial_k = config.initial_k;
 
     assert_eq!(packed_witness.len(), 1usize << log_n);
-    // Deferred-C: direct mode may carry every claim in `direct_fold2`, in
-    // which case there is no materialized basis at all.
-    assert!(
-        b_initial.len() == 1usize << log_n || (direct_fold2.is_some() && b_initial.is_empty())
-    );
+    assert_eq!(b_initial.len(), 1usize << log_n);
     assert_eq!(config.recursive_ks.len(), r);
     assert_eq!(config.log_inv_rates.len(), r + 1);
     assert!(r >= 1);

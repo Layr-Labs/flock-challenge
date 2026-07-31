@@ -1163,12 +1163,12 @@ pub fn fold_and_compute_round_pair_into(
     // ordinary stores only add write-allocate (RFO) read traffic. Route those
     // rounds through the kernel's `stnp` arm (the same best-effort hint the
     // round-2 producer uses); LLC-resident later rounds keep normal stores so
-    // their outputs stay hot for the next round. 2^22 F128 = 64 MiB per array.
+    // their outputs stay hot for the next round. 2^21 F128 = 32 MiB per array: with both output arrays plus eq tables and inputs in flight the round working set exceeds LLC, so these outputs cannot stay resident either.
     #[cfg(target_arch = "aarch64")]
     let nt_stores = {
         use std::sync::OnceLock;
         static NT_ENABLED: OnceLock<bool> = OnceLock::new();
-        half >= (1usize << 22)
+        half >= (1usize << 21)
             && *NT_ENABLED
                 .get_or_init(|| std::env::var_os("FLOCK_ZC_NT_LEGACY").is_none())
     };
