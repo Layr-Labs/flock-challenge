@@ -51,6 +51,20 @@ pub mod zerocheck;
 /// Returns the number of threads the pool was configured with, or `None`
 /// if no change was made because Rayon was already initialized.
 pub fn init_perf_thread_pool() -> Option<usize> {
+    // Tag the CALLING thread too, not just the pool workers. `start_handler`
+    // below only runs on the 10 rayon workers, but the caller (the worker
+    // process's main thread) executes every sequential stretch of the timed
+    // interval: the private-seed input expansion, every Fiat-Shamir
+    // observe/sample between parallel regions, the Merkle multi-proof gather,
+    // proof serialization, and the proof-file publication. On Apple silicon a
+    // thread left at the inherited (unspecified) QoS is freely eligible for
+    // the efficiency cluster, and the performance cluster's shared DVFS domain
+    // takes QoS into account when picking a frequency point. Both effects fall
+    // entirely on the serial critical path.
+    //
+    // This runs unconditionally, before the `build_global` result is checked,
+    // so it still applies when the pool was already constructed.
+    set_prover_thread_qos();
     let n = std::env::var("RAYON_NUM_THREADS")
         .ok()
         .and_then(|s| s.parse::<usize>().ok())

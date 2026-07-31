@@ -156,9 +156,23 @@ pub struct ChainProofBundleLigerito {
     pub cv_last_phys: Vec<bool>,
 }
 
+/// Initial capacity for proof serialization.
+///
+/// The ranked 2^18-BLAKE3 bundle is ~439 kB. Starting at `HEADER_LEN + 1024`
+/// made bincode grow the buffer by doubling — ~10 reallocations and ~880 kB of
+/// cumulative memcpy, the larger steps being fresh mappings rather than
+/// in-place `realloc`. This path is also the one the untimed warm-up never
+/// exercises (the worker black-boxes `prove_fast`'s result without
+/// serializing), so it is fully cold on the measured proof.
+///
+/// 512 KiB covers the ranked shape in a single allocation. Capacity cannot
+/// affect the emitted bytes, only how many times they are copied; larger
+/// proofs still grow correctly, just from a better starting point.
+const SERIALIZE_CAPACITY: usize = 512 * 1024;
+
 impl R1csProofBundleLigerito {
     pub fn to_bytes(&self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(HEADER_LEN + 1024);
+        let mut out = Vec::with_capacity(SERIALIZE_CAPACITY);
         write_header(&mut out, FLAVOR_R1CS_LIGERITO);
         bincode::serialize_into(&mut out, self).expect("bincode serialize R1csProofBundleLigerito");
         out
@@ -171,7 +185,7 @@ impl R1csProofBundleLigerito {
 
 impl ChainProofBundleLigerito {
     pub fn to_bytes(&self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(HEADER_LEN + 1024);
+        let mut out = Vec::with_capacity(SERIALIZE_CAPACITY);
         write_header(&mut out, FLAVOR_CHAIN_LIGERITO);
         bincode::serialize_into(&mut out, self)
             .expect("bincode serialize ChainProofBundleLigerito");

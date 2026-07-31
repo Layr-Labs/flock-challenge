@@ -476,7 +476,7 @@ pub fn uni_skip_fold_and_round_pair_optimized_packed_padded(
     let mut a_folded: Vec<F128> = crate::scratch::take_f128(n_out);
     let mut b_folded: Vec<F128> = crate::scratch::take_f128(n_out);
 
-    let eq = SplitEqGhash::new(&mlv_challenges[1..]);
+    let eq = SplitEqGhash::for_tail(&mlv_challenges[1..]);
     let lo_size = 1usize << eq.n_lo;
     let hi_size = 1usize << eq.n_hi;
     assert_eq!(lo_size * hi_size * 2, n_out);
@@ -797,7 +797,7 @@ pub fn fold_and_compute_round_pair_into(
     let log_n = n.trailing_zeros() as usize;
     assert_eq!(r_next.len(), log_n - 1);
 
-    let eq = SplitEqGhash::new(&r_next[1..]);
+    let eq = SplitEqGhash::for_tail(&r_next[1..]);
     let lo_size = 1usize << eq.n_lo;
     let hi_size = 1usize << eq.n_hi;
     assert!(lo_size >= 2, "fold_and_compute requires lo_size ≥ 2");
@@ -809,138 +809,65 @@ pub fn fold_and_compute_round_pair_into(
     let eq_lo = &eq.lo;
     let eq_hi = &eq.hi;
 
-    let (sum1, sum_inf) = a_out
-        .par_chunks_mut(chunk_out)
-        .zip(b_out.par_chunks_mut(chunk_out))
-        .enumerate()
-        .map(|(x_hi, (a_out, b_out))| {
-            let a_in = &a[x_hi * chunk_in..(x_hi + 1) * chunk_in];
-            let b_in = &b[x_hi * chunk_in..(x_hi + 1) * chunk_in];
+    // One worker chunk: fold `4·lo_size` inputs into `2·lo_size` outputs and
+    // return this chunk's eq_hi-weighted message contribution.
+    let chunk_body = |x_hi: usize, a_out: &mut [F128], b_out: &mut [F128]| -> (F128, F128) {
+        let a_in = &a[x_hi * chunk_in..(x_hi + 1) * chunk_in];
+        let b_in = &b[x_hi * chunk_in..(x_hi + 1) * chunk_in];
 
+        #[cfg(all(
+            target_arch = "x86_64",
+            target_feature = "avx512f",
+            target_feature = "vpclmulqdq"
+        ))]
+        // SAFETY: chunk geometry supplies two inputs per output and two
+        // outputs per eq_lo value; features are guaranteed by the cfg.
+        let (p1, pinf) =
+            unsafe { fold_and_message_x86_avx512(a_in, b_in, a_out, b_out, r_fold, eq_lo) };
+
+        #[cfg(target_arch = "aarch64")]
+        let (p1, pinf) = fold_and_message_aarch64(a_in, b_in, a_out, b_out, r_fold, eq_lo);
+
+        #[cfg(not(any(
+            target_arch = "aarch64",
+            all(
+                target_arch = "x86_64",
+                target_feature = "avx512f",
+                target_feature = "vpclmulqdq"
+            )
+        )))]
+        let (p1, pinf) = {
+            // Fold a_in→a_out and b_in→b_out at r_fold. The field layer
+            // selects the architecture kernel; this loop only consumes
+            // the resulting values to build the message.
+            crate::field::f128_slice::fold_pairs(a_in, 0, a_out, r_fold);
+            crate::field::f128_slice::fold_pairs(b_in, 0, b_out, r_fold);
+
+            let mut p1_acc = F256Unreduced::ZERO;
+            let mut pinf_acc = F256Unreduced::ZERO;
+            // x86: 4-wide deferred-reduction accumulators for the unrolled loop;
+            // the 2-wide tail still uses the scalar `*_acc` above, folded in
+            // before the final reduce.
             #[cfg(all(
                 target_arch = "x86_64",
                 target_feature = "avx512f",
                 target_feature = "vpclmulqdq"
             ))]
-            // SAFETY: chunk geometry supplies two inputs per output and two
-            // outputs per eq_lo value; features are guaranteed by the cfg.
-            let (p1, pinf) =
-                unsafe { fold_and_message_x86_avx512(a_in, b_in, a_out, b_out, r_fold, eq_lo) };
+            // SAFETY: vpclmulqdq+avx512f guaranteed by the cfg gate.
+            let (mut p1_wide, mut pinf_wide) =
+                unsafe { (WideGhashX4::zero(), WideGhashX4::zero()) };
 
-            #[cfg(target_arch = "aarch64")]
-            let (p1, pinf) = fold_and_message_aarch64(a_in, b_in, a_out, b_out, r_fold, eq_lo);
-
-            #[cfg(not(any(
-                target_arch = "aarch64",
-                all(
-                    target_arch = "x86_64",
-                    target_feature = "avx512f",
-                    target_feature = "vpclmulqdq"
-                )
-            )))]
-            let (p1, pinf) = {
-                // Fold a_in→a_out and b_in→b_out at r_fold. The field layer
-                // selects the architecture kernel; this loop only consumes
-                // the resulting values to build the message.
-                crate::field::f128_slice::fold_pairs(a_in, 0, a_out, r_fold);
-                crate::field::f128_slice::fold_pairs(b_in, 0, b_out, r_fold);
-
-                let mut p1_acc = F256Unreduced::ZERO;
-                let mut pinf_acc = F256Unreduced::ZERO;
-                // x86: 4-wide deferred-reduction accumulators for the unrolled loop;
-                // the 2-wide tail still uses the scalar `*_acc` above, folded in
-                // before the final reduce.
-                #[cfg(all(
-                    target_arch = "x86_64",
-                    target_feature = "avx512f",
-                    target_feature = "vpclmulqdq"
-                ))]
-                // SAFETY: vpclmulqdq+avx512f guaranteed by the cfg gate.
-                let (mut p1_wide, mut pinf_wide) =
-                    unsafe { (WideGhashX4::zero(), WideGhashX4::zero()) };
-
-                // Unroll 4 x_lo's per iteration when lo_size % 4 == 0 (the common
-                // case for the fused path; falls back to 2-wide for lo_size==2 at
-                // the smallest fused round). 16 independent r_fold muls and 8
-                // independent msg muls in flight gives the M4 OoO engine and
-                // 2/cy PMULL throughput maximum ILP.
-                assert!(lo_size & 1 == 0, "lo_size must be even");
-                let mut x_lo = 0;
-                if lo_size.is_multiple_of(4) {
-                    while x_lo + 4 <= lo_size {
-                        let x_lo_a = x_lo;
-                        // Read the just-folded pairs: (a0,a1) = (a_out[2·x_lo], a_out[2·x_lo+1]).
-                        let o = 2 * x_lo;
-                        let a0_a = a_out[o];
-                        let a1_a = a_out[o + 1];
-                        let b0_a = b_out[o];
-                        let b1_a = b_out[o + 1];
-                        let a0_b = a_out[o + 2];
-                        let a1_b = a_out[o + 3];
-                        let b0_b = b_out[o + 2];
-                        let b1_b = b_out[o + 3];
-                        let a0_c = a_out[o + 4];
-                        let a1_c = a_out[o + 5];
-                        let b0_c = b_out[o + 4];
-                        let b1_c = b_out[o + 5];
-                        let a0_d = a_out[o + 6];
-                        let a1_d = a_out[o + 7];
-                        let b0_d = b_out[o + 6];
-                        let b1_d = b_out[o + 7];
-
-                        // 8 reduced msg muls (g1 = a1·b1, g_inf = (a0+a1)(b0+b1)).
-                        let g1_a = a1_a * b1_a;
-                        let g1_b = a1_b * b1_b;
-                        let g1_c = a1_c * b1_c;
-                        let g1_d = a1_d * b1_d;
-                        let g_inf_a = (a0_a + a1_a) * (b0_a + b1_a);
-                        let g_inf_b = (a0_b + a1_b) * (b0_b + b1_b);
-                        let g_inf_c = (a0_c + a1_c) * (b0_c + b1_c);
-                        let g_inf_d = (a0_d + a1_d) * (b0_d + b1_d);
-                        // Deferred-reduction accumulate: on x86 widen all 8 products
-                        // 4 lanes at a time (eq_lo[x_lo_a..x_lo_a+4] is contiguous),
-                        // reduced once after the loop; else scalar mul_unreduced.
-                        #[cfg(all(
-                            target_arch = "x86_64",
-                            target_feature = "avx512f",
-                            target_feature = "vpclmulqdq"
-                        ))]
-                        // SAFETY: vpclmulqdq+avx512f guaranteed by the cfg gate; the
-                        // four eq values eq_lo[x_lo_a..x_lo_a+4] are in bounds (the
-                        // 4-wide loop runs only while x_lo + 4 <= lo_size == eq_lo.len()).
-                        unsafe {
-                            let eq4 = f128x4_loadu(eq_lo[x_lo_a..].as_ptr());
-                            p1_wide.mul_acc(eq4, f128x4_set(g1_a, g1_b, g1_c, g1_d));
-                            pinf_wide.mul_acc(eq4, f128x4_set(g_inf_a, g_inf_b, g_inf_c, g_inf_d));
-                        }
-                        #[cfg(not(all(
-                            target_arch = "x86_64",
-                            target_feature = "avx512f",
-                            target_feature = "vpclmulqdq"
-                        )))]
-                        {
-                            let eq_l_a = eq_lo[x_lo_a];
-                            let eq_l_b = eq_lo[x_lo_a + 1];
-                            let eq_l_c = eq_lo[x_lo_a + 2];
-                            let eq_l_d = eq_lo[x_lo_a + 3];
-                            p1_acc ^= eq_l_a.mul_unreduced(g1_a);
-                            p1_acc ^= eq_l_b.mul_unreduced(g1_b);
-                            p1_acc ^= eq_l_c.mul_unreduced(g1_c);
-                            p1_acc ^= eq_l_d.mul_unreduced(g1_d);
-                            pinf_acc ^= eq_l_a.mul_unreduced(g_inf_a);
-                            pinf_acc ^= eq_l_b.mul_unreduced(g_inf_b);
-                            pinf_acc ^= eq_l_c.mul_unreduced(g_inf_c);
-                            pinf_acc ^= eq_l_d.mul_unreduced(g_inf_d);
-                        }
-
-                        x_lo += 4;
-                    }
-                }
-                // 2-wide tail (handles lo_size == 2 case and any remainder when
-                // 4-wide loop is skipped or doesn't cover everything).
-                while x_lo + 2 <= lo_size {
+            // Unroll 4 x_lo's per iteration when lo_size % 4 == 0 (the common
+            // case for the fused path; falls back to 2-wide for lo_size==2 at
+            // the smallest fused round). 16 independent r_fold muls and 8
+            // independent msg muls in flight gives the M4 OoO engine and
+            // 2/cy PMULL throughput maximum ILP.
+            assert!(lo_size & 1 == 0, "lo_size must be even");
+            let mut x_lo = 0;
+            if lo_size.is_multiple_of(4) {
+                while x_lo + 4 <= lo_size {
                     let x_lo_a = x_lo;
-                    let x_lo_b = x_lo + 1;
+                    // Read the just-folded pairs: (a0,a1) = (a_out[2·x_lo], a_out[2·x_lo+1]).
                     let o = 2 * x_lo;
                     let a0_a = a_out[o];
                     let a1_a = a_out[o + 1];
@@ -950,45 +877,144 @@ pub fn fold_and_compute_round_pair_into(
                     let a1_b = a_out[o + 3];
                     let b0_b = b_out[o + 2];
                     let b1_b = b_out[o + 3];
+                    let a0_c = a_out[o + 4];
+                    let a1_c = a_out[o + 5];
+                    let b0_c = b_out[o + 4];
+                    let b1_c = b_out[o + 5];
+                    let a0_d = a_out[o + 6];
+                    let a1_d = a_out[o + 7];
+                    let b0_d = b_out[o + 6];
+                    let b1_d = b_out[o + 7];
 
-                    let eq_l_a = eq_lo[x_lo_a];
-                    let eq_l_b = eq_lo[x_lo_b];
+                    // 8 reduced msg muls (g1 = a1·b1, g_inf = (a0+a1)(b0+b1)).
                     let g1_a = a1_a * b1_a;
                     let g1_b = a1_b * b1_b;
+                    let g1_c = a1_c * b1_c;
+                    let g1_d = a1_d * b1_d;
                     let g_inf_a = (a0_a + a1_a) * (b0_a + b1_a);
                     let g_inf_b = (a0_b + a1_b) * (b0_b + b1_b);
-                    p1_acc ^= eq_l_a.mul_unreduced(g1_a);
-                    p1_acc ^= eq_l_b.mul_unreduced(g1_b);
-                    pinf_acc ^= eq_l_a.mul_unreduced(g_inf_a);
-                    pinf_acc ^= eq_l_b.mul_unreduced(g_inf_b);
+                    let g_inf_c = (a0_c + a1_c) * (b0_c + b1_c);
+                    let g_inf_d = (a0_d + a1_d) * (b0_d + b1_d);
+                    // Deferred-reduction accumulate: on x86 widen all 8 products
+                    // 4 lanes at a time (eq_lo[x_lo_a..x_lo_a+4] is contiguous),
+                    // reduced once after the loop; else scalar mul_unreduced.
+                    #[cfg(all(
+                        target_arch = "x86_64",
+                        target_feature = "avx512f",
+                        target_feature = "vpclmulqdq"
+                    ))]
+                    // SAFETY: vpclmulqdq+avx512f guaranteed by the cfg gate; the
+                    // four eq values eq_lo[x_lo_a..x_lo_a+4] are in bounds (the
+                    // 4-wide loop runs only while x_lo + 4 <= lo_size == eq_lo.len()).
+                    unsafe {
+                        let eq4 = f128x4_loadu(eq_lo[x_lo_a..].as_ptr());
+                        p1_wide.mul_acc(eq4, f128x4_set(g1_a, g1_b, g1_c, g1_d));
+                        pinf_wide.mul_acc(eq4, f128x4_set(g_inf_a, g_inf_b, g_inf_c, g_inf_d));
+                    }
+                    #[cfg(not(all(
+                        target_arch = "x86_64",
+                        target_feature = "avx512f",
+                        target_feature = "vpclmulqdq"
+                    )))]
+                    {
+                        let eq_l_a = eq_lo[x_lo_a];
+                        let eq_l_b = eq_lo[x_lo_a + 1];
+                        let eq_l_c = eq_lo[x_lo_a + 2];
+                        let eq_l_d = eq_lo[x_lo_a + 3];
+                        p1_acc ^= eq_l_a.mul_unreduced(g1_a);
+                        p1_acc ^= eq_l_b.mul_unreduced(g1_b);
+                        p1_acc ^= eq_l_c.mul_unreduced(g1_c);
+                        p1_acc ^= eq_l_d.mul_unreduced(g1_d);
+                        pinf_acc ^= eq_l_a.mul_unreduced(g_inf_a);
+                        pinf_acc ^= eq_l_b.mul_unreduced(g_inf_b);
+                        pinf_acc ^= eq_l_c.mul_unreduced(g_inf_c);
+                        pinf_acc ^= eq_l_d.mul_unreduced(g_inf_d);
+                    }
 
-                    x_lo += 2;
+                    x_lo += 4;
                 }
+            }
+            // 2-wide tail (handles lo_size == 2 case and any remainder when
+            // 4-wide loop is skipped or doesn't cover everything).
+            while x_lo + 2 <= lo_size {
+                let x_lo_a = x_lo;
+                let x_lo_b = x_lo + 1;
+                let o = 2 * x_lo;
+                let a0_a = a_out[o];
+                let a1_a = a_out[o + 1];
+                let b0_a = b_out[o];
+                let b1_a = b_out[o + 1];
+                let a0_b = a_out[o + 2];
+                let a1_b = a_out[o + 3];
+                let b0_b = b_out[o + 2];
+                let b1_b = b_out[o + 3];
 
-                // Merge the 4-wide deferred accumulators with the scalar tail, then
-                // reduce once (reduction is F2-linear, so this equals the scalar
-                // Σ mul_unreduced then reduce).
-                #[cfg(all(
-                    target_arch = "x86_64",
-                    target_feature = "avx512f",
-                    target_feature = "vpclmulqdq"
-                ))]
-                // SAFETY: vpclmulqdq+avx512f+sse4.1 guaranteed by the cfg gate.
-                unsafe {
-                    p1_acc ^= p1_wide.fold();
-                    pinf_acc ^= pinf_wide.fold();
-                }
-                let p1 = p1_acc.reduce();
-                let pinf = pinf_acc.reduce();
-                (p1, pinf)
-            };
-            let eq_h = eq_hi[x_hi];
-            (eq_h * p1, eq_h * pinf)
-        })
-        .reduce(
-            || (F128::ZERO, F128::ZERO),
-            |(s1, sinf), (c1, cinf)| (s1 + c1, sinf + cinf),
-        );
+                let eq_l_a = eq_lo[x_lo_a];
+                let eq_l_b = eq_lo[x_lo_b];
+                let g1_a = a1_a * b1_a;
+                let g1_b = a1_b * b1_b;
+                let g_inf_a = (a0_a + a1_a) * (b0_a + b1_a);
+                let g_inf_b = (a0_b + a1_b) * (b0_b + b1_b);
+                p1_acc ^= eq_l_a.mul_unreduced(g1_a);
+                p1_acc ^= eq_l_b.mul_unreduced(g1_b);
+                pinf_acc ^= eq_l_a.mul_unreduced(g_inf_a);
+                pinf_acc ^= eq_l_b.mul_unreduced(g_inf_b);
+
+                x_lo += 2;
+            }
+
+            // Merge the 4-wide deferred accumulators with the scalar tail, then
+            // reduce once (reduction is F2-linear, so this equals the scalar
+            // Σ mul_unreduced then reduce).
+            #[cfg(all(
+                target_arch = "x86_64",
+                target_feature = "avx512f",
+                target_feature = "vpclmulqdq"
+            ))]
+            // SAFETY: vpclmulqdq+avx512f+sse4.1 guaranteed by the cfg gate.
+            unsafe {
+                p1_acc ^= p1_wide.fold();
+                pinf_acc ^= pinf_wide.fold();
+            }
+            let p1 = p1_acc.reduce();
+            let pinf = pinf_acc.reduce();
+            (p1, pinf)
+        };
+        let eq_h = eq_hi[x_hi];
+        (eq_h * p1, eq_h * pinf)
+    };
+
+    // Work floor. `hi_size` is a fixed 2^TAIL_N_HI regardless of size, so at
+    // the small end of the fused tail this would otherwise open a several-
+    // hundred-chunk rayon region over 32-byte chunks for well under a
+    // microsecond of real work — pure fork/join overhead. XOR is associative
+    // and commutative, so the serial left-to-right combine is bit-identical to
+    // rayon's tree reduce.
+    const SERIAL_FLOOR: usize = 4096;
+    let (sum1, sum_inf) = if half < SERIAL_FLOOR {
+        let mut s1 = F128::ZERO;
+        let mut sinf = F128::ZERO;
+        for (x_hi, (a_chunk, b_chunk)) in a_out
+            .chunks_mut(chunk_out)
+            .zip(b_out.chunks_mut(chunk_out))
+            .enumerate()
+        {
+            let (c1, cinf) = chunk_body(x_hi, a_chunk, b_chunk);
+            s1 += c1;
+            sinf += cinf;
+        }
+        (s1, sinf)
+    } else {
+        a_out
+            .par_chunks_mut(chunk_out)
+            .zip(b_out.par_chunks_mut(chunk_out))
+            .enumerate()
+            .map(|(x_hi, (a_chunk, b_chunk))| chunk_body(x_hi, a_chunk, b_chunk))
+            .reduce(
+                || (F128::ZERO, F128::ZERO),
+                |(s1, sinf), (c1, cinf)| (s1 + c1, sinf + cinf),
+            )
+    };
 
     (r_next[0] * sum1, sum_inf)
 }

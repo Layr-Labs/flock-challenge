@@ -683,6 +683,38 @@ pub fn partial_fold_packed_z_fast_padded(
 /// constant, so the pairing is correct by construction.
 pub(crate) const NEON_TILE_T: usize = 8;
 
+// MEASURED DEAD END — do not "optimize" this to 16 or 32 again.
+//
+// The tempting argument: `process_block_neon_single` spends `2 · BLOCK_K = 16`
+// accumulator load/stores per `BLOCK_K · TILE_T = 64` table gathers, i.e.
+// `2 / TILE_T` = 0.25 memory ops per useful gather (20 % of all load/store
+// slots). Doubling TILE_T halves that to 0.125 and should cut total memory ops
+// per gather from 1.25 to 1.125 (~10 %) over ~537 M gathers. The dispatch is
+// nearly free — `oblock_padded_tiled` is already const-generic over `TILE_T`
+// and `n_stripes = 2^15` at m=32, k_log=14 is divisible by 8, 16 and 32.
+//
+// It loses badly. In-process interleaved A/B at the ranked shape
+// (`oblock_tile_t_ab`, min of 12, m=32 k_log=14):
+//
+//     threads=16   TILE_T=8 10.17 ms   16: +18.4 %   32: +58.3 %
+//     threads=10   TILE_T=8  9.91 ms   16: +38.1 %   32: +102.0 %
+//     threads=10   TILE_T=8  9.68 ms   16: +17.1 %   32: +60.8 %
+//
+// Why the model is wrong: the accumulator LD/ST is not the scarce resource.
+// The 8 accumulator loads and 8 stores bracket a whole `TILE_T`-deep sweep,
+// hit L1 (often store-to-load forwarded) and are close to free. The cost is
+// the random-index table gather, and its cost is set by whether the tables
+// stay hot. The per-worker sum tables are `TILE_T · 256 · 16 B` — 32 KiB at
+// 8, 64 KiB at 16, 128 KiB at 32 — and they compete for L1 with the streaming
+// `z_packed` reads and the private length-k partial (256 KiB at k_log=14,
+// already spilling to L2). Doubling the table footprint raises the gather's
+// L1 miss rate by far more than the ~10 % of load/store slots it recovers.
+// Trading a cheap, predictable, forwardable access for a more expensive
+// random one is a bad trade even when the op *count* goes down.
+//
+// The equivalence test `partial_fold_oblock_all_tile_factors_match_serial`
+// still covers TILE_T ∈ {8, 16, 32} so the const-generic stays honest.
+
 /// Dispatch helper: pick the fastest single-matrix partial fold available
 /// for the given (m, k_log). Threads `useful_bits` through so the kernel
 /// can skip blocks past the useful region of each block (byte-identical to
@@ -1887,6 +1919,125 @@ mod tests {
             let got =
                 partial_fold_packed_z_neon_oblock_padded(&z_packed, m, k_log, useful_bits, &eq);
             assert_eq!(want, got, "m={m} k_log={k_log} useful={useful_bits}");
+        }
+    }
+
+    /// EVERY `TILE_T` we instantiate must equal the scalar reference
+    /// `partial_fold_packed_z`. GF(2^128) add is XOR, so the tiling factor
+    /// only reorders an associative/commutative reduction — any mismatch is a
+    /// genuine indexing bug, not a rounding artifact. Covers dense and padded
+    /// shapes, and shapes where the wide tile does NOT divide `n_stripes` (so
+    /// the fallback in `partial_fold_packed_z_neon_oblock_padded` is exercised).
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn partial_fold_oblock_all_tile_factors_match_serial() {
+        use crate::lincheck::kernels::oblock_padded_tiled;
+        // (m, k_log, useful_bits). n_stripes = 2^(m-k_log-3).
+        let cases: &[(usize, usize, usize)] = &[
+            (14, 4, 1 << 4),   // n_stripes = 128: 8/16/32 all divide
+            (16, 8, 1 << 8),   // n_stripes = 32
+            (18, 10, 1 << 10), // n_stripes = 32
+            (20, 10, 597),     // n_stripes = 128, padded non-byte-aligned
+            (22, 14, 15_409),  // n_stripes = 32, padded non-byte-aligned
+            (14, 8, 1 << 8),   // n_stripes = 8: only TILE_T=8 is legal
+            (15, 8, 1 << 8),   // n_stripes = 16: 8 and 16 legal, 32 is not
+        ];
+        for &(m, k_log, useful_bits) in cases {
+            let k = 1usize << k_log;
+            let n_log = m - k_log;
+            let n_blocks = 1usize << n_log;
+            let mut rng = Rng::new(7300 + (m * 31 + k_log) as u64);
+            let mut z = rng.bits(1 << m);
+            for blk in 0..n_blocks {
+                for j in useful_bits..k {
+                    z[blk * k + j] = false;
+                }
+            }
+            let z_packed = pack_z_lincheck(&z, m, k_log);
+            let eq = build_eq_table(&rng.f128_vec(n_log));
+            let want = partial_fold_packed_z_fast_padded(&z_packed, m, k_log, useful_bits, &eq);
+
+            if n_log_ok_for_tile(m, k_log, 8) {
+                let got = oblock_padded_tiled::<8>(&z_packed, m, k_log, useful_bits, &eq);
+                assert_eq!(want, got, "TILE_T=8 m={m} k_log={k_log}");
+            }
+            if n_log_ok_for_tile(m, k_log, 16) {
+                let got = oblock_padded_tiled::<16>(&z_packed, m, k_log, useful_bits, &eq);
+                assert_eq!(want, got, "TILE_T=16 m={m} k_log={k_log}");
+            }
+            if n_log_ok_for_tile(m, k_log, 32) {
+                let got = oblock_padded_tiled::<32>(&z_packed, m, k_log, useful_bits, &eq);
+                assert_eq!(want, got, "TILE_T=32 m={m} k_log={k_log}");
+            }
+            // And the production dispatcher, whichever branch it picks.
+            if n_log_ok_for_tile(m, k_log, NEON_TILE_T) {
+                let got = partial_fold_packed_z_neon_oblock_padded(
+                    &z_packed,
+                    m,
+                    k_log,
+                    useful_bits,
+                    &eq,
+                );
+                assert_eq!(want, got, "dispatch m={m} k_log={k_log}");
+            }
+        }
+    }
+
+    /// In-process interleaved A/B of the oblock tiling factor at the ranked
+    /// shape (m=32, k_log=14). All variants run in one process against the
+    /// same inputs, round-robin, and we compare **minima** — the only way to
+    /// get a usable signal on a ~13 ms phase while other jobs share the box.
+    ///
+    /// `cargo test --release -p flock-core tile_t_ab -- --ignored --nocapture`
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    #[ignore]
+    fn oblock_tile_t_ab() {
+        use crate::lincheck::kernels::oblock_padded_tiled;
+        use std::time::Instant;
+        let (m, k_log, useful_bits) = (32usize, 14usize, 15_409usize);
+        let k = 1usize << k_log;
+        let n_log = m - k_log;
+        let mut rng = Rng::new(0xB0B0);
+        let mut z = rng.bits(1 << m);
+        for blk in 0..(1usize << n_log) {
+            for j in useful_bits..k {
+                z[blk * k + j] = false;
+            }
+        }
+        let z_packed = pack_z_lincheck(&z, m, k_log);
+        let eq = build_eq_table(&rng.f128_vec(n_log));
+
+        let mut best = [f64::MAX; 3];
+        let mut reference: Option<Vec<F128>> = None;
+        for _ in 0..12 {
+            for (slot, tile) in [0usize, 1, 2].iter().zip([8usize, 16, 32]) {
+                let t = Instant::now();
+                let got = match tile {
+                    8 => oblock_padded_tiled::<8>(&z_packed, m, k_log, useful_bits, &eq),
+                    16 => oblock_padded_tiled::<16>(&z_packed, m, k_log, useful_bits, &eq),
+                    _ => oblock_padded_tiled::<32>(&z_packed, m, k_log, useful_bits, &eq),
+                };
+                let el = t.elapsed().as_secs_f64() * 1e3;
+                match &reference {
+                    None => reference = Some(got),
+                    Some(r) => assert_eq!(r, &got, "TILE_T={tile} diverged"),
+                }
+                if el < best[*slot] {
+                    best[*slot] = el;
+                }
+            }
+        }
+        println!(
+            "oblock TILE_T min-of-12 (m={m}, k_log={k_log}, threads={}):",
+            rayon::current_num_threads()
+        );
+        for (i, tile) in [8usize, 16, 32].iter().enumerate() {
+            println!(
+                "  TILE_T={tile:<3} {:>8.3} ms   ({:+.1}% vs 8)",
+                best[i],
+                100.0 * (best[i] - best[0]) / best[0]
+            );
         }
     }
 

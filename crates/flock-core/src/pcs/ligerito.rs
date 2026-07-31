@@ -1980,9 +1980,14 @@ pub(crate) fn induce_sumcheck_poly(
             if start >= end {
                 return (vec![F128::ZERO; n], F128::ZERO);
             }
-            let mut accum_basis = vec![F128::ZERO; n];
+            // Both buffers are fully written before they are read:
+            // `accum_basis` by the first query's `evaluate_scaled_basis_inplace`
+            // (which writes basis[0] then doubles out to fill all 2^log_msg_cols
+            // slots), `local_basis` by every later one. So neither needs the
+            // `vec![F128::ZERO; n]` calloc they used to pay.
+            let mut accum_basis = crate::alloc_uninit_f128_vec(n);
             // Per-thread scratch reused across this chunk's queries.
-            let mut local_basis = vec![F128::ZERO; n];
+            let mut local_basis = crate::alloc_uninit_f128_vec(n);
             let mut sks_at_x = vec![F128::ZERO; log_msg_cols.max(1)];
             let mut local_sum = F128::ZERO;
 
@@ -1999,30 +2004,64 @@ pub(crate) fn induce_sumcheck_poly(
                 local_sum += dot * ap;
 
                 let q_field = F128::new(q as u64, 0);
-                evaluate_scaled_basis_inplace(
-                    &mut sks_at_x,
-                    &mut local_basis,
-                    sks_vks,
-                    &inv_sks_vks,
-                    q_field,
-                    ap,
-                );
-                for (acc, &v) in accum_basis.iter_mut().zip(local_basis.iter()) {
-                    *acc += v;
+                if i == start {
+                    // Seed the accumulator with the first query's basis
+                    // directly. `0 + x == x` in GF(2^128), so this is
+                    // bit-identical to zero-initializing and accumulating —
+                    // and it removes one full read-modify-write pass over `n`
+                    // on top of the calloc.
+                    evaluate_scaled_basis_inplace(
+                        &mut sks_at_x,
+                        &mut accum_basis,
+                        sks_vks,
+                        &inv_sks_vks,
+                        q_field,
+                        ap,
+                    );
+                } else {
+                    evaluate_scaled_basis_inplace(
+                        &mut sks_at_x,
+                        &mut local_basis,
+                        sks_vks,
+                        &inv_sks_vks,
+                        q_field,
+                        ap,
+                    );
+                    for (acc, &v) in accum_basis.iter_mut().zip(local_basis.iter()) {
+                        *acc += v;
+                    }
                 }
             }
             (accum_basis, local_sum)
         })
         .collect();
 
-    // Reduce across threads.
-    let mut basis_poly = vec![F128::ZERO; n];
+    // Reduce across threads in ONE parallel pass over output bands: each
+    // worker owns a band of `basis_poly`, copies partial 0's slice into it and
+    // XORs the remaining partials on top, so the band is written exactly once.
+    //
+    // The previous code did this reduction **on the calling thread**, walking
+    // `n_threads × n` F128 serially while nine cores sat idle. Band order
+    // matches the old partial-major order (partial 0, then 1, …) and GF(2^128)
+    // add is XOR, so the result is bit-identical.
+    let mut basis_poly = crate::alloc_uninit_f128_vec(n);
+    let band = n.div_ceil(n_threads).max(1024);
+    basis_poly
+        .par_chunks_mut(band)
+        .enumerate()
+        .for_each(|(bi, dst)| {
+            let lo = bi * band;
+            let hi = lo + dst.len();
+            dst.copy_from_slice(&partials[0].0[lo..hi]);
+            for (p, _) in &partials[1..] {
+                for (o, s) in dst.iter_mut().zip(p[lo..hi].iter()) {
+                    *o += *s;
+                }
+            }
+        });
     let mut enforced_sum = F128::ZERO;
-    for (lb, ls) in partials {
-        for (acc, &v) in basis_poly.iter_mut().zip(lb.iter()) {
-            *acc += v;
-        }
-        enforced_sum += ls;
+    for (_, ls) in &partials {
+        enforced_sum += *ls;
     }
 
     (basis_poly, enforced_sum)
@@ -2316,6 +2355,8 @@ impl Drop for SumcheckProver {
     fn drop(&mut self) {
         crate::scratch::give_f128(std::mem::take(&mut self.f));
         crate::scratch::give_f128(std::mem::take(&mut self.combined_basis));
+        crate::scratch::give_f128(std::mem::take(&mut self.scratch_f));
+        crate::scratch::give_f128(std::mem::take(&mut self.scratch_b));
     }
 }
 
@@ -2583,23 +2624,37 @@ fn partial_eval_lsb_one(evals: &mut Vec<F128>, r: F128) {
 /// still in registers. One fork-join instead of three, and ~⅓ less memory
 /// traffic (the folded arrays are not re-read to build the message).
 ///
-/// Returns `(folded_f, folded_b, next_msg)` where `next_msg = round_msg_lsb
-/// (folded_f, folded_b)`. Bit-identical to the unfused sequence.
-fn fold_and_msg_lsb(f: &[F128], b: &[F128], r: F128) -> (Vec<F128>, Vec<F128>, SumcheckMessage) {
+/// Writes the folded `f`/`b` into the caller-provided `nf`/`nb` (each exactly
+/// `f.len()/2` long) and returns `next_msg = round_msg_lsb(nf, nb)`.
+/// Bit-identical to the unfused sequence.
+///
+/// The output buffers are caller-owned so the sumcheck ladder can ping-pong
+/// two persistent scratch buffers instead of allocating a fresh pair per
+/// round — see [`SumcheckProver`]. `nf`/`nb` are fully written before they are
+/// read (the per-chunk `fold_pairs` writes the whole chunk, then the message
+/// loop reads only that chunk), so stale contents from a previous round are
+/// never observed.
+fn fold_and_msg_into(
+    f: &[F128],
+    b: &[F128],
+    r: F128,
+    nf: &mut [F128],
+    nb: &mut [F128],
+) -> SumcheckMessage {
     use rayon::prelude::*;
     let n = f.len();
     debug_assert!(n.is_power_of_two() && n >= 2);
     debug_assert_eq!(b.len(), n);
     let half = n / 2;
+    debug_assert_eq!(nf.len(), half);
+    debug_assert_eq!(nb.len(), half);
     let one_plus_r = F128::ONE + r;
 
     const PAR_THRESHOLD: usize = 4096;
     if half < PAR_THRESHOLD {
-        let mut nf = Vec::with_capacity(half);
-        let mut nb = Vec::with_capacity(half);
         for j in 0..half {
-            nf.push(f[2 * j] * one_plus_r + f[2 * j + 1] * r);
-            nb.push(b[2 * j] * one_plus_r + b[2 * j + 1] * r);
+            nf[j] = f[2 * j] * one_plus_r + f[2 * j + 1] * r;
+            nb[j] = b[2 * j] * one_plus_r + b[2 * j + 1] * r;
         }
         let mut u_0 = F128::ZERO;
         let mut u_2 = F128::ZERO;
@@ -2613,28 +2668,13 @@ fn fold_and_msg_lsb(f: &[F128], b: &[F128], r: F128) -> (Vec<F128>, Vec<F128>, S
             u_2 += (f0 + f1) * (b0 + b1);
             k += 2;
         }
-        return (nf, nb, SumcheckMessage { u_0, u_2 });
+        return SumcheckMessage { u_0, u_2 };
     }
 
     // Parallel path: `half` is a power of two ≥ PAR_THRESHOLD and CHUNK is a
     // power of two, so every chunk has even length and starts at an even
     // global index — message pairs (2k, 2k+1) never straddle a chunk boundary.
     const CHUNK: usize = 2048;
-    // On x86_64, pull the fold outputs from the prewarmed scratch pool (the
-    // prover gives the previous round's buffers back in `SumcheckProver::fold`),
-    // so the initial sumcheck reuses resident pages instead of faulting ~128 MB
-    // of fresh memory every round. On aarch64 this pooling measured slower, so
-    // there we allocate fresh each round.
-    #[cfg(target_arch = "x86_64")]
-    let (mut nf, mut nb) = (
-        crate::scratch::take_f128(half),
-        crate::scratch::take_f128(half),
-    );
-    #[cfg(not(target_arch = "x86_64"))]
-    let (mut nf, mut nb) = (
-        crate::alloc_uninit_f128_vec(half),
-        crate::alloc_uninit_f128_vec(half),
-    );
     let (u_0, u_2) = nf
         .par_chunks_mut(CHUNK)
         .zip(nb.par_chunks_mut(CHUNK))
@@ -2663,7 +2703,7 @@ fn fold_and_msg_lsb(f: &[F128], b: &[F128], r: F128) -> (Vec<F128>, Vec<F128>, S
             || (F128::ZERO, F128::ZERO),
             |(a0, a2), (c0, c2)| (a0 + c0, a2 + c2),
         );
-    (nf, nb, SumcheckMessage { u_0, u_2 })
+    SumcheckMessage { u_0, u_2 }
 }
 
 pub struct SumcheckProver {
@@ -2673,17 +2713,59 @@ pub struct SumcheckProver {
     /// keeps fold cost O(1 + 1) = (f + combined_basis) regardless of how
     /// many recursive intro/glue pairs have happened.
     combined_basis: Vec<F128>,
+    /// Persistent ping-pong destinations for [`Self::fold`], each sized
+    /// `f.len()/2` at construction.
+    ///
+    /// The ladder runs 21 fold rounds at m=32 (6 at L0 from half=2^24 down to
+    /// 2^19, then 15 across the recursive levels). Allocating a fresh output
+    /// pair per round mapped ~1.03 GiB and unmapped ~2 GiB per prove — the
+    /// unmap being single-threaded kernel work with TLB shootdown IPIs to
+    /// every running rayon worker. Worse, the old `self.f = nf` on the
+    /// non-x86 branch *dropped* the previous buffer, and the first fold's
+    /// `self.f`/`self.combined_basis` are the prewarmed pool buffers, so
+    /// every prove permanently leaked two 512 MiB entries out of the pool
+    /// (observable as the pool shrinking 8.5 → 7.5 → 6.5 GiB across proves).
+    ///
+    /// Routing the per-round outputs through `scratch::take_f128` instead was
+    /// measured *slower* on aarch64, and for a concrete reason: `try_take_f128`
+    /// hands back the smallest capacity ≥ n, so the ladder checks out ~12
+    /// oversized prewarmed giants and returns them, overflowing `MAX_POOLED`
+    /// and evicting real buffers. Owning the two scratch buffers for the whole
+    /// ladder avoids both: zero allocations and zero pool traffic across all
+    /// 21 rounds, at the cost of two buffers held for the ladder's lifetime.
+    ///
+    /// Invariant: `scratch_f.len() >= f.len()` and `scratch_b.len() >=
+    /// combined_basis.len()` at all times (they alternate between `n` and
+    /// `n/2` as `f` halves), so `[..half]` always slices in bounds.
+    scratch_f: Vec<F128>,
+    scratch_b: Vec<F128>,
     t_r: F128,
     transcript: Vec<SumcheckMessage>,
     pending_glue: Option<(Vec<F128>, F128)>,
 }
 
 impl SumcheckProver {
+    /// Two `n/2` ping-pong buffers from the scratch pool (empty when there is
+    /// nothing to fold). Returned to the pool in `Drop`.
+    fn make_scratch(n: usize) -> (Vec<F128>, Vec<F128>) {
+        let half = n / 2;
+        if half == 0 {
+            return (Vec::new(), Vec::new());
+        }
+        (
+            crate::scratch::take_f128(half),
+            crate::scratch::take_f128(half),
+        )
+    }
+
     pub fn new(f: Vec<F128>, b1: Vec<F128>, h1: F128) -> (Self, SumcheckMessage) {
         assert_eq!(f.len(), b1.len());
+        let (scratch_f, scratch_b) = Self::make_scratch(f.len());
         let mut inst = Self {
             f,
             combined_basis: b1,
+            scratch_f,
+            scratch_b,
             t_r: h1,
             transcript: Vec::new(),
             pending_glue: None,
@@ -2705,9 +2787,12 @@ impl SumcheckProver {
         first_msg: SumcheckMessage,
     ) -> (Self, SumcheckMessage) {
         assert_eq!(f.len(), b1.len());
+        let (scratch_f, scratch_b) = Self::make_scratch(f.len());
         let mut inst = Self {
             f,
             combined_basis: b1,
+            scratch_f,
+            scratch_b,
             t_r: h1,
             transcript: Vec::new(),
             pending_glue: None,
@@ -2719,23 +2804,24 @@ impl SumcheckProver {
     pub fn fold(&mut self, r: F128) -> SumcheckMessage {
         // Fused: fold f and combined_basis at r AND build the next-round
         // message in one parallel pass (was three passes). See
-        // [`fold_and_msg_lsb`].
-        let (nf, nb, msg) = fold_and_msg_lsb(&self.f, &self.combined_basis, r);
-        // On x86_64, recycle the just-consumed buffers into the scratch pool
-        // (same ownership as the Drop impl) so the next round's
-        // `fold_and_msg_lsb` takes resident pages. aarch64 measured slower with
-        // this pooling, so there we just move the new buffers in and drop the
-        // old ones.
-        #[cfg(target_arch = "x86_64")]
-        {
-            crate::scratch::give_f128(std::mem::replace(&mut self.f, nf));
-            crate::scratch::give_f128(std::mem::replace(&mut self.combined_basis, nb));
-        }
-        #[cfg(not(target_arch = "x86_64"))]
-        {
-            self.f = nf;
-            self.combined_basis = nb;
-        }
+        // [`fold_and_msg_into`]. Outputs land in the persistent ping-pong
+        // scratch, which is then swapped in — zero allocation per round.
+        let half = self.f.len() / 2;
+        debug_assert!(self.scratch_f.len() >= half && self.scratch_b.len() >= half);
+        let msg = fold_and_msg_into(
+            &self.f,
+            &self.combined_basis,
+            r,
+            &mut self.scratch_f[..half],
+            &mut self.scratch_b[..half],
+        );
+        std::mem::swap(&mut self.f, &mut self.scratch_f);
+        std::mem::swap(&mut self.combined_basis, &mut self.scratch_b);
+        // `f`/`combined_basis` are now the (over-long) scratch buffers holding
+        // the fold output in `[..half]`; everything past `half` is stale and
+        // must never be read, so cut the logical length here.
+        self.f.truncate(half);
+        self.combined_basis.truncate(half);
         self.transcript.push(msg);
         msg
     }
@@ -3162,9 +3248,12 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
     let log_inv_rate_1 = config.log_inv_rates[1];
     let _t = std::time::Instant::now();
     let ntt_1 = AdditiveNttF128::standard(log_msg_cols_1 + log_inv_rate_1);
-    let f1 = sc_prover.f().to_vec();
+    // `ligero_commit` only reads `poly` and never touches `sc_prover`, so feed
+    // it the prover's `f` directly. The old `sc_prover.f().to_vec()` was an
+    // 8 MiB allocation plus a **serial** memcpy on the critical path for a
+    // buffer used exactly once, as `&f1`.
     let wtns_1 = ligero_commit(
-        &f1,
+        sc_prover.f(),
         log_msg_cols_1,
         log_num_interleaved_1,
         log_inv_rate_1,
@@ -3215,15 +3304,17 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
     let queries_0 = sample_distinct_queries(challenger, l0_block_len, num_queries_0);
     let alpha_0 = challenger.sample_f128_vec(ceil_log2(num_queries_0));
     let _t = std::time::Instant::now();
-    let opened_rows_0: Vec<Vec<F128>> = queries_0.iter().map(|&q| l0_row(q).to_vec()).collect();
+    // Each row gather is a strided read into a ~1 GiB codeword — a guaranteed
+    // TLB miss per query, and there are 218 of them at L0. Independent, so run
+    // them in parallel.
+    let opened_rows_0: Vec<Vec<F128>> = {
+        use rayon::prelude::*;
+        queries_0.par_iter().map(|&q| l0_row(q).to_vec()).collect()
+    };
     let merkle_proof_0 = merkle_multi_proof_for(l0_tree, l0_block_len, &queries_0);
     if trace {
         t_opens += _t.elapsed();
     }
-    let initial_proof = RecursiveProof {
-        opened_rows: opened_rows_0.clone(),
-        merkle_proof: merkle_proof_0,
-    };
 
     // Induce basis_0 from wtns_0 opens. L0 dominates the induce phase, where the
     // sparse-prefix Fᵀ-NTT path wins; the dispatcher auto-selects it (deeper
@@ -3242,6 +3333,13 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
     if trace {
         t_induce += _t.elapsed();
     }
+    // Built here rather than before the induce so the rows are **moved** into
+    // the proof instead of cloned (the induce only needs `&opened_rows_0`).
+    // The clone was 218 separate small-Vec allocations plus their copies.
+    let initial_proof = RecursiveProof {
+        opened_rows: opened_rows_0,
+        merkle_proof: merkle_proof_0,
+    };
 
     // Introduce + glue basis_0.
     let _t = std::time::Instant::now();
@@ -3293,10 +3391,13 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
             let queries_last =
                 sample_distinct_queries(challenger, wtns_prev.block_len, num_queries_last);
             let _t = std::time::Instant::now();
-            let opened_rows_last: Vec<Vec<F128>> = queries_last
-                .iter()
-                .map(|&q| wtns_prev.row(q).to_vec())
-                .collect();
+            let opened_rows_last: Vec<Vec<F128>> = {
+                use rayon::prelude::*;
+                queries_last
+                    .par_iter()
+                    .map(|&q| wtns_prev.row(q).to_vec())
+                    .collect()
+            };
             let merkle_proof_last =
                 merkle_multi_proof_for(&wtns_prev.tree, wtns_prev.block_len, &queries_last);
             if trace {
@@ -3361,9 +3462,9 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
         let log_inv_rate_next = config.log_inv_rates[i + 2];
         let _t = std::time::Instant::now();
         let ntt_next = AdditiveNttF128::standard(log_msg_cols_next + log_inv_rate_next);
-        let f_evals = sc_prover.f().to_vec();
+        // Same as the L1 commit above: no copy, `ligero_commit` just reads it.
         let wtns_next = ligero_commit(
-            &f_evals,
+            sc_prover.f(),
             log_msg_cols_next,
             log_num_interleaved_next,
             log_inv_rate_next,
@@ -3403,19 +3504,18 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
         let queries_i = sample_distinct_queries(challenger, wtns_prev.block_len, num_queries_i);
         let alpha_i = challenger.sample_f128_vec(ceil_log2(num_queries_i));
         let _t = std::time::Instant::now();
-        let opened_rows_i: Vec<Vec<F128>> = queries_i
-            .iter()
-            .map(|&q| wtns_prev.row(q).to_vec())
-            .collect();
+        let opened_rows_i: Vec<Vec<F128>> = {
+            use rayon::prelude::*;
+            queries_i
+                .par_iter()
+                .map(|&q| wtns_prev.row(q).to_vec())
+                .collect()
+        };
         let merkle_proof_i =
             merkle_multi_proof_for(&wtns_prev.tree, wtns_prev.block_len, &queries_i);
         if trace {
             t_opens += _t.elapsed();
         }
-        recursive_proofs.push(RecursiveProof {
-            opened_rows: opened_rows_i.clone(),
-            merkle_proof: merkle_proof_i,
-        });
 
         let sks_vks_i = eval_sk_at_vks(n_next);
         let _t = std::time::Instant::now();
@@ -3430,6 +3530,11 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
         if trace {
             t_induce += _t.elapsed();
         }
+        // Induce first, then MOVE the rows into the proof (see the L0 site).
+        recursive_proofs.push(RecursiveProof {
+            opened_rows: opened_rows_i,
+            merkle_proof: merkle_proof_i,
+        });
 
         let _t = std::time::Instant::now();
         let intro_msg_i = sc_prover.introduce_new(basis_i_induced, enforced_sum_i);
@@ -5549,6 +5654,71 @@ mod tests {
         let f_resid = prover.f()[0] * one_plus_r + prover.f()[1] * r_last;
         let b_resid = prover.combined_basis[0] * one_plus_r + prover.combined_basis[1] * r_last;
         assert_eq!(f_resid * b_resid, t_r, "residual inner product != t_r");
+    }
+
+    /// The persistent ping-pong scratch must produce exactly the same folds,
+    /// basis and transcript as the reference three-pass sequence
+    /// (`partial_eval_lsb_one` ×2 + `round_msg_lsb`) — including when the
+    /// scratch buffers arrive from the pool holding stale data from an earlier
+    /// use. Sized past `PAR_THRESHOLD` (half = 2^14 ≫ 4096) so the parallel
+    /// `fold_and_msg_into` path with its CHUNK tiling is the one under test;
+    /// the small serial path is already covered by the sumcheck tests below.
+    #[test]
+    fn fold_ping_pong_matches_reference_with_dirty_scratch() {
+        let n = 15;
+        let len = 1usize << n;
+        let mk = |seed: u64| -> Vec<F128> {
+            (0..len)
+                .map(|i| F128::new(seed.wrapping_mul(i as u64 + 7), seed ^ ((i as u64) << 11)))
+                .collect()
+        };
+        let f = mk(0x51);
+        let b = mk(0x52);
+        let h: F128 = f
+            .iter()
+            .zip(b.iter())
+            .map(|(&x, &y)| x * y)
+            .fold(F128::ZERO, |a, v| a + v);
+
+        // Poison the pool so `make_scratch` hands back buffers full of
+        // non-zero garbage: any read past the current `half` shows up as a
+        // transcript mismatch below.
+        crate::scratch::clear();
+        for _ in 0..4 {
+            let mut junk = crate::scratch::take_f128(len);
+            for (i, s) in junk.iter_mut().enumerate() {
+                *s = F128::new(0xDEAD_BEEF_0000_0000 ^ i as u64, 0xFFFF_FFFF_FFFF_FFFF);
+            }
+            crate::scratch::give_f128(junk);
+        }
+
+        let (mut prover, first) = SumcheckProver::new(f.clone(), b.clone(), h);
+
+        // Reference: independent buffers, three separate passes per round.
+        let mut rf = f.clone();
+        let mut rb = b.clone();
+        let mut ref_transcript = vec![round_msg_lsb(&rf, &rb)];
+        assert_eq!(first, ref_transcript[0]);
+
+        let mut ch = crate::challenger::RandomChallenger::new(0x5CA1AB1E);
+        for round in 0..(n - 1) {
+            let r = ch.sample_f128();
+            let msg = prover.fold(r);
+            partial_eval_lsb_one(&mut rf, r);
+            partial_eval_lsb_one(&mut rb, r);
+            let ref_msg = round_msg_lsb(&rf, &rb);
+            assert_eq!(msg, ref_msg, "round {round}: message mismatch");
+            ref_transcript.push(ref_msg);
+            assert_eq!(prover.f(), &rf[..], "round {round}: f mismatch");
+            assert_eq!(
+                &prover.combined_basis[..],
+                &rb[..],
+                "round {round}: basis mismatch"
+            );
+        }
+        assert_eq!(prover.transcript(), &ref_transcript[..]);
+        drop(prover);
+        crate::scratch::clear();
     }
 
     /// Multi-basis sumcheck: introduce_new + glue mid-protocol. Verifier replays.

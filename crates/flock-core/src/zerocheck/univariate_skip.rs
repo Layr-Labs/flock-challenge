@@ -187,9 +187,45 @@ pub struct SplitEqGhash {
     pub hi: Vec<F128>,
 }
 
+/// Hi-half width used by the zerocheck round-2 fold and the fused multilinear
+/// tail rounds.
+///
+/// `MAX_N_HI = 7` gives `2^7 = 128` rayon chunks. On a 10-worker pool rayon's
+/// binary splitter exhausts at 16 jobs of 8 chunks, i.e. a 2-wave schedule with
+/// the second wave only 60% populated. A wider hi half both smooths that and
+/// shrinks `eq.lo` (streamed in full by every worker chunk) into cache.
+///
+/// The split is an exact tensor factorisation `eq(r,x) = eq_lo(x_lo)·eq_hi(x_hi)`
+/// and the per-chunk combine is XOR on a deferred 256-bit accumulator reduced
+/// by an F2-linear map, so changing this regroups the same terms and is
+/// bit-identical.
+pub const TAIL_N_HI: usize = 11;
+
+/// Runtime-resolved [`TAIL_N_HI`]. Honours `FLOCK_N_HI` so the constant can be
+/// swept without a rebuild; falls back to the compiled-in default.
+#[inline]
+pub fn tail_n_hi() -> usize {
+    use std::sync::OnceLock;
+    static V: OnceLock<usize> = OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("FLOCK_N_HI")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(TAIL_N_HI)
+    })
+}
+
 impl SplitEqGhash {
     /// C++-default cap on the hi half size — keeps outer F128 muls cheap.
     pub const MAX_N_HI: usize = 7;
+
+    /// Split tuned for the zerocheck round-2 / tail parallel shape. Always
+    /// leaves at least one lo variable so `lo_size ≥ 2` holds.
+    pub fn for_tail(r: &[F128]) -> Self {
+        let n = r.len();
+        let n_hi = tail_n_hi().min(n.saturating_sub(1));
+        Self::with_n_hi(r, n_hi)
+    }
 
     pub fn new(r: &[F128]) -> Self {
         let n = r.len();
