@@ -1188,6 +1188,7 @@ pub(crate) fn shift_reduce_inner_ab_fused_neon_checked(
     out: &mut [u8; 64],
     check_all_ones: bool,
     check_single_k0: bool,
+    bstatic_w: usize,
 ) {
     let byte_base_b = chunk_byte_base + b_med * N_CHUNKS * 8;
     let bw = |k: usize| -> u64 {
@@ -1209,5 +1210,201 @@ pub(crate) fn shift_reduce_inner_ab_fused_neon_checked(
             return;
         }
     }
+    // Static-b plan (callers pass usize::MAX to disable).
+    if bstatic_w <= 1
+        && shift_reduce_inner_ab_bstatic(
+            a_packed,
+            b_packed,
+            inv_table,
+            chunk_byte_base,
+            b_med,
+            bstatic_w,
+            out,
+        )
+    {
+        return;
+    }
     shift_reduce_inner_ab_fused_neon(a_packed, b_packed, inv_table, chunk_byte_base, b_med, out);
 }
+
+// ---------------------------------------------------------------------------
+// Static-b fast paths (generated dispatch in aarch64_bstatic_gen.rs).
+//
+// The round-1 b operand has byte positions the BLAKE3 circuit fixes
+// independently of the inputs (census: 31.6% of b byte positions, clustered
+// by (window, b_med, K)). Since the inv-NTT byte apply is linear and row 0 of
+// the table is zero, each position's static contribution is precomputed once
+// (`bstatic_partials`) and per block only the varying bytes are gathered.
+// Every K-row is guarded by `(b_word & MASK) == EXPECTED` with a generic
+// fallback, so output is bit-identical for arbitrary witnesses.
+// ---------------------------------------------------------------------------
+
+/// XOR one selected b-byte's table row into the four b-side registers. `J`
+/// selects the byte; placement constants derive from `J` exactly as in the
+/// generic unrolled sequence: `BH = J / 2`, odd bytes use the
+/// half-swapped table.
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn xor_vary_single<const J: u32>(
+    table_base: *const u8,
+    half_swapped_table_base: *const u8,
+    b_word: u64,
+    db0: &mut core::arch::aarch64::uint8x16_t,
+    db1: &mut core::arch::aarch64::uint8x16_t,
+    db2: &mut core::arch::aarch64::uint8x16_t,
+    db3: &mut core::arch::aarch64::uint8x16_t,
+) {
+    use core::arch::aarch64::*;
+    unsafe {
+        let bh = (J as usize) / 2;
+        let t = if J % 2 == 1 {
+            half_swapped_table_base
+        } else {
+            table_base
+        };
+        let r = t.add(byte_from_word::<J>(b_word) * 64);
+        *db0 = veorq_u8(*db0, vld1q_u8(r.add((bh) * 16)));
+        *db1 = veorq_u8(*db1, vld1q_u8(r.add((1 ^ bh) * 16)));
+        *db2 = veorq_u8(*db2, vld1q_u8(r.add((2 ^ bh) * 16)));
+        *db3 = veorq_u8(*db3, vld1q_u8(r.add((3 ^ bh) * 16)));
+    }
+}
+
+/// EOR3-paired form of [`xor_vary_single`] for two varying bytes.
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn xor_vary_pair<const J0: u32, const J1: u32>(
+    table_base: *const u8,
+    half_swapped_table_base: *const u8,
+    b_word: u64,
+    db0: &mut core::arch::aarch64::uint8x16_t,
+    db1: &mut core::arch::aarch64::uint8x16_t,
+    db2: &mut core::arch::aarch64::uint8x16_t,
+    db3: &mut core::arch::aarch64::uint8x16_t,
+) {
+    use core::arch::aarch64::*;
+    unsafe {
+        let bh0 = (J0 as usize) / 2;
+        let t0 = if J0 % 2 == 1 {
+            half_swapped_table_base
+        } else {
+            table_base
+        };
+        let bh1 = (J1 as usize) / 2;
+        let t1 = if J1 % 2 == 1 {
+            half_swapped_table_base
+        } else {
+            table_base
+        };
+        let r0 = t0.add(byte_from_word::<J0>(b_word) * 64);
+        let r1 = t1.add(byte_from_word::<J1>(b_word) * 64);
+        *db0 = xor3_u8(
+            *db0,
+            vld1q_u8(r0.add(bh0 * 16)),
+            vld1q_u8(r1.add(bh1 * 16)),
+        );
+        *db1 = xor3_u8(
+            *db1,
+            vld1q_u8(r0.add((1 ^ bh0) * 16)),
+            vld1q_u8(r1.add((1 ^ bh1) * 16)),
+        );
+        *db2 = xor3_u8(
+            *db2,
+            vld1q_u8(r0.add((2 ^ bh0) * 16)),
+            vld1q_u8(r1.add((2 ^ bh1) * 16)),
+        );
+        *db3 = xor3_u8(
+            *db3,
+            vld1q_u8(r0.add((3 ^ bh0) * 16)),
+            vld1q_u8(r1.add((3 ^ bh1) * 16)),
+        );
+    }
+}
+
+/// One K-row where the b-side NTT extension is already in registers: full
+/// a-side apply, F_8 multiply, widen-shift-XOR into the accumulators. Same
+/// epilogue as [`fused_apply_one_k`].
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+#[allow(clippy::too_many_arguments)]
+unsafe fn fused_apply_one_k_with_b<const K: i32>(
+    table_base: *const u8,
+    half_swapped_table_base: *const u8,
+    a_row: *const u8,
+    db0: core::arch::aarch64::uint8x16_t,
+    db1: core::arch::aarch64::uint8x16_t,
+    db2: core::arch::aarch64::uint8x16_t,
+    db3: core::arch::aarch64::uint8x16_t,
+    acc0_lo: &mut core::arch::aarch64::uint16x8_t,
+    acc0_hi: &mut core::arch::aarch64::uint16x8_t,
+    acc1_lo: &mut core::arch::aarch64::uint16x8_t,
+    acc1_hi: &mut core::arch::aarch64::uint16x8_t,
+    acc2_lo: &mut core::arch::aarch64::uint16x8_t,
+    acc2_hi: &mut core::arch::aarch64::uint16x8_t,
+    acc3_lo: &mut core::arch::aarch64::uint16x8_t,
+    acc3_hi: &mut core::arch::aarch64::uint16x8_t,
+) {
+    use crate::field::gf2_8::neon::gf8_mul_vec16;
+    use core::arch::aarch64::*;
+    unsafe {
+        let a_word = u64::from_le(core::ptr::read_unaligned(a_row.cast::<u64>()));
+        let ra0 = table_base.add(byte_from_word::<0>(a_word) * 64);
+        let mut da0 = vld1q_u8(ra0);
+        let mut da1 = vld1q_u8(ra0.add(16));
+        let mut da2 = vld1q_u8(ra0.add(32));
+        let mut da3 = vld1q_u8(ra0.add(48));
+        xor_apply_byte_pair_into_4_regs::<0, true, 1, false>(
+            table_base,
+            half_swapped_table_base,
+            byte_from_word::<1>(a_word),
+            byte_from_word::<2>(a_word),
+            &mut da0,
+            &mut da1,
+            &mut da2,
+            &mut da3,
+        );
+        xor_apply_byte_pair_into_4_regs::<1, true, 2, false>(
+            table_base,
+            half_swapped_table_base,
+            byte_from_word::<3>(a_word),
+            byte_from_word::<4>(a_word),
+            &mut da0,
+            &mut da1,
+            &mut da2,
+            &mut da3,
+        );
+        xor_apply_byte_pair_into_4_regs::<2, true, 3, false>(
+            table_base,
+            half_swapped_table_base,
+            byte_from_word::<5>(a_word),
+            byte_from_word::<6>(a_word),
+            &mut da0,
+            &mut da1,
+            &mut da2,
+            &mut da3,
+        );
+        xor_apply_byte_into_4_regs::<3, true>(
+            table_base,
+            half_swapped_table_base,
+            byte_from_word::<7>(a_word),
+            &mut da0,
+            &mut da1,
+            &mut da2,
+            &mut da3,
+        );
+        let y0 = gf8_mul_vec16(da0, db0);
+        let y1 = gf8_mul_vec16(da1, db1);
+        let y2 = gf8_mul_vec16(da2, db2);
+        let y3 = gf8_mul_vec16(da3, db3);
+        *acc0_lo = veorq_u16(*acc0_lo, vshll_n_u8::<K>(vget_low_u8(y0)));
+        *acc0_hi = veorq_u16(*acc0_hi, vshll_n_u8::<K>(vget_high_u8(y0)));
+        *acc1_lo = veorq_u16(*acc1_lo, vshll_n_u8::<K>(vget_low_u8(y1)));
+        *acc1_hi = veorq_u16(*acc1_hi, vshll_n_u8::<K>(vget_high_u8(y1)));
+        *acc2_lo = veorq_u16(*acc2_lo, vshll_n_u8::<K>(vget_low_u8(y2)));
+        *acc2_hi = veorq_u16(*acc2_hi, vshll_n_u8::<K>(vget_high_u8(y2)));
+        *acc3_lo = veorq_u16(*acc3_lo, vshll_n_u8::<K>(vget_low_u8(y3)));
+        *acc3_hi = veorq_u16(*acc3_hi, vshll_n_u8::<K>(vget_high_u8(y3)));
+    }
+}
+
+include!("aarch64_bstatic_gen.rs");
