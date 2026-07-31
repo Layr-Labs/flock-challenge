@@ -220,6 +220,15 @@ pub fn commit_into(
         "commit_into: prebuilt codeword buffer has wrong length"
     );
 
+    // Ranked shape: skip the replicate sweep entirely. The interleaved NTT's
+    // message-direct entry reads `z_packed` once and its out-of-place first
+    // pass writes both rate-1/2 codeword halves directly, so no caller-side
+    // replica materialization is needed (or wanted — it would be pure wasted
+    // bandwidth).
+    if use_ranked_message_direct_first_pass(params) {
+        return finalize_commit_from_message(Some(z_packed), codeword, params);
+    }
+
     // RS encoding of [z, 0, …, 0] starts with `log_inv_rate` butterfly layers
     // whose bottom inputs are all zero — each is a pure copy, so after those
     // layers the buffer holds 2^log_inv_rate replicas of z. Write that state
@@ -304,6 +313,27 @@ fn use_ranked_ntt_merkle_leaf_pipeline(params: &PcsParams) -> bool {
         && std::env::var_os("FLOCK_NO_NTT_MERKLE_PIPELINE").is_none()
 }
 
+/// Ranked commits RS-encode straight from the packed witness: the NTT's
+/// message-direct entry fuses the replicate sweep into an out-of-place first
+/// pass (see
+/// [`AdditiveNttF128::forward_transform_interleaved_from_message_and_then`]).
+/// Same scope as the leaf-pipeline shape; `FLOCK_NO_MESSAGE_DIRECT_COMMIT`
+/// restores the replicate path for A/B runs.
+#[inline]
+fn use_ranked_message_direct_first_pass(params: &PcsParams) -> bool {
+    is_ranked_ntt_merkle_leaf_pipeline_shape(params)
+        && std::env::var_os("FLOCK_NO_MESSAGE_DIRECT_COMMIT").is_none()
+}
+
+/// Whether [`commit_into`] will RS-encode straight from the packed witness
+/// for `params` (fused out-of-place first pass), making any caller-side
+/// codeword pre-replication wasted work. Exposed so witness producers (the
+/// ranked hot-codeword path) can skip their replica writes and hand the
+/// commit a plain witness instead.
+pub fn commit_uses_message_direct_first_pass(params: &PcsParams) -> bool {
+    use_ranked_message_direct_first_pass(params)
+}
+
 #[derive(Clone, Copy)]
 struct RankedLeafJob {
     elem_offset: usize,
@@ -318,6 +348,7 @@ struct RankedLeafJob {
 /// small L2-sized window of completed codeword data awaits hashing.
 fn ranked_ntt_with_pipelined_leaves(
     ntt: &AdditiveNttF128,
+    msg: Option<&[F128]>,
     codeword: &mut [F128],
     params: &PcsParams,
     leaves: &mut [Hash],
@@ -375,21 +406,31 @@ fn ranked_ntt_with_pipelined_leaves(
             });
         });
 
-        ntt.forward_transform_interleaved_from_layer_and_then(
-            codeword,
-            num_ntts,
-            params.log_inv_rate,
-            |elem_offset, chunk| {
-                let job = RankedLeafJob {
-                    elem_offset,
-                    elem_len: chunk.len(),
-                };
-                match sender.try_send(job) {
-                    Ok(()) => {}
-                    Err(TrySendError::Full(job) | TrySendError::Disconnected(job)) => hash_job(job),
-                }
-            },
-        );
+        let publish = |elem_offset: usize, chunk: &[F128]| {
+            let job = RankedLeafJob {
+                elem_offset,
+                elem_len: chunk.len(),
+            };
+            match sender.try_send(job) {
+                Ok(()) => {}
+                Err(TrySendError::Full(job) | TrySendError::Disconnected(job)) => hash_job(job),
+            }
+        };
+        match msg {
+            Some(msg) => ntt.forward_transform_interleaved_from_message_and_then(
+                msg,
+                codeword,
+                num_ntts,
+                params.log_inv_rate,
+                publish,
+            ),
+            None => ntt.forward_transform_interleaved_from_layer_and_then(
+                codeword,
+                num_ntts,
+                params.log_inv_rate,
+                publish,
+            ),
+        }
         drop(sender);
 
         // No more jobs can arrive. Pull any bounded queue tail away from the
@@ -411,7 +452,20 @@ fn ranked_ntt_with_pipelined_leaves(
 
 /// Shared tail of [`commit`] / [`commit_into`]: interleaved forward additive
 /// NTT (RS-encode every lane) then the initial Merkle tree over codeword rows.
-fn finalize_commit(mut codeword: Vec<F128>, params: &PcsParams) -> (Commitment, ProverData) {
+fn finalize_commit(codeword: Vec<F128>, params: &PcsParams) -> (Commitment, ProverData) {
+    finalize_commit_from_message(None, codeword, params)
+}
+
+/// [`finalize_commit`] with an optional message-direct source. With
+/// `Some(msg)` the codeword buffer's contents may be arbitrary — the NTT's
+/// message-direct entry writes every slot (fused out-of-place first pass or
+/// replicate fallback). With `None` the buffer must already hold the
+/// replicated post-trivial-layer state.
+fn finalize_commit_from_message(
+    msg: Option<&[F128]>,
+    mut codeword: Vec<F128>,
+    params: &PcsParams,
+) -> (Commitment, ProverData) {
     let helper = if use_ranked_ntt_merkle_leaf_pipeline(params) && rayon::current_num_threads() > 1
     {
         crate::epool::epool()
@@ -438,17 +492,27 @@ fn finalize_commit(mut codeword: Vec<F128>, params: &PcsParams) -> (Commitment, 
     if let (Some(helper), Some(tree)) = (helper, prehashed_tree.as_mut()) {
         ranked_ntt_with_pipelined_leaves(
             &ntt,
+            msg,
             &mut codeword,
             params,
             &mut tree[..params.n_leaves()],
             helper,
         );
     } else {
-        ntt.forward_transform_interleaved_from_layer(
-            &mut codeword,
-            params.num_ntts(),
-            params.log_inv_rate,
-        );
+        match msg {
+            Some(msg) => ntt.forward_transform_interleaved_from_message_and_then(
+                msg,
+                &mut codeword,
+                params.num_ntts(),
+                params.log_inv_rate,
+                |_, _| {},
+            ),
+            None => ntt.forward_transform_interleaved_from_layer(
+                &mut codeword,
+                params.num_ntts(),
+                params.log_inv_rate,
+            ),
+        }
     }
     if timing {
         let phase = if pipelined_leaves {
@@ -712,6 +776,7 @@ mod tests {
         let mut got_tree = vec![[0u8; 32]; 2 * params.n_leaves() - 1];
         ranked_ntt_with_pipelined_leaves(
             &ntt,
+            None,
             &mut got_codeword,
             &params,
             &mut got_tree[..params.n_leaves()],
@@ -725,6 +790,58 @@ mod tests {
 
         assert_eq!(got_codeword, expect_codeword);
         assert_eq!(got_tree, expect_tree);
+
+        // Message-direct variant: a stale (unreplicated) buffer plus the
+        // packed message must land on the same codeword and tree.
+        let mut md_codeword: Vec<F128> = (0..params.codeword_len_f128())
+            .map(|_| rng.f128())
+            .collect();
+        let mut md_tree = vec![[0u8; 32]; 2 * params.n_leaves() - 1];
+        ranked_ntt_with_pipelined_leaves(
+            &ntt,
+            Some(&message),
+            &mut md_codeword,
+            &params,
+            &mut md_tree[..params.n_leaves()],
+            &helper,
+        );
+        let md_tree = merkle::merkle_tree_from_prehashed_leaves(
+            md_tree,
+            params.n_leaves(),
+            HashKind::Blake3,
+        );
+        assert_eq!(md_codeword, expect_codeword);
+        assert_eq!(md_tree, expect_tree);
+    }
+
+    /// The message-direct finalize (arbitrary stale buffer + packed message)
+    /// must produce the same codeword and root as replicate-then-finalize.
+    #[test]
+    fn message_direct_finalize_matches_replicate_finalize() {
+        let params = PcsParams {
+            m: 24,
+            log_inv_rate: 1,
+            log_batch_size: 6,
+            profile: crate::pcs::ligerito::LigeritoProfile::Fast,
+            merkle_hash: HashKind::Blake3,
+        };
+        let mut rng = Rng::new(0x0A5E_0D1E_EC7C_0001);
+        let message: Vec<F128> = (0..1usize << params.log_msg_len())
+            .map(|_| rng.f128())
+            .collect();
+
+        let mut filled = vec![F128::ZERO; params.codeword_len_f128()];
+        replicate_message_fill(&mut filled, &message);
+        let (want_commitment, want_pd) = finalize_commit(filled, &params);
+
+        let stale: Vec<F128> = (0..params.codeword_len_f128())
+            .map(|_| rng.f128())
+            .collect();
+        let (got_commitment, got_pd) =
+            finalize_commit_from_message(Some(&message), stale, &params);
+
+        assert_eq!(got_commitment.root, want_commitment.root);
+        assert!(got_pd.codeword == want_pd.codeword);
     }
 
     /// The replicate-fill + start-at-layer-`log_inv_rate` fast path must be

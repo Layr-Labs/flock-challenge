@@ -145,6 +145,32 @@ pub(super) unsafe fn butterfly_fused_3layer_zero_root_row(
     }
 }
 
+/// Out-of-place two-block fused-three-layer row group (rate-1/2 replicate
+/// fusion). See the portable implementation for the full contract.
+///
+/// # Safety
+/// Same row geometry and disjoint-row-group contract as
+/// [`butterfly_fused_3layer_row`], plus: `src` and `dst` must not overlap and
+/// `tw0[0]`, `tw0[1]`, `tw0[3]` must be zero.
+#[allow(clippy::too_many_arguments)]
+#[inline]
+pub(super) unsafe fn butterfly_fused_3layer_two_block_oop_row(
+    src: *const F128,
+    dst: *mut F128,
+    eighth: usize,
+    num_ntts: usize,
+    r: usize,
+    tw0: &[F128; 7],
+    tw1: &[F128; 7],
+) {
+    // SAFETY: forwarded caller contract.
+    unsafe {
+        portable::butterfly_fused_3layer_two_block_oop_row(
+            src, dst, eighth, num_ntts, r, tw0, tw1,
+        )
+    }
+}
+
 #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
 #[inline]
 pub(super) unsafe fn butterfly_neon_block(chunk: &mut [F128], twiddle: F128, half: usize) {

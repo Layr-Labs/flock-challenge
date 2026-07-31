@@ -376,6 +376,66 @@ impl AdditiveNttF128 {
         }
     }
 
+    /// RS-encode `msg` directly into `data` (message-direct entry).
+    ///
+    /// Contract: byte-identical to filling `data` with `2^r` replicas of
+    /// `msg` (`r = log2(data.len() / msg.len())` — the exact state after the
+    /// first `r` trivial forward layers on `[msg, 0, …, 0]`) and then running
+    /// [`Self::forward_transform_interleaved_from_layer_and_then`] from
+    /// `start_layer`. `data`'s prior contents may be arbitrary.
+    ///
+    /// On the rate-1/2 radix-8 geometry (`start_layer = 1`, first top pass
+    /// fuses layers 1..4) the replicate sweep is fused into an out-of-place
+    /// first pass: both layer-1 blocks read the same message rows, so each
+    /// row group is loaded once from `msg` and both radix-8 results are
+    /// stored straight into the two codeword halves — removing the full
+    /// replicate read+write sweep and halving the first pass's read traffic.
+    /// Every other geometry takes a replicate fallback and is otherwise
+    /// unchanged.
+    pub fn forward_transform_interleaved_from_message_and_then<F>(
+        &self,
+        msg: &[F128],
+        data: &mut [F128],
+        num_ntts: usize,
+        start_layer: usize,
+        finish_chunk: F,
+    ) where
+        F: Fn(usize, &[F128]) + Sync + Send,
+    {
+        assert!(num_ntts.is_power_of_two() && num_ntts > 0);
+        assert!(!msg.is_empty(), "message must be non-empty");
+        assert_eq!(data.len() % msg.len(), 0);
+        assert!((data.len() / msg.len()).is_power_of_two());
+        let n_total = data.len();
+        assert_eq!(n_total % num_ntts, 0);
+        let log_d = log2_pow2(n_total / num_ntts);
+        assert!(log_d <= self.log_domain_size());
+        assert!(start_layer <= log_d);
+
+        #[cfg(any(
+            all(target_arch = "aarch64", target_feature = "aes"),
+            all(target_arch = "x86_64", target_feature = "pclmulqdq"),
+        ))]
+        {
+            self.forward_transform_interleaved_parallel_from_layer_impl(
+                Some(msg),
+                data,
+                num_ntts,
+                start_layer,
+                &finish_chunk,
+            );
+        }
+        #[cfg(not(any(
+            all(target_arch = "aarch64", target_feature = "aes"),
+            all(target_arch = "x86_64", target_feature = "pclmulqdq"),
+        )))]
+        {
+            fill_message_replicas(data, msg);
+            self.forward_transform_interleaved_scalar_from_layer(data, num_ntts, start_layer);
+            finish_chunk(0, data);
+        }
+    }
+
     /// Scalar reference for the interleaved forward NTT.
     pub fn forward_transform_interleaved_scalar(&self, data: &mut [F128], num_ntts: usize) {
         self.forward_transform_interleaved_scalar_from_layer(data, num_ntts, 0);
@@ -465,6 +525,34 @@ impl AdditiveNttF128 {
     ) where
         F: Fn(usize, &[F128]) + Sync + Send,
     {
+        self.forward_transform_interleaved_parallel_from_layer_impl(
+            None,
+            data,
+            num_ntts,
+            start_layer,
+            finish_chunk,
+        );
+    }
+
+    /// Shared body of the in-place (`msg_direct = None`) and message-direct
+    /// (`msg_direct = Some`) parallel transforms. With `Some(msg)` the result
+    /// must be identical to replicating `msg` over `data` first; the rate-1/2
+    /// radix-8 geometry takes the fused out-of-place first pass, every other
+    /// geometry falls back to an explicit replicate fill.
+    #[cfg(any(
+        all(target_arch = "aarch64", target_feature = "aes"),
+        all(target_arch = "x86_64", target_feature = "pclmulqdq"),
+    ))]
+    fn forward_transform_interleaved_parallel_from_layer_impl<F>(
+        &self,
+        msg_direct: Option<&[F128]>,
+        data: &mut [F128],
+        num_ntts: usize,
+        start_layer: usize,
+        finish_chunk: &F,
+    ) where
+        F: Fn(usize, &[F128]) + Sync + Send,
+    {
         use rayon::prelude::*;
         let n_total = data.len();
         let log_d = log2_pow2(n_total / num_ntts);
@@ -504,6 +592,9 @@ impl AdditiveNttF128 {
         };
         let n_top = fusion_aware_interleaved_n_top(log_d, num_ntts, start_layer, n_top);
         if n_top == 0 || log_d < 8 {
+            if let Some(msg) = msg_direct {
+                fill_message_replicas(data, msg);
+            }
             self.forward_transform_interleaved_scalar_from_layer(data, num_ntts, start_layer);
             finish_chunk(0, data);
             return;
@@ -539,6 +630,81 @@ impl AdditiveNttF128 {
         let fused3_ok = !fused4_ok;
         let zero_root_fused3 = use_ranked_zero_root_fusion(log_d, num_ntts, start_layer, n_top);
         let mut layer = start_layer.min(n_top);
+
+        // Message-direct entry: fuse the replicate sweep into an out-of-place
+        // first pass when that pass is the rate-1/2 radix-8 group (layers
+        // 1..4 over exactly two blocks whose pre-pass contents are both
+        // `msg`). One load from the message feeds the zero-root radix-8
+        // (block 0 — its left-spine twiddles are zero for every shape) and
+        // the general radix-8 (block 1); both results store straight into
+        // the two codeword halves. Single flattened Rayon region, one job
+        // per row group, consistent with the flattened top scheduler.
+        if let Some(msg) = msg_direct {
+            let oop_first_pass = fused3_ok
+                && layer == 1
+                && layer + 2 < n_top
+                && msg.len() * 2 == n_total
+                && log_d >= 4;
+            if oop_first_pass {
+                let eighth = 1usize << (log_d - 4);
+                let block_twiddles = |block: usize| {
+                    let mut tw = [F128 { lo: 0, hi: 0 }; 7];
+                    tw[0] = self.twiddle(1, block);
+                    for s in 0..2 {
+                        tw[1 + s] = self.twiddle(2, 2 * block + s);
+                    }
+                    for s in 0..4 {
+                        tw[3 + s] = self.twiddle(3, 4 * block + s);
+                    }
+                    tw
+                };
+                let tw0 = block_twiddles(0);
+                let tw1 = block_twiddles(1);
+                debug_assert_eq!(tw0[0], F128::ZERO);
+                debug_assert_eq!(tw0[1], F128::ZERO);
+                debug_assert_eq!(tw0[3], F128::ZERO);
+                let src = msg.as_ptr() as usize;
+                let dst = data.as_mut_ptr() as usize;
+                const PARALLEL_ROW_THRESHOLD: usize = 256;
+                if eighth < PARALLEL_ROW_THRESHOLD {
+                    for r in 0..eighth {
+                        // SAFETY: row group r touches disjoint rows of both
+                        // codeword halves; msg and data are distinct borrows.
+                        unsafe {
+                            kernels::butterfly_fused_3layer_two_block_oop_row(
+                                src as *const F128,
+                                dst as *mut F128,
+                                eighth,
+                                num_ntts,
+                                r,
+                                &tw0,
+                                &tw1,
+                            )
+                        };
+                    }
+                } else {
+                    (0..eighth).into_par_iter().for_each(|r| {
+                        // SAFETY: distinct r → disjoint row groups in both
+                        // codeword halves; msg and data are distinct borrows.
+                        unsafe {
+                            kernels::butterfly_fused_3layer_two_block_oop_row(
+                                src as *const F128,
+                                dst as *mut F128,
+                                eighth,
+                                num_ntts,
+                                r,
+                                &tw0,
+                                &tw1,
+                            )
+                        };
+                    });
+                }
+                layer += 3;
+            } else {
+                fill_message_replicas(data, msg);
+            }
+        }
+
         while layer < n_top {
             let num_blocks = 1usize << layer;
             let block_size = 1usize << (log_d - layer);
@@ -1352,6 +1518,18 @@ fn log2_pow2(n: usize) -> usize {
     n.trailing_zeros() as usize
 }
 
+/// Fill `data` with `data.len() / msg.len()` replicas of `msg` — the exact
+/// state after the first `log2(data.len() / msg.len())` trivial forward
+/// layers on `[msg, 0, …, 0]`. Fallback for
+/// [`AdditiveNttF128::forward_transform_interleaved_from_message_and_then`]
+/// geometries that don't take the fused out-of-place first pass.
+fn fill_message_replicas(data: &mut [F128], msg: &[F128]) {
+    debug_assert!(!msg.is_empty() && data.len() % msg.len() == 0);
+    for replica in data.chunks_mut(msg.len()) {
+        replica.copy_from_slice(msg);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1500,6 +1678,68 @@ mod tests {
         let observed = observed.into_inner().unwrap();
         assert_eq!(observed.0, want);
         assert!(observed.1.iter().all(|&count| count == 1));
+    }
+
+    /// The message-direct RS entry must be byte-identical to replicating the
+    /// message and running the scalar oracle from `start_layer` — on the
+    /// fused out-of-place geometry (rate 1/2 radix-8 first pass; guaranteed
+    /// at log_d=15 × 64 lanes, where the cache split alone forces n_top ≥ 4
+    /// regardless of thread count) and on every fallback geometry (rate 1/4,
+    /// scalar bail, rate 1). Stale destination contents must never leak, and
+    /// the finish_chunk contract must hold: every element observed exactly
+    /// once, post-transform.
+    #[test]
+    fn from_message_matches_replicate_then_scalar_reference() {
+        let mut rng = Rng::new(0x00A5_0A55_E0F1_0001);
+        for (log_d, num_ntts, log_rate) in [
+            (15usize, 64usize, 1usize), // fused OOP first pass (parallel targets)
+            (12, 2, 1),                 // thread-count-dependent n_top; either path
+            (12, 2, 2),                 // rate 1/4 → replicate fallback
+            (6, 2, 1),                  // small → scalar bail
+            (10, 4, 0),                 // rate 1 → single-copy fallback
+        ] {
+            let msg_len = ((1usize << log_d) >> log_rate) * num_ntts;
+            let msg = rand_vec(&mut rng, msg_len);
+            let ntt = AdditiveNttF128::standard(log_d);
+            let start_layer = log_rate;
+
+            let mut want = vec![F128::ZERO; (1usize << log_d) * num_ntts];
+            for replica in want.chunks_mut(msg.len()) {
+                replica.copy_from_slice(&msg);
+            }
+            ntt.forward_transform_interleaved_scalar_from_layer(&mut want, num_ntts, start_layer);
+
+            // Stale contents must not leak into the result.
+            let mut got = rand_vec(&mut rng, (1usize << log_d) * num_ntts);
+            let observed =
+                std::sync::Mutex::new((vec![F128::ZERO; got.len()], vec![0u8; got.len()]));
+            ntt.forward_transform_interleaved_from_message_and_then(
+                &msg,
+                &mut got,
+                num_ntts,
+                start_layer,
+                |offset, chunk| {
+                    let mut observed = observed.lock().unwrap();
+                    observed.0[offset..offset + chunk.len()].copy_from_slice(chunk);
+                    for count in &mut observed.1[offset..offset + chunk.len()] {
+                        *count += 1;
+                    }
+                },
+            );
+            assert!(
+                got == want,
+                "message-direct mismatch at log_d={log_d} num_ntts={num_ntts} log_rate={log_rate}"
+            );
+            let observed = observed.into_inner().unwrap();
+            assert!(
+                observed.0 == want,
+                "finish_chunk saw wrong data at log_d={log_d} num_ntts={num_ntts}"
+            );
+            assert!(
+                observed.1.iter().all(|&count| count == 1),
+                "finish_chunk coverage wrong at log_d={log_d} num_ntts={num_ntts}"
+            );
+        }
     }
 
     /// Only the ranked macOS/AArch64 L0 transform may use the new tail

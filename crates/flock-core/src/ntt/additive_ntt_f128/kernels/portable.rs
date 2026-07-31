@@ -176,6 +176,54 @@ pub(super) unsafe fn butterfly_fused_3layer_zero_root_row(
     }
 }
 
+/// Out-of-place two-block fused-three-layer row group for the rate-1/2
+/// replicate fusion. Before layer 1 the RS codeword is two replicas of the
+/// message, so both layer-1 blocks read the SAME message rows: one load from
+/// `src` feeds two radix-8 butterflies — the zero-root kernel for block 0 and
+/// the general kernel for block 1 — whose results land directly in the two
+/// codeword halves of `dst`. This replaces the replicate sweep plus the
+/// in-place first pass.
+///
+/// `src` holds the message (`8 * eighth` rows); `dst` holds the codeword
+/// (`16 * eighth` rows: block 0 then block 1). Unlike the in-place zero-root
+/// kernel, row stream 0 of block 0 IS stored: `dst` is uninitialized here, so
+/// the unchanged value still has to be written once.
+///
+/// # Safety
+/// The caller guarantees that every selected row and lane is valid in both
+/// buffers, that `src` and `dst` do not overlap, that concurrent calls use
+/// disjoint row groups `r`, and that `tw0[0]`, `tw0[1]`, `tw0[3]` are zero.
+#[allow(clippy::too_many_arguments)]
+pub(super) unsafe fn butterfly_fused_3layer_two_block_oop_row(
+    src: *const F128,
+    dst: *mut F128,
+    eighth: usize,
+    num_ntts: usize,
+    r: usize,
+    tw0: &[F128; 7],
+    tw1: &[F128; 7],
+) {
+    let block_elems = 8 * eighth * num_ntts;
+    // SAFETY: caller supplies the pointer geometry and disjointness contract.
+    unsafe {
+        for lane in 0..num_ntts {
+            let mut values = [F128::ZERO; 8];
+            for (i, value) in values.iter_mut().enumerate() {
+                *value = *src.add((i * eighth + r) * num_ntts + lane);
+            }
+            let mut values0 = values;
+            butterfly_fused_3layer_zero_root(&mut values0, tw0);
+            for (i, value) in values0.iter().enumerate() {
+                *dst.add((i * eighth + r) * num_ntts + lane) = *value;
+            }
+            butterfly_fused_3layer(&mut values, tw1);
+            for (i, value) in values.iter().enumerate() {
+                *dst.add(block_elems + (i * eighth + r) * num_ntts + lane) = *value;
+            }
+        }
+    }
+}
+
 #[inline]
 pub(super) fn butterfly_fused_4layer(values: &mut [F128; 16], twiddles: &[F128; 15]) {
     #[inline(always)]

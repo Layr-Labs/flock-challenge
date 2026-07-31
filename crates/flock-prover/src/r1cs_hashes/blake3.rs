@@ -1608,6 +1608,10 @@ impl Blake3Setup {
             && self.pcs_params.profile == flock_core::pcs::ligerito::LigeritoProfile::Fast
             && self.pcs_params.merkle_hash == HashKind::Blake3
             && std::env::var_os("FLOCK_NO_HOT_CODEWORD").is_none()
+            // The message-direct commit supersedes pre-writing the replicas:
+            // when commit_into RS-encodes straight from z_packed, filling the
+            // codeword during witness generation is pure wasted bandwidth.
+            && !flock_core::pcs::commit_uses_message_direct_first_pass(&self.pcs_params)
     }
 
     /// Take the codeword before witness generation, then let row workers write
@@ -2613,8 +2617,9 @@ mod tests {
         let mut setup = Blake3Setup::new(RANKED_N_BLOCKS);
         setup.pcs_params.merkle_hash = HashKind::Blake3;
         assert!(
-            setup.use_ranked_rate2_hot_codeword(),
-            "canary must exercise the ranked hot-codeword gate"
+            flock_core::pcs::commit_uses_message_direct_first_pass(&setup.pcs_params)
+                || setup.use_ranked_rate2_hot_codeword(),
+            "canary must exercise a ranked codeword fast path"
         );
 
         // Match `benches/blake3_proof.rs`'s deterministic run-0 input exactly.
