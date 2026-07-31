@@ -450,6 +450,121 @@ impl AdditiveNttF128 {
             start_layer,
             10
         ));
+        // Radix-32+16 schedule: the nine ranked top layers in TWO full-buffer
+        // sweeps (fused-5 at layer 1, fused-4 at layer 6) instead of three
+        // fused-3 sweeps — one fewer 1 GiB read+write pass over the codeword.
+        // Identical butterflies/twiddles in the same per-group order (a zero
+        // twiddle makes `butterfly_q` exactly the XOR-only butterfly), so the
+        // output is bit-identical. Opt-in (`FLOCK_NTT_RADIX32=1`): measured
+        // +50-70 ms/pass slower than fused-3 on Apple hosts even with the
+        // staged low-pressure kernel — the 32 row streams alias into one L1
+        // set (the in-tree radix-16 objection, which extends to staging,
+        // since the LOADS carry the aliasing stride). Kept for the record.
+        #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+        if std::env::var_os("FLOCK_NTT_RADIX32").is_some_and(|v| v == "1") {
+            debug_assert_eq!(start_layer, 1);
+            // Pass 1: layers 1–5, radix-32. 2 outer blocks at layer 1.
+            {
+                let layer = 1usize;
+                let num_blocks = 1usize << layer;
+                let block_size = 1usize << (log_d - layer);
+                let thirtysecond = block_size >> 5;
+                let twiddles: Vec<[F128; 31]> = (0..num_blocks)
+                    .map(|b| {
+                        let mut tw = [F128 { lo: 0, hi: 0 }; 31];
+                        tw[0] = self.twiddle(layer, b);
+                        for s in 0..2 {
+                            tw[1 + s] = self.twiddle(layer + 1, 2 * b + s);
+                        }
+                        for s in 0..4 {
+                            tw[3 + s] = self.twiddle(layer + 2, 4 * b + s);
+                        }
+                        for s in 0..8 {
+                            tw[7 + s] = self.twiddle(layer + 3, 8 * b + s);
+                        }
+                        for s in 0..16 {
+                            tw[15 + s] = self.twiddle(layer + 4, 16 * b + s);
+                        }
+                        tw
+                    })
+                    .collect();
+                // 32 rows × num_ntts lanes per row index → 1 MiB tiles at the
+                // ranked shape with 32 row indices per claim.
+                const ROWS_PER_TILE_5: usize = 32;
+                let tiles_per_block = thirtysecond.div_ceil(ROWS_PER_TILE_5);
+                let block_elems = 32 * thirtysecond * num_ntts;
+                let base = crate::epool::SyncPtr(data.as_mut_ptr());
+                crate::epool::run_hetero_chunks(num_blocks * tiles_per_block, |job| {
+                    let block = job / tiles_per_block;
+                    let tile = job % tiles_per_block;
+                    let row_start = tile * ROWS_PER_TILE_5;
+                    let row_end = (row_start + ROWS_PER_TILE_5).min(thirtysecond);
+                    // SAFETY: each queue index owns one disjoint (block, row
+                    // tile); rows within a tile run serially and all derived
+                    // addresses are inside the validated block range.
+                    unsafe {
+                        let block_base = base.ptr().add(block * block_elems);
+                        for row in row_start..row_end {
+                            kernels::butterfly_fused_5layer_row(
+                                block_base,
+                                thirtysecond,
+                                num_ntts,
+                                row,
+                                &twiddles[block],
+                            );
+                        }
+                    }
+                });
+            }
+            // Pass 2: layers 6–9, radix-16. 64 outer blocks at layer 6.
+            {
+                let layer = 6usize;
+                let num_blocks = 1usize << layer;
+                let block_size = 1usize << (log_d - layer);
+                let sixteenth = block_size >> 4;
+                let twiddles: Vec<[F128; 15]> = (0..num_blocks)
+                    .map(|b| {
+                        let mut tw = [F128 { lo: 0, hi: 0 }; 15];
+                        tw[0] = self.twiddle(layer, b);
+                        for s in 0..2 {
+                            tw[1 + s] = self.twiddle(layer + 1, 2 * b + s);
+                        }
+                        for s in 0..4 {
+                            tw[3 + s] = self.twiddle(layer + 2, 4 * b + s);
+                        }
+                        for s in 0..8 {
+                            tw[7 + s] = self.twiddle(layer + 3, 8 * b + s);
+                        }
+                        tw
+                    })
+                    .collect();
+                // 16 rows per row index → 1 MiB tiles with 64 row indices.
+                const ROWS_PER_TILE_4: usize = 64;
+                let tiles_per_block = sixteenth.div_ceil(ROWS_PER_TILE_4);
+                let block_elems = 16 * sixteenth * num_ntts;
+                let base = crate::epool::SyncPtr(data.as_mut_ptr());
+                crate::epool::run_hetero_chunks(num_blocks * tiles_per_block, |job| {
+                    let block = job / tiles_per_block;
+                    let tile = job % tiles_per_block;
+                    let row_start = tile * ROWS_PER_TILE_4;
+                    let row_end = (row_start + ROWS_PER_TILE_4).min(sixteenth);
+                    // SAFETY: as the radix-32 pass above.
+                    unsafe {
+                        let block_base = base.ptr().add(block * block_elems);
+                        for row in row_start..row_end {
+                            kernels::butterfly_fused_4layer_row(
+                                block_base,
+                                sixteenth,
+                                num_ntts,
+                                row,
+                                &twiddles[block],
+                            );
+                        }
+                    }
+                });
+            }
+            return;
+        }
         #[cfg(any(
             all(target_arch = "aarch64", target_feature = "aes"),
             all(target_arch = "x86_64", target_feature = "pclmulqdq"),
@@ -463,6 +578,191 @@ impl AdditiveNttF128 {
             all(target_arch = "x86_64", target_feature = "pclmulqdq"),
         )))]
         unreachable!("ranked top split requires a hardware NTT target");
+    }
+
+    /// SLC-nested execution of the ranked layers 4–9 (see the call site in
+    /// the top-layer loop for the traffic argument). Per 64 MiB layer-4
+    /// block: its fused-3(4–6) row tiles drain through the P/E hetero
+    /// queue, then its eight 8 MiB layer-7 sub-blocks' fused-3(7–9) tiles
+    /// drain — reading data still resident in the system-level cache.
+    /// Blocks are serial; parallelism is within each ~64-claim region.
+    fn ranked_slc_nested_layers_4_through_9(
+        &self,
+        data: &mut [F128],
+        num_ntts: usize,
+        log_d: usize,
+    ) {
+        const ROWS_PER_TILE: usize = 128;
+        let block_twiddles = |layer: usize, block: usize| {
+            let mut tw = [F128 { lo: 0, hi: 0 }; 7];
+            tw[0] = self.twiddle(layer, block);
+            for s in 0..2 {
+                tw[1 + s] = self.twiddle(layer + 1, 2 * block + s);
+            }
+            for s in 0..4 {
+                tw[3 + s] = self.twiddle(layer + 2, 4 * block + s);
+            }
+            tw
+        };
+
+        let bs4 = 1usize << (log_d - 4);
+        let e4 = bs4 >> 3;
+        let be4 = bs4 * num_ntts;
+        let bs7 = 1usize << (log_d - 7);
+        let e7 = bs7 >> 3;
+        let be7 = bs7 * num_ntts;
+        let tiles4 = e4.div_ceil(ROWS_PER_TILE);
+        let tiles7 = e7.div_ceil(ROWS_PER_TILE);
+
+        let base = crate::epool::SyncPtr(data.as_mut_ptr());
+        for b4 in 0..(1usize << 4) {
+            let tw4 = block_twiddles(4, b4);
+            // Layers 4–6 over this 64 MiB block.
+            crate::epool::run_hetero_chunks(tiles4, |tile| {
+                let row_start = tile * ROWS_PER_TILE;
+                let row_end = (row_start + ROWS_PER_TILE).min(e4);
+                // SAFETY: each queue index owns one disjoint row tile of
+                // block `b4`; the outer block loop is serial, so no other
+                // region touches this block concurrently.
+                unsafe {
+                    let block_base = base.ptr().add(b4 * be4);
+                    for row in row_start..row_end {
+                        if b4 == 0 {
+                            kernels::butterfly_fused_3layer_zero_root_row(
+                                block_base, e4, num_ntts, row, &tw4,
+                            );
+                        } else {
+                            kernels::butterfly_fused_3layer_row(
+                                block_base, e4, num_ntts, row, &tw4,
+                            );
+                        }
+                    }
+                }
+            });
+            // Layers 7–9 over the eight sub-blocks just written (SLC-hot).
+            let tw7: Vec<[F128; 7]> = (0..8).map(|s| block_twiddles(7, 8 * b4 + s)).collect();
+            crate::epool::run_hetero_chunks(8 * tiles7, |job| {
+                let sub = job / tiles7;
+                let tile = job % tiles7;
+                let row_start = tile * ROWS_PER_TILE;
+                let row_end = (row_start + ROWS_PER_TILE).min(e7);
+                let b7 = 8 * b4 + sub;
+                // SAFETY: as above; sub-blocks are disjoint slices of the
+                // serialized outer block.
+                unsafe {
+                    let block_base = base.ptr().add(b7 * be7);
+                    for row in row_start..row_end {
+                        if b7 == 0 {
+                            kernels::butterfly_fused_3layer_zero_root_row(
+                                block_base, e7, num_ntts, row, &tw7[sub],
+                            );
+                        } else {
+                            kernels::butterfly_fused_3layer_row(
+                                block_base, e7, num_ntts, row, &tw7[sub],
+                            );
+                        }
+                    }
+                }
+            });
+        }
+    }
+
+    /// Ranked top passes with the rate-1/2 replicate-fill fused into the
+    /// first pass: both layer-1 blocks' pre-state is the same message `msg`
+    /// (`replicate_message_fill` is exactly the pre-applied layer 0), so the
+    /// layer-1 fused-3 pass loads each radix-8 row group from `msg` once and
+    /// writes both blocks' results — the message is never materialized into
+    /// the codeword, deleting one full replica store from the producer and
+    /// halving this pass's loads. Layers 4 and 7 then run the exact in-place
+    /// hetero passes of [`Self::forward_transform_interleaved_ranked_top_from_layer`].
+    ///
+    /// Every codeword element is written by the layer-1 pass, so `data` may
+    /// hold arbitrary stale bytes on entry. Only the exact ranked L0 shape is
+    /// supported (asserted); callers outside it must replicate-fill and use
+    /// the ordinary transform.
+    pub(crate) fn forward_transform_interleaved_ranked_top_from_message(
+        &self,
+        msg: &[F128],
+        data: &mut [F128],
+        num_ntts: usize,
+        start_layer: usize,
+    ) {
+        let log_d = log2_pow2(data.len() / num_ntts);
+        assert!(use_ranked_deep_pair_fusion(log_d, num_ntts, start_layer, 10));
+        assert_eq!(start_layer, 1, "from-message fusion is a rate-1/2 layer-1 pass");
+        assert_eq!(data.len(), 2 * msg.len());
+
+        let n_top = 10usize;
+        let block_twiddles = |layer: usize, block: usize| {
+            let mut tw = [F128 { lo: 0, hi: 0 }; 7];
+            tw[0] = self.twiddle(layer, block);
+            for s in 0..2 {
+                tw[1 + s] = self.twiddle(layer + 1, 2 * block + s);
+            }
+            for s in 0..4 {
+                tw[3 + s] = self.twiddle(layer + 2, 4 * block + s);
+            }
+            tw
+        };
+
+        // Layer-1 fused-3 pass from the message: 2 blocks, identical input.
+        {
+            let block_size = 1usize << (log_d - 1);
+            let eighth = block_size >> 3;
+            debug_assert_eq!(msg.len(), block_size * num_ntts);
+            let t_zero = block_twiddles(1, 0);
+            let t_gen = block_twiddles(1, 1);
+            debug_assert_eq!(t_zero[0], F128::ZERO);
+            debug_assert_eq!(t_zero[1], F128::ZERO);
+            debug_assert_eq!(t_zero[3], F128::ZERO);
+
+            const ROWS_PER_TILE: usize = 128;
+            let tiles = eighth.div_ceil(ROWS_PER_TILE);
+            let block_elems = 8 * eighth * num_ntts;
+            let src = msg.as_ptr() as usize;
+            let dst = crate::epool::SyncPtr(data.as_mut_ptr());
+            crate::epool::run_hetero_chunks(tiles, |tile| {
+                let row_start = tile * ROWS_PER_TILE;
+                let row_end = (row_start + ROWS_PER_TILE).min(eighth);
+                let dst0 = dst.ptr();
+                // SAFETY: each queue index owns one disjoint row tile; the
+                // two destination blocks are disjoint halves of `data`, and
+                // every derived address is inside the validated geometry.
+                // `msg` is only read.
+                unsafe {
+                    let dst1 = dst0.add(block_elems);
+                    for row in row_start..row_end {
+                        kernels::butterfly_fused_3layer_dual_from_src_row(
+                            src as *const F128,
+                            dst0,
+                            dst1,
+                            eighth,
+                            num_ntts,
+                            row,
+                            &t_zero,
+                            &t_gen,
+                        );
+                    }
+                }
+            });
+        }
+
+        // Layers 4 and 7: exact in-place ranked hetero passes.
+        for layer in [4usize, 7] {
+            let num_blocks = 1usize << layer;
+            let block_size = 1usize << (log_d - layer);
+            let eighth = block_size >> 3;
+            debug_assert!(is_ranked_top_hetero_fused3_pass(
+                log_d,
+                num_ntts,
+                start_layer,
+                n_top,
+                layer
+            ));
+            let twiddles: Vec<[F128; 7]> =
+                (0..num_blocks).map(|b| block_twiddles(layer, b)).collect();
+            butterfly_interleaved_fused_3layer_all_blocks_hetero(data, &twiddles, eighth, num_ntts);
+        }
     }
 
     /// Finish the ranked L0 transform's five cache-local deep pairs and invoke
@@ -679,6 +979,27 @@ impl AdditiveNttF128 {
         let zero_root_fused3 = use_ranked_zero_root_fusion(log_d, num_ntts, start_layer, n_top);
         let mut layer = start_layer.min(n_top);
         while layer < n_top {
+            // SLC-nested schedule for the ranked layers 4–9: the layer-4
+            // blocks are 64 MiB and the layer-7 blocks 8 MiB, against the
+            // M3 Max's ~48 MiB system-level cache. Running each layer-4
+            // block's fused-3(4–6) pass and then IMMEDIATELY its eight
+            // fused-3(7–9) sub-blocks makes the second pass read lines that
+            // are still SLC-resident from the first pass's writeback path —
+            // deleting most of one full 1 GiB DRAM read. Same kernels, same
+            // twiddles, same per-row order → bit-identical; only the block
+            // traversal order changes. `FLOCK_NO_NTT_SLC_NEST=1` restores
+            // the pass-serial schedule as the same-binary control.
+            if layer == 4
+                && zero_root_fused3
+                && is_ranked_top_hetero_fused3_pass(log_d, num_ntts, start_layer, n_top, 4)
+                && std::env::var_os("FLOCK_NO_NTT_TOP_EPOOL").is_none()
+                && std::env::var_os("FLOCK_NTT_BLOCK_REGIONS").is_none()
+                && std::env::var_os("FLOCK_NO_NTT_SLC_NEST").is_none()
+            {
+                self.ranked_slc_nested_layers_4_through_9(data, num_ntts, log_d);
+                layer += 6;
+                continue;
+            }
             let num_blocks = 1usize << layer;
             let block_size = 1usize << (log_d - layer);
             let block_bytes = block_size * num_ntts;

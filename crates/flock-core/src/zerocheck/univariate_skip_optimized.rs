@@ -69,6 +69,11 @@ use kernels::x86_64::shift_reduce_inner_ab_x86_sse;
 // Protocol constants — fixed by the optimization design.
 // ---------------------------------------------------------------------------
 
+/// GPU∥CPU split of the round-1 x_hi loop (runtime-dlopen'd Metal; bit-exact
+/// scalar-oracle semantics; falls back to CPU on any failure).
+#[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+mod gpu_split;
+
 /// Number of variables folded in round 1 for the shift_reduce variant.
 pub const K_SKIP: usize = 6;
 const ELL: usize = 64;
@@ -1021,40 +1026,110 @@ pub fn round1_shift_reduce_extract_c_packed_padded_with_s_hat_v(
 
     let (within_outer_mask, b_med_counts) = build_b_med_counts(padding);
 
-    let (res_ab, res_c_s_0, res_c_s_1) = (0..hi_size)
-        .into_par_iter()
-        .fold(WorkerStateWithSHatV::new, |mut state, x_hi| {
-            let eq_hi_val = eq_hi[x_hi];
-            process_one_x_hi_with_s_hat_v(
-                x_hi,
-                big_lo_size,
-                n_lo_and_inner,
-                within_outer_mask,
-                &b_med_counts,
-                a_packed,
-                b_packed,
-                c_packed,
-                inv_table,
-                &eq_lo_scaled,
-                eq_hi_val,
-                convert,
-                paired_c,
-                &mut state,
-            );
-            state
-        })
-        .map(|s| (s.local_res_ab, s.local_res_c_s_0, s.local_res_c_s_1))
-        .reduce(
-            || ([F128::ZERO; ELL], [F128::ZERO; ELL], [F128::ZERO; ELL]),
-            |(mut ab1, mut c0_1, mut c1_1), (ab2, c0_2, c1_2)| {
+    // GPU∥CPU split: submit a trailing x_hi range to the GPU asynchronously,
+    // process the rest on the CPU pool, then merge. F128 addition is XOR, so
+    // the partition is bit-identical to the all-CPU computation. `None`
+    // (no GPU / setup failure / range too small) means the CPU runs 0..hi_size
+    // exactly as before.
+    #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+    let gpu_job = {
+        let inv_bytes = unsafe {
+            core::slice::from_raw_parts(inv_table.data_ptr(), 256 * (1usize << k_skip))
+        };
+        gpu_split::Round1GpuJob::submit(
+            a_packed,
+            b_packed,
+            c_packed,
+            inv_bytes,
+            convert,
+            &eq_lo_scaled,
+            &b_med_counts,
+            within_outer_mask,
+            hi_size,
+            eq.n_lo,
+            n_lo_and_inner,
+            N_INNER,
+            N_CHUNKS,
+        )
+    };
+    #[cfg(not(all(target_arch = "aarch64", target_os = "macos")))]
+    let gpu_job: Option<core::convert::Infallible> = None;
+
+    let cpu_hi_end = match &gpu_job {
+        Some(job) => {
+            #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+            {
+                job.gpu_hi_start
+            }
+            #[cfg(not(all(target_arch = "aarch64", target_os = "macos")))]
+            {
+                match *job {}
+            }
+        }
+        None => hi_size,
+    };
+
+    let run_cpu_range = |range: std::ops::Range<usize>| {
+        range
+            .into_par_iter()
+            .fold(WorkerStateWithSHatV::new, |mut state, x_hi| {
+                let eq_hi_val = eq_hi[x_hi];
+                process_one_x_hi_with_s_hat_v(
+                    x_hi,
+                    big_lo_size,
+                    n_lo_and_inner,
+                    within_outer_mask,
+                    &b_med_counts,
+                    a_packed,
+                    b_packed,
+                    c_packed,
+                    inv_table,
+                    &eq_lo_scaled,
+                    eq_hi_val,
+                    convert,
+                    paired_c,
+                    &mut state,
+                );
+                state
+            })
+            .map(|s| (s.local_res_ab, s.local_res_c_s_0, s.local_res_c_s_1))
+            .reduce(
+                || ([F128::ZERO; ELL], [F128::ZERO; ELL], [F128::ZERO; ELL]),
+                |(mut ab1, mut c0_1, mut c1_1), (ab2, c0_2, c1_2)| {
+                    for i in 0..ELL {
+                        ab1[i] += ab2[i];
+                        c0_1[i] += c0_2[i];
+                        c1_1[i] += c1_2[i];
+                    }
+                    (ab1, c0_1, c1_1)
+                },
+            )
+    };
+
+    let (mut res_ab, mut res_c_s_0, mut res_c_s_1) = run_cpu_range(0..cpu_hi_end);
+
+    #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+    if let Some(job) = gpu_job {
+        let gpu_hi_start = job.gpu_hi_start;
+        match job.finish(eq_hi) {
+            Some((gab, gc0, gc1)) => {
                 for i in 0..ELL {
-                    ab1[i] += ab2[i];
-                    c0_1[i] += c0_2[i];
-                    c1_1[i] += c1_2[i];
+                    res_ab[i] += gab[i];
+                    res_c_s_0[i] += gc0[i];
+                    res_c_s_1[i] += gc1[i];
                 }
-                (ab1, c0_1, c1_1)
-            },
-        );
+            }
+            None => {
+                // GPU fault: recompute its range on the CPU. Costs time only.
+                let (fab, fc0, fc1) = run_cpu_range(gpu_hi_start..hi_size);
+                for i in 0..ELL {
+                    res_ab[i] += fab[i];
+                    res_c_s_0[i] += fc0[i];
+                    res_c_s_1[i] += fc1[i];
+                }
+            }
+        }
+    }
 
     // Wire output: bank_0 + bank_1 reconstructs the original `res_c_s` (by
     // F_2-linearity of φ_8 over the masked-byte sum).
@@ -1116,53 +1191,120 @@ pub fn round1_shift_reduce_extract_c_packed_padded_with_precomputed_ab(
     let (within_outer_mask, b_med_counts) = build_b_med_counts(padding);
     let ab_inner_bytes = ab_inner.as_bytes();
 
+    // GPU∥CPU split (see `gpu_split`): a trailing `x_hi` range computes on
+    // the GPU at the self-calibrated share while the CPU drains the rest.
+    // F128 addition is XOR, so any split point is bit-identical to the
+    // all-CPU computation; `None` (no GPU / calibrated off / setup failure)
+    // means the CPU runs `0..hi_size` exactly as before.
+    #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+    let gpu_job = gpu_split::Round1PreGpuJob::submit(
+        ab_inner_bytes,
+        c_packed,
+        convert,
+        &eq_lo_scaled,
+        &b_med_counts,
+        within_outer_mask,
+        hi_size,
+        eq.n_lo,
+        n_lo_and_inner,
+        N_INNER,
+        N_CHUNKS,
+    );
+    #[cfg(not(all(target_arch = "aarch64", target_os = "macos")))]
+    let gpu_job: Option<core::convert::Infallible> = None;
+
+    let cpu_hi_end = match &gpu_job {
+        Some(job) => {
+            #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+            {
+                job.gpu_hi_start
+            }
+            #[cfg(not(all(target_arch = "aarch64", target_os = "macos")))]
+            {
+                match *job {}
+            }
+        }
+        None => hi_size,
+    };
+
     // The challenge-independent AB transform finishes while the commitment is
     // still running. Its challenge-weighted completion is therefore a live
     // prover phase, and each x_hi is independent. Drain those chunks through
     // the shared P/E-core queue without changing the hot conversion kernel.
     // A fixed per-index partial keeps the nondeterministic claim order out of
     // the output; the final operation is XOR, so serial reduction is exact.
-    let mut partials: Vec<([F128; ELL], [F128; ELL], [F128; ELL])> =
-        vec![([F128::ZERO; ELL], [F128::ZERO; ELL], [F128::ZERO; ELL],); hi_size];
-    let partials_base = crate::epool::SyncPtr(partials.as_mut_ptr());
-    crate::epool::run_hetero_chunks(hi_size, |x_hi| {
-        let mut state = WorkerStateWithSHatV::new();
-        process_one_x_hi_with_precomputed_ab(
-            x_hi,
-            big_lo_size,
-            n_lo_and_inner,
-            within_outer_mask,
-            &b_med_counts,
-            ab_inner_bytes,
-            c_packed,
-            &eq_lo_scaled,
-            eq_hi[x_hi],
-            convert,
-            paired_c,
-            &mut state,
-        );
-        // SAFETY: the queue hands out each x_hi exactly once, so this task is
-        // the exclusive owner of partials[x_hi]. The queue's completion join
-        // publishes every write before the reduction below reads the vector.
-        unsafe {
-            *partials_base.ptr().add(x_hi) = (
-                state.local_res_ab,
-                state.local_res_c_s_0,
-                state.local_res_c_s_1,
+    let run_cpu_range = |start: usize, count: usize| {
+        let mut partials: Vec<([F128; ELL], [F128; ELL], [F128; ELL])> =
+            vec![([F128::ZERO; ELL], [F128::ZERO; ELL], [F128::ZERO; ELL],); count];
+        let partials_base = crate::epool::SyncPtr(partials.as_mut_ptr());
+        crate::epool::run_hetero_chunks(count, |i| {
+            let x_hi = start + i;
+            let mut state = WorkerStateWithSHatV::new();
+            process_one_x_hi_with_precomputed_ab(
+                x_hi,
+                big_lo_size,
+                n_lo_and_inner,
+                within_outer_mask,
+                &b_med_counts,
+                ab_inner_bytes,
+                c_packed,
+                &eq_lo_scaled,
+                eq_hi[x_hi],
+                convert,
+                paired_c,
+                &mut state,
             );
-        }
-    });
-    let (res_ab, res_c_s_0, res_c_s_1) = partials.into_iter().fold(
-        ([F128::ZERO; ELL], [F128::ZERO; ELL], [F128::ZERO; ELL]),
-        |(mut ab1, mut c0_1, mut c1_1), (ab2, c0_2, c1_2)| {
-            for i in 0..ELL {
-                ab1[i] += ab2[i];
-                c0_1[i] += c0_2[i];
-                c1_1[i] += c1_2[i];
+            // SAFETY: the queue hands out each i exactly once, so this task
+            // is the exclusive owner of partials[i]. The queue's completion
+            // join publishes every write before the reduction below reads
+            // the vector.
+            unsafe {
+                *partials_base.ptr().add(i) = (
+                    state.local_res_ab,
+                    state.local_res_c_s_0,
+                    state.local_res_c_s_1,
+                );
             }
-            (ab1, c0_1, c1_1)
-        },
-    );
+        });
+        partials.into_iter().fold(
+            ([F128::ZERO; ELL], [F128::ZERO; ELL], [F128::ZERO; ELL]),
+            |(mut ab1, mut c0_1, mut c1_1), (ab2, c0_2, c1_2)| {
+                for i in 0..ELL {
+                    ab1[i] += ab2[i];
+                    c0_1[i] += c0_2[i];
+                    c1_1[i] += c1_2[i];
+                }
+                (ab1, c0_1, c1_1)
+            },
+        )
+    };
+
+    let t_cpu = std::time::Instant::now();
+    let (mut res_ab, mut res_c_s_0, mut res_c_s_1) = run_cpu_range(0, cpu_hi_end);
+    let cpu_secs = t_cpu.elapsed().as_secs_f64();
+
+    #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+    if let Some(job) = gpu_job {
+        let gpu_hi_start = job.gpu_hi_start;
+        match job.finish(eq_hi, cpu_hi_end, cpu_secs) {
+            Some((gab, gc0, gc1)) => {
+                for i in 0..ELL {
+                    res_ab[i] += gab[i];
+                    res_c_s_0[i] += gc0[i];
+                    res_c_s_1[i] += gc1[i];
+                }
+            }
+            None => {
+                // GPU fault: recompute its range on the CPU. Costs time only.
+                let (fab, fc0, fc1) = run_cpu_range(gpu_hi_start, hi_size - gpu_hi_start);
+                for i in 0..ELL {
+                    res_ab[i] += fab[i];
+                    res_c_s_0[i] += fc0[i];
+                    res_c_s_1[i] += fc1[i];
+                }
+            }
+        }
+    }
 
     let mut res_c_s_combined = [F128::ZERO; ELL];
     for i in 0..ELL {
@@ -1328,6 +1470,12 @@ mod tests {
         }
         fn f128_vec(&mut self, n: usize) -> Vec<F128> {
             (0..n).map(|_| self.f128()).collect()
+        }
+        fn fill_bytes(&mut self, buf: &mut [u8]) {
+            for chunk in buf.chunks_mut(8) {
+                let v = self.next_u64().to_le_bytes();
+                chunk.copy_from_slice(&v[..chunk.len()]);
+            }
         }
     }
 
@@ -1914,6 +2062,63 @@ mod tests {
 
             assert_eq!(got, expected, "split round-1 mismatch at m={m}");
         }
+    }
+
+    /// Bit-gate for the precomputed-AB GPU split at a proof-sized shape
+    /// (m=27 → 16 MiB packed buffers, page-aligned/page-multiple so the
+    /// zero-copy Metal wrap engages). Compares the GPU∥CPU merged output
+    /// against the forced all-CPU output — they must be byte-identical.
+    /// `#[ignore]`d: needs an Apple-GPU host and ~seconds of runtime; run
+    /// with `cargo test --release -- --ignored gpu_pre_split`.
+    #[test]
+    #[ignore]
+    #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+    fn gpu_pre_split_bit_exact_m27() {
+        let m = 27usize;
+        let mut rng = Rng::new(0x6970_5E27);
+        let total_bytes = (1usize << m) / 8;
+        // SAFETY: single-threaded test setup; no other thread reads env here.
+        unsafe { std::env::set_var("FLOCK_GPU_URM", "1") };
+        let mut a = vec![0u8; total_bytes];
+        let mut b = vec![0u8; total_bytes];
+        let mut c = vec![0u8; total_bytes];
+        rng.fill_bytes(&mut a);
+        rng.fill_bytes(&mut b);
+        rng.fill_bytes(&mut c);
+        let outer = rng.f128_vec(m - K_SKIP - N_INNER);
+        let r = build_protocol_r(m, &outer);
+        let inv_table = make_inv_table();
+        let padding = PaddingSpec::dense(m);
+        let precomputed =
+            precompute_round1_ab_inner_packed_padded(&a, &b, m, K_SKIP, &inv_table, &padding);
+
+        // SAFETY: single-threaded test setup; no other thread reads env here.
+        unsafe { std::env::set_var("FLOCK_GPU_URM_PCT", "0") };
+        let cpu_only = round1_shift_reduce_extract_c_packed_padded_with_precomputed_ab(
+            &precomputed,
+            &c,
+            m,
+            K_SKIP,
+            &r,
+            &inv_table,
+            &padding,
+        );
+        for pct in ["17", "45"] {
+            // SAFETY: as above.
+            unsafe { std::env::set_var("FLOCK_GPU_URM_PCT", pct) };
+            let split = round1_shift_reduce_extract_c_packed_padded_with_precomputed_ab(
+                &precomputed,
+                &c,
+                m,
+                K_SKIP,
+                &r,
+                &inv_table,
+                &padding,
+            );
+            assert_eq!(split, cpu_only, "GPU pre-split mismatch at pct={pct}");
+        }
+        // SAFETY: as above.
+        unsafe { std::env::remove_var("FLOCK_GPU_URM_PCT") };
     }
 
     /// Scalar oracle for the convert-table fold, written independently of the

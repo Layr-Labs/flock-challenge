@@ -222,13 +222,56 @@ pub fn commit_into(
 
     // RS encoding of [z, 0, …, 0] starts with `log_inv_rate` butterfly layers
     // whose bottom inputs are all zero — each is a pure copy, so after those
-    // layers the buffer holds 2^log_inv_rate replicas of z. Write that state
-    // directly (replicating z costs the same writes as the zero-fill it
-    // replaces) and start the NTT at layer `log_inv_rate`, skipping those
-    // layers' full-buffer reads and multiplies.
+    // layers the buffer holds 2^log_inv_rate replicas of z.
+    //
+    // Ranked rate-1/2 shape: don't materialize the replicas at all — the
+    // layer-1 fused-3 pass reads `z_packed` once and writes both blocks
+    // directly (see `forward_transform_interleaved_ranked_top_from_message`),
+    // deleting one full replica store here and halving that pass's loads.
+    // Every other shape writes the replica state and starts the NTT at layer
+    // `log_inv_rate` exactly as before.
+    if ranked_from_message_supported(params, &codeword, z_packed) {
+        return finalize_commit_impl(codeword, params, Some(z_packed));
+    }
     replicate_message_fill(&mut codeword, z_packed);
 
     finalize_commit(codeword, params)
+}
+
+/// Whether the ranked rate-1/2 commit will fuse the replicate-fill into the
+/// first NTT top pass (see
+/// `forward_transform_interleaved_ranked_top_from_message`). Mirrors every
+/// condition under which `finalize_commit` actually reaches the split ranked
+/// top; witness producers use this to decide whether writing the replica
+/// state themselves is still worthwhile.
+///
+/// The first cut of the dual kernel measured −4% at ranked (submission
+/// `cbcedbc7`): its stores interleaved sixteen cold streams 64 KiB apart,
+/// defeating the streaming-store detector and paying read-for-ownership
+/// on the ~1 GiB destination — while the replicate fill it deleted had
+/// been RFO-elided sequential streams. The kernel now stages each row
+/// group in L1 and flushes sequential per-row runs, restoring elided
+/// stores on both destinations. `FLOCK_NO_NTT_FROM_MSG=1` restores the
+/// hot-codeword replicate path as the same-binary A/B control.
+pub fn use_ranked_from_message_commit(params: &PcsParams) -> bool {
+    std::env::var_os("FLOCK_NTT_FROM_MSG").is_some_and(|v| v == "1")
+        && use_ranked_ntt_merkle_leaf_pipeline(params)
+        && crate::epool::epool().is_some()
+        && rayon::current_num_threads() > 1
+        && params.log_inv_rate == 1
+        && std::env::var_os("FLOCK_NO_NTT_TOP_EPOOL").is_none()
+        && std::env::var_os("FLOCK_NTT_BLOCK_REGIONS").is_none()
+        && std::env::var_os("FLOCK_GPU_LEAFSTREAM").is_none()
+}
+
+/// [`use_ranked_from_message_commit`] plus the buffer-geometry check
+/// [`commit_into`] needs before taking the fused path.
+fn ranked_from_message_supported(
+    params: &PcsParams,
+    codeword: &[F128],
+    z_packed: &[F128],
+) -> bool {
+    use_ranked_from_message_commit(params) && codeword.len() == 2 * z_packed.len()
 }
 
 /// Commit from a codeword whose first `log_inv_rate` trivial NTT layers have
@@ -322,6 +365,7 @@ fn ranked_ntt_with_pipelined_leaves(
     params: &PcsParams,
     leaves: &mut [Hash],
     helper: &rayon::ThreadPool,
+    from_message: Option<&[F128]>,
 ) {
     use rayon::prelude::*;
     use std::sync::Mutex;
@@ -356,6 +400,57 @@ fn ranked_ntt_with_pipelined_leaves(
         }
     };
 
+    // GPU leaf stream — measured SLOWER than the E-core pipeline at the
+    // ranked shape (per-command-buffer overhead on 1024-leaf jobs, plus the
+    // E-cores it idles already hide this hashing behind the NTT), so it is
+    // opt-in for experiments only and never fires in the ranked worker's
+    // cleared environment.
+    #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+    if std::env::var_os("FLOCK_GPU_LEAFSTREAM").is_some_and(|v| v == "1") {
+        // The stream path drives the unsplit transform, which expects the
+        // replica state in place. `ranked_from_message_supported` excludes
+        // this env, so `from_message` is normally `None` here; materialize
+        // defensively if a future caller combines them.
+        if let Some(msg) = from_message {
+            replicate_message_fill(codeword, msg);
+        }
+        let codeword_bytes_len = codeword.len() * core::mem::size_of::<F128>();
+        if let Some(stream) = merkle::GpuLeafStream::new(
+            codeword_base.ptr() as *const u8,
+            codeword_bytes_len,
+            leaves_base.ptr(),
+            leaves.len(),
+        ) {
+            let n_leaves_total = leaves.len();
+            ntt.forward_transform_interleaved_from_layer_and_then(
+                codeword,
+                num_ntts,
+                params.log_inv_rate,
+                |elem_offset, chunk| {
+                    debug_assert_eq!(elem_offset % num_ntts, 0);
+                    debug_assert_eq!(chunk.len() % num_ntts, 0);
+                    stream.submit(elem_offset / num_ntts, chunk.len() / num_ntts);
+                },
+            );
+            if stream.finish() {
+                return;
+            }
+            // Safety net: unspecified leaf contents after a GPU fault —
+            // rehash every leaf from the (final, immutable) codeword.
+            let leaves = unsafe {
+                core::slice::from_raw_parts_mut(leaves_base.ptr(), n_leaves_total)
+            };
+            let codeword_bytes = unsafe {
+                core::slice::from_raw_parts(codeword_base.ptr() as *const u8, codeword_bytes_len)
+            };
+            leaves
+                .par_chunks_mut(1024)
+                .zip(codeword_bytes.par_chunks(1024 * 1024))
+                .for_each(|(outs, bytes)| merkle::hash_ranked_blake3_leaf_chunk(bytes, outs));
+            return;
+        }
+    }
+
     // Two queued subtrees per helper keep all four E-cores fed while bounding
     // not-yet-hashed input to 8 MiB on the ranked 4-E-core host.
     let queue_capacity = (2 * helper.current_num_threads()).max(1);
@@ -371,11 +466,23 @@ fn ranked_ntt_with_pipelined_leaves(
         && std::env::var_os("FLOCK_NO_NTT_TOP_EPOOL").is_none()
         && std::env::var_os("FLOCK_NTT_BLOCK_REGIONS").is_none();
     if split_ranked_top {
-        ntt.forward_transform_interleaved_ranked_top_from_layer(
-            codeword,
-            num_ntts,
-            params.log_inv_rate,
-        );
+        match from_message {
+            Some(msg) => ntt.forward_transform_interleaved_ranked_top_from_message(
+                msg,
+                codeword,
+                num_ntts,
+                params.log_inv_rate,
+            ),
+            None => ntt.forward_transform_interleaved_ranked_top_from_layer(
+                codeword,
+                num_ntts,
+                params.log_inv_rate,
+            ),
+        }
+    } else if let Some(msg) = from_message {
+        // Gate mismatch fallback: materialize the replica state the ordinary
+        // way; the unsplit transform below starts at `log_inv_rate`.
+        replicate_message_fill(codeword, msg);
     }
 
     std::thread::scope(|scope| {
@@ -437,7 +544,20 @@ fn ranked_ntt_with_pipelined_leaves(
 
 /// Shared tail of [`commit`] / [`commit_into`]: interleaved forward additive
 /// NTT (RS-encode every lane) then the initial Merkle tree over codeword rows.
-fn finalize_commit(mut codeword: Vec<F128>, params: &PcsParams) -> (Commitment, ProverData) {
+fn finalize_commit(codeword: Vec<F128>, params: &PcsParams) -> (Commitment, ProverData) {
+    finalize_commit_impl(codeword, params, None)
+}
+
+/// [`finalize_commit`] with an optional unmaterialized rate-1/2 message: when
+/// `from_message` is `Some(z)`, `codeword` holds arbitrary stale bytes and
+/// the ranked split top pass synthesizes both replicas from `z` directly
+/// (gate: [`ranked_from_message_supported`]). Paths that cannot fuse fall
+/// back to an explicit [`replicate_message_fill`] first.
+fn finalize_commit_impl(
+    mut codeword: Vec<F128>,
+    params: &PcsParams,
+    from_message: Option<&[F128]>,
+) -> (Commitment, ProverData) {
     let helper = if use_ranked_ntt_merkle_leaf_pipeline(params) && rayon::current_num_threads() > 1
     {
         crate::epool::epool()
@@ -468,8 +588,14 @@ fn finalize_commit(mut codeword: Vec<F128>, params: &PcsParams) -> (Commitment, 
             params,
             &mut tree[..params.n_leaves()],
             helper,
+            from_message,
         );
     } else {
+        // No pipeline → no split ranked top; materialize the replicas the
+        // ordinary way before the full transform.
+        if let Some(msg) = from_message {
+            replicate_message_fill(&mut codeword, msg);
+        }
         ntt.forward_transform_interleaved_from_layer(
             &mut codeword,
             params.num_ntts(),
@@ -742,6 +868,7 @@ mod tests {
             &params,
             &mut got_tree[..params.n_leaves()],
             &helper,
+            None,
         );
         let got_tree = merkle::merkle_tree_from_prehashed_leaves(
             got_tree,

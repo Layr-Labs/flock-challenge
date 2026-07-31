@@ -134,6 +134,15 @@ pub(super) unsafe fn butterfly_fused_4layer_row(
         x86_64::butterfly_fused_4layer_row(ptr, sixteenth, num_ntts, r, twiddles);
     }
 
+    #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+    // SAFETY: forwarded caller contract; the cfg gate supplies `aes`.
+    unsafe {
+        if vector_resident_rows() {
+            aarch64::butterfly_fused_4layer_row(ptr, sixteenth, num_ntts, r, twiddles);
+            return;
+        }
+    }
+
     #[cfg(not(all(
         target_arch = "x86_64",
         target_feature = "avx512f",
@@ -142,6 +151,35 @@ pub(super) unsafe fn butterfly_fused_4layer_row(
     // SAFETY: forwarded caller contract.
     unsafe {
         portable::butterfly_fused_4layer_row(ptr, sixteenth, num_ntts, r, twiddles);
+    }
+}
+
+/// Process one fused-five-layer (radix-32) row group across every
+/// interleaved NTT lane.
+///
+/// # Safety
+/// The caller must ensure the 32 row slices selected by `r` are valid and
+/// disjoint from any row group being processed concurrently.
+#[inline]
+pub(super) unsafe fn butterfly_fused_5layer_row(
+    ptr: *mut F128,
+    thirtysecond: usize,
+    num_ntts: usize,
+    r: usize,
+    twiddles: &[F128; 31],
+) {
+    #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+    // SAFETY: forwarded caller contract; the cfg gate supplies `aes`.
+    unsafe {
+        if vector_resident_rows() {
+            aarch64::butterfly_fused_5layer_row(ptr, thirtysecond, num_ntts, r, twiddles);
+            return;
+        }
+    }
+
+    // SAFETY: forwarded caller contract.
+    unsafe {
+        portable::butterfly_fused_5layer_row(ptr, thirtysecond, num_ntts, r, twiddles);
     }
 }
 
@@ -212,6 +250,44 @@ pub(super) unsafe fn butterfly_fused_3layer_zero_root_row(
     // SAFETY: forwarded caller contract.
     unsafe {
         portable::butterfly_fused_3layer_zero_root_row(ptr, eighth, num_ntts, r, twiddles);
+    }
+}
+
+/// Rate-1/2 first-pass row kernel: one load of the radix-8 row group from
+/// `src`, two fused-3 evaluations — zero-root set to `dst0`, general set to
+/// `dst1`. See the portable form for the full contract.
+///
+/// # Safety
+/// Row/lane geometry valid for all three pointers, disjoint row groups
+/// across concurrent calls, and `t_zero[0] == t_zero[1] == t_zero[3] == 0`.
+#[inline]
+#[allow(clippy::too_many_arguments)]
+pub(super) unsafe fn butterfly_fused_3layer_dual_from_src_row(
+    src: *const F128,
+    dst0: *mut F128,
+    dst1: *mut F128,
+    eighth: usize,
+    num_ntts: usize,
+    r: usize,
+    t_zero: &[F128; 7],
+    t_gen: &[F128; 7],
+) {
+    #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+    // SAFETY: forwarded caller contract; the cfg gate supplies `aes`.
+    unsafe {
+        if vector_resident_rows() {
+            aarch64::butterfly_fused_3layer_dual_from_src_row(
+                src, dst0, dst1, eighth, num_ntts, r, t_zero, t_gen,
+            );
+            return;
+        }
+    }
+
+    // SAFETY: forwarded caller contract.
+    unsafe {
+        portable::butterfly_fused_3layer_dual_from_src_row(
+            src, dst0, dst1, eighth, num_ntts, r, t_zero, t_gen,
+        );
     }
 }
 
