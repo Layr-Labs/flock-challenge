@@ -64,13 +64,21 @@ pub(super) fn shift_reduce_inner_ab(
     #[cfg(target_arch = "aarch64")]
     {
         let _ = (a_col, b_col);
-        aarch64::shift_reduce_inner_ab_fused_neon(
+        // EXPERIMENT (seam-urm): V1 = ntt(all-ones), protocol-fixed.
+        static V1: std::sync::OnceLock<[u8; 64]> = std::sync::OnceLock::new();
+        let v1 = V1.get_or_init(|| {
+            let mut f = [F8::ZERO; 64];
+            inv_table.apply(&[0xffu8; 8], &mut f);
+            core::array::from_fn(|i| f[i].0)
+        });
+        aarch64::shift_reduce_inner_ab_fused_neon_checked(
             a_packed,
             b_packed,
             inv_table,
             chunk_byte_base,
             b_med,
             out,
+            v1,
         );
     }
 

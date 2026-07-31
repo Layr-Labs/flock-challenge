@@ -2760,11 +2760,16 @@ pub fn prove_batched_padded_with_precomputed<Ch: Challenger>(
         && !has_quad[1]
         && std::env::var_os("FLOCK_NO_OPEN_DEFERRED_C").is_none();
 
-    let results: Vec<(RingSwitchProof, RingSwitchBatchOutput)> = work
-        .into_iter()
-        .zip(gammas_rs.iter())
-        .enumerate()
-        .map(|(i, (w, &g))| {
+    // Per-opening tails are independent once every γ_rs is sampled (the
+    // transcript work above is complete), so run the two openings' table and
+    // split builds in parallel instead of serially at ~2 active threads.
+    // Indexed parallel collect preserves output order — bit-identical.
+    let results: Vec<(RingSwitchProof, RingSwitchBatchOutput)> = {
+        use rayon::prelude::*;
+        work.into_par_iter()
+            .zip(gammas_rs.par_iter())
+            .enumerate()
+            .map(|(i, (w, &g))| {
             let scaled_eq_r_dprime: Vec<F128> =
                 w.eq_r_dprime.iter().map(|value| g * *value).collect();
             let table = build_fold_byte_table(&scaled_eq_r_dprime);
@@ -2858,17 +2863,18 @@ pub fn prove_batched_padded_with_precomputed<Ch: Challenger>(
                     entries: fold_b128_elems_sparse_pairs(&sparse_supports[s], &scaled_eq_r_dprime),
                 },
             };
-            (
-                RingSwitchProof { s_hat_v: w.s_hat_v },
-                RingSwitchBatchOutput {
-                    rs_eq_ind,
-                    sumcheck_claim: w.sumcheck_claim,
-                    direct_fold2,
-                    deferred_c_fold2,
-                },
-            )
-        })
-        .collect();
+                (
+                    RingSwitchProof { s_hat_v: w.s_hat_v },
+                    RingSwitchBatchOutput {
+                        rs_eq_ind,
+                        sumcheck_claim: w.sumcheck_claim,
+                        direct_fold2,
+                        deferred_c_fold2,
+                    },
+                )
+            })
+            .collect()
+    };
 
     if trace {
         eprintln!(

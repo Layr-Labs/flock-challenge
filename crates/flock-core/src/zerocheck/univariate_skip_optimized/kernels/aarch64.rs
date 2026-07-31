@@ -910,3 +910,335 @@ pub(crate) fn shift_reduce_inner_ab_fused_neon(
         vst1q_u8(p.add(48), r3);
     }
 }
+
+// ---------------------------------------------------------------------------
+// EXPERIMENT (seam-urm): checked static-structure fast paths.
+//
+// BLAKE3 witness structure (measured on real witnesses, 4096 blocks):
+//  * b_med blocks 0 and 1 of every first 8192-bit window have B == all-ones
+//    for all 8 K rows (const-one wires of linear constraints)
+//  * the final processed b_med block of each witness block has B == 0 for
+//    K = 1..7 (structural zero padding rows)
+// Both are detected at runtime with 8 u64 loads + compares per 64-byte block
+// (vs 512 table loads), so the fast paths are witness-safe: any witness that
+// does not match takes the generic path.
+// ---------------------------------------------------------------------------
+
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn xor_apply_byte_into_4_regs<const BH: usize, const ODD: bool>(
+    table_base: *const u8,
+    half_swapped_table_base: *const u8,
+    a_byte: usize,
+    da0: &mut core::arch::aarch64::uint8x16_t,
+    da1: &mut core::arch::aarch64::uint8x16_t,
+    da2: &mut core::arch::aarch64::uint8x16_t,
+    da3: &mut core::arch::aarch64::uint8x16_t,
+) {
+    use core::arch::aarch64::*;
+    unsafe {
+        let t = if ODD {
+            half_swapped_table_base
+        } else {
+            table_base
+        };
+        let ra = t.add(a_byte * 64);
+        *da0 = veorq_u8(*da0, vld1q_u8(ra.add((0 ^ BH) * 16)));
+        *da1 = veorq_u8(*da1, vld1q_u8(ra.add((1 ^ BH) * 16)));
+        *da2 = veorq_u8(*da2, vld1q_u8(ra.add((2 ^ BH) * 16)));
+        *da3 = veorq_u8(*da3, vld1q_u8(ra.add((3 ^ BH) * 16)));
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+#[allow(clippy::too_many_arguments)]
+unsafe fn xor_apply_byte_pair_into_4_regs<
+    const BH0: usize,
+    const ODD0: bool,
+    const BH1: usize,
+    const ODD1: bool,
+>(
+    table_base: *const u8,
+    half_swapped_table_base: *const u8,
+    a_byte0: usize,
+    a_byte1: usize,
+    da0: &mut core::arch::aarch64::uint8x16_t,
+    da1: &mut core::arch::aarch64::uint8x16_t,
+    da2: &mut core::arch::aarch64::uint8x16_t,
+    da3: &mut core::arch::aarch64::uint8x16_t,
+) {
+    use core::arch::aarch64::*;
+    unsafe {
+        let t0 = if ODD0 {
+            half_swapped_table_base
+        } else {
+            table_base
+        };
+        let t1 = if ODD1 {
+            half_swapped_table_base
+        } else {
+            table_base
+        };
+        let ra0 = t0.add(a_byte0 * 64);
+        let ra1 = t1.add(a_byte1 * 64);
+        *da0 = xor3_u8(
+            *da0,
+            vld1q_u8(ra0.add((0 ^ BH0) * 16)),
+            vld1q_u8(ra1.add((0 ^ BH1) * 16)),
+        );
+        *da1 = xor3_u8(
+            *da1,
+            vld1q_u8(ra0.add((1 ^ BH0) * 16)),
+            vld1q_u8(ra1.add((1 ^ BH1) * 16)),
+        );
+        *da2 = xor3_u8(
+            *da2,
+            vld1q_u8(ra0.add((2 ^ BH0) * 16)),
+            vld1q_u8(ra1.add((2 ^ BH1) * 16)),
+        );
+        *da3 = xor3_u8(
+            *da3,
+            vld1q_u8(ra0.add((3 ^ BH0) * 16)),
+            vld1q_u8(ra1.add((3 ^ BH1) * 16)),
+        );
+    }
+}
+
+/// One K-row of the a-side only: inv-NTT apply into 4 q regs, then
+/// widen-shift-XOR into the u16 accumulators (no product — used when the
+/// entire b-side of the block is the constant all-ones row, in which case
+/// `out = red(sum_K x^K ntt_a[K]) * ntt(1s)` by GF8 linearity).
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+#[allow(clippy::too_many_arguments)]
+unsafe fn fused_apply_one_k_a_only<const K: i32>(
+    table_base: *const u8,
+    half_swapped_table_base: *const u8,
+    a_row: *const u8,
+    acc0_lo: &mut core::arch::aarch64::uint16x8_t,
+    acc0_hi: &mut core::arch::aarch64::uint16x8_t,
+    acc1_lo: &mut core::arch::aarch64::uint16x8_t,
+    acc1_hi: &mut core::arch::aarch64::uint16x8_t,
+    acc2_lo: &mut core::arch::aarch64::uint16x8_t,
+    acc2_hi: &mut core::arch::aarch64::uint16x8_t,
+    acc3_lo: &mut core::arch::aarch64::uint16x8_t,
+    acc3_hi: &mut core::arch::aarch64::uint16x8_t,
+) {
+    use core::arch::aarch64::*;
+    unsafe {
+        let a_word = u64::from_le(core::ptr::read_unaligned(a_row.cast::<u64>()));
+        let ra0 = table_base.add(byte_from_word::<0>(a_word) * 64);
+        let mut da0 = vld1q_u8(ra0);
+        let mut da1 = vld1q_u8(ra0.add(16));
+        let mut da2 = vld1q_u8(ra0.add(32));
+        let mut da3 = vld1q_u8(ra0.add(48));
+        xor_apply_byte_pair_into_4_regs::<0, true, 1, false>(
+            table_base,
+            half_swapped_table_base,
+            byte_from_word::<1>(a_word),
+            byte_from_word::<2>(a_word),
+            &mut da0,
+            &mut da1,
+            &mut da2,
+            &mut da3,
+        );
+        xor_apply_byte_pair_into_4_regs::<1, true, 2, false>(
+            table_base,
+            half_swapped_table_base,
+            byte_from_word::<3>(a_word),
+            byte_from_word::<4>(a_word),
+            &mut da0,
+            &mut da1,
+            &mut da2,
+            &mut da3,
+        );
+        xor_apply_byte_pair_into_4_regs::<2, true, 3, false>(
+            table_base,
+            half_swapped_table_base,
+            byte_from_word::<5>(a_word),
+            byte_from_word::<6>(a_word),
+            &mut da0,
+            &mut da1,
+            &mut da2,
+            &mut da3,
+        );
+        xor_apply_byte_into_4_regs::<3, true>(
+            table_base,
+            half_swapped_table_base,
+            byte_from_word::<7>(a_word),
+            &mut da0,
+            &mut da1,
+            &mut da2,
+            &mut da3,
+        );
+        *acc0_lo = veorq_u16(*acc0_lo, vshll_n_u8::<K>(vget_low_u8(da0)));
+        *acc0_hi = veorq_u16(*acc0_hi, vshll_n_u8::<K>(vget_high_u8(da0)));
+        *acc1_lo = veorq_u16(*acc1_lo, vshll_n_u8::<K>(vget_low_u8(da1)));
+        *acc1_hi = veorq_u16(*acc1_hi, vshll_n_u8::<K>(vget_high_u8(da1)));
+        *acc2_lo = veorq_u16(*acc2_lo, vshll_n_u8::<K>(vget_low_u8(da2)));
+        *acc2_hi = veorq_u16(*acc2_hi, vshll_n_u8::<K>(vget_high_u8(da2)));
+        *acc3_lo = veorq_u16(*acc3_lo, vshll_n_u8::<K>(vget_low_u8(da3)));
+        *acc3_hi = veorq_u16(*acc3_hi, vshll_n_u8::<K>(vget_high_u8(da3)));
+    }
+}
+
+/// Const-ones-B fast path: `out = red(sum_K x^K ntt_a[K]) . V1` with
+/// `V1 = ntt(all-ones)`. Caller has verified all 8 b-words are all-ones.
+#[cfg(target_arch = "aarch64")]
+#[inline(never)]
+fn shift_reduce_inner_a_only_const_b(
+    a_packed: &[u8],
+    inv_table: &InvNttTableByteSingleGf8,
+    byte_base_b: usize,
+    v1: &[u8; 64],
+    out: &mut [u8; 64],
+) {
+    use crate::field::gf2_8::neon::{gf8_mul_vec16, gf8_reduce_vec16};
+    use core::arch::aarch64::*;
+
+    let table_base = inv_table.data_ptr();
+    let half_swapped_table_base = inv_table.half_swapped_data_ptr();
+    unsafe {
+        let mut acc0_lo = vdupq_n_u16(0);
+        let mut acc0_hi = vdupq_n_u16(0);
+        let mut acc1_lo = vdupq_n_u16(0);
+        let mut acc1_hi = vdupq_n_u16(0);
+        let mut acc2_lo = vdupq_n_u16(0);
+        let mut acc2_hi = vdupq_n_u16(0);
+        let mut acc3_lo = vdupq_n_u16(0);
+        let mut acc3_hi = vdupq_n_u16(0);
+        macro_rules! do_k {
+            ($k:literal) => {{
+                let off = byte_base_b + $k * N_CHUNKS;
+                fused_apply_one_k_a_only::<$k>(
+                    table_base,
+                    half_swapped_table_base,
+                    a_packed.as_ptr().add(off),
+                    &mut acc0_lo,
+                    &mut acc0_hi,
+                    &mut acc1_lo,
+                    &mut acc1_hi,
+                    &mut acc2_lo,
+                    &mut acc2_hi,
+                    &mut acc3_lo,
+                    &mut acc3_hi,
+                );
+            }};
+        }
+        do_k!(0);
+        do_k!(1);
+        do_k!(2);
+        do_k!(3);
+        do_k!(4);
+        do_k!(5);
+        do_k!(6);
+        do_k!(7);
+
+        let r0 = gf8_reduce_vec16(vreinterpretq_u8_u16(acc0_lo), vreinterpretq_u8_u16(acc0_hi));
+        let r1 = gf8_reduce_vec16(vreinterpretq_u8_u16(acc1_lo), vreinterpretq_u8_u16(acc1_hi));
+        let r2 = gf8_reduce_vec16(vreinterpretq_u8_u16(acc2_lo), vreinterpretq_u8_u16(acc2_hi));
+        let r3 = gf8_reduce_vec16(vreinterpretq_u8_u16(acc3_lo), vreinterpretq_u8_u16(acc3_hi));
+
+        let vp = v1.as_ptr();
+        let y0 = gf8_mul_vec16(r0, vld1q_u8(vp));
+        let y1 = gf8_mul_vec16(r1, vld1q_u8(vp.add(16)));
+        let y2 = gf8_mul_vec16(r2, vld1q_u8(vp.add(32)));
+        let y3 = gf8_mul_vec16(r3, vld1q_u8(vp.add(48)));
+
+        let p = out.as_mut_ptr();
+        vst1q_u8(p, y0);
+        vst1q_u8(p.add(16), y1);
+        vst1q_u8(p.add(32), y2);
+        vst1q_u8(p.add(48), y3);
+    }
+}
+
+/// Single-live-K fast path: b rows K=1..7 are zero, so only K=0 contributes
+/// and `out = ntt_a[0] . ntt_b[0]` (x^0, already reduced).
+#[cfg(target_arch = "aarch64")]
+#[inline(never)]
+fn shift_reduce_inner_single_k0(
+    a_packed: &[u8],
+    b_packed: &[u8],
+    inv_table: &InvNttTableByteSingleGf8,
+    byte_base_b: usize,
+    out: &mut [u8; 64],
+) {
+    use crate::field::gf2_8::neon::gf8_mul_vec16;
+    use core::arch::aarch64::*;
+
+    let table_base = inv_table.data_ptr();
+    let half_swapped_table_base = inv_table.half_swapped_data_ptr();
+    unsafe {
+        let mut acc0_lo = vdupq_n_u16(0);
+        let mut acc0_hi = vdupq_n_u16(0);
+        let mut acc1_lo = vdupq_n_u16(0);
+        let mut acc1_hi = vdupq_n_u16(0);
+        let mut acc2_lo = vdupq_n_u16(0);
+        let mut acc2_hi = vdupq_n_u16(0);
+        let mut acc3_lo = vdupq_n_u16(0);
+        let mut acc3_hi = vdupq_n_u16(0);
+        fused_apply_one_k::<0>(
+            table_base,
+            half_swapped_table_base,
+            a_packed.as_ptr().add(byte_base_b),
+            b_packed.as_ptr().add(byte_base_b),
+            &mut acc0_lo,
+            &mut acc0_hi,
+            &mut acc1_lo,
+            &mut acc1_hi,
+            &mut acc2_lo,
+            &mut acc2_hi,
+            &mut acc3_lo,
+            &mut acc3_hi,
+        );
+        // Same epilogue as the generic kernel (byte order guaranteed
+        // identical); with K=0 only, the reduction is a near no-op.
+        let _ = gf8_mul_vec16; // silence import when unused
+        use crate::field::gf2_8::neon::gf8_reduce_vec16;
+        let y0 = gf8_reduce_vec16(vreinterpretq_u8_u16(acc0_lo), vreinterpretq_u8_u16(acc0_hi));
+        let y1 = gf8_reduce_vec16(vreinterpretq_u8_u16(acc1_lo), vreinterpretq_u8_u16(acc1_hi));
+        let y2 = gf8_reduce_vec16(vreinterpretq_u8_u16(acc2_lo), vreinterpretq_u8_u16(acc2_hi));
+        let y3 = gf8_reduce_vec16(vreinterpretq_u8_u16(acc3_lo), vreinterpretq_u8_u16(acc3_hi));
+        let p = out.as_mut_ptr();
+        vst1q_u8(p, y0);
+        vst1q_u8(p.add(16), y1);
+        vst1q_u8(p.add(32), y2);
+        vst1q_u8(p.add(48), y3);
+    }
+}
+
+/// Checked static-structure dispatcher. Sniffs the 8 b-words (8 scalar loads
+/// vs 512 table loads) and routes to a fast path when the block matches the
+/// BLAKE3 static structure; generic otherwise. Output is bit-identical for
+/// any witness.
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+pub(crate) fn shift_reduce_inner_ab_fused_neon_checked(
+    a_packed: &[u8],
+    b_packed: &[u8],
+    inv_table: &InvNttTableByteSingleGf8,
+    chunk_byte_base: usize,
+    b_med: usize,
+    out: &mut [u8; 64],
+    v1: &[u8; 64],
+) {
+    let byte_base_b = chunk_byte_base + b_med * N_CHUNKS * 8;
+    let bw = |k: usize| -> u64 {
+        u64::from_le(unsafe {
+            core::ptr::read_unaligned(b_packed.as_ptr().add(byte_base_b + k * 8).cast::<u64>())
+        })
+    };
+    let and_all = bw(0) & bw(1) & bw(2) & bw(3) & bw(4) & bw(5) & bw(6) & bw(7);
+    if and_all == u64::MAX {
+        shift_reduce_inner_a_only_const_b(a_packed, inv_table, byte_base_b, v1, out);
+        return;
+    }
+    let or_tail = bw(1) | bw(2) | bw(3) | bw(4) | bw(5) | bw(6) | bw(7);
+    if or_tail == 0 {
+        shift_reduce_inner_single_k0(a_packed, b_packed, inv_table, byte_base_b, out);
+        return;
+    }
+    shift_reduce_inner_ab_fused_neon(a_packed, b_packed, inv_table, chunk_byte_base, b_med, out);
+}

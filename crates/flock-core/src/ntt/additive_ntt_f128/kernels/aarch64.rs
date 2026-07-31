@@ -338,9 +338,71 @@ pub(super) unsafe fn butterfly_fused_3layer_zero_root_rows(
     }
 }
 
+/// Two low-constant products with everything held in q registers: product
+/// `i` is `v_i · t_i` where `t_i.hi == 0` and `ts_i` holds `t_i.lo` in both
+/// lanes. Same unreduced-word layout and shift-fold reduction as
+/// [`crate::field::gf2_128::aarch64::ghash_mul_low_constants_vec2_neon`]
+/// (`r3 = 0`, single fold, no overflow correction), but the operands arrive
+/// as `uint64x2_t` and the products leave as `uint64x2_t`, so no lane ever
+/// visits a general-purpose register.
+#[inline(always)]
+unsafe fn mul_low_pair_q(
+    v0: core::arch::aarch64::uint64x2_t,
+    v1: core::arch::aarch64::uint64x2_t,
+    ts0: core::arch::aarch64::uint64x2_t,
+    ts1: core::arch::aarch64::uint64x2_t,
+) -> (
+    core::arch::aarch64::uint64x2_t,
+    core::arch::aarch64::uint64x2_t,
+) {
+    use core::arch::aarch64::*;
+    unsafe {
+        // With t.hi == 0 each product needs only ll = v.lo·t.lo and
+        // hl = v.hi·t.lo; `vmull_high_p64` reads v.hi in place.
+        let p0_ll = pmull_ll(v0, ts0);
+        let p0_hl = core::mem::transmute::<u128, uint64x2_t>(vmull_high_p64(
+            vreinterpretq_p64_u64(v0),
+            vreinterpretq_p64_u64(ts0),
+        ));
+        let p1_ll = pmull_ll(v1, ts1);
+        let p1_hl = core::mem::transmute::<u128, uint64x2_t>(vmull_high_p64(
+            vreinterpretq_p64_u64(v1),
+            vreinterpretq_p64_u64(ts1),
+        ));
+
+        // Lane-paired unreduced words: r0 = ll.lo, r1 = ll.hi ^ hl.lo,
+        // r2 = hl.hi, r3 = 0.
+        let r0 = vzip1q_u64(p0_ll, p1_ll);
+        let r1 = veorq_u64(vzip2q_u64(p0_ll, p1_ll), vzip1q_u64(p0_hl, p1_hl));
+        let r2 = vzip2q_u64(p0_hl, p1_hl);
+
+        // Fold r2·x^128 with x^128 = x^7 + x^2 + x + 1. Since r3 is zero,
+        // there is no second overflow correction.
+        let folded_lo = xor3(
+            r2,
+            vshlq_n_u64::<1>(r2),
+            veorq_u64(vshlq_n_u64::<2>(r2), vshlq_n_u64::<7>(r2)),
+        );
+        let folded_hi = xor3(
+            vshrq_n_u64::<63>(r2),
+            vshrq_n_u64::<62>(r2),
+            vshrq_n_u64::<57>(r2),
+        );
+        let out_lo = veorq_u64(r0, folded_lo);
+        let out_hi = veorq_u64(r1, folded_hi);
+
+        // Unzip back to per-product `{ lo, hi }` lane order.
+        (vzip1q_u64(out_lo, out_hi), vzip2q_u64(out_lo, out_hi))
+    }
+}
+
 /// Fused two-layer butterfly specialized for three low-limb-only twiddles.
 /// Two products are issued together at each stage, using four PMULLs instead
-/// of twelve for the pair under the generic Binius field multiplier.
+/// of twelve for the pair under the generic Binius field multiplier, and —
+/// like [`butterfly_fused_2layer`] below — the four row values and every
+/// intermediate stay in `uint64x2_t` across both layers, so the butterfly
+/// XORs are `veorq_u64` rather than scalar `u64` pairs. Same multiplies,
+/// same butterfly order, bit-identical output.
 ///
 /// # Safety
 /// Requires the `aes` target feature.
@@ -356,7 +418,7 @@ pub(super) unsafe fn butterfly_fused_2layer_low_twiddles(
     t_inner_a: F128,
     t_inner_b: F128,
 ) {
-    use crate::field::gf2_128::aarch64::ghash_mul_low_constants_vec2_neon;
+    use core::arch::aarch64::*;
 
     debug_assert_eq!(a.len(), b.len());
     debug_assert_eq!(a.len(), c.len());
@@ -365,34 +427,37 @@ pub(super) unsafe fn butterfly_fused_2layer_low_twiddles(
     debug_assert_eq!(t_inner_a.hi, 0);
     debug_assert_eq!(t_inner_b.hi, 0);
 
-    for lane in 0..a.len() {
-        let mut xa = a[lane];
-        let mut xb = b[lane];
-        let mut xc = c[lane];
-        let mut xd = d[lane];
+    // SAFETY: this function carries aes and all constants have zero high
+    // limbs by the ranked gate and assertions above.
+    unsafe {
+        let to = vdupq_n_u64(t_outer.lo);
+        let ta = vdupq_n_u64(t_inner_a.lo);
+        let tb = vdupq_n_u64(t_inner_b.lo);
+        for lane in 0..a.len() {
+            let mut xa = vld1q_u64((&raw const a[lane]).cast::<u64>());
+            let mut xb = vld1q_u64((&raw const b[lane]).cast::<u64>());
+            let mut xc = vld1q_u64((&raw const c[lane]).cast::<u64>());
+            let mut xd = vld1q_u64((&raw const d[lane]).cast::<u64>());
 
-        // SAFETY: this function carries aes and all constants have zero high
-        // limbs by the ranked gate and assertions above.
-        let outer = unsafe {
-            ghash_mul_low_constants_vec2_neon([t_outer, t_outer], [xc, xd])
-        };
-        xa += outer[0];
-        xc += xa;
-        xb += outer[1];
-        xd += xb;
+            // Layer L: (a,c) and (b,d) share t_outer.
+            let (o0, o1) = mul_low_pair_q(xc, xd, to, to);
+            xa = veorq_u64(xa, o0);
+            xc = veorq_u64(xc, xa);
+            xb = veorq_u64(xb, o1);
+            xd = veorq_u64(xd, xb);
 
-        let inner = unsafe {
-            ghash_mul_low_constants_vec2_neon([t_inner_a, t_inner_b], [xb, xd])
-        };
-        xa += inner[0];
-        xb += xa;
-        xc += inner[1];
-        xd += xc;
+            // Layer L+1: (a,b) under t_inner_a, (c,d) under t_inner_b.
+            let (i0, i1) = mul_low_pair_q(xb, xd, ta, tb);
+            xa = veorq_u64(xa, i0);
+            xb = veorq_u64(xb, xa);
+            xc = veorq_u64(xc, i1);
+            xd = veorq_u64(xd, xc);
 
-        a[lane] = xa;
-        b[lane] = xb;
-        c[lane] = xc;
-        d[lane] = xd;
+            vst1q_u64((&raw mut a[lane]).cast::<u64>(), xa);
+            vst1q_u64((&raw mut b[lane]).cast::<u64>(), xb);
+            vst1q_u64((&raw mut c[lane]).cast::<u64>(), xc);
+            vst1q_u64((&raw mut d[lane]).cast::<u64>(), xd);
+        }
     }
 }
 
