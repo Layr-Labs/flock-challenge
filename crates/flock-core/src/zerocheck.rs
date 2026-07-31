@@ -248,6 +248,23 @@ pub fn prove_packed_padded_capture_s_hat_v_c_with_precomputed_ab<C: Challenger>(
     )
 }
 
+/// Whether the tail round at loop index `i` should run as a fused double pass.
+///
+/// Factored out of the tail loop so the schedule test asserts the *production*
+/// predicate rather than a copy of it: a model that drifts from the loop would
+/// keep passing while the real dispatch changed underneath it.
+///
+/// `log_n_before` is the current table's log-size and `pending` the number of
+/// challenges sampled but not yet folded in, so the pass would output a
+/// `2^(log_n_before - pending)` table.
+fn should_fuse_tail_round(n_mlv: usize, i: usize, log_n_before: usize, pending: usize) -> bool {
+    let out_log = log_n_before - pending;
+    // Two messages must remain (the pass emits both), the read must be large
+    // enough to be bandwidth-bound, and the lookahead eq table needs at least
+    // one hi bit and one lo bit.
+    (n_mlv - 1 - i) >= 2 && log_n_before >= multilinear::fused_tail_min_log_n() && out_log >= 4
+}
+
 #[allow(clippy::too_many_arguments)]
 fn prove_packed_padded_inner<C: Challenger>(
     a_packed: &[u8],
@@ -419,24 +436,49 @@ fn prove_packed_padded_inner<C: Challenger>(
     // table removes the two field multiplications per output that the generic
     // pair fold would require, while materializing exactly the ordinary
     // post-fold tables expected by all subsequent rounds.
+    //
+    // This round could also harvest the next round's lookahead coefficients,
+    // seeding the tail with two challenges so it runs steady-state double
+    // passes immediately instead of paying the bootstrap described below.
+    // That was built, measured, and withdrawn: harvesting it register-live
+    // needs a full output quadruple (w0..w3, v0..v3) live at once — `finf`
+    // mixes all four lanes and the `f`-family straddles the pair boundary, so
+    // the six coefficients collectively span the quadruple — and that working
+    // set does not fit alongside the accumulators in 32 q-registers; it
+    // spilled in-loop, relocating the very traffic the fusion removes.
     let mut first_r_next = vec![F128::ONE; n_mlv - 1];
     first_r_next[1..].copy_from_slice(&r[k_skip + 2..]);
-    let (mut a_mlv, mut b_mlv, first_m1, first_mi) =
-        fold_compact_and_compute_round_pair(&compact_mlv, &fold_table, mlv_rhos[0], &first_r_next);
-    compact_mlv.recycle();
-    multilinear_msgs.push((first_m1, first_mi));
-    challenger.observe_f128(first_m1);
-    challenger.observe_f128(first_mi);
-    mlv_rhos.push(challenger.sample_f128());
+    let (mut a_mlv, mut b_mlv) = {
+        let (a, b, m1, mi) = fold_compact_and_compute_round_pair(
+            &compact_mlv,
+            &fold_table,
+            mlv_rhos[0],
+            &first_r_next,
+        );
+        compact_mlv.recycle();
+        multilinear_msgs.push((m1, mi));
+        challenger.observe_f128(m1);
+        challenger.observe_f128(mi);
+        mlv_rhos.push(challenger.sample_f128());
+        (a, b)
+    };
 
     // Ping-pong scratch buffers for the remaining fused path: each fused round folds
     // (a_mlv, b_mlv) of size N into size N/2. Rather than allocating — and,
     // worse, `munmap`-ing, which is single-threaded and caps the tail's
     // parallel speedup — a fresh 64 MB buffer per round, we alternate between
-    // two persistent buffers. Scratch capacity = N/2 (the largest fused
-    // output); only needed when the first round is actually fused.
+    // two persistent buffers. Scratch capacity = N/2 (the largest out-of-place
+    // output any tail pass produces — the fused double pass writes only N/4).
+    //
+    // Every out-of-place path writes through these buffers, so they must exist
+    // whenever the loop can take one. The previous `n_in >= 1024` guard was
+    // sound for the pre-fusion loop — that consumed the scratch only at
+    // `log_n_before >= 15`, which strictly implies it — but the fused branch
+    // keys off the test-overridable `fused_tail_min_log_n()` and so is
+    // reachable at far smaller tables. `n_in >= 16` is the smallest table any
+    // of these kernels accepts; at ranked sizes it is always taken.
     let n_in = a_mlv.len();
-    let (mut a_nxt, mut b_nxt) = if n_in >= 1024 {
+    let (mut a_nxt, mut b_nxt) = if n_in >= 16 {
         (
             crate::scratch::take_f128(n_in / 2),
             crate::scratch::take_f128(n_in / 2),
@@ -445,17 +487,114 @@ fn prove_packed_padded_inner<C: Challenger>(
         (Vec::new(), Vec::new())
     };
 
-    for i in 1..(n_mlv - 1) {
-        let rho_prev = mlv_rhos[i];
-        let log_n_before = a_mlv.len().trailing_zeros() as usize;
+    // The tail walks from the TOP: the largest rounds are fused first, so the
+    // guaranteed leftover odd round lands at the SMALL end where it costs
+    // almost nothing. Traffic here is geometric — the first round alone is
+    // half of it — so pairing upward from the crossover instead would strand
+    // the dominant round on the unfused path.
+    //
+    // `pending` holds the challenges sampled but not yet folded in. A fused
+    // double pass binds two levels in one streaming read, which is where the
+    // traffic saving comes from, but it needs both challenges up front.
+    //
+    // The loop is entered holding ONE challenge, so the first pass is a
+    // single-level bootstrap at the largest table: it binds one level and
+    // harvests the lookahead coefficients that give the second challenge.
+    // Every pass after it is a steady-state double. Concretely at n_mlv = 26
+    // the ladder runs bootstrap@25 then doubles at 24, 22, 20, 18 — each one
+    // level larger than a seeded schedule's 25, 23, 21, 19 would be. That
+    // shift is the whole cost of not seeding: tail traffic falls 22.2% rather
+    // than 44.4%, since the bootstrap pays full single-round freight at the
+    // round that is half the tail by size.
+    //
+    // Seeding the second challenge from the compact round was implemented and
+    // withdrawn: harvesting the lookahead there re-reads the just-written
+    // output, which is `stnp`-stored and loses the cache eviction race under
+    // the reconstruction's own read stream. Fusing that harvest into the
+    // reconstruction loop needs a full quadruple live (e0/f0/finf each mix all
+    // four lanes) and does not fit the register file alongside the
+    // accumulators. Do not re-derive it without re-measuring both.
+    let mut pending: Vec<F128> = vec![mlv_rhos[1]];
+    let mut i = 1;
 
-        // r_next for the next round's message: length log_n_before - 1.
-        // r_next[0] = ONE (Convention A factor); r_next[1..] are the eq
-        // weights for the remaining variables = r[k_skip + i + 2..m].
-        let mut r_next = vec![F128::ONE; log_n_before - 1];
+    while i < n_mlv - 1 {
+        let log_n_before = a_mlv.len().trailing_zeros() as usize;
+        let out_log = log_n_before - pending.len();
+        debug_assert_eq!(out_log, n_mlv - i - 1);
+
+        // r_next: message for the round operating on the size-2^out_log table.
+        // r_next[0] = ONE (Convention A factor); r_next[1..] are the eq weights
+        // for the remaining variables = r[k_skip + i + 2..m].
+        let mut r_next = vec![F128::ONE; out_log];
         r_next[1..].copy_from_slice(&r[k_skip + i + 2..]);
 
-        let (m1, mi) = if log_n_before >= 15 {
+        // Fuse only when two messages remain, the read is large enough to be
+        // bandwidth-bound, and the output still supports the quadruple split.
+        let fuse = should_fuse_tail_round(n_mlv, i, log_n_before, pending.len());
+
+        if fuse {
+            let mut r_next2 = vec![F128::ONE; out_log - 1];
+            r_next2[1..].copy_from_slice(&r[k_skip + i + 3..]);
+            let out_len = 1usize << out_log;
+
+            let ((m1, mi), look) = match pending.len() {
+                1 => multilinear::fold_and_compute_round_pair_into_with_lookahead(
+                    &a_mlv,
+                    &b_mlv,
+                    &mut a_nxt[..out_len],
+                    &mut b_nxt[..out_len],
+                    pending[0],
+                    &r_next,
+                    &r_next2,
+                ),
+                _ => multilinear::fold2_and_compute_round_pair_into(
+                    &a_mlv,
+                    &b_mlv,
+                    &mut a_nxt[..out_len],
+                    &mut b_nxt[..out_len],
+                    pending[0],
+                    pending[1],
+                    &r_next,
+                    &r_next2,
+                ),
+            };
+            std::mem::swap(&mut a_mlv, &mut a_nxt);
+            std::mem::swap(&mut b_mlv, &mut b_nxt);
+            a_mlv.truncate(out_len);
+            b_mlv.truncate(out_len);
+
+            // Exact message first, then its challenge — the transcript order is
+            // untouched. Only once that challenge exists do we collapse the
+            // lookahead quadratic into the following message.
+            multilinear_msgs.push((m1, mi));
+            challenger.observe_f128(m1);
+            challenger.observe_f128(mi);
+            let rho_c = challenger.sample_f128();
+            mlv_rhos.push(rho_c);
+
+            let (m1b, mib) = look.evaluate(rho_c);
+            multilinear_msgs.push((m1b, mib));
+            challenger.observe_f128(m1b);
+            challenger.observe_f128(mib);
+            let rho_d = challenger.sample_f128();
+            mlv_rhos.push(rho_d);
+
+            pending = vec![rho_c, rho_d];
+            i += 2;
+            continue;
+        }
+
+        // Unfused single round. Settle any surplus pending challenge first so
+        // the existing kernels see their usual one-challenge contract.
+        while pending.len() > 1 {
+            let rho = pending.remove(0);
+            fold_in_place_pair(&mut a_mlv, &mut b_mlv, rho);
+        }
+        let rho_prev = pending[0];
+        let log_now = a_mlv.len().trailing_zeros() as usize;
+        debug_assert_eq!(log_now - 1, out_log);
+
+        let (m1, mi) = if log_now >= 15 {
             let half = a_mlv.len() / 2;
             let (m1, mi) = fold_and_compute_round_pair_into(
                 &a_mlv,
@@ -482,7 +621,16 @@ fn prove_packed_padded_inner<C: Challenger>(
         multilinear_msgs.push((m1, mi));
         challenger.observe_f128(m1);
         challenger.observe_f128(mi);
-        mlv_rhos.push(challenger.sample_f128());
+        let rho = challenger.sample_f128();
+        mlv_rhos.push(rho);
+        pending = vec![rho];
+        i += 1;
+    }
+
+    // Settle every challenge sampled but not yet bound.
+    while pending.len() > 1 {
+        let rho = pending.remove(0);
+        fold_in_place_pair(&mut a_mlv, &mut b_mlv, rho);
     }
 
     // ---- 8. Final binding at ρ_{n_mlv} (the last challenge) ----
@@ -735,6 +883,155 @@ mod tests {
     fn pack_abc(a: &[bool], b: &[bool], c: &[bool]) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
         use univariate_skip::pack_bits;
         (pack_bits(a), pack_bits(b), pack_bits(c))
+    }
+
+    /// **The whole-proof bit-exactness gate for k=2 tail fusion.**
+    ///
+    /// Proves the same statement twice — once with the fused double-level tail
+    /// engaged, once with it disabled so every round takes the pre-fusion
+    /// single-round path — and requires the two proofs to be *identical*: every
+    /// round message, both final evaluations, and every sampled challenge.
+    ///
+    /// This is the claim that matters. The kernel-level tests pin each fused
+    /// pass against the unfused kernels; this pins the whole transcript,
+    /// including the ordering property fusion could plausibly break (a message
+    /// must be observed before its own challenge is sampled, and the lookahead
+    /// must be collapsed only *after* that challenge exists).
+    ///
+    /// The crossover is lowered through a test-only seam so fusion actually
+    /// engages at a size provable in a unit test; at the shipped constant of 17
+    /// it would need `m ≥ 24`. Several `m` are covered so that both an even and
+    /// an odd number of fused-eligible rounds occur, exercising the
+    /// leftover-round fallback.
+    ///
+    /// **Coverage scope**: because the seam is lowered, this proves byte
+    /// identity for the fused *machinery*, not for the ranked configuration
+    /// end-to-end. The ranked path is covered by construction — it runs the
+    /// same two kernels, which the `multilinear` unit tests pin at
+    /// `log_n` 15..18 — plus
+    /// [`fused_tail_pairs_from_the_largest_round_first`], which checks the
+    /// dispatch schedule against the *shipped* crossover with no seam.
+    #[test]
+    fn fused_tail_proof_is_byte_identical_to_unfused() {
+        use multilinear::FUSED_TAIL_MIN_LOG_N_OVERRIDE;
+
+        for &m in &[13usize, 14, 15, 16] {
+            let mut rng = Rng::new(0xFC5E_0000 + m as u64);
+            let a = rng.bits(1 << m);
+            let b = rng.bits(1 << m);
+            // c = a AND b makes the statement true, so the honest path (and the
+            // verifier) is exercised rather than an early reject.
+            let c: Vec<bool> = a.iter().zip(&b).map(|(&x, &y)| x && y).collect();
+            let (ap, bp, cp) = pack_abc(&a, &b, &c);
+
+            // Fusion ON: crossover low enough that the tail actually fuses.
+            FUSED_TAIL_MIN_LOG_N_OVERRIDE.with(|c| c.set(5));
+            let mut ch = FsChallenger::new(b"flock-test-v0");
+            let (proof_fused, claim_fused) = prove_packed(&ap, &bp, &cp, m, &mut ch);
+
+            // Fusion OFF: unreachable crossover, so every round is single.
+            FUSED_TAIL_MIN_LOG_N_OVERRIDE.with(|c| c.set(usize::MAX));
+            let mut ch = FsChallenger::new(b"flock-test-v0");
+            let (proof_plain, claim_plain) = prove_packed(&ap, &bp, &cp, m, &mut ch);
+
+            FUSED_TAIL_MIN_LOG_N_OVERRIDE.with(|c| c.set(0));
+
+            assert_eq!(
+                proof_fused.multilinear_rounds, proof_plain.multilinear_rounds,
+                "round messages diverged at m={m}"
+            );
+            assert_eq!(
+                claim_fused.mlv_challenges, claim_plain.mlv_challenges,
+                "challenges diverged at m={m}"
+            );
+            assert_eq!(proof_fused, proof_plain, "proof diverged at m={m}");
+            assert_eq!(claim_fused, claim_plain, "claim diverged at m={m}");
+
+            // And the fused proof must still verify.
+            let mut ch = FsChallenger::new(b"flock-test-v0");
+            let verified = verify(m, &proof_fused, &mut ch).expect("fused proof verifies");
+            assert_eq!(verified, claim_fused, "verifier claim mismatch at m={m}");
+        }
+    }
+
+    /// The pairing must walk from the TOP of the tail.
+    ///
+    /// Tail traffic is geometric — the first round alone is about half of it —
+    /// so a loop that started at the crossover and walked *upward* would leave
+    /// the largest round on the unfused path and silently forfeit most of the
+    /// win while still producing a correct proof. That failure is invisible to
+    /// every correctness test, so it is asserted directly here against the
+    /// **shipped** crossover, with no test seam involved.
+    ///
+    /// Drives the **production** dispatch predicate
+    /// ([`should_fuse_tail_round`], the same call the tail loop makes) over the
+    /// table-size ladder, and checks that the first pass is a fused one at the
+    /// largest table and that the single leftover round — an odd count is
+    /// guaranteed at ranked sizes — lands at the small end. Only the ladder
+    /// bookkeeping is modelled here; the fuse decision itself is not copied,
+    /// so a change to the predicate cannot silently desynchronize this test.
+    #[test]
+    fn fused_tail_pairs_from_the_largest_round_first() {
+        for &n_mlv in &[26usize, 25, 24, 23, 20] {
+            let mut log_in = n_mlv - 1;
+            let mut pending = 1usize;
+            let mut i = 1usize;
+            let mut passes: Vec<(bool, usize)> = Vec::new();
+
+            while i < n_mlv - 1 {
+                let out_log = log_in - pending;
+                let fuse = should_fuse_tail_round(n_mlv, i, log_in, pending);
+                if fuse {
+                    passes.push((true, log_in));
+                    log_in = out_log;
+                    pending = 2;
+                    i += 2;
+                } else {
+                    if pending == 2 {
+                        log_in -= 1;
+                    }
+                    pending = 1;
+                    passes.push((false, log_in));
+                    log_in -= 1;
+                    i += 1;
+                }
+            }
+
+            // Every message is accounted for exactly once.
+            let emitted: usize = passes.iter().map(|&(f, _)| if f { 2 } else { 1 }).sum();
+            assert_eq!(emitted, n_mlv - 2, "message count wrong at n_mlv={n_mlv}");
+
+            // The tail must actually fuse at these sizes, and the first pass —
+            // the largest table, half the traffic — must be one of the fused
+            // ones rather than being stranded on the single-round path.
+            let fused: Vec<usize> = passes
+                .iter()
+                .filter(|&&(f, _)| f)
+                .map(|&(_, l)| l)
+                .collect();
+            assert!(!fused.is_empty(), "no fusion at all at n_mlv={n_mlv}");
+            assert!(passes[0].0, "largest round not fused at n_mlv={n_mlv}");
+            assert_eq!(
+                fused[0],
+                n_mlv - 1,
+                "first fused pass is not the largest table at n_mlv={n_mlv}"
+            );
+
+            // Fused passes descend, and every unfused round is strictly smaller
+            // than every fused one — i.e. leftovers land at the small end.
+            assert!(
+                fused.windows(2).all(|w| w[0] > w[1]),
+                "fused passes not descending at n_mlv={n_mlv}"
+            );
+            let smallest_fused = *fused.last().expect("non-empty");
+            assert!(
+                passes
+                    .iter()
+                    .filter(|&&(f, _)| !f)
+                    .all(|&(_, l)| l < smallest_fused),
+                "an unfused round is larger than a fused one at n_mlv={n_mlv}"
+            );
+        }
     }
 
     /// `prove` runs end-to-end at the smallest valid m (= k_skip + N_INNER = 13)
@@ -1142,4 +1439,5 @@ mod tests {
         assert_eq!(claim1.z, claim2.z);
         assert_eq!(claim1.mlv_challenges, claim2.mlv_challenges);
     }
+
 }

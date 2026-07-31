@@ -760,6 +760,183 @@ pub fn fold_compact_and_compute_round_pair(
     (a_out, b_out, r_next[0] * sum1, sum_inf)
 }
 
+/// (B) seed: [`fold_compact_and_compute_round_pair`] that additionally harvests
+/// the six challenge-independent coefficients of the *following* round.
+///
+/// This is what lets the fused tail run steady-state double passes from its
+/// very first pass. Without it the tail must open with a single-level
+/// bootstrap at the largest table — the most expensive round there is, half of
+/// the tail's traffic — purely to obtain a second challenge.
+///
+/// The lookahead is gathered from the reconstruction's own output while the
+/// chunk is still resident, immediately after it is written, so it costs a
+/// warm re-read of a chunk rather than a pass over the table. Correctness
+/// argument is identical to [`fold2_and_compute_round_pair_into`]: the next
+/// table is affine in the next challenge, the message is a quadratic form in
+/// the table, and every eq weight is a fixed zerocheck `r`.
+///
+/// Returns the reconstructed tables, the exact message, and the lookahead.
+pub fn fold_compact_and_compute_round_pair_with_lookahead(
+    compact: &UniSkipCompactFold,
+    table: &UniSkipFoldTable,
+    r_fold: F128,
+    r_next: &[F128],
+    r_next2: &[F128],
+) -> (Vec<F128>, Vec<F128>, F128, F128, Lookahead) {
+    let n = compact.len();
+    assert!(!compact.is_empty() && n.is_power_of_two() && n >= 8);
+    assert_eq!(compact.anchors.len(), 2 * n);
+    assert_eq!(compact.deltas.len(), 2 * n * table.n_chunks);
+    assert_eq!(table.n_chunks, 8);
+    let log_n = n.trailing_zeros() as usize;
+    assert_eq!(r_next.len(), log_n);
+    assert_eq!(r_next2.len(), log_n - 1);
+
+    let scaled_table = table.scaled_linear(r_fold);
+
+    // Cap by the SHORTER (lookahead) challenge list before building either
+    // table. Deriving `eq_l`'s split from `eq`'s instead lets `eq_l` clamp to a
+    // smaller `n_hi` whenever the constant exceeds the shorter list's capacity,
+    // and the two tables then disagree on chunk count.
+    let n_hi = COMPACT_RECONSTRUCTION_N_HI.min(r_next2.len() - 1);
+    let eq = SplitEqGhash::with_n_hi(&r_next[1..], n_hi);
+    let eq_l = SplitEqGhash::with_n_hi(&r_next2[1..], n_hi);
+    let lo_size = 1usize << eq.n_lo;
+    let hi_size = 1usize << eq.n_hi;
+    assert_eq!(lo_size * hi_size * 2, n);
+    assert_eq!(eq_l.n_hi, eq.n_hi);
+    assert_eq!(eq_l.n_lo + 1, eq.n_lo);
+    // Each chunk must own whole quadruples of the output for the lookahead.
+    let quads_per_chunk = 1usize << eq_l.n_lo;
+    assert_eq!(quads_per_chunk * hi_size * 4, n);
+    let chunk_size = 2 * lo_size;
+    let eq_hi = &eq.hi;
+    let eq_lo = &eq.lo;
+    let eq_l_lo = &eq_l.lo;
+
+    let mut a_out = crate::scratch::take_f128(n);
+    let mut b_out = crate::scratch::take_f128(n);
+    let mut partials: Vec<[F128; 8]> = vec![[F128::ZERO; 8]; hi_size];
+    let a_base = crate::epool::SyncPtr(a_out.as_mut_ptr());
+    let b_base = crate::epool::SyncPtr(b_out.as_mut_ptr());
+    let partials_base = crate::epool::SyncPtr(partials.as_mut_ptr());
+    crate::epool::run_hetero_chunks(hi_size, |x_hi| {
+        // SAFETY: exclusive per-chunk ownership; queue join publishes writes.
+        let (a_out, b_out) = unsafe {
+            (
+                std::slice::from_raw_parts_mut(a_base.ptr().add(x_hi * chunk_size), chunk_size),
+                std::slice::from_raw_parts_mut(b_base.ptr().add(x_hi * chunk_size), chunk_size),
+            )
+        };
+        {
+            let base = x_hi * chunk_size;
+
+            #[cfg(target_arch = "aarch64")]
+            let (p1, pinf) = unsafe {
+                fold_compact_chunk_neon_unchecked_8(
+                    scaled_table.as_ptr().cast::<u8>(),
+                    compact.anchors.as_ptr().add(2 * base),
+                    compact.deltas.as_ptr().add(2 * base * table.n_chunks),
+                    a_out.as_mut_ptr(),
+                    b_out.as_mut_ptr(),
+                    eq_lo.as_ptr(),
+                    lo_size,
+                )
+            };
+
+            #[cfg(not(target_arch = "aarch64"))]
+            let (p1, pinf) = {
+                let mut p1_acc = F256Unreduced::ZERO;
+                let mut pinf_acc = F256Unreduced::ZERO;
+                for x_lo in 0..lo_size {
+                    let out = 2 * x_lo;
+                    for lane in 0..2 {
+                        let index = base + out + lane;
+                        let mut a = compact.anchors[2 * index];
+                        let mut b = compact.anchors[2 * index + 1];
+                        for j in 0..table.n_chunks {
+                            let d = 2 * index * table.n_chunks + j;
+                            a += scaled_table[j * 256 + compact.deltas[d] as usize];
+                            b +=
+                                scaled_table[j * 256 + compact.deltas[d + table.n_chunks] as usize];
+                        }
+                        a_out[out + lane] = a;
+                        b_out[out + lane] = b;
+                    }
+                    let a0 = a_out[out];
+                    let a1 = a_out[out + 1];
+                    let b0 = b_out[out];
+                    let b1 = b_out[out + 1];
+                    let eq_l = eq_lo[x_lo];
+                    p1_acc ^= eq_l.mul_unreduced(a1 * b1);
+                    pinf_acc ^= eq_l.mul_unreduced((a0 + a1) * (b0 + b1));
+                }
+                (p1_acc.reduce(), pinf_acc.reduce())
+            };
+
+            // Lookahead sweep over the chunk we just wrote — still resident, so
+            // this is a warm re-read rather than a second pass over the table.
+            let mut e0 = F256Unreduced::ZERO;
+            let mut e1 = F256Unreduced::ZERO;
+            let mut einf = F256Unreduced::ZERO;
+            let mut f0 = F256Unreduced::ZERO;
+            let mut f1 = F256Unreduced::ZERO;
+            let mut finf = F256Unreduced::ZERO;
+            for q in 0..quads_per_chunk {
+                let o = 4 * q;
+                let w0 = a_out[o];
+                let w1 = a_out[o + 1];
+                let w2 = a_out[o + 2];
+                let w3 = a_out[o + 3];
+                let v0 = b_out[o];
+                let v1 = b_out[o + 1];
+                let v2 = b_out[o + 2];
+                let v3 = b_out[o + 3];
+                let el = eq_l_lo[q];
+                e0 ^= el.mul_unreduced(w2 * v2);
+                e1 ^= el.mul_unreduced(w3 * v3);
+                einf ^= el.mul_unreduced((w2 + w3) * (v2 + v3));
+                f0 ^= el.mul_unreduced((w0 + w2) * (v0 + v2));
+                f1 ^= el.mul_unreduced((w1 + w3) * (v1 + v3));
+                finf ^= el.mul_unreduced((w0 + w1 + w2 + w3) * (v0 + v1 + v2 + v3));
+            }
+
+            let eq_h = eq_hi[x_hi];
+            let hl = eq_l.hi[x_hi];
+            // SAFETY: exclusive owner of partials[x_hi] (see above).
+            unsafe {
+                *partials_base.ptr().add(x_hi) = [
+                    eq_h * p1,
+                    eq_h * pinf,
+                    hl * e0.reduce(),
+                    hl * e1.reduce(),
+                    hl * einf.reduce(),
+                    hl * f0.reduce(),
+                    hl * f1.reduce(),
+                    hl * finf.reduce(),
+                ];
+            }
+        }
+    });
+    let acc = partials.iter().fold([F128::ZERO; 8], |mut s, c| {
+        for i in 0..8 {
+            s[i] += c[i];
+        }
+        s
+    });
+
+    let look = Lookahead {
+        e0: acc[2],
+        e1: acc[3],
+        einf: acc[4],
+        f0: acc[5],
+        f1: acc[6],
+        finf: acc[7],
+        wire: r_next2[0],
+    };
+    (a_out, b_out, r_next[0] * acc[0], acc[1], look)
+}
+
 /// Optimized fused fold (at the URM challenge `z`, baked into `table`) plus
 /// round-2 prover message. **Packed input** (LSB-first bit packing). **Parallel
 /// by default** via rayon — the outer x_hi loop is distributed across workers,
@@ -1350,6 +1527,453 @@ pub fn fold_and_compute_round_pair_into(
     (r_next[0] * sum1, sum_inf)
 }
 
+// ---------------------------------------------------------------------------
+// Two-round (k=2) fused tail: one pass per DOUBLE level.
+// ---------------------------------------------------------------------------
+
+/// Hi/lo split for the fused double-level tail. Intentionally independent of
+/// [`SplitEqGhash::MAX_N_HI`], which is shared with round 1 (five call sites in
+/// `univariate_skip_optimized`, plus `univariate_skip` and `permutation`) and
+/// is tuned for that phase's chunk count. The fused pass writes `N/4` rather
+/// than `N/2`, so its wave schedule is its own; changing the global cap to suit
+/// this kernel would silently reshape round 1's eq tables.
+const FUSED_TAIL_N_HI: usize = 9;
+
+/// Minimum *input* `log_n` at which the fused double pass is used. Below this
+/// the driver keeps the single-round path verbatim. The tail is geometric —
+/// the top round alone is half its traffic — so a crossover here captures
+/// ~99.9% of the available saving while leaving the small, latency-bound
+/// rounds on the simpler kernel.
+pub const FUSED_TAIL_MIN_LOG_N: usize = 17;
+
+/// Test-only override for [`FUSED_TAIL_MIN_LOG_N`], so the driver-level
+/// differential can drive the fused path at table sizes small enough to prove
+/// end-to-end in a unit test. `0` means "use the real constant".
+///
+/// **Thread-local, deliberately.** `cargo test` runs tests concurrently in one
+/// process, so a global here would leak one test's crossover into every other
+/// test's prover and make unrelated proofs nondeterministic. Thread-locality
+/// confines the override to the test that set it. The prover's rayon workers
+/// never read it — [`fused_tail_min_log_n`] is called only from the driver
+/// thread, once per tail round.
+///
+/// Compiled out entirely in production builds — [`fused_tail_min_log_n`] is a
+/// plain constant read there.
+#[cfg(test)]
+thread_local! {
+    pub(crate) static FUSED_TAIL_MIN_LOG_N_OVERRIDE: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
+
+/// The crossover actually in force. Read once per tail round, never per
+/// element.
+#[inline]
+pub fn fused_tail_min_log_n() -> usize {
+    #[cfg(test)]
+    {
+        let v = FUSED_TAIL_MIN_LOG_N_OVERRIDE.with(std::cell::Cell::get);
+        if v != 0 {
+            return v;
+        }
+    }
+    FUSED_TAIL_MIN_LOG_N
+}
+
+/// Deferred-reduction accumulator set for one chunk of a fused pass.
+///
+/// `p1`/`pinf` are the *exact* message for the round bound by the next
+/// challenge. `e*`/`f*` are the six challenge-independent coefficients of the
+/// round after it, in **evaluation basis** (value at 0, value at 1, leading
+/// coefficient) for each of the two message components.
+#[derive(Clone, Copy)]
+struct FusedAcc {
+    p1: F256Unreduced,
+    pinf: F256Unreduced,
+    e0: F256Unreduced,
+    e1: F256Unreduced,
+    einf: F256Unreduced,
+    f0: F256Unreduced,
+    f1: F256Unreduced,
+    finf: F256Unreduced,
+}
+
+impl FusedAcc {
+    const ZERO: Self = Self {
+        p1: F256Unreduced::ZERO,
+        pinf: F256Unreduced::ZERO,
+        e0: F256Unreduced::ZERO,
+        e1: F256Unreduced::ZERO,
+        einf: F256Unreduced::ZERO,
+        f0: F256Unreduced::ZERO,
+        f1: F256Unreduced::ZERO,
+        finf: F256Unreduced::ZERO,
+    };
+}
+
+/// The six challenge-independent coefficients of a round message, weighted and
+/// summed over the whole table — i.e. the *lookahead* message, still a
+/// polynomial in a challenge that has not been sampled yet.
+///
+/// Stored in evaluation basis: `g0 = G(0)`, `g1 = G(1)`, `ginf` = leading
+/// coefficient, for each of the two components. [`Lookahead::evaluate`] turns
+/// these into a concrete message once the challenge is known.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Lookahead {
+    e0: F128,
+    e1: F128,
+    einf: F128,
+    f0: F128,
+    f1: F128,
+    finf: F128,
+    wire: F128,
+}
+
+impl Lookahead {
+    /// Evaluate the deferred round message at the now-known challenge `rho`.
+    ///
+    /// A degree-2 polynomial with `G(0) = g0`, `G(1) = g1` and leading
+    /// coefficient `L` is, in characteristic 2,
+    ///
+    /// `G(x) = g0 + x·(g0 + g1 + L) + x²·L`
+    ///
+    /// (check: `G(0) = g0`; `G(1) = g0 + g0 + g1 + L + L = g1`). Evaluated by
+    /// Horner, so two multiplies per component.
+    ///
+    /// Returns `(r_next[0] · G(1), G(∞))` — the same wire convention as
+    /// [`round_pair_naive`] and [`fold_and_compute_round_pair_into`].
+    #[inline]
+    pub fn evaluate(&self, rho: F128) -> (F128, F128) {
+        let g1 = self.e0 + rho * ((self.e0 + self.e1 + self.einf) + rho * self.einf);
+        let ginf = self.f0 + rho * ((self.f0 + self.f1 + self.finf) + rho * self.finf);
+        (self.wire * g1, ginf)
+    }
+}
+
+/// Fused **two-level** tail pass: bind `rho_a` and `rho_b` in a single
+/// streaming pass, emit the exact next round message, and harvest the six
+/// challenge-independent coefficients of the round after that.
+///
+/// `a`/`b` have `n` entries; `a_out`/`b_out` receive `n / 4`. Returns the exact
+/// message `(r_next[0]·G(1), G(∞))` for the round the caller is about to emit,
+/// plus a [`Lookahead`] for the round after it.
+///
+/// # Why this is bit-exact
+///
+/// Fiat–Shamir forbids computing a round message before its challenge is
+/// sampled. It does **not** forbid computing that message's *coefficients*.
+/// Let `T` be the table this pass writes. The next round binds `rho_c` and
+/// folds `T` into `T'`, which is **affine** in `rho_c`:
+/// `T'[q] = T[2q] + rho_c·(T[2q] + T[2q+1])`. The round message is a
+/// **quadratic form** in the table (`Σ eq·a·b`), and every eq weight is a
+/// fixed zerocheck `r`, never a `rho` — so the message after next is a degree-2
+/// polynomial in `rho_c` whose coefficients contain no challenge at all.
+///
+/// Concretely, over a quadruple `(w0..w3)` of `T` the two folded values are
+/// `A0 = w0 + s·(w0+w1)` and `A1 = w2 + s·(w2+w3)` for `s = rho_c`, so
+///
+/// * `A1·B1 = w2·v2 + s·(…) + s²·(w2+w3)(v2+v3)`, and
+/// * `(A0+A1)(B0+B1) = (w0+w2)(v0+v2) + s·(…) + s²·(dw·dv)`.
+///
+/// Rather than store the middle coefficient we keep each quadratic in
+/// **evaluation basis** — its values at `s = 0` and `s = 1` plus the leading
+/// term. Characteristic 2 makes both endpoints free: `w2 + (w2+w3) = w3`, so
+/// the `s=1` value of the first form is just `w3·v3`; likewise
+/// `(w0+w2) + dw = w1+w3`. Every accumulator is therefore a product of table
+/// entries the pass already holds in registers.
+///
+/// The transcript is untouched: the caller still observes the exact message
+/// *before* sampling `rho_c`, and only then evaluates the lookahead. Same
+/// challenges, same order, same field operations — only the pass structure
+/// changes. Accumulation stays in [`F256Unreduced`] and reduces once per
+/// chunk, exactly as the single-round kernel does; reduction is `F2`-linear,
+/// so deferring it does not move a bit.
+///
+/// # Traffic
+///
+/// Two single rounds move `48N` then `24N` bytes. This pass reads `32N` and
+/// writes `8N` — `40N` against `72N`, the reason the mechanism exists.
+pub fn fold2_and_compute_round_pair_into(
+    a: &[F128],
+    b: &[F128],
+    a_out: &mut [F128],
+    b_out: &mut [F128],
+    rho_a: F128,
+    rho_b: F128,
+    r_next: &[F128],
+    r_next2: &[F128],
+) -> ((F128, F128), Lookahead) {
+    use rayon::prelude::*;
+
+    let n = a.len();
+    assert_eq!(b.len(), n);
+    assert!(n.is_power_of_two() && n >= 32);
+    let quarter = n / 4;
+    assert_eq!(a_out.len(), quarter);
+    assert_eq!(b_out.len(), quarter);
+    let log_n = n.trailing_zeros() as usize;
+    // Message for the round operating on the size-`quarter` output table.
+    assert_eq!(r_next.len(), log_n - 2);
+    // Message for the round after that, on the size-`quarter/2` table.
+    assert_eq!(r_next2.len(), log_n - 3);
+
+    // Two eq tables, both challenge-free. `eq_e` weights the exact message
+    // over PAIRS of the output table; `eq_l` weights the lookahead over
+    // QUADRUPLES of it. Chunks are aligned to the coarser (quadruple) split so
+    // every chunk owns whole quadruples of both.
+    // `n_hi` is capped by the SHORTER (lookahead) challenge list so both splits
+    // agree on chunk count; the exact split then necessarily has one more lo
+    // bit, which is what makes a chunk own whole quadruples of the exact eq.
+    let n_hi = FUSED_TAIL_N_HI.min(r_next2.len() - 1);
+    let eq_e = SplitEqGhash::with_n_hi(&r_next[1..], n_hi);
+    let eq_l = SplitEqGhash::with_n_hi(&r_next2[1..], n_hi);
+    let hi_size = 1usize << eq_e.n_hi;
+    assert_eq!(eq_l.n_hi, eq_e.n_hi);
+    assert_eq!(eq_l.n_lo + 1, eq_e.n_lo);
+    // Exhaustive-and-disjoint partition, the k=2 analogue of the single-round
+    // `lo_size · hi_size · 2 == half`. Both must hold or a chunk would silently
+    // under-write its output range.
+    let quads_per_chunk = 1usize << eq_l.n_lo;
+    assert_eq!((1usize << eq_e.n_lo) * hi_size * 2, quarter);
+    assert_eq!(quads_per_chunk * hi_size * 4, quarter);
+    assert!(quads_per_chunk >= 1);
+
+    let chunk_in = 16 * quads_per_chunk; // input elements consumed per chunk
+    let chunk_out = 4 * quads_per_chunk; // output elements produced per chunk
+    let eq_e_lo = &eq_e.lo;
+    let eq_l_lo = &eq_l.lo;
+
+    let acc = a_out
+        .par_chunks_mut(chunk_out)
+        .zip(b_out.par_chunks_mut(chunk_out))
+        .enumerate()
+        .map(|(x_hi, (a_out, b_out))| {
+            let a_in = &a[x_hi * chunk_in..(x_hi + 1) * chunk_in];
+            let b_in = &b[x_hi * chunk_in..(x_hi + 1) * chunk_in];
+            let mut acc = FusedAcc::ZERO;
+
+            for q in 0..quads_per_chunk {
+                let i = 16 * q;
+                let o = 4 * q;
+                // Fold two levels through registers. Each output element costs
+                // 3 multiplies per polynomial and touches 4 inputs.
+                let mut w = [F128::ZERO; 4];
+                let mut v = [F128::ZERO; 4];
+                for k in 0..4 {
+                    let s = i + 4 * k;
+                    let t0 = a_in[s];
+                    let t1 = a_in[s + 1];
+                    let t2 = a_in[s + 2];
+                    let t3 = a_in[s + 3];
+                    let a0 = t0 + rho_a * (t0 + t1);
+                    let a1 = t2 + rho_a * (t2 + t3);
+                    w[k] = a0 + rho_b * (a0 + a1);
+
+                    let u0 = b_in[s];
+                    let u1 = b_in[s + 1];
+                    let u2 = b_in[s + 2];
+                    let u3 = b_in[s + 3];
+                    let c0 = u0 + rho_a * (u0 + u1);
+                    let c1 = u2 + rho_a * (u2 + u3);
+                    v[k] = c0 + rho_b * (c0 + c1);
+                }
+                a_out[o] = w[0];
+                a_out[o + 1] = w[1];
+                a_out[o + 2] = w[2];
+                a_out[o + 3] = w[3];
+                b_out[o] = v[0];
+                b_out[o + 1] = v[1];
+                b_out[o + 2] = v[2];
+                b_out[o + 3] = v[3];
+
+                // Products shared between the exact message (pair 2q+1) and the
+                // lookahead (its s=1 and leading terms).
+                let g1_hi = w[3] * v[3];
+                let gi_hi = (w[2] + w[3]) * (v[2] + v[3]);
+
+                // Exact message over the two output pairs (w0,w1) and (w2,w3).
+                let ea = eq_e_lo[2 * q];
+                let eb = eq_e_lo[2 * q + 1];
+                acc.p1 ^= ea.mul_unreduced(w[1] * v[1]);
+                acc.p1 ^= eb.mul_unreduced(g1_hi);
+                acc.pinf ^= ea.mul_unreduced((w[0] + w[1]) * (v[0] + v[1]));
+                acc.pinf ^= eb.mul_unreduced(gi_hi);
+
+                // Lookahead over the single output quadruple, evaluation basis.
+                let el = eq_l_lo[q];
+                let dw = w[0] + w[1] + w[2] + w[3];
+                let dv = v[0] + v[1] + v[2] + v[3];
+                acc.e0 ^= el.mul_unreduced(w[2] * v[2]);
+                acc.e1 ^= el.mul_unreduced(g1_hi);
+                acc.einf ^= el.mul_unreduced(gi_hi);
+                acc.f0 ^= el.mul_unreduced((w[0] + w[2]) * (v[0] + v[2]));
+                acc.f1 ^= el.mul_unreduced((w[1] + w[3]) * (v[1] + v[3]));
+                acc.finf ^= el.mul_unreduced(dw * dv);
+            }
+
+            // One reduction per chunk, then the chunk's hi-half eq weights.
+            let he = eq_e.hi[x_hi];
+            let hl = eq_l.hi[x_hi];
+            [
+                he * acc.p1.reduce(),
+                he * acc.pinf.reduce(),
+                hl * acc.e0.reduce(),
+                hl * acc.e1.reduce(),
+                hl * acc.einf.reduce(),
+                hl * acc.f0.reduce(),
+                hl * acc.f1.reduce(),
+                hl * acc.finf.reduce(),
+            ]
+        })
+        .reduce(
+            || [F128::ZERO; 8],
+            |x, y| std::array::from_fn(|i| x[i] + y[i]),
+        );
+
+    let msg = (r_next[0] * acc[0], acc[1]);
+    let look = Lookahead {
+        e0: acc[2],
+        e1: acc[3],
+        einf: acc[4],
+        f0: acc[5],
+        f1: acc[6],
+        finf: acc[7],
+        wire: r_next2[0],
+    };
+    (msg, look)
+}
+
+/// Bootstrap pass for the fused tail: bind **one** level at `r_fold`, emit the
+/// exact next round message, and additionally harvest the six
+/// challenge-independent coefficients for the round after it.
+///
+/// A steady-state [`fold2_and_compute_round_pair_into`] needs *two* challenges
+/// on entry, but the tail loop starts holding only one. This pass pays the
+/// full single-round traffic once to prime the pipeline; every pass after it
+/// is a double.
+///
+/// Identical output contract to [`fold_and_compute_round_pair_into`] — same
+/// folded tables, same exact message — plus the [`Lookahead`]. See
+/// [`fold2_and_compute_round_pair_into`] for why the lookahead is bit-exact.
+pub fn fold_and_compute_round_pair_into_with_lookahead(
+    a: &[F128],
+    b: &[F128],
+    a_out: &mut [F128],
+    b_out: &mut [F128],
+    r_fold: F128,
+    r_next: &[F128],
+    r_next2: &[F128],
+) -> ((F128, F128), Lookahead) {
+    use rayon::prelude::*;
+
+    let n = a.len();
+    assert_eq!(b.len(), n);
+    assert!(n.is_power_of_two() && n >= 16);
+    let half = n / 2;
+    assert_eq!(a_out.len(), half);
+    assert_eq!(b_out.len(), half);
+    let log_n = n.trailing_zeros() as usize;
+    assert_eq!(r_next.len(), log_n - 1);
+    assert_eq!(r_next2.len(), log_n - 2);
+
+    let n_hi = FUSED_TAIL_N_HI.min(r_next2.len() - 1);
+    let eq_e = SplitEqGhash::with_n_hi(&r_next[1..], n_hi);
+    let eq_l = SplitEqGhash::with_n_hi(&r_next2[1..], n_hi);
+    let hi_size = 1usize << eq_e.n_hi;
+    assert_eq!(eq_l.n_hi, eq_e.n_hi);
+    assert_eq!(eq_l.n_lo + 1, eq_e.n_lo);
+    let quads_per_chunk = 1usize << eq_l.n_lo;
+    assert_eq!((1usize << eq_e.n_lo) * hi_size * 2, half);
+    assert_eq!(quads_per_chunk * hi_size * 4, half);
+
+    let chunk_in = 8 * quads_per_chunk;
+    let chunk_out = 4 * quads_per_chunk;
+    let eq_e_lo = &eq_e.lo;
+    let eq_l_lo = &eq_l.lo;
+
+    let acc = a_out
+        .par_chunks_mut(chunk_out)
+        .zip(b_out.par_chunks_mut(chunk_out))
+        .enumerate()
+        .map(|(x_hi, (a_out, b_out))| {
+            let a_in = &a[x_hi * chunk_in..(x_hi + 1) * chunk_in];
+            let b_in = &b[x_hi * chunk_in..(x_hi + 1) * chunk_in];
+            let mut acc = FusedAcc::ZERO;
+
+            for q in 0..quads_per_chunk {
+                let i = 8 * q;
+                let o = 4 * q;
+                let mut w = [F128::ZERO; 4];
+                let mut v = [F128::ZERO; 4];
+                for k in 0..4 {
+                    let s = i + 2 * k;
+                    let t0 = a_in[s];
+                    let t1 = a_in[s + 1];
+                    w[k] = t0 + r_fold * (t0 + t1);
+                    let u0 = b_in[s];
+                    let u1 = b_in[s + 1];
+                    v[k] = u0 + r_fold * (u0 + u1);
+                }
+                a_out[o] = w[0];
+                a_out[o + 1] = w[1];
+                a_out[o + 2] = w[2];
+                a_out[o + 3] = w[3];
+                b_out[o] = v[0];
+                b_out[o + 1] = v[1];
+                b_out[o + 2] = v[2];
+                b_out[o + 3] = v[3];
+
+                let g1_hi = w[3] * v[3];
+                let gi_hi = (w[2] + w[3]) * (v[2] + v[3]);
+
+                let ea = eq_e_lo[2 * q];
+                let eb = eq_e_lo[2 * q + 1];
+                acc.p1 ^= ea.mul_unreduced(w[1] * v[1]);
+                acc.p1 ^= eb.mul_unreduced(g1_hi);
+                acc.pinf ^= ea.mul_unreduced((w[0] + w[1]) * (v[0] + v[1]));
+                acc.pinf ^= eb.mul_unreduced(gi_hi);
+
+                let el = eq_l_lo[q];
+                let dw = w[0] + w[1] + w[2] + w[3];
+                let dv = v[0] + v[1] + v[2] + v[3];
+                acc.e0 ^= el.mul_unreduced(w[2] * v[2]);
+                acc.e1 ^= el.mul_unreduced(g1_hi);
+                acc.einf ^= el.mul_unreduced(gi_hi);
+                acc.f0 ^= el.mul_unreduced((w[0] + w[2]) * (v[0] + v[2]));
+                acc.f1 ^= el.mul_unreduced((w[1] + w[3]) * (v[1] + v[3]));
+                acc.finf ^= el.mul_unreduced(dw * dv);
+            }
+
+            let he = eq_e.hi[x_hi];
+            let hl = eq_l.hi[x_hi];
+            [
+                he * acc.p1.reduce(),
+                he * acc.pinf.reduce(),
+                hl * acc.e0.reduce(),
+                hl * acc.e1.reduce(),
+                hl * acc.einf.reduce(),
+                hl * acc.f0.reduce(),
+                hl * acc.f1.reduce(),
+                hl * acc.finf.reduce(),
+            ]
+        })
+        .reduce(
+            || [F128::ZERO; 8],
+            |x, y| std::array::from_fn(|i| x[i] + y[i]),
+        );
+
+    let msg = (r_next[0] * acc[0], acc[1]);
+    let look = Lookahead {
+        e0: acc[2],
+        e1: acc[3],
+        einf: acc[4],
+        f0: acc[5],
+        f1: acc[6],
+        finf: acc[7],
+        wire: r_next2[0],
+    };
+    (msg, look)
+}
+
 /// Serial reference — identical I/O contract to
 /// [`uni_skip_fold_and_round_pair_optimized_packed`], no rayon. Kept under
 /// `#[cfg(test)]` as the cross-check oracle for the parallel version.
@@ -1697,6 +2321,156 @@ mod tests {
         }
     }
 
+    /// **The k=2 fusion cross-check**: one fused double-level pass must produce
+    /// exactly what two single rounds produce — same folded tables, same *both*
+    /// messages — with the second message reconstructed from the lookahead
+    /// coefficients only after its challenge is known.
+    ///
+    /// The oracle is the shipped single-round path
+    /// (`fold_and_compute_round_pair_into` → `fold_in_place_pair` +
+    /// `round_pair_naive`), so this pins the fused kernel to the code the
+    /// prover actually used before fusion, not to a re-derivation of it.
+    ///
+    /// Destinations are **oversized and poisoned with non-zero garbage**.
+    /// Zero-filled buffers would hide a missing first write, because `F128`
+    /// addition is XOR and `ZERO` is its identity — a slot accumulated into
+    /// rather than assigned would still read correct. The tail past the used
+    /// prefix must survive untouched, which catches an over-wide chunk range.
+    #[test]
+    fn fused_double_round_matches_two_single_rounds() {
+        const POISON: F128 = F128 {
+            lo: 0xdead_beef_0bad_f00d,
+            hi: 0x1337_c0de_feed_face,
+        };
+
+        for &log_n in &[15usize, 16, 17, 18] {
+            let mut rng = Rng::new(0xF02E_0000 + log_n as u64);
+            let n = 1usize << log_n;
+            let a: Vec<F128> = (0..n).map(|_| rng.f128()).collect();
+            let b: Vec<F128> = (0..n).map(|_| rng.f128()).collect();
+            let rho_a = rng.f128();
+            let rho_b = rng.f128();
+            // Messages for the two rounds the fused pass covers.
+            let r_next = rng.f128_vec(log_n - 2);
+            let r_next2 = rng.f128_vec(log_n - 3);
+
+            let quarter = n / 4;
+            let tail = 64;
+            let mut a_out = vec![POISON; quarter + tail];
+            let mut b_out = vec![POISON; quarter + tail];
+            let ((m1, mi), look) = fold2_and_compute_round_pair_into(
+                &a,
+                &b,
+                &mut a_out[..quarter],
+                &mut b_out[..quarter],
+                rho_a,
+                rho_b,
+                &r_next,
+                &r_next2,
+            );
+
+            // Oracle: bind rho_a, bind rho_b, then read the message off the
+            // resulting table exactly as the unfused prover would.
+            let mut a_unf = a.clone();
+            let mut b_unf = b.clone();
+            fold_in_place_pair(&mut a_unf, &mut b_unf, rho_a);
+            fold_in_place_pair(&mut a_unf, &mut b_unf, rho_b);
+            let (m1_unf, mi_unf) = round_pair_naive(&a_unf, &b_unf, &r_next);
+
+            assert_eq!(&a_out[..quarter], &a_unf[..], "a mismatch at log_n={log_n}");
+            assert_eq!(&b_out[..quarter], &b_unf[..], "b mismatch at log_n={log_n}");
+            assert!(
+                a_out[quarter..].iter().all(|&v| v == POISON)
+                    && b_out[quarter..].iter().all(|&v| v == POISON),
+                "wrote past the destination at log_n={log_n}"
+            );
+            assert_eq!(m1, m1_unf, "exact msg_1 mismatch at log_n={log_n}");
+            assert_eq!(mi, mi_unf, "exact msg_inf mismatch at log_n={log_n}");
+
+            // The lookahead must reproduce the NEXT round's message for an
+            // arbitrary challenge — the challenge is only sampled after the
+            // exact message above is observed, so the kernel cannot have known
+            // it. Several values, since a degree-2 form agreeing at three
+            // points would still be pinned.
+            for _ in 0..4 {
+                let rho_c = rng.f128();
+                let mut a_n = a_unf.clone();
+                let mut b_n = b_unf.clone();
+                fold_in_place_pair(&mut a_n, &mut b_n, rho_c);
+                let expect = round_pair_naive(&a_n, &b_n, &r_next2);
+                assert_eq!(
+                    look.evaluate(rho_c),
+                    expect,
+                    "lookahead mismatch at log_n={log_n}"
+                );
+            }
+        }
+    }
+
+    /// The bootstrap pass must be a drop-in for the shipped single-round kernel
+    /// — identical folded tables and identical message — while additionally
+    /// yielding a lookahead that predicts the following round.
+    #[test]
+    fn fused_bootstrap_matches_single_round() {
+        const POISON: F128 = F128 {
+            lo: 0x0123_4567_89ab_cdef,
+            hi: 0xfedc_ba98_7654_3210,
+        };
+
+        for &log_n in &[15usize, 16, 17] {
+            let mut rng = Rng::new(0xB007_0000 + log_n as u64);
+            let n = 1usize << log_n;
+            let a: Vec<F128> = (0..n).map(|_| rng.f128()).collect();
+            let b: Vec<F128> = (0..n).map(|_| rng.f128()).collect();
+            let r_fold = rng.f128();
+            let r_next = rng.f128_vec(log_n - 1);
+            let r_next2 = rng.f128_vec(log_n - 2);
+
+            let half = n / 2;
+            let tail = 48;
+            let mut a_out = vec![POISON; half + tail];
+            let mut b_out = vec![POISON; half + tail];
+            let ((m1, mi), look) = fold_and_compute_round_pair_into_with_lookahead(
+                &a,
+                &b,
+                &mut a_out[..half],
+                &mut b_out[..half],
+                r_fold,
+                &r_next,
+                &r_next2,
+            );
+
+            // Oracle is the shipped kernel itself, into its own poisoned dest.
+            let mut a_ref = vec![POISON; half];
+            let mut b_ref = vec![POISON; half];
+            let (m1_ref, mi_ref) =
+                fold_and_compute_round_pair_into(&a, &b, &mut a_ref, &mut b_ref, r_fold, &r_next);
+
+            assert_eq!(&a_out[..half], &a_ref[..], "a mismatch at log_n={log_n}");
+            assert_eq!(&b_out[..half], &b_ref[..], "b mismatch at log_n={log_n}");
+            assert!(
+                a_out[half..].iter().all(|&v| v == POISON)
+                    && b_out[half..].iter().all(|&v| v == POISON),
+                "wrote past the destination at log_n={log_n}"
+            );
+            assert_eq!(m1, m1_ref, "msg_1 mismatch at log_n={log_n}");
+            assert_eq!(mi, mi_ref, "msg_inf mismatch at log_n={log_n}");
+
+            for _ in 0..4 {
+                let rho_c = rng.f128();
+                let mut a_n = a_ref.clone();
+                let mut b_n = b_ref.clone();
+                fold_in_place_pair(&mut a_n, &mut b_n, rho_c);
+                let expect = round_pair_naive(&a_n, &b_n, &r_next2);
+                assert_eq!(
+                    look.evaluate(rho_c),
+                    expect,
+                    "bootstrap lookahead mismatch at log_n={log_n}"
+                );
+            }
+        }
+    }
+
     /// **The c-claim identity**: `C_s · interpolate(round1_c, k_skip, z)` equals
     /// `ĉ(z, r_rest)` computed by direct folding (Lagrange at z, then bind each
     /// `r_rest` value). This is the math identity that lets the extract_c
@@ -1936,6 +2710,99 @@ mod tests {
             crate::scratch::give_f128(legacy_b);
             crate::scratch::clear();
         }
+    }
+
+    /// **(B) seed cross-check.** The lookahead-harvesting compact round must be
+    /// a drop-in for [`fold_compact_and_compute_round_pair`] — identical
+    /// reconstructed tables and identical exact message — while additionally
+    /// yielding coefficients that reproduce the *next* round's message once its
+    /// challenge exists.
+    ///
+    /// This is what lets the tail skip its single-level bootstrap, so an error
+    /// here would corrupt the very first tail message at the largest table. The
+    /// oracle is the shipped non-lookahead path plus
+    /// [`fold_in_place_pair`] → [`round_pair_naive`], and the lookahead is
+    /// probed at several challenges including the `0`/`1`/all-ones edge cases
+    /// (a degree-2 form is pinned by three points, so four probes over random
+    /// and extremal values is a real check rather than an interpolation).
+    #[test]
+    fn compact_seed_lookahead_matches_unfused_next_round() {
+        const K_SKIP: usize = 6;
+        const M: usize = 20;
+
+        let mut rng = Rng::new(0x5EED_B00C);
+        let a = rng.bits(1 << M);
+        let b = rng.bits(1 << M);
+        let a_packed = pack_bits(&a);
+        let b_packed = pack_bits(&b);
+        let z = rng.f128();
+        let mlv_challenges = rng.f128_vec(M - K_SKIP);
+        let r_next = rng.f128_vec(M - K_SKIP - 1);
+        let r_next2 = rng.f128_vec(M - K_SKIP - 2);
+        let table = UniSkipFoldTable::new(K_SKIP, z);
+        let padding = PaddingSpec::dense(M);
+
+        crate::scratch::clear();
+        let (compact, _m1, _mi) = uni_skip_fold_and_round_pair_compact_padded(
+            &a_packed,
+            &b_packed,
+            M,
+            K_SKIP,
+            &table,
+            &mlv_challenges,
+            &padding,
+        );
+
+        let rhos = [
+            F128::ZERO,
+            F128::ONE,
+            F128 {
+                lo: u64::MAX,
+                hi: u64::MAX,
+            },
+            rng.f128(),
+        ];
+
+        for &rho in &rhos {
+            // Oracle: the shipped compact round, no lookahead.
+            let (want_a, want_b, want_m1, want_mi) =
+                fold_compact_and_compute_round_pair(&compact, &table, rho, &r_next);
+
+            let (got_a, got_b, got_m1, got_mi, look) =
+                fold_compact_and_compute_round_pair_with_lookahead(
+                    &compact, &table, rho, &r_next, &r_next2,
+                );
+
+            assert_eq!(got_a, want_a, "seed A mismatch at rho={rho:?}");
+            assert_eq!(got_b, want_b, "seed B mismatch at rho={rho:?}");
+            assert_eq!(
+                (got_m1, got_mi),
+                (want_m1, want_mi),
+                "seed exact message mismatch at rho={rho:?}"
+            );
+
+            // The lookahead must equal the true next-round message for a
+            // challenge sampled only after the exact message above is observed.
+            for _ in 0..4 {
+                let rho_c = rng.f128();
+                let mut nx_a = want_a.clone();
+                let mut nx_b = want_b.clone();
+                fold_in_place_pair(&mut nx_a, &mut nx_b, rho_c);
+                assert_eq!(
+                    look.evaluate(rho_c),
+                    round_pair_naive(&nx_a, &nx_b, &r_next2),
+                    "seed lookahead mismatch at rho={rho:?}"
+                );
+            }
+
+            crate::scratch::give_f128(want_a);
+            crate::scratch::give_f128(want_b);
+            crate::scratch::give_f128(got_a);
+            crate::scratch::give_f128(got_b);
+        }
+
+        compact.recycle();
+        crate::scratch::clear();
     }
 
     /// Parallel `uni_skip_fold_and_round_pair_optimized_packed` produces
