@@ -51,6 +51,23 @@ pub(in super::super) fn shift_reduce_inner_ab_scalar(
     }
 }
 
+/// Scalar fallback for the fixed medium-position AB conversion.
+#[cfg(not(target_arch = "aarch64"))]
+pub(super) fn preconvert_ab(
+    chunk_ab_bytes: &[[u8; 64]; 16],
+    n_b_med: usize,
+    convert: &[F128],
+    output: &mut [F128; 64],
+) {
+    for lane in 0..64 {
+        let mut converted_ab = F128::ZERO;
+        for b_med in 0..n_b_med {
+            converted_ab += convert[b_med * 256 + chunk_ab_bytes[b_med][lane] as usize];
+        }
+        output[lane] = converted_ab;
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 #[cfg(not(target_arch = "aarch64"))]
 pub(super) fn accumulate_convert(
@@ -106,6 +123,36 @@ pub(super) fn accumulate_convert_with_s_hat_v(
             converted_c_1 += convert[table_base + (c & 0xaa)];
         }
         partial_ab[lane] += converted_ab * eq_lo_val;
+        partial_c_0[lane] += converted_c_0 * eq_lo_val;
+        partial_c_1[lane] += converted_c_1 * eq_lo_val;
+    }
+}
+
+/// Scalar correctness fallback for a preconverted AB row. Production
+/// selection is AArch64-only, but keeping this implementation portable lets
+/// forced-format tests validate storage and dispatch on every host.
+#[allow(clippy::too_many_arguments)]
+#[cfg(not(target_arch = "aarch64"))]
+pub(super) fn accumulate_preconverted_ab_with_s_hat_v(
+    preconverted_ab: &[F128; 64],
+    chunk_c_bytes: &[[u8; 64]; 16],
+    n_b_med: usize,
+    convert: &[F128],
+    eq_lo_val: F128,
+    partial_ab: &mut [F128; 64],
+    partial_c_0: &mut [F128; 64],
+    partial_c_1: &mut [F128; 64],
+) {
+    for lane in 0..64 {
+        let mut converted_c_0 = F128::ZERO;
+        let mut converted_c_1 = F128::ZERO;
+        for b_med in 0..n_b_med {
+            let table_base = b_med * 256;
+            let c = chunk_c_bytes[b_med][lane] as usize;
+            converted_c_0 += convert[table_base + (c & 0x55)];
+            converted_c_1 += convert[table_base + (c & 0xaa)];
+        }
+        partial_ab[lane] += preconverted_ab[lane] * eq_lo_val;
         partial_c_0[lane] += converted_c_0 * eq_lo_val;
         partial_c_1[lane] += converted_c_1 * eq_lo_val;
     }

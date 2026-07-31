@@ -1141,4 +1141,53 @@ mod tests {
         assert_eq!(claim1.z, claim2.z);
         assert_eq!(claim1.mlv_challenges, claim2.mlv_challenges);
     }
+
+    /// Moving the fixed medium conversion into the challenge-independent AB
+    /// precompute must not perturb any Fiat-Shamir input or downstream proof
+    /// message. Force the ranked-only representation at a small dimension and
+    /// compare both the structured result and serialized proof bytes.
+    #[test]
+    fn preconverted_ab_proof_is_byte_identical_to_fused() {
+        let m = 14;
+        let mut rng = Rng::new(0xAB_C0DE_0014);
+        let a = rng.bits(1 << m);
+        let b = rng.bits(1 << m);
+        let c: Vec<bool> = a.iter().zip(&b).map(|(x, y)| *x & *y).collect();
+        let (a_p, b_p, c_p) = pack_abc(&a, &b, &c);
+        let padding = PaddingSpec::dense(m);
+
+        let ntt_s = crate::ntt::AdditiveNttGf8::new(K_SKIP, crate::field::F8::ZERO);
+        let ntt_l = crate::ntt::AdditiveNttGf8::new(K_SKIP, crate::field::F8(1u8 << K_SKIP));
+        let inv_table = InvNttTableByteSingleGf8::new(&ntt_s, &ntt_l);
+        let ab_inner =
+            univariate_skip_optimized::precompute_round1_ab_inner_packed_padded_force_preconverted(
+                &a_p, &b_p, m, K_SKIP, &inv_table, &padding,
+            );
+
+        let mut fused_challenger = FsChallenger::new(b"flock-preconverted-ab-equivalence-v0");
+        let fused = prove_packed_padded_capture_s_hat_v_c(
+            &a_p,
+            &b_p,
+            &c_p,
+            m,
+            &padding,
+            &mut fused_challenger,
+        );
+        let mut split_challenger = FsChallenger::new(b"flock-preconverted-ab-equivalence-v0");
+        let split = prove_packed_padded_capture_s_hat_v_c_with_precomputed_ab(
+            &a_p,
+            &b_p,
+            &c_p,
+            m,
+            &padding,
+            ab_inner,
+            &mut split_challenger,
+        );
+
+        assert_eq!(split, fused);
+        assert_eq!(
+            bincode::serialize(&split.0).expect("serialize split zerocheck proof"),
+            bincode::serialize(&fused.0).expect("serialize fused zerocheck proof")
+        );
+    }
 }

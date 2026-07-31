@@ -138,6 +138,27 @@ pub(super) fn shift_reduce_inner_ab(
     );
 }
 
+/// Collapse the fixed medium-position AB convert sum before transcript
+/// challenges are available. The output row occupies exactly the same 1 KiB
+/// as the 16 shifted-byte inputs.
+#[inline]
+pub(super) fn preconvert_ab(
+    chunk_ab_bytes: &[[u8; 64]; 16],
+    n_b_med: usize,
+    convert: &[super::F128],
+    output: &mut [super::F128; 64],
+) {
+    #[cfg(target_arch = "aarch64")]
+    // SAFETY: aarch64 statically guarantees NEON and all fixed-size inputs
+    // cover the table-selected loads and contiguous output stores.
+    unsafe {
+        aarch64::preconvert_ab(chunk_ab_bytes, n_b_med, convert, output);
+    }
+
+    #[cfg(not(target_arch = "aarch64"))]
+    portable::preconvert_ab(chunk_ab_bytes, n_b_med, convert, output);
+}
+
 #[allow(clippy::too_many_arguments)]
 #[inline]
 pub(super) fn accumulate_convert(
@@ -257,4 +278,51 @@ pub(super) fn accumulate_convert_with_s_hat_v(
         partial_c_0,
         partial_c_1,
     );
+}
+
+#[allow(clippy::too_many_arguments)]
+#[inline]
+pub(super) fn accumulate_preconverted_ab_with_s_hat_v(
+    preconverted_ab: &[super::F128; 64],
+    chunk_c_bytes: &[[u8; 64]; 16],
+    n_b_med: usize,
+    convert: &[super::F128],
+    paired_c: &(Vec<super::F128>, Vec<super::F128>),
+    eq_lo_val: super::F128,
+    partial_ab: &mut [super::F128; 64],
+    partial_c_0: &mut [super::F128; 64],
+    partial_c_1: &mut [super::F128; 64],
+) {
+    #[cfg(target_arch = "aarch64")]
+    // SAFETY: aarch64 statically guarantees NEON and the fixed arrays cover
+    // every four-lane load/store and table-selected gather.
+    unsafe {
+        aarch64::accumulate_preconverted_ab_with_s_hat_v(
+            preconverted_ab,
+            chunk_c_bytes,
+            n_b_med,
+            convert,
+            &paired_c.0,
+            &paired_c.1,
+            eq_lo_val,
+            partial_ab,
+            partial_c_0,
+            partial_c_1,
+        );
+    }
+
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        let _ = paired_c;
+        portable::accumulate_preconverted_ab_with_s_hat_v(
+            preconverted_ab,
+            chunk_c_bytes,
+            n_b_med,
+            convert,
+            eq_lo_val,
+            partial_ab,
+            partial_c_0,
+            partial_c_1,
+        );
+    }
 }

@@ -1,5 +1,81 @@
 use super::super::{F8, F128, InvNttTableByteSingleGf8, N_CHUNKS};
 
+/// Collapse the fixed medium-position AB convert sum into one F128 per lane.
+/// Four independent lanes and pairwise EOR3 keep the irregular L1 gather
+/// chains in flight while writing one contiguous, storage-neutral 1 KiB row.
+#[inline(always)]
+pub(crate) unsafe fn preconvert_ab(
+    chunk_ab_bytes: &[[u8; 64]; 16],
+    n_b_med: usize,
+    convert: &[F128],
+    output: &mut [F128; 64],
+) {
+    use core::arch::aarch64::*;
+
+    debug_assert!(n_b_med <= 16);
+    debug_assert_eq!(convert.len(), 16 * 256);
+
+    // SAFETY: every byte is a bounded table index and each fixed output group
+    // has four contiguous F128 destinations.
+    unsafe {
+        let convert_ptr = convert.as_ptr() as *const u8;
+        for lane in (0..64).step_by(4) {
+            let mut ab0 = vdupq_n_u8(0);
+            let mut ab1 = vdupq_n_u8(0);
+            let mut ab2 = vdupq_n_u8(0);
+            let mut ab3 = vdupq_n_u8(0);
+
+            for pair in 0..n_b_med / 2 {
+                let b_even = 2 * pair;
+                let b_odd = b_even + 1;
+                let t_even = convert_ptr.add(b_even * 256 * 16);
+                let t_odd = convert_ptr.add(b_odd * 256 * 16);
+                let we = (chunk_ab_bytes[b_even].as_ptr().add(lane) as *const u32).read_unaligned()
+                    as usize;
+                let wo = (chunk_ab_bytes[b_odd].as_ptr().add(lane) as *const u32).read_unaligned()
+                    as usize;
+                ab0 = xor3_u8(
+                    ab0,
+                    vld1q_u8(t_even.add((we & 0xff) * 16)),
+                    vld1q_u8(t_odd.add((wo & 0xff) * 16)),
+                );
+                ab1 = xor3_u8(
+                    ab1,
+                    vld1q_u8(t_even.add(((we >> 8) & 0xff) * 16)),
+                    vld1q_u8(t_odd.add(((wo >> 8) & 0xff) * 16)),
+                );
+                ab2 = xor3_u8(
+                    ab2,
+                    vld1q_u8(t_even.add(((we >> 16) & 0xff) * 16)),
+                    vld1q_u8(t_odd.add(((wo >> 16) & 0xff) * 16)),
+                );
+                ab3 = xor3_u8(
+                    ab3,
+                    vld1q_u8(t_even.add((we >> 24) * 16)),
+                    vld1q_u8(t_odd.add((wo >> 24) * 16)),
+                );
+            }
+
+            if n_b_med & 1 == 1 {
+                let b_med = n_b_med - 1;
+                let table = convert_ptr.add(b_med * 256 * 16);
+                let word = (chunk_ab_bytes[b_med].as_ptr().add(lane) as *const u32).read_unaligned()
+                    as usize;
+                ab0 = veorq_u8(ab0, vld1q_u8(table.add((word & 0xff) * 16)));
+                ab1 = veorq_u8(ab1, vld1q_u8(table.add(((word >> 8) & 0xff) * 16)));
+                ab2 = veorq_u8(ab2, vld1q_u8(table.add(((word >> 16) & 0xff) * 16)));
+                ab3 = veorq_u8(ab3, vld1q_u8(table.add((word >> 24) * 16)));
+            }
+
+            let out = output.as_mut_ptr().add(lane) as *mut u8;
+            vst1q_u8(out, ab0);
+            vst1q_u8(out.add(16), ab1);
+            vst1q_u8(out.add(32), ab2);
+            vst1q_u8(out.add(48), ab3);
+        }
+    }
+}
+
 /// Four-lane convert-table fold.
 ///
 /// Mirrors [`accumulate_convert_with_s_hat_v`]: four lanes are processed
@@ -372,6 +448,166 @@ pub(crate) unsafe fn accumulate_convert_with_s_hat_v(
             drain_lane!(1, ab1, c01, c11);
             drain_lane!(2, ab2, c02, c12);
             drain_lane!(3, ab3, c03, c13);
+        }
+    }
+}
+
+/// Challenge-weight a preconverted AB row while retaining the frontier's
+/// four-lane, paired-table two-bank C fold. Compared with
+/// [`accumulate_convert_with_s_hat_v`], the live phase has no AB byte copies
+/// and no AB convert-table gathers; it reads one sequential F128 row instead.
+#[allow(clippy::too_many_arguments)]
+#[inline(always)]
+pub(crate) unsafe fn accumulate_preconverted_ab_with_s_hat_v(
+    preconverted_ab: &[F128; 64],
+    chunk_c_bytes: &[[u8; 64]; 16],
+    n_b_med: usize,
+    convert: &[F128],
+    m0: &[F128],
+    m1: &[F128],
+    eq_lo_val: F128,
+    partial_ab: &mut [F128; 64],
+    partial_c_0: &mut [F128; 64],
+    partial_c_1: &mut [F128; 64],
+) {
+    use core::arch::aarch64::*;
+
+    debug_assert!(n_b_med <= 16);
+    debug_assert_eq!(convert.len(), 16 * 256);
+    debug_assert_eq!(m0.len(), 8 * 256);
+    debug_assert_eq!(m1.len(), 8 * 256);
+
+    // SAFETY: byte-derived indices remain inside the debug-asserted tables,
+    // and every fixed array covers the four-lane accesses below.
+    unsafe {
+        let convert_ptr = convert.as_ptr() as *const u8;
+        let m0_ptr = m0.as_ptr() as *const u8;
+        let m1_ptr = m1.as_ptr() as *const u8;
+        let n_pairs = n_b_med / 2;
+        for lane in (0..64).step_by(4) {
+            // Eight live q accumulators, down from twelve in the mixed AB+C
+            // kernel, leave ample register headroom for the address stream.
+            let mut c00 = vdupq_n_u8(0);
+            let mut c01 = vdupq_n_u8(0);
+            let mut c02 = vdupq_n_u8(0);
+            let mut c03 = vdupq_n_u8(0);
+            let mut c10 = vdupq_n_u8(0);
+            let mut c11 = vdupq_n_u8(0);
+            let mut c12 = vdupq_n_u8(0);
+            let mut c13 = vdupq_n_u8(0);
+
+            macro_rules! gather_c_pair {
+                ($p:expr) => {{
+                    let p = $p;
+                    let (b_even, b_odd) = (2 * p, 2 * p + 1);
+                    let q0 = m0_ptr.add(p * 256 * 16);
+                    let q1 = m1_ptr.add(p * 256 * 16);
+                    let ce = (chunk_c_bytes[b_even].as_ptr().add(lane) as *const u32)
+                        .read_unaligned() as usize;
+                    let co = (chunk_c_bytes[b_odd].as_ptr().add(lane) as *const u32)
+                        .read_unaligned() as usize;
+                    let jw = (ce & 0x5555_5555) | ((co << 1) & 0xaaaa_aaaa);
+                    let kw = (ce & 0xaaaa_aaaa) | ((co >> 1) & 0x5555_5555);
+                    (q0, q1, jw, kw)
+                }};
+            }
+
+            let mut p = 0;
+            while p + 1 < n_pairs {
+                let (q00, q10, jw0, kw0) = gather_c_pair!(p);
+                let (q01, q11, jw1, kw1) = gather_c_pair!(p + 1);
+                c00 = xor3_u8(
+                    c00,
+                    vld1q_u8(q00.add((jw0 & 0xff) * 16)),
+                    vld1q_u8(q01.add((jw1 & 0xff) * 16)),
+                );
+                c01 = xor3_u8(
+                    c01,
+                    vld1q_u8(q00.add(((jw0 >> 8) & 0xff) * 16)),
+                    vld1q_u8(q01.add(((jw1 >> 8) & 0xff) * 16)),
+                );
+                c02 = xor3_u8(
+                    c02,
+                    vld1q_u8(q00.add(((jw0 >> 16) & 0xff) * 16)),
+                    vld1q_u8(q01.add(((jw1 >> 16) & 0xff) * 16)),
+                );
+                c03 = xor3_u8(
+                    c03,
+                    vld1q_u8(q00.add((jw0 >> 24) * 16)),
+                    vld1q_u8(q01.add((jw1 >> 24) * 16)),
+                );
+                c10 = xor3_u8(
+                    c10,
+                    vld1q_u8(q10.add((kw0 & 0xff) * 16)),
+                    vld1q_u8(q11.add((kw1 & 0xff) * 16)),
+                );
+                c11 = xor3_u8(
+                    c11,
+                    vld1q_u8(q10.add(((kw0 >> 8) & 0xff) * 16)),
+                    vld1q_u8(q11.add(((kw1 >> 8) & 0xff) * 16)),
+                );
+                c12 = xor3_u8(
+                    c12,
+                    vld1q_u8(q10.add(((kw0 >> 16) & 0xff) * 16)),
+                    vld1q_u8(q11.add(((kw1 >> 16) & 0xff) * 16)),
+                );
+                c13 = xor3_u8(
+                    c13,
+                    vld1q_u8(q10.add((kw0 >> 24) * 16)),
+                    vld1q_u8(q11.add((kw1 >> 24) * 16)),
+                );
+                p += 2;
+            }
+            if p < n_pairs {
+                let (q0, q1, jw, kw) = gather_c_pair!(p);
+                c00 = veorq_u8(c00, vld1q_u8(q0.add((jw & 0xff) * 16)));
+                c01 = veorq_u8(c01, vld1q_u8(q0.add(((jw >> 8) & 0xff) * 16)));
+                c02 = veorq_u8(c02, vld1q_u8(q0.add(((jw >> 16) & 0xff) * 16)));
+                c03 = veorq_u8(c03, vld1q_u8(q0.add((jw >> 24) * 16)));
+                c10 = veorq_u8(c10, vld1q_u8(q1.add((kw & 0xff) * 16)));
+                c11 = veorq_u8(c11, vld1q_u8(q1.add(((kw >> 8) & 0xff) * 16)));
+                c12 = veorq_u8(c12, vld1q_u8(q1.add(((kw >> 16) & 0xff) * 16)));
+                c13 = veorq_u8(c13, vld1q_u8(q1.add((kw >> 24) * 16)));
+            }
+
+            // The padded BLAKE3 boundary has 15 live medium positions, so
+            // retain the exact unpaired C fallback for its final position.
+            if n_b_med & 1 == 1 {
+                let b_med = n_b_med - 1;
+                let table = convert_ptr.add(b_med * 256 * 16);
+                let wc = (chunk_c_bytes[b_med].as_ptr().add(lane) as *const u32).read_unaligned()
+                    as usize;
+                let j = wc & 0x5555_5555;
+                let k = wc & 0xaaaa_aaaa;
+                c00 = veorq_u8(c00, vld1q_u8(table.add((j & 0xff) * 16)));
+                c01 = veorq_u8(c01, vld1q_u8(table.add(((j >> 8) & 0xff) * 16)));
+                c02 = veorq_u8(c02, vld1q_u8(table.add(((j >> 16) & 0xff) * 16)));
+                c03 = veorq_u8(c03, vld1q_u8(table.add((j >> 24) * 16)));
+                c10 = veorq_u8(c10, vld1q_u8(table.add((k & 0xff) * 16)));
+                c11 = veorq_u8(c11, vld1q_u8(table.add(((k >> 8) & 0xff) * 16)));
+                c12 = veorq_u8(c12, vld1q_u8(table.add(((k >> 16) & 0xff) * 16)));
+                c13 = veorq_u8(c13, vld1q_u8(table.add((k >> 24) * 16)));
+            }
+
+            macro_rules! drain_lane {
+                ($offset:literal, $c0:ident, $c1:ident) => {{
+                    let c0 = vreinterpretq_u64_u8($c0);
+                    let c1 = vreinterpretq_u64_u8($c1);
+                    partial_ab[lane + $offset] += preconverted_ab[lane + $offset] * eq_lo_val;
+                    partial_c_0[lane + $offset] += F128 {
+                        lo: vgetq_lane_u64::<0>(c0),
+                        hi: vgetq_lane_u64::<1>(c0),
+                    } * eq_lo_val;
+                    partial_c_1[lane + $offset] += F128 {
+                        lo: vgetq_lane_u64::<0>(c1),
+                        hi: vgetq_lane_u64::<1>(c1),
+                    } * eq_lo_val;
+                }};
+            }
+            drain_lane!(0, c00, c10);
+            drain_lane!(1, c01, c11);
+            drain_lane!(2, c02, c12);
+            drain_lane!(3, c03, c13);
         }
     }
 }
