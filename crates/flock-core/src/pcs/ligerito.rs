@@ -3213,9 +3213,8 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
     let log_inv_rate_1 = config.log_inv_rates[1];
     let _t = std::time::Instant::now();
     let ntt_1 = AdditiveNttF128::standard(log_msg_cols_1 + log_inv_rate_1);
-    let f1 = sc_prover.f().to_vec();
     let wtns_1 = ligero_commit(
-        &f1,
+        sc_prover.f(),
         log_msg_cols_1,
         log_num_interleaved_1,
         log_inv_rate_1,
@@ -3271,10 +3270,6 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
     if trace {
         t_opens += _t.elapsed();
     }
-    let initial_proof = RecursiveProof {
-        opened_rows: opened_rows_0.clone(),
-        merkle_proof: merkle_proof_0,
-    };
 
     // Induce basis_0 from wtns_0 opens. L0 dominates the induce phase, where the
     // sparse-prefix Fᵀ-NTT path wins; the dispatcher auto-selects it (deeper
@@ -3293,6 +3288,10 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
     if trace {
         t_induce += _t.elapsed();
     }
+    let initial_proof = RecursiveProof {
+        opened_rows: opened_rows_0,
+        merkle_proof: merkle_proof_0,
+    };
 
     // Introduce + glue basis_0.
     let _t = std::time::Instant::now();
@@ -3412,9 +3411,8 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
         let log_inv_rate_next = config.log_inv_rates[i + 2];
         let _t = std::time::Instant::now();
         let ntt_next = AdditiveNttF128::standard(log_msg_cols_next + log_inv_rate_next);
-        let f_evals = sc_prover.f().to_vec();
         let wtns_next = ligero_commit(
-            &f_evals,
+            sc_prover.f(),
             log_msg_cols_next,
             log_num_interleaved_next,
             log_inv_rate_next,
@@ -3463,10 +3461,6 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
         if trace {
             t_opens += _t.elapsed();
         }
-        recursive_proofs.push(RecursiveProof {
-            opened_rows: opened_rows_i.clone(),
-            merkle_proof: merkle_proof_i,
-        });
 
         let sks_vks_i = eval_sk_at_vks(n_next);
         let _t = std::time::Instant::now();
@@ -3493,6 +3487,10 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
         if trace {
             t_induce += _t.elapsed();
         }
+        recursive_proofs.push(RecursiveProof {
+            opened_rows: opened_rows_i,
+            merkle_proof: merkle_proof_i,
+        });
 
         let _t = std::time::Instant::now();
         let intro_msg_i = sc_prover.introduce_new(basis_i_induced, enforced_sum_i);
