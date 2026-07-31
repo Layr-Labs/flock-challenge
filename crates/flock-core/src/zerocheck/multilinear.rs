@@ -422,8 +422,7 @@ impl UniSkipFoldTable {
                     continue;
                 }
                 let low_bit = value & value.wrapping_neg();
-                scaled[base + value] =
-                    scaled[base + (value ^ low_bit)] + scaled[base + low_bit];
+                scaled[base + value] = scaled[base + (value ^ low_bit)] + scaled[base + low_bit];
             }
         }
         scaled
@@ -522,8 +521,6 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_with_deltas(
     padding: &PaddingSpec,
     deltas_backing: Option<ScratchBytes>,
 ) -> (UniSkipCompactFold, F128, F128) {
-    use rayon::prelude::*;
-
     assert_eq!(
         k_skip, 6,
         "optimized compact fold-and-round_pair variant is k_skip=6 only"
@@ -558,12 +555,33 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_with_deltas(
     let delta_chunk_size = 2 * lo_size * n_chunks;
     let (pair_in_block_mask, useful_pairs_inclusive) = round2_pair_skip(padding, k_skip);
 
-    let (sum1, sum_inf) = compact
-        .anchors
-        .par_chunks_mut(anchor_chunk_size)
-        .zip(compact.deltas.par_chunks_mut(delta_chunk_size))
-        .enumerate()
-        .map(|(x_hi, (anchors, deltas))| {
+    // Chunks drain through the hetero queue so the idle efficiency cores add
+    // throughput without an equal-band barrier penalty (see `epool`). Each
+    // chunk writes only its own anchors/deltas ranges and partials slot; the
+    // XOR reduce below is order-independent, so output is bit-identical to
+    // the rayon map-reduce.
+    let mut partials: Vec<(F128, F128)> = vec![(F128::ZERO, F128::ZERO); hi_size];
+    let anchors_base = crate::epool::SyncPtr(compact.anchors.as_mut_ptr());
+    let deltas_base = crate::epool::SyncPtr(compact.deltas.as_mut_ptr());
+    let partials_base = crate::epool::SyncPtr(partials.as_mut_ptr());
+    crate::epool::run_hetero_chunks(hi_size, |x_hi| {
+        // SAFETY: the queue hands out each x_hi exactly once; chunk x_hi
+        // exclusively owns its anchors/deltas ranges and partials[x_hi]. The
+        // queue's completion join publishes the writes before the reduction
+        // below reads them.
+        let (anchors, deltas) = unsafe {
+            (
+                std::slice::from_raw_parts_mut(
+                    anchors_base.ptr().add(x_hi * anchor_chunk_size),
+                    anchor_chunk_size,
+                ),
+                std::slice::from_raw_parts_mut(
+                    deltas_base.ptr().add(x_hi * delta_chunk_size),
+                    delta_chunk_size,
+                ),
+            )
+        };
+        {
             let pair_idx_base = x_hi * lo_size;
             let row_base = pair_idx_base * 2;
 
@@ -619,12 +637,17 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_with_deltas(
             };
 
             let eq_h = eq_hi[x_hi];
-            (eq_h * p1, eq_h * pinf)
-        })
-        .reduce(
-            || (F128::ZERO, F128::ZERO),
-            |(s1, sinf), (c1, cinf)| (s1 + c1, sinf + cinf),
-        );
+            // SAFETY: exclusive owner of partials[x_hi] (see above).
+            unsafe {
+                *partials_base.ptr().add(x_hi) = (eq_h * p1, eq_h * pinf);
+            }
+        }
+    });
+    let (sum1, sum_inf) = partials
+        .iter()
+        .fold((F128::ZERO, F128::ZERO), |(s1, sinf), &(c1, cinf)| {
+            (s1 + c1, sinf + cinf)
+        });
 
     (compact, mlv_challenges[0] * sum1, sum_inf)
 }
@@ -641,8 +664,6 @@ pub fn fold_compact_and_compute_round_pair(
     r_fold: F128,
     r_next: &[F128],
 ) -> (Vec<F128>, Vec<F128>, F128, F128) {
-    use rayon::prelude::*;
-
     let n = compact.len();
     assert!(!compact.is_empty() && n.is_power_of_two() && n >= 4);
     assert_eq!(compact.anchors.len(), 2 * n);
@@ -664,11 +685,20 @@ pub fn fold_compact_and_compute_round_pair(
 
     let mut a_out = crate::scratch::take_f128(n);
     let mut b_out = crate::scratch::take_f128(n);
-    let (sum1, sum_inf) = a_out
-        .par_chunks_mut(chunk_size)
-        .zip(b_out.par_chunks_mut(chunk_size))
-        .enumerate()
-        .map(|(x_hi, (a_out, b_out))| {
+    // Hetero-queue drain, same contract as the compact materialization above.
+    let mut partials: Vec<(F128, F128)> = vec![(F128::ZERO, F128::ZERO); hi_size];
+    let a_base = crate::epool::SyncPtr(a_out.as_mut_ptr());
+    let b_base = crate::epool::SyncPtr(b_out.as_mut_ptr());
+    let partials_base = crate::epool::SyncPtr(partials.as_mut_ptr());
+    crate::epool::run_hetero_chunks(hi_size, |x_hi| {
+        // SAFETY: exclusive per-chunk ownership; queue join publishes writes.
+        let (a_out, b_out) = unsafe {
+            (
+                std::slice::from_raw_parts_mut(a_base.ptr().add(x_hi * chunk_size), chunk_size),
+                std::slice::from_raw_parts_mut(b_base.ptr().add(x_hi * chunk_size), chunk_size),
+            )
+        };
+        {
             let base = x_hi * chunk_size;
 
             #[cfg(target_arch = "aarch64")]
@@ -697,8 +727,8 @@ pub fn fold_compact_and_compute_round_pair(
                         for j in 0..table.n_chunks {
                             let d = 2 * index * table.n_chunks + j;
                             a += scaled_table[j * 256 + compact.deltas[d] as usize];
-                            b += scaled_table
-                                [j * 256 + compact.deltas[d + table.n_chunks] as usize];
+                            b +=
+                                scaled_table[j * 256 + compact.deltas[d + table.n_chunks] as usize];
                         }
                         a_out[out + lane] = a;
                         b_out[out + lane] = b;
@@ -715,12 +745,17 @@ pub fn fold_compact_and_compute_round_pair(
             };
 
             let eq_h = eq_hi[x_hi];
-            (eq_h * p1, eq_h * pinf)
-        })
-        .reduce(
-            || (F128::ZERO, F128::ZERO),
-            |(s1, sinf), (c1, cinf)| (s1 + c1, sinf + cinf),
-        );
+            // SAFETY: exclusive owner of partials[x_hi] (see above).
+            unsafe {
+                *partials_base.ptr().add(x_hi) = (eq_h * p1, eq_h * pinf);
+            }
+        }
+    });
+    let (sum1, sum_inf) = partials
+        .iter()
+        .fold((F128::ZERO, F128::ZERO), |(s1, sinf), &(c1, cinf)| {
+            (s1 + c1, sinf + cinf)
+        });
 
     (a_out, b_out, r_next[0] * sum1, sum_inf)
 }
