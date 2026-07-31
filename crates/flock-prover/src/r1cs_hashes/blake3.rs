@@ -1116,66 +1116,100 @@ fn write_lin_word_ab_packed(bit_off: usize, val: u32, z: &mut [u64], a: &mut [u6
     or_u32_at_bit(b, bit_off, 0xFFFF_FFFF);
 }
 
-/// Sequential full-word writer for one packed block. Unlike the generic
-/// OR-based helpers, this never reads the destination and initializes every
-/// word, allowing the outer driver to skip its 1.5-GiB ranked zero pass.
-struct PackedWordWriter<'a> {
-    out: &'a mut [u64],
+/// Sequential full-word writer for the three packed z/A/B blocks. Their row
+/// layouts are identical, so their destination positions and word-boundary
+/// decisions are identical too. Keeping one shared cursor avoids running the
+/// same packing control flow three times for every 250-bit G record.
+///
+/// Unlike the generic OR-based helpers, this never reads a destination and
+/// initializes every word, allowing the outer driver to skip its 1.5-GiB
+/// ranked zero pass.
+struct PackedTripleWriter<'a> {
+    z: &'a mut [u64],
+    a: &'a mut [u64],
+    b: &'a mut [u64],
     word: usize,
-    pending: u64,
+    pending_z: u64,
+    pending_a: u64,
+    pending_b: u64,
     used: usize,
 }
 
-impl<'a> PackedWordWriter<'a> {
+impl<'a> PackedTripleWriter<'a> {
     #[inline(always)]
-    fn new(out: &'a mut [u64]) -> Self {
+    fn new(z: &'a mut [u64], a: &'a mut [u64], b: &'a mut [u64]) -> Self {
+        debug_assert_eq!(z.len(), a.len());
+        debug_assert_eq!(z.len(), b.len());
         Self {
-            out,
+            z,
+            a,
+            b,
             word: 0,
-            pending: 0,
+            pending_z: 0,
+            pending_a: 0,
+            pending_b: 0,
             used: 0,
         }
     }
 
     #[inline(always)]
-    fn push(&mut self, value: u64, width: usize) {
+    fn push(&mut self, z: u64, a: u64, b: u64, width: usize) {
         debug_assert!((1..=64).contains(&width));
-        let value = if width == 64 {
-            value
+        let mask = if width == 64 {
+            u64::MAX
         } else {
-            value & ((1u64 << width) - 1)
+            (1u64 << width) - 1
         };
+        let z = z & mask;
+        let a = a & mask;
+        let b = b & mask;
         if self.used == 0 && width == 64 {
-            self.out[self.word] = value;
+            self.z[self.word] = z;
+            self.a[self.word] = a;
+            self.b[self.word] = b;
             self.word += 1;
             return;
         }
         let room = 64 - self.used;
         if width < room {
-            self.pending |= value << self.used;
+            self.pending_z |= z << self.used;
+            self.pending_a |= a << self.used;
+            self.pending_b |= b << self.used;
             self.used += width;
         } else {
-            self.out[self.word] = self.pending | (value << self.used);
+            self.z[self.word] = self.pending_z | (z << self.used);
+            self.a[self.word] = self.pending_a | (a << self.used);
+            self.b[self.word] = self.pending_b | (b << self.used);
             self.word += 1;
             if width == room {
-                self.pending = 0;
+                self.pending_z = 0;
+                self.pending_a = 0;
+                self.pending_b = 0;
                 self.used = 0;
             } else {
-                self.pending = value >> room;
+                self.pending_z = z >> room;
+                self.pending_a = a >> room;
+                self.pending_b = b >> room;
                 self.used = width - room;
             }
         }
     }
 
     #[inline(always)]
-    fn push_record<const N: usize>(&mut self, record: &BitRecord<N>, bits: usize) {
+    fn push_records<const N: usize>(
+        &mut self,
+        z: &BitRecord<N>,
+        a: &BitRecord<N>,
+        b: &BitRecord<N>,
+        bits: usize,
+    ) {
         let mut left = bits;
-        for &value in record.words() {
+        for ((&z, &a), &b) in z.words().iter().zip(a.words()).zip(b.words()) {
             if left == 0 {
                 break;
             }
             let width = left.min(64);
-            self.push(value, width);
+            self.push(z, a, b, width);
             left -= width;
         }
         debug_assert_eq!(left, 0);
@@ -1189,23 +1223,20 @@ impl<'a> PackedWordWriter<'a> {
     #[inline]
     fn finish(mut self) {
         if self.used != 0 {
-            self.out[self.word] = self.pending;
+            self.z[self.word] = self.pending_z;
+            self.a[self.word] = self.pending_a;
+            self.b[self.word] = self.pending_b;
             self.word += 1;
         }
-        self.out[self.word..].fill(0);
+        self.z[self.word..].fill(0);
+        self.a[self.word..].fill(0);
+        self.b[self.word..].fill(0);
     }
 }
 
 #[inline(always)]
-fn stream_lin_word(
-    value: u32,
-    z: &mut PackedWordWriter<'_>,
-    a: &mut PackedWordWriter<'_>,
-    b: &mut PackedWordWriter<'_>,
-) {
-    z.push(value as u64, 32);
-    a.push(value as u64, 32);
-    b.push(u32::MAX as u64, 32);
+fn stream_lin_word(value: u32, out: &mut PackedTripleWriter<'_>) {
+    out.push(value as u64, value as u64, u32::MAX as u64, 32);
 }
 
 /// Build the (z, a, b) blocks for ONE compression instance, into u64 views
@@ -1354,35 +1385,29 @@ fn build_block_witness_ab_stream_into(
     debug_assert_eq!(a.len(), U64_PER_BLOCK);
     debug_assert_eq!(b.len(), U64_PER_BLOCK);
 
-    let mut wz = PackedWordWriter::new(z);
-    let mut wa = PackedWordWriter::new(a);
-    let mut wb = PackedWordWriter::new(b);
+    let mut out = PackedTripleWriter::new(z, a, b);
 
     // Layout prefix: cv, then the aligned out_lo slot whose value is not known
     // until after the seven rounds.
     for &value in cv {
-        stream_lin_word(value, &mut wz, &mut wa, &mut wb);
+        stream_lin_word(value, &mut out);
     }
     for _ in 0..8 {
-        wz.push(0, 32);
-        wa.push(0, 32);
-        wb.push(0, 32);
+        out.push(0, 0, 0, 32);
     }
 
     // Constant pin, message, counter, length, and flags are contiguous.
-    wz.push(1, 1);
-    wa.push(1, 1);
-    wb.push(1, 1);
+    out.push(1, 1, 1, 1);
     for &value in m {
-        stream_lin_word(value, &mut wz, &mut wa, &mut wb);
+        stream_lin_word(value, &mut out);
     }
     let counter_lo = counter as u32;
     let counter_hi = (counter >> 32) as u32;
-    stream_lin_word(counter_lo, &mut wz, &mut wa, &mut wb);
-    stream_lin_word(counter_hi, &mut wz, &mut wa, &mut wb);
-    stream_lin_word(block_len, &mut wz, &mut wa, &mut wb);
-    stream_lin_word(flags, &mut wz, &mut wa, &mut wb);
-    debug_assert_eq!(wz.position(), GS_BASE);
+    stream_lin_word(counter_lo, &mut out);
+    stream_lin_word(counter_hi, &mut out);
+    stream_lin_word(block_len, &mut out);
+    stream_lin_word(flags, &mut out);
+    debug_assert_eq!(out.position(), GS_BASE);
 
     let mut state: [u32; 16] = [
         cv[0],
@@ -1447,9 +1472,7 @@ fn build_block_witness_ab_stream_into(
             ra.push::<REC_LIN1>(d_new);
             rb.push::<REC_LIN1>(u32::MAX);
 
-            wz.push_record(&rz, G_STRIDE);
-            wa.push_record(&ra, G_STRIDE);
-            wb.push_record(&rb, G_STRIDE);
+            out.push_records(&rz, &ra, &rb, G_STRIDE);
 
             state[la] = a_2;
             state[lb] = b_new;
@@ -1457,17 +1480,15 @@ fn build_block_witness_ab_stream_into(
             state[ld] = d_new;
         }
     }
-    debug_assert_eq!(wz.position(), OUT_HI_BASE);
+    debug_assert_eq!(out.position(), OUT_HI_BASE);
 
     let out_lo: [u32; 8] = std::array::from_fn(|w| state[w] ^ state[w + 8]);
     for w in 0..8 {
-        stream_lin_word(state[w + 8] ^ cv[w], &mut wz, &mut wa, &mut wb);
+        stream_lin_word(state[w + 8] ^ cv[w], &mut out);
     }
-    debug_assert_eq!(wz.position(), USEFUL_BITS);
+    debug_assert_eq!(out.position(), USEFUL_BITS);
 
-    wz.finish();
-    wa.finish();
-    wb.finish();
+    out.finish();
 
     // OUT_LO_BASE is 256-bit aligned, so the four reserved words can be
     // replaced without touching neighboring rows.

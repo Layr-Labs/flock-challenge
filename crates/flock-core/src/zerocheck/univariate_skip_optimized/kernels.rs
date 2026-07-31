@@ -62,7 +62,6 @@ pub(super) fn shift_reduce_inner_ab(
     b_col: &mut [F8],
     check_all_ones: bool,
     check_single_k0: bool,
-    const_one_mask: u8,
 ) {
     #[cfg(target_arch = "aarch64")]
     {
@@ -76,7 +75,6 @@ pub(super) fn shift_reduce_inner_ab(
             out,
             check_all_ones,
             check_single_k0,
-            const_one_mask,
         );
     }
 
@@ -87,7 +85,7 @@ pub(super) fn shift_reduce_inner_ab(
         target_feature = "avx512bw"
     ))]
     {
-        let _ = (a_col, b_col, check_all_ones, check_single_k0, const_one_mask);
+        let _ = (a_col, b_col, check_all_ones, check_single_k0);
         // SAFETY: all required target features are enabled at compile time.
         unsafe {
             x86_64::shift_reduce_inner_ab_x86_avx512(
@@ -108,7 +106,7 @@ pub(super) fn shift_reduce_inner_ab(
     ))]
     // SAFETY: gfni is enabled at compile time; SSE2 is baseline on x86_64.
     unsafe {
-        let _ = (check_all_ones, check_single_k0, const_one_mask);
+        let _ = (check_all_ones, check_single_k0);
         x86_64::shift_reduce_inner_ab_x86_sse(
             a_packed,
             b_packed,
@@ -126,7 +124,7 @@ pub(super) fn shift_reduce_inner_ab(
         all(target_arch = "x86_64", target_feature = "gfni")
     )))]
     {
-        let _ = (check_all_ones, check_single_k0, const_one_mask);
+        let _ = (check_all_ones, check_single_k0);
         portable::shift_reduce_inner_ab_scalar(
             a_packed,
             b_packed,

@@ -917,13 +917,11 @@ pub(crate) fn shift_reduce_inner_ab_fused_neon(
 // BLAKE3 witness structure (measured on real witnesses, 4096 blocks):
 //  * b_med blocks 0 and 1 of every first 8192-bit window have B == all-ones
 //    for all 8 K rows (const-one wires of linear constraints)
-//  * first-window b_med 2 has B == all-ones for K = 0..1, and second-window
-//    b_med 13 has B == all-ones for K = 4..7
 //  * the final processed b_med block of each witness block has B == 0 for
 //    K = 1..7 (structural zero padding rows)
-// These are detected at runtime with at most 8 u64 loads + compares per
-// 64-byte block (vs 512 table loads), so the fast paths are witness-safe: any
-// witness that does not match takes the generic path.
+// Both are detected at runtime with 8 u64 loads + compares per 64-byte block
+// (vs 512 table loads), so the fast paths are witness-safe: any witness that
+// does not match takes the generic path.
 // ---------------------------------------------------------------------------
 
 #[cfg(target_arch = "aarch64")]
@@ -1175,90 +1173,6 @@ fn shift_reduce_inner_single_k0(
     }
 }
 
-/// Mixed static-one fast path. K rows selected by `ONE_MASK` have B equal to
-/// the multiplicative identity in every lane, so they contribute the inverse
-/// transform of A directly; all remaining K rows use the generic fused AB
-/// transform and multiply.
-#[cfg(target_arch = "aarch64")]
-#[inline(never)]
-fn shift_reduce_inner_mixed_const_b<const ONE_MASK: u8>(
-    a_packed: &[u8],
-    b_packed: &[u8],
-    inv_table: &InvNttTableByteSingleGf8,
-    byte_base_b: usize,
-    out: &mut [u8; 64],
-) {
-    use crate::field::gf2_8::neon::gf8_reduce_vec16;
-    use core::arch::aarch64::*;
-
-    let table_base = inv_table.data_ptr();
-    let half_swapped_table_base = inv_table.half_swapped_data_ptr();
-    unsafe {
-        let mut acc0_lo = vdupq_n_u16(0);
-        let mut acc0_hi = vdupq_n_u16(0);
-        let mut acc1_lo = vdupq_n_u16(0);
-        let mut acc1_hi = vdupq_n_u16(0);
-        let mut acc2_lo = vdupq_n_u16(0);
-        let mut acc2_hi = vdupq_n_u16(0);
-        let mut acc3_lo = vdupq_n_u16(0);
-        let mut acc3_hi = vdupq_n_u16(0);
-
-        macro_rules! do_k {
-            ($k:literal) => {{
-                let off = byte_base_b + $k * N_CHUNKS;
-                if ONE_MASK & (1 << $k) != 0 {
-                    let word = u64::from_le(core::ptr::read_unaligned(
-                        a_packed.as_ptr().add(off).cast::<u64>(),
-                    ));
-                    let (d0, d1, d2, d3) =
-                        apply_word_into_4_regs(table_base, half_swapped_table_base, word);
-                    acc0_lo = veorq_u16(acc0_lo, vshll_n_u8::<$k>(vget_low_u8(d0)));
-                    acc0_hi = veorq_u16(acc0_hi, vshll_n_u8::<$k>(vget_high_u8(d0)));
-                    acc1_lo = veorq_u16(acc1_lo, vshll_n_u8::<$k>(vget_low_u8(d1)));
-                    acc1_hi = veorq_u16(acc1_hi, vshll_n_u8::<$k>(vget_high_u8(d1)));
-                    acc2_lo = veorq_u16(acc2_lo, vshll_n_u8::<$k>(vget_low_u8(d2)));
-                    acc2_hi = veorq_u16(acc2_hi, vshll_n_u8::<$k>(vget_high_u8(d2)));
-                    acc3_lo = veorq_u16(acc3_lo, vshll_n_u8::<$k>(vget_low_u8(d3)));
-                    acc3_hi = veorq_u16(acc3_hi, vshll_n_u8::<$k>(vget_high_u8(d3)));
-                } else {
-                    fused_apply_one_k::<$k>(
-                        table_base,
-                        half_swapped_table_base,
-                        a_packed.as_ptr().add(off),
-                        b_packed.as_ptr().add(off),
-                        &mut acc0_lo,
-                        &mut acc0_hi,
-                        &mut acc1_lo,
-                        &mut acc1_hi,
-                        &mut acc2_lo,
-                        &mut acc2_hi,
-                        &mut acc3_lo,
-                        &mut acc3_hi,
-                    );
-                }
-            }};
-        }
-        do_k!(0);
-        do_k!(1);
-        do_k!(2);
-        do_k!(3);
-        do_k!(4);
-        do_k!(5);
-        do_k!(6);
-        do_k!(7);
-
-        let r0 = gf8_reduce_vec16(vreinterpretq_u8_u16(acc0_lo), vreinterpretq_u8_u16(acc0_hi));
-        let r1 = gf8_reduce_vec16(vreinterpretq_u8_u16(acc1_lo), vreinterpretq_u8_u16(acc1_hi));
-        let r2 = gf8_reduce_vec16(vreinterpretq_u8_u16(acc2_lo), vreinterpretq_u8_u16(acc2_hi));
-        let r3 = gf8_reduce_vec16(vreinterpretq_u8_u16(acc3_lo), vreinterpretq_u8_u16(acc3_hi));
-        let p = out.as_mut_ptr();
-        vst1q_u8(p, r0);
-        vst1q_u8(p.add(16), r1);
-        vst1q_u8(p.add(32), r2);
-        vst1q_u8(p.add(48), r3);
-    }
-}
-
 /// Checked static-structure dispatcher. Sniffs the 8 b-words (8 scalar loads
 /// vs 512 table loads) and routes to a fast path when the block matches the
 /// BLAKE3 static structure; generic otherwise. Output is bit-identical for
@@ -1274,7 +1188,6 @@ pub(crate) fn shift_reduce_inner_ab_fused_neon_checked(
     out: &mut [u8; 64],
     check_all_ones: bool,
     check_single_k0: bool,
-    const_one_mask: u8,
 ) {
     let byte_base_b = chunk_byte_base + b_med * N_CHUNKS * 8;
     let bw = |k: usize| -> u64 {
@@ -1295,31 +1208,6 @@ pub(crate) fn shift_reduce_inner_ab_fused_neon_checked(
             shift_reduce_inner_single_k0(a_packed, b_packed, inv_table, byte_base_b, out);
             return;
         }
-    }
-    match const_one_mask {
-        0 => {}
-        0x03 if bw(0) & bw(1) == u64::MAX => {
-            shift_reduce_inner_mixed_const_b::<0x03>(
-                a_packed,
-                b_packed,
-                inv_table,
-                byte_base_b,
-                out,
-            );
-            return;
-        }
-        0xf0 if bw(4) & bw(5) & bw(6) & bw(7) == u64::MAX => {
-            shift_reduce_inner_mixed_const_b::<0xf0>(
-                a_packed,
-                b_packed,
-                inv_table,
-                byte_base_b,
-                out,
-            );
-            return;
-        }
-        0x03 | 0xf0 => {}
-        _ => unreachable!("unsupported static-one mask"),
     }
     shift_reduce_inner_ab_fused_neon(a_packed, b_packed, inv_table, chunk_byte_base, b_med, out);
 }
