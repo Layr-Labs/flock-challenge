@@ -2028,9 +2028,26 @@ pub(crate) fn induce_sumcheck_poly(
     (basis_poly, enforced_sum)
 }
 
+/// Gate for the block-zero transpose zero-root specialization inside the
+/// promoted three-layer fused transpose. Default on. Set
+/// `FLOCK_NO_TRANSPOSE_ZERO_ROOT=1` to restore the seven-multiply general
+/// butterfly chain for block 0 in the same binary.
+fn transpose_zero_root_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("FLOCK_NO_TRANSPOSE_ZERO_ROOT").is_none())
+}
+
 /// Apply three consecutive transpose layers in one read/write pass. `layer`
 /// is the lowest (root-most) of the three; the transpose executes forward
 /// layers `layer+2`, `layer+1`, then `layer`.
+///
+/// Block 0 of every triple has left-spine twiddles
+/// `tw[0] = tw[1] = tw[3] = 0` (same invariant the forward NTT already uses
+/// for its radix-8 zero-root kernel). The transpose butterfly with a zero
+/// twiddle collapses to `a' = a + b; b' = b` — seven of twelve multiplies
+/// become pure XORs. At the final triple (`layer = 0`) the whole domain is
+/// block 0, so the specialization covers every row job of that pass.
 fn transpose_forward_ntt_fused_3layer(
     ntt: &AdditiveNttF128,
     data: &mut [F128],
@@ -2044,6 +2061,48 @@ fn transpose_forward_ntt_fused_3layer(
         let sum = values[a] + values[b];
         values[a] = sum;
         values[b] = twiddle * sum + values[b];
+    }
+
+    /// Transpose butterfly with `twiddle == 0`: `a' = a + b`, `b' = b`.
+    #[inline(always)]
+    fn butterfly_zero_t(values: &mut [F128; 8], a: usize, b: usize) {
+        values[a] = values[a] + values[b];
+    }
+
+    /// General seven-multiply radix-8 DAG (promoted scalar body).
+    #[inline(always)]
+    fn radix8_general(values: &mut [F128; 8], tw: &[F128; 7]) {
+        for pair in 0..4 {
+            butterfly(values, 2 * pair, 2 * pair + 1, tw[3 + pair]);
+        }
+        for half in 0..2 {
+            butterfly(values, 4 * half, 4 * half + 2, tw[1 + half]);
+            butterfly(values, 4 * half + 1, 4 * half + 3, tw[1 + half]);
+        }
+        for i in 0..4 {
+            butterfly(values, i, i + 4, tw[0]);
+        }
+    }
+
+    /// Block-0 zero-root: five multiplies + seven XOR-only butterflies.
+    /// Twiddle layout matches the general path; only the known-zero slots
+    /// (`tw[0]`, `tw[1]`, `tw[3]`) take the collapsed form.
+    #[inline(always)]
+    fn radix8_zero_root(values: &mut [F128; 8], tw: &[F128; 7]) {
+        // layer+2: tw[3] = 0; tw[4..7] general
+        butterfly_zero_t(values, 0, 1);
+        butterfly(values, 2, 3, tw[4]);
+        butterfly(values, 4, 5, tw[5]);
+        butterfly(values, 6, 7, tw[6]);
+        // layer+1: tw[1] = 0; tw[2] general
+        butterfly_zero_t(values, 0, 2);
+        butterfly_zero_t(values, 1, 3);
+        butterfly(values, 4, 6, tw[2]);
+        butterfly(values, 5, 7, tw[2]);
+        // layer: tw[0] = 0
+        for i in 0..4 {
+            butterfly_zero_t(values, i, i + 4);
+        }
     }
 
     let num_blocks = 1usize << layer;
@@ -2064,6 +2123,10 @@ fn transpose_forward_ntt_fused_3layer(
             tw
         })
         .collect();
+    debug_assert_eq!(twiddles[0][0], F128::ZERO);
+    debug_assert_eq!(twiddles[0][1], F128::ZERO);
+    debug_assert_eq!(twiddles[0][3], F128::ZERO);
+    let zero_root = transpose_zero_root_enabled();
 
     // Flatten `(block, row)` into one Rayon range. This keeps all cores busy
     // even for the final few large blocks without opening nested parallel
@@ -2084,15 +2147,10 @@ fn transpose_forward_ntt_fused_3layer(
                 *value = *ptr.add(base + i * eighth);
             }
             let tw = &twiddles[block];
-            for pair in 0..4 {
-                butterfly(&mut values, 2 * pair, 2 * pair + 1, tw[3 + pair]);
-            }
-            for half in 0..2 {
-                butterfly(&mut values, 4 * half, 4 * half + 2, tw[1 + half]);
-                butterfly(&mut values, 4 * half + 1, 4 * half + 3, tw[1 + half]);
-            }
-            for i in 0..4 {
-                butterfly(&mut values, i, i + 4, tw[0]);
+            if zero_root && block == 0 {
+                radix8_zero_root(&mut values, tw);
+            } else {
+                radix8_general(&mut values, tw);
             }
             for (i, &value) in values.iter().enumerate() {
                 *ptr.add(base + i * eighth) = value;
