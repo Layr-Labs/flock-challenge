@@ -362,6 +362,22 @@ fn ranked_ntt_with_pipelined_leaves(
     let (sender, receiver) = sync_channel::<RankedLeafJob>(queue_capacity);
     let receiver = Mutex::new(receiver);
 
+    // The exact ranked top passes can borrow the E-core pool themselves. Run
+    // them before starting the blocking leaf receivers; otherwise every helper
+    // worker would be parked on `recv` and a nested top-pass broadcast could
+    // never begin. The deep transform and callback-driven leaf pipeline below
+    // retain their existing overlap and scheduling.
+    let split_ranked_top = is_ranked_ntt_merkle_leaf_pipeline_shape(params)
+        && std::env::var_os("FLOCK_NO_NTT_TOP_EPOOL").is_none()
+        && std::env::var_os("FLOCK_NTT_BLOCK_REGIONS").is_none();
+    if split_ranked_top {
+        ntt.forward_transform_interleaved_ranked_top_from_layer(
+            codeword,
+            num_ntts,
+            params.log_inv_rate,
+        );
+    }
+
     std::thread::scope(|scope| {
         let helper_manager = scope.spawn(|| {
             helper.broadcast(|_| {
@@ -375,21 +391,31 @@ fn ranked_ntt_with_pipelined_leaves(
             });
         });
 
-        ntt.forward_transform_interleaved_from_layer_and_then(
-            codeword,
-            num_ntts,
-            params.log_inv_rate,
-            |elem_offset, chunk| {
-                let job = RankedLeafJob {
-                    elem_offset,
-                    elem_len: chunk.len(),
-                };
-                match sender.try_send(job) {
-                    Ok(()) => {}
-                    Err(TrySendError::Full(job) | TrySendError::Disconnected(job)) => hash_job(job),
-                }
-            },
-        );
+        let finish_chunk = |elem_offset, chunk: &[F128]| {
+            let job = RankedLeafJob {
+                elem_offset,
+                elem_len: chunk.len(),
+            };
+            match sender.try_send(job) {
+                Ok(()) => {}
+                Err(TrySendError::Full(job) | TrySendError::Disconnected(job)) => hash_job(job),
+            }
+        };
+        if split_ranked_top {
+            ntt.forward_transform_interleaved_ranked_deep_and_then(
+                codeword,
+                num_ntts,
+                params.log_inv_rate,
+                finish_chunk,
+            );
+        } else {
+            ntt.forward_transform_interleaved_from_layer_and_then(
+                codeword,
+                num_ntts,
+                params.log_inv_rate,
+                finish_chunk,
+            );
+        }
         drop(sender);
 
         // No more jobs can arrive. Pull any bounded queue tail away from the
