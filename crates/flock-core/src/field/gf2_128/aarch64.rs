@@ -247,6 +247,89 @@ pub unsafe fn ghash_mul_vec2_neon(a: [F128; 2], b: [F128; 2]) -> [F128; 2] {
     }
 }
 
+/// Batch multiply 2× F128 by a SHARED constant `c`, Karatsuba variant of
+/// [`ghash_mul_vec2_neon`]: 6 PMULL instead of 8 (3 per product), reusing
+/// the same lane-paired vectorised GHASH reduction. PMULL is the scarce
+/// resource on M-class (2 units, 1/cycle each), so dropping a quarter of the
+/// products matters in multiplier-bound loops such as the sumcheck fold
+/// (where `c` is the round challenge).
+///
+/// # Safety
+/// Requires the `aes` target feature (compiles to PMULL); only call where
+/// `aes` is statically enabled or has been runtime-detected.
+#[target_feature(enable = "aes")]
+pub unsafe fn ghash_mul_const_vec2_neon(c: F128, b: [F128; 2]) -> [F128; 2] {
+    // SAFETY: function carries the aes target feature; pmull requires it.
+    unsafe {
+        // Karatsuba per product: ll, hh, and (b_lo ^ b_hi)·(c_lo ^ c_hi);
+        // cross = mm ^ ll ^ hh (char 2).
+        let c_mid = c.lo ^ c.hi;
+        let p0_ll = pmull(b[0].lo, c.lo);
+        let p0_hh = pmull(b[0].hi, c.hi);
+        let p0_mm = pmull(b[0].lo ^ b[0].hi, c_mid);
+        let p1_ll = pmull(b[1].lo, c.lo);
+        let p1_hh = pmull(b[1].hi, c.hi);
+        let p1_mm = pmull(b[1].lo ^ b[1].hi, c_mid);
+
+        let c0 = veorq_u64(p0_mm, veorq_u64(p0_ll, p0_hh));
+        let c1 = veorq_u64(p1_mm, veorq_u64(p1_ll, p1_hh));
+
+        // Lane-paired (mul0, mul1) layout for each word position, identical
+        // to `ghash_mul_vec2_neon`:
+        //   r0 = ll_lo
+        //   r1 = ll_hi ^ cross_lo
+        //   r2 = hh_lo ^ cross_hi
+        //   r3 = hh_hi
+        let r0 = vzip1q_u64(p0_ll, p1_ll);
+        let ll_hi = vzip2q_u64(p0_ll, p1_ll);
+        let c_lo = vzip1q_u64(c0, c1);
+        let r1 = veorq_u64(ll_hi, c_lo);
+        let hh_lo = vzip1q_u64(p0_hh, p1_hh);
+        let c_hi = vzip2q_u64(c0, c1);
+        let r2 = veorq_u64(hh_lo, c_hi);
+        let r3 = vzip2q_u64(p0_hh, p1_hh);
+
+        // Vectorised GHASH reduction: fold (r2, r3) into (r0, r1) mod p,
+        // where p = x^128 + x^7 + x^2 + x + 1. r(x) = x^7 + x^2 + x + 1.
+        // Each shift produces (lo_part, overflow); the overflow goes into
+        // the next-higher word.
+        let s1_lo = vshlq_n_u64::<1>(r2);
+        let s1_hi = veorq_u64(vshlq_n_u64::<1>(r3), vshrq_n_u64::<63>(r2));
+        let s2_lo = vshlq_n_u64::<2>(r2);
+        let s2_hi = veorq_u64(vshlq_n_u64::<2>(r3), vshrq_n_u64::<62>(r2));
+        let s7_lo = vshlq_n_u64::<7>(r2);
+        let s7_hi = veorq_u64(vshlq_n_u64::<7>(r3), vshrq_n_u64::<57>(r2));
+
+        let t_lo = veorq_u64(veorq_u64(r2, s1_lo), veorq_u64(s2_lo, s7_lo));
+        let t_hi = veorq_u64(veorq_u64(r3, s1_hi), veorq_u64(s2_hi, s7_hi));
+
+        // Bits of r3 that overflowed past position 127 in the three shifts.
+        let ov = veorq_u64(
+            veorq_u64(vshrq_n_u64::<63>(r3), vshrq_n_u64::<62>(r3)),
+            vshrq_n_u64::<57>(r3),
+        );
+        let corr = veorq_u64(
+            veorq_u64(ov, vshlq_n_u64::<1>(ov)),
+            veorq_u64(vshlq_n_u64::<2>(ov), vshlq_n_u64::<7>(ov)),
+        );
+
+        let final_lo = veorq_u64(veorq_u64(r0, t_lo), corr);
+        let final_hi = veorq_u64(r1, t_hi);
+
+        // Unpack: lane 0 → mul0, lane 1 → mul1.
+        [
+            F128 {
+                lo: vgetq_lane_u64::<0>(final_lo),
+                hi: vgetq_lane_u64::<0>(final_hi),
+            },
+            F128 {
+                lo: vgetq_lane_u64::<1>(final_lo),
+                hi: vgetq_lane_u64::<1>(final_hi),
+            },
+        ]
+    }
+}
+
 /// Full 256-bit carry-less product `a · b`, no mod-p reduction. The standard
 /// middle-cross fold is baked in: r1 = ll_hi ^ cross_lo, r2 = hh_lo ^ cross_hi.
 ///

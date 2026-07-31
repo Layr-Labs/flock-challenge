@@ -566,23 +566,13 @@ const BLAKE3_POW_BATCH: usize = 32;
 /// Smallest nonce in `start .. start + len` whose BLAKE3 PoW hash has `bits`
 /// leading zeros, or `None`.
 ///
-/// Batches the independent nonce hashes through the crate's SIMD compression.
-/// A 64-byte pre-image is a whole-block single chunk, which `hash_many`
-/// reproduces byte-for-byte given `CHUNK_START` / `CHUNK_END | ROOT` — so this
-/// agrees with `blake3::hash` on every nonce, which
+/// Batches the independent nonce hashes through the twelve-way kernel on
+/// Apple AArch64 (upstream `hash_many` tail and fallback) via
+/// [`crate::merkle::blake3_hash_many_pow`]. A 64-byte pre-image is a
+/// whole-block single chunk hashed with `CHUNK_START | CHUNK_END | ROOT` —
+/// so this agrees with `blake3::hash` on every nonce, which
 /// `blake3_batched_pow_matches_scalar` asserts.
 fn blake3_pow_scan(state_digest: &[u8; 32], start: u64, len: u64, bits: u32) -> Option<u64> {
-    use blake3::platform::Platform;
-    // BLAKE3 constants, fixed by the spec.
-    const IV: [u32; 8] = [
-        0x6A09E667, 0xBB67AE85, 0x3C6EF372, 0xA54FF53A, 0x510E527F, 0x9B05688C, 0x1F83D9AB,
-        0x5BE0CD19,
-    ];
-    const CHUNK_START: u8 = 1;
-    const CHUNK_END: u8 = 2;
-    const ROOT: u8 = 8;
-
-    let plat = Platform::detect();
     // The 32-byte state prefix is constant across the whole scan; only the
     // 8 nonce bytes change per lane.
     let mut pre = [[0u8; 64]; BLAKE3_POW_BATCH];
@@ -600,17 +590,17 @@ fn blake3_pow_scan(state_digest: &[u8; 32], start: u64, len: u64, bits: u32) -> 
         }
         #[cfg(feature = "hash-count")]
         fs_count::POW_SHA256.fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
-        let inputs: [&[u8; 64]; BLAKE3_POW_BATCH] = std::array::from_fn(|i| &pre[i]);
-        plat.hash_many(
-            &inputs[..n],
-            &IV,
-            0,
-            blake3::IncrementCounter::No,
-            0,
-            CHUNK_START,
-            CHUNK_END | ROOT,
-            &mut out[..n * 32],
-        );
+        // Twelve-way kernel on Apple AArch64 (upstream `hash_many` tail and
+        // fallback), byte-identical to `blake3::hash` per pre-image.
+        // SAFETY: `pre` is `[[u8; 64]; BLAKE3_POW_BATCH]` and `out` is
+        // `[u8; 32 * BLAKE3_POW_BATCH]`, so the first `n` elements of each
+        // form contiguous 64-byte / 32-byte runs.
+        unsafe {
+            crate::merkle::blake3_hash_many_pow(
+                core::slice::from_raw_parts(pre.as_ptr() as *const u8, n * 64),
+                core::slice::from_raw_parts_mut(out.as_mut_ptr() as *mut [u8; 32], n),
+            );
+        }
         for i in 0..n {
             if has_leading_zero_bits(&out[i * 32..(i + 1) * 32], bits) {
                 return Some(base + i as u64);
@@ -823,6 +813,66 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Timing probe (not a correctness gate): upstream 4-lane `hash_many`
+    /// vs the twelve-way PoW path on 2^20 grind hashes. Run with
+    /// `cargo test -p flock-core --lib -- --ignored --nocapture grind_speed`.
+    #[test]
+    #[ignore]
+    fn grind_speed_probe() {
+        let n = 1usize << 20;
+        let digest = [0xABu8; 32];
+        let mut pre = vec![0u8; n * 64];
+        for i in 0..n {
+            pre[i * 64..i * 64 + 32].copy_from_slice(&digest);
+            pre[i * 64 + 32..i * 64 + 40].copy_from_slice(&(i as u64).to_le_bytes());
+        }
+        let mut out = vec![[0u8; 32]; n];
+
+        let t = std::time::Instant::now();
+        {
+            use blake3::platform::Platform;
+            const IV: [u32; 8] = [
+                0x6A09E667, 0xBB67AE85, 0x3C6EF372, 0xA54FF53A, 0x510E527F, 0x9B05688C, 0x1F83D9AB,
+                0x5BE0CD19,
+            ];
+            let plat = Platform::detect();
+            let mut out_bytes = vec![0u8; n * 32];
+            for chunk in 0..n / 16 {
+                let base = chunk * 16;
+                let inputs: [&[u8; 64]; 16] = std::array::from_fn(|i| {
+                    pre[(base + i) * 64..(base + i + 1) * 64]
+                        .try_into()
+                        .unwrap()
+                });
+                plat.hash_many(
+                    &inputs,
+                    &IV,
+                    0,
+                    blake3::IncrementCounter::No,
+                    0,
+                    1,
+                    2 | 8,
+                    &mut out_bytes[base * 32..(base + 16) * 32],
+                );
+            }
+            out.copy_from_slice(unsafe {
+                core::slice::from_raw_parts(out_bytes.as_ptr() as *const [u8; 32], n)
+            });
+        }
+        let old_ms = t.elapsed().as_secs_f64() * 1e3;
+
+        let mut out2 = vec![[0u8; 32]; n];
+        let t = std::time::Instant::now();
+        crate::merkle::blake3_hash_many_pow(&pre, &mut out2);
+        let new_ms = t.elapsed().as_secs_f64() * 1e3;
+
+        assert_eq!(out, out2, "outputs differ");
+        eprintln!(
+            "{n} hashes: old (4-lane hash_many) {old_ms:.2} ms, new (12-way) {new_ms:.2} ms, speedup {:.2}x",
+            old_ms / new_ms
+        );
     }
 
     /// The grind must return the globally smallest satisfying nonce, on both

@@ -287,6 +287,7 @@ const BLAKE3_IV: [u32; 8] = [
 const BLAKE3_CHUNK_START: u8 = 1;
 const BLAKE3_CHUNK_END: u8 = 2;
 const BLAKE3_PARENT: u8 = 4;
+const BLAKE3_ROOT: u8 = 8;
 
 /// Cached SIMD platform. `Platform::detect()` is cheap but not free, and the
 /// tree build reaches the batched path once per [`BLAKE3_BATCH`] nodes.
@@ -416,6 +417,36 @@ fn blake3_hash_many_parents(data: &[u8], out: &mut [Hash]) {
     }
     #[cfg(not(all(target_arch = "aarch64", target_os = "macos")))]
     blake3_hash_many::<64>(data, out, BLAKE3_PARENT, 0, 0);
+}
+
+/// Batched BLAKE3 PoW grind blocks: `data` is `out.len()` contiguous
+/// 64-byte single-chunk pre-images, hashed with `CHUNK_START | CHUNK_END |
+/// ROOT` — byte-identical to `blake3::hash` on each block. Uses the
+/// twelve-way kernel on Apple AArch64, upstream `hash_many` elsewhere and
+/// for the tail.
+#[inline]
+pub(crate) fn blake3_hash_many_pow(data: &[u8], out: &mut [Hash]) {
+    #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+    {
+        let done = blake3_neon12::hash_complete_pow_groups(data, out);
+        if done < out.len() {
+            blake3_hash_many::<64>(
+                &data[done * 64..],
+                &mut out[done..],
+                0,
+                BLAKE3_CHUNK_START,
+                BLAKE3_CHUNK_END | BLAKE3_ROOT,
+            );
+        }
+    }
+    #[cfg(not(all(target_arch = "aarch64", target_os = "macos")))]
+    blake3_hash_many::<64>(
+        data,
+        out,
+        0,
+        BLAKE3_CHUNK_START,
+        BLAKE3_CHUNK_END | BLAKE3_ROOT,
+    );
 }
 
 /// Hash a run of `out.len()` equal-size leaves from `data` under `kind`.
