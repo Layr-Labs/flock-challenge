@@ -2850,6 +2850,60 @@ fn direct_ab_fuse_init_enabled() -> bool {
 /// single assignment per output slot — deleting the full L/4 zero-fill pass
 /// and the subsequent read-modify-write of `b_out` that used to add fold4(C).
 /// Algebra: `0 + D_0 + … + D_n + fold4(C)` becomes `D_0 + fold4(C) + D_1 + …`.
+/// GHASH multiply helpers with operands and results held in q registers —
+/// shared by the vector-resident lookahead kernel in the parent module.
+/// `mul_q` is the exact `ghash_mul_binius` word sequence (four schoolbook
+/// PMULLs, `vmull_high_p64` reading high lanes in place, two-stage `0x87`
+/// reduction) without the `F128` repack on entry/exit.
+#[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+pub(crate) mod qfold {
+    use core::arch::aarch64::*;
+
+    #[inline(always)]
+    unsafe fn pmull(a: u64, b: u64) -> uint64x2_t {
+        unsafe { core::mem::transmute::<u128, uint64x2_t>(vmull_p64(a, b)) }
+    }
+
+    #[cfg(target_feature = "sha3")]
+    #[inline(always)]
+    unsafe fn xor3(a: uint64x2_t, b: uint64x2_t, c: uint64x2_t) -> uint64x2_t {
+        unsafe { veor3q_u64(a, b, c) }
+    }
+
+    #[cfg(not(target_feature = "sha3"))]
+    #[inline(always)]
+    unsafe fn xor3(a: uint64x2_t, b: uint64x2_t, c: uint64x2_t) -> uint64x2_t {
+        unsafe { veorq_u64(a, veorq_u64(b, c)) }
+    }
+
+    /// # Safety
+    /// Requires the `aes` target feature (guaranteed by the module cfg).
+    #[inline(always)]
+    pub(crate) unsafe fn mul_q(a: uint64x2_t, b: uint64x2_t) -> uint64x2_t {
+        unsafe {
+            let zero = vdupq_n_u64(0);
+            let t0 = pmull(vgetq_lane_u64::<0>(a), vgetq_lane_u64::<0>(b));
+            let t1a = pmull(vgetq_lane_u64::<0>(a), vgetq_lane_u64::<1>(b));
+            let t1b = pmull(vgetq_lane_u64::<1>(a), vgetq_lane_u64::<0>(b));
+            let t2 = core::mem::transmute::<u128, uint64x2_t>(vmull_high_p64(
+                vreinterpretq_p64_u64(a),
+                vreinterpretq_p64_u64(b),
+            ));
+            let t1_cross = veorq_u64(t1a, t1b);
+            let t1 = xor3(
+                t1_cross,
+                vextq_u64::<1>(zero, t2),
+                pmull(vgetq_lane_u64::<1>(t2), 0x87),
+            );
+            xor3(
+                t0,
+                vextq_u64::<1>(zero, t1),
+                pmull(vgetq_lane_u64::<1>(t1), 0x87),
+            )
+        }
+    }
+}
+
 fn materialize_direct_ab_fold2(
     packed_witness: Vec<F128>,
     ordinary_basis: Vec<F128>,
