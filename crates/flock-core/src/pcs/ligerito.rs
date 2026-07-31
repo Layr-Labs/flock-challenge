@@ -2031,13 +2031,20 @@ pub(crate) fn induce_sumcheck_poly(
 /// Transposed forward additive NTT, `Fᵀ`, in place over `2^log_d` coefficients.
 /// Forward butterfly is `M=[[1,t],[1,t+1]]`; transpose `Mᵀ=[[1,1],[t,t+1]]` is
 /// `s=a+b; top=s; bot=t·s+b`, applied in **reverse** layer order. (Baseline:
-/// one parallel sweep per layer.)
+/// one parallel sweep per layer; ranked default fuses three reverse layers
+/// per pass — see [`transpose_forward_ntt_fused3`].)
 fn transpose_forward_ntt(ntt: &AdditiveNttF128, data: &mut [F128], log_d: usize) {
     use rayon::prelude::*;
     debug_assert_eq!(data.len(), 1usize << log_d);
     debug_assert!(log_d <= ntt.log_domain_size());
+    let start_layer = if induce_fuse3_enabled() && log_d >= 3 {
+        transpose_forward_ntt_fused3(ntt, data, log_d);
+        log_d - 3 * (log_d / 3)
+    } else {
+        log_d
+    };
     let n_threads = rayon::current_num_threads().max(1);
-    for layer in (0..log_d).rev() {
+    for layer in (0..start_layer).rev() {
         let num_blocks = 1usize << layer;
         let block_size = 1usize << (log_d - layer);
         let bsh = block_size >> 1;
@@ -2068,6 +2075,138 @@ fn transpose_forward_ntt(ntt: &AdditiveNttF128, data: &mut [F128], log_d: usize)
                         let s = a + b;
                         *a_ref = s;
                         *b_ref = t * s + b;
+                    });
+            }
+        }
+    }
+}
+
+/// Whether the fused three-layer transposed-NTT path is enabled.
+/// `FLOCK_NO_INDUCE_FUSE3=1` restores the per-layer baseline in the same
+/// binary (same-binary A/B control).
+fn induce_fuse3_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("FLOCK_NO_INDUCE_FUSE3").is_none())
+}
+
+/// Fused three-reverse-layer sweeps of the transposed forward additive NTT.
+/// Processes layer triples `(log_d-1, log_d-2, log_d-3), (log_d-4, …), …`
+/// — the innermost `3·(log_d/3)` layers — leaving the outermost
+/// `log_d % 3` layers for the caller's per-layer loop. Each pass loads
+/// eight strided `F128`s per group, applies the exact seven transpose
+/// butterflies (`s = a + b; a' = s; b' = t·s + b`) in the baseline's layer
+/// order while intermediates stay live, and writes the eight values once —
+/// one read+write of `data` per THREE layers instead of three.
+///
+/// Byte-identical to the baseline: each element's dataflow and the twiddle
+/// per butterfly are unchanged; GF(2^128) ops are exact.
+fn transpose_forward_ntt_fused3(ntt: &AdditiveNttF128, data: &mut [F128], log_d: usize) {
+    use rayon::prelude::*;
+    let triples = log_d / 3;
+    for tri in 0..triples {
+        // Innermost remaining layer of this triple.
+        let l0 = log_d - 1 - 3 * tri; // stage 1 layer (smallest distance)
+        let d = 1usize << (log_d - 1 - l0); // stage-1 half-distance = 8^tri
+        let window = 8 * d;
+        debug_assert!(window <= data.len());
+        let num_windows = data.len() / window;
+        let n_threads = rayon::current_num_threads().max(1);
+        let radix8 = |x: &mut [F128; 8], t1: &[F128; 4], t2: &[F128; 2], t3: F128| {
+            // Stage 1 (layer l0, distance d): pairs (0,1)(2,3)(4,5)(6,7).
+            for k in 0..4 {
+                let a = x[2 * k];
+                let b = x[2 * k + 1];
+                let s = a + b;
+                x[2 * k] = s;
+                x[2 * k + 1] = t1[k] * s + b;
+            }
+            // Stage 2 (layer l0-1, distance 2d): (0,2)(1,3)(4,6)(5,7).
+            for k in 0..2 {
+                for m in 0..2 {
+                    let lo = 4 * k + m;
+                    let hi = lo + 2;
+                    let a = x[lo];
+                    let b = x[hi];
+                    let s = a + b;
+                    x[lo] = s;
+                    x[hi] = t2[k] * s + b;
+                }
+            }
+            // Stage 3 (layer l0-2, distance 4d): (i, i+4).
+            for m in 0..4 {
+                let a = x[m];
+                let b = x[m + 4];
+                let s = a + b;
+                x[m] = s;
+                x[m + 4] = t3 * s + b;
+            }
+        };
+        let group_twiddles = |w_idx: usize| {
+            (
+                [
+                    ntt.twiddle(l0, 4 * w_idx),
+                    ntt.twiddle(l0, 4 * w_idx + 1),
+                    ntt.twiddle(l0, 4 * w_idx + 2),
+                    ntt.twiddle(l0, 4 * w_idx + 3),
+                ],
+                [
+                    ntt.twiddle(l0 - 1, 2 * w_idx),
+                    ntt.twiddle(l0 - 1, 2 * w_idx + 1),
+                ],
+                ntt.twiddle(l0 - 2, w_idx),
+            )
+        };
+        if num_windows >= n_threads {
+            data.par_chunks_mut(window)
+                .enumerate()
+                .for_each(|(w_idx, win)| {
+                    let (t1, t2, t3) = group_twiddles(w_idx);
+                    for j in 0..d {
+                        let mut x = [F128::ZERO; 8];
+                        for (i, xi) in x.iter_mut().enumerate() {
+                            *xi = win[j + i * d];
+                        }
+                        radix8(&mut x, &t1, &t2, t3);
+                        for (i, xi) in x.iter().enumerate() {
+                            win[j + i * d] = *xi;
+                        }
+                    }
+                });
+        } else {
+            // Deep triples: few (possibly one) windows — parallelize the
+            // per-window j range instead. Split each window into eight
+            // stride-d lanes and hand disjoint j-chunks to workers.
+            for (w_idx, win) in data.chunks_mut(window).enumerate() {
+                let (t1, t2, t3) = group_twiddles(w_idx);
+                let mut lanes: Vec<&mut [F128]> = Vec::with_capacity(8);
+                let mut rest = win;
+                for _ in 0..8 {
+                    let (lane, tail) = rest.split_at_mut(d);
+                    lanes.push(lane);
+                    rest = tail;
+                }
+                let [l0s, l1s, l2s, l3s, l4s, l5s, l6s, l7s]: [&mut [F128]; 8] =
+                    lanes.try_into().expect("eight lanes");
+                l0s.par_iter_mut()
+                    .zip(l1s.par_iter_mut())
+                    .zip(l2s.par_iter_mut().zip(l3s.par_iter_mut()))
+                    .zip(
+                        l4s.par_iter_mut()
+                            .zip(l5s.par_iter_mut())
+                            .zip(l6s.par_iter_mut().zip(l7s.par_iter_mut())),
+                    )
+                    .for_each(|(((v0, v1), (v2, v3)), ((v4, v5), (v6, v7)))| {
+                        let mut x = [*v0, *v1, *v2, *v3, *v4, *v5, *v6, *v7];
+                        radix8(&mut x, &t1, &t2, t3);
+                        *v0 = x[0];
+                        *v1 = x[1];
+                        *v2 = x[2];
+                        *v3 = x[3];
+                        *v4 = x[4];
+                        *v5 = x[5];
+                        *v6 = x[6];
+                        *v7 = x[7];
                     });
             }
         }
@@ -6384,6 +6523,50 @@ mod tests {
             .map(|(&m, &b)| m * b)
             .fold(F128::ZERO, |a, v| a + v);
         assert_eq!(inner, enforced_sum, "msg · basis_poly != enforced_sum");
+    }
+
+    /// The fused three-layer transpose must be byte-identical to the
+    /// per-layer baseline across depths, incl. depths with 1 and 2 leftover
+    /// outer layers and depths engaging the deep (few-window) parallel path.
+    #[test]
+    fn transpose_fused3_matches_per_layer() {
+        fn per_layer(ntt: &AdditiveNttF128, data: &mut [F128], layers: std::ops::Range<usize>, log_d: usize) {
+            for layer in layers.rev() {
+                let block_size = 1usize << (log_d - layer);
+                let bsh = block_size >> 1;
+                for (block, chunk) in data.chunks_mut(block_size).enumerate() {
+                    let t = ntt.twiddle(layer, block);
+                    let (top, bot) = chunk.split_at_mut(bsh);
+                    for (a_ref, b_ref) in top.iter_mut().zip(bot.iter_mut()) {
+                        let a = *a_ref;
+                        let b = *b_ref;
+                        let s = a + b;
+                        *a_ref = s;
+                        *b_ref = t * s + b;
+                    }
+                }
+            }
+        }
+        use crate::challenger::Challenger;
+        let mut ch = crate::challenger::RandomChallenger::new(0xF05E_D3);
+        for log_d in 0..=13usize {
+            let ntt = AdditiveNttF128::standard(log_d.max(1));
+            let n = 1usize << log_d;
+            let input: Vec<F128> = (0..n).map(|_| ch.sample_f128()).collect();
+            let mut base = input.clone();
+            per_layer(&ntt, &mut base, 0..log_d, log_d);
+
+            // Fused triples + leftover per-layer outers (mirrors the ranked
+            // dispatch in `transpose_forward_ntt` with the gate forced on).
+            let mut fused = input;
+            if log_d >= 3 {
+                transpose_forward_ntt_fused3(&ntt, &mut fused, log_d);
+                per_layer(&ntt, &mut fused, 0..log_d % 3, log_d);
+            } else {
+                per_layer(&ntt, &mut fused, 0..log_d, log_d);
+            }
+            assert_eq!(fused, base, "log_d={log_d}");
+        }
     }
 
     /// `induce_sumcheck_poly_via_ntt` must be byte-identical to dense across
