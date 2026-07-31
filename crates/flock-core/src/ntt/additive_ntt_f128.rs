@@ -726,6 +726,40 @@ impl AdditiveNttF128 {
             .enumerate()
             .for_each(|(sub_idx, sub_data)| {
                 let mut layer = n_top;
+                // Fused triples first: each block is processed with the same
+                // radix-8 schedule as the top-layer fused-3 groups (eight
+                // streams — the proven L1 width), so three layers cost one
+                // read+write visit per row instead of 1.5 for a pair+single.
+                while layer + 2 < log_d {
+                    let layer_in_sub = layer - n_top;
+                    let num_blocks_in_sub = 1usize << layer_in_sub;
+                    let block_size_positions = 1usize << (log_d - layer);
+                    if block_size_positions < 8 {
+                        break;
+                    }
+                    let eighth = block_size_positions >> 3;
+                    let block_elems = block_size_positions * num_ntts;
+
+                    for block_in_sub in 0..num_blocks_in_sub {
+                        let global_block = sub_idx * num_blocks_in_sub + block_in_sub;
+                        let mut tw = [F128 { lo: 0, hi: 0 }; 7];
+                        tw[0] = self.twiddle(layer, global_block);
+                        for s in 0..2 {
+                            tw[1 + s] = self.twiddle(layer + 1, 2 * global_block + s);
+                        }
+                        for s in 0..4 {
+                            tw[3 + s] = self.twiddle(layer + 2, 4 * global_block + s);
+                        }
+                        let block_start = block_in_sub * block_elems;
+                        butterfly_interleaved_fused_3layer_rows_seq(
+                            &mut sub_data[block_start..block_start + block_elems],
+                            &tw,
+                            eighth,
+                            num_ntts,
+                        );
+                    }
+                    layer += 3;
+                }
                 while layer + 1 < log_d {
                     let layer_in_sub = layer - n_top;
                     let num_blocks_in_sub = 1usize << layer_in_sub;
@@ -1185,6 +1219,29 @@ fn butterfly_interleaved_block(
             &mut bot[o..o + num_ntts],
             twiddle,
         );
+    }
+}
+
+/// Serial three-layer (radix-8) butterfly over one deep block, for the
+/// fused-triple deep schedule: `block` holds `8 * eighth` rows of
+/// `num_ntts` lanes; `t` carries the 7 twiddles for the sub-butterflies in
+/// the same breadth-first order the top-layer fused-3 group uses. Serial
+/// over row groups because it runs inside the deep phase's outer Rayon
+/// jobs: adding row-level Rayon here would create a nested fork/join for
+/// every cache-resident subtree.
+#[inline]
+fn butterfly_interleaved_fused_3layer_rows_seq(
+    block: &mut [F128],
+    t: &[F128; 7],
+    eighth: usize,
+    num_ntts: usize,
+) {
+    debug_assert_eq!(block.len(), 8 * eighth * num_ntts);
+    let base = block.as_mut_ptr() as usize;
+    for r in 0..eighth {
+        // SAFETY: row group r writes disjoint rows of this block; `t` is
+        // read-only. Single-threaded by contract (see above).
+        unsafe { kernels::butterfly_fused_3layer_row(base as *mut F128, eighth, num_ntts, r, t) };
     }
 }
 
