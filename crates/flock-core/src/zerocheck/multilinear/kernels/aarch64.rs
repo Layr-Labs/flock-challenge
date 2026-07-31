@@ -144,6 +144,74 @@ unsafe fn fold_row_q(
     }
 }
 
+/// Fold four already-loaded packed rows together. Grouping the independent
+/// lookup chains by byte bank exposes four L1 loads at a time, and loading each
+/// row as one `u64` lets the compact round-two path reuse it for its raw delta.
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn fold_four_row_codes_q(
+    table_data: *const u8,
+    row0: u64,
+    row1: u64,
+    row2: u64,
+    row3: u64,
+) -> (
+    core::arch::aarch64::uint64x2_t,
+    core::arch::aarch64::uint64x2_t,
+    core::arch::aarch64::uint64x2_t,
+    core::arch::aarch64::uint64x2_t,
+) {
+    use core::arch::aarch64::*;
+    unsafe {
+        const STRIDE: usize = 256 * 16;
+        let mut acc0 = vdupq_n_u64(0);
+        let mut acc1 = vdupq_n_u64(0);
+        let mut acc2 = vdupq_n_u64(0);
+        let mut acc3 = vdupq_n_u64(0);
+        for chunk in 0..8 {
+            let shift = 8 * chunk;
+            let offset = chunk * STRIDE;
+            let index0 = ((row0 >> shift) & 0xff) as usize;
+            let index1 = ((row1 >> shift) & 0xff) as usize;
+            let index2 = ((row2 >> shift) & 0xff) as usize;
+            let index3 = ((row3 >> shift) & 0xff) as usize;
+            acc0 = veorq_u64(
+                acc0,
+                vld1q_u64(
+                    table_data
+                        .add(offset + index0 * core::mem::size_of::<F128>())
+                        .cast::<u64>(),
+                ),
+            );
+            acc1 = veorq_u64(
+                acc1,
+                vld1q_u64(
+                    table_data
+                        .add(offset + index1 * core::mem::size_of::<F128>())
+                        .cast::<u64>(),
+                ),
+            );
+            acc2 = veorq_u64(
+                acc2,
+                vld1q_u64(
+                    table_data
+                        .add(offset + index2 * core::mem::size_of::<F128>())
+                        .cast::<u64>(),
+                ),
+            );
+            acc3 = veorq_u64(
+                acc3,
+                vld1q_u64(
+                    table_data
+                        .add(offset + index3 * core::mem::size_of::<F128>())
+                        .cast::<u64>(),
+                ),
+            );
+        }
+        (acc0, acc1, acc2, acc3)
+    }
+}
+
 /// Complete q-register-native round-two worker chunk. Four folded rows stay in
 /// vector registers through output stores, reduced GHASH products, and the
 /// eq-weighted unreduced accumulators; only the two final chunk sums cross back
@@ -278,16 +346,16 @@ pub(crate) unsafe fn fold_round2_compact_chunk_neon_unchecked_8(
             let a1_ptr = a_packed.add(row1 * 8);
             let b0_ptr = b_packed.add(row0 * 8);
             let b1_ptr = b_packed.add(row1 * 8);
-            let a0 = fold_row_q(table_data, a0_ptr);
-            let b0 = fold_row_q(table_data, b0_ptr);
-            let a1 = fold_row_q(table_data, a1_ptr);
-            let b1 = fold_row_q(table_data, b1_ptr);
+            let a0_code = u64::from_le(core::ptr::read_unaligned(a0_ptr.cast::<u64>()));
+            let a1_code = u64::from_le(core::ptr::read_unaligned(a1_ptr.cast::<u64>()));
+            let b0_code = u64::from_le(core::ptr::read_unaligned(b0_ptr.cast::<u64>()));
+            let b1_code = u64::from_le(core::ptr::read_unaligned(b1_ptr.cast::<u64>()));
+            let (a0, a1, b0, b1) =
+                fold_four_row_codes_q(table_data, a0_code, a1_code, b0_code, b1_code);
 
             store_anchor_pair_nt(anchors.add(2 * x_lo), a0, b0);
-            let da = core::ptr::read_unaligned(a0_ptr.cast::<u64>())
-                ^ core::ptr::read_unaligned(a1_ptr.cast::<u64>());
-            let db = core::ptr::read_unaligned(b0_ptr.cast::<u64>())
-                ^ core::ptr::read_unaligned(b1_ptr.cast::<u64>());
+            let da = a0_code ^ a1_code;
+            let db = b0_code ^ b1_code;
             let delta_pair = core::mem::transmute::<[u64; 2], uint64x2_t>([da, db]);
             vst1q_u64(deltas.add(x_lo * 16).cast::<u64>(), delta_pair);
 
@@ -337,23 +405,6 @@ pub(crate) unsafe fn fold_compact_chunk_neon_unchecked_8(
         }
     }
 
-    #[inline(always)]
-    unsafe fn reconstruct(
-        scaled_table: *const u8,
-        anchors: *const F128,
-        deltas: *const u8,
-        index: usize,
-        polynomial: usize,
-    ) -> uint64x2_t {
-        unsafe {
-            let base = vld1q_u64(anchors.add(2 * index + polynomial).cast::<u64>());
-            veorq_u64(
-                base,
-                fold_row_q(scaled_table, deltas.add(index * 16 + polynomial * 8)),
-            )
-        }
-    }
-
     unsafe {
         let zero = vdupq_n_u64(0);
         let mut p1_acc = WideNeon { lo: zero, hi: zero };
@@ -361,10 +412,34 @@ pub(crate) unsafe fn fold_compact_chunk_neon_unchecked_8(
 
         for x_lo in 0..lo_size {
             let out = 2 * x_lo;
-            let a0 = reconstruct(scaled_table, anchors, deltas, out, 0);
-            let a1 = reconstruct(scaled_table, anchors, deltas, out + 1, 0);
-            let b0 = reconstruct(scaled_table, anchors, deltas, out, 1);
-            let b1 = reconstruct(scaled_table, anchors, deltas, out + 1, 1);
+            let delta = deltas.add(out * 16);
+            let a0_code = u64::from_le(core::ptr::read_unaligned(delta.cast::<u64>()));
+            let b0_code = u64::from_le(core::ptr::read_unaligned(delta.add(8).cast::<u64>()));
+            let a1_code = u64::from_le(core::ptr::read_unaligned(delta.add(16).cast::<u64>()));
+            let b1_code = u64::from_le(core::ptr::read_unaligned(delta.add(24).cast::<u64>()));
+            let (a0_delta, a1_delta, b0_delta, b1_delta) = fold_four_row_codes_q(
+                scaled_table,
+                a0_code,
+                a1_code,
+                b0_code,
+                b1_code,
+            );
+            let a0 = veorq_u64(
+                vld1q_u64(anchors.add(2 * out).cast::<u64>()),
+                a0_delta,
+            );
+            let a1 = veorq_u64(
+                vld1q_u64(anchors.add(2 * (out + 1)).cast::<u64>()),
+                a1_delta,
+            );
+            let b0 = veorq_u64(
+                vld1q_u64(anchors.add(2 * out + 1).cast::<u64>()),
+                b0_delta,
+            );
+            let b1 = veorq_u64(
+                vld1q_u64(anchors.add(2 * (out + 1) + 1).cast::<u64>()),
+                b1_delta,
+            );
 
             store_pair_nt(a_out.add(out), a0, a1);
             store_pair_nt(b_out.add(out), b0, b1);

@@ -404,6 +404,29 @@ impl UniSkipFoldTable {
         }
         acc
     }
+
+    /// Return `rho * T_z` using XOR-linearity of every byte bank. Only the 64
+    /// one-hot basis entries require field multiplication; all other entries
+    /// are rebuilt by XOR instead of performing 2,048 independent products.
+    fn scaled_linear(&self, rho: F128) -> Vec<F128> {
+        assert_eq!(self.data.len(), self.n_chunks * 256);
+        let mut scaled = self.data.clone();
+        for chunk in 0..self.n_chunks {
+            let base = chunk * 256;
+            for bit in 0..8 {
+                scaled[base + (1 << bit)] = rho * scaled[base + (1 << bit)];
+            }
+            for value in 3usize..256 {
+                if value.is_power_of_two() {
+                    continue;
+                }
+                let low_bit = value & value.wrapping_neg();
+                scaled[base + value] =
+                    scaled[base + (value ^ low_bit)] + scaled[base + low_bit];
+            }
+        }
+        scaled
+    }
 }
 
 /// Compact materialization of the first multilinear level.
@@ -580,7 +603,7 @@ pub fn fold_compact_and_compute_round_pair(
 
     // Compose the sampled challenge into the resident 32 KiB byte table once.
     // Linearity makes each later row reconstruction lookup/XOR-only.
-    let scaled_table: Vec<F128> = table.data.iter().map(|&x| x * r_fold).collect();
+    let scaled_table = table.scaled_linear(r_fold);
 
     let eq = SplitEqGhash::new(&r_next[1..]);
     let lo_size = 1usize << eq.n_lo;
