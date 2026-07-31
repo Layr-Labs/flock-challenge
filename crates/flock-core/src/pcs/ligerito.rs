@@ -2843,7 +2843,10 @@ fn materialize_direct_ab_fold2(
     use rayon::prelude::*;
 
     assert!(!claims.is_empty());
-    assert_eq!(ordinary_basis.len(), packed_witness.len());
+    // Empty `ordinary_basis` = every claim is direct (the direct-C path): the
+    // combined basis was never materialized at L and the fold-2 residual is
+    // built purely from the claims' composed tables below.
+    assert!(ordinary_basis.is_empty() || ordinary_basis.len() == packed_witness.len());
     let fold_weight = [
         (F128::ONE + r0) * (F128::ONE + r1),
         r0 * (F128::ONE + r1),
@@ -2892,7 +2895,11 @@ fn materialize_direct_ab_fold2(
 
                 let start = 4 * block * block_len;
                 let f_in = &packed_witness[start..start + 4 * block_len];
-                let b_in = &ordinary_basis[start..start + 4 * block_len];
+                let b_in = if ordinary_basis.is_empty() {
+                    None
+                } else {
+                    Some(&ordinary_basis[start..start + 4 * block_len])
+                };
                 for slot in 0..block_len {
                     let fold4 = |input: &[F128]| {
                         let a0 = input[4 * slot];
@@ -2904,7 +2911,9 @@ fn materialize_direct_ab_fold2(
                         low + r1 * (low + high)
                     };
                     f_out[slot] = fold4(f_in);
-                    b_out[slot] += fold4(b_in);
+                    if let Some(b_in) = b_in {
+                        b_out[slot] += fold4(b_in);
+                    }
                 }
                 super::round0_and_round1_lookahead(f_out, b_out)
             },
@@ -3439,7 +3448,13 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
     let initial_k = config.initial_k;
 
     assert_eq!(packed_witness.len(), 1usize << log_n);
-    assert_eq!(b_initial.len(), 1usize << log_n);
+    // Direct mode may carry an EMPTY initial basis (all claims direct — the
+    // direct-C path); the fold-2 residual is then materialized entirely from
+    // the direct claims' composed tables.
+    assert!(
+        b_initial.len() == 1usize << log_n || (b_initial.is_empty() && direct_fold2.is_some()),
+        "b_initial must be full-length, or empty in direct mode"
+    );
     assert_eq!(config.recursive_ks.len(), r);
     assert_eq!(config.log_inv_rates.len(), r + 1);
     assert!(r >= 1);

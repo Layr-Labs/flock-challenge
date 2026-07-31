@@ -2774,6 +2774,31 @@ pub fn prove_batched_padded_with_precomputed<Ch: Challenger>(
                         products,
                     })
                 }
+                // Statistic-less variant (the ranked C claim): carries the
+                // fold-2 materialization ingredients WITHOUT the H products —
+                // this claim's round-0/lookahead contributions come from
+                // pcs's fused sweep, so `products` stays zero and MUST NOT be
+                // fed to `messages_from_direct_products`. Enables the
+                // store-less C sweep + direct L/4 materialization path.
+                // `tail = suffix[2..]` must satisfy the deferred split's
+                // minimum (`split_n_lo` requires n ≥ 4); tiny test shapes
+                // simply skip the factors (the ranked suffix is 25).
+                (Kind::Dense(d), None) if use_split && dense_suffixes[d].len() >= 6 => {
+                    let suffix = dense_suffixes[d];
+                    let low_eq: [F128; 4] = build_eq(&suffix[..2])
+                        .try_into()
+                        .expect("two-coordinate eq has four entries");
+                    let tail = &suffix[2..];
+                    let (eq_lo, eq_hi) =
+                        build_eq_split(tail, deferred_split_n_lo(tail.len()));
+                    Some(DirectFold2Factors {
+                        eq_lo,
+                        eq_hi,
+                        low_eq,
+                        table: table.clone(),
+                        products: [F128::ZERO; 16],
+                    })
+                }
                 _ => None,
             };
             let rs_eq_ind = match kinds[i] {

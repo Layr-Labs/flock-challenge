@@ -301,6 +301,41 @@ fn use_ranked_hetero_open_combine(l: usize, b: usize, n_rs: usize, n_pd: usize) 
         && crate::epool::epool().is_some()
 }
 
+/// Store-less sibling of [`run_hetero_open_combine_blocks_lookahead`]: the
+/// same stateful P/E queue drain and per-block reduce, but with NO global
+/// output array — each worker sweeps its claimed block entirely inside
+/// private scratch. Used by the direct-C path, where the combined basis is
+/// never materialized at L (the fold-2 residual is built directly at L/4).
+fn run_hetero_sweep_blocks_lookahead<S, I, F>(
+    n_blocks: usize,
+    init: I,
+    sweep_block: F,
+) -> (F128, F128, [F128; 6])
+where
+    I: Fn() -> S + Sync,
+    F: Fn(&mut S, usize) -> (F128, F128, [F128; 6]) + Sync,
+{
+    let mut partials = vec![(F128::ZERO, F128::ZERO, [F128::ZERO; 6]); n_blocks];
+    let partials_base = crate::epool::SyncPtr(partials.as_mut_ptr());
+    crate::epool::run_hetero_chunks_stateful(n_blocks, init, |state, block| {
+        // SAFETY: queue index `block` is claimed exactly once and owns one
+        // partial slot; the synchronous two-pool join publishes every write
+        // before the reduce below reads the vector.
+        unsafe {
+            partials_base.ptr().add(block).write(sweep_block(state, block));
+        }
+    });
+    partials.into_iter().fold(
+        (F128::ZERO, F128::ZERO, [F128::ZERO; 6]),
+        |(x0, x2, mut xc), (y0, y2, yc)| {
+            for (x, y) in xc.iter_mut().zip(yc) {
+                *x += y;
+            }
+            (x0 + y0, x2 + y2, xc)
+        },
+    )
+}
+
 /// Drain fixed-size output blocks through the stateful P/E queue and reduce
 /// one `(u0, u2)` partial per block after the synchronous join. `fold_block`
 /// owns the complete output block for its queue index; `init` supplies private
@@ -482,7 +517,7 @@ fn compute_combined_basis_and_target<Ch: Challenger>(
         && n_pd == 0
         && std::env::var_os("FLOCK_NO_OPEN_DIRECT_AB").is_none()
         && direct_ab_claim_mix_supported(&rs_results);
-    let direct_fold2 = if use_direct_ab {
+    let mut direct_fold2 = if use_direct_ab {
         Some(vec![
             rs_results[0]
                 .1
@@ -494,6 +529,29 @@ fn compute_combined_basis_and_target<Ch: Challenger>(
         None
     };
     let direct_count = if direct_fold2.is_some() { 1 } else { 0 };
+    // Direct-C extension: when the AB claim is direct AND the C claim carries
+    // its own (statistic-less) fold-2 factors, the combined basis is never
+    // materialized at L. The fused sweep still computes C's round-0 prime and
+    // lookahead contributions — identical values, per-worker scratch instead
+    // of a 512 MiB store — and ligerito materializes BOTH claims' residuals
+    // directly at L/4. `messages_from_direct_products` must keep seeing only
+    // the AB entry (C's `products` are intentionally zero).
+    let use_direct_c = use_direct_ab
+        && std::env::var_os("FLOCK_NO_OPEN_DIRECT_C").is_none()
+        && rs_results[1].1.direct_fold2.is_some()
+        && matches!(
+            rs_results[1].1.rs_eq_ind,
+            ring_switch::RsEqInd::DeferredDense { .. }
+        );
+    if use_direct_c {
+        direct_fold2.as_mut().expect("use_direct_ab holds").push(
+            rs_results[1]
+                .1
+                .direct_fold2
+                .take()
+                .expect("use_direct_c checked claim one"),
+        );
+    }
 
     let rs_baked: Vec<&[F128]> = rs_results
         .iter()
@@ -545,8 +603,13 @@ fn compute_combined_basis_and_target<Ch: Challenger>(
 
     // ---- Build b_combined (γ-weighted sum of all rs_eq_ind + eq_ind) and the
     //      round-0 prime (u_0, u_2 over packed_witness · b_combined).
+    //      Under direct-C, b_combined is never materialized (empty).
     let t_alloc = std::time::Instant::now();
-    let mut b_combined: Vec<F128> = crate::scratch::take_f128(l);
+    let mut b_combined: Vec<F128> = if use_direct_c {
+        Vec::new()
+    } else {
+        crate::scratch::take_f128(l)
+    };
     let alloc_ms = t_alloc.elapsed().as_secs_f64() * 1e3;
     let t_fold = std::time::Instant::now();
 
@@ -650,7 +713,38 @@ fn compute_combined_basis_and_target<Ch: Challenger>(
         };
 
         let ranked_hetero = use_ranked_hetero_open_combine(l, b, n_rs, n_pd);
-        if want_round1_lookahead {
+        if use_direct_c {
+            // Store-less sweep: identical fill + prime/lookahead math (same
+            // transcript values), swept inside per-worker scratch — the
+            // combined basis never touches DRAM at L.
+            debug_assert!(want_round1_lookahead);
+            let n_blocks = l / b;
+            let sweep = |state: &mut (Vec<F128>, Vec<F128>), hi: usize| {
+                let (ctable, scratch) = state;
+                fold_lookahead_block(ctable, hi, scratch)
+            };
+            let init_state = || (init_ctable(), vec![F128::ZERO; b]);
+            let fast = if ranked_hetero {
+                run_hetero_sweep_blocks_lookahead(n_blocks, init_state, |state, hi| {
+                    sweep(state, hi)
+                })
+            } else {
+                use rayon::prelude::*;
+                (0..n_blocks)
+                    .into_par_iter()
+                    .map_init(init_state, |state, hi| sweep(state, hi))
+                    .reduce(
+                        || (F128::ZERO, F128::ZERO, [F128::ZERO; 6]),
+                        |(x0, x2, mut xc), (y0, y2, yc)| {
+                            for (x, y) in xc.iter_mut().zip(yc) {
+                                *x += y;
+                            }
+                            (x0 + y0, x2 + y2, xc)
+                        },
+                    )
+            };
+            (fast.0, fast.1, Some(fast.2))
+        } else if want_round1_lookahead {
             let fast = if ranked_hetero {
                 run_hetero_open_combine_blocks_lookahead(
                     &mut b_combined,
@@ -749,7 +843,9 @@ fn compute_combined_basis_and_target<Ch: Challenger>(
     };
     let mut round1_lookahead = round1_lookahead;
     if let Some(direct) = direct_fold2.as_ref() {
-        let (direct_round0, direct_lookahead) = messages_from_direct_products(direct);
+        // Only the AB entry carries real H products; the direct-C entry's
+        // message contributions came from the fused sweep above.
+        let (direct_round0, direct_lookahead) = messages_from_direct_products(&direct[..1]);
         round0_u0 += direct_round0.0;
         round0_u2 += direct_round0.1;
         let combined_lookahead = round1_lookahead
