@@ -239,6 +239,33 @@ fn use_ranked_zero_root_fusion(
     use_ranked_deep_pair_fusion(log_d, num_ntts, start_layer, n_top)
 }
 
+/// Whether the ranked L0 commit fuses its second and third top passes into a
+/// single staged radix-64 sweep.
+///
+/// Layers 4-6 and 7-9 are today two independent in-place full-buffer passes:
+/// each reads the whole 1 GiB codeword and writes it back, so the pair costs
+/// 4 GiB of DRAM traffic. Every butterfly in layers 4..9 has a stride that is
+/// a multiple of `k = block_size(4) / 64` positions, so one radix-64 row group
+/// is closed under all six layers. Staging that 64-row group in a 64 KiB
+/// L1-resident tile lets the second sweep read the tile instead of the
+/// codeword and the first sweep write the tile instead of the codeword, which
+/// deletes one full 1 GiB read and one full 1 GiB write outright. The
+/// arithmetic is unchanged — the same two radix-8 kernels run over the same
+/// row groups with the same twiddles — so this is a pure byte-count change.
+///
+/// `FLOCK_NO_NTT_STAGED6=1` restores the two in-place passes in the same
+/// binary.
+#[inline]
+fn use_ranked_staged_six_layer_top(
+    log_d: usize,
+    num_ntts: usize,
+    start_layer: usize,
+    n_top: usize,
+) -> bool {
+    use_ranked_deep_pair_fusion(log_d, num_ntts, start_layer, n_top)
+        && std::env::var_os("FLOCK_NO_NTT_STAGED6").is_none()
+}
+
 /// The three ranked radix-8 passes share fixed one-MiB row tiles with the
 /// efficiency-core pool. Layer 1 has only two outer blocks, but flattening
 /// `(block, row-tile)` still exposes the same 1024 claims as layers 4 and 7.
@@ -551,6 +578,21 @@ impl AdditiveNttF128 {
                     }
                 }
             });
+        }
+
+        // Layers 4-9. The staged radix-64 sweep fuses both remaining top
+        // passes into one codeword read and one codeword write; the opt-out
+        // restores the two exact in-place ranked hetero passes.
+        if use_ranked_staged_six_layer_top(log_d, num_ntts, start_layer, n_top) {
+            let num_blocks = 1usize << 4;
+            let block_size = 1usize << (log_d - 4);
+            let k = block_size >> 6;
+            let t_lo: Vec<[F128; 7]> = (0..num_blocks).map(|b| block_twiddles(4, b)).collect();
+            let t_hi: Vec<[[F128; 7]; 8]> = (0..num_blocks)
+                .map(|b| core::array::from_fn(|g| block_twiddles(7, 8 * b + g)))
+                .collect();
+            butterfly_interleaved_fused_6layer_staged_hetero(data, &t_lo, &t_hi, k, num_ntts);
+            return;
         }
 
         // Layers 4 and 7: exact in-place ranked hetero passes.
@@ -1698,6 +1740,75 @@ fn butterfly_interleaved_fused_3layer_all_blocks_hetero(
     });
 }
 
+/// Staged radix-64 sibling of
+/// [`butterfly_interleaved_fused_3layer_all_blocks_hetero`] that fuses six
+/// layers `(L..L+6)` into one codeword read and one codeword write.
+///
+/// Each outer block holds `64 * k` positions. Row group `r` owns the 64
+/// positions `{ i * k + r }`, and every layer-`L..L+6` butterfly stride is a
+/// multiple of `k` positions, so the group is closed under all six layers.
+/// One claim owns a fixed row tile within one block and evaluates both
+/// radix-8 sweeps of every row group in that tile against a private 64 KiB
+/// staging tile, so the intermediate that the layer-`L+3` pass used to reload
+/// from DRAM is read out of L1 instead.
+///
+/// Traffic ledger at the ranked 1 GiB codeword: the two passes this replaces
+/// moved 4 GiB (each read and wrote the whole codeword); this pass moves 2
+/// GiB. The arithmetic is untouched — the same two radix-8 row kernels, the
+/// same row groups, the same twiddles, the same order — so the output is
+/// bit-identical.
+#[inline]
+fn butterfly_interleaved_fused_6layer_staged_hetero(
+    data: &mut [F128],
+    t_lo: &[[F128; 7]],
+    t_hi: &[[[F128; 7]; 8]],
+    k: usize,
+    num_ntts: usize,
+) {
+    let num_blocks = t_lo.len();
+    debug_assert_eq!(t_hi.len(), num_blocks);
+    let block_elems = 64 * k * num_ntts;
+    debug_assert_eq!(data.len(), num_blocks * block_elems);
+    debug_assert!(k.is_power_of_two());
+
+    // Half the row tile of the radix-8 passes: one claim now carries both
+    // sweeps, so the smaller claim keeps the heterogeneous tail as short as
+    // the single-sweep passes had it while still giving each of the 64 row
+    // streams a 32 KiB sequential run.
+    const ROWS_PER_TILE: usize = 32;
+    let tiles_per_block = k.div_ceil(ROWS_PER_TILE);
+    let base = crate::epool::SyncPtr(data.as_mut_ptr());
+    crate::epool::run_hetero_chunks_stateful(
+        num_blocks * tiles_per_block,
+        // 64 rows stage the fused group; 8 more stage the second sweep's
+        // output rows for their store bursts.
+        || vec![F128::ZERO; 72 * num_ntts],
+        |tile, job| {
+            let block = job / tiles_per_block;
+            let row_tile = job % tiles_per_block;
+            let row_start = row_tile * ROWS_PER_TILE;
+            let row_end = (row_start + ROWS_PER_TILE).min(k);
+            let block_base = unsafe { base.ptr().add(block * block_elems) };
+            // SAFETY: each queue index owns one disjoint (block, row tile)
+            // pair, and a row tile's row groups touch only positions
+            // `i * k + r` for `r` in that tile — disjoint across tiles. The
+            // staging tile is per-worker state, never shared.
+            unsafe {
+                kernels::butterfly_fused_6layer_staged_rows(
+                    block_base,
+                    k,
+                    num_ntts,
+                    row_start,
+                    row_end,
+                    tile.as_mut_ptr(),
+                    &t_lo[block],
+                    &t_hi[block],
+                )
+            }
+        },
+    );
+}
+
 /// Butterfly one top-layer block, fusing four layers `(L..L+4)`. `block` holds
 /// `16 * sixteenth` rows of `num_ntts` lanes; `t` carries the 15 twiddles for
 /// the sub-butterflies (see module comment above). Parallel over row groups.
@@ -1767,6 +1878,57 @@ mod tests {
 
     fn rand_vec(rng: &mut Rng, n: usize) -> Vec<F128> {
         (0..n).map(|_| rng.f128()).collect()
+    }
+
+    /// The staged radix-64 pass must be bit-identical to the two in-place
+    /// fused-three-layer passes it replaces.
+    ///
+    /// The oracle is the existing scalar `scalar_fused_3layer_block`
+    /// reference applied exactly as the incumbent schedule applies it: once
+    /// over each whole outer block for layers `L..L+3` (row stride `8k`),
+    /// then once over each of that block's eight sub-blocks for layers
+    /// `L+3..L+6` (row stride `k`). This pins the row-group closure, the
+    /// tile row mapping, the per-`g` twiddle split, and the driver's
+    /// block/row-tile indexing all at once.
+    #[test]
+    fn staged_six_layer_matches_two_fused_three_layer_passes() {
+        let mut rng = Rng::new(0x5A6E_D6C3_1122_3344);
+        let num_ntts = 3usize;
+        // `k > ROWS_PER_TILE` so the driver hands out more than one row tile
+        // per block, and more than one block so block indexing is covered.
+        let k = 64usize;
+        let num_blocks = 2usize;
+        let block_elems = 64 * k * num_ntts;
+
+        let t_lo: Vec<[F128; 7]> = (0..num_blocks)
+            .map(|_| core::array::from_fn(|_| rng.f128()))
+            .collect();
+        let t_hi: Vec<[[F128; 7]; 8]> = (0..num_blocks)
+            .map(|_| core::array::from_fn(|_| core::array::from_fn(|_| rng.f128())))
+            .collect();
+
+        let data = rand_vec(&mut rng, num_blocks * block_elems);
+
+        let mut expected = data.clone();
+        for b in 0..num_blocks {
+            let block = &mut expected[b * block_elems..(b + 1) * block_elems];
+            // Layers L..L+3: one radix-8 pass over the whole block.
+            scalar_fused_3layer_block(block, &t_lo[b], 8 * k, num_ntts);
+            // Layers L+3..L+6: one radix-8 pass over each of the eight
+            // sub-blocks the previous layers split the block into.
+            let sub_elems = 8 * k * num_ntts;
+            for (g, sub) in block.chunks_mut(sub_elems).enumerate() {
+                scalar_fused_3layer_block(sub, &t_hi[b][g], k, num_ntts);
+            }
+        }
+
+        let mut actual = data.clone();
+        butterfly_interleaved_fused_6layer_staged_hetero(
+            &mut actual, &t_lo, &t_hi, k, num_ntts,
+        );
+
+        assert_eq!(actual, expected);
+        assert_ne!(actual, data);
     }
 
     fn scalar_fused_3layer_block(
