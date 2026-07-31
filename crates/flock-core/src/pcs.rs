@@ -113,8 +113,7 @@ pub fn open_batch_mixed_ligerito_with_precomputed_s_hat_v<Ch: Challenger>(
     lig_config: &ligerito::ProverConfig,
     challenger: &mut Ch,
 ) -> BatchOpeningProofLigerito {
-    let trace =
-        std::env::var("PCS_TRACE").is_ok() || std::env::var_os("FLOCK_OPEN_TIMING").is_some();
+    let trace = std::env::var("PCS_TRACE").is_ok();
     let t_total = std::time::Instant::now();
 
     assert_eq!(
@@ -293,10 +292,7 @@ fn compute_combined_basis_and_target<Ch: Challenger>(
 
     // ---- Build b_combined (γ-weighted sum of all rs_eq_ind + eq_ind) and the
     //      round-0 prime (u_0, u_2 over packed_witness · b_combined).
-    let t_alloc = std::time::Instant::now();
     let mut b_combined: Vec<F128> = crate::scratch::take_f128(l);
-    let alloc_ms = t_alloc.elapsed().as_secs_f64() * 1e3;
-    let t_fold = std::time::Instant::now();
 
     // Fast path (compression-proof open: claims ab, c; also chain/merkle): every
     // RS claim is a fused DeferredDense fold and no DENSE packed-direct claim
@@ -318,77 +314,38 @@ fn compute_combined_basis_and_target<Ch: Challenger>(
         let b = rs_deferred[0].0.len(); // eq_lo.len(); shared across claims (same split)
         debug_assert!(b >= 2 && b.is_multiple_of(2));
         debug_assert!(rs_deferred.iter().all(|d| d.0.len() == b));
-        // Composed-table sweep. `fold_one_slot(·, T)` is F₂-linear, so the
-        // per-slot map `lo ↦ fold_one_slot(lo·e_hi, T)` collapses into ONE
-        // per-claim-per-block byte table (`compose_fold_byte_table_into`),
-        // deleting the per-slot field multiply from the L-sized sweep —
-        // 1 GF mul × L × n_claims of counted work — for a per-block table
-        // build (~4.3k ops) amortized over b slots. Bit-identical: the
-        // composed table encodes exactly the same F₂-linear map (see the
-        // helper's docs). One 64 KiB table is live per thread at a time
-        // (claims composed and swept sequentially — table reused in place),
-        // preserving the claim-sequential L1 footprint.
-        //
-        // Small blocks (tiny test shapes) keep the direct slot-multiply
-        // sweep: the table build wouldn't amortize below ~2^12 slots.
-        const COMPOSE_MIN_BLOCK: usize = 1 << 12;
-        let composed = b >= COMPOSE_MIN_BLOCK;
         b_combined
             .par_chunks_mut(b)
             .enumerate()
-            .map_init(
-                || {
-                    if composed {
-                        vec![F128::ZERO; ring_switch::FOLD_TABLE_LEN]
+            .map(|(hi, out_block)| {
+                // Accumulate each claim's block: first claim writes, rest add.
+                // `e_hi` is read once per claim per block, then swept over eq_lo.
+                for (ci, (eq_lo, eq_hi, table, _)) in rs_deferred.iter().enumerate() {
+                    let e_hi = eq_hi[hi];
+                    if ci == 0 {
+                        for (slot, &lo) in out_block.iter_mut().zip(eq_lo.iter()) {
+                            *slot = ring_switch::fold_one_slot(lo * e_hi, table);
+                        }
                     } else {
-                        Vec::new()
-                    }
-                },
-                |ctable, (hi, out_block)| {
-                    // Accumulate each claim's block: first claim writes, rest add.
-                    // `e_hi` is folded into the composed table once per claim per
-                    // block, then swept over eq_lo with no per-slot multiply.
-                    for (ci, (eq_lo, eq_hi, table, _)) in rs_deferred.iter().enumerate() {
-                        let e_hi = eq_hi[hi];
-                        if composed {
-                            ring_switch::compose_fold_byte_table_into(e_hi, table, ctable);
-                            if ci == 0 {
-                                for (slot, &lo) in out_block.iter_mut().zip(eq_lo.iter()) {
-                                    *slot = ring_switch::fold_one_slot(lo, ctable);
-                                }
-                            } else {
-                                for (slot, &lo) in out_block.iter_mut().zip(eq_lo.iter()) {
-                                    *slot += ring_switch::fold_one_slot(lo, ctable);
-                                }
-                            }
-                        } else if ci == 0 {
-                            for (slot, &lo) in out_block.iter_mut().zip(eq_lo.iter()) {
-                                *slot = ring_switch::fold_one_slot(lo * e_hi, table);
-                            }
-                        } else {
-                            for (slot, &lo) in out_block.iter_mut().zip(eq_lo.iter()) {
-                                *slot += ring_switch::fold_one_slot(lo * e_hi, table);
-                            }
+                        for (slot, &lo) in out_block.iter_mut().zip(eq_lo.iter()) {
+                            *slot += ring_switch::fold_one_slot(lo * e_hi, table);
                         }
                     }
-                    // Round-0 prime over this block's pairs (b is even, base is
-                    // even). Separate pass over the L2-resident block — fusing it
-                    // into the last claim's sweep measured slower (pairwise
-                    // stepping breaks the streaming store pattern).
-                    let base = hi * b;
-                    let mut u0 = F128::ZERO;
-                    let mut u2 = F128::ZERO;
-                    for t in 0..(b / 2) {
-                        let s0 = out_block[2 * t];
-                        let s1 = out_block[2 * t + 1];
-                        let a0 = packed_witness[base + 2 * t];
-                        let a1 = packed_witness[base + 2 * t + 1];
-                        u0 += a0 * s0;
-                        u2 += (a0 + a1) * (s0 + s1);
-                    }
-                    (u0, u2)
-                },
-            )
+                }
+                // Round-0 prime over this block's pairs (b is even, base is even).
+                let base = hi * b;
+                let mut u0 = F128::ZERO;
+                let mut u2 = F128::ZERO;
+                for t in 0..(b / 2) {
+                    let s0 = out_block[2 * t];
+                    let s1 = out_block[2 * t + 1];
+                    let a0 = packed_witness[base + 2 * t];
+                    let a1 = packed_witness[base + 2 * t + 1];
+                    u0 += a0 * s0;
+                    u2 += (a0 + a1) * (s0 + s1);
+                }
+                (u0, u2)
+            })
             .reduce(
                 || (F128::ZERO, F128::ZERO),
                 |(x0, x2), (y0, y2)| (x0 + y0, x2 + y2),
@@ -440,8 +397,6 @@ fn compute_combined_basis_and_target<Ch: Challenger>(
         }
         prime
     };
-    let fold_ms = t_fold.elapsed().as_secs_f64() * 1e3;
-    let t_sparse = std::time::Instant::now();
     let mut adjust_prime_for_delta = |idx: usize, delta: F128| {
         let pair = idx / 2;
         let a0 = packed_witness[2 * pair];
@@ -473,14 +428,10 @@ fn compute_combined_basis_and_target<Ch: Challenger>(
     }
     if trace {
         eprintln!(
-            "  [open_batch] combine rs_eq_ind (L={}, rs×{}, pd×{}, fast={}): alloc {:6.2} ms, fold+prime {:6.2} ms, sparse {:6.2} ms, total {:6.2} ms",
+            "  [open_batch] combine rs_eq_ind (L={}, rs×{}, pd×{}): {:6.2} ms",
             l,
             n_rs,
             n_pd,
-            use_fast,
-            alloc_ms,
-            fold_ms,
-            t_sparse.elapsed().as_secs_f64() * 1e3,
             t.elapsed().as_secs_f64() * 1e3
         );
     }
