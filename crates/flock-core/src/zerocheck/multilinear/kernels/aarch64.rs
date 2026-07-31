@@ -1,4 +1,6 @@
-use crate::field::{F128, F256Unreduced};
+use crate::field::F128;
+#[cfg(all(test, target_arch = "aarch64", target_feature = "aes"))]
+use crate::field::F256Unreduced;
 
 #[cfg(target_arch = "aarch64")]
 #[derive(Clone, Copy)]
@@ -261,11 +263,21 @@ pub(crate) unsafe fn fold_one_row_neon_unchecked_8(
 }
 
 /// Fuse one multilinear tail fold with construction of the following round's
-/// message. The previous AArch64 path first streamed all of `a_in`/`b_in` into
-/// `a_out`/`b_out`, then immediately reread both outputs in a second pass.
-/// Keeping each four-value folded pair live until its message contribution is
-/// accumulated removes that full output readback while preserving the exact
-/// canonical output tables for the next round.
+/// message. Q-register native: each four-value group is loaded into vector
+/// registers, folded at `r_fold` (hoisted/broadcast once per chunk), stored to
+/// `a_out`/`b_out`, and consumed for the message products without ever
+/// crossing back to scalar `F128` — only the two final chunk sums leave the
+/// registers. This removes the per-group SIMD→GPR→SIMD round trips of the
+/// original scalar-struct path (every `F128` multiply used to bounce through
+/// the GPRs) while preserving the exact canonical output tables for the next
+/// round.
+///
+/// Accumulation uses deferred-reduction [`WideNeon`] pairs (same contract as
+/// [`fold_round2_chunk_neon_unchecked_8`]), reduced once at the end of the
+/// chunk. Bit-identical to the scalar path: `mul_q`/`mul_unreduced_q` compute
+/// the same GHASH products as the `F128` operators (see
+/// `karatsuba_q_products_match_scalar_field_products`), and the XOR
+/// accumulation followed by the F2-linear reduction is order-insensitive.
 #[cfg(target_arch = "aarch64")]
 pub(crate) fn fold_and_message_aarch64(
     a_in: &[F128],
@@ -275,41 +287,59 @@ pub(crate) fn fold_and_message_aarch64(
     r_fold: F128,
     eq_lo: &[F128],
 ) -> (F128, F128) {
+    use core::arch::aarch64::*;
+
     debug_assert_eq!(a_in.len(), 2 * a_out.len());
     debug_assert_eq!(b_in.len(), 2 * b_out.len());
     debug_assert_eq!(a_out.len(), 2 * eq_lo.len());
 
-    let mut p1_acc = F256Unreduced::ZERO;
-    let mut pinf_acc = F256Unreduced::ZERO;
+    // SAFETY: PMULL (the `aes` feature) is assumed on every aarch64 CPU this
+    // crate runs on — the same assumption the
+    // `fold_round2_chunk_neon_unchecked_8` call site makes. The length
+    // invariants above bound every load/store: four inputs and two outputs
+    // per `eq_lo` entry.
+    unsafe {
+        let rho = core::mem::transmute::<F128, uint64x2_t>(r_fold);
+        let zero = vdupq_n_u64(0);
+        let mut p1_acc = WideNeon { lo: zero, hi: zero };
+        let mut pinf_acc = WideNeon { lo: zero, hi: zero };
 
-    for (x_lo, &eq_l) in eq_lo.iter().enumerate() {
-        let i = 4 * x_lo;
-        let o = 2 * x_lo;
+        for x_lo in 0..eq_lo.len() {
+            let i = 4 * x_lo;
+            let o = 2 * x_lo;
 
-        let a_even_0 = a_in[i];
-        let a_odd_0 = a_in[i + 1];
-        let a_even_1 = a_in[i + 2];
-        let a_odd_1 = a_in[i + 3];
-        let b_even_0 = b_in[i];
-        let b_odd_0 = b_in[i + 1];
-        let b_even_1 = b_in[i + 2];
-        let b_odd_1 = b_in[i + 3];
+            let a_even_0 = vld1q_u64(a_in.as_ptr().add(i).cast::<u64>());
+            let a_odd_0 = vld1q_u64(a_in.as_ptr().add(i + 1).cast::<u64>());
+            let a_even_1 = vld1q_u64(a_in.as_ptr().add(i + 2).cast::<u64>());
+            let a_odd_1 = vld1q_u64(a_in.as_ptr().add(i + 3).cast::<u64>());
+            let b_even_0 = vld1q_u64(b_in.as_ptr().add(i).cast::<u64>());
+            let b_odd_0 = vld1q_u64(b_in.as_ptr().add(i + 1).cast::<u64>());
+            let b_even_1 = vld1q_u64(b_in.as_ptr().add(i + 2).cast::<u64>());
+            let b_odd_1 = vld1q_u64(b_in.as_ptr().add(i + 3).cast::<u64>());
 
-        let a0 = a_even_0 + r_fold * (a_even_0 + a_odd_0);
-        let a1 = a_even_1 + r_fold * (a_even_1 + a_odd_1);
-        let b0 = b_even_0 + r_fold * (b_even_0 + b_odd_0);
-        let b1 = b_even_1 + r_fold * (b_even_1 + b_odd_1);
+            // Fold at r_fold: out = even + r_fold·(even + odd).
+            let a0 = veorq_u64(a_even_0, mul_q(rho, veorq_u64(a_even_0, a_odd_0)));
+            let a1 = veorq_u64(a_even_1, mul_q(rho, veorq_u64(a_even_1, a_odd_1)));
+            let b0 = veorq_u64(b_even_0, mul_q(rho, veorq_u64(b_even_0, b_odd_0)));
+            let b1 = veorq_u64(b_even_1, mul_q(rho, veorq_u64(b_even_1, b_odd_1)));
 
-        a_out[o] = a0;
-        a_out[o + 1] = a1;
-        b_out[o] = b0;
-        b_out[o + 1] = b1;
+            vst1q_u64(a_out.as_mut_ptr().add(o).cast::<u64>(), a0);
+            vst1q_u64(a_out.as_mut_ptr().add(o + 1).cast::<u64>(), a1);
+            vst1q_u64(b_out.as_mut_ptr().add(o).cast::<u64>(), b0);
+            vst1q_u64(b_out.as_mut_ptr().add(o + 1).cast::<u64>(), b1);
 
-        p1_acc ^= eq_l.mul_unreduced(a1 * b1);
-        pinf_acc ^= eq_l.mul_unreduced((a0 + a1) * (b0 + b1));
+            let g1 = mul_q(a1, b1);
+            let g_inf = mul_q(veorq_u64(a0, a1), veorq_u64(b0, b1));
+            let eq_l = vld1q_u64(eq_lo.as_ptr().add(x_lo).cast::<u64>());
+            wide_xor(&mut p1_acc, mul_unreduced_q(eq_l, g1));
+            wide_xor(&mut pinf_acc, mul_unreduced_q(eq_l, g_inf));
+        }
+
+        (
+            core::mem::transmute::<uint64x2_t, F128>(reduce_wide_q(p1_acc)),
+            core::mem::transmute::<uint64x2_t, F128>(reduce_wide_q(pinf_acc)),
+        )
     }
-
-    (p1_acc.reduce(), pinf_acc.reduce())
 }
 
 #[cfg(all(test, target_arch = "aarch64", target_feature = "aes"))]
@@ -323,6 +353,88 @@ mod tests {
         z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
         z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
         z ^ (z >> 31)
+    }
+
+    /// Scalar reference for [`fold_and_message_aarch64`]: the pre-NEON
+    /// implementation, kept as the cross-check oracle.
+    fn fold_and_message_scalar(
+        a_in: &[F128],
+        b_in: &[F128],
+        a_out: &mut [F128],
+        b_out: &mut [F128],
+        r_fold: F128,
+        eq_lo: &[F128],
+    ) -> (F128, F128) {
+        let mut p1_acc = F256Unreduced::ZERO;
+        let mut pinf_acc = F256Unreduced::ZERO;
+
+        for (x_lo, &eq_l) in eq_lo.iter().enumerate() {
+            let i = 4 * x_lo;
+            let o = 2 * x_lo;
+
+            let a_even_0 = a_in[i];
+            let a_odd_0 = a_in[i + 1];
+            let a_even_1 = a_in[i + 2];
+            let a_odd_1 = a_in[i + 3];
+            let b_even_0 = b_in[i];
+            let b_odd_0 = b_in[i + 1];
+            let b_even_1 = b_in[i + 2];
+            let b_odd_1 = b_in[i + 3];
+
+            let a0 = a_even_0 + r_fold * (a_even_0 + a_odd_0);
+            let a1 = a_even_1 + r_fold * (a_even_1 + a_odd_1);
+            let b0 = b_even_0 + r_fold * (b_even_0 + b_odd_0);
+            let b1 = b_even_1 + r_fold * (b_even_1 + b_odd_1);
+
+            a_out[o] = a0;
+            a_out[o + 1] = a1;
+            b_out[o] = b0;
+            b_out[o + 1] = b1;
+
+            p1_acc ^= eq_l.mul_unreduced(a1 * b1);
+            pinf_acc ^= eq_l.mul_unreduced((a0 + a1) * (b0 + b1));
+        }
+
+        (p1_acc.reduce(), pinf_acc.reduce())
+    }
+
+    /// The q-register native kernel produces bit-identical folded outputs and
+    /// `(p1, pinf)` chunk sums to the scalar reference, across the eq_lo sizes
+    /// the fused tail actually uses (lo_size ≥ 2, powers of two).
+    #[test]
+    fn fold_and_message_q_native_matches_scalar() {
+        let mut state = 0x4652_4f4c_4b5f_4d4c; // "FRLOK_ML"-ish seed
+        for lo_bits in 1..=6 {
+            let lo_size = 1usize << lo_bits;
+            let n_in = 4 * lo_size;
+            let a_in: Vec<F128> = (0..n_in)
+                .map(|_| F128::new(splitmix64(&mut state), splitmix64(&mut state)))
+                .collect();
+            let b_in: Vec<F128> = (0..n_in)
+                .map(|_| F128::new(splitmix64(&mut state), splitmix64(&mut state)))
+                .collect();
+            let eq_lo: Vec<F128> = (0..lo_size)
+                .map(|_| F128::new(splitmix64(&mut state), splitmix64(&mut state)))
+                .collect();
+            let r_fold = F128::new(splitmix64(&mut state), splitmix64(&mut state));
+
+            let mut a_out_q = vec![F128::ZERO; 2 * lo_size];
+            let mut b_out_q = vec![F128::ZERO; 2 * lo_size];
+            let mut a_out_s = vec![F128::ZERO; 2 * lo_size];
+            let mut b_out_s = vec![F128::ZERO; 2 * lo_size];
+
+            let (p1_q, pinf_q) = fold_and_message_aarch64(
+                &a_in, &b_in, &mut a_out_q, &mut b_out_q, r_fold, &eq_lo,
+            );
+            let (p1_s, pinf_s) = fold_and_message_scalar(
+                &a_in, &b_in, &mut a_out_s, &mut b_out_s, r_fold, &eq_lo,
+            );
+
+            assert_eq!(a_out_q, a_out_s, "a_out mismatch at lo_size={lo_size}");
+            assert_eq!(b_out_q, b_out_s, "b_out mismatch at lo_size={lo_size}");
+            assert_eq!(p1_q, p1_s, "p1 mismatch at lo_size={lo_size}");
+            assert_eq!(pinf_q, pinf_s, "pinf mismatch at lo_size={lo_size}");
+        }
     }
 
     #[test]
