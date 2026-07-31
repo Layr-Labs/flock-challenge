@@ -152,6 +152,25 @@ where
     run_chunks_with_helper_stateful(n_chunks, &init, &f, epool());
 }
 
+/// Run one borrowed job on every helper-pool worker while `main` executes on
+/// the calling thread, then join all helper jobs before returning.
+///
+/// `in_place_scope` keeps the scope body on the caller, so the main Rayon pool
+/// remains fully available to `main`; `spawn_broadcast` injects the borrowed
+/// helper job directly into the existing helper pool. This avoids creating a
+/// short-lived OS coordinator thread for every heterogeneous dispatch.
+#[inline]
+fn join_helper_broadcast_in_place<W, M>(helper: &rayon::ThreadPool, worker: &W, main: M)
+where
+    W: Fn() + Sync,
+    M: FnOnce(),
+{
+    helper.in_place_scope(|scope| {
+        scope.spawn_broadcast(|_, _| worker());
+        main();
+    });
+}
+
 /// [`run_hetero_chunks`] with an explicit helper pool, so tests can exercise
 /// the two-pool queue on hosts without efficiency cores.
 pub(crate) fn run_chunks_with_helper<F>(n_chunks: usize, f: &F, helper: Option<&rayon::ThreadPool>)
@@ -190,13 +209,7 @@ where
             .for_each(|_| worker());
     };
     match helper.filter(|_| n_chunks >= EPOOL_MIN_CHUNKS) {
-        Some(ep) => std::thread::scope(|s| {
-            // The scoped thread parks inside `broadcast` while the E-workers
-            // drain; it costs no main-pool worker. The scope join bounds the
-            // tail wait at one chunk on one efficiency core.
-            s.spawn(|| ep.broadcast(|_| worker()));
-            drain_main();
-        }),
+        Some(ep) => join_helper_broadcast_in_place(ep, &worker, drain_main),
         None => drain_main(),
     }
 }
@@ -241,10 +254,7 @@ pub(crate) fn run_chunks_with_helper_stateful<S, I, F>(
             .for_each(|_| worker());
     };
     match helper.filter(|_| n_chunks >= EPOOL_MIN_CHUNKS) {
-        Some(ep) => std::thread::scope(|s| {
-            s.spawn(|| ep.broadcast(|_| worker()));
-            drain_main();
-        }),
+        Some(ep) => join_helper_broadcast_in_place(ep, &worker, drain_main),
         None => drain_main(),
     }
 }
@@ -278,6 +288,35 @@ unsafe impl<T> Sync for SyncPtr<T> {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The helper broadcast must execute concurrently with the caller's main
+    /// drain and the function must not return until every borrowed helper job
+    /// has completed. This pins the safe, scoped Rayon orchestration used by
+    /// the heterogeneous queue without requiring an OS coordinator thread.
+    #[test]
+    fn in_place_helper_broadcast_is_concurrent_and_joined() {
+        let helper = rayon::ThreadPoolBuilder::new()
+            .num_threads(2)
+            .build()
+            .unwrap();
+        let rendezvous = std::sync::Barrier::new(3);
+        let helper_calls = AtomicUsize::new(0);
+        let borrowed = String::from("borrowed until join");
+
+        join_helper_broadcast_in_place(
+            &helper,
+            &|| {
+                assert_eq!(borrowed, "borrowed until join");
+                helper_calls.fetch_add(1, Ordering::Relaxed);
+                rendezvous.wait();
+            },
+            || {
+                rendezvous.wait();
+            },
+        );
+
+        assert_eq!(helper_calls.load(Ordering::Relaxed), 2);
+    }
 
     /// Every chunk index is executed exactly once when both pools drain the
     /// queue concurrently.
