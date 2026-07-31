@@ -502,11 +502,25 @@ pub fn build_eq_table(point: &[F128]) -> Vec<F128> {
 
     let d = point.len();
     // Every slot is written by the level that first exposes it before it can
-    // be read at a later level.
-    let mut out = crate::alloc_uninit_f128_vec(1usize << d);
+    // be read at a later level (both sources are uninitialized/stale, so the
+    // write-before-read contract is identical).
+    //
+    // Large tables (the recursive PCS's OOD eq tables, the induce-phase row
+    // eq) go through the scratch pool so repeated proves reuse the same
+    // resident pages instead of re-faulting fresh allocations.
+    let mut out = if d >= 15 {
+        crate::scratch::take_f128(1usize << d)
+    } else {
+        crate::alloc_uninit_f128_vec(1usize << d)
+    };
     out[0] = F128::ONE;
     const PAR_THRESHOLD: usize = 1 << 12;
-    for j in 0..d {
+    // Fuse the last two doubling levels into one sweep for large tables:
+    // write all 4 children per read with the exact same per-level products
+    // (`vr = v·r`, `lo = v + vr`), so the output is bit-identical while the
+    // table crosses memory once instead of twice.
+    let fused_tail_levels = if d >= 14 { 2 } else { 0 };
+    for j in 0..d - fused_tail_levels {
         let r_j = point[j];
         let len = 1usize << j;
         let (lo, rest) = out.split_at_mut(len);
@@ -531,6 +545,32 @@ pub fn build_eq_table(point: &[F128]) -> Vec<F128> {
                 .zip(hi.par_iter_mut())
                 .for_each(|(lo_i, hi_i)| build_pair(lo_i, hi_i));
         }
+    }
+    if fused_tail_levels == 2 {
+        let r_a = point[d - 2];
+        let r_b = point[d - 1];
+        let q = 1usize << (d - 2);
+        let (s01, s23) = out.split_at_mut(2 * q);
+        let (s0, s1) = s01.split_at_mut(q);
+        let (s2, s3) = s23.split_at_mut(q);
+        s0.par_iter_mut()
+            .zip(s1.par_iter_mut())
+            .zip(s2.par_iter_mut().zip(s3.par_iter_mut()))
+            .for_each(|((v0, v1), (v2, v3))| {
+                // Level d-2 (in registers): a = v·(1+r_a) at bit=0, b = v·r_a
+                // at bit=1; then level d-1 on each — same products as the
+                // unfused sweeps.
+                let v = *v0;
+                let vr = v * r_a;
+                let a = v + vr;
+                let b = vr;
+                let a_hi = a * r_b;
+                *v0 = a + a_hi;
+                *v2 = a_hi;
+                let b_hi = b * r_b;
+                *v1 = b + b_hi;
+                *v3 = b_hi;
+            });
     }
     out
 }

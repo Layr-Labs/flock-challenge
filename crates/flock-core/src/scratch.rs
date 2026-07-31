@@ -160,6 +160,66 @@ pub fn prewarm_prover(m: usize) {
 pub fn clear() {
     POOL.lock().unwrap().clear();
     POOL_U8.lock().unwrap().clear();
+    POOL_HASH.lock().unwrap().clear();
+}
+
+// ---------------------------------------------------------------------------
+// Merkle-node pool (recursive Ligerito commit trees).
+//
+// Each recursive PCS level builds a `2·num_leaves − 1` flat tree of 32-byte
+// hashes (a few MiB at L1) that is dropped when the level's witness is
+// replaced. Recycle those like the F128 buffers so repeated proves reuse
+// resident pages. The top-level L0 commit manages its own tree buffer
+// (`pcs::commit`) and does not go through this pool.
+
+static POOL_HASH: Mutex<Vec<Vec<crate::merkle::Hash>>> = Mutex::new(Vec::new());
+
+/// A prove holds at most two recursive-level trees at once (`wtns_prev` /
+/// `wtns_next`), one class per level size.
+const MAX_POOLED_HASH: usize = 8;
+
+/// Take a length-`n` hash vector, preferring a pooled buffer (smallest
+/// capacity >= `n`); falls back to a fresh uninitialized allocation.
+/// Contents are UNINITIALIZED in both cases (write-before-read contract,
+/// same as [`take_f128`]).
+pub(crate) fn take_hash(n: usize) -> Vec<crate::merkle::Hash> {
+    {
+        let mut pool = POOL_HASH.lock().unwrap();
+        let mut best: Option<usize> = None;
+        for (i, v) in pool.iter().enumerate() {
+            if v.capacity() >= n && best.is_none_or(|b| v.capacity() < pool[b].capacity()) {
+                best = Some(i);
+            }
+        }
+        if let Some(i) = best {
+            let mut v = pool.swap_remove(i);
+            // SAFETY: capacity >= n was checked above; `Hash` is `[u8; 32]`
+            // (Copy, no Drop), so exposing stale bytes is sound to *hold* —
+            // the caller upholds write-before-read per this contract.
+            unsafe { v.set_len(n) };
+            return v;
+        }
+    }
+    crate::alloc_uninit_vec(n)
+}
+
+/// Return a hash buffer to the pool for reuse (smallest-first eviction when
+/// full, same policy as the F128 pool).
+pub(crate) fn give_hash(v: Vec<crate::merkle::Hash>) {
+    if v.capacity() == 0 {
+        return;
+    }
+    let mut pool = POOL_HASH.lock().unwrap();
+    pool.push(v);
+    if pool.len() > MAX_POOLED_HASH {
+        let smallest = pool
+            .iter()
+            .enumerate()
+            .min_by_key(|(_, v)| v.capacity())
+            .map(|(i, _)| i)
+            .expect("pool non-empty");
+        pool.swap_remove(smallest);
+    }
 }
 
 // ---------------------------------------------------------------------------

@@ -699,6 +699,29 @@ pub fn merkle_tree(data: &[u8], num_leaves: usize, kind: HashKind) -> Vec<Hash> 
     merkle_tree_from_prehashed_leaves(tree, num_leaves, kind)
 }
 
+/// [`merkle_tree`] with the node buffer taken from the scratch hash pool
+/// instead of a fresh allocation. Byte-identical output; used by the
+/// recursive Ligerito commits, whose trees are dropped every level (the
+/// witness Drop recycles them via `scratch::give_hash`).
+pub(crate) fn merkle_tree_pooled(data: &[u8], num_leaves: usize, kind: HashKind) -> Vec<Hash> {
+    assert!(
+        num_leaves.is_power_of_two() && num_leaves > 0,
+        "num_leaves must be power of 2"
+    );
+    assert_eq!(
+        data.len() % num_leaves,
+        0,
+        "data length must be a multiple of num_leaves"
+    );
+
+    let leaf_size = data.len() / num_leaves;
+    // Pooled uninit buffer — same write-before-read discipline as
+    // `merkle_tree`'s uninit allocation.
+    let mut tree = crate::scratch::take_hash(2 * num_leaves - 1);
+    hash_leaves(data, leaf_size, &mut tree[..num_leaves], kind);
+    merkle_tree_from_prehashed_leaves(tree, num_leaves, kind)
+}
+
 /// Complete a flat tree whose first `num_leaves` slots already contain leaf
 /// hashes. The vector must have the normal `2*num_leaves-1` allocation; every
 /// remaining slot is written level-by-level before it is read.

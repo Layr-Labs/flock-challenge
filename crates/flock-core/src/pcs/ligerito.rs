@@ -2068,8 +2068,13 @@ fn transpose_forward_ntt_fused_3layer(
     // Flatten `(block, row)` into one Rayon range. This keeps all cores busy
     // even for the final few large blocks without opening nested parallel
     // regions, which caused long-tail scheduler stalls in this phase.
+    // Each job is only eight loads/stores + seven multiplies; without a
+    // minimum grain rayon splits this range far below dispatch cost.
     let data_ptr = data.as_mut_ptr() as usize;
-    (0..num_blocks * eighth).into_par_iter().for_each(|job| {
+    (0..num_blocks * eighth)
+        .into_par_iter()
+        .with_min_len(1 << 10)
+        .for_each(|job| {
         // `eighth` is always a power of two. Spell out the quotient/remainder
         // so rustc does not emit UDIV+MSUB in every eight-value row job.
         let block = job >> eighth_log;
@@ -2319,12 +2324,20 @@ fn transpose_forward_ntt_sparse(
         })
         .collect();
 
-    // Densify (active windows only; the rest stay zero, which is the correct
-    // post-step-(k-1) state for an all-zero window).
-    let mut data = vec![F128::ZERO; n];
-    for (w, buf) in processed {
-        data[(w << k)..((w + 1) << k)].copy_from_slice(&buf);
-    }
+    // Densify: pooled buffer + one parallel pass over the 2^(log_d-k)
+    // windows — active windows copy their processed values, inactive ones
+    // are zero-filled (the correct post-step-(k-1) state for an all-zero
+    // window). Every element is written, satisfying the pool's
+    // write-before-read contract. The buffer flows out as the sumcheck
+    // basis poly; its consumer manages the recycle.
+    let active: HashMap<usize, Vec<F128>> = processed.into_iter().collect();
+    let mut data = crate::scratch::take_f128(n);
+    data.par_chunks_mut(1 << k)
+        .enumerate()
+        .for_each(|(w, chunk)| match active.get(&w) {
+            Some(buf) => chunk.copy_from_slice(buf),
+            None => chunk.fill(F128::ZERO),
+        });
 
     // Remaining steps s = k..log_d-1 = forward layers (log_d-1-k) .. 0, dense.
     let n_threads = rayon::current_num_threads().max(1);
@@ -2388,11 +2401,12 @@ pub(crate) struct LigeroWitness {
     pub num_interleaved: usize,
 }
 
-// Recycle the codeword matrix (128 MB for L1 at m=29) through the scratch
-// pool when a level's witness is replaced/dropped.
+// Recycle the codeword matrix (128 MB for L1 at m=29) and the Merkle node
+// buffer through the scratch pools when a level's witness is replaced/dropped.
 impl Drop for LigeroWitness {
     fn drop(&mut self) {
         crate::scratch::give_f128(std::mem::take(&mut self.mat));
+        crate::scratch::give_hash(std::mem::take(&mut self.tree));
     }
 }
 
@@ -2405,6 +2419,9 @@ impl Drop for SumcheckProver {
         crate::scratch::give_f128(std::mem::take(&mut self.combined_basis));
         crate::scratch::give_f128(std::mem::take(&mut self.spare_f));
         crate::scratch::give_f128(std::mem::take(&mut self.spare_b));
+        for (b_new, _) in self.glue_queue.drain(..) {
+            crate::scratch::give_f128(b_new);
+        }
     }
 }
 
@@ -2466,7 +2483,7 @@ pub(crate) fn ligero_commit(
         )
     };
     debug_assert_eq!(data_bytes.len(), block_len * leaf_size_bytes);
-    let tree = merkle::merkle_tree(data_bytes, block_len, kind);
+    let tree = merkle::merkle_tree_pooled(data_bytes, block_len, kind);
 
     LigeroWitness {
         mat,
@@ -2769,6 +2786,95 @@ fn fold_and_msg_lsb_into(
                 (u0, u2)
             }
         })
+        .reduce(
+            || (F128::ZERO, F128::ZERO),
+            |(a0, a2), (c0, c2)| (a0 + c0, a2 + c2),
+        );
+    SumcheckMessage { u_0, u_2 }
+}
+
+/// [`fold_and_msg_lsb_into`] with queued glues drained in the same read pass:
+/// the basis value at index `j` is read as `b[j] ⊕ Σ_k β_k·b_k[j]` on the fly,
+/// so the deferred `combined_basis += β·b_new` sweeps never materialize.
+///
+/// Bit-identical to applying each glue then folding: GF(2^128) addition is
+/// XOR (associative, exact) and each `β_k·b_k[j]` product is the exact same
+/// multiply [`SumcheckProver::glue`]'s eager sweep would have performed, so
+/// the folded values — and therefore the next-round message — are the same
+/// bits.
+fn fold_glued_and_msg_lsb_into(
+    f: &[F128],
+    b: &[F128],
+    glued: &[(Vec<F128>, F128)],
+    r: F128,
+    nf: &mut Vec<F128>,
+    nb: &mut Vec<F128>,
+) -> SumcheckMessage {
+    use rayon::prelude::*;
+    let n = f.len();
+    debug_assert!(n.is_power_of_two() && n >= 2);
+    debug_assert_eq!(b.len(), n);
+    debug_assert!(glued.iter().all(|(bk, _)| bk.len() == n));
+    let half = n / 2;
+    debug_assert!(nf.capacity() >= half && nb.capacity() >= half);
+    // SAFETY: capacities were checked above; F128: Copy (no Drop), so
+    // exposing uninit/stale elements is sound to *hold* — every slot is
+    // written below before anything reads it.
+    unsafe {
+        nf.set_len(half);
+        nb.set_len(half);
+    }
+    let one_plus_r = F128::ONE + r;
+
+    #[inline(always)]
+    fn b_eff(b: &[F128], glued: &[(Vec<F128>, F128)], i: usize) -> F128 {
+        let mut v = b[i];
+        for (bk, beta) in glued {
+            v += *beta * bk[i];
+        }
+        v
+    }
+
+    let chunk_msg = |base: usize, fc: &mut [F128], bc: &mut [F128]| -> (F128, F128) {
+        let len = fc.len();
+        for j in 0..len {
+            let i0 = 2 * (base + j);
+            fc[j] = f[i0] * one_plus_r + f[i0 + 1] * r;
+            bc[j] = b_eff(b, glued, i0) * one_plus_r + b_eff(b, glued, i0 + 1) * r;
+        }
+        let mut u_0 = F128::ZERO;
+        let mut u_2 = F128::ZERO;
+        let mut k = 0;
+        while k + 1 < len {
+            let f0 = fc[k];
+            let f1 = fc[k + 1];
+            let b0 = bc[k];
+            let b1 = bc[k + 1];
+            u_0 += f0 * b0;
+            u_2 += (f0 + f1) * (b0 + b1);
+            k += 2;
+        }
+        (u_0, u_2)
+    };
+
+    const PAR_THRESHOLD: usize = 4096;
+    if half < PAR_THRESHOLD {
+        let (u_0, u_2) = {
+            // Split borrows: chunk_msg needs both spares mutably.
+            let (nf_s, nb_s) = (&mut nf[..], &mut nb[..]);
+            chunk_msg(0, nf_s, nb_s)
+        };
+        return SumcheckMessage { u_0, u_2 };
+    }
+
+    // Message pairs (2k, 2k+1) never straddle a chunk boundary: `half` and
+    // CHUNK are powers of two (same argument as `fold_and_msg_lsb_into`).
+    const CHUNK: usize = 2048;
+    let (u_0, u_2) = nf
+        .par_chunks_mut(CHUNK)
+        .zip(nb.par_chunks_mut(CHUNK))
+        .enumerate()
+        .map(|(ci, (fc, bc))| chunk_msg(ci * CHUNK, fc, bc))
         .reduce(
             || (F128::ZERO, F128::ZERO),
             |(a0, a2), (c0, c2)| (a0 + c0, a2 + c2),
@@ -3132,6 +3238,14 @@ pub struct SumcheckProver {
     t_r: F128,
     transcript: Vec<SumcheckMessage>,
     pending_glue: Option<(Vec<F128>, F128)>,
+    /// Glues deferred by [`Self::glue`]: `(b_new, β)` pairs whose
+    /// `combined_basis += β·b_new` sweep has not run yet. Drained by the next
+    /// [`Self::fold`], which reads `combined_basis[j] ⊕ Σ β_k·b_k[j]` on the
+    /// fly (see [`fold_glued_and_msg_lsb_into`]) — same field ops, one less
+    /// full read+write pass over `combined_basis` per glue. Nothing between
+    /// a glue and the next fold reads `combined_basis` (`introduce_new*`
+    /// reads only `f`), so deferral is transcript-invisible.
+    glue_queue: Vec<(Vec<F128>, F128)>,
 }
 
 impl SumcheckProver {
@@ -3159,6 +3273,7 @@ impl SumcheckProver {
             t_r: h1,
             transcript: Vec::new(),
             pending_glue: None,
+            glue_queue: Vec::new(),
         };
         let msg = round_msg_lsb(&inst.f, &inst.combined_basis);
         inst.transcript.push(msg);
@@ -3187,6 +3302,7 @@ impl SumcheckProver {
             t_r: h1,
             transcript: Vec::new(),
             pending_glue: None,
+            glue_queue: Vec::new(),
         };
         inst.transcript.push(first_msg);
         (inst, first_msg)
@@ -3206,6 +3322,7 @@ impl SumcheckProver {
             t_r: target,
             transcript: transcript.to_vec(),
             pending_glue: None,
+            glue_queue: Vec::new(),
         }
     }
 
@@ -3214,13 +3331,30 @@ impl SumcheckProver {
         // message in one parallel pass (was three passes), writing the halved
         // outputs into the persistent ping-pong spares and swapping them in.
         // See [`fold_and_msg_lsb_into`].
-        let msg = fold_and_msg_lsb_into(
-            &self.f,
-            &self.combined_basis,
-            r,
-            &mut self.spare_f,
-            &mut self.spare_b,
-        );
+        let msg = if self.glue_queue.is_empty() {
+            fold_and_msg_lsb_into(
+                &self.f,
+                &self.combined_basis,
+                r,
+                &mut self.spare_f,
+                &mut self.spare_b,
+            )
+        } else {
+            // Drain deferred glues in the same read pass — identical values,
+            // one less full sweep over combined_basis per queued glue.
+            let msg = fold_glued_and_msg_lsb_into(
+                &self.f,
+                &self.combined_basis,
+                &self.glue_queue,
+                r,
+                &mut self.spare_f,
+                &mut self.spare_b,
+            );
+            for (b_new, _) in self.glue_queue.drain(..) {
+                crate::scratch::give_f128(b_new);
+            }
+            msg
+        };
         std::mem::swap(&mut self.f, &mut self.spare_f);
         std::mem::swap(&mut self.combined_basis, &mut self.spare_b);
         self.transcript.push(msg);
@@ -3238,6 +3372,7 @@ impl SumcheckProver {
     /// scratch ping-pong allocation.
     fn fold2(&mut self, r_a: F128, r_b: F128) -> (SumcheckMessage, [F128; 6]) {
         debug_assert!(self.pending_glue.is_none(), "fold2 across pending glue");
+        debug_assert!(self.glue_queue.is_empty(), "fold2 across deferred glue");
         let (msg, coeffs) = fold2_and_msgs_lsb(
             &self.f,
             &self.combined_basis,
@@ -3276,28 +3411,20 @@ impl SumcheckProver {
         (msg, h_new)
     }
 
-    /// Combine the introduced basis into `combined_basis` with separation α.
+    /// Combine the introduced basis into `combined_basis` with separation α:
     /// `combined_basis[j] += α · b_new[j]` (pointwise), `T_r += α · h_new`.
+    ///
+    /// The scalar claim update is applied eagerly; the vector sweep is
+    /// deferred into the next [`Self::fold`]'s read pass (same GF(2^128)
+    /// ops, one less pass over `combined_basis` — see `glue_queue`).
     pub fn glue(&mut self, alpha: F128) {
-        use rayon::prelude::*;
         let (b_new, h_new) = self
             .pending_glue
             .take()
             .expect("glue without introduce_new");
         assert_eq!(b_new.len(), self.combined_basis.len());
-        const PAR_THRESHOLD: usize = 4096;
-        if self.combined_basis.len() < PAR_THRESHOLD {
-            for (acc, &v) in self.combined_basis.iter_mut().zip(b_new.iter()) {
-                *acc += alpha * v;
-            }
-        } else {
-            self.combined_basis
-                .par_iter_mut()
-                .zip(b_new.par_iter())
-                .with_min_len(PAR_THRESHOLD / 4)
-                .for_each(|(acc, &v)| *acc += alpha * v);
-        }
         self.t_r += alpha * h_new;
+        self.glue_queue.push((b_new, alpha));
     }
 
     pub fn f(&self) -> &[F128] {
@@ -3862,23 +3989,32 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
     let alpha_0 = challenger.sample_f128_vec(ceil_log2(num_queries_0));
     let _t = std::time::Instant::now();
     let opened_rows_0: Vec<Vec<F128>> = queries_0.iter().map(|&q| l0_row(q).to_vec()).collect();
-    let merkle_proof_0 = merkle_multi_proof_for(l0_tree, l0_block_len, &queries_0);
     if trace {
         t_opens += _t.elapsed();
     }
     // Induce basis_0 from wtns_0 opens. L0 dominates the induce phase, where the
     // sparse-prefix Fᵀ-NTT path wins; the dispatcher auto-selects it (deeper
     // levels stay dense).
+    //
+    // The multi-proof reads only the (frozen) L0 tree and the induce reads
+    // only the opened rows — independent, deterministic, and neither touches
+    // the challenger — so overlap them; joined here, before the proof push
+    // below. (The multi-proof's time is folded into the induce bucket.)
     let sks_vks_n1 = eval_sk_at_vks(n1);
     let _t = std::time::Instant::now();
-    let (basis_0_induced, enforced_sum_0) = induce_sumcheck_poly_auto(
-        n1,
-        log_inv_rate_0,
-        &sks_vks_n1,
-        &opened_rows_0,
-        &r_lane_fold,
-        &queries_0,
-        &alpha_0,
+    let (merkle_proof_0, (basis_0_induced, enforced_sum_0)) = rayon::join(
+        || merkle_multi_proof_for(l0_tree, l0_block_len, &queries_0),
+        || {
+            induce_sumcheck_poly_auto(
+                n1,
+                log_inv_rate_0,
+                &sks_vks_n1,
+                &opened_rows_0,
+                &r_lane_fold,
+                &queries_0,
+                &alpha_0,
+            )
+        },
     );
     if trace {
         t_induce += _t.elapsed();
@@ -4056,33 +4192,38 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
             .iter()
             .map(|&q| wtns_prev.row(q).to_vec())
             .collect();
-        let merkle_proof_i =
-            merkle_multi_proof_for(&wtns_prev.tree, wtns_prev.block_len, &queries_i);
         if trace {
             t_opens += _t.elapsed();
         }
         let sks_vks_i = eval_sk_at_vks(n_next);
+        // Multi-proof ∥ induce, same as the L0 block above: independent
+        // reads (frozen tree vs opened rows), joined before the proof push
+        // and before `wtns_prev` is replaced.
         let _t = std::time::Instant::now();
-        let (basis_i_induced, enforced_sum_i) =
-            if n_next == 16 && config.log_inv_rates[i + 1] == 2 && queries_i.len() == 106 {
-                induce_sumcheck_poly_via_ntt(
-                    n_next,
-                    config.log_inv_rates[i + 1],
-                    &opened_rows_i,
-                    &level_rs,
-                    &queries_i,
-                    &alpha_i,
-                )
-            } else {
-                induce_sumcheck_poly(
-                    n_next,
-                    &sks_vks_i,
-                    &opened_rows_i,
-                    &level_rs,
-                    &queries_i,
-                    &alpha_i,
-                )
-            };
+        let (merkle_proof_i, (basis_i_induced, enforced_sum_i)) = rayon::join(
+            || merkle_multi_proof_for(&wtns_prev.tree, wtns_prev.block_len, &queries_i),
+            || {
+                if n_next == 16 && config.log_inv_rates[i + 1] == 2 && queries_i.len() == 106 {
+                    induce_sumcheck_poly_via_ntt(
+                        n_next,
+                        config.log_inv_rates[i + 1],
+                        &opened_rows_i,
+                        &level_rs,
+                        &queries_i,
+                        &alpha_i,
+                    )
+                } else {
+                    induce_sumcheck_poly(
+                        n_next,
+                        &sks_vks_i,
+                        &opened_rows_i,
+                        &level_rs,
+                        &queries_i,
+                        &alpha_i,
+                    )
+                }
+            },
+        );
         if trace {
             t_induce += _t.elapsed();
         }
