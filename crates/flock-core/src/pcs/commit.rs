@@ -398,15 +398,24 @@ fn ranked_ntt_with_pipelined_leaves(
     let (sender, receiver) = sync_channel::<RankedLeafJob>(queue_capacity);
     let receiver = Mutex::new(receiver);
 
-    // The exact ranked top passes can borrow the E-core pool themselves. Run
-    // them before starting the blocking leaf receivers; otherwise every helper
-    // worker would be parked on `recv` and a nested top-pass broadcast could
-    // never begin. The deep transform and callback-driven leaf pipeline below
-    // retain their existing overlap and scheduling.
+    // The exact ranked top passes can borrow the E-core pool themselves. The
+    // ordinary split path therefore runs them before starting the blocking
+    // leaf receivers; otherwise every helper worker would be parked on recv
+    // and a nested top-pass broadcast could never begin. The wavefront path
+    // runs only the first pass here, then starts the receivers and lets the
+    // main pool release later regions into the same bounded leaf pipeline.
     let split_ranked_top = is_ranked_ntt_merkle_leaf_pipeline_shape(params)
         && std::env::var_os("FLOCK_NO_NTT_TOP_EPOOL").is_none()
         && std::env::var_os("FLOCK_NTT_BLOCK_REGIONS").is_none();
-    if split_ranked_top {
+    let wavefront_ranked_top = split_ranked_top
+        && std::env::var_os("FLOCK_NO_NTT_TOP_WAVEFRONT").is_none();
+    if wavefront_ranked_top {
+        ntt.forward_transform_interleaved_ranked_first_pass(
+            codeword,
+            num_ntts,
+            params.log_inv_rate,
+        );
+    } else if split_ranked_top {
         ntt.forward_transform_interleaved_ranked_top_from_layer(
             codeword,
             num_ntts,
@@ -437,7 +446,14 @@ fn ranked_ntt_with_pipelined_leaves(
                 Err(TrySendError::Full(job) | TrySendError::Disconnected(job)) => hash_job(job),
             }
         };
-        if split_ranked_top {
+        if wavefront_ranked_top {
+            ntt.forward_transform_interleaved_ranked_wavefront_and_then(
+                codeword,
+                num_ntts,
+                params.log_inv_rate,
+                finish_chunk,
+            );
+        } else if split_ranked_top {
             ntt.forward_transform_interleaved_ranked_deep_and_then(
                 codeword,
                 num_ntts,

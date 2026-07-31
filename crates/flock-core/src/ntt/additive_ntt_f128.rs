@@ -465,6 +465,283 @@ impl AdditiveNttF128 {
         unreachable!("ranked top split requires a hardware NTT target");
     }
 
+    /// Apply only the first ranked radix-8 pass (layers 1..3).
+    ///
+    /// The dependency-wavefront commitment path uses this as the common
+    /// predecessor for the sixteen independent layer-4 regions. Keeping the
+    /// first pass on the existing heterogeneous queue preserves its tuned
+    /// E-core participation; later regions are scheduled on the main pool so
+    /// the helper pool can consume finalized Merkle chunks concurrently.
+    #[inline]
+    pub(crate) fn forward_transform_interleaved_ranked_first_pass(
+        &self,
+        data: &mut [F128],
+        num_ntts: usize,
+        start_layer: usize,
+    ) {
+        let log_d = log2_pow2(data.len() / num_ntts);
+        assert!(use_ranked_deep_pair_fusion(
+            log_d,
+            num_ntts,
+            start_layer,
+            10
+        ));
+        assert_eq!(start_layer, 1);
+
+        #[cfg(any(
+            all(target_arch = "aarch64", target_feature = "aes"),
+            all(target_arch = "x86_64", target_feature = "pclmulqdq"),
+        ))]
+        {
+            let layer = start_layer;
+            let num_blocks = 1usize << layer;
+            let block_size = 1usize << (log_d - layer);
+            let block_bytes = block_size * num_ntts;
+            let eighth = block_size >> 3;
+            let twiddles: Vec<[F128; 7]> = (0..num_blocks)
+                .map(|block| {
+                    let mut tw = [F128::ZERO; 7];
+                    tw[0] = self.twiddle(layer, block);
+                    for s in 0..2 {
+                        tw[1 + s] = self.twiddle(layer + 1, 2 * block + s);
+                    }
+                    for s in 0..4 {
+                        tw[3 + s] = self.twiddle(layer + 2, 4 * block + s);
+                    }
+                    tw
+                })
+                .collect();
+            debug_assert_eq!(data.len(), num_blocks * block_bytes);
+            if std::env::var_os("FLOCK_NO_NTT_TOP_EPOOL").is_some() {
+                butterfly_interleaved_fused_3layer_all_blocks_par_rows(
+                    data, &twiddles, eighth, num_ntts,
+                );
+            } else {
+                butterfly_interleaved_fused_3layer_all_blocks_hetero(
+                    data, &twiddles, eighth, num_ntts,
+                );
+            }
+        }
+        #[cfg(not(any(
+            all(target_arch = "aarch64", target_feature = "aes"),
+            all(target_arch = "x86_64", target_feature = "pclmulqdq"),
+        )))]
+        unreachable!("ranked first pass requires a hardware NTT target");
+    }
+
+    /// Continue the ranked transform as a dependency-aware region wavefront.
+    ///
+    /// The first pass leaves sixteen independent layer-4 regions. Each region
+    /// completes its layer-4..6 radix-8 pass, then immediately releases its
+    /// eight layer-7..9 subregions; each of those releases eight cache-local
+    /// deep chunks and their existing leaf callback. The callback and all
+    /// queue ownership remain exactly the same as the ordinary deep path.
+    #[inline]
+    pub(crate) fn forward_transform_interleaved_ranked_wavefront_and_then<F>(
+        &self,
+        data: &mut [F128],
+        num_ntts: usize,
+        start_layer: usize,
+        finish_chunk: F,
+    ) where
+        F: Fn(usize, &[F128]) + Sync + Send,
+    {
+        let log_d = log2_pow2(data.len() / num_ntts);
+        assert!(use_ranked_deep_pair_fusion(
+            log_d,
+            num_ntts,
+            start_layer,
+            10
+        ));
+        assert_eq!(start_layer, 1);
+
+        #[cfg(any(
+            all(target_arch = "aarch64", target_feature = "aes"),
+            all(target_arch = "x86_64", target_feature = "pclmulqdq"),
+        ))]
+        {
+            use rayon::prelude::*;
+
+            const LAYER4: usize = 4;
+            const LAYER7: usize = 7;
+            const N_TOP: usize = 10;
+            const ROWS_PER_TILE: usize = 128;
+            const SUBREGIONS_PER_REGION: usize = 8;
+            const DEEP_CHUNKS_PER_SUBREGION: usize = 8;
+
+            let region_size_positions = 1usize << (log_d - LAYER4);
+            let region_elems = region_size_positions * num_ntts;
+            let region_eighth = region_size_positions >> 3;
+            let region_count = 1usize << LAYER4;
+            let base = crate::epool::SyncPtr(data.as_mut_ptr());
+
+            (0..region_count).into_par_iter().for_each(|region| {
+                let region_base = crate::epool::SyncPtr(unsafe {
+                    base.ptr().add(region * region_elems)
+                });
+                let mut region_twiddles = [F128::ZERO; 7];
+                region_twiddles[0] = self.twiddle(LAYER4, region);
+                for s in 0..2 {
+                    region_twiddles[1 + s] = self.twiddle(LAYER4 + 1, 2 * region + s);
+                }
+                for s in 0..4 {
+                    region_twiddles[3 + s] =
+                        self.twiddle(LAYER4 + 2, 4 * region + s);
+                }
+
+                // Preserve the existing 1 MiB row-tile ownership while
+                // adding a completion boundary for this region only.
+                let region_tiles = region_eighth.div_ceil(ROWS_PER_TILE);
+                rayon::scope(|scope| {
+                    for tile in 0..region_tiles {
+                        let row_start = tile * ROWS_PER_TILE;
+                        let row_end = (row_start + ROWS_PER_TILE).min(region_eighth);
+                        let ptr = region_base;
+                        let twiddles = &region_twiddles;
+                        scope.spawn(move |_| unsafe {
+                            kernels::butterfly_fused_3layer_rows(
+                                ptr.ptr(),
+                                region_eighth,
+                                num_ntts,
+                                row_start,
+                                row_end,
+                                twiddles,
+                            )
+                        });
+                    }
+                });
+
+                // The layer-4..6 region is now complete. Its eight layer-7
+                // subregions are independent and are released one at a time,
+                // allowing their eight 1 MiB deep chunks to enter the same
+                // bounded leaf queue before other regions finish their top
+                // work.
+                let subregion_size_positions = 1usize << (log_d - LAYER7);
+                let subregion_elems = subregion_size_positions * num_ntts;
+                let subregion_eighth = subregion_size_positions >> 3;
+                for subregion in 0..SUBREGIONS_PER_REGION {
+                    let global_subregion = region * SUBREGIONS_PER_REGION + subregion;
+                    let subregion_base = unsafe {
+                        base.ptr().add(global_subregion * subregion_elems)
+                    };
+                    let mut sub_twiddles = [F128::ZERO; 7];
+                    sub_twiddles[0] = self.twiddle(LAYER7, global_subregion);
+                    for s in 0..2 {
+                        sub_twiddles[1 + s] =
+                            self.twiddle(LAYER7 + 1, 2 * global_subregion + s);
+                    }
+                    for s in 0..4 {
+                        sub_twiddles[3 + s] =
+                            self.twiddle(LAYER7 + 2, 4 * global_subregion + s);
+                    }
+
+                    unsafe {
+                        if global_subregion == 0 {
+                            kernels::butterfly_fused_3layer_zero_root_rows(
+                                subregion_base,
+                                subregion_eighth,
+                                num_ntts,
+                                0,
+                                subregion_eighth,
+                                &sub_twiddles,
+                            );
+                        } else {
+                            kernels::butterfly_fused_3layer_rows(
+                                subregion_base,
+                                subregion_eighth,
+                                num_ntts,
+                                0,
+                                subregion_eighth,
+                                &sub_twiddles,
+                            );
+                        }
+                    }
+
+                    rayon::scope(|scope| {
+                        for deep in 0..DEEP_CHUNKS_PER_SUBREGION {
+                            let sub_idx =
+                                global_subregion * DEEP_CHUNKS_PER_SUBREGION + deep;
+                            let finish = &finish_chunk;
+                            scope.spawn(move |_| {
+                                self.finish_ranked_deep_chunk(
+                                    base, num_ntts, N_TOP, log_d, sub_idx, finish,
+                                )
+                            });
+                        }
+                    });
+                }
+            });
+        }
+        #[cfg(not(any(
+            all(target_arch = "aarch64", target_feature = "aes"),
+            all(target_arch = "x86_64", target_feature = "pclmulqdq"),
+        )))]
+        unreachable!("ranked wavefront requires a hardware NTT target");
+    }
+
+    #[inline]
+    fn finish_ranked_deep_chunk<F>(
+        &self,
+        base: crate::epool::SyncPtr<F128>,
+        num_ntts: usize,
+        n_top: usize,
+        log_d: usize,
+        sub_idx: usize,
+        finish_chunk: &F,
+    ) where
+        F: Fn(usize, &[F128]) + Sync + Send,
+    {
+        let sub_size_positions = 1usize << (log_d - n_top);
+        let sub_elems = sub_size_positions * num_ntts;
+        let low_twiddle_final_pair =
+            use_ranked_low_twiddle_final_pair(log_d, num_ntts, n_top);
+        unsafe {
+            let sub_data = core::slice::from_raw_parts_mut(
+                base.ptr().add(sub_idx * sub_elems),
+                sub_elems,
+            );
+            let mut layer = n_top;
+            while layer + 1 < log_d {
+                let layer_in_sub = layer - n_top;
+                let num_blocks_in_sub = 1usize << layer_in_sub;
+                let block_size_positions = 1usize << (log_d - layer);
+                let quarter = block_size_positions >> 2;
+                let block_elems = block_size_positions * num_ntts;
+                for block_in_sub in 0..num_blocks_in_sub {
+                    let global_block = sub_idx * num_blocks_in_sub + block_in_sub;
+                    let t_outer = self.twiddle(layer, global_block);
+                    let t_inner_a = self.twiddle(layer + 1, 2 * global_block);
+                    let t_inner_b = self.twiddle(layer + 1, 2 * global_block + 1);
+                    let block_start = block_in_sub * block_elems;
+                    if low_twiddle_final_pair && layer + 2 == log_d {
+                        debug_assert_eq!(t_outer.hi, 0);
+                        debug_assert_eq!(t_inner_a.hi, 0);
+                        debug_assert_eq!(t_inner_b.hi, 0);
+                        butterfly_interleaved_fused_2layer_low_twiddles_rows_seq(
+                            &mut sub_data[block_start..block_start + block_elems],
+                            t_outer,
+                            t_inner_a,
+                            t_inner_b,
+                            quarter,
+                            num_ntts,
+                        );
+                    } else {
+                        butterfly_interleaved_fused_2layer_rows_seq(
+                            &mut sub_data[block_start..block_start + block_elems],
+                            t_outer,
+                            t_inner_a,
+                            t_inner_b,
+                            quarter,
+                            num_ntts,
+                        );
+                    }
+                }
+                layer += 2;
+            }
+            finish_chunk(sub_idx * sub_elems, sub_data);
+        }
+    }
+
     /// Finish the ranked L0 transform's five cache-local deep pairs and invoke
     /// `finish_chunk` exactly as the unsplit transform does.
     #[inline]
@@ -2071,6 +2348,101 @@ mod tests {
                 "heterogeneous pass mismatch at layer={layer}"
             );
         }
+    }
+
+    /// The wavefront's staged ownership map must produce the same transform
+    /// as the ordinary scalar schedule. This reduced geometry has the same
+    /// three radix-8 stages (first pass, region pass, subregion pass) followed
+    /// by one fused deep pair, so it exercises the exact pointer arithmetic
+    /// used by the ranked 1/4/7/10 split without allocating the 1 GiB shape.
+    #[test]
+    fn staged_region_wavefront_matches_scalar_oracle() {
+        const LOG_D: usize = 11;
+        const NUM_NTTS: usize = 2;
+        const FIRST_LAYER: usize = 0;
+        const REGION_LAYER: usize = 3;
+        const SUBREGION_LAYER: usize = 6;
+        const N_TOP: usize = 9;
+
+        let ntt = AdditiveNttF128::standard(LOG_D);
+        let mut rng = Rng::new(0x7A7E_F00D_20A6_0001);
+        let source = rand_vec(&mut rng, (1usize << LOG_D) * NUM_NTTS);
+        let mut expected = source.clone();
+        ntt.forward_transform_interleaved_scalar(&mut expected, NUM_NTTS);
+
+        let mut got = source;
+        let make_twiddles = |layer: usize, block: usize| {
+            let mut tw = [F128::ZERO; 7];
+            tw[0] = ntt.twiddle(layer, block);
+            for s in 0..2 {
+                tw[1 + s] = ntt.twiddle(layer + 1, 2 * block + s);
+            }
+            for s in 0..4 {
+                tw[3 + s] = ntt.twiddle(layer + 2, 4 * block + s);
+            }
+            tw
+        };
+
+        let first_block_size = 1usize << (LOG_D - FIRST_LAYER);
+        let first_eighth = first_block_size >> 3;
+        let first_twiddles = vec![make_twiddles(FIRST_LAYER, 0)];
+        butterfly_interleaved_fused_3layer_all_blocks_par_rows(
+            &mut got,
+            &first_twiddles,
+            first_eighth,
+            NUM_NTTS,
+        );
+
+        let region_count = 1usize << REGION_LAYER;
+        let region_size = 1usize << (LOG_D - REGION_LAYER);
+        let region_elems = region_size * NUM_NTTS;
+        let region_eighth = region_size >> 3;
+        for region in 0..region_count {
+            let tw = make_twiddles(REGION_LAYER, region);
+            butterfly_interleaved_fused_3layer_par_rows::<false>(
+                &mut got[region * region_elems..(region + 1) * region_elems],
+                &tw,
+                region_eighth,
+                NUM_NTTS,
+            );
+        }
+
+        let subregion_count = 1usize << SUBREGION_LAYER;
+        let subregion_size = 1usize << (LOG_D - SUBREGION_LAYER);
+        let subregion_elems = subregion_size * NUM_NTTS;
+        let subregion_eighth = subregion_size >> 3;
+        for subregion in 0..subregion_count {
+            let tw = make_twiddles(SUBREGION_LAYER, subregion);
+            butterfly_interleaved_fused_3layer_par_rows::<false>(
+                &mut got[subregion * subregion_elems
+                    ..(subregion + 1) * subregion_elems],
+                &tw,
+                subregion_eighth,
+                NUM_NTTS,
+            );
+        }
+
+        let deep_size = 1usize << (LOG_D - N_TOP);
+        let deep_elems = deep_size * NUM_NTTS;
+        let deep_count = (1usize << LOG_D) / deep_size;
+        for sub_idx in 0..deep_count {
+            let block_size = 1usize << (LOG_D - N_TOP);
+            let quarter = block_size >> 2;
+            let global_block = sub_idx;
+            let t_outer = ntt.twiddle(N_TOP, global_block);
+            let t_inner_a = ntt.twiddle(N_TOP + 1, 2 * global_block);
+            let t_inner_b = ntt.twiddle(N_TOP + 1, 2 * global_block + 1);
+            butterfly_interleaved_fused_2layer_rows_seq(
+                &mut got[sub_idx * deep_elems..(sub_idx + 1) * deep_elems],
+                t_outer,
+                t_inner_a,
+                t_inner_b,
+                quarter,
+                NUM_NTTS,
+            );
+        }
+
+        assert_eq!(got, expected);
     }
 
     /// The parallel interleaved transform — whose top layers use the radix-8
