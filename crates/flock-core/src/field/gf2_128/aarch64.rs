@@ -321,6 +321,90 @@ pub unsafe fn ghash_mul_low_constants_vec2_neon(
     }
 }
 
+/// Batch multiply two arbitrary field elements by constants whose high
+/// 64-bit limbs are tiny (`hi < 32`, i.e. degree ≤ 4).
+///
+/// The full schoolbook still needs the two `· constant.hi` products, but
+/// with `deg(constant.hi) ≤ 4` the top unreduced word
+/// `r3 = (value.hi · constant.hi).hi` has degree ≤ 3. The three reduction
+/// shifts (1, 2, 7) therefore cannot carry any `r3` bit past position 127,
+/// and the generic vec2 path's second-order overflow correction (`ov`/`corr`,
+/// six shifts and four XORs) vanishes. Net: 4 PMULL per product versus 6 on
+/// the generic Binius path, with a reduction only one XOR chain longer than
+/// [`ghash_mul_low_constants_vec2_neon`].
+///
+/// (Folding `constant.hi · 2^64` into a precomputed reduced constant does
+/// not help: `constant.hi · 2^64 < 2^128` is already reduced, so the
+/// alternative constant is full-width again and the product returns to the
+/// generic shape.)
+///
+/// # Safety
+/// Requires the `aes` target feature, and both constants must have
+/// `hi < 32`. (Mathematically `hi < 2^57` suffices for the dropped overflow
+/// correction; the tighter bound is the caller's table invariant.)
+#[target_feature(enable = "aes")]
+#[inline]
+pub unsafe fn ghash_mul_tiny_hi_constants_vec2_neon(
+    constants: [F128; 2],
+    values: [F128; 2],
+) -> [F128; 2] {
+    debug_assert!(constants[0].hi < 32);
+    debug_assert!(constants[1].hi < 32);
+
+    // SAFETY: function carries the aes target feature; pmull requires it.
+    unsafe {
+        let p0_ll = pmull(values[0].lo, constants[0].lo);
+        let p0_hl = pmull(values[0].hi, constants[0].lo);
+        let p0_lh = pmull(values[0].lo, constants[0].hi);
+        let p0_hh = pmull(values[0].hi, constants[0].hi);
+        let p1_ll = pmull(values[1].lo, constants[1].lo);
+        let p1_hl = pmull(values[1].hi, constants[1].lo);
+        let p1_lh = pmull(values[1].lo, constants[1].hi);
+        let p1_hh = pmull(values[1].hi, constants[1].hi);
+
+        // Per-mul cross terms (lh + hl).
+        let c0 = veorq_u64(p0_lh, p0_hl);
+        let c1 = veorq_u64(p1_lh, p1_hl);
+
+        // Lane-paired (mul0, mul1) words, exactly as in ghash_mul_vec2_neon:
+        //   r0 = ll_lo
+        //   r1 = ll_hi ^ cross_lo
+        //   r2 = hh_lo ^ cross_hi
+        //   r3 = hh_hi   (degree ≤ 3 by the tiny-hi precondition)
+        let r0 = vzip1q_u64(p0_ll, p1_ll);
+        let r1 = veorq_u64(vzip2q_u64(p0_ll, p1_ll), vzip1q_u64(c0, c1));
+        let r2 = veorq_u64(vzip1q_u64(p0_hh, p1_hh), vzip2q_u64(c0, c1));
+        let r3 = vzip2q_u64(p0_hh, p1_hh);
+
+        // Fold (r2, r3) into (r0, r1) mod p = x^128 + x^7 + x^2 + x + 1.
+        // r3 < 2^4, so no shifted r3 bit can pass position 63 and the
+        // second-order overflow correction is identically zero.
+        let s1_lo = vshlq_n_u64::<1>(r2);
+        let s1_hi = veorq_u64(vshlq_n_u64::<1>(r3), vshrq_n_u64::<63>(r2));
+        let s2_lo = vshlq_n_u64::<2>(r2);
+        let s2_hi = veorq_u64(vshlq_n_u64::<2>(r3), vshrq_n_u64::<62>(r2));
+        let s7_lo = vshlq_n_u64::<7>(r2);
+        let s7_hi = veorq_u64(vshlq_n_u64::<7>(r3), vshrq_n_u64::<57>(r2));
+
+        let t_lo = xor3_u64(r2, s1_lo, veorq_u64(s2_lo, s7_lo));
+        let t_hi = xor3_u64(r3, s1_hi, veorq_u64(s2_hi, s7_hi));
+
+        let out_lo = veorq_u64(r0, t_lo);
+        let out_hi = veorq_u64(r1, t_hi);
+
+        [
+            F128 {
+                lo: vgetq_lane_u64::<0>(out_lo),
+                hi: vgetq_lane_u64::<0>(out_hi),
+            },
+            F128 {
+                lo: vgetq_lane_u64::<1>(out_lo),
+                hi: vgetq_lane_u64::<1>(out_hi),
+            },
+        ]
+    }
+}
+
 /// Batch multiply 2× F128 by a SHARED constant `c`, Karatsuba variant of
 /// [`ghash_mul_vec2_neon`]: 6 PMULL instead of 8 (3 per product), reusing
 /// the same lane-paired vectorised GHASH reduction. PMULL is the scarce
