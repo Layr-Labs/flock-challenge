@@ -633,40 +633,16 @@ fn pow_has_leading_zero_bits(
 /// penalty; the kernel-level probe resolves it.)
 const BLAKE3_POW_BATCH: usize = 48;
 
-/// Whether `FLOCK_NO_GRIND_REG=1` disables the register-resident grind
-/// kernel (kill switch; restores the generic batched scan).
-#[cfg(all(target_arch = "aarch64", target_os = "macos"))]
-fn grind_reg_disabled() -> bool {
-    static DISABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *DISABLED.get_or_init(|| std::env::var("FLOCK_NO_GRIND_REG").is_ok_and(|v| v == "1"))
-}
-
 /// Smallest nonce in `start .. start + len` whose BLAKE3 PoW hash has `bits`
 /// leading zeros, or `None`.
 ///
-/// On Apple AArch64 with `1 <= bits <= 32` (every grind the protocol
-/// configures) this dispatches to the register-resident specialization
-/// [`crate::merkle::blake3_pow_scan_reg`], which keeps the fixed
-/// `state_digest` words, the precomputed nonce-independent round work, and
-/// the IV constants in NEON registers across attempts and injects only the
-/// 8 changing nonce bytes per attempt — byte-exact against `blake3::hash`,
-/// held to the generic path by `grind_reg_scan_matches_generic`. Kill
-/// switch: `FLOCK_NO_GRIND_REG=1`.
+/// Batches the independent nonce hashes through the twelve-way kernel on
+/// Apple AArch64 (upstream `hash_many` tail and fallback) via
+/// [`crate::merkle::blake3_hash_many_pow`]. A 64-byte pre-image is a
+/// whole-block single chunk hashed with `CHUNK_START | CHUNK_END | ROOT` —
+/// so this agrees with `blake3::hash` on every nonce, which
+/// `blake3_batched_pow_matches_scalar` asserts.
 fn blake3_pow_scan(state_digest: &[u8; 32], start: u64, len: u64, bits: u32) -> Option<u64> {
-    #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
-    if (1..=32).contains(&bits) && !grind_reg_disabled() {
-        return crate::merkle::blake3_pow_scan_reg(state_digest, start, len, bits);
-    }
-    blake3_pow_scan_generic(state_digest, start, len, bits)
-}
-
-/// The generic batched scan: materializes each 64-byte pre-image and hashes
-/// batches through the twelve-way kernel on Apple AArch64 (upstream
-/// `hash_many` tail and fallback) via [`crate::merkle::blake3_hash_many_pow`].
-/// A 64-byte pre-image is a whole-block single chunk hashed with
-/// `CHUNK_START | CHUNK_END | ROOT` — so this agrees with `blake3::hash` on
-/// every nonce, which `blake3_batched_pow_matches_scalar` asserts.
-fn blake3_pow_scan_generic(state_digest: &[u8; 32], start: u64, len: u64, bits: u32) -> Option<u64> {
     // The 32-byte state prefix is constant across the whole scan; only the
     // 8 nonce bytes change per lane.
     let mut pre = [[0u8; 64]; BLAKE3_POW_BATCH];
@@ -919,158 +895,21 @@ mod tests {
                 // `bits = 0` makes every nonce a match, so the scan must return
                 // `start` — and the per-lane hashes are all exercised below.
                 assert_eq!(
-                    blake3_pow_scan_generic(&state, start, len, 0),
+                    blake3_pow_scan(&state, start, len, 0),
                     Some(start),
                     "start={start} len={len}"
                 );
-                // Compare the scans (generic and dispatching) against a scalar
-                // sweep at a threshold low enough to hit but high enough to
-                // skip some nonces.
+                // Compare the scan against a scalar sweep at a threshold low
+                // enough to hit but high enough to skip some nonces.
                 let want = (start..start + len)
                     .find(|&n| pow_has_leading_zero_bits(&state, n, 6, HashKind::Blake3));
                 assert_eq!(
-                    blake3_pow_scan_generic(&state, start, len, 6),
+                    blake3_pow_scan(&state, start, len, 6),
                     want,
                     "start={start} len={len}"
                 );
-                assert_eq!(
-                    blake3_pow_scan(&state, start, len, 6),
-                    want,
-                    "dispatch start={start} len={len}"
-                );
             }
         }
-    }
-
-    /// The register-resident grind scan must agree with the generic batched
-    /// scan — same match/no-match, same (smallest) nonce — for random
-    /// digests, every bits value it dispatches on, ragged range shapes, and
-    /// ranges crossing the 12-lane group and 32-bit nonce boundaries. The
-    /// generic path is itself held to `blake3::hash` by
-    /// `blake3_batched_pow_matches_scalar`, so equality here pins the
-    /// specialized kernel to the byte-exact spec.
-    #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
-    #[test]
-    fn grind_reg_scan_matches_generic() {
-        let mut seed = 0x1234_5678_9ABC_DEF0u64;
-        let mut digest = [0u8; 32];
-        for case in 0..24 {
-            for b in digest.iter_mut() {
-                *b = (splitmix64(&mut seed) & 0xFF) as u8;
-            }
-            for bits in [1u32, 2, 6, 8, 13, 19, 24, 32] {
-                for (start, len) in [
-                    (0u64, 1u64),
-                    (0, 11),
-                    (0, 12),
-                    (0, 13),
-                    (7, 500),
-                    (1_000_000, 960),
-                    (u32::MAX as u64 - 30, 60), // nonce-lo carry inside a group
-                ] {
-                    let want = blake3_pow_scan_generic(&digest, start, len, bits);
-                    let got = crate::merkle::blake3_pow_scan_reg(&digest, start, len, bits);
-                    assert_eq!(
-                        got, want,
-                        "case={case} bits={bits} start={start} len={len}"
-                    );
-                }
-            }
-            // Exhaustive predicate agreement on a low threshold: walk ALL
-            // matches in a range (not just the first) by resuming past each.
-            let bits = 4;
-            let (mut a, mut b) = (0u64, 0u64);
-            let end = 2048u64;
-            loop {
-                let want = blake3_pow_scan_generic(&digest, a, end - a, bits);
-                let got = crate::merkle::blake3_pow_scan_reg(&digest, b, end - b, bits);
-                assert_eq!(got, want, "case={case} resume a={a} b={b}");
-                match want {
-                    Some(n) if n + 1 < end => {
-                        a = n + 1;
-                        b = n + 1;
-                    }
-                    _ => break,
-                }
-            }
-        }
-    }
-
-    /// Fixed-seed transcripts must grind to the identical nonce under the
-    /// dispatching scan (register-resident kernel on Apple AArch64) as the
-    /// sequential generic oracle — proof bytes depend on the exact nonce.
-    #[test]
-    fn grind_reg_selects_identical_nonces_fixed_seeds() {
-        for seed in [424242u64, 777, 1, 0xDEAD_BEEF] {
-            for bits in [6u32, 14, 16] {
-                let mut ch = FsChallenger::with_hash(b"grind-reg-fixed", HashKind::Blake3);
-                ch.observe_bytes(&seed.to_le_bytes());
-                let digest = ch.state_digest();
-                let nonce = ch.grind_pow(bits);
-                let mut start = 0u64;
-                let expect = loop {
-                    if let Some(n) = blake3_pow_scan_generic(&digest, start, 4096, bits) {
-                        break n;
-                    }
-                    start += 4096;
-                };
-                assert_eq!(nonce, expect, "seed={seed} bits={bits}");
-            }
-        }
-    }
-
-    /// Paired micro-probe (not a correctness gate): generic batched scan vs
-    /// the register-resident kernel on the same digest set with no early
-    /// exit. Pure compute, single-threaded, no scheduling. Run with
-    /// `cargo test -p flock-core --release --lib -- --ignored --nocapture grind_reg_speed`.
-    #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
-    #[test]
-    #[ignore]
-    fn grind_reg_speed_probe() {
-        const N: u64 = 1 << 19;
-        const REPS: usize = 21;
-        let mut seed = 0xC0FF_EE00_D15E_A5Edu64;
-        let mut digests = Vec::new();
-        while digests.len() < 4 {
-            let mut d = [0u8; 32];
-            for b in d.iter_mut() {
-                *b = (splitmix64(&mut seed) & 0xFF) as u8;
-            }
-            // bits=32: a match in [0, N) has probability N/2^32 ≈ 0.012 per
-            // digest; skip any digest that would early-exit either arm.
-            if blake3_pow_scan_generic(&d, 0, N, 32).is_none() {
-                digests.push(d);
-            }
-        }
-        let mut probe = |f: &dyn Fn(&[u8; 32]) -> Option<u64>| -> (f64, f64) {
-            let mut times = Vec::with_capacity(REPS);
-            for _ in 0..REPS {
-                let t = std::time::Instant::now();
-                for d in &digests {
-                    assert_eq!(f(d), None);
-                }
-                times.push(t.elapsed().as_secs_f64() * 1e3);
-            }
-            times.sort_by(f64::total_cmp);
-            (times[0], times[REPS / 2])
-        };
-        // Warm up + interleave-fair: measure generic, reg, then generic again
-        // to expose drift.
-        let (gen_min, gen_med) = probe(&|d| blake3_pow_scan_generic(d, 0, N, 32));
-        let (reg_min, reg_med) =
-            probe(&|d| crate::merkle::blake3_pow_scan_reg(d, 0, N, 32));
-        let (gen2_min, gen2_med) = probe(&|d| blake3_pow_scan_generic(d, 0, N, 32));
-        let hashes = (N as f64) * digests.len() as f64;
-        eprintln!(
-            "grind probe over {hashes:.0} hashes/iter, {REPS} reps:\n\
-             generic  min {gen_min:.2} ms  med {gen_med:.2} ms  ({:.2} ns/hash min)\n\
-             reg      min {reg_min:.2} ms  med {reg_med:.2} ms  ({:.2} ns/hash min)\n\
-             generic2 min {gen2_min:.2} ms  med {gen2_med:.2} ms\n\
-             speedup (min/min vs first generic): {:.3}x",
-            gen_min * 1e6 / hashes,
-            reg_min * 1e6 / hashes,
-            gen_min / reg_min,
-        );
     }
 
     /// Timing probe (not a correctness gate): upstream 4-lane `hash_many`

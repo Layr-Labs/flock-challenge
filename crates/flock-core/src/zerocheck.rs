@@ -28,7 +28,8 @@ pub mod univariate_skip_optimized;
 
 use multilinear::{
     UniSkipFoldTable, fold_and_compute_round_pair_into, fold_compact_and_compute_round_pair,
-    fold_in_place_pair, interpolate_at_z_combined, interpolate_at_z_on_lambda, round_pair_naive,
+    fold_in_place_pair, fold_round2_reconstruct_direct_padded, interpolate_at_z_combined,
+    interpolate_at_z_on_lambda, round2_message_only_padded, round_pair_naive,
     uni_skip_fold_and_round_pair_compact_padded_with_deltas,
 };
 use univariate_skip_optimized::{
@@ -40,6 +41,17 @@ use univariate_skip_optimized::{
 /// |Λ| = 2^K_SKIP = 64 elements; the round-1 prover message is two length-64
 /// vectors of F128.
 pub const K_SKIP: usize = 6;
+
+/// The ranked Apple-silicon path keeps packed round-two inputs live across
+/// the transcript challenge, avoiding the large anchor/delta checkpoint.
+/// Leave an explicit environment escape hatch for comparison and rollback.
+#[inline]
+fn use_no_checkpoint_round2(m: usize, k_skip: usize) -> bool {
+    cfg!(all(target_os = "macos", target_arch = "aarch64"))
+        && m == 32
+        && k_skip == K_SKIP
+        && std::env::var_os("FLOCK_ZC_ROUND2_CHECKPOINT").is_none()
+}
 
 /// Witness padding descriptor for URM work-skipping.
 ///
@@ -344,8 +356,14 @@ fn prove_packed_padded_inner<C: Challenger>(
     // The A-sized transform is dead after the round-1 message. Its byte length
     // exactly matches compact round two's delta storage, so retain its F128
     // allocation/layout and donate it instead of taking a fresh Vec<u8>.
-    let compact_deltas =
-        precomputed_ab.map(univariate_skip_optimized::Round1AbInner::into_scratch_bytes);
+    let no_checkpoint_round2 = use_no_checkpoint_round2(m, k_skip);
+    let compact_deltas = if no_checkpoint_round2 {
+        // The direct path keeps the packed inputs resident through rho and has
+        // no consumer for the donated round-1 transform allocation.
+        None
+    } else {
+        precomputed_ab.map(univariate_skip_optimized::Round1AbInner::into_scratch_bytes)
+    };
     let c_s = c_s_f128();
     let round1_ab: Vec<F128> = round1_ab_opt.iter().map(|x| c_s * *x).collect();
     let round1_c: Vec<F128> = round1_c_opt.iter().map(|x| c_s * *x).collect();
@@ -379,16 +397,31 @@ fn prove_packed_padded_inner<C: Challenger>(
     let fold_table = UniSkipFoldTable::new(k_skip, z);
     let mut mlv_arg = vec![F128::ONE; n_mlv];
     mlv_arg[1..].copy_from_slice(&r[k_skip + 1..]);
-    let (compact_mlv, msg_1, msg_inf) = uni_skip_fold_and_round_pair_compact_padded_with_deltas(
-        a_packed,
-        b_packed,
-        m,
-        k_skip,
-        &fold_table,
-        &mlv_arg,
-        padding,
-        compact_deltas,
-    );
+    let (compact_mlv, msg_1, msg_inf) = if no_checkpoint_round2 {
+        let (msg_1, msg_inf) = round2_message_only_padded(
+            a_packed,
+            b_packed,
+            m,
+            k_skip,
+            &fold_table,
+            &mlv_arg,
+            padding,
+        );
+        (None, msg_1, msg_inf)
+    } else {
+        let (compact, msg_1, msg_inf) =
+            uni_skip_fold_and_round_pair_compact_padded_with_deltas(
+                a_packed,
+                b_packed,
+                m,
+                k_skip,
+                &fold_table,
+                &mlv_arg,
+                padding,
+                compact_deltas,
+            );
+        (Some(compact), msg_1, msg_inf)
+    };
 
     if zc_timing {
         eprintln!(
@@ -413,16 +446,34 @@ fn prove_packed_padded_inner<C: Challenger>(
     // under MAX_N_HI = 9 at all. Fall back to fold_in_place_pair +
     // round_pair_naive for this serial tail.
     //
-    // The first challenge is applied directly to round two's compact
-    // anchor+packed-delta representation.  Composing rho into the 32 KiB byte
-    // table removes the two field multiplications per output that the generic
-    // pair fold would require, while materializing exactly the ordinary
-    // post-fold tables expected by all subsequent rounds.
+    // The first challenge either reconstructs from the compact checkpoint or,
+    // on the ranked Apple-silicon path, directly from the still-live packed
+    // witness rows. Both branches materialize the ordinary post-fold tables
+    // expected by all subsequent rounds.
     let mut first_r_next = vec![F128::ONE; n_mlv - 1];
     first_r_next[1..].copy_from_slice(&r[k_skip + 2..]);
-    let (mut a_mlv, mut b_mlv, first_m1, first_mi) =
-        fold_compact_and_compute_round_pair(&compact_mlv, &fold_table, mlv_rhos[0], &first_r_next);
-    compact_mlv.recycle();
+    let (mut a_mlv, mut b_mlv, first_m1, first_mi) = match compact_mlv {
+        Some(compact) => {
+            let result = fold_compact_and_compute_round_pair(
+                &compact,
+                &fold_table,
+                mlv_rhos[0],
+                &first_r_next,
+            );
+            compact.recycle();
+            result
+        }
+        None => fold_round2_reconstruct_direct_padded(
+            a_packed,
+            b_packed,
+            m,
+            k_skip,
+            &fold_table,
+            mlv_rhos[0],
+            &first_r_next,
+            padding,
+        ),
+    };
     multilinear_msgs.push((first_m1, first_mi));
     challenger.observe_f128(first_m1);
     challenger.observe_f128(first_mi);
