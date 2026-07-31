@@ -1486,11 +1486,17 @@ pub fn generate_witness_with_ab_packed_and_lincheck(
     // every block. (The chain forbids padding, so this only affects the
     // standalone batch setup.)
     let padding: Compression = ([0u32; 8], [0u32; 16], 0u64, 0u32, 0u32);
+    let stripe_useful_bits = if std::env::var_os("FLOCK_FULL_STRIPE").is_some() {
+        K
+    } else {
+        USEFUL_BITS
+    };
     super::common::drive_witness_packed_and_lincheck_full_write(
         blocks,
         &padding,
         n_blocks_log,
         K_LOG,
+        stripe_useful_bits,
         |block: &Compression, z_u64, a_u64, b_u64| {
             let (cv, m, t, bl, fl) = block;
             build_block_witness_ab_stream_into(cv, m, *t, *bl, *fl, z_u64, a_u64, b_u64);

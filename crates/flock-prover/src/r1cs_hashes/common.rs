@@ -229,6 +229,7 @@ where
         padding,
         n_blocks_log,
         k_log,
+        1usize << k_log,
         per_block,
     )
 }
@@ -243,6 +244,7 @@ pub(crate) fn drive_witness_packed_and_lincheck_full_write<S: Sync, F>(
     padding: &S,
     n_blocks_log: usize,
     k_log: usize,
+    useful_bits: usize,
     per_block: F,
 ) -> (Vec<F128>, Vec<F128>, Vec<F128>, Vec<u8>)
 where
@@ -253,6 +255,7 @@ where
         Some(padding),
         n_blocks_log,
         k_log,
+        useful_bits,
         per_block,
     )
 }
@@ -262,6 +265,7 @@ fn drive_witness_packed_and_lincheck_impl<const PER_BLOCK_FULLY_WRITES: bool, S:
     padding: Option<&S>,
     n_blocks_log: usize,
     k_log: usize,
+    stripe_useful_bits: usize,
     per_block: F,
 ) -> (Vec<F128>, Vec<F128>, Vec<F128>, Vec<u8>)
 where
@@ -274,6 +278,7 @@ where
     let u64_per_block = k / 64;
     let n_total = 1usize << n_blocks_log;
     let n_blocks = initial_states.len();
+    assert!(stripe_useful_bits <= k);
     assert!(
         n_blocks <= n_total,
         "{n_blocks} blocks > 2^{n_blocks_log} = {n_total} slots"
@@ -361,7 +366,8 @@ where
             let z_u64_all: &[u64] = unsafe {
                 std::slice::from_raw_parts(z_grp.as_ptr() as *const u64, z_grp.len() * 2)
             };
-            for i in 0..u64_per_block {
+            let useful_words = stripe_useful_bits.div_ceil(64);
+            for i in 0..useful_words {
                 let lanes: [u64; 8] = [
                     z_u64_all[0 * u64_per_block + i],
                     z_u64_all[u64_per_block + i],
@@ -374,6 +380,7 @@ where
                 ];
                 transpose_8_u64s_to_64_bytes(&lanes, &mut stripe[i * 64..i * 64 + 64]);
             }
+            stripe[useful_words * 64..].fill(0);
         });
 
     (z, a, b, z_lincheck)

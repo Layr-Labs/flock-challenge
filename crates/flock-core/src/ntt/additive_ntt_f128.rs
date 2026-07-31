@@ -548,7 +548,7 @@ impl AdditiveNttF128 {
                 // Fuse three layers (layer..layer+3): one read+write per block
                 // instead of three. Each block contributes an 8-point butterfly.
                 let eighth = block_size >> 3;
-                for block in 0..num_blocks {
+                let block_twiddles = |block: usize| {
                     let mut tw = [F128 { lo: 0, hi: 0 }; 7];
                     tw[0] = self.twiddle(layer, block);
                     for s in 0..2 {
@@ -557,21 +557,32 @@ impl AdditiveNttF128 {
                     for s in 0..4 {
                         tw[3 + s] = self.twiddle(layer + 2, 4 * block + s);
                     }
-                    let start = block * block_bytes;
-                    if block == 0 && zero_root_fused3 {
-                        butterfly_interleaved_fused_3layer_par_rows::<true>(
-                            &mut data[start..start + block_bytes],
-                            &tw,
-                            eighth,
-                            num_ntts,
-                        );
-                    } else {
-                        butterfly_interleaved_fused_3layer_par_rows::<false>(
-                            &mut data[start..start + block_bytes],
-                            &tw,
-                            eighth,
-                            num_ntts,
-                        );
+                    tw
+                };
+                if zero_root_fused3 && std::env::var_os("FLOCK_NTT_BLOCK_REGIONS").is_none() {
+                    let twiddles: Vec<[F128; 7]> = (0..num_blocks).map(block_twiddles).collect();
+                    butterfly_interleaved_fused_3layer_all_blocks_par_rows(
+                        data, &twiddles, eighth, num_ntts,
+                    );
+                } else {
+                    for block in 0..num_blocks {
+                        let tw = block_twiddles(block);
+                        let start = block * block_bytes;
+                        if block == 0 && zero_root_fused3 {
+                            butterfly_interleaved_fused_3layer_par_rows::<true>(
+                                &mut data[start..start + block_bytes],
+                                &tw,
+                                eighth,
+                                num_ntts,
+                            );
+                        } else {
+                            butterfly_interleaved_fused_3layer_par_rows::<false>(
+                                &mut data[start..start + block_bytes],
+                                &tw,
+                                eighth,
+                                num_ntts,
+                            );
+                        }
                     }
                 }
                 layer += 3;
@@ -1242,6 +1253,62 @@ fn butterfly_interleaved_fused_3layer_par_rows<const ZERO_ROOT: bool>(
     }
 }
 
+/// Ranked sibling of [`butterfly_interleaved_fused_3layer_par_rows`] that
+/// flattens every block and row group in one indexed Rayon region.
+///
+/// The ranked top groups contain 2, 16, then 128 blocks. Opening a blocking
+/// region per block creates 146 sequential fork/join barriers even though all
+/// `(block, row)` jobs are disjoint. Flattening retains the exact radix-8
+/// kernels and work order within each row while using one barrier per group.
+#[inline]
+fn butterfly_interleaved_fused_3layer_all_blocks_par_rows(
+    data: &mut [F128],
+    twiddles: &[[F128; 7]],
+    eighth: usize,
+    num_ntts: usize,
+) {
+    use rayon::prelude::*;
+
+    let num_blocks = twiddles.len();
+    let block_elems = 8 * eighth * num_ntts;
+    debug_assert_eq!(data.len(), num_blocks * block_elems);
+    debug_assert!(eighth.is_power_of_two());
+    debug_assert_eq!(twiddles[0][0], F128::ZERO);
+    debug_assert_eq!(twiddles[0][1], F128::ZERO);
+    debug_assert_eq!(twiddles[0][3], F128::ZERO);
+
+    let base = data.as_mut_ptr() as usize;
+    let eighth_log = eighth.trailing_zeros() as usize;
+    let eighth_mask = eighth - 1;
+    (0..num_blocks * eighth).into_par_iter().for_each(|job| {
+        let block = job >> eighth_log;
+        let row = job & eighth_mask;
+        let block_base = unsafe { (base as *mut F128).add(block * block_elems) };
+        // SAFETY: each job maps to one disjoint eight-row group within one
+        // block. Block zero has the three zero roots required by the ranked
+        // specialization; every other block uses the generic radix-8 kernel.
+        unsafe {
+            if block == 0 {
+                kernels::butterfly_fused_3layer_zero_root_row(
+                    block_base,
+                    eighth,
+                    num_ntts,
+                    row,
+                    &twiddles[block],
+                )
+            } else {
+                kernels::butterfly_fused_3layer_row(
+                    block_base,
+                    eighth,
+                    num_ntts,
+                    row,
+                    &twiddles[block],
+                )
+            }
+        }
+    });
+}
+
 /// Butterfly one top-layer block, fusing four layers `(L..L+4)`. `block` holds
 /// `16 * sixteenth` rows of `num_ntts` lanes; `t` carries the 15 twiddles for
 /// the sub-butterflies (see module comment above). Parallel over row groups.
@@ -1508,6 +1575,55 @@ mod tests {
                     );
                 }
             }
+        }
+    }
+
+    #[test]
+    fn fused3_flattened_blocks_match_per_block_regions() {
+        const LOG_D: usize = 10;
+        const LAYER: usize = 2;
+        const NUM_NTTS: usize = 8;
+
+        let ntt = AdditiveNttF128::standard(LOG_D);
+        let num_blocks = 1usize << LAYER;
+        let block_size = 1usize << (LOG_D - LAYER);
+        let eighth = block_size >> 3;
+        let block_elems = block_size * NUM_NTTS;
+        let mut twiddles = Vec::with_capacity(num_blocks);
+        for block in 0..num_blocks {
+            let mut tw = [F128::ZERO; 7];
+            tw[0] = ntt.twiddle(LAYER, block);
+            for s in 0..2 {
+                tw[1 + s] = ntt.twiddle(LAYER + 1, 2 * block + s);
+            }
+            for s in 0..4 {
+                tw[3 + s] = ntt.twiddle(LAYER + 2, 4 * block + s);
+            }
+            twiddles.push(tw);
+        }
+
+        let mut rng = Rng::new(0xF1A7_7EED_20E2_0001);
+        for iteration in 0..3 {
+            let source = rand_vec(&mut rng, (1usize << LOG_D) * NUM_NTTS);
+            let mut expected = source.clone();
+            for (block, tw) in twiddles.iter().enumerate() {
+                let block_data = &mut expected[block * block_elems..(block + 1) * block_elems];
+                if block == 0 {
+                    butterfly_interleaved_fused_3layer_par_rows::<true>(
+                        block_data, tw, eighth, NUM_NTTS,
+                    );
+                } else {
+                    butterfly_interleaved_fused_3layer_par_rows::<false>(
+                        block_data, tw, eighth, NUM_NTTS,
+                    );
+                }
+            }
+
+            let mut got = source;
+            butterfly_interleaved_fused_3layer_all_blocks_par_rows(
+                &mut got, &twiddles, eighth, NUM_NTTS,
+            );
+            assert_eq!(got, expected, "iteration={iteration}");
         }
     }
 
