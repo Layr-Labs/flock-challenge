@@ -237,6 +237,7 @@ pub fn prove_fast_ligerito_from_witness<Ch: Challenger>(
         z_packed_lincheck,
         lincheck_circuit,
         commit_codeword,
+        None,
         challenger,
     )
 }
@@ -265,6 +266,39 @@ pub(crate) fn prove_fast_ligerito_from_preinitialized_codeword<Ch: Challenger>(
         z_packed_lincheck,
         lincheck_circuit,
         CommitCodeword::Preinitialized(codeword),
+        None,
+        challenger,
+    )
+}
+
+/// Ranked counterpart of [`prove_fast_ligerito_from_preinitialized_codeword`]
+/// with the challenge-independent round-1 AB transform already produced by
+/// witness generation.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn prove_fast_ligerito_from_preinitialized_codeword_and_round1_ab_inner<
+    Ch: Challenger,
+>(
+    r1cs: &BlockR1cs,
+    pcs_params: &PcsParams,
+    z_packed: Vec<F128>,
+    a_packed_f128: Vec<F128>,
+    b_packed_f128: Vec<F128>,
+    z_packed_lincheck: Vec<u8>,
+    lincheck_circuit: &dyn lincheck::LincheckCircuit,
+    codeword: Vec<F128>,
+    round1_ab_inner: zerocheck::univariate_skip_optimized::Round1AbInner,
+    challenger: &mut Ch,
+) -> (R1csProofLigerito, Commitment, R1csClaim) {
+    prove_fast_ligerito_from_witness_with_commit_codeword(
+        r1cs,
+        pcs_params,
+        z_packed,
+        a_packed_f128,
+        b_packed_f128,
+        z_packed_lincheck,
+        lincheck_circuit,
+        CommitCodeword::Preinitialized(codeword),
+        Some(round1_ab_inner),
         challenger,
     )
 }
@@ -279,6 +313,7 @@ fn prove_fast_ligerito_from_witness_with_commit_codeword<Ch: Challenger>(
     z_packed_lincheck: Vec<u8>,
     lincheck_circuit: &dyn lincheck::LincheckCircuit,
     commit_codeword: CommitCodeword,
+    round1_ab_inner: Option<zerocheck::univariate_skip_optimized::Round1AbInner>,
     challenger: &mut Ch,
 ) -> (R1csProofLigerito, Commitment, R1csClaim) {
     let lig_config = pcs_params
@@ -304,6 +339,7 @@ fn prove_fast_ligerito_from_witness_with_commit_codeword<Ch: Challenger>(
         z_packed_lincheck,
         lincheck_circuit,
         commit_codeword,
+        round1_ab_inner,
         challenger,
     );
 
@@ -381,10 +417,22 @@ fn commit_with_round1_ab_precompute(
     pcs_params: &PcsParams,
     padding: &zerocheck::PaddingSpec,
     commit_codeword: CommitCodeword,
+    round1_ab_inner: Option<zerocheck::univariate_skip_optimized::Round1AbInner>,
 ) -> (
     (Commitment, pcs::ProverData),
     zerocheck::univariate_skip_optimized::Round1AbInner,
 ) {
+    if let Some(ab_inner) = round1_ab_inner {
+        let commit = match commit_codeword {
+            CommitCodeword::Allocate => pcs::commit(z_packed, pcs_params),
+            CommitCodeword::NeedsReplication(buf) => pcs::commit_into(z_packed, pcs_params, buf),
+            CommitCodeword::Preinitialized(buf) => {
+                pcs::commit_preinitialized(z_packed, buf, pcs_params)
+            }
+        };
+        return (commit, ab_inner);
+    }
+
     let as_bytes = |v: &[F128]| -> &[u8] {
         unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, std::mem::size_of_val(v)) }
     };
@@ -436,6 +484,7 @@ pub fn prove_fast_core<Ch: Challenger>(
         z_packed_lincheck,
         lincheck_circuit,
         CommitCodeword::Allocate,
+        None,
         challenger,
     )
 }
@@ -470,6 +519,7 @@ pub fn prove_fast_core_with_codeword<Ch: Challenger>(
         z_packed_lincheck,
         lincheck_circuit,
         commit_codeword,
+        None,
         challenger,
     )
 }
@@ -484,6 +534,7 @@ fn prove_fast_core_with_commit_codeword<Ch: Challenger>(
     z_packed_lincheck: Vec<u8>,
     lincheck_circuit: &dyn lincheck::LincheckCircuit,
     commit_codeword: CommitCodeword,
+    round1_ab_inner: Option<zerocheck::univariate_skip_optimized::Round1AbInner>,
     challenger: &mut Ch,
 ) -> ProveCore {
     let padding = r1cs.padding_spec();
@@ -494,6 +545,7 @@ fn prove_fast_core_with_commit_codeword<Ch: Challenger>(
         pcs_params,
         &padding,
         commit_codeword,
+        round1_ab_inner,
     );
     bind_statement(challenger, r1cs, &commitment);
 
@@ -632,6 +684,7 @@ pub fn prove_fast_ligerito_timed<Ch: Challenger>(
         z_packed_lincheck,
         lincheck_circuit,
         commit_codeword,
+        None,
         challenger,
     )
 }
@@ -657,6 +710,36 @@ pub(crate) fn prove_fast_ligerito_timed_from_preinitialized_codeword<Ch: Challen
         z_packed_lincheck,
         lincheck_circuit,
         CommitCodeword::Preinitialized(codeword),
+        None,
+        challenger,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn prove_fast_ligerito_timed_from_preinitialized_codeword_and_round1_ab_inner<
+    Ch: Challenger,
+>(
+    r1cs: &BlockR1cs,
+    pcs_params: &PcsParams,
+    z_packed: Vec<F128>,
+    a_packed_f128: Vec<F128>,
+    b_packed_f128: Vec<F128>,
+    z_packed_lincheck: Vec<u8>,
+    lincheck_circuit: &dyn lincheck::LincheckCircuit,
+    codeword: Vec<F128>,
+    round1_ab_inner: zerocheck::univariate_skip_optimized::Round1AbInner,
+    challenger: &mut Ch,
+) -> (R1csProofLigerito, Commitment, R1csClaim, ProvePhaseTimings) {
+    prove_fast_ligerito_timed_with_commit_codeword(
+        r1cs,
+        pcs_params,
+        z_packed,
+        a_packed_f128,
+        b_packed_f128,
+        z_packed_lincheck,
+        lincheck_circuit,
+        CommitCodeword::Preinitialized(codeword),
+        Some(round1_ab_inner),
         challenger,
     )
 }
@@ -671,6 +754,7 @@ fn prove_fast_ligerito_timed_with_commit_codeword<Ch: Challenger>(
     z_packed_lincheck: Vec<u8>,
     lincheck_circuit: &dyn lincheck::LincheckCircuit,
     commit_codeword: CommitCodeword,
+    round1_ab_inner: Option<zerocheck::univariate_skip_optimized::Round1AbInner>,
     challenger: &mut Ch,
 ) -> (R1csProofLigerito, Commitment, R1csClaim, ProvePhaseTimings) {
     use std::time::Instant;
@@ -691,6 +775,7 @@ fn prove_fast_ligerito_timed_with_commit_codeword<Ch: Challenger>(
         pcs_params,
         &padding,
         commit_codeword,
+        round1_ab_inner,
     );
     t.commit_s = t0.elapsed().as_secs_f64();
     bind_statement(challenger, r1cs, &commitment);

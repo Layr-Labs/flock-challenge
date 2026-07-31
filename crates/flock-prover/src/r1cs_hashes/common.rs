@@ -231,6 +231,8 @@ where
         k_log,
         1usize << k_log,
         None,
+        None,
+        None,
         per_block,
     )
 }
@@ -257,6 +259,8 @@ where
         n_blocks_log,
         k_log,
         useful_bits,
+        None,
+        None,
         None,
         per_block,
     )
@@ -302,8 +306,70 @@ where
         k_log,
         useful_bits,
         Some(codeword),
+        None,
+        None,
         per_block,
     )
+}
+
+/// Ranked row-major witness driver that additionally builds the exact
+/// challenge-independent zerocheck round-1 AB transform. The transform is
+/// filled in disjoint 8-block groups from the just-produced A/B blocks and
+/// returned as its normal owned scratch-backed type.
+pub(crate) fn drive_witness_packed_and_lincheck_full_write_with_rate2_codeword_and_round1_ab_inner<
+    S: Sync,
+    F,
+>(
+    initial_states: &[S],
+    padding: &S,
+    n_blocks_log: usize,
+    k_log: usize,
+    stripe_useful_bits: usize,
+    round1_useful_bits: usize,
+    codeword: &mut [F128],
+    per_block: F,
+) -> (
+    (Vec<F128>, Vec<F128>, Vec<F128>, Vec<u8>),
+    flock_core::zerocheck::univariate_skip_optimized::Round1AbInner,
+)
+where
+    F: Fn(&S, &mut [u64], &mut [u64], &mut [u64]) + Sync,
+{
+    use flock_core::ntt::InvNttTableByteSingleGf8;
+    use flock_core::zerocheck::{PaddingSpec, K_SKIP};
+    use flock_core::zerocheck::univariate_skip_optimized::{
+        Round1AbBlockPrecompute, Round1AbInnerWriter,
+    };
+
+    let m = n_blocks_log + k_log;
+    let padding_spec = PaddingSpec {
+        k_log,
+        useful_bits_per_block: round1_useful_bits,
+    };
+    let plan = Round1AbBlockPrecompute::new(
+        k_log,
+        K_SKIP,
+        InvNttTableByteSingleGf8::cached_standard_k6(),
+        &padding_spec,
+    );
+    let mut writer = Round1AbInnerWriter::take_for_m(m);
+    // SAFETY: the specialized driver partitions this slice into disjoint
+    // full blocks and `Round1AbBlockPrecompute` initializes every byte.
+    let ab_inner_out = unsafe { writer.bytes_mut() };
+    let witness = drive_witness_packed_and_lincheck_impl::<true, true, S, F>(
+        initial_states,
+        Some(padding),
+        n_blocks_log,
+        k_log,
+        stripe_useful_bits,
+        Some(codeword),
+        Some(ab_inner_out),
+        Some(&plan),
+        per_block,
+    );
+    // SAFETY: the full-write driver requires padding, visits every allocated
+    // block, and the block plan fills all live bands plus each zero suffix.
+    (witness, unsafe { writer.finish() })
 }
 
 fn drive_witness_packed_and_lincheck_impl<
@@ -318,6 +384,10 @@ fn drive_witness_packed_and_lincheck_impl<
     k_log: usize,
     stripe_useful_bits: usize,
     rate2_codeword: Option<&mut [F128]>,
+    round1_ab_inner: Option<&mut [u8]>,
+    round1_ab_plan: Option<
+        &flock_core::zerocheck::univariate_skip_optimized::Round1AbBlockPrecompute<'_>,
+    >,
     per_block: F,
 ) -> (Vec<F128>, Vec<F128>, Vec<F128>, Vec<u8>)
 where
@@ -358,6 +428,26 @@ where
         );
         Rate2CodewordPtr(codeword.as_mut_ptr())
     });
+    assert_eq!(
+        round1_ab_inner.is_some(),
+        round1_ab_plan.is_some(),
+        "round-1 AB output and block plan must be supplied together"
+    );
+    if let Some(out) = round1_ab_inner.as_ref() {
+        assert!(PER_BLOCK_FULLY_WRITES, "AB fusion requires full-write blocks");
+        assert_eq!(
+            round1_ab_plan
+                .expect("AB output requires a block plan")
+                .block_bytes(),
+            f128_per_block * core::mem::size_of::<F128>(),
+            "AB plan block size must match the witness block"
+        );
+        assert_eq!(
+            out.len(),
+            total_f128 * core::mem::size_of::<F128>(),
+            "round-1 AB output must match the packed A/B table length"
+        );
+    }
     // z/a/b are allocated uninitialized. Ordinary OR-based builders zero each
     // 8-block group inside the parallel loop; full-write builders initialize
     // every word directly and skip that pass. `z_lincheck` comes from the
@@ -370,13 +460,21 @@ where
     let mut b = flock_core::scratch::take_f128(total_f128);
     let mut z_lincheck = flock_core::scratch::take_u8((n_total / 8) * k);
 
-    z.par_chunks_mut(8 * f128_per_block)
-        .zip(a.par_chunks_mut(8 * f128_per_block))
-        .zip(b.par_chunks_mut(8 * f128_per_block))
-        .zip(z_lincheck.par_chunks_mut(k))
-        .with_max_len(256)
-        .enumerate()
-        .for_each(|(g, (((z_grp, a_grp), b_grp), stripe))| {
+    let process_group =
+        |g: usize,
+         z_grp: &mut [F128],
+         a_grp: &mut [F128],
+         b_grp: &mut [F128],
+         stripe: &mut [u8],
+         ab_inner_grp: Option<&mut [u8]>| {
+            let ab_plan = ab_inner_grp
+                .as_ref()
+                .map(|_| round1_ab_plan.expect("AB output requires a block plan"));
+            let block_bytes = ab_plan
+                .map(|plan| plan.block_bytes())
+                .unwrap_or_default();
+            let mut ab_blocks = ab_inner_grp.map(|out| out.chunks_exact_mut(block_bytes));
+
             // Ordinary per-block builders OR 1-bits into pre-zeroed words; any
             // slot left unbuilt (no padding block) stays zero, which the
             // lincheck transpose below reads correctly. Full-write builders
@@ -426,7 +524,29 @@ where
                     )
                 };
                 per_block(init, z_u64, a_u64, b_u64);
+
+                // `per_block` has returned, so all delayed A/B patches are
+                // complete. Consume this 4 KiB A+B working set before the
+                // next block displaces it from cache.
+                if let Some(out_blocks) = ab_blocks.as_mut() {
+                    let out_block = out_blocks.next().expect("one AB output block per witness");
+                    let a_bytes = unsafe {
+                        std::slice::from_raw_parts(a_chunk.as_ptr().cast::<u8>(), block_bytes)
+                    };
+                    let b_bytes = unsafe {
+                        std::slice::from_raw_parts(b_chunk.as_ptr().cast::<u8>(), block_bytes)
+                    };
+                    // SAFETY: the driver validated the plan's block size
+                    // against `f128_per_block`; all three slices are exact
+                    // chunks of that size and are disjoint.
+                    unsafe {
+                        ab_plan
+                            .expect("AB output requires a block plan")
+                            .precompute_block(a_bytes, b_bytes, out_block);
+                    }
+                }
             }
+            debug_assert!(ab_blocks.as_mut().is_none_or(|blocks| blocks.next().is_none()));
 
             // Bit-transpose 8 z chunks into the lincheck stripe.
             let z_u64_all: &[u64] = unsafe {
@@ -472,7 +592,32 @@ where
                     );
                 }
             }
-        });
+
+        };
+
+    if let Some(ab_inner) = round1_ab_inner {
+        let ab_group_bytes = 8 * f128_per_block * core::mem::size_of::<F128>();
+        z.par_chunks_mut(8 * f128_per_block)
+            .zip(a.par_chunks_mut(8 * f128_per_block))
+            .zip(b.par_chunks_mut(8 * f128_per_block))
+            .zip(z_lincheck.par_chunks_mut(k))
+            .zip(ab_inner.par_chunks_mut(ab_group_bytes))
+            .with_max_len(256)
+            .enumerate()
+            .for_each(|(g, ((((z_grp, a_grp), b_grp), stripe), ab_inner_grp))| {
+                process_group(g, z_grp, a_grp, b_grp, stripe, Some(ab_inner_grp));
+            });
+    } else {
+        z.par_chunks_mut(8 * f128_per_block)
+            .zip(a.par_chunks_mut(8 * f128_per_block))
+            .zip(b.par_chunks_mut(8 * f128_per_block))
+            .zip(z_lincheck.par_chunks_mut(k))
+            .with_max_len(256)
+            .enumerate()
+            .for_each(|(g, (((z_grp, a_grp), b_grp), stripe))| {
+                process_group(g, z_grp, a_grp, b_grp, stripe, None);
+            });
+    }
 
     (z, a, b, z_lincheck)
 }

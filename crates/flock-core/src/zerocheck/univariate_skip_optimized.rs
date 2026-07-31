@@ -281,8 +281,16 @@ pub struct Round1AbInner {
 }
 
 impl Round1AbInner {
+    fn take_for_m(m: usize) -> Self {
+        let total_bytes = (1usize << m) / 8;
+        assert_eq!(total_bytes % core::mem::size_of::<F128>(), 0);
+        Self {
+            storage: crate::scratch::take_f128(total_bytes / core::mem::size_of::<F128>()),
+        }
+    }
+
     #[inline]
-    fn as_bytes(&self) -> &[u8] {
+    pub fn as_bytes(&self) -> &[u8] {
         unsafe {
             core::slice::from_raw_parts(
                 self.storage.as_ptr() as *const u8,
@@ -300,6 +308,130 @@ impl Round1AbInner {
     /// without changing the allocation's element type or deallocation layout.
     pub(crate) fn into_scratch_bytes(mut self) -> crate::scratch::ScratchBytes {
         crate::scratch::ScratchBytes::from_initialized_f128(core::mem::take(&mut self.storage))
+    }
+}
+
+/// Scratch-backed write-phase owner for [`Round1AbInner`].
+///
+/// Scratch contents may be stale, so callers must initialize every byte
+/// exposed by [`Self::bytes_mut`] before converting this writer into the
+/// finished, consumable value with [`Self::finish`].
+pub struct Round1AbInnerWriter {
+    inner: Round1AbInner,
+}
+
+impl Round1AbInnerWriter {
+    pub fn take_for_m(m: usize) -> Self {
+        Self {
+            inner: Round1AbInner::take_for_m(m),
+        }
+    }
+
+    /// # Safety
+    ///
+    /// The returned storage is uninitialized. The caller must write every
+    /// byte before reading it or calling [`Self::finish`].
+    #[inline]
+    pub unsafe fn bytes_mut(&mut self) -> &mut [u8] {
+        unsafe {
+            core::slice::from_raw_parts_mut(
+                self.inner.storage.as_mut_ptr() as *mut u8,
+                self.inner.storage.len() * core::mem::size_of::<F128>(),
+            )
+        }
+    }
+
+    /// # Safety
+    ///
+    /// Every byte returned by [`Self::bytes_mut`] must have been initialized.
+    pub unsafe fn finish(self) -> Round1AbInner {
+        self.inner
+    }
+}
+
+/// Reusable per-block form of the challenge-independent AB transform.
+///
+/// Row-major witness generation finishes one `2^k_log`-bit A/B block at a
+/// time. This plan applies the exact same inner kernel and padding policy as
+/// [`precompute_round1_ab_inner_packed_padded`], but lets the caller consume
+/// that completed block while it is still cache-resident.
+pub struct Round1AbBlockPrecompute<'a> {
+    inv_table: &'a InvNttTableByteSingleGf8,
+    block_bytes: usize,
+    b_med_counts: Vec<u8>,
+}
+
+impl<'a> Round1AbBlockPrecompute<'a> {
+    pub fn new(
+        k_log: usize,
+        k_skip: usize,
+        inv_table: &'a InvNttTableByteSingleGf8,
+        padding: &PaddingSpec,
+    ) -> Self {
+        assert_eq!(k_skip, K_SKIP, "optimized variant is k_skip=6 only");
+        assert!(
+            k_log >= K_SKIP + N_INNER,
+            "block-local transform needs k_log >= {}",
+            K_SKIP + N_INNER
+        );
+        assert_eq!(padding.k_log, k_log, "padding must describe one row-major block");
+        assert!(padding.useful_bits_per_block <= 1usize << k_log);
+        assert_eq!(inv_table.k, k_skip);
+        let (_, b_med_counts) = build_b_med_counts(padding);
+        Self {
+            inv_table,
+            block_bytes: (1usize << k_log) / 8,
+            b_med_counts,
+        }
+    }
+
+    pub fn block_bytes(&self) -> usize {
+        self.block_bytes
+    }
+
+    /// Transform one completed row-major A/B block into its canonical slice
+    /// of [`Round1AbInner`]. The output is byte-identical to the corresponding
+    /// slice produced by the whole-table precompute.
+    ///
+    /// # Safety
+    ///
+    /// All three slices must have exactly [`Self::block_bytes`] bytes. The
+    /// architecture kernels use unchecked raw reads after this boundary.
+    #[inline]
+    pub unsafe fn precompute_block(
+        &self,
+        a_block: &[u8],
+        b_block: &[u8],
+        out_block: &mut [u8],
+    ) {
+        const OUTER_BYTES: usize = (1 << N_MEDIUM) * 64;
+        debug_assert_eq!(a_block.len(), self.block_bytes);
+        debug_assert_eq!(b_block.len(), self.block_bytes);
+        debug_assert_eq!(out_block.len(), self.block_bytes);
+        debug_assert_eq!(self.block_bytes / OUTER_BYTES, self.b_med_counts.len());
+
+        let mut a_col = [F8::ZERO; ELL];
+        let mut b_col = [F8::ZERO; ELL];
+        for (within_outer, out_outer) in out_block.chunks_exact_mut(OUTER_BYTES).enumerate() {
+            let n_b_med = self.b_med_counts[within_outer] as usize;
+            let chunk_byte_base = within_outer * OUTER_BYTES;
+            for b_med in 0..n_b_med {
+                let dst: &mut [u8; 64] = (&mut out_outer[b_med * 64..(b_med + 1) * 64])
+                    .try_into()
+                    .expect("one transformed b_med block");
+                shift_reduce_inner_ab(
+                    a_block,
+                    b_block,
+                    self.inv_table,
+                    chunk_byte_base,
+                    b_med,
+                    dst,
+                    &mut a_col,
+                    &mut b_col,
+                );
+            }
+            out_outer[n_b_med * 64..].fill(0);
+        }
     }
 }
 
@@ -342,9 +474,10 @@ pub fn precompute_round1_ab_inner_packed_padded(
     // Reuse an A-sized resident F128 allocation from the prover scratch pool.
     // Treating it as bytes is valid because every byte is written below before
     // the storage is read (including explicit zero writes for padding holes).
-    let mut storage = crate::scratch::take_f128(total_bytes / core::mem::size_of::<F128>());
-    let out_bytes: &mut [u8] =
-        unsafe { core::slice::from_raw_parts_mut(storage.as_mut_ptr() as *mut u8, total_bytes) };
+    let mut writer = Round1AbInnerWriter::take_for_m(m);
+    // SAFETY: every outer chunk writes all live bands and explicitly zeros
+    // its padding suffix before the writer is finished below.
+    let out_bytes = unsafe { writer.bytes_mut() };
 
     out_bytes
         .par_chunks_mut(OUTER_BYTES)
@@ -375,7 +508,9 @@ pub fn precompute_round1_ab_inner_packed_padded(
             },
         );
 
-    Round1AbInner { storage }
+    // SAFETY: the parallel iterator covers every outer chunk exactly once,
+    // and each callback initializes its complete output chunk.
+    unsafe { writer.finish() }
 }
 
 // ---------------------------------------------------------------------------
@@ -1328,6 +1463,50 @@ mod tests {
         }
         fn f128_vec(&mut self, n: usize) -> Vec<F128> {
             (0..n).map(|_| self.f128()).collect()
+        }
+    }
+
+    #[test]
+    fn block_precompute_matches_whole_table_for_every_padding_tail() {
+        const M: usize = K_SKIP + N_INNER;
+        const WORDS: usize = (1usize << M) / 128;
+        let inv_table = InvNttTableByteSingleGf8::cached_standard_k6();
+        let mut rng = Rng::new(0xAB10_CAFE_51DE);
+
+        for n_b_med in 0..=(1 << N_MEDIUM) {
+            let a = rng.f128_vec(WORDS);
+            let b = rng.f128_vec(WORDS);
+            let as_bytes = |v: &[F128]| unsafe {
+                core::slice::from_raw_parts(v.as_ptr().cast::<u8>(), core::mem::size_of_val(v))
+            };
+            let padding = PaddingSpec {
+                k_log: M,
+                useful_bits_per_block: n_b_med * (1 << (K_SKIP + 3)),
+            };
+            let reference = precompute_round1_ab_inner_packed_padded(
+                as_bytes(&a),
+                as_bytes(&b),
+                M,
+                K_SKIP,
+                inv_table,
+                &padding,
+            );
+
+            let plan = Round1AbBlockPrecompute::new(M, K_SKIP, inv_table, &padding);
+            let mut writer = Round1AbInnerWriter::take_for_m(M);
+            // SAFETY: the test poisons, then overwrites, the complete block.
+            unsafe { writer.bytes_mut() }.fill(0xA5);
+            // SAFETY: A, B, and output are all the plan's exact one-block size.
+            unsafe {
+                plan.precompute_block(as_bytes(&a), as_bytes(&b), writer.bytes_mut());
+            }
+            // SAFETY: the one-block plan initialized every byte above.
+            let blockwise = unsafe { writer.finish() };
+            assert_eq!(
+                blockwise.as_bytes(),
+                reference.as_bytes(),
+                "block-local transform mismatch at n_b_med={n_b_med}"
+            );
         }
     }
 

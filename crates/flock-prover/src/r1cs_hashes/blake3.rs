@@ -1580,6 +1580,42 @@ fn generate_witness_with_ab_packed_and_lincheck_rate2_codeword(
     generate_witness_with_ab_packed_and_lincheck_impl(blocks, n_blocks_log, Some(codeword))
 }
 
+fn generate_witness_with_ab_packed_and_lincheck_rate2_codeword_and_round1_ab_inner(
+    blocks: &[Compression],
+    n_blocks_log: usize,
+    codeword: &mut [flock_core::field::F128],
+) -> (
+    (
+        Vec<flock_core::field::F128>,
+        Vec<flock_core::field::F128>,
+        Vec<flock_core::field::F128>,
+        Vec<u8>,
+    ),
+    flock_core::zerocheck::univariate_skip_optimized::Round1AbInner,
+) {
+    let padding: Compression = ([0u32; 8], [0u32; 16], 0u64, 0u32, 0u32);
+    let stripe_useful_bits = if std::env::var_os("FLOCK_FULL_STRIPE").is_some() {
+        K
+    } else {
+        USEFUL_BITS
+    };
+    let per_block =
+        |block: &Compression, z_u64: &mut [u64], a_u64: &mut [u64], b_u64: &mut [u64]| {
+            let (cv, m, t, bl, fl) = block;
+            build_block_witness_ab_stream_into(cv, m, *t, *bl, *fl, z_u64, a_u64, b_u64);
+        };
+    super::common::drive_witness_packed_and_lincheck_full_write_with_rate2_codeword_and_round1_ab_inner(
+        blocks,
+        &padding,
+        n_blocks_log,
+        K_LOG,
+        stripe_useful_bits,
+        USEFUL_BITS,
+        codeword,
+        per_block,
+    )
+}
+
 fn generate_witness_with_ab_packed_and_lincheck_impl(
     blocks: &[Compression],
     n_blocks_log: usize,
@@ -1643,6 +1679,17 @@ pub struct Blake3Setup {
 
 static RANKED_BLAKE3_LINCHECK: Blake3LincheckCircuit = Blake3LincheckCircuit;
 
+struct RankedWitness {
+    codeword: Vec<F128>,
+    z_packed: Vec<F128>,
+    a_packed_f128: Vec<F128>,
+    b_packed_f128: Vec<F128>,
+    z_packed_lincheck: Vec<u8>,
+    round1_ab_inner: Option<
+        flock_core::zerocheck::univariate_skip_optimized::Round1AbInner,
+    >,
+}
+
 impl Blake3Setup {
     /// Build a setup for `n_blocks` BLAKE3 compressions with PCS
     /// `log_inv_rate = 1`.
@@ -1697,6 +1744,18 @@ impl Blake3Setup {
             && std::env::var_os("FLOCK_NO_HOT_CODEWORD").is_none()
     }
 
+    /// Fuse the challenge-independent round-1 AB transform into the exact
+    /// ranked row-major witness path. The kill switch is the byte-identical
+    /// incumbent post-pass running beside commit.
+    #[inline]
+    fn use_ranked_witness_ab_inner(&self) -> bool {
+        self.use_ranked_rate2_hot_codeword()
+            && self.r1cs.k_log == K_LOG
+            && self.r1cs.k_skip == K_SKIP
+            && self.r1cs.useful_bits == USEFUL_BITS
+            && std::env::var_os("FLOCK_NO_WITNESS_AB_INNER").is_none()
+    }
+
     /// Select the reverse transpose only for the promoted benchmark geometry.
     /// `FLOCK_NO_BLAKE3_REVERSE_LINCHECK=1` is the exact CSC A/B control.
     #[inline]
@@ -1735,15 +1794,36 @@ impl Blake3Setup {
     fn generate_witness_ab_with_rate2_codeword(
         &self,
         blocks: &[Compression],
-    ) -> (Vec<F128>, (Vec<F128>, Vec<F128>, Vec<F128>, Vec<u8>)) {
+    ) -> RankedWitness {
         debug_assert!(self.use_ranked_rate2_hot_codeword());
         let mut codeword = flock_core::scratch::take_f128(self.pcs_params.codeword_len_f128());
-        let witness = generate_witness_with_ab_packed_and_lincheck_rate2_codeword(
-            blocks,
-            self.n_blocks_log(),
-            &mut codeword,
-        );
-        (codeword, witness)
+        let ((z_packed, a_packed_f128, b_packed_f128, z_packed_lincheck), round1_ab_inner) =
+            if self.use_ranked_witness_ab_inner() {
+                let (witness, ab_inner) =
+                    generate_witness_with_ab_packed_and_lincheck_rate2_codeword_and_round1_ab_inner(
+                        blocks,
+                        self.n_blocks_log(),
+                        &mut codeword,
+                    );
+                (witness, Some(ab_inner))
+            } else {
+                (
+                    generate_witness_with_ab_packed_and_lincheck_rate2_codeword(
+                        blocks,
+                        self.n_blocks_log(),
+                        &mut codeword,
+                    ),
+                    None,
+                )
+            };
+        RankedWitness {
+            codeword,
+            z_packed,
+            a_packed_f128,
+            b_packed_f128,
+            z_packed_lincheck,
+            round1_ab_inner,
+        }
     }
 
     pub fn new(n_blocks: usize) -> Self {
@@ -1885,20 +1965,42 @@ impl Blake3Setup {
     ) -> (flock_core::proof::R1csProofLigerito, Commitment, R1csClaim) {
         assert_eq!(blocks.len(), self.n_blocks);
         if self.use_ranked_rate2_hot_codeword() {
-            let (codeword, (z_packed, a_packed_f128, b_packed_f128, z_packed_lincheck)) =
-                self.generate_witness_ab_with_rate2_codeword(blocks);
-            let lc_circuit = self.lincheck_circuit();
-            return crate::prover::prove_fast_ligerito_from_preinitialized_codeword(
-                &self.r1cs,
-                &self.pcs_params,
+            let RankedWitness {
+                codeword,
                 z_packed,
                 a_packed_f128,
                 b_packed_f128,
                 z_packed_lincheck,
-                lc_circuit,
-                codeword,
-                challenger,
-            );
+                round1_ab_inner,
+            } = self.generate_witness_ab_with_rate2_codeword(blocks);
+            let lc_circuit = self.lincheck_circuit();
+            return match round1_ab_inner {
+                Some(ab_inner) => {
+                    crate::prover::prove_fast_ligerito_from_preinitialized_codeword_and_round1_ab_inner(
+                        &self.r1cs,
+                        &self.pcs_params,
+                        z_packed,
+                        a_packed_f128,
+                        b_packed_f128,
+                        z_packed_lincheck,
+                        lc_circuit,
+                        codeword,
+                        ab_inner,
+                        challenger,
+                    )
+                }
+                None => crate::prover::prove_fast_ligerito_from_preinitialized_codeword(
+                    &self.r1cs,
+                    &self.pcs_params,
+                    z_packed,
+                    a_packed_f128,
+                    b_packed_f128,
+                    z_packed_lincheck,
+                    lc_circuit,
+                    codeword,
+                    challenger,
+                ),
+            };
         }
         let (codeword, (z_packed, a_packed_f128, b_packed_f128, z_packed_lincheck)) =
             flock_core::pcs::prefault_codeword_during(&self.pcs_params, || {
@@ -1933,17 +2035,46 @@ impl Blake3Setup {
     ) {
         assert_eq!(blocks.len(), self.n_blocks);
         let t0 = std::time::Instant::now();
-        let (codeword, (z_packed, a_packed_f128, b_packed_f128, z_packed_lincheck)) =
+        let (codeword, round1_ab_inner, z_packed, a_packed_f128, b_packed_f128, z_packed_lincheck) =
             if self.use_ranked_rate2_hot_codeword() {
-                let (codeword, witness) = self.generate_witness_ab_with_rate2_codeword(blocks);
-                (Some(codeword), witness)
+                let RankedWitness {
+                    codeword,
+                    z_packed,
+                    a_packed_f128,
+                    b_packed_f128,
+                    z_packed_lincheck,
+                    round1_ab_inner,
+                } = self.generate_witness_ab_with_rate2_codeword(blocks);
+                (
+                    Some(codeword),
+                    round1_ab_inner,
+                    z_packed,
+                    a_packed_f128,
+                    b_packed_f128,
+                    z_packed_lincheck,
+                )
             } else {
-                (None, self.generate_witness_ab(blocks))
+                let (z, a, b, stripe) = self.generate_witness_ab(blocks);
+                (None, None, z, a, b, stripe)
             };
         let witness_s = t0.elapsed().as_secs_f64();
         let lc_circuit = self.lincheck_circuit();
-        let (proof, commitment, claim, mut timings) = match codeword {
-            Some(codeword) => {
+        let (proof, commitment, claim, mut timings) = match (codeword, round1_ab_inner) {
+            (Some(codeword), Some(ab_inner)) => {
+                crate::prover::prove_fast_ligerito_timed_from_preinitialized_codeword_and_round1_ab_inner(
+                    &self.r1cs,
+                    &self.pcs_params,
+                    z_packed,
+                    a_packed_f128,
+                    b_packed_f128,
+                    z_packed_lincheck,
+                    lc_circuit,
+                    codeword,
+                    ab_inner,
+                    challenger,
+                )
+            }
+            (Some(codeword), None) => {
                 crate::prover::prove_fast_ligerito_timed_from_preinitialized_codeword(
                     &self.r1cs,
                     &self.pcs_params,
@@ -1956,7 +2087,7 @@ impl Blake3Setup {
                     challenger,
                 )
             }
-            None => crate::prover::prove_fast_ligerito_timed(
+            (None, None) => crate::prover::prove_fast_ligerito_timed(
                 &self.r1cs,
                 &self.pcs_params,
                 z_packed,
@@ -1967,6 +2098,7 @@ impl Blake3Setup {
                 None,
                 challenger,
             ),
+            (None, Some(_)) => unreachable!("AB-inner fusion requires a preinitialized codeword"),
         };
         timings.witness_s = witness_s;
         (proof, commitment, claim, timings)
@@ -2641,7 +2773,56 @@ mod tests {
     }
 
     #[test]
-    fn preinitialized_codeword_matches_fill_and_proof_roundtrips() {
+    fn fused_ab_inner_matches_legacy_with_padding_slots() {
+        let setup = Blake3Setup::new(13);
+        assert_eq!(setup.n_blocks_log(), 4);
+        let mut rng = Rng::new(0xF051_0A55);
+        let blocks: Vec<Compression> = (0..setup.n_blocks)
+            .map(|_| {
+                let cv = std::array::from_fn(|_| rng.next_u32());
+                let m = std::array::from_fn(|_| rng.next_u32());
+                (cv, m, rng.next_u32() as u64, 64, 11)
+            })
+            .collect();
+
+        let mut fused_codeword =
+            flock_core::scratch::take_f128(setup.pcs_params.codeword_len_f128());
+        let ((z, a, b, stripe), ab_inner) =
+            generate_witness_with_ab_packed_and_lincheck_rate2_codeword_and_round1_ab_inner(
+                &blocks,
+                setup.n_blocks_log(),
+                &mut fused_codeword,
+            );
+        let mut legacy_codeword =
+            flock_core::scratch::take_f128(setup.pcs_params.codeword_len_f128());
+        let (z_legacy, a_legacy, b_legacy, stripe_legacy) =
+            generate_witness_with_ab_packed_and_lincheck_rate2_codeword(
+                &blocks,
+                setup.n_blocks_log(),
+                &mut legacy_codeword,
+            );
+
+        assert_eq!(z, z_legacy);
+        assert_eq!(a, a_legacy);
+        assert_eq!(b, b_legacy);
+        assert_eq!(stripe, stripe_legacy);
+        assert_eq!(fused_codeword, legacy_codeword);
+        let as_bytes = |values: &[F128]| unsafe {
+            std::slice::from_raw_parts(values.as_ptr().cast::<u8>(), std::mem::size_of_val(values))
+        };
+        let reference = flock_core::zerocheck::univariate_skip_optimized::precompute_round1_ab_inner_packed_padded(
+            as_bytes(&a),
+            as_bytes(&b),
+            setup.r1cs.m,
+            K_SKIP,
+            flock_core::ntt::InvNttTableByteSingleGf8::cached_standard_k6(),
+            &setup.r1cs.padding_spec(),
+        );
+        assert_eq!(ab_inner.as_bytes(), reference.as_bytes());
+    }
+
+    #[test]
+    fn fused_ab_inner_matches_postpass_and_proof_roundtrips() {
         use flock_core::challenger::FsChallenger;
 
         let setup = Blake3Setup::new(256);
@@ -2655,11 +2836,26 @@ mod tests {
             .collect();
 
         let mut hot_codeword = flock_core::scratch::take_f128(setup.pcs_params.codeword_len_f128());
-        let (z, a, b, z_lincheck) = generate_witness_with_ab_packed_and_lincheck_rate2_codeword(
-            &blocks,
-            setup.n_blocks_log(),
-            &mut hot_codeword,
-        );
+        let ((z, a, b, z_lincheck), ab_inner) =
+            generate_witness_with_ab_packed_and_lincheck_rate2_codeword_and_round1_ab_inner(
+                &blocks,
+                setup.n_blocks_log(),
+                &mut hot_codeword,
+            );
+
+        let mut legacy_codeword =
+            flock_core::scratch::take_f128(setup.pcs_params.codeword_len_f128());
+        let (z_legacy, a_legacy, b_legacy, stripe_legacy) =
+            generate_witness_with_ab_packed_and_lincheck_rate2_codeword(
+                &blocks,
+                setup.n_blocks_log(),
+                &mut legacy_codeword,
+            );
+        assert_eq!(z, z_legacy, "fused driver changed z");
+        assert_eq!(a, a_legacy, "fused driver changed A");
+        assert_eq!(b, b_legacy, "fused driver changed B");
+        assert_eq!(z_lincheck, stripe_legacy, "fused driver changed lincheck stripe");
+        assert_eq!(hot_codeword, legacy_codeword, "fused driver changed hot codeword");
 
         let mut filled_codeword =
             flock_core::scratch::take_f128(setup.pcs_params.codeword_len_f128());
@@ -2674,13 +2870,26 @@ mod tests {
         );
         flock_core::scratch::give_f128(filled_codeword);
 
-        let (z_fill, a_fill, b_fill, z_lincheck_fill) =
-            (z.clone(), a.clone(), b.clone(), z_lincheck.clone());
+        let ab_reference = flock_core::zerocheck::univariate_skip_optimized::precompute_round1_ab_inner_packed_padded(
+            as_bytes(&a),
+            as_bytes(&b),
+            setup.r1cs.m,
+            K_SKIP,
+            flock_core::ntt::InvNttTableByteSingleGf8::cached_standard_k6(),
+            &setup.r1cs.padding_spec(),
+        );
+        assert_eq!(
+            ab_inner.as_bytes(),
+            ab_reference.as_bytes(),
+            "witness-fused AB-inner must equal the standalone post-pass"
+        );
+        drop(ab_reference);
+
         let circuit = setup.r1cs.csc_lincheck_circuit();
 
         let mut hot_challenger = FsChallenger::new(b"flock-hot-codeword");
         let (hot_proof, hot_commitment, hot_claim) =
-            crate::prover::prove_fast_ligerito_from_preinitialized_codeword(
+            crate::prover::prove_fast_ligerito_from_preinitialized_codeword_and_round1_ab_inner(
                 &setup.r1cs,
                 &setup.pcs_params,
                 z,
@@ -2689,20 +2898,21 @@ mod tests {
                 z_lincheck,
                 circuit,
                 hot_codeword,
+                ab_inner,
                 &mut hot_challenger,
             );
 
         let mut fill_challenger = FsChallenger::new(b"flock-hot-codeword");
         let (fill_proof, fill_commitment, fill_claim) =
-            crate::prover::prove_fast_ligerito_from_witness(
+            crate::prover::prove_fast_ligerito_from_preinitialized_codeword(
                 &setup.r1cs,
                 &setup.pcs_params,
-                z_fill,
-                a_fill,
-                b_fill,
-                z_lincheck_fill,
+                z_legacy,
+                a_legacy,
+                b_legacy,
+                stripe_legacy,
                 circuit,
-                None,
+                legacy_codeword,
                 &mut fill_challenger,
             );
 
