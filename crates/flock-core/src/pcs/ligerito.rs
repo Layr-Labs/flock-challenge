@@ -2817,6 +2817,19 @@ fn fold2_and_msgs_lsb(
     //   u2_D likewise over sums-of-adjacent-x, which reduce to the same three
     //   bilinear forms on (wf0+wf2.., wf1+wf3..) groupings handled below.
     const CHUNK: usize = 2048; // outputs per chunk; 8 inputs per output pair
+    // Fold pairs whose w outputs are past LLC size write ping-pong state not
+    // read until the next fold pair's barrier; `stnp` elides the
+    // write-allocate RFO reads there (same driver-decided policy as the
+    // zerocheck tail's NT rounds). 2^21 F128 = 32 MiB per polynomial (both
+    // polynomials together exceed LLC).
+    #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+    let nt_stores = {
+        use std::sync::OnceLock;
+        static NT_ENABLED: OnceLock<bool> = OnceLock::new();
+        quarter >= (1usize << 21)
+            && *NT_ENABLED
+                .get_or_init(|| std::env::var_os("FLOCK_LIG_NT_LEGACY").is_none())
+    };
     let acc = wf
         .par_chunks_mut(CHUNK)
         .zip(wb.par_chunks_mut(CHUNK))
@@ -2825,8 +2838,9 @@ fn fold2_and_msgs_lsb(
             let base = ci * CHUNK; // output index base
             #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
             {
-                let (u0, u2, c) =
-                    crate::field::f128_slice::fold2_two_and_msgs(f, b, base, wfc, wbc, r_a, r_b);
+                let (u0, u2, c) = crate::field::f128_slice::fold2_two_and_msgs(
+                    f, b, base, wfc, wbc, r_a, r_b, nt_stores,
+                );
                 return (u0, u2, c);
             }
             #[cfg(not(all(target_arch = "aarch64", target_feature = "aes")))]
