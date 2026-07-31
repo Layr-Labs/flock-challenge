@@ -67,6 +67,13 @@ use serde::{Deserialize, Serialize};
 
 use super::pack::LOG_PACKING;
 
+#[cfg(test)]
+thread_local! {
+    static BALANCED_DENSE_SPLIT_BUILD_COUNT: std::cell::Cell<usize> = const {
+        std::cell::Cell::new(0)
+    };
+}
+
 /// Per-block padding descriptor in F_{2^128} units. Computed once from a bit-
 /// level [`PaddingSpec`] and reused across the fold kernels: any chunk whose
 /// index modulo `chunks_per_block` is ≥ `useful_chunks_per_block` is fully
@@ -2447,6 +2454,13 @@ pub fn prove_batched_padded_with_precomputed<Ch: Challenger>(
         }
     }
 
+    let dense_needs_fold: Vec<usize> = (0..dense_suffixes.len())
+        .filter(|&d| !has_precomputed(dense_to_orig[d]))
+        .collect();
+    let sparse_needs_fold: Vec<usize> = (0..sparse_suffixes.len())
+        .filter(|&s| !has_precomputed(sparse_to_orig[s]))
+        .collect();
+
     // 2. Build suffix representations. Dense claims use the tensor-split
     //    factorization (two ~2^(n/2) factors instead of the full 2^n tensor)
     //    whenever `len` is a whole number of 16-wide MFR chunks — i.e. all
@@ -2456,10 +2470,19 @@ pub fn prove_batched_padded_with_precomputed<Ch: Challenger>(
     //    back to the materialized tensor + the legacy multi-fold.
     let use_split = l.is_multiple_of(16);
     let t = std::time::Instant::now();
-    let dense_splits: Vec<(Vec<F128>, Vec<F128>)> = if use_split {
+    let dense_splits: Vec<Option<(Vec<F128>, Vec<F128>)>> = if use_split {
         dense_suffixes
             .iter()
-            .map(|s| build_eq_split(s, split_n_lo(s.len())))
+            .enumerate()
+            .map(|(d, s)| {
+                if has_precomputed(dense_to_orig[d]) {
+                    None
+                } else {
+                    #[cfg(test)]
+                    BALANCED_DENSE_SPLIT_BUILD_COUNT.with(|count| count.set(count.get() + 1));
+                    Some(build_eq_split(s, split_n_lo(s.len())))
+                }
+            })
             .collect()
     } else {
         Vec::new()
@@ -2477,7 +2500,11 @@ pub fn prove_batched_padded_with_precomputed<Ch: Challenger>(
     if trace {
         eprintln!(
             "    [rs::prove_batched] build_eq dense×{} ({}) + sparse×{}: {:6.2} ms",
-            dense_suffixes.len(),
+            if use_split {
+                dense_needs_fold.len()
+            } else {
+                dense_suffixes.len()
+            },
             if use_split { "split" } else { "full" },
             sparse_supports.len(),
             t.elapsed().as_secs_f64() * 1e3
@@ -2492,12 +2519,6 @@ pub fn prove_batched_padded_with_precomputed<Ch: Challenger>(
     //    supplied by the caller. dense_s_hat_v/sparse_s_hat_v are still
     //    indexed by classify-time index `d` / `s`; we splice precomputed
     //    values in at those slots and run the kernel only on the others.
-    let dense_needs_fold: Vec<usize> = (0..dense_suffixes.len())
-        .filter(|&d| !has_precomputed(dense_to_orig[d]))
-        .collect();
-    let sparse_needs_fold: Vec<usize> = (0..sparse_suffixes.len())
-        .filter(|&s| !has_precomputed(sparse_to_orig[s]))
-        .collect();
     let t = std::time::Instant::now();
     let mut dense_s_hat_v: Vec<Vec<F128>> = vec![Vec::new(); dense_suffixes.len()];
     let mut sparse_s_hat_v: Vec<Vec<F128>> = vec![Vec::new(); sparse_suffixes.len()];
@@ -2525,15 +2546,21 @@ pub fn prove_batched_padded_with_precomputed<Ch: Challenger>(
                 // one packed_witness streaming pass, shared transposes.
                 let d0 = dense_needs_fold[0];
                 let d1 = dense_needs_fold[1];
-                let (lo0, hi0) = (dense_splits[d0].0.as_slice(), dense_splits[d0].1.as_slice());
-                let (lo1, hi1) = (dense_splits[d1].0.as_slice(), dense_splits[d1].1.as_slice());
+                let (lo0, hi0) = dense_splits[d0]
+                    .as_ref()
+                    .expect("missing balanced split for dense claim requiring fold");
+                let (lo1, hi1) = dense_splits[d1]
+                    .as_ref()
+                    .expect("missing balanced split for dense claim requiring fold");
                 let (a, b) = fold_1b_rows_split_2way(packed_witness, lo0, hi0, lo1, hi1, padding);
                 dense_s_hat_v[d0] = a;
                 dense_s_hat_v[d1] = b;
             }
             _ => {
                 for &d in &dense_needs_fold {
-                    let (eq_lo, eq_hi) = (&dense_splits[d].0, &dense_splits[d].1);
+                    let (eq_lo, eq_hi) = dense_splits[d]
+                        .as_ref()
+                        .expect("missing balanced split for dense claim requiring fold");
                     dense_s_hat_v[d] = fold_1b_rows_split(packed_witness, eq_lo, eq_hi, padding);
                 }
             }
@@ -3508,7 +3535,7 @@ mod tests {
 
             // Baseline: no precomputes.
             let mut ch_base = FsChallenger::new(b"flock-test-v0");
-            let (base, _) = prove_batched(&packed, &[&x_a, &x_b], &mut ch_base);
+            let (base, base_gammas) = prove_batched(&packed, &[&x_a, &x_b], &mut ch_base);
             let s_hat_v_a = base[0].0.s_hat_v.clone();
             let s_hat_v_b = base[1].0.s_hat_v.clone();
 
@@ -3524,7 +3551,7 @@ mod tests {
                 let pa: Option<&[F128]> = if pre_a { Some(&s_hat_v_a) } else { None };
                 let pb: Option<&[F128]> = if pre_b { Some(&s_hat_v_b) } else { None };
                 let mut ch = FsChallenger::new(b"flock-test-v0");
-                let (got, _) = prove_batched_padded_with_precomputed(
+                let (got, got_gammas) = prove_batched_padded_with_precomputed(
                     &packed,
                     &[&x_a, &x_b],
                     &[pa, pb],
@@ -3539,6 +3566,17 @@ mod tests {
                     got[1].0, base[1].0,
                     "proof[1] mismatch (pre_a={pre_a}, pre_b={pre_b}, m={m})"
                 );
+                assert_eq!(
+                    bincode::serialize(&got[0].0).unwrap(),
+                    bincode::serialize(&base[0].0).unwrap(),
+                    "proof[0] bytes mismatch (pre_a={pre_a}, pre_b={pre_b}, m={m})"
+                );
+                assert_eq!(
+                    bincode::serialize(&got[1].0).unwrap(),
+                    bincode::serialize(&base[1].0).unwrap(),
+                    "proof[1] bytes mismatch (pre_a={pre_a}, pre_b={pre_b}, m={m})"
+                );
+                assert_eq!(got_gammas, base_gammas);
                 assert_eq!(got[0].1.sumcheck_claim, base[0].1.sumcheck_claim);
                 assert_eq!(got[1].1.sumcheck_claim, base[1].1.sumcheck_claim);
                 assert_eq!(
@@ -3551,6 +3589,45 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn fully_precomputed_dense_claims_skip_balanced_splits() {
+        use crate::challenger::FsChallenger;
+
+        let m = 11usize;
+        let mut rng = Rng::new(0x51_17_5A17);
+        let z = rng.bits(1 << m);
+        let packed = pack_witness(&z, m);
+        let x_a: Vec<F128> = (0..(m - 6)).map(|_| rng.f128()).collect();
+        let x_b: Vec<F128> = (0..(m - 6)).map(|_| rng.f128()).collect();
+
+        let mut baseline_challenger = FsChallenger::new(b"flock-split-skip-test");
+        let (baseline, _) = prove_batched(&packed, &[&x_a, &x_b], &mut baseline_challenger);
+        let precomputed = [
+            Some(baseline[0].0.s_hat_v.as_slice()),
+            Some(baseline[1].0.s_hat_v.as_slice()),
+        ];
+
+        BALANCED_DENSE_SPLIT_BUILD_COUNT.with(|count| count.set(0));
+        let mut challenger = FsChallenger::new(b"flock-split-skip-test");
+        let (got, _) = prove_batched_padded_with_precomputed(
+            &packed,
+            &[&x_a, &x_b],
+            &precomputed,
+            &PaddingSpec::dense(m),
+            &mut challenger,
+        );
+
+        assert_eq!(got[0].0, baseline[0].0);
+        assert_eq!(got[1].0, baseline[1].0);
+        BALANCED_DENSE_SPLIT_BUILD_COUNT.with(|count| {
+            assert_eq!(
+                count.get(),
+                0,
+                "precomputed dense claims must not build fold-only balanced factors"
+            );
+        });
     }
 
     /// Degenerate path: when k_log == LOG_PACKING (so x_inner_rest is just
