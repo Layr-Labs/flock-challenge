@@ -261,24 +261,7 @@ pub(super) unsafe fn fold2_two_and_msgs(
     wb: &mut [F128],
     r_a: F128,
     r_b: F128,
-    nt_stores: bool,
 ) -> (F128, F128, [F128; 6]) {
-    // `nt_stores` is decided once per fold round by the driver (round output
-    // past LLC size ⇒ the w arrays are not read until the next fold pair's
-    // barrier ⇒ `stnp` elides write-allocate RFO reads). Per-chunk callers
-    // must not decide this from their sub-slice length.
-    #[inline(always)]
-    unsafe fn store_pair_nt(dst: *mut F128, x: uint64x2_t, y: uint64x2_t) {
-        unsafe {
-            core::arch::asm!(
-                "stnp {x:q}, {y:q}, [{dst}]",
-                dst = in(reg) dst,
-                x = in(vreg) x,
-                y = in(vreg) y,
-                options(nostack, preserves_flags),
-            );
-        }
-    }
     unsafe {
         let zero = vdupq_n_u64(0);
         let ra_q = transmute::<F128, uint64x2_t>(r_a);
@@ -323,21 +306,10 @@ pub(super) unsafe fn fold2_two_and_msgs(
                 let pw = mul_const_vec2(rb_q, veorq_u64(vf0, vf1), veorq_u64(vb0, vb1));
                 let wq_f = veorq_u64(vf0, pw[0]);
                 let wq_b = veorq_u64(vb0, pw[1]);
-                if !nt_stores {
-                    vst1q_u64(wf.as_mut_ptr().add(t + q).cast::<u64>(), wq_f);
-                    vst1q_u64(wb.as_mut_ptr().add(t + q).cast::<u64>(), wq_b);
-                }
+                vst1q_u64(wf.as_mut_ptr().add(t + q).cast::<u64>(), wq_f);
+                vst1q_u64(wb.as_mut_ptr().add(t + q).cast::<u64>(), wq_b);
                 w_regs_f[q] = wq_f;
                 w_regs_b[q] = wq_b;
-            }
-            if nt_stores {
-                // The four group outputs are adjacent: two 32-byte pair
-                // stores per polynomial. Same values as the per-q stores —
-                // only the cacheability hint differs.
-                store_pair_nt(wf.as_mut_ptr().add(t), w_regs_f[0], w_regs_f[1]);
-                store_pair_nt(wf.as_mut_ptr().add(t + 2), w_regs_f[2], w_regs_f[3]);
-                store_pair_nt(wb.as_mut_ptr().add(t), w_regs_b[0], w_regs_b[1]);
-                store_pair_nt(wb.as_mut_ptr().add(t + 2), w_regs_b[2], w_regs_b[3]);
             }
             // Direct message over pairs (w0,w1), (w2,w3); lookahead over the
             // quad. Shared products accumulated once.

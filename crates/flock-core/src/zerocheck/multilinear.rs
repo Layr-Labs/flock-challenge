@@ -1168,7 +1168,7 @@ pub fn fold_and_compute_round_pair_into(
     let nt_stores = {
         use std::sync::OnceLock;
         static NT_ENABLED: OnceLock<bool> = OnceLock::new();
-        half >= (1usize << 21)
+        half >= (1usize << 22)
             && *NT_ENABLED
                 .get_or_init(|| std::env::var_os("FLOCK_ZC_NT_LEGACY").is_none())
     };
