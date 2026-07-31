@@ -2572,14 +2572,7 @@ pub fn prove_batched_padded_with_precomputed<Ch: Challenger>(
     let dense_splits: Vec<(Vec<F128>, Vec<F128>)> = if use_split {
         dense_suffixes
             .iter()
-            .enumerate()
-            .map(|(d, s)| {
-                if has_precomputed(dense_to_orig[d]) {
-                    (Vec::new(), Vec::new())
-                } else {
-                    build_eq_split(s, split_n_lo(s.len()))
-                }
-            })
+            .map(|s| build_eq_split(s, split_n_lo(s.len())))
             .collect()
     } else {
         Vec::new()
