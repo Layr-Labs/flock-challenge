@@ -1296,62 +1296,81 @@ fn prove_padded_inner<Ch: Challenger>(
     //    consistency checks v_a, v_b into a single sumcheck.
     let alpha = challenger.sample_f128();
 
-    // 2. Build the α-batched comb_vec via the circuit's per-block fold. For
-    //    the sparse-matrix default this is the fused single-pass row-fold;
-    //    per-hash circuit walkers compute the same `comb_vec` directly from
-    //    the constraint graph.
-    let t = if trace {
-        Some(std::time::Instant::now())
-    } else {
-        None
-    };
-    let eq_inner = build_quirky_eq_table(x_ab.z_skip, &x_ab.x_inner_rest, k_skip);
-    if let Some(t) = t {
-        eprintln!(
-            "[lc] {:<26} {:>7.2} ms",
-            "build_quirky_eq",
-            t.elapsed().as_secs_f64() * 1e3
-        );
-    }
-    let t = if trace {
-        Some(std::time::Instant::now())
-    } else {
-        None
-    };
-    let mut comb_vec = circuit.fold_alpha_batched(alpha, &eq_inner);
-    if let Some(t) = t {
-        eprintln!(
-            "[lc] {:<26} {:>7.2} ms",
-            "fold_alpha_batched",
-            t.elapsed().as_secs_f64() * 1e3
-        );
-    }
-
-    // 2b. Constant-wire pin. Fold β·eq(j*, ·) into the comb so the same sumcheck
-    //     also proves z_vec[j*] = 1 (the all-ones constant column). Since j* is a
-    //     boolean index, eq(j*, ·) is the one-hot vector and this is a single
-    //     entry update. β is sampled after α; the verifier mirrors both. See
+    // 1b. Constant-wire pin challenge β, sampled immediately after α when the
+    //     circuit pins the constant column (gated on `const_pin_col()` exactly
+    //     as before). There are ZERO challenger observes between the α and β
+    //     samples, so hoisting β up here keeps the transcript byte-identical
+    //     while freeing the two independent computations below to overlap.
+    //     β is sampled after α; the verifier mirrors both. See
     //     docs/const-wire-pin.md.
-    if let Some(col) = circuit.const_pin_col() {
-        let beta = challenger.sample_f128();
-        comb_vec[col] += beta;
-    }
+    let beta_pin: Option<(usize, F128)> = circuit
+        .const_pin_col()
+        .map(|col| (col, challenger.sample_f128()));
 
-    // 3. Partial fold of z at the shared outer half (length-k F128 vector).
-    let t = if trace {
-        Some(std::time::Instant::now())
-    } else {
-        None
+    // 2. Two independent computations, run in one rayon::join (kill switch
+    //    FLOCK_NO_LINCHECK_JOIN=1 restores the exact serial order):
+    //    - comb branch: build the quirky eq table and the α-batched comb_vec
+    //      via the circuit's per-block fold (cache-resident compute), then
+    //      fold β·eq(j*, ·) into the comb so the same sumcheck also proves
+    //      z_vec[j*] = 1 (one-hot ⇒ single entry update; docs/const-wire-pin.md).
+    //    - z branch: partial fold of z at the shared outer half
+    //      (bandwidth-bound stripe fold; length-k F128 vector).
+    let comb_branch = || {
+        let t = if trace {
+            Some(std::time::Instant::now())
+        } else {
+            None
+        };
+        let eq_inner = build_quirky_eq_table(x_ab.z_skip, &x_ab.x_inner_rest, k_skip);
+        if let Some(t) = t {
+            eprintln!(
+                "[lc] {:<26} {:>7.2} ms",
+                "build_quirky_eq",
+                t.elapsed().as_secs_f64() * 1e3
+            );
+        }
+        let t = if trace {
+            Some(std::time::Instant::now())
+        } else {
+            None
+        };
+        let mut comb_vec = circuit.fold_alpha_batched(alpha, &eq_inner);
+        if let Some(t) = t {
+            eprintln!(
+                "[lc] {:<26} {:>7.2} ms",
+                "fold_alpha_batched",
+                t.elapsed().as_secs_f64() * 1e3
+            );
+        }
+        if let Some((col, beta)) = beta_pin {
+            comb_vec[col] += beta;
+        }
+        comb_vec
     };
-    let eq_x_outer = build_eq_table(&x_ab.x_outer);
-    let mut z_vec = partial_fold_packed_z_best(z_packed, m, k_log, useful_bits, &eq_x_outer);
-    if let Some(t) = t {
-        eprintln!(
-            "[lc] {:<26} {:>7.2} ms",
-            "partial_fold_z",
-            t.elapsed().as_secs_f64() * 1e3
-        );
-    }
+    let z_branch = || {
+        let t = if trace {
+            Some(std::time::Instant::now())
+        } else {
+            None
+        };
+        let eq_x_outer = build_eq_table(&x_ab.x_outer);
+        let z_vec = partial_fold_packed_z_best(z_packed, m, k_log, useful_bits, &eq_x_outer);
+        if let Some(t) = t {
+            eprintln!(
+                "[lc] {:<26} {:>7.2} ms",
+                "partial_fold_z",
+                t.elapsed().as_secs_f64() * 1e3
+            );
+        }
+        z_vec
+    };
+    let (mut comb_vec, mut z_vec) = if std::env::var("FLOCK_NO_LINCHECK_JOIN").is_ok() {
+        let comb_vec = comb_branch();
+        let z_vec = z_branch();
+        (comb_vec, z_vec)
+    } else {
+        rayon::join(comb_branch, z_branch)
+    };
     // 3b. Optional capture: clone the pre-sumcheck z_vec for downstream reuse
     //     (PCS open's AB-claim s_hat_v skipping fold_1b_rows). Only pay the
     //     clone when explicitly requested.

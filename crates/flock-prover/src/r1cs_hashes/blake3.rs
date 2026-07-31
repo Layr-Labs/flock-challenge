@@ -704,55 +704,6 @@ impl<'a> ReverseTranspose<'a> {
         id
     }
 
-    #[inline]
-    fn leaf(&mut self, base: usize) -> usize {
-        self.push(ReverseWordOp::Leaf(base))
-    }
-
-    #[inline]
-    fn constant(&mut self, value: u32) -> usize {
-        self.push(ReverseWordOp::Constant(value))
-    }
-
-    #[inline]
-    fn xor_rot(&mut self, x: usize, y: usize, rotation: usize) -> usize {
-        self.push(ReverseWordOp::XorRot {
-            x,
-            y,
-            rotation,
-        })
-    }
-
-    /// Register one carry-only addition and all 31 nonlinear rows that define
-    /// its carry columns.
-    #[inline]
-    fn add(&mut self, x: usize, y: usize, carry_base: usize) -> usize {
-        let out = self.push(ReverseWordOp::Add { x, y, carry_base });
-
-        // Row i reads x[i] in A, y[i] in B, and carry[0..i] in both.
-        // Accumulating the latter backwards turns the triangular row walk into
-        // one suffix scan over the 31 carry columns.
-        let alpha_plus_one = self.alpha + F128::ONE;
-        let mut suffix = F128::ZERO;
-        for i in (0..CARRY_BITS_PER_ADD).rev() {
-            self.comb[carry_base + i] += suffix;
-            let e = self.eq_inner[carry_base + i];
-            self.adjoints[x][i] += self.alpha * e;
-            self.adjoints[y][i] += e;
-            suffix += alpha_plus_one * e;
-        }
-        out
-    }
-
-    /// Attach the A-side weight of a lin-id row to its defining expression;
-    /// its B-side is the constant-one column.
-    #[inline]
-    fn seed_lin_row(&mut self, value: usize, bit: usize, row: usize) {
-        let e = self.eq_inner[row];
-        self.adjoints[value][bit] += self.alpha * e;
-        self.comb[Z_CONST_POS] += e;
-    }
-
     fn finish(mut self) -> Vec<F128> {
         for id in (0..self.ops.len()).rev() {
             // F128 is Copy, so taking this 32-lane value avoids aliasing the
@@ -798,7 +749,360 @@ impl<'a> ReverseTranspose<'a> {
     }
 }
 
+/// One seed event of the lincheck fold, recorded in exact construction
+/// order. Replaying these in order reproduces every `comb`/`adjoints`
+/// accumulation in the same sequence as building the DAG directly, so the
+/// prebuilt-plan path is bit-identical to the build-per-proof path.
+#[derive(Clone, Copy)]
+enum SeedEvent {
+    /// `comb[Z_CONST_POS] += alpha * e0 + e0` for the constant-pin row.
+    ConstPin,
+    /// Input rows: `comb[s] += alpha * e; comb[Z_CONST_POS] += e` for each
+    /// slot in `[base, base + len)`.
+    InputRange { base: usize, len: usize },
+    /// The 31 carry rows of one ADD (suffix scan over the carry columns).
+    AddCarry { x: usize, y: usize, carry_base: usize },
+    /// One lin-id row: A side on `value[bit]`, B side on the one column.
+    LinRow { value: usize, bit: usize, row: usize },
+}
 
+/// Shape-only prebuild of the lincheck reverse-transpose: the ops DAG plus
+/// the ordered seed-event stream. Both are compile-time facts of the BLAKE3
+/// circuit (independent of `alpha`/`eq_inner`), so this is built once — on
+/// the first (untimed warm-up) proof — and cached in [`LC_PLAN`].
+struct ReversePlan {
+    ops: Vec<ReverseWordOp>,
+    seeds: Vec<SeedEvent>,
+}
+
+/// Sink for [`walk_blake3_lincheck`]. [`ReverseTranspose`] executes the walk
+/// directly (build-per-proof path); [`PlanBuilder`] records shape + seed
+/// events for the cached-plan path.
+trait LcWalk {
+    fn const_pin_seed(&mut self);
+    fn input_emit(&mut self, base: usize, len: usize);
+    fn leaf(&mut self, base: usize) -> usize;
+    fn constant(&mut self, value: u32) -> usize;
+    fn xor_rot(&mut self, x: usize, y: usize, rotation: usize) -> usize;
+    /// Register one carry-only addition and all 31 nonlinear rows that define
+    /// its carry columns.
+    fn add(&mut self, x: usize, y: usize, carry_base: usize) -> usize;
+    /// Attach the A-side weight of a lin-id row to its defining expression;
+    /// its B-side is the constant-one column.
+    fn seed_lin_row(&mut self, value: usize, bit: usize, row: usize);
+}
+
+impl<'a> LcWalk for ReverseTranspose<'a> {
+    fn const_pin_seed(&mut self) {
+        let e0 = self.eq_inner[Z_CONST_POS];
+        self.comb[Z_CONST_POS] += self.alpha * e0 + e0;
+    }
+
+    fn input_emit(&mut self, base: usize, len: usize) {
+        for s in base..base + len {
+            let e = self.eq_inner[s];
+            self.comb[s] += self.alpha * e;
+            self.comb[Z_CONST_POS] += e;
+        }
+    }
+
+    #[inline]
+    fn leaf(&mut self, base: usize) -> usize {
+        self.push(ReverseWordOp::Leaf(base))
+    }
+
+    #[inline]
+    fn constant(&mut self, value: u32) -> usize {
+        self.push(ReverseWordOp::Constant(value))
+    }
+
+    #[inline]
+    fn xor_rot(&mut self, x: usize, y: usize, rotation: usize) -> usize {
+        self.push(ReverseWordOp::XorRot {
+            x,
+            y,
+            rotation,
+        })
+    }
+
+    #[inline]
+    fn add(&mut self, x: usize, y: usize, carry_base: usize) -> usize {
+        let out = self.push(ReverseWordOp::Add { x, y, carry_base });
+
+        // Row i reads x[i] in A, y[i] in B, and carry[0..i] in both.
+        // Accumulating the latter backwards turns the triangular row walk into
+        // one suffix scan over the 31 carry columns.
+        let alpha_plus_one = self.alpha + F128::ONE;
+        let mut suffix = F128::ZERO;
+        for i in (0..CARRY_BITS_PER_ADD).rev() {
+            self.comb[carry_base + i] += suffix;
+            let e = self.eq_inner[carry_base + i];
+            self.adjoints[x][i] += self.alpha * e;
+            self.adjoints[y][i] += e;
+            suffix += alpha_plus_one * e;
+        }
+        out
+    }
+
+    #[inline]
+    fn seed_lin_row(&mut self, value: usize, bit: usize, row: usize) {
+        let e = self.eq_inner[row];
+        self.adjoints[value][bit] += self.alpha * e;
+        self.comb[Z_CONST_POS] += e;
+    }
+}
+
+/// Records the circuit walk without touching `alpha`/`eq_inner`.
+#[derive(Default)]
+struct PlanBuilder {
+    ops: Vec<ReverseWordOp>,
+    seeds: Vec<SeedEvent>,
+}
+
+impl PlanBuilder {
+    #[inline]
+    fn push(&mut self, op: ReverseWordOp) -> usize {
+        let id = self.ops.len();
+        self.ops.push(op);
+        id
+    }
+}
+
+impl LcWalk for PlanBuilder {
+    fn const_pin_seed(&mut self) {
+        self.seeds.push(SeedEvent::ConstPin);
+    }
+
+    fn input_emit(&mut self, base: usize, len: usize) {
+        self.seeds.push(SeedEvent::InputRange { base, len });
+    }
+
+    fn leaf(&mut self, base: usize) -> usize {
+        self.push(ReverseWordOp::Leaf(base))
+    }
+
+    fn constant(&mut self, value: u32) -> usize {
+        self.push(ReverseWordOp::Constant(value))
+    }
+
+    fn xor_rot(&mut self, x: usize, y: usize, rotation: usize) -> usize {
+        self.push(ReverseWordOp::XorRot {
+            x,
+            y,
+            rotation,
+        })
+    }
+
+    fn add(&mut self, x: usize, y: usize, carry_base: usize) -> usize {
+        let out = self.push(ReverseWordOp::Add { x, y, carry_base });
+        self.seeds.push(SeedEvent::AddCarry { x, y, carry_base });
+        out
+    }
+
+    fn seed_lin_row(&mut self, value: usize, bit: usize, row: usize) {
+        self.seeds.push(SeedEvent::LinRow { value, bit, row });
+    }
+}
+
+static LC_PLAN: std::sync::OnceLock<ReversePlan> = std::sync::OnceLock::new();
+
+fn lc_plan() -> &'static ReversePlan {
+    LC_PLAN.get_or_init(|| {
+        let mut builder = PlanBuilder::default();
+        walk_blake3_lincheck(&mut builder);
+        ReversePlan {
+            ops: builder.ops,
+            seeds: builder.seeds,
+        }
+    })
+}
+
+thread_local! {
+    /// Per-thread adjoint scratch for the cached-plan fold, reused across
+    /// proofs to skip the ~360 KiB allocation + page-fault cost.
+    static LC_ADJOINTS: std::cell::RefCell<Vec<[F128; WORD_BITS]>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Cached-plan fold: replay the recorded seed events in construction order,
+/// then run the same reverse sweep as [`ReverseTranspose::finish`]. Every
+/// F128 accumulation happens in the same order as the direct build, so the
+/// result is bit-identical.
+fn fold_alpha_with_plan(plan: &ReversePlan, alpha: F128, eq_inner: &[F128]) -> Vec<F128> {
+    let mut comb = vec![F128::ZERO; K];
+    LC_ADJOINTS.with(|cell| {
+        let mut adjoints = cell.borrow_mut();
+        adjoints.clear();
+        adjoints.resize(plan.ops.len(), [F128::ZERO; WORD_BITS]);
+
+        let alpha_plus_one = alpha + F128::ONE;
+        for ev in &plan.seeds {
+            match *ev {
+                SeedEvent::ConstPin => {
+                    let e0 = eq_inner[Z_CONST_POS];
+                    comb[Z_CONST_POS] += alpha * e0 + e0;
+                }
+                SeedEvent::InputRange { base, len } => {
+                    for s in base..base + len {
+                        let e = eq_inner[s];
+                        comb[s] += alpha * e;
+                        comb[Z_CONST_POS] += e;
+                    }
+                }
+                SeedEvent::AddCarry { x, y, carry_base } => {
+                    let mut suffix = F128::ZERO;
+                    for i in (0..CARRY_BITS_PER_ADD).rev() {
+                        comb[carry_base + i] += suffix;
+                        let e = eq_inner[carry_base + i];
+                        adjoints[x][i] += alpha * e;
+                        adjoints[y][i] += e;
+                        suffix += alpha_plus_one * e;
+                    }
+                }
+                SeedEvent::LinRow { value, bit, row } => {
+                    let e = eq_inner[row];
+                    adjoints[value][bit] += alpha * e;
+                    comb[Z_CONST_POS] += e;
+                }
+            }
+        }
+
+        // Reverse sweep — same code as `ReverseTranspose::finish`, reading
+        // the cached ops instead of a freshly built Vec.
+        for id in (0..plan.ops.len()).rev() {
+            let q = adjoints[id];
+            match plan.ops[id] {
+                ReverseWordOp::Leaf(base) => {
+                    for (i, value) in q.into_iter().enumerate() {
+                        comb[base + i] += value;
+                    }
+                }
+                ReverseWordOp::Constant(value) => {
+                    for (i, weight) in q.into_iter().enumerate() {
+                        if (value >> i) & 1 == 1 {
+                            comb[Z_CONST_POS] += weight;
+                        }
+                    }
+                }
+                ReverseWordOp::XorRot { x, y, rotation } => {
+                    for (i, weight) in q.into_iter().enumerate() {
+                        let source_bit = (i + rotation) % WORD_BITS;
+                        adjoints[x][source_bit] += weight;
+                        adjoints[y][source_bit] += weight;
+                    }
+                }
+                ReverseWordOp::Add { x, y, carry_base } => {
+                    // sum[i] = x[i] + y[i] + carry[0] + ... + carry[i-1].
+                    // The reverse of the carry prefix is another suffix scan.
+                    let mut suffix = F128::ZERO;
+                    for i in (0..WORD_BITS).rev() {
+                        if i < CARRY_BITS_PER_ADD {
+                            comb[carry_base + i] += suffix;
+                        }
+                        let weight = q[i];
+                        adjoints[x][i] += weight;
+                        adjoints[y][i] += weight;
+                        suffix += weight;
+                    }
+                }
+            }
+        }
+    });
+    comb
+}
+
+/// Walk the BLAKE3 lincheck circuit in the canonical build order. Single
+/// source of truth for both fold paths: the DAG shape (leaf bases,
+/// constants, XorRot/Add wiring, carry bases, lin-row targets) and the seed
+/// ordering are compile-time facts of the circuit; only the seed VALUES
+/// depend on `alpha`/`eq_inner`.
+fn walk_blake3_lincheck<W: LcWalk>(walk: &mut W) {
+    // Rows whose A side is the input itself and whose B side is one.
+    walk.const_pin_seed();
+    walk.input_emit(CV_BASE, 8 * WORD_BITS);
+    walk.input_emit(M_BASE, 16 * WORD_BITS);
+    walk.input_emit(T_LO_BASE, WORD_BITS);
+    walk.input_emit(T_HI_BASE, WORD_BITS);
+    walk.input_emit(BLEN_BASE, WORD_BITS);
+    walk.input_emit(FLAGS_BASE, WORD_BITS);
+
+    // Unique source nodes preserve matrix column order.  Message words are
+    // shared across every scheduled use, while each materialized b/d word
+    // below gets a fresh leaf at its exact G-block offset.
+    let cv: [usize; 8] = std::array::from_fn(|w| walk.leaf(cv_bit(w, 0)));
+    let messages: [usize; 16] = std::array::from_fn(|w| walk.leaf(m_bit(w, 0)));
+    let mut state: [usize; 16] = [
+        cv[0],
+        cv[1],
+        cv[2],
+        cv[3],
+        cv[4],
+        cv[5],
+        cv[6],
+        cv[7],
+        walk.constant(BLAKE3_IV[0]),
+        walk.constant(BLAKE3_IV[1]),
+        walk.constant(BLAKE3_IV[2]),
+        walk.constant(BLAKE3_IV[3]),
+        walk.leaf(T_LO_BASE),
+        walk.leaf(T_HI_BASE),
+        walk.leaf(BLEN_BASE),
+        walk.leaf(FLAGS_BASE),
+    ];
+
+    for r in 0..N_ROUNDS {
+        for g_in_round in 0..N_G_PER_ROUND {
+            let g = r * N_G_PER_ROUND + g_in_round;
+            let [la, lb, lc, ld] = G_LANES[g_in_round];
+            let [mx_idx, my_idx] = PER_ROUND_MSG_IDX[r][g_in_round];
+            let [a, b, c, d] = [state[la], state[lb], state[lc], state[ld]];
+
+            let tmp_0 =
+                walk.add(a, b, g_add_carry_bit(g, ADD_TMP0, 0));
+            let a_1 = walk.add(
+                tmp_0,
+                messages[mx_idx],
+                g_add_carry_bit(g, ADD_A1, 0),
+            );
+            let d_1 = walk.xor_rot(d, a_1, 16);
+            let c_1 =
+                walk.add(c, d_1, g_add_carry_bit(g, ADD_C1, 0));
+            let b_1 = walk.xor_rot(b, c_1, 12);
+            let tmp_1 =
+                walk.add(a_1, b_1, g_add_carry_bit(g, ADD_TMP1, 0));
+            let a_2 = walk.add(
+                tmp_1,
+                messages[my_idx],
+                g_add_carry_bit(g, ADD_A2, 0),
+            );
+            let d_2 = walk.xor_rot(d_1, a_2, 8);
+            let c_2 =
+                walk.add(c_1, d_2, g_add_carry_bit(g, ADD_C2, 0));
+
+            let b_new = walk.xor_rot(b_1, c_2, 7);
+            for i in 0..WORD_BITS {
+                walk.seed_lin_row(b_new, i, g_lin_bit(g, LIN_B_NEW, i));
+                walk.seed_lin_row(d_2, i, g_lin_bit(g, LIN_D_NEW, i));
+            }
+
+            state[la] = a_2;
+            state[lb] = walk.leaf(g_lin_bit(g, LIN_B_NEW, 0));
+            state[lc] = c_2;
+            state[ld] = walk.leaf(g_lin_bit(g, LIN_D_NEW, 0));
+        }
+    }
+
+    // Finalization lin-id rows.  These nodes are seeded in physical output
+    // coordinate order, exactly as build_matrices writes the rows.
+    for w in 0..8 {
+        let lo = walk.xor_rot(state[w], state[w + 8], 0);
+        let hi = walk.xor_rot(state[w + 8], cv[w], 0);
+        for i in 0..WORD_BITS {
+            walk.seed_lin_row(lo, i, out_lo_bit(w, i));
+            walk.seed_lin_row(hi, i, out_hi_bit(w, i));
+        }
+    }
+}
 
 pub struct Blake3LincheckCircuit;
 
@@ -809,103 +1113,16 @@ impl flock_core::lincheck::LincheckCircuit for Blake3LincheckCircuit {
 
     fn fold_alpha_batched(&self, alpha: F128, eq_inner: &[F128]) -> Vec<F128> {
         assert_eq!(eq_inner.len(), K, "eq_inner length must equal n_cols = K");
-        let mut reverse = ReverseTranspose::new(alpha, eq_inner);
 
-        // Rows whose A side is the input itself and whose B side is one.
-        let e0 = eq_inner[Z_CONST_POS];
-        reverse.comb[Z_CONST_POS] += alpha * e0 + e0;
-        let input_emit = |reverse: &mut ReverseTranspose<'_>, base: usize, len: usize| {
-            for s in base..base + len {
-                let e = reverse.eq_inner[s];
-                reverse.comb[s] += reverse.alpha * e;
-                reverse.comb[Z_CONST_POS] += e;
-            }
-        };
-        input_emit(&mut reverse, CV_BASE, 8 * WORD_BITS);
-        input_emit(&mut reverse, M_BASE, 16 * WORD_BITS);
-        input_emit(&mut reverse, T_LO_BASE, WORD_BITS);
-        input_emit(&mut reverse, T_HI_BASE, WORD_BITS);
-        input_emit(&mut reverse, BLEN_BASE, WORD_BITS);
-        input_emit(&mut reverse, FLAGS_BASE, WORD_BITS);
-
-        // Unique source nodes preserve matrix column order.  Message words are
-        // shared across every scheduled use, while each materialized b/d word
-        // below gets a fresh leaf at its exact G-block offset.
-        let cv: [usize; 8] = std::array::from_fn(|w| reverse.leaf(cv_bit(w, 0)));
-        let messages: [usize; 16] = std::array::from_fn(|w| reverse.leaf(m_bit(w, 0)));
-        let mut state: [usize; 16] = [
-            cv[0],
-            cv[1],
-            cv[2],
-            cv[3],
-            cv[4],
-            cv[5],
-            cv[6],
-            cv[7],
-            reverse.constant(BLAKE3_IV[0]),
-            reverse.constant(BLAKE3_IV[1]),
-            reverse.constant(BLAKE3_IV[2]),
-            reverse.constant(BLAKE3_IV[3]),
-            reverse.leaf(T_LO_BASE),
-            reverse.leaf(T_HI_BASE),
-            reverse.leaf(BLEN_BASE),
-            reverse.leaf(FLAGS_BASE),
-        ];
-
-        for r in 0..N_ROUNDS {
-            for g_in_round in 0..N_G_PER_ROUND {
-                let g = r * N_G_PER_ROUND + g_in_round;
-                let [la, lb, lc, ld] = G_LANES[g_in_round];
-                let [mx_idx, my_idx] = PER_ROUND_MSG_IDX[r][g_in_round];
-                let [a, b, c, d] = [state[la], state[lb], state[lc], state[ld]];
-
-                let tmp_0 =
-                    reverse.add(a, b, g_add_carry_bit(g, ADD_TMP0, 0));
-                let a_1 = reverse.add(
-                    tmp_0,
-                    messages[mx_idx],
-                    g_add_carry_bit(g, ADD_A1, 0),
-                );
-                let d_1 = reverse.xor_rot(d, a_1, 16);
-                let c_1 =
-                    reverse.add(c, d_1, g_add_carry_bit(g, ADD_C1, 0));
-                let b_1 = reverse.xor_rot(b, c_1, 12);
-                let tmp_1 =
-                    reverse.add(a_1, b_1, g_add_carry_bit(g, ADD_TMP1, 0));
-                let a_2 = reverse.add(
-                    tmp_1,
-                    messages[my_idx],
-                    g_add_carry_bit(g, ADD_A2, 0),
-                );
-                let d_2 = reverse.xor_rot(d_1, a_2, 8);
-                let c_2 =
-                    reverse.add(c_1, d_2, g_add_carry_bit(g, ADD_C2, 0));
-
-                let b_new = reverse.xor_rot(b_1, c_2, 7);
-                for i in 0..WORD_BITS {
-                    reverse.seed_lin_row(b_new, i, g_lin_bit(g, LIN_B_NEW, i));
-                    reverse.seed_lin_row(d_2, i, g_lin_bit(g, LIN_D_NEW, i));
-                }
-
-                state[la] = a_2;
-                state[lb] = reverse.leaf(g_lin_bit(g, LIN_B_NEW, 0));
-                state[lc] = c_2;
-                state[ld] = reverse.leaf(g_lin_bit(g, LIN_D_NEW, 0));
-            }
+        // Kill switch: FLOCK_NO_LC_PREBUILD=1 restores the build-per-proof
+        // path (same walk, executed directly instead of replayed).
+        if std::env::var_os("FLOCK_NO_LC_PREBUILD").is_some_and(|v| v == "1") {
+            let mut reverse = ReverseTranspose::new(alpha, eq_inner);
+            walk_blake3_lincheck(&mut reverse);
+            return reverse.finish();
         }
 
-        // Finalization lin-id rows.  These nodes are seeded in physical output
-        // coordinate order, exactly as build_matrices writes the rows.
-        for w in 0..8 {
-            let lo = reverse.xor_rot(state[w], state[w + 8], 0);
-            let hi = reverse.xor_rot(state[w + 8], cv[w], 0);
-            for i in 0..WORD_BITS {
-                reverse.seed_lin_row(lo, i, out_lo_bit(w, i));
-                reverse.seed_lin_row(hi, i, out_hi_bit(w, i));
-            }
-        }
-
-        reverse.finish()
+        fold_alpha_with_plan(lc_plan(), alpha, eq_inner)
     }
 
     fn const_pin_col(&self) -> Option<usize> {
@@ -1848,6 +2065,30 @@ impl Blake3Setup {
     ) -> (flock_core::proof::R1csProofLigerito, Commitment, R1csClaim) {
         assert_eq!(blocks.len(), self.n_blocks);
         if self.use_ranked_rate2_hot_codeword() {
+            // From-message commit: the layer-1 NTT pass synthesizes both
+            // rate-1/2 replicas straight from z_packed, so the witness
+            // driver skips its ~1 GiB of replica stores entirely. The
+            // codeword scratch stays stale until that pass writes it.
+            // `FLOCK_NO_NTT_FROM_MSG=1` restores the hot-codeword replicate
+            // path below as the exact A/B control.
+            if flock_core::pcs::use_ranked_from_message_commit(&self.pcs_params) {
+                let codeword =
+                    flock_core::scratch::take_f128(self.pcs_params.codeword_len_f128());
+                let (z_packed, a_packed_f128, b_packed_f128, z_packed_lincheck) =
+                    self.generate_witness_ab(blocks);
+                let lc_circuit = self.lincheck_circuit();
+                return crate::prover::prove_fast_ligerito_from_witness(
+                    &self.r1cs,
+                    &self.pcs_params,
+                    z_packed,
+                    a_packed_f128,
+                    b_packed_f128,
+                    z_packed_lincheck,
+                    lc_circuit,
+                    Some(codeword),
+                    challenger,
+                );
+            }
             let (codeword, (z_packed, a_packed_f128, b_packed_f128, z_packed_lincheck)) =
                 self.generate_witness_ab_with_rate2_codeword(blocks);
             let lc_circuit = self.lincheck_circuit();
@@ -1896,8 +2137,14 @@ impl Blake3Setup {
     ) {
         assert_eq!(blocks.len(), self.n_blocks);
         let t0 = std::time::Instant::now();
+        let from_message = self.use_ranked_rate2_hot_codeword()
+            && flock_core::pcs::use_ranked_from_message_commit(&self.pcs_params);
         let (codeword, (z_packed, a_packed_f128, b_packed_f128, z_packed_lincheck)) =
-            if self.use_ranked_rate2_hot_codeword() {
+            if from_message {
+                let codeword =
+                    flock_core::scratch::take_f128(self.pcs_params.codeword_len_f128());
+                (Some(codeword), self.generate_witness_ab(blocks))
+            } else if self.use_ranked_rate2_hot_codeword() {
                 let (codeword, witness) = self.generate_witness_ab_with_rate2_codeword(blocks);
                 (Some(codeword), witness)
             } else {
@@ -1906,6 +2153,20 @@ impl Blake3Setup {
         let witness_s = t0.elapsed().as_secs_f64();
         let lc_circuit = self.lincheck_circuit();
         let (proof, commitment, claim, mut timings) = match codeword {
+            // From-message: the buffer is stale scratch — route through the
+            // NeedsReplication path, whose commit_into fuses (or falls back
+            // to an explicit replicate-fill).
+            Some(codeword) if from_message => crate::prover::prove_fast_ligerito_timed(
+                &self.r1cs,
+                &self.pcs_params,
+                z_packed,
+                a_packed_f128,
+                b_packed_f128,
+                z_packed_lincheck,
+                lc_circuit,
+                Some(codeword),
+                challenger,
+            ),
             Some(codeword) => {
                 crate::prover::prove_fast_ligerito_timed_from_preinitialized_codeword(
                     &self.r1cs,

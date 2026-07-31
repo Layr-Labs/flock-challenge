@@ -262,6 +262,294 @@ pub(super) unsafe fn butterfly_fused_3layer_zero_root_row(
     }
 }
 
+/// Vector-resident radix-16 row kernel: fuses four layers in one in-place
+/// pass over 16 rows spaced `sixteenth` apart. Same butterfly order and
+/// twiddle layout as `portable::butterfly_fused_4layer`.
+///
+/// # Safety
+/// As [`butterfly_fused_3layer_row`].
+#[target_feature(enable = "aes")]
+pub(super) unsafe fn butterfly_fused_4layer_row(
+    ptr: *mut F128,
+    sixteenth: usize,
+    num_ntts: usize,
+    r: usize,
+    twiddles: &[F128; 15],
+) {
+    use core::arch::aarch64::*;
+    unsafe {
+        let t: [uint64x2_t; 15] =
+            core::array::from_fn(|i| vld1q_u64((&raw const twiddles[i]).cast::<u64>()));
+
+        for lane in 0..num_ntts {
+            let base = ptr.add(r * num_ntts + lane);
+            let step = sixteenth * num_ntts;
+            let mut v: [uint64x2_t; 16] =
+                core::array::from_fn(|i| vld1q_u64(base.add(i * step).cast::<u64>()));
+
+            for i in 0..8 {
+                let (a, b) = butterfly_q(v[i], v[i + 8], t[0]);
+                v[i] = a;
+                v[i + 8] = b;
+            }
+            for s in 0..2 {
+                for i in 0..4 {
+                    let (u, w) = (8 * s + i, 8 * s + i + 4);
+                    let (a, b) = butterfly_q(v[u], v[w], t[1 + s]);
+                    v[u] = a;
+                    v[w] = b;
+                }
+            }
+            for s in 0..4 {
+                for i in 0..2 {
+                    let (u, w) = (4 * s + i, 4 * s + i + 2);
+                    let (a, b) = butterfly_q(v[u], v[w], t[3 + s]);
+                    v[u] = a;
+                    v[w] = b;
+                }
+            }
+            for s in 0..8 {
+                let (a, b) = butterfly_q(v[2 * s], v[2 * s + 1], t[7 + s]);
+                v[2 * s] = a;
+                v[2 * s + 1] = b;
+            }
+
+            for (i, value) in v.iter().enumerate() {
+                vst1q_u64(base.add(i * step).cast::<u64>(), *value);
+            }
+        }
+    }
+}
+
+/// Vector-resident radix-32 row kernel: fuses five layers in one in-place
+/// memory round-trip over 32 rows spaced `thirtysecond` apart.
+///
+/// Register-pressure structure: a straight 32-value chain spills the whole
+/// q-file and thrashes the allocator (measured slower than three fused-3
+/// sweeps). Instead: layer L runs as a streaming pass (≤3 live values)
+/// staging its outputs in a 512 B stack buffer, then each 16-value half
+/// runs the four remaining layers through the fused-4 chain (16 live
+/// values — fits). Memory traffic is still one load + one store per row;
+/// the stage lives in L1.
+///
+/// # Safety
+/// As [`butterfly_fused_3layer_row`].
+#[target_feature(enable = "aes")]
+pub(super) unsafe fn butterfly_fused_5layer_row(
+    ptr: *mut F128,
+    thirtysecond: usize,
+    num_ntts: usize,
+    r: usize,
+    twiddles: &[F128; 31],
+) {
+    use core::arch::aarch64::*;
+    unsafe {
+        let t0 = vld1q_u64((&raw const twiddles[0]).cast::<u64>());
+        // Per-half fused-4 twiddle views: half h covers layer-(L+1) block
+        // 2b+h, whose fused-4 set is twiddles[1+h], twiddles[3+2h..3+2h+2],
+        // twiddles[7+4h..7+4h+4], twiddles[15+8h..15+8h+8].
+        let half_t = |h: usize| -> [uint64x2_t; 15] {
+            let mut out = [vdupq_n_u64(0); 15];
+            out[0] = vld1q_u64((&raw const twiddles[1 + h]).cast::<u64>());
+            for s in 0..2 {
+                out[1 + s] = vld1q_u64((&raw const twiddles[3 + 2 * h + s]).cast::<u64>());
+            }
+            for s in 0..4 {
+                out[3 + s] = vld1q_u64((&raw const twiddles[7 + 4 * h + s]).cast::<u64>());
+            }
+            for s in 0..8 {
+                out[7 + s] = vld1q_u64((&raw const twiddles[15 + 8 * h + s]).cast::<u64>());
+            }
+            out
+        };
+        let th: [[uint64x2_t; 15]; 2] = [half_t(0), half_t(1)];
+
+        for lane in 0..num_ntts {
+            let base = ptr.add(r * num_ntts + lane);
+            let step = thirtysecond * num_ntts;
+
+            // Layer L: streaming pairs (i, i+16), stage the 32 results.
+            let mut stage = [vdupq_n_u64(0); 32];
+            for i in 0..16 {
+                let u = vld1q_u64(base.add(i * step).cast::<u64>());
+                let w = vld1q_u64(base.add((i + 16) * step).cast::<u64>());
+                let (a, b) = butterfly_q(u, w, t0);
+                stage[i] = a;
+                stage[i + 16] = b;
+            }
+
+            // Layers L+1..L+4: fused-4 per 16-value half, register-resident.
+            for h in 0..2 {
+                let t = &th[h];
+                let mut v: [uint64x2_t; 16] = core::array::from_fn(|i| stage[16 * h + i]);
+                for i in 0..8 {
+                    let (a, b) = butterfly_q(v[i], v[i + 8], t[0]);
+                    v[i] = a;
+                    v[i + 8] = b;
+                }
+                for s in 0..2 {
+                    for i in 0..4 {
+                        let (u, w) = (8 * s + i, 8 * s + i + 4);
+                        let (a, b) = butterfly_q(v[u], v[w], t[1 + s]);
+                        v[u] = a;
+                        v[w] = b;
+                    }
+                }
+                for s in 0..4 {
+                    for i in 0..2 {
+                        let (u, w) = (4 * s + i, 4 * s + i + 2);
+                        let (a, b) = butterfly_q(v[u], v[w], t[3 + s]);
+                        v[u] = a;
+                        v[w] = b;
+                    }
+                }
+                for s in 0..8 {
+                    let (a, b) = butterfly_q(v[2 * s], v[2 * s + 1], t[7 + s]);
+                    v[2 * s] = a;
+                    v[2 * s + 1] = b;
+                }
+                for (i, value) in v.iter().enumerate() {
+                    vst1q_u64(base.add((16 * h + i) * step).cast::<u64>(), *value);
+                }
+            }
+        }
+    }
+}
+
+/// Vector-resident twin of `portable::butterfly_fused_3layer_dual_from_src_row`.
+///
+/// Loads the radix-8 row group from `src` once, keeps it in q registers, and
+/// evaluates both layer-1 blocks' fused-3 butterflies on those registers: the
+/// zero-root set to `dst0`, the general set to `dst1`. All eight rows are
+/// stored to both destinations (they hold stale bytes, unlike the in-place
+/// kernels' own prior state).
+///
+/// # Safety
+/// As [`butterfly_fused_3layer_row`] for all three pointers, plus
+/// `t_zero[0] == t_zero[1] == t_zero[3] == 0`.
+#[target_feature(enable = "aes")]
+#[allow(clippy::too_many_arguments)]
+pub(super) unsafe fn butterfly_fused_3layer_dual_from_src_row(
+    src: *const F128,
+    dst0: *mut F128,
+    dst1: *mut F128,
+    eighth: usize,
+    num_ntts: usize,
+    r: usize,
+    t_zero: &[F128; 7],
+    t_gen: &[F128; 7],
+) {
+    use core::arch::aarch64::*;
+    unsafe {
+        debug_assert_eq!(t_zero[0], F128::ZERO);
+        debug_assert_eq!(t_zero[1], F128::ZERO);
+        debug_assert_eq!(t_zero[3], F128::ZERO);
+
+        let z2 = vld1q_u64((&raw const t_zero[2]).cast::<u64>());
+        let z4 = vld1q_u64((&raw const t_zero[4]).cast::<u64>());
+        let z5 = vld1q_u64((&raw const t_zero[5]).cast::<u64>());
+        let z6 = vld1q_u64((&raw const t_zero[6]).cast::<u64>());
+        let g: [uint64x2_t; 7] =
+            core::array::from_fn(|i| vld1q_u64((&raw const t_gen[i]).cast::<u64>()));
+
+        // Stage all sixteen output rows in stack (L1) buffers during the lane
+        // loop, then flush each destination row as one sequential 1 KiB run.
+        // Storing straight from the lane loop interleaves sixteen cold-line
+        // streams 64 KiB apart, defeating the streaming-store detector and
+        // paying full read-for-ownership on the whole destination — the −4%
+        // ranked verdict on the first cut of this kernel. Sequential per-row
+        // runs (and consecutive `r` continuing each stream contiguously)
+        // restore the elided-RFO fill behavior the replicate path had.
+        const MAX_LANES: usize = 64;
+        debug_assert!(num_ntts <= MAX_LANES);
+        let mut out0 = [[F128 { lo: 0, hi: 0 }; MAX_LANES]; 8];
+        let mut out1 = [[F128 { lo: 0, hi: 0 }; MAX_LANES]; 8];
+
+        for lane in 0..num_ntts {
+            let off = r * num_ntts + lane;
+            let step = eighth * num_ntts;
+            let src_base = src.add(off);
+            let loaded: [uint64x2_t; 8] =
+                core::array::from_fn(|i| vld1q_u64(src_base.add(i * step).cast::<u64>()));
+
+            // Block 0: zero-root chain (mirrors
+            // `butterfly_fused_3layer_zero_root_row`, but keeps v[0] too).
+            {
+                let mut v = loaded;
+                for i in 0..4 {
+                    v[i + 4] = butterfly_zero_q(v[i], v[i + 4]);
+                }
+                for i in 0..2 {
+                    v[i + 2] = butterfly_zero_q(v[i], v[i + 2]);
+                }
+                let (a, b) = butterfly_q(v[4], v[6], z2);
+                v[4] = a;
+                v[6] = b;
+                let (a, b) = butterfly_q(v[5], v[7], z2);
+                v[5] = a;
+                v[7] = b;
+                v[1] = butterfly_zero_q(v[0], v[1]);
+                let (a, b) = butterfly_q(v[2], v[3], z4);
+                v[2] = a;
+                v[3] = b;
+                let (a, b) = butterfly_q(v[4], v[5], z5);
+                v[4] = a;
+                v[5] = b;
+                let (a, b) = butterfly_q(v[6], v[7], z6);
+                v[6] = a;
+                v[7] = b;
+                for (i, value) in v.iter().enumerate() {
+                    vst1q_u64((&raw mut out0[i][lane]).cast::<u64>(), *value);
+                }
+            }
+
+            // Block 1: general chain (mirrors `butterfly_fused_3layer_row`).
+            {
+                let mut v = loaded;
+                for i in 0..4 {
+                    let (a, b) = butterfly_q(v[i], v[i + 4], g[0]);
+                    v[i] = a;
+                    v[i + 4] = b;
+                }
+                for s in 0..2 {
+                    for i in 0..2 {
+                        let (u, w) = (4 * s + i, 4 * s + i + 2);
+                        let (a, b) = butterfly_q(v[u], v[w], g[1 + s]);
+                        v[u] = a;
+                        v[w] = b;
+                    }
+                }
+                for s in 0..4 {
+                    let (a, b) = butterfly_q(v[2 * s], v[2 * s + 1], g[3 + s]);
+                    v[2 * s] = a;
+                    v[2 * s + 1] = b;
+                }
+                for (i, value) in v.iter().enumerate() {
+                    vst1q_u64((&raw mut out1[i][lane]).cast::<u64>(), *value);
+                }
+            }
+        }
+
+        // Sequential flush: one contiguous `num_ntts`-lane run per output row.
+        let step = eighth * num_ntts;
+        let row_off = r * num_ntts;
+        for i in 0..8 {
+            core::ptr::copy_nonoverlapping(
+                out0[i].as_ptr(),
+                dst0.add(i * step + row_off),
+                num_ntts,
+            );
+        }
+        for i in 0..8 {
+            core::ptr::copy_nonoverlapping(
+                out1[i].as_ptr(),
+                dst1.add(i * step + row_off),
+                num_ntts,
+            );
+        }
+    }
+}
+
 /// Fused two-layer butterfly specialized for three low-limb-only twiddles.
 /// Two products are issued together at each stage, using four PMULLs instead
 /// of twelve for the pair under the generic Binius field multiplier.
