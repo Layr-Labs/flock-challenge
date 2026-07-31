@@ -304,9 +304,7 @@ fn prove_packed_padded_inner<C: Challenger>(
     // about this internal optimization; we restore the C_s factor here.
     let zc_timing = std::env::var_os("FLOCK_ZC_TIMING").is_some();
     let t_round1 = std::time::Instant::now();
-    let ntt_s = AdditiveNttGf8::new(k_skip, F8::ZERO);
-    let ntt_l = AdditiveNttGf8::new(k_skip, F8(1u8 << k_skip));
-    let inv_table = InvNttTableByteSingleGf8::new(&ntt_s, &ntt_l);
+    let inv_table = InvNttTableByteSingleGf8::cached_standard(k_skip);
     let (round1_ab_opt, round1_c_opt, s_hat_v_c) = if let Some(ab_inner) = precomputed_ab.as_ref() {
         assert!(
             capture_s_hat_v_c,
@@ -380,16 +378,74 @@ fn prove_packed_padded_inner<C: Challenger>(
     let fold_table = UniSkipFoldTable::new(k_skip, z);
     let mut mlv_arg = vec![F128::ONE; n_mlv];
     mlv_arg[1..].copy_from_slice(&r[k_skip + 1..]);
-    let (compact_mlv, msg_1, msg_inf) = uni_skip_fold_and_round_pair_compact_padded_with_deltas(
-        a_packed,
-        b_packed,
-        m,
-        k_skip,
-        &fold_table,
-        &mlv_arg,
-        padding,
-        compact_deltas,
-    );
+    // Direct rail handoff (opt-in, `FLOCK_R2_DIRECT=1`): round two computes
+    // only its message — zero writes — and the first tail round re-reads the
+    // packed rails with the sampled challenge composed into a resident table
+    // pair, deleting the 1.5 GiB (at ranked m=32) anchors+deltas
+    // materialization and its read-back. MEASURED LOSS locally (M2, paired
+    // in-process minimums at m=31: old r2+r3 65.1 ms vs direct 83.8 ms):
+    // both phases are table-lookup-bound (~11 G lookups/s, ~52 GB/s — far
+    // below DRAM saturation), so doubling the first tail round's lookups
+    // (16 → 32 per entry, no prefolded anchor) costs ~2x more than the
+    // deleted sequential/NT stores were worth. The compact anchor+delta
+    // layout is the measured optimum on the lookup-vs-bytes tradeoff; keep
+    // the direct path opt-in for a possible re-test on wider hardware.
+    let r2_direct = std::env::var_os("FLOCK_R2_DIRECT").is_some();
+    // 16-bit-indexed fold tables (opt-in, `FLOCK_R2_WIDE=1`): halve the
+    // lookup count of the lookup-bound round-2 fold and round-3 first fold
+    // by fusing adjacent byte banks into four 65536-entry banks (4 MiB,
+    // L2-resident). Bit-identical output; the wide tables are exact XOR
+    // compositions of the same per-bit weights. MEASURED LOSS locally (M2,
+    // paired probe `benches/round2_wide_probe.rs`, m=31 min-of-20: old
+    // r2+r3 62.3 ms vs wide 92.8 ms, +49%): the per-lookup cost triples
+    // going L1 → shared L2 (and the E-cluster's 4 MiB L2 cannot hold the
+    // table at all), so halving the count still loses. Table construction
+    // is ~0.1 ms and irrelevant. Kept opt-in for wider-hardware re-tests.
+    let r2_wide = !r2_direct && std::env::var_os("FLOCK_R2_WIDE").is_some();
+    let (compact_mlv_opt, msg_1, msg_inf) = if r2_direct {
+        // The donated round-1 scratch is unused here; return it to the pool
+        // so the tail's folded-level allocations reuse its warm pages.
+        if let Some(deltas) = compact_deltas {
+            deltas.recycle();
+        }
+        let (m1, mi) = multilinear::uni_skip_round_pair_message_only_padded(
+            a_packed, b_packed, m, k_skip, &fold_table, &mlv_arg, padding,
+        );
+        (None, m1, mi)
+    } else if r2_wide {
+        let t_wide = std::time::Instant::now();
+        let wide = multilinear::UniSkipFoldTableWide::new(&fold_table);
+        if zc_timing {
+            eprintln!(
+                "[zc-timing] round2 wide16 table build: {:.2} ms",
+                t_wide.elapsed().as_secs_f64() * 1e3
+            );
+        }
+        let (compact, m1, mi) = multilinear::uni_skip_fold_and_round_pair_compact_padded_wide(
+            a_packed,
+            b_packed,
+            m,
+            k_skip,
+            &wide,
+            &mlv_arg,
+            padding,
+            compact_deltas,
+        );
+        wide.recycle();
+        (Some(compact), m1, mi)
+    } else {
+        let (compact, m1, mi) = uni_skip_fold_and_round_pair_compact_padded_with_deltas(
+            a_packed,
+            b_packed,
+            m,
+            k_skip,
+            &fold_table,
+            &mlv_arg,
+            padding,
+            compact_deltas,
+        );
+        (Some(compact), m1, mi)
+    };
 
     if zc_timing {
         eprintln!(
@@ -421,9 +477,54 @@ fn prove_packed_padded_inner<C: Challenger>(
     // post-fold tables expected by all subsequent rounds.
     let mut first_r_next = vec![F128::ONE; n_mlv - 1];
     first_r_next[1..].copy_from_slice(&r[k_skip + 2..]);
-    let (mut a_mlv, mut b_mlv, first_m1, first_mi) =
-        fold_compact_and_compute_round_pair(&compact_mlv, &fold_table, mlv_rhos[0], &first_r_next);
-    compact_mlv.recycle();
+    let t_round3 = std::time::Instant::now();
+    let (mut a_mlv, mut b_mlv, first_m1, first_mi) = match compact_mlv_opt {
+        None => multilinear::fold_rails_direct_and_compute_round_pair(
+            a_packed,
+            b_packed,
+            m,
+            k_skip,
+            &fold_table,
+            mlv_rhos[0],
+            &first_r_next,
+            padding,
+        ),
+        Some(compact_mlv) => {
+            let out = if r2_wide {
+                let t_wide = std::time::Instant::now();
+                let wide_scaled =
+                    multilinear::UniSkipFoldTableWide::new_scaled(&fold_table, mlv_rhos[0]);
+                if zc_timing {
+                    eprintln!(
+                        "[zc-timing] round3 wide16 scaled table build: {:.2} ms",
+                        t_wide.elapsed().as_secs_f64() * 1e3
+                    );
+                }
+                let out = multilinear::fold_compact_and_compute_round_pair_wide(
+                    &compact_mlv,
+                    &wide_scaled,
+                    &first_r_next,
+                );
+                wide_scaled.recycle();
+                out
+            } else {
+                fold_compact_and_compute_round_pair(
+                    &compact_mlv,
+                    &fold_table,
+                    mlv_rhos[0],
+                    &first_r_next,
+                )
+            };
+            compact_mlv.recycle();
+            out
+        }
+    };
+    if zc_timing {
+        eprintln!(
+            "[zc-timing] round3 first fold: {:.2} ms",
+            t_round3.elapsed().as_secs_f64() * 1e3
+        );
+    }
     multilinear_msgs.push((first_m1, first_mi));
     challenger.observe_f128(first_m1);
     challenger.observe_f128(first_mi);

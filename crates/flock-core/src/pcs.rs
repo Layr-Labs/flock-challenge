@@ -28,7 +28,7 @@ pub mod tensor_algebra;
 
 pub use commit::{
     Commitment, PcsParams, ProverData, commit, commit_into, commit_preinitialized,
-    prefault_codeword_during,
+    prefault_codeword_during, use_ranked_from_message_commit,
 };
 pub use pack::{LOG_PACKING, pack_witness, unpack_witness};
 pub use ring_switch::{RingSwitchProof, SparseEqTensor};

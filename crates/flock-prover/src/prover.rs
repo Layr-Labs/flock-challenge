@@ -391,9 +391,7 @@ fn commit_with_round1_ab_precompute(
     let a_packed = as_bytes(a_packed_f128);
     let b_packed = as_bytes(b_packed_f128);
     let k_skip = zerocheck::K_SKIP;
-    let ntt_s = flock_core::ntt::AdditiveNttGf8::new(k_skip, F8::ZERO);
-    let ntt_l = flock_core::ntt::AdditiveNttGf8::new(k_skip, F8(1u8 << k_skip));
-    let inv_table = flock_core::ntt::InvNttTableByteSingleGf8::new(&ntt_s, &ntt_l);
+    let inv_table = flock_core::ntt::InvNttTableByteSingleGf8::cached_standard(k_skip);
 
     rayon::join(
         || match commit_codeword {
