@@ -210,21 +210,7 @@ pub fn prove_fast_ligerito_from_witness<Ch: Challenger>(
     prefaulted_codeword: Option<Vec<F128>>,
     challenger: &mut Ch,
 ) -> (R1csProofLigerito, Commitment, R1csClaim) {
-    let lig_config = pcs_params
-        .ligerito_prover_config()
-        .expect("Ligerito default config; bump m for tiny instances");
-
-    let ProveCore {
-        zc_proof,
-        lc_proof,
-        ab,
-        c,
-        commitment,
-        prover_data,
-        z_packed,
-        s_hat_v_ab,
-        s_hat_v_c,
-    } = prove_fast_core_with_codeword(
+    let core = prove_fast_core_with_codeword(
         r1cs,
         pcs_params,
         z_packed,
@@ -235,7 +221,55 @@ pub fn prove_fast_ligerito_from_witness<Ch: Challenger>(
         prefaulted_codeword,
         challenger,
     );
+    finish_fast_ligerito(r1cs, pcs_params, core, challenger)
+}
 
+/// BLAKE-style fast pipeline whose A/B factors are reconstructed from z at
+/// their two zerocheck consumption sites instead of retained globally.
+#[allow(clippy::too_many_arguments)]
+pub fn prove_fast_ligerito_from_reconstructed_ab<Ch: Challenger>(
+    r1cs: &BlockR1cs,
+    pcs_params: &PcsParams,
+    z_packed: Vec<F128>,
+    z_packed_lincheck: Vec<u8>,
+    reconstructor: &dyn zerocheck::PackedAbReconstructor,
+    lincheck_circuit: &dyn lincheck::LincheckCircuit,
+    prefaulted_codeword: Option<Vec<F128>>,
+    challenger: &mut Ch,
+) -> (R1csProofLigerito, Commitment, R1csClaim) {
+    let core = prove_fast_core_with_reconstructed_ab(
+        r1cs,
+        pcs_params,
+        z_packed,
+        z_packed_lincheck,
+        reconstructor,
+        lincheck_circuit,
+        prefaulted_codeword,
+        challenger,
+    );
+    finish_fast_ligerito(r1cs, pcs_params, core, challenger)
+}
+
+fn finish_fast_ligerito<Ch: Challenger>(
+    r1cs: &BlockR1cs,
+    pcs_params: &PcsParams,
+    core: ProveCore,
+    challenger: &mut Ch,
+) -> (R1csProofLigerito, Commitment, R1csClaim) {
+    let lig_config = pcs_params
+        .ligerito_prover_config()
+        .expect("Ligerito default config; bump m for tiny instances");
+    let ProveCore {
+        zc_proof,
+        lc_proof,
+        ab,
+        c,
+        commitment,
+        prover_data,
+        z_packed,
+        s_hat_v_ab,
+        s_hat_v_c,
+    } = core;
     let padding = r1cs.padding_spec();
     let pre_ab: Option<&[F128]> = s_hat_v_ab.as_deref();
     let pre_c: Option<&[F128]> = Some(s_hat_v_c.as_slice());
@@ -332,6 +366,39 @@ fn commit_with_round1_ab_precompute(
     )
 }
 
+fn commit_with_round1_ab_precompute_reconstructed(
+    z_packed: &[F128],
+    reconstructor: &dyn zerocheck::PackedAbReconstructor,
+    pcs_params: &PcsParams,
+    padding: &zerocheck::PaddingSpec,
+    prefaulted_codeword: Option<Vec<F128>>,
+) -> (
+    (Commitment, pcs::ProverData),
+    zerocheck::univariate_skip_optimized::Round1AbInner,
+) {
+    let k_skip = zerocheck::K_SKIP;
+    let ntt_s = flock_core::ntt::AdditiveNttGf8::new(k_skip, F8::ZERO);
+    let ntt_l = flock_core::ntt::AdditiveNttGf8::new(k_skip, F8(1u8 << k_skip));
+    let inv_table = flock_core::ntt::InvNttTableByteSingleGf8::new(&ntt_s, &ntt_l);
+
+    rayon::join(
+        || match prefaulted_codeword {
+            Some(buf) => pcs::commit_into(z_packed, pcs_params, buf),
+            None => pcs::commit(z_packed, pcs_params),
+        },
+        || {
+            zerocheck::univariate_skip_optimized::precompute_round1_ab_inner_reconstructed_padded(
+                z_packed,
+                pcs_params.m,
+                k_skip,
+                &inv_table,
+                padding,
+                reconstructor,
+            )
+        },
+    )
+}
+
 /// Run commit → bind → zerocheck → lincheck and build the base claims, stopping
 /// just before the PCS open. See [`ProveCore`].
 pub fn prove_fast_core<Ch: Challenger>(
@@ -374,46 +441,128 @@ pub fn prove_fast_core_with_codeword<Ch: Challenger>(
     prefaulted_codeword: Option<Vec<F128>>,
     challenger: &mut Ch,
 ) -> ProveCore {
-    let padding = r1cs.padding_spec();
-    let ((commitment, prover_data), ab_inner) = commit_with_round1_ab_precompute(
-        &z_packed,
-        &a_packed_f128,
-        &b_packed_f128,
+    prove_fast_core_with_ab_source(
+        r1cs,
         pcs_params,
-        &padding,
+        z_packed,
+        ProverAbSource::Materialized {
+            a: a_packed_f128,
+            b: b_packed_f128,
+        },
+        z_packed_lincheck,
+        lincheck_circuit,
         prefaulted_codeword,
-    );
+        challenger,
+    )
+}
+
+/// No-global-A/B counterpart of [`prove_fast_core_with_codeword`].
+#[allow(clippy::too_many_arguments)]
+pub fn prove_fast_core_with_reconstructed_ab<Ch: Challenger>(
+    r1cs: &BlockR1cs,
+    pcs_params: &PcsParams,
+    z_packed: Vec<F128>,
+    z_packed_lincheck: Vec<u8>,
+    reconstructor: &dyn zerocheck::PackedAbReconstructor,
+    lincheck_circuit: &dyn lincheck::LincheckCircuit,
+    prefaulted_codeword: Option<Vec<F128>>,
+    challenger: &mut Ch,
+) -> ProveCore {
+    prove_fast_core_with_ab_source(
+        r1cs,
+        pcs_params,
+        z_packed,
+        ProverAbSource::Reconstructed(reconstructor),
+        z_packed_lincheck,
+        lincheck_circuit,
+        prefaulted_codeword,
+        challenger,
+    )
+}
+
+enum ProverAbSource<'a> {
+    Materialized { a: Vec<F128>, b: Vec<F128> },
+    Reconstructed(&'a dyn zerocheck::PackedAbReconstructor),
+}
+
+#[allow(clippy::too_many_arguments)]
+fn prove_fast_core_with_ab_source<Ch: Challenger>(
+    r1cs: &BlockR1cs,
+    pcs_params: &PcsParams,
+    z_packed: Vec<F128>,
+    ab_source: ProverAbSource<'_>,
+    z_packed_lincheck: Vec<u8>,
+    lincheck_circuit: &dyn lincheck::LincheckCircuit,
+    prefaulted_codeword: Option<Vec<F128>>,
+    challenger: &mut Ch,
+) -> ProveCore {
+    let padding = r1cs.padding_spec();
+    let ((commitment, prover_data), ab_inner) = match &ab_source {
+        ProverAbSource::Materialized { a, b } => commit_with_round1_ab_precompute(
+            &z_packed,
+            a,
+            b,
+            pcs_params,
+            &padding,
+            prefaulted_codeword,
+        ),
+        ProverAbSource::Reconstructed(reconstructor) => {
+            commit_with_round1_ab_precompute_reconstructed(
+                &z_packed,
+                *reconstructor,
+                pcs_params,
+                &padding,
+                prefaulted_codeword,
+            )
+        }
+    };
     bind_statement(challenger, r1cs, &commitment);
 
     let (zc_proof, zc_claim, s_hat_v_c) = {
-        // Zero-cost &[u8] views of the F128 buffers; c aliases z (C = I).
-        let a_packed: &[u8] = unsafe {
-            std::slice::from_raw_parts(
-                a_packed_f128.as_ptr() as *const u8,
-                a_packed_f128.len() * core::mem::size_of::<F128>(),
-            )
-        };
-        let b_packed: &[u8] = unsafe {
-            std::slice::from_raw_parts(
-                b_packed_f128.as_ptr() as *const u8,
-                b_packed_f128.len() * core::mem::size_of::<F128>(),
-            )
-        };
         let c_packed: &[u8] = unsafe {
             std::slice::from_raw_parts(
                 z_packed.as_ptr() as *const u8,
                 z_packed.len() * core::mem::size_of::<F128>(),
             )
         };
-        zerocheck::prove_packed_padded_capture_s_hat_v_c_with_precomputed_ab(
-            a_packed, b_packed, c_packed, r1cs.m, &padding, ab_inner, challenger,
-        )
+        match &ab_source {
+            ProverAbSource::Materialized { a, b } => {
+                let a_packed: &[u8] = unsafe {
+                    std::slice::from_raw_parts(
+                        a.as_ptr() as *const u8,
+                        a.len() * core::mem::size_of::<F128>(),
+                    )
+                };
+                let b_packed: &[u8] = unsafe {
+                    std::slice::from_raw_parts(
+                        b.as_ptr() as *const u8,
+                        b.len() * core::mem::size_of::<F128>(),
+                    )
+                };
+                zerocheck::prove_packed_padded_capture_s_hat_v_c_with_precomputed_ab(
+                    a_packed, b_packed, c_packed, r1cs.m, &padding, ab_inner, challenger,
+                )
+            }
+            ProverAbSource::Reconstructed(reconstructor) => {
+                zerocheck::prove_packed_padded_capture_s_hat_v_c_with_precomputed_ab_reconstructed(
+                    &z_packed,
+                    c_packed,
+                    *reconstructor,
+                    r1cs.m,
+                    &padding,
+                    ab_inner,
+                    challenger,
+                )
+            }
+        }
     };
     // Nothing downstream reads a/b (zerocheck consumed them in rounds 1–2);
     // recycle the two buffers (2 × 2^(m-3) bytes — 128 MB at m = 29) instead
     // of carrying them through lincheck and the PCS open.
-    flock_core::scratch::give_f128(a_packed_f128);
-    flock_core::scratch::give_f128(b_packed_f128);
+    if let ProverAbSource::Materialized { a, b } = ab_source {
+        flock_core::scratch::give_f128(a);
+        flock_core::scratch::give_f128(b);
+    }
 
     let x_ab = r1cs.x_ab_from_mlv(zc_claim.z, &zc_claim.mlv_challenges);
 
@@ -502,6 +651,55 @@ pub fn prove_fast_ligerito_timed<Ch: Challenger>(
     prefaulted_codeword: Option<Vec<F128>>,
     challenger: &mut Ch,
 ) -> (R1csProofLigerito, Commitment, R1csClaim, ProvePhaseTimings) {
+    prove_fast_ligerito_timed_with_ab_source(
+        r1cs,
+        pcs_params,
+        z_packed,
+        ProverAbSource::Materialized {
+            a: a_packed_f128,
+            b: b_packed_f128,
+        },
+        z_packed_lincheck,
+        lincheck_circuit,
+        prefaulted_codeword,
+        challenger,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn prove_fast_ligerito_reconstructed_timed<Ch: Challenger>(
+    r1cs: &BlockR1cs,
+    pcs_params: &PcsParams,
+    z_packed: Vec<F128>,
+    z_packed_lincheck: Vec<u8>,
+    reconstructor: &dyn zerocheck::PackedAbReconstructor,
+    lincheck_circuit: &dyn lincheck::LincheckCircuit,
+    prefaulted_codeword: Option<Vec<F128>>,
+    challenger: &mut Ch,
+) -> (R1csProofLigerito, Commitment, R1csClaim, ProvePhaseTimings) {
+    prove_fast_ligerito_timed_with_ab_source(
+        r1cs,
+        pcs_params,
+        z_packed,
+        ProverAbSource::Reconstructed(reconstructor),
+        z_packed_lincheck,
+        lincheck_circuit,
+        prefaulted_codeword,
+        challenger,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn prove_fast_ligerito_timed_with_ab_source<Ch: Challenger>(
+    r1cs: &BlockR1cs,
+    pcs_params: &PcsParams,
+    z_packed: Vec<F128>,
+    ab_source: ProverAbSource<'_>,
+    z_packed_lincheck: Vec<u8>,
+    lincheck_circuit: &dyn lincheck::LincheckCircuit,
+    prefaulted_codeword: Option<Vec<F128>>,
+    challenger: &mut Ch,
+) -> (R1csProofLigerito, Commitment, R1csClaim, ProvePhaseTimings) {
     use std::time::Instant;
     let mut t = ProvePhaseTimings::default();
 
@@ -513,45 +711,73 @@ pub fn prove_fast_ligerito_timed<Ch: Challenger>(
 
     // --- PCS commit + challenge-independent zerocheck AB preprocessing ---
     let t0 = Instant::now();
-    let ((commitment, prover_data), ab_inner) = commit_with_round1_ab_precompute(
-        &z_packed,
-        &a_packed_f128,
-        &b_packed_f128,
-        pcs_params,
-        &padding,
-        prefaulted_codeword,
-    );
+    let ((commitment, prover_data), ab_inner) = match &ab_source {
+        ProverAbSource::Materialized { a, b } => commit_with_round1_ab_precompute(
+            &z_packed,
+            a,
+            b,
+            pcs_params,
+            &padding,
+            prefaulted_codeword,
+        ),
+        ProverAbSource::Reconstructed(reconstructor) => {
+            commit_with_round1_ab_precompute_reconstructed(
+                &z_packed,
+                *reconstructor,
+                pcs_params,
+                &padding,
+                prefaulted_codeword,
+            )
+        }
+    };
     t.commit_s = t0.elapsed().as_secs_f64();
     bind_statement(challenger, r1cs, &commitment);
 
     // --- zerocheck ---
     let t0 = Instant::now();
     let (zc_proof, zc_claim, s_hat_v_c) = {
-        let a_packed: &[u8] = unsafe {
-            std::slice::from_raw_parts(
-                a_packed_f128.as_ptr() as *const u8,
-                a_packed_f128.len() * core::mem::size_of::<F128>(),
-            )
-        };
-        let b_packed: &[u8] = unsafe {
-            std::slice::from_raw_parts(
-                b_packed_f128.as_ptr() as *const u8,
-                b_packed_f128.len() * core::mem::size_of::<F128>(),
-            )
-        };
         let c_packed: &[u8] = unsafe {
             std::slice::from_raw_parts(
                 z_packed.as_ptr() as *const u8,
                 z_packed.len() * core::mem::size_of::<F128>(),
             )
         };
-        zerocheck::prove_packed_padded_capture_s_hat_v_c_with_precomputed_ab(
-            a_packed, b_packed, c_packed, r1cs.m, &padding, ab_inner, challenger,
-        )
+        match &ab_source {
+            ProverAbSource::Materialized { a, b } => {
+                let a_packed: &[u8] = unsafe {
+                    std::slice::from_raw_parts(
+                        a.as_ptr() as *const u8,
+                        a.len() * core::mem::size_of::<F128>(),
+                    )
+                };
+                let b_packed: &[u8] = unsafe {
+                    std::slice::from_raw_parts(
+                        b.as_ptr() as *const u8,
+                        b.len() * core::mem::size_of::<F128>(),
+                    )
+                };
+                zerocheck::prove_packed_padded_capture_s_hat_v_c_with_precomputed_ab(
+                    a_packed, b_packed, c_packed, r1cs.m, &padding, ab_inner, challenger,
+                )
+            }
+            ProverAbSource::Reconstructed(reconstructor) => {
+                zerocheck::prove_packed_padded_capture_s_hat_v_c_with_precomputed_ab_reconstructed(
+                    &z_packed,
+                    c_packed,
+                    *reconstructor,
+                    r1cs.m,
+                    &padding,
+                    ab_inner,
+                    challenger,
+                )
+            }
+        }
     };
     t.zerocheck_s = t0.elapsed().as_secs_f64();
-    flock_core::scratch::give_f128(a_packed_f128);
-    flock_core::scratch::give_f128(b_packed_f128);
+    if let ProverAbSource::Materialized { a, b } = ab_source {
+        flock_core::scratch::give_f128(a);
+        flock_core::scratch::give_f128(b);
+    }
 
     let x_ab = r1cs.x_ab_from_mlv(zc_claim.z, &zc_claim.mlv_challenges);
 

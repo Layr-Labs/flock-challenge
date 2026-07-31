@@ -1114,6 +1114,171 @@ impl<'a> PackedWordWriter<'a> {
 }
 
 #[inline(always)]
+fn read_u31_at_bit(input: &[u64], bit_off: usize) -> u32 {
+    const MASK: u64 = 0x7FFF_FFFF;
+    let word = bit_off >> 6;
+    let shift = bit_off & 63;
+    let mut value = input[word] >> shift;
+    if shift > 33 {
+        value |= input[word + 1] << (64 - shift);
+    }
+    (value & MASK) as u32
+}
+
+/// Reconstruct one packed A/B block from the packed witness alone.
+///
+/// For one addition, `carry_aux = (x + cin) · (y + cin)` and the actual
+/// carry recurrence is `carry_out = carry_aux + cin`. Therefore the carry-in
+/// word is the exclusive prefix XOR of the 31 stored `carry_aux` bits. This
+/// recovers both factors and the sum with XORs only:
+///
+/// ```text
+/// left  = x + cin
+/// right = y + cin
+/// sum   = x + y + cin
+/// ```
+///
+/// Linear rows use `A = z, B = 1`; padding rows use zero. Both output blocks
+/// are emitted sequentially so every packed word is written exactly once.
+fn reconstruct_block_ab_from_z(z: &[u64], a: &mut [u64], b: &mut [u64]) {
+    const U64_PER_BLOCK: usize = K / 64;
+    const MASK_LO31: u32 = 0x7FFF_FFFF;
+    debug_assert_eq!(z.len(), U64_PER_BLOCK);
+    debug_assert_eq!(a.len(), U64_PER_BLOCK);
+    debug_assert_eq!(b.len(), U64_PER_BLOCK);
+
+    let read_u32 = |bit_off: usize| -> u32 {
+        let word = bit_off >> 6;
+        let shift = bit_off & 63;
+        let mut value = z[word] >> shift;
+        if shift > 32 {
+            value |= z[word + 1] << (64 - shift);
+        }
+        value as u32
+    };
+
+    let cv: [u32; 8] = std::array::from_fn(|w| read_u32(cv_bit(w, 0)));
+    let m: [u32; 16] = std::array::from_fn(|i| read_u32(m_bit(i, 0)));
+    let counter_lo = read_u32(T_LO_BASE);
+    let counter_hi = read_u32(T_HI_BASE);
+    let block_len = read_u32(BLEN_BASE);
+    let flags = read_u32(FLAGS_BASE);
+    let mut wa = PackedWordWriter::new(a);
+    let mut wb = PackedWordWriter::new(b);
+    for &value in &cv {
+        wa.push(value as u64, 32);
+        wb.push(u32::MAX as u64, 32);
+    }
+    for w in 0..8 {
+        wa.push(read_u32(out_lo_bit(w, 0)) as u64, 32);
+        wb.push(u32::MAX as u64, 32);
+    }
+    wa.push(1, 1);
+    wb.push(1, 1);
+    for &value in &m {
+        wa.push(value as u64, 32);
+        wb.push(u32::MAX as u64, 32);
+    }
+    for value in [counter_lo, counter_hi, block_len, flags] {
+        wa.push(value as u64, 32);
+        wb.push(u32::MAX as u64, 32);
+    }
+    debug_assert_eq!(wa.position(), GS_BASE);
+
+    let mut state: [u32; 16] = [
+        cv[0],
+        cv[1],
+        cv[2],
+        cv[3],
+        cv[4],
+        cv[5],
+        cv[6],
+        cv[7],
+        BLAKE3_IV[0],
+        BLAKE3_IV[1],
+        BLAKE3_IV[2],
+        BLAKE3_IV[3],
+        counter_lo,
+        counter_hi,
+        block_len,
+        flags,
+    ];
+
+    let msg_idx = &PER_ROUND_MSG_IDX;
+    for r in 0..N_ROUNDS {
+        for g_in_round in 0..N_G_PER_ROUND {
+            let g = r * N_G_PER_ROUND + g_in_round;
+            let [la, lb, lc, ld] = G_LANES[g_in_round];
+            let [mx_i, my_i] = msg_idx[r][g_in_round];
+            let mut ra = BitRecord::<4>::new();
+            let mut rb = BitRecord::<4>::new();
+
+            macro_rules! reconstruct_add {
+                ($pos:ident, $add:ident, $x:expr, $y:expr) => {{
+                    let carry_aux = read_u31_at_bit(z, g_add_carry_bit(g, $add, 0));
+                    let mut prefix = carry_aux;
+                    prefix ^= prefix << 1;
+                    prefix ^= prefix << 2;
+                    prefix ^= prefix << 4;
+                    prefix ^= prefix << 8;
+                    prefix ^= prefix << 16;
+                    let cin = prefix << 1;
+                    ra.push::<$pos>(($x ^ cin) & MASK_LO31);
+                    rb.push::<$pos>(($y ^ cin) & MASK_LO31);
+                    $x ^ $y ^ cin
+                }};
+            }
+
+            let tmp_0 = reconstruct_add!(REC_C0, ADD_TMP0, state[la], state[lb]);
+            let a_1 = reconstruct_add!(REC_C1, ADD_A1, tmp_0, m[mx_i]);
+            let d_1 = (state[ld] ^ a_1).rotate_right(16);
+            let c_1 = reconstruct_add!(REC_C2, ADD_C1, state[lc], d_1);
+            let b_1 = (state[lb] ^ c_1).rotate_right(12);
+            let tmp_1 = reconstruct_add!(REC_C3, ADD_TMP1, a_1, b_1);
+            let a_2 = reconstruct_add!(REC_C4, ADD_A2, tmp_1, m[my_i]);
+            let d_2 = (d_1 ^ a_2).rotate_right(8);
+            let c_2 = reconstruct_add!(REC_C5, ADD_C2, c_1, d_2);
+            let b_new = (b_1 ^ c_2).rotate_right(7);
+
+            debug_assert_eq!(b_new, read_u32(g_lin_bit(g, LIN_B_NEW, 0)));
+            debug_assert_eq!(d_2, read_u32(g_lin_bit(g, LIN_D_NEW, 0)));
+            ra.push::<REC_LIN0>(b_new);
+            rb.push::<REC_LIN0>(u32::MAX);
+            ra.push::<REC_LIN1>(d_2);
+            rb.push::<REC_LIN1>(u32::MAX);
+            wa.push_record(&ra, G_STRIDE);
+            wb.push_record(&rb, G_STRIDE);
+            state[la] = a_2;
+            state[lb] = b_new;
+            state[lc] = c_2;
+            state[ld] = d_2;
+        }
+    }
+    debug_assert_eq!(wa.position(), OUT_HI_BASE);
+    for w in 0..8 {
+        wa.push((state[w + 8] ^ cv[w]) as u64, 32);
+        wb.push(u32::MAX as u64, 32);
+    }
+    debug_assert_eq!(wa.position(), USEFUL_BITS);
+    wa.finish();
+    wb.finish();
+}
+
+struct Blake3AbReconstructor;
+
+impl flock_core::zerocheck::PackedAbReconstructor for Blake3AbReconstructor {
+    #[inline]
+    fn block_words(&self) -> usize {
+        K / 64
+    }
+
+    #[inline]
+    fn reconstruct_block(&self, z: &[u64], a: &mut [u64], b: &mut [u64]) {
+        reconstruct_block_ab_from_z(z, a, b);
+    }
+}
+
+#[inline(always)]
 fn stream_lin_word(
     value: u32,
     z: &mut PackedWordWriter<'_>,
@@ -1398,6 +1563,107 @@ fn build_block_witness_ab_stream_into(
     }
 }
 
+/// Z-only counterpart of [`build_block_witness_ab_stream_into`]. A/B are
+/// reconstructed from the stored carry rows inside zerocheck, so witness
+/// generation writes only the committed witness and its lincheck stripe.
+fn build_block_witness_z_stream_into(
+    cv: &[u32; 8],
+    m: &[u32; 16],
+    counter: u64,
+    block_len: u32,
+    flags: u32,
+    z: &mut [u64],
+) {
+    const U64_PER_BLOCK: usize = K / 64;
+    debug_assert_eq!(z.len(), U64_PER_BLOCK);
+    let mut wz = PackedWordWriter::new(z);
+
+    for &value in cv {
+        wz.push(value as u64, 32);
+    }
+    for _ in 0..8 {
+        wz.push(0, 32);
+    }
+    wz.push(1, 1);
+    for &value in m {
+        wz.push(value as u64, 32);
+    }
+    let counter_lo = counter as u32;
+    let counter_hi = (counter >> 32) as u32;
+    wz.push(counter_lo as u64, 32);
+    wz.push(counter_hi as u64, 32);
+    wz.push(block_len as u64, 32);
+    wz.push(flags as u64, 32);
+    debug_assert_eq!(wz.position(), GS_BASE);
+
+    let mut state: [u32; 16] = [
+        cv[0],
+        cv[1],
+        cv[2],
+        cv[3],
+        cv[4],
+        cv[5],
+        cv[6],
+        cv[7],
+        BLAKE3_IV[0],
+        BLAKE3_IV[1],
+        BLAKE3_IV[2],
+        BLAKE3_IV[3],
+        counter_lo,
+        counter_hi,
+        block_len,
+        flags,
+    ];
+    let msg_idx = &PER_ROUND_MSG_IDX;
+    for r in 0..N_ROUNDS {
+        for g_in_round in 0..N_G_PER_ROUND {
+            let [la, lb, lc, ld] = G_LANES[g_in_round];
+            let [mx_i, my_i] = msg_idx[r][g_in_round];
+            let mut rz = BitRecord::<4>::new();
+
+            macro_rules! add_into_z {
+                ($pos:ident, $x:expr, $y:expr) => {{
+                    let (sum, _, _, carry) = add_carry_parts($x, $y);
+                    rz.push::<$pos>(carry);
+                    sum
+                }};
+            }
+
+            let tmp_0 = add_into_z!(REC_C0, state[la], state[lb]);
+            let a_1 = add_into_z!(REC_C1, tmp_0, m[mx_i]);
+            let d_1 = (state[ld] ^ a_1).rotate_right(16);
+            let c_1 = add_into_z!(REC_C2, state[lc], d_1);
+            let b_1 = (state[lb] ^ c_1).rotate_right(12);
+            let tmp_1 = add_into_z!(REC_C3, a_1, b_1);
+            let a_2 = add_into_z!(REC_C4, tmp_1, m[my_i]);
+            let d_2 = (d_1 ^ a_2).rotate_right(8);
+            let c_2 = add_into_z!(REC_C5, c_1, d_2);
+            let b_new = (b_1 ^ c_2).rotate_right(7);
+
+            rz.push::<REC_LIN0>(b_new);
+            rz.push::<REC_LIN1>(d_2);
+            wz.push_record(&rz, G_STRIDE);
+            state[la] = a_2;
+            state[lb] = b_new;
+            state[lc] = c_2;
+            state[ld] = d_2;
+        }
+    }
+    debug_assert_eq!(wz.position(), OUT_HI_BASE);
+
+    let out_lo: [u32; 8] = std::array::from_fn(|w| state[w] ^ state[w + 8]);
+    for w in 0..8 {
+        wz.push((state[w + 8] ^ cv[w]) as u64, 32);
+    }
+    debug_assert_eq!(wz.position(), USEFUL_BITS);
+    wz.finish();
+
+    const OUT_LO_WORD: usize = OUT_LO_BASE / 64;
+    for i in 0..4 {
+        z[OUT_LO_WORD + i] = (out_lo[2 * i] as u64) | ((out_lo[2 * i + 1] as u64) << 32);
+    }
+}
+
 /// **The fast path.** Produces `(z, a, b)` directly as F_{2^128}-packed
 /// vectors — no bool intermediates, no `pack_witness` step, no
 /// `apply_block_diag_packed`. Parallel across compression instances via rayon.
@@ -1494,6 +1760,23 @@ pub fn generate_witness_with_ab_packed_and_lincheck(
         |block: &Compression, z_u64, a_u64, b_u64| {
             let (cv, m, t, bl, fl) = block;
             build_block_witness_ab_stream_into(cv, m, *t, *bl, *fl, z_u64, a_u64, b_u64);
+        },
+    )
+}
+
+fn generate_witness_z_packed_and_lincheck(
+    blocks: &[Compression],
+    n_blocks_log: usize,
+) -> (Vec<flock_core::field::F128>, Vec<u8>) {
+    let padding: Compression = ([0u32; 8], [0u32; 16], 0u64, 0u32, 0u32);
+    super::common::drive_witness_packed_and_lincheck_z_full_write(
+        blocks,
+        &padding,
+        n_blocks_log,
+        K_LOG,
+        |block: &Compression, z_u64| {
+            let (cv, m, t, bl, fl) = block;
+            build_block_witness_z_stream_into(cv, m, *t, *bl, *fl, z_u64);
         },
     )
 }
@@ -1641,6 +1924,24 @@ impl Blake3Setup {
         challenger: &mut Ch,
     ) -> (flock_core::proof::R1csProofLigerito, Commitment, R1csClaim) {
         assert_eq!(blocks.len(), self.n_blocks);
+        if self.r1cs.layout == flock_core::r1cs::WitnessLayout::RowMajor {
+            let (codeword, (z_packed, z_packed_lincheck)) =
+                flock_core::pcs::prefault_codeword_during(&self.pcs_params, || {
+                    generate_witness_z_packed_and_lincheck(blocks, self.n_blocks_log())
+                });
+            let lc_circuit = self.r1cs.csc_lincheck_circuit();
+            return crate::prover::prove_fast_ligerito_from_reconstructed_ab(
+                &self.r1cs,
+                &self.pcs_params,
+                z_packed,
+                z_packed_lincheck,
+                &Blake3AbReconstructor,
+                lc_circuit,
+                codeword,
+                challenger,
+            );
+        }
+
         let (codeword, (z_packed, a_packed_f128, b_packed_f128, z_packed_lincheck)) =
             flock_core::pcs::prefault_codeword_during(&self.pcs_params, || {
                 self.generate_witness_ab(blocks)
@@ -1674,6 +1975,26 @@ impl Blake3Setup {
     ) {
         assert_eq!(blocks.len(), self.n_blocks);
         let t0 = std::time::Instant::now();
+        if self.r1cs.layout == flock_core::r1cs::WitnessLayout::RowMajor {
+            let (z_packed, z_packed_lincheck) =
+                generate_witness_z_packed_and_lincheck(blocks, self.n_blocks_log());
+            let witness_s = t0.elapsed().as_secs_f64();
+            let lc_circuit = self.r1cs.csc_lincheck_circuit();
+            let (proof, commitment, claim, mut timings) =
+                crate::prover::prove_fast_ligerito_reconstructed_timed(
+                    &self.r1cs,
+                    &self.pcs_params,
+                    z_packed,
+                    z_packed_lincheck,
+                    &Blake3AbReconstructor,
+                    lc_circuit,
+                    None,
+                    challenger,
+                );
+            timings.witness_s = witness_s;
+            return (proof, commitment, claim, timings);
+        }
+
         let (z_packed, a_packed_f128, b_packed_f128, z_packed_lincheck) =
             self.generate_witness_ab(blocks);
         let witness_s = t0.elapsed().as_secs_f64();
@@ -2269,6 +2590,52 @@ mod tests {
             assert_eq!(z, z_ref);
             assert_eq!(a, a_ref);
             assert_eq!(b, b_ref);
+        }
+    }
+
+    #[test]
+    fn reconstruct_block_ab_from_z_matches_streaming_builder() {
+        const WORDS: usize = K / 64;
+        let mut rng = Rng::new(0xAB5E_51DE);
+        for _ in 0..32 {
+            let cv: [u32; 8] = std::array::from_fn(|_| rng.next_u32());
+            let m: [u32; 16] = std::array::from_fn(|_| rng.next_u32());
+            let counter = ((rng.next_u32() as u64) << 32) | rng.next_u32() as u64;
+            let block_len = rng.next_u32();
+            let flags = rng.next_u32();
+
+            let mut z = [0u64; WORDS];
+            let mut a_ref = [0u64; WORDS];
+            let mut b_ref = [0u64; WORDS];
+            build_block_witness_ab_stream_into(
+                &cv, &m, counter, block_len, flags, &mut z, &mut a_ref, &mut b_ref,
+            );
+
+            let mut a = [u64::MAX; WORDS];
+            let mut b = [u64::MAX; WORDS];
+            reconstruct_block_ab_from_z(&z, &mut a, &mut b);
+            assert_eq!(a, a_ref);
+            assert_eq!(b, b_ref);
+        }
+    }
+
+    #[test]
+    fn z_only_generator_matches_fused_generator() {
+        for &n_blocks in &[1usize, 8, 13] {
+            let n_log = min_n_blocks_log(n_blocks).max(3);
+            let mut rng = Rng::new(0x20A1_0A11 + n_blocks as u64);
+            let blocks: Vec<Compression> = (0..n_blocks)
+                .map(|_| {
+                    let cv: [u32; 8] = std::array::from_fn(|_| rng.next_u32());
+                    let m: [u32; 16] = std::array::from_fn(|_| rng.next_u32());
+                    (cv, m, rng.next_u32() as u64, 64u32, 11u32)
+                })
+                .collect();
+            let (z_ref, _, _, stripe_ref) =
+                generate_witness_with_ab_packed_and_lincheck(&blocks, n_log);
+            let (z, stripe) = generate_witness_z_packed_and_lincheck(&blocks, n_log);
+            assert_eq!(z, z_ref);
+            assert_eq!(stripe, stripe_ref);
         }
     }
 

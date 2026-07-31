@@ -35,8 +35,8 @@ use std::sync::{LazyLock, OnceLock};
 use crate::field::{F8, F128, PHI_8_TABLE, mul_by_x, phi8};
 use crate::ntt::InvNttTableByteSingleGf8;
 
-use super::PaddingSpec;
 use super::univariate_skip::{SplitEqGhash, ntt_extend_f128_vec_ghash, pack_bits};
+use super::{PackedAbReconstructor, PaddingSpec};
 
 mod kernels;
 
@@ -366,6 +366,90 @@ pub fn precompute_round1_ab_inner_packed_padded(
                     );
                 }
                 out_outer[n_b_med * 64..].fill(0);
+            },
+        );
+
+    Round1AbInner { storage }
+}
+
+/// Reconstructed-input counterpart of
+/// [`precompute_round1_ab_inner_packed_padded`]. Each factor block is derived
+/// from its witness block into worker-local storage, consumed immediately,
+/// and discarded. The full A/B tables are never materialized.
+pub fn precompute_round1_ab_inner_reconstructed_padded(
+    z_packed: &[F128],
+    m: usize,
+    k_skip: usize,
+    inv_table: &InvNttTableByteSingleGf8,
+    padding: &PaddingSpec,
+    reconstructor: &dyn PackedAbReconstructor,
+) -> Round1AbInner {
+    use rayon::prelude::*;
+
+    assert_eq!(k_skip, K_SKIP, "optimized variant is k_skip=6 only");
+    assert!(
+        m >= k_skip + N_INNER,
+        "m must be ≥ k_skip + N_INNER ({}) for the shift_reduce optimization",
+        k_skip + N_INNER
+    );
+    let total_bytes = (1usize << m) / 8;
+    assert_eq!(core::mem::size_of_val(z_packed), total_bytes);
+    assert_eq!(inv_table.k, k_skip);
+    let block_words = reconstructor.block_words();
+    let block_bytes = block_words * core::mem::size_of::<u64>();
+    assert_eq!(block_bytes, 1usize << (padding.k_log - 3));
+    assert_eq!(total_bytes % block_bytes, 0);
+
+    let (_, b_med_counts) = build_b_med_counts(padding);
+    const OUTER_BYTES: usize = (1 << N_MEDIUM) * 64;
+    assert_eq!(block_bytes % OUTER_BYTES, 0);
+
+    let z_words: &[u64] =
+        unsafe { core::slice::from_raw_parts(z_packed.as_ptr() as *const u64, z_packed.len() * 2) };
+    let mut storage = crate::scratch::take_f128(total_bytes / core::mem::size_of::<F128>());
+    let out_bytes: &mut [u8] =
+        unsafe { core::slice::from_raw_parts_mut(storage.as_mut_ptr() as *mut u8, total_bytes) };
+
+    out_bytes
+        .par_chunks_mut(block_bytes)
+        .enumerate()
+        .for_each_init(
+            || {
+                (
+                    vec![0u64; block_words],
+                    vec![0u64; block_words],
+                    [F8::ZERO; ELL],
+                    [F8::ZERO; ELL],
+                )
+            },
+            |(a_block, b_block, a_col, b_col), (block_idx, out_block)| {
+                let word_base = block_idx * block_words;
+                reconstructor.reconstruct_block(
+                    &z_words[word_base..word_base + block_words],
+                    a_block,
+                    b_block,
+                );
+                let a_bytes: &[u8] = unsafe {
+                    core::slice::from_raw_parts(a_block.as_ptr() as *const u8, block_bytes)
+                };
+                let b_bytes: &[u8] = unsafe {
+                    core::slice::from_raw_parts(b_block.as_ptr() as *const u8, block_bytes)
+                };
+
+                for within_outer in 0..(block_bytes / OUTER_BYTES) {
+                    let n_b_med = b_med_counts[within_outer] as usize;
+                    let outer_base = within_outer * OUTER_BYTES;
+                    for b_med in 0..n_b_med {
+                        let dst: &mut [u8; 64] = (&mut out_block
+                            [outer_base + b_med * 64..outer_base + (b_med + 1) * 64])
+                            .try_into()
+                            .expect("one transformed b_med block");
+                        shift_reduce_inner_ab(
+                            a_bytes, b_bytes, inv_table, outer_base, b_med, dst, a_col, b_col,
+                        );
+                    }
+                    out_block[outer_base + n_b_med * 64..outer_base + OUTER_BYTES].fill(0);
+                }
             },
         );
 

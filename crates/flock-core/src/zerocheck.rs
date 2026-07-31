@@ -30,6 +30,7 @@ use multilinear::{
     UniSkipFoldTable, fold_and_compute_round_pair_into, fold_in_place_pair,
     interpolate_at_z_combined, interpolate_at_z_on_lambda, round_pair_naive,
     uni_skip_fold_and_round_pair_optimized_packed_padded,
+    uni_skip_fold_and_round_pair_reconstructed_padded,
 };
 use univariate_skip_optimized::{
     c_s_f128, medium_challenges_ghash, round1_shift_reduce_extract_c_packed_padded,
@@ -54,6 +55,18 @@ pub const K_SKIP: usize = 6;
 pub struct PaddingSpec {
     pub k_log: usize,
     pub useful_bits_per_block: usize,
+}
+
+/// Reconstructs one packed A/B block from the corresponding packed witness
+/// block. Hash-specific fast paths can implement this instead of retaining
+/// two full-size factor arrays between witness generation and zerocheck.
+///
+/// All slices contain `block_words()` u64s in the same little-endian packed
+/// row order. Implementations must overwrite every word of `a` and `b`.
+pub trait PackedAbReconstructor: Sync {
+    fn block_words(&self) -> usize;
+
+    fn reconstruct_block(&self, z: &[u64], a: &mut [u64], b: &mut [u64]);
 }
 
 impl PaddingSpec {
@@ -188,7 +201,13 @@ pub fn prove_packed_padded<C: Challenger>(
     challenger: &mut C,
 ) -> (ZerocheckProof, ZerocheckClaim) {
     let (proof, claim, _) = prove_packed_padded_inner(
-        a_packed, b_packed, c_packed, m, padding, false, None, challenger,
+        ProverPackedAb::Materialized { a_packed, b_packed },
+        c_packed,
+        m,
+        padding,
+        false,
+        None,
+        challenger,
     );
     (proof, claim)
 }
@@ -209,7 +228,13 @@ pub fn prove_packed_padded_capture_s_hat_v_c<C: Challenger>(
     challenger: &mut C,
 ) -> (ZerocheckProof, ZerocheckClaim, Vec<F128>) {
     let (proof, claim, captured) = prove_packed_padded_inner(
-        a_packed, b_packed, c_packed, m, padding, true, None, challenger,
+        ProverPackedAb::Materialized { a_packed, b_packed },
+        c_packed,
+        m,
+        padding,
+        true,
+        None,
+        challenger,
     );
     (
         proof,
@@ -232,8 +257,7 @@ pub fn prove_packed_padded_capture_s_hat_v_c_with_precomputed_ab<C: Challenger>(
     challenger: &mut C,
 ) -> (ZerocheckProof, ZerocheckClaim, Vec<F128>) {
     let (proof, claim, captured) = prove_packed_padded_inner(
-        a_packed,
-        b_packed,
+        ProverPackedAb::Materialized { a_packed, b_packed },
         c_packed,
         m,
         padding,
@@ -248,10 +272,53 @@ pub fn prove_packed_padded_capture_s_hat_v_c_with_precomputed_ab<C: Challenger>(
     )
 }
 
+/// Reconstructed-factor variant of
+/// [`prove_packed_padded_capture_s_hat_v_c_with_precomputed_ab`]. Round 2
+/// rebuilds A/B from z in worker-local chunks instead of reading permanent
+/// full-size factor arrays.
+pub fn prove_packed_padded_capture_s_hat_v_c_with_precomputed_ab_reconstructed<C: Challenger>(
+    z_packed: &[F128],
+    c_packed: &[u8],
+    reconstructor: &dyn PackedAbReconstructor,
+    m: usize,
+    padding: &PaddingSpec,
+    ab_inner: univariate_skip_optimized::Round1AbInner,
+    challenger: &mut C,
+) -> (ZerocheckProof, ZerocheckClaim, Vec<F128>) {
+    let (proof, claim, captured) = prove_packed_padded_inner(
+        ProverPackedAb::Reconstructed {
+            z_packed,
+            reconstructor,
+        },
+        c_packed,
+        m,
+        padding,
+        true,
+        Some(ab_inner),
+        challenger,
+    );
+    (
+        proof,
+        claim,
+        captured.expect("capture=true must produce s_hat_v_c"),
+    )
+}
+
+#[derive(Clone, Copy)]
+enum ProverPackedAb<'a> {
+    Materialized {
+        a_packed: &'a [u8],
+        b_packed: &'a [u8],
+    },
+    Reconstructed {
+        z_packed: &'a [F128],
+        reconstructor: &'a dyn PackedAbReconstructor,
+    },
+}
+
 #[allow(clippy::too_many_arguments)]
 fn prove_packed_padded_inner<C: Challenger>(
-    a_packed: &[u8],
-    b_packed: &[u8],
+    ab_input: ProverPackedAb<'_>,
     c_packed: &[u8],
     m: usize,
     padding: &PaddingSpec,
@@ -267,8 +334,15 @@ fn prove_packed_padded_inner<C: Challenger>(
         k_skip + N_INNER
     );
     let expected_bytes = (1usize << m) / 8;
-    assert_eq!(a_packed.len(), expected_bytes);
-    assert_eq!(b_packed.len(), expected_bytes);
+    match ab_input {
+        ProverPackedAb::Materialized { a_packed, b_packed } => {
+            assert_eq!(a_packed.len(), expected_bytes);
+            assert_eq!(b_packed.len(), expected_bytes);
+        }
+        ProverPackedAb::Reconstructed { z_packed, .. } => {
+            assert_eq!(core::mem::size_of_val(z_packed), expected_bytes);
+        }
+    }
     assert_eq!(c_packed.len(), expected_bytes);
     let n_mlv = m - k_skip;
 
@@ -324,6 +398,9 @@ fn prove_packed_padded_inner<C: Challenger>(
             );
         (ab, c, Some(s))
     } else if capture_s_hat_v_c {
+        let ProverPackedAb::Materialized { a_packed, b_packed } = ab_input else {
+            panic!("reconstructed A/B requires a precomputed round-1 transform");
+        };
         let (ab, c, s) =
             crate::zerocheck::univariate_skip_optimized::round1_shift_reduce_extract_c_packed_padded_with_s_hat_v(
                 a_packed,
@@ -337,6 +414,9 @@ fn prove_packed_padded_inner<C: Challenger>(
             );
         (ab, c, Some(s))
     } else {
+        let ProverPackedAb::Materialized { a_packed, b_packed } = ab_input else {
+            panic!("reconstructed A/B requires a precomputed round-1 transform");
+        };
         let (ab, c) = round1_shift_reduce_extract_c_packed_padded(
             a_packed, b_packed, c_packed, m, k_skip, &r, &inv_table, padding,
         );
@@ -378,16 +458,31 @@ fn prove_packed_padded_inner<C: Challenger>(
     let fold_table = UniSkipFoldTable::new(k_skip, z);
     let mut mlv_arg = vec![F128::ONE; n_mlv];
     mlv_arg[1..].copy_from_slice(&r[k_skip + 1..]);
-    let (mut a_mlv, mut b_mlv, msg_1, msg_inf) =
-        uni_skip_fold_and_round_pair_optimized_packed_padded(
-            a_packed,
-            b_packed,
+    let (mut a_mlv, mut b_mlv, msg_1, msg_inf) = match ab_input {
+        ProverPackedAb::Materialized { a_packed, b_packed } => {
+            uni_skip_fold_and_round_pair_optimized_packed_padded(
+                a_packed,
+                b_packed,
+                m,
+                k_skip,
+                &fold_table,
+                &mlv_arg,
+                padding,
+            )
+        }
+        ProverPackedAb::Reconstructed {
+            z_packed,
+            reconstructor,
+        } => uni_skip_fold_and_round_pair_reconstructed_padded(
+            z_packed,
+            reconstructor,
             m,
             k_skip,
             &fold_table,
             &mlv_arg,
             padding,
-        );
+        ),
+    };
 
     if zc_timing {
         eprintln!(

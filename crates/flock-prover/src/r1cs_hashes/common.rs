@@ -257,6 +257,80 @@ where
     )
 }
 
+/// Z-only full-write driver for circuits whose A/B factors can be
+/// reconstructed from the witness at their consumption sites.
+pub(crate) fn drive_witness_packed_and_lincheck_z_full_write<S: Sync, F>(
+    initial_states: &[S],
+    padding: &S,
+    n_blocks_log: usize,
+    k_log: usize,
+    per_block: F,
+) -> (Vec<F128>, Vec<u8>)
+where
+    F: Fn(&S, &mut [u64]) + Sync,
+{
+    use rayon::prelude::*;
+
+    let k = 1usize << k_log;
+    let f128_per_block = k / 128;
+    let u64_per_block = k / 64;
+    let n_total = 1usize << n_blocks_log;
+    let n_blocks = initial_states.len();
+    assert!(
+        n_blocks <= n_total,
+        "{n_blocks} blocks > 2^{n_blocks_log} = {n_total} slots"
+    );
+    assert!(
+        n_total >= 8 && n_total.is_multiple_of(8),
+        "lincheck stripe layout requires n_total ≥ 8 and divisible by 8"
+    );
+
+    let total_f128 = n_total * f128_per_block;
+    let mut z = flock_core::scratch::take_f128(total_f128);
+    let mut z_lincheck = flock_core::scratch::take_u8((n_total / 8) * k);
+
+    z.par_chunks_mut(8 * f128_per_block)
+        .zip(z_lincheck.par_chunks_mut(k))
+        .enumerate()
+        .for_each(|(g, (z_grp, stripe))| {
+            for k_in in 0..8 {
+                let global_idx = 8 * g + k_in;
+                let init = if global_idx < n_blocks {
+                    &initial_states[global_idx]
+                } else {
+                    padding
+                };
+                let z_chunk = &mut z_grp[k_in * f128_per_block..(k_in + 1) * f128_per_block];
+                let z_u64: &mut [u64] = unsafe {
+                    std::slice::from_raw_parts_mut(
+                        z_chunk.as_mut_ptr() as *mut u64,
+                        z_chunk.len() * 2,
+                    )
+                };
+                per_block(init, z_u64);
+            }
+
+            let z_u64_all: &[u64] = unsafe {
+                std::slice::from_raw_parts(z_grp.as_ptr() as *const u64, z_grp.len() * 2)
+            };
+            for i in 0..u64_per_block {
+                let lanes: [u64; 8] = [
+                    z_u64_all[i],
+                    z_u64_all[u64_per_block + i],
+                    z_u64_all[2 * u64_per_block + i],
+                    z_u64_all[3 * u64_per_block + i],
+                    z_u64_all[4 * u64_per_block + i],
+                    z_u64_all[5 * u64_per_block + i],
+                    z_u64_all[6 * u64_per_block + i],
+                    z_u64_all[7 * u64_per_block + i],
+                ];
+                transpose_8_u64s_to_64_bytes(&lanes, &mut stripe[i * 64..i * 64 + 64]);
+            }
+        });
+
+    (z, z_lincheck)
+}
+
 fn drive_witness_packed_and_lincheck_impl<const PER_BLOCK_FULLY_WRITES: bool, S: Sync, F>(
     initial_states: &[S],
     padding: Option<&S>,
