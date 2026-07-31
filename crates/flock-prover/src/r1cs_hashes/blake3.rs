@@ -1884,9 +1884,17 @@ impl Blake3Setup {
         challenger: &mut Ch,
     ) -> (flock_core::proof::R1csProofLigerito, Commitment, R1csClaim) {
         assert_eq!(blocks.len(), self.n_blocks);
+        let phase_timing = std::env::var_os("FLOCK_PHASE_TIMING").is_some();
         if self.use_ranked_rate2_hot_codeword() {
+            let t_wit = std::time::Instant::now();
             let (codeword, (z_packed, a_packed_f128, b_packed_f128, z_packed_lincheck)) =
                 self.generate_witness_ab_with_rate2_codeword(blocks);
+            if phase_timing {
+                eprintln!(
+                    "[phase-timing] witgen+hot-codeword: {:.2} ms",
+                    t_wit.elapsed().as_secs_f64() * 1e3,
+                );
+            }
             let lc_circuit = self.lincheck_circuit();
             return crate::prover::prove_fast_ligerito_from_preinitialized_codeword(
                 &self.r1cs,

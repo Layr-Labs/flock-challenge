@@ -310,6 +310,9 @@ fn prove_fast_ligerito_from_witness_with_commit_codeword<Ch: Challenger>(
     let padding = r1cs.padding_spec();
     let pre_ab: Option<&[F128]> = s_hat_v_ab.as_deref();
     let pre_c: Option<&[F128]> = Some(s_hat_v_c.as_slice());
+    let phase_timing = std::env::var_os("FLOCK_PHASE_TIMING").is_some();
+    let cpu_open0 = phase_timing.then(process_cpu_ms);
+    let t_open = std::time::Instant::now();
     let pcs_open = open_claims_with_precomputed_ligerito(
         z_packed,
         &prover_data,
@@ -320,6 +323,14 @@ fn prove_fast_ligerito_from_witness_with_commit_codeword<Ch: Challenger>(
         &lig_config,
         challenger,
     );
+    if phase_timing {
+        let wall = t_open.elapsed().as_secs_f64() * 1e3;
+        let cpu = process_cpu_ms() - cpu_open0.unwrap_or(0.0);
+        eprintln!(
+            "[phase-timing] pcs-open: {wall:.2} ms cpu={cpu:.1} util={:.1}",
+            cpu / wall
+        );
+    }
 
     let proof = R1csProofLigerito {
         zerocheck: zc_proof,
@@ -487,6 +498,9 @@ fn prove_fast_core_with_commit_codeword<Ch: Challenger>(
     challenger: &mut Ch,
 ) -> ProveCore {
     let padding = r1cs.padding_spec();
+    let phase_timing = std::env::var_os("FLOCK_PHASE_TIMING").is_some();
+    let cpu0 = phase_timing.then(process_cpu_ms);
+    let t_commit = std::time::Instant::now();
     let ((commitment, prover_data), ab_inner) = commit_with_round1_ab_precompute(
         &z_packed,
         &a_packed_f128,
@@ -495,7 +509,17 @@ fn prove_fast_core_with_commit_codeword<Ch: Challenger>(
         &padding,
         commit_codeword,
     );
+    if phase_timing {
+        let wall = t_commit.elapsed().as_secs_f64() * 1e3;
+        let cpu = process_cpu_ms() - cpu0.unwrap_or(0.0);
+        eprintln!(
+            "[phase-timing] commit+ab-precompute: {wall:.2} ms cpu={cpu:.1} util={:.1}",
+            cpu / wall
+        );
+    }
     bind_statement(challenger, r1cs, &commitment);
+    let cpu_zc0 = phase_timing.then(process_cpu_ms);
+    let t_zc = std::time::Instant::now();
 
     let (zc_proof, zc_claim, s_hat_v_c) = {
         // Zero-cost &[u8] views of the F128 buffers; c aliases z (C = I).
@@ -521,12 +545,22 @@ fn prove_fast_core_with_commit_codeword<Ch: Challenger>(
             a_packed, b_packed, c_packed, r1cs.m, &padding, ab_inner, challenger,
         )
     };
+    if phase_timing {
+        let wall = t_zc.elapsed().as_secs_f64() * 1e3;
+        let cpu = process_cpu_ms() - cpu_zc0.unwrap_or(0.0);
+        eprintln!(
+            "[phase-timing] zerocheck: {wall:.2} ms cpu={cpu:.1} util={:.1}",
+            cpu / wall
+        );
+    }
     // Nothing downstream reads a/b (zerocheck consumed them in rounds 1–2);
     // recycle the two buffers (2 × 2^(m-3) bytes — 128 MB at m = 29) instead
     // of carrying them through lincheck and the PCS open.
     flock_core::scratch::give_f128(a_packed_f128);
     flock_core::scratch::give_f128(b_packed_f128);
 
+    let cpu_lc0 = phase_timing.then(process_cpu_ms);
+    let t_lc = std::time::Instant::now();
     let x_ab = r1cs.x_ab_from_mlv(zc_claim.z, &zc_claim.mlv_challenges);
 
     // Capture lincheck's pre-sumcheck z_vec so the PCS open can derive the
@@ -572,6 +606,14 @@ fn prove_fast_core_with_commit_codeword<Ch: Challenger>(
     } else {
         None
     };
+    if phase_timing {
+        let wall = t_lc.elapsed().as_secs_f64() * 1e3;
+        let cpu = process_cpu_ms() - cpu_lc0.unwrap_or(0.0);
+        eprintln!(
+            "[phase-timing] lincheck+s_hat_v: {wall:.2} ms cpu={cpu:.1} util={:.1}",
+            cpu / wall
+        );
+    }
 
     ProveCore {
         zc_proof,
@@ -584,6 +626,38 @@ fn prove_fast_core_with_commit_codeword<Ch: Challenger>(
         s_hat_v_ab,
         s_hat_v_c,
     }
+}
+
+/// Process CPU time (user+system) in ms, for FLOCK_PHASE_TIMING per-phase
+/// parallelism diagnostics. Diagnostics-only; returns 0.0 off macOS.
+fn process_cpu_ms() -> f64 {
+    #[cfg(target_os = "macos")]
+    {
+        #[repr(C)]
+        struct Timeval {
+            sec: i64,
+            usec: i32,
+        }
+        #[repr(C)]
+        struct Rusage {
+            utime: Timeval,
+            stime: Timeval,
+            other: [i64; 14],
+        }
+        unsafe extern "C" {
+            fn getrusage(who: i32, usage: *mut Rusage) -> i32;
+        }
+        let mut ru = Rusage {
+            utime: Timeval { sec: 0, usec: 0 },
+            stime: Timeval { sec: 0, usec: 0 },
+            other: [0; 14],
+        };
+        if unsafe { getrusage(0, &mut ru) } == 0 {
+            return (ru.utime.sec + ru.stime.sec) as f64 * 1e3
+                + (ru.utime.usec + ru.stime.usec) as f64 * 1e-3;
+        }
+    }
+    0.0
 }
 
 /// Per-phase wall-clock timings (seconds) of the Ligerito fast prover, for
