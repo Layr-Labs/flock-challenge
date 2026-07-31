@@ -2028,16 +2028,96 @@ pub(crate) fn induce_sumcheck_poly(
     (basis_poly, enforced_sum)
 }
 
+/// Apply three consecutive transpose layers in one read/write pass. `layer`
+/// is the lowest (root-most) of the three; the transpose executes forward
+/// layers `layer+2`, `layer+1`, then `layer`.
+fn transpose_forward_ntt_fused_3layer(
+    ntt: &AdditiveNttF128,
+    data: &mut [F128],
+    log_d: usize,
+    layer: usize,
+) {
+    use rayon::prelude::*;
+
+    #[inline(always)]
+    fn butterfly(values: &mut [F128; 8], a: usize, b: usize, twiddle: F128) {
+        let sum = values[a] + values[b];
+        values[a] = sum;
+        values[b] = twiddle * sum + values[b];
+    }
+
+    let num_blocks = 1usize << layer;
+    let block_size = 1usize << (log_d - layer);
+    let eighth = block_size >> 3;
+    let eighth_log = log_d - layer - 3;
+    let row_mask = eighth - 1;
+    let twiddles: Vec<[F128; 7]> = (0..num_blocks)
+        .map(|block| {
+            let mut tw = [F128::ZERO; 7];
+            tw[0] = ntt.twiddle(layer, block);
+            for s in 0..2 {
+                tw[1 + s] = ntt.twiddle(layer + 1, 2 * block + s);
+            }
+            for s in 0..4 {
+                tw[3 + s] = ntt.twiddle(layer + 2, 4 * block + s);
+            }
+            tw
+        })
+        .collect();
+
+    // Flatten `(block, row)` into one Rayon range. This keeps all cores busy
+    // even for the final few large blocks without opening nested parallel
+    // regions, which caused long-tail scheduler stalls in this phase.
+    let data_ptr = data.as_mut_ptr() as usize;
+    (0..num_blocks * eighth).into_par_iter().for_each(|job| {
+        // `eighth` is always a power of two. Spell out the quotient/remainder
+        // so rustc does not emit UDIV+MSUB in every eight-value row job.
+        let block = job >> eighth_log;
+        let row = job & row_mask;
+        let base = block * block_size + row;
+        let mut values = [F128::ZERO; 8];
+        // SAFETY: each `(block,row)` owns the eight distinct positions
+        // `base + i*eighth`, and different jobs never overlap.
+        unsafe {
+            let ptr = data_ptr as *mut F128;
+            for (i, value) in values.iter_mut().enumerate() {
+                *value = *ptr.add(base + i * eighth);
+            }
+            let tw = &twiddles[block];
+            for pair in 0..4 {
+                butterfly(&mut values, 2 * pair, 2 * pair + 1, tw[3 + pair]);
+            }
+            for half in 0..2 {
+                butterfly(&mut values, 4 * half, 4 * half + 2, tw[1 + half]);
+                butterfly(&mut values, 4 * half + 1, 4 * half + 3, tw[1 + half]);
+            }
+            for i in 0..4 {
+                butterfly(&mut values, i, i + 4, tw[0]);
+            }
+            for (i, &value) in values.iter().enumerate() {
+                *ptr.add(base + i * eighth) = value;
+            }
+        }
+    });
+}
+
 /// Transposed forward additive NTT, `Fᵀ`, in place over `2^log_d` coefficients.
 /// Forward butterfly is `M=[[1,t],[1,t+1]]`; transpose `Mᵀ=[[1,1],[t,t+1]]` is
 /// `s=a+b; top=s; bot=t·s+b`, applied in **reverse** layer order. (Baseline:
-/// one parallel sweep per layer.)
+/// one parallel sweep per layer.) Three adjacent layers are fused so each
+/// eight-value row group crosses memory once instead of three times.
 fn transpose_forward_ntt(ntt: &AdditiveNttF128, data: &mut [F128], log_d: usize) {
     use rayon::prelude::*;
     debug_assert_eq!(data.len(), 1usize << log_d);
     debug_assert!(log_d <= ntt.log_domain_size());
     let n_threads = rayon::current_num_threads().max(1);
-    for layer in (0..log_d).rev() {
+    let mut remaining = log_d;
+    while remaining >= 3 {
+        let layer = remaining - 3;
+        transpose_forward_ntt_fused_3layer(ntt, data, log_d, layer);
+        remaining -= 3;
+    }
+    for layer in (0..remaining).rev() {
         let num_blocks = 1usize << layer;
         let block_size = 1usize << (log_d - layer);
         let bsh = block_size >> 1;
@@ -2248,7 +2328,13 @@ fn transpose_forward_ntt_sparse(
 
     // Remaining steps s = k..log_d-1 = forward layers (log_d-1-k) .. 0, dense.
     let n_threads = rayon::current_num_threads().max(1);
-    for layer in (0..(log_d - k)).rev() {
+    let mut remaining = log_d - k;
+    while remaining >= 3 {
+        let layer = remaining - 3;
+        transpose_forward_ntt_fused_3layer(ntt, &mut data, log_d, layer);
+        remaining -= 3;
+    }
+    for layer in (0..remaining).rev() {
         let num_blocks = 1usize << layer;
         let block_size = 1usize << (log_d - layer);
         let bsh = block_size >> 1;
@@ -6411,6 +6497,51 @@ mod tests {
                 let sparse = transpose_forward_ntt_sparse(&ntt, &positions, &values, log_d);
                 assert_eq!(sparse, dense, "log_d={log_d}, nq={nq}");
             }
+        }
+    }
+
+    /// The fused production kernel must be byte-identical to the original
+    /// one-layer-at-a-time transpose, including the ranked proof's largest
+    /// induction domain (`log_d = 20`). Keep the oracle serial and structurally
+    /// independent so a shared parallel indexing bug cannot mask itself.
+    #[test]
+    fn transpose_fused_matches_single_layer_reference() {
+        use crate::challenger::Challenger;
+
+        fn transpose_single_layer_reference(
+            ntt: &AdditiveNttF128,
+            data: &mut [F128],
+            log_d: usize,
+        ) {
+            for layer in (0..log_d).rev() {
+                let num_blocks = 1usize << layer;
+                let block_size = 1usize << (log_d - layer);
+                let half = block_size >> 1;
+                for block in 0..num_blocks {
+                    let twiddle = ntt.twiddle(layer, block);
+                    let start = block * block_size;
+                    for row in 0..half {
+                        let top = data[start + row];
+                        let bottom = data[start + half + row];
+                        let sum = top + bottom;
+                        data[start + row] = sum;
+                        data[start + half + row] = twiddle * sum + bottom;
+                    }
+                }
+            }
+        }
+
+        for &log_d in &[3usize, 4, 5, 8, 12, 18, 20] {
+            let mut challenger =
+                crate::challenger::RandomChallenger::new(0xF053_DA7A ^ log_d as u64);
+            let mut expected = challenger.sample_f128_vec(1usize << log_d);
+            let mut actual = expected.clone();
+            let ntt = AdditiveNttF128::standard(log_d);
+
+            transpose_single_layer_reference(&ntt, &mut expected, log_d);
+            transpose_forward_ntt(&ntt, &mut actual, log_d);
+
+            assert_eq!(actual, expected, "log_d={log_d}");
         }
     }
 
