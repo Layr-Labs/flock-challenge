@@ -31,13 +31,7 @@ static POOL: Mutex<Vec<Vec<F128>>> = Mutex::new(Vec::new());
 /// open stage would fault fresh pages every prove (the pool denies malloc
 /// the page reuse it would otherwise get from the freed early-phase
 /// buffers) — measured as a +24% open_batch regression on M4 before this.
-///
-/// m=32 adds the SumcheckProver ping-pong spares: two half-size buffers per
-/// recursive level (~12 more live classes), so the cap is raised to keep
-/// steady-state below the eviction threshold — eviction must not fire in
-/// steady state, or the small ladder buffers (the ones this pool exists to
-/// keep resident) would be evicted first under the smallest-first policy.
-const MAX_POOLED: usize = 48;
+const MAX_POOLED: usize = 24;
 
 /// Take a length-`n` `F128` vector, preferring a pooled buffer (smallest
 /// capacity ≥ `n`); falls back to a fresh uninitialized allocation.
@@ -142,67 +136,6 @@ pub fn prewarm_prover(m: usize) {
 /// Release every pooled buffer back to the OS.
 pub fn clear() {
     POOL.lock().unwrap().clear();
-    POOL_U8.lock().unwrap().clear();
-}
-
-// ---------------------------------------------------------------------------
-// Byte-buffer pool (the lincheck stripe).
-//
-// The BLAKE3 witness path builds a `2^(m-3)`-byte lincheck stripe (`512 MiB`
-// at the ranked m=32) every prove and frees it after lincheck. Like the F128
-// pool above, this keeps the stripe's pages resident across the worker's
-// warm-up and timed proves instead of re-faulting ~32k pages per prove.
-// Contents are NOT cleared; callers must write every byte before reading
-// (the stripe transpose writes all of it — see
-// `r1cs_hashes::common::drive_witness_packed_and_lincheck_impl`).
-
-static POOL_U8: Mutex<Vec<Vec<u8>>> = Mutex::new(Vec::new());
-
-/// Only a handful of stripe-class buffers ever exist at once.
-const MAX_POOLED_U8: usize = 4;
-
-/// Take a length-`n` byte vector, preferring a pooled buffer (smallest
-/// capacity >= `n`); falls back to a fresh uninitialized allocation.
-/// Contents are UNINITIALIZED in both cases (write-before-read contract,
-/// same as [`take_f128`]).
-pub fn take_u8(n: usize) -> Vec<u8> {
-    {
-        let mut pool = POOL_U8.lock().unwrap();
-        let mut best: Option<usize> = None;
-        for (i, v) in pool.iter().enumerate() {
-            if v.capacity() >= n && best.is_none_or(|b| v.capacity() < pool[b].capacity()) {
-                best = Some(i);
-            }
-        }
-        if let Some(i) = best {
-            let mut v = pool.swap_remove(i);
-            // SAFETY: capacity >= n was checked above; u8: Copy (no Drop), so
-            // exposing stale bytes is sound to *hold* — the caller upholds
-            // write-before-read per this function's contract.
-            unsafe { v.set_len(n) };
-            return v;
-        }
-    }
-    crate::alloc_uninit_vec(n)
-}
-
-/// Return a byte buffer to the pool for reuse (smallest-first eviction when
-/// full, same policy as the F128 pool).
-pub fn give_u8(v: Vec<u8>) {
-    if v.capacity() == 0 {
-        return;
-    }
-    let mut pool = POOL_U8.lock().unwrap();
-    pool.push(v);
-    if pool.len() > MAX_POOLED_U8 {
-        let smallest = pool
-            .iter()
-            .enumerate()
-            .min_by_key(|(_, v)| v.capacity())
-            .map(|(i, _)| i)
-            .expect("pool non-empty");
-        pool.swap_remove(smallest);
-    }
 }
 
 #[cfg(test)]

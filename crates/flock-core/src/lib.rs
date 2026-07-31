@@ -19,7 +19,6 @@
 
 pub mod bits;
 pub mod challenger;
-pub(crate) mod epool;
 pub mod field;
 pub mod hash;
 pub mod lincheck;

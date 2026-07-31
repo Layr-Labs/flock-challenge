@@ -290,15 +290,12 @@ where
     let total_f128 = n_total * f128_per_block;
     // z/a/b are allocated uninitialized. Ordinary OR-based builders zero each
     // 8-block group inside the parallel loop; full-write builders initialize
-    // every word directly and skip that pass. `z_lincheck` comes from the
-    // scratch byte pool (UNINITIALIZED, possibly stale): the transpose below
-    // writes every byte of every group before anything reads it, and the
-    // caller returns it via `scratch::give_u8` after lincheck so the next
-    // prove reuses resident pages instead of re-faulting 2^(m-3) bytes.
+    // every word directly and skip that pass. `z_lincheck` stays
+    // `vec![0u8; _]` (lazy `alloc_zeroed`/mmap — no eager memset).
     let mut z = flock_core::scratch::take_f128(total_f128);
     let mut a = flock_core::scratch::take_f128(total_f128);
     let mut b = flock_core::scratch::take_f128(total_f128);
-    let mut z_lincheck = flock_core::scratch::take_u8((n_total / 8) * k);
+    let mut z_lincheck = vec![0u8; (n_total / 8) * k];
 
     z.par_chunks_mut(8 * f128_per_block)
         .zip(a.par_chunks_mut(8 * f128_per_block))
