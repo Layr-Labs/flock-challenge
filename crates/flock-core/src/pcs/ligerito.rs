@@ -2841,6 +2841,18 @@ fn direct_ab_fuse_init_enabled() -> bool {
     *ON.get_or_init(|| std::env::var_os("FLOCK_NO_DIRECT_AB_FUSE_INIT").is_none())
 }
 
+/// Whether the materializer fuses round-0 / round-1-lookahead accumulation
+/// into the slot write loop (deleting the post-write re-read of `f_out` /
+/// `b_out`).
+///
+/// `FLOCK_NO_DIRECT_AB_FUSE_MSG=1` restores the separate
+/// [`super::round0_and_round1_lookahead`] pass after materialization.
+fn direct_ab_fuse_msg_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("FLOCK_NO_DIRECT_AB_FUSE_MSG").is_none())
+}
+
 /// Materialize the combined sumcheck state only after its first two folds.
 /// `ordinary_basis` contains the incumbent C contribution; `claims` contains
 /// the AB contribution in sufficient-stat form. Both are γ-baked.
@@ -2886,6 +2898,13 @@ fn materialize_direct_ab_fold2(
     }));
 
     let fuse_init = direct_ab_fuse_init_enabled();
+    // Fuse message only on the ranked single-claim shape where every group of
+    // four outputs is produced by a pure assignment (no later RMW from extra
+    // claims). Multi-claim and control arms keep the separate pass.
+    let fuse_msg = fuse_init
+        && direct_ab_fuse_msg_enabled()
+        && claims.len() == 1
+        && block_len.is_multiple_of(4);
     let mut folded_f = crate::scratch::take_f128(out_len);
     let mut folded_b = crate::scratch::take_f128(out_len);
     let stats = folded_b
@@ -2922,26 +2941,66 @@ fn materialize_direct_ab_fold2(
                         first_table,
                         scratch,
                     );
-                    for slot in 0..block_len {
-                        let direct = super::ring_switch::fold_one_slot(
-                            first_claim.eq_lo[slot],
-                            scratch,
-                        );
-                        f_out[slot] = fold4(f_in, slot);
-                        b_out[slot] = direct + fold4(b_in, slot);
-                    }
-                    for (claim, direct_table) in rest_claims.iter().zip(rest_tables.iter()) {
-                        super::ring_switch::compose_fold_byte_table_into(
-                            claim.eq_hi[block],
-                            direct_table,
-                            scratch,
-                        );
-                        for (slot, out) in b_out.iter_mut().enumerate() {
-                            *out += super::ring_switch::fold_one_slot(
-                                claim.eq_lo[slot],
-                                scratch,
+                    if fuse_msg {
+                        // Ranked single-claim path: produce four slots and
+                        // accumulate their message contribution from live
+                        // register values — no post-write re-read of f_out/b_out.
+                        debug_assert!(rest_claims.is_empty());
+                        let mut u0 = F128::ZERO;
+                        let mut u2 = F128::ZERO;
+                        let mut c = [F128::ZERO; 6];
+                        for g in 0..(block_len / 4) {
+                            let mut fa = [F128::ZERO; 4];
+                            let mut ba = [F128::ZERO; 4];
+                            for k in 0..4 {
+                                let slot = 4 * g + k;
+                                let direct = super::ring_switch::fold_one_slot(
+                                    first_claim.eq_lo[slot],
+                                    scratch,
+                                );
+                                fa[k] = fold4(f_in, slot);
+                                ba[k] = direct + fold4(b_in, slot);
+                                f_out[slot] = fa[k];
+                                b_out[slot] = ba[k];
+                            }
+                            super::accumulate_round0_group(
+                                fa[0],
+                                fa[1],
+                                fa[2],
+                                fa[3],
+                                ba[0],
+                                ba[1],
+                                ba[2],
+                                ba[3],
+                                &mut u0,
+                                &mut u2,
+                                &mut c,
                             );
                         }
+                        ((u0, u2), c)
+                    } else {
+                        for slot in 0..block_len {
+                            let direct = super::ring_switch::fold_one_slot(
+                                first_claim.eq_lo[slot],
+                                scratch,
+                            );
+                            f_out[slot] = fold4(f_in, slot);
+                            b_out[slot] = direct + fold4(b_in, slot);
+                        }
+                        for (claim, direct_table) in rest_claims.iter().zip(rest_tables.iter()) {
+                            super::ring_switch::compose_fold_byte_table_into(
+                                claim.eq_hi[block],
+                                direct_table,
+                                scratch,
+                            );
+                            for (slot, out) in b_out.iter_mut().enumerate() {
+                                *out += super::ring_switch::fold_one_slot(
+                                    claim.eq_lo[slot],
+                                    scratch,
+                                );
+                            }
+                        }
+                        super::round0_and_round1_lookahead(f_out, b_out)
                     }
                 } else {
                     // Frontier control: zero-fill, sum all direct claims, then
@@ -2964,8 +3023,8 @@ fn materialize_direct_ab_fold2(
                         f_out[slot] = fold4(f_in, slot);
                         b_out[slot] += fold4(b_in, slot);
                     }
+                    super::round0_and_round1_lookahead(f_out, b_out)
                 }
-                super::round0_and_round1_lookahead(f_out, b_out)
             },
         )
         .reduce(

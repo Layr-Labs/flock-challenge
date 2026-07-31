@@ -202,6 +202,54 @@ struct CombinedClaim {
     direct_fold2: Option<Vec<ring_switch::DirectFold2Factors>>,
 }
 
+/// Accumulate one four-element group's contribution into the round-0 message
+/// and the six round-1 lookahead coefficients.
+///
+/// Extracted so the direct-AB materializer can fuse this into its write loop
+/// (deleting a full re-read of the just-written L/4 buffers) without
+/// duplicating the Karatsuba-cross arithmetic.
+#[inline(always)]
+pub(crate) fn accumulate_round0_group(
+    a0: F128,
+    a1: F128,
+    a2: F128,
+    a3: F128,
+    b0: F128,
+    b1: F128,
+    b2: F128,
+    b3: F128,
+    u0: &mut F128,
+    u2: &mut F128,
+    c: &mut [F128; 6],
+) {
+    let sa0 = a0 + a1;
+    let sb0 = b0 + b1;
+    let sa1 = a2 + a3;
+    let sb1 = b2 + b3;
+    let p_even0 = a0 * b0;
+    let p_sum0 = sa0 * sb0;
+    *u0 += p_even0 + a2 * b2;
+    *u2 += p_sum0 + sa1 * sb1;
+    c[0] += p_even0;
+    // Karatsuba cross term: a0*sb0 + b0*sa0 equals
+    // a1*b1 + (a0*b0) + (sa0*sb0). The endpoint products are already
+    // live for c0/c2, so this costs one product instead of two.
+    c[1] += a1 * b1 + p_even0 + p_sum0;
+    c[2] += p_sum0;
+    let e_a = a0 + a2;
+    let e_b = b0 + b2;
+    let se_a = sa0 + sa1;
+    let se_b = sb0 + sb1;
+    let p_even = e_a * e_b;
+    let p_sum = se_a * se_b;
+    // Same identity for the even/odd grouped pair. Here the complementary
+    // endpoint is (a1+a3, b1+b3).
+    let p_odd = (se_a + e_a) * (se_b + e_b);
+    c[3] += p_even;
+    c[4] += p_odd + p_even + p_sum;
+    c[5] += p_sum;
+}
+
 /// Compute the ordinary round-zero message and the following message as two
 /// quadratics in the first challenge. The latter lets the ranked prover sample
 /// its second challenge before binding the first, so both binds share one pass.
@@ -213,40 +261,19 @@ fn round0_and_round1_lookahead(witness: &[F128], basis: &[F128]) -> ((F128, F128
     let mut u2 = F128::ZERO;
     let mut c = [F128::ZERO; 6];
     for i in (0..witness.len()).step_by(4) {
-        let a0 = witness[i];
-        let a1 = witness[i + 1];
-        let a2 = witness[i + 2];
-        let a3 = witness[i + 3];
-        let b0 = basis[i];
-        let b1 = basis[i + 1];
-        let b2 = basis[i + 2];
-        let b3 = basis[i + 3];
-        let sa0 = a0 + a1;
-        let sb0 = b0 + b1;
-        let sa1 = a2 + a3;
-        let sb1 = b2 + b3;
-        let p_even0 = a0 * b0;
-        let p_sum0 = sa0 * sb0;
-        u0 += p_even0 + a2 * b2;
-        u2 += p_sum0 + sa1 * sb1;
-        c[0] += p_even0;
-        // Karatsuba cross term: a0*sb0 + b0*sa0 equals
-        // a1*b1 + (a0*b0) + (sa0*sb0). The endpoint products are already
-        // live for c0/c2, so this costs one product instead of two.
-        c[1] += a1 * b1 + p_even0 + p_sum0;
-        c[2] += p_sum0;
-        let e_a = a0 + a2;
-        let e_b = b0 + b2;
-        let se_a = sa0 + sa1;
-        let se_b = sb0 + sb1;
-        let p_even = e_a * e_b;
-        let p_sum = se_a * se_b;
-        // Same identity for the even/odd grouped pair. Here the complementary
-        // endpoint is (a1+a3, b1+b3).
-        let p_odd = (se_a + e_a) * (se_b + e_b);
-        c[3] += p_even;
-        c[4] += p_odd + p_even + p_sum;
-        c[5] += p_sum;
+        accumulate_round0_group(
+            witness[i],
+            witness[i + 1],
+            witness[i + 2],
+            witness[i + 3],
+            basis[i],
+            basis[i + 1],
+            basis[i + 2],
+            basis[i + 3],
+            &mut u0,
+            &mut u2,
+            &mut c,
+        );
     }
     ((u0, u2), c)
 }
