@@ -2833,6 +2833,94 @@ fn eval_lookahead(c: &[F128; 6], rho: F128) -> SumcheckMessage {
 /// Materialize the combined sumcheck state only after its first two folds.
 /// `ordinary_basis` contains the incumbent C contribution; `claims` contains
 /// the AB contribution in sufficient-stat form. Both are γ-baked.
+/// Vector-resident fold-4 helpers for the direct materializer's witness and
+/// ordinary-basis legs. The scalar `fold4` closure below performs three
+/// F128 multiplies per output slot through the `{ lo, hi }` struct boundary —
+/// the same GPR↔NEON round-tripping the promoted vector-resident NTT row
+/// kernels eliminate. Here the four inputs, both challenge constants, and
+/// every intermediate stay in `uint64x2_t`; the multiply is the identical
+/// four-PMULL schoolbook + two-stage reduction as `ghash_mul_binius`, so the
+/// output bits are unchanged.
+#[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+pub(crate) mod qfold {
+    use crate::field::F128;
+    use core::arch::aarch64::*;
+
+    #[inline(always)]
+    unsafe fn pmull(a: u64, b: u64) -> uint64x2_t {
+        unsafe { core::mem::transmute::<u128, uint64x2_t>(vmull_p64(a, b)) }
+    }
+
+    #[cfg(target_feature = "sha3")]
+    #[inline(always)]
+    unsafe fn xor3(a: uint64x2_t, b: uint64x2_t, c: uint64x2_t) -> uint64x2_t {
+        unsafe { veor3q_u64(a, b, c) }
+    }
+
+    #[cfg(not(target_feature = "sha3"))]
+    #[inline(always)]
+    unsafe fn xor3(a: uint64x2_t, b: uint64x2_t, c: uint64x2_t) -> uint64x2_t {
+        unsafe { veorq_u64(a, veorq_u64(b, c)) }
+    }
+
+    /// GHASH multiply with operands and result in q registers — the
+    /// `ghash_mul_binius` algorithm without the `F128` repack on entry/exit.
+    #[inline(always)]
+    pub(crate) unsafe fn mul_q(a: uint64x2_t, b: uint64x2_t) -> uint64x2_t {
+        unsafe {
+            let zero = vdupq_n_u64(0);
+            let t0 = pmull(vgetq_lane_u64::<0>(a), vgetq_lane_u64::<0>(b));
+            let t1a = pmull(vgetq_lane_u64::<0>(a), vgetq_lane_u64::<1>(b));
+            let t1b = pmull(vgetq_lane_u64::<1>(a), vgetq_lane_u64::<0>(b));
+            let t2 = core::mem::transmute::<u128, uint64x2_t>(vmull_high_p64(
+                vreinterpretq_p64_u64(a),
+                vreinterpretq_p64_u64(b),
+            ));
+            let t1_cross = veorq_u64(t1a, t1b);
+            let t1 = xor3(
+                t1_cross,
+                vextq_u64::<1>(zero, t2),
+                pmull(vgetq_lane_u64::<1>(t2), 0x87),
+            );
+            xor3(
+                t0,
+                vextq_u64::<1>(zero, t1),
+                pmull(vgetq_lane_u64::<1>(t1), 0x87),
+            )
+        }
+    }
+
+    /// `((a0 + r0·(a0+a1)) + r1·(low+high))` over four consecutive inputs —
+    /// the fold-2-pair contraction, entirely in q registers.
+    #[inline(always)]
+    pub(super) unsafe fn fold4_q(
+        input: *const F128,
+        r0: uint64x2_t,
+        r1: uint64x2_t,
+    ) -> uint64x2_t {
+        unsafe {
+            let p = input.cast::<u64>();
+            let a0 = vld1q_u64(p);
+            let a1 = vld1q_u64(p.add(2));
+            let a2 = vld1q_u64(p.add(4));
+            let a3 = vld1q_u64(p.add(6));
+            let low = veorq_u64(a0, mul_q(veorq_u64(a0, a1), r0));
+            let high = veorq_u64(a2, mul_q(veorq_u64(a2, a3), r0));
+            veorq_u64(low, mul_q(veorq_u64(low, high), r1))
+        }
+    }
+
+    /// Whether the vector-resident fold-4 legs are used.
+    /// `FLOCK_NO_NEON_FOLD4=1` restores the scalar `F128`-typed chain in the
+    /// same binary. Read once per process.
+    #[inline]
+    pub(super) fn enabled() -> bool {
+        use std::sync::OnceLock;
+        static ON: OnceLock<bool> = OnceLock::new();
+        *ON.get_or_init(|| std::env::var_os("FLOCK_NO_NEON_FOLD4").is_none())
+    }
+}
+
 fn materialize_direct_ab_fold2(
     packed_witness: Vec<F128>,
     ordinary_basis: Vec<F128>,
@@ -2877,22 +2965,73 @@ fn materialize_direct_ab_fold2(
         .map_init(
             || vec![F128::ZERO; super::ring_switch::FOLD_TABLE_LEN],
             |scratch, (block, (b_out, f_out))| {
-                b_out.fill(F128::ZERO);
-                for (claim, direct_table) in claims.iter().zip(direct_tables.iter()) {
+                // First claim ASSIGNS its slot values; later claims add. This
+                // deletes the 128 MiB zero-fill pass (and its read-modify
+                // dependency) that previously initialized every output before
+                // the first claim's add — the direct-claim list is asserted
+                // non-empty, so every element is written before it is read.
+                // Mechanism credit: zeeshan8281's `0ebe3ec` note; same
+                // opt-out name for continuity. Process-cached.
+                let assign_first = {
+                    use std::sync::OnceLock;
+                    static ON: OnceLock<bool> = OnceLock::new();
+                    *ON.get_or_init(|| {
+                        std::env::var_os("FLOCK_NO_DIRECT_AB_ASSIGN_FIRST").is_none()
+                    })
+                };
+                if !assign_first {
+                    b_out.fill(F128::ZERO);
+                }
+                for (ci, (claim, direct_table)) in
+                    claims.iter().zip(direct_tables.iter()).enumerate()
+                {
                     super::ring_switch::compose_fold_byte_table_into(
                         claim.eq_hi[block],
                         direct_table,
                         scratch,
                     );
-                    for (slot, out) in b_out.iter_mut().enumerate() {
-                        *out +=
-                            super::ring_switch::fold_one_slot(claim.eq_lo[slot], scratch);
+                    if assign_first && ci == 0 {
+                        for (slot, out) in b_out.iter_mut().enumerate() {
+                            *out =
+                                super::ring_switch::fold_one_slot(claim.eq_lo[slot], scratch);
+                        }
+                    } else {
+                        for (slot, out) in b_out.iter_mut().enumerate() {
+                            *out +=
+                                super::ring_switch::fold_one_slot(claim.eq_lo[slot], scratch);
+                        }
                     }
                 }
 
                 let start = 4 * block * block_len;
                 let f_in = &packed_witness[start..start + 4 * block_len];
                 let b_in = &ordinary_basis[start..start + 4 * block_len];
+                #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+                if qfold::enabled() {
+                    // SAFETY: `aes` is statically enabled by the cfg gate;
+                    // every pointer below stays inside the four bounds-checked
+                    // slices (`4*slot + 3 < 4*block_len`), and F128 is
+                    // repr(C, align(16)) `{ lo, hi }` = little-endian
+                    // uint64x2_t lane order, so loads/stores are
+                    // reinterpretations. Bit-identical to the scalar chain.
+                    unsafe {
+                        use core::arch::aarch64::*;
+                        let r0q = vld1q_u64((&raw const r0).cast::<u64>());
+                        let r1q = vld1q_u64((&raw const r1).cast::<u64>());
+                        let f_in_p = f_in.as_ptr();
+                        let b_in_p = b_in.as_ptr();
+                        let f_out_p = f_out.as_mut_ptr();
+                        let b_out_p = b_out.as_mut_ptr();
+                        for slot in 0..block_len {
+                            let fv = qfold::fold4_q(f_in_p.add(4 * slot), r0q, r1q);
+                            vst1q_u64(f_out_p.add(slot).cast::<u64>(), fv);
+                            let bv = qfold::fold4_q(b_in_p.add(4 * slot), r0q, r1q);
+                            let acc = vld1q_u64(b_out_p.add(slot).cast::<u64>());
+                            vst1q_u64(b_out_p.add(slot).cast::<u64>(), veorq_u64(acc, bv));
+                        }
+                    }
+                    return super::round0_and_round1_lookahead(f_out, b_out);
+                }
                 for slot in 0..block_len {
                     let fold4 = |input: &[F128]| {
                         let a0 = input[4 * slot];

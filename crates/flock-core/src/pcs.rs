@@ -209,6 +209,10 @@ struct CombinedClaim {
 fn round0_and_round1_lookahead(witness: &[F128], basis: &[F128]) -> ((F128, F128), [F128; 6]) {
     assert_eq!(witness.len(), basis.len());
     assert!(witness.len().is_multiple_of(4));
+    #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+    if neon_lookahead_enabled() {
+        return round0_and_round1_lookahead_neon(witness, basis);
+    }
     let mut u0 = F128::ZERO;
     let mut u2 = F128::ZERO;
     let mut c = [F128::ZERO; 6];
@@ -250,6 +254,101 @@ fn round0_and_round1_lookahead(witness: &[F128], basis: &[F128]) -> ((F128, F128
     }
     ((u0, u2), c)
 }
+/// Vector-resident twin of [`round0_and_round1_lookahead`]: the eight
+/// bilinear accumulators, all four witness/basis pair loads, and every
+/// intermediate stay in `uint64x2_t` across the sweep. This kernel runs over
+/// the FULL witness at L in the fused combine and again at L/4 in the direct
+/// materializer — ~9 scalar F128 multiplies per 4-element group otherwise
+/// round-trip the register files (~10^8 multiplies per ranked proof), the
+/// same movement the promoted vector-resident NTT kernels delete. The
+/// multiply is `ligerito::qfold::mul_q` (the exact `ghash_mul_binius` word
+/// sequence in-register), XOR is `veorq`, so output bits are unchanged.
+#[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+fn round0_and_round1_lookahead_neon(
+    witness: &[F128],
+    basis: &[F128],
+) -> ((F128, F128), [F128; 6]) {
+    use core::arch::aarch64::*;
+    use ligerito::qfold::mul_q;
+    debug_assert_eq!(witness.len(), basis.len());
+    debug_assert!(witness.len().is_multiple_of(4));
+    // SAFETY: `aes` is statically enabled by the cfg gate; every load below
+    // stays inside the equal-length slices (indices `4g..4g+4`, `g` bounded by
+    // the loop), and F128 is repr(C, align(16)) `{ lo, hi }` — little-endian
+    // uint64x2_t lane order — so loads are reinterpretations.
+    unsafe {
+        let zero = vdupq_n_u64(0);
+        let mut u0 = zero;
+        let mut u2 = zero;
+        let mut acc = [zero; 6];
+        let wp = witness.as_ptr().cast::<u64>();
+        let bp = basis.as_ptr().cast::<u64>();
+        for g in 0..witness.len() / 4 {
+            let w = wp.add(8 * g);
+            let b = bp.add(8 * g);
+            let a0 = vld1q_u64(w);
+            let a1 = vld1q_u64(w.add(2));
+            let a2 = vld1q_u64(w.add(4));
+            let a3 = vld1q_u64(w.add(6));
+            let b0 = vld1q_u64(b);
+            let b1 = vld1q_u64(b.add(2));
+            let b2 = vld1q_u64(b.add(4));
+            let b3 = vld1q_u64(b.add(6));
+
+            let sa0 = veorq_u64(a0, a1);
+            let sb0 = veorq_u64(b0, b1);
+            let sa1 = veorq_u64(a2, a3);
+            let sb1 = veorq_u64(b2, b3);
+            let p_even0 = mul_q(a0, b0);
+            let p_sum0 = mul_q(sa0, sb0);
+            u0 = veorq_u64(u0, veorq_u64(p_even0, mul_q(a2, b2)));
+            u2 = veorq_u64(u2, veorq_u64(p_sum0, mul_q(sa1, sb1)));
+            acc[0] = veorq_u64(acc[0], p_even0);
+            // Karatsuba cross term, exactly as the scalar chain.
+            acc[1] = veorq_u64(
+                acc[1],
+                veorq_u64(mul_q(a1, b1), veorq_u64(p_even0, p_sum0)),
+            );
+            acc[2] = veorq_u64(acc[2], p_sum0);
+            let e_a = veorq_u64(a0, a2);
+            let e_b = veorq_u64(b0, b2);
+            let se_a = veorq_u64(sa0, sa1);
+            let se_b = veorq_u64(sb0, sb1);
+            let p_even = mul_q(e_a, e_b);
+            let p_sum = mul_q(se_a, se_b);
+            let p_odd = mul_q(veorq_u64(se_a, e_a), veorq_u64(se_b, e_b));
+            acc[3] = veorq_u64(acc[3], p_even);
+            acc[4] = veorq_u64(acc[4], veorq_u64(p_odd, veorq_u64(p_even, p_sum)));
+            acc[5] = veorq_u64(acc[5], p_sum);
+        }
+        let out = |v: uint64x2_t| F128 {
+            lo: vgetq_lane_u64::<0>(v),
+            hi: vgetq_lane_u64::<1>(v),
+        };
+        (
+            (out(u0), out(u2)),
+            [
+                out(acc[0]),
+                out(acc[1]),
+                out(acc[2]),
+                out(acc[3]),
+                out(acc[4]),
+                out(acc[5]),
+            ],
+        )
+    }
+}
+
+/// Whether the vector-resident lookahead kernel is used.
+/// `FLOCK_NO_NEON_LOOKAHEAD=1` restores the scalar chain in the same binary.
+#[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+#[inline]
+fn neon_lookahead_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("FLOCK_NO_NEON_LOOKAHEAD").is_none())
+}
+
 fn messages_from_direct_products(
     products: &[ring_switch::DirectFold2Factors],
 ) -> ((F128, F128), [F128; 6]) {
