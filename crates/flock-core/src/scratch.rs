@@ -117,6 +117,18 @@ pub fn give_f128(v: Vec<F128>) {
 /// allocation. Total ranked retention remains ~6 GiB, but with the requested
 /// size classes rather than oversized substitutes. Release with [`clear`].
 pub fn prewarm_prover(m: usize) {
+    prewarm_prover_impl(m, true);
+}
+
+/// Pre-warm the prove-cycle F128 buffers without reserving the legacy
+/// lincheck byte stripe. The ranked row-major lincheck path folds directly
+/// from the canonical packed witness, so allocating and first-touching that
+/// extra `2^(m-3)`-byte buffer would be pure setup overhead.
+pub fn prewarm_prover_without_lincheck_stripe(m: usize) {
+    prewarm_prover_impl(m, false);
+}
+
+fn prewarm_prover_impl(m: usize, include_lincheck_stripe: bool) {
     use rayon::prelude::*;
     if m < 7 {
         return;
@@ -137,7 +149,7 @@ pub fn prewarm_prover(m: usize) {
             bufs.push(take_f128(ping_pong));
         }
     }
-    let mut stripe = take_u8(stripe_bytes);
+    let mut stripe = include_lincheck_stripe.then(|| take_u8(stripe_bytes));
     // First-touch every page of every buffer, all cores. Already-resident
     // (re-warmed) buffers cost a fast memset; fresh ones fault here, once.
     bufs.par_iter_mut().for_each(|b| {
@@ -146,14 +158,18 @@ pub fn prewarm_prover(m: usize) {
             unsafe { std::ptr::write_bytes(chunk.as_mut_ptr(), 0u8, chunk.len()) }
         });
     });
-    stripe.par_chunks_mut(1 << 20).for_each(|chunk| {
-        // SAFETY: u8 has no invalid bit patterns and every byte is written.
-        unsafe { std::ptr::write_bytes(chunk.as_mut_ptr(), 0u8, chunk.len()) }
-    });
+    if let Some(stripe) = stripe.as_mut() {
+        stripe.par_chunks_mut(1 << 20).for_each(|chunk| {
+            // SAFETY: u8 has no invalid bit patterns and every byte is written.
+            unsafe { std::ptr::write_bytes(chunk.as_mut_ptr(), 0u8, chunk.len()) }
+        });
+    }
     for b in bufs {
         give_f128(b);
     }
-    give_u8(stripe);
+    if let Some(stripe) = stripe {
+        give_u8(stripe);
+    }
 }
 
 /// Release every pooled buffer back to the OS.

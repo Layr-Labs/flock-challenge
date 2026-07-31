@@ -716,11 +716,7 @@ impl<'a> ReverseTranspose<'a> {
 
     #[inline]
     fn xor_rot(&mut self, x: usize, y: usize, rotation: usize) -> usize {
-        self.push(ReverseWordOp::XorRot {
-            x,
-            y,
-            rotation,
-        })
+        self.push(ReverseWordOp::XorRot { x, y, rotation })
     }
 
     /// Register one carry-only addition and all 31 nonlinear rows that define
@@ -798,8 +794,6 @@ impl<'a> ReverseTranspose<'a> {
     }
 }
 
-
-
 pub struct Blake3LincheckCircuit;
 
 impl flock_core::lincheck::LincheckCircuit for Blake3LincheckCircuit {
@@ -859,27 +853,15 @@ impl flock_core::lincheck::LincheckCircuit for Blake3LincheckCircuit {
                 let [mx_idx, my_idx] = PER_ROUND_MSG_IDX[r][g_in_round];
                 let [a, b, c, d] = [state[la], state[lb], state[lc], state[ld]];
 
-                let tmp_0 =
-                    reverse.add(a, b, g_add_carry_bit(g, ADD_TMP0, 0));
-                let a_1 = reverse.add(
-                    tmp_0,
-                    messages[mx_idx],
-                    g_add_carry_bit(g, ADD_A1, 0),
-                );
+                let tmp_0 = reverse.add(a, b, g_add_carry_bit(g, ADD_TMP0, 0));
+                let a_1 = reverse.add(tmp_0, messages[mx_idx], g_add_carry_bit(g, ADD_A1, 0));
                 let d_1 = reverse.xor_rot(d, a_1, 16);
-                let c_1 =
-                    reverse.add(c, d_1, g_add_carry_bit(g, ADD_C1, 0));
+                let c_1 = reverse.add(c, d_1, g_add_carry_bit(g, ADD_C1, 0));
                 let b_1 = reverse.xor_rot(b, c_1, 12);
-                let tmp_1 =
-                    reverse.add(a_1, b_1, g_add_carry_bit(g, ADD_TMP1, 0));
-                let a_2 = reverse.add(
-                    tmp_1,
-                    messages[my_idx],
-                    g_add_carry_bit(g, ADD_A2, 0),
-                );
+                let tmp_1 = reverse.add(a_1, b_1, g_add_carry_bit(g, ADD_TMP1, 0));
+                let a_2 = reverse.add(tmp_1, messages[my_idx], g_add_carry_bit(g, ADD_A2, 0));
                 let d_2 = reverse.xor_rot(d_1, a_2, 8);
-                let c_2 =
-                    reverse.add(c_1, d_2, g_add_carry_bit(g, ADD_C2, 0));
+                let c_2 = reverse.add(c_1, d_2, g_add_carry_bit(g, ADD_C2, 0));
 
                 let b_new = reverse.xor_rot(b_1, c_2, 7);
                 for i in 0..WORD_BITS {
@@ -1119,21 +1101,21 @@ fn write_lin_word_ab_packed(bit_off: usize, val: u32, z: &mut [u64], a: &mut [u6
 /// Sequential full-word writer for one packed block. Unlike the generic
 /// OR-based helpers, this never reads the destination and initializes every
 /// word, allowing the outer driver to skip its 1.5-GiB ranked zero pass.
-struct PackedWordWriter {
-    out: *mut u64,
+struct PackedWordWriter<'a> {
+    out: &'a mut [u64],
     word: usize,
     pending: u64,
     used: usize,
 }
 
-impl PackedWordWriter {
+impl<'a> PackedWordWriter<'a> {
     #[inline(always)]
-    fn at(out: *mut u64, word: usize, pending: u64, used: usize) -> Self {
+    fn new(out: &'a mut [u64]) -> Self {
         Self {
             out,
-            word,
-            pending,
-            used,
+            word: 0,
+            pending: 0,
+            used: 0,
         }
     }
 
@@ -1146,11 +1128,7 @@ impl PackedWordWriter {
             value & ((1u64 << width) - 1)
         };
         if self.used == 0 && width == 64 {
-            // SAFETY: the fixed BLAKE3 layout emits exactly `K / 64` words;
-            // the caller supplies a distinct block-sized destination.
-            unsafe {
-                self.out.add(self.word).write(value);
-            }
+            self.out[self.word] = value;
             self.word += 1;
             return;
         }
@@ -1159,13 +1137,7 @@ impl PackedWordWriter {
             self.pending |= value << self.used;
             self.used += width;
         } else {
-            // SAFETY: the fixed BLAKE3 layout emits exactly `K / 64` words;
-            // the caller supplies a distinct block-sized destination.
-            unsafe {
-                self.out
-                    .add(self.word)
-                    .write(self.pending | (value << self.used));
-            }
+            self.out[self.word] = self.pending | (value << self.used);
             self.word += 1;
             if width == room {
                 self.pending = 0;
@@ -1197,29 +1169,21 @@ impl PackedWordWriter {
     }
 
     #[inline]
-    fn finish(mut self, total_words: usize) {
+    fn finish(mut self) {
         if self.used != 0 {
-            // SAFETY: see `push`; a partial final word is still within the
-            // fixed-size block.
-            unsafe {
-                self.out.add(self.word).write(self.pending);
-            }
+            self.out[self.word] = self.pending;
             self.word += 1;
         }
-        debug_assert!(self.word <= total_words);
-        // SAFETY: the unwritten suffix is within the same block-sized output.
-        unsafe {
-            std::ptr::write_bytes(self.out.add(self.word), 0, total_words - self.word);
-        }
+        self.out[self.word..].fill(0);
     }
 }
 
 #[inline(always)]
 fn stream_lin_word(
     value: u32,
-    z: &mut PackedWordWriter,
-    a: &mut PackedWordWriter,
-    b: &mut PackedWordWriter,
+    z: &mut PackedWordWriter<'_>,
+    a: &mut PackedWordWriter<'_>,
+    b: &mut PackedWordWriter<'_>,
 ) {
     z.push(value as u64, 32);
     a.push(value as u64, 32);
@@ -1372,48 +1336,34 @@ fn build_block_witness_ab_stream_into(
     debug_assert_eq!(a.len(), U64_PER_BLOCK);
     debug_assert_eq!(b.len(), U64_PER_BLOCK);
 
+    let mut wz = PackedWordWriter::new(z);
+    let mut wa = PackedWordWriter::new(a);
+    let mut wb = PackedWordWriter::new(b);
+
+    // Layout prefix: cv, then the aligned out_lo slot whose value is not known
+    // until after the seven rounds.
+    for &value in cv {
+        stream_lin_word(value, &mut wz, &mut wa, &mut wb);
+    }
+    for _ in 0..8 {
+        wz.push(0, 32);
+        wa.push(0, 32);
+        wb.push(0, 32);
+    }
+
+    // Constant pin, message, counter, length, and flags are contiguous.
+    wz.push(1, 1);
+    wa.push(1, 1);
+    wb.push(1, 1);
+    for &value in m {
+        stream_lin_word(value, &mut wz, &mut wa, &mut wb);
+    }
     let counter_lo = counter as u32;
     let counter_hi = (counter >> 32) as u32;
-
-    // Initialize the fixed 1,153-bit prefix directly. This leaves each writer
-    // at word 18 with exactly one pending bit, which makes the subsequent
-    // generated G sequence start from a compile-time-known packing phase.
-    let z_ptr = z.as_mut_ptr();
-    let a_ptr = a.as_mut_ptr();
-    let b_ptr = b.as_mut_ptr();
-    unsafe {
-        for i in 0..4 {
-            let value = (cv[2 * i] as u64) | ((cv[2 * i + 1] as u64) << 32);
-            z_ptr.add(i).write(value);
-            a_ptr.add(i).write(value);
-            b_ptr.add(i).write(u64::MAX);
-        }
-        std::ptr::write_bytes(z_ptr.add(4), 0, 4);
-        std::ptr::write_bytes(a_ptr.add(4), 0, 4);
-        std::ptr::write_bytes(b_ptr.add(4), 0, 4);
-
-        let values = [
-            m[0], m[1], m[2], m[3], m[4], m[5], m[6], m[7], m[8], m[9], m[10], m[11],
-            m[12], m[13], m[14], m[15], counter_lo, counter_hi, block_len, flags,
-        ];
-        for i in 0..10 {
-            let low = if i == 0 {
-                1
-            } else {
-                (values[2 * i - 1] >> 31) as u64
-            };
-            let value = low
-                | ((values[2 * i] as u64) << 1)
-                | ((values[2 * i + 1] as u64) << 33);
-            z_ptr.add(8 + i).write(value);
-            a_ptr.add(8 + i).write(value);
-            b_ptr.add(8 + i).write(u64::MAX);
-        }
-    }
-    let pending = (flags >> 31) as u64;
-    let mut wz = PackedWordWriter::at(z_ptr, 18, pending, 1);
-    let mut wa = PackedWordWriter::at(a_ptr, 18, pending, 1);
-    let mut wb = PackedWordWriter::at(b_ptr, 18, 1, 1);
+    stream_lin_word(counter_lo, &mut wz, &mut wa, &mut wb);
+    stream_lin_word(counter_hi, &mut wz, &mut wa, &mut wb);
+    stream_lin_word(block_len, &mut wz, &mut wa, &mut wb);
+    stream_lin_word(flags, &mut wz, &mut wa, &mut wb);
     debug_assert_eq!(wz.position(), GS_BASE);
 
     let mut state: [u32; 16] = [
@@ -1434,19 +1384,18 @@ fn build_block_witness_ab_stream_into(
         block_len,
         flags,
     ];
-    // The circuit shape and message schedule are fixed. Expanding all 56 Gs
-    // gives LLVM literal state/message indices and exposes the complete
-    // dependency graph to register allocation. This is also the source-level
-    // model for a generated AArch64 kernel: allocation and Rayon stay in Rust,
-    // while only this fixed inner computation is specialized.
-    macro_rules! g {
-        ($la:literal, $lb:literal, $lc:literal, $ld:literal, $mx:literal, $my:literal) => {{
-            let mx = m[$mx];
-            let my = m[$my];
-            let a_val = state[$la];
-            let b_val = state[$lb];
-            let c_val = state[$lc];
-            let d_val = state[$ld];
+    let msg_idx = &PER_ROUND_MSG_IDX;
+    for r in 0..N_ROUNDS {
+        for g_in_round in 0..N_G_PER_ROUND {
+            let [la, lb, lc, ld] = G_LANES[g_in_round];
+            let [mx_i, my_i] = msg_idx[r][g_in_round];
+            let mx = m[mx_i];
+            let my = m[my_i];
+
+            let a_val = state[la];
+            let b_val = state[lb];
+            let c_val = state[lc];
+            let d_val = state[ld];
 
             let mut rz = BitRecord::<4>::new();
             let mut ra = BitRecord::<4>::new();
@@ -1484,34 +1433,12 @@ fn build_block_witness_ab_stream_into(
             wa.push_record(&ra, G_STRIDE);
             wb.push_record(&rb, G_STRIDE);
 
-            state[$la] = a_2;
-            state[$lb] = b_new;
-            state[$lc] = c_2;
-            state[$ld] = d_new;
-        }};
+            state[la] = a_2;
+            state[lb] = b_new;
+            state[lc] = c_2;
+            state[ld] = d_new;
+        }
     }
-    macro_rules! round {
-        ($m0:literal, $m1:literal, $m2:literal, $m3:literal,
-         $m4:literal, $m5:literal, $m6:literal, $m7:literal,
-         $m8:literal, $m9:literal, $m10:literal, $m11:literal,
-         $m12:literal, $m13:literal, $m14:literal, $m15:literal) => {{
-            g!(0, 4, 8, 12, $m0, $m1);
-            g!(1, 5, 9, 13, $m2, $m3);
-            g!(2, 6, 10, 14, $m4, $m5);
-            g!(3, 7, 11, 15, $m6, $m7);
-            g!(0, 5, 10, 15, $m8, $m9);
-            g!(1, 6, 11, 12, $m10, $m11);
-            g!(2, 7, 8, 13, $m12, $m13);
-            g!(3, 4, 9, 14, $m14, $m15);
-        }};
-    }
-    round!(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15);
-    round!(2, 6, 3, 10, 7, 0, 4, 13, 1, 11, 12, 5, 9, 14, 15, 8);
-    round!(3, 4, 10, 12, 13, 2, 7, 14, 6, 5, 9, 0, 11, 15, 8, 1);
-    round!(10, 7, 12, 9, 14, 3, 13, 15, 4, 0, 11, 2, 5, 8, 1, 6);
-    round!(12, 13, 9, 11, 15, 10, 14, 8, 7, 2, 5, 3, 0, 1, 6, 4);
-    round!(9, 14, 11, 5, 8, 12, 15, 1, 13, 3, 0, 10, 2, 6, 4, 7);
-    round!(11, 15, 5, 0, 1, 9, 8, 6, 14, 10, 2, 12, 3, 4, 7, 13);
     debug_assert_eq!(wz.position(), OUT_HI_BASE);
 
     let out_lo: [u32; 8] = std::array::from_fn(|w| state[w] ^ state[w + 8]);
@@ -1520,9 +1447,9 @@ fn build_block_witness_ab_stream_into(
     }
     debug_assert_eq!(wz.position(), USEFUL_BITS);
 
-    wz.finish(U64_PER_BLOCK);
-    wa.finish(U64_PER_BLOCK);
-    wb.finish(U64_PER_BLOCK);
+    wz.finish();
+    wa.finish();
+    wb.finish();
 
     // OUT_LO_BASE is 256-bit aligned, so the four reserved words can be
     // replaced without touching neighboring rows.
@@ -1683,6 +1610,43 @@ fn generate_witness_with_ab_packed_and_lincheck_impl(
     }
 }
 
+/// Exact full-write witness producer used when lincheck folds directly from
+/// the canonical row-major packed witness. Unlike the public striped producer,
+/// this never allocates or writes `z_lincheck`.
+fn generate_witness_with_ab_packed_without_lincheck_stripe(
+    blocks: &[Compression],
+    n_blocks_log: usize,
+    rate2_codeword: Option<&mut [flock_core::field::F128]>,
+) -> (
+    Vec<flock_core::field::F128>,
+    Vec<flock_core::field::F128>,
+    Vec<flock_core::field::F128>,
+) {
+    let padding: Compression = ([0u32; 8], [0u32; 16], 0u64, 0u32, 0u32);
+    let per_block =
+        |block: &Compression, z_u64: &mut [u64], a_u64: &mut [u64], b_u64: &mut [u64]| {
+            let (cv, m, t, bl, fl) = block;
+            build_block_witness_ab_stream_into(cv, m, *t, *bl, *fl, z_u64, a_u64, b_u64);
+        };
+    match rate2_codeword {
+        Some(codeword) => super::common::drive_witness_packed_full_write_with_rate2_codeword(
+            blocks,
+            &padding,
+            n_blocks_log,
+            K_LOG,
+            codeword,
+            per_block,
+        ),
+        None => super::common::drive_witness_packed_full_write(
+            blocks,
+            &padding,
+            n_blocks_log,
+            K_LOG,
+            per_block,
+        ),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Convenience API: Blake3Setup
 // ---------------------------------------------------------------------------
@@ -1769,9 +1733,19 @@ impl Blake3Setup {
             && self.r1cs.b_0.num_cols == K
             && self.pcs_params.log_inv_rate == 1
             && self.pcs_params.log_batch_size == 6
-            && self.pcs_params.profile
-                == flock_core::pcs::ligerito::LigeritoProfile::Fast
+            && self.pcs_params.profile == flock_core::pcs::ligerito::LigeritoProfile::Fast
             && std::env::var_os("FLOCK_NO_BLAKE3_REVERSE_LINCHECK").is_none()
+    }
+
+    /// Fold lincheck's outer variables directly from the canonical row-major
+    /// packed witness for the exact ranked geometry. The explicit opt-out is
+    /// the same-binary A/B control and restores the complete striped path.
+    #[inline]
+    fn use_ranked_row_major_lincheck_fold(&self) -> bool {
+        self.use_ranked_rate2_hot_codeword()
+            && self.use_ranked_reverse_lincheck()
+            && std::env::var_os("FLOCK_FULL_STRIPE").is_none()
+            && std::env::var_os("FLOCK_NO_LINCHECK_ROW_MAJOR_FOLD").is_none()
     }
 
     #[inline]
@@ -1797,6 +1771,28 @@ impl Blake3Setup {
             blocks,
             self.n_blocks_log(),
             &mut codeword,
+        );
+        (codeword, witness)
+    }
+
+    fn generate_witness_ab_without_lincheck_stripe(
+        &self,
+        blocks: &[Compression],
+    ) -> (Vec<F128>, Vec<F128>, Vec<F128>) {
+        debug_assert!(self.use_ranked_row_major_lincheck_fold());
+        generate_witness_with_ab_packed_without_lincheck_stripe(blocks, self.n_blocks_log(), None)
+    }
+
+    fn generate_witness_ab_without_lincheck_stripe_with_rate2_codeword(
+        &self,
+        blocks: &[Compression],
+    ) -> (Vec<F128>, (Vec<F128>, Vec<F128>, Vec<F128>)) {
+        debug_assert!(self.use_ranked_row_major_lincheck_fold());
+        let mut codeword = flock_core::scratch::take_f128(self.pcs_params.codeword_len_f128());
+        let witness = generate_witness_with_ab_packed_without_lincheck_stripe(
+            blocks,
+            self.n_blocks_log(),
+            Some(&mut codeword),
         );
         (codeword, witness)
     }
@@ -1851,7 +1847,11 @@ impl Blake3Setup {
         if !setup.use_ranked_reverse_lincheck() {
             setup.r1cs.csc_lincheck_circuit();
         }
-        flock_core::scratch::prewarm_prover(setup.r1cs.m);
+        if setup.use_ranked_row_major_lincheck_fold() {
+            flock_core::scratch::prewarm_prover_without_lincheck_stripe(setup.r1cs.m);
+        } else {
+            flock_core::scratch::prewarm_prover(setup.r1cs.m);
+        }
         setup
     }
 
@@ -1951,6 +1951,29 @@ impl Blake3Setup {
                 let codeword = flock_core::scratch::take_f128(self.pcs_params.codeword_len_f128());
                 let cpu_wit = phase_timing.then(crate::prover::process_cpu_ms);
                 let t_wit = std::time::Instant::now();
+                if self.use_ranked_row_major_lincheck_fold() {
+                    let (z_packed, a_packed_f128, b_packed_f128) =
+                        self.generate_witness_ab_without_lincheck_stripe(blocks);
+                    if phase_timing {
+                        let wall = t_wit.elapsed().as_secs_f64() * 1e3;
+                        let cpu = crate::prover::process_cpu_ms() - cpu_wit.unwrap_or(0.0);
+                        eprintln!(
+                            "[phase-timing] witgen (from-msg,row-major-lc): {wall:.2} ms cpu={cpu:.1} util={:.1}",
+                            cpu / wall
+                        );
+                    }
+                    let lc_circuit = self.lincheck_circuit();
+                    return crate::prover::prove_fast_ligerito_from_row_major_witness(
+                        &self.r1cs,
+                        &self.pcs_params,
+                        z_packed,
+                        a_packed_f128,
+                        b_packed_f128,
+                        lc_circuit,
+                        Some(codeword),
+                        challenger,
+                    );
+                }
                 let (z_packed, a_packed_f128, b_packed_f128, z_packed_lincheck) =
                     self.generate_witness_ab(blocks);
                 if phase_timing {
@@ -1976,6 +1999,29 @@ impl Blake3Setup {
             }
             let cpu_wit = phase_timing.then(crate::prover::process_cpu_ms);
             let t_wit = std::time::Instant::now();
+            if self.use_ranked_row_major_lincheck_fold() {
+                let (codeword, (z_packed, a_packed_f128, b_packed_f128)) =
+                    self.generate_witness_ab_without_lincheck_stripe_with_rate2_codeword(blocks);
+                if phase_timing {
+                    let wall = t_wit.elapsed().as_secs_f64() * 1e3;
+                    let cpu = crate::prover::process_cpu_ms() - cpu_wit.unwrap_or(0.0);
+                    eprintln!(
+                        "[phase-timing] witgen+hot-codeword (row-major-lc): {wall:.2} ms cpu={cpu:.1} util={:.1}",
+                        cpu / wall
+                    );
+                }
+                let lc_circuit = self.lincheck_circuit();
+                return crate::prover::prove_fast_ligerito_from_row_major_preinitialized_codeword(
+                    &self.r1cs,
+                    &self.pcs_params,
+                    z_packed,
+                    a_packed_f128,
+                    b_packed_f128,
+                    lc_circuit,
+                    codeword,
+                    challenger,
+                );
+            }
             let (codeword, (z_packed, a_packed_f128, b_packed_f128, z_packed_lincheck)) =
                 self.generate_witness_ab_with_rate2_codeword(blocks);
             if phase_timing {
@@ -2032,6 +2078,25 @@ impl Blake3Setup {
     ) {
         assert_eq!(blocks.len(), self.n_blocks);
         let t0 = std::time::Instant::now();
+        if self.use_ranked_row_major_lincheck_fold() {
+            let (codeword, (z_packed, a_packed_f128, b_packed_f128)) =
+                self.generate_witness_ab_without_lincheck_stripe_with_rate2_codeword(blocks);
+            let witness_s = t0.elapsed().as_secs_f64();
+            let lc_circuit = self.lincheck_circuit();
+            let (proof, commitment, claim, mut timings) =
+                crate::prover::prove_fast_ligerito_timed_from_row_major_preinitialized_codeword(
+                    &self.r1cs,
+                    &self.pcs_params,
+                    z_packed,
+                    a_packed_f128,
+                    b_packed_f128,
+                    lc_circuit,
+                    codeword,
+                    challenger,
+                );
+            timings.witness_s = witness_s;
+            return (proof, commitment, claim, timings);
+        }
         let (codeword, (z_packed, a_packed_f128, b_packed_f128, z_packed_lincheck)) =
             if self.use_ranked_rate2_hot_codeword() {
                 let (codeword, witness) = self.generate_witness_ab_with_rate2_codeword(blocks);

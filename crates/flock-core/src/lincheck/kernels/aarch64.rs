@@ -1,4 +1,5 @@
 use super::super::{F128, NEON_TILE_T, build_sum_table};
+use crate::bits::transpose_8_u64s_to_64_bytes;
 
 // The SHA3 extension includes EOR3; retain the two-EOR form for generic
 // AArch64 builds that do not enable it.
@@ -521,6 +522,138 @@ pub(crate) fn oblock_padded_tiled<const TILE_T: usize>(
         for w in 0..n_workers {
             let src = &partials[w * k + lo..w * k + lo + dst.len()];
             for (o, s) in dst.iter_mut().zip(src.iter()) {
+                *o += *s;
+            }
+        }
+    });
+    out
+}
+
+/// Direct row-major sibling of the ranked outer-block fold. It preserves the
+/// existing `TILE_T = 8` table/accumulator schedule, but synthesizes each tile's
+/// stripe bytes from the canonical F128 witness into a 512-byte local scratch
+/// instead of reading a fully materialized witness-sized stripe allocation.
+///
+/// Production dispatch is deliberately restricted by the caller to the exact
+/// ranked geometry. This function remains shape-generic enough for small
+/// oracle tests of the production kernel.
+#[cfg(target_arch = "aarch64")]
+pub(crate) fn partial_fold_packed_z_row_major_neon_padded(
+    z_packed: &[F128],
+    m: usize,
+    k_log: usize,
+    useful_bits: usize,
+    eq_outer: &[F128],
+) -> Vec<F128> {
+    const BLOCK_K: usize = 8;
+    const WORD_BITS: usize = 64;
+    const OUTER_GROUP: usize = 8;
+    const TILES_PER_CLAIM: usize = 64;
+
+    let n_log = m - k_log;
+    let k = 1usize << k_log;
+    let n_outer = 1usize << n_log;
+    assert!(
+        k_log >= 7,
+        "row-major blocks must contain at least one F128"
+    );
+    assert_eq!(z_packed.len(), 1usize << (m - 7));
+    assert_eq!(eq_outer.len(), n_outer);
+    assert!(useful_bits <= k);
+    assert!(
+        n_log >= 3 + NEON_TILE_T.trailing_zeros() as usize,
+        "need n_outer >= 8*NEON_TILE_T"
+    );
+    let n_stripes = n_outer / OUTER_GROUP;
+    assert_eq!(n_stripes % NEON_TILE_T, 0);
+    assert_eq!(k % WORD_BITS, 0);
+
+    let useful = useful_bits.div_ceil(BLOCK_K) * BLOCK_K;
+    let useful = useful.min(k);
+    if useful == 0 {
+        return vec![F128::ZERO; k];
+    }
+    let useful_words = useful.div_ceil(WORD_BITS);
+    let u64_per_block = k / WORD_BITS;
+    let n_tiles = n_stripes / NEON_TILE_T;
+
+    // SAFETY: F128 is repr(C, align(16)) with two little-endian u64 halves.
+    let z_words =
+        unsafe { std::slice::from_raw_parts(z_packed.as_ptr().cast::<u64>(), z_packed.len() * 2) };
+
+    let n_claims = n_tiles.div_ceil(TILES_PER_CLAIM);
+    let mut partials = crate::alloc_uninit_f128_vec(n_claims * k);
+    let partials_base = crate::epool::SyncPtr(partials.as_mut_ptr());
+    crate::epool::run_hetero_chunks(n_claims, |claim| {
+        let tile_lo = claim * TILES_PER_CLAIM;
+        let tile_hi = ((claim + 1) * TILES_PER_CLAIM).min(n_tiles);
+        // SAFETY: every queue claim exclusively owns one complete length-k
+        // partial, initializes it before reading, and joins before reduction.
+        let partial =
+            unsafe { std::slice::from_raw_parts_mut(partials_base.ptr().add(claim * k), k) };
+        // SAFETY: zero is a valid F128 representation.
+        unsafe { std::ptr::write_bytes(partial.as_mut_ptr(), 0, k) };
+
+        let mut tables = vec![F128::ZERO; NEON_TILE_T * 256];
+        let mut stripe_tile = [0u8; NEON_TILE_T * WORD_BITS];
+        for tile in tile_lo..tile_hi {
+            let stripe_base = tile * NEON_TILE_T;
+            for t in 0..NEON_TILE_T {
+                let eq_off = OUTER_GROUP * (stripe_base + t);
+                build_sum_table(
+                    &eq_outer[eq_off..eq_off + OUTER_GROUP],
+                    &mut tables[t * 256..(t + 1) * 256],
+                );
+            }
+            let tables_ptr = tables.as_ptr().cast::<u8>();
+
+            for word in 0..useful_words {
+                // Materialize only this tile's 8 x 64 output bytes. Each input
+                // stripe is eight adjacent row-major blocks, and the shared
+                // transpose produces byte bit r = block (outer) lane r.
+                for t in 0..NEON_TILE_T {
+                    let outer_base = OUTER_GROUP * (stripe_base + t);
+                    let lanes: [u64; OUTER_GROUP] =
+                        std::array::from_fn(|r| z_words[(outer_base + r) * u64_per_block + word]);
+                    transpose_8_u64s_to_64_bytes(
+                        &lanes,
+                        &mut stripe_tile[t * WORD_BITS..(t + 1) * WORD_BITS],
+                    );
+                }
+
+                let inner_base = word * WORD_BITS;
+                let n_this_word = (useful - inner_base).min(WORD_BITS);
+                let mut inner = 0usize;
+                while inner < n_this_word {
+                    // SAFETY: stripe_tile contains NEON_TILE_T rows of 64
+                    // bytes, `inner + 8 <= n_this_word <= 64`, tables contains
+                    // NEON_TILE_T complete 256-entry tables, and partial owns
+                    // this claim's full length-k output.
+                    unsafe {
+                        process_block_neon_single::<NEON_TILE_T>(
+                            stripe_tile.as_ptr(),
+                            WORD_BITS,
+                            inner,
+                            tables_ptr,
+                            partial.as_mut_ptr().add(inner_base + inner),
+                        );
+                    }
+                    inner += BLOCK_K;
+                }
+            }
+        }
+    });
+
+    // Match the established outer-block kernel's one-pass column-band XOR
+    // reduction over claim-private partials.
+    use rayon::prelude::*;
+    let band = k.div_ceil(rayon::current_num_threads().max(1)).max(1024);
+    let mut out = vec![F128::ZERO; k];
+    out.par_chunks_mut(band).enumerate().for_each(|(bi, dst)| {
+        let lo = bi * band;
+        for claim in 0..n_claims {
+            let src = &partials[claim * k + lo..claim * k + lo + dst.len()];
+            for (o, s) in dst.iter_mut().zip(src) {
                 *o += *s;
             }
         }

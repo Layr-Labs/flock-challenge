@@ -234,7 +234,38 @@ pub fn prove_fast_ligerito_from_witness<Ch: Challenger>(
         z_packed,
         a_packed_f128,
         b_packed_f128,
-        z_packed_lincheck,
+        LincheckWitness::Striped(z_packed_lincheck),
+        lincheck_circuit,
+        commit_codeword,
+        challenger,
+    )
+}
+
+/// Ranked row-major counterpart of [`prove_fast_ligerito_from_witness`].
+/// Lincheck folds directly from `z_packed`, avoiding the separate byte-stripe
+/// witness allocation while preserving the generic striped entry point.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn prove_fast_ligerito_from_row_major_witness<Ch: Challenger>(
+    r1cs: &BlockR1cs,
+    pcs_params: &PcsParams,
+    z_packed: Vec<F128>,
+    a_packed_f128: Vec<F128>,
+    b_packed_f128: Vec<F128>,
+    lincheck_circuit: &dyn lincheck::LincheckCircuit,
+    prefaulted_codeword: Option<Vec<F128>>,
+    challenger: &mut Ch,
+) -> (R1csProofLigerito, Commitment, R1csClaim) {
+    let commit_codeword = match prefaulted_codeword {
+        Some(codeword) => CommitCodeword::NeedsReplication(codeword),
+        None => CommitCodeword::Allocate,
+    };
+    prove_fast_ligerito_from_witness_with_commit_codeword(
+        r1cs,
+        pcs_params,
+        z_packed,
+        a_packed_f128,
+        b_packed_f128,
+        LincheckWitness::RowMajorPacked,
         lincheck_circuit,
         commit_codeword,
         challenger,
@@ -262,7 +293,33 @@ pub(crate) fn prove_fast_ligerito_from_preinitialized_codeword<Ch: Challenger>(
         z_packed,
         a_packed_f128,
         b_packed_f128,
-        z_packed_lincheck,
+        LincheckWitness::Striped(z_packed_lincheck),
+        lincheck_circuit,
+        CommitCodeword::Preinitialized(codeword),
+        challenger,
+    )
+}
+
+/// Ranked row-major counterpart of
+/// [`prove_fast_ligerito_from_preinitialized_codeword`].
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn prove_fast_ligerito_from_row_major_preinitialized_codeword<Ch: Challenger>(
+    r1cs: &BlockR1cs,
+    pcs_params: &PcsParams,
+    z_packed: Vec<F128>,
+    a_packed_f128: Vec<F128>,
+    b_packed_f128: Vec<F128>,
+    lincheck_circuit: &dyn lincheck::LincheckCircuit,
+    codeword: Vec<F128>,
+    challenger: &mut Ch,
+) -> (R1csProofLigerito, Commitment, R1csClaim) {
+    prove_fast_ligerito_from_witness_with_commit_codeword(
+        r1cs,
+        pcs_params,
+        z_packed,
+        a_packed_f128,
+        b_packed_f128,
+        LincheckWitness::RowMajorPacked,
         lincheck_circuit,
         CommitCodeword::Preinitialized(codeword),
         challenger,
@@ -276,7 +333,7 @@ fn prove_fast_ligerito_from_witness_with_commit_codeword<Ch: Challenger>(
     z_packed: Vec<F128>,
     a_packed_f128: Vec<F128>,
     b_packed_f128: Vec<F128>,
-    z_packed_lincheck: Vec<u8>,
+    lincheck_witness: LincheckWitness,
     lincheck_circuit: &dyn lincheck::LincheckCircuit,
     commit_codeword: CommitCodeword,
     challenger: &mut Ch,
@@ -301,7 +358,7 @@ fn prove_fast_ligerito_from_witness_with_commit_codeword<Ch: Challenger>(
         z_packed,
         a_packed_f128,
         b_packed_f128,
-        z_packed_lincheck,
+        lincheck_witness,
         lincheck_circuit,
         commit_codeword,
         challenger,
@@ -382,6 +439,60 @@ enum CommitCodeword {
     Preinitialized(Vec<F128>),
 }
 
+/// Physical source used for lincheck's outer-variable fold.
+///
+/// Generic hash/layout paths retain the historical pre-transposed stripe.
+/// The exact ranked BLAKE3 row-major path instead reads the canonical packed
+/// witness and transposes each local tile while folding it.
+enum LincheckWitness {
+    Striped(Vec<u8>),
+    RowMajorPacked,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn prove_lincheck_capture_z_vec<Ch: Challenger>(
+    source: LincheckWitness,
+    z_packed: &[F128],
+    r1cs: &BlockR1cs,
+    lincheck_circuit: &dyn lincheck::LincheckCircuit,
+    x_ab: &QuirkyPoint,
+    challenger: &mut Ch,
+) -> (lincheck::LincheckProof, lincheck::LincheckClaim, Vec<F128>) {
+    match source {
+        LincheckWitness::Striped(stripe) => {
+            let result = lincheck::prove_padded_capture_z_vec(
+                &stripe,
+                r1cs.m,
+                r1cs.k_log,
+                r1cs.k_skip,
+                r1cs.useful_bits,
+                lincheck_circuit,
+                x_ab,
+                challenger,
+            );
+            flock_core::scratch::give_u8(stripe);
+            result
+        }
+        LincheckWitness::RowMajorPacked => {
+            assert_eq!(
+                r1cs.layout,
+                flock_core::r1cs::WitnessLayout::RowMajor,
+                "direct lincheck fold requires a row-major packed witness"
+            );
+            lincheck::prove_padded_capture_z_vec_row_major(
+                z_packed,
+                r1cs.m,
+                r1cs.k_log,
+                r1cs.k_skip,
+                r1cs.useful_bits,
+                lincheck_circuit,
+                x_ab,
+                challenger,
+            )
+        }
+    }
+}
+
 /// Build the witness commitment and the challenge-independent half of
 /// zerocheck round 1 on the same fixed Rayon pool. A/B are only borrowed:
 /// their original packed values remain live for zerocheck round 2.
@@ -452,7 +563,7 @@ pub fn prove_fast_core<Ch: Challenger>(
         z_packed,
         a_packed_f128,
         b_packed_f128,
-        z_packed_lincheck,
+        LincheckWitness::Striped(z_packed_lincheck),
         lincheck_circuit,
         CommitCodeword::Allocate,
         challenger,
@@ -486,7 +597,7 @@ pub fn prove_fast_core_with_codeword<Ch: Challenger>(
         z_packed,
         a_packed_f128,
         b_packed_f128,
-        z_packed_lincheck,
+        LincheckWitness::Striped(z_packed_lincheck),
         lincheck_circuit,
         commit_codeword,
         challenger,
@@ -500,7 +611,7 @@ fn prove_fast_core_with_commit_codeword<Ch: Challenger>(
     z_packed: Vec<F128>,
     a_packed_f128: Vec<F128>,
     b_packed_f128: Vec<F128>,
-    z_packed_lincheck: Vec<u8>,
+    lincheck_witness: LincheckWitness,
     lincheck_circuit: &dyn lincheck::LincheckCircuit,
     commit_codeword: CommitCodeword,
     challenger: &mut Ch,
@@ -573,20 +684,14 @@ fn prove_fast_core_with_commit_codeword<Ch: Challenger>(
 
     // Capture lincheck's pre-sumcheck z_vec so the PCS open can derive the
     // AB-claim's `s_hat_v` from it (skips fold_1b_rows for AB).
-    let (lc_proof, lc_claim, z_vec_pre) = lincheck::prove_padded_capture_z_vec(
-        &z_packed_lincheck,
-        r1cs.m,
-        r1cs.k_log,
-        r1cs.k_skip,
-        r1cs.useful_bits,
+    let (lc_proof, lc_claim, z_vec_pre) = prove_lincheck_capture_z_vec(
+        lincheck_witness,
+        &z_packed,
+        r1cs,
         lincheck_circuit,
         &x_ab,
         challenger,
     );
-    // The lincheck stripe copy of z is dead from here on; return it to the
-    // scratch byte pool before the PCS open (2^(m-3) bytes — 512 MB at
-    // m = 32) so the next prove reuses its resident pages.
-    flock_core::scratch::give_u8(z_packed_lincheck);
 
     let ab = ZClaim {
         point: r1cs.ab_claim_point(lc_claim.r_inner_skip, &lc_claim.r_inner_rest, &x_ab.x_outer),
@@ -711,7 +816,7 @@ pub fn prove_fast_ligerito_timed<Ch: Challenger>(
         z_packed,
         a_packed_f128,
         b_packed_f128,
-        z_packed_lincheck,
+        LincheckWitness::Striped(z_packed_lincheck),
         lincheck_circuit,
         commit_codeword,
         challenger,
@@ -736,7 +841,31 @@ pub(crate) fn prove_fast_ligerito_timed_from_preinitialized_codeword<Ch: Challen
         z_packed,
         a_packed_f128,
         b_packed_f128,
-        z_packed_lincheck,
+        LincheckWitness::Striped(z_packed_lincheck),
+        lincheck_circuit,
+        CommitCodeword::Preinitialized(codeword),
+        challenger,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn prove_fast_ligerito_timed_from_row_major_preinitialized_codeword<Ch: Challenger>(
+    r1cs: &BlockR1cs,
+    pcs_params: &PcsParams,
+    z_packed: Vec<F128>,
+    a_packed_f128: Vec<F128>,
+    b_packed_f128: Vec<F128>,
+    lincheck_circuit: &dyn lincheck::LincheckCircuit,
+    codeword: Vec<F128>,
+    challenger: &mut Ch,
+) -> (R1csProofLigerito, Commitment, R1csClaim, ProvePhaseTimings) {
+    prove_fast_ligerito_timed_with_commit_codeword(
+        r1cs,
+        pcs_params,
+        z_packed,
+        a_packed_f128,
+        b_packed_f128,
+        LincheckWitness::RowMajorPacked,
         lincheck_circuit,
         CommitCodeword::Preinitialized(codeword),
         challenger,
@@ -750,7 +879,7 @@ fn prove_fast_ligerito_timed_with_commit_codeword<Ch: Challenger>(
     z_packed: Vec<F128>,
     a_packed_f128: Vec<F128>,
     b_packed_f128: Vec<F128>,
-    z_packed_lincheck: Vec<u8>,
+    lincheck_witness: LincheckWitness,
     lincheck_circuit: &dyn lincheck::LincheckCircuit,
     commit_codeword: CommitCodeword,
     challenger: &mut Ch,
@@ -810,17 +939,14 @@ fn prove_fast_ligerito_timed_with_commit_codeword<Ch: Challenger>(
 
     // --- lincheck + base-claim / s_hat_v setup ---
     let t0 = Instant::now();
-    let (lc_proof, lc_claim, z_vec_pre) = lincheck::prove_padded_capture_z_vec(
-        &z_packed_lincheck,
-        r1cs.m,
-        r1cs.k_log,
-        r1cs.k_skip,
-        r1cs.useful_bits,
+    let (lc_proof, lc_claim, z_vec_pre) = prove_lincheck_capture_z_vec(
+        lincheck_witness,
+        &z_packed,
+        r1cs,
         lincheck_circuit,
         &x_ab,
         challenger,
     );
-    flock_core::scratch::give_u8(z_packed_lincheck);
     let ab = ZClaim {
         point: r1cs.ab_claim_point(lc_claim.r_inner_skip, &lc_claim.r_inner_rest, &x_ab.x_outer),
         value: lc_claim.w,

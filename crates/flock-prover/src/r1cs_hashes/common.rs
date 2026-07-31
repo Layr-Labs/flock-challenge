@@ -306,6 +306,170 @@ where
     )
 }
 
+/// Full-write row-major witness driver that returns only `(z, a, b)`.
+///
+/// Unlike [`drive_witness_packed_and_lincheck_full_write`], this path never
+/// allocates or writes a lincheck stripe. It is intended for producers whose
+/// downstream path can consume the row-major packed witness directly.
+/// `per_block` MUST overwrite every word of all three block buffers, and
+/// padding is mandatory so the callback runs for every allocated slot.
+pub(crate) fn drive_witness_packed_full_write<S: Sync, F>(
+    initial_states: &[S],
+    padding: &S,
+    n_blocks_log: usize,
+    k_log: usize,
+    per_block: F,
+) -> (Vec<F128>, Vec<F128>, Vec<F128>)
+where
+    F: Fn(&S, &mut [u64], &mut [u64], &mut [u64]) + Sync,
+{
+    drive_witness_packed_full_write_impl::<false, S, F>(
+        initial_states,
+        padding,
+        n_blocks_log,
+        k_log,
+        None,
+        per_block,
+    )
+}
+
+/// Full-write row-major witness driver that returns `(z, a, b)` and also
+/// emits the exact rate-1/2 pre-NTT codeword `[z, z]`.
+///
+/// This is the no-stripe sibling of
+/// [`drive_witness_packed_and_lincheck_full_write_with_rate2_codeword`]: it
+/// never allocates or writes `z_lincheck`. `codeword` must contain exactly two
+/// packed-witness replicas, and every element is overwritten before return.
+pub(crate) fn drive_witness_packed_full_write_with_rate2_codeword<S: Sync, F>(
+    initial_states: &[S],
+    padding: &S,
+    n_blocks_log: usize,
+    k_log: usize,
+    codeword: &mut [F128],
+    per_block: F,
+) -> (Vec<F128>, Vec<F128>, Vec<F128>)
+where
+    F: Fn(&S, &mut [u64], &mut [u64], &mut [u64]) + Sync,
+{
+    drive_witness_packed_full_write_impl::<true, S, F>(
+        initial_states,
+        padding,
+        n_blocks_log,
+        k_log,
+        Some(codeword),
+        per_block,
+    )
+}
+
+fn drive_witness_packed_full_write_impl<const EMIT_RATE2_CODEWORD: bool, S: Sync, F>(
+    initial_states: &[S],
+    padding: &S,
+    n_blocks_log: usize,
+    k_log: usize,
+    rate2_codeword: Option<&mut [F128]>,
+    per_block: F,
+) -> (Vec<F128>, Vec<F128>, Vec<F128>)
+where
+    F: Fn(&S, &mut [u64], &mut [u64], &mut [u64]) + Sync,
+{
+    use rayon::prelude::*;
+
+    let k = 1usize << k_log;
+    let f128_per_block = k / 128;
+    let n_total = 1usize << n_blocks_log;
+    let n_blocks = initial_states.len();
+    assert!(
+        n_blocks <= n_total,
+        "{n_blocks} blocks > 2^{n_blocks_log} = {n_total} slots"
+    );
+    assert!(
+        n_total >= 8,
+        "row-major witness groups require n_total >= 8"
+    );
+
+    let total_f128 = n_total * f128_per_block;
+    assert_eq!(
+        rate2_codeword.is_some(),
+        EMIT_RATE2_CODEWORD,
+        "rate-1/2 codeword presence must match the driver specialization"
+    );
+    let rate2_codeword = rate2_codeword.map(|codeword| {
+        assert_eq!(
+            codeword.len(),
+            2 * total_f128,
+            "rate-1/2 codeword must contain exactly two packed-witness replicas"
+        );
+        Rate2CodewordPtr(codeword.as_mut_ptr())
+    });
+
+    // The full-write producer initializes every word before it is read. No
+    // byte-stripe allocation participates in this path.
+    let mut z = flock_core::scratch::take_f128(total_f128);
+    let mut a = flock_core::scratch::take_f128(total_f128);
+    let mut b = flock_core::scratch::take_f128(total_f128);
+
+    z.par_chunks_mut(8 * f128_per_block)
+        .zip(a.par_chunks_mut(8 * f128_per_block))
+        .zip(b.par_chunks_mut(8 * f128_per_block))
+        .with_max_len(256)
+        .enumerate()
+        .for_each(|(g, ((z_grp, a_grp), b_grp))| {
+            for k_in in 0..8 {
+                let global_idx = 8 * g + k_in;
+                let init = initial_states.get(global_idx).unwrap_or(padding);
+                let z_chunk = &mut z_grp[k_in * f128_per_block..(k_in + 1) * f128_per_block];
+                let a_chunk = &mut a_grp[k_in * f128_per_block..(k_in + 1) * f128_per_block];
+                let b_chunk = &mut b_grp[k_in * f128_per_block..(k_in + 1) * f128_per_block];
+                // SAFETY: F128 is `repr(C, align(16))` with two `u64` fields
+                // in LE order, so each slice has the same byte layout as a
+                // u64 pair. The callback fully initializes every word.
+                let z_u64 = unsafe {
+                    std::slice::from_raw_parts_mut(
+                        z_chunk.as_mut_ptr() as *mut u64,
+                        z_chunk.len() * 2,
+                    )
+                };
+                let a_u64 = unsafe {
+                    std::slice::from_raw_parts_mut(
+                        a_chunk.as_mut_ptr() as *mut u64,
+                        a_chunk.len() * 2,
+                    )
+                };
+                let b_u64 = unsafe {
+                    std::slice::from_raw_parts_mut(
+                        b_chunk.as_mut_ptr() as *mut u64,
+                        b_chunk.len() * 2,
+                    )
+                };
+                per_block(init, z_u64, a_u64, b_u64);
+            }
+
+            if EMIT_RATE2_CODEWORD {
+                let codeword =
+                    rate2_codeword.expect("rate-1/2 driver specialization requires a codeword");
+                let elem_offset = g * z_grp.len();
+                // SAFETY: group `g` owns this range of z and the matching
+                // disjoint range in each codeword replica. The parallel join
+                // publishes all writes before the caller reuses `codeword`.
+                unsafe {
+                    let dst = codeword.get();
+                    std::ptr::copy_nonoverlapping(
+                        z_grp.as_ptr(),
+                        dst.add(elem_offset),
+                        z_grp.len(),
+                    );
+                    std::ptr::copy_nonoverlapping(
+                        z_grp.as_ptr(),
+                        dst.add(total_f128 + elem_offset),
+                        z_grp.len(),
+                    );
+                }
+            }
+        });
+
+    (z, a, b)
+}
+
 fn drive_witness_packed_and_lincheck_impl<
     const PER_BLOCK_FULLY_WRITES: bool,
     const EMIT_RATE2_CODEWORD: bool,
@@ -730,4 +894,102 @@ where
     );
 
     (z, a, b, stripe)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[derive(Clone, Copy)]
+    struct TestState(u64);
+
+    fn fill_test_block(state: &TestState, z: &mut [u64], a: &mut [u64], b: &mut [u64]) {
+        assert_eq!(z.len(), a.len());
+        assert_eq!(z.len(), b.len());
+        for i in 0..z.len() {
+            let value = state
+                .0
+                .wrapping_add((i as u64).wrapping_mul(0x0101_0101_0101_0101));
+            z[i] = value;
+            a[i] = value.rotate_left(17) ^ 0xA5A5_A5A5_A5A5_A5A5;
+            b[i] = value.rotate_right(11) ^ 0x5A5A_5A5A_5A5A_5A5A;
+        }
+    }
+
+    #[test]
+    fn packed_full_write_without_stripe_matches_striped_driver() {
+        const N_BLOCKS_LOG: usize = 3;
+        const K_LOG: usize = 8;
+        const USEFUL_BITS: usize = 193;
+
+        let states = [
+            TestState(3),
+            TestState(5),
+            TestState(8),
+            TestState(13),
+            TestState(21),
+        ];
+        let padding = TestState(0xC0DE_CAFE);
+
+        let (z_striped, a_striped, b_striped, stripe) =
+            drive_witness_packed_and_lincheck_full_write(
+                &states,
+                &padding,
+                N_BLOCKS_LOG,
+                K_LOG,
+                USEFUL_BITS,
+                fill_test_block,
+            );
+        let (z_plain, a_plain, b_plain) = drive_witness_packed_full_write(
+            &states,
+            &padding,
+            N_BLOCKS_LOG,
+            K_LOG,
+            fill_test_block,
+        );
+
+        assert_eq!(z_plain, z_striped);
+        assert_eq!(a_plain, a_striped);
+        assert_eq!(b_plain, b_striped);
+        assert_eq!(stripe.len(), 1usize << (N_BLOCKS_LOG + K_LOG - 3));
+    }
+
+    #[test]
+    fn packed_full_write_without_stripe_matches_rate2_driver() {
+        const N_BLOCKS_LOG: usize = 3;
+        const K_LOG: usize = 8;
+        const K: usize = 1 << K_LOG;
+        const TOTAL_F128: usize = (1 << N_BLOCKS_LOG) * K / 128;
+
+        let states = [TestState(34), TestState(55), TestState(89)];
+        let padding = TestState(0x1234_5678);
+        let mut striped_codeword = vec![F128::ZERO; 2 * TOTAL_F128];
+        let mut plain_codeword = vec![F128::ZERO; 2 * TOTAL_F128];
+
+        let (z_striped, a_striped, b_striped, _stripe) =
+            drive_witness_packed_and_lincheck_full_write_with_rate2_codeword(
+                &states,
+                &padding,
+                N_BLOCKS_LOG,
+                K_LOG,
+                K,
+                &mut striped_codeword,
+                fill_test_block,
+            );
+        let (z_plain, a_plain, b_plain) = drive_witness_packed_full_write_with_rate2_codeword(
+            &states,
+            &padding,
+            N_BLOCKS_LOG,
+            K_LOG,
+            &mut plain_codeword,
+            fill_test_block,
+        );
+
+        assert_eq!(z_plain, z_striped);
+        assert_eq!(a_plain, a_striped);
+        assert_eq!(b_plain, b_striped);
+        assert_eq!(plain_codeword, striped_codeword);
+        assert_eq!(&plain_codeword[..TOTAL_F128], z_plain.as_slice());
+        assert_eq!(&plain_codeword[TOTAL_F128..], z_plain.as_slice());
+    }
 }

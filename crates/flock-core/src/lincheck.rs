@@ -780,6 +780,141 @@ fn partial_fold_packed_z_best(
     }
 }
 
+/// Fold a canonical **row-major** F128-packed witness over its outer block
+/// coordinates without first materializing lincheck's byte-stripe copy.
+///
+/// The input layout is the [`crate::r1cs::WitnessLayout::RowMajor`] layout:
+/// F128 element `i_outer * (k / 128) + i_inner / 128` contains witness bit
+/// `(i_inner & 127)`. The result is identical to first calling
+/// [`pack_z_lincheck_from_packed`] and then the padding-aware production fold:
+///
+/// ```text
+/// out[i_inner] = sum_i_outer z[i_inner, i_outer] * eq_outer[i_outer].
+/// ```
+///
+/// `useful_bits` has the same honest-padding contract as [`prove_padded`]:
+/// rows `[useful_bits, 2^k_log)` in every block must be zero. The ranked
+/// macOS/AArch64 geometry uses an on-the-fly tiled NEON transpose feeding the
+/// existing register-accumulator kernel; other shapes use the portable direct
+/// adapter. Callers retain the striped path separately, which provides a
+/// same-binary control when wiring this adapter into a prover.
+///
+/// # Panics
+///
+/// Panics unless `m >= k_log >= 7`, the packed witness has `2^(m-7)`
+/// elements, `eq_outer` has `2^(m-k_log)` elements, the outer dimension is
+/// divisible by eight, and `useful_bits <= 2^k_log`.
+pub fn partial_fold_packed_z_row_major_padded(
+    z_packed: &[F128],
+    m: usize,
+    k_log: usize,
+    useful_bits: usize,
+    eq_outer: &[F128],
+) -> Vec<F128> {
+    validate_row_major_partial_fold(z_packed, m, k_log, useful_bits, eq_outer);
+
+    #[cfg(target_arch = "aarch64")]
+    if use_ranked_row_major_neon_fold(m, k_log, useful_bits) {
+        return kernels::partial_fold_packed_z_row_major_neon_padded(
+            z_packed,
+            m,
+            k_log,
+            useful_bits,
+            eq_outer,
+        );
+    }
+
+    partial_fold_packed_z_row_major_portable_padded(z_packed, k_log, useful_bits, eq_outer)
+}
+
+#[inline]
+fn use_ranked_row_major_neon_fold(m: usize, k_log: usize, useful_bits: usize) -> bool {
+    cfg!(all(target_os = "macos", target_arch = "aarch64"))
+        && m == 32
+        && k_log == 14
+        && useful_bits == 15_409
+}
+
+#[inline]
+fn validate_row_major_partial_fold(
+    z_packed: &[F128],
+    m: usize,
+    k_log: usize,
+    useful_bits: usize,
+    eq_outer: &[F128],
+) {
+    assert!(m >= k_log, "m must be >= k_log");
+    assert!(
+        k_log >= 7,
+        "row-major blocks must contain at least one F128"
+    );
+    let k = 1usize << k_log;
+    let n_outer = 1usize << (m - k_log);
+    assert_eq!(z_packed.len(), 1usize << (m - 7));
+    assert_eq!(eq_outer.len(), n_outer);
+    assert!(n_outer >= 8 && n_outer.is_multiple_of(8));
+    assert!(useful_bits <= k);
+}
+
+/// Portable direct adapter and correctness fallback. Eight adjacent row-major
+/// blocks are transposed one 64-bit word at a time into the exact byte shape
+/// consumed by lincheck's existing subset-sum fold; only the 64-byte temporary
+/// is materialized.
+fn partial_fold_packed_z_row_major_portable_padded(
+    z_packed: &[F128],
+    k_log: usize,
+    useful_bits: usize,
+    eq_outer: &[F128],
+) -> Vec<F128> {
+    use rayon::prelude::*;
+
+    let k = 1usize << k_log;
+    let f128_per_block = k / 128;
+    let u64_per_block = k / 64;
+    let f128_per_group = 8 * f128_per_block;
+    let useful_words = useful_bits.div_ceil(64);
+
+    z_packed
+        .par_chunks(f128_per_group)
+        .enumerate()
+        .fold(
+            || vec![F128::ZERO; k],
+            |mut out, (group, blocks)| {
+                debug_assert_eq!(blocks.len(), f128_per_group);
+                // SAFETY: F128 is repr(C, align(16)) with two little-endian
+                // u64 halves, so this preserves the canonical witness bit order.
+                let words = unsafe {
+                    std::slice::from_raw_parts(blocks.as_ptr().cast::<u64>(), blocks.len() * 2)
+                };
+                let mut table = [F128::ZERO; 256];
+                build_sum_table(&eq_outer[8 * group..8 * group + 8], &mut table);
+                let mut stripe_word = [0u8; 64];
+                for word in 0..useful_words {
+                    let lanes: [u64; 8] = std::array::from_fn(|r| words[r * u64_per_block + word]);
+                    crate::bits::transpose_8_u64s_to_64_bytes(&lanes, &mut stripe_word);
+                    let inner_base = word * 64;
+                    let n = (useful_bits - inner_base).min(64);
+                    for (dst, &byte) in out[inner_base..inner_base + n]
+                        .iter_mut()
+                        .zip(&stripe_word[..n])
+                    {
+                        *dst += table[byte as usize];
+                    }
+                }
+                out
+            },
+        )
+        .reduce(
+            || vec![F128::ZERO; k],
+            |mut a, b| {
+                for (x, y) in a.iter_mut().zip(b) {
+                    *x += y;
+                }
+                a
+            },
+        )
+}
+
 /// Outer-dimension threshold (`n_log = m − k_log`) at/above which the
 /// outer(tile)-partitioned fold beats the i_inner-partitioned one. See
 /// [`partial_fold_packed_z_best`] for the crossover calibration.
@@ -1175,6 +1310,29 @@ fn sumcheck_bind_both_and_eval_next(
 // API
 // ---------------------------------------------------------------------------
 
+/// Typed source for the one witness-dependent operation in lincheck. Keeping
+/// layout selection here lets the complete transcript/sumcheck implementation
+/// remain shared by the canonical stripe and direct row-major adapters.
+#[derive(Clone, Copy)]
+enum PartialFoldSource<'a> {
+    Striped(&'a [u8]),
+    RowMajor(&'a [F128]),
+}
+
+impl PartialFoldSource<'_> {
+    #[inline]
+    fn fold(self, m: usize, k_log: usize, useful_bits: usize, eq_outer: &[F128]) -> Vec<F128> {
+        match self {
+            Self::Striped(z_packed) => {
+                partial_fold_packed_z_best(z_packed, m, k_log, useful_bits, eq_outer)
+            }
+            Self::RowMajor(z_packed) => {
+                partial_fold_packed_z_row_major_padded(z_packed, m, k_log, useful_bits, eq_outer)
+            }
+        }
+    }
+}
+
 /// Prove the lincheck statement for the block-diagonal R1CS instance
 /// `A = I_{2^n_log} ⊗ a_0`, `B = I ⊗ b_0`, `C = I ⊗ c_0`.
 ///
@@ -1223,7 +1381,7 @@ pub fn prove_padded<Ch: Challenger>(
     challenger: &mut Ch,
 ) -> (LincheckProof, LincheckClaim) {
     let (proof, claim, _) = prove_padded_inner(
-        z_packed,
+        PartialFoldSource::Striped(z_packed),
         m,
         k_log,
         k_skip,
@@ -1256,7 +1414,46 @@ pub fn prove_padded_capture_z_vec<Ch: Challenger>(
     challenger: &mut Ch,
 ) -> (LincheckProof, LincheckClaim, Vec<F128>) {
     let (proof, claim, captured) = prove_padded_inner(
-        z_packed,
+        PartialFoldSource::Striped(z_packed),
+        m,
+        k_log,
+        k_skip,
+        useful_bits,
+        circuit,
+        x_ab,
+        true,
+        challenger,
+    );
+    (
+        proof,
+        claim,
+        captured.expect("capture=true must produce z_vec"),
+    )
+}
+
+/// Row-major counterpart of [`prove_padded_capture_z_vec`]. It consumes the
+/// canonical F128-packed witness directly for lincheck's outer partial fold,
+/// avoiding the witness-sized byte-stripe materialization while sharing the
+/// exact same challenger, circuit-comb, sumcheck, proof, and claim code.
+///
+/// The witness must use [`crate::r1cs::WitnessLayout::RowMajor`] and satisfy
+/// the honest-padding contract documented on
+/// [`partial_fold_packed_z_row_major_padded`]. With the same witness,
+/// challenger state, and circuit, this returns byte-identical proof/claim and
+/// captured-vector values to [`prove_padded_capture_z_vec`].
+#[allow(clippy::too_many_arguments)]
+pub fn prove_padded_capture_z_vec_row_major<Ch: Challenger>(
+    z_packed: &[F128],
+    m: usize,
+    k_log: usize,
+    k_skip: usize,
+    useful_bits: usize,
+    circuit: &dyn LincheckCircuit,
+    x_ab: &QuirkyPoint,
+    challenger: &mut Ch,
+) -> (LincheckProof, LincheckClaim, Vec<F128>) {
+    let (proof, claim, captured) = prove_padded_inner(
+        PartialFoldSource::RowMajor(z_packed),
         m,
         k_log,
         k_skip,
@@ -1275,7 +1472,7 @@ pub fn prove_padded_capture_z_vec<Ch: Challenger>(
 
 #[allow(clippy::too_many_arguments)]
 fn prove_padded_inner<Ch: Challenger>(
-    z_packed: &[u8],
+    z_source: PartialFoldSource<'_>,
     m: usize,
     k_log: usize,
     k_skip: usize,
@@ -1353,7 +1550,7 @@ fn prove_padded_inner<Ch: Challenger>(
             None
         };
         let eq_x_outer = build_eq_table(&x_ab.x_outer);
-        let z_vec = partial_fold_packed_z_best(z_packed, m, k_log, useful_bits, &eq_x_outer);
+        let z_vec = z_source.fold(m, k_log, useful_bits, &eq_x_outer);
         if let Some(t) = t {
             eprintln!(
                 "[lc] {:<26} {:>7.2} ms",
@@ -1877,6 +2074,106 @@ mod tests {
         }
     }
 
+    /// The direct row-major adapter must equal the independent, established
+    /// path of materializing a canonical lincheck stripe and folding it. Cases
+    /// cover dense and honestly padded blocks, including BLAKE3's non-byte-
+    /// aligned useful boundary.
+    #[test]
+    fn partial_fold_row_major_matches_striped_oracle() {
+        let cases: &[(usize, usize, usize)] = &[(14, 7, 1 << 7), (17, 10, 597), (22, 14, 15_409)];
+        for &(m, k_log, useful_bits) in cases {
+            let k = 1usize << k_log;
+            let n_outer = 1usize << (m - k_log);
+            let mut rng = Rng::new(0x524f_574d_414a_4f52 ^ m as u64);
+            let mut z = rng.bits(1usize << m);
+            for outer in 0..n_outer {
+                z[outer * k + useful_bits..(outer + 1) * k].fill(false);
+            }
+            let row_major = crate::pcs::pack_witness(&z, m);
+            let striped = pack_z_lincheck_from_packed(&row_major, m, k_log);
+            let eq_outer = build_eq_table(&rng.f128_vec(m - k_log));
+
+            let want = partial_fold_packed_z_best(&striped, m, k_log, useful_bits, &eq_outer);
+            let got = partial_fold_packed_z_row_major_padded(
+                &row_major,
+                m,
+                k_log,
+                useful_bits,
+                &eq_outer,
+            );
+            assert_eq!(want, got, "m={m} k_log={k_log} useful={useful_bits}");
+        }
+    }
+
+    /// Pin the row-major address decomposition independently of the stripe
+    /// packer: one set bit at `(outer, inner)` contributes exactly that outer
+    /// weight to one output coordinate and zero everywhere else.
+    #[test]
+    fn partial_fold_row_major_one_hot_mapping() {
+        let (m, k_log) = (14usize, 7usize);
+        let k = 1usize << k_log;
+        let n_outer = 1usize << (m - k_log);
+        let mut rng = Rng::new(0x4f4e_4548_4f54);
+        let eq_outer = rng.f128_vec(n_outer);
+        for &(outer, inner) in &[(0usize, 0usize), (7, 63), (8, 64), (91, 127)] {
+            let mut z = vec![false; 1usize << m];
+            z[outer * k + inner] = true;
+            let row_major = crate::pcs::pack_witness(&z, m);
+            let got = partial_fold_packed_z_row_major_padded(&row_major, m, k_log, k, &eq_outer);
+            for (i, value) in got.iter().enumerate() {
+                assert_eq!(
+                    *value,
+                    if i == inner {
+                        eq_outer[outer]
+                    } else {
+                        F128::ZERO
+                    },
+                    "outer={outer} inner={inner} output={i}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn ranked_row_major_neon_gate_is_narrow() {
+        let enabled_here = cfg!(all(target_os = "macos", target_arch = "aarch64"));
+        assert_eq!(use_ranked_row_major_neon_fold(32, 14, 15_409), enabled_here);
+        assert!(!use_ranked_row_major_neon_fold(31, 14, 15_409));
+        assert!(!use_ranked_row_major_neon_fold(32, 13, 15_409));
+        assert!(!use_ranked_row_major_neon_fold(32, 14, 15_408));
+        assert!(!use_ranked_row_major_neon_fold(32, 14, 1 << 14));
+    }
+
+    /// Exercise the exact on-the-fly transpose/table/NEON implementation at
+    /// small tile-eligible shapes; production dispatch is intentionally too
+    /// narrow to allocate in a unit test.
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn partial_fold_row_major_neon_matches_striped_oracle() {
+        let cases: &[(usize, usize, usize)] = &[(13, 7, 101), (20, 14, 15_409)];
+        for &(m, k_log, useful_bits) in cases {
+            let k = 1usize << k_log;
+            let n_outer = 1usize << (m - k_log);
+            let mut rng = Rng::new(0x4e45_4f4e_524d ^ m as u64);
+            let mut z = rng.bits(1usize << m);
+            for outer in 0..n_outer {
+                z[outer * k + useful_bits..(outer + 1) * k].fill(false);
+            }
+            let row_major = crate::pcs::pack_witness(&z, m);
+            let striped = pack_z_lincheck_from_packed(&row_major, m, k_log);
+            let eq_outer = build_eq_table(&rng.f128_vec(m - k_log));
+            let want = partial_fold_packed_z_best(&striped, m, k_log, useful_bits, &eq_outer);
+            let got = kernels::partial_fold_packed_z_row_major_neon_padded(
+                &row_major,
+                m,
+                k_log,
+                useful_bits,
+                &eq_outer,
+            );
+            assert_eq!(want, got, "m={m} k_log={k_log} useful={useful_bits}");
+        }
+    }
+
     #[test]
     fn partial_fold_dispatch_handles_small_k() {
         let (m, k_log) = (8usize, 2usize);
@@ -2172,6 +2469,52 @@ mod tests {
                 "w wrong at m={m}, k_log={k_log}, k_skip={k_skip}"
             );
         }
+    }
+
+    /// Switching only the packed-witness source adapter must preserve every
+    /// transcript-derived object: the proof, claim, and captured pre-sumcheck
+    /// z vector are all byte-identical under matched challengers.
+    #[test]
+    fn prove_row_major_matches_striped_transcript() {
+        let (m, k_log, k_skip, useful_bits) = (14usize, 7usize, 6usize, 101usize);
+        let k = 1usize << k_log;
+        let n_outer = 1usize << (m - k_log);
+        let mut rng = Rng::new(0x5052_4f4f_4652_4f57);
+        let mut z = rng.bits(1usize << m);
+        for outer in 0..n_outer {
+            z[outer * k + useful_bits..(outer + 1) * k].fill(false);
+        }
+        let row_major = crate::pcs::pack_witness(&z, m);
+        let striped = pack_z_lincheck_from_packed(&row_major, m, k_log);
+        let a_0 = random_sparse_matrix(k, 3 * k, &mut rng);
+        let b_0 = random_sparse_matrix(k, 3 * k, &mut rng);
+        let circuit = SparseMatrixCircuit::new(&a_0, &b_0);
+        let x_ab = random_quirky_point(m, k_log, k_skip, &mut rng);
+
+        let mut striped_challenger = FsChallenger::new(b"flock-row-major-oracle-v0");
+        let striped_result = prove_padded_capture_z_vec(
+            &striped,
+            m,
+            k_log,
+            k_skip,
+            useful_bits,
+            &circuit,
+            &x_ab,
+            &mut striped_challenger,
+        );
+        let mut row_major_challenger = FsChallenger::new(b"flock-row-major-oracle-v0");
+        let row_major_result = prove_padded_capture_z_vec_row_major(
+            &row_major,
+            m,
+            k_log,
+            k_skip,
+            useful_bits,
+            &circuit,
+            &x_ab,
+            &mut row_major_challenger,
+        );
+
+        assert_eq!(striped_result, row_major_result);
     }
 
     /// Verify must reject byte-mutated proofs. Mutation positions are picked
