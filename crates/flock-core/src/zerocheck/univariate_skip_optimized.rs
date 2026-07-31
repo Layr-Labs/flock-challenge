@@ -388,6 +388,11 @@ pub fn precompute_round1_ab_inner_packed_padded(
                         } else {
                             0
                         },
+                        if blake3_static_layout {
+                            within_hash_outer
+                        } else {
+                            usize::MAX
+                        },
                     );
                 }
                 out_outer[n_b_med * 64..].fill(0);
@@ -421,6 +426,7 @@ fn shift_reduce_inner_ab(
     check_all_ones: bool,
     check_single_k0: bool,
     const_one_mask: u8,
+    bstatic_w: usize,
 ) {
     kernels::shift_reduce_inner_ab(
         a_packed,
@@ -434,6 +440,7 @@ fn shift_reduce_inner_ab(
         check_all_ones,
         check_single_k0,
         const_one_mask,
+        bstatic_w,
     );
 }
 
@@ -566,6 +573,7 @@ fn process_one_x_hi(
                     true,
                     true,
                     0,
+                    usize::MAX,
                 );
                 let byte_base_b = chunk_byte_base + b_med * N_CHUNKS * 8;
                 let c_in: &[u8; 64] = (&c_packed[byte_base_b..byte_base_b + 64])
@@ -601,6 +609,7 @@ fn process_one_x_hi(
                     true,
                     true,
                     0,
+                    usize::MAX,
                 );
                 let byte_base_b = chunk_byte_base + b_med * N_CHUNKS * 8;
                 let c_in: &[u8; 64] = (&c_packed[byte_base_b..byte_base_b + 64])
@@ -729,6 +738,7 @@ fn process_one_x_hi_with_s_hat_v(
                     true,
                     true,
                     0,
+                    usize::MAX,
                 );
                 let byte_base_b = chunk_byte_base + b_med * N_CHUNKS * 8;
                 let c_in: &[u8; 64] = (&c_packed[byte_base_b..byte_base_b + 64])
@@ -762,6 +772,7 @@ fn process_one_x_hi_with_s_hat_v(
                     true,
                     true,
                     0,
+                    usize::MAX,
                 );
                 let byte_base_b = chunk_byte_base + b_med * N_CHUNKS * 8;
                 let c_in: &[u8; 64] = (&c_packed[byte_base_b..byte_base_b + 64])
@@ -1696,7 +1707,7 @@ mod tests {
                 &a_packed, &b_mixed, &table, 0, 0, &mut want, &mut a_col, &mut b_col,
             );
             shift_reduce_inner_ab_fused_neon_checked(
-                &a_packed, &b_mixed, &table, 0, 0, &mut got, false, false, mask,
+                &a_packed, &b_mixed, &table, 0, 0, &mut got, false, false, mask, usize::MAX,
             );
             assert_eq!(got, want, "mixed const-one mask {mask:#04x}");
         }
