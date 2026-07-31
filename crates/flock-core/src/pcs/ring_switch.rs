@@ -2240,6 +2240,49 @@ pub(crate) struct DirectFold2Factors {
     pub(crate) products: [F128; 16],
 }
 
+#[derive(Clone, Debug)]
+pub(crate) struct DeferredCFold2 {
+    pub(crate) factors: DirectFold2Factors,
+    /// True when a four-bank C precompute populated `factors.products`, so
+    /// pcs can source round-0/1 directly and omit the L-sized scratch sweep.
+    pub(crate) products_ready: bool,
+}
+
+fn build_direct_fold2_factors(
+    suffix: &[F128],
+    s_hat_v_quad: &[F128],
+    table: &[F128],
+    scaled_eq_r_dprime: &[F128],
+) -> DirectFold2Factors {
+    let n_packed = 1usize << LOG_PACKING;
+    assert!(suffix.len() >= 2);
+    assert_eq!(s_hat_v_quad.len(), 4 * n_packed);
+    let low_eq: [F128; 4] = build_eq(&suffix[..2])
+        .try_into()
+        .expect("two-coordinate eq has four entries");
+    let mut products = [F128::ZERO; 16];
+    let mut scaled_bank = vec![F128::ZERO; n_packed];
+    for e in 0..4 {
+        let bank = &s_hat_v_quad[e * n_packed..(e + 1) * n_packed];
+        for d_low in 0..4 {
+            for p in 0..n_packed {
+                scaled_bank[p] = low_eq[d_low] * bank[p];
+            }
+            let transposed = tensor_algebra_transpose(&scaled_bank);
+            products[e * 4 + d_low] = inner_product(&transposed, scaled_eq_r_dprime);
+        }
+    }
+    let tail = &suffix[2..];
+    let (eq_lo, eq_hi) = build_eq_split(tail, deferred_split_n_lo(tail.len()));
+    DirectFold2Factors {
+        eq_lo,
+        eq_hi,
+        low_eq,
+        table: table.to_vec(),
+        products,
+    }
+}
+
 /// Per-claim output of [`prove_batched`]. Mirrors [`RingSwitchOutput`] but lets
 /// the prover skip the dense `2^(m-7)` `rs_eq_ind` allocation for claims whose
 /// suffix tensor is sparse (e.g. the hash-chain claim). Verifier-side
@@ -2254,12 +2297,11 @@ pub struct RingSwitchBatchOutput {
     pub rs_eq_ind: RsEqInd,
     pub sumcheck_claim: F128,
     pub(crate) direct_fold2: Option<DirectFold2Factors>,
-    /// Ranked deferred-C: the ordinary claim's direct-fold2 factor bundle
-    /// (same shape as [`DirectFold2Factors`] but `products` zeroed — C's
-    /// round-0/1 message contribution comes from pcs's combine sweep, not
-    /// from `messages_from_direct_products`). Lets pcs skip materializing
-    /// `b_combined` and fold C 4:1 directly at materialize time.
-    pub(crate) deferred_c_fold2: Option<DirectFold2Factors>,
+    /// Ranked deferred-C: the ordinary claim's direct-fold2 factor bundle.
+    /// With a four-bank C precompute, `products` supplies C's round-0/1
+    /// messages directly; the legacy ordinary capture leaves them zero and
+    /// obtains those messages from pcs's combine sweep instead.
+    pub(crate) deferred_c_fold2: Option<DeferredCFold2>,
 }
 
 /// Sparse-or-dense representation of `rs_eq_ind`. All variants here have γ_k
@@ -2750,15 +2792,16 @@ pub fn prove_batched_padded_with_precomputed<Ch: Challenger>(
     let gammas_rs: Vec<F128> = (0..n).map(|_| challenger.sample_f128()).collect();
 
     // Deferred-C precondition: the exact ranked open shape — two dense split
-    // claims at L = 2^25 where claim 0 is four-bank (AB) and claim 1 is
-    // ordinary (C). Anything else keeps the incumbent outputs untouched.
+    // claims at L = 2^25 where claim 0 is four-bank (AB). Claim 1 is either
+    // ordinary (legacy scratch lookahead) or four-bank (direct C products).
+    // Anything else keeps the incumbent outputs untouched.
     let has_quad: Vec<bool> = work.iter().map(|w| w.s_hat_v_quad.is_some()).collect();
     let deferred_c_enabled = n == 2
         && l == (1usize << 25)
         && use_split
         && has_quad[0]
-        && !has_quad[1]
-        && std::env::var_os("FLOCK_NO_OPEN_DEFERRED_C").is_none();
+        && std::env::var_os("FLOCK_NO_OPEN_DEFERRED_C").is_none()
+        && (!has_quad[1] || std::env::var_os("FLOCK_NO_OPEN_DIRECT_C").is_none());
 
     let results: Vec<(RingSwitchProof, RingSwitchBatchOutput)> = work
         .into_iter()
@@ -2769,57 +2812,51 @@ pub fn prove_batched_padded_with_precomputed<Ch: Challenger>(
                 w.eq_r_dprime.iter().map(|value| g * *value).collect();
             let table = build_fold_byte_table(&scaled_eq_r_dprime);
             let direct_fold2 = match (kinds[i], w.s_hat_v_quad.as_deref()) {
-                (Kind::Dense(d), Some(quad)) if use_split && dense_suffixes[d].len() >= 2 => {
-                    let suffix = dense_suffixes[d];
-                    let low_eq: [F128; 4] = build_eq(&suffix[..2])
-                        .try_into()
-                        .expect("two-coordinate eq has four entries");
-                    let mut products = [F128::ZERO; 16];
-                    let mut scaled_bank = vec![F128::ZERO; n_packed];
-                    for e in 0..4 {
-                        let bank = &quad[e * n_packed..(e + 1) * n_packed];
-                        for d_low in 0..4 {
-                            for p in 0..n_packed {
-                                scaled_bank[p] = low_eq[d_low] * bank[p];
-                            }
-                            let transposed = tensor_algebra_transpose(&scaled_bank);
-                            products[e * 4 + d_low] =
-                                inner_product(&transposed, &scaled_eq_r_dprime);
-                        }
-                    }
-                    let tail = &suffix[2..];
-                    let (eq_lo, eq_hi) =
-                        build_eq_split(tail, deferred_split_n_lo(tail.len()));
-                    Some(DirectFold2Factors {
-                        eq_lo,
-                        eq_hi,
-                        low_eq,
-                        table: table.clone(),
-                        products,
-                    })
+                (Kind::Dense(d), Some(quad))
+                    if i == 0 && use_split && dense_suffixes[d].len() >= 2 =>
+                {
+                    Some(build_direct_fold2_factors(
+                        dense_suffixes[d],
+                        quad,
+                        &table,
+                        &scaled_eq_r_dprime,
+                    ))
                 }
                 _ => None,
             };
-            // Mirrors the AB bundle above minus `products` (zeroed): C's
-            // message contribution flows through pcs's combine sweep.
-            let deferred_c_fold2 = match kinds[i] {
-                Kind::Dense(d)
+            let deferred_c_fold2 = match (kinds[i], w.s_hat_v_quad.as_deref()) {
+                (Kind::Dense(d), quad)
                     if deferred_c_enabled && i == 1 && dense_suffixes[d].len() >= 2 =>
                 {
                     let suffix = dense_suffixes[d];
-                    let low_eq: [F128; 4] = build_eq(&suffix[..2])
-                        .try_into()
-                        .expect("two-coordinate eq has four entries");
-                    let tail = &suffix[2..];
-                    let (eq_lo, eq_hi) =
-                        build_eq_split(tail, deferred_split_n_lo(tail.len()));
-                    Some(DirectFold2Factors {
-                        eq_lo,
-                        eq_hi,
-                        low_eq,
-                        table: table.clone(),
-                        products: [F128::ZERO; 16],
-                    })
+                    if let Some(quad) = quad {
+                        Some(DeferredCFold2 {
+                            factors: build_direct_fold2_factors(
+                                suffix,
+                                quad,
+                                &table,
+                                &scaled_eq_r_dprime,
+                            ),
+                            products_ready: true,
+                        })
+                    } else {
+                        let low_eq: [F128; 4] = build_eq(&suffix[..2])
+                            .try_into()
+                            .expect("two-coordinate eq has four entries");
+                        let tail = &suffix[2..];
+                        let (eq_lo, eq_hi) =
+                            build_eq_split(tail, deferred_split_n_lo(tail.len()));
+                        Some(DeferredCFold2 {
+                            factors: DirectFold2Factors {
+                                eq_lo,
+                                eq_hi,
+                                low_eq,
+                                table: table.clone(),
+                                products: [F128::ZERO; 16],
+                            },
+                            products_ready: false,
+                        })
+                    }
                 }
                 _ => None,
             };

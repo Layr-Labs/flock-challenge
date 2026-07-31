@@ -188,7 +188,7 @@ pub fn prove_packed_padded<C: Challenger>(
     challenger: &mut C,
 ) -> (ZerocheckProof, ZerocheckClaim) {
     let (proof, claim, _) = prove_packed_padded_inner(
-        a_packed, b_packed, c_packed, m, padding, false, None, challenger,
+        a_packed, b_packed, c_packed, m, padding, false, false, None, challenger,
     );
     (proof, claim)
 }
@@ -209,12 +209,33 @@ pub fn prove_packed_padded_capture_s_hat_v_c<C: Challenger>(
     challenger: &mut C,
 ) -> (ZerocheckProof, ZerocheckClaim, Vec<F128>) {
     let (proof, claim, captured) = prove_packed_padded_inner(
-        a_packed, b_packed, c_packed, m, padding, true, None, challenger,
+        a_packed, b_packed, c_packed, m, padding, true, false, None, challenger,
     );
     (
         proof,
         claim,
         captured.expect("capture=true must produce s_hat_v_c"),
+    )
+}
+
+/// Ranked capture variant retaining two additional C suffix coordinates as
+/// four consecutive 128-entry banks. Collapsing those banks at the C point's
+/// first two suffix coordinates recovers exactly the ordinary `s_hat_v_c`.
+pub fn prove_packed_padded_capture_s_hat_v_c_quad<C: Challenger>(
+    a_packed: &[u8],
+    b_packed: &[u8],
+    c_packed: &[u8],
+    m: usize,
+    padding: &PaddingSpec,
+    challenger: &mut C,
+) -> (ZerocheckProof, ZerocheckClaim, Vec<F128>) {
+    let (proof, claim, captured) = prove_packed_padded_inner(
+        a_packed, b_packed, c_packed, m, padding, true, true, None, challenger,
+    );
+    (
+        proof,
+        claim,
+        captured.expect("quad capture must produce s_hat_v_c"),
     )
 }
 
@@ -238,6 +259,7 @@ pub fn prove_packed_padded_capture_s_hat_v_c_with_precomputed_ab<C: Challenger>(
         m,
         padding,
         true,
+        false,
         Some(ab_inner),
         challenger,
     );
@@ -245,6 +267,35 @@ pub fn prove_packed_padded_capture_s_hat_v_c_with_precomputed_ab<C: Challenger>(
         proof,
         claim,
         captured.expect("capture=true must produce s_hat_v_c"),
+    )
+}
+
+/// Precomputed-AB counterpart of
+/// [`prove_packed_padded_capture_s_hat_v_c_quad`].
+pub fn prove_packed_padded_capture_s_hat_v_c_quad_with_precomputed_ab<C: Challenger>(
+    a_packed: &[u8],
+    b_packed: &[u8],
+    c_packed: &[u8],
+    m: usize,
+    padding: &PaddingSpec,
+    ab_inner: univariate_skip_optimized::Round1AbInner,
+    challenger: &mut C,
+) -> (ZerocheckProof, ZerocheckClaim, Vec<F128>) {
+    let (proof, claim, captured) = prove_packed_padded_inner(
+        a_packed,
+        b_packed,
+        c_packed,
+        m,
+        padding,
+        true,
+        true,
+        Some(ab_inner),
+        challenger,
+    );
+    (
+        proof,
+        claim,
+        captured.expect("quad capture must produce s_hat_v_c"),
     )
 }
 
@@ -256,6 +307,7 @@ fn prove_packed_padded_inner<C: Challenger>(
     m: usize,
     padding: &PaddingSpec,
     capture_s_hat_v_c: bool,
+    capture_s_hat_v_c_quad: bool,
     precomputed_ab: Option<univariate_skip_optimized::Round1AbInner>,
     challenger: &mut C,
 ) -> (ZerocheckProof, ZerocheckClaim, Option<Vec<F128>>) {
@@ -306,12 +358,23 @@ fn prove_packed_padded_inner<C: Challenger>(
     let t_round1 = std::time::Instant::now();
     debug_assert_eq!(k_skip, 6, "ranked protocol fixes k_skip=6");
     let inv_table = InvNttTableByteSingleGf8::cached_standard_k6();
+    assert!(!capture_s_hat_v_c_quad || capture_s_hat_v_c);
     let (round1_ab_opt, round1_c_opt, s_hat_v_c) = if let Some(ab_inner) = precomputed_ab.as_ref() {
         assert!(
             capture_s_hat_v_c,
             "precomputed AB path currently requires s_hat_v capture"
         );
-        let (ab, c, s) =
+        let (ab, c, s) = if capture_s_hat_v_c_quad {
+            crate::zerocheck::univariate_skip_optimized::round1_shift_reduce_extract_c_packed_padded_with_precomputed_ab_quad(
+                ab_inner,
+                c_packed,
+                m,
+                k_skip,
+                &r,
+                inv_table,
+                padding,
+            )
+        } else {
             crate::zerocheck::univariate_skip_optimized::round1_shift_reduce_extract_c_packed_padded_with_precomputed_ab(
                 ab_inner,
                 c_packed,
@@ -320,10 +383,22 @@ fn prove_packed_padded_inner<C: Challenger>(
                 &r,
                 inv_table,
                 padding,
-            );
+            )
+        };
         (ab, c, Some(s))
     } else if capture_s_hat_v_c {
-        let (ab, c, s) =
+        let (ab, c, s) = if capture_s_hat_v_c_quad {
+            crate::zerocheck::univariate_skip_optimized::round1_shift_reduce_extract_c_packed_padded_with_s_hat_v_quad(
+                a_packed,
+                b_packed,
+                c_packed,
+                m,
+                k_skip,
+                &r,
+                inv_table,
+                padding,
+            )
+        } else {
             crate::zerocheck::univariate_skip_optimized::round1_shift_reduce_extract_c_packed_padded_with_s_hat_v(
                 a_packed,
                 b_packed,
@@ -333,7 +408,8 @@ fn prove_packed_padded_inner<C: Challenger>(
                 &r,
                 inv_table,
                 padding,
-            );
+            )
+        };
         (ab, c, Some(s))
     } else {
         let (ab, c) = round1_shift_reduce_extract_c_packed_padded(

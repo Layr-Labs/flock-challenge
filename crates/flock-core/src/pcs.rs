@@ -632,6 +632,9 @@ fn compute_combined_basis_and_target<Ch: Challenger>(
     };
 
     let use_deferred_c = deferred_c.is_some();
+    let deferred_c_products_ready = deferred_c.as_ref().is_some_and(|c| {
+        c.products_ready && std::env::var_os("FLOCK_NO_OPEN_DIRECT_C").is_none()
+    });
 
     // ---- Build b_combined (γ-weighted sum of all rs_eq_ind + eq_ind) and the
     //      round-0 prime (u_0, u_2 over packed_witness · b_combined).
@@ -726,7 +729,13 @@ fn compute_combined_basis_and_target<Ch: Challenger>(
 
         let ranked_hetero = use_ranked_hetero_open_combine(l, b, n_rs, n_pd);
         if want_round1_lookahead {
-            let fast = if deferred_c.is_some() {
+            let fast = if deferred_c_products_ready {
+                // AB and C both carry their 4x4 sufficient statistics. Their
+                // complete round-0/1 messages are added below by
+                // `messages_from_direct_products`, so no L-sized C scratch
+                // basis or witness/lookahead sweep is needed here.
+                (F128::ZERO, F128::ZERO, [F128::ZERO; 6])
+            } else if deferred_c.is_some() {
                 run_hetero_open_combine_scratch_lookahead(l / b, b, init_ctable, |ctable, hi, out_block| {
                     fold_lookahead_block(ctable, hi, out_block)
                 })
@@ -827,6 +836,12 @@ fn compute_combined_basis_and_target<Ch: Challenger>(
         (prime.0, prime.1, None)
     };
     let mut round1_lookahead = round1_lookahead;
+    if let Some(c) = deferred_c {
+        direct_fold2
+            .as_mut()
+            .expect("deferred-C requires the direct AB bundle")
+            .push(c.factors);
+    }
     if let Some(direct) = direct_fold2.as_ref() {
         let (direct_round0, direct_lookahead) = messages_from_direct_products(direct);
         round0_u0 += direct_round0.0;
@@ -837,15 +852,6 @@ fn compute_combined_basis_and_target<Ch: Challenger>(
         for (out, value) in combined_lookahead.iter_mut().zip(direct_lookahead) {
             *out += value;
         }
-    }
-    if let Some(c) = deferred_c {
-        // C's round-0/1 contribution already came from the sweep above; its
-        // `products` are zeroed by construction, so it joins only the
-        // materialize-time claims.
-        direct_fold2
-            .as_mut()
-            .expect("deferred-C requires the direct AB bundle")
-            .push(c);
     }
     let fold_ms = t_fold.elapsed().as_secs_f64() * 1e3;
     let t_sparse = std::time::Instant::now();
