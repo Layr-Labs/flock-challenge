@@ -537,6 +537,145 @@ pub(crate) unsafe fn fold_one_row_neon_unchecked_8(
     }
 }
 
+/// Multiply two independent values by the same constant and reduce them in
+/// lane-paired form. Constant-r Karatsuba needs six PMULLs total rather than
+/// the generic two-product schoolbook kernel's eight, and the paired
+/// shift-XOR reduction spends zero PMULLs. Mirrors
+/// `field::f128_slice::aarch64::mul_const_vec2`.
+#[cfg(target_arch = "aarch64")]
+#[inline]
+#[target_feature(enable = "aes")]
+unsafe fn mul_const_vec2_q(
+    r: core::arch::aarch64::uint64x2_t,
+    x0: core::arch::aarch64::uint64x2_t,
+    x1: core::arch::aarch64::uint64x2_t,
+) -> [core::arch::aarch64::uint64x2_t; 2] {
+    use core::arch::aarch64::*;
+    unsafe {
+        let r_lo = vgetq_lane_u64::<0>(r);
+        let r_hi = vgetq_lane_u64::<1>(r);
+        let r_mid = veorq_u64(r, vextq_u64::<1>(r, r));
+        let x0_mid = veorq_u64(x0, vextq_u64::<1>(x0, x0));
+        let x1_mid = veorq_u64(x1, vextq_u64::<1>(x1, x1));
+
+        let p0_ll = pmull_lane(vgetq_lane_u64::<0>(x0), r_lo);
+        let p0_hh = pmull_lane(vgetq_lane_u64::<1>(x0), r_hi);
+        let p0_mm = pmull_lane(vgetq_lane_u64::<0>(x0_mid), vgetq_lane_u64::<0>(r_mid));
+        let p1_ll = pmull_lane(vgetq_lane_u64::<0>(x1), r_lo);
+        let p1_hh = pmull_lane(vgetq_lane_u64::<1>(x1), r_hi);
+        let p1_mm = pmull_lane(vgetq_lane_u64::<0>(x1_mid), vgetq_lane_u64::<0>(r_mid));
+        let c0 = xor3_u64(p0_mm, p0_ll, p0_hh);
+        let c1 = xor3_u64(p1_mm, p1_ll, p1_hh);
+
+        // Pack product 0/1 into lanes and reduce both together.
+        let r0 = vzip1q_u64(p0_ll, p1_ll);
+        let r1 = veorq_u64(vzip2q_u64(p0_ll, p1_ll), vzip1q_u64(c0, c1));
+        let r2 = veorq_u64(vzip1q_u64(p0_hh, p1_hh), vzip2q_u64(c0, c1));
+        let r3 = vzip2q_u64(p0_hh, p1_hh);
+
+        let s1_lo = vshlq_n_u64::<1>(r2);
+        let s1_hi = veorq_u64(vshlq_n_u64::<1>(r3), vshrq_n_u64::<63>(r2));
+        let s2_lo = vshlq_n_u64::<2>(r2);
+        let s2_hi = veorq_u64(vshlq_n_u64::<2>(r3), vshrq_n_u64::<62>(r2));
+        let s7_lo = vshlq_n_u64::<7>(r2);
+        let s7_hi = veorq_u64(vshlq_n_u64::<7>(r3), vshrq_n_u64::<57>(r2));
+        let t_lo = xor3_u64(r2, s1_lo, veorq_u64(s2_lo, s7_lo));
+        let t_hi = xor3_u64(r3, s1_hi, veorq_u64(s2_hi, s7_hi));
+        let overflow = xor3_u64(
+            vshrq_n_u64::<63>(r3),
+            vshrq_n_u64::<62>(r3),
+            vshrq_n_u64::<57>(r3),
+        );
+        let correction = xor3_u64(
+            overflow,
+            vshlq_n_u64::<1>(overflow),
+            veorq_u64(vshlq_n_u64::<2>(overflow), vshlq_n_u64::<7>(overflow)),
+        );
+        let out_lo = xor3_u64(r0, t_lo, correction);
+        let out_hi = veorq_u64(r1, t_hi);
+        [vzip1q_u64(out_lo, out_hi), vzip2q_u64(out_lo, out_hi)]
+    }
+}
+
+/// Q-register-native tail fold + message. **Measured 1.4x SLOWER than the
+/// scalar-struct path on M4 Max** (`fold_and_message_timing`: 0.69x at
+/// eq_len=2^14..2^17) despite dropping ~44 PMULL per 2-output group to 28 and
+/// removing all GPR<->FPR round trips. The wide OoO core hides the scalar
+/// version's fmov traffic, while this version's lane-zip constant-Karatsuba
+/// reduction adds serial vector-ALU latency the PMULL savings do not repay.
+/// Kept (unwired) so the experiment is not repeated.
+#[cfg(target_arch = "aarch64")]
+#[allow(dead_code)]
+#[target_feature(enable = "aes")]
+unsafe fn fold_and_message_aarch64_q(
+    a_in: &[F128],
+    b_in: &[F128],
+    a_out: &mut [F128],
+    b_out: &mut [F128],
+    r_fold: F128,
+    eq_lo: &[F128],
+) -> (F128, F128) {
+    use core::arch::aarch64::*;
+
+    assert_eq!(a_in.len(), 2 * a_out.len());
+    assert_eq!(b_in.len(), 2 * b_out.len());
+    assert_eq!(a_out.len(), 2 * eq_lo.len());
+
+    unsafe {
+        let zero = vdupq_n_u64(0);
+        let r_q = core::mem::transmute::<F128, uint64x2_t>(r_fold);
+        let ap = a_in.as_ptr();
+        let bp = b_in.as_ptr();
+        let aop = a_out.as_mut_ptr();
+        let bop = b_out.as_mut_ptr();
+        let eqp = eq_lo.as_ptr();
+
+        let mut p1 = WideNeon { lo: zero, hi: zero };
+        let mut pinf = WideNeon { lo: zero, hi: zero };
+
+        for x_lo in 0..eq_lo.len() {
+            let i = 4 * x_lo;
+            let o = 2 * x_lo;
+
+            let ae0 = vld1q_u64(ap.add(i).cast::<u64>());
+            let ao0 = vld1q_u64(ap.add(i + 1).cast::<u64>());
+            let ae1 = vld1q_u64(ap.add(i + 2).cast::<u64>());
+            let ao1 = vld1q_u64(ap.add(i + 3).cast::<u64>());
+            let be0 = vld1q_u64(bp.add(i).cast::<u64>());
+            let bo0 = vld1q_u64(bp.add(i + 1).cast::<u64>());
+            let be1 = vld1q_u64(bp.add(i + 2).cast::<u64>());
+            let bo1 = vld1q_u64(bp.add(i + 3).cast::<u64>());
+
+            // Fold at r: v = even ^ r*(even^odd), both values of each
+            // polynomial through one paired constant-r multiply.
+            let pa = mul_const_vec2_q(r_q, veorq_u64(ae0, ao0), veorq_u64(ae1, ao1));
+            let a0 = veorq_u64(ae0, pa[0]);
+            let a1 = veorq_u64(ae1, pa[1]);
+            let pb = mul_const_vec2_q(r_q, veorq_u64(be0, bo0), veorq_u64(be1, bo1));
+            let b0 = veorq_u64(be0, pb[0]);
+            let b1 = veorq_u64(be1, pb[1]);
+
+            vst1q_u64(aop.add(o).cast::<u64>(), a0);
+            vst1q_u64(aop.add(o + 1).cast::<u64>(), a1);
+            vst1q_u64(bop.add(o).cast::<u64>(), b0);
+            vst1q_u64(bop.add(o + 1).cast::<u64>(), b1);
+
+            // Message contributions: eq * (a1·b1) and eq * ((a0+a1)·(b0+b1)),
+            // with the inner product reduced and the eq product left wide.
+            let g1 = mul_q(a1, b1);
+            let ginf = mul_q(veorq_u64(a0, a1), veorq_u64(b0, b1));
+            let eq = vld1q_u64(eqp.add(x_lo).cast::<u64>());
+            wide_xor(&mut p1, mul_unreduced_q(eq, g1));
+            wide_xor(&mut pinf, mul_unreduced_q(eq, ginf));
+        }
+
+        (
+            core::mem::transmute::<uint64x2_t, F128>(reduce_wide_q(p1)),
+            core::mem::transmute::<uint64x2_t, F128>(reduce_wide_q(pinf)),
+        )
+    }
+}
+
 /// Fuse one multilinear tail fold with construction of the following round's
 /// message. The previous AArch64 path first streamed all of `a_in`/`b_in` into
 /// `a_out`/`b_out`, then immediately reread both outputs in a second pass.
@@ -545,6 +684,23 @@ pub(crate) unsafe fn fold_one_row_neon_unchecked_8(
 /// canonical output tables for the next round.
 #[cfg(target_arch = "aarch64")]
 pub(crate) fn fold_and_message_aarch64(
+    a_in: &[F128],
+    b_in: &[F128],
+    a_out: &mut [F128],
+    b_out: &mut [F128],
+    r_fold: F128,
+    eq_lo: &[F128],
+) -> (F128, F128) {
+    // The q-register rewrite measured slower (see fold_and_message_aarch64_q);
+    // the scalar-struct body remains the fastest known form on Apple Silicon.
+    fold_and_message_scalar_ref(a_in, b_in, a_out, b_out, r_fold, eq_lo)
+}
+
+/// Scalar-struct implementation of the fused tail fold + message: the live
+/// path, and the bit-exactness oracle for the (slower, unwired)
+/// [`fold_and_message_aarch64_q`] in tests.
+#[cfg(target_arch = "aarch64")]
+pub(crate) fn fold_and_message_scalar_ref(
     a_in: &[F128],
     b_in: &[F128],
     a_out: &mut [F128],
@@ -661,6 +817,115 @@ mod tests {
                     expected_unreduced
                 );
             }
+        }
+    }
+
+    #[test]
+    fn mul_const_vec2_q_matches_scalar_products() {
+        let mut state = 0x636f_6e73_745f_7632;
+        unsafe {
+            for _ in 0..256 {
+                let r = F128::new(splitmix64(&mut state), splitmix64(&mut state));
+                let x0 = F128::new(splitmix64(&mut state), splitmix64(&mut state));
+                let x1 = F128::new(splitmix64(&mut state), splitmix64(&mut state));
+                let out = mul_const_vec2_q(
+                    core::mem::transmute::<F128, uint64x2_t>(r),
+                    core::mem::transmute::<F128, uint64x2_t>(x0),
+                    core::mem::transmute::<F128, uint64x2_t>(x1),
+                );
+                assert_eq!(core::mem::transmute::<uint64x2_t, F128>(out[0]), r * x0);
+                assert_eq!(core::mem::transmute::<uint64x2_t, F128>(out[1]), r * x1);
+            }
+        }
+    }
+
+    #[test]
+    fn fold_and_message_q_matches_scalar_reference() {
+        let mut state = 0x666f_6c64_6d73_6721;
+        for eq_len in [1usize, 2, 3, 8, 33, 128] {
+            let n_in = 4 * eq_len;
+            let n_out = 2 * eq_len;
+            let rand_f128 =
+                |state: &mut u64| F128::new(splitmix64(state), splitmix64(state));
+
+            let a_in: Vec<F128> = (0..n_in).map(|_| rand_f128(&mut state)).collect();
+            let b_in: Vec<F128> = (0..n_in).map(|_| rand_f128(&mut state)).collect();
+            let eq_lo: Vec<F128> = (0..eq_len).map(|_| rand_f128(&mut state)).collect();
+            let r_fold = rand_f128(&mut state);
+
+            let mut a_out_ref = vec![F128::ZERO; n_out];
+            let mut b_out_ref = vec![F128::ZERO; n_out];
+            let expected = fold_and_message_scalar_ref(
+                &a_in,
+                &b_in,
+                &mut a_out_ref,
+                &mut b_out_ref,
+                r_fold,
+                &eq_lo,
+            );
+
+            let mut a_out_q = vec![F128::ZERO; n_out];
+            let mut b_out_q = vec![F128::ZERO; n_out];
+            let got = unsafe {
+                fold_and_message_aarch64_q(
+                    &a_in,
+                    &b_in,
+                    &mut a_out_q,
+                    &mut b_out_q,
+                    r_fold,
+                    &eq_lo,
+                )
+            };
+
+            assert_eq!(got, expected, "messages diverge at eq_len={eq_len}");
+            assert_eq!(a_out_q, a_out_ref, "a_out diverges at eq_len={eq_len}");
+            assert_eq!(b_out_q, b_out_ref, "b_out diverges at eq_len={eq_len}");
+        }
+    }
+
+    /// Timing harness: `cargo test --profile challenge -p flock-core --lib -- \
+    ///   --ignored --nocapture fold_and_message_timing`
+    #[test]
+    #[ignore]
+    fn fold_and_message_timing() {
+        let mut state = 0x7469_6d69_6e67_2121;
+        let rand_f128 = |state: &mut u64| F128::new(splitmix64(state), splitmix64(state));
+
+        for log_eq in [10usize, 14, 17] {
+            let eq_len = 1 << log_eq;
+            let n_in = 4 * eq_len;
+            let n_out = 2 * eq_len;
+            let a_in: Vec<F128> = (0..n_in).map(|_| rand_f128(&mut state)).collect();
+            let b_in: Vec<F128> = (0..n_in).map(|_| rand_f128(&mut state)).collect();
+            let eq_lo: Vec<F128> = (0..eq_len).map(|_| rand_f128(&mut state)).collect();
+            let r_fold = rand_f128(&mut state);
+            let mut a_out = vec![F128::ZERO; n_out];
+            let mut b_out = vec![F128::ZERO; n_out];
+
+            let reps = (1usize << 24) / eq_len;
+            let time = |f: &mut dyn FnMut() -> (F128, F128)| {
+                let mut acc = F128::ZERO;
+                let start = std::time::Instant::now();
+                for _ in 0..reps {
+                    let (x, y) = f();
+                    acc = acc + x + y;
+                }
+                (start.elapsed().as_nanos() as f64 / reps as f64, acc)
+            };
+
+            let (t_scalar, c_scalar) = time(&mut || {
+                fold_and_message_scalar_ref(&a_in, &b_in, &mut a_out, &mut b_out, r_fold, &eq_lo)
+            });
+            let (t_q, c_q) = time(&mut || unsafe {
+                fold_and_message_aarch64_q(&a_in, &b_in, &mut a_out, &mut b_out, r_fold, &eq_lo)
+            });
+            assert_eq!(c_scalar, c_q);
+            println!(
+                "eq_len=2^{log_eq}: scalar {:>10.1} ns/call  q {:>10.1} ns/call  ({:.2}x)",
+                t_scalar,
+                t_q,
+                t_scalar / t_q
+            );
         }
     }
 }
