@@ -2051,19 +2051,31 @@ fn transpose_forward_ntt_fused_3layer(
     let eighth = block_size >> 3;
     let eighth_log = log_d - layer - 3;
     let row_mask = eighth - 1;
-    let twiddles: Vec<[F128; 7]> = (0..num_blocks)
-        .map(|block| {
-            let mut tw = [F128::ZERO; 7];
-            tw[0] = ntt.twiddle(layer, block);
-            for s in 0..2 {
-                tw[1 + s] = ntt.twiddle(layer + 1, 2 * block + s);
-            }
-            for s in 0..4 {
-                tw[3 + s] = ntt.twiddle(layer + 2, 4 * block + s);
-            }
-            tw
-        })
-        .collect();
+    let load_twiddles = |block| {
+        let mut tw = [F128::ZERO; 7];
+        tw[0] = ntt.twiddle(layer, block);
+        for s in 0..2 {
+            tw[1 + s] = ntt.twiddle(layer + 1, 2 * block + s);
+        }
+        for s in 0..4 {
+            tw[3 + s] = ntt.twiddle(layer + 2, 4 * block + s);
+        }
+        tw
+    };
+
+    // In the deepest fused group `eighth == 1`, so every seven-twiddle
+    // bundle has exactly one consumer. Building a second 14 MiB bundle table
+    // for the ranked log-20 transpose only writes and rereads those values.
+    // Load directly from the NTT's already-precomputed breadth-first table in
+    // that case. Shallower groups retain the gathered layout because each
+    // bundle is reused by several row jobs.
+    let direct_deepest_twiddles =
+        eighth == 1 && std::env::var_os("FLOCK_NO_TRANSPOSE_DIRECT_DEEPEST_TWIDDLES").is_none();
+    let twiddles: Vec<[F128; 7]> = if direct_deepest_twiddles {
+        Vec::new()
+    } else {
+        (0..num_blocks).map(load_twiddles).collect()
+    };
 
     // Flatten `(block, row)` into one Rayon range. This keeps all cores busy
     // even for the final few large blocks without opening nested parallel
@@ -2083,7 +2095,13 @@ fn transpose_forward_ntt_fused_3layer(
             for (i, value) in values.iter_mut().enumerate() {
                 *value = *ptr.add(base + i * eighth);
             }
-            let tw = &twiddles[block];
+            let direct_twiddles;
+            let tw = if direct_deepest_twiddles {
+                direct_twiddles = load_twiddles(block);
+                &direct_twiddles
+            } else {
+                &twiddles[block]
+            };
             for pair in 0..4 {
                 butterfly(&mut values, 2 * pair, 2 * pair + 1, tw[3 + pair]);
             }
