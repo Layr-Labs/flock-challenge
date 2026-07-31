@@ -100,9 +100,9 @@ mod sha256x4;
 mod sha256x4;
 
 /// Apple AArch64 BLAKE3 kernels specialized for the ranked Merkle geometry.
-/// The 1 KiB leaf path interleaves two four-lane states round-by-round, while
-/// parent nodes use three four-lane states. Every other target retains the
-/// upstream `blake3::platform::hash_many` path.
+/// Both the 1 KiB leaf path and one-block path interleave three four-lane
+/// states round-by-round. Every other target retains the upstream
+/// `blake3::platform::hash_many` path.
 #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
 #[path = "merkle/blake3_neon_apple.rs"]
 mod blake3_neon_apple;
