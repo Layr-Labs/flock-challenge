@@ -19,3 +19,7 @@ pub mod merkle_path;
 pub mod proof_io;
 pub mod prover;
 pub mod r1cs_hashes;
+// NOTE: a recycling #[global_allocator] (recycle_alloc.rs) was part of
+// submission 6c3a0ffe, which regressed -4.7% vs its base on the ranked
+// runner while the NTT fusion alone measured +6% locally; the allocator is
+// unwired pending an isolated ranked measurement.

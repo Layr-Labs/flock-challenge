@@ -2569,10 +2569,22 @@ pub fn prove_batched_padded_with_precomputed<Ch: Challenger>(
     //    back to the materialized tensor + the legacy multi-fold.
     let use_split = l.is_multiple_of(16);
     let t = std::time::Instant::now();
+    // `dense_splits[d]` is only ever read by the fold_1b_rows dispatch below,
+    // and only for claims without a precomputed s_hat_v. The deferred-fold
+    // path later re-splits coarse (`deferred_split_n_lo`) on purpose, so
+    // building balanced splits for precomputed claims is pure dead work —
+    // skip them (empty placeholders keep the `d` indexing intact).
     let dense_splits: Vec<(Vec<F128>, Vec<F128>)> = if use_split {
         dense_suffixes
             .iter()
-            .map(|s| build_eq_split(s, split_n_lo(s.len())))
+            .enumerate()
+            .map(|(d, s)| {
+                if has_precomputed(dense_to_orig[d]) {
+                    (Vec::new(), Vec::new())
+                } else {
+                    build_eq_split(s, split_n_lo(s.len()))
+                }
+            })
             .collect()
     } else {
         Vec::new()
