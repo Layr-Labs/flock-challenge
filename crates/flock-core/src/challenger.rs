@@ -556,12 +556,11 @@ fn pow_has_leading_zero_bits(
 
 /// Nonces hashed per `hash_many` call in the BLAKE3 grind.
 ///
-/// Must clear the widest `simd_degree` (16, under AVX-512) so the batch fills
-/// the machine's vector; 32 leaves headroom and keeps the buffers (2 KiB of
-/// pre-images + 1 KiB of digests) stack-resident. Swept 1/4/8/16/32/64 on an
-/// M4 Max: 1 is ~2.2× slower at 17 bits, everything from 4 up is within noise
-/// of each other.
-const BLAKE3_POW_BATCH: usize = 32;
+/// Twenty-four is two complete groups for the Apple twelve-way kernel, so
+/// every normal batch avoids falling back to upstream four-way `hash_many`.
+/// It also clears the widest portable `simd_degree` (16, under AVX-512) and
+/// keeps the buffers (1.5 KiB of pre-images + 768 B of digests) stack-resident.
+const BLAKE3_POW_BATCH: usize = 24;
 
 /// Smallest nonce in `start .. start + len` whose BLAKE3 PoW hash has `bits`
 /// leading zeros, or `None`.
@@ -791,9 +790,9 @@ mod tests {
     #[test]
     fn blake3_batched_pow_matches_scalar() {
         let state = [0x5Au8; 32];
-        // Cover nonce counts either side of the batch width (32): a partial
-        // batch, exactly one, one past, and several with a ragged tail.
-        for len in [1u64, 5, 31, 32, 33, 100] {
+        // Cover counts around both the twelve-way kernel and the 24-wide
+        // grind batch: partial groups/batches, exact widths, and ragged tails.
+        for len in [1u64, 5, 11, 12, 13, 23, 24, 25, 31, 32, 33, 47, 48, 49, 100] {
             for start in [0u64, 7, 1_000_000] {
                 // `bits = 0` makes every nonce a match, so the scan must return
                 // `start` — and the per-lane hashes are all exercised below.
