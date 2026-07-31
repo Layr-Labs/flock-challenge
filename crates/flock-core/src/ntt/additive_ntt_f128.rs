@@ -465,98 +465,6 @@ impl AdditiveNttF128 {
         unreachable!("ranked top split requires a hardware NTT target");
     }
 
-    /// Twiddle set for one fused-three-layer block at `layer..layer+3`.
-    #[inline]
-    fn fused3_block_twiddles(&self, layer: usize, block: usize) -> [F128; 7] {
-        let mut tw = [F128 { lo: 0, hi: 0 }; 7];
-        tw[0] = self.twiddle(layer, block);
-        for s in 0..2 {
-            tw[1 + s] = self.twiddle(layer + 1, 2 * block + s);
-        }
-        for s in 0..4 {
-            tw[3 + s] = self.twiddle(layer + 2, 4 * block + s);
-        }
-        tw
-    }
-
-    /// Ranked top passes with the first radix-8 pass reading the packed
-    /// message directly instead of pre-replicated codeword halves.
-    ///
-    /// After the trivial rate-1/2 layer 0 both codeword halves hold the same
-    /// replica of `msg`, so the layer-1..3 pass can source **`msg` itself**:
-    /// one read of each source row feeds both halves' butterfly networks
-    /// (zero-root for block 0, generic for block 1), and the replica copies
-    /// are never materialized. `data` may be entirely uninitialized on entry;
-    /// every element is written by the pass. Layers 4..9 then run in place
-    /// exactly as [`Self::forward_transform_interleaved_ranked_top_from_layer`]
-    /// would run them.
-    ///
-    /// Callers gate this on the same conditions as the ranked top split
-    /// (`split_ranked_top` in `pcs::commit`); the shape assert mirrors
-    /// [`Self::forward_transform_interleaved_ranked_top_from_layer`].
-    pub(crate) fn forward_transform_interleaved_ranked_top_from_message(
-        &self,
-        msg: &[F128],
-        data: &mut [F128],
-        num_ntts: usize,
-        start_layer: usize,
-    ) {
-        let log_d = log2_pow2(data.len() / num_ntts);
-        assert!(use_ranked_deep_pair_fusion(
-            log_d,
-            num_ntts,
-            start_layer,
-            10
-        ));
-        assert_eq!(start_layer, 1, "from-message pass is a layer-1 kernel");
-        assert_eq!(data.len(), 2 * msg.len());
-
-        #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
-        {
-            let n_top = 10usize;
-            // Pass 1 (layers 1-3) from the message.
-            let block_size = 1usize << (log_d - 1);
-            let tw = [
-                self.fused3_block_twiddles(1, 0),
-                self.fused3_block_twiddles(1, 1),
-            ];
-            butterfly_interleaved_fused_3layer_pass1_from_message_hetero(
-                msg,
-                data,
-                &tw,
-                block_size >> 3,
-                num_ntts,
-            );
-            // Passes 2-3 (layers 4-6, 7-9) in place, identical to the ranked
-            // TOP_ONLY loop's hetero dispatch.
-            for layer in [4usize, 7] {
-                debug_assert!(is_ranked_top_hetero_fused3_pass(
-                    log_d,
-                    num_ntts,
-                    start_layer,
-                    n_top,
-                    layer
-                ));
-                let num_blocks = 1usize << layer;
-                let block_size = 1usize << (log_d - layer);
-                let twiddles: Vec<[F128; 7]> = (0..num_blocks)
-                    .map(|b| self.fused3_block_twiddles(layer, b))
-                    .collect();
-                butterfly_interleaved_fused_3layer_all_blocks_hetero(
-                    data,
-                    &twiddles,
-                    block_size >> 3,
-                    num_ntts,
-                );
-            }
-        }
-        #[cfg(not(all(target_arch = "aarch64", target_feature = "aes")))]
-        {
-            let _ = msg;
-            unreachable!("ranked from-message top pass requires the aarch64 NTT target");
-        }
-    }
-
     /// Finish the ranked L0 transform's five cache-local deep pairs and invoke
     /// `finish_chunk` exactly as the unsplit transform does.
     #[inline]
@@ -1687,54 +1595,6 @@ fn butterfly_interleaved_fused_3layer_all_blocks_hetero(
     });
 }
 
-/// Pass-1-from-message twin of
-/// [`butterfly_interleaved_fused_3layer_all_blocks_hetero`]: the layer-1 pass
-/// over both rate-1/2 blocks, sourcing every row group once from `msg`.
-/// `twiddles[0]` is block 0's zero-root set, `twiddles[1]` block 1's generic
-/// set. `data` may be uninitialized; the pass writes all of it.
-#[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
-fn butterfly_interleaved_fused_3layer_pass1_from_message_hetero(
-    msg: &[F128],
-    data: &mut [F128],
-    twiddles: &[[F128; 7]; 2],
-    eighth: usize,
-    num_ntts: usize,
-) {
-    let block_elems = 8 * eighth * num_ntts;
-    debug_assert_eq!(msg.len(), block_elems);
-    debug_assert_eq!(data.len(), 2 * block_elems);
-    debug_assert!(eighth.is_power_of_two());
-    debug_assert_eq!(twiddles[0][0], F128::ZERO);
-    debug_assert_eq!(twiddles[0][1], F128::ZERO);
-    debug_assert_eq!(twiddles[0][3], F128::ZERO);
-
-    const ROWS_PER_TILE: usize = 128;
-    let tiles = eighth.div_ceil(ROWS_PER_TILE);
-    let msg_base = crate::epool::SyncPtr(msg.as_ptr().cast_mut());
-    let out_base = crate::epool::SyncPtr(data.as_mut_ptr());
-    crate::epool::run_hetero_chunks(tiles, |tile| {
-        let row_start = tile * ROWS_PER_TILE;
-        let row_end = (row_start + ROWS_PER_TILE).min(eighth);
-        for row in row_start..row_end {
-            // SAFETY: each queue index maps to one disjoint row tile; the
-            // kernel writes the same disjoint row group in both output
-            // blocks and only reads `msg`.
-            unsafe {
-                kernels::butterfly_fused_3layer_pass1_from_message_row(
-                    msg_base.ptr().cast_const(),
-                    out_base.ptr(),
-                    out_base.ptr().add(block_elems),
-                    eighth,
-                    num_ntts,
-                    row,
-                    &twiddles[0],
-                    &twiddles[1],
-                );
-            }
-        }
-    });
-}
-
 /// Butterfly one top-layer block, fusing four layers `(L..L+4)`. `block` holds
 /// `16 * sixteenth` rows of `num_ntts` lanes; `t` carries the 15 twiddles for
 /// the sub-butterflies (see module comment above). Parallel over row groups.
@@ -1781,42 +1641,6 @@ fn log2_pow2(n: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
-    #[test]
-    fn pass1_from_message_matches_replicated_pass() {
-        let mut rng = Rng::new(0xA3_FA51_1075);
-        for (log_d, num_ntts) in [(6usize, 2usize), (8, 4), (10, 8)] {
-            let ntt = AdditiveNttF128::standard(log_d);
-            let block_size = 1usize << (log_d - 1);
-            let eighth = block_size >> 3;
-            let n = (1usize << log_d) * num_ntts;
-            let msg: Vec<F128> = (0..n / 2).map(|_| rng.f128()).collect();
-            let tw = [
-                ntt.fused3_block_twiddles(1, 0),
-                ntt.fused3_block_twiddles(1, 1),
-            ];
-
-            // Reference: replicate the message into both halves, then run the
-            // existing in-place fused pass over both blocks.
-            let mut expect: Vec<F128> = msg.iter().chain(msg.iter()).copied().collect();
-            let twv = vec![tw[0], tw[1]];
-            butterfly_interleaved_fused_3layer_all_blocks_hetero(&mut expect, &twv, eighth, num_ntts);
-
-            // From-message driver into a poisoned (stale-content) buffer.
-            let mut got = vec![
-                F128 {
-                    lo: 0xDEAD_BEEF_DEAD_BEEF,
-                    hi: 0xDEAD_BEEF_DEAD_BEEF
-                };
-                n
-            ];
-            butterfly_interleaved_fused_3layer_pass1_from_message_hetero(
-                &msg, &mut got, &tw, eighth, num_ntts,
-            );
-            assert_eq!(got, expect, "log_d={log_d} num_ntts={num_ntts}");
-        }
-    }
 
     struct Rng(u64);
     impl Rng {

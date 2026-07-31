@@ -215,43 +215,6 @@ pub(super) unsafe fn butterfly_fused_3layer_zero_root_row(
     }
 }
 
-/// Pass-1-from-message variant of the fused-three-layer row kernel: one read
-/// of the message row group feeds both rate-1/2 codeword halves (zero-root
-/// block 0 into `out0`, generic block 1 into `out1`).
-///
-/// # Safety
-/// As [`butterfly_fused_3layer_row`] for all three buffers; additionally
-/// `tw0[0]`, `tw0[1]`, and `tw0[3]` must be zero.
-#[inline]
-pub(super) unsafe fn butterfly_fused_3layer_pass1_from_message_row(
-    msg: *const F128,
-    out0: *mut F128,
-    out1: *mut F128,
-    eighth: usize,
-    num_ntts: usize,
-    r: usize,
-    tw0: &[F128; 7],
-    tw1: &[F128; 7],
-) {
-    #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
-    // SAFETY: forwarded caller contract; the cfg gate supplies `aes`.
-    unsafe {
-        if vector_resident_rows() {
-            aarch64::butterfly_fused_3layer_pass1_from_message_row(
-                msg, out0, out1, eighth, num_ntts, r, tw0, tw1,
-            );
-            return;
-        }
-    }
-
-    // SAFETY: forwarded caller contract.
-    unsafe {
-        portable::butterfly_fused_3layer_pass1_from_message_row(
-            msg, out0, out1, eighth, num_ntts, r, tw0, tw1,
-        );
-    }
-}
-
 #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
 #[inline]
 pub(super) unsafe fn butterfly_neon_block(chunk: &mut [F128], twiddle: F128, half: usize) {
