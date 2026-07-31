@@ -72,6 +72,35 @@ pub(super) fn butterfly_fused_2layer(
     portable::butterfly_fused_2layer(a, b, c, d, t_outer, t_inner_a, t_inner_b);
 }
 
+/// AArch64 specialization for a fused pair whose three twiddles all have a
+/// zero high limb. Other targets retain the ordinary field-multiply kernel.
+#[allow(clippy::too_many_arguments)]
+#[inline]
+pub(super) fn butterfly_fused_2layer_low_twiddles(
+    a: &mut [F128],
+    b: &mut [F128],
+    c: &mut [F128],
+    d: &mut [F128],
+    t_outer: F128,
+    t_inner_a: F128,
+    t_inner_b: F128,
+) {
+    debug_assert_eq!(t_outer.hi, 0);
+    debug_assert_eq!(t_inner_a.hi, 0);
+    debug_assert_eq!(t_inner_b.hi, 0);
+
+    #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+    // SAFETY: the cfg gate guarantees PMULL through the aes feature.
+    unsafe {
+        aarch64::butterfly_fused_2layer_low_twiddles(
+            a, b, c, d, t_outer, t_inner_a, t_inner_b,
+        );
+    }
+
+    #[cfg(not(all(target_arch = "aarch64", target_feature = "aes")))]
+    portable::butterfly_fused_2layer(a, b, c, d, t_outer, t_inner_a, t_inner_b);
+}
+
 /// Process one fused-four-layer row group across every interleaved NTT lane.
 ///
 /// # Safety

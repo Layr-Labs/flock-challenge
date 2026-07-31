@@ -651,50 +651,154 @@ pub fn build_block_r1cs(n_blocks_log: usize) -> BlockR1cs {
 // positions (cv_bit/m_bit/etc.).
 // ---------------------------------------------------------------------------
 
-#[inline]
-fn scatter_add_carry_rows(
-    comb: &mut [F128],
-    alpha: F128,
-    eq_inner: &[F128],
-    x: &Word,
-    y: &Word,
-    carry_base: usize,
-) -> Word {
-    for i in 0..CARRY_BITS_PER_ADD {
-        let row = carry_base + i;
-        let e = eq_inner[row];
-        let ea = alpha * e;
-        for &slot in x.bits[i].iter() {
-            comb[slot] += ea;
-        }
-        for j in 0..i {
-            comb[carry_base + j] += ea;
-        }
-        for &slot in y.bits[i].iter() {
-            comb[slot] += e;
-        }
-        for j in 0..i {
-            comb[carry_base + j] += e;
-        }
-    }
-    Word::add_sum(x, y, carry_base)
+/// One node in the compact linear-expression DAG used by the reverse
+/// transpose.  Unlike [`Word`], this never expands an intermediate into its
+/// (potentially very large) set of source columns.
+#[derive(Clone, Copy)]
+enum ReverseWordOp {
+    Leaf(usize),
+    Constant(u32),
+    Add {
+        x: usize,
+        y: usize,
+        carry_base: usize,
+    },
+    XorRot {
+        x: usize,
+        y: usize,
+        rotation: usize,
+    },
 }
 
-#[inline]
-fn scatter_lin_id_row(
-    comb: &mut [F128],
+/// Reverse-mode evaluator for `alpha * A_0^T * eq + B_0^T * eq`.
+///
+/// Each logical 32-bit value is a DAG node.  Row weights are first attached
+/// to the values read by carry and lin-id rows, then one reverse sweep moves
+/// those weights to witness columns.  This makes work proportional to the
+/// BLAKE3 dependency graph rather than to the ~21M entries in its expanded
+/// sparse matrices.
+struct ReverseTranspose<'a> {
     alpha: F128,
-    eq_inner: &[F128],
-    row: usize,
-    word_bits_i: &[usize],
-) {
-    let e = eq_inner[row];
-    let ea = alpha * e;
-    for &slot in word_bits_i.iter() {
-        comb[slot] += ea;
-    }
-    comb[Z_CONST_POS] += e;
+    eq_inner: &'a [F128],
+    ops: Vec<ReverseWordOp>,
+    adjoints: Vec<[F128; WORD_BITS]>,
+    comb: Vec<F128>,
 }
+
+impl<'a> ReverseTranspose<'a> {
+    fn new(alpha: F128, eq_inner: &'a [F128]) -> Self {
+        Self {
+            alpha,
+            eq_inner,
+            ops: Vec::with_capacity(32 + 12 * N_G + 16),
+            adjoints: Vec::with_capacity(32 + 12 * N_G + 16),
+            comb: vec![F128::ZERO; K],
+        }
+    }
+
+    #[inline]
+    fn push(&mut self, op: ReverseWordOp) -> usize {
+        let id = self.ops.len();
+        self.ops.push(op);
+        self.adjoints.push([F128::ZERO; WORD_BITS]);
+        id
+    }
+
+    #[inline]
+    fn leaf(&mut self, base: usize) -> usize {
+        self.push(ReverseWordOp::Leaf(base))
+    }
+
+    #[inline]
+    fn constant(&mut self, value: u32) -> usize {
+        self.push(ReverseWordOp::Constant(value))
+    }
+
+    #[inline]
+    fn xor_rot(&mut self, x: usize, y: usize, rotation: usize) -> usize {
+        self.push(ReverseWordOp::XorRot {
+            x,
+            y,
+            rotation,
+        })
+    }
+
+    /// Register one carry-only addition and all 31 nonlinear rows that define
+    /// its carry columns.
+    #[inline]
+    fn add(&mut self, x: usize, y: usize, carry_base: usize) -> usize {
+        let out = self.push(ReverseWordOp::Add { x, y, carry_base });
+
+        // Row i reads x[i] in A, y[i] in B, and carry[0..i] in both.
+        // Accumulating the latter backwards turns the triangular row walk into
+        // one suffix scan over the 31 carry columns.
+        let alpha_plus_one = self.alpha + F128::ONE;
+        let mut suffix = F128::ZERO;
+        for i in (0..CARRY_BITS_PER_ADD).rev() {
+            self.comb[carry_base + i] += suffix;
+            let e = self.eq_inner[carry_base + i];
+            self.adjoints[x][i] += self.alpha * e;
+            self.adjoints[y][i] += e;
+            suffix += alpha_plus_one * e;
+        }
+        out
+    }
+
+    /// Attach the A-side weight of a lin-id row to its defining expression;
+    /// its B-side is the constant-one column.
+    #[inline]
+    fn seed_lin_row(&mut self, value: usize, bit: usize, row: usize) {
+        let e = self.eq_inner[row];
+        self.adjoints[value][bit] += self.alpha * e;
+        self.comb[Z_CONST_POS] += e;
+    }
+
+    fn finish(mut self) -> Vec<F128> {
+        for id in (0..self.ops.len()).rev() {
+            // F128 is Copy, so taking this 32-lane value avoids aliasing the
+            // current node while predecessor adjoints are updated.
+            let q = self.adjoints[id];
+            match self.ops[id] {
+                ReverseWordOp::Leaf(base) => {
+                    for (i, value) in q.into_iter().enumerate() {
+                        self.comb[base + i] += value;
+                    }
+                }
+                ReverseWordOp::Constant(value) => {
+                    for (i, weight) in q.into_iter().enumerate() {
+                        if (value >> i) & 1 == 1 {
+                            self.comb[Z_CONST_POS] += weight;
+                        }
+                    }
+                }
+                ReverseWordOp::XorRot { x, y, rotation } => {
+                    for (i, weight) in q.into_iter().enumerate() {
+                        let source_bit = (i + rotation) % WORD_BITS;
+                        self.adjoints[x][source_bit] += weight;
+                        self.adjoints[y][source_bit] += weight;
+                    }
+                }
+                ReverseWordOp::Add { x, y, carry_base } => {
+                    // sum[i] = x[i] + y[i] + carry[0] + ... + carry[i-1].
+                    // The reverse of the carry prefix is another suffix scan.
+                    let mut suffix = F128::ZERO;
+                    for i in (0..WORD_BITS).rev() {
+                        if i < CARRY_BITS_PER_ADD {
+                            self.comb[carry_base + i] += suffix;
+                        }
+                        let weight = q[i];
+                        self.adjoints[x][i] += weight;
+                        self.adjoints[y][i] += weight;
+                        suffix += weight;
+                    }
+                }
+            }
+        }
+        self.comb
+    }
+}
+
+
 
 pub struct Blake3LincheckCircuit;
 
@@ -705,129 +809,107 @@ impl flock_core::lincheck::LincheckCircuit for Blake3LincheckCircuit {
 
     fn fold_alpha_batched(&self, alpha: F128, eq_inner: &[F128]) -> Vec<F128> {
         assert_eq!(eq_inner.len(), K, "eq_inner length must equal n_cols = K");
-        let mut comb = vec![F128::ZERO; K];
+        let mut reverse = ReverseTranspose::new(alpha, eq_inner);
 
-        // Const row.
+        // Rows whose A side is the input itself and whose B side is one.
         let e0 = eq_inner[Z_CONST_POS];
-        comb[Z_CONST_POS] += alpha * e0;
-        comb[Z_CONST_POS] += e0;
-
-        // Input self-loops for cv, m, counter, blen, flags.
-        let input_emit = |comb: &mut [F128], base: usize, len: usize| {
-            for j in 0..len {
-                let s = base + j;
-                let e = eq_inner[s];
-                comb[s] += alpha * e;
-                comb[Z_CONST_POS] += e;
+        reverse.comb[Z_CONST_POS] += alpha * e0 + e0;
+        let input_emit = |reverse: &mut ReverseTranspose<'_>, base: usize, len: usize| {
+            for s in base..base + len {
+                let e = reverse.eq_inner[s];
+                reverse.comb[s] += reverse.alpha * e;
+                reverse.comb[Z_CONST_POS] += e;
             }
         };
-        input_emit(&mut comb, CV_BASE, 8 * WORD_BITS);
-        input_emit(&mut comb, M_BASE, 16 * WORD_BITS);
-        input_emit(&mut comb, T_LO_BASE, WORD_BITS);
-        input_emit(&mut comb, T_HI_BASE, WORD_BITS);
-        input_emit(&mut comb, BLEN_BASE, WORD_BITS);
-        input_emit(&mut comb, FLAGS_BASE, WORD_BITS);
+        input_emit(&mut reverse, CV_BASE, 8 * WORD_BITS);
+        input_emit(&mut reverse, M_BASE, 16 * WORD_BITS);
+        input_emit(&mut reverse, T_LO_BASE, WORD_BITS);
+        input_emit(&mut reverse, T_HI_BASE, WORD_BITS);
+        input_emit(&mut reverse, BLEN_BASE, WORD_BITS);
+        input_emit(&mut reverse, FLAGS_BASE, WORD_BITS);
 
-        let msg_idx = &PER_ROUND_MSG_IDX;
-        let mut state: [Word; 16] = initial_lane_words();
+        // Unique source nodes preserve matrix column order.  Message words are
+        // shared across every scheduled use, while each materialized b/d word
+        // below gets a fresh leaf at its exact G-block offset.
+        let cv: [usize; 8] = std::array::from_fn(|w| reverse.leaf(cv_bit(w, 0)));
+        let messages: [usize; 16] = std::array::from_fn(|w| reverse.leaf(m_bit(w, 0)));
+        let mut state: [usize; 16] = [
+            cv[0],
+            cv[1],
+            cv[2],
+            cv[3],
+            cv[4],
+            cv[5],
+            cv[6],
+            cv[7],
+            reverse.constant(BLAKE3_IV[0]),
+            reverse.constant(BLAKE3_IV[1]),
+            reverse.constant(BLAKE3_IV[2]),
+            reverse.constant(BLAKE3_IV[3]),
+            reverse.leaf(T_LO_BASE),
+            reverse.leaf(T_HI_BASE),
+            reverse.leaf(BLEN_BASE),
+            reverse.leaf(FLAGS_BASE),
+        ];
 
         for r in 0..N_ROUNDS {
             for g_in_round in 0..N_G_PER_ROUND {
                 let g = r * N_G_PER_ROUND + g_in_round;
                 let [la, lb, lc, ld] = G_LANES[g_in_round];
-                let [mx_idx, my_idx] = msg_idx[r][g_in_round];
+                let [mx_idx, my_idx] = PER_ROUND_MSG_IDX[r][g_in_round];
+                let [a, b, c, d] = [state[la], state[lb], state[lc], state[ld]];
 
-                let a = state[la].clone();
-                let b = state[lb].clone();
-                let c = state[lc].clone();
-                let d = state[ld].clone();
-                let mx = Word::from_slot_base(m_bit(mx_idx, 0));
-                let my = Word::from_slot_base(m_bit(my_idx, 0));
-
-                let tmp_0 = scatter_add_carry_rows(
-                    &mut comb,
-                    alpha,
-                    eq_inner,
-                    &a,
-                    &b,
-                    g_add_carry_bit(g, ADD_TMP0, 0),
-                );
-                let a_1 = scatter_add_carry_rows(
-                    &mut comb,
-                    alpha,
-                    eq_inner,
-                    &tmp_0,
-                    &mx,
+                let tmp_0 =
+                    reverse.add(a, b, g_add_carry_bit(g, ADD_TMP0, 0));
+                let a_1 = reverse.add(
+                    tmp_0,
+                    messages[mx_idx],
                     g_add_carry_bit(g, ADD_A1, 0),
                 );
-                let d_1 = d.xor(&a_1).dedup().rotr(16);
-                let c_1 = scatter_add_carry_rows(
-                    &mut comb,
-                    alpha,
-                    eq_inner,
-                    &c,
-                    &d_1,
-                    g_add_carry_bit(g, ADD_C1, 0),
-                );
-                let b_1 = b.xor(&c_1).dedup().rotr(12);
-                let tmp_1 = scatter_add_carry_rows(
-                    &mut comb,
-                    alpha,
-                    eq_inner,
-                    &a_1,
-                    &b_1,
-                    g_add_carry_bit(g, ADD_TMP1, 0),
-                );
-                let a_2 = scatter_add_carry_rows(
-                    &mut comb,
-                    alpha,
-                    eq_inner,
-                    &tmp_1,
-                    &my,
+                let d_1 = reverse.xor_rot(d, a_1, 16);
+                let c_1 =
+                    reverse.add(c, d_1, g_add_carry_bit(g, ADD_C1, 0));
+                let b_1 = reverse.xor_rot(b, c_1, 12);
+                let tmp_1 =
+                    reverse.add(a_1, b_1, g_add_carry_bit(g, ADD_TMP1, 0));
+                let a_2 = reverse.add(
+                    tmp_1,
+                    messages[my_idx],
                     g_add_carry_bit(g, ADD_A2, 0),
                 );
-                let d_2 = d_1.xor(&a_2).dedup().rotr(8);
-                let c_2 = scatter_add_carry_rows(
-                    &mut comb,
-                    alpha,
-                    eq_inner,
-                    &c_1,
-                    &d_2,
-                    g_add_carry_bit(g, ADD_C2, 0),
-                );
+                let d_2 = reverse.xor_rot(d_1, a_2, 8);
+                let c_2 =
+                    reverse.add(c_1, d_2, g_add_carry_bit(g, ADD_C2, 0));
 
-                let b_new_word = b_1.xor(&c_2).dedup().rotr(7);
+                let b_new = reverse.xor_rot(b_1, c_2, 7);
                 for i in 0..WORD_BITS {
-                    let s = g_lin_bit(g, LIN_B_NEW, i);
-                    scatter_lin_id_row(&mut comb, alpha, eq_inner, s, &b_new_word.bits[i]);
-                }
-                for i in 0..WORD_BITS {
-                    let s = g_lin_bit(g, LIN_D_NEW, i);
-                    scatter_lin_id_row(&mut comb, alpha, eq_inner, s, &d_2.bits[i]);
+                    reverse.seed_lin_row(b_new, i, g_lin_bit(g, LIN_B_NEW, i));
+                    reverse.seed_lin_row(d_2, i, g_lin_bit(g, LIN_D_NEW, i));
                 }
 
                 state[la] = a_2;
-                state[lb] = Word::from_slot_base(g_lin_bit(g, LIN_B_NEW, 0));
+                state[lb] = reverse.leaf(g_lin_bit(g, LIN_B_NEW, 0));
                 state[lc] = c_2;
-                state[ld] = Word::from_slot_base(g_lin_bit(g, LIN_D_NEW, 0));
+                state[ld] = reverse.leaf(g_lin_bit(g, LIN_D_NEW, 0));
             }
         }
 
+        // Finalization lin-id rows.  These nodes are seeded in physical output
+        // coordinate order, exactly as build_matrices writes the rows.
         for w in 0..8 {
-            let lo = state[w].xor(&state[w + 8]).dedup();
+            let lo = reverse.xor_rot(state[w], state[w + 8], 0);
+            let hi = reverse.xor_rot(state[w + 8], cv[w], 0);
             for i in 0..WORD_BITS {
-                let s = out_lo_bit(w, i);
-                scatter_lin_id_row(&mut comb, alpha, eq_inner, s, &lo.bits[i]);
-            }
-            let cv_w = Word::from_slot_base(cv_bit(w, 0));
-            let hi = state[w + 8].xor(&cv_w).dedup();
-            for i in 0..WORD_BITS {
-                let s = out_hi_bit(w, i);
-                scatter_lin_id_row(&mut comb, alpha, eq_inner, s, &hi.bits[i]);
+                reverse.seed_lin_row(lo, i, out_lo_bit(w, i));
+                reverse.seed_lin_row(hi, i, out_hi_bit(w, i));
             }
         }
 
-        comb
+        reverse.finish()
+    }
+
+    fn const_pin_col(&self) -> Option<usize> {
+        Some(Z_CONST_POS)
     }
 }
 
@@ -1559,6 +1641,8 @@ pub struct Blake3Setup {
     pub pcs_params: PcsParams,
 }
 
+static RANKED_BLAKE3_LINCHECK: Blake3LincheckCircuit = Blake3LincheckCircuit;
+
 impl Blake3Setup {
     /// Build a setup for `n_blocks` BLAKE3 compressions with PCS
     /// `log_inv_rate = 1`.
@@ -1568,6 +1652,9 @@ impl Blake3Setup {
     pub fn new_batch_major(n_blocks: usize) -> Self {
         let mut s = Self::new(n_blocks);
         s.r1cs.layout = flock_core::r1cs::WitnessLayout::BatchMajor;
+        // Batch-major is outside the recognized reverse-transpose shape.
+        // Preserve the old eager CSC construction for this explicit fallback.
+        s.r1cs.csc_lincheck_circuit();
         s
     }
 
@@ -1608,6 +1695,37 @@ impl Blake3Setup {
             && self.pcs_params.profile == flock_core::pcs::ligerito::LigeritoProfile::Fast
             && self.pcs_params.merkle_hash == HashKind::Blake3
             && std::env::var_os("FLOCK_NO_HOT_CODEWORD").is_none()
+    }
+
+    /// Select the reverse transpose only for the promoted benchmark geometry.
+    /// `FLOCK_NO_BLAKE3_REVERSE_LINCHECK=1` is the exact CSC A/B control.
+    #[inline]
+    fn use_ranked_reverse_lincheck(&self) -> bool {
+        self.r1cs.layout == flock_core::r1cs::WitnessLayout::RowMajor
+            && self.r1cs.m == 32
+            && self.r1cs.m == self.pcs_params.m
+            && self.r1cs.k_log == K_LOG
+            && self.r1cs.k_skip == K_SKIP
+            && self.r1cs.useful_bits == USEFUL_BITS
+            && self.r1cs.const_pin == Some(Z_CONST_POS)
+            && self.r1cs.a_0.num_rows == K
+            && self.r1cs.a_0.num_cols == K
+            && self.r1cs.b_0.num_rows == K
+            && self.r1cs.b_0.num_cols == K
+            && self.pcs_params.log_inv_rate == 1
+            && self.pcs_params.log_batch_size == 6
+            && self.pcs_params.profile
+                == flock_core::pcs::ligerito::LigeritoProfile::Fast
+            && std::env::var_os("FLOCK_NO_BLAKE3_REVERSE_LINCHECK").is_none()
+    }
+
+    #[inline]
+    fn lincheck_circuit(&self) -> &dyn flock_core::lincheck::LincheckCircuit {
+        if self.use_ranked_reverse_lincheck() {
+            &RANKED_BLAKE3_LINCHECK
+        } else {
+            self.r1cs.csc_lincheck_circuit()
+        }
     }
 
     /// Take the codeword before witness generation, then let row workers write
@@ -1660,11 +1778,6 @@ impl Blake3Setup {
         assert!(n_blocks >= 1, "n_blocks must be ≥ 1");
         let n_log = min_n_blocks_log(n_blocks);
         let r1cs = build_block_r1cs(n_log);
-        // Warm the CSC fold circuit here so its one-time build (a pass over
-        // ~21M nonzeros) stays out of the first prove/verify, and pre-fault
-        // the prove-cycle scratch buffers (see scratch::prewarm_prover).
-        r1cs.csc_lincheck_circuit();
-        flock_core::scratch::prewarm_prover(r1cs.m);
         let pcs_params = PcsParams {
             m: r1cs.m,
             log_inv_rate,
@@ -1672,11 +1785,19 @@ impl Blake3Setup {
             profile,
             merkle_hash: Default::default(),
         };
-        Self {
+        let setup = Self {
             n_blocks,
             r1cs,
             pcs_params,
+        };
+        // Non-ranked shapes retain the eager CSC build, keeping its one-time
+        // transpose outside the first proof.  The ranked shape never allocates
+        // or walks the ~21M-entry CSC unless its runtime control requests it.
+        if !setup.use_ranked_reverse_lincheck() {
+            setup.r1cs.csc_lincheck_circuit();
         }
+        flock_core::scratch::prewarm_prover(setup.r1cs.m);
+        setup
     }
 
     pub fn m(&self) -> usize {
@@ -1729,7 +1850,7 @@ impl Blake3Setup {
         if self.use_ranked_rate2_hot_codeword() {
             let (codeword, (z_packed, a_packed_f128, b_packed_f128, z_packed_lincheck)) =
                 self.generate_witness_ab_with_rate2_codeword(blocks);
-            let lc_circuit = self.r1cs.csc_lincheck_circuit();
+            let lc_circuit = self.lincheck_circuit();
             return crate::prover::prove_fast_ligerito_from_preinitialized_codeword(
                 &self.r1cs,
                 &self.pcs_params,
@@ -1746,7 +1867,7 @@ impl Blake3Setup {
             flock_core::pcs::prefault_codeword_during(&self.pcs_params, || {
                 self.generate_witness_ab(blocks)
             });
-        let lc_circuit = self.r1cs.csc_lincheck_circuit();
+        let lc_circuit = self.lincheck_circuit();
         crate::prover::prove_fast_ligerito_from_witness(
             &self.r1cs,
             &self.pcs_params,
@@ -1783,7 +1904,7 @@ impl Blake3Setup {
                 (None, self.generate_witness_ab(blocks))
             };
         let witness_s = t0.elapsed().as_secs_f64();
-        let lc_circuit = self.r1cs.csc_lincheck_circuit();
+        let lc_circuit = self.lincheck_circuit();
         let (proof, commitment, claim, mut timings) = match codeword {
             Some(codeword) => {
                 crate::prover::prove_fast_ligerito_timed_from_preinitialized_codeword(
@@ -1820,7 +1941,7 @@ impl Blake3Setup {
         proof: &flock_core::proof::R1csProofLigerito,
         challenger: &mut Ch,
     ) -> Result<R1csClaim, verifier::VerifyError> {
-        let lc_circuit = self.r1cs.csc_lincheck_circuit();
+        let lc_circuit = self.lincheck_circuit();
         verifier::verify_ligerito(
             &self.r1cs,
             commitment,
