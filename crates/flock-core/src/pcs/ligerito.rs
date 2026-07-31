@@ -2344,6 +2344,40 @@ impl LigeroWitness {
 /// The first `log_num_interleaved` LSB variables of the multilinear poly are the
 /// lane indices, so `partial_eval_lsb(poly, lane_challenges)` produces the
 /// next-level poly directly. This composes cleanly with sumcheck folds.
+#[inline]
+fn is_ranked_recursive_ntt_merkle_leaf_pipeline_shape(
+    log_msg_cols: usize,
+    log_num_interleaved: usize,
+    log_inv_rate: usize,
+    kind: HashKind,
+) -> bool {
+    cfg!(all(
+        target_os = "macos",
+        target_arch = "aarch64",
+        target_feature = "aes"
+    )) && kind == HashKind::Blake3
+        && log_num_interleaved == 3
+        // Ranked m=32 rate-1/2 ladder (Fast/Secure): L1 is 32 MiB and L2 is
+        // 8 MiB. Later levels are 2 MiB or smaller, below the cross-pool
+        // dispatch crossover.
+        && matches!((log_msg_cols, log_inv_rate), (16, 2) | (13, 3))
+}
+
+#[inline]
+fn use_ranked_recursive_ntt_merkle_leaf_pipeline(
+    log_msg_cols: usize,
+    log_num_interleaved: usize,
+    log_inv_rate: usize,
+    kind: HashKind,
+) -> bool {
+    is_ranked_recursive_ntt_merkle_leaf_pipeline_shape(
+        log_msg_cols,
+        log_num_interleaved,
+        log_inv_rate,
+        kind,
+    ) && std::env::var_os("FLOCK_NO_NTT_MERKLE_PIPELINE").is_none()
+}
+
 pub(crate) fn ligero_commit(
     poly: &[F128],
     log_msg_cols: usize,
@@ -2351,6 +2385,40 @@ pub(crate) fn ligero_commit(
     log_inv_rate: usize,
     ntt: &AdditiveNttF128,
     kind: HashKind,
+) -> LigeroWitness {
+    let helper = if use_ranked_recursive_ntt_merkle_leaf_pipeline(
+        log_msg_cols,
+        log_num_interleaved,
+        log_inv_rate,
+        kind,
+    ) && rayon::current_num_threads() > 1
+    {
+        crate::epool::epool()
+    } else {
+        None
+    };
+    ligero_commit_with_pipeline_helper(
+        poly,
+        log_msg_cols,
+        log_num_interleaved,
+        log_inv_rate,
+        ntt,
+        kind,
+        helper,
+    )
+}
+
+/// Implementation seam shared by the production geometry gate and the
+/// byte-exact pipeline tests. `None` is the independent NTT-then-Merkle path;
+/// `Some` streams finalized NTT chunks through the shared leaf consumer.
+fn ligero_commit_with_pipeline_helper(
+    poly: &[F128],
+    log_msg_cols: usize,
+    log_num_interleaved: usize,
+    log_inv_rate: usize,
+    ntt: &AdditiveNttF128,
+    kind: HashKind,
+    helper: Option<&rayon::ThreadPool>,
 ) -> LigeroWitness {
     let msg_cols = 1usize << log_msg_cols;
     let num_interleaved = 1usize << log_num_interleaved;
@@ -2368,19 +2436,43 @@ pub(crate) fn ligero_commit(
     let mut mat = crate::scratch::take_f128(codeword_len);
     super::commit::replicate_message_fill(&mut mat, poly);
 
-    // RS-encode every lane in one call (each lane is one independent NTT).
-    ntt.forward_transform_interleaved_from_layer(&mut mat, num_interleaved, log_inv_rate);
+    let mut prehashed_tree = helper.map(|_| crate::alloc_uninit_vec::<Hash>(2 * block_len - 1));
 
-    // Merkle over rows. One leaf = `num_interleaved` consecutive F128 = 16·num_interleaved bytes.
-    let leaf_size_bytes = num_interleaved * core::mem::size_of::<F128>();
-    let data_bytes: &[u8] = unsafe {
-        core::slice::from_raw_parts(
-            mat.as_ptr() as *const u8,
-            mat.len() * core::mem::size_of::<F128>(),
-        )
+    // RS-encode every lane in one call (each lane is one independent NTT).
+    if let (Some(helper), Some(tree)) = (helper, prehashed_tree.as_mut()) {
+        assert_eq!(
+            kind,
+            HashKind::Blake3,
+            "the NTT-to-leaf pipeline currently supports BLAKE3"
+        );
+        super::commit::ntt_with_pipelined_blake3_leaves(
+            ntt,
+            &mut mat,
+            num_interleaved,
+            log_inv_rate,
+            &mut tree[..block_len],
+            helper,
+        );
+    } else {
+        ntt.forward_transform_interleaved_from_layer(&mut mat, num_interleaved, log_inv_rate);
+    }
+
+    // Merkle over rows. One leaf = `num_interleaved` consecutive F128 =
+    // 16·num_interleaved bytes. The pipelined path has already filled the leaf
+    // prefix; both paths use the same parent-level builder.
+    let tree = if let Some(tree) = prehashed_tree {
+        merkle::merkle_tree_from_prehashed_leaves(tree, block_len, kind)
+    } else {
+        let leaf_size_bytes = num_interleaved * core::mem::size_of::<F128>();
+        let data_bytes: &[u8] = unsafe {
+            core::slice::from_raw_parts(
+                mat.as_ptr() as *const u8,
+                mat.len() * core::mem::size_of::<F128>(),
+            )
+        };
+        debug_assert_eq!(data_bytes.len(), block_len * leaf_size_bytes);
+        merkle::merkle_tree(data_bytes, block_len, kind)
     };
-    debug_assert_eq!(data_bytes.len(), block_len * leaf_size_bytes);
-    let tree = merkle::merkle_tree(data_bytes, block_len, kind);
 
     LigeroWitness {
         mat,
@@ -5045,6 +5137,100 @@ pub fn recursive_verifier<Ch: Challenger>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ranked_recursive_ntt_merkle_pipeline_gate_is_narrow() {
+        let enabled_here = cfg!(all(
+            target_os = "macos",
+            target_arch = "aarch64",
+            target_feature = "aes"
+        ));
+        for (log_msg_cols, log_inv_rate) in [(16, 2), (13, 3)] {
+            assert_eq!(
+                is_ranked_recursive_ntt_merkle_leaf_pipeline_shape(
+                    log_msg_cols,
+                    3,
+                    log_inv_rate,
+                    HashKind::Blake3,
+                ),
+                enabled_here
+            );
+        }
+
+        // Ranked L3 and below deliberately remain on the separate path.
+        assert!(!is_ranked_recursive_ntt_merkle_leaf_pipeline_shape(
+            10,
+            3,
+            4,
+            HashKind::Blake3,
+        ));
+        assert!(!is_ranked_recursive_ntt_merkle_leaf_pipeline_shape(
+            16,
+            4,
+            2,
+            HashKind::Blake3,
+        ));
+        assert!(!is_ranked_recursive_ntt_merkle_leaf_pipeline_shape(
+            16,
+            3,
+            2,
+            HashKind::Sha256,
+        ));
+    }
+
+    /// The ranked m=32 rate-1/2 recursive shapes use 128-byte leaves, unlike
+    /// L0's 1 KiB leaves. Pin the complete codeword and flat tree for both
+    /// routed levels against the original independent NTT-then-Merkle path.
+    #[test]
+    fn pipelined_recursive_commits_match_sequential_ranked_shapes() {
+        let helper = rayon::ThreadPoolBuilder::new()
+            .num_threads(2)
+            .build()
+            .unwrap();
+
+        for (log_msg_cols, log_inv_rate, seed) in [
+            (16usize, 2usize, 0x1A11_0002u64),
+            (13usize, 3usize, 0x1A12_0003u64),
+        ] {
+            const LOG_NUM_INTERLEAVED: usize = 3;
+            let mut rng = crate::challenger::RandomChallenger::new(seed);
+            let poly: Vec<F128> = (0..1usize << (log_msg_cols + LOG_NUM_INTERLEAVED))
+                .map(|_| rng.sample_f128())
+                .collect();
+            let ntt = AdditiveNttF128::standard(log_msg_cols + log_inv_rate);
+
+            let sequential = ligero_commit_with_pipeline_helper(
+                &poly,
+                log_msg_cols,
+                LOG_NUM_INTERLEAVED,
+                log_inv_rate,
+                &ntt,
+                HashKind::Blake3,
+                None,
+            );
+            let pipelined = ligero_commit_with_pipeline_helper(
+                &poly,
+                log_msg_cols,
+                LOG_NUM_INTERLEAVED,
+                log_inv_rate,
+                &ntt,
+                HashKind::Blake3,
+                Some(&helper),
+            );
+
+            assert_eq!(pipelined.block_len, sequential.block_len);
+            assert_eq!(pipelined.num_interleaved, sequential.num_interleaved);
+            assert!(
+                pipelined.mat == sequential.mat,
+                "recursive codeword differs for log_msg_cols={log_msg_cols}"
+            );
+            assert!(
+                pipelined.tree == sequential.tree,
+                "recursive flat Merkle tree differs for log_msg_cols={log_msg_cols}"
+            );
+            assert_eq!(pipelined.root(), sequential.root());
+        }
+    }
 
     /// Worked example: `LigeritoSecurityConfig` for BLAKE3 m=29 at rate 1/2.
     /// Paper-compatible m=29 fast example, mechanically derived in the

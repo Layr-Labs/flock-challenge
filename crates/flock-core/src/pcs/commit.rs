@@ -257,9 +257,9 @@ pub(crate) fn replicate_message_fill(codeword: &mut [F128], msg: &[F128]) {
     }
 }
 
-/// Exact ranked geometry for the cache-local NTT-to-Merkle leaf pipeline.
-/// Alternate hashes, profiles, rates, and recursive commits retain the existing
-/// independently scheduled transform and leaf pass.
+/// Exact ranked L0 geometry for the cache-local NTT-to-Merkle leaf pipeline.
+/// Alternate hashes, profiles, and rates retain the existing independently
+/// scheduled transform and leaf pass.
 #[inline]
 fn is_ranked_ntt_merkle_leaf_pipeline_shape(params: &PcsParams) -> bool {
     cfg!(all(
@@ -280,21 +280,25 @@ fn use_ranked_ntt_merkle_leaf_pipeline(params: &PcsParams) -> bool {
 }
 
 #[derive(Clone, Copy)]
-struct RankedLeafJob {
+struct NttLeafJob {
     elem_offset: usize,
     elem_len: usize,
 }
 
-/// Finish the ranked NTT and hash each finalized 1 MiB subtree before it goes
+/// Finish an interleaved NTT and hash each finalized subtree before it goes
 /// cold. P-core transform jobs offer leaf work to a bounded queue drained by
 /// the existing utility-QoS E-core pool; when that queue is full they hash the
-/// just-finished subtree inline. Thus the main NTT never waits for queue space,
-/// the helper pool retains the frontier's extra leaf throughput, and at most a
-/// small L2-sized window of completed codeword data awaits hashing.
-fn ranked_ntt_with_pipelined_leaves(
+/// just-finished subtree inline. Thus the main NTT never waits for queue space
+/// and only a bounded window of completed codeword data awaits hashing.
+///
+/// `num_ntts` also determines the Merkle geometry: each codeword row is one
+/// leaf of `num_ntts * size_of::<F128>()` bytes. The leaf width must be one of
+/// the batched BLAKE3 widths accepted by [`merkle::hash_blake3_leaf_chunk`].
+pub(crate) fn ntt_with_pipelined_blake3_leaves(
     ntt: &AdditiveNttF128,
     codeword: &mut [F128],
-    params: &PcsParams,
+    num_ntts: usize,
+    start_layer: usize,
     leaves: &mut [Hash],
     helper: &rayon::ThreadPool,
 ) {
@@ -302,13 +306,13 @@ fn ranked_ntt_with_pipelined_leaves(
     use std::sync::Mutex;
     use std::sync::mpsc::{TrySendError, sync_channel};
 
-    let num_ntts = params.num_ntts();
-    debug_assert_eq!(num_ntts, 64);
-    debug_assert_eq!(leaves.len(), codeword.len() / num_ntts);
+    assert!(num_ntts.is_power_of_two());
+    assert_eq!(leaves.len(), codeword.len() / num_ntts);
+    let leaf_size = num_ntts * core::mem::size_of::<F128>();
     let codeword_base = crate::epool::SyncPtr(codeword.as_mut_ptr());
     let leaves_base = crate::epool::SyncPtr(leaves.as_mut_ptr());
 
-    let hash_job = |job: RankedLeafJob| {
+    let hash_job = |job: NttLeafJob| {
         debug_assert_eq!(job.elem_offset % num_ntts, 0);
         debug_assert_eq!(job.elem_len % num_ntts, 0);
         let leaf_start = job.elem_offset / num_ntts;
@@ -327,14 +331,14 @@ fn ranked_ntt_with_pipelined_leaves(
                 core::mem::size_of_val(elems),
             );
             let outs = core::slice::from_raw_parts_mut(leaves_base.ptr().add(leaf_start), leaf_len);
-            merkle::hash_ranked_blake3_leaf_chunk(bytes, outs);
+            merkle::hash_blake3_leaf_chunk(bytes, leaf_size, outs);
         }
     };
 
-    // Two queued subtrees per helper keep all four E-cores fed while bounding
-    // not-yet-hashed input to 8 MiB on the ranked 4-E-core host.
+    // Two queued subtrees per helper keep all helper cores fed while bounding
+    // the not-yet-hashed input window.
     let queue_capacity = (2 * helper.current_num_threads()).max(1);
-    let (sender, receiver) = sync_channel::<RankedLeafJob>(queue_capacity);
+    let (sender, receiver) = sync_channel::<NttLeafJob>(queue_capacity);
     let receiver = Mutex::new(receiver);
 
     std::thread::scope(|scope| {
@@ -353,9 +357,9 @@ fn ranked_ntt_with_pipelined_leaves(
         ntt.forward_transform_interleaved_from_layer_and_then(
             codeword,
             num_ntts,
-            params.log_inv_rate,
+            start_layer,
             |elem_offset, chunk| {
-                let job = RankedLeafJob {
+                let job = NttLeafJob {
                     elem_offset,
                     elem_len: chunk.len(),
                 };
@@ -411,10 +415,11 @@ fn finalize_commit(mut codeword: Vec<F128>, params: &PcsParams) -> (Commitment, 
     // caller's replicate-fill (commit_into), so start past them.
     let ntt = AdditiveNttF128::standard(params.k_code());
     if let (Some(helper), Some(tree)) = (helper, prehashed_tree.as_mut()) {
-        ranked_ntt_with_pipelined_leaves(
+        ntt_with_pipelined_blake3_leaves(
             &ntt,
             &mut codeword,
-            params,
+            params.num_ntts(),
+            params.log_inv_rate,
             &mut tree[..params.n_leaves()],
             helper,
         );
@@ -685,10 +690,11 @@ mod tests {
             .unwrap();
         let mut got_codeword = source;
         let mut got_tree = vec![[0u8; 32]; 2 * params.n_leaves() - 1];
-        ranked_ntt_with_pipelined_leaves(
+        ntt_with_pipelined_blake3_leaves(
             &ntt,
             &mut got_codeword,
-            &params,
+            params.num_ntts(),
+            params.log_inv_rate,
             &mut got_tree[..params.n_leaves()],
             &helper,
         );

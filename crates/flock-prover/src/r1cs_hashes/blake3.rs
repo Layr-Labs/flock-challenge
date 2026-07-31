@@ -2016,7 +2016,8 @@ mod tests {
     const ROOT: u32 = 1 << 3;
 
     /// Batch-major witness equality vs the row-major driver (word-transpose
-    /// + identical stripe), incl. padding slots via a non-power-of-two count.
+    /// + identical producer-defined stripe prefix), incl. padding slots via
+    /// a non-power-of-two count.
     #[test]
     fn batch_major_witness_matches_row_major_transposed() {
         for (n_inputs, n_log) in [(8usize, 3usize), (11, 4)] {
@@ -2034,7 +2035,18 @@ mod tests {
                 generate_witness_with_ab_packed_and_lincheck(&inputs, n_log);
             let (z_b, a_b, b_b, stripe_b) = generate_witness_batch_major(&inputs, n_log);
 
-            assert_eq!(stripe_b, stripe_r, "stripe diverged (n_log={n_log})");
+            let written_bytes = USEFUL_BITS.div_ceil(64) * 64;
+            for (g, (batch, row)) in stripe_b
+                .chunks_exact(K)
+                .zip(stripe_r.chunks_exact(K))
+                .enumerate()
+            {
+                assert_eq!(
+                    &batch[..written_bytes],
+                    &row[..written_bytes],
+                    "stripe diverged (n_log={n_log}, group={g})"
+                );
+            }
 
             let chunks_per_block = K / 128;
             let transpose = |row: &[flock_core::field::F128]| {
@@ -2050,6 +2062,84 @@ mod tests {
             assert_eq!(a_b, transpose(&a_r), "a diverged (n_log={n_log})");
             assert_eq!(b_b, transpose(&b_r), "b diverged (n_log={n_log})");
         }
+    }
+
+    /// A proof must return the ranked-path stripe to the byte pool, and the
+    /// next proof must safely reuse the same dirty allocation. Compare every
+    /// byte the batch-major producer defines (a superset of what lincheck
+    /// reads) and the complete deterministic proof against a zero-fresh run.
+    #[test]
+    fn batch_major_reuses_dirty_lincheck_stripe_byte_exactly() {
+        use flock_core::challenger::FsChallenger;
+
+        // Use a geometry distinct from the other end-to-end unit tests, then
+        // reserve the real byte pool so the parallel test harness cannot
+        // borrow this allocation between the two proofs.
+        let n_blocks = 257;
+        let setup = Blake3Setup::new_batch_major(n_blocks);
+        let mut rng = Rng::new(0xBADC_5120);
+        let inputs: Vec<Compression> = (0..n_blocks)
+            .map(|_| {
+                let cv: [u32; 8] = std::array::from_fn(|_| rng.next_u32());
+                let m: [u32; 16] = std::array::from_fn(|_| rng.next_u32());
+                let counter = ((rng.next_u32() as u64) << 32) | rng.next_u32() as u64;
+                (cv, m, counter, 64u32, 11u32)
+            })
+            .collect();
+
+        let _pool_lock = super::super::common::lock_stripe_pool_for_test();
+        flock_core::scratch::clear();
+        let stripe_len = (1usize << setup.m()) / 8;
+        let zero_fresh = vec![0u8; stripe_len];
+        let zero_fresh_ptr = zero_fresh.as_ptr() as usize;
+        let zero_fresh_capacity = zero_fresh.capacity();
+        flock_core::scratch::give_u8(zero_fresh);
+
+        let mut ch_zero = FsChallenger::new(b"flock-b3-dirty-stripe");
+        let (proof_zero, commitment_zero, claim_zero) = setup.prove_fast(&inputs, &mut ch_zero);
+        let zero_observation = super::super::common::take_batch_major_stripe_observation_for_test();
+        assert_eq!(zero_observation.ptr, zero_fresh_ptr);
+        assert_eq!(zero_observation.capacity, zero_fresh_capacity);
+
+        // The first proof returned this exact allocation. Dirty every byte,
+        // including both the producer prefix and the untouched group tails,
+        // before handing it back for the immediately following proof.
+        let mut dirty = flock_core::scratch::take_u8(stripe_len);
+        assert_eq!(dirty.as_ptr() as usize, zero_observation.ptr);
+        assert_eq!(dirty.capacity(), zero_observation.capacity);
+        dirty.fill(0xA5);
+        flock_core::scratch::give_u8(dirty);
+
+        let mut ch_dirty = FsChallenger::new(b"flock-b3-dirty-stripe");
+        let (proof_dirty, commitment_dirty, claim_dirty) = setup.prove_fast(&inputs, &mut ch_dirty);
+        let dirty_observation =
+            super::super::common::take_batch_major_stripe_observation_for_test();
+
+        // Pool reuse is allocation-exact across the two back-to-back proofs.
+        assert_eq!(dirty_observation.ptr, zero_observation.ptr);
+        assert_eq!(dirty_observation.capacity, zero_observation.capacity);
+
+        // BLAKE3 writes 241 transposed words = 15,424 bytes per group.
+        // Lincheck's widest rounded load consumes only 15,416 of them.
+        assert_eq!(zero_observation.bytes_per_group, K);
+        assert_eq!(zero_observation.written_bytes_per_group, 15_424);
+        assert_eq!(zero_observation.consumer_bytes_per_group, 15_416);
+        assert_eq!(
+            dirty_observation.written_bytes, zero_observation.written_bytes,
+            "dirty recycling changed producer-defined stripe bytes"
+        );
+        assert_eq!(commitment_dirty.root, commitment_zero.root);
+        assert_eq!(claim_dirty, claim_zero);
+        assert_eq!(
+            bincode::serialize(&proof_dirty).unwrap(),
+            bincode::serialize(&proof_zero).unwrap(),
+            "dirty recycling changed the proof"
+        );
+
+        // Remove the test allocation while the pool is still reserved.
+        let recycled = flock_core::scratch::take_u8(stripe_len);
+        assert_eq!(recycled.as_ptr() as usize, zero_observation.ptr);
+        drop(recycled);
     }
 
     /// Batch-major end-to-end Ligerito roundtrip + tamper rejection.

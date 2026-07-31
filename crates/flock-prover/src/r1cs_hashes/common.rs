@@ -8,6 +8,124 @@ use flock_core::bits::transpose_8_u64s_to_64_bytes;
 use flock_core::field::F128;
 use flock_core::r1cs::{BlockR1cs, SparseBinaryMatrix, WitnessLayout};
 
+/// Take/return the lincheck byte stripe through one seam so tests can observe
+/// its allocation across an entire proof. Production builds inline directly
+/// to the process-global scratch pool.
+#[inline]
+pub(crate) fn take_lincheck_stripe(n: usize) -> Vec<u8> {
+    #[cfg(test)]
+    let _test_take_guard = if TEST_STRIPE_EXCLUSIVE.with(std::cell::Cell::get) {
+        None
+    } else {
+        Some(lock_test_stripe_take())
+    };
+    flock_core::scratch::take_u8(n)
+}
+
+#[inline]
+pub(crate) fn give_lincheck_stripe(stripe: Vec<u8>) {
+    flock_core::scratch::give_u8(stripe);
+}
+
+// Unit tests run proofs concurrently by default. Serialize their pool takes so
+// the pointer-reuse regression test can reserve the real global pool across
+// two proofs without another test borrowing its buffer between them. A test
+// that already held a buffer before the reservation may still return it, but
+// cannot take the uniquely-sized reserved buffer. None of this exists in
+// non-test builds.
+#[cfg(test)]
+static TEST_STRIPE_TAKE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[cfg(test)]
+thread_local! {
+    static TEST_STRIPE_EXCLUSIVE: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+    static TEST_LAST_BATCH_MAJOR_STRIPE:
+        std::cell::RefCell<Option<TestBatchMajorStripe>> =
+            const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn lock_test_stripe_take() -> std::sync::MutexGuard<'static, ()> {
+    TEST_STRIPE_TAKE_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+#[cfg(test)]
+pub(crate) struct TestStripePoolLock {
+    _guard: std::sync::MutexGuard<'static, ()>,
+}
+
+#[cfg(test)]
+impl Drop for TestStripePoolLock {
+    fn drop(&mut self) {
+        TEST_STRIPE_EXCLUSIVE.with(|exclusive| exclusive.set(false));
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn lock_stripe_pool_for_test() -> TestStripePoolLock {
+    let guard = lock_test_stripe_take();
+    TEST_STRIPE_EXCLUSIVE.with(|exclusive| {
+        assert!(
+            !exclusive.replace(true),
+            "test already holds the lincheck stripe pool"
+        );
+    });
+    TEST_LAST_BATCH_MAJOR_STRIPE.with(|slot| *slot.borrow_mut() = None);
+    TestStripePoolLock { _guard: guard }
+}
+
+#[cfg(test)]
+#[derive(Debug)]
+pub(crate) struct TestBatchMajorStripe {
+    pub(crate) ptr: usize,
+    pub(crate) capacity: usize,
+    pub(crate) bytes_per_group: usize,
+    pub(crate) written_bytes_per_group: usize,
+    pub(crate) consumer_bytes_per_group: usize,
+    pub(crate) written_bytes: Vec<u8>,
+}
+
+#[cfg(test)]
+fn observe_batch_major_stripe_for_test(
+    stripe: &[u8],
+    capacity: usize,
+    bytes_per_group: usize,
+    useful_bits: usize,
+) {
+    let written_bytes_per_group = useful_bits.div_ceil(64) * 64;
+    // The vectorized lincheck kernels round their 8-byte loads to this
+    // boundary; the scalar fallback reads exactly `useful_bits` bytes.
+    let consumer_bytes_per_group = useful_bits.div_ceil(8) * 8;
+    assert!(consumer_bytes_per_group <= written_bytes_per_group);
+    let mut written_bytes =
+        Vec::with_capacity((stripe.len() / bytes_per_group) * written_bytes_per_group);
+    for group in stripe.chunks_exact(bytes_per_group) {
+        written_bytes.extend_from_slice(&group[..written_bytes_per_group]);
+    }
+    TEST_LAST_BATCH_MAJOR_STRIPE.with(|slot| {
+        *slot.borrow_mut() = Some(TestBatchMajorStripe {
+            ptr: stripe.as_ptr() as usize,
+            capacity,
+            bytes_per_group,
+            written_bytes_per_group,
+            consumer_bytes_per_group,
+            written_bytes,
+        });
+    });
+}
+
+#[cfg(test)]
+pub(crate) fn take_batch_major_stripe_observation_for_test() -> TestBatchMajorStripe {
+    TEST_LAST_BATCH_MAJOR_STRIPE.with(|slot| {
+        slot.borrow_mut()
+            .take()
+            .expect("batch-major stripe was not observed")
+    })
+}
+
 /// OR the low 32 bits of `val` into `buf` starting at bit-offset `bit_off`.
 /// Handles u64 straddling when `bit_off % 64 > 32`.
 #[inline(always)]
@@ -298,7 +416,7 @@ where
     let mut z = flock_core::scratch::take_f128(total_f128);
     let mut a = flock_core::scratch::take_f128(total_f128);
     let mut b = flock_core::scratch::take_f128(total_f128);
-    let mut z_lincheck = flock_core::scratch::take_u8((n_total / 8) * k);
+    let mut z_lincheck = take_lincheck_stripe((n_total / 8) * k);
 
     z.par_chunks_mut(8 * f128_per_block)
         .zip(a.par_chunks_mut(8 * f128_per_block))
@@ -587,7 +705,8 @@ where
     let mut z = flock_core::scratch::take_f128(total_f128);
     let mut a = flock_core::scratch::take_f128(total_f128);
     let mut b = flock_core::scratch::take_f128(total_f128);
-    let stripe = vec![0u8; n_total * u64_per_block * 8];
+    let stripe_len = n_total * u64_per_block * 8;
+    let mut stripe = take_lincheck_stripe(stripe_len);
     // Zero the padding suffix (contiguous chunk-columns >= useful_chunks);
     // the producers fully rewrite the useful prefix every call.
     let tail = useful_chunks << n_blocks_log;
@@ -602,7 +721,7 @@ where
         SendPtr(a.as_mut_ptr() as *mut u64),
         SendPtr(b.as_mut_ptr() as *mut u64),
     );
-    let sp = SendPtr(stripe.as_ptr() as *mut u64);
+    let sp = SendPtr(stripe.as_mut_ptr() as *mut u64);
     let inputs_ref = inputs;
 
     (0..n_total / BM_V).into_par_iter().for_each_init(
@@ -629,6 +748,21 @@ where
                 stripe_from_rows(rz, sp.get() as *mut u8, o0, u64_per_block, useful_words);
             }
         },
+    );
+
+    // `stripe_from_rows` unconditionally writes `ceil(useful_bits / 64) * 64`
+    // bytes per group. Lincheck reads at most the useful prefix rounded up to
+    // its 8-byte SIMD block, which is contained in that fully-written range.
+    // The rest of each group is never read, so recycled bytes there need no
+    // canonicalization (and, at ranked size, avoiding it saves a 512 MiB
+    // memset).
+    debug_assert!(useful_bits.div_ceil(8) * 8 <= useful_words * 64);
+    #[cfg(test)]
+    observe_batch_major_stripe_for_test(
+        &stripe,
+        stripe.capacity(),
+        u64_per_block * 64,
+        useful_bits,
     );
 
     (z, a, b, stripe)

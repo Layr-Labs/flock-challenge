@@ -516,28 +516,31 @@ fn hash_leaves(data: &[u8], leaf_size: usize, out: &mut [Hash], kind: HashKind) 
     }
 }
 
-/// Hash one already-partitioned run of ranked 1 KiB BLAKE3 leaves without
+/// Hash one already-partitioned run of batchable BLAKE3 leaves without
 /// starting another Rayon/E-core scheduling region.
 ///
-/// The ranked NTT-to-Merkle pipeline calls this from jobs that are themselves
+/// The NTT-to-Merkle pipeline calls this from jobs that are themselves
 /// distributed across the P-core pool or handed to the existing E-core helper
-/// pool. Keeping this helper scheduling-free avoids a nested barrier per 1 MiB
-/// finalized NTT subtree while preserving the exact twelve-way leaf kernel and
+/// pool. Keeping this helper scheduling-free avoids a nested barrier per
+/// finalized NTT subtree while preserving the same batched leaf kernel and
 /// hash-count semantics used by [`hash_leaves`].
-pub(crate) fn hash_ranked_blake3_leaf_chunk(data: &[u8], out: &mut [Hash]) {
-    const LEAF_SIZE: usize = 1024;
-    assert_eq!(data.len(), out.len() * LEAF_SIZE);
+pub(crate) fn hash_blake3_leaf_chunk(data: &[u8], leaf_size: usize, out: &mut [Hash]) {
+    assert!(
+        blake3_leaf_size_is_batchable(leaf_size),
+        "pipelined BLAKE3 leaf size must use the batched kernel"
+    );
+    assert_eq!(data.len(), out.len() * leaf_size);
     #[cfg(feature = "hash-count")]
     {
         use std::sync::atomic::Ordering::Relaxed;
         hash_count::LEAF_CALLS.fetch_add(out.len() as u64, Relaxed);
         hash_count::LEAF_COMPRESSIONS.fetch_add(
-            out.len() as u64 * hash_count::blocks(HashKind::Blake3, LEAF_SIZE),
+            out.len() as u64 * hash_count::blocks(HashKind::Blake3, leaf_size),
             Relaxed,
         );
     }
-    let batched = blake3_hash_many_leaves(data, LEAF_SIZE, out);
-    assert!(batched, "ranked 1 KiB leaves must use the batched kernel");
+    let batched = blake3_hash_many_leaves(data, leaf_size, out);
+    debug_assert!(batched);
 }
 
 /// Leaves per queue chunk in the batched BLAKE3 leaf path (see `epool`).
@@ -1389,7 +1392,7 @@ mod tests {
             .chunks(CHUNK_LEAVES * LEAF_SIZE)
             .zip(got[..N_LEAVES].chunks_mut(CHUNK_LEAVES))
         {
-            hash_ranked_blake3_leaf_chunk(input, output);
+            hash_blake3_leaf_chunk(input, LEAF_SIZE, output);
         }
         let got = merkle_tree_from_prehashed_leaves(got, N_LEAVES, HashKind::Blake3);
         assert_eq!(got, expect);

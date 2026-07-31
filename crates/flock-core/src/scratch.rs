@@ -158,9 +158,10 @@ pub fn clear() {
 // at the ranked m=32) every prove and frees it after lincheck. Like the F128
 // pool above, this keeps the stripe's pages resident across the worker's
 // warm-up and timed proves instead of re-faulting ~32k pages per prove.
-// Contents are NOT cleared; callers must write every byte before reading
-// (the stripe transpose writes all of it — see
-// `r1cs_hashes::common::drive_witness_packed_and_lincheck_impl`).
+// Contents are NOT cleared; callers must write every byte they can read.
+// Row-major producers rewrite the full stripe, while batch-major producers
+// rewrite the useful prefix of every group and lincheck skips the untouched
+// padding tail.
 
 static POOL_U8: Mutex<Vec<Vec<u8>>> = Mutex::new(Vec::new());
 
