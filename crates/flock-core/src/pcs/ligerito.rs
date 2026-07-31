@@ -2898,14 +2898,10 @@ fn materialize_direct_ab_fold2(
                 let start = 4 * block * block_len;
                 let f_in = &packed_witness[start..start + 4 * block_len];
                 let b_in = &ordinary_basis[start..start + 4 * block_len];
+                // Vector-resident fold4 on AArch64 when FLOCK_NO_NEON_FOLD4 is
+                // unset; scalar otherwise. Loop structure is unchanged.
                 let fold4 = |input: &[F128], slot: usize| {
-                    let a0 = input[4 * slot];
-                    let a1 = input[4 * slot + 1];
-                    let a2 = input[4 * slot + 2];
-                    let a3 = input[4 * slot + 3];
-                    let low = a0 + r0 * (a0 + a1);
-                    let high = a2 + r0 * (a2 + a3);
-                    low + r1 * (low + high)
+                    super::qfold::fold4(input, slot, r0, r1)
                 };
 
                 if fuse_init {

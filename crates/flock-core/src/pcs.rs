@@ -23,6 +23,7 @@ pub mod commit;
 pub mod jagged;
 pub mod ligerito;
 pub mod pack;
+pub(crate) mod qfold;
 pub mod ring_switch;
 pub mod tensor_algebra;
 
