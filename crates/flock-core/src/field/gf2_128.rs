@@ -478,6 +478,41 @@ mod tests {
         }
     }
 
+    /// The tiny-high-limb constants vec2 kernel must agree, lane for lane,
+    /// with the scalar field product across the whole `hi < 32` range,
+    /// including both boundary limbs.
+    #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+    #[test]
+    fn tiny_hi_constants_vec2_matches_scalar() {
+        let mut rng = Rng::new(10);
+        for round in 0..128 {
+            let hi0 = match round {
+                0 => 0,
+                1 => 31,
+                _ => rng.next_u64() & 31,
+            };
+            let hi1 = match round {
+                0 => 31,
+                1 => 0,
+                _ => rng.next_u64() & 31,
+            };
+            let c0 = F128 {
+                lo: rng.next_u64(),
+                hi: hi0,
+            };
+            let c1 = F128 {
+                lo: rng.next_u64(),
+                hi: hi1,
+            };
+            let b0 = rng.next_f128();
+            let b1 = rng.next_f128();
+            let prod =
+                unsafe { aarch64::ghash_mul_tiny_hi_constants_vec2_neon([c0, c1], [b0, b1]) };
+            assert_eq!(prod[0], software::ghash_mul(c0, b0), "lane 0 round {round}");
+            assert_eq!(prod[1], software::ghash_mul(c1, b1), "lane 1 round {round}");
+        }
+    }
+
     #[cfg(all(target_arch = "x86_64", target_feature = "pclmulqdq"))]
     #[test]
     fn all_x86_variants_agree() {

@@ -209,6 +209,24 @@ fn use_ranked_low_twiddle_final_pair(log_d: usize, num_ntts: usize, n_top: usize
         && std::env::var_os("FLOCK_NO_NTT_LOW_TWIDDLE_FINAL").is_none()
 }
 
+/// The standard dimension-20 basis also has tiny-high-limb twiddles (`hi <
+/// 32`) throughout layer 17, the inner layer of the preceding fused pair
+/// (16, 17); layer 16 itself stays generic (high limbs up to 61 bits). This
+/// permits a four-PMULL product for the inner stage on AArch64 instead of
+/// the generic six-PMULL field multiply. Keep the dispatch tied to the exact
+/// ranked deep-transform geometry, like the final-pair gate above.
+#[inline]
+fn use_ranked_low_twiddle_pair16(log_d: usize, num_ntts: usize, n_top: usize) -> bool {
+    cfg!(all(
+        target_os = "macos",
+        target_arch = "aarch64",
+        target_feature = "aes"
+    )) && log_d == 20
+        && num_ntts == 64
+        && n_top == 10
+        && std::env::var_os("FLOCK_NO_NTT_LOW_TWIDDLE_PAIR16").is_none()
+}
+
 /// The zero-root radix-8 kernel is currently scored only for the ranked L0
 /// transform. Keep recursive and diagnostic commits on their prior kernel so
 /// this candidate has one production scope and one transfer story.
@@ -881,6 +899,7 @@ impl AdditiveNttF128 {
         let sub_elems = sub_size_positions * num_ntts;
         let low_twiddle_final_pair =
             use_ranked_low_twiddle_final_pair(log_d, num_ntts, n_top);
+        let low_twiddle_pair16 = use_ranked_low_twiddle_pair16(log_d, num_ntts, n_top);
 
         data.par_chunks_mut(sub_elems)
             .enumerate()
@@ -904,6 +923,17 @@ impl AdditiveNttF128 {
                             debug_assert_eq!(t_inner_a.hi, 0);
                             debug_assert_eq!(t_inner_b.hi, 0);
                             butterfly_interleaved_fused_2layer_low_twiddles_rows_seq(
+                                &mut sub_data[block_start..block_start + block_elems],
+                                t_outer,
+                                t_inner_a,
+                                t_inner_b,
+                                quarter,
+                                num_ntts,
+                            );
+                        } else if low_twiddle_pair16 && layer + 4 == log_d {
+                            debug_assert!(t_inner_a.hi < 32);
+                            debug_assert!(t_inner_b.hi < 32);
+                            butterfly_interleaved_fused_2layer_tiny_hi_inner_rows_seq(
                                 &mut sub_data[block_start..block_start + block_elems],
                                 t_outer,
                                 t_inner_a,
@@ -1363,6 +1393,37 @@ fn butterfly_interleaved_fused_2layer_low_twiddles_rows_seq(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
+#[inline]
+fn butterfly_interleaved_fused_2layer_tiny_hi_inner_rows_seq(
+    block: &mut [F128],
+    t_outer: F128,
+    t_inner_a: F128,
+    t_inner_b: F128,
+    quarter: usize,
+    num_ntts: usize,
+) {
+    let stride = quarter * num_ntts;
+    debug_assert!(num_ntts > 0);
+    debug_assert_eq!(block.len(), 4 * stride);
+    debug_assert!(t_inner_a.hi < 32);
+    debug_assert!(t_inner_b.hi < 32);
+
+    let (top_half, bot_half) = block.split_at_mut(2 * stride);
+    let (q1, q2) = top_half.split_at_mut(stride);
+    let (q3, q4) = bot_half.split_at_mut(stride);
+    for (((row_a, row_b), row_c), row_d) in q1
+        .chunks_exact_mut(num_ntts)
+        .zip(q2.chunks_exact_mut(num_ntts))
+        .zip(q3.chunks_exact_mut(num_ntts))
+        .zip(q4.chunks_exact_mut(num_ntts))
+    {
+        kernels::butterfly_fused_2layer_tiny_hi_inner(
+            row_a, row_b, row_c, row_d, t_outer, t_inner_a, t_inner_b,
+        );
+    }
+}
+
 /// Butterfly one block of an interleaved (SoA) buffer with shared twiddle.
 ///
 /// `block` has length `(2 * block_size_half) * num_ntts` and is laid out as
@@ -1743,6 +1804,42 @@ mod tests {
         }
     }
 
+    /// The tiny-hi-inner AArch64 kernel is algebraically identical to the
+    /// generic fused pair for every lane geometry used by the ranked
+    /// (16, 17) pair: full-width outer twiddle, `hi < 32` inner twiddles
+    /// (both boundary limbs included).
+    #[test]
+    fn fused2_tiny_hi_inner_match_generic() {
+        let mut rng = Rng::new(0x7141_1117_20A5_0001);
+        for (quarter, num_ntts) in [(4usize, 64usize), (1, 64), (4, 8), (64, 2)] {
+            for iteration in 0..4 {
+                let t_outer = rng.f128();
+                let (hi_a, hi_b) = match iteration {
+                    0 => (0, 31),
+                    1 => (31, 0),
+                    _ => (rng.next_u64() & 31, rng.next_u64() & 31),
+                };
+                let t_inner_a = F128::new(rng.next_u64(), hi_a);
+                let t_inner_b = F128::new(rng.next_u64(), hi_b);
+                let source = rand_vec(&mut rng, 4 * quarter * num_ntts);
+
+                let mut want = source.clone();
+                butterfly_interleaved_fused_2layer_rows_seq(
+                    &mut want, t_outer, t_inner_a, t_inner_b, quarter, num_ntts,
+                );
+                let mut got = source;
+                butterfly_interleaved_fused_2layer_tiny_hi_inner_rows_seq(
+                    &mut got, t_outer, t_inner_a, t_inner_b, quarter, num_ntts,
+                );
+                assert_eq!(
+                    got, want,
+                    "tiny-hi-inner fused-2 mismatch at quarter={quarter} \
+                     num_ntts={num_ntts} iteration={iteration}"
+                );
+            }
+        }
+    }
+
     /// Exhaust the exact production tables used by layers 18 and 19. This is
     /// the invariant that makes the ranked narrow dispatch sound.
     #[test]
@@ -1761,6 +1858,29 @@ mod tests {
         assert!(!use_ranked_low_twiddle_final_pair(19, 64, 10));
         assert!(!use_ranked_low_twiddle_final_pair(20, 32, 10));
         assert!(!use_ranked_low_twiddle_final_pair(20, 64, 9));
+    }
+
+    /// Exhaust the exact production tables used by layers 16 and 17: every
+    /// layer-17 twiddle has a tiny high limb (`hi < 32`), while layer 16
+    /// remains generic (some high limb at or above the bound), so only the
+    /// inner stage of the (16, 17) pair is specialized. This is the
+    /// invariant that makes the ranked pair16 dispatch sound.
+    #[test]
+    fn standard_dim20_pair16_inner_twiddles_have_tiny_high_limbs() {
+        let ntt = AdditiveNttF128::standard(20);
+        for block in 0..(1usize << 17) {
+            let hi = ntt.twiddle(17, block).hi;
+            assert!(hi < 32, "high limb {hi:#x} at layer=17 block={block}");
+        }
+        assert!(
+            (0..(1usize << 16)).any(|block| ntt.twiddle(16, block).hi >= 32),
+            "layer 16 unexpectedly satisfies the tiny-hi bound; widen the \
+             specialization instead of gating it at layer 17 only"
+        );
+        assert!(use_ranked_low_twiddle_pair16(20, 64, 10));
+        assert!(!use_ranked_low_twiddle_pair16(19, 64, 10));
+        assert!(!use_ranked_low_twiddle_pair16(20, 32, 10));
+        assert!(!use_ranked_low_twiddle_pair16(20, 64, 9));
     }
 
     /// Exercise five fused deep pairs with the ranked 1024-position subtree

@@ -201,7 +201,10 @@ pub mod fs_count {
 #[derive(Clone)]
 enum FsState {
     Sha256(Sha256),
-    Blake3(Box<blake3::Hasher>),
+    /// The transcript's own incremental hasher (see [`fs_blake3`]) — digest
+    /// and XOF output are bit-identical to `blake3::Hasher`, without the
+    /// crate's per-update chunk-state overhead on the many tiny absorbs.
+    Blake3(Box<fs_blake3::TranscriptBlake3>),
 }
 
 #[derive(Clone)]
@@ -234,7 +237,7 @@ impl FsChallenger {
         let mut c = Self {
             state: match kind {
                 HashKind::Sha256 => FsState::Sha256(Sha256::new()),
-                HashKind::Blake3 => FsState::Blake3(Box::new(blake3::Hasher::new())),
+                HashKind::Blake3 => FsState::Blake3(Box::new(fs_blake3::TranscriptBlake3::new())),
             },
             n_absorbed: 0,
         };
@@ -294,7 +297,7 @@ impl FsChallenger {
                     ctr = ctr.wrapping_add(1);
                 }
             }
-            FsState::Blake3(hasher) => hasher.finalize_xof().fill(out),
+            FsState::Blake3(hasher) => hasher.xof_fill(out),
         }
     }
 
@@ -307,7 +310,7 @@ impl FsChallenger {
         fs_count::SQUEEZES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         match &self.state {
             FsState::Sha256(h) => h.clone().finalize().into(),
-            FsState::Blake3(h) => *h.finalize().as_bytes(),
+            FsState::Blake3(h) => h.finalize(),
         }
     }
 
@@ -696,6 +699,321 @@ fn pow_scan(
         HashKind::Blake3 => blake3_pow_scan(state_digest, start, len, bits),
         HashKind::Sha256 => (start..start.saturating_add(len))
             .find(|&n| pow_has_leading_zero_bits(state_digest, n, bits, kind)),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// fs_blake3 — minimal incremental BLAKE3 for the Fiat-Shamir transcript.
+//
+// On aarch64 the `blake3` crate computes single-input hashing through its
+// portable scalar `compress_in_place` (the crate's NEON code only serves the
+// multi-input `hash_many` used by the Merkle layer), so every tiny transcript
+// absorb and every squeeze also pays the crate's generic chunk-state/CV-stack
+// machinery around that same scalar compression. This module re-implements
+// the unkeyed BLAKE3 tree with reference-impl semantics (chunk state + CV
+// stack) but a hot path shaped for the transcript: absorbing a 1–26-byte
+// fragment is a bounds-check plus memcpy, and a squeeze walks the CV stack
+// once without cloning any hasher. Output is bit-identical to
+// `blake3::Hasher` for every input length and XOF width —
+// `transcript_blake3_matches_crate` and
+// `fs_challenger_blake3_matches_crate_reference` assert this across chunk
+// boundaries.
+// ---------------------------------------------------------------------------
+mod fs_blake3 {
+    const BLOCK_LEN: usize = 64;
+    const CHUNK_LEN: usize = 1024;
+
+    const CHUNK_START: u32 = 1 << 0;
+    const CHUNK_END: u32 = 1 << 1;
+    const PARENT: u32 = 1 << 2;
+    const ROOT: u32 = 1 << 3;
+
+    const IV: [u32; 8] = [
+        0x6A09E667, 0xBB67AE85, 0x3C6EF372, 0xA54FF53A, 0x510E527F, 0x9B05688C, 0x1F83D9AB,
+        0x5BE0CD19,
+    ];
+
+    const MSG_SCHEDULE: [[u8; 16]; 7] = [
+        [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15],
+        [2, 6, 3, 10, 7, 0, 4, 13, 1, 11, 12, 5, 9, 14, 15, 8],
+        [3, 4, 10, 12, 13, 2, 7, 14, 6, 5, 9, 0, 11, 15, 8, 1],
+        [10, 7, 12, 9, 14, 3, 13, 15, 4, 0, 11, 2, 5, 8, 1, 6],
+        [12, 13, 9, 11, 15, 10, 14, 8, 7, 2, 5, 3, 0, 1, 6, 4],
+        [9, 14, 11, 5, 8, 12, 15, 1, 13, 3, 0, 10, 2, 6, 4, 7],
+        [11, 15, 5, 0, 1, 9, 8, 6, 14, 10, 2, 12, 3, 4, 7, 13],
+    ];
+
+    #[inline(always)]
+    fn g(v: &mut [u32; 16], a: usize, b: usize, c: usize, d: usize, x: u32, y: u32) {
+        v[a] = v[a].wrapping_add(v[b]).wrapping_add(x);
+        v[d] = (v[d] ^ v[a]).rotate_right(16);
+        v[c] = v[c].wrapping_add(v[d]);
+        v[b] = (v[b] ^ v[c]).rotate_right(12);
+        v[a] = v[a].wrapping_add(v[b]).wrapping_add(y);
+        v[d] = (v[d] ^ v[a]).rotate_right(8);
+        v[c] = v[c].wrapping_add(v[d]);
+        v[b] = (v[b] ^ v[c]).rotate_right(7);
+    }
+
+    /// One BLAKE3 round. Must be called with a literal `r` (see `compress`).
+    #[inline(always)]
+    fn round(v: &mut [u32; 16], m: &[u32; 16], r: usize) {
+        let s = &MSG_SCHEDULE[r];
+        g(v, 0, 4, 8, 12, m[s[0] as usize], m[s[1] as usize]);
+        g(v, 1, 5, 9, 13, m[s[2] as usize], m[s[3] as usize]);
+        g(v, 2, 6, 10, 14, m[s[4] as usize], m[s[5] as usize]);
+        g(v, 3, 7, 11, 15, m[s[6] as usize], m[s[7] as usize]);
+        g(v, 0, 5, 10, 15, m[s[8] as usize], m[s[9] as usize]);
+        g(v, 1, 6, 11, 12, m[s[10] as usize], m[s[11] as usize]);
+        g(v, 2, 7, 8, 13, m[s[12] as usize], m[s[13] as usize]);
+        g(v, 3, 4, 9, 14, m[s[14] as usize], m[s[15] as usize]);
+    }
+
+    /// One full BLAKE3 compression. Returns all sixteen output words: words
+    /// 0..8 are the chaining value, words 8..16 extend it to the full 64-byte
+    /// XOF block (`out[i+8] = v[i+8] ^ cv[i]`), exactly as the spec defines.
+    fn compress(cv: &[u32; 8], block: &[u8; 64], counter: u64, block_len: u32, flags: u32) -> [u32; 16] {
+        let mut m = [0u32; 16];
+        for (w, src) in m.iter_mut().zip(block.chunks_exact(4)) {
+            *w = u32::from_le_bytes(src.try_into().unwrap());
+        }
+        let mut v = [
+            cv[0],
+            cv[1],
+            cv[2],
+            cv[3],
+            cv[4],
+            cv[5],
+            cv[6],
+            cv[7],
+            IV[0],
+            IV[1],
+            IV[2],
+            IV[3],
+            counter as u32,
+            (counter >> 32) as u32,
+            block_len,
+            flags,
+        ];
+        // Rounds are called with literal indices so the schedule lookups
+        // constant-fold — a `for s in &MSG_SCHEDULE` loop leaves runtime
+        // indexed loads (and bounds checks) in the hot path and compiles
+        // ~2.5× slower than the crate's portable compression.
+        round(&mut v, &m, 0);
+        round(&mut v, &m, 1);
+        round(&mut v, &m, 2);
+        round(&mut v, &m, 3);
+        round(&mut v, &m, 4);
+        round(&mut v, &m, 5);
+        round(&mut v, &m, 6);
+        for i in 0..8 {
+            v[i] ^= v[i + 8];
+            v[i + 8] ^= cv[i];
+        }
+        v
+    }
+
+    #[inline]
+    fn first8(words: &[u32; 16]) -> [u32; 8] {
+        words[..8].try_into().unwrap()
+    }
+
+    /// The 64-byte block of a parent node: left ‖ right chaining values.
+    fn parent_block(left: &[u32; 8], right: &[u32; 8]) -> [u8; 64] {
+        let mut block = [0u8; 64];
+        for i in 0..8 {
+            block[4 * i..4 * i + 4].copy_from_slice(&left[i].to_le_bytes());
+            block[32 + 4 * i..36 + 4 * i].copy_from_slice(&right[i].to_le_bytes());
+        }
+        block
+    }
+
+    /// The inputs of a node's final compression, captured *before* running
+    /// it. `chaining_value` runs it as an interior node; the finalize/XOF
+    /// paths re-run it with `ROOT` and a per-output-block counter, exactly
+    /// like the reference implementation's `Output`.
+    struct Output {
+        cv: [u32; 8],
+        block: [u8; 64],
+        block_len: u32,
+        counter: u64,
+        flags: u32,
+    }
+
+    impl Output {
+        #[inline]
+        fn chaining_value(&self) -> [u32; 8] {
+            first8(&compress(
+                &self.cv,
+                &self.block,
+                self.counter,
+                self.block_len,
+                self.flags,
+            ))
+        }
+    }
+
+    /// Incremental unkeyed BLAKE3 with `blake3::Hasher`-identical output.
+    ///
+    /// 54 chaining values cover the maximum tree height (2^64 input bytes),
+    /// mirroring the crate; the transcript never gets past a handful, but
+    /// the fixed array keeps the type honest for any input length.
+    #[derive(Clone)]
+    pub(super) struct TranscriptBlake3 {
+        chunk_cv: [u32; 8],
+        chunk_counter: u64,
+        block: [u8; 64],
+        block_len: u8,
+        blocks_compressed: u8,
+        stack_len: u8,
+        cv_stack: [[u32; 8]; 54],
+    }
+
+    impl TranscriptBlake3 {
+        pub(super) fn new() -> Self {
+            Self {
+                chunk_cv: IV,
+                chunk_counter: 0,
+                block: [0u8; BLOCK_LEN],
+                block_len: 0,
+                blocks_compressed: 0,
+                stack_len: 0,
+                cv_stack: [[0u32; 8]; 54],
+            }
+        }
+
+        #[inline]
+        fn start_flag(&self) -> u32 {
+            if self.blocks_compressed == 0 { CHUNK_START } else { 0 }
+        }
+
+        /// Absorb bytes. The transcript's dominant case — a small fragment
+        /// that fits in the buffered block — is a copy and a length bump;
+        /// blocks are compressed lazily (only once further input arrives),
+        /// matching the reference implementation exactly.
+        #[inline]
+        pub(super) fn update(&mut self, input: &[u8]) {
+            let len = self.block_len as usize;
+            if len + input.len() <= BLOCK_LEN {
+                self.block[len..len + input.len()].copy_from_slice(input);
+                self.block_len = (len + input.len()) as u8;
+                return;
+            }
+            self.update_general(input);
+        }
+
+        /// Slow path: the input spills past the buffered block. Compresses
+        /// full blocks (finalizing and pushing the chunk's chaining value at
+        /// each 1024-byte boundary) and buffers the tail.
+        #[inline(never)]
+        fn update_general(&mut self, mut input: &[u8]) {
+            while !input.is_empty() {
+                if self.block_len as usize == BLOCK_LEN {
+                    if self.blocks_compressed as usize == CHUNK_LEN / BLOCK_LEN - 1 {
+                        // The buffered block completes the current chunk, and
+                        // more input follows: finalize the chunk and merge its
+                        // chaining value into the stack.
+                        let out = compress(
+                            &self.chunk_cv,
+                            &self.block,
+                            self.chunk_counter,
+                            BLOCK_LEN as u32,
+                            self.start_flag() | CHUNK_END,
+                        );
+                        let total_chunks = self.chunk_counter + 1;
+                        self.push_chunk_cv(first8(&out), total_chunks);
+                        self.chunk_counter = total_chunks;
+                        self.chunk_cv = IV;
+                        self.blocks_compressed = 0;
+                    } else {
+                        let out = compress(
+                            &self.chunk_cv,
+                            &self.block,
+                            self.chunk_counter,
+                            BLOCK_LEN as u32,
+                            self.start_flag(),
+                        );
+                        self.chunk_cv = first8(&out);
+                        self.blocks_compressed += 1;
+                    }
+                    self.block_len = 0;
+                }
+                let take = (BLOCK_LEN - self.block_len as usize).min(input.len());
+                self.block[self.block_len as usize..][..take].copy_from_slice(&input[..take]);
+                self.block_len += take as u8;
+                input = &input[take..];
+            }
+        }
+
+        /// Merge a completed chunk's chaining value into the stack: pop and
+        /// combine once per trailing zero bit of `total_chunks` (each marks a
+        /// completed subtree), then push. Reference `add_chunk_chaining_value`.
+        fn push_chunk_cv(&mut self, mut cv: [u32; 8], mut total_chunks: u64) {
+            while total_chunks & 1 == 0 {
+                self.stack_len -= 1;
+                let block = parent_block(&self.cv_stack[self.stack_len as usize], &cv);
+                cv = first8(&compress(&IV, &block, 0, BLOCK_LEN as u32, PARENT));
+                total_chunks >>= 1;
+            }
+            self.cv_stack[self.stack_len as usize] = cv;
+            self.stack_len += 1;
+        }
+
+        /// Root node's pre-finalization output: the current (possibly
+        /// partial) chunk's output merged with every stacked subtree, deepest
+        /// last. Does not mutate the state — squeezes never disturb the
+        /// transcript.
+        fn root_output(&self) -> Output {
+            // Bytes past `block_len` may hold stale data from earlier blocks;
+            // the spec compresses a zero-padded block.
+            let mut block = [0u8; BLOCK_LEN];
+            block[..self.block_len as usize].copy_from_slice(&self.block[..self.block_len as usize]);
+            let mut out = Output {
+                cv: self.chunk_cv,
+                block,
+                block_len: self.block_len as u32,
+                counter: self.chunk_counter,
+                flags: self.start_flag() | CHUNK_END,
+            };
+            for cv in self.cv_stack[..self.stack_len as usize].iter().rev() {
+                let right = out.chaining_value();
+                out = Output {
+                    cv: IV,
+                    block: parent_block(cv, &right),
+                    block_len: BLOCK_LEN as u32,
+                    counter: 0,
+                    flags: PARENT,
+                };
+            }
+            out
+        }
+
+        /// 32-byte root digest; identical to `blake3::Hasher::finalize`.
+        pub(super) fn finalize(&self) -> [u8; 32] {
+            let o = self.root_output();
+            let words = compress(&o.cv, &o.block, 0, o.block_len, o.flags | ROOT);
+            let mut bytes = [0u8; 32];
+            for (dst, w) in bytes.chunks_exact_mut(4).zip(&words[..8]) {
+                dst.copy_from_slice(&w.to_le_bytes());
+            }
+            bytes
+        }
+
+        /// Fill `out` with XOF output from position 0; identical to
+        /// `blake3::Hasher::finalize_xof().fill(out)`. The 64-byte output
+        /// blocks are independent compressions (counter = block index), so
+        /// wide squeezes overlap in the pipeline for free.
+        pub(super) fn xof_fill(&self, out: &mut [u8]) {
+            let o = self.root_output();
+            for (counter, dst) in out.chunks_mut(BLOCK_LEN).enumerate() {
+                let words = compress(&o.cv, &o.block, counter as u64, o.block_len, o.flags | ROOT);
+                let mut bytes = [0u8; BLOCK_LEN];
+                for (b, w) in bytes.chunks_exact_mut(4).zip(&words) {
+                    b.copy_from_slice(&w.to_le_bytes());
+                }
+                dst.copy_from_slice(&bytes[..dst.len()]);
+            }
+        }
     }
 }
 
@@ -1149,5 +1467,179 @@ mod tests {
             c2.observe_f128(F128::ONE);
             assert_ne!(c1.sample_f128(), c2.sample_f128());
         }
+    }
+
+    /// `TranscriptBlake3` must agree with `blake3::Hasher` bit-for-bit on
+    /// every input length that exercises a distinct code path: empty, partial
+    /// blocks, exact block/chunk boundaries and their neighbours, and
+    /// multi-chunk trees — both digest and XOF output, fed one-shot and in
+    /// pseudorandom small fragments (the transcript's actual access pattern).
+    #[test]
+    fn transcript_blake3_matches_crate() {
+        let mut rng = 0x1717_5EED_u64;
+        for len in [
+            0usize, 1, 2, 31, 63, 64, 65, 127, 128, 129, 192, 1023, 1024, 1025, 2047, 2048, 2049,
+            3072, 4096, 8191,
+        ] {
+            let data: Vec<u8> = (0..len).map(|_| splitmix64(&mut rng) as u8).collect();
+            let expect = blake3::Hasher::new().update(&data).finalize();
+
+            // One-shot.
+            let mut ours = fs_blake3::TranscriptBlake3::new();
+            ours.update(&data);
+            assert_eq!(ours.finalize(), *expect.as_bytes(), "one-shot len {len}");
+
+            // Fragmented into pseudorandom 1..=64-byte pieces.
+            let mut frag = fs_blake3::TranscriptBlake3::new();
+            let mut rest = &data[..];
+            while !rest.is_empty() {
+                let take = (splitmix64(&mut rng) as usize % 64 + 1).min(rest.len());
+                frag.update(&rest[..take]);
+                rest = &rest[take..];
+            }
+            assert_eq!(frag.finalize(), *expect.as_bytes(), "fragmented len {len}");
+
+            // XOF output at widths crossing the 64-byte output-block boundary.
+            let mut reader = blake3::Hasher::new().update(&data).finalize_xof();
+            let mut want = vec![0u8; 200];
+            reader.fill(&mut want);
+            for xof_len in [1usize, 16, 31, 32, 33, 63, 64, 65, 100, 128, 200] {
+                let mut got = vec![0u8; xof_len];
+                ours.xof_fill(&mut got);
+                assert_eq!(got, want[..xof_len], "xof len {xof_len} at input len {len}");
+            }
+        }
+    }
+
+    /// The BLAKE3 `FsChallenger` must be indistinguishable from the same
+    /// duplex built directly on `blake3::Hasher`: 200 pseudorandom
+    /// observe/sample interleavings (including multi-chunk observations and
+    /// wide vector squeezes) produce identical challenges and identical
+    /// state digests throughout.
+    #[test]
+    fn fs_challenger_blake3_matches_crate_reference() {
+        /// Reference duplex over the plain crate, mirroring `FsChallenger`'s
+        /// tag/absorption scheme byte-for-byte.
+        struct RefChallenger {
+            h: blake3::Hasher,
+        }
+        impl RefChallenger {
+            fn new(domain: &[u8]) -> Self {
+                let mut c = Self { h: blake3::Hasher::new() };
+                c.h.update(&[OP_DOMAIN]);
+                c.h.update(&(domain.len() as u64).to_le_bytes());
+                c.h.update(domain);
+                c
+            }
+            fn absorb_f128(&mut self, v: F128) {
+                self.h.update(&v.lo.to_le_bytes());
+                self.h.update(&v.hi.to_le_bytes());
+            }
+            fn observe_label(&mut self, label: &[u8]) {
+                self.h.update(&[OP_LABEL]);
+                self.h.update(&(label.len() as u64).to_le_bytes());
+                self.h.update(label);
+            }
+            fn observe_bytes(&mut self, bytes: &[u8]) {
+                self.h.update(&[OP_BYTES]);
+                self.h.update(&(bytes.len() as u64).to_le_bytes());
+                self.h.update(bytes);
+            }
+            fn observe_f128(&mut self, v: F128) {
+                self.h.update(&[OP_OBSERVE, KIND_SCALAR]);
+                self.absorb_f128(v);
+            }
+            fn observe_f128_slice(&mut self, vs: &[F128]) {
+                self.h.update(&[OP_OBSERVE, KIND_SLICE]);
+                self.h.update(&(vs.len() as u64).to_le_bytes());
+                for v in vs {
+                    self.absorb_f128(*v);
+                }
+            }
+            fn sample_f128(&mut self) -> F128 {
+                self.h.update(&[OP_SQUEEZE, KIND_SCALAR]);
+                let mut buf = [0u8; 16];
+                self.h.finalize_xof().fill(&mut buf);
+                self.h.update(&buf);
+                F128 {
+                    lo: u64::from_le_bytes(buf[..8].try_into().unwrap()),
+                    hi: u64::from_le_bytes(buf[8..].try_into().unwrap()),
+                }
+            }
+            fn sample_f128_vec(&mut self, n: usize) -> Vec<F128> {
+                self.h.update(&[OP_SQUEEZE, KIND_SLICE]);
+                self.h.update(&(n as u64).to_le_bytes());
+                let mut buf = vec![0u8; n * 16];
+                self.h.finalize_xof().fill(&mut buf);
+                self.h.update(&buf);
+                buf.as_chunks::<16>()
+                    .0
+                    .iter()
+                    .map(|c| F128 {
+                        lo: u64::from_le_bytes(c[..8].try_into().unwrap()),
+                        hi: u64::from_le_bytes(c[8..].try_into().unwrap()),
+                    })
+                    .collect()
+            }
+        }
+
+        let mut ours = FsChallenger::with_hash(b"equiv-test", HashKind::Blake3);
+        let mut reference = RefChallenger::new(b"equiv-test");
+        let mut rng = 0xB1A4_3EFA_u64;
+        let rand_f128 = |rng: &mut u64| F128 {
+            lo: splitmix64(rng),
+            hi: splitmix64(rng),
+        };
+        for step in 0..200 {
+            match splitmix64(&mut rng) % 6 {
+                0 => {
+                    // 16–64-byte observations, plus an occasional multi-chunk
+                    // one so the CV stack genuinely merges mid-transcript.
+                    let len = if step % 41 == 3 {
+                        1500 + splitmix64(&mut rng) as usize % 1200
+                    } else {
+                        16 + splitmix64(&mut rng) as usize % 49
+                    };
+                    let bytes: Vec<u8> =
+                        (0..len).map(|_| splitmix64(&mut rng) as u8).collect();
+                    ours.observe_bytes(&bytes);
+                    reference.observe_bytes(&bytes);
+                }
+                1 => {
+                    let v = rand_f128(&mut rng);
+                    ours.observe_f128(v);
+                    reference.observe_f128(v);
+                }
+                2 => {
+                    let n = 1 + splitmix64(&mut rng) as usize % 8;
+                    let vs: Vec<F128> = (0..n).map(|_| rand_f128(&mut rng)).collect();
+                    ours.observe_f128_slice(&vs);
+                    reference.observe_f128_slice(&vs);
+                }
+                3 => {
+                    ours.observe_label(b"phase-label");
+                    reference.observe_label(b"phase-label");
+                }
+                4 => {
+                    assert_eq!(ours.sample_f128(), reference.sample_f128(), "step {step}");
+                }
+                _ => {
+                    let n = 1 + splitmix64(&mut rng) as usize % 37;
+                    assert_eq!(
+                        ours.sample_f128_vec(n),
+                        reference.sample_f128_vec(n),
+                        "step {step}"
+                    );
+                }
+            }
+            if step % 10 == 0 {
+                assert_eq!(
+                    ours.state_digest(),
+                    *reference.h.finalize().as_bytes(),
+                    "digest at step {step}"
+                );
+            }
+        }
+        assert_eq!(ours.state_digest(), *reference.h.finalize().as_bytes());
     }
 }
