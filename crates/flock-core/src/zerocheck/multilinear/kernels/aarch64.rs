@@ -87,6 +87,56 @@ unsafe fn mul_q(
     }
 }
 
+/// Binius-structured GHASH multiply, operands and result in q registers.
+///
+/// [`mul_q`] above is Karatsuba: three product PMULLs plus two reduction
+/// PMULLs. Five is fewer than binius's six, but `ghash_mul_binius`'s own doc
+/// comment records why the scalar field layer picked binius on M-series anyway
+/// — "fewer scalar shifts in the dep chain", i.e. it wins on latency, not
+/// throughput. Karatsuba's `pm = (a.lo^a.hi)·(b.lo^b.hi)` serialises two XORs
+/// ahead of its third PMULL, and the tail fold's multiply sits directly on the
+/// critical path (`a0 = a_even + r_fold·(a_even + a_odd)` feeds both the store
+/// and the next multiply), so latency is what matters here.
+///
+/// Used only by [`fold_and_message_q`]; the round-two kernels keep [`mul_q`],
+/// whose lookup-table structure has different balance and which is already
+/// promoted.
+#[cfg(target_arch = "aarch64")]
+#[inline]
+#[target_feature(enable = "aes")]
+unsafe fn mul_q_binius(
+    a: core::arch::aarch64::uint64x2_t,
+    b: core::arch::aarch64::uint64x2_t,
+) -> core::arch::aarch64::uint64x2_t {
+    use core::arch::aarch64::*;
+    unsafe {
+        let zero = vdupq_n_u64(0);
+
+        let t0 = pmull_lane(vgetq_lane_u64::<0>(a), vgetq_lane_u64::<0>(b));
+        let t1a = pmull_lane(vgetq_lane_u64::<0>(a), vgetq_lane_u64::<1>(b));
+        let t1b = pmull_lane(vgetq_lane_u64::<1>(a), vgetq_lane_u64::<0>(b));
+        let t2 = core::mem::transmute::<u128, uint64x2_t>(vmull_high_p64(
+            vreinterpretq_p64_u64(a),
+            vreinterpretq_p64_u64(b),
+        ));
+        let t1_cross = veorq_u64(t1a, t1b);
+
+        // t1 += x^64 · t2 (mod p).
+        let t1 = xor3_u64(
+            t1_cross,
+            vextq_u64::<1>(zero, t2),
+            pmull_lane(vgetq_lane_u64::<1>(t2), 0x87),
+        );
+
+        // t0 += x^64 · t1 (mod p).
+        xor3_u64(
+            t0,
+            vextq_u64::<1>(zero, t1),
+            pmull_lane(vgetq_lane_u64::<1>(t1), 0x87),
+        )
+    }
+}
+
 #[cfg(target_arch = "aarch64")]
 #[inline]
 #[target_feature(enable = "aes")]
@@ -298,8 +348,8 @@ pub(crate) unsafe fn fold_round2_chunk_neon_unchecked_8(
             store_pair_nt(a_out.add(out), a0, a1);
             store_pair_nt(b_out.add(out), b0, b1);
 
-            let g1 = mul_q(a1, b1);
-            let g_inf = mul_q(veorq_u64(a0, a1), veorq_u64(b0, b1));
+            let g1 = mul_q_binius(a1, b1);
+            let g_inf = mul_q_binius(veorq_u64(a0, a1), veorq_u64(b0, b1));
             let eq_l = vld1q_u64(eq_lo.add(x_lo).cast::<u64>());
             wide_xor(&mut p1_acc, mul_unreduced_q(eq_l, g1));
             wide_xor(&mut pinf_acc, mul_unreduced_q(eq_l, g_inf));
@@ -556,6 +606,38 @@ pub(crate) fn fold_and_message_aarch64(
     debug_assert_eq!(b_in.len(), 2 * b_out.len());
     debug_assert_eq!(a_out.len(), 2 * eq_lo.len());
 
+    // The vector-resident path is the same pattern the round-two kernels in
+    // this file already use (`WideNeon` accumulators, `mul_q`,
+    // `mul_unreduced_q`, `reduce_wide_q`); this kernel was the one that never
+    // adopted it. `FLOCK_NO_ZC_TAIL_NEON=1` restores the scalar chain below in
+    // the same binary.
+    #[cfg(target_feature = "aes")]
+    if vector_resident_tail() {
+        // SAFETY: the cfg gate supplies `aes`; the length contract asserted
+        // above is exactly what the vector form indexes.
+        return unsafe { fold_and_message_q(a_in, b_in, a_out, b_out, r_fold, eq_lo) };
+    }
+
+    fold_and_message_scalar(a_in, b_in, a_out, b_out, r_fold, eq_lo)
+}
+
+/// Scalar `F128`/`F256Unreduced` form, retained as the non-`aes` fallback, as
+/// the `FLOCK_NO_ZC_TAIL_NEON` control, and as the equivalence oracle for
+/// [`fold_and_message_q`].
+///
+/// `inline(never)` keeps this cold body out of the hot chunk closure: when the
+/// vector path is active this code never runs, and inlining it only inflated
+/// the closure's instruction footprint.
+#[cfg(target_arch = "aarch64")]
+#[inline(never)]
+fn fold_and_message_scalar(
+    a_in: &[F128],
+    b_in: &[F128],
+    a_out: &mut [F128],
+    b_out: &mut [F128],
+    r_fold: F128,
+    eq_lo: &[F128],
+) -> (F128, F128) {
     let mut p1_acc = F256Unreduced::ZERO;
     let mut pinf_acc = F256Unreduced::ZERO;
 
@@ -589,6 +671,95 @@ pub(crate) fn fold_and_message_aarch64(
     (p1_acc.reduce(), pinf_acc.reduce())
 }
 
+/// Whether the vector-resident multilinear tail kernel is used.
+///
+/// `FLOCK_NO_ZC_TAIL_NEON=1` restores the scalar `F128`/`F256Unreduced` chain
+/// in the same binary, so a candidate/control pair differs only in this
+/// dispatch. Read once per process.
+#[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+#[inline]
+fn vector_resident_tail() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("FLOCK_NO_ZC_TAIL_NEON").is_none())
+}
+
+/// Vector-resident form of [`fold_and_message_aarch64`].
+///
+/// The scalar chain above accumulates into `F256Unreduced`, a four-word struct,
+/// so each `^=` is four scalar `u64` XORs and each `mul_unreduced` repacks a
+/// NEON result into it — 48 scalar XORs and 45 general-purpose/vector moves per
+/// emitted chunk against 56 PMULLs. Here both deferred accumulators stay in
+/// `WideNeon` (two q registers) and the four folded values never leave vector
+/// registers between load and store.
+///
+/// The multiply count, the butterfly order, the deferred-reduction structure
+/// and the single final `reduce` are all unchanged, so the folded tables and
+/// both returned message coordinates are bit-identical: `reduce` is F2-linear,
+/// XOR is associative, and the same products are summed in the same order.
+///
+/// # Safety
+/// Requires the `aes` target feature. `a_in`/`b_in` must hold `4 * eq_lo.len()`
+/// elements and `a_out`/`b_out` exactly `2 * eq_lo.len()`.
+#[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+#[target_feature(enable = "aes")]
+unsafe fn fold_and_message_q(
+    a_in: &[F128],
+    b_in: &[F128],
+    a_out: &mut [F128],
+    b_out: &mut [F128],
+    r_fold: F128,
+    eq_lo: &[F128],
+) -> (F128, F128) {
+    use core::arch::aarch64::*;
+    unsafe {
+        let zero = vdupq_n_u64(0);
+        let rf = vld1q_u64((&raw const r_fold).cast::<u64>());
+        let mut p1_acc = WideNeon { lo: zero, hi: zero };
+        let mut pinf_acc = WideNeon { lo: zero, hi: zero };
+
+        let ap = a_in.as_ptr().cast::<u64>();
+        let bp = b_in.as_ptr().cast::<u64>();
+        let aq = a_out.as_mut_ptr().cast::<u64>();
+        let bq = b_out.as_mut_ptr().cast::<u64>();
+
+        for (x_lo, eq_l) in eq_lo.iter().enumerate() {
+            let i = 8 * x_lo; // 4 F128 inputs, 2 u64 lanes each
+            let o = 4 * x_lo; // 2 F128 outputs
+
+            let a_even_0 = vld1q_u64(ap.add(i));
+            let a_odd_0 = vld1q_u64(ap.add(i + 2));
+            let a_even_1 = vld1q_u64(ap.add(i + 4));
+            let a_odd_1 = vld1q_u64(ap.add(i + 6));
+            let b_even_0 = vld1q_u64(bp.add(i));
+            let b_odd_0 = vld1q_u64(bp.add(i + 2));
+            let b_even_1 = vld1q_u64(bp.add(i + 4));
+            let b_odd_1 = vld1q_u64(bp.add(i + 6));
+
+            let a0 = veorq_u64(a_even_0, mul_q_binius(rf, veorq_u64(a_even_0, a_odd_0)));
+            let a1 = veorq_u64(a_even_1, mul_q_binius(rf, veorq_u64(a_even_1, a_odd_1)));
+            let b0 = veorq_u64(b_even_0, mul_q_binius(rf, veorq_u64(b_even_0, b_odd_0)));
+            let b1 = veorq_u64(b_even_1, mul_q_binius(rf, veorq_u64(b_even_1, b_odd_1)));
+
+            vst1q_u64(aq.add(o), a0);
+            vst1q_u64(aq.add(o + 2), a1);
+            vst1q_u64(bq.add(o), b0);
+            vst1q_u64(bq.add(o + 2), b1);
+
+            let eq = vld1q_u64((&raw const *eq_l).cast::<u64>());
+            let g1 = mul_q(a1, b1);
+            let g_inf = mul_q(veorq_u64(a0, a1), veorq_u64(b0, b1));
+            wide_xor(&mut p1_acc, mul_unreduced_q(eq, g1));
+            wide_xor(&mut pinf_acc, mul_unreduced_q(eq, g_inf));
+        }
+
+        (
+            core::mem::transmute::<uint64x2_t, F128>(reduce_wide_q(p1_acc)),
+            core::mem::transmute::<uint64x2_t, F128>(reduce_wide_q(pinf_acc)),
+        )
+    }
+}
+
 #[cfg(all(test, target_arch = "aarch64", target_feature = "aes"))]
 mod tests {
     use super::*;
@@ -600,6 +771,44 @@ mod tests {
         z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
         z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
         z ^ (z >> 31)
+    }
+
+    fn rand_f128(state: &mut u64) -> F128 {
+        F128 {
+            lo: splitmix64(state),
+            hi: splitmix64(state),
+        }
+    }
+
+    /// The vector-resident multilinear tail kernel must be bit-identical to the
+    /// scalar `F128`/`F256Unreduced` chain: both folded output tables and both
+    /// returned message coordinates, across the `lo_size` values the ranked
+    /// tail uses.
+    #[test]
+    fn fold_and_message_q_matches_scalar() {
+        let mut state = 0x5441_494C_5F4E_454F;
+        for &lo_size in &[1usize, 2, 4, 8, 64, 256, 512] {
+            let a_in: Vec<F128> = (0..4 * lo_size).map(|_| rand_f128(&mut state)).collect();
+            let b_in: Vec<F128> = (0..4 * lo_size).map(|_| rand_f128(&mut state)).collect();
+            let eq_lo: Vec<F128> = (0..lo_size).map(|_| rand_f128(&mut state)).collect();
+            let r_fold = rand_f128(&mut state);
+
+            let mut aw = vec![F128::ZERO; 2 * lo_size];
+            let mut bw = vec![F128::ZERO; 2 * lo_size];
+            let want = fold_and_message_scalar(&a_in, &b_in, &mut aw, &mut bw, r_fold, &eq_lo);
+
+            let mut ag = vec![F128::ZERO; 2 * lo_size];
+            let mut bg = vec![F128::ZERO; 2 * lo_size];
+            // SAFETY: this module carries `aes` via cfg; lengths satisfy the
+            // documented 4:2:1 in/out/eq contract.
+            let got = unsafe {
+                fold_and_message_q(&a_in, &b_in, &mut ag, &mut bg, r_fold, &eq_lo)
+            };
+
+            assert_eq!(ag, aw, "a_out mismatch at lo_size={lo_size}");
+            assert_eq!(bg, bw, "b_out mismatch at lo_size={lo_size}");
+            assert_eq!(got, want, "message mismatch at lo_size={lo_size}");
+        }
     }
 
     #[test]
