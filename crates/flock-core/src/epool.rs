@@ -128,28 +128,11 @@ const EPOOL_MIN_CHUNKS: usize = 16;
 /// depend on which thread or pool runs it. Chunk-claim order is
 /// nondeterministic; callers get deterministic *output* by making `f(i)`
 /// write only to chunk `i`'s disjoint range.
-pub(crate) fn run_hetero_chunks<F>(n_chunks: usize, f: F)
+pub fn run_hetero_chunks<F>(n_chunks: usize, f: F)
 where
     F: Fn(usize) + Sync,
 {
     run_chunks_with_helper(n_chunks, &f, epool());
-}
-
-/// Stateful sibling of [`run_hetero_chunks`]. Each queue-draining worker
-/// calls `init` exactly once, then reuses that private state for every chunk
-/// it claims. This is intended for kernels with moderately large scratch
-/// (for example a 64 KiB lookup table) where initializing once per chunk or
-/// once per Rayon split would erase the benefit of fine-grained work stealing.
-///
-/// State never crosses threads and `f` is never called concurrently with the
-/// same state. Chunk ownership and output-disjointness requirements are the
-/// same as [`run_hetero_chunks`].
-pub(crate) fn run_hetero_chunks_stateful<S, I, F>(n_chunks: usize, init: I, f: F)
-where
-    I: Fn() -> S + Sync,
-    F: Fn(&mut S, usize) + Sync,
-{
-    run_chunks_with_helper_stateful(n_chunks, &init, &f, epool());
 }
 
 /// [`run_hetero_chunks`] with an explicit helper pool, so tests can exercise
@@ -194,54 +177,6 @@ where
             // The scoped thread parks inside `broadcast` while the E-workers
             // drain; it costs no main-pool worker. The scope join bounds the
             // tail wait at one chunk on one efficiency core.
-            s.spawn(|| ep.broadcast(|_| worker()));
-            drain_main();
-        }),
-        None => drain_main(),
-    }
-}
-
-/// [`run_hetero_chunks_stateful`] with an explicit helper pool, so tests can
-/// exercise state reuse and the two-pool queue on any host.
-pub(crate) fn run_chunks_with_helper_stateful<S, I, F>(
-    n_chunks: usize,
-    init: &I,
-    f: &F,
-    helper: Option<&rayon::ThreadPool>,
-) where
-    I: Fn() -> S + Sync,
-    F: Fn(&mut S, usize) + Sync,
-{
-    if n_chunks == 0 {
-        return;
-    }
-    let main_threads = rayon::current_num_threads();
-    if main_threads <= 1 {
-        let mut state = init();
-        for i in 0..n_chunks {
-            f(&mut state, i);
-        }
-        return;
-    }
-    let next = AtomicUsize::new(0);
-    let worker = || {
-        let mut state = init();
-        loop {
-            let i = next.fetch_add(1, Ordering::Relaxed);
-            if i >= n_chunks {
-                break;
-            }
-            f(&mut state, i);
-        }
-    };
-    let drain_main = || {
-        (0..main_threads)
-            .into_par_iter()
-            .with_max_len(1)
-            .for_each(|_| worker());
-    };
-    match helper.filter(|_| n_chunks >= EPOOL_MIN_CHUNKS) {
-        Some(ep) => std::thread::scope(|s| {
             s.spawn(|| ep.broadcast(|_| worker()));
             drain_main();
         }),
@@ -343,69 +278,5 @@ mod tests {
     #[test]
     fn zero_chunks_is_noop() {
         run_chunks_with_helper(0, &|_| panic!("must not run"), None);
-    }
-
-    /// Stateful workers initialize private scratch once and reuse it across
-    /// many queue claims while still executing every chunk exactly once.
-    #[test]
-    fn stateful_helper_queue_reuses_worker_state() {
-        let helper = rayon::ThreadPoolBuilder::new()
-            .num_threads(2)
-            .build()
-            .unwrap();
-        let n = 1000;
-        let next_state = AtomicUsize::new(0);
-        let counts: Vec<AtomicUsize> = (0..n).map(|_| AtomicUsize::new(0)).collect();
-        let state_for_chunk: Vec<AtomicUsize> =
-            (0..n).map(|_| AtomicUsize::new(usize::MAX)).collect();
-        run_chunks_with_helper_stateful(
-            n,
-            &|| next_state.fetch_add(1, Ordering::Relaxed),
-            &|state, i| {
-                counts[i].fetch_add(1, Ordering::Relaxed);
-                state_for_chunk[i].store(*state, Ordering::Relaxed);
-            },
-            Some(&helper),
-        );
-        assert!(counts.iter().all(|c| c.load(Ordering::Relaxed) == 1));
-        let n_states = next_state.load(Ordering::Relaxed);
-        assert!(n_states < n, "state must be per worker, not per chunk");
-        let mut uses = vec![0usize; n_states];
-        for state in state_for_chunk {
-            uses[state.load(Ordering::Relaxed)] += 1;
-        }
-        assert!(uses.into_iter().any(|n_uses| n_uses > 1));
-    }
-
-    /// The stateful single-thread path preserves strict chunk order and owns
-    /// exactly one state, matching the stateless dispatcher's serial contract.
-    #[test]
-    fn stateful_single_threaded_pool_uses_one_state_in_order() {
-        let single = rayon::ThreadPoolBuilder::new()
-            .num_threads(1)
-            .build()
-            .unwrap();
-        let helper = rayon::ThreadPoolBuilder::new()
-            .num_threads(2)
-            .build()
-            .unwrap();
-        single.install(|| {
-            let init_count = AtomicUsize::new(0);
-            let seen = std::sync::Mutex::new(Vec::new());
-            run_chunks_with_helper_stateful(
-                100,
-                &|| {
-                    init_count.fetch_add(1, Ordering::Relaxed);
-                    0usize
-                },
-                &|state, i| {
-                    *state += 1;
-                    seen.lock().unwrap().push(i);
-                },
-                Some(&helper),
-            );
-            assert_eq!(init_count.load(Ordering::Relaxed), 1);
-            assert_eq!(seen.into_inner().unwrap(), (0..100).collect::<Vec<_>>());
-        });
     }
 }

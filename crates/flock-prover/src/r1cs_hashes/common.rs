@@ -323,8 +323,6 @@ fn drive_witness_packed_and_lincheck_impl<
 where
     F: Fn(&S, &mut [u64], &mut [u64], &mut [u64]) + Sync,
 {
-    use rayon::prelude::*;
-
     let k = 1usize << k_log;
     let f128_per_block = k / 128;
     let u64_per_block = k / 64;
@@ -370,12 +368,54 @@ where
     let mut b = flock_core::scratch::take_f128(total_f128);
     let mut z_lincheck = flock_core::scratch::take_u8((n_total / 8) * k);
 
-    z.par_chunks_mut(8 * f128_per_block)
-        .zip(a.par_chunks_mut(8 * f128_per_block))
-        .zip(b.par_chunks_mut(8 * f128_per_block))
-        .zip(z_lincheck.par_chunks_mut(k))
-        .enumerate()
-        .for_each(|(g, (((z_grp, a_grp), b_grp), stripe))| {
+    // Eight-block witness groups drain through the hetero queue so the idle
+    // efficiency cores add throughput to this otherwise E-core-dead phase
+    // (nothing else runs concurrently with witness generation; the leaf
+    // pipeline and AB precompute only start with the commit). Carry the four
+    // buffer bases as `usize` so the cross-pool closure stays `Sync`; group
+    // `g` exclusively owns its `8 * f128_per_block`-element z/a/b ranges and
+    // its `k`-byte stripe, so claim order cannot change the output.
+    //
+    // Claims are COARSE — `CLAIM_GROUPS` consecutive groups per claim — so
+    // each worker keeps long sequential runs through the z/a/b/codeword write
+    // streams. Per-group claims would hand every worker a scattered ~100 KB
+    // slice and break the streaming-store pattern Rayon's contiguous bands
+    // provided; this phase moves ~2.5 GB, so per-thread write locality is
+    // the binding resource. 256 groups ≈ 6 MB per stream per claim, and the
+    // ranked shape still exposes 128 claims across the two pools.
+    const CLAIM_GROUPS: usize = 256;
+    let group_f128 = 8 * f128_per_block;
+    let n_groups = n_total / 8;
+    let n_claims = n_groups.div_ceil(CLAIM_GROUPS);
+    let z_base = z.as_mut_ptr() as usize;
+    let a_base = a.as_mut_ptr() as usize;
+    let b_base = b.as_mut_ptr() as usize;
+    let stripe_base = z_lincheck.as_mut_ptr() as usize;
+    flock_core::epool::run_hetero_chunks(n_claims, |claim| {
+        let g_end = ((claim + 1) * CLAIM_GROUPS).min(n_groups);
+        for g in claim * CLAIM_GROUPS..g_end {
+        // SAFETY: the queue hands out each group index exactly once; the
+        // per-group ranges below are pairwise disjoint and in bounds, and the
+        // queue's completion join publishes every write before the buffers
+        // are read again.
+        let (z_grp, a_grp, b_grp, stripe) = unsafe {
+            (
+                std::slice::from_raw_parts_mut(
+                    (z_base as *mut F128).add(g * group_f128),
+                    group_f128,
+                ),
+                std::slice::from_raw_parts_mut(
+                    (a_base as *mut F128).add(g * group_f128),
+                    group_f128,
+                ),
+                std::slice::from_raw_parts_mut(
+                    (b_base as *mut F128).add(g * group_f128),
+                    group_f128,
+                ),
+                std::slice::from_raw_parts_mut((stripe_base as *mut u8).add(g * k), k),
+            )
+        };
+        {
             // Ordinary per-block builders OR 1-bits into pre-zeroed words; any
             // slot left unbuilt (no padding block) stays zero, which the
             // lincheck transpose below reads correctly. Full-write builders
@@ -471,7 +511,9 @@ where
                     );
                 }
             }
-        });
+        }
+        }
+    });
 
     (z, a, b, z_lincheck)
 }
