@@ -64,12 +64,32 @@ pub(super) fn butterfly_fused_2layer(
         x86_64::butterfly_fused_2layer(a, b, c, d, t_outer, t_inner_a, t_inner_b);
     }
 
+    #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+    // SAFETY: the cfg gate supplies `aes`; slice equality is asserted above.
+    unsafe {
+        if vector_resident_fused2() {
+            aarch64::butterfly_fused_2layer(a, b, c, d, t_outer, t_inner_a, t_inner_b);
+            return;
+        }
+    }
+
     #[cfg(not(all(
         target_arch = "x86_64",
         target_feature = "avx512f",
         target_feature = "vpclmulqdq"
     )))]
     portable::butterfly_fused_2layer(a, b, c, d, t_outer, t_inner_a, t_inner_b);
+}
+
+/// Same-binary causal control for the vector-resident generic fused pair.
+/// This is intentionally independent of `FLOCK_NO_NTT_NEON_ROWS`, so the
+/// promoted radix-8 AArch64 kernels remain enabled in both A/B arms.
+#[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+#[inline]
+fn vector_resident_fused2() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("FLOCK_NO_NTT_NEON_FUSED2").is_none())
 }
 
 /// AArch64 specialization for a fused pair whose three twiddles all have a
@@ -268,6 +288,103 @@ mod aarch64_row_tests {
             tw[3] = F128::ZERO;
         }
         (buf, tw)
+    }
+
+    /// The vector-resident fused pair must be bit-identical to the portable
+    /// F128-typed chain for arbitrary twiddles and ranked row widths.
+    #[test]
+    fn neon_fused_2layer_matches_portable() {
+        let mut state = 0x4655_5345_4432_5151;
+        for iteration in 0..10_000 {
+            let lanes = [1usize, 2, 8, 64][iteration & 3];
+            let source: [Vec<F128>; 4] =
+                core::array::from_fn(|_| (0..lanes).map(|_| rand_f128(&mut state)).collect());
+            let outer = rand_f128(&mut state);
+            let inner_a = rand_f128(&mut state);
+            let inner_b = rand_f128(&mut state);
+
+            let mut want = source.clone();
+            let [want_a, want_b, want_c, want_d] = &mut want;
+            portable::butterfly_fused_2layer(
+                want_a, want_b, want_c, want_d,
+                outer,
+                inner_a,
+                inner_b,
+            );
+            let mut got = source;
+            let [got_a, got_b, got_c, got_d] = &mut got;
+            // SAFETY: this module is AArch64+aes-only and slices are equal.
+            unsafe {
+                aarch64::butterfly_fused_2layer(
+                    got_a, got_b, got_c, got_d,
+                    outer,
+                    inner_a,
+                    inner_b,
+                );
+            }
+            assert_eq!(got, want, "fused2 mismatch at iteration={iteration}");
+        }
+    }
+
+    /// Same-process proxy covering 4,194,304 lane groups per measurement.
+    #[test]
+    #[ignore]
+    fn neon_fused_2layer_arithmetic_ab() {
+        use std::hint::black_box;
+        use std::time::{Duration, Instant};
+
+        const CALLS: usize = 65_536;
+        const LANES: usize = 64;
+
+        fn measure(neon: bool, seed: u64) -> (Duration, F128) {
+            let mut state = seed;
+            let mut data: [Vec<F128>; 4] = core::array::from_fn(|_| {
+                (0..LANES).map(|_| rand_f128(&mut state)).collect()
+            });
+            let outer = black_box(rand_f128(&mut state));
+            let inner_a = black_box(rand_f128(&mut state));
+            let inner_b = black_box(rand_f128(&mut state));
+            let start = Instant::now();
+            let [data_a, data_b, data_c, data_d] = &mut data;
+            for _ in 0..CALLS {
+                if neon {
+                    unsafe {
+                        aarch64::butterfly_fused_2layer(
+                            black_box(&mut data_a[..]),
+                            black_box(&mut data_b[..]),
+                            black_box(&mut data_c[..]),
+                            black_box(&mut data_d[..]),
+                            outer,
+                            inner_a,
+                            inner_b,
+                        );
+                    }
+                } else {
+                    portable::butterfly_fused_2layer(
+                        black_box(&mut data_a[..]),
+                        black_box(&mut data_b[..]),
+                        black_box(&mut data_c[..]),
+                        black_box(&mut data_d[..]),
+                        outer,
+                        inner_a,
+                        inner_b,
+                    );
+                }
+            }
+            (start.elapsed(), black_box(data[0][0]))
+        }
+
+        for (round, order) in [[false, true], [true, false], [false, true], [true, false]]
+            .into_iter()
+            .enumerate()
+        {
+            let (first_t, first_sum) = measure(order[0], 0xF253_1000 + round as u64);
+            let (second_t, second_sum) = measure(order[1], 0xF253_2000 + round as u64);
+            println!(
+                "round={round} first_neon={} first={first_t:?} second_neon={} second={second_t:?} checks={first_sum:?}/{second_sum:?}",
+                order[0], order[1]
+            );
+        }
     }
 
     /// The vector-resident radix-8 row kernel must be **bit-identical** to the

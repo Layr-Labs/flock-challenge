@@ -139,6 +139,55 @@ unsafe fn butterfly_zero_q(
     unsafe { core::arch::aarch64::veorq_u64(v, u) }
 }
 
+/// Vector-resident generic fused-two-layer row kernel.
+///
+/// All four values stay in q registers across both layers. Each field product
+/// reuses [`mul_q`] through [`butterfly_q`], avoiding the repeated F128
+/// repacking and scalar XORs in the portable chain.
+///
+/// # Safety
+/// Requires `aes`; all four slices must have equal length.
+#[allow(clippy::too_many_arguments)]
+#[target_feature(enable = "aes")]
+pub(super) unsafe fn butterfly_fused_2layer(
+    a: &mut [F128],
+    b: &mut [F128],
+    c: &mut [F128],
+    d: &mut [F128],
+    t_outer: F128,
+    t_inner_a: F128,
+    t_inner_b: F128,
+) {
+    use core::arch::aarch64::*;
+
+    debug_assert_eq!(a.len(), b.len());
+    debug_assert_eq!(a.len(), c.len());
+    debug_assert_eq!(a.len(), d.len());
+
+    unsafe {
+        let outer = vld1q_u64((&raw const t_outer).cast::<u64>());
+        let inner_a = vld1q_u64((&raw const t_inner_a).cast::<u64>());
+        let inner_b = vld1q_u64((&raw const t_inner_b).cast::<u64>());
+
+        for lane in 0..a.len() {
+            let va = vld1q_u64(a.as_ptr().add(lane).cast::<u64>());
+            let vb = vld1q_u64(b.as_ptr().add(lane).cast::<u64>());
+            let vc = vld1q_u64(c.as_ptr().add(lane).cast::<u64>());
+            let vd = vld1q_u64(d.as_ptr().add(lane).cast::<u64>());
+
+            let (va, vc) = butterfly_q(va, vc, outer);
+            let (vb, vd) = butterfly_q(vb, vd, outer);
+            let (va, vb) = butterfly_q(va, vb, inner_a);
+            let (vc, vd) = butterfly_q(vc, vd, inner_b);
+
+            vst1q_u64(a.as_mut_ptr().add(lane).cast::<u64>(), va);
+            vst1q_u64(b.as_mut_ptr().add(lane).cast::<u64>(), vb);
+            vst1q_u64(c.as_mut_ptr().add(lane).cast::<u64>(), vc);
+            vst1q_u64(d.as_mut_ptr().add(lane).cast::<u64>(), vd);
+        }
+    }
+}
+
 /// Vector-resident twin of `portable::butterfly_fused_3layer_row`.
 ///
 /// # Safety
