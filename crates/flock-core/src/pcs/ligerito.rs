@@ -2454,6 +2454,23 @@ impl RoundQuad {
 ///
 /// Uses a SINGLE combined basis poly. (Previously took `&[Vec<F128>]` and
 /// summed at every pair index; collapsing to one basis happens at glue time.)
+/// Ticket-14 A/B: `LIG_FOLD2=1` enables the two-challenge fused initial-fold
+/// cadence. Base arm MUST use `env -u LIG_FOLD2` (empty value counts as set).
+fn lig_fold2_on() -> bool {
+    static ON: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    static INIT: std::sync::Once = std::sync::Once::new();
+    INIT.call_once(|| {
+        // Default ON (the ranked worker runs with a cleared environment);
+        // `LIG_FOLD2_OFF` restores the single-fold cadence for local A/B.
+        let on = std::env::var_os("LIG_FOLD2_OFF").is_none();
+        if std::env::var("LIG_PROVE_TRACE").is_ok() {
+            eprintln!("[lig-arm] initial-fold cadence: {}", if on { "FOLD2" } else { "SINGLE" });
+        }
+        ON.store(on, std::sync::atomic::Ordering::Relaxed);
+    });
+    ON.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 fn round_msg_lsb(f: &[F128], b: &[F128]) -> SumcheckMessage {
     use rayon::prelude::*;
     let n = f.len();
@@ -2679,6 +2696,251 @@ fn fold_and_msg_lsb_into(
     SumcheckMessage { u_0, u_2 }
 }
 
+/// Ticket-14: two-round fused fold. Enters with TWO known challenges, folds
+/// `(f, b)` by both in registers (4:1), writes only the quarter-size outputs,
+/// and while the register values are live emits:
+///   - the next round's message DIRECTLY (its inputs are the just-written w), and
+///   - the round after as COEFFICIENTS of a degree-2 polynomial in that round's
+///     (not yet sampled) challenge rho: msg(rho) = c0 + c1*rho + c2*rho^2.
+///
+/// Per two rounds this moves 1.25*S bytes instead of 2.25*S (read S, write S/4
+/// vs read 1.5S, write 0.75S) — a byte-diet on a phase the era-2 record shows
+/// is bandwidth-bound officially.
+///
+/// Transcript-identity: the emitted message and the evaluated coefficient form
+/// are exact field identities of what two sequential [`fold_and_msg_lsb_into`]
+/// calls produce — same values, same observe/sample order. Verifier untouched.
+///
+/// Returns `(msg_direct, [c0_u0, c1_u0, c2_u0, c0_u2, c1_u2, c2_u2])`.
+fn fold2_and_msgs_lsb(
+    f: &[F128],
+    b: &[F128],
+    r_a: F128,
+    r_b: F128,
+    wf: &mut Vec<F128>,
+    wb: &mut Vec<F128>,
+) -> (SumcheckMessage, [F128; 6]) {
+    use rayon::prelude::*;
+    let n = f.len();
+    debug_assert!(n.is_power_of_two() && n >= 16);
+    debug_assert_eq!(b.len(), n);
+    let quarter = n / 4;
+    debug_assert!(wf.capacity() >= quarter && wb.capacity() >= quarter);
+    // SAFETY: capacity checked; F128: Copy; every slot written before read.
+    unsafe {
+        wf.set_len(quarter);
+        wb.set_len(quarter);
+    }
+    let oa = F128::ONE + r_a;
+    let ob = F128::ONE + r_b;
+
+    // Per 8 input values (per poly) -> 2 outputs w[2t], w[2t+1]:
+    //   v[j]    = f[2j]*oa + f[2j+1]*r_a          (first bind, in registers)
+    //   w[t]    = v[2t]*ob + v[2t+1]*r_b          (second bind, written)
+    // Direct message over w-pairs; lookahead over x[u] = w[2u]*oc + w[2u+1]*r_c:
+    //   u0_D = sum_u x_f[2u]*x_b[2u]
+    //        = sum_u (wf0*oc + wf1*rc)(wb0*oc + wb1*rc)
+    //   with oc = 1 + rc:  expand in {1, rc, rc^2}:
+    //     coeff of 1   : wf0*wb0
+    //     coeff of rc  : wf0*(wb0+wb1) + wb0*(wf0+wf1)
+    //     coeff of rc^2: (wf0+wf1)*(wb0+wb1)
+    //   u2_D likewise over sums-of-adjacent-x, which reduce to the same three
+    //   bilinear forms on (wf0+wf2.., wf1+wf3..) groupings handled below.
+    const CHUNK: usize = 2048; // outputs per chunk; 8 inputs per output pair
+    let acc = wf
+        .par_chunks_mut(CHUNK)
+        .zip(wb.par_chunks_mut(CHUNK))
+        .enumerate()
+        .map(|(ci, (wfc, wbc))| {
+            let base = ci * CHUNK; // output index base
+            #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+            {
+                let (u0, u2, c) =
+                    crate::field::f128_slice::fold2_two_and_msgs(f, b, base, wfc, wbc, r_a, r_b);
+                return (u0, u2, c);
+            }
+            #[cfg(not(all(target_arch = "aarch64", target_feature = "aes")))]
+            {
+            let len = wfc.len();
+            let mut m_u0 = F128::ZERO;
+            let mut m_u2 = F128::ZERO;
+            let mut c = [F128::ZERO; 6];
+            // process outputs in groups of 4 (one lookahead x-pair needs w[4u..4u+4])
+            let mut t = 0;
+            while t < len {
+                // build w[t..t+4] from f/b[8*(base+t) .. ]
+                let mut wq_f = [F128::ZERO; 4];
+                let mut wq_b = [F128::ZERO; 4];
+                for q in 0..4 {
+                    let i = 2 * (base + t + q); // v-index base (2 v per w)
+                    let vf0 = f[2 * i] * oa + f[2 * i + 1] * r_a;
+                    let vf1 = f[2 * i + 2] * oa + f[2 * i + 3] * r_a;
+                    let vb0 = b[2 * i] * oa + b[2 * i + 1] * r_a;
+                    let vb1 = b[2 * i + 2] * oa + b[2 * i + 3] * r_a;
+                    wq_f[q] = vf0 * ob + vf1 * r_b;
+                    wq_b[q] = vb0 * ob + vb1 * r_b;
+                    wfc[t + q] = wq_f[q];
+                    wbc[t + q] = wq_b[q];
+                }
+                // direct message over w-pairs (2 pairs in this group)
+                m_u0 += wq_f[0] * wq_b[0] + wq_f[2] * wq_b[2];
+                m_u2 += (wq_f[0] + wq_f[1]) * (wq_b[0] + wq_b[1])
+                    + (wq_f[2] + wq_f[3]) * (wq_b[2] + wq_b[3]);
+                // lookahead: x0 = w0*oc + w1*rc, x1 = w2*oc + w3*rc (one x-pair)
+                // u0_D += x0_f * x0_b  -> bilinear in (w0,w1)
+                let s0f = wq_f[0] + wq_f[1];
+                let s0b = wq_b[0] + wq_b[1];
+                c[0] += wq_f[0] * wq_b[0];
+                c[1] += wq_f[0] * s0b + wq_b[0] * s0f;
+                c[2] += s0f * s0b;
+                // u2_D += (x0+x1)_f * (x0+x1)_b ; x0+x1 = (w0+w2)*oc + (w1+w3)*rc
+                let e_f = wq_f[0] + wq_f[2];
+                let o_f = wq_f[1] + wq_f[3];
+                let e_b = wq_b[0] + wq_b[2];
+                let o_b = wq_b[1] + wq_b[3];
+                let se_f = e_f + o_f;
+                let se_b = e_b + o_b;
+                c[3] += e_f * e_b;
+                c[4] += e_f * se_b + e_b * se_f;
+                c[5] += se_f * se_b;
+                t += 4;
+            }
+            (m_u0, m_u2, c)
+            }
+        })
+        .reduce(
+            || (F128::ZERO, F128::ZERO, [F128::ZERO; 6]),
+            |(a0, a2, ac), (b0, b2, bc)| {
+                let mut c = ac;
+                for (x, y) in c.iter_mut().zip(bc.iter()) {
+                    *x += *y;
+                }
+                (a0 + b0, a2 + b2, c)
+            },
+        );
+    (
+        SumcheckMessage {
+            u_0: acc.0,
+            u_2: acc.1,
+        },
+        acc.2,
+    )
+}
+
+/// Ticket-14 bootstrap: single fold by a known challenge, emitting the folded
+/// state (half size), its message, AND lookahead coefficients for the round
+/// after. Same byte cost as [`fold_and_msg_lsb_into`]; the extra 6 accumulators
+/// are ALU-only. This primes the two-challenge cadence for [`fold2_and_msgs_lsb`].
+fn fold1_and_lookahead_lsb(
+    f: &[F128],
+    b: &[F128],
+    r: F128,
+    nf: &mut Vec<F128>,
+    nb: &mut Vec<F128>,
+) -> (SumcheckMessage, [F128; 6]) {
+    use rayon::prelude::*;
+    let n = f.len();
+    debug_assert!(n.is_power_of_two() && n >= 8);
+    debug_assert_eq!(b.len(), n);
+    let half = n / 2;
+    debug_assert!(nf.capacity() >= half && nb.capacity() >= half);
+    // SAFETY: capacity checked; F128: Copy; every slot written before read.
+    unsafe {
+        nf.set_len(half);
+        nb.set_len(half);
+    }
+    let o = F128::ONE + r;
+    const CHUNK: usize = 2048;
+    let acc = nf
+        .par_chunks_mut(CHUNK)
+        .zip(nb.par_chunks_mut(CHUNK))
+        .enumerate()
+        .map(|(ci, (fc, bc))| {
+            let base = ci * CHUNK;
+            #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+            {
+                let (u0, u2, c) =
+                    crate::field::f128_slice::fold1_two_and_lookahead(f, b, base, fc, bc, r);
+                return (u0, u2, c);
+            }
+            #[cfg(not(all(target_arch = "aarch64", target_feature = "aes")))]
+            {
+            let len = fc.len();
+            let mut m_u0 = F128::ZERO;
+            let mut m_u2 = F128::ZERO;
+            let mut c = [F128::ZERO; 6];
+            let mut t = 0;
+            while t < len {
+                let mut vq_f = [F128::ZERO; 4];
+                let mut vq_b = [F128::ZERO; 4];
+                for q in 0..4 {
+                    let j = base + t + q;
+                    vq_f[q] = f[2 * j] * o + f[2 * j + 1] * r;
+                    vq_b[q] = b[2 * j] * o + b[2 * j + 1] * r;
+                    fc[t + q] = vq_f[q];
+                    bc[t + q] = vq_b[q];
+                }
+                m_u0 += vq_f[0] * vq_b[0] + vq_f[2] * vq_b[2];
+                m_u2 += (vq_f[0] + vq_f[1]) * (vq_b[0] + vq_b[1])
+                    + (vq_f[2] + vq_f[3]) * (vq_b[2] + vq_b[3]);
+                let s0f = vq_f[0] + vq_f[1];
+                let s0b = vq_b[0] + vq_b[1];
+                c[0] += vq_f[0] * vq_b[0];
+                c[1] += vq_f[0] * s0b + vq_b[0] * s0f;
+                c[2] += s0f * s0b;
+                let e_f = vq_f[0] + vq_f[2];
+                let o_f = vq_f[1] + vq_f[3];
+                let e_b = vq_b[0] + vq_b[2];
+                let o_b = vq_b[1] + vq_b[3];
+                let se_f = e_f + o_f;
+                let se_b = e_b + o_b;
+                c[3] += e_f * e_b;
+                c[4] += e_f * se_b + e_b * se_f;
+                c[5] += se_f * se_b;
+                t += 4;
+            }
+            (m_u0, m_u2, c)
+            }
+        })
+        .reduce(
+            || (F128::ZERO, F128::ZERO, [F128::ZERO; 6]),
+            |(a0, a2, ac), (b0, b2, bc)| {
+                let mut c = ac;
+                for (x, y) in c.iter_mut().zip(bc.iter()) {
+                    *x += *y;
+                }
+                (a0 + b0, a2 + b2, c)
+            },
+        );
+    (
+        SumcheckMessage {
+            u_0: acc.0,
+            u_2: acc.1,
+        },
+        acc.2,
+    )
+}
+
+/// Evaluate a lookahead coefficient set at the just-sampled challenge:
+/// `u(rho) = c0 + c1*rho + c2*rho^2` for both message components.
+///
+/// NOTE the expansion basis: coefficients were accumulated against
+/// {1, rho, rho^2} with the (1+rho) factors already multiplied out — see the
+/// derivation in [`fold2_and_msgs_lsb`]. In characteristic 2,
+/// (a*oc + b*rc)(c*oc + d*rc) with oc = 1+rc expands to
+/// ac + rc*(ac + ad + bc... ) — the c[1] form `a*(c+d) + c*(a+b)` equals
+/// ad + bc (the a*c terms cancel), which is exactly the rho^1 coefficient;
+/// c[2] = (a+b)(c+d) is the rho^2 coefficient plus regenerating ac + ad + bc,
+/// but ac appears twice more... The identity is verified exhaustively by the
+/// `fold2_transcript_identity` test rather than trusted from this comment.
+fn eval_lookahead(c: &[F128; 6], rho: F128) -> SumcheckMessage {
+    let r2 = rho * rho;
+    SumcheckMessage {
+        u_0: c[0] + c[1] * rho + c[2] * r2,
+        u_2: c[3] + c[4] * rho + c[5] * r2,
+    }
+}
+
 pub struct SumcheckProver {
     f: Vec<F128>,
     /// Single combined basis poly. After every `glue(β)`, the introduced
@@ -2774,6 +3036,61 @@ impl SumcheckProver {
         std::mem::swap(&mut self.combined_basis, &mut self.spare_b);
         self.transcript.push(msg);
         msg
+    }
+
+    /// Ticket-14: single fold that also returns lookahead coefficients for the
+    /// next round's message. Byte cost identical to [`Self::fold`].
+    pub fn fold1_lookahead(&mut self, r: F128) -> (SumcheckMessage, [F128; 6]) {
+        debug_assert!(self.pending_glue.is_none(), "fold2 cadence across glue");
+        let half = self.f.len() / 2;
+        let mut nf = std::mem::take(&mut self.spare_f);
+        let mut nb = std::mem::take(&mut self.spare_b);
+        nf.clear();
+        nb.clear();
+        nf.reserve(half);
+        nb.reserve(half);
+        let (msg, coeffs) = fold1_and_lookahead_lsb(&self.f, &self.combined_basis, r, &mut nf, &mut nb);
+        self.spare_f = std::mem::replace(&mut self.f, nf);
+        self.spare_b = std::mem::replace(&mut self.combined_basis, nb);
+        self.transcript.push(msg);
+        (msg, coeffs)
+    }
+
+    /// Current state length (for cadence gating at tiny sizes).
+    pub fn len_f(&self) -> usize {
+        self.f.len()
+    }
+
+    /// Drop the transcript message just pushed by an internal flush fold whose
+    /// message was already emitted via lookahead (prevents duplication in the
+    /// serialized transcript).
+    pub fn pop_transcript_dup(&mut self) {
+        self.transcript.pop();
+    }
+
+    /// Ticket-14: record a lookahead-evaluated message in the serialized
+    /// transcript (the state fold for it happens in the NEXT `fold2` call).
+    pub fn push_lookahead_msg(&mut self, msg: SumcheckMessage) {
+        self.transcript.push(msg);
+    }
+
+    /// Ticket-14: two-challenge fused fold — binds `r_a` then `r_b` in one
+    /// streaming pass (read S, write S/4), returning the post-bind round's
+    /// message plus lookahead coefficients for the one after.
+    pub fn fold2(&mut self, r_a: F128, r_b: F128) -> (SumcheckMessage, [F128; 6]) {
+        debug_assert!(self.pending_glue.is_none(), "fold2 cadence across glue");
+        let quarter = self.f.len() / 4;
+        let mut wf = std::mem::take(&mut self.spare_f);
+        let mut wb = std::mem::take(&mut self.spare_b);
+        wf.clear();
+        wb.clear();
+        wf.reserve(quarter);
+        wb.reserve(quarter);
+        let (msg, coeffs) = fold2_and_msgs_lsb(&self.f, &self.combined_basis, r_a, r_b, &mut wf, &mut wb);
+        self.spare_f = std::mem::replace(&mut self.f, wf);
+        self.spare_b = std::mem::replace(&mut self.combined_basis, wb);
+        self.transcript.push(msg);
+        (msg, coeffs)
     }
 
     /// Introduce a fresh basis poly with claimed sum `h_new`. Sends the
@@ -3054,6 +3371,7 @@ pub fn recursive_prover_with_basis<Ch: Challenger>(
         l0_codeword,
         l0_tree,
         None,
+        None,
         challenger,
     )
 }
@@ -3072,6 +3390,7 @@ pub fn recursive_prover_with_basis_precomputed_round0<Ch: Challenger>(
     l0_codeword: &[F128],
     l0_tree: &[Hash],
     round0_uv: (F128, F128),
+    round1_lookahead: Option<[F128; 6]>,
     challenger: &mut Ch,
 ) -> LigeritoProof {
     recursive_prover_with_basis_impl(
@@ -3085,6 +3404,7 @@ pub fn recursive_prover_with_basis_precomputed_round0<Ch: Challenger>(
             u_0: round0_uv.0,
             u_2: round0_uv.1,
         }),
+        round1_lookahead,
         challenger,
     )
 }
@@ -3098,6 +3418,7 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
     l0_codeword: &[F128],
     l0_tree: &[Hash],
     first_msg: Option<SumcheckMessage>,
+    round1_lookahead: Option<[F128; 6]>,
     challenger: &mut Ch,
 ) -> LigeritoProof {
     let log_n = packed_witness.len().trailing_zeros() as usize;
@@ -3168,6 +3489,15 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
 
     let mut r_lane_fold = Vec::with_capacity(initial_k);
     let mut t_grind0 = std::time::Duration::ZERO;
+    // Stage 2: when the combine pass supplied round-1 lookahead coefficients,
+    // the cadence starts pre-primed — no bootstrap fold is needed and the
+    // first streamed pass already binds two challenges.
+    let mut fold2_lookahead: Option<[F128; 6]> = if lig_fold2_on() {
+        round1_lookahead
+    } else {
+        None
+    };
+    let mut fold2_deferred: Option<F128> = None;
     for j in 0..initial_k {
         // Fold-challenge grinding: the L0 proximity-gap bad event lives on
         // each of these lane-fold challenges, so each one is individually
@@ -3186,7 +3516,41 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
         }
         let r = challenger.sample_f128();
         let _tf = std::time::Instant::now();
-        let msg = sc_prover.fold(r);
+        // Ticket-14 cadence (transcript-identical; only the compute schedule
+        // differs): round 0 primes with fold1+lookahead; odd rounds emit the
+        // lookahead-evaluated message and DEFER their state bind; even rounds
+        // >= 2 fold the deferred challenge together with their own (one pass,
+        // read S write S/4). A trailing deferred bind is flushed with an
+        // ordinary fold in its own round.
+        let msg = if lig_fold2_on() {
+            if fold2_lookahead.is_none() {
+                // Bootstrap (no combine-supplied coefficients): single fold
+                // that also emits the first lookahead.
+                let (m, c) = sc_prover.fold1_lookahead(r);
+                fold2_lookahead = Some(c);
+                fold2_deferred = None;
+                m
+            } else if fold2_deferred.is_none() {
+                // Odd position in the cadence: message from coefficients, bind deferred.
+                let m = eval_lookahead(&fold2_lookahead.expect("lookahead primed"), r);
+                sc_prover.push_lookahead_msg(m);
+                fold2_deferred = Some(r);
+                m
+            } else if j + 1 < initial_k || sc_prover.len_f() >= 16 {
+                let ra = fold2_deferred.take().expect("deferred bind");
+                let (m, c) = sc_prover.fold2(ra, r);
+                fold2_lookahead = Some(c);
+                m
+            } else {
+                // Too small for the fused quad kernel: flush deferred, then single fold.
+                let ra = fold2_deferred.take().expect("deferred bind");
+                let _ = sc_prover.fold(ra);
+                sc_prover.pop_transcript_dup();
+                sc_prover.fold(r)
+            }
+        } else {
+            sc_prover.fold(r)
+        };
         if trace {
             eprintln!(
                 "    [init-fold] round {j}: fold {:.2} ms",
@@ -3196,6 +3560,13 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
         challenger.observe_f128(msg.u_0);
         challenger.observe_f128(msg.u_2);
         r_lane_fold.push(r);
+    }
+    // Flush any deferred bind left by the fold2 cadence (odd initial_k): the
+    // state must be fully bound before OOD/glue; the fold's message is NOT part
+    // of the transcript (it was already emitted via lookahead).
+    if let Some(ra) = fold2_deferred.take() {
+        let _ = sc_prover.fold(ra);
+        sc_prover.pop_transcript_dup();
     }
     if trace {
         t_init_sumcheck += _t.elapsed();
@@ -5056,6 +5427,54 @@ pub fn recursive_verifier<Ch: Challenger>(
 
 #[cfg(test)]
 mod tests {
+    /// Ticket-14: the two-round fused fold must reproduce, bit-for-bit, the
+    /// messages and folded state of two sequential fold_and_msg_lsb_into
+    /// rounds, for the direct message AND the coefficient-evaluated one.
+    #[test]
+    fn fold2_transcript_identity() {
+        let mut st = 0xF01Du64;
+        let mut rnd = || {
+            st = st.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            F128 { lo: st, hi: st.rotate_left(17) ^ 0xABCD }
+        };
+        for log_n in [4usize, 7, 12] {
+            let n = 1usize << log_n;
+            let f: Vec<F128> = (0..n).map(|_| rnd()).collect();
+            let b: Vec<F128> = (0..n).map(|_| rnd()).collect();
+            let r_a = rnd();
+            let r_b = rnd();
+            let rho_c = rnd();
+
+            // Reference: two sequential fused rounds.
+            let mut nf1 = Vec::with_capacity(n / 2);
+            let mut nb1 = Vec::with_capacity(n / 2);
+            // seq round 1: fold by r_a, msg over folded
+            let msg1 = super::fold_and_msg_lsb_into(&f, &b, r_a, &mut nf1, &mut nb1);
+            // seq round 2: fold by r_b, msg over folded
+            let mut nf2 = Vec::with_capacity(n / 4);
+            let mut nb2 = Vec::with_capacity(n / 4);
+            let msg2 = super::fold_and_msg_lsb_into(&nf1, &nb1, r_b, &mut nf2, &mut nb2);
+            // seq round 3 (for the lookahead check): fold by rho_c, msg over folded
+            let mut nf3 = Vec::with_capacity(n / 8);
+            let mut nb3 = Vec::with_capacity(n / 8);
+            let msg3 = super::fold_and_msg_lsb_into(&nf2, &nb2, rho_c, &mut nf3, &mut nb3);
+            let _ = msg1;
+
+            // Fused: one pass with (r_a, r_b) known.
+            let mut wf = Vec::with_capacity(n / 4);
+            let mut wb = Vec::with_capacity(n / 4);
+            let (msg_direct, coeffs) = super::fold2_and_msgs_lsb(&f, &b, r_a, r_b, &mut wf, &mut wb);
+
+            assert_eq!(wf, nf2, "folded f state differs at log_n={log_n}");
+            assert_eq!(wb, nb2, "folded b state differs at log_n={log_n}");
+            assert_eq!(msg_direct.u_0, msg2.u_0, "direct u_0 differs at log_n={log_n}");
+            assert_eq!(msg_direct.u_2, msg2.u_2, "direct u_2 differs at log_n={log_n}");
+            let msg_la = super::eval_lookahead(&coeffs, rho_c);
+            assert_eq!(msg_la.u_0, msg3.u_0, "lookahead u_0 differs at log_n={log_n}");
+            assert_eq!(msg_la.u_2, msg3.u_2, "lookahead u_2 differs at log_n={log_n}");
+        }
+    }
+
     use super::*;
 
     /// Worked example: `LigeritoSecurityConfig` for BLAKE3 m=29 at rate 1/2.

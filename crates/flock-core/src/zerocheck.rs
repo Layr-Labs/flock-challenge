@@ -28,7 +28,8 @@ pub mod univariate_skip_optimized;
 
 use multilinear::{
     UniSkipFoldTable, fold_and_compute_round_pair_into, fold_compact_and_compute_round_pair,
-    fold_in_place_pair, interpolate_at_z_combined, interpolate_at_z_on_lambda, round_pair_naive,
+    fold_in_place_pair, fold1_and_round_pair_lookahead_into, fold2_and_round_pair_lookahead_into,
+    interpolate_at_z_combined, interpolate_at_z_on_lambda, round_pair_naive,
     uni_skip_fold_and_round_pair_compact_padded_with_deltas,
 };
 use univariate_skip_optimized::{
@@ -445,19 +446,80 @@ fn prove_packed_padded_inner<C: Challenger>(
         (Vec::new(), Vec::new())
     };
 
+    // Ticket-14 A/B: the two-challenge fused tail cadence is default-ON;
+    // `ZC_FOLD2_OFF` (any value — select the base arm with `env -u`) restores
+    // the sequential per-round path. Transcript-identical either way: same
+    // messages, same observe/sample order, verifier untouched.
+    let zc_fold2 = std::env::var_os("ZC_FOLD2_OFF").is_none();
+    if zc_timing {
+        eprintln!(
+            "[zc-timing] tail cadence: {}",
+            if zc_fold2 { "fold2" } else { "base" }
+        );
+    }
+    // Cadence state: `la_coeffs` holds the next round's message as a degree-2
+    // polynomial in its (not yet applied) challenge; `deferred` holds a
+    // sampled challenge whose state bind is postponed so the next pass folds
+    // two variables 4:1 in one sweep (read S, write S/4 — vs the sequential
+    // fused path's read 1.5S, write 0.75S per two rounds).
+    let mut la_coeffs: Option<[F128; 6]> = None;
+    let mut deferred: Option<F128> = None;
     for i in 1..(n_mlv - 1) {
         let rho_prev = mlv_rhos[i];
-        let log_n_before = a_mlv.len().trailing_zeros() as usize;
+        let len = a_mlv.len();
+        // NOTE: lags one round behind the logical state while a bind is deferred.
+        let log_n = len.trailing_zeros() as usize;
 
-        // r_next for the next round's message: length log_n_before - 1.
-        // r_next[0] = ONE (Convention A factor); r_next[1..] are the eq
-        // weights for the remaining variables = r[k_skip + i + 2..m].
-        let mut r_next = vec![F128::ONE; log_n_before - 1];
-        r_next[1..].copy_from_slice(&r[k_skip + i + 2..]);
-
-        let (m1, mi) = if log_n_before >= 15 {
-            let half = a_mlv.len() / 2;
-            let (m1, mi) = fold_and_compute_round_pair_into(
+        let (m1, mi) = if let Some(c) = la_coeffs.take() {
+            // Emit this round's message from the previous pass's lookahead
+            // coefficients (O(1)); defer the state bind for the fused pass.
+            debug_assert!(deferred.is_none());
+            deferred = Some(rho_prev);
+            let r2 = rho_prev * rho_prev;
+            (
+                c[0] + c[1] * rho_prev + c[2] * r2,
+                c[3] + c[4] * rho_prev + c[5] * r2,
+            )
+        } else if let Some(ra) = deferred.take() {
+            if log_n >= 16 {
+                // Fused two-challenge pass: bind (ra, rho_prev) 4:1, emit the
+                // next message directly and the one after as coefficients.
+                let quarter = len / 4;
+                let mut r_next = vec![F128::ONE; log_n - 2];
+                r_next[1..].copy_from_slice(&r[k_skip + i + 2..]);
+                let (m1, mi, c) = fold2_and_round_pair_lookahead_into(
+                    &a_mlv,
+                    &b_mlv,
+                    &mut a_nxt[..quarter],
+                    &mut b_nxt[..quarter],
+                    ra,
+                    rho_prev,
+                    &r_next,
+                );
+                std::mem::swap(&mut a_mlv, &mut a_nxt);
+                std::mem::swap(&mut b_mlv, &mut b_nxt);
+                a_mlv.truncate(quarter);
+                b_mlv.truncate(quarter);
+                la_coeffs = Some(c);
+                (m1, mi)
+            } else {
+                // Too small for the fused quad kernel: flush the deferred
+                // bind (its message was already emitted via lookahead), then
+                // run this round sequentially. Cadence ends here.
+                fold_in_place_pair(&mut a_mlv, &mut b_mlv, ra);
+                let log_n_before = a_mlv.len().trailing_zeros() as usize;
+                let mut r_next = vec![F128::ONE; log_n_before - 1];
+                r_next[1..].copy_from_slice(&r[k_skip + i + 2..]);
+                fold_in_place_pair(&mut a_mlv, &mut b_mlv, rho_prev);
+                round_pair_naive(&a_mlv, &b_mlv, &r_next)
+            }
+        } else if zc_fold2 && log_n >= 17 {
+            // Bootstrap: single fold that also emits the first lookahead.
+            // Gate at 17 so the fold2 pass that follows sees log_n - 1 >= 16.
+            let half = len / 2;
+            let mut r_next = vec![F128::ONE; log_n - 1];
+            r_next[1..].copy_from_slice(&r[k_skip + i + 2..]);
+            let (m1, mi, c) = fold1_and_round_pair_lookahead_into(
                 &a_mlv,
                 &b_mlv,
                 &mut a_nxt[..half],
@@ -465,24 +527,55 @@ fn prove_packed_padded_inner<C: Challenger>(
                 rho_prev,
                 &r_next,
             );
-            // Swap current <-> scratch, then shrink the new current to the
-            // folded size. The old (larger) buffer becomes scratch; we only
-            // ever write its leading `half` slots next round, so its stale
-            // length is harmless.
             std::mem::swap(&mut a_mlv, &mut a_nxt);
             std::mem::swap(&mut b_mlv, &mut b_nxt);
             a_mlv.truncate(half);
             b_mlv.truncate(half);
+            la_coeffs = Some(c);
             (m1, mi)
         } else {
-            fold_in_place_pair(&mut a_mlv, &mut b_mlv, rho_prev);
-            round_pair_naive(&a_mlv, &b_mlv, &r_next)
+            // Sequential per-round path (base arm, and the small tail).
+            //
+            // r_next for the next round's message: length log_n - 1.
+            // r_next[0] = ONE (Convention A factor); r_next[1..] are the eq
+            // weights for the remaining variables = r[k_skip + i + 2..m].
+            let mut r_next = vec![F128::ONE; log_n - 1];
+            r_next[1..].copy_from_slice(&r[k_skip + i + 2..]);
+
+            if log_n >= 15 {
+                let half = len / 2;
+                let (m1, mi) = fold_and_compute_round_pair_into(
+                    &a_mlv,
+                    &b_mlv,
+                    &mut a_nxt[..half],
+                    &mut b_nxt[..half],
+                    rho_prev,
+                    &r_next,
+                );
+                // Swap current <-> scratch, then shrink the new current to the
+                // folded size. The old (larger) buffer becomes scratch; we only
+                // ever write its leading `half` slots next round, so its stale
+                // length is harmless.
+                std::mem::swap(&mut a_mlv, &mut a_nxt);
+                std::mem::swap(&mut b_mlv, &mut b_nxt);
+                a_mlv.truncate(half);
+                b_mlv.truncate(half);
+                (m1, mi)
+            } else {
+                fold_in_place_pair(&mut a_mlv, &mut b_mlv, rho_prev);
+                round_pair_naive(&a_mlv, &b_mlv, &r_next)
+            }
         };
 
         multilinear_msgs.push((m1, mi));
         challenger.observe_f128(m1);
         challenger.observe_f128(mi);
         mlv_rhos.push(challenger.sample_f128());
+    }
+    // A trailing deferred bind (odd cadence parity) must be flushed before the
+    // final binding; its message was already emitted via lookahead.
+    if let Some(ra) = deferred.take() {
+        fold_in_place_pair(&mut a_mlv, &mut b_mlv, ra);
     }
 
     // ---- 8. Final binding at ρ_{n_mlv} (the last challenge) ----
