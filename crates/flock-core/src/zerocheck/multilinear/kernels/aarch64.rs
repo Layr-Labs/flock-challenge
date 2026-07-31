@@ -244,11 +244,7 @@ pub(crate) unsafe fn fold_round2_compact_chunk_neon_unchecked_8(
     use core::arch::aarch64::*;
 
     #[inline(always)]
-    unsafe fn store_anchor_pair_nt(
-        dst: *mut F128,
-        a: uint64x2_t,
-        b: uint64x2_t,
-    ) {
+    unsafe fn store_anchor_pair_nt(dst: *mut F128, a: uint64x2_t, b: uint64x2_t) {
         unsafe {
             core::arch::asm!(
                 "stnp {a:q}, {b:q}, [{dst}]",

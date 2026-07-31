@@ -625,8 +625,8 @@ pub fn fold_compact_and_compute_round_pair(
                         for j in 0..table.n_chunks {
                             let d = 2 * index * table.n_chunks + j;
                             a += scaled_table[j * 256 + compact.deltas[d] as usize];
-                            b += scaled_table
-                                [j * 256 + compact.deltas[d + table.n_chunks] as usize];
+                            b +=
+                                scaled_table[j * 256 + compact.deltas[d + table.n_chunks] as usize];
                         }
                         a_out[out + lane] = a;
                         b_out[out + lane] = b;
@@ -706,8 +706,6 @@ pub fn uni_skip_fold_and_round_pair_optimized_packed_padded(
     mlv_challenges: &[F128],
     padding: &PaddingSpec,
 ) -> (Vec<F128>, Vec<F128>, F128, F128) {
-    use rayon::prelude::*;
-
     assert_eq!(
         k_skip, 6,
         "optimized fold-and-round_pair variant is k_skip=6 only"
@@ -737,12 +735,25 @@ pub fn uni_skip_fold_and_round_pair_optimized_packed_padded(
     let (pair_in_block_mask, useful_pairs_inclusive) = round2_pair_skip(padding, k_skip);
 
     // Parallel: each worker writes one disjoint chunk of a_folded/b_folded
-    // and returns its (sum1, sum_inf) contribution. Reduce by F128 XOR.
-    let (sum1, sum_inf) = a_folded
-        .par_chunks_mut(chunk_size)
-        .zip(b_folded.par_chunks_mut(chunk_size))
-        .enumerate()
-        .map(|(x_hi, (a_chunk, b_chunk))| {
+    // and its (sum1, sum_inf) contribution into `partials[x_hi]`. Chunks are
+    // drained through the hetero queue so the idle efficiency cores add
+    // throughput without the equal-band barrier penalty (see `epool`).
+    let mut partials: Vec<(F128, F128)> = vec![(F128::ZERO, F128::ZERO); hi_size];
+    let a_base = crate::epool::SyncPtr(a_folded.as_mut_ptr());
+    let b_base = crate::epool::SyncPtr(b_folded.as_mut_ptr());
+    let partials_base = crate::epool::SyncPtr(partials.as_mut_ptr());
+    crate::epool::run_hetero_chunks(hi_size, |x_hi| {
+        // SAFETY: the queue hands out each x_hi exactly once; chunk x_hi
+        // exclusively owns a_folded/b_folded[x_hi*chunk_size ..][..chunk_size]
+        // and partials[x_hi]. The queue's completion join publishes the
+        // writes before the reduction below reads them.
+        let (a_chunk, b_chunk) = unsafe {
+            (
+                std::slice::from_raw_parts_mut(a_base.ptr().add(x_hi * chunk_size), chunk_size),
+                std::slice::from_raw_parts_mut(b_base.ptr().add(x_hi * chunk_size), chunk_size),
+            )
+        };
+        {
             let mut p1_acc = F256Unreduced::ZERO;
             let mut pinf_acc = F256Unreduced::ZERO;
             let pair_idx_base = x_hi * lo_size;
@@ -917,12 +928,17 @@ pub fn uni_skip_fold_and_round_pair_optimized_packed_padded(
             let p1 = p1_acc.reduce();
             let pinf = pinf_acc.reduce();
             let eq_h = eq_hi[x_hi];
-            (eq_h * p1, eq_h * pinf)
-        })
-        .reduce(
-            || (F128::ZERO, F128::ZERO),
-            |(s1, sinf), (c1, cinf)| (s1 + c1, sinf + cinf),
-        );
+            // SAFETY: exclusive owner of partials[x_hi] (see above).
+            unsafe {
+                *partials_base.ptr().add(x_hi) = (eq_h * p1, eq_h * pinf);
+            }
+        }
+    });
+    let (sum1, sum_inf) = partials
+        .iter()
+        .fold((F128::ZERO, F128::ZERO), |(s1, sinf), &(c1, cinf)| {
+            (s1 + c1, sinf + cinf)
+        });
 
     (a_folded, b_folded, mlv_challenges[0] * sum1, sum_inf)
 }

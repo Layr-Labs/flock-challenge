@@ -168,10 +168,10 @@ pub(crate) unsafe fn accumulate_convert_with_s_hat_v(
                 // word is exactly `chunk_*[b][lane + k]`, so every extracted
                 // index — and every gather it addresses — is bit-identical to
                 // the byte-load form.
-                let we = (chunk_ab_bytes[b_even].as_ptr().add(lane) as *const u32)
-                    .read_unaligned() as usize;
-                let wo = (chunk_ab_bytes[b_odd].as_ptr().add(lane) as *const u32)
-                    .read_unaligned() as usize;
+                let we = (chunk_ab_bytes[b_even].as_ptr().add(lane) as *const u32).read_unaligned()
+                    as usize;
+                let wo = (chunk_ab_bytes[b_odd].as_ptr().add(lane) as *const u32).read_unaligned()
+                    as usize;
                 let e0 = we & 0xff;
                 let e1 = (we >> 8) & 0xff;
                 let e2 = (we >> 16) & 0xff;
@@ -196,10 +196,10 @@ pub(crate) unsafe fn accumulate_convert_with_s_hat_v(
                 // boundary because a bit at even position 2i moves to odd
                 // position 2i+1 of the SAME byte (bit 7 is masked out by
                 // 0xaa's byte pattern before it could wrap).
-                let ce = (chunk_c_bytes[b_even].as_ptr().add(lane) as *const u32)
-                    .read_unaligned() as usize;
-                let co = (chunk_c_bytes[b_odd].as_ptr().add(lane) as *const u32)
-                    .read_unaligned() as usize;
+                let ce = (chunk_c_bytes[b_even].as_ptr().add(lane) as *const u32).read_unaligned()
+                    as usize;
+                let co = (chunk_c_bytes[b_odd].as_ptr().add(lane) as *const u32).read_unaligned()
+                    as usize;
                 let jw = (ce & 0x5555_5555) | ((co << 1) & 0xaaaa_aaaa);
                 let kw = (ce & 0xaaaa_aaaa) | ((co >> 1) & 0x5555_5555);
                 let j0 = jw & 0xff;
@@ -224,10 +224,10 @@ pub(crate) unsafe fn accumulate_convert_with_s_hat_v(
             if n_b_med & 1 == 1 {
                 let b_med = n_b_med - 1;
                 let table = convert_ptr.add(b_med * 256 * 16);
-                let wa = (chunk_ab_bytes[b_med].as_ptr().add(lane) as *const u32)
-                    .read_unaligned() as usize;
-                let wc = (chunk_c_bytes[b_med].as_ptr().add(lane) as *const u32)
-                    .read_unaligned() as usize;
+                let wa = (chunk_ab_bytes[b_med].as_ptr().add(lane) as *const u32).read_unaligned()
+                    as usize;
+                let wc = (chunk_c_bytes[b_med].as_ptr().add(lane) as *const u32).read_unaligned()
+                    as usize;
                 let a0 = wa & 0xff;
                 let a1 = (wa >> 8) & 0xff;
                 let a2 = (wa >> 16) & 0xff;

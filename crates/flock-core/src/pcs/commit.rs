@@ -226,9 +226,17 @@ pub fn commit_into(
     // directly (replicating z costs the same writes as the zero-fill it
     // replaces) and start the NTT at layer `log_inv_rate`, skipping those
     // layers' full-buffer reads and multiplies.
-    replicate_message_fill(&mut codeword, z_packed);
-
-    finalize_commit(codeword, params)
+    // Ranked shape with the pipelined NTT available: skip the materializing
+    // replicate copy entirely — the NTT's first fused pass reads the message
+    // directly for both replica blocks (they are identical by construction)
+    // and writes every codeword slot. Everywhere else: materialize as before.
+    let virtual_replication = use_ranked_ntt_merkle_leaf_pipeline(params)
+        && rayon::current_num_threads() > 1
+        && crate::epool::epool().is_some();
+    if !virtual_replication {
+        replicate_message_fill(&mut codeword, z_packed);
+    }
+    finalize_commit(codeword, params, virtual_replication.then_some(z_packed))
 }
 
 /// Fill `codeword` with `2^r` replicas of `msg` (`r = log2(codeword.len() /
@@ -297,6 +305,7 @@ fn ranked_ntt_with_pipelined_leaves(
     params: &PcsParams,
     leaves: &mut [Hash],
     helper: &rayon::ThreadPool,
+    first_pass_src: Option<&[F128]>,
 ) {
     use rayon::prelude::*;
     use std::sync::Mutex;
@@ -350,21 +359,40 @@ fn ranked_ntt_with_pipelined_leaves(
             });
         });
 
-        ntt.forward_transform_interleaved_from_layer_and_then(
-            codeword,
-            num_ntts,
-            params.log_inv_rate,
-            |elem_offset, chunk| {
-                let job = RankedLeafJob {
-                    elem_offset,
-                    elem_len: chunk.len(),
-                };
-                match sender.try_send(job) {
-                    Ok(()) => {}
-                    Err(TrySendError::Full(job) | TrySendError::Disconnected(job)) => hash_job(job),
-                }
-            },
-        );
+        let finish = |elem_offset: usize, chunk: &[F128]| {
+            let job = RankedLeafJob {
+                elem_offset,
+                elem_len: chunk.len(),
+            };
+            match sender.try_send(job) {
+                Ok(()) => {}
+                Err(TrySendError::Full(job) | TrySendError::Disconnected(job)) => hash_job(job),
+            }
+        };
+        match first_pass_src {
+            #[cfg(any(
+                all(target_arch = "aarch64", target_feature = "aes"),
+                all(target_arch = "x86_64", target_feature = "pclmulqdq"),
+            ))]
+            Some(msg) => ntt.forward_transform_interleaved_from_layer_replicated_and_then(
+                msg,
+                codeword,
+                num_ntts,
+                params.log_inv_rate,
+                finish,
+            ),
+            #[cfg(not(any(
+                all(target_arch = "aarch64", target_feature = "aes"),
+                all(target_arch = "x86_64", target_feature = "pclmulqdq"),
+            )))]
+            Some(_) => unreachable!("replicated first pass gated to SIMD targets"),
+            None => ntt.forward_transform_interleaved_from_layer_and_then(
+                codeword,
+                num_ntts,
+                params.log_inv_rate,
+                finish,
+            ),
+        }
         drop(sender);
 
         // No more jobs can arrive. Pull any bounded queue tail away from the
@@ -377,7 +405,7 @@ fn ranked_ntt_with_pipelined_leaves(
                 tail.push(job);
             }
         }
-        tail.into_par_iter().for_each(|job| hash_job(job));
+        tail.into_par_iter().for_each(hash_job);
         helper_manager
             .join()
             .expect("ranked NTT-to-Merkle helper manager panicked");
@@ -386,7 +414,11 @@ fn ranked_ntt_with_pipelined_leaves(
 
 /// Shared tail of [`commit`] / [`commit_into`]: interleaved forward additive
 /// NTT (RS-encode every lane) then the initial Merkle tree over codeword rows.
-fn finalize_commit(mut codeword: Vec<F128>, params: &PcsParams) -> (Commitment, ProverData) {
+fn finalize_commit(
+    mut codeword: Vec<F128>,
+    params: &PcsParams,
+    first_pass_src: Option<&[F128]>,
+) -> (Commitment, ProverData) {
     let helper = if use_ranked_ntt_merkle_leaf_pipeline(params) && rayon::current_num_threads() > 1
     {
         crate::epool::epool()
@@ -417,8 +449,14 @@ fn finalize_commit(mut codeword: Vec<F128>, params: &PcsParams) -> (Commitment, 
             params,
             &mut tree[..params.n_leaves()],
             helper,
+            first_pass_src,
         );
     } else {
+        if let Some(msg) = first_pass_src {
+            // Robust fallback: this branch has no replicated first pass, so
+            // materialize the replicas the caller skipped.
+            replicate_message_fill(&mut codeword, msg);
+        }
         ntt.forward_transform_interleaved_from_layer(
             &mut codeword,
             params.num_ntts(),
@@ -519,10 +557,33 @@ pub fn prefault_codeword_during<R>(
         return (None, generate());
     }
     let codeword_len = params.n_positions() * params.num_ntts();
-    // Warm path: a pooled buffer is already resident — there is nothing to
-    // pre-fault, and commit_into writes every slot itself. Skip the thread.
-    if let Some(buf) = crate::scratch::try_take_f128(codeword_len) {
-        return (Some(buf), generate());
+    // Warm path: a pooled buffer exists — but "pooled" does not mean "hot".
+    // While the buffer sits idle across the proof's later phases the pager
+    // may compress or otherwise cool its dirty pages, and the next writer
+    // (the replicate fill) then pays a per-page fault inside the timed
+    // window (measured: ~48 ms first pass vs ~7 ms immediately after, at
+    // the ranked 1 GiB codeword). Re-touch one byte per page on a
+    // background-QoS thread hidden under witness generation, exactly like
+    // the cold path hides its zero-fill. Touching writes stale bytes over
+    // stale bytes — commit_into rewrites every slot, same contract as the
+    // cold path's zeros.
+    if let Some(mut buf) = crate::scratch::try_take_f128(codeword_len) {
+        return std::thread::scope(|s| {
+            let h = s.spawn(move || {
+                set_background_qos();
+                // Full rewrite, not a per-page touch: a byte-per-page probe
+                // measurably failed to restore write speed, so whatever state
+                // the idle pooled pages fall into is only cured by a full
+                // streaming write. Same contract as the cold path's zeros —
+                // commit_into rewrites every slot.
+                unsafe {
+                    std::ptr::write_bytes(buf.as_mut_ptr(), 0u8, buf.len());
+                }
+                buf
+            });
+            let r = generate();
+            (Some(h.join().unwrap()), r)
+        });
     }
     // Cold path: allocate + first-touch on a background-QoS thread, hidden
     // under witness generation. (commit_into rewrites all slots, so the
@@ -691,6 +752,7 @@ mod tests {
             &params,
             &mut got_tree[..params.n_leaves()],
             &helper,
+            None,
         );
         let got_tree = merkle::merkle_tree_from_prehashed_leaves(
             got_tree,

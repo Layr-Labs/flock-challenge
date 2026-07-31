@@ -176,6 +176,71 @@ pub(super) unsafe fn butterfly_fused_3layer_zero_root_row(
     }
 }
 
+/// Source→destination variant of [`butterfly_fused_3layer_row`]: reads the
+/// eight row streams from `src` and writes results to the same offsets in
+/// `dst`. Used by the ranked L0's virtually-replicated first pass, where both
+/// layer-1 blocks read the SAME message buffer (the two RS replicas are
+/// identical by construction) and each writes its own codeword half — the
+/// materializing replicate copy is skipped entirely.
+///
+/// # Safety
+/// The caller guarantees both pointer geometries are valid for every selected
+/// row and lane, that `src` and `dst` do not alias, and that concurrent calls
+/// use disjoint `dst` row groups.
+pub(super) unsafe fn butterfly_fused_3layer_row_src(
+    src: *const F128,
+    dst: *mut F128,
+    eighth: usize,
+    num_ntts: usize,
+    r: usize,
+    twiddles: &[F128; 7],
+) {
+    // SAFETY: caller supplies the pointer geometry and disjointness contract.
+    unsafe {
+        for lane in 0..num_ntts {
+            let mut values = [F128::ZERO; 8];
+            for (i, value) in values.iter_mut().enumerate() {
+                *value = *src.add((i * eighth + r) * num_ntts + lane);
+            }
+            butterfly_fused_3layer(&mut values, twiddles);
+            for (i, value) in values.iter().enumerate() {
+                *dst.add((i * eighth + r) * num_ntts + lane) = *value;
+            }
+        }
+    }
+}
+
+/// Source→destination variant of [`butterfly_fused_3layer_zero_root_row`].
+/// Unlike the in-place version, row stream zero IS written back: `dst` may be
+/// uninitialized, so every slot must receive its value even when it equals
+/// the source.
+///
+/// # Safety
+/// Same contract as [`butterfly_fused_3layer_row_src`], plus the caller
+/// guarantees `twiddles[0]`, `twiddles[1]`, and `twiddles[3]` are zero.
+pub(super) unsafe fn butterfly_fused_3layer_zero_root_row_src(
+    src: *const F128,
+    dst: *mut F128,
+    eighth: usize,
+    num_ntts: usize,
+    r: usize,
+    twiddles: &[F128; 7],
+) {
+    // SAFETY: caller supplies the pointer geometry and disjointness contract.
+    unsafe {
+        for lane in 0..num_ntts {
+            let mut values = [F128::ZERO; 8];
+            for (i, value) in values.iter_mut().enumerate() {
+                *value = *src.add((i * eighth + r) * num_ntts + lane);
+            }
+            butterfly_fused_3layer_zero_root(&mut values, twiddles);
+            for (i, value) in values.iter().enumerate() {
+                *dst.add((i * eighth + r) * num_ntts + lane) = *value;
+            }
+        }
+    }
+}
+
 #[inline]
 pub(super) fn butterfly_fused_4layer(values: &mut [F128; 16], twiddles: &[F128; 15]) {
     #[inline(always)]
