@@ -202,6 +202,51 @@ struct CombinedClaim {
     direct_fold2: Option<Vec<ring_switch::DirectFold2Factors>>,
 }
 
+/// One four-element group of [`round0_and_round1_lookahead`]. Extracted so the
+/// open-combine fill can accumulate from live `basis` values without a second
+/// read pass over the just-written block.
+#[inline(always)]
+fn accumulate_round0_group(
+    a0: F128,
+    a1: F128,
+    a2: F128,
+    a3: F128,
+    b0: F128,
+    b1: F128,
+    b2: F128,
+    b3: F128,
+    u0: &mut F128,
+    u2: &mut F128,
+    c: &mut [F128; 6],
+) {
+    let sa0 = a0 + a1;
+    let sb0 = b0 + b1;
+    let sa1 = a2 + a3;
+    let sb1 = b2 + b3;
+    let p_even0 = a0 * b0;
+    let p_sum0 = sa0 * sb0;
+    *u0 += p_even0 + a2 * b2;
+    *u2 += p_sum0 + sa1 * sb1;
+    c[0] += p_even0;
+    // Karatsuba cross term: a0*sb0 + b0*sa0 equals
+    // a1*b1 + (a0*b0) + (sa0*sb0). The endpoint products are already
+    // live for c0/c2, so this costs one product instead of two.
+    c[1] += a1 * b1 + p_even0 + p_sum0;
+    c[2] += p_sum0;
+    let e_a = a0 + a2;
+    let e_b = b0 + b2;
+    let se_a = sa0 + sa1;
+    let se_b = sb0 + sb1;
+    let p_even = e_a * e_b;
+    let p_sum = se_a * se_b;
+    // Same identity for the even/odd grouped pair. Here the complementary
+    // endpoint is (a1+a3, b1+b3).
+    let p_odd = (se_a + e_a) * (se_b + e_b);
+    c[3] += p_even;
+    c[4] += p_odd + p_even + p_sum;
+    c[5] += p_sum;
+}
+
 /// Compute the ordinary round-zero message and the following message as two
 /// quadratics in the first challenge. The latter lets the ranked prover sample
 /// its second challenge before binding the first, so both binds share one pass.
@@ -213,42 +258,33 @@ fn round0_and_round1_lookahead(witness: &[F128], basis: &[F128]) -> ((F128, F128
     let mut u2 = F128::ZERO;
     let mut c = [F128::ZERO; 6];
     for i in (0..witness.len()).step_by(4) {
-        let a0 = witness[i];
-        let a1 = witness[i + 1];
-        let a2 = witness[i + 2];
-        let a3 = witness[i + 3];
-        let b0 = basis[i];
-        let b1 = basis[i + 1];
-        let b2 = basis[i + 2];
-        let b3 = basis[i + 3];
-        let sa0 = a0 + a1;
-        let sb0 = b0 + b1;
-        let sa1 = a2 + a3;
-        let sb1 = b2 + b3;
-        let p_even0 = a0 * b0;
-        let p_sum0 = sa0 * sb0;
-        u0 += p_even0 + a2 * b2;
-        u2 += p_sum0 + sa1 * sb1;
-        c[0] += p_even0;
-        // Karatsuba cross term: a0*sb0 + b0*sa0 equals
-        // a1*b1 + (a0*b0) + (sa0*sb0). The endpoint products are already
-        // live for c0/c2, so this costs one product instead of two.
-        c[1] += a1 * b1 + p_even0 + p_sum0;
-        c[2] += p_sum0;
-        let e_a = a0 + a2;
-        let e_b = b0 + b2;
-        let se_a = sa0 + sa1;
-        let se_b = sb0 + sb1;
-        let p_even = e_a * e_b;
-        let p_sum = se_a * se_b;
-        // Same identity for the even/odd grouped pair. Here the complementary
-        // endpoint is (a1+a3, b1+b3).
-        let p_odd = (se_a + e_a) * (se_b + e_b);
-        c[3] += p_even;
-        c[4] += p_odd + p_even + p_sum;
-        c[5] += p_sum;
+        accumulate_round0_group(
+            witness[i],
+            witness[i + 1],
+            witness[i + 2],
+            witness[i + 3],
+            basis[i],
+            basis[i + 1],
+            basis[i + 2],
+            basis[i + 3],
+            &mut u0,
+            &mut u2,
+            &mut c,
+        );
     }
     ((u0, u2), c)
+}
+
+/// Whether the open-combine single-claim fill fuses round-0 / lookahead
+/// accumulation into the write of each `b_combined` block.
+///
+/// `FLOCK_NO_OPEN_COMBINE_FUSE_MSG=1` restores fill-then-re-read in the same
+/// binary. Multi-claim fills always keep the separate re-read (final basis
+/// values only exist after every claim has been added).
+fn open_combine_fuse_msg_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("FLOCK_NO_OPEN_COMBINE_FUSE_MSG").is_none())
 }
 fn messages_from_direct_products(
     products: &[ring_switch::DirectFold2Factors],
@@ -633,13 +669,65 @@ fn compute_combined_basis_and_target<Ch: Challenger>(
             }
             (u0, u2)
         };
+        let fuse_msg = open_combine_fuse_msg_enabled() && rs_deferred.len() == 1;
         let fold_lookahead_block = |ctable: &mut Vec<F128>, hi: usize, out_block: &mut [F128]| {
-            fill_block(ctable, hi, out_block);
             let base = hi * b;
             debug_assert!(b.is_multiple_of(4));
-            let ((u0, u2), lookahead) =
-                round0_and_round1_lookahead(&packed_witness[base..base + b], out_block);
-            (u0, u2, lookahead)
+            // Ranked direct-AB open has exactly one ordinary deferred claim
+            // (C). Fuse the round-0 / lookahead products into the write of
+            // that claim so each block is not re-read after the fill. The
+            // multi-claim path and the control gate keep fill-then-re-read.
+            //
+            // Access shape of the write is preserved: one sequential pass
+            // over eq_lo / out_block, identical to fill_block's first-claim
+            // arm. A four-slot bank holds just-written basis values so each
+            // message group accumulates without a heap re-read of out_block.
+            // Deliberately not a re-roll of materializer fuse-msg (`32dc8e6`,
+            // −0.95%): that restructured the fuse-init write loop into groups
+            // of four with temporary fa/ba arrays on a different surface.
+            if fuse_msg {
+                let (eq_lo, eq_hi, table, _) = rs_deferred[0];
+                let e_hi = eq_hi[hi];
+                if composed {
+                    ring_switch::compose_fold_byte_table_into(e_hi, table, ctable);
+                }
+                let mut u0 = F128::ZERO;
+                let mut u2 = F128::ZERO;
+                let mut lookahead = [F128::ZERO; 6];
+                let mut bank = [F128::ZERO; 4];
+                for (slot_idx, (out, &lo)) in out_block.iter_mut().zip(eq_lo.iter()).enumerate() {
+                    let s = if composed {
+                        ring_switch::fold_one_slot(lo, ctable)
+                    } else {
+                        ring_switch::fold_one_slot(lo * e_hi, table)
+                    };
+                    *out = s;
+                    let d = slot_idx & 3;
+                    bank[d] = s;
+                    if d == 3 {
+                        let i = slot_idx - 3;
+                        accumulate_round0_group(
+                            packed_witness[base + i],
+                            packed_witness[base + i + 1],
+                            packed_witness[base + i + 2],
+                            packed_witness[base + i + 3],
+                            bank[0],
+                            bank[1],
+                            bank[2],
+                            bank[3],
+                            &mut u0,
+                            &mut u2,
+                            &mut lookahead,
+                        );
+                    }
+                }
+                (u0, u2, lookahead)
+            } else {
+                fill_block(ctable, hi, out_block);
+                let ((u0, u2), lookahead) =
+                    round0_and_round1_lookahead(&packed_witness[base..base + b], out_block);
+                (u0, u2, lookahead)
+            }
         };
         let init_ctable = || {
             if composed {
