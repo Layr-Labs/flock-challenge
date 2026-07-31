@@ -128,7 +128,7 @@ const EPOOL_MIN_CHUNKS: usize = 16;
 /// depend on which thread or pool runs it. Chunk-claim order is
 /// nondeterministic; callers get deterministic *output* by making `f(i)`
 /// write only to chunk `i`'s disjoint range.
-pub(crate) fn run_hetero_chunks<F>(n_chunks: usize, f: F)
+pub fn run_hetero_chunks<F>(n_chunks: usize, f: F)
 where
     F: Fn(usize) + Sync,
 {
@@ -258,14 +258,14 @@ pub(crate) fn run_chunks_with_helper_stateful<S, I, F>(
 /// queue handing out each index exactly once establishes ownership; individual
 /// call sites establish any required happens-before edge.
 #[derive(Clone, Copy)]
-pub(crate) struct SyncPtr<T>(pub(crate) *mut T);
+pub struct SyncPtr<T>(pub *mut T);
 
 impl<T> SyncPtr<T> {
     /// The wrapped base pointer. A method call uses the whole receiver, so
     /// closures capture the `Sync` wrapper rather than (via edition-2021+
     /// precise capture) the bare non-`Sync` pointer field.
     #[inline]
-    pub(crate) fn ptr(self) -> *mut T {
+    pub fn ptr(self) -> *mut T {
         self.0
     }
 }

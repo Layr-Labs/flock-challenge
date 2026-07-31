@@ -323,8 +323,6 @@ fn drive_witness_packed_and_lincheck_impl<
 where
     F: Fn(&S, &mut [u64], &mut [u64], &mut [u64]) + Sync,
 {
-    use rayon::prelude::*;
-
     let k = 1usize << k_log;
     let f128_per_block = k / 128;
     let u64_per_block = k / 64;
@@ -370,12 +368,33 @@ where
     let mut b = flock_core::scratch::take_f128(total_f128);
     let mut z_lincheck = flock_core::scratch::take_u8((n_total / 8) * k);
 
-    z.par_chunks_mut(8 * f128_per_block)
-        .zip(a.par_chunks_mut(8 * f128_per_block))
-        .zip(b.par_chunks_mut(8 * f128_per_block))
-        .zip(z_lincheck.par_chunks_mut(k))
-        .enumerate()
-        .for_each(|(g, (((z_grp, a_grp), b_grp), stripe))| {
+    // Drain the 8-block groups through the shared P/E-core chunk queue
+    // instead of a main-pool-only rayon split: the trace build is the one
+    // remaining phase where the efficiency cores sit idle, and each group
+    // writes only its own fixed, pairwise-disjoint ranges of z/a/b/stripe
+    // (and codeword replicas), so output is byte-identical regardless of
+    // which pool claims which group.
+    let group_f128 = 8 * f128_per_block;
+    let n_groups = n_total / 8;
+    let z_base = flock_core::epool::SyncPtr(z.as_mut_ptr());
+    let a_base = flock_core::epool::SyncPtr(a.as_mut_ptr());
+    let b_base = flock_core::epool::SyncPtr(b.as_mut_ptr());
+    let stripe_base = flock_core::epool::SyncPtr(z_lincheck.as_mut_ptr());
+    flock_core::epool::run_hetero_chunks(n_groups, |g| {
+        // SAFETY: the queue hands out each `g` exactly once; group `g`
+        // exclusively owns `[g*group_f128, (g+1)*group_f128)` in z/a/b and
+        // `[g*k, (g+1)*k)` in the stripe (all in bounds: n_total is a
+        // multiple of 8). The queue's completion join publishes every write
+        // before the buffers are read.
+        let (z_grp, a_grp, b_grp, stripe) = unsafe {
+            (
+                std::slice::from_raw_parts_mut(z_base.ptr().add(g * group_f128), group_f128),
+                std::slice::from_raw_parts_mut(a_base.ptr().add(g * group_f128), group_f128),
+                std::slice::from_raw_parts_mut(b_base.ptr().add(g * group_f128), group_f128),
+                std::slice::from_raw_parts_mut(stripe_base.ptr().add(g * k), k),
+            )
+        };
+        {
             // Ordinary per-block builders OR 1-bits into pre-zeroed words; any
             // slot left unbuilt (no padding block) stays zero, which the
             // lincheck transpose below reads correctly. Full-write builders
@@ -471,7 +490,8 @@ where
                     );
                 }
             }
-        });
+        }
+    });
 
     (z, a, b, z_lincheck)
 }
