@@ -722,10 +722,19 @@ unsafe fn xor_apply_byte_pair_into_8_regs<
 }
 
 /// Process one K-row: 8 byte positions of `a` and `b` via the inv_NTT table,
-/// F_8 multiply, widen-shift by K, XOR into the four `(acc_lo, acc_hi)` pairs.
+/// then multiply-by-`x^K`-premultiplied raw products XORed into the four
+/// `(acc_lo, acc_hi)` pairs.
+///
+/// The x^K factor is a *constant* multiply, so it is pre-applied to the `db`
+/// registers with one nibble split + two 16-entry `vqtbl1q` lookups (5 ops),
+/// after which the raw degree-≤14 `vmull_p8` products accumulate directly —
+/// no per-product `gf8_reduce_vec16` and no `vshll` widen-shift. Bit-exact:
+/// reduction is XOR-linear and `reduce(a·reduce(b·x^K)) = reduce(a·b·x^K)`,
+/// which is exactly the `reduce(a·b) << K` term the caller's single final
+/// reduce previously folded.
 #[cfg(target_arch = "aarch64")]
 #[inline(always)]
-unsafe fn fused_apply_one_k<const K: i32>(
+unsafe fn fused_apply_one_k<const K: usize>(
     table_base: *const u8,
     half_swapped_table_base: *const u8,
     a_row: *const u8,
@@ -739,7 +748,7 @@ unsafe fn fused_apply_one_k<const K: i32>(
     acc3_lo: &mut core::arch::aarch64::uint16x8_t,
     acc3_hi: &mut core::arch::aarch64::uint16x8_t,
 ) {
-    use crate::field::gf2_8::neon::gf8_mul_vec16;
+    use crate::field::gf2_8::neon::{gf8_mul_raw_acc_vec16, gf8_premul_xk_vec16};
     use core::arch::aarch64::*;
     unsafe {
         let a_word = u64::from_le(core::ptr::read_unaligned(a_row.cast::<u64>()));
@@ -822,21 +831,16 @@ unsafe fn fused_apply_one_k<const K: i32>(
             &mut db3,
         );
 
-        // F_8 multiply lane-wise (4 × 16 lanes = 64 total).
-        let y0 = gf8_mul_vec16(da0, db0);
-        let y1 = gf8_mul_vec16(da1, db1);
-        let y2 = gf8_mul_vec16(da2, db2);
-        let y3 = gf8_mul_vec16(da3, db3);
-
-        // Widen-shift by K, XOR into the 16-bit accumulators.
-        *acc0_lo = veorq_u16(*acc0_lo, vshll_n_u8::<K>(vget_low_u8(y0)));
-        *acc0_hi = veorq_u16(*acc0_hi, vshll_n_u8::<K>(vget_high_u8(y0)));
-        *acc1_lo = veorq_u16(*acc1_lo, vshll_n_u8::<K>(vget_low_u8(y1)));
-        *acc1_hi = veorq_u16(*acc1_hi, vshll_n_u8::<K>(vget_high_u8(y1)));
-        *acc2_lo = veorq_u16(*acc2_lo, vshll_n_u8::<K>(vget_low_u8(y2)));
-        *acc2_hi = veorq_u16(*acc2_hi, vshll_n_u8::<K>(vget_high_u8(y2)));
-        *acc3_lo = veorq_u16(*acc3_lo, vshll_n_u8::<K>(vget_low_u8(y3)));
-        *acc3_hi = veorq_u16(*acc3_hi, vshll_n_u8::<K>(vget_high_u8(y3)));
+        // Premultiply the b side by x^K (identity for K = 0), then XOR the
+        // raw polynomial products straight into the 16-bit accumulators.
+        let db0 = gf8_premul_xk_vec16::<K>(db0);
+        let db1 = gf8_premul_xk_vec16::<K>(db1);
+        let db2 = gf8_premul_xk_vec16::<K>(db2);
+        let db3 = gf8_premul_xk_vec16::<K>(db3);
+        gf8_mul_raw_acc_vec16(da0, db0, acc0_lo, acc0_hi);
+        gf8_mul_raw_acc_vec16(da1, db1, acc1_lo, acc1_hi);
+        gf8_mul_raw_acc_vec16(da2, db2, acc2_lo, acc2_hi);
+        gf8_mul_raw_acc_vec16(da3, db3, acc3_lo, acc3_hi);
     }
 }
 

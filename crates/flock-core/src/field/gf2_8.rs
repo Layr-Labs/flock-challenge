@@ -216,6 +216,73 @@ pub mod neon {
             gf8_reduce_vec16(c0, c1)
         }
     }
+
+    /// Nibble tables for multiplying 16 lanes by the constant `x^K`:
+    /// `PREMUL_XK[K][i] = reduce(i · x^K)` and
+    /// `PREMUL_XK[K][16 + i] = reduce((i << 4) · x^K)` for `i ∈ 0..16`.
+    const PREMUL_XK: [[u8; 32]; 8] = {
+        let mut t = [[0u8; 32]; 8];
+        let mut k = 0;
+        while k < 8 {
+            let mut i = 0;
+            while i < 16 {
+                t[k][i] = super::gf8_reduce((i as u16) << k);
+                t[k][16 + i] = super::gf8_reduce(((i as u16) << 4) << k);
+                i += 1;
+            }
+            k += 1;
+        }
+        t
+    };
+
+    /// Multiply 16 GF(2^8) lanes by the constant `x^K` (reduced), via one
+    /// nibble split and two 16-entry table lookups. `K = 0` is the identity
+    /// (constant-folded away at monomorphization).
+    ///
+    /// # Safety
+    /// Uses `core::arch::aarch64` NEON intrinsics; only call on `aarch64`.
+    #[inline]
+    pub(crate) unsafe fn gf8_premul_xk_vec16<const K: usize>(b: uint8x16_t) -> uint8x16_t {
+        debug_assert!(K < 8);
+        if K == 0 {
+            return b;
+        }
+        unsafe {
+            let lo_nibble = vandq_u8(b, vdupq_n_u8(0x0f));
+            let hi_nibble = vshrq_n_u8::<4>(b);
+            let tbl_lo = vld1q_u8(PREMUL_XK[K].as_ptr());
+            let tbl_hi = vld1q_u8(PREMUL_XK[K].as_ptr().add(16));
+            veorq_u8(vqtbl1q_u8(tbl_lo, lo_nibble), vqtbl1q_u8(tbl_hi, hi_nibble))
+        }
+    }
+
+    /// XOR the 16 raw (unreduced, degree ≤ 14) polynomial products `a·b` into
+    /// the interleaved `(acc_lo, acc_hi)` u16 accumulator pair — the same
+    /// layout [`gf8_reduce_vec16`] consumes. Reduction is XOR-linear, so any
+    /// number of raw products may be accumulated before one final reduce.
+    ///
+    /// # Safety
+    /// Uses `core::arch::aarch64` NEON intrinsics (PMULL); only call on `aarch64`.
+    #[inline]
+    pub(crate) unsafe fn gf8_mul_raw_acc_vec16(
+        a: uint8x16_t,
+        b: uint8x16_t,
+        acc_lo: &mut uint16x8_t,
+        acc_hi: &mut uint16x8_t,
+    ) {
+        unsafe {
+            let lo = vreinterpretq_u16_p16(vmull_p8(
+                transmute::<uint8x8_t, poly8x8_t>(vget_low_u8(a)),
+                transmute::<uint8x8_t, poly8x8_t>(vget_low_u8(b)),
+            ));
+            let hi = vreinterpretq_u16_p16(vmull_p8(
+                transmute::<uint8x8_t, poly8x8_t>(vget_high_u8(a)),
+                transmute::<uint8x8_t, poly8x8_t>(vget_high_u8(b)),
+            ));
+            *acc_lo = veorq_u16(*acc_lo, lo);
+            *acc_hi = veorq_u16(*acc_hi, hi);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -383,6 +450,96 @@ mod tests {
                 "high bytes {base:#04x}..={:#04x}",
                 base + 15
             );
+        }
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn neon_gf8_premul_xk_matches_scalar_exhaustive() {
+        use core::arch::aarch64::*;
+        use core::mem::transmute;
+
+        macro_rules! check_k {
+            ($k:literal) => {
+                for base in (0u16..=255).step_by(16) {
+                    let mut input = [0u8; 16];
+                    let mut expected = [0u8; 16];
+                    for lane in 0..16 {
+                        let b = (base + lane as u16) as u8;
+                        input[lane] = b;
+                        expected[lane] = (F8(b) * F8(gf8_reduce(1u16 << $k))).0;
+                    }
+                    let actual: [u8; 16] = unsafe {
+                        transmute(neon::gf8_premul_xk_vec16::<$k>(vld1q_u8(input.as_ptr())))
+                    };
+                    assert_eq!(actual, expected, "K={} base={base:#04x}", $k);
+                }
+            };
+        }
+        check_k!(0);
+        check_k!(1);
+        check_k!(2);
+        check_k!(3);
+        check_k!(4);
+        check_k!(5);
+        check_k!(6);
+        check_k!(7);
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn neon_gf8_raw_acc_of_premul_matches_shifted_reduced_products() {
+        use core::arch::aarch64::*;
+        use core::mem::transmute;
+
+        // Accumulate a·(b·x^K) raw over all K and reduce once; must equal the
+        // XOR of the individually reduced-and-shifted products (the layout
+        // contract of the fused round-1 kernel).
+        let mut rng = Rng::new(0x9f8e_7d6c_5b4a_3928);
+        for _ in 0..64 {
+            let mut a = [[0u8; 16]; 8];
+            let mut b = [[0u8; 16]; 8];
+            for k in 0..8 {
+                for lane in 0..16 {
+                    a[k][lane] = rng.next_u64() as u8;
+                    b[k][lane] = rng.next_u64() as u8;
+                }
+            }
+
+            let mut expected = [0u16; 16];
+            for k in 0..8 {
+                for lane in 0..16 {
+                    let prod = (F8(a[k][lane]) * F8(b[k][lane])).0 as u16;
+                    expected[lane] ^= prod << k;
+                }
+            }
+            let expected_reduced: [u8; 16] =
+                core::array::from_fn(|lane| gf8_reduce(expected[lane]));
+
+            let actual: [u8; 16] = unsafe {
+                let mut acc_lo = vdupq_n_u16(0);
+                let mut acc_hi = vdupq_n_u16(0);
+                macro_rules! step {
+                    ($k:literal) => {{
+                        let av = vld1q_u8(a[$k].as_ptr());
+                        let bv = neon::gf8_premul_xk_vec16::<$k>(vld1q_u8(b[$k].as_ptr()));
+                        neon::gf8_mul_raw_acc_vec16(av, bv, &mut acc_lo, &mut acc_hi);
+                    }};
+                }
+                step!(0);
+                step!(1);
+                step!(2);
+                step!(3);
+                step!(4);
+                step!(5);
+                step!(6);
+                step!(7);
+                transmute(neon::gf8_reduce_vec16(
+                    vreinterpretq_u8_u16(acc_lo),
+                    vreinterpretq_u8_u16(acc_hi),
+                ))
+            };
+            assert_eq!(actual, expected_reduced);
         }
     }
 
