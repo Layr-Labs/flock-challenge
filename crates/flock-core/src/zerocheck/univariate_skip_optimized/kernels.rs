@@ -177,9 +177,9 @@ pub(super) fn accumulate_convert_with_s_hat_v(
     convert: &[super::F128],
     paired_c: &(Vec<super::F128>, Vec<super::F128>),
     eq_lo_val: super::F128,
-    partial_ab: &mut [super::F128; 64],
-    partial_c_0: &mut [super::F128; 64],
-    partial_c_1: &mut [super::F128; 64],
+    partial_ab: &mut [super::Round1Accumulator; 64],
+    partial_c_0: &mut [super::Round1Accumulator; 64],
+    partial_c_1: &mut [super::Round1Accumulator; 64],
 ) {
     #[cfg(target_arch = "aarch64")]
     // SAFETY: aarch64 statically guarantees NEON and the fixed arrays cover
