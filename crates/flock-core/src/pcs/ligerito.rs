@@ -3136,6 +3136,12 @@ fn materialize_direct_ab_fold2(
     assert!(claims.iter().all(|claim| {
         claim.eq_lo.len() == block_len && claim.eq_hi.len() * block_len == out_len
     }));
+    let ranked_lookahead_neon = super::is_ranked_direct_fold2_lookahead_shape(
+        packed_witness.len(),
+        block_len,
+        claims.len(),
+        has_ordinary,
+    );
 
     let fuse_init = direct_ab_fuse_init_enabled();
     let mut folded_f = crate::scratch::take_f128(out_len);
@@ -3237,7 +3243,11 @@ fn materialize_direct_ab_fold2(
                         }
                     }
                 }
-                super::round0_and_round1_lookahead(f_out, b_out)
+                super::round0_and_round1_lookahead_ranked(
+                    f_out,
+                    b_out,
+                    ranked_lookahead_neon,
+                )
             },
         )
         .reduce(
