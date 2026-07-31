@@ -296,24 +296,23 @@ fn build_eq_parallel(r: &[F128]) -> Vec<F128> {
     const PAR_THRESHOLD: usize = 1 << 12;
     for i in 0..n {
         let r_i = r[i];
+        let one_minus_r = F128::ONE + r_i;
         let half = 1usize << i;
         let (lo, hi_rest) = t.split_at_mut(half);
         let hi = &mut hi_rest[..half];
         if half < PAR_THRESHOLD {
             for (lo_x, hi_x) in lo.iter_mut().zip(hi.iter_mut()) {
                 let old = *lo_x;
-                let old_r = old * r_i;
-                *hi_x = old_r;
-                *lo_x = old + old_r;
+                *hi_x = old * r_i;
+                *lo_x = old * one_minus_r;
             }
         } else {
             lo.par_iter_mut()
                 .zip(hi.par_iter_mut())
                 .for_each(|(lo_x, hi_x)| {
                     let old = *lo_x;
-                    let old_r = old * r_i;
-                    *hi_x = old_r;
-                    *lo_x = old + old_r;
+                    *hi_x = old * r_i;
+                    *lo_x = old * one_minus_r;
                 });
         }
     }
@@ -354,21 +353,6 @@ pub fn build_eq_split(r: &[F128], n_lo: usize) -> (Vec<F128>, Vec<F128>) {
 /// split path requires `len` divisible by 16).
 pub fn split_n_lo(n: usize) -> usize {
     (n / 2).clamp(4, n)
-}
-
-/// Low-split width for the factors carried in [`RsEqInd::DeferredDense`].
-/// Unlike [`split_n_lo`]'s balanced split (both factors cache-tiny, tuned for
-/// `fold_1b_rows_split`'s many passes), the deferred fold in pcs's combine
-/// wants **large** blocks: it composes a per-block 16×256 byte table (see
-/// [`compose_fold_byte_table_into`]) whose ~12k-op build must amortize over
-/// the block, and `eq_lo` is a single streaming read shared by every block.
-/// Capped at 15 (`eq_lo` = 512 KiB, L2-resident; table-build overhead ≈ 0.4
-/// ops/slot; ≥ 2^(n-15) ≥ 2^8 blocks of parallel grain at ranked sizes) and
-/// floored at the balanced width so small inputs keep their existing split.
-pub(crate) fn deferred_split_n_lo(n: usize) -> usize {
-    let balanced = split_n_lo(n);
-    let coarse = n.saturating_sub(8).min(15);
-    coarse.max(balanced)
 }
 
 /// Build the 16-entry subset-sum lookup table over 4 F128 elements.
@@ -1572,37 +1556,18 @@ pub fn fold_b128_elems(suffix_tensor: &[F128], eq_r_dprime: &[F128]) -> Vec<F128
 /// `fold_b128_elems(build_eq_parallel(r), eq_r_dprime)` (field multiply is
 /// exact, so `eq_lo[i_lo] * eq_hi[i_hi]` has the same bits as the
 /// materialized entry).
+/// Total entries in a fold byte-table set (16 byte positions × 256 values).
+pub(crate) const FOLD_TABLE_TOTAL: usize = 16 * 256;
+
 /// Number of bytes in an `F128` (= lookup tables for the fold).
 const FOLD_N_BYTES: usize = 16;
 /// Entries per byte-lookup table.
 const FOLD_TABLE_SIZE: usize = 256;
 
-// The SHA3 extension includes EOR3; retain the two-EOR form for generic
-// AArch64 builds that do not enable it.
-#[cfg(target_feature = "sha3")]
-#[inline(always)]
-fn xor3_f128(a: F128, b: F128, c: F128) -> F128 {
-    unsafe {
-        core::mem::transmute::<core::arch::aarch64::uint64x2_t, F128>(
-            core::arch::aarch64::veor3q_u64(
-                core::mem::transmute::<F128, core::arch::aarch64::uint64x2_t>(a),
-                core::mem::transmute::<F128, core::arch::aarch64::uint64x2_t>(b),
-                core::mem::transmute::<F128, core::arch::aarch64::uint64x2_t>(c),
-            ),
-        )
-    }
-}
-
-#[cfg(not(target_feature = "sha3"))]
-#[inline(always)]
-fn xor3_f128(a: F128, b: F128, c: F128) -> F128 {
-    a + (b + c)
-}
-
 /// Build the 16×256 byte-lookup table the fold indexes: `table[k·256 + v]` =
 /// `Σ_{bit b set in v} eq_r_dprime[k·8 + b]`. For the ring-switch fold,
 /// `eq_r_dprime` already has γ_k baked in, so the table carries γ too.
-fn build_fold_byte_table(eq_r_dprime: &[F128]) -> Vec<F128> {
+pub(crate) fn build_fold_byte_table(eq_r_dprime: &[F128]) -> Vec<F128> {
     assert_eq!(eq_r_dprime.len(), 1 << LOG_PACKING);
     let mut tables = vec![F128::ZERO; FOLD_N_BYTES * FOLD_TABLE_SIZE];
     for byte_idx in 0..FOLD_N_BYTES {
@@ -1618,6 +1583,48 @@ fn build_fold_byte_table(eq_r_dprime: &[F128]) -> Vec<F128> {
         }
     }
     tables
+}
+
+/// Compose a fold byte-table set `base` (a [`build_fold_byte_table`] output
+/// representing the F2-linear map `M`) with multiplication by a fixed field
+/// element `e_hi`: fills `out` (length [`FOLD_TABLE_TOTAL`]) so that for
+/// every `x`,
+/// `fold_one_slot(x, out) == fold_one_slot(x * e_hi, base)` **bit-exactly**.
+///
+/// Why this is exact algebra, not an approximation: GF(2^128) multiplication
+/// is F2-bilinear, so with `e_b` the basis element having only bit `b` set,
+/// `x·e_hi = Σ_{b: bit b of x set} (e_b · e_hi)`; and `fold_one_slot(·, base)`
+/// IS the F2-linear map `M`, hence
+/// `M(x·e_hi) = Σ_b x_b · M(e_b·e_hi)`. The columns `col[b] = M(X^b·e_hi)`
+/// are produced by the exact `mul_by_x` doubling chain (bit `b` of the
+/// GHASH layout is the coefficient of `X^b`) + a fold through `base`; the
+/// 16×256 byte tables are their subset sums (`out[k·256+v] =
+/// Σ_{bit j of v} col[8k+j]`). Every step is an exact F2 operation, so the
+/// composed fold is bit-identical to multiply-then-fold.
+///
+/// Cost: 128 `mul_by_x` + 128 folds through `base` + 4096 F128 XORs — O(1)
+/// per block, amortized by the caller over ≥ 2048 fold evaluations.
+pub(crate) fn compose_block_table(base: &[F128], e_hi: F128, out: &mut [F128]) {
+    debug_assert_eq!(base.len(), FOLD_TABLE_TOTAL);
+    debug_assert_eq!(out.len(), FOLD_TABLE_TOTAL);
+    // col[b] = M(X^b · e_hi) via the shift-and-fold doubling chain.
+    let mut cols = [F128::ZERO; 128];
+    let mut w = e_hi; // X^0 · e_hi
+    for c in cols.iter_mut() {
+        *c = fold_one_slot(w, base);
+        w = crate::field::mul_by_x(w);
+    }
+    // Expand each 8-column group into its 256-entry subset-sum table. Every
+    // slot of `out` is written before any read (`v & (v-1) < v`), so `out`
+    // may be uninitialized on entry.
+    for k in 0..FOLD_N_BYTES {
+        let col8 = &cols[k * 8..k * 8 + 8];
+        let block = &mut out[k * FOLD_TABLE_SIZE..(k + 1) * FOLD_TABLE_SIZE];
+        block[0] = F128::ZERO;
+        for v in 1..FOLD_TABLE_SIZE {
+            block[v] = block[v & (v - 1)] + col8[v.trailing_zeros() as usize];
+        }
+    }
 }
 
 /// One folded output slot: `Σ_{k=0..16} tables[k·256 + byte_k(elem)]`, where
@@ -1661,63 +1668,16 @@ pub(crate) fn fold_one_slot(elem: F128, tables: &[F128]) -> F128 {
     let p5 = h2 + h3;
     let p6 = h4 + h5;
     let p7 = h6 + h7;
-    // Levels 2–3: three-input nodes reduce the 16-load tree from depth 4 to 3.
-    let q0 = xor3_f128(p0, p1, p2);
-    let q1 = xor3_f128(p3, p4, p5);
-    let q2 = p6 + p7;
-    xor3_f128(q0, q1, q2)
-}
-
-/// Total length of a fold byte table (`build_fold_byte_table` output).
-pub(crate) const FOLD_TABLE_LEN: usize = FOLD_N_BYTES * FOLD_TABLE_SIZE;
-
-/// Compose the fold byte table with a fixed field multiplier: fills `out`
-/// (length [`FOLD_TABLE_LEN`]) with a table `C` such that
-///
-/// ```text
-/// fold_one_slot(lo, C) == fold_one_slot(lo * e_hi, base)   for every lo
-/// ```
-///
-/// **Why this is exact.** `L(elem) = fold_one_slot(elem, base)` is F₂-linear
-/// in `elem`'s polynomial-basis bits (it is a bit-masked XOR subset-sum), and
-/// multiplication by the constant `e_hi` is also F₂-linear. So the composed
-/// map `G(lo) = L(lo·e_hi)` is F₂-linear and fully determined by its values on
-/// the 128 monomials: `g_b = L(x^b·e_hi)`. `C` is the byte-table encoding of
-/// `G` built from those generators by subset-sum doubling. Every value is an
-/// XOR combination of exact field products, so the result is bit-identical to
-/// the slot-multiply path — same XOR multiset, order-independent.
-///
-/// Cost: 128 field muls (the `x^b·e_hi` ladder) + 128 `fold_one_slot` + 16·255
-/// adds ≈ a few µs — amortized over one 2^(n_lo)-slot block in pcs's fused
-/// combine, where it deletes one field mul per slot.
-pub(crate) fn compose_fold_byte_table_into(e_hi: F128, base: &[F128], out: &mut [F128]) {
-    debug_assert_eq!(base.len(), FOLD_TABLE_LEN);
-    debug_assert_eq!(out.len(), FOLD_TABLE_LEN);
-    // Generators g_b = L(e_b · e_hi) over the single-bit basis elements e_b
-    // (bit b of the lo:hi u128 = polynomial-basis coordinate b, matching
-    // fold_one_slot's byte decomposition). Direct products — exact field muls.
-    let mut g = [F128::ZERO; 128];
-    for (b, gb) in g.iter_mut().enumerate() {
-        let e_b = if b < 64 {
-            F128::new(1u64 << b, 0)
-        } else {
-            F128::new(0, 1u64 << (b - 64))
-        };
-        *gb = fold_one_slot(e_b * e_hi, base);
-    }
-    // Per byte position: subset-sum doubling over that byte's 8 generators.
-    // Every entry is written exactly once (t[0] = 0, then each doubling round
-    // writes the upper half from the lower).
-    for k in 0..FOLD_N_BYTES {
-        let t = &mut out[k * FOLD_TABLE_SIZE..(k + 1) * FOLD_TABLE_SIZE];
-        t[0] = F128::ZERO;
-        for (bit, &gv) in g[k * 8..k * 8 + 8].iter().enumerate() {
-            let half = 1usize << bit;
-            for v in 0..half {
-                t[v + half] = t[v] + gv;
-            }
-        }
-    }
+    // Level 2.
+    let q0 = p0 + p1;
+    let q1 = p2 + p3;
+    let q2 = p4 + p5;
+    let q3 = p6 + p7;
+    // Level 3.
+    let r0 = q0 + q1;
+    let r1 = q2 + q3;
+    // Level 4.
+    r0 + r1
 }
 
 /// Per-output-index value of a [`RsEqInd::DeferredDense`] fold (the value the
@@ -2388,8 +2348,7 @@ pub fn prove_batched_padded_with_precomputed<Ch: Challenger>(
     challenger: &mut Ch,
 ) -> (Vec<(RingSwitchProof, RingSwitchBatchOutput)>, Vec<F128>) {
     assert!(!x_outers.is_empty());
-    let trace =
-        std::env::var("PCS_TRACE").is_ok() || std::env::var_os("FLOCK_OPEN_TIMING").is_some();
+    let trace = std::env::var("PCS_TRACE").is_ok();
     let n = x_outers.len();
     let l = packed_witness.len();
     for x in x_outers {
@@ -2608,27 +2567,14 @@ pub fn prove_batched_padded_with_precomputed<Ch: Challenger>(
             let rs_eq_ind = match kinds[i] {
                 Kind::Dense(d) => {
                     if use_split {
-                        // Defer the fold: carry split factors + the γ-baked byte
-                        // table so pcs's combine folds each slot on the fly into
-                        // `b_combined` (no 2^(m-7) materialize + readback).
-                        //
-                        // The factors are re-split COARSE (blocks of 2^(n-8),
-                        // see `deferred_split_n_lo`) rather than reusing the
-                        // balanced `dense_splits[d]`: the combine composes a
-                        // per-block byte table (`compose_fold_byte_table_into`)
-                        // whose build must amortize over the block. Bit-exact:
-                        // the deferred value at index j is
-                        // `fold_one_slot(build_eq(suffix)[j], table)` under
-                        // either split — `eq_lo[j&(B-1)]·eq_hi[j>>log2 B]` is
-                        // the same field element (exact tensor factoring, see
-                        // `build_eq_split`), and field elements have a unique
-                        // bit representation.
-                        let suffix = dense_suffixes[d];
-                        let (eq_lo, eq_hi) =
-                            build_eq_split(suffix, deferred_split_n_lo(suffix.len()));
+                        // Defer the fold: carry the split factors + γ-baked byte
+                        // table so pcs's combine folds each slot directly into
+                        // `b_combined` (no 2^(m-7) materialize + readback). The
+                        // table build is the only work done here (16·256 adds).
+                        let (eq_lo, eq_hi) = &dense_splits[d];
                         RsEqInd::DeferredDense {
-                            eq_lo,
-                            eq_hi,
+                            eq_lo: eq_lo.clone(),
+                            eq_hi: eq_hi.clone(),
                             table: build_fold_byte_table(&scaled_eq_r_dprime),
                         }
                     } else {
@@ -2955,56 +2901,6 @@ mod tests {
             F128 {
                 lo: self.next_u64(),
                 hi: self.next_u64(),
-            }
-        }
-    }
-
-    /// The composed byte table reproduces the slot-multiply fold bit-for-bit:
-    /// `fold_one_slot(lo, compose(e_hi, T)) == fold_one_slot(lo·e_hi, T)`.
-    #[test]
-    fn compose_fold_byte_table_matches_slot_multiply() {
-        let mut rng = Rng::new(0xC0117_0B1E);
-        for trial in 0..4 {
-            let eq_r_dprime: Vec<F128> = (0..(1 << LOG_PACKING)).map(|_| rng.f128()).collect();
-            let base = build_fold_byte_table(&eq_r_dprime);
-            let e_hi = rng.f128();
-            let mut composed = vec![F128::ZERO; FOLD_TABLE_LEN];
-            compose_fold_byte_table_into(e_hi, &base, &mut composed);
-            // Random los + structured edge cases.
-            let mut los: Vec<F128> = (0..256).map(|_| rng.f128()).collect();
-            los.push(F128::ZERO);
-            los.push(F128::ONE);
-            los.push(F128::new(u64::MAX, u64::MAX));
-            for &lo in &los {
-                assert_eq!(
-                    fold_one_slot(lo, &composed),
-                    fold_one_slot(lo * e_hi, &base),
-                    "trial={trial} lo={lo:?} e_hi={e_hi:?}"
-                );
-            }
-        }
-    }
-
-    /// The coarse deferred split produces the same logical rs_eq_ind values as
-    /// the balanced split (and as the materialized dense fold): the deferred
-    /// value at every index j is independent of the split point.
-    #[test]
-    fn deferred_split_value_independent_of_split_point() {
-        let mut rng = Rng::new(0x5417_D0D0);
-        let n = 10usize;
-        let suffix: Vec<F128> = (0..n).map(|_| rng.f128()).collect();
-        let eq_r_dprime: Vec<F128> = (0..(1 << LOG_PACKING)).map(|_| rng.f128()).collect();
-        let table = build_fold_byte_table(&eq_r_dprime);
-        let dense = fold_b128_elems(&build_eq(&suffix), &eq_r_dprime);
-        for n_lo in [split_n_lo(n), deferred_split_n_lo(n), 4, n] {
-            let (eq_lo, eq_hi) = build_eq_split(&suffix, n_lo);
-            let log_b = eq_lo.len().trailing_zeros() as usize;
-            for j in 0..(1usize << n) {
-                assert_eq!(
-                    deferred_dense_value(&eq_lo, &eq_hi, &table, log_b, j),
-                    dense[j],
-                    "n_lo={n_lo} j={j}"
-                );
             }
         }
     }

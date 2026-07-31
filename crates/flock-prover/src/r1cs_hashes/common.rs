@@ -45,11 +45,6 @@ impl<const NW: usize> BitRecord<NW> {
         Self { w: [0u64; NW] }
     }
 
-    #[inline(always)]
-    pub(crate) fn words(&self) -> &[u64; NW] {
-        &self.w
-    }
-
     /// OR a (pre-masked) value into record bits `[POS, POS + width)`.
     /// `POS` is const so the straddle branch and shifts fold at compile time.
     #[inline(always)]
@@ -224,105 +219,6 @@ pub(crate) fn drive_witness_packed_and_lincheck<S: Sync, F>(
 where
     F: Fn(&S, &mut [u64], &mut [u64], &mut [u64]) + Sync,
 {
-    drive_witness_packed_and_lincheck_impl::<false, false, S, F>(
-        initial_states,
-        padding,
-        n_blocks_log,
-        k_log,
-        1usize << k_log,
-        None,
-        per_block,
-    )
-}
-
-/// Full-write variant of [`drive_witness_packed_and_lincheck`]. It skips the
-/// group zero pass, so `per_block` MUST overwrite every word of all three
-/// buffers before returning. Padding is mandatory: this ensures the callback
-/// runs for every allocated slot, including the tail of a non-power-of-two
-/// input batch.
-pub(crate) fn drive_witness_packed_and_lincheck_full_write<S: Sync, F>(
-    initial_states: &[S],
-    padding: &S,
-    n_blocks_log: usize,
-    k_log: usize,
-    useful_bits: usize,
-    per_block: F,
-) -> (Vec<F128>, Vec<F128>, Vec<F128>, Vec<u8>)
-where
-    F: Fn(&S, &mut [u64], &mut [u64], &mut [u64]) + Sync,
-{
-    drive_witness_packed_and_lincheck_impl::<true, false, S, F>(
-        initial_states,
-        Some(padding),
-        n_blocks_log,
-        k_log,
-        useful_bits,
-        None,
-        per_block,
-    )
-}
-
-#[derive(Clone, Copy)]
-struct Rate2CodewordPtr(*mut F128);
-// SAFETY: the only use is the indexed group writer below. Each group owns
-// disjoint ranges in both replicas, and the parallel iterator joins before the
-// original mutable codeword borrow becomes usable again.
-unsafe impl Send for Rate2CodewordPtr {}
-unsafe impl Sync for Rate2CodewordPtr {}
-impl Rate2CodewordPtr {
-    /// Avoid closure field-capture turning this back into a bare non-Send ptr.
-    fn get(self) -> *mut F128 {
-        self.0
-    }
-}
-
-/// Full-write row-major witness driver that also emits the exact rate-1/2
-/// pre-NTT codeword `[z, z]`. Each worker copies its completed `z` group into
-/// the two disjoint replica ranges while that group is still cache-resident.
-///
-/// `codeword` must have exactly twice the packed-witness length. As with the
-/// scratch buffers allocated by the driver, its old contents may be stale:
-/// every element is overwritten before this function returns.
-pub(crate) fn drive_witness_packed_and_lincheck_full_write_with_rate2_codeword<S: Sync, F>(
-    initial_states: &[S],
-    padding: &S,
-    n_blocks_log: usize,
-    k_log: usize,
-    useful_bits: usize,
-    codeword: &mut [F128],
-    per_block: F,
-) -> (Vec<F128>, Vec<F128>, Vec<F128>, Vec<u8>)
-where
-    F: Fn(&S, &mut [u64], &mut [u64], &mut [u64]) + Sync,
-{
-    drive_witness_packed_and_lincheck_impl::<true, true, S, F>(
-        initial_states,
-        Some(padding),
-        n_blocks_log,
-        k_log,
-        useful_bits,
-        Some(codeword),
-        per_block,
-    )
-}
-
-fn drive_witness_packed_and_lincheck_impl<
-    const PER_BLOCK_FULLY_WRITES: bool,
-    const EMIT_RATE2_CODEWORD: bool,
-    S: Sync,
-    F,
->(
-    initial_states: &[S],
-    padding: Option<&S>,
-    n_blocks_log: usize,
-    k_log: usize,
-    stripe_useful_bits: usize,
-    rate2_codeword: Option<&mut [F128]>,
-    per_block: F,
-) -> (Vec<F128>, Vec<F128>, Vec<F128>, Vec<u8>)
-where
-    F: Fn(&S, &mut [u64], &mut [u64], &mut [u64]) + Sync,
-{
     use rayon::prelude::*;
 
     let k = 1usize << k_log;
@@ -330,7 +226,6 @@ where
     let u64_per_block = k / 64;
     let n_total = 1usize << n_blocks_log;
     let n_blocks = initial_states.len();
-    assert!(stripe_useful_bits <= k);
     assert!(
         n_blocks <= n_total,
         "{n_blocks} blocks > 2^{n_blocks_log} = {n_total} slots"
@@ -339,36 +234,18 @@ where
         n_total >= 8 && n_total.is_multiple_of(8),
         "lincheck stripe layout requires n_total ≥ 8 and divisible by 8"
     );
-    assert!(
-        !PER_BLOCK_FULLY_WRITES || padding.is_some(),
-        "full-write witness generation requires a padding block"
-    );
 
     let total_f128 = n_total * f128_per_block;
-    assert_eq!(
-        rate2_codeword.is_some(),
-        EMIT_RATE2_CODEWORD,
-        "rate-1/2 codeword presence must match the driver specialization"
-    );
-    let rate2_codeword = rate2_codeword.map(|codeword| {
-        assert_eq!(
-            codeword.len(),
-            2 * total_f128,
-            "rate-1/2 codeword must contain exactly two packed-witness replicas"
-        );
-        Rate2CodewordPtr(codeword.as_mut_ptr())
-    });
-    // z/a/b are allocated uninitialized. Ordinary OR-based builders zero each
-    // 8-block group inside the parallel loop; full-write builders initialize
-    // every word directly and skip that pass. `z_lincheck` comes from the
-    // scratch byte pool (UNINITIALIZED, possibly stale): the transpose below
-    // writes every byte of every group before anything reads it, and the
-    // caller returns it via `scratch::give_u8` after lincheck so the next
-    // prove reuses resident pages instead of re-faulting 2^(m-3) bytes.
+    // z/a/b are allocated uninitialized and zeroed *inside* the parallel loop
+    // (one memset per 8-block group), so the ~192 MB zero-fill scales with the
+    // thread count instead of running serially on the main thread before the
+    // parallel build. The per-block builders OR 1-bits into pre-zeroed words,
+    // so each group must be zeroed before its `per_block` calls. `z_lincheck`
+    // stays `vec![0u8; _]` (lazy `alloc_zeroed`/mmap — no eager memset).
     let mut z = flock_core::scratch::take_f128(total_f128);
     let mut a = flock_core::scratch::take_f128(total_f128);
     let mut b = flock_core::scratch::take_f128(total_f128);
-    let mut z_lincheck = flock_core::scratch::take_u8((n_total / 8) * k);
+    let mut z_lincheck = vec![0u8; (n_total / 8) * k];
 
     z.par_chunks_mut(8 * f128_per_block)
         .zip(a.par_chunks_mut(8 * f128_per_block))
@@ -376,18 +253,16 @@ where
         .zip(z_lincheck.par_chunks_mut(k))
         .enumerate()
         .for_each(|(g, (((z_grp, a_grp), b_grp), stripe))| {
-            // Ordinary per-block builders OR 1-bits into pre-zeroed words; any
-            // slot left unbuilt (no padding block) stays zero, which the
-            // lincheck transpose below reads correctly. Full-write builders
-            // skip this pass and must initialize every word themselves.
+            // Zero this group's z/a/b up front (parallel memset — the buffers
+            // were uninit-allocated). The per-block builder ORs 1-bits into
+            // pre-zeroed words; any slot left unbuilt (no padding block) stays
+            // zero, which the lincheck transpose below reads correctly.
             // SAFETY: F128 is `Copy` (no Drop) and the all-zero bit pattern is
             // the valid `F128::ZERO`, so a byte memset is a correct init.
-            if !PER_BLOCK_FULLY_WRITES {
-                unsafe {
-                    std::ptr::write_bytes(z_grp.as_mut_ptr(), 0, z_grp.len());
-                    std::ptr::write_bytes(a_grp.as_mut_ptr(), 0, a_grp.len());
-                    std::ptr::write_bytes(b_grp.as_mut_ptr(), 0, b_grp.len());
-                }
+            unsafe {
+                std::ptr::write_bytes(z_grp.as_mut_ptr(), 0, z_grp.len());
+                std::ptr::write_bytes(a_grp.as_mut_ptr(), 0, a_grp.len());
+                std::ptr::write_bytes(b_grp.as_mut_ptr(), 0, b_grp.len());
             }
             for k_in in 0..8 {
                 let global_idx = 8 * g + k_in;
@@ -431,8 +306,7 @@ where
             let z_u64_all: &[u64] = unsafe {
                 std::slice::from_raw_parts(z_grp.as_ptr() as *const u64, z_grp.len() * 2)
             };
-            let useful_words = stripe_useful_bits.div_ceil(64);
-            for i in 0..useful_words {
+            for i in 0..u64_per_block {
                 let lanes: [u64; 8] = [
                     z_u64_all[0 * u64_per_block + i],
                     z_u64_all[u64_per_block + i],
@@ -445,35 +319,117 @@ where
                 ];
                 transpose_8_u64s_to_64_bytes(&lanes, &mut stripe[i * 64..i * 64 + 64]);
             }
-            stripe[useful_words * 64..].fill(0);
-
-            if EMIT_RATE2_CODEWORD {
-                let codeword =
-                    rate2_codeword.expect("rate-1/2 driver specialization requires a codeword");
-                let elem_offset = g * z_grp.len();
-                // SAFETY: group `g` owns `z[elem_offset..elem_offset+len]`.
-                // The same group exclusively owns those offsets in each of the
-                // two codeword replicas. Groups are disjoint, cover all of z,
-                // and the parallel iterator joins before `codeword` is used
-                // again. Both source and destinations are in bounds and do not
-                // overlap.
-                unsafe {
-                    let dst = codeword.get();
-                    std::ptr::copy_nonoverlapping(
-                        z_grp.as_ptr(),
-                        dst.add(elem_offset),
-                        z_grp.len(),
-                    );
-                    std::ptr::copy_nonoverlapping(
-                        z_grp.as_ptr(),
-                        dst.add(total_f128 + elem_offset),
-                        z_grp.len(),
-                    );
-                }
-            }
         });
 
     (z, a, b, z_lincheck)
+}
+
+/// Stripe-free row-major witness driver for producers that assign every
+/// destination word. It skips the group-wide zero pass; callers must provide
+/// padding and fully initialize all three block slices.
+pub(crate) fn drive_witness_packed<S: Sync, F>(
+    initial_states: &[S],
+    padding: &S,
+    n_blocks_log: usize,
+    k_log: usize,
+    per_block: F,
+) -> (Vec<F128>, Vec<F128>, Vec<F128>)
+where
+    F: Fn(&S, &mut [u64], &mut [u64], &mut [u64]) + Sync,
+{
+    use rayon::prelude::*;
+
+    let k = 1usize << k_log;
+    let f128_per_block = k / 128;
+    let n_total = 1usize << n_blocks_log;
+    assert!(initial_states.len() <= n_total);
+    assert!(
+        n_total >= 8 && n_total.is_multiple_of(8),
+        "row-major witness driver requires at least 8 block slots"
+    );
+
+    let total_f128 = n_total * f128_per_block;
+    let mut z = flock_core::scratch::take_f128(total_f128);
+    let mut a = flock_core::scratch::take_f128(total_f128);
+    let mut b = flock_core::scratch::take_f128(total_f128);
+
+    // The three destination streams total 3 · 2^m bits (1.5 GiB at the ranked
+    // m = 32) and are next read only in later phases — far beyond any cache —
+    // so regular stores' write-allocate costs one hidden DRAM read per line.
+    // On aarch64, build each block in an L1-resident staging buffer and
+    // publish it with `stnp` (same shape as the batch-major driver's
+    // `flush_rows_nt`). `FLOCK_NO_WITNESS_NT` is a local-diagnostics kill
+    // switch; the ranked worker's cleared environment never sets it.
+    let use_nt = cfg!(target_arch = "aarch64")
+        && u64_per_block_is_nt_compatible(f128_per_block * 2)
+        && std::env::var_os("FLOCK_NO_WITNESS_NT").is_none();
+
+    z.par_chunks_mut(8 * f128_per_block)
+        .zip(a.par_chunks_mut(8 * f128_per_block))
+        .zip(b.par_chunks_mut(8 * f128_per_block))
+        .enumerate()
+        .for_each_init(
+            || {
+                if use_nt {
+                    let u64s = f128_per_block * 2;
+                    (vec![0u64; u64s], vec![0u64; u64s], vec![0u64; u64s])
+                } else {
+                    (Vec::new(), Vec::new(), Vec::new())
+                }
+            },
+            |(z_stage, a_stage, b_stage), (g, ((z_grp, a_grp), b_grp))| {
+                for k_in in 0..8 {
+                    let global_idx = 8 * g + k_in;
+                    let initial = initial_states.get(global_idx).unwrap_or(padding);
+                    let z_chunk = &mut z_grp[k_in * f128_per_block..(k_in + 1) * f128_per_block];
+                    let a_chunk = &mut a_grp[k_in * f128_per_block..(k_in + 1) * f128_per_block];
+                    let b_chunk = &mut b_grp[k_in * f128_per_block..(k_in + 1) * f128_per_block];
+                    if use_nt {
+                        per_block(initial, z_stage, a_stage, b_stage);
+                        let n = z_stage.len();
+                        // SAFETY: staging and destination are disjoint,
+                        // both `n` u64s; n = K/64 is a multiple of 16 (checked
+                        // by the gate above).
+                        unsafe {
+                            nt_copy_u64s(z_stage.as_ptr(), z_chunk.as_mut_ptr() as *mut u64, n);
+                            nt_copy_u64s(a_stage.as_ptr(), a_chunk.as_mut_ptr() as *mut u64, n);
+                            nt_copy_u64s(b_stage.as_ptr(), b_chunk.as_mut_ptr() as *mut u64, n);
+                        }
+                        continue;
+                    }
+                    // SAFETY: F128 is repr(C, align(16)) with two little-endian
+                    // u64 fields, and the producer overwrites every destination.
+                    let z_u64 = unsafe {
+                        std::slice::from_raw_parts_mut(
+                            z_chunk.as_mut_ptr() as *mut u64,
+                            z_chunk.len() * 2,
+                        )
+                    };
+                    let a_u64 = unsafe {
+                        std::slice::from_raw_parts_mut(
+                            a_chunk.as_mut_ptr() as *mut u64,
+                            a_chunk.len() * 2,
+                        )
+                    };
+                    let b_u64 = unsafe {
+                        std::slice::from_raw_parts_mut(
+                            b_chunk.as_mut_ptr() as *mut u64,
+                            b_chunk.len() * 2,
+                        )
+                    };
+                    per_block(initial, z_u64, a_u64, b_u64);
+                }
+            },
+        );
+
+    (z, a, b)
+}
+
+/// The staged NT flush copies whole 128-byte rows, so the per-block u64
+/// count must divide into 16-u64 chunks.
+#[inline]
+pub(crate) fn u64_per_block_is_nt_compatible(u64s: usize) -> bool {
+    u64s.is_multiple_of(16)
 }
 
 /// Sort `v` and remove pairs of duplicates (GF(2) cancellation). Keeps R1CS
@@ -581,6 +537,21 @@ pub(crate) unsafe fn nt_store_row(src: *const u64, dst: *mut u64) {
     #[cfg(not(target_arch = "aarch64"))]
     unsafe {
         std::ptr::copy_nonoverlapping(src, dst, 2 * BM_V);
+    }
+}
+
+/// Non-temporal copy of `n` u64s (`n` divisible by 16) in 128-byte
+/// `ldp q / stnp q` chunks. Fallback: plain copy off-aarch64.
+///
+/// SAFETY: `src` valid for `n` u64 reads, `dst` for `n` u64 writes; ranges
+/// must not overlap.
+#[inline]
+pub(crate) unsafe fn nt_copy_u64s(src: *const u64, dst: *mut u64, n: usize) {
+    debug_assert!(n.is_multiple_of(16));
+    let mut i = 0;
+    while i < n {
+        unsafe { nt_store_row(src.add(i), dst.add(i)) };
+        i += 16;
     }
 }
 

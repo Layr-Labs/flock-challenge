@@ -45,133 +45,83 @@ pub(super) fn butterfly_fused_2layer(
     }
 }
 
-/// Fused three-layer (radix-8) butterfly on one lane's 8 values.
-///
-/// `twiddles` holds 7 values in the same breadth-first order
-/// [`butterfly_fused_4layer`] uses, truncated by one level: `[0]` is layer L
-/// (shared by all 4 pairs), `[1..3]` layer L+1 (one per half), `[3..7]`
-/// layer L+2 (one per quarter).
-#[inline]
-pub(super) fn butterfly_fused_3layer(values: &mut [F128; 8], twiddles: &[F128; 7]) {
-    #[inline(always)]
-    fn butterfly(values: &mut [F128; 8], u: usize, v: usize, twiddle: F128) {
-        let new_u = values[u] + values[v] * twiddle;
-        values[v] += new_u;
-        values[u] = new_u;
-    }
-
-    for i in 0..4 {
-        butterfly(values, i, i + 4, twiddles[0]);
-    }
-    for s in 0..2 {
-        for i in 0..2 {
-            butterfly(values, 4 * s + i, 4 * s + i + 2, twiddles[1 + s]);
-        }
-    }
-    for s in 0..4 {
-        butterfly(values, 2 * s, 2 * s + 1, twiddles[3 + s]);
-    }
-}
-
-/// Fused three-layer butterfly for the root block, whose left-spine
-/// twiddles are identically zero: `twiddles[0] == twiddles[1] ==
-/// twiddles[3] == 0`.
-///
-/// A zero-twiddle forward butterfly maps `(u, v)` to `(u, v + u)`, so the
-/// seven butterflies on that spine need only XORs. The remaining five use
-/// the ordinary field multiply. In particular, `values[0]` is unchanged by
-/// all three layers.
-#[inline]
-pub(super) fn butterfly_fused_3layer_zero_root(values: &mut [F128; 8], twiddles: &[F128; 7]) {
-    #[inline(always)]
-    fn butterfly(values: &mut [F128; 8], u: usize, v: usize, twiddle: F128) {
-        let new_u = values[u] + values[v] * twiddle;
-        values[v] += new_u;
-        values[u] = new_u;
-    }
-
-    // Layer L, t[0] = 0: four XOR-only butterflies.
-    for i in 0..4 {
-        let u = values[i];
-        values[i + 4] += u;
-    }
-
-    // Layer L+1. The top-half twiddle t[1] is zero; t[2] is general.
-    for i in 0..2 {
-        let u = values[i];
-        values[i + 2] += u;
-    }
-    butterfly(values, 4, 6, twiddles[2]);
-    butterfly(values, 5, 7, twiddles[2]);
-
-    // Layer L+2. The first quarter's twiddle t[3] is zero.
-    let u = values[0];
-    values[1] += u;
-    butterfly(values, 2, 3, twiddles[4]);
-    butterfly(values, 4, 5, twiddles[5]);
-    butterfly(values, 6, 7, twiddles[6]);
-}
-
-/// Process one fused-three-layer row group across every interleaved lane.
-///
-/// Eight row streams at stride `eighth * num_ntts` elements. Every such
-/// stride is a multiple of the L1 set-repeat period at these shapes, so all
-/// eight streams map onto the same set — exactly 8 ways on an 8-way L1D, the
-/// widest fusion that still fits. Radix-16 would demand 16 ways and thrash.
-///
 /// # Safety
-/// The caller guarantees that every selected row and lane is valid and that
-/// concurrent calls use disjoint row groups.
-pub(super) unsafe fn butterfly_fused_3layer_row(
-    ptr: *mut F128,
-    eighth: usize,
+/// The caller guarantees that every selected source and destination row is
+/// valid, source and destination do not overlap, and concurrent calls write
+/// disjoint destination row groups.
+#[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+#[inline]
+pub(super) unsafe fn butterfly_fused_2layer_row_from(
+    src: *const F128,
+    dst: *mut F128,
+    quarter: usize,
     num_ntts: usize,
     r: usize,
-    twiddles: &[F128; 7],
+    twiddles: &[F128; 3],
 ) {
-    // SAFETY: caller supplies the pointer geometry and disjointness contract.
+    let [t_outer, t_inner_a, t_inner_b] = *twiddles;
     unsafe {
         for lane in 0..num_ntts {
-            let mut values = [F128::ZERO; 8];
-            for (i, value) in values.iter_mut().enumerate() {
-                *value = *ptr.add((i * eighth + r) * num_ntts + lane);
-            }
-            butterfly_fused_3layer(&mut values, twiddles);
-            for (i, value) in values.iter().enumerate() {
-                *ptr.add((i * eighth + r) * num_ntts + lane) = *value;
-            }
+            let mut a = *src.add(r * num_ntts + lane);
+            let mut b = *src.add((quarter + r) * num_ntts + lane);
+            let mut c = *src.add((2 * quarter + r) * num_ntts + lane);
+            let mut d = *src.add((3 * quarter + r) * num_ntts + lane);
+
+            let new_a = a + c * t_outer;
+            c += new_a;
+            a = new_a;
+            let new_b = b + d * t_outer;
+            d += new_b;
+            b = new_b;
+
+            let new_a = a + b * t_inner_a;
+            b += new_a;
+            a = new_a;
+            let new_c = c + d * t_inner_b;
+            d += new_c;
+            c = new_c;
+
+            *dst.add(r * num_ntts + lane) = a;
+            *dst.add((quarter + r) * num_ntts + lane) = b;
+            *dst.add((2 * quarter + r) * num_ntts + lane) = c;
+            *dst.add((3 * quarter + r) * num_ntts + lane) = d;
         }
     }
 }
 
-/// Root-block specialization of [`butterfly_fused_3layer_row`].
-///
-/// The caller additionally guarantees that `twiddles[0]`, `twiddles[1]`, and
-/// `twiddles[3]` are zero. Row stream zero is not written back because the
-/// specialized butterfly proves it is unchanged.
-///
 /// # Safety
-/// The caller guarantees that every selected row and lane is valid and that
-/// concurrent calls use disjoint row groups.
-pub(super) unsafe fn butterfly_fused_3layer_zero_root_row(
-    ptr: *mut F128,
-    eighth: usize,
+/// The caller guarantees that every selected source and destination row is
+/// valid, source and destination do not overlap, and concurrent calls write
+/// disjoint destination row groups.
+#[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+#[inline]
+pub(super) unsafe fn butterfly_fused_2layer_row_from_sparse(
+    src: *const F128,
+    dst: *mut F128,
+    quarter: usize,
     num_ntts: usize,
     r: usize,
-    twiddles: &[F128; 7],
+    right_twiddle: F128,
 ) {
-    // SAFETY: caller supplies the pointer geometry and disjointness contract.
     unsafe {
         for lane in 0..num_ntts {
-            let mut values = [F128::ZERO; 8];
-            for (i, value) in values.iter_mut().enumerate() {
-                *value = *ptr.add((i * eighth + r) * num_ntts + lane);
-            }
-            butterfly_fused_3layer_zero_root(&mut values, twiddles);
-            // values[0] is unchanged, so leave its cache line clean.
-            for (i, value) in values.iter().enumerate().skip(1) {
-                *ptr.add((i * eighth + r) * num_ntts + lane) = *value;
-            }
+            let a = *src.add(r * num_ntts + lane);
+            let mut b = *src.add((quarter + r) * num_ntts + lane);
+            let mut c = *src.add((2 * quarter + r) * num_ntts + lane);
+            let mut d = *src.add((3 * quarter + r) * num_ntts + lane);
+
+            // Layer 1 and the left layer-2 butterfly have zero twiddle.
+            c += a;
+            d += b;
+            b += a;
+            let new_c = c + d * right_twiddle;
+            d += new_c;
+            c = new_c;
+
+            *dst.add(r * num_ntts + lane) = a;
+            *dst.add((quarter + r) * num_ntts + lane) = b;
+            *dst.add((2 * quarter + r) * num_ntts + lane) = c;
+            *dst.add((3 * quarter + r) * num_ntts + lane) = d;
         }
     }
 }

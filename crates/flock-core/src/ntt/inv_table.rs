@@ -56,9 +56,11 @@ impl InvNttTableByteSingleGf8 {
         // straddles two cache lines.
         const TABLE_ALIGNMENT: usize = 64;
         let table_len = 256 * ell;
-        // Odd byte positions need each vector's two 8-byte halves exchanged.
-        // Keep that permutation as a second AArch64 image so the URM leaf can
-        // load it directly instead of executing an EXT for every vector.
+        // The fused AArch64 URM leaf needs odd byte positions with the two
+        // 8-byte halves of each vector exchanged. Keep that permutation as a
+        // second image so the hot path can load it directly instead of
+        // executing one EXT per vector. Other architectures keep the original
+        // footprint.
         let table_images = if cfg!(target_arch = "aarch64") { 2 } else { 1 };
         let mut data = vec![F8::ZERO; table_images * table_len + TABLE_ALIGNMENT - 1];
         let data_offset = (TABLE_ALIGNMENT - (data.as_ptr() as usize & (TABLE_ALIGNMENT - 1)))
@@ -88,7 +90,7 @@ impl InvNttTableByteSingleGf8 {
             if (w & (w - 1)) == 0 {
                 continue; // skip powers of 2 (already written)
             }
-            let lo_bit = w & w.wrapping_neg();
+            let lo_bit = w.isolate_lowest_one();
             let parent = w ^ lo_bit;
             // Borrow-checker friendly: read parent + bit_v slices, then write entry.
             let (parent_off, bit_off, entry_off) = (parent * ell, lo_bit * ell, w * ell);
@@ -129,12 +131,14 @@ impl InvNttTableByteSingleGf8 {
         unsafe { self.data.as_ptr().add(self.data_offset) as *const u8 }
     }
 
-    /// AArch64-only table image with each 16-byte chunk half-swapped.
+    /// Raw pointer to the AArch64-only image in which every 16-byte chunk has
+    /// its two 8-byte halves exchanged.
     #[cfg(target_arch = "aarch64")]
     #[inline]
     pub fn half_swapped_data_ptr(&self) -> *const u8 {
         debug_assert!(self.ell >= 16);
-        // SAFETY: construction appends one complete logical table image.
+        // SAFETY: AArch64 construction appends one complete logical table
+        // immediately after the original image in the same allocation.
         unsafe { self.data.as_ptr().add(self.data_offset + 256 * self.ell) as *const u8 }
     }
 
@@ -441,14 +445,21 @@ mod tests {
             let ntt_s = AdditiveNttGf8::new(k, F8::ZERO);
             let ntt_l = AdditiveNttGf8::new(k, F8(1u8 << k));
             let table = InvNttTableByteSingleGf8::new(&ntt_s, &ntt_l);
+            assert_eq!(table.half_swapped_data_ptr() as usize % 64, 0, "k={k}");
+
             let len = 256 * table.ell;
-            // SAFETY: both pointers expose complete images owned by `table`.
+            // SAFETY: both pointers expose complete `len`-byte images owned
+            // by `table` for the duration of this test.
             let original = unsafe { core::slice::from_raw_parts(table.data_ptr(), len) };
             let swapped =
                 unsafe { core::slice::from_raw_parts(table.half_swapped_data_ptr(), len) };
-            for (source, target) in original.chunks_exact(16).zip(swapped.chunks_exact(16)) {
-                assert_eq!(&target[..8], &source[8..]);
-                assert_eq!(&target[8..], &source[..8]);
+            for (chunk_index, (source, target)) in original
+                .chunks_exact(16)
+                .zip(swapped.chunks_exact(16))
+                .enumerate()
+            {
+                assert_eq!(&target[..8], &source[8..], "k={k}, chunk={chunk_index}");
+                assert_eq!(&target[8..], &source[..8], "k={k}, chunk={chunk_index}");
             }
         }
     }

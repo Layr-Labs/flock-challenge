@@ -158,7 +158,10 @@ pub struct ChainProofBundleLigerito {
 
 impl R1csProofBundleLigerito {
     pub fn to_bytes(&self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(HEADER_LEN + 1024);
+        // Ranked m=32 proofs serialize to ~437-440 KB; reserving up front
+        // avoids ~19 doubling reallocs (~0.9 MB of copies) inside the timed
+        // window. Larger proofs still grow normally.
+        let mut out = Vec::with_capacity(HEADER_LEN + 460_000);
         write_header(&mut out, FLAVOR_R1CS_LIGERITO);
         bincode::serialize_into(&mut out, self).expect("bincode serialize R1csProofBundleLigerito");
         out

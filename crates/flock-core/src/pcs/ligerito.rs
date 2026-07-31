@@ -36,6 +36,16 @@ use crate::merkle::{self, Hash, HashKind};
 use crate::ntt::additive_ntt_f128::AdditiveNttF128;
 use serde::{Deserialize, Serialize};
 
+/// `FLOCK_OPEN_TIMING`: per-level open-phase instrumentation — recursive
+/// commit shapes with their NTT-encode/Merkle split, plus the section totals
+/// the `LIG_PROVE_TRACE` breakdown already prints. Read once per process
+/// (diagnostics only; the ranked worker's cleared env never sets it).
+pub(crate) fn open_timing() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_OPEN_TIMING").is_some());
+    *ON
+}
+
 // ===================================================================
 // Config
 // ===================================================================
@@ -366,6 +376,52 @@ pub fn embedded_security_config(m: usize, profile: LigeritoProfile) -> Option<&'
     })
 }
 
+/// Parse and derive the immutable embedded configurations once. The mandatory
+/// untimed worker proof pays initialization; ranked proofs only scan and clone.
+#[allow(clippy::type_complexity)]
+static PARSED_EMBEDDED_CONFIGS: std::sync::LazyLock<
+    Vec<(
+        (usize, LigeritoProfile),
+        Result<(usize, ProverConfig, VerifierConfig), String>,
+    )>,
+> = std::sync::LazyLock::new(|| {
+    EMBEDDED_CONFIGS
+        .iter()
+        .map(|&(key, toml)| {
+            let parsed = LigeritoSecurityConfig::from_toml_str(toml).and_then(|sec| {
+                let initial_k = sec.initial_k;
+                sec.to_prover_verifier_configs()
+                    .map(|(pv, vc)| (initial_k, pv, vc))
+            });
+            (key, parsed)
+        })
+        .collect()
+});
+
+fn parsed_config_for(
+    m: usize,
+    log_batch_size: usize,
+    profile: LigeritoProfile,
+) -> Option<Result<(ProverConfig, VerifierConfig), String>> {
+    let (_, parsed) = PARSED_EMBEDDED_CONFIGS
+        .iter()
+        .find(|&&(key, _)| key == (m, profile))?;
+    Some(match parsed {
+        Err(e) => Err(e.clone()),
+        Ok((initial_k, pv, vc)) => {
+            if *initial_k != log_batch_size {
+                Err(format!(
+                    "embedded config for (m={m}, profile={}) has \
+                     initial_k={initial_k} but caller requested log_batch_size={log_batch_size}",
+                    profile.as_str()
+                ))
+            } else {
+                Ok((pv.clone(), vc.clone()))
+            }
+        }
+    })
+}
+
 /// Build a `ProverConfig` for `(log_n, log_batch_size, log_inv_rate)` from
 /// the embedded security TOML. **Strict**: returns `Err` if no security
 /// config has been derived for `(m, log_inv_rate)`. Use this as the
@@ -382,7 +438,7 @@ pub fn prover_config_for(
     profile: LigeritoProfile,
 ) -> Result<ProverConfig, String> {
     let m = log_n + crate::pcs::LOG_PACKING;
-    let toml = embedded_security_config(m, profile).ok_or_else(|| {
+    let (pv, _) = parsed_config_for(m, log_batch_size, profile).ok_or_else(|| {
         format!(
             "no security config registered for (m={m}, profile={}). \
              Add a TOML at configs/ligerito/m{m}_{}.toml and register it in \
@@ -390,17 +446,7 @@ pub fn prover_config_for(
             profile.as_str(),
             profile.as_str(),
         )
-    })?;
-    let sec = LigeritoSecurityConfig::from_toml_str(toml)?;
-    if sec.initial_k != log_batch_size {
-        return Err(format!(
-            "embedded config for (m={m}, profile={}) has \
-             initial_k={} but caller requested log_batch_size={log_batch_size}",
-            profile.as_str(),
-            sec.initial_k
-        ));
-    }
-    let (pv, _) = sec.to_prover_verifier_configs()?;
+    })??;
     Ok(pv)
 }
 
@@ -411,22 +457,12 @@ pub fn verifier_config_for(
     profile: LigeritoProfile,
 ) -> Result<VerifierConfig, String> {
     let m = log_n + crate::pcs::LOG_PACKING;
-    let toml = embedded_security_config(m, profile).ok_or_else(|| {
+    let (_, vc) = parsed_config_for(m, log_batch_size, profile).ok_or_else(|| {
         format!(
             "no security config registered for (m={m}, profile={})",
             profile.as_str()
         )
-    })?;
-    let sec = LigeritoSecurityConfig::from_toml_str(toml)?;
-    if sec.initial_k != log_batch_size {
-        return Err(format!(
-            "embedded config for (m={m}, profile={}) has \
-             initial_k={} but caller requested log_batch_size={log_batch_size}",
-            profile.as_str(),
-            sec.initial_k
-        ));
-    }
-    let (_, vc) = sec.to_prover_verifier_configs()?;
+    })??;
     Ok(vc)
 }
 
@@ -2311,14 +2347,17 @@ impl Drop for LigeroWitness {
 }
 
 // SumcheckProver owns the two witness-sized polynomials of the open (the
-// packed witness `f` and the γ-combined basis) plus the fold ping-pong
-// spares — recycle all four on drop.
+// packed witness `f` and the γ-combined basis) — recycle owned heap buffers
+// on drop. Arena-carved buffers are views into `fold_arena`, which drops
+// (joins its prefault thread + frees the one allocation) right after.
 impl Drop for SumcheckProver {
     fn drop(&mut self) {
-        crate::scratch::give_f128(std::mem::take(&mut self.f));
-        crate::scratch::give_f128(std::mem::take(&mut self.combined_basis));
-        crate::scratch::give_f128(std::mem::take(&mut self.spare_f));
-        crate::scratch::give_f128(std::mem::take(&mut self.spare_b));
+        if let FoldBuf::Owned(v) = std::mem::take(&mut self.f) {
+            crate::scratch::give_f128(v);
+        }
+        if let FoldBuf::Owned(v) = std::mem::take(&mut self.combined_basis) {
+            crate::scratch::give_f128(v);
+        }
     }
 }
 
@@ -2359,17 +2398,15 @@ pub(crate) fn ligero_commit(
     assert_eq!(poly.len(), num_interleaved * msg_cols);
     assert!(log_block_len <= ntt.log_domain_size());
 
-    // LSB-lane layout: input matches the SoA layout `data[pos * num_interleaved + lane]`
-    // directly. The first `log_inv_rate` NTT layers on the zero-padded
-    // coefficients are pure copies, so fill the matrix with 2^log_inv_rate
-    // replicas of `poly` (same write cost as copy + zero-fill) and start the
-    // transform past those layers — see `pcs::commit::replicate_message_fill`.
+    // LSB-lane input already matches the position-major SoA codeword layout.
+    // The semantic encoder owns zero-padding shortcuts and target-specific
+    // fusion while overwriting every slot of the recycled matrix.
     let codeword_len = block_len * num_interleaved;
     let mut mat = crate::scratch::take_f128(codeword_len);
-    super::commit::replicate_message_fill(&mut mat, poly);
-
-    // RS-encode every lane in one call (each lane is one independent NTT).
-    ntt.forward_transform_interleaved_from_layer(&mut mat, num_interleaved, log_inv_rate);
+    let ot = open_timing();
+    let t_encode = std::time::Instant::now();
+    ntt.rs_encode_interleaved(poly, &mut mat, num_interleaved);
+    let encode_ms = t_encode.elapsed().as_secs_f64() * 1e3;
 
     // Merkle over rows. One leaf = `num_interleaved` consecutive F128 = 16·num_interleaved bytes.
     let leaf_size_bytes = num_interleaved * core::mem::size_of::<F128>();
@@ -2380,7 +2417,28 @@ pub(crate) fn ligero_commit(
         )
     };
     debug_assert_eq!(data_bytes.len(), block_len * leaf_size_bytes);
-    let tree = merkle::merkle_tree(data_bytes, block_len, kind);
+    let t_merkle = std::time::Instant::now();
+    let mut gpu_busy_ms = 0.0f64;
+    let gpu_tree = if kind == HashKind::Blake3
+        && block_len >= gpu_open_merkle_min_leaves()
+        && merkle::blake3_leaf_size_is_batchable(leaf_size_bytes)
+        && crate::gpu::merkle::available()
+    {
+        gpu_merkle_tree_for_open(data_bytes, block_len, leaf_size_bytes, &mut gpu_busy_ms)
+    } else {
+        None
+    };
+    let on_gpu = gpu_tree.is_some();
+    let tree = gpu_tree.unwrap_or_else(|| merkle::merkle_tree(data_bytes, block_len, kind));
+    if ot {
+        eprintln!(
+            "[open-timing] ligero_commit: leaves=2^{log_block_len} leaf={leaf_size_bytes}B \
+             ({:.1} MiB) encode {encode_ms:.2} ms merkle({}) {:.2} ms (gpu busy {gpu_busy_ms:.2} ms)",
+            (codeword_len * 16) as f64 / (1024.0 * 1024.0),
+            if on_gpu { "gpu" } else { "cpu" },
+            t_merkle.elapsed().as_secs_f64() * 1e3,
+        );
+    }
 
     LigeroWitness {
         mat,
@@ -2388,6 +2446,88 @@ pub(crate) fn ligero_commit(
         block_len,
         num_interleaved,
     }
+}
+
+/// Leaf-count floor for routing a recursive-commit Merkle tree through the
+/// GPU session. Only the L1 (2^18 leaves at the ranked m=32 shape) and L2
+/// (2^16) trees are big enough to possibly beat the wide-pool CPU hash.
+/// Default OFF: in-process paired A/B measured the route ~-3.7 ms on the
+/// open phase, but the trusted fresh-worker harness measured it -4.5% on
+/// the MEDIAN (869,807 vs 912,904 c/s locally) — per-worker session fixed
+/// costs and contention with the URM/Merkle streams dominate outside a
+/// long-lived process. `FLOCK_GPU_OPEN_MERKLE=1` opts in;
+/// `FLOCK_GPU_OPEN_MERKLE_MIN_LOG2` overrides the floor (diagnostics).
+fn gpu_open_merkle_min_leaves() -> usize {
+    static MIN: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
+        if std::env::var_os("FLOCK_NO_GPU_OPEN_MERKLE").is_some() {
+            return usize::MAX;
+        }
+        match std::env::var("FLOCK_GPU_OPEN_MERKLE_MIN_LOG2") {
+            Ok(s) => s.parse::<u32>().map(|l| 1usize << l).unwrap_or(usize::MAX),
+            Err(_) if std::env::var_os("FLOCK_GPU_OPEN_MERKLE").is_some() => 1usize << 18,
+            Err(_) => usize::MAX,
+        }
+    });
+    *MIN
+}
+
+/// The GPU builds parent levels while their node count is ≥ this; the CPU
+/// finishes the top (≤ 1023 pair hashes — microseconds). Small enough that
+/// every eligible tree (≥ 2^16 leaves) gets its parent levels on the GPU.
+const GPU_OPEN_STOP_NODES: usize = 1 << 10;
+
+/// Tree over-allocation, in nodes: one 16 KiB page (512 × 32 B) so
+/// `gpu::merkle::begin`'s floor-page coverage check always passes for the
+/// real node range (same rule as `pcs::commit::TREE_PAD_NODES`).
+const GPU_OPEN_TREE_PAD_NODES: usize = 512;
+
+/// Build one recursive-commit Merkle tree (BLAKE3, flat `merkle_tree`
+/// layout) on the GPU: one leaf command buffer over the fully-encoded
+/// codeword, one parent-levels command buffer, CPU top from
+/// [`GPU_OPEN_STOP_NODES`]. Returns `None` on any refusal or failure —
+/// nothing of the returned-tree contract is left half-done, so the caller
+/// falls back to the byte-identical CPU `merkle_tree` (GPU API failures
+/// latch the process-wide disable, exactly like the streamed-commit path).
+///
+/// These trees (2-16 MiB) sit below the 64 MiB wrap-cache floor, so the
+/// buffers are wrapped fresh per prove and freed with the tree — no pool
+/// retention requirement, and no prewire (prewire no-ops below the floor).
+fn gpu_merkle_tree_for_open(
+    data_bytes: &[u8],
+    block_len: usize,
+    leaf_size: usize,
+    busy_ms: &mut f64,
+) -> Option<Vec<Hash>> {
+    let total_nodes = 2 * block_len - 1;
+    let mut tree: Vec<Hash> = crate::alloc_uninit_vec(total_nodes + GPU_OPEN_TREE_PAD_NODES);
+    // SAFETY (begin): `data_bytes` (the encoded codeword) and `tree` both
+    // outlive the session — finish() is called below before either can drop
+    // — and the CPU neither reads nor writes the GPU-owned node range
+    // `[0, 2n − s_last)` until finish() returns.
+    let mut session = unsafe {
+        crate::gpu::merkle::begin(
+            data_bytes,
+            leaf_size,
+            tree.as_mut_ptr() as *mut [u8; 32],
+            tree.len(),
+            GPU_OPEN_STOP_NODES,
+        )
+    }?;
+    if !session.commit_leaves(0, block_len) || !session.commit_parent_levels() {
+        // Latched inside the session; drain what was committed and rebuild
+        // everything on the CPU (the tree buffer is discarded untouched).
+        session.finish();
+        return None;
+    }
+    *busy_ms = session.finish()? * 1e3;
+    let from_nodes = if GPU_OPEN_STOP_NODES <= block_len / 2 {
+        GPU_OPEN_STOP_NODES
+    } else {
+        block_len
+    };
+    crate::pcs::commit::build_upper_levels(&mut tree, block_len, from_nodes, HashKind::Blake3);
+    tree.truncate(total_nodes);
+    Some(tree)
 }
 
 // ===================================================================
@@ -2545,7 +2685,7 @@ fn round_msg_and_eval_lsb(f: &[F128], b: &[F128]) -> (SumcheckMessage, F128) {
 
 /// Partially evaluate `evals` at LSB variable = `r`, in place. Halves length.
 /// Parallel for large arrays. Test oracle for the fused fold below; the
-/// production path uses `fold_and_msg_lsb_into` instead.
+/// production path uses `fold_and_msg_lsb` instead.
 #[cfg(test)]
 fn partial_eval_lsb_one(evals: &mut Vec<F128>, r: F128) {
     use rayon::prelude::*;
@@ -2586,40 +2726,33 @@ fn partial_eval_lsb_one(evals: &mut Vec<F128>, r: F128) {
 /// still in registers. One fork-join instead of three, and ~⅓ less memory
 /// traffic (the folded arrays are not re-read to build the message).
 ///
-/// Computes `next_msg = round_msg_lsb(folded_f, folded_b)`, bit-identical to
-/// the unfused sequence.
+/// Returns `(folded_f, folded_b, next_msg)` where `next_msg = round_msg_lsb
+/// (folded_f, folded_b)`. Bit-identical to the unfused sequence.
 ///
-/// Writes into caller-provided buffers (each must have capacity >=
-/// `f.len() / 2`; length is set to `f.len() / 2`). Lets [`SumcheckProver`]
-/// ping-pong between two persistent buffer pairs instead of allocating,
-/// faulting, and unmapping a fresh pair every round.
-fn fold_and_msg_lsb_into(
+/// `arena`: optional per-open [`FoldArena`] the parallel path carves its two
+/// output buffers from (prefaulted pages, no per-round zero-fill faults).
+/// `None`, an exhausted arena, or the serial path fall back to the previous
+/// per-arch allocation behavior.
+fn fold_and_msg_lsb(
     f: &[F128],
     b: &[F128],
     r: F128,
-    nf: &mut Vec<F128>,
-    nb: &mut Vec<F128>,
-) -> SumcheckMessage {
+    arena: Option<&mut FoldArena>,
+) -> (FoldBuf, FoldBuf, SumcheckMessage) {
     use rayon::prelude::*;
     let n = f.len();
     debug_assert!(n.is_power_of_two() && n >= 2);
     debug_assert_eq!(b.len(), n);
     let half = n / 2;
-    debug_assert!(nf.capacity() >= half && nb.capacity() >= half);
-    // SAFETY: capacities were checked above; F128: Copy (no Drop), so
-    // exposing uninit/stale elements is sound to *hold* — every slot is
-    // written below before anything reads it.
-    unsafe {
-        nf.set_len(half);
-        nb.set_len(half);
-    }
     let one_plus_r = F128::ONE + r;
 
     const PAR_THRESHOLD: usize = 4096;
     if half < PAR_THRESHOLD {
+        let mut nf = Vec::with_capacity(half);
+        let mut nb = Vec::with_capacity(half);
         for j in 0..half {
-            nf[j] = f[2 * j] * one_plus_r + f[2 * j + 1] * r;
-            nb[j] = b[2 * j] * one_plus_r + b[2 * j + 1] * r;
+            nf.push(f[2 * j] * one_plus_r + f[2 * j + 1] * r);
+            nb.push(b[2 * j] * one_plus_r + b[2 * j + 1] * r);
         }
         let mut u_0 = F128::ZERO;
         let mut u_2 = F128::ZERO;
@@ -2633,95 +2766,766 @@ fn fold_and_msg_lsb_into(
             u_2 += (f0 + f1) * (b0 + b1);
             k += 2;
         }
-        return SumcheckMessage { u_0, u_2 };
+        return (
+            FoldBuf::Owned(nf),
+            FoldBuf::Owned(nb),
+            SumcheckMessage { u_0, u_2 },
+        );
     }
 
     // Parallel path: `half` is a power of two ≥ PAR_THRESHOLD and CHUNK is a
     // power of two, so every chunk has even length and starts at an even
     // global index — message pairs (2k, 2k+1) never straddle a chunk boundary.
     const CHUNK: usize = 2048;
-    let (u_0, u_2) = nf
+    // Non-temporal fold path gate: the folded `nf`/`nb` are next read only
+    // after a Fiat–Shamir round trip; when each output is ≥ 32 MB (64 MB for
+    // the pair) they are DRAM-cold by then on the ranked M4 Pro's SLC and
+    // regular stores' write-allocate is one pure hidden DRAM read per output
+    // line. The NT leaf computes the message terms from registers instead of
+    // reloading the just-written pairs. `FLOCK_NO_OPEN_NT` is a
+    // local-diagnostics kill switch; the ranked worker's cleared environment
+    // never sets it.
+    #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+    let use_nt = half >= (1usize << 21) && std::env::var_os("FLOCK_NO_OPEN_NT").is_none();
+    // All-NEON SoA leaf (see `fold_and_msg_chunk_nt_neon_soa`) unless the
+    // `FLOCK_NO_OPEN_SUMCHECK_OPT` kill switch asks for the previous GPR-mixed
+    // leaf (local diagnostics / A-B; the ranked worker's cleared environment
+    // never sets it). Read once per process. The SoA leaf's EOR3 needs sha3
+    // (statically true under `-C target-cpu=native` on every Apple Silicon
+    // target this ships to; other builds keep the previous leaf).
+    #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+    let use_soa = cfg!(target_feature = "sha3") && {
+        static SOA: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+            std::env::var_os("FLOCK_NO_OPEN_SUMCHECK_OPT").is_none()
+        });
+        *SOA
+    };
+    // Fold-output storage, in preference order:
+    //   1. Per-open `FoldArena` slices: one exact-size prefaulted allocation
+    //      carved round by round — removes the ~1 GiB of kernel zero-fill +
+    //      page faults the fresh-per-round allocations paid inside the
+    //      serial Fiat–Shamir chain.
+    //   2. x86_64: prewarmed scratch pool (the prover gives the previous
+    //      round's buffers back in `SumcheckProver::fold`), so the initial
+    //      sumcheck reuses resident pages.
+    //   3. aarch64 without an arena: fresh uninit allocation each round
+    //      (cross-prove pooling measured slower here).
+    let (mut nf, mut nb) = match arena.and_then(|a| a.carve_pair(half)) {
+        Some(pair) => pair,
+        None => {
+            #[cfg(target_arch = "x86_64")]
+            {
+                (
+                    FoldBuf::Owned(crate::scratch::take_f128(half)),
+                    FoldBuf::Owned(crate::scratch::take_f128(half)),
+                )
+            }
+            #[cfg(not(target_arch = "x86_64"))]
+            {
+                (
+                    FoldBuf::Owned(crate::alloc_uninit_f128_vec(half)),
+                    FoldBuf::Owned(crate::alloc_uninit_f128_vec(half)),
+                )
+            }
+        }
+    };
+    let (nf_s, nb_s): (&mut [F128], &mut [F128]) = (&mut nf, &mut nb);
+    let (u_0, u_2) = nf_s
         .par_chunks_mut(CHUNK)
-        .zip(nb.par_chunks_mut(CHUNK))
+        .zip(nb_s.par_chunks_mut(CHUNK))
         .enumerate()
         .map(|(ci, (fc, bc))| {
             let base = ci * CHUNK;
             #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
             {
-                return crate::field::f128_slice::fold_two_and_msg(f, b, base, fc, bc, r);
-            }
-
-            #[cfg(not(all(target_arch = "aarch64", target_feature = "aes")))]
-            {
-                let len = fc.len();
-                let mut u0 = F128::ZERO;
-                let mut u2 = F128::ZERO;
-                // Fold this slice, then pair up the just-folded values for the msg.
-                crate::field::f128_slice::fold_pairs(f, base, fc, r);
-                crate::field::f128_slice::fold_pairs(b, base, bc, r);
-                let mut k = 0;
-                while k + 1 < len {
-                    let f0 = fc[k];
-                    let f1 = fc[k + 1];
-                    let b0 = bc[k];
-                    let b1 = bc[k + 1];
-                    u0 += f0 * b0;
-                    u2 += (f0 + f1) * (b0 + b1);
-                    k += 2;
+                // SAFETY: aes is cfg-guaranteed (sha3 checked by `use_soa`);
+                // chunk geometry supplies two source elements per output
+                // (bounds asserted by the caller's chunking) and every chunk
+                // has even length.
+                if use_soa {
+                    return unsafe {
+                        if use_nt {
+                            fold_and_msg_chunk_nt_neon_soa::<true>(f, b, base, fc, bc, r)
+                        } else {
+                            // Small rounds: same fused SoA kernel, plain
+                            // `stp` publish (output is re-read next round
+                            // while cache-resident).
+                            fold_and_msg_chunk_nt_neon_soa::<false>(f, b, base, fc, bc, r)
+                        }
+                    };
                 }
-                (u0, u2)
+                if use_nt {
+                    return unsafe { fold_and_msg_chunk_nt_neon(f, b, base, fc, bc, r) };
+                }
             }
+            let len = fc.len();
+            let mut u0 = F128::ZERO;
+            let mut u2 = F128::ZERO;
+            // Fold this slice, then pair up the just-folded values for the msg.
+            crate::field::f128_slice::fold_pairs(f, base, fc, r);
+            crate::field::f128_slice::fold_pairs(b, base, bc, r);
+            let mut k = 0;
+            while k + 1 < len {
+                let f0 = fc[k];
+                let f1 = fc[k + 1];
+                let b0 = bc[k];
+                let b1 = bc[k + 1];
+                u0 += f0 * b0;
+                u2 += (f0 + f1) * (b0 + b1);
+                k += 2;
+            }
+            (u0, u2)
         })
         .reduce(
             || (F128::ZERO, F128::ZERO),
             |(a0, a2), (c0, c2)| (a0 + c0, a2 + c2),
         );
-    SumcheckMessage { u_0, u_2 }
+    (nf, nb, SumcheckMessage { u_0, u_2 })
+}
+
+/// NT leaf for one [`fold_and_msg_lsb`] chunk: fold `f`/`b` at `r` AND build
+/// the (u_0, u_2) message terms from the register values, publishing the
+/// folded pairs with `stnp q,q` non-temporal stores — no write-allocate, no
+/// reload of the just-written pairs. Value-identical to the generic chunk
+/// body: the fold uses the same `ghash_mul_vec2_neon` pair fold as
+/// `f128_slice::fold_pairs`, and the message terms are the same reduced
+/// products XOR-accumulated (order-independent in GF(2^128)).
+///
+/// # Safety
+/// Requires the `aes` target feature. `fc`/`bc` must have equal, even length;
+/// `f`/`b` must contain `2 * (base + fc.len())` elements.
+#[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+#[target_feature(enable = "aes")]
+unsafe fn fold_and_msg_chunk_nt_neon(
+    f: &[F128],
+    b: &[F128],
+    base: usize,
+    fc: &mut [F128],
+    bc: &mut [F128],
+    r: F128,
+) -> (F128, F128) {
+    use crate::field::gf2_128::aarch64::ghash_mul_vec2_neon;
+
+    /// `stnp q,q` of two adjacent F128s from NEON registers (no Rust
+    /// intrinsic emits `stnp`). `dst` must be valid for 32 bytes, 16-aligned.
+    #[inline(always)]
+    unsafe fn store_nt_pair(dst: *mut F128, v0: F128, v1: F128) {
+        // SAFETY: F128 is a plain 16-byte value; transmute to a NEON register
+        // preserves the (lo LE ‖ hi LE) byte layout the store publishes.
+        unsafe {
+            let q0: core::arch::aarch64::uint8x16_t = core::mem::transmute(v0);
+            let q1: core::arch::aarch64::uint8x16_t = core::mem::transmute(v1);
+            core::arch::asm!(
+                "stnp {a:q}, {b:q}, [{p}]",
+                a = in(vreg) q0,
+                b = in(vreg) q1,
+                p = in(reg) dst,
+                options(nostack, preserves_flags)
+            );
+        }
+    }
+
+    let len = fc.len();
+    debug_assert_eq!(bc.len(), len);
+    debug_assert!(len.is_multiple_of(2));
+    let mut u0 = F128::ZERO;
+    let mut u2 = F128::ZERO;
+    unsafe {
+        let mut src_f = f.as_ptr().add(2 * base);
+        let mut src_b = b.as_ptr().add(2 * base);
+        let mut dst_f = fc.as_mut_ptr();
+        let mut dst_b = bc.as_mut_ptr();
+        let mut remaining = len / 2;
+        while remaining != 0 {
+            let fe0 = src_f.read();
+            let fo0 = src_f.add(1).read();
+            let fe1 = src_f.add(2).read();
+            let fo1 = src_f.add(3).read();
+            let be0 = src_b.read();
+            let bo0 = src_b.add(1).read();
+            let be1 = src_b.add(2).read();
+            let bo1 = src_b.add(3).read();
+
+            // fold(e, o) = e + r · (e ⊕ o), two lanes per array — the same
+            // arithmetic as `f128_slice::fold_pairs`.
+            let pf = ghash_mul_vec2_neon(
+                [r, r],
+                [
+                    F128 { lo: fe0.lo ^ fo0.lo, hi: fe0.hi ^ fo0.hi },
+                    F128 { lo: fe1.lo ^ fo1.lo, hi: fe1.hi ^ fo1.hi },
+                ],
+            );
+            let pb = ghash_mul_vec2_neon(
+                [r, r],
+                [
+                    F128 { lo: be0.lo ^ bo0.lo, hi: be0.hi ^ bo0.hi },
+                    F128 { lo: be1.lo ^ bo1.lo, hi: be1.hi ^ bo1.hi },
+                ],
+            );
+            let f0 = F128 { lo: fe0.lo ^ pf[0].lo, hi: fe0.hi ^ pf[0].hi };
+            let f1 = F128 { lo: fe1.lo ^ pf[1].lo, hi: fe1.hi ^ pf[1].hi };
+            let b0 = F128 { lo: be0.lo ^ pb[0].lo, hi: be0.hi ^ pb[0].hi };
+            let b1 = F128 { lo: be1.lo ^ pb[1].lo, hi: be1.hi ^ pb[1].hi };
+
+            store_nt_pair(dst_f, f0, f1);
+            store_nt_pair(dst_b, b0, b1);
+
+            // u_0 += f0·b0, u_2 += (f0+f1)(b0+b1) — from registers.
+            let g = ghash_mul_vec2_neon([f0, f0 + f1], [b0, b0 + b1]);
+            u0 += g[0];
+            u2 += g[1];
+
+            src_f = src_f.add(4);
+            src_b = src_b.add(4);
+            dst_f = dst_f.add(2);
+            dst_b = dst_b.add(2);
+            remaining -= 1;
+        }
+    }
+    (u0, u2)
+}
+
+/// All-NEON SoA variant of [`fold_and_msg_chunk_nt_neon`].
+///
+/// Same values, same store order — but restructured for M4's NEON issue
+/// width, which is what actually caps this loop (the fold rounds scale
+/// exactly linearly with size AND with thread count, so the kernel is
+/// core-issue-bound, not memory-bound: ~19 GB/s per core vs the ~100 GB/s a
+/// single M4 core can stream). Three restructures against the original:
+///
+/// 1. **All-vector dataflow.** The original keeps `F128 {lo, hi}` in GPRs
+///    and calls `ghash_mul_vec2_neon(F128, …)` — ~20 GPR→NEON `fmov`s per
+///    iteration. Here loads land in q-registers (`vld1q`), pair-XORs are
+///    `veor`, PMULL/PMULL2 read lane-paired (SoA) operands with no moves.
+/// 2. **Karatsuba fold muls.** Both fold multiplications share the constant
+///    `r`, so `r.lo ⊕ r.hi` is hoisted; each lane-paired fold is 6 PMULLs
+///    (3 per mul) instead of the schoolbook 8, cross terms via `EOR3`.
+///    Identical output: `dm ⊕ d0 ⊕ d2 = lh ⊕ hl` is exact in F2, and the
+///    same shift-based mod-p reduction produces the canonical value.
+/// 3. **Deferred message reduction.** `(u_0, u_2)` accumulate as UNREDUCED
+///    Karatsuba halves (`Σd0, Σdm, Σd2` per message word, 6 XORs/iter) and
+///    are reduced ONCE per chunk: mod-p reduction is F2-linear, so
+///    `reduce(Σ unreduced) = Σ reduce(each)` bit-exactly (the same idiom the
+///    x86_64 `f128_slice` message path documents). Kills a 17-op shift
+///    reduction + 4 zips per iteration.
+///
+/// # Safety
+/// Requires the `aes` and `sha3` target features (PMULL, EOR3). `fc`/`bc`
+/// must have equal, even length; `f`/`b` must contain `2 * (base + fc.len())`
+/// elements.
+#[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+#[target_feature(enable = "aes,sha3")]
+unsafe fn fold_and_msg_chunk_nt_neon_soa<const NT: bool>(
+    f: &[F128],
+    b: &[F128],
+    base: usize,
+    fc: &mut [F128],
+    bc: &mut [F128],
+    r: F128,
+) -> (F128, F128) {
+    use core::arch::aarch64::*;
+
+    /// `pmull` on lane 0 of both operands, staying in the vector file (the
+    /// intrinsic route through `p64` scalars can round-trip through GPRs).
+    #[inline(always)]
+    unsafe fn pmull_lo(a: uint64x2_t, b: uint64x2_t) -> uint64x2_t {
+        let d: uint64x2_t;
+        unsafe {
+            core::arch::asm!(
+                "pmull {d:v}.1q, {a:v}.1d, {b:v}.1d",
+                d = lateout(vreg) d,
+                a = in(vreg) a,
+                b = in(vreg) b,
+                options(pure, nomem, nostack, preserves_flags)
+            );
+        }
+        d
+    }
+    /// `pmull2` on lane 1 of both operands.
+    #[inline(always)]
+    unsafe fn pmull_hi(a: uint64x2_t, b: uint64x2_t) -> uint64x2_t {
+        let d: uint64x2_t;
+        unsafe {
+            core::arch::asm!(
+                "pmull2 {d:v}.1q, {a:v}.2d, {b:v}.2d",
+                d = lateout(vreg) d,
+                a = in(vreg) a,
+                b = in(vreg) b,
+                options(pure, nomem, nostack, preserves_flags)
+            );
+        }
+        d
+    }
+
+    /// Lane-paired Karatsuba **+ Barrett** fold multiply by the loop
+    /// constant `r`: given the SoA pair-XOR words `(d_lo, d_hi)` of two
+    /// F128s `d0, d1`, returns the two reduced products `(r·d0, r·d1)`
+    /// directly in AoS form (one `[lo, hi]` vector each) — no pack/unpack
+    /// zips. 6 Karatsuba PMULLs + 6 Barrett PMULLs (fold `hi·0x87`, then the
+    /// ≤7-bit overflow `ov·0x87` — `0x87 = x⁷+x²+x+1`, so `ov·0x87` IS the
+    /// shift correction `ov ⊕ ov≪1 ⊕ ov≪2 ⊕ ov≪7`), replacing the ~26-op
+    /// vectorised shift reduction. Word-for-word the arithmetic of
+    /// [`ghash_mul_karatsuba_barrett`]; the canonical mod-p value is unique,
+    /// so results are bit-identical to every other mul variant
+    /// (`all_neon_variants_agree` pins this).
+    ///
+    /// [`ghash_mul_karatsuba_barrett`]: crate::field::gf2_128::aarch64::ghash_mul_karatsuba_barrett
+    #[inline(always)]
+    unsafe fn mul2_kara_barrett_aos(
+        d_lo: uint64x2_t,
+        d_hi: uint64x2_t,
+        r_lo: uint64x2_t,
+        r_hi: uint64x2_t,
+        r_sum: uint64x2_t,
+        c87: uint64x2_t,
+    ) -> (uint64x2_t, uint64x2_t) {
+        unsafe {
+            let d_sum = veorq_u64(d_lo, d_hi);
+            let p0_0 = pmull_lo(d_lo, r_lo);
+            let p0_1 = pmull_hi(d_lo, r_lo);
+            let p2_0 = pmull_lo(d_hi, r_hi);
+            let p2_1 = pmull_hi(d_hi, r_hi);
+            let pm_0 = pmull_lo(d_sum, r_sum);
+            let pm_1 = pmull_hi(d_sum, r_sum);
+            // Cross terms c = dm ⊕ d0 ⊕ d2 (≡ lh ⊕ hl).
+            let c_0 = veor3q_u64(pm_0, p0_0, p2_0);
+            let c_1 = veor3q_u64(pm_1, p0_1, p2_1);
+
+            // Per-lane 256-bit product halves:
+            //   lo128 = d0 ⊕ (c ≪ 64), hi128 = d2 ⊕ (c ≫ 64).
+            let zero = vdupq_n_u64(0);
+            let lo_0 = veorq_u64(p0_0, vextq_u64::<1>(zero, c_0));
+            let hi_0 = veorq_u64(p2_0, vextq_u64::<1>(c_0, zero));
+            let lo_1 = veorq_u64(p0_1, vextq_u64::<1>(zero, c_1));
+            let hi_1 = veorq_u64(p2_1, vextq_u64::<1>(c_1, zero));
+
+            // Barrett fold of hi128: r_lo = hi.lo·0x87, r_hi = hi.hi·0x87,
+            // corr = ov·0x87 with ov = r_hi.hi (≤ 7 bits, product ≤ 14 bits
+            // so it lands entirely in the low word).
+            let rl_0 = pmull_lo(hi_0, c87);
+            let rh_0 = pmull_hi(hi_0, c87);
+            let rl_1 = pmull_lo(hi_1, c87);
+            let rh_1 = pmull_hi(hi_1, c87);
+            let cor_0 = pmull_hi(rh_0, c87);
+            let cor_1 = pmull_hi(rh_1, c87);
+
+            // res.lo = lo128.lo ⊕ r_lo.lo ⊕ corr,
+            // res.hi = lo128.hi ⊕ r_lo.hi ⊕ r_hi.lo.
+            let res_0 = veor3q_u64(lo_0, rl_0, vzip1q_u64(cor_0, rh_0));
+            let res_1 = veor3q_u64(lo_1, rl_1, vzip1q_u64(cor_1, rh_1));
+            (res_0, res_1)
+        }
+    }
+
+    /// Pair store of two adjacent F128s straight from vector registers:
+    /// `stnp q,q` (non-temporal, no write-allocate) when `NT`, else a plain
+    /// `stp q,q` (small rounds re-read their output next round while it is
+    /// still cache-resident, so the allocate is free and NT would forfeit
+    /// the hits). `dst` must be valid for 32 bytes, 16-aligned.
+    #[inline(always)]
+    unsafe fn store_pair_v<const NT: bool>(dst: *mut F128, v0: uint64x2_t, v1: uint64x2_t) {
+        unsafe {
+            if NT {
+                core::arch::asm!(
+                    "stnp {a:q}, {b:q}, [{p}]",
+                    a = in(vreg) v0,
+                    b = in(vreg) v1,
+                    p = in(reg) dst,
+                    options(nostack, preserves_flags)
+                );
+            } else {
+                core::arch::asm!(
+                    "stp {a:q}, {b:q}, [{p}]",
+                    a = in(vreg) v0,
+                    b = in(vreg) v1,
+                    p = in(reg) dst,
+                    options(nostack, preserves_flags)
+                );
+            }
+        }
+    }
+
+    let len = fc.len();
+    debug_assert_eq!(bc.len(), len);
+    debug_assert!(len.is_multiple_of(2));
+    unsafe {
+        let mut src_f = f.as_ptr().add(2 * base) as *const u64;
+        let mut src_b = b.as_ptr().add(2 * base) as *const u64;
+        let mut dst_f = fc.as_mut_ptr();
+        let mut dst_b = bc.as_mut_ptr();
+        // r broadcast once: lane-paired lo/hi/sum words for the fold muls.
+        let r_lo = vdupq_n_u64(r.lo);
+        let r_hi = vdupq_n_u64(r.hi);
+        let r_sum = vdupq_n_u64(r.lo ^ r.hi);
+        // Barrett fold constant: p − x^128 reversed = x⁷+x²+x+1.
+        let c87 = vdupq_n_u64(0x87);
+        // Unreduced SoA message accumulators: lane 0 = u_0, lane 1 = u_2.
+        // Karatsuba halves of Σ f·b: Σd0 (lo·lo), Σdm (sum·sum), Σd2 (hi·hi),
+        // each a full 128-bit carry-less product per lane.
+        let mut acc_d0_0 = vdupq_n_u64(0);
+        let mut acc_d0_1 = vdupq_n_u64(0);
+        let mut acc_dm_0 = vdupq_n_u64(0);
+        let mut acc_dm_1 = vdupq_n_u64(0);
+        let mut acc_d2_0 = vdupq_n_u64(0);
+        let mut acc_d2_1 = vdupq_n_u64(0);
+        let mut remaining = len / 2;
+        while remaining != 0 {
+            let fe0 = vld1q_u64(src_f);
+            let fo0 = vld1q_u64(src_f.add(2));
+            let fe1 = vld1q_u64(src_f.add(4));
+            let fo1 = vld1q_u64(src_f.add(6));
+            let be0 = vld1q_u64(src_b);
+            let bo0 = vld1q_u64(src_b.add(2));
+            let be1 = vld1q_u64(src_b.add(4));
+            let bo1 = vld1q_u64(src_b.add(6));
+
+            // fold(e, o) = e + r · (e ⊕ o), two lanes per array; the Barrett
+            // mul returns each product in AoS form, ready to XOR and store.
+            let fd0 = veorq_u64(fe0, fo0);
+            let fd1 = veorq_u64(fe1, fo1);
+            let (pf0, pf1) = mul2_kara_barrett_aos(
+                vzip1q_u64(fd0, fd1),
+                vzip2q_u64(fd0, fd1),
+                r_lo,
+                r_hi,
+                r_sum,
+                c87,
+            );
+            let bd0 = veorq_u64(be0, bo0);
+            let bd1 = veorq_u64(be1, bo1);
+            let (pb0, pb1) = mul2_kara_barrett_aos(
+                vzip1q_u64(bd0, bd1),
+                vzip2q_u64(bd0, bd1),
+                r_lo,
+                r_hi,
+                r_sum,
+                c87,
+            );
+            let f0 = veorq_u64(fe0, pf0);
+            let f1 = veorq_u64(fe1, pf1);
+            let b0 = veorq_u64(be0, pb0);
+            let b1 = veorq_u64(be1, pb1);
+
+            store_pair_v::<NT>(dst_f, f0, f1);
+            store_pair_v::<NT>(dst_b, b0, b1);
+
+            // u_0 += f0·b0, u_2 += (f0+f1)(b0+b1) — Karatsuba halves
+            // accumulated UNREDUCED; reduced once after the loop.
+            let fs = veorq_u64(f0, f1);
+            let bs = veorq_u64(b0, b1);
+            let a_lo = vzip1q_u64(f0, fs);
+            let a_hi = vzip2q_u64(f0, fs);
+            let b_lo = vzip1q_u64(b0, bs);
+            let b_hi = vzip2q_u64(b0, bs);
+            let a_sum = veorq_u64(a_lo, a_hi);
+            let b_sum = veorq_u64(b_lo, b_hi);
+            acc_d0_0 = veorq_u64(acc_d0_0, pmull_lo(a_lo, b_lo));
+            acc_d0_1 = veorq_u64(acc_d0_1, pmull_hi(a_lo, b_lo));
+            acc_dm_0 = veorq_u64(acc_dm_0, pmull_lo(a_sum, b_sum));
+            acc_dm_1 = veorq_u64(acc_dm_1, pmull_hi(a_sum, b_sum));
+            acc_d2_0 = veorq_u64(acc_d2_0, pmull_lo(a_hi, b_hi));
+            acc_d2_1 = veorq_u64(acc_d2_1, pmull_hi(a_hi, b_hi));
+
+            src_f = src_f.add(8);
+            src_b = src_b.add(8);
+            dst_f = dst_f.add(2);
+            dst_b = dst_b.add(2);
+            remaining -= 1;
+        }
+
+        // Final Karatsuba combine + single mod-p reduction per message word.
+        // Reduction is F2-linear, so this equals the sum of per-pair reduced
+        // products bit-for-bit.
+        #[inline(always)]
+        unsafe fn finish(d0: uint64x2_t, dm: uint64x2_t, d2: uint64x2_t) -> F128 {
+            unsafe {
+                let c = veor3q_u64(dm, d0, d2);
+                crate::field::gf2_128::ghash_reduce(
+                    vgetq_lane_u64::<0>(d0),
+                    vgetq_lane_u64::<1>(d0) ^ vgetq_lane_u64::<0>(c),
+                    vgetq_lane_u64::<0>(d2) ^ vgetq_lane_u64::<1>(c),
+                    vgetq_lane_u64::<1>(d2),
+                )
+            }
+        }
+        (
+            finish(acc_d0_0, acc_dm_0, acc_d2_0),
+            finish(acc_d0_1, acc_dm_1, acc_d2_1),
+        )
+    }
+}
+
+/// Per-open bump arena for the sumcheck fold outputs.
+///
+/// Every fold round's output size is known when the open starts: round `j`
+/// (1-based) of an `l`-slot open produces two `l >> j` buffers, so the
+/// `initial_k` L0 rounds need exactly `2·(l/2 + … + l/2^k) = 2·(l − l/2^k)`
+/// F128s in total. One allocation of that size replaces the two fresh
+/// `alloc_uninit` buffers per round, and its pages are prefaulted by
+/// background threads spawned at open entry — the kernel's ~1 GiB zero-fill
+/// (at the ranked m=32 shape) overlaps the `b_combined` build instead of
+/// being paid fault-by-fault inside the serial Fiat–Shamir fold chain.
+///
+/// Prefaulting is front-to-back per contiguous partition, with a per-
+/// partition watermark. [`Self::carve_pair`] NEVER blocks: a carve succeeds
+/// only if its whole region is already faulted; otherwise the round falls
+/// back to a fresh allocation (exactly the previous behavior) and the region
+/// stays at the front for the next, smaller round — so a slow prefaulter
+/// degrades gracefully instead of stalling the fold chain (at worst the
+/// arena's tail goes unused).
+///
+/// Strictly per-open: created in `pcs::open_batch_mixed_ligerito…`, moved
+/// into the [`SumcheckProver`], freed when the prover drops. Never recycled
+/// across proves (exact-size, no retention). `FLOCK_NO_FOLD_ARENA` disables
+/// creation (local diagnostics; the ranked worker's cleared env never sets
+/// it).
+pub struct FoldArena {
+    ptr: std::ptr::NonNull<F128>,
+    /// Capacity in F128 elements.
+    cap: usize,
+    /// Bump offset in F128 elements; only ever grows, so carved regions are
+    /// pairwise disjoint.
+    offset: usize,
+    /// Per-partition prefault watermarks (absolute element index reached).
+    parts: Vec<PrefaultPart>,
+    /// Prefault threads; joined in Drop (they write into the allocation).
+    threads: Vec<std::thread::JoinHandle<()>>,
+}
+
+/// One contiguous prefault partition `[start, end)` (element indices) and
+/// the watermark its thread has faulted up to (monotone, `start` → `end`).
+struct PrefaultPart {
+    start: usize,
+    end: usize,
+    done: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+}
+
+// SAFETY: the arena is a plain owned allocation + bump offset; F128 is Send.
+unsafe impl Send for FoldArena {}
+
+impl FoldArena {
+    /// Elements needed for every parallel fold round of an `l`-element open
+    /// with `k` initial lane folds: `2 · (l/2 + l/4 + … + l/2^k)`.
+    pub fn capacity_for(l: usize, k: usize) -> usize {
+        debug_assert!(l.is_power_of_two());
+        debug_assert!(k >= 1 && k <= l.trailing_zeros() as usize);
+        2 * (l - (l >> k))
+    }
+
+    /// Allocate `cap` F128s (uninitialized) and start touching one byte per
+    /// page across `PREFAULT_THREADS` contiguous partitions so the kernel's
+    /// zero-fill overlaps the caller's compute.
+    pub fn new_prefaulted(cap: usize) -> Self {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        assert!(cap > 0);
+        let layout = std::alloc::Layout::array::<F128>(cap).expect("FoldArena layout");
+        // SAFETY: layout is non-zero-sized (cap > 0, F128 is 16 bytes).
+        let raw = unsafe { std::alloc::alloc(layout) } as *mut F128;
+        let Some(ptr) = std::ptr::NonNull::new(raw) else {
+            std::alloc::handle_alloc_error(layout);
+        };
+        struct SendPtr(*mut u8);
+        // SAFETY: each thread dereferences only its own disjoint partition,
+        // and the arena joins every thread before dealloc.
+        unsafe impl Send for SendPtr {}
+
+        // 3 threads: round 0's region is the front HALF of the arena and is
+        // needed first (right after the b_combined pass + a ~19-bit grind);
+        // splitting the front across two threads roughly halves its ready
+        // time, while the third covers the later rounds' tail.
+        const PREFAULT_THREADS: usize = 3;
+        // Page-touch stride: 16 KiB matches Apple Silicon pages; elsewhere
+        // 4 KiB pages are still fully faulted because partition SIZES are
+        // 16 KiB-multiples only at the front — use 4 KiB to stay correct.
+        #[cfg(target_os = "macos")]
+        const STRIDE: usize = 16384;
+        #[cfg(not(target_os = "macos"))]
+        const STRIDE: usize = 4096;
+        const STRIDE_ELEMS: usize = STRIDE / core::mem::size_of::<F128>();
+        /// Publish the watermark every 4 MiB of progress.
+        const CHUNK_ELEMS: usize = (4 << 20) / core::mem::size_of::<F128>();
+
+        let bound = |i: usize| -> usize {
+            // Even element split, rounded to a whole stride so every page
+            // belongs to exactly one thread.
+            let raw = cap * i / PREFAULT_THREADS;
+            (raw / STRIDE_ELEMS) * STRIDE_ELEMS
+        };
+        let mut parts = Vec::with_capacity(PREFAULT_THREADS);
+        let mut threads = Vec::with_capacity(PREFAULT_THREADS);
+        for i in 0..PREFAULT_THREADS {
+            let (start, end) = (
+                bound(i),
+                if i + 1 == PREFAULT_THREADS { cap } else { bound(i + 1) },
+            );
+            let done = Arc::new(AtomicUsize::new(start));
+            parts.push(PrefaultPart {
+                start,
+                end,
+                done: done.clone(),
+            });
+            if start >= end {
+                done.store(end, Ordering::Release);
+                continue;
+            }
+            let base = SendPtr(unsafe { raw.add(start) } as *mut u8);
+            let elems = end - start;
+            threads.push(std::thread::spawn(move || {
+                let base = base;
+                let mut e = 0usize;
+                while e < elems {
+                    let chunk_end = (e + CHUNK_ELEMS).min(elems);
+                    while e < chunk_end {
+                        // SAFETY: e < elems, within this thread's partition;
+                        // volatile so the faulting store is not elided.
+                        unsafe {
+                            std::ptr::write_volatile(
+                                base.0.add(e * core::mem::size_of::<F128>()),
+                                0u8,
+                            )
+                        };
+                        e += STRIDE_ELEMS;
+                    }
+                    let e = e.min(elems);
+                    // Release: orders the page-faulting stores above before
+                    // the watermark readers' carves.
+                    done.store(start + e, Ordering::Release);
+                }
+                done.store(end, Ordering::Release);
+            }));
+        }
+        Self {
+            ptr,
+            cap,
+            offset: 0,
+            parts,
+            threads,
+        }
+    }
+
+    /// Carve two disjoint `half`-element buffers, or `None` if the arena is
+    /// exhausted OR the region is not fully prefaulted yet (the caller then
+    /// falls back to a fresh allocation and the region is retried by the
+    /// next round). Never blocks.
+    fn carve_pair(&mut self, half: usize) -> Option<(FoldBuf, FoldBuf)> {
+        use std::sync::atomic::Ordering;
+        if self.cap - self.offset < 2 * half {
+            return None;
+        }
+        let (lo, hi) = (self.offset, self.offset + 2 * half);
+        let ready = self.parts.iter().all(|p| {
+            hi <= p.start || lo >= p.end || p.done.load(Ordering::Acquire) >= hi.min(p.end)
+        });
+        if !ready {
+            return None;
+        }
+        // SAFETY: offset + 2·half ≤ cap, so both regions lie inside the
+        // allocation; the bump offset only grows, so they are disjoint from
+        // every previously carved region. The Acquire watermark loads above
+        // guarantee the prefaulter is done with (and will never revisit)
+        // [lo, hi), so no concurrent writes alias the carved slices.
+        let a = unsafe { self.ptr.add(self.offset) };
+        let b = unsafe { self.ptr.add(self.offset + half) };
+        self.offset += 2 * half;
+        Some((
+            FoldBuf::Arena { ptr: a, len: half },
+            FoldBuf::Arena { ptr: b, len: half },
+        ))
+    }
+}
+
+impl Drop for FoldArena {
+    fn drop(&mut self) {
+        // The prefault threads write into the allocation — they MUST finish
+        // before dealloc.
+        for h in self.threads.drain(..) {
+            let _ = h.join();
+        }
+        let layout = std::alloc::Layout::array::<F128>(self.cap).expect("FoldArena layout");
+        // SAFETY: ptr/layout are exactly what `new_prefaulted` allocated.
+        unsafe { std::alloc::dealloc(self.ptr.as_ptr() as *mut u8, layout) };
+    }
+}
+
+/// Storage for one sumcheck fold buffer: an owned heap `Vec` or a region
+/// carved from the per-open [`FoldArena`].
+///
+/// The `Arena` variant is a plain (ptr, len) view: dropping it is a no-op —
+/// the arena owns the memory and outlives every carved buffer (both live in
+/// the same [`SumcheckProver`], and `pcs` moves the arena into the prover
+/// before any carve).
+pub(crate) enum FoldBuf {
+    Owned(Vec<F128>),
+    Arena {
+        ptr: std::ptr::NonNull<F128>,
+        len: usize,
+    },
+}
+
+// SAFETY: `Arena` regions are pairwise disjoint (bump carve) and uniquely
+// owned by their FoldBuf; F128 is Send + Sync plain data.
+unsafe impl Send for FoldBuf {}
+unsafe impl Sync for FoldBuf {}
+
+impl Default for FoldBuf {
+    fn default() -> Self {
+        FoldBuf::Owned(Vec::new())
+    }
+}
+
+impl std::ops::Deref for FoldBuf {
+    type Target = [F128];
+    #[inline]
+    fn deref(&self) -> &[F128] {
+        match self {
+            FoldBuf::Owned(v) => v,
+            // SAFETY: the region lies inside the arena allocation, which
+            // outlives this buffer; no other FoldBuf aliases it.
+            FoldBuf::Arena { ptr, len } => unsafe {
+                std::slice::from_raw_parts(ptr.as_ptr(), *len)
+            },
+        }
+    }
+}
+
+impl std::ops::DerefMut for FoldBuf {
+    #[inline]
+    fn deref_mut(&mut self) -> &mut [F128] {
+        match self {
+            FoldBuf::Owned(v) => v,
+            // SAFETY: as in Deref, plus &mut self guarantees exclusivity.
+            FoldBuf::Arena { ptr, len } => unsafe {
+                std::slice::from_raw_parts_mut(ptr.as_ptr(), *len)
+            },
+        }
+    }
 }
 
 pub struct SumcheckProver {
-    f: Vec<F128>,
+    f: FoldBuf,
     /// Single combined basis poly. After every `glue(β)`, the introduced
     /// `b_new` is folded into here as `combined_basis += β · b_new`. This
     /// keeps fold cost O(1 + 1) = (f + combined_basis) regardless of how
     /// many recursive intro/glue pairs have happened.
-    combined_basis: Vec<F128>,
-    /// Ping-pong spares for [`Self::fold`]: each fold writes the halved
-    /// outputs into the spares (capacity >= current length / 2) and swaps
-    /// them in, so the ladder touches one resident page set per prove instead
-    /// of allocating, faulting, and unmapping a fresh buffer pair per round
-    /// (~1 GiB of churn across the ranked recursive open). Taken from the
-    /// scratch pool at construction and returned on drop, so the worker's
-    /// timed prove reuses the pages its warm-up prove faulted in.
-    spare_f: Vec<F128>,
-    spare_b: Vec<F128>,
+    combined_basis: FoldBuf,
+    /// Per-open fold-output arena (see [`FoldArena`]). `None` keeps the
+    /// previous per-round allocation behavior. Declared after `f` /
+    /// `combined_basis` purely for clarity; `FoldBuf::Arena` drops are no-ops
+    /// so field drop order is irrelevant for safety.
+    fold_arena: Option<FoldArena>,
     t_r: F128,
     transcript: Vec<SumcheckMessage>,
     pending_glue: Option<(Vec<F128>, F128)>,
 }
 
 impl SumcheckProver {
-    /// Ping-pong spare of capacity >= `f.len() / 2`; an empty Vec when the
-    /// prover is degenerate (len < 2), so `take_f128(0)` can never steal a
-    /// large pooled buffer.
-    fn new_spare(len: usize) -> Vec<F128> {
-        let half = len / 2;
-        if half == 0 {
-            Vec::new()
-        } else {
-            crate::scratch::take_f128(half)
-        }
-    }
-
     pub fn new(f: Vec<F128>, b1: Vec<F128>, h1: F128) -> (Self, SumcheckMessage) {
         assert_eq!(f.len(), b1.len());
-        let spare_f = Self::new_spare(f.len());
-        let spare_b = Self::new_spare(f.len());
         let mut inst = Self {
-            f,
-            combined_basis: b1,
-            spare_f,
-            spare_b,
+            f: FoldBuf::Owned(f),
+            combined_basis: FoldBuf::Owned(b1),
+            fold_arena: None,
             t_r: h1,
             transcript: Vec::new(),
             pending_glue: None,
@@ -2729,6 +3533,17 @@ impl SumcheckProver {
         let msg = round_msg_lsb(&inst.f, &inst.combined_basis);
         inst.transcript.push(msg);
         (inst, msg)
+    }
+
+    /// Hand the prover a per-open [`FoldArena`]; every subsequent parallel
+    /// [`Self::fold`] carves its output buffers from it until exhausted.
+    pub fn set_fold_arena(&mut self, arena: FoldArena) {
+        self.fold_arena = Some(arena);
+    }
+
+    /// Diagnostics only: whether the current `f` buffer is an arena carve.
+    pub(crate) fn f_is_arena(&self) -> bool {
+        matches!(self.f, FoldBuf::Arena { .. })
     }
 
     /// Like [`Self::new`] but skips the initial `round_msg_lsb` pass over
@@ -2743,13 +3558,10 @@ impl SumcheckProver {
         first_msg: SumcheckMessage,
     ) -> (Self, SumcheckMessage) {
         assert_eq!(f.len(), b1.len());
-        let spare_f = Self::new_spare(f.len());
-        let spare_b = Self::new_spare(f.len());
         let mut inst = Self {
-            f,
-            combined_basis: b1,
-            spare_f,
-            spare_b,
+            f: FoldBuf::Owned(f),
+            combined_basis: FoldBuf::Owned(b1),
+            fold_arena: None,
             t_r: h1,
             transcript: Vec::new(),
             pending_glue: None,
@@ -2760,18 +3572,29 @@ impl SumcheckProver {
 
     pub fn fold(&mut self, r: F128) -> SumcheckMessage {
         // Fused: fold f and combined_basis at r AND build the next-round
-        // message in one parallel pass (was three passes), writing the halved
-        // outputs into the persistent ping-pong spares and swapping them in.
-        // See [`fold_and_msg_lsb_into`].
-        let msg = fold_and_msg_lsb_into(
-            &self.f,
-            &self.combined_basis,
-            r,
-            &mut self.spare_f,
-            &mut self.spare_b,
-        );
-        std::mem::swap(&mut self.f, &mut self.spare_f);
-        std::mem::swap(&mut self.combined_basis, &mut self.spare_b);
+        // message in one parallel pass (was three passes). See
+        // [`fold_and_msg_lsb`].
+        let (nf, nb, msg) =
+            fold_and_msg_lsb(&self.f, &self.combined_basis, r, self.fold_arena.as_mut());
+        // On x86_64, recycle the just-consumed OWNED buffers into the scratch
+        // pool (same ownership as the Drop impl) so the next round's
+        // `fold_and_msg_lsb` takes resident pages. aarch64 measured slower with
+        // this pooling, so there we just move the new buffers in and drop the
+        // old ones (a no-op for arena regions — the arena outlives the open).
+        #[cfg(target_arch = "x86_64")]
+        {
+            if let FoldBuf::Owned(v) = std::mem::replace(&mut self.f, nf) {
+                crate::scratch::give_f128(v);
+            }
+            if let FoldBuf::Owned(v) = std::mem::replace(&mut self.combined_basis, nb) {
+                crate::scratch::give_f128(v);
+            }
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            self.f = nf;
+            self.combined_basis = nb;
+        }
         self.transcript.push(msg);
         msg
     }
@@ -3054,6 +3877,7 @@ pub fn recursive_prover_with_basis<Ch: Challenger>(
         l0_codeword,
         l0_tree,
         None,
+        None,
         challenger,
     )
 }
@@ -3072,6 +3896,7 @@ pub fn recursive_prover_with_basis_precomputed_round0<Ch: Challenger>(
     l0_codeword: &[F128],
     l0_tree: &[Hash],
     round0_uv: (F128, F128),
+    fold_arena: Option<FoldArena>,
     challenger: &mut Ch,
 ) -> LigeritoProof {
     recursive_prover_with_basis_impl(
@@ -3085,6 +3910,7 @@ pub fn recursive_prover_with_basis_precomputed_round0<Ch: Challenger>(
             u_0: round0_uv.0,
             u_2: round0_uv.1,
         }),
+        fold_arena,
         challenger,
     )
 }
@@ -3098,6 +3924,7 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
     l0_codeword: &[F128],
     l0_tree: &[Hash],
     first_msg: Option<SumcheckMessage>,
+    fold_arena: Option<FoldArena>,
     challenger: &mut Ch,
 ) -> LigeritoProof {
     let log_n = packed_witness.len().trailing_zeros() as usize;
@@ -3117,8 +3944,7 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
     assert_eq!(l0_codeword.len(), block_len_0 * num_interleaved_0);
     assert_eq!(l0_tree.len(), 2 * block_len_0 - 1);
 
-    let trace =
-        std::env::var("LIG_PROVE_TRACE").is_ok() || std::env::var_os("FLOCK_OPEN_TIMING").is_some();
+    let trace = std::env::var("LIG_PROVE_TRACE").is_ok() || open_timing();
     let mut t_init_sumcheck = std::time::Duration::ZERO;
     let mut t_commits = std::time::Duration::ZERO;
     let mut t_opens = std::time::Duration::ZERO;
@@ -3163,11 +3989,15 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
         Some(msg) => SumcheckProver::new_with_first_msg(packed_witness, b_initial, target, msg),
         None => SumcheckProver::new(packed_witness, b_initial, target),
     };
+    if let Some(arena) = fold_arena {
+        sc_prover.set_fold_arena(arena);
+    }
     challenger.observe_f128(start_msg.u_0);
     challenger.observe_f128(start_msg.u_2);
 
     let mut r_lane_fold = Vec::with_capacity(initial_k);
-    let mut t_grind0 = std::time::Duration::ZERO;
+    // FLOCK_OPEN_TIMING diagnostics: per-round (grind ms, fold ms, arena?)
+    let mut round_diag: Vec<(f64, f64, bool)> = Vec::new();
     for j in 0..initial_k {
         // Fold-challenge grinding: the L0 proximity-gap bad event lives on
         // each of these lane-fold challenges, so each one is individually
@@ -3178,20 +4008,21 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
         // `mca-commutes`), so it needs (fold_bits − j) bits — one fewer per
         // round than the worst (j=0) round `fold_grinding_bits` is sized for.
         // Derived from fold_grinding_bits + round index; not stored.
+        let _tg = std::time::Instant::now();
         let bits = fold_bits(0).saturating_sub(j as u32);
         if bits > 0 {
-            let _tg = std::time::Instant::now();
             fold_grinding_nonces.push(challenger.grind_pow(bits));
-            t_grind0 += _tg.elapsed();
         }
+        let grind_ms = _tg.elapsed().as_secs_f64() * 1e3;
         let r = challenger.sample_f128();
         let _tf = std::time::Instant::now();
         let msg = sc_prover.fold(r);
         if trace {
-            eprintln!(
-                "    [init-fold] round {j}: fold {:.2} ms",
-                _tf.elapsed().as_secs_f64() * 1e3
-            );
+            round_diag.push((
+                grind_ms,
+                _tf.elapsed().as_secs_f64() * 1e3,
+                sc_prover.f_is_arena(),
+            ));
         }
         challenger.observe_f128(msg.u_0);
         challenger.observe_f128(msg.u_2);
@@ -3199,10 +4030,6 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
     }
     if trace {
         t_init_sumcheck += _t.elapsed();
-        eprintln!(
-            "    [init-fold] initial_k={initial_k}, grind total {:.2} ms",
-            t_grind0.as_secs_f64() * 1e3
-        );
     }
 
     // Commit f^1 = folded packed witness as wtns_1.
@@ -3213,9 +4040,8 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
     let log_inv_rate_1 = config.log_inv_rates[1];
     let _t = std::time::Instant::now();
     let ntt_1 = AdditiveNttF128::standard(log_msg_cols_1 + log_inv_rate_1);
-    let f1 = sc_prover.f().to_vec();
     let wtns_1 = ligero_commit(
-        &f1,
+        sc_prover.f(),
         log_msg_cols_1,
         log_num_interleaved_1,
         log_inv_rate_1,
@@ -3360,6 +4186,11 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
                     "  initial sumcheck (initial_k folds + SC build): {:.2} ms",
                     t_init_sumcheck.as_secs_f64() * 1e3
                 );
+                for (j, (g, f, a)) in round_diag.iter().enumerate() {
+                    eprintln!(
+                        "    round {j}: grind {g:.2} ms, fold {f:.2} ms, arena={a}",
+                    );
+                }
                 eprintln!(
                     "  recursive commits (NTT + merkle):              {:.2} ms",
                     t_commits.as_secs_f64() * 1e3
@@ -3412,9 +4243,8 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
         let log_inv_rate_next = config.log_inv_rates[i + 2];
         let _t = std::time::Instant::now();
         let ntt_next = AdditiveNttF128::standard(log_msg_cols_next + log_inv_rate_next);
-        let f_evals = sc_prover.f().to_vec();
         let wtns_next = ligero_commit(
-            &f_evals,
+            sc_prover.f(),
             log_msg_cols_next,
             log_num_interleaved_next,
             log_inv_rate_next,
@@ -3470,26 +4300,14 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
 
         let sks_vks_i = eval_sk_at_vks(n_next);
         let _t = std::time::Instant::now();
-        let (basis_i_induced, enforced_sum_i) =
-            if n_next == 16 && config.log_inv_rates[i + 1] == 2 && queries_i.len() == 106 {
-                induce_sumcheck_poly_via_ntt(
-                    n_next,
-                    config.log_inv_rates[i + 1],
-                    &opened_rows_i,
-                    &level_rs,
-                    &queries_i,
-                    &alpha_i,
-                )
-            } else {
-                induce_sumcheck_poly(
-                    n_next,
-                    &sks_vks_i,
-                    &opened_rows_i,
-                    &level_rs,
-                    &queries_i,
-                    &alpha_i,
-                )
-            };
+        let (basis_i_induced, enforced_sum_i) = induce_sumcheck_poly(
+            n_next,
+            &sks_vks_i,
+            &opened_rows_i,
+            &level_rs,
+            &queries_i,
+            &alpha_i,
+        );
         if trace {
             t_induce += _t.elapsed();
         }
@@ -4682,10 +5500,9 @@ fn recursive_prover_inner<Ch: Challenger>(
         let log_msg_cols_next = n_next - log_num_interleaved_next;
         let log_inv_rate_next = config.log_inv_rates[i + 2];
         let ntt_next = AdditiveNttF128::standard(log_msg_cols_next + log_inv_rate_next);
-        let f_evals = sc_prover.f().to_vec();
         let t = std::time::Instant::now();
         let wtns_next = ligero_commit(
-            &f_evals,
+            sc_prover.f(),
             log_msg_cols_next,
             log_num_interleaved_next,
             log_inv_rate_next,
@@ -5057,6 +5874,132 @@ pub fn recursive_verifier<Ch: Challenger>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The NT fold+message leaf must produce bit-identical folded outputs
+    /// and (u_0, u_2) partials to the generic chunk body it replaces on
+    /// large rounds (the NT hint changes cache allocation only).
+    #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+    #[test]
+    fn fold_and_msg_nt_leaf_matches_generic() {
+        let mut state = 0x1234_5678_9abc_def0_u64;
+        let mut next = || {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            state
+        };
+        let mut f128 = || F128 { lo: next(), hi: next() };
+        for (n_pairs, base) in [(8usize, 0usize), (32, 4), (64, 16)] {
+            let total = 2 * (base + n_pairs);
+            let f: Vec<F128> = (0..total).map(|_| f128()).collect();
+            let b: Vec<F128> = (0..total).map(|_| f128()).collect();
+            let r = f128();
+
+            // Generic reference: fold_pairs then the reload message loop.
+            let mut fc_ref = vec![F128::ZERO; n_pairs];
+            let mut bc_ref = vec![F128::ZERO; n_pairs];
+            crate::field::f128_slice::fold_pairs(&f, base, &mut fc_ref, r);
+            crate::field::f128_slice::fold_pairs(&b, base, &mut bc_ref, r);
+            let mut u0_ref = F128::ZERO;
+            let mut u2_ref = F128::ZERO;
+            let mut k = 0;
+            while k + 1 < n_pairs {
+                let (f0, f1, b0, b1) = (fc_ref[k], fc_ref[k + 1], bc_ref[k], bc_ref[k + 1]);
+                u0_ref += f0 * b0;
+                u2_ref += (f0 + f1) * (b0 + b1);
+                k += 2;
+            }
+
+            let mut fc_nt = vec![F128::ZERO; n_pairs];
+            let mut bc_nt = vec![F128::ZERO; n_pairs];
+            // SAFETY: aes is cfg-guaranteed; slices sized per the contract.
+            let (u0_nt, u2_nt) =
+                unsafe { fold_and_msg_chunk_nt_neon(&f, &b, base, &mut fc_nt, &mut bc_nt, r) };
+            assert_eq!(fc_ref, fc_nt, "folded f mismatch n_pairs={n_pairs}");
+            assert_eq!(bc_ref, bc_nt, "folded b mismatch n_pairs={n_pairs}");
+            assert_eq!(u0_ref, u0_nt, "u0 mismatch n_pairs={n_pairs}");
+            assert_eq!(u2_ref, u2_nt, "u2 mismatch n_pairs={n_pairs}");
+        }
+    }
+
+    /// Oracle: the all-NEON SoA leaf is bit-identical to the previous
+    /// GPR-mixed NT leaf AND the generic fold+reload reference, on random
+    /// inputs at several shapes (incl. an odd base and a larger power-of-two
+    /// chunk like the production `CHUNK`).
+    #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+    #[test]
+    fn fold_and_msg_soa_leaf_matches_nt_and_generic() {
+        let mut state = 0x0fed_cba9_8765_4321_u64;
+        let mut next = || {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            state
+        };
+        let mut f128 = || F128 { lo: next(), hi: next() };
+        for (n_pairs, base) in [(2usize, 0usize), (8, 0), (32, 4), (64, 16), (2048, 2048)] {
+            let total = 2 * (base + n_pairs);
+            let f: Vec<F128> = (0..total).map(|_| f128()).collect();
+            let b: Vec<F128> = (0..total).map(|_| f128()).collect();
+            let r = f128();
+
+            // Generic reference: fold_pairs then the reload message loop.
+            let mut fc_ref = vec![F128::ZERO; n_pairs];
+            let mut bc_ref = vec![F128::ZERO; n_pairs];
+            crate::field::f128_slice::fold_pairs(&f, base, &mut fc_ref, r);
+            crate::field::f128_slice::fold_pairs(&b, base, &mut bc_ref, r);
+            let mut u0_ref = F128::ZERO;
+            let mut u2_ref = F128::ZERO;
+            let mut k = 0;
+            while k + 1 < n_pairs {
+                let (f0, f1, b0, b1) = (fc_ref[k], fc_ref[k + 1], bc_ref[k], bc_ref[k + 1]);
+                u0_ref += f0 * b0;
+                u2_ref += (f0 + f1) * (b0 + b1);
+                k += 2;
+            }
+
+            // Previous NT leaf.
+            let mut fc_nt = vec![F128::ZERO; n_pairs];
+            let mut bc_nt = vec![F128::ZERO; n_pairs];
+            // SAFETY: aes is cfg-guaranteed; slices sized per the contract.
+            let (u0_nt, u2_nt) =
+                unsafe { fold_and_msg_chunk_nt_neon(&f, &b, base, &mut fc_nt, &mut bc_nt, r) };
+
+            // New SoA leaf, both store variants.
+            let mut fc_soa = vec![F128::ZERO; n_pairs];
+            let mut bc_soa = vec![F128::ZERO; n_pairs];
+            // SAFETY: aes is cfg-guaranteed; slices sized per the contract.
+            let (u0_soa, u2_soa) = unsafe {
+                fold_and_msg_chunk_nt_neon_soa::<true>(&f, &b, base, &mut fc_soa, &mut bc_soa, r)
+            };
+            let mut fc_soa_r = vec![F128::ZERO; n_pairs];
+            let mut bc_soa_r = vec![F128::ZERO; n_pairs];
+            // SAFETY: as above.
+            let (u0_soa_r, u2_soa_r) = unsafe {
+                fold_and_msg_chunk_nt_neon_soa::<false>(
+                    &f,
+                    &b,
+                    base,
+                    &mut fc_soa_r,
+                    &mut bc_soa_r,
+                    r,
+                )
+            };
+
+            assert_eq!(fc_ref, fc_soa, "folded f mismatch n_pairs={n_pairs}");
+            assert_eq!(bc_ref, bc_soa, "folded b mismatch n_pairs={n_pairs}");
+            assert_eq!(u0_ref, u0_soa, "u0 vs generic n_pairs={n_pairs}");
+            assert_eq!(u2_ref, u2_soa, "u2 vs generic n_pairs={n_pairs}");
+            assert_eq!(fc_nt, fc_soa, "folded f vs NT n_pairs={n_pairs}");
+            assert_eq!(bc_nt, bc_soa, "folded b vs NT n_pairs={n_pairs}");
+            assert_eq!(u0_nt, u0_soa, "u0 vs NT n_pairs={n_pairs}");
+            assert_eq!(u2_nt, u2_soa, "u2 vs NT n_pairs={n_pairs}");
+            assert_eq!(fc_soa, fc_soa_r, "folded f NT vs stp n_pairs={n_pairs}");
+            assert_eq!(bc_soa, bc_soa_r, "folded b NT vs stp n_pairs={n_pairs}");
+            assert_eq!(u0_soa, u0_soa_r, "u0 NT vs stp n_pairs={n_pairs}");
+            assert_eq!(u2_soa, u2_soa_r, "u2 NT vs stp n_pairs={n_pairs}");
+        }
+    }
 
     /// Worked example: `LigeritoSecurityConfig` for BLAKE3 m=29 at rate 1/2.
     /// Paper-compatible m=29 fast example, mechanically derived in the
@@ -7065,6 +8008,78 @@ mod tests {
         );
     }
 
+    /// Cross-process transcript oracle for the initial-sumcheck fold kernels
+    /// (`#[ignore]`: 64 MB poly; run explicitly). m=29 (log_n=22) is the
+    /// smallest shape whose round-0 fold half (2^21) engages the NT/SoA leaf.
+    /// Prints a deterministic digest of the full proof — run once with
+    /// default env and once with `FLOCK_NO_OPEN_SUMCHECK_OPT=1` (and/or
+    /// `FLOCK_NO_OPEN_NT=1`) and diff the `PROOF_DIGEST` lines: identical
+    /// digests = identical proof bytes = identical transcript.
+    #[test]
+    #[ignore]
+    fn open_sumcheck_kernel_e2e_transcript_digest() {
+        use crate::challenger::Challenger;
+        use std::hash::{Hash as _, Hasher as _};
+        let m = 29usize;
+        let log_n = m - crate::pcs::LOG_PACKING;
+        let initial_k = 6;
+        let mut p_cfg = prover_config_for(log_n, initial_k, LigeritoProfile::Fast)
+            .expect("m29 fast prover config");
+        let mut v_cfg = verifier_config_for(log_n, initial_k, LigeritoProfile::Fast)
+            .expect("m29 fast verifier config");
+        // Mirror the ranked worker: BLAKE3 Merkle + BLAKE3 FS.
+        p_cfg.merkle_hash = HashKind::Blake3;
+        v_cfg.merkle_hash = HashKind::Blake3;
+
+        let mut rng = crate::challenger::RandomChallenger::new(0x50A0_0AC1E_u64);
+        let poly: Vec<F128> = (0..(1usize << log_n)).map(|_| rng.sample_f128()).collect();
+        let z: Vec<F128> = (0..log_n).map(|_| rng.sample_f128()).collect();
+        let b = build_eq_table(&z);
+        let target: F128 = poly
+            .iter()
+            .zip(b.iter())
+            .map(|(&a, &c)| a * c)
+            .fold(F128::ZERO, |a, x| a + x);
+
+        let log_inv_rate_0 = p_cfg.log_inv_rates[0];
+        let log_msg_cols_0 = log_n - initial_k;
+        let ntt_0 = AdditiveNttF128::standard(log_msg_cols_0 + log_inv_rate_0);
+        let wtns_0 = ligero_commit(
+            &poly,
+            log_msg_cols_0,
+            initial_k,
+            log_inv_rate_0,
+            &ntt_0,
+            HashKind::Blake3,
+        );
+        let initial_root = wtns_0.root();
+
+        let mut p_ch =
+            crate::challenger::FsChallenger::with_hash(b"soa-oracle", HashKind::Blake3);
+        let proof = recursive_prover_with_basis(
+            &p_cfg,
+            poly,
+            b.clone(),
+            target,
+            &wtns_0.mat,
+            &wtns_0.tree,
+            &mut p_ch,
+        );
+
+        // Deterministic digest of the whole proof (Debug string through the
+        // fixed-key DefaultHasher — stable across processes of one binary).
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        format!("{proof:?}").hash(&mut h);
+        eprintln!("PROOF_DIGEST {:016x}", h.finish());
+
+        let mut v_ch =
+            crate::challenger::FsChallenger::with_hash(b"soa-oracle", HashKind::Blake3);
+        assert!(
+            recursive_verifier_with_basis(&v_cfg, &proof, &b, target, &initial_root, &mut v_ch),
+            "m29 blake3 proof must verify"
+        );
+    }
+
     /// End-to-end under BLAKE3: the same recursion, every Merkle commitment
     /// (L0 and each recursive level) built and checked with the other hash.
     /// Also pins the failure mode of a hash mismatch — a verifier configured
@@ -7544,5 +8559,37 @@ mod tests {
             HashKind::Sha256,
         );
         assert_eq!(w.root(), w2.root());
+    }
+
+    /// The GPU recursive-commit Merkle route must produce the exact
+    /// node-for-node tree the CPU `merkle_tree` builds, at the production
+    /// shapes: 2^18 leaves × 128 B (the L1 tree at the ranked m=32 open,
+    /// GPU-routed by default) and 2^16 × 128 B (the L2 shape the floor can
+    /// be lowered to via `FLOCK_GPU_OPEN_MERKLE_MIN_LOG2`). Also covers the
+    /// CPU top above [`GPU_OPEN_STOP_NODES`]. SKIPS without Metal.
+    #[test]
+    fn gpu_open_merkle_tree_matches_cpu() {
+        if !crate::gpu::merkle::available() {
+            eprintln!("SKIP gpu_open_merkle_tree_matches_cpu: Metal unavailable");
+            return;
+        }
+        for log_leaves in [16usize, 18] {
+            let n_leaves = 1usize << log_leaves;
+            let leaf_size = 128usize;
+            let data: Vec<F128> = (0..n_leaves * leaf_size / 16)
+                .map(|i| F128::new(i as u64, (i as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15)))
+                .collect();
+            let bytes: &[u8] = unsafe {
+                core::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 16)
+            };
+            let mut busy_ms = 0.0f64;
+            let gpu_tree = gpu_merkle_tree_for_open(bytes, n_leaves, leaf_size, &mut busy_ms)
+                .expect("GPU open-merkle session must complete when Metal is available");
+            let cpu_tree = merkle::merkle_tree(bytes, n_leaves, HashKind::Blake3);
+            assert_eq!(
+                gpu_tree, cpu_tree,
+                "GPU open-merkle tree != CPU at 2^{log_leaves} leaves"
+            );
+        }
     }
 }

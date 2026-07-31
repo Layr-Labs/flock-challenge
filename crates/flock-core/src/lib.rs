@@ -19,8 +19,9 @@
 
 pub mod bits;
 pub mod challenger;
-pub(crate) mod epool;
 pub mod field;
+pub mod gaptime;
+pub mod gpu;
 pub mod hash;
 pub mod lincheck;
 pub mod merkle;
@@ -46,51 +47,25 @@ pub mod zerocheck;
 /// code runs (rayon's global pool is set on first use; if it's already
 /// created, this call is a no-op).
 ///
-/// Respects `RAYON_NUM_THREADS` as an explicit size override while retaining
-/// the platform worker setup below.
+/// Respects `RAYON_NUM_THREADS` — if that env var is set, this function
+/// does nothing (so explicit user configuration always wins).
 ///
 /// Returns the number of threads the pool was configured with, or `None`
-/// if no change was made because Rayon was already initialized.
+/// if no change was made (either because the env var was set or because
+/// rayon was already initialized).
 pub fn init_perf_thread_pool() -> Option<usize> {
-    let n = std::env::var("RAYON_NUM_THREADS")
-        .ok()
-        .and_then(|s| s.parse::<usize>().ok())
-        .filter(|&n| n > 0)
-        .unwrap_or_else(perf_core_count);
-    // The main/calling thread runs *all* sequential work (seed expansion,
-    // Fiat-Shamir observe/sample, proof serialization, multi-proof extract)
-    // but rayon's start_handler only tags the pool workers. On Apple Silicon
-    // an unspecified-QoS thread is freely E-cluster-eligible, which can park
-    // that serial work on efficiency cores while the P-cluster's DVFS domain
-    // still participates in the QoS decision. Pin the caller first so the
-    // whole prover process is USER_INITIATED before any timed trial starts.
-    set_prover_thread_qos();
+    if std::env::var("RAYON_NUM_THREADS").is_ok() {
+        return None;
+    }
+    let n = perf_core_count();
     match rayon::ThreadPoolBuilder::new()
         .num_threads(n)
-        .start_handler(|_| set_prover_thread_qos())
         .build_global()
     {
         Ok(()) => Some(n),
         Err(_) => None, // pool already built
     }
 }
-
-/// Mark Rayon prover workers as latency-sensitive on macOS. A bare Rayon pool
-/// inherits default QoS, which lets sustained jobs drift onto efficiency cores
-/// even when the pool was deliberately sized to the performance-core count.
-#[cfg(target_os = "macos")]
-fn set_prover_thread_qos() {
-    unsafe extern "C" {
-        fn pthread_set_qos_class_self_np(qos_class: u32, relative_priority: i32) -> i32;
-    }
-    // QOS_CLASS_USER_INITIATED: explicit user work that should finish promptly.
-    unsafe {
-        let _ = pthread_set_qos_class_self_np(0x19, 0);
-    }
-}
-
-#[cfg(not(target_os = "macos"))]
-fn set_prover_thread_qos() {}
 
 /// Allocate a `Vec<T>` of length `n` whose contents are NOT zero-initialized.
 /// Caller MUST write every slot before reading it.

@@ -27,9 +27,9 @@ pub mod univariate_skip_deg4_optimized;
 pub mod univariate_skip_optimized;
 
 use multilinear::{
-    UniSkipFoldTable, fold_and_compute_round_pair_into, fold_compact_and_compute_round_pair,
-    fold_in_place_pair, interpolate_at_z_combined, interpolate_at_z_on_lambda, round_pair_naive,
-    uni_skip_fold_and_round_pair_compact_padded_with_deltas,
+    UniSkipFoldTable, fold_and_compute_round_pair_into, fold_in_place_pair,
+    interpolate_at_z_combined, interpolate_at_z_on_lambda, round_pair_naive,
+    uni_skip_fold_and_round_pair_optimized_packed_padded,
 };
 use univariate_skip_optimized::{
     c_s_f128, medium_challenges_ghash, round1_shift_reduce_extract_c_packed_padded,
@@ -40,6 +40,17 @@ use univariate_skip_optimized::{
 /// |Λ| = 2^K_SKIP = 64 elements; the round-1 prover message is two length-64
 /// vectors of F128.
 pub const K_SKIP: usize = 6;
+
+fn build_urm_inv_table(k_skip: usize) -> InvNttTableByteSingleGf8 {
+    let ntt_s = AdditiveNttGf8::new(k_skip, F8::ZERO);
+    let ntt_l = AdditiveNttGf8::new(k_skip, F8(1u8 << k_skip));
+    InvNttTableByteSingleGf8::new(&ntt_s, &ntt_l)
+}
+
+/// Transcript-independent inverse-NTT data for the protocol-fixed skip.
+/// The worker's mandatory untimed proof initializes it before measurements.
+static URM_INV_TABLE_K_SKIP: std::sync::LazyLock<InvNttTableByteSingleGf8> =
+    std::sync::LazyLock::new(|| build_urm_inv_table(K_SKIP));
 
 /// Witness padding descriptor for URM work-skipping.
 ///
@@ -219,7 +230,7 @@ pub fn prove_packed_padded_capture_s_hat_v_c<C: Challenger>(
 }
 
 /// Capture-`s_hat_v_c` prover that consumes a challenge-independent AB inner
-/// transform prepared while the witness commitment was being built. The
+/// transform prepared while the witness commitment was being built.  The
 /// original A and B buffers are still required and remain untouched for the
 /// challenge-dependent round-2 fold.
 pub fn prove_packed_padded_capture_s_hat_v_c_with_precomputed_ab<C: Challenger>(
@@ -256,7 +267,7 @@ fn prove_packed_padded_inner<C: Challenger>(
     m: usize,
     padding: &PaddingSpec,
     capture_s_hat_v_c: bool,
-    precomputed_ab: Option<univariate_skip_optimized::Round1AbInner>,
+    mut precomputed_ab: Option<univariate_skip_optimized::Round1AbInner>,
     challenger: &mut C,
 ) -> (ZerocheckProof, ZerocheckClaim, Option<Vec<F128>>) {
     let k_skip = K_SKIP;
@@ -304,10 +315,14 @@ fn prove_packed_padded_inner<C: Challenger>(
     // about this internal optimization; we restore the C_s factor here.
     let zc_timing = std::env::var_os("FLOCK_ZC_TIMING").is_some();
     let t_round1 = std::time::Instant::now();
-    let ntt_s = AdditiveNttGf8::new(k_skip, F8::ZERO);
-    let ntt_l = AdditiveNttGf8::new(k_skip, F8(1u8 << k_skip));
-    let inv_table = InvNttTableByteSingleGf8::new(&ntt_s, &ntt_l);
-    let (round1_ab_opt, round1_c_opt, s_hat_v_c) = if let Some(ab_inner) = precomputed_ab.as_ref() {
+    let inv_table_owned;
+    let inv_table: &InvNttTableByteSingleGf8 = if k_skip == K_SKIP {
+        &URM_INV_TABLE_K_SKIP
+    } else {
+        inv_table_owned = build_urm_inv_table(k_skip);
+        &inv_table_owned
+    };
+    let (round1_ab_opt, round1_c_opt, s_hat_v_c) = if let Some(ab_inner) = precomputed_ab.as_mut() {
         assert!(
             capture_s_hat_v_c,
             "precomputed AB path currently requires s_hat_v capture"
@@ -315,11 +330,13 @@ fn prove_packed_padded_inner<C: Challenger>(
         let (ab, c, s) =
             crate::zerocheck::univariate_skip_optimized::round1_shift_reduce_extract_c_packed_padded_with_precomputed_ab(
                 ab_inner,
+                a_packed,
+                b_packed,
                 c_packed,
                 m,
                 k_skip,
                 &r,
-                &inv_table,
+                inv_table,
                 padding,
             );
         (ab, c, Some(s))
@@ -332,24 +349,23 @@ fn prove_packed_padded_inner<C: Challenger>(
                 m,
                 k_skip,
                 &r,
-                &inv_table,
+                inv_table,
                 padding,
             );
         (ab, c, Some(s))
     } else {
         let (ab, c) = round1_shift_reduce_extract_c_packed_padded(
-            a_packed, b_packed, c_packed, m, k_skip, &r, &inv_table, padding,
+            a_packed, b_packed, c_packed, m, k_skip, &r, inv_table, padding,
         );
         (ab, c, None)
     };
-    // The A-sized transform is dead after the round-1 message. Its byte length
-    // exactly matches compact round two's delta storage, so retain its F128
-    // allocation/layout and donate it instead of taking a fresh Vec<u8>.
-    let compact_deltas =
-        precomputed_ab.map(univariate_skip_optimized::Round1AbInner::into_scratch_bytes);
+    // The A-sized transform is dead after the round-1 message and can return
+    // to the scratch pool before the much larger round-2 fold allocations.
+    drop(precomputed_ab);
     let c_s = c_s_f128();
     let round1_ab: Vec<F128> = round1_ab_opt.iter().map(|x| c_s * *x).collect();
     let round1_c: Vec<F128> = round1_c_opt.iter().map(|x| c_s * *x).collect();
+    crate::gaptime::mark("zc: round1 done (URM + C_s restore)");
     if zc_timing {
         eprintln!(
             "[zc-timing] round1 URM: {:.2} ms",
@@ -361,6 +377,7 @@ fn prove_packed_padded_inner<C: Challenger>(
     challenger.observe_f128_slice(&round1_ab);
     challenger.observe_f128_slice(&round1_c);
     let z = challenger.sample_f128();
+    crate::gaptime::mark("zc: round1 observed + z sampled");
 
     // ---- 5. c_eval = ĉ(z, r_rest) via interpolation of round1_c at z ----
     //
@@ -378,18 +395,20 @@ fn prove_packed_padded_inner<C: Challenger>(
     // verifier samples ρ_1 after observing this message.
     let t_round2 = std::time::Instant::now();
     let fold_table = UniSkipFoldTable::new(k_skip, z);
+    crate::gaptime::mark("zc: fold_table built");
     let mut mlv_arg = vec![F128::ONE; n_mlv];
     mlv_arg[1..].copy_from_slice(&r[k_skip + 1..]);
-    let (compact_mlv, msg_1, msg_inf) = uni_skip_fold_and_round_pair_compact_padded_with_deltas(
-        a_packed,
-        b_packed,
-        m,
-        k_skip,
-        &fold_table,
-        &mlv_arg,
-        padding,
-        compact_deltas,
-    );
+    let (mut a_mlv, mut b_mlv, msg_1, msg_inf) =
+        uni_skip_fold_and_round_pair_optimized_packed_padded(
+            a_packed,
+            b_packed,
+            m,
+            k_skip,
+            &fold_table,
+            &mlv_arg,
+            padding,
+        );
+    crate::gaptime::mark("zc: round2 fused fold done");
 
     if zc_timing {
         eprintln!(
@@ -408,28 +427,11 @@ fn prove_packed_padded_inner<C: Challenger>(
     // ---- 7. Rounds 3..(n_mlv + 1) — AB only (c is done) ----
     //
     // Iter i: fold (a, b) at ρ_{i+1}, compute round (i+3) message, sample
-    // ρ_{i+2}. Use the fused parallel path while log_n ≥ 15; below that the
-    // 12..14 are structurally valid but open a fixed 128-chunk Rayon region
-    // over too little work; below 12, SplitEqGhash cannot form lo_size ≥ 2
-    // under MAX_N_HI = 9 at all. Fall back to fold_in_place_pair +
-    // round_pair_naive for this serial tail.
+    // ρ_{i+2}. Use the fused parallel path while log_n ≥ 10; below that the
+    // SplitEqGhash inner can't form lo_size ≥ 2, so we fall back to
+    // fold_in_place_pair + round_pair_naive.
     //
-    // The first challenge is applied directly to round two's compact
-    // anchor+packed-delta representation.  Composing rho into the 32 KiB byte
-    // table removes the two field multiplications per output that the generic
-    // pair fold would require, while materializing exactly the ordinary
-    // post-fold tables expected by all subsequent rounds.
-    let mut first_r_next = vec![F128::ONE; n_mlv - 1];
-    first_r_next[1..].copy_from_slice(&r[k_skip + 2..]);
-    let (mut a_mlv, mut b_mlv, first_m1, first_mi) =
-        fold_compact_and_compute_round_pair(&compact_mlv, &fold_table, mlv_rhos[0], &first_r_next);
-    compact_mlv.recycle();
-    multilinear_msgs.push((first_m1, first_mi));
-    challenger.observe_f128(first_m1);
-    challenger.observe_f128(first_mi);
-    mlv_rhos.push(challenger.sample_f128());
-
-    // Ping-pong scratch buffers for the remaining fused path: each fused round folds
+    // Ping-pong scratch buffers for the fused path: each fused round folds
     // (a_mlv, b_mlv) of size N into size N/2. Rather than allocating — and,
     // worse, `munmap`-ing, which is single-threaded and caps the tail's
     // parallel speedup — a fresh 64 MB buffer per round, we alternate between
@@ -444,8 +446,17 @@ fn prove_packed_padded_inner<C: Challenger>(
     } else {
         (Vec::new(), Vec::new())
     };
+    crate::gaptime::mark("zc: tail ping-pong buffers taken");
+    // Diagnostics kill switch: FLOCK_NO_TAIL_FUSION=1 routes every tail round
+    // through the unfused two-pass path (fold_in_place_pair, then a separate
+    // round_pair_naive read of the folded arrays) for one-process A/B runs.
+    // Transcript bytes are identical either way; the ranked worker's cleared
+    // environment never sets it.
+    let no_tail_fusion = std::env::var_os("FLOCK_NO_TAIL_FUSION").is_some();
+    let mut tail_round_ms: Vec<(usize, f64)> = Vec::new();
 
-    for i in 1..(n_mlv - 1) {
+    for i in 0..(n_mlv - 1) {
+        let t_round = std::time::Instant::now();
         let rho_prev = mlv_rhos[i];
         let log_n_before = a_mlv.len().trailing_zeros() as usize;
 
@@ -455,7 +466,7 @@ fn prove_packed_padded_inner<C: Challenger>(
         let mut r_next = vec![F128::ONE; log_n_before - 1];
         r_next[1..].copy_from_slice(&r[k_skip + i + 2..]);
 
-        let (m1, mi) = if log_n_before >= 15 {
+        let (m1, mi) = if log_n_before >= 10 && !no_tail_fusion {
             let half = a_mlv.len() / 2;
             let (m1, mi) = fold_and_compute_round_pair_into(
                 &a_mlv,
@@ -478,12 +489,15 @@ fn prove_packed_padded_inner<C: Challenger>(
             fold_in_place_pair(&mut a_mlv, &mut b_mlv, rho_prev);
             round_pair_naive(&a_mlv, &b_mlv, &r_next)
         };
-
+        if zc_timing {
+            tail_round_ms.push((log_n_before, t_round.elapsed().as_secs_f64() * 1e3));
+        }
         multilinear_msgs.push((m1, mi));
         challenger.observe_f128(m1);
         challenger.observe_f128(mi);
         mlv_rhos.push(challenger.sample_f128());
     }
+    crate::gaptime::mark("zc: tail rounds done");
 
     // ---- 8. Final binding at ρ_{n_mlv} (the last challenge) ----
     let rho_last = *mlv_rhos.last().expect("at least one ρ sampled");
@@ -514,7 +528,16 @@ fn prove_packed_padded_inner<C: Challenger>(
     crate::scratch::give_f128(b_mlv);
     crate::scratch::give_f128(a_nxt);
     crate::scratch::give_f128(b_nxt);
+    crate::gaptime::mark("zc: tail buffers recycled");
 
+    if zc_timing && !tail_round_ms.is_empty() {
+        let per_round: String = tail_round_ms
+            .iter()
+            .map(|(log_n, ms)| format!("n{log_n}:{ms:.2}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        eprintln!("[zc-timing] tail rounds (log_n:ms): {per_round}");
+    }
     if zc_timing {
         eprintln!(
             "[zc-timing] rounds 3+ tail: {:.2} ms",
@@ -768,6 +791,39 @@ mod tests {
             assert_eq!(claim.a_eval, proof.final_a_eval, "m={m}");
             assert_eq!(claim.b_eval, proof.final_b_eval, "m={m}");
             assert_eq!(claim.c_eval, proof.final_c_eval, "m={m}");
+        }
+    }
+    /// **Prove-level tail-fusion oracle**: the fused tail (fold r + message
+    /// r+1 in one pass, q-form NEON kernels) produces a proof and claim
+    /// byte-identical to the unfused two-pass path
+    /// (`FLOCK_NO_TAIL_FUSION=1`: `fold_in_place_pair` then a separate
+    /// `round_pair_naive` sweep every round). m ≥ 17 so several rounds run
+    /// through the fused parallel kernel (log_n ≥ 10).
+    #[test]
+    fn prove_fused_tail_matches_unfused_two_pass() {
+        for &m in &[17usize, 18] {
+            let mut rng = Rng::new(4200 + m as u64);
+            let a = rng.bits(1 << m);
+            let b = rng.bits(1 << m);
+            let c: Vec<bool> = a.iter().zip(&b).map(|(x, y)| *x & *y).collect();
+            let (a_p, b_p, c_p) = pack_abc(&a, &b, &c);
+
+            let mut ch_fused = FsChallenger::new(b"flock-test-v0");
+            let (proof_fused, claim_fused) =
+                prove_packed(&a_p, &b_p, &c_p, m, &mut ch_fused);
+
+            // SAFETY: test-only env toggle; the flag selects between
+            // value-identical code paths, so even a concurrently running
+            // prove observes no behavioral difference.
+            unsafe { std::env::set_var("FLOCK_NO_TAIL_FUSION", "1") };
+            let mut ch_unfused = FsChallenger::new(b"flock-test-v0");
+            let (proof_unfused, claim_unfused) =
+                prove_packed(&a_p, &b_p, &c_p, m, &mut ch_unfused);
+            // SAFETY: as above.
+            unsafe { std::env::remove_var("FLOCK_NO_TAIL_FUSION") };
+
+            assert_eq!(proof_fused, proof_unfused, "proof bytes diverge at m={m}");
+            assert_eq!(claim_fused, claim_unfused, "claim diverges at m={m}");
         }
     }
 

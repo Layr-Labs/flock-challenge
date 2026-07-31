@@ -130,6 +130,62 @@ pub(super) fn shift_reduce_inner_ab(
     );
 }
 
+/// Paired-window variant: computes windows `b_med` and `b_med + 1` in one
+/// call. On aarch64 this takes the interleaved two-window NEON wavefront
+/// (`shift_reduce_inner_ab_fused_neon_x2`); everywhere else it decays to two
+/// sequential single-window calls. Bit-identical to two calls of
+/// [`shift_reduce_inner_ab`] on every path.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn shift_reduce_inner_ab_x2(
+    a_packed: &[u8],
+    b_packed: &[u8],
+    inv_table: &InvNttTableByteSingleGf8,
+    chunk_byte_base: usize,
+    b_med: usize,
+    out0: &mut [u8; 64],
+    out1: &mut [u8; 64],
+    a_col: &mut [F8],
+    b_col: &mut [F8],
+) {
+    #[cfg(target_arch = "aarch64")]
+    {
+        let _ = (a_col, b_col);
+        aarch64::shift_reduce_inner_ab_fused_neon_x2(
+            a_packed,
+            b_packed,
+            inv_table,
+            chunk_byte_base,
+            b_med,
+            out0,
+            out1,
+        );
+    }
+
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        shift_reduce_inner_ab(
+            a_packed,
+            b_packed,
+            inv_table,
+            chunk_byte_base,
+            b_med,
+            out0,
+            a_col,
+            b_col,
+        );
+        shift_reduce_inner_ab(
+            a_packed,
+            b_packed,
+            inv_table,
+            chunk_byte_base,
+            b_med + 1,
+            out1,
+            a_col,
+            b_col,
+        );
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 #[inline]
 pub(super) fn accumulate_convert(
@@ -175,7 +231,6 @@ pub(super) fn accumulate_convert_with_s_hat_v(
     chunk_c_bytes: &[[u8; 64]; 16],
     n_b_med: usize,
     convert: &[super::F128],
-    paired_c: &(Vec<super::F128>, Vec<super::F128>),
     eq_lo_val: super::F128,
     partial_ab: &mut [super::F128; 64],
     partial_c_0: &mut [super::F128; 64],
@@ -190,8 +245,6 @@ pub(super) fn accumulate_convert_with_s_hat_v(
             chunk_c_bytes,
             n_b_med,
             convert,
-            &paired_c.0,
-            &paired_c.1,
             eq_lo_val,
             partial_ab,
             partial_c_0,
@@ -207,7 +260,6 @@ pub(super) fn accumulate_convert_with_s_hat_v(
     // SAFETY: the cfg gate guarantees the SIMD features and the fixed arrays
     // cover every four-lane load/store.
     unsafe {
-        let _ = paired_c;
         x86_64::accumulate_convert_with_s_hat_v_x86_avx512(
             chunk_ab_bytes,
             chunk_c_bytes,
@@ -220,17 +272,6 @@ pub(super) fn accumulate_convert_with_s_hat_v(
         );
     }
 
-    #[cfg(not(any(
-        target_arch = "aarch64",
-        all(
-            target_arch = "x86_64",
-            target_feature = "avx512f",
-            target_feature = "vpclmulqdq"
-        )
-    )))]
-    {
-        let _ = paired_c;
-    }
     #[cfg(not(any(
         target_arch = "aarch64",
         all(

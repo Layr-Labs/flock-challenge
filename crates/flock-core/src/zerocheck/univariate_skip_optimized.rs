@@ -30,7 +30,7 @@
 //!
 //! This variant is hardcoded for `k_skip = 6` (ell=64, n_chunks=8, N_INNER=7).
 
-use std::sync::{LazyLock, OnceLock};
+use std::sync::OnceLock;
 
 use crate::field::{F8, F128, PHI_8_TABLE, mul_by_x, phi8};
 use crate::ntt::InvNttTableByteSingleGf8;
@@ -42,7 +42,8 @@ mod kernels;
 
 #[cfg(all(test, target_arch = "aarch64"))]
 use kernels::aarch64::{
-    bit_transpose_64bytes_neon, shift_reduce_inner_ab_fused_neon, shift_reduce_inner_ab_neon,
+    bit_transpose_64bytes_neon, shift_reduce_inner_ab_fused_neon,
+    shift_reduce_inner_ab_fused_neon_x2, shift_reduce_inner_ab_neon,
 };
 #[cfg(all(test, target_arch = "aarch64"))]
 use kernels::bit_transpose_64bytes_scalar;
@@ -74,7 +75,7 @@ pub const K_SKIP: usize = 6;
 const ELL: usize = 64;
 const N_CHUNKS: usize = 8;
 /// Total inner-most dims absorbed by the optimization: 3 small + 4 medium.
-const N_INNER: usize = 7;
+pub(crate) const N_INNER: usize = 7;
 const N_MEDIUM: usize = 4;
 
 /// The three small-eq challenges (as F_8 values, then embedded via φ_8).
@@ -188,7 +189,7 @@ fn compute_d_inv() -> F128 {
 }
 
 static D_INV_CACHE: OnceLock<F128> = OnceLock::new();
-fn d_inv() -> F128 {
+pub(crate) fn d_inv() -> F128 {
     *D_INV_CACHE.get_or_init(compute_d_inv)
 }
 
@@ -217,52 +218,9 @@ fn build_convert_table() -> Vec<F128> {
     table
 }
 
-fn convert_table() -> &'static [F128] {
+pub(crate) fn convert_table() -> &'static [F128] {
     CONVERT_TABLE_CACHE.get_or_init(build_convert_table)
 }
-
-// ---------------------------------------------------------------------------
-// Paired c-bank convert tables (aarch64 gather-halving).
-//
-// The two C banks select `c & 0x55` and `c & 0xaa`, so each carries only 4
-// live index bits while spending a full 256-row lookup. Two adjacent `b_med`
-// can therefore share ONE lookup per bank if their 4-bit fields are placed in
-// disjoint bit positions — a shift, not a bit-gather.
-//
-// For pair `p` covering `b_med = 2p, 2p+1`:
-//     i0 = (c_2p & 0x55) | ((c_2p1 << 1) & 0xaa)
-//     i1 = (c_2p & 0xaa) | ((c_2p1 >> 1) & 0x55)
-//     M0_p[x] = T_2p[x & 0x55] ^ T_2p1[(x & 0xaa) >> 1]
-//     M1_p[y] = T_2p[y & 0xaa] ^ T_2p1[(y & 0x55) << 1]
-// so `M0_p[i0] == T_2p[c_2p & 0x55] ^ T_2p1[c_2p1 & 0x55]`, exactly the two
-// bank-0 terms the per-`b_med` loop would XOR, and likewise for bank 1. The
-// masks recover each operand because the second term of `i0` sets only odd
-// bits and the first only even ones.
-//
-// Correctness rests on `convert` being F2-linear in its index bits,
-// `T_b[u ^ v] == T_b[u] ^ T_b[v]`, which holds because φ_8 is an F2-linear
-// embedding and scaling by the constant γ^b is F2-linear. Verified
-// exhaustively by `convert_table_index_linear` over all 16·256·256 triples.
-//
-// 8 pairs × 2 banks × 256 × 16 B = 64 KiB, on top of the 64 KiB base table.
-// ---------------------------------------------------------------------------
-
-const PAIRED_C_TABLE_SIZE: usize = 8 * 256;
-
-/// `(bank0, bank1)` paired tables, indexed `p * 256 + i`.
-static PAIRED_C_TABLES: LazyLock<(Vec<F128>, Vec<F128>)> = LazyLock::new(|| {
-    let base = convert_table();
-    let mut m0 = vec![F128::ZERO; PAIRED_C_TABLE_SIZE];
-    let mut m1 = vec![F128::ZERO; PAIRED_C_TABLE_SIZE];
-    for p in 0..8 {
-        let (even, odd) = (2 * p * 256, (2 * p + 1) * 256);
-        for x in 0..256 {
-            m0[p * 256 + x] = base[even + (x & 0x55)] + base[odd + ((x & 0xaa) >> 1)];
-            m1[p * 256 + x] = base[even + (x & 0xaa)] + base[odd + ((x & 0x55) << 1)];
-        }
-    }
-    (m0, m1)
-});
 
 #[inline]
 pub fn bit_transpose_64bytes(input: &[u8; 64], output: &mut [u8; 64]) {
@@ -273,11 +231,17 @@ pub fn bit_transpose_64bytes(input: &[u8; 64], output: &mut [u8; 64]) {
 ///
 /// The storage has exactly the same byte length and block layout as either
 /// packed input: every `(x_outer, b_med)` consumes one 64-byte A block and one
-/// 64-byte B block and produces one 64-byte transformed block. Keeping this
+/// 64-byte B block and produces one 64-byte transformed block.  Keeping this
 /// in a separate scratch allocation is intentional: round 2 still needs the
 /// original A and B tables after the round-1 transcript challenge is sampled.
 pub struct Round1AbInner {
     storage: Vec<F128>,
+    /// Bytes at the start of `storage` that were NEVER written by the
+    /// producer because round 1's GPU URM share was planned to cover those
+    /// x_hi windows from the raw a/b buffers (see
+    /// [`planned_round1_gpu_prefix_bytes`]). Always a multiple of the
+    /// per-x_hi window byte count; 0 means fully valid.
+    invalid_prefix_bytes: usize,
 }
 
 impl Round1AbInner {
@@ -291,15 +255,79 @@ impl Round1AbInner {
         }
     }
 
+    /// Take scratch-backed storage that the caller will fill completely.
+    pub fn take_uninit(total_bytes: usize) -> Self {
+        assert_eq!(total_bytes % core::mem::size_of::<F128>(), 0);
+        Self {
+            storage: crate::scratch::take_f128(total_bytes / core::mem::size_of::<F128>()),
+            invalid_prefix_bytes: 0,
+        }
+    }
+
+    /// Declare the leading `bytes` of the storage unwritten (the producer
+    /// skipped them because round 1's GPU share covers those x_hi windows
+    /// from raw a/b). Round 1 recomputes them on CPU if the GPU share
+    /// doesn't materialize.
+    pub fn set_invalid_prefix_bytes(&mut self, bytes: usize) {
+        assert!(bytes <= self.len_bytes());
+        self.invalid_prefix_bytes = bytes;
+    }
+
+    /// See [`Self::set_invalid_prefix_bytes`].
+    pub fn invalid_prefix_bytes(&self) -> usize {
+        self.invalid_prefix_bytes
+    }
+
+    /// Recompute the invalid prefix from the raw packed a/b buffers (dense
+    /// windows, byte-identical to the streaming producer's
+    /// [`precompute_round1_ab_inner_windows`]), then mark the storage fully
+    /// valid. CPU fallback for when the planned GPU share fails.
+    fn fill_invalid_prefix(
+        &mut self,
+        a_packed: &[u8],
+        b_packed: &[u8],
+        inv_table: &InvNttTableByteSingleGf8,
+    ) {
+        let n = self.invalid_prefix_bytes;
+        if n == 0 {
+            return;
+        }
+        use rayon::prelude::*;
+        const OUTER_BYTES: usize = (1 << N_MEDIUM) * 64;
+        assert_eq!(n % OUTER_BYTES, 0);
+        let out = &mut self.as_bytes_mut()[..n];
+        out.par_chunks_mut(OUTER_BYTES).enumerate().for_each_init(
+            || ([F8::ZERO; ELL], [F8::ZERO; ELL]),
+            |(a_col, b_col), (x_outer, out_outer)| {
+                shift_reduce_windows_into_blocks(
+                    a_packed,
+                    b_packed,
+                    inv_table,
+                    x_outer * OUTER_BYTES,
+                    1 << N_MEDIUM,
+                    out_outer,
+                    a_col,
+                    b_col,
+                );
+            },
+        );
+        self.invalid_prefix_bytes = 0;
+    }
+
+    /// Mutable byte view for a challenge-independent witness generator. Every
+    /// byte must be overwritten before the transform is consumed.
+    pub fn as_bytes_mut(&mut self) -> &mut [u8] {
+        unsafe {
+            core::slice::from_raw_parts_mut(
+                self.storage.as_mut_ptr() as *mut u8,
+                self.storage.len() * core::mem::size_of::<F128>(),
+            )
+        }
+    }
+
     /// Resident scratch bytes retained until the challenge-weighted finish.
     pub fn len_bytes(&self) -> usize {
         self.storage.len() * core::mem::size_of::<F128>()
-    }
-
-    /// Donate the now-dead transform to a byte-oriented scratch consumer
-    /// without changing the allocation's element type or deallocation layout.
-    pub(crate) fn into_scratch_bytes(mut self) -> crate::scratch::ScratchBytes {
-        crate::scratch::ScratchBytes::from_initialized_f128(core::mem::take(&mut self.storage))
     }
 }
 
@@ -310,7 +338,7 @@ impl Drop for Round1AbInner {
 }
 
 /// Precompute the challenge-independent inverse-NTT/product/shift-reduce AB
-/// transform. The result can be produced before the commitment root is
+/// transform.  The result can be produced before the commitment root is
 /// available and consumed later by
 /// [`round1_shift_reduce_extract_c_packed_padded_with_precomputed_ab`].
 pub fn precompute_round1_ab_inner_packed_padded(
@@ -356,26 +384,24 @@ pub fn precompute_round1_ab_inner_packed_padded(
                 let n_b_med = b_med_counts[within_hash_outer] as usize;
                 let chunk_byte_base = x_outer * OUTER_BYTES;
 
-                for b_med in 0..n_b_med {
-                    let dst: &mut [u8; 64] = (&mut out_outer[b_med * 64..(b_med + 1) * 64])
-                        .try_into()
-                        .expect("one transformed b_med block");
-                    shift_reduce_inner_ab(
-                        a_packed,
-                        b_packed,
-                        inv_table,
-                        chunk_byte_base,
-                        b_med,
-                        dst,
-                        a_col,
-                        b_col,
-                    );
-                }
+                shift_reduce_windows_into_blocks(
+                    a_packed,
+                    b_packed,
+                    inv_table,
+                    chunk_byte_base,
+                    n_b_med,
+                    out_outer,
+                    a_col,
+                    b_col,
+                );
                 out_outer[n_b_med * 64..].fill(0);
             },
         );
 
-    Round1AbInner { storage }
+    Round1AbInner {
+        storage,
+        invalid_prefix_bytes: 0,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -410,6 +436,181 @@ fn shift_reduce_inner_ab(
         a_col,
         b_col,
     );
+}
+
+/// Run `shift_reduce_inner_ab` + C-side `bit_transpose_64bytes` for the
+/// `n_b_med` medium windows of one `x_outer`, routing b_med window PAIRS
+/// `(w, w + 1)` through the two-window wavefront kernel
+/// ([`kernels::shift_reduce_inner_ab_x2`]) and the odd tail window (n_b_med
+/// is 16 or 15 at the ranked shape: 15 = 7 pairs + 1 single) through the
+/// single-window path. Every output byte lands in the same
+/// `chunk_ab_bytes[b_med]` / `chunk_c_bytes[b_med]` slot as the previous
+/// one-window-per-call loop, bit for bit.
+#[inline]
+#[allow(clippy::too_many_arguments)]
+fn shift_reduce_transpose_windows(
+    a_packed: &[u8],
+    b_packed: &[u8],
+    c_packed: &[u8],
+    inv_table: &InvNttTableByteSingleGf8,
+    chunk_byte_base: usize,
+    n_b_med: usize,
+    chunk_ab_bytes: &mut [[u8; 64]; 1 << N_MEDIUM],
+    chunk_c_bytes: &mut [[u8; 64]; 1 << N_MEDIUM],
+    a_col: &mut [F8],
+    b_col: &mut [F8],
+) {
+    let mut b_med = 0;
+    while b_med + 1 < n_b_med {
+        let (lo, hi) = chunk_ab_bytes.split_at_mut(b_med + 1);
+        kernels::shift_reduce_inner_ab_x2(
+            a_packed,
+            b_packed,
+            inv_table,
+            chunk_byte_base,
+            b_med,
+            &mut lo[b_med],
+            &mut hi[0],
+            a_col,
+            b_col,
+        );
+        for w in b_med..b_med + 2 {
+            let byte_base_b = chunk_byte_base + w * N_CHUNKS * 8;
+            let c_in: &[u8; 64] = (&c_packed[byte_base_b..byte_base_b + 64])
+                .try_into()
+                .expect("64 c-bytes per medium position");
+            bit_transpose_64bytes(c_in, &mut chunk_c_bytes[w]);
+        }
+        b_med += 2;
+    }
+    if b_med < n_b_med {
+        shift_reduce_inner_ab(
+            a_packed,
+            b_packed,
+            inv_table,
+            chunk_byte_base,
+            b_med,
+            &mut chunk_ab_bytes[b_med],
+            a_col,
+            b_col,
+        );
+        let byte_base_b = chunk_byte_base + b_med * N_CHUNKS * 8;
+        let c_in: &[u8; 64] = (&c_packed[byte_base_b..byte_base_b + 64])
+            .try_into()
+            .expect("64 c-bytes per medium position");
+        bit_transpose_64bytes(c_in, &mut chunk_c_bytes[b_med]);
+    }
+}
+
+/// AB-only pair-loop twin of [`shift_reduce_transpose_windows`] for the
+/// precompute paths, where the transformed blocks land in `n_b_med`
+/// contiguous 64-byte slots of `out_outer` instead of `chunk_ab_bytes` (and
+/// C is handled later, at eq-fold time). Window pairs go through
+/// [`kernels::shift_reduce_inner_ab_x2`], the odd tail through the
+/// single-window kernel — byte-identical to the sequential loop.
+#[inline]
+#[allow(clippy::too_many_arguments)]
+fn shift_reduce_windows_into_blocks(
+    a_packed: &[u8],
+    b_packed: &[u8],
+    inv_table: &InvNttTableByteSingleGf8,
+    chunk_byte_base: usize,
+    n_b_med: usize,
+    out_outer: &mut [u8],
+    a_col: &mut [F8],
+    b_col: &mut [F8],
+) {
+    let mut b_med = 0;
+    while b_med + 1 < n_b_med {
+        let (blk0, rest) = out_outer[b_med * 64..].split_at_mut(64);
+        let out0: &mut [u8; 64] = blk0.try_into().expect("one transformed b_med block");
+        let out1: &mut [u8; 64] = (&mut rest[..64])
+            .try_into()
+            .expect("one transformed b_med block");
+        kernels::shift_reduce_inner_ab_x2(
+            a_packed,
+            b_packed,
+            inv_table,
+            chunk_byte_base,
+            b_med,
+            out0,
+            out1,
+            a_col,
+            b_col,
+        );
+        b_med += 2;
+    }
+    if b_med < n_b_med {
+        let dst: &mut [u8; 64] = (&mut out_outer[b_med * 64..(b_med + 1) * 64])
+            .try_into()
+            .expect("one transformed b_med block");
+        shift_reduce_inner_ab(
+            a_packed,
+            b_packed,
+            inv_table,
+            chunk_byte_base,
+            b_med,
+            dst,
+            a_col,
+            b_col,
+        );
+    }
+}
+
+/// Transform complete 8192-bit outer windows from packed A/B into the
+/// challenge-independent round-one representation. This streaming seam lets
+/// witness generation consume each just-written block while it is still hot.
+pub fn precompute_round1_ab_inner_windows(
+    a_packed: &[u8],
+    b_packed: &[u8],
+    out: &mut [u8],
+    inv_table: &InvNttTableByteSingleGf8,
+) {
+    const OUTER_BYTES: usize = (1 << N_MEDIUM) * 64;
+    assert_eq!(a_packed.len(), b_packed.len());
+    assert_eq!(a_packed.len(), out.len());
+    assert_eq!(a_packed.len() % OUTER_BYTES, 0);
+    assert_eq!(inv_table.k, K_SKIP);
+
+    let mut a_col = [F8::ZERO; ELL];
+    let mut b_col = [F8::ZERO; ELL];
+    for outer in 0..a_packed.len() / OUTER_BYTES {
+        let base = outer * OUTER_BYTES;
+        shift_reduce_windows_into_blocks(
+            a_packed,
+            b_packed,
+            inv_table,
+            base,
+            1 << N_MEDIUM,
+            &mut out[base..base + OUTER_BYTES],
+            &mut a_col,
+            &mut b_col,
+        );
+    }
+}
+
+/// Bytes of the leading ab_inner prefix that a challenge-independent witness
+/// producer may SKIP because round 1's GPU URM share is planned to cover
+/// those x_hi windows from the raw a/b buffers (the CPU fold never reads the
+/// precomputed transform there). Returns 0 whenever the GPU share cannot
+/// engage (no Metal, small m, kill switches), so skipping is always safe:
+/// the producer marks the prefix via
+/// [`Round1AbInner::set_invalid_prefix_bytes`], and round 1 recomputes it on
+/// CPU if the GPU share fails to materialize.
+///
+/// `FLOCK_NO_AB_INNER_SKIP=1` force-disables the skip (diagnostics).
+pub fn planned_round1_gpu_prefix_bytes(m: usize) -> usize {
+    if m < K_SKIP + N_INNER || std::env::var_os("FLOCK_NO_AB_INNER_SKIP").is_some() {
+        return 0;
+    }
+    let n_outer = m - K_SKIP - N_INNER;
+    let n_hi = n_outer.min(SplitEqGhash::MAX_N_HI);
+    // planned_g only engages at hi_size = 128; anything else → no skip.
+    if (1usize << n_hi) != 128 {
+        return 0;
+    }
+    let g = crate::gpu::urm::planned_g(1 << n_hi, m);
+    g * (((1usize << m) / 8) >> n_hi)
 }
 
 // ---------------------------------------------------------------------------
@@ -528,23 +729,18 @@ fn process_one_x_hi(
         // unrolls. The slow path handles the rare boundary window where
         // n_b_med < 16.
         if n_b_med == (1 << N_MEDIUM) {
-            for b_med in 0..(1 << N_MEDIUM) {
-                shift_reduce_inner_ab(
-                    a_packed,
-                    b_packed,
-                    inv_table,
-                    chunk_byte_base,
-                    b_med,
-                    &mut state.chunk_ab_bytes[b_med],
-                    &mut state.a_col,
-                    &mut state.b_col,
-                );
-                let byte_base_b = chunk_byte_base + b_med * N_CHUNKS * 8;
-                let c_in: &[u8; 64] = (&c_packed[byte_base_b..byte_base_b + 64])
-                    .try_into()
-                    .expect("64 c-bytes per medium position");
-                bit_transpose_64bytes(c_in, &mut state.chunk_c_bytes[b_med]);
-            }
+            shift_reduce_transpose_windows(
+                a_packed,
+                b_packed,
+                c_packed,
+                inv_table,
+                chunk_byte_base,
+                1 << N_MEDIUM,
+                &mut state.chunk_ab_bytes,
+                &mut state.chunk_c_bytes,
+                &mut state.a_col,
+                &mut state.b_col,
+            );
 
             kernels::accumulate_convert(
                 &state.chunk_ab_bytes,
@@ -560,23 +756,18 @@ fn process_one_x_hi(
             // within_hash_outer value per [`PaddingSpec`] lands here (the
             // window straddling the useful/padding boundary), so the tighter
             // loop wins despite losing the SIMD chain unroll.
-            for b_med in 0..n_b_med {
-                shift_reduce_inner_ab(
-                    a_packed,
-                    b_packed,
-                    inv_table,
-                    chunk_byte_base,
-                    b_med,
-                    &mut state.chunk_ab_bytes[b_med],
-                    &mut state.a_col,
-                    &mut state.b_col,
-                );
-                let byte_base_b = chunk_byte_base + b_med * N_CHUNKS * 8;
-                let c_in: &[u8; 64] = (&c_packed[byte_base_b..byte_base_b + 64])
-                    .try_into()
-                    .expect("64 c-bytes per medium position");
-                bit_transpose_64bytes(c_in, &mut state.chunk_c_bytes[b_med]);
-            }
+            shift_reduce_transpose_windows(
+                a_packed,
+                b_packed,
+                c_packed,
+                inv_table,
+                chunk_byte_base,
+                n_b_med,
+                &mut state.chunk_ab_bytes,
+                &mut state.chunk_c_bytes,
+                &mut state.a_col,
+                &mut state.b_col,
+            );
 
             kernels::accumulate_convert(
                 &state.chunk_ab_bytes,
@@ -616,7 +807,7 @@ fn process_one_x_hi(
 /// Per-worker scratch + local accumulator for the two-bank C variant.
 /// Identical to [`WorkerState`] except `partial_c` and `local_res_c_s` are
 /// split into bank 0 / bank 1.
-struct WorkerStateWithSHatV {
+pub(crate) struct WorkerStateWithSHatV {
     partial_ab: [F128; ELL],
     partial_c_0: [F128; ELL],
     partial_c_1: [F128; ELL],
@@ -624,13 +815,13 @@ struct WorkerStateWithSHatV {
     chunk_c_bytes: [[u8; 64]; 1 << N_MEDIUM],
     a_col: [F8; ELL],
     b_col: [F8; ELL],
-    local_res_ab: [F128; ELL],
-    local_res_c_s_0: [F128; ELL],
-    local_res_c_s_1: [F128; ELL],
+    pub(crate) local_res_ab: [F128; ELL],
+    pub(crate) local_res_c_s_0: [F128; ELL],
+    pub(crate) local_res_c_s_1: [F128; ELL],
 }
 
 impl WorkerStateWithSHatV {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             partial_ab: [F128::ZERO; ELL],
             partial_c_0: [F128::ZERO; ELL],
@@ -651,7 +842,7 @@ impl WorkerStateWithSHatV {
 /// `cf_c_0` and `cf_c_1` via masked convert-table lookups.
 #[inline]
 #[allow(clippy::too_many_arguments)]
-fn process_one_x_hi_with_s_hat_v(
+pub(crate) fn process_one_x_hi_with_s_hat_v(
     x_hi: usize,
     big_lo_size: usize,
     n_lo_and_inner: usize,
@@ -664,7 +855,6 @@ fn process_one_x_hi_with_s_hat_v(
     eq_lo_scaled: &[F128],
     eq_hi_val: F128,
     convert: &[F128],
-    paired_c: &(Vec<F128>, Vec<F128>),
     state: &mut WorkerStateWithSHatV,
 ) {
     state.partial_ab.iter_mut().for_each(|p| *p = F128::ZERO);
@@ -685,60 +875,48 @@ fn process_one_x_hi_with_s_hat_v(
         let eq_lo_val = eq_lo_scaled[x_outer_lo];
 
         if n_b_med == (1 << N_MEDIUM) {
-            for b_med in 0..(1 << N_MEDIUM) {
-                shift_reduce_inner_ab(
-                    a_packed,
-                    b_packed,
-                    inv_table,
-                    chunk_byte_base,
-                    b_med,
-                    &mut state.chunk_ab_bytes[b_med],
-                    &mut state.a_col,
-                    &mut state.b_col,
-                );
-                let byte_base_b = chunk_byte_base + b_med * N_CHUNKS * 8;
-                let c_in: &[u8; 64] = (&c_packed[byte_base_b..byte_base_b + 64])
-                    .try_into()
-                    .expect("64 c-bytes per medium position");
-                bit_transpose_64bytes(c_in, &mut state.chunk_c_bytes[b_med]);
-            }
+            shift_reduce_transpose_windows(
+                a_packed,
+                b_packed,
+                c_packed,
+                inv_table,
+                chunk_byte_base,
+                1 << N_MEDIUM,
+                &mut state.chunk_ab_bytes,
+                &mut state.chunk_c_bytes,
+                &mut state.a_col,
+                &mut state.b_col,
+            );
 
             kernels::accumulate_convert_with_s_hat_v(
                 &state.chunk_ab_bytes,
                 &state.chunk_c_bytes,
                 1 << N_MEDIUM,
                 convert,
-                paired_c,
                 eq_lo_val,
                 &mut state.partial_ab,
                 &mut state.partial_c_0,
                 &mut state.partial_c_1,
             );
         } else {
-            for b_med in 0..n_b_med {
-                shift_reduce_inner_ab(
-                    a_packed,
-                    b_packed,
-                    inv_table,
-                    chunk_byte_base,
-                    b_med,
-                    &mut state.chunk_ab_bytes[b_med],
-                    &mut state.a_col,
-                    &mut state.b_col,
-                );
-                let byte_base_b = chunk_byte_base + b_med * N_CHUNKS * 8;
-                let c_in: &[u8; 64] = (&c_packed[byte_base_b..byte_base_b + 64])
-                    .try_into()
-                    .expect("64 c-bytes per medium position");
-                bit_transpose_64bytes(c_in, &mut state.chunk_c_bytes[b_med]);
-            }
+            shift_reduce_transpose_windows(
+                a_packed,
+                b_packed,
+                c_packed,
+                inv_table,
+                chunk_byte_base,
+                n_b_med,
+                &mut state.chunk_ab_bytes,
+                &mut state.chunk_c_bytes,
+                &mut state.a_col,
+                &mut state.b_col,
+            );
 
             kernels::accumulate_convert_with_s_hat_v(
                 &state.chunk_ab_bytes,
                 &state.chunk_c_bytes,
                 n_b_med,
                 convert,
-                paired_c,
                 eq_lo_val,
                 &mut state.partial_ab,
                 &mut state.partial_c_0,
@@ -756,7 +934,7 @@ fn process_one_x_hi_with_s_hat_v(
 }
 
 /// Challenge-weighted half of [`process_one_x_hi_with_s_hat_v`] when the AB
-/// shift-reduce blocks were produced earlier. C remains live and is handled
+/// shift-reduce blocks were produced earlier.  C remains live and is handled
 /// exactly as in the fused path so wire output and `s_hat_v_c` stay identical.
 #[inline]
 #[allow(clippy::too_many_arguments)]
@@ -771,7 +949,6 @@ fn process_one_x_hi_with_precomputed_ab(
     eq_lo_scaled: &[F128],
     eq_hi_val: F128,
     convert: &[F128],
-    paired_c: &(Vec<F128>, Vec<F128>),
     state: &mut WorkerStateWithSHatV,
 ) {
     state.partial_ab.iter_mut().for_each(|p| *p = F128::ZERO);
@@ -805,7 +982,6 @@ fn process_one_x_hi_with_precomputed_ab(
             &state.chunk_c_bytes,
             n_b_med,
             convert,
-            paired_c,
             eq_lo_val,
             &mut state.partial_ab,
             &mut state.partial_c_0,
@@ -829,7 +1005,7 @@ fn process_one_x_hi_with_precomputed_ab(
 ///   - `b_med_counts[w]` is how many of the 16 b_med 512-bit sub-windows of
 ///     window `w` we should process. Entries past the useful prefix are 0
 ///     (full skip) — kernels just `continue` past those x_outer_lo iterations.
-fn build_b_med_counts(padding: &PaddingSpec) -> (usize, Vec<u8>) {
+pub(crate) fn build_b_med_counts(padding: &PaddingSpec) -> (usize, Vec<u8>) {
     const STRIDE: usize = 1 << (K_SKIP + N_INNER); // 8192 bits per within-window
     const B_MED_WINDOW: usize = 1 << (K_SKIP + 3); // 512 bits per b_med
     const N_B_MED_MAX: usize = 1 << N_MEDIUM;
@@ -993,6 +1169,32 @@ pub fn round1_shift_reduce_extract_c_packed_padded_with_s_hat_v(
     inv_table: &InvNttTableByteSingleGf8,
     padding: &PaddingSpec,
 ) -> (Vec<F128>, Vec<F128>, Vec<F128>) {
+    round1_with_s_hat_v_impl(
+        a_packed, b_packed, c_packed, m, k_skip, r, inv_table, padding, None,
+    )
+}
+
+/// [`round1_shift_reduce_extract_c_packed_padded_with_s_hat_v`] with an
+/// optional forced CPU/GPU split for tests (season-1 hook shape).
+/// `g_override = Some(0)` forces pure CPU; `Some(g)` forces the GPU to take
+/// `x_hi ∈ [0, g)` (falling back to CPU if Metal is unavailable); `None` is
+/// the production auto split (Metal availability + calibration, see
+/// [`crate::gpu::urm`]).
+///
+/// The CPU/GPU merge is a per-lane F128 XOR of eq_hi-folded partials —
+/// bit-identical to the pure-CPU rayon reduction for any split point.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn round1_with_s_hat_v_impl(
+    a_packed: &[u8],
+    b_packed: &[u8],
+    c_packed: &[u8],
+    m: usize,
+    k_skip: usize,
+    r: &[F128],
+    inv_table: &InvNttTableByteSingleGf8,
+    padding: &PaddingSpec,
+    g_override: Option<usize>,
+) -> (Vec<F128>, Vec<F128>, Vec<F128>) {
     use rayon::prelude::*;
 
     assert_eq!(k_skip, K_SKIP, "optimized variant is k_skip=6 only");
@@ -1016,45 +1218,132 @@ pub fn round1_shift_reduce_extract_c_packed_padded_with_s_hat_v(
     let d_inv_val = d_inv();
     let eq_lo_scaled: Vec<F128> = eq.lo.iter().map(|v| *v * d_inv_val).collect();
     let convert = convert_table();
-    let paired_c = &*PAIRED_C_TABLES;
     let eq_hi = &eq.hi;
 
     let (within_outer_mask, b_med_counts) = build_b_med_counts(padding);
 
-    let (res_ab, res_c_s_0, res_c_s_1) = (0..hi_size)
-        .into_par_iter()
-        .fold(WorkerStateWithSHatV::new, |mut state, x_hi| {
-            let eq_hi_val = eq_hi[x_hi];
-            process_one_x_hi_with_s_hat_v(
-                x_hi,
-                big_lo_size,
-                n_lo_and_inner,
-                within_outer_mask,
-                &b_med_counts,
-                a_packed,
-                b_packed,
-                c_packed,
-                inv_table,
-                &eq_lo_scaled,
-                eq_hi_val,
-                convert,
-                paired_c,
-                &mut state,
-            );
-            state
+    // Rayon fold/reduce over an arbitrary x_hi range (the CPU share, and the
+    // recovery path when the GPU share fails mid-flight).
+    let cpu_fold = |range: core::ops::Range<usize>| {
+        range
+            .into_par_iter()
+            .fold(WorkerStateWithSHatV::new, |mut state, x_hi| {
+                let eq_hi_val = eq_hi[x_hi];
+                process_one_x_hi_with_s_hat_v(
+                    x_hi,
+                    big_lo_size,
+                    n_lo_and_inner,
+                    within_outer_mask,
+                    &b_med_counts,
+                    a_packed,
+                    b_packed,
+                    c_packed,
+                    inv_table,
+                    &eq_lo_scaled,
+                    eq_hi_val,
+                    convert,
+                    &mut state,
+                );
+                state
+            })
+            .map(|s| (s.local_res_ab, s.local_res_c_s_0, s.local_res_c_s_1))
+            .reduce(
+                || ([F128::ZERO; ELL], [F128::ZERO; ELL], [F128::ZERO; ELL]),
+                |(mut ab1, mut c0_1, mut c1_1), (ab2, c0_2, c1_2)| {
+                    for i in 0..ELL {
+                        ab1[i] += ab2[i];
+                        c0_1[i] += c0_2[i];
+                        c1_1[i] += c1_2[i];
+                    }
+                    (ab1, c0_1, c1_1)
+                },
+            )
+    };
+
+    // Kick off the GPU share (x_hi ∈ [0, g)) before the CPU rayon section so
+    // the two run concurrently. Any start failure degrades to g = 0. No clock
+    // keepalive to stop this season: the GPU Merkle stream during commit kept
+    // the clocks warm through the last ~100 ms (see pcs::commit).
+    let g_planned = match g_override {
+        Some(g) => g.min(hi_size),
+        None => crate::gpu::urm::planned_g(hi_size, m),
+    };
+    crate::gpu::gpu_dbg_trace(&format!(
+        "plan: m={m} hi_size={hi_size} g_planned={g_planned}"
+    ));
+    if std::env::var_os("FLOCK_GPU_TRACE").is_some() {
+        eprintln!("[gpu-urm] plan: m={m} hi_size={hi_size} g_planned={g_planned}");
+    }
+    let gpu_job = if g_planned > 0 {
+        crate::gpu::urm::start_share(crate::gpu::urm::ShareArgs {
+            a_packed,
+            b_packed,
+            c_packed,
+            inv_table,
+            eq_lo_scaled: &eq_lo_scaled,
+            eq_hi,
+            b_med_counts: &b_med_counts,
+            within_outer_mask,
+            n_lo: eq.n_lo,
+            n_lo_and_inner,
+            g: g_planned,
+            tile_x_outer_lo: None,
         })
-        .map(|s| (s.local_res_ab, s.local_res_c_s_0, s.local_res_c_s_1))
-        .reduce(
-            || ([F128::ZERO; ELL], [F128::ZERO; ELL], [F128::ZERO; ELL]),
-            |(mut ab1, mut c0_1, mut c1_1), (ab2, c0_2, c1_2)| {
-                for i in 0..ELL {
-                    ab1[i] += ab2[i];
-                    c0_1[i] += c0_2[i];
-                    c1_1[i] += c1_2[i];
+    } else {
+        None
+    };
+    let g = if gpu_job.is_some() { g_planned } else { 0 };
+
+    let cpu_start = std::time::Instant::now();
+    let (mut res_ab, mut res_c_s_0, mut res_c_s_1) = cpu_fold(g..hi_size);
+    let cpu_seconds = cpu_start.elapsed().as_secs_f64();
+
+    if let Some(job) = gpu_job {
+        let wait_start = std::time::Instant::now();
+        match job.finish() {
+            Some(share) => {
+                crate::gpu::gpu_dbg_trace(&format!(
+                    "prove: g={g} gpu_ts={:.2}ms cpu_share={:.2}ms wait={:.2}ms",
+                    share.gpu_seconds * 1e3,
+                    cpu_seconds * 1e3,
+                    wait_start.elapsed().as_secs_f64() * 1e3
+                ));
+                if std::env::var_os("FLOCK_GPU_TRACE").is_some() {
+                    eprintln!(
+                        "[gpu-urm] prove: g={g} gpu_ts={:.2}ms cpu_share={:.2}ms gpu_extra_wait={:.2}ms",
+                        share.gpu_seconds * 1e3,
+                        cpu_seconds * 1e3,
+                        wait_start.elapsed().as_secs_f64() * 1e3,
+                    );
                 }
-                (ab1, c0_1, c1_1)
-            },
-        );
+                for i in 0..ELL {
+                    res_ab[i] += share.res_ab[i];
+                    res_c_s_0[i] += share.res_c0[i];
+                    res_c_s_1[i] += share.res_c1[i];
+                }
+                if g_override.is_none() {
+                    crate::gpu::urm::note_calibration(
+                        g,
+                        hi_size - g,
+                        share.gpu_seconds,
+                        cpu_seconds,
+                        wait_start.elapsed().as_secs_f64(),
+                    );
+                }
+            }
+            None => {
+                crate::gpu::gpu_dbg_trace("prove: GPU job FAILED mid-flight; CPU recompute");
+                // GPU failed mid-flight (fallback already latched inside
+                // `finish`): recompute its share on the CPU.
+                let (ab, c0, c1) = cpu_fold(0..g);
+                for i in 0..ELL {
+                    res_ab[i] += ab[i];
+                    res_c_s_0[i] += c0[i];
+                    res_c_s_1[i] += c1[i];
+                }
+            }
+        }
+    }
 
     // Wire output: bank_0 + bank_1 reconstructs the original `res_c_s` (by
     // F_2-linearity of φ_8 over the masked-byte sum).
@@ -1079,11 +1368,19 @@ pub fn round1_shift_reduce_extract_c_packed_padded_with_s_hat_v(
 }
 
 /// Challenge-weighted completion of round 1 using AB blocks returned by
-/// [`precompute_round1_ab_inner_packed_padded`]. This is byte-identical to
+/// [`precompute_round1_ab_inner_packed_padded`].  This is byte-identical to
 /// [`round1_shift_reduce_extract_c_packed_padded_with_s_hat_v`], while keeping
 /// the original A and B packed buffers available for zerocheck round 2.
+///
+/// `a_packed`/`b_packed` are the SAME original buffers the AB blocks were
+/// precomputed from — the CPU share never touches them here, but the GPU
+/// share (x_hi ∈ [0, g)) recomputes its range from a/b/c directly with the
+/// season-1 URM kernel, which is bit-identical per x_hi to the precomputed
+/// path, so the XOR merge is exact for any split point.
 pub fn round1_shift_reduce_extract_c_packed_padded_with_precomputed_ab(
-    ab_inner: &Round1AbInner,
+    ab_inner: &mut Round1AbInner,
+    a_packed: &[u8],
+    b_packed: &[u8],
     c_packed: &[u8],
     m: usize,
     k_skip: usize,
@@ -1091,6 +1388,28 @@ pub fn round1_shift_reduce_extract_c_packed_padded_with_precomputed_ab(
     inv_table: &InvNttTableByteSingleGf8,
     padding: &PaddingSpec,
 ) -> (Vec<F128>, Vec<F128>, Vec<F128>) {
+    round1_with_precomputed_ab_impl(
+        ab_inner, a_packed, b_packed, c_packed, m, k_skip, r, inv_table, padding, None,
+    )
+}
+
+/// [`round1_shift_reduce_extract_c_packed_padded_with_precomputed_ab`] with
+/// the season-1 `g_override` test hook (see [`round1_with_s_hat_v_impl`]).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn round1_with_precomputed_ab_impl(
+    ab_inner: &mut Round1AbInner,
+    a_packed: &[u8],
+    b_packed: &[u8],
+    c_packed: &[u8],
+    m: usize,
+    k_skip: usize,
+    r: &[F128],
+    inv_table: &InvNttTableByteSingleGf8,
+    padding: &PaddingSpec,
+    g_override: Option<usize>,
+) -> (Vec<F128>, Vec<F128>, Vec<F128>) {
+    use rayon::prelude::*;
+
     assert_eq!(k_skip, K_SKIP, "optimized variant is k_skip=6 only");
     assert!(
         m >= k_skip + N_INNER,
@@ -1099,6 +1418,8 @@ pub fn round1_shift_reduce_extract_c_packed_padded_with_precomputed_ab(
     );
     let total_bytes = (1usize << m) / 8;
     assert_eq!(ab_inner.len_bytes(), total_bytes);
+    assert_eq!(a_packed.len(), total_bytes);
+    assert_eq!(b_packed.len(), total_bytes);
     assert_eq!(c_packed.len(), total_bytes);
     assert_eq!(r.len(), m);
     assert_eq!(inv_table.k, k_skip);
@@ -1111,58 +1432,147 @@ pub fn round1_shift_reduce_extract_c_packed_padded_with_precomputed_ab(
     let d_inv_val = d_inv();
     let eq_lo_scaled: Vec<F128> = eq.lo.iter().map(|v| *v * d_inv_val).collect();
     let convert = convert_table();
-    let paired_c = &*PAIRED_C_TABLES;
     let eq_hi = &eq.hi;
     let (within_outer_mask, b_med_counts) = build_b_med_counts(padding);
-    let ab_inner_bytes = ab_inner.as_bytes();
 
-    // The challenge-independent AB transform finishes while the commitment is
-    // still running. Its challenge-weighted completion is therefore a live
-    // prover phase, and each x_hi is independent. Drain those chunks through
-    // the shared P/E-core queue without changing the hot conversion kernel.
-    // A fixed per-index partial keeps the nondeterministic claim order out of
-    // the output; the final operation is XOR, so serial reduction is exact.
-    let mut partials: Vec<([F128; ELL], [F128; ELL], [F128; ELL])> =
-        vec![([F128::ZERO; ELL], [F128::ZERO; ELL], [F128::ZERO; ELL],); hi_size];
-    let partials_base = crate::epool::SyncPtr(partials.as_mut_ptr());
-    crate::epool::run_hetero_chunks(hi_size, |x_hi| {
-        let mut state = WorkerStateWithSHatV::new();
-        process_one_x_hi_with_precomputed_ab(
-            x_hi,
-            big_lo_size,
-            n_lo_and_inner,
-            within_outer_mask,
-            &b_med_counts,
-            ab_inner_bytes,
-            c_packed,
-            &eq_lo_scaled,
-            eq_hi[x_hi],
-            convert,
-            paired_c,
-            &mut state,
-        );
-        // SAFETY: the queue hands out each x_hi exactly once, so this task is
-        // the exclusive owner of partials[x_hi]. The queue's completion join
-        // publishes every write before the reduction below reads the vector.
-        unsafe {
-            *partials_base.ptr().add(x_hi) = (
-                state.local_res_ab,
-                state.local_res_c_s_0,
-                state.local_res_c_s_1,
-            );
-        }
-    });
-    let (res_ab, res_c_s_0, res_c_s_1) = partials.into_iter().fold(
-        ([F128::ZERO; ELL], [F128::ZERO; ELL], [F128::ZERO; ELL]),
-        |(mut ab1, mut c0_1, mut c1_1), (ab2, c0_2, c1_2)| {
-            for i in 0..ELL {
-                ab1[i] += ab2[i];
-                c0_1[i] += c0_2[i];
-                c1_1[i] += c1_2[i];
-            }
-            (ab1, c0_1, c1_1)
-        },
+    // Producer-skipped prefix (see [`planned_round1_gpu_prefix_bytes`]): the
+    // leading `skipped_w` x_hi windows of ab_inner were never written and
+    // MUST be covered by the GPU share (which reads raw a/b) or recomputed
+    // on CPU before any fold reads them.
+    let bytes_per_window = total_bytes >> eq.n_hi;
+    let invalid_bytes = ab_inner.invalid_prefix_bytes();
+    assert_eq!(
+        invalid_bytes % bytes_per_window,
+        0,
+        "invalid ab_inner prefix must be whole x_hi windows"
     );
+    let skipped_w = invalid_bytes / bytes_per_window;
+    assert!(skipped_w <= hi_size);
+
+    let cpu_fold = |ab_inner_bytes: &[u8], range: core::ops::Range<usize>| {
+        range
+            .into_par_iter()
+            .fold(WorkerStateWithSHatV::new, |mut state, x_hi| {
+                process_one_x_hi_with_precomputed_ab(
+                    x_hi,
+                    big_lo_size,
+                    n_lo_and_inner,
+                    within_outer_mask,
+                    &b_med_counts,
+                    ab_inner_bytes,
+                    c_packed,
+                    &eq_lo_scaled,
+                    eq_hi[x_hi],
+                    convert,
+                    &mut state,
+                );
+                state
+            })
+            .map(|s| (s.local_res_ab, s.local_res_c_s_0, s.local_res_c_s_1))
+            .reduce(
+                || ([F128::ZERO; ELL], [F128::ZERO; ELL], [F128::ZERO; ELL]),
+                |(mut ab1, mut c0_1, mut c1_1), (ab2, c0_2, c1_2)| {
+                    for i in 0..ELL {
+                        ab1[i] += ab2[i];
+                        c0_1[i] += c0_2[i];
+                        c1_1[i] += c1_2[i];
+                    }
+                    (ab1, c0_1, c1_1)
+                },
+            )
+    };
+
+    // GPU share (x_hi ∈ [0, g)) from the raw a/b/c buffers, concurrent with
+    // the CPU's precomputed-AB fold over [g, hi_size). See
+    // [`round1_with_s_hat_v_impl`] for the season-1 hook shape.
+    let g_planned = match g_override {
+        Some(g) => g.min(hi_size),
+        None => crate::gpu::urm::planned_g(hi_size, m),
+    }
+    // The GPU share must cover at least the producer-skipped prefix.
+    .max(skipped_w);
+    crate::gpu::gpu_dbg_trace(&format!(
+        "plan(pre-ab): m={m} hi_size={hi_size} g_planned={g_planned}"
+    ));
+    if std::env::var_os("FLOCK_GPU_TRACE").is_some() {
+        eprintln!("[gpu-urm] plan(pre-ab): m={m} hi_size={hi_size} g_planned={g_planned}");
+    }
+    let gpu_job = if g_planned > 0 {
+        crate::gpu::urm::start_share(crate::gpu::urm::ShareArgs {
+            a_packed,
+            b_packed,
+            c_packed,
+            inv_table,
+            eq_lo_scaled: &eq_lo_scaled,
+            eq_hi,
+            b_med_counts: &b_med_counts,
+            within_outer_mask,
+            n_lo: eq.n_lo,
+            n_lo_and_inner,
+            g: g_planned,
+            tile_x_outer_lo: None,
+        })
+    } else {
+        None
+    };
+    let g = if gpu_job.is_some() { g_planned } else { 0 };
+    if g < skipped_w {
+        // The planned GPU share didn't start (disable latch / no Metal):
+        // recompute the skipped prefix from raw a/b before the CPU fold.
+        ab_inner.fill_invalid_prefix(a_packed, b_packed, inv_table);
+    }
+
+    let cpu_start = std::time::Instant::now();
+    let (mut res_ab, mut res_c_s_0, mut res_c_s_1) = cpu_fold(ab_inner.as_bytes(), g..hi_size);
+    let cpu_seconds = cpu_start.elapsed().as_secs_f64();
+
+    if let Some(job) = gpu_job {
+        let wait_start = std::time::Instant::now();
+        match job.finish() {
+            Some(share) => {
+                crate::gpu::gpu_dbg_trace(&format!(
+                    "prove(pre-ab): g={g} gpu_ts={:.2}ms cpu_share={:.2}ms wait={:.2}ms",
+                    share.gpu_seconds * 1e3,
+                    cpu_seconds * 1e3,
+                    wait_start.elapsed().as_secs_f64() * 1e3
+                ));
+                if std::env::var_os("FLOCK_GPU_TRACE").is_some() {
+                    eprintln!(
+                        "[gpu-urm] prove(pre-ab): g={g} gpu_ts={:.2}ms cpu_share={:.2}ms gpu_extra_wait={:.2}ms",
+                        share.gpu_seconds * 1e3,
+                        cpu_seconds * 1e3,
+                        wait_start.elapsed().as_secs_f64() * 1e3,
+                    );
+                }
+                for i in 0..ELL {
+                    res_ab[i] += share.res_ab[i];
+                    res_c_s_0[i] += share.res_c0[i];
+                    res_c_s_1[i] += share.res_c1[i];
+                }
+                if g_override.is_none() {
+                    crate::gpu::urm::note_calibration(
+                        g,
+                        hi_size - g,
+                        share.gpu_seconds,
+                        cpu_seconds,
+                        wait_start.elapsed().as_secs_f64(),
+                    );
+                }
+            }
+            None => {
+                crate::gpu::gpu_dbg_trace(
+                    "prove(pre-ab): GPU job FAILED mid-flight; CPU recompute",
+                );
+                ab_inner.fill_invalid_prefix(a_packed, b_packed, inv_table);
+                let (ab, c0, c1) = cpu_fold(ab_inner.as_bytes(), 0..g);
+                for i in 0..ELL {
+                    res_ab[i] += ab[i];
+                    res_c_s_0[i] += c0[i];
+                    res_c_s_1[i] += c1[i];
+                }
+            }
+        }
+    }
 
     let mut res_c_s_combined = [F128::ZERO; ELL];
     for i in 0..ELL {
@@ -1633,6 +2043,73 @@ mod tests {
         }
     }
 
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn neon_fused_x2_matches_scalar_inner() {
+        // The two-window wavefront kernel must produce, per window, exactly
+        // the bytes of the scalar oracle (and hence of the single-window
+        // fused kernel) for both windows of every pair.
+        let mut rng = Rng::new(0xF050D_2);
+        let m = 14;
+        let table = make_inv_table();
+        let a_bits = rng.bits(1 << m);
+        let b_bits = rng.bits(1 << m);
+        let a_packed = super::super::univariate_skip::pack_bits(&a_bits);
+        let b_packed = super::super::univariate_skip::pack_bits(&b_bits);
+
+        let mut a_col = vec![F8::ZERO; ELL];
+        let mut b_col = vec![F8::ZERO; ELL];
+
+        for &(chunk_byte_base, b_med) in &[(0usize, 0usize), (64, 4), (1024, 6), (4096, 14)] {
+            let needed = chunk_byte_base + (b_med + 1) * N_CHUNKS * 8 + 8 * N_CHUNKS;
+            if needed > a_packed.len() {
+                continue;
+            }
+            let mut out_scalar_0 = [0u8; 64];
+            let mut out_scalar_1 = [0u8; 64];
+            let mut out_x2_0 = [0u8; 64];
+            let mut out_x2_1 = [0u8; 64];
+            shift_reduce_inner_ab_scalar(
+                &a_packed,
+                &b_packed,
+                &table,
+                chunk_byte_base,
+                b_med,
+                &mut out_scalar_0,
+                &mut a_col,
+                &mut b_col,
+            );
+            shift_reduce_inner_ab_scalar(
+                &a_packed,
+                &b_packed,
+                &table,
+                chunk_byte_base,
+                b_med + 1,
+                &mut out_scalar_1,
+                &mut a_col,
+                &mut b_col,
+            );
+            shift_reduce_inner_ab_fused_neon_x2(
+                &a_packed,
+                &b_packed,
+                &table,
+                chunk_byte_base,
+                b_med,
+                &mut out_x2_0,
+                &mut out_x2_1,
+            );
+            assert_eq!(
+                out_scalar_0, out_x2_0,
+                "x2 window 0 disagrees with scalar at (base={chunk_byte_base}, b_med={b_med})"
+            );
+            assert_eq!(
+                out_scalar_1, out_x2_1,
+                "x2 window 1 disagrees with scalar at (base={chunk_byte_base}, b_med={})",
+                b_med + 1
+            );
+        }
+    }
+
     #[cfg(all(target_arch = "x86_64", target_feature = "gfni"))]
     #[test]
     fn x86_gfni_sse_inner_matches_scalar_inner() {
@@ -1881,12 +2358,11 @@ mod tests {
 
     /// Splitting the challenge-independent AB transform from the later eq
     /// fold must not change any round-1 wire value or the captured C opening
-    /// helper. Cover m=13 through the first dimension that reaches the
-    /// heterogeneous queue's 16-chunk engagement threshold, so both unsplit
-    /// and split eq-table shapes plus the two-pool schedule are exercised.
+    /// helper.  Cover the smallest three legal dimensions so both unsplit and
+    /// split eq-table shapes are exercised cheaply.
     #[test]
-    fn precomputed_ab_matches_fused_at_m13_through_m17() {
-        for m in 13usize..=17 {
+    fn precomputed_ab_matches_fused_at_m13_through_m15() {
+        for &m in &[13usize, 14, 15] {
             let mut rng = Rng::new(0xAB00_0000_u64.wrapping_add(m as u64));
             let a = pack_bits(&rng.bits(1 << m));
             let b = pack_bits(&rng.bits(1 << m));
@@ -1899,11 +2375,13 @@ mod tests {
             let expected = round1_shift_reduce_extract_c_packed_padded_with_s_hat_v(
                 &a, &b, &c, m, K_SKIP, &r, &inv_table, &padding,
             );
-            let precomputed =
+            let mut precomputed =
                 precompute_round1_ab_inner_packed_padded(&a, &b, m, K_SKIP, &inv_table, &padding);
             assert_eq!(precomputed.len_bytes(), a.len());
             let got = round1_shift_reduce_extract_c_packed_padded_with_precomputed_ab(
-                &precomputed,
+                &mut precomputed,
+                &a,
+                &b,
                 &c,
                 m,
                 K_SKIP,
@@ -1916,228 +2394,165 @@ mod tests {
         }
     }
 
-    /// Scalar oracle for the convert-table fold, written independently of the
-    /// NEON kernels: plain `F128` adds and muls, one lane at a time. Mirrors
-    /// the non-aarch64 `kernels::portable::accumulate_convert`, which is
-    /// `cfg`-compiled away on this target and so cannot be called here.
-    #[cfg(target_arch = "aarch64")]
-    fn accumulate_convert_oracle(
-        chunk_ab_bytes: &[[u8; 64]; 1 << N_MEDIUM],
-        chunk_c_bytes: &[[u8; 64]; 1 << N_MEDIUM],
-        n_b_med: usize,
-        convert: &[F128],
-        eq_lo_val: F128,
-        partial_ab: &mut [F128; ELL],
-        partial_c: &mut [F128; ELL],
-    ) {
-        for lane in 0..ELL {
-            let mut cf_ab = F128::ZERO;
-            let mut cf_c = F128::ZERO;
-            for b_med in 0..n_b_med {
-                let base = b_med * 256;
-                cf_ab += convert[base + chunk_ab_bytes[b_med][lane] as usize];
-                cf_c += convert[base + chunk_c_bytes[b_med][lane] as usize];
-            }
-            partial_ab[lane] += cf_ab * eq_lo_val;
-            partial_c[lane] += cf_c * eq_lo_val;
-        }
-    }
-
-    /// Two-bank oracle, same construction as [`accumulate_convert_oracle`].
-    #[cfg(target_arch = "aarch64")]
-    fn accumulate_convert_with_s_hat_v_oracle(
-        chunk_ab_bytes: &[[u8; 64]; 1 << N_MEDIUM],
-        chunk_c_bytes: &[[u8; 64]; 1 << N_MEDIUM],
-        n_b_med: usize,
-        convert: &[F128],
-        eq_lo_val: F128,
-        partial_ab: &mut [F128; ELL],
-        partial_c_0: &mut [F128; ELL],
-        partial_c_1: &mut [F128; ELL],
-    ) {
-        for lane in 0..ELL {
-            let mut cf_ab = F128::ZERO;
-            let mut cf_c_0 = F128::ZERO;
-            let mut cf_c_1 = F128::ZERO;
-            for b_med in 0..n_b_med {
-                let base = b_med * 256;
-                let v_c = chunk_c_bytes[b_med][lane] as usize;
-                cf_ab += convert[base + chunk_ab_bytes[b_med][lane] as usize];
-                cf_c_0 += convert[base + (v_c & 0x55)];
-                cf_c_1 += convert[base + (v_c & 0xaa)];
-            }
-            partial_ab[lane] += cf_ab * eq_lo_val;
-            partial_c_0[lane] += cf_c_0 * eq_lo_val;
-            partial_c_1[lane] += cf_c_1 * eq_lo_val;
-        }
-    }
-
-    /// The 4-lane-wide NEON convert fold must be **bit-identical** to the
-    /// one-lane-at-a-time scalar oracle, for every `n_b_med` the caller can
-    /// pass (0..=16, covering both the unrolled full path and the boundary
-    /// window) and starting from non-zero partials, so that the `+=`
-    /// accumulation semantics are exercised rather than plain assignment.
-    #[cfg(target_arch = "aarch64")]
+    /// **GPU split acceptance (season-1 hook shape)**: a forced CPU/GPU split
+    /// (`g = max(1, hi_size/2)`) through BOTH round-1 entry points must be
+    /// bit-identical to the forced pure-CPU run (`g = 0`) — the merge is a
+    /// per-lane XOR of eq_hi-folded partials, so any drift is a kernel or
+    /// wiring bug, not noise. SKIPS (does not fail) without Metal.
     #[test]
-    fn neon_accumulate_convert_matches_scalar_oracle() {
-        let convert = convert_table();
-        let mut rng = Rng::new(0xACC_C0FFEE);
+    fn gpu_forced_split_matches_pure_cpu() {
+        if !crate::gpu::metal_available() {
+            eprintln!("SKIP gpu_forced_split_matches_pure_cpu: Metal unavailable");
+            return;
+        }
+        for &m in &[14usize, 15, 16] {
+            let mut rng = Rng::new(0x6B0_5117 ^ m as u64);
+            let a = pack_bits(&rng.bits(1 << m));
+            let b = pack_bits(&rng.bits(1 << m));
+            let c = pack_bits(&rng.bits(1 << m));
+            let outer = rng.f128_vec(m - K_SKIP - N_INNER);
+            let r = build_protocol_r(m, &outer);
+            let inv_table = make_inv_table();
+            let padding = PaddingSpec::dense(m);
 
-        for n_b_med in 0..=(1 << N_MEDIUM) {
-            let mut chunk_ab = [[0u8; 64]; 1 << N_MEDIUM];
-            let mut chunk_c = [[0u8; 64]; 1 << N_MEDIUM];
-            for b_med in 0..(1 << N_MEDIUM) {
-                for lane in 0..ELL {
-                    chunk_ab[b_med][lane] = (rng.next_u64() & 0xff) as u8;
-                    chunk_c[b_med][lane] = (rng.next_u64() & 0xff) as u8;
-                }
-            }
-            let eq_lo_val = rng.f128();
+            let hi_size = 1usize << SplitEqGhash::new(&r[K_SKIP + N_INNER..]).n_hi;
+            let g = (hi_size / 2).max(1);
 
-            // Non-zero, and different per lane, so a dropped or misrouted
-            // accumulation cannot coincidentally match.
-            let seed_ab: [F128; ELL] = core::array::from_fn(|_| rng.f128());
-            let seed_c: [F128; ELL] = core::array::from_fn(|_| rng.f128());
-
-            let (mut got_ab, mut got_c) = (seed_ab, seed_c);
-            // SAFETY: aarch64 target; arrays are the exact sizes the kernel
-            // indexes, and `convert` is the full 16*256-entry table.
-            unsafe {
-                kernels::aarch64::accumulate_convert(
-                    &chunk_ab,
-                    &chunk_c,
-                    n_b_med,
-                    convert,
-                    eq_lo_val,
-                    &mut got_ab,
-                    &mut got_c,
-                );
-            }
-
-            let (mut want_ab, mut want_c) = (seed_ab, seed_c);
-            accumulate_convert_oracle(
-                &chunk_ab,
-                &chunk_c,
-                n_b_med,
-                convert,
-                eq_lo_val,
-                &mut want_ab,
-                &mut want_c,
+            let pure_cpu = round1_with_s_hat_v_impl(
+                &a,
+                &b,
+                &c,
+                m,
+                K_SKIP,
+                &r,
+                &inv_table,
+                &padding,
+                Some(0),
             );
-
-            assert_eq!(got_ab, want_ab, "partial_ab mismatch at n_b_med={n_b_med}");
-            assert_eq!(got_c, want_c, "partial_c mismatch at n_b_med={n_b_med}");
-        }
-    }
-
-    /// The gather-halving kernel is only bit-exact because `convert` is
-    /// **F2-linear in its index bits**: `T_b[u ^ v] == T_b[u] ^ T_b[v]`. That
-    /// is what lets one paired lookup stand in for two per-`b_med` lookups.
-    /// Checked exhaustively over every `(b, u, v)` — 16·256·256 triples.
-    #[test]
-    fn convert_table_index_linear() {
-        let t = convert_table();
-        for b in 0..16 {
-            let block = &t[b * 256..(b + 1) * 256];
-            assert_eq!(block[0], F128::ZERO, "T_{b}[0] must be zero");
-            for u in 0..256usize {
-                for v in 0..256usize {
-                    assert_eq!(
-                        block[u ^ v],
-                        block[u] + block[v],
-                        "index-linearity failed at b={b}, u={u}, v={v}"
-                    );
-                }
-            }
-        }
-    }
-
-    /// The paired tables must reproduce, in one lookup, exactly the two
-    /// per-`b_med` bank terms they replace — for every pair and every pair of
-    /// input bytes. This is the identity the kernel's correctness rests on.
-    #[test]
-    fn paired_c_tables_reproduce_both_banks() {
-        let base = convert_table();
-        let (m0, m1) = &*PAIRED_C_TABLES;
-        for p in 0..8 {
-            let (even, odd) = (2 * p * 256, (2 * p + 1) * 256);
-            for ce in 0..256usize {
-                for co in 0..256usize {
-                    let i0 = (ce & 0x55) | ((co << 1) & 0xaa);
-                    let i1 = (ce & 0xaa) | ((co >> 1) & 0x55);
-                    assert_eq!(
-                        m0[p * 256 + i0],
-                        base[even + (ce & 0x55)] + base[odd + (co & 0x55)],
-                        "bank0 pair p={p}, ce={ce}, co={co}"
-                    );
-                    assert_eq!(
-                        m1[p * 256 + i1],
-                        base[even + (ce & 0xaa)] + base[odd + (co & 0xaa)],
-                        "bank1 pair p={p}, ce={ce}, co={co}"
-                    );
-                }
-            }
-        }
-    }
-
-    /// Same contract for the two-bank variant — this is the kernel the prover
-    /// actually runs (`prove_packed_padded_capture_s_hat_v_c` always sets
-    /// `capture = true`), so it gets the same bit-exactness guard.
-    #[cfg(target_arch = "aarch64")]
-    #[test]
-    fn neon_accumulate_convert_with_s_hat_v_matches_scalar_oracle() {
-        let convert = convert_table();
-        let mut rng = Rng::new(0x5A17_C0DE);
-
-        for n_b_med in 0..=(1 << N_MEDIUM) {
-            let mut chunk_ab = [[0u8; 64]; 1 << N_MEDIUM];
-            let mut chunk_c = [[0u8; 64]; 1 << N_MEDIUM];
-            for b_med in 0..(1 << N_MEDIUM) {
-                for lane in 0..ELL {
-                    chunk_ab[b_med][lane] = (rng.next_u64() & 0xff) as u8;
-                    chunk_c[b_med][lane] = (rng.next_u64() & 0xff) as u8;
-                }
-            }
-            let eq_lo_val = rng.f128();
-
-            let seed_ab: [F128; ELL] = core::array::from_fn(|_| rng.f128());
-            let seed_c0: [F128; ELL] = core::array::from_fn(|_| rng.f128());
-            let seed_c1: [F128; ELL] = core::array::from_fn(|_| rng.f128());
-
-            let (mut got_ab, mut got_c0, mut got_c1) = (seed_ab, seed_c0, seed_c1);
-            // SAFETY: aarch64 target; arrays are the exact sizes the kernel
-            // indexes, and `convert` is the full 16*256-entry table.
-            unsafe {
-                let paired_c = &*PAIRED_C_TABLES;
-                kernels::aarch64::accumulate_convert_with_s_hat_v(
-                    &chunk_ab,
-                    &chunk_c,
-                    n_b_med,
-                    convert,
-                    &paired_c.0,
-                    &paired_c.1,
-                    eq_lo_val,
-                    &mut got_ab,
-                    &mut got_c0,
-                    &mut got_c1,
-                );
-            }
-
-            let (mut want_ab, mut want_c0, mut want_c1) = (seed_ab, seed_c0, seed_c1);
-            accumulate_convert_with_s_hat_v_oracle(
-                &chunk_ab,
-                &chunk_c,
-                n_b_med,
-                convert,
-                eq_lo_val,
-                &mut want_ab,
-                &mut want_c0,
-                &mut want_c1,
+            let split = round1_with_s_hat_v_impl(
+                &a,
+                &b,
+                &c,
+                m,
+                K_SKIP,
+                &r,
+                &inv_table,
+                &padding,
+                Some(g),
             );
+            assert_eq!(split, pure_cpu, "s_hat_v split mismatch at m={m} g={g}");
 
-            assert_eq!(got_ab, want_ab, "partial_ab mismatch at n_b_med={n_b_med}");
-            assert_eq!(got_c0, want_c0, "partial_c_0 mismatch at n_b_med={n_b_med}");
-            assert_eq!(got_c1, want_c1, "partial_c_1 mismatch at n_b_med={n_b_med}");
+            let mut precomputed =
+                precompute_round1_ab_inner_packed_padded(&a, &b, m, K_SKIP, &inv_table, &padding);
+            let split_pre = round1_with_precomputed_ab_impl(
+                &mut precomputed,
+                &a,
+                &b,
+                &c,
+                m,
+                K_SKIP,
+                &r,
+                &inv_table,
+                &padding,
+                Some(g),
+            );
+            assert_eq!(
+                split_pre, pure_cpu,
+                "precomputed-AB split mismatch at m={m} g={g}"
+            );
+            assert!(
+                !crate::gpu::is_disabled(),
+                "GPU share failed to start/finish at m={m} — split ran CPU-only"
+            );
+        }
+    }
+
+    /// `fill_invalid_prefix` must reproduce the skipped prefix byte-for-byte:
+    /// scribbling the prefix, marking it invalid, and filling must equal the
+    /// untouched full precompute. m = 20 is the smallest hi_size = 128 shape
+    /// (one x_hi window = one 1024-byte outer window).
+    #[test]
+    fn fill_invalid_prefix_reproduces_precompute() {
+        let m = 20usize;
+        let mut rng = Rng::new(0xF111_2020);
+        let a = pack_bits(&rng.bits(1 << m));
+        let b = pack_bits(&rng.bits(1 << m));
+        let inv_table = make_inv_table();
+        let padding = PaddingSpec::dense(m);
+
+        let mut full =
+            precompute_round1_ab_inner_packed_padded(&a, &b, m, K_SKIP, &inv_table, &padding);
+        let mut skipped =
+            precompute_round1_ab_inner_packed_padded(&a, &b, m, K_SKIP, &inv_table, &padding);
+
+        let bytes_per_window = ((1usize << m) / 8) >> 7; // hi_size = 128
+        let skip_bytes = 5 * bytes_per_window;
+        skipped.as_bytes_mut()[..skip_bytes].fill(0xA5);
+        skipped.set_invalid_prefix_bytes(skip_bytes);
+        skipped.fill_invalid_prefix(&a, &b, &inv_table);
+
+        assert_eq!(skipped.invalid_prefix_bytes(), 0);
+        assert_eq!(
+            skipped.as_bytes_mut(),
+            full.as_bytes_mut(),
+            "fill_invalid_prefix drifted from the standalone precompute"
+        );
+    }
+
+    /// Round 1 with a producer-skipped (invalid) ab_inner prefix must be
+    /// bit-identical to the fully-precomputed pure-CPU run. The skipped
+    /// windows are covered by the forced GPU share where Metal exists, and
+    /// by the CPU `fill_invalid_prefix` fallback otherwise — both paths are
+    /// exercised across machines, both must agree with the oracle.
+    #[test]
+    fn skipped_prefix_matches_full_precompute() {
+        let m = 20usize;
+        let mut rng = Rng::new(0x5C1_0BEEF);
+        let a = pack_bits(&rng.bits(1 << m));
+        let b = pack_bits(&rng.bits(1 << m));
+        let c = pack_bits(&rng.bits(1 << m));
+        let outer = rng.f128_vec(m - K_SKIP - N_INNER);
+        let r = build_protocol_r(m, &outer);
+        let inv_table = make_inv_table();
+        let padding = PaddingSpec::dense(m);
+
+        let mut full =
+            precompute_round1_ab_inner_packed_padded(&a, &b, m, K_SKIP, &inv_table, &padding);
+        let expected = round1_with_precomputed_ab_impl(
+            &mut full,
+            &a,
+            &b,
+            &c,
+            m,
+            K_SKIP,
+            &r,
+            &inv_table,
+            &padding,
+            Some(0),
+        );
+
+        let bytes_per_window = ((1usize << m) / 8) >> 7;
+        for &skipped_w in &[1usize, 7, 128] {
+            let mut pre =
+                precompute_round1_ab_inner_packed_padded(&a, &b, m, K_SKIP, &inv_table, &padding);
+            pre.as_bytes_mut()[..skipped_w * bytes_per_window].fill(0x5A);
+            pre.set_invalid_prefix_bytes(skipped_w * bytes_per_window);
+            let got = round1_with_precomputed_ab_impl(
+                &mut pre,
+                &a,
+                &b,
+                &c,
+                m,
+                K_SKIP,
+                &r,
+                &inv_table,
+                &padding,
+                Some(0),
+            );
+            assert_eq!(
+                got, expected,
+                "skipped-prefix round1 mismatch at skipped_w={skipped_w}"
+            );
         }
     }
 }

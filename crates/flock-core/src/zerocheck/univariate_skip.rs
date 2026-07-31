@@ -29,34 +29,18 @@ use crate::ntt::{AdditiveNttGf8, InvNttTableByteSingleGf8};
 /// `table[x] = ∏_i ((1 + r_i) · (1 ⊕ bit_i(x)) + r_i · bit_i(x))` for `x ∈ {0,1}^n`,
 /// where `n = r.len()`. Standard in-place power-of-two doubling.
 pub fn build_eq(r: &[F128]) -> Vec<F128> {
-    use rayon::prelude::*;
-
     let n = r.len();
     // Uninit alloc — same invariant as `build_eq_parallel` in ring_switch:
     // every slot in t[0..2^n] is written exactly once before any read.
     let mut t = crate::alloc_uninit_f128_vec(1usize << n);
     t[0] = F128::ONE;
-    const PAR_THRESHOLD: usize = 1 << 12;
     for i in 0..n {
         let r_i = r[i];
-        let half = 1usize << i;
-        let (lo, rest) = t.split_at_mut(half);
-        let hi = &mut rest[..half];
-        let build_pair = |lo_x: &mut F128, hi_x: &mut F128| {
-            let v = *lo_x;
-            let vr = v * r_i;
-            *hi_x = vr;
-            // v * (1 + r_i) = v + v * r_i in characteristic two.
-            *lo_x = v + vr;
-        };
-        if half < PAR_THRESHOLD {
-            lo.iter_mut()
-                .zip(hi.iter_mut())
-                .for_each(|(lo_x, hi_x)| build_pair(lo_x, hi_x));
-        } else {
-            lo.par_iter_mut()
-                .zip(hi.par_iter_mut())
-                .for_each(|(lo_x, hi_x)| build_pair(lo_x, hi_x));
+        let one_minus_r = F128::ONE + r_i;
+        // Iterate downward so we read t[x] before overwriting it as t[x | (1<<i)].
+        for x in (0..(1usize << i)).rev() {
+            t[x | (1 << i)] = t[x] * r_i;
+            t[x] *= one_minus_r;
         }
     }
     t
@@ -188,16 +172,8 @@ pub struct SplitEqGhash {
 }
 
 impl SplitEqGhash {
-    /// Cap on the hi half size. The original C++ default was 7 (128 chunks),
-    /// which with a 10-thread ranked pool yields a 2-wave rayon schedule
-    /// (128 → 16 jobs of 8 after four binary splits). Raising to 9 gives
-    /// 512 chunks / ~51 per thread and is bit-identical: the lo/hi split is
-    /// an exact tensor factorisation, XOR is associative, and deferred
-    /// reduction is F2-linear so regrouping across different chunk boundaries
-    /// is exact. The hi table grows from 2 KB to 8 KB (still register-friendly
-    /// as an outer product over 512 F128s); the lo table shrinks 4× and stays
-    /// more L2-resident across the ~120 ms of zerocheck that use this split.
-    pub const MAX_N_HI: usize = 9;
+    /// C++-default cap on the hi half size — keeps outer F128 muls cheap.
+    pub const MAX_N_HI: usize = 7;
 
     pub fn new(r: &[F128]) -> Self {
         let n = r.len();

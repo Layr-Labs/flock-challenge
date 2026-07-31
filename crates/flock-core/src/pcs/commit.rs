@@ -19,6 +19,8 @@ use crate::merkle::{self, Hash, HashKind};
 use crate::ntt::AdditiveNttF128;
 use crate::pcs::pack::LOG_PACKING;
 use serde::{Deserialize, Serialize};
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 /// PCS configuration. Polynomial-basis subspace `{1, x, x², …}` for the NTT.
 ///
@@ -155,10 +157,13 @@ pub struct ProverData {
 }
 
 // Recycle the codeword buffer (the prover's largest single allocation —
-// 128 MB at m = 29) through the scratch pool instead of unmapping it.
+// 128 MB at m = 29) through the scratch pool instead of unmapping it, and
+// the Merkle tree buffer through the commit-local tree pool (the GPU
+// wrap-cache keys MTLBuffer wraps by base pointer — see [`TREE_POOL`]).
 impl Drop for ProverData {
     fn drop(&mut self) {
         crate::scratch::give_f128(std::mem::take(&mut self.codeword));
+        give_tree(std::mem::take(&mut self.merkle_tree));
     }
 }
 
@@ -186,30 +191,22 @@ pub fn commit(z_packed: &[F128], params: &PcsParams) -> (Commitment, ProverData)
     let codeword_len = n_positions * num_ntts;
 
     // ---- Codeword buffer (SoA): codeword[pos * num_ntts + lane].
-    // Copy first 2^log_msg_len positions from packed witness; zero-pad the rest.
-    //
-    // At large m the codeword buffer is huge (128 MB at m=29, 512 MB at m=31).
-    // `vec![F128::ZERO; n]` would eagerly zero all 128 MB upfront, then
-    // immediately overwrite the lower half with `z_packed` — half the zero-fill
-    // is wasted. Instead allocate uninit, write each half exactly once: copy
-    // `z_packed` into the lower half, and zero-fill JUST the upper half (the
-    // RS-encoding zero coefficients that the NTT's first-layer butterfly will
-    // read). Saves ~64 MB of memory writes at m=29 (~9 ms).
+    // The semantic RS encoder overwrites every slot, so take a stale resident
+    // scratch buffer without zeroing it. This is 1 GiB at the m=32 benchmark;
+    // avoiding an eager initialization pass is material.
     let codeword = crate::scratch::take_f128(codeword_len);
     commit_into(z_packed, params, codeword)
 }
 
 /// Like [`commit`], but reuses a caller-provided codeword buffer instead of
 /// allocating its own. The buffer must have length `codeword_len`; its
-/// CONTENTS may be arbitrary (uninit/stale) — every slot is written here:
-/// `z_packed` is replicated into all `2^log_inv_rate` sub-blocks (the exact
-/// state after the first `log_inv_rate` NTT layers on `[z, 0, …, 0]`), in
-/// parallel. Buffers from [`prefault_codeword_during`] or the scratch pool
-/// are already resident, so no write faults.
+/// CONTENTS may be arbitrary (uninit/stale) — every slot is written by the RS
+/// encoder. Buffers from [`prefault_codeword_during`] or the scratch pool are
+/// already resident, so no write faults.
 pub fn commit_into(
     z_packed: &[F128],
     params: &PcsParams,
-    mut codeword: Vec<F128>,
+    codeword: Vec<F128>,
 ) -> (Commitment, ProverData) {
     params.validate();
     assert_eq!(z_packed.len(), 1usize << params.log_msg_len());
@@ -220,300 +217,118 @@ pub fn commit_into(
         "commit_into: prebuilt codeword buffer has wrong length"
     );
 
-    // RS encoding of [z, 0, …, 0] starts with `log_inv_rate` butterfly layers
-    // whose bottom inputs are all zero — each is a pure copy, so after those
-    // layers the buffer holds 2^log_inv_rate replicas of z. Write that state
-    // directly (replicating z costs the same writes as the zero-fill it
-    // replaces) and start the NTT at layer `log_inv_rate`, skipping those
-    // layers' full-buffer reads and multiplies.
-    replicate_message_fill(&mut codeword, z_packed);
-
-    finalize_commit(codeword, params)
+    finalize_commit(codeword, z_packed, params)
 }
 
-/// Commit from a codeword whose first `log_inv_rate` trivial NTT layers have
-/// already been applied.
-///
-/// The caller must initialize every element to the same state produced by
-/// [`replicate_message_fill`] before calling this function. This entry point is
-/// used when a witness producer writes those replicas directly while its input
-/// rows are still cache-resident; unlike [`commit_into`], it performs no
-/// witness-to-codeword fill and begins with the remaining NTT layers.
-pub fn commit_preinitialized(
-    z_packed: &[F128],
-    codeword: Vec<F128>,
-    params: &PcsParams,
-) -> (Commitment, ProverData) {
-    params.validate();
-    assert_eq!(z_packed.len(), 1usize << params.log_msg_len());
-    let codeword_len = params.n_positions() * params.num_ntts();
-    assert_eq!(
-        codeword.len(),
-        codeword_len,
-        "commit_preinitialized: codeword buffer has wrong length"
-    );
-    finalize_commit(codeword, params)
-}
-
-/// Fill `codeword` with `2^r` replicas of `msg` (`r = log2(codeword.len() /
-/// msg.len())`) — the exact state after the first `r` forward-NTT layers on
-/// the zero-padded coefficient vector `[msg, 0, …, 0]`. Pair with
-/// `forward_transform_interleaved_from_layer(…, r)`. Every slot of `codeword`
-/// is written (input contents may be stale/uninit).
-#[doc(hidden)]
-pub fn replicate_message_fill(codeword: &mut [F128], msg: &[F128]) {
-    use rayon::prelude::*;
-    let msg_len = msg.len();
-    debug_assert!(codeword.len().is_multiple_of(msg_len));
-    const COPY_CHUNK: usize = 1 << 16;
-    if msg_len >= COPY_CHUNK {
-        // Both are powers of two, so chunks never straddle a replica boundary.
-        codeword
-            .par_chunks_mut(COPY_CHUNK)
-            .enumerate()
-            .for_each(|(i, dst)| {
-                let src_off = (i * COPY_CHUNK) % msg_len;
-                dst.copy_from_slice(&msg[src_off..src_off + dst.len()]);
-            });
-    } else {
-        for rep in codeword.chunks_mut(msg_len) {
-            rep.copy_from_slice(msg);
-        }
-    }
-}
-
-/// Exact ranked geometry for the cache-local NTT-to-Merkle leaf pipeline.
-/// Alternate hashes, profiles, rates, and recursive commits retain the existing
-/// independently scheduled transform and leaf pass.
-#[inline]
-fn is_ranked_ntt_merkle_leaf_pipeline_shape(params: &PcsParams) -> bool {
-    cfg!(all(
-        target_os = "macos",
-        target_arch = "aarch64",
-        target_feature = "aes"
-    )) && params.m == 32
-        && params.log_inv_rate == 1
-        && params.log_batch_size == 6
-        && params.profile == crate::pcs::ligerito::LigeritoProfile::Fast
-        && params.merkle_hash == HashKind::Blake3
-}
-
-#[inline]
-fn use_ranked_ntt_merkle_leaf_pipeline(params: &PcsParams) -> bool {
-    is_ranked_ntt_merkle_leaf_pipeline_shape(params)
-        && std::env::var_os("FLOCK_NO_NTT_MERKLE_PIPELINE").is_none()
-}
-
-#[derive(Clone, Copy)]
-struct RankedLeafJob {
-    elem_offset: usize,
-    elem_len: usize,
-}
-
-/// Finish the ranked NTT and hash each finalized 1 MiB subtree before it goes
-/// cold. P-core transform jobs offer leaf work to a bounded queue drained by
-/// the existing utility-QoS E-core pool; when that queue is full they hash the
-/// just-finished subtree inline. Thus the main NTT never waits for queue space,
-/// the helper pool retains the frontier's extra leaf throughput, and at most a
-/// small L2-sized window of completed codeword data awaits hashing.
-fn ranked_ntt_with_pipelined_leaves(
-    ntt: &AdditiveNttF128,
-    codeword: &mut [F128],
-    params: &PcsParams,
-    leaves: &mut [Hash],
-    helper: &rayon::ThreadPool,
-) {
-    use rayon::prelude::*;
-    use std::sync::Mutex;
-    use std::sync::mpsc::{TrySendError, sync_channel};
-
-    let num_ntts = params.num_ntts();
-    debug_assert_eq!(num_ntts, 64);
-    debug_assert_eq!(leaves.len(), codeword.len() / num_ntts);
-    let codeword_base = crate::epool::SyncPtr(codeword.as_mut_ptr());
-    let leaves_base = crate::epool::SyncPtr(leaves.as_mut_ptr());
-
-    let hash_job = |job: RankedLeafJob| {
-        debug_assert_eq!(job.elem_offset % num_ntts, 0);
-        debug_assert_eq!(job.elem_len % num_ntts, 0);
-        let leaf_start = job.elem_offset / num_ntts;
-        let leaf_len = job.elem_len / num_ntts;
-        // SAFETY: the NTT publishes a job only after the corresponding mutable
-        // subtree is finalized and never touched again. Every subtree is
-        // published exactly once; offsets are disjoint and cover the codeword,
-        // so both the immutable input ranges and mutable leaf-output ranges are
-        // pairwise disjoint and in bounds. Channel send/receive synchronizes the
-        // completed NTT writes before a helper worker reads them.
-        unsafe {
-            let elems =
-                core::slice::from_raw_parts(codeword_base.ptr().add(job.elem_offset), job.elem_len);
-            let bytes = core::slice::from_raw_parts(
-                elems.as_ptr().cast::<u8>(),
-                core::mem::size_of_val(elems),
-            );
-            let outs = core::slice::from_raw_parts_mut(leaves_base.ptr().add(leaf_start), leaf_len);
-            merkle::hash_ranked_blake3_leaf_chunk(bytes, outs);
-        }
-    };
-
-    // Two queued subtrees per helper keep all four E-cores fed while bounding
-    // not-yet-hashed input to 8 MiB on the ranked 4-E-core host.
-    let queue_capacity = (2 * helper.current_num_threads()).max(1);
-    let (sender, receiver) = sync_channel::<RankedLeafJob>(queue_capacity);
-    let receiver = Mutex::new(receiver);
-
-    // The exact ranked top passes can borrow the E-core pool themselves. Run
-    // them before starting the blocking leaf receivers; otherwise every helper
-    // worker would be parked on `recv` and a nested top-pass broadcast could
-    // never begin. The deep transform and callback-driven leaf pipeline below
-    // retain their existing overlap and scheduling.
-    let split_ranked_top = is_ranked_ntt_merkle_leaf_pipeline_shape(params)
-        && std::env::var_os("FLOCK_NO_NTT_TOP_EPOOL").is_none()
-        && std::env::var_os("FLOCK_NTT_BLOCK_REGIONS").is_none();
-    if split_ranked_top {
-        ntt.forward_transform_interleaved_ranked_top_from_layer(
-            codeword,
-            num_ntts,
-            params.log_inv_rate,
-        );
-    }
-
-    std::thread::scope(|scope| {
-        let helper_manager = scope.spawn(|| {
-            helper.broadcast(|_| {
-                loop {
-                    let job = receiver.lock().unwrap().recv();
-                    match job {
-                        Ok(job) => hash_job(job),
-                        Err(_) => break,
-                    }
-                }
-            });
-        });
-
-        let finish_chunk = |elem_offset, chunk: &[F128]| {
-            let job = RankedLeafJob {
-                elem_offset,
-                elem_len: chunk.len(),
-            };
-            match sender.try_send(job) {
-                Ok(()) => {}
-                Err(TrySendError::Full(job) | TrySendError::Disconnected(job)) => hash_job(job),
-            }
-        };
-        if split_ranked_top {
-            ntt.forward_transform_interleaved_ranked_deep_and_then(
-                codeword,
-                num_ntts,
-                params.log_inv_rate,
-                finish_chunk,
-            );
-        } else {
-            ntt.forward_transform_interleaved_from_layer_and_then(
-                codeword,
-                num_ntts,
-                params.log_inv_rate,
-                finish_chunk,
-            );
-        }
-        drop(sender);
-
-        // No more jobs can arrive. Pull any bounded queue tail away from the
-        // E-cores and let the full main pool finish it while already-claimed E
-        // jobs complete concurrently.
-        let mut tail = Vec::with_capacity(queue_capacity);
-        {
-            let receiver = receiver.lock().unwrap();
-            while let Ok(job) = receiver.try_recv() {
-                tail.push(job);
-            }
-        }
-        tail.into_par_iter().for_each(|job| hash_job(job));
-        helper_manager
-            .join()
-            .expect("ranked NTT-to-Merkle helper manager panicked");
+/// Widest-available rayon pool for hash-throughput-bound bulk hashing (all
+/// logical cores, including efficiency cores that otherwise idle).
+/// Built lazily — the ranked worker's untimed warm-up prove pays the spawn.
+/// Also borrowed by the open phase's `b_combined` build (`pcs.rs`), which is
+/// the one open section that scales with E-core issue capacity.
+pub(crate) fn wide_hash_pool() -> &'static rayon::ThreadPool {
+    use std::sync::LazyLock;
+    static POOL: LazyLock<rayon::ThreadPool> = LazyLock::new(|| {
+        let threads = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(8);
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(threads)
+            .build()
+            .expect("wide hash pool")
     });
+    &POOL
 }
 
 /// Shared tail of [`commit`] / [`commit_into`]: interleaved forward additive
 /// NTT (RS-encode every lane) then the initial Merkle tree over codeword rows.
-fn finalize_commit(mut codeword: Vec<F128>, params: &PcsParams) -> (Commitment, ProverData) {
-    let helper = if use_ranked_ntt_merkle_leaf_pipeline(params) && rayon::current_num_threads() > 1
-    {
-        crate::epool::epool()
-    } else {
-        None
-    };
-    let pipelined_leaves = helper.is_some();
-    let mut prehashed_tree = helper.map(|_| {
-        // Ranked: 64 MiB flat tree. Allocation is uninitialized, so only the
-        // 32 MiB leaf prefix is page-touched during the NTT; the internal half
-        // remains untouched until the normal parent-level build below. This
-        // advances allocation lifetime but does not raise the commit's final
-        // codeword+tree peak alongside the retained prover scratch pools.
-        let total_nodes = 2 * params.n_leaves() - 1;
-        crate::alloc_uninit_vec::<Hash>(total_nodes)
-    });
+fn finalize_commit(
+    mut codeword: Vec<F128>,
+    z_packed: &[F128],
+    params: &PcsParams,
+) -> (Commitment, ProverData) {
     let timing = std::env::var_os("FLOCK_COMMIT_TIMING").is_some();
-    let t_ntt = std::time::Instant::now();
-    // ---- Interleaved forward additive NTT: 2^log_batch_size independent
-    // sub-NTTs with shared twiddles. Each sub-NTT operates on its lane of the
-    // SoA buffer. The first `log_inv_rate` layers were pre-applied by the
-    // caller's replicate-fill (commit_into), so start past them.
     let ntt = AdditiveNttF128::standard(params.k_code());
-    if let (Some(helper), Some(tree)) = (helper, prehashed_tree.as_mut()) {
-        ranked_ntt_with_pipelined_leaves(
+
+    // ---- GPU-hybrid streaming commit (BLAKE3 Merkle on Metal, leaves hashed
+    // in ordered 1/8th-codeword chunks as the NTT deep pass completes them).
+    // Production gates: BLAKE3 trees of ≥ 2^18 leaves with a batchable leaf
+    // size, GPU Merkle pipeline available (Metal present, not latched off,
+    // FLOCK_NO_GPU / FLOCK_NO_GPU_MERKLE unset). Everything else — and any
+    // in-flight GPU failure — lands on the existing pure-CPU path below.
+    if params.merkle_hash == HashKind::Blake3
+        && params.n_leaves() >= (1 << 18)
+        && merkle::blake3_leaf_size_is_batchable(params.leaf_size_bytes())
+        && crate::gpu::merkle::available()
+    {
+        if let Some((merkle_tree, root)) = gpu_streamed_commit(
             &ntt,
             &mut codeword,
+            z_packed,
             params,
-            &mut tree[..params.n_leaves()],
-            helper,
-        );
-    } else {
-        ntt.forward_transform_interleaved_from_layer(
-            &mut codeword,
-            params.num_ntts(),
-            params.log_inv_rate,
-        );
+            N_STREAM_CHUNKS,
+            GPU_STOP_NODES,
+            timing,
+        ) {
+            return (
+                Commitment {
+                    root,
+                    params: params.clone(),
+                },
+                ProverData {
+                    codeword,
+                    merkle_tree,
+                },
+            );
+        }
     }
+
+    let t_ntt = std::time::Instant::now();
+    // ---- Interleaved RS encoding: 2^log_batch_size independent sub-NTTs with
+    // shared twiddles. The encoder owns the zero-padding/replication shortcut
+    // and any target-specific fusion, so this timer covers the complete
+    // logical encoding stage.
+    ntt.rs_encode_interleaved(z_packed, &mut codeword, params.num_ntts());
     if timing {
-        let phase = if pipelined_leaves {
-            "ntt+merkle-leaves"
-        } else {
-            "ntt"
-        };
         eprintln!(
-            "[commit-timing] {phase}: {:.2} ms",
+            "[commit-timing] ntt: {:.2} ms",
             t_ntt.elapsed().as_secs_f64() * 1e3
         );
     }
     let t_merkle = std::time::Instant::now();
 
+    // ---- Merkle commitment: one leaf per codeword position = num_ntts F128.
+    // Zero-copy: cast the codeword Vec<F128> directly to &[u8]. F128 is
+    // repr(C, align(16)) with two u64s laid out little-endian — same bytes
+    // as the explicit lo.to_le_bytes() + hi.to_le_bytes() serialization.
+    let codeword_bytes: &[u8] = unsafe {
+        core::slice::from_raw_parts(
+            codeword.as_ptr() as *const u8,
+            codeword.len() * core::mem::size_of::<F128>(),
+        )
+    };
     // Initial tree: one leaf per codeword position, each containing the
     // row-batch lanes (num_ntts F_{2^128} values = 2^log_batch_size). This is
     // Ligerito's L0 commitment.
-    let merkle_tree = if let Some(tree) = prehashed_tree {
-        merkle::merkle_tree_from_prehashed_leaves(tree, params.n_leaves(), params.merkle_hash)
+    //
+    // Under SHA-256 the leaf level was SHA-unit bound (one unit per core), so
+    // E-cores added ~10-15% at the ranked 2^20-leaf tree. Under BLAKE3 the
+    // tree hash is NEON-bound (hash_many batching, no hw hash unit) — E-cores
+    // still add NEON throughput (~35-40% of a P-core each), so the widest
+    // pool should still pay for LARGE trees. TUNING POINT for the BLAKE3
+    // runner: re-A/B the >=2^18-leaves gate (and whether the E-core spin-up
+    // is worth it at all) once end-to-end numbers exist. The recursive
+    // Ligerito commits (≤ 2^17 leaves) run at open time, where wider pools
+    // measurably regressed under SHA-256.
+    let merkle_tree = if params.n_leaves() >= (1 << 18) {
+        wide_hash_pool()
+            .install(|| merkle::merkle_tree(codeword_bytes, params.n_leaves(), params.merkle_hash))
     } else {
-        // Zero-copy: F128 is repr(C, align(16)) with two u64s laid out
-        // little-endian, matching the canonical leaf serialization.
-        let codeword_bytes: &[u8] = unsafe {
-            core::slice::from_raw_parts(
-                codeword.as_ptr() as *const u8,
-                codeword.len() * core::mem::size_of::<F128>(),
-            )
-        };
         merkle::merkle_tree(codeword_bytes, params.n_leaves(), params.merkle_hash)
     };
     let root = *merkle_tree.last().expect("merkle tree non-empty");
     if timing {
-        let phase = if pipelined_leaves {
-            "merkle-parents"
-        } else {
-            "merkle"
-        };
         eprintln!(
-            "[commit-timing] {phase}: {:.2} ms",
+            "[commit-timing] merkle: {:.2} ms",
             t_merkle.elapsed().as_secs_f64() * 1e3
         );
     }
@@ -528,6 +343,509 @@ fn finalize_commit(mut codeword: Vec<F128>, params: &PcsParams) -> (Commitment, 
             merkle_tree,
         },
     )
+}
+
+// ---------------------------------------------------------------------------
+// GPU-hybrid streaming commit (Metal BLAKE3 Merkle).
+//
+// The season-1 GPU URM offload lost to its fixed costs (~9 ms/prove of buffer
+// wiring + clock ramp) because it fired once per prove. Season-2 shares one
+// warm/wired GPU cycle between TWO phases: (A) Merkle leaf+lower-tree hashing
+// streamed here, chunk by chunk, while the NTT deep pass is still running,
+// then (B) the zerocheck round-1 URM split ~100 ms later. The Merkle stream
+// doubles as the clock keepalive for (B): command buffers land every ~5-10 ms
+// through the whole commit, so no dedicated keepalive thread exists this
+// season (see `flock-prover`'s prove entry).
+// ---------------------------------------------------------------------------
+
+/// Ordered NTT super-chunks per commit = GPU leaf command buffers per commit.
+/// At the ranked m=32 geometry (1 GiB codeword) each chunk is 128 MiB — well
+/// above the ≥64 MiB per-cb floor (0.2 ms fixed cost per cb).
+const N_STREAM_CHUNKS: usize = 8;
+
+/// The GPU builds parent levels while their node count is ≥ this; the CPU
+/// hashes the remaining top (2^14 → root is < 2^14 pair hashes — sub-ms).
+const GPU_STOP_NODES: usize = 1 << 14;
+
+/// Tree over-allocation, in nodes: one 16 KiB page (512 × 32 B) so
+/// `gpu::merkle::begin`'s page-coverage check always passes for the real
+/// node range (see the allocation site in [`gpu_streamed_commit`]).
+const TREE_PAD_NODES: usize = 512;
+
+/// How many of the [`N_STREAM_CHUNKS`] leaf chunks the GPU takes; the rest
+/// are left for the post-NTT CPU join. Default: all (the Merkle kernels
+/// outpace the deep-pass cadence by ~5×; the CPU join is the degraded mode).
+/// Refined per prove by [`note_merkle_calibration`]; the warmup calibration
+/// in `flock-prover` seeds the CPU/GPU rates below.
+static MERKLE_GPU_CHUNK_SHARE: AtomicUsize = AtomicUsize::new(N_STREAM_CHUNKS);
+/// Measured CPU leaf-hash rate, ns per MiB of leaf data (0 = unknown).
+static MERKLE_CPU_NS_PER_MIB: AtomicU64 = AtomicU64::new(0);
+/// Measured GPU full-turnaround leaf rate, ns per MiB (0 = unknown).
+static MERKLE_GPU_NS_PER_MIB: AtomicU64 = AtomicU64::new(0);
+
+/// Season-1 latch rule, Merkle edition: a GPU slower than 6× the CPU on the
+/// same leaves is a broken/contended GPU — turn the pipeline off for the
+/// process lifetime rather than re-probing every prove.
+const MERKLE_LATCH_FACTOR: u64 = 6;
+
+/// Test/diagnostic escape hatches around the calibration atomics.
+pub fn gpu_merkle_split() -> usize {
+    MERKLE_GPU_CHUNK_SHARE.load(Ordering::Relaxed)
+}
+pub fn set_gpu_merkle_split(chunks: usize) {
+    MERKLE_GPU_CHUNK_SHARE.store(chunks.min(N_STREAM_CHUNKS), Ordering::Relaxed);
+}
+
+/// Pool of page-stable Merkle tree buffers. The GPU wrap-cache keys MTLBuffer
+/// wraps by base pointer, so the tree allocation (64 MiB at the ranked shape,
+/// ≥ the 64 MiB wrap-cache floor) must survive across proves — dropping and
+/// re-allocating it would churn a fresh wire+wrap every prove (season-1 rule).
+static TREE_POOL: Mutex<Vec<Vec<Hash>>> = Mutex::new(Vec::new());
+
+fn take_tree(total_nodes: usize) -> Vec<Hash> {
+    if let Ok(mut pool) = TREE_POOL.lock() {
+        if let Some(idx) = pool.iter().position(|v| v.capacity() >= total_nodes) {
+            let mut v = pool.swap_remove(idx);
+            // SAFETY: capacity checked; Hash is plain bytes, every node is
+            // written before it is read (same contract as merkle_tree()).
+            unsafe { v.set_len(total_nodes) };
+            return v;
+        }
+    }
+    crate::alloc_uninit_vec(total_nodes)
+}
+
+fn give_tree(mut tree: Vec<Hash>) {
+    // Only park allocations big enough to matter for wrap-cache stability.
+    if tree.capacity() < (1 << 18) {
+        return;
+    }
+    tree.clear();
+    if let Ok(mut pool) = TREE_POOL.lock() {
+        if pool.len() < 2 {
+            pool.push(tree);
+        }
+    }
+}
+
+/// Record a full prove's Merkle turnaround and refine the CPU/GPU chunk
+/// split. All rates are FULL turnaround (wall time around commit/wait), not
+/// GPU timestamps — season-1's calibration rule.
+#[allow(clippy::too_many_arguments)]
+fn note_merkle_calibration(
+    gpu_chunks: usize,
+    cpu_chunks: usize,
+    chunk_mib: f64,
+    gpu_busy_seconds: f64,
+    wait_seconds: f64,
+    ntt_seconds: f64,
+    cpu_join_seconds: f64,
+    n_chunks: usize,
+) {
+    let to_ns_per_mib = |seconds: f64, chunks: usize| -> u64 {
+        if chunks == 0 || chunk_mib <= 0.0 {
+            return 0;
+        }
+        (seconds * 1e9 / (chunks as f64 * chunk_mib)) as u64
+    };
+    if cpu_chunks > 0 {
+        let ns = to_ns_per_mib(cpu_join_seconds, cpu_chunks);
+        if ns > 0 {
+            MERKLE_CPU_NS_PER_MIB.store(ns, Ordering::Relaxed);
+        }
+    }
+    // GPU rate: busy time per chunk, but never better than what the wall
+    // clock proves (wait after the CPU was already done).
+    if gpu_chunks > 0 {
+        let busy = to_ns_per_mib(gpu_busy_seconds, gpu_chunks);
+        let walled = to_ns_per_mib(wait_seconds, gpu_chunks);
+        let ns = busy.max(walled);
+        if ns > 0 {
+            MERKLE_GPU_NS_PER_MIB.store(ns, Ordering::Relaxed);
+        }
+    }
+    let t_c = MERKLE_CPU_NS_PER_MIB.load(Ordering::Relaxed);
+    let t_g = MERKLE_GPU_NS_PER_MIB.load(Ordering::Relaxed);
+    if t_c == 0 || t_g == 0 {
+        return; // not enough data to re-split
+    }
+    if t_g > MERKLE_LATCH_FACTOR * t_c {
+        crate::gpu::gpu_dbg_trace(&format!(
+            "merkle calib: LATCH OFF (gpu {t_g} ns/MiB > {MERKLE_LATCH_FACTOR}x cpu {t_c})"
+        ));
+        crate::gpu::merkle::set_enabled(false);
+        return;
+    }
+    // Split so both sides finish together: the GPU works during the NTT
+    // (span ntt_seconds) and after it; the CPU join only starts after the
+    // NTT. g·t_g − ntt ≈ (n − g)·t_c  ⇒  g = (ntt + n·t_c) / (t_g + t_c).
+    let t_g_chunk = t_g as f64 * 1e-9 * chunk_mib;
+    let t_c_chunk = t_c as f64 * 1e-9 * chunk_mib;
+    let g = ((ntt_seconds + n_chunks as f64 * t_c_chunk) / (t_g_chunk + t_c_chunk))
+        .floor()
+        .clamp(0.0, n_chunks as f64) as usize;
+    MERKLE_GPU_CHUNK_SHARE.store(g.min(N_STREAM_CHUNKS), Ordering::Relaxed);
+    crate::gpu::gpu_dbg_trace(&format!(
+        "merkle calib: t_c={t_c} t_g={t_g} ns/MiB ntt={:.1}ms -> share {g}/{n_chunks}",
+        ntt_seconds * 1e3
+    ));
+}
+
+/// Hash the CPU-owned leaf chunks after the NTT: wide pool, atomic chunk
+/// cursor. The GPU and this join write **disjoint** `tree[..n_leaves]`
+/// sub-slices — chunk ownership was fixed when each chunk either was or was
+/// not committed to the GPU during the deep pass.
+fn cpu_join_hash_leaves(
+    codeword_bytes: &[u8],
+    leaf_size: usize,
+    leaves_out: &mut [Hash],
+    ranges: &[core::ops::Range<usize>],
+    kind: HashKind,
+) {
+    let cursor = AtomicUsize::new(0);
+    let base = leaves_out.as_mut_ptr() as usize;
+    wide_hash_pool().broadcast(|_| {
+        loop {
+            let i = cursor.fetch_add(1, Ordering::Relaxed);
+            let Some(r) = ranges.get(i) else { break };
+            // SAFETY: the claimed chunk index is unique (fetch_add), ranges
+            // are disjoint sub-ranges of `leaves_out`, and no GPU-owned chunk
+            // appears in `ranges` — so this mutable view aliases nothing.
+            let out = unsafe {
+                core::slice::from_raw_parts_mut((base as *mut Hash).add(r.start), r.len())
+            };
+            merkle::hash_leaves(
+                &codeword_bytes[r.start * leaf_size..r.end * leaf_size],
+                leaf_size,
+                out,
+                kind,
+            );
+        }
+    });
+}
+
+/// Build tree levels from the level with `from_nodes` nodes up to the root,
+/// reading the already-written level below. Flat-layout offsets: the level
+/// with `s` nodes starts at `2·n_leaves − 2·s`.
+pub(crate) fn build_upper_levels(
+    tree: &mut [Hash],
+    n_leaves: usize,
+    from_nodes: usize,
+    kind: HashKind,
+) {
+    let mut s = from_nodes;
+    while s > 1 {
+        let read_start = 2 * n_leaves - 2 * s;
+        let (read, rest) = tree[read_start..].split_at_mut(s);
+        let write = &mut rest[..s / 2];
+        merkle::hash_pairs_level(read, write, kind);
+        s >>= 1;
+    }
+}
+
+/// The GPU-hybrid streaming commit body. Returns `None` only when the GPU
+/// session cannot even begin (alignment/coverage refused — nothing computed
+/// yet, caller falls through to the pure-CPU path). Any failure AFTER the
+/// session starts is repaired here on the CPU (the codeword is always fully
+/// encoded by the CPU regardless of GPU health) and still returns `Some`.
+fn gpu_streamed_commit(
+    ntt: &AdditiveNttF128,
+    codeword: &mut Vec<F128>,
+    z_packed: &[F128],
+    params: &PcsParams,
+    n_chunks: usize,
+    stop_nodes: usize,
+    timing: bool,
+) -> Option<(Vec<Hash>, Hash)> {
+    use crate::gpu;
+
+    let n_leaves = params.n_leaves();
+    let leaf_size = params.leaf_size_bytes();
+    let num_ntts = params.num_ntts();
+    let total_nodes = 2 * n_leaves - 1;
+    let kind = params.merkle_hash;
+
+    // Over-allocate by one 16 KiB page of nodes: gpu::merkle::begin requires
+    // floor_page(tree_len·32) to cover every GPU-written node, and the last
+    // real node may otherwise sit in a partially-covered tail page (matters
+    // for small `stop_nodes`; at the production 2^14 the slack is ~512 KiB).
+    // Truncated back to `total_nodes` before returning.
+    let mut tree: Vec<Hash> = take_tree(total_nodes + TREE_PAD_NODES);
+
+    let cw_ptr = codeword.as_ptr() as *const u8;
+    let cw_len = codeword.len() * core::mem::size_of::<F128>();
+    // SAFETY (begin): the session holds raw pointers, not borrows. The GPU
+    // only ever reads codeword ranges whose NTT super-chunk barrier has
+    // passed (final data, no further CPU writes), and only ever writes tree
+    // slots the CPU join does not touch. Both buffers outlive the session
+    // (finish() is called below before either can drop).
+    let mut session = match unsafe {
+        gpu::merkle::begin(
+            core::slice::from_raw_parts(cw_ptr, cw_len),
+            leaf_size,
+            tree.as_mut_ptr() as *mut [u8; 32],
+            tree.len(),
+            stop_nodes,
+        )
+    } {
+        Some(s) => s,
+        None => {
+            // Alignment/coverage refused — no latch, nothing computed yet.
+            crate::gpu::gpu_dbg_trace("merkle: begin() refused (alignment/coverage); CPU path");
+            give_tree(tree);
+            return None;
+        }
+    };
+
+    // Async prewire of the codeword + tree buffers while the NTT's top
+    // layers run (~30 ms window): the driver's page wiring for ~1.1 GiB
+    // otherwise stalls the first leaf command buffer (season-1: ~23 ms).
+    // The witness a/b/z buffers are prewired at prove entry in flock-prover.
+    let prewire = {
+        let cw_addr = cw_ptr as usize;
+        let tree_addr = tree.as_ptr() as usize;
+        let tree_bytes = tree.len() * core::mem::size_of::<Hash>();
+        std::thread::Builder::new()
+            .name("flock-gpu-prewire-commit".into())
+            .spawn(move || {
+                // SAFETY: both buffers outlive this thread — it is joined
+                // before finish(), below, and the buffers live to end of fn.
+                unsafe {
+                    gpu::prewire(core::slice::from_raw_parts(cw_addr as *const u8, cw_len));
+                    gpu::prewire(core::slice::from_raw_parts(
+                        tree_addr as *const u8,
+                        tree_bytes,
+                    ));
+                }
+            })
+            .ok()
+    };
+
+    // ---- NTT with ordered chunk streaming. Chunk ownership is decided HERE,
+    // once, per chunk: committed to the GPU (chunks 0..gpu_share, while
+    // healthy) or pushed to the CPU-join list. This is what keeps the two
+    // sides' tree writes disjoint.
+    let gpu_share = MERKLE_GPU_CHUNK_SHARE
+        .load(Ordering::Relaxed)
+        .min(n_chunks);
+    let mut gpu_ranges: Vec<core::ops::Range<usize>> = Vec::with_capacity(n_chunks);
+    let mut cpu_ranges: Vec<core::ops::Range<usize>> = Vec::with_capacity(n_chunks);
+    let mut gpu_failed = false;
+
+    let t_ntt = std::time::Instant::now();
+    ntt.rs_encode_interleaved_streamed(
+        z_packed,
+        codeword,
+        num_ntts,
+        n_chunks,
+        &mut |idx, range| {
+            let give_gpu = !gpu_failed && idx < gpu_share;
+            if give_gpu && session.commit_leaves(range.start, range.end) {
+                gpu_ranges.push(range);
+            } else {
+                if give_gpu {
+                    // commit_leaves failed and latched; everything from here
+                    // on (and the repair below) is CPU work.
+                    gpu_failed = true;
+                }
+                cpu_ranges.push(range);
+            }
+        },
+    );
+    let ntt_seconds = t_ntt.elapsed().as_secs_f64();
+
+    let codeword_bytes: &[u8] = unsafe { core::slice::from_raw_parts(cw_ptr, cw_len) };
+
+    // ---- CPU join on the leftover chunks (wide pool, atomic chunk cursor).
+    let t_join = std::time::Instant::now();
+    if !cpu_ranges.is_empty() {
+        cpu_join_hash_leaves(
+            codeword_bytes,
+            leaf_size,
+            &mut tree[..n_leaves],
+            &cpu_ranges,
+            kind,
+        );
+    }
+    let cpu_join_seconds = t_join.elapsed().as_secs_f64();
+
+    // ---- GPU parent levels (node count ≥ stop_nodes). Must be committed
+    // only after every leaf is in place: GPU leaf cbs are queue-ordered
+    // ahead of this cb, and the CPU join writes completed above (shared
+    // storage is coherent at command-buffer commit).
+    let do_gpu_parents = !gpu_failed && n_leaves / 2 >= stop_nodes;
+    let mut committed_parents = false;
+    if do_gpu_parents {
+        if session.commit_parent_levels() {
+            committed_parents = true;
+        } else {
+            gpu_failed = true;
+        }
+    }
+
+    if let Some(h) = prewire {
+        let _ = h.join();
+    }
+
+    // ---- Wait for the GPU (leaf cbs + parent cb).
+    let t_wait = std::time::Instant::now();
+    let gpu_seconds = session.finish();
+    let wait_seconds = t_wait.elapsed().as_secs_f64();
+
+    match gpu_seconds {
+        Some(gpu_busy) if !gpu_failed => {
+            // ---- CPU top: from stop_nodes (or from the leaves when the tree
+            // was too small for GPU parent levels) up to the root.
+            let from_nodes = if committed_parents { stop_nodes } else { n_leaves };
+            build_upper_levels(&mut tree, n_leaves, from_nodes, kind);
+
+            // Calibrate only on production-scale commits: on tiny (test)
+            // shapes the per-cb fixed cost dominates and would poison the
+            // rates (or spuriously latch the pipeline off process-wide).
+            if cw_len >= (64 << 20) {
+                let chunk_mib = (cw_len as f64 / n_chunks as f64) / (1024.0 * 1024.0);
+                note_merkle_calibration(
+                    gpu_ranges.len(),
+                    cpu_ranges.len(),
+                    chunk_mib,
+                    gpu_busy,
+                    wait_seconds,
+                    ntt_seconds,
+                    cpu_join_seconds,
+                    n_chunks,
+                );
+            }
+            if timing {
+                eprintln!(
+                    "[commit-timing] gpu-hybrid: ntt {:.2} ms (gpu {}/{} chunks, busy {:.2} ms), cpu-join {:.2} ms, wait {:.2} ms",
+                    ntt_seconds * 1e3,
+                    gpu_ranges.len(),
+                    n_chunks,
+                    gpu_busy * 1e3,
+                    cpu_join_seconds * 1e3,
+                    wait_seconds * 1e3,
+                );
+            }
+            gpu::gpu_dbg_trace(&format!(
+                "merkle: ntt={:.2}ms gpu_chunks={} cpu_chunks={} busy={:.2}ms join={:.2}ms wait={:.2}ms",
+                ntt_seconds * 1e3,
+                gpu_ranges.len(),
+                cpu_ranges.len(),
+                gpu_busy * 1e3,
+                cpu_join_seconds * 1e3,
+                wait_seconds * 1e3,
+            ));
+        }
+        _ => {
+            // GPU failed mid-flight (latched inside gpu::merkle). The
+            // codeword is fully encoded — rebuild the whole tree on the CPU.
+            // GPU-written tree contents are untrusted; recompute everything.
+            gpu::gpu_dbg_trace("merkle: GPU FAILED mid-flight; full CPU tree rebuild");
+            wide_hash_pool().install(|| {
+                merkle::hash_leaves(codeword_bytes, leaf_size, &mut tree[..n_leaves], kind);
+                build_upper_levels(&mut tree, n_leaves, n_leaves, kind);
+            });
+        }
+    }
+
+    tree.truncate(total_nodes);
+    let root = tree[total_nodes - 1];
+    Some((tree, root))
+}
+
+/// One-time GPU Merkle warmup calibration, called from the per-hash Setup
+/// constructors (the ranked worker's untimed window). Forces Metal context +
+/// pipeline compilation (~45 ms, once), then measures CPU vs GPU leaf-hash
+/// rates on a synthetic 64 MiB buffer and seeds the split atomics — so the
+/// FIRST measured prove already runs with a sane split, and a broken GPU is
+/// latched off before it can cost a prove anything.
+pub fn gpu_merkle_warmup_calibrate() {
+    use crate::gpu;
+    if !gpu::metal_available() || !gpu::merkle::available() {
+        return;
+    }
+    const WARM_F128: usize = 1 << 22; // 64 MiB of leaf data
+    let leaf_size = 1024usize;
+    let n_leaves = WARM_F128 * 16 / leaf_size; // 65536
+    let mut data = crate::scratch::take_f128(WARM_F128);
+    // Deterministic contents (data-independent timing for BLAKE3, but the
+    // buffer must be initialized and resident).
+    data.fill(F128::ZERO);
+    let mut tree: Vec<Hash> = take_tree(2 * n_leaves - 1 + TREE_PAD_NODES);
+
+    // CPU rate: same batched kernels the join uses, on the wide pool.
+    let t_cpu = std::time::Instant::now();
+    {
+        let bytes: &[u8] = unsafe {
+            core::slice::from_raw_parts(data.as_ptr() as *const u8, WARM_F128 * 16)
+        };
+        wide_hash_pool().install(|| {
+            merkle::hash_leaves(bytes, leaf_size, &mut tree[..n_leaves], HashKind::Blake3);
+        });
+    }
+    let cpu_seconds = t_cpu.elapsed().as_secs_f64();
+
+    // GPU rate: two passes (first pays wiring + clock ramp), keep the
+    // second — but calibrate on FULL turnaround of that pass.
+    let mut gpu_seconds_best = f64::INFINITY;
+    for _pass in 0..2 {
+        let bytes: &[u8] = unsafe {
+            core::slice::from_raw_parts(data.as_ptr() as *const u8, WARM_F128 * 16)
+        };
+        // SAFETY: `data` and `tree` outlive the session; no CPU writes race
+        // the GPU (the CPU pass above is complete).
+        let Some(mut session) = (unsafe {
+            gpu::merkle::begin(
+                bytes,
+                leaf_size,
+                tree.as_mut_ptr() as *mut [u8; 32],
+                tree.len(),
+                2 * n_leaves, // leaves only — no parent levels in the probe
+            )
+        }) else {
+            break;
+        };
+        let t_gpu = std::time::Instant::now();
+        let quarter = n_leaves / 4;
+        let mut ok = true;
+        for c in 0..4 {
+            ok = ok && session.commit_leaves(c * quarter, (c + 1) * quarter);
+        }
+        let finished = session.finish();
+        if ok && finished.is_some() {
+            gpu_seconds_best = gpu_seconds_best.min(t_gpu.elapsed().as_secs_f64());
+        } else {
+            break; // failure latched inside gpu::merkle
+        }
+    }
+
+    let mib = (WARM_F128 * 16) as f64 / (1024.0 * 1024.0);
+    let cpu_ns = (cpu_seconds * 1e9 / mib) as u64;
+    if cpu_ns > 0 {
+        MERKLE_CPU_NS_PER_MIB.store(cpu_ns, Ordering::Relaxed);
+    }
+    if gpu_seconds_best.is_finite() {
+        let gpu_ns = (gpu_seconds_best * 1e9 / mib) as u64;
+        if gpu_ns > 0 {
+            MERKLE_GPU_NS_PER_MIB.store(gpu_ns, Ordering::Relaxed);
+        }
+        if gpu_ns > MERKLE_LATCH_FACTOR * cpu_ns {
+            gpu::gpu_dbg_trace(&format!(
+                "merkle warmup: LATCH OFF (gpu {gpu_ns} ns/MiB, cpu {cpu_ns})"
+            ));
+            gpu::merkle::set_enabled(false);
+        } else {
+            // GPU healthy: default to the full share; the NTT overlap makes
+            // the GPU strictly cheaper than the CPU join for every chunk the
+            // deep pass can feed it in time.
+            MERKLE_GPU_CHUNK_SHARE.store(N_STREAM_CHUNKS, Ordering::Relaxed);
+        }
+        gpu::gpu_dbg_trace(&format!(
+            "merkle warmup: cpu {cpu_ns} ns/MiB, gpu {gpu_ns} ns/MiB"
+        ));
+    }
+    give_tree(tree);
+    crate::scratch::give_f128(data);
 }
 
 /// Tag the current thread as background QoS. On macOS the scheduler then
@@ -611,12 +929,6 @@ mod tests {
         fn bits(&mut self, n: usize) -> Vec<bool> {
             (0..n).map(|_| self.next_u64() & 1 == 1).collect()
         }
-        fn f128(&mut self) -> F128 {
-            F128 {
-                lo: self.next_u64(),
-                hi: self.next_u64(),
-            }
-        }
     }
 
     /// The Ligerito configs derived from `PcsParams` must carry the params'
@@ -656,101 +968,6 @@ mod tests {
             profile: Default::default(),
             merkle_hash: Default::default(),
         }
-    }
-
-    #[test]
-    fn ranked_ntt_merkle_pipeline_gate_is_narrow() {
-        let params = PcsParams {
-            m: 32,
-            log_inv_rate: 1,
-            log_batch_size: 6,
-            profile: crate::pcs::ligerito::LigeritoProfile::Fast,
-            merkle_hash: HashKind::Blake3,
-        };
-        let enabled_here = cfg!(all(
-            target_os = "macos",
-            target_arch = "aarch64",
-            target_feature = "aes"
-        ));
-        assert_eq!(
-            is_ranked_ntt_merkle_leaf_pipeline_shape(&params),
-            enabled_here
-        );
-
-        let mut changed = params.clone();
-        changed.m = 31;
-        assert!(!is_ranked_ntt_merkle_leaf_pipeline_shape(&changed));
-        let mut changed = params.clone();
-        changed.log_inv_rate = 2;
-        assert!(!is_ranked_ntt_merkle_leaf_pipeline_shape(&changed));
-        let mut changed = params.clone();
-        changed.log_batch_size = 5;
-        assert!(!is_ranked_ntt_merkle_leaf_pipeline_shape(&changed));
-        let mut changed = params.clone();
-        changed.profile = crate::pcs::ligerito::LigeritoProfile::Secure;
-        assert!(!is_ranked_ntt_merkle_leaf_pipeline_shape(&changed));
-        let mut changed = params;
-        changed.merkle_hash = HashKind::Sha256;
-        assert!(!is_ranked_ntt_merkle_leaf_pipeline_shape(&changed));
-    }
-
-    #[test]
-    fn pipelined_ntt_leaves_match_separate_oracle() {
-        // log_d=12 is large enough to split into multiple finalized chunks on
-        // ordinary test hosts. This exercises concurrent helper receives,
-        // bounded-queue overflow to inline hashing, and the post-NTT tail
-        // drain, rather than only the scalar one-callback fallback.
-        let params = PcsParams {
-            m: 24,
-            log_inv_rate: 1,
-            log_batch_size: 6,
-            profile: crate::pcs::ligerito::LigeritoProfile::Fast,
-            merkle_hash: HashKind::Blake3,
-        };
-        let mut rng = Rng::new(0xCA5E_10CA_C011_1701);
-        let message: Vec<F128> = (0..1usize << params.log_msg_len())
-            .map(|_| rng.f128())
-            .collect();
-
-        let mut source = vec![F128::ZERO; params.codeword_len_f128()];
-        replicate_message_fill(&mut source, &message);
-        let ntt = AdditiveNttF128::standard(params.k_code());
-
-        let mut expect_codeword = source.clone();
-        ntt.forward_transform_interleaved_from_layer(
-            &mut expect_codeword,
-            params.num_ntts(),
-            params.log_inv_rate,
-        );
-        let expect_bytes = unsafe {
-            core::slice::from_raw_parts(
-                expect_codeword.as_ptr().cast::<u8>(),
-                core::mem::size_of_val(expect_codeword.as_slice()),
-            )
-        };
-        let expect_tree = merkle::merkle_tree(expect_bytes, params.n_leaves(), HashKind::Blake3);
-
-        let helper = rayon::ThreadPoolBuilder::new()
-            .num_threads(2)
-            .build()
-            .unwrap();
-        let mut got_codeword = source;
-        let mut got_tree = vec![[0u8; 32]; 2 * params.n_leaves() - 1];
-        ranked_ntt_with_pipelined_leaves(
-            &ntt,
-            &mut got_codeword,
-            &params,
-            &mut got_tree[..params.n_leaves()],
-            &helper,
-        );
-        let got_tree = merkle::merkle_tree_from_prehashed_leaves(
-            got_tree,
-            params.n_leaves(),
-            HashKind::Blake3,
-        );
-
-        assert_eq!(got_codeword, expect_codeword);
-        assert_eq!(got_tree, expect_tree);
     }
 
     /// The replicate-fill + start-at-layer-`log_inv_rate` fast path must be
@@ -865,5 +1082,131 @@ mod tests {
         let z_packed = super::super::pack::pack_witness(&z, m);
         let (_, pd) = commit(&z_packed, &params);
         assert_eq!(pd.codeword.len(), 2 * z_packed.len());
+    }
+
+    /// **GPU-hybrid acceptance**: the streamed GPU commit (leaf chunks + GPU
+    /// parent levels + CPU top) must produce the exact tree and root the
+    /// pure-CPU path produces — every node, not just the root. Forced through
+    /// `gpu_streamed_commit` directly (production gates require ≥ 2^18
+    /// leaves; here small `stop_nodes` values exercise the GPU parent levels
+    /// and the CPU top at m≈20). SKIPS (does not fail) without Metal.
+    #[test]
+    fn gpu_hybrid_commit_matches_pure_cpu() {
+        if !crate::gpu::merkle::available() {
+            eprintln!("SKIP gpu_hybrid_commit_matches_pure_cpu: Metal unavailable");
+            return;
+        }
+        let mut rng = Rng::new(0x69B0);
+        // (m, stop_nodes): stop_nodes = 4 exercises deep GPU parent levels +
+        // CPU top; a huge stop_nodes exercises the leaves-only + full-CPU-top
+        // shape; log_batch_size = 6 gives the production 1024-B leaf.
+        for (m, stop_nodes) in [(20usize, 4usize), (20, 1 << 30), (21, 64), (24, 64)] {
+            let params = PcsParams {
+                m,
+                log_inv_rate: 1,
+                log_batch_size: 6,
+                profile: Default::default(),
+                merkle_hash: HashKind::Blake3,
+            };
+            let z = rng.bits(1 << m);
+            let z_packed = super::super::pack::pack_witness(&z, m);
+
+            // CPU oracle: the normal path (gates keep it off the GPU here).
+            let (cpu_commitment, cpu_pd) = commit(&z_packed, &params);
+
+            // Forced GPU-hybrid.
+            let ntt = AdditiveNttF128::standard(params.k_code());
+            let mut codeword = crate::scratch::take_f128(params.codeword_len_f128());
+            let (gpu_tree, gpu_root) = gpu_streamed_commit(
+                &ntt,
+                &mut codeword,
+                &z_packed,
+                &params,
+                N_STREAM_CHUNKS,
+                stop_nodes,
+                false,
+            )
+            .expect("gpu_streamed_commit refused to start (begin() returned None)");
+
+            assert_eq!(
+                codeword, cpu_pd.codeword,
+                "codeword mismatch at m={m} (streamed NTT)"
+            );
+            assert_eq!(
+                gpu_tree, cpu_pd.merkle_tree,
+                "full tree mismatch at m={m} stop_nodes={stop_nodes}"
+            );
+            assert_eq!(
+                gpu_root, cpu_commitment.root,
+                "root mismatch at m={m} stop_nodes={stop_nodes}"
+            );
+            assert!(
+                crate::gpu::merkle::available(),
+                "GPU latched off during the hybrid commit at m={m} — a command \
+                 buffer failed mid-flight and the CPU repair masked it"
+            );
+            crate::scratch::give_f128(codeword);
+            give_tree(gpu_tree);
+        }
+    }
+
+    /// Production-scale smoke (256 MiB codeword, 2^18 leaves — the real
+    /// `finalize_commit` gate threshold): full commit through the public
+    /// entry, GPU-hybrid vs FLOCK-env-free CPU oracle. Ignored by default
+    /// (allocates ~0.5 GiB); run explicitly with `-- --ignored`.
+    /// SKIPS without Metal.
+    #[test]
+    #[ignore]
+    fn gpu_hybrid_commit_production_scale_smoke() {
+        if !crate::gpu::merkle::available() {
+            eprintln!("SKIP gpu_hybrid_commit_production_scale_smoke: Metal unavailable");
+            return;
+        }
+        // The warmup calibration Blake3Setup runs at m ≥ 26: must seed the
+        // rate atomics, keep the pipeline enabled on a healthy GPU, and leave
+        // the full GPU share in place.
+        gpu_merkle_warmup_calibrate();
+        assert!(
+            crate::gpu::merkle::available(),
+            "warmup calibration latched a healthy GPU off"
+        );
+        assert_eq!(gpu_merkle_split(), N_STREAM_CHUNKS);
+        assert!(MERKLE_CPU_NS_PER_MIB.load(Ordering::Relaxed) > 0);
+        assert!(MERKLE_GPU_NS_PER_MIB.load(Ordering::Relaxed) > 0);
+        let m = 30usize;
+        let params = PcsParams {
+            m,
+            log_inv_rate: 1,
+            log_batch_size: 6,
+            profile: Default::default(),
+            merkle_hash: HashKind::Blake3,
+        };
+        assert!(params.n_leaves() >= (1 << 18), "must clear the real gate");
+        // Random packed witness straight in F128 (2^23 × 16 B): bit-packing
+        // 2^30 bools would dominate the test for no coverage.
+        let mut rng = Rng::new(0x5CA1E);
+        let mut z_packed: Vec<F128> = crate::alloc_uninit_vec(1usize << params.log_msg_len());
+        for v in z_packed.iter_mut() {
+            *v = F128 {
+                lo: rng.next_u64(),
+                hi: rng.next_u64(),
+            };
+        }
+
+        // Public entry — exercises the production gates, the streamed NTT,
+        // prewire, calibration-size guard, GPU parents, CPU top.
+        let (commitment, pd) = commit(&z_packed, &params);
+
+        // CPU oracle on the SAME encoded codeword.
+        let bytes: &[u8] = unsafe {
+            core::slice::from_raw_parts(pd.codeword.as_ptr() as *const u8, pd.codeword.len() * 16)
+        };
+        let oracle = crate::merkle::merkle_tree(bytes, params.n_leaves(), HashKind::Blake3);
+        assert_eq!(pd.merkle_tree, oracle, "hybrid tree != CPU oracle at m={m}");
+        assert_eq!(commitment.root, *oracle.last().unwrap());
+        assert!(
+            crate::gpu::merkle::available(),
+            "GPU latched off during the production-scale hybrid commit"
+        );
     }
 }

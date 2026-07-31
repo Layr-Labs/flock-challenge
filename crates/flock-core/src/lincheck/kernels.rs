@@ -2,6 +2,7 @@
 mod aarch64;
 #[cfg(target_arch = "aarch64")]
 pub use aarch64::{
+    fold_block_major_chunk_neon_x2, gather_transpose_tile_neon, lincheck_qform_enabled,
     partial_fold_packed_z_neon_iblock_padded, partial_fold_packed_z_neon_oblock_padded,
     partial_fold_packed_z_neon_single, partial_fold_packed_z_neon_single_padded,
 };

@@ -27,8 +27,7 @@ pub mod ring_switch;
 pub mod tensor_algebra;
 
 pub use commit::{
-    Commitment, PcsParams, ProverData, commit, commit_into, commit_preinitialized,
-    prefault_codeword_during,
+    Commitment, PcsParams, ProverData, commit, commit_into, prefault_codeword_during,
 };
 pub use pack::{LOG_PACKING, pack_witness, unpack_witness};
 pub use ring_switch::{RingSwitchProof, SparseEqTensor};
@@ -93,6 +92,30 @@ pub struct PackedDirectClaim {
     pub eq_ind: DirectEqInd,
 }
 
+/// Run the `b_combined` build on the all-logical-cores commit pool
+/// ([`commit::wide_hash_pool`]). The combine is DRAM-store + L1-table bound
+/// and scales with the E-cores' extra issue capacity (paired same-session
+/// A/B, m=32 M4 Max, 18 opens/arm: 23.7 → 20.4 ms median), unlike the rest
+/// of the open phase, whose short statically-chunked sections regress behind
+/// E-core stragglers (lig-prove total +4.3 ms when the WHOLE phase runs
+/// wide: induce_sumcheck_poly +2.2, initial folds +1.0, recursive commits
+/// +0.9) — so only this section is widened. Gated to large opens
+/// (`l ≥ 2^22`, the m=29 ranked floor) and to configs where the global pool
+/// is actually narrower; `FLOCK_NO_OPEN_POOL=1` is the kill switch (local
+/// diagnostics; the ranked worker's cleared env never sets it). Pool width
+/// cannot change wire bytes: every parallel reduction here is an XOR sum.
+fn in_wide_combine_pool<R: Send>(l: usize, op: impl FnOnce() -> R + Send) -> R {
+    #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+    if l >= (1 << 22)
+        && std::thread::available_parallelism()
+            .is_ok_and(|n| n.get() > rayon::current_num_threads())
+        && std::env::var_os("FLOCK_NO_OPEN_POOL").is_none()
+    {
+        return commit::wide_hash_pool().install(op);
+    }
+    op()
+}
+
 /// Mixed-claim batched open: supports both **ring-switched** claims (bit-MLE
 /// openings reduced via `ring_switch::prove_batched`, with optional per-claim
 /// precomputed `s_hat_v`) and **packed-direct** claims (packed-MLE openings
@@ -114,8 +137,7 @@ pub fn open_batch_mixed_ligerito_with_precomputed_s_hat_v<Ch: Challenger>(
     lig_config: &ligerito::ProverConfig,
     challenger: &mut Ch,
 ) -> BatchOpeningProofLigerito {
-    let trace =
-        std::env::var("PCS_TRACE").is_ok() || std::env::var_os("FLOCK_OPEN_TIMING").is_some();
+    let trace = std::env::var("PCS_TRACE").is_ok();
     let t_total = std::time::Instant::now();
 
     assert_eq!(
@@ -129,6 +151,35 @@ pub fn open_batch_mixed_ligerito_with_precomputed_s_hat_v<Ch: Challenger>(
         lig_config.log_inv_rates[0], commitment.params.log_inv_rate,
     );
 
+    // Fold arena: all `initial_k` L0 fold rounds' output sizes are known
+    // right now — allocate one exact-size arena (2·(l − l/2^k) F128s; 1008 MiB
+    // at the ranked m=32 shape) and prefault it on a background thread WHILE
+    // `compute_combined_basis_and_target` runs (its b_combined pass is partly
+    // load-issue-bound, leaving spare DRAM bandwidth for the kernel's
+    // zero-fill). The fold rounds then carve slices instead of paying ~1 GiB
+    // of zero-fill + ~62k page faults inside the serial Fiat–Shamir chain.
+    // Strictly per-open (no cross-prove retention): moved into the sumcheck
+    // prover, freed when it drops. `FLOCK_NO_FOLD_ARENA` is a
+    // local-diagnostics escape hatch; the ranked worker's cleared environment
+    // never sets it.
+    #[cfg(target_arch = "aarch64")]
+    let fold_arena = {
+        let l = packed_witness.len();
+        let k = lig_config.initial_k;
+        // Sub-2^13 opens fold serially anyway (no carve) — skip the arena.
+        if k >= 1 && l >= (1 << 13) && std::env::var_os("FLOCK_NO_FOLD_ARENA").is_none() {
+            Some(ligerito::FoldArena::new_prefaulted(
+                ligerito::FoldArena::capacity_for(l, k),
+            ))
+        } else {
+            None
+        }
+    };
+    // x86_64 keeps its prewarmed scratch-pool fold path unchanged.
+    #[cfg(not(target_arch = "aarch64"))]
+    let fold_arena: Option<ligerito::FoldArena> = None;
+    crate::gaptime::mark("open: fold arena ready");
+
     let combined = compute_combined_basis_and_target(
         &packed_witness,
         x_outers,
@@ -138,6 +189,7 @@ pub fn open_batch_mixed_ligerito_with_precomputed_s_hat_v<Ch: Challenger>(
         challenger,
         trace,
     );
+    crate::gaptime::mark("open: combined basis + target done");
 
     let t = std::time::Instant::now();
     let ligerito_proof = ligerito::recursive_prover_with_basis_precomputed_round0(
@@ -148,8 +200,10 @@ pub fn open_batch_mixed_ligerito_with_precomputed_s_hat_v<Ch: Challenger>(
         &prover_data.codeword,
         &prover_data.merkle_tree,
         combined.round0_prime,
+        fold_arena,
         challenger,
     );
+    crate::gaptime::mark("open: ligerito recursive prover done");
     if trace {
         eprintln!(
             "  [open_batch] ligerito::recursive_prover_with_basis: {:6.2} ms",
@@ -219,6 +273,7 @@ fn compute_combined_basis_and_target<Ch: Challenger>(
     } else {
         (Vec::new(), Vec::new())
     };
+    crate::gaptime::mark("open: ring_switch done");
     if trace {
         eprintln!(
             "  [open_batch] ring_switch::prove_batched ×{}: {:6.2} ms",
@@ -294,10 +349,8 @@ fn compute_combined_basis_and_target<Ch: Challenger>(
 
     // ---- Build b_combined (γ-weighted sum of all rs_eq_ind + eq_ind) and the
     //      round-0 prime (u_0, u_2 over packed_witness · b_combined).
-    let t_alloc = std::time::Instant::now();
     let mut b_combined: Vec<F128> = crate::scratch::take_f128(l);
-    let alloc_ms = t_alloc.elapsed().as_secs_f64() * 1e3;
-    let t_fold = std::time::Instant::now();
+    crate::gaptime::mark("open: b_combined taken");
 
     // Fast path (compression-proof open: claims ab, c; also chain/merkle): every
     // RS claim is a fused DeferredDense fold and no DENSE packed-direct claim
@@ -315,85 +368,50 @@ fn compute_combined_basis_and_target<Ch: Challenger>(
     let use_fast =
         !rs_deferred.is_empty() && rs_deferred.len() == rs_results.len() && pd_dense.is_empty();
 
-    let (mut round0_u0, mut round0_u2) = if use_fast {
+    let (mut round0_u0, mut round0_u2) = in_wide_combine_pool(l, || if use_fast {
         let b = rs_deferred[0].0.len(); // eq_lo.len(); shared across claims (same split)
         debug_assert!(b >= 2 && b.is_multiple_of(2));
         debug_assert!(rs_deferred.iter().all(|d| d.0.len() == b));
-        // Composed-table sweep. `fold_one_slot(·, T)` is F₂-linear, so the
-        // per-slot map `lo ↦ fold_one_slot(lo·e_hi, T)` collapses into ONE
-        // per-claim-per-block byte table (`compose_fold_byte_table_into`),
-        // deleting the per-slot field multiply from the L-sized sweep —
-        // 1 GF mul × L × n_claims of counted work — for a per-block table
-        // build (~4.3k ops) amortized over b slots. Bit-identical: the
-        // composed table encodes exactly the same F₂-linear map (see the
-        // helper's docs). One 64 KiB table is live per thread at a time
-        // (claims composed and swept sequentially — table reused in place),
-        // preserving the claim-sequential L1 footprint.
-        //
-        // Small blocks (tiny test shapes) keep the direct slot-multiply
-        // sweep: the table build wouldn't amortize below ~2^12 slots.
-        const COMPOSE_MIN_BLOCK: usize = 1 << 12;
-        let composed = b >= COMPOSE_MIN_BLOCK;
-        b_combined
-            .par_chunks_mut(b)
-            .enumerate()
-            .map_init(
-                || {
-                    if composed {
-                        vec![F128::ZERO; ring_switch::FOLD_TABLE_LEN]
-                    } else {
-                        Vec::new()
-                    }
-                },
-                |ctable, (hi, out_block)| {
-                    // Accumulate each claim's block: first claim writes, rest add.
-                    // `e_hi` is folded into the composed table once per claim per
-                    // block, then swept over eq_lo with no per-slot multiply.
-                    for (ci, (eq_lo, eq_hi, table, _)) in rs_deferred.iter().enumerate() {
-                        let e_hi = eq_hi[hi];
-                        if composed {
-                            ring_switch::compose_fold_byte_table_into(e_hi, table, ctable);
-                            if ci == 0 {
-                                for (slot, &lo) in out_block.iter_mut().zip(eq_lo.iter()) {
-                                    *slot = ring_switch::fold_one_slot(lo, ctable);
-                                }
-                            } else {
-                                for (slot, &lo) in out_block.iter_mut().zip(eq_lo.iter()) {
-                                    *slot += ring_switch::fold_one_slot(lo, ctable);
-                                }
-                            }
-                        } else if ci == 0 {
-                            for (slot, &lo) in out_block.iter_mut().zip(eq_lo.iter()) {
-                                *slot = ring_switch::fold_one_slot(lo * e_hi, table);
-                            }
-                        } else {
-                            for (slot, &lo) in out_block.iter_mut().zip(eq_lo.iter()) {
-                                *slot += ring_switch::fold_one_slot(lo * e_hi, table);
-                            }
-                        }
-                    }
-                    // Round-0 prime over this block's pairs (b is even, base is
-                    // even). Separate pass over the L2-resident block — fusing it
-                    // into the last claim's sweep measured slower (pairwise
-                    // stepping breaks the streaming store pattern).
-                    let base = hi * b;
-                    let mut u0 = F128::ZERO;
-                    let mut u2 = F128::ZERO;
-                    for t in 0..(b / 2) {
-                        let s0 = out_block[2 * t];
-                        let s1 = out_block[2 * t + 1];
-                        let a0 = packed_witness[base + 2 * t];
-                        let a1 = packed_witness[base + 2 * t + 1];
-                        u0 += a0 * s0;
-                        u2 += (a0 + a1) * (s0 + s1);
-                    }
-                    (u0, u2)
-                },
-            )
-            .reduce(
-                || (F128::ZERO, F128::ZERO),
-                |(x0, x2), (y0, y2)| (x0 + y0, x2 + y2),
-            )
+        // aarch64 ranked path: accumulate the leading claims into a 64 KiB
+        // per-task stage and publish the final (s0, s1) pairs with `stnp q,q`
+        // (see `fused_fast_combine_staged_nt`) — kills the 512 MiB
+        // write-allocate read on the cold b_combined lines. Value-identical
+        // to `fused_fast_combine`; `FLOCK_NO_BCOMB_NT` is a local-diagnostics
+        // escape hatch (the ranked worker's cleared environment never sets it).
+        // COMBINE-MERGE AUTOPSY (2026-07-28, M4 Max, m=32, b=4096, paired
+        // same-session A/B, PCS_TRACE combine ms over 6 opens each):
+        //   staged two-pass (this default):        22.3-27.0 ms
+        //   fused2 single-pass (no stage, static
+        //     tables, 2 mult+fold per elem):        25.5-27.5 ms
+        //   merged (per-block composed tables,
+        //     0 mults, 1 fused pass):               33.3-42.0 ms
+        // The phase sits at the ONE-64KiB-table-live L1 floor: co-residing
+        // both claims' random-access tables (128 KiB = all of L1d, on top of
+        // the eq_lo/witness streams) thrashes, and the merged kernel's
+        // per-block 128 KiB table rebuild adds stores that dwarf the two
+        // saved GF mults/elem. Fewer fold evaluations per element is
+        // algebraically impossible for the production claim pair: the ab
+        // point (lincheck + AB-sumcheck challenges) and the c point (the
+        // zerocheck eq challenge r_rest) share no coordinates, so the two
+        // folds never share an argument (see fused_fast_combine_merged_nt
+        // docs for the exact non-commuting step). FLOCK_COMBINE_MERGE=1
+        // opts back into the merged kernel for re-measurement.
+        #[cfg(target_arch = "aarch64")]
+        let prime = if std::env::var_os("FLOCK_NO_BCOMB_NT").is_none() {
+            if rs_deferred.len() <= 2
+                && b >= MERGE_MIN_BLOCK
+                && std::env::var_os("FLOCK_COMBINE_MERGE").is_some()
+            {
+                fused_fast_combine_merged_nt(&mut b_combined, packed_witness, &rs_deferred, b)
+            } else {
+                fused_fast_combine_staged_nt(&mut b_combined, packed_witness, &rs_deferred, b)
+            }
+        } else {
+            fused_fast_combine(&mut b_combined, packed_witness, &rs_deferred, b)
+        };
+        #[cfg(not(target_arch = "aarch64"))]
+        let prime = fused_fast_combine(&mut b_combined, packed_witness, &rs_deferred, b);
+        prime
     } else {
         // General path (mixed / sparse / packed-direct): materialize any
         // deferred-dense claims (parallel block fold), then the per-element
@@ -440,9 +458,8 @@ fn compute_combined_basis_and_target<Ch: Challenger>(
             crate::scratch::give_f128(v);
         }
         prime
-    };
-    let fold_ms = t_fold.elapsed().as_secs_f64() * 1e3;
-    let t_sparse = std::time::Instant::now();
+    });
+    crate::gaptime::mark("open: combine kernel done");
     let mut adjust_prime_for_delta = |idx: usize, delta: F128| {
         let pair = idx / 2;
         let a0 = packed_witness[2 * pair];
@@ -474,14 +491,10 @@ fn compute_combined_basis_and_target<Ch: Challenger>(
     }
     if trace {
         eprintln!(
-            "  [open_batch] combine rs_eq_ind (L={}, rs×{}, pd×{}, fast={}): alloc {:6.2} ms, fold+prime {:6.2} ms, sparse {:6.2} ms, total {:6.2} ms",
+            "  [open_batch] combine rs_eq_ind (L={}, rs×{}, pd×{}): {:6.2} ms",
             l,
             n_rs,
             n_pd,
-            use_fast,
-            alloc_ms,
-            fold_ms,
-            t_sparse.elapsed().as_secs_f64() * 1e3,
             t.elapsed().as_secs_f64() * 1e3
         );
     }
@@ -501,6 +514,308 @@ fn compute_combined_basis_and_target<Ch: Challenger>(
         target_combined,
         round0_prime: (round0_u0, round0_u2),
     }
+}
+
+/// Fused fast-path combine: fold every DeferredDense claim block-by-block
+/// straight into `b_combined` — each claim's `e_hi` hoisted once per
+/// `b = eq_lo.len()`-slot block, exactly as in `fold_b128_elems_split` — and
+/// compute the round-0 prime `(u_0, u_2)` in the same pass. Every claim but
+/// the last writes/RMWs `out_block`; the last claim is handled pairwise so
+/// its result feeds the prime directly from registers rather than rereading
+/// all of `out_block`.
+fn fused_fast_combine(
+    b_combined: &mut [F128],
+    packed_witness: &[F128],
+    rs_deferred: &[(&[F128], &[F128], &[F128], usize)],
+    b: usize,
+) -> (F128, F128) {
+    use rayon::prelude::*;
+    b_combined
+        .par_chunks_mut(b)
+        .enumerate()
+        .map(|(hi, out_block)| {
+            // Accumulate every claim except the last: first claim writes,
+            // subsequent claims add.
+            let last = rs_deferred.len() - 1;
+            for (ci, (eq_lo, eq_hi, table, _)) in rs_deferred[..last].iter().enumerate() {
+                let e_hi = eq_hi[hi];
+                if ci == 0 {
+                    for (slot, &lo) in out_block.iter_mut().zip(eq_lo.iter()) {
+                        *slot = ring_switch::fold_one_slot(lo * e_hi, table);
+                    }
+                } else {
+                    for (slot, &lo) in out_block.iter_mut().zip(eq_lo.iter()) {
+                        *slot += ring_switch::fold_one_slot(lo * e_hi, table);
+                    }
+                }
+            }
+
+            // Final claim + round-0 prime over this block's pairs. This is
+            // the same scalar operation and pair order as the former final
+            // prime loop, but removes one full b_combined cache read pass.
+            let (eq_lo, eq_hi, table, _) = rs_deferred[last];
+            let e_hi = eq_hi[hi];
+            let base = hi * b;
+            let mut u0 = F128::ZERO;
+            let mut u2 = F128::ZERO;
+            for t in 0..(b / 2) {
+                let i0 = 2 * t;
+                let i1 = i0 + 1;
+                let v0 = ring_switch::fold_one_slot(eq_lo[i0] * e_hi, table);
+                let v1 = ring_switch::fold_one_slot(eq_lo[i1] * e_hi, table);
+                let (s0, s1) = if last == 0 {
+                    (v0, v1)
+                } else {
+                    (out_block[i0] + v0, out_block[i1] + v1)
+                };
+                out_block[i0] = s0;
+                out_block[i1] = s1;
+                let a0 = packed_witness[base + i0];
+                let a1 = packed_witness[base + i1];
+                u0 += a0 * s0;
+                u2 += (a0 + a1) * (s0 + s1);
+            }
+            (u0, u2)
+        })
+        .reduce(
+            || (F128::ZERO, F128::ZERO),
+            |(x0, x2), (y0, y2)| (x0 + y0, x2 + y2),
+        )
+}
+
+/// `stnp q,q` publish of two adjacent F128s (32 B) from NEON registers —
+/// non-temporal, so the destination line's write-allocate RFO read is
+/// skipped. No Rust intrinsic emits `stnp`; raw asm, same 3-line wrapper as
+/// the promoted q-form stnp family.
+///
+/// # Safety
+/// `dst` must be valid for 32 bytes of writes and 16-byte aligned.
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn store_nt_f128_pair(dst: *mut F128, v0: F128, v1: F128) {
+    // SAFETY: F128 is repr(C, align(16)) {lo, hi} little-endian — the same
+    // 16 bytes a q-register store publishes.
+    unsafe {
+        let q0: core::arch::aarch64::uint8x16_t = core::mem::transmute(v0);
+        let q1: core::arch::aarch64::uint8x16_t = core::mem::transmute(v1);
+        core::arch::asm!(
+            "stnp {a:q}, {b:q}, [{p}]",
+            a = in(vreg) q0,
+            b = in(vreg) q1,
+            p = in(reg) dst,
+            options(nostack, preserves_flags)
+        );
+    }
+}
+
+/// [`fused_fast_combine`] with staged accumulation + non-temporal publish.
+///
+/// The leading claims' first pass no longer touches the cold `b_combined`
+/// pool lines (512 MiB of write-allocate RFO at the ranked shape): it
+/// accumulates into a reused 64 KiB per-task stage buffer that stays L1/L2
+/// hot. The final pairwise loop reads the stage, forms the final `(s0, s1)`
+/// in registers, and publishes them with `stnp q,q` 32-byte pairs — every
+/// store to a `b_combined` line is non-temporal (blocks are line-aligned),
+/// so no allocate happens at all. `b_combined` is next read only at fold
+/// round 0, after a 19-bit Fiat–Shamir grind — fully DRAM-cold, so no SLC
+/// free-hits are lost.
+///
+/// The `fold_one_slot` table-read ORDER is exactly `fused_fast_combine`'s —
+/// only the store targets change — and the round-0 prime is fed from the
+/// same register values, so the result (and the transcript) is identical.
+#[cfg(target_arch = "aarch64")]
+fn fused_fast_combine_staged_nt(
+    b_combined: &mut [F128],
+    packed_witness: &[F128],
+    rs_deferred: &[(&[F128], &[F128], &[F128], usize)],
+    b: usize,
+) -> (F128, F128) {
+    use rayon::prelude::*;
+    b_combined
+        .par_chunks_mut(b)
+        .enumerate()
+        .map_init(
+            // Per-task stage, reused across this task's blocks. Uninit is
+            // safe: when `last > 0` claim 0 writes every slot before any
+            // read; when `last == 0` the stage is never touched.
+            || crate::alloc_uninit_f128_vec(b),
+            |stage, (hi, out_block)| {
+                let last = rs_deferred.len() - 1;
+                for (ci, (eq_lo, eq_hi, table, _)) in rs_deferred[..last].iter().enumerate() {
+                    let e_hi = eq_hi[hi];
+                    if ci == 0 {
+                        for (slot, &lo) in stage.iter_mut().zip(eq_lo.iter()) {
+                            *slot = ring_switch::fold_one_slot(lo * e_hi, table);
+                        }
+                    } else {
+                        for (slot, &lo) in stage.iter_mut().zip(eq_lo.iter()) {
+                            *slot += ring_switch::fold_one_slot(lo * e_hi, table);
+                        }
+                    }
+                }
+
+                let (eq_lo, eq_hi, table, _) = rs_deferred[last];
+                let e_hi = eq_hi[hi];
+                let base = hi * b;
+                let mut u0 = F128::ZERO;
+                let mut u2 = F128::ZERO;
+                let out_ptr = out_block.as_mut_ptr();
+                for t in 0..(b / 2) {
+                    let i0 = 2 * t;
+                    let i1 = i0 + 1;
+                    let v0 = ring_switch::fold_one_slot(eq_lo[i0] * e_hi, table);
+                    let v1 = ring_switch::fold_one_slot(eq_lo[i1] * e_hi, table);
+                    let (s0, s1) = if last == 0 {
+                        (v0, v1)
+                    } else {
+                        (stage[i0] + v0, stage[i1] + v1)
+                    };
+                    // SAFETY: i1 < b = out_block.len(), so out_ptr + i0 is
+                    // valid for 32 bytes; out_block is a par_chunks_mut(b)
+                    // block of a 16-aligned F128 buffer with b even, so the
+                    // address is 16-byte aligned.
+                    unsafe { store_nt_f128_pair(out_ptr.add(i0), s0, s1) };
+                    let a0 = packed_witness[base + i0];
+                    let a1 = packed_witness[base + i1];
+                    u0 += a0 * s0;
+                    u2 += (a0 + a1) * (s0 + s1);
+                }
+                (u0, u2)
+            },
+        )
+        .reduce(
+            || (F128::ZERO, F128::ZERO),
+            |(x0, x2), (y0, y2)| (x0 + y0, x2 + y2),
+        )
+}
+
+/// Minimum `b = eq_lo.len()` for [`fused_fast_combine_merged_nt`]: the
+/// per-block composed-table rebuild costs ~128 GF doublings + 128 folds +
+/// 4096 XORs per claim, which must amortize over the block's `b` fold
+/// evaluations. Production (m = 32) has b = 4096.
+#[cfg(target_arch = "aarch64")]
+const MERGE_MIN_BLOCK: usize = 2048;
+
+/// OPT-IN (`FLOCK_COMBINE_MERGE=1`) — measured SLOWER than the staged
+/// default at the production shape; kept as the reproducible negative +
+/// the record of why no algebraic claim-merging exists. See the autopsy
+/// comment at the call site for the paired numbers.
+///
+/// # Why the element loop cannot be halved (impossibility record)
+/// `fold_one_slot(x, T)` is the F2-linear map `M_T(x) = Σ_b x_b·col_T[b]` —
+/// linear in BOTH the table and the element. Claim merging
+/// (`fold(x,T1) + fold(x,T2) = fold(x, T1⊕T2)`) therefore needs a COMMON
+/// argument `x`. The production pair folds
+/// `x_ab(j) = eq_lo_ab[i]·eq_hi_ab[h]` and `x_c(j) = eq_lo_c[i]·eq_hi_c[h]`
+/// where the ab point is built from lincheck + AB-sumcheck bind challenges
+/// (`r_inner_*`, `mlv_challenges`) and the c point from the zerocheck eq
+/// challenge (`r_rest`) — independent Fiat–Shamir samples with zero shared
+/// coordinates (`r1cs::ab_claim_point` / `c_claim_point`, both layouts), so
+/// `x_ab(j) ≠ x_c(j)` and no merged table exists. Blockwise hi-factoring
+/// (`M(e_hi·x) = e_hi·M(x)`) fails because `M_T` is F2-linear but not
+/// GF(2^128)-linear: commuting with `mul_{e_hi}` for an `e_hi` generating
+/// the field forces `M = mul_{M(1)}` (the field is its own centralizer in
+/// End_F2), i.e. `eq(b, r'') = α·X^b` for all `b` — a measure-zero event
+/// for a Fiat–Shamir `r''`. And the fold inputs are products of uniform
+/// field elements, so no byte-level repetition exists to memoize.
+///
+/// # What this kernel does instead
+/// [`fused_fast_combine_staged_nt`] with the per-element GF multiply
+/// algebraically absorbed into per-block composed tables, and all (≤ 2)
+/// claims fused into ONE pass.
+///
+/// Identity used (exact, not approximate): `fold_one_slot(·, T)` is the
+/// F2-linear map `M_T`, and GF multiplication is F2-bilinear, so per block
+/// `hi` the map `x ↦ M_T(x · e_hi)` is itself F2-linear and is represented
+/// by a composed byte table built in O(4096) per block
+/// ([`ring_switch::compose_block_table`]). Then
+/// `b[hi·b + i] = Σ_c fold_one_slot(eq_lo_c[i], T'_{c,hi})` — no per-element
+/// multiply, no NEON→GPR byte-extract on the table-address critical path
+/// (`eq_lo_c[i]` loads straight into GPRs), and no 64 KiB stage buffer
+/// (both claims are folded in the same iteration, so `s0`/`s1` form in
+/// registers). The `stnp` publish and the round-0 prime feed are identical
+/// to the staged kernel.
+///
+/// Value-identity: every `s0`/`s1` is the same field element the staged
+/// kernel computes (exact F2 algebra), and the prime is an XOR-reduction
+/// (associative + commutative), so `b_combined` bytes and the transcript
+/// are unchanged. Oracle-tested against [`fused_fast_combine`].
+#[cfg(target_arch = "aarch64")]
+fn fused_fast_combine_merged_nt(
+    b_combined: &mut [F128],
+    packed_witness: &[F128],
+    rs_deferred: &[(&[F128], &[F128], &[F128], usize)],
+    b: usize,
+) -> (F128, F128) {
+    use rayon::prelude::*;
+    const TAB: usize = ring_switch::FOLD_TABLE_TOTAL;
+    let n_claims = rs_deferred.len();
+    assert!(n_claims == 1 || n_claims == 2);
+    b_combined
+        .par_chunks_mut(b)
+        .enumerate()
+        .map_init(
+            // Per-task composed-table storage (64 KiB per claim), rebuilt for
+            // every block. Uninit is safe: `compose_block_table` writes every
+            // slot before any read.
+            || crate::alloc_uninit_f128_vec(n_claims * TAB),
+            |tabs, (hi, out_block)| {
+                for (c, (_, eq_hi, table, _)) in rs_deferred.iter().enumerate() {
+                    ring_switch::compose_block_table(
+                        table,
+                        eq_hi[hi],
+                        &mut tabs[c * TAB..(c + 1) * TAB],
+                    );
+                }
+                let base = hi * b;
+                let mut u0 = F128::ZERO;
+                let mut u2 = F128::ZERO;
+                let out_ptr = out_block.as_mut_ptr();
+                match rs_deferred {
+                    [(lo0, _, _, _)] => {
+                        let t0 = &tabs[..TAB];
+                        for t in 0..(b / 2) {
+                            let i0 = 2 * t;
+                            let i1 = i0 + 1;
+                            let s0 = ring_switch::fold_one_slot(lo0[i0], t0);
+                            let s1 = ring_switch::fold_one_slot(lo0[i1], t0);
+                            // SAFETY: i1 < b = out_block.len(); out_block is a
+                            // par_chunks_mut(b) block of a 16-aligned F128
+                            // buffer with b even, so the address is 16-byte
+                            // aligned and valid for 32 bytes.
+                            unsafe { store_nt_f128_pair(out_ptr.add(i0), s0, s1) };
+                            let a0 = packed_witness[base + i0];
+                            let a1 = packed_witness[base + i1];
+                            u0 += a0 * s0;
+                            u2 += (a0 + a1) * (s0 + s1);
+                        }
+                    }
+                    [(lo0, _, _, _), (lo1, _, _, _)] => {
+                        let (t0, t1) = tabs.split_at(TAB);
+                        for t in 0..(b / 2) {
+                            let i0 = 2 * t;
+                            let i1 = i0 + 1;
+                            let s0 = ring_switch::fold_one_slot(lo0[i0], t0)
+                                + ring_switch::fold_one_slot(lo1[i0], t1);
+                            let s1 = ring_switch::fold_one_slot(lo0[i1], t0)
+                                + ring_switch::fold_one_slot(lo1[i1], t1);
+                            // SAFETY: as above.
+                            unsafe { store_nt_f128_pair(out_ptr.add(i0), s0, s1) };
+                            let a0 = packed_witness[base + i0];
+                            let a1 = packed_witness[base + i1];
+                            u0 += a0 * s0;
+                            u2 += (a0 + a1) * (s0 + s1);
+                        }
+                    }
+                    _ => unreachable!("gated to 1 or 2 claims"),
+                }
+                (u0, u2)
+            },
+        )
+        .reduce(
+            || (F128::ZERO, F128::ZERO),
+            |(x0, x2), (y0, y2)| (x0 + y0, x2 + y2),
+        )
 }
 
 /// Parallel sparse scatter-add: `b_combined[scatter_idx(c)] += gamma * eq.live_tensor[c]`
@@ -796,6 +1111,91 @@ mod tests {
             acc += eq_outer[i_outer] * inner;
         }
         acc
+    }
+    /// Oracle: `compose_block_table` — folding `x` through the composed
+    /// table must be bit-identical to folding `x * e_hi` through the base
+    /// table, for random tables/elements.
+    #[test]
+    fn compose_block_table_matches_mult_then_fold() {
+        let mut rng = Rng::new(0xC0_4B_1E5);
+        for trial in 0..4 {
+            let eq_r_dprime: Vec<F128> = (0..128).map(|_| rng.f128()).collect();
+            let base = ring_switch::build_fold_byte_table(&eq_r_dprime);
+            let e_hi = rng.f128();
+            let mut composed = vec![F128::ZERO; ring_switch::FOLD_TABLE_TOTAL];
+            ring_switch::compose_block_table(&base, e_hi, &mut composed);
+            for _ in 0..256 {
+                let x = rng.f128();
+                assert_eq!(
+                    ring_switch::fold_one_slot(x, &composed),
+                    ring_switch::fold_one_slot(x * e_hi, &base),
+                    "trial {trial}"
+                );
+            }
+            // Edge elements.
+            for x in [F128::ZERO, F128::ONE, F128::new(!0, !0)] {
+                assert_eq!(
+                    ring_switch::fold_one_slot(x, &composed),
+                    ring_switch::fold_one_slot(x * e_hi, &base),
+                );
+            }
+        }
+    }
+
+    /// Oracle: `fused_fast_combine_merged_nt` must produce byte-identical
+    /// `b_combined` and an identical round-0 prime vs the reference
+    /// `fused_fast_combine` (and the staged kernel), for 1- and 2-claim
+    /// shapes at several block sizes including the production-like split.
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn merged_combine_matches_reference() {
+        let mut rng = Rng::new(0x6E_46_D3);
+        for &(b, n_hi, n_claims) in &[
+            (16usize, 8usize, 2usize),
+            (64, 4, 1),
+            (2048, 4, 2),
+            (4096, 2, 2),
+            (4096, 2, 1),
+        ] {
+            let l = b * n_hi;
+            let packed_witness: Vec<F128> = (0..l).map(|_| rng.f128()).collect();
+            let claims: Vec<(Vec<F128>, Vec<F128>, Vec<F128>)> = (0..n_claims)
+                .map(|_| {
+                    let eq_lo: Vec<F128> = (0..b).map(|_| rng.f128()).collect();
+                    let eq_hi: Vec<F128> = (0..n_hi).map(|_| rng.f128()).collect();
+                    let eq_r_dprime: Vec<F128> = (0..128).map(|_| rng.f128()).collect();
+                    let table = ring_switch::build_fold_byte_table(&eq_r_dprime);
+                    (eq_lo, eq_hi, table)
+                })
+                .collect();
+            let rs_deferred: Vec<(&[F128], &[F128], &[F128], usize)> = claims
+                .iter()
+                .map(|(lo, hi, t)| {
+                    (
+                        lo.as_slice(),
+                        hi.as_slice(),
+                        t.as_slice(),
+                        b.trailing_zeros() as usize,
+                    )
+                })
+                .collect();
+
+            let mut b_ref = vec![F128::ZERO; l];
+            let prime_ref = fused_fast_combine(&mut b_ref, &packed_witness, &rs_deferred, b);
+
+            let mut b_merged = vec![F128::ZERO; l];
+            let prime_merged =
+                fused_fast_combine_merged_nt(&mut b_merged, &packed_witness, &rs_deferred, b);
+
+            assert_eq!(b_ref, b_merged, "b={b} n_hi={n_hi} claims={n_claims}");
+            assert_eq!(prime_ref, prime_merged, "b={b} n_hi={n_hi} claims={n_claims}");
+
+            let mut b_staged = vec![F128::ZERO; l];
+            let prime_staged =
+                fused_fast_combine_staged_nt(&mut b_staged, &packed_witness, &rs_deferred, b);
+            assert_eq!(b_staged, b_merged);
+            assert_eq!(prime_staged, prime_merged);
+        }
     }
 
     /// End-to-end Ligerito backend roundtrip through pcs::open_batch_mixed_ligerito
