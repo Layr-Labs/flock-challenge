@@ -247,6 +247,81 @@ pub unsafe fn ghash_mul_vec2_neon(a: [F128; 2], b: [F128; 2]) -> [F128; 2] {
     }
 }
 
+/// Batch-multiply two F128 values by one shared constant.
+///
+/// The generic two-lane path above uses eight independent schoolbook PMULLs.
+/// When both lanes share `b`, Karatsuba needs only six PMULLs and the caller
+/// can hoist `b.lo ^ b.hi` out of its streaming loop. The two unreduced
+/// products are repacked into the same lane-paired layout as
+/// [`ghash_mul_vec2_neon`] and retain its vectorized shift-XOR reduction.
+///
+/// # Safety
+/// Requires the `aes` target feature (compiles to PMULL); only call where
+/// `aes` is statically enabled or has been runtime-detected. `b_cross` must
+/// equal `b.lo ^ b.hi`.
+#[target_feature(enable = "aes")]
+pub unsafe fn ghash_mul_const_vec2_neon(a: [F128; 2], b: F128, b_cross: u64) -> [F128; 2] {
+    debug_assert_eq!(b_cross, b.lo ^ b.hi);
+
+    // SAFETY: function carries the aes target feature; pmull requires it.
+    unsafe {
+        // Interleave both Karatsuba products so their independent PMULLs can
+        // fill both execution pipes before either middle term is consumed.
+        let p0_ll = pmull(a[0].lo, b.lo);
+        let p0_hh = pmull(a[0].hi, b.hi);
+        let p1_ll = pmull(a[1].lo, b.lo);
+        let p1_hh = pmull(a[1].hi, b.hi);
+        let p0_mm = pmull(a[0].lo ^ a[0].hi, b_cross);
+        let p1_mm = pmull(a[1].lo ^ a[1].hi, b_cross);
+
+        let c0 = veorq_u64(veorq_u64(p0_mm, p0_ll), p0_hh);
+        let c1 = veorq_u64(veorq_u64(p1_mm, p1_ll), p1_hh);
+
+        // Lane-paired (mul0, mul1) unreduced words.
+        let r0 = vzip1q_u64(p0_ll, p1_ll);
+        let ll_hi = vzip2q_u64(p0_ll, p1_ll);
+        let c_lo = vzip1q_u64(c0, c1);
+        let r1 = veorq_u64(ll_hi, c_lo);
+        let hh_lo = vzip1q_u64(p0_hh, p1_hh);
+        let c_hi = vzip2q_u64(c0, c1);
+        let r2 = veorq_u64(hh_lo, c_hi);
+        let r3 = vzip2q_u64(p0_hh, p1_hh);
+
+        // Vectorized GHASH reduction, identical to the generic two-lane path.
+        let s1_lo = vshlq_n_u64::<1>(r2);
+        let s1_hi = veorq_u64(vshlq_n_u64::<1>(r3), vshrq_n_u64::<63>(r2));
+        let s2_lo = vshlq_n_u64::<2>(r2);
+        let s2_hi = veorq_u64(vshlq_n_u64::<2>(r3), vshrq_n_u64::<62>(r2));
+        let s7_lo = vshlq_n_u64::<7>(r2);
+        let s7_hi = veorq_u64(vshlq_n_u64::<7>(r3), vshrq_n_u64::<57>(r2));
+
+        let t_lo = veorq_u64(veorq_u64(r2, s1_lo), veorq_u64(s2_lo, s7_lo));
+        let t_hi = veorq_u64(veorq_u64(r3, s1_hi), veorq_u64(s2_hi, s7_hi));
+        let ov = veorq_u64(
+            veorq_u64(vshrq_n_u64::<63>(r3), vshrq_n_u64::<62>(r3)),
+            vshrq_n_u64::<57>(r3),
+        );
+        let corr = veorq_u64(
+            veorq_u64(ov, vshlq_n_u64::<1>(ov)),
+            veorq_u64(vshlq_n_u64::<2>(ov), vshlq_n_u64::<7>(ov)),
+        );
+
+        let final_lo = veorq_u64(veorq_u64(r0, t_lo), corr);
+        let final_hi = veorq_u64(r1, t_hi);
+
+        [
+            F128 {
+                lo: vgetq_lane_u64::<0>(final_lo),
+                hi: vgetq_lane_u64::<0>(final_hi),
+            },
+            F128 {
+                lo: vgetq_lane_u64::<1>(final_lo),
+                hi: vgetq_lane_u64::<1>(final_hi),
+            },
+        ]
+    }
+}
+
 /// Full 256-bit carry-less product `a · b`, no mod-p reduction. The standard
 /// middle-cross fold is baked in: r1 = ll_hi ^ cross_lo, r2 = hh_lo ^ cross_hi.
 ///

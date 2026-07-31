@@ -445,6 +445,22 @@ mod tests {
 
     #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
     #[test]
+    fn neon_mul_const_vec2_matches_scalar() {
+        let mut rng = Rng::new(12);
+        for _ in 0..128 {
+            let a0 = rng.next_f128();
+            let a1 = rng.next_f128();
+            let b = rng.next_f128();
+            let expected = [a0 * b, a1 * b];
+            let result =
+                unsafe { aarch64::ghash_mul_const_vec2_neon([a0, a1], b, b.lo ^ b.hi) };
+            assert_eq!(result[0], expected[0], "lane 0");
+            assert_eq!(result[1], expected[1], "lane 1");
+        }
+    }
+
+    #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+    #[test]
     fn all_neon_variants_agree() {
         let mut rng = Rng::new(8);
         for _ in 0..128 {
