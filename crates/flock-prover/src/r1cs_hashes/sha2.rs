@@ -2045,7 +2045,8 @@ mod tests {
     }
 
     /// Batch-major witness equality vs the row-major driver (word-transpose
-    /// + identical stripe), incl. padding slots via a non-power-of-two count.
+    /// + identical producer-defined stripe prefix), incl. padding slots via
+    /// a non-power-of-two count.
     #[test]
     fn batch_major_witness_matches_row_major_transposed() {
         for (n_inputs, n_log) in [(8usize, 3usize), (11, 4)] {
@@ -2058,7 +2059,18 @@ mod tests {
                 generate_witness_with_ab_packed_and_lincheck(&inputs, n_log);
             let (z_b, a_b, b_b, stripe_b) = generate_witness_batch_major(&inputs, n_log);
 
-            assert_eq!(stripe_b, stripe_r, "stripe diverged (n_log={n_log})");
+            let written_bytes = USEFUL_BITS.div_ceil(64) * 64;
+            for (g, (batch, row)) in stripe_b
+                .chunks_exact(K)
+                .zip(stripe_r.chunks_exact(K))
+                .enumerate()
+            {
+                assert_eq!(
+                    &batch[..written_bytes],
+                    &row[..written_bytes],
+                    "stripe diverged (n_log={n_log}, group={g})"
+                );
+            }
 
             let chunks_per_block = K / 128;
             let transpose = |row: &[flock_core::field::F128]| {
