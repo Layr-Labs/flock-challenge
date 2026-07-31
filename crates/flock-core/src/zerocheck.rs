@@ -29,7 +29,7 @@ pub mod univariate_skip_optimized;
 use multilinear::{
     UniSkipFoldTable, fold_and_compute_round_pair_into, fold_compact_and_compute_round_pair,
     fold_in_place_pair, interpolate_at_z_combined, interpolate_at_z_on_lambda, round_pair_naive,
-    uni_skip_fold_and_round_pair_compact_padded,
+    uni_skip_fold_and_round_pair_compact_padded_with_deltas,
 };
 use univariate_skip_optimized::{
     c_s_f128, medium_challenges_ghash, round1_shift_reduce_extract_c_packed_padded,
@@ -342,9 +342,11 @@ fn prove_packed_padded_inner<C: Challenger>(
         );
         (ab, c, None)
     };
-    // The A-sized transform is dead after the round-1 message and can return
-    // to the scratch pool before the much larger round-2 fold allocations.
-    drop(precomputed_ab);
+    // The A-sized transform is dead after the round-1 message. Its byte length
+    // exactly matches compact round two's delta storage, so retain its F128
+    // allocation/layout and donate it instead of taking a fresh Vec<u8>.
+    let compact_deltas =
+        precomputed_ab.map(univariate_skip_optimized::Round1AbInner::into_scratch_bytes);
     let c_s = c_s_f128();
     let round1_ab: Vec<F128> = round1_ab_opt.iter().map(|x| c_s * *x).collect();
     let round1_c: Vec<F128> = round1_c_opt.iter().map(|x| c_s * *x).collect();
@@ -378,7 +380,7 @@ fn prove_packed_padded_inner<C: Challenger>(
     let fold_table = UniSkipFoldTable::new(k_skip, z);
     let mut mlv_arg = vec![F128::ONE; n_mlv];
     mlv_arg[1..].copy_from_slice(&r[k_skip + 1..]);
-    let (compact_mlv, msg_1, msg_inf) = uni_skip_fold_and_round_pair_compact_padded(
+    let (compact_mlv, msg_1, msg_inf) = uni_skip_fold_and_round_pair_compact_padded_with_deltas(
         a_packed,
         b_packed,
         m,
@@ -386,6 +388,7 @@ fn prove_packed_padded_inner<C: Challenger>(
         &fold_table,
         &mlv_arg,
         padding,
+        compact_deltas,
     );
 
     if zc_timing {

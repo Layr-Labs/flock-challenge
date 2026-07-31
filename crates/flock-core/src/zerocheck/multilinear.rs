@@ -40,6 +40,7 @@
 ))]
 use crate::field::gf2_128::x86_64::{WideGhashX4, f128x4_loadu, f128x4_set, ghash_mul_x4};
 use crate::field::{F128, F256Unreduced, PHI_8_TABLE};
+use crate::scratch::ScratchBytes;
 use crate::zerocheck::PaddingSpec;
 use crate::zerocheck::univariate_skip::{SplitEqGhash, build_eq, pack_bits};
 
@@ -429,6 +430,20 @@ impl UniSkipFoldTable {
     }
 }
 
+/// Local split for compact production/reconstruction; intentionally
+/// independent of [`SplitEqGhash::MAX_N_HI`].
+///
+/// At ranked m=32, 11 hi bits give 2,048 jobs. Each producer job streams
+/// about 1.5 MiB and each reconstruction job about 1.4 MiB: the latter reads
+/// 48 bytes of anchor/delta data and writes 32 bytes per output (3:2
+/// read/write), while its 32 KiB lookup table remains hot. Ten hi bits leave
+/// roughly 3 MiB jobs and excess shared-L2 pressure across ten workers;
+/// twelve halves the footprint again but only adds scheduling/reduction
+/// overhead to an already cache-sized streaming job. Keeping this as one
+/// local constant makes 10/11/12 straightforward to screen without changing
+/// the schedule-tuned global split.
+const COMPACT_RECONSTRUCTION_N_HI: usize = 11;
+
 /// Compact materialization of the first multilinear level.
 ///
 /// For each adjacent post-URM row pair this keeps the folded even-row anchor
@@ -446,7 +461,7 @@ pub struct UniSkipCompactFold {
     /// Interleaved `[a_anchor, b_anchor]` entries, two F128s per row pair.
     pub anchors: Vec<F128>,
     /// Interleaved `[a_delta; 8], [b_delta; 8]`, sixteen bytes per row pair.
-    pub deltas: Vec<u8>,
+    pub deltas: ScratchBytes,
 }
 
 impl UniSkipCompactFold {
@@ -462,8 +477,9 @@ impl UniSkipCompactFold {
 
     /// Return both large buffers to their process-wide scratch pools.
     pub fn recycle(self) {
-        crate::scratch::give_f128(self.anchors);
-        crate::scratch::give_u8(self.deltas);
+        let Self { anchors, deltas } = self;
+        crate::scratch::give_f128(anchors);
+        deltas.recycle();
     }
 }
 
@@ -480,6 +496,32 @@ pub fn uni_skip_fold_and_round_pair_compact_padded(
     mlv_challenges: &[F128],
     padding: &PaddingSpec,
 ) -> (UniSkipCompactFold, F128, F128) {
+    uni_skip_fold_and_round_pair_compact_padded_with_deltas(
+        a_packed,
+        b_packed,
+        m,
+        k_skip,
+        table,
+        mlv_challenges,
+        padding,
+        None,
+    )
+}
+
+/// Donation-aware implementation of
+/// [`uni_skip_fold_and_round_pair_compact_padded`]. `deltas_backing`, when
+/// present, must have exactly the compact delta byte length; its original
+/// allocation layout is preserved by [`ScratchBytes`].
+pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_with_deltas(
+    a_packed: &[u8],
+    b_packed: &[u8],
+    m: usize,
+    k_skip: usize,
+    table: &UniSkipFoldTable,
+    mlv_challenges: &[F128],
+    padding: &PaddingSpec,
+    deltas_backing: Option<ScratchBytes>,
+) -> (UniSkipCompactFold, F128, F128) {
     use rayon::prelude::*;
 
     assert_eq!(
@@ -494,12 +536,19 @@ pub fn uni_skip_fold_and_round_pair_compact_padded(
     assert_eq!(b_packed.len(), n_out * n_chunks);
     assert_eq!(mlv_challenges.len(), m - k_skip);
 
+    let deltas_len = 2 * n_pairs * n_chunks;
+    let deltas = deltas_backing.unwrap_or_else(|| ScratchBytes::take(deltas_len));
+    assert_eq!(
+        deltas.len(),
+        deltas_len,
+        "donated compact delta backing has the wrong byte length"
+    );
     let mut compact = UniSkipCompactFold {
         anchors: crate::scratch::take_f128(2 * n_pairs),
-        deltas: crate::scratch::take_u8(2 * n_pairs * n_chunks),
+        deltas,
     };
 
-    let eq = SplitEqGhash::new(&mlv_challenges[1..]);
+    let eq = SplitEqGhash::with_n_hi(&mlv_challenges[1..], COMPACT_RECONSTRUCTION_N_HI);
     let lo_size = 1usize << eq.n_lo;
     let hi_size = 1usize << eq.n_hi;
     assert_eq!(lo_size * hi_size, n_pairs);
@@ -605,7 +654,7 @@ pub fn fold_compact_and_compute_round_pair(
     // Linearity makes each later row reconstruction lookup/XOR-only.
     let scaled_table = table.scaled_linear(r_fold);
 
-    let eq = SplitEqGhash::new(&r_next[1..]);
+    let eq = SplitEqGhash::with_n_hi(&r_next[1..], COMPACT_RECONSTRUCTION_N_HI);
     let lo_size = 1usize << eq.n_lo;
     let hi_size = 1usize << eq.n_hi;
     assert_eq!(lo_size * hi_size * 2, n);
@@ -1714,6 +1763,143 @@ mod tests {
             assert_eq!(b_fused, b_unf, "b mismatch at log_n={log_n}");
             assert_eq!(m1_fused, m1_unf, "msg_1 mismatch at log_n={log_n}");
             assert_eq!(minf_fused, minf_unf, "msg_inf mismatch at log_n={log_n}");
+        }
+    }
+
+    /// Full compact-path oracle against the legacy materialized round two.
+    ///
+    /// Covers both byte-pool and donated-F128 delta backing, forces all large
+    /// destinations to come from poisoned recycled storage, compares the
+    /// round-two wire message, then compares reconstructed A/B and the next
+    /// message after folding at rho=0, rho=1, an all-ones value, and a random
+    /// challenge.
+    #[test]
+    fn compact_round2_and_reconstruction_match_legacy_with_poisoned_scratch() {
+        const K_SKIP: usize = 6;
+        const M: usize = 20;
+        const K_LOG: usize = 14;
+        const USEFUL_BITS: usize = 15_409;
+        const POISON: F128 = F128 {
+            lo: 0xa5a5_a5a5_a5a5_a5a5,
+            hi: 0x5a5a_5a5a_5a5a_5a5a,
+        };
+
+        let mut rng = Rng::new(0xC0A0_AC7);
+        let mut a = rng.bits(1 << M);
+        let mut b = rng.bits(1 << M);
+        let block_size = 1usize << K_LOG;
+        for block in 0..(1usize << (M - K_LOG)) {
+            a[block * block_size + USEFUL_BITS..(block + 1) * block_size].fill(false);
+            b[block * block_size + USEFUL_BITS..(block + 1) * block_size].fill(false);
+        }
+        let a_packed = pack_bits(&a);
+        let b_packed = pack_bits(&b);
+        let z = rng.f128();
+        let mlv_challenges = rng.f128_vec(M - K_SKIP);
+        let r_next = rng.f128_vec(M - K_SKIP - 1);
+        let random_rho = rng.f128();
+        let rhos = [
+            F128::ZERO,
+            F128::ONE,
+            F128 {
+                lo: u64::MAX,
+                hi: u64::MAX,
+            },
+            random_rho,
+        ];
+        let table = UniSkipFoldTable::new(K_SKIP, z);
+        let padding = PaddingSpec {
+            k_log: K_LOG,
+            useful_bits_per_block: USEFUL_BITS,
+        };
+        let n_out = 1usize << (M - K_SKIP);
+        let n_pairs = n_out / 2;
+        let deltas_len = n_out * table.n_chunks;
+
+        for donate_f128 in [false, true] {
+            crate::scratch::clear();
+
+            let (legacy_a, legacy_b, legacy_m1, legacy_mi) =
+                uni_skip_fold_and_round_pair_optimized_packed_padded(
+                    &a_packed,
+                    &b_packed,
+                    M,
+                    K_SKIP,
+                    &table,
+                    &mlv_challenges,
+                    &padding,
+                );
+
+            // Hold all poison allocations until they are initialized so
+            // smallest-fit cannot substitute the larger anchor allocation for
+            // either reconstruction output.
+            let mut poison_a_out = crate::scratch::take_f128(n_pairs);
+            let mut poison_b_out = crate::scratch::take_f128(n_pairs);
+            let mut poison_anchors = crate::scratch::take_f128(n_out);
+            poison_a_out.fill(POISON);
+            poison_b_out.fill(POISON);
+            poison_anchors.fill(POISON);
+            crate::scratch::give_f128(poison_a_out);
+            crate::scratch::give_f128(poison_b_out);
+            crate::scratch::give_f128(poison_anchors);
+
+            let deltas_backing = if donate_f128 {
+                let donor = vec![POISON; deltas_len / core::mem::size_of::<F128>()];
+                Some(ScratchBytes::from_initialized_f128(donor))
+            } else {
+                let mut poison_deltas = crate::scratch::take_u8(deltas_len);
+                poison_deltas.fill(0xa5);
+                crate::scratch::give_u8(poison_deltas);
+                None
+            };
+
+            let (compact, compact_m1, compact_mi) =
+                uni_skip_fold_and_round_pair_compact_padded_with_deltas(
+                    &a_packed,
+                    &b_packed,
+                    M,
+                    K_SKIP,
+                    &table,
+                    &mlv_challenges,
+                    &padding,
+                    deltas_backing,
+                );
+            assert_eq!(
+                (compact_m1, compact_mi),
+                (legacy_m1, legacy_mi),
+                "round-two message mismatch; donate_f128={donate_f128}"
+            );
+
+            for &rho in &rhos {
+                let mut expected_a = legacy_a.clone();
+                let mut expected_b = legacy_b.clone();
+                fold_in_place_pair(&mut expected_a, &mut expected_b, rho);
+                let expected_msg = round_pair_naive(&expected_a, &expected_b, &r_next);
+
+                let (actual_a, actual_b, actual_m1, actual_mi) =
+                    fold_compact_and_compute_round_pair(&compact, &table, rho, &r_next);
+                assert_eq!(
+                    actual_a, expected_a,
+                    "reconstructed A mismatch; donate_f128={donate_f128}, rho={rho:?}"
+                );
+                assert_eq!(
+                    actual_b, expected_b,
+                    "reconstructed B mismatch; donate_f128={donate_f128}, rho={rho:?}"
+                );
+                assert_eq!(
+                    (actual_m1, actual_mi),
+                    expected_msg,
+                    "post-reconstruction message mismatch; donate_f128={donate_f128}, rho={rho:?}"
+                );
+
+                crate::scratch::give_f128(actual_a);
+                crate::scratch::give_f128(actual_b);
+            }
+
+            compact.recycle();
+            crate::scratch::give_f128(legacy_a);
+            crate::scratch::give_f128(legacy_b);
+            crate::scratch::clear();
         }
     }
 

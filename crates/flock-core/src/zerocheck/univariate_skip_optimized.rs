@@ -295,6 +295,12 @@ impl Round1AbInner {
     pub fn len_bytes(&self) -> usize {
         self.storage.len() * core::mem::size_of::<F128>()
     }
+
+    /// Donate the now-dead transform to a byte-oriented scratch consumer
+    /// without changing the allocation's element type or deallocation layout.
+    pub(crate) fn into_scratch_bytes(mut self) -> crate::scratch::ScratchBytes {
+        crate::scratch::ScratchBytes::from_initialized_f128(core::mem::take(&mut self.storage))
+    }
 }
 
 impl Drop for Round1AbInner {
