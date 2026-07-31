@@ -193,6 +193,22 @@ fn use_ranked_deep_pair_fusion(
         && n_top == 10
 }
 
+/// The standard dimension-20 basis has low-limb-only twiddles throughout the
+/// final two layers. This permits a two-PMULL product on AArch64 instead of the
+/// generic six-PMULL field multiply. Keep the dispatch tied to the exact
+/// ranked deep-transform geometry.
+#[inline]
+fn use_ranked_low_twiddle_final_pair(log_d: usize, num_ntts: usize, n_top: usize) -> bool {
+    cfg!(all(
+        target_os = "macos",
+        target_arch = "aarch64",
+        target_feature = "aes"
+    )) && log_d == 20
+        && num_ntts == 64
+        && n_top == 10
+        && std::env::var_os("FLOCK_NO_NTT_LOW_TWIDDLE_FINAL").is_none()
+}
+
 /// The zero-root radix-8 kernel is currently scored only for the ranked L0
 /// transform. Keep recursive and diagnostic commits on their prior kernel so
 /// this candidate has one production scope and one transfer story.
@@ -863,6 +879,8 @@ impl AdditiveNttF128 {
         debug_assert_eq!(data.len(), (1usize << log_d) * num_ntts);
         let sub_size_positions = 1usize << (log_d - n_top);
         let sub_elems = sub_size_positions * num_ntts;
+        let low_twiddle_final_pair =
+            use_ranked_low_twiddle_final_pair(log_d, num_ntts, n_top);
 
         data.par_chunks_mut(sub_elems)
             .enumerate()
@@ -881,14 +899,28 @@ impl AdditiveNttF128 {
                         let t_inner_a = self.twiddle(layer + 1, 2 * global_block);
                         let t_inner_b = self.twiddle(layer + 1, 2 * global_block + 1);
                         let block_start = block_in_sub * block_elems;
-                        butterfly_interleaved_fused_2layer_rows_seq(
-                            &mut sub_data[block_start..block_start + block_elems],
-                            t_outer,
-                            t_inner_a,
-                            t_inner_b,
-                            quarter,
-                            num_ntts,
-                        );
+                        if low_twiddle_final_pair && layer + 2 == log_d {
+                            debug_assert_eq!(t_outer.hi, 0);
+                            debug_assert_eq!(t_inner_a.hi, 0);
+                            debug_assert_eq!(t_inner_b.hi, 0);
+                            butterfly_interleaved_fused_2layer_low_twiddles_rows_seq(
+                                &mut sub_data[block_start..block_start + block_elems],
+                                t_outer,
+                                t_inner_a,
+                                t_inner_b,
+                                quarter,
+                                num_ntts,
+                            );
+                        } else {
+                            butterfly_interleaved_fused_2layer_rows_seq(
+                                &mut sub_data[block_start..block_start + block_elems],
+                                t_outer,
+                                t_inner_a,
+                                t_inner_b,
+                                quarter,
+                                num_ntts,
+                            );
+                        }
                     }
                     layer += 2;
                 }
@@ -1299,6 +1331,38 @@ fn butterfly_interleaved_fused_2layer_rows_seq(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
+#[inline]
+fn butterfly_interleaved_fused_2layer_low_twiddles_rows_seq(
+    block: &mut [F128],
+    t_outer: F128,
+    t_inner_a: F128,
+    t_inner_b: F128,
+    quarter: usize,
+    num_ntts: usize,
+) {
+    let stride = quarter * num_ntts;
+    debug_assert!(num_ntts > 0);
+    debug_assert_eq!(block.len(), 4 * stride);
+    debug_assert_eq!(t_outer.hi, 0);
+    debug_assert_eq!(t_inner_a.hi, 0);
+    debug_assert_eq!(t_inner_b.hi, 0);
+
+    let (top_half, bot_half) = block.split_at_mut(2 * stride);
+    let (q1, q2) = top_half.split_at_mut(stride);
+    let (q3, q4) = bot_half.split_at_mut(stride);
+    for (((row_a, row_b), row_c), row_d) in q1
+        .chunks_exact_mut(num_ntts)
+        .zip(q2.chunks_exact_mut(num_ntts))
+        .zip(q3.chunks_exact_mut(num_ntts))
+        .zip(q4.chunks_exact_mut(num_ntts))
+    {
+        kernels::butterfly_fused_2layer_low_twiddles(
+            row_a, row_b, row_c, row_d, t_outer, t_inner_a, t_inner_b,
+        );
+    }
+}
+
 /// Butterfly one block of an interleaved (SoA) buffer with shared twiddle.
 ///
 /// `block` has length `(2 * block_size_half) * num_ntts` and is laid out as
@@ -1647,6 +1711,56 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// The low-twiddle AArch64 kernel is algebraically identical to the
+    /// generic fused pair for every lane geometry used by the ranked final
+    /// pair.
+    #[test]
+    fn fused2_low_twiddles_match_generic() {
+        let mut rng = Rng::new(0x10F1_7A11_20A5_0001);
+        for (quarter, num_ntts) in [(1usize, 64usize), (4, 8), (64, 2)] {
+            for iteration in 0..4 {
+                let t_outer = F128::new(rng.next_u64(), 0);
+                let t_inner_a = F128::new(rng.next_u64(), 0);
+                let t_inner_b = F128::new(rng.next_u64(), 0);
+                let source = rand_vec(&mut rng, 4 * quarter * num_ntts);
+
+                let mut want = source.clone();
+                butterfly_interleaved_fused_2layer_rows_seq(
+                    &mut want, t_outer, t_inner_a, t_inner_b, quarter, num_ntts,
+                );
+                let mut got = source;
+                butterfly_interleaved_fused_2layer_low_twiddles_rows_seq(
+                    &mut got, t_outer, t_inner_a, t_inner_b, quarter, num_ntts,
+                );
+                assert_eq!(
+                    got, want,
+                    "low-twiddle fused-2 mismatch at quarter={quarter} \
+                     num_ntts={num_ntts} iteration={iteration}"
+                );
+            }
+        }
+    }
+
+    /// Exhaust the exact production tables used by layers 18 and 19. This is
+    /// the invariant that makes the ranked narrow dispatch sound.
+    #[test]
+    fn standard_dim20_final_pair_twiddles_have_zero_high_limbs() {
+        let ntt = AdditiveNttF128::standard(20);
+        for layer in 18..20 {
+            for block in 0..(1usize << layer) {
+                assert_eq!(
+                    ntt.twiddle(layer, block).hi,
+                    0,
+                    "nonzero high limb at layer={layer} block={block}"
+                );
+            }
+        }
+        assert!(use_ranked_low_twiddle_final_pair(20, 64, 10));
+        assert!(!use_ranked_low_twiddle_final_pair(19, 64, 10));
+        assert!(!use_ranked_low_twiddle_final_pair(20, 32, 10));
+        assert!(!use_ranked_low_twiddle_final_pair(20, 64, 9));
     }
 
     /// Exercise five fused deep pairs with the ranked 1024-position subtree
