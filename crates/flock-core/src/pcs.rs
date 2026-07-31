@@ -208,9 +208,52 @@ struct CombinedClaim {
 /// quadratics in the first challenge. The latter lets the ranked prover sample
 /// its second challenge before binding the first, so both binds share one pass.
 #[inline]
+fn use_ranked_open_lookahead_neon(ranked_shape: bool, len: usize) -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    cfg!(all(
+        target_os = "macos",
+        target_arch = "aarch64",
+        target_feature = "aes"
+    )) && ranked_shape
+        && len == (1usize << 15)
+        && *ON.get_or_init(|| std::env::var_os("FLOCK_NO_OPEN_LOOKAHEAD_NEON").is_none())
+}
+
+#[inline]
+#[cfg(test)]
 fn round0_and_round1_lookahead(witness: &[F128], basis: &[F128]) -> ((F128, F128), [F128; 6]) {
     assert_eq!(witness.len(), basis.len());
     assert!(witness.len().is_multiple_of(4));
+
+    round0_and_round1_lookahead_scalar(witness, basis)
+}
+
+/// Ranked-shape dispatcher for the deferred-reduction AArch64 kernel. Keeping
+/// the generic helper scalar makes promotion an explicit property of the two
+/// benchmark geometry call sites rather than an accidental property of a
+/// local 2^15-slot slice.
+#[inline]
+fn round0_and_round1_lookahead_ranked(
+    witness: &[F128],
+    basis: &[F128],
+    ranked_shape: bool,
+) -> ((F128, F128), [F128; 6]) {
+    assert_eq!(witness.len(), basis.len());
+    assert!(witness.len().is_multiple_of(4));
+
+    #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+    if use_ranked_open_lookahead_neon(ranked_shape, witness.len()) {
+        return crate::field::f128_slice::round0_and_round1_lookahead(witness, basis);
+    }
+
+    round0_and_round1_lookahead_scalar(witness, basis)
+}
+
+#[inline]
+fn round0_and_round1_lookahead_scalar(
+    witness: &[F128],
+    basis: &[F128],
+) -> ((F128, F128), [F128; 6]) {
     let mut u0 = F128::ZERO;
     let mut u2 = F128::ZERO;
     let mut c = [F128::ZERO; 6];
@@ -293,6 +336,21 @@ fn messages_from_direct_products(
 #[inline]
 fn is_ranked_hetero_open_combine_shape(l: usize, b: usize, n_rs: usize, n_pd: usize) -> bool {
     l == (1usize << 25) && b == (1usize << 15) && n_rs == 2 && n_pd == 0
+}
+
+/// Exact ranked direct-fold2 materialization shapes. The first arm is the
+/// frontier AB claim plus ordinary C basis; the second is deferred C encoded
+/// as a second direct claim with no materialized ordinary basis.
+#[inline]
+fn is_ranked_direct_fold2_lookahead_shape(
+    packed_len: usize,
+    block_len: usize,
+    claim_count: usize,
+    has_ordinary: bool,
+) -> bool {
+    packed_len == (1usize << 25)
+        && block_len == (1usize << 15)
+        && ((claim_count == 1 && has_ordinary) || (claim_count == 2 && !has_ordinary))
 }
 
 #[inline]
@@ -708,12 +766,17 @@ fn compute_combined_basis_and_target<Ch: Challenger>(
             }
             (u0, u2)
         };
+        let ranked_lookahead_neon = enable_fold2
+            && is_ranked_hetero_open_combine_shape(l, b, n_rs, n_pd);
         let fold_lookahead_block = |ctable: &mut Vec<F128>, hi: usize, out_block: &mut [F128]| {
             fill_block(ctable, hi, out_block);
             let base = hi * b;
             debug_assert!(b.is_multiple_of(4));
-            let ((u0, u2), lookahead) =
-                round0_and_round1_lookahead(&packed_witness[base..base + b], out_block);
+            let ((u0, u2), lookahead) = round0_and_round1_lookahead_ranked(
+                &packed_witness[base..base + b],
+                out_block,
+                ranked_lookahead_neon,
+            );
             (u0, u2, lookahead)
         };
         let init_ctable = || {
@@ -1359,6 +1422,74 @@ mod tests {
             assert_eq!(evaluated, oracle1, "round one at log_n={log_n}");
         }
     }
+
+    #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+    #[test]
+    fn ranked_open_lookahead_neon_matches_scalar() {
+        let mut rng = Rng::new(0x10CA_AEAD);
+        for log_n in [2usize, 5, 9, 15] {
+            let n = 1usize << log_n;
+            let witness: Vec<F128> = (0..n).map(|_| rng.f128()).collect();
+            let basis: Vec<F128> = (0..n).map(|_| rng.f128()).collect();
+            let expected = round0_and_round1_lookahead_scalar(&witness, &basis);
+            let actual = crate::field::f128_slice::round0_and_round1_lookahead(
+                &witness,
+                &basis,
+            );
+            assert_eq!(actual, expected, "deferred reduction at log_n={log_n}");
+        }
+    }
+
+    #[test]
+    fn ranked_open_lookahead_neon_gate_is_exact() {
+        let expected = cfg!(all(
+            target_os = "macos",
+            target_arch = "aarch64",
+            target_feature = "aes"
+        )) && std::env::var_os("FLOCK_NO_OPEN_LOOKAHEAD_NEON").is_none();
+        assert_eq!(use_ranked_open_lookahead_neon(true, 1usize << 15), expected);
+        assert!(!use_ranked_open_lookahead_neon(false, 1usize << 15));
+        assert!(!use_ranked_open_lookahead_neon(true, 1usize << 14));
+        assert!(!use_ranked_open_lookahead_neon(true, 1usize << 16));
+
+        assert!(is_ranked_direct_fold2_lookahead_shape(
+            1 << 25,
+            1 << 15,
+            1,
+            true,
+        ));
+        assert!(is_ranked_direct_fold2_lookahead_shape(
+            1 << 25,
+            1 << 15,
+            2,
+            false,
+        ));
+        assert!(!is_ranked_direct_fold2_lookahead_shape(
+            1 << 24,
+            1 << 15,
+            2,
+            false,
+        ));
+        assert!(!is_ranked_direct_fold2_lookahead_shape(
+            1 << 25,
+            1 << 14,
+            2,
+            false,
+        ));
+        assert!(!is_ranked_direct_fold2_lookahead_shape(
+            1 << 25,
+            1 << 15,
+            1,
+            false,
+        ));
+        assert!(!is_ranked_direct_fold2_lookahead_shape(
+            1 << 25,
+            1 << 15,
+            2,
+            true,
+        ));
+    }
+
     #[test]
     fn direct_products_reproduce_round0_and_lookahead() {
         let mut rng = Rng::new(0xD1CE_0002);
