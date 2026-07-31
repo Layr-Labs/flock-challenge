@@ -2600,7 +2600,6 @@ fn fold_and_msg_lsb_into(
     nf: &mut Vec<F128>,
     nb: &mut Vec<F128>,
 ) -> SumcheckMessage {
-    use rayon::prelude::*;
     let n = f.len();
     debug_assert!(n.is_power_of_two() && n >= 2);
     debug_assert_eq!(b.len(), n);
@@ -2640,42 +2639,88 @@ fn fold_and_msg_lsb_into(
     // power of two, so every chunk has even length and starts at an even
     // global index — message pairs (2k, 2k+1) never straddle a chunk boundary.
     const CHUNK: usize = 2048;
-    let (u_0, u_2) = nf
-        .par_chunks_mut(CHUNK)
-        .zip(nb.par_chunks_mut(CHUNK))
-        .enumerate()
-        .map(|(ci, (fc, bc))| {
-            let base = ci * CHUNK;
-            #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
-            {
-                return crate::field::f128_slice::fold_two_and_msg(f, b, base, fc, bc, r);
-            }
+    let n_chunks = half.div_ceil(CHUNK);
 
-            #[cfg(not(all(target_arch = "aarch64", target_feature = "aes")))]
-            {
-                let len = fc.len();
-                let mut u0 = F128::ZERO;
-                let mut u2 = F128::ZERO;
-                // Fold this slice, then pair up the just-folded values for the msg.
-                crate::field::f128_slice::fold_pairs(f, base, fc, r);
-                crate::field::f128_slice::fold_pairs(b, base, bc, r);
-                let mut k = 0;
-                while k + 1 < len {
-                    let f0 = fc[k];
-                    let f1 = fc[k + 1];
-                    let b0 = bc[k];
-                    let b1 = bc[k + 1];
-                    u0 += f0 * b0;
-                    u2 += (f0 + f1) * (b0 + b1);
-                    k += 2;
-                }
-                (u0, u2)
+    // Chunks drain through the hetero queue so the otherwise idle efficiency
+    // cores add throughput without an equal-band barrier penalty (see
+    // `epool`). Chunk `ci` writes only `nf[base..base+len]`, `nb[base..
+    // base+len]` and `partials[ci]`; the reduce below is a serial XOR in
+    // ascending chunk order, so the message is bit-identical to the rayon
+    // map-reduce this replaces.
+    //
+    // `epool::EPOOL_MIN_CHUNKS` (16) already keeps tiny jobs main-pool-only.
+    // This site raises that bar. Unlike the hash- and gather-dominated epool
+    // call sites, every chunk here is PMULL-bound, so an efficiency core
+    // contributes at a lower per-core rate and the fixed cross-pool kickoff is
+    // amortized against less headroom. The fold ladder also calls this once
+    // per round with a geometrically halving `half`, so a per-round fixed cost
+    // would be paid on many rounds that together hold almost none of the work:
+    // gating at 64 chunks (`half >= 128 Ki`) still covers >99% of the ladder's
+    // total element count. This number is a GUESS, not a tuned value — it is
+    // pending measurement on an uncontended machine, and should be lowered or
+    // dropped if the small rounds turn out to profit.
+    const EPOOL_MIN_FOLD_CHUNKS: usize = 64;
+
+    let mut partials: Vec<(F128, F128)> = vec![(F128::ZERO, F128::ZERO); n_chunks];
+    let nf_base = crate::epool::SyncPtr(nf.as_mut_ptr());
+    let nb_base = crate::epool::SyncPtr(nb.as_mut_ptr());
+    let partials_base = crate::epool::SyncPtr(partials.as_mut_ptr());
+    let body = |ci: usize| {
+        let base = ci * CHUNK;
+        let len = CHUNK.min(half - base);
+        // SAFETY: the queue hands out each `ci` exactly once, and the ranges
+        // `[ci*CHUNK, ci*CHUNK+len)` are pairwise disjoint and within `half`,
+        // so this chunk exclusively owns its `nf`/`nb` sub-slices — the same
+        // partition `par_chunks_mut(CHUNK)` produced. `nf`/`nb` are `&mut`
+        // and cannot alias the shared reads of `f`/`b`. The queue's completion
+        // join publishes the writes before the reduction below reads them.
+        let (fc, bc) = unsafe {
+            (
+                std::slice::from_raw_parts_mut(nf_base.ptr().add(base), len),
+                std::slice::from_raw_parts_mut(nb_base.ptr().add(base), len),
+            )
+        };
+
+        #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+        let (u0, u2) = crate::field::f128_slice::fold_two_and_msg(f, b, base, fc, bc, r);
+
+        #[cfg(not(all(target_arch = "aarch64", target_feature = "aes")))]
+        let (u0, u2) = {
+            let mut u0 = F128::ZERO;
+            let mut u2 = F128::ZERO;
+            // Fold this slice, then pair up the just-folded values for the msg.
+            crate::field::f128_slice::fold_pairs(f, base, fc, r);
+            crate::field::f128_slice::fold_pairs(b, base, bc, r);
+            let mut k = 0;
+            while k + 1 < len {
+                let f0 = fc[k];
+                let f1 = fc[k + 1];
+                let b0 = bc[k];
+                let b1 = bc[k + 1];
+                u0 += f0 * b0;
+                u2 += (f0 + f1) * (b0 + b1);
+                k += 2;
             }
-        })
-        .reduce(
-            || (F128::ZERO, F128::ZERO),
-            |(a0, a2), (c0, c2)| (a0 + c0, a2 + c2),
-        );
+            (u0, u2)
+        };
+
+        // SAFETY: exclusive owner of `partials[ci]` (see above).
+        unsafe {
+            *partials_base.ptr().add(ci) = (u0, u2);
+        }
+    };
+    let helper = if n_chunks >= EPOOL_MIN_FOLD_CHUNKS {
+        crate::epool::epool()
+    } else {
+        None
+    };
+    crate::epool::run_chunks_with_helper(n_chunks, &body, helper);
+
+    let (u_0, u_2) = partials
+        .iter()
+        .fold((F128::ZERO, F128::ZERO), |(a0, a2), &(c0, c2)| {
+            (a0 + c0, a2 + c2)
+        });
     SumcheckMessage { u_0, u_2 }
 }
 

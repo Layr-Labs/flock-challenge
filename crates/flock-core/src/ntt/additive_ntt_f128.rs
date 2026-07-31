@@ -41,7 +41,7 @@
 //! FRI fold processes layers in **reverse** (deepest first), at which level
 //! pairs are adjacent — matching the standard `fold_pair` formula in DP24.
 
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, LazyLock, OnceLock};
 
 use crate::field::F128;
 
@@ -144,6 +144,34 @@ fn cached_standard_twiddles(dim: usize, evals: &[Vec<F128>]) -> Option<Arc<[F128
     )
 }
 
+/// Largest `dim` whose standard-basis eval table is memoized. [`AdditiveNttF128::standard`]
+/// asserts `dim ≤ 64`, and the table below is 65 pointer-sized `OnceLock`s
+/// (~1 KiB of statics), so every legal `dim` gets a slot.
+const MAX_STANDARD_EVALS_LOG: usize = 64;
+
+/// Memoized normalized subspace-polynomial table for the standard basis.
+///
+/// `AdditiveNttF128::standard(dim)` is a **pure function of `dim`**: its basis is
+/// literally `(0..dim).map(|i| F128::new(1 << i, 0))`, with no state, randomness,
+/// or caller input beyond `dim`. `generate_evals_from_subspace` is itself pure,
+/// so every call with the same `dim` returns bit-identical rows. Memoizing on
+/// `dim` alone is therefore sound and bit-exact.
+///
+/// Worth caching because the recomputation is not free: the subspace walk is
+/// `O(dim²)` field multiplies and each of the `dim` rows costs one
+/// [`F128::inv`], which is Fermat exponentiation (~254 multiplies each).
+fn cached_standard_evals(dim: usize) -> Arc<[Vec<F128>]> {
+    debug_assert!(dim <= MAX_STANDARD_EVALS_LOG);
+    static TABLES: LazyLock<[OnceLock<Arc<[Vec<F128>]>>; MAX_STANDARD_EVALS_LOG + 1]> =
+        LazyLock::new(|| std::array::from_fn(|_| OnceLock::new()));
+    TABLES[dim]
+        .get_or_init(|| {
+            let basis: Vec<F128> = (0..dim).map(|i| F128::new(1u64 << i, 0)).collect();
+            Arc::from(generate_evals_from_subspace(&basis))
+        })
+        .clone()
+}
+
 /// Complete the last radix-8 group for the ranked Apple-silicon L0 commit.
 ///
 /// The generic 2 MiB cache split selects `n_top = 9` for the production shape
@@ -212,6 +240,13 @@ fn use_ranked_zero_root_fusion(
 /// It overlaps the concurrently-running round-1 AB precompute on the main
 /// Rayon pool; the separate helper pool is otherwise idle until these queues
 /// finish and the deep-transform leaf receivers start.
+///
+/// That AB precompute is a plain Rayon `par_chunks_mut` region
+/// (`univariate_skip_optimized.rs:353`), so it occupies performance cores
+/// only and leaves the E-cores idle for the whole layer-1 window. The pass
+/// rates agree: layers 4 and 7 move the same 2 GiB as layer 1 at ~215 GB/s
+/// against layer 1's ~43 GB/s, well under the ~238 GB/s this class of machine
+/// sustains — layer 1 is core-starved, not bandwidth-starved.
 #[inline]
 fn is_ranked_top_hetero_fused3_pass(
     log_d: usize,
@@ -235,7 +270,9 @@ const INTERLEAVED_PHASE_DEEP_ONLY: u8 = 2;
 #[derive(Clone, Debug)]
 pub struct AdditiveNttF128 {
     /// `evals[i]` of length `ℓ − i`, the normalized subspace polynomial values.
-    evals: Vec<Vec<F128>>,
+    /// Shared: the standard-basis tables are memoized by `dim` and handed out
+    /// as clones of the same `Arc` (see [`cached_standard_evals`]).
+    evals: Arc<[Vec<F128>]>,
     /// Breadth-first table: layer `l` starts at `2^l - 1`.
     precomputed_twiddles: Option<Arc<[F128]>>,
 }
@@ -246,7 +283,7 @@ impl AdditiveNttF128 {
         let evals = generate_evals_from_subspace(basis);
         let precomputed_twiddles = precompute_twiddles(&evals).map(Arc::from);
         Self {
-            evals,
+            evals: Arc::from(evals),
             precomputed_twiddles,
         }
     }
@@ -255,8 +292,7 @@ impl AdditiveNttF128 {
     /// (the low 64 bits of F_{2^128} hold these basis vectors).
     pub fn standard(dim: usize) -> Self {
         assert!(dim <= 64, "standard NTT requires dim ≤ 64");
-        let basis: Vec<F128> = (0..dim).map(|i| F128::new(1u64 << i, 0)).collect();
-        let evals = generate_evals_from_subspace(&basis);
+        let evals = cached_standard_evals(dim);
         let precomputed_twiddles = cached_standard_twiddles(dim, &evals);
         Self {
             evals,
@@ -1783,6 +1819,9 @@ mod tests {
                 enabled_here
             );
         }
+        // Non-pass layers and non-ranked shapes stay on plain Rayon.
+        assert!(!is_ranked_top_hetero_fused3_pass(20, 64, 1, 10, 10));
+        assert!(!is_ranked_top_hetero_fused3_pass(20, 64, 1, 9, 1));
         assert!(!is_ranked_top_hetero_fused3_pass(20, 64, 1, 10, 2));
         assert!(!is_ranked_top_hetero_fused3_pass(19, 64, 1, 10, 4));
         assert!(!is_ranked_top_hetero_fused3_pass(20, 8, 1, 10, 4));
@@ -2172,6 +2211,28 @@ mod tests {
             fallback.twiddle(layer, block),
             span_get(&eval_row[1..], block)
         );
+    }
+
+    /// `standard(dim)` memoizes its eval table. The cached table must be
+    /// bit-identical to a freshly computed one, and repeated calls must hand
+    /// out clones of the same allocation.
+    #[test]
+    fn standard_evals_are_cached_and_bit_exact() {
+        // `dim = 0` is not a supported domain (an empty basis has no row to
+        // normalize), so start at 1.
+        for dim in [1usize, 4, 10, 20, MAX_PRECOMPUTED_TWIDDLE_LOG + 1] {
+            let basis: Vec<F128> = (0..dim).map(|i| F128::new(1u64 << i, 0)).collect();
+            let fresh = generate_evals_from_subspace(&basis);
+            let ntt = AdditiveNttF128::standard(dim);
+            assert_eq!(ntt.evals.as_ref(), fresh.as_slice(), "dim={dim}");
+
+            let again = AdditiveNttF128::standard(dim);
+            assert_eq!(again.evals.as_ref(), fresh.as_slice(), "dim={dim}");
+            assert!(
+                Arc::ptr_eq(&ntt.evals, &again.evals),
+                "dim={dim} should reuse one cached allocation"
+            );
+        }
     }
 
     /// At layer log_d - 1 (deepest, where FRI starts), pairs are adjacent.

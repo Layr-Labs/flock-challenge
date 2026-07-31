@@ -177,58 +177,144 @@ struct CombinedClaim {
     round0_prime: (F128, F128),
 }
 
-/// Exact ranked shape for the heterogeneous combined-basis queue. The gate is
-/// deliberately narrower than the algebraic fast path: two ring-switched
-/// BLAKE3 claims, no packed-direct claim, 2^25 packed slots split into 2^15
-/// slot blocks (1024 independent 512 KiB jobs).
-#[inline]
-fn is_ranked_hetero_open_combine_shape(l: usize, b: usize, n_rs: usize, n_pd: usize) -> bool {
-    l == (1usize << 25) && b == (1usize << 15) && n_rs == 2 && n_pd == 0
-}
-
-#[inline]
-fn use_ranked_hetero_open_combine(l: usize, b: usize, n_rs: usize, n_pd: usize) -> bool {
-    cfg!(all(target_os = "macos", target_arch = "aarch64"))
-        && is_ranked_hetero_open_combine_shape(l, b, n_rs, n_pd)
-        && std::env::var_os("FLOCK_NO_HETERO_OPEN_COMBINE").is_none()
-        && crate::epool::epool().is_some()
-}
-
-/// Drain fixed-size output blocks through the stateful P/E queue and reduce
-/// one `(u0, u2)` partial per block after the synchronous join. `fold_block`
-/// owns the complete output block for its queue index; `init` supplies private
-/// worker scratch that persists across all blocks claimed by that worker.
-fn run_hetero_open_combine_blocks<S, I, F>(
-    out: &mut [F128],
-    block_len: usize,
-    init: I,
-    fold_block: F,
-) -> (F128, F128)
-where
-    I: Fn() -> S + Sync,
-    F: Fn(&mut S, usize, &mut [F128]) -> (F128, F128) + Sync,
-{
-    assert!(block_len > 0 && out.len().is_multiple_of(block_len));
-    let n_blocks = out.len() / block_len;
-    let mut partials = vec![(F128::ZERO, F128::ZERO); n_blocks];
-    let out_base = crate::epool::SyncPtr(out.as_mut_ptr());
+/// Fused deferred-dense sweep: writes the γ-weighted combination of every
+/// [`ring_switch::RsEqInd::DeferredDense`] claim into `b_combined` and returns
+/// the round-0 sumcheck prime `(u_0, u_2)` over
+/// `packed_witness · b_combined` in the same pass.
+///
+/// Each claim carries `(eq_lo, eq_hi, γ-baked byte table, log₂ B)`; the value
+/// at output index `j` is `Σ_k fold_one_slot(eq_lo[j mod B]·eq_hi[j / B], T_k)`.
+/// Blocks of `B = eq_lo.len()` slots are the unit of parallelism.
+///
+/// # Determinism
+/// The block sweep drains through the hetero chunk queue (see [`crate::epool`])
+/// so the otherwise-idle efficiency cores add throughput to what is the largest
+/// phase of `open` — and a gather+XOR-dominated one, which transfers to E-cores
+/// well — without the equal-band barrier penalty of widening the main pool.
+/// Output is bit-identical to a serial sweep regardless of scheduling:
+///
+/// * chunk `hi` writes ONLY `b_combined[hi·B .. (hi+1)·B]` and `partials[hi]`
+///   — fixed, pairwise-disjoint output ranges, one owner each;
+/// * the chunk body is a pure function of `hi` and shared read-only state, so
+///   which pool claims `hi`, and in what order, cannot change an output bit;
+/// * the `(u_0, u_2)` reduction runs serially over `partials` in ascending
+///   chunk order after the queue joins. F128 addition is XOR — associative and
+///   commutative — so this fixed-order fold equals any other summation order
+///   bit-for-bit.
+fn fused_deferred_sweep(
+    rs_deferred: &[(&[F128], &[F128], &[F128], usize)],
+    packed_witness: &[F128],
+    b_combined: &mut [F128],
+) -> (F128, F128) {
+    let b = rs_deferred[0].0.len(); // eq_lo.len(); shared across claims (same split)
+    debug_assert!(b >= 2 && b.is_multiple_of(2));
+    debug_assert!(rs_deferred.iter().all(|d| d.0.len() == b));
+    // Composed-table sweep. `fold_one_slot(·, T)` is F₂-linear, so the
+    // per-slot map `lo ↦ fold_one_slot(lo·e_hi, T)` collapses into ONE
+    // per-claim-per-block byte table (`compose_fold_byte_table_into`),
+    // deleting the per-slot field multiply from the L-sized sweep —
+    // 1 GF mul × L × n_claims of counted work — for a per-block table
+    // build (~4.3k ops) amortized over b slots. Bit-identical: the
+    // composed table encodes exactly the same F₂-linear map (see the
+    // helper's docs). One 64 KiB table is live per worker at a time
+    // (claims composed and swept sequentially — table reused in place),
+    // preserving the claim-sequential L1 footprint.
+    //
+    // Small blocks (tiny test shapes) keep the direct slot-multiply
+    // sweep: the table build wouldn't amortize below ~2^12 slots.
+    const COMPOSE_MIN_BLOCK: usize = 1 << 12;
+    let composed = b >= COMPOSE_MIN_BLOCK;
+    // Chunk count at ranked geometry (m = 32): L = 2^(32−7) = 2^25 slots and
+    // the suffix `x_outer[1..]` has n = 25 vars, so
+    // `deferred_split_n_lo(25) = max(min(25−8, 15), split_n_lo(25)=12) = 15`
+    // ⇒ B = 2^15 and n_blocks = 2^25 / 2^15 = 2^10 = **1024 chunks**, 64×
+    // `EPOOL_MIN_CHUNKS` (16), so the helper pool engages with room to spare.
+    // Small test shapes land below 16 and `run_hetero_chunks_init` degrades to
+    // main-pool-only by itself; `RAYON_NUM_THREADS=1` runs the queue inline.
+    // Neither needs a branch here.
+    let n_blocks = b_combined.len() / b;
+    // Exact division: `b_combined.len() == eq_lo.len() · eq_hi.len()` and
+    // `b == eq_lo.len()`, so `n_blocks == eq_hi.len()`. Asserted because the
+    // chunk body forms raw slices from it.
+    assert_eq!(n_blocks * b, b_combined.len());
+    let mut partials: Vec<(F128, F128)> = vec![(F128::ZERO, F128::ZERO); n_blocks];
+    let out_base = crate::epool::SyncPtr(b_combined.as_mut_ptr());
     let partials_base = crate::epool::SyncPtr(partials.as_mut_ptr());
-    crate::epool::run_hetero_chunks_stateful(n_blocks, init, |state, block| {
-        // SAFETY: queue index `block` is claimed exactly once. It owns disjoint
-        // output `[block*block_len, (block+1)*block_len)` and one partial slot;
-        // the synchronous two-pool join publishes both before reduce.
+    // Composed-table scratch: `run_hetero_chunks_init` gives the hetero queue
+    // rayon `map_init` semantics — `init()` runs once per draining worker, not
+    // once per chunk. That matters here: a fresh
+    // `vec![F128::ZERO; FOLD_TABLE_LEN]` per chunk would pay 1024 × 64 KiB of
+    // allocation whose zeroing is dead work anyway, since
+    // `compose_fold_byte_table_into` overwrites every entry before any read.
+    // Per-worker reuse keeps the table warm in L2 exactly as the `map_init`
+    // this replaced did, and carries nothing across chunks: every chunk
+    // recomposes the table for each claim before reading it.
+    let make_ctable = || {
+        if composed {
+            vec![F128::ZERO; ring_switch::FOLD_TABLE_LEN]
+        } else {
+            Vec::new()
+        }
+    };
+    crate::epool::run_hetero_chunks_init(n_blocks, make_ctable, |ctable, hi| {
+        // SAFETY: the queue hands out each `hi` exactly once; chunk `hi`
+        // exclusively owns `b_combined[hi·b .. (hi+1)·b]` and `partials[hi]`.
+        // The queue's completion join publishes these writes before the
+        // reduction below reads them.
+        let out_block = unsafe { std::slice::from_raw_parts_mut(out_base.ptr().add(hi * b), b) };
+        // Accumulate each claim's block: first claim writes, rest add.
+        // `e_hi` is folded into the composed table once per claim per
+        // block, then swept over eq_lo with no per-slot multiply.
+        if composed {
+            for (ci, (eq_lo, eq_hi, table, _)) in rs_deferred.iter().enumerate() {
+                ring_switch::compose_fold_byte_table_into(eq_hi[hi], table, ctable);
+                if ci == 0 {
+                    for (slot, &lo) in out_block.iter_mut().zip(eq_lo.iter()) {
+                        *slot = ring_switch::fold_one_slot(lo, ctable);
+                    }
+                } else {
+                    for (slot, &lo) in out_block.iter_mut().zip(eq_lo.iter()) {
+                        *slot += ring_switch::fold_one_slot(lo, ctable);
+                    }
+                }
+            }
+        } else {
+            for (ci, (eq_lo, eq_hi, table, _)) in rs_deferred.iter().enumerate() {
+                let e_hi = eq_hi[hi];
+                if ci == 0 {
+                    for (slot, &lo) in out_block.iter_mut().zip(eq_lo.iter()) {
+                        *slot = ring_switch::fold_one_slot(lo * e_hi, table);
+                    }
+                } else {
+                    for (slot, &lo) in out_block.iter_mut().zip(eq_lo.iter()) {
+                        *slot += ring_switch::fold_one_slot(lo * e_hi, table);
+                    }
+                }
+            }
+        }
+        // Round-0 prime over this block's pairs (b is even, base is even).
+        // Separate pass over the L2-resident block — fusing it into the last
+        // claim's sweep measured slower (pairwise stepping breaks the
+        // streaming store pattern).
+        let base = hi * b;
+        let mut u0 = F128::ZERO;
+        let mut u2 = F128::ZERO;
+        for t in 0..(b / 2) {
+            let s0 = out_block[2 * t];
+            let s1 = out_block[2 * t + 1];
+            let a0 = packed_witness[base + 2 * t];
+            let a1 = packed_witness[base + 2 * t + 1];
+            u0 += a0 * s0;
+            u2 += (a0 + a1) * (s0 + s1);
+        }
+        // SAFETY: exclusive owner of partials[hi] (see above).
         unsafe {
-            let out_block =
-                core::slice::from_raw_parts_mut(out_base.ptr().add(block * block_len), block_len);
-            partials_base
-                .ptr()
-                .add(block)
-                .write(fold_block(state, block, out_block));
+            *partials_base.ptr().add(hi) = (u0, u2);
         }
     });
     partials
-        .into_iter()
-        .fold((F128::ZERO, F128::ZERO), |(x0, x2), (y0, y2)| {
+        .iter()
+        .fold((F128::ZERO, F128::ZERO), |(x0, x2), &(y0, y2)| {
             (x0 + y0, x2 + y2)
         })
 }
@@ -372,100 +458,7 @@ fn compute_combined_basis_and_target<Ch: Challenger>(
         !rs_deferred.is_empty() && rs_deferred.len() == rs_results.len() && pd_dense.is_empty();
 
     let (mut round0_u0, mut round0_u2) = if use_fast {
-        let b = rs_deferred[0].0.len(); // eq_lo.len(); shared across claims (same split)
-        debug_assert!(b >= 2 && b.is_multiple_of(2));
-        debug_assert!(rs_deferred.iter().all(|d| d.0.len() == b));
-        // Composed-table sweep. `fold_one_slot(·, T)` is F₂-linear, so the
-        // per-slot map `lo ↦ fold_one_slot(lo·e_hi, T)` collapses into ONE
-        // per-claim-per-block byte table (`compose_fold_byte_table_into`),
-        // deleting the per-slot field multiply from the L-sized sweep —
-        // 1 GF mul × L × n_claims of counted work — for a per-block table
-        // build (~4.3k ops) amortized over b slots. Bit-identical: the
-        // composed table encodes exactly the same F₂-linear map (see the
-        // helper's docs). One 64 KiB table is live per thread at a time
-        // (claims composed and swept sequentially — table reused in place),
-        // preserving the claim-sequential L1 footprint.
-        //
-        // Small blocks (tiny test shapes) keep the direct slot-multiply
-        // sweep: the table build wouldn't amortize below ~2^12 slots.
-        const COMPOSE_MIN_BLOCK: usize = 1 << 12;
-        let composed = b >= COMPOSE_MIN_BLOCK;
-        let fold_block = |ctable: &mut Vec<F128>, hi: usize, out_block: &mut [F128]| {
-            // Accumulate each claim's block: first claim writes, rest add.
-            // `e_hi` is folded into the composed table once per claim per
-            // block, then swept over eq_lo with no per-slot multiply.
-            for (ci, (eq_lo, eq_hi, table, _)) in rs_deferred.iter().enumerate() {
-                let e_hi = eq_hi[hi];
-                if composed {
-                    ring_switch::compose_fold_byte_table_into(e_hi, table, ctable);
-                    if ci == 0 {
-                        for (slot, &lo) in out_block.iter_mut().zip(eq_lo.iter()) {
-                            *slot = ring_switch::fold_one_slot(lo, ctable);
-                        }
-                    } else {
-                        for (slot, &lo) in out_block.iter_mut().zip(eq_lo.iter()) {
-                            *slot += ring_switch::fold_one_slot(lo, ctable);
-                        }
-                    }
-                } else if ci == 0 {
-                    for (slot, &lo) in out_block.iter_mut().zip(eq_lo.iter()) {
-                        *slot = ring_switch::fold_one_slot(lo * e_hi, table);
-                    }
-                } else {
-                    for (slot, &lo) in out_block.iter_mut().zip(eq_lo.iter()) {
-                        *slot += ring_switch::fold_one_slot(lo * e_hi, table);
-                    }
-                }
-            }
-            // Round-0 prime over this block's pairs (b is even, base is even).
-            // Keep this separate from the last claim's streaming store: the
-            // pairwise stepping variant is slower even though it removes a pass.
-            let base = hi * b;
-            let mut u0 = F128::ZERO;
-            let mut u2 = F128::ZERO;
-            for t in 0..(b / 2) {
-                let s0 = out_block[2 * t];
-                let s1 = out_block[2 * t + 1];
-                let a0 = packed_witness[base + 2 * t];
-                let a1 = packed_witness[base + 2 * t + 1];
-                u0 += a0 * s0;
-                u2 += (a0 + a1) * (s0 + s1);
-            }
-            (u0, u2)
-        };
-        let init_ctable = || {
-            if composed {
-                vec![F128::ZERO; ring_switch::FOLD_TABLE_LEN]
-            } else {
-                Vec::new()
-            }
-        };
-
-        if use_ranked_hetero_open_combine(l, b, n_rs, n_pd) {
-            // The 10 P-core Rayon workers and four utility-QoS E-core workers
-            // drain one shared queue. Each worker keeps one private 64 KiB
-            // composed table across all of its claims; an E-core can hold the
-            // join behind by at most one 512 KiB block.
-            run_hetero_open_combine_blocks(
-                &mut b_combined,
-                b,
-                init_ctable,
-                |ctable, hi, out_block| fold_block(ctable, hi, out_block),
-            )
-        } else {
-            // Exact opt-out/general schedule: retain Rayon `map_init`, including
-            // its folder-local composed-table reuse and parallel reduction.
-            b_combined
-                .par_chunks_mut(b)
-                .enumerate()
-                .map_init(init_ctable, |ctable, (hi, out_block)| {
-                    fold_block(ctable, hi, out_block)
-                })
-                .reduce(
-                    || (F128::ZERO, F128::ZERO),
-                    |(x0, x2), (y0, y2)| (x0 + y0, x2 + y2),
-                )
-        }
+        fused_deferred_sweep(&rs_deferred, packed_witness, &mut b_combined)
     } else {
         // General path (mixed / sparse / packed-direct): materialize any
         // deferred-dense claims (parallel block fold), then the per-element
@@ -851,63 +844,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn ranked_hetero_open_combine_shape_gate_is_narrow() {
-        assert!(is_ranked_hetero_open_combine_shape(1 << 25, 1 << 15, 2, 0));
-        assert!(!is_ranked_hetero_open_combine_shape(1 << 24, 1 << 15, 2, 0));
-        assert!(!is_ranked_hetero_open_combine_shape(1 << 25, 1 << 14, 2, 0));
-        assert!(!is_ranked_hetero_open_combine_shape(1 << 25, 1 << 15, 1, 0));
-        assert!(!is_ranked_hetero_open_combine_shape(1 << 25, 1 << 15, 2, 1));
-    }
-
-    /// Compact ownership/reduction oracle for the production stateful block
-    /// dispatcher. It uses the same 64 KiB private-state size as the ranked
-    /// composed table while keeping the output small enough for an ordinary
-    /// unit test.
-    #[test]
-    fn hetero_open_combine_block_dispatch_matches_serial() {
-        const N_BLOCKS: usize = 256;
-        const BLOCK_LEN: usize = 32;
-        let mut got = vec![F128::ZERO; N_BLOCKS * BLOCK_LEN];
-        let got_uv = run_hetero_open_combine_blocks(
-            &mut got,
-            BLOCK_LEN,
-            || vec![F128::ZERO; ring_switch::FOLD_TABLE_LEN],
-            |scratch, block, out_block| {
-                scratch[0] = F128::new(block as u64 ^ 0xA55A, (block as u64) << 32);
-                let mut u0 = F128::ZERO;
-                let mut u2 = F128::ZERO;
-                for (offset, slot) in out_block.iter_mut().enumerate() {
-                    *slot = scratch[0] + F128::new(offset as u64, offset as u64 * 3);
-                    if offset.is_multiple_of(2) {
-                        u0 += *slot;
-                    }
-                    u2 += *slot;
-                }
-                (u0, u2)
-            },
-        );
-
-        let mut expected = vec![F128::ZERO; got.len()];
-        let mut expected_uv = (F128::ZERO, F128::ZERO);
-        for (block, out_block) in expected.chunks_mut(BLOCK_LEN).enumerate() {
-            let seed = F128::new(block as u64 ^ 0xA55A, (block as u64) << 32);
-            let mut u0 = F128::ZERO;
-            let mut u2 = F128::ZERO;
-            for (offset, slot) in out_block.iter_mut().enumerate() {
-                *slot = seed + F128::new(offset as u64, offset as u64 * 3);
-                if offset.is_multiple_of(2) {
-                    u0 += *slot;
-                }
-                u2 += *slot;
-            }
-            expected_uv.0 += u0;
-            expected_uv.1 += u2;
-        }
-        assert_eq!(got, expected);
-        assert_eq!(got_uv, expected_uv);
-    }
-
     fn zhat_skip_reference(z: &[bool], m: usize, z_skip: F128, x_outer: &[F128]) -> F128 {
         const K_SKIP: usize = 6;
         let ell = 1usize << K_SKIP;
@@ -1014,5 +950,88 @@ mod tests {
             &mut ch_v,
         )
         .unwrap_or_else(|e| panic!("ligerito verify rejected honest proof: {e:?}"));
+    }
+
+    /// `fused_deferred_sweep` is bit-exact against a naive serial reference,
+    /// for both the composed-table path (`B >= COMPOSE_MIN_BLOCK`) and the
+    /// direct slot-multiply path, and for one and two claims.
+    ///
+    /// This is the epool-parallel sweep's correctness contract: the hetero
+    /// queue's chunk-claim order is nondeterministic, so every scheduling must
+    /// produce exactly the reference bits. `B = 2^12` also puts the block count
+    /// above `EPOOL_MIN_CHUNKS`, exercising the two-pool drain rather than the
+    /// degraded main-pool-only path.
+    #[test]
+    fn fused_deferred_sweep_matches_naive_reference() {
+        let mut rng = Rng::new(0xA5F0_1234);
+        // (log2 B, log2 n_blocks): a composed-path shape whose block count
+        // clears EPOOL_MIN_CHUNKS, and a small direct-path shape below it.
+        for &(log_b, log_blocks) in &[(12usize, 5usize), (5, 3)] {
+            for n_claims in 1..=2 {
+                let b = 1usize << log_b;
+                let n_blocks = 1usize << log_blocks;
+                let l = b * n_blocks;
+
+                // `table[k·256 + v] = Σ_{bit b set in v} scaled[k·8 + b]` —
+                // the same subset-sum layout `fold_one_slot` indexes, with γ
+                // baked into `scaled` exactly as ring_switch does.
+                let claims: Vec<(Vec<F128>, Vec<F128>, Vec<F128>)> = (0..n_claims)
+                    .map(|_| {
+                        let eq_lo: Vec<F128> = (0..b).map(|_| rng.f128()).collect();
+                        let eq_hi: Vec<F128> = (0..n_blocks).map(|_| rng.f128()).collect();
+                        let scaled: Vec<F128> =
+                            (0..(1usize << LOG_PACKING)).map(|_| rng.f128()).collect();
+                        let mut table = vec![F128::ZERO; ring_switch::FOLD_TABLE_LEN];
+                        for k in 0..(ring_switch::FOLD_TABLE_LEN / 256) {
+                            for v in 0..256usize {
+                                let mut acc = F128::ZERO;
+                                for bit in 0..8 {
+                                    if (v >> bit) & 1 == 1 {
+                                        acc += scaled[k * 8 + bit];
+                                    }
+                                }
+                                table[k * 256 + v] = acc;
+                            }
+                        }
+                        (eq_lo, eq_hi, table)
+                    })
+                    .collect();
+                let rs_deferred: Vec<(&[F128], &[F128], &[F128], usize)> = claims
+                    .iter()
+                    .map(|(lo, hi, t)| (lo.as_slice(), hi.as_slice(), t.as_slice(), log_b))
+                    .collect();
+                let packed_witness: Vec<F128> = (0..l).map(|_| rng.f128()).collect();
+
+                // Naive serial reference: per output slot, sum every claim's
+                // `fold_one_slot(eq_lo·eq_hi, table)`; then the round-0 prime
+                // over consecutive pairs, in index order.
+                let mut want = vec![F128::ZERO; l];
+                for (j, slot) in want.iter_mut().enumerate() {
+                    for (eq_lo, eq_hi, table) in claims.iter() {
+                        *slot += ring_switch::fold_one_slot(
+                            eq_lo[j % b] * eq_hi[j / b],
+                            table.as_slice(),
+                        );
+                    }
+                }
+                let (mut want_u0, mut want_u2) = (F128::ZERO, F128::ZERO);
+                for t in 0..(l / 2) {
+                    let (s0, s1) = (want[2 * t], want[2 * t + 1]);
+                    let (a0, a1) = (packed_witness[2 * t], packed_witness[2 * t + 1]);
+                    want_u0 += a0 * s0;
+                    want_u2 += (a0 + a1) * (s0 + s1);
+                }
+
+                let mut got = vec![F128::ZERO; l];
+                let (u0, u2) = fused_deferred_sweep(&rs_deferred, &packed_witness, &mut got);
+
+                assert_eq!(got, want, "b_combined mismatch (b=2^{log_b}, {n_claims} claims)");
+                assert_eq!(
+                    (u0, u2),
+                    (want_u0, want_u2),
+                    "round-0 prime mismatch (b=2^{log_b}, {n_claims} claims)"
+                );
+            }
+        }
     }
 }

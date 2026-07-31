@@ -1135,6 +1135,21 @@ pub fn fold_and_compute_round_pair_optimized(
 /// buffers, so the ~22 decreasing-size buffers are allocated/freed once rather
 /// than per round. The per-round `munmap` of the old buffer (64 MB at m=29)
 /// runs single-threaded and otherwise caps the tail's parallel speedup.
+///
+/// # Determinism
+/// The chunk loop drains through [`crate::epool::run_hetero_chunks`], so the
+/// claim order of the `hi_size` chunks is nondeterministic (main pool and
+/// efficiency-core helper pool race on one atomic cursor). Output is still
+/// bit-identical to the previous rayon map-reduce:
+/// * chunk `x_hi` writes exactly `a_out/b_out[x_hi·chunk_out ..
+///   (x_hi+1)·chunk_out]`, a function of the index alone, and
+///   `chunk_out · hi_size == half`, so the ranges are pairwise disjoint and
+///   exhaust both outputs — every slot has one writer with one value;
+/// * each chunk's `(eq_hi[x_hi]·G(1), eq_hi[x_hi]·G(∞))` contribution lands in
+///   its own `partials[x_hi]` slot, never in a shared accumulator;
+/// * the two sums are then folded serially in ascending index. F128 addition
+///   is XOR — associative and commutative — so a fixed ascending order equals
+///   any tree reduce over the same multiset of terms, exactly.
 pub fn fold_and_compute_round_pair_into(
     a: &[F128],
     b: &[F128],
@@ -1143,8 +1158,6 @@ pub fn fold_and_compute_round_pair_into(
     r_fold: F128,
     r_next: &[F128],
 ) -> (F128, F128) {
-    use rayon::prelude::*;
-
     let n = a.len();
     assert_eq!(b.len(), n);
     assert!(n.is_power_of_two() && n >= 8);
@@ -1166,11 +1179,36 @@ pub fn fold_and_compute_round_pair_into(
     let eq_lo = &eq.lo;
     let eq_hi = &eq.hi;
 
-    let (sum1, sum_inf) = a_out
-        .par_chunks_mut(chunk_out)
-        .zip(b_out.par_chunks_mut(chunk_out))
-        .enumerate()
-        .map(|(x_hi, (a_out, b_out))| {
+    // Chunks drain through the hetero queue so the idle efficiency cores add
+    // throughput without an equal-band barrier penalty (see `epool`).
+    //
+    // `hi_size = 2^min(log_n − 2, SplitEqGhash::MAX_N_HI)`. It does *not*
+    // shrink across the tail: the zerocheck driver only takes this path while
+    // `log_n ≥ 15`, so the cap binds and every tail round runs exactly 512
+    // chunks (it is `lo_size = 2^(log_n − 11)` that halves each round, 16 at
+    // the last fused round). Dropping below `EPOOL_MIN_CHUNKS` = 16 would need
+    // `log_n < 6`, which the `lo_size ≥ 2` assert above already rejects — so
+    // the gate is unreachable here. Were it reachable, `run_hetero_chunks`
+    // degrades to main-pool-only, the wanted behaviour for jobs too small to
+    // amortize the cross-pool kickoff.
+    let mut partials: Vec<(F128, F128)> = vec![(F128::ZERO, F128::ZERO); hi_size];
+    let a_base = crate::epool::SyncPtr(a_out.as_mut_ptr());
+    let b_base = crate::epool::SyncPtr(b_out.as_mut_ptr());
+    let partials_base = crate::epool::SyncPtr(partials.as_mut_ptr());
+    crate::epool::run_hetero_chunks(hi_size, |x_hi| {
+        // SAFETY: the queue hands out each x_hi exactly once; chunk x_hi
+        // exclusively owns `[x_hi·chunk_out, (x_hi+1)·chunk_out)` of both
+        // outputs plus `partials[x_hi]`. `chunk_out · hi_size == half ==
+        // a_out.len() == b_out.len()`, so the derived ranges are pairwise
+        // disjoint, in bounds, and exhaustive. The queue's completion join
+        // publishes the writes before the reduction below reads them.
+        let (a_out, b_out) = unsafe {
+            (
+                std::slice::from_raw_parts_mut(a_base.ptr().add(x_hi * chunk_out), chunk_out),
+                std::slice::from_raw_parts_mut(b_base.ptr().add(x_hi * chunk_out), chunk_out),
+            )
+        };
+        {
             let a_in = &a[x_hi * chunk_in..(x_hi + 1) * chunk_in];
             let b_in = &b[x_hi * chunk_in..(x_hi + 1) * chunk_in];
 
@@ -1340,12 +1378,19 @@ pub fn fold_and_compute_round_pair_into(
                 (p1, pinf)
             };
             let eq_h = eq_hi[x_hi];
-            (eq_h * p1, eq_h * pinf)
-        })
-        .reduce(
-            || (F128::ZERO, F128::ZERO),
-            |(s1, sinf), (c1, cinf)| (s1 + c1, sinf + cinf),
-        );
+            // SAFETY: exclusive owner of partials[x_hi] (see above).
+            unsafe {
+                *partials_base.ptr().add(x_hi) = (eq_h * p1, eq_h * pinf);
+            }
+        }
+    });
+    // Serial XOR fold in ascending chunk index; see the determinism note on
+    // this function.
+    let (sum1, sum_inf) = partials
+        .iter()
+        .fold((F128::ZERO, F128::ZERO), |(s1, sinf), &(c1, cinf)| {
+            (s1 + c1, sinf + cinf)
+        });
 
     (r_next[0] * sum1, sum_inf)
 }
@@ -1798,6 +1843,63 @@ mod tests {
             assert_eq!(b_fused, b_unf, "b mismatch at log_n={log_n}");
             assert_eq!(m1_fused, m1_unf, "msg_1 mismatch at log_n={log_n}");
             assert_eq!(minf_fused, minf_unf, "msg_inf mismatch at log_n={log_n}");
+        }
+    }
+
+    /// `fold_and_compute_round_pair_into` on the shapes the zerocheck tail
+    /// actually runs (`log_n ≥ 15`, the driver's fused cutoff), writing into
+    /// *oversized, poisoned* destinations exactly as the ping-pong scratch in
+    /// `zerocheck::prove` does (`&mut a_nxt[..half]` over a longer buffer).
+    ///
+    /// This is the exhaustiveness guard for the hetero-queue conversion: the
+    /// chunk closure derives its output range by pointer offset, so a
+    /// mis-derived range would leave POISON behind (or clobber the tail past
+    /// `half`) instead of tripping a slice bound. The oracle is the serial
+    /// `fold_in_place_pair` → `round_pair_naive` pair.
+    #[test]
+    fn fused_round_into_matches_unfused_on_poisoned_scratch() {
+        const POISON: F128 = F128 {
+            lo: 0xa5a5_a5a5_a5a5_a5a5,
+            hi: 0x5a5a_5a5a_5a5a_5a5a,
+        };
+
+        let mut rng = Rng::new(0x7A11_E900);
+        for &log_n in &[15usize, 16, 17] {
+            let n = 1usize << log_n;
+            let half = n / 2;
+            let a: Vec<F128> = (0..n).map(|_| rng.f128()).collect();
+            let b: Vec<F128> = (0..n).map(|_| rng.f128()).collect();
+            let r_fold = rng.f128();
+            let r_next = rng.f128_vec(log_n - 1);
+
+            // Destinations are longer than `half` and fully poisoned, so both
+            // a missed output slot and a write past the end are visible.
+            let tail = 64;
+            let mut a_out = vec![POISON; half + tail];
+            let mut b_out = vec![POISON; half + tail];
+            let (m1, minf) = fold_and_compute_round_pair_into(
+                &a,
+                &b,
+                &mut a_out[..half],
+                &mut b_out[..half],
+                r_fold,
+                &r_next,
+            );
+
+            let mut a_unf = a.clone();
+            let mut b_unf = b.clone();
+            fold_in_place_pair(&mut a_unf, &mut b_unf, r_fold);
+            let (m1_unf, minf_unf) = round_pair_naive(&a_unf, &b_unf, &r_next);
+
+            assert_eq!(&a_out[..half], &a_unf[..], "a mismatch at log_n={log_n}");
+            assert_eq!(&b_out[..half], &b_unf[..], "b mismatch at log_n={log_n}");
+            assert!(
+                a_out[half..].iter().all(|&v| v == POISON)
+                    && b_out[half..].iter().all(|&v| v == POISON),
+                "wrote past the destination at log_n={log_n}"
+            );
+            assert_eq!(m1, m1_unf, "msg_1 mismatch at log_n={log_n}");
+            assert_eq!(minf, minf_unf, "msg_inf mismatch at log_n={log_n}");
         }
     }
 
