@@ -3343,6 +3343,31 @@ fn merkle_multi_proof_for(tree: &[Hash], block_len: usize, queries: &[usize]) ->
     merkle::merkle_multi_proof(tree, block_len, queries)
 }
 
+/// Gather the opened rows for a query set. The rows live in a codeword that
+/// is DRAM-cold at ranked sizes (512 MiB at L0), so the serial
+/// `map(to_vec).collect` is a latency-bound single-thread stretch between
+/// transcript rounds while the pool idles. Indexed parallel map with an
+/// order-preserving collect issues the independent row fetches concurrently —
+/// output byte-identical. Small query sets stay serial (dispatch overhead).
+/// `FLOCK_NO_PAR_OPEN_ROWS=1` restores the serial gather.
+fn gather_opened_rows<'a, R>(queries: &[usize], row: R) -> Vec<Vec<F128>>
+where
+    R: Fn(usize) -> &'a [F128] + Sync,
+{
+    const PAR_MIN_QUERIES: usize = 64;
+    let par_enabled = queries.len() >= PAR_MIN_QUERIES && {
+        use std::sync::OnceLock;
+        static ENABLED: OnceLock<bool> = OnceLock::new();
+        *ENABLED.get_or_init(|| std::env::var_os("FLOCK_NO_PAR_OPEN_ROWS").is_none())
+    };
+    if par_enabled {
+        use rayon::prelude::*;
+        queries.par_iter().map(|&q| row(q).to_vec()).collect()
+    } else {
+        queries.iter().map(|&q| row(q).to_vec()).collect()
+    }
+}
+
 /// Drive the recursive Ligerito prover to prove `poly(eval_point) = claimed_value`.
 ///
 /// Protocol structure (unique-decoding regime, no OOD samples yet):
@@ -3861,7 +3886,7 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
     let queries_0 = sample_distinct_queries(challenger, l0_block_len, num_queries_0);
     let alpha_0 = challenger.sample_f128_vec(ceil_log2(num_queries_0));
     let _t = std::time::Instant::now();
-    let opened_rows_0: Vec<Vec<F128>> = queries_0.iter().map(|&q| l0_row(q).to_vec()).collect();
+    let opened_rows_0: Vec<Vec<F128>> = gather_opened_rows(&queries_0, l0_row);
     let merkle_proof_0 = merkle_multi_proof_for(l0_tree, l0_block_len, &queries_0);
     if trace {
         t_opens += _t.elapsed();
@@ -3942,10 +3967,8 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
             let queries_last =
                 sample_distinct_queries(challenger, wtns_prev.block_len, num_queries_last);
             let _t = std::time::Instant::now();
-            let opened_rows_last: Vec<Vec<F128>> = queries_last
-                .iter()
-                .map(|&q| wtns_prev.row(q).to_vec())
-                .collect();
+            let opened_rows_last: Vec<Vec<F128>> =
+                gather_opened_rows(&queries_last, |q| wtns_prev.row(q));
             let merkle_proof_last =
                 merkle_multi_proof_for(&wtns_prev.tree, wtns_prev.block_len, &queries_last);
             if trace {
@@ -4052,10 +4075,7 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
         let queries_i = sample_distinct_queries(challenger, wtns_prev.block_len, num_queries_i);
         let alpha_i = challenger.sample_f128_vec(ceil_log2(num_queries_i));
         let _t = std::time::Instant::now();
-        let opened_rows_i: Vec<Vec<F128>> = queries_i
-            .iter()
-            .map(|&q| wtns_prev.row(q).to_vec())
-            .collect();
+        let opened_rows_i: Vec<Vec<F128>> = gather_opened_rows(&queries_i, |q| wtns_prev.row(q));
         let merkle_proof_i =
             merkle_multi_proof_for(&wtns_prev.tree, wtns_prev.block_len, &queries_i);
         if trace {
