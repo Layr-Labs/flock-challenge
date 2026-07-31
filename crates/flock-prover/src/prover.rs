@@ -394,25 +394,42 @@ fn commit_with_round1_ab_precompute(
     debug_assert_eq!(k_skip, 6, "ranked protocol fixes k_skip=6");
     let inv_table = flock_core::ntt::InvNttTableByteSingleGf8::cached_standard_k6();
 
-    rayon::join(
-        || match commit_codeword {
-            CommitCodeword::Allocate => pcs::commit(z_packed, pcs_params),
-            CommitCodeword::NeedsReplication(buf) => pcs::commit_into(z_packed, pcs_params, buf),
-            CommitCodeword::Preinitialized(buf) => {
-                pcs::commit_preinitialized(z_packed, buf, pcs_params)
-            }
-        },
-        || {
-            zerocheck::univariate_skip_optimized::precompute_round1_ab_inner_packed_padded(
-                a_packed,
-                b_packed,
-                pcs_params.m,
-                k_skip,
-                inv_table,
-                padding,
-            )
-        },
-    )
+    let precompute_ab = || {
+        zerocheck::univariate_skip_optimized::precompute_round1_ab_inner_packed_padded(
+            a_packed,
+            b_packed,
+            pcs_params.m,
+            k_skip,
+            inv_table,
+            padding,
+        )
+    };
+    match commit_codeword {
+        // The ranked BLAKE3 witness path already owns a fully initialized
+        // codeword. Let PCS run its top NTT without sibling contention, then
+        // place this challenge-independent AB work beside the existing deep
+        // NTT + bounded Merkle-leaf pipeline. The PCS entry point contains the
+        // exact shape/feature/opt-out gate and restores this function's former
+        // whole-commit join on every fallback.
+        CommitCodeword::Preinitialized(buf) => pcs::commit_preinitialized_join_after_ranked_top(
+            z_packed,
+            buf,
+            pcs_params,
+            precompute_ab,
+        ),
+        commit_codeword => rayon::join(
+            || match commit_codeword {
+                CommitCodeword::Allocate => pcs::commit(z_packed, pcs_params),
+                CommitCodeword::NeedsReplication(buf) => {
+                    pcs::commit_into(z_packed, pcs_params, buf)
+                }
+                CommitCodeword::Preinitialized(_) => {
+                    unreachable!("preinitialized codeword handled above")
+                }
+            },
+            precompute_ab,
+        ),
+    }
 }
 
 /// Run commit → bind → zerocheck → lincheck and build the base claims, stopping

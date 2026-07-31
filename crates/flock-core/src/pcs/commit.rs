@@ -255,6 +255,46 @@ pub fn commit_preinitialized(
     finalize_commit(codeword, params)
 }
 
+/// Ranked preinitialized commitment that moves the caller's independent work
+/// from the whole-commit join to the boundary after the three top NTT passes.
+///
+/// On the exact ranked Apple shape, the top NTT first uses the otherwise-idle
+/// main and efficiency-core pools without a competing sibling. The existing
+/// cache-local deep NTT plus bounded Merkle-leaf pipeline then shares the main
+/// pool with `after_top`. This keeps the established leaf queue, inline
+/// fallback, local-parent ownership, and tail drain unchanged.
+///
+/// Every other shape and every opt-out executes the prior schedule exactly:
+/// the complete ordinary commitment is joined with `after_top`. Set
+/// `FLOCK_NO_COMMIT_TOP_FIRST_AB=1` for that same-binary control.
+pub fn commit_preinitialized_join_after_ranked_top<R, F>(
+    z_packed: &[F128],
+    codeword: Vec<F128>,
+    params: &PcsParams,
+    after_top: F,
+) -> ((Commitment, ProverData), R)
+where
+    R: Send,
+    F: FnOnce() -> R + Send,
+{
+    if !use_ranked_commit_top_first_join(params) {
+        return rayon::join(
+            || commit_preinitialized(z_packed, codeword, params),
+            after_top,
+        );
+    }
+
+    params.validate();
+    assert_eq!(z_packed.len(), 1usize << params.log_msg_len());
+    let codeword_len = params.n_positions() * params.num_ntts();
+    assert_eq!(
+        codeword.len(),
+        codeword_len,
+        "commit_preinitialized_join_after_ranked_top: codeword buffer has wrong length"
+    );
+    finalize_commit_join_after_ranked_top(codeword, params, after_top)
+}
+
 /// Fill `codeword` with `2^r` replicas of `msg` (`r = log2(codeword.len() /
 /// msg.len())`) — the exact state after the first `r` forward-NTT layers on
 /// the zero-padded coefficient vector `[msg, 0, …, 0]`. Pair with
@@ -304,6 +344,21 @@ fn use_ranked_ntt_merkle_leaf_pipeline(params: &PcsParams) -> bool {
         && std::env::var_os("FLOCK_NO_NTT_MERKLE_PIPELINE").is_none()
 }
 
+/// The top-first placement is valid only when the ranked pipeline can split
+/// the top NTT from the deep callback phase and borrow the helper pool for all
+/// three top passes. Any diagnostic or pipeline opt-out restores the former
+/// whole-commit/independent-work join rather than silently changing only part
+/// of the schedule.
+#[inline]
+fn use_ranked_commit_top_first_join(params: &PcsParams) -> bool {
+    use_ranked_ntt_merkle_leaf_pipeline(params)
+        && rayon::current_num_threads() > 1
+        && crate::epool::epool().is_some()
+        && std::env::var_os("FLOCK_NO_NTT_TOP_EPOOL").is_none()
+        && std::env::var_os("FLOCK_NTT_BLOCK_REGIONS").is_none()
+        && std::env::var_os("FLOCK_NO_COMMIT_TOP_FIRST_AB").is_none()
+}
+
 #[derive(Clone, Copy)]
 struct RankedLeafJob {
     elem_offset: usize,
@@ -323,6 +378,54 @@ fn ranked_ntt_with_pipelined_leaves(
     tree: &mut [Hash],
     helper: &rayon::ThreadPool,
 ) -> usize {
+    let (parent_levels, after_top) = ranked_ntt_with_pipelined_leaves_inner::<(), fn()>(
+        ntt, codeword, params, tree, helper, None,
+    );
+    debug_assert!(after_top.is_none());
+    parent_levels
+}
+
+/// Exact ranked sibling of [`ranked_ntt_with_pipelined_leaves`] that starts
+/// independent main-pool work only after the heterogeneous top NTT has fully
+/// joined, then overlaps it with the unchanged deep/leaf phase.
+fn ranked_ntt_with_pipelined_leaves_join_after_top<R, F>(
+    ntt: &AdditiveNttF128,
+    codeword: &mut [F128],
+    params: &PcsParams,
+    tree: &mut [Hash],
+    helper: &rayon::ThreadPool,
+    after_top: F,
+) -> (usize, R)
+where
+    R: Send,
+    F: FnOnce() -> R + Send,
+{
+    let (parent_levels, after_top) = ranked_ntt_with_pipelined_leaves_inner(
+        ntt,
+        codeword,
+        params,
+        tree,
+        helper,
+        Some(after_top),
+    );
+    (
+        parent_levels,
+        after_top.expect("ranked after-top task must return a result"),
+    )
+}
+
+fn ranked_ntt_with_pipelined_leaves_inner<R, F>(
+    ntt: &AdditiveNttF128,
+    codeword: &mut [F128],
+    params: &PcsParams,
+    tree: &mut [Hash],
+    helper: &rayon::ThreadPool,
+    after_top: Option<F>,
+) -> (usize, Option<R>)
+where
+    R: Send,
+    F: FnOnce() -> R + Send,
+{
     use rayon::prelude::*;
     use std::sync::Mutex;
     use std::sync::mpsc::{TrySendError, sync_channel};
@@ -406,6 +509,10 @@ fn ranked_ntt_with_pipelined_leaves(
     let split_ranked_top = is_ranked_ntt_merkle_leaf_pipeline_shape(params)
         && std::env::var_os("FLOCK_NO_NTT_TOP_EPOOL").is_none()
         && std::env::var_os("FLOCK_NTT_BLOCK_REGIONS").is_none();
+    assert!(
+        after_top.is_none() || split_ranked_top,
+        "after-top work requires the exact ranked top/deep split"
+    );
     if split_ranked_top {
         ntt.forward_transform_interleaved_ranked_top_from_layer(
             codeword,
@@ -414,7 +521,7 @@ fn ranked_ntt_with_pipelined_leaves(
         );
     }
 
-    std::thread::scope(|scope| {
+    let finish_deep_and_leaves = || std::thread::scope(|scope| {
         let helper_manager = scope.spawn(|| {
             helper.broadcast(|_| {
                 loop {
@@ -469,12 +576,50 @@ fn ranked_ntt_with_pipelined_leaves(
             .join()
             .expect("ranked NTT-to-Merkle helper manager panicked");
     });
-    local_parent_levels
+
+    let after_top_result = if let Some(after_top) = after_top {
+        let ((), result) = rayon::join(finish_deep_and_leaves, after_top);
+        Some(result)
+    } else {
+        finish_deep_and_leaves();
+        None
+    };
+    (local_parent_levels, after_top_result)
 }
 
 /// Shared tail of [`commit`] / [`commit_into`]: interleaved forward additive
 /// NTT (RS-encode every lane) then the initial Merkle tree over codeword rows.
-fn finalize_commit(mut codeword: Vec<F128>, params: &PcsParams) -> (Commitment, ProverData) {
+fn finalize_commit(codeword: Vec<F128>, params: &PcsParams) -> (Commitment, ProverData) {
+    let (commit, after_top) = finalize_commit_inner::<(), fn()>(codeword, params, None);
+    debug_assert!(after_top.is_none());
+    commit
+}
+
+fn finalize_commit_join_after_ranked_top<R, F>(
+    codeword: Vec<F128>,
+    params: &PcsParams,
+    after_top: F,
+) -> ((Commitment, ProverData), R)
+where
+    R: Send,
+    F: FnOnce() -> R + Send,
+{
+    let (commit, after_top) = finalize_commit_inner(codeword, params, Some(after_top));
+    (
+        commit,
+        after_top.expect("ranked after-top task must return a result"),
+    )
+}
+
+fn finalize_commit_inner<R, F>(
+    mut codeword: Vec<F128>,
+    params: &PcsParams,
+    after_top: Option<F>,
+) -> ((Commitment, ProverData), Option<R>)
+where
+    R: Send,
+    F: FnOnce() -> R + Send,
+{
     let helper = if use_ranked_ntt_merkle_leaf_pipeline(params) && rayon::current_num_threads() > 1
     {
         crate::epool::epool()
@@ -493,27 +638,47 @@ fn finalize_commit(mut codeword: Vec<F128>, params: &PcsParams) -> (Commitment, 
     });
     let timing = std::env::var_os("FLOCK_COMMIT_TIMING").is_some();
     let t_ntt = std::time::Instant::now();
-    let mut prehashed_parent_levels = 0usize;
     // ---- Interleaved forward additive NTT: 2^log_batch_size independent
     // sub-NTTs with shared twiddles. Each sub-NTT operates on its lane of the
     // SoA buffer. The first `log_inv_rate` layers were pre-applied by the
     // caller's replicate-fill (commit_into), so start past them.
     let ntt = AdditiveNttF128::standard(params.k_code());
-    if let (Some(helper), Some(tree)) = (helper, prehashed_tree.as_mut()) {
-        prehashed_parent_levels = ranked_ntt_with_pipelined_leaves(
-            &ntt,
-            &mut codeword,
-            params,
-            tree,
-            helper,
-        );
-    } else {
-        ntt.forward_transform_interleaved_from_layer(
-            &mut codeword,
-            params.num_ntts(),
-            params.log_inv_rate,
-        );
-    }
+    let (prehashed_parent_levels, after_top_result) =
+        if let (Some(helper), Some(tree)) = (helper, prehashed_tree.as_mut()) {
+            if let Some(after_top) = after_top {
+                let (parent_levels, result) = ranked_ntt_with_pipelined_leaves_join_after_top(
+                    &ntt,
+                    &mut codeword,
+                    params,
+                    tree,
+                    helper,
+                    after_top,
+                );
+                (parent_levels, Some(result))
+            } else {
+                (
+                    ranked_ntt_with_pipelined_leaves(
+                        &ntt,
+                        &mut codeword,
+                        params,
+                        tree,
+                        helper,
+                    ),
+                    None,
+                )
+            }
+        } else {
+            assert!(
+                after_top.is_none(),
+                "after-top work requires the ranked NTT-to-Merkle pipeline"
+            );
+            ntt.forward_transform_interleaved_from_layer(
+                &mut codeword,
+                params.num_ntts(),
+                params.log_inv_rate,
+            );
+            (0, None)
+        };
     if timing {
         let phase = if pipelined_leaves {
             "ntt+merkle-leaves"
@@ -562,14 +727,17 @@ fn finalize_commit(mut codeword: Vec<F128>, params: &PcsParams) -> (Commitment, 
     }
 
     (
-        Commitment {
-            root,
-            params: params.clone(),
-        },
-        ProverData {
-            codeword,
-            merkle_tree,
-        },
+        (
+            Commitment {
+                root,
+                params: params.clone(),
+            },
+            ProverData {
+                codeword,
+                merkle_tree,
+            },
+        ),
+        after_top_result,
     )
 }
 
@@ -735,6 +903,31 @@ mod tests {
         let mut changed = params;
         changed.merkle_hash = HashKind::Sha256;
         assert!(!is_ranked_ntt_merkle_leaf_pipeline_shape(&changed));
+    }
+
+    /// Non-ranked preinitialized commits retain the former whole-commit join
+    /// and return byte-identical commitment data plus the sibling result.
+    #[test]
+    fn join_after_ranked_top_api_falls_back_exactly() {
+        let params = default_params(12);
+        let mut rng = Rng::new(0xA83F_7E21_5A11_BACC);
+        let message: Vec<F128> = (0..1usize << params.log_msg_len())
+            .map(|_| rng.f128())
+            .collect();
+        let mut codeword = vec![F128::ZERO; params.codeword_len_f128()];
+        replicate_message_fill(&mut codeword, &message);
+
+        let (expected_commitment, expected_data) =
+            commit_preinitialized(&message, codeword.clone(), &params);
+        let ((got_commitment, got_data), sibling) =
+            commit_preinitialized_join_after_ranked_top(&message, codeword, &params, || {
+                0xA17E_F00Du64
+            });
+
+        assert_eq!(sibling, 0xA17E_F00D);
+        assert_eq!(got_commitment.root, expected_commitment.root);
+        assert_eq!(got_data.codeword, expected_data.codeword);
+        assert_eq!(got_data.merkle_tree, expected_data.merkle_tree);
     }
 
     #[test]
