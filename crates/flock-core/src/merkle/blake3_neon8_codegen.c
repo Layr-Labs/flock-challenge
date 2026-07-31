@@ -8,7 +8,8 @@
 //
 // Regenerate with Apple clang 21, then remove the host-specific
 // `.build_version` directive before checking in the output:
-//   xcrun clang -S -O3 -mcpu=apple-m3 -fno-stack-protector \
+//   xcrun clang -S -O3 -mcpu=apple-m3 -mllvm -misched=ilpmax \
+//     -fno-stack-protector \
 //     -fno-asynchronous-unwind-tables -fvisibility=hidden \
 //     blake3_neon8_codegen.c -o blake3_neon8_macos.S
 
