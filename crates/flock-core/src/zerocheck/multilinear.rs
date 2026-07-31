@@ -125,20 +125,32 @@ pub fn lagrange_weights_naive(k_skip: usize, z: F128) -> Vec<F128> {
 pub fn lagrange_weights_lambda_naive(k_skip: usize, z: F128) -> Vec<F128> {
     let ell = 1usize << k_skip;
     assert!(2 * ell <= 256, "Λ ∪ S must fit in F_8 (need k_skip ≤ 7)");
+    // Λ is an affine coset of an additive subgroup. Therefore the multiset
+    // {s_i + s_j | j != i} is the same for every i: the coset offset cancels
+    // in characteristic two and translating the subgroup merely permutes it.
+    // Its product, and hence its relatively expensive inverse, can be shared
+    // by every Lagrange weight.
+    let s0 = PHI_8_TABLE[ell];
+    let mut den = F128::ONE;
+    for j in 1..ell {
+        den *= s0 + PHI_8_TABLE[ell + j];
+    }
+    let den_inv = den.inv();
+
+    // Build every numerator Π_{j≠i}(z + s_j) in linear rather than quadratic
+    // time with prefix/suffix products.  This also remains correct when z is
+    // itself a Λ node (so division by z + s_i would not be valid).
+    let mut prefix = Vec::with_capacity(ell + 1);
+    prefix.push(F128::ONE);
+    for j in 0..ell {
+        let term = z + PHI_8_TABLE[ell + j];
+        prefix.push(prefix[j] * term);
+    }
     let mut weights = vec![F128::ZERO; ell];
-    for i in 0..ell {
-        let si = PHI_8_TABLE[ell + i];
-        let mut num = F128::ONE;
-        let mut den = F128::ONE;
-        for j in 0..ell {
-            if j == i {
-                continue;
-            }
-            let sj = PHI_8_TABLE[ell + j];
-            num *= z + sj;
-            den *= si + sj;
-        }
-        weights[i] = num * den.inv();
+    let mut suffix = F128::ONE;
+    for i in (0..ell).rev() {
+        weights[i] = prefix[i] * suffix * den_inv;
+        suffix *= z + PHI_8_TABLE[ell + i];
     }
     weights
 }
@@ -158,6 +170,45 @@ pub fn interpolate_at_z_on_lambda(values: &[F128], k_skip: usize, z: F128) -> F1
         acc += weights[i] * values[i];
     }
     acc
+}
+
+#[cfg(test)]
+fn lagrange_weights_lambda_quadratic_reference(k_skip: usize, z: F128) -> Vec<F128> {
+    let ell = 1usize << k_skip;
+    (0..ell)
+        .map(|i| {
+            let si = PHI_8_TABLE[ell + i];
+            let mut numerator = F128::ONE;
+            let mut denominator = F128::ONE;
+            for j in 0..ell {
+                if i != j {
+                    let sj = PHI_8_TABLE[ell + j];
+                    numerator *= z + sj;
+                    denominator *= si + sj;
+                }
+            }
+            numerator * denominator.inv()
+        })
+        .collect()
+}
+
+#[test]
+fn optimized_lambda_weights_match_quadratic_reference() {
+    for k_skip in 0..=7 {
+        for &z in &[
+            F128::ZERO,
+            F128::ONE,
+            PHI_8_TABLE[0],
+            PHI_8_TABLE[1usize << k_skip],
+            PHI_8_TABLE[255],
+        ] {
+            assert_eq!(
+                lagrange_weights_lambda_naive(k_skip, z),
+                lagrange_weights_lambda_quadratic_reference(k_skip, z),
+                "mismatch for k_skip={k_skip}"
+            );
+        }
+    }
 }
 
 /// Interpolate a degree-`< 2·2^k_skip` polynomial at z, given its `2^k_skip`
