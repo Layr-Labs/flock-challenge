@@ -197,6 +197,22 @@ unsafe fn round3(
 /// remain on upstream `hash_many`, so arbitrary Rayon partitions are safe.
 #[inline]
 pub(super) fn hash_complete_parent_groups(data: &[u8], out: &mut [[u8; 32]]) -> usize {
+    hash_complete_groups_flags(data, out, 4)
+}
+
+/// Twelve-way PoW grind blocks: 64-byte single-chunk pre-images with
+/// `CHUNK_START | CHUNK_END | ROOT` (11) instead of the Merkle `PARENT`
+/// flag (4) — the same layout, IV, counter-zero, and 32-byte output
+/// contract as [`hash_complete_parent_groups`], so each output agrees with
+/// `blake3::hash` on the same 64-byte pre-image.
+pub(crate) fn hash_complete_pow_groups(data: &[u8], out: &mut [[u8; 32]]) -> usize {
+    hash_complete_groups_flags(data, out, 11)
+}
+
+/// Shared driver: hash complete groups of twelve contiguous 64-byte blocks
+/// with the given BLAKE3 domain `flags`. Returns the number of outputs
+/// written; the caller handles the tail through upstream `hash_many`.
+fn hash_complete_groups_flags(data: &[u8], out: &mut [[u8; 32]], flags: u32) -> usize {
     debug_assert_eq!(data.len(), out.len() * 64);
     let groups = out.len() / 12;
     if groups == 0 {
@@ -231,7 +247,7 @@ pub(super) fn hash_complete_parent_groups(data: &[u8], out: &mut [[u8; 32]]) -> 
             zero,
             zero,
             vdupq_n_u32(64),
-            vdupq_n_u32(4),
+            vdupq_n_u32(flags),
         ];
         for group in 0..groups {
             let input = data.as_ptr().add(group * 12 * 64);

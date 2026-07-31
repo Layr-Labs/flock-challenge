@@ -462,6 +462,22 @@ mod tests {
         }
     }
 
+    /// The shared-constant vec2 Karatsuba must agree, lane for lane, with
+    /// the scalar field product.
+    #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+    #[test]
+    fn const_vec2_karatsuba_matches_scalar() {
+        let mut rng = Rng::new(9);
+        for _ in 0..128 {
+            let c = rng.next_f128();
+            let b0 = rng.next_f128();
+            let b1 = rng.next_f128();
+            let prod = unsafe { aarch64::ghash_mul_const_vec2_neon(c, [b0, b1]) };
+            assert_eq!(prod[0], software::ghash_mul(c, b0));
+            assert_eq!(prod[1], software::ghash_mul(c, b1));
+        }
+    }
+
     #[cfg(all(target_arch = "x86_64", target_feature = "pclmulqdq"))]
     #[test]
     fn all_x86_variants_agree() {
