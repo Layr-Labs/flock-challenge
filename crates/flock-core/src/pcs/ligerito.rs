@@ -2101,57 +2101,172 @@ fn transpose_forward_ntt_fused_3layer(
     });
 }
 
-/// Transposed forward additive NTT, `Fᵀ`, in place over `2^log_d` coefficients.
-/// Forward butterfly is `M=[[1,t],[1,t+1]]`; transpose `Mᵀ=[[1,1],[t,t+1]]` is
-/// `s=a+b; top=s; bot=t·s+b`, applied in **reverse** layer order. (Baseline:
-/// one parallel sweep per layer.) Three adjacent layers are fused so each
-/// eight-value row group crosses memory once instead of three times.
-fn transpose_forward_ntt(ntt: &AdditiveNttF128, data: &mut [F128], log_d: usize) {
+/// Four-layer sibling of [`transpose_forward_ntt_fused_3layer`]: sixteen
+/// strided values, fifteen butterflies (layers `layer+3 .. layer` reverse),
+/// one write-back. Used when the remaining reverse depth is at least four and
+/// not six (six is cheaper as two fused triples).
+fn transpose_forward_ntt_fused_4layer(
+    ntt: &AdditiveNttF128,
+    data: &mut [F128],
+    log_d: usize,
+    layer: usize,
+) {
     use rayon::prelude::*;
-    debug_assert_eq!(data.len(), 1usize << log_d);
-    debug_assert!(log_d <= ntt.log_domain_size());
-    let n_threads = rayon::current_num_threads().max(1);
-    let mut remaining = log_d;
-    while remaining >= 3 {
-        let layer = remaining - 3;
-        transpose_forward_ntt_fused_3layer(ntt, data, log_d, layer);
-        remaining -= 3;
+
+    #[inline(always)]
+    fn butterfly(values: &mut [F128; 16], a: usize, b: usize, twiddle: F128) {
+        let sum = values[a] + values[b];
+        values[a] = sum;
+        values[b] = twiddle * sum + values[b];
     }
-    for layer in (0..remaining).rev() {
-        let num_blocks = 1usize << layer;
-        let block_size = 1usize << (log_d - layer);
-        let bsh = block_size >> 1;
-        if num_blocks >= n_threads {
-            data.par_chunks_mut(block_size)
-                .enumerate()
-                .for_each(|(block, chunk)| {
-                    let t = ntt.twiddle(layer, block);
-                    let (top, bot) = chunk.split_at_mut(bsh);
-                    for (a_ref, b_ref) in top.iter_mut().zip(bot.iter_mut()) {
-                        let a = *a_ref;
-                        let b = *b_ref;
-                        let s = a + b;
-                        *a_ref = s;
-                        *b_ref = t * s + b;
-                    }
-                });
-        } else {
-            for block in 0..num_blocks {
-                let t = ntt.twiddle(layer, block);
-                let chunk = &mut data[block * block_size..(block + 1) * block_size];
-                let (top, bot) = chunk.split_at_mut(bsh);
-                top.par_iter_mut()
-                    .zip(bot.par_iter_mut())
-                    .for_each(|(a_ref, b_ref)| {
-                        let a = *a_ref;
-                        let b = *b_ref;
-                        let s = a + b;
-                        *a_ref = s;
-                        *b_ref = t * s + b;
-                    });
+
+    let num_blocks = 1usize << layer;
+    let block_size = 1usize << (log_d - layer);
+    let sixteenth = block_size >> 4;
+    let sixteenth_log = log_d - layer - 4;
+    let row_mask = sixteenth - 1;
+    // Twiddle packing (lowest layer index = outer):
+    //   tw[0]     = twiddle(layer, block)
+    //   tw[1..2]  = twiddle(layer+1, 2*block + s)
+    //   tw[3..6]  = twiddle(layer+2, 4*block + s)
+    //   tw[7..14] = twiddle(layer+3, 8*block + s)
+    let twiddles: Vec<[F128; 15]> = (0..num_blocks)
+        .map(|block| {
+            let mut tw = [F128::ZERO; 15];
+            tw[0] = ntt.twiddle(layer, block);
+            for s in 0..2 {
+                tw[1 + s] = ntt.twiddle(layer + 1, 2 * block + s);
+            }
+            for s in 0..4 {
+                tw[3 + s] = ntt.twiddle(layer + 2, 4 * block + s);
+            }
+            for s in 0..8 {
+                tw[7 + s] = ntt.twiddle(layer + 3, 8 * block + s);
+            }
+            tw
+        })
+        .collect();
+
+    let data_ptr = data.as_mut_ptr() as usize;
+    (0..num_blocks * sixteenth).into_par_iter().for_each(|job| {
+        let block = job >> sixteenth_log;
+        let row = job & row_mask;
+        let base = block * block_size + row;
+        let mut values = [F128::ZERO; 16];
+        // SAFETY: each `(block,row)` owns the sixteen distinct positions
+        // `base + i*sixteenth`; jobs never overlap.
+        unsafe {
+            let ptr = data_ptr as *mut F128;
+            for (i, value) in values.iter_mut().enumerate() {
+                *value = *ptr.add(base + i * sixteenth);
+            }
+            let tw = &twiddles[block];
+            // layer+3: distance-1 pairs
+            for pair in 0..8 {
+                butterfly(&mut values, 2 * pair, 2 * pair + 1, tw[7 + pair]);
+            }
+            // layer+2: distance-2 pairs inside each 4-group
+            for g in 0..4 {
+                butterfly(&mut values, 4 * g, 4 * g + 2, tw[3 + g]);
+                butterfly(&mut values, 4 * g + 1, 4 * g + 3, tw[3 + g]);
+            }
+            // layer+1: distance-4 pairs inside each 8-group
+            for g in 0..2 {
+                for j in 0..4 {
+                    butterfly(&mut values, 8 * g + j, 8 * g + j + 4, tw[1 + g]);
+                }
+            }
+            // layer: distance-8 pairs across the 16-group
+            for j in 0..8 {
+                butterfly(&mut values, j, j + 8, tw[0]);
+            }
+            for (i, &value) in values.iter().enumerate() {
+                *ptr.add(base + i * sixteenth) = value;
             }
         }
+    });
+}
+
+/// Whether four-layer reverse-transpose fusion is enabled. Opt out restores
+/// the promoted three-layer-only schedule in the same binary.
+#[inline]
+fn transpose_fuse4_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("FLOCK_NO_TRANSPOSE_FUSE4").is_none())
+}
+
+/// Drive reverse-layer fusion: prefer four-layer when remaining ≥ 4 except
+/// remaining = 6 (two fused triples, fewer passes). Fall back to three-layer,
+/// then the incumbent single-layer body for a 1- or 2-layer tail.
+fn transpose_forward_ntt_fused_drive(
+    ntt: &AdditiveNttF128,
+    data: &mut [F128],
+    log_d: usize,
+    mut remaining: usize,
+) {
+    use rayon::prelude::*;
+    let n_threads = rayon::current_num_threads().max(1);
+    let fuse4 = transpose_fuse4_enabled();
+    while remaining > 0 {
+        if fuse4 && remaining >= 4 && remaining != 6 {
+            let layer = remaining - 4;
+            transpose_forward_ntt_fused_4layer(ntt, data, log_d, layer);
+            remaining -= 4;
+        } else if remaining >= 3 {
+            let layer = remaining - 3;
+            transpose_forward_ntt_fused_3layer(ntt, data, log_d, layer);
+            remaining -= 3;
+        } else {
+            for layer in (0..remaining).rev() {
+                let num_blocks = 1usize << layer;
+                let block_size = 1usize << (log_d - layer);
+                let bsh = block_size >> 1;
+                if num_blocks >= n_threads {
+                    data.par_chunks_mut(block_size)
+                        .enumerate()
+                        .for_each(|(block, chunk)| {
+                            let t = ntt.twiddle(layer, block);
+                            let (top, bot) = chunk.split_at_mut(bsh);
+                            for (a_ref, b_ref) in top.iter_mut().zip(bot.iter_mut()) {
+                                let a = *a_ref;
+                                let b = *b_ref;
+                                let s = a + b;
+                                *a_ref = s;
+                                *b_ref = t * s + b;
+                            }
+                        });
+                } else {
+                    for block in 0..num_blocks {
+                        let t = ntt.twiddle(layer, block);
+                        let chunk = &mut data[block * block_size..(block + 1) * block_size];
+                        let (top, bot) = chunk.split_at_mut(bsh);
+                        top.par_iter_mut()
+                            .zip(bot.par_iter_mut())
+                            .for_each(|(a_ref, b_ref)| {
+                                let a = *a_ref;
+                                let b = *b_ref;
+                                let s = a + b;
+                                *a_ref = s;
+                                *b_ref = t * s + b;
+                            });
+                    }
+                }
+            }
+            break;
+        }
     }
+}
+
+/// Transposed forward additive NTT, `Fᵀ`, in place over `2^log_d` coefficients.
+/// Forward butterfly is `M=[[1,t],[1,t+1]]`; transpose `Mᵀ=[[1,1],[t,t+1]]` is
+/// `s=a+b; top=s; bot=t·s+b`, applied in **reverse** layer order. Adjacent
+/// reverse layers are fused (four when profitable, else three) so each
+/// multi-value row group crosses memory once instead of once per layer.
+fn transpose_forward_ntt(ntt: &AdditiveNttF128, data: &mut [F128], log_d: usize) {
+    debug_assert_eq!(data.len(), 1usize << log_d);
+    debug_assert!(log_d <= ntt.log_domain_size());
+    transpose_forward_ntt_fused_drive(ntt, data, log_d, log_d);
 }
 
 /// `Fᵀ`-based fast path for [`induce_sumcheck_poly`]: scatter per-query weights
@@ -2327,48 +2442,8 @@ fn transpose_forward_ntt_sparse(
     }
 
     // Remaining steps s = k..log_d-1 = forward layers (log_d-1-k) .. 0, dense.
-    let n_threads = rayon::current_num_threads().max(1);
-    let mut remaining = log_d - k;
-    while remaining >= 3 {
-        let layer = remaining - 3;
-        transpose_forward_ntt_fused_3layer(ntt, &mut data, log_d, layer);
-        remaining -= 3;
-    }
-    for layer in (0..remaining).rev() {
-        let num_blocks = 1usize << layer;
-        let block_size = 1usize << (log_d - layer);
-        let bsh = block_size >> 1;
-        if num_blocks >= n_threads {
-            data.par_chunks_mut(block_size)
-                .enumerate()
-                .for_each(|(block, chunk)| {
-                    let t = ntt.twiddle(layer, block);
-                    let (top, bot) = chunk.split_at_mut(bsh);
-                    for (a_ref, b_ref) in top.iter_mut().zip(bot.iter_mut()) {
-                        let a = *a_ref;
-                        let b = *b_ref;
-                        let sab = a + b;
-                        *a_ref = sab;
-                        *b_ref = t * sab + b;
-                    }
-                });
-        } else {
-            for block in 0..num_blocks {
-                let t = ntt.twiddle(layer, block);
-                let chunk = &mut data[block * block_size..(block + 1) * block_size];
-                let (top, bot) = chunk.split_at_mut(bsh);
-                top.par_iter_mut()
-                    .zip(bot.par_iter_mut())
-                    .for_each(|(a_ref, b_ref)| {
-                        let a = *a_ref;
-                        let b = *b_ref;
-                        let sab = a + b;
-                        *a_ref = sab;
-                        *b_ref = t * sab + b;
-                    });
-            }
-        }
-    }
+    // Same fused drive as the full transpose (4-layer preferred, then 3, then 1).
+    transpose_forward_ntt_fused_drive(ntt, &mut data, log_d, log_d - k);
     data
 }
 
