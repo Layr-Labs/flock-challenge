@@ -10462,4 +10462,4 @@ mod tests {
 // RealAdii draw 3 on 76f9e98.
 // angelX disclosed draw 3 on 39541e2 (draws 1-2: 1,252,541 / 1,241,514; zero-diff marker per board protocol).
 // angelX disclosed draw 7 of the tree on 775378c (prior: 1,252,541 / 1,241,514 / 1,255,076 P / 1,245,411 / 1,249,152 / pending; zero-diff marker).
-// RealAdii sample 1 on beeedc6.
+// angelX disclosed draw 4 of the z-pin tree on 0a755b6 (prior: -0.63% / -0.57% / pending; zero-diff marker per board protocol).
