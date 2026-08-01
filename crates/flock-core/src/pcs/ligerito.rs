@@ -9423,3 +9423,4 @@ mod tests {
     }
 }
 // Redraw marker 4 (drift probe): zero-diff; prior draws 1,205,646 / 1,205,107 / 1,206,245.
+// Redraw marker 5: preserve the 1,207,147.73 promoted executable exactly.
