@@ -9931,3 +9931,4 @@ mod tests {
 // RealAdii draw 2 on 76f9e98 (draw 1: 1,250,243.88).
 // RealAdii draw 3 on 76f9e98.
 // angelX disclosed draw 3 on 39541e2 (draws 1-2: 1,252,541 / 1,241,514; zero-diff marker per board protocol).
+// angelX disclosed draw 4 of the tree on 775378c (prior: 1,252,541 / 1,241,514 / 1,255,076 promoted / leaf-merge 1,250,473; zero-diff marker).
