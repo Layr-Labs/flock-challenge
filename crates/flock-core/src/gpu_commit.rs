@@ -372,6 +372,183 @@ pub fn note_precompute_branch_wall_ms(ms: f64) {
     PRECOMPUTE_BRANCH_WALL_MS.store(ms.to_bits(), std::sync::atomic::Ordering::Relaxed);
 }
 
+/// Process-local lifecycle of the exact ranked k=5/k=6 retest. The prover
+/// requests it before entering the warmup join. A valid cross-process cache
+/// hit satisfies it inside the commit arm; otherwise the post-join replay
+/// atomically claims it. This keeps every later proof and cache-hit worker
+/// out of the expensive replay closure.
+const RANKED_K56_RETEST_IDLE: u8 = 0;
+const RANKED_K56_RETEST_REQUESTED: u8 = 1;
+const RANKED_K56_RETEST_SATISFIED: u8 = 2;
+static RANKED_K56_RETEST_STATE: std::sync::atomic::AtomicU8 =
+    std::sync::atomic::AtomicU8::new(RANKED_K56_RETEST_IDLE);
+
+fn request_ranked_k56_in(state: &std::sync::atomic::AtomicU8) -> bool {
+    state
+        .compare_exchange(
+            RANKED_K56_RETEST_IDLE,
+            RANKED_K56_RETEST_REQUESTED,
+            std::sync::atomic::Ordering::AcqRel,
+            std::sync::atomic::Ordering::Acquire,
+        )
+        .is_ok()
+}
+
+fn ranked_k56_pending_in(state: &std::sync::atomic::AtomicU8) -> bool {
+    state.load(std::sync::atomic::Ordering::Acquire) == RANKED_K56_RETEST_REQUESTED
+}
+
+fn satisfy_ranked_k56_in(state: &std::sync::atomic::AtomicU8) -> bool {
+    state
+        .compare_exchange(
+            RANKED_K56_RETEST_REQUESTED,
+            RANKED_K56_RETEST_SATISFIED,
+            std::sync::atomic::Ordering::AcqRel,
+            std::sync::atomic::Ordering::Acquire,
+        )
+        .is_ok()
+}
+
+/// Called by `flock-prover` before entering the warmup commit/AB join.
+/// Returns true only to the first requester in this process, so later scored
+/// proofs do not construct or enter the replay path.
+#[doc(hidden)]
+pub fn request_ranked_k56_contention_retest() -> bool {
+    request_ranked_k56_in(&RANKED_K56_RETEST_STATE)
+}
+
+/// Whether call-zero requested an exact replay that a cache hit has not yet
+/// satisfied. The prover samples this before its warmup commit/AB join.
+#[doc(hidden)]
+pub fn ranked_k56_contention_retest_pending() -> bool {
+    ranked_k56_pending_in(&RANKED_K56_RETEST_STATE)
+}
+
+/// Satisfy a pending request without replay (valid cache hit or a warmup
+/// decision for which no hybrid finalist is needed).
+fn satisfy_ranked_k56_contention_retest() {
+    let _ = satisfy_ranked_k56_in(&RANKED_K56_RETEST_STATE);
+}
+
+/// Claim the one cache-miss replay after the outer warmup join returns.
+fn claim_ranked_k56_contention_retest() -> bool {
+    satisfy_ranked_k56_in(&RANKED_K56_RETEST_STATE)
+}
+
+/// Resolve a balanced exact-contention k=5/k=6 finalist pair. Keep the
+/// incumbent k=5 inside a 1.5% noise band and select k=6 only when the exact
+/// replay shows a material win. This avoids hard-biasing a host whose two
+/// adjacent candidates are indistinguishable while still capturing the
+/// large k=6 gap observed on the ranked M4 worker.
+fn choose_ranked_k56(k5_ms: [f64; 2], k6_ms: [f64; 2]) -> Option<usize> {
+    if k5_ms
+        .into_iter()
+        .chain(k6_ms)
+        .any(|ms| !ms.is_finite() || ms < 0.0)
+    {
+        return None;
+    }
+    let k5_mean = (k5_ms[0] + k5_ms[1]) * 0.5;
+    let k6_mean = (k6_ms[0] + k6_ms[1]) * 0.5;
+    Some(if k6_mean * 1.015 < k5_mean { 6 } else { 5 })
+}
+
+/// Run the balanced finalist order with a canonical from-z re-prime
+/// immediately before every sample. Keeping this sequencing in one pure
+/// driver makes it impossible for production to accidentally time a second
+/// NTT over a previous candidate's already-transformed staging contents.
+fn collect_ranked_k56_samples<E>(
+    mut reprime: impl FnMut() -> Result<(), E>,
+    mut sample: impl FnMut(usize) -> Result<f64, E>,
+) -> Result<([f64; 2], [f64; 2]), E> {
+    let mut walls = [0.0; 4];
+    for (i, k) in [5, 6, 6, 5].into_iter().enumerate() {
+        reprime()?;
+        walls[i] = sample(k)?;
+    }
+    Ok(([walls[0], walls[3]], [walls[1], walls[2]]))
+}
+
+#[cfg(test)]
+mod ranked_k56_select_tests {
+    use super::{
+        choose_ranked_k56, collect_ranked_k56_samples, ranked_k56_pending_in,
+        request_ranked_k56_in, satisfy_ranked_k56_in, RANKED_K56_RETEST_IDLE,
+    };
+    use std::sync::atomic::AtomicU8;
+
+    #[test]
+    fn cache_miss_replay_is_claimed_only_once() {
+        let state = AtomicU8::new(RANKED_K56_RETEST_IDLE);
+        assert!(request_ranked_k56_in(&state));
+        assert!(ranked_k56_pending_in(&state));
+        assert!(satisfy_ranked_k56_in(&state));
+        assert!(!ranked_k56_pending_in(&state));
+        assert!(!request_ranked_k56_in(&state));
+        assert!(!satisfy_ranked_k56_in(&state));
+    }
+
+    #[test]
+    fn cache_hit_satisfies_replay_before_post_join_claim() {
+        let state = AtomicU8::new(RANKED_K56_RETEST_IDLE);
+        assert!(request_ranked_k56_in(&state));
+        assert!(satisfy_ranked_k56_in(&state));
+        assert!(!ranked_k56_pending_in(&state));
+        assert!(!satisfy_ranked_k56_in(&state));
+        assert!(!request_ranked_k56_in(&state));
+    }
+
+    #[test]
+    fn balanced_means_ignore_forward_reverse_order() {
+        assert_eq!(choose_ranked_k56([100.0, 104.0], [101.0, 99.0]), Some(6));
+        assert_eq!(choose_ranked_k56([104.0, 100.0], [99.0, 101.0]), Some(6));
+    }
+
+    #[test]
+    fn near_ties_keep_incumbent_k5() {
+        assert_eq!(choose_ranked_k56([100.0, 100.0], [98.6, 98.6]), Some(5));
+        assert_eq!(choose_ranked_k56([100.0, 100.0], [98.5, 98.5]), Some(6));
+    }
+
+    #[test]
+    fn invalid_sample_refuses_to_publish() {
+        assert_eq!(choose_ranked_k56([100.0, f64::NAN], [99.0, 99.0]), None);
+    }
+
+    #[test]
+    fn every_balanced_finalist_sample_is_immediately_reprimed() {
+        let events = std::cell::RefCell::new(Vec::new());
+        let (k5, k6) = collect_ranked_k56_samples(
+            || {
+                events.borrow_mut().push(0);
+                Ok::<(), ()>(())
+            },
+            |k| {
+                events.borrow_mut().push(k);
+                Ok::<f64, ()>(k as f64)
+            },
+        )
+        .unwrap();
+        assert_eq!(*events.borrow(), [0, 5, 0, 6, 0, 6, 0, 5]);
+        assert_eq!(k5, [5.0, 5.0]);
+        assert_eq!(k6, [6.0, 6.0]);
+    }
+}
+
+/// Run the requested finalist pass once, after the warmup commit/AB join has
+/// returned and while its read-only A/B inputs are still live. The callback
+/// replays that exact AB work beside each graph sample. This function is a
+/// no-op off the ranked Metal path and after the one warmup invocation.
+#[doc(hidden)]
+pub fn retune_ranked_k56_with_contention(
+    params: &crate::pcs::commit::PcsParams,
+    cpu_codeword: &[F128],
+    cpu_tree: &[crate::merkle::Hash],
+    replay_ab: impl Fn() + Sync,
+) {
+    imp::retune_ranked_k56_with_contention(params, cpu_codeword, cpu_tree, replay_ab);
+}
+
 #[cfg_attr(
     not(all(target_os = "macos", target_arch = "aarch64")),
     allow(dead_code)
@@ -3204,6 +3381,12 @@ kernel void parent_hash3(device const uint* children [[buffer(0)]],
     static TUNED_HYBRID_K: std::sync::atomic::AtomicUsize =
         std::sync::atomic::AtomicUsize::new(usize::MAX);
 
+    /// CPU reference-commit wall from the cache-miss warmup. Cache
+    /// publication is deferred until the exact finalist has selected and
+    /// verified a valid split, so no worker can observe the untuned sentinel.
+    static RANKED_K56_PENDING_CPU_WALL_BITS: std::sync::atomic::AtomicU64 =
+        std::sync::atomic::AtomicU64::new(0);
+
     /// Exact override / kill-switch resolution. `FLOCK_NO_HYBRID_COMMIT`
     /// forces the pure-GPU graph; `FLOCK_HYBRID_CPU_BLOCKS` pins an exact
     /// split. Either also disables the warmup sweep.
@@ -3219,6 +3402,12 @@ kernel void parent_hash3(device const uint* children [[buffer(0)]],
                 .and_then(|v| v.parse().ok())
                 .filter(|k| *k < 16)
         })
+    }
+
+    fn ranked_k56_retest_applicable(params: &crate::pcs::commit::PcsParams) -> bool {
+        super::is_ranked_gpu_shape(params)
+            && hybrid_cpu_split_override().is_none()
+            && std::env::var_os("FLOCK_NO_HYBRID_AUTOTUNE").is_none()
     }
 
     /// Pure selection over the sweep's per-candidate best walls; `candidates`
@@ -3277,6 +3466,19 @@ kernel void parent_hash3(device const uint* children [[buffer(0)]],
             return;
         }
         let dbg = debug_enabled() || std::env::var_os("FLOCK_COMMIT_TIMING").is_some();
+        if super::ranked_k56_contention_retest_pending() {
+            // The row-major ranked prover will replay the real AB branch once
+            // the outer warmup join returns. Avoid both double-tuning and the
+            // broad synthetic sweep's 12--13 graph executions; the deferred
+            // balanced finalist pass uses four post-stream samples, four
+            // canonical prefix re-primes, and one full oracle verification.
+            if dbg {
+                eprintln!(
+                    "[gpu-commit] autotune: deferring to exact-AB k5/k6 finalist pass"
+                );
+            }
+            return;
+        }
         let z_buf = latched.wraps[0].2;
         let (tw_buf, tree_buf, staging) = (latched.tw_buf, latched.tree_buf, latched.staging);
         struct GraphCtx<'a> {
@@ -3518,6 +3720,177 @@ kernel void parent_hash3(device const uint* children [[buffer(0)]],
         TUNED_HYBRID_K.store(chosen, std::sync::atomic::Ordering::Relaxed);
     }
 
+    /// Contention-faithful finalist calibration for the exact ranked
+    /// row-major prover. The ordinary tuner has to synthesize the already
+    /// completed round-1 AB arm with a compute burn; fresh-worker evidence
+    /// shows that model can reverse adjacent k=5/k=6 choices even though the
+    /// commit implementation is identical. Here the prover supplies the
+    /// actual read-only AB closure after the warmup join.
+    ///
+    /// Candidate order is balanced (`5, 6, 6, 5`) and selection uses the
+    /// mean of both samples, avoiding the promoted sweep's noise-sensitive
+    /// minimum-of-two statistic. Immediately before every sample, the shared
+    /// from-z first pass restores canonical layer-4 staging outside the timed
+    /// interval; the timed region is exactly the post-stream graph joined
+    /// with a fresh AB replay. The selected full graph is finally compared
+    /// against the CPU-authoritative warmup codeword and tree.
+    pub(crate) fn retune_ranked_k56_with_contention(
+        params: &crate::pcs::commit::PcsParams,
+        cpu_codeword: &[F128],
+        cpu_tree: &[Hash],
+        replay_ab: impl Fn() + Sync,
+    ) {
+        use std::sync::atomic::Ordering;
+
+        if !ranked_k56_retest_applicable(params)
+            || !super::claim_ranked_k56_contention_retest()
+        {
+            return;
+        }
+
+        let dbg = debug_enabled() || std::env::var_os("FLOCK_COMMIT_TIMING").is_some();
+        let latch = LATCH.lock().unwrap();
+        let LatchState::On(latched) = &*latch else {
+            finish_ranked_k56_contention_retest(params, cpu_tree, 0);
+            return;
+        };
+        if STAGING_IN_USE.load(Ordering::Acquire) {
+            // The requested call belongs immediately after warmup, whose
+            // ProverData is CPU-owned. Refuse an accidental later invocation
+            // instead of overwriting a live GPU codeword view.
+            finish_ranked_k56_contention_retest(params, cpu_tree, 0);
+            return;
+        }
+        let Ok(gpu) = gpu() else {
+            finish_ranked_k56_contention_retest(params, cpu_tree, 0);
+            return;
+        };
+
+        struct GraphCtx<'a> {
+            gpu: &'a Gpu,
+            z_buf: Id,
+            staging: Id,
+            tw_buf: Id,
+            tree_buf: Id,
+        }
+        // SAFETY: the latch is held for the entire finalist pass, Metal
+        // command submission is thread-safe, and exactly one graph arm runs
+        // at a time. The wrapper only permits capture by `rayon::join`.
+        unsafe impl Send for GraphCtx<'_> {}
+        unsafe impl Sync for GraphCtx<'_> {}
+
+        let ctx = GraphCtx {
+            gpu,
+            z_buf: latched.wraps[0].2,
+            staging: latched.staging,
+            tw_buf: latched.tw_buf,
+            tree_buf: latched.tree_buf,
+        };
+        let timed_graph = |k: usize| -> Result<(), String> {
+            let c = &ctx;
+            unsafe {
+                run_commit_graph_from_z_hybrid_impl(
+                    c.gpu,
+                    c.z_buf,
+                    c.staging,
+                    c.tw_buf,
+                    c.tree_buf,
+                    params.k_code(),
+                    params.n_leaves(),
+                    k,
+                    true,
+                    None,
+                )
+            }
+        };
+        let sample = |k: usize| -> Result<f64, String> {
+            let t0 = std::time::Instant::now();
+            let (graph, ()) = rayon::join(|| timed_graph(k), &replay_ab);
+            graph?;
+            Ok(t0.elapsed().as_secs_f64() * 1e3)
+        };
+        let reprime = || unsafe {
+            run_from_z_first_pass(
+                ctx.gpu,
+                ctx.z_buf,
+                ctx.staging,
+                ctx.tw_buf,
+                params.k_code(),
+            )
+        };
+        let (k5_ms, k6_ms) = match super::collect_ranked_k56_samples(reprime, sample) {
+            Ok(samples) => samples,
+            Err(e) => {
+                if dbg {
+                    eprintln!(
+                        "[gpu-commit] exact-AB finalist failed ({e}); pinning verified k=0"
+                    );
+                }
+                finish_ranked_k56_contention_retest(params, cpu_tree, 0);
+                return;
+            }
+        };
+        let Some(chosen) = super::choose_ranked_k56(k5_ms, k6_ms) else {
+            finish_ranked_k56_contention_retest(params, cpu_tree, 0);
+            return;
+        };
+
+        // Restore a canonical full graph and retain the warmup latch's
+        // trust-but-verify contract for whichever finalist this host chose.
+        let verified = unsafe {
+            run_commit_graph_from_z_hybrid(
+                gpu,
+                ctx.z_buf,
+                ctx.staging,
+                ctx.tw_buf,
+                ctx.tree_buf,
+                params.k_code(),
+                params.n_leaves(),
+                chosen,
+            )
+        }
+        .is_ok()
+            && cpu_codeword.len() == params.codeword_len_f128()
+            && cpu_tree.len() == 2 * params.n_leaves() - 1
+            && unsafe {
+                bytes_equal_parallel(
+                    gpu.buffer_contents(ctx.staging),
+                    core::slice::from_raw_parts(
+                        cpu_codeword.as_ptr().cast::<u8>(),
+                        core::mem::size_of_val(cpu_codeword),
+                    ),
+                )
+            }
+            && unsafe {
+                bytes_equal_parallel(
+                    gpu.buffer_contents(ctx.tree_buf),
+                    core::slice::from_raw_parts(
+                        cpu_tree.as_ptr().cast::<u8>(),
+                        core::mem::size_of_val(cpu_tree),
+                    ),
+                )
+            };
+
+        if dbg {
+            let [k5_a, k5_b] = k5_ms;
+            let [k6_a, k6_b] = k6_ms;
+            let k5_mean = (k5_a + k5_b) * 0.5;
+            let k6_mean = (k6_a + k6_b) * 0.5;
+            eprintln!(
+                "[gpu-commit] exact-AB finalists \
+                 k5=[{k5_a:.1},{k5_b:.1}] mean={k5_mean:.1}ms \
+                 k6=[{k6_a:.1},{k6_b:.1}] mean={k6_mean:.1}ms \
+                 -> k={} verified={verified}",
+                if verified { chosen } else { 0 },
+            );
+        }
+        finish_ranked_k56_contention_retest(
+            params,
+            cpu_tree,
+            if verified { chosen } else { 0 },
+        );
+    }
+
     /// Use the ranked cache-local deep-pair CPU suffix and hash each finalized
     /// chunk before eviction. `FLOCK_NO_HYBRID_CPU_SUFFIX_DEEP=1` restores the
     /// original all-layer streaming suffix plus separate leaf-hash pass for an
@@ -3541,7 +3914,7 @@ kernel void parent_hash3(device const uint* children [[buffer(0)]],
     // reference commit is byte-identical across all ~120 processes of a
     // ranked run. The first process performs the incumbent full dual-run
     // (CPU arm under real precompute contention, GPU arm, full codeword +
-    // tree byte compare, autotune sweep with its trust-but-verify compare)
+    // tree byte compare, split calibration with its trust-but-verify compare)
     // and publishes {latch decision, tuned k, CPU wall, full CPU reference
     // tree} to the shared scratch directory (`TMPDIR`, the only writable
     // path inside the ranked Seatbelt profile). Later processes run only
@@ -3556,7 +3929,9 @@ kernel void parent_hash3(device const uint* children [[buffer(0)]],
     // dual-run. Nothing timed changes in any path.
     // -----------------------------------------------------------------------
 
-    const WARMUP_CACHE_MAGIC: u64 = 0x464C_4B5F_574C_4332; // "FLK_WLC2"
+    // V3 excludes any V2 entry written before exact-finalist publication was
+    // deferred (those entries could contain the usize::MAX untuned sentinel).
+    const WARMUP_CACHE_MAGIC: u64 = 0x464C_4B5F_574C_4333; // "FLK_WLC3"
 
     /// Cache key component tying entries to the exact GPU kernel source.
     const WARMUP_CACHE_MSL_FNV: u64 = fnv1a64(MSL_SOURCE);
@@ -3574,7 +3949,7 @@ kernel void parent_hash3(device const uint* children [[buffer(0)]],
     }
 
     fn warmup_cache_path() -> std::path::PathBuf {
-        std::env::temp_dir().join("flock-warmup-latch-v2.bin")
+        std::env::temp_dir().join("flock-warmup-latch-v3.bin")
     }
 
     fn read_warmup_cache(log_d: usize, n_leaves: usize) -> Option<WarmupCache> {
@@ -3597,7 +3972,7 @@ kernel void parent_hash3(device const uint* children [[buffer(0)]],
         let latch_on = take_u64(&bytes)? == 1;
         let tuned_k = take_u64(&bytes)? as usize;
         let cpu_wall_ms = f64::from_bits(take_u64(&bytes)?);
-        if !cpu_wall_ms.is_finite() || tuned_k > 16 {
+        if !cpu_wall_ms.is_finite() || cpu_wall_ms <= 0.0 || tuned_k > 16 {
             return None;
         }
         let root_bytes = bytes.get(off..)?;
@@ -3617,6 +3992,9 @@ kernel void parent_hash3(device const uint* children [[buffer(0)]],
         cpu_wall_ms: f64,
         cpu_tree: &[Hash],
     ) {
+        if !cpu_wall_ms.is_finite() || cpu_wall_ms <= 0.0 || tuned_k > 16 {
+            return;
+        }
         let cpu_root: Hash = if latch_on {
             match cpu_tree.last() {
                 Some(root) => *root,
@@ -3642,6 +4020,32 @@ kernel void parent_hash3(device const uint* children [[buffer(0)]],
         let tmp = path.with_extension(format!("tmp{}", std::process::id()));
         if std::fs::write(&tmp, &buf).is_ok() {
             let _ = std::fs::rename(&tmp, &path);
+        }
+    }
+
+    /// Publish the terminal outcome of the cache-miss exact retest. `k=0`
+    /// is the correctness-first fallback: the pure-GPU graph was already
+    /// byte-verified by warmup, whereas a failed hybrid sample was not.
+    fn finish_ranked_k56_contention_retest(
+        params: &crate::pcs::commit::PcsParams,
+        cpu_tree: &[Hash],
+        k: usize,
+    ) {
+        debug_assert!(matches!(k, 0 | 5 | 6));
+        TUNED_HYBRID_K.store(k, std::sync::atomic::Ordering::Release);
+        if super::warmup_latch_cache_enabled() {
+            let cpu_wall_ms = f64::from_bits(
+                RANKED_K56_PENDING_CPU_WALL_BITS
+                    .load(std::sync::atomic::Ordering::Acquire),
+            );
+            write_warmup_cache(
+                params.k_code(),
+                params.n_leaves(),
+                true,
+                k,
+                cpu_wall_ms,
+                cpu_tree,
+            );
         }
     }
 
@@ -3769,6 +4173,7 @@ kernel void parent_hash3(device const uint* children [[buffer(0)]],
                         eprintln!("[gpu-commit] warmup cache: latch OFF (cached)");
                     }
                     let cpu_tree = cpu(&mut codeword);
+                    super::satisfy_ranked_k56_contention_retest();
                     *latch = LatchState::Off;
                     return (CodewordBuf::Cpu(codeword), MerkleTreeBuf::Cpu(cpu_tree));
                 }
@@ -3796,6 +4201,10 @@ kernel void parent_hash3(device const uint* children [[buffer(0)]],
                         }
                         TUNED_HYBRID_K
                             .store(cache.tuned_k, std::sync::atomic::Ordering::Relaxed);
+                        // A cache-published split has already completed the
+                        // exact replay in the first worker. Prevent this
+                        // worker's post-join callback from replaying it.
+                        super::satisfy_ranked_k56_contention_retest();
                         // The warmup prove continues on this commit's output:
                         // materialize the verified GPU codeword into the
                         // caller's CPU buffer and hand back the GPU tree.
@@ -3850,6 +4259,7 @@ kernel void parent_hash3(device const uint* children [[buffer(0)]],
                     eprintln!("[gpu-commit] warmup: GPU unavailable ({e}); latching CPU path");
                 }
                 *latch = LatchState::Off;
+                super::satisfy_ranked_k56_contention_retest();
                 if super::warmup_latch_cache_enabled() {
                     write_warmup_cache(
                         params.k_code(),
@@ -3929,15 +4339,28 @@ kernel void parent_hash3(device const uint* children [[buffer(0)]],
             release_latched(gpu, run.latched);
             *latch = LatchState::Off;
         }
-        if super::warmup_latch_cache_enabled() {
-            write_warmup_cache(
-                params.k_code(),
-                params.n_leaves(),
-                on,
-                TUNED_HYBRID_K.load(std::sync::atomic::Ordering::Relaxed),
-                cpu_wall_ms,
-                &cpu_tree,
-            );
+        let defer_ranked_cache = on
+            && super::ranked_k56_contention_retest_pending()
+            && ranked_k56_retest_applicable(params);
+        if defer_ranked_cache {
+            // The outer commit/AB join has not returned yet. Do not publish
+            // an entry containing the untuned sentinel: the post-join exact
+            // replay will atomically claim the request, verify its winner,
+            // and publish the terminal k with this CPU reference wall/root.
+            RANKED_K56_PENDING_CPU_WALL_BITS
+                .store(cpu_wall_ms.to_bits(), std::sync::atomic::Ordering::Release);
+        } else {
+            super::satisfy_ranked_k56_contention_retest();
+            if super::warmup_latch_cache_enabled() {
+                write_warmup_cache(
+                    params.k_code(),
+                    params.n_leaves(),
+                    on,
+                    if on { hybrid_cpu_sixteenths() } else { 0 },
+                    cpu_wall_ms,
+                    &cpu_tree,
+                );
+            }
         }
         (CodewordBuf::Cpu(codeword), MerkleTreeBuf::Cpu(cpu_tree))
     }
@@ -4456,6 +4879,14 @@ mod imp {
             crate::pcs::commit::CodewordBuf::Cpu(codeword),
             crate::pcs::commit::MerkleTreeBuf::Cpu(tree),
         )
+    }
+
+    pub(crate) fn retune_ranked_k56_with_contention(
+        _params: &crate::pcs::commit::PcsParams,
+        _cpu_codeword: &[F128],
+        _cpu_tree: &[crate::merkle::Hash],
+        _replay_ab: impl Fn() + Sync,
+    ) {
     }
 
     pub(crate) fn give_tree(_tree: Vec<crate::merkle::Hash>) {}

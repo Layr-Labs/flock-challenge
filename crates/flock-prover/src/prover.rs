@@ -418,6 +418,35 @@ pub(crate) fn prove_fast_ligerito_from_streamed_first_pass_deferred_stripe<Ch: C
     )
 }
 
+/// Exact ranked experiment: keep the streamed witness's row-major `z_packed`
+/// as the sole C/lincheck representation. Fold8 C and the final lincheck fold
+/// both transpose into small per-tile stack buffers instead of hydrating the
+/// deferred 512 MiB byte stripe.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn prove_fast_ligerito_from_streamed_first_pass_row_major<Ch: Challenger>(
+    r1cs: &BlockR1cs,
+    pcs_params: &PcsParams,
+    z_packed: Vec<F128>,
+    a_packed_f128: Vec<F128>,
+    b_packed_f128: Vec<F128>,
+    lincheck_circuit: &dyn lincheck::LincheckCircuit,
+    codeword: Vec<F128>,
+    stream: flock_core::gpu_commit::FromZFirstPassStream,
+    challenger: &mut Ch,
+) -> (R1csProofLigerito, Commitment, R1csClaim) {
+    prove_fast_ligerito_from_witness_with_commit_codeword(
+        r1cs,
+        pcs_params,
+        z_packed,
+        a_packed_f128,
+        b_packed_f128,
+        LincheckStripeInput::RowMajorRanked,
+        lincheck_circuit,
+        CommitCodeword::StreamedFirstPass(codeword, stream),
+        challenger,
+    )
+}
+
 #[allow(clippy::too_many_arguments)]
 fn prove_fast_ligerito_from_witness_with_commit_codeword<Ch: Challenger>(
     r1cs: &BlockR1cs,
@@ -538,6 +567,12 @@ enum CommitCodeword {
 enum LincheckStripeInput {
     Ready(Vec<u8>),
     DeferredRanked,
+    RowMajorRanked,
+}
+
+enum PreparedLincheckWitness {
+    Stripe(Vec<u8>),
+    RowMajorRanked,
 }
 
 const DEFERRED_STRIPE_GROUPS_PER_JOB: usize = 64;
@@ -727,7 +762,26 @@ fn commit_with_round1_ab_precompute(
     debug_assert_eq!(k_skip, 6, "ranked protocol fixes k_skip=6");
     let inv_table = flock_core::ntt::InvNttTableByteSingleGf8::cached_standard_k6();
 
-    rayon::join(
+    let precompute_ab = || {
+        zerocheck::univariate_skip_optimized::precompute_round1_ab_inner_packed_padded(
+            a_packed,
+            b_packed,
+            pcs_params.m,
+            k_skip,
+            inv_table,
+            padding,
+        )
+    };
+    // `Blake3Setup::prove_fast` issues this ticket before call-zero witness
+    // generation. Warmup deliberately materializes a Ready lincheck stripe,
+    // so requesting from the eventual RowMajorRanked enum would first fire
+    // inside the measured second proof. Observe the call-zero ticket here;
+    // a valid cross-process cache hit can satisfy it in the commit arm before
+    // the post-join retune attempts to claim it.
+    let run_ranked_row_major_retest =
+        flock_core::gpu_commit::ranked_k56_contention_retest_pending();
+
+    let result = rayon::join(
         || match commit_codeword {
             CommitCodeword::Allocate => pcs::commit(z_packed, pcs_params),
             CommitCodeword::NeedsReplication(buf) => pcs::commit_into(z_packed, pcs_params, buf),
@@ -740,14 +794,7 @@ fn commit_with_round1_ab_precompute(
         },
         || {
             let t = std::time::Instant::now();
-            let r = zerocheck::univariate_skip_optimized::precompute_round1_ab_inner_packed_padded(
-                a_packed,
-                b_packed,
-                pcs_params.m,
-                k_skip,
-                inv_table,
-                padding,
-            );
+            let r = precompute_ab();
             let wall_ms = t.elapsed().as_secs_f64() * 1e3;
             // The hybrid-commit warmup sweep sizes its contention emulation
             // from this arm's measured wall (an Instant read is free; the
@@ -758,7 +805,20 @@ fn commit_with_round1_ab_precompute(
             }
             r
         },
-    )
+    );
+
+    if run_ranked_row_major_retest {
+        flock_core::gpu_commit::retune_ranked_k56_with_contention(
+            pcs_params,
+            &result.0.1.codeword,
+            &result.0.1.merkle_tree,
+            || {
+                let replayed = precompute_ab();
+                std::hint::black_box(&replayed);
+            },
+        );
+    }
+    result
 }
 
 /// Run commit → bind → zerocheck → lincheck and build the base claims, stopping
@@ -856,13 +916,14 @@ fn prove_fast_core_with_commit_codeword<Ch: Challenger>(
         (commitment, prover_data, ab_inner)
     };
 
-    // Publish the stripe before zerocheck: the ranked identity-C producer now
-    // consumes it immediately after the commitment challenge is available.
-    // Deferred fill is shorter than commit+AB at the target shape, so moving
-    // this join earlier adds no measured tail while eliminating C's 32-bank
-    // row-major drain.
-    let (pre_zerocheck, z_packed_lincheck) = match z_packed_lincheck {
-        LincheckStripeInput::Ready(stripe) => (run_commit(), stripe),
+    // Prepare C/lincheck storage before zerocheck. The promoted arm publishes
+    // its deferred stripe here because identity C consumes it immediately.
+    // The guarded row-major arm carries only a marker: both consumers read the
+    // permanently retained z allocation directly.
+    let (pre_zerocheck, lincheck_witness) = match z_packed_lincheck {
+        LincheckStripeInput::Ready(stripe) => {
+            (run_commit(), PreparedLincheckWitness::Stripe(stripe))
+        }
         LincheckStripeInput::DeferredRanked => {
             assert_eq!(r1cs.m, 32);
             assert_eq!(r1cs.k_log, 14);
@@ -924,7 +985,24 @@ fn prove_fast_core_with_commit_codeword<Ch: Challenger>(
                 }
                 pre
             });
-            (pre, stripe)
+            (pre, PreparedLincheckWitness::Stripe(stripe))
+        }
+        LincheckStripeInput::RowMajorRanked => {
+            assert_eq!(r1cs.m, 32);
+            assert_eq!(r1cs.k_log, 14);
+            assert_eq!(r1cs.k_skip, zerocheck::K_SKIP);
+            assert_eq!(r1cs.useful_bits, 15_409);
+            assert!(
+                ranked_lincheck_c_reuse_enabled(r1cs)
+                    && ranked_direct_fold8_precompute_enabled(r1cs),
+                "row-major stripe deletion requires ranked identity-C Fold8"
+            );
+            if phase_timing {
+                eprintln!(
+                    "[phase-timing] lincheck stripe: elided (row-major Fold8 C + lincheck)"
+                );
+            }
+            (run_commit(), PreparedLincheckWitness::RowMajorRanked)
         }
     };
     let (commitment, prover_data, ab_inner) = pre_zerocheck;
@@ -952,21 +1030,38 @@ fn prove_fast_core_with_commit_codeword<Ch: Challenger>(
                 z_packed.len() * core::mem::size_of::<F128>(),
             )
         };
-        if ranked_lincheck_c_reuse_enabled(r1cs) {
-            zerocheck::prove_packed_padded_capture_s_hat_v_c_with_precomputed_ab_and_lincheck_c(
-                a_packed,
-                b_packed,
-                c_packed,
-                &z_packed_lincheck,
-                r1cs.m,
-                &padding,
-                ab_inner,
-                challenger,
-            )
-        } else {
-            zerocheck::prove_packed_padded_capture_s_hat_v_c_with_precomputed_ab(
-                a_packed, b_packed, c_packed, r1cs.m, &padding, ab_inner, challenger,
-            )
+        match &lincheck_witness {
+            PreparedLincheckWitness::RowMajorRanked => {
+                zerocheck::prove_packed_padded_capture_s_hat_v_c_with_precomputed_ab_and_row_major_c(
+                    a_packed,
+                    b_packed,
+                    c_packed,
+                    &z_packed,
+                    r1cs.m,
+                    &padding,
+                    ab_inner,
+                    challenger,
+                )
+            }
+            PreparedLincheckWitness::Stripe(stripe)
+                if ranked_lincheck_c_reuse_enabled(r1cs) =>
+            {
+                zerocheck::prove_packed_padded_capture_s_hat_v_c_with_precomputed_ab_and_lincheck_c(
+                    a_packed,
+                    b_packed,
+                    c_packed,
+                    stripe,
+                    r1cs.m,
+                    &padding,
+                    ab_inner,
+                    challenger,
+                )
+            }
+            PreparedLincheckWitness::Stripe(_) => {
+                zerocheck::prove_packed_padded_capture_s_hat_v_c_with_precomputed_ab(
+                    a_packed, b_packed, c_packed, r1cs.m, &padding, ab_inner, challenger,
+                )
+            }
         }
     };
     if phase_timing {
@@ -989,20 +1084,36 @@ fn prove_fast_core_with_commit_codeword<Ch: Challenger>(
 
     // Capture lincheck's pre-sumcheck z_vec so the PCS open can derive the
     // AB-claim's `s_hat_v` from it (skips fold_1b_rows for AB).
-    let (lc_proof, lc_claim, z_vec_pre) = lincheck::prove_padded_capture_z_vec(
-        &z_packed_lincheck,
-        r1cs.m,
-        r1cs.k_log,
-        r1cs.k_skip,
-        r1cs.useful_bits,
-        lincheck_circuit,
-        &x_ab,
-        challenger,
-    );
-    // The lincheck stripe copy of z is dead from here on; return it to the
-    // scratch byte pool before the PCS open (2^(m-3) bytes — 512 MB at
-    // m = 32) so the next prove reuses its resident pages.
-    flock_core::scratch::give_u8(z_packed_lincheck);
+    let (lc_proof, lc_claim, z_vec_pre) = match lincheck_witness {
+        PreparedLincheckWitness::Stripe(stripe) => {
+            let result = lincheck::prove_padded_capture_z_vec(
+                &stripe,
+                r1cs.m,
+                r1cs.k_log,
+                r1cs.k_skip,
+                r1cs.useful_bits,
+                lincheck_circuit,
+                &x_ab,
+                challenger,
+            );
+            // The stripe is dead after lincheck; return its 512 MiB ranked
+            // allocation before PCS-open residency.
+            flock_core::scratch::give_u8(stripe);
+            result
+        }
+        PreparedLincheckWitness::RowMajorRanked => {
+            lincheck::prove_padded_capture_z_vec_row_major_f128(
+                &z_packed,
+                r1cs.m,
+                r1cs.k_log,
+                r1cs.k_skip,
+                r1cs.useful_bits,
+                lincheck_circuit,
+                &x_ab,
+                challenger,
+            )
+        }
+    };
 
     let ab = ZClaim {
         point: r1cs.ab_claim_point(lc_claim.r_inner_skip, &lc_claim.r_inner_rest, &x_ab.x_outer),

@@ -131,6 +131,7 @@ pub use kernels::partial_fold_packed_z_x86_tiled_padded;
 pub use kernels::{
     partial_fold_packed_z_neon_iblock_padded, partial_fold_packed_z_neon_oblock_padded,
     partial_fold_packed_z_neon_single, partial_fold_packed_z_neon_single_padded,
+    partial_fold_row_major_f128_neon_oblock_padded,
 };
 
 /// Bench-only A/B toggle: when set, [`partial_fold_packed_z_best`] uses the legacy
@@ -780,6 +781,76 @@ pub(crate) fn partial_fold_packed_z_best(
     }
 }
 
+/// Scalar oracle/fallback for folding the canonical row-major F128 witness
+/// without materializing lincheck's byte-stripe copy. Each group of eight
+/// outer instances is transposed one 64-bit word at a time and consumed
+/// immediately through that group's sum table.
+fn partial_fold_row_major_f128_padded(
+    z_row_major: &[F128],
+    m: usize,
+    k_log: usize,
+    useful_bits: usize,
+    eq_outer: &[F128],
+) -> Vec<F128> {
+    assert!(m >= 7, "F128-packed witness requires m >= 7");
+    assert!(m >= k_log, "row-major block dimension exceeds witness");
+    assert!(k_log >= 7, "row-major F128 blocks require k_log >= 7");
+    let k = 1usize << k_log;
+    let n_log = m - k_log;
+    let n_outer = 1usize << n_log;
+    assert_eq!(z_row_major.len(), 1usize << (m - 7));
+    assert_eq!(eq_outer.len(), n_outer);
+    assert!(useful_bits <= k);
+    assert!(n_outer >= 8 && n_outer.is_multiple_of(8));
+
+    let u64_per_block = k / 64;
+    let useful_words = useful_bits.div_ceil(64);
+    // SAFETY: F128 is repr(C) with exactly two u64 fields and no padding.
+    let z_words: &[u64] = unsafe {
+        core::slice::from_raw_parts(z_row_major.as_ptr().cast::<u64>(), z_row_major.len() * 2)
+    };
+    let mut out = vec![F128::ZERO; k];
+    let mut table = vec![F128::ZERO; 256];
+    let mut transposed = [0u8; 64];
+    for stripe in 0..n_outer / 8 {
+        build_sum_table(&eq_outer[8 * stripe..8 * stripe + 8], &mut table);
+        let outer0 = 8 * stripe;
+        for word in 0..useful_words {
+            let lanes = std::array::from_fn(|lane| z_words[(outer0 + lane) * u64_per_block + word]);
+            crate::bits::transpose_8_u64s_to_64_bytes(&lanes, &mut transposed);
+            let inner0 = word * 64;
+            let n = (useful_bits - inner0).min(64);
+            for i in 0..n {
+                out[inner0 + i] += table[transposed[i] as usize];
+            }
+        }
+    }
+    out
+}
+
+/// Fastest available direct row-major fold. The ranked Apple path uses the
+/// outer-tiled NEON kernel recovered from `5c51bba`; other targets retain the
+/// compact scalar oracle/fallback.
+pub(crate) fn partial_fold_row_major_f128_best(
+    z_row_major: &[F128],
+    m: usize,
+    k_log: usize,
+    useful_bits: usize,
+    eq_outer: &[F128],
+) -> Vec<F128> {
+    #[cfg(target_arch = "aarch64")]
+    if n_log_ok_for_tile(m, k_log, NEON_TILE_T) && k_log >= 7 {
+        return partial_fold_row_major_f128_neon_oblock_padded(
+            z_row_major,
+            m,
+            k_log,
+            useful_bits,
+            eq_outer,
+        );
+    }
+    partial_fold_row_major_f128_padded(z_row_major, m, k_log, useful_bits, eq_outer)
+}
+
 /// Outer-dimension threshold (`n_log = m − k_log`) at/above which the
 /// outer(tile)-partitioned fold beats the i_inner-partitioned one. See
 /// [`partial_fold_packed_z_best`] for the crossover calibration.
@@ -1175,6 +1246,14 @@ fn sumcheck_bind_both_and_eval_next(
 // API
 // ---------------------------------------------------------------------------
 
+#[derive(Clone, Copy)]
+enum LincheckWitness<'a> {
+    /// Pre-transposed byte stripes: `[outer_group_of_8][i_inner]`.
+    Stripe(&'a [u8]),
+    /// Canonical row-major F128 witness: `[i_outer][i_inner / 128]`.
+    RowMajorF128(&'a [F128]),
+}
+
 /// Prove the lincheck statement for the block-diagonal R1CS instance
 /// `A = I_{2^n_log} ⊗ a_0`, `B = I ⊗ b_0`, `C = I ⊗ c_0`.
 ///
@@ -1223,7 +1302,7 @@ pub fn prove_padded<Ch: Challenger>(
     challenger: &mut Ch,
 ) -> (LincheckProof, LincheckClaim) {
     let (proof, claim, _) = prove_padded_inner(
-        z_packed,
+        LincheckWitness::Stripe(z_packed),
         m,
         k_log,
         k_skip,
@@ -1256,7 +1335,39 @@ pub fn prove_padded_capture_z_vec<Ch: Challenger>(
     challenger: &mut Ch,
 ) -> (LincheckProof, LincheckClaim, Vec<F128>) {
     let (proof, claim, captured) = prove_padded_inner(
-        z_packed,
+        LincheckWitness::Stripe(z_packed),
+        m,
+        k_log,
+        k_skip,
+        useful_bits,
+        circuit,
+        x_ab,
+        true,
+        challenger,
+    );
+    (
+        proof,
+        claim,
+        captured.expect("capture=true must produce z_vec"),
+    )
+}
+
+/// Direct-row-major sibling of [`prove_padded_capture_z_vec`]. It derives the
+/// same pre-sumcheck `z_vec` from the retained canonical F128 witness, avoiding
+/// a full byte-stripe materialization. The transcript and proof bytes are
+/// identical for the same witness and challenger state.
+pub fn prove_padded_capture_z_vec_row_major_f128<Ch: Challenger>(
+    z_row_major: &[F128],
+    m: usize,
+    k_log: usize,
+    k_skip: usize,
+    useful_bits: usize,
+    circuit: &dyn LincheckCircuit,
+    x_ab: &QuirkyPoint,
+    challenger: &mut Ch,
+) -> (LincheckProof, LincheckClaim, Vec<F128>) {
+    let (proof, claim, captured) = prove_padded_inner(
+        LincheckWitness::RowMajorF128(z_row_major),
         m,
         k_log,
         k_skip,
@@ -1275,7 +1386,7 @@ pub fn prove_padded_capture_z_vec<Ch: Challenger>(
 
 #[allow(clippy::too_many_arguments)]
 fn prove_padded_inner<Ch: Challenger>(
-    z_packed: &[u8],
+    witness: LincheckWitness<'_>,
     m: usize,
     k_log: usize,
     k_skip: usize,
@@ -1353,7 +1464,18 @@ fn prove_padded_inner<Ch: Challenger>(
             None
         };
         let eq_x_outer = build_eq_table(&x_ab.x_outer);
-        let z_vec = partial_fold_packed_z_best(z_packed, m, k_log, useful_bits, &eq_x_outer);
+        let z_vec = match witness {
+            LincheckWitness::Stripe(z_packed) => {
+                partial_fold_packed_z_best(z_packed, m, k_log, useful_bits, &eq_x_outer)
+            }
+            LincheckWitness::RowMajorF128(z_row_major) => partial_fold_row_major_f128_best(
+                z_row_major,
+                m,
+                k_log,
+                useful_bits,
+                &eq_x_outer,
+            ),
+        };
         if let Some(t) = t {
             eprintln!(
                 "[lc] {:<26} {:>7.2} ms",
@@ -1875,6 +1997,79 @@ mod tests {
             let fast = partial_fold_packed_z_fast(&z_packed, m, k_log, &eq);
             assert_eq!(serial, fast, "at m={m}, k_log={k_log}");
         }
+    }
+
+    /// Folding directly from canonical row-major F128 storage must equal the
+    /// materialized-stripe path, including the ranked non-byte-aligned pad.
+    #[test]
+    fn partial_fold_row_major_f128_matches_stripe() {
+        let cases = [
+            (14usize, 7usize, 113usize),
+            (16, 8, 213),
+            (20, 7, 113), // two 64-tile heterogeneous claims
+            (20, 14, 15_409),
+        ];
+        for (m, k_log, useful_bits) in cases {
+            let k = 1usize << k_log;
+            let n_outer = 1usize << (m - k_log);
+            let mut rng = Rng::new(0xD1EC_7F01_u64 ^ ((m as u64) << 8) ^ k_log as u64);
+            let mut z = rng.bits(1usize << m);
+            for outer in 0..n_outer {
+                z[outer * k + useful_bits..(outer + 1) * k].fill(false);
+            }
+            let row_major = crate::pcs::pack_witness(&z, m);
+            let stripe = pack_z_lincheck(&z, m, k_log);
+            let eq_outer = build_eq_table(&rng.f128_vec(m - k_log));
+
+            let want = partial_fold_packed_z_best(&stripe, m, k_log, useful_bits, &eq_outer);
+            let got =
+                partial_fold_row_major_f128_best(&row_major, m, k_log, useful_bits, &eq_outer);
+            assert_eq!(got, want, "m={m} k_log={k_log} useful={useful_bits}");
+        }
+    }
+
+    /// Storage layout is prover-local: the same pre-sumcheck vector must emit
+    /// byte-identical proof data and transcript-derived claims.
+    #[test]
+    fn row_major_f128_prover_matches_stripe_prover() {
+        let (m, k_log, k_skip, useful_bits) = (14usize, 7usize, 6usize, 113usize);
+        let k = 1usize << k_log;
+        let n_outer = 1usize << (m - k_log);
+        let mut rng = Rng::new(0xD1EC_7F02);
+        let a_0 = random_sparse_matrix(k, 2 * k, &mut rng);
+        let b_0 = random_sparse_matrix(k, 2 * k, &mut rng);
+        let circuit = SparseMatrixCircuit::new(&a_0, &b_0);
+        let mut z = rng.bits(1usize << m);
+        for outer in 0..n_outer {
+            z[outer * k + useful_bits..(outer + 1) * k].fill(false);
+        }
+        let stripe = pack_z_lincheck(&z, m, k_log);
+        let row_major = crate::pcs::pack_witness(&z, m);
+        let x_ab = random_quirky_point(m, k_log, k_skip, &mut rng);
+        let mut stripe_challenger = FsChallenger::new(b"flock-direct-lincheck-test-v0");
+        let mut direct_challenger = FsChallenger::new(b"flock-direct-lincheck-test-v0");
+
+        let stripe_result = prove_padded_capture_z_vec(
+            &stripe,
+            m,
+            k_log,
+            k_skip,
+            useful_bits,
+            &circuit,
+            &x_ab,
+            &mut stripe_challenger,
+        );
+        let direct_result = prove_padded_capture_z_vec_row_major_f128(
+            &row_major,
+            m,
+            k_log,
+            k_skip,
+            useful_bits,
+            &circuit,
+            &x_ab,
+            &mut direct_challenger,
+        );
+        assert_eq!(direct_result, stripe_result);
     }
 
     #[test]
