@@ -512,6 +512,98 @@ pub fn round1_extract_c_packed_with_s_hat_v(
     (res_ab, res_c_lifted, s_hat_v_c)
 }
 
+/// **Test oracle, not part of the protocol.** Eight-bank generalization of
+/// [`round1_extract_c_packed_with_s_hat_v`], producing the C claim's four-bank
+/// (quad) sufficient statistic.
+///
+/// Where the two-bank form routes on `x_rest & 1` (= witness bit `k_skip`) and
+/// divides by `eq(r[k_skip], b_7)`, this routes on `x_rest & 7` (witness bits
+/// `k_skip..k_skip+3`) and divides bank `K = b_7 + 2 e` by the full
+/// `eq(r[k_skip], b_7) · eq(r[k_skip+1], e₀) · eq(r[k_skip+2], e₁)`. Because the
+/// division is by the literal eq weights, this oracle is **generic in `r`** —
+/// it never mentions α — so it is an independent check of the α-free convention
+/// the optimized capture's banks are defined in.
+///
+/// Output layout: `quad[e · 128 + (lane | (b_7 << k_skip))]`, length `4 · 128`.
+#[cfg(test)]
+pub(crate) fn round1_extract_c_packed_quad_oracle(
+    a_packed: &[u8],
+    b_packed: &[u8],
+    c_packed: &[u8],
+    m: usize,
+    k_skip: usize,
+    r: &[F128],
+    inv_table: &InvNttTableByteSingleGf8,
+) -> Vec<F128> {
+    let _ = (a_packed, b_packed);
+    assert!(k_skip + 3 <= m);
+    let total_bytes = (1usize << m) / 8;
+    assert_eq!(c_packed.len(), total_bytes);
+    assert_eq!(r.len(), m);
+    assert_eq!(inv_table.k, k_skip);
+
+    let ell = 1usize << k_skip;
+    let n_chunks = ell / 8;
+
+    let eq = SplitEqGhash::new(&r[k_skip..]);
+    let lo_size = 1usize << eq.n_lo;
+    let hi_size = 1usize << eq.n_hi;
+
+    // Eight raw banks indexed by K = x_rest & 7.
+    let mut res = vec![vec![F128::ZERO; ell]; 8];
+    let mut partial = vec![vec![F128::ZERO; ell]; 8];
+
+    for x_hi in 0..hi_size {
+        partial
+            .iter_mut()
+            .for_each(|bank| bank.iter_mut().for_each(|p| *p = F128::ZERO));
+
+        for x_lo in 0..lo_size {
+            let x_rest = (x_hi << eq.n_lo) | x_lo;
+            let chunk_offset = x_rest * n_chunks;
+            let eq_lo = eq.lo[x_lo];
+            let target = &mut partial[x_rest & 7];
+            for s in 0..ell {
+                let c_bit = (c_packed[chunk_offset + s / 8] >> (s % 8)) & 1;
+                if c_bit != 0 {
+                    target[s] += eq_lo;
+                }
+            }
+        }
+
+        let eq_hi = eq.hi[x_hi];
+        for (bank, part) in res.iter_mut().zip(partial.iter()) {
+            for lane in 0..ell {
+                bank[lane] += eq_hi * part[lane];
+            }
+        }
+    }
+
+    // Strip the three small-eq factors that routed each bank.
+    let eq_small = |coord: usize, bit: usize| -> F128 {
+        if bit == 0 {
+            F128::ONE + r[coord]
+        } else {
+            r[coord]
+        }
+    };
+    let mut quad = vec![F128::ZERO; 4 * 2 * ell];
+    for e in 0..4 {
+        for b_7 in 0..2 {
+            let k = b_7 + 2 * e;
+            let weight = (eq_small(k_skip, b_7)
+                * eq_small(k_skip + 1, e & 1)
+                * eq_small(k_skip + 2, (e >> 1) & 1))
+            .inv();
+            let base = e * 2 * ell + b_7 * ell;
+            for lane in 0..ell {
+                quad[base + lane] = res[k][lane] * weight;
+            }
+        }
+    }
+    quad
+}
+
 // ---------------------------------------------------------------------------
 // Test oracle: round-1 polynomial values evaluated AT S
 // ---------------------------------------------------------------------------

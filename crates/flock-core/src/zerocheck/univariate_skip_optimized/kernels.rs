@@ -1,4 +1,4 @@
-use super::{InvNttTableByteSingleGf8, F8};
+use super::{C_MASK_TABLE_STRIDE, InvNttTableByteSingleGf8, F8};
 
 mod portable;
 
@@ -228,35 +228,91 @@ pub(super) fn accumulate_convert(
     );
 }
 
-#[allow(clippy::too_many_arguments)]
+/// The eight α-free single-bit-`K` C banks for one `x_outer_lo`.
+///
+/// Bank `s` accumulates `Σ_b γ^b · bit_s(chunk_c_bytes[b][lane])`. For `b < 16`
+/// `γ^b = F128 { lo: 1 << b }` — `gamma_pow` is repeated `mul_by_x` from ONE and
+/// never reduces below bit 128 — so the entire bank value is the u16 mask of
+/// bit `s` across the 16 `b_med` C bytes. The C side therefore needs **no
+/// convert table, no gathers and no F128 XOR accumulators at all**.
+///
+/// The remaining `F128 { lo: mask } * eq_lo_val` is F₂-linear in the mask bits,
+/// so it is a table lookup rather than a multiply: `mask_tables` is this
+/// `x_outer_lo`'s [`C_MASK_TABLE_STRIDE`]-entry slice with
+/// `[v] = F128 { lo: v } * eq_lo` and `[256 + v] = F128 { lo: v << 8 } * eq_lo`,
+/// built once per prove by [`super::build_c_mask_tables`]. **Zero multiplies in
+/// the hot loop.**
+///
+/// The banks are **α-free** and carry **no `C_2`**: `α^K` and `C_2` are exactly
+/// the small-eq weights that `low_eq = build_eq([r[k_skip+1], r[k_skip+2]])`
+/// re-applies downstream — in `collapse_s_hat_v_quad` on intake *and* in
+/// `build_direct_fold2_table` at materialize time. Folding either constant in
+/// here would double-count it. The wire `s_hat_v_c` re-applies them once, at
+/// reduction time (`α^K` per bank, then `C_2 · α^{-b_3[0]}`).
+///
+/// Padding: with `n_b_med < 16` the missing `b_med` simply leave their mask bit
+/// clear, which is the same field element the per-`b_med` form would have
+/// accumulated (those windows are all-zero witness).
+#[inline]
+pub(super) fn accumulate_c_banks(
+    chunk_c_bytes: &[[u8; 64]; 16],
+    n_b_med: usize,
+    mask_tables: &[super::F128],
+    partial_c: &mut [[super::F128; 64]; 8],
+) {
+    #[cfg(target_arch = "aarch64")]
+    // SAFETY: aarch64 statically guarantees NEON; the fixed-size arrays cover
+    // every load/store and the table halves bound every `u8`-scaled index.
+    unsafe {
+        aarch64::accumulate_c_banks(chunk_c_bytes, n_b_med, mask_tables, partial_c);
+    }
+
+    #[cfg(not(target_arch = "aarch64"))]
+    accumulate_c_banks_scalar(chunk_c_bytes, n_b_med, mask_tables, partial_c);
+}
+
+/// Portable reference for [`accumulate_c_banks`], and the shape the aarch64
+/// kernel is tested against.
+#[cfg_attr(target_arch = "aarch64", allow(dead_code))]
+pub(super) fn accumulate_c_banks_scalar(
+    chunk_c_bytes: &[[u8; 64]; 16],
+    n_b_med: usize,
+    mask_tables: &[super::F128],
+    partial_c: &mut [[super::F128; 64]; 8],
+) {
+    debug_assert!(n_b_med <= 16);
+    debug_assert_eq!(mask_tables.len(), C_MASK_TABLE_STRIDE);
+    let (t_lo, t_hi) = mask_tables.split_at(256);
+    for lane in 0..64 {
+        let mut masks = [0u16; 8];
+        for b_med in 0..n_b_med {
+            let c = chunk_c_bytes[b_med][lane];
+            for (s, mask) in masks.iter_mut().enumerate() {
+                *mask |= u16::from((c >> s) & 1) << b_med;
+            }
+        }
+        for (bank, mask) in partial_c.iter_mut().zip(masks) {
+            bank[lane] += t_lo[usize::from(mask & 0xff)] + t_hi[usize::from(mask >> 8)];
+        }
+    }
+}
+
 #[inline]
 pub(super) fn accumulate_convert_with_s_hat_v(
     chunk_ab_bytes: &[[u8; 64]; 16],
     chunk_c_bytes: &[[u8; 64]; 16],
     n_b_med: usize,
     convert: &[super::F128],
-    paired_c: &(Vec<super::F128>, Vec<super::F128>),
     eq_lo_val: super::F128,
+    mask_tables: &[super::F128],
     partial_ab: &mut [super::F128; 64],
-    partial_c_0: &mut [super::F128; 64],
-    partial_c_1: &mut [super::F128; 64],
+    partial_c: &mut [[super::F128; 64]; 8],
 ) {
     #[cfg(target_arch = "aarch64")]
     // SAFETY: aarch64 statically guarantees NEON and the fixed arrays cover
     // all table-selected loads.
     unsafe {
-        aarch64::accumulate_convert_with_s_hat_v(
-            chunk_ab_bytes,
-            chunk_c_bytes,
-            n_b_med,
-            convert,
-            &paired_c.0,
-            &paired_c.1,
-            eq_lo_val,
-            partial_ab,
-            partial_c_0,
-            partial_c_1,
-        );
+        aarch64::accumulate_convert_ab(chunk_ab_bytes, n_b_med, convert, eq_lo_val, partial_ab);
     }
 
     #[cfg(all(
@@ -267,16 +323,12 @@ pub(super) fn accumulate_convert_with_s_hat_v(
     // SAFETY: the cfg gate guarantees the SIMD features and the fixed arrays
     // cover every four-lane load/store.
     unsafe {
-        let _ = paired_c;
-        x86_64::accumulate_convert_with_s_hat_v_x86_avx512(
+        x86_64::accumulate_convert_ab_x86_avx512(
             chunk_ab_bytes,
-            chunk_c_bytes,
             n_b_med,
             convert,
             eq_lo_val,
             partial_ab,
-            partial_c_0,
-            partial_c_1,
         );
     }
 
@@ -288,25 +340,7 @@ pub(super) fn accumulate_convert_with_s_hat_v(
             target_feature = "vpclmulqdq"
         )
     )))]
-    {
-        let _ = paired_c;
-    }
-    #[cfg(not(any(
-        target_arch = "aarch64",
-        all(
-            target_arch = "x86_64",
-            target_feature = "avx512f",
-            target_feature = "vpclmulqdq"
-        )
-    )))]
-    portable::accumulate_convert_with_s_hat_v(
-        chunk_ab_bytes,
-        chunk_c_bytes,
-        n_b_med,
-        convert,
-        eq_lo_val,
-        partial_ab,
-        partial_c_0,
-        partial_c_1,
-    );
+    portable::accumulate_convert_ab(chunk_ab_bytes, n_b_med, convert, eq_lo_val, partial_ab);
+
+    accumulate_c_banks(chunk_c_bytes, n_b_med, mask_tables, partial_c);
 }

@@ -1371,7 +1371,11 @@ pub fn s_hat_v_quad_from_z_vec(
         )
 }
 
-fn collapse_s_hat_v_quad(s_hat_v_quad: &[F128], low_point: &[F128]) -> Vec<F128> {
+/// Collapse a four-bank sufficient statistic back to the canonical length-128
+/// `s_hat_v` by re-applying `eq(low_point, ·)` over the two retained
+/// coordinates. `pub(crate)` so the zerocheck capture can assert Requirement
+/// C-QUAD against the exact function that runs on intake.
+pub(crate) fn collapse_s_hat_v_quad(s_hat_v_quad: &[F128], low_point: &[F128]) -> Vec<F128> {
     debug_assert_eq!(s_hat_v_quad.len(), 4 * (1usize << LOG_PACKING));
     debug_assert_eq!(low_point.len(), 2);
     let low_eq = build_eq(low_point);
@@ -3793,6 +3797,135 @@ mod tests {
         );
         assert!(direct[0].1.direct_fold2.is_some());
         assert!(direct[1].1.direct_fold2.is_none());
+    }
+
+    /// Both claims dense and both carrying a quad — the completed direct path.
+    ///
+    /// Claim 1's quad is built straight from the acceptance spec
+    /// (`quad_c[e·128 + p] = Σ_h eq_tail[h] · bit_p(f[4h+e])`), so this test is
+    /// independent of how the zerocheck capture happens to produce it. It pins
+    /// the four things the completion depends on: the observed `s_hat_v` is
+    /// unchanged, each claim's `products` equal the bilinear oracle against its
+    /// own γ-baked basis, the diagonal collapses to `γ · sumcheck_claim`, and
+    /// the round-0 + round-1-lookahead messages built from both claims'
+    /// `products` equal the streamed sweep over the summed basis.
+    #[test]
+    fn all_direct_quad_ab_and_c_matches_ring_wire_oracle() {
+        use crate::challenger::FsChallenger;
+        use crate::lincheck::{pack_z_lincheck, partial_fold_packed_z};
+
+        const M: usize = 17;
+        const K_LOG: usize = 13;
+        const K_SKIP: usize = 6;
+        let mut rng = Rng::new(0xD1CE_A11D);
+        let z = rng.bits(1 << M);
+        let packed = pack_witness(&z, M);
+        let z_packed_lincheck = pack_z_lincheck(&z, M, K_LOG);
+        let inner_rest: Vec<F128> = (0..(K_LOG - K_SKIP)).map(|_| rng.f128()).collect();
+        let outer: Vec<F128> = (0..(M - K_LOG)).map(|_| rng.f128()).collect();
+        let mut ab_point = inner_rest.clone();
+        ab_point.extend_from_slice(&outer);
+        // Dense (no zero coords) so claim 1 classifies Dense and takes the
+        // direct arm, exactly as the ranked C claim does.
+        let c_point: Vec<F128> = (0..ab_point.len()).map(|_| rng.f128()).collect();
+        let z_vec = partial_fold_packed_z(&z_packed_lincheck, M, K_LOG, &build_eq(&outer));
+        let quad_ab = s_hat_v_quad_from_z_vec(&z_vec, &inner_rest[1..]);
+
+        // Acceptance spec, verbatim.
+        let n_packed = 1usize << LOG_PACKING;
+        let suffix_c = &c_point[1..];
+        let eq_tail = build_eq(&suffix_c[2..]);
+        assert_eq!(eq_tail.len(), packed.len() / 4);
+        let mut quad_c = vec![F128::ZERO; 4 * n_packed];
+        for (h, &weight) in eq_tail.iter().enumerate() {
+            for e in 0..4 {
+                let w = packed[4 * h + e];
+                for p in 0..n_packed {
+                    let bit = if p < 64 {
+                        (w.lo >> p) & 1
+                    } else {
+                        (w.hi >> (p - 64)) & 1
+                    };
+                    if bit == 1 {
+                        quad_c[e * n_packed + p] += weight;
+                    }
+                }
+            }
+        }
+
+        let padding = PaddingSpec::dense(M);
+        let mut baseline_challenger = FsChallenger::new(b"direct-all-wire");
+        let (baseline, baseline_gammas) = prove_batched_padded_with_precomputed(
+            &packed,
+            &[&ab_point, &c_point],
+            &[],
+            &padding,
+            &mut baseline_challenger,
+        );
+        let mut direct_challenger = FsChallenger::new(b"direct-all-wire");
+        let (direct, direct_gammas) = prove_batched_padded_with_precomputed(
+            &packed,
+            &[&ab_point, &c_point],
+            &[Some(quad_ab.as_slice()), Some(quad_c.as_slice())],
+            &padding,
+            &mut direct_challenger,
+        );
+
+        // 1. Transcript preservation: same observed s_hat_v, same γ_rs, same
+        //    sumcheck claims, same basis.
+        assert_eq!(direct_gammas, baseline_gammas);
+        for claim in 0..2 {
+            assert_eq!(direct[claim].0, baseline[claim].0, "s_hat_v claim {claim}");
+            assert_eq!(
+                direct[claim].1.sumcheck_claim,
+                baseline[claim].1.sumcheck_claim,
+                "sumcheck_claim claim {claim}"
+            );
+            assert_eq!(
+                direct[claim].1.rs_eq_ind.to_dense(),
+                baseline[claim].1.rs_eq_ind.to_dense(),
+                "rs_eq_ind claim {claim}"
+            );
+            assert!(direct[claim].1.direct_fold2.is_some());
+            assert!(direct[claim].1.deferred_c_fold2.is_none());
+        }
+
+        // 2. Each claim's products equal the bilinear oracle over its own basis,
+        //    and 3. the diagonal collapses to γ · sumcheck_claim.
+        let bases: Vec<Vec<F128>> = (0..2).map(|k| baseline[k].1.rs_eq_ind.to_dense()).collect();
+        for claim in 0..2 {
+            let mut oracle = [F128::ZERO; 16];
+            for high in 0..(packed.len() / 4) {
+                for e in 0..4 {
+                    for d in 0..4 {
+                        oracle[4 * e + d] += packed[4 * high + e] * bases[claim][4 * high + d];
+                    }
+                }
+            }
+            let products = direct[claim].1.direct_fold2.as_ref().unwrap().products;
+            assert_eq!(products, oracle, "products claim {claim}");
+            let diagonal = products[0] + products[5] + products[10] + products[15];
+            assert_eq!(
+                diagonal,
+                direct_gammas[claim] * baseline[claim].1.sumcheck_claim,
+                "diagonal invariant claim {claim}"
+            );
+        }
+
+        // 4. The messages the pcs open would ship: products path == streamed
+        //    sweep over the summed basis. This is the value that must be
+        //    bit-identical for the proof to be unchanged.
+        let b_combined: Vec<F128> = bases[0]
+            .iter()
+            .zip(bases[1].iter())
+            .map(|(a, b)| *a + *b)
+            .collect();
+        let want = super::super::round0_and_round1_lookahead_scalar(&packed, &b_combined);
+        let factors: Vec<DirectFold2Factors> = (0..2)
+            .map(|k| direct[k].1.direct_fold2.clone().unwrap())
+            .collect();
+        let got = super::super::messages_from_direct_products(&factors);
+        assert_eq!(got, want, "round-0 + round-1 lookahead");
     }
 
     /// `prove_batched_padded_with_precomputed` is byte-identical to the

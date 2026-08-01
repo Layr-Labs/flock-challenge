@@ -41,6 +41,32 @@ fn ranked_direct_ab_precompute_enabled(r1cs: &BlockR1cs) -> bool {
         && std::env::var_os("FLOCK_NO_LIG_FOLD2").is_none()
 }
 
+/// Whether the c-claim ships its four-bank sufficient statistic instead of the
+/// canonical `s_hat_v_c`. Same shape conditions as the AB quad plus the single
+/// process-wide direct-C predicate `pcs`'s consumer reads, so capture and
+/// consumer can never disagree; a shape miss simply keeps the 128-vector and
+/// the incumbent deferred-C path.
+#[inline]
+fn ranked_direct_c_precompute_enabled(r1cs: &BlockR1cs) -> bool {
+    ranked_direct_ab_precompute_enabled(r1cs) && pcs::ranked_direct_c_enabled()
+}
+
+/// Pick the c-claim's precomputed slot: the 512-long quad on the ranked
+/// direct-C shape, otherwise the canonical 128-long `s_hat_v_c`. Both describe
+/// the same claim — `collapse_s_hat_v_quad` maps one to the other — so the
+/// transcript is identical either way.
+#[inline]
+fn pre_c_slot<'a>(
+    r1cs: &BlockR1cs,
+    captured: &'a zerocheck::CapturedSHatVC,
+) -> Option<&'a [F128]> {
+    Some(if ranked_direct_c_precompute_enabled(r1cs) {
+        captured.quad.as_slice()
+    } else {
+        captured.s_hat_v_c.as_slice()
+    })
+}
+
 /// Construct a multilinear `x_outer_full` of length `m − k_skip` from a
 /// QuirkyPoint: concatenate `x_inner_rest` and `x_outer`. This is the format
 /// the PCS expects (k_skip = 6 absorbed via `z_skip`; everything else is
@@ -186,7 +212,7 @@ pub fn prove_ligerito<Ch: Challenger>(
         None
     };
     let pre_ab: Option<&[F128]> = s_hat_v_ab.as_deref();
-    let pre_c: Option<&[F128]> = Some(s_hat_v_c.as_slice());
+    let pre_c: Option<&[F128]> = pre_c_slot(r1cs, &s_hat_v_c);
     let pcs_open = open_claims_with_precomputed_ligerito(
         z_packed,
         &prover_data,
@@ -338,7 +364,7 @@ fn prove_fast_ligerito_from_witness_with_commit_codeword<Ch: Challenger>(
 
     let padding = r1cs.padding_spec();
     let pre_ab: Option<&[F128]> = s_hat_v_ab.as_deref();
-    let pre_c: Option<&[F128]> = Some(s_hat_v_c.as_slice());
+    let pre_c: Option<&[F128]> = pre_c_slot(r1cs, &s_hat_v_c);
     let phase_timing = std::env::var_os("FLOCK_PHASE_TIMING").is_some();
     let cpu_open0 = phase_timing.then(process_cpu_ms);
     let t_open = std::time::Instant::now();
@@ -394,11 +420,11 @@ pub struct ProveCore {
     /// Real R1CS instances have `k_log >= 16` so this branch only fires in
     /// tiny test setups.
     pub s_hat_v_ab: Option<Vec<F128>>,
-    /// Precomputed `s_hat_v` for the C claim — produced by zerocheck round 1's
-    /// two-bank fusion kernel (one extra `vld1q+veorq` per chunk-lane-b_med
-    /// vs the original single-bank C-side). Skips `fold_1b_rows` for the C
-    /// claim at PCS-open time.
-    pub s_hat_v_c: Vec<F128>,
+    /// Precomputed opening statistics for the C claim — produced by zerocheck
+    /// round 1's eight-bank fusion kernel. Skips `fold_1b_rows` for the C claim
+    /// at PCS-open time; [`ranked_direct_c_precompute_enabled`] decides which of
+    /// the two forms goes into the open.
+    pub s_hat_v_c: zerocheck::CapturedSHatVC,
 }
 
 /// Ownership and initialization state of the commit codeword buffer.
@@ -881,7 +907,7 @@ fn prove_fast_ligerito_timed_with_commit_codeword<Ch: Challenger>(
 
     // --- Ligerito recursive PCS open ---
     let pre_ab: Option<&[F128]> = s_hat_v_ab.as_deref();
-    let pre_c: Option<&[F128]> = Some(s_hat_v_c.as_slice());
+    let pre_c: Option<&[F128]> = pre_c_slot(r1cs, &s_hat_v_c);
     let t0 = Instant::now();
     let pcs_open = open_claims_with_precomputed_ligerito(
         z_packed,

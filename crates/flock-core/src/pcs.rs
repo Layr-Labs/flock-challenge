@@ -197,10 +197,12 @@ struct CombinedClaim {
     /// Round-1 message as two quadratics in the first fold challenge. Present
     /// only for the exact ranked two-challenge cadence.
     round1_lookahead: Option<[F128; 6]>,
-    /// AB sufficient statistics for direct materialization after rounds 0/1.
-    /// `b_combined` still contains every ordinary claim (currently C) —
+    /// Per-claim sufficient statistics for direct materialization after rounds
+    /// 0/1. `b_combined` still contains every ordinary claim (currently C) —
     /// unless deferred-C is active, in which case C rides along here as a
-    /// second claim (products zeroed) and `b_combined` is empty.
+    /// second claim (products zeroed) and `b_combined` is empty, or the
+    /// direct-C completion is active, in which case C rides along with real
+    /// `products` and there is no basis sweep at all.
     direct_fold2: Option<Vec<ring_switch::DirectFold2Factors>>,
 }
 
@@ -498,6 +500,38 @@ fn direct_ab_claim_mix_supported(
     )
 }
 
+/// Completed direct path: **both** claims carry their own four-bank factor
+/// bundle, so every round-0/round-1 statistic comes from `products` and the
+/// L-sized combine sweep has nothing left to compute.
+#[inline]
+fn direct_all_claim_mix_supported(
+    rs_results: &[(RingSwitchProof, ring_switch::RingSwitchBatchOutput)],
+) -> bool {
+    matches!(
+        rs_results,
+        [(_, ab), (_, c)]
+            if ab.direct_fold2.is_some()
+                && c.direct_fold2.is_some()
+                && matches!(&ab.rs_eq_ind, ring_switch::RsEqInd::DeferredDense { .. })
+                && matches!(&c.rs_eq_ind, ring_switch::RsEqInd::DeferredDense { .. })
+    )
+}
+
+/// Direct-C completion kill switch, latched once per process.
+///
+/// Default **enabled**: the ranked worker's environment is cleared down to
+/// `RAYON_NUM_THREADS` + `TMPDIR`, so an env opt-out never reaches it and
+/// default-on is the shipped behaviour. `FLOCK_NO_OPEN_DIRECT_C=1` restores the
+/// deferred-C path bit-for-bit in the same binary. Read by both the zerocheck-side
+/// quad handoff (`flock_prover::prover`) and `use_direct_all` below, so the
+/// capture and its consumer can never disagree; the structural predicate above
+/// stays the final authority, so a mismatch degrades instead of panicking.
+#[inline]
+pub fn ranked_direct_c_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("FLOCK_NO_OPEN_DIRECT_C").is_none())
+}
+
 /// Runs ring_switch over RS claims, observes packed-direct claim values +
 /// samples their gammas, then builds `b_combined` (the γ-weighted linear
 /// combination of all `rs_eq_ind`s and `eq_ind`s) and `target_combined`.
@@ -577,16 +611,33 @@ fn compute_combined_basis_and_target<Ch: Challenger>(
     for (pd, g) in packed_direct.iter().zip(gammas_pd.iter()) {
         target_combined += *g * pd.value;
     }
-    // The ranked direct path is deliberately AB-only: claim 0 supplies the
-    // four-bank sufficient statistic, while claim 1 (C) remains on the exact
-    // incumbent basis path. The opt-out restores the ordinary implementation.
-    let use_direct_ab = enable_fold2
+    // The ranked direct path takes claim 0's four-bank sufficient statistic
+    // unconditionally; when claim 1 (C) also carries one, `use_direct_all`
+    // takes it too and no claim is left on the basis sweep. Either opt-out
+    // restores the corresponding incumbent implementation.
+    let direct_common = enable_fold2
         && l == (1usize << 25)
         && n_rs == 2
         && n_pd == 0
-        && std::env::var_os("FLOCK_NO_OPEN_DIRECT_AB").is_none()
-        && direct_ab_claim_mix_supported(&rs_results);
-    let mut direct_fold2 = if use_direct_ab {
+        && std::env::var_os("FLOCK_NO_OPEN_DIRECT_AB").is_none();
+    let use_direct_all =
+        direct_common && ranked_direct_c_enabled() && direct_all_claim_mix_supported(&rs_results);
+    let use_direct_ab =
+        direct_common && (use_direct_all || direct_ab_claim_mix_supported(&rs_results));
+    let mut direct_fold2 = if use_direct_all {
+        Some(vec![
+            rs_results[0]
+                .1
+                .direct_fold2
+                .take()
+                .expect("direct-all gate checked claim zero"),
+            rs_results[1]
+                .1
+                .direct_fold2
+                .take()
+                .expect("direct-all gate checked claim one"),
+        ])
+    } else if use_direct_ab {
         Some(vec![
             rs_results[0]
                 .1
@@ -597,22 +648,26 @@ fn compute_combined_basis_and_target<Ch: Challenger>(
     } else {
         None
     };
-    let direct_count = if direct_fold2.is_some() { 1 } else { 0 };
+    let direct_count = direct_fold2.as_ref().map_or(0, Vec::len);
     // Deferred-C candidate: taken here, before `rs_baked`/`rs_deferred`
     // borrow `rs_results`; confirmed below once the ranked sweep shape is
-    // known (dropped — incumbent path — otherwise).
-    let mut deferred_c_candidate =
-        if use_direct_ab && std::env::var_os("FLOCK_NO_OPEN_DEFERRED_C").is_none() {
-            rs_results[1].1.deferred_c_fold2.take()
-        } else {
-            None
-        };
+    // known (dropped — incumbent path — otherwise). Mutually exclusive with
+    // the completed path, which needs no sweep at all.
+    let mut deferred_c_candidate = if use_direct_ab
+        && !use_direct_all
+        && std::env::var_os("FLOCK_NO_OPEN_DEFERRED_C").is_none()
+    {
+        rs_results[1].1.deferred_c_fold2.take()
+    } else {
+        None
+    };
 
     let rs_baked: Vec<&[F128]> = rs_results
         .iter()
         .enumerate()
         .filter_map(|(index, (_, output))| {
-            if use_direct_ab && index == 0 {
+            // Direct claims are always taken from the front (0, then 1).
+            if index < direct_count {
                 return None;
             }
             match &output.rs_eq_ind {
@@ -629,7 +684,8 @@ fn compute_combined_basis_and_target<Ch: Challenger>(
         .iter()
         .enumerate()
         .filter_map(|(index, (_, output))| {
-            if use_direct_ab && index == 0 {
+            // Direct claims are always taken from the front (0, then 1).
+            if index < direct_count {
                 return None;
             }
             match &output.rs_eq_ind {
@@ -694,14 +750,21 @@ fn compute_combined_basis_and_target<Ch: Challenger>(
     // ---- Build b_combined (γ-weighted sum of all rs_eq_ind + eq_ind) and the
     //      round-0 prime (u_0, u_2 over packed_witness · b_combined).
     let t_alloc = std::time::Instant::now();
-    let mut b_combined: Vec<F128> = if use_deferred_c {
+    let mut b_combined: Vec<F128> = if use_deferred_c || use_direct_all {
         Vec::new()
     } else {
         crate::scratch::take_f128(l)
     };
     let alloc_ms = t_alloc.elapsed().as_secs_f64() * 1e3;
     let t_fold = std::time::Instant::now();
-    let (mut round0_u0, mut round0_u2, round1_lookahead) = if use_fast {
+    let (mut round0_u0, mut round0_u2, round1_lookahead) = if use_direct_all {
+        // Every claim's round-0 and round-1 contribution comes from its own
+        // `products` (added below, from `messages_from_direct_products`), so
+        // there is no basis to sweep: no L-sized allocation, no per-slot fold,
+        // no witness streaming pass. Seeding the lookahead with zeros — rather
+        // than `None` — is what keeps the accumulate below a plain add.
+        (F128::ZERO, F128::ZERO, Some([F128::ZERO; 6]))
+    } else if use_fast {
         let b = rs_deferred[0].0.len(); // eq_lo.len(); shared across claims (same split)
         debug_assert!(b >= 2 && b.is_multiple_of(2));
         debug_assert!(rs_deferred.iter().all(|d| d.0.len() == b));
@@ -896,7 +959,7 @@ fn compute_combined_basis_and_target<Ch: Challenger>(
         round0_u2 += direct_round0.1;
         let combined_lookahead = round1_lookahead
             .as_mut()
-            .expect("direct AB gate requires ordinary C lookahead");
+            .expect("direct fold2 gate requires a round-1 lookahead");
         for (out, value) in combined_lookahead.iter_mut().zip(direct_lookahead) {
             *out += value;
         }
