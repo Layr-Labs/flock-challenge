@@ -260,15 +260,82 @@ pub(super) fn accumulate_c_banks(
     mask_tables: &[super::F128],
     partial_c: &mut [[super::F128; 64]; 8],
 ) {
+    accumulate_c_banks_with_policy(c_block, n_b_med, mask_tables, partial_c, true);
+}
+
+#[inline]
+pub(super) fn accumulate_c_banks_with_policy(
+    c_block: &[u8; 16 * 64],
+    n_b_med: usize,
+    mask_tables: &[super::F128],
+    partial_c: &mut [[super::F128; 64]; 8],
+    drain4: bool,
+) {
     #[cfg(target_arch = "aarch64")]
     // SAFETY: aarch64 statically guarantees NEON; the fixed-size arrays cover
     // every load/store and the table halves bound every `u8`-scaled index.
     unsafe {
-        aarch64::accumulate_c_banks(c_block, n_b_med, mask_tables, partial_c);
+        aarch64::accumulate_c_banks(c_block, n_b_med, mask_tables, partial_c, drain4);
     }
 
     #[cfg(not(target_arch = "aarch64"))]
-    accumulate_c_banks_scalar(c_block, n_b_med, mask_tables, partial_c);
+    {
+        let _ = drain4;
+        accumulate_c_banks_scalar(c_block, n_b_med, mask_tables, partial_c);
+    }
+}
+
+/// AB-only half of [`accumulate_convert_with_s_hat_v`].  Keeping this as a
+/// separate entry point lets the ranked precomputed-AB path finish a whole
+/// `x_hi` band with the 64 KiB convert table resident before switching to the
+/// unrelated C-mask tables.
+#[inline]
+pub(super) fn accumulate_convert_ab(
+    chunk_ab_bytes: &[[u8; 64]; 16],
+    n_b_med: usize,
+    convert: &[super::F128],
+    eq_lo_val: super::F128,
+    partial_ab: &mut [super::F128; 64],
+) {
+    #[cfg(target_arch = "aarch64")]
+    // SAFETY: aarch64 statically guarantees NEON and the fixed arrays cover
+    // every table-selected load.
+    unsafe {
+        aarch64::accumulate_convert_ab(
+            chunk_ab_bytes,
+            n_b_med,
+            convert,
+            eq_lo_val,
+            partial_ab,
+        );
+    }
+
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
+    ))]
+    // SAFETY: the cfg gate guarantees the SIMD features and the fixed arrays
+    // cover every four-lane load/store.
+    unsafe {
+        x86_64::accumulate_convert_ab_x86_avx512(
+            chunk_ab_bytes,
+            n_b_med,
+            convert,
+            eq_lo_val,
+            partial_ab,
+        );
+    }
+
+    #[cfg(not(any(
+        target_arch = "aarch64",
+        all(
+            target_arch = "x86_64",
+            target_feature = "avx512f",
+            target_feature = "vpclmulqdq"
+        )
+    )))]
+    portable::accumulate_convert_ab(chunk_ab_bytes, n_b_med, convert, eq_lo_val, partial_ab);
 }
 
 /// Portable reference for [`accumulate_c_banks`], and the shape the aarch64
@@ -323,39 +390,6 @@ pub(super) fn accumulate_convert_with_s_hat_v(
     partial_ab: &mut [super::F128; 64],
     partial_c: &mut [[super::F128; 64]; 8],
 ) {
-    #[cfg(target_arch = "aarch64")]
-    // SAFETY: aarch64 statically guarantees NEON and the fixed arrays cover
-    // all table-selected loads.
-    unsafe {
-        aarch64::accumulate_convert_ab(chunk_ab_bytes, n_b_med, convert, eq_lo_val, partial_ab);
-    }
-
-    #[cfg(all(
-        target_arch = "x86_64",
-        target_feature = "avx512f",
-        target_feature = "vpclmulqdq"
-    ))]
-    // SAFETY: the cfg gate guarantees the SIMD features and the fixed arrays
-    // cover every four-lane load/store.
-    unsafe {
-        x86_64::accumulate_convert_ab_x86_avx512(
-            chunk_ab_bytes,
-            n_b_med,
-            convert,
-            eq_lo_val,
-            partial_ab,
-        );
-    }
-
-    #[cfg(not(any(
-        target_arch = "aarch64",
-        all(
-            target_arch = "x86_64",
-            target_feature = "avx512f",
-            target_feature = "vpclmulqdq"
-        )
-    )))]
-    portable::accumulate_convert_ab(chunk_ab_bytes, n_b_med, convert, eq_lo_val, partial_ab);
-
+    accumulate_convert_ab(chunk_ab_bytes, n_b_med, convert, eq_lo_val, partial_ab);
     accumulate_c_banks(c_block, n_b_med, mask_tables, partial_c);
 }
