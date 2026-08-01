@@ -188,6 +188,35 @@ pub(crate) unsafe fn accumulate_convert_with_s_hat_v(
         let m0_ptr = m0.as_ptr() as *const u8;
         let m1_ptr = m1.as_ptr() as *const u8;
         let n_pairs = n_b_med / 2;
+
+        // Each paired-C index is reused by all sixteen four-lane groups below.
+        // Form the two masked/interleaved banks once with NEON instead of
+        // repeating six scalar mask/shift/or instructions per pair and group.
+        // Only the first `n_pairs * 64` bytes of each scratch array are read.
+        let mut paired_c0 = core::mem::MaybeUninit::<[u8; 8 * 64]>::uninit();
+        let mut paired_c1 = core::mem::MaybeUninit::<[u8; 8 * 64]>::uninit();
+        let paired_c0_ptr = paired_c0.as_mut_ptr().cast::<u8>();
+        let paired_c1_ptr = paired_c1.as_mut_ptr().cast::<u8>();
+        let mask55 = vdupq_n_u8(0x55);
+        let maskaa = vdupq_n_u8(0xaa);
+        for p in 0..n_pairs {
+            let even = chunk_c_bytes[2 * p].as_ptr();
+            let odd = chunk_c_bytes[2 * p + 1].as_ptr();
+            macro_rules! pair_c_block {
+                ($offset:literal) => {{
+                    let ce = vld1q_u8(even.add($offset));
+                    let co = vld1q_u8(odd.add($offset));
+                    let j = vbslq_u8(mask55, ce, vshlq_n_u8::<1>(co));
+                    let k = vbslq_u8(maskaa, ce, vshrq_n_u8::<1>(co));
+                    vst1q_u8(paired_c0_ptr.add(p * 64 + $offset), j);
+                    vst1q_u8(paired_c1_ptr.add(p * 64 + $offset), k);
+                }};
+            }
+            pair_c_block!(0);
+            pair_c_block!(16);
+            pair_c_block!(32);
+            pair_c_block!(48);
+        }
         for lane in (0..64).step_by(4) {
             // 12 live accumulator q-registers (4 lanes × 3 banks); the paired
             // loop adds only address temporaries, so nothing spills.
@@ -249,14 +278,10 @@ pub(crate) unsafe fn accumulate_convert_with_s_hat_v(
                         vld1q_u8(t_odd.add(o3 * 16)),
                     );
 
-                    // The pairing masks distribute over the word; one
-                    // mask/shift sequence builds all 4 lanes' j and k.
-                    let ce = (chunk_c_bytes[b_even].as_ptr().add(lane) as *const u32)
-                        .read_unaligned() as usize;
-                    let co = (chunk_c_bytes[b_odd].as_ptr().add(lane) as *const u32)
-                        .read_unaligned() as usize;
-                    let jw = (ce & 0x5555_5555) | ((co << 1) & 0xaaaa_aaaa);
-                    let kw = (ce & 0xaaaa_aaaa) | ((co >> 1) & 0x5555_5555);
+                    let jw =
+                        (paired_c0_ptr.add(p * 64 + lane) as *const u32).read_unaligned() as usize;
+                    let kw =
+                        (paired_c1_ptr.add(p * 64 + lane) as *const u32).read_unaligned() as usize;
                     (q0, q1, jw, kw)
                 }};
             }

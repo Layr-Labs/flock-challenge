@@ -151,7 +151,7 @@ pub struct Commitment {
 /// a factor of ~1.5 (e.g. at m=35: 13 GB → 9 GB).
 pub struct ProverData {
     pub codeword: CodewordBuf,
-    pub merkle_tree: MerkleTreeBuf,
+    pub merkle_tree: Vec<Hash>,
 }
 
 /// Storage for the L0 codeword. Normally a pooled `Vec` (CPU commit); with
@@ -161,37 +161,6 @@ pub struct ProverData {
 pub enum CodewordBuf {
     Cpu(Vec<F128>),
     Gpu(crate::gpu_commit::GpuCodeword),
-}
-
-/// Storage for the L0 Merkle tree. Ranked GPU commitments leave the tree in
-/// their persistent host-visible Metal buffer, avoiding a 64 MiB copy-out.
-pub enum MerkleTreeBuf {
-    Cpu(Vec<Hash>),
-    Gpu(crate::gpu_commit::GpuMerkleTree),
-}
-
-impl core::ops::Deref for MerkleTreeBuf {
-    type Target = [Hash];
-    fn deref(&self) -> &[Hash] {
-        match self {
-            MerkleTreeBuf::Cpu(v) => v,
-            MerkleTreeBuf::Gpu(g) => g,
-        }
-    }
-}
-
-impl core::fmt::Debug for MerkleTreeBuf {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.debug_struct("MerkleTreeBuf").field("len", &self.len()).finish()
-    }
-}
-
-impl PartialEq<Vec<Hash>> for MerkleTreeBuf {
-    fn eq(&self, other: &Vec<Hash>) -> bool { &**self == other.as_slice() }
-}
-
-impl PartialEq<MerkleTreeBuf> for Vec<Hash> {
-    fn eq(&self, other: &MerkleTreeBuf) -> bool { self.as_slice() == &**other }
 }
 
 impl core::ops::Deref for CodewordBuf {
@@ -211,18 +180,11 @@ impl core::ops::Deref for CodewordBuf {
 // copy-out target page-resident across the warmup and timed proves).
 impl Drop for ProverData {
     fn drop(&mut self) {
-        // Drop the borrowed GPU-tree view before releasing the staging lease
-        // carried by the codeword. This keeps both persistent GPU buffers
-        // protected for the complete lifetime of ProverData.
-        if let MerkleTreeBuf::Cpu(tree) =
-            std::mem::replace(&mut self.merkle_tree, MerkleTreeBuf::Cpu(Vec::new()))
-        {
-            crate::gpu_commit::give_tree(tree);
-        }
         match std::mem::replace(&mut self.codeword, CodewordBuf::Cpu(Vec::new())) {
             CodewordBuf::Cpu(v) => crate::scratch::give_f128(v),
             CodewordBuf::Gpu(g) => drop(g),
         }
+        crate::gpu_commit::give_tree(std::mem::take(&mut self.merkle_tree));
     }
 }
 

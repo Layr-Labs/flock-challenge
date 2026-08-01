@@ -73,7 +73,7 @@ pub(crate) fn commit_l0_or_fallback(
     codeword: Vec<F128>,
     params: &crate::pcs::commit::PcsParams,
     cpu: impl FnOnce(&mut [F128]) -> Vec<crate::merkle::Hash>,
-) -> (crate::pcs::commit::CodewordBuf, crate::pcs::commit::MerkleTreeBuf) {
+) -> (crate::pcs::commit::CodewordBuf, Vec<crate::merkle::Hash>) {
     imp::commit_l0_or_fallback(z_packed, codeword, params, cpu)
 }
 
@@ -84,33 +84,6 @@ pub(crate) fn commit_l0_or_fallback(
 pub struct GpuCodeword {
     ptr: *const F128,
     len: usize,
-}
-
-/// Read-only ranked L0 tree in the persistent shared Metal buffer.
-pub struct GpuMerkleTree {
-    ptr: *const crate::merkle::Hash,
-    len: usize,
-}
-unsafe impl Send for GpuMerkleTree {}
-unsafe impl Sync for GpuMerkleTree {}
-impl GpuMerkleTree {
-    /// SAFETY: `ptr` must point at `len` initialized Hash nodes that stay valid
-    /// and un-mutated for this value's lifetime (the process-persistent tree
-    /// buffer, guarded by the staging lease / latch).
-    #[cfg_attr(
-        not(all(target_os = "macos", target_arch = "aarch64")),
-        allow(dead_code)
-    )]
-    pub(crate) unsafe fn new(ptr: *const crate::merkle::Hash, len: usize) -> Self {
-        Self { ptr, len }
-    }
-}
-impl core::ops::Deref for GpuMerkleTree {
-    type Target = [crate::merkle::Hash];
-    fn deref(&self) -> &[crate::merkle::Hash] {
-        // SAFETY: contract of `new`.
-        unsafe { core::slice::from_raw_parts(self.ptr, self.len) }
-    }
 }
 
 // SAFETY: the underlying memory is plain host-visible shared memory owned by
@@ -536,11 +509,9 @@ kernel void ntt_fused(device uint4* data                [[buffer(0)]],
 // One thread owns ALL 2^f tile positions of a single lane in registers, so
 // the whole radix-2^f butterfly network happens in-thread: no threadgroup
 // staging of data, no inter-layer barriers. A threadgroup is 64 threads =
-// one or more same-B tiles (64 lanes each); their shared 2^f - 1 twiddles get
-// four reduced nibble tables each (gf_mul_tab4), built cooperatively in two
-// phases: first the 4 base values tw*x^(4k) per twiddle, then the 16 nibble
-// multiples of each base. Same-B tiles execute sequentially, keeping the
-// 64-thread occupancy and register footprint of the one-tile kernel.
+// one tile (64 lanes); its 2^f - 1 twiddles get four reduced nibble tables
+// each (gf_mul_tab4), built cooperatively in two phases: first the 4 base
+// values tw*x^(4k) per twiddle, then the 16 nibble multiples of each base.
 // The f loops below have compile-time bounds, so the elems[] array stays in
 // registers (dynamic indexing would spill it to stack memory).
 // ===========================================================================
@@ -555,15 +526,17 @@ kernel void NAME(device uint4* data                [[buffer(0)]],              \
     constexpr uint F   = F_CONST;                                              \
     constexpr uint NF  = 1u << F;                                              \
     constexpr uint NTW = NF - 1u;                                              \
+    constexpr uint NTHREADS = 64u << LOG_G;                                    \
     threadgroup uint4 bases[NTW * 4u];                                         \
     threadgroup uint4 tabs[NTW * 64u];                                         \
                                                                                \
-    /* LOG_G > 0: process 2^LOG_G consecutive-r tiles sequentially while    */\
-    /* reusing one same-B twiddle table. Requires s >= LOG_G. */              \
-    const uint lane = lid;                                                     \
+    /* LOG_G > 0: 2^LOG_G tiles with consecutive r (same B, hence the same   */\
+    /* twiddle set and tables) share this threadgroup. Requires s >= LOG_G.  */\
+    const uint lane = lid & 63u;                                               \
+    const uint rr   = lid >> 6;                                                \
     const uint B = tgid >> (P.s - LOG_G);                                      \
-    const uint r_base =                                                        \
-        (tgid & ((1u << (P.s - LOG_G)) - 1u)) << LOG_G;                        \
+    const uint r = ((tgid & ((1u << (P.s - LOG_G)) - 1u)) << LOG_G) + rr;      \
+    const uint pos_base = (B << (P.log_d - P.l)) + r;                          \
                                                                                \
     /* Phase 1: base values tw * x^(4k), one entry per thread (<= 60). */     \
     if (lid < NTW * 4u) {                                                      \
@@ -578,7 +551,7 @@ kernel void NAME(device uint4* data                [[buffer(0)]],              \
     threadgroup_barrier(mem_flags::mem_threadgroup);                           \
                                                                                \
     /* Phase 2: nibble multiples of each base. */                             \
-    for (uint ei = lid; ei < NTW * 64u; ei += 64u) {                           \
+    for (uint ei = lid; ei < NTW * 64u; ei += NTHREADS) {                      \
         uint t   = ei >> 6;                                                    \
         uint sub = ei & 63u;                                                   \
         uint n   = sub & 15u;                                                  \
@@ -592,35 +565,32 @@ kernel void NAME(device uint4* data                [[buffer(0)]],              \
     }                                                                          \
     threadgroup_barrier(mem_flags::mem_threadgroup);                           \
                                                                                \
-    for (uint rr = 0; rr < (1u << LOG_G); rr++) {                              \
-        const uint r = r_base + rr;                                            \
-        const uint pos_base = (B << (P.log_d - P.l)) + r;                      \
-        /* Load one lane's tile column into registers (coalesced per e). */    \
-        uint4 elems[NF];                                                       \
-        for (uint e = 0; e < NF; e++) {                                        \
-            elems[e] = data[((pos_base + (e << P.s)) << 6) + lane];            \
+    /* Load the lane's tile column into registers (coalesced per e). */       \
+    uint4 elems[NF];                                                           \
+    for (uint e = 0; e < NF; e++) {                                            \
+        elems[e] = data[((pos_base + (e << P.s)) << 6) + lane];                \
+    }                                                                          \
+                                                                               \
+    /* f butterfly sub-layers, entirely in registers. */                      \
+    for (uint j = 0; j < F; j++) {                                             \
+        uint bpos = F - 1u - j;                                                \
+        for (uint b = 0; b < (NF >> 1); b++) {                                 \
+            uint low = b & ((1u << bpos) - 1u);                                \
+            uint eu  = ((b >> bpos) << (bpos + 1u)) | low;                     \
+            uint ev  = eu | (1u << bpos);                                      \
+            uint tsel = ((1u << j) - 1u) + (eu >> (F - j));                    \
+            uint4 nu = elems[eu] ^ gf_mul_tab4(elems[ev], &tabs[tsel << 6]);   \
+            elems[eu] = nu;                                                    \
+            elems[ev] ^= nu;                                                   \
         }                                                                      \
-        /* f butterfly sub-layers, entirely in registers. */                  \
-        for (uint j = 0; j < F; j++) {                                         \
-            uint bpos = F - 1u - j;                                            \
-            for (uint b = 0; b < (NF >> 1); b++) {                             \
-                uint low = b & ((1u << bpos) - 1u);                            \
-                uint eu  = ((b >> bpos) << (bpos + 1u)) | low;                 \
-                uint ev  = eu | (1u << bpos);                                  \
-                uint tsel = ((1u << j) - 1u) + (eu >> (F - j));                \
-                uint4 nu = elems[eu]                                           \
-                    ^ gf_mul_tab4(elems[ev], &tabs[tsel << 6]);                \
-                elems[eu] = nu;                                                \
-                elems[ev] ^= nu;                                               \
-            }                                                                  \
-        }                                                                      \
-        for (uint e = 0; e < NF; e++) {                                        \
-            data[((pos_base + (e << P.s)) << 6) + lane] = elems[e];            \
-        }                                                                      \
+    }                                                                          \
+                                                                               \
+    for (uint e = 0; e < NF; e++) {                                            \
+        data[((pos_base + (e << P.s)) << 6) + lane] = elems[e];                \
     }                                                                          \
 }
 
-DEF_NTT_FUSED_REG(ntt_fused_reg4g4, 4u, 2u)   // 4 same-B tiles, sequential
+DEF_NTT_FUSED_REG(ntt_fused_reg4g8, 4u, 3u)   // 8 same-B tiles, 512 threads
 DEF_NTT_FUSED_REG(ntt_fused_reg4,   4u, 0u)
 DEF_NTT_FUSED_REG(ntt_fused_reg3,   3u, 0u)
 
@@ -795,7 +765,10 @@ kernel void parent_hash(device const uint* children [[buffer(0)]],
         pub(crate) device: Id,
         pub(crate) queue: Id,
         pub(crate) pso_ntt: Id,
-        pub(crate) pso_ntt4g4: Id,
+        /// Compiled but unselected: 8-tile shared-table variant, kept for
+        /// occupancy experiments (see the note in `encode_ntt_passes`).
+        #[allow(dead_code)]
+        pub(crate) pso_ntt4g8: Id,
         pub(crate) pso_ntt4: Id,
         pub(crate) pso_ntt3: Id,
         pub(crate) pso_ntt4z: Id,
@@ -879,7 +852,7 @@ kernel void parent_hash(device const uint* children [[buffer(0)]],
                     Ok(p)
                 };
                 let pso_ntt = pso("ntt_fused")?;
-                let pso_ntt4g4 = pso("ntt_fused_reg4g4")?;
+                let pso_ntt4g8 = pso("ntt_fused_reg4g8")?;
                 let pso_ntt4 = pso("ntt_fused_reg4")?;
                 let pso_ntt3 = pso("ntt_fused_reg3")?;
                 let pso_ntt4z = pso("ntt_fused_reg4_from_z")?;
@@ -891,7 +864,7 @@ kernel void parent_hash(device const uint* children [[buffer(0)]],
                     device,
                     queue,
                     pso_ntt,
-                    pso_ntt4g4,
+                    pso_ntt4g8,
                     pso_ntt4,
                     pso_ntt3,
                     pso_ntt4z,
@@ -1164,26 +1137,18 @@ kernel void parent_hash(device const uint* children [[buffer(0)]],
         unsafe {
             gpu.set_buffer(enc, data_buf, 0, 0);
             gpu.set_buffer(enc, tw_buf, 0, 1);
-            let share_log = if std::env::var_os("FLOCK_NO_GPU_TABLE_REUSE").is_some() {
-                0usize
-            } else {
-                2usize
-            };
             for (l, f) in super::plan_passes(log_d, start_layer) {
                 // Register-resident specializations for the production pass
-                // widths; the generic staged kernel covers the rest. At
-                // production passes with s >= 2, one 64-thread group builds
-                // the shared twiddle table once and processes four adjacent
-                // same-B tiles sequentially. This preserves the incumbent
-                // register occupancy; parallel 128/256/512-thread grouping
-                // loses badly because each lane keeps 16 F128s live.
+                // widths; the generic staged kernel covers the rest. The g8
+                // variant packs 8 same-twiddle tiles per threadgroup (needs
+                // s >= 3) for much better occupancy per KiB of tables.
+                // NOTE: an 8-tile shared-table variant (pso_ntt4g8, 512
+                // threads/group) measured ~55% SLOWER than 64-thread groups:
+                // elems[16] costs ~64 registers/thread and monolithic
+                // 512-thread groups lose the scheduler's register-granular
+                // packing. Kept for future experiments; not selected.
                 let s = log_d - l - f;
                 let (pso, tpg, groups) = match f {
-                    4 if share_log > 0 && s >= share_log => (
-                        gpu.pso_ntt4g4,
-                        64u64,
-                        1u64 << (log_d - f - share_log),
-                    ),
                     4 => (gpu.pso_ntt4, 64u64, 1u64 << (log_d - f)),
                     3 => (gpu.pso_ntt3, 64u64, 1u64 << (log_d - f)),
                     _ => (gpu.pso_ntt, 1u64 << (f + 5), 1u64 << (log_d - f)),
@@ -1223,20 +1188,10 @@ kernel void parent_hash(device const uint* children [[buffer(0)]],
         unsafe {
             gpu.set_buffer(enc, data_buf, 0, 0);
             gpu.set_buffer(enc, tw_buf, 0, 1);
-            let share_log = if std::env::var_os("FLOCK_NO_GPU_TABLE_REUSE").is_some() {
-                0usize
-            } else {
-                2usize
-            };
             for (l, f) in super::plan_passes(log_d, start_layer) {
                 debug_assert!(l >= 4, "prefix passes require layer >= 4 blocks");
                 let s = log_d - l - f;
                 let (pso, tpg, groups) = match f {
-                    4 if share_log > 0 && s >= share_log => (
-                        gpu.pso_ntt4g4,
-                        64u64,
-                        1u64 << (log_d - f - share_log),
-                    ),
                     4 => (gpu.pso_ntt4, 64u64, 1u64 << (log_d - f)),
                     3 => (gpu.pso_ntt3, 64u64, 1u64 << (log_d - f)),
                     _ => (gpu.pso_ntt, 1u64 << (f + 5), 1u64 << (log_d - f)),
@@ -1650,6 +1605,14 @@ kernel void parent_hash(device const uint* children [[buffer(0)]],
                     gpu.buffer_contents(staging).cast::<F128>(),
                     n_leaves * 64,
                 );
+                ntt.forward_transform_interleaved_block_range(
+                    data,
+                    64,
+                    4,
+                    log_d,
+                    16 - k_cpu16,
+                    16,
+                );
                 let tree: &mut [Hash] = core::slice::from_raw_parts_mut(
                     gpu.buffer_contents(tree_buf).cast::<Hash>(),
                     2 * n_leaves - 1,
@@ -1657,69 +1620,22 @@ kernel void parent_hash(device const uint* children [[buffer(0)]],
                 let tree_base = crate::epool::SyncPtr(tree.as_mut_ptr());
                 let suffix_leaf_start = prefix_leaves;
                 let suffix_leaves = n_leaves - prefix_leaves;
-                if hybrid_cpu_suffix_deep_pipeline_enabled() {
-                    // Publish and hash each finalized layer-10 chunk before it
-                    // leaves cache.  `elem_offset` is absolute in the shared
-                    // staging buffer, hence `leaf_start` lands directly in the
-                    // CPU-owned suffix of the shared tree. Different callback
-                    // invocations own disjoint 1,024-leaf ranges; the GPU owns
-                    // only `0..prefix_leaves`.
-                    let finish_chunk = |elem_offset: usize, chunk: &[F128]| {
-                        debug_assert_eq!(elem_offset % 64, 0);
-                        let leaf_start = elem_offset / 64;
-                        let leaf_len = chunk.len() / 64;
-                        debug_assert!(leaf_start >= suffix_leaf_start);
-                        debug_assert!(leaf_start + leaf_len <= n_leaves);
-                        // SAFETY: the NTT callback runs only after this chunk's
-                        // last write. Callback ranges are pairwise disjoint and
-                        // disjoint from the concurrently executing GPU prefix.
-                        let bytes = core::slice::from_raw_parts(
-                            chunk.as_ptr().cast::<u8>(),
-                            core::mem::size_of_val(chunk),
-                        );
+                let suffix_bytes: &[u8] = core::slice::from_raw_parts(
+                    data.as_ptr().cast::<u8>().add(suffix_leaf_start * 1024),
+                    suffix_leaves * 1024,
+                );
+                const LEAF_JOB: usize = 1 << 12;
+                suffix_bytes
+                    .par_chunks(LEAF_JOB * 1024)
+                    .enumerate()
+                    .for_each(|(i, bytes)| {
+                        // SAFETY: disjoint leaf output ranges per job.
                         let outs = core::slice::from_raw_parts_mut(
-                            tree_base.ptr().add(leaf_start),
-                            leaf_len,
+                            tree_base.ptr().add(suffix_leaf_start + i * LEAF_JOB),
+                            bytes.len() / 1024,
                         );
                         crate::merkle::hash_ranked_blake3_leaf_chunk(bytes, outs);
-                    };
-                    ntt.forward_transform_interleaved_ranked_block_range_and_then(
-                        data,
-                        64,
-                        4,
-                        log_d,
-                        16 - k_cpu16,
-                        16,
-                        finish_chunk,
-                    );
-                } else {
-                    // Exact same-binary control: the original streaming suffix
-                    // driver followed by a separate 4,096-leaf hash traversal.
-                    ntt.forward_transform_interleaved_block_range(
-                        data,
-                        64,
-                        4,
-                        log_d,
-                        16 - k_cpu16,
-                        16,
-                    );
-                    let suffix_bytes: &[u8] = core::slice::from_raw_parts(
-                        data.as_ptr().cast::<u8>().add(suffix_leaf_start * 1024),
-                        suffix_leaves * 1024,
-                    );
-                    const LEAF_JOB: usize = 1 << 12;
-                    suffix_bytes
-                        .par_chunks(LEAF_JOB * 1024)
-                        .enumerate()
-                        .for_each(|(i, bytes)| {
-                            // SAFETY: disjoint leaf output ranges per job.
-                            let outs = core::slice::from_raw_parts_mut(
-                                tree_base.ptr().add(suffix_leaf_start + i * LEAF_JOB),
-                                bytes.len() / 1024,
-                            );
-                            crate::merkle::hash_ranked_blake3_leaf_chunk(bytes, outs);
-                        });
-                }
+                    });
                 // Suffix aligned subtrees' parents (greedy decomposition).
                 let mut sstart = suffix_leaf_start;
                 while sstart < n_leaves {
@@ -1796,11 +1712,11 @@ kernel void parent_hash(device const uint* children [[buffer(0)]],
     }
 
     /// CPU share of the hybrid commit in sixteenths of the position range.
-    /// 0 disables (pure-GPU graph). Default 5 is the conservative midpoint of
-    /// the cache-local suffix plateau: it retains most of the measured gain on
-    /// a 10P/4E M4 Pro without assuming the benchmark's larger M3 Max GPU has
-    /// the same CPU/GPU balance. `FLOCK_HYBRID_CPU_BLOCKS` remains the exact
-    /// split-point override.
+    /// 0 disables (pure-GPU graph). Default 2: measured best on-box (k=2
+    /// commit p25 101.1 ms vs pure-GPU 108.8; k≥3 loses — the plain-pass
+    /// suffix driver costs ~2.8× the tuned full-CPU path per sixteenth, and
+    /// the shared unified-memory bandwidth caps how much streaming work the
+    /// CPU can add while the GPU runs).
     fn hybrid_cpu_sixteenths() -> usize {
         use std::sync::OnceLock;
         static K: OnceLock<usize> = OnceLock::new();
@@ -1812,18 +1728,8 @@ kernel void parent_hash(device const uint* children [[buffer(0)]],
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .filter(|k| *k < 16)
-                .unwrap_or(5)
+                .unwrap_or(2)
         })
-    }
-
-    /// Use the ranked cache-local deep-pair CPU suffix and hash each finalized
-    /// chunk before eviction. `FLOCK_NO_HYBRID_CPU_SUFFIX_DEEP=1` restores the
-    /// original all-layer streaming suffix plus separate leaf-hash pass for an
-    /// exact same-binary comparison.
-    fn hybrid_cpu_suffix_deep_pipeline_enabled() -> bool {
-        use std::sync::OnceLock;
-        static ON: OnceLock<bool> = OnceLock::new();
-        *ON.get_or_init(|| std::env::var_os("FLOCK_NO_HYBRID_CPU_SUFFIX_DEEP").is_none())
     }
 
     struct WarmupRun {
@@ -1927,8 +1833,8 @@ kernel void parent_hash(device const uint* children [[buffer(0)]],
         mut codeword: Vec<F128>,
         params: &crate::pcs::commit::PcsParams,
         cpu: impl FnOnce(&mut [F128]) -> Vec<Hash>,
-    ) -> (crate::pcs::commit::CodewordBuf, crate::pcs::commit::MerkleTreeBuf) {
-        use crate::pcs::commit::{CodewordBuf, MerkleTreeBuf};
+    ) -> (crate::pcs::commit::CodewordBuf, Vec<Hash>) {
+        use crate::pcs::commit::CodewordBuf;
         let dbg = debug_enabled();
 
         // CPU first: the warmup prove's commit arm runs concurrently with the
@@ -1950,7 +1856,7 @@ kernel void parent_hash(device const uint* children [[buffer(0)]],
                     eprintln!("[gpu-commit] warmup: GPU unavailable ({e}); latching CPU path");
                 }
                 *latch = LatchState::Off;
-                return (CodewordBuf::Cpu(codeword), MerkleTreeBuf::Cpu(cpu_tree));
+                return (CodewordBuf::Cpu(codeword), cpu_tree);
             }
         };
         let gpu = gpu().expect("gpu() succeeded during warmup_gpu_run");
@@ -1993,22 +1899,21 @@ kernel void parent_hash(device const uint* children [[buffer(0)]],
             release_latched(gpu, run.latched);
             *latch = LatchState::Off;
         }
-        (CodewordBuf::Cpu(codeword), MerkleTreeBuf::Cpu(cpu_tree))
+        (CodewordBuf::Cpu(codeword), cpu_tree)
     }
 
     /// Timed-prove path once latched On: run the from-z graph into the
     /// persistent staging buffer (never touching the caller's z or codeword
-    /// buffers), hand back a zero-copy tree view, return the pooled input
-    /// codeword to the scratch pool, and hand back a `GpuCodeword` view of the
-    /// staging.
+    /// buffers), copy the tree out, return the pooled input codeword to the
+    /// scratch pool, and hand back a `GpuCodeword` view of the staging.
     fn run_latched(
         latch: &mut LatchState,
         z_packed: &[F128],
         mut codeword: Vec<F128>,
         params: &crate::pcs::commit::PcsParams,
         cpu: impl FnOnce(&mut [F128]) -> Vec<Hash>,
-    ) -> (crate::pcs::commit::CodewordBuf, crate::pcs::commit::MerkleTreeBuf) {
-        use crate::pcs::commit::{CodewordBuf, MerkleTreeBuf};
+    ) -> (crate::pcs::commit::CodewordBuf, Vec<Hash>) {
+        use crate::pcs::commit::CodewordBuf;
         use std::sync::atomic::Ordering;
         let log_d = params.k_code();
         let n_leaves = params.n_leaves();
@@ -2018,7 +1923,7 @@ kernel void parent_hash(device const uint* children [[buffer(0)]],
             Ok(g) => g,
             Err(_) => {
                 let tree = cpu(&mut codeword);
-                return (CodewordBuf::Cpu(codeword), MerkleTreeBuf::Cpu(tree));
+                return (CodewordBuf::Cpu(codeword), tree);
             }
         };
 
@@ -2030,7 +1935,7 @@ kernel void parent_hash(device const uint* children [[buffer(0)]],
                 eprintln!("[gpu-commit] staging still in use; CPU fallback");
             }
             let tree = cpu(&mut codeword);
-            return (CodewordBuf::Cpu(codeword), MerkleTreeBuf::Cpu(tree));
+            return (CodewordBuf::Cpu(codeword), tree);
         }
 
         // Resolve the read-only z wrap (normally cached from the warmup).
@@ -2061,7 +1966,7 @@ kernel void parent_hash(device const uint* children [[buffer(0)]],
                         }
                         STAGING_IN_USE.store(false, Ordering::Release);
                         let tree = cpu(&mut codeword);
-                        return (CodewordBuf::Cpu(codeword), MerkleTreeBuf::Cpu(tree));
+                        return (CodewordBuf::Cpu(codeword), tree);
                     }
                 },
             };
@@ -2088,16 +1993,20 @@ kernel void parent_hash(device const uint* children [[buffer(0)]],
                 release_latched(gpu, state);
             }
             let tree = cpu(&mut codeword);
-            return (CodewordBuf::Cpu(codeword), MerkleTreeBuf::Cpu(tree));
+            return (CodewordBuf::Cpu(codeword), tree);
         }
         let graph_ms = t0.elapsed().as_secs_f64() * 1e3;
-        // Zero-copy: opening only needs a query-dependent subset of the 64 MiB
-        // tree; keep it in the persistent shared Metal buffer.
-        let tree = unsafe {
-            super::GpuMerkleTree::new(gpu.buffer_contents(tree_buf).cast::<Hash>(), total_nodes)
-        };
+        let mut tree = take_tree(total_nodes);
+        unsafe {
+            copy_bytes_parallel(gpu.buffer_contents(tree_buf), {
+                core::slice::from_raw_parts_mut(tree.as_mut_ptr().cast::<u8>(), total_nodes * 32)
+            });
+        }
         if std::env::var_os("FLOCK_COMMIT_TIMING").is_some() || debug_enabled() {
-            eprintln!("[commit-timing] gpu-commit: graph {graph_ms:.2} ms + zero-copy tree");
+            eprintln!(
+                "[commit-timing] gpu-commit: graph {graph_ms:.2} ms + tree-copyout {:.2} ms",
+                t0.elapsed().as_secs_f64() * 1e3 - graph_ms
+            );
         }
         // The replicated input codeword was never read by the from-z graph;
         // hand it straight back to the scratch pool for the next prove.
@@ -2105,7 +2014,7 @@ kernel void parent_hash(device const uint* children [[buffer(0)]],
         let gpu_codeword = unsafe {
             super::GpuCodeword::new(gpu.buffer_contents(staging).cast::<F128>(), codeword_len)
         };
-        (CodewordBuf::Gpu(gpu_codeword), MerkleTreeBuf::Gpu(tree))
+        (CodewordBuf::Gpu(gpu_codeword), tree)
     }
 
     pub(crate) fn commit_l0_or_fallback(
@@ -2113,21 +2022,21 @@ kernel void parent_hash(device const uint* children [[buffer(0)]],
         mut codeword: Vec<F128>,
         params: &crate::pcs::commit::PcsParams,
         cpu: impl FnOnce(&mut [F128]) -> Vec<Hash>,
-    ) -> (crate::pcs::commit::CodewordBuf, crate::pcs::commit::MerkleTreeBuf) {
-        use crate::pcs::commit::{CodewordBuf, MerkleTreeBuf};
+    ) -> (crate::pcs::commit::CodewordBuf, Vec<Hash>) {
+        use crate::pcs::commit::CodewordBuf;
         if !super::gpu_commit_enabled()
             || !super::is_ranked_gpu_shape(params)
             || rayon::current_num_threads() <= 1
         {
             let tree = cpu(&mut codeword);
-            return (CodewordBuf::Cpu(codeword), MerkleTreeBuf::Cpu(tree));
+            return (CodewordBuf::Cpu(codeword), tree);
         }
         let mut latch = LATCH.lock().unwrap();
         match &*latch {
             LatchState::Off => {
                 drop(latch);
                 let tree = cpu(&mut codeword);
-                (CodewordBuf::Cpu(codeword), MerkleTreeBuf::Cpu(tree))
+                (CodewordBuf::Cpu(codeword), tree)
             }
             LatchState::Undecided => {
                 warmup_and_decide(&mut latch, z_packed, codeword, params, cpu)
@@ -2219,12 +2128,9 @@ mod imp {
         mut codeword: Vec<F128>,
         _params: &crate::pcs::commit::PcsParams,
         cpu: impl FnOnce(&mut [F128]) -> Vec<crate::merkle::Hash>,
-    ) -> (crate::pcs::commit::CodewordBuf, crate::pcs::commit::MerkleTreeBuf) {
+    ) -> (crate::pcs::commit::CodewordBuf, Vec<crate::merkle::Hash>) {
         let tree = cpu(&mut codeword);
-        (
-            crate::pcs::commit::CodewordBuf::Cpu(codeword),
-            crate::pcs::commit::MerkleTreeBuf::Cpu(tree),
-        )
+        (crate::pcs::commit::CodewordBuf::Cpu(codeword), tree)
     }
 
     pub(crate) fn give_tree(_tree: Vec<crate::merkle::Hash>) {}
@@ -2329,74 +2235,6 @@ mod tests {
                 data, expect,
                 "GPU NTT mismatch at log_d={log_d} start={start_layer}"
             );
-        }
-    }
-
-    /// The hybrid commit sends only a high-block prefix through the GPU NTT
-    /// encoder. Check that the grouped four-tile kernel preserves that exact
-    /// range: the selected prefix matches the complete CPU transform while
-    /// the CPU-owned suffix remains untouched.
-    #[test]
-    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-    fn gpu_ntt_prefix_matches_cpu_small_shape() {
-        use super::imp;
-
-        let log_d = 10usize;
-        let start_layer = 4usize;
-        let prefix16 = 14u64;
-        let ntt = AdditiveNttF128::standard(log_d);
-        let mut rng = Rng::new(0xA11C_ED16);
-        let input = rng.vec(64 << log_d);
-        let mut expect = input.clone();
-        ntt.forward_transform_interleaved_scalar_from_layer(&mut expect, 64, start_layer);
-
-        let gpu = match gpu_or_skip(imp::gpu().map(|g| g as *const imp::Gpu)) {
-            Some(g) => unsafe { &*g },
-            None => return,
-        };
-        let twiddles = flat_twiddle_table(&ntt, log_d);
-        unsafe {
-            let pool = gpu.pool_push();
-            let data_bytes = core::mem::size_of_val(input.as_slice());
-            let data_buf = gpu.new_buffer(data_bytes).unwrap();
-            let tw_buf = gpu
-                .new_buffer(core::mem::size_of_val(twiddles.as_slice()))
-                .unwrap();
-            std::ptr::copy_nonoverlapping(
-                input.as_ptr().cast::<u8>(),
-                gpu.buffer_contents(data_buf),
-                data_bytes,
-            );
-            std::ptr::copy_nonoverlapping(
-                twiddles.as_ptr().cast::<u8>(),
-                gpu.buffer_contents(tw_buf),
-                core::mem::size_of_val(twiddles.as_slice()),
-            );
-
-            let cb = gpu.command_buffer().unwrap();
-            let enc = gpu.compute_encoder(cb).unwrap();
-            imp::encode_ntt_passes_prefix(
-                gpu,
-                enc,
-                data_buf,
-                tw_buf,
-                log_d,
-                start_layer,
-                prefix16,
-            );
-            gpu.end_encoding(enc);
-            gpu.commit_and_wait(cb).unwrap();
-
-            let got = core::slice::from_raw_parts(
-                gpu.buffer_contents(data_buf).cast::<F128>(),
-                input.len(),
-            );
-            let prefix_len = input.len() / 16 * prefix16 as usize;
-            assert_eq!(&got[..prefix_len], &expect[..prefix_len]);
-            assert_eq!(&got[prefix_len..], &input[prefix_len..]);
-            gpu.release(data_buf);
-            gpu.release(tw_buf);
-            gpu.pool_pop(pool);
         }
     }
 
@@ -2649,7 +2487,7 @@ mod tests {
 
         // Warmup commit: dual-run, CPU-authoritative, decides the latch.
         let (c1, pd1) = crate::pcs::commit::commit(&z, &params);
-        let tree1 = pd1.merkle_tree.to_vec();
+        let tree1 = pd1.merkle_tree.clone();
         let codeword1 = pd1.codeword.to_vec();
         drop(pd1); // returns codeword + tree to the pools, as the prover does
 
@@ -2657,7 +2495,7 @@ mod tests {
         let t0 = std::time::Instant::now();
         let (c2, pd2) = crate::pcs::commit::commit(&z, &params);
         let latched_ms = t0.elapsed().as_secs_f64() * 1e3;
-        eprintln!("latched commit (replicate+gpu graph+zero-copy tree): {latched_ms:.2} ms");
+        eprintln!("latched commit (replicate+gpu graph+copyout): {latched_ms:.2} ms");
 
         assert_eq!(c1.root, c2.root, "roots differ between warmup and latched");
         assert_eq!(tree1, pd2.merkle_tree, "trees differ");
