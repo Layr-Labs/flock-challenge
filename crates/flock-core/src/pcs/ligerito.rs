@@ -9448,3 +9448,5 @@ mod tests {
 }
 // Redraw marker 4 (drift probe): zero-diff; prior draws 1,205,646 / 1,205,107 / 1,206,245.
 // RealAdii draw 1 on 1a6ad0e.
+// RealAdii self-extension draw on e53696f.
+// RealAdii self-extension draw 2 on e53696f (draw 1: 1,241,804.63).
