@@ -96,6 +96,7 @@ use flock_core::pcs::{Commitment, PcsParams};
 use flock_core::proof::R1csClaim;
 use flock_core::r1cs::{BlockR1cs, SparseBinaryMatrix};
 use flock_core::verifier;
+use std::collections::HashMap;
 
 // ---------------------------------------------------------------------------
 // Public constants
@@ -683,6 +684,10 @@ struct ReverseTranspose<'a> {
     ops: Vec<ReverseWordOp>,
     adjoints: Vec<[F128; WORD_BITS]>,
     comb: Vec<F128>,
+    /// Dedup `Constant(v)` nodes. Reverse-mode adjoints are linear, so sharing
+    /// one node per distinct `u32` is bit-identical to emitting duplicates and
+    /// deletes repeated op/adjoint slots (IV words, flags masks, etc.).
+    const_cache: HashMap<u32, usize>,
 }
 
 impl<'a> ReverseTranspose<'a> {
@@ -693,6 +698,7 @@ impl<'a> ReverseTranspose<'a> {
             ops: Vec::with_capacity(32 + 12 * N_G + 16),
             adjoints: Vec::with_capacity(32 + 12 * N_G + 16),
             comb: vec![F128::ZERO; K],
+            const_cache: HashMap::with_capacity(64),
         }
     }
 
@@ -711,7 +717,12 @@ impl<'a> ReverseTranspose<'a> {
 
     #[inline]
     fn constant(&mut self, value: u32) -> usize {
-        self.push(ReverseWordOp::Constant(value))
+        if let Some(&id) = self.const_cache.get(&value) {
+            return id;
+        }
+        let id = self.push(ReverseWordOp::Constant(value));
+        self.const_cache.insert(value, id);
+        id
     }
 
     #[inline]
