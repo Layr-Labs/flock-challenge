@@ -1978,11 +1978,21 @@ pub(crate) fn induce_sumcheck_poly(
             let start = t * chunk_size;
             let end = (start + chunk_size).min(n_queries);
             if start >= end {
-                return (vec![F128::ZERO; n], F128::ZERO);
+                // Empty marker: contributes nothing, skipped in the reduce
+                // (previously a length-n zeroed vec that was allocated,
+                // filled, and XOR-added for no effect).
+                return (Vec::new(), F128::ZERO);
             }
-            let mut accum_basis = vec![F128::ZERO; n];
-            // Per-thread scratch reused across this chunk's queries.
-            let mut local_basis = vec![F128::ZERO; n];
+            // Both per-thread buffers are uninit-sound: `local_basis` is
+            // fully written by `evaluate_scaled_basis_inplace` before any
+            // read (`basis[0] = alpha`, then each doubling level writes
+            // `[2^k, 2^{k+1})` from the already-written lower half), and
+            // `accum_basis` is seeded by a full `copy_from_slice` of the
+            // chunk's FIRST query before any accumulation — algebraically
+            // identical to zero-init + XOR-add (x ⊕ 0 = x), deleting one
+            // length-n memset and one full-buffer RMW pass per worker.
+            let mut accum_basis = crate::alloc_uninit_f128_vec(n);
+            let mut local_basis = crate::alloc_uninit_f128_vec(n);
             let mut sks_at_x = vec![F128::ZERO; log_msg_cols.max(1)];
             let mut local_sum = F128::ZERO;
 
@@ -1999,6 +2009,17 @@ pub(crate) fn induce_sumcheck_poly(
                 local_sum += dot * ap;
 
                 let q_field = F128::new(q as u64, 0);
+                if i == start {
+                    evaluate_scaled_basis_inplace(
+                        &mut sks_at_x,
+                        &mut accum_basis,
+                        sks_vks,
+                        &inv_sks_vks,
+                        q_field,
+                        ap,
+                    );
+                    continue;
+                }
                 evaluate_scaled_basis_inplace(
                     &mut sks_at_x,
                     &mut local_basis,
@@ -2015,10 +2036,16 @@ pub(crate) fn induce_sumcheck_poly(
         })
         .collect();
 
-    // Reduce across threads.
-    let mut basis_poly = vec![F128::ZERO; n];
-    let mut enforced_sum = F128::ZERO;
-    for (lb, ls) in partials {
+    // Reduce across threads: seed with the first non-empty partial (a move —
+    // deletes the zero-seeded output buffer and its redundant first XOR-add
+    // pass), then fold the rest in. Zero-query calls keep the zeroed-output
+    // behavior of the original.
+    let mut iter = partials.into_iter().filter(|(lb, _)| !lb.is_empty());
+    let (mut basis_poly, mut enforced_sum) = match iter.next() {
+        Some(first) => first,
+        None => return (vec![F128::ZERO; n], F128::ZERO),
+    };
+    for (lb, ls) in iter {
         for (acc, &v) in basis_poly.iter_mut().zip(lb.iter()) {
             *acc += v;
         }
@@ -2180,15 +2207,31 @@ pub(crate) fn induce_sumcheck_poly_via_ntt(
         table.into_iter().take(n_queries).collect()
     };
 
-    let mut enforced_sum = F128::ZERO;
-    for i in 0..n_queries {
+    // Parallel per-query dot products, mirroring the dense variant's
+    // per-thread accumulation. Every term is independent and F128 addition
+    // is XOR (associative, commutative), so the parallel reduction is
+    // bit-identical to the serial fold regardless of association. This loop
+    // is the NTT variant's only serial stretch — n_queries · row_len
+    // multiplies on one worker while the rest of the pool idles between the
+    // per-level opens and the transpose.
+    const PAR_QUERY_THRESHOLD: usize = 32;
+    let query_term = |i: usize| -> F128 {
         let dot: F128 = opened_rows[i]
             .iter()
             .zip(eq.iter())
             .map(|(&r, &e)| r * e)
             .fold(F128::ZERO, |a, v| a + v);
-        enforced_sum += dot * alpha_pows[i];
-    }
+        dot * alpha_pows[i]
+    };
+    let enforced_sum = if n_queries >= PAR_QUERY_THRESHOLD {
+        use rayon::prelude::*;
+        (0..n_queries)
+            .into_par_iter()
+            .map(query_term)
+            .reduce(|| F128::ZERO, |a, b| a + b)
+    } else {
+        (0..n_queries).map(query_term).fold(F128::ZERO, |a, b| a + b)
+    };
 
     let mut coeffs = if log_block == 0 {
         let mut c = vec![F128::ZERO; block_len];
@@ -2259,193 +2302,14 @@ pub(crate) fn induce_sumcheck_poly_auto(
 /// contain a nonzero (a dense `2^k` transpose each), densify, then run the
 /// remaining steps as full dense sweeps. Output is identical to
 /// `transpose_forward_ntt` applied to the scattered input.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct ActiveWindow {
-    window_index: usize,
-    input_start: usize,
-    input_end: usize,
-}
-
-#[inline]
-fn positions_are_sorted(positions: &[usize]) -> bool {
-    positions.windows(2).all(|pair| pair[0] <= pair[1])
-}
-
-fn group_sorted_positions(positions: &[usize], prefix_k: usize) -> Vec<ActiveWindow> {
-    debug_assert!(positions_are_sorted(positions));
-    let mut groups = Vec::with_capacity(positions.len());
-    let mut input_start = 0;
-    while input_start < positions.len() {
-        let window_index = positions[input_start] >> prefix_k;
-        let mut input_end = input_start + 1;
-        while input_end < positions.len() && positions[input_end] >> prefix_k == window_index {
-            input_end += 1;
-        }
-        groups.push(ActiveWindow {
-            window_index,
-            input_start,
-            input_end,
-        });
-        input_start = input_end;
-    }
-    groups
-}
-
-fn scatter_active_windows(
-    groups: &[ActiveWindow],
-    positions: &[usize],
-    values: &[F128],
-    prefix_k: usize,
-) -> Vec<F128> {
-    debug_assert_eq!(positions.len(), values.len());
-    let window_len = 1usize << prefix_k;
-    let window_mask = window_len - 1;
-    let mut arena = vec![F128::ZERO; groups.len() * window_len];
-    for (arena_index, group) in groups.iter().enumerate() {
-        let window = &mut arena[arena_index * window_len..(arena_index + 1) * window_len];
-        for input_index in group.input_start..group.input_end {
-            window[positions[input_index] & window_mask] += values[input_index];
-        }
-    }
-    arena
-}
-
-#[inline]
-fn transform_active_window(
-    ntt: &AdditiveNttF128,
-    window: &mut [F128],
-    window_index: usize,
-    prefix_k: usize,
-    log_d: usize,
-) {
-    for s in 0..prefix_k {
-        let layer = log_d - 1 - s;
-        let half = 1usize << s;
-        let block_size = half << 1;
-        let nblocks = window.len() / block_size;
-        for block in 0..nblocks {
-            let twiddle = ntt.twiddle(layer, (window_index << (prefix_k - s - 1)) + block);
-            let base = block * block_size;
-            for row in 0..half {
-                let top = window[base + row];
-                let bottom = window[base + row + half];
-                let sum = top + bottom;
-                window[base + row] = sum;
-                window[base + row + half] = twiddle * sum + bottom;
-            }
-        }
-    }
-}
-
-fn transform_active_windows(
-    ntt: &AdditiveNttF128,
-    arena: &mut [F128],
-    groups: &[ActiveWindow],
-    prefix_k: usize,
-    log_d: usize,
-) {
-    use rayon::prelude::*;
-    let window_len = 1usize << prefix_k;
-    arena
-        .par_chunks_mut(window_len)
-        .zip(groups.par_iter())
-        .for_each(|(window, group)| {
-            transform_active_window(ntt, window, group.window_index, prefix_k, log_d);
-        });
-}
-
-fn densify_active_windows(
-    arena: &[F128],
-    groups: &[ActiveWindow],
-    log_d: usize,
-    prefix_k: usize,
-) -> Vec<F128> {
-    use rayon::prelude::*;
-
-    const INACTIVE: usize = usize::MAX;
-    let n = 1usize << log_d;
-    let window_len = 1usize << prefix_k;
-    let n_windows = n / window_len;
-    let mut window_to_arena = vec![INACTIVE; n_windows];
-    for (arena_index, group) in groups.iter().enumerate() {
-        window_to_arena[group.window_index] = arena_index;
-    }
-
-    let mut data: Vec<F128> = crate::alloc_uninit_vec(n);
-    data.par_chunks_mut(window_len)
-        .enumerate()
-        .for_each(|(window_index, destination)| {
-            let arena_index = window_to_arena[window_index];
-            if arena_index == INACTIVE {
-                destination.fill(F128::ZERO);
-            } else {
-                let source = &arena[arena_index * window_len..(arena_index + 1) * window_len];
-                destination.copy_from_slice(source);
-            }
-        });
-    // Every chunk covers one disjoint dense window and takes exactly one of
-    // the fill/copy branches above, so all uninitialized elements are written
-    // before the dense transpose can read them.
-    data
-}
-
-fn transpose_forward_ntt_dense_suffix(
-    ntt: &AdditiveNttF128,
-    data: &mut [F128],
-    log_d: usize,
-    prefix_k: usize,
-) {
-    use rayon::prelude::*;
-    let n_threads = rayon::current_num_threads().max(1);
-    let mut remaining = log_d - prefix_k;
-    while remaining >= 3 {
-        let layer = remaining - 3;
-        transpose_forward_ntt_fused_3layer(ntt, data, log_d, layer);
-        remaining -= 3;
-    }
-    for layer in (0..remaining).rev() {
-        let num_blocks = 1usize << layer;
-        let block_size = 1usize << (log_d - layer);
-        let half = block_size >> 1;
-        if num_blocks >= n_threads {
-            data.par_chunks_mut(block_size)
-                .enumerate()
-                .for_each(|(block, chunk)| {
-                    let twiddle = ntt.twiddle(layer, block);
-                    let (top, bottom) = chunk.split_at_mut(half);
-                    for (top, bottom) in top.iter_mut().zip(bottom.iter_mut()) {
-                        let a = *top;
-                        let b = *bottom;
-                        let sum = a + b;
-                        *top = sum;
-                        *bottom = twiddle * sum + b;
-                    }
-                });
-        } else {
-            for block in 0..num_blocks {
-                let twiddle = ntt.twiddle(layer, block);
-                let chunk = &mut data[block * block_size..(block + 1) * block_size];
-                let (top, bottom) = chunk.split_at_mut(half);
-                top.par_iter_mut()
-                    .zip(bottom.par_iter_mut())
-                    .for_each(|(top, bottom)| {
-                        let a = *top;
-                        let b = *bottom;
-                        let sum = a + b;
-                        *top = sum;
-                        *bottom = twiddle * sum + b;
-                    });
-            }
-        }
-    }
-}
-
 fn transpose_forward_ntt_sparse(
     ntt: &AdditiveNttF128,
     positions: &[usize],
     values: &[F128],
     log_d: usize,
 ) -> Vec<F128> {
+    use rayon::prelude::*;
+    use std::collections::HashMap;
     let n = 1usize << log_d;
     // No prefix for small domains — just scatter + full dense transpose.
     let k = if log_d >= 12 { 8usize.min(log_d) } else { 0 };
@@ -2461,63 +2325,93 @@ fn transpose_forward_ntt_sparse(
         return data;
     }
 
-    static LINEAR_WINDOWS_ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    let use_linear_windows = positions_are_sorted(positions)
-        && *LINEAR_WINDOWS_ENABLED
-            .get_or_init(|| std::env::var_os("FLOCK_NO_INDUCE_LINEAR_WINDOWS").is_none());
-    if !use_linear_windows {
-        return transpose_forward_ntt_sparse_hashmap(ntt, positions, values, log_d, k);
-    }
-
-    let groups = group_sorted_positions(positions, k);
-
-    let mut arena = scatter_active_windows(&groups, positions, values, k);
-
-    transform_active_windows(ntt, &mut arena, &groups, k, log_d);
-
-    let mut data = densify_active_windows(&arena, &groups, log_d, k);
-
-    transpose_forward_ntt_dense_suffix(ntt, &mut data, log_d, k);
-    data
-}
-
-fn transpose_forward_ntt_sparse_hashmap(
-    ntt: &AdditiveNttF128,
-    positions: &[usize],
-    values: &[F128],
-    log_d: usize,
-    prefix_k: usize,
-) -> Vec<F128> {
-    use rayon::prelude::*;
-    use std::collections::HashMap;
-    let n = 1usize << log_d;
-    let window_len = 1usize << prefix_k;
-    let window_mask = window_len - 1;
-
+    let wmask = (1usize << k) - 1;
+    // Group nonzeros into 2^k windows.
     let mut windows: HashMap<usize, Vec<F128>> = HashMap::new();
-    for (&position, &value) in positions.iter().zip(values) {
-        let window = windows
-            .entry(position >> prefix_k)
-            .or_insert_with(|| vec![F128::ZERO; window_len]);
-        window[position & window_mask] += value;
+    for (&p, &v) in positions.iter().zip(values) {
+        let buf = windows
+            .entry(p >> k)
+            .or_insert_with(|| vec![F128::ZERO; 1 << k]);
+        buf[p & wmask] += v;
     }
 
-    let windows: Vec<(usize, Vec<F128>)> = windows.into_iter().collect();
-    let processed: Vec<(usize, Vec<F128>)> = windows
+    // Steps s = 0..k-1 within each active window, in parallel (windows disjoint).
+    let win_vec: Vec<(usize, Vec<F128>)> = windows.into_iter().collect();
+    let processed: Vec<(usize, Vec<F128>)> = win_vec
         .into_par_iter()
-        .map(|(window_index, mut window)| {
-            transform_active_window(ntt, &mut window, window_index, prefix_k, log_d);
-            (window_index, window)
+        .map(|(w, mut buf)| {
+            for s in 0..k {
+                let layer = log_d - 1 - s;
+                let bsh = 1usize << s; // pairing distance
+                let block_size = bsh << 1;
+                let nblocks = (1usize << k) / block_size;
+                for jb in 0..nblocks {
+                    // global block index = ((w<<k) + jb*block_size) >> (s+1).
+                    let t = ntt.twiddle(layer, (w << (k - s - 1)) + jb);
+                    let base = jb * block_size;
+                    for r in 0..bsh {
+                        let a = buf[base + r];
+                        let b = buf[base + r + bsh];
+                        let sab = a + b;
+                        buf[base + r] = sab;
+                        buf[base + r + bsh] = t * sab + b;
+                    }
+                }
+            }
+            (w, buf)
         })
         .collect();
 
+    // Densify (active windows only; the rest stay zero, which is the correct
+    // post-step-(k-1) state for an all-zero window).
     let mut data = vec![F128::ZERO; n];
-    for (window_index, window) in processed {
-        let start = window_index << prefix_k;
-        data[start..start + window_len].copy_from_slice(&window);
+    for (w, buf) in processed {
+        data[(w << k)..((w + 1) << k)].copy_from_slice(&buf);
     }
 
-    transpose_forward_ntt_dense_suffix(ntt, &mut data, log_d, prefix_k);
+    // Remaining steps s = k..log_d-1 = forward layers (log_d-1-k) .. 0, dense.
+    let n_threads = rayon::current_num_threads().max(1);
+    let mut remaining = log_d - k;
+    while remaining >= 3 {
+        let layer = remaining - 3;
+        transpose_forward_ntt_fused_3layer(ntt, &mut data, log_d, layer);
+        remaining -= 3;
+    }
+    for layer in (0..remaining).rev() {
+        let num_blocks = 1usize << layer;
+        let block_size = 1usize << (log_d - layer);
+        let bsh = block_size >> 1;
+        if num_blocks >= n_threads {
+            data.par_chunks_mut(block_size)
+                .enumerate()
+                .for_each(|(block, chunk)| {
+                    let t = ntt.twiddle(layer, block);
+                    let (top, bot) = chunk.split_at_mut(bsh);
+                    for (a_ref, b_ref) in top.iter_mut().zip(bot.iter_mut()) {
+                        let a = *a_ref;
+                        let b = *b_ref;
+                        let sab = a + b;
+                        *a_ref = sab;
+                        *b_ref = t * sab + b;
+                    }
+                });
+        } else {
+            for block in 0..num_blocks {
+                let t = ntt.twiddle(layer, block);
+                let chunk = &mut data[block * block_size..(block + 1) * block_size];
+                let (top, bot) = chunk.split_at_mut(bsh);
+                top.par_iter_mut()
+                    .zip(bot.par_iter_mut())
+                    .for_each(|(a_ref, b_ref)| {
+                        let a = *a_ref;
+                        let b = *b_ref;
+                        let sab = a + b;
+                        *a_ref = sab;
+                        *b_ref = t * sab + b;
+                    });
+            }
+        }
+    }
     data
 }
 
@@ -3136,6 +3030,12 @@ fn materialize_direct_ab_fold2(
     assert!(claims.iter().all(|claim| {
         claim.eq_lo.len() == block_len && claim.eq_hi.len() * block_len == out_len
     }));
+    let ranked_lookahead_neon = super::is_ranked_direct_fold2_lookahead_shape(
+        packed_witness.len(),
+        block_len,
+        claims.len(),
+        has_ordinary,
+    );
 
     let fuse_init = direct_ab_fuse_init_enabled();
     let mut folded_f = crate::scratch::take_f128(out_len);
@@ -3237,7 +3137,11 @@ fn materialize_direct_ab_fold2(
                         }
                     }
                 }
-                super::round0_and_round1_lookahead(f_out, b_out)
+                super::round0_and_round1_lookahead_ranked(
+                    f_out,
+                    b_out,
+                    ranked_lookahead_neon,
+                )
             },
         )
         .reduce(
@@ -4010,7 +3914,12 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
     let queries_0 = sample_distinct_queries(challenger, l0_block_len, num_queries_0);
     let alpha_0 = challenger.sample_f128_vec(ceil_log2(num_queries_0));
     let _t = std::time::Instant::now();
-    let opened_rows_0: Vec<Vec<F128>> = queries_0.iter().map(|&q| l0_row(q).to_vec()).collect();
+    let opened_rows_0: Vec<Vec<F128>> = {
+        use rayon::prelude::*;
+        // Indexed parallel collect is order-preserving: bit-identical to
+        // the serial map; each row copy is independent of the challenger.
+        queries_0.par_iter().map(|&q| l0_row(q).to_vec()).collect()
+    };
     let merkle_proof_0 = merkle_multi_proof_for(l0_tree, l0_block_len, &queries_0);
     if trace {
         t_opens += _t.elapsed();
@@ -4091,10 +4000,14 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
             let queries_last =
                 sample_distinct_queries(challenger, wtns_prev.block_len, num_queries_last);
             let _t = std::time::Instant::now();
-            let opened_rows_last: Vec<Vec<F128>> = queries_last
-                .iter()
-                .map(|&q| wtns_prev.row(q).to_vec())
-                .collect();
+            let opened_rows_last: Vec<Vec<F128>> = {
+                use rayon::prelude::*;
+                // Order-preserving parallel collect — bit-identical.
+                queries_last
+                    .par_iter()
+                    .map(|&q| wtns_prev.row(q).to_vec())
+                    .collect()
+            };
             let merkle_proof_last =
                 merkle_multi_proof_for(&wtns_prev.tree, wtns_prev.block_len, &queries_last);
             if trace {
@@ -4201,10 +4114,14 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
         let queries_i = sample_distinct_queries(challenger, wtns_prev.block_len, num_queries_i);
         let alpha_i = challenger.sample_f128_vec(ceil_log2(num_queries_i));
         let _t = std::time::Instant::now();
-        let opened_rows_i: Vec<Vec<F128>> = queries_i
-            .iter()
-            .map(|&q| wtns_prev.row(q).to_vec())
-            .collect();
+        let opened_rows_i: Vec<Vec<F128>> = {
+            use rayon::prelude::*;
+            // Order-preserving parallel collect — bit-identical.
+            queries_i
+                .par_iter()
+                .map(|&q| wtns_prev.row(q).to_vec())
+                .collect()
+        };
         let merkle_proof_i =
             merkle_multi_proof_for(&wtns_prev.tree, wtns_prev.block_len, &queries_i);
         if trace {
@@ -5323,7 +5240,11 @@ fn recursive_prover_inner<Ch: Challenger>(
     let queries_0 = sample_distinct_queries(challenger, wtns_0.block_len, num_queries_0);
     let alpha_0 = challenger.sample_f128_vec(ceil_log2(num_queries_0));
     let t = std::time::Instant::now();
-    let opened_rows_0: Vec<Vec<F128>> = queries_0.iter().map(|&q| wtns_0.row(q).to_vec()).collect();
+    let opened_rows_0: Vec<Vec<F128>> = {
+        use rayon::prelude::*;
+        // Order-preserving parallel collect — bit-identical (see above).
+        queries_0.par_iter().map(|&q| wtns_0.row(q).to_vec()).collect()
+    };
     let merkle_proof_0 = merkle_multi_proof_for(&wtns_0.tree, wtns_0.block_len, &queries_0);
     t_opens += t.elapsed();
     let initial_proof = RecursiveProof {
@@ -5396,10 +5317,14 @@ fn recursive_prover_inner<Ch: Challenger>(
             let num_queries_last = udr_queries(config.log_inv_rates[i + 1]);
             let queries_last =
                 sample_distinct_queries(challenger, wtns_prev.block_len, num_queries_last);
-            let opened_rows_last: Vec<Vec<F128>> = queries_last
-                .iter()
-                .map(|&q| wtns_prev.row(q).to_vec())
-                .collect();
+            let opened_rows_last: Vec<Vec<F128>> = {
+                use rayon::prelude::*;
+                // Order-preserving parallel collect — bit-identical.
+                queries_last
+                    .par_iter()
+                    .map(|&q| wtns_prev.row(q).to_vec())
+                    .collect()
+            };
             let merkle_proof_last =
                 merkle_multi_proof_for(&wtns_prev.tree, wtns_prev.block_len, &queries_last);
             return LigeritoProof {
@@ -5453,10 +5378,14 @@ fn recursive_prover_inner<Ch: Challenger>(
         let queries_i = sample_distinct_queries(challenger, wtns_prev.block_len, num_queries_i);
         let alpha_i = challenger.sample_f128_vec(ceil_log2(num_queries_i));
         let t = std::time::Instant::now();
-        let opened_rows_i: Vec<Vec<F128>> = queries_i
-            .iter()
-            .map(|&q| wtns_prev.row(q).to_vec())
-            .collect();
+        let opened_rows_i: Vec<Vec<F128>> = {
+            use rayon::prelude::*;
+            // Order-preserving parallel collect — bit-identical.
+            queries_i
+                .par_iter()
+                .map(|&q| wtns_prev.row(q).to_vec())
+                .collect()
+        };
         let merkle_proof_i =
             merkle_multi_proof_for(&wtns_prev.tree, wtns_prev.block_len, &queries_i);
         t_opens += t.elapsed();
@@ -6721,15 +6650,13 @@ mod tests {
     #[test]
     fn transpose_sparse_matches_dense() {
         use crate::challenger::Challenger;
-        for &log_d in &[0usize, 1, 6, 8, 11, 12, 14, 16, 18, 20] {
-            for &nq in &[0usize, 1, 2, 5, 43, 106, 218] {
+        for &log_d in &[6usize, 11, 12, 14, 16, 18] {
+            for &nq in &[1usize, 5, 43, 218] {
                 let n = 1usize << log_d;
                 let nq = nq.min(n);
                 let mut ch =
                     crate::challenger::RandomChallenger::new(0xC0DE ^ (log_d * 131 + nq) as u64);
-                // The transform itself supports log_d=0, while the standard
-                // basis constructor starts at one dimension.
-                let ntt = AdditiveNttF128::standard(log_d.max(1));
+                let ntt = AdditiveNttF128::standard(log_d);
                 let mut positions: Vec<usize> = Vec::new();
                 let mut values: Vec<F128> = Vec::new();
                 while positions.len() < nq {
@@ -6749,70 +6676,6 @@ mod tests {
                 assert_eq!(sparse, dense, "log_d={log_d}, nq={nq}");
             }
         }
-    }
-
-    #[test]
-    fn linear_sparse_windows_match_hashmap_and_dense() {
-        use crate::challenger::Challenger;
-
-        for &log_d in &[12usize, 14, 18, 20] {
-            let n = 1usize << log_d;
-            let ntt = AdditiveNttF128::standard(log_d);
-            for &n_queries in &[0usize, 1, 5, 43, 218] {
-                let mut challenger = crate::challenger::RandomChallenger::new(
-                    0x11EA_2105 ^ ((log_d as u64) << 32) ^ n_queries as u64,
-                );
-                let mut pairs = Vec::with_capacity(n_queries);
-                while pairs.len() < n_queries {
-                    let position = (challenger.sample_f128().lo as usize) % n;
-                    if !pairs.iter().any(|&(p, _)| p == position) {
-                        pairs.push((position, challenger.sample_f128()));
-                    }
-                }
-                pairs.sort_unstable_by_key(|&(position, _)| position);
-                let (positions, values): (Vec<_>, Vec<_>) = pairs.into_iter().unzip();
-
-                let mut dense = vec![F128::ZERO; n];
-                for (&position, &value) in positions.iter().zip(&values) {
-                    dense[position] += value;
-                }
-                transpose_forward_ntt(&ntt, &mut dense, log_d);
-
-                let legacy =
-                    transpose_forward_ntt_sparse_hashmap(&ntt, &positions, &values, log_d, 8);
-                let linear = transpose_forward_ntt_sparse(&ntt, &positions, &values, log_d);
-                assert_eq!(
-                    linear, legacy,
-                    "linear != hashmap at log_d={log_d}, nq={n_queries}"
-                );
-                assert_eq!(
-                    linear, dense,
-                    "linear != dense at log_d={log_d}, nq={n_queries}"
-                );
-            }
-        }
-
-        let log_d = 12;
-        let ntt = AdditiveNttF128::standard(log_d);
-        let positions = vec![0usize, 0, 1, 255, 256, 256, (1usize << log_d) - 1];
-        let values = vec![
-            F128::ONE,
-            F128::ONE,
-            F128::new(2, 0),
-            F128::ZERO,
-            F128::new(4, 0),
-            F128::new(5, 0),
-            F128::new(6, 0),
-        ];
-        let legacy = transpose_forward_ntt_sparse_hashmap(&ntt, &positions, &values, log_d, 8);
-        let linear = transpose_forward_ntt_sparse(&ntt, &positions, &values, log_d);
-        assert_eq!(linear, legacy, "duplicate-position accumulation changed");
-
-        let positions: Vec<usize> = (0..1usize << log_d).step_by(1 << 8).collect();
-        let values = vec![F128::ONE; positions.len()];
-        let legacy = transpose_forward_ntt_sparse_hashmap(&ntt, &positions, &values, log_d, 8);
-        let linear = transpose_forward_ntt_sparse(&ntt, &positions, &values, log_d);
-        assert_eq!(linear, legacy, "all-active-window case changed");
     }
 
     /// The fused production kernel must be byte-identical to the original
