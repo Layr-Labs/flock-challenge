@@ -35,6 +35,10 @@ use crate::ntt::AdditiveNttF128;
 /// Env var that disables the GPU commit path entirely.
 pub const ENV_NO_GPU_COMMIT: &str = "FLOCK_NO_GPU_COMMIT";
 
+/// Same-binary control that preserves the CPU codeword allocation/prefault
+/// even after the ranked GPU commit has latched on.
+pub const ENV_NO_LAZY_GPU_CODEWORD: &str = "FLOCK_NO_LAZY_GPU_CODEWORD";
+
 /// Env var that latches the GPU on whenever it is bit-exact, even without a
 /// wall-clock win (A/B and test tooling).
 pub const ENV_GPU_COMMIT_FORCE: &str = "FLOCK_GPU_COMMIT_FORCE";
@@ -246,6 +250,33 @@ pub(crate) fn give_tree(tree: Vec<crate::merkle::Hash>) {
 static PRECOMPUTE_BRANCH_WALL_MS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
+/// Maximum untimed-warmup delay allowed while handing the concurrently
+/// measured AB-branch wall to the hybrid split sweep. The wait is outside
+/// every scored prove and prevents the sweep from silently substituting its
+/// 100 ms fallback when the commit arm reaches tuning just before the sibling
+/// `rayon::join` arm publishes its measurement.
+const PRECOMPUTE_WALL_HANDOFF_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_secs(2);
+
+fn wait_for_nonzero_wall_ms(
+    wall_bits: &std::sync::atomic::AtomicU64,
+    timeout: std::time::Duration,
+) -> f64 {
+    let start = std::time::Instant::now();
+    loop {
+        let wall = f64::from_bits(wall_bits.load(std::sync::atomic::Ordering::Relaxed));
+        if wall.is_finite() && wall > 0.0 {
+            return wall;
+        }
+        if start.elapsed() >= timeout {
+            return 0.0;
+        }
+        // This runs only in the untimed warmup. Yield instead of burning the
+        // current OS time slice while the sibling AB precompute publishes.
+        std::thread::yield_now();
+    }
+}
+
 /// Record the measured precompute branch wall for this process (called by
 /// the prover; last writer wins, which is the most recent prove).
 pub fn note_precompute_branch_wall_ms(ms: f64) {
@@ -256,8 +287,11 @@ pub fn note_precompute_branch_wall_ms(ms: f64) {
     not(all(target_os = "macos", target_arch = "aarch64")),
     allow(dead_code)
 )]
-pub(crate) fn precompute_branch_wall_ms() -> f64 {
-    f64::from_bits(PRECOMPUTE_BRANCH_WALL_MS.load(std::sync::atomic::Ordering::Relaxed))
+fn wait_for_precompute_branch_wall_ms() -> f64 {
+    wait_for_nonzero_wall_ms(
+        &PRECOMPUTE_BRANCH_WALL_MS,
+        PRECOMPUTE_WALL_HANDOFF_TIMEOUT,
+    )
 }
 
 /// Returns true when the GPU commit machinery is allowed to initialize.
@@ -269,6 +303,12 @@ pub(crate) fn gpu_commit_enabled() -> bool {
     GPU_COMMIT_DEFAULT
         && cfg!(all(target_os = "macos", target_arch = "aarch64"))
         && std::env::var_os(ENV_NO_GPU_COMMIT).is_none()
+}
+
+/// True after untimed warmup permanently selected the ranked GPU path.
+/// The opt-out only restores speculative CPU buffers; it does not disable GPU.
+pub(crate) fn gpu_commit_latched_on() -> bool {
+    std::env::var_os(ENV_NO_LAZY_GPU_CODEWORD).is_none() && imp::gpu_commit_latched_on()
 }
 
 /// Build the flat breadth-first twiddle table for `log_d` layers: layer `l`
@@ -2700,7 +2740,11 @@ kernel void parent_hash(device const uint* children [[buffer(0)]],
         // precompute branch wall. The only wall available at sweep time is
         // the warmup prove's own, which is first-prove-inflated (cold
         // tables/pages; measured ~2x locally), so scale by 0.6 and cap.
-        let pre_wall = super::precompute_branch_wall_ms();
+        // Wait for the sibling warmup branch to publish its actual wall. An
+        // immediate relaxed load can race the store at the end of the outer
+        // `rayon::join`, silently replacing the host measurement with 100 ms
+        // and tuning every scored prove against synthetic contention.
+        let pre_wall = super::wait_for_precompute_branch_wall_ms();
         let burn_ms = if pre_wall > 0.0 {
             (pre_wall * 0.6).min(250.0)
         } else {
@@ -3058,6 +3102,7 @@ kernel void parent_hash(device const uint* children [[buffer(0)]],
         let gpu = match gpu() {
             Ok(g) => g,
             Err(_) => {
+                codeword = ensure_cpu_codeword(codeword, codeword_len);
                 let tree = cpu(&mut codeword);
                 return (CodewordBuf::Cpu(codeword), MerkleTreeBuf::Cpu(tree));
             }
@@ -3070,6 +3115,7 @@ kernel void parent_hash(device const uint* children [[buffer(0)]],
             if debug_enabled() {
                 eprintln!("[gpu-commit] staging still in use; CPU fallback");
             }
+            codeword = ensure_cpu_codeword(codeword, codeword_len);
             let tree = cpu(&mut codeword);
             return (CodewordBuf::Cpu(codeword), MerkleTreeBuf::Cpu(tree));
         }
@@ -3101,6 +3147,7 @@ kernel void parent_hash(device const uint* children [[buffer(0)]],
                             eprintln!("[gpu-commit] z wrap failed at prove time ({e})");
                         }
                         STAGING_IN_USE.store(false, Ordering::Release);
+                        codeword = ensure_cpu_codeword(codeword, codeword_len);
                         let tree = cpu(&mut codeword);
                         return (CodewordBuf::Cpu(codeword), MerkleTreeBuf::Cpu(tree));
                     }
@@ -3128,6 +3175,7 @@ kernel void parent_hash(device const uint* children [[buffer(0)]],
             if let LatchState::On(state) = std::mem::replace(latch, LatchState::Off) {
                 release_latched(gpu, state);
             }
+            codeword = ensure_cpu_codeword(codeword, codeword_len);
             let tree = cpu(&mut codeword);
             return (CodewordBuf::Cpu(codeword), MerkleTreeBuf::Cpu(tree));
         }
@@ -3142,7 +3190,10 @@ kernel void parent_hash(device const uint* children [[buffer(0)]],
         }
         // The replicated input codeword was never read by the from-z graph;
         // hand it straight back to the scratch pool for the next prove.
-        crate::scratch::give_f128(codeword);
+        // Empty marker (latched timed path) is a no-op drop.
+        if !codeword.is_empty() {
+            crate::scratch::give_f128(codeword);
+        }
         let gpu_codeword = unsafe {
             super::GpuCodeword::new(gpu.buffer_contents(staging).cast::<F128>(), codeword_len)
         };
@@ -3223,6 +3274,7 @@ kernel void parent_hash(device const uint* children [[buffer(0)]],
                 release_latched(stream.gpu, state);
             }
             drop(latch);
+            codeword = ensure_cpu_codeword(codeword, params.codeword_len_f128());
             let tree = cpu(&mut codeword);
             return (CodewordBuf::Cpu(codeword), MerkleTreeBuf::Cpu(tree));
         }
@@ -3241,7 +3293,10 @@ kernel void parent_hash(device const uint* children [[buffer(0)]],
                 "[commit-timing] gpu-commit: streamed witness+graph window {wall_ms:.2} ms + zero-copy tree"
             );
         }
-        crate::scratch::give_f128(codeword);
+        // Empty marker (latched streamed path) is a no-op drop.
+        if !codeword.is_empty() {
+            crate::scratch::give_f128(codeword);
+        }
         let gpu_codeword = unsafe {
             super::GpuCodeword::new(
                 stream.gpu.buffer_contents(stream.staging).cast::<F128>(),
@@ -3252,6 +3307,17 @@ kernel void parent_hash(device const uint* children [[buffer(0)]],
         stream.owns_lease = false;
         drop(latch);
         (CodewordBuf::Gpu(gpu_codeword), MerkleTreeBuf::Gpu(tree))
+    }
+
+    pub(crate) fn gpu_commit_latched_on() -> bool {
+        matches!(*LATCH.lock().unwrap(), LatchState::On(_))
+    }
+
+    fn ensure_cpu_codeword(mut codeword: Vec<F128>, len: usize) -> Vec<F128> {
+        if codeword.len() != len {
+            codeword = crate::scratch::take_f128(len);
+        }
+        codeword
     }
 
     pub(crate) fn commit_l0_or_fallback(
@@ -3265,6 +3331,7 @@ kernel void parent_hash(device const uint* children [[buffer(0)]],
             || !super::is_ranked_gpu_shape(params)
             || rayon::current_num_threads() <= 1
         {
+            codeword = ensure_cpu_codeword(codeword, params.codeword_len_f128());
             let tree = cpu(&mut codeword);
             return (CodewordBuf::Cpu(codeword), MerkleTreeBuf::Cpu(tree));
         }
@@ -3272,6 +3339,7 @@ kernel void parent_hash(device const uint* children [[buffer(0)]],
         match &*latch {
             LatchState::Off => {
                 drop(latch);
+                codeword = ensure_cpu_codeword(codeword, params.codeword_len_f128());
                 let tree = cpu(&mut codeword);
                 (CodewordBuf::Cpu(codeword), MerkleTreeBuf::Cpu(tree))
             }
@@ -3388,6 +3456,10 @@ mod imp {
         Err("GPU commit is only available on macOS/aarch64".into())
     }
 
+    pub(crate) fn gpu_commit_latched_on() -> bool {
+        false
+    }
+
     pub(crate) fn commit_l0_or_fallback(
         _z_packed: &[F128],
         mut codeword: Vec<F128>,
@@ -3414,6 +3486,26 @@ pub(crate) use imp::{gpu_merkle_tree_blake3, gpu_ntt_interleaved_from_layer};
 mod tests {
     use super::*;
     use crate::field::F128;
+
+    #[test]
+    fn precompute_wall_handoff_observes_late_store() {
+        let wall_bits = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let writer = wall_bits.clone();
+        let handle = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+            writer.store(137.25f64.to_bits(), std::sync::atomic::Ordering::Relaxed);
+        });
+        let got = wait_for_nonzero_wall_ms(&wall_bits, std::time::Duration::from_millis(250));
+        handle.join().unwrap();
+        assert_eq!(got, 137.25);
+    }
+
+    #[test]
+    fn precompute_wall_handoff_times_out_to_fallback_sentinel() {
+        let wall_bits = std::sync::atomic::AtomicU64::new(0);
+        let got = wait_for_nonzero_wall_ms(&wall_bits, std::time::Duration::from_millis(1));
+        assert_eq!(got, 0.0);
+    }
 
     struct Rng(u64);
     impl Rng {
@@ -3452,6 +3544,38 @@ mod tests {
             }
             Err(e) => panic!("GPU error: {e}"),
         }
+    }
+
+    /// A latched caller is allowed to pass an empty marker instead of the
+    /// ranked CPU scratch buffer. Every CPU fallback gate must hydrate that
+    /// marker before invoking the closure; use a small non-ranked shape to
+    /// exercise the deterministic early-gate path without initializing Metal.
+    #[test]
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    fn empty_codeword_marker_is_hydrated_before_cpu_fallback() {
+        use crate::merkle::HashKind;
+        use crate::pcs::commit::{CodewordBuf, MerkleTreeBuf, PcsParams};
+        use crate::pcs::ligerito::LigeritoProfile;
+
+        let params = PcsParams {
+            m: 10,
+            log_inv_rate: 1,
+            log_batch_size: 1,
+            profile: LigeritoProfile::Fast,
+            merkle_hash: HashKind::Blake3,
+        };
+        let expected_len = params.codeword_len_f128();
+        let (codeword, tree) = commit_l0_or_fallback(&[], Vec::new(), &params, |cw| {
+            assert_eq!(cw.len(), expected_len);
+            cw.fill(F128::ONE);
+            vec![[0xA5; 32]]
+        });
+
+        assert!(matches!(codeword, CodewordBuf::Cpu(_)));
+        assert_eq!(codeword.len(), expected_len);
+        assert!(codeword.iter().all(|&x| x == F128::ONE));
+        assert!(matches!(tree, MerkleTreeBuf::Cpu(_)));
+        assert_eq!(&*tree, &[[0xA5; 32]]);
     }
 
     /// CPU oracle for exactly one interleaved butterfly layer.
