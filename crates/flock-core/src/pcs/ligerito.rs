@@ -3592,60 +3592,107 @@ fn materialize_direct_fold4(
 
     let mut folded_f = crate::scratch::take_f128(out_len);
     let mut folded_b = crate::scratch::take_f128(out_len);
-    let stats = folded_b
-        .par_chunks_mut(block_len)
-        .zip(folded_f.par_chunks_mut(block_len))
-        .enumerate()
-        .map_init(
-            || vec![F128::ZERO; super::ring_switch::FOLD_TABLE_LEN],
-            |scratch, (block, (b_out, f_out))| {
-                let start = 16 * block * block_len;
-                let f_in = &packed_witness[start..start + 16 * block_len];
-                let b_in: &[F128] = if has_ordinary {
-                    &ordinary_basis[start..start + 16 * block_len]
-                } else {
-                    &[]
-                };
-                let fold16 = |input: &[F128], slot: usize| {
-                    let base = 16 * slot;
-                    let mut value = F128::ZERO;
-                    for bank in 0..16 {
-                        value += fold_weight[bank] * input[base + bank];
-                    }
-                    value
-                };
+    // Per-block body shared verbatim by both scheduling arms below, so the
+    // arms are computation-identical: only which pool runs a block differs.
+    let run_block = |scratch: &mut Vec<F128>, block: usize, b_out: &mut [F128], f_out: &mut [F128]| -> FoldStats {
+        let start = 16 * block * block_len;
+        let f_in = &packed_witness[start..start + 16 * block_len];
+        let b_in: &[F128] = if has_ordinary {
+            &ordinary_basis[start..start + 16 * block_len]
+        } else {
+            &[]
+        };
+        let fold16 = |input: &[F128], slot: usize| {
+            let base = 16 * slot;
+            let mut value = F128::ZERO;
+            for bank in 0..16 {
+                value += fold_weight[bank] * input[base + bank];
+            }
+            value
+        };
 
-                let (first_claim, rest_claims) = claims.split_first().unwrap();
-                let (first_table, rest_tables) = direct_tables.split_first().unwrap();
-                super::ring_switch::compose_fold_byte_table_into(
-                    first_claim.eq_hi[block],
-                    first_table,
-                    scratch,
-                );
-                for slot in 0..block_len {
-                    f_out[slot] = fold16(f_in, slot);
-                    let direct =
-                        super::ring_switch::fold_one_slot(first_claim.eq_lo[slot], scratch);
-                    b_out[slot] = if has_ordinary {
-                        direct + fold16(b_in, slot)
-                    } else {
-                        direct
-                    };
+        let (first_claim, rest_claims) = claims.split_first().unwrap();
+        let (first_table, rest_tables) = direct_tables.split_first().unwrap();
+        super::ring_switch::compose_fold_byte_table_into(
+            first_claim.eq_hi[block],
+            first_table,
+            scratch,
+        );
+        for slot in 0..block_len {
+            f_out[slot] = fold16(f_in, slot);
+            let direct = super::ring_switch::fold_one_slot(first_claim.eq_lo[slot], scratch);
+            b_out[slot] = if has_ordinary {
+                direct + fold16(b_in, slot)
+            } else {
+                direct
+            };
+        }
+        for (claim, table) in rest_claims.iter().zip(rest_tables.iter()) {
+            super::ring_switch::compose_fold_byte_table_into(claim.eq_hi[block], table, scratch);
+            for (slot, out) in b_out.iter_mut().enumerate() {
+                *out += super::ring_switch::fold_one_slot(claim.eq_lo[slot], scratch);
+            }
+        }
+        super::round0_and_round1_lookahead_scalar(f_out, b_out)
+    };
+
+    let n_blocks = out_len / block_len;
+    // The materialize fold is the open phase's largest block (~4 ms at the
+    // ranked shape) and previously ran on the main P-core pool alone while
+    // the E-core helper pool sat parked. Drain blocks through the incumbent
+    // two-pool queue (same shape as the witgen/tail hetero drains): each
+    // block writes only its disjoint output range plus its own indexed stats
+    // slot, and the per-block stats are merged in ascending block order after
+    // the join. F128 sums are XOR, so the merged stats are bit-identical to
+    // the rayon reduce regardless of merge shape; the ascending merge keeps
+    // the arm auditably deterministic. Blocks are coarse (2^15 slots each —
+    // hundreds of microseconds), the promoted-good hetero granularity.
+    // `FLOCK_NO_OPEN_FOLD4_HETERO=1` restores the main-pool-only rayon arm.
+    let hetero = n_blocks >= 16
+        && std::env::var_os("FLOCK_NO_OPEN_FOLD4_HETERO").is_none();
+    let stats = if hetero {
+        let mut block_stats: Vec<FoldStats> = vec![empty_stats(); n_blocks];
+        let stats_base = crate::epool::SyncPtr(block_stats.as_mut_ptr());
+        let f_base = crate::epool::SyncPtr(folded_f.as_mut_ptr());
+        let b_base = crate::epool::SyncPtr(folded_b.as_mut_ptr());
+        crate::epool::run_hetero_chunks_stateful(
+            n_blocks,
+            || vec![F128::ZERO; super::ring_switch::FOLD_TABLE_LEN],
+            |scratch, block| {
+                // SAFETY: block `i` exclusively owns output range
+                // [i*block_len, (i+1)*block_len) in both buffers and stats
+                // slot `i`; the queue join publishes all writes before the
+                // merge below reads them.
+                let (b_out, f_out) = unsafe {
+                    (
+                        core::slice::from_raw_parts_mut(
+                            b_base.ptr().add(block * block_len),
+                            block_len,
+                        ),
+                        core::slice::from_raw_parts_mut(
+                            f_base.ptr().add(block * block_len),
+                            block_len,
+                        ),
+                    )
+                };
+                let stats_i = run_block(scratch, block, b_out, f_out);
+                unsafe {
+                    *stats_base.ptr().add(block) = stats_i;
                 }
-                for (claim, table) in rest_claims.iter().zip(rest_tables.iter()) {
-                    super::ring_switch::compose_fold_byte_table_into(
-                        claim.eq_hi[block],
-                        table,
-                        scratch,
-                    );
-                    for (slot, out) in b_out.iter_mut().enumerate() {
-                        *out += super::ring_switch::fold_one_slot(claim.eq_lo[slot], scratch);
-                    }
-                }
-                super::round0_and_round1_lookahead_scalar(f_out, b_out)
             },
-        )
-        .reduce(empty_stats, merge_stats);
+        );
+        block_stats.into_iter().fold(empty_stats(), merge_stats)
+    } else {
+        folded_b
+            .par_chunks_mut(block_len)
+            .zip(folded_f.par_chunks_mut(block_len))
+            .enumerate()
+            .map_init(
+                || vec![F128::ZERO; super::ring_switch::FOLD_TABLE_LEN],
+                |scratch, (block, (b_out, f_out))| run_block(scratch, block, b_out, f_out),
+            )
+            .reduce(empty_stats, merge_stats)
+    };
 
     crate::scratch::give_f128(packed_witness);
     crate::scratch::give_f128(ordinary_basis);
