@@ -300,6 +300,13 @@ impl AdditiveNttF128 {
         self.evals.len()
     }
 
+    /// Full breadth-first twiddle table when cached (domains up to
+    /// `MAX_PRECOMPUTED_TWIDDLE_LOG`): layer `l` starts at `2^l - 1`. The GPU
+    /// commit uploads this table once at init.
+    pub(crate) fn precomputed_twiddle_table(&self) -> Option<&[F128]> {
+        self.precomputed_twiddles.as_deref()
+    }
+
     /// Twiddle at `(layer, block)` for the forward NTT and FRI fold.
     ///
     /// At layer `l` ∈ `[0, ℓ)`, block index `b` ∈ `[0, 2^l)`:

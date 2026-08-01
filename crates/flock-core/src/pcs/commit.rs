@@ -150,15 +150,41 @@ pub struct Commitment {
 /// avoids ~4 GB of duplication at large `m`, dropping peak commit memory by
 /// a factor of ~1.5 (e.g. at m=35: 13 GB → 9 GB).
 pub struct ProverData {
-    pub codeword: Vec<F128>,
+    pub codeword: CodewordBuf,
     pub merkle_tree: Vec<Hash>,
 }
 
+/// Storage for the L0 codeword. Normally a pooled `Vec` (CPU commit); with
+/// the GPU commit latched on it is a view into the process-persistent Metal
+/// staging buffer instead (unified memory — CPU reads during the open are
+/// ordinary cached reads). Derefs to `[F128]` either way.
+pub enum CodewordBuf {
+    Cpu(Vec<F128>),
+    Gpu(crate::gpu_commit::GpuCodeword),
+}
+
+impl core::ops::Deref for CodewordBuf {
+    type Target = [F128];
+    fn deref(&self) -> &[F128] {
+        match self {
+            CodewordBuf::Cpu(v) => v,
+            CodewordBuf::Gpu(g) => g,
+        }
+    }
+}
+
 // Recycle the codeword buffer (the prover's largest single allocation —
-// 128 MB at m = 29) through the scratch pool instead of unmapping it.
+// 128 MB at m = 29) through the scratch pool instead of unmapping it (the
+// GPU-staging variant hands the staging buffer back to the latch on drop),
+// and ranked-size trees through the GPU commit's tree pool (keeps the 64 MiB
+// copy-out target page-resident across the warmup and timed proves).
 impl Drop for ProverData {
     fn drop(&mut self) {
-        crate::scratch::give_f128(std::mem::take(&mut self.codeword));
+        match std::mem::replace(&mut self.codeword, CodewordBuf::Cpu(Vec::new())) {
+            CodewordBuf::Cpu(v) => crate::scratch::give_f128(v),
+            CodewordBuf::Gpu(g) => drop(g),
+        }
+        crate::gpu_commit::give_tree(std::mem::take(&mut self.merkle_tree));
     }
 }
 
@@ -233,11 +259,11 @@ pub fn commit_into(
     // full replica store here and halving that pass's loads. Every other
     // shape writes the replica state and starts the NTT at `log_inv_rate`.
     if ranked_from_message_supported(params, &codeword, z_packed) {
-        return finalize_commit_impl(codeword, params, Some(z_packed));
+        return finalize_commit_impl(z_packed, codeword, params, true);
     }
     replicate_message_fill(&mut codeword, z_packed);
 
-    finalize_commit(codeword, params)
+    finalize_commit_impl(z_packed, codeword, params, false)
 }
 
 /// Whether the ranked rate-1/2 commit will fuse the replicate-fill into the
@@ -288,7 +314,7 @@ pub fn commit_preinitialized(
         codeword_len,
         "commit_preinitialized: codeword buffer has wrong length"
     );
-    finalize_commit(codeword, params)
+    finalize_commit_impl(z_packed, codeword, params, false)
 }
 
 /// Process CPU (user+system) in ms for `FLOCK_COMMIT_TIMING` diagnostics.
@@ -555,20 +581,56 @@ fn ranked_ntt_with_pipelined_leaves(
 
 /// Shared tail of [`commit`] / [`commit_into`]: interleaved forward additive
 /// NTT (RS-encode every lane) then the initial Merkle tree over codeword rows.
-fn finalize_commit(codeword: Vec<F128>, params: &PcsParams) -> (Commitment, ProverData) {
-    finalize_commit_impl(codeword, params, None)
+///
+/// `from_message = true` is the ranked rate-1/2 fusion: `codeword` holds
+/// arbitrary STALE bytes and both replicas are synthesized from `z_packed`
+/// directly — by the split ranked top pass on the CPU (see
+/// `forward_transform_interleaved_ranked_top_from_message`), or inherently by
+/// the GPU graph, whose first pass always reads only `z_packed`. With
+/// `from_message = false` the caller materialized the exact
+/// [`replicate_message_fill`] state.
+///
+/// GPU latch (see [`crate::gpu_commit`]): the GPU graph never writes
+/// `z_packed` or `codeword`, so on any Metal failure the CPU closure below
+/// runs on the untouched inputs and reproduces the exact CPU result for BOTH
+/// `from_message` modes — the fallback keeps the frontier's from-message
+/// fusion rather than forcing a re-replication.
+fn finalize_commit_impl(
+    z_packed: &[F128],
+    codeword: Vec<F128>,
+    params: &PcsParams,
+    from_message: bool,
+) -> (Commitment, ProverData) {
+    let (codeword, merkle_tree) =
+        crate::gpu_commit::commit_l0_or_fallback(z_packed, codeword, params, |cw| {
+            cpu_transform_and_tree(cw, params, from_message.then_some(z_packed))
+        });
+    let root = *merkle_tree.last().expect("merkle tree non-empty");
+    (
+        Commitment {
+            root,
+            params: params.clone(),
+        },
+        ProverData {
+            codeword,
+            merkle_tree,
+        },
+    )
 }
 
-/// [`finalize_commit`] with an optional unmaterialized rate-1/2 message: when
-/// `from_message` is `Some(z)`, `codeword` holds arbitrary stale bytes and
-/// the ranked split top pass synthesizes both replicas from `z` directly
+/// The CPU commit pipeline: interleaved forward NTT from the rate layers,
+/// then the L0 Merkle tree. This is the (only) path on non-ranked shapes and
+/// the latched fallback for the GPU offload.
+///
+/// When `from_message` is `Some(z)`, `codeword` holds arbitrary stale bytes
+/// and the ranked split top pass synthesizes both replicas from `z` directly
 /// (gate: [`ranked_from_message_supported`]). Paths that cannot fuse fall
 /// back to an explicit [`replicate_message_fill`] first.
-fn finalize_commit_impl(
-    mut codeword: Vec<F128>,
+pub(crate) fn cpu_transform_and_tree(
+    codeword: &mut [F128],
     params: &PcsParams,
     from_message: Option<&[F128]>,
-) -> (Commitment, ProverData) {
+) -> Vec<Hash> {
     let helper = if use_ranked_ntt_merkle_leaf_pipeline(params) && rayon::current_num_threads() > 1
     {
         crate::epool::epool()
@@ -595,22 +657,16 @@ fn finalize_commit_impl(
     // caller's replicate-fill (commit_into), so start past them.
     let ntt = AdditiveNttF128::standard(params.k_code());
     if let (Some(helper), Some(tree)) = (helper, prehashed_tree.as_mut()) {
-        prehashed_parent_levels = ranked_ntt_with_pipelined_leaves(
-            &ntt,
-            &mut codeword,
-            params,
-            tree,
-            helper,
-            from_message,
-        );
+        prehashed_parent_levels =
+            ranked_ntt_with_pipelined_leaves(&ntt, codeword, params, tree, helper, from_message);
     } else {
         // No pipeline → no split ranked top; materialize the replicas the
         // ordinary way before the full transform.
         if let Some(msg) = from_message {
-            replicate_message_fill(&mut codeword, msg);
+            replicate_message_fill(codeword, msg);
         }
         ntt.forward_transform_interleaved_from_layer(
-            &mut codeword,
+            codeword,
             params.num_ntts(),
             params.log_inv_rate,
         );
@@ -649,7 +705,6 @@ fn finalize_commit_impl(
         };
         merkle::merkle_tree(codeword_bytes, params.n_leaves(), params.merkle_hash)
     };
-    let root = *merkle_tree.last().expect("merkle tree non-empty");
     if timing {
         let phase = if pipelined_leaves {
             "merkle-parents"
@@ -661,16 +716,7 @@ fn finalize_commit_impl(
         eprintln!("[commit-timing] {phase}: {wall:.2} ms cpu={cpu:.1}");
     }
 
-    (
-        Commitment {
-            root,
-            params: params.clone(),
-        },
-        ProverData {
-            codeword,
-            merkle_tree,
-        },
-    )
+    merkle_tree
 }
 
 /// Tag the current thread as background QoS. On macOS the scheduler then
@@ -925,8 +971,8 @@ mod tests {
             let ntt = AdditiveNttF128::standard(params.k_code());
             ntt.forward_transform_interleaved(&mut oracle, params.num_ntts());
 
-            assert_eq!(
-                pd.codeword, oracle,
+            assert!(
+                pd.codeword[..] == oracle[..],
                 "codeword mismatch at m={m} r={log_inv_rate}"
             );
             let oracle_bytes: &[u8] = unsafe {
@@ -996,7 +1042,7 @@ mod tests {
         let (_, pd1) = commit(&pack(&z1), &params);
         let (_, pd2) = commit(&pack(&z2), &params);
         let (_, pd_x) = commit(&pack(&z_xor), &params);
-        for (i, (&c1, &c2)) in pd1.codeword.iter().zip(&pd2.codeword).enumerate() {
+        for (i, (&c1, &c2)) in pd1.codeword.iter().zip(pd2.codeword.iter()).enumerate() {
             assert_eq!(c1 + c2, pd_x.codeword[i], "linearity fails at i={i}");
         }
     }

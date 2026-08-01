@@ -21,6 +21,7 @@ pub mod bits;
 pub mod challenger;
 pub(crate) mod epool;
 pub mod field;
+pub(crate) mod gpu_commit;
 pub mod hash;
 pub mod lincheck;
 pub mod merkle;
