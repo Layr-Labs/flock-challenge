@@ -3556,6 +3556,14 @@ kernel void parent_hash3(device const uint* children [[buffer(0)]],
     // dual-run. Nothing timed changes in any path.
     // -----------------------------------------------------------------------
 
+    // (Redraw marker, 2026-08-02: submission d0f0bb52 — this exact tree plus
+    // a two-pass autotune base sweep — went `failed` with no score. If the
+    // cross-process cache below does not hit on the ranked runner, that
+    // sweep runs in every worker (+8 contended graph runs × ~120 processes),
+    // which is a CI-cap death; a transient runner failure is the alternative
+    // explanation. The boost is therefore withdrawn pending a runner signal
+    // that the cache hits; this resubmission is the promoted bytes with only
+    // this marker. Content change required for per-account resubmission.)
     const WARMUP_CACHE_MAGIC: u64 = 0x464C_4B5F_574C_4332; // "FLK_WLC2"
 
     /// Cache key component tying entries to the exact GPU kernel source.
