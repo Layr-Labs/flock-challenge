@@ -156,30 +156,32 @@ unsafe fn reduce_wide_q(value: WideNeon) -> core::arch::aarch64::uint64x2_t {
 #[cfg(target_arch = "aarch64")]
 #[inline(always)]
 unsafe fn fold_row_q(
-    table_data: *const u8,
+    table_data: *const F128,
     bytes_ptr: *const u8,
 ) -> core::arch::aarch64::uint64x2_t {
     use core::arch::aarch64::*;
     unsafe {
-        const STRIDE: usize = 256 * 16;
+        // Preserve the F128 element type through address formation. On
+        // AArch64 this lets LLVM select `ldr q, [base, index, lsl #4]`
+        // directly instead of shifting and masking a byte offset before
+        // every one of these hot table loads.
+        const STRIDE: usize = 256;
         let entry = |chunk: usize| {
-            table_data.add(
-                chunk * STRIDE + (*bytes_ptr.add(chunk)) as usize * core::mem::size_of::<F128>(),
-            )
+            table_data.add(chunk * STRIDE + (*bytes_ptr.add(chunk)) as usize)
         };
         let a = xor3_u64(
-            vreinterpretq_u64_u8(vld1q_u8(entry(0))),
-            vreinterpretq_u64_u8(vld1q_u8(entry(1))),
-            vreinterpretq_u64_u8(vld1q_u8(entry(2))),
+            vld1q_u64(entry(0).cast::<u64>()),
+            vld1q_u64(entry(1).cast::<u64>()),
+            vld1q_u64(entry(2).cast::<u64>()),
         );
         let b = xor3_u64(
-            vreinterpretq_u64_u8(vld1q_u8(entry(3))),
-            vreinterpretq_u64_u8(vld1q_u8(entry(4))),
-            vreinterpretq_u64_u8(vld1q_u8(entry(5))),
+            vld1q_u64(entry(3).cast::<u64>()),
+            vld1q_u64(entry(4).cast::<u64>()),
+            vld1q_u64(entry(5).cast::<u64>()),
         );
         let c = veorq_u64(
-            vreinterpretq_u64_u8(vld1q_u8(entry(6))),
-            vreinterpretq_u64_u8(vld1q_u8(entry(7))),
+            vld1q_u64(entry(6).cast::<u64>()),
+            vld1q_u64(entry(7).cast::<u64>()),
         );
         xor3_u64(a, b, c)
     }
@@ -191,7 +193,7 @@ unsafe fn fold_row_q(
 #[cfg(target_arch = "aarch64")]
 #[inline(always)]
 unsafe fn fold_four_row_codes_q(
-    table_data: *const u8,
+    table_data: *const F128,
     row0: u64,
     row1: u64,
     row2: u64,
@@ -204,16 +206,12 @@ unsafe fn fold_four_row_codes_q(
 ) {
     use core::arch::aarch64::*;
     unsafe {
-        const STRIDE: usize = 256 * 16;
+        const STRIDE: usize = 256;
         let load = |row: u64, chunk: usize| {
             let shift = 8 * chunk;
             let offset = chunk * STRIDE;
             let index = ((row >> shift) & 0xff) as usize;
-            vld1q_u64(
-                table_data
-                    .add(offset + index * core::mem::size_of::<F128>())
-                    .cast::<u64>(),
-            )
+            vld1q_u64(table_data.add(offset + index).cast::<u64>())
         };
 
         // Retain the four independent row streams while consuming two new
@@ -241,7 +239,7 @@ unsafe fn fold_four_row_codes_q(
 #[cfg(target_arch = "aarch64")]
 #[inline(always)]
 unsafe fn fold_two_row_codes_q(
-    table_data: *const u8,
+    table_data: *const F128,
     row0: u64,
     row1: u64,
 ) -> (
@@ -250,16 +248,12 @@ unsafe fn fold_two_row_codes_q(
 ) {
     use core::arch::aarch64::*;
     unsafe {
-        const STRIDE: usize = 256 * 16;
+        const STRIDE: usize = 256;
         let load = |row: u64, chunk: usize| {
             let shift = 8 * chunk;
             let offset = chunk * STRIDE;
             let index = ((row >> shift) & 0xff) as usize;
-            vld1q_u64(
-                table_data
-                    .add(offset + index * core::mem::size_of::<F128>())
-                    .cast::<u64>(),
-            )
+            vld1q_u64(table_data.add(offset + index).cast::<u64>())
         };
         let mut acc0 = load(row0, 0);
         let mut acc1 = load(row1, 0);
@@ -289,7 +283,7 @@ unsafe fn is_zero_q(v: core::arch::aarch64::uint64x2_t) -> bool {
 #[cfg(target_arch = "aarch64")]
 #[target_feature(enable = "aes")]
 pub(crate) unsafe fn fold_round2_chunk_neon_unchecked_8(
-    table_data: *const u8,
+    table_data: *const F128,
     a_packed: *const u8,
     b_packed: *const u8,
     a_out: *mut F128,
@@ -376,7 +370,7 @@ pub(crate) unsafe fn fold_round2_chunk_neon_unchecked_8(
 #[cfg(target_arch = "aarch64")]
 #[target_feature(enable = "aes")]
 pub(crate) unsafe fn fold_round2_compact_chunk_neon_unchecked_8(
-    table_data: *const u8,
+    table_data: *const F128,
     a_packed: *const u8,
     b_packed: *const u8,
     anchors: *mut F128,
@@ -485,21 +479,17 @@ pub(crate) unsafe fn fold_round2_compact_chunk_neon_unchecked_8(
 #[cfg(target_arch = "aarch64")]
 #[inline(always)]
 unsafe fn lookup_lanes_q<const L: usize>(
-    table_data: *const u8,
+    table_data: *const F128,
     code: u64,
     lane0: usize,
 ) -> core::arch::aarch64::uint64x2_t {
     use core::arch::aarch64::*;
     unsafe {
-        const STRIDE: usize = 256 * 16;
+        const STRIDE: usize = 256;
         let load = |j: usize| {
             let lane = lane0 + j;
             let index = ((code >> (8 * lane)) & 0xff) as usize;
-            vld1q_u64(
-                table_data
-                    .add(lane * STRIDE + index * core::mem::size_of::<F128>())
-                    .cast::<u64>(),
-            )
+            vld1q_u64(table_data.add(lane * STRIDE + index).cast::<u64>())
         };
         let mut acc = load(0);
         let mut j = 1;
@@ -528,7 +518,7 @@ const STREAM_TILE_PAIRS: usize = 128;
 #[cfg(target_arch = "aarch64")]
 #[target_feature(enable = "aes")]
 pub(crate) unsafe fn fold_round2_compact_stream_chunk_neon<const L: usize>(
-    table_data: *const u8,
+    table_data: *const F128,
     a_packed: *const u8,
     b_packed: *const u8,
     anchors: *mut F128,
@@ -644,7 +634,7 @@ pub(crate) unsafe fn fold_round2_compact_stream_chunk_neon<const L: usize>(
 #[cfg(target_arch = "aarch64")]
 #[target_feature(enable = "aes")]
 pub(crate) unsafe fn fold_compact_stream_chunk_neon<const L: usize>(
-    scaled_table: *const u8,
+    scaled_table: *const F128,
     anchors: *const F128,
     deltas: *const u8,
     a_out: *mut F128,
@@ -761,7 +751,7 @@ pub(crate) unsafe fn fold_compact_stream_chunk_neon<const L: usize>(
 #[cfg(target_arch = "aarch64")]
 #[target_feature(enable = "aes")]
 pub(crate) unsafe fn fold_compact_chunk_neon_unchecked_8(
-    scaled_table: *const u8,
+    scaled_table: *const F128,
     anchors: *const F128,
     deltas: *const u8,
     a_out: *mut F128,
@@ -874,53 +864,42 @@ pub(crate) unsafe fn fold_compact_chunk_neon_unchecked_8(
 /// `n_chunks = 8` (the k_skip=6 protocol size). Returns the folded F128.
 ///
 /// The table is `Vec<F128>` with each entry 16-byte aligned (F128 is
-/// `repr(C, align(16))`), so every `vld1q_u8` lands on an aligned address.
+/// `repr(C, align(16))`), so every vector load lands on an aligned address.
 ///
 /// # Safety
-/// Caller must guarantee `table_data` points to ≥ 8 × 256 × 16 valid bytes
+/// Caller must guarantee `table_data` points to ≥ 8 × 256 valid F128 entries
 /// (an `n_chunks ≥ 8` table) and `bytes_ptr` to ≥ 8 valid bytes.
 #[cfg(all(target_arch = "aarch64", test))]
 #[inline(always)]
 pub(crate) unsafe fn fold_one_row_neon_unchecked_8(
-    table_data: *const u8,
+    table_data: *const F128,
     bytes_ptr: *const u8,
 ) -> F128 {
     use core::arch::aarch64::*;
     unsafe {
-        const STRIDE: usize = 256 * 16;
-        let mut acc = vld1q_u8(table_data.add((*bytes_ptr) as usize * 16));
-        acc = veorq_u8(
+        const STRIDE: usize = 256;
+        let mut acc = vld1q_u64(table_data.add((*bytes_ptr) as usize).cast::<u64>());
+        acc = veorq_u64(
             acc,
-            vld1q_u8(table_data.add(1 * STRIDE + (*bytes_ptr.add(1)) as usize * 16)),
+            vld1q_u64(
+                table_data
+                    .add(STRIDE + (*bytes_ptr.add(1)) as usize)
+                    .cast::<u64>(),
+            ),
         );
-        acc = veorq_u8(
-            acc,
-            vld1q_u8(table_data.add(2 * STRIDE + (*bytes_ptr.add(2)) as usize * 16)),
-        );
-        acc = veorq_u8(
-            acc,
-            vld1q_u8(table_data.add(3 * STRIDE + (*bytes_ptr.add(3)) as usize * 16)),
-        );
-        acc = veorq_u8(
-            acc,
-            vld1q_u8(table_data.add(4 * STRIDE + (*bytes_ptr.add(4)) as usize * 16)),
-        );
-        acc = veorq_u8(
-            acc,
-            vld1q_u8(table_data.add(5 * STRIDE + (*bytes_ptr.add(5)) as usize * 16)),
-        );
-        acc = veorq_u8(
-            acc,
-            vld1q_u8(table_data.add(6 * STRIDE + (*bytes_ptr.add(6)) as usize * 16)),
-        );
-        acc = veorq_u8(
-            acc,
-            vld1q_u8(table_data.add(7 * STRIDE + (*bytes_ptr.add(7)) as usize * 16)),
-        );
-        let acc_u64 = vreinterpretq_u64_u8(acc);
+        for chunk in 2..8 {
+            acc = veorq_u64(
+                acc,
+                vld1q_u64(
+                    table_data
+                        .add(chunk * STRIDE + (*bytes_ptr.add(chunk)) as usize)
+                        .cast::<u64>(),
+                ),
+            );
+        }
         F128 {
-            lo: vgetq_lane_u64::<0>(acc_u64),
-            hi: vgetq_lane_u64::<1>(acc_u64),
+            lo: vgetq_lane_u64::<0>(acc),
+            hi: vgetq_lane_u64::<1>(acc),
         }
     }
 }
