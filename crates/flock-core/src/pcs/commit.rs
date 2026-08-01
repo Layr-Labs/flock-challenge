@@ -259,6 +259,20 @@ pub fn commit(z_packed: &[F128], params: &PcsParams) -> (Commitment, ProverData)
     // `z_packed` into the lower half, and zero-fill JUST the upper half (the
     // RS-encoding zero coefficients that the NTT's first-layer butterfly will
     // read). Saves ~64 MB of memory writes at m=29 (~9 ms).
+    //
+    // Latched-GPU ranked exception: the Metal from-z graph reads only
+    // `z_packed` and homes the transformed codeword in the persistent shared
+    // staging buffer, so a pooled CPU codeword would be withdrawn and handed
+    // back untouched every timed prove. Pass the empty marker instead; every
+    // CPU fallback arm materializes a real buffer via `ensure_cpu_codeword`
+    // (stale contents are fine — this is the from-message path).
+    // `FLOCK_NO_CODEWORD_SKIP=1` restores the withdraw (same-binary control).
+    if use_ranked_from_message_commit(params)
+        && codeword_len == 2 * z_packed.len()
+        && crate::pcs::ranked_gpu_commit_latched_on()
+    {
+        return finalize_commit_impl(z_packed, Vec::new(), params, true);
+    }
     let codeword = crate::scratch::take_f128(codeword_len);
     commit_into(z_packed, params, codeword)
 }

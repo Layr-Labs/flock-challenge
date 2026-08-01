@@ -3176,65 +3176,12 @@ fn direct_ab_fuse_init_enabled() -> bool {
 /// single assignment per output slot — deleting the full L/4 zero-fill pass
 /// and the subsequent read-modify-write of `b_out` that used to add fold4(C).
 /// Algebra: `0 + D_0 + … + D_n + fold4(C)` becomes `D_0 + fold4(C) + D_1 + …`.
-/// Exact ranked direct-AB materialization can distribute its 256 independent
-/// 2 MiB blocks across the existing P/E stateful queue. Each worker retains
-/// one private fold table; the queue changes only block ownership.
-#[inline]
-fn use_ranked_direct_ab_hetero_materialize(
-    packed_len: usize,
-    block_len: usize,
-    claim_count: usize,
-    has_ordinary: bool,
-) -> bool {
-    cfg!(all(target_os = "macos", target_arch = "aarch64"))
-        && matches!(rayon::current_num_threads(), 2..=16)
-        && super::is_ranked_direct_fold2_lookahead_shape(
-            packed_len,
-            block_len,
-            claim_count,
-            has_ordinary,
-        )
-        && std::env::var_os("FLOCK_NO_DIRECT_AB_HETERO_MATERIALIZE").is_none()
-        && crate::epool::epool().is_some()
-}
-
 fn materialize_direct_ab_fold2(
     packed_witness: Vec<F128>,
     ordinary_basis: Vec<F128>,
     claims: &[super::ring_switch::DirectFold2Factors],
     r0: F128,
     r1: F128,
-) -> (Vec<F128>, Vec<F128>, SumcheckMessage, [F128; 6]) {
-    let block_len = claims
-        .first()
-        .expect("direct AB materialization requires a claim")
-        .eq_lo
-        .len();
-    let helper = use_ranked_direct_ab_hetero_materialize(
-        packed_witness.len(),
-        block_len,
-        claims.len(),
-        !ordinary_basis.is_empty(),
-    )
-    .then(crate::epool::epool)
-    .flatten();
-    materialize_direct_ab_fold2_with_helper(
-        packed_witness,
-        ordinary_basis,
-        claims,
-        r0,
-        r1,
-        helper,
-    )
-}
-
-fn materialize_direct_ab_fold2_with_helper(
-    packed_witness: Vec<F128>,
-    ordinary_basis: Vec<F128>,
-    claims: &[super::ring_switch::DirectFold2Factors],
-    r0: F128,
-    r1: F128,
-    helper: Option<&rayon::ThreadPool>,
 ) -> (Vec<F128>, Vec<F128>, SumcheckMessage, [F128; 6]) {
     use rayon::prelude::*;
 
@@ -3274,21 +3221,13 @@ fn materialize_direct_ab_fold2_with_helper(
     let fuse_init = direct_ab_fuse_init_enabled();
     let mut folded_f = crate::scratch::take_f128(out_len);
     let mut folded_b = crate::scratch::take_f128(out_len);
-    type FoldStats = ((F128, F128), [F128; 6]);
-    fn empty_stats() -> FoldStats {
-        ((F128::ZERO, F128::ZERO), [F128::ZERO; 6])
-    }
-    fn merge_stats(
-        ((x0, x2), mut xc): FoldStats,
-        ((y0, y2), yc): FoldStats,
-    ) -> FoldStats {
-        for (x, y) in xc.iter_mut().zip(yc) {
-            *x += y;
-        }
-        ((x0 + y0, x2 + y2), xc)
-    }
-    let fold_block =
-        |scratch: &mut Vec<F128>, block: usize, b_out: &mut [F128], f_out: &mut [F128]| {
+    let stats = folded_b
+        .par_chunks_mut(block_len)
+        .zip(folded_f.par_chunks_mut(block_len))
+        .enumerate()
+        .map_init(
+            || vec![F128::ZERO; super::ring_switch::FOLD_TABLE_LEN],
+            |scratch, (block, (b_out, f_out))| {
                 let start = 4 * block * block_len;
                 let f_in = &packed_witness[start..start + 4 * block_len];
                 let b_in: &[F128] = if has_ordinary {
@@ -3384,53 +3323,17 @@ fn materialize_direct_ab_fold2_with_helper(
                     b_out,
                     ranked_lookahead_neon,
                 )
-            };
-    let stats = if let Some(helper) = helper {
-        let n_blocks = out_len / block_len;
-        let mut partials = vec![empty_stats(); n_blocks];
-        let b_base = crate::epool::SyncPtr(folded_b.as_mut_ptr());
-        let f_base = crate::epool::SyncPtr(folded_f.as_mut_ptr());
-        let partials_base = crate::epool::SyncPtr(partials.as_mut_ptr());
-        crate::epool::run_chunks_with_helper_stateful(
-            n_blocks,
-            &|| vec![F128::ZERO; super::ring_switch::FOLD_TABLE_LEN],
-            &|scratch, block| {
-                // SAFETY: the queue claims each block exactly once. That
-                // block owns disjoint folded-f/folded-b output ranges and
-                // exactly one partial slot until the synchronous join.
-                unsafe {
-                    let b_out = core::slice::from_raw_parts_mut(
-                        b_base.ptr().add(block * block_len),
-                        block_len,
-                    );
-                    let f_out = core::slice::from_raw_parts_mut(
-                        f_base.ptr().add(block * block_len),
-                        block_len,
-                    );
-                    partials_base
-                        .ptr()
-                        .add(block)
-                        .write(fold_block(scratch, block, b_out, f_out));
-                }
             },
-            Some(helper),
+        )
+        .reduce(
+            || ((F128::ZERO, F128::ZERO), [F128::ZERO; 6]),
+            |((x0, x2), mut xc), ((y0, y2), yc)| {
+                for (x, y) in xc.iter_mut().zip(yc) {
+                    *x += y;
+                }
+                ((x0 + y0, x2 + y2), xc)
+            },
         );
-        partials.into_iter().fold(empty_stats(), merge_stats)
-    } else {
-        // Preserve the frontier scheduler when the exact ranked P/E gate is
-        // closed or its explicit kill switch is set.
-        folded_b
-            .par_chunks_mut(block_len)
-            .zip(folded_f.par_chunks_mut(block_len))
-            .enumerate()
-            .map_init(
-                || vec![F128::ZERO; super::ring_switch::FOLD_TABLE_LEN],
-                |scratch, (block, (b_out, f_out))| {
-                    fold_block(scratch, block, b_out, f_out)
-                },
-            )
-            .reduce(empty_stats, merge_stats)
-    };
     crate::scratch::give_f128(packed_witness);
     crate::scratch::give_f128(ordinary_basis);
     (
@@ -6089,13 +5992,13 @@ mod tests {
                 .wrapping_add(1442695040888963407);
             F128::new(state, state.rotate_left(29))
         };
-        let n = 1usize << 10;
+        let n = 1usize << 8;
         let f: Vec<F128> = (0..n).map(|_| random()).collect();
         let ordinary_c: Vec<F128> = (0..n).map(|_| random()).collect();
         let r0 = random();
         let r1 = random();
 
-        let suffix: Vec<F128> = (0..10).map(|_| random()).collect();
+        let suffix: Vec<F128> = (0..8).map(|_| random()).collect();
         let gamma = random();
         let scaled_rdp: Vec<F128> = build_eq_table(
             &(0..crate::pcs::LOG_PACKING)
@@ -6114,7 +6017,7 @@ mod tests {
             .zip(direct_full)
             .map(|(&ordinary, direct)| ordinary + direct)
             .collect();
-        let (eq_lo, eq_hi) = super::super::ring_switch::build_eq_split(&suffix[2..], 4);
+        let (eq_lo, eq_hi) = super::super::ring_switch::build_eq_split(&suffix[2..], 3);
         let direct = vec![super::super::ring_switch::DirectFold2Factors {
             eq_lo,
             eq_hi,
@@ -6133,19 +6036,8 @@ mod tests {
             &mut want_f,
             &mut want_b,
         );
-        let helper = rayon::ThreadPoolBuilder::new()
-            .num_threads(2)
-            .build()
-            .unwrap();
         let (got_f, got_b, got_msg, got_coeffs) =
-            super::materialize_direct_ab_fold2_with_helper(
-                f,
-                ordinary_c,
-                &direct,
-                r0,
-                r1,
-                Some(&helper),
-            );
+            super::materialize_direct_ab_fold2(f, ordinary_c, &direct, r0, r1);
         assert_eq!(got_f, want_f);
         assert_eq!(got_b, want_b);
         assert_eq!(got_msg, want_msg);

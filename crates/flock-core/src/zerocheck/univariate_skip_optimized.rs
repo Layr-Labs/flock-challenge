@@ -322,41 +322,139 @@ pub fn precompute_round1_ab_inner_packed_padded(
     inv_table: &InvNttTableByteSingleGf8,
     padding: &PaddingSpec,
 ) -> Round1AbInner {
+    let mut pre = Round1AbPrecompute::begin(a_packed.len(), m, k_skip, inv_table, padding);
+    let n = pre.n_outer_chunks();
+    pre.run_outer_range(a_packed, b_packed, inv_table, 0, n);
+    pre.finish()
+}
+
+/// Incremental form of [`precompute_round1_ab_inner_packed_padded`]: the
+/// caller runs disjoint `x_outer` chunk ranges in any order/concurrency and
+/// calls [`Self::finish`] once every chunk has run exactly once. Each chunk
+/// `x_outer` reads ONLY bytes `[x_outer * 8192, (x_outer + 1) * 8192)` of
+/// `a_packed` and `b_packed`, which is what makes running the transform over
+/// a completed witness PREFIX (while later blocks are still being generated)
+/// sound. Output is bit-identical to the one-shot form for any schedule.
+pub struct Round1AbPrecompute {
+    storage: Vec<F128>,
+    total_bytes: usize,
+    within_outer_mask: usize,
+    b_med_counts: Vec<u8>,
+    blake3_static_layout: bool,
+    static_b_context: Option<kernels::StaticBContext>,
+}
+
+impl Round1AbPrecompute {
+    pub const OUTER_BYTES: usize = (1 << N_MEDIUM) * 64;
+
+    pub fn begin(
+        total_bytes: usize,
+        m: usize,
+        k_skip: usize,
+        inv_table: &InvNttTableByteSingleGf8,
+        padding: &PaddingSpec,
+    ) -> Self {
+        assert_eq!(k_skip, K_SKIP, "optimized variant is k_skip=6 only");
+        assert!(
+            m >= k_skip + N_INNER,
+            "m must be ≥ k_skip + N_INNER ({}) for the shift_reduce optimization",
+            k_skip + N_INNER
+        );
+        assert_eq!(total_bytes, (1usize << m) / 8);
+        assert_eq!(inv_table.k, k_skip);
+        assert_eq!(total_bytes % core::mem::size_of::<F128>(), 0);
+        debug_assert_eq!(Self::OUTER_BYTES, (1 << N_INNER) * N_CHUNKS);
+
+        let (within_outer_mask, b_med_counts) = build_b_med_counts(padding);
+        // The BLAKE3 R1CS has two 8192-bit windows per 16384-bit block.
+        // Besides the full all-ones B rows at b_med 0/1 and the single-K0
+        // tail, two mixed rows have fixed one-valued K subsets: K0..1 at
+        // first-window b_med 2 and K4..7 at second-window b_med 13. Restrict
+        // runtime sniffing to these five candidates; every other block enters
+        // the generic kernel directly.
+        let blake3_static_layout = padding.k_log == 14 && padding.useful_bits_per_block == 15_409;
+        let static_b_context = kernels::prepare_static_b_context(inv_table, blake3_static_layout);
+
+        // Reuse an A-sized resident F128 allocation from the prover scratch
+        // pool. Treating it as bytes is valid because every byte is written
+        // by the chunk runs before the storage is read (including explicit
+        // zero writes for padding holes).
+        let storage = crate::scratch::take_f128(total_bytes / core::mem::size_of::<F128>());
+        Self {
+            storage,
+            total_bytes,
+            within_outer_mask,
+            b_med_counts,
+            blake3_static_layout,
+            static_b_context,
+        }
+    }
+
+    pub fn n_outer_chunks(&self) -> usize {
+        self.total_bytes / Self::OUTER_BYTES
+    }
+
+    /// Run chunks `x_outer ∈ [start, end)`. Requires bytes
+    /// `[start * 8192, end * 8192)` of BOTH inputs to be fully written.
+    /// Ranges must be disjoint across calls; concurrency across disjoint
+    /// ranges is fine (each writes only its own storage window).
+    pub fn run_outer_range(
+        &mut self,
+        a_packed: &[u8],
+        b_packed: &[u8],
+        inv_table: &InvNttTableByteSingleGf8,
+        start: usize,
+        end: usize,
+    ) {
+        // SAFETY: disjoint-range contract above; identical to the mutable
+        // sub-slice of `storage`.
+        let out_bytes: &mut [u8] = unsafe {
+            core::slice::from_raw_parts_mut(
+                (self.storage.as_mut_ptr() as *mut u8).add(start * Self::OUTER_BYTES),
+                (end - start) * Self::OUTER_BYTES,
+            )
+        };
+        run_ab_outer_chunks(
+            out_bytes,
+            start,
+            a_packed,
+            b_packed,
+            inv_table,
+            self.within_outer_mask,
+            &self.b_med_counts,
+            self.blake3_static_layout,
+            self.static_b_context,
+        );
+    }
+
+    pub fn finish(self) -> Round1AbInner {
+        Round1AbInner {
+            storage: self.storage,
+        }
+    }
+}
+
+/// Transform outer chunks `[first_outer, first_outer + out_bytes/8192)` into
+/// `out_bytes`. Factored out of the one-shot precompute so range and one-shot
+/// callers share the exact per-chunk code (bit-identical outputs).
+#[allow(clippy::too_many_arguments)]
+fn run_ab_outer_chunks(
+    out_bytes: &mut [u8],
+    first_outer: usize,
+    a_packed: &[u8],
+    b_packed: &[u8],
+    inv_table: &InvNttTableByteSingleGf8,
+    within_outer_mask: usize,
+    b_med_counts: &[u8],
+    blake3_static_layout: bool,
+    static_b_context: Option<kernels::StaticBContext>,
+) {
     use rayon::prelude::*;
-
-    assert_eq!(k_skip, K_SKIP, "optimized variant is k_skip=6 only");
-    assert!(
-        m >= k_skip + N_INNER,
-        "m must be ≥ k_skip + N_INNER ({}) for the shift_reduce optimization",
-        k_skip + N_INNER
-    );
-    let total_bytes = (1usize << m) / 8;
-    assert_eq!(a_packed.len(), total_bytes);
-    assert_eq!(b_packed.len(), total_bytes);
-    assert_eq!(inv_table.k, k_skip);
-    assert_eq!(total_bytes % core::mem::size_of::<F128>(), 0);
-
-    let (within_outer_mask, b_med_counts) = build_b_med_counts(padding);
-    // The BLAKE3 R1CS has two 8192-bit windows per 16384-bit block. Besides
-    // the full all-ones B rows at b_med 0/1 and the single-K0 tail, two mixed
-    // rows have fixed one-valued K subsets: K0..1 at first-window b_med 2 and
-    // K4..7 at second-window b_med 13. Restrict runtime sniffing to these five
-    // candidates; every other block enters the generic kernel directly.
-    let blake3_static_layout = padding.k_log == 14 && padding.useful_bits_per_block == 15_409;
-    let static_b_context = kernels::prepare_static_b_context(inv_table, blake3_static_layout);
-    const OUTER_BYTES: usize = (1 << N_MEDIUM) * 64;
-    debug_assert_eq!(OUTER_BYTES, (1 << N_INNER) * N_CHUNKS);
-
-    // Reuse an A-sized resident F128 allocation from the prover scratch pool.
-    // Treating it as bytes is valid because every byte is written below before
-    // the storage is read (including explicit zero writes for padding holes).
-    let mut storage = crate::scratch::take_f128(total_bytes / core::mem::size_of::<F128>());
-    let out_bytes: &mut [u8] =
-        unsafe { core::slice::from_raw_parts_mut(storage.as_mut_ptr() as *mut u8, total_bytes) };
-
+    const OUTER_BYTES: usize = Round1AbPrecompute::OUTER_BYTES;
     out_bytes
         .par_chunks_mut(OUTER_BYTES)
         .enumerate()
+        .map(|(i, c)| (first_outer + i, c))
         .for_each_init(
             || ([F8::ZERO; ELL], [F8::ZERO; ELL]),
             |(a_col, b_col), (x_outer, out_outer)| {
@@ -400,8 +498,6 @@ pub fn precompute_round1_ab_inner_packed_padded(
                 out_outer[n_b_med * 64..].fill(0);
             },
         );
-
-    Round1AbInner { storage }
 }
 
 // ---------------------------------------------------------------------------

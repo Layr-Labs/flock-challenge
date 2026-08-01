@@ -477,6 +477,203 @@ where
     (z, a, b, z_lincheck)
 }
 
+/// [`drive_witness_packed_and_lincheck_full_write`] fused with the
+/// challenge-independent zerocheck round-1 AB precompute, software-pipelined:
+/// witness groups run in `N_STAGES` sequential stages, and while stage `s+1`
+/// generates, the AB transform consumes stage `s`'s completed `a`/`b` bytes
+/// under the same `rayon::join`. The AB arm therefore leaves the
+/// commit-phase join entirely — the arm the split auto-tuner balances the
+/// GPU/CPU commit against becomes empty.
+///
+/// Bit-exactness: the witness body is the exact full-write group body of the
+/// generic driver, and the AB transform is a pure per-8KiB-chunk function of
+/// `a`/`b` (`Round1AbPrecompute` — output independent of chunk schedule).
+/// Borrow safety is plain `split_at_mut`: the AB arm reads the completed
+/// PREFIX (absolute byte offsets are preserved because a prefix starts at
+/// 0), the witness arm writes the disjoint current-stage window.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn drive_witness_full_write_with_ab_pipeline<S: Sync, F>(
+    initial_states: &[S],
+    padding: &S,
+    n_blocks_log: usize,
+    k_log: usize,
+    stripe_useful_bits: usize,
+    per_block: F,
+    m: usize,
+    ab_padding: &flock_core::zerocheck::PaddingSpec,
+) -> (
+    (Vec<F128>, Vec<F128>, Vec<F128>, Vec<u8>),
+    flock_core::zerocheck::univariate_skip_optimized::Round1AbInner,
+)
+where
+    F: Fn(&S, &mut [u64], &mut [u64], &mut [u64]) + Sync,
+{
+    use flock_core::zerocheck::univariate_skip_optimized::Round1AbPrecompute;
+
+    let k = 1usize << k_log;
+    let f128_per_block = k / 128;
+    let u64_per_block = k / 64;
+    let n_total = 1usize << n_blocks_log;
+    let n_blocks = initial_states.len();
+    assert!(stripe_useful_bits <= k);
+    assert!(n_blocks <= n_total);
+    assert!(n_total >= 8 && n_total.is_multiple_of(8));
+
+    let total_f128 = n_total * f128_per_block;
+    let total_bytes = total_f128 * core::mem::size_of::<F128>();
+    let group_f128 = 8 * f128_per_block;
+    let group_bytes = group_f128 * core::mem::size_of::<F128>();
+    assert_eq!(
+        group_bytes % Round1AbPrecompute::OUTER_BYTES,
+        0,
+        "witness group must cover whole AB outer chunks"
+    );
+    let chunks_per_group = group_bytes / Round1AbPrecompute::OUTER_BYTES;
+    let n_groups = n_total / 8;
+
+    let inv_table = flock_core::ntt::InvNttTableByteSingleGf8::cached_standard_k6();
+    let mut pre = Round1AbPrecompute::begin(
+        total_bytes,
+        m,
+        flock_core::zerocheck::K_SKIP,
+        inv_table,
+        ab_padding,
+    );
+
+    let mut z = flock_core::scratch::take_f128(total_f128);
+    let mut a = flock_core::scratch::take_f128(total_f128);
+    let mut b = flock_core::scratch::take_f128(total_f128);
+    let mut z_lincheck = flock_core::scratch::take_u8((n_total / 8) * k);
+
+    // The exact full-write group body of the generic driver, over groups
+    // [group_lo, group_lo + <slice groups>) of the passed stage windows.
+    let run_witness_stage = |z_s: &mut [F128],
+                             a_s: &mut [F128],
+                             b_s: &mut [F128],
+                             zl_s: &mut [u8],
+                             group_lo: usize| {
+        use rayon::prelude::*;
+        z_s.par_chunks_mut(group_f128)
+            .zip(a_s.par_chunks_mut(group_f128))
+            .zip(b_s.par_chunks_mut(group_f128))
+            .zip(zl_s.par_chunks_mut(k))
+            .with_max_len(256)
+            .enumerate()
+            .for_each(|(gi, (((z_grp, a_grp), b_grp), stripe))| {
+                let g = group_lo + gi;
+                for k_in in 0..8 {
+                    let global_idx = 8 * g + k_in;
+                    let init: &S = if global_idx < n_blocks {
+                        &initial_states[global_idx]
+                    } else {
+                        padding
+                    };
+                    let z_chunk = &mut z_grp[k_in * f128_per_block..(k_in + 1) * f128_per_block];
+                    let a_chunk = &mut a_grp[k_in * f128_per_block..(k_in + 1) * f128_per_block];
+                    let b_chunk = &mut b_grp[k_in * f128_per_block..(k_in + 1) * f128_per_block];
+                    // SAFETY: F128 is `repr(C, align(16))` with two `u64`
+                    // fields in LE order — same byte layout as a u64 pair.
+                    let z_u64: &mut [u64] = unsafe {
+                        std::slice::from_raw_parts_mut(
+                            z_chunk.as_mut_ptr() as *mut u64,
+                            z_chunk.len() * 2,
+                        )
+                    };
+                    let a_u64: &mut [u64] = unsafe {
+                        std::slice::from_raw_parts_mut(
+                            a_chunk.as_mut_ptr() as *mut u64,
+                            a_chunk.len() * 2,
+                        )
+                    };
+                    let b_u64: &mut [u64] = unsafe {
+                        std::slice::from_raw_parts_mut(
+                            b_chunk.as_mut_ptr() as *mut u64,
+                            b_chunk.len() * 2,
+                        )
+                    };
+                    per_block(init, z_u64, a_u64, b_u64);
+                }
+
+                // Bit-transpose 8 z chunks into the lincheck stripe.
+                let z_u64_all: &[u64] = unsafe {
+                    std::slice::from_raw_parts(z_grp.as_ptr() as *const u64, z_grp.len() * 2)
+                };
+                let useful_words = stripe_useful_bits.div_ceil(64);
+                for i in 0..useful_words {
+                    let lanes: [u64; 8] = [
+                        z_u64_all[0 * u64_per_block + i],
+                        z_u64_all[u64_per_block + i],
+                        z_u64_all[2 * u64_per_block + i],
+                        z_u64_all[3 * u64_per_block + i],
+                        z_u64_all[4 * u64_per_block + i],
+                        z_u64_all[5 * u64_per_block + i],
+                        z_u64_all[6 * u64_per_block + i],
+                        z_u64_all[7 * u64_per_block + i],
+                    ];
+                    transpose_8_u64s_to_64_bytes(&lanes, &mut stripe[i * 64..i * 64 + 64]);
+                }
+                stripe[useful_words * 64..].fill(0);
+            });
+    };
+
+    // Stage layout: N_STAGES equal group ranges (n_total is a power of two
+    // ≥ 8, so groups split evenly for any power-of-two stage count ≤ groups).
+    const N_STAGES: usize = 8;
+    let n_stages = N_STAGES.min(n_groups);
+    let groups_per_stage = n_groups / n_stages;
+    debug_assert_eq!(n_groups % n_stages, 0);
+
+    let as_bytes = |v: &[F128]| -> &[u8] {
+        unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, std::mem::size_of_val(v)) }
+    };
+
+    for s in 0..n_stages {
+        let wit_lo_f128 = s * groups_per_stage * group_f128;
+        let wit_hi_f128 = (s + 1) * groups_per_stage * group_f128;
+        // Split each array at the stage boundary: `done` is the completed
+        // prefix (readable by the AB arm), `rest` heads with this stage's
+        // write window.
+        let (z_done_rest, _) = (&mut z[..], ());
+        let (_, z_rest) = z_done_rest.split_at_mut(wit_lo_f128);
+        let z_stage = &mut z_rest[..wit_hi_f128 - wit_lo_f128];
+        let (a_done, a_rest) = a.split_at_mut(wit_lo_f128);
+        let a_stage = &mut a_rest[..wit_hi_f128 - wit_lo_f128];
+        let (b_done, b_rest) = b.split_at_mut(wit_lo_f128);
+        let b_stage = &mut b_rest[..wit_hi_f128 - wit_lo_f128];
+        let zl_stage =
+            &mut z_lincheck[s * groups_per_stage * k..(s + 1) * groups_per_stage * k];
+
+        let ab_lo = (s.saturating_sub(1)) * groups_per_stage * chunks_per_group;
+        let ab_hi = s * groups_per_stage * chunks_per_group;
+        let pre_ref = &mut pre;
+        rayon::join(
+            || run_witness_stage(z_stage, a_stage, b_stage, zl_stage, s * groups_per_stage),
+            move || {
+                if s > 0 {
+                    pre_ref.run_outer_range(
+                        as_bytes(a_done),
+                        as_bytes(b_done),
+                        inv_table,
+                        ab_lo,
+                        ab_hi,
+                    );
+                }
+            },
+        );
+    }
+    // Final stage's AB chunks (and everything if n_stages == 1).
+    let n_chunks = pre.n_outer_chunks();
+    pre.run_outer_range(
+        as_bytes(&a),
+        as_bytes(&b),
+        inv_table,
+        (n_stages - 1) * groups_per_stage * chunks_per_group,
+        n_chunks,
+    );
+
+    ((z, a, b, z_lincheck), pre.finish())
+}
+
 /// Sort `v` and remove pairs of duplicates (GF(2) cancellation). Keeps R1CS
 /// rows in canonical (sorted, square-free) form.
 pub(crate) fn xor_dedup(mut v: Vec<usize>) -> Vec<usize> {

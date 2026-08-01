@@ -1635,6 +1635,47 @@ fn generate_witness_with_ab_packed_and_lincheck_rate2_codeword(
     generate_witness_with_ab_packed_and_lincheck_impl(blocks, n_blocks_log, Some(codeword))
 }
 
+/// [`generate_witness_with_ab_packed_and_lincheck`] software-pipelined with
+/// the challenge-independent zerocheck round-1 AB transform: witness groups
+/// run in stages and the AB transform consumes each completed stage's a/b
+/// bytes while the next stage generates. Ranked from-message path only.
+pub(crate) fn generate_witness_with_ab_pipeline(
+    blocks: &[Compression],
+    n_blocks_log: usize,
+    m: usize,
+    ab_padding: &flock_core::zerocheck::PaddingSpec,
+) -> (
+    (
+        Vec<flock_core::field::F128>,
+        Vec<flock_core::field::F128>,
+        Vec<flock_core::field::F128>,
+        Vec<u8>,
+    ),
+    flock_core::zerocheck::univariate_skip_optimized::Round1AbInner,
+) {
+    let padding: Compression = ([0u32; 8], [0u32; 16], 0u64, 0u32, 0u32);
+    let stripe_useful_bits = if std::env::var_os("FLOCK_FULL_STRIPE").is_some() {
+        K
+    } else {
+        USEFUL_BITS
+    };
+    let per_block =
+        |block: &Compression, z_u64: &mut [u64], a_u64: &mut [u64], b_u64: &mut [u64]| {
+            let (cv, m, t, bl, fl) = block;
+            build_block_witness_ab_stream_into(cv, m, *t, *bl, *fl, z_u64, a_u64, b_u64);
+        };
+    super::common::drive_witness_full_write_with_ab_pipeline(
+        blocks,
+        &padding,
+        n_blocks_log,
+        K_LOG,
+        stripe_useful_bits,
+        per_block,
+        m,
+        ab_padding,
+    )
+}
+
 fn generate_witness_with_ab_packed_and_lincheck_impl(
     blocks: &[Compression],
     n_blocks_log: usize,
@@ -1948,9 +1989,58 @@ impl Blake3Setup {
             // `FLOCK_NO_NTT_FROM_MSG=1` restores the hot-codeword replicate
             // path below as the exact A/B control.
             if flock_core::pcs::use_ranked_from_message_commit(&self.pcs_params) {
-                let codeword = flock_core::scratch::take_f128(self.pcs_params.codeword_len_f128());
+                // With the GPU latch On, the Metal graph reads only z_packed
+                // and homes the codeword in its persistent staging buffer —
+                // the pooled 1 GiB scratch would be withdrawn and returned
+                // untouched. Skip it (pcs::commit passes the empty marker;
+                // any CPU fallback re-materializes lazily).
+                let codeword = if flock_core::pcs::ranked_gpu_commit_latched_on() {
+                    None
+                } else {
+                    Some(flock_core::scratch::take_f128(
+                        self.pcs_params.codeword_len_f128(),
+                    ))
+                };
                 let cpu_wit = phase_timing.then(crate::prover::process_cpu_ms);
                 let t_wit = std::time::Instant::now();
+                // The zerocheck round-1 AB transform is challenge-independent
+                // (a pure per-8KiB-chunk function of a/b), so pipeline it
+                // under the witness stages: the commit join's precompute arm
+                // — the arm the hybrid-split auto-tuner balances against —
+                // becomes empty. `FLOCK_NO_WITGEN_AB_PIPELINE=1` restores
+                // the unpipelined driver + in-join precompute exactly.
+                let pipeline_ab =
+                    std::env::var_os("FLOCK_NO_WITGEN_AB_PIPELINE").is_none();
+                if pipeline_ab {
+                    let ((z_packed, a_packed_f128, b_packed_f128, z_packed_lincheck), ab_inner) =
+                        generate_witness_with_ab_pipeline(
+                            blocks,
+                            self.n_blocks_log(),
+                            self.r1cs.m,
+                            &self.r1cs.padding_spec(),
+                        );
+                    if phase_timing {
+                        let wall = t_wit.elapsed().as_secs_f64() * 1e3;
+                        let cpu = crate::prover::process_cpu_ms() - cpu_wit.unwrap_or(0.0);
+                        eprintln!(
+                            "[phase-timing] witgen+ab-pipeline (from-msg): {wall:.2} ms cpu={cpu:.1} util={:.1}",
+                            cpu / wall
+                        );
+                    }
+                    let lc_circuit = self.lincheck_circuit();
+                    return crate::prover::prove_fast_ligerito_from_witness_with_ab(
+                        &self.r1cs,
+                        &self.pcs_params,
+                        z_packed,
+                        a_packed_f128,
+                        b_packed_f128,
+                        z_packed_lincheck,
+                        lc_circuit,
+                        codeword,
+                        ab_inner,
+                        challenger,
+                    );
+                }
                 let (z_packed, a_packed_f128, b_packed_f128, z_packed_lincheck) =
                     self.generate_witness_ab(blocks);
                 if phase_timing {
@@ -1970,7 +2060,7 @@ impl Blake3Setup {
                     b_packed_f128,
                     z_packed_lincheck,
                     lc_circuit,
-                    Some(codeword),
+                    codeword,
                     challenger,
                 );
             }

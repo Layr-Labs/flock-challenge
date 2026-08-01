@@ -237,6 +237,42 @@ pub fn prove_fast_ligerito_from_witness<Ch: Challenger>(
         z_packed_lincheck,
         lincheck_circuit,
         commit_codeword,
+        None,
+        challenger,
+    )
+}
+
+/// [`prove_fast_ligerito_from_witness`] with the challenge-independent
+/// zerocheck round-1 AB transform ALREADY computed (the staged witness/AB
+/// pipeline produces it while later witness blocks are still generating).
+/// The commit phase then runs without its precompute join arm.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn prove_fast_ligerito_from_witness_with_ab<Ch: Challenger>(
+    r1cs: &BlockR1cs,
+    pcs_params: &PcsParams,
+    z_packed: Vec<F128>,
+    a_packed_f128: Vec<F128>,
+    b_packed_f128: Vec<F128>,
+    z_packed_lincheck: Vec<u8>,
+    lincheck_circuit: &dyn lincheck::LincheckCircuit,
+    prefaulted_codeword: Option<Vec<F128>>,
+    precomputed_ab: zerocheck::univariate_skip_optimized::Round1AbInner,
+    challenger: &mut Ch,
+) -> (R1csProofLigerito, Commitment, R1csClaim) {
+    let commit_codeword = match prefaulted_codeword {
+        Some(codeword) => CommitCodeword::NeedsReplication(codeword),
+        None => CommitCodeword::Allocate,
+    };
+    prove_fast_ligerito_from_witness_with_commit_codeword(
+        r1cs,
+        pcs_params,
+        z_packed,
+        a_packed_f128,
+        b_packed_f128,
+        z_packed_lincheck,
+        lincheck_circuit,
+        commit_codeword,
+        Some(precomputed_ab),
         challenger,
     )
 }
@@ -265,6 +301,7 @@ pub(crate) fn prove_fast_ligerito_from_preinitialized_codeword<Ch: Challenger>(
         z_packed_lincheck,
         lincheck_circuit,
         CommitCodeword::Preinitialized(codeword),
+        None,
         challenger,
     )
 }
@@ -279,6 +316,7 @@ fn prove_fast_ligerito_from_witness_with_commit_codeword<Ch: Challenger>(
     z_packed_lincheck: Vec<u8>,
     lincheck_circuit: &dyn lincheck::LincheckCircuit,
     commit_codeword: CommitCodeword,
+    precomputed_ab: Option<zerocheck::univariate_skip_optimized::Round1AbInner>,
     challenger: &mut Ch,
 ) -> (R1csProofLigerito, Commitment, R1csClaim) {
     let lig_config = pcs_params
@@ -304,6 +342,7 @@ fn prove_fast_ligerito_from_witness_with_commit_codeword<Ch: Challenger>(
         z_packed_lincheck,
         lincheck_circuit,
         commit_codeword,
+        precomputed_ab,
         challenger,
     );
 
@@ -392,10 +431,29 @@ fn commit_with_round1_ab_precompute(
     pcs_params: &PcsParams,
     padding: &zerocheck::PaddingSpec,
     commit_codeword: CommitCodeword,
+    precomputed_ab: Option<zerocheck::univariate_skip_optimized::Round1AbInner>,
 ) -> (
     (Commitment, pcs::ProverData),
     zerocheck::univariate_skip_optimized::Round1AbInner,
 ) {
+    // Pipelined path: the AB transform was already produced under the
+    // witness stages, so the join's precompute arm is empty. Record a ~zero
+    // arm wall so the hybrid-split warmup sweep sizes its contention
+    // emulation to match the join it will actually run against.
+    if let Some(ab) = precomputed_ab {
+        let commit_result = match commit_codeword {
+            CommitCodeword::Allocate => pcs::commit(z_packed, pcs_params),
+            CommitCodeword::NeedsReplication(buf) => pcs::commit_into(z_packed, pcs_params, buf),
+            CommitCodeword::Preinitialized(buf) => {
+                pcs::commit_preinitialized(z_packed, buf, pcs_params)
+            }
+        };
+        flock_core::gpu_commit::note_precompute_branch_wall_ms(0.0);
+        if std::env::var_os("FLOCK_PHASE_TIMING").is_some() {
+            eprintln!("[phase-timing] ab-precompute branch wall: 0.00 ms (pipelined under witgen)");
+        }
+        return (commit_result, ab);
+    }
     let as_bytes = |v: &[F128]| -> &[u8] {
         unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, std::mem::size_of_val(v)) }
     };
@@ -457,6 +515,7 @@ pub fn prove_fast_core<Ch: Challenger>(
         z_packed_lincheck,
         lincheck_circuit,
         CommitCodeword::Allocate,
+        None,
         challenger,
     )
 }
@@ -491,6 +550,7 @@ pub fn prove_fast_core_with_codeword<Ch: Challenger>(
         z_packed_lincheck,
         lincheck_circuit,
         commit_codeword,
+        None,
         challenger,
     )
 }
@@ -505,6 +565,7 @@ fn prove_fast_core_with_commit_codeword<Ch: Challenger>(
     z_packed_lincheck: Vec<u8>,
     lincheck_circuit: &dyn lincheck::LincheckCircuit,
     commit_codeword: CommitCodeword,
+    precomputed_ab: Option<zerocheck::univariate_skip_optimized::Round1AbInner>,
     challenger: &mut Ch,
 ) -> ProveCore {
     let padding = r1cs.padding_spec();
@@ -518,6 +579,7 @@ fn prove_fast_core_with_commit_codeword<Ch: Challenger>(
         pcs_params,
         &padding,
         commit_codeword,
+        precomputed_ab,
     );
     if phase_timing {
         let wall = t_commit.elapsed().as_secs_f64() * 1e3;
@@ -775,6 +837,7 @@ fn prove_fast_ligerito_timed_with_commit_codeword<Ch: Challenger>(
         pcs_params,
         &padding,
         commit_codeword,
+        None,
     );
     t.commit_s = t0.elapsed().as_secs_f64();
     bind_statement(challenger, r1cs, &commitment);

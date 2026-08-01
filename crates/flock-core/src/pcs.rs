@@ -33,6 +33,17 @@ pub use commit::{
 pub use pack::{LOG_PACKING, pack_witness, unpack_witness};
 pub use ring_switch::{RingSwitchProof, SparseEqTensor};
 
+/// True iff the ranked GPU commit latch is On and the timed-path codeword
+/// skip is enabled: the latched Metal graph reads only `z_packed`, so the
+/// prover's witness driver skips withdrawing the 1 GiB hot-codeword scratch
+/// and [`commit`] passes the empty marker through to the GPU path (see the
+/// latched exception in [`commit`]). `FLOCK_NO_CODEWORD_SKIP=1` restores the
+/// incumbent withdraw-and-return behavior as the same-binary control.
+pub fn ranked_gpu_commit_latched_on() -> bool {
+    crate::gpu_commit::gpu_commit_latched_on()
+        && std::env::var_os("FLOCK_NO_CODEWORD_SKIP").is_none()
+}
+
 use crate::challenger::Challenger;
 use crate::field::F128;
 use crate::zerocheck::PaddingSpec;

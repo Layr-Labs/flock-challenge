@@ -185,6 +185,34 @@ pub(crate) fn precompute_branch_wall_ms() -> f64 {
     f64::from_bits(PRECOMPUTE_BRANCH_WALL_MS.load(std::sync::atomic::Ordering::Relaxed))
 }
 
+/// True iff the warmup latch decided On — timed proves run the Metal graph,
+/// whose commit reads only `z_packed` and homes the codeword in the
+/// persistent shared staging buffer. Witness drivers and [`crate::pcs`] use
+/// this to skip withdrawing the 1 GiB CPU codeword the latched graph never
+/// reads (every fallback arm materializes a real buffer first).
+pub fn gpu_commit_latched_on() -> bool {
+    imp::latched_on()
+}
+
+/// Materialize a full-length codeword buffer if the caller passed the empty
+/// latched-path marker (stale contents are fine: only the from-message path
+/// can produce the marker, and its CPU fallback synthesizes both replicas
+/// from `z_packed`).
+#[cfg_attr(
+    not(all(target_os = "macos", target_arch = "aarch64")),
+    allow(dead_code)
+)]
+pub(crate) fn ensure_cpu_codeword(
+    codeword: &mut Vec<F128>,
+    params: &crate::pcs::commit::PcsParams,
+) {
+    let len = params.codeword_len_f128();
+    if codeword.len() != len {
+        debug_assert!(codeword.is_empty(), "codeword must be full-length or the empty marker");
+        *codeword = crate::scratch::take_f128(len);
+    }
+}
+
 /// Returns true when the GPU commit machinery is allowed to initialize.
 pub(crate) fn gpu_commit_enabled() -> bool {
     // A/B-CONTROL: set to `false` to build an exact GPU-off control binary
@@ -1686,6 +1714,12 @@ kernel void parent_hash(device const uint* children [[buffer(0)]],
 
     static LATCH: Mutex<LatchState> = Mutex::new(LatchState::Undecided);
 
+    /// See [`super::gpu_commit_latched_on`]. Called outside the commit path,
+    /// so the brief lock never contends with `commit_l0_or_fallback`'s.
+    pub(crate) fn latched_on() -> bool {
+        matches!(&*LATCH.lock().unwrap(), LatchState::On(_))
+    }
+
     /// Pool for ranked-size tree allocations (the 64 MiB copy-out target).
     static TREE_POOL: Mutex<Vec<Vec<Hash>>> = Mutex::new(Vec::new());
     /// Ranked tree node count; only allocations this large are pooled.
@@ -1753,78 +1787,6 @@ kernel void parent_hash(device const uint* children [[buffer(0)]],
                 );
             }
         });
-    }
-
-    /// Parent levels built by each finalized 1,024-leaf CPU-suffix chunk.
-    ///
-    /// Eight levels leave four roots (128 contiguous bytes) per chunk for the
-    /// existing aligned-subtree builder. This is the same cache-local boundary
-    /// used by the full-CPU ranked NTT-to-Merkle pipeline.
-    const HYBRID_LOCAL_PARENT_LEVELS: usize = 8;
-
-    /// A/B-CONTROL: set the default to `false` for an exact source-level
-    /// control when the worker environment is cleared by the benchmark
-    /// harness. The environment switch remains useful for local tooling.
-    const HYBRID_LOCAL_PARENTS_DEFAULT: bool = true;
-
-    fn hybrid_local_parent_levels() -> usize {
-        if HYBRID_LOCAL_PARENTS_DEFAULT
-            && std::env::var_os("FLOCK_NO_HYBRID_LOCAL_PARENTS").is_none()
-        {
-            HYBRID_LOCAL_PARENT_LEVELS
-        } else {
-            0
-        }
-    }
-
-    /// Hash one finalized ranked leaf chunk and its first local parent levels
-    /// directly into the global flat-tree layout.
-    ///
-    /// # Safety
-    ///
-    /// `tree_base` must point to `2 * n_leaves - 1` writable hashes. The caller
-    /// must exclusively own this chunk's ranges at every requested level, and
-    /// `bytes` must remain immutable for the duration of the call.
-    pub(crate) unsafe fn hash_ranked_leaf_chunk_and_local_parents(
-        bytes: &[u8],
-        tree_base: crate::epool::SyncPtr<Hash>,
-        n_leaves: usize,
-        leaf_start: usize,
-        leaf_len: usize,
-        local_parent_levels: usize,
-    ) {
-        assert!(n_leaves.is_power_of_two());
-        assert!(leaf_len.is_power_of_two());
-        assert!(leaf_start + leaf_len <= n_leaves);
-        assert!(local_parent_levels <= leaf_len.ilog2() as usize);
-        assert_eq!(leaf_start % (1usize << local_parent_levels), 0);
-        assert_eq!(bytes.len(), leaf_len * 1024);
-
-        unsafe {
-            let leaves = core::slice::from_raw_parts_mut(tree_base.ptr().add(leaf_start), leaf_len);
-            crate::merkle::hash_ranked_blake3_leaf_chunk(bytes, leaves);
-
-            let mut read_level_start = 0usize;
-            let mut read_level_len = n_leaves;
-            let mut local_start = leaf_start;
-            let mut local_len = leaf_len;
-            for _ in 0..local_parent_levels {
-                let write_level_start = read_level_start + read_level_len;
-                let write_start = write_level_start + (local_start >> 1);
-                let write_len = local_len >> 1;
-                let read = core::slice::from_raw_parts(
-                    tree_base.ptr().add(read_level_start + local_start),
-                    local_len,
-                );
-                let write =
-                    core::slice::from_raw_parts_mut(tree_base.ptr().add(write_start), write_len);
-                crate::merkle::hash_ranked_blake3_parent_chunk(read, write);
-                read_level_start = write_level_start;
-                read_level_len >>= 1;
-                local_start >>= 1;
-                local_len >>= 1;
-            }
-        }
     }
 
     /// Encode + run the full production commit graph from the message `z`:
@@ -1976,21 +1938,13 @@ kernel void parent_hash(device const uint* children [[buffer(0)]],
                 let tree_base = crate::epool::SyncPtr(tree.as_mut_ptr());
                 let suffix_leaf_start = prefix_leaves;
                 let suffix_leaves = n_leaves - prefix_leaves;
-                let deep_pipeline = hybrid_cpu_suffix_deep_pipeline_enabled();
-                let local_parent_levels = if deep_pipeline {
-                    hybrid_local_parent_levels()
-                } else {
-                    0
-                };
-                if deep_pipeline {
-                    // Publish and hash each finalized layer-10 chunk, then
-                    // build its local parent levels before the leaf hashes
-                    // leave cache. `elem_offset` is absolute in the shared
-                    // staging buffer, hence `leaf_start` lands directly in
-                    // the CPU-owned suffix of the shared tree. Different
-                    // callback invocations own disjoint 1,024-leaf ranges at
-                    // every local level; the GPU owns only
-                    // `0..prefix_leaves`.
+                if hybrid_cpu_suffix_deep_pipeline_enabled() {
+                    // Publish and hash each finalized layer-10 chunk before it
+                    // leaves cache.  `elem_offset` is absolute in the shared
+                    // staging buffer, hence `leaf_start` lands directly in the
+                    // CPU-owned suffix of the shared tree. Different callback
+                    // invocations own disjoint 1,024-leaf ranges; the GPU owns
+                    // only `0..prefix_leaves`.
                     let finish_chunk = |elem_offset: usize, chunk: &[F128]| {
                         debug_assert_eq!(elem_offset % 64, 0);
                         let leaf_start = elem_offset / 64;
@@ -2004,14 +1958,11 @@ kernel void parent_hash(device const uint* children [[buffer(0)]],
                             chunk.as_ptr().cast::<u8>(),
                             core::mem::size_of_val(chunk),
                         );
-                        hash_ranked_leaf_chunk_and_local_parents(
-                            bytes,
-                            tree_base,
-                            n_leaves,
-                            leaf_start,
+                        let outs = core::slice::from_raw_parts_mut(
+                            tree_base.ptr().add(leaf_start),
                             leaf_len,
-                            local_parent_levels,
                         );
+                        crate::merkle::hash_ranked_blake3_leaf_chunk(bytes, outs);
                     };
                     ntt.forward_transform_interleaved_ranked_block_range_and_then(
                         data,
@@ -2061,15 +2012,6 @@ kernel void parent_hash(device const uint* children [[buffer(0)]],
                     let mut level_len = n_leaves;
                     let mut local_start = sstart;
                     let mut local_len = size;
-                    // Each 1,024-leaf callback already populated these exact
-                    // flat-tree ranges. Resume at the first shared level
-                    // instead of traversing the cache-cold leaves again.
-                    for _ in 0..local_parent_levels {
-                        level_start += level_len;
-                        level_len /= 2;
-                        local_start /= 2;
-                        local_len /= 2;
-                    }
                     while local_len > 1 {
                         let write_level_start = level_start + level_len;
                         let (r0, w0) =
@@ -2598,7 +2540,8 @@ kernel void parent_hash(device const uint* children [[buffer(0)]],
         let gpu = match gpu() {
             Ok(g) => g,
             Err(_) => {
-                let tree = cpu(&mut codeword);
+                super::ensure_cpu_codeword(&mut codeword, params);
+            let tree = cpu(&mut codeword);
                 return (CodewordBuf::Cpu(codeword), MerkleTreeBuf::Cpu(tree));
             }
         };
@@ -2610,6 +2553,7 @@ kernel void parent_hash(device const uint* children [[buffer(0)]],
             if debug_enabled() {
                 eprintln!("[gpu-commit] staging still in use; CPU fallback");
             }
+            super::ensure_cpu_codeword(&mut codeword, params);
             let tree = cpu(&mut codeword);
             return (CodewordBuf::Cpu(codeword), MerkleTreeBuf::Cpu(tree));
         }
@@ -2641,7 +2585,8 @@ kernel void parent_hash(device const uint* children [[buffer(0)]],
                             eprintln!("[gpu-commit] z wrap failed at prove time ({e})");
                         }
                         STAGING_IN_USE.store(false, Ordering::Release);
-                        let tree = cpu(&mut codeword);
+                        super::ensure_cpu_codeword(&mut codeword, params);
+            let tree = cpu(&mut codeword);
                         return (CodewordBuf::Cpu(codeword), MerkleTreeBuf::Cpu(tree));
                     }
                 },
@@ -2668,6 +2613,7 @@ kernel void parent_hash(device const uint* children [[buffer(0)]],
             if let LatchState::On(state) = std::mem::replace(latch, LatchState::Off) {
                 release_latched(gpu, state);
             }
+            super::ensure_cpu_codeword(&mut codeword, params);
             let tree = cpu(&mut codeword);
             return (CodewordBuf::Cpu(codeword), MerkleTreeBuf::Cpu(tree));
         }
@@ -2681,8 +2627,11 @@ kernel void parent_hash(device const uint* children [[buffer(0)]],
             eprintln!("[commit-timing] gpu-commit: graph {graph_ms:.2} ms + zero-copy tree");
         }
         // The replicated input codeword was never read by the from-z graph;
-        // hand it straight back to the scratch pool for the next prove.
-        crate::scratch::give_f128(codeword);
+        // hand it straight back to the scratch pool for the next prove. The
+        // latched-path empty marker (codeword skip) is dropped, not pooled.
+        if !codeword.is_empty() {
+            crate::scratch::give_f128(codeword);
+        }
         let gpu_codeword = unsafe {
             super::GpuCodeword::new(gpu.buffer_contents(staging).cast::<F128>(), codeword_len)
         };
@@ -2700,6 +2649,7 @@ kernel void parent_hash(device const uint* children [[buffer(0)]],
             || !super::is_ranked_gpu_shape(params)
             || rayon::current_num_threads() <= 1
         {
+            super::ensure_cpu_codeword(&mut codeword, params);
             let tree = cpu(&mut codeword);
             return (CodewordBuf::Cpu(codeword), MerkleTreeBuf::Cpu(tree));
         }
@@ -2707,7 +2657,8 @@ kernel void parent_hash(device const uint* children [[buffer(0)]],
         match &*latch {
             LatchState::Off => {
                 drop(latch);
-                let tree = cpu(&mut codeword);
+                super::ensure_cpu_codeword(&mut codeword, params);
+            let tree = cpu(&mut codeword);
                 (CodewordBuf::Cpu(codeword), MerkleTreeBuf::Cpu(tree))
             }
             LatchState::Undecided => {
@@ -2811,6 +2762,10 @@ mod imp {
     pub(crate) fn give_tree(_tree: Vec<crate::merkle::Hash>) {}
 
     pub(crate) fn staging_released() {}
+
+    pub(crate) fn latched_on() -> bool {
+        false
+    }
 }
 
 #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
@@ -3079,55 +3034,6 @@ mod tests {
                 crate::merkle::merkle_tree(&data, n_leaves, crate::merkle::HashKind::Blake3);
             assert_eq!(got, expect, "GPU Merkle mismatch at n_leaves={n_leaves}");
         }
-    }
-
-    #[test]
-    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-    fn ranked_leaf_chunk_local_parents_match_full_tree_layout() {
-        const N_LEAVES: usize = 32;
-        const LEAF_START: usize = 8;
-        const LEAF_LEN: usize = 8;
-        const LOCAL_PARENT_LEVELS: usize = 2;
-        const SENTINEL: crate::merkle::Hash = [0xA5; 32];
-
-        let mut rng = Rng::new(0x10CA_1A11);
-        let data: Vec<u8> = (0..N_LEAVES * 1024).map(|_| rng.next_u64() as u8).collect();
-        let expected = crate::merkle::merkle_tree(&data, N_LEAVES, crate::merkle::HashKind::Blake3);
-        let mut actual = vec![SENTINEL; 2 * N_LEAVES - 1];
-
-        unsafe {
-            imp::hash_ranked_leaf_chunk_and_local_parents(
-                &data[LEAF_START * 1024..(LEAF_START + LEAF_LEN) * 1024],
-                crate::epool::SyncPtr(actual.as_mut_ptr()),
-                N_LEAVES,
-                LEAF_START,
-                LEAF_LEN,
-                LOCAL_PARENT_LEVELS,
-            );
-        }
-
-        let mut affected = vec![false; actual.len()];
-        let mut level_start = 0usize;
-        let mut level_len = N_LEAVES;
-        let mut local_start = LEAF_START;
-        let mut local_len = LEAF_LEN;
-        for _ in 0..=LOCAL_PARENT_LEVELS {
-            let start = level_start + local_start;
-            let end = start + local_len;
-            assert_eq!(&actual[start..end], &expected[start..end]);
-            affected[start..end].fill(true);
-            level_start += level_len;
-            level_len >>= 1;
-            local_start >>= 1;
-            local_len >>= 1;
-        }
-        assert!(
-            actual
-                .iter()
-                .zip(affected)
-                .all(|(node, touched)| touched || *node == SENTINEL),
-            "local chunk helper wrote outside its owned flat-tree ranges",
-        );
     }
 
     /// M3 gate: full ranked-size tree (2^20 1 KiB leaves). Run with `--ignored`.
