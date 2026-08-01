@@ -2535,6 +2535,68 @@ fn use_deferred_ranked_lincheck_stripe(n_blocks_log: usize, pcs_params: &PcsPara
     )
 }
 
+/// Legacy experiment control. `0` remains a same-binary fallback to the
+/// materialized deferred stripe; `1` and an unset variable select the promoted
+/// row-major path when all strict ranked guards below match.
+pub const ENV_EXPERIMENTAL_ROW_MAJOR_LINCHECK: &str =
+    "FLOCK_EXPERIMENTAL_ROW_MAJOR_LINCHECK";
+/// Exact-value emergency kill for the promoted ranked row-major lincheck path.
+pub const ENV_NO_ROW_MAJOR_LINCHECK: &str = "FLOCK_NO_ROW_MAJOR_LINCHECK";
+
+fn row_major_lincheck_env_enabled(
+    experimental: Option<&std::ffi::OsStr>,
+    kill: Option<&std::ffi::OsStr>,
+) -> bool {
+    kill != Some(std::ffi::OsStr::new("1"))
+        && experimental != Some(std::ffi::OsStr::new("0"))
+}
+
+fn select_ranked_row_major_lincheck(
+    n_blocks_log: usize,
+    pcs_params: &PcsParams,
+    platform_supported: bool,
+    enabled: bool,
+    full_stripe: bool,
+    fold8_producer_enabled: bool,
+) -> bool {
+    platform_supported
+        && enabled
+        && !full_stripe
+        && fold8_producer_enabled
+        && n_blocks_log == 18
+        && pcs_params.m == 32
+        && pcs_params.log_inv_rate == 1
+        && pcs_params.log_batch_size == 6
+        && pcs_params.profile == flock_core::pcs::ligerito::LigeritoProfile::Fast
+        && pcs_params.merkle_hash == flock_core::merkle::HashKind::Blake3
+}
+
+fn use_ranked_row_major_lincheck(n_blocks_log: usize, pcs_params: &PcsParams) -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let enabled = *ENABLED.get_or_init(|| {
+        row_major_lincheck_env_enabled(
+            std::env::var_os(ENV_EXPERIMENTAL_ROW_MAJOR_LINCHECK).as_deref(),
+            std::env::var_os(ENV_NO_ROW_MAJOR_LINCHECK).as_deref(),
+        )
+    });
+    let fold8_producer_enabled = flock_core::pcs::ranked_direct_fold8_enabled()
+        && std::env::var_os("FLOCK_NO_OPEN_DIRECT_AB").is_none()
+        && std::env::var_os("FLOCK_NO_LIG_FOLD2").is_none()
+        && std::env::var_os("FLOCK_NO_ZC_LINCHECK_C_REUSE").is_none();
+    select_ranked_row_major_lincheck(
+        n_blocks_log,
+        pcs_params,
+        cfg!(all(
+            target_os = "macos",
+            target_arch = "aarch64",
+            target_feature = "aes"
+        )),
+        enabled,
+        std::env::var_os("FLOCK_FULL_STRIPE").is_some(),
+        fold8_producer_enabled,
+    )
+}
+
 fn generate_witness_with_ab_packed_and_lincheck_streamed(
     blocks: &[Compression],
     n_blocks_log: usize,
@@ -2561,11 +2623,13 @@ fn generate_witness_with_ab_packed_and_lincheck_streamed(
     // with the scalar driver, incl. the Metal band-streaming protocol.
     #[cfg(target_arch = "aarch64")]
     if witgen_simd::enabled() {
+        let omit_eager_stripe = use_ranked_row_major_lincheck(n_blocks_log, pcs_params)
+            || use_deferred_ranked_lincheck_stripe(n_blocks_log, pcs_params);
         return witgen_simd::generate_streamed(
             blocks,
             n_blocks_log,
             pcs_params,
-            use_deferred_ranked_lincheck_stripe(n_blocks_log, pcs_params),
+            omit_eager_stripe,
         );
     }
     let (z, a, b, stripe, stream) =
@@ -2891,6 +2955,20 @@ impl Blake3Setup {
                                 challenger,
                             )
                         }
+                        None if use_ranked_row_major_lincheck(
+                            self.n_blocks_log(),
+                            &self.pcs_params,
+                        ) => crate::prover::prove_fast_ligerito_from_streamed_first_pass_row_major(
+                            &self.r1cs,
+                            &self.pcs_params,
+                            z_packed,
+                            a_packed_f128,
+                            b_packed_f128,
+                            lc_circuit,
+                            codeword,
+                            stream,
+                            challenger,
+                        ),
                         None => crate::prover::prove_fast_ligerito_from_streamed_first_pass_deferred_stripe(
                             &self.r1cs,
                             &self.pcs_params,
@@ -3399,6 +3477,75 @@ mod tests {
         wrong.merkle_hash = flock_core::merkle::HashKind::Sha256;
         assert!(!select_deferred_ranked_lincheck_stripe(
             18, &wrong, true, true, false, false
+        ));
+    }
+
+    #[test]
+    fn row_major_lincheck_selector_is_default_on_killable_and_fold8_only() {
+        use std::ffi::OsStr;
+
+        // Cleared official environment promotes the exact ranked path.
+        assert!(row_major_lincheck_env_enabled(None, None));
+        assert!(row_major_lincheck_env_enabled(
+            Some(OsStr::new("1")),
+            None
+        ));
+        // New exact kill and legacy experiment=0 both retain a same-binary
+        // control. Non-exact kill values do not silently disable promotion.
+        assert!(!row_major_lincheck_env_enabled(
+            None,
+            Some(OsStr::new("1"))
+        ));
+        assert!(!row_major_lincheck_env_enabled(
+            Some(OsStr::new("0")),
+            None
+        ));
+        for value in ["", "0", "01", "true"] {
+            assert!(row_major_lincheck_env_enabled(
+                None,
+                Some(OsStr::new(value))
+            ));
+        }
+        assert!(!row_major_lincheck_env_enabled(
+            Some(OsStr::new("1")),
+            Some(OsStr::new("1"))
+        ));
+
+        let ranked = PcsParams {
+            m: 32,
+            log_inv_rate: 1,
+            log_batch_size: 6,
+            profile: flock_core::pcs::ligerito::LigeritoProfile::Fast,
+            merkle_hash: flock_core::merkle::HashKind::Blake3,
+        };
+        assert!(select_ranked_row_major_lincheck(
+            18, &ranked, true, true, false, true
+        ));
+        assert!(!select_ranked_row_major_lincheck(
+            18, &ranked, false, true, false, true
+        ));
+        assert!(!select_ranked_row_major_lincheck(
+            18, &ranked, true, false, false, true
+        ));
+        assert!(!select_ranked_row_major_lincheck(
+            18, &ranked, true, true, true, true
+        ));
+        assert!(!select_ranked_row_major_lincheck(
+            18, &ranked, true, true, false, false
+        ));
+        assert!(!select_ranked_row_major_lincheck(
+            17, &ranked, true, true, false, true
+        ));
+
+        let mut wrong = ranked.clone();
+        wrong.log_batch_size = 5;
+        assert!(!select_ranked_row_major_lincheck(
+            18, &wrong, true, true, false, true
+        ));
+        wrong = ranked;
+        wrong.merkle_hash = flock_core::merkle::HashKind::Sha256;
+        assert!(!select_ranked_row_major_lincheck(
+            18, &wrong, true, true, false, true
         ));
     }
 

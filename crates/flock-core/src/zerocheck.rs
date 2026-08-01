@@ -238,6 +238,12 @@ pub struct CapturedSHatVC {
     pub fold8: Option<Vec<F128>>,
 }
 
+#[derive(Clone, Copy)]
+enum IdentityCSource<'a> {
+    LincheckStripe(&'a [u8]),
+    RowMajorF128(&'a [F128]),
+}
+
 /// Capture-`s_hat_v_c` prover that consumes a challenge-independent AB inner
 /// transform prepared while the witness commitment was being built. The
 /// original A and B buffers are still required and remain untouched for the
@@ -294,7 +300,41 @@ pub fn prove_packed_padded_capture_s_hat_v_c_with_precomputed_ab_and_lincheck_c<
         padding,
         true,
         Some(ab_inner),
-        Some(c_lincheck),
+        Some(IdentityCSource::LincheckStripe(c_lincheck)),
+        challenger,
+    );
+    (
+        proof,
+        claim,
+        captured.expect("capture=true must produce s_hat_v_c"),
+    )
+}
+
+/// Ranked Fold8 specialization that derives identity C directly from the
+/// retained row-major F128 witness. This is transcript-identical to the
+/// lincheck-stripe API but removes the 512 MiB stripe allocation and write.
+#[allow(clippy::too_many_arguments)]
+pub fn prove_packed_padded_capture_s_hat_v_c_with_precomputed_ab_and_row_major_c<
+    C: Challenger,
+>(
+    a_packed: &[u8],
+    b_packed: &[u8],
+    c_packed: &[u8],
+    c_row_major: &[F128],
+    m: usize,
+    padding: &PaddingSpec,
+    ab_inner: univariate_skip_optimized::Round1AbInner,
+    challenger: &mut C,
+) -> (ZerocheckProof, ZerocheckClaim, CapturedSHatVC) {
+    let (proof, claim, captured) = prove_packed_padded_inner(
+        a_packed,
+        b_packed,
+        c_packed,
+        m,
+        padding,
+        true,
+        Some(ab_inner),
+        Some(IdentityCSource::RowMajorF128(c_row_major)),
         challenger,
     );
     (
@@ -313,7 +353,7 @@ fn prove_packed_padded_inner<C: Challenger>(
     padding: &PaddingSpec,
     capture_s_hat_v_c: bool,
     precomputed_ab: Option<univariate_skip_optimized::Round1AbInner>,
-    c_lincheck: Option<&[u8]>,
+    identity_c: Option<IdentityCSource<'_>>,
     challenger: &mut C,
 ) -> (ZerocheckProof, ZerocheckClaim, Option<CapturedSHatVC>) {
     let k_skip = K_SKIP;
@@ -369,7 +409,7 @@ fn prove_packed_padded_inner<C: Challenger>(
             capture_s_hat_v_c,
             "precomputed AB path currently requires s_hat_v capture"
         );
-        if let Some(c_lincheck) = c_lincheck {
+        if let Some(identity_c) = identity_c {
             assert!(m == 32 || cfg!(test), "lincheck C reuse is ranked-only");
             assert_eq!(padding.k_log, 14, "lincheck C reuse fixes k_log=14");
             assert!(
@@ -395,19 +435,33 @@ fn prove_packed_padded_inner<C: Challenger>(
             let cpu_c = crate::pcs::commit::commit_cpu_ms();
             let t_c = std::time::Instant::now();
             if crate::pcs::ranked_direct_fold8_enabled() {
-                let (c, s_hat_v_c, quad, fold8) =
-                    crate::zerocheck::univariate_skip_optimized::round1_c_fold8_from_lincheck_stripe(
-                        c_lincheck,
-                        m,
-                        padding.k_log,
-                        k_skip,
-                        padding.useful_bits_per_block,
-                        &r,
-                        inv_table,
-                    );
+                let (c, s_hat_v_c, quad, fold8) = match identity_c {
+                    IdentityCSource::LincheckStripe(c_lincheck) => {
+                        crate::zerocheck::univariate_skip_optimized::round1_c_fold8_from_lincheck_stripe(
+                            c_lincheck,
+                            m,
+                            padding.k_log,
+                            k_skip,
+                            padding.useful_bits_per_block,
+                            &r,
+                            inv_table,
+                        )
+                    }
+                    IdentityCSource::RowMajorF128(c_row_major) => {
+                        crate::zerocheck::univariate_skip_optimized::round1_c_fold8_from_row_major_f128(
+                            c_row_major,
+                            m,
+                            padding.k_log,
+                            k_skip,
+                            padding.useful_bits_per_block,
+                            &r,
+                            inv_table,
+                        )
+                    }
+                };
                 if zc_timing {
                     eprintln!(
-                        "[zc-timing] round1 lincheck-stripe C (fold8): {:.2} ms cpu={:.1}",
+                        "[zc-timing] round1 alternate-layout C (fold8): {:.2} ms cpu={:.1}",
                         t_c.elapsed().as_secs_f64() * 1e3,
                         crate::pcs::commit::commit_cpu_ms() - cpu_c,
                     );
@@ -423,6 +477,9 @@ fn prove_packed_padded_inner<C: Challenger>(
                     }),
                 )
             } else {
+                let IdentityCSource::LincheckStripe(c_lincheck) = identity_c else {
+                    panic!("row-major identity C requires ranked DirectFold8");
+                };
                 let (c, s_hat_v_c, quad, fold4) =
                     crate::zerocheck::univariate_skip_optimized::round1_c_fold4_from_lincheck_stripe(
                         c_lincheck,
@@ -1053,16 +1110,38 @@ mod tests {
             &padding,
             true,
             Some(new_ab),
-            Some(&c_lincheck),
+            Some(IdentityCSource::LincheckStripe(&c_lincheck)),
             &mut new_ch,
+        );
+
+        let direct_ab = univariate_skip_optimized::precompute_round1_ab_inner_packed_padded(
+            &a_p, &b_p, M, K_SKIP, inv_table, &padding,
+        );
+        let mut direct_ch = FsChallenger::new(b"flock-c-stripe-proof-v0");
+        let (direct_proof, direct_claim, direct_capture) = prove_packed_padded_inner(
+            &a_p,
+            &b_p,
+            &c_p,
+            M,
+            &padding,
+            true,
+            Some(direct_ab),
+            Some(IdentityCSource::RowMajorF128(&c_words)),
+            &mut direct_ch,
         );
 
         assert_eq!(new_proof, old_proof);
         assert_eq!(new_claim, old_claim);
+        assert_eq!(direct_proof, new_proof);
+        assert_eq!(direct_claim, new_claim);
         let old_capture = old_capture.expect("legacy C capture");
         let new_capture = new_capture.expect("stripe C capture");
+        let direct_capture = direct_capture.expect("row-major C capture");
         assert_eq!(new_capture.s_hat_v_c, old_capture.s_hat_v_c);
         assert_eq!(new_capture.quad, old_capture.quad);
+        assert_eq!(direct_capture.s_hat_v_c, new_capture.s_hat_v_c);
+        assert_eq!(direct_capture.quad, new_capture.quad);
+        assert_eq!(direct_capture.fold8, new_capture.fold8);
 
         let mut verifier = FsChallenger::new(b"flock-c-stripe-proof-v0");
         assert_eq!(verify(M, &new_proof, &mut verifier), Ok(new_claim));

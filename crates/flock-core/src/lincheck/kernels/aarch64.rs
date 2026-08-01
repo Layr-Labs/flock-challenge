@@ -258,6 +258,98 @@ unsafe fn process_block_neon_single<const TILE_T: usize>(
     vst1q_u8(o.add(112), a7);
 }
 
+/// Transpose two independent 8x64 row-major bit matrices in parallel.
+///
+/// Each input row is one `u64`; the two matrices occupy the low/high NEON
+/// lanes. The bit butterfly moves the row index into each output byte, then
+/// the byte butterfly writes the two ordinary 64-byte lincheck stripes
+/// contiguously. This is the same proven transpose/interleave network used by
+/// zerocheck's direct-C mask kernel, specialized here to eliminate two calls
+/// to the more general `TBL` + three-SWAR-round 64-byte transpose.
+///
+/// # Safety
+/// - `matrix0` and `matrix1` each address eight readable `u64`s separated by
+///   `row_stride_words`.
+/// - `out` addresses 128 writable bytes.
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+#[allow(unsafe_op_in_unsafe_fn)]
+unsafe fn transpose_two_8x64_row_major_neon(
+    matrix0: *const u64,
+    matrix1: *const u64,
+    row_stride_words: usize,
+    out: *mut u8,
+) {
+    use std::arch::aarch64::*;
+
+    macro_rules! load_pair {
+        ($row:expr) => {{
+            let lo = matrix0.add($row * row_stride_words).read();
+            let hi = matrix1.add($row * row_stride_words).read();
+            vreinterpretq_u8_u64(vcombine_u64(vcreate_u64(lo), vcreate_u64(hi)))
+        }};
+    }
+
+    let x = [
+        load_pair!(0),
+        load_pair!(1),
+        load_pair!(2),
+        load_pair!(3),
+        load_pair!(4),
+        load_pair!(5),
+        load_pair!(6),
+        load_pair!(7),
+    ];
+
+    // Bit `s` from each of the eight input rows becomes byte `s`'s row mask,
+    // independently in all sixteen byte columns (eight per matrix).
+    let mut a = [vdupq_n_u8(0); 8];
+    for b in 0..4 {
+        a[b] = vsliq_n_u8::<4>(x[b], x[b + 4]);
+        a[b + 4] = vsriq_n_u8::<4>(x[b + 4], x[b]);
+    }
+    let m33 = vdupq_n_u8(0x33);
+    let mut c = [vdupq_n_u8(0); 8];
+    for q in 0..2 {
+        for b in 0..2 {
+            let (i, j) = (4 * q + b, 4 * q + b + 2);
+            c[i] = vbslq_u8(m33, a[i], vshlq_n_u8::<2>(a[j]));
+            c[j] = vbslq_u8(m33, vshrq_n_u8::<2>(a[i]), a[j]);
+        }
+    }
+    let m55 = vdupq_n_u8(0x55);
+    let mut r = [vdupq_n_u8(0); 8];
+    for p in 0..4 {
+        let (i, j) = (2 * p, 2 * p + 1);
+        r[i] = vbslq_u8(m55, c[i], vshlq_n_u8::<1>(c[j]));
+        r[j] = vbslq_u8(m55, vshrq_n_u8::<1>(c[i]), c[j]);
+    }
+
+    // Eight-way byte interleave. Flattened output is matrix0's 64 bytes then
+    // matrix1's 64 bytes, exactly the row layout process_block consumes.
+    let (a0, a1) = (vzip1q_u8(r[0], r[4]), vzip2q_u8(r[0], r[4]));
+    let (b0, b1) = (vzip1q_u8(r[2], r[6]), vzip2q_u8(r[2], r[6]));
+    let (c0, c1) = (vzip1q_u8(r[1], r[5]), vzip2q_u8(r[1], r[5]));
+    let (d0, d1) = (vzip1q_u8(r[3], r[7]), vzip2q_u8(r[3], r[7]));
+    let (e0, e1) = (vzip1q_u8(a0, b0), vzip2q_u8(a0, b0));
+    let (e2, e3) = (vzip1q_u8(a1, b1), vzip2q_u8(a1, b1));
+    let (f0, f1) = (vzip1q_u8(c0, d0), vzip2q_u8(c0, d0));
+    let (f2, f3) = (vzip1q_u8(c1, d1), vzip2q_u8(c1, d1));
+    let rows = [
+        vzip1q_u8(e0, f0),
+        vzip2q_u8(e0, f0),
+        vzip1q_u8(e1, f1),
+        vzip2q_u8(e1, f1),
+        vzip1q_u8(e2, f2),
+        vzip2q_u8(e2, f2),
+        vzip1q_u8(e3, f3),
+        vzip2q_u8(e3, f3),
+    ];
+    for (i, row) in rows.into_iter().enumerate() {
+        vst1q_u8(out.add(i * 16), row);
+    }
+}
+
 /// **i_inner-partitioned** NEON partial fold. Same result as
 /// [`partial_fold_packed_z_neon_single_padded`] but parallelizes over the
 /// **output** (`i_inner`) instead of over z stripes.
@@ -521,6 +613,155 @@ pub(crate) fn oblock_padded_tiled<const TILE_T: usize>(
         for w in 0..n_workers {
             let src = &partials[w * k + lo..w * k + lo + dst.len()];
             for (o, s) in dst.iter_mut().zip(src.iter()) {
+                *o += *s;
+            }
+        }
+    });
+    out
+}
+
+/// Fold a row-major F128-packed witness directly, without first materializing
+/// the byte-stripe consumed by [`partial_fold_packed_z_neon_oblock_padded`].
+///
+/// One tile covers `TILE_T = 8` byte stripes = 64 outer instances. For each
+/// 64-bit inner word, the corresponding words from each group of eight
+/// instances are bit-transposed into a 512-byte stack tile, then fed to the
+/// same eight-stripe register kernel as the materialized path. Consequently
+/// the arithmetic and reduction order are identical; only the transient
+/// storage changes from a 512 MiB ranked vector to an L1 stack tile.
+///
+/// Parallelism follows the existing oblock kernel: workers own outer tile
+/// bands and one private length-k partial, followed by one column-band XOR
+/// reduction. This reads the retained packed witness once and removes the
+/// stripe's full-size write plus its allocation/pooling lifetime.
+#[cfg(target_arch = "aarch64")]
+pub fn partial_fold_row_major_f128_neon_oblock_padded(
+    z_row_major: &[F128],
+    m: usize,
+    k_log: usize,
+    useful_bits: usize,
+    eq_outer: &[F128],
+) -> Vec<F128> {
+    use rayon::prelude::*;
+
+    const TILE_T: usize = NEON_TILE_T;
+    const BLOCK_K: usize = 8;
+    const WORD_BITS: usize = 64;
+
+    assert!(m >= 7, "F128-packed witness requires m >= 7");
+    assert!(m >= k_log, "row-major block dimension exceeds witness");
+    assert!(k_log >= 7, "row-major F128 blocks require k_log >= 7");
+    let n_log = m - k_log;
+    let k = 1usize << k_log;
+    let n_outer = 1usize << n_log;
+    assert_eq!(z_row_major.len(), 1usize << (m - 7));
+    assert_eq!(eq_outer.len(), n_outer);
+    assert!(useful_bits <= k);
+    assert!(n_log >= 3 + TILE_T.trailing_zeros() as usize);
+    let n_stripes = n_outer / 8;
+    assert_eq!(n_stripes % TILE_T, 0);
+
+    let useful = useful_bits.div_ceil(BLOCK_K) * BLOCK_K;
+    if useful == 0 {
+        return vec![F128::ZERO; k];
+    }
+    let useful_words = useful_bits.div_ceil(WORD_BITS);
+    let u64_per_block = k / WORD_BITS;
+    // SAFETY: F128 is repr(C) with exactly two u64 fields and no padding.
+    let z_words: &[u64] = unsafe {
+        core::slice::from_raw_parts(z_row_major.as_ptr().cast::<u64>(), z_row_major.len() * 2)
+    };
+
+    let n_tiles = n_stripes / TILE_T;
+
+    // Match the promoted packed-oblock scheduler exactly: fine contiguous
+    // claims are drained by the heterogeneous two-pool queue, so efficiency
+    // cores help this load/permute-bound fold and the long fixed P-core tail is
+    // removed. First-touch each uninitialized partial on its claiming core.
+    const TILES_PER_CLAIM: usize = 64;
+    let n_claims = n_tiles.div_ceil(TILES_PER_CLAIM);
+    let mut partials = crate::alloc_uninit_f128_vec(n_claims * k);
+    let partials_base = crate::epool::SyncPtr(partials.as_mut_ptr());
+    crate::epool::run_hetero_chunks(n_claims, |claim| {
+        let tile_lo = claim * TILES_PER_CLAIM;
+        let tile_hi = ((claim + 1) * TILES_PER_CLAIM).min(n_tiles);
+        // SAFETY: each queue claim is unique and exclusively owns this slot;
+        // the slot is fully zeroed before the first read.
+        let partial =
+            unsafe { std::slice::from_raw_parts_mut(partials_base.ptr().add(claim * k), k) };
+        // SAFETY: all-zero bytes are a valid F128::ZERO representation.
+        unsafe {
+            std::ptr::write_bytes(partial.as_mut_ptr(), 0, k);
+        }
+        let mut tables = vec![F128::ZERO; TILE_T * 256];
+        // Reused for every 64-bit inner word. Paired transposes write two
+        // adjacent 64-byte stripe rows at a time.
+        let mut transposed = [[0u8; WORD_BITS]; TILE_T];
+
+        for tile in tile_lo..tile_hi {
+            let stripe_base = tile * TILE_T;
+            for t in 0..TILE_T {
+                let eq_off = 8 * (stripe_base + t);
+                build_sum_table(
+                    &eq_outer[eq_off..eq_off + 8],
+                    &mut tables[t * 256..(t + 1) * 256],
+                );
+            }
+            let tables_ptr = tables.as_ptr().cast::<u8>();
+
+            for word in 0..useful_words {
+                let tile_word =
+                    unsafe { z_words.as_ptr().add(8 * stripe_base * u64_per_block + word) };
+                let tile_out = transposed.as_mut_ptr().cast::<u8>();
+                let mut t = 0usize;
+                while t < TILE_T {
+                    let matrix0 = unsafe { tile_word.add(t * 8 * u64_per_block) };
+                    let matrix1 = unsafe { matrix0.add(8 * u64_per_block) };
+                    // SAFETY: the tile covers TILE_T groups of eight outer
+                    // rows. Each row has u64_per_block words and tile_out has
+                    // two complete 64-byte rows starting at t * WORD_BITS.
+                    unsafe {
+                        transpose_two_8x64_row_major_neon(
+                            matrix0,
+                            matrix1,
+                            u64_per_block,
+                            tile_out.add(t * WORD_BITS),
+                        );
+                    }
+                    t += 2;
+                }
+
+                let inner_base = word * WORD_BITS;
+                let blocks_here = (useful - inner_base).min(WORD_BITS) / BLOCK_K;
+                let tile_ptr = transposed.as_ptr().cast::<u8>();
+                for block in 0..blocks_here {
+                    let local = block * BLOCK_K;
+                    // SAFETY: every transposed row has WORD_BITS bytes;
+                    // `local + BLOCK_K <= WORD_BITS`. Tables contain
+                    // TILE_T * 256 entries and `partial` contains k.
+                    unsafe {
+                        process_block_neon_single::<TILE_T>(
+                            tile_ptr,
+                            WORD_BITS,
+                            local,
+                            tables_ptr,
+                            partial.as_mut_ptr().add(inner_base + local),
+                        );
+                    }
+                }
+            }
+        }
+    });
+
+    let n_workers = n_claims;
+    let p = rayon::current_num_threads().max(1);
+    let band = k.div_ceil(p).max(1024);
+    let mut out = vec![F128::ZERO; k];
+    out.par_chunks_mut(band).enumerate().for_each(|(bi, dst)| {
+        let lo = bi * band;
+        for worker in 0..n_workers {
+            let src = &partials[worker * k + lo..worker * k + lo + dst.len()];
+            for (o, s) in dst.iter_mut().zip(src) {
                 *o += *s;
             }
         }
