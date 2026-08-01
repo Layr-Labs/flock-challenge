@@ -9422,3 +9422,4 @@ mod tests {
         assert_eq!(w.root(), w2.root());
     }
 }
+// Redraw marker 4 (drift probe): zero-diff; prior draws 1,205,646 / 1,205,107 / 1,206,245.
