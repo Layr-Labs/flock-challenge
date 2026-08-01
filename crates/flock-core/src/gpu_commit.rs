@@ -1879,6 +1879,7 @@ kernel void parent_hash3(device const uint* children [[buffer(0)]],
         n_leaves_total: usize,
         leaf_start: usize,
         subtree_leaves: usize,
+        skip_leaf: bool,
     ) {
         unsafe {
             encode_merkle_subtree_impl(
@@ -1890,6 +1891,7 @@ kernel void parent_hash3(device const uint* children [[buffer(0)]],
                 leaf_start,
                 subtree_leaves,
                 super::select_gpu_parent3(n_leaves_total, super::gpu_parent3_enabled()),
+                skip_leaf,
             )
         }
     }
@@ -1903,15 +1905,18 @@ kernel void parent_hash3(device const uint* children [[buffer(0)]],
         leaf_start: usize,
         subtree_leaves: usize,
         parent3: bool,
+        skip_leaf: bool,
     ) {
         debug_assert!(subtree_leaves.is_power_of_two());
         debug_assert_eq!(leaf_start % subtree_leaves, 0);
         unsafe {
-            gpu.set_pipeline(enc, gpu.pso_leaf);
-            gpu.set_buffer(enc, codeword_buf, leaf_start * 1024, 0);
-            gpu.set_buffer(enc, tree_buf, leaf_start * 32, 1);
-            let tpg = 256u64.min(subtree_leaves as u64);
-            gpu.dispatch(enc, subtree_leaves as u64 / tpg, tpg);
+            if !skip_leaf {
+                gpu.set_pipeline(enc, gpu.pso_leaf);
+                gpu.set_buffer(enc, codeword_buf, leaf_start * 1024, 0);
+                gpu.set_buffer(enc, tree_buf, leaf_start * 32, 1);
+                let tpg = 256u64.min(subtree_leaves as u64);
+                gpu.dispatch(enc, subtree_leaves as u64 / tpg, tpg);
+            }
 
             let mut level_start = 0usize; // global node index of level base
             let mut level_len = n_leaves_total;
@@ -2729,17 +2734,29 @@ kernel void parent_hash3(device const uint* children [[buffer(0)]],
             let cb2 = gpu.command_buffer()?;
             let enc = gpu.compute_encoder(cb2)?;
             encode_ntt_passes_prefix(gpu, enc, staging, tw_buf, log_d, 4, prefix16);
+            // One leaf dispatch over the whole contiguous GPU prefix instead
+            // of one per aligned subtree: the leaf_hash kernel is
+            // position-relative (id maps to the bound offset), the prefix
+            // spans codeword/tree positions [0, prefix_leaves) contiguously,
+            // and the greedy subtrees are aligned within it. Same kernel,
+            // same bytes, one launch instead of three. The subtrees below
+            // then skip their leaf dispatches (skip_leaf = true).
+            let sixteenth = n_leaves / 16;
+            let prefix_leaves = (16 - k_cpu16) * sixteenth;
+            gpu.set_pipeline(enc, gpu.pso_leaf);
+            gpu.set_buffer(enc, staging, 0, 0);
+            gpu.set_buffer(enc, tree_buf, 0, 1);
+            let tpg = 256u64.min(prefix_leaves as u64);
+            gpu.dispatch(enc, prefix_leaves as u64 / tpg, tpg);
             // Greedy aligned power-of-two subtree decomposition of the
             // leaf prefix.
-            let sixteenth = n_leaves / 16;
             let mut start = 0usize;
-            let prefix_leaves = (16 - k_cpu16) * sixteenth;
             while start < prefix_leaves {
                 let mut size = 1usize << (prefix_leaves - start).ilog2();
                 while start % size != 0 {
                     size >>= 1;
                 }
-                encode_merkle_subtree(gpu, enc, staging, tree_buf, n_leaves, start, size);
+                encode_merkle_subtree(gpu, enc, staging, tree_buf, n_leaves, start, size, true);
                 start += size;
             }
             gpu.end_encoding(enc);
@@ -4440,6 +4457,7 @@ mod tests {
                 LEAF_START,
                 SUBTREE_LEAVES,
                 true,
+                false,
             );
             gpu.end_encoding(enc);
             gpu.commit_and_wait(cb).unwrap();
