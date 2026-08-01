@@ -716,11 +716,7 @@ impl<'a> ReverseTranspose<'a> {
 
     #[inline]
     fn xor_rot(&mut self, x: usize, y: usize, rotation: usize) -> usize {
-        self.push(ReverseWordOp::XorRot {
-            x,
-            y,
-            rotation,
-        })
+        self.push(ReverseWordOp::XorRot { x, y, rotation })
     }
 
     /// Register one carry-only addition and all 31 nonlinear rows that define
@@ -798,8 +794,6 @@ impl<'a> ReverseTranspose<'a> {
     }
 }
 
-
-
 pub struct Blake3LincheckCircuit;
 
 impl flock_core::lincheck::LincheckCircuit for Blake3LincheckCircuit {
@@ -859,27 +853,15 @@ impl flock_core::lincheck::LincheckCircuit for Blake3LincheckCircuit {
                 let [mx_idx, my_idx] = PER_ROUND_MSG_IDX[r][g_in_round];
                 let [a, b, c, d] = [state[la], state[lb], state[lc], state[ld]];
 
-                let tmp_0 =
-                    reverse.add(a, b, g_add_carry_bit(g, ADD_TMP0, 0));
-                let a_1 = reverse.add(
-                    tmp_0,
-                    messages[mx_idx],
-                    g_add_carry_bit(g, ADD_A1, 0),
-                );
+                let tmp_0 = reverse.add(a, b, g_add_carry_bit(g, ADD_TMP0, 0));
+                let a_1 = reverse.add(tmp_0, messages[mx_idx], g_add_carry_bit(g, ADD_A1, 0));
                 let d_1 = reverse.xor_rot(d, a_1, 16);
-                let c_1 =
-                    reverse.add(c, d_1, g_add_carry_bit(g, ADD_C1, 0));
+                let c_1 = reverse.add(c, d_1, g_add_carry_bit(g, ADD_C1, 0));
                 let b_1 = reverse.xor_rot(b, c_1, 12);
-                let tmp_1 =
-                    reverse.add(a_1, b_1, g_add_carry_bit(g, ADD_TMP1, 0));
-                let a_2 = reverse.add(
-                    tmp_1,
-                    messages[my_idx],
-                    g_add_carry_bit(g, ADD_A2, 0),
-                );
+                let tmp_1 = reverse.add(a_1, b_1, g_add_carry_bit(g, ADD_TMP1, 0));
+                let a_2 = reverse.add(tmp_1, messages[my_idx], g_add_carry_bit(g, ADD_A2, 0));
                 let d_2 = reverse.xor_rot(d_1, a_2, 8);
-                let c_2 =
-                    reverse.add(c_1, d_2, g_add_carry_bit(g, ADD_C2, 0));
+                let c_2 = reverse.add(c_1, d_2, g_add_carry_bit(g, ADD_C2, 0));
 
                 let b_new = reverse.xor_rot(b_1, c_2, 7);
                 for i in 0..WORD_BITS {
@@ -1226,6 +1208,96 @@ fn stream_lin_word(
     b.push(u32::MAX as u64, 32);
 }
 
+/// Generate one fixed BLAKE3 round. Seven no-inline monomorphs preserve each
+/// round's constant message schedule while bounding register allocation to
+/// eight G functions instead of the complete 56-G block.
+#[inline(never)]
+fn stream_round<const ROUND: usize, const USED: usize>(
+    state: &mut [u32; 16],
+    m: &[u32; 16],
+    z_out: *mut u64,
+    a_out: *mut u64,
+    b_out: *mut u64,
+    pending: &mut [u64; 3],
+) {
+    let mut wz = PackedWordWriter::at(z_out, 0, pending[0], USED);
+    let mut wa = PackedWordWriter::at(a_out, 0, pending[1], USED);
+    let mut wb = PackedWordWriter::at(b_out, 0, pending[2], USED);
+    let schedule = &PER_ROUND_MSG_IDX[ROUND];
+
+    macro_rules! g {
+        ($g:literal, $la:literal, $lb:literal, $lc:literal, $ld:literal) => {{
+            let mx = m[schedule[$g][0]];
+            let my = m[schedule[$g][1]];
+            let a_val = state[$la];
+            let b_val = state[$lb];
+            let c_val = state[$lc];
+            let d_val = state[$ld];
+
+            let mut rz = BitRecord::<4>::new();
+            let mut ra = BitRecord::<4>::new();
+            let mut rb = BitRecord::<4>::new();
+
+            macro_rules! add_into_stream {
+                ($pos:ident, $x:expr, $y:expr) => {{
+                    let (sum, left, right, carry) = add_carry_parts($x, $y);
+                    rz.push::<$pos>(carry);
+                    ra.push::<$pos>(left);
+                    rb.push::<$pos>(right);
+                    sum
+                }};
+            }
+
+            let tmp_0 = add_into_stream!(REC_C0, a_val, b_val);
+            let a_1 = add_into_stream!(REC_C1, tmp_0, mx);
+            let d_1 = (d_val ^ a_1).rotate_right(16);
+            let c_1 = add_into_stream!(REC_C2, c_val, d_1);
+            let b_1 = (b_val ^ c_1).rotate_right(12);
+            let tmp_1 = add_into_stream!(REC_C3, a_1, b_1);
+            let a_2 = add_into_stream!(REC_C4, tmp_1, my);
+            let d_2 = (d_1 ^ a_2).rotate_right(8);
+            let c_2 = add_into_stream!(REC_C5, c_1, d_2);
+            let b_new = (b_1 ^ c_2).rotate_right(7);
+            let d_new = d_2;
+            rz.push::<REC_LIN0>(b_new);
+            ra.push::<REC_LIN0>(b_new);
+            rb.push::<REC_LIN0>(u32::MAX);
+            rz.push::<REC_LIN1>(d_new);
+            ra.push::<REC_LIN1>(d_new);
+            rb.push::<REC_LIN1>(u32::MAX);
+
+            wz.push_record(&rz, G_STRIDE);
+            wa.push_record(&ra, G_STRIDE);
+            wb.push_record(&rb, G_STRIDE);
+
+            state[$la] = a_2;
+            state[$lb] = b_new;
+            state[$lc] = c_2;
+            state[$ld] = d_new;
+        }};
+    }
+
+    g!(0, 0, 4, 8, 12);
+    g!(1, 1, 5, 9, 13);
+    g!(2, 2, 6, 10, 14);
+    g!(3, 3, 7, 11, 15);
+    g!(4, 0, 5, 10, 15);
+    g!(5, 1, 6, 11, 12);
+    g!(6, 2, 7, 8, 13);
+    g!(7, 3, 4, 9, 14);
+
+    const ROUND_BITS: usize = N_G_PER_ROUND * G_STRIDE;
+    debug_assert_eq!(wz.word, (USED + ROUND_BITS) / 64);
+    debug_assert_eq!(wa.word, (USED + ROUND_BITS) / 64);
+    debug_assert_eq!(wb.word, (USED + ROUND_BITS) / 64);
+    debug_assert_eq!(wz.used, (USED + ROUND_BITS) % 64);
+    debug_assert_eq!(wa.used, (USED + ROUND_BITS) % 64);
+    debug_assert_eq!(wb.used, (USED + ROUND_BITS) % 64);
+    pending[0] = wz.pending;
+    pending[1] = wa.pending;
+    pending[2] = wb.pending;
+}
+
 /// Build the (z, a, b) blocks for ONE compression instance, into u64 views
 /// of the F128-packed per-block storage. Buffers must be zero on entry.
 ///
@@ -1393,8 +1465,8 @@ fn build_block_witness_ab_stream_into(
         std::ptr::write_bytes(b_ptr.add(4), 0, 4);
 
         let values = [
-            m[0], m[1], m[2], m[3], m[4], m[5], m[6], m[7], m[8], m[9], m[10], m[11],
-            m[12], m[13], m[14], m[15], counter_lo, counter_hi, block_len, flags,
+            m[0], m[1], m[2], m[3], m[4], m[5], m[6], m[7], m[8], m[9], m[10], m[11], m[12], m[13],
+            m[14], m[15], counter_lo, counter_hi, block_len, flags,
         ];
         for i in 0..10 {
             let low = if i == 0 {
@@ -1402,19 +1474,14 @@ fn build_block_witness_ab_stream_into(
             } else {
                 (values[2 * i - 1] >> 31) as u64
             };
-            let value = low
-                | ((values[2 * i] as u64) << 1)
-                | ((values[2 * i + 1] as u64) << 33);
+            let value = low | ((values[2 * i] as u64) << 1) | ((values[2 * i + 1] as u64) << 33);
             z_ptr.add(8 + i).write(value);
             a_ptr.add(8 + i).write(value);
             b_ptr.add(8 + i).write(u64::MAX);
         }
     }
-    let pending = (flags >> 31) as u64;
-    let mut wz = PackedWordWriter::at(z_ptr, 18, pending, 1);
-    let mut wa = PackedWordWriter::at(a_ptr, 18, pending, 1);
-    let mut wb = PackedWordWriter::at(b_ptr, 18, 1, 1);
-    debug_assert_eq!(wz.position(), GS_BASE);
+    let pending_bit = (flags >> 31) as u64;
+    let mut pending = [pending_bit, pending_bit, 1];
 
     let mut state: [u32; 16] = [
         cv[0],
@@ -1434,84 +1501,34 @@ fn build_block_witness_ab_stream_into(
         block_len,
         flags,
     ];
-    // The circuit shape and message schedule are fixed. Expanding all 56 Gs
-    // gives LLVM literal state/message indices and exposes the complete
-    // dependency graph to register allocation. This is also the source-level
-    // model for a generated AArch64 kernel: allocation and Rayon stay in Rust,
-    // while only this fixed inner computation is specialized.
-    macro_rules! g {
-        ($la:literal, $lb:literal, $lc:literal, $ld:literal, $mx:literal, $my:literal) => {{
-            let mx = m[$mx];
-            let my = m[$my];
-            let a_val = state[$la];
-            let b_val = state[$lb];
-            let c_val = state[$lc];
-            let d_val = state[$ld];
-
-            let mut rz = BitRecord::<4>::new();
-            let mut ra = BitRecord::<4>::new();
-            let mut rb = BitRecord::<4>::new();
-
-            macro_rules! add_into_stream {
-                ($pos:ident, $x:expr, $y:expr) => {{
-                    let (sum, left, right, carry) = add_carry_parts($x, $y);
-                    rz.push::<$pos>(carry);
-                    ra.push::<$pos>(left);
-                    rb.push::<$pos>(right);
-                    sum
-                }};
-            }
-
-            let tmp_0 = add_into_stream!(REC_C0, a_val, b_val);
-            let a_1 = add_into_stream!(REC_C1, tmp_0, mx);
-            let d_1 = (d_val ^ a_1).rotate_right(16);
-            let c_1 = add_into_stream!(REC_C2, c_val, d_1);
-            let b_1 = (b_val ^ c_1).rotate_right(12);
-            let tmp_1 = add_into_stream!(REC_C3, a_1, b_1);
-            let a_2 = add_into_stream!(REC_C4, tmp_1, my);
-            let d_2 = (d_1 ^ a_2).rotate_right(8);
-            let c_2 = add_into_stream!(REC_C5, c_1, d_2);
-            let b_new = (b_1 ^ c_2).rotate_right(7);
-            let d_new = d_2;
-            rz.push::<REC_LIN0>(b_new);
-            ra.push::<REC_LIN0>(b_new);
-            rb.push::<REC_LIN0>(u32::MAX);
-            rz.push::<REC_LIN1>(d_new);
-            ra.push::<REC_LIN1>(d_new);
-            rb.push::<REC_LIN1>(u32::MAX);
-
-            wz.push_record(&rz, G_STRIDE);
-            wa.push_record(&ra, G_STRIDE);
-            wb.push_record(&rb, G_STRIDE);
-
-            state[$la] = a_2;
-            state[$lb] = b_new;
-            state[$lc] = c_2;
-            state[$ld] = d_new;
-        }};
-    }
     macro_rules! round {
-        ($m0:literal, $m1:literal, $m2:literal, $m3:literal,
-         $m4:literal, $m5:literal, $m6:literal, $m7:literal,
-         $m8:literal, $m9:literal, $m10:literal, $m11:literal,
-         $m12:literal, $m13:literal, $m14:literal, $m15:literal) => {{
-            g!(0, 4, 8, 12, $m0, $m1);
-            g!(1, 5, 9, 13, $m2, $m3);
-            g!(2, 6, 10, 14, $m4, $m5);
-            g!(3, 7, 11, 15, $m6, $m7);
-            g!(0, 5, 10, 15, $m8, $m9);
-            g!(1, 6, 11, 12, $m10, $m11);
-            g!(2, 7, 8, 13, $m12, $m13);
-            g!(3, 4, 9, 14, $m14, $m15);
+        ($round:literal) => {{
+            const BASE_BIT: usize = GS_BASE + $round * N_G_PER_ROUND * G_STRIDE;
+            const BASE_WORD: usize = BASE_BIT / 64;
+            const USED: usize = BASE_BIT % 64;
+            stream_round::<$round, USED>(
+                &mut state,
+                m,
+                unsafe { z_ptr.add(BASE_WORD) },
+                unsafe { a_ptr.add(BASE_WORD) },
+                unsafe { b_ptr.add(BASE_WORD) },
+                &mut pending,
+            );
         }};
     }
-    round!(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15);
-    round!(2, 6, 3, 10, 7, 0, 4, 13, 1, 11, 12, 5, 9, 14, 15, 8);
-    round!(3, 4, 10, 12, 13, 2, 7, 14, 6, 5, 9, 0, 11, 15, 8, 1);
-    round!(10, 7, 12, 9, 14, 3, 13, 15, 4, 0, 11, 2, 5, 8, 1, 6);
-    round!(12, 13, 9, 11, 15, 10, 14, 8, 7, 2, 5, 3, 0, 1, 6, 4);
-    round!(9, 14, 11, 5, 8, 12, 15, 1, 13, 3, 0, 10, 2, 6, 4, 7);
-    round!(11, 15, 5, 0, 1, 9, 8, 6, 14, 10, 2, 12, 3, 4, 7, 13);
+    round!(0);
+    round!(1);
+    round!(2);
+    round!(3);
+    round!(4);
+    round!(5);
+    round!(6);
+
+    const FINAL_WORD: usize = OUT_HI_BASE / 64;
+    const FINAL_USED: usize = OUT_HI_BASE % 64;
+    let mut wz = PackedWordWriter::at(z_ptr, FINAL_WORD, pending[0], FINAL_USED);
+    let mut wa = PackedWordWriter::at(a_ptr, FINAL_WORD, pending[1], FINAL_USED);
+    let mut wb = PackedWordWriter::at(b_ptr, FINAL_WORD, pending[2], FINAL_USED);
     debug_assert_eq!(wz.position(), OUT_HI_BASE);
 
     let out_lo: [u32; 8] = std::array::from_fn(|w| state[w] ^ state[w + 8]);
@@ -1769,8 +1786,7 @@ impl Blake3Setup {
             && self.r1cs.b_0.num_cols == K
             && self.pcs_params.log_inv_rate == 1
             && self.pcs_params.log_batch_size == 6
-            && self.pcs_params.profile
-                == flock_core::pcs::ligerito::LigeritoProfile::Fast
+            && self.pcs_params.profile == flock_core::pcs::ligerito::LigeritoProfile::Fast
             && std::env::var_os("FLOCK_NO_BLAKE3_REVERSE_LINCHECK").is_none()
     }
 
