@@ -56,6 +56,11 @@ pub const ENV_NO_GPU_MIXED_FINAL: &str = "FLOCK_NO_GPU_MIXED_FINAL";
 /// exact value `1` disables it; the optimization remains ranked-tree-only.
 pub const ENV_NO_GPU_PARENT3: &str = "FLOCK_NO_GPU_PARENT3";
 
+/// Strict same-binary control for the streamed hybrid-tuner metric repair.
+/// Exact value `1` restores the promoted behavior that subtracts a separately
+/// measured first-pass wall from a graph that already excludes that pass.
+pub const ENV_NO_HYBRID_TUNE_METRIC_FIX: &str = "FLOCK_NO_HYBRID_TUNE_METRIC_FIX";
+
 fn gpu_parent3_value_enabled(value: Option<&std::ffi::OsStr>) -> bool {
     value != Some(std::ffi::OsStr::new("1"))
 }
@@ -69,6 +74,23 @@ fn gpu_parent3_enabled() -> bool {
 
 fn select_gpu_parent3(n_leaves_total: usize, enabled: bool) -> bool {
     enabled && n_leaves_total == 1usize << 20
+}
+
+fn hybrid_tune_metric_fix_value_enabled(value: Option<&std::ffi::OsStr>) -> bool {
+    value != Some(std::ffi::OsStr::new("1"))
+}
+
+#[cfg_attr(
+    not(all(target_os = "macos", target_arch = "aarch64")),
+    allow(dead_code)
+)]
+fn hybrid_tune_metric_fix_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        hybrid_tune_metric_fix_value_enabled(
+            std::env::var_os(ENV_NO_HYBRID_TUNE_METRIC_FIX).as_deref(),
+        )
+    })
 }
 
 #[cfg(test)]
@@ -377,6 +399,192 @@ pub(crate) fn plan_passes(log_d: usize, start_layer: usize) -> Vec<(usize, usize
         l += f;
     }
     passes
+}
+
+/// Promoted fixed hybrid share, used when the warmup sweep is disabled or has
+/// not published a winner.
+#[cfg_attr(
+    not(all(target_os = "macos", target_arch = "aarch64")),
+    allow(dead_code)
+)]
+const DEFAULT_HYBRID_K: usize = 5;
+
+/// Pure selection over the sweep's per-candidate best walls; `candidates` is
+/// ascending and must contain `default_k`. Deliberately asymmetric toward the
+/// promoted default:
+/// - the smallest share within 1.5% of the fastest wins (the timed prove's
+///   round-1 precompute contends for the same cores, so near-ties resolve
+///   toward the GPU);
+/// - if the default is itself within 1.5% of the fastest, keep it -- an
+///   emulated sweep cannot adjudicate noise-thin margins, the ranked runner
+///   can;
+/// - k=0 must beat the default by > 4% -- official board evidence has the
+///   hybrid several percent ahead of the pure-GPU graph, so a sweep that says
+///   otherwise is more likely an emulation artifact (for example, the burn
+///   floor collapsing all candidates) than truth.
+///
+/// The metric repair changes only the walls supplied to this function; the
+/// candidate set and this policy stay exact.
+#[cfg_attr(
+    not(all(target_os = "macos", target_arch = "aarch64")),
+    allow(dead_code)
+)]
+fn choose_hybrid_k(candidates: &[usize], best_ms: &[f64], default_k: usize) -> Option<usize> {
+    let default_i = candidates
+        .iter()
+        .position(|&k| k == default_k)
+        .expect("default split is a sweep candidate");
+    let fastest = best_ms.iter().cloned().fold(f64::INFINITY, f64::min);
+    let chosen_i = (0..candidates.len()).find(|&i| best_ms[i] <= fastest * 1.015)?;
+    let mut chosen = candidates[chosen_i];
+    if best_ms[default_i] <= fastest * 1.015 {
+        chosen = default_k;
+    }
+    if chosen == 0 && best_ms[chosen_i] > best_ms[default_i] * (1.0 - 0.04) {
+        chosen = default_k;
+    }
+    Some(chosen)
+}
+
+/// Convert an observed post-first-pass joined wall to the selector metric.
+/// The repaired default returns the observation unchanged. The strict control
+/// reproduces the promoted shifted/clamped metric exactly.
+#[cfg_attr(
+    not(all(target_os = "macos", target_arch = "aarch64")),
+    allow(dead_code)
+)]
+fn hybrid_tune_metric_ms(observed_ms: f64, first_pass_ms: f64, repaired: bool) -> f64 {
+    if repaired {
+        observed_ms
+    } else {
+        (observed_ms - first_pass_ms).max(0.0)
+    }
+}
+
+#[cfg(test)]
+mod tune_metric_tests {
+    use super::{
+        DEFAULT_HYBRID_K, choose_hybrid_k, hybrid_tune_metric_fix_value_enabled,
+        hybrid_tune_metric_ms, plan_passes,
+    };
+    use std::ffi::OsStr;
+
+    const CANDIDATES: [usize; 8] = [0, 2, 3, 4, 5, 6, 7, 8];
+
+    fn metrics(observed: [f64; 8], first_pass_ms: f64, repaired: bool) -> [f64; 8] {
+        observed.map(|ms| hybrid_tune_metric_ms(ms, first_pass_ms, repaired))
+    }
+
+    #[test]
+    fn strict_control_restores_promoted_metric_only_for_exact_one() {
+        assert!(!hybrid_tune_metric_fix_value_enabled(Some(OsStr::new("1"))));
+        for value in [None, Some(""), Some("0"), Some("01"), Some("true")] {
+            assert!(hybrid_tune_metric_fix_value_enabled(value.map(OsStr::new)));
+        }
+        assert_eq!(hybrid_tune_metric_ms(160.0, 40.0, true), 160.0);
+        assert_eq!(hybrid_tune_metric_ms(160.0, 40.0, false), 120.0);
+        assert_eq!(hybrid_tune_metric_ms(30.0, 40.0, false), 0.0);
+    }
+
+    #[test]
+    fn raw_wall_preserves_true_near_tie_that_shift_breaks() {
+        // 162 / 160 = 1.0125, so the declared 1.5% rule retains default k=5.
+        let observed = [300.0, 300.0, 160.0, 300.0, 162.0, 300.0, 300.0, 300.0];
+        let repaired = metrics(observed, 40.0, true);
+        let promoted = metrics(observed, 40.0, false);
+        assert_eq!(
+            choose_hybrid_k(&CANDIDATES, &repaired, DEFAULT_HYBRID_K),
+            Some(5)
+        );
+        assert_eq!(
+            choose_hybrid_k(&CANDIDATES, &promoted, DEFAULT_HYBRID_K),
+            Some(3)
+        );
+    }
+
+    #[test]
+    fn raw_wall_preserves_k0_guard_that_shift_breaks() {
+        // k=0 is only 3.125% faster than default and must not clear its 4% gate.
+        let observed = [155.0, 300.0, 300.0, 300.0, 160.0, 300.0, 300.0, 300.0];
+        let repaired = metrics(observed, 40.0, true);
+        let promoted = metrics(observed, 40.0, false);
+        assert_eq!(
+            choose_hybrid_k(&CANDIDATES, &repaired, DEFAULT_HYBRID_K),
+            Some(5)
+        );
+        assert_eq!(
+            choose_hybrid_k(&CANDIDATES, &promoted, DEFAULT_HYBRID_K),
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn raw_wall_avoids_shifted_clamp_counterexample() {
+        // The same marginal k=0 lead is converted into 0 ms versus 2 ms by
+        // subtraction and clamp, bypassing the intended 4% protection.
+        let observed = [100.0, 300.0, 300.0, 300.0, 103.0, 300.0, 300.0, 300.0];
+        let repaired = metrics(observed, 101.0, true);
+        let promoted = metrics(observed, 101.0, false);
+        assert_eq!(
+            choose_hybrid_k(&CANDIDATES, &repaired, DEFAULT_HYBRID_K),
+            Some(5)
+        );
+        assert_eq!(promoted[0], 0.0);
+        assert_eq!(promoted[4], 2.0);
+        assert_eq!(
+            choose_hybrid_k(&CANDIDATES, &promoted, DEFAULT_HYBRID_K),
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn ranked_one_sixteenth_work_counts_are_source_derived() {
+        const LOG_D: usize = 20;
+        const LANES: usize = 64;
+        const SIXTEENTHS: usize = 16;
+        let passes = plan_passes(LOG_D, 4);
+        assert_eq!(passes, [(4, 4), (8, 4), (12, 4), (16, 4)]);
+
+        let f128_elements = ((1usize << LOG_D) * LANES) / SIXTEENTHS;
+        let remaining_layers: usize = passes.iter().map(|&(_, f)| f).sum();
+        let butterflies = (f128_elements / 2) * remaining_layers;
+        let min_cpu_rw_bytes =
+            f128_elements * core::mem::size_of::<super::F128>() * 2 * passes.len();
+        assert_eq!(f128_elements, 1 << 22);
+        assert_eq!(butterflies, 1 << 25);
+        assert_eq!(min_cpu_rw_bytes, 1 << 29);
+
+        // Mirrors the default table-reuse grids in encode_ntt_passes_prefix:
+        // the first three passes group four same-B tiles; the final pass does not.
+        let gpu_threadgroups: usize = passes
+            .iter()
+            .map(|&(l, f)| {
+                let s = LOG_D - l - f;
+                let full_groups = if f == 4 && s >= 2 {
+                    1usize << (LOG_D - f - 2)
+                } else {
+                    1usize << (LOG_D - f)
+                };
+                full_groups / SIXTEENTHS
+            })
+            .sum();
+        assert_eq!(gpu_threadgroups, 7_168);
+
+        let leaves = (1usize << LOG_D) / SIXTEENTHS;
+        let leaf_compressions = leaves * 16;
+        let internal_parents = leaves - 1;
+        assert_eq!(leaves, 65_536);
+        assert_eq!(leaf_compressions, 1_048_576);
+        assert_eq!(internal_parents, 65_535);
+
+        // One removed standalone tuned from-z pass reads 512 MiB of z, writes
+        // 1 GiB of staging, and launches 2^(20-6) g4 threadgroups.
+        let z_bytes = (1usize << 25) * core::mem::size_of::<super::F128>();
+        let staging_bytes = (1usize << LOG_D) * LANES * core::mem::size_of::<super::F128>();
+        assert_eq!(z_bytes, 1 << 29);
+        assert_eq!(staging_bytes, 1 << 30);
+        assert_eq!(1usize << (LOG_D - 6), 16_384);
+    }
 }
 
 /// Upper bound on the bit-length of any twiddle at `layer` of a size-`2^log_d`
@@ -2991,10 +3199,6 @@ kernel void parent_hash3(device const uint* children [[buffer(0)]],
         }
     }
 
-    /// Promoted fixed default, used when the warmup sweep is disabled or has
-    /// not published a winner.
-    const DEFAULT_HYBRID_K: usize = 5;
-
     /// Warmup-sweep-published CPU share (sentinel `usize::MAX` = not tuned).
     static TUNED_HYBRID_K: std::sync::atomic::AtomicUsize =
         std::sync::atomic::AtomicUsize::new(usize::MAX);
@@ -3014,36 +3218,6 @@ kernel void parent_hash3(device const uint* children [[buffer(0)]],
                 .and_then(|v| v.parse().ok())
                 .filter(|k| *k < 16)
         })
-    }
-
-    /// Pure selection over the sweep's per-candidate best walls; `candidates`
-    /// is ascending and must contain `default_k`. Deliberately asymmetric
-    /// toward the promoted default:
-    /// - the smallest share within 1.5% of the fastest wins (the timed
-    ///   prove's round-1 precompute contends for the same cores, so
-    ///   near-ties resolve toward the GPU);
-    /// - if the default is itself within 1.5% of the fastest, keep it — an
-    ///   emulated sweep cannot adjudicate noise-thin margins, the ranked
-    ///   runner can;
-    /// - k=0 must beat the default by > 4% — official board evidence has the
-    ///   hybrid several percent ahead of the pure-GPU graph, so a sweep that
-    ///   says otherwise is more likely an emulation artifact (e.g. the burn
-    ///   floor collapsing all candidates) than truth.
-    fn choose_hybrid_k(candidates: &[usize], best_ms: &[f64], default_k: usize) -> Option<usize> {
-        let default_i = candidates
-            .iter()
-            .position(|&k| k == default_k)
-            .expect("default split is a sweep candidate");
-        let fastest = best_ms.iter().cloned().fold(f64::INFINITY, f64::min);
-        let chosen_i = (0..candidates.len()).find(|&i| best_ms[i] <= fastest * 1.015)?;
-        let mut chosen = candidates[chosen_i];
-        if best_ms[default_i] <= fastest * 1.015 {
-            chosen = default_k;
-        }
-        if chosen == 0 && best_ms[chosen_i] > best_ms[default_i] * (1.0 - 0.04) {
-            chosen = default_k;
-        }
-        Some(chosen)
     }
 
     /// Untimed-warmup split sweep. The scoring host's CPU/GPU balance is
@@ -3189,16 +3363,16 @@ kernel void parent_hash3(device const uint* children [[buffer(0)]],
                 std::hint::black_box(x);
             });
         };
-        // Wall-safe streamed-regime correction: the per-candidate staging
-        // re-prime form runs the from-z first pass 8+ extra times per
-        // warm-up; multiplied by the harness's ~120 fresh worker processes
-        // that spends minutes of JOB wall against the ranked CI's 8-minute
-        // budget (three above-bar submissions died to it as "failed"
-        // timeouts before the mechanism was identified). The first pass is
-        // k-INDEPENDENT, so measuring its wall once and subtracting the
-        // constant from each candidate's full-graph wall yields the same
-        // corrected ranking at one extra pass total.
-        let first_pass_ms = if streamed_probe {
+        // `timed_graph` already excludes the streamed first pass. Feed its
+        // raw joined wall to the percentage-based selector: subtracting an
+        // unrelated constant preserves ordering before clamp, but corrupts
+        // both the 1.5% near-tie band and the 4% k=0 guard. The graph grids,
+        // loop counts, and memory volume are input-value-independent; the
+        // exact winner is still re-primed from z and byte-checked below.
+        // Exact-value control `1` restores the promoted shifted/clamped
+        // metric, including its standalone first-pass probe.
+        let metric_repaired = super::hybrid_tune_metric_fix_enabled();
+        let first_pass_ms = if streamed_probe && !metric_repaired {
             let c = &ctx;
             let t0 = std::time::Instant::now();
             match unsafe { run_from_z_first_pass(c.gpu, c.z_buf, c.staging, c.tw_buf, log_d) } {
@@ -3219,7 +3393,11 @@ kernel void parent_hash3(device const uint* children [[buffer(0)]],
             let t0 = std::time::Instant::now();
             let (r, ()) = rayon::join(|| timed_graph(k), burn_work);
             r?;
-            Ok((t0.elapsed().as_secs_f64() * 1e3 - first_pass_ms).max(0.0))
+            Ok(super::hybrid_tune_metric_ms(
+                t0.elapsed().as_secs_f64() * 1e3,
+                first_pass_ms,
+                metric_repaired,
+            ))
         };
         const CANDIDATES: [usize; 8] = [0, 2, 3, 4, 5, 6, 7, 8];
         let mut best_ms = [f64::INFINITY; CANDIDATES.len()];
