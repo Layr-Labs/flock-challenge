@@ -374,7 +374,10 @@ where
         .zip(a.par_chunks_mut(8 * f128_per_block))
         .zip(b.par_chunks_mut(8 * f128_per_block))
         .zip(z_lincheck.par_chunks_mut(k))
-        .with_max_len(256)
+        // Each item emits eight blocks and touches hundreds of KiB across
+        // z/a/b/stripe. Finer tasks let work stealing smooth per-core
+        // variation without scheduling each group separately.
+        .with_max_len(32)
         .enumerate()
         .for_each(|(g, (((z_grp, a_grp), b_grp), stripe))| {
             // Ordinary per-block builders OR 1-bits into pre-zeroed words; any
