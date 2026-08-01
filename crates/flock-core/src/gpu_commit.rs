@@ -44,10 +44,21 @@ pub const ENV_GPU_COMMIT_FORCE: &str = "FLOCK_GPU_COMMIT_FORCE";
 /// restoring the incumbent kernel selection as the same-binary control.
 pub const ENV_NO_NTT_PASS_TUNE: &str = "FLOCK_NO_NTT_PASS_TUNE";
 
+/// Disable the direct-schedule BLAKE3 GPU kernels and restore the incumbent
+/// runtime message-permutation kernels for a same-binary comparison.
+pub const ENV_NO_GPU_B3_DIRECT: &str = "FLOCK_NO_GPU_B3_DIRECT";
+
 /// Latched once: pass tuning enabled unless the kill switch is set.
 pub(crate) fn pass_tune_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os(ENV_NO_NTT_PASS_TUNE).is_none())
+}
+
+/// Latched once outside the GPU hot path. Both implementations are compiled
+/// into the same Metal library; graph encoding pays only this cached branch.
+pub(crate) fn gpu_b3_direct_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os(ENV_NO_GPU_B3_DIRECT).is_none())
 }
 
 /// Wall-clock margin the GPU must beat during the warmup dual-run: latch on
@@ -951,6 +962,47 @@ static void b3_compress(thread uint* cv, thread const uint* m_in,
     for (int i = 0; i < 8; i++) cv[i] = v[i] ^ v[8 + i];
 }
 
+// Direct seven-round schedule for the fixed leaf/parent compression shape.
+// The incumbent routine above carries two 16-word arrays and permutes/copies
+// the message after six rounds. Every message index is compile-time constant
+// here, so those 192 local-word moves and their dynamic indexing disappear
+// from each compression. A ranked tree executes 16 leaf compressions plus
+// almost one parent compression per leaf, making this a broad graph lever.
+static inline void b3_compress_direct(thread uint* cv,
+                                      thread const uint* m,
+                                      uint flags) {
+    uint v[16];
+    for (int i = 0; i < 8; i++) v[i] = cv[i];
+    for (int i = 0; i < 4; i++) v[8 + i] = B3_IV[i];
+    v[12] = 0u;
+    v[13] = 0u;
+    v[14] = 64u;
+    v[15] = flags;
+
+    #define B3_GD(a,b,c,d,x,y) \
+        v[a] = v[a] + v[b] + x; v[d] = ((v[d]^v[a])>>16)|((v[d]^v[a])<<16); \
+        v[c] = v[c] + v[d];     v[b] = ((v[b]^v[c])>>12)|((v[b]^v[c])<<20); \
+        v[a] = v[a] + v[b] + y; v[d] = ((v[d]^v[a])>>8) |((v[d]^v[a])<<24); \
+        v[c] = v[c] + v[d];     v[b] = ((v[b]^v[c])>>7) |((v[b]^v[c])<<25);
+    #define B3_RD(i0,i1,i2,i3,i4,i5,i6,i7,i8,i9,i10,i11,i12,i13,i14,i15) \
+        B3_GD(0,4,8,12,  m[i0], m[i1]);   B3_GD(1,5,9,13,  m[i2], m[i3]); \
+        B3_GD(2,6,10,14, m[i4], m[i5]);   B3_GD(3,7,11,15, m[i6], m[i7]); \
+        B3_GD(0,5,10,15, m[i8], m[i9]);   B3_GD(1,6,11,12, m[i10],m[i11]); \
+        B3_GD(2,7,8,13,  m[i12],m[i13]);  B3_GD(3,4,9,14,  m[i14],m[i15]);
+
+    B3_RD(0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15)
+    B3_RD(2,6,3,10,7,0,4,13,1,11,12,5,9,14,15,8)
+    B3_RD(3,4,10,12,13,2,7,14,6,5,9,0,11,15,8,1)
+    B3_RD(10,7,12,9,14,3,13,15,4,0,11,2,5,8,1,6)
+    B3_RD(12,13,9,11,15,10,14,8,7,2,5,3,0,1,6,4)
+    B3_RD(9,14,11,5,8,12,15,1,13,3,0,10,2,6,4,7)
+    B3_RD(11,15,5,0,1,9,8,6,14,10,2,12,3,4,7,13)
+
+    #undef B3_RD
+    #undef B3_GD
+    for (int i = 0; i < 8; i++) cv[i] = v[i] ^ v[8 + i];
+}
+
 kernel void leaf_hash(device const uint* codeword [[buffer(0)]],
                       device uint* out            [[buffer(1)]],
                       uint id [[thread_position_in_grid]])
@@ -979,6 +1031,34 @@ kernel void parent_hash(device const uint* children [[buffer(0)]],
     for (int i = 0; i < 8; i++) parents[id * 8u + i] = cv[i];
 }
 
+kernel void leaf_hash_direct(device const uint* codeword [[buffer(0)]],
+                             device uint* out            [[buffer(1)]],
+                             uint id [[thread_position_in_grid]])
+{
+    device const uint* leaf = codeword + id * 256u;
+    uint cv[8];
+    for (int i = 0; i < 8; i++) cv[i] = B3_IV[i];
+    for (uint b = 0; b < 16u; b++) {
+        uint block[16];
+        for (uint i = 0; i < 16u; i++) block[i] = leaf[b * 16u + i];
+        uint flags = (b == 0u ? B3_CHUNK_START : 0u) | (b == 15u ? B3_CHUNK_END : 0u);
+        b3_compress_direct(cv, block, flags);
+    }
+    for (int i = 0; i < 8; i++) out[id * 8u + i] = cv[i];
+}
+
+kernel void parent_hash_direct(device const uint* children [[buffer(0)]],
+                               device uint* parents        [[buffer(1)]],
+                               uint id [[thread_position_in_grid]])
+{
+    uint block[16];
+    for (uint i = 0; i < 16u; i++) block[i] = children[id * 16u + i];
+    uint cv[8];
+    for (int i = 0; i < 8; i++) cv[i] = B3_IV[i];
+    b3_compress_direct(cv, block, B3_PARENT);
+    for (int i = 0; i < 8; i++) parents[id * 8u + i] = cv[i];
+}
+
 "#;
 
     // -----------------------------------------------------------------------
@@ -1000,6 +1080,8 @@ kernel void parent_hash(device const uint* children [[buffer(0)]],
         pub(crate) pso_ntt4h8: Id,
         pub(crate) pso_leaf: Id,
         pub(crate) pso_parent: Id,
+        pub(crate) pso_leaf_direct: Id,
+        pub(crate) pso_parent_direct: Id,
     }
     // SAFETY: MTLDevice/MTLCommandQueue/MTLComputePipelineState are
     // documented thread-safe; command buffers/encoders are created and used
@@ -1100,6 +1182,8 @@ kernel void parent_hash(device const uint* children [[buffer(0)]],
                 let pso_ntt4h8 = pso("ntt_fused_reg4h8")?;
                 let pso_leaf = pso("leaf_hash")?;
                 let pso_parent = pso("parent_hash")?;
+                let pso_leaf_direct = pso("leaf_hash_direct")?;
+                let pso_parent_direct = pso("parent_hash_direct")?;
                 send!(api, unsafe extern "C" fn(Id, Sel) -> Id, library, c"release");
                 Ok(Gpu {
                     api,
@@ -1114,6 +1198,8 @@ kernel void parent_hash(device const uint* children [[buffer(0)]],
                     pso_ntt4h8,
                     pso_leaf,
                     pso_parent,
+                    pso_leaf_direct,
+                    pso_parent_direct,
                 })
             })();
             pool_pop(pool);
@@ -1505,13 +1591,28 @@ kernel void parent_hash(device const uint* children [[buffer(0)]],
         debug_assert!(subtree_leaves.is_power_of_two());
         debug_assert_eq!(leaf_start % subtree_leaves, 0);
         unsafe {
-            gpu.set_pipeline(enc, gpu.pso_leaf);
+            let direct = super::gpu_b3_direct_enabled();
+            gpu.set_pipeline(
+                enc,
+                if direct {
+                    gpu.pso_leaf_direct
+                } else {
+                    gpu.pso_leaf
+                },
+            );
             gpu.set_buffer(enc, codeword_buf, leaf_start * 1024, 0);
             gpu.set_buffer(enc, tree_buf, leaf_start * 32, 1);
             let tpg = 256u64.min(subtree_leaves as u64);
             gpu.dispatch(enc, subtree_leaves as u64 / tpg, tpg);
 
-            gpu.set_pipeline(enc, gpu.pso_parent);
+            gpu.set_pipeline(
+                enc,
+                if direct {
+                    gpu.pso_parent_direct
+                } else {
+                    gpu.pso_parent
+                },
+            );
             let mut level_start = 0usize; // global node index of level base
             let mut level_len = n_leaves_total;
             let mut local_start = leaf_start;
@@ -1546,13 +1647,28 @@ kernel void parent_hash(device const uint* children [[buffer(0)]],
         n_leaves: usize,
     ) {
         unsafe {
-            gpu.set_pipeline(enc, gpu.pso_leaf);
+            let direct = super::gpu_b3_direct_enabled();
+            gpu.set_pipeline(
+                enc,
+                if direct {
+                    gpu.pso_leaf_direct
+                } else {
+                    gpu.pso_leaf
+                },
+            );
             gpu.set_buffer(enc, codeword_buf, 0, 0);
             gpu.set_buffer(enc, tree_buf, 0, 1);
             let tpg = 256u64.min(n_leaves as u64);
             gpu.dispatch(enc, n_leaves as u64 / tpg, tpg);
 
-            gpu.set_pipeline(enc, gpu.pso_parent);
+            gpu.set_pipeline(
+                enc,
+                if direct {
+                    gpu.pso_parent_direct
+                } else {
+                    gpu.pso_parent
+                },
+            );
             let mut read_start = 0usize; // node index
             let mut read_len = n_leaves;
             while read_len > 1 {
