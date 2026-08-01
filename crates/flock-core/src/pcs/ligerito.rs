@@ -2101,6 +2101,70 @@ fn transpose_forward_ntt_fused_3layer(
     });
 }
 
+/// Final three transpose layers when the caller retains only the low half.
+/// The first two layers still contribute to both root inputs, but the root
+/// butterfly's retained output is just `top = a + b`. Its discarded output
+/// `bottom = t * (a + b) + b` therefore needs neither the field product nor
+/// the store. The four writes per row cover exactly `data[..data.len() / 2]`.
+fn transpose_forward_ntt_fused_final_3layer_low_half(
+    ntt: &AdditiveNttF128,
+    data: &mut [F128],
+    log_d: usize,
+) {
+    use rayon::prelude::*;
+
+    #[cfg(test)]
+    TEST_TRUNCATED_FINAL_NTT_HITS.with(|hits| hits.set(hits.get() + 1));
+
+    #[inline(always)]
+    fn butterfly(values: &mut [F128; 8], a: usize, b: usize, twiddle: F128) {
+        let sum = values[a] + values[b];
+        values[a] = sum;
+        values[b] = twiddle * sum + values[b];
+    }
+
+    assert!(log_d >= 3);
+    assert_eq!(data.len(), 1usize << log_d);
+    let eighth = data.len() >> 3;
+    let mut layer_1_twiddles = [F128::ZERO; 2];
+    let mut layer_2_twiddles = [F128::ZERO; 4];
+    for (block, twiddle) in layer_1_twiddles.iter_mut().enumerate() {
+        *twiddle = ntt.twiddle(1, block);
+    }
+    for (block, twiddle) in layer_2_twiddles.iter_mut().enumerate() {
+        *twiddle = ntt.twiddle(2, block);
+    }
+
+    let data_ptr = data.as_mut_ptr() as usize;
+    (0..eighth).into_par_iter().for_each(|row| {
+        let mut values = [F128::ZERO; 8];
+        // SAFETY: each row owns the eight positions `row + i*eighth`.
+        // Different rows never overlap. Only positions i=0..4 are written;
+        // together those positions are exactly the retained low half.
+        unsafe {
+            let ptr = data_ptr as *mut F128;
+            for (i, value) in values.iter_mut().enumerate() {
+                *value = *ptr.add(row + i * eighth);
+            }
+            for pair in 0..4 {
+                butterfly(&mut values, 2 * pair, 2 * pair + 1, layer_2_twiddles[pair]);
+            }
+            for half in 0..2 {
+                butterfly(&mut values, 4 * half, 4 * half + 2, layer_1_twiddles[half]);
+                butterfly(
+                    &mut values,
+                    4 * half + 1,
+                    4 * half + 3,
+                    layer_1_twiddles[half],
+                );
+            }
+            for i in 0..4 {
+                *ptr.add(row + i * eighth) = values[i] + values[i + 4];
+            }
+        }
+    });
+}
+
 /// Transposed forward additive NTT, `Fᵀ`, in place over `2^log_d` coefficients.
 /// Forward butterfly is `M=[[1,t],[1,t+1]]`; transpose `Mᵀ=[[1,1],[t,t+1]]` is
 /// `s=a+b; top=s; bot=t·s+b`, applied in **reverse** layer order. (Baseline:
@@ -2154,6 +2218,74 @@ fn transpose_forward_ntt(ntt: &AdditiveNttF128, data: &mut [F128], log_d: usize)
     }
 }
 
+/// Exact ranked top-level induction shape. It transforms a 2^20 rate-two
+/// codeword, keeps 2^19 coefficients, folds 64 lanes, and batches 218 opens.
+#[inline]
+fn is_ranked_induce_truncated_final_ntt_shape(
+    log_msg_cols: usize,
+    log_inv_rate: usize,
+    log_num_interleaved: usize,
+    n_queries: usize,
+    alpha_len: usize,
+) -> bool {
+    log_msg_cols == 19
+        && log_inv_rate == 1
+        && log_num_interleaved == 6
+        && n_queries == 218
+        && alpha_len == 8
+}
+
+#[cfg(test)]
+std::thread_local! {
+    static TEST_TRUNCATED_FINAL_NTT_OVERRIDE: std::cell::Cell<Option<bool>> =
+        const { std::cell::Cell::new(None) };
+    static TEST_TRUNCATED_FINAL_NTT_HITS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
+
+#[inline]
+fn use_ranked_induce_truncated_final_ntt(
+    log_msg_cols: usize,
+    log_inv_rate: usize,
+    log_num_interleaved: usize,
+    n_queries: usize,
+    alpha_len: usize,
+) -> bool {
+    #[cfg(test)]
+    if let Some(enabled) = TEST_TRUNCATED_FINAL_NTT_OVERRIDE.with(|slot| slot.get()) {
+        return enabled;
+    }
+
+    cfg!(all(target_os = "macos", target_arch = "aarch64"))
+        && is_ranked_induce_truncated_final_ntt_shape(
+            log_msg_cols,
+            log_inv_rate,
+            log_num_interleaved,
+            n_queries,
+            alpha_len,
+        )
+        && std::env::var_os("FLOCK_NO_LIG_INDUCE_TRUNCATED_NTT").is_none()
+}
+
+#[cfg(test)]
+fn with_truncated_final_ntt_override<T>(enabled: bool, f: impl FnOnce() -> T) -> T {
+    TEST_TRUNCATED_FINAL_NTT_OVERRIDE.with(|slot| {
+        struct Reset<'a> {
+            slot: &'a std::cell::Cell<Option<bool>>,
+            previous: Option<bool>,
+        }
+        impl Drop for Reset<'_> {
+            fn drop(&mut self) {
+                self.slot.set(self.previous);
+            }
+        }
+
+        let previous = slot.replace(Some(enabled));
+        let _reset = Reset { slot, previous };
+        f()
+    })
+}
+
 /// `Fᵀ`-based fast path for [`induce_sumcheck_poly`]: scatter per-query weights
 /// into the codeword domain, apply `Fᵀ`, keep the low `2^log_msg_cols` outputs.
 /// Byte-identical output to [`induce_sumcheck_poly`].
@@ -2170,6 +2302,13 @@ pub(crate) fn induce_sumcheck_poly_via_ntt(
     let block_len = 1usize << log_block;
     let n_queries = queries.len();
     assert_eq!(opened_rows.len(), n_queries);
+    let truncate_final_group = use_ranked_induce_truncated_final_ntt(
+        log_msg_cols,
+        log_inv_rate,
+        v_challenges.len(),
+        n_queries,
+        alpha.len(),
+    );
 
     let eq = build_eq_table(v_challenges);
     let alpha_pows: Vec<F128> = if n_queries == 0 {
@@ -2198,7 +2337,7 @@ pub(crate) fn induce_sumcheck_poly_via_ntt(
         c
     } else {
         let ntt = AdditiveNttF128::standard(log_block);
-        transpose_forward_ntt_sparse(&ntt, queries, &alpha_pows, log_block)
+        transpose_forward_ntt_sparse(&ntt, queries, &alpha_pows, log_block, truncate_final_group)
     };
     coeffs.truncate(n);
     (coeffs, enforced_sum)
@@ -2394,13 +2533,24 @@ fn transpose_forward_ntt_dense_suffix(
     data: &mut [F128],
     log_d: usize,
     prefix_k: usize,
+    truncate_final_group: bool,
 ) {
     use rayon::prelude::*;
     let n_threads = rayon::current_num_threads().max(1);
     let mut remaining = log_d - prefix_k;
+    if truncate_final_group {
+        // The optimized ranked schedule ends in the fused layers 2,1,0.
+        // Keep the gate explicit so another sparse geometry cannot silently
+        // skip outputs from a differently shaped suffix schedule.
+        assert!(remaining >= 3 && remaining.is_multiple_of(3));
+    }
     while remaining >= 3 {
         let layer = remaining - 3;
-        transpose_forward_ntt_fused_3layer(ntt, data, log_d, layer);
+        if truncate_final_group && layer == 0 {
+            transpose_forward_ntt_fused_final_3layer_low_half(ntt, data, log_d);
+        } else {
+            transpose_forward_ntt_fused_3layer(ntt, data, log_d, layer);
+        }
         remaining -= 3;
     }
     for layer in (0..remaining).rev() {
@@ -2445,12 +2595,14 @@ fn transpose_forward_ntt_sparse(
     positions: &[usize],
     values: &[F128],
     log_d: usize,
+    truncate_final_group: bool,
 ) -> Vec<F128> {
     let n = 1usize << log_d;
     // No prefix for small domains — just scatter + full dense transpose.
     let k = if log_d >= 12 { 8usize.min(log_d) } else { 0 };
 
     if k == 0 {
+        assert!(!truncate_final_group);
         let mut data = vec![F128::ZERO; n];
         for (&p, &v) in positions.iter().zip(values) {
             data[p] += v;
@@ -2466,7 +2618,14 @@ fn transpose_forward_ntt_sparse(
         && *LINEAR_WINDOWS_ENABLED
             .get_or_init(|| std::env::var_os("FLOCK_NO_INDUCE_LINEAR_WINDOWS").is_none());
     if !use_linear_windows {
-        return transpose_forward_ntt_sparse_hashmap(ntt, positions, values, log_d, k);
+        return transpose_forward_ntt_sparse_hashmap(
+            ntt,
+            positions,
+            values,
+            log_d,
+            k,
+            truncate_final_group,
+        );
     }
 
     let groups = group_sorted_positions(positions, k);
@@ -2477,7 +2636,10 @@ fn transpose_forward_ntt_sparse(
 
     let mut data = densify_active_windows(&arena, &groups, log_d, k);
 
-    transpose_forward_ntt_dense_suffix(ntt, &mut data, log_d, k);
+    transpose_forward_ntt_dense_suffix(ntt, &mut data, log_d, k, truncate_final_group);
+    if truncate_final_group {
+        data.truncate(n >> 1);
+    }
     data
 }
 
@@ -2487,6 +2649,7 @@ fn transpose_forward_ntt_sparse_hashmap(
     values: &[F128],
     log_d: usize,
     prefix_k: usize,
+    truncate_final_group: bool,
 ) -> Vec<F128> {
     use rayon::prelude::*;
     use std::collections::HashMap;
@@ -2517,7 +2680,16 @@ fn transpose_forward_ntt_sparse_hashmap(
         data[start..start + window_len].copy_from_slice(&window);
     }
 
-    transpose_forward_ntt_dense_suffix(ntt, &mut data, log_d, prefix_k);
+    transpose_forward_ntt_dense_suffix(
+        ntt,
+        &mut data,
+        log_d,
+        prefix_k,
+        truncate_final_group,
+    );
+    if truncate_final_group {
+        data.truncate(n >> 1);
+    }
     data
 }
 
@@ -6859,7 +7031,7 @@ mod tests {
                     dense[p] += v;
                 }
                 transpose_forward_ntt(&ntt, &mut dense, log_d);
-                let sparse = transpose_forward_ntt_sparse(&ntt, &positions, &values, log_d);
+                let sparse = transpose_forward_ntt_sparse(&ntt, &positions, &values, log_d, false);
                 assert_eq!(sparse, dense, "log_d={log_d}, nq={nq}");
             }
         }
@@ -6892,9 +7064,16 @@ mod tests {
                 }
                 transpose_forward_ntt(&ntt, &mut dense, log_d);
 
-                let legacy =
-                    transpose_forward_ntt_sparse_hashmap(&ntt, &positions, &values, log_d, 8);
-                let linear = transpose_forward_ntt_sparse(&ntt, &positions, &values, log_d);
+                let legacy = transpose_forward_ntt_sparse_hashmap(
+                    &ntt,
+                    &positions,
+                    &values,
+                    log_d,
+                    8,
+                    false,
+                );
+                let linear =
+                    transpose_forward_ntt_sparse(&ntt, &positions, &values, log_d, false);
                 assert_eq!(
                     linear, legacy,
                     "linear != hashmap at log_d={log_d}, nq={n_queries}"
@@ -6918,15 +7097,123 @@ mod tests {
             F128::new(5, 0),
             F128::new(6, 0),
         ];
-        let legacy = transpose_forward_ntt_sparse_hashmap(&ntt, &positions, &values, log_d, 8);
-        let linear = transpose_forward_ntt_sparse(&ntt, &positions, &values, log_d);
+        let legacy =
+            transpose_forward_ntt_sparse_hashmap(&ntt, &positions, &values, log_d, 8, false);
+        let linear = transpose_forward_ntt_sparse(&ntt, &positions, &values, log_d, false);
         assert_eq!(linear, legacy, "duplicate-position accumulation changed");
 
         let positions: Vec<usize> = (0..1usize << log_d).step_by(1 << 8).collect();
         let values = vec![F128::ONE; positions.len()];
-        let legacy = transpose_forward_ntt_sparse_hashmap(&ntt, &positions, &values, log_d, 8);
-        let linear = transpose_forward_ntt_sparse(&ntt, &positions, &values, log_d);
+        let legacy =
+            transpose_forward_ntt_sparse_hashmap(&ntt, &positions, &values, log_d, 8, false);
+        let linear = transpose_forward_ntt_sparse(&ntt, &positions, &values, log_d, false);
         assert_eq!(linear, legacy, "all-active-window case changed");
+    }
+
+    #[test]
+    fn ranked_induce_truncated_final_ntt_shape_gate_is_narrow() {
+        assert!(is_ranked_induce_truncated_final_ntt_shape(19, 1, 6, 218, 8));
+        assert!(!is_ranked_induce_truncated_final_ntt_shape(
+            18, 1, 6, 218, 8
+        ));
+        assert!(!is_ranked_induce_truncated_final_ntt_shape(
+            19, 2, 6, 218, 8
+        ));
+        assert!(!is_ranked_induce_truncated_final_ntt_shape(
+            19, 1, 5, 218, 8
+        ));
+        assert!(!is_ranked_induce_truncated_final_ntt_shape(
+            19, 1, 6, 217, 8
+        ));
+        assert!(!is_ranked_induce_truncated_final_ntt_shape(
+            19, 1, 6, 218, 7
+        ));
+    }
+
+    #[test]
+    fn ranked_induce_truncated_final_ntt_gate_tracks_optout() {
+        let expected = cfg!(all(target_os = "macos", target_arch = "aarch64"))
+            && std::env::var_os("FLOCK_NO_LIG_INDUCE_TRUNCATED_NTT").is_none();
+        assert_eq!(
+            use_ranked_induce_truncated_final_ntt(19, 1, 6, 218, 8),
+            expected,
+        );
+    }
+
+    /// Independent single-layer oracle for the final fused group. The
+    /// optimized kernel must reproduce the retained half while leaving every
+    /// discarded slot untouched (proving that bottom stores are absent).
+    #[test]
+    fn transpose_truncated_final_group_matches_reference_low_half() {
+        use crate::challenger::Challenger;
+
+        fn final_three_layer_reference(ntt: &AdditiveNttF128, data: &mut [F128], log_d: usize) {
+            for layer in (0..3).rev() {
+                let num_blocks = 1usize << layer;
+                let block_size = 1usize << (log_d - layer);
+                let half = block_size >> 1;
+                for block in 0..num_blocks {
+                    let twiddle = ntt.twiddle(layer, block);
+                    let start = block * block_size;
+                    for row in 0..half {
+                        let a = data[start + row];
+                        let b = data[start + half + row];
+                        let sum = a + b;
+                        data[start + row] = sum;
+                        data[start + half + row] = twiddle * sum + b;
+                    }
+                }
+            }
+        }
+
+        for &log_d in &[3usize, 6, 9, 14] {
+            let mut challenger =
+                crate::challenger::RandomChallenger::new(0x7A11_F17E ^ log_d as u64);
+            let before = challenger.sample_f128_vec(1usize << log_d);
+            let mut expected = before.clone();
+            let mut actual = before.clone();
+            let ntt = AdditiveNttF128::standard(log_d);
+
+            final_three_layer_reference(&ntt, &mut expected, log_d);
+            transpose_forward_ntt_fused_final_3layer_low_half(&ntt, &mut actual, log_d);
+
+            let half = actual.len() >> 1;
+            assert_eq!(&actual[..half], &expected[..half], "log_d={log_d}");
+            assert_eq!(
+                &actual[half..],
+                &before[half..],
+                "bottom write at log_d={log_d}"
+            );
+        }
+    }
+
+    /// Exercise the complete sparse-prefix schedule at sizes where its final
+    /// dense group is layers 2,1,0. The truncated result must equal the low
+    /// half of the untouched frontier transform.
+    #[test]
+    fn transpose_sparse_truncated_final_group_matches_full_transform() {
+        use crate::challenger::Challenger;
+
+        for &log_d in &[14usize, 17] {
+            let n = 1usize << log_d;
+            let mut challenger =
+                crate::challenger::RandomChallenger::new(0x5A95_EF17 ^ log_d as u64);
+            let mut positions = Vec::new();
+            let mut values = Vec::new();
+            while positions.len() < 43 {
+                let position = (challenger.sample_f128().lo as usize) % n;
+                if !positions.contains(&position) {
+                    positions.push(position);
+                    values.push(challenger.sample_f128());
+                }
+            }
+            let ntt = AdditiveNttF128::standard(log_d);
+            let mut expected =
+                transpose_forward_ntt_sparse(&ntt, &positions, &values, log_d, false);
+            expected.truncate(n >> 1);
+            let actual = transpose_forward_ntt_sparse(&ntt, &positions, &values, log_d, true);
+            assert_eq!(actual, expected, "log_d={log_d}");
+        }
     }
 
     /// The fused production kernel must be byte-identical to the original
@@ -7595,6 +7882,122 @@ mod tests {
         let proof2: LigeritoProof = bincode::deserialize(&bytes).expect("deserialize");
         assert_eq!(proof, proof2);
         eprintln!("LigeritoProof bincode size: {} bytes", bytes.len());
+    }
+
+    /// Full-prover control for the truncated final F^T group. This canary uses
+    /// a smaller domain whose sparse prefix also ends in fused layers 2,1,0;
+    /// a test-only thread-local policy selects either the untouched full group
+    /// or the top-only group without weakening the production ranked gate.
+    #[test]
+    fn truncated_final_ntt_full_proof_and_claim_bytes_match_control() {
+        use crate::challenger::Challenger;
+
+        let log_n = 16;
+        let initial_k = 3;
+        let k_0 = 3;
+        let log_inv_rate = 1;
+        let log_msg_cols_0 = log_n - initial_k;
+        let mut rng = crate::challenger::RandomChallenger::new(0xF17E_BA5E);
+        let poly: Vec<F128> = (0..(1usize << log_n)).map(|_| rng.sample_f128()).collect();
+        let point: Vec<F128> = (0..log_n).map(|_| rng.sample_f128()).collect();
+        let basis = build_eq_table(&point);
+        let target = poly
+            .iter()
+            .zip(basis.iter())
+            .map(|(&f, &b)| f * b)
+            .fold(F128::ZERO, |acc, value| acc + value);
+
+        let log_inv_rates = vec![log_inv_rate, log_inv_rate];
+        let queries = vec![218, 106];
+        let cfg = ProverConfig {
+            log_inv_rates: log_inv_rates.clone(),
+            recursive_steps: 1,
+            initial_log_msg_cols: log_msg_cols_0,
+            initial_log_num_interleaved: initial_k,
+            initial_k,
+            recursive_log_msg_cols: vec![log_msg_cols_0 - k_0],
+            recursive_ks: vec![k_0],
+            queries: queries.clone(),
+            grinding_bits: vec![0; log_inv_rates.len()],
+            fold_grinding_bits: vec![0; 2],
+            ood_samples: vec![0; 2],
+            merkle_hash: HashKind::Sha256,
+        };
+        let verifier_cfg = VerifierConfig {
+            log_inv_rates: log_inv_rates.clone(),
+            recursive_steps: 1,
+            initial_log_msg_cols: log_msg_cols_0,
+            initial_log_num_interleaved: initial_k,
+            initial_k,
+            recursive_log_msg_cols: vec![log_msg_cols_0 - k_0],
+            recursive_ks: vec![k_0],
+            queries,
+            grinding_bits: vec![0; log_inv_rates.len()],
+            fold_grinding_bits: vec![0; 2],
+            ood_samples: vec![0; 2],
+            merkle_hash: HashKind::Sha256,
+        };
+
+        let ntt_0 = AdditiveNttF128::standard(log_msg_cols_0 + log_inv_rate);
+        let wtns_0 = ligero_commit(
+            &poly,
+            log_msg_cols_0,
+            initial_k,
+            log_inv_rate,
+            &ntt_0,
+            HashKind::Sha256,
+        );
+        let initial_root = wtns_0.root();
+
+        let prove = |truncate_final_group: bool| {
+            with_truncated_final_ntt_override(truncate_final_group, || {
+                TEST_TRUNCATED_FINAL_NTT_HITS.with(|hits| hits.set(0));
+                assert_eq!(
+                    use_ranked_induce_truncated_final_ntt(
+                        log_msg_cols_0,
+                        log_inv_rate,
+                        initial_k,
+                        218,
+                        8,
+                    ),
+                    truncate_final_group,
+                );
+                let mut challenger =
+                    crate::challenger::FsChallenger::new(b"truncated-final-ntt-proof-oracle");
+                let proof = recursive_prover_with_basis(
+                    &cfg,
+                    poly.clone(),
+                    basis.clone(),
+                    target,
+                    &wtns_0.mat,
+                    &wtns_0.tree,
+                    &mut challenger,
+                );
+                let hits = TEST_TRUNCATED_FINAL_NTT_HITS.with(|hits| hits.get());
+                (proof, hits)
+            })
+        };
+
+        let (control, control_hits) = prove(false);
+        let (truncated, truncated_hits) = prove(true);
+        assert_eq!(control_hits, 0);
+        assert_eq!(truncated_hits, 1);
+        assert_eq!(truncated, control);
+        assert_eq!(
+            bincode::serialize(&(&truncated, target)).expect("serialize truncated proof/claim"),
+            bincode::serialize(&(&control, target)).expect("serialize control proof/claim"),
+        );
+
+        let mut verifier_challenger =
+            crate::challenger::FsChallenger::new(b"truncated-final-ntt-proof-oracle");
+        assert!(recursive_verifier_with_basis(
+            &verifier_cfg,
+            &truncated,
+            &basis,
+            target,
+            &initial_root,
+            &mut verifier_challenger,
+        ));
     }
 
     /// `recursive_prover_with_basis` + `recursive_verifier_with_basis`
