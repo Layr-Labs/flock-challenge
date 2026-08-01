@@ -42,7 +42,7 @@ mod kernels;
 
 #[cfg(all(test, target_arch = "aarch64"))]
 use kernels::aarch64::{
-    bit_transpose_64bytes_neon, shift_reduce_inner_ab_fused_neon,
+    bit_transpose_64bytes_neon, bit_transpose_pair_64bytes_neon, shift_reduce_inner_ab_fused_neon,
     shift_reduce_inner_ab_fused_neon_checked, shift_reduce_inner_ab_neon,
 };
 #[cfg(all(test, target_arch = "aarch64"))]
@@ -268,6 +268,108 @@ static PAIRED_C_TABLES: LazyLock<(Vec<F128>, Vec<F128>)> = LazyLock::new(|| {
 #[inline]
 pub fn bit_transpose_64bytes(input: &[u8; 64], output: &mut [u8; 64]) {
     kernels::bit_transpose_64bytes(input, output);
+}
+
+/// Prepare C blocks in the representation expected by the target's two-bank
+/// conversion kernel. AArch64 forms paired-table indices while the two source
+/// blocks are still register-resident after transposition. Other targets keep
+/// the ordinary per-block transpose consumed by their existing kernels.
+#[inline(always)]
+fn prepare_c_blocks_with_s_hat_v(
+    c_packed: &[u8],
+    chunk_byte_base: usize,
+    n_b_med: usize,
+    out: &mut [[u8; 64]; 16],
+) {
+    #[cfg(target_arch = "aarch64")]
+    {
+        debug_assert!(n_b_med <= 16);
+        debug_assert!(chunk_byte_base + n_b_med * 64 <= c_packed.len());
+        let n_pairs = n_b_med / 2;
+        // SAFETY: the two debug assertions encode the production invariant:
+        // each medium position is one 64-byte block, and out has 16 slots.
+        // Pair p uses distinct inputs 2p/2p+1 and distinct outputs 2p/2p+1.
+        // The optional tail uses the final free slot n_b_med-1.
+        unsafe {
+            let input = c_packed.as_ptr().add(chunk_byte_base);
+            let output = out.as_mut_ptr();
+            for p in 0..n_pairs {
+                let even = &*input.add(2 * p * 64).cast::<[u8; 64]>();
+                let odd = &*input.add((2 * p + 1) * 64).cast::<[u8; 64]>();
+                let bank0 = &mut *output.add(2 * p);
+                let bank1 = &mut *output.add(2 * p + 1);
+                kernels::bit_transpose_pair_64bytes(even, odd, bank0, bank1);
+            }
+            if n_b_med & 1 == 1 {
+                let b_med = n_b_med - 1;
+                let tail = &*input.add(b_med * 64).cast::<[u8; 64]>();
+                bit_transpose_64bytes(tail, &mut *output.add(b_med));
+            }
+        }
+    }
+
+    #[cfg(not(target_arch = "aarch64"))]
+    for (b_med, output) in out.iter_mut().enumerate().take(n_b_med) {
+        let byte_base = chunk_byte_base + b_med * N_CHUNKS * 8;
+        let input: &[u8; 64] = (&c_packed[byte_base..byte_base + 64])
+            .try_into()
+            .expect("64 c-bytes per medium position");
+        bit_transpose_64bytes(input, output);
+    }
+}
+
+/// Copy precomputed AB blocks and prepare paired C indices in one pass.
+///
+/// Keeping both operations in the same pair loop preserves the original
+/// producer's AB/C memory interleaving and prevents the small, fixed AB copy
+/// from being fully unrolled into a long chain of bounds checks.
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+fn prepare_precomputed_ab_and_c_with_s_hat_v(
+    ab_inner: &[u8],
+    c_packed: &[u8],
+    chunk_byte_base: usize,
+    n_b_med: usize,
+    out_ab: &mut [[u8; 64]; 16],
+    out_c: &mut [[u8; 64]; 16],
+) {
+    debug_assert!(n_b_med <= 16);
+    debug_assert!(chunk_byte_base + n_b_med * 64 <= ab_inner.len());
+    debug_assert!(chunk_byte_base + n_b_med * 64 <= c_packed.len());
+
+    // SAFETY: the assertions encode the production layout: each medium
+    // position is one 64-byte block and both outputs have 16 disjoint slots.
+    // AB and C are immutable inputs owned outside the worker-local outputs.
+    unsafe {
+        let ab_input = ab_inner.as_ptr().add(chunk_byte_base);
+        let c_input = c_packed.as_ptr().add(chunk_byte_base);
+        let ab_output = out_ab.as_mut_ptr().cast::<u8>();
+        let c_output = out_c.as_mut_ptr();
+        let n_pairs = n_b_med / 2;
+
+        for p in 0..n_pairs {
+            let pair_byte = 2 * p * 64;
+            core::ptr::copy_nonoverlapping(
+                ab_input.add(pair_byte),
+                ab_output.add(pair_byte),
+                2 * 64,
+            );
+
+            let even = &*c_input.add(pair_byte).cast::<[u8; 64]>();
+            let odd = &*c_input.add(pair_byte + 64).cast::<[u8; 64]>();
+            let bank0 = &mut *c_output.add(2 * p);
+            let bank1 = &mut *c_output.add(2 * p + 1);
+            kernels::bit_transpose_pair_64bytes(even, odd, bank0, bank1);
+        }
+
+        if n_b_med & 1 == 1 {
+            let b_med = n_b_med - 1;
+            let byte = b_med * 64;
+            core::ptr::copy_nonoverlapping(ab_input.add(byte), ab_output.add(byte), 64);
+            let tail = &*c_input.add(byte).cast::<[u8; 64]>();
+            bit_transpose_64bytes(tail, &mut *c_output.add(b_med));
+        }
+    }
 }
 
 /// Challenge-independent AB half of the optimized round-1 kernel.
@@ -747,12 +849,13 @@ fn process_one_x_hi_with_s_hat_v(
                     usize::MAX,
                     None,
                 );
-                let byte_base_b = chunk_byte_base + b_med * N_CHUNKS * 8;
-                let c_in: &[u8; 64] = (&c_packed[byte_base_b..byte_base_b + 64])
-                    .try_into()
-                    .expect("64 c-bytes per medium position");
-                bit_transpose_64bytes(c_in, &mut state.chunk_c_bytes[b_med]);
             }
+            prepare_c_blocks_with_s_hat_v(
+                c_packed,
+                chunk_byte_base,
+                1 << N_MEDIUM,
+                &mut state.chunk_c_bytes,
+            );
 
             kernels::accumulate_convert_with_s_hat_v(
                 &state.chunk_ab_bytes,
@@ -782,12 +885,13 @@ fn process_one_x_hi_with_s_hat_v(
                     usize::MAX,
                     None,
                 );
-                let byte_base_b = chunk_byte_base + b_med * N_CHUNKS * 8;
-                let c_in: &[u8; 64] = (&c_packed[byte_base_b..byte_base_b + 64])
-                    .try_into()
-                    .expect("64 c-bytes per medium position");
-                bit_transpose_64bytes(c_in, &mut state.chunk_c_bytes[b_med]);
             }
+            prepare_c_blocks_with_s_hat_v(
+                c_packed,
+                chunk_byte_base,
+                n_b_med,
+                &mut state.chunk_c_bytes,
+            );
 
             kernels::accumulate_convert_with_s_hat_v(
                 &state.chunk_ab_bytes,
@@ -847,13 +951,29 @@ fn process_one_x_hi_with_precomputed_ab(
         let chunk_byte_base = ((x_outer_lo << N_INNER) | (x_hi << n_lo_and_inner)) * N_CHUNKS;
         let eq_lo_val = eq_lo_scaled[x_outer_lo];
 
-        for b_med in 0..n_b_med {
-            let byte_base_b = chunk_byte_base + b_med * N_CHUNKS * 8;
-            state.chunk_ab_bytes[b_med].copy_from_slice(&ab_inner[byte_base_b..byte_base_b + 64]);
-            let c_in: &[u8; 64] = (&c_packed[byte_base_b..byte_base_b + 64])
-                .try_into()
-                .expect("64 c-bytes per medium position");
-            bit_transpose_64bytes(c_in, &mut state.chunk_c_bytes[b_med]);
+        #[cfg(target_arch = "aarch64")]
+        prepare_precomputed_ab_and_c_with_s_hat_v(
+            ab_inner,
+            c_packed,
+            chunk_byte_base,
+            n_b_med,
+            &mut state.chunk_ab_bytes,
+            &mut state.chunk_c_bytes,
+        );
+
+        #[cfg(not(target_arch = "aarch64"))]
+        {
+            for b_med in 0..n_b_med {
+                let byte_base_b = chunk_byte_base + b_med * N_CHUNKS * 8;
+                state.chunk_ab_bytes[b_med]
+                    .copy_from_slice(&ab_inner[byte_base_b..byte_base_b + 64]);
+            }
+            prepare_c_blocks_with_s_hat_v(
+                c_packed,
+                chunk_byte_base,
+                n_b_med,
+                &mut state.chunk_c_bytes,
+            );
         }
 
         kernels::accumulate_convert_with_s_hat_v(
@@ -1623,6 +1743,47 @@ mod tests {
         }
     }
 
+    #[test]
+    fn paired_transpose_preinterleave_matches_masks() {
+        let mut rng = Rng::new(0xC001_D00D);
+        for _ in 0..64 {
+            let mut even = [0u8; 64];
+            let mut odd = [0u8; 64];
+            for byte in even.iter_mut().chain(odd.iter_mut()) {
+                *byte = (rng.next_u64() & 0xff) as u8;
+            }
+
+            // Scalar model of TRN1(e, o) / TRN2(o, e) after the table
+            // reorder: each 8-byte group is indexed by x_small.
+            let mut j_input = [0u8; 64];
+            let mut k_input = [0u8; 64];
+            for pair in 0..4 {
+                for b_chunk in 0..8 {
+                    let even_row = (2 * pair) * 8 + b_chunk;
+                    let odd_row = (2 * pair + 1) * 8 + b_chunk;
+                    j_input[even_row] = even[even_row];
+                    j_input[odd_row] = odd[even_row];
+                    k_input[even_row] = odd[odd_row];
+                    k_input[odd_row] = even[odd_row];
+                }
+            }
+
+            let mut even_t = [0u8; 64];
+            let mut odd_t = [0u8; 64];
+            let mut got0 = [0u8; 64];
+            let mut got1 = [0u8; 64];
+            bit_transpose_64bytes_scalar(&even, &mut even_t);
+            bit_transpose_64bytes_scalar(&odd, &mut odd_t);
+            bit_transpose_64bytes_scalar(&j_input, &mut got0);
+            bit_transpose_64bytes_scalar(&k_input, &mut got1);
+
+            let want0 = core::array::from_fn(|i| (even_t[i] & 0x55) | ((odd_t[i] << 1) & 0xaa));
+            let want1 = core::array::from_fn(|i| (even_t[i] & 0xaa) | ((odd_t[i] >> 1) & 0x55));
+            assert_eq!(got0, want0, "pre-interleaved bank-0 disagreement");
+            assert_eq!(got1, want1, "pre-interleaved bank-1 disagreement");
+        }
+    }
+
     #[cfg(target_arch = "aarch64")]
     #[test]
     fn neon_bit_transpose_matches_scalar() {
@@ -1638,6 +1799,35 @@ mod tests {
             // SAFETY: on aarch64.
             unsafe { bit_transpose_64bytes_neon(&input, &mut out_neon) };
             assert_eq!(out_scalar, out_neon, "bit_transpose disagreement");
+        }
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn neon_bit_transpose_pair_matches_scalar() {
+        let mut rng = Rng::new(0xC0DE_CAFE);
+        for _ in 0..64 {
+            let mut even = [0u8; 64];
+            let mut odd = [0u8; 64];
+            for byte in even.iter_mut().chain(odd.iter_mut()) {
+                *byte = (rng.next_u64() & 0xff) as u8;
+            }
+
+            let mut even_t = [0u8; 64];
+            let mut odd_t = [0u8; 64];
+            bit_transpose_64bytes_scalar(&even, &mut even_t);
+            bit_transpose_64bytes_scalar(&odd, &mut odd_t);
+            let want0 = core::array::from_fn(|i| (even_t[i] & 0x55) | ((odd_t[i] << 1) & 0xaa));
+            let want1 = core::array::from_fn(|i| (even_t[i] & 0xaa) | ((odd_t[i] >> 1) & 0x55));
+
+            let mut got0 = [0u8; 64];
+            let mut got1 = [0u8; 64];
+            // SAFETY: on aarch64; fixed arrays satisfy the kernel contract.
+            unsafe {
+                bit_transpose_pair_64bytes_neon(&even, &odd, &mut got0, &mut got1);
+            }
+            assert_eq!(got0, want0, "paired bank-0 transpose disagreement");
+            assert_eq!(got1, want1, "paired bank-1 transpose disagreement");
         }
     }
 
@@ -2317,6 +2507,22 @@ mod tests {
             }
             let eq_lo_val = rng.f128();
 
+            // The AArch64 producer stores each pair's final j/k indices in
+            // adjacent slots. Preserve the ordinary blocks separately for the
+            // scalar oracle, including the unpaired padded-boundary tail.
+            let mut chunk_c_paired = [[0u8; 64]; 1 << N_MEDIUM];
+            for p in 0..(n_b_med / 2) {
+                for lane in 0..ELL {
+                    let ce = chunk_c[2 * p][lane];
+                    let co = chunk_c[2 * p + 1][lane];
+                    chunk_c_paired[2 * p][lane] = (ce & 0x55) | ((co << 1) & 0xaa);
+                    chunk_c_paired[2 * p + 1][lane] = (ce & 0xaa) | ((co >> 1) & 0x55);
+                }
+            }
+            if n_b_med & 1 == 1 {
+                chunk_c_paired[n_b_med - 1] = chunk_c[n_b_med - 1];
+            }
+
             let seed_ab: [F128; ELL] = core::array::from_fn(|_| rng.f128());
             let seed_c0: [F128; ELL] = core::array::from_fn(|_| rng.f128());
             let seed_c1: [F128; ELL] = core::array::from_fn(|_| rng.f128());
@@ -2328,7 +2534,7 @@ mod tests {
                 let paired_c = &*PAIRED_C_TABLES;
                 kernels::aarch64::accumulate_convert_with_s_hat_v(
                     &chunk_ab,
-                    &chunk_c,
+                    &chunk_c_paired,
                     n_b_med,
                     convert,
                     &paired_c.0,

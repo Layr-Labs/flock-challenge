@@ -76,6 +76,23 @@ pub(super) fn bit_transpose_64bytes(input: &[u8; 64], output: &mut [u8; 64]) {
     portable::bit_transpose_64bytes_scalar(input, output);
 }
 
+/// AArch64-only producer for the paired-C lookup representation. The two
+/// outputs are the bit-transposed inputs with adjacent source bits interleaved
+/// into the exact bank-0 / bank-1 table indices consumed by
+/// `accumulate_convert_with_s_hat_v`.
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+pub(super) fn bit_transpose_pair_64bytes(
+    even: &[u8; 64],
+    odd: &[u8; 64],
+    bank0: &mut [u8; 64],
+    bank1: &mut [u8; 64],
+) {
+    // SAFETY: aarch64 statically guarantees NEON; all inputs and outputs are
+    // fixed-size, non-overlapping arrays supplied by the caller.
+    unsafe { aarch64::bit_transpose_pair_64bytes_neon(even, odd, bank0, bank1) }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(super) fn shift_reduce_inner_ab(
     a_packed: &[u8],

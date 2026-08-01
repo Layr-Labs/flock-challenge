@@ -158,6 +158,12 @@ pub(crate) unsafe fn accumulate_convert(
 ///
 /// An odd trailing `b_med` (only reachable on the padded boundary window) falls
 /// back to the unpaired path.
+///
+/// On AArch64, `chunk_c_bytes` is already in paired-table index form:
+/// slots `2p` and `2p+1` contain the bank-0 `j` and bank-1 `k` bytes
+/// for pair `p`. An odd tail remains as an ordinary transposed block in slot
+/// `n_b_med-1`. The producer forms this layout register-resident during the
+/// two-block transpose.
 #[allow(clippy::too_many_arguments)]
 #[inline(always)]
 pub(crate) unsafe fn accumulate_convert_with_s_hat_v(
@@ -249,14 +255,12 @@ pub(crate) unsafe fn accumulate_convert_with_s_hat_v(
                         vld1q_u8(t_odd.add(o3 * 16)),
                     );
 
-                    // The pairing masks distribute over the word; one
-                    // mask/shift sequence builds all 4 lanes' j and k.
-                    let ce = (chunk_c_bytes[b_even].as_ptr().add(lane) as *const u32)
+                    // The producer fused these paired indices into the two
+                    // transpose outputs. Slots 2p and 2p+1 hold j and k.
+                    let jw = (chunk_c_bytes[2 * p].as_ptr().add(lane) as *const u32)
                         .read_unaligned() as usize;
-                    let co = (chunk_c_bytes[b_odd].as_ptr().add(lane) as *const u32)
+                    let kw = (chunk_c_bytes[2 * p + 1].as_ptr().add(lane) as *const u32)
                         .read_unaligned() as usize;
-                    let jw = (ce & 0x5555_5555) | ((co << 1) & 0xaaaa_aaaa);
-                    let kw = (ce & 0xaaaa_aaaa) | ((co >> 1) & 0x5555_5555);
                     (q0, q1, jw, kw)
                 }};
             }
@@ -420,14 +424,12 @@ unsafe fn xor3_u8(
     unsafe { core::arch::aarch64::veorq_u8(a, core::arch::aarch64::veorq_u8(b, c)) }
 }
 
-/// NEON 64-byte bit-transpose. Two-stage:
-///   1. `vqtbl4q_u8` reorders the 64 input bytes so each 8-byte group within
-///      the output is one byte-chunk's worth of `x_small=0..8` bytes.
-///   2. Three rounds of bit-swap at distances 7, 14, 28 across `uint64x2_t`
-///      lanes do the actual 8×8 bit transpose.
+/// Reorder the 64 input bytes into independent 8-byte transpose groups.
 #[cfg(target_arch = "aarch64")]
 #[inline(always)]
-pub(crate) unsafe fn bit_transpose_64bytes_neon(input: &[u8; 64], output: &mut [u8; 64]) {
+unsafe fn bit_transpose_64bytes_neon_reorder(
+    input: &[u8; 64],
+) -> [core::arch::aarch64::uint8x16_t; 4] {
     use core::arch::aarch64::*;
 
     unsafe {
@@ -445,10 +447,28 @@ pub(crate) unsafe fn bit_transpose_64bytes_neon(input: &[u8; 64], output: &mut [
         const IDX2: [u8; 16] = [4, 12, 20, 28, 36, 44, 52, 60, 5, 13, 21, 29, 37, 45, 53, 61];
         const IDX3: [u8; 16] = [6, 14, 22, 30, 38, 46, 54, 62, 7, 15, 23, 31, 39, 47, 55, 63];
 
-        let mut y0 = vreinterpretq_u64_u8(vqtbl4q_u8(table, vld1q_u8(IDX0.as_ptr())));
-        let mut y1 = vreinterpretq_u64_u8(vqtbl4q_u8(table, vld1q_u8(IDX1.as_ptr())));
-        let mut y2 = vreinterpretq_u64_u8(vqtbl4q_u8(table, vld1q_u8(IDX2.as_ptr())));
-        let mut y3 = vreinterpretq_u64_u8(vqtbl4q_u8(table, vld1q_u8(IDX3.as_ptr())));
+        [
+            vqtbl4q_u8(table, vld1q_u8(IDX0.as_ptr())),
+            vqtbl4q_u8(table, vld1q_u8(IDX1.as_ptr())),
+            vqtbl4q_u8(table, vld1q_u8(IDX2.as_ptr())),
+            vqtbl4q_u8(table, vld1q_u8(IDX3.as_ptr())),
+        ]
+    }
+}
+
+/// Finish four reordered groups with the three 8×8 bit-swap rounds.
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn bit_transpose_64bytes_neon_finish(
+    y: [core::arch::aarch64::uint8x16_t; 4],
+) -> [core::arch::aarch64::uint8x16_t; 4] {
+    use core::arch::aarch64::*;
+
+    unsafe {
+        let mut y0 = vreinterpretq_u64_u8(y[0]);
+        let mut y1 = vreinterpretq_u64_u8(y[1]);
+        let mut y2 = vreinterpretq_u64_u8(y[2]);
+        let mut y3 = vreinterpretq_u64_u8(y[3]);
 
         let mask1 = vdupq_n_u64(0x00AA00AA00AA00AA);
         let mask2 = vdupq_n_u64(0x0000CCCC0000CCCC);
@@ -484,11 +504,87 @@ pub(crate) unsafe fn bit_transpose_64bytes_neon(input: &[u8; 64], output: &mut [
         y2 = xor3_u64(y2, t2, vshlq_n_u64::<28>(t2));
         y3 = xor3_u64(y3, t3, vshlq_n_u64::<28>(t3));
 
-        let out_ptr = output.as_mut_ptr();
-        vst1q_u8(out_ptr, vreinterpretq_u8_u64(y0));
-        vst1q_u8(out_ptr.add(16), vreinterpretq_u8_u64(y1));
-        vst1q_u8(out_ptr.add(32), vreinterpretq_u8_u64(y2));
-        vst1q_u8(out_ptr.add(48), vreinterpretq_u8_u64(y3));
+        [
+            vreinterpretq_u8_u64(y0),
+            vreinterpretq_u8_u64(y1),
+            vreinterpretq_u8_u64(y2),
+            vreinterpretq_u8_u64(y3),
+        ]
+    }
+}
+
+/// Register-returning core of the NEON 64-byte bit-transpose.
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn bit_transpose_64bytes_neon_regs(
+    input: &[u8; 64],
+) -> [core::arch::aarch64::uint8x16_t; 4] {
+    unsafe { bit_transpose_64bytes_neon_finish(bit_transpose_64bytes_neon_reorder(input)) }
+}
+
+/// NEON 64-byte bit-transpose.
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+pub(crate) unsafe fn bit_transpose_64bytes_neon(input: &[u8; 64], output: &mut [u8; 64]) {
+    use core::arch::aarch64::*;
+
+    unsafe {
+        let y = bit_transpose_64bytes_neon_regs(input);
+        let out = output.as_mut_ptr();
+        vst1q_u8(out, y[0]);
+        vst1q_u8(out.add(16), y[1]);
+        vst1q_u8(out.add(32), y[2]);
+        vst1q_u8(out.add(48), y[3]);
+    }
+}
+
+/// Transpose two adjacent C blocks and directly form the paired-table indices:
+/// `bank0 = (even & 0x55) | ((odd << 1) & 0xaa)` and
+/// `bank1 = (even & 0xaa) | ((odd >> 1) & 0x55)`.
+///
+/// Transpose is a bit permutation, so the identities can be formed earlier by
+/// interleaving the even source rows with `TRN1` and the odd rows with
+/// `TRN2`. This needs eight interleaves per pair, then performs the same eight
+/// 16-byte stores directly in their final representation. The original path
+/// rebuilt the indices in each of sixteen four-lane gather groups.
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+pub(crate) unsafe fn bit_transpose_pair_64bytes_neon(
+    even: &[u8; 64],
+    odd: &[u8; 64],
+    bank0: &mut [u8; 64],
+    bank1: &mut [u8; 64],
+) {
+    use core::arch::aarch64::*;
+
+    unsafe {
+        let e = bit_transpose_64bytes_neon_reorder(even);
+        let o = bit_transpose_64bytes_neon_reorder(odd);
+        let j = bit_transpose_64bytes_neon_finish([
+            vtrn1q_u8(e[0], o[0]),
+            vtrn1q_u8(e[1], o[1]),
+            vtrn1q_u8(e[2], o[2]),
+            vtrn1q_u8(e[3], o[3]),
+        ]);
+        let k = bit_transpose_64bytes_neon_finish([
+            vtrn2q_u8(o[0], e[0]),
+            vtrn2q_u8(o[1], e[1]),
+            vtrn2q_u8(o[2], e[2]),
+            vtrn2q_u8(o[3], e[3]),
+        ]);
+        let out0 = bank0.as_mut_ptr();
+        let out1 = bank1.as_mut_ptr();
+
+        macro_rules! store_pair {
+            ($index:literal, $offset:literal) => {{
+                vst1q_u8(out0.add($offset), j[$index]);
+                vst1q_u8(out1.add($offset), k[$index]);
+            }};
+        }
+        store_pair!(0, 0);
+        store_pair!(1, 16);
+        store_pair!(2, 32);
+        store_pair!(3, 48);
     }
 }
 
