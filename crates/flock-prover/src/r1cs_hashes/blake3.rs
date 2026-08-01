@@ -679,6 +679,7 @@ enum ReverseWordOp {
 /// sparse matrices.
 struct ReverseTranspose<'a> {
     alpha: F128,
+    alpha_plus_one: F128,
     eq_inner: &'a [F128],
     ops: Vec<ReverseWordOp>,
     adjoints: Vec<[F128; WORD_BITS]>,
@@ -689,6 +690,7 @@ impl<'a> ReverseTranspose<'a> {
     fn new(alpha: F128, eq_inner: &'a [F128]) -> Self {
         Self {
             alpha,
+            alpha_plus_one: alpha + F128::ONE,
             eq_inner,
             ops: Vec::with_capacity(32 + 12 * N_G + 16),
             adjoints: Vec::with_capacity(32 + 12 * N_G + 16),
@@ -732,14 +734,13 @@ impl<'a> ReverseTranspose<'a> {
         // Row i reads x[i] in A, y[i] in B, and carry[0..i] in both.
         // Accumulating the latter backwards turns the triangular row walk into
         // one suffix scan over the 31 carry columns.
-        let alpha_plus_one = self.alpha + F128::ONE;
         let mut suffix = F128::ZERO;
         for i in (0..CARRY_BITS_PER_ADD).rev() {
             self.comb[carry_base + i] += suffix;
             let e = self.eq_inner[carry_base + i];
             self.adjoints[x][i] += self.alpha * e;
             self.adjoints[y][i] += e;
-            suffix += alpha_plus_one * e;
+            suffix += self.alpha_plus_one * e;
         }
         out
     }
@@ -1388,9 +1389,6 @@ fn build_block_witness_ab_stream_into(
             a_ptr.add(i).write(value);
             b_ptr.add(i).write(u64::MAX);
         }
-        std::ptr::write_bytes(z_ptr.add(4), 0, 4);
-        std::ptr::write_bytes(a_ptr.add(4), 0, 4);
-        std::ptr::write_bytes(b_ptr.add(4), 0, 4);
 
         let values = [
             m[0], m[1], m[2], m[3], m[4], m[5], m[6], m[7], m[8], m[9], m[10], m[11],

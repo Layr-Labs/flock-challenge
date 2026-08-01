@@ -31,7 +31,7 @@
 
 use crate::challenger::Challenger;
 use crate::field::F128;
-use crate::lincheck::build_eq_table;
+use crate::lincheck::{build_eq_table, build_eq_table_prefix};
 use crate::merkle::{self, Hash, HashKind};
 use crate::ntt::additive_ntt_f128::AdditiveNttF128;
 use serde::{Deserialize, Serialize};
@@ -1953,13 +1953,7 @@ pub(crate) fn induce_sumcheck_poly(
     // `i ∈ {0,1}^{⌈log₂ n_queries⌉}` (LSB-first), truncated to the first
     // `n_queries` indices. Replaces the legacy α^i Vandermonde scheme;
     // matches the multilinear S-Z structure used by the lane fold.
-    let alpha_pows: Vec<F128> = if n_queries == 0 {
-        Vec::new()
-    } else {
-        let table = build_eq_table(alpha);
-        debug_assert!(table.len() >= n_queries);
-        table.into_iter().take(n_queries).collect()
-    };
+    let alpha_pows: Vec<F128> = build_eq_table_prefix(alpha, n_queries);
 
     // Precompute inv_sks_vks once across all queries and threads.
     let inv_sks_vks: Vec<F128> = sks_vks
@@ -2199,13 +2193,7 @@ pub(crate) fn induce_sumcheck_poly_via_ntt(
     assert_eq!(opened_rows.len(), n_queries);
 
     let eq = build_eq_table(v_challenges);
-    let alpha_pows: Vec<F128> = if n_queries == 0 {
-        Vec::new()
-    } else {
-        let table = build_eq_table(alpha);
-        debug_assert!(table.len() >= n_queries);
-        table.into_iter().take(n_queries).collect()
-    };
+    let alpha_pows: Vec<F128> = build_eq_table_prefix(alpha, n_queries);
 
     // Parallel per-query dot products, mirroring the dense variant's
     // per-thread accumulation. Every term is independent and F128 addition
