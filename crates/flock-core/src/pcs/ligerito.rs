@@ -3072,12 +3072,87 @@ fn fold2_and_msgs_lsb(
         acc.2,
     )
 }
+
+/// Final initial-lane pair: bind two challenges and emit only the direct next
+/// message. The ordinary lookahead would describe a round beyond
+/// `initial_k`, so computing it cannot affect the transcript or folded state.
+fn fold2_and_msg_lsb(
+    f: &[F128],
+    b: &[F128],
+    r_a: F128,
+    r_b: F128,
+    wf: &mut Vec<F128>,
+    wb: &mut Vec<F128>,
+) -> SumcheckMessage {
+    #[cfg(not(all(target_arch = "aarch64", target_feature = "aes")))]
+    {
+        // The ranked production path is AArch64. Keep other targets simple
+        // and byte-identical by using the portable full oracle and discarding
+        // only its unobserved lookahead.
+        return fold2_and_msgs_lsb(f, b, r_a, r_b, wf, wb).0;
+    }
+
+    #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+    {
+        use rayon::prelude::*;
+
+        let n = f.len();
+        debug_assert!(n.is_power_of_two() && n >= 16);
+        debug_assert_eq!(b.len(), n);
+        let quarter = n / 4;
+        debug_assert!(wf.capacity() >= quarter && wb.capacity() >= quarter);
+        // SAFETY: capacity checked; every slot is initialized by its unique
+        // parallel chunk before the reduction returns.
+        unsafe {
+            wf.set_len(quarter);
+            wb.set_len(quarter);
+        }
+
+        const CHUNK: usize = 2048;
+        let nt_stores = {
+            use std::sync::OnceLock;
+            static NT_ENABLED: OnceLock<bool> = OnceLock::new();
+            quarter >= (1usize << 21)
+                && *NT_ENABLED.get_or_init(|| std::env::var_os("FLOCK_LIG_NT_LEGACY").is_none())
+        };
+        let (u_0, u_2) = wf
+            .par_chunks_mut(CHUNK)
+            .zip(wb.par_chunks_mut(CHUNK))
+            .enumerate()
+            .map(|(chunk, (f_out, b_out))| {
+                crate::field::f128_slice::fold2_two_and_msg(
+                    f,
+                    b,
+                    chunk * CHUNK,
+                    f_out,
+                    b_out,
+                    r_a,
+                    r_b,
+                    nt_stores,
+                )
+            })
+            .reduce(
+                || (F128::ZERO, F128::ZERO),
+                |(a0, a2), (b0, b2)| (a0 + b0, a2 + b2),
+            );
+        SumcheckMessage { u_0, u_2 }
+    }
+}
+
 fn eval_lookahead(c: &[F128; 6], rho: F128) -> SumcheckMessage {
     let r2 = rho * rho;
     SumcheckMessage {
         u_0: c[0] + c[1] * rho + c[2] * r2,
         u_2: c[3] + c[4] * rho + c[5] * r2,
     }
+}
+
+/// Exact fallback for the final-pair specialization. With the opt-out set,
+/// the prover computes and discards the incumbent lookahead as before.
+fn fold2_final_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("FLOCK_NO_LIG_FOLD2_FINAL").is_none())
 }
 /// Whether the fused first-claim + ordinary-basis fold4 initialization is
 /// enabled for [`materialize_direct_ab_fold2`].
@@ -3409,6 +3484,24 @@ impl SumcheckProver {
         std::mem::swap(&mut self.combined_basis, &mut self.spare_b);
         self.transcript.push(msg);
         (msg, coeffs)
+    }
+
+    /// Bind the final two initial-lane challenges without producing the
+    /// lookahead that has no consumer past `initial_k`.
+    fn fold2_final(&mut self, r_a: F128, r_b: F128) -> SumcheckMessage {
+        debug_assert!(self.pending_glue.is_none(), "fold2 across pending glue");
+        let msg = fold2_and_msg_lsb(
+            &self.f,
+            &self.combined_basis,
+            r_a,
+            r_b,
+            &mut self.spare_f,
+            &mut self.spare_b,
+        );
+        std::mem::swap(&mut self.f, &mut self.spare_f);
+        std::mem::swap(&mut self.combined_basis, &mut self.spare_b);
+        self.transcript.push(msg);
+        msg
     }
 
     /// Introduce a fresh basis poly with claimed sum `h_new`. Sends the
@@ -3912,9 +4005,10 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
                     ));
                     fold2_lookahead = Some(next_lookahead);
                     msg
+                } else if j + 1 == initial_k && fold2_final_enabled() {
+                    sc_prover.as_mut().unwrap().fold2_final(r_a, r)
                 } else {
-                    let (msg, next_lookahead) =
-                        sc_prover.as_mut().unwrap().fold2(r_a, r);
+                    let (msg, next_lookahead) = sc_prover.as_mut().unwrap().fold2(r_a, r);
                     fold2_lookahead = Some(next_lookahead);
                     msg
                 }
@@ -5857,9 +5951,19 @@ mod tests {
             let mut wb = Vec::with_capacity(n / 4);
             let (msg_direct, coeffs) =
                 super::fold2_and_msgs_lsb(&f, &b, r_a, r_b, &mut wf, &mut wb);
+            let mut final_wf = Vec::with_capacity(n / 4);
+            let mut final_wb = Vec::with_capacity(n / 4);
+            let final_msg =
+                super::fold2_and_msg_lsb(&f, &b, r_a, r_b, &mut final_wf, &mut final_wb);
 
             assert_eq!(wf, nf2, "folded f state differs at log_n={log_n}");
             assert_eq!(wb, nb2, "folded b state differs at log_n={log_n}");
+            assert_eq!(final_wf, wf, "final folded f differs at log_n={log_n}");
+            assert_eq!(final_wb, wb, "final folded b differs at log_n={log_n}");
+            assert_eq!(
+                final_msg, msg_direct,
+                "final message differs at log_n={log_n}"
+            );
             assert_eq!(
                 msg_direct.u_0, msg2.u_0,
                 "direct u_0 differs at log_n={log_n}"
@@ -7578,9 +7682,13 @@ mod tests {
         use crate::challenger::Challenger;
 
         let log_n = 12;
-        let initial_k = 2;
+        // Six initial folds exercise direct materialization at j=1, the
+        // ordinary paired fold at j=3, and the direct-only final pair at j=5.
+        let initial_k = 6;
         let k_0 = 2;
-        let log_inv_rate = 1;
+        // The final 4-column message needs enough codeword positions for the
+        // unique-decoding query count.
+        let log_inv_rate = 3;
         let mut rng = crate::challenger::RandomChallenger::new(0xD1CE_AB02);
         let poly: Vec<F128> = (0..(1usize << log_n))
             .map(|_| rng.sample_f128())
@@ -7675,9 +7783,35 @@ mod tests {
 
         assert_eq!(got, ordinary);
         assert_eq!(
-            bincode::serialize(&(got, target)).expect("serialize direct proof/claim"),
+            bincode::serialize(&(got.clone(), target)).expect("serialize direct proof/claim"),
             bincode::serialize(&(ordinary, target)).expect("serialize ordinary proof/claim"),
         );
+
+        // The specialization changes no transcript field or verifier rule.
+        let v_cfg = VerifierConfig {
+            log_inv_rates: log_inv_rates.clone(),
+            recursive_steps: 1,
+            initial_log_msg_cols: log_n - initial_k,
+            initial_log_num_interleaved: initial_k,
+            initial_k,
+            recursive_log_msg_cols: vec![log_n - initial_k - k_0],
+            recursive_ks: vec![k_0],
+            queries: log_inv_rates.iter().map(|&rate| udr_queries(rate)).collect(),
+            grinding_bits: vec![0; log_inv_rates.len()],
+            fold_grinding_bits: vec![0; 2],
+            ood_samples: vec![0; 2],
+            merkle_hash: Default::default(),
+        };
+        let mut verifier_challenger =
+            crate::challenger::FsChallenger::new(b"direct-ab-proof-byte-oracle");
+        assert!(recursive_verifier_with_basis(
+            &v_cfg,
+            &got,
+            &combined_basis,
+            target,
+            &wtns_0.root(),
+            &mut verifier_challenger,
+        ));
     }
 
     /// `induce_sumcheck_evaluate_at_residual` matches dense
