@@ -56,6 +56,11 @@ pub const ENV_NO_GPU_MIXED_FINAL: &str = "FLOCK_NO_GPU_MIXED_FINAL";
 /// exact value `1` disables it; the optimization remains ranked-tree-only.
 pub const ENV_NO_GPU_PARENT3: &str = "FLOCK_NO_GPU_PARENT3";
 
+/// Strict kill switch for the ranked 11/16 hybrid-prefix Merkle schedule.
+/// Only exact value `1` disables it; the optimization remains
+/// ranked-tree-only (2^20 leaves, k=5, parent3 present).
+pub const ENV_NO_GPU_PREFIX_HYBRID: &str = "FLOCK_NO_GPU_PREFIX_HYBRID";
+
 fn gpu_parent3_value_enabled(value: Option<&std::ffi::OsStr>) -> bool {
     value != Some(std::ffi::OsStr::new("1"))
 }
@@ -71,6 +76,28 @@ fn select_gpu_parent3(n_leaves_total: usize, enabled: bool) -> bool {
     enabled && n_leaves_total == 1usize << 20
 }
 
+fn gpu_prefix_hybrid_value_enabled(value: Option<&std::ffi::OsStr>) -> bool {
+    value != Some(std::ffi::OsStr::new("1"))
+}
+
+fn gpu_prefix_hybrid_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        gpu_prefix_hybrid_value_enabled(
+            std::env::var_os(ENV_NO_GPU_PREFIX_HYBRID).as_deref(),
+        )
+    })
+}
+
+fn select_gpu_prefix_hybrid(
+    n_leaves_total: usize,
+    k_cpu16: usize,
+    parent3: bool,
+    enabled: bool,
+) -> bool {
+    enabled && parent3 && n_leaves_total == 1usize << 20 && k_cpu16 == 5
+}
+
 #[cfg(test)]
 mod parent3_gate_tests {
     use std::ffi::OsStr;
@@ -84,6 +111,142 @@ mod parent3_gate_tests {
         assert!(super::select_gpu_parent3(1 << 20, true));
         assert!(!super::select_gpu_parent3(1 << 20, false));
         assert!(!super::select_gpu_parent3(1 << 19, true));
+    }
+
+    /// Host-side oracle for the extended tail's flat-tree slot arithmetic,
+    /// including the prefix-hybrid partial chains: the final sixteenth
+    /// (128 children, floor 16 -> writes 64/32/16) and the 176-child join
+    /// chain (floor 11 -> writes 88/44/22/11) must land on the same absolute
+    /// node indices as the ordinary per-level walks they replace, and must
+    /// stop exactly at the sixteen-root join (CPU repair owns above).
+    #[test]
+    fn prefix_hybrid_tail_slot_arithmetic_matches_ordinary_loop() {
+        const N: usize = 1 << 20;
+        fn level_bases(n: usize) -> Vec<usize> {
+            let mut bases = Vec::new();
+            let (mut base, mut len) = (0usize, n);
+            while len >= 1 {
+                bases.push(base);
+                base += len;
+                len >>= 1;
+            }
+            bases
+        }
+        let bases = level_bases(N);
+        // After 3 common parent3 passes on the 11/16 prefix:
+        //   level_len = 2^20 >> 9 = 2^11, local_len = 11 * 128 = 1408.
+        let split_level_len = 1usize << 11;
+        let split_level_start = bases[20 - 11]; // level base for 2^11 nodes
+        let segment_len = 128usize;
+        let first_len = 10 * segment_len;
+        assert_eq!(split_level_len, 2048);
+        assert_eq!(first_len % 256, 0);
+
+        // --- Final segment: 3 ordinary dispatches vs one tail(floor=16) ---
+        // Ordinary writes (segment children at [first_len, first_len+128)).
+        let mut ordinary = Vec::new();
+        let (mut ls, mut ll, mut cs, mut cl) =
+            (split_level_start, split_level_len, first_len, segment_len);
+        for _ in 0..3 {
+            ordinary.push(ls + ll + cs / 2);
+            ls += ll;
+            ll >>= 1;
+            cs >>= 1;
+            cl >>= 1;
+        }
+        assert_eq!(cl, 16);
+        // Tail out_start walk (mirror of encode_parent_tail).
+        let mut tail_out = Vec::new();
+        let (mut ls, mut ll, mut cs, mut cl) =
+            (split_level_start, split_level_len, first_len, segment_len);
+        while cl > 1 {
+            tail_out.push(ls + ll + cs / 2);
+            ls += ll;
+            ll >>= 1;
+            cs >>= 1;
+            cl >>= 1;
+        }
+        assert_eq!(tail_out[..3], ordinary[..]);
+        // Levels written by the kernel with floor=16: level 0 always
+        // (n_out = len>>1 = 64), then the loop while len > 16: exactly
+        // 64 -> 32 -> 16 = three levels.
+        let mut written = 1usize; // level 0 always
+        let mut len = segment_len >> 1; // chain width after level 0
+        while len > 16 {
+            written += 1;
+            len >>= 1;
+        }
+        assert_eq!(written, 3);
+
+        // --- Join chain: 176 children at level3, tail(floor=11) ---
+        let level3_len = split_level_len >> 3; // 2^8
+        let level3_start = bases[20 - 8];
+        assert_eq!(level3_len, 256);
+        let join_len = first_len / 8 + segment_len / 8; // 160 + 16 = 176
+        assert_eq!(join_len, 176);
+        // Ordinary loop: 176 -> 88 -> 44 -> 22 -> 11 (4 dispatches).
+        let mut ordinary = Vec::new();
+        let (mut ls, mut ll, mut cl) = (level3_start, level3_len, join_len);
+        while ll > 16 {
+            ordinary.push(ls + ll);
+            ls += ll;
+            ll >>= 1;
+            cl >>= 1;
+        }
+        assert_eq!(ordinary.len(), 4);
+        assert_eq!(ll, 16);
+        assert_eq!(cl, 11);
+        // Tail out_start walk.
+        let mut tail_out = Vec::new();
+        let (mut ls, mut ll, mut cs, mut cl) = (level3_start, level3_len, 0usize, join_len);
+        while cl > 1 {
+            tail_out.push(ls + ll + cs / 2);
+            ls += ll;
+            ll >>= 1;
+            cs >>= 1;
+            cl >>= 1;
+        }
+        assert_eq!(tail_out[..4], ordinary[..]);
+        // Kernel floor=11: level 0 (n_out=88) then 44, 22, 11 = 4 levels.
+        let mut written = 1usize;
+        let mut len = join_len >> 1; // 88 after level 0
+        while len > 11 {
+            written += 1;
+            len >>= 1;
+        }
+        assert_eq!(written, 4);
+        assert_eq!(len, 11);
+        // Lane coverage: the kernel's strided loop must cover every output
+        // at every level with only 32 lanes. Largest n_out here is 88.
+        let mut n_out = join_len >> 1;
+        let mut covered = true;
+        while n_out > 1 {
+            if n_out > 32 {
+                covered = false;
+            }
+            n_out >>= 1;
+        }
+        // n_out values 88 -> 44 -> 22 -> 11: two of them exceed 32 lanes,
+        // which is exactly why the kernel uses the strided j-loop; assert
+        // the test itself exercises the wide case.
+        assert!(!covered, "join chain must exercise the wide strided loop");
+        // Every written node stays below the sixteen-root join (2N-1).
+        for &node in tail_out[..4].iter() {
+            assert!(node < 2 * N - 1);
+        }
+    }
+
+    #[test]
+    fn prefix_hybrid_default_on_exact_kill_switch_ranked_only() {
+        assert!(!super::gpu_prefix_hybrid_value_enabled(Some(OsStr::new("1"))));
+        for value in [None, Some(""), Some("0"), Some("01"), Some("true")] {
+            assert!(super::gpu_prefix_hybrid_value_enabled(value.map(OsStr::new)));
+        }
+        assert!(super::select_gpu_prefix_hybrid(1 << 20, 5, true, true));
+        assert!(!super::select_gpu_prefix_hybrid(1 << 20, 5, true, false));
+        assert!(!super::select_gpu_prefix_hybrid(1 << 20, 5, false, true));
+        assert!(!super::select_gpu_prefix_hybrid(1 << 20, 4, true, true));
+        assert!(!super::select_gpu_prefix_hybrid(1 << 19, 5, true, true));
     }
 }
 
@@ -1243,6 +1406,82 @@ static void b3_compress(thread uint* cv, thread const uint* m_in,
     for (int i = 0; i < 8; i++) cv[i] = v[i] ^ v[8 + i];
 }
 
+// Single-dispatch parent tail: ONE threadgroup consumes the remaining
+// L <= 256 children of a local chain and produces the chain's parent levels
+// down to `floor` (1 = full chain to its root), each written to its standard
+// flat-tree slot. Intermediate levels ping-pong through threadgroup memory,
+// so a whole dependent dispatch chain collapses into one launch. Level 0 is
+// always emitted (children live in device memory); the loop then continues
+// while the chain is wider than `floor`. Node indices are absolute (tree
+// buffer bound at offset 0).
+struct TailParams {
+    uint child_start;   // absolute node index of the first child
+    uint n_children;    // 2..=256 (need not be a power of two: the strided
+                        // level-0 loop and halving chain handle any even L)
+    uint floor;         // stop once len <= floor; 1 = full chain to root
+    uint out_start[8];  // absolute node index of each output level's slot 0
+};
+
+kernel void parent_hash_tail(device uint* tree      [[buffer(0)]],
+                             constant TailParams& T [[buffer(1)]],
+                             uint lid [[thread_index_in_threadgroup]])
+{
+    threadgroup uint stage[2][128u * 8u];
+    uint len = T.n_children;
+    uint level = 0u;
+    uint src_sel = 0u;
+
+    // Level 0 reads the children from device memory. The 128-lane
+    // threadgroup covers up to 128 child-pairs (256 children) with one lane
+    // per output; the strided j-loop is retained for safety.
+    {
+        const uint n_out = len >> 1;
+        for (uint j = lid; j < n_out; j += 32u) {
+            uint block[16];
+            device const uint* src = tree + (T.child_start + 2u * j) * 8u;
+            for (uint i = 0u; i < 16u; i++) block[i] = src[i];
+            uint cv[8];
+            for (uint i = 0u; i < 8u; i++) cv[i] = B3_IV[i];
+            b3_compress(cv, block, 64u, B3_PARENT);
+            device uint* dst = tree + (T.out_start[0] + j) * 8u;
+            for (uint i = 0u; i < 8u; i++) {
+                dst[i] = cv[i];
+                stage[0][j * 8u + i] = cv[i];
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        len = n_out;
+        level = 1u;
+    }
+
+    while (len > T.floor) {
+        const uint n_out = len >> 1;
+        threadgroup const uint* src = stage[src_sel];
+        threadgroup uint* nxt = stage[src_sel ^ 1u];
+        // 128 lanes cover every n_out <= 64 here; the strided loop is
+        // retained for safety.
+        for (uint j = lid; j < n_out; j += 32u) {
+            uint block[16];
+            for (uint i = 0u; i < 8u; i++) {
+                block[i]      = src[(2u * j) * 8u + i];
+                block[8u + i] = src[(2u * j + 1u) * 8u + i];
+            }
+            uint cv[8];
+            for (uint i = 0u; i < 8u; i++) cv[i] = B3_IV[i];
+            b3_compress(cv, block, 64u, B3_PARENT);
+            device uint* dst = tree + (T.out_start[level] + j) * 8u;
+            for (uint i = 0u; i < 8u; i++) {
+                dst[i] = cv[i];
+                nxt[j * 8u + i] = cv[i];
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        src_sel ^= 1u;
+        len = n_out;
+        level++;
+    }
+}
+
 kernel void leaf_hash(device const uint* codeword [[buffer(0)]],
                       device uint* out            [[buffer(1)]],
                       uint id [[thread_position_in_grid]])
@@ -1357,6 +1596,7 @@ kernel void parent_hash3(device const uint* children [[buffer(0)]],
         pub(crate) pso_leaf: Id,
         pub(crate) pso_parent: Id,
         pub(crate) pso_parent3: Id,
+        pub(crate) pso_parent_tail: Id,
     }
     // SAFETY: MTLDevice/MTLCommandQueue/MTLComputePipelineState are
     // documented thread-safe; command buffers/encoders are created and used
@@ -1459,6 +1699,7 @@ kernel void parent_hash3(device const uint* children [[buffer(0)]],
                 let pso_leaf = pso("leaf_hash")?;
                 let pso_parent = pso("parent_hash")?;
                 let pso_parent3 = pso("parent_hash3")?;
+                let pso_parent_tail = pso("parent_hash_tail")?;
                 send!(api, unsafe extern "C" fn(Id, Sel) -> Id, library, c"release");
                 Ok(Gpu {
                     api,
@@ -1475,6 +1716,7 @@ kernel void parent_hash3(device const uint* children [[buffer(0)]],
                     pso_leaf,
                     pso_parent,
                     pso_parent3,
+                    pso_parent_tail,
                 })
             })();
             pool_pop(pool);
@@ -2040,6 +2282,189 @@ kernel void parent_hash3(device const uint* children [[buffer(0)]],
                 read_start = write_start;
                 read_len = n_out;
             }
+        }
+    }
+
+    /// Encode the ranked 11/16 GPU prefix with one leaf dispatch while
+    /// preserving parent3 fusion across the odd forest boundary. After a
+    /// common fused prefix, the first ten sixteenths take one more parent3
+    /// pass; three ordinary passes catch the last sixteenth up to that level;
+    /// the now-contiguous forest then stops at the global sixteen-node join.
+    /// CPU-side mirror of the MSL `TailParams` argument block.
+    #[repr(C)]
+    pub(crate) struct TailParams {
+        pub(crate) child_start: u32,
+        pub(crate) n_children: u32,
+        pub(crate) floor: u32,
+        pub(crate) out_start: [u32; 8],
+    }
+
+    /// Encode the single-dispatch parent tail: one 128-thread threadgroup
+    /// consumes the `local_len` children at `level_start + local_start` and
+    /// writes the chain's parent levels down to `floor` (1 = full chain to
+    /// its root), each to its standard flat-tree slot. `level_start` /
+    /// `level_len` describe the children's global level; `local_start` /
+    /// `local_len` the chain's slice of it. `local_len` need not be a power
+    /// of two (the halving chain still converges to `floor`).
+    unsafe fn encode_parent_tail(
+        gpu: &Gpu,
+        enc: Id,
+        tree_buf: Id,
+        level_start: usize,
+        level_len: usize,
+        local_start: usize,
+        local_len: usize,
+        floor: usize,
+    ) {
+        debug_assert!((2..=256).contains(&local_len));
+        debug_assert_eq!(local_len % 2, 0);
+        debug_assert!(floor >= 1);
+        let mut t = TailParams {
+            child_start: (level_start + local_start) as u32,
+            n_children: local_len as u32,
+            floor: floor as u32,
+            out_start: [0u32; 8],
+        };
+        let (mut ls, mut ll, mut cs, mut cl, mut i) =
+            (level_start, level_len, local_start, local_len, 0usize);
+        while cl > 1 {
+            let w = ls + ll;
+            t.out_start[i] = (w + cs / 2) as u32;
+            ls = w;
+            ll >>= 1;
+            cs >>= 1;
+            cl >>= 1;
+            i += 1;
+        }
+        unsafe {
+            gpu.set_pipeline(enc, gpu.pso_parent_tail);
+            gpu.set_buffer(enc, tree_buf, 0, 0);
+            let bytes = core::slice::from_raw_parts(
+                (&t as *const TailParams).cast::<u8>(),
+                core::mem::size_of::<TailParams>(),
+            );
+            gpu.set_bytes(enc, bytes, 1);
+            gpu.dispatch(enc, 1, 128);
+        }
+    }
+
+    pub(crate) unsafe fn encode_merkle_prefix_hybrid_impl(
+        gpu: &Gpu,
+        enc: Id,
+        codeword_buf: Id,
+        tree_buf: Id,
+        n_leaves_total: usize,
+        prefix_leaves: usize,
+        common_parent3_passes: usize,
+    ) {
+        debug_assert!(n_leaves_total.is_power_of_two());
+        debug_assert!(n_leaves_total >= 16);
+        debug_assert_eq!(prefix_leaves, 11 * (n_leaves_total / 16));
+        unsafe {
+            gpu.set_pipeline(enc, gpu.pso_leaf);
+            gpu.set_buffer(enc, codeword_buf, 0, 0);
+            gpu.set_buffer(enc, tree_buf, 0, 1);
+            let mut leaf_tpg = 256usize.min(prefix_leaves);
+            while prefix_leaves % leaf_tpg != 0 {
+                leaf_tpg >>= 1;
+            }
+            gpu.dispatch(
+                enc,
+                (prefix_leaves / leaf_tpg) as u64,
+                leaf_tpg as u64,
+            );
+
+            let mut level_start = 0usize;
+            let mut level_len = n_leaves_total;
+            let mut local_len = prefix_leaves;
+            gpu.set_pipeline(enc, gpu.pso_parent3);
+
+            // Production uses three common triples. The compact oracle uses
+            // the scaled one-triple analogue so the same split/catch-up
+            // geometry is exercised without allocating a ranked 1 GiB leaf
+            // buffer.
+            for _ in 0..common_parent3_passes {
+                debug_assert_eq!(local_len % 256, 0);
+                let level1_start = level_start + level_len;
+                let level1_len = level_len / 2;
+                let level2_start = level1_start + level1_len;
+                let level2_len = level1_len / 2;
+                let level3_start = level2_start + level2_len;
+                let level3_len = level2_len / 2;
+                gpu.set_buffer(enc, tree_buf, level_start * 32, 0);
+                gpu.set_buffer(enc, tree_buf, level1_start * 32, 1);
+                gpu.set_buffer(enc, tree_buf, level2_start * 32, 2);
+                gpu.set_buffer(enc, tree_buf, level3_start * 32, 3);
+                gpu.dispatch(enc, (local_len / 256) as u64, 128);
+                level_start = level3_start;
+                level_len = level3_len;
+                local_len >>= 3;
+            }
+
+            // The common range is eleven equal sixteenth segments. Fuse the
+            // aligned first ten (an even number of segments) once more.
+            debug_assert_eq!(local_len % 11, 0);
+            let segment_len = local_len / 11;
+            let first_len = 10 * segment_len;
+            debug_assert_eq!(first_len % 256, 0);
+            let split_level_start = level_start;
+            let split_level_len = level_len;
+            let level1_start = level_start + level_len;
+            let level1_len = level_len / 2;
+            let level2_start = level1_start + level1_len;
+            let level2_len = level1_len / 2;
+            let level3_start = level2_start + level2_len;
+            let level3_len = level2_len / 2;
+            gpu.set_buffer(enc, tree_buf, level_start * 32, 0);
+            gpu.set_buffer(enc, tree_buf, level1_start * 32, 1);
+            gpu.set_buffer(enc, tree_buf, level2_start * 32, 2);
+            gpu.set_buffer(enc, tree_buf, level3_start * 32, 3);
+            gpu.dispatch(enc, (first_len / 256) as u64, 128);
+
+            // Catch the final sixteenth up by the same three levels in ONE
+            // tail dispatch (128 children, floor 16): writes the 64 / 32 /
+            // 16 levels, each beginning exactly after the first-ten range
+            // that parent3 just emitted, so the forest is contiguous again.
+            encode_parent_tail(
+                gpu,
+                enc,
+                tree_buf,
+                split_level_start,
+                split_level_len,
+                first_len,
+                segment_len,
+                16,
+            );
+
+            // First-ten and last-one are contiguous at `level3` (176
+            // children). Finish them together down to the sixteen-root join
+            // (floor 11: the 11 prefix chains + 5 CPU chains = 16 nodes at
+            // the join level) in ONE tail dispatch; the CPU repair owns all
+            // nodes above it.
+            let join_len = prefix_leaves >> (3 * (common_parent3_passes + 1));
+            debug_assert_eq!(join_len, first_len / 8 + segment_len / 8);
+            encode_parent_tail(
+                gpu,
+                enc,
+                tree_buf,
+                level3_start,
+                level3_len,
+                0,
+                join_len,
+                11,
+            );
+            level_start = level3_start;
+            level_len = level3_len;
+            local_len = join_len;
+            // Simulate the tail's halving chain to re-establish the join
+            // invariants (levels written: 88, 44, 22, 11).
+            while level_len > 16 {
+                level_start += level_len;
+                level_len >>= 1;
+                local_len >>= 1;
+            }
+            debug_assert_eq!(level_len, 16);
+            debug_assert_eq!(local_len, 11);
         }
     }
 
@@ -2729,18 +3154,36 @@ kernel void parent_hash3(device const uint* children [[buffer(0)]],
             let cb2 = gpu.command_buffer()?;
             let enc = gpu.compute_encoder(cb2)?;
             encode_ntt_passes_prefix(gpu, enc, staging, tw_buf, log_d, 4, prefix16);
-            // Greedy aligned power-of-two subtree decomposition of the
-            // leaf prefix.
             let sixteenth = n_leaves / 16;
-            let mut start = 0usize;
             let prefix_leaves = (16 - k_cpu16) * sixteenth;
-            while start < prefix_leaves {
-                let mut size = 1usize << (prefix_leaves - start).ilog2();
-                while start % size != 0 {
-                    size >>= 1;
+            let parent3 = super::select_gpu_parent3(n_leaves, super::gpu_parent3_enabled());
+            if super::select_gpu_prefix_hybrid(
+                n_leaves,
+                k_cpu16,
+                parent3,
+                super::gpu_prefix_hybrid_enabled(),
+            ) {
+                encode_merkle_prefix_hybrid_impl(
+                    gpu,
+                    enc,
+                    staging,
+                    tree_buf,
+                    n_leaves,
+                    prefix_leaves,
+                    3,
+                );
+            } else {
+                // Same-binary incumbent: greedy aligned power-of-two subtree
+                // decomposition with separate leaf/parent schedules.
+                let mut start = 0usize;
+                while start < prefix_leaves {
+                    let mut size = 1usize << (prefix_leaves - start).ilog2();
+                    while start % size != 0 {
+                        size >>= 1;
+                    }
+                    encode_merkle_subtree(gpu, enc, staging, tree_buf, n_leaves, start, size);
+                    start += size;
                 }
-                encode_merkle_subtree(gpu, enc, staging, tree_buf, n_leaves, start, size);
-                start += size;
             }
             gpu.end_encoding(enc);
             Ok(cb2)
@@ -4477,6 +4920,97 @@ mod tests {
                 .zip(affected)
                 .all(|(node, touched)| touched || *node == SENTINEL),
             "parent3 subtree encoder wrote outside its owned flat-tree ranges",
+        );
+    }
+
+    /// Scaled real-Metal oracle for the 10+1 sixteenth split/catch-up
+    /// schedule. One common parent3 pass at 2^15 has the same segment geometry
+    /// as three common passes at the ranked 2^20 shape.
+    #[test]
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    fn gpu_prefix_hybrid_matches_cpu_and_preserves_join_boundaries() {
+        use super::imp;
+
+        const N_LEAVES: usize = 1 << 15;
+        const PREFIX16: usize = 11;
+        const PREFIX_LEAVES: usize = PREFIX16 * (N_LEAVES / 16);
+        const SENTINEL: crate::merkle::Hash = [0xD4; 32];
+        let mut rng = Rng::new(0x10_01_03_04_11);
+        let data: Vec<u8> = (0..N_LEAVES * 1024)
+            .map(|_| (rng.next_u64() & 0xff) as u8)
+            .collect();
+        let expect =
+            crate::merkle::merkle_tree(&data, N_LEAVES, crate::merkle::HashKind::Blake3);
+        let mut actual = vec![SENTINEL; expect.len()];
+        let gpu = match gpu_or_skip(imp::gpu().map(|g| g as *const imp::Gpu)) {
+            Some(g) => unsafe { &*g },
+            None => return,
+        };
+
+        unsafe {
+            let pool = gpu.pool_push();
+            let data_buf = gpu.new_buffer(data.len()).unwrap();
+            let tree_bytes = core::mem::size_of_val(actual.as_slice());
+            let tree_buf = gpu.new_buffer(tree_bytes).unwrap();
+            std::ptr::copy_nonoverlapping(
+                data.as_ptr(),
+                gpu.buffer_contents(data_buf),
+                data.len(),
+            );
+            std::ptr::copy_nonoverlapping(
+                actual.as_ptr().cast::<u8>(),
+                gpu.buffer_contents(tree_buf),
+                tree_bytes,
+            );
+            let cb = gpu.command_buffer().unwrap();
+            let enc = gpu.compute_encoder(cb).unwrap();
+            imp::encode_merkle_prefix_hybrid_impl(
+                gpu,
+                enc,
+                data_buf,
+                tree_buf,
+                N_LEAVES,
+                PREFIX_LEAVES,
+                1,
+            );
+            gpu.end_encoding(enc);
+            gpu.commit_and_wait(cb).unwrap();
+            std::ptr::copy_nonoverlapping(
+                gpu.buffer_contents(tree_buf).cast::<crate::merkle::Hash>(),
+                actual.as_mut_ptr(),
+                actual.len(),
+            );
+            gpu.release(data_buf);
+            gpu.release(tree_buf);
+            gpu.pool_pop(pool);
+        }
+
+        let mut affected = vec![false; actual.len()];
+        let mut level_start = 0usize;
+        let mut level_len = N_LEAVES;
+        let mut local_len = PREFIX_LEAVES;
+        loop {
+            let end = level_start + local_len;
+            assert_eq!(
+                &actual[level_start..end],
+                &expect[level_start..end],
+                "hybrid prefix mismatch at global level {level_len}",
+            );
+            affected[level_start..end].fill(true);
+            if level_len == 16 {
+                assert_eq!(local_len, PREFIX16);
+                break;
+            }
+            level_start += level_len;
+            level_len >>= 1;
+            local_len >>= 1;
+        }
+        assert!(
+            actual
+                .iter()
+                .zip(affected)
+                .all(|(node, touched)| touched || *node == SENTINEL),
+            "hybrid prefix wrote into the CPU suffix or above the join level",
         );
     }
 
