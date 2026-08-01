@@ -232,6 +232,10 @@ pub struct CapturedSHatVC {
     pub s_hat_v_c: Vec<F128>,
     pub quad: Vec<F128>,
     pub fold4: Option<Vec<F128>>,
+    /// Sixty-four-bank form for the direct-fold8 route; collapses under
+    /// `suffix[..6]` to `s_hat_v_c` exactly like `fold4` does under
+    /// `suffix[..4]`. Present only behind the shared DirectFold8 opt-in.
+    pub fold8: Option<Vec<F128>>,
 }
 
 /// Capture-`s_hat_v_c` prover that consumes a challenge-independent AB inner
@@ -390,32 +394,63 @@ fn prove_packed_padded_inner<C: Challenger>(
             }
             let cpu_c = crate::pcs::commit::commit_cpu_ms();
             let t_c = std::time::Instant::now();
-            let (c, s_hat_v_c, quad, fold4) =
-                crate::zerocheck::univariate_skip_optimized::round1_c_fold4_from_lincheck_stripe(
-                    c_lincheck,
-                    m,
-                    padding.k_log,
-                    k_skip,
-                    padding.useful_bits_per_block,
-                    &r,
-                    inv_table,
-                );
-            if zc_timing {
-                eprintln!(
-                    "[zc-timing] round1 lincheck-stripe C: {:.2} ms cpu={:.1}",
-                    t_c.elapsed().as_secs_f64() * 1e3,
-                    crate::pcs::commit::commit_cpu_ms() - cpu_c,
-                );
+            if crate::pcs::ranked_direct_fold8_enabled() {
+                let (c, s_hat_v_c, quad, fold8) =
+                    crate::zerocheck::univariate_skip_optimized::round1_c_fold8_from_lincheck_stripe(
+                        c_lincheck,
+                        m,
+                        padding.k_log,
+                        k_skip,
+                        padding.useful_bits_per_block,
+                        &r,
+                        inv_table,
+                    );
+                if zc_timing {
+                    eprintln!(
+                        "[zc-timing] round1 lincheck-stripe C (fold8): {:.2} ms cpu={:.1}",
+                        t_c.elapsed().as_secs_f64() * 1e3,
+                        crate::pcs::commit::commit_cpu_ms() - cpu_c,
+                    );
+                }
+                (
+                    ab,
+                    c,
+                    Some(CapturedSHatVC {
+                        s_hat_v_c,
+                        quad,
+                        fold4: None,
+                        fold8: Some(fold8),
+                    }),
+                )
+            } else {
+                let (c, s_hat_v_c, quad, fold4) =
+                    crate::zerocheck::univariate_skip_optimized::round1_c_fold4_from_lincheck_stripe(
+                        c_lincheck,
+                        m,
+                        padding.k_log,
+                        k_skip,
+                        padding.useful_bits_per_block,
+                        &r,
+                        inv_table,
+                    );
+                if zc_timing {
+                    eprintln!(
+                        "[zc-timing] round1 lincheck-stripe C: {:.2} ms cpu={:.1}",
+                        t_c.elapsed().as_secs_f64() * 1e3,
+                        crate::pcs::commit::commit_cpu_ms() - cpu_c,
+                    );
+                }
+                (
+                    ab,
+                    c,
+                    Some(CapturedSHatVC {
+                        s_hat_v_c,
+                        quad,
+                        fold4: Some(fold4),
+                        fold8: None,
+                    }),
+                )
             }
-            (
-                ab,
-                c,
-                Some(CapturedSHatVC {
-                    s_hat_v_c,
-                    quad,
-                    fold4: Some(fold4),
-                }),
-            )
         } else if m == 32 && crate::pcs::ranked_direct_fold4_enabled() {
             let (ab, c, s_hat_v_c, quad, fold4) =
                 crate::zerocheck::univariate_skip_optimized::round1_shift_reduce_extract_c_packed_padded_with_precomputed_ab_fold4(
@@ -434,6 +469,7 @@ fn prove_packed_padded_inner<C: Challenger>(
                     s_hat_v_c,
                     quad,
                     fold4: Some(fold4),
+                    fold8: None,
                 }),
             )
         } else {
@@ -454,6 +490,7 @@ fn prove_packed_padded_inner<C: Challenger>(
                     s_hat_v_c,
                     quad,
                     fold4: None,
+                    fold8: None,
                 }),
             )
         }
@@ -476,6 +513,7 @@ fn prove_packed_padded_inner<C: Challenger>(
                 s_hat_v_c,
                 quad,
                 fold4: None,
+                fold8: None,
             }),
         )
     } else {
