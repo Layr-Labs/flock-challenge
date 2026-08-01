@@ -853,6 +853,7 @@ fn process_one_x_hi_with_precomputed_ab(
     mask_tables: &[F128],
     split_ab_c: bool,
     direct_ab_rows: bool,
+    ab_drain8: bool,
     c_drain4: bool,
     state: &mut WorkerStateWithSHatV,
 ) {
@@ -897,6 +898,7 @@ fn process_one_x_hi_with_precomputed_ab(
                 convert,
                 eq_lo_scaled[x_outer_lo],
                 &mut state.partial_ab,
+                ab_drain8,
             );
         }
 
@@ -1347,6 +1349,9 @@ pub fn round1_shift_reduce_extract_c_packed_padded_with_precomputed_ab(
     let ab_inner_bytes = ab_inner.as_bytes();
     let split_ab_c = std::env::var_os("FLOCK_NO_ZC_SPLIT_AB_C").is_none();
     let direct_ab_rows = std::env::var_os("FLOCK_NO_ZC_DIRECT_AB_ROWS").is_none();
+    let ab_drain8 = cfg!(all(target_os = "macos", target_arch = "aarch64"))
+        && m == 32
+        && std::env::var_os("FLOCK_NO_ZC_AB_DRAIN8").is_none();
     let c_drain4 = std::env::var_os("FLOCK_NO_ZC_C_DRAIN4").is_none();
 
     // The challenge-independent AB transform finishes while the commitment is
@@ -1374,6 +1379,7 @@ pub fn round1_shift_reduce_extract_c_packed_padded_with_precomputed_ab(
             &mask_tables,
             split_ab_c,
             direct_ab_rows,
+            ab_drain8,
             c_drain4,
             &mut state,
         );
@@ -2545,6 +2551,42 @@ mod tests {
 
             assert_eq!(got_ab, want_ab, "partial_ab mismatch at n_b_med={n_b_med}");
             assert_eq!(got_c, want_c, "partial_c mismatch at n_b_med={n_b_med}");
+        }
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn direct_ab_eight_lane_matches_four_lane() {
+        let convert = convert_table();
+        let mut rng = Rng::new(0xAB_D8A1_2026);
+        for n_b_med in 0..=(1 << N_MEDIUM) {
+            let mut chunk_ab = [[0u8; 64]; 1 << N_MEDIUM];
+            for row in &mut chunk_ab {
+                for byte in row {
+                    *byte = (rng.next_u64() & 0xff) as u8;
+                }
+            }
+            let eq_lo_val = rng.f128();
+            let seed: [F128; ELL] = core::array::from_fn(|_| rng.f128());
+            let mut got = seed;
+            kernels::accumulate_convert_ab(
+                &chunk_ab,
+                n_b_med,
+                convert,
+                eq_lo_val,
+                &mut got,
+                true,
+            );
+            let mut want = seed;
+            kernels::accumulate_convert_ab(
+                &chunk_ab,
+                n_b_med,
+                convert,
+                eq_lo_val,
+                &mut want,
+                false,
+            );
+            assert_eq!(got, want, "AB drain mismatch at n_b_med={n_b_med}");
         }
     }
 

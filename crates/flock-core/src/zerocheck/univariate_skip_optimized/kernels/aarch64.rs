@@ -149,6 +149,7 @@ pub(crate) unsafe fn accumulate_convert_ab(
     convert: &[F128],
     eq_lo_val: F128,
     partial_ab: &mut [F128; 64],
+    drain8: bool,
 ) {
     use core::arch::aarch64::*;
 
@@ -161,6 +162,83 @@ pub(crate) unsafe fn accumulate_convert_ab(
     // 16 convert blocks.
     unsafe {
         let convert_ptr = convert.as_ptr() as *const u8;
+        if drain8 {
+            for lane in (0..64).step_by(8) {
+                let mut ab0 = vdupq_n_u8(0);
+                let mut ab1 = vdupq_n_u8(0);
+                let mut ab2 = vdupq_n_u8(0);
+                let mut ab3 = vdupq_n_u8(0);
+                let mut ab4 = vdupq_n_u8(0);
+                let mut ab5 = vdupq_n_u8(0);
+                let mut ab6 = vdupq_n_u8(0);
+                let mut ab7 = vdupq_n_u8(0);
+                for p in 0..n_b_med / 2 {
+                    let (b_even, b_odd) = (2 * p, 2 * p + 1);
+                    let t_even = convert_ptr.add(b_even * 256 * 16);
+                    let t_odd = convert_ptr.add(b_odd * 256 * 16);
+                    let we = (chunk_ab_bytes[b_even].as_ptr().add(lane) as *const u64)
+                        .read_unaligned() as usize;
+                    let wo = (chunk_ab_bytes[b_odd].as_ptr().add(lane) as *const u64)
+                        .read_unaligned() as usize;
+                    macro_rules! fold_lane {
+                        ($acc:ident, $shift:literal) => {
+                            $acc = xor3_u8(
+                                $acc,
+                                vld1q_u8(t_even.add(((we >> $shift) & 0xff) * 16)),
+                                vld1q_u8(t_odd.add(((wo >> $shift) & 0xff) * 16)),
+                            );
+                        };
+                    }
+                    fold_lane!(ab0, 0);
+                    fold_lane!(ab1, 8);
+                    fold_lane!(ab2, 16);
+                    fold_lane!(ab3, 24);
+                    fold_lane!(ab4, 32);
+                    fold_lane!(ab5, 40);
+                    fold_lane!(ab6, 48);
+                    fold_lane!(ab7, 56);
+                }
+                if n_b_med & 1 == 1 {
+                    let b_med = n_b_med - 1;
+                    let table = convert_ptr.add(b_med * 256 * 16);
+                    let wa = (chunk_ab_bytes[b_med].as_ptr().add(lane) as *const u64)
+                        .read_unaligned() as usize;
+                    macro_rules! fold_tail {
+                        ($acc:ident, $shift:literal) => {
+                            $acc = veorq_u8(
+                                $acc,
+                                vld1q_u8(table.add(((wa >> $shift) & 0xff) * 16)),
+                            );
+                        };
+                    }
+                    fold_tail!(ab0, 0);
+                    fold_tail!(ab1, 8);
+                    fold_tail!(ab2, 16);
+                    fold_tail!(ab3, 24);
+                    fold_tail!(ab4, 32);
+                    fold_tail!(ab5, 40);
+                    fold_tail!(ab6, 48);
+                    fold_tail!(ab7, 56);
+                }
+                macro_rules! drain_lane8 {
+                    ($offset:literal, $ab:ident) => {{
+                        let ab = vreinterpretq_u64_u8($ab);
+                        partial_ab[lane + $offset] += F128 {
+                            lo: vgetq_lane_u64::<0>(ab),
+                            hi: vgetq_lane_u64::<1>(ab),
+                        } * eq_lo_val;
+                    }};
+                }
+                drain_lane8!(0, ab0);
+                drain_lane8!(1, ab1);
+                drain_lane8!(2, ab2);
+                drain_lane8!(3, ab3);
+                drain_lane8!(4, ab4);
+                drain_lane8!(5, ab5);
+                drain_lane8!(6, ab6);
+                drain_lane8!(7, ab7);
+            }
+        } else {
         let n_pairs = n_b_med / 2;
         for lane in (0..64).step_by(4) {
             // 4 live accumulator q-registers (4 lanes × 1 bank); the paired
@@ -230,6 +308,7 @@ pub(crate) unsafe fn accumulate_convert_ab(
             drain_lane!(1, ab1);
             drain_lane!(2, ab2);
             drain_lane!(3, ab3);
+        }
         }
     }
 }
