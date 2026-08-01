@@ -4525,20 +4525,23 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
     let log_msg_cols_1 = n1 - log_num_interleaved_1;
     let log_inv_rate_1 = config.log_inv_rates[1];
     let _t = std::time::Instant::now();
-    let ntt_1 = AdditiveNttF128::standard(log_msg_cols_1 + log_inv_rate_1);
-    // Borrow the folded evaluations directly: `ligero_commit` copies its
-    // input into its own scratch codeword (`replicate_message_fill`), so the
-    // previous `sc_prover.f().to_vec()` materialized a second 2^(n1) copy
-    // (8 MiB at the ranked shape) on the timed path only to drop it after
-    // the commit.
-    let wtns_1 = ligero_commit(
-        sc_prover.f(),
-        log_msg_cols_1,
-        log_num_interleaved_1,
-        log_inv_rate_1,
-        &ntt_1,
-        config.merkle_hash,
-    );
+    // Scope NTT twiddles to commit only — not live through OOD/open/induce.
+    let wtns_1 = {
+        let ntt_1 = AdditiveNttF128::standard(log_msg_cols_1 + log_inv_rate_1);
+        // Borrow the folded evaluations directly: `ligero_commit` copies its
+        // input into its own scratch codeword (`replicate_message_fill`), so the
+        // previous `sc_prover.f().to_vec()` materialized a second 2^(n1) copy
+        // (8 MiB at the ranked shape) on the timed path only to drop it after
+        // the commit.
+        ligero_commit(
+            sc_prover.f(),
+            log_msg_cols_1,
+            log_num_interleaved_1,
+            log_inv_rate_1,
+            &ntt_1,
+            config.merkle_hash,
+        )
+    };
     if trace {
         t_commits += _t.elapsed();
     }
@@ -4744,16 +4747,19 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
         let log_msg_cols_next = n_next - log_num_interleaved_next;
         let log_inv_rate_next = config.log_inv_rates[i + 2];
         let _t = std::time::Instant::now();
-        let ntt_next = AdditiveNttF128::standard(log_msg_cols_next + log_inv_rate_next);
-        // Same borrow-instead-of-copy as the wtns_1 commit above.
-        let wtns_next = ligero_commit(
-            sc_prover.f(),
-            log_msg_cols_next,
-            log_num_interleaved_next,
-            log_inv_rate_next,
-            &ntt_next,
-            config.merkle_hash,
-        );
+        // Drop NTT twiddles as soon as codeword+tree exist (commit-only).
+        let wtns_next = {
+            let ntt_next = AdditiveNttF128::standard(log_msg_cols_next + log_inv_rate_next);
+            // Same borrow-instead-of-copy as the wtns_1 commit above.
+            ligero_commit(
+                sc_prover.f(),
+                log_msg_cols_next,
+                log_num_interleaved_next,
+                log_inv_rate_next,
+                &ntt_next,
+                config.merkle_hash,
+            )
+        };
         if trace {
             t_commits += _t.elapsed();
         }
@@ -5899,16 +5905,18 @@ fn recursive_prover_inner<Ch: Challenger>(
     assert!(n1 >= log_num_interleaved_1, "n1 < k_0");
     let log_msg_cols_1 = n1 - log_num_interleaved_1;
     let log_inv_rate_1 = config.log_inv_rates[1];
-    let ntt_1 = AdditiveNttF128::standard(log_msg_cols_1 + log_inv_rate_1);
     let t = std::time::Instant::now();
-    let wtns_1 = ligero_commit(
-        &f1,
-        log_msg_cols_1,
-        log_num_interleaved_1,
-        log_inv_rate_1,
-        &ntt_1,
-        config.merkle_hash,
-    );
+    let wtns_1 = {
+        let ntt_1 = AdditiveNttF128::standard(log_msg_cols_1 + log_inv_rate_1);
+        ligero_commit(
+            &f1,
+            log_msg_cols_1,
+            log_num_interleaved_1,
+            log_inv_rate_1,
+            &ntt_1,
+            config.merkle_hash,
+        )
+    };
     let t_l1 = t.elapsed();
     t_commits += t_l1;
     tlog!("  [ligerito]   L1 commit: {:.2?}", t_l1);
@@ -6043,17 +6051,19 @@ fn recursive_prover_inner<Ch: Challenger>(
         );
         let log_msg_cols_next = n_next - log_num_interleaved_next;
         let log_inv_rate_next = config.log_inv_rates[i + 2];
-        let ntt_next = AdditiveNttF128::standard(log_msg_cols_next + log_inv_rate_next);
-        let f_evals = sc_prover.f().to_vec();
         let t = std::time::Instant::now();
-        let wtns_next = ligero_commit(
-            &f_evals,
-            log_msg_cols_next,
-            log_num_interleaved_next,
-            log_inv_rate_next,
-            &ntt_next,
-            config.merkle_hash,
-        );
+        let wtns_next = {
+            let ntt_next = AdditiveNttF128::standard(log_msg_cols_next + log_inv_rate_next);
+            let f_evals = sc_prover.f().to_vec();
+            ligero_commit(
+                &f_evals,
+                log_msg_cols_next,
+                log_num_interleaved_next,
+                log_inv_rate_next,
+                &ntt_next,
+                config.merkle_hash,
+            )
+        };
         let t_li = t.elapsed();
         t_commits += t_li;
         tlog!("  [ligerito]   L{} commit: {:.2?}", i + 2, t_li);
