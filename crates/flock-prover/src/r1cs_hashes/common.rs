@@ -268,7 +268,7 @@ where
     (z, a, b, stripe)
 }
 
-/// Ranked full-write witness driver that publishes eight coarse readiness
+/// Ranked full-write witness driver that publishes sixteen readiness
 /// bands to the latched Metal from-`z` pass. Returns `None` for the stream on
 /// warmup/non-Metal/fallback paths while preserving identical witness output.
 pub(crate) fn drive_witness_packed_and_lincheck_full_write_streamed<S: Sync, F>(
@@ -609,13 +609,13 @@ where
     let n_groups = n_total / 8;
     if let Some(stream) = &mut stream {
         const SEGMENTS: usize = 8;
-        const BANDS: usize = 8;
+        const BANDS: usize = 16;
         let groups_per_segment = n_groups / SEGMENTS;
         let groups_per_band = groups_per_segment / BANDS;
         let r_total = 1usize << 16;
         let r_per_band = r_total / BANDS;
         debug_assert_eq!(groups_per_segment, 4096);
-        debug_assert_eq!(groups_per_band, 512);
+        debug_assert_eq!(groups_per_band, 256);
         for band in 0..BANDS {
             (0..SEGMENTS * groups_per_band)
                 .into_par_iter()
@@ -652,10 +652,10 @@ mod streamed_first_pass_tests {
     #[test]
     fn ranked_bands_cover_each_group_and_every_published_tile_is_ready() {
         const SEGMENTS: usize = 8;
-        const BANDS: usize = 8;
+        const BANDS: usize = 16;
         const GROUPS_PER_SEGMENT: usize = 4096;
-        const GROUPS_PER_BAND: usize = 512;
-        const R_PER_BAND: usize = 8192;
+        const GROUPS_PER_BAND: usize = 256;
+        const R_PER_BAND: usize = 4096;
         let mut seen = vec![false; SEGMENTS * GROUPS_PER_SEGMENT];
 
         for band in 0..BANDS {
