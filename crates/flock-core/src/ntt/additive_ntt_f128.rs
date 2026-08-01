@@ -518,6 +518,8 @@ impl AdditiveNttF128 {
             tw
         };
 
+        let pass_timing = std::env::var_os("FLOCK_NTT_PASS_TIMING").is_some();
+        let t_l1 = std::time::Instant::now();
         // Layer-1 fused-3 pass from the message: 2 blocks, identical input.
         {
             let block_size = 1usize << (log_d - 1);
@@ -560,6 +562,12 @@ impl AdditiveNttF128 {
             });
         }
 
+        if pass_timing {
+            eprintln!(
+                "[ntt-pass] layer1-from-msg: {:.2} ms",
+                t_l1.elapsed().as_secs_f64() * 1e3
+            );
+        }
         // Layers 4 and 7: exact in-place ranked hetero passes.
         for layer in [4usize, 7] {
             let num_blocks = 1usize << layer;
@@ -2541,6 +2549,44 @@ mod tests {
         // At layer log_d - 1 = 3, there are 2^3 = 8 blocks. twiddle(3, b) for b ∈ 0..8.
         for b in 0..8 {
             let _t = ntt.twiddle(log_d - 1, b);
+        }
+    }
+}
+
+#[cfg(test)]
+mod twiddle_structure_check {
+    use super::*;
+    #[test]
+    #[ignore]
+    fn dump_top_layer_twiddle_structure() {
+        // Ranked shape: log_domain 20 positions? standard(k_code) — use 20.
+        let ntt = AdditiveNttF128::standard(20);
+        for layer in [1usize, 4, 7] {
+            let blocks = 1usize << layer;
+            let mut hi_zero = 0usize;
+            let mut lo_zero = 0usize;
+            for b in 0..blocks {
+                let t = ntt.twiddle(layer, b);
+                if t.hi == 0 {
+                    hi_zero += 1;
+                }
+                if t.lo == 0 && t.hi == 0 {
+                    lo_zero += 1;
+                }
+            }
+            println!("layer {layer}: {blocks} twiddles, hi==0: {hi_zero}, all-zero: {lo_zero}");
+            if layer == 7 {
+                for b in 0..8 {
+                    let t = ntt.twiddle(layer, b);
+                    println!("  t[{b}] = {:#018x}_{:016x}", t.hi, t.lo);
+                }
+            }
+        }
+        // also deep layers for context
+        for layer in [10usize, 15, 19] {
+            let blocks = 1usize << layer;
+            let hi_zero = (0..blocks).filter(|&b| ntt.twiddle(layer, b).hi == 0).count();
+            println!("layer {layer}: {blocks} twiddles, hi==0: {hi_zero}");
         }
     }
 }
