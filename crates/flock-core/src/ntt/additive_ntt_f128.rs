@@ -256,6 +256,25 @@ fn is_ranked_top_hetero_fused3_pass(
     use_ranked_deep_pair_fusion(log_d, num_ntts, start_layer, n_top) && matches!(layer, 1 | 4 | 7)
 }
 
+/// Extend the incumbent one-MiB heterogeneous top-pass queue to the two
+/// timed radix-8 passes in the six-block hybrid CPU suffix.  The queue is a
+/// repeatable win for that split, while the five-block autotune choice is
+/// better served by the incumbent range scheduler.  The complete-L0 path
+/// already uses the same q-resident multi-row kernel and queue grain; this
+/// selector is deliberately separate so the generic range scheduler remains
+/// the exact same-binary control.
+#[inline]
+fn use_ranked_hybrid_suffix_tile_queue(cpu_blocks: usize) -> bool {
+    cpu_blocks == 6
+        && cfg!(all(
+            target_os = "macos",
+            target_arch = "aarch64",
+            target_feature = "aes"
+        ))
+        && std::env::var_os("FLOCK_NO_HYBRID_SUFFIX_TILE_QUEUE").is_none()
+        && std::env::var_os("FLOCK_NO_NTT_TOP_EPOOL").is_none()
+}
+
 const INTERLEAVED_PHASE_ALL: u8 = 0;
 const INTERLEAVED_PHASE_TOP_ONLY: u8 = 1;
 const INTERLEAVED_PHASE_DEEP_ONLY: u8 = 2;
@@ -697,6 +716,58 @@ impl AdditiveNttF128 {
         }
     }
 
+    /// Run only the ranked hybrid suffix's two broad radix-8 passes through
+    /// fixed one-MiB tile claims.  Absolute block indices preserve the
+    /// incumbent range driver's twiddles; the CPU-owned suffix always begins
+    /// after a nonempty GPU prefix, so none of its local blocks is the global
+    /// zero root.
+    fn forward_transform_interleaved_ranked_suffix_top_tile_queue(
+        &self,
+        data: &mut [F128],
+        b_start: usize,
+        b_end: usize,
+    ) {
+        const LOG_D: usize = 20;
+        const NUM_NTTS: usize = 64;
+        const START_LAYER: usize = 4;
+
+        debug_assert_eq!(data.len(), (1usize << LOG_D) * NUM_NTTS);
+        debug_assert!(0 < b_start && b_start < b_end && b_end <= (1 << START_LAYER));
+
+        let range_blocks = b_end - b_start;
+        let top_block_positions = 1usize << (LOG_D - START_LAYER);
+        let range_base = b_start * top_block_positions * NUM_NTTS;
+        let range_elems = range_blocks * top_block_positions * NUM_NTTS;
+        let range = &mut data[range_base..range_base + range_elems];
+
+        for layer in [START_LAYER, START_LAYER + 3] {
+            let num_blocks = range_blocks << (layer - START_LAYER);
+            let abs_first = b_start << (layer - START_LAYER);
+            let block_positions = 1usize << (LOG_D - layer);
+            let eighth = block_positions >> 3;
+            let twiddles: Vec<[F128; 7]> = (0..num_blocks)
+                .map(|local| {
+                    let abs = abs_first + local;
+                    let mut tw = [F128 { lo: 0, hi: 0 }; 7];
+                    tw[0] = self.twiddle(layer, abs);
+                    for s in 0..2 {
+                        tw[1 + s] = self.twiddle(layer + 1, 2 * abs + s);
+                    }
+                    for s in 0..4 {
+                        tw[3 + s] = self.twiddle(layer + 2, 4 * abs + s);
+                    }
+                    tw
+                })
+                .collect();
+            butterfly_interleaved_fused_3layer_selected_blocks_hetero(
+                range,
+                &twiddles,
+                eighth,
+                NUM_NTTS,
+            );
+        }
+    }
+
     /// Complete a ranked hybrid suffix with the same cache-local schedule as
     /// the tuned full-CPU transform, then publish each finalized 1 MiB chunk.
     ///
@@ -731,16 +802,24 @@ impl AdditiveNttF128 {
         assert_eq!(stop_layer, log_d, "ranked hybrid suffix completes the NTT");
         assert!(b_start < b_end && b_end <= (1usize << start_layer));
 
-        // Two fused radix-8 passes.  Unlike the old all-layer range driver,
-        // this is the last streaming traversal of the complete suffix.
-        self.forward_transform_interleaved_block_range(
-            data,
-            num_ntts,
-            start_layer,
-            DEEP_LAYER,
-            b_start,
-            b_end,
-        );
+        // Two fused radix-8 passes. Unlike the old all-layer range driver,
+        // this is the last streaming traversal of the complete suffix. The
+        // candidate changes only how its independent row groups are claimed;
+        // the incumbent range scheduler remains an exact opt-out.
+        if use_ranked_hybrid_suffix_tile_queue(b_end - b_start) {
+            self.forward_transform_interleaved_ranked_suffix_top_tile_queue(
+                data, b_start, b_end,
+            );
+        } else {
+            self.forward_transform_interleaved_block_range(
+                data,
+                num_ntts,
+                start_layer,
+                DEEP_LAYER,
+                b_start,
+                b_end,
+            );
+        }
 
         // Every layer-4 block contains 2^(10-4) independent layer-10
         // sub-NTTs.  Preserve their absolute indices so all deeper twiddles
@@ -1856,6 +1935,47 @@ fn butterfly_interleaved_fused_3layer_all_blocks_par_rows(
     });
 }
 
+/// Heterogeneous tile queue for a contiguous nonzero block range.  This is
+/// the hybrid-suffix analogue of the complete-ranked dispatcher below, but it
+/// intentionally has no block-zero specialization: local block zero is an
+/// absolute nonzero block after the GPU-owned prefix.
+#[inline]
+fn butterfly_interleaved_fused_3layer_selected_blocks_hetero(
+    data: &mut [F128],
+    twiddles: &[[F128; 7]],
+    eighth: usize,
+    num_ntts: usize,
+) {
+    let num_blocks = twiddles.len();
+    let block_elems = 8 * eighth * num_ntts;
+    debug_assert_eq!(data.len(), num_blocks * block_elems);
+    debug_assert!(eighth.is_power_of_two());
+
+    const ROWS_PER_TILE: usize = 128;
+    let tiles_per_block = eighth.div_ceil(ROWS_PER_TILE);
+    let base = crate::epool::SyncPtr(data.as_mut_ptr());
+    crate::epool::run_hetero_chunks(num_blocks * tiles_per_block, |job| {
+        let block = job / tiles_per_block;
+        let tile = job % tiles_per_block;
+        let row_start = tile * ROWS_PER_TILE;
+        let row_end = (row_start + ROWS_PER_TILE).min(eighth);
+        let block_base = unsafe { base.ptr().add(block * block_elems) };
+        // SAFETY: each claim owns one disjoint block/tile row range. The
+        // incumbent q-resident multi-row kernel retains all seven twiddles
+        // across the claim and performs the same butterflies as the control.
+        unsafe {
+            kernels::butterfly_fused_3layer_rows(
+                block_base,
+                eighth,
+                num_ntts,
+                row_start,
+                row_end,
+                &twiddles[block],
+            )
+        }
+    });
+}
+
 /// Ranked block/tile-queue sibling of
 /// [`butterfly_interleaved_fused_3layer_all_blocks_par_rows`]. Each queue
 /// claim owns a fixed row tile within one block and processes those rows
@@ -2228,6 +2348,14 @@ mod tests {
         assert!(!use_ranked_zero_root_fusion(20, 8, 1, 10));
         assert!(!use_ranked_zero_root_fusion(20, 64, 0, 10));
         assert!(!use_ranked_zero_root_fusion(20, 64, 1, 9));
+        assert_eq!(
+            use_ranked_hybrid_suffix_tile_queue(6),
+            enabled_here
+                && std::env::var_os("FLOCK_NO_HYBRID_SUFFIX_TILE_QUEUE").is_none()
+                && std::env::var_os("FLOCK_NO_NTT_TOP_EPOOL").is_none()
+        );
+        assert!(!use_ranked_hybrid_suffix_tile_queue(5));
+        assert!(!use_ranked_hybrid_suffix_tile_queue(7));
 
         for layer in [1, 4, 7] {
             assert_eq!(
@@ -2387,13 +2515,29 @@ mod tests {
                 );
             }
 
-            let mut got = source;
+            let mut got = source.clone();
             butterfly_interleaved_fused_3layer_all_blocks_hetero(
                 &mut got, &twiddles, eighth, NUM_NTTS,
             );
             assert_eq!(
                 got, expected,
                 "heterogeneous pass mismatch at layer={layer}"
+            );
+
+            // The hybrid suffix begins at a nonzero absolute block. Exercise
+            // that exact ownership rule by presenting block 1 as local block
+            // zero; it must retain generic arithmetic and absolute twiddles.
+            let mut selected = source[block_elems..].to_vec();
+            butterfly_interleaved_fused_3layer_selected_blocks_hetero(
+                &mut selected,
+                &twiddles[1..],
+                eighth,
+                NUM_NTTS,
+            );
+            assert_eq!(
+                selected,
+                &expected[block_elems..],
+                "selected heterogeneous pass mismatch at layer={layer}"
             );
         }
     }

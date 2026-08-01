@@ -1442,66 +1442,6 @@ pub(crate) fn round1_c_fold4_from_lincheck_stripe(
     (round1_c_opt, s_hat_v_c, quad, fold4)
 }
 
-/// Fold8 sibling of [`round1_c_fold4_from_lincheck_stripe`]: same single
-/// stripe fold, but six inner coordinates are retained (64 banks) for the
-/// direct-fold8 PCS consumer. The wire outputs (`round1_c_opt`, canonical
-/// `s_hat_v_c`, `quad`) are derived by collapsing the wider statistic and are
-/// bitwise identical to the fold4 variant's — the extra two retained
-/// coordinates only widen the exported tensor.
-pub(crate) fn round1_c_fold8_from_lincheck_stripe(
-    c_lincheck: &[u8],
-    m: usize,
-    k_log: usize,
-    k_skip: usize,
-    useful_bits: usize,
-    r: &[F128],
-    inv_table: &InvNttTableByteSingleGf8,
-) -> (Vec<F128>, Vec<F128>, Vec<F128>, Vec<F128>) {
-    assert_eq!(k_skip, K_SKIP);
-    assert!(
-        k_log >= k_skip + 7,
-        "Fold8 needs six retained tail coordinates"
-    );
-    assert_eq!(r.len(), m);
-    assert_eq!(c_lincheck.len(), (1usize << m) / 8);
-
-    let eq_outer = crate::lincheck::build_eq_table(&r[k_log..]);
-    let c_inner =
-        crate::lincheck::partial_fold_packed_z_best(c_lincheck, m, k_log, useful_bits, &eq_outer);
-    let inner_tail = &r[k_skip + 1..k_log];
-    let fold8 = crate::pcs::ring_switch::s_hat_v_fold8_from_z_vec(&c_inner, inner_tail);
-    let s_hat_v_c = crate::pcs::ring_switch::collapse_s_hat_v_fold8(&fold8, &inner_tail[..6]);
-
-    // Fold retained coordinates 2..6 to recover the incumbent four-bank
-    // tensor (coordinates 0 and 1 remain bank selectors).
-    let retained_hi_eq = build_eq(&inner_tail[2..6]);
-    let n_packed = 1usize << crate::pcs::LOG_PACKING;
-    let mut quad = vec![F128::ZERO; 4 * n_packed];
-    for q in 0..16 {
-        for e in 0..4 {
-            let src = (e + 4 * q) * n_packed;
-            let dst = e * n_packed;
-            for packed in 0..n_packed {
-                quad[dst + packed] += retained_hi_eq[q] * fold8[src + packed];
-            }
-        }
-    }
-
-    // RingSwitch leaves global bit k_skip as its 128-way prefix. Fold that
-    // bit at the original C point to recover C's 64 S-domain evaluations.
-    // The optimized round-one convention omits C_s; the common caller restores
-    // it before placing the message on the transcript.
-    let prefix = r[k_skip];
-    let mut res_c_s = [F128::ZERO; ELL];
-    let c_s_inv = c_s_f128().inv();
-    for lane in 0..ELL {
-        let naive = (F128::ONE + prefix) * s_hat_v_c[lane] + prefix * s_hat_v_c[ELL + lane];
-        res_c_s[lane] = c_s_inv * naive;
-    }
-    let round1_c_opt = ntt_extend_f128_vec_ghash(&res_c_s, inv_table);
-    (round1_c_opt, s_hat_v_c, quad, fold8)
-}
-
 /// Pair-fused C job with the original 32-bank accumulator and one job per
 /// `x_hi`. This isolates the benefit of halving field-table/state updates
 /// from the q-local scheduling experiment below.
@@ -4402,45 +4342,6 @@ mod tests {
             assert_eq!(got_c.1, incumbent.2, "canonical C mismatch in case {case}");
             assert_eq!(got_c.2, incumbent.3, "quad C mismatch in case {case}");
             assert_eq!(got_c.3, incumbent.4, "fold4 C mismatch in case {case}");
-
-            // Fold8 sibling: identical wire outputs from the wider statistic,
-            // and the 64-bank tensor must collapse to every narrower form.
-            let got_c8 = round1_c_fold8_from_lincheck_stripe(
-                &c_lincheck,
-                M,
-                K_LOG,
-                K_SKIP,
-                padding.useful_bits_per_block,
-                &r,
-                &inv_table,
-            );
-            assert_eq!(got_c8.0, incumbent.1, "fold8 round-one C mismatch in case {case}");
-            assert_eq!(got_c8.1, incumbent.2, "fold8 canonical C mismatch in case {case}");
-            assert_eq!(got_c8.2, incumbent.3, "fold8 quad C mismatch in case {case}");
-            let inner_tail = &r[K_SKIP + 1..K_LOG];
-            assert_eq!(
-                crate::pcs::ring_switch::collapse_s_hat_v_fold8(&got_c8.3, &inner_tail[..6]),
-                incumbent.2,
-                "fold8 suffix[..6] collapse mismatch in case {case}"
-            );
-            // Folding retained coordinates 4 and 5 must reproduce the
-            // incumbent 16-bank fold4 tensor exactly.
-            let hi_eq = build_eq(&inner_tail[4..6]);
-            let n_packed = 1usize << crate::pcs::LOG_PACKING;
-            let mut fold4_from_8 = vec![F128::ZERO; 16 * n_packed];
-            for q in 0..4 {
-                for e in 0..16 {
-                    let src = (e + 16 * q) * n_packed;
-                    let dst = e * n_packed;
-                    for packed in 0..n_packed {
-                        fold4_from_8[dst + packed] += hi_eq[q] * got_c8.3[src + packed];
-                    }
-                }
-            }
-            assert_eq!(
-                fold4_from_8, incumbent.4,
-                "fold8 → fold4 reduction mismatch in case {case}"
-            );
         }
     }
 }
