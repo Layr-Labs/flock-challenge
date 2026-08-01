@@ -697,67 +697,6 @@ impl AdditiveNttF128 {
         }
     }
 
-    /// Complete a ranked hybrid suffix with the same cache-local schedule as
-    /// the tuned full-CPU transform, then publish each finalized 1 MiB chunk.
-    ///
-    /// The shared GPU pass has already completed layers 0..4.  This routine
-    /// runs the two remaining top radix-8 groups (layers 4..10) over the
-    /// requested absolute layer-4 blocks, then finishes layers 10..20 as five
-    /// fused pairs inside independent layer-10 sub-NTTs.  `finish_chunk`
-    /// receives an absolute element offset, so a concurrent GPU prefix and
-    /// this CPU suffix can write disjoint Merkle leaf ranges without rebasing
-    /// indices.  It runs immediately after the last pair while the 1 MiB
-    /// codeword chunk is still cache-resident.
-    ///
-    /// This deliberately has a narrow production contract.  Other shapes
-    /// keep [`Self::forward_transform_interleaved_block_range`].
-    pub(crate) fn forward_transform_interleaved_ranked_block_range_and_then<F>(
-        &self,
-        data: &mut [F128],
-        num_ntts: usize,
-        start_layer: usize,
-        stop_layer: usize,
-        b_start: usize,
-        b_end: usize,
-        finish_chunk: F,
-    ) where
-        F: Fn(usize, &[F128]) + Sync + Send,
-    {
-        const DEEP_LAYER: usize = 10;
-        let log_d = log2_pow2(data.len() / num_ntts);
-        assert_eq!(log_d, 20, "ranked hybrid suffix requires log_d=20");
-        assert_eq!(num_ntts, 64, "ranked hybrid suffix requires 64 lanes");
-        assert_eq!(start_layer, 4, "ranked hybrid suffix starts at layer 4");
-        assert_eq!(stop_layer, log_d, "ranked hybrid suffix completes the NTT");
-        assert!(b_start < b_end && b_end <= (1usize << start_layer));
-
-        // Two fused radix-8 passes.  Unlike the old all-layer range driver,
-        // this is the last streaming traversal of the complete suffix.
-        self.forward_transform_interleaved_block_range(
-            data,
-            num_ntts,
-            start_layer,
-            DEEP_LAYER,
-            b_start,
-            b_end,
-        );
-
-        // Every layer-4 block contains 2^(10-4) independent layer-10
-        // sub-NTTs.  Preserve their absolute indices so all deeper twiddles
-        // match the unsplit transform exactly.
-        let sub_start = b_start << (DEEP_LAYER - start_layer);
-        let sub_end = b_end << (DEEP_LAYER - start_layer);
-        self.forward_transform_interleaved_deep_fused_pairs_range_and_then(
-            data,
-            num_ntts,
-            DEEP_LAYER,
-            log_d,
-            sub_start,
-            sub_end,
-            &finish_chunk,
-        );
-    }
-
     /// Finish the ranked L0 transform's five cache-local deep pairs and invoke
     /// `finish_chunk` exactly as the unsplit transform does.
     #[inline]
@@ -1182,50 +1121,18 @@ impl AdditiveNttF128 {
     ) where
         F: Fn(usize, &[F128]) + Sync + Send,
     {
-        self.forward_transform_interleaved_deep_fused_pairs_range_and_then(
-            data,
-            num_ntts,
-            n_top,
-            log_d,
-            0,
-            1usize << n_top,
-            finish_chunk,
-        );
-    }
-
-    /// Range form of the ranked deep-pair scheduler. `sub_start..sub_end` are
-    /// absolute layer-`n_top` block indices in the full transform; using the
-    /// absolute `sub_idx` below is what preserves every deeper twiddle index.
-    fn forward_transform_interleaved_deep_fused_pairs_range_and_then<F>(
-        &self,
-        data: &mut [F128],
-        num_ntts: usize,
-        n_top: usize,
-        log_d: usize,
-        sub_start: usize,
-        sub_end: usize,
-        finish_chunk: &F,
-    ) where
-        F: Fn(usize, &[F128]) + Sync + Send,
-    {
         use rayon::prelude::*;
 
         debug_assert!(n_top <= log_d);
         debug_assert_eq!(data.len(), (1usize << log_d) * num_ntts);
-        debug_assert!(sub_start < sub_end && sub_end <= (1usize << n_top));
         let sub_size_positions = 1usize << (log_d - n_top);
         let sub_elems = sub_size_positions * num_ntts;
         let low_twiddle_final_pair =
             use_ranked_low_twiddle_final_pair(log_d, num_ntts, n_top);
 
-        let range_start = sub_start * sub_elems;
-        let range_end = sub_end * sub_elems;
-
-        data[range_start..range_end]
-            .par_chunks_mut(sub_elems)
+        data.par_chunks_mut(sub_elems)
             .enumerate()
-            .for_each(|(local_sub_idx, sub_data)| {
-                let sub_idx = sub_start + local_sub_idx;
+            .for_each(|(sub_idx, sub_data)| {
                 let mut layer = n_top;
                 while layer + 1 < log_d {
                     let layer_in_sub = layer - n_top;
@@ -2835,68 +2742,5 @@ mod block_range_equivalence {
             );
         }
         assert_eq!(full, split, "layer-4 split diverges");
-    }
-
-    #[test]
-    fn cache_local_block_range_matches_plain_with_absolute_callbacks() {
-        // Compact analogue of ranked layers 4..10 streaming + cache-local
-        // deep pairs: six top layers followed by two fused deep pairs.
-        let num_ntts = 4usize;
-        let log_d = 12usize;
-        let start_layer = 2usize;
-        let n_top = 8usize;
-        let (b_start, b_end) = (1usize, 4usize);
-        let n = (1usize << log_d) * num_ntts;
-        let ntt = AdditiveNttF128::standard(log_d);
-        let mut state = 0x6a09_e667_f3bc_c909u64;
-        let mut next = move || {
-            state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
-            state
-        };
-        let src: Vec<F128> = (0..n).map(|_| F128::new(next(), next())).collect();
-
-        let mut plain = src.clone();
-        ntt.forward_transform_interleaved_block_range(
-            &mut plain,
-            num_ntts,
-            start_layer,
-            log_d,
-            b_start,
-            b_end,
-        );
-
-        let mut cache_local = src;
-        ntt.forward_transform_interleaved_block_range(
-            &mut cache_local,
-            num_ntts,
-            start_layer,
-            n_top,
-            b_start,
-            b_end,
-        );
-        let sub_start = b_start << (n_top - start_layer);
-        let sub_end = b_end << (n_top - start_layer);
-        let sub_elems = (1usize << (log_d - n_top)) * num_ntts;
-        let offsets = std::sync::Mutex::new(Vec::new());
-        ntt.forward_transform_interleaved_deep_fused_pairs_range_and_then(
-            &mut cache_local,
-            num_ntts,
-            n_top,
-            log_d,
-            sub_start,
-            sub_end,
-            &|elem_offset, chunk| {
-                assert_eq!(elem_offset % sub_elems, 0);
-                assert_eq!(chunk, &plain[elem_offset..elem_offset + sub_elems]);
-                offsets.lock().unwrap().push(elem_offset);
-            },
-        );
-
-        assert_eq!(cache_local, plain, "cache-local range diverges from plain driver");
-        let mut got_offsets = offsets.into_inner().unwrap();
-        got_offsets.sort_unstable();
-        let expected_offsets: Vec<usize> =
-            (sub_start..sub_end).map(|sub| sub * sub_elems).collect();
-        assert_eq!(got_offsets, expected_offsets, "callback coverage/offsets diverge");
     }
 }
