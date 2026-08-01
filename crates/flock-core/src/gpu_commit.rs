@@ -3071,6 +3071,31 @@ kernel void parent_hash3(device const uint* children [[buffer(0)]],
         {
             return;
         }
+
+        // Benchmark the same incumbent suffix schedule that originally
+        // selected the host split. Replaying the ranked radix-64 suffix for
+        // every sweep candidate perturbs the following scored graph enough
+        // to hide its fixed-k6 gain. The guard is deliberately scoped over
+        // the winner verification too, and restores the optimized schedule
+        // before the timed prove consumes the published split.
+        struct SuppressRankedRadix64;
+        impl SuppressRankedRadix64 {
+            fn new() -> Self {
+                crate::ntt::additive_ntt_f128::set_hybrid_suffix_radix64_autotune_suppressed(
+                    true,
+                );
+                Self
+            }
+        }
+        impl Drop for SuppressRankedRadix64 {
+            fn drop(&mut self) {
+                crate::ntt::additive_ntt_f128::set_hybrid_suffix_radix64_autotune_suppressed(
+                    false,
+                );
+            }
+        }
+        let _suppress_ranked_radix64 = SuppressRankedRadix64::new();
+
         let dbg = debug_enabled() || std::env::var_os("FLOCK_COMMIT_TIMING").is_some();
         let z_buf = latched.wraps[0].2;
         let (tw_buf, tree_buf, staging) = (latched.tw_buf, latched.tree_buf, latched.staging);
