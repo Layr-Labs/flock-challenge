@@ -2703,6 +2703,11 @@ impl Blake3Setup {
         if !setup.use_ranked_reverse_lincheck() {
             setup.r1cs.csc_lincheck_circuit();
         }
+        // Latch the recycling allocator's kill switch before the first proof;
+        // reading the environment allocates, so it cannot be done lazily from
+        // inside the allocator itself.
+        #[cfg(target_os = "macos")]
+        crate::recycle_alloc::init_from_env();
         flock_core::scratch::prewarm_prover(setup.r1cs.m);
         setup
     }

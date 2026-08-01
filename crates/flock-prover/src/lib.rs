@@ -19,7 +19,11 @@ pub mod merkle_path;
 pub mod proof_io;
 pub mod prover;
 pub mod r1cs_hashes;
-#[cfg(all(target_os = "macos", not(test)))]
+// Compiled under `cfg(test)` too — without the `#[global_allocator]` binding
+// below — so its class-table invariants stay unit-testable. Installing a
+// custom global allocator under the test harness is what the original cfg
+// avoided; merely defining the type is inert.
+#[cfg(target_os = "macos")]
 pub mod recycle_alloc;
 
 /// Reuse large warm-up allocations in the ranked worker's timed proof.
