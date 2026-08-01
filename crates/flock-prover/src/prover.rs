@@ -286,7 +286,7 @@ pub fn prove_fast_ligerito_from_witness<Ch: Challenger>(
         z_packed,
         a_packed_f128,
         b_packed_f128,
-        z_packed_lincheck,
+        LincheckStripeInput::Ready(z_packed_lincheck),
         lincheck_circuit,
         commit_codeword,
         challenger,
@@ -314,7 +314,7 @@ pub(crate) fn prove_fast_ligerito_from_preinitialized_codeword<Ch: Challenger>(
         z_packed,
         a_packed_f128,
         b_packed_f128,
-        z_packed_lincheck,
+        LincheckStripeInput::Ready(z_packed_lincheck),
         lincheck_circuit,
         CommitCodeword::Preinitialized(codeword),
         challenger,
@@ -343,7 +343,39 @@ pub(crate) fn prove_fast_ligerito_from_streamed_first_pass<Ch: Challenger>(
         z_packed,
         a_packed_f128,
         b_packed_f128,
-        z_packed_lincheck,
+        LincheckStripeInput::Ready(z_packed_lincheck),
+        lincheck_circuit,
+        CommitCodeword::StreamedFirstPass(codeword, stream),
+        challenger,
+    )
+}
+
+/// Ranked path that moves the 512 MiB lincheck transpose out of
+/// witness generation. Two utility-pool workers transpose the immutable
+/// packed witness behind a scoped coordinator while commit, round-1 AB
+/// preprocessing, and zerocheck run; the scope is joined immediately before
+/// lincheck can read the stripe. The caller's exact-shape/helper-availability
+/// gate is deliberately kept in the BLAKE3 witness driver, where omission of
+/// the eager stripe is decided.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn prove_fast_ligerito_from_streamed_first_pass_deferred_stripe<Ch: Challenger>(
+    r1cs: &BlockR1cs,
+    pcs_params: &PcsParams,
+    z_packed: Vec<F128>,
+    a_packed_f128: Vec<F128>,
+    b_packed_f128: Vec<F128>,
+    lincheck_circuit: &dyn lincheck::LincheckCircuit,
+    codeword: Vec<F128>,
+    stream: flock_core::gpu_commit::FromZFirstPassStream,
+    challenger: &mut Ch,
+) -> (R1csProofLigerito, Commitment, R1csClaim) {
+    prove_fast_ligerito_from_witness_with_commit_codeword(
+        r1cs,
+        pcs_params,
+        z_packed,
+        a_packed_f128,
+        b_packed_f128,
+        LincheckStripeInput::DeferredRanked,
         lincheck_circuit,
         CommitCodeword::StreamedFirstPass(codeword, stream),
         challenger,
@@ -357,7 +389,7 @@ fn prove_fast_ligerito_from_witness_with_commit_codeword<Ch: Challenger>(
     z_packed: Vec<F128>,
     a_packed_f128: Vec<F128>,
     b_packed_f128: Vec<F128>,
-    z_packed_lincheck: Vec<u8>,
+    z_packed_lincheck: LincheckStripeInput,
     lincheck_circuit: &dyn lincheck::LincheckCircuit,
     commit_codeword: CommitCodeword,
     challenger: &mut Ch,
@@ -464,6 +496,178 @@ enum CommitCodeword {
     StreamedFirstPass(Vec<F128>, flock_core::gpu_commit::FromZFirstPassStream),
 }
 
+/// Lincheck stripe ownership at the commit boundary. `DeferredRanked` is
+/// constructed only by the exact BLAKE3 streamed-GPU selector; all generic
+/// and fallback paths carry the already-materialized byte stripe.
+enum LincheckStripeInput {
+    Ready(Vec<u8>),
+    DeferredRanked,
+}
+
+const DEFERRED_STRIPE_GROUPS_PER_JOB: usize = 64;
+
+fn fill_deferred_lincheck_stripe_group(
+    z_packed: &[F128],
+    stripe: &mut [u8],
+    group: usize,
+    group_f128: usize,
+    u64_per_block: usize,
+    useful_words: usize,
+) {
+    let group_start = group * group_f128;
+    let z_group = &z_packed[group_start..group_start + group_f128];
+    // SAFETY: F128 is repr(C) as two little-endian u64 halves; this is the
+    // same read-only view used by the eager witness transpose.
+    let z_u64: &[u64] =
+        unsafe { std::slice::from_raw_parts(z_group.as_ptr().cast::<u64>(), z_group.len() * 2) };
+    let mut transposed = [0u8; 64];
+    for word in 0..useful_words {
+        let lanes: [u64; 8] = std::array::from_fn(|lane| z_u64[lane * u64_per_block + word]);
+        flock_core::bits::transpose_8_u64s_to_64_bytes(&lanes, &mut transposed);
+        let dst = &mut stripe[word * 64..word * 64 + 64];
+        #[cfg(target_arch = "aarch64")]
+        unsafe {
+            // The stripe is not read until after commit+zerocheck, so use the
+            // same cache-bypassing store flavor as the eager SIMD witness
+            // path. `ldp/stnp` permit these 64-byte slices and the stack
+            // temporary without an extra alignment contract.
+            core::arch::asm!(
+                "ldp {t0:q}, {t1:q}, [{src}]",
+                "stnp {t0:q}, {t1:q}, [{dst}]",
+                "ldp {t0:q}, {t1:q}, [{src}, #32]",
+                "stnp {t0:q}, {t1:q}, [{dst}, #32]",
+                src = in(reg) transposed.as_ptr(),
+                dst = in(reg) dst.as_mut_ptr(),
+                t0 = out(vreg) _,
+                t1 = out(vreg) _,
+                options(nostack)
+            );
+        }
+        #[cfg(not(target_arch = "aarch64"))]
+        dst.copy_from_slice(&transposed);
+    }
+    // The ranked padded fold never observes the tail. Keeping the honest
+    // full-stripe contract in tests catches accidental selector widening.
+    #[cfg(test)]
+    stripe[useful_words * 64..].fill(0);
+}
+
+/// Materialize a BLAKE3-style lincheck stripe from immutable row-major packed
+/// `z`, dispatching coarse, pairwise-disjoint stripe slabs through `dispatch`.
+/// Production calls only the asserted ranked geometry below; compact
+/// congruent shapes give the exact fill oracle a cheap unit-test surface.
+fn fill_deferred_lincheck_stripe_with_dispatch(
+    z_packed: &[F128],
+    z_lincheck: &mut [u8],
+    m: usize,
+    k_log: usize,
+    useful_bits: usize,
+    dispatch: impl FnOnce(usize, &(dyn Fn(usize) + Sync)) -> bool,
+) -> bool {
+    assert!(k_log >= 7, "packed block must contain whole F128 words");
+    assert!(
+        m >= k_log + 3,
+        "lincheck layout needs at least eight blocks"
+    );
+    let k = 1usize << k_log;
+    let n_total = 1usize << m;
+    assert!(useful_bits <= k);
+    let f128_per_block = k / 128;
+    let u64_per_block = k / 64;
+    let group_f128 = 8 * f128_per_block;
+    let useful_words = useful_bits.div_ceil(64);
+    assert_eq!(z_packed.len(), n_total / 128);
+    assert_eq!(z_lincheck.len(), n_total / 8);
+
+    let n_groups = z_lincheck.len() / k;
+    let n_jobs = n_groups.div_ceil(DEFERRED_STRIPE_GROUPS_PER_JOB);
+    let stripe_base = flock_core::epool::SyncPtr(z_lincheck.as_mut_ptr());
+    dispatch(n_jobs, &|job| {
+        let group_start = job * DEFERRED_STRIPE_GROUPS_PER_JOB;
+        let group_end = (group_start + DEFERRED_STRIPE_GROUPS_PER_JOB).min(n_groups);
+        for group in group_start..group_end {
+            // SAFETY: every dispatched job owns a distinct contiguous set of
+            // groups, and each group maps to one disjoint k-byte stripe.
+            let stripe =
+                unsafe { std::slice::from_raw_parts_mut(stripe_base.ptr().add(group * k), k) };
+            fill_deferred_lincheck_stripe_group(
+                z_packed,
+                stripe,
+                group,
+                group_f128,
+                u64_per_block,
+                useful_words,
+            );
+        }
+    })
+}
+
+/// Safe sequential fallback if the utility pool becomes unavailable after the
+/// witness driver selected deferred materialization.
+fn fill_deferred_lincheck_stripe(
+    z_packed: &[F128],
+    z_lincheck: &mut [u8],
+    m: usize,
+    k_log: usize,
+    useful_bits: usize,
+) {
+    let completed = fill_deferred_lincheck_stripe_with_dispatch(
+        z_packed,
+        z_lincheck,
+        m,
+        k_log,
+        useful_bits,
+        |n_jobs, job| {
+            for i in 0..n_jobs {
+                job(i);
+            }
+            true
+        },
+    );
+    debug_assert!(completed);
+}
+
+#[cfg(test)]
+mod deferred_stripe_tests {
+    use super::*;
+
+    #[test]
+    fn deferred_fill_modes_match_canonical_packed_stripe() {
+        const M: usize = 20;
+        const K_LOG: usize = 8;
+        let z: Vec<F128> = (0..1usize << (M - 7))
+            .map(|i| {
+                let x = (i as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+                F128::new(x ^ x.rotate_left(17), (!x).rotate_right(11))
+            })
+            .collect();
+        let expected = pack_z_lincheck_from_packed(&z, M, K_LOG);
+        let mut actual = vec![0xa5; expected.len()];
+        fill_deferred_lincheck_stripe(&z, &mut actual, M, K_LOG, 1 << K_LOG);
+        assert_eq!(actual, expected);
+
+        let helper = rayon::ThreadPoolBuilder::new()
+            .num_threads(4)
+            .build()
+            .unwrap();
+        let mut helper_actual = vec![0xa5; expected.len()];
+        assert!(fill_deferred_lincheck_stripe_with_dispatch(
+            &z,
+            &mut helper_actual,
+            M,
+            K_LOG,
+            1 << K_LOG,
+            |n_jobs, job| flock_core::epool::run_chunks_with_helper_only(
+                n_jobs,
+                4,
+                job,
+                Some(&helper),
+            ),
+        ));
+        assert_eq!(helper_actual, expected);
+    }
+}
+
 /// Build the witness commitment and the challenge-independent half of
 /// zerocheck round 1 on the same fixed Rayon pool. A/B are only borrowed:
 /// their original packed values remain live for zerocheck round 2.
@@ -539,7 +743,7 @@ pub fn prove_fast_core<Ch: Challenger>(
         z_packed,
         a_packed_f128,
         b_packed_f128,
-        z_packed_lincheck,
+        LincheckStripeInput::Ready(z_packed_lincheck),
         lincheck_circuit,
         CommitCodeword::Allocate,
         challenger,
@@ -573,7 +777,7 @@ pub fn prove_fast_core_with_codeword<Ch: Challenger>(
         z_packed,
         a_packed_f128,
         b_packed_f128,
-        z_packed_lincheck,
+        LincheckStripeInput::Ready(z_packed_lincheck),
         lincheck_circuit,
         commit_codeword,
         challenger,
@@ -587,67 +791,138 @@ fn prove_fast_core_with_commit_codeword<Ch: Challenger>(
     z_packed: Vec<F128>,
     a_packed_f128: Vec<F128>,
     b_packed_f128: Vec<F128>,
-    z_packed_lincheck: Vec<u8>,
+    z_packed_lincheck: LincheckStripeInput,
     lincheck_circuit: &dyn lincheck::LincheckCircuit,
     commit_codeword: CommitCodeword,
     challenger: &mut Ch,
 ) -> ProveCore {
     let padding = r1cs.padding_spec();
     let phase_timing = std::env::var_os("FLOCK_PHASE_TIMING").is_some();
-    let cpu0 = phase_timing.then(process_cpu_ms);
-    let t_commit = std::time::Instant::now();
-    let ((commitment, prover_data), ab_inner) = commit_with_round1_ab_precompute(
-        &z_packed,
-        &a_packed_f128,
-        &b_packed_f128,
-        pcs_params,
-        &padding,
-        commit_codeword,
-    );
-    if phase_timing {
-        let wall = t_commit.elapsed().as_secs_f64() * 1e3;
-        let cpu = process_cpu_ms() - cpu0.unwrap_or(0.0);
-        eprintln!(
-            "[phase-timing] commit+ab-precompute: {wall:.2} ms cpu={cpu:.1} util={:.1}",
-            cpu / wall
+    let run_commit_and_zerocheck = || {
+        let cpu0 = phase_timing.then(process_cpu_ms);
+        let t_commit = std::time::Instant::now();
+        let ((commitment, prover_data), ab_inner) = commit_with_round1_ab_precompute(
+            &z_packed,
+            &a_packed_f128,
+            &b_packed_f128,
+            pcs_params,
+            &padding,
+            commit_codeword,
         );
-    }
-    bind_statement(challenger, r1cs, &commitment);
-    let cpu_zc0 = phase_timing.then(process_cpu_ms);
-    let t_zc = std::time::Instant::now();
+        if phase_timing {
+            let wall = t_commit.elapsed().as_secs_f64() * 1e3;
+            let cpu = process_cpu_ms() - cpu0.unwrap_or(0.0);
+            eprintln!(
+                "[phase-timing] commit+ab-precompute: {wall:.2} ms cpu={cpu:.1} util={:.1}",
+                cpu / wall
+            );
+        }
+        bind_statement(challenger, r1cs, &commitment);
+        let cpu_zc0 = phase_timing.then(process_cpu_ms);
+        let t_zc = std::time::Instant::now();
 
-    let (zc_proof, zc_claim, s_hat_v_c) = {
-        // Zero-cost &[u8] views of the F128 buffers; c aliases z (C = I).
-        let a_packed: &[u8] = unsafe {
-            std::slice::from_raw_parts(
-                a_packed_f128.as_ptr() as *const u8,
-                a_packed_f128.len() * core::mem::size_of::<F128>(),
+        let (zc_proof, zc_claim, s_hat_v_c) = {
+            // Zero-cost &[u8] views of the F128 buffers; c aliases z (C = I).
+            let a_packed: &[u8] = unsafe {
+                std::slice::from_raw_parts(
+                    a_packed_f128.as_ptr() as *const u8,
+                    a_packed_f128.len() * core::mem::size_of::<F128>(),
+                )
+            };
+            let b_packed: &[u8] = unsafe {
+                std::slice::from_raw_parts(
+                    b_packed_f128.as_ptr() as *const u8,
+                    b_packed_f128.len() * core::mem::size_of::<F128>(),
+                )
+            };
+            let c_packed: &[u8] = unsafe {
+                std::slice::from_raw_parts(
+                    z_packed.as_ptr() as *const u8,
+                    z_packed.len() * core::mem::size_of::<F128>(),
+                )
+            };
+            zerocheck::prove_packed_padded_capture_s_hat_v_c_with_precomputed_ab(
+                a_packed, b_packed, c_packed, r1cs.m, &padding, ab_inner, challenger,
             )
         };
-        let b_packed: &[u8] = unsafe {
-            std::slice::from_raw_parts(
-                b_packed_f128.as_ptr() as *const u8,
-                b_packed_f128.len() * core::mem::size_of::<F128>(),
-            )
-        };
-        let c_packed: &[u8] = unsafe {
-            std::slice::from_raw_parts(
-                z_packed.as_ptr() as *const u8,
-                z_packed.len() * core::mem::size_of::<F128>(),
-            )
-        };
-        zerocheck::prove_packed_padded_capture_s_hat_v_c_with_precomputed_ab(
-            a_packed, b_packed, c_packed, r1cs.m, &padding, ab_inner, challenger,
-        )
+        if phase_timing {
+            let wall = t_zc.elapsed().as_secs_f64() * 1e3;
+            let cpu = process_cpu_ms() - cpu_zc0.unwrap_or(0.0);
+            eprintln!(
+                "[phase-timing] zerocheck: {wall:.2} ms cpu={cpu:.1} util={:.1}",
+                cpu / wall
+            );
+        }
+        (commitment, prover_data, zc_proof, zc_claim, s_hat_v_c)
     };
-    if phase_timing {
-        let wall = t_zc.elapsed().as_secs_f64() * 1e3;
-        let cpu = process_cpu_ms() - cpu_zc0.unwrap_or(0.0);
-        eprintln!(
-            "[phase-timing] zerocheck: {wall:.2} ms cpu={cpu:.1} util={:.1}",
-            cpu / wall
-        );
-    }
+
+    let (pre_lincheck, z_packed_lincheck) = match z_packed_lincheck {
+        LincheckStripeInput::Ready(stripe) => (run_commit_and_zerocheck(), stripe),
+        LincheckStripeInput::DeferredRanked => {
+            assert_eq!(r1cs.m, 32);
+            assert_eq!(r1cs.k_log, 14);
+            assert_eq!(r1cs.useful_bits, 15_409);
+            let (m, k_log, useful_bits) = (r1cs.m, r1cs.k_log, r1cs.useful_bits);
+            let mut stripe = flock_core::scratch::take_u8(1usize << (m - 3));
+            // E2 is the measured contention optimum: E4 steals bandwidth from
+            // commit, while E1 lets the stripe spill into zerocheck. Keep the
+            // override for controlled same-binary diagnostics only.
+            let epool_workers = std::env::var_os("FLOCK_DEFER_STRIPE_EPOOL_THREADS")
+                .and_then(|value| value.to_str()?.parse::<usize>().ok())
+                .filter(|workers| (1..=4).contains(workers))
+                .unwrap_or(2);
+            let pre = std::thread::scope(|scope| {
+                let stripe_job = scope.spawn(|| {
+                    let started = std::time::Instant::now();
+                    let filled_on_epool = fill_deferred_lincheck_stripe_with_dispatch(
+                        &z_packed,
+                        &mut stripe,
+                        m,
+                        k_log,
+                        useful_bits,
+                        |n_jobs, job| {
+                            flock_core::epool::run_helper_only_chunks(n_jobs, epool_workers, job)
+                        },
+                    );
+                    if !filled_on_epool {
+                        fill_deferred_lincheck_stripe(
+                            &z_packed,
+                            &mut stripe,
+                            m,
+                            k_log,
+                            useful_bits,
+                        );
+                    }
+                    if phase_timing {
+                        eprintln!(
+                            "[phase-timing] deferred lincheck stripe: {:.2} ms mode={} workers={}",
+                            started.elapsed().as_secs_f64() * 1e3,
+                            if filled_on_epool {
+                                "epool"
+                            } else {
+                                "sequential"
+                            },
+                            if filled_on_epool { epool_workers } else { 0 },
+                        );
+                    }
+                });
+                let pre = run_commit_and_zerocheck();
+                let join_started = std::time::Instant::now();
+                stripe_job
+                    .join()
+                    .expect("deferred ranked lincheck stripe worker panicked");
+                if phase_timing {
+                    eprintln!(
+                        "[phase-timing] deferred lincheck stripe join tail: {:.2} ms",
+                        join_started.elapsed().as_secs_f64() * 1e3
+                    );
+                }
+                pre
+            });
+            (pre, stripe)
+        }
+    };
+    let (commitment, prover_data, zc_proof, zc_claim, s_hat_v_c) = pre_lincheck;
     // Nothing downstream reads a/b (zerocheck consumed them in rounds 1–2);
     // recycle the two buffers (2 × 2^(m-3) bytes — 128 MB at m = 29) instead
     // of carrying them through lincheck and the PCS open.

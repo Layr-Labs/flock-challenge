@@ -116,6 +116,15 @@ pub(crate) fn epool() -> Option<&'static rayon::ThreadPool> {
     POOL.get_or_init(build_epool).as_ref()
 }
 
+/// Whether this host has a live efficiency-core helper pool.
+///
+/// The ranked worker calls this during its warm-up proof before deciding to
+/// omit work from witness generation. A missing pool therefore preserves the
+/// eager path instead of falling back to a contending performance-core thread.
+pub fn helper_pool_available() -> bool {
+    epool().is_some()
+}
+
 /// Don't engage the helper pool below this many chunks: tiny jobs (recursive
 /// Ligerito levels) drain faster than the cross-pool kickoff amortizes.
 const EPOOL_MIN_CHUNKS: usize = 16;
@@ -143,6 +152,61 @@ where
     F: Fn(usize) + Sync,
 {
     run_chunks_with_helper(n_chunks, &f, epool());
+}
+
+/// Try to process chunks exclusively on the efficiency-core helper pool.
+///
+/// Unlike [`run_hetero_chunks`], the calling thread and the main Rayon pool do
+/// not claim work. The caller only waits for the helper broadcast to finish,
+/// making this suitable for best-effort background work that must not consume
+/// a performance core. Returns `false` without running `f` when the helper
+/// pool is unavailable or `max_workers` is zero, so callers can fall back to a
+/// sequential implementation.
+pub fn run_helper_only_chunks<F>(n_chunks: usize, max_workers: usize, f: &F) -> bool
+where
+    F: Fn(usize) + Sync + ?Sized,
+{
+    run_chunks_with_helper_only(n_chunks, max_workers, f, epool())
+}
+
+/// [`run_helper_only_chunks`] with an explicit helper pool, so tests can
+/// exercise the helper-only queue on hosts without efficiency cores.
+#[doc(hidden)]
+pub fn run_chunks_with_helper_only<F>(
+    n_chunks: usize,
+    max_workers: usize,
+    f: &F,
+    helper: Option<&rayon::ThreadPool>,
+) -> bool
+where
+    F: Fn(usize) + Sync + ?Sized,
+{
+    let Some(ep) = helper else {
+        return false;
+    };
+    let max_workers = max_workers.min(ep.current_num_threads());
+    if max_workers == 0 {
+        return false;
+    }
+    if n_chunks == 0 {
+        return true;
+    }
+
+    let next = AtomicUsize::new(0);
+    ep.broadcast(|context| {
+        if context.index() >= max_workers {
+            return;
+        }
+        loop {
+            let i = next.fetch_add(1, Ordering::Relaxed);
+            if i >= n_chunks {
+                break;
+            }
+            EPOOL_HELPER_CHUNKS.fetch_add(1, Ordering::Relaxed);
+            f(i);
+        }
+    });
+    true
 }
 
 /// Stateful sibling of [`run_hetero_chunks`]. Each queue-draining worker
@@ -374,6 +438,46 @@ mod tests {
     #[test]
     fn zero_chunks_is_noop() {
         run_chunks_with_helper(0, &|_| panic!("must not run"), None);
+    }
+
+    /// The helper-only drain never recruits the caller/main pool and still
+    /// gives every chunk exactly one owner. Limiting the broadcast to two of
+    /// four helper workers also covers the production tuning seam.
+    #[test]
+    fn helper_only_queue_runs_each_chunk_exactly_once() {
+        let helper = rayon::ThreadPoolBuilder::new()
+            .num_threads(4)
+            .thread_name(|i| format!("helper-only-test-{i}"))
+            .build()
+            .unwrap();
+        let n = 513;
+        let counts: Vec<AtomicUsize> = (0..n).map(|_| AtomicUsize::new(0)).collect();
+        let worker_mask = AtomicUsize::new(0);
+        assert!(run_chunks_with_helper_only(
+            n,
+            2,
+            &|i| {
+                counts[i].fetch_add(1, Ordering::Relaxed);
+                let worker = rayon::current_thread_index().expect("helper worker");
+                worker_mask.fetch_or(1usize << worker, Ordering::Relaxed);
+            },
+            Some(&helper),
+        ));
+        assert!(counts
+            .iter()
+            .all(|count| count.load(Ordering::Relaxed) == 1));
+        assert_eq!(worker_mask.load(Ordering::Relaxed) & !0b11, 0);
+
+        let untouched = AtomicUsize::new(0);
+        assert!(!run_chunks_with_helper_only(
+            1,
+            2,
+            &|_| {
+                untouched.fetch_add(1, Ordering::Relaxed);
+            },
+            None,
+        ));
+        assert_eq!(untouched.load(Ordering::Relaxed), 0);
     }
 
     /// Stateful workers initialize private scratch once and reuse it across

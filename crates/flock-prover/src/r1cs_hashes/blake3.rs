@@ -2085,11 +2085,12 @@ pub(crate) mod witgen_simd {
         blocks: &[Compression],
         n_blocks_log: usize,
         stream_params: Option<&flock_core::pcs::PcsParams>,
+        defer_ranked_stripe: bool,
     ) -> (
         Vec<F128>,
         Vec<F128>,
         Vec<F128>,
-        Vec<u8>,
+        Option<Vec<u8>>,
         Option<flock_core::gpu_commit::FromZFirstPassStream>,
     ) {
         let n_total = 1usize << n_blocks_log;
@@ -2109,7 +2110,6 @@ pub(crate) mod witgen_simd {
         let mut z = flock_core::scratch::take_f128(total_f128);
         let mut a = flock_core::scratch::take_f128(total_f128);
         let mut b = flock_core::scratch::take_f128(total_f128);
-        let mut z_lincheck = flock_core::scratch::take_u8((n_total / 8) * K);
 
         let mut stream = stream_params.and_then(|params| {
             // SAFETY: z's allocation/address stays fixed until the returned
@@ -2128,6 +2128,12 @@ pub(crate) mod witgen_simd {
         if stream.is_some() && n_total != 1 << 18 {
             stream = None;
         }
+        // Omit the eager L1-hot transpose only when the exact streamed Metal
+        // lease was actually acquired. A warmup/failure/non-ranked miss keeps
+        // the ordinary stripe so no fallback can observe an absent buffer.
+        let defer_ranked_stripe = defer_ranked_stripe && stream.is_some();
+        let mut z_lincheck =
+            (!defer_ranked_stripe).then(|| flock_core::scratch::take_u8((n_total / 8) * K));
 
         #[derive(Clone, Copy)]
         struct WritePtr<T>(*mut T);
@@ -2143,18 +2149,19 @@ pub(crate) mod witgen_simd {
         let z_base = WritePtr(z.as_mut_ptr());
         let a_base = WritePtr(a.as_mut_ptr());
         let b_base = WritePtr(b.as_mut_ptr());
-        let stripe_base = WritePtr(z_lincheck.as_mut_ptr());
+        let stripe_base = z_lincheck
+            .as_mut()
+            .map(|stripe| WritePtr(stripe.as_mut_ptr()));
         let nt = nt_enabled();
 
         let process_group = |g: usize| {
             // SAFETY: each scheduled group index occurs exactly once. Every
             // group owns disjoint z/a/b ranges and one disjoint stripe.
-            let (z_grp, a_grp, b_grp, stripe) = unsafe {
+            let (z_grp, a_grp, b_grp) = unsafe {
                 (
                     std::slice::from_raw_parts_mut(z_base.get().add(g * group_f128), group_f128),
                     std::slice::from_raw_parts_mut(a_base.get().add(g * group_f128), group_f128),
                     std::slice::from_raw_parts_mut(b_base.get().add(g * group_f128), group_f128),
-                    std::slice::from_raw_parts_mut(stripe_base.get().add(g * K), K),
                 )
             };
             for half in 0..2 {
@@ -2179,41 +2186,45 @@ pub(crate) mod witgen_simd {
                     );
                 }
             }
-            // Bit-transpose 8 z chunks into the lincheck stripe (identical
-            // to the generic driver; z stores stay plain so this re-read is
-            // L1-hot — failed.md §16). The stripe itself passes §14 (never
-            // re-read in-window) → NT stores.
-            let z_u64_all: &[u64] = unsafe {
-                std::slice::from_raw_parts(z_grp.as_ptr() as *const u64, z_grp.len() * 2)
-            };
-            let u64_per_block = K / 64;
-            let useful_words = stripe_useful_bits.div_ceil(64);
-            let mut tmp = [0u8; 64];
-            for i in 0..useful_words {
-                let lanes: [u64; 8] = std::array::from_fn(|j| z_u64_all[j * u64_per_block + i]);
-                if nt {
-                    transpose_8_u64s_to_64_bytes(&lanes, &mut tmp);
-                    // SAFETY: stripe chunk i is 64 in-bounds bytes.
-                    unsafe {
-                        stripe_store_nt(tmp.as_ptr(), stripe.as_mut_ptr().add(i * 64));
+            if let Some(stripe_base) = stripe_base {
+                // Bit-transpose 8 z chunks into the lincheck stripe
+                // (identical to the generic driver; z stores stay plain so
+                // this re-read is L1-hot). The ranked deferred arm
+                // skips this whole block and reconstructs from immutable z.
+                let stripe =
+                    unsafe { std::slice::from_raw_parts_mut(stripe_base.get().add(g * K), K) };
+                let z_u64_all: &[u64] = unsafe {
+                    std::slice::from_raw_parts(z_grp.as_ptr() as *const u64, z_grp.len() * 2)
+                };
+                let u64_per_block = K / 64;
+                let useful_words = stripe_useful_bits.div_ceil(64);
+                let mut tmp = [0u8; 64];
+                for i in 0..useful_words {
+                    let lanes: [u64; 8] = std::array::from_fn(|j| z_u64_all[j * u64_per_block + i]);
+                    if nt {
+                        transpose_8_u64s_to_64_bytes(&lanes, &mut tmp);
+                        // SAFETY: stripe chunk i is 64 in-bounds bytes.
+                        unsafe {
+                            stripe_store_nt(tmp.as_ptr(), stripe.as_mut_ptr().add(i * 64));
+                        }
+                    } else {
+                        transpose_8_u64s_to_64_bytes(&lanes, &mut stripe[i * 64..i * 64 + 64]);
                     }
-                } else {
-                    transpose_8_u64s_to_64_bytes(&lanes, &mut stripe[i * 64..i * 64 + 64]);
                 }
-            }
-            // Mirrors the generic driver: the padded fold never observes the
-            // tail; the honest zero pad is test-only.
-            #[cfg(test)]
-            {
-                stripe[useful_words * 64..].fill(0);
+                // Mirrors the generic driver: the padded fold never observes
+                // the tail; the honest zero pad is test-only.
+                #[cfg(test)]
+                {
+                    stripe[useful_words * 64..].fill(0);
+                }
             }
         };
 
         let n_groups = n_total / 8;
         // W-H1 engagement evidence (mirrors the generic driver): helper-pool
         // slab claims across the whole witness drain.
-        let claimed_before =
-            super::super::common::witgen_hetero_trace().then(flock_core::epool::helper_chunks_claimed);
+        let claimed_before = super::super::common::witgen_hetero_trace()
+            .then(flock_core::epool::helper_chunks_claimed);
         if let Some(stream) = &mut stream {
             const SEGMENTS: usize = 8;
             const BANDS: usize = 8;
@@ -2256,9 +2267,14 @@ pub(crate) mod witgen_simd {
         blocks: &[Compression],
         n_blocks_log: usize,
     ) -> (Vec<F128>, Vec<F128>, Vec<F128>, Vec<u8>) {
-        let (z, a, b, stripe, stream) = generate_impl(blocks, n_blocks_log, None);
+        let (z, a, b, stripe, stream) = generate_impl(blocks, n_blocks_log, None, false);
         debug_assert!(stream.is_none());
-        (z, a, b, stripe)
+        (
+            z,
+            a,
+            b,
+            stripe.expect("non-streamed witness always emits lincheck stripe"),
+        )
     }
 
     /// Streamed entry (matches `drive_witness_packed_and_lincheck_full_write_streamed`).
@@ -2267,14 +2283,15 @@ pub(crate) mod witgen_simd {
         blocks: &[Compression],
         n_blocks_log: usize,
         pcs_params: &flock_core::pcs::PcsParams,
+        defer_ranked_stripe: bool,
     ) -> (
         Vec<F128>,
         Vec<F128>,
         Vec<F128>,
-        Vec<u8>,
+        Option<Vec<u8>>,
         Option<flock_core::gpu_commit::FromZFirstPassStream>,
     ) {
-        generate_impl(blocks, n_blocks_log, Some(pcs_params))
+        generate_impl(blocks, n_blocks_log, Some(pcs_params), defer_ranked_stripe)
     }
 }
 
@@ -2434,6 +2451,44 @@ fn generate_witness_with_ab_packed_and_lincheck_impl(
     }
 }
 
+/// Strict production selector for moving the lincheck stripe transpose out of
+/// witness generation. Requiring the exact ranked PCS geometry here keeps the
+/// downstream `DeferredRanked` marker impossible for generic callers;
+/// `generate_impl` additionally requires a live streamed Metal lease before
+/// it actually omits the eager stripe. `FLOCK_NO_DEFER_LINCHECK_STRIPE=1`
+/// restores eager materialization as an exact same-binary control. Requiring
+/// a live utility pool avoids the known-negative performance-core fallback.
+fn select_deferred_ranked_lincheck_stripe(
+    n_blocks_log: usize,
+    pcs_params: &PcsParams,
+    platform_supported: bool,
+    helper_pool_available: bool,
+    disabled: bool,
+    full_stripe: bool,
+) -> bool {
+    platform_supported
+        && helper_pool_available
+        && !disabled
+        && !full_stripe
+        && n_blocks_log == 18
+        && pcs_params.m == 32
+        && pcs_params.log_inv_rate == 1
+        && pcs_params.log_batch_size == 6
+        && pcs_params.profile == flock_core::pcs::ligerito::LigeritoProfile::Fast
+        && pcs_params.merkle_hash == flock_core::merkle::HashKind::Blake3
+}
+
+fn use_deferred_ranked_lincheck_stripe(n_blocks_log: usize, pcs_params: &PcsParams) -> bool {
+    select_deferred_ranked_lincheck_stripe(
+        n_blocks_log,
+        pcs_params,
+        cfg!(all(target_os = "macos", target_arch = "aarch64")),
+        flock_core::epool::helper_pool_available(),
+        std::env::var_os("FLOCK_NO_DEFER_LINCHECK_STRIPE").is_some(),
+        std::env::var_os("FLOCK_FULL_STRIPE").is_some(),
+    )
+}
+
 fn generate_witness_with_ab_packed_and_lincheck_streamed(
     blocks: &[Compression],
     n_blocks_log: usize,
@@ -2442,7 +2497,7 @@ fn generate_witness_with_ab_packed_and_lincheck_streamed(
     Vec<F128>,
     Vec<F128>,
     Vec<F128>,
-    Vec<u8>,
+    Option<Vec<u8>>,
     Option<flock_core::gpu_commit::FromZFirstPassStream>,
 ) {
     let padding: Compression = ([0u32; 8], [0u32; 16], 0u64, 0u32, 0u32);
@@ -2460,17 +2515,24 @@ fn generate_witness_with_ab_packed_and_lincheck_streamed(
     // with the scalar driver, incl. the Metal band-streaming protocol.
     #[cfg(target_arch = "aarch64")]
     if witgen_simd::enabled() {
-        return witgen_simd::generate_streamed(blocks, n_blocks_log, pcs_params);
+        return witgen_simd::generate_streamed(
+            blocks,
+            n_blocks_log,
+            pcs_params,
+            use_deferred_ranked_lincheck_stripe(n_blocks_log, pcs_params),
+        );
     }
-    super::common::drive_witness_packed_and_lincheck_full_write_streamed(
-        blocks,
-        &padding,
-        n_blocks_log,
-        K_LOG,
-        stripe_useful_bits,
-        pcs_params,
-        per_block,
-    )
+    let (z, a, b, stripe, stream) =
+        super::common::drive_witness_packed_and_lincheck_full_write_streamed(
+            blocks,
+            &padding,
+            n_blocks_log,
+            K_LOG,
+            stripe_useful_bits,
+            pcs_params,
+            per_block,
+        );
+    (z, a, b, Some(stripe), stream)
 }
 
 // ---------------------------------------------------------------------------
@@ -2749,17 +2811,12 @@ impl Blake3Setup {
                 };
                 let cpu_wit = phase_timing.then(crate::prover::process_cpu_ms);
                 let t_wit = std::time::Instant::now();
-                let (
-                    z_packed,
-                    a_packed_f128,
-                    b_packed_f128,
-                    z_packed_lincheck,
-                    gpu_first_pass,
-                ) = generate_witness_with_ab_packed_and_lincheck_streamed(
-                    blocks,
-                    self.n_blocks_log(),
-                    &self.pcs_params,
-                );
+                let (z_packed, a_packed_f128, b_packed_f128, z_packed_lincheck, gpu_first_pass) =
+                    generate_witness_with_ab_packed_and_lincheck_streamed(
+                        blocks,
+                        self.n_blocks_log(),
+                        &self.pcs_params,
+                    );
                 if phase_timing {
                     let wall = t_wit.elapsed().as_secs_f64() * 1e3;
                     let cpu = crate::prover::process_cpu_ms() - cpu_wit.unwrap_or(0.0);
@@ -2770,20 +2827,36 @@ impl Blake3Setup {
                 }
                 let lc_circuit = self.lincheck_circuit();
                 if let Some(stream) = gpu_first_pass {
-                    return crate::prover::prove_fast_ligerito_from_streamed_first_pass(
-                        &self.r1cs,
-                        &self.pcs_params,
-                        z_packed,
-                        a_packed_f128,
-                        b_packed_f128,
-                        z_packed_lincheck,
-                        lc_circuit,
-                        // A live stream implies the GPU latch is on; the empty
-                        // marker is hydrated only if the Metal finish fails.
-                        codeword.unwrap_or_default(),
-                        stream,
-                        challenger,
-                    );
+                    // A live stream implies the GPU latch is on; the empty
+                    // marker is hydrated only if the Metal finish fails.
+                    let codeword = codeword.unwrap_or_default();
+                    return match z_packed_lincheck {
+                        Some(stripe) => {
+                            crate::prover::prove_fast_ligerito_from_streamed_first_pass(
+                                &self.r1cs,
+                                &self.pcs_params,
+                                z_packed,
+                                a_packed_f128,
+                                b_packed_f128,
+                                stripe,
+                                lc_circuit,
+                                codeword,
+                                stream,
+                                challenger,
+                            )
+                        }
+                        None => crate::prover::prove_fast_ligerito_from_streamed_first_pass_deferred_stripe(
+                            &self.r1cs,
+                            &self.pcs_params,
+                            z_packed,
+                            a_packed_f128,
+                            b_packed_f128,
+                            lc_circuit,
+                            codeword,
+                            stream,
+                            challenger,
+                        ),
+                    };
                 }
                 return crate::prover::prove_fast_ligerito_from_witness(
                     &self.r1cs,
@@ -2791,7 +2864,8 @@ impl Blake3Setup {
                     z_packed,
                     a_packed_f128,
                     b_packed_f128,
-                    z_packed_lincheck,
+                    z_packed_lincheck
+                        .expect("non-streamed witness fallback must materialize lincheck stripe"),
                     lc_circuit,
                     codeword,
                     challenger,
@@ -3236,6 +3310,51 @@ mod tests {
     const CHUNK_START: u32 = 1 << 0;
     const CHUNK_END: u32 = 1 << 1;
     const ROOT: u32 = 1 << 3;
+
+    #[test]
+    fn deferred_stripe_selector_is_exact_and_killable() {
+        let ranked = PcsParams {
+            m: 32,
+            log_inv_rate: 1,
+            log_batch_size: 6,
+            profile: flock_core::pcs::ligerito::LigeritoProfile::Fast,
+            merkle_hash: flock_core::merkle::HashKind::Blake3,
+        };
+        assert!(select_deferred_ranked_lincheck_stripe(
+            18, &ranked, true, true, false, false
+        ));
+        assert!(!select_deferred_ranked_lincheck_stripe(
+            18, &ranked, false, true, false, false
+        ));
+        assert!(!select_deferred_ranked_lincheck_stripe(
+            18, &ranked, true, false, false, false
+        ));
+        assert!(!select_deferred_ranked_lincheck_stripe(
+            18, &ranked, true, true, true, false
+        ));
+        assert!(!select_deferred_ranked_lincheck_stripe(
+            18, &ranked, true, true, false, true
+        ));
+        assert!(!select_deferred_ranked_lincheck_stripe(
+            17, &ranked, true, true, false, false
+        ));
+
+        let mut wrong = ranked.clone();
+        wrong.log_batch_size = 5;
+        assert!(!select_deferred_ranked_lincheck_stripe(
+            18, &wrong, true, true, false, false
+        ));
+        wrong = ranked.clone();
+        wrong.profile = flock_core::pcs::ligerito::LigeritoProfile::Slim;
+        assert!(!select_deferred_ranked_lincheck_stripe(
+            18, &wrong, true, true, false, false
+        ));
+        wrong = ranked;
+        wrong.merkle_hash = flock_core::merkle::HashKind::Sha256;
+        assert!(!select_deferred_ranked_lincheck_stripe(
+            18, &wrong, true, true, false, false
+        ));
+    }
 
     /// Batch-major witness equality vs the row-major driver (word-transpose
     /// + identical stripe), incl. padding slots via a non-power-of-two count.
