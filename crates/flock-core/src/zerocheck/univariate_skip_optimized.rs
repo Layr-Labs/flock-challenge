@@ -1556,8 +1556,50 @@ pub(crate) fn round1_c_fold8_from_lincheck_stripe(
     let eq_outer = crate::lincheck::build_eq_table(&r[k_log..]);
     let c_inner =
         crate::lincheck::partial_fold_packed_z_best(c_lincheck, m, k_log, useful_bits, &eq_outer);
+    finish_round1_c_fold8(&c_inner, k_log, k_skip, r, inv_table)
+}
+
+/// Direct-row-major sibling of [`round1_c_fold8_from_lincheck_stripe`]. It
+/// performs the same outer fold from the retained canonical F128 witness and
+/// never allocates or writes the ranked 512 MiB lincheck stripe.
+pub(crate) fn round1_c_fold8_from_row_major_f128(
+    c_row_major: &[F128],
+    m: usize,
+    k_log: usize,
+    k_skip: usize,
+    useful_bits: usize,
+    r: &[F128],
+    inv_table: &InvNttTableByteSingleGf8,
+) -> (Vec<F128>, Vec<F128>, Vec<F128>, Vec<F128>) {
+    assert_eq!(k_skip, K_SKIP);
+    assert!(
+        k_log >= k_skip + 7,
+        "Fold8 needs six retained tail coordinates"
+    );
+    assert_eq!(r.len(), m);
+    assert_eq!(c_row_major.len(), 1usize << (m - 7));
+
+    let eq_outer = crate::lincheck::build_eq_table(&r[k_log..]);
+    let c_inner = crate::lincheck::partial_fold_row_major_f128_best(
+        c_row_major,
+        m,
+        k_log,
+        useful_bits,
+        &eq_outer,
+    );
+    finish_round1_c_fold8(&c_inner, k_log, k_skip, r, inv_table)
+}
+
+fn finish_round1_c_fold8(
+    c_inner: &[F128],
+    k_log: usize,
+    k_skip: usize,
+    r: &[F128],
+    inv_table: &InvNttTableByteSingleGf8,
+) -> (Vec<F128>, Vec<F128>, Vec<F128>, Vec<F128>) {
+    debug_assert_eq!(c_inner.len(), 1usize << k_log);
     let inner_tail = &r[k_skip + 1..k_log];
-    let fold8 = crate::pcs::ring_switch::s_hat_v_fold8_from_z_vec(&c_inner, inner_tail);
+    let fold8 = crate::pcs::ring_switch::s_hat_v_fold8_from_z_vec(c_inner, inner_tail);
     let s_hat_v_c = crate::pcs::ring_switch::collapse_s_hat_v_fold8(&fold8, &inner_tail[..6]);
 
     // Fold retained coordinates 2..6 to recover the incumbent four-bank
@@ -4598,6 +4640,19 @@ mod tests {
                 padding.useful_bits_per_block,
                 &r,
                 &inv_table,
+            );
+            let got_c8_row_major = round1_c_fold8_from_row_major_f128(
+                &c_words,
+                M,
+                K_LOG,
+                K_SKIP,
+                padding.useful_bits_per_block,
+                &r,
+                &inv_table,
+            );
+            assert_eq!(
+                got_c8_row_major, got_c8,
+                "row-major Fold8 C mismatch in case {case}"
             );
             assert_eq!(got_c8.0, incumbent.1, "fold8 round-one C mismatch in case {case}");
             assert_eq!(got_c8.1, incumbent.2, "fold8 canonical C mismatch in case {case}");
