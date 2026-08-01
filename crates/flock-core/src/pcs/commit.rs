@@ -209,6 +209,20 @@ impl core::ops::Deref for CodewordBuf {
 // GPU-staging variant hands the staging buffer back to the latch on drop),
 // and ranked-size trees through the GPU commit's tree pool (keeps the 64 MiB
 // copy-out target page-resident across the warmup and timed proves).
+impl ProverData {
+    /// Move L0 codeword + Merkle tree out for the open path.
+    ///
+    /// After the open has copied the queried rows and multi-proof, the open
+    /// path can drop these buffers so the ~1 GiB codeword / ~64 MiB tree do
+    /// not stay resident through recursive commits + induce. Replaces both
+    /// fields with empty CPU placeholders; subsequent `Drop` is a no-op give.
+    pub fn take_l0_for_open(&mut self) -> (CodewordBuf, MerkleTreeBuf) {
+        let tree = std::mem::replace(&mut self.merkle_tree, MerkleTreeBuf::Cpu(Vec::new()));
+        let codeword = std::mem::replace(&mut self.codeword, CodewordBuf::Cpu(Vec::new()));
+        (codeword, tree)
+    }
+}
+
 impl Drop for ProverData {
     fn drop(&mut self) {
         // Drop the borrowed GPU-tree view before releasing the staging lease

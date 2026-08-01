@@ -310,7 +310,7 @@ pub fn prove_chain_ligerito_generic<Ch: Challenger>(
         zc_proof,
         lc_proof,
         commitment,
-        prover_data,
+        mut prover_data,
         z_packed,
         s_hat_v_ab,
         s_hat_v_c,
@@ -322,7 +322,7 @@ pub fn prove_chain_ligerito_generic<Ch: Challenger>(
     let pre_c: Option<&[F128]> = Some(s_hat_v_c.s_hat_v_c.as_slice());
     let pcs_open = flock_core::pcs::open_batch_mixed_ligerito_with_precomputed_s_hat_v(
         z_packed,
-        &prover_data,
+        &mut prover_data,
         &commitment,
         &[ab_x_outer.as_slice(), c_x_outer.as_slice()],
         &[pre_ab, pre_c],

@@ -4110,8 +4110,8 @@ pub fn recursive_prover_with_basis<Ch: Challenger>(
         packed_witness,
         b_initial,
         target,
-        l0_codeword,
-        l0_tree,
+        crate::pcs::CodewordBuf::Cpu(l0_codeword.to_vec()),
+        crate::pcs::MerkleTreeBuf::Cpu(l0_tree.to_vec()),
         None,
         None,
         None,
@@ -4133,8 +4133,8 @@ pub fn recursive_prover_with_basis_precomputed_round0<Ch: Challenger>(
     packed_witness: Vec<F128>,
     b_initial: Vec<F128>,
     target: F128,
-    l0_codeword: &[F128],
-    l0_tree: &[Hash],
+    l0_codeword: crate::pcs::CodewordBuf,
+    l0_tree: crate::pcs::MerkleTreeBuf,
     round0_uv: (F128, F128),
     round1_lookahead: Option<[F128; 6]>,
     challenger: &mut Ch,
@@ -4168,8 +4168,8 @@ pub(crate) fn recursive_prover_with_basis_direct_ab_fold2<Ch: Challenger>(
     ordinary_basis: Vec<F128>,
     direct: Vec<super::ring_switch::DirectFold2Factors>,
     target: F128,
-    l0_codeword: &[F128],
-    l0_tree: &[Hash],
+    l0_codeword: crate::pcs::CodewordBuf,
+    l0_tree: crate::pcs::MerkleTreeBuf,
     round0_uv: (F128, F128),
     round1_lookahead: [F128; 6],
     challenger: &mut Ch,
@@ -4204,8 +4204,8 @@ pub(crate) fn recursive_prover_with_basis_direct_fold4<Ch: Challenger>(
     ordinary_basis: Vec<F128>,
     direct: Vec<super::ring_switch::DirectFold4Factors>,
     target: F128,
-    l0_codeword: &[F128],
-    l0_tree: &[Hash],
+    l0_codeword: crate::pcs::CodewordBuf,
+    l0_tree: crate::pcs::MerkleTreeBuf,
     round0_uv: (F128, F128),
     round1_lookahead: [F128; 6],
     round2_lookahead: super::Fold4Lookahead2,
@@ -4233,13 +4233,27 @@ pub(crate) fn recursive_prover_with_basis_direct_fold4<Ch: Challenger>(
     )
 }
 #[allow(clippy::too_many_arguments)]
+/// Recycle L0 open buffers after rows + multi-proof are owned copies.
+/// Tree before codeword — matches `ProverData::drop` lease ordering
+/// (GPU tree view must die before staging release on the codeword).
+fn release_l0_open_bufs(tree: crate::pcs::MerkleTreeBuf, codeword: crate::pcs::CodewordBuf) {
+    match tree {
+        crate::pcs::MerkleTreeBuf::Cpu(t) => crate::gpu_commit::give_tree(t),
+        crate::pcs::MerkleTreeBuf::Gpu(g) => drop(g),
+    }
+    match codeword {
+        crate::pcs::CodewordBuf::Cpu(v) => crate::scratch::give_f128(v),
+        crate::pcs::CodewordBuf::Gpu(g) => drop(g),
+    }
+}
+
 fn recursive_prover_with_basis_impl<Ch: Challenger>(
     config: &ProverConfig,
     packed_witness: Vec<F128>,
     b_initial: Vec<F128>,
     target: F128,
-    l0_codeword: &[F128],
-    l0_tree: &[Hash],
+    mut l0_codeword: crate::pcs::CodewordBuf,
+    mut l0_tree: crate::pcs::MerkleTreeBuf,
     first_msg: Option<SumcheckMessage>,
     round1_lookahead: Option<[F128; 6]>,
     round2_lookahead: Option<super::Fold4Lookahead2>,
@@ -4297,10 +4311,6 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
     let initial_root: Hash = l0_tree[l0_tree.len() - 1];
     let l0_block_len = block_len_0;
     let l0_num_interleaved = num_interleaved_0;
-    let l0_row = |q: usize| -> &[F128] {
-        let start = q * l0_num_interleaved;
-        &l0_codeword[start..start + l0_num_interleaved]
-    };
     challenger.observe_bytes(&initial_root);
 
     // L0 takes no explicit OOD samples: it is bound by the opening's own
@@ -4587,12 +4597,28 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
         use rayon::prelude::*;
         // Indexed parallel collect is order-preserving: bit-identical to
         // the serial map; each row copy is independent of the challenger.
-        queries_0.par_iter().map(|&q| l0_row(q).to_vec()).collect()
+        let code = &l0_codeword;
+        let ni = l0_num_interleaved;
+        queries_0
+            .par_iter()
+            .map(|&q| {
+                let start = q * ni;
+                code[start..start + ni].to_vec()
+            })
+            .collect()
     };
-    let merkle_proof_0 = merkle_multi_proof_for(l0_tree, l0_block_len, &queries_0);
+    let merkle_proof_0 = merkle_multi_proof_for(&l0_tree, l0_block_len, &queries_0);
     if trace {
         t_opens += _t.elapsed();
     }
+    // Rows + multi-proof are owned. L0 codeword (~1 GiB ranked) and tree
+    // (~64 MiB) are dead for the rest of the open — recycle before induce and
+    // every recursive commit so they do not stack under wtns_1.. and induce.
+    // Tree then codeword (GPU tree view before staging release).
+    release_l0_open_bufs(
+        std::mem::replace(&mut l0_tree, crate::pcs::MerkleTreeBuf::Cpu(Vec::new())),
+        std::mem::replace(&mut l0_codeword, crate::pcs::CodewordBuf::Cpu(Vec::new())),
+    );
     // Induce basis_0 from wtns_0 opens. L0 dominates the induce phase, where the
     // sparse-prefix Fᵀ-NTT path wins; the dispatcher auto-selects it (deeper
     // levels stay dense).
@@ -8289,8 +8315,8 @@ mod tests {
             poly.clone(),
             combined_basis.clone(),
             target,
-            &wtns_0.mat,
-            &wtns_0.tree,
+            crate::pcs::CodewordBuf::Cpu(wtns_0.mat.clone()),
+            crate::pcs::MerkleTreeBuf::Cpu(wtns_0.tree.clone()),
             round0,
             Some(lookahead),
             &mut ordinary_challenger,
@@ -8303,8 +8329,8 @@ mod tests {
             ordinary_c,
             direct,
             target,
-            &wtns_0.mat,
-            &wtns_0.tree,
+            crate::pcs::CodewordBuf::Cpu(wtns_0.mat.clone()),
+            crate::pcs::MerkleTreeBuf::Cpu(wtns_0.tree.clone()),
             round0,
             lookahead,
             &mut direct_challenger,
@@ -8424,8 +8450,8 @@ mod tests {
             poly.clone(),
             combined_basis.clone(),
             target,
-            &wtns_0.mat,
-            &wtns_0.tree,
+            crate::pcs::CodewordBuf::Cpu(wtns_0.mat.clone()),
+            crate::pcs::MerkleTreeBuf::Cpu(wtns_0.tree.clone()),
             round0,
             Some(round1),
             &mut ordinary_challenger,
@@ -8438,8 +8464,8 @@ mod tests {
             Vec::new(),
             direct,
             target,
-            &wtns_0.mat,
-            &wtns_0.tree,
+            crate::pcs::CodewordBuf::Cpu(wtns_0.mat.clone()),
+            crate::pcs::MerkleTreeBuf::Cpu(wtns_0.tree.clone()),
             round0,
             round1,
             round2,

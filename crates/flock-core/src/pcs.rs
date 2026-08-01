@@ -33,8 +33,9 @@ pub fn ranked_gpu_commit_latched_on() -> bool {
 }
 
 pub use commit::{
-    Commitment, PcsParams, ProverData, commit, commit_from_streamed_first_pass, commit_into,
-    commit_preinitialized, prefault_codeword_during, use_ranked_from_message_commit,
+    CodewordBuf, Commitment, MerkleTreeBuf, PcsParams, ProverData, commit,
+    commit_from_streamed_first_pass, commit_into, commit_preinitialized,
+    prefault_codeword_during, use_ranked_from_message_commit,
 };
 pub use pack::{LOG_PACKING, pack_witness, unpack_witness};
 pub use ring_switch::{RingSwitchProof, SparseEqTensor};
@@ -111,7 +112,7 @@ pub struct PackedDirectClaim {
 #[allow(clippy::too_many_arguments)]
 pub fn open_batch_mixed_ligerito_with_precomputed_s_hat_v<Ch: Challenger>(
     packed_witness: Vec<F128>,
-    prover_data: &ProverData,
+    prover_data: &mut ProverData,
     commitment: &Commitment,
     x_outers: &[&[F128]],
     precomputed_s_hat_v: &[Option<&[F128]>],
@@ -147,6 +148,9 @@ pub fn open_batch_mixed_ligerito_with_precomputed_s_hat_v<Ch: Challenger>(
     );
 
     let t = std::time::Instant::now();
+    // Move L0 into the open so rows/multi-proof can release ~1 GiB+64 MiB
+    // before induce/recursive commits (release_l0_open_bufs).
+    let (l0_codeword, l0_tree) = prover_data.take_l0_for_open();
     let ligerito_proof = if let Some(direct) = combined.direct_fold4 {
         ligerito::recursive_prover_with_basis_direct_fold4(
             lig_config,
@@ -154,8 +158,8 @@ pub fn open_batch_mixed_ligerito_with_precomputed_s_hat_v<Ch: Challenger>(
             combined.b_combined,
             direct,
             combined.target_combined,
-            &prover_data.codeword,
-            &*prover_data.merkle_tree,
+            l0_codeword,
+            l0_tree,
             combined.round0_prime,
             combined
                 .round1_lookahead
@@ -175,8 +179,8 @@ pub fn open_batch_mixed_ligerito_with_precomputed_s_hat_v<Ch: Challenger>(
             combined.b_combined,
             direct,
             combined.target_combined,
-            &prover_data.codeword,
-            &*prover_data.merkle_tree,
+            l0_codeword,
+            l0_tree,
             combined.round0_prime,
             combined
                 .round1_lookahead
@@ -189,8 +193,8 @@ pub fn open_batch_mixed_ligerito_with_precomputed_s_hat_v<Ch: Challenger>(
             packed_witness,
             combined.b_combined,
             combined.target_combined,
-            &prover_data.codeword,
-            &*prover_data.merkle_tree,
+            l0_codeword,
+            l0_tree,
             combined.round0_prime,
             combined.round1_lookahead,
             challenger,
@@ -1867,7 +1871,7 @@ mod tests {
             merkle_hash: Default::default(),
         };
         let z_packed = pack_witness(&z, m);
-        let (commitment, prover_data) = commit(&z_packed, &params);
+        let (commitment, mut prover_data) = commit(&z_packed, &params);
 
         let recursive_ks = vec![3usize, 3, 3];
         let log_inv_rates = vec![1usize, 3, 4, 6];
@@ -1909,7 +1913,7 @@ mod tests {
         let mut ch_p = FsChallenger::new(b"flock-test-lig-v0");
         let proof = open_batch_mixed_ligerito_with_precomputed_s_hat_v(
             z_packed.clone(),
-            &prover_data,
+            &mut prover_data,
             &commitment,
             &[x_outer.as_slice()],
             &[],

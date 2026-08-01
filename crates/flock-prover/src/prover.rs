@@ -142,7 +142,7 @@ pub(crate) fn quirky_x_outer_full(point: &QuirkyPoint) -> Vec<F128> {
 /// [`flock_core::verifier::verify_claims_ligerito`].
 pub(crate) fn open_claims_with_precomputed_ligerito<Ch: Challenger>(
     z_packed: Vec<F128>,
-    prover_data: &pcs::ProverData,
+    prover_data: &mut pcs::ProverData,
     commitment: &Commitment,
     claims: &[ZClaim],
     precomputed_s_hat_v: &[Option<&[F128]>],
@@ -197,7 +197,7 @@ pub fn prove_ligerito<Ch: Challenger>(
         .ligerito_prover_config()
         .expect("Ligerito default config; bump m for tiny instances");
 
-    let (commitment, prover_data) = pcs::commit(&z_packed, pcs_params);
+    let (commitment, mut prover_data) = pcs::commit(&z_packed, pcs_params);
     bind_statement(challenger, r1cs, &commitment);
 
     // a = A·z, b = B·z; for the C = I convention c aliases z.
@@ -257,7 +257,7 @@ pub fn prove_ligerito<Ch: Challenger>(
     let pre_c: Option<&[F128]> = pre_c_slot(r1cs, &s_hat_v_c);
     let pcs_open = open_claims_with_precomputed_ligerito(
         z_packed,
-        &prover_data,
+        &mut prover_data,
         &commitment,
         &[ab.clone(), c.clone()],
         &[pre_ab, pre_c],
@@ -420,7 +420,7 @@ fn prove_fast_ligerito_from_witness_with_commit_codeword<Ch: Challenger>(
         ab,
         c,
         commitment,
-        prover_data,
+        mut prover_data,
         z_packed,
         s_hat_v_ab,
         s_hat_v_c,
@@ -444,7 +444,7 @@ fn prove_fast_ligerito_from_witness_with_commit_codeword<Ch: Challenger>(
     let t_open = std::time::Instant::now();
     let pcs_open = open_claims_with_precomputed_ligerito(
         z_packed,
-        &prover_data,
+        &mut prover_data,
         &commitment,
         &[ab.clone(), c.clone()],
         &[pre_ab, pre_c],
@@ -817,7 +817,7 @@ fn prove_fast_core_with_commit_codeword<Ch: Challenger>(
     let run_commit = || {
         let cpu0 = phase_timing.then(process_cpu_ms);
         let t_commit = std::time::Instant::now();
-        let ((commitment, prover_data), ab_inner) = commit_with_round1_ab_precompute(
+        let ((commitment, mut prover_data), ab_inner) = commit_with_round1_ab_precompute(
             &z_packed,
             &a_packed_f128,
             &b_packed_f128,
@@ -907,7 +907,7 @@ fn prove_fast_core_with_commit_codeword<Ch: Challenger>(
             (pre, stripe)
         }
     };
-    let (commitment, prover_data, ab_inner) = pre_zerocheck;
+    let (commitment, mut prover_data, ab_inner) = pre_zerocheck;
     bind_statement(challenger, r1cs, &commitment);
     let cpu_zc0 = phase_timing.then(process_cpu_ms);
     let t_zc = std::time::Instant::now();
@@ -1153,7 +1153,7 @@ fn prove_fast_ligerito_timed_with_commit_codeword<Ch: Challenger>(
 
     // --- PCS commit + challenge-independent zerocheck AB preprocessing ---
     let t0 = Instant::now();
-    let ((commitment, prover_data), ab_inner) = commit_with_round1_ab_precompute(
+    let ((commitment, mut prover_data), ab_inner) = commit_with_round1_ab_precompute(
         &z_packed,
         &a_packed_f128,
         &b_packed_f128,
@@ -1228,7 +1228,7 @@ fn prove_fast_ligerito_timed_with_commit_codeword<Ch: Challenger>(
     let t0 = Instant::now();
     let pcs_open = open_claims_with_precomputed_ligerito(
         z_packed,
-        &prover_data,
+        &mut prover_data,
         &commitment,
         &[ab.clone(), c.clone()],
         &[pre_ab, pre_c],
