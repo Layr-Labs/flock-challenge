@@ -498,12 +498,23 @@ pub enum VerifyError {
 /// Standard "doubling-in-half" construction: `O(2^d)` F128 muls, no
 /// inversions. Indexing is LSB-first — `bit_j(i)` is the `j`-th LSB of `i`.
 pub fn build_eq_table(point: &[F128]) -> Vec<F128> {
-    use rayon::prelude::*;
-
     let d = point.len();
     // Every slot is written by the level that first exposes it before it can
     // be read at a later level.
     let mut out = crate::alloc_uninit_f128_vec(1usize << d);
+    build_eq_table_into(&mut out, point);
+    out
+}
+
+/// In-place body of [`build_eq_table`]: fills `out` (whose length must be
+/// `2^point.len()`; contents may be uninitialized/stale — every slot is
+/// written before it is read). Split out so callers can supply a pooled
+/// buffer via [`crate::scratch::take_f128`] instead of a fresh allocation.
+pub fn build_eq_table_into(out: &mut [F128], point: &[F128]) {
+    use rayon::prelude::*;
+
+    let d = point.len();
+    debug_assert_eq!(out.len(), 1usize << d);
     out[0] = F128::ONE;
     const PAR_THRESHOLD: usize = 1 << 12;
     for j in 0..d {
@@ -532,7 +543,6 @@ pub fn build_eq_table(point: &[F128]) -> Vec<F128> {
                 .for_each(|(lo_i, hi_i)| build_pair(lo_i, hi_i));
         }
     }
-    out
 }
 
 /// Fold a sparse boolean matrix's rows against an eq table at the row

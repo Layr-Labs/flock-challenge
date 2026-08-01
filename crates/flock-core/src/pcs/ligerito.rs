@@ -3681,6 +3681,14 @@ pub struct SumcheckProver {
     pending_glue: Option<(Vec<F128>, F128)>,
 }
 
+/// Open-path residency diet (spare trimming, glue-basis recycling, pooled
+/// OOD eq tables). Allocation-behavior only — proof bytes are unchanged.
+/// `FLOCK_NO_OPEN_RESIDENCY_DIET=1` restores the incumbent behavior.
+fn residency_diet_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("FLOCK_NO_OPEN_RESIDENCY_DIET").is_none())
+}
+
 impl SumcheckProver {
     /// Ping-pong spare of capacity >= `f.len() / 2`; an empty Vec when the
     /// prover is degenerate (len < 2), so `take_f128(0)` can never steal a
@@ -3788,8 +3796,42 @@ impl SumcheckProver {
         );
         std::mem::swap(&mut self.f, &mut self.spare_f);
         std::mem::swap(&mut self.combined_basis, &mut self.spare_b);
+        self.trim_spares();
         self.transcript.push(msg);
         msg
+    }
+
+    /// After the ping-pong swap the spares hold the PRE-fold allocations
+    /// (up to 128 MiB each at m = 32) while every later fold writes at most
+    /// `f.len() / 2` elements. Park ≥4x-oversized spares in the scratch
+    /// pool and re-take exact-size ones, so the L1 commit, the induce
+    /// tables, and the recursive levels reuse those already-faulted pages
+    /// mid-open instead of allocating fresh. Zero copies; the fold kernels
+    /// are capacity-driven (`debug_assert!(nf.capacity() >= half)`), so the
+    /// spare-length contract is unchanged.
+    fn trim_spares(&mut self) {
+        if !residency_diet_enabled() {
+            return;
+        }
+        let need = self.f.len() / 2;
+        if need == 0 {
+            return;
+        }
+        if self.spare_f.capacity() >= need * 4 {
+            if std::env::var_os("FLOCK_RESIDENCY_DEBUG").is_some() {
+                eprintln!(
+                    "[open-residency] trim spare_f {} -> {} F128",
+                    self.spare_f.capacity(),
+                    need
+                );
+            }
+            crate::scratch::give_f128(std::mem::take(&mut self.spare_f));
+            self.spare_f = crate::scratch::take_f128(need);
+        }
+        if self.spare_b.capacity() >= need * 4 {
+            crate::scratch::give_f128(std::mem::take(&mut self.spare_b));
+            self.spare_b = crate::scratch::take_f128(need);
+        }
     }
 
     /// Record a message produced by evaluating lookahead coefficients. Its
@@ -3813,6 +3855,7 @@ impl SumcheckProver {
         );
         std::mem::swap(&mut self.f, &mut self.spare_f);
         std::mem::swap(&mut self.combined_basis, &mut self.spare_b);
+        self.trim_spares();
         self.transcript.push(msg);
         (msg, coeffs)
     }
@@ -3831,6 +3874,7 @@ impl SumcheckProver {
         );
         std::mem::swap(&mut self.f, &mut self.spare_f);
         std::mem::swap(&mut self.combined_basis, &mut self.spare_b);
+        self.trim_spares();
         self.transcript.push(msg);
         msg
     }
@@ -3881,6 +3925,12 @@ impl SumcheckProver {
                 .for_each(|(acc, &v)| *acc += alpha * v);
         }
         self.t_r += alpha * h_new;
+        // The introduced basis is fully absorbed into `combined_basis`;
+        // park it in the scratch pool instead of paying its munmap here on
+        // the open's critical path (and the next taker's fresh faults).
+        if residency_diet_enabled() {
+            crate::scratch::give_f128(b_new);
+        }
     }
 
     pub fn f(&self) -> &[F128] {
@@ -4556,7 +4606,16 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
             // Build eq(z, ·) once and fuse the MLE eval `y = f̂1(z)` into the
             // introduce round message (single pass over f1 + eq_z), instead of
             // a separate `mle_eval_inline` fold.
-            let eq_z = build_eq_table(&z);
+            let eq_z = if residency_diet_enabled() {
+                // Pooled variant: the table is given back by `glue`, so the
+                // OOD eq tables cycle through the scratch pool instead of
+                // paying a fresh mmap + fault + munmap per binding.
+                let mut v = crate::scratch::take_f128(1usize << z.len());
+                crate::lincheck::build_eq_table_into(&mut v, &z);
+                v
+            } else {
+                build_eq_table(&z)
+            };
             let (intro, y) = sc_prover.introduce_new_with_eval(eq_z);
             challenger.observe_f128(y);
             ood_values.push(y);
@@ -4766,7 +4825,16 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
             let _t = std::time::Instant::now();
             for _ in 0..ood_count(i + 2) {
                 let z = challenger.sample_f128_vec(n_next);
-                let eq_z = build_eq_table(&z);
+                let eq_z = if residency_diet_enabled() {
+                // Pooled variant: the table is given back by `glue`, so the
+                // OOD eq tables cycle through the scratch pool instead of
+                // paying a fresh mmap + fault + munmap per binding.
+                let mut v = crate::scratch::take_f128(1usize << z.len());
+                crate::lincheck::build_eq_table_into(&mut v, &z);
+                v
+            } else {
+                build_eq_table(&z)
+            };
                 let (intro, y) = sc_prover.introduce_new_with_eval(eq_z);
                 challenger.observe_f128(y);
                 ood_values.push(y);
@@ -9447,3 +9515,5 @@ mod tests {
     }
 }
 // Redraw marker 4 (drift probe): zero-diff; prior draws 1,205,646 / 1,205,107 / 1,206,245.
+
+// redraw marker: akashneelesh session-f661 draw B (disclosed zero-diff resample of 01d5338)
