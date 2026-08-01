@@ -778,3 +778,252 @@ pub(super) unsafe fn butterfly_fused_2layer(
         }
     }
 }
+
+/// The fused-three-layer radix-8 register chain, shared by every staged
+/// sweep so the arithmetic exists in exactly one place. Same butterfly order
+/// and the same seven twiddles as [`butterfly_fused_3layer_row_with_q`].
+#[inline(always)]
+unsafe fn radix8_chain_q(
+    v: &mut [core::arch::aarch64::uint64x2_t; 8],
+    t: &[core::arch::aarch64::uint64x2_t; 7],
+) {
+    unsafe {
+        // Layer L: stride 4, shared twiddle t[0].
+        for i in 0..4 {
+            let (a, b) = butterfly_q(v[i], v[i + 4], t[0]);
+            v[i] = a;
+            v[i + 4] = b;
+        }
+        // Layer L+1: stride 2, twiddles t[1], t[2] per half.
+        for s in 0..2 {
+            for i in 0..2 {
+                let (u, w) = (4 * s + i, 4 * s + i + 2);
+                let (a, b) = butterfly_q(v[u], v[w], t[1 + s]);
+                v[u] = a;
+                v[w] = b;
+            }
+        }
+        // Layer L+2: stride 1, twiddles t[3..7] per quarter.
+        for s in 0..4 {
+            let (a, b) = butterfly_q(v[2 * s], v[2 * s + 1], t[3 + s]);
+            v[2 * s] = a;
+            v[2 * s + 1] = b;
+        }
+    }
+}
+
+/// One radix-8 fused-three-layer sweep that reads eight row streams from
+/// `src` and writes eight row streams to `dst`, each stream stepping by its
+/// own row stride. Same register chain, same butterfly order, and the same
+/// seven twiddles as [`butterfly_fused_3layer_row_with_q`]; only the source
+/// and destination geometries are decoupled.
+///
+/// # Safety
+/// Both geometries valid for eight rows of `num_ntts` lanes; `dst` rows are
+/// owned exclusively by this call.
+#[target_feature(enable = "aes")]
+unsafe fn radix8_rows_from_to_q(
+    src: *const F128,
+    src_step: usize,
+    dst: *mut F128,
+    dst_step: usize,
+    num_ntts: usize,
+    t: &[core::arch::aarch64::uint64x2_t; 7],
+) {
+    use core::arch::aarch64::*;
+    unsafe {
+        for lane in 0..num_ntts {
+            let s = src.add(lane);
+            let mut v: [uint64x2_t; 8] =
+                core::array::from_fn(|j| vld1q_u64(s.add(j * src_step).cast::<u64>()));
+
+            radix8_chain_q(&mut v, t);
+
+            let d = dst.add(lane);
+            for (j, value) in v.iter().enumerate() {
+                vst1q_u64(d.add(j * dst_step).cast::<u64>(), *value);
+            }
+        }
+    }
+}
+
+/// Best-effort non-temporal store pair; same `stnp` idiom as
+/// [`butterfly_fused_3layer_dual_from_src_row`]'s burst arm.
+///
+/// # Safety
+/// `dst` must be valid for a 32 B write.
+#[inline(always)]
+unsafe fn staged_store_pair_nt(
+    dst: *mut F128,
+    x: core::arch::aarch64::uint64x2_t,
+    y: core::arch::aarch64::uint64x2_t,
+) {
+    unsafe {
+        core::arch::asm!(
+            "stnp {x:q}, {y:q}, [{dst}]",
+            dst = in(reg) dst,
+            x = in(vreg) x,
+            y = in(vreg) y,
+            options(nostack, preserves_flags),
+        );
+    }
+}
+
+/// Whether the staged pass emits its codeword writes as non-temporal bursts.
+///
+/// `FLOCK_NO_NTT_STAGED6_NT=1` selects ordinary vector stores in the same
+/// binary, isolating the store flavor from the fusion itself.
+#[inline]
+fn staged_nt_bursts() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("FLOCK_NO_NTT_STAGED6_NT").is_none())
+}
+
+/// Second sweep of the staged pass: reads eight contiguous tile rows, applies
+/// the fused-three-layer radix-8 chain, stages the eight output rows in an
+/// L1-resident buffer, then emits each destination row's whole lane run as one
+/// sequential burst.
+///
+/// The staging exists for the store microarchitecture, not the arithmetic.
+/// Writing the results per lane would interleave eight 16 B streams a
+/// megabyte apart; note `516b4da` measured that exact shape on this codeword
+/// as defeating the streaming-store detector and paying a full RFO read on
+/// ~1 GiB of destination lines. The in-place layer-7 pass escapes that only
+/// because it re-writes lines its own lane loop read microseconds earlier —
+/// a staged sweep last touched them a whole tile ago, so it must restore the
+/// fill-like store behavior explicitly.
+///
+/// # Safety
+/// Tile and destination geometries valid for eight rows of `num_ntts` lanes,
+/// `out` writable for `8 * num_ntts` elements and private to this call, and
+/// 16 B-aligned destinations.
+#[target_feature(enable = "aes")]
+#[allow(clippy::too_many_arguments)]
+unsafe fn radix8_tile_to_burst_rows_q(
+    src: *const F128,
+    dst: *mut F128,
+    dst_step: usize,
+    num_ntts: usize,
+    t: &[core::arch::aarch64::uint64x2_t; 7],
+    out: *mut F128,
+    nt: bool,
+) {
+    use core::arch::aarch64::*;
+    unsafe {
+        for lane in 0..num_ntts {
+            let s = src.add(lane);
+            let mut v: [uint64x2_t; 8] =
+                core::array::from_fn(|j| vld1q_u64(s.add(j * num_ntts).cast::<u64>()));
+
+            radix8_chain_q(&mut v, t);
+
+            for (j, value) in v.iter().enumerate() {
+                vst1q_u64(out.add(j * num_ntts + lane).cast::<u64>(), *value);
+            }
+        }
+
+        // One sequential burst per destination row.
+        for j in 0..8 {
+            let o = out.add(j * num_ntts);
+            let d = dst.add(j * dst_step);
+            let mut lane = 0;
+            while lane < num_ntts {
+                let x = vld1q_u64(o.add(lane).cast::<u64>());
+                let y = vld1q_u64(o.add(lane + 1).cast::<u64>());
+                if nt {
+                    staged_store_pair_nt(d.add(lane), x, y);
+                } else {
+                    vst1q_u64(d.add(lane).cast::<u64>(), x);
+                    vst1q_u64(d.add(lane + 1).cast::<u64>(), y);
+                }
+                lane += 2;
+            }
+        }
+    }
+}
+
+/// Vector-resident twin of `portable::butterfly_fused_6layer_staged_rows`.
+///
+/// Fuses six top layers of one outer block into a single codeword read and a
+/// single codeword write by staging the intermediate 64-row group in an
+/// L1-resident tile instead of a second full-buffer round trip. See the
+/// portable form for the row-group algebra; the arithmetic, butterfly order
+/// and twiddles are unchanged, so the result is bit-identical to the two
+/// in-place radix-8 passes it replaces.
+///
+/// # Safety
+/// Same contract as the portable form: valid block geometry for `64 * k`
+/// positions of `num_ntts` lanes, a private writable `tile` of
+/// `64 * strip * num_ntts + 8 * num_ntts` elements where
+/// `strip = row_end - row_start`, and disjoint row ranges across concurrent
+/// calls.
+#[target_feature(enable = "aes")]
+#[allow(clippy::too_many_arguments)]
+pub(super) unsafe fn butterfly_fused_6layer_staged_rows(
+    block: *mut F128,
+    k: usize,
+    num_ntts: usize,
+    row_start: usize,
+    row_end: usize,
+    tile: *mut F128,
+    t_lo: &[F128; 7],
+    t_hi: &[[F128; 7]; 8],
+) {
+    use core::arch::aarch64::*;
+    unsafe {
+        let lo: [uint64x2_t; 7] =
+            core::array::from_fn(|i| vld1q_u64((&raw const t_lo[i]).cast::<u64>()));
+        let hi: [[uint64x2_t; 7]; 8] = core::array::from_fn(|g| {
+            core::array::from_fn(|i| vld1q_u64((&raw const t_hi[g][i]).cast::<u64>()))
+        });
+
+        // The second sweep's store bursts emit lane pairs.
+        debug_assert!(num_ntts.is_multiple_of(2));
+        let strip = row_end - row_start;
+        // Tile row `i` is the whole strip of row group `i`, contiguous:
+        // `tile[i * tile_row + rr * num_ntts + lane]`. Rows 64..72 stage the
+        // second sweep's eight output rows for their store bursts.
+        let tile_row = strip * num_ntts;
+        let burst = tile.add(64 * tile_row);
+        let nt = staged_nt_bursts();
+        let block_step = k * num_ntts;
+
+        // Radix-8 group index outer, row group inner. That ordering is the
+        // whole point: for a fixed `i0` the eight source streams advance one
+        // row (`num_ntts` elements) per `rr`, so each is a sequential run over
+        // the strip and only eight are live at once — the same stream count
+        // the in-place passes present, and the count the hardware prefetcher
+        // can actually track. The row-group-outer ordering keeps all 64
+        // streams live simultaneously and defeats it.
+        for i0 in 0..8 {
+            for rr in 0..strip {
+                radix8_rows_from_to_q(
+                    block.add((i0 * k + row_start + rr) * num_ntts),
+                    8 * block_step,
+                    tile.add(i0 * tile_row + rr * num_ntts),
+                    8 * tile_row,
+                    num_ntts,
+                    &lo,
+                );
+            }
+        }
+        // Layers L+3..L+6, same ordering: eight destination streams `k`
+        // positions apart, each advancing one row per `rr`, so consecutive
+        // bursts of a stream are contiguous and the whole strip leaves as one
+        // sequential non-temporal run.
+        for g in 0..8 {
+            for rr in 0..strip {
+                radix8_tile_to_burst_rows_q(
+                    tile.add(8 * g * tile_row + rr * num_ntts),
+                    block.add((8 * g * k + row_start + rr) * num_ntts),
+                    block_step,
+                    num_ntts,
+                    &hi[g],
+                    burst,
+                    nt,
+                );
+            }
+        }
+    }
+}
