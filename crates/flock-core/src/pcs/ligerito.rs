@@ -9448,3 +9448,7 @@ mod tests {
 }
 // Redraw marker 4 (drift probe): zero-diff; prior draws 1,205,646 / 1,205,107 / 1,206,245.
 // RealAdii draw 1 on 1a6ad0e.
+// Akashneelesh draw F on the 1,250,503.69 parent3 frontier (fb7e350); prior-content draws 1,248,190 / 1,242,649 / 1,244,437 / 1,240,085 / 1,241,813.
+// Akashneelesh draw G; parent3-content ledger so far: 1,250,504 / 1,246,202.
+// Akashneelesh draw H: exact frontier content; our zero-diff controls on this tree drew 1,246,202 / 1,246,537, so the 1,250,504 bar is a +0.30% outlier.
+// Akashneelesh draw I: zero-diff ledger on this tree now 1,246,202 / 1,246,537 / 1,248,857 (mean 1,247,198); bar 1,250,504 sits +0.26% above it.
