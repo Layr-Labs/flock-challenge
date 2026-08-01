@@ -44,10 +44,33 @@ pub const ENV_GPU_COMMIT_FORCE: &str = "FLOCK_GPU_COMMIT_FORCE";
 /// restoring the incumbent kernel selection as the same-binary control.
 pub const ENV_NO_NTT_PASS_TUNE: &str = "FLOCK_NO_NTT_PASS_TUNE";
 
+/// Disable only the mixed-algebra ranked final NTT pass, restoring the
+/// incumbent h8 kernel as a same-binary control.
+pub const ENV_NO_GPU_MIXED_FINAL: &str = "FLOCK_NO_GPU_MIXED_FINAL";
+
 /// Latched once: pass tuning enabled unless the kill switch is set.
 pub(crate) fn pass_tune_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os(ENV_NO_NTT_PASS_TUNE).is_none())
+}
+
+#[cfg(test)]
+mod mixed_final_gate_tests {
+    #[test]
+    fn ranked_selector_honors_broad_and_narrow_gates() {
+        assert!(super::select_gpu_mixed_final(20, 16, 4, true, true));
+        assert!(!super::select_gpu_mixed_final(20, 16, 4, true, false));
+        assert!(!super::select_gpu_mixed_final(20, 16, 4, false, true));
+        assert!(!super::select_gpu_mixed_final(20, 12, 4, true, true));
+        assert!(!super::select_gpu_mixed_final(20, 17, 3, true, true));
+    }
+}
+
+/// Cached outside graph encoding so the narrow control adds no environment
+/// lookup to the per-proof dispatch path.
+pub(crate) fn gpu_mixed_final_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os(ENV_NO_GPU_MIXED_FINAL).is_none())
 }
 
 /// Wall-clock margin the GPU must beat during the warmup dual-run: latch on
@@ -227,6 +250,47 @@ pub(crate) fn plan_passes(log_d: usize, start_layer: usize) -> Vec<(usize, usize
         l += f;
     }
     passes
+}
+
+/// Upper bound on the bit-length of any twiddle at `layer` of a size-`2^log_d`
+/// additive NTT in the standard basis. At the ranked final pass, layers 18/19
+/// need at most 37/20 bits, which bounds the mixed kernel's fixed loops.
+pub(crate) fn max_twiddle_bits(log_d: usize, layer: usize) -> u32 {
+    if layer == 0 || layer >= log_d {
+        return 0;
+    }
+    let shift = log_d - layer - 1;
+    if shift >= 32 {
+        return u32::MAX;
+    }
+    match (layer as u64).checked_mul(1u64 << shift) {
+        Some(d) if d < u32::MAX as u64 - 1 => d as u32 + 1,
+        _ => u32::MAX,
+    }
+}
+
+/// Correctness gate for the mixed final-pass kernel's 40/20-bit hard bounds.
+pub(crate) fn pass5_mixed_ok(log_d: usize, l: usize, f: usize) -> bool {
+    f == 4
+        && l + 4 == log_d
+        && max_twiddle_bits(log_d, l + 2) <= 40
+        && max_twiddle_bits(log_d, l + 3) <= 20
+}
+
+/// Pure selector shared by both full and hybrid-prefix dispatch sites.
+pub(crate) fn select_gpu_mixed_final(
+    log_d: usize,
+    l: usize,
+    f: usize,
+    pass_tune: bool,
+    mixed_enabled: bool,
+) -> bool {
+    pass_tune && mixed_enabled && pass5_mixed_ok(log_d, l, f)
+}
+
+#[inline]
+fn gpu_mixed_final_selected(log_d: usize, l: usize, f: usize) -> bool {
+    select_gpu_mixed_final(log_d, l, f, true, gpu_mixed_final_enabled())
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -733,6 +797,107 @@ kernel void ntt_fused_reg4h8(device uint4* data                [[buffer(0)]],
     }
 }
 
+// a * x^4 mod P.
+static inline uint4 gf_shl4(uint4 a) {
+    uint h = a.w >> 28;
+    uint4 r;
+    r.w = (a.w << 4) | (a.z >> 28);
+    r.z = (a.z << 4) | (a.y >> 28);
+    r.y = (a.y << 4) | (a.x >> 28);
+    r.x = (a.x << 4) ^ ((h << 7) ^ (h << 2) ^ (h << 1) ^ h);
+    return r;
+}
+
+// Mixed ranked final pass. Shallow sub-layers retain the proven table
+// multiply. Deep sub-layers Horner over the short twiddle instead of scanning
+// all 128 bits of the value. Dispatch is restricted by pass5_mixed_ok().
+kernel void ntt_pass5_mixed(device uint4* data                [[buffer(0)]],
+                            device const uint4* twiddles      [[buffer(1)]],
+                            constant NttParams& P             [[buffer(2)]],
+                            uint tgid [[threadgroup_position_in_grid]],
+                            uint lid  [[thread_index_in_threadgroup]])
+{
+    constexpr uint F = 4u, NF = 1u << F;
+    constexpr uint NNIB_A = 10u;   // sub-layer 2: twiddle < 2^40
+    constexpr uint NNIB_B = 5u;    // sub-layer 3: twiddle < 2^20
+    threadgroup uint4 bases[3u * 4u];
+    threadgroup uint4 tabs[3u * 64u];
+    threadgroup uint  nibA[4u * NNIB_A];
+    threadgroup uint  nibB[8u * NNIB_B];
+
+    const uint lane = lid & 63u;
+    const uint B = tgid >> P.s;
+    const uint r = tgid & ((1u << P.s) - 1u);
+    const uint pos_base = (B << (P.log_d - P.l)) + r;
+
+    if (lid < 12u) {
+        uint t = lid >> 2, k = lid & 3u;
+        uint j = 31u - clz(t + 1u), c = t + 1u - (1u << j);
+        uint4 p = twiddles[(1u << (P.l + j)) - 1u + (B << j) + c];
+        for (uint m = 0; m < k * 4u; m++) p = gf_mulx(p);
+        bases[lid] = p;
+    }
+    if (lid < 40u) {
+        uint cA = lid / NNIB_A, qA = lid % NNIB_A;
+        uint4 twA = twiddles[(1u << (P.l + 2u)) - 1u + (B << 2) + cA];
+        nibA[lid] = (twA[qA >> 3] >> ((qA & 7u) * 4u)) & 15u;
+        uint cB = lid / NNIB_B, qB = lid % NNIB_B;
+        uint4 twB = twiddles[(1u << (P.l + 3u)) - 1u + (B << 3) + cB];
+        nibB[lid] = (twB[qB >> 3] >> ((qB & 7u) * 4u)) & 15u;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint ei = lid; ei < 3u * 64u; ei += 64u) {
+        uint t = ei >> 6, sub = ei & 63u, n = sub & 15u;
+        uint4 p = bases[(t << 2) | (sub >> 4)];
+        uint4 val = uint4(0u);
+        for (uint k = 0; k < 4u; k++) {
+            if ((n >> k) & 1u) val ^= p;
+            p = gf_mulx(p);
+        }
+        tabs[ei] = val;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    uint4 elems[NF];
+    for (uint e = 0; e < NF; e++) {
+        elems[e] = data[((pos_base + (e << P.s)) << 6) + lane];
+    }
+    for (uint j = 0; j < F; j++) {
+        const uint bpos = F - 1u - j;
+        for (uint b = 0; b < (NF >> 1); b++) {
+            uint low = b & ((1u << bpos) - 1u);
+            uint eu = ((b >> bpos) << (bpos + 1u)) | low;
+            uint ev = eu | (1u << bpos);
+            uint c = eu >> (F - j);
+            uint4 acc;
+            if (j < 2u) {
+                acc = gf_mul_tab4(elems[ev], &tabs[(((1u << j) - 1u) + c) << 6]);
+            } else {
+                const uint NN = (j == 2u) ? NNIB_A : NNIB_B;
+                threadgroup const uint* nb =
+                    (j == 2u) ? &nibA[c * NNIB_A] : &nibB[c * NNIB_B];
+                uint4 V0 = elems[ev];
+                uint4 V1 = gf_mulx(V0), V2 = gf_mulx(V1), V3 = gf_mulx(V2);
+                acc = uint4(0u);
+                for (int q = (int)NN - 1; q >= 0; q--) {
+                    acc = gf_shl4(acc);
+                    uint n = nb[q];
+                    if (n & 1u) acc ^= V0;
+                    if (n & 2u) acc ^= V1;
+                    if (n & 4u) acc ^= V2;
+                    if (n & 8u) acc ^= V3;
+                }
+            }
+            uint4 nu = elems[eu] ^ acc;
+            elems[eu] = nu;
+            elems[ev] ^= nu;
+        }
+    }
+    for (uint e = 0; e < NF; e++) {
+        data[((pos_base + (e << P.s)) << 6) + lane] = elems[e];
+    }
+}
+
 // ===========================================================================
 // From-z first pass: fuses the RS zero-padding into the first four layers.
 //
@@ -998,6 +1163,7 @@ kernel void parent_hash(device const uint* children [[buffer(0)]],
         /// sub-layer skipped, and the half-footprint final-pass kernel.
         pub(crate) pso_ntt4zg4: Id,
         pub(crate) pso_ntt4h8: Id,
+        pub(crate) pso_ntt5mix: Id,
         pub(crate) pso_leaf: Id,
         pub(crate) pso_parent: Id,
     }
@@ -1098,6 +1264,7 @@ kernel void parent_hash(device const uint* children [[buffer(0)]],
                 let pso_ntt4z = pso("ntt_fused_reg4_from_z")?;
                 let pso_ntt4zg4 = pso("ntt_fused_reg4_from_zg4")?;
                 let pso_ntt4h8 = pso("ntt_fused_reg4h8")?;
+                let pso_ntt5mix = pso("ntt_pass5_mixed")?;
                 let pso_leaf = pso("leaf_hash")?;
                 let pso_parent = pso("parent_hash")?;
                 send!(api, unsafe extern "C" fn(Id, Sel) -> Id, library, c"release");
@@ -1112,6 +1279,7 @@ kernel void parent_hash(device const uint* children [[buffer(0)]],
                     pso_ntt4z,
                     pso_ntt4zg4,
                     pso_ntt4h8,
+                    pso_ntt5mix,
                     pso_leaf,
                     pso_parent,
                 })
@@ -1401,6 +1569,11 @@ kernel void parent_hash(device const uint* children [[buffer(0)]],
                         64u64,
                         1u64 << (log_d - f - share_log),
                     ),
+                    4 if super::pass_tune_enabled()
+                        && super::gpu_mixed_final_selected(log_d, l, f) =>
+                    {
+                        (gpu.pso_ntt5mix, 64u64, 1u64 << (log_d - f))
+                    }
                     // s < 2 (the final pass): no same-B tiles exist to
                     // share, so spend the same occupancy currency the other
                     // way — halve the per-tile table footprint (byte-Horner
@@ -1461,6 +1634,11 @@ kernel void parent_hash(device const uint* children [[buffer(0)]],
                         64u64,
                         1u64 << (log_d - f - share_log),
                     ),
+                    4 if super::pass_tune_enabled()
+                        && super::gpu_mixed_final_selected(log_d, l, f) =>
+                    {
+                        (gpu.pso_ntt5mix, 64u64, 1u64 << (log_d - f))
+                    }
                     // s < 2 (the final pass): no same-B tiles exist to
                     // share, so spend the same occupancy currency the other
                     // way — halve the per-tile table footprint (byte-Horner
