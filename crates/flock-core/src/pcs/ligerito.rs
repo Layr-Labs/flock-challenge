@@ -9447,4 +9447,3 @@ mod tests {
     }
 }
 // Redraw marker 4 (drift probe): zero-diff; prior draws 1,205,646 / 1,205,107 / 1,206,245.
-// Zeeshan redraw 1 on the promoted helper-only 1,209,374.77 frontier.

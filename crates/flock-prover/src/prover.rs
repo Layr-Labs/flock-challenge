@@ -57,6 +57,22 @@ fn ranked_direct_fold4_precompute_enabled(r1cs: &BlockR1cs) -> bool {
         && pcs::ranked_direct_fold4_enabled()
 }
 
+/// Exact-shape gate for deriving identity C from the already-materialized
+/// lincheck stripe. Keep this narrower than the generic DirectFold4 gate:
+/// the shortcut relies on ranked BLAKE3's block geometry and honest padding,
+/// while every miss retains the incumbent row-major C producer.
+#[inline]
+fn ranked_lincheck_c_reuse_enabled(r1cs: &BlockR1cs) -> bool {
+    ranked_direct_fold4_precompute_enabled(r1cs)
+        && r1cs.m == 32
+        && r1cs.k_log == 14
+        && r1cs.k_skip == zerocheck::K_SKIP
+        && r1cs.useful_bits == 15_409
+        && r1cs.layout == flock_core::r1cs::WitnessLayout::RowMajor
+        && r1cs.c0_is_identity()
+        && std::env::var_os("FLOCK_NO_ZC_LINCHECK_C_REUSE").is_none()
+}
+
 fn precompute_ab_s_hat_v(
     r1cs: &BlockR1cs,
     z_vec: &[F128],
@@ -798,7 +814,7 @@ fn prove_fast_core_with_commit_codeword<Ch: Challenger>(
 ) -> ProveCore {
     let padding = r1cs.padding_spec();
     let phase_timing = std::env::var_os("FLOCK_PHASE_TIMING").is_some();
-    let run_commit_and_zerocheck = || {
+    let run_commit = || {
         let cpu0 = phase_timing.then(process_cpu_ms);
         let t_commit = std::time::Instant::now();
         let ((commitment, prover_data), ab_inner) = commit_with_round1_ab_precompute(
@@ -817,47 +833,16 @@ fn prove_fast_core_with_commit_codeword<Ch: Challenger>(
                 cpu / wall
             );
         }
-        bind_statement(challenger, r1cs, &commitment);
-        let cpu_zc0 = phase_timing.then(process_cpu_ms);
-        let t_zc = std::time::Instant::now();
-
-        let (zc_proof, zc_claim, s_hat_v_c) = {
-            // Zero-cost &[u8] views of the F128 buffers; c aliases z (C = I).
-            let a_packed: &[u8] = unsafe {
-                std::slice::from_raw_parts(
-                    a_packed_f128.as_ptr() as *const u8,
-                    a_packed_f128.len() * core::mem::size_of::<F128>(),
-                )
-            };
-            let b_packed: &[u8] = unsafe {
-                std::slice::from_raw_parts(
-                    b_packed_f128.as_ptr() as *const u8,
-                    b_packed_f128.len() * core::mem::size_of::<F128>(),
-                )
-            };
-            let c_packed: &[u8] = unsafe {
-                std::slice::from_raw_parts(
-                    z_packed.as_ptr() as *const u8,
-                    z_packed.len() * core::mem::size_of::<F128>(),
-                )
-            };
-            zerocheck::prove_packed_padded_capture_s_hat_v_c_with_precomputed_ab(
-                a_packed, b_packed, c_packed, r1cs.m, &padding, ab_inner, challenger,
-            )
-        };
-        if phase_timing {
-            let wall = t_zc.elapsed().as_secs_f64() * 1e3;
-            let cpu = process_cpu_ms() - cpu_zc0.unwrap_or(0.0);
-            eprintln!(
-                "[phase-timing] zerocheck: {wall:.2} ms cpu={cpu:.1} util={:.1}",
-                cpu / wall
-            );
-        }
-        (commitment, prover_data, zc_proof, zc_claim, s_hat_v_c)
+        (commitment, prover_data, ab_inner)
     };
 
-    let (pre_lincheck, z_packed_lincheck) = match z_packed_lincheck {
-        LincheckStripeInput::Ready(stripe) => (run_commit_and_zerocheck(), stripe),
+    // Publish the stripe before zerocheck: the ranked identity-C producer now
+    // consumes it immediately after the commitment challenge is available.
+    // Deferred fill is shorter than commit+AB at the target shape, so moving
+    // this join earlier adds no measured tail while eliminating C's 32-bank
+    // row-major drain.
+    let (pre_zerocheck, z_packed_lincheck) = match z_packed_lincheck {
+        LincheckStripeInput::Ready(stripe) => (run_commit(), stripe),
         LincheckStripeInput::DeferredRanked => {
             assert_eq!(r1cs.m, 32);
             assert_eq!(r1cs.k_log, 14);
@@ -906,7 +891,7 @@ fn prove_fast_core_with_commit_codeword<Ch: Challenger>(
                         );
                     }
                 });
-                let pre = run_commit_and_zerocheck();
+                let pre = run_commit();
                 let join_started = std::time::Instant::now();
                 stripe_job
                     .join()
@@ -922,7 +907,56 @@ fn prove_fast_core_with_commit_codeword<Ch: Challenger>(
             (pre, stripe)
         }
     };
-    let (commitment, prover_data, zc_proof, zc_claim, s_hat_v_c) = pre_lincheck;
+    let (commitment, prover_data, ab_inner) = pre_zerocheck;
+    bind_statement(challenger, r1cs, &commitment);
+    let cpu_zc0 = phase_timing.then(process_cpu_ms);
+    let t_zc = std::time::Instant::now();
+
+    let (zc_proof, zc_claim, s_hat_v_c) = {
+        // Zero-cost &[u8] views of the F128 buffers; c aliases z (C = I).
+        let a_packed: &[u8] = unsafe {
+            std::slice::from_raw_parts(
+                a_packed_f128.as_ptr() as *const u8,
+                a_packed_f128.len() * core::mem::size_of::<F128>(),
+            )
+        };
+        let b_packed: &[u8] = unsafe {
+            std::slice::from_raw_parts(
+                b_packed_f128.as_ptr() as *const u8,
+                b_packed_f128.len() * core::mem::size_of::<F128>(),
+            )
+        };
+        let c_packed: &[u8] = unsafe {
+            std::slice::from_raw_parts(
+                z_packed.as_ptr() as *const u8,
+                z_packed.len() * core::mem::size_of::<F128>(),
+            )
+        };
+        if ranked_lincheck_c_reuse_enabled(r1cs) {
+            zerocheck::prove_packed_padded_capture_s_hat_v_c_with_precomputed_ab_and_lincheck_c(
+                a_packed,
+                b_packed,
+                c_packed,
+                &z_packed_lincheck,
+                r1cs.m,
+                &padding,
+                ab_inner,
+                challenger,
+            )
+        } else {
+            zerocheck::prove_packed_padded_capture_s_hat_v_c_with_precomputed_ab(
+                a_packed, b_packed, c_packed, r1cs.m, &padding, ab_inner, challenger,
+            )
+        }
+    };
+    if phase_timing {
+        let wall = t_zc.elapsed().as_secs_f64() * 1e3;
+        let cpu = process_cpu_ms() - cpu_zc0.unwrap_or(0.0);
+        eprintln!(
+            "[phase-timing] zerocheck: {wall:.2} ms cpu={cpu:.1} util={:.1}",
+            cpu / wall
+        );
+    }
     // Nothing downstream reads a/b (zerocheck consumed them in rounds 1–2);
     // recycle the two buffers (2 × 2^(m-3) bytes — 128 MB at m = 29) instead
     // of carrying them through lincheck and the PCS open.

@@ -1323,6 +1323,125 @@ fn process_one_x_hi_with_precomputed_ab_fold4_ab(
     }
 }
 
+/// Challenge-weighted AB completion for the retained-coordinate ranked path,
+/// without the independent C drain.  The legacy wire AB message is unchanged;
+/// callers that can derive C from another honest representation use this to
+/// avoid touching the 32-bank Fold4 C accumulator.
+pub(crate) fn round1_shift_reduce_ab_packed_padded_with_precomputed(
+    ab_inner: &Round1AbInner,
+    m: usize,
+    k_skip: usize,
+    r: &[F128],
+    padding: &PaddingSpec,
+) -> Vec<F128> {
+    assert_eq!(k_skip, K_SKIP, "optimized variant is k_skip=6 only");
+    let total_bytes = (1usize << m) / 8;
+    assert_eq!(ab_inner.len_bytes(), total_bytes);
+    assert_eq!(r.len(), m);
+
+    let fold4_n_hi = fold4_n_hi_from_env();
+    let eq = SplitEqGhash::with_n_hi(&r[k_skip + N_INNER..], fold4_n_hi);
+    let big_lo_size = 1usize << eq.n_lo;
+    let hi_size = 1usize << eq.n_hi;
+    let n_lo_and_inner = eq.n_lo + N_INNER;
+    let eq_lo_scaled: Vec<F128> = eq.lo.iter().map(|v| *v * d_inv()).collect();
+    let convert = convert_table();
+    let (within_outer_mask, b_med_counts) = build_b_med_counts(padding);
+    let ab_inner_bytes = ab_inner.as_bytes();
+
+    let mut partials = vec![[F128::ZERO; ELL]; hi_size];
+    let partials_base = crate::epool::SyncPtr(partials.as_mut_ptr());
+    crate::epool::run_hetero_chunks(hi_size, |x_hi| {
+        let mut partial = [F128::ZERO; ELL];
+        process_one_x_hi_with_precomputed_ab_fold4_ab(
+            x_hi,
+            big_lo_size,
+            n_lo_and_inner,
+            within_outer_mask,
+            &b_med_counts,
+            ab_inner_bytes,
+            &eq_lo_scaled,
+            eq.hi[x_hi],
+            convert,
+            None,
+            &mut partial,
+        );
+        // SAFETY: each queue index owns one disjoint output slot and the
+        // synchronous queue join publishes all writes before reduction.
+        unsafe { *partials_base.ptr().add(x_hi) = partial };
+    });
+
+    partials
+        .into_iter()
+        .fold([F128::ZERO; ELL], |mut left, right| {
+            for lane in 0..ELL {
+                left[lane] += right[lane];
+            }
+            left
+        })
+        .to_vec()
+}
+
+/// Derive the exact legacy C round-one message and its existing RingSwitch
+/// helper tensors from the lincheck stripe.  The stripe represents identity C
+/// (`Cz = z`) in an outer-fold-friendly layout.  Folding it at the original
+/// zerocheck `r_outer` yields a tiny length-`2^k_log` inner table; retaining
+/// four inner coordinates from that table is algebraically identical to the
+/// row-major 32-bank Fold4 drain.
+pub(crate) fn round1_c_fold4_from_lincheck_stripe(
+    c_lincheck: &[u8],
+    m: usize,
+    k_log: usize,
+    k_skip: usize,
+    useful_bits: usize,
+    r: &[F128],
+    inv_table: &InvNttTableByteSingleGf8,
+) -> (Vec<F128>, Vec<F128>, Vec<F128>, Vec<F128>) {
+    assert_eq!(k_skip, K_SKIP);
+    assert!(
+        k_log >= k_skip + 5,
+        "Fold4 needs four retained tail coordinates"
+    );
+    assert_eq!(r.len(), m);
+    assert_eq!(c_lincheck.len(), (1usize << m) / 8);
+
+    let eq_outer = crate::lincheck::build_eq_table(&r[k_log..]);
+    let c_inner =
+        crate::lincheck::partial_fold_packed_z_best(c_lincheck, m, k_log, useful_bits, &eq_outer);
+    let inner_tail = &r[k_skip + 1..k_log];
+    let fold4 = crate::pcs::ring_switch::s_hat_v_fold4_from_z_vec(&c_inner, inner_tail);
+    let s_hat_v_c = crate::pcs::ring_switch::collapse_s_hat_v_fold4(&fold4, &inner_tail[..4]);
+
+    // Fold only retained coordinates 2 and 3 to recover the incumbent
+    // four-bank tensor (coordinates 0 and 1 remain bank selectors).
+    let retained_hi_eq = build_eq(&inner_tail[2..4]);
+    let n_packed = 1usize << crate::pcs::LOG_PACKING;
+    let mut quad = vec![F128::ZERO; 4 * n_packed];
+    for q in 0..4 {
+        for e in 0..4 {
+            let src = (e + 4 * q) * n_packed;
+            let dst = e * n_packed;
+            for packed in 0..n_packed {
+                quad[dst + packed] += retained_hi_eq[q] * fold4[src + packed];
+            }
+        }
+    }
+
+    // RingSwitch leaves global bit k_skip as its 128-way prefix. Fold that
+    // bit at the original C point to recover C's 64 S-domain evaluations.
+    // The optimized round-one convention omits C_s; the common caller restores
+    // it before placing the message on the transcript.
+    let prefix = r[k_skip];
+    let mut res_c_s = [F128::ZERO; ELL];
+    let c_s_inv = c_s_f128().inv();
+    for lane in 0..ELL {
+        let naive = (F128::ONE + prefix) * s_hat_v_c[lane] + prefix * s_hat_v_c[ELL + lane];
+        res_c_s[lane] = c_s_inv * naive;
+    }
+    let round1_c_opt = ntt_extend_f128_vec_ghash(&res_c_s, inv_table);
+    (round1_c_opt, s_hat_v_c, quad, fold4)
+}
+
 /// Pair-fused C job with the original 32-bank accumulator and one job per
 /// `x_hi`. This isolates the benefit of halving field-table/state updates
 /// from the q-local scheduling experiment below.
@@ -4133,6 +4252,96 @@ mod tests {
                     "partial_c bank {s} mismatch at n_b_med={n_b_med}"
                 );
             }
+        }
+    }
+
+    /// The ranked identity-C shortcut must reproduce every value emitted by
+    /// the incumbent 32-bank C producer.  Build the alternate lincheck stripe
+    /// from the same packed witness, then compare AB, the round-one C wire
+    /// contribution, and all three captured RingSwitch tensors independently.
+    #[test]
+    fn lincheck_stripe_c_fold4_matches_incumbent() {
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(2)
+            .stack_size(16 << 20)
+            .build()
+            .unwrap();
+        pool.install(lincheck_stripe_c_fold4_matches_incumbent_inner);
+    }
+
+    fn lincheck_stripe_c_fold4_matches_incumbent_inner() {
+        const M: usize = 17;
+        const K_LOG: usize = 14;
+        let cases = [
+            PaddingSpec {
+                k_log: K_LOG,
+                useful_bits_per_block: 1 << K_LOG,
+            },
+            PaddingSpec {
+                k_log: K_LOG,
+                useful_bits_per_block: 15_409,
+            },
+        ];
+
+        for (case, padding) in cases.into_iter().enumerate() {
+            let mut rng = Rng::new(0xC57A_1F00_u64.wrapping_add(case as u64));
+            let total_bits = 1usize << M;
+            let mut a = rng.bits(total_bits);
+            let mut b = rng.bits(total_bits);
+            let mut c = rng.bits(total_bits);
+            if padding.useful_bits_per_block < (1usize << K_LOG) {
+                for block in 0..(total_bits >> K_LOG) {
+                    for bit in padding.useful_bits_per_block..(1usize << K_LOG) {
+                        let index = (block << K_LOG) + bit;
+                        a[index] = false;
+                        b[index] = false;
+                        c[index] = false;
+                    }
+                }
+            }
+
+            let a = pack_bits(&a);
+            let b = pack_bits(&b);
+            let c = pack_bits(&c);
+            let outer = rng.f128_vec(M - K_SKIP - N_INNER);
+            let r = build_protocol_r(M, &outer);
+            let inv_table = make_inv_table();
+            let ab_inner =
+                precompute_round1_ab_inner_packed_padded(&a, &b, M, K_SKIP, &inv_table, &padding);
+            let incumbent = round1_shift_reduce_extract_c_packed_padded_with_precomputed_ab_fold4(
+                &ab_inner, &c, M, K_SKIP, &r, &inv_table, &padding,
+            );
+
+            let got_ab = round1_shift_reduce_ab_packed_padded_with_precomputed(
+                &ab_inner, M, K_SKIP, &r, &padding,
+            );
+            assert_eq!(got_ab, incumbent.0, "AB mismatch in case {case}");
+
+            // `pack_bits` uses the same little-endian polynomial-basis layout
+            // as packed F128 witnesses. Materialize aligned words for the
+            // public lincheck stripe converter rather than transmuting a
+            // byte-aligned allocation.
+            let c_words: Vec<F128> = c
+                .chunks_exact(16)
+                .map(|bytes| F128 {
+                    lo: u64::from_le_bytes(bytes[..8].try_into().unwrap()),
+                    hi: u64::from_le_bytes(bytes[8..].try_into().unwrap()),
+                })
+                .collect();
+            let c_lincheck = crate::lincheck::pack_z_lincheck_from_packed(&c_words, M, K_LOG);
+            let got_c = round1_c_fold4_from_lincheck_stripe(
+                &c_lincheck,
+                M,
+                K_LOG,
+                K_SKIP,
+                padding.useful_bits_per_block,
+                &r,
+                &inv_table,
+            );
+            assert_eq!(got_c.0, incumbent.1, "round-one C mismatch in case {case}");
+            assert_eq!(got_c.1, incumbent.2, "canonical C mismatch in case {case}");
+            assert_eq!(got_c.2, incumbent.3, "quad C mismatch in case {case}");
+            assert_eq!(got_c.3, incumbent.4, "fold4 C mismatch in case {case}");
         }
     }
 }
