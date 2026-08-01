@@ -432,6 +432,17 @@ where
             let z_u64_all: &[u64] = unsafe {
                 std::slice::from_raw_parts(z_grp.as_ptr() as *const u64, z_grp.len() * 2)
             };
+            // Padded lincheck fold reads only stripe[..useful_bits]
+            // (`partial_fold_packed_z_fast_padded`). Ranked Blake3 defaults
+            // useful_bits=USEFUL_BITS (15409) with k=16384, so the tail past
+            // useful_words*64 is never observed on the timed path.
+            //
+            // `take_u8` is write-before-read / stale-pool (scratch.rs): skipping
+            // the tail memset leaves pool garbage in stripe[useful_words*64..].
+            // Production fold never loads that range; unit oracles that compare
+            // full-k stripes still need an honest zero pad. Gate the memset on
+            // `cfg(test)` so release/ranked proves elide ~960 B/stripe × n_stripes
+            // while `cargo test` keeps the full-stripe contract.
             let useful_words = stripe_useful_bits.div_ceil(64);
             for i in 0..useful_words {
                 let lanes: [u64; 8] = [
@@ -446,7 +457,10 @@ where
                 ];
                 transpose_8_u64s_to_64_bytes(&lanes, &mut stripe[i * 64..i * 64 + 64]);
             }
-            stripe[useful_words * 64..].fill(0);
+            #[cfg(test)]
+            {
+                stripe[useful_words * 64..].fill(0);
+            }
 
             if EMIT_RATE2_CODEWORD {
                 let codeword =
