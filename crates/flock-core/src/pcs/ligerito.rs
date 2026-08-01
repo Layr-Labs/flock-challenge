@@ -3562,6 +3562,75 @@ fn materialize_direct_ab_fold2_with_helper(
     )
 }
 
+#[inline(always)]
+fn direct_fold4_fold16_scalar(
+    input: &[F128],
+    slot: usize,
+    fold_weight: &[F128; 16],
+) -> F128 {
+    let base = 16 * slot;
+    let mut value = F128::ZERO;
+    for bank in 0..16 {
+        value += fold_weight[bank] * input[base + bank];
+    }
+    value
+}
+
+/// Fold two adjacent witness slots with independent accumulators while sharing
+/// each bank's constant. The existing vec2 kernel uses six PMULL instructions
+/// for both exact products instead of the scalar path's six per product.
+#[cfg(all(target_os = "macos", target_arch = "aarch64", target_feature = "aes"))]
+#[inline(always)]
+fn direct_fold4_fold16_pair_neon(
+    input: &[F128],
+    slot: usize,
+    fold_weight: &[F128; 16],
+) -> [F128; 2] {
+    debug_assert!(16 * (slot + 2) <= input.len());
+    let base = 16 * slot;
+    let mut first = F128::ZERO;
+    let mut second = F128::ZERO;
+    for bank in 0..16 {
+        // SAFETY: this function is compiled only when AES/PMULL is statically
+        // enabled, and both adjacent 16-element slots are bounds-checked by
+        // the caller's block geometry.
+        let product = unsafe {
+            crate::field::gf2_128::aarch64::ghash_mul_const_vec2_neon(
+                fold_weight[bank],
+                [input[base + bank], input[base + 16 + bank]],
+            )
+        };
+        first += product[0];
+        second += product[1];
+    }
+    [first, second]
+}
+
+#[inline]
+fn direct_fold4_fold16_vec2_eligible(
+    has_ordinary: bool,
+    claim_count: usize,
+    block_len: usize,
+) -> bool {
+    cfg!(all(target_os = "macos", target_arch = "aarch64", target_feature = "aes"))
+        && !has_ordinary
+        && claim_count == 2
+        && block_len.is_multiple_of(2)
+}
+
+#[inline]
+fn direct_fold4_fold16_vec2_enabled(
+    has_ordinary: bool,
+    claim_count: usize,
+    block_len: usize,
+) -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    direct_fold4_fold16_vec2_eligible(has_ordinary, claim_count, block_len)
+        && *ON.get_or_init(|| {
+            std::env::var_os("FLOCK_NO_LIG_DIRECT_FOLD4_FOLD16_VEC2").is_none()
+        })
+}
+
 /// Correctness-first sixteen-bank materializer. Four challenges are sampled
 /// from direct product statistics before this function binds the witness and
 /// combined basis in one N→N/16 pass. It emits only the ordinary message M4
@@ -3572,6 +3641,30 @@ fn materialize_direct_fold4(
     ordinary_basis: Vec<F128>,
     claims: &[super::ring_switch::DirectFold4Factors],
     challenges: [F128; 4],
+) -> (Vec<F128>, Vec<F128>, SumcheckMessage, [F128; 6]) {
+    let has_ordinary = !ordinary_basis.is_empty();
+    let block_len = claims
+        .first()
+        .expect("direct-fold4 requires at least one claim")
+        .eq_lo
+        .len();
+    let use_fold16_vec2 =
+        direct_fold4_fold16_vec2_enabled(has_ordinary, claims.len(), block_len);
+    materialize_direct_fold4_with_fold16_policy(
+        packed_witness,
+        ordinary_basis,
+        claims,
+        challenges,
+        use_fold16_vec2,
+    )
+}
+
+fn materialize_direct_fold4_with_fold16_policy(
+    packed_witness: Vec<F128>,
+    ordinary_basis: Vec<F128>,
+    claims: &[super::ring_switch::DirectFold4Factors],
+    challenges: [F128; 4],
+    use_fold16_vec2: bool,
 ) -> (Vec<F128>, Vec<F128>, SumcheckMessage, [F128; 6]) {
     use rayon::prelude::*;
 
@@ -3609,6 +3702,11 @@ fn materialize_direct_fold4(
     assert!(claims.iter().all(|claim| {
         claim.eq_lo.len() == block_len && claim.eq_hi.len() * block_len == out_len
     }));
+    assert!(
+        !use_fold16_vec2
+            || direct_fold4_fold16_vec2_eligible(has_ordinary, claims.len(), block_len),
+        "fold16 vec2 policy requires the exact default DirectFold4 shape"
+    );
 
     type FoldStats = ((F128, F128), [F128; 6]);
     let empty_stats = || ((F128::ZERO, F128::ZERO), [F128::ZERO; 6]);
@@ -3635,14 +3733,6 @@ fn materialize_direct_fold4(
                 } else {
                     &[]
                 };
-                let fold16 = |input: &[F128], slot: usize| {
-                    let base = 16 * slot;
-                    let mut value = F128::ZERO;
-                    for bank in 0..16 {
-                        value += fold_weight[bank] * input[base + bank];
-                    }
-                    value
-                };
 
                 let (first_claim, rest_claims) = claims.split_first().unwrap();
                 let (first_table, rest_tables) = direct_tables.split_first().unwrap();
@@ -3651,15 +3741,49 @@ fn materialize_direct_fold4(
                     first_table,
                     scratch,
                 );
-                for slot in 0..block_len {
-                    f_out[slot] = fold16(f_in, slot);
-                    let direct =
-                        super::ring_switch::fold_one_slot(first_claim.eq_lo[slot], scratch);
-                    b_out[slot] = if has_ordinary {
-                        direct + fold16(b_in, slot)
-                    } else {
-                        direct
-                    };
+                if use_fold16_vec2 {
+                    #[cfg(all(
+                        target_os = "macos",
+                        target_arch = "aarch64",
+                        target_feature = "aes"
+                    ))]
+                    for slot in (0..block_len).step_by(2) {
+                        let folded =
+                            direct_fold4_fold16_pair_neon(f_in, slot, &fold_weight);
+                        f_out[slot] = folded[0];
+                        f_out[slot + 1] = folded[1];
+                        b_out[slot] = super::ring_switch::fold_one_slot(
+                            first_claim.eq_lo[slot],
+                            scratch,
+                        );
+                        b_out[slot + 1] = super::ring_switch::fold_one_slot(
+                            first_claim.eq_lo[slot + 1],
+                            scratch,
+                        );
+                    }
+                    #[cfg(not(all(
+                        target_os = "macos",
+                        target_arch = "aarch64",
+                        target_feature = "aes"
+                    )))]
+                    unreachable!("fold16 vec2 selector is false on this target");
+                } else {
+                    for slot in 0..block_len {
+                        f_out[slot] =
+                            direct_fold4_fold16_scalar(f_in, slot, &fold_weight);
+                        let direct =
+                            super::ring_switch::fold_one_slot(first_claim.eq_lo[slot], scratch);
+                        b_out[slot] = if has_ordinary {
+                            direct
+                                + direct_fold4_fold16_scalar(
+                                    b_in,
+                                    slot,
+                                    &fold_weight,
+                                )
+                        } else {
+                            direct
+                        };
+                    }
                 }
                 for (claim, table) in rest_claims.iter().zip(rest_tables.iter()) {
                     super::ring_switch::compose_fold_byte_table_into(
@@ -8696,40 +8820,54 @@ mod tests {
         let poly: Vec<F128> = (0..(1usize << log_n))
             .map(|_| rng.sample_f128())
             .collect();
-        let suffix: Vec<F128> = (0..log_n).map(|_| rng.sample_f128()).collect();
-        let scaled_rdp: Vec<F128> = build_eq_table(
-            &(0..crate::pcs::LOG_PACKING)
-                .map(|_| rng.sample_f128())
-                .collect::<Vec<_>>(),
-        );
-        let combined_basis = super::super::ring_switch::fold_b128_elems(
-            &build_eq_table(&suffix),
-            &scaled_rdp,
-        );
+        let mut make_claim = || {
+            let suffix: Vec<F128> = (0..log_n).map(|_| rng.sample_f128()).collect();
+            let scaled_rdp: Vec<F128> = build_eq_table(
+                &(0..crate::pcs::LOG_PACKING)
+                    .map(|_| rng.sample_f128())
+                    .collect::<Vec<_>>(),
+            );
+            let basis = super::super::ring_switch::fold_b128_elems(
+                &build_eq_table(&suffix),
+                &scaled_rdp,
+            );
+            let mut products = [F128::ZERO; 256];
+            for high in 0..poly.len() / 16 {
+                for e in 0..16 {
+                    for d in 0..16 {
+                        products[16 * e + d] +=
+                            poly[16 * high + e] * basis[16 * high + d];
+                    }
+                }
+            }
+            let (eq_lo, eq_hi) = super::super::ring_switch::build_eq_split(
+                &suffix[4..],
+                (log_n - 4) / 2,
+            );
+            (
+                basis,
+                super::super::ring_switch::DirectFold4Factors {
+                    eq_lo,
+                    eq_hi,
+                    low_eq: build_eq_table(&suffix[..4]).try_into().unwrap(),
+                    table: super::super::ring_switch::build_fold_byte_table(&scaled_rdp),
+                    products,
+                },
+            )
+        };
+        let (first_basis, first_claim) = make_claim();
+        let (second_basis, second_claim) = make_claim();
+        let combined_basis: Vec<F128> = first_basis
+            .into_iter()
+            .zip(second_basis)
+            .map(|(first, second)| first + second)
+            .collect();
+        let direct = vec![first_claim, second_claim];
         let target = poly
             .iter()
             .zip(combined_basis.iter())
             .map(|(&f, &b)| f * b)
             .fold(F128::ZERO, |acc, value| acc + value);
-
-        let mut products = [F128::ZERO; 256];
-        for high in 0..poly.len() / 16 {
-            for e in 0..16 {
-                for d in 0..16 {
-                    products[16 * e + d] +=
-                        poly[16 * high + e] * combined_basis[16 * high + d];
-                }
-            }
-        }
-        let (eq_lo, eq_hi) =
-            super::super::ring_switch::build_eq_split(&suffix[4..], (log_n - 4) / 2);
-        let direct = vec![super::super::ring_switch::DirectFold4Factors {
-            eq_lo,
-            eq_hi,
-            low_eq: build_eq_table(&suffix[..4]).try_into().unwrap(),
-            table: super::super::ring_switch::build_fold_byte_table(&scaled_rdp),
-            products,
-        }];
         let (round0, round1, round2, round3) =
             super::super::messages_from_direct_products_fold4(&direct);
 
