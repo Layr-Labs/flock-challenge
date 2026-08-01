@@ -28,7 +28,7 @@ pub mod tensor_algebra;
 
 pub use commit::{
     Commitment, PcsParams, ProverData, commit, commit_into, commit_preinitialized,
-    prefault_codeword_during, use_ranked_from_message_commit,
+    prefault_codeword_during,
 };
 pub use pack::{LOG_PACKING, pack_witness, unpack_witness};
 pub use ring_switch::{RingSwitchProof, SparseEqTensor};
@@ -149,7 +149,7 @@ pub fn open_batch_mixed_ligerito_with_precomputed_s_hat_v<Ch: Challenger>(
             direct,
             combined.target_combined,
             &prover_data.codeword,
-            &*prover_data.merkle_tree,
+            &prover_data.merkle_tree,
             combined.round0_prime,
             combined
                 .round1_lookahead
@@ -163,7 +163,7 @@ pub fn open_batch_mixed_ligerito_with_precomputed_s_hat_v<Ch: Challenger>(
             combined.b_combined,
             combined.target_combined,
             &prover_data.codeword,
-            &*prover_data.merkle_tree,
+            &prover_data.merkle_tree,
             combined.round0_prime,
             combined.round1_lookahead,
             challenger,
@@ -198,9 +198,7 @@ struct CombinedClaim {
     /// only for the exact ranked two-challenge cadence.
     round1_lookahead: Option<[F128; 6]>,
     /// AB sufficient statistics for direct materialization after rounds 0/1.
-    /// `b_combined` still contains every ordinary claim (currently C) —
-    /// unless deferred-C is active, in which case C rides along here as a
-    /// second claim (products zeroed) and `b_combined` is empty.
+    /// `b_combined` still contains every ordinary claim (currently C).
     direct_fold2: Option<Vec<ring_switch::DirectFold2Factors>>,
 }
 
@@ -208,52 +206,9 @@ struct CombinedClaim {
 /// quadratics in the first challenge. The latter lets the ranked prover sample
 /// its second challenge before binding the first, so both binds share one pass.
 #[inline]
-fn use_ranked_open_lookahead_neon(ranked_shape: bool, len: usize) -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    cfg!(all(
-        target_os = "macos",
-        target_arch = "aarch64",
-        target_feature = "aes"
-    )) && ranked_shape
-        && len == (1usize << 15)
-        && *ON.get_or_init(|| std::env::var_os("FLOCK_NO_OPEN_LOOKAHEAD_NEON").is_none())
-}
-
-#[inline]
-#[cfg(test)]
 fn round0_and_round1_lookahead(witness: &[F128], basis: &[F128]) -> ((F128, F128), [F128; 6]) {
     assert_eq!(witness.len(), basis.len());
     assert!(witness.len().is_multiple_of(4));
-
-    round0_and_round1_lookahead_scalar(witness, basis)
-}
-
-/// Ranked-shape dispatcher for the deferred-reduction AArch64 kernel. Keeping
-/// the generic helper scalar makes promotion an explicit property of the two
-/// benchmark geometry call sites rather than an accidental property of a
-/// local 2^15-slot slice.
-#[inline]
-fn round0_and_round1_lookahead_ranked(
-    witness: &[F128],
-    basis: &[F128],
-    ranked_shape: bool,
-) -> ((F128, F128), [F128; 6]) {
-    assert_eq!(witness.len(), basis.len());
-    assert!(witness.len().is_multiple_of(4));
-
-    #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
-    if use_ranked_open_lookahead_neon(ranked_shape, witness.len()) {
-        return crate::field::f128_slice::round0_and_round1_lookahead(witness, basis);
-    }
-
-    round0_and_round1_lookahead_scalar(witness, basis)
-}
-
-#[inline]
-fn round0_and_round1_lookahead_scalar(
-    witness: &[F128],
-    basis: &[F128],
-) -> ((F128, F128), [F128; 6]) {
     let mut u0 = F128::ZERO;
     let mut u2 = F128::ZERO;
     let mut c = [F128::ZERO; 6];
@@ -338,21 +293,6 @@ fn is_ranked_hetero_open_combine_shape(l: usize, b: usize, n_rs: usize, n_pd: us
     l == (1usize << 25) && b == (1usize << 15) && n_rs == 2 && n_pd == 0
 }
 
-/// Exact ranked direct-fold2 materialization shapes. The first arm is the
-/// frontier AB claim plus ordinary C basis; the second is deferred C encoded
-/// as a second direct claim with no materialized ordinary basis.
-#[inline]
-fn is_ranked_direct_fold2_lookahead_shape(
-    packed_len: usize,
-    block_len: usize,
-    claim_count: usize,
-    has_ordinary: bool,
-) -> bool {
-    packed_len == (1usize << 25)
-        && block_len == (1usize << 15)
-        && ((claim_count == 1 && has_ordinary) || (claim_count == 2 && !has_ordinary))
-}
-
 #[inline]
 fn use_ranked_hetero_open_combine(l: usize, b: usize, n_rs: usize, n_pd: usize) -> bool {
     cfg!(all(target_os = "macos", target_arch = "aarch64"))
@@ -430,50 +370,6 @@ where
                 .write(fold_block(state, block, out_block));
         }
     });
-    partials.into_iter().fold(
-        (F128::ZERO, F128::ZERO, [F128::ZERO; 6]),
-        |(x0, x2, mut xc), (y0, y2, yc)| {
-            for (x, y) in xc.iter_mut().zip(yc) {
-                *x += y;
-            }
-            (x0 + y0, x2 + y2, xc)
-        },
-    )
-}
-
-/// Deferred-C sibling of [`run_hetero_open_combine_blocks_lookahead`]: no
-/// L-sized output — each worker owns a private block-sized scratch buffer
-/// that `fold_block` fully rewrites for every block it claims. Identical
-/// per-block value sequence and block-indexed reduction, so the returned
-/// prime + lookahead are bit-identical to the materializing variant.
-fn run_hetero_open_combine_scratch_lookahead<S, I, F>(
-    n_blocks: usize,
-    block_len: usize,
-    init: I,
-    fold_block: F,
-) -> (F128, F128, [F128; 6])
-where
-    I: Fn() -> S + Sync,
-    F: Fn(&mut S, usize, &mut [F128]) -> (F128, F128, [F128; 6]) + Sync,
-{
-    assert!(block_len > 0 && n_blocks > 0);
-    let mut partials = vec![(F128::ZERO, F128::ZERO, [F128::ZERO; 6]); n_blocks];
-    let partials_base = crate::epool::SyncPtr(partials.as_mut_ptr());
-    crate::epool::run_hetero_chunks_stateful(
-        n_blocks,
-        || (init(), vec![F128::ZERO; block_len]),
-        |(state, scratch), block| {
-            // SAFETY: queue index `block` is claimed exactly once; it owns
-            // one partial slot until the synchronous two-pool join. The
-            // scratch buffer is worker-private.
-            unsafe {
-                partials_base
-                    .ptr()
-                    .add(block)
-                    .write(fold_block(state, block, scratch));
-            }
-        },
-    );
     partials.into_iter().fold(
         (F128::ZERO, F128::ZERO, [F128::ZERO; 6]),
         |(x0, x2, mut xc), (y0, y2, yc)| {
@@ -586,7 +482,7 @@ fn compute_combined_basis_and_target<Ch: Challenger>(
         && n_pd == 0
         && std::env::var_os("FLOCK_NO_OPEN_DIRECT_AB").is_none()
         && direct_ab_claim_mix_supported(&rs_results);
-    let mut direct_fold2 = if use_direct_ab {
+    let direct_fold2 = if use_direct_ab {
         Some(vec![
             rs_results[0]
                 .1
@@ -598,15 +494,6 @@ fn compute_combined_basis_and_target<Ch: Challenger>(
         None
     };
     let direct_count = if direct_fold2.is_some() { 1 } else { 0 };
-    // Deferred-C candidate: taken here, before `rs_baked`/`rs_deferred`
-    // borrow `rs_results`; confirmed below once the ranked sweep shape is
-    // known (dropped — incumbent path — otherwise).
-    let mut deferred_c_candidate =
-        if use_direct_ab && std::env::var_os("FLOCK_NO_OPEN_DEFERRED_C").is_none() {
-            rs_results[1].1.deferred_c_fold2.take()
-        } else {
-            None
-        };
 
     let rs_baked: Vec<&[F128]> = rs_results
         .iter()
@@ -656,6 +543,13 @@ fn compute_combined_basis_and_target<Ch: Challenger>(
         })
         .collect();
 
+    // ---- Build b_combined (γ-weighted sum of all rs_eq_ind + eq_ind) and the
+    //      round-0 prime (u_0, u_2 over packed_witness · b_combined).
+    let t_alloc = std::time::Instant::now();
+    let mut b_combined: Vec<F128> = crate::scratch::take_f128(l);
+    let alloc_ms = t_alloc.elapsed().as_secs_f64() * 1e3;
+    let t_fold = std::time::Instant::now();
+
     // Fast path (compression-proof open: claims ab, c; also chain/merkle): every
     // RS claim is a fused DeferredDense fold and no DENSE packed-direct claim
     // needs the per-element combine. Fold all claims block-by-block straight into
@@ -674,33 +568,6 @@ fn compute_combined_basis_and_target<Ch: Challenger>(
         && pd_dense.is_empty();
 
     let want_round1_lookahead = use_fast && enable_fold2;
-
-    // Deferred-C: on the ranked direct-AB shape, when C also carries its
-    // factor bundle, `b_combined` is never materialized — the combine sweep
-    // below writes per-worker scratch blocks (same per-block value sequence,
-    // same block-indexed reduction, so the prime + lookahead come out
-    // bit-identical) and C joins AB as a second direct claim at materialize
-    // time. `FLOCK_NO_OPEN_DEFERRED_C=1` restores the incumbent path.
-    let deferred_c = if want_round1_lookahead
-        && use_ranked_hetero_open_combine(l, rs_deferred[0].0.len(), n_rs, n_pd)
-    {
-        deferred_c_candidate.take()
-    } else {
-        None
-    };
-
-    let use_deferred_c = deferred_c.is_some();
-
-    // ---- Build b_combined (γ-weighted sum of all rs_eq_ind + eq_ind) and the
-    //      round-0 prime (u_0, u_2 over packed_witness · b_combined).
-    let t_alloc = std::time::Instant::now();
-    let mut b_combined: Vec<F128> = if use_deferred_c {
-        Vec::new()
-    } else {
-        crate::scratch::take_f128(l)
-    };
-    let alloc_ms = t_alloc.elapsed().as_secs_f64() * 1e3;
-    let t_fold = std::time::Instant::now();
     let (mut round0_u0, mut round0_u2, round1_lookahead) = if use_fast {
         let b = rs_deferred[0].0.len(); // eq_lo.len(); shared across claims (same split)
         debug_assert!(b >= 2 && b.is_multiple_of(2));
@@ -766,17 +633,12 @@ fn compute_combined_basis_and_target<Ch: Challenger>(
             }
             (u0, u2)
         };
-        let ranked_lookahead_neon = enable_fold2
-            && is_ranked_hetero_open_combine_shape(l, b, n_rs, n_pd);
         let fold_lookahead_block = |ctable: &mut Vec<F128>, hi: usize, out_block: &mut [F128]| {
             fill_block(ctable, hi, out_block);
             let base = hi * b;
             debug_assert!(b.is_multiple_of(4));
-            let ((u0, u2), lookahead) = round0_and_round1_lookahead_ranked(
-                &packed_witness[base..base + b],
-                out_block,
-                ranked_lookahead_neon,
-            );
+            let ((u0, u2), lookahead) =
+                round0_and_round1_lookahead(&packed_witness[base..base + b], out_block);
             (u0, u2, lookahead)
         };
         let init_ctable = || {
@@ -789,11 +651,7 @@ fn compute_combined_basis_and_target<Ch: Challenger>(
 
         let ranked_hetero = use_ranked_hetero_open_combine(l, b, n_rs, n_pd);
         if want_round1_lookahead {
-            let fast = if deferred_c.is_some() {
-                run_hetero_open_combine_scratch_lookahead(l / b, b, init_ctable, |ctable, hi, out_block| {
-                    fold_lookahead_block(ctable, hi, out_block)
-                })
-            } else if ranked_hetero {
+            let fast = if ranked_hetero {
                 run_hetero_open_combine_blocks_lookahead(
                     &mut b_combined,
                     b,
@@ -901,15 +759,6 @@ fn compute_combined_basis_and_target<Ch: Challenger>(
             *out += value;
         }
     }
-    if let Some(c) = deferred_c {
-        // C's round-0/1 contribution already came from the sweep above; its
-        // `products` are zeroed by construction, so it joins only the
-        // materialize-time claims.
-        direct_fold2
-            .as_mut()
-            .expect("deferred-C requires the direct AB bundle")
-            .push(c);
-    }
     let fold_ms = t_fold.elapsed().as_secs_f64() * 1e3;
     let t_sparse = std::time::Instant::now();
     let mut adjust_prime_for_delta = |idx: usize, delta: F128| {
@@ -945,12 +794,11 @@ fn compute_combined_basis_and_target<Ch: Challenger>(
     }
     if trace {
         eprintln!(
-            "  [open_batch] combine rs_eq_ind (L={}, rs×{}, pd×{}, fast={}, deferred_c={}): alloc {:6.2} ms, fold+prime {:6.2} ms, sparse {:6.2} ms, total {:6.2} ms",
+            "  [open_batch] combine rs_eq_ind (L={}, rs×{}, pd×{}, fast={}): alloc {:6.2} ms, fold+prime {:6.2} ms, sparse {:6.2} ms, total {:6.2} ms",
             l,
             n_rs,
             n_pd,
             use_fast,
-            use_deferred_c,
             alloc_ms,
             fold_ms,
             t_sparse.elapsed().as_secs_f64() * 1e3,
@@ -1284,7 +1132,6 @@ mod tests {
                     },
                     sumcheck_claim: F128::ZERO,
                     direct_fold2: Some(direct()),
-                    deferred_c_fold2: None,
                 },
             ),
             (
@@ -1296,7 +1143,6 @@ mod tests {
                     },
                     sumcheck_claim: F128::ZERO,
                     direct_fold2: None,
-                    deferred_c_fold2: None,
                 },
             ),
         ];
@@ -1317,7 +1163,6 @@ mod tests {
                     },
                     sumcheck_claim: F128::ZERO,
                     direct_fold2: Some(direct()),
-                    deferred_c_fold2: None,
                 },
             ),
             (
@@ -1330,7 +1175,6 @@ mod tests {
                     },
                     sumcheck_claim: F128::ZERO,
                     direct_fold2: None,
-                    deferred_c_fold2: None,
                 },
             ),
         ];
@@ -1422,74 +1266,6 @@ mod tests {
             assert_eq!(evaluated, oracle1, "round one at log_n={log_n}");
         }
     }
-
-    #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
-    #[test]
-    fn ranked_open_lookahead_neon_matches_scalar() {
-        let mut rng = Rng::new(0x10CA_AEAD);
-        for log_n in [2usize, 5, 9, 15] {
-            let n = 1usize << log_n;
-            let witness: Vec<F128> = (0..n).map(|_| rng.f128()).collect();
-            let basis: Vec<F128> = (0..n).map(|_| rng.f128()).collect();
-            let expected = round0_and_round1_lookahead_scalar(&witness, &basis);
-            let actual = crate::field::f128_slice::round0_and_round1_lookahead(
-                &witness,
-                &basis,
-            );
-            assert_eq!(actual, expected, "deferred reduction at log_n={log_n}");
-        }
-    }
-
-    #[test]
-    fn ranked_open_lookahead_neon_gate_is_exact() {
-        let expected = cfg!(all(
-            target_os = "macos",
-            target_arch = "aarch64",
-            target_feature = "aes"
-        )) && std::env::var_os("FLOCK_NO_OPEN_LOOKAHEAD_NEON").is_none();
-        assert_eq!(use_ranked_open_lookahead_neon(true, 1usize << 15), expected);
-        assert!(!use_ranked_open_lookahead_neon(false, 1usize << 15));
-        assert!(!use_ranked_open_lookahead_neon(true, 1usize << 14));
-        assert!(!use_ranked_open_lookahead_neon(true, 1usize << 16));
-
-        assert!(is_ranked_direct_fold2_lookahead_shape(
-            1 << 25,
-            1 << 15,
-            1,
-            true,
-        ));
-        assert!(is_ranked_direct_fold2_lookahead_shape(
-            1 << 25,
-            1 << 15,
-            2,
-            false,
-        ));
-        assert!(!is_ranked_direct_fold2_lookahead_shape(
-            1 << 24,
-            1 << 15,
-            2,
-            false,
-        ));
-        assert!(!is_ranked_direct_fold2_lookahead_shape(
-            1 << 25,
-            1 << 14,
-            2,
-            false,
-        ));
-        assert!(!is_ranked_direct_fold2_lookahead_shape(
-            1 << 25,
-            1 << 15,
-            1,
-            false,
-        ));
-        assert!(!is_ranked_direct_fold2_lookahead_shape(
-            1 << 25,
-            1 << 15,
-            2,
-            true,
-        ));
-    }
-
     #[test]
     fn direct_products_reproduce_round0_and_lookahead() {
         let mut rng = Rng::new(0xD1CE_0002);

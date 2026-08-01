@@ -112,46 +112,6 @@ pub(super) fn butterfly_fused_3layer_zero_root(values: &mut [F128; 8], twiddles:
     butterfly(values, 6, 7, twiddles[6]);
 }
 
-/// Rate-1/2 first-pass row kernel: load the radix-8 row group from `src`
-/// once, evaluate both layer-1 blocks' fused-3 butterflies — the zero-root
-/// set to `dst0`, the general set to `dst1`. Both destinations hold stale
-/// bytes on entry; every selected slot is written.
-///
-/// # Safety
-/// Row/lane geometry valid for all three pointers, disjoint row groups
-/// across concurrent calls, and `t_zero[0] == t_zero[1] == t_zero[3] == 0`.
-#[allow(clippy::too_many_arguments)]
-pub(super) unsafe fn butterfly_fused_3layer_dual_from_src_row(
-    src: *const F128,
-    dst0: *mut F128,
-    dst1: *mut F128,
-    eighth: usize,
-    num_ntts: usize,
-    r: usize,
-    t_zero: &[F128; 7],
-    t_gen: &[F128; 7],
-) {
-    // SAFETY: caller supplies the pointer geometry and disjointness contract.
-    unsafe {
-        for lane in 0..num_ntts {
-            let mut loaded = [F128::ZERO; 8];
-            for (i, value) in loaded.iter_mut().enumerate() {
-                *value = *src.add((i * eighth + r) * num_ntts + lane);
-            }
-            let mut v0 = loaded;
-            butterfly_fused_3layer_zero_root(&mut v0, t_zero);
-            for (i, value) in v0.iter().enumerate() {
-                *dst0.add((i * eighth + r) * num_ntts + lane) = *value;
-            }
-            let mut v1 = loaded;
-            butterfly_fused_3layer(&mut v1, t_gen);
-            for (i, value) in v1.iter().enumerate() {
-                *dst1.add((i * eighth + r) * num_ntts + lane) = *value;
-            }
-        }
-    }
-}
-
 /// Process one fused-three-layer row group across every interleaved lane.
 ///
 /// Eight row streams at stride `eighth * num_ntts` elements. Every such

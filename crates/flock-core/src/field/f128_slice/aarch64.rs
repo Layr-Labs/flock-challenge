@@ -141,83 +141,6 @@ unsafe fn reduce_wide(value: WideNeon) -> uint64x2_t {
     }
 }
 
-/// Accumulate the ranked opening's round-zero message and round-one
-/// lookahead without reducing every product individually.
-///
-/// The scalar expression has eight independent product sums per four input
-/// slots. Carry-less multiplication is linear over XOR, so each sum may stay
-/// in the 256-bit product domain for the full slice and be reduced once at
-/// the end. This preserves the exact field result while removing the
-/// per-product reduction/shuttle from the hot scan.
-///
-/// # Safety
-/// Requires the `aes` target feature (PMULL). `witness` and `basis` must have
-/// equal lengths divisible by four.
-#[target_feature(enable = "aes")]
-pub(super) unsafe fn round0_and_round1_lookahead(
-    witness: &[F128],
-    basis: &[F128],
-) -> ((F128, F128), [F128; 6]) {
-    unsafe {
-        debug_assert_eq!(witness.len(), basis.len());
-        debug_assert!(witness.len().is_multiple_of(4));
-
-        let zero = vdupq_n_u64(0);
-        let mut a_c0 = WideNeon { lo: zero, hi: zero };
-        let mut a_c1_endpoint = WideNeon { lo: zero, hi: zero };
-        let mut a_c2 = WideNeon { lo: zero, hi: zero };
-        let mut a_u0_second = WideNeon { lo: zero, hi: zero };
-        let mut a_u2_second = WideNeon { lo: zero, hi: zero };
-        let mut a_c3 = WideNeon { lo: zero, hi: zero };
-        let mut a_c4_endpoint = WideNeon { lo: zero, hi: zero };
-        let mut a_c5 = WideNeon { lo: zero, hi: zero };
-
-        let mut i = 0usize;
-        while i < witness.len() {
-            let a0 = vld1q_u64(witness.as_ptr().add(i).cast::<u64>());
-            let a1 = vld1q_u64(witness.as_ptr().add(i + 1).cast::<u64>());
-            let a2 = vld1q_u64(witness.as_ptr().add(i + 2).cast::<u64>());
-            let a3 = vld1q_u64(witness.as_ptr().add(i + 3).cast::<u64>());
-            let b0 = vld1q_u64(basis.as_ptr().add(i).cast::<u64>());
-            let b1 = vld1q_u64(basis.as_ptr().add(i + 1).cast::<u64>());
-            let b2 = vld1q_u64(basis.as_ptr().add(i + 2).cast::<u64>());
-            let b3 = vld1q_u64(basis.as_ptr().add(i + 3).cast::<u64>());
-
-            let sa0 = veorq_u64(a0, a1);
-            let sb0 = veorq_u64(b0, b1);
-            let sa1 = veorq_u64(a2, a3);
-            let sb1 = veorq_u64(b2, b3);
-            xor_wide(&mut a_c0, mul_unreduced(a0, b0));
-            xor_wide(&mut a_c1_endpoint, mul_unreduced(a1, b1));
-            xor_wide(&mut a_c2, mul_unreduced(sa0, sb0));
-            xor_wide(&mut a_u0_second, mul_unreduced(a2, b2));
-            xor_wide(&mut a_u2_second, mul_unreduced(sa1, sb1));
-
-            let even_a = veorq_u64(a0, a2);
-            let even_b = veorq_u64(b0, b2);
-            let odd_a = veorq_u64(a1, a3);
-            let odd_b = veorq_u64(b1, b3);
-            let sum_a = veorq_u64(even_a, odd_a);
-            let sum_b = veorq_u64(even_b, odd_b);
-            xor_wide(&mut a_c3, mul_unreduced(even_a, even_b));
-            xor_wide(&mut a_c4_endpoint, mul_unreduced(odd_a, odd_b));
-            xor_wide(&mut a_c5, mul_unreduced(sum_a, sum_b));
-            i += 4;
-        }
-
-        let red = |value: WideNeon| transmute::<uint64x2_t, F128>(reduce_wide(value));
-        let c0 = red(a_c0);
-        let c2 = red(a_c2);
-        let c3 = red(a_c3);
-        let c5 = red(a_c5);
-        let c1 = red(a_c1_endpoint) + c0 + c2;
-        let c4 = red(a_c4_endpoint) + c3 + c5;
-        let u0 = c0 + red(a_u0_second);
-        let u2 = c2 + red(a_u2_second);
-        ((u0, u2), [c0, c1, c2, c3, c4, c5])
-    }
-}
-
 /// Two-lane pair fold using NEON and PMULL.
 ///
 /// # Safety
@@ -338,25 +261,7 @@ pub(super) unsafe fn fold2_two_and_msgs(
     wb: &mut [F128],
     r_a: F128,
     r_b: F128,
-    nt_stores: bool,
 ) -> (F128, F128, [F128; 6]) {
-    // `nt_stores` is decided once per fold round by the driver (round output
-    // past LLC size ⇒ the w arrays are not read until the next fold pair's
-    // barrier ⇒ `stnp` elides write-allocate RFO reads). Per-chunk callers
-    // must not decide this from their sub-slice length. (Resample draw 2 of
-    // this re-land; mechanism unchanged — see submission note.)
-    #[inline(always)]
-    unsafe fn store_pair_nt(dst: *mut F128, x: uint64x2_t, y: uint64x2_t) {
-        unsafe {
-            core::arch::asm!(
-                "stnp {x:q}, {y:q}, [{dst}]",
-                dst = in(reg) dst,
-                x = in(vreg) x,
-                y = in(vreg) y,
-                options(nostack, preserves_flags),
-            );
-        }
-    }
     unsafe {
         let zero = vdupq_n_u64(0);
         let ra_q = transmute::<F128, uint64x2_t>(r_a);
@@ -401,21 +306,10 @@ pub(super) unsafe fn fold2_two_and_msgs(
                 let pw = mul_const_vec2(rb_q, veorq_u64(vf0, vf1), veorq_u64(vb0, vb1));
                 let wq_f = veorq_u64(vf0, pw[0]);
                 let wq_b = veorq_u64(vb0, pw[1]);
-                if !nt_stores {
-                    vst1q_u64(wf.as_mut_ptr().add(t + q).cast::<u64>(), wq_f);
-                    vst1q_u64(wb.as_mut_ptr().add(t + q).cast::<u64>(), wq_b);
-                }
+                vst1q_u64(wf.as_mut_ptr().add(t + q).cast::<u64>(), wq_f);
+                vst1q_u64(wb.as_mut_ptr().add(t + q).cast::<u64>(), wq_b);
                 w_regs_f[q] = wq_f;
                 w_regs_b[q] = wq_b;
-            }
-            if nt_stores {
-                // The four group outputs are adjacent: two 32-byte pair
-                // stores per polynomial. Same values as the per-q stores —
-                // only the cacheability hint differs.
-                store_pair_nt(wf.as_mut_ptr().add(t), w_regs_f[0], w_regs_f[1]);
-                store_pair_nt(wf.as_mut_ptr().add(t + 2), w_regs_f[2], w_regs_f[3]);
-                store_pair_nt(wb.as_mut_ptr().add(t), w_regs_b[0], w_regs_b[1]);
-                store_pair_nt(wb.as_mut_ptr().add(t + 2), w_regs_b[2], w_regs_b[3]);
             }
             // Direct message over pairs (w0,w1), (w2,w3); lookahead over the
             // quad. Shared products accumulated once.
@@ -454,100 +348,5 @@ pub(super) unsafe fn fold2_two_and_msgs(
         let u_0 = c0 + red(a_u0b);
         let u_2 = c2v + red(a_u2b);
         (u_0, u_2, [c0, c1, c2v, c3, c4, c5])
-    }
-}
-
-/// Final two-challenge Ligerito fold. This is the direct-message-only sibling
-/// of [`fold2_two_and_msgs`]: after the last initial-lane pair there is no
-/// following lookahead to evaluate, so retaining its four extra endpoint
-/// products and wide accumulators is dead work.
-///
-/// # Safety
-/// Caller guarantees PMULL and: `f.len() == b.len()`, `wf.len() == wb.len()`,
-/// `wf.len() % 4 == 0`, `base % 4 == 0`, and `4 * (base + wf.len()) <= f.len()`.
-pub(super) unsafe fn fold2_two_and_msg(
-    f: &[F128],
-    b: &[F128],
-    base: usize,
-    wf: &mut [F128],
-    wb: &mut [F128],
-    r_a: F128,
-    r_b: F128,
-    nt_stores: bool,
-) -> (F128, F128) {
-    #[inline(always)]
-    unsafe fn store_pair_nt(dst: *mut F128, x: uint64x2_t, y: uint64x2_t) {
-        unsafe {
-            core::arch::asm!(
-                "stnp {x:q}, {y:q}, [{dst}]",
-                dst = in(reg) dst,
-                x = in(vreg) x,
-                y = in(vreg) y,
-                options(nostack, preserves_flags),
-            );
-        }
-    }
-
-    unsafe {
-        let zero = vdupq_n_u64(0);
-        let ra_q = transmute::<F128, uint64x2_t>(r_a);
-        let rb_q = transmute::<F128, uint64x2_t>(r_b);
-        let mut a_u0a = WideNeon { lo: zero, hi: zero };
-        let mut a_u0b = WideNeon { lo: zero, hi: zero };
-        let mut a_u2a = WideNeon { lo: zero, hi: zero };
-        let mut a_u2b = WideNeon { lo: zero, hi: zero };
-
-        let mut w_regs_f = [zero; 4];
-        let mut w_regs_b = [zero; 4];
-        let mut t = 0;
-        while t < wf.len() {
-            for q in 0..4 {
-                let src = 4 * (base + t + q);
-                let fe0 = vld1q_u64(f.as_ptr().add(src).cast::<u64>());
-                let fo0 = vld1q_u64(f.as_ptr().add(src + 1).cast::<u64>());
-                let fe1 = vld1q_u64(f.as_ptr().add(src + 2).cast::<u64>());
-                let fo1 = vld1q_u64(f.as_ptr().add(src + 3).cast::<u64>());
-                let be0 = vld1q_u64(b.as_ptr().add(src).cast::<u64>());
-                let bo0 = vld1q_u64(b.as_ptr().add(src + 1).cast::<u64>());
-                let be1 = vld1q_u64(b.as_ptr().add(src + 2).cast::<u64>());
-                let bo1 = vld1q_u64(b.as_ptr().add(src + 3).cast::<u64>());
-
-                let pf = mul_const_vec2(ra_q, veorq_u64(fe0, fo0), veorq_u64(fe1, fo1));
-                let vf0 = veorq_u64(fe0, pf[0]);
-                let vf1 = veorq_u64(fe1, pf[1]);
-                let pb = mul_const_vec2(ra_q, veorq_u64(be0, bo0), veorq_u64(be1, bo1));
-                let vb0 = veorq_u64(be0, pb[0]);
-                let vb1 = veorq_u64(be1, pb[1]);
-
-                let pw = mul_const_vec2(rb_q, veorq_u64(vf0, vf1), veorq_u64(vb0, vb1));
-                let wq_f = veorq_u64(vf0, pw[0]);
-                let wq_b = veorq_u64(vb0, pw[1]);
-                if !nt_stores {
-                    vst1q_u64(wf.as_mut_ptr().add(t + q).cast::<u64>(), wq_f);
-                    vst1q_u64(wb.as_mut_ptr().add(t + q).cast::<u64>(), wq_b);
-                }
-                w_regs_f[q] = wq_f;
-                w_regs_b[q] = wq_b;
-            }
-            if nt_stores {
-                store_pair_nt(wf.as_mut_ptr().add(t), w_regs_f[0], w_regs_f[1]);
-                store_pair_nt(wf.as_mut_ptr().add(t + 2), w_regs_f[2], w_regs_f[3]);
-                store_pair_nt(wb.as_mut_ptr().add(t), w_regs_b[0], w_regs_b[1]);
-                store_pair_nt(wb.as_mut_ptr().add(t + 2), w_regs_b[2], w_regs_b[3]);
-            }
-
-            let s0f = veorq_u64(w_regs_f[0], w_regs_f[1]);
-            let s0b = veorq_u64(w_regs_b[0], w_regs_b[1]);
-            let s1f = veorq_u64(w_regs_f[2], w_regs_f[3]);
-            let s1b = veorq_u64(w_regs_b[2], w_regs_b[3]);
-            xor_wide(&mut a_u0a, mul_unreduced(w_regs_f[0], w_regs_b[0]));
-            xor_wide(&mut a_u0b, mul_unreduced(w_regs_f[2], w_regs_b[2]));
-            xor_wide(&mut a_u2a, mul_unreduced(s0f, s0b));
-            xor_wide(&mut a_u2b, mul_unreduced(s1f, s1b));
-            t += 4;
-        }
-
-        let red = |w: WideNeon| transmute::<uint64x2_t, F128>(reduce_wide(w));
-        (red(a_u0a) + red(a_u0b), red(a_u2a) + red(a_u2b))
     }
 }

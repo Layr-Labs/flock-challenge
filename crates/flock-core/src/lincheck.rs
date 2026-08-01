@@ -675,6 +675,8 @@ pub fn partial_fold_packed_z_fast_padded(
     useful_bits: usize,
     eq_outer: &[F128],
 ) -> Vec<F128> {
+    use rayon::prelude::*;
+
     let n_log = m - k_log;
     let k = 1usize << k_log;
     let n_outer = 1usize << n_log;
@@ -685,7 +687,6 @@ pub fn partial_fold_packed_z_fast_padded(
     let n_stripes = n_outer / 8;
 
     let stripes_per_chunk = (n_stripes / 256).max(1);
-    use rayon::prelude::*;
     let bytes_per_chunk = stripes_per_chunk * k;
 
     // fold(): one length-k accumulator per WORKER rather than per chunk —
@@ -861,6 +862,7 @@ pub fn pack_z_lincheck_from_packed(
     m: usize,
     k_log: usize,
 ) -> Vec<u8> {
+    use rayon::prelude::*;
     let k = 1usize << k_log;
     let n_total = 1usize << m;
     assert_eq!(z_packed_f128.len(), n_total / 128);
@@ -873,37 +875,29 @@ pub fn pack_z_lincheck_from_packed(
     let mut z_packed: Vec<u8> = crate::alloc_uninit_vec(n_total / 8);
     // Each stripe (byte_idx) writes a disjoint k-byte chunk — process them in
     // parallel. Inside one stripe, k independent output bytes.
-    // Hetero-queue drain (same contract as the promoted zerocheck
-    // conversions): pure bit-extraction compute over disjoint stripes with
-    // no reduction — the ideal shape for the efficiency-core queue. Each
-    // chunk writes only its own k-byte stripe; output is bit-identical by
-    // construction.
-    let stripes = z_packed.len() / k;
-    let z_base = crate::epool::SyncPtr(z_packed.as_mut_ptr());
-    crate::epool::run_hetero_chunks(stripes, |byte_idx| {
-        // SAFETY: the queue hands out each stripe exactly once; stripe
-        // byte_idx exclusively owns z_packed[byte_idx*k..][..k]; the queue's
-        // completion join publishes the writes before the caller reads.
-        let chunk = unsafe { std::slice::from_raw_parts_mut(z_base.ptr().add(byte_idx * k), k) };
-        for i_inner in 0..k {
-            let mut byte = 0u8;
-            for r in 0..8 {
-                let i_outer = 8 * byte_idx + r;
-                let logical_idx = i_inner + i_outer * k;
-                let f128_idx = logical_idx / 128;
-                let local_bit = logical_idx % 128;
-                let bit = if local_bit < 64 {
-                    (z_packed_f128[f128_idx].lo >> local_bit) & 1 == 1
-                } else {
-                    (z_packed_f128[f128_idx].hi >> (local_bit - 64)) & 1 == 1
-                };
-                if bit {
-                    byte |= 1u8 << r;
+    z_packed
+        .par_chunks_mut(k)
+        .enumerate()
+        .for_each(|(byte_idx, chunk)| {
+            for i_inner in 0..k {
+                let mut byte = 0u8;
+                for r in 0..8 {
+                    let i_outer = 8 * byte_idx + r;
+                    let logical_idx = i_inner + i_outer * k;
+                    let f128_idx = logical_idx / 128;
+                    let local_bit = logical_idx % 128;
+                    let bit = if local_bit < 64 {
+                        (z_packed_f128[f128_idx].lo >> local_bit) & 1 == 1
+                    } else {
+                        (z_packed_f128[f128_idx].hi >> (local_bit - 64)) & 1 == 1
+                    };
+                    if bit {
+                        byte |= 1u8 << r;
+                    }
                 }
+                chunk[i_inner] = byte;
             }
-            chunk[i_inner] = byte;
-        }
-    });
+        });
     z_packed
 }
 
@@ -1302,72 +1296,62 @@ fn prove_padded_inner<Ch: Challenger>(
     //    consistency checks v_a, v_b into a single sumcheck.
     let alpha = challenger.sample_f128();
 
-    // 1b. Constant-wire pin challenge β. There are no transcript observes
-    // between the α and β samples, so sampling it now is byte-identical to
-    // the serial path and makes the two independent computations below safe
-    // to overlap.
-    let beta_pin: Option<(usize, F128)> = circuit
-        .const_pin_col()
-        .map(|col| (col, challenger.sample_f128()));
-
-    // Build the circuit comb and the packed-witness partial fold concurrently.
-    // The former is compute/cache-resident while the latter is bandwidth
-    // dominated. FLOCK_NO_LINCHECK_JOIN restores the exact serial scheduling
-    // for same-binary A/B measurement.
-    let comb_branch = || {
-        let t = if trace {
-            Some(std::time::Instant::now())
-        } else {
-            None
-        };
-        let eq_inner = build_quirky_eq_table(x_ab.z_skip, &x_ab.x_inner_rest, k_skip);
-        if let Some(t) = t {
-            eprintln!(
-                "[lc] {:<26} {:>7.2} ms",
-                "build_quirky_eq",
-                t.elapsed().as_secs_f64() * 1e3
-            );
-        }
-        let t = if trace {
-            Some(std::time::Instant::now())
-        } else {
-            None
-        };
-        let mut comb_vec = circuit.fold_alpha_batched(alpha, &eq_inner);
-        if let Some(t) = t {
-            eprintln!(
-                "[lc] {:<26} {:>7.2} ms",
-                "fold_alpha_batched",
-                t.elapsed().as_secs_f64() * 1e3
-            );
-        }
-        if let Some((col, beta)) = beta_pin {
-            comb_vec[col] += beta;
-        }
-        comb_vec
-    };
-    let z_branch = || {
-        let t = if trace {
-            Some(std::time::Instant::now())
-        } else {
-            None
-        };
-        let eq_x_outer = build_eq_table(&x_ab.x_outer);
-        let z_vec = partial_fold_packed_z_best(z_packed, m, k_log, useful_bits, &eq_x_outer);
-        if let Some(t) = t {
-            eprintln!(
-                "[lc] {:<26} {:>7.2} ms",
-                "partial_fold_z",
-                t.elapsed().as_secs_f64() * 1e3
-            );
-        }
-        z_vec
-    };
-    let (mut comb_vec, mut z_vec) = if std::env::var_os("FLOCK_NO_LINCHECK_JOIN").is_some() {
-        (comb_branch(), z_branch())
+    // 2. Build the α-batched comb_vec via the circuit's per-block fold. For
+    //    the sparse-matrix default this is the fused single-pass row-fold;
+    //    per-hash circuit walkers compute the same `comb_vec` directly from
+    //    the constraint graph.
+    let t = if trace {
+        Some(std::time::Instant::now())
     } else {
-        rayon::join(comb_branch, z_branch)
+        None
     };
+    let eq_inner = build_quirky_eq_table(x_ab.z_skip, &x_ab.x_inner_rest, k_skip);
+    if let Some(t) = t {
+        eprintln!(
+            "[lc] {:<26} {:>7.2} ms",
+            "build_quirky_eq",
+            t.elapsed().as_secs_f64() * 1e3
+        );
+    }
+    let t = if trace {
+        Some(std::time::Instant::now())
+    } else {
+        None
+    };
+    let mut comb_vec = circuit.fold_alpha_batched(alpha, &eq_inner);
+    if let Some(t) = t {
+        eprintln!(
+            "[lc] {:<26} {:>7.2} ms",
+            "fold_alpha_batched",
+            t.elapsed().as_secs_f64() * 1e3
+        );
+    }
+
+    // 2b. Constant-wire pin. Fold β·eq(j*, ·) into the comb so the same sumcheck
+    //     also proves z_vec[j*] = 1 (the all-ones constant column). Since j* is a
+    //     boolean index, eq(j*, ·) is the one-hot vector and this is a single
+    //     entry update. β is sampled after α; the verifier mirrors both. See
+    //     docs/const-wire-pin.md.
+    if let Some(col) = circuit.const_pin_col() {
+        let beta = challenger.sample_f128();
+        comb_vec[col] += beta;
+    }
+
+    // 3. Partial fold of z at the shared outer half (length-k F128 vector).
+    let t = if trace {
+        Some(std::time::Instant::now())
+    } else {
+        None
+    };
+    let eq_x_outer = build_eq_table(&x_ab.x_outer);
+    let mut z_vec = partial_fold_packed_z_best(z_packed, m, k_log, useful_bits, &eq_x_outer);
+    if let Some(t) = t {
+        eprintln!(
+            "[lc] {:<26} {:>7.2} ms",
+            "partial_fold_z",
+            t.elapsed().as_secs_f64() * 1e3
+        );
+    }
     // 3b. Optional capture: clone the pre-sumcheck z_vec for downstream reuse
     //     (PCS open's AB-claim s_hat_v skipping fold_1b_rows). Only pay the
     //     clone when explicitly requested.

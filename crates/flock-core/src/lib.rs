@@ -21,10 +21,6 @@ pub mod bits;
 pub mod challenger;
 pub(crate) mod epool;
 pub mod field;
-// Public only for `note_precompute_branch_wall_ms` (the prover's join arm
-// reports its wall to the hybrid-split warmup sweep); internals stay
-// pub(crate).
-pub mod gpu_commit;
 pub mod hash;
 pub mod lincheck;
 pub mod merkle;
@@ -78,14 +74,6 @@ pub fn init_perf_thread_pool() -> Option<usize> {
         Err(_) => None, // pool already built
     }
 }
-
-/// Start the benchmark worker's pool keepalive nudger; see
-/// [`epool::keepalive_start`]. Intended to be called once, right before the
-/// worker signals readiness for the timed seed. Disabled by
-/// `FLOCK_NO_EPOOL_KEEPALIVE=1`.
-
-/// Flip the keepalive nudger to proving mode (helper pool only); see
-/// [`epool::keepalive_proving`]. Call as soon as the timed seed arrives.
 
 /// Mark Rayon prover workers as latency-sensitive on macOS. A bare Rayon pool
 /// inherits default QoS, which lets sustained jobs drift onto efficiency cores

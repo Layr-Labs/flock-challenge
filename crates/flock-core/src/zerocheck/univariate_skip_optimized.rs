@@ -42,8 +42,7 @@ mod kernels;
 
 #[cfg(all(test, target_arch = "aarch64"))]
 use kernels::aarch64::{
-    bit_transpose_64bytes_neon, shift_reduce_inner_ab_fused_neon,
-    shift_reduce_inner_ab_fused_neon_checked, shift_reduce_inner_ab_neon,
+    bit_transpose_64bytes_neon, shift_reduce_inner_ab_fused_neon, shift_reduce_inner_ab_neon,
 };
 #[cfg(all(test, target_arch = "aarch64"))]
 use kernels::bit_transpose_64bytes_scalar;
@@ -337,13 +336,6 @@ pub fn precompute_round1_ab_inner_packed_padded(
     assert_eq!(total_bytes % core::mem::size_of::<F128>(), 0);
 
     let (within_outer_mask, b_med_counts) = build_b_med_counts(padding);
-    // The BLAKE3 R1CS has two 8192-bit windows per 16384-bit block. Besides
-    // the full all-ones B rows at b_med 0/1 and the single-K0 tail, two mixed
-    // rows have fixed one-valued K subsets: K0..1 at first-window b_med 2 and
-    // K4..7 at second-window b_med 13. Restrict runtime sniffing to these five
-    // candidates; every other block enters the generic kernel directly.
-    let blake3_static_layout = padding.k_log == 14 && padding.useful_bits_per_block == 15_409;
-    let static_b_context = kernels::prepare_static_b_context(inv_table, blake3_static_layout);
     const OUTER_BYTES: usize = (1 << N_MEDIUM) * 64;
     debug_assert_eq!(OUTER_BYTES, (1 << N_INNER) * N_CHUNKS);
 
@@ -377,24 +369,6 @@ pub fn precompute_round1_ab_inner_packed_padded(
                         dst,
                         a_col,
                         b_col,
-                        !blake3_static_layout || (within_hash_outer == 0 && b_med < 2),
-                        !blake3_static_layout || (within_hash_outer == 1 && b_med + 1 == n_b_med),
-                        if blake3_static_layout && within_hash_outer == 0 && b_med == 2 {
-                            0x03
-                        } else if blake3_static_layout
-                            && within_hash_outer == 1
-                            && b_med + 2 == n_b_med
-                        {
-                            0xf0
-                        } else {
-                            0
-                        },
-                        if blake3_static_layout {
-                            within_hash_outer
-                        } else {
-                            usize::MAX
-                        },
-                        static_b_context,
                     );
                 }
                 out_outer[n_b_med * 64..].fill(0);
@@ -425,11 +399,6 @@ fn shift_reduce_inner_ab(
     out: &mut [u8; 64],
     a_col: &mut [F8],
     b_col: &mut [F8],
-    check_all_ones: bool,
-    check_single_k0: bool,
-    const_one_mask: u8,
-    bstatic_w: usize,
-    static_b_context: Option<kernels::StaticBContext>,
 ) {
     kernels::shift_reduce_inner_ab(
         a_packed,
@@ -440,11 +409,6 @@ fn shift_reduce_inner_ab(
         out,
         a_col,
         b_col,
-        check_all_ones,
-        check_single_k0,
-        const_one_mask,
-        bstatic_w,
-        static_b_context,
     );
 }
 
@@ -574,11 +538,6 @@ fn process_one_x_hi(
                     &mut state.chunk_ab_bytes[b_med],
                     &mut state.a_col,
                     &mut state.b_col,
-                    true,
-                    true,
-                    0,
-                    usize::MAX,
-                    None,
                 );
                 let byte_base_b = chunk_byte_base + b_med * N_CHUNKS * 8;
                 let c_in: &[u8; 64] = (&c_packed[byte_base_b..byte_base_b + 64])
@@ -611,11 +570,6 @@ fn process_one_x_hi(
                     &mut state.chunk_ab_bytes[b_med],
                     &mut state.a_col,
                     &mut state.b_col,
-                    true,
-                    true,
-                    0,
-                    usize::MAX,
-                    None,
                 );
                 let byte_base_b = chunk_byte_base + b_med * N_CHUNKS * 8;
                 let c_in: &[u8; 64] = (&c_packed[byte_base_b..byte_base_b + 64])
@@ -741,11 +695,6 @@ fn process_one_x_hi_with_s_hat_v(
                     &mut state.chunk_ab_bytes[b_med],
                     &mut state.a_col,
                     &mut state.b_col,
-                    true,
-                    true,
-                    0,
-                    usize::MAX,
-                    None,
                 );
                 let byte_base_b = chunk_byte_base + b_med * N_CHUNKS * 8;
                 let c_in: &[u8; 64] = (&c_packed[byte_base_b..byte_base_b + 64])
@@ -776,11 +725,6 @@ fn process_one_x_hi_with_s_hat_v(
                     &mut state.chunk_ab_bytes[b_med],
                     &mut state.a_col,
                     &mut state.b_col,
-                    true,
-                    true,
-                    0,
-                    usize::MAX,
-                    None,
                 );
                 let byte_base_b = chunk_byte_base + b_med * N_CHUNKS * 8;
                 let c_in: &[u8; 64] = (&c_packed[byte_base_b..byte_base_b + 64])
@@ -1686,167 +1630,6 @@ mod tests {
                 out_scalar, out_fused,
                 "fused-neon disagrees with scalar at (base={chunk_byte_base}, b_med={b_med})"
             );
-        }
-    }
-
-    #[cfg(target_arch = "aarch64")]
-    #[test]
-    fn static_b_context_gate_respects_layout_and_legacy_policy() {
-        let table = make_inv_table();
-        assert!(
-            kernels::aarch64::prepare_static_b_context_with_policy(&table, false, false, false)
-                .is_none(),
-            "non-BLAKE3 layouts must not prepare the generated static-B plan"
-        );
-        assert!(
-            kernels::aarch64::prepare_static_b_context_with_policy(&table, true, true, false)
-                .is_none(),
-            "the legacy control must retain the generic fallback"
-        );
-        assert!(
-            matches!(
-                kernels::aarch64::prepare_static_b_context_with_policy(&table, true, false, true),
-                Some(kernels::aarch64::StaticBContext::LegacyPerCall)
-            ),
-            "the context control must retain per-call lookups and static-B"
-        );
-        assert!(
-            matches!(
-                kernels::aarch64::prepare_static_b_context_with_policy(&table, true, false, false),
-                Some(kernels::aarch64::StaticBContext::Prepared { .. })
-            ),
-            "the checked static-B plan should be prepared for its exact layout"
-        );
-    }
-
-    #[cfg(target_arch = "aarch64")]
-    #[test]
-    fn prepared_static_b_context_matches_scalar_and_guard_fallback() {
-        // The generated debug kernel keeps every match arm's SIMD locals in
-        // the frame; give this direct-kernel oracle more than libtest's small
-        // worker stack. Release builds reuse the slots aggressively.
-        std::thread::Builder::new()
-            .stack_size(16 << 20)
-            .spawn(|| {
-                let mut rng = Rng::new(0xB57A_71C0);
-                let table = make_inv_table();
-                let a_packed = pack_bits(&rng.bits(1 << 14));
-                let mut b_packed = pack_bits(&rng.bits(1 << 14));
-                let w = 0usize;
-                let b_med = 3usize;
-                let blk = w * (1 << N_MEDIUM) + b_med;
-                let byte_base_b = b_med * N_CHUNKS * 8;
-
-                // Force every generated static position to its expected value while
-                // retaining random bytes in the dynamic positions.
-                for k in 0..N_CHUNKS {
-                    let off = byte_base_b + k * N_CHUNKS;
-                    let (mask, expected) = kernels::aarch64::BSTATIC_MASKS[blk][k];
-                    let word = u64::from_le_bytes(b_packed[off..off + 8].try_into().unwrap());
-                    let word = (word & !mask) | expected;
-                    b_packed[off..off + 8].copy_from_slice(&word.to_le_bytes());
-                }
-
-                let context = kernels::aarch64::prepare_static_b_context_with_policy(
-                    &table, true, false, false,
-                )
-                .expect("enabled static-B context");
-                let legacy_context = kernels::aarch64::prepare_static_b_context_with_policy(
-                    &table, true, false, true,
-                )
-                .expect("per-call static-B control");
-                let run_scalar = |b: &[u8]| {
-                    let mut out = [0u8; 64];
-                    let mut a_col = [F8::ZERO; ELL];
-                    let mut b_col = [F8::ZERO; ELL];
-                    shift_reduce_inner_ab_scalar(
-                        &a_packed, b, &table, 0, b_med, &mut out, &mut a_col, &mut b_col,
-                    );
-                    out
-                };
-                let run_context = |b: &[u8], context| {
-                    let mut out = [0u8; 64];
-                    shift_reduce_inner_ab_fused_neon_checked(
-                        &a_packed,
-                        b,
-                        &table,
-                        0,
-                        b_med,
-                        &mut out,
-                        false,
-                        false,
-                        0,
-                        w,
-                        Some(context),
-                    );
-                    out
-                };
-
-                assert_eq!(run_context(&b_packed, context), run_scalar(&b_packed));
-                assert_eq!(
-                    run_context(&b_packed, legacy_context),
-                    run_scalar(&b_packed)
-                );
-
-                // Break one guarded static bit. The prepared plan must still take its
-                // row-local generic fallback and remain identical to the scalar oracle.
-                let guarded_k = 1usize;
-                let (guard_mask, _) = kernels::aarch64::BSTATIC_MASKS[blk][guarded_k];
-                assert_ne!(guard_mask, 0);
-                let off = byte_base_b + guarded_k * N_CHUNKS;
-                let mut word = u64::from_le_bytes(b_packed[off..off + 8].try_into().unwrap());
-                word ^= guard_mask & guard_mask.wrapping_neg();
-                b_packed[off..off + 8].copy_from_slice(&word.to_le_bytes());
-                assert_eq!(run_context(&b_packed, context), run_scalar(&b_packed));
-                assert_eq!(
-                    run_context(&b_packed, legacy_context),
-                    run_scalar(&b_packed)
-                );
-            })
-            .expect("spawn static-B oracle")
-            .join()
-            .expect("static-B oracle thread");
-    }
-
-    #[cfg(target_arch = "aarch64")]
-    #[test]
-    fn neon_mixed_const_one_inner_matches_scalar_inner() {
-        let mut rng = Rng::new(0xC057_01E5);
-        let m = 14;
-        let table = make_inv_table();
-        let a_bits = rng.bits(1 << m);
-        let b_bits = rng.bits(1 << m);
-        let a_packed = super::super::univariate_skip::pack_bits(&a_bits);
-        let b_packed = super::super::univariate_skip::pack_bits(&b_bits);
-
-        for mask in [0x03u8, 0xf0] {
-            let mut b_mixed = b_packed.clone();
-            for k in 0..8 {
-                if mask & (1 << k) != 0 {
-                    b_mixed[k * N_CHUNKS..(k + 1) * N_CHUNKS].fill(u8::MAX);
-                }
-            }
-            let mut a_col = [F8::ZERO; ELL];
-            let mut b_col = [F8::ZERO; ELL];
-            let mut want = [0u8; 64];
-            let mut got = [0u8; 64];
-            shift_reduce_inner_ab_scalar(
-                &a_packed, &b_mixed, &table, 0, 0, &mut want, &mut a_col, &mut b_col,
-            );
-            shift_reduce_inner_ab_fused_neon_checked(
-                &a_packed,
-                &b_mixed,
-                &table,
-                0,
-                0,
-                &mut got,
-                false,
-                false,
-                mask,
-                usize::MAX,
-                None,
-            );
-            assert_eq!(got, want, "mixed const-one mask {mask:#04x}");
         }
     }
 

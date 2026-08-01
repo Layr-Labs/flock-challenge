@@ -2259,193 +2259,14 @@ pub(crate) fn induce_sumcheck_poly_auto(
 /// contain a nonzero (a dense `2^k` transpose each), densify, then run the
 /// remaining steps as full dense sweeps. Output is identical to
 /// `transpose_forward_ntt` applied to the scattered input.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct ActiveWindow {
-    window_index: usize,
-    input_start: usize,
-    input_end: usize,
-}
-
-#[inline]
-fn positions_are_sorted(positions: &[usize]) -> bool {
-    positions.windows(2).all(|pair| pair[0] <= pair[1])
-}
-
-fn group_sorted_positions(positions: &[usize], prefix_k: usize) -> Vec<ActiveWindow> {
-    debug_assert!(positions_are_sorted(positions));
-    let mut groups = Vec::with_capacity(positions.len());
-    let mut input_start = 0;
-    while input_start < positions.len() {
-        let window_index = positions[input_start] >> prefix_k;
-        let mut input_end = input_start + 1;
-        while input_end < positions.len() && positions[input_end] >> prefix_k == window_index {
-            input_end += 1;
-        }
-        groups.push(ActiveWindow {
-            window_index,
-            input_start,
-            input_end,
-        });
-        input_start = input_end;
-    }
-    groups
-}
-
-fn scatter_active_windows(
-    groups: &[ActiveWindow],
-    positions: &[usize],
-    values: &[F128],
-    prefix_k: usize,
-) -> Vec<F128> {
-    debug_assert_eq!(positions.len(), values.len());
-    let window_len = 1usize << prefix_k;
-    let window_mask = window_len - 1;
-    let mut arena = vec![F128::ZERO; groups.len() * window_len];
-    for (arena_index, group) in groups.iter().enumerate() {
-        let window = &mut arena[arena_index * window_len..(arena_index + 1) * window_len];
-        for input_index in group.input_start..group.input_end {
-            window[positions[input_index] & window_mask] += values[input_index];
-        }
-    }
-    arena
-}
-
-#[inline]
-fn transform_active_window(
-    ntt: &AdditiveNttF128,
-    window: &mut [F128],
-    window_index: usize,
-    prefix_k: usize,
-    log_d: usize,
-) {
-    for s in 0..prefix_k {
-        let layer = log_d - 1 - s;
-        let half = 1usize << s;
-        let block_size = half << 1;
-        let nblocks = window.len() / block_size;
-        for block in 0..nblocks {
-            let twiddle = ntt.twiddle(layer, (window_index << (prefix_k - s - 1)) + block);
-            let base = block * block_size;
-            for row in 0..half {
-                let top = window[base + row];
-                let bottom = window[base + row + half];
-                let sum = top + bottom;
-                window[base + row] = sum;
-                window[base + row + half] = twiddle * sum + bottom;
-            }
-        }
-    }
-}
-
-fn transform_active_windows(
-    ntt: &AdditiveNttF128,
-    arena: &mut [F128],
-    groups: &[ActiveWindow],
-    prefix_k: usize,
-    log_d: usize,
-) {
-    use rayon::prelude::*;
-    let window_len = 1usize << prefix_k;
-    arena
-        .par_chunks_mut(window_len)
-        .zip(groups.par_iter())
-        .for_each(|(window, group)| {
-            transform_active_window(ntt, window, group.window_index, prefix_k, log_d);
-        });
-}
-
-fn densify_active_windows(
-    arena: &[F128],
-    groups: &[ActiveWindow],
-    log_d: usize,
-    prefix_k: usize,
-) -> Vec<F128> {
-    use rayon::prelude::*;
-
-    const INACTIVE: usize = usize::MAX;
-    let n = 1usize << log_d;
-    let window_len = 1usize << prefix_k;
-    let n_windows = n / window_len;
-    let mut window_to_arena = vec![INACTIVE; n_windows];
-    for (arena_index, group) in groups.iter().enumerate() {
-        window_to_arena[group.window_index] = arena_index;
-    }
-
-    let mut data: Vec<F128> = crate::alloc_uninit_vec(n);
-    data.par_chunks_mut(window_len)
-        .enumerate()
-        .for_each(|(window_index, destination)| {
-            let arena_index = window_to_arena[window_index];
-            if arena_index == INACTIVE {
-                destination.fill(F128::ZERO);
-            } else {
-                let source = &arena[arena_index * window_len..(arena_index + 1) * window_len];
-                destination.copy_from_slice(source);
-            }
-        });
-    // Every chunk covers one disjoint dense window and takes exactly one of
-    // the fill/copy branches above, so all uninitialized elements are written
-    // before the dense transpose can read them.
-    data
-}
-
-fn transpose_forward_ntt_dense_suffix(
-    ntt: &AdditiveNttF128,
-    data: &mut [F128],
-    log_d: usize,
-    prefix_k: usize,
-) {
-    use rayon::prelude::*;
-    let n_threads = rayon::current_num_threads().max(1);
-    let mut remaining = log_d - prefix_k;
-    while remaining >= 3 {
-        let layer = remaining - 3;
-        transpose_forward_ntt_fused_3layer(ntt, data, log_d, layer);
-        remaining -= 3;
-    }
-    for layer in (0..remaining).rev() {
-        let num_blocks = 1usize << layer;
-        let block_size = 1usize << (log_d - layer);
-        let half = block_size >> 1;
-        if num_blocks >= n_threads {
-            data.par_chunks_mut(block_size)
-                .enumerate()
-                .for_each(|(block, chunk)| {
-                    let twiddle = ntt.twiddle(layer, block);
-                    let (top, bottom) = chunk.split_at_mut(half);
-                    for (top, bottom) in top.iter_mut().zip(bottom.iter_mut()) {
-                        let a = *top;
-                        let b = *bottom;
-                        let sum = a + b;
-                        *top = sum;
-                        *bottom = twiddle * sum + b;
-                    }
-                });
-        } else {
-            for block in 0..num_blocks {
-                let twiddle = ntt.twiddle(layer, block);
-                let chunk = &mut data[block * block_size..(block + 1) * block_size];
-                let (top, bottom) = chunk.split_at_mut(half);
-                top.par_iter_mut()
-                    .zip(bottom.par_iter_mut())
-                    .for_each(|(top, bottom)| {
-                        let a = *top;
-                        let b = *bottom;
-                        let sum = a + b;
-                        *top = sum;
-                        *bottom = twiddle * sum + b;
-                    });
-            }
-        }
-    }
-}
-
 fn transpose_forward_ntt_sparse(
     ntt: &AdditiveNttF128,
     positions: &[usize],
     values: &[F128],
     log_d: usize,
 ) -> Vec<F128> {
+    use rayon::prelude::*;
+    use std::collections::HashMap;
     let n = 1usize << log_d;
     // No prefix for small domains — just scatter + full dense transpose.
     let k = if log_d >= 12 { 8usize.min(log_d) } else { 0 };
@@ -2461,63 +2282,93 @@ fn transpose_forward_ntt_sparse(
         return data;
     }
 
-    static LINEAR_WINDOWS_ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    let use_linear_windows = positions_are_sorted(positions)
-        && *LINEAR_WINDOWS_ENABLED
-            .get_or_init(|| std::env::var_os("FLOCK_NO_INDUCE_LINEAR_WINDOWS").is_none());
-    if !use_linear_windows {
-        return transpose_forward_ntt_sparse_hashmap(ntt, positions, values, log_d, k);
-    }
-
-    let groups = group_sorted_positions(positions, k);
-
-    let mut arena = scatter_active_windows(&groups, positions, values, k);
-
-    transform_active_windows(ntt, &mut arena, &groups, k, log_d);
-
-    let mut data = densify_active_windows(&arena, &groups, log_d, k);
-
-    transpose_forward_ntt_dense_suffix(ntt, &mut data, log_d, k);
-    data
-}
-
-fn transpose_forward_ntt_sparse_hashmap(
-    ntt: &AdditiveNttF128,
-    positions: &[usize],
-    values: &[F128],
-    log_d: usize,
-    prefix_k: usize,
-) -> Vec<F128> {
-    use rayon::prelude::*;
-    use std::collections::HashMap;
-    let n = 1usize << log_d;
-    let window_len = 1usize << prefix_k;
-    let window_mask = window_len - 1;
-
+    let wmask = (1usize << k) - 1;
+    // Group nonzeros into 2^k windows.
     let mut windows: HashMap<usize, Vec<F128>> = HashMap::new();
-    for (&position, &value) in positions.iter().zip(values) {
-        let window = windows
-            .entry(position >> prefix_k)
-            .or_insert_with(|| vec![F128::ZERO; window_len]);
-        window[position & window_mask] += value;
+    for (&p, &v) in positions.iter().zip(values) {
+        let buf = windows
+            .entry(p >> k)
+            .or_insert_with(|| vec![F128::ZERO; 1 << k]);
+        buf[p & wmask] += v;
     }
 
-    let windows: Vec<(usize, Vec<F128>)> = windows.into_iter().collect();
-    let processed: Vec<(usize, Vec<F128>)> = windows
+    // Steps s = 0..k-1 within each active window, in parallel (windows disjoint).
+    let win_vec: Vec<(usize, Vec<F128>)> = windows.into_iter().collect();
+    let processed: Vec<(usize, Vec<F128>)> = win_vec
         .into_par_iter()
-        .map(|(window_index, mut window)| {
-            transform_active_window(ntt, &mut window, window_index, prefix_k, log_d);
-            (window_index, window)
+        .map(|(w, mut buf)| {
+            for s in 0..k {
+                let layer = log_d - 1 - s;
+                let bsh = 1usize << s; // pairing distance
+                let block_size = bsh << 1;
+                let nblocks = (1usize << k) / block_size;
+                for jb in 0..nblocks {
+                    // global block index = ((w<<k) + jb*block_size) >> (s+1).
+                    let t = ntt.twiddle(layer, (w << (k - s - 1)) + jb);
+                    let base = jb * block_size;
+                    for r in 0..bsh {
+                        let a = buf[base + r];
+                        let b = buf[base + r + bsh];
+                        let sab = a + b;
+                        buf[base + r] = sab;
+                        buf[base + r + bsh] = t * sab + b;
+                    }
+                }
+            }
+            (w, buf)
         })
         .collect();
 
+    // Densify (active windows only; the rest stay zero, which is the correct
+    // post-step-(k-1) state for an all-zero window).
     let mut data = vec![F128::ZERO; n];
-    for (window_index, window) in processed {
-        let start = window_index << prefix_k;
-        data[start..start + window_len].copy_from_slice(&window);
+    for (w, buf) in processed {
+        data[(w << k)..((w + 1) << k)].copy_from_slice(&buf);
     }
 
-    transpose_forward_ntt_dense_suffix(ntt, &mut data, log_d, prefix_k);
+    // Remaining steps s = k..log_d-1 = forward layers (log_d-1-k) .. 0, dense.
+    let n_threads = rayon::current_num_threads().max(1);
+    let mut remaining = log_d - k;
+    while remaining >= 3 {
+        let layer = remaining - 3;
+        transpose_forward_ntt_fused_3layer(ntt, &mut data, log_d, layer);
+        remaining -= 3;
+    }
+    for layer in (0..remaining).rev() {
+        let num_blocks = 1usize << layer;
+        let block_size = 1usize << (log_d - layer);
+        let bsh = block_size >> 1;
+        if num_blocks >= n_threads {
+            data.par_chunks_mut(block_size)
+                .enumerate()
+                .for_each(|(block, chunk)| {
+                    let t = ntt.twiddle(layer, block);
+                    let (top, bot) = chunk.split_at_mut(bsh);
+                    for (a_ref, b_ref) in top.iter_mut().zip(bot.iter_mut()) {
+                        let a = *a_ref;
+                        let b = *b_ref;
+                        let sab = a + b;
+                        *a_ref = sab;
+                        *b_ref = t * sab + b;
+                    }
+                });
+        } else {
+            for block in 0..num_blocks {
+                let t = ntt.twiddle(layer, block);
+                let chunk = &mut data[block * block_size..(block + 1) * block_size];
+                let (top, bot) = chunk.split_at_mut(bsh);
+                top.par_iter_mut()
+                    .zip(bot.par_iter_mut())
+                    .for_each(|(a_ref, b_ref)| {
+                        let a = *a_ref;
+                        let b = *b_ref;
+                        let sab = a + b;
+                        *a_ref = sab;
+                        *b_ref = t * sab + b;
+                    });
+            }
+        }
+    }
     data
 }
 
@@ -2966,19 +2817,6 @@ fn fold2_and_msgs_lsb(
     //   u2_D likewise over sums-of-adjacent-x, which reduce to the same three
     //   bilinear forms on (wf0+wf2.., wf1+wf3..) groupings handled below.
     const CHUNK: usize = 2048; // outputs per chunk; 8 inputs per output pair
-    // Fold pairs whose w outputs are past LLC size write ping-pong state not
-    // read until the next fold pair's barrier; `stnp` elides the
-    // write-allocate RFO reads there (same driver-decided policy as the
-    // zerocheck tail's NT rounds). 2^21 F128 = 32 MiB per polynomial (both
-    // polynomials together exceed LLC).
-    #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
-    let nt_stores = {
-        use std::sync::OnceLock;
-        static NT_ENABLED: OnceLock<bool> = OnceLock::new();
-        quarter >= (1usize << 21)
-            && *NT_ENABLED
-                .get_or_init(|| std::env::var_os("FLOCK_LIG_NT_LEGACY").is_none())
-    };
     let acc = wf
         .par_chunks_mut(CHUNK)
         .zip(wb.par_chunks_mut(CHUNK))
@@ -2987,9 +2825,8 @@ fn fold2_and_msgs_lsb(
             let base = ci * CHUNK; // output index base
             #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
             {
-                let (u0, u2, c) = crate::field::f128_slice::fold2_two_and_msgs(
-                    f, b, base, wfc, wbc, r_a, r_b, nt_stores,
-                );
+                let (u0, u2, c) =
+                    crate::field::f128_slice::fold2_two_and_msgs(f, b, base, wfc, wbc, r_a, r_b);
                 return (u0, u2, c);
             }
             #[cfg(not(all(target_arch = "aarch64", target_feature = "aes")))]
@@ -3072,87 +2909,12 @@ fn fold2_and_msgs_lsb(
         acc.2,
     )
 }
-
-/// Final initial-lane pair: bind two challenges and emit only the direct next
-/// message. The ordinary lookahead would describe a round beyond
-/// `initial_k`, so computing it cannot affect the transcript or folded state.
-fn fold2_and_msg_lsb(
-    f: &[F128],
-    b: &[F128],
-    r_a: F128,
-    r_b: F128,
-    wf: &mut Vec<F128>,
-    wb: &mut Vec<F128>,
-) -> SumcheckMessage {
-    #[cfg(not(all(target_arch = "aarch64", target_feature = "aes")))]
-    {
-        // The ranked production path is AArch64. Keep other targets simple
-        // and byte-identical by using the portable full oracle and discarding
-        // only its unobserved lookahead.
-        return fold2_and_msgs_lsb(f, b, r_a, r_b, wf, wb).0;
-    }
-
-    #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
-    {
-        use rayon::prelude::*;
-
-        let n = f.len();
-        debug_assert!(n.is_power_of_two() && n >= 16);
-        debug_assert_eq!(b.len(), n);
-        let quarter = n / 4;
-        debug_assert!(wf.capacity() >= quarter && wb.capacity() >= quarter);
-        // SAFETY: capacity checked; every slot is initialized by its unique
-        // parallel chunk before the reduction returns.
-        unsafe {
-            wf.set_len(quarter);
-            wb.set_len(quarter);
-        }
-
-        const CHUNK: usize = 2048;
-        let nt_stores = {
-            use std::sync::OnceLock;
-            static NT_ENABLED: OnceLock<bool> = OnceLock::new();
-            quarter >= (1usize << 21)
-                && *NT_ENABLED.get_or_init(|| std::env::var_os("FLOCK_LIG_NT_LEGACY").is_none())
-        };
-        let (u_0, u_2) = wf
-            .par_chunks_mut(CHUNK)
-            .zip(wb.par_chunks_mut(CHUNK))
-            .enumerate()
-            .map(|(chunk, (f_out, b_out))| {
-                crate::field::f128_slice::fold2_two_and_msg(
-                    f,
-                    b,
-                    chunk * CHUNK,
-                    f_out,
-                    b_out,
-                    r_a,
-                    r_b,
-                    nt_stores,
-                )
-            })
-            .reduce(
-                || (F128::ZERO, F128::ZERO),
-                |(a0, a2), (b0, b2)| (a0 + b0, a2 + b2),
-            );
-        SumcheckMessage { u_0, u_2 }
-    }
-}
-
 fn eval_lookahead(c: &[F128; 6], rho: F128) -> SumcheckMessage {
     let r2 = rho * rho;
     SumcheckMessage {
         u_0: c[0] + c[1] * rho + c[2] * r2,
         u_2: c[3] + c[4] * rho + c[5] * r2,
     }
-}
-
-/// Exact fallback for the final-pair specialization. With the opt-out set,
-/// the prover computes and discards the incumbent lookahead as before.
-fn fold2_final_enabled() -> bool {
-    use std::sync::OnceLock;
-    static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("FLOCK_NO_LIG_FOLD2_FINAL").is_none())
 }
 /// Whether the fused first-claim + ordinary-basis fold4 initialization is
 /// enabled for [`materialize_direct_ab_fold2`].
@@ -3167,9 +2929,7 @@ fn direct_ab_fuse_init_enabled() -> bool {
 
 /// Materialize the combined sumcheck state only after its first two folds.
 /// `ordinary_basis` contains the incumbent C contribution; `claims` contains
-/// the AB contribution in sufficient-stat form. Both are γ-baked. Deferred-C
-/// mode instead passes `ordinary_basis` EMPTY and C as a second direct claim,
-/// so there is no fold4 over a materialized basis at all.
+/// the AB contribution in sufficient-stat form. Both are γ-baked.
 ///
 /// Ranked shape has exactly one direct claim (AB). The default path therefore
 /// fuses that claim's contribution with the ordinary-basis fold4 into a
@@ -3186,8 +2946,7 @@ fn materialize_direct_ab_fold2(
     use rayon::prelude::*;
 
     assert!(!claims.is_empty());
-    let has_ordinary = !ordinary_basis.is_empty();
-    assert!(!has_ordinary || ordinary_basis.len() == packed_witness.len());
+    assert_eq!(ordinary_basis.len(), packed_witness.len());
     let fold_weight = [
         (F128::ONE + r0) * (F128::ONE + r1),
         r0 * (F128::ONE + r1),
@@ -3211,12 +2970,6 @@ fn materialize_direct_ab_fold2(
     assert!(claims.iter().all(|claim| {
         claim.eq_lo.len() == block_len && claim.eq_hi.len() * block_len == out_len
     }));
-    let ranked_lookahead_neon = super::is_ranked_direct_fold2_lookahead_shape(
-        packed_witness.len(),
-        block_len,
-        claims.len(),
-        has_ordinary,
-    );
 
     let fuse_init = direct_ab_fuse_init_enabled();
     let mut folded_f = crate::scratch::take_f128(out_len);
@@ -3230,11 +2983,7 @@ fn materialize_direct_ab_fold2(
             |scratch, (block, (b_out, f_out))| {
                 let start = 4 * block * block_len;
                 let f_in = &packed_witness[start..start + 4 * block_len];
-                let b_in: &[F128] = if has_ordinary {
-                    &ordinary_basis[start..start + 4 * block_len]
-                } else {
-                    &[]
-                };
+                let b_in = &ordinary_basis[start..start + 4 * block_len];
                 let fold4 = |input: &[F128], slot: usize| {
                     let a0 = input[4 * slot];
                     let a1 = input[4 * slot + 1];
@@ -3259,23 +3008,13 @@ fn materialize_direct_ab_fold2(
                         first_table,
                         scratch,
                     );
-                    if has_ordinary {
-                        for slot in 0..block_len {
-                            let direct = super::ring_switch::fold_one_slot(
-                                first_claim.eq_lo[slot],
-                                scratch,
-                            );
-                            f_out[slot] = fold4(f_in, slot);
-                            b_out[slot] = direct + fold4(b_in, slot);
-                        }
-                    } else {
-                        for slot in 0..block_len {
-                            f_out[slot] = fold4(f_in, slot);
-                            b_out[slot] = super::ring_switch::fold_one_slot(
-                                first_claim.eq_lo[slot],
-                                scratch,
-                            );
-                        }
+                    for slot in 0..block_len {
+                        let direct = super::ring_switch::fold_one_slot(
+                            first_claim.eq_lo[slot],
+                            scratch,
+                        );
+                        f_out[slot] = fold4(f_in, slot);
+                        b_out[slot] = direct + fold4(b_in, slot);
                     }
                     for (claim, direct_table) in rest_claims.iter().zip(rest_tables.iter()) {
                         super::ring_switch::compose_fold_byte_table_into(
@@ -3307,22 +3046,12 @@ fn materialize_direct_ab_fold2(
                             );
                         }
                     }
-                    if has_ordinary {
-                        for slot in 0..block_len {
-                            f_out[slot] = fold4(f_in, slot);
-                            b_out[slot] += fold4(b_in, slot);
-                        }
-                    } else {
-                        for slot in 0..block_len {
-                            f_out[slot] = fold4(f_in, slot);
-                        }
+                    for slot in 0..block_len {
+                        f_out[slot] = fold4(f_in, slot);
+                        b_out[slot] += fold4(b_in, slot);
                     }
                 }
-                super::round0_and_round1_lookahead_ranked(
-                    f_out,
-                    b_out,
-                    ranked_lookahead_neon,
-                )
+                super::round0_and_round1_lookahead(f_out, b_out)
             },
         )
         .reduce(
@@ -3484,24 +3213,6 @@ impl SumcheckProver {
         std::mem::swap(&mut self.combined_basis, &mut self.spare_b);
         self.transcript.push(msg);
         (msg, coeffs)
-    }
-
-    /// Bind the final two initial-lane challenges without producing the
-    /// lookahead that has no consumer past `initial_k`.
-    fn fold2_final(&mut self, r_a: F128, r_b: F128) -> SumcheckMessage {
-        debug_assert!(self.pending_glue.is_none(), "fold2 across pending glue");
-        let msg = fold2_and_msg_lsb(
-            &self.f,
-            &self.combined_basis,
-            r_a,
-            r_b,
-            &mut self.spare_f,
-            &mut self.spare_b,
-        );
-        std::mem::swap(&mut self.f, &mut self.spare_f);
-        std::mem::swap(&mut self.combined_basis, &mut self.spare_b);
-        self.transcript.push(msg);
-        msg
     }
 
     /// Introduce a fresh basis poly with claimed sum `h_new`. Sends the
@@ -3873,11 +3584,7 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
     let initial_k = config.initial_k;
 
     assert_eq!(packed_witness.len(), 1usize << log_n);
-    // Deferred-C: direct mode may carry every claim in `direct_fold2`, in
-    // which case there is no materialized basis at all.
-    assert!(
-        b_initial.len() == 1usize << log_n || (direct_fold2.is_some() && b_initial.is_empty())
-    );
+    assert_eq!(b_initial.len(), 1usize << log_n);
     assert_eq!(config.recursive_ks.len(), r);
     assert_eq!(config.log_inv_rates.len(), r + 1);
     assert!(r >= 1);
@@ -4005,10 +3712,9 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
                     ));
                     fold2_lookahead = Some(next_lookahead);
                     msg
-                } else if j + 1 == initial_k && fold2_final_enabled() {
-                    sc_prover.as_mut().unwrap().fold2_final(r_a, r)
                 } else {
-                    let (msg, next_lookahead) = sc_prover.as_mut().unwrap().fold2(r_a, r);
+                    let (msg, next_lookahead) =
+                        sc_prover.as_mut().unwrap().fold2(r_a, r);
                     fold2_lookahead = Some(next_lookahead);
                     msg
                 }
@@ -5951,19 +5657,9 @@ mod tests {
             let mut wb = Vec::with_capacity(n / 4);
             let (msg_direct, coeffs) =
                 super::fold2_and_msgs_lsb(&f, &b, r_a, r_b, &mut wf, &mut wb);
-            let mut final_wf = Vec::with_capacity(n / 4);
-            let mut final_wb = Vec::with_capacity(n / 4);
-            let final_msg =
-                super::fold2_and_msg_lsb(&f, &b, r_a, r_b, &mut final_wf, &mut final_wb);
 
             assert_eq!(wf, nf2, "folded f state differs at log_n={log_n}");
             assert_eq!(wb, nb2, "folded b state differs at log_n={log_n}");
-            assert_eq!(final_wf, wf, "final folded f differs at log_n={log_n}");
-            assert_eq!(final_wb, wb, "final folded b differs at log_n={log_n}");
-            assert_eq!(
-                final_msg, msg_direct,
-                "final message differs at log_n={log_n}"
-            );
             assert_eq!(
                 msg_direct.u_0, msg2.u_0,
                 "direct u_0 differs at log_n={log_n}"
@@ -6835,15 +6531,13 @@ mod tests {
     #[test]
     fn transpose_sparse_matches_dense() {
         use crate::challenger::Challenger;
-        for &log_d in &[0usize, 1, 6, 8, 11, 12, 14, 16, 18, 20] {
-            for &nq in &[0usize, 1, 2, 5, 43, 106, 218] {
+        for &log_d in &[6usize, 11, 12, 14, 16, 18] {
+            for &nq in &[1usize, 5, 43, 218] {
                 let n = 1usize << log_d;
                 let nq = nq.min(n);
                 let mut ch =
                     crate::challenger::RandomChallenger::new(0xC0DE ^ (log_d * 131 + nq) as u64);
-                // The transform itself supports log_d=0, while the standard
-                // basis constructor starts at one dimension.
-                let ntt = AdditiveNttF128::standard(log_d.max(1));
+                let ntt = AdditiveNttF128::standard(log_d);
                 let mut positions: Vec<usize> = Vec::new();
                 let mut values: Vec<F128> = Vec::new();
                 while positions.len() < nq {
@@ -6863,70 +6557,6 @@ mod tests {
                 assert_eq!(sparse, dense, "log_d={log_d}, nq={nq}");
             }
         }
-    }
-
-    #[test]
-    fn linear_sparse_windows_match_hashmap_and_dense() {
-        use crate::challenger::Challenger;
-
-        for &log_d in &[12usize, 14, 18, 20] {
-            let n = 1usize << log_d;
-            let ntt = AdditiveNttF128::standard(log_d);
-            for &n_queries in &[0usize, 1, 5, 43, 218] {
-                let mut challenger = crate::challenger::RandomChallenger::new(
-                    0x11EA_2105 ^ ((log_d as u64) << 32) ^ n_queries as u64,
-                );
-                let mut pairs = Vec::with_capacity(n_queries);
-                while pairs.len() < n_queries {
-                    let position = (challenger.sample_f128().lo as usize) % n;
-                    if !pairs.iter().any(|&(p, _)| p == position) {
-                        pairs.push((position, challenger.sample_f128()));
-                    }
-                }
-                pairs.sort_unstable_by_key(|&(position, _)| position);
-                let (positions, values): (Vec<_>, Vec<_>) = pairs.into_iter().unzip();
-
-                let mut dense = vec![F128::ZERO; n];
-                for (&position, &value) in positions.iter().zip(&values) {
-                    dense[position] += value;
-                }
-                transpose_forward_ntt(&ntt, &mut dense, log_d);
-
-                let legacy =
-                    transpose_forward_ntt_sparse_hashmap(&ntt, &positions, &values, log_d, 8);
-                let linear = transpose_forward_ntt_sparse(&ntt, &positions, &values, log_d);
-                assert_eq!(
-                    linear, legacy,
-                    "linear != hashmap at log_d={log_d}, nq={n_queries}"
-                );
-                assert_eq!(
-                    linear, dense,
-                    "linear != dense at log_d={log_d}, nq={n_queries}"
-                );
-            }
-        }
-
-        let log_d = 12;
-        let ntt = AdditiveNttF128::standard(log_d);
-        let positions = vec![0usize, 0, 1, 255, 256, 256, (1usize << log_d) - 1];
-        let values = vec![
-            F128::ONE,
-            F128::ONE,
-            F128::new(2, 0),
-            F128::ZERO,
-            F128::new(4, 0),
-            F128::new(5, 0),
-            F128::new(6, 0),
-        ];
-        let legacy = transpose_forward_ntt_sparse_hashmap(&ntt, &positions, &values, log_d, 8);
-        let linear = transpose_forward_ntt_sparse(&ntt, &positions, &values, log_d);
-        assert_eq!(linear, legacy, "duplicate-position accumulation changed");
-
-        let positions: Vec<usize> = (0..1usize << log_d).step_by(1 << 8).collect();
-        let values = vec![F128::ONE; positions.len()];
-        let legacy = transpose_forward_ntt_sparse_hashmap(&ntt, &positions, &values, log_d, 8);
-        let linear = transpose_forward_ntt_sparse(&ntt, &positions, &values, log_d);
-        assert_eq!(linear, legacy, "all-active-window case changed");
     }
 
     /// The fused production kernel must be byte-identical to the original
@@ -7682,13 +7312,9 @@ mod tests {
         use crate::challenger::Challenger;
 
         let log_n = 12;
-        // Six initial folds exercise direct materialization at j=1, the
-        // ordinary paired fold at j=3, and the direct-only final pair at j=5.
-        let initial_k = 6;
+        let initial_k = 2;
         let k_0 = 2;
-        // The final 4-column message needs enough codeword positions for the
-        // unique-decoding query count.
-        let log_inv_rate = 3;
+        let log_inv_rate = 1;
         let mut rng = crate::challenger::RandomChallenger::new(0xD1CE_AB02);
         let poly: Vec<F128> = (0..(1usize << log_n))
             .map(|_| rng.sample_f128())
@@ -7783,35 +7409,9 @@ mod tests {
 
         assert_eq!(got, ordinary);
         assert_eq!(
-            bincode::serialize(&(got.clone(), target)).expect("serialize direct proof/claim"),
+            bincode::serialize(&(got, target)).expect("serialize direct proof/claim"),
             bincode::serialize(&(ordinary, target)).expect("serialize ordinary proof/claim"),
         );
-
-        // The specialization changes no transcript field or verifier rule.
-        let v_cfg = VerifierConfig {
-            log_inv_rates: log_inv_rates.clone(),
-            recursive_steps: 1,
-            initial_log_msg_cols: log_n - initial_k,
-            initial_log_num_interleaved: initial_k,
-            initial_k,
-            recursive_log_msg_cols: vec![log_n - initial_k - k_0],
-            recursive_ks: vec![k_0],
-            queries: log_inv_rates.iter().map(|&rate| udr_queries(rate)).collect(),
-            grinding_bits: vec![0; log_inv_rates.len()],
-            fold_grinding_bits: vec![0; 2],
-            ood_samples: vec![0; 2],
-            merkle_hash: Default::default(),
-        };
-        let mut verifier_challenger =
-            crate::challenger::FsChallenger::new(b"direct-ab-proof-byte-oracle");
-        assert!(recursive_verifier_with_basis(
-            &v_cfg,
-            &got,
-            &combined_basis,
-            target,
-            &wtns_0.root(),
-            &mut verifier_challenger,
-        ));
     }
 
     /// `induce_sumcheck_evaluate_at_residual` matches dense

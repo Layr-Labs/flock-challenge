@@ -51,8 +51,7 @@ use kernels::aarch64::fold_one_row_neon_unchecked_8;
 #[cfg(target_arch = "aarch64")]
 use kernels::aarch64::{
     fold_and_message_aarch64, fold_compact_chunk_neon_unchecked_8,
-    fold_compact_stream_chunk_neon, fold_round2_chunk_neon_unchecked_8,
-    fold_round2_compact_chunk_neon_unchecked_8, fold_round2_compact_stream_chunk_neon,
+    fold_round2_chunk_neon_unchecked_8, fold_round2_compact_chunk_neon_unchecked_8,
 };
 #[cfg(all(
     target_arch = "x86_64",
@@ -72,15 +71,6 @@ use kernels::x86_64::{fold_and_message_x86_avx512, fold_round2_pair_x86_unchecke
 /// when `useful_bits` is odd in chunk units) is INSIDE the useful range and
 /// processed normally — its padding side has value 0 so the message
 /// contribution is naturally correct.
-/// Kill switch for the b≡1 chunk-class degeneration in the compact round-2 /
-/// round-3 kernels: `FLOCK_NO_R2_DEGEN=1` restores the plain gather path
-/// (bit-identical output either way — the degeneration only skips
-/// value-forced work). Read once per phase call, off the hot path.
-#[cfg(target_arch = "aarch64")]
-fn r2_degen_enabled() -> bool {
-    std::env::var_os("FLOCK_NO_R2_DEGEN").is_none_or(|v| v != *"1")
-}
-
 fn round2_pair_skip(padding: &PaddingSpec, k_skip: usize) -> (usize, usize) {
     if padding.k_log <= k_skip + 1 {
         return (0, usize::MAX);
@@ -564,8 +554,6 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_with_deltas(
     let anchor_chunk_size = 2 * lo_size;
     let delta_chunk_size = 2 * lo_size * n_chunks;
     let (pair_in_block_mask, useful_pairs_inclusive) = round2_pair_skip(padding, k_skip);
-    #[cfg(target_arch = "aarch64")]
-    let degen = r2_degen_enabled();
 
     // Chunks drain through the hetero queue so the idle efficiency cores add
     // throughput without an equal-band barrier penalty (see `epool`). Each
@@ -610,7 +598,6 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_with_deltas(
                     pair_idx_base,
                     pair_in_block_mask,
                     useful_pairs_inclusive,
-                    degen,
                 )
             };
 
@@ -665,204 +652,6 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_with_deltas(
     (compact, mlv_challenges[0] * sum1, sum_inf)
 }
 
-/// Byte-lane-outer streaming variant of
-/// [`uni_skip_fold_and_round_pair_compact_padded`]. Bit-identical outputs
-/// (fold XOR trees are merely reassociated). `lanes_per_pass ∈ {1, 2, 4, 8}`
-/// is the lane-blocking factor: each pass over a 128-pair tile consumes that
-/// many byte lanes of the fold table while the tile's four fold accumulators
-/// stay L1-resident. Probe-only entry point; non-aarch64 builds delegate to
-/// the gather-shaped base implementation.
-pub fn uni_skip_fold_and_round_pair_compact_padded_stream(
-    a_packed: &[u8],
-    b_packed: &[u8],
-    m: usize,
-    k_skip: usize,
-    table: &UniSkipFoldTable,
-    mlv_challenges: &[F128],
-    padding: &PaddingSpec,
-    lanes_per_pass: usize,
-) -> (UniSkipCompactFold, F128, F128) {
-    assert!(matches!(lanes_per_pass, 1 | 2 | 4 | 8));
-    #[cfg(not(target_arch = "aarch64"))]
-    {
-        let _ = lanes_per_pass;
-        return uni_skip_fold_and_round_pair_compact_padded(
-            a_packed,
-            b_packed,
-            m,
-            k_skip,
-            table,
-            mlv_challenges,
-            padding,
-        );
-    }
-    #[cfg(target_arch = "aarch64")]
-    {
-        assert_eq!(k_skip, 6, "compact stream variant is k_skip=6 only");
-        assert_eq!(table.n_chunks, 8);
-        let n_chunks = table.n_chunks;
-        let n_out = 1usize << (m - k_skip);
-        let n_pairs = n_out / 2;
-        assert_eq!(a_packed.len(), n_out * n_chunks);
-        assert_eq!(b_packed.len(), n_out * n_chunks);
-        assert_eq!(mlv_challenges.len(), m - k_skip);
-
-        let mut compact = UniSkipCompactFold {
-            anchors: crate::scratch::take_f128(2 * n_pairs),
-            deltas: ScratchBytes::take(2 * n_pairs * n_chunks),
-        };
-
-        let eq = SplitEqGhash::with_n_hi(&mlv_challenges[1..], COMPACT_RECONSTRUCTION_N_HI);
-        let lo_size = 1usize << eq.n_lo;
-        let hi_size = 1usize << eq.n_hi;
-        assert_eq!(lo_size * hi_size, n_pairs);
-        let eq_hi = &eq.hi;
-        let eq_lo = &eq.lo;
-        let anchor_chunk_size = 2 * lo_size;
-        let delta_chunk_size = 2 * lo_size * n_chunks;
-        let (pair_in_block_mask, useful_pairs_inclusive) = round2_pair_skip(padding, k_skip);
-
-        let mut partials: Vec<(F128, F128)> = vec![(F128::ZERO, F128::ZERO); hi_size];
-        let anchors_base = crate::epool::SyncPtr(compact.anchors.as_mut_ptr());
-        let deltas_base = crate::epool::SyncPtr(compact.deltas.as_mut_ptr());
-        let partials_base = crate::epool::SyncPtr(partials.as_mut_ptr());
-        crate::epool::run_hetero_chunks(hi_size, |x_hi| {
-            // SAFETY: same exclusive per-chunk ownership contract as
-            // `uni_skip_fold_and_round_pair_compact_padded_with_deltas`.
-            let (anchors, deltas) = unsafe {
-                (
-                    anchors_base.ptr().add(x_hi * anchor_chunk_size),
-                    deltas_base.ptr().add(x_hi * delta_chunk_size),
-                )
-            };
-            let pair_idx_base = x_hi * lo_size;
-            let row_base = pair_idx_base * 2;
-            let (p1, pinf) = unsafe {
-                let a_ptr = a_packed.as_ptr().add(row_base * n_chunks);
-                let b_ptr = b_packed.as_ptr().add(row_base * n_chunks);
-                let t_ptr = table.data.as_ptr().cast::<u8>();
-                match lanes_per_pass {
-                    1 => fold_round2_compact_stream_chunk_neon::<1>(
-                        t_ptr, a_ptr, b_ptr, anchors, deltas, eq_lo.as_ptr(), lo_size,
-                        pair_idx_base, pair_in_block_mask, useful_pairs_inclusive,
-                    ),
-                    2 => fold_round2_compact_stream_chunk_neon::<2>(
-                        t_ptr, a_ptr, b_ptr, anchors, deltas, eq_lo.as_ptr(), lo_size,
-                        pair_idx_base, pair_in_block_mask, useful_pairs_inclusive,
-                    ),
-                    4 => fold_round2_compact_stream_chunk_neon::<4>(
-                        t_ptr, a_ptr, b_ptr, anchors, deltas, eq_lo.as_ptr(), lo_size,
-                        pair_idx_base, pair_in_block_mask, useful_pairs_inclusive,
-                    ),
-                    _ => fold_round2_compact_stream_chunk_neon::<8>(
-                        t_ptr, a_ptr, b_ptr, anchors, deltas, eq_lo.as_ptr(), lo_size,
-                        pair_idx_base, pair_in_block_mask, useful_pairs_inclusive,
-                    ),
-                }
-            };
-            let eq_h = eq_hi[x_hi];
-            // SAFETY: exclusive owner of partials[x_hi].
-            unsafe {
-                *partials_base.ptr().add(x_hi) = (eq_h * p1, eq_h * pinf);
-            }
-        });
-        let (sum1, sum_inf) = partials
-            .iter()
-            .fold((F128::ZERO, F128::ZERO), |(s1, sinf), &(c1, cinf)| {
-                (s1 + c1, sinf + cinf)
-            });
-
-        (compact, mlv_challenges[0] * sum1, sum_inf)
-    }
-}
-
-/// Byte-lane-outer streaming variant of
-/// [`fold_compact_and_compute_round_pair`]. Bit-identical outputs; see
-/// [`uni_skip_fold_and_round_pair_compact_padded_stream`] for the schedule and
-/// the `lanes_per_pass` contract. Probe-only entry point.
-pub fn fold_compact_and_compute_round_pair_stream(
-    compact: &UniSkipCompactFold,
-    table: &UniSkipFoldTable,
-    r_fold: F128,
-    r_next: &[F128],
-    lanes_per_pass: usize,
-) -> (Vec<F128>, Vec<F128>, F128, F128) {
-    assert!(matches!(lanes_per_pass, 1 | 2 | 4 | 8));
-    #[cfg(not(target_arch = "aarch64"))]
-    {
-        let _ = lanes_per_pass;
-        return fold_compact_and_compute_round_pair(compact, table, r_fold, r_next);
-    }
-    #[cfg(target_arch = "aarch64")]
-    {
-        let n = compact.len();
-        assert!(!compact.is_empty() && n.is_power_of_two() && n >= 4);
-        assert_eq!(compact.anchors.len(), 2 * n);
-        assert_eq!(compact.deltas.len(), 2 * n * table.n_chunks);
-        assert_eq!(table.n_chunks, 8);
-        assert_eq!(r_next.len(), n.trailing_zeros() as usize);
-
-        let scaled_table = table.scaled_linear(r_fold);
-
-        let eq = SplitEqGhash::with_n_hi(&r_next[1..], COMPACT_RECONSTRUCTION_N_HI);
-        let lo_size = 1usize << eq.n_lo;
-        let hi_size = 1usize << eq.n_hi;
-        assert_eq!(lo_size * hi_size * 2, n);
-        let chunk_size = 2 * lo_size;
-        let eq_hi = &eq.hi;
-        let eq_lo = &eq.lo;
-
-        let mut a_out = crate::scratch::take_f128(n);
-        let mut b_out = crate::scratch::take_f128(n);
-        let mut partials: Vec<(F128, F128)> = vec![(F128::ZERO, F128::ZERO); hi_size];
-        let a_base = crate::epool::SyncPtr(a_out.as_mut_ptr());
-        let b_base = crate::epool::SyncPtr(b_out.as_mut_ptr());
-        let partials_base = crate::epool::SyncPtr(partials.as_mut_ptr());
-        crate::epool::run_hetero_chunks(hi_size, |x_hi| {
-            // SAFETY: same exclusive per-chunk ownership contract as
-            // `fold_compact_and_compute_round_pair`.
-            let (a_ptr, b_ptr) = unsafe {
-                (
-                    a_base.ptr().add(x_hi * chunk_size),
-                    b_base.ptr().add(x_hi * chunk_size),
-                )
-            };
-            let base = x_hi * chunk_size;
-            let (p1, pinf) = unsafe {
-                let t_ptr = scaled_table.as_ptr().cast::<u8>();
-                let anchors = compact.anchors.as_ptr().add(2 * base);
-                let deltas = compact.deltas.as_ptr().add(2 * base * table.n_chunks);
-                match lanes_per_pass {
-                    1 => fold_compact_stream_chunk_neon::<1>(
-                        t_ptr, anchors, deltas, a_ptr, b_ptr, eq_lo.as_ptr(), lo_size,
-                    ),
-                    2 => fold_compact_stream_chunk_neon::<2>(
-                        t_ptr, anchors, deltas, a_ptr, b_ptr, eq_lo.as_ptr(), lo_size,
-                    ),
-                    4 => fold_compact_stream_chunk_neon::<4>(
-                        t_ptr, anchors, deltas, a_ptr, b_ptr, eq_lo.as_ptr(), lo_size,
-                    ),
-                    _ => fold_compact_stream_chunk_neon::<8>(
-                        t_ptr, anchors, deltas, a_ptr, b_ptr, eq_lo.as_ptr(), lo_size,
-                    ),
-                }
-            };
-            let eq_h = eq_hi[x_hi];
-            // SAFETY: exclusive owner of partials[x_hi].
-            unsafe {
-                *partials_base.ptr().add(x_hi) = (eq_h * p1, eq_h * pinf);
-            }
-        });
-        let (sum1, sum_inf) = partials
-            .iter()
-            .fold((F128::ZERO, F128::ZERO), |(s1, sinf), &(c1, cinf)| {
-                (s1 + c1, sinf + cinf)
-            });
-
-        (a_out, b_out, r_next[0] * sum1, sum_inf)
-    }
-}
-
 /// Bind the first multilinear challenge from a compact round-two
 /// materialization and compute the following round message.
 ///
@@ -896,8 +685,6 @@ pub fn fold_compact_and_compute_round_pair(
 
     let mut a_out = crate::scratch::take_f128(n);
     let mut b_out = crate::scratch::take_f128(n);
-    #[cfg(target_arch = "aarch64")]
-    let degen = r2_degen_enabled();
     // Hetero-queue drain, same contract as the compact materialization above.
     let mut partials: Vec<(F128, F128)> = vec![(F128::ZERO, F128::ZERO); hi_size];
     let a_base = crate::epool::SyncPtr(a_out.as_mut_ptr());
@@ -924,7 +711,6 @@ pub fn fold_compact_and_compute_round_pair(
                     b_out.as_mut_ptr(),
                     eq_lo.as_ptr(),
                     lo_size,
-                    degen,
                 )
             };
 
@@ -1372,20 +1158,6 @@ pub fn fold_and_compute_round_pair_into(
     let lo_size = 1usize << eq.n_lo;
     let hi_size = 1usize << eq.n_hi;
     assert!(lo_size >= 2, "fold_and_compute requires lo_size ≥ 2");
-    // Rounds whose outputs are past LLC size write ping-pong buffers that are
-    // not read until the next round's barrier and cannot stay cache-resident;
-    // ordinary stores only add write-allocate (RFO) read traffic. Route those
-    // rounds through the kernel's `stnp` arm (the same best-effort hint the
-    // round-2 producer uses); LLC-resident later rounds keep normal stores so
-    // their outputs stay hot for the next round. 2^22 F128 = 64 MiB per array.
-    #[cfg(target_arch = "aarch64")]
-    let nt_stores = {
-        use std::sync::OnceLock;
-        static NT_ENABLED: OnceLock<bool> = OnceLock::new();
-        half >= (1usize << 21)
-            && *NT_ENABLED
-                .get_or_init(|| std::env::var_os("FLOCK_ZC_NT_LEGACY").is_none())
-    };
     // Total non-bound multilinear vars is log_n - 1; eq covers log_n - 2 of those.
     assert_eq!(lo_size * hi_size * 2, half);
 
@@ -1413,8 +1185,7 @@ pub fn fold_and_compute_round_pair_into(
                 unsafe { fold_and_message_x86_avx512(a_in, b_in, a_out, b_out, r_fold, eq_lo) };
 
             #[cfg(target_arch = "aarch64")]
-            let (p1, pinf) =
-                fold_and_message_aarch64(a_in, b_in, a_out, b_out, r_fold, eq_lo, nt_stores);
+            let (p1, pinf) = fold_and_message_aarch64(a_in, b_in, a_out, b_out, r_fold, eq_lo);
 
             #[cfg(not(any(
                 target_arch = "aarch64",

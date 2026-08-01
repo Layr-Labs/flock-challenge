@@ -1,4 +1,4 @@
-use super::{InvNttTableByteSingleGf8, F8};
+use super::{F8, InvNttTableByteSingleGf8};
 
 mod portable;
 
@@ -16,34 +16,8 @@ pub(super) use portable::shift_reduce_inner_ab_scalar;
 #[cfg(target_arch = "aarch64")]
 pub(super) mod aarch64;
 
-#[cfg(target_arch = "aarch64")]
-pub(super) use aarch64::StaticBContext;
-
-#[cfg(not(target_arch = "aarch64"))]
-#[derive(Clone, Copy)]
-pub(super) struct StaticBContext;
-
 #[cfg(target_arch = "x86_64")]
 pub(super) mod x86_64;
-
-/// Resolve the process-wide static-B policy and inverse-NTT partial table once
-/// per AB precompute, rather than once for every hot `(window, b_med)` call.
-#[inline]
-pub(super) fn prepare_static_b_context(
-    inv_table: &InvNttTableByteSingleGf8,
-    blake3_static_layout: bool,
-) -> Option<StaticBContext> {
-    #[cfg(target_arch = "aarch64")]
-    {
-        aarch64::prepare_static_b_context(inv_table, blake3_static_layout)
-    }
-
-    #[cfg(not(target_arch = "aarch64"))]
-    {
-        let _ = (inv_table, blake3_static_layout);
-        None
-    }
-}
 
 #[inline]
 pub(super) fn bit_transpose_64bytes(input: &[u8; 64], output: &mut [u8; 64]) {
@@ -86,27 +60,17 @@ pub(super) fn shift_reduce_inner_ab(
     out: &mut [u8; 64],
     a_col: &mut [F8],
     b_col: &mut [F8],
-    check_all_ones: bool,
-    check_single_k0: bool,
-    const_one_mask: u8,
-    bstatic_w: usize,
-    static_b_context: Option<StaticBContext>,
 ) {
     #[cfg(target_arch = "aarch64")]
     {
         let _ = (a_col, b_col);
-        aarch64::shift_reduce_inner_ab_fused_neon_checked(
+        aarch64::shift_reduce_inner_ab_fused_neon(
             a_packed,
             b_packed,
             inv_table,
             chunk_byte_base,
             b_med,
             out,
-            check_all_ones,
-            check_single_k0,
-            const_one_mask,
-            bstatic_w,
-            static_b_context,
         );
     }
 
@@ -117,15 +81,7 @@ pub(super) fn shift_reduce_inner_ab(
         target_feature = "avx512bw"
     ))]
     {
-        let _ = (
-            a_col,
-            b_col,
-            check_all_ones,
-            check_single_k0,
-            const_one_mask,
-            bstatic_w,
-            static_b_context,
-        );
+        let _ = (a_col, b_col);
         // SAFETY: all required target features are enabled at compile time.
         unsafe {
             x86_64::shift_reduce_inner_ab_x86_avx512(
@@ -146,13 +102,6 @@ pub(super) fn shift_reduce_inner_ab(
     ))]
     // SAFETY: gfni is enabled at compile time; SSE2 is baseline on x86_64.
     unsafe {
-        let _ = (
-            check_all_ones,
-            check_single_k0,
-            const_one_mask,
-            bstatic_w,
-            static_b_context,
-        );
         x86_64::shift_reduce_inner_ab_x86_sse(
             a_packed,
             b_packed,
@@ -169,25 +118,16 @@ pub(super) fn shift_reduce_inner_ab(
         target_arch = "aarch64",
         all(target_arch = "x86_64", target_feature = "gfni")
     )))]
-    {
-        let _ = (
-            check_all_ones,
-            check_single_k0,
-            const_one_mask,
-            bstatic_w,
-            static_b_context,
-        );
-        portable::shift_reduce_inner_ab_scalar(
-            a_packed,
-            b_packed,
-            inv_table,
-            chunk_byte_base,
-            b_med,
-            out,
-            a_col,
-            b_col,
-        );
-    }
+    portable::shift_reduce_inner_ab_scalar(
+        a_packed,
+        b_packed,
+        inv_table,
+        chunk_byte_base,
+        b_med,
+        out,
+        a_col,
+        b_col,
+    );
 }
 
 #[allow(clippy::too_many_arguments)]
