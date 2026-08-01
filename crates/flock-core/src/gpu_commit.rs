@@ -87,6 +87,170 @@ mod parent3_gate_tests {
     }
 }
 
+/// Strict kill switch for the single-dispatch fused Merkle parent tail (the
+/// ≤64-child chain after the parent3 passes). Only exact value `1` disables
+/// it; the optimization remains ranked-tree-only.
+pub const ENV_NO_GPU_PARENT_TAIL: &str = "FLOCK_NO_GPU_PARENT_TAIL";
+
+fn gpu_parent_tail_value_enabled(value: Option<&std::ffi::OsStr>) -> bool {
+    value != Some(std::ffi::OsStr::new("1"))
+}
+
+fn gpu_parent_tail_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        gpu_parent_tail_value_enabled(std::env::var_os(ENV_NO_GPU_PARENT_TAIL).as_deref())
+    })
+}
+
+fn select_gpu_parent_tail(n_leaves_total: usize, enabled: bool) -> bool {
+    enabled && n_leaves_total == 1usize << 20
+}
+
+#[cfg(test)]
+mod parent_tail_gate_tests {
+    use std::ffi::OsStr;
+
+    #[test]
+    fn default_on_exact_kill_switch_and_ranked_tree_only() {
+        assert!(!super::gpu_parent_tail_value_enabled(Some(OsStr::new("1"))));
+        for value in [None, Some(""), Some("0"), Some("01"), Some("true")] {
+            assert!(super::gpu_parent_tail_value_enabled(value.map(OsStr::new)));
+        }
+        assert!(super::select_gpu_parent_tail(1 << 20, true));
+        assert!(!super::select_gpu_parent_tail(1 << 20, false));
+        assert!(!super::select_gpu_parent_tail(1 << 19, true));
+    }
+
+    /// Host-side oracle for the tail's flat-tree slot arithmetic: the
+    /// `encode_parent_tail` out-start walk (`(ls,ll,cs,cl)` halving per
+    /// level) must land on the same absolute node indices as the flat-tree
+    /// level bases independently derived from the ranked geometry. Covers the
+    /// production call sites: full-tree chain (32 children after parent3) and
+    /// hybrid subtree chains (128 children after parent3 with the extended
+    /// tail), across the ranked 2^20-leaf geometry.
+    #[test]
+    fn tail_flat_slot_arithmetic_matches_layout() {
+        const N: usize = 1 << 20;
+
+        // Flat-tree level bases: level j base = sum of preceding level sizes.
+        fn level_bases(n: usize) -> Vec<usize> {
+            let mut bases = Vec::new();
+            let (mut base, mut len) = (0usize, n);
+            while len >= 1 {
+                bases.push(base);
+                base += len;
+                len >>= 1;
+            }
+            bases
+        }
+        let bases = level_bases(N);
+        assert_eq!(bases.len(), 21); // leaves .. root, 21 levels for 2^20
+
+        // Mirror of encode_parent_tail's out_start walk.
+        fn tail_out_starts(
+            level_start: usize,
+            level_len: usize,
+            local_start: usize,
+            local_len: usize,
+        ) -> Vec<usize> {
+            let mut out = Vec::new();
+            let (mut ls, mut ll, mut cs, mut cl) =
+                (level_start, level_len, local_start, local_len);
+            while cl > 1 {
+                let w = ls + ll;
+                out.push(w + cs / 2);
+                ls = w;
+                ll >>= 1;
+                cs >>= 1;
+                cl >>= 1;
+            }
+            out
+        }
+
+        // Full tree: parent3 stops at 32 children (level base = 2N-32 .. ),
+        // local chain spans the whole level.
+        for tail_len in [32usize, 64, 128] {
+            // Level containing `tail_len` nodes of the full tree: its base is
+            // bases[20 - tail_len.ilog2() as usize].
+            let lvl = 20 - tail_len.ilog2() as usize;
+            let base = bases[lvl];
+            let out = tail_out_starts(base, tail_len, 0, tail_len);
+            assert_eq!(out.len(), tail_len.ilog2() as usize);
+            for (i, &node) in out.iter().enumerate() {
+                assert_eq!(node, bases[lvl + 1 + i], "full-tree tail level {i}");
+            }
+            assert!(out.iter().all(|&n| n < 2 * N - 1));
+        }
+
+        // Hybrid subtree: subtree of 2^16 leaves at leaf_start (aligned),
+        // parent3 stops at local_len = 128 after three fused dispatches
+        // (3 halvings each), i.e. d = 16 - 7 = 9 levels descended. The
+        // residue sits at global level j = 20 - d = 11 (2^11 nodes), and its
+        // local position in that level is leaf_start >> d.
+        for leaf_start in [0usize, 1 << 19, (1 << 19) + (1 << 17), 11 * (N / 16) - (1 << 16)] {
+            let s = 1usize << 16;
+            assert_eq!(leaf_start % s, 0);
+            let local_len = 128usize; // 2^7
+            let d = 16 - local_len.ilog2() as usize;
+            let j = 20 - d; // global level of the residue
+            let local_start = leaf_start >> d;
+            let base = bases[20 - j];
+            assert!(local_start + local_len <= (1 << j));
+            let out = tail_out_starts(base, 1 << j, local_start, local_len);
+            assert_eq!(out.len(), 7); // 128 -> 64 -> 32 -> 16 -> 8 -> 4 -> 2 -> 1
+            for (i, &node) in out.iter().enumerate() {
+                let expect_local = local_start >> (i + 1);
+                assert_eq!(
+                    node,
+                    bases[20 - j + 1 + i] + expect_local,
+                    "hybrid subtree tail level {i}"
+                );
+                assert!(node < 2 * N - 1);
+            }
+        }
+    }
+}
+
+/// Opt-in switch for hashing Merkle leaves inside the final NTT pass (which
+/// would delete the standalone leaf dispatch and its 1 GiB codeword re-read).
+/// The kernel and its oracles are retained, but the mechanism is **off by
+/// default**: on the development host the fused epilogue costs more than the
+/// re-read it removes, so only an explicit `FLOCK_GPU_LEAF_FUSE=1` selects it.
+/// The protected runner clears the environment, so production takes the
+/// incumbent leaf dispatch.
+pub const ENV_GPU_LEAF_FUSE: &str = "FLOCK_GPU_LEAF_FUSE";
+
+fn gpu_leaf_fuse_value_enabled(value: Option<&std::ffi::OsStr>) -> bool {
+    value == Some(std::ffi::OsStr::new("1"))
+}
+
+fn gpu_leaf_fuse_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| gpu_leaf_fuse_value_enabled(std::env::var_os(ENV_GPU_LEAF_FUSE).as_deref()))
+}
+
+/// Leaf fusion needs the ranked final-pass geometry: it rides the mixed final
+/// pass, which only exists at `log_d = 20` with pass tuning active.
+fn gpu_leaf_fuse_selected(log_d: usize) -> bool {
+    gpu_leaf_fuse_enabled()
+        && log_d == 20
+        && select_gpu_mixed_final(log_d, 16, 4, pass_tune_enabled(), gpu_mixed_final_enabled())
+}
+
+#[cfg(test)]
+mod leaf_fuse_gate_tests {
+    use std::ffi::OsStr;
+
+    #[test]
+    fn default_off_and_exact_opt_in() {
+        assert!(super::gpu_leaf_fuse_value_enabled(Some(OsStr::new("1"))));
+        for value in [None, Some(""), Some("0"), Some("01"), Some("true")] {
+            assert!(!super::gpu_leaf_fuse_value_enabled(value.map(OsStr::new)));
+        }
+    }
+}
+
 /// Latched once: pass tuning enabled unless the kill switch is set.
 pub(crate) fn pass_tune_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -1334,6 +1498,198 @@ kernel void parent_hash3(device const uint* children [[buffer(0)]],
     }
 }
 
+// Single-dispatch parent tail: ONE threadgroup consumes the remaining L <= 128
+// children of a local chain (L a power of two) and produces all L-1 remaining
+// nodes across log2(L) levels, each written to its standard flat-tree slot.
+// Intermediate levels ping-pong through threadgroup memory, so the whole
+// 32->16->8->4->2->1 chain (5 dependent dispatches today) collapses into one
+// launch (and 128->64->...->1, previously parent3+ordinary+tail, also
+// collapses into one). Node indices are absolute (tree buffer bound at 0).
+struct TailParams {
+    uint child_start;   // absolute node index of the first child
+    uint n_children;    // power of two, 2..=128
+    uint out_start[7];  // absolute node index of each output level's slot 0
+};
+
+kernel void parent_hash_tail(device uint* tree      [[buffer(0)]],
+                             constant TailParams& T [[buffer(1)]],
+                             uint lid [[thread_index_in_threadgroup]])
+{
+    threadgroup uint stage[2][64u * 8u];
+    uint len = T.n_children;
+    uint level = 0u;
+    uint src_sel = 0u;
+
+    // Level 0 reads the children from device memory. Up to 128 children
+    // (64 outputs) are consumed by the 32-lane threadgroup two lanes at a
+    // time via the strided j-loop; smaller chains take one lane each.
+    {
+        const uint n_out = len >> 1;
+        for (uint j = lid; j < n_out; j += 32u) {
+            uint block[16];
+            device const uint* src = tree + (T.child_start + 2u * j) * 8u;
+            for (uint i = 0u; i < 16u; i++) block[i] = src[i];
+            uint cv[8];
+            for (uint i = 0u; i < 8u; i++) cv[i] = B3_IV[i];
+            b3_compress(cv, block, 64u, B3_PARENT);
+            device uint* dst = tree + (T.out_start[0] + j) * 8u;
+            for (uint i = 0u; i < 8u; i++) {
+                dst[i] = cv[i];
+                stage[0][j * 8u + i] = cv[i];
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        len = n_out;
+        level = 1u;
+    }
+
+    while (len > 1u) {
+        const uint n_out = len >> 1;
+        threadgroup const uint* src = stage[src_sel];
+        threadgroup uint* nxt = stage[src_sel ^ 1u];
+        if (lid < n_out) {
+            uint block[16];
+            for (uint i = 0u; i < 8u; i++) {
+                block[i]      = src[(2u * lid) * 8u + i];
+                block[8u + i] = src[(2u * lid + 1u) * 8u + i];
+            }
+            uint cv[8];
+            for (uint i = 0u; i < 8u; i++) cv[i] = B3_IV[i];
+            b3_compress(cv, block, 64u, B3_PARENT);
+            device uint* dst = tree + (T.out_start[level] + lid) * 8u;
+            for (uint i = 0u; i < 8u; i++) {
+                dst[i] = cv[i];
+                nxt[lid * 8u + i] = cv[i];
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        src_sel ^= 1u;
+        len = n_out;
+        level++;
+    }
+}
+
+// Leaf-fused mixed ranked final pass: identical algebra to ntt_pass5_mixed,
+// plus a BLAKE3 leaf epilogue. Requires P.s == 0 (guaranteed by
+// pass5_mixed_ok's l + 4 == log_d): the group's 16 elems are then positions
+// [16*tgid, 16*tgid + 16) — 16 contiguous whole 1 KiB leaves — so 16 threads
+// hash one leaf each (16 sequential 64-byte compressions: counter 0,
+// CHUNK_START on block 0, CHUNK_END on block 15, non-root, exactly the
+// leaf_hash chaining) and write the hashes to their flat-tree leaf slots in
+// buffer(3). This deletes the standalone leaf_hash dispatch and its 1 GiB
+// cold codeword re-read: after a device-scope barrier the epilogue reads the
+// group's own 16 KiB straight back out of cache. (A 16 KiB threadgroup tile
+// stage was measured first and lost ~2x — it caps final-pass occupancy — so
+// the device-readback variant is the one that lands.)
+kernel void ntt_pass5_mixed_leaf(device uint4* data                [[buffer(0)]],
+                                 device const uint4* twiddles      [[buffer(1)]],
+                                 constant NttParams& P             [[buffer(2)]],
+                                 device uint* leaves               [[buffer(3)]],
+                                 uint tgid [[threadgroup_position_in_grid]],
+                                 uint lid  [[thread_index_in_threadgroup]])
+{
+    constexpr uint F = 4u, NF = 1u << F;
+    constexpr uint NNIB_A = 10u;   // sub-layer 2: twiddle < 2^40
+    constexpr uint NNIB_B = 5u;    // sub-layer 3: twiddle < 2^20
+    threadgroup uint4 bases[3u * 4u];
+    threadgroup uint4 tabs[3u * 64u];
+    threadgroup uint  nibA[4u * NNIB_A];
+    threadgroup uint  nibB[8u * NNIB_B];
+
+    const uint lane = lid & 63u;
+    const uint B = tgid >> P.s;
+    const uint r = tgid & ((1u << P.s) - 1u);
+    const uint pos_base = (B << (P.log_d - P.l)) + r;
+
+    if (lid < 12u) {
+        uint t = lid >> 2, k = lid & 3u;
+        uint j = 31u - clz(t + 1u), c = t + 1u - (1u << j);
+        uint4 p = twiddles[(1u << (P.l + j)) - 1u + (B << j) + c];
+        for (uint m = 0; m < k * 4u; m++) p = gf_mulx(p);
+        bases[lid] = p;
+    }
+    if (lid < 40u) {
+        uint cA = lid / NNIB_A, qA = lid % NNIB_A;
+        uint4 twA = twiddles[(1u << (P.l + 2u)) - 1u + (B << 2) + cA];
+        nibA[lid] = (twA[qA >> 3] >> ((qA & 7u) * 4u)) & 15u;
+        uint cB = lid / NNIB_B, qB = lid % NNIB_B;
+        uint4 twB = twiddles[(1u << (P.l + 3u)) - 1u + (B << 3) + cB];
+        nibB[lid] = (twB[qB >> 3] >> ((qB & 7u) * 4u)) & 15u;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint ei = lid; ei < 3u * 64u; ei += 64u) {
+        uint t = ei >> 6, sub = ei & 63u, n = sub & 15u;
+        uint4 p = bases[(t << 2) | (sub >> 4)];
+        uint4 val = uint4(0u);
+        for (uint k = 0; k < 4u; k++) {
+            if ((n >> k) & 1u) val ^= p;
+            p = gf_mulx(p);
+        }
+        tabs[ei] = val;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    uint4 elems[NF];
+    for (uint e = 0; e < NF; e++) {
+        elems[e] = data[((pos_base + (e << P.s)) << 6) + lane];
+    }
+    for (uint j = 0; j < F; j++) {
+        const uint bpos = F - 1u - j;
+        for (uint b = 0; b < (NF >> 1); b++) {
+            uint low = b & ((1u << bpos) - 1u);
+            uint eu = ((b >> bpos) << (bpos + 1u)) | low;
+            uint ev = eu | (1u << bpos);
+            uint c = eu >> (F - j);
+            uint4 acc;
+            if (j < 2u) {
+                acc = gf_mul_tab4(elems[ev], &tabs[(((1u << j) - 1u) + c) << 6]);
+            } else {
+                const uint NN = (j == 2u) ? NNIB_A : NNIB_B;
+                threadgroup const uint* nb =
+                    (j == 2u) ? &nibA[c * NNIB_A] : &nibB[c * NNIB_B];
+                uint4 V0 = elems[ev];
+                uint4 V1 = gf_mulx(V0), V2 = gf_mulx(V1), V3 = gf_mulx(V2);
+                acc = uint4(0u);
+                for (int q = (int)NN - 1; q >= 0; q--) {
+                    acc = gf_shl4(acc);
+                    uint n = nb[q];
+                    if (n & 1u) acc ^= V0;
+                    if (n & 2u) acc ^= V1;
+                    if (n & 4u) acc ^= V2;
+                    if (n & 8u) acc ^= V3;
+                }
+            }
+            uint4 nu = elems[eu] ^ acc;
+            elems[eu] = nu;
+            elems[ev] ^= nu;
+        }
+    }
+    for (uint e = 0; e < NF; e++) {
+        data[((pos_base + (e << P.s)) << 6) + lane] = elems[e];
+    }
+    // Make this group's device writes visible to its own threads; the
+    // epilogue only reads positions this group just wrote.
+    threadgroup_barrier(mem_flags::mem_device);
+
+    // BLAKE3 leaf epilogue: thread t (< 16) hashes the finished leaf at
+    // position pos_base + t straight back out of (cached) device memory.
+    if (lid < NF) {
+        device const uint* leaf =
+            ((device const uint*)data) + ((pos_base + lid) << 8);
+        uint cv[8];
+        for (uint i = 0u; i < 8u; i++) cv[i] = B3_IV[i];
+        for (uint b = 0u; b < 16u; b++) {
+            uint block[16];
+            for (uint i = 0u; i < 16u; i++) block[i] = leaf[b * 16u + i];
+            uint flags = (b == 0u ? B3_CHUNK_START : 0u)
+                       | (b == 15u ? B3_CHUNK_END : 0u);
+            b3_compress(cv, block, 64u, flags);
+        }
+        device uint* out = leaves + (pos_base + lid) * 8u;
+        for (uint i = 0u; i < 8u; i++) out[i] = cv[i];
+    }
+}
+
 "#;
 
     // -----------------------------------------------------------------------
@@ -1357,6 +1713,8 @@ kernel void parent_hash3(device const uint* children [[buffer(0)]],
         pub(crate) pso_leaf: Id,
         pub(crate) pso_parent: Id,
         pub(crate) pso_parent3: Id,
+        pub(crate) pso_parent_tail: Id,
+        pub(crate) pso_ntt5mix_leaf: Id,
     }
     // SAFETY: MTLDevice/MTLCommandQueue/MTLComputePipelineState are
     // documented thread-safe; command buffers/encoders are created and used
@@ -1459,6 +1817,8 @@ kernel void parent_hash3(device const uint* children [[buffer(0)]],
                 let pso_leaf = pso("leaf_hash")?;
                 let pso_parent = pso("parent_hash")?;
                 let pso_parent3 = pso("parent_hash3")?;
+                let pso_parent_tail = pso("parent_hash_tail")?;
+                let pso_ntt5mix_leaf = pso("ntt_pass5_mixed_leaf")?;
                 send!(api, unsafe extern "C" fn(Id, Sel) -> Id, library, c"release");
                 Ok(Gpu {
                     api,
@@ -1475,6 +1835,8 @@ kernel void parent_hash3(device const uint* children [[buffer(0)]],
                     pso_leaf,
                     pso_parent,
                     pso_parent3,
+                    pso_parent_tail,
+                    pso_ntt5mix_leaf,
                 })
             })();
             pool_pop(pool);
@@ -1746,6 +2108,25 @@ kernel void parent_hash3(device const uint* children [[buffer(0)]],
         log_d: usize,
         start_layer: usize,
     ) {
+        unsafe { encode_ntt_passes_fused(gpu, enc, data_buf, tw_buf, log_d, start_layer, None) }
+    }
+
+    /// [`encode_ntt_passes`] with optional leaf fusion: when `leaf_tree` is
+    /// `Some(tree_buf)`, the final pass dispatches `ntt_pass5_mixed_leaf`
+    /// (which additionally hashes every finished leaf into `tree_buf`'s leaf
+    /// slots) instead of `ntt_pass5_mixed`. Callers must only pass `Some`
+    /// when the mixed final pass is selected for `(log_d - 4, 4)` (see
+    /// `select_gpu_leaf_fuse`), and must then skip the standalone leaf_hash
+    /// dispatch.
+    pub(crate) unsafe fn encode_ntt_passes_fused(
+        gpu: &Gpu,
+        enc: Id,
+        data_buf: Id,
+        tw_buf: Id,
+        log_d: usize,
+        start_layer: usize,
+        leaf_tree: Option<Id>,
+    ) {
         unsafe {
             gpu.set_buffer(enc, data_buf, 0, 0);
             gpu.set_buffer(enc, tw_buf, 0, 1);
@@ -1763,7 +2144,12 @@ kernel void parent_hash3(device const uint* children [[buffer(0)]],
                 // register occupancy; parallel 128/256/512-thread grouping
                 // loses badly because each lane keeps 16 F128s live.
                 let s = log_d - l - f;
+                let leaf_here = if l + f == log_d { leaf_tree } else { None };
                 let (pso, tpg, groups) = match f {
+                    4 if leaf_here.is_some() => {
+                        debug_assert!(super::gpu_mixed_final_selected(log_d, l, f));
+                        (gpu.pso_ntt5mix_leaf, 64u64, 1u64 << (log_d - f))
+                    }
                     4 if share_log > 0 && s >= share_log => (
                         gpu.pso_ntt4g4,
                         64u64,
@@ -1785,6 +2171,9 @@ kernel void parent_hash3(device const uint* children [[buffer(0)]],
                     3 => (gpu.pso_ntt3, 64u64, 1u64 << (log_d - f)),
                     _ => (gpu.pso_ntt, 1u64 << (f + 5), 1u64 << (log_d - f)),
                 };
+                if let Some(tree) = leaf_here {
+                    gpu.set_buffer(enc, tree, 0, 3);
+                }
                 gpu.set_pipeline(enc, pso);
                 let p = NttParams {
                     log_d: log_d as u32,
@@ -1808,6 +2197,7 @@ kernel void parent_hash3(device const uint* children [[buffer(0)]],
     /// (`B = tgid >> (P.s - LOG_G)`), so dispatching `groups * prefix16/16`
     /// threadgroups enumerates exactly the prefix blocks of every pass with
     /// `l >= 4`.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) unsafe fn encode_ntt_passes_prefix(
         gpu: &Gpu,
         enc: Id,
@@ -1816,6 +2206,36 @@ kernel void parent_hash3(device const uint* children [[buffer(0)]],
         log_d: usize,
         start_layer: usize,
         prefix16: u64,
+    ) {
+        unsafe {
+            encode_ntt_passes_prefix_fused(
+                gpu,
+                enc,
+                data_buf,
+                tw_buf,
+                log_d,
+                start_layer,
+                prefix16,
+                None,
+            )
+        }
+    }
+
+    /// [`encode_ntt_passes_prefix`] with optional leaf fusion (see
+    /// [`encode_ntt_passes_fused`]). The final mixed pass finalizes 16
+    /// contiguous positions (= 16 whole leaves) per group, so the prefix
+    /// dispatch bound `groups * prefix16 / 16` covers exactly the leaves
+    /// `[0, prefix16 * 2^(log_d-4))` — precisely the GPU-owned hybrid prefix.
+    /// CPU-owned suffix leaves are never touched.
+    pub(crate) unsafe fn encode_ntt_passes_prefix_fused(
+        gpu: &Gpu,
+        enc: Id,
+        data_buf: Id,
+        tw_buf: Id,
+        log_d: usize,
+        start_layer: usize,
+        prefix16: u64,
+        leaf_tree: Option<Id>,
     ) {
         unsafe {
             gpu.set_buffer(enc, data_buf, 0, 0);
@@ -1828,7 +2248,12 @@ kernel void parent_hash3(device const uint* children [[buffer(0)]],
             for (l, f) in super::plan_passes(log_d, start_layer) {
                 debug_assert!(l >= 4, "prefix passes require layer >= 4 blocks");
                 let s = log_d - l - f;
+                let leaf_here = if l + f == log_d { leaf_tree } else { None };
                 let (pso, tpg, groups) = match f {
+                    4 if leaf_here.is_some() => {
+                        debug_assert!(super::gpu_mixed_final_selected(log_d, l, f));
+                        (gpu.pso_ntt5mix_leaf, 64u64, 1u64 << (log_d - f))
+                    }
                     4 if share_log > 0 && s >= share_log => (
                         gpu.pso_ntt4g4,
                         64u64,
@@ -1850,6 +2275,9 @@ kernel void parent_hash3(device const uint* children [[buffer(0)]],
                     3 => (gpu.pso_ntt3, 64u64, 1u64 << (log_d - f)),
                     _ => (gpu.pso_ntt, 1u64 << (f + 5), 1u64 << (log_d - f)),
                 };
+                if let Some(tree) = leaf_here {
+                    gpu.set_buffer(enc, tree, 0, 3);
+                }
                 gpu.set_pipeline(enc, pso);
                 let p = NttParams {
                     log_d: log_d as u32,
@@ -1868,9 +2296,64 @@ kernel void parent_hash3(device const uint* children [[buffer(0)]],
         }
     }
 
+    /// CPU-side mirror of the MSL `TailParams` argument block.
+    #[repr(C)]
+    pub(crate) struct TailParams {
+        pub(crate) child_start: u32,
+        pub(crate) n_children: u32,
+        pub(crate) out_start: [u32; 7],
+    }
+
+    /// Encode the single-dispatch parent tail: one 32-thread threadgroup
+    /// consumes the `local_len <= 128` children at
+    /// `level_start + local_start` and writes every remaining node of the
+    /// local chain (all `log2(local_len)` levels) to its standard flat-tree
+    /// slot. `level_start`/`level_len` describe the children's global level;
+    /// `local_start`/`local_len` the chain's slice of it.
+    unsafe fn encode_parent_tail(
+        gpu: &Gpu,
+        enc: Id,
+        tree_buf: Id,
+        level_start: usize,
+        level_len: usize,
+        local_start: usize,
+        local_len: usize,
+    ) {
+        debug_assert!(local_len.is_power_of_two());
+        debug_assert!((2..=128).contains(&local_len));
+        let mut t = TailParams {
+            child_start: (level_start + local_start) as u32,
+            n_children: local_len as u32,
+            out_start: [0u32; 7],
+        };
+        let (mut ls, mut ll, mut cs, mut cl, mut i) =
+            (level_start, level_len, local_start, local_len, 0usize);
+        while cl > 1 {
+            let w = ls + ll;
+            t.out_start[i] = (w + cs / 2) as u32;
+            ls = w;
+            ll >>= 1;
+            cs >>= 1;
+            cl >>= 1;
+            i += 1;
+        }
+        unsafe {
+            gpu.set_pipeline(enc, gpu.pso_parent_tail);
+            gpu.set_buffer(enc, tree_buf, 0, 0);
+            let bytes = core::slice::from_raw_parts(
+                (&t as *const TailParams).cast::<u8>(),
+                core::mem::size_of::<TailParams>(),
+            );
+            gpu.set_bytes(enc, bytes, 1);
+            gpu.dispatch(enc, 1, 32);
+        }
+    }
+
     /// Encode leaves + all parent levels of ONE aligned subtree
     /// (`subtree_leaves` a power of two, `leaf_start` aligned to it), writing
-    /// into the subtree's slots of the GLOBAL flat tree layout.
+    /// into the subtree's slots of the GLOBAL flat tree layout. With
+    /// `skip_leaf` the leaf hashes are assumed already written (leaf-fused
+    /// final NTT pass) and only the parent levels are encoded.
     pub(crate) unsafe fn encode_merkle_subtree(
         gpu: &Gpu,
         enc: Id,
@@ -1879,6 +2362,7 @@ kernel void parent_hash3(device const uint* children [[buffer(0)]],
         n_leaves_total: usize,
         leaf_start: usize,
         subtree_leaves: usize,
+        skip_leaf: bool,
     ) {
         unsafe {
             encode_merkle_subtree_impl(
@@ -1890,6 +2374,8 @@ kernel void parent_hash3(device const uint* children [[buffer(0)]],
                 leaf_start,
                 subtree_leaves,
                 super::select_gpu_parent3(n_leaves_total, super::gpu_parent3_enabled()),
+                super::select_gpu_parent_tail(n_leaves_total, super::gpu_parent_tail_enabled()),
+                skip_leaf,
             )
         }
     }
@@ -1903,15 +2389,19 @@ kernel void parent_hash3(device const uint* children [[buffer(0)]],
         leaf_start: usize,
         subtree_leaves: usize,
         parent3: bool,
+        parent_tail: bool,
+        skip_leaf: bool,
     ) {
         debug_assert!(subtree_leaves.is_power_of_two());
         debug_assert_eq!(leaf_start % subtree_leaves, 0);
         unsafe {
-            gpu.set_pipeline(enc, gpu.pso_leaf);
-            gpu.set_buffer(enc, codeword_buf, leaf_start * 1024, 0);
-            gpu.set_buffer(enc, tree_buf, leaf_start * 32, 1);
-            let tpg = 256u64.min(subtree_leaves as u64);
-            gpu.dispatch(enc, subtree_leaves as u64 / tpg, tpg);
+            if !skip_leaf {
+                gpu.set_pipeline(enc, gpu.pso_leaf);
+                gpu.set_buffer(enc, codeword_buf, leaf_start * 1024, 0);
+                gpu.set_buffer(enc, tree_buf, leaf_start * 32, 1);
+                let tpg = 256u64.min(subtree_leaves as u64);
+                gpu.dispatch(enc, subtree_leaves as u64 / tpg, tpg);
+            }
 
             let mut level_start = 0usize; // global node index of level base
             let mut level_len = n_leaves_total;
@@ -1949,8 +2439,12 @@ kernel void parent_hash3(device const uint* children [[buffer(0)]],
                 }
             }
 
+            // Ordinary passes down to the tail-fusible width (<= 64 children
+            // when the tail kernel is on, mirroring parent3's boundary
+            // choice), then one dispatch for the whole remaining chain.
+            let floor = if parent_tail { 128 } else { 1 };
             gpu.set_pipeline(enc, gpu.pso_parent);
-            while local_len > 1 {
+            while local_len > floor {
                 let write_level_start = level_start + level_len;
                 let n_out = local_len / 2;
                 gpu.set_buffer(enc, tree_buf, (level_start + local_start) * 32, 0);
@@ -1967,17 +2461,25 @@ kernel void parent_hash3(device const uint* children [[buffer(0)]],
                 local_start /= 2;
                 local_len = n_out;
             }
+            if parent_tail && local_len > 1 {
+                encode_parent_tail(
+                    gpu, enc, tree_buf, level_start, level_len, local_start, local_len,
+                );
+            }
         }
     }
 
     /// Encode leaf hashing (1 KiB leaves) + all parent levels into `tree_buf`
-    /// (flat layout: leaves first, then parent levels, root last).
+    /// (flat layout: leaves first, then parent levels, root last). With
+    /// `skip_leaf` the leaf hashes are assumed already written (leaf-fused
+    /// final NTT pass) and only the parent levels are encoded.
     pub(crate) unsafe fn encode_merkle(
         gpu: &Gpu,
         enc: Id,
         codeword_buf: Id,
         tree_buf: Id,
         n_leaves: usize,
+        skip_leaf: bool,
     ) {
         unsafe {
             encode_merkle_impl(
@@ -1987,6 +2489,8 @@ kernel void parent_hash3(device const uint* children [[buffer(0)]],
                 tree_buf,
                 n_leaves,
                 super::select_gpu_parent3(n_leaves, super::gpu_parent3_enabled()),
+                super::select_gpu_parent_tail(n_leaves, super::gpu_parent_tail_enabled()),
+                skip_leaf,
             )
         }
     }
@@ -1998,13 +2502,17 @@ kernel void parent_hash3(device const uint* children [[buffer(0)]],
         tree_buf: Id,
         n_leaves: usize,
         parent3: bool,
+        parent_tail: bool,
+        skip_leaf: bool,
     ) {
         unsafe {
-            gpu.set_pipeline(enc, gpu.pso_leaf);
-            gpu.set_buffer(enc, codeword_buf, 0, 0);
-            gpu.set_buffer(enc, tree_buf, 0, 1);
-            let tpg = 256u64.min(n_leaves as u64);
-            gpu.dispatch(enc, n_leaves as u64 / tpg, tpg);
+            if !skip_leaf {
+                gpu.set_pipeline(enc, gpu.pso_leaf);
+                gpu.set_buffer(enc, codeword_buf, 0, 0);
+                gpu.set_buffer(enc, tree_buf, 0, 1);
+                let tpg = 256u64.min(n_leaves as u64);
+                gpu.dispatch(enc, n_leaves as u64 / tpg, tpg);
+            }
 
             let mut read_start = 0usize; // node index
             let mut read_len = n_leaves;
@@ -2029,8 +2537,11 @@ kernel void parent_hash3(device const uint* children [[buffer(0)]],
                 }
             }
 
+            // Ordinary passes down to the tail-fusible width, then a single
+            // dispatch for the whole remaining 32-child (or <= 64) chain.
+            let floor = if parent_tail { 128 } else { 1 };
             gpu.set_pipeline(enc, gpu.pso_parent);
-            while read_len > 1 {
+            while read_len > floor {
                 let write_start = read_start + read_len;
                 let n_out = read_len / 2;
                 gpu.set_buffer(enc, tree_buf, read_start * 32, 0);
@@ -2039,6 +2550,10 @@ kernel void parent_hash3(device const uint* children [[buffer(0)]],
                 gpu.dispatch(enc, n_out as u64 / tpg, tpg);
                 read_start = write_start;
                 read_len = n_out;
+            }
+            if parent_tail && read_len > 1 {
+                // Full tree: the local chain spans the whole level.
+                encode_parent_tail(gpu, enc, tree_buf, read_start, read_len, 0, read_len);
             }
         }
     }
@@ -2605,9 +3120,21 @@ kernel void parent_hash3(device const uint* children [[buffer(0)]],
                 } else {
                     gpu.dispatch(enc, 1u64 << (log_d - 4), 64);
                 }
-                // Passes 2..: layers 4..log_d in place over staging.
-                encode_ntt_passes(gpu, enc, staging, tw_buf, log_d, 4);
-                encode_merkle(gpu, enc, staging, tree_buf, n_leaves);
+                // Passes 2..: layers 4..log_d in place over staging. When
+                // leaf fusion is selected, the final pass also hashes every
+                // leaf into tree_buf, so the Merkle encoder skips its leaf
+                // dispatch (and the 1 GiB codeword re-read).
+                let leaf_fuse = super::gpu_leaf_fuse_selected(log_d);
+                encode_ntt_passes_fused(
+                    gpu,
+                    enc,
+                    staging,
+                    tw_buf,
+                    log_d,
+                    4,
+                    leaf_fuse.then_some(tree_buf),
+                );
+                encode_merkle(gpu, enc, staging, tree_buf, n_leaves, leaf_fuse);
                 gpu.end_encoding(enc);
                 gpu.commit_and_wait(cb)
             })();
@@ -2631,8 +3158,17 @@ kernel void parent_hash3(device const uint* children [[buffer(0)]],
             let r = (|| {
                 let cb = gpu.command_buffer()?;
                 let enc = gpu.compute_encoder(cb)?;
-                encode_ntt_passes(gpu, enc, staging, tw_buf, log_d, 4);
-                encode_merkle(gpu, enc, staging, tree_buf, n_leaves);
+                let leaf_fuse = super::gpu_leaf_fuse_selected(log_d);
+                encode_ntt_passes_fused(
+                    gpu,
+                    enc,
+                    staging,
+                    tw_buf,
+                    log_d,
+                    4,
+                    leaf_fuse.then_some(tree_buf),
+                );
+                encode_merkle(gpu, enc, staging, tree_buf, n_leaves, leaf_fuse);
                 gpu.end_encoding(enc);
                 gpu.commit_and_wait(cb)
             })();
@@ -2728,7 +3264,22 @@ kernel void parent_hash3(device const uint* children [[buffer(0)]],
             let prefix16 = (16 - k_cpu16) as u64;
             let cb2 = gpu.command_buffer()?;
             let enc = gpu.compute_encoder(cb2)?;
-            encode_ntt_passes_prefix(gpu, enc, staging, tw_buf, log_d, 4, prefix16);
+            // Leaf fusion: the final mixed pass writes exactly the prefix's
+            // leaves (its dispatch covers positions [0, prefix16 * 2^16),
+            // 16 whole contiguous leaves per group), so every prefix subtree
+            // below skips its leaf dispatch. CPU-owned suffix leaves are
+            // outside the dispatch bound and stay untouched.
+            let leaf_fuse = super::gpu_leaf_fuse_selected(log_d);
+            encode_ntt_passes_prefix_fused(
+                gpu,
+                enc,
+                staging,
+                tw_buf,
+                log_d,
+                4,
+                prefix16,
+                leaf_fuse.then_some(tree_buf),
+            );
             // Greedy aligned power-of-two subtree decomposition of the
             // leaf prefix.
             let sixteenth = n_leaves / 16;
@@ -2739,7 +3290,9 @@ kernel void parent_hash3(device const uint* children [[buffer(0)]],
                 while start % size != 0 {
                     size >>= 1;
                 }
-                encode_merkle_subtree(gpu, enc, staging, tree_buf, n_leaves, start, size);
+                encode_merkle_subtree(
+                    gpu, enc, staging, tree_buf, n_leaves, start, size, leaf_fuse,
+                );
                 start += size;
             }
             gpu.end_encoding(enc);
@@ -3878,7 +4431,7 @@ kernel void parent_hash3(device const uint* children [[buffer(0)]],
                 let run = (|| -> Result<Vec<crate::merkle::Hash>, String> {
                     let cb = gpu.command_buffer()?;
                     let enc = gpu.compute_encoder(cb)?;
-                    encode_merkle(gpu, enc, data_buf, tree_buf, n_leaves);
+                    encode_merkle(gpu, enc, data_buf, tree_buf, n_leaves, false);
                     gpu.end_encoding(enc);
                     gpu.commit_and_wait(cb)?;
                     let mut tree: Vec<crate::merkle::Hash> =
@@ -4376,7 +4929,7 @@ mod tests {
             );
             let cb = gpu.command_buffer().unwrap();
             let enc = gpu.compute_encoder(cb).unwrap();
-            imp::encode_merkle_impl(gpu, enc, data_buf, tree_buf, n_leaves, true);
+            imp::encode_merkle_impl(gpu, enc, data_buf, tree_buf, n_leaves, true, false, false);
             gpu.end_encoding(enc);
             gpu.commit_and_wait(cb).unwrap();
             let got = core::slice::from_raw_parts(
@@ -4440,6 +4993,8 @@ mod tests {
                 LEAF_START,
                 SUBTREE_LEAVES,
                 true,
+                false,
+                false,
             );
             gpu.end_encoding(enc);
             gpu.commit_and_wait(cb).unwrap();
@@ -4477,6 +5032,389 @@ mod tests {
                 .zip(affected)
                 .all(|(node, touched)| touched || *node == SENTINEL),
             "parent3 subtree encoder wrote outside its owned flat-tree ranges",
+        );
+    }
+
+    /// Compact real-Metal oracle for the single-dispatch parent tail: every
+    /// flat-tree node vs the CPU reference, across parent3 on/off and small
+    /// whole-remainder trees (L <= 64 fused in one dispatch).
+    #[test]
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    fn gpu_parent_tail_full_tree_matches_cpu_compact() {
+        use super::imp;
+
+        for (n_leaves, parent3) in [(1usize << 12, true), (1 << 12, false), (64, false), (32, false)]
+        {
+            let mut rng = Rng::new(0x7A11 + n_leaves as u64 + parent3 as u64);
+            let data: Vec<u8> = (0..n_leaves * 1024)
+                .map(|_| (rng.next_u64() & 0xff) as u8)
+                .collect();
+            let expect =
+                crate::merkle::merkle_tree(&data, n_leaves, crate::merkle::HashKind::Blake3);
+            let gpu = match gpu_or_skip(imp::gpu().map(|g| g as *const imp::Gpu)) {
+                Some(g) => unsafe { &*g },
+                None => return,
+            };
+            unsafe {
+                let pool = gpu.pool_push();
+                let data_buf = gpu.new_buffer(data.len()).unwrap();
+                let tree_buf = gpu.new_buffer(expect.len() * 32).unwrap();
+                std::ptr::copy_nonoverlapping(
+                    data.as_ptr(),
+                    gpu.buffer_contents(data_buf),
+                    data.len(),
+                );
+                let cb = gpu.command_buffer().unwrap();
+                let enc = gpu.compute_encoder(cb).unwrap();
+                imp::encode_merkle_impl(
+                    gpu, enc, data_buf, tree_buf, n_leaves, parent3, true, false,
+                );
+                gpu.end_encoding(enc);
+                gpu.commit_and_wait(cb).unwrap();
+                let got = core::slice::from_raw_parts(
+                    gpu.buffer_contents(tree_buf).cast::<crate::merkle::Hash>(),
+                    expect.len(),
+                );
+                assert_eq!(
+                    got,
+                    expect.as_slice(),
+                    "parent tail mismatch n_leaves={n_leaves} parent3={parent3}"
+                );
+                gpu.release(data_buf);
+                gpu.release(tree_buf);
+                gpu.pool_pop(pool);
+            }
+        }
+    }
+
+    /// Hybrid aligned-subtree oracle for the parent tail: owned flat-tree
+    /// ranges exactly match the CPU reference at every level, everything
+    /// else keeps its sentinel (the concurrent CPU owner's ranges are never
+    /// touched).
+    #[test]
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    fn gpu_parent_tail_subtree_layout_matches_cpu_compact() {
+        use super::imp;
+
+        const N_LEAVES: usize = 1 << 10;
+        const SENTINEL: crate::merkle::Hash = [0xA5; 32];
+        let mut rng = Rng::new(0x7A11_5B);
+        let data: Vec<u8> = (0..N_LEAVES * 1024)
+            .map(|_| (rng.next_u64() & 0xff) as u8)
+            .collect();
+        let expect = crate::merkle::merkle_tree(&data, N_LEAVES, crate::merkle::HashKind::Blake3);
+        let gpu = match gpu_or_skip(imp::gpu().map(|g| g as *const imp::Gpu)) {
+            Some(g) => unsafe { &*g },
+            None => return,
+        };
+
+        for (leaf_start, subtree_leaves, parent3) in
+            [(512usize, 512usize, true), (512, 512, false), (960, 64, false)]
+        {
+            let mut initial = vec![SENTINEL; expect.len()];
+            unsafe {
+                let pool = gpu.pool_push();
+                let data_buf = gpu.new_buffer(data.len()).unwrap();
+                let tree_bytes = core::mem::size_of_val(initial.as_slice());
+                let tree_buf = gpu.new_buffer(tree_bytes).unwrap();
+                std::ptr::copy_nonoverlapping(
+                    data.as_ptr(),
+                    gpu.buffer_contents(data_buf),
+                    data.len(),
+                );
+                std::ptr::copy_nonoverlapping(
+                    initial.as_ptr().cast::<u8>(),
+                    gpu.buffer_contents(tree_buf),
+                    tree_bytes,
+                );
+                let cb = gpu.command_buffer().unwrap();
+                let enc = gpu.compute_encoder(cb).unwrap();
+                imp::encode_merkle_subtree_impl(
+                    gpu,
+                    enc,
+                    data_buf,
+                    tree_buf,
+                    N_LEAVES,
+                    leaf_start,
+                    subtree_leaves,
+                    parent3,
+                    true,
+                    false,
+                );
+                gpu.end_encoding(enc);
+                gpu.commit_and_wait(cb).unwrap();
+                std::ptr::copy_nonoverlapping(
+                    gpu.buffer_contents(tree_buf).cast::<crate::merkle::Hash>(),
+                    initial.as_mut_ptr(),
+                    initial.len(),
+                );
+                gpu.release(data_buf);
+                gpu.release(tree_buf);
+                gpu.pool_pop(pool);
+            }
+
+            let mut affected = vec![false; initial.len()];
+            let mut level_start = 0usize;
+            let mut level_len = N_LEAVES;
+            let mut local_start = leaf_start;
+            let mut local_len = subtree_leaves;
+            loop {
+                let start = level_start + local_start;
+                let end = start + local_len;
+                assert_eq!(
+                    &initial[start..end],
+                    &expect[start..end],
+                    "tail subtree mismatch start={leaf_start} size={subtree_leaves} parent3={parent3}"
+                );
+                affected[start..end].fill(true);
+                if local_len == 1 {
+                    break;
+                }
+                level_start += level_len;
+                level_len >>= 1;
+                local_start >>= 1;
+                local_len >>= 1;
+            }
+            assert!(
+                initial
+                    .iter()
+                    .zip(affected)
+                    .all(|(node, touched)| touched || *node == SENTINEL),
+                "parent tail subtree encoder wrote outside its owned flat-tree ranges",
+            );
+        }
+    }
+
+    /// Compact real-Metal oracle for the leaf-fused final NTT pass on the
+    /// full-tree path: the final pass hashes leaves itself, the Merkle
+    /// encoder skips its leaf dispatch, and codeword + every flat-tree node
+    /// must match the CPU reference — across A off / A on (composability).
+    #[test]
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    fn gpu_leaf_fuse_full_graph_matches_cpu_compact() {
+        use super::imp;
+        let log_d = 8usize;
+        let n_leaves = 1usize << log_d;
+        let ntt = AdditiveNttF128::standard(log_d);
+        let twiddles = flat_twiddle_table(&ntt, log_d);
+        // The compact shape must satisfy the mixed-final gate the leaf-fused
+        // kernel piggybacks on.
+        assert!(pass5_mixed_ok(log_d, log_d - 4, 4));
+        let mut rng = Rng::new(0x1EAF_F5);
+        let input = rng.vec(64 << log_d);
+        let mut expect = input.clone();
+        ntt.forward_transform_interleaved_from_layer(&mut expect, 64, 4);
+        let expect_bytes = unsafe {
+            core::slice::from_raw_parts(
+                expect.as_ptr().cast::<u8>(),
+                core::mem::size_of_val(expect.as_slice()),
+            )
+        };
+        let expect_tree =
+            crate::merkle::merkle_tree(expect_bytes, n_leaves, crate::merkle::HashKind::Blake3);
+        let gpu = match gpu_or_skip(imp::gpu().map(|g| g as *const imp::Gpu)) {
+            Some(g) => unsafe { &*g },
+            None => return,
+        };
+        for (leaf_fuse, parent_tail) in [(true, false), (false, true), (true, true)] {
+            unsafe {
+                let pool = gpu.pool_push();
+                let data_bytes = core::mem::size_of_val(input.as_slice());
+                let data_buf = gpu.new_buffer(data_bytes).unwrap();
+                let tw_buf = gpu
+                    .new_buffer(core::mem::size_of_val(twiddles.as_slice()))
+                    .unwrap();
+                let tree_buf = gpu.new_buffer((2 * n_leaves - 1) * 32).unwrap();
+                std::ptr::copy_nonoverlapping(
+                    input.as_ptr().cast::<u8>(),
+                    gpu.buffer_contents(data_buf),
+                    data_bytes,
+                );
+                std::ptr::copy_nonoverlapping(
+                    twiddles.as_ptr().cast::<u8>(),
+                    gpu.buffer_contents(tw_buf),
+                    core::mem::size_of_val(twiddles.as_slice()),
+                );
+                let cb = gpu.command_buffer().unwrap();
+                let enc = gpu.compute_encoder(cb).unwrap();
+                imp::encode_ntt_passes_fused(
+                    gpu,
+                    enc,
+                    data_buf,
+                    tw_buf,
+                    log_d,
+                    4,
+                    leaf_fuse.then_some(tree_buf),
+                );
+                imp::encode_merkle_impl(
+                    gpu, enc, data_buf, tree_buf, n_leaves, false, parent_tail, leaf_fuse,
+                );
+                gpu.end_encoding(enc);
+                gpu.commit_and_wait(cb).unwrap();
+                let got = core::slice::from_raw_parts(
+                    gpu.buffer_contents(data_buf).cast::<F128>(),
+                    expect.len(),
+                );
+                assert_eq!(
+                    got,
+                    expect.as_slice(),
+                    "codeword mismatch leaf_fuse={leaf_fuse} tail={parent_tail}"
+                );
+                let got_tree = core::slice::from_raw_parts(
+                    gpu.buffer_contents(tree_buf).cast::<crate::merkle::Hash>(),
+                    expect_tree.len(),
+                );
+                assert_eq!(
+                    got_tree,
+                    expect_tree.as_slice(),
+                    "tree mismatch leaf_fuse={leaf_fuse} tail={parent_tail}"
+                );
+                gpu.release(data_buf);
+                gpu.release(tw_buf);
+                gpu.release(tree_buf);
+                gpu.pool_pop(pool);
+            }
+        }
+    }
+
+    /// Hybrid-prefix oracle for the leaf-fused final pass: the prefix
+    /// dispatch must hash exactly the GPU-owned prefix leaves (16 whole
+    /// contiguous leaves per group), the prefix subtrees build their parents
+    /// from them, and every CPU-owned leaf slot and codeword position stays
+    /// untouched (sentinel checks mirror the parent3 subtree test).
+    #[test]
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    fn gpu_leaf_fuse_hybrid_prefix_layout_matches_cpu_compact() {
+        use super::imp;
+        let log_d = 8usize;
+        let n_leaves = 1usize << log_d;
+        let k_cpu16 = 5usize; // prefix16 = 11: exercises 128/32/16 subtrees
+        let prefix16 = 16 - k_cpu16;
+        let prefix_leaves = prefix16 * (n_leaves / 16);
+        const SENTINEL: crate::merkle::Hash = [0xA5; 32];
+        let ntt = AdditiveNttF128::standard(log_d);
+        let twiddles = flat_twiddle_table(&ntt, log_d);
+        assert!(pass5_mixed_ok(log_d, log_d - 4, 4));
+        let mut rng = Rng::new(0x1EAF_11B);
+        let input = rng.vec(64 << log_d);
+        let mut expect = input.clone();
+        ntt.forward_transform_interleaved_from_layer(&mut expect, 64, 4);
+        let expect_bytes = unsafe {
+            core::slice::from_raw_parts(
+                expect.as_ptr().cast::<u8>(),
+                core::mem::size_of_val(expect.as_slice()),
+            )
+        };
+        let expect_tree =
+            crate::merkle::merkle_tree(expect_bytes, n_leaves, crate::merkle::HashKind::Blake3);
+        let mut tree = vec![SENTINEL; expect_tree.len()];
+        let gpu = match gpu_or_skip(imp::gpu().map(|g| g as *const imp::Gpu)) {
+            Some(g) => unsafe { &*g },
+            None => return,
+        };
+        let got_data: Vec<F128>;
+        unsafe {
+            let pool = gpu.pool_push();
+            let data_bytes = core::mem::size_of_val(input.as_slice());
+            let data_buf = gpu.new_buffer(data_bytes).unwrap();
+            let tw_buf = gpu
+                .new_buffer(core::mem::size_of_val(twiddles.as_slice()))
+                .unwrap();
+            let tree_bytes = core::mem::size_of_val(tree.as_slice());
+            let tree_buf = gpu.new_buffer(tree_bytes).unwrap();
+            std::ptr::copy_nonoverlapping(
+                input.as_ptr().cast::<u8>(),
+                gpu.buffer_contents(data_buf),
+                data_bytes,
+            );
+            std::ptr::copy_nonoverlapping(
+                twiddles.as_ptr().cast::<u8>(),
+                gpu.buffer_contents(tw_buf),
+                core::mem::size_of_val(twiddles.as_slice()),
+            );
+            std::ptr::copy_nonoverlapping(
+                tree.as_ptr().cast::<u8>(),
+                gpu.buffer_contents(tree_buf),
+                tree_bytes,
+            );
+            let cb = gpu.command_buffer().unwrap();
+            let enc = gpu.compute_encoder(cb).unwrap();
+            imp::encode_ntt_passes_prefix_fused(
+                gpu,
+                enc,
+                data_buf,
+                tw_buf,
+                log_d,
+                4,
+                prefix16 as u64,
+                Some(tree_buf),
+            );
+            let mut start = 0usize;
+            while start < prefix_leaves {
+                let mut size = 1usize << (prefix_leaves - start).ilog2();
+                while start % size != 0 {
+                    size >>= 1;
+                }
+                imp::encode_merkle_subtree_impl(
+                    gpu, enc, data_buf, tree_buf, n_leaves, start, size, false, true, true,
+                );
+                start += size;
+            }
+            gpu.end_encoding(enc);
+            gpu.commit_and_wait(cb).unwrap();
+            got_data = {
+                let ptr = gpu.buffer_contents(data_buf).cast::<F128>();
+                core::slice::from_raw_parts(ptr, input.len()).to_vec()
+            };
+            std::ptr::copy_nonoverlapping(
+                gpu.buffer_contents(tree_buf).cast::<crate::merkle::Hash>(),
+                tree.as_mut_ptr(),
+                tree.len(),
+            );
+            gpu.release(data_buf);
+            gpu.release(tw_buf);
+            gpu.release(tree_buf);
+            gpu.pool_pop(pool);
+        }
+
+        // Codeword: prefix positions transformed, suffix untouched.
+        let split = prefix_leaves * 64;
+        assert_eq!(&got_data[..split], &expect[..split], "prefix codeword");
+        assert_eq!(&got_data[split..], &input[split..], "suffix codeword must be untouched");
+
+        // Tree: every prefix-subtree chain matches, all else sentinel
+        // (including every CPU-owned suffix leaf slot).
+        let mut affected = vec![false; tree.len()];
+        let mut start = 0usize;
+        while start < prefix_leaves {
+            let mut size = 1usize << (prefix_leaves - start).ilog2();
+            while start % size != 0 {
+                size >>= 1;
+            }
+            let mut level_start = 0usize;
+            let mut level_len = n_leaves;
+            let mut local_start = start;
+            let mut local_len = size;
+            loop {
+                let s = level_start + local_start;
+                let e = s + local_len;
+                assert_eq!(&tree[s..e], &expect_tree[s..e], "subtree at {start} size {size}");
+                affected[s..e].fill(true);
+                if local_len == 1 {
+                    break;
+                }
+                level_start += level_len;
+                level_len >>= 1;
+                local_start >>= 1;
+                local_len >>= 1;
+            }
+            start += size;
+        }
+        assert!(
+            tree.iter()
+                .zip(affected)
+                .all(|(node, touched)| touched || *node == SENTINEL),
+            "leaf-fused prefix wrote outside the GPU-owned flat-tree ranges",
         );
     }
 
@@ -4635,6 +5573,187 @@ mod tests {
         }
     }
 
+    /// Ranked-shape end-to-end NTT+Merkle oracle with BOTH mechanisms on
+    /// (production selectors at log_d=20: parent3 + parent tail + leaf-fused
+    /// final pass): every codeword element and every flat-tree node bit-exact
+    /// vs the CPU reference. Run with `--ignored`.
+    #[test]
+    #[ignore = "1 GiB buffers; run explicitly with --ignored"]
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    fn gpu_leaf_parent_fuse_ranked_end_to_end() {
+        use super::imp;
+        let log_d = 20usize;
+        let n_leaves = 1usize << log_d;
+        let ntt = AdditiveNttF128::standard(log_d);
+        let twiddles = flat_twiddle_table(&ntt, log_d);
+        let mut rng = Rng::new(0xF05E);
+        let input = rng.vec(64 << log_d);
+        let gpu = match gpu_or_skip(imp::gpu().map(|g| g as *const imp::Gpu)) {
+            Some(g) => unsafe { &*g },
+            None => return,
+        };
+        // Leaf fusion is opt-in (see `ENV_GPU_LEAF_FUSE`); this oracle forces
+        // it on below so the kernel stays covered even though production takes
+        // the incumbent leaf dispatch.
+        assert!(
+            !super::gpu_leaf_fuse_selected(log_d),
+            "leaf fuse must be opt-in, not default ON"
+        );
+        assert!(
+            super::select_gpu_parent_tail(n_leaves, super::gpu_parent_tail_enabled()),
+            "parent tail must default ON at ranked"
+        );
+        unsafe {
+            let pool = gpu.pool_push();
+            let data_bytes = core::mem::size_of_val(input.as_slice());
+            let data_buf = gpu.new_buffer(data_bytes).unwrap();
+            let tw_buf = gpu
+                .new_buffer(core::mem::size_of_val(twiddles.as_slice()))
+                .unwrap();
+            let tree_buf = gpu.new_buffer((2 * n_leaves - 1) * 32).unwrap();
+            std::ptr::copy_nonoverlapping(
+                input.as_ptr().cast::<u8>(),
+                gpu.buffer_contents(data_buf),
+                data_bytes,
+            );
+            std::ptr::copy_nonoverlapping(
+                twiddles.as_ptr().cast::<u8>(),
+                gpu.buffer_contents(tw_buf),
+                core::mem::size_of_val(twiddles.as_slice()),
+            );
+            // Layer-4.. graph tail with leaf fusion FORCED on (production
+            // leaves it opt-in): fused NTT passes (leaf-fused final) + Merkle
+            // with skipped leaf dispatch.
+            let leaf_fuse = true;
+            let cb = gpu.command_buffer().unwrap();
+            let enc = gpu.compute_encoder(cb).unwrap();
+            imp::encode_ntt_passes_fused(
+                gpu,
+                enc,
+                data_buf,
+                tw_buf,
+                log_d,
+                4,
+                leaf_fuse.then_some(tree_buf),
+            );
+            imp::encode_merkle(gpu, enc, data_buf, tree_buf, n_leaves, leaf_fuse);
+            gpu.end_encoding(enc);
+            gpu.commit_and_wait(cb).unwrap();
+
+            let mut expect = input.clone();
+            ntt.forward_transform_interleaved_from_layer(&mut expect, 64, 4);
+            let got = core::slice::from_raw_parts(
+                gpu.buffer_contents(data_buf).cast::<F128>(),
+                expect.len(),
+            );
+            assert_eq!(got, expect.as_slice(), "ranked codeword mismatch");
+            let expect_bytes = core::slice::from_raw_parts(
+                expect.as_ptr().cast::<u8>(),
+                core::mem::size_of_val(expect.as_slice()),
+            );
+            let expect_tree = crate::merkle::merkle_tree(
+                expect_bytes,
+                n_leaves,
+                crate::merkle::HashKind::Blake3,
+            );
+            let got_tree = core::slice::from_raw_parts(
+                gpu.buffer_contents(tree_buf).cast::<crate::merkle::Hash>(),
+                2 * n_leaves - 1,
+            );
+            assert_eq!(got_tree, expect_tree.as_slice(), "ranked tree mismatch");
+            gpu.release(data_buf);
+            gpu.release(tw_buf);
+            gpu.release(tree_buf);
+            gpu.pool_pop(pool);
+        }
+    }
+
+    /// Perf probe at the ranked shape for mechanisms A (parent tail) and B
+    /// (leaf-fused final pass): times "final NTT pass + leaves + full parent
+    /// chain" as one command buffer, min-of-5 after one warm pass, for
+    /// (a) incumbent, (b) A only, (c) B only, (d) both. Numbers are
+    /// directional on local hardware. Run with `--ignored --nocapture`.
+    #[test]
+    #[ignore = "1 GiB buffers; run explicitly with --ignored"]
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    fn gpu_leaf_parent_fuse_probe_at_ranked_shape() {
+        use super::imp;
+        let log_d = 20usize;
+        let n_leaves = 1usize << log_d;
+        let ntt = AdditiveNttF128::standard(log_d);
+        let twiddles = flat_twiddle_table(&ntt, log_d);
+        let mut rng = Rng::new(0x9B0B);
+        let input = rng.vec(64 << log_d);
+        let gpu = match gpu_or_skip(imp::gpu().map(|g| g as *const imp::Gpu)) {
+            Some(g) => unsafe { &*g },
+            None => return,
+        };
+        unsafe {
+            let pool = gpu.pool_push();
+            let data_bytes = core::mem::size_of_val(input.as_slice());
+            let data_buf = gpu.new_buffer(data_bytes).unwrap();
+            let tw_buf = gpu
+                .new_buffer(core::mem::size_of_val(twiddles.as_slice()))
+                .unwrap();
+            let tree_buf = gpu.new_buffer((2 * n_leaves - 1) * 32).unwrap();
+            std::ptr::copy_nonoverlapping(
+                input.as_ptr().cast::<u8>(),
+                gpu.buffer_contents(data_buf),
+                data_bytes,
+            );
+            std::ptr::copy_nonoverlapping(
+                twiddles.as_ptr().cast::<u8>(),
+                gpu.buffer_contents(tw_buf),
+                core::mem::size_of_val(twiddles.as_slice()),
+            );
+            let run = |tail: bool, fuse: bool| -> f64 {
+                let mut best = f64::MAX;
+                for i in 0..6 {
+                    let t = std::time::Instant::now();
+                    let cb = gpu.command_buffer().unwrap();
+                    let enc = gpu.compute_encoder(cb).unwrap();
+                    // Final pass only (l = 16 at log_d = 20), leaf-fused or
+                    // not, then the full Merkle path (parent3 on, as in
+                    // production).
+                    imp::encode_ntt_passes_fused(
+                        gpu,
+                        enc,
+                        data_buf,
+                        tw_buf,
+                        log_d,
+                        16,
+                        fuse.then_some(tree_buf),
+                    );
+                    imp::encode_merkle_impl(
+                        gpu, enc, data_buf, tree_buf, n_leaves, true, tail, fuse,
+                    );
+                    gpu.end_encoding(enc);
+                    gpu.commit_and_wait(cb).unwrap();
+                    let ms = t.elapsed().as_secs_f64() * 1e3;
+                    if i > 0 {
+                        best = best.min(ms);
+                    }
+                }
+                best
+            };
+            let a_off_b_off = run(false, false);
+            let a_on_b_off = run(true, false);
+            let a_off_b_on = run(false, true);
+            let a_on_b_on = run(true, true);
+            eprintln!(
+                "leaf/parent fuse probe (final pass + leaves + parents, min-of-5 warmed):\n\
+                 (a) incumbent            : {a_off_b_off:.2} ms\n\
+                 (b) A parent-tail only   : {a_on_b_off:.2} ms\n\
+                 (c) B leaf-fuse only     : {a_off_b_on:.2} ms\n\
+                 (d) both                 : {a_on_b_on:.2} ms"
+            );
+            gpu.release(data_buf);
+            gpu.release(tw_buf);
+            gpu.release(tree_buf);
+            gpu.pool_pop(pool);
+        }
+    }
+
     /// Timing probe for the full warm commit graph (5 fused NTT passes +
     /// leaves + 20 parent levels, ONE command buffer) on persistent
     /// already-touched buffers — the shape the latched production path runs.
@@ -4689,7 +5808,7 @@ mod tests {
                 let t = std::time::Instant::now();
                 let cb = gpu.command_buffer().unwrap();
                 let enc = gpu.compute_encoder(cb).unwrap();
-                imp::encode_merkle(gpu, enc, data_buf, tree_buf, n_leaves);
+                imp::encode_merkle(gpu, enc, data_buf, tree_buf, n_leaves, false);
                 gpu.end_encoding(enc);
                 gpu.commit_and_wait(cb).unwrap();
                 let merkle_ms = t.elapsed().as_secs_f64() * 1e3;
