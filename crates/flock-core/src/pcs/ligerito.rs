@@ -9447,3 +9447,4 @@ mod tests {
     }
 }
 // Redraw marker 4 (drift probe): zero-diff; prior draws 1,205,646 / 1,205,107 / 1,206,245.
+// Zeeshan redraw of the promoted 1,245,446.54 identity-C stripe-reuse frontier.
