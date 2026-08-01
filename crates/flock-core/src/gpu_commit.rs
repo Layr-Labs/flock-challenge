@@ -2362,6 +2362,61 @@ kernel void parent_hash(device const uint* children [[buffer(0)]],
         }
     }
 
+    /// Suffix-NTT twiddle table for the hybrid CPU share. Deterministic per
+    /// `log_d`; built once per process. Exposed so the warmup autotune sweep
+    /// can prebuild it untimed instead of charging the build to the first
+    /// hybrid candidate's measured wall.
+    fn hybrid_suffix_ntt(log_d: usize) -> &'static AdditiveNttF128 {
+        static NTT: std::sync::OnceLock<AdditiveNttF128> = std::sync::OnceLock::new();
+        let ntt = NTT.get_or_init(|| AdditiveNttF128::standard(log_d));
+        debug_assert_eq!(ntt.log_domain_size(), log_d);
+        ntt
+    }
+
+    /// From-z top pass (layers 0..3) over the full position range, alone in
+    /// its own command buffer. This is the graph prefix the witness-overlapped
+    /// stream runs before the timed prove; the autotune sweep uses it as an
+    /// untimed staging re-prime so each candidate times only the
+    /// after-first-pass graph the timed prove actually dispatches.
+    unsafe fn run_from_z_first_pass(
+        gpu: &Gpu,
+        z_buf: Id,
+        staging: Id,
+        tw_buf: Id,
+        log_d: usize,
+    ) -> Result<(), String> {
+        unsafe {
+            let cb1 = gpu.command_buffer()?;
+            let enc = gpu.compute_encoder(cb1)?;
+            // From-z tiles all live in block B = 0 (l = 0), so the g4
+            // table-reuse idiom applies; the tuned kernel also skips
+            // the zero-region sub-layer (a pure copy).
+            let zg4 = super::pass_tune_enabled();
+            gpu.set_pipeline(enc, if zg4 { gpu.pso_ntt4zg4 } else { gpu.pso_ntt4z });
+            gpu.set_buffer(enc, staging, 0, 0);
+            gpu.set_buffer(enc, tw_buf, 0, 1);
+            let p = NttParams {
+                log_d: log_d as u32,
+                l: 0,
+                f: 4,
+                s: (log_d - 4) as u32,
+            };
+            let bytes = core::slice::from_raw_parts(
+                (&p as *const NttParams).cast::<u8>(),
+                core::mem::size_of::<NttParams>(),
+            );
+            gpu.set_bytes(enc, bytes, 2);
+            gpu.set_buffer(enc, z_buf, 0, 3);
+            if zg4 {
+                gpu.dispatch(enc, 1u64 << (log_d - 6), 64);
+            } else {
+                gpu.dispatch(enc, 1u64 << (log_d - 4), 64);
+            }
+            gpu.end_encoding(enc);
+            gpu.commit_and_wait(cb1)
+        }
+    }
+
     /// Hybrid GPU/CPU commit graph: the GPU runs the shared from-z top pass
     /// (layers 0..3) over the full codeword, then owns the position prefix
     /// (first `16 - k` sixteenths: remaining NTT passes + its aligned Merkle
@@ -2391,34 +2446,7 @@ kernel void parent_hash(device const uint* children [[buffer(0)]],
             let r = (|| {
                 if !first_pass_done {
                     // cb1: shared top pass, full range.
-                    let cb1 = gpu.command_buffer()?;
-                    let enc = gpu.compute_encoder(cb1)?;
-                    // From-z tiles all live in block B = 0 (l = 0), so the g4
-                    // table-reuse idiom applies; the tuned kernel also skips
-                    // the zero-region sub-layer (a pure copy).
-                    let zg4 = super::pass_tune_enabled();
-                    gpu.set_pipeline(enc, if zg4 { gpu.pso_ntt4zg4 } else { gpu.pso_ntt4z });
-                    gpu.set_buffer(enc, staging, 0, 0);
-                    gpu.set_buffer(enc, tw_buf, 0, 1);
-                    let p = NttParams {
-                        log_d: log_d as u32,
-                        l: 0,
-                        f: 4,
-                        s: (log_d - 4) as u32,
-                    };
-                    let bytes = core::slice::from_raw_parts(
-                        (&p as *const NttParams).cast::<u8>(),
-                        core::mem::size_of::<NttParams>(),
-                    );
-                    gpu.set_bytes(enc, bytes, 2);
-                    gpu.set_buffer(enc, z_buf, 0, 3);
-                    if zg4 {
-                        gpu.dispatch(enc, 1u64 << (log_d - 6), 64);
-                    } else {
-                        gpu.dispatch(enc, 1u64 << (log_d - 4), 64);
-                    }
-                    gpu.end_encoding(enc);
-                    gpu.commit_and_wait(cb1)?;
+                    run_from_z_first_pass(gpu, z_buf, staging, tw_buf, log_d)?;
                 }
 
                 // cb2: GPU prefix — remaining passes + aligned subtrees.
@@ -2443,11 +2471,9 @@ kernel void parent_hash(device const uint* children [[buffer(0)]],
                 gpu.commit_async(cb2);
 
                 // CPU: suffix NTT completion + leaves + subtree parents.
-                // The twiddle table is deterministic per log_d; build it once
-                // per process (first call lands in the untimed warmup).
-                static NTT: std::sync::OnceLock<AdditiveNttF128> = std::sync::OnceLock::new();
-                let ntt = NTT.get_or_init(|| AdditiveNttF128::standard(log_d));
-                debug_assert_eq!(ntt.log_domain_size(), log_d);
+                // The twiddle table is deterministic per log_d; built once per
+                // process (the autotune sweep prebuilds it untimed).
+                let ntt = hybrid_suffix_ntt(log_d);
                 let data: &mut [F128] = core::slice::from_raw_parts_mut(
                     gpu.buffer_contents(staging).cast::<F128>(),
                     n_leaves * 64,
@@ -2675,6 +2701,36 @@ kernel void parent_hash(device const uint* children [[buffer(0)]],
         })
     }
 
+    /// Pure selection over the sweep's per-candidate best walls; `candidates`
+    /// is ascending and must contain `default_k`. Deliberately asymmetric
+    /// toward the promoted default:
+    /// - the smallest share within 1.5% of the fastest wins (the timed
+    ///   prove's round-1 precompute contends for the same cores, so
+    ///   near-ties resolve toward the GPU);
+    /// - if the default is itself within 1.5% of the fastest, keep it — an
+    ///   emulated sweep cannot adjudicate noise-thin margins, the ranked
+    ///   runner can;
+    /// - k=0 must beat the default by > 4% — official board evidence has the
+    ///   hybrid several percent ahead of the pure-GPU graph, so a sweep that
+    ///   says otherwise is more likely an emulation artifact (e.g. the burn
+    ///   floor collapsing all candidates) than truth.
+    fn choose_hybrid_k(candidates: &[usize], best_ms: &[f64], default_k: usize) -> Option<usize> {
+        let default_i = candidates
+            .iter()
+            .position(|&k| k == default_k)
+            .expect("default split is a sweep candidate");
+        let fastest = best_ms.iter().cloned().fold(f64::INFINITY, f64::min);
+        let chosen_i = (0..candidates.len()).find(|&i| best_ms[i] <= fastest * 1.015)?;
+        let mut chosen = candidates[chosen_i];
+        if best_ms[default_i] <= fastest * 1.015 {
+            chosen = default_k;
+        }
+        if chosen == 0 && best_ms[chosen_i] > best_ms[default_i] * (1.0 - 0.04) {
+            chosen = default_k;
+        }
+        Some(chosen)
+    }
+
     /// Untimed-warmup split sweep. The scoring host's CPU/GPU balance is
     /// unknown at build time: the same fixed split that wins on a small-GPU
     /// dev host over-allocates a Max-class GPU host's CPU and vice versa
@@ -2731,6 +2787,38 @@ kernel void parent_hash(device const uint* children [[buffer(0)]],
                 }
             }
         };
+        // The timed prove no longer runs the from-z first pass inside its
+        // commit window: the witness-overlapped stream finishes layers 0..3
+        // before `finish_from_z_first_pass_or_fallback` dispatches the rest
+        // (`first_pass_done = true`). Timing the full graph here adds a
+        // k-independent GPU constant to every candidate, diluting the GPU
+        // side's k-sensitivity and biasing the chosen split toward too much
+        // CPU (and inflating the near-tie base). Probe the streamed regime
+        // instead: per candidate an untimed staging re-prime via the shared
+        // first pass, then time only the after-first-pass graph — exactly the
+        // dispatch the timed prove runs. `FLOCK_NO_HYBRID_TUNE_STREAMED=1`
+        // restores the full-graph probe.
+        let streamed_probe = std::env::var_os("FLOCK_NO_HYBRID_TUNE_STREAMED").is_none();
+        let timed_graph = |k: usize| -> Result<(), String> {
+            if !streamed_probe {
+                return run_graph(k);
+            }
+            let c = &ctx;
+            unsafe {
+                if k == 0 {
+                    run_commit_graph_after_from_z(
+                        c.gpu, c.staging, c.tw_buf, c.tree_buf, log_d, n_leaves,
+                    )
+                } else {
+                    run_commit_graph_from_z_hybrid_impl(
+                        c.gpu, c.z_buf, c.staging, c.tw_buf, c.tree_buf, log_d, n_leaves, k, true,
+                    )
+                }
+            }
+        };
+        // Prebuild the CPU-suffix twiddle table untimed so its one-time build
+        // is not charged to the first hybrid candidate's measured wall.
+        let _ = hybrid_suffix_ntt(log_d);
         // Contention emulation. In the timed prove the graph shares the
         // rayon pool with the round-1 AB precompute; an uncontended sweep
         // therefore over-allocates the CPU (measured here: the uncontended
@@ -2785,13 +2873,39 @@ kernel void parent_hash(device const uint* children [[buffer(0)]],
                 std::hint::black_box(x);
             });
         };
+        // Wall-safe streamed-regime correction: the per-candidate staging
+        // re-prime form runs the from-z first pass 8+ extra times per
+        // warm-up; multiplied by the harness's ~120 fresh worker processes
+        // that spends minutes of JOB wall against the ranked CI's 8-minute
+        // budget (three above-bar submissions died to it as "failed"
+        // timeouts before the mechanism was identified). The first pass is
+        // k-INDEPENDENT, so measuring its wall once and subtracting the
+        // constant from each candidate's full-graph wall yields the same
+        // corrected ranking at one extra pass total.
+        let first_pass_ms = if streamed_probe {
+            let c = &ctx;
+            let t0 = std::time::Instant::now();
+            match unsafe { run_from_z_first_pass(c.gpu, c.z_buf, c.staging, c.tw_buf, log_d) } {
+                Ok(()) => t0.elapsed().as_secs_f64() * 1e3,
+                Err(e) => {
+                    if dbg {
+                        eprintln!(
+                            "[gpu-commit] autotune: first-pass probe failed ({e}); keeping default"
+                        );
+                    }
+                    return;
+                }
+            }
+        } else {
+            0.0
+        };
         let contended_run = |k: usize| -> Result<f64, String> {
             let t0 = std::time::Instant::now();
-            let (r, ()) = rayon::join(|| run_graph(k), burn_work);
+            let (r, ()) = rayon::join(|| timed_graph(k), burn_work);
             r?;
-            Ok(t0.elapsed().as_secs_f64() * 1e3)
+            Ok((t0.elapsed().as_secs_f64() * 1e3 - first_pass_ms).max(0.0))
         };
-        const CANDIDATES: [usize; 7] = [0, 2, 3, 4, 5, 6, 7];
+        const CANDIDATES: [usize; 8] = [0, 2, 3, 4, 5, 6, 7, 8];
         let mut best_ms = [f64::INFINITY; CANDIDATES.len()];
         for i in 0..CANDIDATES.len() {
             match contended_run(CANDIDATES[i]) {
@@ -2809,37 +2923,29 @@ kernel void parent_hash(device const uint* children [[buffer(0)]],
                 }
             }
         }
-        // Second sample for the three stage-1 leaders (min per candidate):
-        // one cold draw per k is too noisy to split plateau neighbors.
-        let mut order: Vec<usize> = (0..CANDIDATES.len()).collect();
-        order.sort_by(|&a, &b| best_ms[a].total_cmp(&best_ms[b]));
-        for &i in order.iter().take(3) {
-            if let Ok(ms) = contended_run(CANDIDATES[i]) {
-                best_ms[i] = best_ms[i].min(ms);
-            }
-        }
-        let fastest = best_ms.iter().cloned().fold(f64::INFINITY, f64::min);
-        // Selection is deliberately asymmetric toward the promoted default:
-        // - near-ties (< 1.5%) keep the default — an emulated sweep cannot
-        //   adjudicate noise-thin margins, the ranked runner can;
-        // - k=0 must beat the default by > 4% — official board evidence has
-        //   the hybrid several percent ahead of the pure-GPU graph, so a
-        //   sweep that says otherwise is more likely an emulation artifact
-        //   (e.g. the burn floor collapsing all candidates) than truth.
+        // Second sample for the three stage-1 leaders plus, always, the
+        // promoted default (min per candidate): one cold draw per k is too
+        // noisy to split plateau neighbors, and the default's wall is a
+        // selection pivot (near-tie band), so it must not keep a single cold
+        // sample just because it missed the top three.
         let default_i = CANDIDATES
             .iter()
             .position(|&k| k == DEFAULT_HYBRID_K)
             .expect("default split is a sweep candidate");
-        let Some(chosen_i) = (0..CANDIDATES.len()).find(|&i| best_ms[i] <= fastest * 1.015) else {
+        let mut order: Vec<usize> = (0..CANDIDATES.len()).collect();
+        order.sort_by(|&a, &b| best_ms[a].total_cmp(&best_ms[b]));
+        let mut resample: Vec<usize> = order.iter().take(3).copied().collect();
+        if !resample.contains(&default_i) {
+            resample.push(default_i);
+        }
+        for &i in &resample {
+            if let Ok(ms) = contended_run(CANDIDATES[i]) {
+                best_ms[i] = best_ms[i].min(ms);
+            }
+        }
+        let Some(chosen) = choose_hybrid_k(&CANDIDATES, &best_ms, DEFAULT_HYBRID_K) else {
             return;
         };
-        let mut chosen = CANDIDATES[chosen_i];
-        if best_ms[default_i] <= fastest * 1.015 {
-            chosen = DEFAULT_HYBRID_K;
-        }
-        if chosen == 0 && best_ms[chosen_i] > best_ms[default_i] * (1.0 - 0.04) {
-            chosen = DEFAULT_HYBRID_K;
-        }
         if dbg {
             let table: Vec<String> = CANDIDATES
                 .iter()
@@ -3398,6 +3504,54 @@ kernel void parent_hash(device const uint* children [[buffer(0)]],
             })();
             gpu.pool_pop(pool);
             result
+        }
+    }
+
+    #[cfg(test)]
+    mod split_select_tests {
+        use super::{DEFAULT_HYBRID_K, choose_hybrid_k};
+        const C: [usize; 8] = [0, 2, 3, 4, 5, 6, 7, 8];
+
+        #[test]
+        fn smallest_share_within_band_wins() {
+            // k=3 fastest; k=2 within 1.5%; default k=5 far off → smallest in band.
+            let ms = [200.0, 100.5, 100.0, 120.0, 150.0, 150.0, 150.0, 150.0];
+            assert_eq!(choose_hybrid_k(&C, &ms, DEFAULT_HYBRID_K), Some(2));
+        }
+
+        #[test]
+        fn default_near_tie_keeps_default() {
+            // k=3 fastest but default k=5 within 1.5% → default retained.
+            let ms = [200.0, 130.0, 100.0, 120.0, 101.0, 150.0, 150.0, 150.0];
+            assert_eq!(choose_hybrid_k(&C, &ms, DEFAULT_HYBRID_K), Some(5));
+        }
+
+        #[test]
+        fn marginal_pure_gpu_is_rejected() {
+            // k=0 fastest but beats the default by < 4% → default retained.
+            let ms = [100.0, 130.0, 130.0, 130.0, 103.0, 150.0, 150.0, 150.0];
+            assert_eq!(choose_hybrid_k(&C, &ms, DEFAULT_HYBRID_K), Some(5));
+        }
+
+        #[test]
+        fn decisive_pure_gpu_wins() {
+            // k=0 beats the default by > 4% and nothing else is in band.
+            let ms = [100.0, 130.0, 130.0, 130.0, 120.0, 150.0, 150.0, 150.0];
+            assert_eq!(choose_hybrid_k(&C, &ms, DEFAULT_HYBRID_K), Some(0));
+        }
+
+        #[test]
+        fn k8_is_reachable() {
+            // Largest share wins decisively → the sweep can now choose it.
+            let ms = [200.0, 180.0, 170.0, 160.0, 150.0, 140.0, 130.0, 100.0];
+            assert_eq!(choose_hybrid_k(&C, &ms, DEFAULT_HYBRID_K), Some(8));
+        }
+
+        #[test]
+        #[should_panic(expected = "default split is a sweep candidate")]
+        fn missing_default_is_a_contract_violation() {
+            let ms = [100.0, 100.0];
+            let _ = choose_hybrid_k(&[0, 2], &ms, DEFAULT_HYBRID_K);
         }
     }
 }
