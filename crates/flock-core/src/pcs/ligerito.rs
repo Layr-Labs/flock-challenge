@@ -9448,3 +9448,5 @@ mod tests {
 }
 // Redraw marker 4 (drift probe): zero-diff; prior draws 1,205,646 / 1,205,107 / 1,206,245.
 // RealAdii draw 1 on 1a6ad0e.
+// Redraw marker 5 (disclosed draw): zero-diff draw 1 on fb7e350 (356e09cc, 1,250,503.69).
+// No mechanism change. Submitted from a memory-blocked seat with no local timing signal.
