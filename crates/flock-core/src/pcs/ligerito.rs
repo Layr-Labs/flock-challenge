@@ -9447,3 +9447,5 @@ mod tests {
     }
 }
 // Redraw marker 4 (drift probe): zero-diff; prior draws 1,205,646 / 1,205,107 / 1,206,245.
+
+// redraw marker: akashneelesh session-f661 draw B (disclosed zero-diff resample of 01d5338)
