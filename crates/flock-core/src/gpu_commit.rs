@@ -39,6 +39,17 @@ pub const ENV_NO_GPU_COMMIT: &str = "FLOCK_NO_GPU_COMMIT";
 /// wall-clock win (A/B and test tooling).
 pub const ENV_GPU_COMMIT_FORCE: &str = "FLOCK_GPU_COMMIT_FORCE";
 
+/// Env var that disables the shared-table (4 same-B tiles per 256-thread
+/// group) NTT kernel selection, restoring the one-tile-per-group kernels as
+/// the exact same-binary control.
+pub const ENV_NO_NTT_SHARED_TABS: &str = "FLOCK_NO_NTT_SHARED_TABS";
+
+/// Latched once: shared-table kernels enabled unless the kill switch is set.
+pub(crate) fn shared_tabs_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os(ENV_NO_NTT_SHARED_TABS).is_none())
+}
+
 /// Wall-clock margin the GPU must beat during the warmup dual-run: latch on
 /// only when `gpu_wall * 1.10 <= cpu_wall`.
 const LATCH_MARGIN: f64 = 1.10;
@@ -199,6 +210,7 @@ mod imp {
         pool_push: unsafe extern "C" fn() -> *mut c_void,
         pool_pop: unsafe extern "C" fn(*mut c_void),
         create_system_default_device: unsafe extern "C" fn() -> Id,
+        copy_all_devices: unsafe extern "C" fn() -> Id,
     }
     // SAFETY: all fields are process-global immutable function pointers.
     unsafe impl Send for Api {}
@@ -263,6 +275,10 @@ mod imp {
                     create_system_default_device: core::mem::transmute(sym(
                         metal,
                         c"MTLCreateSystemDefaultDevice",
+                    )?),
+                    copy_all_devices: core::mem::transmute(sym(
+                        metal,
+                        c"MTLCopyAllDevices",
                     )?),
                 })
             }
@@ -591,6 +607,7 @@ kernel void NAME(device uint4* data                [[buffer(0)]],              \
 }
 
 DEF_NTT_FUSED_REG(ntt_fused_reg4g8, 4u, 3u)   // 8 same-B tiles, 512 threads
+DEF_NTT_FUSED_REG(ntt_fused_reg4g2, 4u, 2u)   // 4 same-B tiles, 256 threads
 DEF_NTT_FUSED_REG(ntt_fused_reg4,   4u, 0u)
 DEF_NTT_FUSED_REG(ntt_fused_reg3,   3u, 0u)
 
@@ -607,73 +624,80 @@ DEF_NTT_FUSED_REG(ntt_fused_reg3,   3u, 0u)
 // back to the CPU with the inputs intact. Requires P.l == 0, P.f == 4,
 // log_inv_rate == 1.
 // ===========================================================================
-kernel void ntt_fused_reg4_from_z(device uint4* data                [[buffer(0)]],
-                                  device const uint4* twiddles      [[buffer(1)]],
-                                  constant NttParams& P             [[buffer(2)]],
-                                  device const uint4* z             [[buffer(3)]],
-                                  uint tgid [[threadgroup_position_in_grid]],
-                                  uint lid  [[thread_index_in_threadgroup]])
-{
-    constexpr uint F   = 4u;
-    constexpr uint NF  = 1u << F;
-    constexpr uint NTW = NF - 1u;
-    threadgroup uint4 bases[NTW * 4u];
-    threadgroup uint4 tabs[NTW * 64u];
-
-    const uint lane = lid & 63u;
-    // l = 0: a single block, B = 0; tgid enumerates r in [0, 2^s).
-    const uint r = tgid;
-    const uint pos_base = r;
-
-    if (lid < NTW * 4u) {
-        uint t = lid >> 2;
-        uint k = lid & 3u;
-        uint j = 31u - clz(t + 1u);
-        uint c = t + 1u - (1u << j);
-        uint4 p = twiddles[(1u << j) - 1u + c];
-        for (uint m = 0; m < k * 4u; m++) { p = gf_mulx(p); }
-        bases[lid] = p;
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    for (uint ei = lid; ei < NTW * 64u; ei += 64u) {
-        uint t   = ei >> 6;
-        uint sub = ei & 63u;
-        uint n   = sub & 15u;
-        uint4 p  = bases[(t << 2) | (sub >> 4)];
-        uint4 val = uint4(0u);
-        for (uint k = 0; k < 4u; k++) {
-            if ((n >> k) & 1u) { val ^= p; }
-            p = gf_mulx(p);
-        }
-        tabs[ei] = val;
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    uint4 elems[NF];
-    for (uint e = 0; e < NF / 2u; e++) {
-        elems[e] = z[(((e << P.s) + r) << 6) + lane];
-    }
-    for (uint e = NF / 2u; e < NF; e++) {
-        elems[e] = uint4(0u);   // the zero-padded coefficient region
-    }
-
-    for (uint j = 0; j < F; j++) {
-        uint bpos = F - 1u - j;
-        for (uint b = 0; b < (NF >> 1); b++) {
-            uint low = b & ((1u << bpos) - 1u);
-            uint eu  = ((b >> bpos) << (bpos + 1u)) | low;
-            uint ev  = eu | (1u << bpos);
-            uint tsel = ((1u << j) - 1u) + (eu >> (F - j));
-            uint4 nu = elems[eu] ^ gf_mul_tab4(elems[ev], &tabs[tsel << 6]);
-            elems[eu] = nu;
-            elems[ev] ^= nu;
-        }
-    }
-
-    for (uint e = 0; e < NF; e++) {
-        data[((pos_base + (e << P.s)) << 6) + lane] = elems[e];
-    }
+#define DEF_NTT_FROM_Z(NAME, LOG_G)                                            \
+kernel void NAME(device uint4* data                [[buffer(0)]],              \
+                 device const uint4* twiddles      [[buffer(1)]],              \
+                 constant NttParams& P             [[buffer(2)]],              \
+                 device const uint4* z             [[buffer(3)]],              \
+                 uint tgid [[threadgroup_position_in_grid]],                   \
+                 uint lid  [[thread_index_in_threadgroup]])                    \
+{                                                                              \
+    constexpr uint F   = 4u;                                                   \
+    constexpr uint NF  = 1u << F;                                              \
+    constexpr uint NTW = NF - 1u;                                              \
+    constexpr uint NTHREADS = 64u << LOG_G;                                    \
+    threadgroup uint4 bases[NTW * 4u];                                         \
+    threadgroup uint4 tabs[NTW * 64u];                                         \
+                                                                               \
+    /* l = 0: a single block, B = 0, so ALL tiles share the twiddle set and  */\
+    /* 2^LOG_G consecutive-r tiles can share this threadgroup's tables.      */\
+    const uint lane = lid & 63u;                                               \
+    const uint rr   = lid >> 6;                                                \
+    const uint r = (tgid << LOG_G) + rr;                                       \
+    const uint pos_base = r;                                                   \
+                                                                               \
+    if (lid < NTW * 4u) {                                                      \
+        uint t = lid >> 2;                                                     \
+        uint k = lid & 3u;                                                     \
+        uint j = 31u - clz(t + 1u);                                            \
+        uint c = t + 1u - (1u << j);                                           \
+        uint4 p = twiddles[(1u << j) - 1u + c];                                \
+        for (uint m = 0; m < k * 4u; m++) { p = gf_mulx(p); }                  \
+        bases[lid] = p;                                                        \
+    }                                                                          \
+    threadgroup_barrier(mem_flags::mem_threadgroup);                           \
+    for (uint ei = lid; ei < NTW * 64u; ei += NTHREADS) {                      \
+        uint t   = ei >> 6;                                                    \
+        uint sub = ei & 63u;                                                   \
+        uint n   = sub & 15u;                                                  \
+        uint4 p  = bases[(t << 2) | (sub >> 4)];                               \
+        uint4 val = uint4(0u);                                                 \
+        for (uint k = 0; k < 4u; k++) {                                        \
+            if ((n >> k) & 1u) { val ^= p; }                                   \
+            p = gf_mulx(p);                                                    \
+        }                                                                      \
+        tabs[ei] = val;                                                        \
+    }                                                                          \
+    threadgroup_barrier(mem_flags::mem_threadgroup);                           \
+                                                                               \
+    uint4 elems[NF];                                                           \
+    for (uint e = 0; e < NF / 2u; e++) {                                       \
+        elems[e] = z[(((e << P.s) + r) << 6) + lane];                          \
+    }                                                                          \
+    for (uint e = NF / 2u; e < NF; e++) {                                      \
+        elems[e] = uint4(0u);   /* the zero-padded coefficient region */       \
+    }                                                                          \
+                                                                               \
+    for (uint j = 0; j < F; j++) {                                             \
+        uint bpos = F - 1u - j;                                                \
+        for (uint b = 0; b < (NF >> 1); b++) {                                 \
+            uint low = b & ((1u << bpos) - 1u);                                \
+            uint eu  = ((b >> bpos) << (bpos + 1u)) | low;                     \
+            uint ev  = eu | (1u << bpos);                                      \
+            uint tsel = ((1u << j) - 1u) + (eu >> (F - j));                    \
+            uint4 nu = elems[eu] ^ gf_mul_tab4(elems[ev], &tabs[tsel << 6]);   \
+            elems[eu] = nu;                                                    \
+            elems[ev] ^= nu;                                                   \
+        }                                                                      \
+    }                                                                          \
+                                                                               \
+    for (uint e = 0; e < NF; e++) {                                            \
+        data[((pos_base + (e << P.s)) << 6) + lane] = elems[e];                \
+    }                                                                          \
 }
+
+DEF_NTT_FROM_Z(ntt_fused_reg4_from_z,   0u)
+DEF_NTT_FROM_Z(ntt_fused_reg4_from_zg2, 2u)   // 4 same-table tiles, 256 threads
 
 // ===========================================================================
 // BLAKE3 tree kernels (added in the Merkle milestone; kept in one library).
@@ -769,6 +793,11 @@ kernel void parent_hash(device const uint* children [[buffer(0)]],
         /// occupancy experiments (see the note in `encode_ntt_passes`).
         #[allow(dead_code)]
         pub(crate) pso_ntt4g8: Id,
+        /// Shared-table production variants: 4 same-B tiles per 256-thread
+        /// group build ONE table set, quadrupling the tiles resident per
+        /// core's threadgroup-memory budget (the binding occupancy limit).
+        pub(crate) pso_ntt4g2: Id,
+        pub(crate) pso_ntt4zg2: Id,
         pub(crate) pso_ntt4: Id,
         pub(crate) pso_ntt3: Id,
         pub(crate) pso_ntt4z: Id,
@@ -797,7 +826,21 @@ kernel void parent_hash(device const uint* children [[buffer(0)]],
             let pool_pop = api.pool_pop;
             let pool = pool_push();
             let result = (move || -> Result<Gpu, String> {
-                let device = (api.create_system_default_device)();
+                let mut device = (api.create_system_default_device)();
+                if device.is_null() {
+                    // Sessions without a WindowServer bootstrap (ssh, CI)
+                    // get no *default* device; MTLCopyAllDevices still
+                    // enumerates the built-in GPU.
+                    let all = (api.copy_all_devices)();
+                    if !all.is_null() {
+                        device = send!(
+                            api,
+                            unsafe extern "C" fn(Id, Sel) -> Id,
+                            all,
+                            c"firstObject"
+                        );
+                    }
+                }
                 if device.is_null() {
                     return Err("MTLCreateSystemDefaultDevice returned nil".into());
                 }
@@ -853,6 +896,8 @@ kernel void parent_hash(device const uint* children [[buffer(0)]],
                 };
                 let pso_ntt = pso("ntt_fused")?;
                 let pso_ntt4g8 = pso("ntt_fused_reg4g8")?;
+                let pso_ntt4g2 = pso("ntt_fused_reg4g2")?;
+                let pso_ntt4zg2 = pso("ntt_fused_reg4_from_zg2")?;
                 let pso_ntt4 = pso("ntt_fused_reg4")?;
                 let pso_ntt3 = pso("ntt_fused_reg3")?;
                 let pso_ntt4z = pso("ntt_fused_reg4_from_z")?;
@@ -865,6 +910,8 @@ kernel void parent_hash(device const uint* children [[buffer(0)]],
                     queue,
                     pso_ntt,
                     pso_ntt4g8,
+                    pso_ntt4g2,
+                    pso_ntt4zg2,
                     pso_ntt4,
                     pso_ntt3,
                     pso_ntt4z,
@@ -1117,11 +1164,11 @@ kernel void parent_hash(device const uint* children [[buffer(0)]],
     // -----------------------------------------------------------------------
 
     #[repr(C)]
-    struct NttParams {
-        log_d: u32,
-        l: u32,
-        f: u32,
-        s: u32,
+    pub(crate) struct NttParams {
+        pub(crate) log_d: u32,
+        pub(crate) l: u32,
+        pub(crate) f: u32,
+        pub(crate) s: u32,
     }
 
     /// Encode the fused NTT passes for `layers [start_layer, log_d)` over a
@@ -1139,16 +1186,19 @@ kernel void parent_hash(device const uint* children [[buffer(0)]],
             gpu.set_buffer(enc, tw_buf, 0, 1);
             for (l, f) in super::plan_passes(log_d, start_layer) {
                 // Register-resident specializations for the production pass
-                // widths; the generic staged kernel covers the rest. The g8
-                // variant packs 8 same-twiddle tiles per threadgroup (needs
-                // s >= 3) for much better occupancy per KiB of tables.
-                // NOTE: an 8-tile shared-table variant (pso_ntt4g8, 512
-                // threads/group) measured ~55% SLOWER than 64-thread groups:
-                // elems[16] costs ~64 registers/thread and monolithic
-                // 512-thread groups lose the scheduler's register-granular
-                // packing. Kept for future experiments; not selected.
+                // widths; the generic staged kernel covers the rest. When a
+                // pass has s >= 2, four same-B tiles share one 256-thread
+                // group and ONE table build (g2): the kernels are threadgroup
+                // -memory occupancy-capped (a +16 KiB dead-pad probe halves
+                // throughput), and sharing the ~16 KiB table set quadruples
+                // tiles-per-core; measured 1.94x on f=4 passes. The 512-
+                // thread g8 shape loses the scheduler's register-granular
+                // packing (~18% slower than g2) and stays unselected.
                 let s = log_d - l - f;
                 let (pso, tpg, groups) = match f {
+                    4 if s >= 2 && super::shared_tabs_enabled() => {
+                        (gpu.pso_ntt4g2, 256u64, 1u64 << (log_d - f - 2))
+                    }
                     4 => (gpu.pso_ntt4, 64u64, 1u64 << (log_d - f)),
                     3 => (gpu.pso_ntt3, 64u64, 1u64 << (log_d - f)),
                     _ => (gpu.pso_ntt, 1u64 << (f + 5), 1u64 << (log_d - f)),
@@ -1191,7 +1241,14 @@ kernel void parent_hash(device const uint* children [[buffer(0)]],
             for (l, f) in super::plan_passes(log_d, start_layer) {
                 debug_assert!(l >= 4, "prefix passes require layer >= 4 blocks");
                 let s = log_d - l - f;
+                // Same g2 selection as encode_ntt_passes: B still comes from
+                // the HIGH bits of tgid (B = tgid >> (s - LOG_G)), so the
+                // prefix restriction stays "dispatch the first fraction of
+                // threadgroups".
                 let (pso, tpg, groups) = match f {
+                    4 if s >= 2 && super::shared_tabs_enabled() => {
+                        (gpu.pso_ntt4g2, 256u64, 1u64 << (log_d - f - 2))
+                    }
                     4 => (gpu.pso_ntt4, 64u64, 1u64 << (log_d - f)),
                     3 => (gpu.pso_ntt3, 64u64, 1u64 << (log_d - f)),
                     _ => (gpu.pso_ntt, 1u64 << (f + 5), 1u64 << (log_d - f)),
@@ -1499,7 +1556,10 @@ kernel void parent_hash(device const uint* children [[buffer(0)]],
                 let cb = gpu.command_buffer()?;
                 let enc = gpu.compute_encoder(cb)?;
                 // Pass 1: layers 0..3 from z.
-                gpu.set_pipeline(enc, gpu.pso_ntt4z);
+                // From-z tiles all live in block B = 0 (l = 0), so the g2
+                // shared-table shape applies whenever it is enabled.
+                let g2 = super::shared_tabs_enabled();
+                gpu.set_pipeline(enc, if g2 { gpu.pso_ntt4zg2 } else { gpu.pso_ntt4z });
                 gpu.set_buffer(enc, staging, 0, 0);
                 gpu.set_buffer(enc, tw_buf, 0, 1);
                 let p = NttParams {
@@ -1514,7 +1574,11 @@ kernel void parent_hash(device const uint* children [[buffer(0)]],
                 );
                 gpu.set_bytes(enc, bytes, 2);
                 gpu.set_buffer(enc, z_buf, 0, 3);
-                gpu.dispatch(enc, 1u64 << (log_d - 4), 64);
+                if g2 {
+                    gpu.dispatch(enc, 1u64 << (log_d - 6), 256);
+                } else {
+                    gpu.dispatch(enc, 1u64 << (log_d - 4), 64);
+                }
                 // Passes 2..: layers 4..log_d in place over staging.
                 encode_ntt_passes(gpu, enc, staging, tw_buf, log_d, 4);
                 encode_merkle(gpu, enc, staging, tree_buf, n_leaves);
@@ -1555,7 +1619,10 @@ kernel void parent_hash(device const uint* children [[buffer(0)]],
                 // cb1: shared top pass, full range.
                 let cb1 = gpu.command_buffer()?;
                 let enc = gpu.compute_encoder(cb1)?;
-                gpu.set_pipeline(enc, gpu.pso_ntt4z);
+                // From-z tiles all live in block B = 0 (l = 0), so the g2
+                // shared-table shape applies whenever it is enabled.
+                let g2 = super::shared_tabs_enabled();
+                gpu.set_pipeline(enc, if g2 { gpu.pso_ntt4zg2 } else { gpu.pso_ntt4z });
                 gpu.set_buffer(enc, staging, 0, 0);
                 gpu.set_buffer(enc, tw_buf, 0, 1);
                 let p = NttParams {
@@ -1570,7 +1637,11 @@ kernel void parent_hash(device const uint* children [[buffer(0)]],
                 );
                 gpu.set_bytes(enc, bytes, 2);
                 gpu.set_buffer(enc, z_buf, 0, 3);
-                gpu.dispatch(enc, 1u64 << (log_d - 4), 64);
+                if g2 {
+                    gpu.dispatch(enc, 1u64 << (log_d - 6), 256);
+                } else {
+                    gpu.dispatch(enc, 1u64 << (log_d - 4), 64);
+                }
                 gpu.end_encoding(enc);
                 gpu.commit_and_wait(cb1)?;
 
@@ -2362,6 +2433,119 @@ mod tests {
             "ranked-shape Merkle: gpu {gpu_ms:.1} ms (incl. copies) vs cpu {cpu_ms:.1} ms"
         );
         assert_eq!(got, expect, "GPU Merkle mismatch at ranked shape");
+    }
+
+    /// Per-pass profile at the ranked shape: times each fused NTT pass in
+    /// its own command buffer (min of 3), then A/Bs the l=9 pass between
+    /// ntt_fused_reg4 and the 16 KiB-padded occupancy probe. Diagnostics
+    /// only, no bit-exactness claims. Run with `--ignored --nocapture`.
+    #[test]
+    #[ignore = "1 GiB buffers; run explicitly with --ignored"]
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    fn gpu_pass_profile_at_ranked_shape() {
+        use super::imp;
+        let log_d = 20usize;
+        let ntt = AdditiveNttF128::standard(log_d);
+        let mut rng = Rng::new(0x9A55);
+        let input = rng.vec(64 << log_d);
+        let gpu = match gpu_or_skip(imp::gpu().map(|g| g as *const imp::Gpu)) {
+            Some(g) => unsafe { &*g },
+            None => return,
+        };
+        let twiddles = flat_twiddle_table(&ntt, log_d);
+        unsafe {
+            let pool = gpu.pool_push();
+            let data_bytes = core::mem::size_of_val(input.as_slice());
+            let data_buf = gpu.new_buffer(data_bytes).unwrap();
+            let tw_buf = gpu
+                .new_buffer(core::mem::size_of_val(twiddles.as_slice()))
+                .unwrap();
+            std::ptr::copy_nonoverlapping(
+                input.as_ptr().cast::<u8>(),
+                gpu.buffer_contents(data_buf),
+                data_bytes,
+            );
+            std::ptr::copy_nonoverlapping(
+                twiddles.as_ptr().cast::<u8>(),
+                gpu.buffer_contents(tw_buf),
+                core::mem::size_of_val(twiddles.as_slice()),
+            );
+            let time_pass = |pso: imp::Id, l: usize, f: usize, tpg: u64| -> f64 {
+                let mut best = f64::MAX;
+                for _ in 0..3 {
+                    let t = std::time::Instant::now();
+                    let cb = gpu.command_buffer().unwrap();
+                    let enc = gpu.compute_encoder(cb).unwrap();
+                    gpu.set_buffer(enc, data_buf, 0, 0);
+                    gpu.set_buffer(enc, tw_buf, 0, 1);
+                    gpu.set_pipeline(enc, pso);
+                    let p = imp::NttParams {
+                        log_d: log_d as u32,
+                        l: l as u32,
+                        f: f as u32,
+                        s: (log_d - l - f) as u32,
+                    };
+                    let bytes = core::slice::from_raw_parts(
+                        (&p as *const imp::NttParams).cast::<u8>(),
+                        core::mem::size_of::<imp::NttParams>(),
+                    );
+                    gpu.set_bytes(enc, bytes, 2);
+                    gpu.dispatch(enc, 1u64 << (log_d - f), tpg);
+                    gpu.end_encoding(enc);
+                    gpu.commit_and_wait(cb).unwrap();
+                    best = best.min(t.elapsed().as_secs_f64() * 1e3);
+                }
+                best
+            };
+            for (l, f) in super::plan_passes(log_d, 1) {
+                let (pso, tpg) = match f {
+                    4 => (gpu.pso_ntt4, 64u64),
+                    3 => (gpu.pso_ntt3, 64u64),
+                    _ => (gpu.pso_ntt, 1u64 << (f + 5)),
+                };
+                let ms = time_pass(pso, l, f, tpg);
+                eprintln!("pass l={l:2} f={f}: {ms:7.2} ms");
+            }
+            // Table-sharing variants (dispatch shrinks by 2^LOG_G, tpg grows).
+            let time_g = |pso: imp::Id, l: usize, log_g: u64| -> f64 {
+                let mut best = f64::MAX;
+                for _ in 0..3 {
+                    let t = std::time::Instant::now();
+                    let cb = gpu.command_buffer().unwrap();
+                    let enc = gpu.compute_encoder(cb).unwrap();
+                    gpu.set_buffer(enc, data_buf, 0, 0);
+                    gpu.set_buffer(enc, tw_buf, 0, 1);
+                    gpu.set_pipeline(enc, pso);
+                    let p = imp::NttParams {
+                        log_d: log_d as u32,
+                        l: l as u32,
+                        f: 4,
+                        s: (log_d - l - 4) as u32,
+                    };
+                    let bytes = core::slice::from_raw_parts(
+                        (&p as *const imp::NttParams).cast::<u8>(),
+                        core::mem::size_of::<imp::NttParams>(),
+                    );
+                    gpu.set_bytes(enc, bytes, 2);
+                    gpu.dispatch(enc, (1u64 << (log_d - 4)) >> log_g, 64u64 << log_g);
+                    gpu.end_encoding(enc);
+                    gpu.commit_and_wait(cb).unwrap();
+                    best = best.min(t.elapsed().as_secs_f64() * 1e3);
+                }
+                best
+            };
+            for l in [5usize, 9, 13] {
+                let base = time_g(gpu.pso_ntt4, l, 0);
+                let g2 = time_g(gpu.pso_ntt4g2, l, 2);
+                let g8 = time_g(gpu.pso_ntt4g8, l, 3);
+                eprintln!(
+                    "shared-table probe l={l:2}: reg4 {base:.2} ms, g2 {g2:.2} ms, g8 {g8:.2} ms"
+                );
+            }
+            gpu.release(data_buf);
+            gpu.release(tw_buf);
+            gpu.pool_pop(pool);
+        }
     }
 
     /// Timing probe for the full warm commit graph (5 fused NTT passes +
