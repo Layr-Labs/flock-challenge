@@ -3556,6 +3556,11 @@ kernel void parent_hash3(device const uint* children [[buffer(0)]],
     // dual-run. Nothing timed changes in any path.
     // -----------------------------------------------------------------------
 
+    // (Redraw marker #3, 2026-08-02: account draw history of this binary —
+    // 1,317,199.94 promoted (6c3f15e), 1,315,742.57 (2ae546d), 1,314,259.74
+    // (88d3156); chasing the 1,317,920.93 bar (b03a435, a marker-only
+    // resample of this same binary). Content change required for a
+    // per-account resubmission.)
     const WARMUP_CACHE_MAGIC: u64 = 0x464C_4B5F_574C_4332; // "FLK_WLC2"
 
     /// Cache key component tying entries to the exact GPU kernel source.
