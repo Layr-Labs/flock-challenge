@@ -151,7 +151,7 @@ pub struct Commitment {
 /// a factor of ~1.5 (e.g. at m=35: 13 GB → 9 GB).
 pub struct ProverData {
     pub codeword: CodewordBuf,
-    pub merkle_tree: Vec<Hash>,
+    pub merkle_tree: MerkleTreeBuf,
 }
 
 /// Storage for the L0 codeword. Normally a pooled `Vec` (CPU commit); with
@@ -161,6 +161,24 @@ pub struct ProverData {
 pub enum CodewordBuf {
     Cpu(Vec<F128>),
     Gpu(crate::gpu_commit::GpuCodeword),
+}
+
+/// Storage for the flat L0 Merkle tree.  CPU commits own a pooled vector;
+/// latched GPU commits keep a read-only view of the persistent shared Metal
+/// buffer and therefore avoid copying 64 MiB during the timed commit.
+pub enum MerkleTreeBuf {
+    Cpu(Vec<Hash>),
+    Gpu(crate::gpu_commit::GpuTree),
+}
+
+impl core::ops::Deref for MerkleTreeBuf {
+    type Target = [Hash];
+    fn deref(&self) -> &[Hash] {
+        match self {
+            MerkleTreeBuf::Cpu(v) => v,
+            MerkleTreeBuf::Gpu(g) => g,
+        }
+    }
 }
 
 impl core::ops::Deref for CodewordBuf {
@@ -180,11 +198,14 @@ impl core::ops::Deref for CodewordBuf {
 // copy-out target page-resident across the warmup and timed proves).
 impl Drop for ProverData {
     fn drop(&mut self) {
+        match std::mem::replace(&mut self.merkle_tree, MerkleTreeBuf::Cpu(Vec::new())) {
+            MerkleTreeBuf::Cpu(v) => crate::gpu_commit::give_tree(v),
+            MerkleTreeBuf::Gpu(g) => drop(g),
+        }
         match std::mem::replace(&mut self.codeword, CodewordBuf::Cpu(Vec::new())) {
             CodewordBuf::Cpu(v) => crate::scratch::give_f128(v),
             CodewordBuf::Gpu(g) => drop(g),
         }
-        crate::gpu_commit::give_tree(std::mem::take(&mut self.merkle_tree));
     }
 }
 
