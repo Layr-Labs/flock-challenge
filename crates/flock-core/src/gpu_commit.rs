@@ -1796,11 +1796,11 @@ kernel void parent_hash(device const uint* children [[buffer(0)]],
     }
 
     /// CPU share of the hybrid commit in sixteenths of the position range.
-    /// 0 disables (pure-GPU graph). Default 5 is the conservative midpoint of
-    /// the cache-local suffix plateau: it retains most of the measured gain on
-    /// a 10P/4E M4 Pro without assuming the benchmark's larger M3 Max GPU has
-    /// the same CPU/GPU balance. `FLOCK_HYBRID_CPU_BLOCKS` remains the exact
-    /// split-point override.
+    /// 0 disables (pure-GPU graph). Default 4 is the lower neighboring point
+    /// around the official M3 Max optimum: k=5 promoted decisively while k=7
+    /// over-allocated its slower CPU relative to the Max-class GPU. This
+    /// tests the remaining GPU/CPU balance without changing any graph math.
+    /// `FLOCK_HYBRID_CPU_BLOCKS` remains the exact split-point override.
     fn hybrid_cpu_sixteenths() -> usize {
         use std::sync::OnceLock;
         static K: OnceLock<usize> = OnceLock::new();
@@ -1812,7 +1812,7 @@ kernel void parent_hash(device const uint* children [[buffer(0)]],
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .filter(|k| *k < 16)
-                .unwrap_or(5)
+                .unwrap_or(4)
         })
     }
 
