@@ -28,8 +28,10 @@ pub mod univariate_skip_optimized;
 
 use multilinear::{
     UniSkipFoldTable, fold_and_compute_round_pair_into, fold_compact_and_compute_round_pair,
-    fold_in_place_pair, interpolate_at_z_combined, interpolate_at_z_on_lambda, round_pair_naive,
+    fold_in_place_pair, fold_packed_and_compute_round_pair, interpolate_at_z_combined,
+    interpolate_at_z_on_lambda, round_pair_naive,
     uni_skip_fold_and_round_pair_compact_padded_with_deltas,
+    uni_skip_round_pair_message_only_padded,
 };
 use univariate_skip_optimized::{
     c_s_f128, medium_challenges_ghash, round1_shift_reduce_extract_c_packed_padded,
@@ -394,16 +396,37 @@ fn prove_packed_padded_inner<C: Challenger>(
     let fold_table = UniSkipFoldTable::new(k_skip, z);
     let mut mlv_arg = vec![F128::ONE; n_mlv];
     mlv_arg[1..].copy_from_slice(&r[k_skip + 1..]);
-    let (compact_mlv, msg_1, msg_inf) = uni_skip_fold_and_round_pair_compact_padded_with_deltas(
-        a_packed,
-        b_packed,
-        m,
-        k_skip,
-        &fold_table,
-        &mlv_arg,
-        padding,
-        compact_deltas,
-    );
+    // Direct round-3 path (default): round two is store-less (message only)
+    // and round three re-derives its level straight from the packed rows via
+    // the 16-lane composed table — the 1.5 GiB compact anchor/delta
+    // write+read round-trip disappears. `FLOCK_ZC_COMPACT_LEGACY=1` restores
+    // the compact materialization as the same-binary A/B control; both paths
+    // produce identical field elements (F₂-linearity of the byte banks), so
+    // proof bytes are unchanged either way.
+    let compact_legacy = std::env::var_os("FLOCK_ZC_COMPACT_LEGACY").is_some_and(|v| v == *"1");
+    let (compact_mlv, msg_1, msg_inf) = if compact_legacy {
+        let (compact, m1, mi) = uni_skip_fold_and_round_pair_compact_padded_with_deltas(
+            a_packed,
+            b_packed,
+            m,
+            k_skip,
+            &fold_table,
+            &mlv_arg,
+            padding,
+            compact_deltas,
+        );
+        (Some(compact), m1, mi)
+    } else {
+        // The donated round-1 backing is unused on the direct path; hand its
+        // allocation straight back to the pool for the tail's ping-pong take.
+        if let Some(backing) = compact_deltas {
+            backing.recycle();
+        }
+        let (m1, mi) = uni_skip_round_pair_message_only_padded(
+            a_packed, b_packed, m, k_skip, &fold_table, &mlv_arg, padding,
+        );
+        (None, m1, mi)
+    };
 
     if zc_timing {
         eprintln!(
@@ -437,9 +460,24 @@ fn prove_packed_padded_inner<C: Challenger>(
     // post-fold tables expected by all subsequent rounds.
     let mut first_r_next = vec![F128::ONE; n_mlv - 1];
     first_r_next[1..].copy_from_slice(&r[k_skip + 2..]);
-    let (mut a_mlv, mut b_mlv, first_m1, first_mi) =
-        fold_compact_and_compute_round_pair(&compact_mlv, &fold_table, mlv_rhos[0], &first_r_next);
-    compact_mlv.recycle();
+    let (mut a_mlv, mut b_mlv, first_m1, first_mi) = match compact_mlv {
+        Some(compact) => {
+            let out =
+                fold_compact_and_compute_round_pair(&compact, &fold_table, mlv_rhos[0], &first_r_next);
+            compact.recycle();
+            out
+        }
+        None => fold_packed_and_compute_round_pair(
+            a_packed,
+            b_packed,
+            m,
+            k_skip,
+            &fold_table,
+            mlv_rhos[0],
+            &first_r_next,
+            padding,
+        ),
+    };
     multilinear_msgs.push((first_m1, first_mi));
     challenger.observe_f128(first_m1);
     challenger.observe_f128(first_mi);

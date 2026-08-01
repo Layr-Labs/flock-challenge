@@ -870,6 +870,301 @@ pub(crate) unsafe fn fold_compact_chunk_neon_unchecked_8(
     }
 }
 
+/// Store-less sibling of [`fold_round2_compact_chunk_neon_unchecked_8`]: the
+/// identical fold/message math with the anchor and delta stores removed. Used
+/// by the direct round-3 path, where the next round re-derives its inputs from
+/// the packed rows instead of a materialized compact representation, so round
+/// two only owes the transcript its `(G(1), G(∞))` message.
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "aes")]
+pub(crate) unsafe fn round2_message_only_chunk_neon_unchecked_8(
+    table_data: *const u8,
+    a_packed: *const u8,
+    b_packed: *const u8,
+    eq_lo: *const F128,
+    lo_size: usize,
+    pair_idx_base: usize,
+    pair_in_block_mask: usize,
+    useful_pairs_inclusive: usize,
+    degen: bool,
+) -> (F128, F128) {
+    use core::arch::aarch64::*;
+
+    unsafe {
+        let zero = vdupq_n_u64(0);
+        let mut p1_acc = WideNeon { lo: zero, hi: zero };
+        let mut pinf_acc = WideNeon { lo: zero, hi: zero };
+
+        // Fold of the all-ones row code = Σ_i L_i(z); see the compact kernel.
+        let ones_bytes = [0xFFu8; 8];
+        let b_ones = fold_row_q(table_data, ones_bytes.as_ptr());
+        let ones_is_one = is_zero_q(veorq_u64(
+            b_ones,
+            core::mem::transmute::<F128, uint64x2_t>(F128::ONE),
+        ));
+
+        for x_lo in 0..lo_size {
+            if ((pair_idx_base + x_lo) & pair_in_block_mask) >= useful_pairs_inclusive {
+                continue;
+            }
+
+            let row0 = 2 * x_lo;
+            let row1 = row0 + 1;
+            let a0_code = u64::from_le(core::ptr::read_unaligned(a_packed.add(row0 * 8).cast::<u64>()));
+            let a1_code = u64::from_le(core::ptr::read_unaligned(a_packed.add(row1 * 8).cast::<u64>()));
+            let b0_code = u64::from_le(core::ptr::read_unaligned(b_packed.add(row0 * 8).cast::<u64>()));
+            let b1_code = u64::from_le(core::ptr::read_unaligned(b_packed.add(row1 * 8).cast::<u64>()));
+
+            if degen && (b0_code & b1_code) == u64::MAX {
+                // b ≡ 1 pair: b0 = b1 = fold(all-ones) = 1; `b0 + b1 = 0`
+                // zeroes the G(∞) term. Only a1 is needed for the message.
+                let (_a0, a1) = fold_two_row_codes_q(table_data, a0_code, a1_code);
+                let g1 = if ones_is_one { a1 } else { mul_q(a1, b_ones) };
+                let eq_l = vld1q_u64(eq_lo.add(x_lo).cast::<u64>());
+                wide_xor(&mut p1_acc, mul_unreduced_q(eq_l, g1));
+                continue;
+            }
+
+            let (a0, a1, b0, b1) =
+                fold_four_row_codes_q(table_data, a0_code, a1_code, b0_code, b1_code);
+
+            let g1 = mul_q(a1, b1);
+            let g_inf = mul_q(veorq_u64(a0, a1), veorq_u64(b0, b1));
+            let eq_l = vld1q_u64(eq_lo.add(x_lo).cast::<u64>());
+            wide_xor(&mut p1_acc, mul_unreduced_q(eq_l, g1));
+            wide_xor(&mut pinf_acc, mul_unreduced_q(eq_l, g_inf));
+        }
+
+        (
+            core::mem::transmute::<uint64x2_t, F128>(reduce_wide_q(p1_acc)),
+            core::mem::transmute::<uint64x2_t, F128>(reduce_wide_q(pinf_acc)),
+        )
+    }
+}
+
+/// Fold four (even-row, odd-row) code pairs against the 16-lane composed
+/// round-3 table (lanes 0..8 = `(1+ρ)·T_z` indexed by even-row bytes, lanes
+/// 8..16 = `ρ·T_z` indexed by odd-row bytes). Each accumulator is one round-3
+/// output `(1+ρ)·fold_z(even) + ρ·fold_z(odd)`, F₂-linearity making the two
+/// half-folds independent XOR trees over one table image.
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn fold_four_code_pairs_composed_q(
+    table_data: *const u8,
+    c0: (u64, u64),
+    c1: (u64, u64),
+    c2: (u64, u64),
+    c3: (u64, u64),
+) -> (
+    core::arch::aarch64::uint64x2_t,
+    core::arch::aarch64::uint64x2_t,
+    core::arch::aarch64::uint64x2_t,
+    core::arch::aarch64::uint64x2_t,
+) {
+    use core::arch::aarch64::*;
+    unsafe {
+        const STRIDE: usize = 256 * 16;
+        let load = |pair: (u64, u64), chunk: usize| {
+            let byte = if chunk < 8 {
+                (pair.0 >> (8 * chunk)) & 0xff
+            } else {
+                (pair.1 >> (8 * (chunk - 8))) & 0xff
+            };
+            vld1q_u64(
+                table_data
+                    .add(chunk * STRIDE + byte as usize * core::mem::size_of::<F128>())
+                    .cast::<u64>(),
+            )
+        };
+        let mut acc0 = load(c0, 0);
+        let mut acc1 = load(c1, 0);
+        let mut acc2 = load(c2, 0);
+        let mut acc3 = load(c3, 0);
+        for chunk in (1..15).step_by(2) {
+            acc0 = xor3_u64(acc0, load(c0, chunk), load(c0, chunk + 1));
+            acc1 = xor3_u64(acc1, load(c1, chunk), load(c1, chunk + 1));
+            acc2 = xor3_u64(acc2, load(c2, chunk), load(c2, chunk + 1));
+            acc3 = xor3_u64(acc3, load(c3, chunk), load(c3, chunk + 1));
+        }
+        acc0 = veorq_u64(acc0, load(c0, 15));
+        acc1 = veorq_u64(acc1, load(c1, 15));
+        acc2 = veorq_u64(acc2, load(c2, 15));
+        acc3 = veorq_u64(acc3, load(c3, 15));
+        (acc0, acc1, acc2, acc3)
+    }
+}
+
+/// Two-stream variant of [`fold_four_code_pairs_composed_q`] for the
+/// degenerate-b and mixed-padding paths.
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn fold_two_code_pairs_composed_q(
+    table_data: *const u8,
+    c0: (u64, u64),
+    c1: (u64, u64),
+) -> (
+    core::arch::aarch64::uint64x2_t,
+    core::arch::aarch64::uint64x2_t,
+) {
+    use core::arch::aarch64::*;
+    unsafe {
+        const STRIDE: usize = 256 * 16;
+        let load = |pair: (u64, u64), chunk: usize| {
+            let byte = if chunk < 8 {
+                (pair.0 >> (8 * chunk)) & 0xff
+            } else {
+                (pair.1 >> (8 * (chunk - 8))) & 0xff
+            };
+            vld1q_u64(
+                table_data
+                    .add(chunk * STRIDE + byte as usize * core::mem::size_of::<F128>())
+                    .cast::<u64>(),
+            )
+        };
+        let mut acc0 = load(c0, 0);
+        let mut acc1 = load(c1, 0);
+        for chunk in (1..15).step_by(2) {
+            acc0 = xor3_u64(acc0, load(c0, chunk), load(c0, chunk + 1));
+            acc1 = xor3_u64(acc1, load(c1, chunk), load(c1, chunk + 1));
+        }
+        acc0 = veorq_u64(acc0, load(c0, 15));
+        acc1 = veorq_u64(acc1, load(c1, 15));
+        (acc0, acc1)
+    }
+}
+
+/// Direct round-3 worker: reconstruct the round-3 folded level straight from
+/// the packed round-2 rows via the 16-lane composed table, skipping the
+/// compact anchor/delta materialization entirely. Per output `o` (one per
+/// round-2 pair) it reads the pair's two 8-byte row codes for each of a/b and
+/// produces `(1+ρ)·fold_z(even) + ρ·fold_z(odd)` — the same field value the
+/// compact path reconstructs as `anchor + fold_{ρT}(delta)` — then computes
+/// the identical round-3 message over adjacent outputs.
+///
+/// Padded outputs (same predicate the compact producer used to zero its
+/// anchor/delta slots) are written as zeros and contribute zeros to the
+/// message, matching the compact path's arithmetic exactly.
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "aes")]
+#[allow(clippy::too_many_arguments)]
+pub(crate) unsafe fn fold_packed_round3_chunk_neon_unchecked_8(
+    composed_table: *const u8,
+    a_packed: *const u8,
+    b_packed: *const u8,
+    a_out: *mut F128,
+    b_out: *mut F128,
+    eq_lo: *const F128,
+    lo_size: usize,
+    out_idx_base: usize,
+    pair_in_block_mask: usize,
+    useful_pairs_inclusive: usize,
+    degen: bool,
+) -> (F128, F128) {
+    use core::arch::aarch64::*;
+
+    #[inline(always)]
+    unsafe fn store_pair_nt(dst: *mut F128, x: uint64x2_t, y: uint64x2_t) {
+        unsafe {
+            core::arch::asm!(
+                "stnp {x:q}, {y:q}, [{dst}]",
+                dst = in(reg) dst,
+                x = in(vreg) x,
+                y = in(vreg) y,
+                options(nostack, preserves_flags),
+            );
+        }
+    }
+
+    unsafe {
+        let zero = vdupq_n_u64(0);
+        let mut p1_acc = WideNeon { lo: zero, hi: zero };
+        let mut pinf_acc = WideNeon { lo: zero, hi: zero };
+        let one_q = core::mem::transmute::<F128, uint64x2_t>(F128::ONE);
+
+        // Composed fold of the all-ones pair: (1+ρ)·1 + ρ·1 = 1. Computed
+        // through the table so the degenerate shortcut stays value-gated.
+        let ones_pair = (u64::MAX, u64::MAX);
+        let (b_ones, _) = fold_two_code_pairs_composed_q(composed_table, ones_pair, ones_pair);
+
+        let read_code = |base: *const u8, row: usize| -> u64 {
+            u64::from_le(core::ptr::read_unaligned(base.add(row * 8).cast::<u64>()))
+        };
+
+        for x_lo in 0..lo_size {
+            let out = 2 * x_lo;
+            let p0 = ((out_idx_base + out) & pair_in_block_mask) >= useful_pairs_inclusive;
+            let p1 = ((out_idx_base + out + 1) & pair_in_block_mask) >= useful_pairs_inclusive;
+
+            if p0 && p1 {
+                // Both outputs padded: zeros in, zeros out, zero message terms.
+                store_pair_nt(a_out.add(out), zero, zero);
+                store_pair_nt(b_out.add(out), zero, zero);
+                continue;
+            }
+
+            // Chunk-local rows: output `out` ← rows (4·x_lo, 4·x_lo+1),
+            // output `out+1` ← rows (4·x_lo+2, 4·x_lo+3).
+            let r = 4 * x_lo;
+            let (a0, a1, b0, b1) = if p0 || p1 {
+                // Mixed padding (block-tail straddle): compute only the useful
+                // output; the padded one is zero, exactly as the compact
+                // producer stored it.
+                if p1 {
+                    let ac = (read_code(a_packed, r), read_code(a_packed, r + 1));
+                    let bc = (read_code(b_packed, r), read_code(b_packed, r + 1));
+                    let (a0, b0) = fold_two_code_pairs_composed_q(composed_table, ac, bc);
+                    (a0, zero, b0, zero)
+                } else {
+                    let ac = (read_code(a_packed, r + 2), read_code(a_packed, r + 3));
+                    let bc = (read_code(b_packed, r + 2), read_code(b_packed, r + 3));
+                    let (a1, b1) = fold_two_code_pairs_composed_q(composed_table, ac, bc);
+                    (zero, a1, zero, b1)
+                }
+            } else {
+                let a_c0 = (read_code(a_packed, r), read_code(a_packed, r + 1));
+                let a_c1 = (read_code(a_packed, r + 2), read_code(a_packed, r + 3));
+                let b_c0 = (read_code(b_packed, r), read_code(b_packed, r + 1));
+                let b_c1 = (read_code(b_packed, r + 2), read_code(b_packed, r + 3));
+
+                if degen
+                    && (b_c0.0 & b_c0.1 & b_c1.0 & b_c1.1) == u64::MAX
+                {
+                    // All four b rows all-ones: both b outputs are the composed
+                    // all-ones fold (= 1); G(∞)'s b factor vanishes.
+                    let (a0, a1) = fold_two_code_pairs_composed_q(composed_table, a_c0, a_c1);
+                    store_pair_nt(a_out.add(out), a0, a1);
+                    store_pair_nt(b_out.add(out), b_ones, b_ones);
+
+                    let g1 = if is_zero_q(veorq_u64(b_ones, one_q)) {
+                        a1
+                    } else {
+                        mul_q(a1, b_ones)
+                    };
+                    let eq_l = vld1q_u64(eq_lo.add(x_lo).cast::<u64>());
+                    wide_xor(&mut p1_acc, mul_unreduced_q(eq_l, g1));
+                    continue;
+                }
+
+                fold_four_code_pairs_composed_q(composed_table, a_c0, a_c1, b_c0, b_c1)
+            };
+
+            store_pair_nt(a_out.add(out), a0, a1);
+            store_pair_nt(b_out.add(out), b0, b1);
+
+            let g1 = mul_q(a1, b1);
+            let g_inf = mul_q(veorq_u64(a0, a1), veorq_u64(b0, b1));
+            let eq_l = vld1q_u64(eq_lo.add(x_lo).cast::<u64>());
+            wide_xor(&mut p1_acc, mul_unreduced_q(eq_l, g1));
+            wide_xor(&mut pinf_acc, mul_unreduced_q(eq_l, g_inf));
+        }
+
+        (
+            core::mem::transmute::<uint64x2_t, F128>(reduce_wide_q(p1_acc)),
+            core::mem::transmute::<uint64x2_t, F128>(reduce_wide_q(pinf_acc)),
+        )
+    }
+}
+
 /// NEON one-row fold: 8 aligned 16-byte loads + 8 XORs, hand-unrolled for
 /// `n_chunks = 8` (the k_skip=6 protocol size). Returns the folded F128.
 ///
