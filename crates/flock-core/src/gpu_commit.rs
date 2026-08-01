@@ -2069,9 +2069,10 @@ kernel void parent_hash(device const uint* children [[buffer(0)]],
             // prefix passes with no host round-trip, and `finish` skips the
             // encode on the CPU-suffix critical path. Bit-identical: the
             // encoded work is exactly what `finish` would have encoded.
-            // (Redraw marker: first draw of this tree scored 1,199,897.47 —
-            // 0.12% below the 1,201,360 bar — on 2026-08-01; content change
-            // required for a per-account resubmission.)
+            // (Redraw markers, 2026-08-01: draw #1 scored 1,199,897.47,
+            // 0.12% below the then-bar; draw #2 PROMOTED at 1,206,565.38;
+            // this is defensive draw #3 of the identical tree — a content
+            // change is required for any per-account resubmission.)
             if self.failed.is_none()
                 && self.early_k > 0
                 && self.early_cb2.is_none()
