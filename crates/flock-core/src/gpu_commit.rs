@@ -56,6 +56,11 @@ pub const ENV_NO_GPU_MIXED_FINAL: &str = "FLOCK_NO_GPU_MIXED_FINAL";
 /// exact value `1` disables it; the optimization remains ranked-tree-only.
 pub const ENV_NO_GPU_PARENT3: &str = "FLOCK_NO_GPU_PARENT3";
 
+/// Strict opt-in for the ranked 11/16 hybrid-prefix Merkle schedule. Exact
+/// value `1`, the ranked tree, k=5, and parent3 must all be present.
+pub const ENV_EXPERIMENTAL_GPU_PREFIX_HYBRID: &str =
+    "FLOCK_EXPERIMENTAL_GPU_PREFIX_HYBRID";
+
 fn gpu_parent3_value_enabled(value: Option<&std::ffi::OsStr>) -> bool {
     value != Some(std::ffi::OsStr::new("1"))
 }
@@ -71,6 +76,28 @@ fn select_gpu_parent3(n_leaves_total: usize, enabled: bool) -> bool {
     enabled && n_leaves_total == 1usize << 20
 }
 
+fn gpu_prefix_hybrid_value_enabled(value: Option<&std::ffi::OsStr>) -> bool {
+    value == Some(std::ffi::OsStr::new("1"))
+}
+
+fn gpu_prefix_hybrid_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        gpu_prefix_hybrid_value_enabled(
+            std::env::var_os(ENV_EXPERIMENTAL_GPU_PREFIX_HYBRID).as_deref(),
+        )
+    })
+}
+
+fn select_gpu_prefix_hybrid(
+    n_leaves_total: usize,
+    k_cpu16: usize,
+    parent3: bool,
+    enabled: bool,
+) -> bool {
+    enabled && parent3 && n_leaves_total == 1usize << 20 && k_cpu16 == 5
+}
+
 #[cfg(test)]
 mod parent3_gate_tests {
     use std::ffi::OsStr;
@@ -84,6 +111,21 @@ mod parent3_gate_tests {
         assert!(super::select_gpu_parent3(1 << 20, true));
         assert!(!super::select_gpu_parent3(1 << 20, false));
         assert!(!super::select_gpu_parent3(1 << 19, true));
+    }
+
+    #[test]
+    fn prefix_hybrid_is_strict_ranked_parent3_opt_in() {
+        assert!(super::gpu_prefix_hybrid_value_enabled(Some(OsStr::new("1"))));
+        for value in [None, Some(""), Some("0"), Some("01"), Some("true")] {
+            assert!(!super::gpu_prefix_hybrid_value_enabled(
+                value.map(OsStr::new)
+            ));
+        }
+        assert!(super::select_gpu_prefix_hybrid(1 << 20, 5, true, true));
+        assert!(!super::select_gpu_prefix_hybrid(1 << 20, 5, true, false));
+        assert!(!super::select_gpu_prefix_hybrid(1 << 20, 5, false, true));
+        assert!(!super::select_gpu_prefix_hybrid(1 << 20, 4, true, true));
+        assert!(!super::select_gpu_prefix_hybrid(1 << 19, 5, true, true));
     }
 }
 
@@ -2043,6 +2085,148 @@ kernel void parent_hash3(device const uint* children [[buffer(0)]],
         }
     }
 
+    /// Encode the ranked 11/16 GPU prefix with one leaf dispatch while
+    /// preserving parent3 fusion across the odd forest boundary. After a
+    /// common fused prefix, the first ten sixteenths take one more parent3
+    /// pass; three ordinary passes catch the last sixteenth up to that level;
+    /// the now-contiguous forest then stops at the global sixteen-node join.
+    pub(crate) unsafe fn encode_merkle_prefix_hybrid_impl(
+        gpu: &Gpu,
+        enc: Id,
+        codeword_buf: Id,
+        tree_buf: Id,
+        n_leaves_total: usize,
+        prefix_leaves: usize,
+        common_parent3_passes: usize,
+    ) {
+        debug_assert!(n_leaves_total.is_power_of_two());
+        debug_assert!(n_leaves_total >= 16);
+        debug_assert_eq!(prefix_leaves, 11 * (n_leaves_total / 16));
+        unsafe {
+            gpu.set_pipeline(enc, gpu.pso_leaf);
+            gpu.set_buffer(enc, codeword_buf, 0, 0);
+            gpu.set_buffer(enc, tree_buf, 0, 1);
+            let mut leaf_tpg = 256usize.min(prefix_leaves);
+            while prefix_leaves % leaf_tpg != 0 {
+                leaf_tpg >>= 1;
+            }
+            gpu.dispatch(
+                enc,
+                (prefix_leaves / leaf_tpg) as u64,
+                leaf_tpg as u64,
+            );
+
+            let mut level_start = 0usize;
+            let mut level_len = n_leaves_total;
+            let mut local_len = prefix_leaves;
+            gpu.set_pipeline(enc, gpu.pso_parent3);
+
+            // Production uses three common triples. The compact oracle uses
+            // the scaled one-triple analogue so the same split/catch-up
+            // geometry is exercised without allocating a ranked 1 GiB leaf
+            // buffer.
+            for _ in 0..common_parent3_passes {
+                debug_assert_eq!(local_len % 256, 0);
+                let level1_start = level_start + level_len;
+                let level1_len = level_len / 2;
+                let level2_start = level1_start + level1_len;
+                let level2_len = level1_len / 2;
+                let level3_start = level2_start + level2_len;
+                let level3_len = level2_len / 2;
+                gpu.set_buffer(enc, tree_buf, level_start * 32, 0);
+                gpu.set_buffer(enc, tree_buf, level1_start * 32, 1);
+                gpu.set_buffer(enc, tree_buf, level2_start * 32, 2);
+                gpu.set_buffer(enc, tree_buf, level3_start * 32, 3);
+                gpu.dispatch(enc, (local_len / 256) as u64, 128);
+                level_start = level3_start;
+                level_len = level3_len;
+                local_len >>= 3;
+            }
+
+            // The common range is eleven equal sixteenth segments. Fuse the
+            // aligned first ten (an even number of segments) once more.
+            debug_assert_eq!(local_len % 11, 0);
+            let segment_len = local_len / 11;
+            let first_len = 10 * segment_len;
+            debug_assert_eq!(first_len % 256, 0);
+            let split_level_start = level_start;
+            let split_level_len = level_len;
+            let level1_start = level_start + level_len;
+            let level1_len = level_len / 2;
+            let level2_start = level1_start + level1_len;
+            let level2_len = level1_len / 2;
+            let level3_start = level2_start + level2_len;
+            let level3_len = level2_len / 2;
+            gpu.set_buffer(enc, tree_buf, level_start * 32, 0);
+            gpu.set_buffer(enc, tree_buf, level1_start * 32, 1);
+            gpu.set_buffer(enc, tree_buf, level2_start * 32, 2);
+            gpu.set_buffer(enc, tree_buf, level3_start * 32, 3);
+            gpu.dispatch(enc, (first_len / 256) as u64, 128);
+
+            // Catch the final sixteenth up by the same three levels. At every
+            // level its write begins exactly after the first-ten range that
+            // parent3 just emitted, so the forest is contiguous again.
+            gpu.set_pipeline(enc, gpu.pso_parent);
+            let mut last_level_start = split_level_start;
+            let mut last_level_len = split_level_len;
+            let mut last_local_start = first_len;
+            let mut last_local_len = segment_len;
+            for _ in 0..3 {
+                let write_start = last_level_start + last_level_len;
+                let n_out = last_local_len / 2;
+                gpu.set_buffer(
+                    enc,
+                    tree_buf,
+                    (last_level_start + last_local_start) * 32,
+                    0,
+                );
+                gpu.set_buffer(
+                    enc,
+                    tree_buf,
+                    (write_start + last_local_start / 2) * 32,
+                    1,
+                );
+                let mut tpg = 256usize.min(n_out);
+                while n_out % tpg != 0 {
+                    tpg >>= 1;
+                }
+                gpu.dispatch(enc, (n_out / tpg) as u64, tpg as u64);
+                last_level_start = write_start;
+                last_level_len >>= 1;
+                last_local_start >>= 1;
+                last_local_len = n_out;
+            }
+            debug_assert_eq!(last_level_start, level3_start);
+            debug_assert_eq!(last_level_len, level3_len);
+            debug_assert_eq!(last_local_start, first_len / 8);
+
+            // First-ten and last-one are contiguous at `level3`. Finish them
+            // together only to the sixteen-root join; the CPU repair owns all
+            // nodes above it.
+            level_start = level3_start;
+            level_len = level3_len;
+            local_len = first_len / 8 + last_local_len;
+            debug_assert_eq!(local_len, prefix_leaves >> (3 * (common_parent3_passes + 1)));
+            while level_len > 16 {
+                debug_assert_eq!(local_len % 2, 0);
+                let write_start = level_start + level_len;
+                let n_out = local_len / 2;
+                gpu.set_buffer(enc, tree_buf, level_start * 32, 0);
+                gpu.set_buffer(enc, tree_buf, write_start * 32, 1);
+                let mut tpg = 256usize.min(n_out);
+                while n_out % tpg != 0 {
+                    tpg >>= 1;
+                }
+                gpu.dispatch(enc, (n_out / tpg) as u64, tpg as u64);
+                level_start = write_start;
+                level_len >>= 1;
+                local_len = n_out;
+            }
+            debug_assert_eq!(level_len, 16);
+            debug_assert_eq!(local_len, 11);
+        }
+    }
+
     // -----------------------------------------------------------------------
     // Copy-in/copy-out harness (tests and the warmup dual-run).
     // -----------------------------------------------------------------------
@@ -2729,18 +2913,36 @@ kernel void parent_hash3(device const uint* children [[buffer(0)]],
             let cb2 = gpu.command_buffer()?;
             let enc = gpu.compute_encoder(cb2)?;
             encode_ntt_passes_prefix(gpu, enc, staging, tw_buf, log_d, 4, prefix16);
-            // Greedy aligned power-of-two subtree decomposition of the
-            // leaf prefix.
             let sixteenth = n_leaves / 16;
-            let mut start = 0usize;
             let prefix_leaves = (16 - k_cpu16) * sixteenth;
-            while start < prefix_leaves {
-                let mut size = 1usize << (prefix_leaves - start).ilog2();
-                while start % size != 0 {
-                    size >>= 1;
+            let parent3 = super::select_gpu_parent3(n_leaves, super::gpu_parent3_enabled());
+            if super::select_gpu_prefix_hybrid(
+                n_leaves,
+                k_cpu16,
+                parent3,
+                super::gpu_prefix_hybrid_enabled(),
+            ) {
+                encode_merkle_prefix_hybrid_impl(
+                    gpu,
+                    enc,
+                    staging,
+                    tree_buf,
+                    n_leaves,
+                    prefix_leaves,
+                    3,
+                );
+            } else {
+                // Same-binary incumbent: greedy aligned power-of-two subtree
+                // decomposition with separate leaf/parent schedules.
+                let mut start = 0usize;
+                while start < prefix_leaves {
+                    let mut size = 1usize << (prefix_leaves - start).ilog2();
+                    while start % size != 0 {
+                        size >>= 1;
+                    }
+                    encode_merkle_subtree(gpu, enc, staging, tree_buf, n_leaves, start, size);
+                    start += size;
                 }
-                encode_merkle_subtree(gpu, enc, staging, tree_buf, n_leaves, start, size);
-                start += size;
             }
             gpu.end_encoding(enc);
             Ok(cb2)
@@ -4477,6 +4679,97 @@ mod tests {
                 .zip(affected)
                 .all(|(node, touched)| touched || *node == SENTINEL),
             "parent3 subtree encoder wrote outside its owned flat-tree ranges",
+        );
+    }
+
+    /// Scaled real-Metal oracle for the 10+1 sixteenth split/catch-up
+    /// schedule. One common parent3 pass at 2^15 has the same segment geometry
+    /// as three common passes at the ranked 2^20 shape.
+    #[test]
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    fn gpu_prefix_hybrid_matches_cpu_and_preserves_join_boundaries() {
+        use super::imp;
+
+        const N_LEAVES: usize = 1 << 15;
+        const PREFIX16: usize = 11;
+        const PREFIX_LEAVES: usize = PREFIX16 * (N_LEAVES / 16);
+        const SENTINEL: crate::merkle::Hash = [0xD4; 32];
+        let mut rng = Rng::new(0x10_01_03_04_11);
+        let data: Vec<u8> = (0..N_LEAVES * 1024)
+            .map(|_| (rng.next_u64() & 0xff) as u8)
+            .collect();
+        let expect =
+            crate::merkle::merkle_tree(&data, N_LEAVES, crate::merkle::HashKind::Blake3);
+        let mut actual = vec![SENTINEL; expect.len()];
+        let gpu = match gpu_or_skip(imp::gpu().map(|g| g as *const imp::Gpu)) {
+            Some(g) => unsafe { &*g },
+            None => return,
+        };
+
+        unsafe {
+            let pool = gpu.pool_push();
+            let data_buf = gpu.new_buffer(data.len()).unwrap();
+            let tree_bytes = core::mem::size_of_val(actual.as_slice());
+            let tree_buf = gpu.new_buffer(tree_bytes).unwrap();
+            std::ptr::copy_nonoverlapping(
+                data.as_ptr(),
+                gpu.buffer_contents(data_buf),
+                data.len(),
+            );
+            std::ptr::copy_nonoverlapping(
+                actual.as_ptr().cast::<u8>(),
+                gpu.buffer_contents(tree_buf),
+                tree_bytes,
+            );
+            let cb = gpu.command_buffer().unwrap();
+            let enc = gpu.compute_encoder(cb).unwrap();
+            imp::encode_merkle_prefix_hybrid_impl(
+                gpu,
+                enc,
+                data_buf,
+                tree_buf,
+                N_LEAVES,
+                PREFIX_LEAVES,
+                1,
+            );
+            gpu.end_encoding(enc);
+            gpu.commit_and_wait(cb).unwrap();
+            std::ptr::copy_nonoverlapping(
+                gpu.buffer_contents(tree_buf).cast::<crate::merkle::Hash>(),
+                actual.as_mut_ptr(),
+                actual.len(),
+            );
+            gpu.release(data_buf);
+            gpu.release(tree_buf);
+            gpu.pool_pop(pool);
+        }
+
+        let mut affected = vec![false; actual.len()];
+        let mut level_start = 0usize;
+        let mut level_len = N_LEAVES;
+        let mut local_len = PREFIX_LEAVES;
+        loop {
+            let end = level_start + local_len;
+            assert_eq!(
+                &actual[level_start..end],
+                &expect[level_start..end],
+                "hybrid prefix mismatch at global level {level_len}",
+            );
+            affected[level_start..end].fill(true);
+            if level_len == 16 {
+                assert_eq!(local_len, PREFIX16);
+                break;
+            }
+            level_start += level_len;
+            level_len >>= 1;
+            local_len >>= 1;
+        }
+        assert!(
+            actual
+                .iter()
+                .zip(affected)
+                .all(|(node, touched)| touched || *node == SENTINEL),
+            "hybrid prefix wrote into the CPU suffix or above the join level",
         );
     }
 
