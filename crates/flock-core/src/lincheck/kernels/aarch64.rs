@@ -258,6 +258,125 @@ unsafe fn process_block_neon_single<const TILE_T: usize>(
     vst1q_u8(o.add(112), a7);
 }
 
+/// Ranked two-block sibling of [`process_block_neon_single`]. Processing
+/// sixteen adjacent outputs at once lets each stripe use one 16-byte source
+/// load and direct byte-lane extracts. The old pair of eight-output calls used
+/// two scalar loads plus shift/mask chains for those same sixteen indices.
+#[cfg(target_arch = "aarch64")]
+#[inline(never)]
+#[allow(unsafe_op_in_unsafe_fn)]
+unsafe fn process_block_neon_wide<const TILE_T: usize>(
+    row_ptr: *const u8,
+    row_stride: usize,
+    bs: usize,
+    tables_ptr: *const u8,
+    out_ptr: *mut F128,
+) {
+    use std::arch::aarch64::*;
+
+    let o = out_ptr as *mut u8;
+    let mut a0 = vld1q_u8(o);
+    let mut a1 = vld1q_u8(o.add(16));
+    let mut a2 = vld1q_u8(o.add(32));
+    let mut a3 = vld1q_u8(o.add(48));
+    let mut a4 = vld1q_u8(o.add(64));
+    let mut a5 = vld1q_u8(o.add(80));
+    let mut a6 = vld1q_u8(o.add(96));
+    let mut a7 = vld1q_u8(o.add(112));
+    let mut a8 = vld1q_u8(o.add(128));
+    let mut a9 = vld1q_u8(o.add(144));
+    let mut a10 = vld1q_u8(o.add(160));
+    let mut a11 = vld1q_u8(o.add(176));
+    let mut a12 = vld1q_u8(o.add(192));
+    let mut a13 = vld1q_u8(o.add(208));
+    let mut a14 = vld1q_u8(o.add(224));
+    let mut a15 = vld1q_u8(o.add(240));
+
+    let mut t = 0;
+    while t + 1 < TILE_T {
+        let stripe0 = row_ptr.add(t * row_stride + bs);
+        let stripe1 = row_ptr.add((t + 1) * row_stride + bs);
+        let table0 = tables_ptr.add(t * 256 * 16);
+        let table1 = tables_ptr.add((t + 1) * 256 * 16);
+        let z0 = vld1q_u8(stripe0);
+        let z1 = vld1q_u8(stripe1);
+
+        macro_rules! fold_pair {
+            ($acc:ident, $lane:literal) => {
+                $acc = xor3_u8(
+                    $acc,
+                    vld1q_u8(table0.add(vgetq_lane_u8::<$lane>(z0) as usize * 16)),
+                    vld1q_u8(table1.add(vgetq_lane_u8::<$lane>(z1) as usize * 16)),
+                );
+            };
+        }
+        fold_pair!(a0, 0);
+        fold_pair!(a1, 1);
+        fold_pair!(a2, 2);
+        fold_pair!(a3, 3);
+        fold_pair!(a4, 4);
+        fold_pair!(a5, 5);
+        fold_pair!(a6, 6);
+        fold_pair!(a7, 7);
+        fold_pair!(a8, 8);
+        fold_pair!(a9, 9);
+        fold_pair!(a10, 10);
+        fold_pair!(a11, 11);
+        fold_pair!(a12, 12);
+        fold_pair!(a13, 13);
+        fold_pair!(a14, 14);
+        fold_pair!(a15, 15);
+        t += 2;
+    }
+    if t < TILE_T {
+        let stripe = row_ptr.add(t * row_stride + bs);
+        let table = tables_ptr.add(t * 256 * 16);
+        let z = vld1q_u8(stripe);
+
+        macro_rules! fold_one {
+            ($acc:ident, $lane:literal) => {
+                $acc = veorq_u8(
+                    $acc,
+                    vld1q_u8(table.add(vgetq_lane_u8::<$lane>(z) as usize * 16)),
+                );
+            };
+        }
+        fold_one!(a0, 0);
+        fold_one!(a1, 1);
+        fold_one!(a2, 2);
+        fold_one!(a3, 3);
+        fold_one!(a4, 4);
+        fold_one!(a5, 5);
+        fold_one!(a6, 6);
+        fold_one!(a7, 7);
+        fold_one!(a8, 8);
+        fold_one!(a9, 9);
+        fold_one!(a10, 10);
+        fold_one!(a11, 11);
+        fold_one!(a12, 12);
+        fold_one!(a13, 13);
+        fold_one!(a14, 14);
+        fold_one!(a15, 15);
+    }
+
+    vst1q_u8(o, a0);
+    vst1q_u8(o.add(16), a1);
+    vst1q_u8(o.add(32), a2);
+    vst1q_u8(o.add(48), a3);
+    vst1q_u8(o.add(64), a4);
+    vst1q_u8(o.add(80), a5);
+    vst1q_u8(o.add(96), a6);
+    vst1q_u8(o.add(112), a7);
+    vst1q_u8(o.add(128), a8);
+    vst1q_u8(o.add(144), a9);
+    vst1q_u8(o.add(160), a10);
+    vst1q_u8(o.add(176), a11);
+    vst1q_u8(o.add(192), a12);
+    vst1q_u8(o.add(208), a13);
+    vst1q_u8(o.add(224), a14);
+    vst1q_u8(o.add(240), a15);
+}
+
 /// **i_inner-partitioned** NEON partial fold. Same result as
 /// [`partial_fold_packed_z_neon_single_padded`] but parallelizes over the
 /// **output** (`i_inner`) instead of over z stripes.
@@ -421,7 +540,7 @@ pub(crate) fn oblock_padded_tiled<const TILE_T: usize>(
 ) -> Vec<F128> {
     use rayon::prelude::*;
 
-    const BLOCK_K: usize = 8;
+    const BLOCK_K: usize = 16;
 
     let n_log = m - k_log;
     let k = 1usize << k_log;
@@ -490,7 +609,7 @@ pub(crate) fn oblock_padded_tiled<const TILE_T: usize>(
             let mut bs = 0usize;
             while bs < useful {
                 unsafe {
-                    process_block_neon_single::<TILE_T>(
+                    process_block_neon_wide::<TILE_T>(
                         z_base,
                         k,
                         bs,
