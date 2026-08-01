@@ -255,7 +255,7 @@ pub(super) fn accumulate_convert(
 /// accumulated (those windows are all-zero witness).
 #[inline]
 pub(super) fn accumulate_c_banks(
-    c_block: &[u8; 16 * 64],
+    chunk_c_bytes: &[[u8; 64]; 16],
     n_b_med: usize,
     mask_tables: &[super::F128],
     partial_c: &mut [[super::F128; 64]; 8],
@@ -264,24 +264,18 @@ pub(super) fn accumulate_c_banks(
     // SAFETY: aarch64 statically guarantees NEON; the fixed-size arrays cover
     // every load/store and the table halves bound every `u8`-scaled index.
     unsafe {
-        aarch64::accumulate_c_banks(c_block, n_b_med, mask_tables, partial_c);
+        aarch64::accumulate_c_banks(chunk_c_bytes, n_b_med, mask_tables, partial_c);
     }
 
     #[cfg(not(target_arch = "aarch64"))]
-    accumulate_c_banks_scalar(c_block, n_b_med, mask_tables, partial_c);
+    accumulate_c_banks_scalar(chunk_c_bytes, n_b_med, mask_tables, partial_c);
 }
 
 /// Portable reference for [`accumulate_c_banks`], and the shape the aarch64
 /// kernel is tested against.
-///
-/// Deliberately written as the **composition** the fused kernel replaces —
-/// per-`b_med` [`bit_transpose_64bytes`] into a scratch row, then the
-/// cross-`b_med` mask scatter — so the differential test compares two
-/// genuinely different routes to the same bytes rather than two spellings of
-/// one route.
 #[cfg_attr(target_arch = "aarch64", allow(dead_code))]
 pub(super) fn accumulate_c_banks_scalar(
-    c_block: &[u8; 16 * 64],
+    chunk_c_bytes: &[[u8; 64]; 16],
     n_b_med: usize,
     mask_tables: &[super::F128],
     partial_c: &mut [[super::F128; 64]; 8],
@@ -289,19 +283,10 @@ pub(super) fn accumulate_c_banks_scalar(
     debug_assert!(n_b_med <= 16);
     debug_assert_eq!(mask_tables.len(), C_MASK_TABLE_STRIDE);
     let (t_lo, t_hi) = mask_tables.split_at(256);
-
-    let mut transposed = [[0u8; 64]; 16];
-    for b_med in 0..n_b_med {
-        let row: &[u8; 64] = c_block[b_med * 64..(b_med + 1) * 64]
-            .try_into()
-            .expect("64 c-bytes per medium position");
-        bit_transpose_64bytes(row, &mut transposed[b_med]);
-    }
-
     for lane in 0..64 {
         let mut masks = [0u16; 8];
-        for (b_med, row) in transposed.iter().enumerate().take(n_b_med) {
-            let c = row[lane];
+        for b_med in 0..n_b_med {
+            let c = chunk_c_bytes[b_med][lane];
             for (s, mask) in masks.iter_mut().enumerate() {
                 *mask |= u16::from((c >> s) & 1) << b_med;
             }
@@ -312,10 +297,64 @@ pub(super) fn accumulate_c_banks_scalar(
     }
 }
 
+/// Direct form of [`accumulate_c_banks`] for canonical, untransposed C rows.
+///
+/// `bit_transpose_64bytes` followed by the C-bank cross-`b_med` transpose is
+/// itself a single transpose: bank `s`, lane `8*b_chunk+t` receives bit `t`
+/// of raw byte `64*b_med + 8*s + b_chunk`. Consuming that layout directly
+/// removes one complete 64-byte transpose and its scratch traffic per row.
+#[inline]
+pub(super) fn accumulate_c_banks_raw(
+    raw_c_bytes: &[u8],
+    n_b_med: usize,
+    mask_tables: &[super::F128],
+    partial_c: &mut [[super::F128; 64]; 8],
+) {
+    debug_assert!(raw_c_bytes.len() >= n_b_med * 64);
+
+    #[cfg(target_arch = "aarch64")]
+    // SAFETY: aarch64 statically guarantees NEON; the slice covers every
+    // complete raw C row and the fixed arrays cover every output lane.
+    unsafe {
+        aarch64::accumulate_c_banks_raw(raw_c_bytes, n_b_med, mask_tables, partial_c);
+    }
+
+    #[cfg(not(target_arch = "aarch64"))]
+    accumulate_c_banks_raw_scalar(raw_c_bytes, n_b_med, mask_tables, partial_c);
+}
+
+/// Portable oracle for [`accumulate_c_banks_raw`].
+#[cfg_attr(target_arch = "aarch64", allow(dead_code))]
+pub(super) fn accumulate_c_banks_raw_scalar(
+    raw_c_bytes: &[u8],
+    n_b_med: usize,
+    mask_tables: &[super::F128],
+    partial_c: &mut [[super::F128; 64]; 8],
+) {
+    debug_assert!(n_b_med <= 16);
+    debug_assert!(raw_c_bytes.len() >= n_b_med * 64);
+    debug_assert_eq!(mask_tables.len(), C_MASK_TABLE_STRIDE);
+    let (t_lo, t_hi) = mask_tables.split_at(256);
+    for s in 0..8 {
+        for b_chunk in 0..8 {
+            for t in 0..8 {
+                let mut mask = 0u16;
+                for b_med in 0..n_b_med {
+                    let c = raw_c_bytes[b_med * 64 + s * 8 + b_chunk];
+                    mask |= u16::from((c >> t) & 1) << b_med;
+                }
+                let lane = b_chunk * 8 + t;
+                partial_c[s][lane] +=
+                    t_lo[usize::from(mask & 0xff)] + t_hi[usize::from(mask >> 8)];
+            }
+        }
+    }
+}
+
 #[inline]
 pub(super) fn accumulate_convert_with_s_hat_v(
     chunk_ab_bytes: &[[u8; 64]; 16],
-    c_block: &[u8; 16 * 64],
+    chunk_c_bytes: &[[u8; 64]; 16],
     n_b_med: usize,
     convert: &[super::F128],
     eq_lo_val: super::F128,
@@ -357,5 +396,57 @@ pub(super) fn accumulate_convert_with_s_hat_v(
     )))]
     portable::accumulate_convert_ab(chunk_ab_bytes, n_b_med, convert, eq_lo_val, partial_ab);
 
-    accumulate_c_banks(c_block, n_b_med, mask_tables, partial_c);
+    accumulate_c_banks(chunk_c_bytes, n_b_med, mask_tables, partial_c);
+}
+
+/// Precomputed-AB fold with C consumed in its canonical packed layout.
+///
+/// This is the same AB dispatch as [`accumulate_convert_with_s_hat_v`]; only
+/// the C input representation differs.
+#[inline]
+pub(super) fn accumulate_convert_with_s_hat_v_raw_c(
+    chunk_ab_bytes: &[[u8; 64]; 16],
+    raw_c_bytes: &[u8],
+    n_b_med: usize,
+    convert: &[super::F128],
+    eq_lo_val: super::F128,
+    mask_tables: &[super::F128],
+    partial_ab: &mut [super::F128; 64],
+    partial_c: &mut [[super::F128; 64]; 8],
+) {
+    #[cfg(target_arch = "aarch64")]
+    // SAFETY: aarch64 statically guarantees NEON and the fixed arrays cover
+    // all table-selected loads.
+    unsafe {
+        aarch64::accumulate_convert_ab(chunk_ab_bytes, n_b_med, convert, eq_lo_val, partial_ab);
+    }
+
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
+    ))]
+    // SAFETY: the cfg gate guarantees the SIMD features and the fixed arrays
+    // cover every four-lane load/store.
+    unsafe {
+        x86_64::accumulate_convert_ab_x86_avx512(
+            chunk_ab_bytes,
+            n_b_med,
+            convert,
+            eq_lo_val,
+            partial_ab,
+        );
+    }
+
+    #[cfg(not(any(
+        target_arch = "aarch64",
+        all(
+            target_arch = "x86_64",
+            target_feature = "avx512f",
+            target_feature = "vpclmulqdq"
+        )
+    )))]
+    portable::accumulate_convert_ab(chunk_ab_bytes, n_b_med, convert, eq_lo_val, partial_ab);
+
+    accumulate_c_banks_raw(raw_c_bytes, n_b_med, mask_tables, partial_c);
 }

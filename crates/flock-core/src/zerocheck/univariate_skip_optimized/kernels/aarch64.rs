@@ -234,43 +234,30 @@ pub(crate) unsafe fn accumulate_convert_ab(
     }
 }
 
-/// Eight α-free single-bit-`K` C banks, NEON — straight off the packed witness.
+/// Eight α-free single-bit-`K` C banks, NEON.
 ///
-/// Three phases, no multiplies, no convert-table gathers, and **no per-`b_med`
-/// `bit_transpose_64bytes`**:
+/// Two phases, no multiplies and no convert-table gathers:
 ///
-/// 1. **Cross-`b_med` bit transpose, on the raw rows.** `partial_c[s][lane]`
-///    wants the u16 whose bit `b` is bit `s` of `bit_transpose(raw[b])[lane]`,
-///    which unfolds to *bit `t` of `raw[b][8s + g]`* for `lane = 8g + t`. So the
-///    axis that has to move is `b` ↔ the bit index — a plain 8×8 bit transpose
-///    across eight q-registers, sixteen byte-columns at a time, run twice (`b`
-///    low half → `m_lo`, high half → `m_hi`). The butterfly is the standard
+/// 1. **Cross-`b_med` bit transpose.** `partial_c[s][lane]` wants the u16 mask
+///    whose bit `b` is bit `s` of `chunk_c_bytes[b][lane]` — i.e. the byte-index
+///    axis (`b_med`) and the bit axis (`s`) swap. Sixteen lanes at a time, that
+///    is a plain 8×8 bit transpose across eight q-registers, run twice (`b` low
+///    half → `m_lo`, high half → `m_hi`). The butterfly is the standard
 ///    recursive block swap: distance 4 is a nibble exchange, one `SLI` + one
 ///    `SRI` per pair; distances 2 and 1 are one shift + one `BSL` per side.
-///    24 vector ops per 8×8 block.
+///    24 vector ops per 8×8 block, 8 blocks per call.
 ///
-/// 2. **Interleaved store — this is what deletes the second permutation.** The
-///    transpose leaves `P_t[j]` (bit `b` = bit `t` of `raw[b][j]`), and the
-///    drain wants `m_s[8g + t] = P_t[8s + g]`. Written *interleaved*, i.e. into
-///    `R[j·8 + t]`, that reindex becomes `m_s[lane] = R[64s + lane]` — the
-///    identity on a `[[u8; 64]; 8]` buffer. So the byte permutation costs
-///    nothing but the store order: an 8-way byte interleave of the eight
-///    transpose outputs, `I8 = zip(zip(zip(r0,r4), zip(r2,r6)), zip(zip(r1,r5),
-///    zip(r3,r7)))`, 24 `ZIP1`/`ZIP2` per block. Verified index-by-index by
-///    `fused_c_masks_match_composed_transpose`.
+/// 2. **Table drain.** `F128 { lo: mask } * eq_lo` is F₂-linear in the mask, so
+///    it splits along the byte boundary the transpose already produced:
+///    `t_lo[m_lo] + t_hi[m_hi]`, folded into the accumulator with one EOR3.
+///    Keeping the two halves separate is why phase 1 never reassembles a u16.
 ///
-/// 3. **Table drain.** `F128 { lo: mask } * eq_lo` is F₂-linear in the mask, so
-///    it splits along the byte boundary phases 1–2 already produced:
-///    `t_lo[m_lo] + t_hi[m_hi]`, folded in with one EOR3. Keeping the halves
-///    separate is why nothing ever reassembles a u16.
-///
-/// Net vs the composed form this replaces: 16 × `bit_transpose_64bytes_neon`
-/// (~72 vector ops each) plus a 320-op mask transpose, against ~512 ops here.
-/// `c_block` is the 1024 raw witness bytes for this `x_outer_lo`, laid out as
-/// 16 contiguous 64-byte `b_med` rows.
+/// Bit-exactness vs the scalar form is the same field element by construction;
+/// `accumulate_convert_with_s_hat_v_matches_scalar_oracle` checks it against a
+/// convert-table oracle for every `n_b_med`.
 #[inline(always)]
 pub(crate) unsafe fn accumulate_c_banks(
-    c_block: &[u8; 16 * 64],
+    chunk_c_bytes: &[[u8; 64]; 16],
     n_b_med: usize,
     mask_tables: &[F128],
     partial_c: &mut [[F128; 64]; 8],
@@ -313,83 +300,62 @@ pub(crate) unsafe fn accumulate_c_banks(
             }};
         }
 
-        // 8-way byte interleave: `out[8c + t] == r[t][c]` over the 128 bytes.
-        macro_rules! interleave8 {
-            ($r:expr) => {{
-                let r: [uint8x16_t; 8] = $r;
-                let (a0, a1) = (vzip1q_u8(r[0], r[4]), vzip2q_u8(r[0], r[4]));
-                let (b0, b1) = (vzip1q_u8(r[2], r[6]), vzip2q_u8(r[2], r[6]));
-                let (c0, c1) = (vzip1q_u8(r[1], r[5]), vzip2q_u8(r[1], r[5]));
-                let (d0, d1) = (vzip1q_u8(r[3], r[7]), vzip2q_u8(r[3], r[7]));
-                let (e0, e1) = (vzip1q_u8(a0, b0), vzip2q_u8(a0, b0));
-                let (e2, e3) = (vzip1q_u8(a1, b1), vzip2q_u8(a1, b1));
-                let (f0, f1) = (vzip1q_u8(c0, d0), vzip2q_u8(c0, d0));
-                let (f2, f3) = (vzip1q_u8(c1, d1), vzip2q_u8(c1, d1));
-                [
-                    vzip1q_u8(e0, f0),
-                    vzip2q_u8(e0, f0),
-                    vzip1q_u8(e1, f1),
-                    vzip2q_u8(e1, f1),
-                    vzip1q_u8(e2, f2),
-                    vzip2q_u8(e2, f2),
-                    vzip1q_u8(e3, f3),
-                    vzip2q_u8(e3, f3),
-                ]
-            }};
-        }
-
         let m33 = vdupq_n_u8(0x33);
         let m55 = vdupq_n_u8(0x55);
 
-        // Bit `b` of `m_lo[s][lane]` is bit `s` of the transposed C byte for
-        // `b_med = b` (`m_hi` covers `b_med` 8..16). 1 KiB of stack, dead at
-        // return; phase 2 writes it in exactly this layout.
+        // Bit `b` of `m_lo[s][lane]` is bit `s` of `chunk_c_bytes[b][lane]`
+        // (`m_hi` covers `b_med` 8..16). 1 KiB of stack, dead at return.
         let mut m_lo = [[0u8; 64]; 8];
         let mut m_hi = [[0u8; 64]; 8];
-        let src = c_block.as_ptr();
 
         // `n_b_med` is fixed for the whole call, so the padded boundary window
         // gets its own arm rather than a runtime-zeroed row array — otherwise
-        // the full path pays sixteen dead vector stores per column chunk.
-        // Rows past `n_b_med` must read as ZERO rather than as witness bytes:
-        // the incumbent skips them outright, and matching that keeps the kernel
-        // exact even on a witness whose padding is not honestly zero.
+        // the full path pays sixteen dead vector stores per lane group.
         macro_rules! build_masks {
             ($row:expr) => {
-                for chunk in 0..4 {
-                    let col = chunk * 16;
-                    let row = |b: usize| -> uint8x16_t { $row(b, col) };
-                    for (half, dst) in [m_lo.as_mut_ptr(), m_hi.as_mut_ptr()].into_iter().enumerate()
-                    {
-                        let base = half * 8;
-                        let t = transpose8!(
-                            [
-                                row(base),
-                                row(base + 1),
-                                row(base + 2),
-                                row(base + 3),
-                                row(base + 4),
-                                row(base + 5),
-                                row(base + 6),
-                                row(base + 7)
-                            ],
-                            m33,
-                            m55
-                        );
-                        let g = interleave8!(t);
-                        let out = dst as *mut u8;
-                        for (i, value) in g.into_iter().enumerate() {
-                            vst1q_u8(out.add(chunk * 128 + i * 16), value);
-                        }
+                for group in 0..4 {
+                    let base = group * 16;
+                    let row = |b: usize| -> uint8x16_t { $row(b, base) };
+                    let lo = transpose8!(
+                        [
+                            row(0),
+                            row(1),
+                            row(2),
+                            row(3),
+                            row(4),
+                            row(5),
+                            row(6),
+                            row(7)
+                        ],
+                        m33,
+                        m55
+                    );
+                    let hi = transpose8!(
+                        [
+                            row(8),
+                            row(9),
+                            row(10),
+                            row(11),
+                            row(12),
+                            row(13),
+                            row(14),
+                            row(15)
+                        ],
+                        m33,
+                        m55
+                    );
+                    for s in 0..8 {
+                        vst1q_u8(m_lo[s].as_mut_ptr().add(base), lo[s]);
+                        vst1q_u8(m_hi[s].as_mut_ptr().add(base), hi[s]);
                     }
                 }
             };
         }
         if n_b_med == 16 {
-            build_masks!(|b: usize, col: usize| vld1q_u8(src.add(b * 64 + col)));
+            build_masks!(|b: usize, base: usize| vld1q_u8(chunk_c_bytes[b].as_ptr().add(base)));
         } else {
-            build_masks!(|b: usize, col: usize| if b < n_b_med {
-                vld1q_u8(src.add(b * 64 + col))
+            build_masks!(|b: usize, base: usize| if b < n_b_med {
+                vld1q_u8(chunk_c_bytes[b].as_ptr().add(base))
             } else {
                 vdupq_n_u8(0)
             });
@@ -409,6 +375,134 @@ pub(crate) unsafe fn accumulate_c_banks(
                         vld1q_u8(t_hi.add(usize::from(m_hi[s][lane]) * 16)),
                     ),
                 );
+            }
+        }
+    }
+}
+
+/// Direct raw-C form of [`accumulate_c_banks`].
+///
+/// The old path first transposed each 64-byte row from `(s, b_chunk)` to
+/// `(b_chunk, t)`, then transposed `b_med` with `s`. Composing those two
+/// permutations means that eight raw `b_med` rows can instead be transposed
+/// directly: output `t`, byte `8*s+b_chunk` is the desired mask byte for bank
+/// `s`, lane `8*b_chunk+t`. Four 16-byte groups cover the two-bank pairs.
+#[inline(always)]
+pub(crate) unsafe fn accumulate_c_banks_raw(
+    raw_c_bytes: &[u8],
+    n_b_med: usize,
+    mask_tables: &[F128],
+    partial_c: &mut [[F128; 64]; 8],
+) {
+    use core::arch::aarch64::*;
+
+    debug_assert!(n_b_med <= 16);
+    debug_assert!(raw_c_bytes.len() >= n_b_med * 64);
+    debug_assert_eq!(mask_tables.len(), 512);
+
+    // SAFETY: callers provide `n_b_med` complete 64-byte rows. Padded rows are
+    // synthesized as zero vectors; all table indices are bytes and therefore
+    // remain within their respective 256-entry halves.
+    unsafe {
+        macro_rules! transpose8 {
+            ($x:expr, $m33:expr, $m55:expr) => {{
+                let x: [uint8x16_t; 8] = $x;
+                let mut a = [vdupq_n_u8(0); 8];
+                for b in 0..4 {
+                    a[b] = vsliq_n_u8::<4>(x[b], x[b + 4]);
+                    a[b + 4] = vsriq_n_u8::<4>(x[b + 4], x[b]);
+                }
+                let mut c = [vdupq_n_u8(0); 8];
+                for q in 0..2 {
+                    for b in 0..2 {
+                        let (i, j) = (4 * q + b, 4 * q + b + 2);
+                        c[i] = vbslq_u8($m33, a[i], vshlq_n_u8::<2>(a[j]));
+                        c[j] = vbslq_u8($m33, vshrq_n_u8::<2>(a[i]), a[j]);
+                    }
+                }
+                let mut out = [vdupq_n_u8(0); 8];
+                for p in 0..4 {
+                    let (i, j) = (2 * p, 2 * p + 1);
+                    out[i] = vbslq_u8($m55, c[i], vshlq_n_u8::<1>(c[j]));
+                    out[j] = vbslq_u8($m55, vshrq_n_u8::<1>(c[i]), c[j]);
+                }
+                out
+            }};
+        }
+
+        let m33 = vdupq_n_u8(0x33);
+        let m55 = vdupq_n_u8(0x55);
+        let t_lo = mask_tables.as_ptr() as *const u8;
+        let t_hi = t_lo.add(256 * 16);
+
+        for group in 0..4 {
+            let base = group * 16;
+            // Dense ranked windows always have 16 rows. Keep that arm free of
+            // sixteen repeated padding comparisons, as in the incumbent
+            // cross-row kernel; only the final padded window uses zero rows.
+            let (lo, hi) = if n_b_med == 16 {
+                let row = |b: usize| -> uint8x16_t {
+                    vld1q_u8(raw_c_bytes.as_ptr().add(b * 64 + base))
+                };
+                (
+                    transpose8!(
+                        [row(0), row(1), row(2), row(3), row(4), row(5), row(6), row(7)],
+                        m33,
+                        m55
+                    ),
+                    transpose8!(
+                        [row(8), row(9), row(10), row(11), row(12), row(13), row(14), row(15)],
+                        m33,
+                        m55
+                    ),
+                )
+            } else {
+                let row = |b: usize| -> uint8x16_t {
+                    if b < n_b_med {
+                        vld1q_u8(raw_c_bytes.as_ptr().add(b * 64 + base))
+                    } else {
+                        vdupq_n_u8(0)
+                    }
+                };
+                (
+                    transpose8!(
+                        [row(0), row(1), row(2), row(3), row(4), row(5), row(6), row(7)],
+                        m33,
+                        m55
+                    ),
+                    transpose8!(
+                        [row(8), row(9), row(10), row(11), row(12), row(13), row(14), row(15)],
+                        m33,
+                        m55
+                    ),
+                )
+            };
+
+            // Each vector holds two banks × eight b_chunk bytes. Keep the
+            // temporary small and drain each bank's output lanes in order.
+            let mut masks_lo = [[0u8; 16]; 8];
+            let mut masks_hi = [[0u8; 16]; 8];
+            for t in 0..8 {
+                vst1q_u8(masks_lo[t].as_mut_ptr(), lo[t]);
+                vst1q_u8(masks_hi[t].as_mut_ptr(), hi[t]);
+            }
+            for half in 0..2 {
+                let bank = partial_c[group * 2 + half].as_mut_ptr() as *mut u8;
+                for b_chunk in 0..8 {
+                    let pos = half * 8 + b_chunk;
+                    for t in 0..8 {
+                        let lane = b_chunk * 8 + t;
+                        let slot = bank.add(lane * 16);
+                        vst1q_u8(
+                            slot,
+                            xor3_u8(
+                                vld1q_u8(slot),
+                                vld1q_u8(t_lo.add(usize::from(masks_lo[t][pos]) * 16)),
+                                vld1q_u8(t_hi.add(usize::from(masks_hi[t][pos]) * 16)),
+                            ),
+                        );
+                    }
+                }
             }
         }
     }
