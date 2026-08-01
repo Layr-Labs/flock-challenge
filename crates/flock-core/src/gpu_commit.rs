@@ -2108,6 +2108,14 @@ kernel void parent_hash(device const uint* children [[buffer(0)]],
         {
             return;
         }
+        // Keep the promoted 0d8 candidate curve byte-for-byte/schedule-for-
+        // schedule during every sweep sample and the winner verification.
+        // The guard is global because run_graph's CPU suffix executes on
+        // Rayon workers; RAII restores the timed flat scheduler on every
+        // return. On the successful path TUNED_HYBRID_K is published before
+        // this guard drops.
+        let _generic_suffix_probe =
+            crate::ntt::additive_ntt_f128::suppress_ranked_flat_cpu_suffix_for_probe();
         let dbg = debug_enabled() || std::env::var_os("FLOCK_COMMIT_TIMING").is_some();
         let z_buf = latched.wraps[0].2;
         let (tw_buf, tree_buf, staging) = (latched.tw_buf, latched.tree_buf, latched.staging);

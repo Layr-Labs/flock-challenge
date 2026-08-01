@@ -47,6 +47,62 @@ use crate::field::F128;
 
 mod kernels;
 
+/// Same-binary control for the flat ranked hybrid CPU suffix scheduler.
+pub(crate) const ENV_NO_RANKED_FLAT_CPU_SUFFIX: &str =
+    "FLOCK_NO_RANKED_FLAT_CPU_SUFFIX";
+
+/// Number of active calibration/probe regions that require the incumbent
+/// generic suffix scheduler. This is process-global (rather than thread-local)
+/// because the hybrid graph's CPU arm is drained by arbitrary Rayon workers.
+static RANKED_FLAT_CPU_SUFFIX_PROBE_DEPTH: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// RAII suppression token used while the GPU/CPU split autotuner measures and
+/// verifies candidates. Dropping it republishes the flat scheduler on every
+/// exit path, including early returns.
+#[must_use = "the guard must stay alive for the complete probe region"]
+pub(crate) struct RankedFlatCpuSuffixProbeGuard {
+    _private: (),
+}
+
+pub(crate) fn suppress_ranked_flat_cpu_suffix_for_probe() -> RankedFlatCpuSuffixProbeGuard {
+    RANKED_FLAT_CPU_SUFFIX_PROBE_DEPTH
+        .fetch_update(
+            std::sync::atomic::Ordering::SeqCst,
+            std::sync::atomic::Ordering::SeqCst,
+            |depth| depth.checked_add(1),
+        )
+        .expect("ranked flat-suffix probe depth overflow");
+    RankedFlatCpuSuffixProbeGuard { _private: () }
+}
+
+impl Drop for RankedFlatCpuSuffixProbeGuard {
+    fn drop(&mut self) {
+        RANKED_FLAT_CPU_SUFFIX_PROBE_DEPTH
+            .fetch_update(
+                std::sync::atomic::Ordering::SeqCst,
+                std::sync::atomic::Ordering::SeqCst,
+                |depth| depth.checked_sub(1),
+            )
+            .expect("ranked flat-suffix probe depth underflow");
+    }
+}
+
+#[inline]
+fn ranked_flat_cpu_suffix_enabled() -> bool {
+    cfg!(all(
+        target_os = "macos",
+        target_arch = "aarch64",
+        target_feature = "aes"
+    )) && std::env::var_os(ENV_NO_RANKED_FLAT_CPU_SUFFIX).is_none()
+        && RANKED_FLAT_CPU_SUFFIX_PROBE_DEPTH.load(std::sync::atomic::Ordering::SeqCst) == 0
+}
+
+#[cfg(test)]
+fn ranked_flat_cpu_suffix_probe_depth() -> usize {
+    RANKED_FLAT_CPU_SUFFIX_PROBE_DEPTH.load(std::sync::atomic::Ordering::SeqCst)
+}
+
 /// Compute the normalized subspace-polynomial evaluation table.
 ///
 /// Returns `evals` where `evals[i] = [Ŵ_i(β_i), Ŵ_i(β_{i+1}), …, Ŵ_i(β_{ℓ-1})]`.
@@ -731,16 +787,27 @@ impl AdditiveNttF128 {
         assert_eq!(stop_layer, log_d, "ranked hybrid suffix completes the NTT");
         assert!(b_start < b_end && b_end <= (1usize << start_layer));
 
-        // Two fused radix-8 passes.  Unlike the old all-layer range driver,
-        // this is the last streaming traversal of the complete suffix.
-        self.forward_transform_interleaved_block_range(
-            data,
-            num_ntts,
-            start_layer,
-            DEEP_LAYER,
-            b_start,
-            b_end,
-        );
+        if ranked_flat_cpu_suffix_enabled() {
+            // Timed path: flatten every selected (block,row) job into one
+            // Rayon region per pass. The generic range driver opens one
+            // region per block (5 + 40 joins at the ranked default k=5).
+            self.forward_transform_interleaved_ranked_block_range_top_flat(
+                data, b_start, b_end,
+            );
+        } else {
+            // Calibration/control path. The autotuner must observe the exact
+            // promoted 0d8 scheduler while choosing and verifying its split;
+            // its RAII probe guard reaches every Rayon worker through the
+            // process-global atomic above.
+            self.forward_transform_interleaved_block_range(
+                data,
+                num_ntts,
+                start_layer,
+                DEEP_LAYER,
+                b_start,
+                b_end,
+            );
+        }
 
         // Every layer-4 block contains 2^(10-4) independent layer-10
         // sub-NTTs.  Preserve their absolute indices so all deeper twiddles
@@ -756,6 +823,78 @@ impl AdditiveNttF128 {
             sub_end,
             &finish_chunk,
         );
+    }
+
+    /// Run ranked suffix layers 4..10 as two flat radix-8 job populations.
+    ///
+    /// Each `(block,row)` job owns eight disjoint position rows across all 64
+    /// lanes. Absolute block indices preserve the generic range driver's
+    /// twiddle mapping for every nonzero suffix start.
+    fn forward_transform_interleaved_ranked_block_range_top_flat(
+        &self,
+        data: &mut [F128],
+        b_start: usize,
+        b_end: usize,
+    ) {
+        use rayon::prelude::*;
+
+        const LOG_D: usize = 20;
+        const NUM_NTTS: usize = 64;
+        const START_LAYER: usize = 4;
+
+        debug_assert_eq!(data.len(), (1usize << LOG_D) * NUM_NTTS);
+        debug_assert!(b_start < b_end && b_end <= (1 << START_LAYER));
+
+        let range_blocks = b_end - b_start;
+        let top_block_positions = 1usize << (LOG_D - START_LAYER);
+        let range_base = b_start * top_block_positions * NUM_NTTS;
+        let range_elems = range_blocks * top_block_positions * NUM_NTTS;
+        let range = &mut data[range_base..range_base + range_elems];
+
+        for layer in [START_LAYER, START_LAYER + 3] {
+            let num_blocks = range_blocks << (layer - START_LAYER);
+            let abs_first = b_start << (layer - START_LAYER);
+            let block_positions = 1usize << (LOG_D - layer);
+            let block_elems = block_positions * NUM_NTTS;
+            let eighth = block_positions >> 3;
+            let twiddles: Vec<[F128; 7]> = (0..num_blocks)
+                .map(|local| {
+                    let abs = abs_first + local;
+                    let mut tw = [F128 { lo: 0, hi: 0 }; 7];
+                    tw[0] = self.twiddle(layer, abs);
+                    for s in 0..2 {
+                        tw[1 + s] = self.twiddle(layer + 1, 2 * abs + s);
+                    }
+                    for s in 0..4 {
+                        tw[3 + s] = self.twiddle(layer + 2, 4 * abs + s);
+                    }
+                    tw
+                })
+                .collect();
+
+            let base = range.as_mut_ptr() as usize;
+            let eighth_log = eighth.trailing_zeros() as usize;
+            let eighth_mask = eighth - 1;
+            (0..num_blocks * eighth)
+                .into_par_iter()
+                .for_each(|job| {
+                    let block = job >> eighth_log;
+                    let row = job & eighth_mask;
+                    let block_base =
+                        unsafe { (base as *mut F128).add(block * block_elems) };
+                    // SAFETY: each indexed job owns eight disjoint rows in
+                    // exactly one selected block.
+                    unsafe {
+                        kernels::butterfly_fused_3layer_row(
+                            block_base,
+                            eighth,
+                            NUM_NTTS,
+                            row,
+                            &twiddles[block],
+                        );
+                    }
+                });
+        }
     }
 
     /// Finish the ranked L0 transform's five cache-local deep pairs and invoke
@@ -1963,6 +2102,41 @@ fn log2_pow2(n: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn flat_suffix_probe_guard_is_global_nested_and_restores() {
+        let baseline_depth = ranked_flat_cpu_suffix_probe_depth();
+        let baseline_enabled = ranked_flat_cpu_suffix_enabled();
+
+        fn return_early(expected_depth: usize) {
+            let _guard = suppress_ranked_flat_cpu_suffix_for_probe();
+            assert_eq!(ranked_flat_cpu_suffix_probe_depth(), expected_depth + 1);
+        }
+
+        return_early(baseline_depth);
+        assert_eq!(ranked_flat_cpu_suffix_probe_depth(), baseline_depth);
+        assert_eq!(ranked_flat_cpu_suffix_enabled(), baseline_enabled);
+
+        let outer = suppress_ranked_flat_cpu_suffix_for_probe();
+        assert_eq!(ranked_flat_cpu_suffix_probe_depth(), baseline_depth + 1);
+        assert!(!ranked_flat_cpu_suffix_enabled());
+        let (left_depth, right_depth) = rayon::join(
+            ranked_flat_cpu_suffix_probe_depth,
+            ranked_flat_cpu_suffix_probe_depth,
+        );
+        assert_eq!(left_depth, baseline_depth + 1);
+        assert_eq!(right_depth, baseline_depth + 1);
+
+        {
+            let _inner = suppress_ranked_flat_cpu_suffix_for_probe();
+            assert_eq!(ranked_flat_cpu_suffix_probe_depth(), baseline_depth + 2);
+            assert!(!ranked_flat_cpu_suffix_enabled());
+        }
+        assert_eq!(ranked_flat_cpu_suffix_probe_depth(), baseline_depth + 1);
+        drop(outer);
+        assert_eq!(ranked_flat_cpu_suffix_probe_depth(), baseline_depth);
+        assert_eq!(ranked_flat_cpu_suffix_enabled(), baseline_enabled);
+    }
 
     struct Rng(u64);
     impl Rng {
