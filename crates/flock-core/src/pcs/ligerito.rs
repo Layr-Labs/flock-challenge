@@ -9448,3 +9448,15 @@ mod tests {
 }
 // Redraw marker 4 (drift probe): zero-diff; prior draws 1,205,646 / 1,205,107 / 1,206,245.
 // RealAdii draw 1 on 1a6ad0e.
+// RealAdii draw 1 on fb7e350.
+// RealAdii draw 2 on fb7e350 (draw 1: 1,244,567.97).
+// RealAdii draw 3 on fb7e350 (draws: 1,244,567.97 / 1,240,168.86).
+// RealAdii draw 4 on fb7e350 (draws: 1,244,567.97 / 1,240,168.86 / 1,245,038.14).
+// RealAdii draw 5 on fb7e350 (prior: 1244568/1240169/1245038/1242403).
+// RealAdii draw 6 on fb7e350 (prior best: 1246349).
+// RealAdii draw 7 on fb7e350.
+// RealAdii draw 8 on fb7e350.
+// RealAdii draw 9 on fb7e350.
+// RealAdii draw 10 on fb7e350.
+// RealAdii draw 11 on fb7e350.
+// RealAdii draw 12 on fb7e350.
