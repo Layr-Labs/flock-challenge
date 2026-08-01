@@ -394,16 +394,39 @@ fn prove_packed_padded_inner<C: Challenger>(
     let fold_table = UniSkipFoldTable::new(k_skip, z);
     let mut mlv_arg = vec![F128::ONE; n_mlv];
     mlv_arg[1..].copy_from_slice(&r[k_skip + 1..]);
-    let (compact_mlv, msg_1, msg_inf) = uni_skip_fold_and_round_pair_compact_padded_with_deltas(
-        a_packed,
-        b_packed,
-        m,
-        k_skip,
-        &fold_table,
-        &mlv_arg,
-        padding,
-        compact_deltas,
-    );
+    // GPU offload (ranked shape, post-latch only): the commit graph is long
+    // finished and the GPU idles for the rest of the prove, so the fold at
+    // `z` — pure byte-table lookups XOR-reduced, exact GF(2^128) in any
+    // order — runs there, materializing one folded F128 per packed row. The
+    // CPU keeps the PMULL message work, and round 3 consumes the folded
+    // arrays through the same fused kernel every later round uses.
+    // `FLOCK_NO_GPU_ZC_FOLD=1` (or any gate/failure) keeps the incumbent CPU
+    // fused path bit-for-bit.
+    let gpu_fold = crate::gpu_commit::zc_fold_z_gpu(a_packed, b_packed, &fold_table.data);
+    let (gpu_fold, compact_mlv, msg_1, msg_inf) = match gpu_fold {
+        Some(fold) => {
+            // The donated round-1 backing fed the compact deltas; unused on
+            // the GPU path — hand its allocation straight back to the pool.
+            if let Some(backing) = compact_deltas {
+                backing.recycle();
+            }
+            let (m1, mi) = multilinear::eq_weighted_pair_messages(fold.a(), fold.b(), &mlv_arg);
+            (Some(fold), None, m1, mi)
+        }
+        None => {
+            let (compact, m1, mi) = uni_skip_fold_and_round_pair_compact_padded_with_deltas(
+                a_packed,
+                b_packed,
+                m,
+                k_skip,
+                &fold_table,
+                &mlv_arg,
+                padding,
+                compact_deltas,
+            );
+            (None, Some(compact), m1, mi)
+        }
+    };
 
     if zc_timing {
         eprintln!(
@@ -437,9 +460,36 @@ fn prove_packed_padded_inner<C: Challenger>(
     // post-fold tables expected by all subsequent rounds.
     let mut first_r_next = vec![F128::ONE; n_mlv - 1];
     first_r_next[1..].copy_from_slice(&r[k_skip + 2..]);
-    let (mut a_mlv, mut b_mlv, first_m1, first_mi) =
-        fold_compact_and_compute_round_pair(&compact_mlv, &fold_table, mlv_rhos[0], &first_r_next);
-    compact_mlv.recycle();
+    let (mut a_mlv, mut b_mlv, first_m1, first_mi) = match (&gpu_fold, compact_mlv) {
+        (Some(fold), _) => {
+            // GPU path: round 3 is the ordinary fused pair fold over the
+            // materialized folded arrays — the same kernel rounds 4+ use.
+            let half = fold.a().len() / 2;
+            let mut a_out = crate::scratch::take_f128(half);
+            let mut b_out = crate::scratch::take_f128(half);
+            let (m1, mi) = fold_and_compute_round_pair_into(
+                fold.a(),
+                fold.b(),
+                &mut a_out,
+                &mut b_out,
+                mlv_rhos[0],
+                &first_r_next,
+            );
+            (a_out, b_out, m1, mi)
+        }
+        (None, Some(compact)) => {
+            let out = fold_compact_and_compute_round_pair(
+                &compact,
+                &fold_table,
+                mlv_rhos[0],
+                &first_r_next,
+            );
+            compact.recycle();
+            out
+        }
+        (None, None) => unreachable!("one of gpu_fold/compact_mlv is always produced"),
+    };
+    drop(gpu_fold);
     multilinear_msgs.push((first_m1, first_mi));
     challenger.observe_f128(first_m1);
     challenger.observe_f128(first_mi);

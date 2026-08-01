@@ -274,7 +274,6 @@ pub(crate) unsafe fn accumulate_c_banks(
     n_b_med: usize,
     mask_tables: &[F128],
     partial_c: &mut [[F128; 64]; 8],
-    drain4: bool,
 ) {
     use core::arch::aarch64::*;
 
@@ -398,51 +397,18 @@ pub(crate) unsafe fn accumulate_c_banks(
 
         let t_lo = mask_tables.as_ptr() as *const u8;
         let t_hi = t_lo.add(256 * 16);
-        if drain4 {
-            // Four independent lanes expose eight random table loads at once,
-            // matching the latency-hiding shape of the AB convert kernel.
-            // The old scalar drain kept only the low/high pair for one lane in
-            // flight, leaving the dependent L1 gather latency on the critical
-            // chain even though the register file has ample headroom.
-            for s in 0..8 {
-                let bank = partial_c[s].as_mut_ptr() as *mut u8;
-                for lane in (0..64).step_by(4) {
-                    let lo = (m_lo[s].as_ptr().add(lane) as *const u32).read_unaligned();
-                    let hi = (m_hi[s].as_ptr().add(lane) as *const u32).read_unaligned();
-
-                    let l0 = vld1q_u8(t_lo.add(usize::from((lo & 0xff) as u8) * 16));
-                    let l1 = vld1q_u8(t_lo.add(usize::from(((lo >> 8) & 0xff) as u8) * 16));
-                    let l2 = vld1q_u8(t_lo.add(usize::from(((lo >> 16) & 0xff) as u8) * 16));
-                    let l3 = vld1q_u8(t_lo.add(usize::from((lo >> 24) as u8) * 16));
-                    let h0 = vld1q_u8(t_hi.add(usize::from((hi & 0xff) as u8) * 16));
-                    let h1 = vld1q_u8(t_hi.add(usize::from(((hi >> 8) & 0xff) as u8) * 16));
-                    let h2 = vld1q_u8(t_hi.add(usize::from(((hi >> 16) & 0xff) as u8) * 16));
-                    let h3 = vld1q_u8(t_hi.add(usize::from((hi >> 24) as u8) * 16));
-
-                    let p0 = bank.add(lane * 16);
-                    let p1 = p0.add(16);
-                    let p2 = p1.add(16);
-                    let p3 = p2.add(16);
-                    vst1q_u8(p0, xor3_u8(vld1q_u8(p0), l0, h0));
-                    vst1q_u8(p1, xor3_u8(vld1q_u8(p1), l1, h1));
-                    vst1q_u8(p2, xor3_u8(vld1q_u8(p2), l2, h2));
-                    vst1q_u8(p3, xor3_u8(vld1q_u8(p3), l3, h3));
-                }
-            }
-        } else {
-            for s in 0..8 {
-                let bank = partial_c[s].as_mut_ptr() as *mut u8;
-                for lane in 0..64 {
-                    let slot = bank.add(lane * 16);
-                    vst1q_u8(
-                        slot,
-                        xor3_u8(
-                            vld1q_u8(slot),
-                            vld1q_u8(t_lo.add(usize::from(m_lo[s][lane]) * 16)),
-                            vld1q_u8(t_hi.add(usize::from(m_hi[s][lane]) * 16)),
-                        ),
-                    );
-                }
+        for s in 0..8 {
+            let bank = partial_c[s].as_mut_ptr() as *mut u8;
+            for lane in 0..64 {
+                let slot = bank.add(lane * 16);
+                vst1q_u8(
+                    slot,
+                    xor3_u8(
+                        vld1q_u8(slot),
+                        vld1q_u8(t_lo.add(usize::from(m_lo[s][lane]) * 16)),
+                        vld1q_u8(t_hi.add(usize::from(m_hi[s][lane]) * 16)),
+                    ),
+                );
             }
         }
     }

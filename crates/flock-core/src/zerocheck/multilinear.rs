@@ -50,7 +50,7 @@ mod kernels;
 use kernels::aarch64::fold_one_row_neon_unchecked_8;
 #[cfg(target_arch = "aarch64")]
 use kernels::aarch64::{
-    fold_and_message_aarch64, fold_compact_chunk_neon_unchecked_8,
+    eq_pair_messages_chunk_neon, fold_and_message_aarch64, fold_compact_chunk_neon_unchecked_8,
     fold_compact_stream_chunk_neon, fold_round2_chunk_neon_unchecked_8,
     fold_round2_compact_chunk_neon_unchecked_8, fold_round2_compact_stream_chunk_neon,
 };
@@ -663,6 +663,80 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_with_deltas(
         });
 
     (compact, mlv_challenges[0] * sum1, sum_inf)
+}
+
+/// Round-2 message from pre-folded row arrays (the GPU fold path): the same
+/// `(G(1), G(∞))` the fused compact producer computes, over
+/// `a_folded[x] = fold_z(a row x)` / `b_folded` produced elsewhere (GPU).
+/// Padded rows are zeros in the folded arrays (table entry 0 is zero), and
+/// zero pairs contribute zero message terms, so uniform processing matches
+/// the fused kernel's padded-pair skip bit-for-bit.
+pub(crate) fn eq_weighted_pair_messages(
+    a_folded: &[F128],
+    b_folded: &[F128],
+    mlv_challenges: &[F128],
+) -> (F128, F128) {
+    let n_rows = a_folded.len();
+    assert_eq!(b_folded.len(), n_rows);
+    let n_pairs = n_rows / 2;
+    assert!(n_pairs.is_power_of_two());
+    assert_eq!(mlv_challenges.len(), n_rows.trailing_zeros() as usize);
+
+    let eq = SplitEqGhash::with_n_hi(&mlv_challenges[1..], COMPACT_RECONSTRUCTION_N_HI);
+    let lo_size = 1usize << eq.n_lo;
+    let hi_size = 1usize << eq.n_hi;
+    assert_eq!(lo_size * hi_size, n_pairs);
+    let eq_hi = &eq.hi;
+    let eq_lo = &eq.lo;
+
+    let mut partials: Vec<(F128, F128)> = vec![(F128::ZERO, F128::ZERO); hi_size];
+    let partials_base = crate::epool::SyncPtr(partials.as_mut_ptr());
+    crate::epool::run_hetero_chunks(hi_size, |x_hi| {
+        let pair_base = x_hi * lo_size;
+        let row_base = 2 * pair_base;
+
+        #[cfg(target_arch = "aarch64")]
+        let (p1, pinf) = unsafe {
+            eq_pair_messages_chunk_neon(
+                a_folded.as_ptr().add(row_base),
+                b_folded.as_ptr().add(row_base),
+                eq_lo.as_ptr(),
+                lo_size,
+            )
+        };
+
+        #[cfg(not(target_arch = "aarch64"))]
+        let (p1, pinf) = {
+            let mut p1_acc = F256Unreduced::ZERO;
+            let mut pinf_acc = F256Unreduced::ZERO;
+            for x_lo in 0..lo_size {
+                let o = row_base + 2 * x_lo;
+                let a0 = a_folded[o];
+                let a1 = a_folded[o + 1];
+                let b0 = b_folded[o];
+                let b1 = b_folded[o + 1];
+                let eq_l = eq_lo[x_lo];
+                p1_acc ^= eq_l.mul_unreduced(a1 * b1);
+                pinf_acc ^= eq_l.mul_unreduced((a0 + a1) * (b0 + b1));
+            }
+            (p1_acc.reduce(), pinf_acc.reduce())
+        };
+
+        let eq_h = eq_hi[x_hi];
+        // SAFETY: the queue hands out each x_hi exactly once; chunk x_hi
+        // exclusively owns partials[x_hi]; the completion join publishes the
+        // writes before the reduction below reads them.
+        unsafe {
+            *partials_base.ptr().add(x_hi) = (eq_h * p1, eq_h * pinf);
+        }
+    });
+    let (sum1, sum_inf) = partials
+        .iter()
+        .fold((F128::ZERO, F128::ZERO), |(s1, sinf), &(c1, cinf)| {
+            (s1 + c1, sinf + cinf)
+        });
+
+    (mlv_challenges[0] * sum1, sum_inf)
 }
 
 /// Byte-lane-outer streaming variant of
@@ -2165,6 +2239,83 @@ mod tests {
             crate::scratch::give_f128(legacy_b);
             crate::scratch::clear();
         }
+    }
+
+    /// The GPU-fold-path CPU consumers are bit-identical to the compact
+    /// pipeline. `a_folded`/`b_folded` stand in for the GPU output via the
+    /// scalar per-row fold (the Metal kernel XORs the same table entries;
+    /// end-to-end proof identity covers the device itself): the round-2
+    /// message from [`eq_weighted_pair_messages`] and the round-3
+    /// fold+message from the generic [`fold_and_compute_round_pair_into`]
+    /// must match the compact producer/reconstructor exactly, including
+    /// padded block tails (which fold to zero naturally).
+    #[test]
+    fn gpu_fold_consumers_match_compact_pipeline() {
+        const K_SKIP: usize = 6;
+        const M: usize = 20;
+        const K_LOG: usize = 14;
+        const USEFUL_BITS: usize = 15_409;
+
+        let mut rng = Rng::new(0x6F0);
+        let mut a = rng.bits(1 << M);
+        let mut b = rng.bits(1 << M);
+        let block_size = 1usize << K_LOG;
+        for block in 0..(1usize << (M - K_LOG)) {
+            a[block * block_size + USEFUL_BITS..(block + 1) * block_size].fill(false);
+            b[block * block_size + USEFUL_BITS..(block + 1) * block_size].fill(false);
+            // Cover the degenerate b≡1 mass the fused kernels special-case.
+            b[block * block_size..block * block_size + 1024].fill(true);
+        }
+        let a_packed = pack_bits(&a);
+        let b_packed = pack_bits(&b);
+        let z = rng.f128();
+        let mlv_challenges = rng.f128_vec(M - K_SKIP);
+        let r_next = rng.f128_vec(M - K_SKIP - 1);
+        let rho = rng.f128();
+        let table = UniSkipFoldTable::new(K_SKIP, z);
+        let padding = PaddingSpec {
+            k_log: K_LOG,
+            useful_bits_per_block: USEFUL_BITS,
+        };
+
+        let n_rows = 1usize << (M - K_SKIP);
+        let a_folded: Vec<F128> = (0..n_rows)
+            .map(|x| table.fold_one_row(&a_packed[x * 8..(x + 1) * 8]))
+            .collect();
+        let b_folded: Vec<F128> = (0..n_rows)
+            .map(|x| table.fold_one_row(&b_packed[x * 8..(x + 1) * 8]))
+            .collect();
+
+        let (compact, m1, mi) = uni_skip_fold_and_round_pair_compact_padded(
+            &a_packed,
+            &b_packed,
+            M,
+            K_SKIP,
+            &table,
+            &mlv_challenges,
+            &padding,
+        );
+
+        let (g1, gi) = eq_weighted_pair_messages(&a_folded, &b_folded, &mlv_challenges);
+        assert_eq!((g1, gi), (m1, mi), "round-2 message mismatch");
+
+        let (expected_a, expected_b, expected_m1, expected_mi) =
+            fold_compact_and_compute_round_pair(&compact, &table, rho, &r_next);
+
+        let half = n_rows / 2;
+        let mut a_out = vec![F128::ZERO; half];
+        let mut b_out = vec![F128::ZERO; half];
+        let (r3_m1, r3_mi) = fold_and_compute_round_pair_into(
+            &a_folded, &b_folded, &mut a_out, &mut b_out, rho, &r_next,
+        );
+        assert_eq!(a_out, *expected_a, "round-3 A mismatch");
+        assert_eq!(b_out, *expected_b, "round-3 B mismatch");
+        assert_eq!((r3_m1, r3_mi), (expected_m1, expected_mi), "round-3 message mismatch");
+
+        crate::scratch::give_f128(expected_a);
+        crate::scratch::give_f128(expected_b);
+        compact.recycle();
+        crate::scratch::clear();
     }
 
     /// Parallel `uni_skip_fold_and_round_pair_optimized_packed` produces

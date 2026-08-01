@@ -870,6 +870,42 @@ pub(crate) unsafe fn fold_compact_chunk_neon_unchecked_8(
     }
 }
 
+/// Round-2 message over pre-folded rows (the GPU fold path): per pair
+/// `(a0,a1,b0,b1) = (a[2x], a[2x+1], b[2x], b[2x+1])`, accumulate
+/// `eq_lo[x]·(a1·b1)` and `eq_lo[x]·((a0⊕a1)(b0⊕b1))`. Padded pairs are
+/// zeros and contribute zero terms — uniform processing is bit-exact.
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "aes")]
+pub(crate) unsafe fn eq_pair_messages_chunk_neon(
+    a: *const F128,
+    b: *const F128,
+    eq_lo: *const F128,
+    lo_size: usize,
+) -> (F128, F128) {
+    use core::arch::aarch64::*;
+    unsafe {
+        let zero = vdupq_n_u64(0);
+        let mut p1_acc = WideNeon { lo: zero, hi: zero };
+        let mut pinf_acc = WideNeon { lo: zero, hi: zero };
+        for x_lo in 0..lo_size {
+            let o = 2 * x_lo;
+            let a0 = vld1q_u64(a.add(o).cast::<u64>());
+            let a1 = vld1q_u64(a.add(o + 1).cast::<u64>());
+            let b0 = vld1q_u64(b.add(o).cast::<u64>());
+            let b1 = vld1q_u64(b.add(o + 1).cast::<u64>());
+            let g1 = mul_q(a1, b1);
+            let g_inf = mul_q(veorq_u64(a0, a1), veorq_u64(b0, b1));
+            let eq_l = vld1q_u64(eq_lo.add(x_lo).cast::<u64>());
+            wide_xor(&mut p1_acc, mul_unreduced_q(eq_l, g1));
+            wide_xor(&mut pinf_acc, mul_unreduced_q(eq_l, g_inf));
+        }
+        (
+            core::mem::transmute::<uint64x2_t, F128>(reduce_wide_q(p1_acc)),
+            core::mem::transmute::<uint64x2_t, F128>(reduce_wide_q(pinf_acc)),
+        )
+    }
+}
+
 /// NEON one-row fold: 8 aligned 16-byte loads + 8 XORs, hand-unrolled for
 /// `n_chunks = 8` (the k_skip=6 protocol size). Returns the folded F128.
 ///

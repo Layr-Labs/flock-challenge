@@ -691,15 +691,6 @@ struct WorkerStateWithSHatV {
     local_res_c_s: [[F128; ELL]; N_C_BANKS],
 }
 
-#[inline]
-fn precomputed_ab_rows(ab_inner: &[u8], byte_base: usize) -> &[[u8; 64]; 1 << N_MEDIUM] {
-    let bytes = &ab_inner[byte_base..byte_base + (1 << N_MEDIUM) * 64];
-    // SAFETY: both source and target have alignment one and the slice above
-    // proves the complete 1024-byte extent. `[[u8; 64]; 16]` has no padding,
-    // so this changes only the borrow's shape, not its byte representation.
-    unsafe { &*bytes.as_ptr().cast::<[[u8; 64]; 1 << N_MEDIUM]>() }
-}
-
 impl WorkerStateWithSHatV {
     fn new() -> Self {
         Self {
@@ -851,9 +842,6 @@ fn process_one_x_hi_with_precomputed_ab(
     eq_hi_val: F128,
     convert: &[F128],
     mask_tables: &[F128],
-    split_ab_c: bool,
-    direct_ab_rows: bool,
-    c_drain4: bool,
     state: &mut WorkerStateWithSHatV,
 ) {
     state.partial_ab.iter_mut().for_each(|p| *p = F128::ZERO);
@@ -864,109 +852,40 @@ fn process_one_x_hi_with_precomputed_ab(
 
     let n_lo = n_lo_and_inner - N_INNER;
 
-    if split_ab_c {
-        // AB's 64 KiB convert table is exactly the cache-residency boundary on
-        // the efficiency cores.  The old per-window AB→C alternation touched
-        // a disjoint 8 KiB C table between every two AB uses.  Complete the AB
-        // population first, then drain C in a second linear pass; the witness
-        // bytes read are unchanged and characteristic-two accumulation makes
-        // the reordering bit-exact.
-        for x_outer_lo in 0..big_lo_size {
-            let x_outer = x_outer_lo | (x_hi << n_lo);
-            let within_hash_outer = x_outer & within_outer_mask;
-            let n_b_med = b_med_counts[within_hash_outer] as usize;
-            if n_b_med == 0 {
-                continue;
-            }
-
-            let chunk_byte_base =
-                ((x_outer_lo << N_INNER) | (x_hi << n_lo_and_inner)) * N_CHUNKS;
-            let chunk_ab_bytes = if direct_ab_rows {
-                precomputed_ab_rows(ab_inner, chunk_byte_base)
-            } else {
-                for b_med in 0..n_b_med {
-                    let byte_base_b = chunk_byte_base + b_med * N_CHUNKS * 8;
-                    state.chunk_ab_bytes[b_med]
-                        .copy_from_slice(&ab_inner[byte_base_b..byte_base_b + 64]);
-                }
-                &state.chunk_ab_bytes
-            };
-            kernels::accumulate_convert_ab(
-                chunk_ab_bytes,
-                n_b_med,
-                convert,
-                eq_lo_scaled[x_outer_lo],
-                &mut state.partial_ab,
-            );
+    for x_outer_lo in 0..big_lo_size {
+        let x_outer = x_outer_lo | (x_hi << n_lo);
+        let within_hash_outer = x_outer & within_outer_mask;
+        let n_b_med = b_med_counts[within_hash_outer] as usize;
+        if n_b_med == 0 {
+            continue;
         }
 
-        for x_outer_lo in 0..big_lo_size {
-            let x_outer = x_outer_lo | (x_hi << n_lo);
-            let within_hash_outer = x_outer & within_outer_mask;
-            let n_b_med = b_med_counts[within_hash_outer] as usize;
-            if n_b_med == 0 {
-                continue;
-            }
+        let chunk_byte_base = ((x_outer_lo << N_INNER) | (x_hi << n_lo_and_inner)) * N_CHUNKS;
+        let eq_lo_val = eq_lo_scaled[x_outer_lo];
+        let c_tables = &mask_tables
+            [x_outer_lo * C_MASK_TABLE_STRIDE..(x_outer_lo + 1) * C_MASK_TABLE_STRIDE];
+        // The C side reads the packed witness directly: the fused mask kernel
+        // subsumes the per-`b_med` `bit_transpose_64bytes` this path used to run.
+        let c_rows: &[u8; (1 << N_MEDIUM) * 64] = (&c_packed
+            [chunk_byte_base..chunk_byte_base + (1 << N_MEDIUM) * 64])
+            .try_into()
+            .expect("sixteen 64-byte c rows per x_outer_lo");
 
-            let chunk_byte_base =
-                ((x_outer_lo << N_INNER) | (x_hi << n_lo_and_inner)) * N_CHUNKS;
-            let c_rows: &[u8; (1 << N_MEDIUM) * 64] = (&c_packed
-                [chunk_byte_base..chunk_byte_base + (1 << N_MEDIUM) * 64])
-                .try_into()
-                .expect("sixteen 64-byte c rows per x_outer_lo");
-            let c_tables = &mask_tables
-                [x_outer_lo * C_MASK_TABLE_STRIDE..(x_outer_lo + 1) * C_MASK_TABLE_STRIDE];
-            kernels::accumulate_c_banks_with_policy(
-                c_rows,
-                n_b_med,
-                c_tables,
-                &mut state.partial_c,
-                c_drain4,
-            );
+        for b_med in 0..n_b_med {
+            let byte_base_b = chunk_byte_base + b_med * N_CHUNKS * 8;
+            state.chunk_ab_bytes[b_med].copy_from_slice(&ab_inner[byte_base_b..byte_base_b + 64]);
         }
-    } else {
-        for x_outer_lo in 0..big_lo_size {
-            let x_outer = x_outer_lo | (x_hi << n_lo);
-            let within_hash_outer = x_outer & within_outer_mask;
-            let n_b_med = b_med_counts[within_hash_outer] as usize;
-            if n_b_med == 0 {
-                continue;
-            }
 
-            let chunk_byte_base =
-                ((x_outer_lo << N_INNER) | (x_hi << n_lo_and_inner)) * N_CHUNKS;
-            let eq_lo_val = eq_lo_scaled[x_outer_lo];
-            let c_tables = &mask_tables
-                [x_outer_lo * C_MASK_TABLE_STRIDE..(x_outer_lo + 1) * C_MASK_TABLE_STRIDE];
-            // The C side reads the packed witness directly: the fused mask kernel
-            // subsumes the per-`b_med` `bit_transpose_64bytes` this path used to run.
-            let c_rows: &[u8; (1 << N_MEDIUM) * 64] = (&c_packed
-                [chunk_byte_base..chunk_byte_base + (1 << N_MEDIUM) * 64])
-                .try_into()
-                .expect("sixteen 64-byte c rows per x_outer_lo");
-
-            let chunk_ab_bytes = if direct_ab_rows {
-                precomputed_ab_rows(ab_inner, chunk_byte_base)
-            } else {
-                for b_med in 0..n_b_med {
-                    let byte_base_b = chunk_byte_base + b_med * N_CHUNKS * 8;
-                    state.chunk_ab_bytes[b_med]
-                        .copy_from_slice(&ab_inner[byte_base_b..byte_base_b + 64]);
-                }
-                &state.chunk_ab_bytes
-            };
-
-            kernels::accumulate_convert_with_s_hat_v(
-                chunk_ab_bytes,
-                c_rows,
-                n_b_med,
-                convert,
-                eq_lo_val,
-                c_tables,
-                &mut state.partial_ab,
-                &mut state.partial_c,
-            );
-        }
+        kernels::accumulate_convert_with_s_hat_v(
+            &state.chunk_ab_bytes,
+            c_rows,
+            n_b_med,
+            convert,
+            eq_lo_val,
+            c_tables,
+            &mut state.partial_ab,
+            &mut state.partial_c,
+        );
     }
 
     for lane in 0..ELL {
@@ -1345,9 +1264,6 @@ pub fn round1_shift_reduce_extract_c_packed_padded_with_precomputed_ab(
     let eq_hi = &eq.hi;
     let (within_outer_mask, b_med_counts) = build_b_med_counts(padding);
     let ab_inner_bytes = ab_inner.as_bytes();
-    let split_ab_c = std::env::var_os("FLOCK_NO_ZC_SPLIT_AB_C").is_none();
-    let direct_ab_rows = std::env::var_os("FLOCK_NO_ZC_DIRECT_AB_ROWS").is_none();
-    let c_drain4 = std::env::var_os("FLOCK_NO_ZC_C_DRAIN4").is_none();
 
     // The challenge-independent AB transform finishes while the commitment is
     // still running. Its challenge-weighted completion is therefore a live
@@ -1372,9 +1288,6 @@ pub fn round1_shift_reduce_extract_c_packed_padded_with_precomputed_ab(
             eq_hi[x_hi],
             convert,
             &mask_tables,
-            split_ab_c,
-            direct_ab_rows,
-            c_drain4,
             &mut state,
         );
         // SAFETY: the queue hands out each x_hi exactly once, so this task is

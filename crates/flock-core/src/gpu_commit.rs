@@ -39,6 +39,10 @@ pub const ENV_NO_GPU_COMMIT: &str = "FLOCK_NO_GPU_COMMIT";
 /// even after the ranked GPU commit has latched on.
 pub const ENV_NO_LAZY_GPU_CODEWORD: &str = "FLOCK_NO_LAZY_GPU_CODEWORD";
 
+/// Same-binary control that disables the zerocheck round-2 GPU fold,
+/// restoring the CPU fused fold as the exact A/B control.
+pub const ENV_NO_GPU_ZC_FOLD: &str = "FLOCK_NO_GPU_ZC_FOLD";
+
 /// Env var that latches the GPU on whenever it is bit-exact, even without a
 /// wall-clock win (A/B and test tooling).
 pub const ENV_GPU_COMMIT_FORCE: &str = "FLOCK_GPU_COMMIT_FORCE";
@@ -165,6 +169,40 @@ pub(crate) fn finish_from_z_first_pass_or_fallback(
     cpu: impl FnOnce(&mut [F128]) -> Vec<crate::merkle::Hash>,
 ) -> (crate::pcs::commit::CodewordBuf, crate::pcs::commit::MerkleTreeBuf) {
     imp::finish_from_z_first_pass_or_fallback(stream.inner, z_packed, codeword, params, cpu)
+}
+
+/// Zero-copy view of the GPU-folded zerocheck round-2 arrays: one folded
+/// F128 per packed row (`a_folded[x] = fold_z(a row x)`, likewise `b`), in
+/// persistent shared Metal buffers. Padded rows fold to zero automatically
+/// (all-zero row bytes hit table entry 0, which is zero).
+pub struct ZcFoldZ {
+    inner: imp::ZcFoldZ,
+}
+
+impl ZcFoldZ {
+    pub fn a(&self) -> &[F128] {
+        self.inner.a()
+    }
+    pub fn b(&self) -> &[F128] {
+        self.inner.b()
+    }
+}
+
+/// Fold every packed round-2 row at `z` on the GPU (the commit graph is done
+/// and the GPU is otherwise idle for the rest of the prove). Ranked shape
+/// only, only after the untimed warmup latched the ranked Metal commit on,
+/// and never when `FLOCK_NO_GPU_ZC_FOLD=1`. Returns `None` whenever the CPU
+/// fused path should stay in control; the inputs are never written, so the
+/// caller's fallback is always safe.
+pub(crate) fn zc_fold_z_gpu(
+    a_packed: &[u8],
+    b_packed: &[u8],
+    table: &[F128],
+) -> Option<ZcFoldZ> {
+    if std::env::var_os(ENV_NO_GPU_ZC_FOLD).is_some() {
+        return None;
+    }
+    imp::zc_fold_z_gpu(a_packed, b_packed, table).map(|inner| ZcFoldZ { inner })
 }
 
 /// A read-only view of the transformed L0 codeword living in the GPU's
@@ -1236,6 +1274,65 @@ kernel void parent_hash(device const uint* children [[buffer(0)]],
     for (int i = 0; i < 8; i++) parents[id * 8u + i] = cv[i];
 }
 
+// ===========================================================================
+// Zerocheck round-2 univariate-skip fold (added with the GPU zc-fold
+// milestone). One thread folds one packed row: 8 byte-indexed lookups into
+// the 32 KiB z-table (staged in threadgroup memory) XOR-reduced to one F128.
+// Every table entry is an XOR-subset of the 64 Lagrange basis weights, so the
+// fold is exact GF(2^128) addition — bit-identical to the CPU kernels by
+// construction, in any evaluation order. Padded rows are all-zero bits and
+// table entry 0 is zero, so padding folds to zero with no branches.
+// ===========================================================================
+
+kernel void zc_fold_z(device const ulong* a_packed [[buffer(0)]],
+                      device const ulong* b_packed [[buffer(1)]],
+                      device uint4* a_out          [[buffer(2)]],
+                      device uint4* b_out          [[buffer(3)]],
+                      device const uint4* table    [[buffer(4)]],
+                      uint gid [[thread_position_in_grid]])
+{
+    // Device table (L1/L2-cached; the constant cache serializes divergent
+    // indexing). Four rows per thread keeps 8 independent lookup chains in
+    // flight to hide gather latency behind ILP.
+    uint base = gid * 4u;
+    ulong ca0 = a_packed[base + 0u];
+    ulong ca1 = a_packed[base + 1u];
+    ulong ca2 = a_packed[base + 2u];
+    ulong ca3 = a_packed[base + 3u];
+    ulong cb0 = b_packed[base + 0u];
+    ulong cb1 = b_packed[base + 1u];
+    ulong cb2 = b_packed[base + 2u];
+    ulong cb3 = b_packed[base + 3u];
+    uint4 fa0 = table[(uint)(ca0 & 0xffu)];
+    uint4 fa1 = table[(uint)(ca1 & 0xffu)];
+    uint4 fa2 = table[(uint)(ca2 & 0xffu)];
+    uint4 fa3 = table[(uint)(ca3 & 0xffu)];
+    uint4 fb0 = table[(uint)(cb0 & 0xffu)];
+    uint4 fb1 = table[(uint)(cb1 & 0xffu)];
+    uint4 fb2 = table[(uint)(cb2 & 0xffu)];
+    uint4 fb3 = table[(uint)(cb3 & 0xffu)];
+    for (uint j = 1; j < 8u; j++) {
+        device const uint4* bank = table + j * 256u;
+        uint sh = 8u * j;
+        fa0 ^= bank[(uint)((ca0 >> sh) & 0xffu)];
+        fa1 ^= bank[(uint)((ca1 >> sh) & 0xffu)];
+        fa2 ^= bank[(uint)((ca2 >> sh) & 0xffu)];
+        fa3 ^= bank[(uint)((ca3 >> sh) & 0xffu)];
+        fb0 ^= bank[(uint)((cb0 >> sh) & 0xffu)];
+        fb1 ^= bank[(uint)((cb1 >> sh) & 0xffu)];
+        fb2 ^= bank[(uint)((cb2 >> sh) & 0xffu)];
+        fb3 ^= bank[(uint)((cb3 >> sh) & 0xffu)];
+    }
+    a_out[base + 0u] = fa0;
+    a_out[base + 1u] = fa1;
+    a_out[base + 2u] = fa2;
+    a_out[base + 3u] = fa3;
+    b_out[base + 0u] = fb0;
+    b_out[base + 1u] = fb1;
+    b_out[base + 2u] = fb2;
+    b_out[base + 3u] = fb3;
+}
+
 "#;
 
     // -----------------------------------------------------------------------
@@ -1258,6 +1355,7 @@ kernel void parent_hash(device const uint* children [[buffer(0)]],
         pub(crate) pso_ntt5mix: Id,
         pub(crate) pso_leaf: Id,
         pub(crate) pso_parent: Id,
+        pub(crate) pso_zc_fold: Id,
     }
     // SAFETY: MTLDevice/MTLCommandQueue/MTLComputePipelineState are
     // documented thread-safe; command buffers/encoders are created and used
@@ -1359,6 +1457,9 @@ kernel void parent_hash(device const uint* children [[buffer(0)]],
                 let pso_ntt5mix = pso("ntt_pass5_mixed")?;
                 let pso_leaf = pso("leaf_hash")?;
                 let pso_parent = pso("parent_hash")?;
+                // Non-fatal: the zerocheck fold is an optional offload; a
+                // pipeline failure here must not take down the GPU commit.
+                let pso_zc_fold = pso("zc_fold_z").unwrap_or(NIL);
                 send!(api, unsafe extern "C" fn(Id, Sel) -> Id, library, c"release");
                 Ok(Gpu {
                     api,
@@ -1374,6 +1475,7 @@ kernel void parent_hash(device const uint* children [[buffer(0)]],
                     pso_ntt5mix,
                     pso_leaf,
                     pso_parent,
+                    pso_zc_fold,
                 })
             })();
             pool_pop(pool);
@@ -3350,6 +3452,162 @@ kernel void parent_hash(device const uint* children [[buffer(0)]],
         }
     }
 
+    /// Persistent shared output/table buffers for the zerocheck GPU fold
+    /// (Ids stored as usize; allocated once per process, reused every prove).
+    static ZC_FOLD_BUFS: Mutex<Option<(usize, usize, usize, usize)>> = Mutex::new(None);
+
+    pub(crate) struct ZcFoldZ {
+        gpu: &'static Gpu,
+        wrap_a: Id,
+        wrap_b: Id,
+        a_ptr: *const F128,
+        b_ptr: *const F128,
+        len: usize,
+    }
+
+    impl ZcFoldZ {
+        pub(crate) fn a(&self) -> &[F128] {
+            unsafe { core::slice::from_raw_parts(self.a_ptr, self.len) }
+        }
+        pub(crate) fn b(&self) -> &[F128] {
+            unsafe { core::slice::from_raw_parts(self.b_ptr, self.len) }
+        }
+    }
+
+    impl Drop for ZcFoldZ {
+        fn drop(&mut self) {
+            unsafe {
+                self.gpu.release(self.wrap_a);
+                self.gpu.release(self.wrap_b);
+            }
+        }
+    }
+
+    pub(crate) fn zc_fold_z_gpu(
+        a_packed: &[u8],
+        b_packed: &[u8],
+        table: &[F128],
+    ) -> Option<ZcFoldZ> {
+        // Ranked shape only, only after the untimed warmup latched the GPU
+        // commit on (which also proved the Metal stack bit-exact end-to-end),
+        // and only when the pipeline compiled.
+        if !super::gpu_commit_enabled() || rayon::current_num_threads() <= 1 {
+            return None;
+        }
+        if !gpu_commit_latched_on() {
+            return None;
+        }
+        let n_rows = a_packed.len() / 8;
+        if n_rows != (1usize << 26)
+            || a_packed.len() != n_rows * 8
+            || b_packed.len() != a_packed.len()
+            || table.len() != 8 * 256
+        {
+            return None;
+        }
+        let gpu = gpu().ok()?;
+        if gpu.pso_zc_fold.is_null() {
+            return None;
+        }
+
+        let t0 = std::time::Instant::now();
+        unsafe {
+            let pool = gpu.pool_push();
+            let result = (|| -> Result<ZcFoldZ, String> {
+                let (a_out, b_out, tab) = {
+                    let mut bufs = ZC_FOLD_BUFS.lock().unwrap();
+                    match *bufs {
+                        Some((a, b, t, rows)) if rows == n_rows => {
+                            (a as Id, b as Id, t as Id)
+                        }
+                        _ => {
+                            let a = gpu.new_buffer(n_rows * 16)?;
+                            let b = match gpu.new_buffer(n_rows * 16) {
+                                Ok(b) => b,
+                                Err(e) => {
+                                    gpu.release(a);
+                                    return Err(e);
+                                }
+                            };
+                            let t = match gpu.new_buffer(8 * 256 * 16) {
+                                Ok(t) => t,
+                                Err(e) => {
+                                    gpu.release(a);
+                                    gpu.release(b);
+                                    return Err(e);
+                                }
+                            };
+                            *bufs = Some((a as usize, b as usize, t as usize, n_rows));
+                            (a, b, t)
+                        }
+                    }
+                };
+                // Upload the per-prove 32 KiB z-table.
+                core::ptr::copy_nonoverlapping(
+                    table.as_ptr().cast::<u8>(),
+                    gpu.buffer_contents(tab),
+                    8 * 256 * 16,
+                );
+                let wrap_a =
+                    gpu.wrap_buffer(a_packed.as_ptr().cast_mut().cast::<u8>(), a_packed.len())?;
+                let wrap_b = match gpu
+                    .wrap_buffer(b_packed.as_ptr().cast_mut().cast::<u8>(), b_packed.len())
+                {
+                    Ok(w) => w,
+                    Err(e) => {
+                        gpu.release(wrap_a);
+                        return Err(e);
+                    }
+                };
+                let run = (|| -> Result<(), String> {
+                    let cb = gpu.command_buffer()?;
+                    let enc = gpu.compute_encoder(cb)?;
+                    gpu.set_pipeline(enc, gpu.pso_zc_fold);
+                    gpu.set_buffer(enc, wrap_a, 0, 0);
+                    gpu.set_buffer(enc, wrap_b, 0, 1);
+                    gpu.set_buffer(enc, a_out, 0, 2);
+                    gpu.set_buffer(enc, b_out, 0, 3);
+                    gpu.set_buffer(enc, tab, 0, 4);
+                    // Four rows per thread (see the kernel's coarsening).
+                    gpu.dispatch(enc, (n_rows / (4 * 256)) as u64, 256);
+                    gpu.end_encoding(enc);
+                    gpu.commit_and_wait(cb)
+                })();
+                if let Err(e) = run {
+                    gpu.release(wrap_a);
+                    gpu.release(wrap_b);
+                    return Err(e);
+                }
+                Ok(ZcFoldZ {
+                    gpu,
+                    wrap_a,
+                    wrap_b,
+                    a_ptr: gpu.buffer_contents(a_out).cast::<F128>(),
+                    b_ptr: gpu.buffer_contents(b_out).cast::<F128>(),
+                    len: n_rows,
+                })
+            })();
+            gpu.pool_pop(pool);
+            match result {
+                Ok(fold) => {
+                    if std::env::var_os("FLOCK_COMMIT_TIMING").is_some() || debug_enabled() {
+                        eprintln!(
+                            "[commit-timing] zc-fold gpu: {:.2} ms",
+                            t0.elapsed().as_secs_f64() * 1e3
+                        );
+                    }
+                    Some(fold)
+                }
+                Err(e) => {
+                    if debug_enabled() {
+                        eprintln!("[gpu-commit] zc fold failed ({e}); CPU fused path");
+                    }
+                    None
+                }
+            }
+        }
+    }
+
     /// Build the full BLAKE3 Merkle tree (1 KiB leaves) for `data` on the
     /// GPU. Copy-in/copy-out; bit-gate test harness.
     #[cfg_attr(not(test), allow(dead_code))]
@@ -3458,6 +3716,25 @@ mod imp {
 
     pub(crate) fn gpu_commit_latched_on() -> bool {
         false
+    }
+
+    pub(crate) struct ZcFoldZ;
+
+    impl ZcFoldZ {
+        pub(crate) fn a(&self) -> &[F128] {
+            &[]
+        }
+        pub(crate) fn b(&self) -> &[F128] {
+            &[]
+        }
+    }
+
+    pub(crate) fn zc_fold_z_gpu(
+        _a_packed: &[u8],
+        _b_packed: &[u8],
+        _table: &[F128],
+    ) -> Option<ZcFoldZ> {
+        None
     }
 
     pub(crate) fn commit_l0_or_fallback(
