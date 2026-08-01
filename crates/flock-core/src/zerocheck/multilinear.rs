@@ -94,18 +94,6 @@ fn round2_pair_skip(padding: &PaddingSpec, k_skip: usize) -> (usize, usize) {
     (pairs_per_block - 1, useful_pairs)
 }
 
-/// Kill switch for draining the DRAM-bound tail loop rounds (half ≥ 2^21)
-/// through the hetero E-core queue (H2). `FLOCK_NO_ZC_TAIL_HETERO=1` keeps
-/// them on the main rayon pool. Bit-identical either way — chunk ownership
-/// and output ranges are unchanged; only scheduling differs.
-#[cfg(target_arch = "aarch64")]
-fn zc_tail_hetero_enabled() -> bool {
-    use std::sync::LazyLock;
-    static ENABLED: LazyLock<bool> =
-        LazyLock::new(|| std::env::var_os("FLOCK_NO_ZC_TAIL_HETERO").is_none());
-    *ENABLED
-}
-
 // ---------------------------------------------------------------------------
 // Lagrange weights for the univariate-skip fold at z.
 // ---------------------------------------------------------------------------
@@ -584,7 +572,11 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_with_deltas(
     // chunk writes only its own anchors/deltas ranges and partials slot; the
     // XOR reduce below is order-independent, so output is bit-identical to
     // the rayon map-reduce.
-    let mut partials: Vec<(F128, F128)> = vec![(F128::ZERO, F128::ZERO); hi_size];
+    // Uninit alloc — run_hetero_chunks hands out each x_hi exactly once, and
+    // the closure below writes partials[x_hi] unconditionally (no early
+    // return/continue before the write) before the fold-reduce past the
+    // queue join reads it, so the zero-fill was dead work.
+    let mut partials: Vec<(F128, F128)> = crate::alloc_uninit_vec(hi_size);
     let anchors_base = crate::epool::SyncPtr(compact.anchors.as_mut_ptr());
     let deltas_base = crate::epool::SyncPtr(compact.deltas.as_mut_ptr());
     let partials_base = crate::epool::SyncPtr(partials.as_mut_ptr());
@@ -734,7 +726,11 @@ pub fn uni_skip_fold_and_round_pair_compact_padded_stream(
         let delta_chunk_size = 2 * lo_size * n_chunks;
         let (pair_in_block_mask, useful_pairs_inclusive) = round2_pair_skip(padding, k_skip);
 
-        let mut partials: Vec<(F128, F128)> = vec![(F128::ZERO, F128::ZERO); hi_size];
+        // Uninit alloc — same write-before-read argument as the base
+        // (non-stream) variant above: every x_hi is handed out exactly once
+        // and the closure writes partials[x_hi] unconditionally before the
+        // post-join fold-reduce reads it.
+        let mut partials: Vec<(F128, F128)> = crate::alloc_uninit_vec(hi_size);
         let anchors_base = crate::epool::SyncPtr(compact.anchors.as_mut_ptr());
         let deltas_base = crate::epool::SyncPtr(compact.deltas.as_mut_ptr());
         let partials_base = crate::epool::SyncPtr(partials.as_mut_ptr());
@@ -826,7 +822,11 @@ pub fn fold_compact_and_compute_round_pair_stream(
 
         let mut a_out = crate::scratch::take_f128(n);
         let mut b_out = crate::scratch::take_f128(n);
-        let mut partials: Vec<(F128, F128)> = vec![(F128::ZERO, F128::ZERO); hi_size];
+        // Uninit alloc — same write-before-read argument as elsewhere in
+        // this file: run_hetero_chunks hands out each x_hi exactly once and
+        // the closure writes partials[x_hi] unconditionally before the
+        // post-join fold-reduce reads it.
+        let mut partials: Vec<(F128, F128)> = crate::alloc_uninit_vec(hi_size);
         let a_base = crate::epool::SyncPtr(a_out.as_mut_ptr());
         let b_base = crate::epool::SyncPtr(b_out.as_mut_ptr());
         let partials_base = crate::epool::SyncPtr(partials.as_mut_ptr());
@@ -911,7 +911,10 @@ pub fn fold_compact_and_compute_round_pair(
     #[cfg(target_arch = "aarch64")]
     let degen = r2_degen_enabled();
     // Hetero-queue drain, same contract as the compact materialization above.
-    let mut partials: Vec<(F128, F128)> = vec![(F128::ZERO, F128::ZERO); hi_size];
+    // Uninit alloc — run_hetero_chunks hands out each x_hi exactly once and
+    // the closure writes partials[x_hi] unconditionally before the
+    // post-join fold-reduce reads it, so the zero-fill was dead work.
+    let mut partials: Vec<(F128, F128)> = crate::alloc_uninit_vec(hi_size);
     let a_base = crate::epool::SyncPtr(a_out.as_mut_ptr());
     let b_base = crate::epool::SyncPtr(b_out.as_mut_ptr());
     let partials_base = crate::epool::SyncPtr(partials.as_mut_ptr());
@@ -1406,16 +1409,14 @@ pub fn fold_and_compute_round_pair_into(
     let eq_lo = &eq.lo;
     let eq_hi = &eq.hi;
 
-    // Per-chunk fused fold+message: reads one disjoint 4·lo_size input chunk,
-    // writes the corresponding 2·lo_size output chunk, returns the chunk's
-    // unscaled message partials. Shared by the rayon sweep and the hetero
-    // E-core drain (H2).
-    let chunk_partial = |a_in: &[F128],
-                         b_in: &[F128],
-                         a_out: &mut [F128],
-                         b_out: &mut [F128]|
-     -> (F128, F128) {
-        {
+    let (sum1, sum_inf) = a_out
+        .par_chunks_mut(chunk_out)
+        .zip(b_out.par_chunks_mut(chunk_out))
+        .enumerate()
+        .map(|(x_hi, (a_out, b_out))| {
+            let a_in = &a[x_hi * chunk_in..(x_hi + 1) * chunk_in];
+            let b_in = &b[x_hi * chunk_in..(x_hi + 1) * chunk_in];
+
             #[cfg(all(
                 target_arch = "x86_64",
                 target_feature = "avx512f",
@@ -1582,67 +1583,13 @@ pub fn fold_and_compute_round_pair_into(
                 let pinf = pinf_acc.reduce();
                 (p1, pinf)
             };
-            (p1, pinf)
-        }
-    };
-
-    // H2: drain the DRAM-bound rounds (outputs past LLC) through the hetero
-    // E-core queue — the same contract as the T3 compact reconstruction.
-    #[cfg(target_arch = "aarch64")]
-    let hetero = half >= (1usize << 21) && zc_tail_hetero_enabled();
-    #[cfg(not(target_arch = "aarch64"))]
-    let hetero = false;
-
-    let (sum1, sum_inf) = if hetero {
-        let mut partials: Vec<(F128, F128)> = vec![(F128::ZERO, F128::ZERO); hi_size];
-        let a_base = crate::epool::SyncPtr(a_out.as_mut_ptr());
-        let b_base = crate::epool::SyncPtr(b_out.as_mut_ptr());
-        let partials_base = crate::epool::SyncPtr(partials.as_mut_ptr());
-        crate::epool::run_hetero_chunks(hi_size, |x_hi| {
-            // SAFETY: exclusive per-chunk ownership; queue join publishes writes.
-            let (a_out, b_out) = unsafe {
-                (
-                    std::slice::from_raw_parts_mut(a_base.ptr().add(x_hi * chunk_out), chunk_out),
-                    std::slice::from_raw_parts_mut(b_base.ptr().add(x_hi * chunk_out), chunk_out),
-                )
-            };
-            let (p1, pinf) = chunk_partial(
-                &a[x_hi * chunk_in..(x_hi + 1) * chunk_in],
-                &b[x_hi * chunk_in..(x_hi + 1) * chunk_in],
-                a_out,
-                b_out,
-            );
             let eq_h = eq_hi[x_hi];
-            // SAFETY: exclusive owner of partials[x_hi].
-            unsafe {
-                *partials_base.ptr().add(x_hi) = (eq_h * p1, eq_h * pinf);
-            }
-        });
-        partials
-            .iter()
-            .fold((F128::ZERO, F128::ZERO), |(s1, sinf), &(c1, cinf)| {
-                (s1 + c1, sinf + cinf)
-            })
-    } else {
-        a_out
-            .par_chunks_mut(chunk_out)
-            .zip(b_out.par_chunks_mut(chunk_out))
-            .enumerate()
-            .map(|(x_hi, (a_out, b_out))| {
-                let (p1, pinf) = chunk_partial(
-                    &a[x_hi * chunk_in..(x_hi + 1) * chunk_in],
-                    &b[x_hi * chunk_in..(x_hi + 1) * chunk_in],
-                    a_out,
-                    b_out,
-                );
-                let eq_h = eq_hi[x_hi];
-                (eq_h * p1, eq_h * pinf)
-            })
-            .reduce(
-                || (F128::ZERO, F128::ZERO),
-                |(s1, sinf), (c1, cinf)| (s1 + c1, sinf + cinf),
-            )
-    };
+            (eq_h * p1, eq_h * pinf)
+        })
+        .reduce(
+            || (F128::ZERO, F128::ZERO),
+            |(s1, sinf), (c1, cinf)| (s1 + c1, sinf + cinf),
+        );
 
     (r_next[0] * sum1, sum_inf)
 }
