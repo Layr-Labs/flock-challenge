@@ -355,6 +355,7 @@ pub(crate) fn shift_reduce_inner_ab_bstatic(
     chunk_byte_base: usize,
     b_med: usize,
     w: usize,
+    context: StaticBContext,
     out: &mut [u8; 64],
 ) -> bool {
     use crate::field::gf2_8::neon::gf8_reduce_vec16;
@@ -366,7 +367,10 @@ pub(crate) fn shift_reduce_inner_ab_bstatic(
     if !BSTATIC_ARM_LIVE[blk] {
         return false;
     }
-    let partials = bstatic_partials(inv_table);
+    let partials = match context {
+        StaticBContext::Prepared { partials } => partials,
+        StaticBContext::LegacyPerCall => bstatic_partials(inv_table),
+    };
     let byte_base_b = chunk_byte_base + b_med * N_CHUNKS * 8;
     let table_base = inv_table.data_ptr();
     let half_swapped_table_base = inv_table.half_swapped_data_ptr();

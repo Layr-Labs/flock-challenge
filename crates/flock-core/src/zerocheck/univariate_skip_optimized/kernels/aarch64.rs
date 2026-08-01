@@ -1439,12 +1439,64 @@ unsafe fn fused_apply_one_k_with_b<const K: i32>(
     }
 }
 
+/// Pre-resolved state shared by every static-B kernel call in one AB
+/// precompute. The reference is process-stable because the partials live in a
+/// `OnceLock`; carrying it here removes the lock's hot-path acquire from each
+/// `(window, b_med)` call.
+#[derive(Clone, Copy)]
+pub(crate) enum StaticBContext {
+    Prepared {
+        partials: &'static [[u8; 64]; 248],
+    },
+    /// Exact same-binary control: retain both historical per-call OnceLock
+    /// queries while leaving the generated static-B kernel enabled.
+    LegacyPerCall,
+}
+
 include!("aarch64_bstatic_gen.rs");
 
 fn bstatic_legacy_enabled() -> bool {
     use std::sync::OnceLock;
     static FLAG: OnceLock<bool> = OnceLock::new();
     *FLAG.get_or_init(|| std::env::var_os("FLOCK_ZC_BSTATIC_LEGACY").is_some())
+}
+
+#[inline]
+pub(crate) fn prepare_static_b_context(
+    inv_table: &InvNttTableByteSingleGf8,
+    blake3_static_layout: bool,
+) -> Option<StaticBContext> {
+    if std::env::var_os("FLOCK_ZC_BSTATIC_CONTEXT_LEGACY").is_some() {
+        return blake3_static_layout.then_some(StaticBContext::LegacyPerCall);
+    }
+    prepare_static_b_context_with_policy(
+        inv_table,
+        blake3_static_layout,
+        bstatic_legacy_enabled(),
+        false,
+    )
+}
+
+/// Policy-injected form used by the gate/oracle tests without mutating the
+/// process environment or the cached legacy switch.
+#[inline]
+pub(crate) fn prepare_static_b_context_with_policy(
+    inv_table: &InvNttTableByteSingleGf8,
+    blake3_static_layout: bool,
+    legacy_enabled: bool,
+    context_legacy: bool,
+) -> Option<StaticBContext> {
+    if !blake3_static_layout {
+        None
+    } else if context_legacy {
+        Some(StaticBContext::LegacyPerCall)
+    } else if legacy_enabled {
+        None
+    } else {
+        Some(StaticBContext::Prepared {
+            partials: bstatic_partials(inv_table),
+        })
+    }
 }
 
 /// Checked static-structure dispatcher. Sniffs the 8 b-words (8 scalar loads
@@ -1467,6 +1519,7 @@ pub(crate) fn shift_reduce_inner_ab_fused_neon_checked(
     check_single_k0: bool,
     const_one_mask: u8,
     bstatic_w: usize,
+    static_b_context: Option<StaticBContext>,
 ) {
     let byte_base_b = chunk_byte_base + b_med * N_CHUNKS * 8;
     let bw = |k: usize| -> u64 {
@@ -1514,18 +1567,24 @@ pub(crate) fn shift_reduce_inner_ab_fused_neon_checked(
         _ => unreachable!("unsupported static-one mask"),
     }
     if bstatic_w <= 1
-        && !bstatic_legacy_enabled()
-        && shift_reduce_inner_ab_bstatic(
-            a_packed,
-            b_packed,
-            inv_table,
-            chunk_byte_base,
-            b_med,
-            bstatic_w,
-            out,
-        )
+        && let Some(context) = static_b_context
     {
-        return;
+        let enabled =
+            !matches!(context, StaticBContext::LegacyPerCall) || !bstatic_legacy_enabled();
+        if enabled
+            && shift_reduce_inner_ab_bstatic(
+                a_packed,
+                b_packed,
+                inv_table,
+                chunk_byte_base,
+                b_med,
+                bstatic_w,
+                context,
+                out,
+            )
+        {
+            return;
+        }
     }
     shift_reduce_inner_ab_fused_neon(a_packed, b_packed, inv_table, chunk_byte_base, b_med, out);
 }
