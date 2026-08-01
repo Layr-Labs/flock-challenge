@@ -1978,11 +1978,21 @@ pub(crate) fn induce_sumcheck_poly(
             let start = t * chunk_size;
             let end = (start + chunk_size).min(n_queries);
             if start >= end {
-                return (vec![F128::ZERO; n], F128::ZERO);
+                // Empty marker: contributes nothing, skipped in the reduce
+                // (previously a length-n zeroed vec that was allocated,
+                // filled, and XOR-added for no effect).
+                return (Vec::new(), F128::ZERO);
             }
-            let mut accum_basis = vec![F128::ZERO; n];
-            // Per-thread scratch reused across this chunk's queries.
-            let mut local_basis = vec![F128::ZERO; n];
+            // Both per-thread buffers are uninit-sound: `local_basis` is
+            // fully written by `evaluate_scaled_basis_inplace` before any
+            // read (`basis[0] = alpha`, then each doubling level writes
+            // `[2^k, 2^{k+1})` from the already-written lower half), and
+            // `accum_basis` is seeded by a full `copy_from_slice` of the
+            // chunk's FIRST query before any accumulation — algebraically
+            // identical to zero-init + XOR-add (x ⊕ 0 = x), deleting one
+            // length-n memset and one full-buffer RMW pass per worker.
+            let mut accum_basis = crate::alloc_uninit_f128_vec(n);
+            let mut local_basis = crate::alloc_uninit_f128_vec(n);
             let mut sks_at_x = vec![F128::ZERO; log_msg_cols.max(1)];
             let mut local_sum = F128::ZERO;
 
@@ -1999,6 +2009,17 @@ pub(crate) fn induce_sumcheck_poly(
                 local_sum += dot * ap;
 
                 let q_field = F128::new(q as u64, 0);
+                if i == start {
+                    evaluate_scaled_basis_inplace(
+                        &mut sks_at_x,
+                        &mut accum_basis,
+                        sks_vks,
+                        &inv_sks_vks,
+                        q_field,
+                        ap,
+                    );
+                    continue;
+                }
                 evaluate_scaled_basis_inplace(
                     &mut sks_at_x,
                     &mut local_basis,
@@ -2015,10 +2036,14 @@ pub(crate) fn induce_sumcheck_poly(
         })
         .collect();
 
-    // Reduce across threads.
-    let mut basis_poly = vec![F128::ZERO; n];
-    let mut enforced_sum = F128::ZERO;
-    for (lb, ls) in partials {
+    // Reduce across threads: seed with the first non-empty partial (a move —
+    // deletes the zero-seeded output buffer and one full XOR pass), then
+    // fold the rest.
+    let mut partials_iter = partials.into_iter().filter(|(lb, _)| !lb.is_empty());
+    let Some((mut basis_poly, mut enforced_sum)) = partials_iter.next() else {
+        return (vec![F128::ZERO; n], F128::ZERO);
+    };
+    for (lb, ls) in partials_iter {
         for (acc, &v) in basis_poly.iter_mut().zip(lb.iter()) {
             *acc += v;
         }
