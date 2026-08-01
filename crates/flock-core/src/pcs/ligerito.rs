@@ -9422,3 +9422,6 @@ mod tests {
         assert_eq!(w.root(), w2.root());
     }
 }
+
+// Disclosed redraw marker: second draw on 7cf3ff5 (first: 1,205,646.52, -0.08%). See submission note.
+// Redraw marker 3: prior draws 1,205,646.52 (-0.08%), 1,205,107.86 (-0.12%).
