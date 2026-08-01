@@ -1329,6 +1329,62 @@ pub fn fold_in_place_pair(a: &mut Vec<F128>, b: &mut Vec<F128>, challenge: F128)
     b.truncate(half);
 }
 
+/// Serial tail fast path: bind one variable in place while accumulating the
+/// following round's message from the just-folded values.  Each iteration
+/// reads four input entries before writing the two lower output entries, so
+/// the compacting writes never clobber unread input.  This removes the full
+/// post-fold A/B reread performed by `fold_in_place_pair` followed by
+/// `round_pair_naive`.
+pub fn fold_and_compute_round_pair_in_place(
+    a: &mut Vec<F128>,
+    b: &mut Vec<F128>,
+    r_fold: F128,
+    r_next: &[F128],
+) -> (F128, F128) {
+    let n = a.len();
+    assert_eq!(b.len(), n);
+    assert!(n.is_power_of_two() && n >= 4);
+    let half = n / 2;
+    let log_n = n.trailing_zeros() as usize;
+    assert_eq!(r_next.len(), log_n - 1);
+
+    let eq_remaining = build_eq(&r_next[1..]);
+    assert_eq!(eq_remaining.len(), half / 2);
+    let mut g_one = F256Unreduced::ZERO;
+    let mut g_inf = F256Unreduced::ZERO;
+
+    for (x_prime, &eq_x) in eq_remaining.iter().enumerate() {
+        let i = 4 * x_prime;
+        let o = 2 * x_prime;
+
+        let a0_even = a[i];
+        let a0_odd = a[i + 1];
+        let a1_even = a[i + 2];
+        let a1_odd = a[i + 3];
+        let b0_even = b[i];
+        let b0_odd = b[i + 1];
+        let b1_even = b[i + 2];
+        let b1_odd = b[i + 3];
+
+        let a0 = a0_even + r_fold * (a0_even + a0_odd);
+        let a1 = a1_even + r_fold * (a1_even + a1_odd);
+        let b0 = b0_even + r_fold * (b0_even + b0_odd);
+        let b1 = b1_even + r_fold * (b1_even + b1_odd);
+
+        a[o] = a0;
+        a[o + 1] = a1;
+        b[o] = b0;
+        b[o + 1] = b1;
+
+        g_one ^= eq_x.mul_unreduced(a1 * b1);
+        g_inf ^= eq_x.mul_unreduced((a0 + a1) * (b0 + b1));
+    }
+
+    a.truncate(half);
+    b.truncate(half);
+    (r_next[0] * g_one.reduce(), g_inf.reduce())
+}
+
 /// Fused: bind one variable at `r_fold` AND compute the *next* round's prover
 /// message. Returns the new (folded) `a, b` vectors (half the input size) and
 /// `(r_next[0] · G(1), G(∞))` for the next round.
@@ -1991,6 +2047,36 @@ mod tests {
                 assert_eq!(a[x], a0 + challenge * (a1 + a0), "log_n={log_n}, x={x}");
                 assert_eq!(b[x], b0 + challenge * (b1 + b0), "log_n={log_n}, x={x}");
             }
+        }
+    }
+
+    #[test]
+    fn fused_serial_in_place_matches_fold_then_round() {
+        let mut rng = Rng::new(301);
+        for log_n in 2usize..=12 {
+            let n = 1usize << log_n;
+            let a_orig: Vec<F128> = (0..n).map(|_| rng.f128()).collect();
+            let b_orig: Vec<F128> = (0..n).map(|_| rng.f128()).collect();
+            let r_fold = rng.f128();
+            let r_next: Vec<F128> = (0..log_n - 1).map(|_| rng.f128()).collect();
+
+            let mut expected_a = a_orig.clone();
+            let mut expected_b = b_orig.clone();
+            fold_in_place_pair(&mut expected_a, &mut expected_b, r_fold);
+            let expected_msg = round_pair_naive(&expected_a, &expected_b, &r_next);
+
+            let mut actual_a = a_orig;
+            let mut actual_b = b_orig;
+            let actual_msg = fold_and_compute_round_pair_in_place(
+                &mut actual_a,
+                &mut actual_b,
+                r_fold,
+                &r_next,
+            );
+
+            assert_eq!(actual_a, expected_a, "A mismatch at log_n={log_n}");
+            assert_eq!(actual_b, expected_b, "B mismatch at log_n={log_n}");
+            assert_eq!(actual_msg, expected_msg, "message mismatch at log_n={log_n}");
         }
     }
 

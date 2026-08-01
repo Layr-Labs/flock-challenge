@@ -27,9 +27,9 @@ pub mod univariate_skip_deg4_optimized;
 pub mod univariate_skip_optimized;
 
 use multilinear::{
-    UniSkipFoldTable, fold_and_compute_round_pair_into, fold_compact_and_compute_round_pair,
-    fold_in_place_pair, interpolate_at_z_combined, interpolate_at_z_on_lambda, round_pair_naive,
-    uni_skip_fold_and_round_pair_compact_padded_with_deltas,
+    UniSkipFoldTable, fold_and_compute_round_pair_in_place, fold_and_compute_round_pair_into,
+    fold_compact_and_compute_round_pair, fold_in_place_pair, interpolate_at_z_combined,
+    interpolate_at_z_on_lambda, uni_skip_fold_and_round_pair_compact_padded_with_deltas,
 };
 use univariate_skip_optimized::{
     c_s_f128, medium_challenges_ghash, round1_shift_reduce_extract_c_packed_padded,
@@ -469,8 +469,8 @@ fn prove_packed_padded_inner<C: Challenger>(
     // ρ_{i+2}. Use the fused parallel path while log_n ≥ 15; below that the
     // 12..14 are structurally valid but open a fixed 128-chunk Rayon region
     // over too little work; below 12, SplitEqGhash cannot form lo_size ≥ 2
-    // under MAX_N_HI = 9 at all. Fall back to fold_in_place_pair +
-    // round_pair_naive for this serial tail.
+    // under MAX_N_HI = 9 at all. Fall back to the fused in-place serial
+    // fold-and-message path for this tail.
     //
     // The first challenge is applied directly to round two's compact
     // anchor+packed-delta representation.  Composing rho into the 32 KiB byte
@@ -537,8 +537,7 @@ fn prove_packed_padded_inner<C: Challenger>(
             b_mlv.truncate(half);
             (m1, mi)
         } else {
-            fold_in_place_pair(&mut a_mlv, &mut b_mlv, rho_prev);
-            round_pair_naive(&a_mlv, &b_mlv, &r_next)
+            fold_and_compute_round_pair_in_place(&mut a_mlv, &mut b_mlv, rho_prev, &r_next)
         };
 
         multilinear_msgs.push((m1, mi));
