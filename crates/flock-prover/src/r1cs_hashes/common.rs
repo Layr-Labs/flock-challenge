@@ -360,6 +360,86 @@ where
     (z, a, b, stripe)
 }
 
+/// Kill switch for the hetero (E-core) drain of the witness-generation
+/// groups: `FLOCK_NO_WITGEN_HETERO=1` restores the incumbent main-pool rayon
+/// pass. Bit-identical output either way — the drain only changes *which*
+/// core processes a group, never what the group writes.
+fn witgen_hetero_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_WITGEN_HETERO").is_none());
+    *ON
+}
+
+/// Engagement tracer: `FLOCK_WITGEN_HETERO_TRACE=1` prints the helper-pool
+/// chunk-claim delta around each witness drain (epool::helper_chunks_claimed
+/// pattern — engagement evidence for hetero claims).
+pub(crate) fn witgen_hetero_trace() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_WITGEN_HETERO_TRACE").is_some());
+    *ON
+}
+
+/// Oracle/debug arm: `FLOCK_WITGEN_HETERO_MAIN_ONLY=1` drains the groups
+/// through the shared atomic queue but WITHOUT the efficiency-core pool —
+/// isolates queue-vs-slab scheduling from the E-core addition.
+fn witgen_hetero_main_only() -> bool {
+    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        std::env::var_os("FLOCK_WITGEN_HETERO_MAIN_ONLY").is_some()
+    });
+    *ON
+}
+
+/// Slab size for the hetero drain: one claim covers WITGEN_HETERO_SLAB
+/// consecutive groups, preserving the incumbent's long ascending store runs
+/// per worker while still letting the efficiency cores pull slabs. 64 groups
+/// = 4 MiB of z per slab at K_LOG=14; 32,768 groups → 512 slabs ≫
+/// EPOOL_MIN_CHUNKS. (Measured on b844d53: single-group claims interleave 14
+/// writers' store streams and cost +2.5 ms of pure scheduling damage;
+/// 64-group slabs recover it and the E-cores convert −1.3 ms.)
+const WITGEN_HETERO_SLAB: usize = 64;
+
+/// Oracle arm: `FLOCK_WITGEN_HETERO_SINGLE=1` drains single groups per claim
+/// (the naive `run_hetero_chunks` shape) instead of 64-group slabs.
+fn witgen_hetero_single() -> bool {
+    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        std::env::var_os("FLOCK_WITGEN_HETERO_SINGLE").is_some()
+    });
+    *ON
+}
+
+/// W-H1 scheduling shim: drain `n_jobs` group jobs either on the incumbent
+/// main-pool sweep (`with_max_len(256)`) or through the hetero E-core queue
+/// in 64-group slabs. Group `g` owns disjoint ranges in every witness
+/// buffer, so the output is byte-identical regardless of which pool claims
+/// a group; the drain's completion join publishes every write.
+pub(crate) fn drain_group_jobs<F>(n_jobs: usize, f: &F)
+where
+    F: Fn(usize) + Sync,
+{
+    use rayon::prelude::*;
+    if !witgen_hetero_enabled() {
+        (0..n_jobs)
+            .into_par_iter()
+            .with_max_len(256)
+            .for_each(f);
+        return;
+    }
+    if witgen_hetero_main_only() {
+        flock_core::epool::run_chunks_with_helper(n_jobs, f, None);
+    } else if witgen_hetero_single() {
+        flock_core::epool::run_hetero_chunks(n_jobs, f);
+    } else {
+        let n_slabs = n_jobs.div_ceil(WITGEN_HETERO_SLAB);
+        flock_core::epool::run_hetero_chunks(n_slabs, &|s: usize| {
+            let lo = s * WITGEN_HETERO_SLAB;
+            let hi = (lo + WITGEN_HETERO_SLAB).min(n_jobs);
+            for g in lo..hi {
+                f(g);
+            }
+        });
+    }
+}
+
 fn drive_witness_packed_and_lincheck_impl<
     const PER_BLOCK_FULLY_WRITES: bool,
     const EMIT_RATE2_CODEWORD: bool,
@@ -384,8 +464,6 @@ fn drive_witness_packed_and_lincheck_impl<
 where
     F: Fn(&S, &mut [u64], &mut [u64], &mut [u64]) + Sync,
 {
-    use rayon::prelude::*;
-
     let k = 1usize << k_log;
     let f128_per_block = k / 128;
     let u64_per_block = k / 64;
@@ -607,6 +685,10 @@ where
         };
 
     let n_groups = n_total / 8;
+    // W-H1 engagement evidence: E-core slab claims across the whole witness
+    // drain (both streamed bands and the plain sweep route through the same
+    // shim, so one delta covers whichever arm runs).
+    let claimed_before = witgen_hetero_trace().then(flock_core::epool::helper_chunks_claimed);
     if let Some(stream) = &mut stream {
         const SEGMENTS: usize = 8;
         const BANDS: usize = 8;
@@ -617,29 +699,35 @@ where
         debug_assert_eq!(groups_per_segment, 4096);
         debug_assert_eq!(groups_per_band, 512);
         for band in 0..BANDS {
-            (0..SEGMENTS * groups_per_band)
-                .into_par_iter()
-                .with_max_len(256)
-                .for_each(|job| {
-                    let g = ranked_stream_group_index(
-                        job,
-                        band,
-                        groups_per_segment,
-                        groups_per_band,
-                    );
-                    process_group(g);
-                });
-            // The Rayon join above publishes every CPU write in this band;
-            // command-buffer submission then makes those shared-memory pages
-            // visible to Metal before it starts the range.
+            // W-H1: the band's jobs drain through the same slab shim. A slab
+            // never straddles a segment (512 % 64 == 0), so consecutive jobs
+            // stay consecutive groups and the long ascending store runs are
+            // preserved. The queue join below still bounds the band before
+            // submission, exactly like the incumbent Rayon join.
+            let band_job = |job: usize| {
+                let g = ranked_stream_group_index(
+                    job,
+                    band,
+                    groups_per_segment,
+                    groups_per_band,
+                );
+                process_group(g);
+            };
+            drain_group_jobs(SEGMENTS * groups_per_band, &band_job);
+            // The queue/Rayon join above publishes every CPU write in this
+            // band; command-buffer submission then makes those shared-memory
+            // pages visible to Metal before it starts the range.
             std::sync::atomic::fence(std::sync::atomic::Ordering::Release);
             stream.submit_ready_range(band * r_per_band, r_per_band);
         }
     } else {
-        (0..n_groups)
-            .into_par_iter()
-            .with_max_len(256)
-            .for_each(process_group);
+        drain_group_jobs(n_groups, &process_group);
+    }
+    if let Some(before) = claimed_before {
+        eprintln!(
+            "[witgen-hetero] groups={n_groups} helper-claims={}",
+            flock_core::epool::helper_chunks_claimed() - before
+        );
     }
 
     (z, a, b, z_lincheck, stream)

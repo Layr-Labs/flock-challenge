@@ -128,7 +128,17 @@ const EPOOL_MIN_CHUNKS: usize = 16;
 /// depend on which thread or pool runs it. Chunk-claim order is
 /// nondeterministic; callers get deterministic *output* by making `f(i)`
 /// write only to chunk `i`'s disjoint range.
-pub(crate) fn run_hetero_chunks<F>(n_chunks: usize, f: F)
+/// Chunks claimed by the efficiency-core helper pool across all hetero
+/// drains (diagnostic only; relaxed ordering). Read deltas around a window
+/// to prove E-core engagement for that window.
+static EPOOL_HELPER_CHUNKS: AtomicUsize = AtomicUsize::new(0);
+
+/// Total chunks claimed by the helper pool so far (monotonic).
+pub fn helper_chunks_claimed() -> usize {
+    EPOOL_HELPER_CHUNKS.load(Ordering::Relaxed)
+}
+
+pub fn run_hetero_chunks<F>(n_chunks: usize, f: F)
 where
     F: Fn(usize) + Sync,
 {
@@ -154,7 +164,7 @@ where
 
 /// [`run_hetero_chunks`] with an explicit helper pool, so tests can exercise
 /// the two-pool queue on hosts without efficiency cores.
-pub(crate) fn run_chunks_with_helper<F>(n_chunks: usize, f: &F, helper: Option<&rayon::ThreadPool>)
+pub fn run_chunks_with_helper<F>(n_chunks: usize, f: &F, helper: Option<&rayon::ThreadPool>)
 where
     F: Fn(usize) + Sync,
 {
@@ -194,7 +204,16 @@ where
             // The scoped thread parks inside `broadcast` while the E-workers
             // drain; it costs no main-pool worker. The scope join bounds the
             // tail wait at one chunk on one efficiency core.
-            s.spawn(|| ep.broadcast(|_| worker()));
+            s.spawn(|| {
+                ep.broadcast(|_| loop {
+                    let i = next.fetch_add(1, Ordering::Relaxed);
+                    if i >= n_chunks {
+                        break;
+                    }
+                    EPOOL_HELPER_CHUNKS.fetch_add(1, Ordering::Relaxed);
+                    f(i);
+                })
+            });
             drain_main();
         }),
         None => drain_main(),
@@ -242,7 +261,19 @@ pub(crate) fn run_chunks_with_helper_stateful<S, I, F>(
     };
     match helper.filter(|_| n_chunks >= EPOOL_MIN_CHUNKS) {
         Some(ep) => std::thread::scope(|s| {
-            s.spawn(|| ep.broadcast(|_| worker()));
+            s.spawn(|| {
+                ep.broadcast(|_| {
+                    let mut state = init();
+                    loop {
+                        let i = next.fetch_add(1, Ordering::Relaxed);
+                        if i >= n_chunks {
+                            break;
+                        }
+                        EPOOL_HELPER_CHUNKS.fetch_add(1, Ordering::Relaxed);
+                        f(&mut state, i);
+                    }
+                })
+            });
             drain_main();
         }),
         None => drain_main(),
@@ -258,14 +289,14 @@ pub(crate) fn run_chunks_with_helper_stateful<S, I, F>(
 /// queue handing out each index exactly once establishes ownership; individual
 /// call sites establish any required happens-before edge.
 #[derive(Clone, Copy)]
-pub(crate) struct SyncPtr<T>(pub(crate) *mut T);
+pub struct SyncPtr<T>(pub *mut T);
 
 impl<T> SyncPtr<T> {
     /// The wrapped base pointer. A method call uses the whole receiver, so
     /// closures capture the `Sync` wrapper rather than (via edition-2021+
     /// precise capture) the bare non-`Sync` pointer field.
     #[inline]
-    pub(crate) fn ptr(self) -> *mut T {
+    pub fn ptr(self) -> *mut T {
         self.0
     }
 }
