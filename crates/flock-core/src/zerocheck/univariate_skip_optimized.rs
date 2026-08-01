@@ -3986,6 +3986,53 @@ mod tests {
         }
     }
 
+    /// The ranked Fold4 producer uses the AB-only gather, so pin it directly
+    /// against the independent scalar fold for every live medium-row count.
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn neon_accumulate_convert_ab_matches_scalar_oracle() {
+        let convert = convert_table();
+        let mut rng = Rng::new(0xABAD_1DEA);
+
+        for n_b_med in 0..=(1 << N_MEDIUM) {
+            let mut chunk_ab = [[0u8; 64]; 1 << N_MEDIUM];
+            for row in &mut chunk_ab {
+                for byte in row {
+                    *byte = (rng.next_u64() & 0xff) as u8;
+                }
+            }
+            let chunk_c = [[0u8; 64]; 1 << N_MEDIUM];
+            let eq_lo_val = rng.f128();
+            let seed_ab: [F128; ELL] = core::array::from_fn(|_| rng.f128());
+
+            let mut got_ab = seed_ab;
+            // SAFETY: the fixed arrays and full convert table satisfy every
+            // bound required by the AArch64 gather kernel.
+            unsafe {
+                kernels::aarch64::accumulate_convert_ab(
+                    &chunk_ab,
+                    n_b_med,
+                    convert,
+                    eq_lo_val,
+                    &mut got_ab,
+                );
+            }
+
+            let mut want_ab = seed_ab;
+            let mut ignored_c = [F128::ZERO; ELL];
+            accumulate_convert_oracle(
+                &chunk_ab,
+                &chunk_c,
+                n_b_med,
+                convert,
+                eq_lo_val,
+                &mut want_ab,
+                &mut ignored_c,
+            );
+            assert_eq!(got_ab, want_ab, "partial_ab mismatch at n_b_med={n_b_med}");
+        }
+    }
+
     /// **The fused-transpose gate.** The kernel now reads the packed witness
     /// directly and does one cross-`b_med` transpose; the reference still goes
     /// the long way round — sixteen per-`b_med` [`bit_transpose_64bytes`] calls

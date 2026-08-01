@@ -160,7 +160,9 @@ pub(crate) unsafe fn accumulate_convert_ab(
     // bounded by the debug-asserted table length: `b_med < 16` selects one of
     // 16 convert blocks.
     unsafe {
-        let convert_ptr = convert.as_ptr() as *const u8;
+        // Keep the table in F128 units through the lookup so LLVM can fold
+        // the 16-byte element scale into AArch64's register-offset load.
+        let convert_ptr = convert.as_ptr();
         let n_pairs = n_b_med / 2;
         for lane in (0..64).step_by(4) {
             // 4 live accumulator q-registers (4 lanes × 1 bank); the paired
@@ -172,8 +174,8 @@ pub(crate) unsafe fn accumulate_convert_ab(
 
             for p in 0..n_pairs {
                 let (b_even, b_odd) = (2 * p, 2 * p + 1);
-                let t_even = convert_ptr.add(b_even * 256 * 16);
-                let t_odd = convert_ptr.add(b_odd * 256 * 16);
+                let t_even = convert_ptr.add(b_even * 256);
+                let t_odd = convert_ptr.add(b_odd * 256);
 
                 // One u32 load per b_med covers the 4 adjacent lanes; each
                 // extracted byte addresses the same table row as the original
@@ -184,36 +186,36 @@ pub(crate) unsafe fn accumulate_convert_ab(
                     as usize;
                 ab0 = xor3_u8(
                     ab0,
-                    vld1q_u8(t_even.add((we & 0xff) * 16)),
-                    vld1q_u8(t_odd.add((wo & 0xff) * 16)),
+                    vld1q_u8(t_even.add(we & 0xff).cast::<u8>()),
+                    vld1q_u8(t_odd.add(wo & 0xff).cast::<u8>()),
                 );
                 ab1 = xor3_u8(
                     ab1,
-                    vld1q_u8(t_even.add(((we >> 8) & 0xff) * 16)),
-                    vld1q_u8(t_odd.add(((wo >> 8) & 0xff) * 16)),
+                    vld1q_u8(t_even.add((we >> 8) & 0xff).cast::<u8>()),
+                    vld1q_u8(t_odd.add((wo >> 8) & 0xff).cast::<u8>()),
                 );
                 ab2 = xor3_u8(
                     ab2,
-                    vld1q_u8(t_even.add(((we >> 16) & 0xff) * 16)),
-                    vld1q_u8(t_odd.add(((wo >> 16) & 0xff) * 16)),
+                    vld1q_u8(t_even.add((we >> 16) & 0xff).cast::<u8>()),
+                    vld1q_u8(t_odd.add((wo >> 16) & 0xff).cast::<u8>()),
                 );
                 ab3 = xor3_u8(
                     ab3,
-                    vld1q_u8(t_even.add((we >> 24) * 16)),
-                    vld1q_u8(t_odd.add((wo >> 24) * 16)),
+                    vld1q_u8(t_even.add(we >> 24).cast::<u8>()),
+                    vld1q_u8(t_odd.add(wo >> 24).cast::<u8>()),
                 );
             }
 
             // Odd trailing b_med: unpaired fallback.
             if n_b_med & 1 == 1 {
                 let b_med = n_b_med - 1;
-                let table = convert_ptr.add(b_med * 256 * 16);
+                let table = convert_ptr.add(b_med * 256);
                 let wa = (chunk_ab_bytes[b_med].as_ptr().add(lane) as *const u32).read_unaligned()
                     as usize;
-                ab0 = veorq_u8(ab0, vld1q_u8(table.add((wa & 0xff) * 16)));
-                ab1 = veorq_u8(ab1, vld1q_u8(table.add(((wa >> 8) & 0xff) * 16)));
-                ab2 = veorq_u8(ab2, vld1q_u8(table.add(((wa >> 16) & 0xff) * 16)));
-                ab3 = veorq_u8(ab3, vld1q_u8(table.add((wa >> 24) * 16)));
+                ab0 = veorq_u8(ab0, vld1q_u8(table.add(wa & 0xff).cast::<u8>()));
+                ab1 = veorq_u8(ab1, vld1q_u8(table.add((wa >> 8) & 0xff).cast::<u8>()));
+                ab2 = veorq_u8(ab2, vld1q_u8(table.add((wa >> 16) & 0xff).cast::<u8>()));
+                ab3 = veorq_u8(ab3, vld1q_u8(table.add(wa >> 24).cast::<u8>()));
             }
 
             macro_rules! drain_lane {
@@ -848,8 +850,8 @@ pub(crate) unsafe fn accumulate_c_fold4_four_banks(
         let m33 = vdupq_n_u8(0x33);
         let m55 = vdupq_n_u8(0x55);
         let zero = vdupq_n_u8(0);
-        let table01 = pair_mask_tables[0].as_ptr() as *const u8;
-        let table23 = pair_mask_tables[1].as_ptr() as *const u8;
+        let table01 = pair_mask_tables[0].as_ptr();
+        let table23 = pair_mask_tables[1].as_ptr();
 
         for q in 0..4 {
             for side in 0..4 {
@@ -916,36 +918,36 @@ pub(crate) unsafe fn accumulate_c_fold4_four_banks(
                     // Combine the two independent pair-table loads first, so
                     // only eight values remain live across accumulator loads.
                     let t0 = veorq_u8(
-                        vld1q_u8(table01.add(i010 * 16)),
-                        vld1q_u8(table23.add(i230 * 16)),
+                        vld1q_u8(table01.add(i010).cast::<u8>()),
+                        vld1q_u8(table23.add(i230).cast::<u8>()),
                     );
                     let t1 = veorq_u8(
-                        vld1q_u8(table01.add(i011 * 16)),
-                        vld1q_u8(table23.add(i231 * 16)),
+                        vld1q_u8(table01.add(i011).cast::<u8>()),
+                        vld1q_u8(table23.add(i231).cast::<u8>()),
                     );
                     let t2 = veorq_u8(
-                        vld1q_u8(table01.add(i012 * 16)),
-                        vld1q_u8(table23.add(i232 * 16)),
+                        vld1q_u8(table01.add(i012).cast::<u8>()),
+                        vld1q_u8(table23.add(i232).cast::<u8>()),
                     );
                     let t3 = veorq_u8(
-                        vld1q_u8(table01.add(i013 * 16)),
-                        vld1q_u8(table23.add(i233 * 16)),
+                        vld1q_u8(table01.add(i013).cast::<u8>()),
+                        vld1q_u8(table23.add(i233).cast::<u8>()),
                     );
                     let t4 = veorq_u8(
-                        vld1q_u8(table01.add(i014 * 16)),
-                        vld1q_u8(table23.add(i234 * 16)),
+                        vld1q_u8(table01.add(i014).cast::<u8>()),
+                        vld1q_u8(table23.add(i234).cast::<u8>()),
                     );
                     let t5 = veorq_u8(
-                        vld1q_u8(table01.add(i015 * 16)),
-                        vld1q_u8(table23.add(i235 * 16)),
+                        vld1q_u8(table01.add(i015).cast::<u8>()),
+                        vld1q_u8(table23.add(i235).cast::<u8>()),
                     );
                     let t6 = veorq_u8(
-                        vld1q_u8(table01.add(i016 * 16)),
-                        vld1q_u8(table23.add(i236 * 16)),
+                        vld1q_u8(table01.add(i016).cast::<u8>()),
+                        vld1q_u8(table23.add(i236).cast::<u8>()),
                     );
                     let t7 = veorq_u8(
-                        vld1q_u8(table01.add(i017 * 16)),
-                        vld1q_u8(table23.add(i237 * 16)),
+                        vld1q_u8(table01.add(i017).cast::<u8>()),
+                        vld1q_u8(table23.add(i237).cast::<u8>()),
                     );
 
                     let p0 = bank.add(lane * 16);

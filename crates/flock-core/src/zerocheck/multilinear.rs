@@ -632,7 +632,7 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_with_deltas(
             #[cfg(target_arch = "aarch64")]
             let (p1, pinf) = unsafe {
                 fold_round2_compact_chunk_neon_unchecked_8(
-                    table.data.as_ptr().cast::<u8>(),
+                    table.data.as_ptr(),
                     a_packed.as_ptr().add(row_base * n_chunks),
                     b_packed.as_ptr().add(row_base * n_chunks),
                     anchors.as_mut_ptr(),
@@ -772,7 +772,7 @@ pub fn uni_skip_fold_and_round_pair_compact_padded_stream(
             let (p1, pinf) = unsafe {
                 let a_ptr = a_packed.as_ptr().add(row_base * n_chunks);
                 let b_ptr = b_packed.as_ptr().add(row_base * n_chunks);
-                let t_ptr = table.data.as_ptr().cast::<u8>();
+                let t_ptr = table.data.as_ptr();
                 match lanes_per_pass {
                     1 => fold_round2_compact_stream_chunk_neon::<1>(
                         t_ptr, a_ptr, b_ptr, anchors, deltas, eq_lo.as_ptr(), lo_size,
@@ -861,7 +861,7 @@ pub fn fold_compact_and_compute_round_pair_stream(
             };
             let base = x_hi * chunk_size;
             let (p1, pinf) = unsafe {
-                let t_ptr = scaled_table.as_ptr().cast::<u8>();
+                let t_ptr = scaled_table.as_ptr();
                 let anchors = compact.anchors.as_ptr().add(2 * base);
                 let deltas = compact.deltas.as_ptr().add(2 * base * table.n_chunks);
                 match lanes_per_pass {
@@ -949,7 +949,7 @@ pub fn fold_compact_and_compute_round_pair(
             #[cfg(target_arch = "aarch64")]
             let (p1, pinf) = unsafe {
                 fold_compact_chunk_neon_unchecked_8(
-                    scaled_table.as_ptr().cast::<u8>(),
+                    scaled_table.as_ptr(),
                     compact.anchors.as_ptr().add(2 * base),
                     compact.deltas.as_ptr().add(2 * base * table.n_chunks),
                     a_out.as_mut_ptr(),
@@ -1102,7 +1102,7 @@ pub fn uni_skip_fold_and_round_pair_optimized_packed_padded(
 
             #[cfg(target_arch = "aarch64")]
             unsafe {
-                let table_ptr = table.data.as_ptr() as *const u8;
+                let table_ptr = table.data.as_ptr();
                 let a_pkt_ptr = a_packed.as_ptr();
                 let b_pkt_ptr = b_packed.as_ptr();
                 let base = x_hi * chunk_size;
@@ -1971,7 +1971,7 @@ mod tests {
             let scalar = table.fold_one_row(&bytes);
             // SAFETY: on aarch64; bytes has 8 entries; table has 8 chunks.
             let neon = unsafe {
-                fold_one_row_neon_unchecked_8(table.data.as_ptr() as *const u8, bytes.as_ptr())
+                fold_one_row_neon_unchecked_8(table.data.as_ptr(), bytes.as_ptr())
             };
             assert_eq!(scalar, neon, "fold mismatch bytes={bytes:02x?}");
         }
