@@ -1205,12 +1205,11 @@ kernel void parent_hash(device const uint* children [[buffer(0)]],
         }
     }
 
-    /// [`encode_ntt_passes`] restricted to the position prefix covering the
-    /// first `prefix16` sixteenths of the codeword. Valid because the kernel
-    /// derives its block index from the HIGH bits of `tgid`
-    /// (`B = tgid >> (P.s - LOG_G)`), so dispatching `groups * prefix16/16`
-    /// threadgroups enumerates exactly the prefix blocks of every pass with
-    /// `l >= 4`.
+    /// [`encode_ntt_passes`] restricted to the first `prefix_blocks` blocks at
+    /// `start_layer`. Valid because every later kernel derives its block index
+    /// from the HIGH bits of `tgid` (`B = tgid >> (P.s - LOG_G)`), so
+    /// dispatching the same prefix fraction enumerates exactly those blocks
+    /// and all of their descendants.
     pub(crate) unsafe fn encode_ntt_passes_prefix(
         gpu: &Gpu,
         enc: Id,
@@ -1218,9 +1217,11 @@ kernel void parent_hash(device const uint* children [[buffer(0)]],
         tw_buf: Id,
         log_d: usize,
         start_layer: usize,
-        prefix16: u64,
+        prefix_blocks: u64,
     ) {
         unsafe {
+            let partition_blocks = 1u64 << start_layer;
+            debug_assert!(prefix_blocks <= partition_blocks);
             gpu.set_buffer(enc, data_buf, 0, 0);
             gpu.set_buffer(enc, tw_buf, 0, 1);
             let share_log = if std::env::var_os("FLOCK_NO_GPU_TABLE_REUSE").is_some() {
@@ -1229,7 +1230,7 @@ kernel void parent_hash(device const uint* children [[buffer(0)]],
                 2usize
             };
             for (l, f) in super::plan_passes(log_d, start_layer) {
-                debug_assert!(l >= 4, "prefix passes require layer >= 4 blocks");
+                debug_assert!(l >= start_layer);
                 let s = log_d - l - f;
                 let (pso, tpg, groups) = match f {
                     4 if share_log > 0 && s >= share_log => (
@@ -1253,9 +1254,56 @@ kernel void parent_hash(device const uint* children [[buffer(0)]],
                     core::mem::size_of::<NttParams>(),
                 );
                 gpu.set_bytes(enc, bytes, 2);
-                debug_assert_eq!(groups % 16, 0);
-                gpu.dispatch(enc, groups / 16 * prefix16, tpg);
+                debug_assert_eq!(groups % partition_blocks, 0);
+                gpu.dispatch(enc, groups / partition_blocks * prefix_blocks, tpg);
             }
+        }
+    }
+
+    /// Advance the first `prefix_layer4_blocks` absolute layer-4 blocks
+    /// through layers 4..7. This is stage A of the fine hybrid boundary: the
+    /// CPU owns the complementary whole blocks, so both devices write disjoint
+    /// ranges before the layer-8 handoff barrier. The GPU keeps the incumbent
+    /// fused-four table-reuse pass and therefore adds no extra DRAM sweep.
+    pub(crate) unsafe fn encode_ntt_layer4_to8_prefix(
+        gpu: &Gpu,
+        enc: Id,
+        data_buf: Id,
+        tw_buf: Id,
+        log_d: usize,
+        prefix_layer4_blocks: u64,
+    ) {
+        debug_assert!(log_d >= 8);
+        debug_assert!(prefix_layer4_blocks <= 16);
+        unsafe {
+            let share_log = if log_d < 10
+                || std::env::var_os("FLOCK_NO_GPU_TABLE_REUSE").is_some()
+            {
+                0usize
+            } else {
+                2usize
+            };
+            let (pso, groups) = if share_log > 0 {
+                (gpu.pso_ntt4g4, 1u64 << (log_d - 4 - share_log))
+            } else {
+                (gpu.pso_ntt4, 1u64 << (log_d - 4))
+            };
+            gpu.set_pipeline(enc, pso);
+            gpu.set_buffer(enc, data_buf, 0, 0);
+            gpu.set_buffer(enc, tw_buf, 0, 1);
+            let p = NttParams {
+                log_d: log_d as u32,
+                l: 4,
+                f: 4,
+                s: (log_d - 8) as u32,
+            };
+            let bytes = core::slice::from_raw_parts(
+                (&p as *const NttParams).cast::<u8>(),
+                core::mem::size_of::<NttParams>(),
+            );
+            gpu.set_bytes(enc, bytes, 2);
+            debug_assert_eq!(groups % 16, 0);
+            gpu.dispatch(enc, groups / 16 * prefix_layer4_blocks, 64);
         }
     }
 
@@ -1572,13 +1620,14 @@ kernel void parent_hash(device const uint* children [[buffer(0)]],
     }
 
     /// Hybrid GPU/CPU commit graph: the GPU runs the shared from-z top pass
-    /// (layers 0..3) over the full codeword, then owns the position prefix
-    /// (first `16 - k` sixteenths: remaining NTT passes + its aligned Merkle
-    /// subtrees) asynchronously while the CPU completes the suffix `k`
-    /// sixteenths (layers 4.. via the bit-exact block-range driver, suffix
-    /// leaves + subtree parents) directly in the shared staging and tree
-    /// buffers. The top 7 tree nodes are (re)computed on the CPU after the
-    /// join, covering every decomposition boundary.
+    /// (layers 0..3) over the full codeword. GPU and CPU then advance disjoint
+    /// whole layer-4 blocks through layer 8; the GPU owns the one boundary
+    /// block when the requested split is not a multiple of sixteen. After that
+    /// barrier, the GPU owns the first `256 - k` layer-8 blocks (remaining NTT
+    /// passes + aligned Merkle subtrees) while the CPU completes the contiguous
+    /// suffix `k` (cache-local NTT, leaves, and subtree parents). The 255 tree
+    /// nodes above the two-hundred-fifty-sixth roots are recomputed after the
+    /// join.
     ///
     /// Bit-exact: same kernels/twiddles on both sides, every element and
     /// tree node written exactly once (top nodes twice, identically).
@@ -1590,10 +1639,10 @@ kernel void parent_hash(device const uint* children [[buffer(0)]],
         tree_buf: Id,
         log_d: usize,
         n_leaves: usize,
-        k_cpu16: usize,
+        k_cpu256: usize,
     ) -> Result<(), String> {
         use rayon::prelude::*;
-        debug_assert!((1..16).contains(&k_cpu16));
+        debug_assert!((1..256).contains(&k_cpu256));
         unsafe {
             let pool = gpu.pool_push();
             let r = (|| {
@@ -1619,16 +1668,57 @@ kernel void parent_hash(device const uint* children [[buffer(0)]],
                 gpu.end_encoding(enc);
                 gpu.commit_and_wait(cb1)?;
 
-                // cb2: GPU prefix — remaining passes + aligned subtrees.
-                let prefix16 = (16 - k_cpu16) as u64;
+                // Resolve the deterministic CPU driver and shared codeword
+                // before the two disjoint layer-4 ranges run concurrently.
+                static NTT: std::sync::OnceLock<AdditiveNttF128> = std::sync::OnceLock::new();
+                let ntt = NTT.get_or_init(|| AdditiveNttF128::standard(log_d));
+                debug_assert_eq!(ntt.log_domain_size(), log_d);
+                let data: &mut [F128] = core::slice::from_raw_parts_mut(
+                    gpu.buffer_contents(staging).cast::<F128>(),
+                    n_leaves * 64,
+                );
+
+                // Stage A: advance whole layer-4 blocks through layer 8 on
+                // disjoint devices. The GPU owns the boundary block, rounded
+                // upward, so a non-multiple-of-sixteen split never divides a
+                // radix-16 dependency. Its trailing layer-8 subblocks hand off
+                // to the CPU only after the command-buffer barrier below.
+                let prefix256 = (256 - k_cpu256) as u64;
+                let gpu_layer4_blocks = (prefix256 as usize).div_ceil(16);
+                let cb2a = gpu.command_buffer()?;
+                let enc = gpu.compute_encoder(cb2a)?;
+                encode_ntt_layer4_to8_prefix(
+                    gpu,
+                    enc,
+                    staging,
+                    tw_buf,
+                    log_d,
+                    gpu_layer4_blocks as u64,
+                );
+                gpu.end_encoding(enc);
+                gpu.commit_async(cb2a);
+                if gpu_layer4_blocks < 16 {
+                    ntt.forward_transform_interleaved_block_range(
+                        data,
+                        64,
+                        4,
+                        8,
+                        gpu_layer4_blocks,
+                        16,
+                    );
+                }
+                gpu.wait_cb(cb2a)?;
+
+                // Stage B: exact layer-8 split. The GPU finishes the prefix
+                // while the CPU finishes the contiguous suffix.
                 let cb2 = gpu.command_buffer()?;
                 let enc = gpu.compute_encoder(cb2)?;
-                encode_ntt_passes_prefix(gpu, enc, staging, tw_buf, log_d, 4, prefix16);
+                encode_ntt_passes_prefix(gpu, enc, staging, tw_buf, log_d, 8, prefix256);
                 // Greedy aligned power-of-two subtree decomposition of the
                 // leaf prefix.
-                let sixteenth = n_leaves / 16;
+                let two_fifty_sixth = n_leaves / 256;
                 let mut start = 0usize;
-                let prefix_leaves = (16 - k_cpu16) * sixteenth;
+                let prefix_leaves = (256 - k_cpu256) * two_fifty_sixth;
                 while start < prefix_leaves {
                     let mut size = 1usize << (prefix_leaves - start).ilog2();
                     while start % size != 0 {
@@ -1641,15 +1731,6 @@ kernel void parent_hash(device const uint* children [[buffer(0)]],
                 gpu.commit_async(cb2);
 
                 // CPU: suffix NTT completion + leaves + subtree parents.
-                // The twiddle table is deterministic per log_d; build it once
-                // per process (first call lands in the untimed warmup).
-                static NTT: std::sync::OnceLock<AdditiveNttF128> = std::sync::OnceLock::new();
-                let ntt = NTT.get_or_init(|| AdditiveNttF128::standard(log_d));
-                debug_assert_eq!(ntt.log_domain_size(), log_d);
-                let data: &mut [F128] = core::slice::from_raw_parts_mut(
-                    gpu.buffer_contents(staging).cast::<F128>(),
-                    n_leaves * 64,
-                );
                 let tree: &mut [Hash] = core::slice::from_raw_parts_mut(
                     gpu.buffer_contents(tree_buf).cast::<Hash>(),
                     2 * n_leaves - 1,
@@ -1686,10 +1767,10 @@ kernel void parent_hash(device const uint* children [[buffer(0)]],
                     ntt.forward_transform_interleaved_ranked_block_range_and_then(
                         data,
                         64,
-                        4,
+                        8,
                         log_d,
-                        16 - k_cpu16,
-                        16,
+                        256 - k_cpu256,
+                        256,
                         finish_chunk,
                     );
                 } else {
@@ -1698,10 +1779,10 @@ kernel void parent_hash(device const uint* children [[buffer(0)]],
                     ntt.forward_transform_interleaved_block_range(
                         data,
                         64,
-                        4,
+                        8,
                         log_d,
-                        16 - k_cpu16,
-                        16,
+                        256 - k_cpu256,
+                        256,
                     );
                     let suffix_bytes: &[u8] = core::slice::from_raw_parts(
                         data.as_ptr().cast::<u8>().add(suffix_leaf_start * 1024),
@@ -1764,15 +1845,15 @@ kernel void parent_hash(device const uint* children [[buffer(0)]],
                 }
 
                 // Join the GPU prefix, then (re)compute every level above
-                // the sixteenth-granularity roots. Every subtree on either
-                // side spans ≥ one sixteenth (2^16 leaves), so the 16-node
-                // level is always fully populated by subtree-internal
-                // parents; the 15 nodes above it are recomputed here,
+                // the 1/256-granularity roots. Every subtree on either side
+                // spans at least one 1/256 block (2^12 leaves), so the 256-node
+                // level is fully populated by subtree-internal parents; the
+                // 255 nodes above it are recomputed here,
                 // covering every decomposition boundary for any k.
                 gpu.wait_cb(cb2)?;
                 let mut level_start = 0usize;
                 let mut level_len = n_leaves;
-                while level_len > 16 {
+                while level_len > 256 {
                     level_start += level_len;
                     level_len /= 2;
                 }
@@ -1795,24 +1876,31 @@ kernel void parent_hash(device const uint* children [[buffer(0)]],
         }
     }
 
-    /// CPU share of the hybrid commit in sixteenths of the position range.
-    /// 0 disables (pure-GPU graph). Default 5 is the conservative midpoint of
-    /// the cache-local suffix plateau: it retains most of the measured gain on
-    /// a 10P/4E M4 Pro without assuming the benchmark's larger M3 Max GPU has
-    /// the same CPU/GPU balance. `FLOCK_HYBRID_CPU_BLOCKS` remains the exact
-    /// split-point override.
-    fn hybrid_cpu_sixteenths() -> usize {
+    /// CPU share of the hybrid commit in 1/256 blocks. The default 72/256 is
+    /// exactly halfway between the official k=4 and k=5 sixteenth boundaries.
+    /// `FLOCK_HYBRID_CPU_256THS` selects the fine split; the established
+    /// `FLOCK_HYBRID_CPU_BLOCKS` control remains compatible by mapping each
+    /// sixteenth to sixteen layer-8 blocks.
+    fn hybrid_cpu_two_fifty_sixths() -> usize {
         use std::sync::OnceLock;
         static K: OnceLock<usize> = OnceLock::new();
         *K.get_or_init(|| {
             if std::env::var_os("FLOCK_NO_HYBRID_COMMIT").is_some() {
                 return 0;
             }
+            if let Some(k) = std::env::var("FLOCK_HYBRID_CPU_256THS")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .filter(|k| *k < 256)
+            {
+                return k;
+            }
             std::env::var("FLOCK_HYBRID_CPU_BLOCKS")
                 .ok()
-                .and_then(|v| v.parse().ok())
+                .and_then(|v| v.parse::<usize>().ok())
                 .filter(|k| *k < 16)
-                .unwrap_or(5)
+                .map(|k| 16 * k)
+                .unwrap_or(72)
         })
     }
 
@@ -2069,11 +2157,11 @@ kernel void parent_hash(device const uint* children [[buffer(0)]],
         };
 
         let t0 = std::time::Instant::now();
-        let k_cpu16 = hybrid_cpu_sixteenths();
+        let k_cpu256 = hybrid_cpu_two_fifty_sixths();
         let run = unsafe {
-            if k_cpu16 > 0 {
+            if k_cpu256 > 0 {
                 run_commit_graph_from_z_hybrid(
-                    gpu, z_buf, staging, tw_buf, tree_buf, log_d, n_leaves, k_cpu16,
+                    gpu, z_buf, staging, tw_buf, tree_buf, log_d, n_leaves, k_cpu256,
                 )
             } else {
                 run_commit_graph_from_z(gpu, z_buf, staging, tw_buf, tree_buf, log_d, n_leaves)
@@ -2342,13 +2430,87 @@ mod tests {
         use super::imp;
 
         let log_d = 10usize;
-        let start_layer = 4usize;
-        let prefix16 = 14u64;
         let ntt = AdditiveNttF128::standard(log_d);
-        let mut rng = Rng::new(0xA11C_ED16);
+        let gpu = match gpu_or_skip(imp::gpu().map(|g| g as *const imp::Gpu)) {
+            Some(g) => unsafe { &*g },
+            None => return,
+        };
+        let twiddles = flat_twiddle_table(&ntt, log_d);
+        for (start_layer, prefix_blocks, seed) in [
+            (4usize, 14u64, 0xA11C_ED16),
+            (6, 47, 0xA11C_ED64),
+            (8, 183, 0xA11C_E256),
+        ]
+        {
+            let mut rng = Rng::new(seed);
+            let input = rng.vec(64 << log_d);
+            let mut expect = input.clone();
+            ntt.forward_transform_interleaved_scalar_from_layer(&mut expect, 64, start_layer);
+
+            unsafe {
+                let pool = gpu.pool_push();
+                let data_bytes = core::mem::size_of_val(input.as_slice());
+                let data_buf = gpu.new_buffer(data_bytes).unwrap();
+                let tw_buf = gpu
+                    .new_buffer(core::mem::size_of_val(twiddles.as_slice()))
+                    .unwrap();
+                std::ptr::copy_nonoverlapping(
+                    input.as_ptr().cast::<u8>(),
+                    gpu.buffer_contents(data_buf),
+                    data_bytes,
+                );
+                std::ptr::copy_nonoverlapping(
+                    twiddles.as_ptr().cast::<u8>(),
+                    gpu.buffer_contents(tw_buf),
+                    core::mem::size_of_val(twiddles.as_slice()),
+                );
+
+                let cb = gpu.command_buffer().unwrap();
+                let enc = gpu.compute_encoder(cb).unwrap();
+                imp::encode_ntt_passes_prefix(
+                    gpu,
+                    enc,
+                    data_buf,
+                    tw_buf,
+                    log_d,
+                    start_layer,
+                    prefix_blocks,
+                );
+                gpu.end_encoding(enc);
+                gpu.commit_and_wait(cb).unwrap();
+
+                let got = core::slice::from_raw_parts(
+                    gpu.buffer_contents(data_buf).cast::<F128>(),
+                    input.len(),
+                );
+                let partition_blocks = 1usize << start_layer;
+                let prefix_len = input.len() / partition_blocks * prefix_blocks as usize;
+                assert_eq!(&got[..prefix_len], &expect[..prefix_len]);
+                assert_eq!(&got[prefix_len..], &input[prefix_len..]);
+                gpu.release(data_buf);
+                gpu.release(tw_buf);
+                gpu.pool_pop(pool);
+            }
+        }
+    }
+
+    /// Exact oracle for the two-stage 1/256 handoff. Stage A gives the GPU the
+    /// rounded-up boundary layer-4 block and the CPU the remaining whole
+    /// blocks; stage B transfers only the boundary block's trailing layer-8
+    /// children to the CPU. The mixed result must equal one full CPU NTT.
+    #[test]
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    fn gpu_ntt_fine_handoff_matches_cpu_small_shape() {
+        use super::imp;
+
+        let log_d = 10usize;
+        let prefix256 = 184usize;
+        let gpu_layer4_blocks = prefix256.div_ceil(16);
+        let ntt = AdditiveNttF128::standard(log_d);
+        let mut rng = Rng::new(0xF164_B044);
         let input = rng.vec(64 << log_d);
         let mut expect = input.clone();
-        ntt.forward_transform_interleaved_scalar_from_layer(&mut expect, 64, start_layer);
+        ntt.forward_transform_interleaved_scalar_from_layer(&mut expect, 64, 4);
 
         let gpu = match gpu_or_skip(imp::gpu().map(|g| g as *const imp::Gpu)) {
             Some(g) => unsafe { &*g },
@@ -2375,25 +2537,51 @@ mod tests {
 
             let cb = gpu.command_buffer().unwrap();
             let enc = gpu.compute_encoder(cb).unwrap();
+            imp::encode_ntt_layer4_to8_prefix(
+                gpu,
+                enc,
+                data_buf,
+                tw_buf,
+                log_d,
+                gpu_layer4_blocks as u64,
+            );
+            gpu.end_encoding(enc);
+            gpu.commit_and_wait(cb).unwrap();
+            let mixed = core::slice::from_raw_parts_mut(
+                gpu.buffer_contents(data_buf).cast::<F128>(),
+                input.len(),
+            );
+            ntt.forward_transform_interleaved_block_range(
+                mixed,
+                64,
+                4,
+                8,
+                gpu_layer4_blocks,
+                16,
+            );
+
+            let cb = gpu.command_buffer().unwrap();
+            let enc = gpu.compute_encoder(cb).unwrap();
             imp::encode_ntt_passes_prefix(
                 gpu,
                 enc,
                 data_buf,
                 tw_buf,
                 log_d,
-                start_layer,
-                prefix16,
+                8,
+                prefix256 as u64,
             );
             gpu.end_encoding(enc);
             gpu.commit_and_wait(cb).unwrap();
-
-            let got = core::slice::from_raw_parts(
+            let mixed = core::slice::from_raw_parts_mut(
                 gpu.buffer_contents(data_buf).cast::<F128>(),
                 input.len(),
             );
-            let prefix_len = input.len() / 16 * prefix16 as usize;
-            assert_eq!(&got[..prefix_len], &expect[..prefix_len]);
-            assert_eq!(&got[prefix_len..], &input[prefix_len..]);
+            ntt.forward_transform_interleaved_block_range(
+                mixed, 64, 8, log_d, prefix256, 256,
+            );
+            assert_eq!(mixed, expect.as_slice(), "fine hybrid handoff diverges");
+
             gpu.release(data_buf);
             gpu.release(tw_buf);
             gpu.pool_pop(pool);

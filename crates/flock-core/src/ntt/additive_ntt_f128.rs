@@ -700,10 +700,11 @@ impl AdditiveNttF128 {
     /// Complete a ranked hybrid suffix with the same cache-local schedule as
     /// the tuned full-CPU transform, then publish each finalized 1 MiB chunk.
     ///
-    /// The shared GPU pass has already completed layers 0..4.  This routine
-    /// runs the two remaining top radix-8 groups (layers 4..10) over the
-    /// requested absolute layer-4 blocks, then finishes layers 10..20 as five
-    /// fused pairs inside independent layer-10 sub-NTTs.  `finish_chunk`
+    /// The shared GPU pass has completed all layers below `start_layer` (four,
+    /// six, or eight in the ranked hybrid graphs). This routine runs the remaining
+    /// broad passes through layer 10 over the requested absolute blocks, then
+    /// finishes layers 10..20 as five fused pairs inside independent layer-10
+    /// sub-NTTs. `finish_chunk`
     /// receives an absolute element offset, so a concurrent GPU prefix and
     /// this CPU suffix can write disjoint Merkle leaf ranges without rebasing
     /// indices.  It runs immediately after the last pair while the 1 MiB
@@ -727,12 +728,15 @@ impl AdditiveNttF128 {
         let log_d = log2_pow2(data.len() / num_ntts);
         assert_eq!(log_d, 20, "ranked hybrid suffix requires log_d=20");
         assert_eq!(num_ntts, 64, "ranked hybrid suffix requires 64 lanes");
-        assert_eq!(start_layer, 4, "ranked hybrid suffix starts at layer 4");
+        assert!(
+            matches!(start_layer, 4 | 6 | 8),
+            "ranked hybrid suffix starts at layer 4, 6, or 8"
+        );
         assert_eq!(stop_layer, log_d, "ranked hybrid suffix completes the NTT");
         assert!(b_start < b_end && b_end <= (1usize << start_layer));
 
-        // Two fused radix-8 passes.  Unlike the old all-layer range driver,
-        // this is the last streaming traversal of the complete suffix.
+        // Complete the broad top passes. Unlike the old all-layer range
+        // driver, these are the last streaming traversals of the suffix.
         self.forward_transform_interleaved_block_range(
             data,
             num_ntts,
@@ -742,9 +746,9 @@ impl AdditiveNttF128 {
             b_end,
         );
 
-        // Every layer-4 block contains 2^(10-4) independent layer-10
-        // sub-NTTs.  Preserve their absolute indices so all deeper twiddles
-        // match the unsplit transform exactly.
+        // Every start-layer block contains 2^(10-start_layer) independent
+        // layer-10 sub-NTTs. Preserve their absolute indices so all deeper
+        // twiddles match the unsplit transform exactly.
         let sub_start = b_start << (DEEP_LAYER - start_layer);
         let sub_end = b_end << (DEEP_LAYER - start_layer);
         self.forward_transform_interleaved_deep_fused_pairs_range_and_then(
@@ -2835,6 +2839,36 @@ mod block_range_equivalence {
             );
         }
         assert_eq!(full, split, "layer-4 split diverges");
+
+        // Split at layer 6: the finer hybrid graph's 64 independent blocks.
+        let mut split64 = src.clone();
+        ntt.forward_transform_interleaved_block_range(&mut split64, num_ntts, 1, 6, 0, 2);
+        for b in 0..64 {
+            ntt.forward_transform_interleaved_block_range(
+                &mut split64,
+                num_ntts,
+                6,
+                log_d,
+                b,
+                b + 1,
+            );
+        }
+        assert_eq!(full, split64, "layer-6 split diverges");
+
+        // Split at layer 8: the traffic-preserving fine graph's 256 blocks.
+        let mut split256 = src.clone();
+        ntt.forward_transform_interleaved_block_range(&mut split256, num_ntts, 1, 8, 0, 2);
+        for b in 0..256 {
+            ntt.forward_transform_interleaved_block_range(
+                &mut split256,
+                num_ntts,
+                8,
+                log_d,
+                b,
+                b + 1,
+            );
+        }
+        assert_eq!(full, split256, "layer-8 split diverges");
     }
 
     #[test]
