@@ -564,6 +564,80 @@ pub(crate) unsafe fn bit_transpose_64bytes_neon(input: &[u8; 64], output: &mut [
     }
 }
 
+/// Strided form used by the row-major witness stripe builder. Loading the
+/// eight source words straight into four Q registers avoids materializing a
+/// temporary `[u64; 8]` only for the contiguous transpose to reload it.
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+pub(crate) unsafe fn bit_transpose_8_strided_u64s_neon(
+    base: *const u64,
+    stride: usize,
+    output: &mut [u8; 64],
+) {
+    use core::arch::aarch64::*;
+
+    unsafe {
+        let load_pair = |lane: usize| {
+            let mut v = vdupq_n_u64(0);
+            v = vld1q_lane_u64::<0>(base.add(lane * stride), v);
+            vld1q_lane_u64::<1>(base.add((lane + 1) * stride), v)
+        };
+        let table = uint8x16x4_t(
+            vreinterpretq_u8_u64(load_pair(0)),
+            vreinterpretq_u8_u64(load_pair(2)),
+            vreinterpretq_u8_u64(load_pair(4)),
+            vreinterpretq_u8_u64(load_pair(6)),
+        );
+
+        const IDX0: [u8; 16] = [0, 8, 16, 24, 32, 40, 48, 56, 1, 9, 17, 25, 33, 41, 49, 57];
+        const IDX1: [u8; 16] = [2, 10, 18, 26, 34, 42, 50, 58, 3, 11, 19, 27, 35, 43, 51, 59];
+        const IDX2: [u8; 16] = [4, 12, 20, 28, 36, 44, 52, 60, 5, 13, 21, 29, 37, 45, 53, 61];
+        const IDX3: [u8; 16] = [6, 14, 22, 30, 38, 46, 54, 62, 7, 15, 23, 31, 39, 47, 55, 63];
+
+        let mut y0 = vreinterpretq_u64_u8(vqtbl4q_u8(table, vld1q_u8(IDX0.as_ptr())));
+        let mut y1 = vreinterpretq_u64_u8(vqtbl4q_u8(table, vld1q_u8(IDX1.as_ptr())));
+        let mut y2 = vreinterpretq_u64_u8(vqtbl4q_u8(table, vld1q_u8(IDX2.as_ptr())));
+        let mut y3 = vreinterpretq_u64_u8(vqtbl4q_u8(table, vld1q_u8(IDX3.as_ptr())));
+
+        let mask1 = vdupq_n_u64(0x00AA00AA00AA00AA);
+        let mask2 = vdupq_n_u64(0x0000CCCC0000CCCC);
+        let mask3 = vdupq_n_u64(0x00000000F0F0F0F0);
+
+        let t0 = vandq_u64(veorq_u64(y0, vshrq_n_u64::<7>(y0)), mask1);
+        let t1 = vandq_u64(veorq_u64(y1, vshrq_n_u64::<7>(y1)), mask1);
+        let t2 = vandq_u64(veorq_u64(y2, vshrq_n_u64::<7>(y2)), mask1);
+        let t3 = vandq_u64(veorq_u64(y3, vshrq_n_u64::<7>(y3)), mask1);
+        y0 = xor3_u64(y0, t0, vshlq_n_u64::<7>(t0));
+        y1 = xor3_u64(y1, t1, vshlq_n_u64::<7>(t1));
+        y2 = xor3_u64(y2, t2, vshlq_n_u64::<7>(t2));
+        y3 = xor3_u64(y3, t3, vshlq_n_u64::<7>(t3));
+
+        let t0 = vandq_u64(veorq_u64(y0, vshrq_n_u64::<14>(y0)), mask2);
+        let t1 = vandq_u64(veorq_u64(y1, vshrq_n_u64::<14>(y1)), mask2);
+        let t2 = vandq_u64(veorq_u64(y2, vshrq_n_u64::<14>(y2)), mask2);
+        let t3 = vandq_u64(veorq_u64(y3, vshrq_n_u64::<14>(y3)), mask2);
+        y0 = xor3_u64(y0, t0, vshlq_n_u64::<14>(t0));
+        y1 = xor3_u64(y1, t1, vshlq_n_u64::<14>(t1));
+        y2 = xor3_u64(y2, t2, vshlq_n_u64::<14>(t2));
+        y3 = xor3_u64(y3, t3, vshlq_n_u64::<14>(t3));
+
+        let t0 = vandq_u64(veorq_u64(y0, vshrq_n_u64::<28>(y0)), mask3);
+        let t1 = vandq_u64(veorq_u64(y1, vshrq_n_u64::<28>(y1)), mask3);
+        let t2 = vandq_u64(veorq_u64(y2, vshrq_n_u64::<28>(y2)), mask3);
+        let t3 = vandq_u64(veorq_u64(y3, vshrq_n_u64::<28>(y3)), mask3);
+        y0 = xor3_u64(y0, t0, vshlq_n_u64::<28>(t0));
+        y1 = xor3_u64(y1, t1, vshlq_n_u64::<28>(t1));
+        y2 = xor3_u64(y2, t2, vshlq_n_u64::<28>(t2));
+        y3 = xor3_u64(y3, t3, vshlq_n_u64::<28>(t3));
+
+        let out_ptr = output.as_mut_ptr();
+        vst1q_u8(out_ptr, vreinterpretq_u8_u64(y0));
+        vst1q_u8(out_ptr.add(16), vreinterpretq_u8_u64(y1));
+        vst1q_u8(out_ptr.add(32), vreinterpretq_u8_u64(y2));
+        vst1q_u8(out_ptr.add(48), vreinterpretq_u8_u64(y3));
+    }
+}
+
 // Intermediate-stage NEON kernel: scalar `inv_table.apply` writing to
 // `a_col`/`b_col` Vecs, then NEON `gf8_mul_vec16` from those Vecs. Superseded
 // by `shift_reduce_inner_ab_fused_neon` which keeps everything register-

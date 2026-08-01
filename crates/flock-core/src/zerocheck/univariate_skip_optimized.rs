@@ -283,6 +283,16 @@ pub fn bit_transpose_64bytes(input: &[u8; 64], output: &mut [u8; 64]) {
     kernels::bit_transpose_64bytes(input, output);
 }
 
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+pub(crate) unsafe fn bit_transpose_8_strided_u64s(
+    base: *const u64,
+    stride: usize,
+    output: &mut [u8; 64],
+) {
+    unsafe { kernels::bit_transpose_8_strided_u64s(base, stride, output) }
+}
+
 /// Challenge-independent AB half of the optimized round-1 kernel.
 ///
 /// The storage has exactly the same byte length and block layout as either

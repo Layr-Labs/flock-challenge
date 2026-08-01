@@ -1557,7 +1557,9 @@ pub(crate) mod witgen_simd {
         REC_C4, REC_C5, REC_LIN0, REC_LIN1, USEFUL_BITS,
     };
     use core::arch::aarch64::*;
-    use flock_core::bits::transpose_8_u64s_to_64_bytes;
+    use flock_core::bits::{
+        transpose_8_strided_u64s_to_64_bytes, transpose_8_u64s_to_64_bytes,
+    };
     use flock_core::field::F128;
     use std::sync::LazyLock;
 
@@ -2145,6 +2147,7 @@ pub(crate) mod witgen_simd {
         let b_base = WritePtr(b.as_mut_ptr());
         let stripe_base = WritePtr(z_lincheck.as_mut_ptr());
         let nt = nt_enabled();
+        let direct_stripe_loads = std::env::var_os("FLOCK_NO_DIRECT_STRIPE_LOADS").is_none();
 
         let process_group = |g: usize| {
             // SAFETY: each scheduled group index occurs exactly once. Every
@@ -2190,15 +2193,40 @@ pub(crate) mod witgen_simd {
             let useful_words = stripe_useful_bits.div_ceil(64);
             let mut tmp = [0u8; 64];
             for i in 0..useful_words {
-                let lanes: [u64; 8] = std::array::from_fn(|j| z_u64_all[j * u64_per_block + i]);
-                if nt {
-                    transpose_8_u64s_to_64_bytes(&lanes, &mut tmp);
-                    // SAFETY: stripe chunk i is 64 in-bounds bytes.
+                if direct_stripe_loads {
+                    // SAFETY: z_u64_all contains eight complete block rows;
+                    // the largest address is 7*u64_per_block+i, in bounds.
                     unsafe {
-                        stripe_store_nt(tmp.as_ptr(), stripe.as_mut_ptr().add(i * 64));
+                        if nt {
+                            transpose_8_strided_u64s_to_64_bytes(
+                                z_u64_all.as_ptr().add(i),
+                                u64_per_block,
+                                &mut tmp,
+                            );
+                            stripe_store_nt(tmp.as_ptr(), stripe.as_mut_ptr().add(i * 64));
+                        } else {
+                            transpose_8_strided_u64s_to_64_bytes(
+                                z_u64_all.as_ptr().add(i),
+                                u64_per_block,
+                                &mut stripe[i * 64..i * 64 + 64],
+                            );
+                        }
                     }
                 } else {
-                    transpose_8_u64s_to_64_bytes(&lanes, &mut stripe[i * 64..i * 64 + 64]);
+                    let lanes: [u64; 8] =
+                        std::array::from_fn(|j| z_u64_all[j * u64_per_block + i]);
+                    if nt {
+                        transpose_8_u64s_to_64_bytes(&lanes, &mut tmp);
+                        // SAFETY: stripe chunk i is 64 in-bounds bytes.
+                        unsafe {
+                            stripe_store_nt(tmp.as_ptr(), stripe.as_mut_ptr().add(i * 64));
+                        }
+                    } else {
+                        transpose_8_u64s_to_64_bytes(
+                            &lanes,
+                            &mut stripe[i * 64..i * 64 + 64],
+                        );
+                    }
                 }
             }
             // Mirrors the generic driver: the padded fold never observes the

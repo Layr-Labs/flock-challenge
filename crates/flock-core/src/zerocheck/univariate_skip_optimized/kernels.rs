@@ -76,6 +76,16 @@ pub(super) fn bit_transpose_64bytes(input: &[u8; 64], output: &mut [u8; 64]) {
     portable::bit_transpose_64bytes_scalar(input, output);
 }
 
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+pub(super) unsafe fn bit_transpose_8_strided_u64s(
+    base: *const u64,
+    stride: usize,
+    output: &mut [u8; 64],
+) {
+    unsafe { aarch64::bit_transpose_8_strided_u64s_neon(base, stride, output) }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(super) fn shift_reduce_inner_ab(
     a_packed: &[u8],

@@ -5,6 +5,8 @@
 use std::sync::OnceLock;
 
 use flock_core::bits::transpose_8_u64s_to_64_bytes;
+#[cfg(target_arch = "aarch64")]
+use flock_core::bits::transpose_8_strided_u64s_to_64_bytes;
 use flock_core::field::F128;
 use flock_core::r1cs::{BlockR1cs, SparseBinaryMatrix, WitnessLayout};
 
@@ -548,6 +550,8 @@ where
     }
 
     let group_f128 = 8 * f128_per_block;
+    #[cfg(target_arch = "aarch64")]
+    let direct_stripe_loads = std::env::var_os("FLOCK_NO_DIRECT_STRIPE_LOADS").is_none();
     let z_base = F128WritePtr(z.as_mut_ptr());
     let a_base = F128WritePtr(a.as_mut_ptr());
     let b_base = F128WritePtr(b.as_mut_ptr());
@@ -640,17 +644,34 @@ where
             // `cfg(test)` so release/ranked proves elide ~960 B/stripe × n_stripes
             // while `cargo test` keeps the full-stripe contract.
             let useful_words = stripe_useful_bits.div_ceil(64);
+            #[cfg(target_arch = "aarch64")]
+            if direct_stripe_loads {
+                for i in 0..useful_words {
+                    // SAFETY: z_u64_all contains eight complete block rows;
+                    // the largest address is 7*u64_per_block+i, in bounds.
+                    unsafe {
+                        transpose_8_strided_u64s_to_64_bytes(
+                            z_u64_all.as_ptr().add(i),
+                            u64_per_block,
+                            &mut stripe[i * 64..i * 64 + 64],
+                        );
+                    }
+                }
+            } else {
+                for i in 0..useful_words {
+                    let lanes: [u64; 8] = std::array::from_fn(|lane| {
+                        z_u64_all[lane * u64_per_block + i]
+                    });
+                    transpose_8_u64s_to_64_bytes(
+                        &lanes,
+                        &mut stripe[i * 64..i * 64 + 64],
+                    );
+                }
+            }
+            #[cfg(not(target_arch = "aarch64"))]
             for i in 0..useful_words {
-                let lanes: [u64; 8] = [
-                    z_u64_all[0 * u64_per_block + i],
-                    z_u64_all[u64_per_block + i],
-                    z_u64_all[2 * u64_per_block + i],
-                    z_u64_all[3 * u64_per_block + i],
-                    z_u64_all[4 * u64_per_block + i],
-                    z_u64_all[5 * u64_per_block + i],
-                    z_u64_all[6 * u64_per_block + i],
-                    z_u64_all[7 * u64_per_block + i],
-                ];
+                let lanes: [u64; 8] =
+                    std::array::from_fn(|lane| z_u64_all[lane * u64_per_block + i]);
                 transpose_8_u64s_to_64_bytes(&lanes, &mut stripe[i * 64..i * 64 + 64]);
             }
             #[cfg(test)]

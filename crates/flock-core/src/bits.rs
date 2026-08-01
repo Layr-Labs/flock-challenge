@@ -38,6 +38,26 @@ pub fn transpose_8_u64s_to_64_bytes(lanes: &[u64; 8], out: &mut [u8]) {
     crate::zerocheck::univariate_skip_optimized::bit_transpose_64bytes(input, out64);
 }
 
+/// Strided-input form of [`transpose_8_u64s_to_64_bytes`].
+///
+/// # Safety
+/// `base.add(lane * stride)` must be readable for every `lane in 0..8`.
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+pub unsafe fn transpose_8_strided_u64s_to_64_bytes(
+    base: *const u64,
+    stride: usize,
+    out: &mut [u8],
+) {
+    debug_assert_eq!(out.len(), 64);
+    let out64: &mut [u8; 64] = out.try_into().expect("64-byte stripe slice");
+    unsafe {
+        crate::zerocheck::univariate_skip_optimized::bit_transpose_8_strided_u64s(
+            base, stride, out64,
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -90,6 +110,26 @@ mod tests {
             transpose_8_u64s_to_64_bytes_scalar(&lanes, &mut oracle);
             assert_eq!(fast, oracle, "lanes={lanes:?}");
         }
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn strided_transpose_matches_contiguous() {
+        const STRIDE: usize = 13;
+        let mut source = [0u64; 8 * STRIDE];
+        let lanes = std::array::from_fn(|lane| {
+            let value = 0x9E37_79B9_7F4A_7C15u64
+                .wrapping_mul((lane as u64).wrapping_add(0x1234_5678));
+            source[lane * STRIDE] = value;
+            value
+        });
+        let mut want = [0u8; 64];
+        let mut got = [0u8; 64];
+        transpose_8_u64s_to_64_bytes(&lanes, &mut want);
+        unsafe {
+            transpose_8_strided_u64s_to_64_bytes(source.as_ptr(), STRIDE, &mut got);
+        }
+        assert_eq!(got, want);
     }
 
     /// Transposing twice is the identity.
