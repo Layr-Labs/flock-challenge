@@ -21,7 +21,10 @@ pub mod bits;
 pub mod challenger;
 pub(crate) mod epool;
 pub mod field;
-pub(crate) mod gpu_commit;
+// Public only for `note_precompute_branch_wall_ms` (the prover's join arm
+// reports its wall to the hybrid-split warmup sweep); internals stay
+// pub(crate).
+pub mod gpu_commit;
 pub mod hash;
 pub mod lincheck;
 pub mod merkle;

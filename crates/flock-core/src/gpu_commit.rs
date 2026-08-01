@@ -164,6 +164,27 @@ pub(crate) fn give_tree(tree: Vec<crate::merkle::Hash>) {
     imp::give_tree(tree);
 }
 
+/// Wall of the round-1 AB precompute arm that runs `rayon::join`ed against
+/// the commit (f64 bits; 0 = not yet measured this process). The prover
+/// stores it every prove; the hybrid-split warmup sweep reads it to size its
+/// contention emulation. Cross-crate because the join lives in flock-prover.
+static PRECOMPUTE_BRANCH_WALL_MS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Record the measured precompute branch wall for this process (called by
+/// the prover; last writer wins, which is the most recent prove).
+pub fn note_precompute_branch_wall_ms(ms: f64) {
+    PRECOMPUTE_BRANCH_WALL_MS.store(ms.to_bits(), std::sync::atomic::Ordering::Relaxed);
+}
+
+#[cfg_attr(
+    not(all(target_os = "macos", target_arch = "aarch64")),
+    allow(dead_code)
+)]
+pub(crate) fn precompute_branch_wall_ms() -> f64 {
+    f64::from_bits(PRECOMPUTE_BRANCH_WALL_MS.load(std::sync::atomic::Ordering::Relaxed))
+}
+
 /// Returns true when the GPU commit machinery is allowed to initialize.
 pub(crate) fn gpu_commit_enabled() -> bool {
     // A/B-CONTROL: set to `false` to build an exact GPU-off control binary
@@ -2028,18 +2049,250 @@ kernel void parent_hash(device const uint* children [[buffer(0)]],
     /// the same CPU/GPU balance. `FLOCK_HYBRID_CPU_BLOCKS` remains the exact
     /// split-point override.
     fn hybrid_cpu_sixteenths() -> usize {
+        if let Some(k) = hybrid_cpu_split_override() {
+            return k;
+        }
+        match TUNED_HYBRID_K.load(std::sync::atomic::Ordering::Relaxed) {
+            usize::MAX => DEFAULT_HYBRID_K,
+            k => k,
+        }
+    }
+
+    /// Promoted fixed default, used when the warmup sweep is disabled or has
+    /// not published a winner.
+    const DEFAULT_HYBRID_K: usize = 5;
+
+    /// Warmup-sweep-published CPU share (sentinel `usize::MAX` = not tuned).
+    static TUNED_HYBRID_K: std::sync::atomic::AtomicUsize =
+        std::sync::atomic::AtomicUsize::new(usize::MAX);
+
+    /// Exact override / kill-switch resolution. `FLOCK_NO_HYBRID_COMMIT`
+    /// forces the pure-GPU graph; `FLOCK_HYBRID_CPU_BLOCKS` pins an exact
+    /// split. Either also disables the warmup sweep.
+    fn hybrid_cpu_split_override() -> Option<usize> {
         use std::sync::OnceLock;
-        static K: OnceLock<usize> = OnceLock::new();
+        static K: OnceLock<Option<usize>> = OnceLock::new();
         *K.get_or_init(|| {
             if std::env::var_os("FLOCK_NO_HYBRID_COMMIT").is_some() {
-                return 0;
+                return Some(0);
             }
             std::env::var("FLOCK_HYBRID_CPU_BLOCKS")
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .filter(|k| *k < 16)
-                .unwrap_or(5)
         })
+    }
+
+    /// Untimed-warmup split sweep. The scoring host's CPU/GPU balance is
+    /// unknown at build time: the same fixed split that wins on a small-GPU
+    /// dev host over-allocates a Max-class GPU host's CPU and vice versa
+    /// (measured both directions on this board). With the latched buffers
+    /// live, wall-clock the full from-z commit graph at each candidate CPU
+    /// share on THIS host (two interleaved passes, per-candidate min), pick
+    /// the smallest share within 1.5% of the fastest (the timed prove's
+    /// round-1 precompute contends for the same cores, so near-ties should
+    /// resolve toward the GPU), verify the winner's staging and tree
+    /// bit-exact against the CPU reference commit, and publish it for every
+    /// timed prove of this process. Runs once, entirely inside the untimed
+    /// warmup prove. `FLOCK_NO_HYBRID_AUTOTUNE=1` keeps the fixed default.
+    fn autotune_hybrid_split(
+        gpu: &Gpu,
+        latched: &Latched,
+        log_d: usize,
+        n_leaves: usize,
+        codeword: &[F128],
+        cpu_tree: &[Hash],
+    ) {
+        if hybrid_cpu_split_override().is_some()
+            || std::env::var_os("FLOCK_NO_HYBRID_AUTOTUNE").is_some()
+        {
+            return;
+        }
+        let dbg = debug_enabled() || std::env::var_os("FLOCK_COMMIT_TIMING").is_some();
+        let z_buf = latched.wraps[0].2;
+        let (tw_buf, tree_buf, staging) = (latched.tw_buf, latched.tree_buf, latched.staging);
+        struct GraphCtx<'a> {
+            gpu: &'a Gpu,
+            z_buf: Id,
+            staging: Id,
+            tw_buf: Id,
+            tree_buf: Id,
+        }
+        // SAFETY: Metal command-buffer creation/commit is thread-safe and
+        // the wrapped ids are the process-persistent latched buffers, driven
+        // by exactly one graph run at a time here. The wrapper exists only
+        // so the sweep's `rayon::join` arm is `Send`.
+        unsafe impl Send for GraphCtx<'_> {}
+        unsafe impl Sync for GraphCtx<'_> {}
+        let ctx = GraphCtx { gpu, z_buf, staging, tw_buf, tree_buf };
+        let run_graph = |k: usize| -> Result<(), String> {
+            let c = &ctx;
+            unsafe {
+                if k == 0 {
+                    run_commit_graph_from_z(
+                        c.gpu, c.z_buf, c.staging, c.tw_buf, c.tree_buf, log_d, n_leaves,
+                    )
+                } else {
+                    run_commit_graph_from_z_hybrid(
+                        c.gpu, c.z_buf, c.staging, c.tw_buf, c.tree_buf, log_d, n_leaves, k,
+                    )
+                }
+            }
+        };
+        // Contention emulation. In the timed prove the graph shares the
+        // rayon pool with the round-1 AB precompute; an uncontended sweep
+        // therefore over-allocates the CPU (measured here: the uncontended
+        // sweep preferred k=7 at 164 ms while the contended timed graph at
+        // k=7 then ran 337 ms on the same host). Each candidate run is
+        // joined with a fixed all-thread work pile sized from the measured
+        // precompute branch wall. The only wall available at sweep time is
+        // the warmup prove's own, which is first-prove-inflated (cold
+        // tables/pages; measured ~2x locally), so scale by 0.6 and cap.
+        let pre_wall = super::precompute_branch_wall_ms();
+        let burn_ms = if pre_wall > 0.0 {
+            (pre_wall * 0.6).min(250.0)
+        } else {
+            100.0
+        };
+        let spin_chunk = |x: &mut u64| {
+            for _ in 0..4096u32 {
+                *x = x.wrapping_mul(0x9E37_79B9_7F4A_7C15).rotate_left(31);
+            }
+        };
+        let spins_per_ms = {
+            let t0 = std::time::Instant::now();
+            let mut x = 1u64;
+            let mut it = 0u64;
+            while t0.elapsed().as_secs_f64() < 5e-3 {
+                spin_chunk(&mut x);
+                it += 4096;
+            }
+            std::hint::black_box(x);
+            it as f64 / (t0.elapsed().as_secs_f64() * 1e3)
+        };
+        // Fixed WORK, not fixed wall: the real precompute is a finite pile
+        // of small tasks that timeshares with the suffix via work-stealing.
+        // Emit the burn as ~1 ms tasks (max_len 1) so it interleaves the
+        // same way instead of parking whole workers for the full window.
+        let burn_work = || {
+            use rayon::prelude::*;
+            let n = rayon::current_num_threads().max(1);
+            let tasks = ((burn_ms as usize) * n).max(1);
+            let per_task = spins_per_ms as u64;
+            (0..tasks).into_par_iter().with_max_len(1).for_each(|_| {
+                let mut x = 0xA5A5_A5A5_A5A5_A5A5u64;
+                let mut done = 0u64;
+                while done < per_task {
+                    spin_chunk(&mut x);
+                    done += 4096;
+                }
+                std::hint::black_box(x);
+            });
+        };
+        let contended_run = |k: usize| -> Result<f64, String> {
+            let t0 = std::time::Instant::now();
+            let (r, ()) = rayon::join(|| run_graph(k), burn_work);
+            r?;
+            Ok(t0.elapsed().as_secs_f64() * 1e3)
+        };
+        const CANDIDATES: [usize; 7] = [0, 2, 3, 4, 5, 6, 7];
+        let mut best_ms = [f64::INFINITY; CANDIDATES.len()];
+        for i in 0..CANDIDATES.len() {
+            match contended_run(CANDIDATES[i]) {
+                Ok(ms) => best_ms[i] = ms,
+                Err(e) => {
+                    // Leave the fixed default in place; the timed path has
+                    // its own mid-prove CPU fallback for GPU errors.
+                    if dbg {
+                        eprintln!(
+                            "[gpu-commit] autotune: k={} failed ({e}); keeping default",
+                            CANDIDATES[i]
+                        );
+                    }
+                    return;
+                }
+            }
+        }
+        // Second sample for the three stage-1 leaders (min per candidate):
+        // one cold draw per k is too noisy to split plateau neighbors.
+        let mut order: Vec<usize> = (0..CANDIDATES.len()).collect();
+        order.sort_by(|&a, &b| best_ms[a].total_cmp(&best_ms[b]));
+        for &i in order.iter().take(3) {
+            if let Ok(ms) = contended_run(CANDIDATES[i]) {
+                best_ms[i] = best_ms[i].min(ms);
+            }
+        }
+        let fastest = best_ms.iter().cloned().fold(f64::INFINITY, f64::min);
+        // Selection is deliberately asymmetric toward the promoted default:
+        // - near-ties (< 1.5%) keep the default — an emulated sweep cannot
+        //   adjudicate noise-thin margins, the ranked runner can;
+        // - k=0 must beat the default by > 4% — official board evidence has
+        //   the hybrid several percent ahead of the pure-GPU graph, so a
+        //   sweep that says otherwise is more likely an emulation artifact
+        //   (e.g. the burn floor collapsing all candidates) than truth.
+        let default_i = CANDIDATES
+            .iter()
+            .position(|&k| k == DEFAULT_HYBRID_K)
+            .expect("default split is a sweep candidate");
+        let Some(chosen_i) = (0..CANDIDATES.len()).find(|&i| best_ms[i] <= fastest * 1.015) else {
+            return;
+        };
+        let mut chosen = CANDIDATES[chosen_i];
+        if best_ms[default_i] <= fastest * 1.015 {
+            chosen = DEFAULT_HYBRID_K;
+        }
+        if chosen == 0 && best_ms[chosen_i] > best_ms[default_i] * (1.0 - 0.04) {
+            chosen = DEFAULT_HYBRID_K;
+        }
+        if dbg {
+            let table: Vec<String> = CANDIDATES
+                .iter()
+                .zip(best_ms.iter())
+                .map(|(k, ms)| format!("k={k}:{ms:.1}ms"))
+                .collect();
+            eprintln!(
+                "[gpu-commit] autotune sweep {} -> k={chosen} (default {})",
+                table.join(" "),
+                DEFAULT_HYBRID_K
+            );
+        }
+        if chosen != 0 {
+            // Trust-but-verify the winner on this host: one more run, full
+            // staging + tree byte compare against the CPU reference commit.
+            if run_graph(chosen).is_err() {
+                return;
+            }
+            let staging_ok = unsafe {
+                bytes_equal_parallel(
+                    gpu.buffer_contents(staging),
+                    core::slice::from_raw_parts(
+                        codeword.as_ptr().cast::<u8>(),
+                        core::mem::size_of_val(codeword),
+                    ),
+                )
+            };
+            let tree_ok = unsafe {
+                bytes_equal_parallel(
+                    gpu.buffer_contents(tree_buf),
+                    core::slice::from_raw_parts(
+                        cpu_tree.as_ptr().cast::<u8>(),
+                        core::mem::size_of_val(cpu_tree),
+                    ),
+                )
+            };
+            if !(staging_ok && tree_ok) {
+                // Should be unreachable (the hybrid graph is bit-exact by
+                // construction and test); if it ever fires, the pure-GPU
+                // graph was already verified by the latch compare.
+                eprintln!(
+                    "[gpu-commit] AUTOTUNE MISMATCH at k={chosen} \
+                     (staging_ok={staging_ok} tree_ok={tree_ok}); pinning k=0"
+                );
+                TUNED_HYBRID_K.store(0, std::sync::atomic::Ordering::Relaxed);
+                return;
+            }
+        }
+        TUNED_HYBRID_K.store(chosen, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Use the ranked cache-local deep-pair CPU suffix and hash each finalized
@@ -2214,6 +2467,16 @@ kernel void parent_hash(device const uint* children [[buffer(0)]],
         }
         give_tree(run.gpu_tree);
         if on {
+            // Still inside the untimed warmup prove: sweep the hybrid split
+            // on this host before the first timed prove can consume it.
+            autotune_hybrid_split(
+                gpu,
+                &run.latched,
+                params.k_code(),
+                params.n_leaves(),
+                &codeword,
+                &cpu_tree,
+            );
             *latch = LatchState::On(run.latched);
         } else {
             release_latched(gpu, run.latched);

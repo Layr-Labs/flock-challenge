@@ -423,11 +423,13 @@ fn commit_with_round1_ab_precompute(
                 inv_table,
                 padding,
             );
+            let wall_ms = t.elapsed().as_secs_f64() * 1e3;
+            // The hybrid-commit warmup sweep sizes its contention emulation
+            // from this arm's measured wall (an Instant read is free; the
+            // store is one relaxed atomic per prove).
+            flock_core::gpu_commit::note_precompute_branch_wall_ms(wall_ms);
             if std::env::var_os("FLOCK_PHASE_TIMING").is_some() {
-                eprintln!(
-                    "[phase-timing] ab-precompute branch wall: {:.2} ms",
-                    t.elapsed().as_secs_f64() * 1e3
-                );
+                eprintln!("[phase-timing] ab-precompute branch wall: {wall_ms:.2} ms");
             }
             r
         },
