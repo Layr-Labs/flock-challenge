@@ -27,8 +27,11 @@ pub mod univariate_skip_deg4_optimized;
 pub mod univariate_skip_optimized;
 
 use multilinear::{
-    UniSkipFoldTable, fold_and_compute_round_pair_into, fold_compact_and_compute_round_pair,
-    fold_in_place_pair, interpolate_at_z_combined, interpolate_at_z_on_lambda, round_pair_naive,
+    UniSkipFoldTable, fold_and_compute_round_pair_interleaved_into,
+    fold_and_compute_round_pair_into, fold_compact_and_compute_round_pair,
+    fold_compact_and_compute_round_pair_interleaved, fold_in_place_pair,
+    fold_in_place_pair_interleaved, interpolate_at_z_combined, interpolate_at_z_on_lambda,
+    round_pair_naive, round_pair_naive_interleaved,
     uni_skip_fold_and_round_pair_compact_padded_with_deltas,
 };
 use univariate_skip_optimized::{
@@ -479,8 +482,32 @@ fn prove_packed_padded_inner<C: Challenger>(
     // post-fold tables expected by all subsequent rounds.
     let mut first_r_next = vec![F128::ONE; n_mlv - 1];
     first_r_next[1..].copy_from_slice(&r[k_skip + 2..]);
-    let (mut a_mlv, mut b_mlv, first_m1, first_mi) =
-        fold_compact_and_compute_round_pair(&compact_mlv, &fold_table, mlv_rhos[0], &first_r_next);
+    // The ranked Apple path keeps A/B adjacent through the large tail folds,
+    // reducing four independent streams to two without changing bytes moved
+    // or arithmetic. Keep a narrow kill switch for exact same-binary control;
+    // the experimental opt-in still exposes the layout to reduced-shape
+    // diagnostics without broadening the production selector.
+    let interleaved_tail = std::env::var_os("FLOCK_NO_ZC_INTERLEAVED_TAIL").is_none()
+        && (std::env::var_os("FLOCK_EXPERIMENTAL_ZC_INTERLEAVED_TAIL")
+            .is_some_and(|value| value == "1")
+            || (cfg!(all(target_os = "macos", target_arch = "aarch64")) && m == 32));
+    let (mut a_mlv, mut b_mlv, mut ab_mlv, first_m1, first_mi) = if interleaved_tail {
+        let (ab, m1, mi) = fold_compact_and_compute_round_pair_interleaved(
+            &compact_mlv,
+            &fold_table,
+            mlv_rhos[0],
+            &first_r_next,
+        );
+        (Vec::new(), Vec::new(), ab, m1, mi)
+    } else {
+        let (a, b, m1, mi) = fold_compact_and_compute_round_pair(
+            &compact_mlv,
+            &fold_table,
+            mlv_rhos[0],
+            &first_r_next,
+        );
+        (a, b, Vec::new(), m1, mi)
+    };
     compact_mlv.recycle();
     multilinear_msgs.push((first_m1, first_mi));
     challenger.observe_f128(first_m1);
@@ -493,14 +520,23 @@ fn prove_packed_padded_inner<C: Challenger>(
     // parallel speedup — a fresh 64 MB buffer per round, we alternate between
     // two persistent buffers. Scratch capacity = N/2 (the largest fused
     // output); only needed when the first round is actually fused.
-    let n_in = a_mlv.len();
-    let (mut a_nxt, mut b_nxt) = if n_in >= 1024 {
-        (
-            crate::scratch::take_f128(n_in / 2),
-            crate::scratch::take_f128(n_in / 2),
-        )
+    let n_in = if interleaved_tail {
+        ab_mlv.len() / 2
     } else {
-        (Vec::new(), Vec::new())
+        a_mlv.len()
+    };
+    let (mut a_nxt, mut b_nxt, mut ab_nxt) = if n_in >= 1024 {
+        if interleaved_tail {
+            (Vec::new(), Vec::new(), crate::scratch::take_f128(n_in))
+        } else {
+            (
+                crate::scratch::take_f128(n_in / 2),
+                crate::scratch::take_f128(n_in / 2),
+                Vec::new(),
+            )
+        }
+    } else {
+        (Vec::new(), Vec::new(), Vec::new())
     };
 
     // H2 engagement evidence: E-core chunks claimed across the loop rounds
@@ -509,7 +545,11 @@ fn prove_packed_padded_inner<C: Challenger>(
     let hetero_claimed_before = crate::epool::helper_chunks_claimed();
     for i in 1..(n_mlv - 1) {
         let rho_prev = mlv_rhos[i];
-        let log_n_before = a_mlv.len().trailing_zeros() as usize;
+        let log_n_before = if interleaved_tail {
+            (ab_mlv.len() / 2).trailing_zeros() as usize
+        } else {
+            a_mlv.len().trailing_zeros() as usize
+        };
 
         // r_next for the next round's message: length log_n_before - 1.
         // r_next[0] = ONE (Convention A factor); r_next[1..] are the eq
@@ -518,27 +558,45 @@ fn prove_packed_padded_inner<C: Challenger>(
         r_next[1..].copy_from_slice(&r[k_skip + i + 2..]);
 
         let (m1, mi) = if log_n_before >= 15 {
-            let half = a_mlv.len() / 2;
-            let (m1, mi) = fold_and_compute_round_pair_into(
-                &a_mlv,
-                &b_mlv,
-                &mut a_nxt[..half],
-                &mut b_nxt[..half],
-                rho_prev,
-                &r_next,
-            );
-            // Swap current <-> scratch, then shrink the new current to the
-            // folded size. The old (larger) buffer becomes scratch; we only
-            // ever write its leading `half` slots next round, so its stale
-            // length is harmless.
-            std::mem::swap(&mut a_mlv, &mut a_nxt);
-            std::mem::swap(&mut b_mlv, &mut b_nxt);
-            a_mlv.truncate(half);
-            b_mlv.truncate(half);
-            (m1, mi)
+            if interleaved_tail {
+                let half_elems = ab_mlv.len() / 2;
+                let msg = fold_and_compute_round_pair_interleaved_into(
+                    &ab_mlv,
+                    &mut ab_nxt[..half_elems],
+                    rho_prev,
+                    &r_next,
+                );
+                std::mem::swap(&mut ab_mlv, &mut ab_nxt);
+                ab_mlv.truncate(half_elems);
+                msg
+            } else {
+                let half = a_mlv.len() / 2;
+                let msg = fold_and_compute_round_pair_into(
+                    &a_mlv,
+                    &b_mlv,
+                    &mut a_nxt[..half],
+                    &mut b_nxt[..half],
+                    rho_prev,
+                    &r_next,
+                );
+                // Swap current <-> scratch, then shrink the new current to the
+                // folded size. The old (larger) buffer becomes scratch; we only
+                // ever write its leading `half` slots next round, so its stale
+                // length is harmless.
+                std::mem::swap(&mut a_mlv, &mut a_nxt);
+                std::mem::swap(&mut b_mlv, &mut b_nxt);
+                a_mlv.truncate(half);
+                b_mlv.truncate(half);
+                msg
+            }
         } else {
-            fold_in_place_pair(&mut a_mlv, &mut b_mlv, rho_prev);
-            round_pair_naive(&a_mlv, &b_mlv, &r_next)
+            if interleaved_tail {
+                fold_in_place_pair_interleaved(&mut ab_mlv, rho_prev);
+                round_pair_naive_interleaved(&ab_mlv, &r_next)
+            } else {
+                fold_in_place_pair(&mut a_mlv, &mut b_mlv, rho_prev);
+                round_pair_naive(&a_mlv, &b_mlv, &r_next)
+            }
         };
 
         multilinear_msgs.push((m1, mi));
@@ -556,12 +614,16 @@ fn prove_packed_padded_inner<C: Challenger>(
 
     // ---- 8. Final binding at ρ_{n_mlv} (the last challenge) ----
     let rho_last = *mlv_rhos.last().expect("at least one ρ sampled");
-    fold_in_place_pair(&mut a_mlv, &mut b_mlv, rho_last);
-    debug_assert_eq!(a_mlv.len(), 1);
-    debug_assert_eq!(b_mlv.len(), 1);
-
-    let final_a_eval = a_mlv[0];
-    let final_b_eval = b_mlv[0];
+    let (final_a_eval, final_b_eval) = if interleaved_tail {
+        fold_in_place_pair_interleaved(&mut ab_mlv, rho_last);
+        debug_assert_eq!(ab_mlv.len(), 2);
+        (ab_mlv[0], ab_mlv[1])
+    } else {
+        fold_in_place_pair(&mut a_mlv, &mut b_mlv, rho_last);
+        debug_assert_eq!(a_mlv.len(), 1);
+        debug_assert_eq!(b_mlv.len(), 1);
+        (a_mlv[0], b_mlv[0])
+    };
 
     // ---- Fiat–Shamir: bind the final â, b̂ claims into the transcript ----
     //
@@ -583,6 +645,8 @@ fn prove_packed_padded_inner<C: Challenger>(
     crate::scratch::give_f128(b_mlv);
     crate::scratch::give_f128(a_nxt);
     crate::scratch::give_f128(b_nxt);
+    crate::scratch::give_f128(ab_mlv);
+    crate::scratch::give_f128(ab_nxt);
 
     if zc_timing {
         eprintln!(

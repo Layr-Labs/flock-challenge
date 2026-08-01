@@ -760,7 +760,7 @@ pub(crate) unsafe fn fold_compact_stream_chunk_neon<const L: usize>(
 /// values, so they are bit-exact by construction.
 #[cfg(target_arch = "aarch64")]
 #[target_feature(enable = "aes")]
-pub(crate) unsafe fn fold_compact_chunk_neon_unchecked_8(
+pub(crate) unsafe fn fold_compact_chunk_neon_unchecked_8<const INTERLEAVED: bool>(
     scaled_table: *const u8,
     anchors: *const F128,
     deltas: *const u8,
@@ -792,6 +792,30 @@ pub(crate) unsafe fn fold_compact_chunk_neon_unchecked_8(
 
         let one_q = core::mem::transmute::<F128, uint64x2_t>(F128::ONE);
 
+        #[inline(always)]
+        unsafe fn store_outputs<const INTERLEAVED: bool>(
+            a_out: *mut F128,
+            b_out: *mut F128,
+            out: usize,
+            a0: uint64x2_t,
+            a1: uint64x2_t,
+            b0: uint64x2_t,
+            b1: uint64x2_t,
+        ) {
+            unsafe {
+                if INTERLEAVED {
+                    // One AoS stream: [a0,b0,a1,b1,...].  `b_out` aliases
+                    // `a_out` in this specialization and is intentionally not
+                    // addressed.
+                    store_pair_nt(a_out.add(2 * out), a0, b0);
+                    store_pair_nt(a_out.add(2 * out + 2), a1, b1);
+                } else {
+                    store_pair_nt(a_out.add(out), a0, a1);
+                    store_pair_nt(b_out.add(out), b0, b1);
+                }
+            }
+        }
+
         for x_lo in 0..lo_size {
             let out = 2 * x_lo;
             let delta = deltas.add(out * 16);
@@ -811,8 +835,7 @@ pub(crate) unsafe fn fold_compact_chunk_neon_unchecked_8(
                 let b0 = vld1q_u64(anchors.add(2 * out + 1).cast::<u64>());
                 let b1 = vld1q_u64(anchors.add(2 * (out + 1) + 1).cast::<u64>());
 
-                store_pair_nt(a_out.add(out), a0, a1);
-                store_pair_nt(b_out.add(out), b0, b1);
+                store_outputs::<INTERLEAVED>(a_out, b_out, out, a0, a1, b0, b1);
 
                 let eq_l = vld1q_u64(eq_lo.add(x_lo).cast::<u64>());
                 let g1 = if is_zero_q(veorq_u64(b1, one_q)) {
@@ -853,8 +876,7 @@ pub(crate) unsafe fn fold_compact_chunk_neon_unchecked_8(
                 b1_delta,
             );
 
-            store_pair_nt(a_out.add(out), a0, a1);
-            store_pair_nt(b_out.add(out), b0, b1);
+            store_outputs::<INTERLEAVED>(a_out, b_out, out, a0, a1, b0, b1);
 
             let g1 = mul_q(a1, b1);
             let g_inf = mul_q(veorq_u64(a0, a1), veorq_u64(b0, b1));
@@ -951,6 +973,123 @@ pub(crate) fn fold_and_message_aarch64(
     } else {
         fold_and_message_body::<false>(a_in, b_in, a_out, b_out, r_fold, eq_lo)
     }
+}
+
+/// AoS-layout sibling of [`fold_and_message_aarch64`]. Input and output rows
+/// are `[a0, b0, a1, b1, ...]`, keeping the two claims in one sequential
+/// stream through the large Zerocheck tail rounds.
+#[cfg(target_arch = "aarch64")]
+pub(crate) fn fold_and_message_interleaved_aarch64(
+    ab_in: &[F128],
+    ab_out: &mut [F128],
+    r_fold: F128,
+    eq_lo: &[F128],
+    nt_stores: bool,
+) -> (F128, F128) {
+    if nt_stores {
+        fold_and_message_interleaved_body::<true>(ab_in, ab_out, r_fold, eq_lo)
+    } else {
+        fold_and_message_interleaved_body::<false>(ab_in, ab_out, r_fold, eq_lo)
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+fn fold_and_message_interleaved_body<const NT: bool>(
+    ab_in: &[F128],
+    ab_out: &mut [F128],
+    r_fold: F128,
+    eq_lo: &[F128],
+) -> (F128, F128) {
+    use core::arch::aarch64::uint64x2_t;
+
+    assert_eq!(ab_in.len(), 2 * ab_out.len());
+    assert_eq!(ab_out.len(), 4 * eq_lo.len());
+
+    #[inline(always)]
+    unsafe fn store_pair_nt(dst: *mut F128, x: uint64x2_t, y: uint64x2_t) {
+        unsafe {
+            core::arch::asm!(
+                "stnp {x:q}, {y:q}, [{dst}]",
+                dst = in(reg) dst,
+                x = in(vreg) x,
+                y = in(vreg) y,
+                options(nostack, preserves_flags),
+            );
+        }
+    }
+
+    let mut p1_acc = F256Unreduced::ZERO;
+    let mut pinf_acc = F256Unreduced::ZERO;
+    let in_ptr = ab_in.as_ptr();
+    let out_ptr = ab_out.as_mut_ptr();
+    let eq_ptr = eq_lo.as_ptr();
+
+    for x_lo in 0..eq_lo.len() {
+        // Four input rows and two output rows, with A/B adjacent per row.
+        let i = 8 * x_lo;
+        let o = 4 * x_lo;
+        // SAFETY: the entry assertions establish `ab_in.len() == 8 *
+        // eq_lo.len()` and `ab_out.len() == 4 * eq_lo.len()`. Every pointer
+        // below therefore stays within its slice, and each iteration writes
+        // four disjoint initialized output elements.
+        let (
+            a_even_0,
+            b_even_0,
+            a_odd_0,
+            b_odd_0,
+            a_even_1,
+            b_even_1,
+            a_odd_1,
+            b_odd_1,
+            eq_l,
+        ) = unsafe {
+            (
+                *in_ptr.add(i),
+                *in_ptr.add(i + 1),
+                *in_ptr.add(i + 2),
+                *in_ptr.add(i + 3),
+                *in_ptr.add(i + 4),
+                *in_ptr.add(i + 5),
+                *in_ptr.add(i + 6),
+                *in_ptr.add(i + 7),
+                *eq_ptr.add(x_lo),
+            )
+        };
+
+        let a0 = a_even_0 + r_fold * (a_even_0 + a_odd_0);
+        let b0 = b_even_0 + r_fold * (b_even_0 + b_odd_0);
+        let a1 = a_even_1 + r_fold * (a_even_1 + a_odd_1);
+        let b1 = b_even_1 + r_fold * (b_even_1 + b_odd_1);
+
+        if NT {
+            // Two adjacent 32-byte pair stores form one AoS output stream.
+            unsafe {
+                store_pair_nt(
+                    out_ptr.add(o),
+                    core::mem::transmute::<F128, uint64x2_t>(a0),
+                    core::mem::transmute::<F128, uint64x2_t>(b0),
+                );
+                store_pair_nt(
+                    out_ptr.add(o + 2),
+                    core::mem::transmute::<F128, uint64x2_t>(a1),
+                    core::mem::transmute::<F128, uint64x2_t>(b1),
+                );
+            }
+        } else {
+            unsafe {
+                out_ptr.add(o).write(a0);
+                out_ptr.add(o + 1).write(b0);
+                out_ptr.add(o + 2).write(a1);
+                out_ptr.add(o + 3).write(b1);
+            }
+        }
+
+        p1_acc ^= eq_l.mul_unreduced(a1 * b1);
+        pinf_acc ^= eq_l.mul_unreduced((a0 + a1) * (b0 + b1));
+    }
+
+    (p1_acc.reduce(), pinf_acc.reduce())
 }
 
 #[inline(always)]
