@@ -461,6 +461,10 @@ fn prove_packed_padded_inner<C: Challenger>(
         (Vec::new(), Vec::new())
     };
 
+    // H2 engagement evidence: E-core chunks claimed across the loop rounds
+    // (T3's hetero drain is already behind us, so the delta is loop-only).
+    let hetero_trace = std::env::var_os("FLOCK_ZC_TAIL_HETERO_TRACE").is_some();
+    let hetero_claimed_before = crate::epool::helper_chunks_claimed();
     for i in 1..(n_mlv - 1) {
         let rho_prev = mlv_rhos[i];
         let log_n_before = a_mlv.len().trailing_zeros() as usize;
@@ -499,6 +503,13 @@ fn prove_packed_padded_inner<C: Challenger>(
         challenger.observe_f128(m1);
         challenger.observe_f128(mi);
         mlv_rhos.push(challenger.sample_f128());
+    }
+
+    if hetero_trace {
+        eprintln!(
+            "[zc-tail] hetero loop rounds: {} chunks claimed by E-cores",
+            crate::epool::helper_chunks_claimed() - hetero_claimed_before
+        );
     }
 
     // ---- 8. Final binding at ρ_{n_mlv} (the last challenge) ----

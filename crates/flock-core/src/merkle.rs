@@ -335,8 +335,18 @@ fn blake3_hash_many<const N: usize>(
         // holds a valid reference rather than uninitialized memory.
         let first: &[u8; N] = msgs[..N].try_into().unwrap();
         let mut inputs: [&[u8; N]; BLAKE3_BATCH] = [first; BLAKE3_BATCH];
-        for (i, slot) in inputs[..n].iter_mut().enumerate() {
-            *slot = msgs[i * N..(i + 1) * N].try_into().unwrap();
+        // Scalar pointer-bump fill. The `black_box` keeps LLVM from
+        // vectorizing this loop into a `<2 x i64>` induction whose pooled
+        // start constant this toolchain once emitted as a *different
+        // function's* literal (LLVM constant-pool symbol collision), feeding
+        // garbage pointers to `hash_many` — see notes/merkle-oob.md.
+        let mut p: *const u8 = msgs.as_ptr();
+        for slot in inputs[..n].iter_mut() {
+            // SAFETY: `msgs` is exactly `n * N` bytes (`data` is chunked in
+            // step with `out` and `data.len() == out.len() * N`), so `p`
+            // addresses a full `N`-byte message for every slot.
+            *slot = unsafe { &*core::hint::black_box(p).cast::<[u8; N]>() };
+            p = p.wrapping_add(N);
         }
         // SAFETY: `Hash` is `[u8; 32]`, so `outs` is exactly `n * 32` bytes of
         // initialized, contiguous, unpadded storage — the amount `hash_many`
