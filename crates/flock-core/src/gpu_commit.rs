@@ -246,6 +246,33 @@ pub(crate) fn give_tree(tree: Vec<crate::merkle::Hash>) {
 static PRECOMPUTE_BRANCH_WALL_MS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
+/// Maximum untimed-warmup delay allowed while handing the concurrently
+/// measured AB-branch wall to the hybrid split sweep. The wait is outside
+/// every scored prove and prevents the sweep from silently substituting its
+/// 100 ms fallback when the commit arm reaches tuning just before the sibling
+/// `rayon::join` arm publishes its measurement.
+const PRECOMPUTE_WALL_HANDOFF_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_secs(2);
+
+fn wait_for_nonzero_wall_ms(
+    wall_bits: &std::sync::atomic::AtomicU64,
+    timeout: std::time::Duration,
+) -> f64 {
+    let start = std::time::Instant::now();
+    loop {
+        let wall = f64::from_bits(wall_bits.load(std::sync::atomic::Ordering::Relaxed));
+        if wall.is_finite() && wall > 0.0 {
+            return wall;
+        }
+        if start.elapsed() >= timeout {
+            return 0.0;
+        }
+        // This runs only in the untimed warmup. Yield instead of burning the
+        // current OS time slice while the sibling AB precompute publishes.
+        std::thread::yield_now();
+    }
+}
+
 /// Record the measured precompute branch wall for this process (called by
 /// the prover; last writer wins, which is the most recent prove).
 pub fn note_precompute_branch_wall_ms(ms: f64) {
@@ -256,8 +283,11 @@ pub fn note_precompute_branch_wall_ms(ms: f64) {
     not(all(target_os = "macos", target_arch = "aarch64")),
     allow(dead_code)
 )]
-pub(crate) fn precompute_branch_wall_ms() -> f64 {
-    f64::from_bits(PRECOMPUTE_BRANCH_WALL_MS.load(std::sync::atomic::Ordering::Relaxed))
+fn wait_for_precompute_branch_wall_ms() -> f64 {
+    wait_for_nonzero_wall_ms(
+        &PRECOMPUTE_BRANCH_WALL_MS,
+        PRECOMPUTE_WALL_HANDOFF_TIMEOUT,
+    )
 }
 
 /// Returns true when the GPU commit machinery is allowed to initialize.
@@ -2700,7 +2730,11 @@ kernel void parent_hash(device const uint* children [[buffer(0)]],
         // precompute branch wall. The only wall available at sweep time is
         // the warmup prove's own, which is first-prove-inflated (cold
         // tables/pages; measured ~2x locally), so scale by 0.6 and cap.
-        let pre_wall = super::precompute_branch_wall_ms();
+        // Wait for the sibling warmup branch to publish its actual wall. An
+        // immediate relaxed load can race the store at the end of the outer
+        // `rayon::join`, silently replacing the host measurement with 100 ms
+        // and tuning every scored prove against synthetic contention.
+        let pre_wall = super::wait_for_precompute_branch_wall_ms();
         let burn_ms = if pre_wall > 0.0 {
             (pre_wall * 0.6).min(250.0)
         } else {
@@ -3414,6 +3448,26 @@ pub(crate) use imp::{gpu_merkle_tree_blake3, gpu_ntt_interleaved_from_layer};
 mod tests {
     use super::*;
     use crate::field::F128;
+
+    #[test]
+    fn precompute_wall_handoff_observes_late_store() {
+        let wall_bits = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let writer = wall_bits.clone();
+        let handle = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+            writer.store(137.25f64.to_bits(), std::sync::atomic::Ordering::Relaxed);
+        });
+        let got = wait_for_nonzero_wall_ms(&wall_bits, std::time::Duration::from_millis(250));
+        handle.join().unwrap();
+        assert_eq!(got, 137.25);
+    }
+
+    #[test]
+    fn precompute_wall_handoff_times_out_to_fallback_sentinel() {
+        let wall_bits = std::sync::atomic::AtomicU64::new(0);
+        let got = wait_for_nonzero_wall_ms(&wall_bits, std::time::Duration::from_millis(1));
+        assert_eq!(got, 0.0);
+    }
 
     struct Rng(u64);
     impl Rng {
