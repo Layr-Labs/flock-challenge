@@ -1,4 +1,88 @@
 use super::super::{F8, F128, InvNttTableByteSingleGf8, N_CHUNKS};
+use core::arch::aarch64::{uint64x2_t, veorq_u64, vextq_u64, vgetq_lane_u64, vmull_p64};
+use core::mem::transmute;
+
+#[derive(Clone, Copy)]
+struct WideProduct {
+    lo: uint64x2_t,
+    hi: uint64x2_t,
+}
+
+/// Persistent unreduced AB products for one Fold4 high-coordinate job.
+pub(crate) struct WideAbAccumulator {
+    lo: [F128; 64],
+    hi: [F128; 64],
+}
+
+impl WideAbAccumulator {
+    #[inline]
+    pub(crate) fn zero() -> Self {
+        Self {
+            lo: [F128::ZERO; 64],
+            hi: [F128::ZERO; 64],
+        }
+    }
+}
+
+#[inline]
+#[target_feature(enable = "aes")]
+unsafe fn pmull_u64(a: u64, b: u64) -> uint64x2_t {
+    unsafe { transmute::<u128, uint64x2_t>(vmull_p64(a, b)) }
+}
+
+#[inline(always)]
+unsafe fn mul_unreduced(a: uint64x2_t, b: uint64x2_t) -> WideProduct {
+    unsafe {
+        let ll = pmull_u64(vgetq_lane_u64::<0>(a), vgetq_lane_u64::<0>(b));
+        let hh = pmull_u64(vgetq_lane_u64::<1>(a), vgetq_lane_u64::<1>(b));
+        let a_mid = veorq_u64(a, vextq_u64::<1>(a, a));
+        let b_mid = veorq_u64(b, vextq_u64::<1>(b, b));
+        let middle = pmull_u64(
+            vgetq_lane_u64::<0>(a_mid),
+            vgetq_lane_u64::<0>(b_mid),
+        );
+        let cross = xor3_u64(middle, ll, hh);
+        let zero = core::arch::aarch64::vdupq_n_u64(0);
+        WideProduct {
+            lo: veorq_u64(ll, vextq_u64::<1>(zero, cross)),
+            hi: veorq_u64(hh, vextq_u64::<1>(cross, zero)),
+        }
+    }
+}
+
+#[inline(always)]
+unsafe fn reduce_wide(value: WideProduct) -> uint64x2_t {
+    use core::arch::aarch64::*;
+    unsafe {
+        let zero = vdupq_n_u64(0);
+        let high = value.hi;
+        let shift1 = veorq_u64(
+            vshlq_n_u64::<1>(high),
+            vextq_u64::<1>(zero, vshrq_n_u64::<63>(high)),
+        );
+        let shift2 = veorq_u64(
+            vshlq_n_u64::<2>(high),
+            vextq_u64::<1>(zero, vshrq_n_u64::<62>(high)),
+        );
+        let shift7 = veorq_u64(
+            vshlq_n_u64::<7>(high),
+            vextq_u64::<1>(zero, vshrq_n_u64::<57>(high)),
+        );
+        let folded = xor3_u64(high, shift1, veorq_u64(shift2, shift7));
+        let high_word = vextq_u64::<1>(high, zero);
+        let overflow = xor3_u64(
+            vshrq_n_u64::<63>(high_word),
+            vshrq_n_u64::<62>(high_word),
+            vshrq_n_u64::<57>(high_word),
+        );
+        let correction = xor3_u64(
+            overflow,
+            vshlq_n_u64::<1>(overflow),
+            veorq_u64(vshlq_n_u64::<2>(overflow), vshlq_n_u64::<7>(overflow)),
+        );
+        xor3_u64(value.lo, folded, correction)
+    }
+}
 
 /// Four-lane convert-table fold.
 ///
@@ -229,6 +313,107 @@ pub(crate) unsafe fn accumulate_convert_ab(
             drain_lane!(1, ab1);
             drain_lane!(2, ab2);
             drain_lane!(3, ab3);
+        }
+    }
+}
+
+/// Fold4 AB gather with reductions deferred across the complete low band.
+#[inline(always)]
+pub(crate) unsafe fn accumulate_convert_ab_wide(
+    chunk_ab_bytes: &[[u8; 64]; 16],
+    n_b_med: usize,
+    convert: &[F128],
+    eq_lo_val: F128,
+    partial_ab: &mut WideAbAccumulator,
+) {
+    use core::arch::aarch64::*;
+
+    debug_assert!(n_b_med <= 16);
+    debug_assert_eq!(convert.len(), 16 * 256);
+
+    unsafe {
+        let convert_ptr = convert.as_ptr() as *const u8;
+        let n_pairs = n_b_med / 2;
+        let eq = vreinterpretq_u64_u8(vld1q_u8((&eq_lo_val as *const F128).cast::<u8>()));
+        for lane in (0..64).step_by(4) {
+            let mut ab0 = vdupq_n_u8(0);
+            let mut ab1 = vdupq_n_u8(0);
+            let mut ab2 = vdupq_n_u8(0);
+            let mut ab3 = vdupq_n_u8(0);
+
+            for p in 0..n_pairs {
+                let (b_even, b_odd) = (2 * p, 2 * p + 1);
+                let t_even = convert_ptr.add(b_even * 256 * 16);
+                let t_odd = convert_ptr.add(b_odd * 256 * 16);
+                let we = (chunk_ab_bytes[b_even].as_ptr().add(lane) as *const u32)
+                    .read_unaligned() as usize;
+                let wo = (chunk_ab_bytes[b_odd].as_ptr().add(lane) as *const u32)
+                    .read_unaligned() as usize;
+                ab0 = xor3_u8(
+                    ab0,
+                    vld1q_u8(t_even.add((we & 0xff) * 16)),
+                    vld1q_u8(t_odd.add((wo & 0xff) * 16)),
+                );
+                ab1 = xor3_u8(
+                    ab1,
+                    vld1q_u8(t_even.add(((we >> 8) & 0xff) * 16)),
+                    vld1q_u8(t_odd.add(((wo >> 8) & 0xff) * 16)),
+                );
+                ab2 = xor3_u8(
+                    ab2,
+                    vld1q_u8(t_even.add(((we >> 16) & 0xff) * 16)),
+                    vld1q_u8(t_odd.add(((wo >> 16) & 0xff) * 16)),
+                );
+                ab3 = xor3_u8(
+                    ab3,
+                    vld1q_u8(t_even.add((we >> 24) * 16)),
+                    vld1q_u8(t_odd.add((wo >> 24) * 16)),
+                );
+            }
+
+            if n_b_med & 1 == 1 {
+                let b_med = n_b_med - 1;
+                let table = convert_ptr.add(b_med * 256 * 16);
+                let wa = (chunk_ab_bytes[b_med].as_ptr().add(lane) as *const u32)
+                    .read_unaligned() as usize;
+                ab0 = veorq_u8(ab0, vld1q_u8(table.add((wa & 0xff) * 16)));
+                ab1 = veorq_u8(ab1, vld1q_u8(table.add(((wa >> 8) & 0xff) * 16)));
+                ab2 = veorq_u8(ab2, vld1q_u8(table.add(((wa >> 16) & 0xff) * 16)));
+                ab3 = veorq_u8(ab3, vld1q_u8(table.add((wa >> 24) * 16)));
+            }
+
+            let gathered = [ab0, ab1, ab2, ab3];
+            for offset in 0..4 {
+                let product = mul_unreduced(vreinterpretq_u64_u8(gathered[offset]), eq);
+                let old_lo = vld1q_u64(partial_ab.lo.as_ptr().add(lane + offset).cast::<u64>());
+                let old_hi = vld1q_u64(partial_ab.hi.as_ptr().add(lane + offset).cast::<u64>());
+                vst1q_u64(
+                    partial_ab.lo.as_mut_ptr().add(lane + offset).cast::<u64>(),
+                    veorq_u64(old_lo, product.lo),
+                );
+                vst1q_u64(
+                    partial_ab.hi.as_mut_ptr().add(lane + offset).cast::<u64>(),
+                    veorq_u64(old_hi, product.hi),
+                );
+            }
+        }
+    }
+}
+
+/// Reduce one complete Fold4 AB band and apply its high-coordinate weight.
+#[inline]
+pub(crate) unsafe fn finish_convert_ab_wide(
+    partial_ab: &WideAbAccumulator,
+    eq_hi_val: F128,
+    out: &mut [F128; 64],
+) {
+    use core::arch::aarch64::*;
+    unsafe {
+        for lane in 0..64 {
+            let lo = vld1q_u64(partial_ab.lo.as_ptr().add(lane).cast::<u64>());
+            let hi = vld1q_u64(partial_ab.hi.as_ptr().add(lane).cast::<u64>());
+            let reduced = transmute::<uint64x2_t, F128>(reduce_wide(WideProduct { lo, hi }));
+            out[lane] = reduced * eq_hi_val;
         }
     }
 }

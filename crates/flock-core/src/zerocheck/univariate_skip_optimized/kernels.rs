@@ -18,6 +18,8 @@ pub(super) mod aarch64;
 
 #[cfg(target_arch = "aarch64")]
 pub(super) use aarch64::StaticBContext;
+#[cfg(target_arch = "aarch64")]
+pub(super) use aarch64::WideAbAccumulator;
 
 #[cfg(not(target_arch = "aarch64"))]
 #[derive(Clone, Copy)]
@@ -484,6 +486,40 @@ pub(super) fn accumulate_convert_ab(
         )
     )))]
     portable::accumulate_convert_ab(chunk_ab_bytes, n_b_med, convert, eq_lo_val, partial_ab);
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline]
+pub(super) fn accumulate_convert_ab_wide(
+    chunk_ab_bytes: &[[u8; 64]; 16],
+    n_b_med: usize,
+    convert: &[super::F128],
+    eq_lo_val: super::F128,
+    partial_ab: &mut WideAbAccumulator,
+) {
+    // SAFETY: AArch64 supplies NEON; PMULL is carried by the leaf helper's
+    // target-feature contract. Fixed arrays cover every selected load.
+    unsafe {
+        aarch64::accumulate_convert_ab_wide(
+            chunk_ab_bytes,
+            n_b_med,
+            convert,
+            eq_lo_val,
+            partial_ab,
+        );
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline]
+pub(super) fn finish_convert_ab_wide(
+    partial_ab: &WideAbAccumulator,
+    eq_hi_val: super::F128,
+    out: &mut [super::F128; 64],
+) {
+    // SAFETY: all accumulator lanes were initialized and updated as exact
+    // unreduced field products by the paired entry point above.
+    unsafe { aarch64::finish_convert_ab_wide(partial_ab, eq_hi_val, out) }
 }
 
 /// Portable reference for [`accumulate_c_banks`], and the shape the aarch64

@@ -1287,6 +1287,47 @@ fn process_one_x_hi_with_precomputed_ab_fold4_ab(
 
     let n_lo = n_lo_and_inner - N_INNER;
 
+    #[cfg(target_arch = "aarch64")]
+    {
+        static WIDE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if *WIDE.get_or_init(|| std::env::var_os("FLOCK_NO_FOLD4_AB_WIDE").is_none()) {
+            let t_ab = timing_cpu_ns.map(|_| std::time::Instant::now());
+            let mut wide = kernels::WideAbAccumulator::zero();
+            for x_outer_lo in 0..big_lo_size {
+                let x_outer = x_outer_lo | (x_hi << n_lo);
+                let n_b_med = b_med_counts[x_outer & within_outer_mask] as usize;
+                if n_b_med == 0 {
+                    continue;
+                }
+                let chunk_byte_base =
+                    ((x_outer_lo << N_INNER) | (x_hi << n_lo_and_inner)) * N_CHUNKS;
+                kernels::accumulate_convert_ab_wide(
+                    precomputed_ab_rows(ab_inner, chunk_byte_base),
+                    n_b_med,
+                    convert,
+                    eq_lo_scaled[x_outer_lo],
+                    &mut wide,
+                );
+            }
+            if let (Some(totals), Some(start)) = (timing_cpu_ns, t_ab) {
+                totals[0].fetch_add(
+                    start.elapsed().as_nanos() as u64,
+                    std::sync::atomic::Ordering::Relaxed,
+                );
+            }
+
+            let t_high = timing_cpu_ns.map(|_| std::time::Instant::now());
+            kernels::finish_convert_ab_wide(&wide, eq_hi_val, partial_ab);
+            if let (Some(totals), Some(start)) = (timing_cpu_ns, t_high) {
+                totals[2].fetch_add(
+                    start.elapsed().as_nanos() as u64,
+                    std::sync::atomic::Ordering::Relaxed,
+                );
+            }
+            return;
+        }
+    }
+
     // Ranked AB policy: its 64 KiB table stays resident for the complete band.
     let t_ab = timing_cpu_ns.map(|_| std::time::Instant::now());
     for x_outer_lo in 0..big_lo_size {
