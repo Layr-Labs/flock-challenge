@@ -1712,6 +1712,11 @@ kernel void parent_hash(device const uint* children [[buffer(0)]],
     }
 
     /// CPU share of the hybrid commit in sixteenths of the position range.
+    /// Retuned to 4 after the cache-resident suffix schedule landed: the
+    /// balance sweep on that driver bottoms at k=4–5 (commit min 84.3/83.4 ms
+    /// vs 92.2 at the previous default k=2; sharp unified-memory cliff at
+    /// k=6: 99.7). k=4 sits one step inside the cliff for robustness to the
+    /// ranked box's GPU:CPU ratio.
     /// 0 disables (pure-GPU graph). Default 2: measured best on-box (k=2
     /// commit p25 101.1 ms vs pure-GPU 108.8; k≥3 loses — the plain-pass
     /// suffix driver costs ~2.8× the tuned full-CPU path per sixteenth, and
@@ -1728,7 +1733,7 @@ kernel void parent_hash(device const uint* children [[buffer(0)]],
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .filter(|k| *k < 16)
-                .unwrap_or(2)
+                .unwrap_or(4)
         })
     }
 
