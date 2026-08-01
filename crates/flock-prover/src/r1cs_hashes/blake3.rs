@@ -1683,6 +1683,39 @@ fn generate_witness_with_ab_packed_and_lincheck_impl(
     }
 }
 
+fn generate_witness_with_ab_packed_and_lincheck_streamed(
+    blocks: &[Compression],
+    n_blocks_log: usize,
+    pcs_params: &PcsParams,
+) -> (
+    Vec<F128>,
+    Vec<F128>,
+    Vec<F128>,
+    Vec<u8>,
+    Option<flock_core::gpu_commit::FromZFirstPassStream>,
+) {
+    let padding: Compression = ([0u32; 8], [0u32; 16], 0u64, 0u32, 0u32);
+    let stripe_useful_bits = if std::env::var_os("FLOCK_FULL_STRIPE").is_some() {
+        K
+    } else {
+        USEFUL_BITS
+    };
+    let per_block =
+        |block: &Compression, z_u64: &mut [u64], a_u64: &mut [u64], b_u64: &mut [u64]| {
+            let (cv, m, t, bl, fl) = block;
+            build_block_witness_ab_stream_into(cv, m, *t, *bl, *fl, z_u64, a_u64, b_u64);
+        };
+    super::common::drive_witness_packed_and_lincheck_full_write_streamed(
+        blocks,
+        &padding,
+        n_blocks_log,
+        K_LOG,
+        stripe_useful_bits,
+        pcs_params,
+        per_block,
+    )
+}
+
 // ---------------------------------------------------------------------------
 // Convenience API: Blake3Setup
 // ---------------------------------------------------------------------------
@@ -1951,8 +1984,17 @@ impl Blake3Setup {
                 let codeword = flock_core::scratch::take_f128(self.pcs_params.codeword_len_f128());
                 let cpu_wit = phase_timing.then(crate::prover::process_cpu_ms);
                 let t_wit = std::time::Instant::now();
-                let (z_packed, a_packed_f128, b_packed_f128, z_packed_lincheck) =
-                    self.generate_witness_ab(blocks);
+                let (
+                    z_packed,
+                    a_packed_f128,
+                    b_packed_f128,
+                    z_packed_lincheck,
+                    gpu_first_pass,
+                ) = generate_witness_with_ab_packed_and_lincheck_streamed(
+                    blocks,
+                    self.n_blocks_log(),
+                    &self.pcs_params,
+                );
                 if phase_timing {
                     let wall = t_wit.elapsed().as_secs_f64() * 1e3;
                     let cpu = crate::prover::process_cpu_ms() - cpu_wit.unwrap_or(0.0);
@@ -1962,6 +2004,20 @@ impl Blake3Setup {
                     );
                 }
                 let lc_circuit = self.lincheck_circuit();
+                if let Some(stream) = gpu_first_pass {
+                    return crate::prover::prove_fast_ligerito_from_streamed_first_pass(
+                        &self.r1cs,
+                        &self.pcs_params,
+                        z_packed,
+                        a_packed_f128,
+                        b_packed_f128,
+                        z_packed_lincheck,
+                        lc_circuit,
+                        codeword,
+                        stream,
+                        challenger,
+                    );
+                }
                 return crate::prover::prove_fast_ligerito_from_witness(
                     &self.r1cs,
                     &self.pcs_params,

@@ -224,15 +224,18 @@ pub(crate) fn drive_witness_packed_and_lincheck<S: Sync, F>(
 where
     F: Fn(&S, &mut [u64], &mut [u64], &mut [u64]) + Sync,
 {
-    drive_witness_packed_and_lincheck_impl::<false, false, S, F>(
+    let (z, a, b, stripe, stream) = drive_witness_packed_and_lincheck_impl::<false, false, S, F>(
         initial_states,
         padding,
         n_blocks_log,
         k_log,
         1usize << k_log,
         None,
+        None,
         per_block,
-    )
+    );
+    debug_assert!(stream.is_none());
+    (z, a, b, stripe)
 }
 
 /// Full-write variant of [`drive_witness_packed_and_lincheck`]. It skips the
@@ -251,6 +254,41 @@ pub(crate) fn drive_witness_packed_and_lincheck_full_write<S: Sync, F>(
 where
     F: Fn(&S, &mut [u64], &mut [u64], &mut [u64]) + Sync,
 {
+    let (z, a, b, stripe, stream) = drive_witness_packed_and_lincheck_impl::<true, false, S, F>(
+        initial_states,
+        Some(padding),
+        n_blocks_log,
+        k_log,
+        useful_bits,
+        None,
+        None,
+        per_block,
+    );
+    debug_assert!(stream.is_none());
+    (z, a, b, stripe)
+}
+
+/// Ranked full-write witness driver that publishes eight coarse readiness
+/// bands to the latched Metal from-`z` pass. Returns `None` for the stream on
+/// warmup/non-Metal/fallback paths while preserving identical witness output.
+pub(crate) fn drive_witness_packed_and_lincheck_full_write_streamed<S: Sync, F>(
+    initial_states: &[S],
+    padding: &S,
+    n_blocks_log: usize,
+    k_log: usize,
+    useful_bits: usize,
+    pcs_params: &flock_core::pcs::PcsParams,
+    per_block: F,
+) -> (
+    Vec<F128>,
+    Vec<F128>,
+    Vec<F128>,
+    Vec<u8>,
+    Option<flock_core::gpu_commit::FromZFirstPassStream>,
+)
+where
+    F: Fn(&S, &mut [u64], &mut [u64], &mut [u64]) + Sync,
+{
     drive_witness_packed_and_lincheck_impl::<true, false, S, F>(
         initial_states,
         Some(padding),
@@ -258,6 +296,7 @@ where
         k_log,
         useful_bits,
         None,
+        Some(pcs_params),
         per_block,
     )
 }
@@ -274,6 +313,18 @@ impl Rate2CodewordPtr {
     fn get(self) -> *mut F128 {
         self.0
     }
+}
+
+#[inline(always)]
+fn ranked_stream_group_index(
+    job: usize,
+    band: usize,
+    groups_per_segment: usize,
+    groups_per_band: usize,
+) -> usize {
+    let segment = job / groups_per_band;
+    let local = job % groups_per_band;
+    segment * groups_per_segment + band * groups_per_band + local
 }
 
 /// Full-write row-major witness driver that also emits the exact rate-1/2
@@ -295,15 +346,18 @@ pub(crate) fn drive_witness_packed_and_lincheck_full_write_with_rate2_codeword<S
 where
     F: Fn(&S, &mut [u64], &mut [u64], &mut [u64]) + Sync,
 {
-    drive_witness_packed_and_lincheck_impl::<true, true, S, F>(
+    let (z, a, b, stripe, stream) = drive_witness_packed_and_lincheck_impl::<true, true, S, F>(
         initial_states,
         Some(padding),
         n_blocks_log,
         k_log,
         useful_bits,
         Some(codeword),
+        None,
         per_block,
-    )
+    );
+    debug_assert!(stream.is_none());
+    (z, a, b, stripe)
 }
 
 fn drive_witness_packed_and_lincheck_impl<
@@ -318,8 +372,15 @@ fn drive_witness_packed_and_lincheck_impl<
     k_log: usize,
     stripe_useful_bits: usize,
     rate2_codeword: Option<&mut [F128]>,
+    stream_params: Option<&flock_core::pcs::PcsParams>,
     per_block: F,
-) -> (Vec<F128>, Vec<F128>, Vec<F128>, Vec<u8>)
+) -> (
+    Vec<F128>,
+    Vec<F128>,
+    Vec<F128>,
+    Vec<u8>,
+    Option<flock_core::gpu_commit::FromZFirstPassStream>,
+)
 where
     F: Fn(&S, &mut [u64], &mut [u64], &mut [u64]) + Sync,
 {
@@ -370,13 +431,70 @@ where
     let mut b = flock_core::scratch::take_f128(total_f128);
     let mut z_lincheck = flock_core::scratch::take_u8((n_total / 8) * k);
 
-    z.par_chunks_mut(8 * f128_per_block)
-        .zip(a.par_chunks_mut(8 * f128_per_block))
-        .zip(b.par_chunks_mut(8 * f128_per_block))
-        .zip(z_lincheck.par_chunks_mut(k))
-        .with_max_len(256)
-        .enumerate()
-        .for_each(|(g, (((z_grp, a_grp), b_grp), stripe))| {
+    let mut stream = stream_params.and_then(|params| {
+        // SAFETY: z's allocation/address stays fixed until the returned stream
+        // is consumed by commit. No range is submitted until all eight source
+        // segments for it have been fully initialized below.
+        unsafe {
+            flock_core::gpu_commit::begin_from_z_first_pass_stream(
+                z.as_mut_ptr(),
+                z.len(),
+                params,
+            )
+        }
+    });
+    // The range-to-witness mapping below is the ranked BLAKE3 geometry:
+    // 2^18 blocks × 2^14 bits, grouped by eight blocks, with eight from-z
+    // source segments. A mismatched caller simply retains the ordinary loop.
+    if stream.is_some() && (n_total != 1 << 18 || k_log != 14 || EMIT_RATE2_CODEWORD) {
+        stream = None;
+    }
+
+    #[derive(Clone, Copy)]
+    struct F128WritePtr(*mut F128);
+    unsafe impl Send for F128WritePtr {}
+    unsafe impl Sync for F128WritePtr {}
+    impl F128WritePtr {
+        fn get(self) -> *mut F128 {
+            self.0
+        }
+    }
+    #[derive(Clone, Copy)]
+    struct U8WritePtr(*mut u8);
+    unsafe impl Send for U8WritePtr {}
+    unsafe impl Sync for U8WritePtr {}
+    impl U8WritePtr {
+        fn get(self) -> *mut u8 {
+            self.0
+        }
+    }
+
+    let group_f128 = 8 * f128_per_block;
+    let z_base = F128WritePtr(z.as_mut_ptr());
+    let a_base = F128WritePtr(a.as_mut_ptr());
+    let b_base = F128WritePtr(b.as_mut_ptr());
+    let stripe_base = U8WritePtr(z_lincheck.as_mut_ptr());
+
+    let process_group = |g: usize| {
+            // SAFETY: each scheduled group index occurs exactly once. Every
+            // group owns disjoint z/a/b ranges and one disjoint stripe.
+            let (z_grp, a_grp, b_grp, stripe) = unsafe {
+                (
+                    std::slice::from_raw_parts_mut(
+                        z_base.get().add(g * group_f128),
+                        group_f128,
+                    ),
+                    std::slice::from_raw_parts_mut(
+                        a_base.get().add(g * group_f128),
+                        group_f128,
+                    ),
+                    std::slice::from_raw_parts_mut(
+                        b_base.get().add(g * group_f128),
+                        group_f128,
+                    ),
+                    std::slice::from_raw_parts_mut(stripe_base.get().add(g * k), k),
+                )
+            };
             // Ordinary per-block builders OR 1-bits into pre-zeroed words; any
             // slot left unbuilt (no padding block) stays zero, which the
             // lincheck transpose below reads correctly. Full-write builders
@@ -486,9 +604,94 @@ where
                     );
                 }
             }
-        });
+        };
 
-    (z, a, b, z_lincheck)
+    let n_groups = n_total / 8;
+    if let Some(stream) = &mut stream {
+        const SEGMENTS: usize = 8;
+        const BANDS: usize = 8;
+        let groups_per_segment = n_groups / SEGMENTS;
+        let groups_per_band = groups_per_segment / BANDS;
+        let r_total = 1usize << 16;
+        let r_per_band = r_total / BANDS;
+        debug_assert_eq!(groups_per_segment, 4096);
+        debug_assert_eq!(groups_per_band, 512);
+        for band in 0..BANDS {
+            (0..SEGMENTS * groups_per_band)
+                .into_par_iter()
+                .with_max_len(256)
+                .for_each(|job| {
+                    let g = ranked_stream_group_index(
+                        job,
+                        band,
+                        groups_per_segment,
+                        groups_per_band,
+                    );
+                    process_group(g);
+                });
+            // The Rayon join above publishes every CPU write in this band;
+            // command-buffer submission then makes those shared-memory pages
+            // visible to Metal before it starts the range.
+            std::sync::atomic::fence(std::sync::atomic::Ordering::Release);
+            stream.submit_ready_range(band * r_per_band, r_per_band);
+        }
+    } else {
+        (0..n_groups)
+            .into_par_iter()
+            .with_max_len(256)
+            .for_each(process_group);
+    }
+
+    (z, a, b, z_lincheck, stream)
+}
+
+#[cfg(test)]
+mod streamed_first_pass_tests {
+    use super::ranked_stream_group_index;
+
+    #[test]
+    fn ranked_bands_cover_each_group_and_every_published_tile_is_ready() {
+        const SEGMENTS: usize = 8;
+        const BANDS: usize = 8;
+        const GROUPS_PER_SEGMENT: usize = 4096;
+        const GROUPS_PER_BAND: usize = 512;
+        const R_PER_BAND: usize = 8192;
+        let mut seen = vec![false; SEGMENTS * GROUPS_PER_SEGMENT];
+
+        for band in 0..BANDS {
+            for job in 0..SEGMENTS * GROUPS_PER_BAND {
+                let g = ranked_stream_group_index(
+                    job,
+                    band,
+                    GROUPS_PER_SEGMENT,
+                    GROUPS_PER_BAND,
+                );
+                assert!(!std::mem::replace(&mut seen[g], true), "duplicate group {g}");
+            }
+
+            // One witness group is eight compressions = sixteen NTT
+            // positions. For every tile r published in this band, all eight
+            // from-z source segments therefore land in groups completed by
+            // the enumeration above.
+            for r in band * R_PER_BAND..(band + 1) * R_PER_BAND {
+                for segment in 0..SEGMENTS {
+                    let g = segment * GROUPS_PER_SEGMENT + r / 16;
+                    assert!(seen[g], "band {band} published unreadied group {g}");
+
+                    // Binding z at byte offset r_start*64*sizeof(F128) makes
+                    // the kernel's local-r address equal its global address.
+                    for lane in [0usize, 63] {
+                        let local_r = r - band * R_PER_BAND;
+                        let offset_elems = band * R_PER_BAND * 64;
+                        let local = ((segment << 16) + local_r) * 64 + lane;
+                        let global = ((segment << 16) + r) * 64 + lane;
+                        assert_eq!(offset_elems + local, global);
+                    }
+                }
+            }
+        }
+        assert!(seen.into_iter().all(|done| done));
+    }
 }
 
 /// Sort `v` and remove pairs of duplicates (GF(2) cancellation). Keeps R1CS

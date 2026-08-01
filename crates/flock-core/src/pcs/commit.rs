@@ -355,6 +355,43 @@ pub fn commit_preinitialized(
     finalize_commit_impl(z_packed, codeword, params, false)
 }
 
+/// Complete a ranked commitment whose GPU from-`z` layers 0..3 were streamed
+/// during witness generation. On any stream/Metal failure this takes the
+/// unchanged stale codeword through the exact ordinary from-message CPU path.
+#[doc(hidden)]
+pub fn commit_from_streamed_first_pass(
+    z_packed: &[F128],
+    codeword: Vec<F128>,
+    params: &PcsParams,
+    stream: crate::gpu_commit::FromZFirstPassStream,
+) -> (Commitment, ProverData) {
+    params.validate();
+    assert_eq!(z_packed.len(), 1usize << params.log_msg_len());
+    assert_eq!(
+        codeword.len(),
+        params.codeword_len_f128(),
+        "streamed commit: codeword buffer has wrong length"
+    );
+    let (codeword, merkle_tree) = crate::gpu_commit::finish_from_z_first_pass_or_fallback(
+        stream,
+        z_packed,
+        codeword,
+        params,
+        |cw| cpu_transform_and_tree(cw, params, Some(z_packed)),
+    );
+    let root = *merkle_tree.last().expect("merkle tree non-empty");
+    (
+        Commitment {
+            root,
+            params: params.clone(),
+        },
+        ProverData {
+            codeword,
+            merkle_tree,
+        },
+    )
+}
+
 /// Process CPU (user+system) in ms for `FLOCK_COMMIT_TIMING` diagnostics.
 /// Direct `getrusage(RUSAGE_SELF)`; diagnostics-only, 0.0 off macOS.
 pub(crate) fn commit_cpu_ms() -> f64 {
