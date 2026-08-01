@@ -251,7 +251,10 @@ fn use_ranked_open_lookahead_neon(ranked_shape: bool, len: usize) -> bool {
         target_arch = "aarch64",
         target_feature = "aes"
     )) && ranked_shape
-        && len == (1usize << 15)
+        // 2^15 is the direct-fold2 block; 2^13 the direct-fold4 block
+        // (`deferred_split_n_lo(25 − 4) = 13`). `ranked_shape` is the real
+        // authority — this stays as the belt-and-braces geometry check.
+        && (len == (1usize << 15) || len == (1usize << 13))
         && *ON.get_or_init(|| std::env::var_os("FLOCK_NO_OPEN_LOOKAHEAD_NEON").is_none())
 }
 
@@ -519,6 +522,24 @@ fn is_ranked_direct_fold2_lookahead_shape(
     packed_len == (1usize << 25)
         && block_len == (1usize << 15)
         && ((claim_count == 1 && has_ordinary) || (claim_count == 2 && !has_ordinary))
+}
+
+/// Exact ranked direct-fold4 materialization shape: both ranked claims carry a
+/// sixteen-bank bundle, so there is no materialized ordinary basis and the
+/// deferred split puts `2^13` slots in a block (`deferred_split_n_lo(21)`).
+/// Gates the deferred-reduction lookahead kernel the fold2 materializer
+/// already uses; the scalar path stays the same-binary fallback.
+#[inline]
+pub(crate) fn is_ranked_direct_fold4_lookahead_shape(
+    packed_len: usize,
+    block_len: usize,
+    claim_count: usize,
+    has_ordinary: bool,
+) -> bool {
+    packed_len == (1usize << 25)
+        && block_len == (1usize << 13)
+        && claim_count == 2
+        && !has_ordinary
 }
 
 #[inline]

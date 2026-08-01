@@ -3533,6 +3533,43 @@ fn materialize_direct_ab_fold2_with_helper(
     )
 }
 
+/// Deferred-reduction sixteen-bank fold, latched once per process.
+///
+/// Default **enabled** wherever PMULL exists; `FLOCK_NO_OPEN_FOLD16_NEON=1`
+/// restores the per-product-reduction scalar fold bit-for-bit in the same
+/// binary (the ranked worker's environment is cleared, so default-on is the
+/// shipped behaviour).
+#[inline]
+fn use_open_fold16_neon() -> bool {
+    #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+    {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var_os("FLOCK_NO_OPEN_FOLD16_NEON").is_none())
+    }
+    #[cfg(not(all(target_arch = "aarch64", target_feature = "aes")))]
+    {
+        false
+    }
+}
+
+/// Callable on every target: the PMULL kernel where it exists (the only place
+/// [`use_open_fold16_neon`] can return true), otherwise the same scalar sum the
+/// caller's fallback loop computes.
+#[inline]
+fn fold16_weighted_into_ranked(weights: &[F128; 16], input: &[F128], out: &mut [F128]) {
+    #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+    crate::field::f128_slice::fold16_weighted_into(weights, input, out);
+    #[cfg(not(all(target_arch = "aarch64", target_feature = "aes")))]
+    for (slot, dst) in out.iter_mut().enumerate() {
+        let base = 16 * slot;
+        let mut value = F128::ZERO;
+        for (bank, weight) in weights.iter().enumerate() {
+            value += *weight * input[base + bank];
+        }
+        *dst = value;
+    }
+}
+
 /// Correctness-first sixteen-bank materializer. Four challenges are sampled
 /// from direct product statistics before this function binds the witness and
 /// combined basis in one N→N/16 pass. It emits only the ordinary message M4
@@ -3572,6 +3609,14 @@ fn materialize_direct_fold4(
             )
         })
         .collect();
+
+    let fold16_neon = use_open_fold16_neon();
+    let ranked_lookahead_neon = super::is_ranked_direct_fold4_lookahead_shape(
+        packed_witness.len(),
+        claims[0].eq_lo.len(),
+        claims.len(),
+        has_ordinary,
+    );
 
     let out_len = packed_witness.len() / 16;
     let block_len = claims[0].eq_lo.len();
@@ -3622,15 +3667,40 @@ fn materialize_direct_fold4(
                     first_table,
                     scratch,
                 );
-                for slot in 0..block_len {
-                    f_out[slot] = fold16(f_in, slot);
-                    let direct =
-                        super::ring_switch::fold_one_slot(first_claim.eq_lo[slot], scratch);
-                    b_out[slot] = if has_ordinary {
-                        direct + fold16(b_in, slot)
+                if fold16_neon {
+                    // Same products, same block, same order of blocks: only the
+                    // per-product GHASH reduction and the schoolbook's fourth
+                    // PMULL are deleted (96 → 48 PMULL per output slot). The
+                    // `direct` term is XOR-added after the bank fold, which is
+                    // the same field value as adding it before.
+                    fold16_weighted_into_ranked(&fold_weight, f_in, f_out);
+                    if has_ordinary {
+                        fold16_weighted_into_ranked(&fold_weight, b_in, b_out);
+                        for (slot, out) in b_out.iter_mut().enumerate() {
+                            *out += super::ring_switch::fold_one_slot(
+                                first_claim.eq_lo[slot],
+                                scratch,
+                            );
+                        }
                     } else {
-                        direct
-                    };
+                        for (slot, out) in b_out.iter_mut().enumerate() {
+                            *out = super::ring_switch::fold_one_slot(
+                                first_claim.eq_lo[slot],
+                                scratch,
+                            );
+                        }
+                    }
+                } else {
+                    for slot in 0..block_len {
+                        f_out[slot] = fold16(f_in, slot);
+                        let direct =
+                            super::ring_switch::fold_one_slot(first_claim.eq_lo[slot], scratch);
+                        b_out[slot] = if has_ordinary {
+                            direct + fold16(b_in, slot)
+                        } else {
+                            direct
+                        };
+                    }
                 }
                 for (claim, table) in rest_claims.iter().zip(rest_tables.iter()) {
                     super::ring_switch::compose_fold_byte_table_into(
@@ -3642,7 +3712,7 @@ fn materialize_direct_fold4(
                         *out += super::ring_switch::fold_one_slot(claim.eq_lo[slot], scratch);
                     }
                 }
-                super::round0_and_round1_lookahead_scalar(f_out, b_out)
+                super::round0_and_round1_lookahead_ranked(f_out, b_out, ranked_lookahead_neon)
             },
         )
         .reduce(empty_stats, merge_stats);

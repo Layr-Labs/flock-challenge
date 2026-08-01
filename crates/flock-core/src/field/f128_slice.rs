@@ -41,6 +41,23 @@ pub(crate) fn round0_and_round1_lookahead(
     unsafe { aarch64::round0_and_round1_lookahead(witness, basis) }
 }
 
+/// AArch64 deferred-reduction kernel for the direct-fold4 opening's
+/// sixteen-bank witness fold: `out[slot] = Σ_bank weights[bank] ·
+/// input[16·slot + bank]`.
+///
+/// Bit-identical to the scalar `Σ weights[bank] * input[..]` the caller keeps
+/// as its portable fallback — carry-less multiplication and the GHASH
+/// reduction are both F₂-linear, so reducing the XOR-sum of the sixteen
+/// unreduced products equals the XOR-sum of the sixteen reduced products.
+#[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+#[inline]
+pub(crate) fn fold16_weighted_into(weights: &[F128; 16], input: &[F128], out: &mut [F128]) {
+    assert_eq!(input.len(), 16 * out.len());
+    // SAFETY: the cfg gate supplies PMULL through `aes`; the length assertion
+    // above is the complete slice-shape contract of the architecture kernel.
+    unsafe { aarch64::fold16_weighted(weights, input, out) }
+}
+
 /// Fold adjacent pairs from `src` into `dst`, starting at pair `base`.
 ///
 /// Computes `dst[t] = src[2j] * (1 + r) + src[2j + 1] * r`, where
@@ -298,5 +315,91 @@ mod tests {
             assert_eq!(got_u0, expected_u0, "u0 trial={trial}");
             assert_eq!(got_u2, expected_u2, "u2 trial={trial}");
         }
+    }
+
+    /// The deferred-reduction sixteen-bank fold must be bit-identical to the
+    /// per-product-reduction scalar sum it replaces in `materialize_direct_fold4`.
+    #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+    #[test]
+    fn fold16_weighted_matches_scalar_weighted_sum() {
+        let mut state = 0x51ed_2704_c0ff_ee11_u64;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        for trial in 0..32 {
+            let weights: [F128; 16] = std::array::from_fn(|_| F128::new(next(), next()));
+            let slots = 1 + trial % 7;
+            let input: Vec<F128> = (0..16 * slots).map(|_| F128::new(next(), next())).collect();
+
+            let expected: Vec<F128> = (0..slots)
+                .map(|slot| {
+                    let mut value = F128::ZERO;
+                    for bank in 0..16 {
+                        value += weights[bank] * input[16 * slot + bank];
+                    }
+                    value
+                })
+                .collect();
+
+            let mut got = vec![F128::ZERO; slots];
+            fold16_weighted_into(&weights, &input, &mut got);
+            assert_eq!(got, expected, "trial={trial}");
+        }
+    }
+
+    /// Single-thread paired price of the deferred-reduction sixteen-bank fold
+    /// against the per-product-reduction scalar sum, on the ranked block shape
+    /// (`2^13` output slots = one `materialize_direct_fold4` block). Ignored:
+    /// it is a measurement, not an assertion.
+    ///
+    /// `cargo test --release -p flock-core --lib fold16_deferred_price -- --ignored --nocapture`
+    #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+    #[test]
+    #[ignore]
+    fn fold16_deferred_price() {
+        use std::time::Instant;
+        let mut state = 0x2f81_9a55_1234_9977_u64;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let slots = 1usize << 13;
+        let weights: [F128; 16] = std::array::from_fn(|_| F128::new(next(), next()));
+        let input: Vec<F128> = (0..16 * slots).map(|_| F128::new(next(), next())).collect();
+        let mut out = vec![F128::ZERO; slots];
+
+        let mut best_scalar = f64::MAX;
+        let mut best_neon = f64::MAX;
+        for _ in 0..40 {
+            let t = Instant::now();
+            for (slot, dst) in out.iter_mut().enumerate() {
+                let base = 16 * slot;
+                let mut value = F128::ZERO;
+                for bank in 0..16 {
+                    value += weights[bank] * input[base + bank];
+                }
+                *dst = value;
+            }
+            best_scalar = best_scalar.min(t.elapsed().as_secs_f64());
+            std::hint::black_box(&out);
+
+            let t = Instant::now();
+            fold16_weighted_into(&weights, &input, &mut out);
+            best_neon = best_neon.min(t.elapsed().as_secs_f64());
+            std::hint::black_box(&out);
+        }
+        println!(
+            "fold16 block={slots} slots: scalar {:.3} ms ({:.2} ns/slot), deferred {:.3} ms ({:.2} ns/slot), {:.2}x",
+            best_scalar * 1e3,
+            best_scalar * 1e9 / slots as f64,
+            best_neon * 1e3,
+            best_neon * 1e9 / slots as f64,
+            best_scalar / best_neon,
+        );
     }
 }

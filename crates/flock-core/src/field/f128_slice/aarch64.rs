@@ -30,6 +30,20 @@ unsafe fn pmull(a: u64, b: u64) -> uint64x2_t {
     unsafe { transmute::<u128, uint64x2_t>(vmull_p64(a, b)) }
 }
 
+/// `pmull2`: carry-less product of both operands' high lanes.
+#[inline]
+#[target_feature(enable = "aes")]
+unsafe fn pmull_high(a: uint64x2_t, b: uint64x2_t) -> uint64x2_t {
+    // SAFETY: the caller provides the `aes` target feature; all three types are
+    // 128-bit bit containers with compatible alignment.
+    unsafe {
+        transmute::<u128, uint64x2_t>(vmull_high_p64(
+            transmute::<uint64x2_t, poly64x2_t>(a),
+            transmute::<uint64x2_t, poly64x2_t>(b),
+        ))
+    }
+}
+
 /// Multiply two independent values by the same constant and reduce them in
 /// lane-paired form. Constant-r Karatsuba needs six PMULLs total rather than
 /// the generic two-product schoolbook kernel's eight.
@@ -138,6 +152,156 @@ unsafe fn reduce_wide(value: WideNeon) -> uint64x2_t {
             veorq_u64(vshlq_n_u64::<2>(overflow), vshlq_n_u64::<7>(overflow)),
         );
         xor3_u64(value.lo, folded, correction)
+    }
+}
+
+/// Weighted sixteen-bank fold with one deferred reduction per output slot:
+/// `out[slot] = Σ_{bank<16} weights[bank] · input[16·slot + bank]`.
+///
+/// Both carry-less multiplication and the GHASH reduction are F₂-linear, so
+/// the sixteen products of a slot may stay in the 256-bit unreduced domain and
+/// be reduced exactly once. Against the generic per-product `Mul` (the six-
+/// PMULL binius variant: four schoolbook plus two reduction-stage PMULLs) this
+/// deletes both the fifteen redundant reductions and the schoolbook's fourth
+/// product, leaving the three-PMULL Karatsuba unreduced form:
+/// **96 → 48 PMULL per output slot**, bit-identical result.
+///
+/// The three product halves accumulate separately (`ll`, `hh`, and the
+/// Karatsuba middle), so the middle term's lane placement also drops from
+/// once per product to once per slot; banks are taken two at a time so one
+/// `pmull`/`pmull2` pair serves both, and eight slots are kept in flight so
+/// the XOR chains sit off the PMULL critical path. All of that only reorders
+/// an XOR-associative sum of the same sixteen products.
+///
+/// Measured single-thread on the ranked block (`2^13` slots, M2): 15.1 →
+/// 9.6 ns/slot, 1.57×.
+///
+/// # Safety
+/// Requires the `aes` target feature (PMULL). `input.len()` must equal
+/// `16 * out.len()`.
+#[target_feature(enable = "aes")]
+pub(super) unsafe fn fold16_weighted(weights: &[F128; 16], input: &[F128], out: &mut [F128]) {
+    unsafe {
+        debug_assert_eq!(input.len(), 16 * out.len());
+
+        let zero = vdupq_n_u64(0);
+        // Constant Karatsuba operands stay in vector form: the PMULL operands
+        // are then lane reads of a vector register, not a general-register
+        // round trip through `fmov`.
+        // Bank pair `p` covers banks `2p` and `2p + 1`; its three constants are
+        // the two low words, the two high words, and their XOR (the Karatsuba
+        // middle operand), lane-paired so one `pmull` plus one `pmull2` covers
+        // both banks with no lane shuffling of the constant.
+        let weight_ptr = weights.as_ptr().cast::<u64>();
+        let mut w_lo = [zero; 8];
+        let mut w_hi = [zero; 8];
+        let mut w_mid = [zero; 8];
+        for pair in 0..8 {
+            let even = vld1q_u64(weight_ptr.add(4 * pair));
+            let odd = vld1q_u64(weight_ptr.add(4 * pair + 2));
+            let lo = vuzp1q_u64(even, odd);
+            let hi = vuzp2q_u64(even, odd);
+            w_lo[pair] = lo;
+            w_hi[pair] = hi;
+            w_mid[pair] = veorq_u64(lo, hi);
+        }
+
+        let src = input.as_ptr().cast::<u64>();
+        let n = out.len();
+        let dst = out.as_mut_ptr().cast::<u64>();
+
+        // Bank-outer over a tile of TILE slots: the two weight registers are
+        // loaded once per bank instead of once per product, and the TILE
+        // independent accumulator pairs hide the XOR latency behind PMULL
+        // throughput. All 16 · TILE products of a tile are the same products
+        // in a different issue order — XOR is associative, so the value is
+        // unchanged.
+        // Three raw accumulators per slot — the low, high, and Karatsuba
+        // middle product halves — instead of a placed 256-bit accumulator.
+        // The middle term's two lane placements then happen once per slot
+        // rather than once per product, leaving three PMULL and three XOR
+        // (plus the input's own middle word) per product.
+        const TILE: usize = 8;
+        let mut slot = 0usize;
+        while slot + TILE <= n {
+            let mut acc_ll = [zero; TILE];
+            let mut acc_hh = [zero; TILE];
+            let mut acc_mm = [zero; TILE];
+            for pair in 0..8 {
+                let c_lo = w_lo[pair];
+                let c_hi = w_hi[pair];
+                let c_mid = w_mid[pair];
+                for tile in 0..TILE {
+                    let base = src.add(32 * (slot + tile) + 4 * pair);
+                    let even = vld1q_u64(base);
+                    let odd = vld1q_u64(base.add(2));
+                    // Lane-pair the two banks' low, high and middle words, so
+                    // one `pmull`/`pmull2` pair covers both banks per half.
+                    let x_lo = vuzp1q_u64(even, odd);
+                    let x_hi = vuzp2q_u64(even, odd);
+                    let x_mid = veorq_u64(x_lo, x_hi);
+                    acc_ll[tile] = xor3_u64(
+                        acc_ll[tile],
+                        pmull(vgetq_lane_u64::<0>(x_lo), vgetq_lane_u64::<0>(c_lo)),
+                        pmull_high(x_lo, c_lo),
+                    );
+                    acc_hh[tile] = xor3_u64(
+                        acc_hh[tile],
+                        pmull(vgetq_lane_u64::<0>(x_hi), vgetq_lane_u64::<0>(c_hi)),
+                        pmull_high(x_hi, c_hi),
+                    );
+                    acc_mm[tile] = xor3_u64(
+                        acc_mm[tile],
+                        pmull(vgetq_lane_u64::<0>(x_mid), vgetq_lane_u64::<0>(c_mid)),
+                        pmull_high(x_mid, c_mid),
+                    );
+                }
+            }
+            for tile in 0..TILE {
+                let cross = xor3_u64(acc_mm[tile], acc_ll[tile], acc_hh[tile]);
+                let wide = WideNeon {
+                    lo: veorq_u64(acc_ll[tile], vextq_u64::<1>(zero, cross)),
+                    hi: veorq_u64(acc_hh[tile], vextq_u64::<1>(cross, zero)),
+                };
+                vst1q_u64(dst.add(2 * (slot + tile)), reduce_wide(wide));
+            }
+            slot += TILE;
+        }
+        while slot < n {
+            let base = src.add(32 * slot);
+            let mut acc_ll = zero;
+            let mut acc_hh = zero;
+            let mut acc_mm = zero;
+            for pair in 0..8 {
+                let even = vld1q_u64(base.add(4 * pair));
+                let odd = vld1q_u64(base.add(4 * pair + 2));
+                let x_lo = vuzp1q_u64(even, odd);
+                let x_hi = vuzp2q_u64(even, odd);
+                let x_mid = veorq_u64(x_lo, x_hi);
+                acc_ll = xor3_u64(
+                    acc_ll,
+                    pmull(vgetq_lane_u64::<0>(x_lo), vgetq_lane_u64::<0>(w_lo[pair])),
+                    pmull_high(x_lo, w_lo[pair]),
+                );
+                acc_hh = xor3_u64(
+                    acc_hh,
+                    pmull(vgetq_lane_u64::<0>(x_hi), vgetq_lane_u64::<0>(w_hi[pair])),
+                    pmull_high(x_hi, w_hi[pair]),
+                );
+                acc_mm = xor3_u64(
+                    acc_mm,
+                    pmull(vgetq_lane_u64::<0>(x_mid), vgetq_lane_u64::<0>(w_mid[pair])),
+                    pmull_high(x_mid, w_mid[pair]),
+                );
+            }
+            let cross = xor3_u64(acc_mm, acc_ll, acc_hh);
+            let wide = WideNeon {
+                lo: veorq_u64(acc_ll, vextq_u64::<1>(zero, cross)),
+                hi: veorq_u64(acc_hh, vextq_u64::<1>(cross, zero)),
+            };
+            vst1q_u64(dst.add(2 * slot), reduce_wide(wide));
+            slot += 1;
+        }
     }
 }
 
