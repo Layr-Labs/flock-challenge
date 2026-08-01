@@ -19,10 +19,7 @@
 
 pub mod bits;
 pub mod challenger;
-// Public but hidden: flock-prover's witness driver drains its groups through
-// the hetero queue (W-H1). Not a stable API surface.
-#[doc(hidden)]
-pub mod epool;
+pub(crate) mod epool;
 pub mod field;
 // Public only for `note_precompute_branch_wall_ms` (the prover's join arm
 // reports its wall to the hybrid-split warmup sweep); internals stay

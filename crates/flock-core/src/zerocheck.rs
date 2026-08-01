@@ -188,7 +188,7 @@ pub fn prove_packed_padded<C: Challenger>(
     challenger: &mut C,
 ) -> (ZerocheckProof, ZerocheckClaim) {
     let (proof, claim, _) = prove_packed_padded_inner(
-        a_packed, b_packed, c_packed, m, padding, false, None, None, challenger,
+        a_packed, b_packed, c_packed, m, padding, false, None, challenger,
     );
     (proof, claim)
 }
@@ -207,31 +207,15 @@ pub fn prove_packed_padded_capture_s_hat_v_c<C: Challenger>(
     m: usize,
     padding: &PaddingSpec,
     challenger: &mut C,
-) -> (ZerocheckProof, ZerocheckClaim, CapturedSHatVC) {
+) -> (ZerocheckProof, ZerocheckClaim, Vec<F128>) {
     let (proof, claim, captured) = prove_packed_padded_inner(
-        a_packed, b_packed, c_packed, m, padding, true, None, None, challenger,
+        a_packed, b_packed, c_packed, m, padding, true, None, challenger,
     );
     (
         proof,
         claim,
         captured.expect("capture=true must produce s_hat_v_c"),
     )
-}
-
-/// The c-claim opening statistics round 1 captures for free.
-///
-/// The incumbent pair comes out of the same eight α-free banks: `s_hat_v_c` is the canonical
-/// length-128 vector `fold_1b_rows` would produce, `quad` the length-512
-/// four-bank form that lets the PCS open take C's `products` directly instead
-/// of sweeping the combined basis. `collapse_s_hat_v_quad(quad, suffix[..2])`
-/// reproduces `s_hat_v_c` exactly, so shipping either keeps the transcript.
-/// The experimental `fold4` tensor has sixteen 128-element banks and likewise
-/// collapses under `suffix[..4]`; it is present only behind the shared strict
-/// DirectFold4 opt-in.
-pub struct CapturedSHatVC {
-    pub s_hat_v_c: Vec<F128>,
-    pub quad: Vec<F128>,
-    pub fold4: Option<Vec<F128>>,
 }
 
 /// Capture-`s_hat_v_c` prover that consumes a challenge-independent AB inner
@@ -246,7 +230,7 @@ pub fn prove_packed_padded_capture_s_hat_v_c_with_precomputed_ab<C: Challenger>(
     padding: &PaddingSpec,
     ab_inner: univariate_skip_optimized::Round1AbInner,
     challenger: &mut C,
-) -> (ZerocheckProof, ZerocheckClaim, CapturedSHatVC) {
+) -> (ZerocheckProof, ZerocheckClaim, Vec<F128>) {
     let (proof, claim, captured) = prove_packed_padded_inner(
         a_packed,
         b_packed,
@@ -255,42 +239,6 @@ pub fn prove_packed_padded_capture_s_hat_v_c_with_precomputed_ab<C: Challenger>(
         padding,
         true,
         Some(ab_inner),
-        None,
-        challenger,
-    );
-    (
-        proof,
-        claim,
-        captured.expect("capture=true must produce s_hat_v_c"),
-    )
-}
-
-/// Ranked identity-C specialization of
-/// [`prove_packed_padded_capture_s_hat_v_c_with_precomputed_ab`]. The extra
-/// buffer is the already-built lincheck stripe for C (= z); it lets round one
-/// derive the legacy C message and all RingSwitch captures after a single
-/// outer fold instead of draining the row-major witness into 32 field banks.
-/// The proof and transcript remain byte-identical to the ordinary Fold4 path.
-#[allow(clippy::too_many_arguments)]
-pub fn prove_packed_padded_capture_s_hat_v_c_with_precomputed_ab_and_lincheck_c<C: Challenger>(
-    a_packed: &[u8],
-    b_packed: &[u8],
-    c_packed: &[u8],
-    c_lincheck: &[u8],
-    m: usize,
-    padding: &PaddingSpec,
-    ab_inner: univariate_skip_optimized::Round1AbInner,
-    challenger: &mut C,
-) -> (ZerocheckProof, ZerocheckClaim, CapturedSHatVC) {
-    let (proof, claim, captured) = prove_packed_padded_inner(
-        a_packed,
-        b_packed,
-        c_packed,
-        m,
-        padding,
-        true,
-        Some(ab_inner),
-        Some(c_lincheck),
         challenger,
     );
     (
@@ -309,9 +257,8 @@ fn prove_packed_padded_inner<C: Challenger>(
     padding: &PaddingSpec,
     capture_s_hat_v_c: bool,
     precomputed_ab: Option<univariate_skip_optimized::Round1AbInner>,
-    c_lincheck: Option<&[u8]>,
     challenger: &mut C,
-) -> (ZerocheckProof, ZerocheckClaim, Option<CapturedSHatVC>) {
+) -> (ZerocheckProof, ZerocheckClaim, Option<Vec<F128>>) {
     let k_skip = K_SKIP;
     const N_INNER: usize = 7; // 3 small + 4 medium fixed-constant eq dims
     assert!(
@@ -365,101 +312,20 @@ fn prove_packed_padded_inner<C: Challenger>(
             capture_s_hat_v_c,
             "precomputed AB path currently requires s_hat_v capture"
         );
-        if let Some(c_lincheck) = c_lincheck {
-            assert!(m == 32 || cfg!(test), "lincheck C reuse is ranked-only");
-            assert_eq!(padding.k_log, 14, "lincheck C reuse fixes k_log=14");
-            assert!(
-                crate::pcs::ranked_direct_fold4_enabled() || cfg!(test),
-                "lincheck C reuse requires ranked DirectFold4"
-            );
-            let cpu_ab = crate::pcs::commit::commit_cpu_ms();
-            let t_ab = std::time::Instant::now();
-            let ab = crate::zerocheck::univariate_skip_optimized::round1_shift_reduce_ab_packed_padded_with_precomputed(
+        let (ab, c, s) =
+            crate::zerocheck::univariate_skip_optimized::round1_shift_reduce_extract_c_packed_padded_with_precomputed_ab(
                 ab_inner,
+                c_packed,
                 m,
                 k_skip,
                 &r,
+                inv_table,
                 padding,
             );
-            if zc_timing {
-                eprintln!(
-                    "[zc-timing] round1 AB completion: {:.2} ms cpu={:.1}",
-                    t_ab.elapsed().as_secs_f64() * 1e3,
-                    crate::pcs::commit::commit_cpu_ms() - cpu_ab,
-                );
-            }
-            let cpu_c = crate::pcs::commit::commit_cpu_ms();
-            let t_c = std::time::Instant::now();
-            let (c, s_hat_v_c, quad, fold4) =
-                crate::zerocheck::univariate_skip_optimized::round1_c_fold4_from_lincheck_stripe(
-                    c_lincheck,
-                    m,
-                    padding.k_log,
-                    k_skip,
-                    padding.useful_bits_per_block,
-                    &r,
-                    inv_table,
-                );
-            if zc_timing {
-                eprintln!(
-                    "[zc-timing] round1 lincheck-stripe C: {:.2} ms cpu={:.1}",
-                    t_c.elapsed().as_secs_f64() * 1e3,
-                    crate::pcs::commit::commit_cpu_ms() - cpu_c,
-                );
-            }
-            (
-                ab,
-                c,
-                Some(CapturedSHatVC {
-                    s_hat_v_c,
-                    quad,
-                    fold4: Some(fold4),
-                }),
-            )
-        } else if m == 32 && crate::pcs::ranked_direct_fold4_enabled() {
-            let (ab, c, s_hat_v_c, quad, fold4) =
-                crate::zerocheck::univariate_skip_optimized::round1_shift_reduce_extract_c_packed_padded_with_precomputed_ab_fold4(
-                    ab_inner,
-                    c_packed,
-                    m,
-                    k_skip,
-                    &r,
-                    inv_table,
-                    padding,
-                );
-            (
-                ab,
-                c,
-                Some(CapturedSHatVC {
-                    s_hat_v_c,
-                    quad,
-                    fold4: Some(fold4),
-                }),
-            )
-        } else {
-            let (ab, c, s_hat_v_c, quad) =
-                crate::zerocheck::univariate_skip_optimized::round1_shift_reduce_extract_c_packed_padded_with_precomputed_ab(
-                    ab_inner,
-                    c_packed,
-                    m,
-                    k_skip,
-                    &r,
-                    inv_table,
-                    padding,
-                );
-            (
-                ab,
-                c,
-                Some(CapturedSHatVC {
-                    s_hat_v_c,
-                    quad,
-                    fold4: None,
-                }),
-            )
-        }
+        (ab, c, Some(s))
     } else if capture_s_hat_v_c {
-        let (ab, c, s_hat_v_c, quad) =
-            crate::zerocheck::univariate_skip_optimized::round1_shift_reduce_extract_c_packed_padded_with_s_hat_v_quad(
+        let (ab, c, s) =
+            crate::zerocheck::univariate_skip_optimized::round1_shift_reduce_extract_c_packed_padded_with_s_hat_v(
                 a_packed,
                 b_packed,
                 c_packed,
@@ -469,15 +335,7 @@ fn prove_packed_padded_inner<C: Challenger>(
                 inv_table,
                 padding,
             );
-        (
-            ab,
-            c,
-            Some(CapturedSHatVC {
-                s_hat_v_c,
-                quad,
-                fold4: None,
-            }),
-        )
+        (ab, c, Some(s))
     } else {
         let (ab, c) = round1_shift_reduce_extract_c_packed_padded(
             a_packed, b_packed, c_packed, m, k_skip, &r, inv_table, padding,
@@ -591,10 +449,6 @@ fn prove_packed_padded_inner<C: Challenger>(
         (Vec::new(), Vec::new())
     };
 
-    // H2 engagement evidence: E-core chunks claimed across the loop rounds
-    // (T3's hetero drain is already behind us, so the delta is loop-only).
-    let hetero_trace = std::env::var_os("FLOCK_ZC_TAIL_HETERO_TRACE").is_some();
-    let hetero_claimed_before = crate::epool::helper_chunks_claimed();
     for i in 1..(n_mlv - 1) {
         let rho_prev = mlv_rhos[i];
         let log_n_before = a_mlv.len().trailing_zeros() as usize;
@@ -633,13 +487,6 @@ fn prove_packed_padded_inner<C: Challenger>(
         challenger.observe_f128(m1);
         challenger.observe_f128(mi);
         mlv_rhos.push(challenger.sample_f128());
-    }
-
-    if hetero_trace {
-        eprintln!(
-            "[zc-tail] hetero loop rounds: {} chunks claimed by E-cores",
-            crate::epool::helper_chunks_claimed() - hetero_claimed_before
-        );
     }
 
     // ---- 8. Final binding at ρ_{n_mlv} (the last challenge) ----
@@ -950,84 +797,6 @@ mod tests {
 
             assert_eq!(claim_p, claim_v, "claim mismatch at m={m}");
         }
-    }
-
-    /// End-to-end transcript gate for the ranked identity-C producer. The
-    /// alternate lincheck-stripe path must emit the exact legacy zerocheck
-    /// proof and claim, not merely an algebraically equivalent C opening.
-    #[test]
-    fn lincheck_stripe_c_proof_is_byte_identical() {
-        let pool = rayon::ThreadPoolBuilder::new()
-            .num_threads(2)
-            .stack_size(16 << 20)
-            .build()
-            .unwrap();
-        pool.install(lincheck_stripe_c_proof_is_byte_identical_inner);
-    }
-
-    fn lincheck_stripe_c_proof_is_byte_identical_inner() {
-        const M: usize = 17;
-        const K_LOG: usize = 14;
-        let padding = PaddingSpec {
-            k_log: K_LOG,
-            useful_bits_per_block: 1 << K_LOG,
-        };
-        let mut rng = Rng::new(0x1D_C5_7A1E);
-        let a = rng.bits(1 << M);
-        let b = rng.bits(1 << M);
-        let c: Vec<bool> = a.iter().zip(&b).map(|(x, y)| *x & *y).collect();
-        let (a_p, b_p, c_p) = pack_abc(&a, &b, &c);
-        let inv_table = InvNttTableByteSingleGf8::cached_standard_k6();
-
-        let old_ab = univariate_skip_optimized::precompute_round1_ab_inner_packed_padded(
-            &a_p, &b_p, M, K_SKIP, inv_table, &padding,
-        );
-        let mut old_ch = FsChallenger::new(b"flock-c-stripe-proof-v0");
-        let (old_proof, old_claim, old_capture) = prove_packed_padded_inner(
-            &a_p,
-            &b_p,
-            &c_p,
-            M,
-            &padding,
-            true,
-            Some(old_ab),
-            None,
-            &mut old_ch,
-        );
-
-        let c_words: Vec<F128> = c_p
-            .chunks_exact(16)
-            .map(|bytes| F128 {
-                lo: u64::from_le_bytes(bytes[..8].try_into().unwrap()),
-                hi: u64::from_le_bytes(bytes[8..].try_into().unwrap()),
-            })
-            .collect();
-        let c_lincheck = crate::lincheck::pack_z_lincheck_from_packed(&c_words, M, K_LOG);
-        let new_ab = univariate_skip_optimized::precompute_round1_ab_inner_packed_padded(
-            &a_p, &b_p, M, K_SKIP, inv_table, &padding,
-        );
-        let mut new_ch = FsChallenger::new(b"flock-c-stripe-proof-v0");
-        let (new_proof, new_claim, new_capture) = prove_packed_padded_inner(
-            &a_p,
-            &b_p,
-            &c_p,
-            M,
-            &padding,
-            true,
-            Some(new_ab),
-            Some(&c_lincheck),
-            &mut new_ch,
-        );
-
-        assert_eq!(new_proof, old_proof);
-        assert_eq!(new_claim, old_claim);
-        let old_capture = old_capture.expect("legacy C capture");
-        let new_capture = new_capture.expect("stripe C capture");
-        assert_eq!(new_capture.s_hat_v_c, old_capture.s_hat_v_c);
-        assert_eq!(new_capture.quad, old_capture.quad);
-
-        let mut verifier = FsChallenger::new(b"flock-c-stripe-proof-v0");
-        assert_eq!(verify(M, &new_proof, &mut verifier), Ok(new_claim));
     }
 
     /// **Verify rejects byte-mutated proofs.** Walk each component of the

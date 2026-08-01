@@ -736,7 +736,7 @@ pub(crate) const NEON_TILE_T: usize = 8;
 /// for the given (m, k_log). Threads `useful_bits` through so the kernel
 /// can skip blocks past the useful region of each block (byte-identical to
 /// the dense path on honestly-padded witnesses).
-pub(crate) fn partial_fold_packed_z_best(
+fn partial_fold_packed_z_best(
     z_packed: &[u8],
     m: usize,
     k_log: usize,

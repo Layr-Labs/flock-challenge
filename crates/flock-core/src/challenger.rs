@@ -263,13 +263,22 @@ impl FsChallenger {
                 h.update(bytes);
             }
         }
-        self.n_absorbed = self.n_absorbed.wrapping_add(bytes.len() as u64);
+        #[cfg(feature = "hash-count")]
+        {
+            self.n_absorbed = self.n_absorbed.wrapping_add(bytes.len() as u64);
+        }
     }
 
     #[inline]
     fn absorb_f128(&mut self, v: F128) {
-        self.absorb(&v.lo.to_le_bytes());
-        self.absorb(&v.hi.to_le_bytes());
+        // Fused: one absorb() of a 16-byte stack buffer instead of two
+        // separate absorb() calls. Byte stream (lo ‖ hi) is unchanged —
+        // `absorb` has no per-call framing, so splitting or fusing the
+        // underlying `update()` calls is invisible to the hash output.
+        let mut buf = [0u8; 16];
+        buf[..8].copy_from_slice(&v.lo.to_le_bytes());
+        buf[8..].copy_from_slice(&v.hi.to_le_bytes());
+        self.absorb(&buf);
     }
 
     /// Squeeze `out.len()` pseudorandom bytes from the current transcript
@@ -328,16 +337,31 @@ impl Challenger for FsChallenger {
     }
 
     fn observe_f128(&mut self, value: F128) {
-        self.absorb(&[OP_OBSERVE, KIND_SCALAR]);
-        self.absorb_f128(value);
+        // Fused: [OP_OBSERVE, KIND_SCALAR] ‖ lo ‖ hi in one 18-byte stack
+        // buffer, one absorb() instead of three. Identical byte stream.
+        let mut buf = [0u8; 18];
+        buf[0] = OP_OBSERVE;
+        buf[1] = KIND_SCALAR;
+        buf[2..10].copy_from_slice(&value.lo.to_le_bytes());
+        buf[10..18].copy_from_slice(&value.hi.to_le_bytes());
+        self.absorb(&buf);
     }
 
     fn observe_f128_slice(&mut self, values: &[F128]) {
-        self.absorb(&[OP_OBSERVE, KIND_SLICE]);
-        self.absorb(&(values.len() as u64).to_le_bytes());
+        // Build the whole tag ‖ len ‖ lo0‖hi0‖lo1‖hi1‖… byte stream in one
+        // contiguous buffer and absorb it in a single call, instead of
+        // 2 + 2*n separate absorb() calls. Streaming hash update is
+        // associative under concatenation, so this is the identical byte
+        // stream `absorb` would otherwise see split across many calls.
+        let mut buf = Vec::with_capacity(2 + 8 + values.len() * 16);
+        buf.push(OP_OBSERVE);
+        buf.push(KIND_SLICE);
+        buf.extend_from_slice(&(values.len() as u64).to_le_bytes());
         for v in values {
-            self.absorb_f128(*v);
+            buf.extend_from_slice(&v.lo.to_le_bytes());
+            buf.extend_from_slice(&v.hi.to_le_bytes());
         }
+        self.absorb(&buf);
     }
 
     fn observe_bytes(&mut self, bytes: &[u8]) {

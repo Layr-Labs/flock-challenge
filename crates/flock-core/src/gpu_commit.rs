@@ -35,10 +35,6 @@ use crate::ntt::AdditiveNttF128;
 /// Env var that disables the GPU commit path entirely.
 pub const ENV_NO_GPU_COMMIT: &str = "FLOCK_NO_GPU_COMMIT";
 
-/// Same-binary control that preserves the CPU codeword allocation/prefault
-/// even after the ranked GPU commit has latched on.
-pub const ENV_NO_LAZY_GPU_CODEWORD: &str = "FLOCK_NO_LAZY_GPU_CODEWORD";
-
 /// Env var that latches the GPU on whenever it is bit-exact, even without a
 /// wall-clock win (A/B and test tooling).
 pub const ENV_GPU_COMMIT_FORCE: &str = "FLOCK_GPU_COMMIT_FORCE";
@@ -113,58 +109,6 @@ pub(crate) fn commit_l0_or_fallback(
     cpu: impl FnOnce(&mut [F128]) -> Vec<crate::merkle::Hash>,
 ) -> (crate::pcs::commit::CodewordBuf, crate::pcs::commit::MerkleTreeBuf) {
     imp::commit_l0_or_fallback(z_packed, codeword, params, cpu)
-}
-
-/// In-flight ownership of the ranked from-`z` first Metal NTT pass.
-///
-/// Witness generation publishes independent `r` ranges as it finishes them;
-/// the stream writes those ranges into the persistent staging buffer while
-/// later witness ranges are still being produced on the CPU. The type is
-/// deliberately opaque outside this module so the staging lease and pending
-/// command buffers cannot be separated.
-#[doc(hidden)]
-pub struct FromZFirstPassStream {
-    inner: imp::FromZFirstPassStream,
-}
-
-/// Reserve the latched ranked GPU staging buffer before `z` is initialized.
-/// Returns `None` during warmup, on unsupported targets/shapes, or whenever
-/// the ordinary CPU/GPU fallback machinery should remain in control.
-///
-/// # Safety
-/// `z_ptr..z_ptr+z_len` must remain allocated and at the same address until
-/// the returned stream is consumed or dropped. A range may only be submitted
-/// after every byte read by that range has been initialized.
-#[doc(hidden)]
-pub unsafe fn begin_from_z_first_pass_stream(
-    z_ptr: *mut F128,
-    z_len: usize,
-    params: &crate::pcs::commit::PcsParams,
-) -> Option<FromZFirstPassStream> {
-    unsafe { imp::begin_from_z_first_pass_stream(z_ptr, z_len, params) }
-        .map(|inner| FromZFirstPassStream { inner })
-}
-
-impl FromZFirstPassStream {
-    /// Publish `r_start..r_start+r_count` (in position tiles). Ranges must be
-    /// contiguous, ordered, and multiples of four for the tuned g4 kernel.
-    #[doc(hidden)]
-    pub fn submit_ready_range(&mut self, r_start: usize, r_count: usize) {
-        self.inner.submit_ready_range(r_start, r_count);
-    }
-}
-
-/// Finish a streamed first pass, run the remaining commitment graph, and
-/// preserve the same bit-exact CPU fallback contract as the normal entry.
-#[doc(hidden)]
-pub(crate) fn finish_from_z_first_pass_or_fallback(
-    stream: FromZFirstPassStream,
-    z_packed: &[F128],
-    codeword: Vec<F128>,
-    params: &crate::pcs::commit::PcsParams,
-    cpu: impl FnOnce(&mut [F128]) -> Vec<crate::merkle::Hash>,
-) -> (crate::pcs::commit::CodewordBuf, crate::pcs::commit::MerkleTreeBuf) {
-    imp::finish_from_z_first_pass_or_fallback(stream.inner, z_packed, codeword, params, cpu)
 }
 
 /// A read-only view of the transformed L0 codeword living in the GPU's
@@ -250,33 +194,6 @@ pub(crate) fn give_tree(tree: Vec<crate::merkle::Hash>) {
 static PRECOMPUTE_BRANCH_WALL_MS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
-/// Maximum untimed-warmup delay allowed while handing the concurrently
-/// measured AB-branch wall to the hybrid split sweep. The wait is outside
-/// every scored prove and prevents the sweep from silently substituting its
-/// 100 ms fallback when the commit arm reaches tuning just before the sibling
-/// `rayon::join` arm publishes its measurement.
-const PRECOMPUTE_WALL_HANDOFF_TIMEOUT: std::time::Duration =
-    std::time::Duration::from_secs(2);
-
-fn wait_for_nonzero_wall_ms(
-    wall_bits: &std::sync::atomic::AtomicU64,
-    timeout: std::time::Duration,
-) -> f64 {
-    let start = std::time::Instant::now();
-    loop {
-        let wall = f64::from_bits(wall_bits.load(std::sync::atomic::Ordering::Relaxed));
-        if wall.is_finite() && wall > 0.0 {
-            return wall;
-        }
-        if start.elapsed() >= timeout {
-            return 0.0;
-        }
-        // This runs only in the untimed warmup. Yield instead of burning the
-        // current OS time slice while the sibling AB precompute publishes.
-        std::thread::yield_now();
-    }
-}
-
 /// Record the measured precompute branch wall for this process (called by
 /// the prover; last writer wins, which is the most recent prove).
 pub fn note_precompute_branch_wall_ms(ms: f64) {
@@ -287,11 +204,8 @@ pub fn note_precompute_branch_wall_ms(ms: f64) {
     not(all(target_os = "macos", target_arch = "aarch64")),
     allow(dead_code)
 )]
-fn wait_for_precompute_branch_wall_ms() -> f64 {
-    wait_for_nonzero_wall_ms(
-        &PRECOMPUTE_BRANCH_WALL_MS,
-        PRECOMPUTE_WALL_HANDOFF_TIMEOUT,
-    )
+pub(crate) fn precompute_branch_wall_ms() -> f64 {
+    f64::from_bits(PRECOMPUTE_BRANCH_WALL_MS.load(std::sync::atomic::Ordering::Relaxed))
 }
 
 /// Returns true when the GPU commit machinery is allowed to initialize.
@@ -303,12 +217,6 @@ pub(crate) fn gpu_commit_enabled() -> bool {
     GPU_COMMIT_DEFAULT
         && cfg!(all(target_os = "macos", target_arch = "aarch64"))
         && std::env::var_os(ENV_NO_GPU_COMMIT).is_none()
-}
-
-/// True after untimed warmup permanently selected the ranked GPU path.
-/// The opt-out only restores speculative CPU buffers; it does not disable GPU.
-pub(crate) fn gpu_commit_latched_on() -> bool {
-    std::env::var_os(ENV_NO_LAZY_GPU_CODEWORD).is_none() && imp::gpu_commit_latched_on()
 }
 
 /// Build the flat breadth-first twiddle table for `log_d` layers: layer `l`
@@ -1461,13 +1369,6 @@ kernel void parent_hash(device const uint* children [[buffer(0)]],
             }
         }
 
-        /// Keep an autoreleased command buffer alive after its local
-        /// autorelease pool is popped. Paired with [`Self::release`] after the
-        /// stream waits for completion.
-        pub(crate) unsafe fn retain(&self, obj: Id) -> Id {
-            unsafe { send!(self.api, unsafe extern "C" fn(Id, Sel) -> Id, obj, c"retain") }
-        }
-
         pub(crate) unsafe fn command_buffer(&self) -> Result<Id, String> {
             unsafe {
                 let cb: Id = send!(
@@ -1963,265 +1864,6 @@ kernel void parent_hash(device const uint* children [[buffer(0)]],
 
     static LATCH: Mutex<LatchState> = Mutex::new(LatchState::Undecided);
 
-    /// A staging lease plus retained command buffers for partial first-pass
-    /// dispatches. Each dispatch uses buffer offsets, so the existing tuned
-    /// kernel sees a local `r = 0..r_count` while reading/writing the desired
-    /// global range in all eight message segments.
-    pub(crate) struct FromZFirstPassStream {
-        gpu: &'static Gpu,
-        z_buf: Id,
-        staging: Id,
-        tw_buf: Id,
-        tree_buf: Id,
-        log_d: usize,
-        n_leaves: usize,
-        next_r: usize,
-        pending: Vec<Id>,
-        failed: Option<String>,
-        owns_lease: bool,
-        started: std::time::Instant,
-        /// Hybrid CPU share captured at stream creation; 0 disables the
-        /// early-prefix commit (kill switch, non-hybrid split, or pure-GPU).
-        early_k: usize,
-        /// GPU-prefix command buffer (retained) committed directly behind the
-        /// final streamed tile, with the split it was encoded for. Queue
-        /// order makes it start the moment the first pass completes, deleting
-        /// the host wait/encode bubble; `finish` consumes (or drains) it.
-        early_cb2: Option<(Id, usize)>,
-    }
-
-    // SAFETY: all captured Metal objects are process-persistent and Metal's
-    // command queue/buffers are thread-safe. Mutable range publication is
-    // serialized by `&mut self`; the staging lease excludes another graph.
-    unsafe impl Send for FromZFirstPassStream {}
-
-    impl FromZFirstPassStream {
-        pub(crate) fn submit_ready_range(&mut self, r_start: usize, r_count: usize) {
-            if self.failed.is_some() {
-                return;
-            }
-            let total_r = 1usize << (self.log_d - 4);
-            if r_start != self.next_r
-                || r_count == 0
-                || r_start + r_count > total_r
-                || !r_start.is_multiple_of(4)
-                || !r_count.is_multiple_of(4)
-            {
-                self.failed = Some(format!(
-                    "invalid streamed range start={r_start} count={r_count} next={} total={total_r}",
-                    self.next_r
-                ));
-                return;
-            }
-
-            // A position contains 64 F128 lanes = 1 KiB. Offsetting both the
-            // z and staging bindings makes local kernel r map to global
-            // r_start+r without modifying the proven full-range kernel.
-            let byte_offset = r_start * 64 * core::mem::size_of::<F128>();
-            std::sync::atomic::fence(std::sync::atomic::Ordering::Release);
-            let result = unsafe {
-                let pool = self.gpu.pool_push();
-                let result = (|| -> Result<Id, String> {
-                    let cb = self.gpu.command_buffer()?;
-                    let enc = self.gpu.compute_encoder(cb)?;
-                    let zg4 = super::pass_tune_enabled();
-                    self.gpu.set_pipeline(
-                        enc,
-                        if zg4 { self.gpu.pso_ntt4zg4 } else { self.gpu.pso_ntt4z },
-                    );
-                    self.gpu.set_buffer(enc, self.staging, byte_offset, 0);
-                    self.gpu.set_buffer(enc, self.tw_buf, 0, 1);
-                    let p = NttParams {
-                        log_d: self.log_d as u32,
-                        l: 0,
-                        f: 4,
-                        s: (self.log_d - 4) as u32,
-                    };
-                    let bytes = core::slice::from_raw_parts(
-                        (&p as *const NttParams).cast::<u8>(),
-                        core::mem::size_of::<NttParams>(),
-                    );
-                    self.gpu.set_bytes(enc, bytes, 2);
-                    self.gpu.set_buffer(enc, self.z_buf, byte_offset, 3);
-                    self.gpu.dispatch(enc, (r_count >> if zg4 { 2 } else { 0 }) as u64, 64);
-                    self.gpu.end_encoding(enc);
-                    // `commandBuffer` is autoreleased. Retain it before
-                    // popping this short-lived pool because completion is
-                    // deliberately deferred until witness generation ends.
-                    let cb = self.gpu.retain(cb);
-                    self.gpu.commit_async(cb);
-                    Ok(cb)
-                })();
-                self.gpu.pool_pop(pool);
-                result
-            };
-            match result {
-                Ok(cb) => {
-                    self.pending.push(cb);
-                    self.next_r += r_count;
-                }
-                Err(e) => self.failed = Some(e),
-            }
-
-            // Final tile queued: encode the hybrid GPU prefix now and commit
-            // it directly behind that tile on the same (serial) queue. The
-            // GPU then flows from the last first-pass tile straight into the
-            // prefix passes with no host round-trip, and `finish` skips the
-            // encode on the CPU-suffix critical path. Bit-identical: the
-            // encoded work is exactly what `finish` would have encoded.
-            // (Redraw marker: first draw of this tree scored 1,199,897.47 —
-            // 0.12% below the 1,201,360 bar — on 2026-08-01; content change
-            // required for a per-account resubmission.)
-            if self.failed.is_none()
-                && self.early_k > 0
-                && self.early_cb2.is_none()
-                && self.next_r == total_r
-            {
-                let result = unsafe {
-                    let pool = self.gpu.pool_push();
-                    let result = (|| -> Result<Id, String> {
-                        let cb2 = encode_hybrid_prefix_cb2(
-                            self.gpu,
-                            self.staging,
-                            self.tw_buf,
-                            self.tree_buf,
-                            self.log_d,
-                            self.n_leaves,
-                            self.early_k,
-                        )?;
-                        // Retain across the pool: completion is consumed by
-                        // `finish` (same idiom as the streamed tiles above).
-                        let cb2 = self.gpu.retain(cb2);
-                        self.gpu.commit_async(cb2);
-                        Ok(cb2)
-                    })();
-                    self.gpu.pool_pop(pool);
-                    result
-                };
-                match result {
-                    Ok(cb2) => {
-                        self.early_cb2 = Some((cb2, self.early_k));
-                        if debug_enabled() {
-                            eprintln!(
-                                "[gpu-commit] early hybrid prefix committed behind final tile (k={})",
-                                self.early_k
-                            );
-                        }
-                    }
-                    // Encode failure is not a stream failure: `finish` simply
-                    // takes the ordinary encode path.
-                    Err(e) => {
-                        if debug_enabled() {
-                            eprintln!("[gpu-commit] early hybrid prefix encode failed ({e})");
-                        }
-                    }
-                }
-            }
-        }
-
-        fn wait_pending(&mut self) -> Result<(), String> {
-            let mut result = self.failed.take().map_or(Ok(()), Err);
-            for cb in self.pending.drain(..) {
-                let waited = unsafe { self.gpu.wait_cb(cb) };
-                unsafe { self.gpu.release(cb) };
-                if result.is_ok() {
-                    result = waited;
-                }
-            }
-            result
-        }
-    }
-
-    impl Drop for FromZFirstPassStream {
-        fn drop(&mut self) {
-            let _ = self.wait_pending();
-            if let Some((cb2, _)) = self.early_cb2.take() {
-                let _ = unsafe { self.gpu.wait_cb(cb2) };
-                unsafe { self.gpu.release(cb2) };
-            }
-            if self.owns_lease {
-                STAGING_IN_USE.store(false, std::sync::atomic::Ordering::Release);
-            }
-        }
-    }
-
-    pub(crate) unsafe fn begin_from_z_first_pass_stream(
-        z_ptr: *mut F128,
-        z_len: usize,
-        params: &crate::pcs::commit::PcsParams,
-    ) -> Option<FromZFirstPassStream> {
-        use std::sync::atomic::Ordering;
-        if !super::gpu_commit_enabled()
-            || !super::is_ranked_gpu_shape(params)
-            || rayon::current_num_threads() <= 1
-            || std::env::var_os("FLOCK_NO_WITNESS_GPU_STREAM").is_some()
-            || z_len != 1usize << params.log_msg_len()
-        {
-            return None;
-        }
-        let gpu = gpu().ok()?;
-        let mut latch = LATCH.lock().ok()?;
-        let LatchState::On(state) = &mut *latch else {
-            // The first proof must still run the ordinary dual-path warmup.
-            return None;
-        };
-        if STAGING_IN_USE.swap(true, Ordering::Acquire) {
-            return None;
-        }
-
-        let z_bytes = z_len * core::mem::size_of::<F128>();
-        let z_addr = z_ptr as usize;
-        let cached = state
-            .wraps
-            .iter()
-            .find(|(p, l, _)| *p == z_addr && *l == z_bytes)
-            .map(|&(_, _, buf)| buf);
-        let z_buf = match cached {
-            Some(buf) => buf,
-            None => match unsafe { gpu.wrap_buffer(z_ptr.cast::<u8>(), z_bytes) } {
-                Ok(buf) => {
-                    state.wraps.push((z_addr, z_bytes, buf));
-                    buf
-                }
-                Err(e) => {
-                    if debug_enabled() {
-                        eprintln!("[gpu-commit] streamed z wrap failed ({e})");
-                    }
-                    STAGING_IN_USE.store(false, Ordering::Release);
-                    return None;
-                }
-            },
-        };
-        // Capture the hybrid split for the early-prefix commit at creation:
-        // the sweep publishes before any timed prove, so this matches the
-        // value `finish` will read; `finish` still re-checks and recovers if
-        // it changed (possible only around warmup).
-        let early_k = if std::env::var_os("FLOCK_NO_EARLY_GPU_PREFIX").is_some() {
-            0
-        } else {
-            match hybrid_cpu_sixteenths() {
-                k @ 1..=15 => k,
-                _ => 0,
-            }
-        };
-        Some(FromZFirstPassStream {
-            gpu,
-            z_buf,
-            staging: state.staging,
-            tw_buf: state.tw_buf,
-            tree_buf: state.tree_buf,
-            log_d: params.k_code(),
-            n_leaves: params.n_leaves(),
-            next_r: 0,
-            pending: Vec::with_capacity(8),
-            failed: None,
-            owns_lease: true,
-            started: std::time::Instant::now(),
-            early_k,
-            early_cb2: None,
-        })
-    }
-
     /// Pool for ranked-size tree allocations (the 64 MiB copy-out target).
     static TREE_POOL: Mutex<Vec<Vec<Hash>>> = Mutex::new(Vec::new());
     /// Ranked tree node count; only allocations this large are pooled.
@@ -2418,86 +2060,6 @@ kernel void parent_hash(device const uint* children [[buffer(0)]],
         }
     }
 
-    /// Finish the pure-GPU graph when layers 0..3 have already been written
-    /// into `staging` by the witness-overlapped stream.
-    unsafe fn run_commit_graph_after_from_z(
-        gpu: &Gpu,
-        staging: Id,
-        tw_buf: Id,
-        tree_buf: Id,
-        log_d: usize,
-        n_leaves: usize,
-    ) -> Result<(), String> {
-        unsafe {
-            let pool = gpu.pool_push();
-            let r = (|| {
-                let cb = gpu.command_buffer()?;
-                let enc = gpu.compute_encoder(cb)?;
-                encode_ntt_passes(gpu, enc, staging, tw_buf, log_d, 4);
-                encode_merkle(gpu, enc, staging, tree_buf, n_leaves);
-                gpu.end_encoding(enc);
-                gpu.commit_and_wait(cb)
-            })();
-            gpu.pool_pop(pool);
-            r
-        }
-    }
-
-    /// Suffix-NTT twiddle table for the hybrid CPU share. Deterministic per
-    /// `log_d`; built once per process. Exposed so the warmup autotune sweep
-    /// can prebuild it untimed instead of charging the build to the first
-    /// hybrid candidate's measured wall.
-    fn hybrid_suffix_ntt(log_d: usize) -> &'static AdditiveNttF128 {
-        static NTT: std::sync::OnceLock<AdditiveNttF128> = std::sync::OnceLock::new();
-        let ntt = NTT.get_or_init(|| AdditiveNttF128::standard(log_d));
-        debug_assert_eq!(ntt.log_domain_size(), log_d);
-        ntt
-    }
-
-    /// From-z top pass (layers 0..3) over the full position range, alone in
-    /// its own command buffer. This is the graph prefix the witness-overlapped
-    /// stream runs before the timed prove; the autotune sweep uses it as an
-    /// untimed staging re-prime so each candidate times only the
-    /// after-first-pass graph the timed prove actually dispatches.
-    unsafe fn run_from_z_first_pass(
-        gpu: &Gpu,
-        z_buf: Id,
-        staging: Id,
-        tw_buf: Id,
-        log_d: usize,
-    ) -> Result<(), String> {
-        unsafe {
-            let cb1 = gpu.command_buffer()?;
-            let enc = gpu.compute_encoder(cb1)?;
-            // From-z tiles all live in block B = 0 (l = 0), so the g4
-            // table-reuse idiom applies; the tuned kernel also skips
-            // the zero-region sub-layer (a pure copy).
-            let zg4 = super::pass_tune_enabled();
-            gpu.set_pipeline(enc, if zg4 { gpu.pso_ntt4zg4 } else { gpu.pso_ntt4z });
-            gpu.set_buffer(enc, staging, 0, 0);
-            gpu.set_buffer(enc, tw_buf, 0, 1);
-            let p = NttParams {
-                log_d: log_d as u32,
-                l: 0,
-                f: 4,
-                s: (log_d - 4) as u32,
-            };
-            let bytes = core::slice::from_raw_parts(
-                (&p as *const NttParams).cast::<u8>(),
-                core::mem::size_of::<NttParams>(),
-            );
-            gpu.set_bytes(enc, bytes, 2);
-            gpu.set_buffer(enc, z_buf, 0, 3);
-            if zg4 {
-                gpu.dispatch(enc, 1u64 << (log_d - 6), 64);
-            } else {
-                gpu.dispatch(enc, 1u64 << (log_d - 4), 64);
-            }
-            gpu.end_encoding(enc);
-            gpu.commit_and_wait(cb1)
-        }
-    }
-
     /// Hybrid GPU/CPU commit graph: the GPU runs the shared from-z top pass
     /// (layers 0..3) over the full codeword, then owns the position prefix
     /// (first `16 - k` sixteenths: remaining NTT passes + its aligned Merkle
@@ -2509,47 +2071,7 @@ kernel void parent_hash(device const uint* children [[buffer(0)]],
     ///
     /// Bit-exact: same kernels/twiddles on both sides, every element and
     /// tree node written exactly once (top nodes twice, identically).
-    /// Encode (but do not commit) the hybrid graph's GPU-prefix command
-    /// buffer: remaining NTT passes over the first `16 - k_cpu16` sixteenths
-    /// plus their aligned Merkle subtrees. The returned command buffer is
-    /// autoreleased — callers that outlive the current pool must retain it.
-    /// Factored out so the streamed first pass can pre-encode and commit it
-    /// immediately behind the final streamed tile, removing the host
-    /// wait/encode bubble between first-pass completion and prefix start.
-    unsafe fn encode_hybrid_prefix_cb2(
-        gpu: &Gpu,
-        staging: Id,
-        tw_buf: Id,
-        tree_buf: Id,
-        log_d: usize,
-        n_leaves: usize,
-        k_cpu16: usize,
-    ) -> Result<Id, String> {
-        debug_assert!((1..16).contains(&k_cpu16));
-        unsafe {
-            let prefix16 = (16 - k_cpu16) as u64;
-            let cb2 = gpu.command_buffer()?;
-            let enc = gpu.compute_encoder(cb2)?;
-            encode_ntt_passes_prefix(gpu, enc, staging, tw_buf, log_d, 4, prefix16);
-            // Greedy aligned power-of-two subtree decomposition of the
-            // leaf prefix.
-            let sixteenth = n_leaves / 16;
-            let mut start = 0usize;
-            let prefix_leaves = (16 - k_cpu16) * sixteenth;
-            while start < prefix_leaves {
-                let mut size = 1usize << (prefix_leaves - start).ilog2();
-                while start % size != 0 {
-                    size >>= 1;
-                }
-                encode_merkle_subtree(gpu, enc, staging, tree_buf, n_leaves, start, size);
-                start += size;
-            }
-            gpu.end_encoding(enc);
-            Ok(cb2)
-        }
-    }
-
-    unsafe fn run_commit_graph_from_z_hybrid_impl(
+    unsafe fn run_commit_graph_from_z_hybrid(
         gpu: &Gpu,
         z_buf: Id,
         staging: Id,
@@ -2558,39 +2080,69 @@ kernel void parent_hash(device const uint* children [[buffer(0)]],
         log_d: usize,
         n_leaves: usize,
         k_cpu16: usize,
-        first_pass_done: bool,
-        pre_cb2: Option<Id>,
     ) -> Result<(), String> {
         use rayon::prelude::*;
         debug_assert!((1..16).contains(&k_cpu16));
         unsafe {
             let pool = gpu.pool_push();
             let r = (|| {
-                if !first_pass_done {
-                    // cb1: shared top pass, full range.
-                    debug_assert!(pre_cb2.is_none());
-                    run_from_z_first_pass(gpu, z_buf, staging, tw_buf, log_d)?;
+                // cb1: shared top pass, full range.
+                let cb1 = gpu.command_buffer()?;
+                let enc = gpu.compute_encoder(cb1)?;
+                // From-z tiles all live in block B = 0 (l = 0), so the g4
+                // table-reuse idiom applies; the tuned kernel also skips the
+                // zero-region sub-layer (a pure copy).
+                let zg4 = super::pass_tune_enabled();
+                gpu.set_pipeline(enc, if zg4 { gpu.pso_ntt4zg4 } else { gpu.pso_ntt4z });
+                gpu.set_buffer(enc, staging, 0, 0);
+                gpu.set_buffer(enc, tw_buf, 0, 1);
+                let p = NttParams {
+                    log_d: log_d as u32,
+                    l: 0,
+                    f: 4,
+                    s: (log_d - 4) as u32,
+                };
+                let bytes = core::slice::from_raw_parts(
+                    (&p as *const NttParams).cast::<u8>(),
+                    core::mem::size_of::<NttParams>(),
+                );
+                gpu.set_bytes(enc, bytes, 2);
+                gpu.set_buffer(enc, z_buf, 0, 3);
+                if zg4 {
+                    gpu.dispatch(enc, 1u64 << (log_d - 6), 64);
+                } else {
+                    gpu.dispatch(enc, 1u64 << (log_d - 4), 64);
                 }
+                gpu.end_encoding(enc);
+                gpu.commit_and_wait(cb1)?;
 
                 // cb2: GPU prefix — remaining passes + aligned subtrees.
-                // A pre-committed cb2 (streamed early-prefix path) was
-                // already queued directly behind the final first-pass tile.
-                let cb2 = match pre_cb2 {
-                    Some(cb2) => cb2,
-                    None => {
-                        let cb2 = encode_hybrid_prefix_cb2(
-                            gpu, staging, tw_buf, tree_buf, log_d, n_leaves, k_cpu16,
-                        )?;
-                        gpu.commit_async(cb2);
-                        cb2
+                let prefix16 = (16 - k_cpu16) as u64;
+                let cb2 = gpu.command_buffer()?;
+                let enc = gpu.compute_encoder(cb2)?;
+                encode_ntt_passes_prefix(gpu, enc, staging, tw_buf, log_d, 4, prefix16);
+                // Greedy aligned power-of-two subtree decomposition of the
+                // leaf prefix.
+                let sixteenth = n_leaves / 16;
+                let mut start = 0usize;
+                let prefix_leaves = (16 - k_cpu16) * sixteenth;
+                while start < prefix_leaves {
+                    let mut size = 1usize << (prefix_leaves - start).ilog2();
+                    while start % size != 0 {
+                        size >>= 1;
                     }
-                };
-                let prefix_leaves = (16 - k_cpu16) * (n_leaves / 16);
+                    encode_merkle_subtree(gpu, enc, staging, tree_buf, n_leaves, start, size);
+                    start += size;
+                }
+                gpu.end_encoding(enc);
+                gpu.commit_async(cb2);
 
                 // CPU: suffix NTT completion + leaves + subtree parents.
-                // The twiddle table is deterministic per log_d; built once per
-                // process (the autotune sweep prebuilds it untimed).
-                let ntt = hybrid_suffix_ntt(log_d);
+                // The twiddle table is deterministic per log_d; build it once
+                // per process (first call lands in the untimed warmup).
+                static NTT: std::sync::OnceLock<AdditiveNttF128> = std::sync::OnceLock::new();
+                let ntt = NTT.get_or_init(|| AdditiveNttF128::standard(log_d));
+                debug_assert_eq!(ntt.log_domain_size(), log_d);
                 let data: &mut [F128] = core::slice::from_raw_parts_mut(
                     gpu.buffer_contents(staging).cast::<F128>(),
                     n_leaves * 64,
@@ -2760,23 +2312,6 @@ kernel void parent_hash(device const uint* children [[buffer(0)]],
         }
     }
 
-    unsafe fn run_commit_graph_from_z_hybrid(
-        gpu: &Gpu,
-        z_buf: Id,
-        staging: Id,
-        tw_buf: Id,
-        tree_buf: Id,
-        log_d: usize,
-        n_leaves: usize,
-        k_cpu16: usize,
-    ) -> Result<(), String> {
-        unsafe {
-            run_commit_graph_from_z_hybrid_impl(
-                gpu, z_buf, staging, tw_buf, tree_buf, log_d, n_leaves, k_cpu16, false, None,
-            )
-        }
-    }
-
     /// CPU share of the hybrid commit in sixteenths of the position range.
     /// 0 disables (pure-GPU graph). Default 5 is the conservative midpoint of
     /// the cache-local suffix plateau: it retains most of the measured gain on
@@ -2816,36 +2351,6 @@ kernel void parent_hash(device const uint* children [[buffer(0)]],
                 .and_then(|v| v.parse().ok())
                 .filter(|k| *k < 16)
         })
-    }
-
-    /// Pure selection over the sweep's per-candidate best walls; `candidates`
-    /// is ascending and must contain `default_k`. Deliberately asymmetric
-    /// toward the promoted default:
-    /// - the smallest share within 1.5% of the fastest wins (the timed
-    ///   prove's round-1 precompute contends for the same cores, so
-    ///   near-ties resolve toward the GPU);
-    /// - if the default is itself within 1.5% of the fastest, keep it — an
-    ///   emulated sweep cannot adjudicate noise-thin margins, the ranked
-    ///   runner can;
-    /// - k=0 must beat the default by > 4% — official board evidence has the
-    ///   hybrid several percent ahead of the pure-GPU graph, so a sweep that
-    ///   says otherwise is more likely an emulation artifact (e.g. the burn
-    ///   floor collapsing all candidates) than truth.
-    fn choose_hybrid_k(candidates: &[usize], best_ms: &[f64], default_k: usize) -> Option<usize> {
-        let default_i = candidates
-            .iter()
-            .position(|&k| k == default_k)
-            .expect("default split is a sweep candidate");
-        let fastest = best_ms.iter().cloned().fold(f64::INFINITY, f64::min);
-        let chosen_i = (0..candidates.len()).find(|&i| best_ms[i] <= fastest * 1.015)?;
-        let mut chosen = candidates[chosen_i];
-        if best_ms[default_i] <= fastest * 1.015 {
-            chosen = default_k;
-        }
-        if chosen == 0 && best_ms[chosen_i] > best_ms[default_i] * (1.0 - 0.04) {
-            chosen = default_k;
-        }
-        Some(chosen)
     }
 
     /// Untimed-warmup split sweep. The scoring host's CPU/GPU balance is
@@ -2904,39 +2409,6 @@ kernel void parent_hash(device const uint* children [[buffer(0)]],
                 }
             }
         };
-        // The timed prove no longer runs the from-z first pass inside its
-        // commit window: the witness-overlapped stream finishes layers 0..3
-        // before `finish_from_z_first_pass_or_fallback` dispatches the rest
-        // (`first_pass_done = true`). Timing the full graph here adds a
-        // k-independent GPU constant to every candidate, diluting the GPU
-        // side's k-sensitivity and biasing the chosen split toward too much
-        // CPU (and inflating the near-tie base). Probe the streamed regime
-        // instead: per candidate an untimed staging re-prime via the shared
-        // first pass, then time only the after-first-pass graph — exactly the
-        // dispatch the timed prove runs. `FLOCK_NO_HYBRID_TUNE_STREAMED=1`
-        // restores the full-graph probe.
-        let streamed_probe = std::env::var_os("FLOCK_NO_HYBRID_TUNE_STREAMED").is_none();
-        let timed_graph = |k: usize| -> Result<(), String> {
-            if !streamed_probe {
-                return run_graph(k);
-            }
-            let c = &ctx;
-            unsafe {
-                if k == 0 {
-                    run_commit_graph_after_from_z(
-                        c.gpu, c.staging, c.tw_buf, c.tree_buf, log_d, n_leaves,
-                    )
-                } else {
-                    run_commit_graph_from_z_hybrid_impl(
-                        c.gpu, c.z_buf, c.staging, c.tw_buf, c.tree_buf, log_d, n_leaves, k, true,
-                        None,
-                    )
-                }
-            }
-        };
-        // Prebuild the CPU-suffix twiddle table untimed so its one-time build
-        // is not charged to the first hybrid candidate's measured wall.
-        let _ = hybrid_suffix_ntt(log_d);
         // Contention emulation. In the timed prove the graph shares the
         // rayon pool with the round-1 AB precompute; an uncontended sweep
         // therefore over-allocates the CPU (measured here: the uncontended
@@ -2946,11 +2418,7 @@ kernel void parent_hash(device const uint* children [[buffer(0)]],
         // precompute branch wall. The only wall available at sweep time is
         // the warmup prove's own, which is first-prove-inflated (cold
         // tables/pages; measured ~2x locally), so scale by 0.6 and cap.
-        // Wait for the sibling warmup branch to publish its actual wall. An
-        // immediate relaxed load can race the store at the end of the outer
-        // `rayon::join`, silently replacing the host measurement with 100 ms
-        // and tuning every scored prove against synthetic contention.
-        let pre_wall = super::wait_for_precompute_branch_wall_ms();
+        let pre_wall = super::precompute_branch_wall_ms();
         let burn_ms = if pre_wall > 0.0 {
             (pre_wall * 0.6).min(250.0)
         } else {
@@ -2991,39 +2459,13 @@ kernel void parent_hash(device const uint* children [[buffer(0)]],
                 std::hint::black_box(x);
             });
         };
-        // Wall-safe streamed-regime correction: the per-candidate staging
-        // re-prime form runs the from-z first pass 8+ extra times per
-        // warm-up; multiplied by the harness's ~120 fresh worker processes
-        // that spends minutes of JOB wall against the ranked CI's 8-minute
-        // budget (three above-bar submissions died to it as "failed"
-        // timeouts before the mechanism was identified). The first pass is
-        // k-INDEPENDENT, so measuring its wall once and subtracting the
-        // constant from each candidate's full-graph wall yields the same
-        // corrected ranking at one extra pass total.
-        let first_pass_ms = if streamed_probe {
-            let c = &ctx;
-            let t0 = std::time::Instant::now();
-            match unsafe { run_from_z_first_pass(c.gpu, c.z_buf, c.staging, c.tw_buf, log_d) } {
-                Ok(()) => t0.elapsed().as_secs_f64() * 1e3,
-                Err(e) => {
-                    if dbg {
-                        eprintln!(
-                            "[gpu-commit] autotune: first-pass probe failed ({e}); keeping default"
-                        );
-                    }
-                    return;
-                }
-            }
-        } else {
-            0.0
-        };
         let contended_run = |k: usize| -> Result<f64, String> {
             let t0 = std::time::Instant::now();
-            let (r, ()) = rayon::join(|| timed_graph(k), burn_work);
+            let (r, ()) = rayon::join(|| run_graph(k), burn_work);
             r?;
-            Ok((t0.elapsed().as_secs_f64() * 1e3 - first_pass_ms).max(0.0))
+            Ok(t0.elapsed().as_secs_f64() * 1e3)
         };
-        const CANDIDATES: [usize; 8] = [0, 2, 3, 4, 5, 6, 7, 8];
+        const CANDIDATES: [usize; 7] = [0, 2, 3, 4, 5, 6, 7];
         let mut best_ms = [f64::INFINITY; CANDIDATES.len()];
         for i in 0..CANDIDATES.len() {
             match contended_run(CANDIDATES[i]) {
@@ -3041,29 +2483,37 @@ kernel void parent_hash(device const uint* children [[buffer(0)]],
                 }
             }
         }
-        // Second sample for the three stage-1 leaders plus, always, the
-        // promoted default (min per candidate): one cold draw per k is too
-        // noisy to split plateau neighbors, and the default's wall is a
-        // selection pivot (near-tie band), so it must not keep a single cold
-        // sample just because it missed the top three.
-        let default_i = CANDIDATES
-            .iter()
-            .position(|&k| k == DEFAULT_HYBRID_K)
-            .expect("default split is a sweep candidate");
+        // Second sample for the three stage-1 leaders (min per candidate):
+        // one cold draw per k is too noisy to split plateau neighbors.
         let mut order: Vec<usize> = (0..CANDIDATES.len()).collect();
         order.sort_by(|&a, &b| best_ms[a].total_cmp(&best_ms[b]));
-        let mut resample: Vec<usize> = order.iter().take(3).copied().collect();
-        if !resample.contains(&default_i) {
-            resample.push(default_i);
-        }
-        for &i in &resample {
+        for &i in order.iter().take(3) {
             if let Ok(ms) = contended_run(CANDIDATES[i]) {
                 best_ms[i] = best_ms[i].min(ms);
             }
         }
-        let Some(chosen) = choose_hybrid_k(&CANDIDATES, &best_ms, DEFAULT_HYBRID_K) else {
+        let fastest = best_ms.iter().cloned().fold(f64::INFINITY, f64::min);
+        // Selection is deliberately asymmetric toward the promoted default:
+        // - near-ties (< 1.5%) keep the default — an emulated sweep cannot
+        //   adjudicate noise-thin margins, the ranked runner can;
+        // - k=0 must beat the default by > 4% — official board evidence has
+        //   the hybrid several percent ahead of the pure-GPU graph, so a
+        //   sweep that says otherwise is more likely an emulation artifact
+        //   (e.g. the burn floor collapsing all candidates) than truth.
+        let default_i = CANDIDATES
+            .iter()
+            .position(|&k| k == DEFAULT_HYBRID_K)
+            .expect("default split is a sweep candidate");
+        let Some(chosen_i) = (0..CANDIDATES.len()).find(|&i| best_ms[i] <= fastest * 1.015) else {
             return;
         };
+        let mut chosen = CANDIDATES[chosen_i];
+        if best_ms[default_i] <= fastest * 1.015 {
+            chosen = DEFAULT_HYBRID_K;
+        }
+        if chosen == 0 && best_ms[chosen_i] > best_ms[default_i] * (1.0 - 0.04) {
+            chosen = DEFAULT_HYBRID_K;
+        }
         if dbg {
             let table: Vec<String> = CANDIDATES
                 .iter()
@@ -3326,7 +2776,6 @@ kernel void parent_hash(device const uint* children [[buffer(0)]],
         let gpu = match gpu() {
             Ok(g) => g,
             Err(_) => {
-                codeword = ensure_cpu_codeword(codeword, codeword_len);
                 let tree = cpu(&mut codeword);
                 return (CodewordBuf::Cpu(codeword), MerkleTreeBuf::Cpu(tree));
             }
@@ -3339,7 +2788,6 @@ kernel void parent_hash(device const uint* children [[buffer(0)]],
             if debug_enabled() {
                 eprintln!("[gpu-commit] staging still in use; CPU fallback");
             }
-            codeword = ensure_cpu_codeword(codeword, codeword_len);
             let tree = cpu(&mut codeword);
             return (CodewordBuf::Cpu(codeword), MerkleTreeBuf::Cpu(tree));
         }
@@ -3371,7 +2819,6 @@ kernel void parent_hash(device const uint* children [[buffer(0)]],
                             eprintln!("[gpu-commit] z wrap failed at prove time ({e})");
                         }
                         STAGING_IN_USE.store(false, Ordering::Release);
-                        codeword = ensure_cpu_codeword(codeword, codeword_len);
                         let tree = cpu(&mut codeword);
                         return (CodewordBuf::Cpu(codeword), MerkleTreeBuf::Cpu(tree));
                     }
@@ -3399,7 +2846,6 @@ kernel void parent_hash(device const uint* children [[buffer(0)]],
             if let LatchState::On(state) = std::mem::replace(latch, LatchState::Off) {
                 release_latched(gpu, state);
             }
-            codeword = ensure_cpu_codeword(codeword, codeword_len);
             let tree = cpu(&mut codeword);
             return (CodewordBuf::Cpu(codeword), MerkleTreeBuf::Cpu(tree));
         }
@@ -3414,210 +2860,11 @@ kernel void parent_hash(device const uint* children [[buffer(0)]],
         }
         // The replicated input codeword was never read by the from-z graph;
         // hand it straight back to the scratch pool for the next prove.
-        // Empty marker (latched timed path) is a no-op drop.
-        if !codeword.is_empty() {
-            crate::scratch::give_f128(codeword);
-        }
+        crate::scratch::give_f128(codeword);
         let gpu_codeword = unsafe {
             super::GpuCodeword::new(gpu.buffer_contents(staging).cast::<F128>(), codeword_len)
         };
         (CodewordBuf::Gpu(gpu_codeword), MerkleTreeBuf::Gpu(tree))
-    }
-
-    pub(crate) fn finish_from_z_first_pass_or_fallback(
-        mut stream: FromZFirstPassStream,
-        z_packed: &[F128],
-        mut codeword: Vec<F128>,
-        params: &crate::pcs::commit::PcsParams,
-        cpu: impl FnOnce(&mut [F128]) -> Vec<Hash>,
-    ) -> (crate::pcs::commit::CodewordBuf, crate::pcs::commit::MerkleTreeBuf) {
-        use crate::pcs::commit::{CodewordBuf, MerkleTreeBuf};
-        use std::sync::atomic::Ordering;
-
-        let total_r = 1usize << (stream.log_d - 4);
-        let first_pass = stream.wait_pending().and_then(|()| {
-            if stream.next_r == total_r {
-                Ok(())
-            } else {
-                Err(format!(
-                    "streamed first pass incomplete: {} of {total_r} r tiles",
-                    stream.next_r
-                ))
-            }
-        });
-
-        let mut latch = LATCH.lock().unwrap();
-        let state_matches = matches!(
-            &*latch,
-            LatchState::On(state)
-                if state.staging == stream.staging
-                    && state.tw_buf == stream.tw_buf
-                    && state.tree_buf == stream.tree_buf
-        );
-        // Consume any early-committed GPU prefix before choosing a path: it
-        // was queued directly behind the final streamed tile and may already
-        // be executing against the latched buffers, so every exit from this
-        // function must have waited on it (or handed it to the graph, which
-        // waits internally).
-        let early = stream.early_cb2.take();
-        let drain_early = |early: Option<(Id, usize)>| {
-            if let Some((cb2, _)) = early {
-                let _ = unsafe { stream.gpu.wait_cb(cb2) };
-                unsafe { stream.gpu.release(cb2) };
-            }
-        };
-        let run = if let Err(e) = first_pass {
-            drain_early(early);
-            Err(e)
-        } else if !state_matches
-            || z_packed.as_ptr() as usize
-                != unsafe { stream.gpu.buffer_contents(stream.z_buf) } as usize
-            || z_packed.len() != 1usize << params.log_msg_len()
-        {
-            drain_early(early);
-            Err("streamed GPU latch or z allocation changed before finish".into())
-        } else {
-            let k_cpu16 = hybrid_cpu_sixteenths();
-            unsafe {
-                match early {
-                    Some((cb2, k_early)) if k_early == k_cpu16 => {
-                        let r = run_commit_graph_from_z_hybrid_impl(
-                            stream.gpu,
-                            stream.z_buf,
-                            stream.staging,
-                            stream.tw_buf,
-                            stream.tree_buf,
-                            stream.log_d,
-                            stream.n_leaves,
-                            k_cpu16,
-                            true,
-                            Some(cb2),
-                        );
-                        stream.gpu.release(cb2);
-                        r
-                    }
-                    Some(early_stale @ (_, _)) => {
-                        // The published split changed between the final tile
-                        // and finish (possible only around warmup): the early
-                        // prefix advanced the wrong block range past layer 4.
-                        // Drain it, restore the whole layer-4 staging state
-                        // with a fresh full-range first pass, then run the
-                        // graph for the current split.
-                        drain_early(Some(early_stale));
-                        run_from_z_first_pass(
-                            stream.gpu,
-                            stream.z_buf,
-                            stream.staging,
-                            stream.tw_buf,
-                            stream.log_d,
-                        )
-                        .and_then(|()| {
-                            if k_cpu16 > 0 {
-                                run_commit_graph_from_z_hybrid_impl(
-                                    stream.gpu,
-                                    stream.z_buf,
-                                    stream.staging,
-                                    stream.tw_buf,
-                                    stream.tree_buf,
-                                    stream.log_d,
-                                    stream.n_leaves,
-                                    k_cpu16,
-                                    true,
-                                    None,
-                                )
-                            } else {
-                                run_commit_graph_after_from_z(
-                                    stream.gpu,
-                                    stream.staging,
-                                    stream.tw_buf,
-                                    stream.tree_buf,
-                                    stream.log_d,
-                                    stream.n_leaves,
-                                )
-                            }
-                        })
-                    }
-                    None => {
-                        if k_cpu16 > 0 {
-                            run_commit_graph_from_z_hybrid_impl(
-                                stream.gpu,
-                                stream.z_buf,
-                                stream.staging,
-                                stream.tw_buf,
-                                stream.tree_buf,
-                                stream.log_d,
-                                stream.n_leaves,
-                                k_cpu16,
-                                true,
-                                None,
-                            )
-                        } else {
-                            run_commit_graph_after_from_z(
-                                stream.gpu,
-                                stream.staging,
-                                stream.tw_buf,
-                                stream.tree_buf,
-                                stream.log_d,
-                                stream.n_leaves,
-                            )
-                        }
-                    }
-                }
-            }
-        };
-
-        if let Err(e) = run {
-            eprintln!("[gpu-commit] streamed GPU failed ({e}); falling back to CPU");
-            stream.owns_lease = false;
-            STAGING_IN_USE.store(false, Ordering::Release);
-            if let LatchState::On(state) = std::mem::replace(&mut *latch, LatchState::Off) {
-                release_latched(stream.gpu, state);
-            }
-            drop(latch);
-            codeword = ensure_cpu_codeword(codeword, params.codeword_len_f128());
-            let tree = cpu(&mut codeword);
-            return (CodewordBuf::Cpu(codeword), MerkleTreeBuf::Cpu(tree));
-        }
-
-        let total_nodes = 2 * stream.n_leaves - 1;
-        let codeword_len = params.codeword_len_f128();
-        let tree = unsafe {
-            super::GpuMerkleTree::new(
-                stream.gpu.buffer_contents(stream.tree_buf).cast::<Hash>(),
-                total_nodes,
-            )
-        };
-        if std::env::var_os("FLOCK_COMMIT_TIMING").is_some() || debug_enabled() {
-            let wall_ms = stream.started.elapsed().as_secs_f64() * 1e3;
-            eprintln!(
-                "[commit-timing] gpu-commit: streamed witness+graph window {wall_ms:.2} ms + zero-copy tree"
-            );
-        }
-        // Empty marker (latched streamed path) is a no-op drop.
-        if !codeword.is_empty() {
-            crate::scratch::give_f128(codeword);
-        }
-        let gpu_codeword = unsafe {
-            super::GpuCodeword::new(
-                stream.gpu.buffer_contents(stream.staging).cast::<F128>(),
-                codeword_len,
-            )
-        };
-        // Transfer the staging lease to `GpuCodeword`; its Drop releases it.
-        stream.owns_lease = false;
-        drop(latch);
-        (CodewordBuf::Gpu(gpu_codeword), MerkleTreeBuf::Gpu(tree))
-    }
-
-    pub(crate) fn gpu_commit_latched_on() -> bool {
-        matches!(*LATCH.lock().unwrap(), LatchState::On(_))
-    }
-
-    fn ensure_cpu_codeword(mut codeword: Vec<F128>, len: usize) -> Vec<F128> {
-        if codeword.len() != len {
-            codeword = crate::scratch::take_f128(len);
-        }
-        codeword
     }
 
     pub(crate) fn commit_l0_or_fallback(
@@ -3631,7 +2878,6 @@ kernel void parent_hash(device const uint* children [[buffer(0)]],
             || !super::is_ranked_gpu_shape(params)
             || rayon::current_num_threads() <= 1
         {
-            codeword = ensure_cpu_codeword(codeword, params.codeword_len_f128());
             let tree = cpu(&mut codeword);
             return (CodewordBuf::Cpu(codeword), MerkleTreeBuf::Cpu(tree));
         }
@@ -3639,7 +2885,6 @@ kernel void parent_hash(device const uint* children [[buffer(0)]],
         match &*latch {
             LatchState::Off => {
                 drop(latch);
-                codeword = ensure_cpu_codeword(codeword, params.codeword_len_f128());
                 let tree = cpu(&mut codeword);
                 (CodewordBuf::Cpu(codeword), MerkleTreeBuf::Cpu(tree))
             }
@@ -3700,54 +2945,6 @@ kernel void parent_hash(device const uint* children [[buffer(0)]],
             result
         }
     }
-
-    #[cfg(test)]
-    mod split_select_tests {
-        use super::{DEFAULT_HYBRID_K, choose_hybrid_k};
-        const C: [usize; 8] = [0, 2, 3, 4, 5, 6, 7, 8];
-
-        #[test]
-        fn smallest_share_within_band_wins() {
-            // k=3 fastest; k=2 within 1.5%; default k=5 far off → smallest in band.
-            let ms = [200.0, 100.5, 100.0, 120.0, 150.0, 150.0, 150.0, 150.0];
-            assert_eq!(choose_hybrid_k(&C, &ms, DEFAULT_HYBRID_K), Some(2));
-        }
-
-        #[test]
-        fn default_near_tie_keeps_default() {
-            // k=3 fastest but default k=5 within 1.5% → default retained.
-            let ms = [200.0, 130.0, 100.0, 120.0, 101.0, 150.0, 150.0, 150.0];
-            assert_eq!(choose_hybrid_k(&C, &ms, DEFAULT_HYBRID_K), Some(5));
-        }
-
-        #[test]
-        fn marginal_pure_gpu_is_rejected() {
-            // k=0 fastest but beats the default by < 4% → default retained.
-            let ms = [100.0, 130.0, 130.0, 130.0, 103.0, 150.0, 150.0, 150.0];
-            assert_eq!(choose_hybrid_k(&C, &ms, DEFAULT_HYBRID_K), Some(5));
-        }
-
-        #[test]
-        fn decisive_pure_gpu_wins() {
-            // k=0 beats the default by > 4% and nothing else is in band.
-            let ms = [100.0, 130.0, 130.0, 130.0, 120.0, 150.0, 150.0, 150.0];
-            assert_eq!(choose_hybrid_k(&C, &ms, DEFAULT_HYBRID_K), Some(0));
-        }
-
-        #[test]
-        fn k8_is_reachable() {
-            // Largest share wins decisively → the sweep can now choose it.
-            let ms = [200.0, 180.0, 170.0, 160.0, 150.0, 140.0, 130.0, 100.0];
-            assert_eq!(choose_hybrid_k(&C, &ms, DEFAULT_HYBRID_K), Some(8));
-        }
-
-        #[test]
-        #[should_panic(expected = "default split is a sweep candidate")]
-        fn missing_default_is_a_contract_violation() {
-            let ms = [100.0, 100.0];
-            let _ = choose_hybrid_k(&[0, 2], &ms, DEFAULT_HYBRID_K);
-        }
-    }
 }
 
 // Test-harness entry points (copy-in/copy-out); production goes through
@@ -3759,34 +2956,6 @@ pub(crate) use imp::{gpu_merkle_tree_blake3, gpu_ntt_interleaved_from_layer};
 #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
 mod imp {
     use super::*;
-
-    pub(crate) struct FromZFirstPassStream;
-
-    impl FromZFirstPassStream {
-        pub(crate) fn submit_ready_range(&mut self, _r_start: usize, _r_count: usize) {}
-    }
-
-    pub(crate) unsafe fn begin_from_z_first_pass_stream(
-        _z_ptr: *mut F128,
-        _z_len: usize,
-        _params: &crate::pcs::commit::PcsParams,
-    ) -> Option<FromZFirstPassStream> {
-        None
-    }
-
-    pub(crate) fn finish_from_z_first_pass_or_fallback(
-        _stream: FromZFirstPassStream,
-        _z_packed: &[F128],
-        mut codeword: Vec<F128>,
-        _params: &crate::pcs::commit::PcsParams,
-        cpu: impl FnOnce(&mut [F128]) -> Vec<crate::merkle::Hash>,
-    ) -> (crate::pcs::commit::CodewordBuf, crate::pcs::commit::MerkleTreeBuf) {
-        let tree = cpu(&mut codeword);
-        (
-            crate::pcs::commit::CodewordBuf::Cpu(codeword),
-            crate::pcs::commit::MerkleTreeBuf::Cpu(tree),
-        )
-    }
 
     pub(crate) fn gpu_ntt_interleaved_from_layer(
         _ntt: &AdditiveNttF128,
@@ -3802,10 +2971,6 @@ mod imp {
         _n_leaves: usize,
     ) -> Result<Vec<crate::merkle::Hash>, String> {
         Err("GPU commit is only available on macOS/aarch64".into())
-    }
-
-    pub(crate) fn gpu_commit_latched_on() -> bool {
-        false
     }
 
     pub(crate) fn commit_l0_or_fallback(
@@ -3834,26 +2999,6 @@ pub(crate) use imp::{gpu_merkle_tree_blake3, gpu_ntt_interleaved_from_layer};
 mod tests {
     use super::*;
     use crate::field::F128;
-
-    #[test]
-    fn precompute_wall_handoff_observes_late_store() {
-        let wall_bits = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
-        let writer = wall_bits.clone();
-        let handle = std::thread::spawn(move || {
-            std::thread::sleep(std::time::Duration::from_millis(5));
-            writer.store(137.25f64.to_bits(), std::sync::atomic::Ordering::Relaxed);
-        });
-        let got = wait_for_nonzero_wall_ms(&wall_bits, std::time::Duration::from_millis(250));
-        handle.join().unwrap();
-        assert_eq!(got, 137.25);
-    }
-
-    #[test]
-    fn precompute_wall_handoff_times_out_to_fallback_sentinel() {
-        let wall_bits = std::sync::atomic::AtomicU64::new(0);
-        let got = wait_for_nonzero_wall_ms(&wall_bits, std::time::Duration::from_millis(1));
-        assert_eq!(got, 0.0);
-    }
 
     struct Rng(u64);
     impl Rng {
@@ -3892,38 +3037,6 @@ mod tests {
             }
             Err(e) => panic!("GPU error: {e}"),
         }
-    }
-
-    /// A latched caller is allowed to pass an empty marker instead of the
-    /// ranked CPU scratch buffer. Every CPU fallback gate must hydrate that
-    /// marker before invoking the closure; use a small non-ranked shape to
-    /// exercise the deterministic early-gate path without initializing Metal.
-    #[test]
-    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-    fn empty_codeword_marker_is_hydrated_before_cpu_fallback() {
-        use crate::merkle::HashKind;
-        use crate::pcs::commit::{CodewordBuf, MerkleTreeBuf, PcsParams};
-        use crate::pcs::ligerito::LigeritoProfile;
-
-        let params = PcsParams {
-            m: 10,
-            log_inv_rate: 1,
-            log_batch_size: 1,
-            profile: LigeritoProfile::Fast,
-            merkle_hash: HashKind::Blake3,
-        };
-        let expected_len = params.codeword_len_f128();
-        let (codeword, tree) = commit_l0_or_fallback(&[], Vec::new(), &params, |cw| {
-            assert_eq!(cw.len(), expected_len);
-            cw.fill(F128::ONE);
-            vec![[0xA5; 32]]
-        });
-
-        assert!(matches!(codeword, CodewordBuf::Cpu(_)));
-        assert_eq!(codeword.len(), expected_len);
-        assert!(codeword.iter().all(|&x| x == F128::ONE));
-        assert!(matches!(tree, MerkleTreeBuf::Cpu(_)));
-        assert_eq!(&*tree, &[[0xA5; 32]]);
     }
 
     /// CPU oracle for exactly one interleaved butterfly layer.
