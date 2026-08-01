@@ -3071,6 +3071,10 @@ kernel void parent_hash3(device const uint* children [[buffer(0)]],
         {
             return;
         }
+        // Preserve the promoted split-selection curve. The flat scheduler is
+        // a timed-path execution optimization, not a policy change.
+        let _generic_suffix_probe =
+            crate::ntt::additive_ntt_f128::suppress_ranked_flat_cpu_suffix_for_probe();
         let dbg = debug_enabled() || std::env::var_os("FLOCK_COMMIT_TIMING").is_some();
         let z_buf = latched.wraps[0].2;
         let (tw_buf, tree_buf, staging) = (latched.tw_buf, latched.tree_buf, latched.staging);
