@@ -71,6 +71,11 @@ fn select_gpu_parent3(n_leaves_total: usize, enabled: bool) -> bool {
     enabled && n_leaves_total == 1usize << 20
 }
 
+#[inline]
+fn select_gpu_parent_tail5(local_len: usize, parent3: bool) -> bool {
+    parent3 && local_len == 32
+}
+
 #[cfg(test)]
 mod parent3_gate_tests {
     use std::ffi::OsStr;
@@ -84,6 +89,10 @@ mod parent3_gate_tests {
         assert!(super::select_gpu_parent3(1 << 20, true));
         assert!(!super::select_gpu_parent3(1 << 20, false));
         assert!(!super::select_gpu_parent3(1 << 19, true));
+        assert!(super::select_gpu_parent_tail5(32, true));
+        assert!(!super::select_gpu_parent_tail5(32, false));
+        assert!(!super::select_gpu_parent_tail5(16, true));
+        assert!(!super::select_gpu_parent_tail5(64, true));
     }
 }
 
@@ -1334,6 +1343,99 @@ kernel void parent_hash3(device const uint* children [[buffer(0)]],
     }
 }
 
+// Finish an exact 32-node tail in one 32-thread dispatch. The ranked full
+// tree reaches this shape after its five parent_hash3 dispatches. Subtree
+// encoding may reach the same aligned shape. All barriers are unconditional;
+// successively smaller lane prefixes emit the ordinary 16 / 8 / 4 / 2 / 1
+// flat-tree levels while keeping each intermediate read set in threadgroup
+// memory. This removes four tiny dispatches without changing any node slot.
+kernel void parent_hash_tail5(device const uint* children [[buffer(0)]],
+                              device uint* parents1      [[buffer(1)]],
+                              device uint* parents2      [[buffer(2)]],
+                              device uint* parents3      [[buffer(3)]],
+                              device uint* parents4      [[buffer(4)]],
+                              device uint* parents5      [[buffer(5)]],
+                              uint lid [[thread_index_in_threadgroup]])
+{
+    threadgroup uint level1[16u * 8u];
+    threadgroup uint level2[8u * 8u];
+    threadgroup uint level3[4u * 8u];
+    threadgroup uint level4[2u * 8u];
+
+    if (lid < 16u) {
+        uint block[16];
+        for (uint i = 0u; i < 16u; i++) block[i] = children[lid * 16u + i];
+        uint cv[8];
+        for (uint i = 0u; i < 8u; i++) cv[i] = B3_IV[i];
+        b3_compress(cv, block, 64u, B3_PARENT);
+        for (uint i = 0u; i < 8u; i++) {
+            parents1[lid * 8u + i] = cv[i];
+            level1[lid * 8u + i] = cv[i];
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (lid < 8u) {
+        uint block[16];
+        for (uint i = 0u; i < 8u; i++) {
+            block[i] = level1[(2u * lid) * 8u + i];
+            block[8u + i] = level1[(2u * lid + 1u) * 8u + i];
+        }
+        uint cv[8];
+        for (uint i = 0u; i < 8u; i++) cv[i] = B3_IV[i];
+        b3_compress(cv, block, 64u, B3_PARENT);
+        for (uint i = 0u; i < 8u; i++) {
+            parents2[lid * 8u + i] = cv[i];
+            level2[lid * 8u + i] = cv[i];
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (lid < 4u) {
+        uint block[16];
+        for (uint i = 0u; i < 8u; i++) {
+            block[i] = level2[(2u * lid) * 8u + i];
+            block[8u + i] = level2[(2u * lid + 1u) * 8u + i];
+        }
+        uint cv[8];
+        for (uint i = 0u; i < 8u; i++) cv[i] = B3_IV[i];
+        b3_compress(cv, block, 64u, B3_PARENT);
+        for (uint i = 0u; i < 8u; i++) {
+            parents3[lid * 8u + i] = cv[i];
+            level3[lid * 8u + i] = cv[i];
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (lid < 2u) {
+        uint block[16];
+        for (uint i = 0u; i < 8u; i++) {
+            block[i] = level3[(2u * lid) * 8u + i];
+            block[8u + i] = level3[(2u * lid + 1u) * 8u + i];
+        }
+        uint cv[8];
+        for (uint i = 0u; i < 8u; i++) cv[i] = B3_IV[i];
+        b3_compress(cv, block, 64u, B3_PARENT);
+        for (uint i = 0u; i < 8u; i++) {
+            parents4[lid * 8u + i] = cv[i];
+            level4[lid * 8u + i] = cv[i];
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (lid == 0u) {
+        uint block[16];
+        for (uint i = 0u; i < 8u; i++) {
+            block[i] = level4[i];
+            block[8u + i] = level4[8u + i];
+        }
+        uint cv[8];
+        for (uint i = 0u; i < 8u; i++) cv[i] = B3_IV[i];
+        b3_compress(cv, block, 64u, B3_PARENT);
+        for (uint i = 0u; i < 8u; i++) parents5[i] = cv[i];
+    }
+}
+
 "#;
 
     // -----------------------------------------------------------------------
@@ -1357,6 +1459,7 @@ kernel void parent_hash3(device const uint* children [[buffer(0)]],
         pub(crate) pso_leaf: Id,
         pub(crate) pso_parent: Id,
         pub(crate) pso_parent3: Id,
+        pub(crate) pso_parent_tail5: Id,
     }
     // SAFETY: MTLDevice/MTLCommandQueue/MTLComputePipelineState are
     // documented thread-safe; command buffers/encoders are created and used
@@ -1459,6 +1562,7 @@ kernel void parent_hash3(device const uint* children [[buffer(0)]],
                 let pso_leaf = pso("leaf_hash")?;
                 let pso_parent = pso("parent_hash")?;
                 let pso_parent3 = pso("parent_hash3")?;
+                let pso_parent_tail5 = pso("parent_hash_tail5")?;
                 send!(api, unsafe extern "C" fn(Id, Sel) -> Id, library, c"release");
                 Ok(Gpu {
                     api,
@@ -1475,6 +1579,7 @@ kernel void parent_hash3(device const uint* children [[buffer(0)]],
                     pso_leaf,
                     pso_parent,
                     pso_parent3,
+                    pso_parent_tail5,
                 })
             })();
             pool_pop(pool);
@@ -1949,6 +2054,37 @@ kernel void parent_hash3(device const uint* children [[buffer(0)]],
                 }
             }
 
+            if super::select_gpu_parent_tail5(local_len, parent3) {
+                let level1_start = level_start + level_len;
+                let level1_len = level_len / 2;
+                let local1_start = local_start / 2;
+                let level2_start = level1_start + level1_len;
+                let level2_len = level1_len / 2;
+                let local2_start = local1_start / 2;
+                let level3_start = level2_start + level2_len;
+                let level3_len = level2_len / 2;
+                let local3_start = local2_start / 2;
+                let level4_start = level3_start + level3_len;
+                let level4_len = level3_len / 2;
+                let local4_start = local3_start / 2;
+                let level5_start = level4_start + level4_len;
+                let level5_len = level4_len / 2;
+                let local5_start = local4_start / 2;
+                debug_assert_eq!(local5_start * 32, local_start);
+                gpu.set_pipeline(enc, gpu.pso_parent_tail5);
+                gpu.set_buffer(enc, tree_buf, (level_start + local_start) * 32, 0);
+                gpu.set_buffer(enc, tree_buf, (level1_start + local1_start) * 32, 1);
+                gpu.set_buffer(enc, tree_buf, (level2_start + local2_start) * 32, 2);
+                gpu.set_buffer(enc, tree_buf, (level3_start + local3_start) * 32, 3);
+                gpu.set_buffer(enc, tree_buf, (level4_start + local4_start) * 32, 4);
+                gpu.set_buffer(enc, tree_buf, (level5_start + local5_start) * 32, 5);
+                gpu.dispatch(enc, 1, 32);
+                level_start = level5_start;
+                level_len = level5_len;
+                local_start = local5_start;
+                local_len = 1;
+            }
+
             gpu.set_pipeline(enc, gpu.pso_parent);
             while local_len > 1 {
                 let write_level_start = level_start + level_len;
@@ -2027,6 +2163,29 @@ kernel void parent_hash3(device const uint* children [[buffer(0)]],
                     read_start = write3_start;
                     read_len = write3_len;
                 }
+            }
+
+            if super::select_gpu_parent_tail5(read_len, parent3) {
+                let write1_start = read_start + read_len;
+                let write1_len = read_len / 2;
+                let write2_start = write1_start + write1_len;
+                let write2_len = write1_len / 2;
+                let write3_start = write2_start + write2_len;
+                let write3_len = write2_len / 2;
+                let write4_start = write3_start + write3_len;
+                let write4_len = write3_len / 2;
+                let write5_start = write4_start + write4_len;
+                let write5_len = write4_len / 2;
+                gpu.set_pipeline(enc, gpu.pso_parent_tail5);
+                gpu.set_buffer(enc, tree_buf, read_start * 32, 0);
+                gpu.set_buffer(enc, tree_buf, write1_start * 32, 1);
+                gpu.set_buffer(enc, tree_buf, write2_start * 32, 2);
+                gpu.set_buffer(enc, tree_buf, write3_start * 32, 3);
+                gpu.set_buffer(enc, tree_buf, write4_start * 32, 4);
+                gpu.set_buffer(enc, tree_buf, write5_start * 32, 5);
+                gpu.dispatch(enc, 1, 32);
+                read_start = write5_start;
+                read_len = write5_len;
             }
 
             gpu.set_pipeline(enc, gpu.pso_parent);
@@ -4344,16 +4503,16 @@ mod tests {
         }
     }
 
-    /// Compact real-Metal oracle for the three-level parent pass. It forces
-    /// the experimental encoder independent of the ranked-only env selector
-    /// and compares every flat-tree node with the CPU implementation.
+    /// Compact real-Metal oracle for the three-level parent pass plus the exact
+    /// 32-node tail. It forces the experimental encoder independent of the
+    /// ranked-only env selector and compares every flat-tree node with CPU.
     #[test]
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-    fn gpu_parent3_full_tree_matches_cpu_compact() {
+    fn gpu_parent3_tail5_full_tree_matches_cpu_compact() {
         use super::imp;
 
-        let n_leaves = 1usize << 12;
-        let mut rng = Rng::new(0xB3_3000_12);
+        let n_leaves = 1usize << 11;
+        let mut rng = Rng::new(0xB3_3000_11);
         let data: Vec<u8> = (0..n_leaves * 1024)
             .map(|_| (rng.next_u64() & 0xff) as u8)
             .collect();
@@ -4391,18 +4550,18 @@ mod tests {
     }
 
     /// The hybrid GPU prefix hashes aligned subtrees into global flat-tree
-    /// slots. Verify the fused pass writes every owned node at every level and
-    /// leaves the concurrent CPU owner's ranges untouched.
+    /// slots. Exercise parent3 plus the exact tail and verify every owned node
+    /// while leaving the concurrent CPU owner's ranges untouched.
     #[test]
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-    fn gpu_parent3_subtree_layout_matches_cpu_compact() {
+    fn gpu_parent3_tail5_subtree_layout_matches_cpu_compact() {
         use super::imp;
 
-        const N_LEAVES: usize = 1 << 10;
-        const LEAF_START: usize = 1 << 9;
-        const SUBTREE_LEAVES: usize = 1 << 9;
+        const N_LEAVES: usize = 1 << 12;
+        const LEAF_START: usize = 1 << 11;
+        const SUBTREE_LEAVES: usize = 1 << 11;
         const SENTINEL: crate::merkle::Hash = [0xA5; 32];
-        let mut rng = Rng::new(0xB3_3000_10);
+        let mut rng = Rng::new(0xB3_3000_11);
         let data: Vec<u8> = (0..N_LEAVES * 1024)
             .map(|_| (rng.next_u64() & 0xff) as u8)
             .collect();
@@ -4476,7 +4635,7 @@ mod tests {
                 .iter()
                 .zip(affected)
                 .all(|(node, touched)| touched || *node == SENTINEL),
-            "parent3 subtree encoder wrote outside its owned flat-tree ranges",
+            "parent3/tail5 subtree encoder wrote outside its owned flat-tree ranges",
         );
     }
 
