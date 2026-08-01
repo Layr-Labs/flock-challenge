@@ -1976,7 +1976,8 @@ kernel void parent_hash(device const uint* children [[buffer(0)]],
         log_d: usize,
         n_leaves: usize,
         next_r: usize,
-        pending: Vec<Id>,
+        pending: [Id; 8],
+        pending_len: usize,
         failed: Option<String>,
         owns_lease: bool,
         started: std::time::Instant,
@@ -2057,8 +2058,15 @@ kernel void parent_hash(device const uint* children [[buffer(0)]],
             };
             match result {
                 Ok(cb) => {
-                    self.pending.push(cb);
-                    self.next_r += r_count;
+                    if self.pending_len == self.pending.len() {
+                        let _ = unsafe { self.gpu.wait_cb(cb) };
+                        unsafe { self.gpu.release(cb) };
+                        self.failed = Some("streamed first pass exceeded eight ranked bands".into());
+                    } else {
+                        self.pending[self.pending_len] = cb;
+                        self.pending_len += 1;
+                        self.next_r += r_count;
+                    }
                 }
                 Err(e) => self.failed = Some(e),
             }
@@ -2121,13 +2129,15 @@ kernel void parent_hash(device const uint* children [[buffer(0)]],
 
         fn wait_pending(&mut self) -> Result<(), String> {
             let mut result = self.failed.take().map_or(Ok(()), Err);
-            for cb in self.pending.drain(..) {
+            for index in 0..self.pending_len {
+                let cb = self.pending[index];
                 let waited = unsafe { self.gpu.wait_cb(cb) };
                 unsafe { self.gpu.release(cb) };
                 if result.is_ok() {
                     result = waited;
                 }
             }
+            self.pending_len = 0;
             result
         }
     }
@@ -2213,7 +2223,8 @@ kernel void parent_hash(device const uint* children [[buffer(0)]],
             log_d: params.k_code(),
             n_leaves: params.n_leaves(),
             next_r: 0,
-            pending: Vec::with_capacity(8),
+            pending: [core::ptr::null_mut(); 8],
+            pending_len: 0,
             failed: None,
             owns_lease: true,
             started: std::time::Instant::now(),
