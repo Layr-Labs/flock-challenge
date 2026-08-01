@@ -4682,6 +4682,10 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
             if trace {
                 t_opens += _t.elapsed();
             }
+            // Final open complete — recycle last recursive codeword/tree before
+            // proof-object assembly (transcript copy etc.).
+            crate::scratch::give_f128(std::mem::take(&mut wtns_prev.mat));
+            wtns_prev.tree = Vec::new();
             if trace {
                 let total = t_total.elapsed();
                 eprintln!("[lig-prove] total = {:.2} ms", total.as_secs_f64() * 1e3);
@@ -4796,6 +4800,12 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
         if trace {
             t_opens += _t.elapsed();
         }
+        // Rows + multi-proof are owned copies now. Prior-level codeword mat and
+        // Merkle tree are dead through induce/intro-glue; recycle before induce
+        // so they do not stack under wtns_next (already committed) + induce temps.
+        // Bit-identical: no further reads of wtns_prev.mat/tree this iteration.
+        crate::scratch::give_f128(std::mem::take(&mut wtns_prev.mat));
+        wtns_prev.tree = Vec::new();
         let sks_vks_i = eval_sk_at_vks(n_next);
         let _t = std::time::Instant::now();
         let (basis_i_induced, enforced_sum_i) =
@@ -5916,10 +5926,12 @@ fn recursive_prover_inner<Ch: Challenger>(
     };
     let merkle_proof_0 = merkle_multi_proof_for(&wtns_0.tree, wtns_0.block_len, &queries_0);
     t_opens += t.elapsed();
-    let initial_proof = RecursiveProof {
-        opened_rows: opened_rows_0.clone(),
-        merkle_proof: merkle_proof_0,
-    };
+    // L0 mat/tree dead after open copies; recycle before induce.
+    {
+        let mut wtns_0 = wtns_0;
+        crate::scratch::give_f128(std::mem::take(&mut wtns_0.mat));
+        wtns_0.tree = Vec::new();
+    }
 
     // ---- Induce basis from wtns_0 opens ----
     let sks_vks_n1 = eval_sk_at_vks(n1);
@@ -5933,6 +5945,11 @@ fn recursive_prover_inner<Ch: Challenger>(
         &queries_0,
         &alpha_0,
     );
+    // Move rows into the proof after induce (mirrors the timed basis path).
+    let initial_proof = RecursiveProof {
+        opened_rows: opened_rows_0,
+        merkle_proof: merkle_proof_0,
+    };
     t_induce += t.elapsed();
 
     // ---- Start sumcheck: f¹ · eq(z[initial_k..], ·) = claimed_value ----
@@ -5996,6 +6013,8 @@ fn recursive_prover_inner<Ch: Challenger>(
             };
             let merkle_proof_last =
                 merkle_multi_proof_for(&wtns_prev.tree, wtns_prev.block_len, &queries_last);
+            crate::scratch::give_f128(std::mem::take(&mut wtns_prev.mat));
+            wtns_prev.tree = Vec::new();
             return LigeritoProof {
                 initial_root,
                 initial_proof,
@@ -6058,10 +6077,9 @@ fn recursive_prover_inner<Ch: Challenger>(
         let merkle_proof_i =
             merkle_multi_proof_for(&wtns_prev.tree, wtns_prev.block_len, &queries_i);
         t_opens += t.elapsed();
-        recursive_proofs.push(RecursiveProof {
-            opened_rows: opened_rows_i.clone(),
-            merkle_proof: merkle_proof_i,
-        });
+        // Prior-level mat/tree dead after the open; recycle before induce.
+        crate::scratch::give_f128(std::mem::take(&mut wtns_prev.mat));
+        wtns_prev.tree = Vec::new();
 
         // Induce fresh basis from these opens.
         let sks_vks_i = eval_sk_at_vks(n_next);
@@ -6073,6 +6091,12 @@ fn recursive_prover_inner<Ch: Challenger>(
             &queries_i,
             &alpha_i,
         );
+
+        // Move rows into the proof after induce (no pre-induce clone).
+        recursive_proofs.push(RecursiveProof {
+            opened_rows: opened_rows_i,
+            merkle_proof: merkle_proof_i,
+        });
 
         // Introduce + glue.
         let intro_msg_i = sc_prover.introduce_new(basis_i_induced, enforced_sum_i);
@@ -9423,4 +9447,3 @@ mod tests {
     }
 }
 // Redraw marker 4 (drift probe): zero-diff; prior draws 1,205,646 / 1,205,107 / 1,206,245.
-// Redraw marker 5: preserve the 1,207,147.73 promoted executable exactly.

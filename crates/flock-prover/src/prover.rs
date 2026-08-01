@@ -235,6 +235,8 @@ pub fn prove_ligerito<Ch: Challenger>(
 
     let s_hat_v_ab =
         precompute_ab_s_hat_v(r1cs, &z_vec_pre, &lc_claim.r_inner_rest[1..]);
+        // z_vec_pre only fed s_hat_v_ab; recycle before PCS open residency.
+        flock_core::scratch::give_f128(z_vec_pre);
     let pre_ab: Option<&[F128]> = s_hat_v_ab.as_deref();
     let pre_c: Option<&[F128]> = pre_c_slot(r1cs, &s_hat_v_c);
     let pcs_open = open_claims_with_precomputed_ligerito(
@@ -688,6 +690,8 @@ fn prove_fast_core_with_commit_codeword<Ch: Challenger>(
     // (only test setups; real R1CS has k_log >= 16).
     let s_hat_v_ab =
         precompute_ab_s_hat_v(r1cs, &z_vec_pre, &lc_claim.r_inner_rest[1..]);
+        // z_vec_pre only fed s_hat_v_ab; recycle before PCS open residency.
+        flock_core::scratch::give_f128(z_vec_pre);
     if phase_timing {
         let wall = t_lc.elapsed().as_secs_f64() * 1e3;
         let cpu = process_cpu_ms() - cpu_lc0.unwrap_or(0.0);
@@ -905,6 +909,8 @@ fn prove_fast_ligerito_timed_with_commit_codeword<Ch: Challenger>(
     };
     let s_hat_v_ab =
         precompute_ab_s_hat_v(r1cs, &z_vec_pre, &lc_claim.r_inner_rest[1..]);
+        // z_vec_pre only fed s_hat_v_ab; recycle before PCS open residency.
+        flock_core::scratch::give_f128(z_vec_pre);
     t.lincheck_s = t0.elapsed().as_secs_f64();
 
     // --- Ligerito recursive PCS open ---
