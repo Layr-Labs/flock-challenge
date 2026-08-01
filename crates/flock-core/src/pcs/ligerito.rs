@@ -3952,6 +3952,70 @@ fn materialize_direct_fold4(
     )
 }
 
+/// Exact-`1` control for pairing the ranked DirectFold8 witness/basis
+/// products that share each fold weight. Any other value keeps the paired
+/// path enabled.
+#[inline]
+fn direct_fold8_pair_mul_value_enabled(value: Option<&std::ffi::OsStr>) -> bool {
+    value != Some(std::ffi::OsStr::new("1"))
+}
+
+#[inline]
+#[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+fn direct_fold8_pair_mul_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        direct_fold8_pair_mul_value_enabled(
+            std::env::var_os("FLOCK_NO_DIRECT_FOLD8_PAIR_MUL").as_deref(),
+        )
+    })
+}
+
+/// Fold one 64-bank witness slot and its ordinary-basis peer with the same
+/// weights. On ranked AArch64 the two products for each bank share one
+/// constant-multiplier PMULL reduction; the portable/control path preserves
+/// the original two scalar products exactly.
+#[inline]
+fn fold64_pair_same_weights(
+    witness: &[F128],
+    basis: &[F128],
+    slot: usize,
+    fold_weight: &[F128; 64],
+) -> (F128, F128) {
+    let base = 64 * slot;
+    debug_assert!(base + 64 <= witness.len());
+    debug_assert!(base + 64 <= basis.len());
+
+    #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+    if direct_fold8_pair_mul_enabled() {
+        let mut witness_value = F128::ZERO;
+        let mut basis_value = F128::ZERO;
+        for bank in 0..64 {
+            // SAFETY: the cfg gate supplies PMULL through `aes`. Both products
+            // use the same public fold weight and independent initialized
+            // inputs, which is the complete contract of the paired helper.
+            let products = unsafe {
+                crate::field::gf2_128::aarch64::ghash_mul_const_vec2_neon(
+                    fold_weight[bank],
+                    [witness[base + bank], basis[base + bank]],
+                )
+            };
+            witness_value += products[0];
+            basis_value += products[1];
+        }
+        return (witness_value, basis_value);
+    }
+
+    let mut witness_value = F128::ZERO;
+    let mut basis_value = F128::ZERO;
+    for bank in 0..64 {
+        witness_value += fold_weight[bank] * witness[base + bank];
+        basis_value += fold_weight[bank] * basis[base + bank];
+    }
+    (witness_value, basis_value)
+}
+
 /// Sixty-four-bank materializer. Six challenges are sampled from direct
 /// product statistics before this function binds the witness and combined
 /// basis in one N→N/64 pass. It emits M6 — the round message of the folded
@@ -4034,14 +4098,17 @@ fn materialize_direct_fold8(
                     scratch,
                 );
                 for slot in 0..block_len {
-                    f_out[slot] = fold64(f_in, slot);
                     let direct =
                         super::ring_switch::fold_one_slot(first_claim.eq_lo[slot], scratch);
-                    b_out[slot] = if has_ordinary {
-                        direct + fold64(b_in, slot)
+                    if has_ordinary {
+                        let (folded_witness, folded_basis) =
+                            fold64_pair_same_weights(f_in, b_in, slot, &fold_weight);
+                        f_out[slot] = folded_witness;
+                        b_out[slot] = direct + folded_basis;
                     } else {
-                        direct
-                    };
+                        f_out[slot] = fold64(f_in, slot);
+                        b_out[slot] = direct;
+                    }
                 }
                 for (claim, table) in rest_claims.iter().zip(rest_tables.iter()) {
                     super::ring_switch::compose_fold_byte_table_into(
@@ -7031,6 +7098,47 @@ pub fn recursive_verifier<Ch: Challenger>(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn direct_fold8_pair_mul_kill_switch_is_exact_one() {
+        use std::ffi::OsStr;
+
+        assert!(super::direct_fold8_pair_mul_value_enabled(None));
+        assert!(super::direct_fold8_pair_mul_value_enabled(Some(OsStr::new(""))));
+        assert!(super::direct_fold8_pair_mul_value_enabled(Some(OsStr::new("0"))));
+        assert!(super::direct_fold8_pair_mul_value_enabled(Some(OsStr::new("01"))));
+        assert!(super::direct_fold8_pair_mul_value_enabled(Some(OsStr::new("true"))));
+        assert!(!super::direct_fold8_pair_mul_value_enabled(Some(OsStr::new("1"))));
+    }
+
+    #[test]
+    fn direct_fold8_pair_mul_matches_two_scalar_weighted_sums() {
+        let mut state = 0xD1F8_5041_2A11_2026u64;
+        let mut next = || {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            F128 {
+                lo: state,
+                hi: state.rotate_left(23) ^ 0xA5A5_5A5A_C3C3_3C3C,
+            }
+        };
+        let witness: Vec<F128> = (0..192).map(|_| next()).collect();
+        let basis: Vec<F128> = (0..192).map(|_| next()).collect();
+        let weights: [F128; 64] = std::array::from_fn(|_| next());
+
+        for slot in 0..3 {
+            let got = super::fold64_pair_same_weights(&witness, &basis, slot, &weights);
+            let base = 64 * slot;
+            let mut expected_witness = F128::ZERO;
+            let mut expected_basis = F128::ZERO;
+            for bank in 0..64 {
+                expected_witness += weights[bank] * witness[base + bank];
+                expected_basis += weights[bank] * basis[base + bank];
+            }
+            assert_eq!(got, (expected_witness, expected_basis));
+        }
+    }
+
     /// The paired fold must reproduce two sequential state binds, the direct
     /// message, and the coefficient-evaluated following message bit-for-bit.
     #[test]
