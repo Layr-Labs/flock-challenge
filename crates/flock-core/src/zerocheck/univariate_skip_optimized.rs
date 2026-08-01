@@ -685,7 +685,6 @@ struct WorkerStateWithSHatV {
     partial_ab: [F128; ELL],
     partial_c: [[F128; ELL]; N_C_BANKS],
     chunk_ab_bytes: [[u8; 64]; 1 << N_MEDIUM],
-    chunk_c_bytes: [[u8; 64]; 1 << N_MEDIUM],
     a_col: [F8; ELL],
     b_col: [F8; ELL],
     local_res_ab: [F128; ELL],
@@ -698,7 +697,6 @@ impl WorkerStateWithSHatV {
             partial_ab: [F128::ZERO; ELL],
             partial_c: [[F128::ZERO; ELL]; N_C_BANKS],
             chunk_ab_bytes: [[0u8; 64]; 1 << N_MEDIUM],
-            chunk_c_bytes: [[0u8; 64]; 1 << N_MEDIUM],
             a_col: [F8::ZERO; ELL],
             b_col: [F8::ZERO; ELL],
             local_res_ab: [F128::ZERO; ELL],
@@ -748,6 +746,12 @@ fn process_one_x_hi_with_s_hat_v(
         let eq_lo_val = eq_lo_scaled[x_outer_lo];
         let c_tables = &mask_tables
             [x_outer_lo * C_MASK_TABLE_STRIDE..(x_outer_lo + 1) * C_MASK_TABLE_STRIDE];
+        // The C side reads the packed witness directly: the fused mask kernel
+        // subsumes the per-`b_med` `bit_transpose_64bytes` this path used to run.
+        let c_rows: &[u8; (1 << N_MEDIUM) * 64] = (&c_packed
+            [chunk_byte_base..chunk_byte_base + (1 << N_MEDIUM) * 64])
+            .try_into()
+            .expect("sixteen 64-byte c rows per x_outer_lo");
 
         if n_b_med == (1 << N_MEDIUM) {
             for b_med in 0..(1 << N_MEDIUM) {
@@ -766,16 +770,11 @@ fn process_one_x_hi_with_s_hat_v(
                     usize::MAX,
                     None,
                 );
-                let byte_base_b = chunk_byte_base + b_med * N_CHUNKS * 8;
-                let c_in: &[u8; 64] = (&c_packed[byte_base_b..byte_base_b + 64])
-                    .try_into()
-                    .expect("64 c-bytes per medium position");
-                bit_transpose_64bytes(c_in, &mut state.chunk_c_bytes[b_med]);
             }
 
             kernels::accumulate_convert_with_s_hat_v(
                 &state.chunk_ab_bytes,
-                &state.chunk_c_bytes,
+                c_rows,
                 1 << N_MEDIUM,
                 convert,
                 eq_lo_val,
@@ -800,16 +799,11 @@ fn process_one_x_hi_with_s_hat_v(
                     usize::MAX,
                     None,
                 );
-                let byte_base_b = chunk_byte_base + b_med * N_CHUNKS * 8;
-                let c_in: &[u8; 64] = (&c_packed[byte_base_b..byte_base_b + 64])
-                    .try_into()
-                    .expect("64 c-bytes per medium position");
-                bit_transpose_64bytes(c_in, &mut state.chunk_c_bytes[b_med]);
             }
 
             kernels::accumulate_convert_with_s_hat_v(
                 &state.chunk_ab_bytes,
-                &state.chunk_c_bytes,
+                c_rows,
                 n_b_med,
                 convert,
                 eq_lo_val,
@@ -870,19 +864,21 @@ fn process_one_x_hi_with_precomputed_ab(
         let eq_lo_val = eq_lo_scaled[x_outer_lo];
         let c_tables = &mask_tables
             [x_outer_lo * C_MASK_TABLE_STRIDE..(x_outer_lo + 1) * C_MASK_TABLE_STRIDE];
+        // The C side reads the packed witness directly: the fused mask kernel
+        // subsumes the per-`b_med` `bit_transpose_64bytes` this path used to run.
+        let c_rows: &[u8; (1 << N_MEDIUM) * 64] = (&c_packed
+            [chunk_byte_base..chunk_byte_base + (1 << N_MEDIUM) * 64])
+            .try_into()
+            .expect("sixteen 64-byte c rows per x_outer_lo");
 
         for b_med in 0..n_b_med {
             let byte_base_b = chunk_byte_base + b_med * N_CHUNKS * 8;
             state.chunk_ab_bytes[b_med].copy_from_slice(&ab_inner[byte_base_b..byte_base_b + 64]);
-            let c_in: &[u8; 64] = (&c_packed[byte_base_b..byte_base_b + 64])
-                .try_into()
-                .expect("64 c-bytes per medium position");
-            bit_transpose_64bytes(c_in, &mut state.chunk_c_bytes[b_med]);
         }
 
         kernels::accumulate_convert_with_s_hat_v(
             &state.chunk_ab_bytes,
-            &state.chunk_c_bytes,
+            c_rows,
             n_b_med,
             convert,
             eq_lo_val,
@@ -2370,13 +2366,20 @@ mod tests {
     /// `Σ_b γ^b · bit_s(c_b) == F128 { lo: mask_s }`, not a restatement of it.
     fn accumulate_convert_with_s_hat_v_oracle(
         chunk_ab_bytes: &[[u8; 64]; 1 << N_MEDIUM],
-        chunk_c_bytes: &[[u8; 64]; 1 << N_MEDIUM],
+        c_block: &[u8; (1 << N_MEDIUM) * 64],
         n_b_med: usize,
         convert: &[F128],
         eq_lo_val: F128,
         partial_ab: &mut [F128; ELL],
         partial_c: &mut [[F128; ELL]; N_C_BANKS],
     ) {
+        // The kernel fuses the per-`b_med` transpose into its mask build; the
+        // oracle keeps them separate, so this is also a transpose cross-check.
+        let mut chunk_c_bytes = [[0u8; 64]; 1 << N_MEDIUM];
+        for b_med in 0..n_b_med {
+            let row: &[u8; 64] = c_block[b_med * 64..(b_med + 1) * 64].try_into().unwrap();
+            bit_transpose_64bytes(row, &mut chunk_c_bytes[b_med]);
+        }
         let alpha_inv = alpha_inv_f128();
         let mut alpha_inv_pow = [F128::ONE; N_C_BANKS];
         for s in 1..N_C_BANKS {
@@ -2458,32 +2461,38 @@ mod tests {
         }
     }
 
-    /// The NEON C-bank kernel must be bit-identical to the portable scalar
-    /// form for every `n_b_med`, from non-zero partials so the `+=` semantics
-    /// are exercised. Localizes a cross-`b_med` transpose bug to this kernel
-    /// rather than to the whole round-1 output.
+    /// **The fused-transpose gate.** The kernel now reads the packed witness
+    /// directly and does one cross-`b_med` transpose; the reference still goes
+    /// the long way round — sixteen per-`b_med` [`bit_transpose_64bytes`] calls
+    /// into scratch rows, then the mask scatter. Two genuinely different routes
+    /// to the same bytes, compared for every `n_b_med` (0..=16, covering the
+    /// full path and the padded boundary window) over random blocks, from
+    /// non-zero partials so `+=` semantics are exercised too.
     #[cfg(target_arch = "aarch64")]
     #[test]
-    fn neon_c_banks_match_scalar() {
+    fn fused_c_masks_match_composed_transpose() {
         let mut rng = Rng::new(0xC0DE_BA5E);
-        for n_b_med in 0..=(1 << N_MEDIUM) {
-            let mut chunk_c = [[0u8; 64]; 1 << N_MEDIUM];
-            for row in chunk_c.iter_mut() {
-                for lane in row.iter_mut() {
-                    *lane = (rng.next_u64() & 0xff) as u8;
+        for round in 0..4 {
+            for n_b_med in 0..=(1 << N_MEDIUM) {
+                let mut c_block = [0u8; (1 << N_MEDIUM) * 64];
+                for byte in c_block.iter_mut() {
+                    *byte = (rng.next_u64() & 0xff) as u8;
                 }
-            }
-            let mask_tables = build_c_mask_tables(&[rng.f128()]);
-            let seed: [[F128; ELL]; N_C_BANKS] =
-                core::array::from_fn(|_| core::array::from_fn(|_| rng.f128()));
+                let mask_tables = build_c_mask_tables(&[rng.f128()]);
+                let seed: [[F128; ELL]; N_C_BANKS] =
+                    core::array::from_fn(|_| core::array::from_fn(|_| rng.f128()));
 
-            let mut got = seed;
-            kernels::accumulate_c_banks(&chunk_c, n_b_med, &mask_tables, &mut got);
-            let mut want = seed;
-            kernels::accumulate_c_banks_scalar(&chunk_c, n_b_med, &mask_tables, &mut want);
+                let mut got = seed;
+                kernels::accumulate_c_banks(&c_block, n_b_med, &mask_tables, &mut got);
+                let mut want = seed;
+                kernels::accumulate_c_banks_scalar(&c_block, n_b_med, &mask_tables, &mut want);
 
-            for s in 0..N_C_BANKS {
-                assert_eq!(got[s], want[s], "bank {s} mismatch at n_b_med={n_b_med}");
+                for s in 0..N_C_BANKS {
+                    assert_eq!(
+                        got[s], want[s],
+                        "bank {s} mismatch at n_b_med={n_b_med}, round={round}"
+                    );
+                }
             }
         }
     }
@@ -2556,11 +2565,11 @@ mod tests {
 
         for n_b_med in 0..=(1 << N_MEDIUM) {
             let mut chunk_ab = [[0u8; 64]; 1 << N_MEDIUM];
-            let mut chunk_c = [[0u8; 64]; 1 << N_MEDIUM];
+            let mut c_block = [0u8; (1 << N_MEDIUM) * 64];
             for b_med in 0..(1 << N_MEDIUM) {
                 for lane in 0..ELL {
                     chunk_ab[b_med][lane] = (rng.next_u64() & 0xff) as u8;
-                    chunk_c[b_med][lane] = (rng.next_u64() & 0xff) as u8;
+                    c_block[b_med * 64 + lane] = (rng.next_u64() & 0xff) as u8;
                 }
             }
             let eq_lo_val = rng.f128();
@@ -2577,7 +2586,7 @@ mod tests {
             let (mut got_ab, mut got_c) = (seed_ab, seed_c);
             kernels::accumulate_convert_with_s_hat_v(
                 &chunk_ab,
-                &chunk_c,
+                &c_block,
                 n_b_med,
                 convert,
                 eq_lo_val,
@@ -2589,7 +2598,7 @@ mod tests {
             let (mut want_ab, mut want_c) = (seed_ab, seed_c);
             accumulate_convert_with_s_hat_v_oracle(
                 &chunk_ab,
-                &chunk_c,
+                &c_block,
                 n_b_med,
                 convert,
                 eq_lo_val,

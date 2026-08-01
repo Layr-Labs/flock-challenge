@@ -255,7 +255,7 @@ pub(super) fn accumulate_convert(
 /// accumulated (those windows are all-zero witness).
 #[inline]
 pub(super) fn accumulate_c_banks(
-    chunk_c_bytes: &[[u8; 64]; 16],
+    c_block: &[u8; 16 * 64],
     n_b_med: usize,
     mask_tables: &[super::F128],
     partial_c: &mut [[super::F128; 64]; 8],
@@ -264,18 +264,24 @@ pub(super) fn accumulate_c_banks(
     // SAFETY: aarch64 statically guarantees NEON; the fixed-size arrays cover
     // every load/store and the table halves bound every `u8`-scaled index.
     unsafe {
-        aarch64::accumulate_c_banks(chunk_c_bytes, n_b_med, mask_tables, partial_c);
+        aarch64::accumulate_c_banks(c_block, n_b_med, mask_tables, partial_c);
     }
 
     #[cfg(not(target_arch = "aarch64"))]
-    accumulate_c_banks_scalar(chunk_c_bytes, n_b_med, mask_tables, partial_c);
+    accumulate_c_banks_scalar(c_block, n_b_med, mask_tables, partial_c);
 }
 
 /// Portable reference for [`accumulate_c_banks`], and the shape the aarch64
 /// kernel is tested against.
+///
+/// Deliberately written as the **composition** the fused kernel replaces —
+/// per-`b_med` [`bit_transpose_64bytes`] into a scratch row, then the
+/// cross-`b_med` mask scatter — so the differential test compares two
+/// genuinely different routes to the same bytes rather than two spellings of
+/// one route.
 #[cfg_attr(target_arch = "aarch64", allow(dead_code))]
 pub(super) fn accumulate_c_banks_scalar(
-    chunk_c_bytes: &[[u8; 64]; 16],
+    c_block: &[u8; 16 * 64],
     n_b_med: usize,
     mask_tables: &[super::F128],
     partial_c: &mut [[super::F128; 64]; 8],
@@ -283,10 +289,19 @@ pub(super) fn accumulate_c_banks_scalar(
     debug_assert!(n_b_med <= 16);
     debug_assert_eq!(mask_tables.len(), C_MASK_TABLE_STRIDE);
     let (t_lo, t_hi) = mask_tables.split_at(256);
+
+    let mut transposed = [[0u8; 64]; 16];
+    for b_med in 0..n_b_med {
+        let row: &[u8; 64] = c_block[b_med * 64..(b_med + 1) * 64]
+            .try_into()
+            .expect("64 c-bytes per medium position");
+        bit_transpose_64bytes(row, &mut transposed[b_med]);
+    }
+
     for lane in 0..64 {
         let mut masks = [0u16; 8];
-        for b_med in 0..n_b_med {
-            let c = chunk_c_bytes[b_med][lane];
+        for (b_med, row) in transposed.iter().enumerate().take(n_b_med) {
+            let c = row[lane];
             for (s, mask) in masks.iter_mut().enumerate() {
                 *mask |= u16::from((c >> s) & 1) << b_med;
             }
@@ -300,7 +315,7 @@ pub(super) fn accumulate_c_banks_scalar(
 #[inline]
 pub(super) fn accumulate_convert_with_s_hat_v(
     chunk_ab_bytes: &[[u8; 64]; 16],
-    chunk_c_bytes: &[[u8; 64]; 16],
+    c_block: &[u8; 16 * 64],
     n_b_med: usize,
     convert: &[super::F128],
     eq_lo_val: super::F128,
@@ -342,5 +357,5 @@ pub(super) fn accumulate_convert_with_s_hat_v(
     )))]
     portable::accumulate_convert_ab(chunk_ab_bytes, n_b_med, convert, eq_lo_val, partial_ab);
 
-    accumulate_c_banks(chunk_c_bytes, n_b_med, mask_tables, partial_c);
+    accumulate_c_banks(c_block, n_b_med, mask_tables, partial_c);
 }
