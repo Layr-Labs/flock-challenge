@@ -2807,6 +2807,7 @@ kernel void parent_hash3(device const uint* children [[buffer(0)]],
                     0
                 };
                 if deep_pipeline {
+                    let data_base = crate::epool::SyncPtr(data.as_mut_ptr());
                     // Publish and hash each finalized layer-10 chunk, then
                     // build its local parent levels before the leaf hashes
                     // leave cache. `elem_offset` is absolute in the shared
@@ -2815,15 +2816,19 @@ kernel void parent_hash3(device const uint* children [[buffer(0)]],
                     // callback invocations own disjoint 1,024-leaf ranges at
                     // every local level; the GPU owns only
                     // `0..prefix_leaves`.
-                    let finish_chunk = |elem_offset: usize, chunk: &[F128]| {
+                    let hash_job = |(elem_offset, elem_len): (usize, usize)| {
                         debug_assert_eq!(elem_offset % 64, 0);
                         let leaf_start = elem_offset / 64;
-                        let leaf_len = chunk.len() / 64;
+                        let leaf_len = elem_len / 64;
                         debug_assert!(leaf_start >= suffix_leaf_start);
                         debug_assert!(leaf_start + leaf_len <= n_leaves);
                         // SAFETY: the NTT callback runs only after this chunk's
                         // last write. Callback ranges are pairwise disjoint and
                         // disjoint from the concurrently executing GPU prefix.
+                        let chunk = core::slice::from_raw_parts(
+                            data_base.ptr().add(elem_offset),
+                            elem_len,
+                        );
                         let bytes = core::slice::from_raw_parts(
                             chunk.as_ptr().cast::<u8>(),
                             core::mem::size_of_val(chunk),
@@ -2837,15 +2842,94 @@ kernel void parent_hash3(device const uint* children [[buffer(0)]],
                             local_parent_levels,
                         );
                     };
-                    ntt.forward_transform_interleaved_ranked_block_range_and_then(
-                        data,
-                        64,
-                        4,
-                        log_d,
-                        16 - k_cpu16,
-                        16,
-                        finish_chunk,
-                    );
+                    let helper = hybrid_cpu_suffix_equeue_enabled()
+                        .then(crate::epool::epool)
+                        .flatten()
+                        .filter(|pool| pool.current_num_threads() >= 4);
+                    if let Some(helper) = helper {
+                        use std::sync::Mutex;
+                        use std::sync::atomic::{AtomicUsize, Ordering};
+                        use std::sync::mpsc::{TrySendError, sync_channel};
+
+                        // The deferred stripe reserves helper indices 0..2.
+                        // Use only indices 2 and 3, which are otherwise idle,
+                        // and keep at most two 1 MiB jobs queued per worker.
+                        let (sender, receiver) = sync_channel::<(usize, usize)>(4);
+                        let receiver = Mutex::new(receiver);
+                        let helper_jobs = AtomicUsize::new(0);
+                        std::thread::scope(|scope| {
+                            let manager = scope.spawn(|| {
+                                helper.broadcast(|context| {
+                                    if context.index() < 2 {
+                                        return;
+                                    }
+                                    loop {
+                                        let job = receiver.lock().unwrap().recv();
+                                        match job {
+                                            Ok(job) => {
+                                                helper_jobs.fetch_add(1, Ordering::Relaxed);
+                                                hash_job(job);
+                                            }
+                                            Err(_) => break,
+                                        }
+                                    }
+                                });
+                            });
+                            let finish_chunk = |elem_offset: usize, chunk: &[F128]| {
+                                let job = (elem_offset, chunk.len());
+                                match sender.try_send(job) {
+                                    Ok(()) => {}
+                                    Err(TrySendError::Full(job)
+                                    | TrySendError::Disconnected(job)) => hash_job(job),
+                                }
+                            };
+                            ntt.forward_transform_interleaved_ranked_block_range_and_then(
+                                data,
+                                64,
+                                4,
+                                log_d,
+                                16 - k_cpu16,
+                                16,
+                                finish_chunk,
+                            );
+                            drop(sender);
+
+                            // Pull the bounded tail back to the now-free main
+                            // pool while already-claimed helper work finishes.
+                            let mut tail = Vec::with_capacity(4);
+                            {
+                                let receiver = receiver.lock().unwrap();
+                                while let Ok(job) = receiver.try_recv() {
+                                    tail.push(job);
+                                }
+                            }
+                            tail.into_par_iter().for_each(hash_job);
+                            manager
+                                .join()
+                                .expect("hybrid suffix leaf helper manager panicked");
+                        });
+                        if debug_enabled()
+                            || std::env::var_os("FLOCK_COMMIT_TIMING").is_some()
+                        {
+                            eprintln!(
+                                "[gpu-commit] hybrid suffix E-core leaf jobs: {}",
+                                helper_jobs.load(Ordering::Relaxed),
+                            );
+                        }
+                    } else {
+                        let finish_chunk = |elem_offset: usize, chunk: &[F128]| {
+                            hash_job((elem_offset, chunk.len()));
+                        };
+                        ntt.forward_transform_interleaved_ranked_block_range_and_then(
+                            data,
+                            64,
+                            4,
+                            log_d,
+                            16 - k_cpu16,
+                            16,
+                            finish_chunk,
+                        );
+                    }
                 } else {
                     // Exact same-binary control: the original streaming suffix
                     // driver followed by a separate 4,096-leaf hash traversal.
@@ -3321,6 +3405,17 @@ kernel void parent_hash3(device const uint* children [[buffer(0)]],
         use std::sync::OnceLock;
         static ON: OnceLock<bool> = OnceLock::new();
         *ON.get_or_init(|| std::env::var_os("FLOCK_NO_HYBRID_CPU_SUFFIX_DEEP").is_none())
+    }
+
+    /// Send finalized hybrid-suffix chunks to the two E-core workers not used
+    /// by the deferred lincheck stripe. The producer never blocks: a full or
+    /// unavailable queue restores the promoted inline P-core callback.
+    fn hybrid_cpu_suffix_equeue_enabled() -> bool {
+        use std::sync::OnceLock;
+        static ON: OnceLock<bool> = OnceLock::new();
+        *ON.get_or_init(|| {
+            std::env::var_os("FLOCK_NO_HYBRID_CPU_SUFFIX_EQUEUE").is_none()
+        })
     }
 
     struct WarmupRun {
