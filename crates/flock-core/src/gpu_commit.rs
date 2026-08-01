@@ -2195,7 +2195,7 @@ kernel void parent_hash(device const uint* children [[buffer(0)]],
             r?;
             Ok(t0.elapsed().as_secs_f64() * 1e3)
         };
-        const CANDIDATES: [usize; 7] = [0, 2, 3, 4, 5, 6, 7];
+        const CANDIDATES: [usize; 8] = [0, 2, 3, 4, 5, 6, 7, 8];
         let mut best_ms = [f64::INFINITY; CANDIDATES.len()];
         for i in 0..CANDIDATES.len() {
             match contended_run(CANDIDATES[i]) {

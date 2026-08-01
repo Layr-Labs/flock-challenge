@@ -2034,8 +2034,13 @@ impl Blake3Setup {
         let t0 = std::time::Instant::now();
         let (codeword, (z_packed, a_packed_f128, b_packed_f128, z_packed_lincheck)) =
             if self.use_ranked_rate2_hot_codeword() {
-                let (codeword, witness) = self.generate_witness_ab_with_rate2_codeword(blocks);
-                (Some(codeword), witness)
+                if flock_core::pcs::use_ranked_from_message_commit(&self.pcs_params) {
+                    let codeword = flock_core::scratch::take_f128(self.pcs_params.codeword_len_f128());
+                    (Some(codeword), self.generate_witness_ab(blocks))
+                } else {
+                    let (codeword, witness) = self.generate_witness_ab_with_rate2_codeword(blocks);
+                    (Some(codeword), witness)
+                }
             } else {
                 (None, self.generate_witness_ab(blocks))
             };
