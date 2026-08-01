@@ -29,7 +29,9 @@ pub mod univariate_skip_optimized;
 use multilinear::{
     UniSkipFoldTable, fold_and_compute_round_pair_into, fold_compact_and_compute_round_pair,
     fold_in_place_pair, interpolate_at_z_combined, interpolate_at_z_on_lambda, round_pair_naive,
+    uni_skip_bind_two_and_compute_round_pair_padded,
     uni_skip_fold_and_round_pair_compact_padded_with_deltas,
+    uni_skip_round2_with_round3_lookahead_padded,
 };
 use univariate_skip_optimized::{
     c_s_f128, medium_challenges_ghash, round1_shift_reduce_extract_c_packed_padded,
@@ -394,16 +396,33 @@ fn prove_packed_padded_inner<C: Challenger>(
     let fold_table = UniSkipFoldTable::new(k_skip, z);
     let mut mlv_arg = vec![F128::ONE; n_mlv];
     mlv_arg[1..].copy_from_slice(&r[k_skip + 1..]);
-    let (compact_mlv, msg_1, msg_inf) = uni_skip_fold_and_round_pair_compact_padded_with_deltas(
-        a_packed,
-        b_packed,
-        m,
-        k_skip,
-        &fold_table,
-        &mlv_arg,
-        padding,
-        compact_deltas,
-    );
+    // Ranked two-round lookahead. `FLOCK_NO_ZC_ROUND23_LOOKAHEAD=1` restores
+    // compact production + reconstruction + the following ordinary bind for
+    // exact same-binary comparisons.
+    let round23_lookahead = cfg!(target_arch = "aarch64")
+        && m == 32
+        && std::env::var_os("FLOCK_NO_ZC_ROUND23_LOOKAHEAD").is_none();
+    let (compact_mlv, round3_poly, msg_1, msg_inf) = if round23_lookahead {
+        if let Some(deltas) = compact_deltas {
+            deltas.recycle();
+        }
+        let (m1, mi, poly) = uni_skip_round2_with_round3_lookahead_padded(
+            a_packed, b_packed, m, k_skip, &fold_table, &mlv_arg, padding,
+        );
+        (None, Some(poly), m1, mi)
+    } else {
+        let (compact, m1, mi) = uni_skip_fold_and_round_pair_compact_padded_with_deltas(
+            a_packed,
+            b_packed,
+            m,
+            k_skip,
+            &fold_table,
+            &mlv_arg,
+            padding,
+            compact_deltas,
+        );
+        (Some(compact), None, m1, mi)
+    };
 
     if zc_timing {
         eprintln!(
@@ -435,15 +454,51 @@ fn prove_packed_padded_inner<C: Challenger>(
     // table removes the two field multiplications per output that the generic
     // pair fold would require, while materializing exactly the ordinary
     // post-fold tables expected by all subsequent rounds.
-    let mut first_r_next = vec![F128::ONE; n_mlv - 1];
-    first_r_next[1..].copy_from_slice(&r[k_skip + 2..]);
-    let (mut a_mlv, mut b_mlv, first_m1, first_mi) =
-        fold_compact_and_compute_round_pair(&compact_mlv, &fold_table, mlv_rhos[0], &first_r_next);
-    compact_mlv.recycle();
-    multilinear_msgs.push((first_m1, first_mi));
-    challenger.observe_f128(first_m1);
-    challenger.observe_f128(first_mi);
-    mlv_rhos.push(challenger.sample_f128());
+    let (mut a_mlv, mut b_mlv, fused_loop_start) = if let Some(poly) = round3_poly {
+        // The round-three wire values were computed symbolically before rho1
+        // existed. Evaluate only after sampling it, preserving transcript
+        // order, then sample rho2 and bind both challenges in one packed pass.
+        let (first_m1, first_mi) = poly.evaluate(mlv_rhos[0]);
+        multilinear_msgs.push((first_m1, first_mi));
+        challenger.observe_f128(first_m1);
+        challenger.observe_f128(first_mi);
+        mlv_rhos.push(challenger.sample_f128());
+
+        let mut second_r_next = vec![F128::ONE; n_mlv - 2];
+        second_r_next[1..].copy_from_slice(&r[k_skip + 3..]);
+        let (a, b, second_m1, second_mi) = uni_skip_bind_two_and_compute_round_pair_padded(
+            a_packed,
+            b_packed,
+            m,
+            k_skip,
+            &fold_table,
+            mlv_rhos[0],
+            mlv_rhos[1],
+            &second_r_next,
+            padding,
+        );
+        multilinear_msgs.push((second_m1, second_mi));
+        challenger.observe_f128(second_m1);
+        challenger.observe_f128(second_mi);
+        mlv_rhos.push(challenger.sample_f128());
+        (a, b, 2)
+    } else {
+        let compact_mlv = compact_mlv.expect("compact round two selected");
+        let mut first_r_next = vec![F128::ONE; n_mlv - 1];
+        first_r_next[1..].copy_from_slice(&r[k_skip + 2..]);
+        let (a, b, first_m1, first_mi) = fold_compact_and_compute_round_pair(
+            &compact_mlv,
+            &fold_table,
+            mlv_rhos[0],
+            &first_r_next,
+        );
+        compact_mlv.recycle();
+        multilinear_msgs.push((first_m1, first_mi));
+        challenger.observe_f128(first_m1);
+        challenger.observe_f128(first_mi);
+        mlv_rhos.push(challenger.sample_f128());
+        (a, b, 1)
+    };
 
     // Ping-pong scratch buffers for the remaining fused path: each fused round folds
     // (a_mlv, b_mlv) of size N into size N/2. Rather than allocating — and,
@@ -461,7 +516,7 @@ fn prove_packed_padded_inner<C: Challenger>(
         (Vec::new(), Vec::new())
     };
 
-    for i in 1..(n_mlv - 1) {
+    for i in fused_loop_start..(n_mlv - 1) {
         let rho_prev = mlv_rhos[i];
         let log_n_before = a_mlv.len().trailing_zeros() as usize;
 

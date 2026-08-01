@@ -281,6 +281,263 @@ unsafe fn is_zero_q(v: core::arch::aarch64::uint64x2_t) -> bool {
     unsafe { vmaxvq_u32(vreinterpretq_u32_u64(v)) == 0 }
 }
 
+/// Round-two message plus the six coefficients of the round-three message as
+/// quadratic polynomials in the first transcript challenge. No large output
+/// is written. Two adjacent round-two pairs are handled together so their
+/// four folded rows remain in registers for the lookahead products.
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "aes")]
+pub(crate) unsafe fn round23_lookahead_chunk_neon_8(
+    table_data: *const u8,
+    a_packed: *const u8,
+    b_packed: *const u8,
+    eq2_lo: *const F128,
+    eq3_lo: *const F128,
+    group_count: usize,
+    pair_idx_base: usize,
+    pair_in_block_mask: usize,
+    useful_pairs_inclusive: usize,
+) -> [F128; 8] {
+    use core::arch::aarch64::*;
+
+    #[inline(always)]
+    unsafe fn useful(pair: usize, mask: usize, limit: usize) -> bool {
+        mask == 0 || (pair & mask) < limit
+    }
+
+    #[inline(always)]
+    unsafe fn weighted_linear_product(
+        eq: uint64x2_t,
+        a0: uint64x2_t,
+        ad: uint64x2_t,
+        b0: uint64x2_t,
+        bd: uint64x2_t,
+    ) -> [uint64x2_t; 3] {
+        unsafe {
+            // Karatsuba in the polynomial variable: three field products
+            // after scaling the two A coefficients by the equality weight.
+            let ea0 = mul_q(eq, a0);
+            let ead = mul_q(eq, ad);
+            let c0 = mul_q(ea0, b0);
+            let c2 = mul_q(ead, bd);
+            let cs = mul_q(veorq_u64(ea0, ead), veorq_u64(b0, bd));
+            [c0, xor3_u64(cs, c0, c2), c2]
+        }
+    }
+
+    unsafe {
+        let zero = vdupq_n_u64(0);
+        let mut r2_one = WideNeon { lo: zero, hi: zero };
+        let mut r2_inf = WideNeon { lo: zero, hi: zero };
+        let mut coeffs = [zero; 6];
+
+        for g in 0..group_count {
+            let pair0 = pair_idx_base + 2 * g;
+            let use0 = useful(pair0, pair_in_block_mask, useful_pairs_inclusive);
+            let use1 = useful(pair0 + 1, pair_in_block_mask, useful_pairs_inclusive);
+            if !use0 && !use1 {
+                continue;
+            }
+            let row = 4 * g;
+            let (a0, a1, a2, a3) = if use0 && use1 {
+                let p = a_packed.add(row * 8).cast::<u64>();
+                fold_four_row_codes_q(
+                    table_data,
+                    u64::from_le(core::ptr::read_unaligned(p)),
+                    u64::from_le(core::ptr::read_unaligned(p.add(1))),
+                    u64::from_le(core::ptr::read_unaligned(p.add(2))),
+                    u64::from_le(core::ptr::read_unaligned(p.add(3))),
+                )
+            } else if use0 {
+                let p = a_packed.add(row * 8).cast::<u64>();
+                let (x0, x1) = fold_two_row_codes_q(
+                    table_data,
+                    u64::from_le(core::ptr::read_unaligned(p)),
+                    u64::from_le(core::ptr::read_unaligned(p.add(1))),
+                );
+                (x0, x1, zero, zero)
+            } else {
+                let p = a_packed.add((row + 2) * 8).cast::<u64>();
+                let (x2, x3) = fold_two_row_codes_q(
+                    table_data,
+                    u64::from_le(core::ptr::read_unaligned(p)),
+                    u64::from_le(core::ptr::read_unaligned(p.add(1))),
+                );
+                (zero, zero, x2, x3)
+            };
+            let (b0, b1, b2, b3) = if use0 && use1 {
+                let p = b_packed.add(row * 8).cast::<u64>();
+                fold_four_row_codes_q(
+                    table_data,
+                    u64::from_le(core::ptr::read_unaligned(p)),
+                    u64::from_le(core::ptr::read_unaligned(p.add(1))),
+                    u64::from_le(core::ptr::read_unaligned(p.add(2))),
+                    u64::from_le(core::ptr::read_unaligned(p.add(3))),
+                )
+            } else if use0 {
+                let p = b_packed.add(row * 8).cast::<u64>();
+                let (x0, x1) = fold_two_row_codes_q(
+                    table_data,
+                    u64::from_le(core::ptr::read_unaligned(p)),
+                    u64::from_le(core::ptr::read_unaligned(p.add(1))),
+                );
+                (x0, x1, zero, zero)
+            } else {
+                let p = b_packed.add((row + 2) * 8).cast::<u64>();
+                let (x2, x3) = fold_two_row_codes_q(
+                    table_data,
+                    u64::from_le(core::ptr::read_unaligned(p)),
+                    u64::from_le(core::ptr::read_unaligned(p.add(1))),
+                );
+                (zero, zero, x2, x3)
+            };
+
+            let e20 = vld1q_u64(eq2_lo.add(2 * g).cast::<u64>());
+            let e21 = vld1q_u64(eq2_lo.add(2 * g + 1).cast::<u64>());
+            wide_xor(&mut r2_one, mul_unreduced_q(e20, mul_q(a1, b1)));
+            wide_xor(&mut r2_one, mul_unreduced_q(e21, mul_q(a3, b3)));
+            wide_xor(
+                &mut r2_inf,
+                mul_unreduced_q(e20, mul_q(veorq_u64(a0, a1), veorq_u64(b0, b1))),
+            );
+            wide_xor(
+                &mut r2_inf,
+                mul_unreduced_q(e21, mul_q(veorq_u64(a2, a3), veorq_u64(b2, b3))),
+            );
+
+            let e3 = vld1q_u64(eq3_lo.add(g).cast::<u64>());
+            let one = weighted_linear_product(
+                e3,
+                a2,
+                veorq_u64(a2, a3),
+                b2,
+                veorq_u64(b2, b3),
+            );
+            let inf = weighted_linear_product(
+                e3,
+                veorq_u64(a0, a2),
+                xor3_u64(veorq_u64(a0, a1), a2, a3),
+                veorq_u64(b0, b2),
+                xor3_u64(veorq_u64(b0, b1), b2, b3),
+            );
+            for i in 0..3 {
+                coeffs[i] = veorq_u64(coeffs[i], one[i]);
+                coeffs[3 + i] = veorq_u64(coeffs[3 + i], inf[i]);
+            }
+        }
+
+        [
+            core::mem::transmute(reduce_wide_q(r2_one)),
+            core::mem::transmute(reduce_wide_q(r2_inf)),
+            core::mem::transmute(coeffs[0]),
+            core::mem::transmute(coeffs[1]),
+            core::mem::transmute(coeffs[2]),
+            core::mem::transmute(coeffs[3]),
+            core::mem::transmute(coeffs[4]),
+            core::mem::transmute(coeffs[5]),
+        ]
+    }
+}
+
+/// Bind two transcript challenges directly from packed post-URM rows, write
+/// the table after both bindings, and compute its next round message.
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "aes")]
+pub(crate) unsafe fn bind_two_packed_chunk_neon_8(
+    table_data: *const u8,
+    rho1_table: *const u8,
+    a_packed: *const u8,
+    b_packed: *const u8,
+    a_out: *mut F128,
+    b_out: *mut F128,
+    rho2: F128,
+    eq_lo: *const F128,
+    lo_size: usize,
+    pair_idx_base: usize,
+    pair_in_block_mask: usize,
+    useful_pairs_inclusive: usize,
+) -> (F128, F128) {
+    use core::arch::aarch64::*;
+
+    #[inline(always)]
+    unsafe fn store_pair_nt(dst: *mut F128, x: uint64x2_t, y: uint64x2_t) {
+        unsafe {
+            core::arch::asm!(
+                "stnp {x:q}, {y:q}, [{dst}]",
+                dst = in(reg) dst,
+                x = in(vreg) x,
+                y = in(vreg) y,
+                options(nostack, preserves_flags),
+            );
+        }
+    }
+
+    #[inline(always)]
+    unsafe fn useful(pair: usize, mask: usize, limit: usize) -> bool {
+        mask == 0 || (pair & mask) < limit
+    }
+
+    unsafe {
+        let zero = vdupq_n_u64(0);
+        let rho2q = core::mem::transmute::<F128, uint64x2_t>(rho2);
+        let mut p1 = WideNeon { lo: zero, hi: zero };
+        let mut pinf = WideNeon { lo: zero, hi: zero };
+
+        for x_lo in 0..lo_size {
+            let mut av = [zero; 2];
+            let mut bv = [zero; 2];
+            for lane in 0..2 {
+                let out = 2 * x_lo + lane;
+                let pair0 = pair_idx_base + 2 * out;
+                let use0 = useful(pair0, pair_in_block_mask, useful_pairs_inclusive);
+                let use1 = useful(pair0 + 1, pair_in_block_mask, useful_pairs_inclusive);
+                if !use0 && !use1 {
+                    continue;
+                }
+                let row = 4 * out;
+                let ap = a_packed.add(row * 8).cast::<u64>();
+                let bp = b_packed.add(row * 8).cast::<u64>();
+                let ac0 = if use0 { u64::from_le(core::ptr::read_unaligned(ap)) } else { 0 };
+                let ac1 = if use0 { u64::from_le(core::ptr::read_unaligned(ap.add(1))) } else { 0 };
+                let ac2 = if use1 { u64::from_le(core::ptr::read_unaligned(ap.add(2))) } else { 0 };
+                let ac3 = if use1 { u64::from_le(core::ptr::read_unaligned(ap.add(3))) } else { 0 };
+                let bc0 = if use0 { u64::from_le(core::ptr::read_unaligned(bp)) } else { 0 };
+                let bc1 = if use0 { u64::from_le(core::ptr::read_unaligned(bp.add(1))) } else { 0 };
+                let bc2 = if use1 { u64::from_le(core::ptr::read_unaligned(bp.add(2))) } else { 0 };
+                let bc3 = if use1 { u64::from_le(core::ptr::read_unaligned(bp.add(3))) } else { 0 };
+
+                let (aa0, bb0, aa1, bb1) =
+                    fold_four_row_codes_q(table_data, ac0, bc0, ac2, bc2);
+                let (ad0, bd0, ad1, bd1) = fold_four_row_codes_q(
+                    rho1_table,
+                    ac0 ^ ac1,
+                    bc0 ^ bc1,
+                    ac2 ^ ac3,
+                    bc2 ^ bc3,
+                );
+                let u0a = veorq_u64(aa0, ad0);
+                let u0b = veorq_u64(bb0, bd0);
+                let u1a = veorq_u64(aa1, ad1);
+                let u1b = veorq_u64(bb1, bd1);
+                av[lane] = veorq_u64(u0a, mul_q(rho2q, veorq_u64(u0a, u1a)));
+                bv[lane] = veorq_u64(u0b, mul_q(rho2q, veorq_u64(u0b, u1b)));
+            }
+            store_pair_nt(a_out.add(2 * x_lo), av[0], av[1]);
+            store_pair_nt(b_out.add(2 * x_lo), bv[0], bv[1]);
+            let e = vld1q_u64(eq_lo.add(x_lo).cast::<u64>());
+            wide_xor(&mut p1, mul_unreduced_q(e, mul_q(av[1], bv[1])));
+            wide_xor(
+                &mut pinf,
+                mul_unreduced_q(e, mul_q(veorq_u64(av[0], av[1]), veorq_u64(bv[0], bv[1]))),
+            );
+        }
+        (
+            core::mem::transmute(reduce_wide_q(p1)),
+            core::mem::transmute(reduce_wide_q(pinf)),
+        )
+    }
+}
+
 /// Complete q-register-native round-two worker chunk. Four folded rows stay in
 /// vector registers through output stores, reduced GHASH products, and the
 /// eq-weighted unreduced accumulators; only the two final chunk sums cross back
