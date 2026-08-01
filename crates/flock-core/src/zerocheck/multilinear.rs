@@ -1394,11 +1394,50 @@ pub fn fold_and_compute_round_pair_into(
     let eq_lo = &eq.lo;
     let eq_hi = &eq.hi;
 
-    let (sum1, sum_inf) = a_out
+    // --- Hybrid GPU prefix (macOS AArch64) ---
+    // A warmup-calibrated share of the x_hi chunks runs on the Metal
+    // fold+message kernel while the CPU takes the suffix; per-chunk (p1,pinf)
+    // partials are eq_hi-combined below exactly like the CPU chunks (XOR
+    // combination is order-independent, so any chunk partition is
+    // bit-identical to the all-CPU total).
+    #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+    let (gpu_prefix, gpu_round, zc_calibrate) = {
+        use std::sync::atomic::Ordering;
+        let hi_chunks = half / chunk_out;
+        let enabled = n >= (1 << 19) && std::env::var_os("FLOCK_NO_ZC_GPU").is_none();
+        if !enabled {
+            (0usize, None, false)
+        } else {
+            match crate::gpu_commit::ZC_GPU_SHARE16.load(Ordering::Relaxed) {
+                usize::MAX => (0, None, true),
+                0 => (0, None, false),
+                share => {
+                    let g = hi_chunks * share / 16;
+                    if g == 0 {
+                        (0, None, false)
+                    } else {
+                        match crate::gpu_commit::zc_fold_launch(
+                            a, b, a_out, b_out, r_fold, eq_lo, g,
+                        ) {
+                            Some(r) => (g, Some(r), false),
+                            None => (0, None, false),
+                        }
+                    }
+                }
+            }
+        }
+    };
+    #[cfg(not(all(target_arch = "aarch64", target_os = "macos")))]
+    let gpu_prefix = 0usize;
+    #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+    let t_cpu0 = std::time::Instant::now();
+
+    let (sum1, sum_inf) = a_out[gpu_prefix * chunk_out..]
         .par_chunks_mut(chunk_out)
-        .zip(b_out.par_chunks_mut(chunk_out))
+        .zip(b_out[gpu_prefix * chunk_out..].par_chunks_mut(chunk_out))
         .enumerate()
-        .map(|(x_hi, (a_out, b_out))| {
+        .map(|(idx, (a_out, b_out))| {
+            let x_hi = gpu_prefix + idx;
             let a_in = &a[x_hi * chunk_in..(x_hi + 1) * chunk_in];
             let b_in = &b[x_hi * chunk_in..(x_hi + 1) * chunk_in];
 
@@ -1576,7 +1615,141 @@ pub fn fold_and_compute_round_pair_into(
             |(s1, sinf), (c1, cinf)| (s1 + c1, sinf + cinf),
         );
 
+    #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+    let (sum1, sum_inf) = {
+        let mut sum1 = sum1;
+        let mut sum_inf = sum_inf;
+        if let Some(round) = gpu_round {
+            match crate::gpu_commit::zc_fold_wait(round) {
+                Some(partials) => {
+                    for (c, &(p1, pinf)) in partials.iter().enumerate() {
+                        let eq_h = eq_hi[c];
+                        sum1 += eq_h * p1;
+                        sum_inf += eq_h * pinf;
+                    }
+                }
+                None => {
+                    // GPU failed mid-round: disable for the process and
+                    // recompute the whole round on the CPU (the prefix
+                    // outputs are in an unknown state).
+                    eprintln!("[zc-gpu] wait failed; disabling and recomputing on CPU");
+                    crate::gpu_commit::ZC_GPU_SHARE16
+                        .store(0, std::sync::atomic::Ordering::Relaxed);
+                    return fold_and_compute_round_pair_into(a, b, a_out, b_out, r_fold, r_next);
+                }
+            }
+        }
+        if zc_calibrate {
+            zc_calibrate_gpu_share(a, b, a_out, b_out, r_fold, eq_lo, eq_hi, (sum1, sum_inf), t_cpu0);
+        }
+        (sum1, sum_inf)
+    };
+
     (r_next[0] * sum1, sum_inf)
+}
+
+/// First ranked-size tail round of the process (inside the untimed warmup
+/// prove): time the CPU pass that just ran, run the GPU kernel over the full
+/// round into scratch, verify the folded arrays and eq_hi-combined sums
+/// bit-exact, and publish the GPU's chunk share for every later prove.
+/// Any mismatch or GPU error pins the share to 0 (pure CPU, the incumbent).
+#[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+#[allow(clippy::too_many_arguments)]
+fn zc_calibrate_gpu_share(
+    a: &[F128],
+    b: &[F128],
+    a_out_cpu: &[F128],
+    b_out_cpu: &[F128],
+    r_fold: F128,
+    eq_lo: &[F128],
+    eq_hi: &[F128],
+    cpu_sums: (F128, F128),
+    t_cpu0: std::time::Instant,
+) {
+    use std::sync::atomic::Ordering;
+    let t_cpu = t_cpu0.elapsed().as_secs_f64();
+    let half = a_out_cpu.len();
+    let hi_chunks = half / (2 * eq_lo.len());
+    let mut a_tmp = crate::scratch::take_f128(half);
+    let mut b_tmp = crate::scratch::take_f128(half);
+    let zc_dbg = std::env::var_os("FLOCK_ZC_TIMING").is_some()
+        || std::env::var_os("FLOCK_GPU_COMMIT_DEBUG").is_some();
+    let decided = (|| -> Option<usize> {
+        let t0 = std::time::Instant::now();
+        let round = match crate::gpu_commit::zc_fold_launch(
+            a,
+            b,
+            &mut a_tmp[..half],
+            &mut b_tmp[..half],
+            r_fold,
+            eq_lo,
+            hi_chunks,
+        ) {
+            Some(r) => r,
+            None => {
+                if zc_dbg {
+                    eprintln!(
+                        "[zc-gpu] calibrate: launch unavailable (gpu off or \
+                         non-page-aligned buffers a={:p} ao={:p}); pinning CPU path",
+                        a.as_ptr(),
+                        a_tmp.as_ptr()
+                    );
+                }
+                return None;
+            }
+        };
+        let partials = crate::gpu_commit::zc_fold_wait(round)?;
+        let mut t_gpu = t0.elapsed().as_secs_f64();
+        // Second GPU sample (min): a single cold draw includes pipeline
+        // first-run costs and competing-load noise.
+        let t1 = std::time::Instant::now();
+        if let Some(r2) = crate::gpu_commit::zc_fold_launch(
+            a,
+            b,
+            &mut a_tmp[..half],
+            &mut b_tmp[..half],
+            r_fold,
+            eq_lo,
+            hi_chunks,
+        ) && crate::gpu_commit::zc_fold_wait(r2).is_some()
+        {
+            t_gpu = t_gpu.min(t1.elapsed().as_secs_f64());
+        }
+        if a_tmp[..half] != *a_out_cpu || b_tmp[..half] != *b_out_cpu {
+            eprintln!("[zc-gpu] CALIBRATION MISMATCH (folded arrays); pinning CPU path");
+            return Some(0);
+        }
+        let mut s1 = F128::ZERO;
+        let mut sinf = F128::ZERO;
+        for (c, &(p1, pinf)) in partials.iter().enumerate() {
+            s1 += eq_hi[c] * p1;
+            sinf += eq_hi[c] * pinf;
+        }
+        if (s1, sinf) != cpu_sums {
+            eprintln!("[zc-gpu] CALIBRATION MISMATCH (message sums); pinning CPU path");
+            return Some(0);
+        }
+        // Proportional split from isolated full-round rates, floored at 2
+        // and capped at 12 sixteenths: below 2 the dispatch overhead beats
+        // the offload, and the cap bounds the damage of a load-polluted CPU
+        // sample (the CPU side has only one draw — it IS the production
+        // warmup pass).
+        let share = ((16.0 * t_cpu / (t_cpu + t_gpu)) as usize).min(12);
+        if std::env::var_os("FLOCK_ZC_TIMING").is_some()
+            || std::env::var_os("FLOCK_GPU_COMMIT_DEBUG").is_some()
+        {
+            eprintln!(
+                "[zc-gpu] calibrate: cpu {:.2} ms vs gpu {:.2} ms (bit-exact) -> share {}/16",
+                t_cpu * 1e3,
+                t_gpu * 1e3,
+                if share < 2 { 0 } else { share }
+            );
+        }
+        Some(if share < 2 { 0 } else { share })
+    })();
+    crate::scratch::give_f128(a_tmp);
+    crate::scratch::give_f128(b_tmp);
+    crate::gpu_commit::ZC_GPU_SHARE16.store(decided.unwrap_or(0), Ordering::Relaxed);
 }
 
 /// Serial reference — identical I/O contract to
@@ -2408,5 +2581,96 @@ mod tests {
             g_via_sum += eq_remaining[x_prime] * a_x * b_x;
         }
         assert_eq!(g_via_poly, g_via_sum);
+    }
+
+    /// The Metal fold+message kernel must be bit-identical to the AArch64 CPU
+    /// kernel per x_hi chunk: folded quarter arrays and per-chunk (p1, pinf)
+    /// partials. Covers lo_size < 64 (idle kernel threads), non-power-of-two
+    /// chunk counts, and prefix-only dispatches. Skips (rather than fails) on
+    /// hosts without a Metal device.
+    #[cfg(all(target_arch = "aarch64", target_os = "macos", target_feature = "aes"))]
+    #[test]
+    fn zc_fold_msg_gpu_matches_cpu_kernel() {
+        use super::kernels::aarch64::fold_and_message_aarch64;
+
+        // Page-aligned allocations: the zero-copy wrap requires 16 KiB
+        // alignment and page-multiple byte lengths.
+        fn page_vec(n: usize) -> Vec<F128> {
+            let bytes = n * core::mem::size_of::<F128>();
+            assert_eq!(bytes % 16384, 0, "test shape must be page-multiple");
+            let layout = std::alloc::Layout::from_size_align(bytes, 16384).unwrap();
+            unsafe {
+                let ptr = std::alloc::alloc_zeroed(layout).cast::<F128>();
+                assert!(!ptr.is_null());
+                Vec::from_raw_parts(ptr, n, n)
+            }
+        }
+
+        let mut rng = Rng::new(0x2C60_1DF0);
+        // (lo_size, hi_chunks, gpu_chunks): all n and n/2 page-multiples.
+        for &(lo_size, hi_chunks, gpu_chunks) in
+            &[(32usize, 16usize, 16usize), (64, 8, 8), (256, 4, 4), (2048, 3, 2)]
+        {
+            let n = 4 * lo_size * hi_chunks;
+            let mut a = page_vec(n);
+            let mut b = page_vec(n);
+            for i in 0..n {
+                a[i] = rng.f128();
+                b[i] = rng.f128();
+            }
+            let eq_lo: Vec<F128> = (0..lo_size).map(|_| rng.f128()).collect();
+            let r_fold = rng.f128();
+
+            let mut ao_cpu = vec![F128::ZERO; n / 2];
+            let mut bo_cpu = vec![F128::ZERO; n / 2];
+            let mut partials_cpu = Vec::new();
+            for c in 0..hi_chunks {
+                let (p1, pinf) = fold_and_message_aarch64(
+                    &a[c * 4 * lo_size..(c + 1) * 4 * lo_size],
+                    &b[c * 4 * lo_size..(c + 1) * 4 * lo_size],
+                    &mut ao_cpu[c * 2 * lo_size..(c + 1) * 2 * lo_size],
+                    &mut bo_cpu[c * 2 * lo_size..(c + 1) * 2 * lo_size],
+                    r_fold,
+                    &eq_lo,
+                    false,
+                );
+                partials_cpu.push((p1, pinf));
+            }
+
+            let mut ao_gpu = page_vec(n / 2);
+            let mut bo_gpu = page_vec(n / 2);
+            let Some(round) = crate::gpu_commit::zc_fold_launch(
+                &a, &b, &mut ao_gpu, &mut bo_gpu, r_fold, &eq_lo, gpu_chunks,
+            ) else {
+                eprintln!("zc_fold_msg test skipped: no Metal device");
+                return;
+            };
+            let partials_gpu =
+                crate::gpu_commit::zc_fold_wait(round).expect("gpu round completes");
+
+            let covered = gpu_chunks * 2 * lo_size;
+            assert_eq!(
+                &ao_gpu[..covered],
+                &ao_cpu[..covered],
+                "a_out lo_size={lo_size} hi={hi_chunks} g={gpu_chunks}"
+            );
+            assert_eq!(&bo_gpu[..covered], &bo_cpu[..covered], "b_out lo_size={lo_size}");
+            assert_eq!(
+                partials_gpu,
+                partials_cpu[..gpu_chunks],
+                "partials lo_size={lo_size} hi={hi_chunks} g={gpu_chunks}"
+            );
+            // Prefix-only dispatch must not touch the uncovered suffix.
+            for &v in &ao_gpu[covered..] {
+                assert_eq!(v, F128::ZERO, "suffix write leak lo_size={lo_size}");
+            }
+            // The page-aligned vecs were allocated with 16 KiB alignment;
+            // Vec's drop would deallocate with F128's layout. Leak them
+            // (test-only, a few hundred KiB).
+            core::mem::forget(a);
+            core::mem::forget(b);
+            core::mem::forget(ao_gpu);
+            core::mem::forget(bo_gpu);
+        }
     }
 }

@@ -979,6 +979,122 @@ kernel void parent_hash(device const uint* children [[buffer(0)]],
     for (int i = 0; i < 8; i++) parents[id * 8u + i] = cv[i];
 }
 
+// ===========================================================================
+// Zerocheck fused tail round: fold (a,b) pairs at the constant r_fold and
+// accumulate the round message partials (p1, pinf) per x_hi chunk.
+//
+// Bit-exactness note: on the CPU, per-chunk partials accumulate karatsuba
+// products UNREDUCED (256-bit XOR) and reduce once. Reduction mod P is
+// GF(2)-linear and idempotent, so reduce(sum of unreduced products) equals
+// the XOR of per-product reduced values: reducing every product immediately
+// (as here) yields bit-identical per-chunk (p1, pinf).
+// ===========================================================================
+
+// a << 4 mod P.
+static inline uint4 gf_shl4(uint4 a) {
+    uint h = a.w >> 28;
+    uint4 r;
+    r.w = (a.w << 4) | (a.z >> 28);
+    r.z = (a.z << 4) | (a.y >> 28);
+    r.y = (a.y << 4) | (a.x >> 28);
+    r.x = (a.x << 4) ^ ((h << 7) ^ (h << 2) ^ (h << 1) ^ h);
+    return r;
+}
+
+// Variable * variable reduced product via a per-thread 16-entry nibble table
+// of b in threadgroup memory (tb[n] = n*b mod P), then a 32-step nibble
+// Horner over a (high nibble first): acc = acc*x^4 ^ (nib(a)*b).
+static inline uint4 gf_mul_var(uint4 a, uint4 b, threadgroup uint4* tb) {
+    tb[0] = uint4(0u);
+    tb[1] = b;
+    for (uint n = 1u; n < 8u; n++) {
+        uint4 e = gf_mulx(tb[n]);
+        tb[2u * n] = e;
+        tb[2u * n + 1u] = e ^ b;
+    }
+    uint4 acc = uint4(0u);
+    for (int i = 31; i >= 0; i--) {
+        acc = gf_shl4(acc);
+        acc ^= tb[(a[i >> 3] >> ((i & 7) * 4)) & 15u];
+    }
+    return acc;
+}
+
+struct ZcParams {
+    uint lo_size;   // eq_lo length; one x_hi chunk = 4*lo_size inputs
+    uint n_chunks;  // number of x_hi chunks this dispatch covers
+};
+
+// One threadgroup = one x_hi chunk (64 threads; thread owns x_lo = lid+64k).
+kernel void zc_fold_msg(device const uint4* a_in     [[buffer(0)]],
+                        device const uint4* b_in     [[buffer(1)]],
+                        device uint4* a_out          [[buffer(2)]],
+                        device uint4* b_out          [[buffer(3)]],
+                        device const uint4* eq_lo    [[buffer(4)]],
+                        device const uint4* rf_tab   [[buffer(5)]],
+                        device uint4* partials       [[buffer(6)]],
+                        constant ZcParams& P         [[buffer(7)]],
+                        uint tgid [[threadgroup_position_in_grid]],
+                        uint lid  [[thread_index_in_threadgroup]])
+{
+    threadgroup uint4 rf[64];          // r_fold nibble tables (gf_mul_tab4 layout)
+    threadgroup uint4 mul_tb[64 * 16]; // per-thread variable-mul tables
+    threadgroup uint4 red[2 * 64];     // p1/pinf reduction scratch
+
+    rf[lid] = rf_tab[lid];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    threadgroup uint4* tb = mul_tb + lid * 16u;
+    const uint in_base  = tgid * P.lo_size * 4u;
+    const uint out_base = tgid * P.lo_size * 2u;
+
+    uint4 p1 = uint4(0u);
+    uint4 pinf = uint4(0u);
+    for (uint x_lo = lid; x_lo < P.lo_size; x_lo += 64u) {
+        const uint i = in_base + 4u * x_lo;
+        const uint o = out_base + 2u * x_lo;
+        uint4 ae0 = a_in[i];
+        uint4 ao0 = a_in[i + 1u];
+        uint4 ae1 = a_in[i + 2u];
+        uint4 ao1 = a_in[i + 3u];
+        uint4 be0 = b_in[i];
+        uint4 bo0 = b_in[i + 1u];
+        uint4 be1 = b_in[i + 2u];
+        uint4 bo1 = b_in[i + 3u];
+
+        uint4 a0 = ae0 ^ gf_mul_tab4(ae0 ^ ao0, rf);
+        uint4 a1 = ae1 ^ gf_mul_tab4(ae1 ^ ao1, rf);
+        uint4 b0 = be0 ^ gf_mul_tab4(be0 ^ bo0, rf);
+        uint4 b1 = be1 ^ gf_mul_tab4(be1 ^ bo1, rf);
+
+        a_out[o] = a0;
+        a_out[o + 1u] = a1;
+        b_out[o] = b0;
+        b_out[o + 1u] = b1;
+
+        uint4 g1 = gf_mul_var(a1, b1, tb);
+        uint4 gi = gf_mul_var(a0 ^ a1, b0 ^ b1, tb);
+        uint4 eq = eq_lo[x_lo];
+        p1 ^= gf_mul_var(eq, g1, tb);
+        pinf ^= gf_mul_var(eq, gi, tb);
+    }
+
+    red[lid] = p1;
+    red[64u + lid] = pinf;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint s = 32u; s > 0u; s >>= 1) {
+        if (lid < s) {
+            red[lid] ^= red[lid + s];
+            red[64u + lid] ^= red[64u + lid + s];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (lid == 0u) {
+        partials[2u * tgid] = red[0];
+        partials[2u * tgid + 1u] = red[64];
+    }
+}
+
 "#;
 
     // -----------------------------------------------------------------------
@@ -1000,6 +1116,8 @@ kernel void parent_hash(device const uint* children [[buffer(0)]],
         pub(crate) pso_ntt4h8: Id,
         pub(crate) pso_leaf: Id,
         pub(crate) pso_parent: Id,
+        /// Zerocheck fused tail round: fold + message partials per x_hi chunk.
+        pub(crate) pso_zc_fold: Id,
     }
     // SAFETY: MTLDevice/MTLCommandQueue/MTLComputePipelineState are
     // documented thread-safe; command buffers/encoders are created and used
@@ -1100,6 +1218,7 @@ kernel void parent_hash(device const uint* children [[buffer(0)]],
                 let pso_ntt4h8 = pso("ntt_fused_reg4h8")?;
                 let pso_leaf = pso("leaf_hash")?;
                 let pso_parent = pso("parent_hash")?;
+                let pso_zc_fold = pso("zc_fold_msg")?;
                 send!(api, unsafe extern "C" fn(Id, Sel) -> Id, library, c"release");
                 Ok(Gpu {
                     api,
@@ -1114,6 +1233,7 @@ kernel void parent_hash(device const uint* children [[buffer(0)]],
                     pso_ntt4h8,
                     pso_leaf,
                     pso_parent,
+                    pso_zc_fold,
                 })
             })();
             pool_pop(pool);
@@ -2597,6 +2717,200 @@ kernel void parent_hash(device const uint* children [[buffer(0)]],
         (CodewordBuf::Gpu(gpu_codeword), MerkleTreeBuf::Gpu(tree))
     }
 
+    // -------------------------------------------------------------------
+    // Zerocheck hybrid tail rounds: GPU fold + message partials for a
+    // position-prefix of x_hi chunks, overlapped with the CPU suffix.
+    // -------------------------------------------------------------------
+
+    /// `gf_mul_tab4` nibble-table layout for the constant `c`:
+    /// `tab[16k + n] = (n · x^(4k)) · c` for `k = 0..4`, `n = 0..16`.
+    fn zc_fold_tables(c: F128) -> [F128; 64] {
+        let mut tab = [F128::ZERO; 64];
+        for k in 0..4u64 {
+            for n in 0..16u64 {
+                tab[(16 * k + n) as usize] = F128::new(n << (4 * k), 0) * c;
+            }
+        }
+        tab
+    }
+
+    struct ZcState {
+        eq_buf: Id,
+        eq_cap: usize,
+        rf_buf: Id,
+        part_buf: Id,
+        part_cap: usize,
+        /// (base ptr, wrapped byte len, buffer) — no-copy wraps of the tail's
+        /// pooled ping-pong allocations, cached across rounds and proves.
+        wraps: Vec<(usize, usize, Id)>,
+    }
+    // SAFETY: Metal buffer objects are thread-safe; access is Mutex-guarded.
+    unsafe impl Send for ZcState {}
+    static ZC: Mutex<Option<ZcState>> = Mutex::new(None);
+
+    fn zc_wrap(
+        gpu: &Gpu,
+        st: &mut ZcState,
+        ptr: *const F128,
+        len_elems: usize,
+    ) -> Result<Id, String> {
+        let p = ptr as usize;
+        let bytes = len_elems * core::mem::size_of::<F128>();
+        if let Some(&(_, _, buf)) = st
+            .wraps
+            .iter()
+            .find(|&&(wp, wl, _)| wp == p && bytes <= wl)
+        {
+            return Ok(buf);
+        }
+        // Wrap requires page alignment; the tail's pooled buffers satisfy it
+        // at ranked sizes. Anything else falls back to the CPU path.
+        let buf = unsafe { gpu.wrap_buffer(p as *mut u8, bytes)? };
+        st.wraps.push((p, bytes, buf));
+        Ok(buf)
+    }
+
+    pub(crate) struct ZcGpuRound {
+        cb: Id,
+        n_chunks: usize,
+    }
+    // SAFETY: the command buffer handle is only waited on, once.
+    unsafe impl Send for ZcGpuRound {}
+
+    #[repr(C)]
+    struct ZcParams {
+        lo_size: u32,
+        n_chunks: u32,
+    }
+
+    /// Encode + async-commit the fold/message kernel over x_hi chunks
+    /// `[0, n_chunks)`. Inputs are the round's full `a`/`b`; outputs land in
+    /// the leading half of `a_out`/`b_out` exactly as the CPU kernel writes
+    /// them. Returns `None` (nothing written) when the GPU or a zero-copy
+    /// wrap is unavailable.
+    pub(crate) fn zc_fold_launch(
+        a: &[F128],
+        b: &[F128],
+        a_out: &mut [F128],
+        b_out: &mut [F128],
+        r_fold: F128,
+        eq_lo: &[F128],
+        n_chunks: usize,
+    ) -> Option<ZcGpuRound> {
+        let gpu = gpu().ok()?;
+        if n_chunks == 0 {
+            return None;
+        }
+        let mut guard = ZC.lock().unwrap();
+        unsafe {
+            let pool = gpu.pool_push();
+            let r = (|| -> Result<ZcGpuRound, String> {
+                if guard.is_none() {
+                    let rf_buf = gpu.new_buffer(64 * 16)?;
+                    // Generous fixed caps: eq_lo up to 2^14 entries and up to
+                    // 2^13 x_hi chunks (256 KiB each) cover every fused tail
+                    // geometry with margin.
+                    let eq_cap = (1 << 14) * 16;
+                    let eq_buf = gpu.new_buffer(eq_cap)?;
+                    let part_cap = (1 << 13) * 32;
+                    let part_buf = gpu.new_buffer(part_cap)?;
+                    *guard = Some(ZcState {
+                        eq_buf,
+                        eq_cap,
+                        rf_buf,
+                        part_buf,
+                        part_cap,
+                        wraps: Vec::new(),
+                    });
+                }
+                let st = guard.as_mut().expect("just initialized");
+                let eq_bytes = core::mem::size_of_val(eq_lo);
+                let part_bytes = n_chunks * 32;
+                if eq_bytes > st.eq_cap || part_bytes > st.part_cap {
+                    return Err("zc buffers too small for this shape".into());
+                }
+                let a_buf = zc_wrap(gpu, st, a.as_ptr(), a.len())?;
+                let b_buf = zc_wrap(gpu, st, b.as_ptr(), b.len())?;
+                let ao_buf = zc_wrap(gpu, st, a_out.as_ptr(), a_out.len())?;
+                let bo_buf = zc_wrap(gpu, st, b_out.as_ptr(), b_out.len())?;
+                let tab = zc_fold_tables(r_fold);
+                core::ptr::copy_nonoverlapping(
+                    tab.as_ptr().cast::<u8>(),
+                    gpu.buffer_contents(st.rf_buf),
+                    64 * 16,
+                );
+                core::ptr::copy_nonoverlapping(
+                    eq_lo.as_ptr().cast::<u8>(),
+                    gpu.buffer_contents(st.eq_buf),
+                    eq_bytes,
+                );
+                let cb = gpu.command_buffer()?;
+                let enc = gpu.compute_encoder(cb)?;
+                gpu.set_pipeline(enc, gpu.pso_zc_fold);
+                gpu.set_buffer(enc, a_buf, 0, 0);
+                gpu.set_buffer(enc, b_buf, 0, 1);
+                gpu.set_buffer(enc, ao_buf, 0, 2);
+                gpu.set_buffer(enc, bo_buf, 0, 3);
+                gpu.set_buffer(enc, st.eq_buf, 0, 4);
+                gpu.set_buffer(enc, st.rf_buf, 0, 5);
+                gpu.set_buffer(enc, st.part_buf, 0, 6);
+                let p = ZcParams {
+                    lo_size: eq_lo.len() as u32,
+                    n_chunks: n_chunks as u32,
+                };
+                let bytes = core::slice::from_raw_parts(
+                    (&p as *const ZcParams).cast::<u8>(),
+                    core::mem::size_of::<ZcParams>(),
+                );
+                gpu.set_bytes(enc, bytes, 7);
+                gpu.dispatch(enc, n_chunks as u64, 64);
+                gpu.end_encoding(enc);
+                // The command buffer outlives this call's autoreleasepool
+                // (waited on in `zc_fold_wait`): retain it explicitly;
+                // released after the wait.
+                send!(gpu.api, unsafe extern "C" fn(Id, Sel) -> Id, cb, c"retain");
+                gpu.commit_async(cb);
+                Ok(ZcGpuRound { cb, n_chunks })
+            })();
+            gpu.pool_pop(pool);
+            match r {
+                Ok(round) => Some(round),
+                Err(e) => {
+                    if debug_enabled() || std::env::var_os("FLOCK_ZC_TIMING").is_some() {
+                        eprintln!("[zc-gpu] launch failed: {e}");
+                    }
+                    None
+                }
+            }
+        }
+    }
+
+    /// Wait for a launched round and copy out its per-chunk `(p1, pinf)`
+    /// partials. Returns `None` on GPU error (caller must recompute the
+    /// covered chunks on the CPU).
+    pub(crate) fn zc_fold_wait(round: ZcGpuRound) -> Option<Vec<(F128, F128)>> {
+        let gpu = gpu().ok()?;
+        unsafe {
+            let waited = gpu.wait_cb(round.cb);
+            send!(gpu.api, unsafe extern "C" fn(Id, Sel), round.cb, c"release");
+            waited.ok()?;
+            let guard = ZC.lock().unwrap();
+            let st = guard.as_ref()?;
+            let src = gpu.buffer_contents(st.part_buf).cast::<F128>();
+            let mut out = Vec::with_capacity(round.n_chunks);
+            for c in 0..round.n_chunks {
+                out.push((*src.add(2 * c), *src.add(2 * c + 1)));
+            }
+            Some(out)
+        }
+    }
+
+    /// GPU share of the tail rounds in sixteenths of the x_hi chunk range.
+    /// `usize::MAX` = undecided (first ranked tail round of the process — the
+    /// untimed warmup prove — calibrates and stores it).
+    pub(crate) static ZC_GPU_SHARE16: std::sync::atomic::AtomicUsize =
+        std::sync::atomic::AtomicUsize::new(usize::MAX);
+
     pub(crate) fn commit_l0_or_fallback(
         z_packed: &[F128],
         mut codeword: Vec<F128>,
@@ -2682,6 +2996,11 @@ kernel void parent_hash(device const uint* children [[buffer(0)]],
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[cfg_attr(not(test), allow(unused_imports))]
 pub(crate) use imp::{gpu_merkle_tree_blake3, gpu_ntt_interleaved_from_layer};
+
+// Zerocheck hybrid tail-round entry points (macOS AArch64 only; call sites
+// in `zerocheck::multilinear` are cfg-gated identically).
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub(crate) use imp::{ZC_GPU_SHARE16, zc_fold_launch, zc_fold_wait};
 
 #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
 mod imp {
