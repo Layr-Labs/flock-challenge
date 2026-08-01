@@ -271,43 +271,166 @@ pub(super) fn accumulate_c_banks_with_policy(
     partial_c: &mut [[super::F128; 64]; 8],
     drain4: bool,
 ) {
-    accumulate_c_banks_with_drain_lanes(
-        c_block,
-        n_b_med,
-        mask_tables,
-        partial_c,
-        if drain4 { 4 } else { 1 },
-    );
-}
-
-#[inline]
-pub(super) fn accumulate_c_banks_with_drain_lanes(
-    c_block: &[u8; 16 * 64],
-    n_b_med: usize,
-    mask_tables: &[super::F128],
-    partial_c: &mut [[super::F128; 64]; 8],
-    drain_lanes: usize,
-) {
-    debug_assert!(matches!(drain_lanes, 1 | 4 | 8));
-
     #[cfg(target_arch = "aarch64")]
     // SAFETY: aarch64 statically guarantees NEON; the fixed-size arrays cover
     // every load/store and the table halves bound every `u8`-scaled index.
     unsafe {
-        aarch64::accumulate_c_banks(
-            c_block,
-            n_b_med,
-            mask_tables,
-            partial_c,
-            drain_lanes,
-        );
+        aarch64::accumulate_c_banks(c_block, n_b_med, mask_tables, partial_c, drain4);
     }
 
     #[cfg(not(target_arch = "aarch64"))]
     {
-        let _ = drain_lanes;
+        let _ = drain4;
         accumulate_c_banks_scalar(c_block, n_b_med, mask_tables, partial_c);
     }
+}
+
+/// Thirty-two-bank C drain for the experimental direct-fold4 capture.
+/// `q = b_med & 3` is retained alongside the incumbent eight small-bit banks;
+/// the 16-entry table folds only `h = b_med >> 2`.
+#[inline]
+#[cfg_attr(not(test), allow(dead_code))]
+pub(super) fn accumulate_c_fold4_banks(
+    c_block: &[u8; 16 * 64],
+    n_b_med: usize,
+    mask_table: &[super::F128],
+    partial_c: &mut [[super::F128; 64]; 32],
+) {
+    #[cfg(target_arch = "aarch64")]
+    // SAFETY: aarch64 statically guarantees NEON; fixed-size arrays cover
+    // every load/store and each mask-table index is a four-bit nibble.
+    unsafe {
+        aarch64::accumulate_c_fold4_banks(c_block, n_b_med, mask_table, partial_c);
+    }
+
+    #[cfg(not(target_arch = "aarch64"))]
+    super::accumulate_c_fold4_banks_scalar(c_block, n_b_med, mask_table, partial_c);
+}
+
+/// Pair-fused Fold4 drain with the original 32-bank accumulator shape.  This
+/// is the first A/B candidate: it halves drain traffic without changing the
+/// 128-job schedule or allocating additional partials.
+#[inline]
+#[allow(clippy::too_many_arguments)]
+pub(super) fn accumulate_c_fold4_pair_banks(
+    c_block_even: &[u8; 16 * 64],
+    n_b_med_even: usize,
+    c_block_odd: &[u8; 16 * 64],
+    n_b_med_odd: usize,
+    pair_mask_table: &[super::F128; 256],
+    partial_c: &mut [[super::F128; 64]; 32],
+) {
+    for q in 0..4 {
+        let q_banks: &mut [[super::F128; 64]; 8] = (&mut partial_c[q * 8..(q + 1) * 8])
+            .try_into()
+            .expect("eight Fold4 banks per retained q group");
+        accumulate_c_fold4_q_pair_banks(
+            c_block_even,
+            n_b_med_even,
+            c_block_odd,
+            n_b_med_odd,
+            q,
+            pair_mask_table,
+            q_banks,
+        );
+    }
+}
+
+/// Four-block Fold4 drain for the monolithic 32-bank candidate. Two composed
+/// pair tables cover blocks (0,1) and (2,3); the architecture kernel combines
+/// their contributions before one accumulator read/modify/write.
+#[inline]
+#[allow(clippy::too_many_arguments)]
+pub(super) fn accumulate_c_fold4_four_banks(
+    c_blocks: [&[u8; 16 * 64]; 4],
+    n_b_med: [usize; 4],
+    pair_mask_tables: [&[super::F128; 256]; 2],
+    partial_c: &mut [[super::F128; 64]; 32],
+) {
+    assert!(
+        n_b_med.into_iter().all(|count| count <= 16),
+        "Fold4 padding count exceeds 16 rows"
+    );
+
+    #[cfg(target_arch = "aarch64")]
+    // SAFETY: fixed arrays cover all selected rows and both table indices are
+    // assembled from two four-bit masks.
+    unsafe {
+        aarch64::accumulate_c_fold4_four_banks(c_blocks, n_b_med, pair_mask_tables, partial_c);
+    }
+
+    #[cfg(not(target_arch = "aarch64"))]
+    for q in 0..4 {
+        let q_banks: &mut [[super::F128; 64]; 8] = (&mut partial_c[q * 8..(q + 1) * 8])
+            .try_into()
+            .expect("eight Fold4 banks per retained q group");
+        super::accumulate_c_fold4_q_pair_banks_scalar(
+            c_blocks[0],
+            n_b_med[0],
+            c_blocks[1],
+            n_b_med[1],
+            q,
+            pair_mask_tables[0],
+            q_banks,
+        );
+        super::accumulate_c_fold4_q_pair_banks_scalar(
+            c_blocks[2],
+            n_b_med[2],
+            c_blocks[3],
+            n_b_med[3],
+            q,
+            pair_mask_tables[1],
+            q_banks,
+        );
+    }
+}
+
+/// Pair-fused q-local Fold4 drain. The low and high nibbles come from two
+/// adjacent low-coordinate witness blocks with independent padding bounds;
+/// the 256-entry table contains their already-added field contributions.
+#[inline]
+#[allow(clippy::too_many_arguments)]
+pub(super) fn accumulate_c_fold4_q_pair_banks(
+    c_block_even: &[u8; 16 * 64],
+    n_b_med_even: usize,
+    c_block_odd: &[u8; 16 * 64],
+    n_b_med_odd: usize,
+    q: usize,
+    pair_mask_table: &[super::F128; 256],
+    partial_c: &mut [[super::F128; 64]; 8],
+) {
+    assert!(
+        n_b_med_even <= 16,
+        "even Fold4 padding count exceeds 16 rows"
+    );
+    assert!(n_b_med_odd <= 16, "odd Fold4 padding count exceeds 16 rows");
+    assert!(q < 4, "Fold4 retained-medium group must be in 0..4");
+    #[cfg(target_arch = "aarch64")]
+    // SAFETY: aarch64 statically guarantees NEON; both fixed arrays cover
+    // every selected row, q is checked by the kernel, and the two four-bit
+    // masks form a bounded eight-bit table index.
+    unsafe {
+        aarch64::accumulate_c_fold4_q_pair_banks(
+            c_block_even,
+            n_b_med_even,
+            c_block_odd,
+            n_b_med_odd,
+            q,
+            pair_mask_table,
+            partial_c,
+        );
+    }
+
+    #[cfg(not(target_arch = "aarch64"))]
+    super::accumulate_c_fold4_q_pair_banks_scalar(
+        c_block_even,
+        n_b_med_even,
+        c_block_odd,
+        n_b_med_odd,
+        q,
+        pair_mask_table,
+        partial_c,
+    );
 }
 
 /// AB-only half of [`accumulate_convert_with_s_hat_v`].  Keeping this as a

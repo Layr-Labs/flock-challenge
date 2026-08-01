@@ -147,7 +147,28 @@ pub fn open_batch_mixed_ligerito_with_precomputed_s_hat_v<Ch: Challenger>(
     );
 
     let t = std::time::Instant::now();
-    let ligerito_proof = if let Some(direct) = combined.direct_fold2 {
+    let ligerito_proof = if let Some(direct) = combined.direct_fold4 {
+        ligerito::recursive_prover_with_basis_direct_fold4(
+            lig_config,
+            packed_witness,
+            combined.b_combined,
+            direct,
+            combined.target_combined,
+            &prover_data.codeword,
+            &*prover_data.merkle_tree,
+            combined.round0_prime,
+            combined
+                .round1_lookahead
+                .expect("direct-fold4 requires round-1 lookahead"),
+            combined
+                .round2_lookahead
+                .expect("direct-fold4 requires round-2 lookahead"),
+            combined
+                .round3_lookahead
+                .expect("direct-fold4 requires round-3 lookahead"),
+            challenger,
+        )
+    } else if let Some(direct) = combined.direct_fold2 {
         ligerito::recursive_prover_with_basis_direct_ab_fold2(
             lig_config,
             packed_witness,
@@ -203,6 +224,10 @@ struct CombinedClaim {
     /// Round-1 message as two quadratics in the first fold challenge. Present
     /// only for the exact ranked two-challenge cadence.
     round1_lookahead: Option<[F128; 6]>,
+    /// Experimental direct-fold4 round-2 bivariate lookahead.
+    round2_lookahead: Option<Fold4Lookahead2>,
+    /// Experimental direct-fold4 round-3 trivariate lookahead.
+    round3_lookahead: Option<Fold4Lookahead3>,
     /// Per-claim sufficient statistics for direct materialization after rounds
     /// 0/1. `b_combined` still contains every ordinary claim (currently C) —
     /// unless deferred-C is active, in which case C rides along here as a
@@ -210,6 +235,9 @@ struct CombinedClaim {
     /// direct-C completion is active, in which case C rides along with real
     /// `products` and there is no basis sweep at all.
     direct_fold2: Option<Vec<ring_switch::DirectFold2Factors>>,
+    /// Sixteen-bank direct factors. This is populated only behind the strict
+    /// experimental opt-in and leaves the frontier path unchanged by default.
+    direct_fold4: Option<Vec<ring_switch::DirectFold4Factors>>,
 }
 
 /// Compute the ordinary round-zero message and the following message as two
@@ -335,6 +363,138 @@ fn messages_from_direct_products(
         block_sum(&[0, 1, 2, 3], &[0, 1, 2, 3]),
     ];
     (round0, lookahead)
+}
+
+pub(crate) type Fold4Lookahead2 = [F128; 18];
+pub(crate) type Fold4Lookahead3 = [F128; 54];
+
+#[inline(always)]
+fn quadratic_coefficients([at_zero, at_one, leading]: [F128; 3]) -> [F128; 3] {
+    [at_zero, at_zero + at_one + leading, leading]
+}
+
+/// Convert an evaluation tensor over `{0, 1, leading}^variables` into the
+/// matching degree-at-most-two coefficient tensor, in row-major coordinate
+/// order. This is the fold3 interpolation algebra generalized to three prior
+/// challenges for the direct-fold4 scaffold.
+fn tensor_quadratic_coefficients(values: &mut [F128], variables: usize) {
+    debug_assert_eq!(values.len(), 3usize.pow(variables as u32));
+    for axis in 0..variables {
+        let stride = 3usize.pow((variables - axis - 1) as u32);
+        let period = 3 * stride;
+        for block in (0..values.len()).step_by(period) {
+            for offset in 0..stride {
+                let indices = [block + offset, block + stride + offset, block + 2 * stride + offset];
+                let coefficients = quadratic_coefficients([
+                    values[indices[0]],
+                    values[indices[1]],
+                    values[indices[2]],
+                ]);
+                for (index, coefficient) in indices.into_iter().zip(coefficients) {
+                    values[index] = coefficient;
+                }
+            }
+        }
+    }
+}
+
+/// Build the two message-polynomial coefficient tensors at `round` from a
+/// 16×16 bilinear product matrix. Prior-coordinate grid digit 0 selects the
+/// zero endpoint, 1 the one endpoint, and 2 the quadratic leading term (the
+/// sum of both endpoint banks). The current-coordinate `u_2` grid similarly
+/// selects both halves. Higher coordinates are summed independently.
+fn direct_fold4_message_coefficients(
+    h: &[F128; 256],
+    round: usize,
+) -> (Vec<F128>, Vec<F128>) {
+    debug_assert!(round < 4);
+    let grid_len = 3usize.pow(round as u32);
+    let mut endpoints = vec![F128::ZERO; 2 * grid_len];
+
+    let product = |mask: u16| {
+        let mut sum = F128::ZERO;
+        for e in 0..16 {
+            if mask & (1 << e) == 0 {
+                continue;
+            }
+            for d in 0..16 {
+                if mask & (1 << d) != 0 {
+                    sum += h[16 * e + d];
+                }
+            }
+        }
+        sum
+    };
+
+    for current_leading in 0..2 {
+        for grid_index in 0..grid_len {
+            let mut total = F128::ZERO;
+            let high_assignments = 1usize << (3 - round);
+            for high in 0..high_assignments {
+                let mut mask = 0u16;
+                'bank: for bank in 0..16 {
+                    if current_leading == 0 && ((bank >> round) & 1) != 0 {
+                        continue;
+                    }
+                    for bit in 0..round {
+                        let divisor = 3usize.pow((round - bit - 1) as u32);
+                        let mode = (grid_index / divisor) % 3;
+                        if mode < 2 && ((bank >> bit) & 1) != mode {
+                            continue 'bank;
+                        }
+                    }
+                    if bank >> (round + 1) != high {
+                        continue;
+                    }
+                    mask |= 1 << bank;
+                }
+                total += product(mask);
+            }
+            endpoints[current_leading * grid_len + grid_index] = total;
+        }
+    }
+
+    let (u0, u2) = endpoints.split_at_mut(grid_len);
+    tensor_quadratic_coefficients(u0, round);
+    tensor_quadratic_coefficients(u2, round);
+    (u0.to_vec(), u2.to_vec())
+}
+
+/// Derive the first four transcript messages from sixteen-bank direct
+/// sufficient statistics, without materializing either N-sized polynomial.
+/// The returned lookaheads are respectively uni-, bi-, and trivariate
+/// quadratics in the already-sampled challenges.
+pub(crate) fn messages_from_direct_products_fold4(
+    factors: &[ring_switch::DirectFold4Factors],
+) -> (
+    (F128, F128),
+    [F128; 6],
+    Fold4Lookahead2,
+    Fold4Lookahead3,
+) {
+    let mut h = [F128::ZERO; 256];
+    for claim in factors {
+        for (out, value) in h.iter_mut().zip(claim.products) {
+            *out += value;
+        }
+    }
+
+    let (round0_u0, round0_u2) = direct_fold4_message_coefficients(&h, 0);
+    let (round1_u0, round1_u2) = direct_fold4_message_coefficients(&h, 1);
+    let (round2_u0, round2_u2) = direct_fold4_message_coefficients(&h, 2);
+    let (round3_u0, round3_u2) = direct_fold4_message_coefficients(&h, 3);
+
+    let mut round1 = [F128::ZERO; 6];
+    round1[..3].copy_from_slice(&round1_u0);
+    round1[3..].copy_from_slice(&round1_u2);
+    let mut round2 = [F128::ZERO; 18];
+    round2[..9].copy_from_slice(&round2_u0);
+    round2[9..].copy_from_slice(&round2_u2);
+    let mut round3 = [F128::ZERO; 54];
+    round3[..27].copy_from_slice(&round3_u0);
+    round3[27..].copy_from_slice(&round3_u2);
+
+    ((round0_u0[0], round0_u2[0]), round1, round2, round3)
 }
 
 /// Exact ranked shape for the heterogeneous combined-basis queue. The gate is
@@ -523,6 +683,35 @@ fn direct_all_claim_mix_supported(
     )
 }
 
+/// Experimental sixteen-bank route: both ranked claims must expose a complete
+/// direct-fold4 bundle, so no ordinary basis sweep or duplicate statistics
+/// path is needed.
+#[inline]
+fn direct_fold4_all_claim_mix_supported(
+    rs_results: &[(RingSwitchProof, ring_switch::RingSwitchBatchOutput)],
+) -> bool {
+    matches!(
+        rs_results,
+        [(_, ab), (_, c)]
+            if ab.direct_fold4.is_some()
+                && c.direct_fold4.is_some()
+                && matches!(&ab.rs_eq_ind, ring_switch::RsEqInd::DeferredDense { .. })
+                && matches!(&c.rs_eq_ind, ring_switch::RsEqInd::DeferredDense { .. })
+    )
+}
+
+/// Direct-fold4 enable, latched once per process.
+///
+/// Default **enabled** for the ranked worker. `FLOCK_NO_OPEN_DIRECT_FOLD4=1`
+/// restores the previous direct-C route bit-for-bit. The retained-coordinate
+/// producers and this consumer share this predicate so they cannot silently
+/// disagree.
+#[inline]
+pub fn ranked_direct_fold4_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("FLOCK_NO_OPEN_DIRECT_FOLD4").is_none())
+}
+
 /// Direct-C completion kill switch, latched once per process.
 ///
 /// Default **enabled**: the ranked worker's environment is cleared down to
@@ -626,10 +815,31 @@ fn compute_combined_basis_and_target<Ch: Challenger>(
         && n_rs == 2
         && n_pd == 0
         && std::env::var_os("FLOCK_NO_OPEN_DIRECT_AB").is_none();
-    let use_direct_all =
-        direct_common && ranked_direct_c_enabled() && direct_all_claim_mix_supported(&rs_results);
+    let use_direct_fold4 = direct_common
+        && ranked_direct_fold4_enabled()
+        && direct_fold4_all_claim_mix_supported(&rs_results);
+    let use_direct_all = !use_direct_fold4
+        && direct_common
+        && ranked_direct_c_enabled()
+        && direct_all_claim_mix_supported(&rs_results);
     let use_direct_ab =
         direct_common && (use_direct_all || direct_ab_claim_mix_supported(&rs_results));
+    let direct_fold4 = if use_direct_fold4 {
+        Some(vec![
+            rs_results[0]
+                .1
+                .direct_fold4
+                .take()
+                .expect("direct-fold4 gate checked claim zero"),
+            rs_results[1]
+                .1
+                .direct_fold4
+                .take()
+                .expect("direct-fold4 gate checked claim one"),
+        ])
+    } else {
+        None
+    };
     let mut direct_fold2 = if use_direct_all {
         Some(vec![
             rs_results[0]
@@ -654,7 +864,9 @@ fn compute_combined_basis_and_target<Ch: Challenger>(
     } else {
         None
     };
-    let direct_count = direct_fold2.as_ref().map_or(0, Vec::len);
+    let direct_count = direct_fold4
+        .as_ref()
+        .map_or_else(|| direct_fold2.as_ref().map_or(0, Vec::len), Vec::len);
     // Deferred-C candidate: taken here, before `rs_baked`/`rs_deferred`
     // borrow `rs_results`; confirmed below once the ranked sweep shape is
     // known (dropped — incumbent path — otherwise). Mutually exclusive with
@@ -756,14 +968,18 @@ fn compute_combined_basis_and_target<Ch: Challenger>(
     // ---- Build b_combined (γ-weighted sum of all rs_eq_ind + eq_ind) and the
     //      round-0 prime (u_0, u_2 over packed_witness · b_combined).
     let t_alloc = std::time::Instant::now();
-    let mut b_combined: Vec<F128> = if use_deferred_c || use_direct_all {
+    let mut b_combined: Vec<F128> = if use_deferred_c || use_direct_all || use_direct_fold4 {
         Vec::new()
     } else {
         crate::scratch::take_f128(l)
     };
     let alloc_ms = t_alloc.elapsed().as_secs_f64() * 1e3;
     let t_fold = std::time::Instant::now();
-    let (mut round0_u0, mut round0_u2, round1_lookahead) = if use_direct_all {
+    let (mut round0_u0, mut round0_u2, round1_lookahead) = if use_direct_fold4 {
+        // All four initial messages come from the two claims' 16×16 product
+        // matrices below; no L-sized basis exists to sweep.
+        (F128::ZERO, F128::ZERO, Some([F128::ZERO; 6]))
+    } else if use_direct_all {
         // Every claim's round-0 and round-1 contribution comes from its own
         // `products` (added below, from `messages_from_direct_products`), so
         // there is no basis to sweep: no L-sized allocation, no per-slot fold,
@@ -959,6 +1175,22 @@ fn compute_combined_basis_and_target<Ch: Challenger>(
         (prime.0, prime.1, None)
     };
     let mut round1_lookahead = round1_lookahead;
+    let mut round2_lookahead = None;
+    let mut round3_lookahead = None;
+    if let Some(direct) = direct_fold4.as_ref() {
+        let (direct_round0, direct_round1, direct_round2, direct_round3) =
+            messages_from_direct_products_fold4(direct);
+        round0_u0 += direct_round0.0;
+        round0_u2 += direct_round0.1;
+        let combined_round1 = round1_lookahead
+            .as_mut()
+            .expect("direct-fold4 gate requires round-1 lookahead storage");
+        for (out, value) in combined_round1.iter_mut().zip(direct_round1) {
+            *out += value;
+        }
+        round2_lookahead = Some(direct_round2);
+        round3_lookahead = Some(direct_round3);
+    }
     if let Some(direct) = direct_fold2.as_ref() {
         let (direct_round0, direct_lookahead) = messages_from_direct_products(direct);
         round0_u0 += direct_round0.0;
@@ -1042,7 +1274,10 @@ fn compute_combined_basis_and_target<Ch: Challenger>(
         target_combined,
         round0_prime: (round0_u0, round0_u2),
         round1_lookahead,
+        round2_lookahead,
+        round3_lookahead,
         direct_fold2,
+        direct_fold4,
     }
 }
 
@@ -1353,6 +1588,7 @@ mod tests {
                     },
                     sumcheck_claim: F128::ZERO,
                     direct_fold2: Some(direct()),
+                    direct_fold4: None,
                     deferred_c_fold2: None,
                 },
             ),
@@ -1365,6 +1601,7 @@ mod tests {
                     },
                     sumcheck_claim: F128::ZERO,
                     direct_fold2: None,
+                    direct_fold4: None,
                     deferred_c_fold2: None,
                 },
             ),
@@ -1386,6 +1623,7 @@ mod tests {
                     },
                     sumcheck_claim: F128::ZERO,
                     direct_fold2: Some(direct()),
+                    direct_fold4: None,
                     deferred_c_fold2: None,
                 },
             ),
@@ -1399,6 +1637,7 @@ mod tests {
                     },
                     sumcheck_claim: F128::ZERO,
                     direct_fold2: None,
+                    direct_fold4: None,
                     deferred_c_fold2: None,
                 },
             ),

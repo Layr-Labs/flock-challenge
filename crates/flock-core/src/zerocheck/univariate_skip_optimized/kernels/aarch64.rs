@@ -1,4 +1,4 @@
-use super::super::{InvNttTableByteSingleGf8, F128, F8, N_CHUNKS};
+use super::super::{F8, F128, InvNttTableByteSingleGf8, N_CHUNKS};
 
 /// Four-lane convert-table fold.
 ///
@@ -178,9 +178,8 @@ pub(crate) unsafe fn accumulate_convert_ab(
                 // One u32 load per b_med covers the 4 adjacent lanes; each
                 // extracted byte addresses the same table row as the original
                 // byte-load form.
-                let we =
-                    (chunk_ab_bytes[b_even].as_ptr().add(lane) as *const u32).read_unaligned()
-                        as usize;
+                let we = (chunk_ab_bytes[b_even].as_ptr().add(lane) as *const u32).read_unaligned()
+                    as usize;
                 let wo = (chunk_ab_bytes[b_odd].as_ptr().add(lane) as *const u32).read_unaligned()
                     as usize;
                 ab0 = xor3_u8(
@@ -274,7 +273,7 @@ pub(crate) unsafe fn accumulate_c_banks(
     n_b_med: usize,
     mask_tables: &[F128],
     partial_c: &mut [[F128; 64]; 8],
-    drain_lanes: usize,
+    drain4: bool,
 ) {
     use core::arch::aarch64::*;
 
@@ -360,7 +359,9 @@ pub(crate) unsafe fn accumulate_c_banks(
                 for chunk in 0..4 {
                     let col = chunk * 16;
                     let row = |b: usize| -> uint8x16_t { $row(b, col) };
-                    for (half, dst) in [m_lo.as_mut_ptr(), m_hi.as_mut_ptr()].into_iter().enumerate()
+                    for (half, dst) in [m_lo.as_mut_ptr(), m_hi.as_mut_ptr()]
+                        .into_iter()
+                        .enumerate()
                     {
                         let base = half * 8;
                         let t = transpose8!(
@@ -398,53 +399,7 @@ pub(crate) unsafe fn accumulate_c_banks(
 
         let t_lo = mask_tables.as_ptr() as *const u8;
         let t_hi = t_lo.add(256 * 16);
-        if drain_lanes == 8 {
-            // Eight independent lanes keep sixteen unrelated table loads in
-            // flight. The register footprint remains below AArch64's 32-vector
-            // budget because each partial is loaded only immediately before
-            // its store.
-            for s in 0..8 {
-                let bank = partial_c[s].as_mut_ptr() as *mut u8;
-                for lane in (0..64).step_by(8) {
-                    let lo = (m_lo[s].as_ptr().add(lane) as *const u64).read_unaligned();
-                    let hi = (m_hi[s].as_ptr().add(lane) as *const u64).read_unaligned();
-
-                    let l0 = vld1q_u8(t_lo.add(usize::from((lo & 0xff) as u8) * 16));
-                    let l1 = vld1q_u8(t_lo.add(usize::from(((lo >> 8) & 0xff) as u8) * 16));
-                    let l2 = vld1q_u8(t_lo.add(usize::from(((lo >> 16) & 0xff) as u8) * 16));
-                    let l3 = vld1q_u8(t_lo.add(usize::from(((lo >> 24) & 0xff) as u8) * 16));
-                    let l4 = vld1q_u8(t_lo.add(usize::from(((lo >> 32) & 0xff) as u8) * 16));
-                    let l5 = vld1q_u8(t_lo.add(usize::from(((lo >> 40) & 0xff) as u8) * 16));
-                    let l6 = vld1q_u8(t_lo.add(usize::from(((lo >> 48) & 0xff) as u8) * 16));
-                    let l7 = vld1q_u8(t_lo.add(usize::from((lo >> 56) as u8) * 16));
-                    let h0 = vld1q_u8(t_hi.add(usize::from((hi & 0xff) as u8) * 16));
-                    let h1 = vld1q_u8(t_hi.add(usize::from(((hi >> 8) & 0xff) as u8) * 16));
-                    let h2 = vld1q_u8(t_hi.add(usize::from(((hi >> 16) & 0xff) as u8) * 16));
-                    let h3 = vld1q_u8(t_hi.add(usize::from(((hi >> 24) & 0xff) as u8) * 16));
-                    let h4 = vld1q_u8(t_hi.add(usize::from(((hi >> 32) & 0xff) as u8) * 16));
-                    let h5 = vld1q_u8(t_hi.add(usize::from(((hi >> 40) & 0xff) as u8) * 16));
-                    let h6 = vld1q_u8(t_hi.add(usize::from(((hi >> 48) & 0xff) as u8) * 16));
-                    let h7 = vld1q_u8(t_hi.add(usize::from((hi >> 56) as u8) * 16));
-
-                    let p0 = bank.add(lane * 16);
-                    let p1 = p0.add(16);
-                    let p2 = p1.add(16);
-                    let p3 = p2.add(16);
-                    let p4 = p3.add(16);
-                    let p5 = p4.add(16);
-                    let p6 = p5.add(16);
-                    let p7 = p6.add(16);
-                    vst1q_u8(p0, xor3_u8(vld1q_u8(p0), l0, h0));
-                    vst1q_u8(p1, xor3_u8(vld1q_u8(p1), l1, h1));
-                    vst1q_u8(p2, xor3_u8(vld1q_u8(p2), l2, h2));
-                    vst1q_u8(p3, xor3_u8(vld1q_u8(p3), l3, h3));
-                    vst1q_u8(p4, xor3_u8(vld1q_u8(p4), l4, h4));
-                    vst1q_u8(p5, xor3_u8(vld1q_u8(p5), l5, h5));
-                    vst1q_u8(p6, xor3_u8(vld1q_u8(p6), l6, h6));
-                    vst1q_u8(p7, xor3_u8(vld1q_u8(p7), l7, h7));
-                }
-            }
-        } else if drain_lanes == 4 {
+        if drain4 {
             // Four independent lanes expose eight random table loads at once,
             // matching the latency-hiding shape of the AB convert kernel.
             // The old scalar drain kept only the low/high pair for one lane in
@@ -488,6 +443,527 @@ pub(crate) unsafe fn accumulate_c_banks(
                             vld1q_u8(t_hi.add(usize::from(m_hi[s][lane]) * 16)),
                         ),
                     );
+                }
+            }
+        }
+    }
+}
+
+/// Direct-fold4 C capture, NEON — retain `q = b_med & 3` in four groups of
+/// the incumbent eight alpha-free small-bit banks.
+///
+/// This follows the incumbent fused-mask kernel's two efficient primitives:
+/// an 8x8 cross-row bit transpose directly from the packed witness, and a
+/// four-lane field-table drain.  The difference is the row grouping.  For a
+/// fixed q we transpose rows `[q, q+4, q+8, q+12, 0, 0, 0, 0]`; the resulting
+/// low nibble is exactly the h-mask selecting gamma exponents {0,4,8,12}.
+/// Thus no per-bit or per-lane scalar mask construction remains in the ranked
+/// hot loop.  Four group transposes replace the incumbent two half transposes,
+/// while the table shrinks from 512 to 16 F128 entries.
+#[inline(always)]
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) unsafe fn accumulate_c_fold4_banks(
+    c_block: &[u8; 16 * 64],
+    n_b_med: usize,
+    mask_table: &[F128],
+    partial_c: &mut [[F128; 64]; 32],
+) {
+    use core::arch::aarch64::*;
+
+    debug_assert!(n_b_med <= 16);
+    debug_assert_eq!(mask_table.len(), 16);
+
+    // SAFETY: every load and store below is a fixed offset into a fixed-size
+    // caller-owned array. Rows at or above n_b_med are replaced with zero, and
+    // each table index is produced by a transpose with only four live rows.
+    unsafe {
+        macro_rules! transpose8 {
+            ($x:expr, $m33:expr, $m55:expr) => {{
+                let x: [uint8x16_t; 8] = $x;
+                let mut a = [vdupq_n_u8(0); 8];
+                for b in 0..4 {
+                    a[b] = vsliq_n_u8::<4>(x[b], x[b + 4]);
+                    a[b + 4] = vsriq_n_u8::<4>(x[b + 4], x[b]);
+                }
+                let mut c = [vdupq_n_u8(0); 8];
+                for block in 0..2 {
+                    for b in 0..2 {
+                        let (i, j) = (4 * block + b, 4 * block + b + 2);
+                        c[i] = vbslq_u8($m33, a[i], vshlq_n_u8::<2>(a[j]));
+                        c[j] = vbslq_u8($m33, vshrq_n_u8::<2>(a[i]), a[j]);
+                    }
+                }
+                let mut out = [vdupq_n_u8(0); 8];
+                for pair in 0..4 {
+                    let (i, j) = (2 * pair, 2 * pair + 1);
+                    out[i] = vbslq_u8($m55, c[i], vshlq_n_u8::<1>(c[j]));
+                    out[j] = vbslq_u8($m55, vshrq_n_u8::<1>(c[i]), c[j]);
+                }
+                out
+            }};
+        }
+
+        macro_rules! interleave8 {
+            ($r:expr) => {{
+                let r: [uint8x16_t; 8] = $r;
+                let (a0, a1) = (vzip1q_u8(r[0], r[4]), vzip2q_u8(r[0], r[4]));
+                let (b0, b1) = (vzip1q_u8(r[2], r[6]), vzip2q_u8(r[2], r[6]));
+                let (c0, c1) = (vzip1q_u8(r[1], r[5]), vzip2q_u8(r[1], r[5]));
+                let (d0, d1) = (vzip1q_u8(r[3], r[7]), vzip2q_u8(r[3], r[7]));
+                let (e0, e1) = (vzip1q_u8(a0, b0), vzip2q_u8(a0, b0));
+                let (e2, e3) = (vzip1q_u8(a1, b1), vzip2q_u8(a1, b1));
+                let (f0, f1) = (vzip1q_u8(c0, d0), vzip2q_u8(c0, d0));
+                let (f2, f3) = (vzip1q_u8(c1, d1), vzip2q_u8(c1, d1));
+                [
+                    vzip1q_u8(e0, f0),
+                    vzip2q_u8(e0, f0),
+                    vzip1q_u8(e1, f1),
+                    vzip2q_u8(e1, f1),
+                    vzip1q_u8(e2, f2),
+                    vzip2q_u8(e2, f2),
+                    vzip1q_u8(e3, f3),
+                    vzip2q_u8(e3, f3),
+                ]
+            }};
+        }
+
+        // masks[q][K][lane] is a low-nibble h mask. All bytes are overwritten
+        // by the four 16-column chunks below before the drain reads them.
+        let mut masks = [[[0u8; 64]; 8]; 4];
+        let src = c_block.as_ptr();
+        let m33 = vdupq_n_u8(0x33);
+        let m55 = vdupq_n_u8(0x55);
+        let zero = vdupq_n_u8(0);
+
+        macro_rules! build_masks {
+            ($row:expr) => {
+                for chunk in 0..4 {
+                    let col = chunk * 16;
+                    let row = |b: usize| -> uint8x16_t { $row(b, col) };
+                    for q in 0..4 {
+                        let t = transpose8!(
+                            [
+                                row(q),
+                                row(q + 4),
+                                row(q + 8),
+                                row(q + 12),
+                                zero,
+                                zero,
+                                zero,
+                                zero,
+                            ],
+                            m33,
+                            m55
+                        );
+                        let interleaved = interleave8!(t);
+                        let dst = masks[q].as_mut_ptr() as *mut u8;
+                        for (i, value) in interleaved.into_iter().enumerate() {
+                            vst1q_u8(dst.add(chunk * 128 + i * 16), value);
+                        }
+                    }
+                }
+            };
+        }
+
+        if n_b_med == 16 {
+            build_masks!(|b: usize, col: usize| vld1q_u8(src.add(b * 64 + col)));
+        } else {
+            build_masks!(|b: usize, col: usize| if b < n_b_med {
+                vld1q_u8(src.add(b * 64 + col))
+            } else {
+                zero
+            });
+        }
+
+        let table = mask_table.as_ptr() as *const u8;
+        for q in 0..4 {
+            for k in 0..8 {
+                let bank = partial_c[q * 8 + k].as_mut_ptr() as *mut u8;
+                for lane in (0..64).step_by(4) {
+                    let indices = (masks[q][k].as_ptr().add(lane) as *const u32).read_unaligned();
+                    let i0 = usize::from((indices & 0xff) as u8);
+                    let i1 = usize::from(((indices >> 8) & 0xff) as u8);
+                    let i2 = usize::from(((indices >> 16) & 0xff) as u8);
+                    let i3 = usize::from((indices >> 24) as u8);
+                    debug_assert!(i0 < 16 && i1 < 16 && i2 < 16 && i3 < 16);
+
+                    let p0 = bank.add(lane * 16);
+                    let p1 = p0.add(16);
+                    let p2 = p1.add(16);
+                    let p3 = p2.add(16);
+                    vst1q_u8(p0, veorq_u8(vld1q_u8(p0), vld1q_u8(table.add(i0 * 16))));
+                    vst1q_u8(p1, veorq_u8(vld1q_u8(p1), vld1q_u8(table.add(i1 * 16))));
+                    vst1q_u8(p2, veorq_u8(vld1q_u8(p2), vld1q_u8(table.add(i2 * 16))));
+                    vst1q_u8(p3, veorq_u8(vld1q_u8(p3), vld1q_u8(table.add(i3 * 16))));
+                }
+            }
+        }
+    }
+}
+
+/// Pair-fused direct-fold4 C capture for one retained-medium q group.
+/// Two adjacent low-coordinate blocks contribute the low and high nibble of
+/// one eight-bit index into an already-composed field table.  The eight-lane
+/// drain issues all independent table loads before touching the accumulator,
+/// and performs one RMW for the pair instead of one per block.
+#[inline]
+#[allow(clippy::too_many_arguments)]
+pub(crate) unsafe fn accumulate_c_fold4_q_pair_banks(
+    c_block_even: &[u8; 16 * 64],
+    n_b_med_even: usize,
+    c_block_odd: &[u8; 16 * 64],
+    n_b_med_odd: usize,
+    q: usize,
+    pair_mask_table: &[F128; 256],
+    partial_c: &mut [[F128; 64]; 8],
+) {
+    use core::arch::aarch64::*;
+
+    debug_assert!(n_b_med_even <= 16);
+    debug_assert!(n_b_med_odd <= 16);
+    debug_assert!(q < 4);
+    debug_assert_eq!(pair_mask_table.len(), 256);
+
+    // SAFETY: every live row is bounds-checked against its block's independent
+    // padding count. Each transpose has four live rows and four zero rows, so
+    // every mask byte is a nibble and their concatenation is a valid u8 index.
+    unsafe {
+        macro_rules! transpose8 {
+            ($x:expr, $m33:expr, $m55:expr) => {{
+                let x: [uint8x16_t; 8] = $x;
+                let mut a = [vdupq_n_u8(0); 8];
+                for b in 0..4 {
+                    a[b] = vsliq_n_u8::<4>(x[b], x[b + 4]);
+                    a[b + 4] = vsriq_n_u8::<4>(x[b + 4], x[b]);
+                }
+                let mut c = [vdupq_n_u8(0); 8];
+                for block in 0..2 {
+                    for b in 0..2 {
+                        let (i, j) = (4 * block + b, 4 * block + b + 2);
+                        c[i] = vbslq_u8($m33, a[i], vshlq_n_u8::<2>(a[j]));
+                        c[j] = vbslq_u8($m33, vshrq_n_u8::<2>(a[i]), a[j]);
+                    }
+                }
+                let mut out = [vdupq_n_u8(0); 8];
+                for pair in 0..4 {
+                    let (i, j) = (2 * pair, 2 * pair + 1);
+                    out[i] = vbslq_u8($m55, c[i], vshlq_n_u8::<1>(c[j]));
+                    out[j] = vbslq_u8($m55, vshrq_n_u8::<1>(c[i]), c[j]);
+                }
+                out
+            }};
+        }
+
+        macro_rules! interleave8 {
+            ($r:expr) => {{
+                let r: [uint8x16_t; 8] = $r;
+                let (a0, a1) = (vzip1q_u8(r[0], r[4]), vzip2q_u8(r[0], r[4]));
+                let (b0, b1) = (vzip1q_u8(r[2], r[6]), vzip2q_u8(r[2], r[6]));
+                let (c0, c1) = (vzip1q_u8(r[1], r[5]), vzip2q_u8(r[1], r[5]));
+                let (d0, d1) = (vzip1q_u8(r[3], r[7]), vzip2q_u8(r[3], r[7]));
+                let (e0, e1) = (vzip1q_u8(a0, b0), vzip2q_u8(a0, b0));
+                let (e2, e3) = (vzip1q_u8(a1, b1), vzip2q_u8(a1, b1));
+                let (f0, f1) = (vzip1q_u8(c0, d0), vzip2q_u8(c0, d0));
+                let (f2, f3) = (vzip1q_u8(c1, d1), vzip2q_u8(c1, d1));
+                [
+                    vzip1q_u8(e0, f0),
+                    vzip2q_u8(e0, f0),
+                    vzip1q_u8(e1, f1),
+                    vzip2q_u8(e1, f1),
+                    vzip1q_u8(e2, f2),
+                    vzip2q_u8(e2, f2),
+                    vzip1q_u8(e3, f3),
+                    vzip2q_u8(e3, f3),
+                ]
+            }};
+        }
+
+        // masks[side][K][lane], side 0=even and side 1=odd. All bytes are
+        // overwritten by the four 16-column chunks before the drain.
+        let mut masks = [[[0u8; 64]; 8]; 2];
+        let sources = [c_block_even.as_ptr(), c_block_odd.as_ptr()];
+        let counts = [n_b_med_even, n_b_med_odd];
+        let m33 = vdupq_n_u8(0x33);
+        let m55 = vdupq_n_u8(0x55);
+        let zero = vdupq_n_u8(0);
+
+        for side in 0..2 {
+            let src = sources[side];
+            let n_b_med = counts[side];
+            for chunk in 0..4 {
+                let col = chunk * 16;
+                let row = |b: usize| -> uint8x16_t {
+                    if b < n_b_med {
+                        vld1q_u8(src.add(b * 64 + col))
+                    } else {
+                        zero
+                    }
+                };
+                let t = transpose8!(
+                    [
+                        row(q),
+                        row(q + 4),
+                        row(q + 8),
+                        row(q + 12),
+                        zero,
+                        zero,
+                        zero,
+                        zero,
+                    ],
+                    m33,
+                    m55
+                );
+                let interleaved = interleave8!(t);
+                let dst = masks[side].as_mut_ptr() as *mut u8;
+                for (i, value) in interleaved.into_iter().enumerate() {
+                    vst1q_u8(dst.add(chunk * 128 + i * 16), value);
+                }
+            }
+        }
+
+        let table = pair_mask_table.as_ptr() as *const u8;
+        for k in 0..8 {
+            let bank = partial_c[k].as_mut_ptr() as *mut u8;
+            for lane in (0..64).step_by(8) {
+                let even = (masks[0][k].as_ptr().add(lane) as *const u64).read_unaligned();
+                let odd = (masks[1][k].as_ptr().add(lane) as *const u64).read_unaligned();
+                // Both operands contain only low nibbles in every byte, so a
+                // whole-word shift cannot carry across byte boundaries.
+                let indices = even | (odd << 4);
+                let i0 = usize::from((indices & 0xff) as u8);
+                let i1 = usize::from(((indices >> 8) & 0xff) as u8);
+                let i2 = usize::from(((indices >> 16) & 0xff) as u8);
+                let i3 = usize::from(((indices >> 24) & 0xff) as u8);
+                let i4 = usize::from(((indices >> 32) & 0xff) as u8);
+                let i5 = usize::from(((indices >> 40) & 0xff) as u8);
+                let i6 = usize::from(((indices >> 48) & 0xff) as u8);
+                let i7 = usize::from((indices >> 56) as u8);
+
+                // Pipeline the independent pair-table loads ahead of the
+                // accumulator dependency chain.
+                let t0 = vld1q_u8(table.add(i0 * 16));
+                let t1 = vld1q_u8(table.add(i1 * 16));
+                let t2 = vld1q_u8(table.add(i2 * 16));
+                let t3 = vld1q_u8(table.add(i3 * 16));
+                let t4 = vld1q_u8(table.add(i4 * 16));
+                let t5 = vld1q_u8(table.add(i5 * 16));
+                let t6 = vld1q_u8(table.add(i6 * 16));
+                let t7 = vld1q_u8(table.add(i7 * 16));
+
+                let p0 = bank.add(lane * 16);
+                let p1 = p0.add(16);
+                let p2 = p1.add(16);
+                let p3 = p2.add(16);
+                let p4 = p3.add(16);
+                let p5 = p4.add(16);
+                let p6 = p5.add(16);
+                let p7 = p6.add(16);
+                vst1q_u8(p0, veorq_u8(vld1q_u8(p0), t0));
+                vst1q_u8(p1, veorq_u8(vld1q_u8(p1), t1));
+                vst1q_u8(p2, veorq_u8(vld1q_u8(p2), t2));
+                vst1q_u8(p3, veorq_u8(vld1q_u8(p3), t3));
+                vst1q_u8(p4, veorq_u8(vld1q_u8(p4), t4));
+                vst1q_u8(p5, veorq_u8(vld1q_u8(p5), t5));
+                vst1q_u8(p6, veorq_u8(vld1q_u8(p6), t6));
+                vst1q_u8(p7, veorq_u8(vld1q_u8(p7), t7));
+            }
+        }
+    }
+}
+
+/// Four-block direct-fold4 drain. For each q/K/lane, blocks 0-1 form one
+/// pair-table index and blocks 2-3 form another. Their two field values are
+/// XORed before the sole accumulator load/store, reducing logical drain
+/// traffic from 24 GiB for pair fusion to 16 GiB at the ranked shape.
+#[inline]
+#[allow(clippy::too_many_arguments)]
+pub(crate) unsafe fn accumulate_c_fold4_four_banks(
+    c_blocks: [&[u8; 16 * 64]; 4],
+    n_b_med: [usize; 4],
+    pair_mask_tables: [&[F128; 256]; 2],
+    partial_c: &mut [[F128; 64]; 32],
+) {
+    use core::arch::aarch64::*;
+
+    debug_assert!(n_b_med.into_iter().all(|count| count <= 16));
+
+    // SAFETY: safe wrapper validates every row count. Each transpose has four
+    // live rows and four zero rows, so masks remain nibbles; concatenating two
+    // masks therefore indexes exactly one of 256 fixed table entries.
+    unsafe {
+        macro_rules! transpose8 {
+            ($x:expr, $m33:expr, $m55:expr) => {{
+                let x: [uint8x16_t; 8] = $x;
+                let mut a = [vdupq_n_u8(0); 8];
+                for b in 0..4 {
+                    a[b] = vsliq_n_u8::<4>(x[b], x[b + 4]);
+                    a[b + 4] = vsriq_n_u8::<4>(x[b + 4], x[b]);
+                }
+                let mut c = [vdupq_n_u8(0); 8];
+                for block in 0..2 {
+                    for b in 0..2 {
+                        let (i, j) = (4 * block + b, 4 * block + b + 2);
+                        c[i] = vbslq_u8($m33, a[i], vshlq_n_u8::<2>(a[j]));
+                        c[j] = vbslq_u8($m33, vshrq_n_u8::<2>(a[i]), a[j]);
+                    }
+                }
+                let mut out = [vdupq_n_u8(0); 8];
+                for pair in 0..4 {
+                    let (i, j) = (2 * pair, 2 * pair + 1);
+                    out[i] = vbslq_u8($m55, c[i], vshlq_n_u8::<1>(c[j]));
+                    out[j] = vbslq_u8($m55, vshrq_n_u8::<1>(c[i]), c[j]);
+                }
+                out
+            }};
+        }
+
+        macro_rules! interleave8 {
+            ($r:expr) => {{
+                let r: [uint8x16_t; 8] = $r;
+                let (a0, a1) = (vzip1q_u8(r[0], r[4]), vzip2q_u8(r[0], r[4]));
+                let (b0, b1) = (vzip1q_u8(r[2], r[6]), vzip2q_u8(r[2], r[6]));
+                let (c0, c1) = (vzip1q_u8(r[1], r[5]), vzip2q_u8(r[1], r[5]));
+                let (d0, d1) = (vzip1q_u8(r[3], r[7]), vzip2q_u8(r[3], r[7]));
+                let (e0, e1) = (vzip1q_u8(a0, b0), vzip2q_u8(a0, b0));
+                let (e2, e3) = (vzip1q_u8(a1, b1), vzip2q_u8(a1, b1));
+                let (f0, f1) = (vzip1q_u8(c0, d0), vzip2q_u8(c0, d0));
+                let (f2, f3) = (vzip1q_u8(c1, d1), vzip2q_u8(c1, d1));
+                [
+                    vzip1q_u8(e0, f0),
+                    vzip2q_u8(e0, f0),
+                    vzip1q_u8(e1, f1),
+                    vzip2q_u8(e1, f1),
+                    vzip1q_u8(e2, f2),
+                    vzip2q_u8(e2, f2),
+                    vzip1q_u8(e3, f3),
+                    vzip2q_u8(e3, f3),
+                ]
+            }};
+        }
+
+        // Build and consume one q at a time. This keeps mask scratch at 2 KiB
+        // instead of retaining all four q groups for all four witness blocks.
+        let mut masks = [[[0u8; 64]; 8]; 4];
+        let sources = c_blocks.map(|block| block.as_ptr());
+        let m33 = vdupq_n_u8(0x33);
+        let m55 = vdupq_n_u8(0x55);
+        let zero = vdupq_n_u8(0);
+        let table01 = pair_mask_tables[0].as_ptr() as *const u8;
+        let table23 = pair_mask_tables[1].as_ptr() as *const u8;
+
+        for q in 0..4 {
+            for side in 0..4 {
+                let src = sources[side];
+                let count = n_b_med[side];
+                for chunk in 0..4 {
+                    let col = chunk * 16;
+                    let row = |b: usize| -> uint8x16_t {
+                        if b < count {
+                            vld1q_u8(src.add(b * 64 + col))
+                        } else {
+                            zero
+                        }
+                    };
+                    let t = transpose8!(
+                        [
+                            row(q),
+                            row(q + 4),
+                            row(q + 8),
+                            row(q + 12),
+                            zero,
+                            zero,
+                            zero,
+                            zero,
+                        ],
+                        m33,
+                        m55
+                    );
+                    let interleaved = interleave8!(t);
+                    let dst = masks[side].as_mut_ptr() as *mut u8;
+                    for (i, value) in interleaved.into_iter().enumerate() {
+                        vst1q_u8(dst.add(chunk * 128 + i * 16), value);
+                    }
+                }
+            }
+
+            for k in 0..8 {
+                let bank = partial_c[q * 8 + k].as_mut_ptr() as *mut u8;
+                for lane in (0..64).step_by(8) {
+                    let m0 = (masks[0][k].as_ptr().add(lane) as *const u64).read_unaligned();
+                    let m1 = (masks[1][k].as_ptr().add(lane) as *const u64).read_unaligned();
+                    let m2 = (masks[2][k].as_ptr().add(lane) as *const u64).read_unaligned();
+                    let m3 = (masks[3][k].as_ptr().add(lane) as *const u64).read_unaligned();
+                    let indices01 = m0 | (m1 << 4);
+                    let indices23 = m2 | (m3 << 4);
+
+                    let i010 = usize::from((indices01 & 0xff) as u8);
+                    let i011 = usize::from(((indices01 >> 8) & 0xff) as u8);
+                    let i012 = usize::from(((indices01 >> 16) & 0xff) as u8);
+                    let i013 = usize::from(((indices01 >> 24) & 0xff) as u8);
+                    let i014 = usize::from(((indices01 >> 32) & 0xff) as u8);
+                    let i015 = usize::from(((indices01 >> 40) & 0xff) as u8);
+                    let i016 = usize::from(((indices01 >> 48) & 0xff) as u8);
+                    let i017 = usize::from((indices01 >> 56) as u8);
+                    let i230 = usize::from((indices23 & 0xff) as u8);
+                    let i231 = usize::from(((indices23 >> 8) & 0xff) as u8);
+                    let i232 = usize::from(((indices23 >> 16) & 0xff) as u8);
+                    let i233 = usize::from(((indices23 >> 24) & 0xff) as u8);
+                    let i234 = usize::from(((indices23 >> 32) & 0xff) as u8);
+                    let i235 = usize::from(((indices23 >> 40) & 0xff) as u8);
+                    let i236 = usize::from(((indices23 >> 48) & 0xff) as u8);
+                    let i237 = usize::from((indices23 >> 56) as u8);
+
+                    // Combine the two independent pair-table loads first, so
+                    // only eight values remain live across accumulator loads.
+                    let t0 = veorq_u8(
+                        vld1q_u8(table01.add(i010 * 16)),
+                        vld1q_u8(table23.add(i230 * 16)),
+                    );
+                    let t1 = veorq_u8(
+                        vld1q_u8(table01.add(i011 * 16)),
+                        vld1q_u8(table23.add(i231 * 16)),
+                    );
+                    let t2 = veorq_u8(
+                        vld1q_u8(table01.add(i012 * 16)),
+                        vld1q_u8(table23.add(i232 * 16)),
+                    );
+                    let t3 = veorq_u8(
+                        vld1q_u8(table01.add(i013 * 16)),
+                        vld1q_u8(table23.add(i233 * 16)),
+                    );
+                    let t4 = veorq_u8(
+                        vld1q_u8(table01.add(i014 * 16)),
+                        vld1q_u8(table23.add(i234 * 16)),
+                    );
+                    let t5 = veorq_u8(
+                        vld1q_u8(table01.add(i015 * 16)),
+                        vld1q_u8(table23.add(i235 * 16)),
+                    );
+                    let t6 = veorq_u8(
+                        vld1q_u8(table01.add(i016 * 16)),
+                        vld1q_u8(table23.add(i236 * 16)),
+                    );
+                    let t7 = veorq_u8(
+                        vld1q_u8(table01.add(i017 * 16)),
+                        vld1q_u8(table23.add(i237 * 16)),
+                    );
+
+                    let p0 = bank.add(lane * 16);
+                    let p1 = p0.add(16);
+                    let p2 = p1.add(16);
+                    let p3 = p2.add(16);
+                    let p4 = p3.add(16);
+                    let p5 = p4.add(16);
+                    let p6 = p5.add(16);
+                    let p7 = p6.add(16);
+                    vst1q_u8(p0, veorq_u8(vld1q_u8(p0), t0));
+                    vst1q_u8(p1, veorq_u8(vld1q_u8(p1), t1));
+                    vst1q_u8(p2, veorq_u8(vld1q_u8(p2), t2));
+                    vst1q_u8(p3, veorq_u8(vld1q_u8(p3), t3));
+                    vst1q_u8(p4, veorq_u8(vld1q_u8(p4), t4));
+                    vst1q_u8(p5, veorq_u8(vld1q_u8(p5), t5));
+                    vst1q_u8(p6, veorq_u8(vld1q_u8(p6), t6));
+                    vst1q_u8(p7, veorq_u8(vld1q_u8(p7), t7));
                 }
             }
         }
@@ -1448,11 +1924,7 @@ unsafe fn xor_vary_pair<const J0: u32, const J1: u32>(
         };
         let r0 = t0.add(byte_from_word::<J0>(b_word) * 64);
         let r1 = t1.add(byte_from_word::<J1>(b_word) * 64);
-        *db0 = xor3_u8(
-            *db0,
-            vld1q_u8(r0.add(bh0 * 16)),
-            vld1q_u8(r1.add(bh1 * 16)),
-        );
+        *db0 = xor3_u8(*db0, vld1q_u8(r0.add(bh0 * 16)), vld1q_u8(r1.add(bh1 * 16)));
         *db1 = xor3_u8(
             *db1,
             vld1q_u8(r0.add((1 ^ bh0) * 16)),

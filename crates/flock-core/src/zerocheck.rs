@@ -220,14 +220,18 @@ pub fn prove_packed_padded_capture_s_hat_v_c<C: Challenger>(
 
 /// The c-claim opening statistics round 1 captures for free.
 ///
-/// Both come out of the same eight α-free banks: `s_hat_v_c` is the canonical
+/// The incumbent pair comes out of the same eight α-free banks: `s_hat_v_c` is the canonical
 /// length-128 vector `fold_1b_rows` would produce, `quad` the length-512
 /// four-bank form that lets the PCS open take C's `products` directly instead
 /// of sweeping the combined basis. `collapse_s_hat_v_quad(quad, suffix[..2])`
 /// reproduces `s_hat_v_c` exactly, so shipping either keeps the transcript.
+/// The experimental `fold4` tensor has sixteen 128-element banks and likewise
+/// collapses under `suffix[..4]`; it is present only behind the shared strict
+/// DirectFold4 opt-in.
 pub struct CapturedSHatVC {
     pub s_hat_v_c: Vec<F128>,
     pub quad: Vec<F128>,
+    pub fold4: Option<Vec<F128>>,
 }
 
 /// Capture-`s_hat_v_c` prover that consumes a challenge-independent AB inner
@@ -324,17 +328,47 @@ fn prove_packed_padded_inner<C: Challenger>(
             capture_s_hat_v_c,
             "precomputed AB path currently requires s_hat_v capture"
         );
-        let (ab, c, s_hat_v_c, quad) =
-            crate::zerocheck::univariate_skip_optimized::round1_shift_reduce_extract_c_packed_padded_with_precomputed_ab(
-                ab_inner,
-                c_packed,
-                m,
-                k_skip,
-                &r,
-                inv_table,
-                padding,
-            );
-        (ab, c, Some(CapturedSHatVC { s_hat_v_c, quad }))
+        if m == 32 && crate::pcs::ranked_direct_fold4_enabled() {
+            let (ab, c, s_hat_v_c, quad, fold4) =
+                crate::zerocheck::univariate_skip_optimized::round1_shift_reduce_extract_c_packed_padded_with_precomputed_ab_fold4(
+                    ab_inner,
+                    c_packed,
+                    m,
+                    k_skip,
+                    &r,
+                    inv_table,
+                    padding,
+                );
+            (
+                ab,
+                c,
+                Some(CapturedSHatVC {
+                    s_hat_v_c,
+                    quad,
+                    fold4: Some(fold4),
+                }),
+            )
+        } else {
+            let (ab, c, s_hat_v_c, quad) =
+                crate::zerocheck::univariate_skip_optimized::round1_shift_reduce_extract_c_packed_padded_with_precomputed_ab(
+                    ab_inner,
+                    c_packed,
+                    m,
+                    k_skip,
+                    &r,
+                    inv_table,
+                    padding,
+                );
+            (
+                ab,
+                c,
+                Some(CapturedSHatVC {
+                    s_hat_v_c,
+                    quad,
+                    fold4: None,
+                }),
+            )
+        }
     } else if capture_s_hat_v_c {
         let (ab, c, s_hat_v_c, quad) =
             crate::zerocheck::univariate_skip_optimized::round1_shift_reduce_extract_c_packed_padded_with_s_hat_v_quad(
@@ -347,7 +381,15 @@ fn prove_packed_padded_inner<C: Challenger>(
                 inv_table,
                 padding,
             );
-        (ab, c, Some(CapturedSHatVC { s_hat_v_c, quad }))
+        (
+            ab,
+            c,
+            Some(CapturedSHatVC {
+                s_hat_v_c,
+                quad,
+                fold4: None,
+            }),
+        )
     } else {
         let (ab, c) = round1_shift_reduce_extract_c_packed_padded(
             a_packed, b_packed, c_packed, m, k_skip, &r, inv_table, padding,

@@ -51,16 +51,51 @@ fn ranked_direct_c_precompute_enabled(r1cs: &BlockR1cs) -> bool {
     ranked_direct_ab_precompute_enabled(r1cs) && pcs::ranked_direct_c_enabled()
 }
 
-/// Pick the c-claim's precomputed slot: the 512-long quad on the ranked
-/// direct-C shape, otherwise the canonical 128-long `s_hat_v_c`. Both describe
-/// the same claim — `collapse_s_hat_v_quad` maps one to the other — so the
-/// transcript is identical either way.
+#[inline]
+fn ranked_direct_fold4_precompute_enabled(r1cs: &BlockR1cs) -> bool {
+    ranked_direct_ab_precompute_enabled(r1cs)
+        && pcs::ranked_direct_fold4_enabled()
+}
+
+fn precompute_ab_s_hat_v(
+    r1cs: &BlockR1cs,
+    z_vec: &[F128],
+    inner_rest_tail: &[F128],
+) -> Option<Vec<F128>> {
+    if ranked_direct_fold4_precompute_enabled(r1cs) {
+        Some(pcs::ring_switch::s_hat_v_fold4_from_z_vec(
+            z_vec,
+            inner_rest_tail,
+        ))
+    } else if ranked_direct_ab_precompute_enabled(r1cs) {
+        Some(pcs::ring_switch::s_hat_v_quad_from_z_vec(
+            z_vec,
+            inner_rest_tail,
+        ))
+    } else if r1cs.k_log >= pcs::LOG_PACKING {
+        Some(pcs::ring_switch::s_hat_v_from_z_vec(
+            z_vec,
+            inner_rest_tail,
+        ))
+    } else {
+        None
+    }
+}
+
+/// Pick C's precomputed slot. The strict DirectFold4 experiment takes the
+/// sixteen-bank tensor; the incumbent ranked path takes the four-bank tensor;
+/// every other shape takes the canonical transcript-visible statistic.
 #[inline]
 fn pre_c_slot<'a>(
     r1cs: &BlockR1cs,
     captured: &'a zerocheck::CapturedSHatVC,
 ) -> Option<&'a [F128]> {
-    Some(if ranked_direct_c_precompute_enabled(r1cs) {
+    Some(if ranked_direct_fold4_precompute_enabled(r1cs) {
+        captured
+            .fold4
+            .as_deref()
+            .expect("DirectFold4 capture and consumer gates must agree")
+    } else if ranked_direct_c_precompute_enabled(r1cs) {
         captured.quad.as_slice()
     } else {
         captured.s_hat_v_c.as_slice()
@@ -198,19 +233,8 @@ pub fn prove_ligerito<Ch: Challenger>(
         value: zc_claim.c_eval,
     };
 
-    let s_hat_v_ab = if ranked_direct_ab_precompute_enabled(r1cs) {
-        Some(pcs::ring_switch::s_hat_v_quad_from_z_vec(
-            &z_vec_pre,
-            &lc_claim.r_inner_rest[1..],
-        ))
-    } else if r1cs.k_log >= pcs::LOG_PACKING {
-        Some(pcs::ring_switch::s_hat_v_from_z_vec(
-            &z_vec_pre,
-            &lc_claim.r_inner_rest[1..],
-        ))
-    } else {
-        None
-    };
+    let s_hat_v_ab =
+        precompute_ab_s_hat_v(r1cs, &z_vec_pre, &lc_claim.r_inner_rest[1..]);
     let pre_ab: Option<&[F128]> = s_hat_v_ab.as_deref();
     let pre_c: Option<&[F128]> = pre_c_slot(r1cs, &s_hat_v_c);
     let pcs_open = open_claims_with_precomputed_ligerito(
@@ -662,19 +686,8 @@ fn prove_fast_core_with_commit_codeword<Ch: Challenger>(
     // (everything past prefix0). Byte-identical to `fold_1b_rows` on the AB
     // suffix tensor — see `s_hat_v_from_z_vec`. Skip when k_log < LOG_PACKING
     // (only test setups; real R1CS has k_log >= 16).
-    let s_hat_v_ab = if ranked_direct_ab_precompute_enabled(r1cs) {
-        Some(pcs::ring_switch::s_hat_v_quad_from_z_vec(
-            &z_vec_pre,
-            &lc_claim.r_inner_rest[1..],
-        ))
-    } else if r1cs.k_log >= pcs::LOG_PACKING {
-        Some(pcs::ring_switch::s_hat_v_from_z_vec(
-            &z_vec_pre,
-            &lc_claim.r_inner_rest[1..],
-        ))
-    } else {
-        None
-    };
+    let s_hat_v_ab =
+        precompute_ab_s_hat_v(r1cs, &z_vec_pre, &lc_claim.r_inner_rest[1..]);
     if phase_timing {
         let wall = t_lc.elapsed().as_secs_f64() * 1e3;
         let cpu = process_cpu_ms() - cpu_lc0.unwrap_or(0.0);
@@ -890,19 +903,8 @@ fn prove_fast_ligerito_timed_with_commit_codeword<Ch: Challenger>(
         point: r1cs.c_claim_point(zc_claim.z, &zc_claim.r_rest),
         value: zc_claim.c_eval,
     };
-    let s_hat_v_ab = if ranked_direct_ab_precompute_enabled(r1cs) {
-        Some(pcs::ring_switch::s_hat_v_quad_from_z_vec(
-            &z_vec_pre,
-            &lc_claim.r_inner_rest[1..],
-        ))
-    } else if r1cs.k_log >= pcs::LOG_PACKING {
-        Some(pcs::ring_switch::s_hat_v_from_z_vec(
-            &z_vec_pre,
-            &lc_claim.r_inner_rest[1..],
-        ))
-    } else {
-        None
-    };
+    let s_hat_v_ab =
+        precompute_ab_s_hat_v(r1cs, &z_vec_pre, &lc_claim.r_inner_rest[1..]);
     t.lincheck_s = t0.elapsed().as_secs_f64();
 
     // --- Ligerito recursive PCS open ---
