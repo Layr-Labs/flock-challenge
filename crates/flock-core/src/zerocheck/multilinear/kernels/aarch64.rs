@@ -185,31 +185,6 @@ unsafe fn fold_row_q(
     }
 }
 
-/// Load one byte-indexed row from a fold table while keeping byte extraction
-/// in a single instruction. LLVM otherwise hoists `lsr` values and then masks
-/// each one before the load; on Apple M3, `ubfx` plus a scaled register offset
-/// saves one integer instruction for every lookup after byte zero.
-#[cfg(target_arch = "aarch64")]
-#[inline(always)]
-unsafe fn load_table_byte_q<const BYTE: u32>(
-    table_bank: *const u8,
-    row: u64,
-) -> core::arch::aarch64::uint64x2_t {
-    use core::arch::aarch64::*;
-    debug_assert!(BYTE < 8);
-    let index: u64;
-    unsafe {
-        core::arch::asm!(
-            "ubfx {index}, {row}, #{lsb}, #8",
-            index = out(reg) index,
-            row = in(reg) row,
-            lsb = const BYTE * 8,
-            options(pure, nomem, nostack, preserves_flags),
-        );
-        vld1q_u64(table_bank.add(index as usize * 16).cast::<u64>())
-    }
-}
-
 /// Fold four already-loaded packed rows together. Grouping the independent
 /// lookup chains by byte bank exposes four L1 loads at a time, and loading each
 /// row as one `u64` lets the compact round-two path reuse it for its raw delta.
@@ -230,53 +205,33 @@ unsafe fn fold_four_row_codes_q(
     use core::arch::aarch64::*;
     unsafe {
         const STRIDE: usize = 256 * 16;
-        let banks = [
-            table_data,
-            table_data.add(STRIDE),
-            table_data.add(2 * STRIDE),
-            table_data.add(3 * STRIDE),
-            table_data.add(4 * STRIDE),
-            table_data.add(5 * STRIDE),
-            table_data.add(6 * STRIDE),
-            table_data.add(7 * STRIDE),
-        ];
+        let load = |row: u64, chunk: usize| {
+            let shift = 8 * chunk;
+            let offset = chunk * STRIDE;
+            let index = ((row >> shift) & 0xff) as usize;
+            vld1q_u64(
+                table_data
+                    .add(offset + index * core::mem::size_of::<F128>())
+                    .cast::<u64>(),
+            )
+        };
+
         // Retain the four independent row streams while consuming two new
         // table rows per dependent accumulator update.
-        let mut acc0 = load_table_byte_q::<0>(banks[0], row0);
-        let mut acc1 = load_table_byte_q::<0>(banks[0], row1);
-        let mut acc2 = load_table_byte_q::<0>(banks[0], row2);
-        let mut acc3 = load_table_byte_q::<0>(banks[0], row3);
-        macro_rules! fold_byte_pair {
-            ($first:literal, $second:literal) => {
-                acc0 = xor3_u64(
-                    acc0,
-                    load_table_byte_q::<$first>(banks[$first as usize], row0),
-                    load_table_byte_q::<$second>(banks[$second as usize], row0),
-                );
-                acc1 = xor3_u64(
-                    acc1,
-                    load_table_byte_q::<$first>(banks[$first as usize], row1),
-                    load_table_byte_q::<$second>(banks[$second as usize], row1),
-                );
-                acc2 = xor3_u64(
-                    acc2,
-                    load_table_byte_q::<$first>(banks[$first as usize], row2),
-                    load_table_byte_q::<$second>(banks[$second as usize], row2),
-                );
-                acc3 = xor3_u64(
-                    acc3,
-                    load_table_byte_q::<$first>(banks[$first as usize], row3),
-                    load_table_byte_q::<$second>(banks[$second as usize], row3),
-                );
-            };
+        let mut acc0 = load(row0, 0);
+        let mut acc1 = load(row1, 0);
+        let mut acc2 = load(row2, 0);
+        let mut acc3 = load(row3, 0);
+        for chunk in (1..7).step_by(2) {
+            acc0 = xor3_u64(acc0, load(row0, chunk), load(row0, chunk + 1));
+            acc1 = xor3_u64(acc1, load(row1, chunk), load(row1, chunk + 1));
+            acc2 = xor3_u64(acc2, load(row2, chunk), load(row2, chunk + 1));
+            acc3 = xor3_u64(acc3, load(row3, chunk), load(row3, chunk + 1));
         }
-        fold_byte_pair!(1, 2);
-        fold_byte_pair!(3, 4);
-        fold_byte_pair!(5, 6);
-        acc0 = veorq_u64(acc0, load_table_byte_q::<7>(banks[7], row0));
-        acc1 = veorq_u64(acc1, load_table_byte_q::<7>(banks[7], row1));
-        acc2 = veorq_u64(acc2, load_table_byte_q::<7>(banks[7], row2));
-        acc3 = veorq_u64(acc3, load_table_byte_q::<7>(banks[7], row3));
+        acc0 = veorq_u64(acc0, load(row0, 7));
+        acc1 = veorq_u64(acc1, load(row1, 7));
+        acc2 = veorq_u64(acc2, load(row2, 7));
+        acc3 = veorq_u64(acc3, load(row3, 7));
         (acc0, acc1, acc2, acc3)
     }
 }
@@ -296,37 +251,24 @@ unsafe fn fold_two_row_codes_q(
     use core::arch::aarch64::*;
     unsafe {
         const STRIDE: usize = 256 * 16;
-        let banks = [
-            table_data,
-            table_data.add(STRIDE),
-            table_data.add(2 * STRIDE),
-            table_data.add(3 * STRIDE),
-            table_data.add(4 * STRIDE),
-            table_data.add(5 * STRIDE),
-            table_data.add(6 * STRIDE),
-            table_data.add(7 * STRIDE),
-        ];
-        let mut acc0 = load_table_byte_q::<0>(banks[0], row0);
-        let mut acc1 = load_table_byte_q::<0>(banks[0], row1);
-        macro_rules! fold_byte_pair {
-            ($first:literal, $second:literal) => {
-                acc0 = xor3_u64(
-                    acc0,
-                    load_table_byte_q::<$first>(banks[$first as usize], row0),
-                    load_table_byte_q::<$second>(banks[$second as usize], row0),
-                );
-                acc1 = xor3_u64(
-                    acc1,
-                    load_table_byte_q::<$first>(banks[$first as usize], row1),
-                    load_table_byte_q::<$second>(banks[$second as usize], row1),
-                );
-            };
+        let load = |row: u64, chunk: usize| {
+            let shift = 8 * chunk;
+            let offset = chunk * STRIDE;
+            let index = ((row >> shift) & 0xff) as usize;
+            vld1q_u64(
+                table_data
+                    .add(offset + index * core::mem::size_of::<F128>())
+                    .cast::<u64>(),
+            )
+        };
+        let mut acc0 = load(row0, 0);
+        let mut acc1 = load(row1, 0);
+        for chunk in (1..7).step_by(2) {
+            acc0 = xor3_u64(acc0, load(row0, chunk), load(row0, chunk + 1));
+            acc1 = xor3_u64(acc1, load(row1, chunk), load(row1, chunk + 1));
         }
-        fold_byte_pair!(1, 2);
-        fold_byte_pair!(3, 4);
-        fold_byte_pair!(5, 6);
-        acc0 = veorq_u64(acc0, load_table_byte_q::<7>(banks[7], row0));
-        acc1 = veorq_u64(acc1, load_table_byte_q::<7>(banks[7], row1));
+        acc0 = veorq_u64(acc0, load(row0, 7));
+        acc1 = veorq_u64(acc1, load(row1, 7));
         (acc0, acc1)
     }
 }
