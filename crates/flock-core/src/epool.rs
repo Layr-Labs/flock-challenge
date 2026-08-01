@@ -295,6 +295,21 @@ pub(crate) fn run_chunks_with_helper_stateful<S, I, F>(
     I: Fn() -> S + Sync,
     F: Fn(&mut S, usize) + Sync,
 {
+    run_chunks_with_helper_stateful_capped(n_chunks, init, f, helper, usize::MAX);
+}
+
+/// Stateful two-pool queue with an explicit upper bound on participating
+/// helper workers. Main-pool width and queue ownership are unchanged.
+pub(crate) fn run_chunks_with_helper_stateful_capped<S, I, F>(
+    n_chunks: usize,
+    init: &I,
+    f: &F,
+    helper: Option<&rayon::ThreadPool>,
+    max_helper_workers: usize,
+) where
+    I: Fn() -> S + Sync,
+    F: Fn(&mut S, usize) + Sync,
+{
     if n_chunks == 0 {
         return;
     }
@@ -326,11 +341,90 @@ pub(crate) fn run_chunks_with_helper_stateful<S, I, F>(
     match helper.filter(|_| n_chunks >= EPOOL_MIN_CHUNKS) {
         Some(ep) => std::thread::scope(|s| {
             s.spawn(|| {
-                ep.broadcast(|_| {
+                ep.broadcast(|context| {
+                    if context.index() >= max_helper_workers {
+                        return;
+                    }
                     let mut state = init();
                     loop {
                         let i = next.fetch_add(1, Ordering::Relaxed);
                         if i >= n_chunks {
+                            break;
+                        }
+                        EPOOL_HELPER_CHUNKS.fetch_add(1, Ordering::Relaxed);
+                        f(&mut state, i);
+                    }
+                })
+            });
+            drain_main();
+        }),
+        None => drain_main(),
+    }
+}
+
+/// Capped stateful scheduling with a fixed prefix owned only by helper workers.
+///
+/// The bounded helper work finishes before the main-pool tail while preserving
+/// exact, disjoint ownership of every chunk.
+pub(crate) fn run_chunks_with_helper_stateful_capped_prefix<S, I, F>(
+    n_chunks: usize,
+    helper_chunks: usize,
+    init: &I,
+    f: &F,
+    helper: Option<&rayon::ThreadPool>,
+    max_helper_workers: usize,
+) where
+    I: Fn() -> S + Sync,
+    F: Fn(&mut S, usize) + Sync,
+{
+    if n_chunks == 0 {
+        return;
+    }
+    let main_threads = rayon::current_num_threads();
+    if main_threads <= 1 {
+        let mut state = init();
+        for i in 0..n_chunks {
+            f(&mut state, i);
+        }
+        return;
+    }
+
+    let helper = helper.filter(|_| {
+        n_chunks >= EPOOL_MIN_CHUNKS && helper_chunks != 0 && max_helper_workers != 0
+    });
+    let reserved = helper
+        .map(|_| helper_chunks.min(n_chunks))
+        .unwrap_or_default();
+    let next_main = AtomicUsize::new(reserved);
+    let next_helper = AtomicUsize::new(0);
+    let main_worker = || {
+        let mut state = init();
+        loop {
+            let i = next_main.fetch_add(1, Ordering::Relaxed);
+            if i >= n_chunks {
+                break;
+            }
+            f(&mut state, i);
+        }
+    };
+    let drain_main = || {
+        (0..main_threads)
+            .into_par_iter()
+            .with_max_len(1)
+            .for_each(|_| main_worker());
+    };
+
+    match helper {
+        Some(ep) => std::thread::scope(|scope| {
+            scope.spawn(|| {
+                ep.broadcast(|context| {
+                    if context.index() >= max_helper_workers {
+                        return;
+                    }
+                    let mut state = init();
+                    loop {
+                        let i = next_helper.fetch_add(1, Ordering::Relaxed);
+                        if i >= reserved {
                             break;
                         }
                         EPOOL_HELPER_CHUNKS.fetch_add(1, Ordering::Relaxed);
@@ -510,6 +604,83 @@ mod tests {
             uses[state.load(Ordering::Relaxed)] += 1;
         }
         assert!(uses.into_iter().any(|n_uses| n_uses > 1));
+    }
+
+    #[test]
+    fn stateful_helper_worker_cap_is_exact() {
+        let helper = rayon::ThreadPoolBuilder::new()
+            .num_threads(4)
+            .thread_name(|i| format!("cap-helper-{i}"))
+            .build()
+            .unwrap();
+        let helper_mask = AtomicUsize::new(0);
+        run_chunks_with_helper_stateful_capped(
+            1_000,
+            &|| (),
+            &|_, _| {
+                if let Some(name) = std::thread::current().name()
+                    && let Some(index) = name.strip_prefix("cap-helper-")
+                {
+                    helper_mask.fetch_or(
+                        1usize << index.parse::<usize>().unwrap(),
+                        Ordering::Relaxed,
+                    );
+                }
+                std::thread::sleep(std::time::Duration::from_micros(10));
+            },
+            Some(&helper),
+            1,
+        );
+        let mask = helper_mask.load(Ordering::Relaxed);
+        assert_ne!(mask, 0, "the permitted helper must claim work");
+        assert_eq!(mask & !1, 0, "only helper worker zero may claim work");
+    }
+
+    #[test]
+    fn capped_helper_prefix_has_exact_owners() {
+        let main = rayon::ThreadPoolBuilder::new()
+            .num_threads(4)
+            .thread_name(|i| format!("prefix-main-{i}"))
+            .build()
+            .unwrap();
+        let helper = rayon::ThreadPoolBuilder::new()
+            .num_threads(4)
+            .thread_name(|i| format!("prefix-helper-{i}"))
+            .build()
+            .unwrap();
+        let n = 128;
+        let reserved = 4;
+        let counts: Vec<AtomicUsize> = (0..n).map(|_| AtomicUsize::new(0)).collect();
+        let helper_mask: Vec<AtomicUsize> = (0..n).map(|_| AtomicUsize::new(0)).collect();
+
+        main.install(|| {
+            run_chunks_with_helper_stateful_capped_prefix(
+                n,
+                reserved,
+                &|| (),
+                &|_, i| {
+                    counts[i].fetch_add(1, Ordering::Relaxed);
+                    if let Some(name) = std::thread::current().name()
+                        && let Some(index) = name.strip_prefix("prefix-helper-")
+                    {
+                        helper_mask[i].fetch_or(
+                            1usize << index.parse::<usize>().unwrap(),
+                            Ordering::Relaxed,
+                        );
+                    }
+                },
+                Some(&helper),
+                1,
+            );
+        });
+
+        assert!(counts.iter().all(|count| count.load(Ordering::Relaxed) == 1));
+        assert!(helper_mask[..reserved]
+            .iter()
+            .all(|mask| mask.load(Ordering::Relaxed) == 1));
+        assert!(helper_mask[reserved..]
+            .iter()
+            .all(|mask| mask.load(Ordering::Relaxed) == 0));
     }
 
     /// The stateful single-thread path preserves strict chunk order and owns
