@@ -3689,6 +3689,42 @@ fn materialize_direct_fold4(
     )
 }
 
+/// Exact ranked geometry for the Fold8 materialization: both direct claims,
+/// no ordinary basis, and sixteen independent 512 KiB output blocks. This is
+/// deliberately narrower than the algebraic Fold8 route because the helper
+/// queue is a host-scheduling optimization only.
+#[inline]
+fn is_ranked_direct_fold8_materialize_shape(
+    packed_len: usize,
+    block_len: usize,
+    claim_count: usize,
+    has_ordinary: bool,
+) -> bool {
+    packed_len == (1usize << 25)
+        && block_len == (1usize << 15)
+        && claim_count == 2
+        && !has_ordinary
+}
+
+#[inline]
+fn use_ranked_direct_fold8_hetero_materialize(
+    packed_len: usize,
+    block_len: usize,
+    claim_count: usize,
+    has_ordinary: bool,
+) -> bool {
+    cfg!(all(target_os = "macos", target_arch = "aarch64"))
+        && matches!(rayon::current_num_threads(), 2..=16)
+        && is_ranked_direct_fold8_materialize_shape(
+            packed_len,
+            block_len,
+            claim_count,
+            has_ordinary,
+        )
+        && std::env::var_os("FLOCK_NO_DIRECT_FOLD8_HETERO_MATERIALIZE").is_none()
+        && crate::epool::epool().is_some()
+}
+
 /// Sixty-four-bank materializer. Six challenges are sampled from direct
 /// product statistics before this function binds the witness and combined
 /// basis in one N→N/64 pass. It emits M6 — the round message of the folded
@@ -3738,15 +3774,18 @@ fn materialize_direct_fold8(
         claim.eq_lo.len() == block_len && claim.eq_hi.len() * block_len == out_len
     }));
 
+    let helper = use_ranked_direct_fold8_hetero_materialize(
+        packed_witness.len(),
+        block_len,
+        claims.len(),
+        has_ordinary,
+    )
+    .then(crate::epool::epool)
+    .flatten();
+
     let mut folded_f = crate::scratch::take_f128(out_len);
     let mut folded_b = crate::scratch::take_f128(out_len);
-    let stats = folded_b
-        .par_chunks_mut(block_len)
-        .zip(folded_f.par_chunks_mut(block_len))
-        .enumerate()
-        .map_init(
-            || vec![F128::ZERO; super::ring_switch::FOLD_TABLE_LEN],
-            |scratch, (block, (b_out, f_out))| {
+    let fold_block = |scratch: &mut Vec<F128>, block: usize, b_out: &mut [F128], f_out: &mut [F128]| {
                 let start = 64 * block * block_len;
                 let f_in = &packed_witness[start..start + 64 * block_len];
                 let b_in: &[F128] = if has_ordinary {
@@ -3791,12 +3830,50 @@ fn materialize_direct_fold8(
                     }
                 }
                 super::round0_scalar(f_out, b_out)
+            };
+    let stats = if let Some(helper) = helper {
+        let n_blocks = out_len / block_len;
+        let mut partials = vec![(F128::ZERO, F128::ZERO); n_blocks];
+        let b_base = crate::epool::SyncPtr(folded_b.as_mut_ptr());
+        let f_base = crate::epool::SyncPtr(folded_f.as_mut_ptr());
+        let partials_base = crate::epool::SyncPtr(partials.as_mut_ptr());
+        crate::epool::run_chunks_with_helper_stateful(
+            n_blocks,
+            &|| vec![F128::ZERO; super::ring_switch::FOLD_TABLE_LEN],
+            &|scratch, block| unsafe {
+                let b_out = core::slice::from_raw_parts_mut(
+                    b_base.ptr().add(block * block_len),
+                    block_len,
+                );
+                let f_out = core::slice::from_raw_parts_mut(
+                    f_base.ptr().add(block * block_len),
+                    block_len,
+                );
+                partials_base
+                    .ptr()
+                    .add(block)
+                    .write(fold_block(scratch, block, b_out, f_out));
             },
-        )
-        .reduce(
-            || (F128::ZERO, F128::ZERO),
-            |(x0, x2), (y0, y2)| (x0 + y0, x2 + y2),
+            Some(helper),
         );
+        partials.into_iter().fold(
+            (F128::ZERO, F128::ZERO),
+            |(x0, x2), (y0, y2)| (x0 + y0, x2 + y2),
+        )
+    } else {
+        folded_b
+            .par_chunks_mut(block_len)
+            .zip(folded_f.par_chunks_mut(block_len))
+            .enumerate()
+            .map_init(
+                || vec![F128::ZERO; super::ring_switch::FOLD_TABLE_LEN],
+                |scratch, (block, (b_out, f_out))| fold_block(scratch, block, b_out, f_out),
+            )
+            .reduce(
+                || (F128::ZERO, F128::ZERO),
+                |(x0, x2), (y0, y2)| (x0 + y0, x2 + y2),
+            )
+    };
 
     crate::scratch::give_f128(packed_witness);
     crate::scratch::give_f128(ordinary_basis);
@@ -8955,6 +9032,34 @@ mod tests {
             target,
             &wtns_0.root(),
             &mut verifier_challenger,
+        ));
+    }
+
+    #[test]
+    fn ranked_direct_fold8_materialize_shape_is_exact() {
+        assert!(super::is_ranked_direct_fold8_materialize_shape(
+            1usize << 25,
+            1usize << 15,
+            2,
+            false,
+        ));
+        assert!(!super::is_ranked_direct_fold8_materialize_shape(
+            1usize << 25,
+            1usize << 14,
+            2,
+            false,
+        ));
+        assert!(!super::is_ranked_direct_fold8_materialize_shape(
+            1usize << 25,
+            1usize << 15,
+            1,
+            false,
+        ));
+        assert!(!super::is_ranked_direct_fold8_materialize_shape(
+            1usize << 25,
+            1usize << 15,
+            2,
+            true,
         ));
     }
 
