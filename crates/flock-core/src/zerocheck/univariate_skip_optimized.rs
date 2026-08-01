@@ -590,48 +590,6 @@ impl Drop for Round1AbInner {
     }
 }
 
-/// Kill switch for the non-temporal store flavor of the deferred AB
-/// precompute output: `FLOCK_NO_ZC_AB_PRE_NT=1` restores the incumbent plain
-/// cached stores as a same-binary control. Store flavor only — the bytes
-/// written are identical.
-pub const ENV_NO_ZC_AB_PRE_NT: &str = "FLOCK_NO_ZC_AB_PRE_NT";
-
-fn ab_pre_nt_enabled() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os(ENV_NO_ZC_AB_PRE_NT).is_none())
-}
-
-/// Non-temporal 64-byte store (L1 stack bounce → `stnp` pair burst), the same
-/// best-effort cache-bypass idiom as the witness stripe drain. The precompute
-/// output is a 512 MiB write-once surface whose consumer runs tens of
-/// milliseconds later (after the commitment root), so its lines are never
-/// usefully cache-resident; plain stores cost a write-allocate RFO read of
-/// every line while the streamed GPU commit is saturating the same memory
-/// system.
-#[cfg(target_arch = "aarch64")]
-#[inline(always)]
-unsafe fn store_nt_64(src: *const u8, dst: *mut u8) {
-    unsafe {
-        core::arch::asm!(
-            "ldp {t0:q}, {t1:q}, [{src}]",
-            "stnp {t0:q}, {t1:q}, [{dst}]",
-            "ldp {t0:q}, {t1:q}, [{src}, #32]",
-            "stnp {t0:q}, {t1:q}, [{dst}, #32]",
-            src = in(reg) src,
-            dst = in(reg) dst,
-            t0 = out(vreg) _,
-            t1 = out(vreg) _,
-            options(nostack)
-        );
-    }
-}
-
-#[cfg(not(target_arch = "aarch64"))]
-#[inline(always)]
-unsafe fn store_nt_64(src: *const u8, dst: *mut u8) {
-    unsafe { core::ptr::copy_nonoverlapping(src, dst, 64) };
-}
-
 /// Precompute the challenge-independent inverse-NTT/product/shift-reduce AB
 /// transform. The result can be produced before the commitment root is
 /// available and consumed later by
@@ -643,28 +601,6 @@ pub fn precompute_round1_ab_inner_packed_padded(
     k_skip: usize,
     inv_table: &InvNttTableByteSingleGf8,
     padding: &PaddingSpec,
-) -> Round1AbInner {
-    precompute_round1_ab_inner_packed_padded_with_flavor(
-        a_packed,
-        b_packed,
-        m,
-        k_skip,
-        inv_table,
-        padding,
-        ab_pre_nt_enabled(),
-    )
-}
-
-/// Store-flavor-parameterized body; the public wrapper passes the latched env
-/// choice, tests compare both arms byte-for-byte in one process.
-fn precompute_round1_ab_inner_packed_padded_with_flavor(
-    a_packed: &[u8],
-    b_packed: &[u8],
-    m: usize,
-    k_skip: usize,
-    inv_table: &InvNttTableByteSingleGf8,
-    padding: &PaddingSpec,
-    nt: bool,
 ) -> Round1AbInner {
     use rayon::prelude::*;
 
@@ -708,19 +644,10 @@ fn precompute_round1_ab_inner_packed_padded_with_flavor(
                 let n_b_med = b_med_counts[within_hash_outer] as usize;
                 let chunk_byte_base = x_outer * OUTER_BYTES;
 
-                // NT arm: the kernel writes a stack temporary and the 64-byte
-                // block drains to the big buffer with `stnp` (write-once
-                // lines, consumer runs after the commit root). Control arm is
-                // the incumbent direct kernel write, byte-for-byte.
-                let mut tmp = [0u8; 64];
                 for b_med in 0..n_b_med {
-                    let dst: &mut [u8; 64] = if nt {
-                        &mut tmp
-                    } else {
-                        (&mut out_outer[b_med * 64..(b_med + 1) * 64])
-                            .try_into()
-                            .expect("one transformed b_med block")
-                    };
+                    let dst: &mut [u8; 64] = (&mut out_outer[b_med * 64..(b_med + 1) * 64])
+                        .try_into()
+                        .expect("one transformed b_med block");
                     shift_reduce_inner_ab(
                         a_packed,
                         b_packed,
@@ -749,23 +676,8 @@ fn precompute_round1_ab_inner_packed_padded_with_flavor(
                         },
                         static_b_context,
                     );
-                    if nt {
-                        // SAFETY: `b_med < n_b_med ≤ OUTER_BYTES / 64`, so the
-                        // 64 destination bytes are in-bounds of `out_outer`.
-                        unsafe { store_nt_64(tmp.as_ptr(), out_outer.as_mut_ptr().add(b_med * 64)) };
-                    }
                 }
-                if nt {
-                    let tail = &mut out_outer[n_b_med * 64..];
-                    debug_assert_eq!(tail.len() % 64, 0);
-                    let zero = [0u8; 64];
-                    for i in 0..tail.len() / 64 {
-                        // SAFETY: chunk `i` is 64 in-bounds bytes of `tail`.
-                        unsafe { store_nt_64(zero.as_ptr(), tail.as_mut_ptr().add(i * 64)) };
-                    }
-                } else {
-                    out_outer[n_b_med * 64..].fill(0);
-                }
+                out_outer[n_b_med * 64..].fill(0);
             },
         );
 
@@ -3093,103 +3005,6 @@ mod tests {
             assert_eq!(pre_c, fused_c, "res_c_lifted mismatch at m={m}");
             assert_eq!(pre_s_hat_v, s_hat_v_c, "s_hat_v_c mismatch at m={m}");
             assert_eq!(pre_quad, quad, "quad mismatch at m={m}");
-        }
-    }
-
-    #[test]
-    fn ab_precompute_nt_flavor_is_byte_identical() {
-        use crate::zerocheck::univariate_skip::pack_bits;
-        // Same padded/dense case matrix as the precompute oracle above: the
-        // NT drain (stack bounce + stnp) and the incumbent direct kernel
-        // write must produce identical storage bytes, including zeroed
-        // padding holes.
-        let cases: [(usize, Option<(usize, usize)>); 3] = [
-            (13, None),
-            (14, Some((14, 15_409))), // BLAKE3 block shape
-            (17, Some((14, 15_409))),
-        ];
-        for (m, padded) in cases {
-            let mut rng = Rng::new(0xAB_57_0F14_u64 ^ (m as u64));
-            let total_bits = 1usize << m;
-            let mut a = rng.bits(total_bits);
-            let mut b = rng.bits(total_bits);
-            let padding = match padded {
-                None => PaddingSpec::dense(m),
-                Some((k_log, useful_bits)) => {
-                    let block_size = 1usize << k_log;
-                    for blk in 0..(total_bits / block_size) {
-                        for j in useful_bits..block_size {
-                            let idx = blk * block_size + j;
-                            a[idx] = false;
-                            b[idx] = false;
-                        }
-                    }
-                    PaddingSpec {
-                        k_log,
-                        useful_bits_per_block: useful_bits,
-                    }
-                }
-            };
-            let (a_p, b_p) = (pack_bits(&a), pack_bits(&b));
-            let table = make_inv_table();
-            let plain = precompute_round1_ab_inner_packed_padded_with_flavor(
-                &a_p, &b_p, m, K_SKIP, &table, &padding, false,
-            );
-            let nt = precompute_round1_ab_inner_packed_padded_with_flavor(
-                &a_p, &b_p, m, K_SKIP, &table, &padding, true,
-            );
-            assert_eq!(
-                plain.as_bytes(),
-                nt.as_bytes(),
-                "store flavor changed bytes at m={m}, padded={}",
-                padded.is_some()
-            );
-        }
-    }
-
-    /// Owned-kernel interleaved A/B of the store flavor at the ranked
-    /// geometry (m=32, BLAKE3 padding). Ignored: ~1.5 GiB and seconds of
-    /// wall; run explicitly with `--ignored --nocapture`.
-    #[test]
-    #[ignore]
-    fn ab_precompute_nt_bench() {
-        use crate::zerocheck::univariate_skip::pack_bits;
-        let m = 32usize;
-        let total_bits = 1usize << m;
-        let padding = PaddingSpec {
-            k_log: 14,
-            useful_bits_per_block: 15_409,
-        };
-        let mut rng = Rng::new(0xBE9C4);
-        let mut a = rng.bits(total_bits);
-        let mut b = rng.bits(total_bits);
-        let block_size = 1usize << padding.k_log;
-        for blk in 0..(total_bits / block_size) {
-            for j in padding.useful_bits_per_block..block_size {
-                a[blk * block_size + j] = false;
-                b[blk * block_size + j] = false;
-            }
-        }
-        let (a_p, b_p) = (pack_bits(&a), pack_bits(&b));
-        drop(a);
-        drop(b);
-        let table = make_inv_table();
-        // Warmup one of each, then interleave measured reps.
-        for nt in [false, true] {
-            let _ = precompute_round1_ab_inner_packed_padded_with_flavor(
-                &a_p, &b_p, m, K_SKIP, &table, &padding, nt,
-            );
-        }
-        for rep in 0..4 {
-            for nt in [rep % 2 == 1, rep % 2 == 0] {
-                let t0 = std::time::Instant::now();
-                let out = precompute_round1_ab_inner_packed_padded_with_flavor(
-                    &a_p, &b_p, m, K_SKIP, &table, &padding, nt,
-                );
-                let ms = t0.elapsed().as_secs_f64() * 1e3;
-                println!("rep={rep} nt={nt}: {ms:.2} ms");
-                drop(out);
-            }
         }
     }
 
