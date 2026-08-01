@@ -1490,49 +1490,66 @@ kernel void parent_hash(device const uint* children [[buffer(0)]],
         }
     }
 
-    /// Encode leaves + all parent levels of ONE aligned subtree
-    /// (`subtree_leaves` a power of two, `leaf_start` aligned to it), writing
-    /// into the subtree's slots of the GLOBAL flat tree layout.
-    pub(crate) unsafe fn encode_merkle_subtree(
+    /// Encode one contiguous leaf prefix and exactly the parent nodes needed
+    /// to populate its entries in the global sixteen-node level. The hybrid
+    /// join recomputes every node above that level after the GPU prefix and
+    /// CPU suffix have completed, so emitting separate power-of-two subtrees
+    /// (and their soon-overwritten roots) only adds command-buffer dispatches.
+    #[inline]
+    pub(crate) fn prefix_dispatch_shape(
+        prefix_sixteenths: usize,
+        per_sixteenth: usize,
+    ) -> (u64, u64) {
+        assert!((1..16).contains(&prefix_sixteenths));
+        assert!(per_sixteenth.is_power_of_two());
+        let count = prefix_sixteenths
+            .checked_mul(per_sixteenth)
+            .expect("prefix dispatch size overflow");
+        let threads = if count <= 256 {
+            count
+        } else {
+            per_sixteenth.min(256)
+        };
+        assert_eq!(count % threads, 0);
+        ((count / threads) as u64, threads as u64)
+    }
+
+    pub(crate) unsafe fn encode_merkle_prefix_to_sixteenth_roots(
         gpu: &Gpu,
         enc: Id,
         codeword_buf: Id,
         tree_buf: Id,
         n_leaves_total: usize,
-        leaf_start: usize,
-        subtree_leaves: usize,
+        prefix_sixteenths: usize,
     ) {
-        debug_assert!(subtree_leaves.is_power_of_two());
-        debug_assert_eq!(leaf_start % subtree_leaves, 0);
+        assert!(n_leaves_total.is_power_of_two());
+        assert!(n_leaves_total >= 16);
+        assert!((1..16).contains(&prefix_sixteenths));
+        let mut per_sixteenth = n_leaves_total / 16;
         unsafe {
             gpu.set_pipeline(enc, gpu.pso_leaf);
-            gpu.set_buffer(enc, codeword_buf, leaf_start * 1024, 0);
-            gpu.set_buffer(enc, tree_buf, leaf_start * 32, 1);
-            let tpg = 256u64.min(subtree_leaves as u64);
-            gpu.dispatch(enc, subtree_leaves as u64 / tpg, tpg);
+            gpu.set_buffer(enc, codeword_buf, 0, 0);
+            gpu.set_buffer(enc, tree_buf, 0, 1);
+            let (groups, threads) =
+                prefix_dispatch_shape(prefix_sixteenths, per_sixteenth);
+            gpu.dispatch(enc, groups, threads);
 
             gpu.set_pipeline(enc, gpu.pso_parent);
             let mut level_start = 0usize; // global node index of level base
             let mut level_len = n_leaves_total;
-            let mut local_start = leaf_start;
-            let mut local_len = subtree_leaves;
-            while local_len > 1 {
+            while level_len > 16 {
                 let write_level_start = level_start + level_len;
-                let n_out = local_len / 2;
-                gpu.set_buffer(enc, tree_buf, (level_start + local_start) * 32, 0);
-                gpu.set_buffer(
-                    enc,
-                    tree_buf,
-                    (write_level_start + local_start / 2) * 32,
-                    1,
-                );
-                let tpg = 256u64.min(n_out as u64);
-                gpu.dispatch(enc, n_out as u64 / tpg, tpg);
+                per_sixteenth /= 2;
+                gpu.set_buffer(enc, tree_buf, level_start * 32, 0);
+                gpu.set_buffer(enc, tree_buf, write_level_start * 32, 1);
+                let (groups, threads) =
+                    prefix_dispatch_shape(prefix_sixteenths, per_sixteenth);
+                gpu.dispatch(enc, groups, threads);
                 level_start = write_level_start;
                 level_len /= 2;
-                local_start /= 2;
-                local_len = n_out;
             }
+            assert_eq!(level_len, 16);
+            assert_eq!(per_sixteenth, 1);
         }
     }
 
@@ -1812,15 +1829,17 @@ kernel void parent_hash(device const uint* children [[buffer(0)]],
 
     /// Hybrid GPU/CPU commit graph: the GPU runs the shared from-z top pass
     /// (layers 0..3) over the full codeword, then owns the position prefix
-    /// (first `16 - k` sixteenths: remaining NTT passes + its aligned Merkle
-    /// subtrees) asynchronously while the CPU completes the suffix `k`
+    /// (first `16 - k` sixteenths: remaining NTT passes + its contiguous
+    /// Merkle prefix through the sixteen-node level) asynchronously while the
+    /// CPU completes the suffix `k`
     /// sixteenths (layers 4.. via the bit-exact block-range driver, suffix
     /// leaves + subtree parents) directly in the shared staging and tree
-    /// buffers. The top 7 tree nodes are (re)computed on the CPU after the
-    /// join, covering every decomposition boundary.
+    /// buffers. The 15 nodes above the sixteen-node frontier are computed on
+    /// the CPU after the join, covering every decomposition boundary.
     ///
-    /// Bit-exact: same kernels/twiddles on both sides, every element and
-    /// tree node written exactly once (top nodes twice, identically).
+    /// Bit-exact: same kernels/twiddles on both sides; every element and tree
+    /// node has one owner, and the only cross-boundary parents are delayed
+    /// until both owners have completed.
     unsafe fn run_commit_graph_from_z_hybrid(
         gpu: &Gpu,
         z_buf: Id,
@@ -1867,23 +1886,28 @@ kernel void parent_hash(device const uint* children [[buffer(0)]],
                 gpu.commit_and_wait(cb1)?;
 
                 // cb2: GPU prefix — remaining passes + aligned subtrees.
-                let prefix16 = (16 - k_cpu16) as u64;
+                let prefix16 = 16 - k_cpu16;
                 let cb2 = gpu.command_buffer()?;
                 let enc = gpu.compute_encoder(cb2)?;
-                encode_ntt_passes_prefix(gpu, enc, staging, tw_buf, log_d, 4, prefix16);
-                // Greedy aligned power-of-two subtree decomposition of the
-                // leaf prefix.
+                encode_ntt_passes_prefix(
+                    gpu,
+                    enc,
+                    staging,
+                    tw_buf,
+                    log_d,
+                    4,
+                    prefix16 as u64,
+                );
                 let sixteenth = n_leaves / 16;
-                let mut start = 0usize;
-                let prefix_leaves = (16 - k_cpu16) * sixteenth;
-                while start < prefix_leaves {
-                    let mut size = 1usize << (prefix_leaves - start).ilog2();
-                    while start % size != 0 {
-                        size >>= 1;
-                    }
-                    encode_merkle_subtree(gpu, enc, staging, tree_buf, n_leaves, start, size);
-                    start += size;
-                }
+                let prefix_leaves = prefix16 * sixteenth;
+                encode_merkle_prefix_to_sixteenth_roots(
+                    gpu,
+                    enc,
+                    staging,
+                    tree_buf,
+                    n_leaves,
+                    prefix16,
+                );
                 gpu.end_encoding(enc);
                 gpu.commit_async(cb2);
 
@@ -3262,5 +3286,35 @@ mod tests {
             }
         }
         assert_eq!(plan_passes(20, 1), vec![(1, 4), (5, 4), (9, 4), (13, 4), (17, 3)]);
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    fn prefix_dispatch_shapes_cover_every_split_exactly() {
+        let n_leaves = 1usize << 20;
+        for prefix16 in 1..16 {
+            let mut level_start = 0usize;
+            let mut level_len = n_leaves;
+            let mut per_sixteenth = n_leaves / 16;
+
+            for level in 0..=16 {
+                let count = prefix16 * per_sixteenth;
+                let (groups, threads) =
+                    imp::prefix_dispatch_shape(prefix16, per_sixteenth);
+                assert_eq!(groups * threads, count as u64, "prefix={prefix16} level={level}");
+                assert!((1..=256).contains(&threads));
+                assert!(count <= level_len);
+
+                if level < 16 {
+                    level_start += level_len;
+                    level_len /= 2;
+                    per_sixteenth /= 2;
+                }
+            }
+
+            assert_eq!(level_start, 2 * n_leaves - 32);
+            assert_eq!(level_len, 16);
+            assert_eq!(per_sixteenth, 1);
+        }
     }
 }
