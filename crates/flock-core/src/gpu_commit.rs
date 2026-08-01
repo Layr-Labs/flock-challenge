@@ -52,6 +52,19 @@ pub const ENV_NO_NTT_PASS_TUNE: &str = "FLOCK_NO_NTT_PASS_TUNE";
 /// incumbent h8 kernel as a same-binary control.
 pub const ENV_NO_GPU_MIXED_FINAL: &str = "FLOCK_NO_GPU_MIXED_FINAL";
 
+/// Exact-`1` control for keeping the warmup's ranked z allocation bound to
+/// its retained Metal no-copy view across later proves.
+pub const ENV_NO_GPU_Z_PIN: &str = "FLOCK_NO_GPU_Z_PIN";
+
+fn gpu_z_pin_value_enabled(value: Option<&std::ffi::OsStr>) -> bool {
+    value != Some(std::ffi::OsStr::new("1"))
+}
+
+fn gpu_z_pin_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| gpu_z_pin_value_enabled(std::env::var_os(ENV_NO_GPU_Z_PIN).as_deref()))
+}
+
 /// Strict kill switch for the fused three-level GPU Merkle parent pass. Only
 /// exact value `1` disables it; the optimization remains ranked-tree-only.
 pub const ENV_NO_GPU_PARENT3: &str = "FLOCK_NO_GPU_PARENT3";
@@ -84,6 +97,19 @@ mod parent3_gate_tests {
         assert!(super::select_gpu_parent3(1 << 20, true));
         assert!(!super::select_gpu_parent3(1 << 20, false));
         assert!(!super::select_gpu_parent3(1 << 19, true));
+    }
+}
+
+#[cfg(test)]
+mod z_pin_gate_tests {
+    use std::ffi::OsStr;
+
+    #[test]
+    fn exact_one_is_the_only_z_pin_kill_value() {
+        assert!(!super::gpu_z_pin_value_enabled(Some(OsStr::new("1"))));
+        for value in [None, Some(""), Some("0"), Some("01"), Some("true")] {
+            assert!(super::gpu_z_pin_value_enabled(value.map(OsStr::new)));
+        }
     }
 }
 
@@ -2134,9 +2160,10 @@ kernel void parent_hash3(device const uint* children [[buffer(0)]],
         /// Metal memory during the open are ordinary cached reads).
         staging: Id,
         /// No-copy read-only wraps of caller z buffers: `(ptr, len, buffer)`.
-        /// The pooled z allocation is stable across the worker's warmup and
-        /// timed proves, so this normally holds one entry created AND
-        /// page-wired during the untimed warmup.
+        /// The default ranked latch pins the warmup z allocation across
+        /// proves, so steady state holds the one entry created and page-wired
+        /// during untimed warmup. The kill-switched incumbent behavior can
+        /// still append a wrap when scratch chooses a different address.
         wraps: Vec<(usize, usize, Id)>,
     }
     // SAFETY: Metal objects are thread-safe; access is serialized by LATCH.
@@ -3410,8 +3437,18 @@ kernel void parent_hash3(device const uint* children [[buffer(0)]],
             gpu.release(latched.tw_buf);
             gpu.release(latched.tree_buf);
             gpu.release(latched.staging);
-            for (_, _, buf) in latched.wraps {
+            for (addr, bytes, buf) in latched.wraps {
+                // The Metal object must die before its caller-owned storage
+                // can leave scratch's non-evictable pin. A checked-out z Vec
+                // remains owned by its caller and becomes ordinary scratch
+                // again when it is eventually returned.
                 gpu.release(buf);
+                if bytes.is_multiple_of(core::mem::size_of::<F128>()) {
+                    crate::scratch::unpin_f128_allocation(
+                        addr,
+                        bytes / core::mem::size_of::<F128>(),
+                    );
+                }
             }
         }
     }
@@ -3473,7 +3510,23 @@ kernel void parent_hash3(device const uint* children [[buffer(0)]],
 
         let force = std::env::var_os(super::ENV_GPU_COMMIT_FORCE).is_some();
         let fast = run.gpu_wall_ms * super::LATCH_MARGIN <= cpu_wall_ms;
-        let on = exact && (fast || force);
+        let would_latch_on = exact && (fast || force);
+        // `scratch::prewarm_prover` deliberately parks six equal 512 MiB
+        // allocations at the ranked shape. Smallest-fit + swap-remove,
+        // followed by early a/b recycling, does not guarantee that the next
+        // proof's z receives this warmup address. Bind this exact allocation
+        // to the retained no-copy Metal view instead: once z returns through
+        // `give_f128`, it is kept outside the evictable pool and is the first
+        // equal-size allocation handed out by the next prove. The Vec owns
+        // the allocation while checked out; the pin owns it otherwise,
+        // including across `scratch::clear`.
+        let z_pinned = !would_latch_on
+            || !super::gpu_z_pin_enabled()
+            || crate::scratch::pin_f128_allocation(z_packed);
+        let on = would_latch_on && z_pinned;
+        if would_latch_on && !z_pinned && dbg {
+            eprintln!("[gpu-commit] warmup z allocation pin unavailable; latching CPU path");
+        }
         if dbg {
             eprintln!(
                 "[gpu-commit] warmup: gpu {:.2} ms vs cpu {:.2} ms, bit-exact={exact}, \
