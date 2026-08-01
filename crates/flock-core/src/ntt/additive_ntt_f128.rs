@@ -472,6 +472,99 @@ impl AdditiveNttF128 {
         unreachable!("ranked top split requires a hardware NTT target");
     }
 
+    /// Start an interleaved transform directly from the rate-reduced message,
+    /// fusing the first three nontrivial layers into the stores that initialize
+    /// `data`, then finish the remaining layers in place.
+    ///
+    /// The ordinary path first writes `2^start_layer` replicas of `msg`, then
+    /// immediately reads and rewrites the whole codeword for the radix-8 pass
+    /// at `start_layer..start_layer + 3`. This entry point reads the same
+    /// message rows and writes the post-radix-8 values directly, so stale
+    /// destination bytes are never loaded and the replica-fill pass vanishes.
+    pub(crate) fn forward_transform_interleaved_from_message_fused3(
+        &self,
+        msg: &[F128],
+        data: &mut [F128],
+        num_ntts: usize,
+        start_layer: usize,
+    ) {
+        use rayon::prelude::*;
+
+        assert_eq!(num_ntts, 8, "recursive from-message fusion uses eight lanes");
+        let log_d = log2_pow2(data.len() / num_ntts);
+        assert!(start_layer + 3 <= log_d);
+        assert_eq!(data.len(), msg.len() << start_layer);
+
+        let num_blocks = 1usize << start_layer;
+        let block_positions = 1usize << (log_d - start_layer);
+        let block_elems = block_positions * num_ntts;
+        let eighth = block_positions >> 3;
+        assert_eq!(msg.len(), block_elems);
+        let twiddles: Vec<[F128; 7]> = (0..num_blocks)
+            .map(|block| {
+                let mut tw = [F128 { lo: 0, hi: 0 }; 7];
+                tw[0] = self.twiddle(start_layer, block);
+                for s in 0..2 {
+                    tw[1 + s] = self.twiddle(start_layer + 1, 2 * block + s);
+                }
+                for s in 0..4 {
+                    tw[3 + s] = self.twiddle(start_layer + 2, 4 * block + s);
+                }
+                tw
+            })
+            .collect();
+        debug_assert_eq!(twiddles[0][0], F128::ZERO);
+        debug_assert_eq!(twiddles[0][1], F128::ZERO);
+        debug_assert_eq!(twiddles[0][3], F128::ZERO);
+
+        const ROWS_PER_TILE: usize = 128;
+        let tiles_per_block = eighth.div_ceil(ROWS_PER_TILE);
+        let src = msg.as_ptr() as usize;
+        let dst = data.as_mut_ptr() as usize;
+        (0..num_blocks * tiles_per_block)
+            .into_par_iter()
+            .for_each(|job| {
+                let block = job / tiles_per_block;
+                let tile = job % tiles_per_block;
+                let row_start = tile * ROWS_PER_TILE;
+                let row_end = (row_start + ROWS_PER_TILE).min(eighth);
+                // SAFETY: each `(block, tile)` job owns all eight destination
+                // rows for one disjoint row interval. `msg` is immutable and
+                // has one complete layer-start block; every derived address
+                // is in the validated source/destination geometry.
+                unsafe {
+                    let dst_block = (dst as *mut F128).add(block * block_elems);
+                    for row in row_start..row_end {
+                        if block == 0 {
+                            kernels::butterfly_fused_3layer_zero_root_from_src_row(
+                                src as *const F128,
+                                dst_block,
+                                eighth,
+                                num_ntts,
+                                row,
+                                &twiddles[block],
+                            );
+                        } else {
+                            kernels::butterfly_fused_3layer_from_src_row(
+                                src as *const F128,
+                                dst_block,
+                                eighth,
+                                num_ntts,
+                                row,
+                                &twiddles[block],
+                            );
+                        }
+                    }
+                }
+            });
+
+        self.forward_transform_interleaved_from_layer(
+            data,
+            num_ntts,
+            start_layer + 3,
+        );
+    }
+
     /// Ranked L0 top passes with the layer-1 pass fused from the message:
     /// both rate-1/2 replica blocks' layer-1..3 butterflies are evaluated
     /// straight from `msg` (`replicate_message_fill` is exactly the
@@ -2444,6 +2537,40 @@ mod tests {
             }
         }
         assert!(exercised, "test never transformed anything");
+    }
+
+    /// Directly initializing the codeword with the first nontrivial radix-8
+    /// pass must match replica-fill followed by the ordinary transform, even
+    /// when every destination slot starts as poisoned scratch.
+    #[test]
+    fn recursive_from_message_fused3_matches_replicated_transform() {
+        const NUM_NTTS: usize = 8;
+        let mut rng = Rng::new(0x5241_5445_384D_5347);
+        for (log_d, start_layer) in [(12usize, 2usize), (12, 3)] {
+            let ntt = AdditiveNttF128::standard(log_d);
+            let msg_len = (1usize << (log_d - start_layer)) * NUM_NTTS;
+            let msg = rand_vec(&mut rng, msg_len);
+
+            let mut want = vec![F128::ZERO; msg_len << start_layer];
+            for replica in want.chunks_mut(msg_len) {
+                replica.copy_from_slice(&msg);
+            }
+            ntt.forward_transform_interleaved_from_layer(
+                &mut want,
+                NUM_NTTS,
+                start_layer,
+            );
+
+            let poison = F128::new(0xA5A5_A5A5_A5A5_A5A5, 0x5A5A_5A5A_5A5A_5A5A);
+            let mut got = vec![poison; msg_len << start_layer];
+            ntt.forward_transform_interleaved_from_message_fused3(
+                &msg,
+                &mut got,
+                NUM_NTTS,
+                start_layer,
+            );
+            assert_eq!(got, want, "log_d={log_d} rate_log={start_layer}");
+        }
     }
 
     /// The ranked split extension must produce three consecutive radix-8

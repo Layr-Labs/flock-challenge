@@ -1546,8 +1546,9 @@ fn build_block_witness_ab_stream_into(
 // rotate-XOR is shr/shl/or, and the bit packing is a const-shift sequential
 // push network mirroring `PackedWordWriter`'s algebra lane-wise.
 // Kill switch: `FLOCK_NO_WITGEN_SIMD=1` restores the scalar driver.
-// `FLOCK_WITGEN_SIMD_PLAIN_STORES=1` replaces the a/b/stripe NT stores with
-// plain ones (same-binary store-flavor A/B).
+// `FLOCK_WITGEN_SIMD_PLAIN_STORES=1` replaces every z/a/b NT drain with plain
+// stores (same-binary store-flavor A/B). `FLOCK_NO_WITGEN_Z_NT=1` disables
+// only z's deferred-stream NT drain while preserving the incumbent a/b mode.
 // ---------------------------------------------------------------------------
 
 #[cfg(target_arch = "aarch64")]
@@ -1571,10 +1572,25 @@ pub(crate) mod witgen_simd {
     }
 
     fn nt_enabled() -> bool {
-        // a/b/stripe NT stores (all §14 never-read); z stays plain (§16).
+        // Global same-binary kill switch for all SIMD NT drain stores.
         static NT: LazyLock<bool> =
             LazyLock::new(|| std::env::var_os("FLOCK_WITGEN_SIMD_PLAIN_STORES").is_none());
         *NT
+    }
+
+    fn z_nt_enabled() -> bool {
+        static ON: LazyLock<bool> =
+            LazyLock::new(|| std::env::var_os("FLOCK_NO_WITGEN_Z_NT").is_none());
+        *ON
+    }
+
+    #[inline(always)]
+    pub(super) const fn select_z_nt(
+        nt_enabled: bool,
+        defer_ranked_stripe: bool,
+        z_nt_enabled: bool,
+    ) -> bool {
+        nt_enabled && defer_ranked_stripe && z_nt_enabled
     }
 
     type V4 = uint32x4_t;
@@ -1667,12 +1683,16 @@ pub(crate) mod witgen_simd {
         }
 
         /// Push the low WIDTH bits of `v` at stream offset ≡ USED (mod 32).
-        /// WIDTH ∈ {31, 32}; `v` is pre-masked by construction (carry parts
-        /// are 31-bit; lin words are full width) — identical to the scalar
-        /// writer, whose defensive mask is a no-op on these values. BACK is
-        /// the straddle back-shift `room = 32 − USED`; WORD is the absolute
-        /// index of the completed word (iff this push completes one). All
-        /// consts are spelled out at the call site (stable Rust cannot
+        /// WIDTH ∈ {31, 32}. Carry values deliberately retain an arbitrary
+        /// bit 31: `vsli` preserves only the already-final low `USED` bits and
+        /// overwrites every following bit with the new field, so the dirty bit
+        /// just above a 31-bit field is overwritten by the next push instead
+        /// of requiring an eager mask. The fixed stream ends in full-width
+        /// lin-id fields, hence no dirty carry bit can reach `finish`.
+        ///
+        /// BACK is the straddle back-shift `room = 32 − USED`; WORD is the
+        /// absolute index of the completed word (iff this push completes one).
+        /// All consts are spelled out at the call site (stable Rust cannot
         /// derive const arguments from const parameters).
         #[inline(always)]
         unsafe fn push<const USED: i32, const WIDTH: i32, const BACK: i32, const WORD: usize>(
@@ -1687,9 +1707,10 @@ pub(crate) mod witgen_simd {
             }
             debug_assert!(USED + WIDTH <= 32 || BACK == 32 - USED);
             unsafe {
-                // The USED == 0 arm avoids instantiating `vshlq_n::<0>`
-                // (illegal immediate) — no shift is needed at word-aligned
-                // positions.
+                // The USED == 0 arm avoids instantiating `vsliq_n::<0>`
+                // (illegal immediate) — no insert is needed at word-aligned
+                // positions. A width-31 value may leave bit 31 dirty here;
+                // the next `vsli #31` overwrites it exactly.
                 if USED == 0 {
                     if WIDTH == 32 {
                         vst1q_u32(self.stage.add(WORD) as *mut u32, v);
@@ -1698,9 +1719,9 @@ pub(crate) mod witgen_simd {
                         self.pending = v;
                     }
                 } else if USED + WIDTH < 32 {
-                    self.pending = vorrq_u32(self.pending, vshlq_n_u32::<USED>(v));
+                    self.pending = vsliq_n_u32::<USED>(self.pending, v);
                 } else {
-                    let out = vorrq_u32(self.pending, vshlq_n_u32::<USED>(v));
+                    let out = vsliq_n_u32::<USED>(self.pending, v);
                     vst1q_u32(self.stage.add(WORD) as *mut u32, out);
                     if USED + WIDTH == 32 {
                         self.pending = vdupq_n_u32(0);
@@ -1779,14 +1800,16 @@ pub(crate) mod witgen_simd {
     /// Lane-wise `add_carry_parts`: `(sum, left, right, carry_aux)`.
     /// `vaddq_u32` wraps mod 2^32 per lane — bit-identical to scalar
     /// `wrapping_add` for each independent block; carries never cross lanes.
+    /// The three row values retain their irrelevant bit 31. [`W32::push`]
+    /// consumes only the low 31 bits and overwrites that dirty boundary bit,
+    /// removing two vector masks from every one of the 336 additions.
     #[inline(always)]
     fn add_carry_parts_v(x: V4, y: V4) -> (V4, V4, V4, V4) {
         unsafe {
-            let mask = vdupq_n_u32(0x7FFF_FFFF);
             let sum = vaddq_u32(x, y);
             let cin = veorq_u32(veorq_u32(sum, x), y);
-            let left = vandq_u32(veorq_u32(x, cin), mask);
-            let right = vandq_u32(veorq_u32(y, cin), mask);
+            let left = veorq_u32(x, cin);
+            let right = veorq_u32(y, cin);
             let carry = vandq_u32(left, right);
             (sum, left, right, carry)
         }
@@ -1807,13 +1830,16 @@ pub(crate) mod witgen_simd {
     /// Build the (z, a, b) blocks for FOUR compressions in u32-lane lockstep,
     /// fully writing every word (stale scratch). `z`/`a`/`b` point at the
     /// quad's first block; block j occupies `dst + j*512 .. +512` u32 words.
+    /// `z_nt` and `ab_nt` independently select non-temporal drain stores for
+    /// z and for the a/b pair, respectively.
     /// Bit-exact with [`super::build_block_witness_ab_stream_into`] x4.
     pub(crate) unsafe fn build_quad_witness_ab_stream_neon(
         inputs: [&Compression; 4],
         z: *mut u32,
         a: *mut u32,
         b: *mut u32,
-        nt: bool,
+        z_nt: bool,
+        ab_nt: bool,
     ) {
         unsafe {
             // ---- gather: SoA block-lane vectors via 4x4 transposes ----
@@ -1891,22 +1917,29 @@ pub(crate) mod witgen_simd {
 
             // ---- L1 stages (block-lane words; drained by `dump` at the
             // end so each block's 2 KiB is one ascending burst) ----
+            // Every element is written before it is read: prefix/out_lo own
+            // words 0..35, W32 owns 36..481, and the explicit suffix owns
+            // 482..511. Keep the stages uninitialized so each quad avoids
+            // three redundant 8 KiB bzero calls before those full writes.
             let zero = vdupq_n_u32(0);
-            let mut zs = [zero; U32_PER_BLOCK];
-            let mut ast = [zero; U32_PER_BLOCK];
-            let mut bs = [zero; U32_PER_BLOCK];
+            let mut zs = core::mem::MaybeUninit::<[V4; U32_PER_BLOCK]>::uninit();
+            let mut ast = core::mem::MaybeUninit::<[V4; U32_PER_BLOCK]>::uninit();
+            let mut bs = core::mem::MaybeUninit::<[V4; U32_PER_BLOCK]>::uninit();
+            let zs = zs.as_mut_ptr().cast::<V4>();
+            let ast = ast.as_mut_ptr().cast::<V4>();
+            let bs = bs.as_mut_ptr().cast::<V4>();
 
             // ---- prefix (bits 0..1153), straight into the stages ----
             // cv slot, words 0..8: z=a=cv, b=MAX.
             for w in 0..8usize {
-                vst1q_u32(zs.as_mut_ptr().add(w) as *mut u32, cv_v[w]);
-                vst1q_u32(ast.as_mut_ptr().add(w) as *mut u32, cv_v[w]);
+                vst1q_u32(zs.add(w) as *mut u32, cv_v[w]);
+                vst1q_u32(ast.add(w) as *mut u32, cv_v[w]);
             }
             let maxv = vdupq_n_u32(u32::MAX);
             // b prefix words 0..36 = MAX (the out_lo slot is MAX too — the
             // scalar writes MAX over MAX, so b needs no out_lo pass).
             for w in 0..36usize {
-                vst1q_u32(bs.as_mut_ptr().add(w) as *mut u32, maxv);
+                vst1q_u32(bs.add(w) as *mut u32, maxv);
             }
             // Message region words 16..36: word16 = 1|m0<<1, then
             // word16+k = chain[k-1]>>31 | chain[k]<<1 over
@@ -1917,7 +1950,7 @@ pub(crate) mod witgen_simd {
                 m[13], m[14], m[15], tlo, thi, blen, flags,
             ];
             vst1q_u32(
-                zs.as_mut_ptr().add(16) as *mut u32,
+                zs.add(16) as *mut u32,
                 vorrq_u32(one, vshlq_n_u32::<1>(chain[0])),
             );
             for k in 1..20usize {
@@ -1925,21 +1958,21 @@ pub(crate) mod witgen_simd {
                     vshrq_n_u32::<31>(chain[k - 1]),
                     vshlq_n_u32::<1>(chain[k]),
                 );
-                vst1q_u32(zs.as_mut_ptr().add(16 + k) as *mut u32, w);
+                vst1q_u32(zs.add(16 + k) as *mut u32, w);
             }
             // a's message region equals z's.
             for w in 16..36usize {
-                let v = vld1q_u32(zs.as_ptr().add(w) as *const u32);
-                vst1q_u32(ast.as_mut_ptr().add(w) as *mut u32, v);
+                let v = vld1q_u32(zs.add(w) as *const u32);
+                vst1q_u32(ast.add(w) as *mut u32, v);
             }
 
             // ---- G stream (bits 1153..15409): sequential push network ----
             // Writers start at u32 word 36 with one pending bit (flags>>31
             // for z/a, 1 for b) — the scalar writer's u64-word-18 state.
             let pending_bit = vshrq_n_u32::<31>(flags);
-            let mut wz = W32::at(zs.as_mut_ptr(), pending_bit);
-            let mut wa = W32::at(ast.as_mut_ptr(), pending_bit);
-            let mut wb = W32::at(bs.as_mut_ptr(), one);
+            let mut wz = W32::at(zs, pending_bit);
+            let mut wa = W32::at(ast, pending_bit);
+            let mut wb = W32::at(bs, one);
 
             macro_rules! g {
                 ($g:expr, $la:literal, $lb:literal, $lc:literal, $ld:literal,
@@ -2037,26 +2070,30 @@ pub(crate) mod witgen_simd {
                 assert!(U32_PER_BLOCK - ZF == 30);
             }
             for w in 0..30usize {
-                vst1q_u32(zs.as_mut_ptr().add(ZF + w) as *mut u32, zero);
-                vst1q_u32(ast.as_mut_ptr().add(ZF + w) as *mut u32, zero);
-                vst1q_u32(bs.as_mut_ptr().add(ZF + w) as *mut u32, zero);
+                vst1q_u32(zs.add(ZF + w) as *mut u32, zero);
+                vst1q_u32(ast.add(ZF + w) as *mut u32, zero);
+                vst1q_u32(bs.add(ZF + w) as *mut u32, zero);
             }
 
             // ---- out_lo slot, words 8..16 (z/a only) ----
             for w in 0..8usize {
                 let lo = veorq_u32(state[w], state[w + 8]);
-                vst1q_u32(zs.as_mut_ptr().add(8 + w) as *mut u32, lo);
-                vst1q_u32(ast.as_mut_ptr().add(8 + w) as *mut u32, lo);
+                vst1q_u32(zs.add(8 + w) as *mut u32, lo);
+                vst1q_u32(ast.add(8 + w) as *mut u32, lo);
             }
 
             // ---- drain stages: per-block 2 KiB ascending bursts ----
-            dump::<false>(zs.as_ptr(), z);
-            if nt {
-                dump::<true>(ast.as_ptr(), a);
-                dump::<true>(bs.as_ptr(), b);
+            if z_nt {
+                dump::<true>(zs, z);
             } else {
-                dump::<false>(ast.as_ptr(), a);
-                dump::<false>(bs.as_ptr(), b);
+                dump::<false>(zs, z);
+            }
+            if ab_nt {
+                dump::<true>(ast, a);
+                dump::<true>(bs, b);
+            } else {
+                dump::<false>(ast, a);
+                dump::<false>(bs, b);
             }
         }
     }
@@ -2153,6 +2190,13 @@ pub(crate) mod witgen_simd {
             .as_mut()
             .map(|stripe| WritePtr(stripe.as_mut_ptr()));
         let nt = nt_enabled();
+        // The ordinary path rereads z immediately to emit the lincheck
+        // stripe, so its cached stores remain intentional. With an acquired
+        // Metal stream and deferred stripe, z's next consumer is the GPU;
+        // store it non-temporally like a/b and avoid polluting CPU caches with
+        // the full 512 MiB ranked buffer. The per-band release fence below is
+        // the same visibility boundary used by the cached-store path.
+        let z_nt = select_z_nt(nt, defer_ranked_stripe, z_nt_enabled());
 
         let process_group = |g: usize| {
             // SAFETY: each scheduled group index occurs exactly once. Every
@@ -2182,15 +2226,17 @@ pub(crate) mod witgen_simd {
                         z_grp[base..].as_mut_ptr() as *mut u32,
                         a_grp[base..].as_mut_ptr() as *mut u32,
                         b_grp[base..].as_mut_ptr() as *mut u32,
+                        z_nt,
                         nt,
                     );
                 }
             }
             if let Some(stripe_base) = stripe_base {
                 // Bit-transpose 8 z chunks into the lincheck stripe
-                // (identical to the generic driver; z stores stay plain so
-                // this re-read is L1-hot). The ranked deferred arm
-                // skips this whole block and reconstructs from immutable z.
+                // (identical to the generic driver). This immediate-stripe
+                // arm necessarily has z_nt=false, so the re-read is L1-hot;
+                // the ranked deferred arm skips this whole block and
+                // reconstructs from immutable z.
                 let stripe =
                     unsafe { std::slice::from_raw_parts_mut(stripe_base.get().add(g * K), K) };
                 let z_u64_all: &[u64] = unsafe {
@@ -3356,6 +3402,25 @@ mod tests {
         ));
     }
 
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn deferred_z_nt_selector_is_exact_and_killable() {
+        for nt_enabled in [false, true] {
+            for defer_ranked_stripe in [false, true] {
+                for z_nt_enabled in [false, true] {
+                    assert_eq!(
+                        witgen_simd::select_z_nt(
+                            nt_enabled,
+                            defer_ranked_stripe,
+                            z_nt_enabled,
+                        ),
+                        nt_enabled && defer_ranked_stripe && z_nt_enabled,
+                    );
+                }
+            }
+        }
+    }
+
     /// Batch-major witness equality vs the row-major driver (word-transpose
     /// + identical stripe), incl. padding slots via a non-power-of-two count.
     #[test]
@@ -3630,8 +3695,8 @@ mod tests {
             let counter = ((rng.next_u32() as u64) << 32) | rng.next_u32() as u64;
             (cv, m, counter, rng.next_u32(), rng.next_u32())
         };
-        // Per-block kernel equality, both store flavors.
-        for nt in [false, true] {
+        // Per-block kernel equality, all independently selectable store modes.
+        for (z_nt, ab_nt) in [(false, false), (false, true), (true, false), (true, true)] {
             for _ in 0..8 {
                 let inputs: [Compression; 4] = std::array::from_fn(|_| mk(&mut rng));
                 let mut zq = [u64::MAX; 4 * WORDS];
@@ -3643,7 +3708,8 @@ mod tests {
                         zq.as_mut_ptr() as *mut u32,
                         aq.as_mut_ptr() as *mut u32,
                         bq.as_mut_ptr() as *mut u32,
-                        nt,
+                        z_nt,
+                        ab_nt,
                     );
                 }
                 for (j, inp) in inputs.iter().enumerate() {
@@ -3662,7 +3728,7 @@ mod tests {
                         if got != want {
                             let w = got.iter().zip(want).position(|(x, y)| x != y).unwrap();
                             panic!(
-                                "{name} lane {j} nt={nt}: first diff u64 word {w} (u32 word {}):\
+                                "{name} lane {j} z_nt={z_nt} ab_nt={ab_nt}: first diff u64 word {w} (u32 word {}):\
                                  got {:#018x} want {:#018x}",
                                 2 * w,
                                 got[w],

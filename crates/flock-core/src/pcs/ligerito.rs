@@ -2128,6 +2128,70 @@ fn transpose_forward_ntt_fused_3layer(
     });
 }
 
+/// Final three transpose layers when the caller retains only the low half.
+/// The first two layers still contribute to both root inputs, but the root
+/// butterfly's retained output is just `top = a + b`. Its discarded output
+/// `bottom = t * (a + b) + b` therefore needs neither the field product nor
+/// the store. The four writes per row cover exactly `data[..data.len() / 2]`.
+fn transpose_forward_ntt_fused_final_3layer_low_half(
+    ntt: &AdditiveNttF128,
+    data: &mut [F128],
+    log_d: usize,
+) {
+    use rayon::prelude::*;
+
+    #[cfg(test)]
+    TEST_TRUNCATED_FINAL_NTT_HITS.with(|hits| hits.set(hits.get() + 1));
+
+    #[inline(always)]
+    fn butterfly(values: &mut [F128; 8], a: usize, b: usize, twiddle: F128) {
+        let sum = values[a] + values[b];
+        values[a] = sum;
+        values[b] = twiddle * sum + values[b];
+    }
+
+    assert!(log_d >= 3);
+    assert_eq!(data.len(), 1usize << log_d);
+    let eighth = data.len() >> 3;
+    let mut layer_1_twiddles = [F128::ZERO; 2];
+    let mut layer_2_twiddles = [F128::ZERO; 4];
+    for (block, twiddle) in layer_1_twiddles.iter_mut().enumerate() {
+        *twiddle = ntt.twiddle(1, block);
+    }
+    for (block, twiddle) in layer_2_twiddles.iter_mut().enumerate() {
+        *twiddle = ntt.twiddle(2, block);
+    }
+
+    let data_ptr = data.as_mut_ptr() as usize;
+    (0..eighth).into_par_iter().for_each(|row| {
+        let mut values = [F128::ZERO; 8];
+        // SAFETY: each row owns the eight positions `row + i*eighth`.
+        // Different rows never overlap. Only positions i=0..4 are written;
+        // together those positions are exactly the retained low half.
+        unsafe {
+            let ptr = data_ptr as *mut F128;
+            for (i, value) in values.iter_mut().enumerate() {
+                *value = *ptr.add(row + i * eighth);
+            }
+            for pair in 0..4 {
+                butterfly(&mut values, 2 * pair, 2 * pair + 1, layer_2_twiddles[pair]);
+            }
+            for half in 0..2 {
+                butterfly(&mut values, 4 * half, 4 * half + 2, layer_1_twiddles[half]);
+                butterfly(
+                    &mut values,
+                    4 * half + 1,
+                    4 * half + 3,
+                    layer_1_twiddles[half],
+                );
+            }
+            for i in 0..4 {
+                *ptr.add(row + i * eighth) = values[i] + values[i + 4];
+            }
+        }
+    });
+}
+
 /// Transposed forward additive NTT, `Fᵀ`, in place over `2^log_d` coefficients.
 /// Forward butterfly is `M=[[1,t],[1,t+1]]`; transpose `Mᵀ=[[1,1],[t,t+1]]` is
 /// `s=a+b; top=s; bot=t·s+b`, applied in **reverse** layer order. (Baseline:
@@ -2181,6 +2245,74 @@ fn transpose_forward_ntt(ntt: &AdditiveNttF128, data: &mut [F128], log_d: usize)
     }
 }
 
+/// Exact ranked top-level induction shape. It transforms a 2^20 rate-two
+/// codeword, keeps 2^19 coefficients, folds 64 lanes, and batches 218 opens.
+#[inline]
+fn is_ranked_induce_truncated_final_ntt_shape(
+    log_msg_cols: usize,
+    log_inv_rate: usize,
+    log_num_interleaved: usize,
+    n_queries: usize,
+    alpha_len: usize,
+) -> bool {
+    log_msg_cols == 19
+        && log_inv_rate == 1
+        && log_num_interleaved == 6
+        && n_queries == 218
+        && alpha_len == 8
+}
+
+#[cfg(test)]
+std::thread_local! {
+    static TEST_TRUNCATED_FINAL_NTT_OVERRIDE: std::cell::Cell<Option<bool>> =
+        const { std::cell::Cell::new(None) };
+    static TEST_TRUNCATED_FINAL_NTT_HITS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
+
+#[inline]
+fn use_ranked_induce_truncated_final_ntt(
+    log_msg_cols: usize,
+    log_inv_rate: usize,
+    log_num_interleaved: usize,
+    n_queries: usize,
+    alpha_len: usize,
+) -> bool {
+    #[cfg(test)]
+    if let Some(enabled) = TEST_TRUNCATED_FINAL_NTT_OVERRIDE.with(|slot| slot.get()) {
+        return enabled;
+    }
+
+    cfg!(all(target_os = "macos", target_arch = "aarch64"))
+        && is_ranked_induce_truncated_final_ntt_shape(
+            log_msg_cols,
+            log_inv_rate,
+            log_num_interleaved,
+            n_queries,
+            alpha_len,
+        )
+        && std::env::var_os("FLOCK_NO_LIG_INDUCE_TRUNCATED_NTT").is_none()
+}
+
+#[cfg(test)]
+fn with_truncated_final_ntt_override<T>(enabled: bool, f: impl FnOnce() -> T) -> T {
+    TEST_TRUNCATED_FINAL_NTT_OVERRIDE.with(|slot| {
+        struct Reset<'a> {
+            slot: &'a std::cell::Cell<Option<bool>>,
+            previous: Option<bool>,
+        }
+        impl Drop for Reset<'_> {
+            fn drop(&mut self) {
+                self.slot.set(self.previous);
+            }
+        }
+
+        let previous = slot.replace(Some(enabled));
+        let _reset = Reset { slot, previous };
+        f()
+    })
+}
+
 /// `Fᵀ`-based fast path for [`induce_sumcheck_poly`]: scatter per-query weights
 /// into the codeword domain, apply `Fᵀ`, keep the low `2^log_msg_cols` outputs.
 /// Byte-identical output to [`induce_sumcheck_poly`].
@@ -2197,6 +2329,13 @@ pub(crate) fn induce_sumcheck_poly_via_ntt(
     let block_len = 1usize << log_block;
     let n_queries = queries.len();
     assert_eq!(opened_rows.len(), n_queries);
+    let truncate_final_group = use_ranked_induce_truncated_final_ntt(
+        log_msg_cols,
+        log_inv_rate,
+        v_challenges.len(),
+        n_queries,
+        alpha.len(),
+    );
 
     let eq = build_eq_table(v_challenges);
     let alpha_pows: Vec<F128> = if n_queries == 0 {
@@ -2241,7 +2380,13 @@ pub(crate) fn induce_sumcheck_poly_via_ntt(
         c
     } else {
         let ntt = AdditiveNttF128::standard(log_block);
-        transpose_forward_ntt_sparse(&ntt, queries, &alpha_pows, log_block)
+        transpose_forward_ntt_sparse(
+            &ntt,
+            queries,
+            &alpha_pows,
+            log_block,
+            truncate_final_group,
+        )
     };
     coeffs.truncate(n);
     (coeffs, enforced_sum)
@@ -2437,13 +2582,24 @@ fn transpose_forward_ntt_dense_suffix(
     data: &mut [F128],
     log_d: usize,
     prefix_k: usize,
+    truncate_final_group: bool,
 ) {
     use rayon::prelude::*;
     let n_threads = rayon::current_num_threads().max(1);
     let mut remaining = log_d - prefix_k;
+    if truncate_final_group {
+        // The optimized ranked schedule ends in the fused layers 2,1,0.
+        // Keep the gate explicit so another sparse geometry cannot silently
+        // skip outputs from a differently shaped suffix schedule.
+        assert!(remaining >= 3 && remaining.is_multiple_of(3));
+    }
     while remaining >= 3 {
         let layer = remaining - 3;
-        transpose_forward_ntt_fused_3layer(ntt, data, log_d, layer);
+        if truncate_final_group && layer == 0 {
+            transpose_forward_ntt_fused_final_3layer_low_half(ntt, data, log_d);
+        } else {
+            transpose_forward_ntt_fused_3layer(ntt, data, log_d, layer);
+        }
         remaining -= 3;
     }
     for layer in (0..remaining).rev() {
@@ -2488,12 +2644,14 @@ fn transpose_forward_ntt_sparse(
     positions: &[usize],
     values: &[F128],
     log_d: usize,
+    truncate_final_group: bool,
 ) -> Vec<F128> {
     let n = 1usize << log_d;
     // No prefix for small domains — just scatter + full dense transpose.
     let k = if log_d >= 12 { 8usize.min(log_d) } else { 0 };
 
     if k == 0 {
+        assert!(!truncate_final_group);
         let mut data = vec![F128::ZERO; n];
         for (&p, &v) in positions.iter().zip(values) {
             data[p] += v;
@@ -2509,7 +2667,14 @@ fn transpose_forward_ntt_sparse(
         && *LINEAR_WINDOWS_ENABLED
             .get_or_init(|| std::env::var_os("FLOCK_NO_INDUCE_LINEAR_WINDOWS").is_none());
     if !use_linear_windows {
-        return transpose_forward_ntt_sparse_hashmap(ntt, positions, values, log_d, k);
+        return transpose_forward_ntt_sparse_hashmap(
+            ntt,
+            positions,
+            values,
+            log_d,
+            k,
+            truncate_final_group,
+        );
     }
 
     let groups = group_sorted_positions(positions, k);
@@ -2520,7 +2685,10 @@ fn transpose_forward_ntt_sparse(
 
     let mut data = densify_active_windows(&arena, &groups, log_d, k);
 
-    transpose_forward_ntt_dense_suffix(ntt, &mut data, log_d, k);
+    transpose_forward_ntt_dense_suffix(ntt, &mut data, log_d, k, truncate_final_group);
+    if truncate_final_group {
+        data.truncate(n >> 1);
+    }
     data
 }
 
@@ -2530,6 +2698,7 @@ fn transpose_forward_ntt_sparse_hashmap(
     values: &[F128],
     log_d: usize,
     prefix_k: usize,
+    truncate_final_group: bool,
 ) -> Vec<F128> {
     use rayon::prelude::*;
     use std::collections::HashMap;
@@ -2560,7 +2729,16 @@ fn transpose_forward_ntt_sparse_hashmap(
         data[start..start + window_len].copy_from_slice(&window);
     }
 
-    transpose_forward_ntt_dense_suffix(ntt, &mut data, log_d, prefix_k);
+    transpose_forward_ntt_dense_suffix(
+        ntt,
+        &mut data,
+        log_d,
+        prefix_k,
+        truncate_final_group,
+    );
+    if truncate_final_group {
+        data.truncate(n >> 1);
+    }
     data
 }
 
@@ -2630,6 +2808,43 @@ pub(crate) fn ligero_commit(
     ntt: &AdditiveNttF128,
     kind: HashKind,
 ) -> LigeroWitness {
+    let level_opt_out = match (log_msg_cols, log_num_interleaved, log_inv_rate) {
+        (16, 3, 2) => Some("FLOCK_NO_RECURSIVE_FROM_MESSAGE_L1"),
+        (13, 3, 3) => Some("FLOCK_NO_RECURSIVE_FROM_MESSAGE_L2"),
+        _ => None,
+    };
+    let recursive_from_message_shape = kind == HashKind::Blake3 && level_opt_out.is_some();
+    let level_enabled = level_opt_out.is_some_and(|name| std::env::var_os(name).is_none());
+    let fuse_from_message = cfg!(all(
+        target_os = "macos",
+        target_arch = "aarch64",
+        target_feature = "aes"
+    )) && recursive_from_message_shape
+        && level_enabled
+        && std::env::var_os("FLOCK_NO_RECURSIVE_FROM_MESSAGE").is_none();
+    ligero_commit_impl(
+        poly,
+        log_msg_cols,
+        log_num_interleaved,
+        log_inv_rate,
+        ntt,
+        kind,
+        fuse_from_message,
+    )
+}
+
+/// Implementation split so the exact matrix/tree oracle can force the new
+/// path independently of target-feature and environment dispatch.
+#[allow(clippy::too_many_arguments)]
+fn ligero_commit_impl(
+    poly: &[F128],
+    log_msg_cols: usize,
+    log_num_interleaved: usize,
+    log_inv_rate: usize,
+    ntt: &AdditiveNttF128,
+    kind: HashKind,
+    fuse_from_message: bool,
+) -> LigeroWitness {
     let msg_cols = 1usize << log_msg_cols;
     let num_interleaved = 1usize << log_num_interleaved;
     let block_len = msg_cols << log_inv_rate;
@@ -2637,19 +2852,47 @@ pub(crate) fn ligero_commit(
     assert_eq!(poly.len(), num_interleaved * msg_cols);
     assert!(log_block_len <= ntt.log_domain_size());
 
-    // LSB-lane layout: input matches the SoA layout `data[pos * num_interleaved + lane]`
-    // directly. The first `log_inv_rate` NTT layers on the zero-padded
-    // coefficients are pure copies, so fill the matrix with 2^log_inv_rate
-    // replicas of `poly` (same write cost as copy + zero-fill) and start the
-    // transform past those layers — see `pcs::commit::replicate_message_fill`.
-    let codeword_len = block_len * num_interleaved;
-    let mut mat = crate::scratch::take_f128(codeword_len);
-    super::commit::replicate_message_fill(&mut mat, poly);
+    let timing = std::env::var_os("LIG_PROVE_TRACE").is_some()
+        || std::env::var_os("FLOCK_OPEN_TIMING").is_some();
+    let total_start = timing.then(std::time::Instant::now);
 
-    // RS-encode every lane in one call (each lane is one independent NTT).
-    ntt.forward_transform_interleaved_from_layer(&mut mat, num_interleaved, log_inv_rate);
+    // LSB-lane layout: input matches `data[pos * num_interleaved + lane]`.
+    // The first `log_inv_rate` layers on zero-padded coefficients are pure
+    // copies. The ordinary path materializes those replicas; the exact ranked
+    // recursive shapes fuse that logical state into their first radix-8 pass.
+    let codeword_len = block_len * num_interleaved;
+    let alloc_start = timing.then(std::time::Instant::now);
+    let mut mat = crate::scratch::take_f128(codeword_len);
+    let alloc_elapsed = alloc_start.map_or(std::time::Duration::ZERO, |t| t.elapsed());
+    let mut fill_elapsed = std::time::Duration::ZERO;
+    let ntt_start = timing.then(std::time::Instant::now);
+    if fuse_from_message {
+        // Write the first nontrivial radix-8 result straight from the compact
+        // message into stale codeword storage. This deletes the full replica
+        // fill and the first pass's destination reads/RFOs.
+        ntt.forward_transform_interleaved_from_message_fused3(
+            poly,
+            &mut mat,
+            num_interleaved,
+            log_inv_rate,
+        );
+    } else {
+        let fill_start = timing.then(std::time::Instant::now);
+        super::commit::replicate_message_fill(&mut mat, poly);
+        fill_elapsed = fill_start.map_or(std::time::Duration::ZERO, |t| t.elapsed());
+        // RS-encode every lane in one call (each lane is one independent NTT).
+        ntt.forward_transform_interleaved_from_layer(
+            &mut mat,
+            num_interleaved,
+            log_inv_rate,
+        );
+    }
+    let ntt_elapsed = ntt_start
+        .map_or(std::time::Duration::ZERO, |t| t.elapsed())
+        .saturating_sub(fill_elapsed);
 
     // Merkle over rows. One leaf = `num_interleaved` consecutive F128 = 16·num_interleaved bytes.
+    let merkle_start = timing.then(std::time::Instant::now);
     let leaf_size_bytes = num_interleaved * core::mem::size_of::<F128>();
     let data_bytes: &[u8] = unsafe {
         core::slice::from_raw_parts(
@@ -2659,6 +2902,26 @@ pub(crate) fn ligero_commit(
     };
     debug_assert_eq!(data_bytes.len(), block_len * leaf_size_bytes);
     let tree = merkle::merkle_tree(data_bytes, block_len, kind);
+    let merkle_elapsed = merkle_start.map_or(std::time::Duration::ZERO, |t| t.elapsed());
+
+    if timing {
+        let level = match (log_msg_cols, log_num_interleaved, log_inv_rate) {
+            (16, 3, 2) => Some("L1"),
+            (13, 3, 3) => Some("L2"),
+            _ => None,
+        };
+        if let Some(level) = level {
+            let total_elapsed = total_start.expect("timing start").elapsed();
+            eprintln!(
+                "    [recursive-commit {level}] fused={fuse_from_message} alloc={:.2} ms fill={:.2} ms ntt={:.2} ms merkle={:.2} ms total={:.2} ms",
+                alloc_elapsed.as_secs_f64() * 1e3,
+                fill_elapsed.as_secs_f64() * 1e3,
+                ntt_elapsed.as_secs_f64() * 1e3,
+                merkle_elapsed.as_secs_f64() * 1e3,
+                total_elapsed.as_secs_f64() * 1e3,
+            );
+        }
+    }
 
     LigeroWitness {
         mat,
@@ -6916,6 +7179,44 @@ mod tests {
 
     use super::*;
 
+    /// The recursive from-message first pass preserves every encoded element
+    /// and every node of the ordinary Merkle tree for both production rates.
+    #[test]
+    fn recursive_from_message_commit_matches_replica_oracle() {
+        use crate::challenger::Challenger;
+
+        for (log_msg_cols, log_inv_rate, seed) in [
+            (16usize, 2usize, 0xF14C_0002_u64),
+            (13usize, 3usize, 0xF14C_0003_u64),
+        ] {
+            let log_num_interleaved = 3usize;
+            let mut rng = crate::challenger::RandomChallenger::new(seed);
+            let poly = rng.sample_f128_vec(1usize << (log_msg_cols + log_num_interleaved));
+            let ntt = AdditiveNttF128::standard(log_msg_cols + log_inv_rate);
+            let ordinary = ligero_commit_impl(
+                &poly,
+                log_msg_cols,
+                log_num_interleaved,
+                log_inv_rate,
+                &ntt,
+                HashKind::Blake3,
+                false,
+            );
+            let fused = ligero_commit_impl(
+                &poly,
+                log_msg_cols,
+                log_num_interleaved,
+                log_inv_rate,
+                &ntt,
+                HashKind::Blake3,
+                true,
+            );
+            assert_eq!(fused.mat, ordinary.mat, "encoded matrix changed");
+            assert_eq!(fused.tree, ordinary.tree, "flat Merkle tree changed");
+            assert_eq!(fused.root(), ordinary.root(), "Merkle root changed");
+        }
+    }
+
     /// Worked example: `LigeritoSecurityConfig` for BLAKE3 m=29 at rate 1/2.
     /// Paper-compatible m=29 fast example, mechanically derived in the
     /// unique-decoding regime (Theorem 1.4, ε* = 10⁻³) targeting 100-bit
@@ -7729,7 +8030,8 @@ mod tests {
                     dense[p] += v;
                 }
                 transpose_forward_ntt(&ntt, &mut dense, log_d);
-                let sparse = transpose_forward_ntt_sparse(&ntt, &positions, &values, log_d);
+                let sparse =
+                    transpose_forward_ntt_sparse(&ntt, &positions, &values, log_d, false);
                 assert_eq!(sparse, dense, "log_d={log_d}, nq={nq}");
             }
         }
@@ -7762,9 +8064,16 @@ mod tests {
                 }
                 transpose_forward_ntt(&ntt, &mut dense, log_d);
 
-                let legacy =
-                    transpose_forward_ntt_sparse_hashmap(&ntt, &positions, &values, log_d, 8);
-                let linear = transpose_forward_ntt_sparse(&ntt, &positions, &values, log_d);
+                let legacy = transpose_forward_ntt_sparse_hashmap(
+                    &ntt,
+                    &positions,
+                    &values,
+                    log_d,
+                    8,
+                    false,
+                );
+                let linear =
+                    transpose_forward_ntt_sparse(&ntt, &positions, &values, log_d, false);
                 assert_eq!(
                     linear, legacy,
                     "linear != hashmap at log_d={log_d}, nq={n_queries}"
@@ -7788,15 +8097,120 @@ mod tests {
             F128::new(5, 0),
             F128::new(6, 0),
         ];
-        let legacy = transpose_forward_ntt_sparse_hashmap(&ntt, &positions, &values, log_d, 8);
-        let linear = transpose_forward_ntt_sparse(&ntt, &positions, &values, log_d);
+        let legacy =
+            transpose_forward_ntt_sparse_hashmap(&ntt, &positions, &values, log_d, 8, false);
+        let linear = transpose_forward_ntt_sparse(&ntt, &positions, &values, log_d, false);
         assert_eq!(linear, legacy, "duplicate-position accumulation changed");
 
         let positions: Vec<usize> = (0..1usize << log_d).step_by(1 << 8).collect();
         let values = vec![F128::ONE; positions.len()];
-        let legacy = transpose_forward_ntt_sparse_hashmap(&ntt, &positions, &values, log_d, 8);
-        let linear = transpose_forward_ntt_sparse(&ntt, &positions, &values, log_d);
+        let legacy =
+            transpose_forward_ntt_sparse_hashmap(&ntt, &positions, &values, log_d, 8, false);
+        let linear = transpose_forward_ntt_sparse(&ntt, &positions, &values, log_d, false);
         assert_eq!(linear, legacy, "all-active-window case changed");
+    }
+
+    #[test]
+    fn ranked_induce_truncated_final_ntt_shape_gate_is_narrow() {
+        assert!(is_ranked_induce_truncated_final_ntt_shape(19, 1, 6, 218, 8));
+        for shape in [
+            (18, 1, 6, 218, 8),
+            (19, 2, 6, 218, 8),
+            (19, 1, 5, 218, 8),
+            (19, 1, 6, 217, 8),
+            (19, 1, 6, 218, 7),
+        ] {
+            assert!(!is_ranked_induce_truncated_final_ntt_shape(
+                shape.0, shape.1, shape.2, shape.3, shape.4,
+            ));
+        }
+    }
+
+    #[test]
+    fn ranked_induce_truncated_final_ntt_gate_tracks_optout() {
+        let expected = cfg!(all(target_os = "macos", target_arch = "aarch64"))
+            && std::env::var_os("FLOCK_NO_LIG_INDUCE_TRUNCATED_NTT").is_none();
+        assert_eq!(
+            use_ranked_induce_truncated_final_ntt(19, 1, 6, 218, 8),
+            expected,
+        );
+    }
+
+    /// Independent oracle for the final fused group. The optimized kernel
+    /// must reproduce the retained half while leaving every discarded slot
+    /// untouched, proving that the dead root stores are absent.
+    #[test]
+    fn transpose_truncated_final_group_matches_reference_low_half() {
+        use crate::challenger::Challenger;
+
+        fn final_three_layer_reference(ntt: &AdditiveNttF128, data: &mut [F128], log_d: usize) {
+            for layer in (0..3).rev() {
+                let num_blocks = 1usize << layer;
+                let block_size = 1usize << (log_d - layer);
+                let half = block_size >> 1;
+                for block in 0..num_blocks {
+                    let twiddle = ntt.twiddle(layer, block);
+                    let start = block * block_size;
+                    for row in 0..half {
+                        let a = data[start + row];
+                        let b = data[start + half + row];
+                        let sum = a + b;
+                        data[start + row] = sum;
+                        data[start + half + row] = twiddle * sum + b;
+                    }
+                }
+            }
+        }
+
+        for &log_d in &[3usize, 6, 9, 14] {
+            let mut challenger =
+                crate::challenger::RandomChallenger::new(0x7A11_F17E ^ log_d as u64);
+            let before = challenger.sample_f128_vec(1usize << log_d);
+            let mut expected = before.clone();
+            let mut actual = before.clone();
+            let ntt = AdditiveNttF128::standard(log_d);
+
+            final_three_layer_reference(&ntt, &mut expected, log_d);
+            transpose_forward_ntt_fused_final_3layer_low_half(&ntt, &mut actual, log_d);
+
+            let half = actual.len() >> 1;
+            assert_eq!(&actual[..half], &expected[..half], "log_d={log_d}");
+            assert_eq!(
+                &actual[half..],
+                &before[half..],
+                "discarded-half write at log_d={log_d}",
+            );
+        }
+    }
+
+    /// Exercise the complete sparse-prefix schedule at sizes where its final
+    /// dense group is layers 2,1,0. The truncated result must equal the low
+    /// half of the untouched frontier transform.
+    #[test]
+    fn transpose_sparse_truncated_final_group_matches_full_transform() {
+        use crate::challenger::Challenger;
+
+        for &log_d in &[14usize, 17] {
+            let n = 1usize << log_d;
+            let mut challenger =
+                crate::challenger::RandomChallenger::new(0x5A95_EF17 ^ log_d as u64);
+            let mut pairs = Vec::new();
+            while pairs.len() < 43 {
+                let position = (challenger.sample_f128().lo as usize) % n;
+                if !pairs.iter().any(|&(p, _)| p == position) {
+                    pairs.push((position, challenger.sample_f128()));
+                }
+            }
+            pairs.sort_unstable_by_key(|&(position, _)| position);
+            let (positions, values): (Vec<_>, Vec<_>) = pairs.into_iter().unzip();
+            let ntt = AdditiveNttF128::standard(log_d);
+            let mut expected =
+                transpose_forward_ntt_sparse(&ntt, &positions, &values, log_d, false);
+            expected.truncate(n >> 1);
+            let actual =
+                transpose_forward_ntt_sparse(&ntt, &positions, &values, log_d, true);
+            assert_eq!(actual, expected, "log_d={log_d}");
+        }
     }
 
     /// The fused production kernel must be byte-identical to the original
@@ -8465,6 +8879,122 @@ mod tests {
         let proof2: LigeritoProof = bincode::deserialize(&bytes).expect("deserialize");
         assert_eq!(proof, proof2);
         eprintln!("LigeritoProof bincode size: {} bytes", bytes.len());
+    }
+
+    /// Full-prover control for the truncated final F^T group. This uses a
+    /// smaller domain whose sparse suffix still ends in fused layers 2,1,0;
+    /// a test-only policy selects candidate/control without weakening the
+    /// exact production gate.
+    #[test]
+    fn truncated_final_ntt_full_proof_and_claim_bytes_match_control() {
+        use crate::challenger::Challenger;
+
+        let log_n = 16;
+        let initial_k = 3;
+        let k_0 = 3;
+        let log_inv_rate = 1;
+        let log_msg_cols_0 = log_n - initial_k;
+        let mut rng = crate::challenger::RandomChallenger::new(0xF17E_BA5E);
+        let poly: Vec<F128> = (0..(1usize << log_n)).map(|_| rng.sample_f128()).collect();
+        let point: Vec<F128> = (0..log_n).map(|_| rng.sample_f128()).collect();
+        let basis = build_eq_table(&point);
+        let target = poly
+            .iter()
+            .zip(basis.iter())
+            .map(|(&f, &b)| f * b)
+            .fold(F128::ZERO, |acc, value| acc + value);
+
+        let log_inv_rates = vec![log_inv_rate, log_inv_rate];
+        let queries = vec![218, 106];
+        let cfg = ProverConfig {
+            log_inv_rates: log_inv_rates.clone(),
+            recursive_steps: 1,
+            initial_log_msg_cols: log_msg_cols_0,
+            initial_log_num_interleaved: initial_k,
+            initial_k,
+            recursive_log_msg_cols: vec![log_msg_cols_0 - k_0],
+            recursive_ks: vec![k_0],
+            queries: queries.clone(),
+            grinding_bits: vec![0; log_inv_rates.len()],
+            fold_grinding_bits: vec![0; 2],
+            ood_samples: vec![0; 2],
+            merkle_hash: HashKind::Sha256,
+        };
+        let verifier_cfg = VerifierConfig {
+            log_inv_rates: log_inv_rates.clone(),
+            recursive_steps: 1,
+            initial_log_msg_cols: log_msg_cols_0,
+            initial_log_num_interleaved: initial_k,
+            initial_k,
+            recursive_log_msg_cols: vec![log_msg_cols_0 - k_0],
+            recursive_ks: vec![k_0],
+            queries,
+            grinding_bits: vec![0; log_inv_rates.len()],
+            fold_grinding_bits: vec![0; 2],
+            ood_samples: vec![0; 2],
+            merkle_hash: HashKind::Sha256,
+        };
+
+        let ntt_0 = AdditiveNttF128::standard(log_msg_cols_0 + log_inv_rate);
+        let wtns_0 = ligero_commit(
+            &poly,
+            log_msg_cols_0,
+            initial_k,
+            log_inv_rate,
+            &ntt_0,
+            HashKind::Sha256,
+        );
+        let initial_root = wtns_0.root();
+
+        let prove = |truncate_final_group: bool| {
+            with_truncated_final_ntt_override(truncate_final_group, || {
+                TEST_TRUNCATED_FINAL_NTT_HITS.with(|hits| hits.set(0));
+                assert_eq!(
+                    use_ranked_induce_truncated_final_ntt(
+                        log_msg_cols_0,
+                        log_inv_rate,
+                        initial_k,
+                        218,
+                        8,
+                    ),
+                    truncate_final_group,
+                );
+                let mut challenger =
+                    crate::challenger::FsChallenger::new(b"truncated-final-ntt-proof-oracle");
+                let proof = recursive_prover_with_basis(
+                    &cfg,
+                    poly.clone(),
+                    basis.clone(),
+                    target,
+                    &wtns_0.mat,
+                    &wtns_0.tree,
+                    &mut challenger,
+                );
+                let hits = TEST_TRUNCATED_FINAL_NTT_HITS.with(|hits| hits.get());
+                (proof, hits)
+            })
+        };
+
+        let (control, control_hits) = prove(false);
+        let (truncated, truncated_hits) = prove(true);
+        assert_eq!(control_hits, 0);
+        assert_eq!(truncated_hits, 1);
+        assert_eq!(truncated, control);
+        assert_eq!(
+            bincode::serialize(&(&truncated, target)).expect("serialize truncated proof/claim"),
+            bincode::serialize(&(&control, target)).expect("serialize control proof/claim"),
+        );
+
+        let mut verifier_challenger =
+            crate::challenger::FsChallenger::new(b"truncated-final-ntt-proof-oracle");
+        assert!(recursive_verifier_with_basis(
+            &verifier_cfg,
+            &truncated,
+            &basis,
+            target,
+            &initial_root,
+            &mut verifier_challenger,
+        ));
     }
 
     /// `recursive_prover_with_basis` + `recursive_verifier_with_basis`
