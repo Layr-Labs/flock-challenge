@@ -1928,10 +1928,48 @@ impl Blake3Setup {
         let (proof, commitment, claim) = self.prove_fast_inner(blocks, challenger);
         if call == 0 {
             let (proof, commitment) = warm_publish_path(proof, commitment);
+            self.release_surplus_ranked_codeword_scratch();
             return (proof, commitment, claim);
         }
         (proof, commitment, claim)
     }
+
+    /// The m=32 warm proof needs two exact 1 GiB F128 buffers concurrently:
+    /// the CPU reference codeword used to decide the GPU latch and Zerocheck's
+    /// large scratch. Once exact warmup latches Metal on, the lazy timed path
+    /// omits that CPU codeword and needs exactly one buffer (confirmed by an
+    /// allocation-callsite trace, with zero timed fresh F128 allocations).
+    ///
+    /// Run only after warm proof serialization, remove only one exact
+    /// codeword-size surplus while retaining one resident peer, and bypass the
+    /// recycling global allocator so the dead 1 GiB actually reaches
+    /// libmalloc. Every gate mirrors the lazy ranked from-message path.
+    #[cfg(all(target_os = "macos", not(test)))]
+    fn release_surplus_ranked_codeword_scratch(&self) {
+        const ENV_NO_POST_LATCH_SCRATCH_TRIM: &str = "FLOCK_NO_POST_LATCH_SCRATCH_TRIM";
+        const ENV_SCRATCH_TRIM_DEBUG: &str = "FLOCK_SCRATCH_TRIM_DEBUG";
+        if std::env::var_os(ENV_NO_POST_LATCH_SCRATCH_TRIM).is_some()
+            || !self.use_ranked_rate2_hot_codeword()
+            || !flock_core::pcs::use_ranked_from_message_commit(&self.pcs_params)
+            || !flock_core::pcs::ranked_gpu_commit_latched_on()
+        {
+            return;
+        }
+        let codeword_len = self.pcs_params.codeword_len_f128();
+        if let Some(dead) = flock_core::scratch::take_surplus_exact_f128(codeword_len, 1) {
+            debug_assert_eq!(dead.capacity(), codeword_len);
+            if std::env::var_os(ENV_SCRATCH_TRIM_DEBUG).is_some() {
+                eprintln!(
+                    "[scratch-trim] releasing one {}-byte post-latch surplus",
+                    codeword_len * core::mem::size_of::<F128>()
+                );
+            }
+            crate::recycle_alloc::release_f128_to_system(dead);
+        }
+    }
+
+    #[cfg(not(all(target_os = "macos", not(test))))]
+    fn release_surplus_ranked_codeword_scratch(&self) {}
 
     fn prove_fast_inner<Ch: Challenger>(
         &self,
@@ -1948,7 +1986,15 @@ impl Blake3Setup {
             // `FLOCK_NO_NTT_FROM_MSG=1` restores the hot-codeword replicate
             // path below as the exact A/B control.
             if flock_core::pcs::use_ranked_from_message_commit(&self.pcs_params) {
-                let codeword = flock_core::scratch::take_f128(self.pcs_params.codeword_len_f128());
+                // Persistent Metal staging makes this 1 GiB CPU fallback dead
+                // after warmup; GPU failures allocate it lazily in commit.
+                let codeword = if flock_core::pcs::ranked_gpu_commit_latched_on() {
+                    None
+                } else {
+                    Some(flock_core::scratch::take_f128(
+                        self.pcs_params.codeword_len_f128(),
+                    ))
+                };
                 let cpu_wit = phase_timing.then(crate::prover::process_cpu_ms);
                 let t_wit = std::time::Instant::now();
                 let (z_packed, a_packed_f128, b_packed_f128, z_packed_lincheck) =
@@ -1970,7 +2016,7 @@ impl Blake3Setup {
                     b_packed_f128,
                     z_packed_lincheck,
                     lc_circuit,
-                    Some(codeword),
+                    codeword,
                     challenger,
                 );
             }

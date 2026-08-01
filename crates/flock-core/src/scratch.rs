@@ -78,6 +78,31 @@ pub(crate) fn try_take_f128(n: usize) -> Option<Vec<F128>> {
     None
 }
 
+/// Remove one exact-capacity surplus buffer while retaining at least
+/// `retain` peers of the same class. This is a narrow ownership seam for the
+/// ranked worker's post-warmup memory trim: the caller decides how to release
+/// the returned allocation because the final binary's global allocator owns
+/// that policy.
+///
+/// No larger buffer is substituted and the last `retain` exact buffers are
+/// never removed. Contents and current length are irrelevant; ownership of
+/// the allocation transfers to the caller.
+pub fn take_surplus_exact_f128(n: usize, retain: usize) -> Option<Vec<F128>> {
+    let mut pool = POOL.lock().unwrap();
+    let mut seen = 0usize;
+    let mut candidate = None;
+    for (i, v) in pool.iter().enumerate() {
+        if v.capacity() == n {
+            seen += 1;
+            candidate = Some(i);
+        }
+    }
+    if seen <= retain {
+        return None;
+    }
+    Some(pool.swap_remove(candidate.expect("surplus exact buffer exists")))
+}
+
 /// Return a buffer to the pool for reuse. When the pool is full, the
 /// smallest-capacity buffer is evicted (large buffers are the expensive ones
 /// to re-fault; a run that ramps problem sizes upward must not get its big
@@ -360,6 +385,27 @@ mod tests {
         let recycled = take_f128(64);
         assert_eq!(recycled.as_ptr(), ptr);
         give_f128(recycled);
+        clear();
+    }
+
+    #[test]
+    fn surplus_exact_take_preserves_requested_reserve_and_other_classes() {
+        clear();
+        give_f128(vec![F128::ZERO; 8]);
+        give_f128(vec![F128::ZERO; 16]);
+        give_f128(vec![F128::ZERO; 16]);
+        give_f128(vec![F128::ZERO; 32]);
+
+        let released = take_surplus_exact_f128(16, 1).expect("one exact surplus");
+        assert_eq!(released.capacity(), 16);
+        assert!(take_surplus_exact_f128(16, 1).is_none());
+
+        let pool = POOL.lock().unwrap();
+        assert_eq!(pool.iter().filter(|v| v.capacity() == 8).count(), 1);
+        assert_eq!(pool.iter().filter(|v| v.capacity() == 16).count(), 1);
+        assert_eq!(pool.iter().filter(|v| v.capacity() == 32).count(), 1);
+        drop(pool);
+        drop(released);
         clear();
     }
 }
