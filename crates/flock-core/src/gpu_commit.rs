@@ -52,6 +52,41 @@ pub const ENV_NO_NTT_PASS_TUNE: &str = "FLOCK_NO_NTT_PASS_TUNE";
 /// incumbent h8 kernel as a same-binary control.
 pub const ENV_NO_GPU_MIXED_FINAL: &str = "FLOCK_NO_GPU_MIXED_FINAL";
 
+/// Strict kill switch for the fused three-level GPU Merkle parent pass. Only
+/// exact value `1` disables it; the optimization remains ranked-tree-only.
+pub const ENV_NO_GPU_PARENT3: &str = "FLOCK_NO_GPU_PARENT3";
+
+fn gpu_parent3_value_enabled(value: Option<&std::ffi::OsStr>) -> bool {
+    value != Some(std::ffi::OsStr::new("1"))
+}
+
+fn gpu_parent3_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        gpu_parent3_value_enabled(std::env::var_os(ENV_NO_GPU_PARENT3).as_deref())
+    })
+}
+
+fn select_gpu_parent3(n_leaves_total: usize, enabled: bool) -> bool {
+    enabled && n_leaves_total == 1usize << 20
+}
+
+#[cfg(test)]
+mod parent3_gate_tests {
+    use std::ffi::OsStr;
+
+    #[test]
+    fn default_on_exact_kill_switch_and_ranked_tree_only() {
+        assert!(!super::gpu_parent3_value_enabled(Some(OsStr::new("1"))));
+        for value in [None, Some(""), Some("0"), Some("01"), Some("true")] {
+            assert!(super::gpu_parent3_value_enabled(value.map(OsStr::new)));
+        }
+        assert!(super::select_gpu_parent3(1 << 20, true));
+        assert!(!super::select_gpu_parent3(1 << 20, false));
+        assert!(!super::select_gpu_parent3(1 << 19, true));
+    }
+}
+
 /// Latched once: pass tuning enabled unless the kill switch is set.
 pub(crate) fn pass_tune_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -1236,6 +1271,69 @@ kernel void parent_hash(device const uint* children [[buffer(0)]],
     for (int i = 0; i < 8; i++) parents[id * 8u + i] = cv[i];
 }
 
+// Three adjacent parent levels in one dispatch. A 128-thread group consumes
+// 256 children, emits 128 / 64 / 32 parents into their ordinary flat-tree
+// levels, and keeps the two intermediate read sets in 6 KiB of threadgroup
+// memory. Every active phase is a whole number of 32-lane SIMD groups, so the
+// fusion deletes two global read passes without a partially active SIMDgroup.
+kernel void parent_hash3(device const uint* children [[buffer(0)]],
+                         device uint* parents1      [[buffer(1)]],
+                         device uint* parents2      [[buffer(2)]],
+                         device uint* parents3      [[buffer(3)]],
+                         uint tgid [[threadgroup_position_in_grid]],
+                         uint lid [[thread_index_in_threadgroup]])
+{
+    threadgroup uint level1[128u * 8u];
+    threadgroup uint level2[64u * 8u];
+
+    // Level 1: all 128 threads consume one pair of global children.
+    {
+        uint block[16];
+        const uint id = tgid * 128u + lid;
+        for (uint i = 0u; i < 16u; i++) block[i] = children[id * 16u + i];
+        uint cv[8];
+        for (uint i = 0u; i < 8u; i++) cv[i] = B3_IV[i];
+        b3_compress(cv, block, 64u, B3_PARENT);
+        for (uint i = 0u; i < 8u; i++) {
+            parents1[id * 8u + i] = cv[i];
+            level1[lid * 8u + i] = cv[i];
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Level 2: exactly two complete SIMD groups consume level1 locally.
+    if (lid < 64u) {
+        uint block[16];
+        for (uint i = 0u; i < 8u; i++) {
+            block[i] = level1[(2u * lid) * 8u + i];
+            block[8u + i] = level1[(2u * lid + 1u) * 8u + i];
+        }
+        uint cv[8];
+        for (uint i = 0u; i < 8u; i++) cv[i] = B3_IV[i];
+        b3_compress(cv, block, 64u, B3_PARENT);
+        const uint id = tgid * 64u + lid;
+        for (uint i = 0u; i < 8u; i++) {
+            parents2[id * 8u + i] = cv[i];
+            level2[lid * 8u + i] = cv[i];
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Level 3: one complete SIMD group consumes level2 locally.
+    if (lid < 32u) {
+        uint block[16];
+        for (uint i = 0u; i < 8u; i++) {
+            block[i] = level2[(2u * lid) * 8u + i];
+            block[8u + i] = level2[(2u * lid + 1u) * 8u + i];
+        }
+        uint cv[8];
+        for (uint i = 0u; i < 8u; i++) cv[i] = B3_IV[i];
+        b3_compress(cv, block, 64u, B3_PARENT);
+        const uint id = tgid * 32u + lid;
+        for (uint i = 0u; i < 8u; i++) parents3[id * 8u + i] = cv[i];
+    }
+}
+
 "#;
 
     // -----------------------------------------------------------------------
@@ -1258,6 +1356,7 @@ kernel void parent_hash(device const uint* children [[buffer(0)]],
         pub(crate) pso_ntt5mix: Id,
         pub(crate) pso_leaf: Id,
         pub(crate) pso_parent: Id,
+        pub(crate) pso_parent3: Id,
     }
     // SAFETY: MTLDevice/MTLCommandQueue/MTLComputePipelineState are
     // documented thread-safe; command buffers/encoders are created and used
@@ -1359,6 +1458,7 @@ kernel void parent_hash(device const uint* children [[buffer(0)]],
                 let pso_ntt5mix = pso("ntt_pass5_mixed")?;
                 let pso_leaf = pso("leaf_hash")?;
                 let pso_parent = pso("parent_hash")?;
+                let pso_parent3 = pso("parent_hash3")?;
                 send!(api, unsafe extern "C" fn(Id, Sel) -> Id, library, c"release");
                 Ok(Gpu {
                     api,
@@ -1374,6 +1474,7 @@ kernel void parent_hash(device const uint* children [[buffer(0)]],
                     pso_ntt5mix,
                     pso_leaf,
                     pso_parent,
+                    pso_parent3,
                 })
             })();
             pool_pop(pool);
@@ -1779,6 +1880,30 @@ kernel void parent_hash(device const uint* children [[buffer(0)]],
         leaf_start: usize,
         subtree_leaves: usize,
     ) {
+        unsafe {
+            encode_merkle_subtree_impl(
+                gpu,
+                enc,
+                codeword_buf,
+                tree_buf,
+                n_leaves_total,
+                leaf_start,
+                subtree_leaves,
+                super::select_gpu_parent3(n_leaves_total, super::gpu_parent3_enabled()),
+            )
+        }
+    }
+
+    pub(crate) unsafe fn encode_merkle_subtree_impl(
+        gpu: &Gpu,
+        enc: Id,
+        codeword_buf: Id,
+        tree_buf: Id,
+        n_leaves_total: usize,
+        leaf_start: usize,
+        subtree_leaves: usize,
+        parent3: bool,
+    ) {
         debug_assert!(subtree_leaves.is_power_of_two());
         debug_assert_eq!(leaf_start % subtree_leaves, 0);
         unsafe {
@@ -1788,11 +1913,43 @@ kernel void parent_hash(device const uint* children [[buffer(0)]],
             let tpg = 256u64.min(subtree_leaves as u64);
             gpu.dispatch(enc, subtree_leaves as u64 / tpg, tpg);
 
-            gpu.set_pipeline(enc, gpu.pso_parent);
             let mut level_start = 0usize; // global node index of level base
             let mut level_len = n_leaves_total;
             let mut local_start = leaf_start;
             let mut local_len = subtree_leaves;
+
+            // Consume three parent levels per dispatch while all three local
+            // ranges contain whole 256-child groups. Each output retains its
+            // ordinary global flat-tree slot, so opening is unchanged.
+            if parent3 {
+                gpu.set_pipeline(enc, gpu.pso_parent3);
+                while local_len >= 256 {
+                    let level1_start = level_start + level_len;
+                    let level1_len = level_len / 2;
+                    let local1_start = local_start / 2;
+                    let local1_len = local_len / 2;
+                    let level2_start = level1_start + level1_len;
+                    let level2_len = level1_len / 2;
+                    let local2_start = local1_start / 2;
+                    let local2_len = local1_len / 2;
+                    let level3_start = level2_start + level2_len;
+                    let level3_len = level2_len / 2;
+                    let local3_start = local2_start / 2;
+                    let local3_len = local2_len / 2;
+                    debug_assert_eq!(local_len % 256, 0);
+                    gpu.set_buffer(enc, tree_buf, (level_start + local_start) * 32, 0);
+                    gpu.set_buffer(enc, tree_buf, (level1_start + local1_start) * 32, 1);
+                    gpu.set_buffer(enc, tree_buf, (level2_start + local2_start) * 32, 2);
+                    gpu.set_buffer(enc, tree_buf, (level3_start + local3_start) * 32, 3);
+                    gpu.dispatch(enc, (local_len / 256) as u64, 128);
+                    level_start = level3_start;
+                    level_len = level3_len;
+                    local_start = local3_start;
+                    local_len = local3_len;
+                }
+            }
+
+            gpu.set_pipeline(enc, gpu.pso_parent);
             while local_len > 1 {
                 let write_level_start = level_start + level_len;
                 let n_out = local_len / 2;
@@ -1823,15 +1980,56 @@ kernel void parent_hash(device const uint* children [[buffer(0)]],
         n_leaves: usize,
     ) {
         unsafe {
+            encode_merkle_impl(
+                gpu,
+                enc,
+                codeword_buf,
+                tree_buf,
+                n_leaves,
+                super::select_gpu_parent3(n_leaves, super::gpu_parent3_enabled()),
+            )
+        }
+    }
+
+    pub(crate) unsafe fn encode_merkle_impl(
+        gpu: &Gpu,
+        enc: Id,
+        codeword_buf: Id,
+        tree_buf: Id,
+        n_leaves: usize,
+        parent3: bool,
+    ) {
+        unsafe {
             gpu.set_pipeline(enc, gpu.pso_leaf);
             gpu.set_buffer(enc, codeword_buf, 0, 0);
             gpu.set_buffer(enc, tree_buf, 0, 1);
             let tpg = 256u64.min(n_leaves as u64);
             gpu.dispatch(enc, n_leaves as u64 / tpg, tpg);
 
-            gpu.set_pipeline(enc, gpu.pso_parent);
             let mut read_start = 0usize; // node index
             let mut read_len = n_leaves;
+
+            if parent3 {
+                gpu.set_pipeline(enc, gpu.pso_parent3);
+                while read_len >= 256 {
+                    let write1_start = read_start + read_len;
+                    let write1_len = read_len / 2;
+                    let write2_start = write1_start + write1_len;
+                    let write2_len = write1_len / 2;
+                    let write3_start = write2_start + write2_len;
+                    let write3_len = write2_len / 2;
+                    debug_assert_eq!(read_len % 256, 0);
+                    gpu.set_buffer(enc, tree_buf, read_start * 32, 0);
+                    gpu.set_buffer(enc, tree_buf, write1_start * 32, 1);
+                    gpu.set_buffer(enc, tree_buf, write2_start * 32, 2);
+                    gpu.set_buffer(enc, tree_buf, write3_start * 32, 3);
+                    gpu.dispatch(enc, (read_len / 256) as u64, 128);
+                    read_start = write3_start;
+                    read_len = write3_len;
+                }
+            }
+
+            gpu.set_pipeline(enc, gpu.pso_parent);
             while read_len > 1 {
                 let write_start = read_start + read_len;
                 let n_out = read_len / 2;
@@ -4144,6 +4342,142 @@ mod tests {
                 crate::merkle::merkle_tree(&data, n_leaves, crate::merkle::HashKind::Blake3);
             assert_eq!(got, expect, "GPU Merkle mismatch at n_leaves={n_leaves}");
         }
+    }
+
+    /// Compact real-Metal oracle for the three-level parent pass. It forces
+    /// the experimental encoder independent of the ranked-only env selector
+    /// and compares every flat-tree node with the CPU implementation.
+    #[test]
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    fn gpu_parent3_full_tree_matches_cpu_compact() {
+        use super::imp;
+
+        let n_leaves = 1usize << 12;
+        let mut rng = Rng::new(0xB3_3000_12);
+        let data: Vec<u8> = (0..n_leaves * 1024)
+            .map(|_| (rng.next_u64() & 0xff) as u8)
+            .collect();
+        let expect =
+            crate::merkle::merkle_tree(&data, n_leaves, crate::merkle::HashKind::Blake3);
+        let gpu = match gpu_or_skip(imp::gpu().map(|g| g as *const imp::Gpu)) {
+            Some(g) => unsafe { &*g },
+            None => return,
+        };
+
+        unsafe {
+            let pool = gpu.pool_push();
+            let data_buf = gpu.new_buffer(data.len()).unwrap();
+            let tree_bytes = expect.len() * core::mem::size_of::<crate::merkle::Hash>();
+            let tree_buf = gpu.new_buffer(tree_bytes).unwrap();
+            std::ptr::copy_nonoverlapping(
+                data.as_ptr(),
+                gpu.buffer_contents(data_buf),
+                data.len(),
+            );
+            let cb = gpu.command_buffer().unwrap();
+            let enc = gpu.compute_encoder(cb).unwrap();
+            imp::encode_merkle_impl(gpu, enc, data_buf, tree_buf, n_leaves, true);
+            gpu.end_encoding(enc);
+            gpu.commit_and_wait(cb).unwrap();
+            let got = core::slice::from_raw_parts(
+                gpu.buffer_contents(tree_buf).cast::<crate::merkle::Hash>(),
+                expect.len(),
+            );
+            assert_eq!(got, expect.as_slice());
+            gpu.release(data_buf);
+            gpu.release(tree_buf);
+            gpu.pool_pop(pool);
+        }
+    }
+
+    /// The hybrid GPU prefix hashes aligned subtrees into global flat-tree
+    /// slots. Verify the fused pass writes every owned node at every level and
+    /// leaves the concurrent CPU owner's ranges untouched.
+    #[test]
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    fn gpu_parent3_subtree_layout_matches_cpu_compact() {
+        use super::imp;
+
+        const N_LEAVES: usize = 1 << 10;
+        const LEAF_START: usize = 1 << 9;
+        const SUBTREE_LEAVES: usize = 1 << 9;
+        const SENTINEL: crate::merkle::Hash = [0xA5; 32];
+        let mut rng = Rng::new(0xB3_3000_10);
+        let data: Vec<u8> = (0..N_LEAVES * 1024)
+            .map(|_| (rng.next_u64() & 0xff) as u8)
+            .collect();
+        let expect =
+            crate::merkle::merkle_tree(&data, N_LEAVES, crate::merkle::HashKind::Blake3);
+        let mut initial = vec![SENTINEL; expect.len()];
+        let gpu = match gpu_or_skip(imp::gpu().map(|g| g as *const imp::Gpu)) {
+            Some(g) => unsafe { &*g },
+            None => return,
+        };
+
+        unsafe {
+            let pool = gpu.pool_push();
+            let data_buf = gpu.new_buffer(data.len()).unwrap();
+            let tree_bytes = core::mem::size_of_val(initial.as_slice());
+            let tree_buf = gpu.new_buffer(tree_bytes).unwrap();
+            std::ptr::copy_nonoverlapping(
+                data.as_ptr(),
+                gpu.buffer_contents(data_buf),
+                data.len(),
+            );
+            std::ptr::copy_nonoverlapping(
+                initial.as_ptr().cast::<u8>(),
+                gpu.buffer_contents(tree_buf),
+                tree_bytes,
+            );
+            let cb = gpu.command_buffer().unwrap();
+            let enc = gpu.compute_encoder(cb).unwrap();
+            imp::encode_merkle_subtree_impl(
+                gpu,
+                enc,
+                data_buf,
+                tree_buf,
+                N_LEAVES,
+                LEAF_START,
+                SUBTREE_LEAVES,
+                true,
+            );
+            gpu.end_encoding(enc);
+            gpu.commit_and_wait(cb).unwrap();
+            std::ptr::copy_nonoverlapping(
+                gpu.buffer_contents(tree_buf).cast::<crate::merkle::Hash>(),
+                initial.as_mut_ptr(),
+                initial.len(),
+            );
+            gpu.release(data_buf);
+            gpu.release(tree_buf);
+            gpu.pool_pop(pool);
+        }
+
+        let mut affected = vec![false; initial.len()];
+        let mut level_start = 0usize;
+        let mut level_len = N_LEAVES;
+        let mut local_start = LEAF_START;
+        let mut local_len = SUBTREE_LEAVES;
+        loop {
+            let start = level_start + local_start;
+            let end = start + local_len;
+            assert_eq!(&initial[start..end], &expect[start..end]);
+            affected[start..end].fill(true);
+            if local_len == 1 {
+                break;
+            }
+            level_start += level_len;
+            level_len >>= 1;
+            local_start >>= 1;
+            local_len >>= 1;
+        }
+        assert!(
+            initial
+                .iter()
+                .zip(affected)
+                .all(|(node, touched)| touched || *node == SENTINEL),
+            "parent3 subtree encoder wrote outside its owned flat-tree ranges",
+        );
     }
 
     #[test]
