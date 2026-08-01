@@ -4364,8 +4364,13 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
     let fold4_round1 = direct_fold4_mode.then_some(round1_lookahead).flatten();
     let fold4_round2 = direct_fold4_mode.then_some(round2_lookahead).flatten();
     let fold4_round3 = direct_fold4_mode.then_some(round3_lookahead).flatten();
-    let mut fold4_challenges = Vec::with_capacity(3);
-    let mut fold4_initial_msgs = Vec::with_capacity(3);
+    let mut fold4_challenges = [F128::ZERO; 3];
+    let zero_msg = SumcheckMessage {
+        u_0: F128::ZERO,
+        u_2: F128::ZERO,
+    };
+    let mut fold4_initial_msgs = [zero_msg; 3];
+    let mut fold4_len = 0usize;
     let mut deferred_challenge = None;
     let mut deferred_msg = None;
     for j in 0..initial_k {
@@ -4387,7 +4392,7 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
         let r = challenger.sample_f128();
         let _tf = std::time::Instant::now();
         let msg = if direct_fold4.is_some() {
-            match fold4_challenges.len() {
+            match fold4_len {
                 0 => {
                     let msg = eval_lookahead(
                         fold4_round1
@@ -4395,8 +4400,9 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
                             .expect("direct-fold4 round-1 lookahead"),
                         r,
                     );
-                    fold4_challenges.push(r);
-                    fold4_initial_msgs.push(msg);
+                    fold4_challenges[0] = r;
+                    fold4_initial_msgs[0] = msg;
+                    fold4_len = 1;
                     msg
                 }
                 1 => {
@@ -4407,8 +4413,9 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
                         fold4_challenges[0],
                         r,
                     );
-                    fold4_challenges.push(r);
-                    fold4_initial_msgs.push(msg);
+                    fold4_challenges[1] = r;
+                    fold4_initial_msgs[1] = msg;
+                    fold4_len = 2;
                     msg
                 }
                 2 => {
@@ -4420,8 +4427,9 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
                         fold4_challenges[1],
                         r,
                     );
-                    fold4_challenges.push(r);
-                    fold4_initial_msgs.push(msg);
+                    fold4_challenges[2] = r;
+                    fold4_initial_msgs[2] = msg;
+                    fold4_len = 3;
                     msg
                 }
                 3 => {
@@ -4448,8 +4456,7 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
                             msg,
                         ],
                     ));
-                    fold4_challenges.clear();
-                    fold4_initial_msgs.clear();
+                    fold4_len = 0;
                     fold2_lookahead = Some(next_lookahead);
                     msg
                 }
@@ -4508,7 +4515,7 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
         deferred_challenge.is_none(),
         "ranked initial_k must be even"
     );
-    debug_assert!(fold4_challenges.is_empty(), "direct-fold4 must materialize");
+    debug_assert_eq!(fold4_len, 0, "direct-fold4 must materialize");
     let mut sc_prover = sc_prover.expect("initial direct mode must materialize");
     if trace {
         t_init_sumcheck += _t.elapsed();
