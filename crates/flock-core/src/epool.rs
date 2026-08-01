@@ -295,6 +295,21 @@ pub(crate) fn run_chunks_with_helper_stateful<S, I, F>(
     I: Fn() -> S + Sync,
     F: Fn(&mut S, usize) + Sync,
 {
+    run_chunks_with_helper_stateful_capped(n_chunks, init, f, helper, usize::MAX);
+}
+
+/// Stateful two-pool queue with an explicit upper bound on participating
+/// helper workers. Main-pool width and queue ownership are unchanged.
+pub(crate) fn run_chunks_with_helper_stateful_capped<S, I, F>(
+    n_chunks: usize,
+    init: &I,
+    f: &F,
+    helper: Option<&rayon::ThreadPool>,
+    max_helper_workers: usize,
+) where
+    I: Fn() -> S + Sync,
+    F: Fn(&mut S, usize) + Sync,
+{
     if n_chunks == 0 {
         return;
     }
@@ -326,7 +341,10 @@ pub(crate) fn run_chunks_with_helper_stateful<S, I, F>(
     match helper.filter(|_| n_chunks >= EPOOL_MIN_CHUNKS) {
         Some(ep) => std::thread::scope(|s| {
             s.spawn(|| {
-                ep.broadcast(|_| {
+                ep.broadcast(|context| {
+                    if context.index() >= max_helper_workers {
+                        return;
+                    }
                     let mut state = init();
                     loop {
                         let i = next.fetch_add(1, Ordering::Relaxed);
@@ -510,6 +528,36 @@ mod tests {
             uses[state.load(Ordering::Relaxed)] += 1;
         }
         assert!(uses.into_iter().any(|n_uses| n_uses > 1));
+    }
+
+    #[test]
+    fn stateful_helper_worker_cap_is_exact() {
+        let helper = rayon::ThreadPoolBuilder::new()
+            .num_threads(4)
+            .thread_name(|i| format!("cap-helper-{i}"))
+            .build()
+            .unwrap();
+        let helper_mask = AtomicUsize::new(0);
+        run_chunks_with_helper_stateful_capped(
+            1_000,
+            &|| (),
+            &|_, _| {
+                if let Some(name) = std::thread::current().name()
+                    && let Some(index) = name.strip_prefix("cap-helper-")
+                {
+                    helper_mask.fetch_or(
+                        1usize << index.parse::<usize>().unwrap(),
+                        Ordering::Relaxed,
+                    );
+                }
+                std::thread::sleep(std::time::Duration::from_micros(10));
+            },
+            Some(&helper),
+            1,
+        );
+        let mask = helper_mask.load(Ordering::Relaxed);
+        assert_ne!(mask, 0, "the permitted helper must claim work");
+        assert_eq!(mask & !1, 0, "only helper worker zero may claim work");
     }
 
     /// The stateful single-thread path preserves strict chunk order and owns
