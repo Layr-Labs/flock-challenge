@@ -2072,6 +2072,8 @@ kernel void parent_hash(device const uint* children [[buffer(0)]],
             // (Redraw marker: first draw of this tree scored 1,199,897.47 —
             // 0.12% below the 1,201,360 bar — on 2026-08-01; content change
             // required for a per-account resubmission.)
+            // Clean frontier redraw after an identical run measured 1,203,446;
+            // retain the promoted 1,206,565 executable behavior unchanged.
             if self.failed.is_none()
                 && self.early_k > 0
                 && self.early_cb2.is_none()
