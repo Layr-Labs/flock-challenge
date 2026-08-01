@@ -870,6 +870,183 @@ pub(crate) unsafe fn fold_compact_chunk_neon_unchecked_8(
     }
 }
 
+/// Message-only sibling of [`fold_compact_chunk_neon_unchecked_8`]: identical
+/// reconstruction and message algebra, no table stores.
+///
+/// # Safety
+/// Same contract as [`fold_compact_chunk_neon_unchecked_8`] minus the output
+/// pointers: `scaled_table` points to an `8 × 256` F128 table, `anchors` to
+/// `4·lo_size` F128s, `deltas` to `32·lo_size` bytes, `eq_lo` to `lo_size`
+/// F128s.
+#[cfg(target_arch = "aarch64")]
+pub(crate) unsafe fn fold_compact_msg_chunk_neon_unchecked_8(
+    scaled_table: *const u8,
+    anchors: *const F128,
+    deltas: *const u8,
+    eq_lo: *const F128,
+    lo_size: usize,
+    degen: bool,
+) -> (F128, F128) {
+    use core::arch::aarch64::*;
+
+    unsafe {
+        let zero = vdupq_n_u64(0);
+        let mut p1_acc = WideNeon { lo: zero, hi: zero };
+        let mut pinf_acc = WideNeon { lo: zero, hi: zero };
+
+        let one_q = core::mem::transmute::<F128, uint64x2_t>(F128::ONE);
+
+        for x_lo in 0..lo_size {
+            let out = 2 * x_lo;
+            let delta = deltas.add(out * 16);
+            let a0_code = u64::from_le(core::ptr::read_unaligned(delta.cast::<u64>()));
+            let b0_code = u64::from_le(core::ptr::read_unaligned(delta.add(8).cast::<u64>()));
+            let a1_code = u64::from_le(core::ptr::read_unaligned(delta.add(16).cast::<u64>()));
+            let b1_code = u64::from_le(core::ptr::read_unaligned(delta.add(24).cast::<u64>()));
+
+            if degen && (b0_code | b1_code) == 0 {
+                let (a0_delta, a1_delta) = fold_two_row_codes_q(scaled_table, a0_code, a1_code);
+                let a0 = veorq_u64(vld1q_u64(anchors.add(2 * out).cast::<u64>()), a0_delta);
+                let a1 = veorq_u64(vld1q_u64(anchors.add(2 * (out + 1)).cast::<u64>()), a1_delta);
+                let b0 = vld1q_u64(anchors.add(2 * out + 1).cast::<u64>());
+                let b1 = vld1q_u64(anchors.add(2 * (out + 1) + 1).cast::<u64>());
+
+                let eq_l = vld1q_u64(eq_lo.add(x_lo).cast::<u64>());
+                let g1 = if is_zero_q(veorq_u64(b1, one_q)) {
+                    a1
+                } else {
+                    mul_q(a1, b1)
+                };
+                wide_xor(&mut p1_acc, mul_unreduced_q(eq_l, g1));
+                let b_sum = veorq_u64(b0, b1);
+                if !is_zero_q(b_sum) {
+                    let g_inf = mul_q(veorq_u64(a0, a1), b_sum);
+                    wide_xor(&mut pinf_acc, mul_unreduced_q(eq_l, g_inf));
+                }
+                continue;
+            }
+
+            let (a0_delta, a1_delta, b0_delta, b1_delta) =
+                fold_four_row_codes_q(scaled_table, a0_code, a1_code, b0_code, b1_code);
+            let a0 = veorq_u64(vld1q_u64(anchors.add(2 * out).cast::<u64>()), a0_delta);
+            let a1 = veorq_u64(vld1q_u64(anchors.add(2 * (out + 1)).cast::<u64>()), a1_delta);
+            let b0 = veorq_u64(vld1q_u64(anchors.add(2 * out + 1).cast::<u64>()), b0_delta);
+            let b1 = veorq_u64(vld1q_u64(anchors.add(2 * (out + 1) + 1).cast::<u64>()), b1_delta);
+
+            let g1 = mul_q(a1, b1);
+            let g_inf = mul_q(veorq_u64(a0, a1), veorq_u64(b0, b1));
+            let eq_l = vld1q_u64(eq_lo.add(x_lo).cast::<u64>());
+            wide_xor(&mut p1_acc, mul_unreduced_q(eq_l, g1));
+            wide_xor(&mut pinf_acc, mul_unreduced_q(eq_l, g_inf));
+        }
+
+        (
+            core::mem::transmute::<uint64x2_t, F128>(reduce_wide_q(p1_acc)),
+            core::mem::transmute::<uint64x2_t, F128>(reduce_wide_q(pinf_acc)),
+        )
+    }
+}
+
+/// Two-challenge deferred-materialization chunk: reconstructs four adjacent
+/// compact rows through the caller's `rho1`-scaled table (`v_j = anchor_j +
+/// T(delta_j)`), binds `rho2` with one product per output (`out = v_0 +
+/// rho2·(v_0 + v_1)`), stores the two folded outputs per side, and
+/// accumulates the following round's message pair. Same 32 KiB table
+/// footprint as the incumbent reconstruction.
+///
+/// # Safety
+/// `scaled_table` points to an `8 × 256` F128 table; `anchors` to
+/// `8·lo_size` F128s; `deltas` to `64·lo_size` bytes; `a_out`/`b_out` to
+/// `2·lo_size` F128s each, exclusively owned by this call; `eq_lo` to
+/// `lo_size` F128s.
+#[cfg(target_arch = "aarch64")]
+pub(crate) unsafe fn fold_compact2_chunk_neon_unchecked_8(
+    scaled_table: *const u8,
+    anchors: *const F128,
+    deltas: *const u8,
+    a_out: *mut F128,
+    b_out: *mut F128,
+    eq_lo: *const F128,
+    lo_size: usize,
+    rho2: F128,
+    degen: bool,
+) -> (F128, F128) {
+    use core::arch::aarch64::*;
+
+    #[inline(always)]
+    unsafe fn store_pair_nt(dst: *mut F128, x: uint64x2_t, y: uint64x2_t) {
+        unsafe {
+            core::arch::asm!(
+                "stnp {x:q}, {y:q}, [{dst}]",
+                dst = in(reg) dst,
+                x = in(vreg) x,
+                y = in(vreg) y,
+                options(nostack, preserves_flags),
+            );
+        }
+    }
+
+    unsafe {
+        let zero = vdupq_n_u64(0);
+        let mut p1_acc = WideNeon { lo: zero, hi: zero };
+        let mut pinf_acc = WideNeon { lo: zero, hi: zero };
+        let rho2_q = core::mem::transmute::<F128, uint64x2_t>(rho2);
+
+        for x_lo in 0..lo_size {
+            let delta = deltas.add(64 * x_lo);
+            let a0_code = u64::from_le(core::ptr::read_unaligned(delta.cast::<u64>()));
+            let b0_code = u64::from_le(core::ptr::read_unaligned(delta.add(8).cast::<u64>()));
+            let a1_code = u64::from_le(core::ptr::read_unaligned(delta.add(16).cast::<u64>()));
+            let b1_code = u64::from_le(core::ptr::read_unaligned(delta.add(24).cast::<u64>()));
+            let a2_code = u64::from_le(core::ptr::read_unaligned(delta.add(32).cast::<u64>()));
+            let b2_code = u64::from_le(core::ptr::read_unaligned(delta.add(40).cast::<u64>()));
+            let a3_code = u64::from_le(core::ptr::read_unaligned(delta.add(48).cast::<u64>()));
+            let b3_code = u64::from_le(core::ptr::read_unaligned(delta.add(56).cast::<u64>()));
+
+            let (da0, da1, da2, da3) =
+                fold_four_row_codes_q(scaled_table, a0_code, a1_code, a2_code, a3_code);
+
+            let anchor = |k: usize| vld1q_u64(anchors.add(8 * x_lo + k).cast::<u64>());
+            let va0 = veorq_u64(anchor(0), da0);
+            let va1 = veorq_u64(anchor(2), da1);
+            let va2 = veorq_u64(anchor(4), da2);
+            let va3 = veorq_u64(anchor(6), da3);
+
+            let (vb0, vb1, vb2, vb3) = if degen && (b0_code | b1_code | b2_code | b3_code) == 0 {
+                (anchor(1), anchor(3), anchor(5), anchor(7))
+            } else {
+                let (db0, db1, db2, db3) =
+                    fold_four_row_codes_q(scaled_table, b0_code, b1_code, b2_code, b3_code);
+                (
+                    veorq_u64(anchor(1), db0),
+                    veorq_u64(anchor(3), db1),
+                    veorq_u64(anchor(5), db2),
+                    veorq_u64(anchor(7), db3),
+                )
+            };
+
+            let out_a0 = veorq_u64(va0, mul_q(rho2_q, veorq_u64(va0, va1)));
+            let out_a1 = veorq_u64(va2, mul_q(rho2_q, veorq_u64(va2, va3)));
+            let out_b0 = veorq_u64(vb0, mul_q(rho2_q, veorq_u64(vb0, vb1)));
+            let out_b1 = veorq_u64(vb2, mul_q(rho2_q, veorq_u64(vb2, vb3)));
+
+            store_pair_nt(a_out.add(2 * x_lo), out_a0, out_a1);
+            store_pair_nt(b_out.add(2 * x_lo), out_b0, out_b1);
+
+            let g1 = mul_q(out_a1, out_b1);
+            let g_inf = mul_q(veorq_u64(out_a0, out_a1), veorq_u64(out_b0, out_b1));
+            let eq_l = vld1q_u64(eq_lo.add(x_lo).cast::<u64>());
+            wide_xor(&mut p1_acc, mul_unreduced_q(eq_l, g1));
+            wide_xor(&mut pinf_acc, mul_unreduced_q(eq_l, g_inf));
+        }
+
+        (
+            core::mem::transmute::<uint64x2_t, F128>(reduce_wide_q(p1_acc)),
+            core::mem::transmute::<uint64x2_t, F128>(reduce_wide_q(pinf_acc)),
+        )
+    }
+}
+
 /// NEON one-row fold: 8 aligned 16-byte loads + 8 XORs, hand-unrolled for
 /// `n_chunks = 8` (the k_skip=6 protocol size). Returns the folded F128.
 ///

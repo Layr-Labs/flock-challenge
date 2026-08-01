@@ -27,9 +27,10 @@ pub mod univariate_skip_deg4_optimized;
 pub mod univariate_skip_optimized;
 
 use multilinear::{
-    UniSkipFoldTable, fold_and_compute_round_pair_into, fold_compact_and_compute_round_pair,
+    UniSkipFoldTable, compact_round_pair_message_only, fold_and_compute_round_pair_into,
+    fold_compact2_and_compute_round_pair, fold_compact_and_compute_round_pair,
     fold_in_place_pair, interpolate_at_z_combined, interpolate_at_z_on_lambda, round_pair_naive,
-    uni_skip_fold_and_round_pair_compact_padded_with_deltas,
+    uni_skip_fold_and_round_pair_compact_padded_with_deltas, zc_compact_defer2_enabled,
 };
 use univariate_skip_optimized::{
     c_s_f128, medium_challenges_ghash, round1_shift_reduce_extract_c_packed_padded,
@@ -605,13 +606,55 @@ fn prove_packed_padded_inner<C: Challenger>(
     // post-fold tables expected by all subsequent rounds.
     let mut first_r_next = vec![F128::ONE; n_mlv - 1];
     first_r_next[1..].copy_from_slice(&r[k_skip + 2..]);
-    let (mut a_mlv, mut b_mlv, first_m1, first_mi) =
-        fold_compact_and_compute_round_pair(&compact_mlv, &fold_table, mlv_rhos[0], &first_r_next);
-    compact_mlv.recycle();
-    multilinear_msgs.push((first_m1, first_mi));
-    challenger.observe_f128(first_m1);
-    challenger.observe_f128(first_mi);
-    mlv_rhos.push(challenger.sample_f128());
+    // Deferred round-3 materialization: compute the round-3 message straight
+    // from the compact representation, sample the next challenge, then
+    // materialize once at the round-4 size. Deletes the full-size round-3
+    // table write + reread; messages, challenges, and all later tables are
+    // bit-identical. `FLOCK_NO_ZC_COMPACT_DEFER2=1` restores the incumbent
+    // sequence. Gated to the large fused shapes (the small-tail rounds keep
+    // the incumbent path unconditionally).
+    let defer2 = n_mlv >= 4 && compact_mlv.len() >= (1 << 15) && zc_compact_defer2_enabled();
+    let (mut a_mlv, mut b_mlv, tail_start) = if defer2 {
+        let (first_m1, first_mi) = compact_round_pair_message_only(
+            &compact_mlv,
+            &fold_table,
+            mlv_rhos[0],
+            &first_r_next,
+        );
+        multilinear_msgs.push((first_m1, first_mi));
+        challenger.observe_f128(first_m1);
+        challenger.observe_f128(first_mi);
+        mlv_rhos.push(challenger.sample_f128());
+
+        let mut second_r_next = vec![F128::ONE; n_mlv - 2];
+        second_r_next[1..].copy_from_slice(&r[k_skip + 3..]);
+        let (a_mlv, b_mlv, second_m1, second_mi) = fold_compact2_and_compute_round_pair(
+            &compact_mlv,
+            &fold_table,
+            mlv_rhos[0],
+            mlv_rhos[1],
+            &second_r_next,
+        );
+        compact_mlv.recycle();
+        multilinear_msgs.push((second_m1, second_mi));
+        challenger.observe_f128(second_m1);
+        challenger.observe_f128(second_mi);
+        mlv_rhos.push(challenger.sample_f128());
+        (a_mlv, b_mlv, 2usize)
+    } else {
+        let (a_mlv, b_mlv, first_m1, first_mi) = fold_compact_and_compute_round_pair(
+            &compact_mlv,
+            &fold_table,
+            mlv_rhos[0],
+            &first_r_next,
+        );
+        compact_mlv.recycle();
+        multilinear_msgs.push((first_m1, first_mi));
+        challenger.observe_f128(first_m1);
+        challenger.observe_f128(first_mi);
+        mlv_rhos.push(challenger.sample_f128());
+        (a_mlv, b_mlv, 1usize)
+    };
 
     // Ping-pong scratch buffers for the remaining fused path: each fused round folds
     // (a_mlv, b_mlv) of size N into size N/2. Rather than allocating — and,
@@ -633,7 +676,7 @@ fn prove_packed_padded_inner<C: Challenger>(
     // (T3's hetero drain is already behind us, so the delta is loop-only).
     let hetero_trace = std::env::var_os("FLOCK_ZC_TAIL_HETERO_TRACE").is_some();
     let hetero_claimed_before = crate::epool::helper_chunks_claimed();
-    for i in 1..(n_mlv - 1) {
+    for i in tail_start..(n_mlv - 1) {
         let rho_prev = mlv_rhos[i];
         let log_n_before = a_mlv.len().trailing_zeros() as usize;
 
