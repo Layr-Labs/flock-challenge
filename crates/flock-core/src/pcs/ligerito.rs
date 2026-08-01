@@ -9447,4 +9447,5 @@ mod tests {
     }
 }
 // Redraw marker 4 (drift probe): zero-diff; prior draws 1,205,646 / 1,205,107 / 1,206,245.
-// RealAdii draw 1 on 1a6ad0e.
+// Redraw marker 5: zero-diff redraw of the promoted 1,245,446.54 stripe-C frontier (Akashneelesh draw A).
+// Redraw marker 6: zero-diff redraw of our promoted 1,248,189.98 draw (Akashneelesh draw B, cushion probe).
