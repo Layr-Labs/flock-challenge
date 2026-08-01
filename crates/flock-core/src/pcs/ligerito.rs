@@ -9448,3 +9448,4 @@ mod tests {
 }
 // Redraw marker 4 (drift probe): zero-diff; prior draws 1,205,646 / 1,205,107 / 1,206,245.
 // RealAdii draw 1 on 1a6ad0e.
+// Akashneelesh draw K: zero-diff of the live frontier; 5 prior same-content draws mean 1245086.70, spread .700%, bar 1250503.69225807 (+.400%).
