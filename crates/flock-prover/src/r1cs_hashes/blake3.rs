@@ -1619,7 +1619,7 @@ pub fn generate_witness_with_ab_packed_and_lincheck(
     Vec<flock_core::field::F128>,
     Vec<u8>,
 ) {
-    generate_witness_with_ab_packed_and_lincheck_impl(blocks, n_blocks_log, None)
+    generate_witness_with_ab_packed_and_lincheck_impl(blocks, n_blocks_log, None, false)
 }
 
 fn generate_witness_with_ab_packed_and_lincheck_rate2_codeword(
@@ -1632,13 +1632,19 @@ fn generate_witness_with_ab_packed_and_lincheck_rate2_codeword(
     Vec<flock_core::field::F128>,
     Vec<u8>,
 ) {
-    generate_witness_with_ab_packed_and_lincheck_impl(blocks, n_blocks_log, Some(codeword))
+    generate_witness_with_ab_packed_and_lincheck_impl(
+        blocks,
+        n_blocks_log,
+        Some(codeword),
+        false,
+    )
 }
 
 fn generate_witness_with_ab_packed_and_lincheck_impl(
     blocks: &[Compression],
     n_blocks_log: usize,
     rate2_codeword: Option<&mut [flock_core::field::F128]>,
+    use_hetero: bool,
 ) -> (
     Vec<flock_core::field::F128>,
     Vec<flock_core::field::F128>,
@@ -1672,14 +1678,20 @@ fn generate_witness_with_ab_packed_and_lincheck_impl(
                 per_block,
             )
         }
-        None => super::common::drive_witness_packed_and_lincheck_full_write(
-            blocks,
-            &padding,
-            n_blocks_log,
-            K_LOG,
-            stripe_useful_bits,
-            per_block,
-        ),
+        None => {
+            (if use_hetero {
+                super::common::drive_witness_packed_and_lincheck_full_write_hetero
+            } else {
+                super::common::drive_witness_packed_and_lincheck_full_write
+            })(
+                blocks,
+                &padding,
+                n_blocks_log,
+                K_LOG,
+                stripe_useful_bits,
+                per_block,
+            )
+        }
     }
 }
 
@@ -1723,11 +1735,31 @@ impl Blake3Setup {
         Vec<flock_core::field::F128>,
         Vec<u8>,
     ) {
+        self.generate_witness_ab_scheduled(blocks, self.use_ranked_witness_epool())
+    }
+
+    /// Shared production/test dispatch. Tests force `use_hetero` on a small
+    /// real BLAKE3 batch; production supplies the exact ranked gate above.
+    fn generate_witness_ab_scheduled(
+        &self,
+        blocks: &[Compression],
+        use_hetero: bool,
+    ) -> (
+        Vec<flock_core::field::F128>,
+        Vec<flock_core::field::F128>,
+        Vec<flock_core::field::F128>,
+        Vec<u8>,
+    ) {
         match self.r1cs.layout {
-            flock_core::r1cs::WitnessLayout::RowMajor => {
-                generate_witness_with_ab_packed_and_lincheck(blocks, self.n_blocks_log())
-            }
+            flock_core::r1cs::WitnessLayout::RowMajor =>
+                generate_witness_with_ab_packed_and_lincheck_impl(
+                    blocks,
+                    self.n_blocks_log(),
+                    None,
+                    use_hetero,
+                ),
             flock_core::r1cs::WitnessLayout::BatchMajor => {
+                debug_assert!(!use_hetero);
                 generate_witness_batch_major(blocks, self.n_blocks_log())
             }
         }
@@ -1750,6 +1782,18 @@ impl Blake3Setup {
             && self.pcs_params.profile == flock_core::pcs::ligerito::LigeritoProfile::Fast
             && self.pcs_params.merkle_hash == HashKind::Blake3
             && std::env::var_os("FLOCK_NO_HOT_CODEWORD").is_none()
+    }
+
+    /// Add bounded E-core claims only inside the exact ranked from-message
+    /// path. `FLOCK_NO_WITNESS_EPOOL=1` restores the incumbent Rayon driver in
+    /// the same binary without changing witness or lincheck bytes.
+    #[inline]
+    fn use_ranked_witness_epool(&self) -> bool {
+        self.use_ranked_rate2_hot_codeword()
+            && flock_core::pcs::use_ranked_from_message_commit(&self.pcs_params)
+            && flock_core::prover_support::helper_pool_available()
+            && rayon::current_num_threads() > 1
+            && std::env::var_os("FLOCK_NO_WITNESS_EPOOL").is_none()
     }
 
     /// Select the reverse transpose only for the promoted benchmark geometry.
@@ -2737,6 +2781,77 @@ mod tests {
                 "lincheck stripe mismatch at n_blocks={n_blocks}"
             );
         }
+    }
+
+    #[test]
+    fn ranked_no_codeword_dispatch_enters_epool_and_matches_incumbent_bytes() {
+        use std::sync::atomic::Ordering;
+
+        let _guard = crate::r1cs_hashes::common::HETERO_WITNESS_TEST_LOCK
+            .lock()
+            .unwrap();
+        // This invokes the same scheduled RowMajor dispatch used by the
+        // ranked from-message branch, at a unit-test-sized real BLAKE3 shape.
+        let setup = Blake3Setup::new(1024);
+        let mut rng = Rng::new(0xE_C0DE_025);
+        let blocks: Vec<Compression> = (0..setup.n_blocks)
+            .map(|_| {
+                let cv = std::array::from_fn(|_| rng.next_u32());
+                let m = std::array::from_fn(|_| rng.next_u32());
+                (cv, m, rng.next_u32() as u64, 64, 11)
+            })
+            .collect();
+
+        let incumbent = setup.generate_witness_ab_scheduled(&blocks, false);
+        crate::r1cs_hashes::common::HETERO_WITNESS_CLAIMS.store(0, Ordering::Relaxed);
+        let hetero = setup.generate_witness_ab_scheduled(&blocks, true);
+
+        assert_eq!(hetero, incumbent);
+        assert_eq!(
+            crate::r1cs_hashes::common::HETERO_WITNESS_CLAIMS.load(Ordering::Relaxed),
+            16,
+            "production no-codeword dispatch must enter sixteen coarse claims",
+        );
+    }
+
+    /// Exact production dispatch oracle. The ordinary unit test above proves
+    /// bytes at a small shape; this ignored target-machine check proves the
+    /// ranked geometry itself reaches all 4,096 coarse claims.
+    #[cfg(all(
+        target_os = "macos",
+        target_arch = "aarch64",
+        target_feature = "aes"
+    ))]
+    #[test]
+    #[ignore = "ranked witness activation oracle allocates roughly 1.6 GiB"]
+    fn ranked_no_codeword_production_dispatch_enters_epool() {
+        use std::sync::atomic::Ordering;
+
+        let _guard = crate::r1cs_hashes::common::HETERO_WITNESS_TEST_LOCK
+            .lock()
+            .unwrap();
+        let mut setup = Blake3Setup::new(1 << 18);
+        // Match the protected worker's post-construction benchmark override.
+        setup.pcs_params.merkle_hash = HashKind::Blake3;
+        assert!(
+            setup.use_ranked_witness_epool(),
+            "ranked target must select the from-message E-core witness route: hot={} from_msg={} helper={} threads={} opt_out={}",
+            setup.use_ranked_rate2_hot_codeword(),
+            flock_core::pcs::use_ranked_from_message_commit(&setup.pcs_params),
+            flock_core::prover_support::helper_pool_available(),
+            rayon::current_num_threads(),
+            std::env::var_os("FLOCK_NO_WITNESS_EPOOL").is_some(),
+        );
+        let block: Compression = ([0; 8], [0; 16], 0, 64, 11);
+        let blocks = vec![block; setup.n_blocks];
+
+        crate::r1cs_hashes::common::HETERO_WITNESS_CLAIMS.store(0, Ordering::Relaxed);
+        let witness = setup.generate_witness_ab(&blocks);
+        assert_eq!(
+            crate::r1cs_hashes::common::HETERO_WITNESS_CLAIMS.load(Ordering::Relaxed),
+            4096,
+        );
+        drop(witness);
     }
 
     #[test]
