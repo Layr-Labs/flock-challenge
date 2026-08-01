@@ -2630,6 +2630,39 @@ pub(crate) fn ligero_commit(
     ntt: &AdditiveNttF128,
     kind: HashKind,
 ) -> LigeroWitness {
+    let num_interleaved = 1usize << log_num_interleaved;
+    let block_len = 1usize << (log_msg_cols + log_inv_rate);
+    let pipeline_leaves = cfg!(all(
+        target_os = "macos",
+        target_arch = "aarch64",
+        target_feature = "aes"
+    )) && kind == HashKind::Blake3
+        && num_interleaved == 8
+        && block_len >= 256
+        && std::env::var_os("FLOCK_NO_RECURSIVE_NTT_MERKLE_PIPELINE").is_none();
+    ligero_commit_impl(
+        poly,
+        log_msg_cols,
+        log_num_interleaved,
+        log_inv_rate,
+        ntt,
+        kind,
+        pipeline_leaves,
+    )
+}
+
+/// Implementation split out so exact tests can compare the callback-driven
+/// NTT-to-Merkle pipeline with the ordinary transform-then-tree traversal.
+#[allow(clippy::too_many_arguments)]
+fn ligero_commit_impl(
+    poly: &[F128],
+    log_msg_cols: usize,
+    log_num_interleaved: usize,
+    log_inv_rate: usize,
+    ntt: &AdditiveNttF128,
+    kind: HashKind,
+    pipeline_leaves: bool,
+) -> LigeroWitness {
     let msg_cols = 1usize << log_msg_cols;
     let num_interleaved = 1usize << log_num_interleaved;
     let block_len = msg_cols << log_inv_rate;
@@ -2646,19 +2679,96 @@ pub(crate) fn ligero_commit(
     let mut mat = crate::scratch::take_f128(codeword_len);
     super::commit::replicate_message_fill(&mut mat, poly);
 
-    // RS-encode every lane in one call (each lane is one independent NTT).
-    ntt.forward_transform_interleaved_from_layer(&mut mat, num_interleaved, log_inv_rate);
-
-    // Merkle over rows. One leaf = `num_interleaved` consecutive F128 = 16·num_interleaved bytes.
+    // Merkle over rows. One leaf = `num_interleaved` consecutive F128 =
+    // 16·num_interleaved bytes.
     let leaf_size_bytes = num_interleaved * core::mem::size_of::<F128>();
-    let data_bytes: &[u8] = unsafe {
-        core::slice::from_raw_parts(
-            mat.as_ptr() as *const u8,
-            mat.len() * core::mem::size_of::<F128>(),
+    let tree = if pipeline_leaves {
+        assert_eq!(kind, HashKind::Blake3);
+        assert!(matches!(leaf_size_bytes, 64 | 128 | 256 | 512 | 1024));
+
+        // Each finalized NTT cache chunk owns an aligned subtree. Hash its
+        // leaves and eight local parent levels immediately in the callback,
+        // before the worker moves on and the encoded rows leave cache. The
+        // ordinary flat tree layout is retained exactly; only the small shared
+        // top remains for the level-wise builder after the NTT barrier.
+        const LOCAL_PARENT_LEVELS: usize = 8;
+        assert!(block_len >= 1 << LOCAL_PARENT_LEVELS);
+        let mut tree: Vec<Hash> = crate::alloc_uninit_vec(2 * block_len - 1);
+        let tree_base = crate::epool::SyncPtr(tree.as_mut_ptr());
+        ntt.forward_transform_interleaved_from_layer_and_then(
+            &mut mat,
+            num_interleaved,
+            log_inv_rate,
+            |elem_offset, chunk| {
+                assert_eq!(elem_offset % num_interleaved, 0);
+                assert_eq!(chunk.len() % num_interleaved, 0);
+                let leaf_start = elem_offset / num_interleaved;
+                let leaf_len = chunk.len() / num_interleaved;
+                assert_eq!(leaf_start % (1 << LOCAL_PARENT_LEVELS), 0);
+                assert_eq!(leaf_len % (1 << LOCAL_PARENT_LEVELS), 0);
+
+                // SAFETY: NTT completion callbacks cover disjoint finalized
+                // chunks exactly once. Their leaf ranges and every aligned
+                // local-parent range are therefore pairwise disjoint and in
+                // bounds. The NTT never touches `chunk` after publication.
+                unsafe {
+                    let bytes = core::slice::from_raw_parts(
+                        chunk.as_ptr().cast::<u8>(),
+                        core::mem::size_of_val(chunk),
+                    );
+                    let leaves = core::slice::from_raw_parts_mut(
+                        tree_base.ptr().add(leaf_start),
+                        leaf_len,
+                    );
+                    merkle::hash_blake3_leaf_chunk(bytes, leaf_size_bytes, leaves);
+
+                    let mut read_level_start = 0usize;
+                    let mut read_level_len = block_len;
+                    let mut local_start = leaf_start;
+                    let mut local_len = leaf_len;
+                    for _ in 0..LOCAL_PARENT_LEVELS {
+                        let write_level_start = read_level_start + read_level_len;
+                        let write_start = write_level_start + (local_start >> 1);
+                        let write_len = local_len >> 1;
+                        let read = core::slice::from_raw_parts(
+                            tree_base.ptr().add(read_level_start + local_start),
+                            local_len,
+                        );
+                        let write = core::slice::from_raw_parts_mut(
+                            tree_base.ptr().add(write_start),
+                            write_len,
+                        );
+                        merkle::hash_blake3_parent_chunk(read, write);
+                        read_level_start = write_level_start;
+                        read_level_len >>= 1;
+                        local_start >>= 1;
+                        local_len >>= 1;
+                    }
+                }
+            },
+        );
+        merkle::merkle_tree_from_prehashed_level(
+            tree,
+            block_len,
+            kind,
+            LOCAL_PARENT_LEVELS,
         )
+    } else {
+        // RS-encode every lane in one call (each lane is one independent NTT).
+        ntt.forward_transform_interleaved_from_layer(
+            &mut mat,
+            num_interleaved,
+            log_inv_rate,
+        );
+        let data_bytes: &[u8] = unsafe {
+            core::slice::from_raw_parts(
+                mat.as_ptr() as *const u8,
+                mat.len() * core::mem::size_of::<F128>(),
+            )
+        };
+        debug_assert_eq!(data_bytes.len(), block_len * leaf_size_bytes);
+        merkle::merkle_tree(data_bytes, block_len, kind)
     };
-    debug_assert_eq!(data_bytes.len(), block_len * leaf_size_bytes);
-    let tree = merkle::merkle_tree(data_bytes, block_len, kind);
 
     LigeroWitness {
         mat,
@@ -6574,6 +6684,43 @@ mod tests {
     }
 
     use super::*;
+
+    /// Callback-driven recursive NTT-to-Merkle completion preserves every
+    /// codeword element and every flat-tree node, not only the root.
+    #[test]
+    fn recursive_ntt_merkle_pipeline_matches_ordinary_tree() {
+        use crate::challenger::Challenger;
+
+        let log_msg_cols = 12usize;
+        let log_num_interleaved = 3usize;
+        let log_inv_rate = 2usize;
+        let mut rng = crate::challenger::RandomChallenger::new(0x4E54_545F_4D45_524B);
+        let poly = rng.sample_f128_vec(1usize << (log_msg_cols + log_num_interleaved));
+        let ntt = AdditiveNttF128::standard(log_msg_cols + log_inv_rate);
+
+        let ordinary = ligero_commit_impl(
+            &poly,
+            log_msg_cols,
+            log_num_interleaved,
+            log_inv_rate,
+            &ntt,
+            HashKind::Blake3,
+            false,
+        );
+        let pipelined = ligero_commit_impl(
+            &poly,
+            log_msg_cols,
+            log_num_interleaved,
+            log_inv_rate,
+            &ntt,
+            HashKind::Blake3,
+            true,
+        );
+
+        assert_eq!(pipelined.mat, ordinary.mat, "encoded matrix changed");
+        assert_eq!(pipelined.tree, ordinary.tree, "flat Merkle tree changed");
+        assert_eq!(pipelined.root(), ordinary.root(), "Merkle root changed");
+    }
 
     /// Worked example: `LigeritoSecurityConfig` for BLAKE3 m=29 at rate 1/2.
     /// Paper-compatible m=29 fast example, mechanically derived in the

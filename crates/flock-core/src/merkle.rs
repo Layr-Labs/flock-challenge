@@ -532,37 +532,56 @@ fn hash_leaves(data: &[u8], leaf_size: usize, out: &mut [Hash], kind: HashKind) 
     }
 }
 
-/// Hash one already-partitioned run of ranked 1 KiB BLAKE3 leaves without
+/// Hash one already-partitioned run of batchable BLAKE3 leaves without
 /// starting another Rayon/E-core scheduling region.
 ///
-/// The ranked NTT-to-Merkle pipeline calls this from jobs that are themselves
-/// distributed across the P-core pool or handed to the existing E-core helper
-/// pool. Keeping this helper scheduling-free avoids a nested barrier per 1 MiB
-/// finalized NTT subtree while preserving the exact twelve-way leaf kernel and
-/// hash-count semantics used by [`hash_leaves`].
-pub(crate) fn hash_ranked_blake3_leaf_chunk(data: &[u8], out: &mut [Hash]) {
-    const LEAF_SIZE: usize = 1024;
-    assert_eq!(data.len(), out.len() * LEAF_SIZE);
+/// NTT-to-Merkle pipelines call this from jobs that are already distributed
+/// across the prover pool. Keeping the helper scheduling-free avoids a nested
+/// parallel region per finalized cache chunk while preserving the exact
+/// batched leaf kernel and hash-count semantics used by [`hash_leaves`].
+pub(crate) fn hash_blake3_leaf_chunk(
+    data: &[u8],
+    leaf_size: usize,
+    out: &mut [Hash],
+) {
+    assert_eq!(data.len(), out.len() * leaf_size);
     #[cfg(feature = "hash-count")]
     {
         use std::sync::atomic::Ordering::Relaxed;
         hash_count::LEAF_CALLS.fetch_add(out.len() as u64, Relaxed);
         hash_count::LEAF_COMPRESSIONS.fetch_add(
-            out.len() as u64 * hash_count::blocks(HashKind::Blake3, LEAF_SIZE),
+            out.len() as u64 * hash_count::blocks(HashKind::Blake3, leaf_size),
             Relaxed,
         );
     }
-    let batched = blake3_hash_many_leaves(data, LEAF_SIZE, out);
-    assert!(batched, "ranked 1 KiB leaves must use the batched kernel");
+    let batched = blake3_hash_many_leaves(data, leaf_size, out);
+    assert!(batched, "NTT pipeline leaf size must use the batched kernel");
 }
 
-/// Hash one scheduling-free run of BLAKE3 parent nodes. Ranked NTT completion
-/// jobs use this after hashing their cache-hot leaves; the run is deliberately
-/// capped at the serial cutoff so it cannot open a nested Rayon/E-core region.
-pub(crate) fn hash_ranked_blake3_parent_chunk(read: &[Hash], write: &mut [Hash]) {
+/// Ranked L0's fixed 1 KiB specialization of [`hash_blake3_leaf_chunk`].
+pub(crate) fn hash_ranked_blake3_leaf_chunk(data: &[u8], out: &mut [Hash]) {
+    hash_blake3_leaf_chunk(data, 1024, out);
+}
+
+/// Hash one scheduling-free run of BLAKE3 parent nodes. NTT completion jobs
+/// use this after hashing their cache-hot leaves. The caller already provides
+/// outer parallelism, so this bypasses [`hash_pairs_level`]'s nested scheduler.
+pub(crate) fn hash_blake3_parent_chunk(read: &[Hash], write: &mut [Hash]) {
     assert_eq!(read.len(), 2 * write.len());
+    #[cfg(feature = "hash-count")]
+    hash_count::PAIR_CALLS.fetch_add(write.len() as u64, std::sync::atomic::Ordering::Relaxed);
+    // SAFETY: `Hash` is `[u8; 32]`, so `read` is exactly the contiguous
+    // left/right 64-byte pairs consumed by the batched parent kernel.
+    let read_bytes = unsafe {
+        core::slice::from_raw_parts(read.as_ptr().cast::<u8>(), read.len() * 32)
+    };
+    blake3_hash_many_parents(read_bytes, write);
+}
+
+/// Ranked L0 guard around [`hash_blake3_parent_chunk`].
+pub(crate) fn hash_ranked_blake3_parent_chunk(read: &[Hash], write: &mut [Hash]) {
     assert!(write.len() <= 1024);
-    hash_pairs_level(read, write, HashKind::Blake3);
+    hash_blake3_parent_chunk(read, write);
 }
 
 /// Leaves per queue chunk in the batched BLAKE3 leaf path (see `epool`).
