@@ -864,13 +864,14 @@ fn prove_fast_core_with_commit_codeword<Ch: Challenger>(
             assert_eq!(r1cs.useful_bits, 15_409);
             let (m, k_log, useful_bits) = (r1cs.m, r1cs.k_log, r1cs.useful_bits);
             let mut stripe = flock_core::scratch::take_u8(1usize << (m - 3));
-            // E2 is the measured contention optimum: E4 steals bandwidth from
-            // commit, while E1 lets the stripe spill into zerocheck. Keep the
-            // override for controlled same-binary diagnostics only.
+            // E3 is the current overlap point: it finishes the stripe earlier
+            // without recruiting a performance core. E1 spills too far into
+            // zerocheck and E4 can steal bandwidth from commit. Keep the
+            // override for controlled same-binary diagnostics.
             let epool_workers = std::env::var_os("FLOCK_DEFER_STRIPE_EPOOL_THREADS")
                 .and_then(|value| value.to_str()?.parse::<usize>().ok())
                 .filter(|workers| (1..=4).contains(workers))
-                .unwrap_or(2);
+                .unwrap_or(3);
             let pre = std::thread::scope(|scope| {
                 let stripe_job = scope.spawn(|| {
                     let started = std::time::Instant::now();
