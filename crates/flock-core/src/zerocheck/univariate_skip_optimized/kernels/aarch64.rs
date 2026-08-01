@@ -234,6 +234,63 @@ pub(crate) unsafe fn accumulate_convert_ab(
     }
 }
 
+// Shared by the buffered and stackless C-bank kernels below; both expand the
+// macros inside a `use core::arch::aarch64::*` scope.
+//
+// `x[b] bit s` -> `out[s] bit b`, vectorized over the 16 byte columns.
+macro_rules! transpose8 {
+    ($x:expr, $m33:expr, $m55:expr) => {{
+        let x: [uint8x16_t; 8] = $x;
+        // distance 4: exchange the 4x4 off-diagonal blocks.
+        let mut a = [vdupq_n_u8(0); 8];
+        for b in 0..4 {
+            a[b] = vsliq_n_u8::<4>(x[b], x[b + 4]);
+            a[b + 4] = vsriq_n_u8::<4>(x[b + 4], x[b]);
+        }
+        // distance 2, then distance 1: same swap, masked halves.
+        let mut c = [vdupq_n_u8(0); 8];
+        for q in 0..2 {
+            for b in 0..2 {
+                let (i, j) = (4 * q + b, 4 * q + b + 2);
+                c[i] = vbslq_u8($m33, a[i], vshlq_n_u8::<2>(a[j]));
+                c[j] = vbslq_u8($m33, vshrq_n_u8::<2>(a[i]), a[j]);
+            }
+        }
+        let mut out = [vdupq_n_u8(0); 8];
+        for p in 0..4 {
+            let (i, j) = (2 * p, 2 * p + 1);
+            out[i] = vbslq_u8($m55, c[i], vshlq_n_u8::<1>(c[j]));
+            out[j] = vbslq_u8($m55, vshrq_n_u8::<1>(c[i]), c[j]);
+        }
+        out
+    }};
+}
+
+// 8-way byte interleave: `out[8c + t] == r[t][c]` over the 128 bytes.
+macro_rules! interleave8 {
+    ($r:expr) => {{
+        let r: [uint8x16_t; 8] = $r;
+        let (a0, a1) = (vzip1q_u8(r[0], r[4]), vzip2q_u8(r[0], r[4]));
+        let (b0, b1) = (vzip1q_u8(r[2], r[6]), vzip2q_u8(r[2], r[6]));
+        let (c0, c1) = (vzip1q_u8(r[1], r[5]), vzip2q_u8(r[1], r[5]));
+        let (d0, d1) = (vzip1q_u8(r[3], r[7]), vzip2q_u8(r[3], r[7]));
+        let (e0, e1) = (vzip1q_u8(a0, b0), vzip2q_u8(a0, b0));
+        let (e2, e3) = (vzip1q_u8(a1, b1), vzip2q_u8(a1, b1));
+        let (f0, f1) = (vzip1q_u8(c0, d0), vzip2q_u8(c0, d0));
+        let (f2, f3) = (vzip1q_u8(c1, d1), vzip2q_u8(c1, d1));
+        [
+            vzip1q_u8(e0, f0),
+            vzip2q_u8(e0, f0),
+            vzip1q_u8(e1, f1),
+            vzip2q_u8(e1, f1),
+            vzip1q_u8(e2, f2),
+            vzip2q_u8(e2, f2),
+            vzip1q_u8(e3, f3),
+            vzip2q_u8(e3, f3),
+        ]
+    }};
+}
+
 /// Eight α-free single-bit-`K` C banks, NEON — straight off the packed witness.
 ///
 /// Three phases, no multiplies, no convert-table gathers, and **no per-`b_med`
@@ -285,60 +342,6 @@ pub(crate) unsafe fn accumulate_c_banks(
     // fixed-size arrays; table indices are `u8` scaled by the 16-byte row size,
     // bounded by the debug-asserted 256-row halves.
     unsafe {
-        // `x[b] bit s` -> `out[s] bit b`, vectorized over the 16 byte columns.
-        macro_rules! transpose8 {
-            ($x:expr, $m33:expr, $m55:expr) => {{
-                let x: [uint8x16_t; 8] = $x;
-                // distance 4: exchange the 4x4 off-diagonal blocks.
-                let mut a = [vdupq_n_u8(0); 8];
-                for b in 0..4 {
-                    a[b] = vsliq_n_u8::<4>(x[b], x[b + 4]);
-                    a[b + 4] = vsriq_n_u8::<4>(x[b + 4], x[b]);
-                }
-                // distance 2, then distance 1: same swap, masked halves.
-                let mut c = [vdupq_n_u8(0); 8];
-                for q in 0..2 {
-                    for b in 0..2 {
-                        let (i, j) = (4 * q + b, 4 * q + b + 2);
-                        c[i] = vbslq_u8($m33, a[i], vshlq_n_u8::<2>(a[j]));
-                        c[j] = vbslq_u8($m33, vshrq_n_u8::<2>(a[i]), a[j]);
-                    }
-                }
-                let mut out = [vdupq_n_u8(0); 8];
-                for p in 0..4 {
-                    let (i, j) = (2 * p, 2 * p + 1);
-                    out[i] = vbslq_u8($m55, c[i], vshlq_n_u8::<1>(c[j]));
-                    out[j] = vbslq_u8($m55, vshrq_n_u8::<1>(c[i]), c[j]);
-                }
-                out
-            }};
-        }
-
-        // 8-way byte interleave: `out[8c + t] == r[t][c]` over the 128 bytes.
-        macro_rules! interleave8 {
-            ($r:expr) => {{
-                let r: [uint8x16_t; 8] = $r;
-                let (a0, a1) = (vzip1q_u8(r[0], r[4]), vzip2q_u8(r[0], r[4]));
-                let (b0, b1) = (vzip1q_u8(r[2], r[6]), vzip2q_u8(r[2], r[6]));
-                let (c0, c1) = (vzip1q_u8(r[1], r[5]), vzip2q_u8(r[1], r[5]));
-                let (d0, d1) = (vzip1q_u8(r[3], r[7]), vzip2q_u8(r[3], r[7]));
-                let (e0, e1) = (vzip1q_u8(a0, b0), vzip2q_u8(a0, b0));
-                let (e2, e3) = (vzip1q_u8(a1, b1), vzip2q_u8(a1, b1));
-                let (f0, f1) = (vzip1q_u8(c0, d0), vzip2q_u8(c0, d0));
-                let (f2, f3) = (vzip1q_u8(c1, d1), vzip2q_u8(c1, d1));
-                [
-                    vzip1q_u8(e0, f0),
-                    vzip2q_u8(e0, f0),
-                    vzip1q_u8(e1, f1),
-                    vzip2q_u8(e1, f1),
-                    vzip1q_u8(e2, f2),
-                    vzip2q_u8(e2, f2),
-                    vzip1q_u8(e3, f3),
-                    vzip2q_u8(e3, f3),
-                ]
-            }};
-        }
-
         let m33 = vdupq_n_u8(0x33);
         let m55 = vdupq_n_u8(0x55);
 
@@ -490,6 +493,190 @@ pub(crate) unsafe fn accumulate_c_banks(
                     );
                 }
             }
+        }
+    }
+}
+
+/// Register-direct eight-lane drain: [`accumulate_c_banks`]'s three phases
+/// with the `m_lo`/`m_hi` scratch deleted.
+///
+/// The buffered kernel spills all 64 interleave vectors to a 1 KiB stack
+/// scratch and reloads them as `u64` index words. That round trip is pure
+/// layout bookkeeping: phase 2 stores vector `i` of chunk `c` at flat offset
+/// `c·128 + i·16`, so bank `2c` owns vectors `0..4`, bank `2c + 1` vectors
+/// `4..8`, and the `u64` the drain reads at lane `8k` of bank `s` is exactly
+/// lane `k & 1` of vector `4·(s & 1) + (k >> 1)` — reinterpreting the byte
+/// vector as `uint64x2_t` yields it without touching memory (little-endian,
+/// so `vgetq_lane_u64` and the buffered `read_unaligned` agree byte for
+/// byte). Each chunk therefore drains its two banks the moment their sixteen
+/// interleave vectors exist, and the scratch arrays, their 64 vector stores,
+/// and their 128 scalar reloads disappear from the kernel.
+///
+/// Table and accumulator semantics are byte-identical to the buffered
+/// eight-lane drain, including the padded boundary window: rows at or past
+/// `n_b_med` still enter the transpose as explicit zero vectors, never as
+/// witness bytes. Only the eight-lane shape exists here; the caller's policy
+/// routes this kernel exactly where `drain_lanes == 8` was chosen before.
+#[inline(always)]
+pub(crate) unsafe fn accumulate_c_banks_stackless(
+    c_block: &[u8; 16 * 64],
+    n_b_med: usize,
+    mask_tables: &[F128],
+    partial_c: &mut [[F128; 64]; 8],
+) {
+    use core::arch::aarch64::*;
+
+    debug_assert!(n_b_med <= 16);
+    debug_assert_eq!(mask_tables.len(), 512);
+
+    // SAFETY: every load/store below is a fixed offset into the caller's
+    // fixed-size arrays; table indices are `u8` scaled by the 16-byte row
+    // size, bounded by the debug-asserted 256-row halves.
+    unsafe {
+        let m33 = vdupq_n_u8(0x33);
+        let m55 = vdupq_n_u8(0x55);
+        let src = c_block.as_ptr();
+        let t_lo = mask_tables.as_ptr() as *const u8;
+        let t_hi = t_lo.add(256 * 16);
+
+        // The buffered drain8 group body verbatim, with the two `u64` index
+        // words handed in from registers instead of reloaded from scratch.
+        macro_rules! drain_group8 {
+            ($bank:expr, $lane:literal, $lo:expr, $hi:expr) => {{
+                let lo: u64 = $lo;
+                let hi: u64 = $hi;
+
+                let l0 = vld1q_u8(t_lo.add(usize::from((lo & 0xff) as u8) * 16));
+                let l1 = vld1q_u8(t_lo.add(usize::from(((lo >> 8) & 0xff) as u8) * 16));
+                let l2 = vld1q_u8(t_lo.add(usize::from(((lo >> 16) & 0xff) as u8) * 16));
+                let l3 = vld1q_u8(t_lo.add(usize::from(((lo >> 24) & 0xff) as u8) * 16));
+                let l4 = vld1q_u8(t_lo.add(usize::from(((lo >> 32) & 0xff) as u8) * 16));
+                let l5 = vld1q_u8(t_lo.add(usize::from(((lo >> 40) & 0xff) as u8) * 16));
+                let l6 = vld1q_u8(t_lo.add(usize::from(((lo >> 48) & 0xff) as u8) * 16));
+                let l7 = vld1q_u8(t_lo.add(usize::from((lo >> 56) as u8) * 16));
+                let h0 = vld1q_u8(t_hi.add(usize::from((hi & 0xff) as u8) * 16));
+                let h1 = vld1q_u8(t_hi.add(usize::from(((hi >> 8) & 0xff) as u8) * 16));
+                let h2 = vld1q_u8(t_hi.add(usize::from(((hi >> 16) & 0xff) as u8) * 16));
+                let h3 = vld1q_u8(t_hi.add(usize::from(((hi >> 24) & 0xff) as u8) * 16));
+                let h4 = vld1q_u8(t_hi.add(usize::from(((hi >> 32) & 0xff) as u8) * 16));
+                let h5 = vld1q_u8(t_hi.add(usize::from(((hi >> 40) & 0xff) as u8) * 16));
+                let h6 = vld1q_u8(t_hi.add(usize::from(((hi >> 48) & 0xff) as u8) * 16));
+                let h7 = vld1q_u8(t_hi.add(usize::from((hi >> 56) as u8) * 16));
+
+                let p0 = $bank.add($lane * 16);
+                let p1 = p0.add(16);
+                let p2 = p1.add(16);
+                let p3 = p2.add(16);
+                let p4 = p3.add(16);
+                let p5 = p4.add(16);
+                let p6 = p5.add(16);
+                let p7 = p6.add(16);
+                vst1q_u8(p0, xor3_u8(vld1q_u8(p0), l0, h0));
+                vst1q_u8(p1, xor3_u8(vld1q_u8(p1), l1, h1));
+                vst1q_u8(p2, xor3_u8(vld1q_u8(p2), l2, h2));
+                vst1q_u8(p3, xor3_u8(vld1q_u8(p3), l3, h3));
+                vst1q_u8(p4, xor3_u8(vld1q_u8(p4), l4, h4));
+                vst1q_u8(p5, xor3_u8(vld1q_u8(p5), l5, h5));
+                vst1q_u8(p6, xor3_u8(vld1q_u8(p6), l6, h6));
+                vst1q_u8(p7, xor3_u8(vld1q_u8(p7), l7, h7));
+            }};
+        }
+
+        // One bank's 64 lanes from its four low-half and four high-half
+        // interleave vectors: `u64` word `k` of the bank's index row is lane
+        // `k & 1` of vector `k >> 1`.
+        macro_rules! drain_bank8 {
+            ($bank:expr, $q0:expr, $q1:expr, $q2:expr, $q3:expr,
+             $r0:expr, $r1:expr, $r2:expr, $r3:expr) => {{
+                let bank = $bank as *mut u8;
+                let q0 = vreinterpretq_u64_u8($q0);
+                let q1 = vreinterpretq_u64_u8($q1);
+                let q2 = vreinterpretq_u64_u8($q2);
+                let q3 = vreinterpretq_u64_u8($q3);
+                let r0 = vreinterpretq_u64_u8($r0);
+                let r1 = vreinterpretq_u64_u8($r1);
+                let r2 = vreinterpretq_u64_u8($r2);
+                let r3 = vreinterpretq_u64_u8($r3);
+                drain_group8!(bank, 0, vgetq_lane_u64::<0>(q0), vgetq_lane_u64::<0>(r0));
+                drain_group8!(bank, 8, vgetq_lane_u64::<1>(q0), vgetq_lane_u64::<1>(r0));
+                drain_group8!(bank, 16, vgetq_lane_u64::<0>(q1), vgetq_lane_u64::<0>(r1));
+                drain_group8!(bank, 24, vgetq_lane_u64::<1>(q1), vgetq_lane_u64::<1>(r1));
+                drain_group8!(bank, 32, vgetq_lane_u64::<0>(q2), vgetq_lane_u64::<0>(r2));
+                drain_group8!(bank, 40, vgetq_lane_u64::<1>(q2), vgetq_lane_u64::<1>(r2));
+                drain_group8!(bank, 48, vgetq_lane_u64::<0>(q3), vgetq_lane_u64::<0>(r3));
+                drain_group8!(bank, 56, vgetq_lane_u64::<1>(q3), vgetq_lane_u64::<1>(r3));
+            }};
+        }
+
+        // Same two-arm boundary handling as the buffered kernel: `n_b_med` is
+        // fixed for the whole call, and rows past it must read as ZERO rather
+        // than as witness bytes.
+        macro_rules! run_chunks {
+            ($row:expr) => {
+                for chunk in 0..4 {
+                    let col = chunk * 16;
+                    let row = |b: usize| -> uint8x16_t { $row(b, col) };
+                    let g_lo = interleave8!(transpose8!(
+                        [
+                            row(0),
+                            row(1),
+                            row(2),
+                            row(3),
+                            row(4),
+                            row(5),
+                            row(6),
+                            row(7)
+                        ],
+                        m33,
+                        m55
+                    ));
+                    let g_hi = interleave8!(transpose8!(
+                        [
+                            row(8),
+                            row(9),
+                            row(10),
+                            row(11),
+                            row(12),
+                            row(13),
+                            row(14),
+                            row(15)
+                        ],
+                        m33,
+                        m55
+                    ));
+                    drain_bank8!(
+                        partial_c[2 * chunk].as_mut_ptr(),
+                        g_lo[0],
+                        g_lo[1],
+                        g_lo[2],
+                        g_lo[3],
+                        g_hi[0],
+                        g_hi[1],
+                        g_hi[2],
+                        g_hi[3]
+                    );
+                    drain_bank8!(
+                        partial_c[2 * chunk + 1].as_mut_ptr(),
+                        g_lo[4],
+                        g_lo[5],
+                        g_lo[6],
+                        g_lo[7],
+                        g_hi[4],
+                        g_hi[5],
+                        g_hi[6],
+                        g_hi[7]
+                    );
+                }
+            };
+        }
+        if n_b_med == 16 {
+            run_chunks!(|b: usize, col: usize| vld1q_u8(src.add(b * 64 + col)));
+        } else {
+            run_chunks!(|b: usize, col: usize| if b < n_b_med {
+                vld1q_u8(src.add(b * 64 + col))
+            } else {
+                vdupq_n_u8(0)
+            });
         }
     }
 }

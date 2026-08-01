@@ -310,6 +310,29 @@ pub(super) fn accumulate_c_banks_with_drain_lanes(
     }
 }
 
+/// Register-direct variant of the eight-lane drain: identical mask and table
+/// semantics to [`accumulate_c_banks_with_drain_lanes`] at `drain_lanes == 8`,
+/// but the fused transpose/interleave outputs are consumed as table indices
+/// straight from NEON registers — the 1 KiB `m_lo`/`m_hi` stack scratch and
+/// its store-then-reload round trip do not exist on this path.
+#[inline]
+pub(super) fn accumulate_c_banks_stackless(
+    c_block: &[u8; 16 * 64],
+    n_b_med: usize,
+    mask_tables: &[super::F128],
+    partial_c: &mut [[super::F128; 64]; 8],
+) {
+    #[cfg(target_arch = "aarch64")]
+    // SAFETY: aarch64 statically guarantees NEON; the fixed-size arrays cover
+    // every load/store and the table halves bound every `u8`-scaled index.
+    unsafe {
+        aarch64::accumulate_c_banks_stackless(c_block, n_b_med, mask_tables, partial_c);
+    }
+
+    #[cfg(not(target_arch = "aarch64"))]
+    accumulate_c_banks_scalar(c_block, n_b_med, mask_tables, partial_c);
+}
+
 /// AB-only half of [`accumulate_convert_with_s_hat_v`].  Keeping this as a
 /// separate entry point lets the ranked precomputed-AB path finish a whole
 /// `x_hi` band with the 64 KiB convert table resident before switching to the

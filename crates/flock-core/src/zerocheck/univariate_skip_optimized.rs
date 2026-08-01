@@ -855,6 +855,7 @@ fn process_one_x_hi_with_precomputed_ab(
     direct_ab_rows: bool,
     c_drain4: bool,
     c_drain8: bool,
+    c_stackless: bool,
     state: &mut WorkerStateWithSHatV,
 ) {
     state.partial_ab.iter_mut().for_each(|p| *p = F128::ZERO);
@@ -917,19 +918,28 @@ fn process_one_x_hi_with_precomputed_ab(
                 .expect("sixteen 64-byte c rows per x_outer_lo");
             let c_tables = &mask_tables
                 [x_outer_lo * C_MASK_TABLE_STRIDE..(x_outer_lo + 1) * C_MASK_TABLE_STRIDE];
-            kernels::accumulate_c_banks_with_drain_lanes(
-                c_rows,
-                n_b_med,
-                c_tables,
-                &mut state.partial_c,
-                if c_drain8 {
-                    8
-                } else if c_drain4 {
-                    4
-                } else {
-                    1
-                },
-            );
+            if c_stackless {
+                kernels::accumulate_c_banks_stackless(
+                    c_rows,
+                    n_b_med,
+                    c_tables,
+                    &mut state.partial_c,
+                );
+            } else {
+                kernels::accumulate_c_banks_with_drain_lanes(
+                    c_rows,
+                    n_b_med,
+                    c_tables,
+                    &mut state.partial_c,
+                    if c_drain8 {
+                        8
+                    } else if c_drain4 {
+                        4
+                    } else {
+                        1
+                    },
+                );
+            }
         }
     } else {
         for x_outer_lo in 0..big_lo_size {
@@ -1361,6 +1371,12 @@ pub fn round1_shift_reduce_extract_c_packed_padded_with_precomputed_ab(
     let c_drain8 = cfg!(all(target_os = "macos", target_arch = "aarch64"))
         && m == 32
         && std::env::var_os("FLOCK_NO_ZC_C_DRAIN8").is_none();
+    // Register-direct variant of the eight-lane drain: same narrow ranked
+    // gate as `c_drain8`, one more same-binary control on top. Precedence is
+    // stackless > drain8 > drain4 > scalar — `FLOCK_NO_ZC_C_STACKLESS=1`
+    // alone restores the buffered eight-lane kernel exactly; disabling a
+    // coarser lever also disables everything finer than it.
+    let c_stackless = c_drain8 && std::env::var_os("FLOCK_NO_ZC_C_STACKLESS").is_none();
 
     // The challenge-independent AB transform finishes while the commitment is
     // still running. Its challenge-weighted completion is therefore a live
@@ -1389,6 +1405,7 @@ pub fn round1_shift_reduce_extract_c_packed_padded_with_precomputed_ab(
             direct_ab_rows,
             c_drain4,
             c_drain8,
+            c_stackless,
             &mut state,
         );
         // SAFETY: the queue hands out each x_hi exactly once, so this task is
@@ -2622,6 +2639,38 @@ mod tests {
             let mut want = seed;
             kernels::accumulate_c_banks_scalar(&c_block, n_b_med, &mask_tables, &mut want);
             assert_eq!(got, want, "eight-lane drain mismatch at n_b_med={n_b_med}");
+        }
+    }
+
+    /// **The stackless-drain gate.** The register-direct kernel never
+    /// materializes the `m_lo`/`m_hi` scratch, so its only defense against a
+    /// mis-mapped interleave lane is this differential: every `n_b_med`
+    /// (0..=16, covering the full path and the padded boundary window), random
+    /// blocks each round, against the independent composed-transpose scalar
+    /// oracle, from non-zero partials so `+=` semantics are exercised too.
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn fused_c_stackless_drain_matches_scalar_oracle() {
+        let mut rng = Rng::new(0xC0DE_57AC);
+        for round in 0..4 {
+            for n_b_med in 0..=(1 << N_MEDIUM) {
+                let mut c_block = [0u8; (1 << N_MEDIUM) * 64];
+                for byte in c_block.iter_mut() {
+                    *byte = (rng.next_u64() & 0xff) as u8;
+                }
+                let mask_tables = build_c_mask_tables(&[rng.f128()]);
+                let seed: [[F128; ELL]; N_C_BANKS] =
+                    core::array::from_fn(|_| core::array::from_fn(|_| rng.f128()));
+
+                let mut got = seed;
+                kernels::accumulate_c_banks_stackless(&c_block, n_b_med, &mask_tables, &mut got);
+                let mut want = seed;
+                kernels::accumulate_c_banks_scalar(&c_block, n_b_med, &mask_tables, &mut want);
+                assert_eq!(
+                    got, want,
+                    "stackless drain mismatch at n_b_med={n_b_med}, round={round}"
+                );
+            }
         }
     }
 
