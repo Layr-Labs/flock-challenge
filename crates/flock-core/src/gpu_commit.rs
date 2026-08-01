@@ -2397,7 +2397,7 @@ kernel void parent_hash3(device const uint* children [[buffer(0)]],
         let early_k = if std::env::var_os("FLOCK_NO_EARLY_GPU_PREFIX").is_some() {
             0
         } else {
-            match hybrid_cpu_sixteenths() {
+            match hybrid_cpu_sixteenths(params.k_code()) {
                 k @ 1..=15 => k,
                 _ => 0,
             }
@@ -2976,16 +2976,23 @@ kernel void parent_hash3(device const uint* children [[buffer(0)]],
     }
 
     /// CPU share of the hybrid commit in sixteenths of the position range.
-    /// 0 disables (pure-GPU graph). Default 5 is the conservative midpoint of
-    /// the cache-local suffix plateau: it retains most of the measured gain on
-    /// a 10P/4E M4 Pro without assuming the benchmark's larger M3 Max GPU has
-    /// the same CPU/GPU balance. `FLOCK_HYBRID_CPU_BLOCKS` remains the exact
-    /// split-point override.
-    fn hybrid_cpu_sixteenths() -> usize {
+    /// 0 disables (pure-GPU graph). The incumbent default 5 is the conservative
+    /// midpoint of the original suffix plateau. The ranked cache-staged
+    /// radix-64 schedule uses 6 because its lower CPU traffic shifts the
+    /// production overlap's optimum by one sixteenth. The environment remains
+    /// the exact split-point override.
+    fn hybrid_cpu_sixteenths(log_d: usize) -> usize {
         if let Some(k) = hybrid_cpu_split_override() {
             return k;
         }
         match TUNED_HYBRID_K.load(std::sync::atomic::Ordering::Relaxed) {
+            usize::MAX
+                if crate::ntt::additive_ntt_f128::use_ranked_hybrid_suffix_radix64(
+                    log_d, 64, 4, 10,
+                ) =>
+            {
+                RANKED_RADIX64_HYBRID_K
+            }
             usize::MAX => DEFAULT_HYBRID_K,
             k => k,
         }
@@ -2994,6 +3001,11 @@ kernel void parent_hash3(device const uint* children [[buffer(0)]],
     /// Promoted fixed default, used when the warmup sweep is disabled or has
     /// not published a winner.
     const DEFAULT_HYBRID_K: usize = 5;
+
+    /// The cache-staged radix-64 suffix changes the scored overlap's balance:
+    /// k=6 removes one more sixteenth from the GPU and keeps a 64 KiB CPU tile
+    /// resident, beating k=5 by 4.73 ms in the production streamed graph.
+    const RANKED_RADIX64_HYBRID_K: usize = 6;
 
     /// Warmup-sweep-published CPU share (sentinel `usize::MAX` = not tuned).
     static TUNED_HYBRID_K: std::sync::atomic::AtomicUsize =
@@ -3057,7 +3069,10 @@ kernel void parent_hash3(device const uint* children [[buffer(0)]],
     /// resolve toward the GPU), verify the winner's staging and tree
     /// bit-exact against the CPU reference commit, and publish it for every
     /// timed prove of this process. Runs once, entirely inside the untimed
-    /// warmup prove. `FLOCK_NO_HYBRID_AUTOTUNE=1` keeps the fixed default.
+    /// warmup prove. The ranked radix-64 suffix bypasses this incumbent-cost
+    /// sweep and uses its production-profiled k=6 default; replaying it for
+    /// every candidate erased the scored gain. `FLOCK_NO_HYBRID_AUTOTUNE=1`
+    /// keeps the applicable fixed default.
     fn autotune_hybrid_split(
         gpu: &Gpu,
         latched: &Latched,
@@ -3068,9 +3083,13 @@ kernel void parent_hash3(device const uint* children [[buffer(0)]],
     ) {
         if hybrid_cpu_split_override().is_some()
             || std::env::var_os("FLOCK_NO_HYBRID_AUTOTUNE").is_some()
+            || crate::ntt::additive_ntt_f128::use_ranked_hybrid_suffix_radix64(
+                log_d, 64, 4, 10,
+            )
         {
             return;
         }
+
         let dbg = debug_enabled() || std::env::var_os("FLOCK_COMMIT_TIMING").is_some();
         let z_buf = latched.wraps[0].2;
         let (tw_buf, tree_buf, staging) = (latched.tw_buf, latched.tree_buf, latched.staging);
@@ -3579,7 +3598,7 @@ kernel void parent_hash3(device const uint* children [[buffer(0)]],
         };
 
         let t0 = std::time::Instant::now();
-        let k_cpu16 = hybrid_cpu_sixteenths();
+        let k_cpu16 = hybrid_cpu_sixteenths(log_d);
         let run = unsafe {
             if k_cpu16 > 0 {
                 run_commit_graph_from_z_hybrid(
@@ -3675,7 +3694,7 @@ kernel void parent_hash3(device const uint* children [[buffer(0)]],
             drain_early(early);
             Err("streamed GPU latch or z allocation changed before finish".into())
         } else {
-            let k_cpu16 = hybrid_cpu_sixteenths();
+            let k_cpu16 = hybrid_cpu_sixteenths(stream.log_d);
             unsafe {
                 match early {
                     Some((cb2, k_early)) if k_early == k_cpu16 => {

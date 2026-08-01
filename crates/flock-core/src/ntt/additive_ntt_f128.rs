@@ -256,6 +256,38 @@ fn is_ranked_top_hetero_fused3_pass(
     use_ranked_deep_pair_fusion(log_d, num_ntts, start_layer, n_top) && matches!(layer, 1 | 4 | 7)
 }
 
+/// Exact production shape where the hybrid CPU suffix can retain layers
+/// 4..10 in a cache-staged radix-64 tile. The arithmetic remains two radix-8
+/// groups, but the intermediate lives in worker scratch instead of making a
+/// second complete traversal of the CPU-owned staging range.
+#[inline]
+fn is_ranked_hybrid_suffix_radix64_shape(
+    log_d: usize,
+    num_ntts: usize,
+    start_layer: usize,
+    stop_layer: usize,
+) -> bool {
+    cfg!(all(
+        target_os = "macos",
+        target_arch = "aarch64",
+        target_feature = "aes"
+    )) && log_d == 20
+        && num_ntts == 64
+        && start_layer == 4
+        && stop_layer == 10
+}
+
+#[inline]
+pub(crate) fn use_ranked_hybrid_suffix_radix64(
+    log_d: usize,
+    num_ntts: usize,
+    start_layer: usize,
+    stop_layer: usize,
+) -> bool {
+    is_ranked_hybrid_suffix_radix64_shape(log_d, num_ntts, start_layer, stop_layer)
+        && std::env::var_os("FLOCK_NO_HYBRID_SUFFIX_RADIX64").is_none()
+}
+
 const INTERLEAVED_PHASE_ALL: u8 = 0;
 const INTERLEAVED_PHASE_TOP_ONLY: u8 = 1;
 const INTERLEAVED_PHASE_DEEP_ONLY: u8 = 2;
@@ -790,6 +822,168 @@ impl AdditiveNttF128 {
         }
     }
 
+    /// Apply exactly six layers to a selected absolute block range while each
+    /// 64-position row tile is resident in private worker scratch.
+    ///
+    /// The ordinary range driver performs a radix-8 sweep for layers 4..7 and
+    /// another radix-8 sweep for layers 7..10. Each sweep reads and writes the
+    /// entire selected range. Here, one layer-`start_layer` block is viewed as
+    /// an 8×8 grid of layer-`start_layer+6` rows. A tile is transposed only in
+    /// its scratch addressing: the first set of radix-8 butterflies runs down
+    /// one grid dimension and the second set runs across the other. Source and
+    /// destination retain the original layout, so the next layer observes
+    /// byte-identical state.
+    fn forward_transform_interleaved_radix64_block_range(
+        &self,
+        data: &mut [F128],
+        num_ntts: usize,
+        start_layer: usize,
+        b_start: usize,
+        b_end: usize,
+    ) {
+        const RADIX: usize = 8;
+        const RADIX64: usize = RADIX * RADIX;
+        // At 64 lanes this stages 64 KiB per worker. Keeping the complete
+        // radix-64 intermediate inside the private L1 is the point of the
+        // schedule; a wider 512 KiB tile measured slower because its two
+        // butterfly dimensions spilled back through the shared cache.
+        const ROWS_PER_TILE: usize = 1;
+        // Amortize the hetero-queue claim over 4 MiB of source data while
+        // reusing the same L1-resident 64 KiB tile. One job per individual
+        // row measured dominated by queue/scheduling overhead.
+        const TILES_PER_JOB: usize = 64;
+
+        let log_d = log2_pow2(data.len() / num_ntts);
+        let stop_layer = start_layer + 6;
+        assert!(stop_layer <= log_d);
+        assert!(b_start < b_end && b_end <= (1usize << start_layer));
+
+        let rows_per_block = 1usize << (log_d - stop_layer);
+        let top_block_positions = RADIX64 * rows_per_block;
+        let top_block_elems = top_block_positions * num_ntts;
+        let range_blocks = b_end - b_start;
+
+        let fused3_twiddles = |layer: usize, block: usize| {
+            let mut tw = [F128::ZERO; 7];
+            tw[0] = self.twiddle(layer, block);
+            for s in 0..2 {
+                tw[1 + s] = self.twiddle(layer + 1, 2 * block + s);
+            }
+            for s in 0..4 {
+                tw[3 + s] = self.twiddle(layer + 2, 4 * block + s);
+            }
+            tw
+        };
+        let first_twiddles: Vec<[F128; 7]> = (b_start..b_end)
+            .map(|block| fused3_twiddles(start_layer, block))
+            .collect();
+        let second_twiddles: Vec<[[F128; 7]; RADIX]> = (b_start..b_end)
+            .map(|block| {
+                std::array::from_fn(|outer| fused3_twiddles(start_layer + 3, block * RADIX + outer))
+            })
+            .collect();
+
+        let tiles_per_block = rows_per_block.div_ceil(ROWS_PER_TILE);
+        let jobs_per_block = tiles_per_block.div_ceil(TILES_PER_JOB);
+        let n_jobs = range_blocks * jobs_per_block;
+        let base = crate::epool::SyncPtr(data.as_mut_ptr());
+        let scratch_elems = RADIX64 * ROWS_PER_TILE * num_ntts;
+        crate::epool::run_chunks_with_helper_stateful(
+            n_jobs,
+            &|| vec![F128::ZERO; scratch_elems],
+            &|scratch, job| {
+                let local_block = job / jobs_per_block;
+                let job_in_block = job % jobs_per_block;
+                let tile_start = job_in_block * TILES_PER_JOB;
+                let tile_end = (tile_start + TILES_PER_JOB).min(tiles_per_block);
+                let absolute_block = b_start + local_block;
+                let block_base = unsafe { base.ptr().add(absolute_block * top_block_elems) };
+
+                for tile in tile_start..tile_end {
+                    let row_start = tile * ROWS_PER_TILE;
+                    let row_end = (row_start + ROWS_PER_TILE).min(rows_per_block);
+                    let tile_rows = row_end - row_start;
+
+                    // Global cell order is [outer][inner]. Scratch uses
+                    // [inner][outer][tile-row], so both radix-8 dimensions can
+                    // use the existing q-resident kernel without a transpose.
+                    for inner in 0..RADIX {
+                        for outer in 0..RADIX {
+                            let global_cell = outer * RADIX + inner;
+                            let scratch_cell = inner * RADIX + outer;
+                            let src = unsafe {
+                                block_base
+                                    .add((global_cell * rows_per_block + row_start) * num_ntts)
+                            };
+                            let dst = unsafe {
+                                scratch
+                                    .as_mut_ptr()
+                                    .add(scratch_cell * tile_rows * num_ntts)
+                            };
+                            unsafe {
+                                core::ptr::copy_nonoverlapping(src, dst, tile_rows * num_ntts)
+                            };
+                        }
+                    }
+
+                    // Layers start..start+3: for each inner coordinate, the
+                    // eight outer values are consecutive scratch cells.
+                    for inner in 0..RADIX {
+                        let ptr = unsafe {
+                            scratch
+                                .as_mut_ptr()
+                                .add(inner * RADIX * tile_rows * num_ntts)
+                        };
+                        unsafe {
+                            kernels::butterfly_fused_3layer_rows(
+                                ptr,
+                                tile_rows,
+                                num_ntts,
+                                0,
+                                tile_rows,
+                                &first_twiddles[local_block],
+                            )
+                        };
+                    }
+
+                    // Layers start+3..start+6: a fixed outer coordinate occurs
+                    // at row `outer*tile_rows+r` in each inner group.
+                    for outer in 0..RADIX {
+                        unsafe {
+                            kernels::butterfly_fused_3layer_rows(
+                                scratch.as_mut_ptr(),
+                                RADIX * tile_rows,
+                                num_ntts,
+                                outer * tile_rows,
+                                (outer + 1) * tile_rows,
+                                &second_twiddles[local_block][outer],
+                            )
+                        };
+                    }
+
+                    // Restore the original [outer][inner][row][lane] layout.
+                    for inner in 0..RADIX {
+                        for outer in 0..RADIX {
+                            let global_cell = outer * RADIX + inner;
+                            let scratch_cell = inner * RADIX + outer;
+                            let src = unsafe {
+                                scratch.as_ptr().add(scratch_cell * tile_rows * num_ntts)
+                            };
+                            let dst = unsafe {
+                                block_base
+                                    .add((global_cell * rows_per_block + row_start) * num_ntts)
+                            };
+                            unsafe {
+                                core::ptr::copy_nonoverlapping(src, dst, tile_rows * num_ntts)
+                            };
+                        }
+                    }
+                }
+            },
+            None,
+        );
+    }
+
     /// Complete a ranked hybrid suffix with the same cache-local schedule as
     /// the tuned full-CPU transform, then publish each finalized 1 MiB chunk.
     ///
@@ -824,16 +1018,28 @@ impl AdditiveNttF128 {
         assert_eq!(stop_layer, log_d, "ranked hybrid suffix completes the NTT");
         assert!(b_start < b_end && b_end <= (1usize << start_layer));
 
-        // Two fused radix-8 passes.  Unlike the old all-layer range driver,
-        // this is the last streaming traversal of the complete suffix.
-        self.forward_transform_interleaved_block_range(
-            data,
-            num_ntts,
-            start_layer,
-            DEEP_LAYER,
-            b_start,
-            b_end,
-        );
+        if use_ranked_hybrid_suffix_radix64(log_d, num_ntts, start_layer, DEEP_LAYER) {
+            // One global read/write traversal of the suffix; the intermediate
+            // between the two radix-8 groups remains in worker scratch.
+            self.forward_transform_interleaved_radix64_block_range(
+                data,
+                num_ntts,
+                start_layer,
+                b_start,
+                b_end,
+            );
+        } else {
+            // Exact same-binary control: two independent full-suffix radix-8
+            // traversals, selected with FLOCK_NO_HYBRID_SUFFIX_RADIX64=1.
+            self.forward_transform_interleaved_block_range(
+                data,
+                num_ntts,
+                start_layer,
+                DEEP_LAYER,
+                b_start,
+                b_end,
+            );
+        }
 
         // Every layer-4 block contains 2^(10-4) independent layer-10
         // sub-NTTs.  Preserve their absolute indices so all deeper twiddles
@@ -2925,6 +3131,72 @@ mod twiddle_structure_check {
 #[cfg(test)]
 mod block_range_equivalence {
     use super::*;
+
+    /// Compact oracle for the production 8×8 schedule. It exercises multiple
+    /// absolute layer-4 blocks, four rows per radix-64 cell, general twiddles
+    /// in both radix-8 dimensions, and untouched prefix/suffix sentinels.
+    #[test]
+    fn cache_staged_radix64_range_matches_two_radix8_sweeps() {
+        const NUM_NTTS: usize = 4;
+        const LOG_D: usize = 12;
+        const START_LAYER: usize = 4;
+        const STOP_LAYER: usize = START_LAYER + 6;
+        const B_START: usize = 3;
+        const B_END: usize = 9;
+
+        let ntt = AdditiveNttF128::standard(LOG_D);
+        let mut state = 0x8A64_57A6_EC4C_0190u64;
+        let mut next = || {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            state
+        };
+        for iteration in 0..3 {
+            let source: Vec<F128> = (0..(1usize << LOG_D) * NUM_NTTS)
+                .map(|_| F128::new(next(), next()))
+                .collect();
+            let mut expected = source.clone();
+            ntt.forward_transform_interleaved_block_range(
+                &mut expected,
+                NUM_NTTS,
+                START_LAYER,
+                STOP_LAYER,
+                B_START,
+                B_END,
+            );
+
+            let mut got = source;
+            ntt.forward_transform_interleaved_radix64_block_range(
+                &mut got,
+                NUM_NTTS,
+                START_LAYER,
+                B_START,
+                B_END,
+            );
+            assert_eq!(
+                got, expected,
+                "radix64 range mismatch at iteration={iteration}"
+            );
+        }
+    }
+
+    #[test]
+    fn hybrid_suffix_radix64_gate_is_ranked_only() {
+        let enabled_here = cfg!(all(
+            target_os = "macos",
+            target_arch = "aarch64",
+            target_feature = "aes"
+        ));
+        assert_eq!(
+            is_ranked_hybrid_suffix_radix64_shape(20, 64, 4, 10),
+            enabled_here
+        );
+        assert!(!is_ranked_hybrid_suffix_radix64_shape(19, 64, 4, 10));
+        assert!(!is_ranked_hybrid_suffix_radix64_shape(20, 32, 4, 10));
+        assert!(!is_ranked_hybrid_suffix_radix64_shape(20, 64, 3, 10));
+        assert!(!is_ranked_hybrid_suffix_radix64_shape(20, 64, 4, 9));
+    }
 
     #[test]
     fn block_range_matches_full_transform() {
