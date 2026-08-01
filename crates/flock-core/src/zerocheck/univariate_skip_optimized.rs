@@ -970,6 +970,25 @@ fn zero_c_fold4_banks() -> Box<[[F128; ELL]; N_C_FOLD4_BANKS]> {
     }
 }
 
+/// Allocate the fold4 C banks without the allocator's zero pass. Only for
+/// call sites whose consumer re-establishes the all-zero precondition itself:
+/// every `process_one_x_hi_with_precomputed_ab_fold4_c_*` begins with
+/// `partial_c.iter_mut().for_each(|bank| bank.fill(F128::ZERO))`, so the
+/// constructor's memset there is written twice before any read.
+fn uninit_c_fold4_banks() -> Box<[[F128; ELL]; N_C_FOLD4_BANKS]> {
+    // SAFETY: `F128` is a plain 16-byte value with no invalid bit patterns
+    // observed here — the boxed banks are fully overwritten by the consumer's
+    // leading zero-fill before any lane is read.
+    unsafe {
+        let layout = std::alloc::Layout::new::<[[F128; ELL]; N_C_FOLD4_BANKS]>();
+        let ptr = std::alloc::alloc(layout) as *mut [[F128; ELL]; N_C_FOLD4_BANKS];
+        if ptr.is_null() {
+            std::alloc::handle_alloc_error(layout);
+        }
+        Box::from_raw(ptr)
+    }
+}
+
 /// Allocate one retained-medium group directly on the heap.  Each C worker
 /// owns only 8 KiB of accumulator state, leaving room in a performance core's
 /// L1 data cache for masks, table lines, and the current witness rows.
@@ -2268,7 +2287,7 @@ fn round1_shift_reduce_extract_c_packed_padded_with_precomputed_ab_fold4_n_hi(
                 timing_cpu_ns_ref,
                 &mut partial_ab,
             );
-            let mut partial_c = zero_c_fold4_banks();
+            let mut partial_c = uninit_c_fold4_banks();
             if pair4 && big_lo_size >= 4 {
                 process_one_x_hi_with_precomputed_ab_fold4_c_four(
                     x_hi,

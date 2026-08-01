@@ -843,7 +843,14 @@ pub(crate) unsafe fn accumulate_c_fold4_four_banks(
 
         // Build and consume one q at a time. This keeps mask scratch at 2 KiB
         // instead of retaining all four q groups for all four witness blocks.
-        let mut masks = [[[0u8; 64]; 8]; 4];
+        // SAFETY: for each `q`, the interleave stores below write all 512
+        // bytes of every `masks[side]` (chunk*128 + i*16 for chunk in 0..4,
+        // i in 0..8) before the drain loop reads any of them; short rows are
+        // covered by the explicit `zero` vector stores, never by pre-zeroed
+        // scratch. Skipping the zero-init drops a 2 KiB memset from each of
+        // the ~131k per-prove calls at the ranked shape.
+        let mut masks_scratch = core::mem::MaybeUninit::<[[[u8; 64]; 8]; 4]>::uninit();
+        let masks = &mut *masks_scratch.as_mut_ptr();
         let sources = c_blocks.map(|block| block.as_ptr());
         let m33 = vdupq_n_u8(0x33);
         let m55 = vdupq_n_u8(0x55);

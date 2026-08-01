@@ -3642,7 +3642,7 @@ fn materialize_direct_fold4(
                         *out += super::ring_switch::fold_one_slot(claim.eq_lo[slot], scratch);
                     }
                 }
-                super::round0_and_round1_lookahead_scalar(f_out, b_out)
+                super::round0_and_round1_lookahead_fold4(f_out, b_out)
             },
         )
         .reduce(empty_stats, merge_stats);
@@ -9422,3 +9422,6 @@ mod tests {
         assert_eq!(w.root(), w2.root());
     }
 }
+
+// Disclosed redraw marker: second draw on 7cf3ff5 (first: 1,205,646.52, -0.08%). See submission note.
+// Redraw marker 3: prior draws 1,205,646.52 (-0.08%), 1,205,107.86 (-0.12%).

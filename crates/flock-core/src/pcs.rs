@@ -285,6 +285,37 @@ fn round0_and_round1_lookahead_ranked(
     round0_and_round1_lookahead_scalar(witness, basis)
 }
 
+/// The fold4 materializer's block length at the ranked shape (21 tail
+/// coordinates split as 13 low / 8 high). The deferred-reduction kernel's
+/// contract is only `len % 4 == 0` with equal slice lengths, so gating on the
+/// exact ranked block size keeps every other shape on the scalar route.
+#[inline]
+fn use_fold4_open_lookahead_neon(len: usize) -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    cfg!(all(
+        target_os = "macos",
+        target_arch = "aarch64",
+        target_feature = "aes"
+    )) && len == (1usize << 13)
+        && *ON.get_or_init(|| std::env::var_os("FLOCK_NO_OPEN_LOOKAHEAD_NEON").is_none())
+}
+
+#[inline]
+fn round0_and_round1_lookahead_fold4(
+    witness: &[F128],
+    basis: &[F128],
+) -> ((F128, F128), [F128; 6]) {
+    assert_eq!(witness.len(), basis.len());
+    assert!(witness.len().is_multiple_of(4));
+
+    #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+    if use_fold4_open_lookahead_neon(witness.len()) {
+        return crate::field::f128_slice::round0_and_round1_lookahead(witness, basis);
+    }
+
+    round0_and_round1_lookahead_scalar(witness, basis)
+}
+
 #[inline]
 fn round0_and_round1_lookahead_scalar(
     witness: &[F128],

@@ -2973,19 +2973,21 @@ pub fn prove_batched_padded_with_precomputed<Ch: Challenger>(
                     let low_eq: [F128; 16] = build_eq(&suffix[..4])
                         .try_into()
                         .expect("four-coordinate eq has sixteen entries");
+                    // All 256 products are independent; indexed parallel
+                    // writes preserve the serial loop's slot assignment, so
+                    // the output is bit-identical to the nested loops.
                     let mut products = [F128::ZERO; 256];
-                    let mut scaled_bank = vec![F128::ZERO; n_packed];
-                    for e in 0..16 {
+                    products.par_iter_mut().enumerate().for_each(|(idx, out)| {
+                        let e = idx / 16;
+                        let d_low = idx % 16;
                         let bank = &fold4[e * n_packed..(e + 1) * n_packed];
-                        for d_low in 0..16 {
-                            for packed in 0..n_packed {
-                                scaled_bank[packed] = low_eq[d_low] * bank[packed];
-                            }
-                            let transposed = tensor_algebra_transpose(&scaled_bank);
-                            products[e * 16 + d_low] =
-                                inner_product(&transposed, &scaled_eq_r_dprime);
+                        let mut scaled_bank = vec![F128::ZERO; n_packed];
+                        for packed in 0..n_packed {
+                            scaled_bank[packed] = low_eq[d_low] * bank[packed];
                         }
-                    }
+                        let transposed = tensor_algebra_transpose(&scaled_bank);
+                        *out = inner_product(&transposed, &scaled_eq_r_dprime);
+                    });
                     let tail = &suffix[4..];
                     let (eq_lo, eq_hi) =
                         build_eq_split(tail, deferred_split_n_lo(tail.len()));
