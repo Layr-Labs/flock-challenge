@@ -1394,11 +1394,11 @@ pub fn fold_and_compute_round_pair_into(
     let eq_lo = &eq.lo;
     let eq_hi = &eq.hi;
 
-    let (sum1, sum_inf) = a_out
-        .par_chunks_mut(chunk_out)
-        .zip(b_out.par_chunks_mut(chunk_out))
-        .enumerate()
-        .map(|(x_hi, (a_out, b_out))| {
+    // Per-chunk fold + message kernel, shared by both drain strategies below.
+    // Returns the chunk's raw (p1, pinf); the eq_hi weighting happens at the
+    // reduce so the hetero path can store raw per-chunk partials.
+    let chunk_msgs = |x_hi: usize, a_out: &mut [F128], b_out: &mut [F128]| -> (F128, F128) {
+        {
             let a_in = &a[x_hi * chunk_in..(x_hi + 1) * chunk_in];
             let b_in = &b[x_hi * chunk_in..(x_hi + 1) * chunk_in];
 
@@ -1568,13 +1568,69 @@ pub fn fold_and_compute_round_pair_into(
                 let pinf = pinf_acc.reduce();
                 (p1, pinf)
             };
+            (p1, pinf)
+        }
+    };
+
+    // Same-binary control: the pre-hetero rayon map-reduce over the P-pool
+    // only (`FLOCK_FUSED_HETERO_LEGACY=1`).
+    let (sum1, sum_inf) = if !crate::epool::fused_hetero_enabled() {
+        a_out
+            .par_chunks_mut(chunk_out)
+            .zip(b_out.par_chunks_mut(chunk_out))
+            .enumerate()
+            .map(|(x_hi, (ao, bo))| {
+                let (p1, pinf) = chunk_msgs(x_hi, ao, bo);
+                let eq_h = eq_hi[x_hi];
+                (eq_h * p1, eq_h * pinf)
+            })
+            .reduce(
+                || (F128::ZERO, F128::ZERO),
+                |(s1, sinf), (c1, cinf)| (s1 + c1, sinf + cinf),
+            )
+    } else {
+        // Hetero drain: the idle efficiency cores add throughput through the
+        // shared chunk queue — the promoted round-2 compact mechanism,
+        // extended to every fused tail round. Chunk x_hi writes only its own
+        // a_out/b_out ranges and partials slot; XOR is order-independent and
+        // the weighted reduce below runs in fixed chunk order, so the result
+        // is bit-identical to the rayon map-reduce.
+        let mut partials: Vec<(F128, F128)> = vec![(F128::ZERO, F128::ZERO); hi_size];
+        let a_out_base = crate::epool::SyncPtr(a_out.as_mut_ptr());
+        let b_out_base = crate::epool::SyncPtr(b_out.as_mut_ptr());
+        let partials_base = crate::epool::SyncPtr(partials.as_mut_ptr());
+        crate::epool::run_hetero_chunks(hi_size, |x_hi| {
+            // SAFETY: the queue hands out each x_hi exactly once; chunk x_hi
+            // exclusively owns its output ranges and partials slot; the
+            // queue's completion join publishes the writes before the
+            // reduction below reads them.
+            let (ao, bo) = unsafe {
+                (
+                    std::slice::from_raw_parts_mut(
+                        a_out_base.ptr().add(x_hi * chunk_out),
+                        chunk_out,
+                    ),
+                    std::slice::from_raw_parts_mut(
+                        b_out_base.ptr().add(x_hi * chunk_out),
+                        chunk_out,
+                    ),
+                )
+            };
+            let msgs = chunk_msgs(x_hi, ao, bo);
+            // SAFETY: exclusive slot per x_hi (see above).
+            unsafe {
+                *partials_base.ptr().add(x_hi) = msgs;
+            }
+        });
+        let mut s1 = F128::ZERO;
+        let mut sinf = F128::ZERO;
+        for (x_hi, &(p1, pinf)) in partials.iter().enumerate() {
             let eq_h = eq_hi[x_hi];
-            (eq_h * p1, eq_h * pinf)
-        })
-        .reduce(
-            || (F128::ZERO, F128::ZERO),
-            |(s1, sinf), (c1, cinf)| (s1 + c1, sinf + cinf),
-        );
+            s1 += eq_h * p1;
+            sinf += eq_h * pinf;
+        }
+        (s1, sinf)
+    };
 
     (r_next[0] * sum1, sum_inf)
 }

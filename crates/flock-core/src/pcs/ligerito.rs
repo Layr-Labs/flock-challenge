@@ -2979,11 +2979,9 @@ fn fold2_and_msgs_lsb(
             && *NT_ENABLED
                 .get_or_init(|| std::env::var_os("FLOCK_LIG_NT_LEGACY").is_none())
     };
-    let acc = wf
-        .par_chunks_mut(CHUNK)
-        .zip(wb.par_chunks_mut(CHUNK))
-        .enumerate()
-        .map(|(ci, (wfc, wbc))| {
+    // Per-chunk fused fold + messages, shared by both drain strategies.
+    let chunk_body = |ci: usize, wfc: &mut [F128], wbc: &mut [F128]| -> (F128, F128, [F128; 6]) {
+        {
             let base = ci * CHUNK; // output index base
             #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
             {
@@ -3053,17 +3051,69 @@ fn fold2_and_msgs_lsb(
                 }
                 (m_u0, m_u2, c)
             }
-        })
-        .reduce(
-            || (F128::ZERO, F128::ZERO, [F128::ZERO; 6]),
-            |(a0, a2, ac), (b0, b2, bc)| {
-                let mut c = ac;
-                for (x, y) in c.iter_mut().zip(bc.iter()) {
-                    *x += *y;
-                }
-                (a0 + b0, a2 + b2, c)
-            },
-        );
+        }
+    };
+
+    let acc = if !crate::epool::fused_hetero_enabled() {
+        // Same-binary control (`FLOCK_FUSED_HETERO_LEGACY=1`): the pre-hetero
+        // rayon map-reduce over the P-pool only.
+        wf.par_chunks_mut(CHUNK)
+            .zip(wb.par_chunks_mut(CHUNK))
+            .enumerate()
+            .map(|(ci, (wfc, wbc))| chunk_body(ci, wfc, wbc))
+            .reduce(
+                || (F128::ZERO, F128::ZERO, [F128::ZERO; 6]),
+                |(a0, a2, ac), (b0, b2, bc)| {
+                    let mut c = ac;
+                    for (x, y) in c.iter_mut().zip(bc.iter()) {
+                        *x += *y;
+                    }
+                    (a0 + b0, a2 + b2, c)
+                },
+            )
+    } else {
+        // Hetero drain: idle efficiency cores add throughput through the
+        // shared chunk queue (the promoted round-2 compact mechanism, applied
+        // to the opening's fused fold). Chunk ci writes only its own output
+        // ranges and partials slot; XOR combination is order-independent and
+        // the reduce below runs in fixed chunk order, so the result is
+        // bit-identical to the rayon map-reduce.
+        let n_out = wf.len();
+        let n_chunks = n_out.div_ceil(CHUNK);
+        let mut partials: Vec<(F128, F128, [F128; 6])> =
+            vec![(F128::ZERO, F128::ZERO, [F128::ZERO; 6]); n_chunks];
+        let wf_base = crate::epool::SyncPtr(wf.as_mut_ptr());
+        let wb_base = crate::epool::SyncPtr(wb.as_mut_ptr());
+        let partials_base = crate::epool::SyncPtr(partials.as_mut_ptr());
+        crate::epool::run_hetero_chunks(n_chunks, |ci| {
+            let start = ci * CHUNK;
+            let len = CHUNK.min(n_out - start);
+            // SAFETY: the queue hands out each ci exactly once; chunk ci
+            // exclusively owns its wf/wb ranges and partials slot; the
+            // queue's completion join publishes the writes before the
+            // reduction below reads them.
+            let (wfc, wbc) = unsafe {
+                (
+                    std::slice::from_raw_parts_mut(wf_base.ptr().add(start), len),
+                    std::slice::from_raw_parts_mut(wb_base.ptr().add(start), len),
+                )
+            };
+            let msgs = chunk_body(ci, wfc, wbc);
+            // SAFETY: exclusive slot per ci (see above).
+            unsafe {
+                *partials_base.ptr().add(ci) = msgs;
+            }
+        });
+        let mut acc = (F128::ZERO, F128::ZERO, [F128::ZERO; 6]);
+        for &(u0, u2, c) in partials.iter() {
+            acc.0 += u0;
+            acc.1 += u2;
+            for (x, y) in acc.2.iter_mut().zip(c.iter()) {
+                *x += *y;
+            }
+        }
+        acc
+    };
     (
         SumcheckMessage {
             u_0: acc.0,

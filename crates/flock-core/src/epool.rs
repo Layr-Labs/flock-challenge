@@ -107,6 +107,16 @@ fn build_epool() -> Option<rayon::ThreadPool> {
         .ok()
 }
 
+/// One switch for the fused-fold hetero-drain family (zerocheck tail rounds
+/// + the opening's fold2): `FLOCK_FUSED_HETERO_LEGACY=1` restores the plain
+/// P-pool rayon map-reduce at every converted site for an exact same-binary
+/// control.
+pub(crate) fn fused_hetero_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("FLOCK_FUSED_HETERO_LEGACY").is_none())
+}
+
 /// The lazily-built efficiency-core helper pool, or `None` off-target.
 ///
 /// First use happens during the worker's fixed-seed warm-up proof, so the
