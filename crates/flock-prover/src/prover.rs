@@ -269,35 +269,6 @@ pub(crate) fn prove_fast_ligerito_from_preinitialized_codeword<Ch: Challenger>(
     )
 }
 
-/// Ranked from-message path whose first GPU NTT pass was launched in bands
-/// during witness generation. The remaining graph still runs in the commit
-/// arm concurrently with round-1 AB precomputation.
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn prove_fast_ligerito_from_streamed_first_pass<Ch: Challenger>(
-    r1cs: &BlockR1cs,
-    pcs_params: &PcsParams,
-    z_packed: Vec<F128>,
-    a_packed_f128: Vec<F128>,
-    b_packed_f128: Vec<F128>,
-    z_packed_lincheck: Vec<u8>,
-    lincheck_circuit: &dyn lincheck::LincheckCircuit,
-    codeword: Vec<F128>,
-    stream: flock_core::gpu_commit::FromZFirstPassStream,
-    challenger: &mut Ch,
-) -> (R1csProofLigerito, Commitment, R1csClaim) {
-    prove_fast_ligerito_from_witness_with_commit_codeword(
-        r1cs,
-        pcs_params,
-        z_packed,
-        a_packed_f128,
-        b_packed_f128,
-        z_packed_lincheck,
-        lincheck_circuit,
-        CommitCodeword::StreamedFirstPass(codeword, stream),
-        challenger,
-    )
-}
-
 #[allow(clippy::too_many_arguments)]
 fn prove_fast_ligerito_from_witness_with_commit_codeword<Ch: Challenger>(
     r1cs: &BlockR1cs,
@@ -409,7 +380,6 @@ enum CommitCodeword {
     Allocate,
     NeedsReplication(Vec<F128>),
     Preinitialized(Vec<F128>),
-    StreamedFirstPass(Vec<F128>, flock_core::gpu_commit::FromZFirstPassStream),
 }
 
 /// Build the witness commitment and the challenge-independent half of
@@ -441,9 +411,6 @@ fn commit_with_round1_ab_precompute(
             CommitCodeword::NeedsReplication(buf) => pcs::commit_into(z_packed, pcs_params, buf),
             CommitCodeword::Preinitialized(buf) => {
                 pcs::commit_preinitialized(z_packed, buf, pcs_params)
-            }
-            CommitCodeword::StreamedFirstPass(buf, stream) => {
-                pcs::commit_from_streamed_first_pass(z_packed, buf, pcs_params, stream)
             }
         },
         || {

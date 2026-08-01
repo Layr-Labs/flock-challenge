@@ -259,6 +259,13 @@ pub fn commit(z_packed: &[F128], params: &PcsParams) -> (Commitment, ProverData)
     // `z_packed` into the lower half, and zero-fill JUST the upper half (the
     // RS-encoding zero coefficients that the NTT's first-layer butterfly will
     // read). Saves ~64 MB of memory writes at m=29 (~9 ms).
+    if crate::gpu_commit::gpu_commit_latched_on()
+        && ranked_from_message_supported_len(params, codeword_len, z_packed)
+    {
+        // Latched Metal graph reads z directly into persistent staging.
+        // CPU fallback buffer is allocated lazily only if Metal fails.
+        return finalize_commit_impl(z_packed, Vec::new(), params, true);
+    }
     let codeword = crate::scratch::take_f128(codeword_len);
     commit_into(z_packed, params, codeword)
 }
@@ -323,12 +330,20 @@ pub fn use_ranked_from_message_commit(params: &PcsParams) -> bool {
 
 /// [`use_ranked_from_message_commit`] plus the buffer-geometry check
 /// [`commit_into`] needs before taking the fused path.
+fn ranked_from_message_supported_len(
+    params: &PcsParams,
+    codeword_len: usize,
+    z_packed: &[F128],
+) -> bool {
+    use_ranked_from_message_commit(params) && codeword_len == 2 * z_packed.len()
+}
+
 fn ranked_from_message_supported(
     params: &PcsParams,
     codeword: &[F128],
     z_packed: &[F128],
 ) -> bool {
-    use_ranked_from_message_commit(params) && codeword.len() == 2 * z_packed.len()
+    ranked_from_message_supported_len(params, codeword.len(), z_packed)
 }
 
 /// Commit from a codeword whose first `log_inv_rate` trivial NTT layers have
@@ -353,43 +368,6 @@ pub fn commit_preinitialized(
         "commit_preinitialized: codeword buffer has wrong length"
     );
     finalize_commit_impl(z_packed, codeword, params, false)
-}
-
-/// Complete a ranked commitment whose GPU from-`z` layers 0..3 were streamed
-/// during witness generation. On any stream/Metal failure this takes the
-/// unchanged stale codeword through the exact ordinary from-message CPU path.
-#[doc(hidden)]
-pub fn commit_from_streamed_first_pass(
-    z_packed: &[F128],
-    codeword: Vec<F128>,
-    params: &PcsParams,
-    stream: crate::gpu_commit::FromZFirstPassStream,
-) -> (Commitment, ProverData) {
-    params.validate();
-    assert_eq!(z_packed.len(), 1usize << params.log_msg_len());
-    assert_eq!(
-        codeword.len(),
-        params.codeword_len_f128(),
-        "streamed commit: codeword buffer has wrong length"
-    );
-    let (codeword, merkle_tree) = crate::gpu_commit::finish_from_z_first_pass_or_fallback(
-        stream,
-        z_packed,
-        codeword,
-        params,
-        |cw| cpu_transform_and_tree(cw, params, Some(z_packed)),
-    );
-    let root = *merkle_tree.last().expect("merkle tree non-empty");
-    (
-        Commitment {
-            root,
-            params: params.clone(),
-        },
-        ProverData {
-            codeword,
-            merkle_tree,
-        },
-    )
 }
 
 /// Process CPU (user+system) in ms for `FLOCK_COMMIT_TIMING` diagnostics.
@@ -831,6 +809,11 @@ pub fn prefault_codeword_during<R>(
         // Truly single-threaded (or explicitly disabled): no extra OS thread;
         // commit allocates inline. FLOCK_NO_PREFAULT lets benchmarks A/B the
         // offload and keeps fixed-thread-count sweeps honest.
+        return (None, generate());
+    }
+    // Warmup selected persistent Metal staging: do not pull the unused
+    // 1 GiB CPU codeword into the timed witness phase.
+    if crate::gpu_commit::gpu_commit_latched_on() && use_ranked_from_message_commit(params) {
         return (None, generate());
     }
     let codeword_len = params.n_positions() * params.num_ntts();
