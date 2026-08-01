@@ -26,12 +26,6 @@ pub mod pack;
 pub mod ring_switch;
 pub mod tensor_algebra;
 
-/// Whether untimed warmup permanently selected the ranked Metal commit.
-/// Callers may omit CPU-only speculative buffers once this is true.
-pub fn ranked_gpu_commit_latched_on() -> bool {
-    crate::gpu_commit::gpu_commit_latched_on()
-}
-
 pub use commit::{
     Commitment, PcsParams, ProverData, commit, commit_into, commit_preinitialized,
     prefault_codeword_during, use_ranked_from_message_commit,
