@@ -234,6 +234,87 @@ pub(crate) unsafe fn accumulate_convert_ab(
     }
 }
 
+/// Preconvert one outer block's AB medium rows into 64 F128 lane values —
+/// the same 4-lane paired-`b_med` EOR3 gather schedule as
+/// [`accumulate_convert_ab`], with the drain storing the converted values
+/// instead of multiply-accumulating them (the `eq_lo` weight is applied by
+/// the challenge-weighted completion). Runs on the commit-overlapped
+/// challenge-independent branch.
+#[inline(always)]
+pub(crate) unsafe fn preconvert_ab_block(
+    chunk_ab_bytes: &[[u8; 64]; 16],
+    n_b_med: usize,
+    convert: &[F128],
+    out: &mut [F128; 64],
+) {
+    use core::arch::aarch64::*;
+
+    debug_assert!(n_b_med <= 16);
+    debug_assert_eq!(convert.len(), 16 * 256);
+
+    // SAFETY: caller guarantees fixed input sizes and aarch64 provides NEON;
+    // every table offset is a u8 index scaled by the 16-byte row size within
+    // the debug-asserted table length.
+    unsafe {
+        let convert_ptr = convert.as_ptr() as *const u8;
+        let n_pairs = n_b_med / 2;
+        for lane in (0..64).step_by(4) {
+            let mut ab0 = vdupq_n_u8(0);
+            let mut ab1 = vdupq_n_u8(0);
+            let mut ab2 = vdupq_n_u8(0);
+            let mut ab3 = vdupq_n_u8(0);
+
+            for p in 0..n_pairs {
+                let (b_even, b_odd) = (2 * p, 2 * p + 1);
+                let t_even = convert_ptr.add(b_even * 256 * 16);
+                let t_odd = convert_ptr.add(b_odd * 256 * 16);
+                let we =
+                    (chunk_ab_bytes[b_even].as_ptr().add(lane) as *const u32).read_unaligned()
+                        as usize;
+                let wo = (chunk_ab_bytes[b_odd].as_ptr().add(lane) as *const u32).read_unaligned()
+                    as usize;
+                ab0 = xor3_u8(
+                    ab0,
+                    vld1q_u8(t_even.add((we & 0xff) * 16)),
+                    vld1q_u8(t_odd.add((wo & 0xff) * 16)),
+                );
+                ab1 = xor3_u8(
+                    ab1,
+                    vld1q_u8(t_even.add(((we >> 8) & 0xff) * 16)),
+                    vld1q_u8(t_odd.add(((wo >> 8) & 0xff) * 16)),
+                );
+                ab2 = xor3_u8(
+                    ab2,
+                    vld1q_u8(t_even.add(((we >> 16) & 0xff) * 16)),
+                    vld1q_u8(t_odd.add(((wo >> 16) & 0xff) * 16)),
+                );
+                ab3 = xor3_u8(
+                    ab3,
+                    vld1q_u8(t_even.add((we >> 24) * 16)),
+                    vld1q_u8(t_odd.add((wo >> 24) * 16)),
+                );
+            }
+
+            if n_b_med & 1 == 1 {
+                let b_med = n_b_med - 1;
+                let table = convert_ptr.add(b_med * 256 * 16);
+                let wa = (chunk_ab_bytes[b_med].as_ptr().add(lane) as *const u32).read_unaligned()
+                    as usize;
+                ab0 = veorq_u8(ab0, vld1q_u8(table.add((wa & 0xff) * 16)));
+                ab1 = veorq_u8(ab1, vld1q_u8(table.add(((wa >> 8) & 0xff) * 16)));
+                ab2 = veorq_u8(ab2, vld1q_u8(table.add(((wa >> 16) & 0xff) * 16)));
+                ab3 = veorq_u8(ab3, vld1q_u8(table.add((wa >> 24) * 16)));
+            }
+
+            let base = out.as_mut_ptr().add(lane) as *mut u8;
+            vst1q_u8(base, ab0);
+            vst1q_u8(base.add(16), ab1);
+            vst1q_u8(base.add(32), ab2);
+            vst1q_u8(base.add(48), ab3);
+        }
+    }
+}
+
 /// Eight α-free single-bit-`K` C banks, NEON — straight off the packed witness.
 ///
 /// Three phases, no multiplies, no convert-table gathers, and **no per-`b_med`

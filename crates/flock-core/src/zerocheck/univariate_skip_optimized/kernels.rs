@@ -190,6 +190,38 @@ pub(super) fn shift_reduce_inner_ab(
     }
 }
 
+/// Preconvert one outer block's AB medium rows into 64 F128 lane values
+/// (fixed medium-coordinate conversion, challenge-independent). NEON uses
+/// the same 4-lane paired-table EOR3 schedule as [`accumulate_convert_ab`]
+/// with a storing drain; the portable form is the scalar sum the oracle
+/// tests pin.
+#[inline]
+pub(super) fn preconvert_ab_block(
+    chunk_ab_bytes: &[[u8; 64]; 16],
+    n_b_med: usize,
+    convert: &[super::F128],
+    out: &mut [super::F128; 64],
+) {
+    #[cfg(target_arch = "aarch64")]
+    // SAFETY: aarch64 statically guarantees NEON and the fixed arrays cover
+    // every table-selected load.
+    unsafe {
+        aarch64::preconvert_ab_block(chunk_ab_bytes, n_b_med, convert, out);
+    }
+
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        out.fill(super::F128::ZERO);
+        for b_med in 0..n_b_med {
+            let table = &convert[b_med * 256..(b_med + 1) * 256];
+            let src = &chunk_ab_bytes[b_med];
+            for lane in 0..64 {
+                out[lane] += table[src[lane] as usize];
+            }
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 #[inline]
 pub(super) fn accumulate_convert(

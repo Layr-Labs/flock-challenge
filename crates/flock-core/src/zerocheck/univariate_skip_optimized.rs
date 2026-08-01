@@ -292,9 +292,73 @@ pub fn bit_transpose_64bytes(input: &[u8; 64], output: &mut [u8; 64]) {
 /// original A and B tables after the round-1 transcript challenge is sampled.
 pub struct Round1AbInner {
     storage: Vec<F128>,
+    /// When set, each 1 KiB outer block holds 64 already-converted `F128`
+    /// lane values (the fixed medium-coordinate conversion collapsed at
+    /// precompute time) instead of 16 shifted-GF(2^8) 64-byte rows. The
+    /// challenge-weighted completion then reads one sequential F128 row and
+    /// applies only `eq_lo`, deleting the 16 convert-table gathers per lane
+    /// group from the live round-1 phase. Total storage is unchanged:
+    /// 64 lanes × 16 B = 16 medium × 64 B = 1 KiB per outer assignment.
+    preconverted: bool,
 }
 
+/// Ranked-shape gate for the AB preconversion. The representation must be
+/// chosen identically by the producer and every consumer within one prove, so
+/// the decision is a pure function of the padding shape, `m`, and the same
+/// environment kill switches the completion reads: preconversion requires the
+/// split-AB linear pass and the direct row view (its 1 KiB blocks are only
+/// dereferenced on that path).
+fn ab_preconvert_enabled(m: usize, padding: &PaddingSpec) -> bool {
+    // Deliberately OPT-IN (`FLOCK_ZC_AB_PRECONVERT=1`) until the mechanism
+    // has clean ranked-runner evidence: its first runner sample (submission
+    // dfead724, scalar producer tail) scored −6.24% — the added AB-branch
+    // conversion cost appears to exceed the commit-join slack on the scoring
+    // host even though the round-1 saving is real (~25% r1 CPU locally).
+    // The NEON tail below cuts the branch cost several-fold; flip this to
+    // default-on only behind a fresh runner measurement.
+    cfg!(all(target_os = "macos", target_arch = "aarch64"))
+        && m == 32
+        && padding.k_log == 14
+        && padding.useful_bits_per_block == 15_409
+        && std::env::var_os("FLOCK_ZC_AB_PRECONVERT").is_some()
+        && std::env::var_os("FLOCK_NO_ZC_SPLIT_AB_C").is_none()
+        && std::env::var_os("FLOCK_NO_ZC_DIRECT_AB_ROWS").is_none()
+}
+
+/// Collapse one outer assignment's 16 shifted-byte medium rows into its 64
+/// preconverted `F128` lane values, in place. `convert` is the fixed
+/// `γ^b · φ_8(v)` table — challenge-independent — so this runs entirely on
+/// the commit-overlapped precompute branch. Padding holes are explicit zero
+/// rows and `convert[b][0] == 0`, so summing live rows only is exact.
+#[inline]
+fn preconvert_outer_block(out_outer: &mut [u8], n_b_med: usize, convert: &[F128]) {
+    debug_assert_eq!(out_outer.len(), OUTER_BYTES_CONST);
+    let mut bytes = [[0u8; 64]; 16];
+    for (b_med, row) in bytes.iter_mut().enumerate().take(n_b_med) {
+        row.copy_from_slice(&out_outer[b_med * 64..(b_med + 1) * 64]);
+    }
+    let mut row_f = [F128::ZERO; 64];
+    kernels::preconvert_ab_block(&bytes, n_b_med, convert, &mut row_f);
+    // SAFETY: `out_outer` is a 1 KiB view into a `Vec<F128>` at a 1 KiB-
+    // aligned offset; 64 × 16 B exactly fills it.
+    unsafe {
+        core::ptr::copy_nonoverlapping(
+            row_f.as_ptr().cast::<u8>(),
+            out_outer.as_mut_ptr(),
+            OUTER_BYTES_CONST,
+        );
+    }
+}
+
+const OUTER_BYTES_CONST: usize = (1 << N_MEDIUM) * 64;
+
 impl Round1AbInner {
+    /// Whether the storage holds preconverted F128 rows (see field docs).
+    #[inline]
+    pub fn is_preconverted(&self) -> bool {
+        self.preconverted
+    }
+
     #[inline]
     fn as_bytes(&self) -> &[u8] {
         unsafe {
@@ -366,6 +430,12 @@ pub fn precompute_round1_ab_inner_packed_padded(
     let mut storage = crate::scratch::take_f128(total_bytes / core::mem::size_of::<F128>());
     let out_bytes: &mut [u8] =
         unsafe { core::slice::from_raw_parts_mut(storage.as_mut_ptr() as *mut u8, total_bytes) };
+    let preconverted = ab_preconvert_enabled(m, padding);
+    let convert = if preconverted {
+        Some(convert_table())
+    } else {
+        None
+    };
 
     out_bytes
         .par_chunks_mut(OUTER_BYTES)
@@ -411,10 +481,19 @@ pub fn precompute_round1_ab_inner_packed_padded(
                     );
                 }
                 out_outer[n_b_med * 64..].fill(0);
+                if let Some(convert) = convert {
+                    // Fixed-coordinate conversion collapsed here, on the
+                    // commit-overlapped branch, while the freshly written
+                    // rows are still cache-hot.
+                    preconvert_outer_block(out_outer, n_b_med, convert);
+                }
             },
         );
 
-    Round1AbInner { storage }
+    Round1AbInner {
+        storage,
+        preconverted,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -855,6 +934,7 @@ fn process_one_x_hi_with_precomputed_ab(
     direct_ab_rows: bool,
     c_drain4: bool,
     c_drain8: bool,
+    ab_preconverted: bool,
     state: &mut WorkerStateWithSHatV,
 ) {
     state.partial_ab.iter_mut().for_each(|p| *p = F128::ZERO);
@@ -882,6 +962,24 @@ fn process_one_x_hi_with_precomputed_ab(
 
             let chunk_byte_base =
                 ((x_outer_lo << N_INNER) | (x_hi << n_lo_and_inner)) * N_CHUNKS;
+            if ab_preconverted {
+                // The fixed medium-coordinate conversion happened on the
+                // commit-overlapped precompute branch: the block holds 64
+                // F128 lane values; only `eq_lo` remains challenge-side.
+                // SAFETY: the block is a 1 KiB-aligned view into the
+                // precompute's `Vec<F128>` storage.
+                let row: &[F128; 64] = unsafe {
+                    &*ab_inner
+                        .as_ptr()
+                        .add(chunk_byte_base)
+                        .cast::<[F128; 64]>()
+                };
+                let eq_lo_val = eq_lo_scaled[x_outer_lo];
+                for (p, r) in state.partial_ab.iter_mut().zip(row.iter()) {
+                    *p += *r * eq_lo_val;
+                }
+                continue;
+            }
             let chunk_ab_bytes = if direct_ab_rows {
                 precomputed_ab_rows(ab_inner, chunk_byte_base)
             } else {
@@ -1352,7 +1450,12 @@ pub fn round1_shift_reduce_extract_c_packed_padded_with_precomputed_ab(
     let eq_hi = &eq.hi;
     let (within_outer_mask, b_med_counts) = build_b_med_counts(padding);
     let ab_inner_bytes = ab_inner.as_bytes();
-    let split_ab_c = std::env::var_os("FLOCK_NO_ZC_SPLIT_AB_C").is_none();
+    let ab_preconverted = ab_inner.is_preconverted();
+    // The preconverted representation is only dereferenced on the split-AB
+    // path; the producer's gate implies split, and forcing it here keeps the
+    // interpretation correct even if the env toggles between the precompute
+    // and this completion.
+    let split_ab_c = std::env::var_os("FLOCK_NO_ZC_SPLIT_AB_C").is_none() || ab_preconverted;
     let direct_ab_rows = std::env::var_os("FLOCK_NO_ZC_DIRECT_AB_ROWS").is_none();
     let c_drain4 = std::env::var_os("FLOCK_NO_ZC_C_DRAIN4").is_none();
     // The ranked Apple shape has enough independent table lookups to fill an
@@ -1389,6 +1492,7 @@ pub fn round1_shift_reduce_extract_c_packed_padded_with_precomputed_ab(
             direct_ab_rows,
             c_drain4,
             c_drain8,
+            ab_preconverted,
             &mut state,
         );
         // SAFETY: the queue hands out each x_hi exactly once, so this task is
@@ -2391,6 +2495,89 @@ mod tests {
                 &inv_table,
             );
             assert_eq!(got_quad, oracle_quad, "quad mismatch vs scalar oracle at m={m}");
+        }
+    }
+
+    /// The preconverted AB representation (64 F128 lane values per outer,
+    /// fixed medium-coordinate conversion collapsed at precompute time) must
+    /// reproduce every wire the byte representation produces: res_ab,
+    /// res_c_lifted, s_hat_v_c, and the quad. Covers dense m=13..=17 plus
+    /// the exact BLAKE3 padded layout (k_log=14, 15,409 useful bits) at
+    /// m=15..=17, which exercises partial `n_b_med` rows and zero holes.
+    /// The production gate is m=32-only, so the preconverted inner is built
+    /// here through the same `preconvert_outer_block` the producer tail uses.
+    #[test]
+    fn ab_preconversion_matches_byte_representation() {
+        let mut cases: Vec<(usize, PaddingSpec)> =
+            (13usize..=17).map(|m| (m, PaddingSpec::dense(m))).collect();
+        for m in 15usize..=17 {
+            cases.push((
+                m,
+                PaddingSpec {
+                    k_log: 14,
+                    useful_bits_per_block: 15_409,
+                },
+            ));
+        }
+        for (m, padding) in cases {
+            let mut rng = Rng::new(0xAB11_0000_u64.wrapping_add(m as u64) ^ padding.k_log as u64);
+            let a = pack_bits(&rng.bits(1 << m));
+            let b = pack_bits(&rng.bits(1 << m));
+            let c = pack_bits(&rng.bits(1 << m));
+            let outer = rng.f128_vec(m - K_SKIP - N_INNER);
+            let r = build_protocol_r(m, &outer);
+            let inv_table = make_inv_table();
+
+            let byte_inner =
+                precompute_round1_ab_inner_packed_padded(&a, &b, m, K_SKIP, &inv_table, &padding);
+            assert!(
+                !byte_inner.is_preconverted(),
+                "small shapes must not take the ranked gate"
+            );
+
+            // Build the preconverted twin through the same conversion the
+            // producer tail applies under the ranked gate.
+            let (within_outer_mask, b_med_counts) = build_b_med_counts(&padding);
+            let convert = convert_table();
+            let mut storage = byte_inner.storage.clone();
+            {
+                let total_bytes = storage.len() * core::mem::size_of::<F128>();
+                let bytes: &mut [u8] = unsafe {
+                    core::slice::from_raw_parts_mut(storage.as_mut_ptr() as *mut u8, total_bytes)
+                };
+                for (x_outer, out_outer) in bytes.chunks_mut(OUTER_BYTES_CONST).enumerate() {
+                    let n_b_med = b_med_counts[x_outer & within_outer_mask] as usize;
+                    preconvert_outer_block(out_outer, n_b_med, convert);
+                }
+            }
+            let pre_inner = Round1AbInner {
+                storage,
+                preconverted: true,
+            };
+
+            let got_bytes = round1_shift_reduce_extract_c_packed_padded_with_precomputed_ab(
+                &byte_inner,
+                &c,
+                m,
+                K_SKIP,
+                &r,
+                &inv_table,
+                &padding,
+            );
+            let got_pre = round1_shift_reduce_extract_c_packed_padded_with_precomputed_ab(
+                &pre_inner,
+                &c,
+                m,
+                K_SKIP,
+                &r,
+                &inv_table,
+                &padding,
+            );
+            assert_eq!(
+                got_bytes, got_pre,
+                "preconverted AB wires diverge at m={m}, k_log={}",
+                padding.k_log
+            );
         }
     }
 
