@@ -509,9 +509,11 @@ kernel void ntt_fused(device uint4* data                [[buffer(0)]],
 // One thread owns ALL 2^f tile positions of a single lane in registers, so
 // the whole radix-2^f butterfly network happens in-thread: no threadgroup
 // staging of data, no inter-layer barriers. A threadgroup is 64 threads =
-// one tile (64 lanes); its 2^f - 1 twiddles get four reduced nibble tables
-// each (gf_mul_tab4), built cooperatively in two phases: first the 4 base
-// values tw*x^(4k) per twiddle, then the 16 nibble multiples of each base.
+// one or more same-B tiles (64 lanes each); their shared 2^f - 1 twiddles get
+// four reduced nibble tables each (gf_mul_tab4), built cooperatively in two
+// phases: first the 4 base values tw*x^(4k) per twiddle, then the 16 nibble
+// multiples of each base. Same-B tiles execute sequentially, keeping the
+// 64-thread occupancy and register footprint of the one-tile kernel.
 // The f loops below have compile-time bounds, so the elems[] array stays in
 // registers (dynamic indexing would spill it to stack memory).
 // ===========================================================================
@@ -526,17 +528,15 @@ kernel void NAME(device uint4* data                [[buffer(0)]],              \
     constexpr uint F   = F_CONST;                                              \
     constexpr uint NF  = 1u << F;                                              \
     constexpr uint NTW = NF - 1u;                                              \
-    constexpr uint NTHREADS = 64u << LOG_G;                                    \
     threadgroup uint4 bases[NTW * 4u];                                         \
     threadgroup uint4 tabs[NTW * 64u];                                         \
                                                                                \
-    /* LOG_G > 0: 2^LOG_G tiles with consecutive r (same B, hence the same   */\
-    /* twiddle set and tables) share this threadgroup. Requires s >= LOG_G.  */\
-    const uint lane = lid & 63u;                                               \
-    const uint rr   = lid >> 6;                                                \
+    /* LOG_G > 0: process 2^LOG_G consecutive-r tiles sequentially while    */\
+    /* reusing one same-B twiddle table. Requires s >= LOG_G. */              \
+    const uint lane = lid;                                                     \
     const uint B = tgid >> (P.s - LOG_G);                                      \
-    const uint r = ((tgid & ((1u << (P.s - LOG_G)) - 1u)) << LOG_G) + rr;      \
-    const uint pos_base = (B << (P.log_d - P.l)) + r;                          \
+    const uint r_base =                                                        \
+        (tgid & ((1u << (P.s - LOG_G)) - 1u)) << LOG_G;                        \
                                                                                \
     /* Phase 1: base values tw * x^(4k), one entry per thread (<= 60). */     \
     if (lid < NTW * 4u) {                                                      \
@@ -551,7 +551,7 @@ kernel void NAME(device uint4* data                [[buffer(0)]],              \
     threadgroup_barrier(mem_flags::mem_threadgroup);                           \
                                                                                \
     /* Phase 2: nibble multiples of each base. */                             \
-    for (uint ei = lid; ei < NTW * 64u; ei += NTHREADS) {                      \
+    for (uint ei = lid; ei < NTW * 64u; ei += 64u) {                           \
         uint t   = ei >> 6;                                                    \
         uint sub = ei & 63u;                                                   \
         uint n   = sub & 15u;                                                  \
@@ -565,32 +565,35 @@ kernel void NAME(device uint4* data                [[buffer(0)]],              \
     }                                                                          \
     threadgroup_barrier(mem_flags::mem_threadgroup);                           \
                                                                                \
-    /* Load the lane's tile column into registers (coalesced per e). */       \
-    uint4 elems[NF];                                                           \
-    for (uint e = 0; e < NF; e++) {                                            \
-        elems[e] = data[((pos_base + (e << P.s)) << 6) + lane];                \
-    }                                                                          \
-                                                                               \
-    /* f butterfly sub-layers, entirely in registers. */                      \
-    for (uint j = 0; j < F; j++) {                                             \
-        uint bpos = F - 1u - j;                                                \
-        for (uint b = 0; b < (NF >> 1); b++) {                                 \
-            uint low = b & ((1u << bpos) - 1u);                                \
-            uint eu  = ((b >> bpos) << (bpos + 1u)) | low;                     \
-            uint ev  = eu | (1u << bpos);                                      \
-            uint tsel = ((1u << j) - 1u) + (eu >> (F - j));                    \
-            uint4 nu = elems[eu] ^ gf_mul_tab4(elems[ev], &tabs[tsel << 6]);   \
-            elems[eu] = nu;                                                    \
-            elems[ev] ^= nu;                                                   \
+    for (uint rr = 0; rr < (1u << LOG_G); rr++) {                              \
+        const uint r = r_base + rr;                                            \
+        const uint pos_base = (B << (P.log_d - P.l)) + r;                      \
+        /* Load one lane's tile column into registers (coalesced per e). */    \
+        uint4 elems[NF];                                                       \
+        for (uint e = 0; e < NF; e++) {                                        \
+            elems[e] = data[((pos_base + (e << P.s)) << 6) + lane];            \
         }                                                                      \
-    }                                                                          \
-                                                                               \
-    for (uint e = 0; e < NF; e++) {                                            \
-        data[((pos_base + (e << P.s)) << 6) + lane] = elems[e];                \
+        /* f butterfly sub-layers, entirely in registers. */                  \
+        for (uint j = 0; j < F; j++) {                                         \
+            uint bpos = F - 1u - j;                                            \
+            for (uint b = 0; b < (NF >> 1); b++) {                             \
+                uint low = b & ((1u << bpos) - 1u);                            \
+                uint eu  = ((b >> bpos) << (bpos + 1u)) | low;                 \
+                uint ev  = eu | (1u << bpos);                                  \
+                uint tsel = ((1u << j) - 1u) + (eu >> (F - j));                \
+                uint4 nu = elems[eu]                                           \
+                    ^ gf_mul_tab4(elems[ev], &tabs[tsel << 6]);                \
+                elems[eu] = nu;                                                \
+                elems[ev] ^= nu;                                               \
+            }                                                                  \
+        }                                                                      \
+        for (uint e = 0; e < NF; e++) {                                        \
+            data[((pos_base + (e << P.s)) << 6) + lane] = elems[e];            \
+        }                                                                      \
     }                                                                          \
 }
 
-DEF_NTT_FUSED_REG(ntt_fused_reg4g8, 4u, 3u)   // 8 same-B tiles, 512 threads
+DEF_NTT_FUSED_REG(ntt_fused_reg4g4, 4u, 2u)   // 4 same-B tiles, sequential
 DEF_NTT_FUSED_REG(ntt_fused_reg4,   4u, 0u)
 DEF_NTT_FUSED_REG(ntt_fused_reg3,   3u, 0u)
 
@@ -765,10 +768,7 @@ kernel void parent_hash(device const uint* children [[buffer(0)]],
         pub(crate) device: Id,
         pub(crate) queue: Id,
         pub(crate) pso_ntt: Id,
-        /// Compiled but unselected: 8-tile shared-table variant, kept for
-        /// occupancy experiments (see the note in `encode_ntt_passes`).
-        #[allow(dead_code)]
-        pub(crate) pso_ntt4g8: Id,
+        pub(crate) pso_ntt4g4: Id,
         pub(crate) pso_ntt4: Id,
         pub(crate) pso_ntt3: Id,
         pub(crate) pso_ntt4z: Id,
@@ -852,7 +852,7 @@ kernel void parent_hash(device const uint* children [[buffer(0)]],
                     Ok(p)
                 };
                 let pso_ntt = pso("ntt_fused")?;
-                let pso_ntt4g8 = pso("ntt_fused_reg4g8")?;
+                let pso_ntt4g4 = pso("ntt_fused_reg4g4")?;
                 let pso_ntt4 = pso("ntt_fused_reg4")?;
                 let pso_ntt3 = pso("ntt_fused_reg3")?;
                 let pso_ntt4z = pso("ntt_fused_reg4_from_z")?;
@@ -864,7 +864,7 @@ kernel void parent_hash(device const uint* children [[buffer(0)]],
                     device,
                     queue,
                     pso_ntt,
-                    pso_ntt4g8,
+                    pso_ntt4g4,
                     pso_ntt4,
                     pso_ntt3,
                     pso_ntt4z,
@@ -1049,36 +1049,6 @@ kernel void parent_hash(device const uint* children [[buffer(0)]],
         }
 
         /// Commit and block until completion; verifies status == completed.
-        /// Commit without waiting (hybrid: CPU works while the GPU runs).
-        pub(crate) unsafe fn commit_async(&self, cb: Id) {
-            unsafe {
-                send!(self.api, unsafe extern "C" fn(Id, Sel), cb, c"commit");
-            }
-        }
-
-        /// Wait for a previously `commit_async`ed buffer and check status.
-        pub(crate) unsafe fn wait_cb(&self, cb: Id) -> Result<(), String> {
-            unsafe {
-                send!(
-                    self.api,
-                    unsafe extern "C" fn(Id, Sel),
-                    cb,
-                    c"waitUntilCompleted"
-                );
-                let status: u64 = send!(
-                    self.api,
-                    unsafe extern "C" fn(Id, Sel) -> u64,
-                    cb,
-                    c"status"
-                );
-                if status == 4 {
-                    Ok(())
-                } else {
-                    Err(format!("command buffer status {status} (hybrid arm)"))
-                }
-            }
-        }
-
         pub(crate) unsafe fn commit_and_wait(&self, cb: Id) -> Result<(), String> {
             unsafe {
                 send!(self.api, unsafe extern "C" fn(Id, Sel), cb, c"commit");
@@ -1137,18 +1107,26 @@ kernel void parent_hash(device const uint* children [[buffer(0)]],
         unsafe {
             gpu.set_buffer(enc, data_buf, 0, 0);
             gpu.set_buffer(enc, tw_buf, 0, 1);
+            let share_log = if std::env::var_os("FLOCK_NO_GPU_TABLE_REUSE").is_some() {
+                0usize
+            } else {
+                2usize
+            };
             for (l, f) in super::plan_passes(log_d, start_layer) {
                 // Register-resident specializations for the production pass
-                // widths; the generic staged kernel covers the rest. The g8
-                // variant packs 8 same-twiddle tiles per threadgroup (needs
-                // s >= 3) for much better occupancy per KiB of tables.
-                // NOTE: an 8-tile shared-table variant (pso_ntt4g8, 512
-                // threads/group) measured ~55% SLOWER than 64-thread groups:
-                // elems[16] costs ~64 registers/thread and monolithic
-                // 512-thread groups lose the scheduler's register-granular
-                // packing. Kept for future experiments; not selected.
+                // widths; the generic staged kernel covers the rest. At
+                // production passes with s >= 2, one 64-thread group builds
+                // the shared twiddle table once and processes four adjacent
+                // same-B tiles sequentially. This preserves the incumbent
+                // register occupancy; parallel 128/256/512-thread grouping
+                // loses badly because each lane keeps 16 F128s live.
                 let s = log_d - l - f;
                 let (pso, tpg, groups) = match f {
+                    4 if share_log > 0 && s >= share_log => (
+                        gpu.pso_ntt4g4,
+                        64u64,
+                        1u64 << (log_d - f - share_log),
+                    ),
                     4 => (gpu.pso_ntt4, 64u64, 1u64 << (log_d - f)),
                     3 => (gpu.pso_ntt3, 64u64, 1u64 << (log_d - f)),
                     _ => (gpu.pso_ntt, 1u64 << (f + 5), 1u64 << (log_d - f)),
@@ -1166,96 +1144,6 @@ kernel void parent_hash(device const uint* children [[buffer(0)]],
                 );
                 gpu.set_bytes(enc, bytes, 2);
                 gpu.dispatch(enc, groups, tpg);
-            }
-        }
-    }
-
-    /// [`encode_ntt_passes`] restricted to the position prefix covering the
-    /// first `prefix16` sixteenths of the codeword. Valid because the kernel
-    /// derives its block index from the HIGH bits of `tgid`
-    /// (`B = tgid >> (P.s - LOG_G)`), so dispatching `groups * prefix16/16`
-    /// threadgroups enumerates exactly the prefix blocks of every pass with
-    /// `l >= 4`.
-    pub(crate) unsafe fn encode_ntt_passes_prefix(
-        gpu: &Gpu,
-        enc: Id,
-        data_buf: Id,
-        tw_buf: Id,
-        log_d: usize,
-        start_layer: usize,
-        prefix16: u64,
-    ) {
-        unsafe {
-            gpu.set_buffer(enc, data_buf, 0, 0);
-            gpu.set_buffer(enc, tw_buf, 0, 1);
-            for (l, f) in super::plan_passes(log_d, start_layer) {
-                debug_assert!(l >= 4, "prefix passes require layer >= 4 blocks");
-                let s = log_d - l - f;
-                let (pso, tpg, groups) = match f {
-                    4 => (gpu.pso_ntt4, 64u64, 1u64 << (log_d - f)),
-                    3 => (gpu.pso_ntt3, 64u64, 1u64 << (log_d - f)),
-                    _ => (gpu.pso_ntt, 1u64 << (f + 5), 1u64 << (log_d - f)),
-                };
-                gpu.set_pipeline(enc, pso);
-                let p = NttParams {
-                    log_d: log_d as u32,
-                    l: l as u32,
-                    f: f as u32,
-                    s: s as u32,
-                };
-                let bytes = core::slice::from_raw_parts(
-                    (&p as *const NttParams).cast::<u8>(),
-                    core::mem::size_of::<NttParams>(),
-                );
-                gpu.set_bytes(enc, bytes, 2);
-                debug_assert_eq!(groups % 16, 0);
-                gpu.dispatch(enc, groups / 16 * prefix16, tpg);
-            }
-        }
-    }
-
-    /// Encode leaves + all parent levels of ONE aligned subtree
-    /// (`subtree_leaves` a power of two, `leaf_start` aligned to it), writing
-    /// into the subtree's slots of the GLOBAL flat tree layout.
-    pub(crate) unsafe fn encode_merkle_subtree(
-        gpu: &Gpu,
-        enc: Id,
-        codeword_buf: Id,
-        tree_buf: Id,
-        n_leaves_total: usize,
-        leaf_start: usize,
-        subtree_leaves: usize,
-    ) {
-        debug_assert!(subtree_leaves.is_power_of_two());
-        debug_assert_eq!(leaf_start % subtree_leaves, 0);
-        unsafe {
-            gpu.set_pipeline(enc, gpu.pso_leaf);
-            gpu.set_buffer(enc, codeword_buf, leaf_start * 1024, 0);
-            gpu.set_buffer(enc, tree_buf, leaf_start * 32, 1);
-            let tpg = 256u64.min(subtree_leaves as u64);
-            gpu.dispatch(enc, subtree_leaves as u64 / tpg, tpg);
-
-            gpu.set_pipeline(enc, gpu.pso_parent);
-            let mut level_start = 0usize; // global node index of level base
-            let mut level_len = n_leaves_total;
-            let mut local_start = leaf_start;
-            let mut local_len = subtree_leaves;
-            while local_len > 1 {
-                let write_level_start = level_start + level_len;
-                let n_out = local_len / 2;
-                gpu.set_buffer(enc, tree_buf, (level_start + local_start) * 32, 0);
-                gpu.set_buffer(
-                    enc,
-                    tree_buf,
-                    (write_level_start + local_start / 2) * 32,
-                    1,
-                );
-                let tpg = 256u64.min(n_out as u64);
-                gpu.dispatch(enc, n_out as u64 / tpg, tpg);
-                level_start = write_level_start;
-                level_len /= 2;
-                local_start /= 2;
-                local_len = n_out;
             }
         }
     }
@@ -1526,212 +1414,6 @@ kernel void parent_hash(device const uint* children [[buffer(0)]],
         }
     }
 
-    /// Hybrid GPU/CPU commit graph: the GPU runs the shared from-z top pass
-    /// (layers 0..3) over the full codeword, then owns the position prefix
-    /// (first `16 - k` sixteenths: remaining NTT passes + its aligned Merkle
-    /// subtrees) asynchronously while the CPU completes the suffix `k`
-    /// sixteenths (layers 4.. via the bit-exact block-range driver, suffix
-    /// leaves + subtree parents) directly in the shared staging and tree
-    /// buffers. The top 7 tree nodes are (re)computed on the CPU after the
-    /// join, covering every decomposition boundary.
-    ///
-    /// Bit-exact: same kernels/twiddles on both sides, every element and
-    /// tree node written exactly once (top nodes twice, identically).
-    unsafe fn run_commit_graph_from_z_hybrid(
-        gpu: &Gpu,
-        z_buf: Id,
-        staging: Id,
-        tw_buf: Id,
-        tree_buf: Id,
-        log_d: usize,
-        n_leaves: usize,
-        k_cpu16: usize,
-    ) -> Result<(), String> {
-        use rayon::prelude::*;
-        debug_assert!((1..16).contains(&k_cpu16));
-        unsafe {
-            let pool = gpu.pool_push();
-            let r = (|| {
-                // cb1: shared top pass, full range.
-                let cb1 = gpu.command_buffer()?;
-                let enc = gpu.compute_encoder(cb1)?;
-                gpu.set_pipeline(enc, gpu.pso_ntt4z);
-                gpu.set_buffer(enc, staging, 0, 0);
-                gpu.set_buffer(enc, tw_buf, 0, 1);
-                let p = NttParams {
-                    log_d: log_d as u32,
-                    l: 0,
-                    f: 4,
-                    s: (log_d - 4) as u32,
-                };
-                let bytes = core::slice::from_raw_parts(
-                    (&p as *const NttParams).cast::<u8>(),
-                    core::mem::size_of::<NttParams>(),
-                );
-                gpu.set_bytes(enc, bytes, 2);
-                gpu.set_buffer(enc, z_buf, 0, 3);
-                gpu.dispatch(enc, 1u64 << (log_d - 4), 64);
-                gpu.end_encoding(enc);
-                gpu.commit_and_wait(cb1)?;
-
-                // cb2: GPU prefix — remaining passes + aligned subtrees.
-                let prefix16 = (16 - k_cpu16) as u64;
-                let cb2 = gpu.command_buffer()?;
-                let enc = gpu.compute_encoder(cb2)?;
-                encode_ntt_passes_prefix(gpu, enc, staging, tw_buf, log_d, 4, prefix16);
-                // Greedy aligned power-of-two subtree decomposition of the
-                // leaf prefix.
-                let sixteenth = n_leaves / 16;
-                let mut start = 0usize;
-                let prefix_leaves = (16 - k_cpu16) * sixteenth;
-                while start < prefix_leaves {
-                    let mut size = 1usize << (prefix_leaves - start).ilog2();
-                    while start % size != 0 {
-                        size >>= 1;
-                    }
-                    encode_merkle_subtree(gpu, enc, staging, tree_buf, n_leaves, start, size);
-                    start += size;
-                }
-                gpu.end_encoding(enc);
-                gpu.commit_async(cb2);
-
-                // CPU: suffix NTT completion + leaves + subtree parents.
-                // The twiddle table is deterministic per log_d; build it once
-                // per process (first call lands in the untimed warmup).
-                static NTT: std::sync::OnceLock<AdditiveNttF128> = std::sync::OnceLock::new();
-                let ntt = NTT.get_or_init(|| AdditiveNttF128::standard(log_d));
-                debug_assert_eq!(ntt.log_domain_size(), log_d);
-                let data: &mut [F128] = core::slice::from_raw_parts_mut(
-                    gpu.buffer_contents(staging).cast::<F128>(),
-                    n_leaves * 64,
-                );
-                ntt.forward_transform_interleaved_block_range(
-                    data,
-                    64,
-                    4,
-                    log_d,
-                    16 - k_cpu16,
-                    16,
-                );
-                let tree: &mut [Hash] = core::slice::from_raw_parts_mut(
-                    gpu.buffer_contents(tree_buf).cast::<Hash>(),
-                    2 * n_leaves - 1,
-                );
-                let tree_base = crate::epool::SyncPtr(tree.as_mut_ptr());
-                let suffix_leaf_start = prefix_leaves;
-                let suffix_leaves = n_leaves - prefix_leaves;
-                let suffix_bytes: &[u8] = core::slice::from_raw_parts(
-                    data.as_ptr().cast::<u8>().add(suffix_leaf_start * 1024),
-                    suffix_leaves * 1024,
-                );
-                const LEAF_JOB: usize = 1 << 12;
-                suffix_bytes
-                    .par_chunks(LEAF_JOB * 1024)
-                    .enumerate()
-                    .for_each(|(i, bytes)| {
-                        // SAFETY: disjoint leaf output ranges per job.
-                        let outs = core::slice::from_raw_parts_mut(
-                            tree_base.ptr().add(suffix_leaf_start + i * LEAF_JOB),
-                            bytes.len() / 1024,
-                        );
-                        crate::merkle::hash_ranked_blake3_leaf_chunk(bytes, outs);
-                    });
-                // Suffix aligned subtrees' parents (greedy decomposition).
-                let mut sstart = suffix_leaf_start;
-                while sstart < n_leaves {
-                    let mut size = 1usize << (n_leaves - sstart).ilog2();
-                    while sstart % size != 0 {
-                        size >>= 1;
-                    }
-                    let mut level_start = 0usize;
-                    let mut level_len = n_leaves;
-                    let mut local_start = sstart;
-                    let mut local_len = size;
-                    while local_len > 1 {
-                        let write_level_start = level_start + level_len;
-                        let (r0, w0) =
-                            (level_start + local_start, write_level_start + local_start / 2);
-                        let n_out = local_len / 2;
-                        // ≤1024-output jobs (the parent kernel's contract),
-                        // parallel across the level.
-                        // SAFETY: read level fully written (leaves above /
-                        // previous iteration); each job's write range is
-                        // disjoint, and all are disjoint from concurrent GPU
-                        // subtree ranges.
-                        (0..n_out.div_ceil(1024)).into_par_iter().for_each(|j| {
-                            let o = j * 1024;
-                            let len = 1024.min(n_out - o);
-                            let read = core::slice::from_raw_parts(
-                                tree_base.ptr().add(r0 + 2 * o),
-                                2 * len,
-                            );
-                            let write = core::slice::from_raw_parts_mut(
-                                tree_base.ptr().add(w0 + o),
-                                len,
-                            );
-                            crate::merkle::hash_ranked_blake3_parent_chunk(read, write);
-                        });
-                        level_start = write_level_start;
-                        level_len /= 2;
-                        local_start /= 2;
-                        local_len /= 2;
-                    }
-                    sstart += size;
-                }
-
-                // Join the GPU prefix, then (re)compute every level above
-                // the sixteenth-granularity roots. Every subtree on either
-                // side spans ≥ one sixteenth (2^16 leaves), so the 16-node
-                // level is always fully populated by subtree-internal
-                // parents; the 15 nodes above it are recomputed here,
-                // covering every decomposition boundary for any k.
-                gpu.wait_cb(cb2)?;
-                let mut level_start = 0usize;
-                let mut level_len = n_leaves;
-                while level_len > 16 {
-                    level_start += level_len;
-                    level_len /= 2;
-                }
-                while level_len > 1 {
-                    let write_start = level_start + level_len;
-                    let read =
-                        core::slice::from_raw_parts(tree_base.ptr().add(level_start), level_len);
-                    let write = core::slice::from_raw_parts_mut(
-                        tree_base.ptr().add(write_start),
-                        level_len / 2,
-                    );
-                    crate::merkle::hash_ranked_blake3_parent_chunk(read, write);
-                    level_start = write_start;
-                    level_len /= 2;
-                }
-                Ok(())
-            })();
-            gpu.pool_pop(pool);
-            r
-        }
-    }
-
-    /// CPU share of the hybrid commit in sixteenths of the position range.
-    /// 0 disables (pure-GPU graph). Default 2: measured best on-box (k=2
-    /// commit p25 101.1 ms vs pure-GPU 108.8; k≥3 loses — the plain-pass
-    /// suffix driver costs ~2.8× the tuned full-CPU path per sixteenth, and
-    /// the shared unified-memory bandwidth caps how much streaming work the
-    /// CPU can add while the GPU runs).
-    fn hybrid_cpu_sixteenths() -> usize {
-        use std::sync::OnceLock;
-        static K: OnceLock<usize> = OnceLock::new();
-        *K.get_or_init(|| {
-            if std::env::var_os("FLOCK_NO_HYBRID_COMMIT").is_some() {
-                return 0;
-            }
-            std::env::var("FLOCK_HYBRID_CPU_BLOCKS")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .filter(|k| *k < 16)
-                .unwrap_or(2)
-        })
-    }
-
     struct WarmupRun {
         latched: Latched,
         gpu_tree: Vec<Hash>,
@@ -1974,15 +1656,8 @@ kernel void parent_hash(device const uint* children [[buffer(0)]],
         };
 
         let t0 = std::time::Instant::now();
-        let k_cpu16 = hybrid_cpu_sixteenths();
         let run = unsafe {
-            if k_cpu16 > 0 {
-                run_commit_graph_from_z_hybrid(
-                    gpu, z_buf, staging, tw_buf, tree_buf, log_d, n_leaves, k_cpu16,
-                )
-            } else {
-                run_commit_graph_from_z(gpu, z_buf, staging, tw_buf, tree_buf, log_d, n_leaves)
-            }
+            run_commit_graph_from_z(gpu, z_buf, staging, tw_buf, tree_buf, log_d, n_leaves)
         };
         if let Err(e) = run {
             // Neither z nor the replicated codeword was written by the GPU,
