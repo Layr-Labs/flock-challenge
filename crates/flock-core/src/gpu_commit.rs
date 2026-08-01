@@ -56,6 +56,12 @@ pub const ENV_NO_GPU_MIXED_FINAL: &str = "FLOCK_NO_GPU_MIXED_FINAL";
 /// exact value `1` disables it; the optimization remains ranked-tree-only.
 pub const ENV_NO_GPU_PARENT3: &str = "FLOCK_NO_GPU_PARENT3";
 
+/// Strict same-binary control for unretained Metal resource references on the
+/// ranked witness-overlapped command buffers. Only exact value `1` disables
+/// the optimization; ordinary graph, warmup, tuner, and test command buffers
+/// always retain their resources.
+pub const ENV_NO_GPU_STREAM_UNRETAINED: &str = "FLOCK_NO_GPU_STREAM_UNRETAINED";
+
 fn gpu_parent3_value_enabled(value: Option<&std::ffi::OsStr>) -> bool {
     value != Some(std::ffi::OsStr::new("1"))
 }
@@ -71,6 +77,57 @@ fn select_gpu_parent3(n_leaves_total: usize, enabled: bool) -> bool {
     enabled && n_leaves_total == 1usize << 20
 }
 
+fn gpu_stream_unretained_value_enabled(value: Option<&std::ffi::OsStr>) -> bool {
+    value != Some(std::ffi::OsStr::new("1"))
+}
+
+fn gpu_stream_unretained_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        gpu_stream_unretained_value_enabled(
+            std::env::var_os(ENV_NO_GPU_STREAM_UNRETAINED).as_deref(),
+        )
+    })
+}
+
+fn select_gpu_stream_unretained(ranked: bool, streamed: bool, enabled: bool) -> bool {
+    ranked && streamed && enabled
+}
+
+/// Wait every submitted command buffer before releasing its explicit retain.
+/// Preserve the earliest error, but never abandon later handles: with
+/// unretained resource references, draining the entire queue is the lifetime
+/// boundary for the persistent Metal buffers.
+fn drain_stream_handles<T: Copy, E>(
+    handles: &mut Vec<T>,
+    mut result: Result<(), E>,
+    mut wait: impl FnMut(T) -> Result<(), E>,
+    mut release: impl FnMut(T),
+) -> Result<(), E> {
+    for handle in handles.drain(..) {
+        let waited = wait(handle);
+        release(handle);
+        if result.is_ok() {
+            result = waited;
+        }
+    }
+    result
+}
+
+fn wait_and_release_stream_handle<T: Copy, E>(
+    handle: T,
+    mut wait: impl FnMut(T) -> Result<(), E>,
+    mut release: impl FnMut(T),
+) -> Result<(), E> {
+    let waited = wait(handle);
+    release(handle);
+    waited
+}
+
+fn stream_resources_quiesced(pending: usize, has_early: bool) -> bool {
+    pending == 0 && !has_early
+}
+
 #[cfg(test)]
 mod parent3_gate_tests {
     use std::ffi::OsStr;
@@ -84,6 +141,132 @@ mod parent3_gate_tests {
         assert!(super::select_gpu_parent3(1 << 20, true));
         assert!(!super::select_gpu_parent3(1 << 20, false));
         assert!(!super::select_gpu_parent3(1 << 19, true));
+    }
+}
+
+#[cfg(test)]
+mod stream_unretained_gate_tests {
+    use std::cell::RefCell;
+    use std::ffi::OsStr;
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum Mode {
+        Retained,
+        Unretained,
+    }
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum Event {
+        Create(Mode, u8),
+        Wait(u8),
+        ReleaseCommandBuffer(u8),
+        ReleaseResources,
+    }
+
+    fn simulate_drop(
+        mode: Mode,
+        initial_error: bool,
+        wait_error: Option<u8>,
+        early: bool,
+    ) -> (Result<(), &'static str>, Vec<Event>) {
+        let events = RefCell::new(Vec::new());
+        let mut pending = vec![0, 1];
+        for &id in &pending {
+            events.borrow_mut().push(Event::Create(mode, id));
+        }
+        let mut result = if initial_error { Err("encode") } else { Ok(()) };
+        result = super::drain_stream_handles(
+            &mut pending,
+            result,
+            |id| {
+                events.borrow_mut().push(Event::Wait(id));
+                if wait_error == Some(id) {
+                    Err("wait")
+                } else {
+                    Ok(())
+                }
+            },
+            |id| events.borrow_mut().push(Event::ReleaseCommandBuffer(id)),
+        );
+        let mut has_early = early;
+        if early {
+            events.borrow_mut().push(Event::Create(mode, 2));
+            let waited = super::wait_and_release_stream_handle(
+                2,
+                |id| {
+                    events.borrow_mut().push(Event::Wait(id));
+                    if wait_error == Some(id) {
+                        Err("wait")
+                    } else {
+                        Ok(())
+                    }
+                },
+                |id| events.borrow_mut().push(Event::ReleaseCommandBuffer(id)),
+            );
+            if result.is_ok() {
+                result = waited;
+            }
+            has_early = false;
+        }
+        assert!(super::stream_resources_quiesced(pending.len(), has_early));
+        events.borrow_mut().push(Event::ReleaseResources);
+        (result, events.into_inner())
+    }
+
+    fn without_creation_mode(events: &[Event]) -> Vec<(u8, u8)> {
+        events
+            .iter()
+            .map(|event| match *event {
+                Event::Create(_, id) => (0, id),
+                Event::Wait(id) => (1, id),
+                Event::ReleaseCommandBuffer(id) => (2, id),
+                Event::ReleaseResources => (3, 0),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn exact_switch_and_ranked_stream_selector() {
+        assert!(!super::gpu_stream_unretained_value_enabled(Some(OsStr::new("1"))));
+        for value in [None, Some(""), Some("0"), Some("01"), Some("true")] {
+            assert!(super::gpu_stream_unretained_value_enabled(value.map(OsStr::new)));
+        }
+        assert!(super::select_gpu_stream_unretained(true, true, true));
+        assert!(!super::select_gpu_stream_unretained(false, true, true));
+        assert!(!super::select_gpu_stream_unretained(true, false, true));
+        assert!(!super::select_gpu_stream_unretained(true, true, false));
+    }
+
+    #[test]
+    fn retained_and_unretained_modes_have_identical_completion_trace() {
+        let (_, retained) = simulate_drop(Mode::Retained, false, None, true);
+        let (_, unretained) = simulate_drop(Mode::Unretained, false, None, true);
+        assert_eq!(without_creation_mode(&retained), without_creation_mode(&unretained));
+        assert_eq!(retained.last(), Some(&Event::ReleaseResources));
+        assert_eq!(unretained.last(), Some(&Event::ReleaseResources));
+    }
+
+    #[test]
+    fn partial_and_early_failures_still_drain_before_resource_release() {
+        let (partial, partial_events) = simulate_drop(Mode::Unretained, false, Some(0), true);
+        assert_eq!(partial, Err("wait"));
+        assert_eq!(partial_events.last(), Some(&Event::ReleaseResources));
+        assert!(partial_events.contains(&Event::Wait(1)));
+        assert!(partial_events.contains(&Event::Wait(2)));
+
+        // A tile encode failure is recorded after a successfully submitted
+        // prefix. The original error wins and those submitted handles still
+        // complete before the resources may be released.
+        let (tile_encode, tile_events) = simulate_drop(Mode::Unretained, true, None, false);
+        assert_eq!(tile_encode, Err("encode"));
+        assert_eq!(tile_events.last(), Some(&Event::ReleaseResources));
+
+        // An early-prefix encode failure is deliberately non-fatal: it leaves
+        // no early handle and `finish` takes the ordinary retained encode path.
+        let (early_encode, early_events) = simulate_drop(Mode::Unretained, false, None, false);
+        assert_eq!(early_encode, Ok(()));
+        assert_eq!(early_events.last(), Some(&Event::ReleaseResources));
+        assert!(!early_events.iter().any(|event| matches!(event, Event::Create(_, 2))));
     }
 }
 
@@ -1585,6 +1768,39 @@ kernel void parent_hash3(device const uint* children [[buffer(0)]],
             }
         }
 
+        /// Create a command buffer for the ranked witness-overlapped stream.
+        ///
+        /// Metal normally retains every bound resource for every command
+        /// buffer. The stream already provides the stronger lifetime:
+        /// `GPU` owns the queue/pipelines for the process, `LATCH` owns
+        /// staging/twiddle/tree/z buffers, and every submitted buffer is
+        /// explicitly retained and waited before the stream can release its
+        /// lease or the latch can release resources. `setBytes` copies
+        /// `NttParams` while encoding. Thus only Metal's redundant resource
+        /// references are omitted. A disabled selector or nil API result
+        /// falls back to the ordinary retained command-buffer factory.
+        pub(crate) unsafe fn stream_command_buffer(
+            &self,
+            unretained_refs: bool,
+        ) -> Result<Id, String> {
+            if !unretained_refs {
+                return unsafe { self.command_buffer() };
+            }
+            unsafe {
+                let cb: Id = send!(
+                    self.api,
+                    unsafe extern "C" fn(Id, Sel) -> Id,
+                    self.queue,
+                    c"commandBufferWithUnretainedReferences"
+                );
+                if cb.is_null() {
+                    self.command_buffer()
+                } else {
+                    Ok(cb)
+                }
+            }
+        }
+
         pub(crate) unsafe fn compute_encoder(&self, cb: Id) -> Result<Id, String> {
             unsafe {
                 let e: Id = send!(
@@ -2161,10 +2377,13 @@ kernel void parent_hash3(device const uint* children [[buffer(0)]],
 
     static LATCH: Mutex<LatchState> = Mutex::new(LatchState::Undecided);
 
-    /// A staging lease plus retained command buffers for partial first-pass
-    /// dispatches. Each dispatch uses buffer offsets, so the existing tuned
-    /// kernel sees a local `r = 0..r_count` while reading/writing the desired
-    /// global range in all eight message segments.
+    /// A staging lease plus explicitly retained command buffers for partial
+    /// first-pass dispatches. Metal resource references may be unretained,
+    /// but the command buffers themselves stay retained until their waits and
+    /// every referenced object remains owned by `GPU`/`LATCH` throughout.
+    /// Each dispatch uses buffer offsets, so the existing tuned kernel sees a
+    /// local `r = 0..r_count` while reading/writing the desired global range
+    /// in all eight message segments.
     pub(crate) struct FromZFirstPassStream {
         gpu: &'static Gpu,
         z_buf: Id,
@@ -2178,6 +2397,9 @@ kernel void parent_hash3(device const uint* children [[buffer(0)]],
         failed: Option<String>,
         owns_lease: bool,
         started: std::time::Instant,
+        /// Exact ranked-stream-only resource-reference policy captured once
+        /// when the lease is acquired. It does not affect graph semantics.
+        unretained_refs: bool,
         /// Hybrid CPU share captured at stream creation; 0 disables the
         /// early-prefix commit (kill switch, non-hybrid split, or pure-GPU).
         early_k: usize,
@@ -2220,7 +2442,7 @@ kernel void parent_hash3(device const uint* children [[buffer(0)]],
             let result = unsafe {
                 let pool = self.gpu.pool_push();
                 let result = (|| -> Result<Id, String> {
-                    let cb = self.gpu.command_buffer()?;
+                    let cb = self.gpu.stream_command_buffer(self.unretained_refs)?;
                     let enc = self.gpu.compute_encoder(cb)?;
                     let zg4 = super::pass_tune_enabled();
                     self.gpu.set_pipeline(
@@ -2286,6 +2508,7 @@ kernel void parent_hash3(device const uint* children [[buffer(0)]],
                             self.log_d,
                             self.n_leaves,
                             self.early_k,
+                            self.unretained_refs,
                         )?;
                         // Retain across the pool: completion is consumed by
                         // `finish` (same idiom as the streamed tiles above).
@@ -2318,15 +2541,12 @@ kernel void parent_hash3(device const uint* children [[buffer(0)]],
         }
 
         fn wait_pending(&mut self) -> Result<(), String> {
-            let mut result = self.failed.take().map_or(Ok(()), Err);
-            for cb in self.pending.drain(..) {
-                let waited = unsafe { self.gpu.wait_cb(cb) };
-                unsafe { self.gpu.release(cb) };
-                if result.is_ok() {
-                    result = waited;
-                }
-            }
-            result
+            super::drain_stream_handles(
+                &mut self.pending,
+                self.failed.take().map_or(Ok(()), Err),
+                |cb| unsafe { self.gpu.wait_cb(cb) },
+                |cb| unsafe { self.gpu.release(cb) },
+            )
         }
     }
 
@@ -2334,10 +2554,17 @@ kernel void parent_hash3(device const uint* children [[buffer(0)]],
         fn drop(&mut self) {
             let _ = self.wait_pending();
             if let Some((cb2, _)) = self.early_cb2.take() {
-                let _ = unsafe { self.gpu.wait_cb(cb2) };
-                unsafe { self.gpu.release(cb2) };
+                let _ = super::wait_and_release_stream_handle(
+                    cb2,
+                    |cb| unsafe { self.gpu.wait_cb(cb) },
+                    |cb| unsafe { self.gpu.release(cb) },
+                );
             }
             if self.owns_lease {
+                debug_assert!(super::stream_resources_quiesced(
+                    self.pending.len(),
+                    self.early_cb2.is_some()
+                ));
                 STAGING_IN_USE.store(false, std::sync::atomic::Ordering::Release);
             }
         }
@@ -2415,6 +2642,11 @@ kernel void parent_hash3(device const uint* children [[buffer(0)]],
             failed: None,
             owns_lease: true,
             started: std::time::Instant::now(),
+            unretained_refs: super::select_gpu_stream_unretained(
+                super::is_ranked_gpu_shape(params),
+                true,
+                super::gpu_stream_unretained_enabled(),
+            ),
             early_k,
             early_cb2: None,
         })
@@ -2722,11 +2954,16 @@ kernel void parent_hash3(device const uint* children [[buffer(0)]],
         log_d: usize,
         n_leaves: usize,
         k_cpu16: usize,
+        stream_unretained_refs: bool,
     ) -> Result<Id, String> {
         debug_assert!((1..16).contains(&k_cpu16));
         unsafe {
             let prefix16 = (16 - k_cpu16) as u64;
-            let cb2 = gpu.command_buffer()?;
+            let cb2 = if stream_unretained_refs {
+                gpu.stream_command_buffer(true)?
+            } else {
+                gpu.command_buffer()?
+            };
             let enc = gpu.compute_encoder(cb2)?;
             encode_ntt_passes_prefix(gpu, enc, staging, tw_buf, log_d, 4, prefix16);
             // Greedy aligned power-of-two subtree decomposition of the
@@ -2777,7 +3014,14 @@ kernel void parent_hash3(device const uint* children [[buffer(0)]],
                     Some(cb2) => cb2,
                     None => {
                         let cb2 = encode_hybrid_prefix_cb2(
-                            gpu, staging, tw_buf, tree_buf, log_d, n_leaves, k_cpu16,
+                            gpu,
+                            staging,
+                            tw_buf,
+                            tree_buf,
+                            log_d,
+                            n_leaves,
+                            k_cpu16,
+                            false,
                         )?;
                         gpu.commit_async(cb2);
                         cb2
@@ -3660,8 +3904,11 @@ kernel void parent_hash3(device const uint* children [[buffer(0)]],
         let early = stream.early_cb2.take();
         let drain_early = |early: Option<(Id, usize)>| {
             if let Some((cb2, _)) = early {
-                let _ = unsafe { stream.gpu.wait_cb(cb2) };
-                unsafe { stream.gpu.release(cb2) };
+                let _ = super::wait_and_release_stream_handle(
+                    cb2,
+                    |cb| unsafe { stream.gpu.wait_cb(cb) },
+                    |cb| unsafe { stream.gpu.release(cb) },
+                );
             }
         };
         let run = if let Err(e) = first_pass {
@@ -3768,6 +4015,10 @@ kernel void parent_hash3(device const uint* children [[buffer(0)]],
             eprintln!("[gpu-commit] streamed GPU failed ({e}); falling back to CPU");
             stream.owns_lease = false;
             STAGING_IN_USE.store(false, Ordering::Release);
+            debug_assert!(super::stream_resources_quiesced(
+                stream.pending.len(),
+                stream.early_cb2.is_some()
+            ));
             if let LatchState::On(state) = std::mem::replace(&mut *latch, LatchState::Off) {
                 release_latched(stream.gpu, state);
             }
@@ -3802,6 +4053,10 @@ kernel void parent_hash3(device const uint* children [[buffer(0)]],
             )
         };
         // Transfer the staging lease to `GpuCodeword`; its Drop releases it.
+        debug_assert!(super::stream_resources_quiesced(
+            stream.pending.len(),
+            stream.early_cb2.is_some()
+        ));
         stream.owns_lease = false;
         drop(latch);
         (CodewordBuf::Gpu(gpu_codeword), MerkleTreeBuf::Gpu(tree))
