@@ -1948,7 +1948,18 @@ impl Blake3Setup {
             // `FLOCK_NO_NTT_FROM_MSG=1` restores the hot-codeword replicate
             // path below as the exact A/B control.
             if flock_core::pcs::use_ranked_from_message_commit(&self.pcs_params) {
-                let codeword = flock_core::scratch::take_f128(self.pcs_params.codeword_len_f128());
+                // With the GPU latch On, the Metal graph reads only z_packed
+                // and homes the codeword in its persistent staging buffer —
+                // the pooled 1 GiB scratch would be withdrawn and returned
+                // untouched. Skip it (pcs::commit passes the empty marker;
+                // any CPU fallback re-materializes lazily).
+                let codeword = if flock_core::pcs::ranked_gpu_commit_latched_on() {
+                    None
+                } else {
+                    Some(flock_core::scratch::take_f128(
+                        self.pcs_params.codeword_len_f128(),
+                    ))
+                };
                 let cpu_wit = phase_timing.then(crate::prover::process_cpu_ms);
                 let t_wit = std::time::Instant::now();
                 let (z_packed, a_packed_f128, b_packed_f128, z_packed_lincheck) =
@@ -1970,7 +1981,7 @@ impl Blake3Setup {
                     b_packed_f128,
                     z_packed_lincheck,
                     lc_circuit,
-                    Some(codeword),
+                    codeword,
                     challenger,
                 );
             }

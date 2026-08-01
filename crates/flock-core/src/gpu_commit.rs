@@ -208,6 +208,34 @@ pub(crate) fn precompute_branch_wall_ms() -> f64 {
     f64::from_bits(PRECOMPUTE_BRANCH_WALL_MS.load(std::sync::atomic::Ordering::Relaxed))
 }
 
+/// True iff the warmup latch decided On — timed proves run the Metal graph,
+/// whose commit reads only `z_packed` and homes the codeword in the
+/// persistent shared staging buffer. Witness drivers and [`crate::pcs`] use
+/// this to skip withdrawing the 1 GiB CPU codeword the latched graph never
+/// reads (every fallback arm materializes a real buffer first).
+pub fn gpu_commit_latched_on() -> bool {
+    imp::latched_on()
+}
+
+/// Materialize a full-length codeword buffer if the caller passed the empty
+/// latched-path marker (stale contents are fine: only the from-message path
+/// can produce the marker, and its CPU fallback synthesizes both replicas
+/// from `z_packed`).
+#[cfg_attr(
+    not(all(target_os = "macos", target_arch = "aarch64")),
+    allow(dead_code)
+)]
+pub(crate) fn ensure_cpu_codeword(
+    codeword: &mut Vec<F128>,
+    params: &crate::pcs::commit::PcsParams,
+) {
+    let len = params.codeword_len_f128();
+    if codeword.len() != len {
+        debug_assert!(codeword.is_empty(), "codeword must be full-length or the empty marker");
+        *codeword = crate::scratch::take_f128(len);
+    }
+}
+
 /// Returns true when the GPU commit machinery is allowed to initialize.
 pub(crate) fn gpu_commit_enabled() -> bool {
     // A/B-CONTROL: set to `false` to build an exact GPU-off control binary
@@ -1864,6 +1892,12 @@ kernel void parent_hash(device const uint* children [[buffer(0)]],
 
     static LATCH: Mutex<LatchState> = Mutex::new(LatchState::Undecided);
 
+    /// See [`super::gpu_commit_latched_on`]. Called outside the commit path,
+    /// so the brief lock never contends with `commit_l0_or_fallback`'s.
+    pub(crate) fn latched_on() -> bool {
+        matches!(&*LATCH.lock().unwrap(), LatchState::On(_))
+    }
+
     /// Pool for ranked-size tree allocations (the 64 MiB copy-out target).
     static TREE_POOL: Mutex<Vec<Vec<Hash>>> = Mutex::new(Vec::new());
     /// Ranked tree node count; only allocations this large are pooled.
@@ -2776,7 +2810,8 @@ kernel void parent_hash(device const uint* children [[buffer(0)]],
         let gpu = match gpu() {
             Ok(g) => g,
             Err(_) => {
-                let tree = cpu(&mut codeword);
+                super::ensure_cpu_codeword(&mut codeword, params);
+            let tree = cpu(&mut codeword);
                 return (CodewordBuf::Cpu(codeword), MerkleTreeBuf::Cpu(tree));
             }
         };
@@ -2788,6 +2823,7 @@ kernel void parent_hash(device const uint* children [[buffer(0)]],
             if debug_enabled() {
                 eprintln!("[gpu-commit] staging still in use; CPU fallback");
             }
+            super::ensure_cpu_codeword(&mut codeword, params);
             let tree = cpu(&mut codeword);
             return (CodewordBuf::Cpu(codeword), MerkleTreeBuf::Cpu(tree));
         }
@@ -2819,7 +2855,8 @@ kernel void parent_hash(device const uint* children [[buffer(0)]],
                             eprintln!("[gpu-commit] z wrap failed at prove time ({e})");
                         }
                         STAGING_IN_USE.store(false, Ordering::Release);
-                        let tree = cpu(&mut codeword);
+                        super::ensure_cpu_codeword(&mut codeword, params);
+            let tree = cpu(&mut codeword);
                         return (CodewordBuf::Cpu(codeword), MerkleTreeBuf::Cpu(tree));
                     }
                 },
@@ -2846,6 +2883,7 @@ kernel void parent_hash(device const uint* children [[buffer(0)]],
             if let LatchState::On(state) = std::mem::replace(latch, LatchState::Off) {
                 release_latched(gpu, state);
             }
+            super::ensure_cpu_codeword(&mut codeword, params);
             let tree = cpu(&mut codeword);
             return (CodewordBuf::Cpu(codeword), MerkleTreeBuf::Cpu(tree));
         }
@@ -2859,8 +2897,11 @@ kernel void parent_hash(device const uint* children [[buffer(0)]],
             eprintln!("[commit-timing] gpu-commit: graph {graph_ms:.2} ms + zero-copy tree");
         }
         // The replicated input codeword was never read by the from-z graph;
-        // hand it straight back to the scratch pool for the next prove.
-        crate::scratch::give_f128(codeword);
+        // hand it straight back to the scratch pool for the next prove. The
+        // latched-path empty marker (codeword skip) is dropped, not pooled.
+        if !codeword.is_empty() {
+            crate::scratch::give_f128(codeword);
+        }
         let gpu_codeword = unsafe {
             super::GpuCodeword::new(gpu.buffer_contents(staging).cast::<F128>(), codeword_len)
         };
@@ -2878,6 +2919,7 @@ kernel void parent_hash(device const uint* children [[buffer(0)]],
             || !super::is_ranked_gpu_shape(params)
             || rayon::current_num_threads() <= 1
         {
+            super::ensure_cpu_codeword(&mut codeword, params);
             let tree = cpu(&mut codeword);
             return (CodewordBuf::Cpu(codeword), MerkleTreeBuf::Cpu(tree));
         }
@@ -2885,7 +2927,8 @@ kernel void parent_hash(device const uint* children [[buffer(0)]],
         match &*latch {
             LatchState::Off => {
                 drop(latch);
-                let tree = cpu(&mut codeword);
+                super::ensure_cpu_codeword(&mut codeword, params);
+            let tree = cpu(&mut codeword);
                 (CodewordBuf::Cpu(codeword), MerkleTreeBuf::Cpu(tree))
             }
             LatchState::Undecided => {
@@ -2989,6 +3032,10 @@ mod imp {
     pub(crate) fn give_tree(_tree: Vec<crate::merkle::Hash>) {}
 
     pub(crate) fn staging_released() {}
+
+    pub(crate) fn latched_on() -> bool {
+        false
+    }
 }
 
 #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
