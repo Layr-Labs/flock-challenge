@@ -56,6 +56,12 @@ pub const ENV_NO_GPU_MIXED_FINAL: &str = "FLOCK_NO_GPU_MIXED_FINAL";
 /// exact value `1` disables it; the optimization remains ranked-tree-only.
 pub const ENV_NO_GPU_PARENT3: &str = "FLOCK_NO_GPU_PARENT3";
 
+/// Strict control for the ranked hybrid join-boundary ownership cut. Exact
+/// value `1` restores the promoted behavior in which each aligned GPU/CPU
+/// subtree redundantly builds above the global 16-node level before the CPU
+/// rebuilds those same top 15 nodes.
+pub const ENV_NO_GPU_JOIN_BOUNDARY: &str = "FLOCK_NO_GPU_JOIN_BOUNDARY";
+
 fn gpu_parent3_value_enabled(value: Option<&std::ffi::OsStr>) -> bool {
     value != Some(std::ffi::OsStr::new("1"))
 }
@@ -69,6 +75,169 @@ fn gpu_parent3_enabled() -> bool {
 
 fn select_gpu_parent3(n_leaves_total: usize, enabled: bool) -> bool {
     enabled && n_leaves_total == 1usize << 20
+}
+
+fn gpu_join_boundary_value_enabled(value: Option<&std::ffi::OsStr>) -> bool {
+    value != Some(std::ffi::OsStr::new("1"))
+}
+
+fn gpu_join_boundary_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        gpu_join_boundary_value_enabled(
+            std::env::var_os(ENV_NO_GPU_JOIN_BOUNDARY).as_deref(),
+        )
+    })
+}
+
+fn select_gpu_join_boundary(
+    n_leaves_total: usize,
+    k_cpu_sixteenths: usize,
+    enabled: bool,
+) -> bool {
+    enabled
+        && n_leaves_total == 1usize << 20
+        && (1..16).contains(&k_cpu_sixteenths)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct GreedyAlignedSubtrees {
+    cursor: usize,
+    end: usize,
+}
+
+impl GreedyAlignedSubtrees {
+    fn new(start: usize, end: usize) -> Self {
+        Self { cursor: start, end }
+    }
+}
+
+impl Iterator for GreedyAlignedSubtrees {
+    type Item = (usize, usize);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.cursor >= self.end {
+            return None;
+        }
+        let remaining = self.end - self.cursor;
+        let mut size = 1usize << remaining.ilog2();
+        while self.cursor % size != 0 {
+            size >>= 1;
+        }
+        let start = self.cursor;
+        self.cursor += size;
+        Some((start, size))
+    }
+}
+
+fn redundant_parent_levels_above_join16(subtree_leaves: usize) -> Option<usize> {
+    if !subtree_leaves.is_power_of_two()
+        || !(1usize << 16..=1usize << 19).contains(&subtree_leaves)
+    {
+        return None;
+    }
+    Some(subtree_leaves.ilog2() as usize - 16)
+}
+
+fn ranked_join_boundary_savings(k_cpu_sixteenths: usize) -> Option<(usize, usize)> {
+    if !(1..16).contains(&k_cpu_sixteenths) {
+        return None;
+    }
+    let sixteenth = 1usize << 16;
+    let prefix_end = (16 - k_cpu_sixteenths) * sixteenth;
+    let end = 16 * sixteenth;
+    let saved = |start, stop| -> Option<usize> {
+        GreedyAlignedSubtrees::new(start, stop)
+            .try_fold(0usize, |sum, (_, size)| {
+                sum.checked_add(redundant_parent_levels_above_join16(size)?)
+            })
+    };
+    Some((saved(0, prefix_end)?, saved(prefix_end, end)?))
+}
+
+#[cfg(test)]
+mod join_boundary_gate_tests {
+    use super::{
+        GreedyAlignedSubtrees, gpu_join_boundary_value_enabled,
+        ranked_join_boundary_savings, redundant_parent_levels_above_join16,
+        select_gpu_join_boundary,
+    };
+    use std::ffi::OsStr;
+
+    #[test]
+    fn exact_switch_and_ranked_hybrid_selector() {
+        assert!(!gpu_join_boundary_value_enabled(Some(OsStr::new("1"))));
+        for value in [None, Some(""), Some("0"), Some("true"), Some("01")] {
+            assert!(gpu_join_boundary_value_enabled(value.map(OsStr::new)));
+        }
+        for k in 1..16 {
+            assert!(select_gpu_join_boundary(1 << 20, k, true));
+        }
+        assert!(!select_gpu_join_boundary(1 << 20, 0, true));
+        assert!(!select_gpu_join_boundary(1 << 20, 16, true));
+        assert!(!select_gpu_join_boundary(1 << 19, 5, true));
+        assert!(!select_gpu_join_boundary(1 << 20, 5, false));
+    }
+
+    #[test]
+    fn all_splits_tile_and_delete_only_redundant_join_work() {
+        const EXPECTED_GPU: [usize; 15] = [6, 6, 5, 5, 4, 4, 3, 3, 3, 3, 2, 2, 1, 1, 0];
+        const EXPECTED_CPU: [usize; 15] = [0, 1, 1, 2, 2, 3, 3, 3, 3, 4, 4, 5, 5, 6, 6];
+        const EXPECTED_TOTAL: [usize; 15] = [6, 7, 6, 7, 6, 7, 6, 6, 6, 7, 6, 7, 6, 7, 6];
+        for k in 1..16 {
+            let sixteenth = 1usize << 16;
+            let prefix_end = (16 - k) * sixteenth;
+            let end = 16 * sixteenth;
+            let mut boundary_owner = [None; 16];
+            for (start, stop) in [(0, prefix_end), (prefix_end, end)] {
+                let ranges: Vec<_> = GreedyAlignedSubtrees::new(start, stop).collect();
+                let mut cursor = start;
+                for &(subtree_start, size) in &ranges {
+                    assert_eq!(subtree_start, cursor);
+                    assert!(size.is_power_of_two());
+                    assert_eq!(subtree_start % size, 0);
+                    assert!((1usize << 16..=1usize << 19).contains(&size));
+                    let owner = usize::from(start == prefix_end);
+                    let boundary_start = subtree_start / sixteenth;
+                    let boundary_len = size / sixteenth;
+                    for slot in
+                        &mut boundary_owner[boundary_start..boundary_start + boundary_len]
+                    {
+                        assert_eq!(*slot, None, "boundary node received two subtree owners");
+                        *slot = Some(owner);
+                    }
+                    cursor += size;
+                }
+                assert_eq!(cursor, stop);
+            }
+            assert!(boundary_owner[..16 - k].iter().all(|owner| *owner == Some(0)));
+            assert!(boundary_owner[16 - k..].iter().all(|owner| *owner == Some(1)));
+            let (gpu_saved, cpu_saved) = ranked_join_boundary_savings(k).unwrap();
+            assert_eq!(gpu_saved, EXPECTED_GPU[k - 1], "GPU savings at k={k}");
+            assert_eq!(cpu_saved, EXPECTED_CPU[k - 1], "CPU savings at k={k}");
+            assert_eq!(
+                gpu_saved + cpu_saved,
+                EXPECTED_TOTAL[k - 1],
+                "total savings at k={k}: gpu={gpu_saved} cpu={cpu_saved}"
+            );
+        }
+    }
+
+    #[test]
+    fn malformed_subtrees_and_splits_fail_closed() {
+        for size in [0, 1 << 15, 3 << 15, (1 << 20) + 1] {
+            assert_eq!(redundant_parent_levels_above_join16(size), None);
+        }
+        assert_eq!(ranked_join_boundary_savings(0), None);
+        assert_eq!(ranked_join_boundary_savings(16), None);
+        assert_eq!(redundant_parent_levels_above_join16(1 << 20), None);
+        for q in 16..=19 {
+            assert_eq!(
+                redundant_parent_levels_above_join16(1 << q),
+                Some(q - 16)
+            );
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1904,8 +2073,59 @@ kernel void parent_hash3(device const uint* children [[buffer(0)]],
         subtree_leaves: usize,
         parent3: bool,
     ) {
+        unsafe {
+            encode_merkle_subtree_impl_with_floor(
+                gpu,
+                enc,
+                codeword_buf,
+                tree_buf,
+                n_leaves_total,
+                leaf_start,
+                subtree_leaves,
+                parent3,
+                1,
+            )
+        }
+    }
+
+    unsafe fn encode_merkle_subtree_to_join16(
+        gpu: &Gpu,
+        enc: Id,
+        codeword_buf: Id,
+        tree_buf: Id,
+        n_leaves_total: usize,
+        leaf_start: usize,
+        subtree_leaves: usize,
+    ) {
+        unsafe {
+            encode_merkle_subtree_impl_with_floor(
+                gpu,
+                enc,
+                codeword_buf,
+                tree_buf,
+                n_leaves_total,
+                leaf_start,
+                subtree_leaves,
+                super::select_gpu_parent3(n_leaves_total, super::gpu_parent3_enabled()),
+                16,
+            )
+        }
+    }
+
+    unsafe fn encode_merkle_subtree_impl_with_floor(
+        gpu: &Gpu,
+        enc: Id,
+        codeword_buf: Id,
+        tree_buf: Id,
+        n_leaves_total: usize,
+        leaf_start: usize,
+        subtree_leaves: usize,
+        parent3: bool,
+        global_level_floor: usize,
+    ) {
         debug_assert!(subtree_leaves.is_power_of_two());
         debug_assert_eq!(leaf_start % subtree_leaves, 0);
+        debug_assert!(global_level_floor == 1 || global_level_floor == 16);
         unsafe {
             gpu.set_pipeline(enc, gpu.pso_leaf);
             gpu.set_buffer(enc, codeword_buf, leaf_start * 1024, 0);
@@ -1950,7 +2170,7 @@ kernel void parent_hash3(device const uint* children [[buffer(0)]],
             }
 
             gpu.set_pipeline(enc, gpu.pso_parent);
-            while local_len > 1 {
+            while local_len > 1 && level_len > global_level_floor {
                 let write_level_start = level_start + level_len;
                 let n_out = local_len / 2;
                 gpu.set_buffer(enc, tree_buf, (level_start + local_start) * 32, 0);
@@ -1967,6 +2187,7 @@ kernel void parent_hash3(device const uint* children [[buffer(0)]],
                 local_start /= 2;
                 local_len = n_out;
             }
+            debug_assert!(global_level_floor == 1 || level_len == 16);
         }
     }
 
@@ -2702,11 +2923,12 @@ kernel void parent_hash3(device const uint* children [[buffer(0)]],
     /// subtrees) asynchronously while the CPU completes the suffix `k`
     /// sixteenths (layers 4.. via the bit-exact block-range driver, suffix
     /// leaves + subtree parents) directly in the shared staging and tree
-    /// buffers. The top 7 tree nodes are (re)computed on the CPU after the
+    /// buffers. The top 15 tree nodes are computed on the CPU after the
     /// join, covering every decomposition boundary.
     ///
-    /// Bit-exact: same kernels/twiddles on both sides, every element and
-    /// tree node written exactly once (top nodes twice, identically).
+    /// Bit-exact: same kernels/twiddles on both sides. Each side writes only
+    /// through the global 16-node join level; after the GPU join, the CPU is
+    /// the sole writer of the 15 nodes above that boundary.
     /// Encode (but do not commit) the hybrid graph's GPU-prefix command
     /// buffer: remaining NTT passes over the first `16 - k_cpu16` sixteenths
     /// plus their aligned Merkle subtrees. The returned command buffer is
@@ -2732,15 +2954,22 @@ kernel void parent_hash3(device const uint* children [[buffer(0)]],
             // Greedy aligned power-of-two subtree decomposition of the
             // leaf prefix.
             let sixteenth = n_leaves / 16;
-            let mut start = 0usize;
             let prefix_leaves = (16 - k_cpu16) * sixteenth;
-            while start < prefix_leaves {
-                let mut size = 1usize << (prefix_leaves - start).ilog2();
-                while start % size != 0 {
-                    size >>= 1;
+            let join_boundary = super::select_gpu_join_boundary(
+                n_leaves,
+                k_cpu16,
+                super::gpu_join_boundary_enabled(),
+            );
+            for (start, size) in super::GreedyAlignedSubtrees::new(0, prefix_leaves) {
+                if join_boundary {
+                    encode_merkle_subtree_to_join16(
+                        gpu, enc, staging, tree_buf, n_leaves, start, size,
+                    );
+                } else {
+                    encode_merkle_subtree(
+                        gpu, enc, staging, tree_buf, n_leaves, start, size,
+                    );
                 }
-                encode_merkle_subtree(gpu, enc, staging, tree_buf, n_leaves, start, size);
-                start += size;
             }
             gpu.end_encoding(enc);
             Ok(cb2)
@@ -2784,6 +3013,11 @@ kernel void parent_hash3(device const uint* children [[buffer(0)]],
                     }
                 };
                 let prefix_leaves = (16 - k_cpu16) * (n_leaves / 16);
+                let join_boundary = super::select_gpu_join_boundary(
+                    n_leaves,
+                    k_cpu16,
+                    super::gpu_join_boundary_enabled(),
+                );
 
                 // CPU: suffix NTT completion + leaves + subtree parents.
                 // The twiddle table is deterministic per log_d; built once per
@@ -2875,12 +3109,9 @@ kernel void parent_hash3(device const uint* children [[buffer(0)]],
                         });
                 }
                 // Suffix aligned subtrees' parents (greedy decomposition).
-                let mut sstart = suffix_leaf_start;
-                while sstart < n_leaves {
-                    let mut size = 1usize << (n_leaves - sstart).ilog2();
-                    while sstart % size != 0 {
-                        size >>= 1;
-                    }
+                for (sstart, size) in
+                    super::GreedyAlignedSubtrees::new(suffix_leaf_start, n_leaves)
+                {
                     let mut level_start = 0usize;
                     let mut level_len = n_leaves;
                     let mut local_start = sstart;
@@ -2894,7 +3125,7 @@ kernel void parent_hash3(device const uint* children [[buffer(0)]],
                         local_start /= 2;
                         local_len /= 2;
                     }
-                    while local_len > 1 {
+                    while local_len > 1 && (!join_boundary || level_len > 16) {
                         let write_level_start = level_start + level_len;
                         let (r0, w0) =
                             (level_start + local_start, write_level_start + local_start / 2);
@@ -2923,7 +3154,7 @@ kernel void parent_hash3(device const uint* children [[buffer(0)]],
                         local_start /= 2;
                         local_len /= 2;
                     }
-                    sstart += size;
+                    debug_assert!(!join_boundary || level_len == 16);
                 }
 
                 // Join the GPU prefix, then (re)compute every level above
@@ -3608,7 +3839,21 @@ kernel void parent_hash3(device const uint* children [[buffer(0)]],
             super::GpuMerkleTree::new(gpu.buffer_contents(tree_buf).cast::<Hash>(), total_nodes)
         };
         if std::env::var_os("FLOCK_COMMIT_TIMING").is_some() || debug_enabled() {
-            eprintln!("[commit-timing] gpu-commit: graph {graph_ms:.2} ms + zero-copy tree");
+            let join_boundary = super::select_gpu_join_boundary(
+                n_leaves,
+                k_cpu16,
+                super::gpu_join_boundary_enabled(),
+            );
+            let (gpu_saved, cpu_saved) = if join_boundary {
+                super::ranked_join_boundary_savings(k_cpu16).unwrap_or_default()
+            } else {
+                (0, 0)
+            };
+            eprintln!(
+                "[commit-timing] gpu-commit: graph {graph_ms:.2} ms + zero-copy tree; \
+                 join_boundary={join_boundary} gpu_dispatches_saved={gpu_saved} \
+                 cpu_parent_levels_saved={cpu_saved}"
+            );
         }
         // The replicated input codeword was never read by the from-z graph;
         // hand it straight back to the scratch pool for the next prove.
@@ -3664,6 +3909,7 @@ kernel void parent_hash3(device const uint* children [[buffer(0)]],
                 unsafe { stream.gpu.release(cb2) };
             }
         };
+        let k_cpu16 = hybrid_cpu_sixteenths();
         let run = if let Err(e) = first_pass {
             drain_early(early);
             Err(e)
@@ -3675,7 +3921,6 @@ kernel void parent_hash3(device const uint* children [[buffer(0)]],
             drain_early(early);
             Err("streamed GPU latch or z allocation changed before finish".into())
         } else {
-            let k_cpu16 = hybrid_cpu_sixteenths();
             unsafe {
                 match early {
                     Some((cb2, k_early)) if k_early == k_cpu16 => {
@@ -3787,8 +4032,20 @@ kernel void parent_hash3(device const uint* children [[buffer(0)]],
         };
         if std::env::var_os("FLOCK_COMMIT_TIMING").is_some() || debug_enabled() {
             let wall_ms = stream.started.elapsed().as_secs_f64() * 1e3;
+            let join_boundary = super::select_gpu_join_boundary(
+                stream.n_leaves,
+                k_cpu16,
+                super::gpu_join_boundary_enabled(),
+            );
+            let (gpu_saved, cpu_saved) = if join_boundary {
+                super::ranked_join_boundary_savings(k_cpu16).unwrap_or_default()
+            } else {
+                (0, 0)
+            };
             eprintln!(
-                "[commit-timing] gpu-commit: streamed witness+graph window {wall_ms:.2} ms + zero-copy tree"
+                "[commit-timing] gpu-commit: streamed witness+graph window {wall_ms:.2} ms \
+                 + zero-copy tree; join_boundary={join_boundary} \
+                 gpu_dispatches_saved={gpu_saved} cpu_parent_levels_saved={cpu_saved}"
             );
         }
         // Empty marker (latched streamed path) is a no-op drop.
