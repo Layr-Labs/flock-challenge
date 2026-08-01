@@ -1,5 +1,5 @@
 #[cfg(all(target_feature = "avx512f", target_feature = "vpclmulqdq"))]
-use super::super::{ELL, F128, N_MEDIUM};
+use super::super::{ELL, F128, N_MEDIUM, Round1Partial};
 #[cfg(target_feature = "gfni")]
 use super::super::{F8, InvNttTableByteSingleGf8, N_CHUNKS};
 
@@ -154,9 +154,9 @@ pub(crate) unsafe fn accumulate_convert_with_s_hat_v_x86_avx512(
     n_b_med: usize,
     convert: &[F128],
     eq_lo_val: F128,
-    partial_ab: &mut [F128; ELL],
-    partial_c_0: &mut [F128; ELL],
-    partial_c_1: &mut [F128; ELL],
+    partial_ab: &mut [Round1Partial; ELL],
+    partial_c_0: &mut [Round1Partial; ELL],
+    partial_c_1: &mut [Round1Partial; ELL],
 ) {
     use crate::field::gf2_128::x86_64::{f128x4_set, ghash_mul_x4};
     use core::arch::x86_64::*;

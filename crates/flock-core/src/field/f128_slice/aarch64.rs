@@ -86,12 +86,25 @@ unsafe fn mul_const_vec2(r: uint64x2_t, x0: uint64x2_t, x1: uint64x2_t) -> [uint
 #[target_feature(enable = "aes")]
 unsafe fn mul_unreduced(a: uint64x2_t, b: uint64x2_t) -> WideNeon {
     unsafe {
+        // On Apple M3 the three-multiply Karatsuba form is not throughput
+        // optimal here: extracting and XORing both high lanes consumes more
+        // vector issue slots than a fourth PMULL. Swapping `b` lets PMULL and
+        // PMULL2 form both cross terms without lane shuttles.
         let ll = pmull(vgetq_lane_u64::<0>(a), vgetq_lane_u64::<0>(b));
-        let hh = pmull(vgetq_lane_u64::<1>(a), vgetq_lane_u64::<1>(b));
-        let a_mid = veorq_u64(a, vextq_u64::<1>(a, a));
-        let b_mid = veorq_u64(b, vextq_u64::<1>(b, b));
-        let middle = pmull(vgetq_lane_u64::<0>(a_mid), vgetq_lane_u64::<0>(b_mid));
-        let cross = xor3_u64(middle, ll, hh);
+        let hh = transmute::<u128, uint64x2_t>(vmull_high_p64(
+            vreinterpretq_p64_u64(a),
+            vreinterpretq_p64_u64(b),
+        ));
+        let b_swapped = vextq_u64::<1>(b, b);
+        let cross_lo = pmull(
+            vgetq_lane_u64::<0>(a),
+            vgetq_lane_u64::<0>(b_swapped),
+        );
+        let cross_hi = transmute::<u128, uint64x2_t>(vmull_high_p64(
+            vreinterpretq_p64_u64(a),
+            vreinterpretq_p64_u64(b_swapped),
+        ));
+        let cross = veorq_u64(cross_lo, cross_hi);
         let zero = vdupq_n_u64(0);
         WideNeon {
             lo: veorq_u64(ll, vextq_u64::<1>(zero, cross)),

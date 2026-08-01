@@ -1,5 +1,14 @@
 #[cfg(not(target_arch = "aarch64"))]
 use super::super::F128;
+#[cfg(not(any(
+    target_arch = "aarch64",
+    all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
+    )
+)))]
+use super::super::Round1Partial;
 use super::super::{F8, InvNttTableByteSingleGf8, N_CHUNKS};
 use crate::field::gf2_8::gf8_reduce;
 
@@ -90,9 +99,9 @@ pub(super) fn accumulate_convert_with_s_hat_v(
     n_b_med: usize,
     convert: &[F128],
     eq_lo_val: F128,
-    partial_ab: &mut [F128; 64],
-    partial_c_0: &mut [F128; 64],
-    partial_c_1: &mut [F128; 64],
+    partial_ab: &mut [Round1Partial; 64],
+    partial_c_0: &mut [Round1Partial; 64],
+    partial_c_1: &mut [Round1Partial; 64],
 ) {
     for lane in 0..64 {
         let mut converted_ab = F128::ZERO;

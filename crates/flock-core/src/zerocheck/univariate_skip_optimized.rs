@@ -32,11 +32,32 @@
 
 use std::sync::{LazyLock, OnceLock};
 
+#[cfg(target_arch = "aarch64")]
+use crate::field::F256Unreduced;
 use crate::field::{F8, F128, PHI_8_TABLE, mul_by_x, phi8};
 use crate::ntt::InvNttTableByteSingleGf8;
 
 use super::PaddingSpec;
 use super::univariate_skip::{SplitEqGhash, ntt_extend_f128_vec_ghash, pack_bits};
+
+// The AArch64 kernel defers reduction across all low-outer positions. Other
+// backends retain their reduced accumulator type and existing SIMD paths.
+#[cfg(target_arch = "aarch64")]
+type Round1Partial = F256Unreduced;
+#[cfg(not(target_arch = "aarch64"))]
+type Round1Partial = F128;
+
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+fn reduce_round1_partial(value: Round1Partial) -> F128 {
+    value.reduce()
+}
+
+#[cfg(not(target_arch = "aarch64"))]
+#[inline(always)]
+fn reduce_round1_partial(value: Round1Partial) -> F128 {
+    value
+}
 
 mod kernels;
 
@@ -663,9 +684,9 @@ fn process_one_x_hi(
 /// Identical to [`WorkerState`] except `partial_c` and `local_res_c_s` are
 /// split into bank 0 / bank 1.
 struct WorkerStateWithSHatV {
-    partial_ab: [F128; ELL],
-    partial_c_0: [F128; ELL],
-    partial_c_1: [F128; ELL],
+    partial_ab: [Round1Partial; ELL],
+    partial_c_0: [Round1Partial; ELL],
+    partial_c_1: [Round1Partial; ELL],
     chunk_ab_bytes: [[u8; 64]; 1 << N_MEDIUM],
     chunk_c_bytes: [[u8; 64]; 1 << N_MEDIUM],
     a_col: [F8; ELL],
@@ -678,9 +699,9 @@ struct WorkerStateWithSHatV {
 impl WorkerStateWithSHatV {
     fn new() -> Self {
         Self {
-            partial_ab: [F128::ZERO; ELL],
-            partial_c_0: [F128::ZERO; ELL],
-            partial_c_1: [F128::ZERO; ELL],
+            partial_ab: [Round1Partial::ZERO; ELL],
+            partial_c_0: [Round1Partial::ZERO; ELL],
+            partial_c_1: [Round1Partial::ZERO; ELL],
             chunk_ab_bytes: [[0u8; 64]; 1 << N_MEDIUM],
             chunk_c_bytes: [[0u8; 64]; 1 << N_MEDIUM],
             a_col: [F8::ZERO; ELL],
@@ -713,9 +734,9 @@ fn process_one_x_hi_with_s_hat_v(
     paired_c: &(Vec<F128>, Vec<F128>),
     state: &mut WorkerStateWithSHatV,
 ) {
-    state.partial_ab.iter_mut().for_each(|p| *p = F128::ZERO);
-    state.partial_c_0.iter_mut().for_each(|p| *p = F128::ZERO);
-    state.partial_c_1.iter_mut().for_each(|p| *p = F128::ZERO);
+    state.partial_ab.iter_mut().for_each(|p| *p = Round1Partial::ZERO);
+    state.partial_c_0.iter_mut().for_each(|p| *p = Round1Partial::ZERO);
+    state.partial_c_1.iter_mut().for_each(|p| *p = Round1Partial::ZERO);
 
     let n_lo = n_lo_and_inner - N_INNER;
 
@@ -805,9 +826,9 @@ fn process_one_x_hi_with_s_hat_v(
 
     // Outer fold by eq_hi (per bank).
     for lane in 0..ELL {
-        state.local_res_ab[lane] += eq_hi_val * state.partial_ab[lane];
-        state.local_res_c_s_0[lane] += eq_hi_val * state.partial_c_0[lane];
-        state.local_res_c_s_1[lane] += eq_hi_val * state.partial_c_1[lane];
+        state.local_res_ab[lane] += eq_hi_val * reduce_round1_partial(state.partial_ab[lane]);
+        state.local_res_c_s_0[lane] += eq_hi_val * reduce_round1_partial(state.partial_c_0[lane]);
+        state.local_res_c_s_1[lane] += eq_hi_val * reduce_round1_partial(state.partial_c_1[lane]);
     }
 }
 
@@ -830,9 +851,9 @@ fn process_one_x_hi_with_precomputed_ab(
     paired_c: &(Vec<F128>, Vec<F128>),
     state: &mut WorkerStateWithSHatV,
 ) {
-    state.partial_ab.iter_mut().for_each(|p| *p = F128::ZERO);
-    state.partial_c_0.iter_mut().for_each(|p| *p = F128::ZERO);
-    state.partial_c_1.iter_mut().for_each(|p| *p = F128::ZERO);
+    state.partial_ab.iter_mut().for_each(|p| *p = Round1Partial::ZERO);
+    state.partial_c_0.iter_mut().for_each(|p| *p = Round1Partial::ZERO);
+    state.partial_c_1.iter_mut().for_each(|p| *p = Round1Partial::ZERO);
 
     let n_lo = n_lo_and_inner - N_INNER;
 
@@ -870,9 +891,9 @@ fn process_one_x_hi_with_precomputed_ab(
     }
 
     for lane in 0..ELL {
-        state.local_res_ab[lane] += eq_hi_val * state.partial_ab[lane];
-        state.local_res_c_s_0[lane] += eq_hi_val * state.partial_c_0[lane];
-        state.local_res_c_s_1[lane] += eq_hi_val * state.partial_c_1[lane];
+        state.local_res_ab[lane] += eq_hi_val * reduce_round1_partial(state.partial_ab[lane]);
+        state.local_res_c_s_0[lane] += eq_hi_val * reduce_round1_partial(state.partial_c_0[lane]);
+        state.local_res_c_s_1[lane] += eq_hi_val * reduce_round1_partial(state.partial_c_1[lane]);
     }
 }
 
@@ -2321,7 +2342,15 @@ mod tests {
             let seed_c0: [F128; ELL] = core::array::from_fn(|_| rng.f128());
             let seed_c1: [F128; ELL] = core::array::from_fn(|_| rng.f128());
 
-            let (mut got_ab, mut got_c0, mut got_c1) = (seed_ab, seed_c0, seed_c1);
+            let lift = |value: F128| F256Unreduced {
+                r0: value.lo,
+                r1: value.hi,
+                r2: 0,
+                r3: 0,
+            };
+            let mut got_ab = seed_ab.map(lift);
+            let mut got_c0 = seed_c0.map(lift);
+            let mut got_c1 = seed_c1.map(lift);
             // SAFETY: aarch64 target; arrays are the exact sizes the kernel
             // indexes, and `convert` is the full 16*256-entry table.
             unsafe {
@@ -2352,9 +2381,21 @@ mod tests {
                 &mut want_c1,
             );
 
-            assert_eq!(got_ab, want_ab, "partial_ab mismatch at n_b_med={n_b_med}");
-            assert_eq!(got_c0, want_c0, "partial_c_0 mismatch at n_b_med={n_b_med}");
-            assert_eq!(got_c1, want_c1, "partial_c_1 mismatch at n_b_med={n_b_med}");
+            assert_eq!(
+                got_ab.map(F256Unreduced::reduce),
+                want_ab,
+                "partial_ab mismatch at n_b_med={n_b_med}"
+            );
+            assert_eq!(
+                got_c0.map(F256Unreduced::reduce),
+                want_c0,
+                "partial_c_0 mismatch at n_b_med={n_b_med}"
+            );
+            assert_eq!(
+                got_c1.map(F256Unreduced::reduce),
+                want_c1,
+                "partial_c_1 mismatch at n_b_med={n_b_med}"
+            );
         }
     }
 }
