@@ -57,6 +57,18 @@ fn ranked_direct_fold4_precompute_enabled(r1cs: &BlockR1cs) -> bool {
         && pcs::ranked_direct_fold4_enabled()
 }
 
+/// Direct-fold8 capture/consumer predicate: the fold4 chain plus the shared
+/// fold8 latch and six retainable tail coordinates (k_log >= k_skip + 7).
+/// Read by BOTH the AB/C producers and (transitively) the pcs consumer gate,
+/// so capture and consumer cannot disagree; a shape miss simply keeps the
+/// 16-bank tensor and the incumbent fold4 route.
+#[inline]
+fn ranked_direct_fold8_precompute_enabled(r1cs: &BlockR1cs) -> bool {
+    ranked_direct_fold4_precompute_enabled(r1cs)
+        && pcs::ranked_direct_fold8_enabled()
+        && r1cs.k_log >= r1cs.k_skip + 7
+}
+
 /// Exact-shape gate for deriving identity C from the already-materialized
 /// lincheck stripe. Keep this narrower than the generic DirectFold4 gate:
 /// the shortcut relies on ranked BLAKE3's block geometry and honest padding,
@@ -78,7 +90,12 @@ fn precompute_ab_s_hat_v(
     z_vec: &[F128],
     inner_rest_tail: &[F128],
 ) -> Option<Vec<F128>> {
-    if ranked_direct_fold4_precompute_enabled(r1cs) {
+    if ranked_direct_fold8_precompute_enabled(r1cs) {
+        Some(pcs::ring_switch::s_hat_v_fold8_from_z_vec(
+            z_vec,
+            inner_rest_tail,
+        ))
+    } else if ranked_direct_fold4_precompute_enabled(r1cs) {
         Some(pcs::ring_switch::s_hat_v_fold4_from_z_vec(
             z_vec,
             inner_rest_tail,
@@ -98,20 +115,23 @@ fn precompute_ab_s_hat_v(
     }
 }
 
-/// Pick C's precomputed slot. The strict DirectFold4 experiment takes the
-/// sixteen-bank tensor; the incumbent ranked path takes the four-bank tensor;
-/// every other shape takes the canonical transcript-visible statistic.
+/// Pick C's precomputed slot. The DirectFold8 route takes the sixty-four-bank
+/// tensor; the strict DirectFold4 experiment takes the sixteen-bank tensor;
+/// the incumbent ranked path takes the four-bank tensor; every other shape
+/// takes the canonical transcript-visible statistic. Falls back through
+/// narrower captures by presence, so a producer shape miss (e.g. no lincheck
+/// stripe) degrades to a still-correct route instead of panicking.
 #[inline]
 fn pre_c_slot<'a>(
     r1cs: &BlockR1cs,
     captured: &'a zerocheck::CapturedSHatVC,
 ) -> Option<&'a [F128]> {
-    Some(if ranked_direct_fold4_precompute_enabled(r1cs) {
-        captured
-            .fold4
-            .as_deref()
-            .expect("DirectFold4 capture and consumer gates must agree")
-    } else if ranked_direct_c_precompute_enabled(r1cs) {
+    Some(
+        if ranked_direct_fold8_precompute_enabled(r1cs) && captured.fold8.is_some() {
+            captured.fold8.as_deref().unwrap()
+        } else if ranked_direct_fold4_precompute_enabled(r1cs) && captured.fold4.is_some() {
+            captured.fold4.as_deref().unwrap()
+        } else if ranked_direct_c_precompute_enabled(r1cs) {
         captured.quad.as_slice()
     } else {
         captured.s_hat_v_c.as_slice()
