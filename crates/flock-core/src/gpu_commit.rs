@@ -3428,19 +3428,31 @@ kernel void parent_hash3(device const uint* children [[buffer(0)]],
         };
         const CANDIDATES: [usize; 8] = [0, 2, 3, 4, 5, 6, 7, 8];
         let mut best_ms = [f64::INFINITY; CANDIDATES.len()];
-        for i in 0..CANDIDATES.len() {
-            match contended_run(CANDIDATES[i]) {
-                Ok(ms) => best_ms[i] = ms,
-                Err(e) => {
-                    // Leave the fixed default in place; the timed path has
-                    // its own mid-prove CPU fallback for GPU errors.
-                    if dbg {
-                        eprintln!(
-                            "[gpu-commit] autotune: k={} failed ({e}); keeping default",
-                            CANDIDATES[i]
-                        );
+        // With the cross-process warmup latch cache, only the first worker
+        // of a run pays this sweep, so its per-candidate sampling can afford
+        // a second base pass: one cold draw per k was observed to flip the
+        // near-tie leaders (k=0 vs k=2 on consecutive runs of the same
+        // host), and the chosen k steers every timed prove of all ~120
+        // workers. Two interleaved base passes + the existing leader
+        // resamples cut that selection noise at a one-process cost the
+        // cache already repaid ~119 times over. Without the cache (kill
+        // switch set), the incumbent single pass is preserved.
+        let base_passes = if super::warmup_latch_cache_enabled() { 2 } else { 1 };
+        for _ in 0..base_passes {
+            for i in 0..CANDIDATES.len() {
+                match contended_run(CANDIDATES[i]) {
+                    Ok(ms) => best_ms[i] = best_ms[i].min(ms),
+                    Err(e) => {
+                        // Leave the fixed default in place; the timed path has
+                        // its own mid-prove CPU fallback for GPU errors.
+                        if dbg {
+                            eprintln!(
+                                "[gpu-commit] autotune: k={} failed ({e}); keeping default",
+                                CANDIDATES[i]
+                            );
+                        }
+                        return;
                     }
-                    return;
                 }
             }
         }
