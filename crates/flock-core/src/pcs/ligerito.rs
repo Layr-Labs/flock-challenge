@@ -3538,7 +3538,7 @@ fn materialize_direct_ab_fold2_with_helper(
 /// combined basis in one N→N/16 pass. It emits only the ordinary message M4
 /// and univariate lookahead for M5; the incumbent final fold2 cadence then
 /// handles rounds four and five.
-fn materialize_direct_fold4(
+fn materialize_direct_fold4_banked(
     packed_witness: Vec<F128>,
     ordinary_basis: Vec<F128>,
     claims: &[super::ring_switch::DirectFold4Factors],
@@ -4425,7 +4425,7 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
                     msg
                 }
                 3 => {
-                    let (f4, b4, msg, next_lookahead) = materialize_direct_fold4(
+                    let (f4, b4, msg, next_lookahead) = materialize_direct_fold4_banked(
                         packed_witness.take().unwrap(),
                         b_initial.take().unwrap(),
                         direct_fold4.take().unwrap().as_slice(),
