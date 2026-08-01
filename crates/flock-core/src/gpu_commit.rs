@@ -164,6 +164,9 @@ pub(crate) fn gpu_commit_enabled() -> bool {
         && std::env::var_os(ENV_NO_GPU_COMMIT).is_none()
 }
 
+/// True after untimed warmup permanently selected the ranked GPU path.
+pub(crate) fn gpu_commit_latched_on() -> bool { imp::gpu_commit_latched_on() }
+
 /// Build the flat breadth-first twiddle table for `log_d` layers: layer `l`
 /// occupies `[2^l - 1, 2^(l+1) - 1)`. Uses the NTT's cached table when
 /// present, otherwise rebuilds it (small test domains only).
@@ -2017,6 +2020,7 @@ kernel void parent_hash(device const uint* children [[buffer(0)]],
         let gpu = match gpu() {
             Ok(g) => g,
             Err(_) => {
+                codeword = ensure_cpu_codeword(codeword, codeword_len);
                 let tree = cpu(&mut codeword);
                 return (CodewordBuf::Cpu(codeword), MerkleTreeBuf::Cpu(tree));
             }
@@ -2029,6 +2033,7 @@ kernel void parent_hash(device const uint* children [[buffer(0)]],
             if debug_enabled() {
                 eprintln!("[gpu-commit] staging still in use; CPU fallback");
             }
+            codeword = ensure_cpu_codeword(codeword, codeword_len);
             let tree = cpu(&mut codeword);
             return (CodewordBuf::Cpu(codeword), MerkleTreeBuf::Cpu(tree));
         }
@@ -2060,6 +2065,7 @@ kernel void parent_hash(device const uint* children [[buffer(0)]],
                             eprintln!("[gpu-commit] z wrap failed at prove time ({e})");
                         }
                         STAGING_IN_USE.store(false, Ordering::Release);
+                        codeword = ensure_cpu_codeword(codeword, codeword_len);
                         let tree = cpu(&mut codeword);
                         return (CodewordBuf::Cpu(codeword), MerkleTreeBuf::Cpu(tree));
                     }
@@ -2087,6 +2093,7 @@ kernel void parent_hash(device const uint* children [[buffer(0)]],
             if let LatchState::On(state) = std::mem::replace(latch, LatchState::Off) {
                 release_latched(gpu, state);
             }
+            codeword = ensure_cpu_codeword(codeword, codeword_len);
             let tree = cpu(&mut codeword);
             return (CodewordBuf::Cpu(codeword), MerkleTreeBuf::Cpu(tree));
         }
@@ -2101,11 +2108,20 @@ kernel void parent_hash(device const uint* children [[buffer(0)]],
         }
         // The replicated input codeword was never read by the from-z graph;
         // hand it straight back to the scratch pool for the next prove.
-        crate::scratch::give_f128(codeword);
+        if !codeword.is_empty() { crate::scratch::give_f128(codeword); }
         let gpu_codeword = unsafe {
             super::GpuCodeword::new(gpu.buffer_contents(staging).cast::<F128>(), codeword_len)
         };
         (CodewordBuf::Gpu(gpu_codeword), MerkleTreeBuf::Gpu(tree))
+    }
+
+    pub(crate) fn gpu_commit_latched_on() -> bool {
+        matches!(*LATCH.lock().unwrap(), LatchState::On(_))
+    }
+
+    fn ensure_cpu_codeword(mut codeword: Vec<F128>, len: usize) -> Vec<F128> {
+        if codeword.len() != len { codeword = crate::scratch::take_f128(len); }
+        codeword
     }
 
     pub(crate) fn commit_l0_or_fallback(
@@ -2119,6 +2135,7 @@ kernel void parent_hash(device const uint* children [[buffer(0)]],
             || !super::is_ranked_gpu_shape(params)
             || rayon::current_num_threads() <= 1
         {
+            codeword = ensure_cpu_codeword(codeword, params.codeword_len_f128());
             let tree = cpu(&mut codeword);
             return (CodewordBuf::Cpu(codeword), MerkleTreeBuf::Cpu(tree));
         }
@@ -2126,6 +2143,7 @@ kernel void parent_hash(device const uint* children [[buffer(0)]],
         match &*latch {
             LatchState::Off => {
                 drop(latch);
+                codeword = ensure_cpu_codeword(codeword, params.codeword_len_f128());
                 let tree = cpu(&mut codeword);
                 (CodewordBuf::Cpu(codeword), MerkleTreeBuf::Cpu(tree))
             }
@@ -2213,6 +2231,8 @@ mod imp {
     ) -> Result<Vec<crate::merkle::Hash>, String> {
         Err("GPU commit is only available on macOS/aarch64".into())
     }
+
+    pub(crate) fn gpu_commit_latched_on() -> bool { false }
 
     pub(crate) fn commit_l0_or_fallback(
         _z_packed: &[F128],
