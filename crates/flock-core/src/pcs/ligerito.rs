@@ -9930,3 +9930,4 @@ mod tests {
 // RealAdii draw 1 on 76f9e98.
 // RealAdii draw 2 on 76f9e98 (draw 1: 1,250,243.88).
 // RealAdii draw 3 on 76f9e98.
+// angelX disclosed draw 2 on 39541e2 (draw 1: 1,252,541.41, -0.43% paired; zero-diff marker per board protocol).
