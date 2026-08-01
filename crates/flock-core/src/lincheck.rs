@@ -535,6 +535,77 @@ pub fn build_eq_table(point: &[F128]) -> Vec<F128> {
     out
 }
 
+/// Prefix variant of [`build_eq_table`]: returns only the first `n` entries
+/// of the length-`2^d` eq table (`d = point.len()`), byte-identical to
+/// `build_eq_table(point)[..n]` but without ever allocating or computing the
+/// discarded suffix `[n, 2^d)`.
+///
+/// Callers that need the full power-of-two table (e.g. dot-producting
+/// against a same-length row) must keep using [`build_eq_table`]; this is
+/// only for callers that immediately truncate to a non-power-of-two `n`
+/// (e.g. `n_queries`), such as the per-query eq-tensor weights in
+/// `pcs::ligerito::induce_sumcheck_poly` / `induce_sumcheck_poly_via_ntt`.
+pub fn build_eq_table_prefix(point: &[F128], n: usize) -> Vec<F128> {
+    use rayon::prelude::*;
+
+    if n == 0 {
+        return Vec::new();
+    }
+    let d = point.len();
+    debug_assert!(n <= 1usize << d, "n ({n}) exceeds 2^point.len() ({d})");
+
+    let mut out = crate::alloc_uninit_f128_vec(n);
+    out[0] = F128::ONE;
+    const PAR_THRESHOLD: usize = 1 << 12;
+    let mut len = 1usize;
+    for j in 0..d {
+        if len >= n {
+            break;
+        }
+        let r_j = point[j];
+        // Only indices < n are ever read again (by a later level, or by the
+        // caller); indices in [n, 2*len) are the discarded suffix and are
+        // skipped entirely — never allocated, never multiplied.
+        let hi_len = (n - len).min(len);
+        let (lo, rest) = out.split_at_mut(len);
+        let hi = &mut rest[..hi_len];
+        let build_pair = |lo_i: &mut F128, hi_i: &mut F128| {
+            let v = *lo_i;
+            let vr = v * r_j;
+            *hi_i = vr;
+            *lo_i = v + vr;
+        };
+        if hi_len < PAR_THRESHOLD {
+            lo[..hi_len]
+                .iter_mut()
+                .zip(hi.iter_mut())
+                .for_each(|(lo_i, hi_i)| build_pair(lo_i, hi_i));
+        } else {
+            lo[..hi_len]
+                .par_iter_mut()
+                .zip(hi.par_iter_mut())
+                .for_each(|(lo_i, hi_i)| build_pair(lo_i, hi_i));
+        }
+        // Remaining `lo` entries (those with no surviving `hi` mirror, i.e.
+        // hi_len < len) still fall inside the retained prefix and must get
+        // the same doubling update, just without writing a `hi` output.
+        if hi_len < len {
+            let update_solo = |lo_i: &mut F128| {
+                let v = *lo_i;
+                *lo_i = v + v * r_j;
+            };
+            let tail = &mut lo[hi_len..len];
+            if tail.len() < PAR_THRESHOLD {
+                tail.iter_mut().for_each(update_solo);
+            } else {
+                tail.par_iter_mut().for_each(update_solo);
+            }
+        }
+        len *= 2;
+    }
+    out
+}
+
 /// Fold a sparse boolean matrix's rows against an eq table at the row
 /// coords. Computes the **transposed** matrix-vector product:
 ///
@@ -1421,7 +1492,9 @@ fn prove_padded_inner<Ch: Challenger>(
     }
 
     // 6. Send `z_partial` (the post-sumcheck collapsed z_vec). Length 2^k_skip.
-    let z_partial = z_vec.clone();
+    //    `z_vec` is dead after this point (only `z_partial` is read below), so
+    //    move instead of clone.
+    let z_partial = z_vec;
     challenger.observe_f128_slice(&z_partial);
 
     // 7. Sample fresh z_skip AFTER observing z_partial — gives Schwartz-Zippel

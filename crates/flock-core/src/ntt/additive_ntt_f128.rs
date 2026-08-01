@@ -1008,7 +1008,7 @@ impl AdditiveNttF128 {
                     for block in 0..num_blocks {
                         let tw = block_twiddles(block);
                         let start = block * block_bytes;
-                        if block == 0 && zero_root_fused3 {
+                        if tw[0] == F128::ZERO && tw[1] == F128::ZERO && tw[3] == F128::ZERO {
                             butterfly_interleaved_fused_3layer_par_rows::<true>(
                                 &mut data[start..start + block_bytes],
                                 &tw,
