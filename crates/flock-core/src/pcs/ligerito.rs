@@ -9448,3 +9448,6 @@ mod tests {
 }
 // Redraw marker 4 (drift probe): zero-diff; prior draws 1,205,646 / 1,205,107 / 1,206,245.
 // RealAdii draw 1 on 1a6ad0e.
+// Zeeshan draw 1 on the promoted 1,248,331.39 stripe-C frontier.
+// Zeeshan draw 2 on the promoted 1,248,331.39 stripe-C frontier.
+// Zeeshan draw 3 on the promoted 1,248,331.39 stripe-C frontier.
