@@ -1171,6 +1171,85 @@ fn sumcheck_bind_both_and_eval_next(
     (e1, einf)
 }
 
+/// **Non-destructive z variant of [`sumcheck_bind_both_and_eval_next`].**
+///
+/// Binds `comb` in place (same as the base function) but folds `z` into
+/// `z_scratch` instead of in-place, leaving `z` untouched.  This lets the
+/// caller preserve the pre-sumcheck `z_vec` for downstream reuse (PCS
+/// `s_hat_v`) without paying a full `z_vec.clone()`.
+///
+/// `z_scratch` must have capacity for at least `z.len() / 2` elements.
+/// After the call, `z_scratch.len()` is set to `z.len() / 2`.
+fn sumcheck_bind_both_eval_next_z_to_scratch(
+    comb: &mut Vec<F128>,
+    z: &[F128],
+    z_scratch: &mut Vec<F128>,
+    r: F128,
+) -> (F128, F128) {
+    use rayon::prelude::*;
+    let len = comb.len();
+    debug_assert_eq!(z.len(), len);
+    let half = len / 2;
+    let half2 = half / 2;
+    debug_assert!(half2 >= 1, "fused step needs a well-defined next round");
+    debug_assert!(z_scratch.capacity() >= half, "z_scratch too small");
+
+    // SAFETY: capacity checked; F128: Copy; every slot written before read.
+    unsafe { z_scratch.set_len(half); }
+
+    let (c_lo, c_hi) = comb.split_at_mut(half);
+    let (cq0, cq1) = c_lo.split_at_mut(half2);
+    let (cq2, cq3) = c_hi.split_at(half2);
+    let (z_lo, z_hi) = z.split_at(half);
+    let (zq0, zq1) = z_lo.split_at(half2);
+    let (zq2, zq3) = z_hi.split_at(half2);
+    let (zs0, zs1) = z_scratch.split_at_mut(half2);
+
+    let (e1, einf) = if half2 < SUMCHECK_PAR_THRESHOLD {
+        let mut e1 = F128::ZERO;
+        let mut einf = F128::ZERO;
+        for i in 0..half2 {
+            let lo = cq0[i] + r * (cq2[i] + cq0[i]);
+            let hi = cq1[i] + r * (cq3[i] + cq1[i]);
+            let zlo = zq0[i] + r * (zq2[i] + zq0[i]);
+            let zhi = zq1[i] + r * (zq3[i] + zq1[i]);
+            cq0[i] = lo;
+            cq1[i] = hi;
+            zs0[i] = zlo;
+            zs1[i] = zhi;
+            e1 += hi * zhi;
+            einf += (hi + lo) * (zhi + zlo);
+        }
+        (e1, einf)
+    } else {
+        cq0.par_iter_mut()
+            .zip(cq1.par_iter_mut())
+            .zip(cq2.par_iter())
+            .zip(cq3.par_iter())
+            .zip(zq0.par_iter())
+            .zip(zq1.par_iter())
+            .zip(zq2.par_iter())
+            .zip(zq3.par_iter())
+            .zip(zs0.par_iter_mut())
+            .zip(zs1.par_iter_mut())
+            .map(|(((((((((c0, c1), c2), c3), z0), z1), z2), z3), s0), s1)| {
+                let lo = *c0 + r * (*c2 + *c0);
+                let hi = *c1 + r * (*c3 + *c1);
+                let zlo = *z0 + r * (*z2 + *z0);
+                let zhi = *z1 + r * (*z3 + *z1);
+                *c0 = lo;
+                *c1 = hi;
+                *s0 = zlo;
+                *s1 = zhi;
+                (hi * zhi, (hi + lo) * (zhi + zlo))
+            })
+            .reduce(|| (F128::ZERO, F128::ZERO), |a, b| (a.0 + b.0, a.1 + b.1))
+    };
+
+    comb.truncate(half);
+    (e1, einf)
+}
+
 // ---------------------------------------------------------------------------
 // API
 // ---------------------------------------------------------------------------
@@ -1368,14 +1447,11 @@ fn prove_padded_inner<Ch: Challenger>(
     } else {
         rayon::join(comb_branch, z_branch)
     };
-    // 3b. Optional capture: clone the pre-sumcheck z_vec for downstream reuse
-    //     (PCS open's AB-claim s_hat_v skipping fold_1b_rows). Only pay the
-    //     clone when explicitly requested.
-    let captured_z_vec: Option<Vec<F128>> = if capture_z_vec {
-        Some(z_vec.clone())
-    } else {
-        None
-    };
+    // 3b. When capture is requested, preserve z_vec by folding the sumcheck
+    //     into a scratch buffer instead of in-place. This eliminates a 512 MiB
+    //     clone — z_vec stays read-only and is returned intact for downstream
+    //     PCS `s_hat_v` reuse.
+    let preserve_z = capture_z_vec;
     let t_sumcheck_start = if trace {
         Some(std::time::Instant::now())
     } else {
@@ -1389,6 +1465,15 @@ fn prove_padded_inner<Ch: Challenger>(
     //    rayon when the residual table is large enough.
     let mut rounds = Vec::with_capacity(inner_rest_len);
     let mut r_rounds = Vec::with_capacity(inner_rest_len);
+    // When preserving z_vec, fold z into a scratch buffer so z_vec stays
+    // intact for downstream PCS s_hat_v. The scratch takes over as the
+    // working z for subsequent rounds.
+    let mut z_fold_buf: Option<Vec<F128>> = if preserve_z && inner_rest_len > 0 {
+        Some(crate::scratch::take_f128(z_vec.len() / 2))
+    } else {
+        None
+    };
+
     if inner_rest_len > 0 {
         // Round 0's message is the only standalone evaluation pass; every later
         // round's message falls out of binding the previous round (fold +
@@ -1402,13 +1487,34 @@ fn prove_padded_inner<Ch: Challenger>(
             r_rounds.push(r);
             if t + 1 < inner_rest_len {
                 // Fused: bind both tables at r AND compute round (t+1)'s message.
-                let (ne1, neinf) = sumcheck_bind_both_and_eval_next(&mut comb_vec, &mut z_vec, r);
-                e1 = ne1;
-                einf = neinf;
+                if preserve_z {
+                    if t == 0 {
+                        // First bind: z_vec read-only, folds into z_fold_buf.
+                        let zfb = z_fold_buf.as_mut().unwrap();
+                        let (ne1, neinf) = sumcheck_bind_both_eval_next_z_to_scratch(
+                            &mut comb_vec, &z_vec, zfb, r,
+                        );
+                        e1 = ne1;
+                        einf = neinf;
+                    } else {
+                        let zfb = z_fold_buf.as_mut().unwrap();
+                        let (ne1, neinf) = sumcheck_bind_both_and_eval_next(&mut comb_vec, zfb, r);
+                        e1 = ne1;
+                        einf = neinf;
+                    }
+                } else {
+                    let (ne1, neinf) = sumcheck_bind_both_and_eval_next(&mut comb_vec, &mut z_vec, r);
+                    e1 = ne1;
+                    einf = neinf;
+                }
             } else {
-                // Final round: just fold; z_vec collapses to z_partial.
+                // Final round: just fold; the working z collapses to z_partial.
                 sumcheck_bind_top_in_place_par(&mut comb_vec, r);
-                sumcheck_bind_top_in_place_par(&mut z_vec, r);
+                if preserve_z {
+                    sumcheck_bind_top_in_place_par(z_fold_buf.as_mut().unwrap(), r);
+                } else {
+                    sumcheck_bind_top_in_place_par(&mut z_vec, r);
+                }
             }
         }
     }
@@ -1420,8 +1526,15 @@ fn prove_padded_inner<Ch: Challenger>(
         );
     }
 
-    // 6. Send `z_partial` (the post-sumcheck collapsed z_vec). Length 2^k_skip.
-    let z_partial = z_vec.clone();
+    // 6. Send `z_partial` (the post-sumcheck collapsed z). Length 2^k_skip.
+    let z_partial = if preserve_z && z_fold_buf.is_some() {
+        // z_fold_buf has been folded down to 2^k_skip entries.
+        z_fold_buf.unwrap()
+    } else {
+        z_vec.clone()
+    };
+    // Return the original z_vec intact as the captured pre-sumcheck value.
+    let captured_z_vec: Option<Vec<F128>> = if preserve_z { Some(z_vec) } else { None };
     challenger.observe_f128_slice(&z_partial);
 
     // 7. Sample fresh z_skip AFTER observing z_partial — gives Schwartz-Zippel
