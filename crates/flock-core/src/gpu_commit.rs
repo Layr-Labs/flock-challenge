@@ -73,7 +73,7 @@ pub(crate) fn commit_l0_or_fallback(
     codeword: Vec<F128>,
     params: &crate::pcs::commit::PcsParams,
     cpu: impl FnOnce(&mut [F128]) -> Vec<crate::merkle::Hash>,
-) -> (crate::pcs::commit::CodewordBuf, Vec<crate::merkle::Hash>) {
+) -> (crate::pcs::commit::CodewordBuf, crate::pcs::commit::MerkleTreeBuf) {
     imp::commit_l0_or_fallback(z_packed, codeword, params, cpu)
 }
 
@@ -84,6 +84,33 @@ pub(crate) fn commit_l0_or_fallback(
 pub struct GpuCodeword {
     ptr: *const F128,
     len: usize,
+}
+
+/// Read-only ranked L0 tree in the persistent shared Metal buffer.
+pub struct GpuMerkleTree {
+    ptr: *const crate::merkle::Hash,
+    len: usize,
+}
+unsafe impl Send for GpuMerkleTree {}
+unsafe impl Sync for GpuMerkleTree {}
+impl GpuMerkleTree {
+    /// SAFETY: `ptr` must point at `len` initialized Hash nodes that stay valid
+    /// and un-mutated for this value's lifetime (the process-persistent tree
+    /// buffer, guarded by the staging lease / latch).
+    #[cfg_attr(
+        not(all(target_os = "macos", target_arch = "aarch64")),
+        allow(dead_code)
+    )]
+    pub(crate) unsafe fn new(ptr: *const crate::merkle::Hash, len: usize) -> Self {
+        Self { ptr, len }
+    }
+}
+impl core::ops::Deref for GpuMerkleTree {
+    type Target = [crate::merkle::Hash];
+    fn deref(&self) -> &[crate::merkle::Hash] {
+        // SAFETY: contract of `new`.
+        unsafe { core::slice::from_raw_parts(self.ptr, self.len) }
+    }
 }
 
 // SAFETY: the underlying memory is plain host-visible shared memory owned by
@@ -1833,8 +1860,8 @@ kernel void parent_hash(device const uint* children [[buffer(0)]],
         mut codeword: Vec<F128>,
         params: &crate::pcs::commit::PcsParams,
         cpu: impl FnOnce(&mut [F128]) -> Vec<Hash>,
-    ) -> (crate::pcs::commit::CodewordBuf, Vec<Hash>) {
-        use crate::pcs::commit::CodewordBuf;
+    ) -> (crate::pcs::commit::CodewordBuf, crate::pcs::commit::MerkleTreeBuf) {
+        use crate::pcs::commit::{CodewordBuf, MerkleTreeBuf};
         let dbg = debug_enabled();
 
         // CPU first: the warmup prove's commit arm runs concurrently with the
@@ -1856,7 +1883,7 @@ kernel void parent_hash(device const uint* children [[buffer(0)]],
                     eprintln!("[gpu-commit] warmup: GPU unavailable ({e}); latching CPU path");
                 }
                 *latch = LatchState::Off;
-                return (CodewordBuf::Cpu(codeword), cpu_tree);
+                return (CodewordBuf::Cpu(codeword), MerkleTreeBuf::Cpu(cpu_tree));
             }
         };
         let gpu = gpu().expect("gpu() succeeded during warmup_gpu_run");
@@ -1899,21 +1926,22 @@ kernel void parent_hash(device const uint* children [[buffer(0)]],
             release_latched(gpu, run.latched);
             *latch = LatchState::Off;
         }
-        (CodewordBuf::Cpu(codeword), cpu_tree)
+        (CodewordBuf::Cpu(codeword), MerkleTreeBuf::Cpu(cpu_tree))
     }
 
     /// Timed-prove path once latched On: run the from-z graph into the
     /// persistent staging buffer (never touching the caller's z or codeword
-    /// buffers), copy the tree out, return the pooled input codeword to the
-    /// scratch pool, and hand back a `GpuCodeword` view of the staging.
+    /// buffers), hand back a zero-copy tree view, return the pooled input
+    /// codeword to the scratch pool, and hand back a `GpuCodeword` view of the
+    /// staging.
     fn run_latched(
         latch: &mut LatchState,
         z_packed: &[F128],
         mut codeword: Vec<F128>,
         params: &crate::pcs::commit::PcsParams,
         cpu: impl FnOnce(&mut [F128]) -> Vec<Hash>,
-    ) -> (crate::pcs::commit::CodewordBuf, Vec<Hash>) {
-        use crate::pcs::commit::CodewordBuf;
+    ) -> (crate::pcs::commit::CodewordBuf, crate::pcs::commit::MerkleTreeBuf) {
+        use crate::pcs::commit::{CodewordBuf, MerkleTreeBuf};
         use std::sync::atomic::Ordering;
         let log_d = params.k_code();
         let n_leaves = params.n_leaves();
@@ -1923,7 +1951,7 @@ kernel void parent_hash(device const uint* children [[buffer(0)]],
             Ok(g) => g,
             Err(_) => {
                 let tree = cpu(&mut codeword);
-                return (CodewordBuf::Cpu(codeword), tree);
+                return (CodewordBuf::Cpu(codeword), MerkleTreeBuf::Cpu(tree));
             }
         };
 
@@ -1935,7 +1963,7 @@ kernel void parent_hash(device const uint* children [[buffer(0)]],
                 eprintln!("[gpu-commit] staging still in use; CPU fallback");
             }
             let tree = cpu(&mut codeword);
-            return (CodewordBuf::Cpu(codeword), tree);
+            return (CodewordBuf::Cpu(codeword), MerkleTreeBuf::Cpu(tree));
         }
 
         // Resolve the read-only z wrap (normally cached from the warmup).
@@ -1966,7 +1994,7 @@ kernel void parent_hash(device const uint* children [[buffer(0)]],
                         }
                         STAGING_IN_USE.store(false, Ordering::Release);
                         let tree = cpu(&mut codeword);
-                        return (CodewordBuf::Cpu(codeword), tree);
+                        return (CodewordBuf::Cpu(codeword), MerkleTreeBuf::Cpu(tree));
                     }
                 },
             };
@@ -1993,20 +2021,16 @@ kernel void parent_hash(device const uint* children [[buffer(0)]],
                 release_latched(gpu, state);
             }
             let tree = cpu(&mut codeword);
-            return (CodewordBuf::Cpu(codeword), tree);
+            return (CodewordBuf::Cpu(codeword), MerkleTreeBuf::Cpu(tree));
         }
         let graph_ms = t0.elapsed().as_secs_f64() * 1e3;
-        let mut tree = take_tree(total_nodes);
-        unsafe {
-            copy_bytes_parallel(gpu.buffer_contents(tree_buf), {
-                core::slice::from_raw_parts_mut(tree.as_mut_ptr().cast::<u8>(), total_nodes * 32)
-            });
-        }
+        // Zero-copy: opening only needs a query-dependent subset of the 64 MiB
+        // tree; keep it in the persistent shared Metal buffer.
+        let tree = unsafe {
+            super::GpuMerkleTree::new(gpu.buffer_contents(tree_buf).cast::<Hash>(), total_nodes)
+        };
         if std::env::var_os("FLOCK_COMMIT_TIMING").is_some() || debug_enabled() {
-            eprintln!(
-                "[commit-timing] gpu-commit: graph {graph_ms:.2} ms + tree-copyout {:.2} ms",
-                t0.elapsed().as_secs_f64() * 1e3 - graph_ms
-            );
+            eprintln!("[commit-timing] gpu-commit: graph {graph_ms:.2} ms + zero-copy tree");
         }
         // The replicated input codeword was never read by the from-z graph;
         // hand it straight back to the scratch pool for the next prove.
@@ -2014,7 +2038,7 @@ kernel void parent_hash(device const uint* children [[buffer(0)]],
         let gpu_codeword = unsafe {
             super::GpuCodeword::new(gpu.buffer_contents(staging).cast::<F128>(), codeword_len)
         };
-        (CodewordBuf::Gpu(gpu_codeword), tree)
+        (CodewordBuf::Gpu(gpu_codeword), MerkleTreeBuf::Gpu(tree))
     }
 
     pub(crate) fn commit_l0_or_fallback(
@@ -2022,21 +2046,21 @@ kernel void parent_hash(device const uint* children [[buffer(0)]],
         mut codeword: Vec<F128>,
         params: &crate::pcs::commit::PcsParams,
         cpu: impl FnOnce(&mut [F128]) -> Vec<Hash>,
-    ) -> (crate::pcs::commit::CodewordBuf, Vec<Hash>) {
-        use crate::pcs::commit::CodewordBuf;
+    ) -> (crate::pcs::commit::CodewordBuf, crate::pcs::commit::MerkleTreeBuf) {
+        use crate::pcs::commit::{CodewordBuf, MerkleTreeBuf};
         if !super::gpu_commit_enabled()
             || !super::is_ranked_gpu_shape(params)
             || rayon::current_num_threads() <= 1
         {
             let tree = cpu(&mut codeword);
-            return (CodewordBuf::Cpu(codeword), tree);
+            return (CodewordBuf::Cpu(codeword), MerkleTreeBuf::Cpu(tree));
         }
         let mut latch = LATCH.lock().unwrap();
         match &*latch {
             LatchState::Off => {
                 drop(latch);
                 let tree = cpu(&mut codeword);
-                (CodewordBuf::Cpu(codeword), tree)
+                (CodewordBuf::Cpu(codeword), MerkleTreeBuf::Cpu(tree))
             }
             LatchState::Undecided => {
                 warmup_and_decide(&mut latch, z_packed, codeword, params, cpu)
@@ -2128,9 +2152,12 @@ mod imp {
         mut codeword: Vec<F128>,
         _params: &crate::pcs::commit::PcsParams,
         cpu: impl FnOnce(&mut [F128]) -> Vec<crate::merkle::Hash>,
-    ) -> (crate::pcs::commit::CodewordBuf, Vec<crate::merkle::Hash>) {
+    ) -> (crate::pcs::commit::CodewordBuf, crate::pcs::commit::MerkleTreeBuf) {
         let tree = cpu(&mut codeword);
-        (crate::pcs::commit::CodewordBuf::Cpu(codeword), tree)
+        (
+            crate::pcs::commit::CodewordBuf::Cpu(codeword),
+            crate::pcs::commit::MerkleTreeBuf::Cpu(tree),
+        )
     }
 
     pub(crate) fn give_tree(_tree: Vec<crate::merkle::Hash>) {}
@@ -2487,7 +2514,7 @@ mod tests {
 
         // Warmup commit: dual-run, CPU-authoritative, decides the latch.
         let (c1, pd1) = crate::pcs::commit::commit(&z, &params);
-        let tree1 = pd1.merkle_tree.clone();
+        let tree1 = pd1.merkle_tree.to_vec();
         let codeword1 = pd1.codeword.to_vec();
         drop(pd1); // returns codeword + tree to the pools, as the prover does
 
@@ -2495,7 +2522,7 @@ mod tests {
         let t0 = std::time::Instant::now();
         let (c2, pd2) = crate::pcs::commit::commit(&z, &params);
         let latched_ms = t0.elapsed().as_secs_f64() * 1e3;
-        eprintln!("latched commit (replicate+gpu graph+copyout): {latched_ms:.2} ms");
+        eprintln!("latched commit (replicate+gpu graph+zero-copy tree): {latched_ms:.2} ms");
 
         assert_eq!(c1.root, c2.root, "roots differ between warmup and latched");
         assert_eq!(tree1, pd2.merkle_tree, "trees differ");
