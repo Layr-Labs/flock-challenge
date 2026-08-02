@@ -3157,6 +3157,7 @@ kernel void parent_hash3(device const uint* children [[buffer(0)]],
                         log_d,
                         16 - k_cpu16,
                         16,
+                        ranked_suffix_narrow_wavefront(),
                         finish_chunk,
                     );
                 } else {
@@ -3312,6 +3313,48 @@ kernel void parent_hash3(device const uint* children [[buffer(0)]],
     static TUNED_HYBRID_K: std::sync::atomic::AtomicUsize =
         std::sync::atomic::AtomicUsize::new(usize::MAX);
 
+    const RANKED_SUFFIX_FLAT: u8 = 0;
+    const RANKED_SUFFIX_NARROW_WAVEFRONT: u8 = 1;
+    static TUNED_RANKED_SUFFIX_MODE: std::sync::atomic::AtomicU8 =
+        std::sync::atomic::AtomicU8::new(RANKED_SUFFIX_FLAT);
+
+    fn ranked_suffix_mode_override() -> Option<bool> {
+        use std::sync::OnceLock;
+        static MODE: OnceLock<Option<bool>> = OnceLock::new();
+        *MODE.get_or_init(|| {
+            if std::env::var_os("FLOCK_NO_HYBRID_NARROW_WAVEFRONT").is_some() {
+                Some(false)
+            } else if std::env::var_os("FLOCK_HYBRID_NARROW_WAVEFRONT").is_some() {
+                Some(true)
+            } else {
+                None
+            }
+        })
+    }
+
+    #[inline]
+    fn ranked_suffix_narrow_wavefront() -> bool {
+        ranked_suffix_mode_override().unwrap_or_else(|| {
+            TUNED_RANKED_SUFFIX_MODE.load(std::sync::atomic::Ordering::Acquire)
+                == RANKED_SUFFIX_NARROW_WAVEFRONT
+        })
+    }
+
+    fn set_ranked_suffix_narrow_wavefront(enabled: bool) {
+        TUNED_RANKED_SUFFIX_MODE.store(
+            if enabled {
+                RANKED_SUFFIX_NARROW_WAVEFRONT
+            } else {
+                RANKED_SUFFIX_FLAT
+            },
+            std::sync::atomic::Ordering::Release,
+        );
+    }
+
+    fn ranked_suffix_mode_tune_enabled() -> bool {
+        ranked_suffix_mode_override().is_none()
+    }
+
     /// CPU reference-commit wall from the cache-miss warmup. Cache
     /// publication waits for the exact-contention winner, so no cache-hit
     /// worker can observe the untuned sentinel.
@@ -3372,10 +3415,10 @@ kernel void parent_hash3(device const uint* children [[buffer(0)]],
         Some(chosen)
     }
 
-    /// Broad candidate set retained deliberately: the warmup cache publishes
-    /// the first process's winner to later workers, so the one calibration
-    /// process should search both pure GPU and the full observed hybrid
-    /// plateau instead of narrowing around a development-host optimum.
+    /// Broad candidate set retained deliberately. The ranked harness recreates
+    /// TMPDIR for every fresh worker, so each worker independently searches
+    /// pure GPU and the full observed hybrid plateau instead of inheriting a
+    /// development-host optimum.
     const RANKED_EXACT_TUNE_CANDIDATES: [usize; 8] = [0, 2, 3, 4, 5, 6, 7, 8];
 
     /// Two samples per candidate, with the second pass in reverse order so
@@ -3409,6 +3452,46 @@ kernel void parent_hash3(device const uint* children [[buffer(0)]],
             *mean = (a + b) * 0.5;
         }
         Some(means)
+    }
+
+    /// Compare the protected flat suffix against the one-region wavefront in
+    /// both orders. Every sample receives freshly re-primed canonical staging
+    /// and the same exact AB contention closure as the k sweep.
+    fn collect_ranked_suffix_mode_samples<E>(
+        mut reprime: impl FnMut() -> Result<(), E>,
+        mut sample: impl FnMut(bool) -> Result<f64, E>,
+    ) -> Result<[[f64; 2]; 2], E> {
+        let mut walls = [[0.0; 2]; 2]; // [flat, narrow][forward, reverse]
+        reprime()?;
+        walls[0][0] = sample(false)?;
+        reprime()?;
+        walls[1][0] = sample(true)?;
+        reprime()?;
+        walls[1][1] = sample(true)?;
+        reprime()?;
+        walls[0][1] = sample(false)?;
+        Ok(walls)
+    }
+
+    const RANKED_NARROW_MIN_GAIN_MS: f64 = 1.0;
+
+    /// Admit the wavefront only when it wins both order-reversed target
+    /// samples and its mean gain is large enough to clear ordinary scheduler
+    /// noise. A non-finite or negative timer always keeps protected flat.
+    fn choose_ranked_suffix_narrow(samples: [[f64; 2]; 2]) -> bool {
+        let [flat, narrow] = samples;
+        if flat
+            .into_iter()
+            .chain(narrow)
+            .any(|ms| !ms.is_finite() || ms < 0.0)
+        {
+            return false;
+        }
+        let mean_flat = (flat[0] + flat[1]) * 0.5;
+        let mean_narrow = (narrow[0] + narrow[1]) * 0.5;
+        narrow[0] < flat[0]
+            && narrow[1] < flat[1]
+            && mean_narrow + RANKED_NARROW_MIN_GAIN_MS <= mean_flat
     }
 
     #[inline]
@@ -3723,18 +3806,18 @@ kernel void parent_hash3(device const uint* children [[buffer(0)]],
         let dbg = debug_enabled() || std::env::var_os("FLOCK_COMMIT_TIMING").is_some();
         let latch = LATCH.lock().unwrap();
         let LatchState::On(latched) = &*latch else {
-            finish_ranked_exact_contention_tune(params, cpu_tree, 0);
+            finish_ranked_exact_contention_tune(params, cpu_tree, 0, false);
             return;
         };
         if STAGING_IN_USE.load(Ordering::Acquire) {
             // This callback belongs immediately after call-zero warmup,
             // whose ProverData is CPU-owned. Refuse any later invocation
             // rather than overwrite a live GPU codeword view.
-            finish_ranked_exact_contention_tune(params, cpu_tree, 0);
+            finish_ranked_exact_contention_tune(params, cpu_tree, 0, false);
             return;
         }
         let Ok(gpu) = gpu() else {
-            finish_ranked_exact_contention_tune(params, cpu_tree, 0);
+            finish_ranked_exact_contention_tune(params, cpu_tree, 0, false);
             return;
         };
 
@@ -3785,13 +3868,13 @@ kernel void parent_hash3(device const uint* children [[buffer(0)]],
                 }
             }
         };
-        let sample = |k: usize| -> Result<f64, String> {
+        let mut sample = |k: usize| -> Result<f64, String> {
             let t0 = std::time::Instant::now();
             let (graph, ()) = rayon::join(|| timed_graph(k), || replay_ab());
             graph?;
             Ok(t0.elapsed().as_secs_f64() * 1e3)
         };
-        let reprime = || unsafe {
+        let mut reprime = || unsafe {
             run_from_z_first_pass(
                 ctx.gpu,
                 ctx.z_buf,
@@ -3800,7 +3883,11 @@ kernel void parent_hash3(device const uint* children [[buffer(0)]],
                 params.k_code(),
             )
         };
-        let samples = match collect_ranked_exact_samples(reprime, sample) {
+        // The broad split sweep prices the protected flat scheduler first.
+        // The source-distinct narrow wavefront is admitted separately at the
+        // selected k so scheduler choice cannot distort split selection.
+        set_ranked_suffix_narrow_wavefront(false);
+        let samples = match collect_ranked_exact_samples(&mut reprime, &mut sample) {
             Ok(samples) => samples,
             Err(e) => {
                 if dbg {
@@ -3808,12 +3895,12 @@ kernel void parent_hash3(device const uint* children [[buffer(0)]],
                         "[gpu-commit] broad exact-AB tune failed ({e}); pinning verified k=0"
                     );
                 }
-                finish_ranked_exact_contention_tune(params, cpu_tree, 0);
+                finish_ranked_exact_contention_tune(params, cpu_tree, 0, false);
                 return;
             }
         };
         let Some(means) = mean_ranked_exact_samples(samples) else {
-            finish_ranked_exact_contention_tune(params, cpu_tree, 0);
+            finish_ranked_exact_contention_tune(params, cpu_tree, 0, false);
             return;
         };
         let Some(chosen) = choose_hybrid_k(
@@ -3821,9 +3908,26 @@ kernel void parent_hash3(device const uint* children [[buffer(0)]],
             &means,
             DEFAULT_HYBRID_K,
         ) else {
-            finish_ranked_exact_contention_tune(params, cpu_tree, 0);
+            finish_ranked_exact_contention_tune(params, cpu_tree, 0, false);
             return;
         };
+
+        let mut mode_samples = None;
+        let chosen_narrow = if chosen != 0 && ranked_suffix_mode_tune_enabled() {
+            match collect_ranked_suffix_mode_samples(&mut reprime, |narrow| {
+                set_ranked_suffix_narrow_wavefront(narrow);
+                sample(chosen)
+            }) {
+                Ok(samples) => {
+                    mode_samples = Some(samples);
+                    choose_ranked_suffix_narrow(samples)
+                }
+                Err(_) => false,
+            }
+        } else {
+            ranked_suffix_mode_override().unwrap_or(false) && chosen != 0
+        };
+        set_ranked_suffix_narrow_wavefront(chosen_narrow);
 
         let verified = unsafe {
             if chosen == 0 {
@@ -3883,15 +3987,19 @@ kernel void parent_hash3(device const uint* children [[buffer(0)]],
                 })
                 .collect();
             eprintln!(
-                "[gpu-commit] broad exact-AB {} -> k={} verified={verified}",
+                "[gpu-commit] broad exact-AB {} -> k={} narrow={} mode_samples={:?} \
+                 verified={verified}",
                 table.join(" "),
                 if verified { chosen } else { 0 },
+                verified && chosen_narrow,
+                mode_samples,
             );
         }
         finish_ranked_exact_contention_tune(
             params,
             cpu_tree,
             if verified { chosen } else { 0 },
+            verified && chosen_narrow,
         );
     }
 
@@ -3912,16 +4020,16 @@ kernel void parent_hash3(device const uint* children [[buffer(0)]],
     }
 
     // -----------------------------------------------------------------------
-    // Cross-process warmup latch cache.
+    // Opportunistic cross-process warmup latch cache.
     //
     // Every worker process proves the same fixed warmup seed, so the CPU
-    // reference commit is byte-identical across all ~120 processes of a
-    // ranked run. The first process performs the incumbent full dual-run
+    // reference commit is byte-identical across compatible processes. The
+    // first process performs the incumbent full dual-run
     // (CPU arm under real precompute contention, GPU arm, full codeword +
     // tree byte compare, autotune sweep with its trust-but-verify compare)
     // and publishes {latch decision, tuned k, CPU wall, full CPU reference
     // tree} to the shared scratch directory (`TMPDIR`, the only writable
-    // path inside the ranked Seatbelt profile). Later processes run only
+    // path inside the Seatbelt profile). Later processes run only
     // their own GPU warmup graph and byte-compare their complete Merkle
     // tree against the published CPU reference: the tree commits to every
     // codeword byte, so per-process bit-exactness enforcement is preserved
@@ -3930,7 +4038,9 @@ kernel void parent_hash3(device const uint* children [[buffer(0)]],
     // process with the worker's own GPU wall against the cached CPU wall.
     //
     // Any read/validate/compare failure falls back to the incumbent full
-    // dual-run. Nothing timed changes in any path.
+    // dual-run. Nothing timed changes in any path. The official ranked harness
+    // deletes TMPDIR before and after every trial, so this cache deliberately
+    // has no effect there and every official worker calibrates independently.
     // -----------------------------------------------------------------------
 
     const WARMUP_CACHE_MAGIC_V2: u64 = 0x464C_4B5F_574C_4332; // "FLK_WLC2"
@@ -3938,7 +4048,6 @@ kernel void parent_hash3(device const uint* children [[buffer(0)]],
     // entries can contain the usize::MAX untuned sentinel. The canonical
     // reprime kill switch deliberately returns to the incumbent V2 cache.
     const WARMUP_CACHE_MAGIC_V3: u64 = 0x464C_4B5F_574C_4333; // "FLK_WLC3"
-
     fn warmup_cache_magic() -> u64 {
         if hybrid_tune_canonical_reprime_enabled() {
             WARMUP_CACHE_MAGIC_V3
@@ -4045,9 +4154,11 @@ kernel void parent_hash3(device const uint* children [[buffer(0)]],
         params: &crate::pcs::commit::PcsParams,
         cpu_tree: &[Hash],
         k: usize,
+        narrow_wavefront: bool,
     ) {
         debug_assert!(RANKED_EXACT_TUNE_CANDIDATES.contains(&k));
         TUNED_HYBRID_K.store(k, std::sync::atomic::Ordering::Release);
+        set_ranked_suffix_narrow_wavefront(k != 0 && narrow_wavefront);
         if super::warmup_latch_cache_enabled() {
             let cpu_wall_ms = f64::from_bits(
                 RANKED_EXACT_PENDING_CPU_WALL_BITS.load(std::sync::atomic::Ordering::Acquire),
@@ -4215,6 +4326,9 @@ kernel void parent_hash3(device const uint* children [[buffer(0)]],
                         }
                         TUNED_HYBRID_K
                             .store(cache.tuned_k, std::sync::atomic::Ordering::Relaxed);
+                        // A surviving cache has no target-side scheduler sample;
+                        // keep the protected flat suffix in that conservative path.
+                        set_ranked_suffix_narrow_wavefront(false);
                         // The publishing worker already completed the exact
                         // replay; keep cache-hit workers out of calibration.
                         super::satisfy_ranked_exact_contention_tune();
@@ -4776,7 +4890,8 @@ kernel void parent_hash3(device const uint* children [[buffer(0)]],
     mod split_select_tests {
         use super::{
             DEFAULT_HYBRID_K, RANKED_EXACT_TUNE_CANDIDATES, choose_hybrid_k,
-            collect_ranked_exact_samples, mean_ranked_exact_samples,
+            choose_ranked_suffix_narrow, collect_ranked_exact_samples,
+            collect_ranked_suffix_mode_samples, mean_ranked_exact_samples,
         };
         const C: [usize; 8] = [0, 2, 3, 4, 5, 6, 7, 8];
 
@@ -4817,6 +4932,44 @@ kernel void parent_hash3(device const uint* children [[buffer(0)]],
             assert_eq!(mean_ranked_exact_samples(samples).unwrap()[1], 100.0);
             samples[1][1] = f64::NAN;
             assert!(mean_ranked_exact_samples(samples).is_none());
+        }
+
+        #[test]
+        fn suffix_mode_samples_are_order_reversed_and_each_reprimed() {
+            let events = std::cell::RefCell::new(Vec::new());
+            let samples = collect_ranked_suffix_mode_samples(
+                || {
+                    events.borrow_mut().push(-1);
+                    Ok::<(), ()>(())
+                },
+                |narrow| {
+                    events.borrow_mut().push(i32::from(narrow));
+                    Ok::<f64, ()>(if narrow { 90.0 } else { 100.0 })
+                },
+            )
+            .unwrap();
+            assert_eq!(*events.borrow(), [-1, 0, -1, 1, -1, 1, -1, 0]);
+            assert_eq!(samples, [[100.0, 100.0], [90.0, 90.0]]);
+        }
+
+        #[test]
+        fn suffix_mode_requires_two_wins_and_material_mean() {
+            assert!(choose_ranked_suffix_narrow([
+                [100.0, 102.0],
+                [98.0, 100.0]
+            ]));
+            assert!(!choose_ranked_suffix_narrow([
+                [100.0, 102.0],
+                [99.5, 101.5]
+            ]));
+            assert!(!choose_ranked_suffix_narrow([
+                [100.0, 102.0],
+                [98.0, 103.0]
+            ]));
+            assert!(!choose_ranked_suffix_narrow([
+                [100.0, f64::NAN],
+                [90.0, 90.0]
+            ]));
         }
 
         #[test]

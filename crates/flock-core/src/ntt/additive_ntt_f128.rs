@@ -812,6 +812,7 @@ impl AdditiveNttF128 {
         stop_layer: usize,
         b_start: usize,
         b_end: usize,
+        narrow_wavefront: bool,
         finish_chunk: F,
     ) where
         F: Fn(usize, &[F128]) + Sync + Send,
@@ -824,15 +825,21 @@ impl AdditiveNttF128 {
         assert_eq!(stop_layer, log_d, "ranked hybrid suffix completes the NTT");
         assert!(b_start < b_end && b_end <= (1usize << start_layer));
 
-        // Two fused radix-8 passes.  Unlike the old all-layer range driver,
-        // this is the last streaming traversal of the complete suffix.
-        self.forward_transform_interleaved_block_range(
-            data,
-            num_ntts,
-            start_layer,
-            DEEP_LAYER,
-            b_start,
-            b_end,
+        if narrow_wavefront && b_end - b_start >= 2 {
+            self.forward_transform_interleaved_ranked_narrow_wavefront_and_then(
+                data,
+                b_start,
+                b_end,
+                &finish_chunk,
+            );
+            return;
+        }
+
+        // Two fused radix-8 passes. Flatten every selected (block,row) job
+        // into one Rayon region per pass: the generic range driver opens one
+        // region per block at each layer.
+        self.forward_transform_interleaved_ranked_block_range_top_flat(
+            data, b_start, b_end,
         );
 
         // Every layer-4 block contains 2^(10-4) independent layer-10
@@ -848,6 +855,196 @@ impl AdditiveNttF128 {
             sub_start,
             sub_end,
             &finish_chunk,
+        );
+    }
+
+    /// Run ranked suffix layers 4..10 as two flat radix-8 job populations.
+    ///
+    /// Each `(block,row)` job owns eight disjoint position rows across all 64
+    /// lanes. Absolute block indices preserve the generic range driver's
+    /// twiddle mapping for every nonzero suffix start.
+    fn forward_transform_interleaved_ranked_block_range_top_flat(
+        &self,
+        data: &mut [F128],
+        b_start: usize,
+        b_end: usize,
+    ) {
+        const LOG_D: usize = 20;
+        const NUM_NTTS: usize = 64;
+        const START_LAYER: usize = 4;
+
+        debug_assert_eq!(data.len(), (1usize << LOG_D) * NUM_NTTS);
+        debug_assert!(b_start < b_end && b_end <= (1 << START_LAYER));
+
+        let range_blocks = b_end - b_start;
+        let top_block_positions = 1usize << (LOG_D - START_LAYER);
+        let range_base = b_start * top_block_positions * NUM_NTTS;
+        let range_elems = range_blocks * top_block_positions * NUM_NTTS;
+        let range = &mut data[range_base..range_base + range_elems];
+
+        self.forward_transform_interleaved_ranked_top_flat_slice(
+            range,
+            LOG_D,
+            NUM_NTTS,
+            START_LAYER,
+            b_start,
+        );
+    }
+
+    /// Slice form of the flat ranked top driver. `abs_first_top_block` keeps
+    /// twiddle addressing absolute while callers safely split disjoint CPU
+    /// suffix regions for dependency-aware scheduling.
+    fn forward_transform_interleaved_ranked_top_flat_slice(
+        &self,
+        range: &mut [F128],
+        log_d: usize,
+        num_ntts: usize,
+        start_layer: usize,
+        abs_first_top_block: usize,
+    ) {
+        use rayon::prelude::*;
+
+        debug_assert!(start_layer + 6 <= log_d);
+        let top_block_positions = 1usize << (log_d - start_layer);
+        let top_block_elems = top_block_positions * num_ntts;
+        debug_assert!(!range.is_empty() && range.len().is_multiple_of(top_block_elems));
+        let range_blocks = range.len() / top_block_elems;
+
+        for layer in [start_layer, start_layer + 3] {
+            let num_blocks = range_blocks << (layer - start_layer);
+            let abs_first = abs_first_top_block << (layer - start_layer);
+            let block_positions = 1usize << (log_d - layer);
+            let block_elems = block_positions * num_ntts;
+            let eighth = block_positions >> 3;
+            let twiddles: Vec<[F128; 7]> = (0..num_blocks)
+                .map(|local| {
+                    let abs = abs_first + local;
+                    let mut tw = [F128 { lo: 0, hi: 0 }; 7];
+                    tw[0] = self.twiddle(layer, abs);
+                    for s in 0..2 {
+                        tw[1 + s] = self.twiddle(layer + 1, 2 * abs + s);
+                    }
+                    for s in 0..4 {
+                        tw[3 + s] = self.twiddle(layer + 2, 4 * abs + s);
+                    }
+                    tw
+                })
+                .collect();
+
+            let base = range.as_mut_ptr() as usize;
+            let eighth_log = eighth.trailing_zeros() as usize;
+            let eighth_mask = eighth - 1;
+            (0..num_blocks * eighth)
+                .into_par_iter()
+                .for_each(|job| {
+                    let block = job >> eighth_log;
+                    let row = job & eighth_mask;
+                    let block_base = unsafe { (base as *mut F128).add(block * block_elems) };
+                    // SAFETY: each indexed job owns eight disjoint rows in
+                    // exactly one selected block.
+                    unsafe {
+                        kernels::butterfly_fused_3layer_row(
+                            block_base,
+                            eighth,
+                            num_ntts,
+                            row,
+                            &twiddles[block],
+                        );
+                    }
+                });
+        }
+    }
+
+    /// Complete one early layer-4 region through leaves/local parents while
+    /// the remaining CPU suffix keeps the protected broad flat schedule.
+    /// This removes only one global dependency edge: early deep work can
+    /// overlap the broad region's second top pass without wavefronting every
+    /// region and monopolizing the shared Rayon/AB resources.
+    fn forward_transform_interleaved_ranked_narrow_wavefront_and_then<F>(
+        &self,
+        data: &mut [F128],
+        b_start: usize,
+        b_end: usize,
+        finish_chunk: &F,
+    ) where
+        F: Fn(usize, &[F128]) + Sync + Send,
+    {
+        const LOG_D: usize = 20;
+        const NUM_NTTS: usize = 64;
+        const START_LAYER: usize = 4;
+        const DEEP_LAYER: usize = 10;
+
+        self.forward_transform_interleaved_narrow_wavefront_range_and_then(
+            data,
+            LOG_D,
+            NUM_NTTS,
+            START_LAYER,
+            DEEP_LAYER,
+            b_start,
+            b_end,
+            finish_chunk,
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn forward_transform_interleaved_narrow_wavefront_range_and_then<F>(
+        &self,
+        data: &mut [F128],
+        log_d: usize,
+        num_ntts: usize,
+        start_layer: usize,
+        deep_layer: usize,
+        b_start: usize,
+        b_end: usize,
+        finish_chunk: &F,
+    ) where
+        F: Fn(usize, &[F128]) + Sync + Send,
+    {
+        debug_assert_eq!(deep_layer, start_layer + 6);
+        debug_assert!(b_start + 1 < b_end);
+        let top_block_elems = (1usize << (log_d - start_layer)) * num_ntts;
+        let range_base = b_start * top_block_elems;
+        let range_elems = (b_end - b_start) * top_block_elems;
+        let range = &mut data[range_base..range_base + range_elems];
+        let (early, broad) = range.split_at_mut(top_block_elems);
+        let early_sub_start = b_start << (deep_layer - start_layer);
+        let broad_sub_start = (b_start + 1) << (deep_layer - start_layer);
+
+        rayon::join(
+            || {
+                self.forward_transform_interleaved_ranked_top_flat_slice(
+                    early,
+                    log_d,
+                    num_ntts,
+                    start_layer,
+                    b_start,
+                );
+                self.forward_transform_interleaved_deep_fused_pairs_slice_and_then(
+                    early,
+                    num_ntts,
+                    deep_layer,
+                    log_d,
+                    early_sub_start,
+                    finish_chunk,
+                );
+            },
+            || {
+                self.forward_transform_interleaved_ranked_top_flat_slice(
+                    broad,
+                    log_d,
+                    num_ntts,
+                    start_layer,
+                    b_start + 1,
+                );
+                self.forward_transform_interleaved_deep_fused_pairs_slice_and_then(
+                    broad,
+                    num_ntts,
+                    deep_layer,
+                    log_d,
+                    broad_sub_start,
+                    finish_chunk,
+                );
+            },
         );
     }
 
@@ -1301,20 +1498,49 @@ impl AdditiveNttF128 {
     ) where
         F: Fn(usize, &[F128]) + Sync + Send,
     {
-        use rayon::prelude::*;
-
         debug_assert!(n_top <= log_d);
         debug_assert_eq!(data.len(), (1usize << log_d) * num_ntts);
         debug_assert!(sub_start < sub_end && sub_end <= (1usize << n_top));
         let sub_size_positions = 1usize << (log_d - n_top);
         let sub_elems = sub_size_positions * num_ntts;
-        let low_twiddle_final_pair =
-            use_ranked_low_twiddle_final_pair(log_d, num_ntts, n_top);
 
         let range_start = sub_start * sub_elems;
         let range_end = sub_end * sub_elems;
 
-        data[range_start..range_end]
+        self.forward_transform_interleaved_deep_fused_pairs_slice_and_then(
+            &mut data[range_start..range_end],
+            num_ntts,
+            n_top,
+            log_d,
+            sub_start,
+            finish_chunk,
+        );
+    }
+
+    /// Slice form of the deep-pair range driver. The slice contains whole
+    /// consecutive layer-`n_top` sub-NTTs and `sub_start` is their absolute
+    /// first index in the full transform.
+    fn forward_transform_interleaved_deep_fused_pairs_slice_and_then<F>(
+        &self,
+        data: &mut [F128],
+        num_ntts: usize,
+        n_top: usize,
+        log_d: usize,
+        sub_start: usize,
+        finish_chunk: &F,
+    ) where
+        F: Fn(usize, &[F128]) + Sync + Send,
+    {
+        use rayon::prelude::*;
+
+        debug_assert!(n_top <= log_d);
+        let sub_size_positions = 1usize << (log_d - n_top);
+        let sub_elems = sub_size_positions * num_ntts;
+        debug_assert!(!data.is_empty() && data.len().is_multiple_of(sub_elems));
+        let low_twiddle_final_pair =
+            use_ranked_low_twiddle_final_pair(log_d, num_ntts, n_top);
+
+        data
             .par_chunks_mut(sub_elems)
             .enumerate()
             .for_each(|(local_sub_idx, sub_data)| {
@@ -3025,5 +3251,60 @@ mod block_range_equivalence {
         let expected_offsets: Vec<usize> =
             (sub_start..sub_end).map(|sub| sub * sub_elems).collect();
         assert_eq!(got_offsets, expected_offsets, "callback coverage/offsets diverge");
+    }
+
+    #[test]
+    fn narrow_wavefront_matches_plain_range_and_callback_coverage() {
+        const NUM_NTTS: usize = 4;
+        const LOG_D: usize = 12;
+        const START_LAYER: usize = 2;
+        const DEEP_LAYER: usize = 8;
+        const B_START: usize = 1;
+        const B_END: usize = 4;
+
+        let ntt = AdditiveNttF128::standard(LOG_D);
+        let mut state = 0xbb67_ae85_84ca_a73bu64;
+        let mut next = move || {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            state
+        };
+        let source: Vec<F128> = (0..(1usize << LOG_D) * NUM_NTTS)
+            .map(|_| F128::new(next(), next()))
+            .collect();
+
+        let mut plain = source.clone();
+        ntt.forward_transform_interleaved_block_range(
+            &mut plain,
+            NUM_NTTS,
+            START_LAYER,
+            LOG_D,
+            B_START,
+            B_END,
+        );
+
+        let sub_elems = (1usize << (LOG_D - DEEP_LAYER)) * NUM_NTTS;
+        let sub_start = B_START << (DEEP_LAYER - START_LAYER);
+        let sub_end = B_END << (DEEP_LAYER - START_LAYER);
+        let observed = std::sync::Mutex::new(Vec::new());
+        let mut wavefront = source;
+        ntt.forward_transform_interleaved_narrow_wavefront_range_and_then(
+            &mut wavefront,
+            LOG_D,
+            NUM_NTTS,
+            START_LAYER,
+            DEEP_LAYER,
+            B_START,
+            B_END,
+            &|offset, chunk| {
+                assert_eq!(chunk, &plain[offset..offset + sub_elems]);
+                observed.lock().unwrap().push(offset);
+            },
+        );
+
+        assert_eq!(wavefront, plain);
+        let mut got = observed.into_inner().unwrap();
+        got.sort_unstable();
+        let want: Vec<usize> = (sub_start..sub_end).map(|sub| sub * sub_elems).collect();
+        assert_eq!(got, want);
     }
 }
