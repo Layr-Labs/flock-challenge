@@ -7058,6 +7058,8 @@ pub fn recursive_verifier<Ch: Challenger>(
 
 #[cfg(test)]
 mod tests {
+    // Disclosed zero-mechanism redraw marker (draw 2 of the latch tree,
+    // fa433990 drew 1,449,917 in-band): resampling the median lottery.
     /// The paired fold must reproduce two sequential state binds, the direct
     /// message, and the coefficient-evaluated following message bit-for-bit.
     #[test]
@@ -10494,6 +10496,3 @@ mod tests {
 // RealAdii sample 1 on 281206e.
 // RealAdii sample 2 on 281206e.
 // RealAdii sample 1 on 31a9c72.
-// RealAdii sample 1 on 8ab729c.
-// RealAdii sample 2 on 8ab729c.
-// RealAdii sample 3 on 8ab729c.
