@@ -2901,20 +2901,7 @@ fn ligero_commit_impl(
         )
     };
     debug_assert_eq!(data_bytes.len(), block_len * leaf_size_bytes);
-    // The 128-byte-leaf recursive shapes are the only serial CPU BLAKE3
-    // blocks in the opening spine while the GPU sits idle; the offload
-    // returns the bit-identical flat tree or `None` for the exact CPU path
-    // (kill switch `FLOCK_NO_GPU_RECURSIVE_MERKLE=1`, non-Blake3 hashes,
-    // other shapes, and every GPU failure).
-    let gpu_tree = if matches!(kind, HashKind::Blake3) && leaf_size_bytes == 128 {
-        crate::gpu_commit::gpu_recursive_merkle_blake3(data_bytes, block_len)
-    } else {
-        None
-    };
-    let tree = match gpu_tree {
-        Some(tree) => tree,
-        None => merkle::merkle_tree(data_bytes, block_len, kind),
-    };
+    let tree = merkle::merkle_tree(data_bytes, block_len, kind);
     let merkle_elapsed = merkle_start.map_or(std::time::Duration::ZERO, |t| t.elapsed());
 
     if timing {
@@ -10493,4 +10480,4 @@ mod tests {
 // RealAdii sample 1 on 88aff39.
 // RealAdii sample 1 on 281206e.
 // RealAdii sample 2 on 281206e.
-// RealAdii sample 1 on 31a9c72.
+// numinous draw 9 1785676826810660507
