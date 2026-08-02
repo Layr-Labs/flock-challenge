@@ -131,6 +131,23 @@ pub(crate) fn gpu_zc_r2_debug() -> bool {
     *ON
 }
 
+/// Kill switch for the zerocheck first-tail-round (T3 compact reconstruction)
+/// products GPU arm.
+pub const ENV_NO_GPU_ZC_T3: &str = "FLOCK_NO_GPU_ZC_T3";
+
+pub(crate) fn gpu_zc_t3_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os(ENV_NO_GPU_ZC_T3).is_none());
+    *ON
+}
+
+/// Diagnostic trace for the T3 products arm (`FLOCK_ZC_T3_GPU_DEBUG=1`).
+pub(crate) fn gpu_zc_t3_debug() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_ZC_T3_GPU_DEBUG").is_some());
+    *ON
+}
+
 /// Kill switch for the cross-process warmup latch cache:
 /// `FLOCK_NO_WARMUP_LATCH_CACHE=1` restores the incumbent full dual-run +
 /// autotune sweep in every worker process. The cache changes **no timed
@@ -2721,6 +2738,90 @@ kernel void blake3_pow_scan(
                     Ok(())
                 } else {
                     Err(format!("command buffer status {status} (hybrid arm)"))
+                }
+            }
+        }
+
+        /// Commit and spin-poll `status` to completion. For sub-millisecond
+        /// dispatches on the prove's serial spine (the PCS grind scans),
+        /// `waitUntilCompleted` pays a thread park plus a completion-handler
+        /// wake on every call; polling the status property from the calling
+        /// thread skips both. Bounded: past `budget_ms` of spinning it falls
+        /// back to the blocking wait, so a long or hung dispatch costs one
+        /// spin budget and then behaves exactly like [`commit_and_wait`].
+        pub(crate) unsafe fn commit_and_spin(
+            &self,
+            cb: Id,
+            budget_ms: f64,
+        ) -> Result<(), String> {
+            unsafe {
+                send!(self.api, unsafe extern "C" fn(Id, Sel), cb, c"commit");
+                let start = std::time::Instant::now();
+                loop {
+                    let status: u64 = send!(
+                        self.api,
+                        unsafe extern "C" fn(Id, Sel) -> u64,
+                        cb,
+                        c"status"
+                    );
+                    if status >= 4 {
+                        if status == 4 {
+                            return Ok(());
+                        }
+                        let err: Id = send!(
+                            self.api,
+                            unsafe extern "C" fn(Id, Sel) -> Id,
+                            cb,
+                            c"error"
+                        );
+                        return Err(format!(
+                            "command buffer status {status}: {}",
+                            self.api.error_string(err)
+                        ));
+                    }
+                    if start.elapsed().as_secs_f64() * 1e3 > budget_ms {
+                        return self.wait_cb(cb);
+                    }
+                    std::hint::spin_loop();
+                }
+            }
+        }
+
+        /// Bounded status spin on an already-committed command buffer: the
+        /// same park-latency dodge as `commit_and_spin`, for drain sites
+        /// where the submit happened earlier (zc-r2 join). If the buffer is
+        /// already complete the first status poll returns immediately at
+        /// zero cost; past the budget it degrades to the exact blocking
+        /// wait.
+        pub(crate) unsafe fn spin_wait_cb(&self, cb: Id, budget_ms: f64) -> Result<(), String> {
+            unsafe {
+                let start = std::time::Instant::now();
+                loop {
+                    let status: u64 = send!(
+                        self.api,
+                        unsafe extern "C" fn(Id, Sel) -> u64,
+                        cb,
+                        c"status"
+                    );
+                    if status >= 4 {
+                        if status == 4 {
+                            return Ok(());
+                        }
+                        let err: Id = send!(
+                            self.api,
+                            unsafe extern "C" fn(Id, Sel) -> Id,
+                            cb,
+                            c"error"
+                        );
+                        return Err(format!(
+                            "command buffer status {status}: {}",
+                            self.api.error_string(err)
+                        ));
+                    }
+                    if start.elapsed().as_secs_f64() * 1e3 > budget_ms {
+                        return self.wait_cb(cb);
+                    }
+                    std::hint::spin_loop();
                 }
             }
         }
@@ -5762,7 +5863,14 @@ kernel void blake3_pow_scan(
                 const THREADS: u64 = 64;
                 gpu.dispatch(enc, u64::from(len).div_ceil(THREADS), THREADS);
                 gpu.end_encoding(enc);
-                gpu.commit_and_wait(cb)?;
+                // The grind sits on the transcript's serial spine: nothing
+                // else can run until the nonce is known, so the calling
+                // thread spins the sub-millisecond dispatch home instead of
+                // parking in `waitUntilCompleted` (measured ~0.5 ms of fixed
+                // roundtrip per scan, paid 7x per ranked prove). The 4 ms
+                // budget covers every observed scan wall with margin; past
+                // it the path degrades to the exact blocking wait.
+                gpu.commit_and_spin(cb, 4.0)?;
                 let offset = out.read_volatile();
                 Ok((offset != u32::MAX).then(|| start + u64::from(offset)))
             })();
@@ -6986,7 +7094,20 @@ LC_KERNEL(lc_fold_stripes, 4)
         }
         let stripe_hi = crate::lincheck::oblock_claim_stripe_base(claim_lo);
         let gpu = gpu().ok()?;
-        let mut guard = ZC_FOLD.lock().ok()?;
+        // Poison tolerance: a panic anywhere while this guard is held would
+        // otherwise disable the fold arm for the remainder of the process —
+        // silently, reported as "arm not available" — turning one transient
+        // fault into a CPU-only worker on a median-scored benchmark. On
+        // poison, discard the (possibly mid-mutation) state and re-init a
+        // fresh one below; never reuse state a panic may have torn.
+        let mut guard = match ZC_FOLD.lock() {
+            Ok(g) => g,
+            Err(poisoned) => {
+                let mut g = poisoned.into_inner();
+                *g = None;
+                g
+            }
+        };
         if guard.is_none() {
             let t = std::time::Instant::now();
             *guard = Some(zc_fold_init(gpu));
@@ -7471,7 +7592,17 @@ kernel void rec_parent_hash(device const uint* children [[buffer(0)]],
         }
         let gpu = gpu().ok()?;
         let started = rec_merkle_debug().then(std::time::Instant::now);
-        let mut guard = REC_MERKLE.lock().ok()?;
+        // Poison-tolerant for the same reason as `ZC_FOLD`: discard torn
+        // state and re-init rather than silently disabling the arm for the
+        // rest of the process.
+        let mut guard = match REC_MERKLE.lock() {
+            Ok(g) => g,
+            Err(poisoned) => {
+                let mut g = poisoned.into_inner();
+                *g = None;
+                g
+            }
+        };
         if guard.is_none() {
             *guard = Some(rec_merkle_init(gpu));
         }
@@ -7823,13 +7954,16 @@ kernel void zc_r2_products(
     /// Anchors-only CPU work is measured locally at ~0.55x of the fused
     /// chunk (two of four folds, no products); the share solves
     /// `(hi - (1-ALPHA) g) c_f = g u_g` — balanced, no CPU-ward bias — and
-    /// caps at `3·hi/4` as the overshoot guard (an optimistic warmup ratio
-    /// must not make the GPU the timed straggler; at the cap the CPU still
-    /// owns a quarter of the fused sweep plus every anchor). At every
-    /// observed ratio (0.33–0.83 across hosts) the previous `hi/2` clamp was
-    /// what bound the share, leaving the GPU idle while the CPU ground
-    /// through fused chunks — the same measured mistake the balanced
-    /// lincheck split corrected at 32/64.
+    /// caps at `7·hi/8` as the overshoot guard (an optimistic warmup ratio
+    /// must not make the GPU the timed straggler; at this cap the GPU only
+    /// straggles once the true timed ratio exceeds `(1-0.45·7/8)/(7/8)` ≈
+    /// 0.69, a 21% overshoot above the ~0.57 measured on the ranked M3 Max).
+    /// History of this clamp: `hi/2` always bound (promoted fix → 3·hi/4,
+    /// +5.19%), and at every observed ratio (0.33–0.83 across hosts) the
+    /// 3·hi/4 cap was *still* what bound the share — the balance point
+    /// `hi/(ratio+0.45)` sits at 0.98·hi at ratio 0.57 — so the cap moves
+    /// again to 7·hi/8, the same measured mistake the balanced lincheck
+    /// split corrected at 32/64.
     ///
     /// Ratios in `(2, 8)`: the probe's equality oracle has already proven
     /// the kernel exact on this machine, so a slow-looking GPU gets a floor
@@ -7854,7 +7988,7 @@ kernel void zc_r2_products(
             return 0;
         }
         let g = (hi_size as f64 / (ratio + (1.0 - ZC_R2_ALPHA))).round();
-        (g as usize).min(hi_size * 3 / 4)
+        (g as usize).min(hi_size * 7 / 8)
     }
 
     fn zc_r2_init(gpu: &'static Gpu) -> Result<ZcR2, String> {
@@ -8087,7 +8221,7 @@ kernel void zc_r2_products(
             // 1/8 probe that shipped there.
             (hi_size / 16).clamp(8, 128)
         } else {
-            tuned.min(hi_size * 3 / 4)
+            tuned.min(hi_size * 7 / 8)
         };
         if chunks == 0 {
             return None;
@@ -8186,7 +8320,12 @@ kernel void zc_r2_products(
             ZcR2Result::Failed
         };
         unsafe {
-            if gpu.wait_cb(job.cb).is_err() {
+            // The CPU worker reaches this join after finishing its own share
+            // of a balanced split, so the GPU is normally already complete
+            // (first status poll, zero cost) or within a hair of it — a
+            // bounded spin dodges the ~0.3-0.5 ms `waitUntilCompleted` park
+            // once per timed prove.
+            if gpu.spin_wait_cb(job.cb, 2.0).is_err() {
                 return poison(job.cb);
             }
             let first_wall = zc_fold_gpu_wall_ms(gpu, job.cb);
@@ -8298,6 +8437,657 @@ kernel void zc_r2_products(
             };
             ZC_R2_TUNED.store(share, Ordering::Relaxed);
             ZcR2Result::Calibrated
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Zerocheck first-tail-round (T3) compact-reconstruction products GPU
+    // arm (see `ENV_NO_GPU_ZC_T3`).
+    //
+    // The first tail round reconstructs `a, b` from round two's compact
+    // anchors+deltas through the ρ-composed 32 KiB byte table and computes
+    // the next round's message products — per pair: 4 reconstructions
+    // (anchor ⊕ 8 byte-table lookups each) plus the two message products
+    // and the eq_lo weight. Structurally this is the round-two sweep with
+    // anchors added, so the arm is the zc-r2 arm re-instantiated: the GPU
+    // computes ONLY the products for a measured prefix of the hi-chunks
+    // (folding its chunks' pairs redundantly from the same compact inputs
+    // via the same nibble decomposition), while the CPU writes every
+    // reconstruction output through a products-skipping sibling of the NEON
+    // kernel (byte-identical stores). One reduced partial pair (32 bytes)
+    // per chunk is the entire GPU output surface.
+    //
+    // Bit-exactness: identical argument to zc-r2 — F2-linear nibble fold,
+    // oracle-proven emulated clmul, order-independent unreduced XOR
+    // accumulation, and a calibration equality oracle on the target machine
+    // before any share is published.
+    // -----------------------------------------------------------------------
+
+    const ZC_T3_MSL_SOURCE: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+static inline ulong clmul32(uint a, uint b) {
+    const ulong M0 = 0x1111111111111111UL, M1 = 0x2222222222222222UL,
+                M2 = 0x4444444444444444UL, M3 = 0x8888888888888888UL;
+    ulong a0 = a & 0x11111111u, a1 = a & 0x22222222u,
+          a2 = a & 0x44444444u, a3 = a & 0x88888888u;
+    ulong b0 = b & 0x11111111u, b1 = b & 0x22222222u,
+          b2 = b & 0x44444444u, b3 = b & 0x88888888u;
+    ulong r0 = (a0*b0 ^ a1*b3 ^ a2*b2 ^ a3*b1) & M0;
+    ulong r1 = (a0*b1 ^ a1*b0 ^ a2*b3 ^ a3*b2) & M1;
+    ulong r2 = (a0*b2 ^ a1*b1 ^ a2*b0 ^ a3*b3) & M2;
+    ulong r3 = (a0*b3 ^ a1*b2 ^ a2*b1 ^ a3*b0) & M3;
+    return r0 | r1 | r2 | r3;
+}
+
+struct U128k { ulong lo; ulong hi; };
+struct U256k { ulong r0; ulong r1; ulong r2; ulong r3; };
+
+static inline U128k clmul64(ulong a, ulong b) {
+    uint al = uint(a), ah = uint(a >> 32);
+    uint bl = uint(b), bh = uint(b >> 32);
+    ulong p_lo = clmul32(al, bl);
+    ulong p_hi = clmul32(ah, bh);
+    ulong p_mid = clmul32(al ^ ah, bl ^ bh) ^ p_lo ^ p_hi;
+    U128k r;
+    r.lo = p_lo ^ (p_mid << 32);
+    r.hi = p_hi ^ (p_mid >> 32);
+    return r;
+}
+
+static inline U256k clmul128(uint4 a, uint4 b) {
+    ulong al = (ulong(a.y) << 32) | a.x, ah = (ulong(a.w) << 32) | a.z;
+    ulong bl = (ulong(b.y) << 32) | b.x, bh = (ulong(b.w) << 32) | b.z;
+    U128k p0 = clmul64(al, bl);
+    U128k p2 = clmul64(ah, bh);
+    U128k pm = clmul64(al ^ ah, bl ^ bh);
+    pm.lo ^= p0.lo ^ p2.lo;
+    pm.hi ^= p0.hi ^ p2.hi;
+    U256k r;
+    r.r0 = p0.lo;
+    r.r1 = p0.hi ^ pm.lo;
+    r.r2 = p2.lo ^ pm.hi;
+    r.r3 = p2.hi;
+    return r;
+}
+
+static inline uint4 gf_reduce(U256k p) {
+    ulong h0 = p.r2, h1 = p.r3;
+    ulong t0 = h0 ^ (h0 << 1) ^ (h0 << 2) ^ (h0 << 7);
+    ulong t1 = h1 ^ (h1 << 1) ^ (h1 << 2) ^ (h1 << 7)
+             ^ (h0 >> 63) ^ (h0 >> 62) ^ (h0 >> 57);
+    ulong ov = (h1 >> 63) ^ (h1 >> 62) ^ (h1 >> 57);
+    t0 ^= ov ^ (ov << 1) ^ (ov << 2) ^ (ov << 7);
+    ulong l0 = p.r0 ^ t0, l1 = p.r1 ^ t1;
+    return uint4(uint(l0), uint(l0 >> 32), uint(l1), uint(l1 >> 32));
+}
+
+static inline uint4 zc_t3_fold8(uint lo, uint hi, threadgroup const uint4* nib) {
+    uint4 acc = uint4(0u);
+    for (uint j = 0u; j < 4u; j++) {
+        uint b = (lo >> (8u * j)) & 0xffu;
+        acc ^= nib[j * 32u + (b & 15u)] ^ nib[j * 32u + 16u + (b >> 4u)];
+    }
+    for (uint j = 0u; j < 4u; j++) {
+        uint b = (hi >> (8u * j)) & 0xffu;
+        acc ^= nib[(j + 4u) * 32u + (b & 15u)] ^ nib[(j + 4u) * 32u + 16u + (b >> 4u)];
+    }
+    return acc;
+}
+
+struct ZcT3Params { uint lo_size; uint xpt; };
+
+// One threadgroup per hi-chunk (256 threads, xpt = lo_size/256 pairs per
+// thread). Per pair: 4 anchor loads + 2 packed delta rows (uint4 each,
+// coalesced), reconstruct all four values via the nibble tables XOR the
+// anchor, message products via emulated clmul, eq_lo weight via a third
+// clmul, 256-bit unreduced accumulate. Threadgroup XOR-reduce; thread 0
+// reduces, weights by eq_hi[chunk], writes the REDUCED partial pair --
+// exactly the CPU's per-chunk `(eq_hi * p1, eq_hi * pinf)` values.
+kernel void zc_t3_products(
+    device const uint4* anchors [[buffer(0)]],
+    device const uint4* deltas  [[buffer(1)]],
+    device const uint4* eq_lo [[buffer(2)]],
+    device const uint4* eq_hi [[buffer(3)]],
+    device const uint4* nib_tab_dev [[buffer(4)]],
+    device uint4*       partials    [[buffer(5)]],
+    constant ZcT3Params& p          [[buffer(6)]],
+    uint tgid [[threadgroup_position_in_grid]],
+    uint lid  [[thread_index_in_threadgroup]])
+{
+    threadgroup uint4 nib[256];
+    threadgroup ulong4 red[256];
+    nib[lid] = nib_tab_dev[lid];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    ulong4 acc1 = ulong4(0ul);
+    ulong4 acci = ulong4(0ul);
+    for (uint k = 0u; k < p.xpt; k++) {
+        uint x_lo = k * 256u + lid;
+        uint pair_idx = tgid * p.lo_size + x_lo;
+        // Delta layout per pair: [a0 code (8B) | b0 code (8B)] then
+        // [a1 code (8B) | b1 code (8B)]. Anchor layout per pair:
+        // [a0, b0, a1, b1] (element-interleaved a/b at 2*out, 2*out+1).
+        uint4 d0 = deltas[pair_idx * 2u];
+        uint4 d1 = deltas[pair_idx * 2u + 1u];
+        uint4 a0 = anchors[pair_idx * 4u]      ^ zc_t3_fold8(d0.x, d0.y, nib);
+        uint4 b0 = anchors[pair_idx * 4u + 1u] ^ zc_t3_fold8(d0.z, d0.w, nib);
+        uint4 a1 = anchors[pair_idx * 4u + 2u] ^ zc_t3_fold8(d1.x, d1.y, nib);
+        uint4 b1 = anchors[pair_idx * 4u + 3u] ^ zc_t3_fold8(d1.z, d1.w, nib);
+
+        uint4 g1 = gf_reduce(clmul128(a1, b1));
+        uint4 gi = gf_reduce(clmul128(a0 ^ a1, b0 ^ b1));
+        uint4 e  = eq_lo[x_lo];
+        U256k m1 = clmul128(e, g1);
+        U256k mi = clmul128(e, gi);
+        acc1 ^= ulong4(m1.r0, m1.r1, m1.r2, m1.r3);
+        acci ^= ulong4(mi.r0, mi.r1, mi.r2, mi.r3);
+    }
+
+    red[lid] = acc1;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint s = 128u; s > 0u; s >>= 1u) {
+        if (lid < s) { red[lid] ^= red[lid + s]; }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    ulong4 chunk1 = red[0];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    red[lid] = acci;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint s = 128u; s > 0u; s >>= 1u) {
+        if (lid < s) { red[lid] ^= red[lid + s]; }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (lid == 0u) {
+        ulong4 chunki = red[0];
+        U256k u1; u1.r0 = chunk1.x; u1.r1 = chunk1.y; u1.r2 = chunk1.z; u1.r3 = chunk1.w;
+        U256k ui; ui.r0 = chunki.x; ui.r1 = chunki.y; ui.r2 = chunki.z; ui.r3 = chunki.w;
+        uint4 p1 = gf_reduce(u1);
+        uint4 pi = gf_reduce(ui);
+        uint4 e = eq_hi[tgid];
+        partials[tgid * 2u]      = gf_reduce(clmul128(e, p1));
+        partials[tgid * 2u + 1u] = gf_reduce(clmul128(e, pi));
+    }
+}
+"#;
+
+    /// Process-lifetime Metal state for the T3 products arm.
+    struct ZcT3 {
+        pso: Id,
+        nib_buf: Id,
+        eq_lo_buf: Id,
+        eq_lo_cap: usize,
+        eq_hi_buf: Id,
+        eq_hi_cap: usize,
+        part_buf: Id,
+        part_cap: usize,
+        /// Cached no-copy wraps of the compact anchors/deltas `(ptr, len, buf)`.
+        wraps: Vec<(usize, usize, Id)>,
+    }
+
+    // SAFETY: same argument as `ZcR2`.
+    unsafe impl Send for ZcT3 {}
+
+    static ZC_T3_STATE: std::sync::OnceLock<Option<std::sync::Mutex<ZcT3>>> =
+        std::sync::OnceLock::new();
+    static ZC_T3_TUNED: std::sync::atomic::AtomicUsize =
+        std::sync::atomic::AtomicUsize::new(usize::MAX);
+    static ZC_T3_POISONED: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
+
+    #[cfg(test)]
+    pub(crate) fn zc_t3_test_reset() {
+        use std::sync::atomic::Ordering;
+        ZC_T3_TUNED.store(usize::MAX, Ordering::Relaxed);
+        ZC_T3_POISONED.store(false, Ordering::Relaxed);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn zc_t3_test_state() -> (usize, bool) {
+        use std::sync::atomic::Ordering;
+        (
+            ZC_T3_TUNED.load(Ordering::Relaxed),
+            ZC_T3_POISONED.load(Ordering::Relaxed),
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn zc_t3_test_set_share(share: usize) {
+        ZC_T3_TUNED.store(share, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Ratio-gate override (`FLOCK_ZC_T3_GPU_FORCE_RATIO=<f64>`).
+    fn zc_t3_forced_ratio() -> Option<f64> {
+        static V: std::sync::LazyLock<Option<f64>> = std::sync::LazyLock::new(|| {
+            std::env::var("FLOCK_ZC_T3_GPU_FORCE_RATIO")
+                .ok()
+                .and_then(|s| s.parse::<f64>().ok())
+        });
+        *V
+    }
+
+    /// Reconstruction-only CPU work keeps all 64 table lookups and the
+    /// output stores and drops only the products (2 muls + 2 eq-weight
+    /// muls per pair), so its per-chunk cost is a larger fraction of the
+    /// fused chunk than r2's anchors-only sibling: ALPHA = 0.65. Same
+    /// balanced form `(hi - (1-ALPHA) g) c_f = g u_g` ⇒
+    /// `g* = hi/(ratio + 0.35)`; same 7·hi/8 overshoot cap, same hi/8
+    /// admission floor for ratios in (2, 8), same ≥ 8 disable (ticket-26
+    /// clamp-audit law, instance five).
+    const ZC_T3_ALPHA: f64 = 0.65;
+    const ZC_T3_MAX_RATIO: f64 = 2.0;
+    const ZC_T3_FLOOR_MAX_RATIO: f64 = 8.0;
+
+    pub(crate) fn zc_t3_gate_share(ratio: f64, hi_size: usize) -> usize {
+        if !ratio.is_finite() || ratio <= 0.0 {
+            return 0;
+        }
+        if ratio > ZC_T3_MAX_RATIO {
+            if ratio < ZC_T3_FLOOR_MAX_RATIO {
+                return hi_size / 8;
+            }
+            return 0;
+        }
+        let g = (hi_size as f64 / (ratio + (1.0 - ZC_T3_ALPHA))).round();
+        (g as usize).min(hi_size * 7 / 8)
+    }
+
+    fn zc_t3_init(gpu: &'static Gpu) -> Result<ZcT3, String> {
+        unsafe {
+            let pool = gpu.pool_push();
+            let built = (|| -> Result<Id, String> {
+                let src = gpu.api.nsstring(ZC_T3_MSL_SOURCE)?;
+                let mut err: Id = NIL;
+                let library: Id = send!(
+                    gpu.api,
+                    unsafe extern "C" fn(Id, Sel, Id, Id, *mut Id) -> Id,
+                    gpu.device,
+                    c"newLibraryWithSource:options:error:",
+                    src,
+                    NIL,
+                    &mut err
+                );
+                if library.is_null() {
+                    return Err(format!(
+                        "zc-t3 shader compile failed: {}",
+                        gpu.api.error_string(err)
+                    ));
+                }
+                let ns = gpu.api.nsstring("zc_t3_products")?;
+                let f: Id = send!(
+                    gpu.api,
+                    unsafe extern "C" fn(Id, Sel, Id) -> Id,
+                    library,
+                    c"newFunctionWithName:",
+                    ns
+                );
+                if f.is_null() {
+                    send!(gpu.api, unsafe extern "C" fn(Id, Sel) -> Id, library, c"release");
+                    return Err("zc_t3_products kernel not found".into());
+                }
+                let mut perr: Id = NIL;
+                let pso: Id = send!(
+                    gpu.api,
+                    unsafe extern "C" fn(Id, Sel, Id, *mut Id) -> Id,
+                    gpu.device,
+                    c"newComputePipelineStateWithFunction:error:",
+                    f,
+                    &mut perr
+                );
+                send!(gpu.api, unsafe extern "C" fn(Id, Sel) -> Id, f, c"release");
+                send!(gpu.api, unsafe extern "C" fn(Id, Sel) -> Id, library, c"release");
+                if pso.is_null() {
+                    return Err(format!(
+                        "zc_t3_products pipeline: {}",
+                        gpu.api.error_string(perr)
+                    ));
+                }
+                Ok(pso)
+            })();
+            gpu.pool_pop(pool);
+            let pso = built?;
+            let nib_buf = gpu.new_buffer(256 * 16)?;
+            Ok(ZcT3 {
+                pso,
+                nib_buf,
+                eq_lo_buf: NIL,
+                eq_lo_cap: 0,
+                eq_hi_buf: NIL,
+                eq_hi_cap: 0,
+                part_buf: NIL,
+                part_cap: 0,
+                wraps: Vec::new(),
+            })
+        }
+    }
+
+    fn zc_t3_state() -> Option<&'static std::sync::Mutex<ZcT3>> {
+        ZC_T3_STATE
+            .get_or_init(|| {
+                let gpu = gpu().ok()?;
+                match zc_t3_init(gpu) {
+                    Ok(s) => Some(std::sync::Mutex::new(s)),
+                    Err(e) => {
+                        if super::gpu_zc_t3_debug() {
+                            eprintln!("[zc-t3] init failed: {e}");
+                        }
+                        None
+                    }
+                }
+            })
+            .as_ref()
+    }
+
+    pub(crate) struct ZcT3Job {
+        cb: Id,
+        pub chunks: usize,
+        calibration: bool,
+        submitted: std::time::Instant,
+    }
+
+    // SAFETY: same argument as `ZcR2Job`.
+    unsafe impl Send for ZcT3Job {}
+
+    impl ZcT3Job {
+        /// How many leading chunks the CPU should run reconstruction-only.
+        /// Zero during calibration (CPU runs every chunk fused; the probe is
+        /// compared against its values, then discarded).
+        pub(crate) fn cpu_split(&self) -> usize {
+            if self.calibration { 0 } else { self.chunks }
+        }
+
+        pub(crate) fn is_calibration(&self) -> bool {
+            self.calibration
+        }
+    }
+
+    /// Result of draining the T3 products arm.
+    pub(crate) enum ZcT3Result {
+        Calibrated,
+        Prefix(Vec<(F128, F128)>),
+        Failed,
+    }
+
+    unsafe fn zc_t3_submit(
+        gpu: &Gpu,
+        state: &ZcT3,
+        anchors_buf: Id,
+        deltas_buf: Id,
+        chunks: usize,
+        lo_size: usize,
+    ) -> Result<Id, String> {
+        unsafe {
+            #[repr(C)]
+            struct P {
+                lo_size: u32,
+                xpt: u32,
+            }
+            let params = P {
+                lo_size: lo_size as u32,
+                xpt: (lo_size / 256) as u32,
+            };
+            let pb = std::slice::from_raw_parts(
+                (&raw const params).cast::<u8>(),
+                core::mem::size_of::<P>(),
+            );
+            let cb = gpu.command_buffer()?;
+            let enc = gpu.compute_encoder(cb)?;
+            gpu.set_pipeline(enc, state.pso);
+            gpu.set_buffer(enc, anchors_buf, 0, 0);
+            gpu.set_buffer(enc, deltas_buf, 0, 1);
+            gpu.set_buffer(enc, state.eq_lo_buf, 0, 2);
+            gpu.set_buffer(enc, state.eq_hi_buf, 0, 3);
+            gpu.set_buffer(enc, state.nib_buf, 0, 4);
+            gpu.set_buffer(enc, state.part_buf, 0, 5);
+            gpu.set_bytes(enc, pb, 6);
+            gpu.dispatch(enc, chunks as u64, 256);
+            gpu.end_encoding(enc);
+            let cb = gpu.retain(cb);
+            gpu.commit_async(cb);
+            Ok(cb)
+        }
+    }
+
+    unsafe fn zc_t3_wrap(state: &mut ZcT3, gpu: &Gpu, ptr: *const u8, len: usize) -> Result<Id, String> {
+        let addr = ptr as usize;
+        if let Some(&(_, _, buf)) = state
+            .wraps
+            .iter()
+            .find(|&&(p, l, _)| p == addr && l == len)
+        {
+            return Ok(buf);
+        }
+        let buf = unsafe { gpu.wrap_buffer(ptr.cast_mut(), len)? };
+        state.wraps.push((addr, len, buf));
+        Ok(buf)
+    }
+
+    /// Launch the T3 products prefix. `None` = whole round stays on the
+    /// exact incumbent CPU path.
+    pub(crate) fn launch_zc_t3_products(
+        anchors: &[F128],
+        deltas: &[u8],
+        scaled_table: &[F128],
+        eq_lo: &[F128],
+        eq_hi: &[F128],
+        lo_size: usize,
+        hi_size: usize,
+    ) -> Option<ZcT3Job> {
+        use std::sync::atomic::Ordering;
+        if !super::gpu_zc_t3_enabled() || ZC_T3_POISONED.load(Ordering::Relaxed) {
+            return None;
+        }
+        if scaled_table.len() != 8 * 256
+            || lo_size < 256
+            || !lo_size.is_multiple_of(256)
+            || hi_size < 8
+            || anchors.len() != 4 * lo_size * hi_size
+            || deltas.len() != 32 * lo_size * hi_size
+        {
+            return None;
+        }
+        let tuned = ZC_T3_TUNED.load(Ordering::Relaxed);
+        if tuned == 0 {
+            return None;
+        }
+        let calibration = tuned == usize::MAX;
+        let chunks = if calibration {
+            (hi_size / 16).clamp(8, 128)
+        } else {
+            tuned.min(hi_size * 7 / 8)
+        };
+        if chunks == 0 {
+            return None;
+        }
+        let gpu = gpu().ok()?;
+        let state_mutex = zc_t3_state()?;
+        let mut state = state_mutex.lock().ok()?;
+        unsafe {
+            // Nibble decomposition of the ρ-composed 32 KiB table (per
+            // prove; the table depends on the sampled challenge).
+            let nib = gpu.buffer_contents(state.nib_buf).cast::<F128>();
+            for j in 0..8 {
+                for n in 0..16 {
+                    *nib.add(j * 32 + n) = scaled_table[j * 256 + n];
+                    *nib.add(j * 32 + 16 + n) = scaled_table[j * 256 + (n << 4)];
+                }
+            }
+            let need_lo = lo_size * 16;
+            if state.eq_lo_cap < need_lo {
+                if state.eq_lo_cap > 0 {
+                    gpu.release(state.eq_lo_buf);
+                }
+                state.eq_lo_buf = gpu.new_buffer(need_lo).ok()?;
+                state.eq_lo_cap = need_lo;
+            }
+            std::ptr::copy_nonoverlapping(
+                eq_lo.as_ptr().cast::<u8>(),
+                gpu.buffer_contents(state.eq_lo_buf),
+                need_lo,
+            );
+            let need_hi = hi_size * 16;
+            if state.eq_hi_cap < need_hi {
+                if state.eq_hi_cap > 0 {
+                    gpu.release(state.eq_hi_buf);
+                }
+                state.eq_hi_buf = gpu.new_buffer(need_hi).ok()?;
+                state.eq_hi_cap = need_hi;
+            }
+            std::ptr::copy_nonoverlapping(
+                eq_hi.as_ptr().cast::<u8>(),
+                gpu.buffer_contents(state.eq_hi_buf),
+                need_hi,
+            );
+            let need_part = hi_size * 32;
+            if state.part_cap < need_part {
+                if state.part_cap > 0 {
+                    gpu.release(state.part_buf);
+                }
+                state.part_buf = gpu.new_buffer(need_part).ok()?;
+                state.part_cap = need_part;
+            }
+            let anchors_buf =
+                zc_t3_wrap(&mut state, gpu, anchors.as_ptr().cast::<u8>(), anchors.len() * 16)
+                    .ok()?;
+            let deltas_buf = zc_t3_wrap(&mut state, gpu, deltas.as_ptr(), deltas.len()).ok()?;
+            let cb = zc_t3_submit(gpu, &state, anchors_buf, deltas_buf, chunks, lo_size).ok()?;
+            Some(ZcT3Job {
+                cb,
+                chunks,
+                calibration,
+                submitted: std::time::Instant::now(),
+            })
+        }
+    }
+
+    /// Drain the T3 arm. Same contract as [`zc_r2_wait`].
+    pub(crate) fn zc_t3_wait(
+        job: ZcT3Job,
+        cpu_partials: Option<&[(F128, F128)]>,
+        cpu_wall_ms: f64,
+        hi_size: usize,
+    ) -> ZcT3Result {
+        use std::sync::atomic::Ordering;
+        let gpu = match gpu() {
+            Ok(g) => g,
+            Err(_) => return ZcT3Result::Failed,
+        };
+        let poison = |cb: Id| {
+            ZC_T3_POISONED.store(true, Ordering::Relaxed);
+            ZC_T3_TUNED.store(0, Ordering::Relaxed);
+            unsafe { gpu.release(cb) };
+            ZcT3Result::Failed
+        };
+        unsafe {
+            // Balanced split ⇒ the GPU is normally already complete when the
+            // CPU worker reaches this join; bounded spin dodges the park.
+            if gpu.spin_wait_cb(job.cb, 2.0).is_err() {
+                return poison(job.cb);
+            }
+            let first_wall = zc_fold_gpu_wall_ms(gpu, job.cb);
+            let state_mutex = match zc_t3_state() {
+                Some(s) => s,
+                None => return poison(job.cb),
+            };
+            let state = match state_mutex.lock() {
+                Ok(s) => s,
+                Err(_) => return poison(job.cb),
+            };
+            let parts = gpu.buffer_contents(state.part_buf).cast::<F128>();
+            let mut out = Vec::with_capacity(job.chunks);
+            for c in 0..job.chunks {
+                out.push((*parts.add(c * 2), *parts.add(c * 2 + 1)));
+            }
+            if !job.calibration {
+                gpu.release(job.cb);
+                if super::gpu_zc_t3_debug() {
+                    eprintln!(
+                        "[zc-t3] timed prefix {}/{} chunks: gpu={first_wall:.2}ms \
+                         submit-to-drain={:.2}ms",
+                        job.chunks,
+                        hi_size,
+                        job.submitted.elapsed().as_secs_f64() * 1e3,
+                    );
+                }
+                return ZcT3Result::Prefix(out);
+            }
+
+            // ---- Calibration (untimed warmup prove, once per process) ----
+            let Some(cpu_all) = cpu_partials else {
+                return poison(job.cb);
+            };
+            for c in 0..job.chunks {
+                if out[c] != cpu_all[c] {
+                    if super::gpu_zc_t3_debug() {
+                        eprintln!(
+                            "[zc-t3] CALIBRATION MISMATCH at chunk {c}: gpu={:?} cpu={:?} — poisoned",
+                            out[c], cpu_all[c]
+                        );
+                    }
+                    return poison(job.cb);
+                }
+            }
+            // Ramp-robust pricing: replay to a plateau, price from the min
+            // wall (same policy as zc-r2).
+            let mut walls = [0.0f64; 5];
+            walls[0] = first_wall.max(0.0);
+            let mut n_walls = usize::from(walls[0] > 0.0);
+            let mut w_min = if n_walls > 0 { walls[0] } else { f64::MAX };
+            gpu.release(job.cb);
+            if let (Some(&(_, _, anchors_buf)), Some(&(_, _, deltas_buf))) =
+                (state.wraps.first(), state.wraps.get(1))
+            {
+                let lo_size = state.eq_lo_cap / 16;
+                while n_walls < walls.len() {
+                    let Ok(cb2) =
+                        zc_t3_submit(gpu, &state, anchors_buf, deltas_buf, job.chunks, lo_size)
+                    else {
+                        break;
+                    };
+                    let w = if gpu.wait_cb(cb2).is_ok() {
+                        zc_fold_gpu_wall_ms(gpu, cb2)
+                    } else {
+                        0.0
+                    };
+                    gpu.release(cb2);
+                    if w <= 0.0 {
+                        break;
+                    }
+                    walls[n_walls] = w;
+                    n_walls += 1;
+                    let prev_min = w_min;
+                    w_min = w_min.min(w);
+                    if n_walls >= 3 && w > 0.95 * prev_min {
+                        break;
+                    }
+                }
+            }
+            drop(state);
+            let u_gpu = if n_walls > 0 && w_min < f64::MAX {
+                w_min / job.chunks as f64
+            } else {
+                f64::INFINITY
+            };
+            let u_cpu = cpu_wall_ms / hi_size.max(1) as f64;
+            let share = if u_cpu.is_finite() && u_cpu > 0.0 && u_gpu.is_finite() {
+                let measured = u_gpu / u_cpu;
+                let ratio = zc_t3_forced_ratio().unwrap_or(measured);
+                let g = zc_t3_gate_share(ratio, hi_size);
+                if super::gpu_zc_t3_debug() {
+                    eprintln!("[zc-t3] gate replay walls: {:?}", &walls[..n_walls]);
+                    eprintln!(
+                        "[zc-t3] gate u_gpu={u_gpu:.4}ms/chunk u_cpu={u_cpu:.4}ms/chunk \
+                         ratio={:.3} -> share {g}/{hi_size}",
+                        u_gpu / u_cpu,
+                    );
+                }
+                g
+            } else {
+                0
+            };
+            ZC_T3_TUNED.store(share, Ordering::Relaxed);
+            ZcT3Result::Calibrated
         }
     }
 }
@@ -8590,6 +9380,47 @@ mod tests {
             };
             assert_eq!(got, expected, "start={start} len={len} bits={bits}");
         }
+    }
+
+    /// Profile the grind scan's fixed submit/wait overhead vs kernel time.
+    /// The ranked prove issues 7 serial transcript-dependent scans, so the
+    /// per-call roundtrip (encode + commit + `waitUntilCompleted` park/wake)
+    /// is paid 7×. Solving wall(2^23) = fixed + 8·k and wall(2^20) =
+    /// fixed + k separates the two. Run with
+    /// `cargo test --release gpu_grind_roundtrip_profile -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "profiling only"]
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    fn gpu_grind_roundtrip_profile() {
+        let digest = core::array::from_fn(|i| (i as u8).wrapping_mul(151).wrapping_add(3));
+        let min_wall = |len: u32, n: usize| -> f64 {
+            let mut best = f64::MAX;
+            for _ in 0..n {
+                let t = std::time::Instant::now();
+                let r = gpu_blake3_pow_scan(&digest, 0, len, 32);
+                let w = t.elapsed().as_secs_f64() * 1e3;
+                if gpu_or_skip(r).is_none() {
+                    return f64::NAN;
+                }
+                best = best.min(w);
+            }
+            best
+        };
+        // Warm the pipeline and clocks off the record.
+        let _ = min_wall(1 << 20, 5);
+        let small = min_wall(1 << 20, 20);
+        let large = min_wall(1 << 23, 10);
+        if small.is_nan() || large.is_nan() {
+            return;
+        }
+        let kernel = (large - small) / 7.0;
+        let fixed = small - kernel;
+        eprintln!(
+            "[grind-profile] wall(2^20)={small:.3}ms wall(2^23)={large:.3}ms \
+             => kernel(2^20)~{kernel:.3}ms fixed-roundtrip~{fixed:.3}ms \
+             (x7 serial per prove ~{:.3}ms)",
+            fixed * 7.0
+        );
     }
 
     /// A latched caller is allowed to pass an empty marker instead of the
@@ -9919,6 +10750,28 @@ DEF_PROBE(probe_g4_t8_p0,    8u,  0u,   tsel & 7u)
         assert_eq!(lincheck_gate_share_legacy(1.0, 16), 7);
     }
 
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    fn zc_r2_gate_share_policy() {
+        use imp::zc_r2_gate_share;
+        // Balance point hi/(ratio+0.45); ranked-observed ratios land above
+        // the 7·hi/8 cap, which is the binding overshoot guard.
+        assert_eq!(zc_r2_gate_share(0.57, 2048), 1792);
+        assert_eq!(zc_r2_gate_share(0.38, 2048), 1792);
+        // Slow-but-usable GPU: the formula takes over below the cap.
+        assert_eq!(zc_r2_gate_share(1.0, 2048), 1412); // 2048/1.45
+        assert_eq!(zc_r2_gate_share(2.0, 2048), 836); // 2048/2.45
+        // Admission floor for ratios in (2, 8): the equality oracle already
+        // proved the kernel, so pricing failures get hi/8, not 0.
+        assert_eq!(zc_r2_gate_share(2.01, 2048), 256);
+        assert_eq!(zc_r2_gate_share(7.9, 2048), 256);
+        // Past the floor ceiling, or unusable: exact incumbent.
+        assert_eq!(zc_r2_gate_share(8.0, 2048), 0);
+        assert_eq!(zc_r2_gate_share(f64::NAN, 2048), 0);
+        assert_eq!(zc_r2_gate_share(0.0, 2048), 0);
+        assert_eq!(zc_r2_gate_share(-1.0, 2048), 0);
+    }
+
     /// The lincheck arm's GPU prefix equals the CPU fold over exactly the
     /// claims it owns, and prefix ⊕ CPU-suffix equals the whole-range
     /// production fold — the same discipline the zerocheck arm is held to.
@@ -10162,3 +11015,5 @@ DEF_PROBE(probe_g4_t8_p0,    8u,  0u,   tsel & 7u)
         imp::zc_r2_test_reset();
     }
 }
+
+// resample-marker: v5 draw 2 (disclosed marker-only resample; see submission note)

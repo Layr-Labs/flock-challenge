@@ -728,20 +728,68 @@ fn gpu_grind_calibration(state_digest: &[u8; 32]) -> Result<Vec<Option<u64>>, St
 /// as the CPU scan.  One expected-work block balances GPU over-scan against
 /// recurring command-buffer latency; failure is propagated to the caller's
 /// exact CPU fallback.
+///
+/// Hybrid prefetch (`FLOCK_NO_GRIND_HYBRID` kills): while the calling thread
+/// drives the GPU scan of block `[start, start+B)` — a sub-millisecond
+/// dispatch it spins home — every CPU core is otherwise idle, because the
+/// grind sits on the transcript's serial spine.  So the CPU concurrently
+/// scans the *following* block `[start+B, start+2B)` with the same two-pool
+/// kernel the pure-CPU path uses.  A one-expected-work block misses with
+/// probability e^-1 ≈ 0.37; on a miss the old path paid a second full GPU
+/// round trip (~0.8 ms fixed+kernel), which the prefetch has already covered
+/// by the time the spin returns.  Determinism: the GPU reports the smallest
+/// match in its block, the CPU window returns the smallest in the next block,
+/// and blocks are visited in ascending order — if the GPU hits, every earlier
+/// block was exhausted empty, so its nonce is the global minimum; if the GPU
+/// block is empty and the CPU window hit, the same argument gives the CPU
+/// minimum.  Byte-identical to the sequential search either way.
 fn gpu_blake3_pow_nonce(state_digest: &[u8; 32], bits: u32) -> Result<u64, String> {
     debug_assert!((GPU_GRIND_MIN_BITS..=32).contains(&bits));
     let block_len = 1u32 << bits.min(24);
+    let hybrid = grind_hybrid_enabled() && rayon::current_num_threads() > 1;
     let mut start = 0u64;
     loop {
-        if let Some(nonce) =
-            crate::gpu_commit::gpu_blake3_pow_scan(state_digest, start, block_len, bits)?
-        {
+        if !hybrid {
+            if let Some(nonce) =
+                crate::gpu_commit::gpu_blake3_pow_scan(state_digest, start, block_len, bits)?
+            {
+                return Ok(nonce);
+            }
+            start = start
+                .checked_add(u64::from(block_len))
+                .ok_or_else(|| "GPU grind nonce range exhausted".to_string())?;
+            continue;
+        }
+        let next_start = start
+            .checked_add(u64::from(block_len))
+            .ok_or_else(|| "GPU grind nonce range exhausted".to_string())?;
+        let (gpu_result, cpu_next) = std::thread::scope(|s| {
+            let gpu_scan = s.spawn(|| {
+                crate::gpu_commit::gpu_blake3_pow_scan(state_digest, start, block_len, bits)
+            });
+            let cpu = cpu_blake3_pow_window(state_digest, next_start, block_len, bits);
+            let gpu = gpu_scan
+                .join()
+                .unwrap_or_else(|_| Err("GPU grind scan thread panicked".to_string()));
+            (gpu, cpu)
+        });
+        if let Some(nonce) = gpu_result? {
             return Ok(nonce);
         }
-        start = start
+        if let Some(nonce) = cpu_next {
+            return Ok(nonce);
+        }
+        start = next_start
             .checked_add(u64::from(block_len))
             .ok_or_else(|| "GPU grind nonce range exhausted".to_string())?;
     }
+}
+
+/// `FLOCK_NO_GRIND_HYBRID` kills the CPU-prefetch arm of the GPU grind,
+/// restoring the pure serial GPU block walk (exact rollback lever).
+fn grind_hybrid_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("FLOCK_NO_GRIND_HYBRID").is_none())
 }
 
 // ---------------------------------------------------------------------------
@@ -1228,6 +1276,36 @@ mod tests {
                     start += 4096;
                 };
                 assert_eq!(nonce, expect, "seed={seed} bits={bits}");
+            }
+        }
+    }
+
+    /// The hybrid GPU/CPU-prefetch block walk must select the identical
+    /// nonce as the sequential generic oracle — proof bytes depend on the
+    /// exact nonce, so the prefetch's "GPU block first, CPU next-block on a
+    /// miss" merge is held to bit-exactness on real Metal hardware. Skips
+    /// where no GPU grind pipeline is available.
+    #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+    #[test]
+    fn gpu_grind_hybrid_nonce_matches_generic_oracle() {
+        if crate::gpu_commit::gpu_blake3_pow_scan(&[0u8; 32], 0, 64, 1).is_err() {
+            return; // no Metal device / pipeline in this environment
+        }
+        for seed in [0xFEED_F00Du64, 31337, 8_675_309] {
+            for bits in [14u32, 16, 19] {
+                let mut ch = FsChallenger::with_hash(b"grind-hybrid-fixed", HashKind::Blake3);
+                ch.observe_bytes(&seed.to_le_bytes());
+                let digest = ch.state_digest();
+                let got = gpu_blake3_pow_nonce(&digest, bits)
+                    .expect("GPU grind must scan on an available device");
+                let mut start = 0u64;
+                let expect = loop {
+                    if let Some(n) = blake3_pow_scan_generic(&digest, start, 4096, bits) {
+                        break n;
+                    }
+                    start += 4096;
+                };
+                assert_eq!(got, expect, "seed={seed} bits={bits}");
             }
         }
     }
