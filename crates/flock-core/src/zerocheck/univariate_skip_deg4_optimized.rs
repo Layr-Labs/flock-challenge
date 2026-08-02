@@ -110,14 +110,13 @@ fn build_convert_table() -> Vec<F128> {
     for b in 1..16 {
         gamma_pow[b] = mul_by_x(gamma_pow[b - 1]);
     }
-    // The cache is immutable after construction, so build each bank directly
-    // in final order rather than zero-writing 4,096 field elements and then
-    // overwriting all 64 KiB. Exact capacity also prevents reallocations.
-    let mut table = Vec::with_capacity(16 * 256);
-    for g_b in gamma_pow {
-        table.extend(PHI_8_TABLE.iter().map(|&value| g_b * value));
+    let mut table = vec![F128::ZERO; 16 * 256];
+    for b in 0..16 {
+        let g_b = gamma_pow[b];
+        for v in 0..256 {
+            table[b * 256 + v] = g_b * PHI_8_TABLE[v];
+        }
     }
-    debug_assert_eq!(table.len(), 16 * 256);
     table
 }
 
