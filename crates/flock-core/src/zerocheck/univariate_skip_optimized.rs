@@ -681,13 +681,13 @@ fn precompute_round1_ab_inner_packed_padded_with_flavor(
     assert_eq!(total_bytes % core::mem::size_of::<F128>(), 0);
 
     let (within_outer_mask, b_med_counts) = build_b_med_counts(padding);
-    // The BLAKE3 R1CS has two 8192-bit windows per 16384-bit block. Besides
-    // the full all-ones B rows at b_med 0/1 and the single-K0 tail, two mixed
-    // rows have fixed one-valued K subsets: K0..1 at first-window b_med 2 and
-    // K4..7 at second-window b_med 13. Restrict runtime sniffing to these five
-    // candidates; every other block enters the generic kernel directly.
-    let blake3_static_layout = padding.k_log == 14 && padding.useful_bits_per_block == 15_409;
-    let static_b_context = kernels::prepare_static_b_context(inv_table, blake3_static_layout);
+    // The aligned BLAKE3 layout packs every B=1 row at the front of each
+    // 16,384-row block. In the first 8,192-row window, medium blocks 0..8
+    // are entirely one and block 9 has K rows 0..5 entirely one. Remaining
+    // blocks are dynamic (apart from structural zero padding), so the old
+    // fragmented-layout generated mask census must not run on this shape.
+    let blake3_static_layout = padding.k_log == 14 && padding.useful_bits_per_block == 15_472;
+    let static_b_context = kernels::prepare_static_b_context(inv_table, false);
     const OUTER_BYTES: usize = (1 << N_MEDIUM) * 64;
     debug_assert_eq!(OUTER_BYTES, (1 << N_INNER) * N_CHUNKS);
 
@@ -730,23 +730,14 @@ fn precompute_round1_ab_inner_packed_padded_with_flavor(
                         dst,
                         a_col,
                         b_col,
-                        !blake3_static_layout || (within_hash_outer == 0 && b_med < 2),
-                        !blake3_static_layout || (within_hash_outer == 1 && b_med + 1 == n_b_med),
-                        if blake3_static_layout && within_hash_outer == 0 && b_med == 2 {
-                            0x03
-                        } else if blake3_static_layout
-                            && within_hash_outer == 1
-                            && b_med + 2 == n_b_med
-                        {
-                            0xf0
+                        !blake3_static_layout || (within_hash_outer == 0 && b_med < 9),
+                        !blake3_static_layout,
+                        if blake3_static_layout && within_hash_outer == 0 && b_med == 9 {
+                            0x3f
                         } else {
                             0
                         },
-                        if blake3_static_layout {
-                            within_hash_outer
-                        } else {
-                            usize::MAX
-                        },
+                        usize::MAX,
                         static_b_context,
                     );
                     if nt {
@@ -2937,7 +2928,7 @@ mod tests {
     /// a literal zero to the dense sum (the convert table maps φ_8(0) = 0).
     ///
     /// Covers the three hash padding shapes:
-    ///   - BLAKE3: k_log=14, useful=15409 → b_med_counts ≈ [16, 15]
+    ///   - BLAKE3: k_log=14, useful=15472 → b_med_counts ≈ [16, 15]
     ///   - SHA-2:  k_log=15, useful=31401 → b_med_counts ≈ [16, 16, 16, 14]
     ///   - Keccak: k_log=16, useful=42560 → b_med_counts = [16, 16, 16, 16, 16, 4, 0, 0]
     ///     (this is the only shape that exercises the full-skip case.)
@@ -2950,7 +2941,7 @@ mod tests {
         // m = k_log + n_blocks_log is small enough to keep the test fast
         // while still exercising the kernel's parallel + boundary paths.
         let cases = [
-            (14usize, 15_409usize, 0usize), // BLAKE3, m=14
+            (14usize, 15_472usize, 0usize), // BLAKE3, m=14
             (15, 31_401, 0),                // SHA-2,  m=15
             (16, 42_560, 0),                // Keccak, m=16
             (16, 42_560, 3),                // Keccak, m=19 (multiple hashes)
@@ -3029,8 +3020,8 @@ mod tests {
         let cases: [(usize, Option<(usize, usize)>); 5] = [
             (13, None),
             (15, None),
-            (14, Some((14, 15_409))), // BLAKE3 block shape (one b_med window skipped)
-            (17, Some((14, 15_409))), // …across several blocks, both eq halves live
+            (14, Some((14, 15_472))), // BLAKE3 block shape (one b_med window skipped)
+            (17, Some((14, 15_472))), // …across several blocks, both eq halves live
             (15, Some((15, 31_401))), // SHA-2 block shape
         ];
 
@@ -3105,8 +3096,8 @@ mod tests {
         // padding holes.
         let cases: [(usize, Option<(usize, usize)>); 3] = [
             (13, None),
-            (14, Some((14, 15_409))), // BLAKE3 block shape
-            (17, Some((14, 15_409))),
+            (14, Some((14, 15_472))), // BLAKE3 block shape
+            (17, Some((14, 15_472))),
         ];
         for (m, padded) in cases {
             let mut rng = Rng::new(0xAB_57_0F14_u64 ^ (m as u64));
@@ -3158,7 +3149,7 @@ mod tests {
         let total_bits = 1usize << m;
         let padding = PaddingSpec {
             k_log: 14,
-            useful_bits_per_block: 15_409,
+            useful_bits_per_block: 15_472,
         };
         let mut rng = Rng::new(0xBE9C4);
         let mut a = rng.bits(total_bits);
@@ -3389,7 +3380,7 @@ mod tests {
         let a_packed = super::super::univariate_skip::pack_bits(&a_bits);
         let b_packed = super::super::univariate_skip::pack_bits(&b_bits);
 
-        for mask in [0x03u8, 0xf0] {
+        for mask in [0x03u8, 0x3f, 0xf0] {
             let mut b_mixed = b_packed.clone();
             for k in 0..8 {
                 if mask & (1 << k) != 0 {
@@ -3755,14 +3746,14 @@ mod tests {
                 14,
                 PaddingSpec {
                     k_log: 14,
-                    useful_bits_per_block: 15_409,
+                    useful_bits_per_block: 15_472,
                 },
             ),
             (
                 17,
                 PaddingSpec {
                     k_log: 14,
-                    useful_bits_per_block: 15_409,
+                    useful_bits_per_block: 15_472,
                 },
             ),
         ];
@@ -4524,7 +4515,7 @@ mod tests {
             },
             PaddingSpec {
                 k_log: K_LOG,
-                useful_bits_per_block: 15_409,
+                useful_bits_per_block: 15_472,
             },
         ];
 

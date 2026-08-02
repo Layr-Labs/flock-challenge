@@ -1928,7 +1928,7 @@ mod tests {
             (16, 8, 1 << 8),   // dense
             (18, 10, 1 << 10), // dense
             (20, 10, 597),     // padded, non-byte-aligned
-            (22, 14, 15_409),  // padded, non-byte-aligned (k=16384)
+            (22, 14, 15_472),  // padded BLAKE3 shape (k=16384)
         ];
         for &(m, k_log, useful_bits) in cases {
             assert!(
@@ -1990,8 +1990,8 @@ mod tests {
     fn partial_fold_padded_matches_dense() {
         // (m, k_log, useful_bits)
         let cases: &[(usize, usize, usize)] = &[
-            // BLAKE3 (k_log=14, useful=15409 — boundary not byte-aligned).
-            (17, 14, 15_409),
+            // BLAKE3 (k_log=14, useful=15472 — boundary not 128-aligned).
+            (17, 14, 15_472),
             // SHA-2  (k_log=15, useful=31401 — boundary not byte-aligned).
             (18, 15, 31_401),
             // Keccak (k_log=16, useful=42560 — exact byte boundary).

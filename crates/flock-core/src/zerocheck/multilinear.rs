@@ -2195,7 +2195,7 @@ mod tests {
         const K_SKIP: usize = 6;
         const M: usize = 20;
         const K_LOG: usize = 14;
-        const USEFUL_BITS: usize = 15_409;
+        const USEFUL_BITS: usize = 15_472;
         const POISON: F128 = F128 {
             lo: 0xa5a5_a5a5_a5a5_a5a5,
             hi: 0x5a5a_5a5a_5a5a_5a5a,
@@ -2369,13 +2369,13 @@ mod tests {
     /// zero, then asserts the `_padded` kernel produces the same
     /// `(a_mlv, b_mlv, msg_1, msg_inf)` as the dense path.
     ///
-    /// Covers all three hash padding shapes: BLAKE3 (k_log=14, useful=15409),
+    /// Covers all three hash padding shapes: BLAKE3 (k_log=14, useful=15472),
     /// SHA-2 (k_log=15, useful=31401), Keccak (k_log=16, useful=42560).
     #[test]
     fn uni_skip_fold_round_pair_padded_matches_dense() {
         const K_SKIP: usize = 6;
         let cases: &[(usize, usize, usize)] =
-            &[(17, 14, 15_409), (18, 15, 31_401), (19, 16, 42_560)];
+            &[(17, 14, 15_472), (18, 15, 31_401), (19, 16, 42_560)];
         for &(m, k_log, useful_bits) in cases {
             let mut rng = Rng::new(0xFADE_F00D_u64.wrapping_add((k_log * 31 + m) as u64));
             let total_bits = 1usize << m;
