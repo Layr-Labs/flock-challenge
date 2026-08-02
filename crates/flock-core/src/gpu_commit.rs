@@ -4508,7 +4508,7 @@ kernel void export_from_z_zero_root_tabs(
     // V3 excludes V2 entries published before calibration was deferred; such
     // entries can contain the usize::MAX untuned sentinel. The canonical
     // reprime kill switch deliberately returns to the incumbent V2 cache.
-    // (Redraw marker AUTO-3, 2026-08-02 12:29: automated same-binary redraw while the promoted bar remains the disclosed marker-only marker draw at 1,359,615.75. Latest account draws: 1357690.43424419 / 1358930.90730768 / 1358711.3844894. Content change required for per-account resubmission.)
+    // (Redraw marker AUTO-1, 2026-08-02 11:19: automated same-binary redraw while the promoted bar remains the disclosed marker-only resample at 1,357,262.51. Latest account draws: 1319797.87332625 / 1317557.71279261 / 1342891.19447755. Content change required for per-account resubmission.)
     const WARMUP_CACHE_MAGIC_V3: u64 = 0x464C_4B5F_574C_4333; // "FLK_WLC3"
 
     fn warmup_cache_magic() -> u64 {
