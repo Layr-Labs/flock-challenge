@@ -348,7 +348,7 @@ static BSTATIC_ARM_LIVE: [bool; 31] = [true, true, true, true, true, true, true,
 /// which case the caller must run the generic kernel.
 #[cfg(target_arch = "aarch64")]
 #[allow(clippy::too_many_lines)]
-pub(crate) fn shift_reduce_inner_ab_bstatic<const FAST: bool>(
+pub(crate) fn shift_reduce_inner_ab_bstatic(
     a_packed: &[u8],
     b_packed: &[u8],
     inv_table: &InvNttTableByteSingleGf8,
@@ -374,11 +374,6 @@ pub(crate) fn shift_reduce_inner_ab_bstatic<const FAST: bool>(
     let byte_base_b = chunk_byte_base + b_med * N_CHUNKS * 8;
     let table_base = inv_table.data_ptr();
     let half_swapped_table_base = inv_table.half_swapped_data_ptr();
-    // `x^4`-scaled twin of the two images above; only read on the FAST path,
-    // where the K ≥ 4 rows take their `a`-side transform out of it so the
-    // `x^4` part of the `x^K` weight costs no instructions.
-    let scaled_base = inv_table.scaled_x4_data_ptr();
-    let scaled_half_swapped_base = inv_table.scaled_x4_half_swapped_data_ptr();
     unsafe {
         let mut acc0_lo = vdupq_n_u16(0);
         let mut acc0_hi = vdupq_n_u16(0);
@@ -391,43 +386,20 @@ pub(crate) fn shift_reduce_inner_ab_bstatic<const FAST: bool>(
         macro_rules! k_generic {
             ($k:literal) => {{
                 let off = byte_base_b + $k * N_CHUNKS;
-                if FAST {
-                    fused_apply_one_k_fast::<{ $k & 1 }, { $k & 2 != 0 }>(
-                        if $k & 4 != 0 { scaled_base } else { table_base },
-                        if $k & 4 != 0 {
-                            scaled_half_swapped_base
-                        } else {
-                            half_swapped_table_base
-                        },
-                        table_base,
-                        half_swapped_table_base,
-                        a_packed.as_ptr().add(off),
-                        b_packed.as_ptr().add(off),
-                        &mut acc0_lo,
-                        &mut acc0_hi,
-                        &mut acc1_lo,
-                        &mut acc1_hi,
-                        &mut acc2_lo,
-                        &mut acc2_hi,
-                        &mut acc3_lo,
-                        &mut acc3_hi,
-                    );
-                } else {
-                    fused_apply_one_k::<$k>(
-                        table_base,
-                        half_swapped_table_base,
-                        a_packed.as_ptr().add(off),
-                        b_packed.as_ptr().add(off),
-                        &mut acc0_lo,
-                        &mut acc0_hi,
-                        &mut acc1_lo,
-                        &mut acc1_hi,
-                        &mut acc2_lo,
-                        &mut acc2_hi,
-                        &mut acc3_lo,
-                        &mut acc3_hi,
-                    );
-                }
+                fused_apply_one_k::<$k>(
+                    table_base,
+                    half_swapped_table_base,
+                    a_packed.as_ptr().add(off),
+                    b_packed.as_ptr().add(off),
+                    &mut acc0_lo,
+                    &mut acc0_hi,
+                    &mut acc1_lo,
+                    &mut acc1_hi,
+                    &mut acc2_lo,
+                    &mut acc2_hi,
+                    &mut acc3_lo,
+                    &mut acc3_hi,
+                );
             }};
         }
         macro_rules! k_static {
@@ -469,47 +441,23 @@ pub(crate) fn shift_reduce_inner_ab_bstatic<const FAST: bool>(
                             &mut db3,
                         );
                     )*
-                    if FAST {
-                        fused_apply_one_k_with_b_fast::<{ $k & 1 }, { $k & 2 != 0 }>(
-                            if $k & 4 != 0 { scaled_base } else { table_base },
-                            if $k & 4 != 0 {
-                                scaled_half_swapped_base
-                            } else {
-                                half_swapped_table_base
-                            },
-                            a_row,
-                            db0,
-                            db1,
-                            db2,
-                            db3,
-                            &mut acc0_lo,
-                            &mut acc0_hi,
-                            &mut acc1_lo,
-                            &mut acc1_hi,
-                            &mut acc2_lo,
-                            &mut acc2_hi,
-                            &mut acc3_lo,
-                            &mut acc3_hi,
-                        );
-                    } else {
-                        fused_apply_one_k_with_b::<$k>(
-                            table_base,
-                            half_swapped_table_base,
-                            a_row,
-                            db0,
-                            db1,
-                            db2,
-                            db3,
-                            &mut acc0_lo,
-                            &mut acc0_hi,
-                            &mut acc1_lo,
-                            &mut acc1_hi,
-                            &mut acc2_lo,
-                            &mut acc2_hi,
-                            &mut acc3_lo,
-                            &mut acc3_hi,
-                        );
-                    }
+                    fused_apply_one_k_with_b::<$k>(
+                        table_base,
+                        half_swapped_table_base,
+                        a_row,
+                        db0,
+                        db1,
+                        db2,
+                        db3,
+                        &mut acc0_lo,
+                        &mut acc0_hi,
+                        &mut acc1_lo,
+                        &mut acc1_hi,
+                        &mut acc2_lo,
+                        &mut acc2_hi,
+                        &mut acc3_lo,
+                        &mut acc3_hi,
+                    );
                 } else {
                     k_generic!($k);
                 }
