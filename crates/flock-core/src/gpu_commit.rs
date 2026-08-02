@@ -106,6 +106,12 @@ pub const ENV_NO_NTT_PASS_TUNE: &str = "FLOCK_NO_NTT_PASS_TUNE";
 /// Exact `1` restores the untouched incumbent g4 pipeline state.
 pub const ENV_NO_GPU_FROM_Z_ZERO_ROOT: &str = "FLOCK_NO_GPU_FROM_Z_ZERO_ROOT";
 
+/// Exact-`1` rollback from the power-basis table builder to the promoted
+/// compact zero-root builder. Both kernels construct the same 704-entry
+/// nibble-table image in threadgroup memory; only the construction graph
+/// differs.
+pub const ENV_NO_GPU_FROM_Z_POWER_TABLES: &str = "FLOCK_NO_GPU_FROM_Z_POWER_TABLES";
+
 fn gpu_from_z_zero_root_value_enabled(value: Option<&std::ffi::OsStr>) -> bool {
     value != Some(std::ffi::OsStr::new("1"))
 }
@@ -117,6 +123,44 @@ fn gpu_from_z_zero_root_enabled() -> bool {
             std::env::var_os(ENV_NO_GPU_FROM_Z_ZERO_ROOT).as_deref(),
         )
     })
+}
+
+fn gpu_from_z_power_tables_value_enabled(value: Option<&std::ffi::OsStr>) -> bool {
+    value != Some(std::ffi::OsStr::new("1"))
+}
+
+fn gpu_from_z_power_tables_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        gpu_from_z_power_tables_value_enabled(
+            std::env::var_os(ENV_NO_GPU_FROM_Z_POWER_TABLES).as_deref(),
+        )
+    })
+}
+
+const FROM_Z_POWER_UNDECIDED: u8 = 0;
+const FROM_Z_POWER_COMPACT: u8 = 1;
+const FROM_Z_POWER_SELECTED: u8 = 2;
+static FROM_Z_POWER_MODE: std::sync::atomic::AtomicU8 =
+    std::sync::atomic::AtomicU8::new(FROM_Z_POWER_UNDECIDED);
+
+fn admit_gpu_from_z_power_tables(compact_ms: [f64; 2], power_ms: [f64; 2]) -> bool {
+    const MIN_MEAN_WIN_MS: f64 = 1.0;
+    let both_win = power_ms[0] < compact_ms[0] && power_ms[1] < compact_ms[1];
+    let compact_mean = (compact_ms[0] + compact_ms[1]) * 0.5;
+    let power_mean = (power_ms[0] + power_ms[1]) * 0.5;
+    both_win && compact_mean - power_mean >= MIN_MEAN_WIN_MS
+}
+
+fn publish_gpu_from_z_power_tables(selected: bool) {
+    FROM_Z_POWER_MODE.store(
+        if selected {
+            FROM_Z_POWER_SELECTED
+        } else {
+            FROM_Z_POWER_COMPACT
+        },
+        std::sync::atomic::Ordering::Release,
+    );
 }
 
 fn select_gpu_from_z_zero_root(
@@ -142,6 +186,13 @@ fn gpu_from_z_zero_root_selected(log_d: usize) -> bool {
     )
 }
 
+#[inline]
+fn gpu_from_z_power_tables_selected(log_d: usize) -> bool {
+    gpu_from_z_zero_root_selected(log_d)
+        && gpu_from_z_power_tables_enabled()
+        && FROM_Z_POWER_MODE.load(std::sync::atomic::Ordering::Acquire) != FROM_Z_POWER_COMPACT
+}
+
 #[cfg(test)]
 mod from_z_zero_root_gate_tests {
     use std::ffi::OsStr;
@@ -159,6 +210,32 @@ mod from_z_zero_root_gate_tests {
         assert!(!super::select_gpu_from_z_zero_root(20, 32, 0, 4, true, true));
         assert!(!super::select_gpu_from_z_zero_root(20, 64, 1, 4, true, true));
         assert!(!super::select_gpu_from_z_zero_root(20, 64, 0, 3, true, true));
+    }
+
+    #[test]
+    fn power_tables_have_an_exact_one_rollback() {
+        assert!(!super::gpu_from_z_power_tables_value_enabled(Some(OsStr::new("1"))));
+        for value in [None, Some(""), Some("0"), Some("01"), Some("true")] {
+            assert!(super::gpu_from_z_power_tables_value_enabled(
+                value.map(OsStr::new)
+            ));
+        }
+    }
+
+    #[test]
+    fn power_table_admission_requires_two_wins_and_one_ms_mean() {
+        assert!(super::admit_gpu_from_z_power_tables(
+            [9.0, 9.4],
+            [7.9, 8.3]
+        ));
+        assert!(!super::admit_gpu_from_z_power_tables(
+            [9.0, 9.4],
+            [8.2, 8.5]
+        ));
+        assert!(!super::admit_gpu_from_z_power_tables(
+            [9.0, 9.4],
+            [7.8, 9.5]
+        ));
     }
 
     #[test]
@@ -182,6 +259,16 @@ mod from_z_zero_root_gate_tests {
         assert_eq!(COMPACT_BUILD_MULX, 3_080);
         assert_eq!((INCUMBENT_BUILD_MULX - COMPACT_BUILD_MULX) * GROUPS, 18_350_080);
 
+        // The successor uses one x^4 reducer per bank step and only three
+        // serial mulx calls to form each bank's four basis powers. It then
+        // emits all sixteen XOR combinations directly from registers.
+        const POWER_BUILD_MULX: usize = 11 * 4 * 3;
+        const POWER_BUILD_SHL4: usize = 11 * (0 + 1 + 2 + 3);
+        assert_eq!(POWER_BUILD_MULX, 132);
+        assert_eq!(POWER_BUILD_SHL4, 66);
+        assert_eq!((COMPACT_BUILD_MULX - POWER_BUILD_MULX) * GROUPS, 48_300_032);
+        assert_eq!(POWER_BUILD_SHL4 * GROUPS, 1_081_344);
+
         // Layer zero is already a copy. In layers 1..3 the zero root occurs
         // 4+2+1 times per tile and lane; four tiles and 64 lanes share each
         // ranked group. Each deleted tab4 call contains eight shl16 steps and
@@ -192,6 +279,7 @@ mod from_z_zero_root_gate_tests {
         assert_eq!(ZERO_PRODUCTS * 8, 234_881_024);
         assert_eq!(ZERO_PRODUCTS * 32, 939_524_096);
         assert_eq!((11 * 4 + 11 * 64) * 16, 11_968);
+        assert_eq!(11 * 64 * 16, 11_264);
     }
 }
 
@@ -1671,6 +1759,16 @@ static inline uint4 gf_mulx_zero_root(uint4 v) {
     return r;
 }
 
+static inline uint4 gf_shl4_zero_root(uint4 a) {
+    uint h = a.w >> 28;
+    uint4 r;
+    r.w = (a.w << 4) | (a.z >> 28);
+    r.z = (a.z << 4) | (a.y >> 28);
+    r.y = (a.y << 4) | (a.x >> 28);
+    r.x = (a.x << 4) ^ ((h << 7) ^ (h << 2) ^ (h << 1) ^ h);
+    return r;
+}
+
 static inline uint4 gf_shl16_zero_root(uint4 a) {
     uint h = a.w >> 16;
     uint4 r;
@@ -1737,6 +1835,61 @@ static inline void build_zero_root_tabs(
             p = gf_mulx_zero_root(p);
         }
         tabs[ei] = value;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+}
+
+// Successor builder: one thread owns each compact-table bank. It forms the
+// four basis powers once, then writes all sixteen XOR combinations directly.
+// The x^4 bank jump replaces four dependent mulx calls. Static threadgroup
+// memory is only the final 704-entry table image = 11,264 B.
+static inline void store_zero_root_nibble_table(
+    threadgroup uint4* tab,
+    uint4 b0,
+    uint4 b1,
+    uint4 b2,
+    uint4 b3)
+{
+    uint4 b01 = b0 ^ b1;
+    uint4 b02 = b0 ^ b2;
+    uint4 b12 = b1 ^ b2;
+    uint4 b012 = b01 ^ b2;
+    tab[0] = uint4(0u);
+    tab[1] = b0;
+    tab[2] = b1;
+    tab[3] = b01;
+    tab[4] = b2;
+    tab[5] = b02;
+    tab[6] = b12;
+    tab[7] = b012;
+    tab[8] = b3;
+    tab[9] = b0 ^ b3;
+    tab[10] = b1 ^ b3;
+    tab[11] = b01 ^ b3;
+    tab[12] = b2 ^ b3;
+    tab[13] = b02 ^ b3;
+    tab[14] = b12 ^ b3;
+    tab[15] = b012 ^ b3;
+}
+
+static inline void build_zero_root_power_tabs(
+    device const uint4* twiddles,
+    threadgroup uint4* tabs,
+    uint lid)
+{
+    constexpr uint NTW = 11u;
+    if (lid < NTW * 4u) {
+        uint compact = lid >> 2;
+        uint bank = lid & 3u;
+        uint4 b0 = twiddles[zero_root_raw_twiddle(compact)];
+        for (uint m = 0u; m < bank; m++) {
+            b0 = gf_shl4_zero_root(b0);
+        }
+        uint4 b1 = gf_mulx_zero_root(b0);
+        uint4 b2 = gf_mulx_zero_root(b1);
+        uint4 b3 = gf_mulx_zero_root(b2);
+        store_zero_root_nibble_table(
+            &tabs[(compact << 6) | (bank << 4)], b0, b1, b2, b3);
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 }
@@ -1819,6 +1972,75 @@ kernel void ntt_fused_reg4_from_zg4_zero_root(
     }
 }
 
+kernel void ntt_fused_reg4_from_zg4_zero_root_power(
+    device uint4* data             [[buffer(0)]],
+    device const uint4* twiddles   [[buffer(1)]],
+    constant NttParams& P          [[buffer(2)]],
+    device const uint4* z          [[buffer(3)]],
+    uint tgid [[threadgroup_position_in_grid]],
+    uint lid  [[thread_index_in_threadgroup]])
+{
+    constexpr uint NF = 16u;
+    constexpr uint LOG_G = 2u;
+    threadgroup uint4 tabs[11u * 64u];
+    build_zero_root_power_tabs(twiddles, tabs, lid);
+
+    const uint lane = lid & 63u;
+    const uint r_base = tgid << LOG_G;
+    for (uint rr = 0u; rr < (1u << LOG_G); rr++) {
+        const uint r = r_base + rr;
+        uint4 elems[NF];
+
+        for (uint e = 0u; e < NF / 2u; e++) {
+            elems[e] = z[(((e << P.s) + r) << 6) + lane];
+            elems[e + NF / 2u] = elems[e];
+        }
+
+        #define POWER_ZERO_BFLY(EU, EV) \
+            elems[EV] ^= elems[EU];
+        #define POWER_TAB_BFLY(EU, EV, CT) { \
+            uint4 nu = elems[EU] \
+                ^ gf_mul_tab4_zero_root(elems[EV], &tabs[(CT) * 64u]); \
+            elems[EU] = nu; \
+            elems[EV] ^= nu; \
+        }
+
+        POWER_ZERO_BFLY(0, 4)
+        POWER_ZERO_BFLY(1, 5)
+        POWER_ZERO_BFLY(2, 6)
+        POWER_ZERO_BFLY(3, 7)
+        POWER_TAB_BFLY(8, 12, 0)
+        POWER_TAB_BFLY(9, 13, 0)
+        POWER_TAB_BFLY(10, 14, 0)
+        POWER_TAB_BFLY(11, 15, 0)
+
+        POWER_ZERO_BFLY(0, 2)
+        POWER_ZERO_BFLY(1, 3)
+        POWER_TAB_BFLY(4, 6, 1)
+        POWER_TAB_BFLY(5, 7, 1)
+        POWER_TAB_BFLY(8, 10, 2)
+        POWER_TAB_BFLY(9, 11, 2)
+        POWER_TAB_BFLY(12, 14, 3)
+        POWER_TAB_BFLY(13, 15, 3)
+
+        POWER_ZERO_BFLY(0, 1)
+        POWER_TAB_BFLY(2, 3, 4)
+        POWER_TAB_BFLY(4, 5, 5)
+        POWER_TAB_BFLY(6, 7, 6)
+        POWER_TAB_BFLY(8, 9, 7)
+        POWER_TAB_BFLY(10, 11, 8)
+        POWER_TAB_BFLY(12, 13, 9)
+        POWER_TAB_BFLY(14, 15, 10)
+
+        #undef POWER_TAB_BFLY
+        #undef POWER_ZERO_BFLY
+
+        for (uint e = 0u; e < NF; e++) {
+            data[((r + (e << P.s)) << 6) + lane] = elems[e];
+        }
+    }
+}
+
 // Test-only PSO. It exports the exact table image built by the shared
 // helper above so a real-Metal oracle can compare every compact entry.
 kernel void export_from_z_zero_root_tabs(
@@ -1829,6 +2051,18 @@ kernel void export_from_z_zero_root_tabs(
     threadgroup uint4 bases[11u * 4u];
     threadgroup uint4 tabs[11u * 64u];
     build_zero_root_tabs(twiddles, bases, tabs, lid);
+    for (uint ei = lid; ei < 11u * 64u; ei += 64u) {
+        out[ei] = tabs[ei];
+    }
+}
+
+kernel void export_from_z_zero_root_power_tabs(
+    device const uint4* twiddles [[buffer(0)]],
+    device uint4* out            [[buffer(1)]],
+    uint lid [[thread_index_in_threadgroup]])
+{
+    threadgroup uint4 tabs[11u * 64u];
+    build_zero_root_power_tabs(twiddles, tabs, lid);
     for (uint ei = lid; ei < 11u * 64u; ei += 64u) {
         out[ei] = tabs[ei];
     }
@@ -1946,10 +2180,17 @@ kernel void export_from_z_zero_root_tabs(
         /// PSO constructs eleven compact tables per group; it never reads a
         /// prebuilt device table.
         pub(crate) pso_ntt4zg4_zero_root: Id,
+        /// Same hot network and table image, with the register power-basis
+        /// builder selected only by the per-worker admission gate.
+        pub(crate) pso_ntt4zg4_zero_root_power: Id,
         /// Real-Metal oracle exporter for the shared compact table builder.
         /// `NIL` outside `cfg(test)`.
         #[cfg_attr(not(test), allow(dead_code))]
         pub(crate) pso_export_from_z_zero_root_tabs: Id,
+        /// Real-Metal oracle exporter for the power-basis table builder.
+        /// `NIL` outside `cfg(test)`.
+        #[cfg_attr(not(test), allow(dead_code))]
+        pub(crate) pso_export_from_z_zero_root_power_tabs: Id,
         pub(crate) pso_ntt4h8: Id,
         pub(crate) pso_ntt5mix: Id,
         pub(crate) pso_leaf: Id,
@@ -2092,7 +2333,12 @@ kernel void export_from_z_zero_root_tabs(
                 // Keep the embedded incumbent metallib byte-for-byte intact.
                 // The exact rollback skips this supplemental compile and
                 // selects the incumbent pso_ntt4zg4 below.
-                let (pso_ntt4zg4_zero_root, pso_export_from_z_zero_root_tabs) =
+                let (
+                    pso_ntt4zg4_zero_root,
+                    pso_ntt4zg4_zero_root_power,
+                    pso_export_from_z_zero_root_tabs,
+                    pso_export_from_z_zero_root_power_tabs,
+                ) =
                     if cfg!(test) || super::gpu_from_z_zero_root_selected(20) {
                         let src = api.nsstring(FROM_Z_ZERO_ROOT_MSL_SOURCE)?;
                         let mut err: Id = NIL;
@@ -2143,15 +2389,19 @@ kernel void export_from_z_zero_root_tabs(
                             }
                         };
                         let candidate = build("ntt_fused_reg4_from_zg4_zero_root")?;
-                        let export = if cfg!(test) {
-                            build("export_from_z_zero_root_tabs")?
+                        let power = build("ntt_fused_reg4_from_zg4_zero_root_power")?;
+                        let (export, power_export) = if cfg!(test) {
+                            (
+                                build("export_from_z_zero_root_tabs")?,
+                                build("export_from_z_zero_root_power_tabs")?,
+                            )
                         } else {
-                            NIL
+                            (NIL, NIL)
                         };
                         send!(api, unsafe extern "C" fn(Id, Sel) -> Id, library, c"release");
-                        (candidate, export)
+                        (candidate, power, export, power_export)
                     } else {
-                        (NIL, NIL)
+                        (NIL, NIL, NIL, NIL)
                     };
                 Ok(Gpu {
                     api,
@@ -2164,7 +2414,9 @@ kernel void export_from_z_zero_root_tabs(
                     pso_ntt4z,
                     pso_ntt4zg4,
                     pso_ntt4zg4_zero_root,
+                    pso_ntt4zg4_zero_root_power,
                     pso_export_from_z_zero_root_tabs,
+                    pso_export_from_z_zero_root_power_tabs,
                     pso_ntt4h8,
                     pso_ntt5mix,
                     pso_leaf,
@@ -2463,14 +2715,17 @@ kernel void export_from_z_zero_root_tabs(
     struct FromZFirstPassPlan {
         grouped: bool,
         zero_root: bool,
+        power_tables: bool,
     }
 
     impl FromZFirstPassPlan {
         fn new(log_d: usize) -> Self {
             let grouped = super::pass_tune_enabled();
+            let zero_root = grouped && super::gpu_from_z_zero_root_selected(log_d);
             Self {
                 grouped,
-                zero_root: grouped && super::gpu_from_z_zero_root_selected(log_d),
+                zero_root,
+                power_tables: zero_root && super::gpu_from_z_power_tables_selected(log_d),
             }
         }
 
@@ -2485,10 +2740,14 @@ kernel void export_from_z_zero_root_tabs(
             byte_offset: usize,
             r_count: usize,
         ) {
+            debug_assert!(!self.power_tables || self.zero_root);
             debug_assert!(!self.zero_root || self.grouped);
             debug_assert!(!self.grouped || r_count.is_multiple_of(4));
             unsafe {
-                let pso = if self.zero_root {
+                let pso = if self.power_tables {
+                    debug_assert!(!gpu.pso_ntt4zg4_zero_root_power.is_null());
+                    gpu.pso_ntt4zg4_zero_root_power
+                } else if self.zero_root {
                     debug_assert!(!gpu.pso_ntt4zg4_zero_root.is_null());
                     gpu.pso_ntt4zg4_zero_root
                 } else if self.grouped {
@@ -2530,11 +2789,13 @@ kernel void export_from_z_zero_root_tabs(
         tw_buf: Id,
         z_buf: Id,
         log_d: usize,
+        power_tables: bool,
     ) {
         unsafe {
             FromZFirstPassPlan {
                 grouped: true,
                 zero_root: true,
+                power_tables,
             }
             .encode_range(
                 gpu,
@@ -2559,6 +2820,22 @@ kernel void export_from_z_zero_root_tabs(
         unsafe {
             debug_assert!(!gpu.pso_export_from_z_zero_root_tabs.is_null());
             gpu.set_pipeline(enc, gpu.pso_export_from_z_zero_root_tabs);
+            gpu.set_buffer(enc, tw_buf, 0, 0);
+            gpu.set_buffer(enc, out, 0, 1);
+            gpu.dispatch(enc, 1, 64);
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) unsafe fn encode_zero_root_power_table_export_for_test(
+        gpu: &Gpu,
+        enc: Id,
+        tw_buf: Id,
+        out: Id,
+    ) {
+        unsafe {
+            debug_assert!(!gpu.pso_export_from_z_zero_root_power_tabs.is_null());
+            gpu.set_pipeline(enc, gpu.pso_export_from_z_zero_root_power_tabs);
             gpu.set_buffer(enc, tw_buf, 0, 0);
             gpu.set_buffer(enc, out, 0, 1);
             gpu.dispatch(enc, 1, 64);
@@ -3466,12 +3743,13 @@ kernel void export_from_z_zero_root_tabs(
     /// stream runs before the timed prove; the autotune sweep uses it as an
     /// untimed staging re-prime so each candidate times only the
     /// after-first-pass graph the timed prove actually dispatches.
-    unsafe fn run_from_z_first_pass(
+    unsafe fn run_from_z_first_pass_with_plan(
         gpu: &Gpu,
         z_buf: Id,
         staging: Id,
         tw_buf: Id,
         log_d: usize,
+        plan: FromZFirstPassPlan,
     ) -> Result<(), String> {
         unsafe {
             let cb1 = gpu.command_buffer()?;
@@ -3479,7 +3757,7 @@ kernel void export_from_z_zero_root_tabs(
             // From-z tiles all live in block B = 0 (l = 0), so the g4
             // table-reuse idiom applies; the tuned kernel also skips
             // the zero-region sub-layer (a pure copy).
-            FromZFirstPassPlan::new(log_d).encode_range(
+            plan.encode_range(
                 gpu,
                 enc,
                 staging,
@@ -3491,6 +3769,93 @@ kernel void export_from_z_zero_root_tabs(
             );
             gpu.end_encoding(enc);
             gpu.commit_and_wait(cb1)
+        }
+    }
+
+    unsafe fn run_from_z_first_pass(
+        gpu: &Gpu,
+        z_buf: Id,
+        staging: Id,
+        tw_buf: Id,
+        log_d: usize,
+    ) -> Result<(), String> {
+        unsafe {
+            run_from_z_first_pass_with_plan(
+                gpu,
+                z_buf,
+                staging,
+                tw_buf,
+                log_d,
+                FromZFirstPassPlan::new(log_d),
+            )
+        }
+    }
+
+    /// Per-worker, untimed admission gate for the power-basis table builder.
+    /// Persistent buffers/views already exist. Every sample includes command
+    /// creation, encoding, the in-kernel table construction, submit, and wait;
+    /// only equal warm-up runs are outside the timer. Reversed order plus two
+    /// wins and a one-millisecond mean margin protects workers whose table
+    /// construction is not on the critical path.
+    unsafe fn calibrate_from_z_power_tables(
+        gpu: &Gpu,
+        z_buf: Id,
+        staging: Id,
+        tw_buf: Id,
+        log_d: usize,
+    ) {
+        if !super::gpu_from_z_zero_root_selected(log_d)
+            || !super::gpu_from_z_power_tables_enabled()
+        {
+            super::publish_gpu_from_z_power_tables(false);
+            return;
+        }
+
+        let compact = FromZFirstPassPlan {
+            grouped: true,
+            zero_root: true,
+            power_tables: false,
+        };
+        let power = FromZFirstPassPlan {
+            grouped: true,
+            zero_root: true,
+            power_tables: true,
+        };
+        let run = |plan| unsafe {
+            run_from_z_first_pass_with_plan(gpu, z_buf, staging, tw_buf, log_d, plan)
+        };
+        let sample = |plan| -> Result<f64, String> {
+            let t0 = std::time::Instant::now();
+            run(plan)?;
+            Ok(t0.elapsed().as_secs_f64() * 1e3)
+        };
+
+        if run(compact).is_err() || run(power).is_err() {
+            super::publish_gpu_from_z_power_tables(false);
+            return;
+        }
+        let measured = (|| -> Result<([f64; 2], [f64; 2]), String> {
+            let compact_first = sample(compact)?;
+            let power_second = sample(power)?;
+            let power_first = sample(power)?;
+            let compact_second = sample(compact)?;
+            Ok(([compact_first, compact_second], [power_second, power_first]))
+        })();
+        let (compact_ms, power_ms) = match measured {
+            Ok(v) => v,
+            Err(_) => {
+                super::publish_gpu_from_z_power_tables(false);
+                return;
+            }
+        };
+        let selected = super::admit_gpu_from_z_power_tables(compact_ms, power_ms);
+        super::publish_gpu_from_z_power_tables(selected);
+        if debug_enabled() || std::env::var_os("FLOCK_COMMIT_TIMING").is_some() {
+            eprintln!(
+                "[gpu-commit] from-z power tables: compact={compact_ms:?} ms \
+                 power={power_ms:?} ms -> {}",
+                if selected { "POWER" } else { "COMPACT" }
+            );
         }
     }
 
@@ -4522,46 +4887,62 @@ kernel void export_from_z_zero_root_tabs(
     /// Cache key component tying entries to both the exact GPU source and
     /// selected from-z mode. Candidate and exact-rollback processes must not
     /// consume each other's latch or tuned split.
-    fn warmup_cache_msl_fnv_for(zero_root: bool) -> u64 {
+    fn warmup_cache_msl_fnv_for(zero_root: bool, power_tables: bool) -> u64 {
+        debug_assert!(!power_tables || zero_root);
         let base = fnv1a64(MSL_SOURCE);
         if zero_root {
-            base ^ fnv1a64(FROM_Z_ZERO_ROOT_MSL_SOURCE).rotate_left(1)
-                ^ 0x5A52_4F4F_545F_3131 // "ZROOT_11"
+            let compact = base
+                ^ fnv1a64(FROM_Z_ZERO_ROOT_MSL_SOURCE).rotate_left(1)
+                ^ 0x5A52_4F4F_545F_3131; // "ZROOT_11"
+            if power_tables {
+                compact ^ 0x5057_5254_4142_3131 // "PWRTAB11"
+            } else {
+                compact
+            }
         } else {
             base
         }
     }
 
     fn warmup_cache_msl_fnv() -> u64 {
-        warmup_cache_msl_fnv_for(super::gpu_from_z_zero_root_selected(20))
+        let zero_root = super::gpu_from_z_zero_root_selected(20);
+        warmup_cache_msl_fnv_for(
+            zero_root,
+            zero_root && super::gpu_from_z_power_tables_enabled(),
+        )
     }
 
     #[cfg(test)]
     mod zero_root_cache_key_tests {
         #[test]
         fn supplemental_source_and_mode_have_a_distinct_fingerprint() {
-            let incumbent = super::warmup_cache_msl_fnv_for(false);
-            let candidate = super::warmup_cache_msl_fnv_for(true);
+            let incumbent = super::warmup_cache_msl_fnv_for(false, false);
+            let candidate = super::warmup_cache_msl_fnv_for(true, false);
+            let power = super::warmup_cache_msl_fnv_for(true, true);
             assert_eq!(incumbent, super::fnv1a64(super::MSL_SOURCE));
             assert_ne!(candidate, incumbent);
+            assert_ne!(power, candidate);
             assert_eq!(
                 candidate,
                 incumbent
                     ^ super::fnv1a64(super::FROM_Z_ZERO_ROOT_MSL_SOURCE).rotate_left(1)
                     ^ 0x5A52_4F4F_545F_3131
             );
+            assert_eq!(power, candidate ^ 0x5057_5254_4142_3131);
         }
 
         #[test]
         fn hot_network_is_literal_and_has_no_device_table_preload() {
             let src = super::FROM_Z_ZERO_ROOT_MSL_SOURCE;
             // One macro definition plus exactly 7/17 literal call sites.
-            assert_eq!(src.matches("ZERO_BFLY(").count(), 8);
-            assert_eq!(src.matches("TAB_BFLY(").count(), 18);
+            assert_eq!(src.matches("ZERO_BFLY(").count(), 16);
+            assert_eq!(src.matches("TAB_BFLY(").count(), 36);
             assert!(!src.contains("fixed_tabs"));
             assert!(!src.contains("device const uint4* tabs"));
             assert!(src.contains("threadgroup uint4 tabs[11u * 64u]"));
             assert!(src.contains("twiddles[zero_root_raw_twiddle(compact)]"));
+            assert!(src.contains("build_zero_root_power_tabs"));
+            assert!(src.contains("gf_shl4_zero_root"));
         }
     }
 
@@ -4715,6 +5096,12 @@ kernel void export_from_z_zero_root_tabs(
                 let z_buf =
                     gpu.wrap_buffer(z_packed.as_ptr().cast_mut().cast::<u8>(), z_bytes)?;
                 created.push(z_buf);
+
+                // Decide between the promoted compact builder and the
+                // power-basis successor on this worker before the ordinary
+                // full-graph warmup/oracle. The gate only overwrites staging;
+                // every following graph reconstructs it from immutable z.
+                calibrate_from_z_power_tables(gpu, z_buf, staging, tw_buf, log_d);
 
                 // Untimed wiring run, then the identical timed run.
                 run_commit_graph_from_z(gpu, z_buf, staging, tw_buf, tree_buf, log_d, n_leaves)?;
@@ -5793,11 +6180,10 @@ mod tests {
         }
     }
 
-    /// Compact real-Metal oracle for the direct zero-root specialization. It
-    /// exports every entry from the exact shared threadgroup builder, forces
-    /// the production candidate PSO at log_d=8, compares candidate,
-    /// incumbent, and scalar first passes, then completes the NTT+Merkle graph
-    /// and checks the entire codeword and tree.
+    /// Real-Metal oracle for both compact table builders. It exports every
+    /// entry from each exact shared helper, forces both production PSOs at
+    /// log_d=8, compares power/compact/incumbent/scalar first passes, then
+    /// completes the power-builder NTT+Merkle graph.
     #[test]
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     fn gpu_from_z_zero_root_table_codeword_and_tree_match_scaled() {
@@ -5864,7 +6250,8 @@ mod tests {
             let data_bytes = core::mem::size_of_val(expect_first.as_slice());
             let tree_bytes = (2 * n_leaves - 1) * core::mem::size_of::<crate::merkle::Hash>();
             let table_bytes = core::mem::size_of_val(expect_table.as_slice());
-            let candidate = gpu.new_buffer(data_bytes).unwrap();
+            let compact = gpu.new_buffer(data_bytes).unwrap();
+            let power = gpu.new_buffer(data_bytes).unwrap();
             let incumbent = gpu.new_buffer(data_bytes).unwrap();
             let tw_buf = gpu
                 .new_buffer(core::mem::size_of_val(twiddles.as_slice()))
@@ -5873,6 +6260,7 @@ mod tests {
                 .new_buffer(core::mem::size_of_val(z.as_slice()))
                 .unwrap();
             let table_buf = gpu.new_buffer(table_bytes).unwrap();
+            let power_table_buf = gpu.new_buffer(table_bytes).unwrap();
             let tree_buf = gpu.new_buffer(tree_bytes).unwrap();
             std::ptr::copy_nonoverlapping(
                 twiddles.as_ptr().cast::<u8>(),
@@ -5884,19 +6272,30 @@ mod tests {
                 gpu.buffer_contents(z_buf),
                 core::mem::size_of_val(z.as_slice()),
             );
-            std::ptr::write_bytes(gpu.buffer_contents(candidate), 0xA5, data_bytes);
+            std::ptr::write_bytes(gpu.buffer_contents(compact), 0xA5, data_bytes);
+            std::ptr::write_bytes(gpu.buffer_contents(power), 0x69, data_bytes);
             std::ptr::write_bytes(gpu.buffer_contents(incumbent), 0x5A, data_bytes);
             std::ptr::write_bytes(gpu.buffer_contents(table_buf), 0xC3, table_bytes);
+            std::ptr::write_bytes(gpu.buffer_contents(power_table_buf), 0x96, table_bytes);
             std::ptr::write_bytes(gpu.buffer_contents(tree_buf), 0x3C, tree_bytes);
 
-            // Force the candidate and export the table through the helper
-            // shared verbatim with its production PSO.
+            // Force both zero-root modes and export both table images through
+            // the helpers shared verbatim with their production PSOs.
             let cb = gpu.command_buffer().unwrap();
             let enc = gpu.compute_encoder(cb).unwrap();
             imp::encode_from_z_zero_root_for_test(
-                gpu, enc, candidate, tw_buf, z_buf, log_d,
+                gpu, enc, compact, tw_buf, z_buf, log_d, false,
+            );
+            imp::encode_from_z_zero_root_for_test(
+                gpu, enc, power, tw_buf, z_buf, log_d, true,
             );
             imp::encode_zero_root_table_export_for_test(gpu, enc, tw_buf, table_buf);
+            imp::encode_zero_root_power_table_export_for_test(
+                gpu,
+                enc,
+                tw_buf,
+                power_table_buf,
+            );
             gpu.end_encoding(enc);
             gpu.commit_and_wait(cb).unwrap();
 
@@ -5926,8 +6325,16 @@ mod tests {
                 gpu.buffer_contents(table_buf).cast::<F128>(),
                 expect_table.len(),
             );
-            let candidate_first = core::slice::from_raw_parts(
-                gpu.buffer_contents(candidate).cast::<F128>(),
+            let got_power_table = core::slice::from_raw_parts(
+                gpu.buffer_contents(power_table_buf).cast::<F128>(),
+                expect_table.len(),
+            );
+            let compact_first = core::slice::from_raw_parts(
+                gpu.buffer_contents(compact).cast::<F128>(),
+                expect_first.len(),
+            );
+            let power_first = core::slice::from_raw_parts(
+                gpu.buffer_contents(power).cast::<F128>(),
                 expect_first.len(),
             );
             let incumbent_first = core::slice::from_raw_parts(
@@ -5935,37 +6342,47 @@ mod tests {
                 expect_first.len(),
             );
             assert_eq!(got_table, expect_table.as_slice(), "compact table mismatch");
-            assert_eq!(candidate_first, expect_first.as_slice(), "candidate first pass mismatch");
+            assert_eq!(got_power_table, expect_table.as_slice(), "power table mismatch");
+            assert_eq!(compact_first, expect_first.as_slice(), "compact first pass mismatch");
+            assert_eq!(power_first, expect_first.as_slice(), "power first pass mismatch");
             assert_eq!(incumbent_first, expect_first.as_slice(), "incumbent first pass mismatch");
-            assert_eq!(candidate_first, incumbent_first);
+            assert_eq!(compact_first, incumbent_first);
+            assert_eq!(power_first, incumbent_first);
             assert_eq!(
                 gpu.pipeline_resources(gpu.pso_ntt4zg4_zero_root).0,
                 11_968,
-                "candidate static threadgroup footprint"
+                "compact static threadgroup footprint"
+            );
+            assert_eq!(
+                gpu.pipeline_resources(gpu.pso_ntt4zg4_zero_root_power).0,
+                11_264,
+                "power-builder static threadgroup footprint"
             );
 
             let cb = gpu.command_buffer().unwrap();
             let enc = gpu.compute_encoder(cb).unwrap();
-            imp::encode_ntt_passes(gpu, enc, candidate, tw_buf, log_d, 4);
-            imp::encode_merkle(gpu, enc, candidate, tree_buf, n_leaves);
+            imp::encode_ntt_passes(gpu, enc, power, tw_buf, log_d, 4);
+            imp::encode_merkle(gpu, enc, power, tree_buf, n_leaves);
             gpu.end_encoding(enc);
             gpu.commit_and_wait(cb).unwrap();
-            let candidate_full = core::slice::from_raw_parts(
-                gpu.buffer_contents(candidate).cast::<F128>(),
+            let power_full = core::slice::from_raw_parts(
+                gpu.buffer_contents(power).cast::<F128>(),
                 expect_full.len(),
             );
             let got_tree = core::slice::from_raw_parts(
                 gpu.buffer_contents(tree_buf).cast::<crate::merkle::Hash>(),
                 expect_tree.len(),
             );
-            assert_eq!(candidate_full, expect_full.as_slice(), "full codeword mismatch");
+            assert_eq!(power_full, expect_full.as_slice(), "full codeword mismatch");
             assert_eq!(got_tree, expect_tree.as_slice(), "full tree mismatch");
 
-            gpu.release(candidate);
+            gpu.release(compact);
+            gpu.release(power);
             gpu.release(incumbent);
             gpu.release(tw_buf);
             gpu.release(z_buf);
             gpu.release(table_buf);
+            gpu.release(power_table_buf);
             gpu.release(tree_buf);
             gpu.pool_pop(pool);
         }
