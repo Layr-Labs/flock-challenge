@@ -2103,6 +2103,36 @@ pub(crate) mod witgen_simd {
     /// process_group shape, same optional Metal band streaming, same stripe
     /// pass; the per-block builder runs as two NEON quads per group and the
     /// a/b/stripe stores are non-temporal (§14; z stays plain, §16).
+    /// Process-global latch for the witgen GPU arm (None = undecided). The
+    /// first ranked streamed prove runs the incumbent CPU pass, then probes
+    /// the GPU arm against it (bit-exact slice compare AND wall-clock x1.10);
+    /// only a passing probe flips the latch. Any later dispatch failure falls
+    /// back to the CPU path for that call.
+    fn gpu_witgen_latch() -> &'static std::sync::Mutex<Option<bool>> {
+        static L: std::sync::OnceLock<std::sync::Mutex<Option<bool>>> =
+            std::sync::OnceLock::new();
+        L.get_or_init(|| std::sync::Mutex::new(None))
+    }
+
+    /// Pack blocks (+ all-zero padding slots) into the GPU kernel's 28-u32
+    /// input layout: [cv0..cv7 | m0..m15 | counter_lo | counter_hi | blen |
+    /// flags]. Padding slots stay all-zero (the all-zero compression pin).
+    fn pack_blocks_for_gpu(blocks: &[Compression], n_blocks: usize, n_total: usize) -> Vec<u32> {
+        let mut packed = vec![0u32; n_total * 28];
+        for (idx, slot) in packed.chunks_exact_mut(28).enumerate() {
+            if idx < n_blocks {
+                let (cv, m, t, bl, fl) = &blocks[idx];
+                slot[0..8].copy_from_slice(cv);
+                slot[8..24].copy_from_slice(m);
+                slot[24] = *t as u32;
+                slot[25] = (*t >> 32) as u32;
+                slot[26] = *bl;
+                slot[27] = *fl;
+            }
+        }
+        packed
+    }
+
     #[allow(clippy::type_complexity)]
     fn generate_impl(
         blocks: &[Compression],
@@ -2183,6 +2213,41 @@ pub(crate) mod witgen_simd {
         // the full 512 MiB ranked buffer. The per-band release fence below is
         // the same visibility boundary used by the cached-store path.
         let z_nt = select_z_nt(nt, defer_ranked_stripe, z_nt_enabled());
+
+        // ---- GPU witgen arm (ranked, streamed): latched fast path ----
+        // The kernel is a bit-exact transcription of the scalar per-block
+        // builder; the one-time warmup probe below compares it against the
+        // incumbent CPU pass before the latch can flip. On the latched path
+        // the CPU group loop is skipped entirely: the kernel writes z/a/b
+        // (F128-packed, same layout) into the page-aligned scratch via a
+        // zero-copy Metal wrap, and the lincheck stripe is deferred
+        // GPU-side by the commit stream (z_lincheck is None here). The whole
+        // z range is published to the stream in one sequential range, which
+        // is exactly what the CPU band loop would have done band by band.
+        let gpu_shape = defer_ranked_stripe
+            && stream.is_some()
+            && n_total == 1 << 18
+            && n_blocks == n_total;
+        let gpu_took = gpu_shape
+            && *gpu_witgen_latch().lock().unwrap() == Some(true)
+            && {
+                let packed = pack_blocks_for_gpu(blocks, n_blocks, n_total);
+                flock_core::gpu_commit::try_witgen_gpu(
+                    &packed,
+                    n_total,
+                    z.as_mut_ptr().cast::<u8>(),
+                    a.as_mut_ptr().cast::<u8>(),
+                    b.as_mut_ptr().cast::<u8>(),
+                )
+            };
+        if gpu_took {
+            debug_assert!(z_lincheck.is_none());
+            if let Some(stream) = &mut stream {
+                stream.submit_ready_range(0, n_total / 64);
+            }
+            return (z, a, b, z_lincheck, stream);
+        }
+        let t_cpu0 = std::time::Instant::now();
 
         let process_group = |g: usize| {
             // SAFETY: each scheduled group index occurs exactly once. Every
@@ -2311,6 +2376,36 @@ pub(crate) mod witgen_simd {
             eprintln!(
                 "[witgen-hetero] groups={n_groups} helper-claims={}",
                 flock_core::epool::helper_chunks_claimed() - before
+            );
+        }
+
+        // ---- GPU witgen warmup probe (one-time, on the untimed first pass)
+        // The CPU pass above is the incumbent and authoritative. Probe the
+        // GPU arm into throwaway page-aligned scratch buffers, slice-compare
+        // bit-for-bit, wall-clock both paths, and latch once. The incumbent
+        // output is never touched; a failed or diverged probe just latches
+        // the arm off forever (CPU path stands — no `failed` possible).
+        if gpu_shape && gpu_witgen_latch().lock().unwrap().is_none() {
+            let cpu_wall = t_cpu0.elapsed();
+            let packed = pack_blocks_for_gpu(blocks, n_blocks, n_total);
+            let mut gz = flock_core::scratch::take_f128(total_f128);
+            let mut ga = flock_core::scratch::take_f128(total_f128);
+            let mut gb = flock_core::scratch::take_f128(total_f128);
+            let t0 = std::time::Instant::now();
+            let ok = flock_core::gpu_commit::try_witgen_gpu(
+                &packed,
+                n_total,
+                gz.as_mut_ptr().cast::<u8>(),
+                ga.as_mut_ptr().cast::<u8>(),
+                gb.as_mut_ptr().cast::<u8>(),
+            );
+            let gpu_wall = t0.elapsed();
+            let bit_exact = ok && gz == z && ga == a && gb == b;
+            let promoted =
+                bit_exact && gpu_wall.as_secs_f64() * 1.10 <= cpu_wall.as_secs_f64();
+            *gpu_witgen_latch().lock().unwrap() = Some(promoted);
+            eprintln!(
+                "[witgen-gpu] probe: bit_exact={bit_exact} cpu={cpu_wall:?} gpu={gpu_wall:?} promoted={promoted}"
             );
         }
 
@@ -4340,6 +4435,363 @@ mod tests {
             assert_eq!(setup.n_blocks_log(), expected_n_log, "n_blocks={n_blocks}");
             assert_eq!(setup.m(), K_LOG + expected_n_log);
             assert!(setup.n_block_slots() >= n_blocks);
+        }
+    }
+    // ------------------------------------------------------------------
+    // Kernel-emulation oracle for the witgen GPU arm (x86-runnable): a Rust
+    // port of the MSL `witgen_quad` kernel's exact arithmetic (one thread =
+    // one block), written from the kernel spec rather than from the scalar
+    // builder, so a divergence from `build_block_witness_ab_stream_into`
+    // here is a KERNEL bug caught on x86. The runtime probe on the scored
+    // path enforces the same equality against the NEON path before the arm
+    // can latch on.
+    // ------------------------------------------------------------------
+    const WITGEN_IV: [u32; 8] = [
+        0x6A09E667, 0xBB67AE85, 0x3C6EF372, 0xA54FF53A, 0x510E527F, 0x9B05688C, 0x1F83D9AB,
+        0x5BE0CD19,
+    ];
+
+    #[inline(always)]
+    fn wrotr(x: u32, n: u32) -> u32 {
+        (x >> n) | (x << (32 - n))
+    }
+
+    #[inline(always)]
+    fn wacp(x: u32, y: u32) -> (u32, u32, u32, u32) {
+        let m31 = 0x7FFF_FFFFu32;
+        let sum = x.wrapping_add(y);
+        let cin = sum ^ x ^ y;
+        let left = (x ^ cin) & m31;
+        let right = (y ^ cin) & m31;
+        let carry = left & right;
+        (sum, left, right, carry)
+    }
+
+    struct WW {
+        pending: u64,
+        used: usize,
+        word: usize,
+    }
+
+    fn wpush(w: &mut WW, out: &mut [u64], value: u64, width: usize) {
+        let value = if width == 64 {
+            value
+        } else {
+            value & ((1u64 << width) - 1)
+        };
+        if w.used == 0 && width == 64 {
+            out[w.word] = value;
+            w.word += 1;
+            return;
+        }
+        let room = 64 - w.used;
+        if width < room {
+            w.pending |= value << w.used;
+            w.used += width;
+        } else {
+            out[w.word] = w.pending | (value << w.used);
+            w.word += 1;
+            if width == room {
+                w.pending = 0;
+                w.used = 0;
+            } else {
+                w.pending = value >> room;
+                w.used = width - room;
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn push_g_record(
+        w: &mut WW,
+        out: &mut [u64],
+        f0: u32,
+        f1: u32,
+        f2: u32,
+        f3: u32,
+        f4: u32,
+        f5: u32,
+        lin0: u32,
+        lin1: u32,
+    ) {
+        let r0 = f0 as u64 | ((f1 as u64) << 31) | (((f2 as u64) & 0x3) << 62);
+        let r1 = ((f2 as u64) >> 2) | ((f3 as u64) << 29) | (((f4 as u64) & 0xF) << 60);
+        // lin0 is a full 32-bit field at record bit 186: bits 0..5 land in
+        // word 2 (58..63), bits 6..31 spill into word 3 (0..25).
+        let r2 = ((f4 as u64) >> 4) | ((f5 as u64) << 27) | (((lin0 as u64) & 0x3F) << 58);
+        let r3 = ((lin0 as u64) >> 6) | ((lin1 as u64) << 26);
+        wpush(w, out, r0, 64);
+        wpush(w, out, r1, 64);
+        wpush(w, out, r2, 64);
+        wpush(w, out, r3, 58);
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn witgen_g(
+        s: &mut [u32; 16],
+        m: &[u32; 16],
+        la: usize,
+        lb: usize,
+        lc: usize,
+        ld: usize,
+        mi0: usize,
+        mi1: usize,
+        wz: &mut WW,
+        zrow: &mut [u64],
+        wa: &mut WW,
+        arow: &mut [u64],
+        wb: &mut WW,
+        brow: &mut [u64],
+    ) {
+        let av = s[la];
+        let bv = s[lb];
+        let cvv = s[lc];
+        let dv = s[ld];
+        let (t0, l0, r0v, c0) = wacp(av, bv);
+        let (a1, l1, r1b, c1) = wacp(t0, m[mi0]);
+        let d1 = wrotr(dv ^ a1, 16);
+        let (c1v, l2, r2b, c2) = wacp(cvv, d1);
+        let b1 = wrotr(bv ^ c1v, 12);
+        let (t1, l3, r3b, c3) = wacp(a1, b1);
+        let (a2, l4, r4b, c4) = wacp(t1, m[mi1]);
+        let d2 = wrotr(d1 ^ a2, 8);
+        let (c2v, l5, r5b, c5) = wacp(c1v, d2);
+        let bnew = wrotr(b1 ^ c2v, 7);
+        let dnew = d2;
+        push_g_record(wz, zrow, c0, c1, c2, c3, c4, c5, bnew, dnew);
+        push_g_record(wa, arow, l0, l1, l2, l3, l4, l5, bnew, dnew);
+        push_g_record(wb, brow, r0v, r1b, r2b, r3b, r4b, r5b, u32::MAX, u32::MAX);
+        s[la] = a2;
+        s[lb] = bnew;
+        s[lc] = c2v;
+        s[ld] = dnew;
+    }
+
+    fn kernel_emu_block(
+        cv: &[u32; 8],
+        m: &[u32; 16],
+        t: u64,
+        bl: u32,
+        fl: u32,
+    ) -> ([u64; 256], [u64; 256], [u64; 256]) {
+        let mut zrow = [0u64; 256];
+        let mut arow = [0u64; 256];
+        let mut brow = [0u64; 256];
+        let tlo = t as u32;
+        let thi = (t >> 32) as u32;
+
+        // Prefix: words 0..4 = cv pairs (z/a), MAX (b); words 8..18 = the
+        // message region (z/a), MAX (b).
+        for i in 0..4 {
+            let v = cv[2 * i] as u64 | ((cv[2 * i + 1] as u64) << 32);
+            zrow[i] = v;
+            arow[i] = v;
+            brow[i] = u64::MAX;
+        }
+        let mut values = [0u32; 20];
+        for (i, v) in values.iter_mut().enumerate() {
+            *v = if i < 16 { m[i] } else { 0 };
+        }
+        values[16] = tlo;
+        values[17] = thi;
+        values[18] = bl;
+        values[19] = fl;
+        for i in 0..10 {
+            let lo = if i == 0 {
+                1u64
+            } else {
+                (values[2 * i - 1] >> 31) as u64
+            };
+            let v = lo | ((values[2 * i] as u64) << 1) | ((values[2 * i + 1] as u64) << 33);
+            zrow[8 + i] = v;
+            arow[8 + i] = v;
+            brow[8 + i] = u64::MAX;
+        }
+
+        // Compression state.
+        let mut s = [0u32; 16];
+        for (i, v) in s.iter_mut().enumerate() {
+            *v = if i < 8 { cv[i] } else { WITGEN_IV[i - 8] };
+        }
+        s[12] = tlo;
+        s[13] = thi;
+        s[14] = bl;
+        s[15] = fl;
+
+        // Writers start at u64 word 18 with one pending bit.
+        let mut wz = WW {
+            pending: (fl >> 31) as u64,
+            used: 1,
+            word: 18,
+        };
+        let mut wa = WW {
+            pending: (fl >> 31) as u64,
+            used: 1,
+            word: 18,
+        };
+        let mut wb = WW {
+            pending: 1,
+            used: 1,
+            word: 18,
+        };
+
+        macro_rules! g {
+            ($la:expr, $lb:expr, $lc:expr, $ld:expr, $a:expr, $b:expr) => {
+                witgen_g(
+                    &mut s,
+                    m,
+                    $la,
+                    $lb,
+                    $lc,
+                    $ld,
+                    $a,
+                    $b,
+                    &mut wz,
+                    &mut zrow,
+                    &mut wa,
+                    &mut arow,
+                    &mut wb,
+                    &mut brow,
+                )
+            };
+        }
+        // 7 rounds x 8 Gs (BLAKE3 message schedule) — same calls as the kernel.
+        g!(0, 4, 8, 12, 0, 1);
+        g!(1, 5, 9, 13, 2, 3);
+        g!(2, 6, 10, 14, 4, 5);
+        g!(3, 7, 11, 15, 6, 7);
+        g!(0, 5, 10, 15, 8, 9);
+        g!(1, 6, 11, 12, 10, 11);
+        g!(2, 7, 8, 13, 12, 13);
+        g!(3, 4, 9, 14, 14, 15);
+        g!(0, 4, 8, 12, 2, 6);
+        g!(1, 5, 9, 13, 3, 10);
+        g!(2, 6, 10, 14, 7, 0);
+        g!(3, 7, 11, 15, 4, 13);
+        g!(0, 5, 10, 15, 1, 11);
+        g!(1, 6, 11, 12, 12, 5);
+        g!(2, 7, 8, 13, 9, 14);
+        g!(3, 4, 9, 14, 15, 8);
+        g!(0, 4, 8, 12, 3, 4);
+        g!(1, 5, 9, 13, 10, 12);
+        g!(2, 6, 10, 14, 13, 2);
+        g!(3, 7, 11, 15, 7, 14);
+        g!(0, 5, 10, 15, 6, 5);
+        g!(1, 6, 11, 12, 9, 0);
+        g!(2, 7, 8, 13, 11, 15);
+        g!(3, 4, 9, 14, 8, 1);
+        g!(0, 4, 8, 12, 10, 7);
+        g!(1, 5, 9, 13, 12, 9);
+        g!(2, 6, 10, 14, 14, 3);
+        g!(3, 7, 11, 15, 13, 15);
+        g!(0, 5, 10, 15, 4, 0);
+        g!(1, 6, 11, 12, 11, 2);
+        g!(2, 7, 8, 13, 5, 8);
+        g!(3, 4, 9, 14, 1, 6);
+        g!(0, 4, 8, 12, 12, 13);
+        g!(1, 5, 9, 13, 9, 11);
+        g!(2, 6, 10, 14, 15, 10);
+        g!(3, 7, 11, 15, 14, 8);
+        g!(0, 5, 10, 15, 7, 2);
+        g!(1, 6, 11, 12, 5, 3);
+        g!(2, 7, 8, 13, 0, 1);
+        g!(3, 4, 9, 14, 6, 4);
+        g!(0, 4, 8, 12, 9, 14);
+        g!(1, 5, 9, 13, 11, 5);
+        g!(2, 6, 10, 14, 8, 12);
+        g!(3, 7, 11, 15, 15, 1);
+        g!(0, 5, 10, 15, 13, 3);
+        g!(1, 6, 11, 12, 0, 10);
+        g!(2, 7, 8, 13, 2, 6);
+        g!(3, 4, 9, 14, 4, 7);
+        g!(0, 4, 8, 12, 11, 15);
+        g!(1, 5, 9, 13, 5, 0);
+        g!(2, 6, 10, 14, 1, 9);
+        g!(3, 7, 11, 15, 8, 6);
+        g!(0, 5, 10, 15, 14, 10);
+        g!(1, 6, 11, 12, 2, 12);
+        g!(2, 7, 8, 13, 3, 4);
+        g!(3, 4, 9, 14, 7, 13);
+
+        // OUT_HI: 8 lin words state[w+8] ^ cv[w] (b gets MAX).
+        for w in 0..8 {
+            let v = s[w + 8] ^ cv[w];
+            wpush(&mut wz, &mut zrow, v as u64, 32);
+            wpush(&mut wa, &mut arow, v as u64, 32);
+            wpush(&mut wb, &mut brow, u64::MAX, 32);
+        }
+
+        // Finish: flush pending + zero suffix.
+        if wz.used != 0 {
+            zrow[wz.word] = wz.pending;
+            wz.word += 1;
+        }
+        for w in wz.word..256 {
+            zrow[w] = 0;
+        }
+        if wa.used != 0 {
+            arow[wa.word] = wa.pending;
+            wa.word += 1;
+        }
+        for w in wa.word..256 {
+            arow[w] = 0;
+        }
+        if wb.used != 0 {
+            brow[wb.word] = wb.pending;
+            wb.word += 1;
+        }
+        for w in wb.word..256 {
+            brow[w] = 0;
+        }
+
+        // out_lo: words 4..8 (z/a only; b stays MAX).
+        for i in 0..4 {
+            let v = (s[2 * i] ^ s[8 + 2 * i]) as u64
+                | (((s[2 * i + 1] ^ s[8 + 2 * i + 1]) as u64) << 32);
+            zrow[4 + i] = v;
+            arow[4 + i] = v;
+            brow[4 + i] = u64::MAX;
+        }
+        (zrow, arow, brow)
+    }
+
+    #[test]
+    fn witgen_kernel_emu_matches_scalar_stream_builder() {
+        let mut rng = Rng::new(0x51D0_0F11_5EED_51AD);
+        for _ in 0..32 {
+            let cv: [u32; 8] = std::array::from_fn(|_| rng.next_u32());
+            let m: [u32; 16] = std::array::from_fn(|_| rng.next_u32());
+            let t = ((rng.next_u32() as u64) << 32) | rng.next_u32() as u64;
+            let bl = rng.next_u32();
+            let fl = rng.next_u32();
+            let (zq, aq, bq) = kernel_emu_block(&cv, &m, t, bl, fl);
+            let mut z_ref = [0u64; 256];
+            let mut a_ref = [0u64; 256];
+            let mut b_ref = [0u64; 256];
+            build_block_witness_ab_stream_into(
+                &cv, &m, t, bl, fl, &mut z_ref, &mut a_ref, &mut b_ref,
+            );
+            if zq != z_ref {
+                let w = zq.iter().zip(&z_ref).position(|(x, y)| x != y).unwrap();
+                panic!(
+                    "z first diff u64 word {w}: emu={:#018x} ref={:#018x} w18..24 emu={:?} ref={:?} cv={cv:?} m={m:?} t={t} bl={bl} fl={fl}",
+                    zq[w], z_ref[w], &zq[18..24], &z_ref[18..24]
+                );
+            }
+            if aq != a_ref {
+                let w = aq.iter().zip(&a_ref).position(|(x, y)| x != y).unwrap();
+                panic!(
+                    "a first diff u64 word {w}: emu={:#018x} ref={:#018x} cv={cv:?} m={m:?} t={t} bl={bl} fl={fl}",
+                    aq[w], a_ref[w]
+                );
+            }
+            if bq != b_ref {
+                let w = bq.iter().zip(&b_ref).position(|(x, y)| x != y).unwrap();
+                panic!(
+                    "b first diff u64 word {w}: emu={:#018x} ref={:#018x} cv={cv:?} m={m:?} t={t} bl={bl} fl={fl}",
+                    bq[w], b_ref[w]
+                );
+            }
         }
     }
 }
