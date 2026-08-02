@@ -155,7 +155,6 @@ pub(super) unsafe fn butterfly_fused_3layer_row(
     ptr: *mut F128,
     eighth: usize,
     num_ntts: usize,
-    lanes: usize,
     r: usize,
     twiddles: &[F128; 7],
 ) {
@@ -163,14 +162,14 @@ pub(super) unsafe fn butterfly_fused_3layer_row(
     // SAFETY: forwarded caller contract; the cfg gate supplies `aes`.
     unsafe {
         if vector_resident_rows() {
-            aarch64::butterfly_fused_3layer_row(ptr, eighth, num_ntts, lanes, r, twiddles);
+            aarch64::butterfly_fused_3layer_row(ptr, eighth, num_ntts, r, twiddles);
             return;
         }
     }
 
     // SAFETY: forwarded caller contract.
     unsafe {
-        portable::butterfly_fused_3layer_row(ptr, eighth, num_ntts, lanes, r, twiddles);
+        portable::butterfly_fused_3layer_row(ptr, eighth, num_ntts, r, twiddles);
     }
 }
 
@@ -194,7 +193,7 @@ pub(super) unsafe fn butterfly_fused_3layer_rows(
     }
     unsafe {
         for r in row_start..row_end {
-            portable::butterfly_fused_3layer_row(ptr, eighth, num_ntts, num_ntts, r, twiddles);
+            portable::butterfly_fused_3layer_row(ptr, eighth, num_ntts, r, twiddles);
         }
     }
 }
@@ -328,7 +327,6 @@ pub(super) unsafe fn butterfly_fused_3layer_zero_root_row(
     ptr: *mut F128,
     eighth: usize,
     num_ntts: usize,
-    lanes: usize,
     r: usize,
     twiddles: &[F128; 7],
 ) {
@@ -336,16 +334,14 @@ pub(super) unsafe fn butterfly_fused_3layer_zero_root_row(
     // SAFETY: forwarded caller contract; the cfg gate supplies `aes`.
     unsafe {
         if vector_resident_rows() {
-            aarch64::butterfly_fused_3layer_zero_root_row(
-                ptr, eighth, num_ntts, lanes, r, twiddles,
-            );
+            aarch64::butterfly_fused_3layer_zero_root_row(ptr, eighth, num_ntts, r, twiddles);
             return;
         }
     }
 
     // SAFETY: forwarded caller contract.
     unsafe {
-        portable::butterfly_fused_3layer_zero_root_row(ptr, eighth, num_ntts, lanes, r, twiddles);
+        portable::butterfly_fused_3layer_zero_root_row(ptr, eighth, num_ntts, r, twiddles);
     }
 }
 
@@ -370,7 +366,7 @@ pub(super) unsafe fn butterfly_fused_3layer_zero_root_rows(
     unsafe {
         for r in row_start..row_end {
             portable::butterfly_fused_3layer_zero_root_row(
-                ptr, eighth, num_ntts, num_ntts, r, twiddles,
+                ptr, eighth, num_ntts, r, twiddles,
             );
         }
     }
@@ -450,49 +446,36 @@ mod aarch64_row_tests {
         let mut state = 0x4E54_5F52_4F57_5300;
         for &(eighth, num_ntts) in &[(1usize, 1usize), (1, 64), (2, 64), (4, 16), (3, 5)] {
             for r in 0..eighth.min(2) {
-                for lanes in [num_ntts, num_ntts.saturating_sub(7).max(1)] {
-                    let (base, tw) = fixture(&mut state, eighth, num_ntts, false);
+                let (base, tw) = fixture(&mut state, eighth, num_ntts, false);
 
-                    let mut want = base.clone();
-                    // SAFETY: buffer is 8 * eighth * num_ntts long, r < eighth,
-                    // lanes <= num_ntts.
-                    unsafe {
-                        portable::butterfly_fused_3layer_row(
-                            want.as_mut_ptr(),
-                            eighth,
-                            num_ntts,
-                            lanes,
-                            r,
-                            &tw,
-                        );
-                    }
-
-                    let mut got = base.clone();
-                    // SAFETY: same geometry; this module carries `aes` via cfg.
-                    unsafe {
-                        aarch64::butterfly_fused_3layer_row(
-                            got.as_mut_ptr(),
-                            eighth,
-                            num_ntts,
-                            lanes,
-                            r,
-                            &tw,
-                        );
-                    }
-
-                    assert_eq!(
-                        got, want,
-                        "fused3 row mismatch at eighth={eighth} num_ntts={num_ntts} \
-                         lanes={lanes} r={r}"
+                let mut want = base.clone();
+                // SAFETY: buffer is 8 * eighth * num_ntts long and r < eighth.
+                unsafe {
+                    portable::butterfly_fused_3layer_row(
+                        want.as_mut_ptr(),
+                        eighth,
+                        num_ntts,
+                        r,
+                        &tw,
                     );
-                    // Lanes beyond the processed prefix must be untouched.
-                    for row in 0..8 {
-                        for lane in lanes..num_ntts {
-                            let idx = (row * eighth + r) * num_ntts + lane;
-                            assert_eq!(got[idx], base[idx], "lane {lane} was written");
-                        }
-                    }
                 }
+
+                let mut got = base.clone();
+                // SAFETY: same geometry; this module carries `aes` via cfg.
+                unsafe {
+                    aarch64::butterfly_fused_3layer_row(
+                        got.as_mut_ptr(),
+                        eighth,
+                        num_ntts,
+                        r,
+                        &tw,
+                    );
+                }
+
+                assert_eq!(
+                    got, want,
+                    "fused3 row mismatch at eighth={eighth} num_ntts={num_ntts} r={r}"
+                );
             }
         }
     }
@@ -504,47 +487,41 @@ mod aarch64_row_tests {
         let mut state = 0x5A45_524F_524F_4F54;
         for &(eighth, num_ntts) in &[(1usize, 1usize), (1, 64), (2, 64), (4, 16), (3, 5)] {
             for r in 0..eighth.min(2) {
-                for lanes in [num_ntts, num_ntts.saturating_sub(7).max(1)] {
-                    let (base, tw) = fixture(&mut state, eighth, num_ntts, true);
+                let (base, tw) = fixture(&mut state, eighth, num_ntts, true);
 
-                    let mut want = base.clone();
-                    // SAFETY: geometry as above; twiddles 0/1/3 are zero.
-                    unsafe {
-                        portable::butterfly_fused_3layer_zero_root_row(
-                            want.as_mut_ptr(),
-                            eighth,
-                            num_ntts,
-                            lanes,
-                            r,
-                            &tw,
-                        );
-                    }
-
-                    let mut got = base.clone();
-                    // SAFETY: geometry as above; twiddles 0/1/3 are zero.
-                    unsafe {
-                        aarch64::butterfly_fused_3layer_zero_root_row(
-                            got.as_mut_ptr(),
-                            eighth,
-                            num_ntts,
-                            lanes,
-                            r,
-                            &tw,
-                        );
-                    }
-
-                    assert_eq!(
-                        got, want,
-                        "zero-root row mismatch at eighth={eighth} num_ntts={num_ntts} \
-                         lanes={lanes} r={r}"
+                let mut want = base.clone();
+                // SAFETY: geometry as above; twiddles 0/1/3 are zero.
+                unsafe {
+                    portable::butterfly_fused_3layer_zero_root_row(
+                        want.as_mut_ptr(),
+                        eighth,
+                        num_ntts,
+                        r,
+                        &tw,
                     );
-                    // Lanes beyond the processed prefix must be untouched.
-                    for row in 0..8 {
-                        for lane in lanes..num_ntts {
-                            let idx = (row * eighth + r) * num_ntts + lane;
-                            assert_eq!(got[idx], base[idx], "lane {lane} was written");
-                        }
-                    }
+                }
+
+                let mut got = base.clone();
+                // SAFETY: geometry as above; twiddles 0/1/3 are zero.
+                unsafe {
+                    aarch64::butterfly_fused_3layer_zero_root_row(
+                        got.as_mut_ptr(),
+                        eighth,
+                        num_ntts,
+                        r,
+                        &tw,
+                    );
+                }
+
+                assert_eq!(
+                    got, want,
+                    "zero-root row mismatch at eighth={eighth} num_ntts={num_ntts} r={r}"
+                );
+
+                // Row stream zero must be unchanged by either implementation.
+                for lane in 0..num_ntts {
+                    let idx = r * num_ntts + lane;
+                    assert_eq!(got[idx], base[idx], "row 0 was written");
                 }
             }
         }
