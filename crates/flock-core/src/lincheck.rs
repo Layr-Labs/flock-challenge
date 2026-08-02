@@ -132,12 +132,6 @@ pub use kernels::{
     partial_fold_packed_z_neon_iblock_padded, partial_fold_packed_z_neon_oblock_padded,
     partial_fold_packed_z_neon_single, partial_fold_packed_z_neon_single_padded,
 };
-#[cfg(target_arch = "aarch64")]
-#[cfg_attr(not(target_os = "macos"), allow(unused_imports))]
-pub(crate) use kernels::{
-    oblock_claim_count, oblock_claim_stripe_base, partial_fold_packed_z_neon_oblock_padded_range,
-    partial_fold_packed_z_neon_oblock_padded_suffix,
-};
 
 /// Bench-only A/B toggle: when set, [`partial_fold_packed_z_best`] uses the legacy
 /// `i_inner`-partitioned `partial_fold_packed_z_neon_iblock_padded` instead of the
