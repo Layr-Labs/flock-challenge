@@ -76,6 +76,81 @@ pub(crate) fn warmup_latch_cache_enabled() -> bool {
 /// restoring the incumbent kernel selection as the same-binary control.
 pub const ENV_NO_NTT_PASS_TUNE: &str = "FLOCK_NO_NTT_PASS_TUNE";
 
+/// Exact-`1` rollback for the ranked from-`z` first-pass table preload. The
+/// 15 KiB l=0/B=0 nibble table is expanded once into the otherwise-dead
+/// Merkle buffer, then cooperatively copied into threadgroup memory by each
+/// radix-16 group. Only exact `1` restores the incumbent kernel.
+pub const ENV_NO_GPU_FROM_Z_PRELOAD_TABLE: &str = "FLOCK_NO_GPU_FROM_Z_PRELOAD_TABLE";
+
+fn gpu_from_z_preload_value_enabled(value: Option<&std::ffi::OsStr>) -> bool {
+    value != Some(std::ffi::OsStr::new("1"))
+}
+
+fn gpu_from_z_preload_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        gpu_from_z_preload_value_enabled(
+            std::env::var_os(ENV_NO_GPU_FROM_Z_PRELOAD_TABLE).as_deref(),
+        )
+    })
+}
+
+fn select_gpu_from_z_preload(
+    log_d: usize,
+    num_ntts: usize,
+    l: usize,
+    f: usize,
+    pass_tune: bool,
+    preload_enabled: bool,
+) -> bool {
+    preload_enabled && pass_tune && log_d == 20 && num_ntts == 64 && l == 0 && f == 4
+}
+
+#[inline]
+fn gpu_from_z_preload_selected(log_d: usize) -> bool {
+    select_gpu_from_z_preload(
+        log_d,
+        64,
+        0,
+        4,
+        pass_tune_enabled(),
+        gpu_from_z_preload_enabled(),
+    )
+}
+
+#[cfg(test)]
+mod from_z_preload_gate_tests {
+    use std::ffi::OsStr;
+
+    #[test]
+    fn exact_one_rollback_and_ranked_shape_only() {
+        assert!(!super::gpu_from_z_preload_value_enabled(Some(OsStr::new("1"))));
+        for value in [None, Some(""), Some("0"), Some("01"), Some("true")] {
+            assert!(super::gpu_from_z_preload_value_enabled(value.map(OsStr::new)));
+        }
+        assert!(super::select_gpu_from_z_preload(20, 64, 0, 4, true, true));
+        assert!(!super::select_gpu_from_z_preload(20, 64, 0, 4, false, true));
+        assert!(!super::select_gpu_from_z_preload(20, 64, 0, 4, true, false));
+        assert!(!super::select_gpu_from_z_preload(19, 64, 0, 4, true, true));
+        assert!(!super::select_gpu_from_z_preload(20, 32, 0, 4, true, true));
+        assert!(!super::select_gpu_from_z_preload(20, 64, 1, 4, true, true));
+        assert!(!super::select_gpu_from_z_preload(20, 64, 0, 3, true, true));
+    }
+
+    #[test]
+    fn ranked_static_work_accounting() {
+        // Incumbent group: 15 bases × (0+4+8+12) mulx plus 960 table
+        // entries × 4 mulx. Ranked g4 launches 2^(20-6) groups.
+        const MULX_PER_GROUP: usize = 15 * (0 + 4 + 8 + 12) + 15 * 64 * 4;
+        const GROUPS: usize = 1 << (20 - 6);
+        const TABLE_BYTES: usize = 15 * 64 * 16;
+        assert_eq!(MULX_PER_GROUP, 4_200);
+        assert_eq!(MULX_PER_GROUP * GROUPS, 68_812_800);
+        assert_eq!(GROUPS, 16_384); // also one barrier removed per group
+        assert_eq!(TABLE_BYTES * GROUPS, 240 * 1024 * 1024);
+    }
+}
+
 /// Disable only the mixed-algebra ranked final NTT pass, restoring the
 /// incumbent h8 kernel as a same-binary control.
 pub const ENV_NO_GPU_MIXED_FINAL: &str = "FLOCK_NO_GPU_MIXED_FINAL";
@@ -1527,6 +1602,139 @@ kernel void parent_hash3(device const uint* children [[buffer(0)]],
 
 "#;
 
+    /// Source-only ranked from-z specialization. Keeping these
+    /// two small kernels in a supplemental library leaves the incumbent MSL
+    /// and embedded metallib untouched. The library is compiled only while
+    /// the exact rollback is not active, during untimed GPU initialization.
+    const FROM_Z_PRELOAD_MSL_SOURCE: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+struct NttParams {
+    uint log_d;
+    uint l;
+    uint f;
+    uint s;
+};
+
+static inline uint4 gf_mulx_preload(uint4 v) {
+    uint carry = v.w >> 31;
+    uint4 r;
+    r.w = (v.w << 1) | (v.z >> 31);
+    r.z = (v.z << 1) | (v.y >> 31);
+    r.y = (v.y << 1) | (v.x >> 31);
+    r.x = (v.x << 1) ^ (carry * 0x87u);
+    return r;
+}
+
+static inline uint4 gf_shl16_preload(uint4 a) {
+    uint h = a.w >> 16;
+    uint4 r;
+    r.w = (a.w << 16) | (a.z >> 16);
+    r.z = (a.z << 16) | (a.y >> 16);
+    r.y = (a.y << 16) | (a.x >> 16);
+    r.x = (a.x << 16) ^ ((h << 7) ^ (h << 2) ^ (h << 1) ^ h);
+    return r;
+}
+
+static inline uint4 gf_mul_tab4_preload(
+    uint4 v,
+    threadgroup const uint4* tab)
+{
+    uint4 acc = uint4(0u);
+    for (int i = 7; i >= 0; i--) {
+        acc = gf_shl16_preload(acc);
+        uint h = (v[i >> 1] >> ((i & 1) * 16)) & 0xffffu;
+        acc ^= tab[h & 15u]
+             ^ tab[16u + ((h >> 4) & 15u)]
+             ^ tab[32u + ((h >> 8) & 15u)]
+             ^ tab[48u + (h >> 12)];
+    }
+    return acc;
+}
+
+// Expand the 15 raw l=0/B=0 twiddles into the exact 960-entry table layout
+// consumed by the incumbent kernel. One 64-thread group writes the first
+// 15 KiB of the otherwise-dead tree buffer once per first-pass graph.
+kernel void build_from_z_preload_table(
+    device const uint4* twiddles [[buffer(0)]],
+    device uint4* fixed_tabs     [[buffer(1)]],
+    uint lid [[thread_index_in_threadgroup]])
+{
+    constexpr uint NTW = 15u;
+    constexpr uint NTAB = NTW * 64u;
+    for (uint ei = lid; ei < NTAB; ei += 64u) {
+        uint t = ei >> 6;
+        uint sub = ei & 63u;
+        uint n = sub & 15u;
+        uint4 p = twiddles[t];
+        for (uint m = 0u; m < (sub >> 4) * 4u; m++) {
+            p = gf_mulx_preload(p);
+        }
+        uint4 val = uint4(0u);
+        for (uint k = 0u; k < 4u; k++) {
+            if ((n >> k) & 1u) { val ^= p; }
+            p = gf_mulx_preload(p);
+        }
+        fixed_tabs[ei] = val;
+    }
+}
+
+// Every ranked group reads the same immutable 15 KiB region, cooperatively
+// copies it in 15 coalesced waves, then uses the incumbent threadgroup lookup
+// arithmetic. This removes the per-group field/table build and one barrier.
+kernel void ntt_fused_reg4_from_zg4_preload(
+    device uint4* data             [[buffer(0)]],
+    device const uint4* fixed_tabs [[buffer(1)]],
+    constant NttParams& P          [[buffer(2)]],
+    device const uint4* z          [[buffer(3)]],
+    uint tgid [[threadgroup_position_in_grid]],
+    uint lid  [[thread_index_in_threadgroup]])
+{
+    constexpr uint F = 4u;
+    constexpr uint NF = 1u << F;
+    constexpr uint NTAB = 15u * 64u;
+    constexpr uint LOG_G = 2u;
+    threadgroup uint4 tabs[NTAB];
+
+    for (uint ei = lid; ei < NTAB; ei += 64u) {
+        tabs[ei] = fixed_tabs[ei];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    const uint lane = lid & 63u;
+    const uint r_base = tgid << LOG_G;
+    for (uint rr = 0u; rr < (1u << LOG_G); rr++) {
+        const uint r = r_base + rr;
+        uint4 elems[NF];
+
+        // Sub-layer 0 crosses the zero-padded half and is a pure copy.
+        for (uint e = 0u; e < NF / 2u; e++) {
+            elems[e] = z[(((e << P.s) + r) << 6) + lane];
+            elems[e + NF / 2u] = elems[e];
+        }
+
+        for (uint j = 1u; j < F; j++) {
+            uint bpos = F - 1u - j;
+            for (uint b = 0u; b < (NF >> 1); b++) {
+                uint low = b & ((1u << bpos) - 1u);
+                uint eu = ((b >> bpos) << (bpos + 1u)) | low;
+                uint ev = eu | (1u << bpos);
+                uint tsel = ((1u << j) - 1u) + (eu >> (F - j));
+                uint4 nu = elems[eu]
+                    ^ gf_mul_tab4_preload(elems[ev], &tabs[tsel << 6]);
+                elems[eu] = nu;
+                elems[ev] ^= nu;
+            }
+        }
+
+        for (uint e = 0u; e < NF; e++) {
+            data[((r + (e << P.s)) << 6) + lane] = elems[e];
+        }
+    }
+}
+"#;
+
     // -----------------------------------------------------------------------
     // Embedded precompiled metallib.
     //
@@ -1634,6 +1842,10 @@ kernel void parent_hash3(device const uint* children [[buffer(0)]],
         /// Pass-tuned variants: g4 shared-table from-z with the zero-region
         /// sub-layer skipped, and the half-footprint final-pass kernel.
         pub(crate) pso_ntt4zg4: Id,
+        /// Ranked first-pass table builder and cooperative preload kernel,
+        /// compiled from the supplemental source unless exactly rolled back.
+        pub(crate) pso_from_z_preload_build: Id,
+        pub(crate) pso_ntt4zg4_preload: Id,
         pub(crate) pso_ntt4h8: Id,
         pub(crate) pso_ntt5mix: Id,
         pub(crate) pso_leaf: Id,
@@ -1772,6 +1984,67 @@ kernel void parent_hash3(device const uint* children [[buffer(0)]],
                             p
                         }
                     };
+
+                // The exact rollback leaves the incumbent initialization path
+                // untouched. The candidate adds no persistent allocation;
+                // its small source compiles during untimed initialization.
+                let (pso_from_z_preload_build, pso_ntt4zg4_preload) =
+                    if cfg!(test) || super::gpu_from_z_preload_enabled() {
+                        let src = api.nsstring(FROM_Z_PRELOAD_MSL_SOURCE)?;
+                        let mut err: Id = NIL;
+                        let library: Id = send!(
+                            api,
+                            unsafe extern "C" fn(Id, Sel, Id, Id, *mut Id) -> Id,
+                            device,
+                            c"newLibraryWithSource:options:error:",
+                            src,
+                            NIL,
+                            &mut err
+                        );
+                        if library.is_null() {
+                            return Err(format!(
+                                "from-z preload shader compile failed: {}",
+                                api.error_string(err)
+                            ));
+                        }
+                        let build = |name: &str| -> Result<Id, String> {
+                            let ns = api.nsstring(name)?;
+                            let f: Id = send!(
+                                api,
+                                unsafe extern "C" fn(Id, Sel, Id) -> Id,
+                                library,
+                                c"newFunctionWithName:",
+                                ns
+                            );
+                            if f.is_null() {
+                                return Err(format!("from-z preload kernel {name} not found"));
+                            }
+                            let mut pso_err: Id = NIL;
+                            let pso: Id = send!(
+                                api,
+                                unsafe extern "C" fn(Id, Sel, Id, *mut Id) -> Id,
+                                device,
+                                c"newComputePipelineStateWithFunction:error:",
+                                f,
+                                &mut pso_err
+                            );
+                            send!(api, unsafe extern "C" fn(Id, Sel) -> Id, f, c"release");
+                            if pso.is_null() {
+                                Err(format!(
+                                    "from-z preload pipeline {name}: {}",
+                                    api.error_string(pso_err)
+                                ))
+                            } else {
+                                Ok(pso)
+                            }
+                        };
+                        let build_pso = build("build_from_z_preload_table")?;
+                        let preload_pso = build("ntt_fused_reg4_from_zg4_preload")?;
+                        send!(api, unsafe extern "C" fn(Id, Sel) -> Id, library, c"release");
+                        (build_pso, preload_pso)
+                    } else {
+                        (NIL, NIL)
+                    };
                 Ok(Gpu {
                     api,
                     device,
@@ -1782,6 +2055,8 @@ kernel void parent_hash3(device const uint* children [[buffer(0)]],
                     pso_ntt3,
                     pso_ntt4z,
                     pso_ntt4zg4,
+                    pso_from_z_preload_build,
+                    pso_ntt4zg4_preload,
                     pso_ntt4h8,
                     pso_ntt5mix,
                     pso_leaf,
@@ -1966,6 +2241,31 @@ kernel void parent_hash3(device const uint* children [[buffer(0)]],
             }
         }
 
+        #[cfg(test)]
+        pub(crate) unsafe fn pipeline_resources(&self, pso: Id) -> (u64, u64, u64) {
+            unsafe {
+                let static_tg: u64 = send!(
+                    self.api,
+                    unsafe extern "C" fn(Id, Sel) -> u64,
+                    pso,
+                    c"staticThreadgroupMemoryLength"
+                );
+                let simd_width: u64 = send!(
+                    self.api,
+                    unsafe extern "C" fn(Id, Sel) -> u64,
+                    pso,
+                    c"threadExecutionWidth"
+                );
+                let max_threads: u64 = send!(
+                    self.api,
+                    unsafe extern "C" fn(Id, Sel) -> u64,
+                    pso,
+                    c"maxTotalThreadsPerThreadgroup"
+                );
+                (static_tg, simd_width, max_threads)
+            }
+        }
+
         pub(crate) unsafe fn end_encoding(&self, enc: Id) {
             unsafe {
                 send!(self.api, unsafe extern "C" fn(Id, Sel), enc, c"endEncoding");
@@ -2046,6 +2346,155 @@ kernel void parent_hash3(device const uint* children [[buffer(0)]],
         pub(crate) l: u32,
         pub(crate) f: u32,
         pub(crate) s: u32,
+    }
+
+    /// One immutable decision per logical from-z first pass. Keeping table
+    /// construction on this plan makes it structurally impossible for the
+    /// streamed range encoder to rebuild the table per chunk.
+    #[derive(Clone, Copy)]
+    struct FromZFirstPassPlan {
+        preload: bool,
+    }
+
+    impl FromZFirstPassPlan {
+        fn new(log_d: usize) -> Self {
+            Self {
+                preload: super::gpu_from_z_preload_selected(log_d),
+            }
+        }
+
+        /// Encode the single table expansion for this logical first pass.
+        /// A separate encoder establishes an explicit write->read boundary
+        /// before any first-pass dispatch in the same command buffer.
+        unsafe fn encode_table_build(
+            self,
+            gpu: &Gpu,
+            cb: Id,
+            tw_buf: Id,
+            tree_buf: Id,
+        ) -> Result<(), String> {
+            if !self.preload {
+                return Ok(());
+            }
+            unsafe {
+                debug_assert!(!gpu.pso_from_z_preload_build.is_null());
+                let enc = gpu.compute_encoder(cb)?;
+                gpu.set_pipeline(enc, gpu.pso_from_z_preload_build);
+                gpu.set_buffer(enc, tw_buf, 0, 0);
+                gpu.set_buffer(enc, tree_buf, 0, 1);
+                gpu.dispatch(enc, 1, 64);
+                gpu.end_encoding(enc);
+            }
+            Ok(())
+        }
+
+        /// Encode one or more position ranges using the table built once by
+        /// the logical first-pass owner. `tree_buf` is read only in preload
+        /// mode and remains dead scratch until all first-pass ranges finish.
+        unsafe fn encode_range(
+            self,
+            gpu: &Gpu,
+            enc: Id,
+            staging: Id,
+            tw_buf: Id,
+            tree_buf: Id,
+            z_buf: Id,
+            log_d: usize,
+            byte_offset: usize,
+            r_count: usize,
+        ) {
+            let zg4 = super::pass_tune_enabled();
+            debug_assert!(!self.preload || zg4);
+            debug_assert!(!zg4 || r_count.is_multiple_of(4));
+            unsafe {
+                gpu.set_pipeline(
+                    enc,
+                    if self.preload {
+                        debug_assert!(!gpu.pso_ntt4zg4_preload.is_null());
+                        gpu.pso_ntt4zg4_preload
+                    } else if zg4 {
+                        gpu.pso_ntt4zg4
+                    } else {
+                        gpu.pso_ntt4z
+                    },
+                );
+                gpu.set_buffer(enc, staging, byte_offset, 0);
+                gpu.set_buffer(enc, if self.preload { tree_buf } else { tw_buf }, 0, 1);
+                let p = NttParams {
+                    log_d: log_d as u32,
+                    l: 0,
+                    f: 4,
+                    s: (log_d - 4) as u32,
+                };
+                let bytes = core::slice::from_raw_parts(
+                    (&p as *const NttParams).cast::<u8>(),
+                    core::mem::size_of::<NttParams>(),
+                );
+                gpu.set_bytes(enc, bytes, 2);
+                gpu.set_buffer(enc, z_buf, byte_offset, 3);
+                gpu.dispatch(enc, (r_count >> if zg4 { 2 } else { 0 }) as u64, 64);
+            }
+        }
+    }
+
+    /// Queue the streamed path's one preload build before any range command
+    /// buffer. The process-persistent Metal queue is serial, so every later
+    /// range observes the completed table without a host wait. The retained
+    /// command buffer is drained with the other stream buffers.
+    unsafe fn queue_from_z_table_build(
+        gpu: &Gpu,
+        first_pass: FromZFirstPassPlan,
+        tw_buf: Id,
+        tree_buf: Id,
+    ) -> Result<Option<Id>, String> {
+        if !first_pass.preload {
+            return Ok(None);
+        }
+        unsafe {
+            let pool = gpu.pool_push();
+            let result = (|| -> Result<Id, String> {
+                let cb = gpu.command_buffer()?;
+                first_pass.encode_table_build(gpu, cb, tw_buf, tree_buf)?;
+                let cb = gpu.retain(cb);
+                gpu.commit_async(cb);
+                Ok(cb)
+            })();
+            gpu.pool_pop(pool);
+            result.map(Some)
+        }
+    }
+
+    /// Scaled real-Metal oracle entrypoint. Production selection remains
+    /// ranked-only; tests force the identical build+preload pair at a compact
+    /// shape so every table entry and output byte can be checked cheaply.
+    #[cfg(test)]
+    pub(crate) unsafe fn encode_from_z_preload_for_test(
+        gpu: &Gpu,
+        cb: Id,
+        staging: Id,
+        tw_buf: Id,
+        tree_buf: Id,
+        z_buf: Id,
+        log_d: usize,
+    ) -> Result<(), String> {
+        unsafe {
+            let first_pass = FromZFirstPassPlan { preload: true };
+            first_pass.encode_table_build(gpu, cb, tw_buf, tree_buf)?;
+            let enc = gpu.compute_encoder(cb)?;
+            first_pass.encode_range(
+                gpu,
+                enc,
+                staging,
+                tw_buf,
+                tree_buf,
+                z_buf,
+                log_d,
+                0,
+                1usize << (log_d - 4),
+            );
+            gpu.end_encoding(enc);
+        }
+        Ok(())
     }
 
     /// Encode the fused NTT passes for `layers [start_layer, log_d)` over a
@@ -2484,6 +2933,7 @@ kernel void parent_hash3(device const uint* children [[buffer(0)]],
         staging: Id,
         tw_buf: Id,
         tree_buf: Id,
+        first_pass: FromZFirstPassPlan,
         log_d: usize,
         n_leaves: usize,
         next_r: usize,
@@ -2535,26 +2985,17 @@ kernel void parent_hash3(device const uint* children [[buffer(0)]],
                 let result = (|| -> Result<Id, String> {
                     let cb = self.gpu.command_buffer()?;
                     let enc = self.gpu.compute_encoder(cb)?;
-                    let zg4 = super::pass_tune_enabled();
-                    self.gpu.set_pipeline(
+                    self.first_pass.encode_range(
+                        self.gpu,
                         enc,
-                        if zg4 { self.gpu.pso_ntt4zg4 } else { self.gpu.pso_ntt4z },
+                        self.staging,
+                        self.tw_buf,
+                        self.tree_buf,
+                        self.z_buf,
+                        self.log_d,
+                        byte_offset,
+                        r_count,
                     );
-                    self.gpu.set_buffer(enc, self.staging, byte_offset, 0);
-                    self.gpu.set_buffer(enc, self.tw_buf, 0, 1);
-                    let p = NttParams {
-                        log_d: self.log_d as u32,
-                        l: 0,
-                        f: 4,
-                        s: (self.log_d - 4) as u32,
-                    };
-                    let bytes = core::slice::from_raw_parts(
-                        (&p as *const NttParams).cast::<u8>(),
-                        core::mem::size_of::<NttParams>(),
-                    );
-                    self.gpu.set_bytes(enc, bytes, 2);
-                    self.gpu.set_buffer(enc, self.z_buf, byte_offset, 3);
-                    self.gpu.dispatch(enc, (r_count >> if zg4 { 2 } else { 0 }) as u64, 64);
                     self.gpu.end_encoding(enc);
                     // `commandBuffer` is autoreleased. Retain it before
                     // popping this short-lived pool because completion is
@@ -2715,16 +3156,32 @@ kernel void parent_hash3(device const uint* children [[buffer(0)]],
                 _ => 0,
             }
         };
+        let first_pass = FromZFirstPassPlan::new(params.k_code());
+        let mut pending = Vec::with_capacity(9);
+        match unsafe {
+            queue_from_z_table_build(gpu, first_pass, state.tw_buf, state.tree_buf)
+        } {
+            Ok(Some(cb)) => pending.push(cb),
+            Ok(None) => {}
+            Err(e) => {
+                if debug_enabled() {
+                    eprintln!("[gpu-commit] streamed from-z table build failed ({e})");
+                }
+                STAGING_IN_USE.store(false, Ordering::Release);
+                return None;
+            }
+        }
         Some(FromZFirstPassStream {
             gpu,
             z_buf,
             staging: state.staging,
             tw_buf: state.tw_buf,
             tree_buf: state.tree_buf,
+            first_pass,
             log_d: params.k_code(),
             n_leaves: params.n_leaves(),
             next_r: 0,
-            pending: Vec::with_capacity(8),
+            pending,
             failed: None,
             owns_lease: true,
             started: std::time::Instant::now(),
@@ -2891,33 +3348,25 @@ kernel void parent_hash3(device const uint* children [[buffer(0)]],
         unsafe {
             let pool = gpu.pool_push();
             let r = (|| {
+                let first_pass = FromZFirstPassPlan::new(log_d);
                 let cb = gpu.command_buffer()?;
+                // Exactly one table build per logical first pass. Ending this
+                // encoder before the graph encoder makes the tree-scratch
+                // write visible before the preload kernel reads it.
+                first_pass.encode_table_build(gpu, cb, tw_buf, tree_buf)?;
                 let enc = gpu.compute_encoder(cb)?;
                 // Pass 1: layers 0..3 from z.
-                // From-z tiles all live in block B = 0 (l = 0), so the g4
-                // table-reuse idiom applies; the tuned kernel also skips the
-                // zero-region sub-layer (a pure copy).
-                let zg4 = super::pass_tune_enabled();
-                gpu.set_pipeline(enc, if zg4 { gpu.pso_ntt4zg4 } else { gpu.pso_ntt4z });
-                gpu.set_buffer(enc, staging, 0, 0);
-                gpu.set_buffer(enc, tw_buf, 0, 1);
-                let p = NttParams {
-                    log_d: log_d as u32,
-                    l: 0,
-                    f: 4,
-                    s: (log_d - 4) as u32,
-                };
-                let bytes = core::slice::from_raw_parts(
-                    (&p as *const NttParams).cast::<u8>(),
-                    core::mem::size_of::<NttParams>(),
+                first_pass.encode_range(
+                    gpu,
+                    enc,
+                    staging,
+                    tw_buf,
+                    tree_buf,
+                    z_buf,
+                    log_d,
+                    0,
+                    1usize << (log_d - 4),
                 );
-                gpu.set_bytes(enc, bytes, 2);
-                gpu.set_buffer(enc, z_buf, 0, 3);
-                if zg4 {
-                    gpu.dispatch(enc, 1u64 << (log_d - 6), 64);
-                } else {
-                    gpu.dispatch(enc, 1u64 << (log_d - 4), 64);
-                }
                 // Passes 2..: layers 4..log_d in place over staging.
                 encode_ntt_passes(gpu, enc, staging, tw_buf, log_d, 4);
                 encode_merkle(gpu, enc, staging, tree_buf, n_leaves);
@@ -2975,35 +3424,28 @@ kernel void parent_hash3(device const uint* children [[buffer(0)]],
         z_buf: Id,
         staging: Id,
         tw_buf: Id,
+        tree_buf: Id,
         log_d: usize,
     ) -> Result<(), String> {
         unsafe {
+            let first_pass = FromZFirstPassPlan::new(log_d);
             let cb1 = gpu.command_buffer()?;
+            // Rebuild on every blocking first-pass invocation: autotune
+            // reprimes and stale-early recovery may follow a Merkle graph
+            // that overwrote the tree-scratch table.
+            first_pass.encode_table_build(gpu, cb1, tw_buf, tree_buf)?;
             let enc = gpu.compute_encoder(cb1)?;
-            // From-z tiles all live in block B = 0 (l = 0), so the g4
-            // table-reuse idiom applies; the tuned kernel also skips
-            // the zero-region sub-layer (a pure copy).
-            let zg4 = super::pass_tune_enabled();
-            gpu.set_pipeline(enc, if zg4 { gpu.pso_ntt4zg4 } else { gpu.pso_ntt4z });
-            gpu.set_buffer(enc, staging, 0, 0);
-            gpu.set_buffer(enc, tw_buf, 0, 1);
-            let p = NttParams {
-                log_d: log_d as u32,
-                l: 0,
-                f: 4,
-                s: (log_d - 4) as u32,
-            };
-            let bytes = core::slice::from_raw_parts(
-                (&p as *const NttParams).cast::<u8>(),
-                core::mem::size_of::<NttParams>(),
+            first_pass.encode_range(
+                gpu,
+                enc,
+                staging,
+                tw_buf,
+                tree_buf,
+                z_buf,
+                log_d,
+                0,
+                1usize << (log_d - 4),
             );
-            gpu.set_bytes(enc, bytes, 2);
-            gpu.set_buffer(enc, z_buf, 0, 3);
-            if zg4 {
-                gpu.dispatch(enc, 1u64 << (log_d - 6), 64);
-            } else {
-                gpu.dispatch(enc, 1u64 << (log_d - 4), 64);
-            }
             gpu.end_encoding(enc);
             gpu.commit_and_wait(cb1)
         }
@@ -3080,7 +3522,7 @@ kernel void parent_hash3(device const uint* children [[buffer(0)]],
                 if !first_pass_done {
                     // cb1: shared top pass, full range.
                     debug_assert!(pre_cb2.is_none());
-                    run_from_z_first_pass(gpu, z_buf, staging, tw_buf, log_d)?;
+                    run_from_z_first_pass(gpu, z_buf, staging, tw_buf, tree_buf, log_d)?;
                 }
 
                 // cb2: GPU prefix — remaining passes + aligned subtrees.
@@ -3582,7 +4024,9 @@ kernel void parent_hash3(device const uint* children [[buffer(0)]],
         let first_pass_ms = if streamed_probe && !canonical_reprime {
             let c = &ctx;
             let t0 = std::time::Instant::now();
-            match unsafe { run_from_z_first_pass(c.gpu, c.z_buf, c.staging, c.tw_buf, log_d) } {
+            match unsafe {
+                run_from_z_first_pass(c.gpu, c.z_buf, c.staging, c.tw_buf, c.tree_buf, log_d)
+            } {
                 Ok(()) => t0.elapsed().as_secs_f64() * 1e3,
                 Err(e) => {
                     if dbg {
@@ -3600,7 +4044,9 @@ kernel void parent_hash3(device const uint* children [[buffer(0)]],
             if canonical_reprime {
                 let c = &ctx;
                 unsafe {
-                    run_from_z_first_pass(c.gpu, c.z_buf, c.staging, c.tw_buf, log_d)?;
+                    run_from_z_first_pass(
+                        c.gpu, c.z_buf, c.staging, c.tw_buf, c.tree_buf, log_d,
+                    )?;
                 }
             }
             let t0 = std::time::Instant::now();
@@ -3797,6 +4243,7 @@ kernel void parent_hash3(device const uint* children [[buffer(0)]],
                 ctx.z_buf,
                 ctx.staging,
                 ctx.tw_buf,
+                ctx.tree_buf,
                 params.k_code(),
             )
         };
@@ -3947,8 +4394,18 @@ kernel void parent_hash3(device const uint* children [[buffer(0)]],
         }
     }
 
-    /// Cache key component tying entries to the exact GPU kernel source.
-    const WARMUP_CACHE_MSL_FNV: u64 = fnv1a64(MSL_SOURCE);
+    /// Cache key component tying entries to the exact selected GPU kernel
+    /// source. Candidate and exact-rollback workers must never consume each
+    /// other's latch/tune result even though the incumbent metallib is the
+    /// same in both processes.
+    fn warmup_cache_msl_fnv() -> u64 {
+        let base = fnv1a64(MSL_SOURCE);
+        if super::gpu_from_z_preload_selected(20) {
+            base ^ fnv1a64(FROM_Z_PRELOAD_MSL_SOURCE).rotate_left(1)
+        } else {
+            base
+        }
+    }
 
     struct WarmupCache {
         latch_on: bool,
@@ -3978,7 +4435,7 @@ kernel void parent_hash3(device const uint* children [[buffer(0)]],
         if take_u64(&bytes)? != warmup_cache_magic() {
             return None;
         }
-        if take_u64(&bytes)? != WARMUP_CACHE_MSL_FNV {
+        if take_u64(&bytes)? != warmup_cache_msl_fnv() {
             return None;
         }
         if take_u64(&bytes)? != log_d as u64 || take_u64(&bytes)? != n_leaves as u64 {
@@ -4021,7 +4478,7 @@ kernel void parent_hash3(device const uint* children [[buffer(0)]],
         let mut buf = Vec::with_capacity(64 + core::mem::size_of::<Hash>());
         for v in [
             warmup_cache_magic(),
-            WARMUP_CACHE_MSL_FNV,
+            warmup_cache_msl_fnv(),
             log_d as u64,
             n_leaves as u64,
             u64::from(latch_on),
@@ -4580,6 +5037,7 @@ kernel void parent_hash3(device const uint* children [[buffer(0)]],
                             stream.z_buf,
                             stream.staging,
                             stream.tw_buf,
+                            stream.tree_buf,
                             stream.log_d,
                         )
                         .and_then(|()| {
@@ -5096,6 +5554,168 @@ mod tests {
                 data, expect,
                 "GPU NTT mismatch at log_d={log_d} start={start_layer}"
             );
+        }
+    }
+
+    /// Compact real-Metal oracle for the ranked first-pass specialization.
+    /// It forces the production build+preload kernels at dimension 8, checks
+    /// all 960 scratch-table entries, compares the first pass with both the
+    /// incumbent g4 kernel and scalar CPU, then proves that the subsequent
+    /// NTT+Merkle graph safely overwrites scratch with the exact full tree.
+    #[test]
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    fn gpu_from_z_preload_table_codeword_and_tree_match_scaled() {
+        use super::imp;
+        use crate::field::mul_by_x;
+
+        let log_d = 8usize;
+        let n_leaves = 1usize << log_d;
+        let ntt = AdditiveNttF128::standard(log_d);
+        let mut rng = Rng::new(0xA11C_F20A_7AB1_E008);
+        let z = rng.vec(64 << (log_d - 1));
+
+        let mut expect_first = vec![F128::ZERO; 64 << log_d];
+        crate::pcs::commit::replicate_message_fill(&mut expect_first, &z);
+        ntt.forward_transform_interleaved_block_range(&mut expect_first, 64, 1, 4, 0, 2);
+        let mut expect_full = vec![F128::ZERO; 64 << log_d];
+        crate::pcs::commit::replicate_message_fill(&mut expect_full, &z);
+        ntt.forward_transform_interleaved_scalar_from_layer(&mut expect_full, 64, 1);
+        let expect_bytes = unsafe {
+            core::slice::from_raw_parts(
+                expect_full.as_ptr().cast::<u8>(),
+                core::mem::size_of_val(expect_full.as_slice()),
+            )
+        };
+        let expect_tree = crate::merkle::merkle_tree(
+            expect_bytes,
+            n_leaves,
+            crate::merkle::HashKind::Blake3,
+        );
+
+        let gpu = match gpu_or_skip(imp::gpu().map(|g| g as *const imp::Gpu)) {
+            Some(g) => unsafe { &*g },
+            None => return,
+        };
+        let twiddles = flat_twiddle_table(&ntt, log_d);
+        let mut expect_table = vec![F128::ZERO; 15 * 64];
+        for t in 0..15 {
+            let mut base = twiddles[t];
+            for bank in 0..4 {
+                let mut powers = [F128::ZERO; 4];
+                powers[0] = base;
+                for bit in 1..4 {
+                    powers[bit] = mul_by_x(powers[bit - 1]);
+                }
+                for nibble in 0..16 {
+                    let mut value = F128::ZERO;
+                    for (bit, &power) in powers.iter().enumerate() {
+                        if nibble & (1 << bit) != 0 {
+                            value += power;
+                        }
+                    }
+                    expect_table[t * 64 + bank * 16 + nibble] = value;
+                }
+                for _ in 0..4 {
+                    base = mul_by_x(base);
+                }
+            }
+        }
+
+        unsafe {
+            let pool = gpu.pool_push();
+            let data_bytes = core::mem::size_of_val(expect_first.as_slice());
+            let tree_bytes = (2 * n_leaves - 1) * 32;
+            assert!(tree_bytes >= core::mem::size_of_val(expect_table.as_slice()));
+            let candidate = gpu.new_buffer(data_bytes).unwrap();
+            let incumbent = gpu.new_buffer(data_bytes).unwrap();
+            let tw_buf = gpu
+                .new_buffer(core::mem::size_of_val(twiddles.as_slice()))
+                .unwrap();
+            let z_buf = gpu
+                .new_buffer(core::mem::size_of_val(z.as_slice()))
+                .unwrap();
+            let tree_buf = gpu.new_buffer(tree_bytes).unwrap();
+            std::ptr::copy_nonoverlapping(
+                twiddles.as_ptr().cast::<u8>(),
+                gpu.buffer_contents(tw_buf),
+                core::mem::size_of_val(twiddles.as_slice()),
+            );
+            std::ptr::copy_nonoverlapping(
+                z.as_ptr().cast::<u8>(),
+                gpu.buffer_contents(z_buf),
+                core::mem::size_of_val(z.as_slice()),
+            );
+            std::ptr::write_bytes(gpu.buffer_contents(tree_buf), 0xA5, tree_bytes);
+
+            let cb = gpu.command_buffer().unwrap();
+            imp::encode_from_z_preload_for_test(
+                gpu, cb, candidate, tw_buf, tree_buf, z_buf, log_d,
+            )
+            .unwrap();
+            gpu.commit_and_wait(cb).unwrap();
+
+            let cb = gpu.command_buffer().unwrap();
+            let enc = gpu.compute_encoder(cb).unwrap();
+            gpu.set_pipeline(enc, gpu.pso_ntt4zg4);
+            gpu.set_buffer(enc, incumbent, 0, 0);
+            gpu.set_buffer(enc, tw_buf, 0, 1);
+            let p = imp::NttParams {
+                log_d: log_d as u32,
+                l: 0,
+                f: 4,
+                s: (log_d - 4) as u32,
+            };
+            let p_bytes = core::slice::from_raw_parts(
+                (&p as *const imp::NttParams).cast::<u8>(),
+                core::mem::size_of::<imp::NttParams>(),
+            );
+            gpu.set_bytes(enc, p_bytes, 2);
+            gpu.set_buffer(enc, z_buf, 0, 3);
+            gpu.dispatch(enc, 1u64 << (log_d - 6), 64);
+            gpu.end_encoding(enc);
+            gpu.commit_and_wait(cb).unwrap();
+
+            let candidate_first = core::slice::from_raw_parts(
+                gpu.buffer_contents(candidate).cast::<F128>(),
+                expect_first.len(),
+            );
+            let incumbent_first = core::slice::from_raw_parts(
+                gpu.buffer_contents(incumbent).cast::<F128>(),
+                expect_first.len(),
+            );
+            let got_table = core::slice::from_raw_parts(
+                gpu.buffer_contents(tree_buf).cast::<F128>(),
+                expect_table.len(),
+            );
+            assert_eq!(got_table, expect_table.as_slice(), "expanded table mismatch");
+            assert_eq!(candidate_first, expect_first.as_slice(), "candidate first pass mismatch");
+            assert_eq!(incumbent_first, expect_first.as_slice(), "incumbent first pass mismatch");
+            assert_eq!(candidate_first, incumbent_first);
+            assert_eq!(gpu.pipeline_resources(gpu.pso_ntt4zg4_preload).0, 15 * 1024);
+
+            let cb = gpu.command_buffer().unwrap();
+            let enc = gpu.compute_encoder(cb).unwrap();
+            imp::encode_ntt_passes(gpu, enc, candidate, tw_buf, log_d, 4);
+            imp::encode_merkle(gpu, enc, candidate, tree_buf, n_leaves);
+            gpu.end_encoding(enc);
+            gpu.commit_and_wait(cb).unwrap();
+            let candidate_full = core::slice::from_raw_parts(
+                gpu.buffer_contents(candidate).cast::<F128>(),
+                expect_full.len(),
+            );
+            let got_tree = core::slice::from_raw_parts(
+                gpu.buffer_contents(tree_buf).cast::<crate::merkle::Hash>(),
+                expect_tree.len(),
+            );
+            assert_eq!(candidate_full, expect_full.as_slice(), "full codeword mismatch");
+            assert_eq!(got_tree, expect_tree.as_slice(), "full tree mismatch");
+
+            gpu.release(candidate);
+            gpu.release(incumbent);
+            gpu.release(tw_buf);
+            gpu.release(z_buf);
+            gpu.release(tree_buf);
+            gpu.pool_pop(pool);
         }
     }
 
