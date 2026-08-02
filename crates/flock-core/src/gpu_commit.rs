@@ -2725,6 +2725,90 @@ kernel void blake3_pow_scan(
             }
         }
 
+        /// Commit and spin-poll `status` to completion. For sub-millisecond
+        /// dispatches on the prove's serial spine (the PCS grind scans),
+        /// `waitUntilCompleted` pays a thread park plus a completion-handler
+        /// wake on every call; polling the status property from the calling
+        /// thread skips both. Bounded: past `budget_ms` of spinning it falls
+        /// back to the blocking wait, so a long or hung dispatch costs one
+        /// spin budget and then behaves exactly like [`commit_and_wait`].
+        pub(crate) unsafe fn commit_and_spin(
+            &self,
+            cb: Id,
+            budget_ms: f64,
+        ) -> Result<(), String> {
+            unsafe {
+                send!(self.api, unsafe extern "C" fn(Id, Sel), cb, c"commit");
+                let start = std::time::Instant::now();
+                loop {
+                    let status: u64 = send!(
+                        self.api,
+                        unsafe extern "C" fn(Id, Sel) -> u64,
+                        cb,
+                        c"status"
+                    );
+                    if status >= 4 {
+                        if status == 4 {
+                            return Ok(());
+                        }
+                        let err: Id = send!(
+                            self.api,
+                            unsafe extern "C" fn(Id, Sel) -> Id,
+                            cb,
+                            c"error"
+                        );
+                        return Err(format!(
+                            "command buffer status {status}: {}",
+                            self.api.error_string(err)
+                        ));
+                    }
+                    if start.elapsed().as_secs_f64() * 1e3 > budget_ms {
+                        return self.wait_cb(cb);
+                    }
+                    std::hint::spin_loop();
+                }
+            }
+        }
+
+        /// Bounded status spin on an already-committed command buffer: the
+        /// same park-latency dodge as `commit_and_spin`, for drain sites
+        /// where the submit happened earlier (zc-r2 join). If the buffer is
+        /// already complete the first status poll returns immediately at
+        /// zero cost; past the budget it degrades to the exact blocking
+        /// wait.
+        pub(crate) unsafe fn spin_wait_cb(&self, cb: Id, budget_ms: f64) -> Result<(), String> {
+            unsafe {
+                let start = std::time::Instant::now();
+                loop {
+                    let status: u64 = send!(
+                        self.api,
+                        unsafe extern "C" fn(Id, Sel) -> u64,
+                        cb,
+                        c"status"
+                    );
+                    if status >= 4 {
+                        if status == 4 {
+                            return Ok(());
+                        }
+                        let err: Id = send!(
+                            self.api,
+                            unsafe extern "C" fn(Id, Sel) -> Id,
+                            cb,
+                            c"error"
+                        );
+                        return Err(format!(
+                            "command buffer status {status}: {}",
+                            self.api.error_string(err)
+                        ));
+                    }
+                    if start.elapsed().as_secs_f64() * 1e3 > budget_ms {
+                        return self.wait_cb(cb);
+                    }
+                    std::hint::spin_loop();
+                }
+            }
+        }
+
         pub(crate) unsafe fn commit_and_wait(&self, cb: Id) -> Result<(), String> {
             unsafe {
                 send!(self.api, unsafe extern "C" fn(Id, Sel), cb, c"commit");
@@ -5762,7 +5846,14 @@ kernel void blake3_pow_scan(
                 const THREADS: u64 = 64;
                 gpu.dispatch(enc, u64::from(len).div_ceil(THREADS), THREADS);
                 gpu.end_encoding(enc);
-                gpu.commit_and_wait(cb)?;
+                // The grind sits on the transcript's serial spine: nothing
+                // else can run until the nonce is known, so the calling
+                // thread spins the sub-millisecond dispatch home instead of
+                // parking in `waitUntilCompleted` (measured ~0.5 ms of fixed
+                // roundtrip per scan, paid 7x per ranked prove). The 4 ms
+                // budget covers every observed scan wall with margin; past
+                // it the path degrades to the exact blocking wait.
+                gpu.commit_and_spin(cb, 4.0)?;
                 let offset = out.read_volatile();
                 Ok((offset != u32::MAX).then(|| start + u64::from(offset)))
             })();
@@ -6986,7 +7077,20 @@ LC_KERNEL(lc_fold_stripes, 4)
         }
         let stripe_hi = crate::lincheck::oblock_claim_stripe_base(claim_lo);
         let gpu = gpu().ok()?;
-        let mut guard = ZC_FOLD.lock().ok()?;
+        // Poison tolerance: a panic anywhere while this guard is held would
+        // otherwise disable the fold arm for the remainder of the process —
+        // silently, reported as "arm not available" — turning one transient
+        // fault into a CPU-only worker on a median-scored benchmark. On
+        // poison, discard the (possibly mid-mutation) state and re-init a
+        // fresh one below; never reuse state a panic may have torn.
+        let mut guard = match ZC_FOLD.lock() {
+            Ok(g) => g,
+            Err(poisoned) => {
+                let mut g = poisoned.into_inner();
+                *g = None;
+                g
+            }
+        };
         if guard.is_none() {
             let t = std::time::Instant::now();
             *guard = Some(zc_fold_init(gpu));
@@ -7471,7 +7575,17 @@ kernel void rec_parent_hash(device const uint* children [[buffer(0)]],
         }
         let gpu = gpu().ok()?;
         let started = rec_merkle_debug().then(std::time::Instant::now);
-        let mut guard = REC_MERKLE.lock().ok()?;
+        // Poison-tolerant for the same reason as `ZC_FOLD`: discard torn
+        // state and re-init rather than silently disabling the arm for the
+        // rest of the process.
+        let mut guard = match REC_MERKLE.lock() {
+            Ok(g) => g,
+            Err(poisoned) => {
+                let mut g = poisoned.into_inner();
+                *g = None;
+                g
+            }
+        };
         if guard.is_none() {
             *guard = Some(rec_merkle_init(gpu));
         }
@@ -7823,13 +7937,16 @@ kernel void zc_r2_products(
     /// Anchors-only CPU work is measured locally at ~0.55x of the fused
     /// chunk (two of four folds, no products); the share solves
     /// `(hi - (1-ALPHA) g) c_f = g u_g` — balanced, no CPU-ward bias — and
-    /// caps at `3·hi/4` as the overshoot guard (an optimistic warmup ratio
-    /// must not make the GPU the timed straggler; at the cap the CPU still
-    /// owns a quarter of the fused sweep plus every anchor). At every
-    /// observed ratio (0.33–0.83 across hosts) the previous `hi/2` clamp was
-    /// what bound the share, leaving the GPU idle while the CPU ground
-    /// through fused chunks — the same measured mistake the balanced
-    /// lincheck split corrected at 32/64.
+    /// caps at `7·hi/8` as the overshoot guard (an optimistic warmup ratio
+    /// must not make the GPU the timed straggler; at this cap the GPU only
+    /// straggles once the true timed ratio exceeds `(1-0.45·7/8)/(7/8)` ≈
+    /// 0.69, a 21% overshoot above the ~0.57 measured on the ranked M3 Max).
+    /// History of this clamp: `hi/2` always bound (promoted fix → 3·hi/4,
+    /// +5.19%), and at every observed ratio (0.33–0.83 across hosts) the
+    /// 3·hi/4 cap was *still* what bound the share — the balance point
+    /// `hi/(ratio+0.45)` sits at 0.98·hi at ratio 0.57 — so the cap moves
+    /// again to 7·hi/8, the same measured mistake the balanced lincheck
+    /// split corrected at 32/64.
     ///
     /// Ratios in `(2, 8)`: the probe's equality oracle has already proven
     /// the kernel exact on this machine, so a slow-looking GPU gets a floor
@@ -7854,7 +7971,7 @@ kernel void zc_r2_products(
             return 0;
         }
         let g = (hi_size as f64 / (ratio + (1.0 - ZC_R2_ALPHA))).round();
-        (g as usize).min(hi_size * 3 / 4)
+        (g as usize).min(hi_size * 7 / 8)
     }
 
     fn zc_r2_init(gpu: &'static Gpu) -> Result<ZcR2, String> {
@@ -8087,7 +8204,7 @@ kernel void zc_r2_products(
             // 1/8 probe that shipped there.
             (hi_size / 16).clamp(8, 128)
         } else {
-            tuned.min(hi_size * 3 / 4)
+            tuned.min(hi_size * 7 / 8)
         };
         if chunks == 0 {
             return None;
@@ -8186,7 +8303,12 @@ kernel void zc_r2_products(
             ZcR2Result::Failed
         };
         unsafe {
-            if gpu.wait_cb(job.cb).is_err() {
+            // The CPU worker reaches this join after finishing its own share
+            // of a balanced split, so the GPU is normally already complete
+            // (first status poll, zero cost) or within a hair of it — a
+            // bounded spin dodges the ~0.3-0.5 ms `waitUntilCompleted` park
+            // once per timed prove.
+            if gpu.spin_wait_cb(job.cb, 2.0).is_err() {
                 return poison(job.cb);
             }
             let first_wall = zc_fold_gpu_wall_ms(gpu, job.cb);
@@ -8590,6 +8712,47 @@ mod tests {
             };
             assert_eq!(got, expected, "start={start} len={len} bits={bits}");
         }
+    }
+
+    /// Profile the grind scan's fixed submit/wait overhead vs kernel time.
+    /// The ranked prove issues 7 serial transcript-dependent scans, so the
+    /// per-call roundtrip (encode + commit + `waitUntilCompleted` park/wake)
+    /// is paid 7×. Solving wall(2^23) = fixed + 8·k and wall(2^20) =
+    /// fixed + k separates the two. Run with
+    /// `cargo test --release gpu_grind_roundtrip_profile -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "profiling only"]
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    fn gpu_grind_roundtrip_profile() {
+        let digest = core::array::from_fn(|i| (i as u8).wrapping_mul(151).wrapping_add(3));
+        let min_wall = |len: u32, n: usize| -> f64 {
+            let mut best = f64::MAX;
+            for _ in 0..n {
+                let t = std::time::Instant::now();
+                let r = gpu_blake3_pow_scan(&digest, 0, len, 32);
+                let w = t.elapsed().as_secs_f64() * 1e3;
+                if gpu_or_skip(r).is_none() {
+                    return f64::NAN;
+                }
+                best = best.min(w);
+            }
+            best
+        };
+        // Warm the pipeline and clocks off the record.
+        let _ = min_wall(1 << 20, 5);
+        let small = min_wall(1 << 20, 20);
+        let large = min_wall(1 << 23, 10);
+        if small.is_nan() || large.is_nan() {
+            return;
+        }
+        let kernel = (large - small) / 7.0;
+        let fixed = small - kernel;
+        eprintln!(
+            "[grind-profile] wall(2^20)={small:.3}ms wall(2^23)={large:.3}ms \
+             => kernel(2^20)~{kernel:.3}ms fixed-roundtrip~{fixed:.3}ms \
+             (x7 serial per prove ~{:.3}ms)",
+            fixed * 7.0
+        );
     }
 
     /// A latched caller is allowed to pass an empty marker instead of the
@@ -9917,6 +10080,28 @@ DEF_PROBE(probe_g4_t8_p0,    8u,  0u,   tsel & 7u)
         assert_eq!(lincheck_gate_share_legacy(2.01, 64), 0);
         assert_eq!(lincheck_gate_share_legacy(0.5, 64), 32);
         assert_eq!(lincheck_gate_share_legacy(1.0, 16), 7);
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    fn zc_r2_gate_share_policy() {
+        use imp::zc_r2_gate_share;
+        // Balance point hi/(ratio+0.45); ranked-observed ratios land above
+        // the 7·hi/8 cap, which is the binding overshoot guard.
+        assert_eq!(zc_r2_gate_share(0.57, 2048), 1792);
+        assert_eq!(zc_r2_gate_share(0.38, 2048), 1792);
+        // Slow-but-usable GPU: the formula takes over below the cap.
+        assert_eq!(zc_r2_gate_share(1.0, 2048), 1412); // 2048/1.45
+        assert_eq!(zc_r2_gate_share(2.0, 2048), 836); // 2048/2.45
+        // Admission floor for ratios in (2, 8): the equality oracle already
+        // proved the kernel, so pricing failures get hi/8, not 0.
+        assert_eq!(zc_r2_gate_share(2.01, 2048), 256);
+        assert_eq!(zc_r2_gate_share(7.9, 2048), 256);
+        // Past the floor ceiling, or unusable: exact incumbent.
+        assert_eq!(zc_r2_gate_share(8.0, 2048), 0);
+        assert_eq!(zc_r2_gate_share(f64::NAN, 2048), 0);
+        assert_eq!(zc_r2_gate_share(0.0, 2048), 0);
+        assert_eq!(zc_r2_gate_share(-1.0, 2048), 0);
     }
 
     /// The lincheck arm's GPU prefix equals the CPU fold over exactly the
