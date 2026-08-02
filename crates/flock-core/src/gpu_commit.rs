@@ -663,7 +663,16 @@ fn wait_for_precompute_branch_wall_ms() -> f64 {
 }
 
 /// Returns true when the GPU commit machinery is allowed to initialize.
+#[inline(always)]
 pub(crate) fn gpu_commit_enabled() -> bool {
+    // The benchmark harness clears worker environments before proving, so the
+    // process-wide answer is immutable in production. Resolve the kill switch
+    // once rather than repeating an environment lookup at every commit boundary.
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(gpu_commit_enabled_uncached)
+}
+
+fn gpu_commit_enabled_uncached() -> bool {
     // A/B-CONTROL: set to `false` to build an exact GPU-off control binary
     // (the benchmark harness env-clears workers, so the env kill switch
     // cannot reach them; it still serves in-process tests and tooling).
