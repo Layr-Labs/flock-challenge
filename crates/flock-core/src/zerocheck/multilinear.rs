@@ -1629,6 +1629,50 @@ fn fold_and_compute_round_pair_into_with_n_hi(
         }
     };
 
+    // GPU arm (see `ENV_NO_GPU_ZC_TAIL`): the otherwise-idle GPU takes the
+    // chunk prefix `[0, gpu_hi)` while the CPU drains the suffix. Chunk
+    // partials XOR together and reduction is F2-linear, so the combined
+    // messages and the (disjointly written) fold outputs are bit-identical
+    // to the whole-range CPU result for any split point.
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    let (gpu_job, gpu_hi) = {
+        // Only the largest rounds carry enough work to amortize a Metal
+        // submit+drain sync; the small tail rounds stay pure CPU.
+        let eligible = half >= (1usize << 21)
+            && lo_size >= 256
+            && lo_size.is_multiple_of(256)
+            && crate::gpu_commit::gpu_zc_tail_enabled();
+        if eligible {
+            let want = crate::gpu_commit::zc_tail_gpu_chunks(hi_size);
+            if want > 0 {
+                let mut rho_tab = [F128::ZERO; 32];
+                for nib in 0..16u64 {
+                    rho_tab[nib as usize] = r_fold * F128::new(nib, 0);
+                    rho_tab[16 + nib as usize] = r_fold * F128::new(nib << 4, 0);
+                }
+                let job = crate::gpu_commit::launch_zc_tail_fold(
+                    a,
+                    b,
+                    a_out.as_mut_ptr(),
+                    b_out.as_mut_ptr(),
+                    half,
+                    &rho_tab,
+                    eq_lo,
+                    &eq_hi[..want],
+                    want,
+                );
+                let hi = if job.is_some() { want } else { 0 };
+                (job, hi)
+            } else {
+                (None, 0)
+            }
+        } else {
+            (None, 0)
+        }
+    };
+    #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+    let gpu_hi = 0usize;
+
     // H2: drain the DRAM-bound rounds (outputs past LLC) through the hetero
     // E-core queue — the same contract as the T3 compact reconstruction.
     #[cfg(target_arch = "aarch64")]
@@ -1636,12 +1680,14 @@ fn fold_and_compute_round_pair_into_with_n_hi(
     #[cfg(not(target_arch = "aarch64"))]
     let hetero = false;
 
+    let t_cpu_drain = std::time::Instant::now();
     let (sum1, sum_inf) = if hetero {
         let mut partials: Vec<(F128, F128)> = vec![(F128::ZERO, F128::ZERO); hi_size];
         let a_base = crate::epool::SyncPtr(a_out.as_mut_ptr());
         let b_base = crate::epool::SyncPtr(b_out.as_mut_ptr());
         let partials_base = crate::epool::SyncPtr(partials.as_mut_ptr());
-        crate::epool::run_hetero_chunks(hi_size, |x_hi| {
+        crate::epool::run_hetero_chunks(hi_size - gpu_hi, |i| {
+            let x_hi = gpu_hi + i;
             // SAFETY: exclusive per-chunk ownership; queue join publishes writes.
             let (a_out, b_out) = unsafe {
                 (
@@ -1667,11 +1713,12 @@ fn fold_and_compute_round_pair_into_with_n_hi(
                 (s1 + c1, sinf + cinf)
             })
     } else {
-        a_out
+        a_out[gpu_hi * chunk_out..]
             .par_chunks_mut(chunk_out)
-            .zip(b_out.par_chunks_mut(chunk_out))
+            .zip(b_out[gpu_hi * chunk_out..].par_chunks_mut(chunk_out))
             .enumerate()
-            .map(|(x_hi, (a_out, b_out))| {
+            .map(|(i, (a_out, b_out))| {
+                let x_hi = gpu_hi + i;
                 let (p1, pinf) = chunk_partial(
                     &a[x_hi * chunk_in..(x_hi + 1) * chunk_in],
                     &b[x_hi * chunk_in..(x_hi + 1) * chunk_in],
@@ -1686,6 +1733,42 @@ fn fold_and_compute_round_pair_into_with_n_hi(
                 |(s1, sinf), (c1, cinf)| (s1 + c1, sinf + cinf),
             )
     };
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    let (sum1, sum_inf) = if let Some(job) = gpu_job {
+        let cpu_ms = t_cpu_drain.elapsed().as_secs_f64() * 1e3;
+        match job.finish(hi_size - gpu_hi, cpu_ms) {
+            Ok((g1, gi)) => (sum1 + g1, sum_inf + gi),
+            Err(e) => {
+                // The prefix never landed and the CPU skipped it. Redo those
+                // chunks here — slower, still exact (identical writes).
+                if crate::gpu_commit::gpu_zerocheck_debug() {
+                    eprintln!("[gpu-zc-tail] prefix failed, CPU redo: {e}");
+                }
+                let mut r1 = F128::ZERO;
+                let mut ri = F128::ZERO;
+                for x_hi in 0..gpu_hi {
+                    let (a_chunk, b_chunk) = (
+                        &mut a_out[x_hi * chunk_out..(x_hi + 1) * chunk_out],
+                        &mut b_out[x_hi * chunk_out..(x_hi + 1) * chunk_out],
+                    );
+                    let (p1, pinf) = chunk_partial(
+                        &a[x_hi * chunk_in..(x_hi + 1) * chunk_in],
+                        &b[x_hi * chunk_in..(x_hi + 1) * chunk_in],
+                        a_chunk,
+                        b_chunk,
+                    );
+                    r1 += eq_hi[x_hi] * p1;
+                    ri += eq_hi[x_hi] * pinf;
+                }
+                (sum1 + r1, sum_inf + ri)
+            }
+        }
+    } else {
+        (sum1, sum_inf)
+    };
+    #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+    let _ = t_cpu_drain;
 
     (r_next[0] * sum1, sum_inf)
 }
@@ -2181,6 +2264,78 @@ mod tests {
         assert_eq!(a11, a9, "folded a differs across equality splits");
         assert_eq!(b11, b9, "folded b differs across equality splits");
         assert_eq!(msg11, msg9, "round message differs across equality splits");
+    }
+
+    /// GPU tail-arm oracle: at a size crossing the GPU-arm threshold
+    /// (`half ≥ 2^20`, `lo_size ≥ 256`), the production driver — which hands
+    /// a chunk prefix to the GPU when one is available — must match a plain
+    /// serial F128 reference bit-for-bit: both folded buffers and both wire
+    /// messages. On hosts without the arm the driver is pure CPU and the
+    /// oracle still binds.
+    #[test]
+    fn gpu_tail_arm_matches_serial_reference() {
+        let mut rng = Rng::new(0x67D0_7A11);
+        let log_n = 22usize;
+        let n = 1usize << log_n;
+        let half = n / 2;
+        let a: Vec<F128> = (0..n).map(|_| rng.f128()).collect();
+        let b: Vec<F128> = (0..n).map(|_| rng.f128()).collect();
+        let r_fold = rng.f128();
+        let r_next = rng.f128_vec(log_n - 1);
+
+        let mut a_drv = vec![F128::ZERO; half];
+        let mut b_drv = vec![F128::ZERO; half];
+        let (m1_drv, minf_drv) = fold_and_compute_round_pair_into(
+            &a,
+            &b,
+            &mut a_drv,
+            &mut b_drv,
+            r_fold,
+            &r_next,
+        );
+
+        // Serial reference with plain reduced F128 arithmetic.
+        let n_hi = if half >= LARGE_TAIL_EQ_MIN_HALF && zc_tail_split11_enabled() {
+            LARGE_TAIL_EQ_N_HI
+        } else {
+            SplitEqGhash::MAX_N_HI
+        };
+        let eq = SplitEqGhash::with_n_hi(&r_next[1..], n_hi);
+        let lo_size = 1usize << eq.n_lo;
+        let hi_size = 1usize << eq.n_hi;
+        assert_eq!(lo_size * hi_size * 2, half);
+        let mut a_ref = vec![F128::ZERO; half];
+        let mut b_ref = vec![F128::ZERO; half];
+        let mut sum1 = F128::ZERO;
+        let mut sum_inf = F128::ZERO;
+        for x_hi in 0..hi_size {
+            let mut p1 = F128::ZERO;
+            let mut pinf = F128::ZERO;
+            for x_lo in 0..lo_size {
+                let g = x_hi * lo_size + x_lo;
+                let i = 4 * g;
+                let o = 2 * g;
+                let a0 = a[i] + r_fold * (a[i] + a[i + 1]);
+                let a1 = a[i + 2] + r_fold * (a[i + 2] + a[i + 3]);
+                let b0 = b[i] + r_fold * (b[i] + b[i + 1]);
+                let b1 = b[i + 2] + r_fold * (b[i + 2] + b[i + 3]);
+                a_ref[o] = a0;
+                a_ref[o + 1] = a1;
+                b_ref[o] = b0;
+                b_ref[o + 1] = b1;
+                p1 += eq.lo[x_lo] * (a1 * b1);
+                pinf += eq.lo[x_lo] * ((a0 + a1) * (b0 + b1));
+            }
+            sum1 += eq.hi[x_hi] * p1;
+            sum_inf += eq.hi[x_hi] * pinf;
+        }
+        let m1_ref = r_next[0] * sum1;
+        let minf_ref = sum_inf;
+
+        assert_eq!(a_drv, a_ref, "folded a differs from serial reference");
+        assert_eq!(b_drv, b_ref, "folded b differs from serial reference");
+        assert_eq!(m1_drv, m1_ref, "m1 differs from serial reference");
+        assert_eq!(minf_drv, minf_ref, "m_inf differs from serial reference");
     }
 
     /// Full compact-path oracle against the legacy materialized round two.

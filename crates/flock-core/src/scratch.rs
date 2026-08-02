@@ -66,6 +66,27 @@ const MAX_POOLED: usize = 48;
 /// Contents are UNINITIALIZED in both cases — recycled buffers hold stale
 /// data from a previous use. Caller MUST write every slot before reading it
 /// (same contract as [`crate::alloc_uninit_vec`]).
+/// Addresses and allocation byte sizes of currently pooled (free) `F128`
+/// buffers at or above `min_bytes`. Used by the GPU zc-tail arm to pre-wrap
+/// and page-wire candidate tail-round allocations during the untimed
+/// inter-prove window, so a measured prove only ever sees cache-hit wraps.
+/// Sound to retain wraps for these: pool eviction is smallest-first, so the
+/// large allocations this filter selects live for the process (the same
+/// lifetime assumption the promoted stripe/z wrap caches already make).
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub(crate) fn f128_pool_big_entries(min_bytes: usize) -> Vec<(usize, usize)> {
+    let pool = POOL.lock().unwrap();
+    pool.iter()
+        .filter(|v| v.capacity() * core::mem::size_of::<F128>() >= min_bytes)
+        .map(|v| {
+            (
+                v.as_ptr() as usize,
+                v.capacity() * core::mem::size_of::<F128>(),
+            )
+        })
+        .collect()
+}
+
 pub fn take_f128(n: usize) -> Vec<F128> {
     if let Some(v) = try_take_pinned_f128(n) {
         return v;
