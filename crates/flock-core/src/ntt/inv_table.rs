@@ -207,6 +207,18 @@ impl InvNttTableByteSingleGf8 {
         &self.data[self.data_offset..self.data_offset + 256 * self.ell]
     }
 
+    /// The plain (unswizzled, unscaled) `256 × ell` table image as bytes —
+    /// the exact array [`Self::apply_scalar`] indexes. Used to upload the
+    /// table to a GPU threadgroup, where the byte-collapse is reproduced
+    /// verbatim, so the two paths cannot drift.
+    #[inline]
+    pub fn table_image_bytes(&self) -> &[u8] {
+        let t = self.table();
+        // SAFETY: F8 is `#[repr(transparent)]` over u8, so the slice has the
+        // same length and layout as its byte image.
+        unsafe { core::slice::from_raw_parts(t.as_ptr().cast::<u8>(), t.len()) }
+    }
+
     /// Apply M to a single byte-packed row, in place.
     /// `bytes` is `n_chunks` bytes (the LCH-coefficient bits of the row);
     /// `out` will be filled with the `ell` evaluations on Λ.

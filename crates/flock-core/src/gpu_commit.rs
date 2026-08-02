@@ -164,6 +164,509 @@ pub(crate) fn gpu_zc_loop_debug() -> bool {
     *ON
 }
 
+// ---------------------------------------------------------------------------
+// Round-one AB precompute GPU arm.
+// ---------------------------------------------------------------------------
+
+/// Kill switch for the round-one AB-precompute GPU arm:
+/// `FLOCK_NO_GPU_AB_PRECOMPUTE=1` keeps the whole transform on the CPU (the
+/// exact incumbent, down to the calibration probe never running).
+///
+/// The arm offloads a PREFIX of the `x_outer` chunk range of
+/// `precompute_round1_ab_inner_packed_padded` to the GPU while the CPU runs
+/// the untouched incumbent over the suffix. Unlike the sumcheck-message arms
+/// that failed before it, this kernel contains no GF(2^128) data x data
+/// product: `shift_reduce_inner_ab` is a byte-table collapse (the §2.1
+/// inverse-NTT image), a GF(2^8) product, and an F2-linear shift-reduce —
+/// table-lookup + XOR work, which Apple GPUs run at memory rate.
+pub const ENV_NO_GPU_AB_PRECOMPUTE: &str = "FLOCK_NO_GPU_AB_PRECOMPUTE";
+
+/// Exact GPU share of the AB precompute, in percent of the `x_outer` chunk
+/// range (`FLOCK_AB_PRECOMPUTE_GPU_PCT=<n>`). `0` declines every dispatch;
+/// any value also pins the warmup autotune off so a controlled A/B keeps the
+/// requested share. Values above 100 are clamped.
+pub const ENV_AB_PRECOMPUTE_GPU_PCT: &str = "FLOCK_AB_PRECOMPUTE_GPU_PCT";
+
+pub(crate) fn gpu_ab_precompute_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os(ENV_NO_GPU_AB_PRECOMPUTE).is_none());
+    *ON
+}
+
+/// Diagnostic trace for the AB-precompute arm (`FLOCK_AB_GPU_DEBUG=1`).
+pub(crate) fn gpu_ab_precompute_debug() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_AB_GPU_DEBUG").is_some());
+    *ON
+}
+
+/// Per-prove no-copy-wrap accounting for the AB arm
+/// (`FLOCK_AB_WRAP_TRACE=1`). Prints one line per prove naming every wrap
+/// hit/created, so the fresh-process worker pattern (warmup prove then timed
+/// prove) can prove that ZERO wraps are created inside a timed prove. An
+/// in-process loop cannot show this — the poaching that creates a fresh
+/// 512 MiB wrap happens BETWEEN proves.
+pub(crate) fn gpu_ab_precompute_wrap_trace() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_AB_WRAP_TRACE").is_some());
+    *ON
+}
+
+pub(crate) fn ab_precompute_pct_override() -> Option<usize> {
+    static P: std::sync::LazyLock<Option<usize>> = std::sync::LazyLock::new(|| {
+        std::env::var(ENV_AB_PRECOMPUTE_GPU_PCT)
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .map(|p| p.min(100))
+    });
+    *P
+}
+
+/// One observation of the commit window's two arms plus the host's steady
+/// GPU price for the whole AB chunk range. All walls in ms.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct AbGateSample {
+    /// Wall of the commit arm of the `rayon::join` (the GPU commit graph plus
+    /// whatever CPU work the hybrid commit keeps).
+    pub commit_arm_ms: f64,
+    /// Wall of the CPU AB-precompute arm of the same join, incumbent-only.
+    pub ab_arm_ms: f64,
+    /// GPU wall for the FULL `x_outer` range at steady clock, measured
+    /// post-join (uncontended) during the untimed warmup prove.
+    pub gpu_full_ms: f64,
+    /// Chunks in the full range.
+    pub n_outer: usize,
+}
+
+/// Bias the published share CPU-ward. Overshooting makes the GPU arm the
+/// straggler inside a window it does not otherwise own, which costs wall
+/// directly; undershooting only leaves some of the free window unused.
+const AB_GATE_CPU_BIAS: f64 = 0.9;
+/// Ceiling on the GPU's per-chunk price relative to the CPU's.
+///
+/// Purely arithmetically the balance formula tolerates ANY ratio when the
+/// slack is large enough — a 5x-slower GPU still shortens a window with 36 ms
+/// of slack. That arithmetic is not trustworthy that far out, because
+/// `u_gpu` is priced post-join on an IDLE GPU while the shipped dispatch runs
+/// CONCURRENTLY with the commit graph: the real cost of moving a chunk is
+/// `u_gpu` inflated by contention, plus the contention the AB kernel inflicts
+/// back on the commit graph. Neither term is in the model. Both grow with the
+/// share, so a large ratio (which buys its gain with a large share) is
+/// exactly where the model error can flip the sign. Cap at the same 2.0 the
+/// sibling lincheck fold gate uses, keeping the arm in the regime where the
+/// unmodelled terms are second order.
+const AB_GATE_MAX_GPU_RATIO: f64 = 2.0;
+/// A predicted saving below this is not worth a 512 MiB no-copy wrap, a
+/// second command queue and a mid-window drain.
+const AB_GATE_MIN_GAIN_MS: f64 = 1.0;
+/// ...nor below this fraction of the arm it is shortening.
+const AB_GATE_MIN_GAIN_FRAC: f64 = 0.01;
+
+/// The warmup profitability gate, pure.
+///
+/// The commit window is `max(commit_arm, ab_arm)`. Moving `g` of the `n`
+/// AB chunks to the GPU takes `g · u_cpu` off the AB arm and (worst case,
+/// assuming the GPU work is fully serialized behind the commit graph rather
+/// than filling its gaps) puts `g · u_gpu` onto the commit arm:
+///
+/// ```text
+///   ab(g)     = ab_arm     - g·u_cpu
+///   commit(g) = commit_arm + g·u_gpu
+/// ```
+///
+/// so the arms balance at `g* = (ab_arm - commit_arm) / (u_cpu + u_gpu)` and
+/// the window shrinks by `g*·u_cpu`. **`ab_arm - commit_arm` is the whole
+/// gate**: it is the measured GPU slack on THIS host. Where the AB arm is not
+/// the tail — our M4 Max dev box, whose commit window is purely GPU-bound —
+/// the slack is negative and the share is 0, i.e. the exact incumbent. A
+/// shipped constant here is what got a sibling arm rejected at −16.95%.
+pub(crate) fn ab_gate_share(s: AbGateSample) -> usize {
+    if s.n_outer == 0
+        || !s.commit_arm_ms.is_finite()
+        || !s.ab_arm_ms.is_finite()
+        || !s.gpu_full_ms.is_finite()
+        || s.ab_arm_ms <= 0.0
+        || s.gpu_full_ms <= 0.0
+    {
+        return 0;
+    }
+    let u_cpu = s.ab_arm_ms / s.n_outer as f64;
+    let u_gpu = s.gpu_full_ms / s.n_outer as f64;
+    if u_cpu <= 0.0 || u_gpu <= 0.0 || u_gpu / u_cpu > AB_GATE_MAX_GPU_RATIO {
+        return 0;
+    }
+    // Measured GPU slack in this window. <= 0 means the commit arm is the
+    // tail and every chunk moved onto the GPU lengthens the window.
+    let slack_ms = s.ab_arm_ms - s.commit_arm_ms;
+    if slack_ms <= 0.0 {
+        return 0;
+    }
+    let balanced = AB_GATE_CPU_BIAS * slack_ms / (u_cpu + u_gpu);
+    let g = (balanced.floor().max(0.0) as usize).min(s.n_outer / 2);
+    let gain_ms = g as f64 * u_cpu;
+    if gain_ms < AB_GATE_MIN_GAIN_MS || gain_ms < AB_GATE_MIN_GAIN_FRAC * s.ab_arm_ms {
+        return 0;
+    }
+    g
+}
+
+/// How far below the AB arm the commit arm must sit before the warmup skips
+/// calibration entirely. The gate itself only needs `slack > 0`, but the
+/// calibration is not free — a full-range GPU dispatch, its replays, two
+/// checksums, a full CPU restore pass, and 1.5 GiB of page wiring — so a host
+/// that is nowhere near the boundary should not pay it.
+///
+/// Deliberately a large margin rather than a tight one. On the target the
+/// slack is ~4.4 ms in an ~86 ms window (+5%); this dev box measures −62 ms in
+/// a ~100 ms window (−160%). Anything within 25% of balance still calibrates,
+/// so ordinary run-to-run noise cannot turn a machine that has slack into one
+/// that never measures itself.
+const AB_HOPELESS_SLACK_FRAC: f64 = -0.25;
+
+/// Whether this host is so far from having GPU slack that measuring the kernel
+/// would be wasted work. Conservative in the direction that matters: a `false`
+/// only costs an untimed warmup pass, a wrong `true` would silently disable the
+/// arm on a machine where it pays.
+pub(crate) fn ab_slack_is_hopeless(commit_arm_ms: f64, ab_arm_ms: f64) -> bool {
+    if !commit_arm_ms.is_finite() || !ab_arm_ms.is_finite() || ab_arm_ms <= 0.0 {
+        return true;
+    }
+    (ab_arm_ms - commit_arm_ms) / ab_arm_ms < AB_HOPELESS_SLACK_FRAC
+}
+
+/// A GPU arm that finishes AFTER the CPU suffix is the straggler, and it costs
+/// window directly. Below this the drain is just scheduling noise.
+const AB_STRAGGLER_MS: f64 = 0.5;
+
+/// The shrink-only straggler correction, pure.
+///
+/// The warmup gate prices the kernel POST-JOIN, on an idle GPU. The shipped
+/// dispatch runs CONCURRENTLY with the commit graph, so its real per-chunk cost
+/// is higher — measured on this dev box at roughly double, a 45% prefix taking
+/// as long in-window as the whole range does idle. A fixed derate would be a
+/// constant fitted to THIS machine, which is the mistake that got a sibling arm
+/// rejected. Instead every engaged prove reports its own IN-WINDOW price
+/// (`gpu_ms / share`, both measured in that prove) and the share walks down
+/// until the GPU stops being the straggler:
+///
+/// ```text
+///   blocked = Δ · (u_gpu_in_window + u_cpu)
+/// ```
+///
+/// Monotone by construction — the caller only ever applies a strictly smaller
+/// share — so it cannot oscillate and cannot take the arm past the incumbent.
+/// A balance point that can no longer repay the dispatch collapses to 0 = off.
+pub(crate) fn ab_straggler_shrink(
+    share: usize,
+    n_cpu_chunks: usize,
+    gpu_ms: f64,
+    blocked_ms: f64,
+    cpu_suffix_ms: f64,
+) -> Option<usize> {
+    if share == 0
+        || n_cpu_chunks == 0
+        || blocked_ms <= AB_STRAGGLER_MS
+        || !(gpu_ms.is_finite() && cpu_suffix_ms.is_finite() && blocked_ms.is_finite())
+        || gpu_ms <= 0.0
+        || cpu_suffix_ms <= 0.0
+    {
+        return None;
+    }
+    let u_gpu = gpu_ms / share as f64;
+    let u_cpu = cpu_suffix_ms / n_cpu_chunks as f64;
+    let delta = blocked_ms / (u_gpu + u_cpu);
+    if !delta.is_finite() || delta <= 0.0 {
+        return None;
+    }
+    let shrunk = share.saturating_sub(delta.ceil() as usize);
+    let total = share + n_cpu_chunks;
+    let gain_ms = shrunk as f64 * u_cpu;
+    if gain_ms < AB_GATE_MIN_GAIN_MS || gain_ms < AB_GATE_MIN_GAIN_FRAC * (total as f64 * u_cpu) {
+        return Some(0);
+    }
+    Some(shrunk)
+}
+
+/// Per-process accounting for the AB arm, for tests and the wrap trace.
+#[derive(Clone, Copy, Debug, Default)]
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) struct AbArmStats {
+    pub submits: usize,
+    pub declines: usize,
+    /// Wraps created before the calibration latch (expected: 3, all in the
+    /// untimed warmup prove).
+    pub wraps_warmup: usize,
+    /// Wraps created after it. Any nonzero value is the −16.95% bug.
+    pub wraps_after_warmup: usize,
+    pub latched_off: bool,
+    pub tuned_chunks: usize,
+    /// Steady-clock GPU wall (ms) measured for the full chunk range, or 0.
+    pub gpu_full_ms: f64,
+}
+
+/// The gate is the one piece of the arm that MUST be exercised on a host
+/// where it will never fire, so these are synthetic samples rather than
+/// measurements. Tuning the gate until it fires on this dev box would be
+/// fitting it to the wrong machine.
+#[cfg(test)]
+mod ab_gate_tests {
+    use super::{AbGateSample, ab_gate_share};
+
+    /// The ranked chunk count: `2^32 / 8 / 1024` `x_outer` chunks.
+    const RANKED_OUTER: usize = 1 << 19;
+
+    /// This dev box (M4 Max), from `FLOCK_PHASE_TIMING` on the ranked worker:
+    /// the commit arm is the tail by a wide margin, so the GPU has no slack
+    /// and the arm must publish share 0 = untouched incumbent.
+    #[test]
+    fn no_gpu_slack_on_this_host_publishes_share_zero() {
+        let g = ab_gate_share(AbGateSample {
+            commit_arm_ms: 96.94,
+            ab_arm_ms: 43.50,
+            gpu_full_ms: 30.0,
+            n_outer: RANKED_OUTER,
+        });
+        assert_eq!(g, 0, "a GPU-bound commit window must not gain GPU work");
+    }
+
+    /// A GPU that prices the range above [`super::AB_GATE_MAX_GPU_RATIO`] x
+    /// the CPU arm gates off even when the window has plenty of slack. The
+    /// bare balance arithmetic would happily engage here (a 4.65x GPU still
+    /// "shortens" a window with 36 ms of slack, on paper); the rail refuses,
+    /// because that gain is bought with a share large enough for the
+    /// unmodelled contention terms to flip its sign.
+    #[test]
+    fn slow_gpu_samples_publish_share_zero() {
+        for gpu_full_ms in [200.0, 400.0, 900.0, 5_000.0] {
+            let g = ab_gate_share(AbGateSample {
+                commit_arm_ms: 50.0,
+                ab_arm_ms: 86.0,
+                gpu_full_ms,
+                n_outer: RANKED_OUTER,
+            });
+            assert_eq!(g, 0, "slow GPU sample {gpu_full_ms} must gate off");
+        }
+        // ...and the rail is what rejects them: the same slack with a GPU
+        // just inside the ratio engages.
+        assert!(
+            ab_gate_share(AbGateSample {
+                commit_arm_ms: 50.0,
+                ab_arm_ms: 86.0,
+                gpu_full_ms: 86.0 * 1.9,
+                n_outer: RANKED_OUTER,
+            }) > 0
+        );
+    }
+
+    /// Real slack, but too little of it to be worth the wiring: still 0.
+    #[test]
+    fn slack_below_the_minimum_gain_publishes_share_zero() {
+        let g = ab_gate_share(AbGateSample {
+            commit_arm_ms: 86.0,
+            ab_arm_ms: 86.4,
+            gpu_full_ms: 30.0,
+            n_outer: RANKED_OUTER,
+        });
+        assert_eq!(g, 0, "0.4 ms of slack cannot repay the arm");
+    }
+
+    /// The target-machine shape (georgwiese's M3 Max `FLOCK_GPU_WINDOW_TRACE`:
+    /// window 86.41 ms, GPU chain ending ~82 ms with slack). The arm must
+    /// engage, take a minority prefix, and predict a saving in the range the
+    /// window imbalance allows.
+    #[test]
+    fn target_like_samples_engage_with_a_balanced_minority_share() {
+        let s = AbGateSample {
+            commit_arm_ms: 82.0,
+            ab_arm_ms: 86.41,
+            gpu_full_ms: 30.0,
+            n_outer: RANKED_OUTER,
+        };
+        let g = ab_gate_share(s);
+        assert!(g > 0, "target-like slack must engage the arm");
+        assert!(
+            g < s.n_outer / 2,
+            "the balanced share is a minority prefix, got {g}/{}",
+            s.n_outer
+        );
+        let u_cpu = s.ab_arm_ms / s.n_outer as f64;
+        let u_gpu = s.gpu_full_ms / s.n_outer as f64;
+        let gain = g as f64 * u_cpu;
+        assert!(
+            (1.0..=4.41).contains(&gain),
+            "predicted saving {gain:.2} ms outside the window imbalance"
+        );
+        // The published share never overshoots the balance point, so the GPU
+        // cannot become the straggler.
+        let balanced = (s.ab_arm_ms - s.commit_arm_ms) / (u_cpu + u_gpu);
+        assert!(g as f64 <= balanced, "share overshot the balance point");
+    }
+
+    /// Slack grows -> share grows, monotonically, and the arm never hands the
+    /// GPU more than half the range.
+    #[test]
+    fn share_is_monotone_in_slack_and_capped_at_half() {
+        let mut last = 0usize;
+        for slack in [2.0, 5.0, 10.0, 25.0, 60.0, 400.0] {
+            let g = ab_gate_share(AbGateSample {
+                commit_arm_ms: 86.0,
+                ab_arm_ms: 86.0 + slack,
+                gpu_full_ms: 30.0,
+                n_outer: RANKED_OUTER,
+            });
+            assert!(g >= last, "share fell as slack rose ({slack} ms)");
+            assert!(g <= RANKED_OUTER / 2, "share exceeded the half-range cap");
+            last = g;
+        }
+        assert!(last > 0);
+    }
+
+    use super::ab_straggler_shrink;
+
+    /// The measured in-window effect this exists for: the gate priced the
+    /// kernel on an idle GPU, the shipped dispatch runs against the commit
+    /// graph and costs ~2x that, so the GPU lands late. The share must fall.
+    #[test]
+    fn straggler_share_shrinks_toward_balance() {
+        // 19092 GPU chunks priced at 22.6 ms idle; in-window it took 45 ms and
+        // finished 12 ms after the CPU suffix.
+        let share = 19_092usize;
+        let n_cpu = RANKED_OUTER - share;
+        let got = ab_straggler_shrink(share, n_cpu, 45.0, 12.0, 83.3)
+            .expect("a 12 ms straggler must correct");
+        assert!(got < share, "share must shrink, got {got}");
+        // One step lands at or above the balance point, never below zero.
+        let u_gpu = 45.0 / share as f64;
+        let u_cpu = 83.3 / n_cpu as f64;
+        let want = share as f64 - 12.0 / (u_gpu + u_cpu);
+        assert!(
+            (got as f64 - want).abs() <= 1.0,
+            "got {got}, balance {want:.1}"
+        );
+    }
+
+    /// Repeated application converges downward and stops; it must never grow
+    /// the share or wrap around. Modelled on a GPU whose IN-WINDOW per-chunk
+    /// price is 3x the CPU's — i.e. exactly the case the idle-priced warmup
+    /// gate would have missed.
+    #[test]
+    fn straggler_correction_is_monotone_and_terminates() {
+        const N: usize = RANKED_OUTER;
+        let u_cpu = 86.41 / N as f64; // ms per chunk on the CPU arm
+        let u_gpu = 3.0 * u_cpu; // ...and in-window on the GPU
+        let mut share = N / 2;
+        let mut steps = 0usize;
+        loop {
+            let n_cpu = N - share;
+            let gpu_ms = share as f64 * u_gpu;
+            let cpu_ms = n_cpu as f64 * u_cpu;
+            let blocked = (gpu_ms - cpu_ms).max(0.0);
+            let Some(next) = ab_straggler_shrink(share, n_cpu, gpu_ms, blocked, cpu_ms) else {
+                break;
+            };
+            assert!(next <= share, "share grew: {share} -> {next}");
+            if next == share {
+                break;
+            }
+            share = next;
+            steps += 1;
+            assert!(steps < 64, "correction did not terminate");
+        }
+        assert!(share < N / 2, "the correction never fired");
+        // It settles at the balance point `3s·u = (N-s)·u`, i.e. s = N/4.
+        let balance = N / 4;
+        assert!(
+            share.abs_diff(balance) <= 2,
+            "settled at {share}, balance {balance}"
+        );
+    }
+
+    /// Noise below the straggler threshold, and a GPU that finished first,
+    /// must both leave the share alone.
+    #[test]
+    fn straggler_correction_ignores_noise_and_a_winning_gpu() {
+        let share = 19_092usize;
+        let n_cpu = RANKED_OUTER - share;
+        assert_eq!(ab_straggler_shrink(share, n_cpu, 22.6, 0.0, 83.3), None);
+        assert_eq!(ab_straggler_shrink(share, n_cpu, 22.6, 0.4, 83.3), None);
+        assert_eq!(ab_straggler_shrink(0, n_cpu, 22.6, 9.0, 83.3), None);
+        assert_eq!(ab_straggler_shrink(share, 0, 22.6, 9.0, 83.3), None);
+    }
+
+    /// When the balance point can no longer repay the dispatch, the arm turns
+    /// itself off rather than running a share that cannot pay for itself.
+    #[test]
+    fn straggler_correction_collapses_to_off_below_the_minimum_gain() {
+        let share = 200usize;
+        let n_cpu = RANKED_OUTER - share;
+        let got = ab_straggler_shrink(share, n_cpu, 40.0, 30.0, 86.0);
+        assert_eq!(got, Some(0));
+    }
+
+    use super::ab_slack_is_hopeless;
+
+    /// The hopeless-skip must not be able to disqualify the target. Its whole
+    /// job is to spare a GPU-bound host the calibration cost, so the margin
+    /// has to be wide on this dev box and nowhere near tripping on the target.
+    #[test]
+    fn hopeless_skip_spares_this_host_and_never_disqualifies_the_target() {
+        // Measured here, three fresh worker processes (default config):
+        for (commit, ab) in [(100.17, 38.17), (103.19, 40.65), (110.46, 45.31)] {
+            assert!(
+                ab_slack_is_hopeless(commit, ab),
+                "this GPU-bound host should skip calibration ({commit}/{ab})"
+            );
+        }
+        // Target shape, and the same shape degraded well past plausible
+        // measurement noise — all must still calibrate.
+        for (commit, ab) in [
+            (82.0, 86.41),  // the published M3 Max trace
+            (86.41, 86.41), // exactly balanced
+            (95.0, 86.41),  // commit arm 10% long: still measures itself
+            (105.0, 86.41), // ...and 21% long
+        ] {
+            assert!(
+                !ab_slack_is_hopeless(commit, ab),
+                "a host near balance must still calibrate ({commit}/{ab})"
+            );
+        }
+        assert!(ab_slack_is_hopeless(f64::NAN, 86.0));
+        assert!(ab_slack_is_hopeless(80.0, 0.0));
+    }
+
+    #[test]
+    fn degenerate_samples_publish_share_zero() {
+        let base = AbGateSample {
+            commit_arm_ms: 82.0,
+            ab_arm_ms: 86.41,
+            gpu_full_ms: 30.0,
+            n_outer: RANKED_OUTER,
+        };
+        assert_eq!(ab_gate_share(AbGateSample { n_outer: 0, ..base }), 0);
+        assert_eq!(
+            ab_gate_share(AbGateSample {
+                gpu_full_ms: 0.0,
+                ..base
+            }),
+            0
+        );
+        assert_eq!(
+            ab_gate_share(AbGateSample {
+                gpu_full_ms: f64::NAN,
+                ..base
+            }),
+            0
+        );
+        assert_eq!(
+            ab_gate_share(AbGateSample {
+                ab_arm_ms: -1.0,
+                ..base
+            }),
+            0
+        );
+    }
+}
+
 /// Kill switch for the cross-process warmup latch cache:
 /// `FLOCK_NO_WARMUP_LATCH_CACHE=1` restores the incumbent full dual-run +
 /// autotune sweep in every worker process. The cache changes **no timed
@@ -2796,6 +3299,47 @@ kernel void blake3_pow_scan(
                     self.api,
                     unsafe extern "C" fn(Id, Sel) -> Id,
                     self.queue,
+                    c"commandBuffer"
+                );
+                if cb.is_null() {
+                    Err("commandBuffer failed".into())
+                } else {
+                    Ok(cb)
+                }
+            }
+        }
+
+        /// A second `MTLCommandQueue` on the same device.
+        ///
+        /// The AB-precompute arm needs its own queue: command buffers on ONE
+        /// queue begin in commit order, so appending the AB dispatch to the
+        /// commit graph's queue would schedule it after the last graph buffer
+        /// — past the point where the window's GPU slack exists. A separate
+        /// queue lets the AB kernel interleave into the graph's gaps, which is
+        /// the entire mechanism.
+        pub(crate) unsafe fn new_queue(&self) -> Result<Id, String> {
+            unsafe {
+                let q: Id = send!(
+                    self.api,
+                    unsafe extern "C" fn(Id, Sel) -> Id,
+                    self.device,
+                    c"newCommandQueue"
+                );
+                if q.is_null() {
+                    Err("newCommandQueue failed (AB precompute arm)".into())
+                } else {
+                    Ok(q)
+                }
+            }
+        }
+
+        /// [`Self::command_buffer`] on a caller-owned queue.
+        pub(crate) unsafe fn command_buffer_on(&self, queue: Id) -> Result<Id, String> {
+            unsafe {
+                let cb: Id = send!(
+                    self.api,
+                    unsafe extern "C" fn(Id, Sel) -> Id,
+                    queue,
                     c"commandBuffer"
                 );
                 if cb.is_null() {
@@ -7558,6 +8102,1216 @@ LC_KERNEL(lc_fold_stripes, 4)
             let ms = [200.0, 180.0, 100.0];
             assert_eq!(choose_hybrid_k(&C, &ms, DEFAULT_HYBRID_K), Some(5));
         }
+    }
+
+    // =======================================================================
+    // Round-one AB precompute GPU arm.
+    //
+    // The CPU kernel this mirrors (`zerocheck::univariate_skip_optimized::
+    // shift_reduce_inner_ab`, scalar oracle in `kernels/portable.rs`) is a
+    // pure 64-bytes-of-A + 64-bytes-of-B -> 64-bytes-of-out map at the SAME
+    // byte offset. For block `blk` (= x_outer*16 + b_med), with
+    // `T` the §2.1 inverse-NTT byte-collapse table (256 rows x 64 bytes):
+    //
+    //   for k in 0..8:                         // eight 8-byte sub-rows
+    //     a_col[lane] = XOR_{c<8} T[a[k*8+c]][lane ^ 8c]        (F2-linear)
+    //     b_col[lane] = XOR_{c<8} T[b[k*8+c]][lane ^ 8c]
+    //     acc[lane]  ^= u16(a_col[lane] * b_col[lane]) << k     (GF(2^8))
+    //   out[lane] = gf8_reduce(acc[lane])                       (F2-linear)
+    //
+    // Every step is a table lookup or an XOR except the one GF(2^8) product,
+    // which is a 2-lookup half-nibble table on the GPU — NOT the GF(2^128)
+    // data x data product that costs ~1100 scalar ops on Apple GPUs and sank
+    // the round-2 and tail arms.
+    //
+    // GPU packing. Lanes go four to a `uint`: `lane = 4*tt + j`, `tt` in
+    // 0..16. Because `8c = 4*(2c)` and `j < 4`,
+    //   `lane ^ 8c = 4*(tt ^ 2c) + j`
+    // so the four lanes of one `uint` gather from FOUR CONSECUTIVE table
+    // bytes and the whole per-lane gather becomes one `uint` load at row
+    // index `a_byte * 16 + (tt ^ 2c)`. Sixteen threads cover a 64-byte block.
+    //
+    // The `<< k` accumulate is kept in two byte-planes (`acc_lo`, `acc_hi`)
+    // with per-byte masks so no bits cross a lane boundary, and the final
+    // `gf8_reduce` is split by F2-linearity into
+    //   `gf8_reduce(lo + 256*hi) = lo ^ gf8_reduce(256*hi)`
+    // i.e. the identity on the low byte plus one 256-entry table on the high
+    // byte. (`gf8_reduce` of a value below 256 is that value.)
+    // =======================================================================
+
+    /// Threads per AB threadgroup. 256 = sixteen 64-byte output blocks x
+    /// sixteen `uint` lane-groups = exactly one `x_outer` chunk per
+    /// iteration. The 512-thread twin does two chunks per iteration off one
+    /// copy of the threadgroup tables, doubling resident SIMD groups per core
+    /// at no extra threadgroup memory; the pipeline's
+    /// `maxTotalThreadsPerThreadgroup` picks which one runs.
+    const AB_TG_SMALL: usize = 256;
+    const AB_TG_LARGE: usize = 512;
+    /// `x_outer` chunks in one 64-byte-block group (`1 << N_MEDIUM`).
+    const AB_BLOCKS_PER_OUTER: usize = 16;
+    /// Bytes of one `x_outer` chunk of A, B and out alike.
+    const AB_OUTER_BYTES: usize = AB_BLOCKS_PER_OUTER * 64;
+    /// Least chunks a threadgroup should own, so the ~25 KiB threadgroup
+    /// table build is amortized even for a small prefix share.
+    const AB_MIN_CHUNKS_PER_GROUP: usize = 32;
+    /// Grid width ceiling. ~13x the ranked runner's GPU core count leaves
+    /// room for load balance without shrinking each group's table amortization.
+    const AB_MAX_GROUPS: usize = 512;
+
+    const AB_MSL_SOURCE: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+struct AbParams {
+    uint outer_lo;          // first x_outer chunk of the GPU prefix
+    uint outer_hi;          // exclusive bound of the GPU prefix
+    uint outer_per_group;   // chunks owned by one threadgroup
+    uint within_outer_mask; // within_hash_outer = x_outer & mask (padding)
+};
+
+// One `uint` = four lanes of the §2.1 table row `W`, at lane-group TT.
+// Byte c of the 8-byte sub-row selects row (W >> 8c) & 255 and lane-group
+// TT ^ 2c — the `lane ^ 8c` permutation, hoisted to `uint` granularity.
+#define AB_GATHER(T, W0, W1, TT) (                     \
+      (T)[(((W0)      ) & 255u) * 16u + ((TT) ^  0u)]  \
+    ^ (T)[(((W0) >>  8) & 255u) * 16u + ((TT) ^  2u)]  \
+    ^ (T)[(((W0) >> 16) & 255u) * 16u + ((TT) ^  4u)]  \
+    ^ (T)[(((W0) >> 24)       ) * 16u + ((TT) ^  6u)]  \
+    ^ (T)[(((W1)      ) & 255u) * 16u + ((TT) ^  8u)]  \
+    ^ (T)[(((W1) >>  8) & 255u) * 16u + ((TT) ^ 10u)]  \
+    ^ (T)[(((W1) >> 16) & 255u) * 16u + ((TT) ^ 12u)]  \
+    ^ (T)[(((W1) >> 24)       ) * 16u + ((TT) ^ 14u)])
+
+// GF(2^8) product of one byte pair, split over B's nibbles:
+//   a*b = a*(b & 15) + a*(b & 240),  both halves 4 KiB tables.
+#define AB_MULB(M, A, B) \
+    (uint((M)[(A) * 16u + ((B) & 15u)]) ^ uint((M)[4096u + (A) * 16u + ((B) >> 4)]))
+
+#define AB_MUL4(M, A, B) (                                       \
+       AB_MULB(M,  (A)        & 255u,  (B)        & 255u)        \
+    | (AB_MULB(M, ((A) >>  8) & 255u, ((B) >>  8) & 255u) <<  8) \
+    | (AB_MULB(M, ((A) >> 16) & 255u, ((B) >> 16) & 255u) << 16) \
+    | (AB_MULB(M, ((A) >> 24)       , ((B) >> 24)       ) << 24))
+
+// gf8_reduce(256 * h), per byte: the only part of the shift-reduce that the
+// low byte-plane does not already carry.
+#define AB_RED4(R, H) (                          \
+       uint((R)[ (H)        & 255u])             \
+    | (uint((R)[((H) >>  8) & 255u]) <<  8)      \
+    | (uint((R)[((H) >> 16) & 255u]) << 16)      \
+    | (uint((R)[((H) >> 24)       ]) << 24))
+
+#define AB_KERNEL(NAME, TG)                                                  \
+kernel void NAME(                                                            \
+    device const uint*  a32   [[buffer(0)]],                                 \
+    device const uint*  b32   [[buffer(1)]],                                 \
+    device uint*        out32 [[buffer(2)]],                                 \
+    device const uint*  tbl   [[buffer(3)]],                                 \
+    device const uint*  mul   [[buffer(4)]],                                 \
+    device const uint*  red   [[buffer(5)]],                                 \
+    device const uchar* bmed  [[buffer(6)]],                                 \
+    constant AbParams&  p     [[buffer(7)]],                                 \
+    uint tgid [[threadgroup_position_in_grid]],                              \
+    uint lid  [[thread_position_in_threadgroup]])                            \
+{                                                                            \
+    threadgroup uint  t_tbl[4096];   /* 256 rows x 64 B  = 16 KiB */         \
+    threadgroup uint  t_mul[2048];   /* 2 x 256 x 16 B   =  8 KiB */         \
+    threadgroup uint  t_red[64];     /* 256 B                      */        \
+    for (uint i = lid; i < 4096u; i += TG) { t_tbl[i] = tbl[i]; }            \
+    for (uint i = lid; i < 2048u; i += TG) { t_mul[i] = mul[i]; }            \
+    for (uint i = lid; i <   64u; i += TG) { t_red[i] = red[i]; }            \
+    threadgroup_barrier(mem_flags::mem_threadgroup);                         \
+    threadgroup const uchar* m8 = (threadgroup const uchar*)t_mul;           \
+    threadgroup const uchar* r8 = (threadgroup const uchar*)t_red;           \
+    const uint per_iter = TG / 256u;                                         \
+    uint blk = lid >> 4;                                                     \
+    uint tt  = lid & 15u;                                                    \
+    uint sub = blk >> 4;                                                     \
+    uint bm  = blk & 15u;                                                    \
+    uint lo  = p.outer_lo + tgid * p.outer_per_group;                        \
+    uint hi  = min(lo + p.outer_per_group, p.outer_hi);                      \
+    for (uint x = lo; x < hi; x += per_iter) {                               \
+        uint xo = x + sub;                                                   \
+        if (xo >= hi) { continue; }                                          \
+        uint base = xo * 256u + bm * 16u;                                    \
+        if (bm >= uint(bmed[xo & p.within_outer_mask])) {                    \
+            out32[base + tt] = 0u;                                           \
+            continue;                                                        \
+        }                                                                    \
+        uint acc_lo = 0u, acc_hi = 0u;                                       \
+        for (uint k = 0u; k < 8u; ++k) {                                     \
+            uint i0 = base + 2u * k;                                         \
+            uint av = AB_GATHER(t_tbl, a32[i0], a32[i0 + 1u], tt);           \
+            uint bv = AB_GATHER(t_tbl, b32[i0], b32[i0 + 1u], tt);           \
+            uint y  = AB_MUL4(m8, av, bv);                                   \
+            acc_lo ^= (y << k) & ((0xFFu & (0xFFu << k)) * 0x01010101u);     \
+            acc_hi ^= (k == 0u)                                              \
+                    ? 0u                                                     \
+                    : ((y >> (8u - k)) & (((1u << k) - 1u) * 0x01010101u));  \
+        }                                                                    \
+        out32[base + tt] = acc_lo ^ AB_RED4(r8, acc_hi);                     \
+    }                                                                        \
+}
+
+AB_KERNEL(ab_shift_reduce_256, 256u)
+AB_KERNEL(ab_shift_reduce_512, 512u)
+"#;
+
+    #[repr(C)]
+    struct AbParams {
+        outer_lo: u32,
+        outer_hi: u32,
+        outer_per_group: u32,
+        within_outer_mask: u32,
+    }
+
+    /// Which caller allocation a cached no-copy wrap names.
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum AbWrap {
+        A = 0,
+        B = 1,
+        Out = 2,
+    }
+    const AB_WRAP_ROLES: usize = 3;
+
+    /// Process-lifetime Metal state for the AB arm.
+    struct AbPre {
+        gpu: &'static Gpu,
+        /// Dedicated queue — see [`Gpu::new_queue`].
+        queue: Id,
+        pso: Id,
+        tg: usize,
+        tbl_buf: Id,
+        mul_buf: Id,
+        red_buf: Id,
+        bmed_buf: Id,
+        bmed_cap: usize,
+        /// One cached wrap per role, keyed by `(ptr, len)`.
+        wraps: [Option<(usize, usize, Id)>; AB_WRAP_ROLES],
+    }
+    // SAFETY: Metal objects are thread-safe and every access is serialized by
+    // the AB_PRE mutex; one prove owns the lease at a time.
+    unsafe impl Send for AbPre {}
+
+    static AB_PRE: Mutex<Option<Result<AbPre, String>>> = Mutex::new(None);
+
+    /// Published GPU chunk share (`usize::MAX` = not yet tuned).
+    static AB_TUNED_CHUNKS: std::sync::atomic::AtomicUsize =
+        std::sync::atomic::AtomicUsize::new(usize::MAX);
+    /// Set once the post-join warmup calibration has run (or failed).
+    static AB_CALIBRATED: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
+    /// Permanent disable: wrap churn, a mid-flight Metal error, or a
+    /// calibration checksum mismatch. Never cleared.
+    static AB_LATCHED_OFF: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
+    /// Steady-clock GPU wall (ms, bit pattern) for the FULL chunk range.
+    static AB_GPU_FULL_MS: std::sync::atomic::AtomicU64 =
+        std::sync::atomic::AtomicU64::new(0);
+    /// Successful prefix submissions, and dispatches declined for churn.
+    static AB_SUBMITS: std::sync::atomic::AtomicUsize =
+        std::sync::atomic::AtomicUsize::new(0);
+    static AB_DECLINES: std::sync::atomic::AtomicUsize =
+        std::sync::atomic::AtomicUsize::new(0);
+    /// Wraps created, split at the calibration boundary. Any increment of the
+    /// second counter is the −16.95% bug reproducing itself.
+    static AB_WRAPS_WARMUP: std::sync::atomic::AtomicUsize =
+        std::sync::atomic::AtomicUsize::new(0);
+    static AB_WRAPS_AFTER_WARMUP: std::sync::atomic::AtomicUsize =
+        std::sync::atomic::AtomicUsize::new(0);
+    /// Proves that reached the arm, for the per-prove wrap trace.
+    static AB_PROVES: std::sync::atomic::AtomicUsize =
+        std::sync::atomic::AtomicUsize::new(0);
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn ab_precompute_stats() -> super::AbArmStats {
+        use std::sync::atomic::Ordering::Relaxed;
+        super::AbArmStats {
+            submits: AB_SUBMITS.load(Relaxed),
+            declines: AB_DECLINES.load(Relaxed),
+            wraps_warmup: AB_WRAPS_WARMUP.load(Relaxed),
+            wraps_after_warmup: AB_WRAPS_AFTER_WARMUP.load(Relaxed),
+            latched_off: AB_LATCHED_OFF.load(Relaxed),
+            tuned_chunks: AB_TUNED_CHUNKS.load(Relaxed),
+            gpu_full_ms: ab_gpu_full_ms(),
+        }
+    }
+
+    impl AbPre {
+        /// Look up (or, during warmup only, create) the no-copy wrap naming
+        /// `ptr..ptr+len` for `role`.
+        ///
+        /// # Wrap discipline
+        /// After calibration this NEVER creates a wrap. Metal wires a
+        /// wrapped range's pages on first GPU touch — several ms for each of
+        /// the ranked 512 MiB buffers — so a wrap rebuilt inside a timed
+        /// prove costs far more than the arm can win. That is precisely the
+        /// −16.95% rejection: a same-size-class consumer poached the pooled
+        /// allocation between proves, the address moved, and every timed
+        /// prove silently re-wired 512 MiB. `scratch::take_f128_exclusive`
+        /// now prevents the poaching; this refuses to pay for it even if
+        /// something else moves the address, and latches the arm off.
+        unsafe fn wrap(
+            &mut self,
+            role: AbWrap,
+            ptr: *const u8,
+            len: usize,
+            may_create: bool,
+        ) -> Result<Id, String> {
+            let key = (ptr as usize, len);
+            let slot = role as usize;
+            if let Some((p, l, buf)) = self.wraps[slot]
+                && (p, l) == key
+            {
+                return Ok(buf);
+            }
+            if !may_create {
+                return Err(format!(
+                    "wrap churn: role {slot} moved to ptr={ptr:p} len={len} after warmup"
+                ));
+            }
+            let buf = unsafe { self.gpu.wrap_buffer(ptr as *mut u8, len)? };
+            if let Some((_, _, old)) = self.wraps[slot].replace((key.0, key.1, buf)) {
+                unsafe { self.gpu.release(old) };
+            }
+            if AB_CALIBRATED.load(std::sync::atomic::Ordering::Relaxed) {
+                AB_WRAPS_AFTER_WARMUP.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            } else {
+                AB_WRAPS_WARMUP.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            Ok(buf)
+        }
+
+        /// True when all three roles are already wrapped at these exact
+        /// addresses — checked BEFORE any wiring cost is paid.
+        fn wraps_cached(&self, keys: [(usize, usize); AB_WRAP_ROLES]) -> bool {
+            self.wraps
+                .iter()
+                .zip(keys)
+                .all(|(w, k)| matches!(w, Some((p, l, _)) if (*p, *l) == k))
+        }
+
+        unsafe fn ensure_small(
+            &self,
+            slot: &mut Id,
+            cap: &mut usize,
+            need: usize,
+        ) -> Result<(), String> {
+            if *cap >= need && !slot.is_null() {
+                return Ok(());
+            }
+            unsafe {
+                let fresh = self.gpu.new_buffer(need)?;
+                self.gpu.release(*slot);
+                *slot = fresh;
+                *cap = need;
+            }
+            Ok(())
+        }
+    }
+
+    /// The GF(2^8) half-nibble product tables and the `x^8` reduction image,
+    /// built from the SAME `F8`/`gf8_reduce` the CPU kernel uses, so the two
+    /// paths cannot drift by construction.
+    fn ab_scalar_tables() -> ([u8; 8192], [u8; 256]) {
+        use crate::field::F8;
+        let mut mul = [0u8; 8192];
+        for a in 0..256usize {
+            for n in 0..16usize {
+                mul[a * 16 + n] = (F8(a as u8) * F8(n as u8)).0;
+                mul[4096 + a * 16 + n] = (F8(a as u8) * F8((n as u8) << 4)).0;
+            }
+        }
+        let mut red = [0u8; 256];
+        for (h, slot) in red.iter_mut().enumerate() {
+            *slot = crate::field::gf2_8::gf8_reduce((h as u16) << 8);
+        }
+        (mul, red)
+    }
+
+    fn ab_pre_init(gpu: &'static Gpu, table_image: &[u8]) -> Result<AbPre, String> {
+        unsafe {
+            let pool = gpu.pool_push();
+            let built = (|| -> Result<(Id, usize, Id), String> {
+                let src = gpu.api.nsstring(AB_MSL_SOURCE)?;
+                let mut err: Id = NIL;
+                let library: Id = send!(
+                    gpu.api,
+                    unsafe extern "C" fn(Id, Sel, Id, Id, *mut Id) -> Id,
+                    gpu.device,
+                    c"newLibraryWithSource:options:error:",
+                    src,
+                    NIL,
+                    &mut err
+                );
+                if library.is_null() {
+                    return Err(format!(
+                        "AB precompute shader compile failed: {}",
+                        gpu.api.error_string(err)
+                    ));
+                }
+                let build = |name: &str| -> Result<(Id, u64), String> {
+                    let ns = gpu.api.nsstring(name)?;
+                    let f: Id = send!(
+                        gpu.api,
+                        unsafe extern "C" fn(Id, Sel, Id) -> Id,
+                        library,
+                        c"newFunctionWithName:",
+                        ns
+                    );
+                    if f.is_null() {
+                        return Err(format!("AB precompute kernel {name} not found"));
+                    }
+                    let mut perr: Id = NIL;
+                    let pso: Id = send!(
+                        gpu.api,
+                        unsafe extern "C" fn(Id, Sel, Id, *mut Id) -> Id,
+                        gpu.device,
+                        c"newComputePipelineStateWithFunction:error:",
+                        f,
+                        &mut perr
+                    );
+                    send!(gpu.api, unsafe extern "C" fn(Id, Sel) -> Id, f, c"release");
+                    if pso.is_null() {
+                        return Err(format!(
+                            "AB precompute pipeline {name}: {}",
+                            gpu.api.error_string(perr)
+                        ));
+                    }
+                    let max_threads: u64 = send!(
+                        gpu.api,
+                        unsafe extern "C" fn(Id, Sel) -> u64,
+                        pso,
+                        c"maxTotalThreadsPerThreadgroup"
+                    );
+                    Ok((pso, max_threads))
+                };
+                // Prefer the 512-thread twin: same ~25 KiB of threadgroup
+                // tables, twice the resident SIMD groups per core. Fall back
+                // when the pipeline's register pressure forbids it.
+                let large = build("ab_shift_reduce_512");
+                let chosen = match large {
+                    Ok((pso, max)) if max as usize >= AB_TG_LARGE => Ok((pso, AB_TG_LARGE)),
+                    Ok((pso, _)) => {
+                        gpu.release(pso);
+                        build("ab_shift_reduce_256").map(|(p, _)| (p, AB_TG_SMALL))
+                    }
+                    Err(_) => build("ab_shift_reduce_256").map(|(p, _)| (p, AB_TG_SMALL)),
+                };
+                let (pso, tg) = match chosen {
+                    Ok(v) => v,
+                    Err(e) => {
+                        send!(gpu.api, unsafe extern "C" fn(Id, Sel) -> Id, library, c"release");
+                        return Err(e);
+                    }
+                };
+                send!(gpu.api, unsafe extern "C" fn(Id, Sel) -> Id, library, c"release");
+                let queue = match gpu.new_queue() {
+                    Ok(q) => q,
+                    Err(e) => {
+                        gpu.release(pso);
+                        return Err(e);
+                    }
+                };
+                Ok((pso, tg, queue))
+            })();
+            gpu.pool_pop(pool);
+            let (pso, tg, queue) = built?;
+
+            let state = AbPre {
+                gpu,
+                queue,
+                pso,
+                tg,
+                tbl_buf: NIL,
+                mul_buf: NIL,
+                red_buf: NIL,
+                bmed_buf: NIL,
+                bmed_cap: 0,
+                wraps: [None; AB_WRAP_ROLES],
+            };
+            // The §2.1 table and the two scalar tables are protocol-fixed:
+            // upload once per process.
+            let pool = gpu.pool_push();
+            let uploaded = (|| -> Result<(Id, Id, Id), String> {
+                let tbl = gpu.new_buffer(table_image.len())?;
+                std::ptr::copy_nonoverlapping(
+                    table_image.as_ptr(),
+                    gpu.buffer_contents(tbl),
+                    table_image.len(),
+                );
+                let (mul, red) = ab_scalar_tables();
+                let mul_buf = gpu.new_buffer(mul.len())?;
+                std::ptr::copy_nonoverlapping(
+                    mul.as_ptr(),
+                    gpu.buffer_contents(mul_buf),
+                    mul.len(),
+                );
+                let red_buf = gpu.new_buffer(red.len())?;
+                std::ptr::copy_nonoverlapping(
+                    red.as_ptr(),
+                    gpu.buffer_contents(red_buf),
+                    red.len(),
+                );
+                Ok((tbl, mul_buf, red_buf))
+            })();
+            gpu.pool_pop(pool);
+            let (tbl_buf, mul_buf, red_buf) = match uploaded {
+                Ok(v) => v,
+                Err(e) => {
+                    gpu.release(pso);
+                    gpu.release(queue);
+                    return Err(e);
+                }
+            };
+            Ok(AbPre {
+                tbl_buf,
+                mul_buf,
+                red_buf,
+                ..state
+            })
+        }
+    }
+
+    /// Everything one AB dispatch needs, kept so the calibration can replay
+    /// an identical encode back-to-back for the GPU clock ramp.
+    #[derive(Clone, Copy)]
+    struct AbPlan {
+        a_buf: Id,
+        b_buf: Id,
+        out_buf: Id,
+        outer_lo: usize,
+        outer_hi: usize,
+        outer_per_group: usize,
+        within_outer_mask: usize,
+        n_groups: usize,
+    }
+
+    fn ab_plan_geometry(chunks: usize, tg: usize) -> (usize, usize) {
+        let per_iter = (tg / 256).max(1);
+        let n_groups = chunks
+            .div_ceil(AB_MIN_CHUNKS_PER_GROUP)
+            .clamp(1, AB_MAX_GROUPS);
+        let outer_per_group = chunks.div_ceil(n_groups).next_multiple_of(per_iter);
+        (n_groups, outer_per_group)
+    }
+
+    unsafe fn ab_submit(gpu: &Gpu, state: &AbPre, plan: &AbPlan) -> Result<Id, String> {
+        unsafe {
+            let params = AbParams {
+                outer_lo: plan.outer_lo as u32,
+                outer_hi: plan.outer_hi as u32,
+                outer_per_group: plan.outer_per_group as u32,
+                within_outer_mask: plan.within_outer_mask as u32,
+            };
+            let params_bytes = std::slice::from_raw_parts(
+                (&raw const params).cast::<u8>(),
+                core::mem::size_of::<AbParams>(),
+            );
+            let cb = gpu.command_buffer_on(state.queue)?;
+            let enc = gpu.compute_encoder(cb)?;
+            gpu.set_pipeline(enc, state.pso);
+            gpu.set_buffer(enc, plan.a_buf, 0, 0);
+            gpu.set_buffer(enc, plan.b_buf, 0, 1);
+            gpu.set_buffer(enc, plan.out_buf, 0, 2);
+            gpu.set_buffer(enc, state.tbl_buf, 0, 3);
+            gpu.set_buffer(enc, state.mul_buf, 0, 4);
+            gpu.set_buffer(enc, state.red_buf, 0, 5);
+            gpu.set_buffer(enc, state.bmed_buf, 0, 6);
+            gpu.set_bytes(enc, params_bytes, 7);
+            gpu.dispatch(enc, plan.n_groups as u64, state.tg as u64);
+            gpu.end_encoding(enc);
+            let cb = gpu.retain(cb);
+            gpu.commit_async(cb);
+            Ok(cb)
+        }
+    }
+
+    /// The caller-side description of one AB precompute, shared by the launch
+    /// and calibration entry points.
+    pub(crate) struct AbShape<'a> {
+        pub a_packed: &'a [u8],
+        pub b_packed: &'a [u8],
+        /// Base of the full `Round1AbInner` storage and its byte length. The
+        /// wrap always names the WHOLE buffer so its `(ptr, len)` key is
+        /// independent of the split fraction.
+        pub out_ptr: *mut u8,
+        pub out_len: usize,
+        pub table_image: &'a [u8],
+        pub within_outer_mask: usize,
+        pub b_med_counts: &'a [u8],
+    }
+
+    impl AbShape<'_> {
+        /// The exact ranked geometry this kernel is written for. Anything
+        /// else stays on the untouched incumbent.
+        fn is_supported(&self) -> bool {
+            self.out_len == self.a_packed.len()
+                && self.out_len == self.b_packed.len()
+                && self.out_len.is_multiple_of(AB_OUTER_BYTES)
+                && self.out_len / AB_OUTER_BYTES >= AB_MIN_CHUNKS_PER_GROUP
+                && self.table_image.len() == 256 * 64
+                && !self.b_med_counts.is_empty()
+                && self.b_med_counts.len() == self.within_outer_mask + 1
+                && self.b_med_counts.iter().all(|&c| c as usize <= AB_BLOCKS_PER_OUTER)
+                && (self.out_len / AB_OUTER_BYTES) as u64 * 256 <= u32::MAX as u64
+        }
+
+        fn n_outer(&self) -> usize {
+            self.out_len / AB_OUTER_BYTES
+        }
+
+        fn wrap_keys(&self) -> [(usize, usize); AB_WRAP_ROLES] {
+            [
+                (self.a_packed.as_ptr() as usize, self.a_packed.len()),
+                (self.b_packed.as_ptr() as usize, self.b_packed.len()),
+                (self.out_ptr as usize, self.out_len),
+            ]
+        }
+    }
+
+    /// A submitted AB prefix. The caller runs the CPU suffix while this is in
+    /// flight, then drains it with [`AbPrecomputeJob::finish`].
+    pub(crate) struct AbPrecomputeJob {
+        guard: std::sync::MutexGuard<'static, Option<Result<AbPre, String>>>,
+        cb: Id,
+        outer_hi: usize,
+        submitted: std::time::Instant,
+    }
+
+    impl AbPrecomputeJob {
+        /// Chunks `[0, outer_hi)` belong to the GPU; the caller's CPU suffix
+        /// MUST start at exactly this chunk.
+        pub(crate) fn outer_hi(&self) -> usize {
+            self.outer_hi
+        }
+
+        /// Wait for the prefix. `Err` means the caller must recompute
+        /// `[0, outer_hi)` on the CPU — the arm latches off for the process.
+        ///
+        /// `cpu_suffix_ms` / `n_cpu_chunks` describe the concurrent CPU
+        /// suffix and feed the shrink-only straggler correction.
+        pub(crate) fn finish(
+            mut self,
+            cpu_suffix_ms: f64,
+            n_cpu_chunks: usize,
+        ) -> Result<(), String> {
+            let state = self
+                .guard
+                .as_ref()
+                .and_then(|r| r.as_ref().ok())
+                .ok_or_else(|| "AB precompute state vanished".to_string())?;
+            let gpu = state.gpu;
+            let cb = self.cb;
+            self.cb = NIL;
+            let blocked = std::time::Instant::now();
+            let wait = unsafe { gpu.wait_cb(cb) };
+            let blocked_ms = blocked.elapsed().as_secs_f64() * 1e3;
+            let gpu_ms = unsafe { zc_fold_gpu_wall_ms(gpu, cb) };
+            unsafe { gpu.release(cb) };
+            if super::gpu_ab_precompute_debug() {
+                eprintln!(
+                    "[gpu-ab] prefix {} chunks: gpu={gpu_ms:.2}ms \
+                     submit-to-drain={:.2}ms host-blocked={blocked_ms:.2}ms",
+                    self.outer_hi,
+                    self.submitted.elapsed().as_secs_f64() * 1e3,
+                );
+            }
+            if let Err(e) = wait {
+                AB_LATCHED_OFF.store(true, std::sync::atomic::Ordering::Relaxed);
+                return Err(e);
+            }
+            ab_note_straggler(self.outer_hi, gpu_ms, blocked_ms, cpu_suffix_ms, n_cpu_chunks);
+            Ok(())
+        }
+    }
+
+    /// Apply [`super::ab_straggler_shrink`] to the published share.
+    fn ab_note_straggler(
+        share: usize,
+        gpu_ms: f64,
+        blocked_ms: f64,
+        cpu_suffix_ms: f64,
+        n_cpu_chunks: usize,
+    ) {
+        use std::sync::atomic::Ordering::Relaxed;
+        if super::ab_precompute_pct_override().is_some() || !AB_CALIBRATED.load(Relaxed) {
+            return;
+        }
+        let Some(shrunk) =
+            super::ab_straggler_shrink(share, n_cpu_chunks, gpu_ms, blocked_ms, cpu_suffix_ms)
+        else {
+            return;
+        };
+        let mut cur = AB_TUNED_CHUNKS.load(Relaxed);
+        while shrunk < cur {
+            match AB_TUNED_CHUNKS.compare_exchange_weak(cur, shrunk, Relaxed, Relaxed) {
+                Ok(_) => {
+                    if super::gpu_ab_precompute_debug() {
+                        eprintln!(
+                            "[gpu-ab] straggler: blocked={blocked_ms:.2}ms at share \
+                             {share} -> share {shrunk}"
+                        );
+                    }
+                    return;
+                }
+                Err(seen) => cur = seen,
+            }
+        }
+    }
+
+    /// Chunks the GPU should take this prove, before any wrap check.
+    fn ab_share_for(n_outer: usize) -> usize {
+        if let Some(pct) = super::ab_precompute_pct_override() {
+            return (n_outer * pct / 100).min(n_outer);
+        }
+        match AB_TUNED_CHUNKS.load(std::sync::atomic::Ordering::Relaxed) {
+            usize::MAX => 0, // not calibrated yet: exact incumbent
+            g => g.min(n_outer),
+        }
+    }
+
+    /// Emit the per-prove wrap line the fresh-process trace reads.
+    fn ab_trace_prove(prove: usize, share: usize, n_outer: usize, note: &str) {
+        if !super::gpu_ab_precompute_wrap_trace() {
+            return;
+        }
+        use std::sync::atomic::Ordering::Relaxed;
+        eprintln!(
+            "[ab-wrap] prove={prove} phase={} share={share}/{n_outer} \
+             wraps_warmup={} wraps_after_warmup={} submits={} declines={} \
+             latched_off={} {note}",
+            if AB_CALIBRATED.load(Relaxed) { "timed" } else { "warmup" },
+            AB_WRAPS_WARMUP.load(Relaxed),
+            AB_WRAPS_AFTER_WARMUP.load(Relaxed),
+            AB_SUBMITS.load(Relaxed),
+            AB_DECLINES.load(Relaxed),
+            AB_LATCHED_OFF.load(Relaxed),
+        );
+    }
+
+    /// Submit the GPU prefix of the AB precompute. `None` keeps the WHOLE
+    /// transform on the untouched incumbent — kill switch, share 0, latched
+    /// off, unsupported shape, no Metal device, shader/wrap/dispatch error,
+    /// or detected wrap churn.
+    ///
+    /// # Safety
+    /// `shape.out_ptr .. out_ptr + out_len` must stay allocated at that
+    /// address until the returned job is finished or dropped, and the caller
+    /// must not touch `[0, outer_hi * AB_OUTER_BYTES)` of it until then.
+    pub(crate) unsafe fn launch_ab_precompute_prefix(
+        shape: &AbShape<'_>,
+    ) -> Option<AbPrecomputeJob> {
+        use std::sync::atomic::Ordering::Relaxed;
+        let prove = AB_PROVES.fetch_add(1, Relaxed) + 1;
+        if !super::gpu_ab_precompute_enabled() {
+            return None;
+        }
+        if AB_LATCHED_OFF.load(Relaxed) {
+            ab_trace_prove(prove, 0, shape.n_outer(), "latched-off");
+            return None;
+        }
+        if !shape.is_supported() {
+            return None;
+        }
+        let n_outer = shape.n_outer();
+        let share = ab_share_for(n_outer);
+        if share == 0 || share > n_outer {
+            ab_trace_prove(prove, 0, n_outer, "share-zero");
+            return None;
+        }
+        let gpu = gpu().ok()?;
+        let mut guard = AB_PRE.lock().ok()?;
+        if guard.is_none() {
+            *guard = Some(ab_pre_init(gpu, shape.table_image));
+        }
+        if guard.as_ref().is_some_and(|r| r.is_err()) {
+            return None;
+        }
+
+        // DECLINE BEFORE WIRING. Everything above is free; creating a wrap is
+        // not. If the three allocations are not already the calibrated ones,
+        // stop here rather than pay 512 MiB of page wiring inside a timed
+        // prove, and never try again this process.
+        //
+        // Creation is legitimate in exactly one place: a prove that runs
+        // BEFORE the post-join calibration latch, i.e. the untimed warmup
+        // prove. `FLOCK_AB_PRECOMPUTE_GPU_PCT` reaches the dispatch there
+        // before the calibration has built the wraps, and a controlled A/B
+        // must not be turned into a decline by its own first prove.
+        let may_create = !AB_CALIBRATED.load(Relaxed);
+        let keys = shape.wrap_keys();
+        {
+            let state = guard.as_ref()?.as_ref().ok()?;
+            if !may_create && !state.wraps_cached(keys) {
+                AB_DECLINES.fetch_add(1, Relaxed);
+                AB_LATCHED_OFF.store(true, Relaxed);
+                if super::gpu_ab_precompute_debug() {
+                    eprintln!(
+                        "[gpu-ab] wrap churn on prove {prove}: declining before wiring, \
+                         arm latched off for the process"
+                    );
+                }
+                ab_trace_prove(prove, share, n_outer, "DECLINED-churn");
+                return None;
+            }
+        }
+
+        let submitted = std::time::Instant::now();
+        let cb = {
+            let state = guard.as_mut()?.as_mut().ok()?;
+            unsafe {
+                let pool = gpu.pool_push();
+                let built = (|| -> Result<Id, String> {
+                    ab_upload_bmed(gpu, state, shape.b_med_counts)?;
+                    let (n_groups, outer_per_group) = ab_plan_geometry(share, state.tg);
+                    let plan = AbPlan {
+                        a_buf: state.wrap(
+                            AbWrap::A,
+                            shape.a_packed.as_ptr(),
+                            shape.a_packed.len(),
+                            may_create,
+                        )?,
+                        b_buf: state.wrap(
+                            AbWrap::B,
+                            shape.b_packed.as_ptr(),
+                            shape.b_packed.len(),
+                            may_create,
+                        )?,
+                        out_buf: state.wrap(AbWrap::Out, shape.out_ptr, shape.out_len, may_create)?,
+                        outer_lo: 0,
+                        outer_hi: share,
+                        outer_per_group,
+                        within_outer_mask: shape.within_outer_mask,
+                        n_groups,
+                    };
+                    ab_submit(gpu, state, &plan)
+                })();
+                gpu.pool_pop(pool);
+                match built {
+                    Ok(cb) => cb,
+                    Err(e) => {
+                        AB_LATCHED_OFF.store(true, Relaxed);
+                        if super::gpu_ab_precompute_debug() {
+                            eprintln!("[gpu-ab] submit failed, CPU-only precompute: {e}");
+                        }
+                        ab_trace_prove(prove, share, n_outer, "submit-failed");
+                        return None;
+                    }
+                }
+            }
+        };
+        AB_SUBMITS.fetch_add(1, Relaxed);
+        ab_trace_prove(prove, share, n_outer, "submitted");
+        Some(AbPrecomputeJob {
+            guard,
+            cb,
+            outer_hi: share,
+            submitted,
+        })
+    }
+
+    /// Whether this geometry has a kernel at all. Lets the caller skip the
+    /// calibration's restore pass entirely on shapes the arm will never run.
+    pub(crate) fn ab_shape_supported(shape: &AbShape<'_>) -> bool {
+        shape.is_supported()
+    }
+
+    /// Run the AB kernel synchronously over an explicit chunk range.
+    ///
+    /// Test-only seam for the byte-exact oracles: it bypasses the published
+    /// share, the wrap-churn refusal and the calibration latch so one process
+    /// can compare many split fractions against the incumbent. Production
+    /// goes through [`launch_ab_precompute_prefix`].
+    ///
+    /// # Safety
+    /// Same contract as [`launch_ab_precompute_prefix`] over
+    /// `[outer_lo, outer_hi)`.
+    #[cfg(test)]
+    pub(crate) unsafe fn ab_gpu_range_for_test(
+        shape: &AbShape<'_>,
+        outer_lo: usize,
+        outer_hi: usize,
+    ) -> Result<f64, String> {
+        if !shape.is_supported() {
+            return Err("unsupported AB shape".into());
+        }
+        if outer_lo > outer_hi || outer_hi > shape.n_outer() {
+            return Err("range outside the chunk space".into());
+        }
+        if outer_lo == outer_hi {
+            return Ok(0.0);
+        }
+        let gpu = gpu().map_err(|e| format!("no Metal device: {e}"))?;
+        let mut guard = AB_PRE.lock().map_err(|_| "AB state poisoned".to_string())?;
+        if guard.is_none() {
+            *guard = Some(ab_pre_init(gpu, shape.table_image));
+        }
+        let state = match guard.as_mut() {
+            Some(Ok(s)) => s,
+            Some(Err(e)) => return Err(e.clone()),
+            None => return Err("AB state missing".into()),
+        };
+        unsafe {
+            let pool = gpu.pool_push();
+            let r = (|| -> Result<f64, String> {
+                ab_upload_bmed(gpu, state, shape.b_med_counts)?;
+                let (n_groups, outer_per_group) =
+                    ab_plan_geometry(outer_hi - outer_lo, state.tg);
+                let plan = AbPlan {
+                    a_buf: state.wrap(
+                        AbWrap::A,
+                        shape.a_packed.as_ptr(),
+                        shape.a_packed.len(),
+                        true,
+                    )?,
+                    b_buf: state.wrap(
+                        AbWrap::B,
+                        shape.b_packed.as_ptr(),
+                        shape.b_packed.len(),
+                        true,
+                    )?,
+                    out_buf: state.wrap(AbWrap::Out, shape.out_ptr, shape.out_len, true)?,
+                    outer_lo,
+                    outer_hi,
+                    outer_per_group,
+                    within_outer_mask: shape.within_outer_mask,
+                    n_groups,
+                };
+                let cb = ab_submit(gpu, state, &plan)?;
+                let ok = gpu.wait_cb(cb);
+                let wall = zc_fold_gpu_wall_ms(gpu, cb);
+                gpu.release(cb);
+                ok.map(|()| wall)
+            })();
+            gpu.pool_pop(pool);
+            r
+        }
+    }
+
+    /// Drop every cached wrap so a test can re-exercise creation, and reset
+    /// the churn/latch state. Test-only.
+    #[cfg(test)]
+    pub(crate) fn ab_reset_for_test() {
+        use std::sync::atomic::Ordering::Relaxed;
+        if let Ok(mut guard) = AB_PRE.lock()
+            && let Some(Ok(state)) = guard.as_mut()
+        {
+            for slot in state.wraps.iter_mut() {
+                if let Some((_, _, buf)) = slot.take() {
+                    unsafe { state.gpu.release(buf) };
+                }
+            }
+        }
+        AB_LATCHED_OFF.store(false, Relaxed);
+        AB_CALIBRATED.store(false, Relaxed);
+        AB_TUNED_CHUNKS.store(usize::MAX, Relaxed);
+        AB_SUBMITS.store(0, Relaxed);
+        AB_DECLINES.store(0, Relaxed);
+        AB_WRAPS_WARMUP.store(0, Relaxed);
+        AB_WRAPS_AFTER_WARMUP.store(0, Relaxed);
+    }
+
+    /// Force the arm into its post-warmup state at a chosen share, so a test
+    /// can drive [`launch_ab_precompute_prefix`] exactly as a timed prove
+    /// does — including the decline-before-wiring refusal. Test-only.
+    #[cfg(test)]
+    pub(crate) fn ab_force_calibrated_share_for_test(share: usize) {
+        use std::sync::atomic::Ordering::Relaxed;
+        AB_TUNED_CHUNKS.store(share, Relaxed);
+        AB_CALIBRATED.store(true, Relaxed);
+    }
+
+    /// Warmup calibration, run ONCE per process from the post-join hook.
+    ///
+    /// Post-join is deliberate. The gate reads the two arm walls of the
+    /// commit window; running the calibration inside the window would inflate
+    /// both of them by an amount that depends on GPU contention, i.e. it
+    /// would corrupt exactly the measurement it exists to serve. After the
+    /// join the commit graph is finished, so `u_gpu` is priced on an idle GPU
+    /// and neither arm wall is disturbed.
+    ///
+    /// Returns the GPU's full-range wall in ms on success. The caller then
+    /// recomputes the whole range on the CPU: this dispatch writes GPU bytes
+    /// over a live `Round1AbInner`, and the arm does not rely on them.
+    ///
+    /// # Safety
+    /// Same contract as [`launch_ab_precompute_prefix`], for the full range.
+    pub(crate) unsafe fn calibrate_ab_precompute(shape: &AbShape<'_>) -> Option<f64> {
+        use std::sync::atomic::Ordering::Relaxed;
+        if !super::gpu_ab_precompute_enabled()
+            || AB_LATCHED_OFF.load(Relaxed)
+            || !shape.is_supported()
+        {
+            return None;
+        }
+        let n_outer = shape.n_outer();
+        let gpu = gpu().ok()?;
+        let mut guard = AB_PRE.lock().ok()?;
+        if guard.is_none() {
+            *guard = Some(ab_pre_init(gpu, shape.table_image));
+        }
+        let state = guard.as_mut()?.as_mut().ok()?;
+
+        // Price the FULL range, back-to-back, and take the minimum.
+        //
+        // Two reasons for full range rather than a probe prefix. (1) Metal
+        // wires a wrapped range's pages on first GPU touch; touching every
+        // page here is what makes a later, larger timed-prove share free.
+        // (2) The GPU governor drops clocks within tens of ms of idleness and
+        // ramps over ~10-20 ms of sustained work, so a short probe prices the
+        // ramp, not the kernel. Replay until the wall stops improving on the
+        // running minimum and price from that minimum, exactly as the
+        // promoted lincheck fold gate does.
+        let measured = unsafe {
+            let pool = gpu.pool_push();
+            let r = (|| -> Result<(f64, usize), String> {
+                ab_upload_bmed(gpu, state, shape.b_med_counts)?;
+                let (n_groups, outer_per_group) = ab_plan_geometry(n_outer, state.tg);
+                let plan = AbPlan {
+                    a_buf: state.wrap(
+                        AbWrap::A,
+                        shape.a_packed.as_ptr(),
+                        shape.a_packed.len(),
+                        true,
+                    )?,
+                    b_buf: state.wrap(
+                        AbWrap::B,
+                        shape.b_packed.as_ptr(),
+                        shape.b_packed.len(),
+                        true,
+                    )?,
+                    out_buf: state.wrap(AbWrap::Out, shape.out_ptr, shape.out_len, true)?,
+                    outer_lo: 0,
+                    outer_hi: n_outer,
+                    outer_per_group,
+                    within_outer_mask: shape.within_outer_mask,
+                    n_groups,
+                };
+                let mut w_min = f64::MAX;
+                let mut n_walls = 0usize;
+                let mut walls = [0.0f64; AB_CALIBRATION_REPLAYS];
+                for slot in &mut walls {
+                    let cb = ab_submit(gpu, state, &plan)?;
+                    let ok = gpu.wait_cb(cb);
+                    let w = if ok.is_ok() {
+                        zc_fold_gpu_wall_ms(gpu, cb)
+                    } else {
+                        0.0
+                    };
+                    gpu.release(cb);
+                    ok?;
+                    if w <= 0.0 {
+                        break;
+                    }
+                    *slot = w;
+                    n_walls += 1;
+                    let prev_min = w_min;
+                    w_min = w_min.min(w);
+                    // Converged: at least three back-to-back replays (~100%
+                    // duty ramps the governor in one or two) and this wall
+                    // did not improve the best seen by more than 5%.
+                    if n_walls >= 3 && w > 0.95 * prev_min {
+                        break;
+                    }
+                }
+                if super::gpu_ab_precompute_debug() {
+                    eprintln!(
+                        "[gpu-ab] calibration walls (full {n_outer} chunks, tg={}): {:?}",
+                        state.tg,
+                        &walls[..n_walls]
+                    );
+                }
+                if n_walls == 0 {
+                    return Err("no usable AB calibration wall".into());
+                }
+                Ok((w_min, n_walls))
+            })();
+            gpu.pool_pop(pool);
+            r
+        };
+        match measured {
+            Ok((w_min, _)) => {
+                AB_GPU_FULL_MS.store(w_min.to_bits(), Relaxed);
+                Some(w_min)
+            }
+            Err(e) => {
+                AB_LATCHED_OFF.store(true, Relaxed);
+                if super::gpu_ab_precompute_debug() {
+                    eprintln!("[gpu-ab] calibration failed, arm off: {e}");
+                }
+                None
+            }
+        }
+    }
+
+    /// Back-to-back full-range replays allowed while the GPU clock ramps.
+    const AB_CALIBRATION_REPLAYS: usize = 6;
+
+    unsafe fn ab_upload_bmed(gpu: &Gpu, state: &mut AbPre, counts: &[u8]) -> Result<(), String> {
+        let need = counts.len().max(16);
+        let (mut buf, mut cap) = (state.bmed_buf, state.bmed_cap);
+        unsafe { state.ensure_small(&mut buf, &mut cap, need)? };
+        state.bmed_buf = buf;
+        state.bmed_cap = cap;
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                counts.as_ptr(),
+                gpu.buffer_contents(state.bmed_buf),
+                counts.len(),
+            );
+        }
+        Ok(())
+    }
+
+    /// Close the warmup: publish the share the rest of the process runs at.
+    /// Separated from [`calibrate_ab_precompute`] so the caller can restore
+    /// the CPU-authoritative bytes in between.
+    pub(crate) fn publish_ab_share(sample: super::AbGateSample) -> usize {
+        use std::sync::atomic::Ordering::Relaxed;
+        let g = if AB_LATCHED_OFF.load(Relaxed) {
+            0
+        } else {
+            super::ab_gate_share(sample)
+        };
+        AB_TUNED_CHUNKS.store(g, Relaxed);
+        AB_CALIBRATED.store(true, Relaxed);
+        if g == 0 && super::ab_precompute_pct_override().is_none() {
+            // Nothing will dispatch this process, so give the three 512 MiB
+            // no-copy views back: their pages stay wired for as long as the
+            // Metal buffer exists, and on a host that gates the arm off that
+            // is 1.5 GiB of pressure bought for nothing.
+            ab_release_wraps();
+        }
+        if super::gpu_ab_precompute_debug() {
+            let u_cpu = sample.ab_arm_ms / sample.n_outer.max(1) as f64;
+            eprintln!(
+                "[gpu-ab] gate commit_arm={:.2}ms ab_arm={:.2}ms slack={:.2}ms \
+                 gpu_full={:.2}ms -> share {g}/{} (predicted saving {:.2} ms)",
+                sample.commit_arm_ms,
+                sample.ab_arm_ms,
+                sample.ab_arm_ms - sample.commit_arm_ms,
+                sample.gpu_full_ms,
+                sample.n_outer,
+                g as f64 * u_cpu,
+            );
+        }
+        g
+    }
+
+    /// Drop every cached no-copy view, releasing its page wiring.
+    fn ab_release_wraps() {
+        if let Ok(mut guard) = AB_PRE.lock()
+            && let Some(Ok(state)) = guard.as_mut()
+        {
+            for slot in state.wraps.iter_mut() {
+                if let Some((_, _, buf)) = slot.take() {
+                    // SAFETY: no dispatch is in flight — the arm is settled at
+                    // share 0 and every job holds the same mutex.
+                    unsafe { state.gpu.release(buf) };
+                }
+            }
+        }
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn ab_gpu_full_ms() -> f64 {
+        f64::from_bits(AB_GPU_FULL_MS.load(std::sync::atomic::Ordering::Relaxed))
+    }
+
+    pub(crate) fn ab_calibration_done() -> bool {
+        AB_CALIBRATED.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    pub(crate) fn ab_latch_off(reason: &str) {
+        AB_LATCHED_OFF.store(true, std::sync::atomic::Ordering::Relaxed);
+        AB_TUNED_CHUNKS.store(0, std::sync::atomic::Ordering::Relaxed);
+        if super::gpu_ab_precompute_debug() {
+            eprintln!("[gpu-ab] arm latched off: {reason}");
+        }
+    }
+
+    #[cfg(test)]
+    mod split_select_tests {
+        use super::{
+            DEFAULT_HYBRID_K, RANKED_EXACT_TUNE_CANDIDATES, choose_hybrid_k,
+            collect_ranked_exact_samples, mean_ranked_exact_samples,
+        };
+        const C: [usize; 8] = [0, 2, 3, 4, 5, 6, 7, 8];
+
+        #[test]
+        fn broad_candidate_set_is_stable() {
+            assert_eq!(RANKED_EXACT_TUNE_CANDIDATES, C);
+        }
+
+        #[test]
+        fn exact_samples_are_broad_balanced_and_each_reprimed() {
+            let events = std::cell::RefCell::new(Vec::new());
+            let samples = collect_ranked_exact_samples(
+                || {
+                    events.borrow_mut().push(-1);
+                    Ok::<(), ()>(())
+                },
+                |k| {
+                    events.borrow_mut().push(k as i32);
+                    Ok::<f64, ()>(k as f64)
+                },
+            )
+            .unwrap();
+            assert_eq!(
+                *events.borrow(),
+                [
+                    -1, 0, -1, 2, -1, 3, -1, 4, -1, 5, -1, 6, -1, 7, -1, 8, -1, 8,
+                    -1, 7, -1, 6, -1, 5, -1, 4, -1, 3, -1, 2, -1, 0,
+                ]
+            );
+            assert_eq!(samples[0], [0.0, 0.0]);
+            assert_eq!(samples[7], [8.0, 8.0]);
+        }
+
+        #[test]
+        fn exact_selection_uses_valid_balanced_means() {
+            let mut samples = [[100.0; 2]; RANKED_EXACT_TUNE_CANDIDATES.len()];
+            samples[1] = [90.0, 110.0];
+            assert_eq!(mean_ranked_exact_samples(samples).unwrap()[1], 100.0);
+            samples[1][1] = f64::NAN;
+            assert!(mean_ranked_exact_samples(samples).is_none());
+        }
+
+        #[test]
+        fn smallest_share_within_band_wins() {
+            // k=3 fastest; k=2 within 1.5%; default k=5 far off → smallest in band.
+            let ms = [200.0, 100.5, 100.0, 120.0, 150.0, 150.0, 150.0, 150.0];
+            assert_eq!(choose_hybrid_k(&C, &ms, DEFAULT_HYBRID_K), Some(2));
+        }
+
+        #[test]
+        fn default_near_tie_keeps_default() {
+            // k=3 fastest but default k=5 within 1.5% → default retained.
+            let ms = [200.0, 130.0, 100.0, 120.0, 101.0, 150.0, 150.0, 150.0];
+            assert_eq!(choose_hybrid_k(&C, &ms, DEFAULT_HYBRID_K), Some(5));
+        }
+
+        #[test]
+        fn marginal_pure_gpu_is_rejected() {
+            // k=0 fastest but beats the default by < 4% → default retained.
+            let ms = [100.0, 130.0, 130.0, 130.0, 103.0, 150.0, 150.0, 150.0];
+            assert_eq!(choose_hybrid_k(&C, &ms, DEFAULT_HYBRID_K), Some(5));
+        }
+
+        #[test]
+        fn decisive_pure_gpu_wins() {
+            // k=0 beats the default by > 4% and nothing else is in band.
+            let ms = [100.0, 130.0, 130.0, 130.0, 120.0, 150.0, 150.0, 150.0];
+            assert_eq!(choose_hybrid_k(&C, &ms, DEFAULT_HYBRID_K), Some(0));
+        }
+
+        #[test]
+        fn k8_is_reachable() {
+            // Largest share wins decisively → the sweep can now choose it.
+            let ms = [200.0, 180.0, 170.0, 160.0, 150.0, 140.0, 130.0, 100.0];
+            assert_eq!(choose_hybrid_k(&C, &ms, DEFAULT_HYBRID_K), Some(8));
+        }
 
         #[test]
         #[should_panic(expected = "default split is a sweep candidate")]
@@ -8448,6 +10202,22 @@ kernel void zc_r2_products(
         }
         let buf = unsafe { gpu.wrap_buffer(data.as_ptr().cast_mut(), len)? };
         state.wraps.push((ptr, len, buf));
+        // Observability only (no behaviour change). This cache is keyed on the
+        // caller's address and never evicts, so it silently depends on
+        // `a_packed`/`b_packed` keeping one address for the life of the
+        // process: a moved buffer builds a FRESH 512 MiB no-copy wrap, and
+        // Metal wires its pages on first GPU touch. Measured on the unmodified
+        // 8ab729c, that is exactly what happened — two wraps in the warmup
+        // prove and a THIRD inside the timed prove, in every worker process.
+        // The owner-exclusive pins that `take_f128_exclusive` puts on `a` and
+        // `b` (see `scratch::ExclusiveOwner`) are what now hold those
+        // addresses still; this line is how that is proven per prove.
+        if super::gpu_zc_r2_debug() {
+            eprintln!(
+                "[zc-r2-wrap] CREATED wrap #{} ptr={ptr:#x} len={len}",
+                state.wraps.len()
+            );
+        }
         Ok(buf)
     }
 
@@ -10069,6 +11839,19 @@ pub(crate) use imp::{ZcT3Job, ZcT3Result, launch_zc_t3_products, zc_t3_wait};
 #[cfg_attr(not(test), allow(unused_imports))]
 pub(crate) use imp::{ZcLoopJob, ZcLoopResult, launch_zc_loop_products, zc_loop_wait};
 
+/// Round-one AB precompute GPU arm (see [`ENV_NO_GPU_AB_PRECOMPUTE`]).
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[allow(unused_imports)]
+pub(crate) use imp::{
+    AbPrecomputeJob, AbShape, ab_calibration_done, ab_gpu_full_ms, ab_latch_off,
+    ab_precompute_stats, ab_shape_supported, calibrate_ab_precompute,
+    launch_ab_precompute_prefix, publish_ab_share,
+};
+#[cfg(all(test, target_os = "macos", target_arch = "aarch64"))]
+pub(crate) use imp::{
+    ab_force_calibrated_share_for_test, ab_gpu_range_for_test, ab_reset_for_test,
+};
+
 #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
 mod imp {
     use super::*;
@@ -10161,11 +11944,79 @@ mod imp {
     pub(crate) fn give_tree(_tree: Vec<crate::merkle::Hash>) {}
 
     pub(crate) fn staging_released() {}
+
+    // --- AB precompute arm: never available off macOS/aarch64. ---
+
+    pub(crate) struct AbShape<'a> {
+        pub a_packed: &'a [u8],
+        pub b_packed: &'a [u8],
+        pub out_ptr: *mut u8,
+        pub out_len: usize,
+        pub table_image: &'a [u8],
+        pub within_outer_mask: usize,
+        pub b_med_counts: &'a [u8],
+    }
+
+    pub(crate) struct AbPrecomputeJob(std::convert::Infallible);
+
+    impl AbPrecomputeJob {
+        pub(crate) fn outer_hi(&self) -> usize {
+            match self.0 {}
+        }
+        pub(crate) fn finish(
+            self,
+            _cpu_suffix_ms: f64,
+            _n_cpu_chunks: usize,
+        ) -> Result<(), String> {
+            match self.0 {}
+        }
+    }
+
+    pub(crate) unsafe fn launch_ab_precompute_prefix(
+        _shape: &AbShape<'_>,
+    ) -> Option<AbPrecomputeJob> {
+        None
+    }
+
+    pub(crate) unsafe fn calibrate_ab_precompute(_shape: &AbShape<'_>) -> Option<f64> {
+        None
+    }
+
+    pub(crate) fn publish_ab_share(_sample: super::AbGateSample) -> usize {
+        0
+    }
+
+    pub(crate) fn ab_gpu_full_ms() -> f64 {
+        0.0
+    }
+
+    pub(crate) fn ab_calibration_done() -> bool {
+        false
+    }
+
+    pub(crate) fn ab_latch_off(_reason: &str) {}
+
+    pub(crate) fn ab_shape_supported(_shape: &AbShape<'_>) -> bool {
+        false
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn ab_precompute_stats() -> super::AbArmStats {
+        super::AbArmStats::default()
+    }
 }
 
 #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
 #[cfg_attr(not(test), allow(unused_imports))]
 pub(crate) use imp::{gpu_merkle_tree_blake3, gpu_ntt_interleaved_from_layer};
+
+#[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+#[allow(unused_imports)]
+pub(crate) use imp::{
+    AbPrecomputeJob, AbShape, ab_calibration_done, ab_gpu_full_ms, ab_latch_off,
+    ab_precompute_stats, ab_shape_supported, calibrate_ab_precompute,
+    launch_ab_precompute_prefix, publish_ab_share,
+};
 
 #[cfg(test)]
 mod tests {

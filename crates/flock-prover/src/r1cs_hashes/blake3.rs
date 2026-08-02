@@ -2131,8 +2131,23 @@ pub(crate) mod witgen_simd {
         let padding: Compression = ([0u32; 8], [0u32; 16], 0u64, 0u32, 0u32);
         let total_f128 = n_total * F128_PER_BLOCK;
         let mut z = flock_core::scratch::take_f128(total_f128);
-        let mut a = flock_core::scratch::take_f128(total_f128);
-        let mut b = flock_core::scratch::take_f128(total_f128);
+        // `a` and `b` are OWNER-EXCLUSIVE: the AB-precompute GPU arm keeps a
+        // process-lifetime `newBufferWithBytesNoCopy` view of each, and at the
+        // ranked m = 32 they share the 512 MiB size class with `z`, the
+        // `Round1AbInner` transform and several PCS transients. Ordinary
+        // `take_f128` is smallest-fit, so those three consecutive takes can
+        // permute across proves — which would move a wrapped address and force
+        // a fresh 512 MiB wrap (and its page wiring) inside a timed prove.
+        // With the arm off these are ordinary pooled buffers with a reserved
+        // slot; nothing about their contents or use changes.
+        let mut a = flock_core::scratch::take_f128_exclusive(
+            flock_core::scratch::ExclusiveOwner::AbPrecomputeA,
+            total_f128,
+        );
+        let mut b = flock_core::scratch::take_f128_exclusive(
+            flock_core::scratch::ExclusiveOwner::AbPrecomputeB,
+            total_f128,
+        );
 
         let mut stream = stream_params.and_then(|params| {
             // SAFETY: z's allocation/address stays fixed until the returned
@@ -2831,18 +2846,6 @@ impl Blake3Setup {
         use std::sync::atomic::{AtomicUsize, Ordering};
         static PROVE_FAST_CALLS: AtomicUsize = AtomicUsize::new(0);
         let call = PROVE_FAST_CALLS.fetch_add(1, Ordering::Relaxed);
-        // Seed pipelining: on the timed call the proof for these blocks may
-        // already be several milliseconds in flight on the seed-pipe thread,
-        // started the moment the harness wrote the seed instead of after the
-        // protected wrapper's serial expansion of it. Adoption is gated on a
-        // full byte-equality check of `blocks`; see `crate::seed_pipe`. This
-        // must run before the keep-warm pause below — on the adopted path the
-        // speculative thread already issued it at its own prove entry.
-        if call > 0 {
-            if let Some(adopted) = crate::seed_pipe::try_adopt(blocks) {
-                return adopted;
-            }
-        }
         // The GPU keep-warm bridge must never overlap a prove: pause it for
         // the whole prove; the warmup latch paths re-arm it on completion of
         // the first ranked commit (untimed), bridging the warmup CPU tail
@@ -2864,45 +2867,9 @@ impl Blake3Setup {
         let (proof, commitment, claim) = self.prove_fast_inner(blocks, challenger);
         if call == 0 {
             let (proof, commitment) = warm_publish_path(proof, commitment);
-            // Last thing the untimed warm-up does: hand stdin to the seed-pipe
-            // thread. The worker publishes its ready file immediately after we
-            // return and only then touches `io::stdin()`, so the splice lands
-            // outside every measured interval and before the wrapper's
-            // `BufReader` binds a descriptor.
-            self.arm_seed_pipe();
             return (proof, commitment, claim);
         }
         (proof, commitment, claim)
-    }
-
-    /// Start the speculative seed pipeline for this setup. No-op outside the
-    /// ranked worker and under `FLOCK_NO_SEED_PIPE=1`.
-    fn arm_seed_pipe(&self) {
-        if !self.n_blocks.is_power_of_two() {
-            return;
-        }
-        crate::seed_pipe::arm(
-            self.n_blocks.trailing_zeros(),
-            std::ptr::from_ref(self) as usize,
-            Self::run_speculative_prove,
-        );
-    }
-
-    /// Body of a speculative proof: identical to the timed call the wrapper
-    /// would have made, including a challenger built from the benchmark domain
-    /// and hash, so the emitted proof bytes are the same ones.
-    fn run_speculative_prove(setup_addr: usize, blocks: &[Compression]) -> crate::seed_pipe::ProveOut {
-        // SAFETY: `setup_addr` is the address of the `Blake3Setup` the ranked
-        // worker builds in `main` and holds until the process exits, so it
-        // outlives this thread. Only shared reads happen through it — the same
-        // `&self` the Rayon pool already fans out during any prove.
-        let setup: &Self = unsafe { &*(setup_addr as *const Self) };
-        flock_core::gpu_commit::gpu_keepwarm_prove_started();
-        let mut challenger = flock_core::challenger::FsChallenger::with_hash(
-            crate::seed_pipe::BENCH_DOMAIN,
-            HashKind::Blake3,
-        );
-        setup.prove_fast_inner(blocks, &mut challenger)
     }
 
     fn prove_fast_inner<Ch: Challenger>(
