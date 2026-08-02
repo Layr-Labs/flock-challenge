@@ -8959,9 +8959,17 @@ kernel void zc_t3_products(
     /// muls per pair), so its per-chunk cost is a larger fraction of the
     /// fused chunk than r2's anchors-only sibling: ALPHA = 0.65. Same
     /// balanced form `(hi - (1-ALPHA) g) c_f = g u_g` ⇒
-    /// `g* = hi/(ratio + 0.35)`; same 7·hi/8 overshoot cap, same hi/8
+    /// `g* = hi/(ratio + 0.35)`; same 15·hi/16 overshoot cap, same hi/8
     /// admission floor for ratios in (2, 8), same ≥ 8 disable (ticket-26
     /// clamp-audit law, instance five).
+    /// Cap history: this arm shared r2's 7·hi/8 guard until v18 (eace1dc7)
+    /// moved r2 to 15·hi/16 after its cap bound a third time — the GPU
+    /// drained its zc-r2 prefix early and sat idle inside the round wall.
+    /// t3's balance point hi/(ratio+0.35) is *more* cap-bound than r2's
+    /// (g* ≈ 2.1·hi at the ranked warmup ratio), and at 15·hi/16 the GPU
+    /// only straggles once the true timed ratio exceeds
+    /// (1 − 0.65·15/16)/(15/16) ≈ 0.717 — 26% above the ~0.57 measured on
+    /// the ranked M3 Max, the safest margin of any cap move in this family.
     const ZC_T3_ALPHA: f64 = 0.65;
     const ZC_T3_MAX_RATIO: f64 = 2.0;
     const ZC_T3_FLOOR_MAX_RATIO: f64 = 8.0;
@@ -8977,7 +8985,7 @@ kernel void zc_t3_products(
             return 0;
         }
         let g = (hi_size as f64 / (ratio + (1.0 - ZC_T3_ALPHA))).round();
-        (g as usize).min(hi_size * 7 / 8)
+        (g as usize).min(hi_size * 15 / 16)
     }
 
     fn zc_t3_init(gpu: &'static Gpu) -> Result<ZcT3, String> {
@@ -9191,7 +9199,7 @@ kernel void zc_t3_products(
             // halved. 64 chunks still price the kernel stably.
             (hi_size / 32).clamp(8, 64)
         } else {
-            tuned.min(hi_size * 7 / 8)
+            tuned.min(hi_size * 15 / 16)
         };
         if chunks == 0 {
             return None;
@@ -11746,6 +11754,31 @@ DEF_PROBE(probe_g4_t8_p0,    8u,  0u,   tsel & 7u)
         assert_eq!(zc_r2_gate_share(f64::NAN, 2048), 0);
         assert_eq!(zc_r2_gate_share(0.0, 2048), 0);
         assert_eq!(zc_r2_gate_share(-1.0, 2048), 0);
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    fn zc_t3_gate_share_policy() {
+        use imp::zc_t3_gate_share;
+        // Balance point hi/(ratio+0.35); ranked-observed ratios land far
+        // above the 15·hi/16 cap, which is the binding overshoot guard.
+        assert_eq!(zc_t3_gate_share(0.125, 2048), 1920); // g* ≈ 2.1·hi
+        assert_eq!(zc_t3_gate_share(0.57, 2048), 1920);
+        assert_eq!(zc_t3_gate_share(0.62, 2048), 1920);
+        // The guard still binds before the GPU can straggle: at 15/16 the
+        // crossover is (1-0.65·15/16)/(15/16) ≈ 0.717, above the ranked 0.57.
+        assert!(zc_t3_gate_share(0.72, 2048) < 2048);
+        // Slow-but-usable GPU: the formula takes over below the cap.
+        assert_eq!(zc_t3_gate_share(1.0, 2048), 1517); // 2048/1.35
+        assert_eq!(zc_t3_gate_share(2.0, 2048), 871); // 2048/2.35
+        // Admission floor for ratios in (2, 8): hi/8, not 0.
+        assert_eq!(zc_t3_gate_share(2.01, 2048), 256);
+        assert_eq!(zc_t3_gate_share(7.9, 2048), 256);
+        // Past the floor ceiling, or unusable: exact incumbent.
+        assert_eq!(zc_t3_gate_share(8.0, 2048), 0);
+        assert_eq!(zc_t3_gate_share(f64::NAN, 2048), 0);
+        assert_eq!(zc_t3_gate_share(0.0, 2048), 0);
+        assert_eq!(zc_t3_gate_share(-1.0, 2048), 0);
     }
 
     /// The lincheck arm's GPU prefix equals the CPU fold over exactly the
