@@ -655,6 +655,13 @@ pub fn precompute_round1_ab_inner_packed_padded(
     )
 }
 
+/// x_outers per atomic-queue claim in the AB precompute's chunk queue (see
+/// below). Sized like `BLAKE3_LEAF_QUEUE_CHUNK`/`BLAKE3_PARENT_QUEUE_CHUNK` in
+/// `merkle.rs`: large enough that the shared atomic counter isn't hot even at
+/// the ranked block count (n_outer in the hundreds of thousands), small
+/// enough that no worker's tail group dominates the wall clock.
+const AB_PRECOMPUTE_QUEUE_GROUP: usize = 512;
+
 /// Store-flavor-parameterized body; the public wrapper passes the latched env
 /// choice, tests compare both arms byte-for-byte in one process.
 fn precompute_round1_ab_inner_packed_padded_with_flavor(
@@ -666,8 +673,6 @@ fn precompute_round1_ab_inner_packed_padded_with_flavor(
     padding: &PaddingSpec,
     nt: bool,
 ) -> Round1AbInner {
-    use rayon::prelude::*;
-
     assert_eq!(k_skip, K_SKIP, "optimized variant is k_skip=6 only");
     assert!(
         m >= k_skip + N_INNER,
@@ -698,15 +703,38 @@ fn precompute_round1_ab_inner_packed_padded_with_flavor(
     let out_bytes: &mut [u8] =
         unsafe { core::slice::from_raw_parts_mut(storage.as_mut_ptr() as *mut u8, total_bytes) };
 
-    out_bytes
-        .par_chunks_mut(OUTER_BYTES)
-        .enumerate()
-        .for_each_init(
-            || ([F8::ZERO; ELL], [F8::ZERO; ELL]),
-            |(a_col, b_col), (x_outer, out_outer)| {
+    // Chunk-queue dispatch (grouped) instead of a static rayon split, so the
+    // efficiency-core helper pool (when present) can steal x_outer work
+    // alongside the main pool while `pcs::commit` runs concurrently via
+    // `rayon::join` — see `epool`. Each x_outer still writes only its own
+    // disjoint `out_bytes[x_outer*OUTER_BYTES .. (x_outer+1)*OUTER_BYTES]`
+    // range and reads only immutable `a_packed`/`b_packed`, so output is
+    // byte-identical to the static split regardless of which pool (or which
+    // worker within a pool) claims which group. Groups of
+    // `AB_PRECOMPUTE_QUEUE_GROUP` x_outers per atomic-queue claim keep queue
+    // overhead off the hot path (one claim per x_outer is several times
+    // slower at this chunk count).
+    let n_outer = out_bytes.len() / OUTER_BYTES;
+    debug_assert_eq!(out_bytes.len() % OUTER_BYTES, 0);
+    let out_base = crate::epool::SyncPtr(out_bytes.as_mut_ptr());
+    crate::epool::run_hetero_chunks_stateful(
+        n_outer.div_ceil(AB_PRECOMPUTE_QUEUE_GROUP),
+        || ([F8::ZERO; ELL], [F8::ZERO; ELL]),
+        |(a_col, b_col), group| {
+            let start = group * AB_PRECOMPUTE_QUEUE_GROUP;
+            let end = (start + AB_PRECOMPUTE_QUEUE_GROUP).min(n_outer);
+            for x_outer in start..end {
+                let chunk_byte_base = x_outer * OUTER_BYTES;
+                // SAFETY: the queue hands out each `x_outer` exactly once
+                // across both pools, and `[chunk_byte_base, chunk_byte_base +
+                // OUTER_BYTES)` ranges are pairwise disjoint and in-bounds
+                // (`x_outer < n_outer == out_bytes.len() / OUTER_BYTES`), so
+                // this closure holds the only `&mut` into its range.
+                let out_outer = unsafe {
+                    core::slice::from_raw_parts_mut(out_base.ptr().add(chunk_byte_base), OUTER_BYTES)
+                };
                 let within_hash_outer = x_outer & within_outer_mask;
                 let n_b_med = b_med_counts[within_hash_outer] as usize;
-                let chunk_byte_base = x_outer * OUTER_BYTES;
 
                 // NT arm: the kernel writes a stack temporary and the 64-byte
                 // block drains to the big buffer with `stnp` (write-once
@@ -766,8 +794,9 @@ fn precompute_round1_ab_inner_packed_padded_with_flavor(
                 } else {
                     out_outer[n_b_med * 64..].fill(0);
                 }
-            },
-        );
+            }
+        },
+    );
 
     Round1AbInner { storage }
 }
