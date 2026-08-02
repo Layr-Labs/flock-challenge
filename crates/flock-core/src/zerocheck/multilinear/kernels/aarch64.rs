@@ -770,6 +770,64 @@ pub(crate) unsafe fn fold_compact_chunk_neon_unchecked_8(
     lo_size: usize,
     degen: bool,
 ) -> (F128, F128) {
+    unsafe {
+        fold_compact_chunk_neon_impl::<true>(
+            scaled_table,
+            anchors,
+            deltas,
+            a_out,
+            b_out,
+            eq_lo,
+            lo_size,
+            degen,
+        )
+    }
+}
+
+/// Message-only twin of [`fold_compact_chunk_neon_unchecked_8`]: identical
+/// reconstruction and accumulation chain with the level stores compiled out
+/// (`STORE = false`), so the deferred round-three pass reads the compact
+/// level without materializing it. Output pointers are never dereferenced and
+/// may be null.
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "aes")]
+pub(crate) unsafe fn fold_compact_chunk_neon_msg_only_8(
+    scaled_table: *const u8,
+    anchors: *const F128,
+    deltas: *const u8,
+    eq_lo: *const F128,
+    lo_size: usize,
+    degen: bool,
+) -> (F128, F128) {
+    unsafe {
+        fold_compact_chunk_neon_impl::<false>(
+            scaled_table,
+            anchors,
+            deltas,
+            core::ptr::null_mut(),
+            core::ptr::null_mut(),
+            eq_lo,
+            lo_size,
+            degen,
+        )
+    }
+}
+
+/// Shared body for the storing and message-only compact chunk kernels. The
+/// `STORE` const keeps one transcription of the reconstruction arithmetic;
+/// when `STORE = false` the two output pointers are never read or written.
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "aes")]
+unsafe fn fold_compact_chunk_neon_impl<const STORE: bool>(
+    scaled_table: *const u8,
+    anchors: *const F128,
+    deltas: *const u8,
+    a_out: *mut F128,
+    b_out: *mut F128,
+    eq_lo: *const F128,
+    lo_size: usize,
+    degen: bool,
+) -> (F128, F128) {
     use core::arch::aarch64::*;
 
     #[inline(always)]
@@ -811,8 +869,10 @@ pub(crate) unsafe fn fold_compact_chunk_neon_unchecked_8(
                 let b0 = vld1q_u64(anchors.add(2 * out + 1).cast::<u64>());
                 let b1 = vld1q_u64(anchors.add(2 * (out + 1) + 1).cast::<u64>());
 
-                store_pair_nt(a_out.add(out), a0, a1);
-                store_pair_nt(b_out.add(out), b0, b1);
+                if STORE {
+                    store_pair_nt(a_out.add(out), a0, a1);
+                    store_pair_nt(b_out.add(out), b0, b1);
+                }
 
                 let eq_l = vld1q_u64(eq_lo.add(x_lo).cast::<u64>());
                 let g1 = if is_zero_q(veorq_u64(b1, one_q)) {
@@ -853,11 +913,156 @@ pub(crate) unsafe fn fold_compact_chunk_neon_unchecked_8(
                 b1_delta,
             );
 
-            store_pair_nt(a_out.add(out), a0, a1);
-            store_pair_nt(b_out.add(out), b0, b1);
+            if STORE {
+                store_pair_nt(a_out.add(out), a0, a1);
+                store_pair_nt(b_out.add(out), b0, b1);
+            }
 
             let g1 = mul_q(a1, b1);
             let g_inf = mul_q(veorq_u64(a0, a1), veorq_u64(b0, b1));
+            let eq_l = vld1q_u64(eq_lo.add(x_lo).cast::<u64>());
+            wide_xor(&mut p1_acc, mul_unreduced_q(eq_l, g1));
+            wide_xor(&mut pinf_acc, mul_unreduced_q(eq_l, g_inf));
+        }
+
+        (
+            core::mem::transmute::<uint64x2_t, F128>(reduce_wide_q(p1_acc)),
+            core::mem::transmute::<uint64x2_t, F128>(reduce_wide_q(pinf_acc)),
+        )
+    }
+}
+
+/// Two-challenge compact reconstruction chunk: binds the next multilinear
+/// challenge `rho2` directly on top of the rho1-composed byte table, writes
+/// only the half-size level, and forms the following round's message. The
+/// intermediate one-challenge level never exists.
+///
+/// Reconstruction identity (XOR-linearity of every scaled byte bank):
+///
+/// `w = anchor0 + rho2·(anchor0 + anchor1) + T1(code0) + T12(code0 XOR code1)`
+///
+/// where `T1` is the rho1-scaled univariate fold table and `T12` the
+/// (rho1·rho2)-scaled one; both stay cache-resident. Outputs are past-LLC
+/// write-once streams, so stores use the same `stnp` hint as the
+/// one-challenge kernel.
+///
+/// `degen` enables the b≡1 chunk-class degeneration: quads whose four b delta
+/// codes are all zero reconstruct both b outputs from anchors alone (table
+/// entry 0 is zero in every scaled bank), and the message shortcuts
+/// (`wb0 + wb1 = 0` ⇒ skip the `G(∞)` mul chain, `wb1 = 1` ⇒
+/// `wa1·wb1 = wa1`) are additionally gated on the reconstructed values, so
+/// they are bit-exact by construction.
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "aes")]
+pub(crate) unsafe fn fold_compact2_chunk_neon_unchecked_8(
+    scaled_t1: *const u8,
+    scaled_t12: *const u8,
+    anchors: *const F128,
+    deltas: *const u8,
+    rho2: F128,
+    a_out: *mut F128,
+    b_out: *mut F128,
+    eq_lo: *const F128,
+    lo_size: usize,
+    degen: bool,
+) -> (F128, F128) {
+    use core::arch::aarch64::*;
+
+    #[inline(always)]
+    unsafe fn store_pair_nt(dst: *mut F128, x: uint64x2_t, y: uint64x2_t) {
+        unsafe {
+            core::arch::asm!(
+                "stnp {x:q}, {y:q}, [{dst}]",
+                dst = in(reg) dst,
+                x = in(vreg) x,
+                y = in(vreg) y,
+                options(nostack, preserves_flags),
+            );
+        }
+    }
+
+    unsafe {
+        let zero = vdupq_n_u64(0);
+        let mut p1_acc = WideNeon { lo: zero, hi: zero };
+        let mut pinf_acc = WideNeon { lo: zero, hi: zero };
+
+        let one_q = core::mem::transmute::<F128, uint64x2_t>(F128::ONE);
+        let rho2_q = core::mem::transmute::<F128, uint64x2_t>(rho2);
+
+        for x_lo in 0..lo_size {
+            // Two half-level outputs per eq_lo value, consuming the quad of
+            // compact entries `2·out .. 2·out+3`.
+            let out = 2 * x_lo;
+            let delta = deltas.add(2 * out * 16);
+            let a0_code = u64::from_le(core::ptr::read_unaligned(delta.cast::<u64>()));
+            let b0_code = u64::from_le(core::ptr::read_unaligned(delta.add(8).cast::<u64>()));
+            let a1_code = u64::from_le(core::ptr::read_unaligned(delta.add(16).cast::<u64>()));
+            let b1_code = u64::from_le(core::ptr::read_unaligned(delta.add(24).cast::<u64>()));
+            let a2_code = u64::from_le(core::ptr::read_unaligned(delta.add(32).cast::<u64>()));
+            let b2_code = u64::from_le(core::ptr::read_unaligned(delta.add(40).cast::<u64>()));
+            let a3_code = u64::from_le(core::ptr::read_unaligned(delta.add(48).cast::<u64>()));
+            let b3_code = u64::from_le(core::ptr::read_unaligned(delta.add(56).cast::<u64>()));
+            let ax0_code = a0_code ^ a1_code;
+            let ax1_code = a2_code ^ a3_code;
+
+            // rho2-bound anchor pairs (the anchor half of the identity).
+            let aa0 = vld1q_u64(anchors.add(4 * out).cast::<u64>());
+            let ab0 = vld1q_u64(anchors.add(4 * out + 1).cast::<u64>());
+            let aa1 = vld1q_u64(anchors.add(4 * out + 2).cast::<u64>());
+            let ab1 = vld1q_u64(anchors.add(4 * out + 3).cast::<u64>());
+            let aa2 = vld1q_u64(anchors.add(4 * out + 4).cast::<u64>());
+            let ab2 = vld1q_u64(anchors.add(4 * out + 5).cast::<u64>());
+            let aa3 = vld1q_u64(anchors.add(4 * out + 6).cast::<u64>());
+            let ab3 = vld1q_u64(anchors.add(4 * out + 7).cast::<u64>());
+            let an_a0 = veorq_u64(aa0, mul_q(rho2_q, veorq_u64(aa0, aa1)));
+            let an_a1 = veorq_u64(aa2, mul_q(rho2_q, veorq_u64(aa2, aa3)));
+            let an_b0 = veorq_u64(ab0, mul_q(rho2_q, veorq_u64(ab0, ab1)));
+            let an_b1 = veorq_u64(ab2, mul_q(rho2_q, veorq_u64(ab2, ab3)));
+
+            if degen && (b0_code | b1_code | b2_code | b3_code) == 0 {
+                // Zero b deltas across the quad: both b outputs are pure
+                // anchor folds with no lookups.
+                let (t1_a0, t1_a1) = fold_two_row_codes_q(scaled_t1, a0_code, a2_code);
+                let (t12_a0, t12_a1) = fold_two_row_codes_q(scaled_t12, ax0_code, ax1_code);
+                let wa0 = xor3_u64(an_a0, t1_a0, t12_a0);
+                let wa1 = xor3_u64(an_a1, t1_a1, t12_a1);
+                let wb0 = an_b0;
+                let wb1 = an_b1;
+
+                store_pair_nt(a_out.add(out), wa0, wa1);
+                store_pair_nt(b_out.add(out), wb0, wb1);
+
+                let eq_l = vld1q_u64(eq_lo.add(x_lo).cast::<u64>());
+                let g1 = if is_zero_q(veorq_u64(wb1, one_q)) {
+                    wa1
+                } else {
+                    mul_q(wa1, wb1)
+                };
+                wide_xor(&mut p1_acc, mul_unreduced_q(eq_l, g1));
+                let b_sum = veorq_u64(wb0, wb1);
+                if !is_zero_q(b_sum) {
+                    let g_inf = mul_q(veorq_u64(wa0, wa1), b_sum);
+                    wide_xor(&mut pinf_acc, mul_unreduced_q(eq_l, g_inf));
+                }
+                continue;
+            }
+
+            let bx0_code = b0_code ^ b1_code;
+            let bx1_code = b2_code ^ b3_code;
+            let (t1_a0, t1_a1, t1_b0, t1_b1) =
+                fold_four_row_codes_q(scaled_t1, a0_code, a2_code, b0_code, b2_code);
+            let (t12_a0, t12_a1, t12_b0, t12_b1) =
+                fold_four_row_codes_q(scaled_t12, ax0_code, ax1_code, bx0_code, bx1_code);
+            let wa0 = xor3_u64(an_a0, t1_a0, t12_a0);
+            let wa1 = xor3_u64(an_a1, t1_a1, t12_a1);
+            let wb0 = xor3_u64(an_b0, t1_b0, t12_b0);
+            let wb1 = xor3_u64(an_b1, t1_b1, t12_b1);
+
+            store_pair_nt(a_out.add(out), wa0, wa1);
+            store_pair_nt(b_out.add(out), wb0, wb1);
+
+            let g1 = mul_q(wa1, wb1);
+            let g_inf = mul_q(veorq_u64(wa0, wa1), veorq_u64(wb0, wb1));
             let eq_l = vld1q_u64(eq_lo.add(x_lo).cast::<u64>());
             wide_xor(&mut p1_acc, mul_unreduced_q(eq_l, g1));
             wide_xor(&mut pinf_acc, mul_unreduced_q(eq_l, g_inf));

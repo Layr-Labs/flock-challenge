@@ -27,7 +27,8 @@ pub mod univariate_skip_deg4_optimized;
 pub mod univariate_skip_optimized;
 
 use multilinear::{
-    UniSkipFoldTable, fold_and_compute_round_pair_into, fold_compact_and_compute_round_pair,
+    UniSkipFoldTable, compact_round_pair_deferred, fold_and_compute_round_pair_into,
+    fold_compact_and_compute_round_pair, fold_compact_twice_and_compute_round_pair,
     fold_in_place_pair, interpolate_at_z_combined, interpolate_at_z_on_lambda, round_pair_naive,
     uni_skip_fold_and_round_pair_compact_padded_with_deltas,
 };
@@ -40,6 +41,37 @@ use univariate_skip_optimized::{
 /// |Λ| = 2^K_SKIP = 64 elements; the round-1 prover message is two length-64
 /// vectors of F128.
 pub const K_SKIP: usize = 6;
+
+/// Kill switch for the two-challenge deferred compact binding of the first
+/// two multilinear rounds: `FLOCK_NO_ZC_COMPACT_DEFER2=1` restores the
+/// incumbent one-challenge materialization as a same-binary control. The
+/// proof and transcript are byte-identical either way; only the intermediate
+/// full-size level's stores and re-reads differ.
+pub const ENV_NO_ZC_COMPACT_DEFER2: &str = "FLOCK_NO_ZC_COMPACT_DEFER2";
+
+/// The deferred binding pays only when the one-challenge level it deletes is
+/// far past LLC size (it trades that level's streamed stores and re-reads for
+/// a second pass over the resident compact deltas). 2^21 pairs = 64 MiB of
+/// anchors; the ranked shape sits at 2^25.
+const ZC_COMPACT_DEFER2_MIN_LEN: usize = 1 << 21;
+
+#[cfg(test)]
+thread_local! {
+    static ZC_COMPACT_DEFER2_TEST_OVERRIDE: std::cell::Cell<Option<bool>> =
+        const { std::cell::Cell::new(None) };
+}
+
+fn zc_compact_defer2_enabled(compact_len: usize) -> bool {
+    #[cfg(test)]
+    if let Some(forced) = ZC_COMPACT_DEFER2_TEST_OVERRIDE.with(|v| v.get()) {
+        return forced && compact_len >= 8;
+    }
+    if compact_len < ZC_COMPACT_DEFER2_MIN_LEN {
+        return false;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os(ENV_NO_ZC_COMPACT_DEFER2).is_none())
+}
 
 /// Witness padding descriptor for URM work-skipping.
 ///
@@ -605,13 +637,49 @@ fn prove_packed_padded_inner<C: Challenger>(
     // post-fold tables expected by all subsequent rounds.
     let mut first_r_next = vec![F128::ONE; n_mlv - 1];
     first_r_next[1..].copy_from_slice(&r[k_skip + 2..]);
-    let (mut a_mlv, mut b_mlv, first_m1, first_mi) =
-        fold_compact_and_compute_round_pair(&compact_mlv, &fold_table, mlv_rhos[0], &first_r_next);
+    // Deferred two-challenge binding: compute this round's message straight
+    // from the compact level (no materialization), sample the next challenge,
+    // then bind both challenges in one half-size materialization. The
+    // one-challenge level — two full-size streamed tables plus their re-read
+    // by the next fused round — never exists. Messages, transcript, and all
+    // later tables are byte-identical to the incumbent cadence.
+    let defer2 = zc_compact_defer2_enabled(compact_mlv.len());
+    let (mut a_mlv, mut b_mlv, loop_start) = if defer2 {
+        let (first_m1, first_mi) =
+            compact_round_pair_deferred(&compact_mlv, &fold_table, mlv_rhos[0], &first_r_next);
+        multilinear_msgs.push((first_m1, first_mi));
+        challenger.observe_f128(first_m1);
+        challenger.observe_f128(first_mi);
+        mlv_rhos.push(challenger.sample_f128());
+
+        let mut second_r_next = vec![F128::ONE; n_mlv - 2];
+        second_r_next[1..].copy_from_slice(&r[k_skip + 3..]);
+        let (a_mlv, b_mlv, second_m1, second_mi) = fold_compact_twice_and_compute_round_pair(
+            &compact_mlv,
+            &fold_table,
+            mlv_rhos[0],
+            mlv_rhos[1],
+            &second_r_next,
+        );
+        multilinear_msgs.push((second_m1, second_mi));
+        challenger.observe_f128(second_m1);
+        challenger.observe_f128(second_mi);
+        mlv_rhos.push(challenger.sample_f128());
+        (a_mlv, b_mlv, 2usize)
+    } else {
+        let (a_mlv, b_mlv, first_m1, first_mi) = fold_compact_and_compute_round_pair(
+            &compact_mlv,
+            &fold_table,
+            mlv_rhos[0],
+            &first_r_next,
+        );
+        multilinear_msgs.push((first_m1, first_mi));
+        challenger.observe_f128(first_m1);
+        challenger.observe_f128(first_mi);
+        mlv_rhos.push(challenger.sample_f128());
+        (a_mlv, b_mlv, 1usize)
+    };
     compact_mlv.recycle();
-    multilinear_msgs.push((first_m1, first_mi));
-    challenger.observe_f128(first_m1);
-    challenger.observe_f128(first_mi);
-    mlv_rhos.push(challenger.sample_f128());
 
     // Ping-pong scratch buffers for the remaining fused path: each fused round folds
     // (a_mlv, b_mlv) of size N into size N/2. Rather than allocating — and,
@@ -633,7 +701,7 @@ fn prove_packed_padded_inner<C: Challenger>(
     // (T3's hetero drain is already behind us, so the delta is loop-only).
     let hetero_trace = std::env::var_os("FLOCK_ZC_TAIL_HETERO_TRACE").is_some();
     let hetero_claimed_before = crate::epool::helper_chunks_claimed();
-    for i in 1..(n_mlv - 1) {
+    for i in loop_start..(n_mlv - 1) {
         let rho_prev = mlv_rhos[i];
         let log_n_before = a_mlv.len().trailing_zeros() as usize;
 
@@ -1066,6 +1134,36 @@ mod tests {
 
         let mut verifier = FsChallenger::new(b"flock-c-stripe-proof-v0");
         assert_eq!(verify(M, &new_proof, &mut verifier), Ok(new_claim));
+    }
+
+    /// The deferred two-challenge compact binding must emit the exact
+    /// incumbent zerocheck proof, claim, and transcript, and the result must
+    /// still verify. Exercised across sizes so both the fused and serial
+    /// multilinear tails run after the deferred rounds.
+    #[test]
+    fn compact_defer2_proof_is_byte_identical() {
+        for &m in &[15usize, 16, 17] {
+            let mut rng = Rng::new(0xDEF2_0000 + m as u64);
+            let a = rng.bits(1 << m);
+            let b = rng.bits(1 << m);
+            let c: Vec<bool> = a.iter().zip(&b).map(|(x, y)| *x & *y).collect();
+            let (a_p, b_p, c_p) = pack_abc(&a, &b, &c);
+
+            ZC_COMPACT_DEFER2_TEST_OVERRIDE.with(|v| v.set(Some(false)));
+            let mut ch_off = FsChallenger::new(b"flock-defer2-v0");
+            let (proof_off, claim_off) = prove_packed(&a_p, &b_p, &c_p, m, &mut ch_off);
+
+            ZC_COMPACT_DEFER2_TEST_OVERRIDE.with(|v| v.set(Some(true)));
+            let mut ch_on = FsChallenger::new(b"flock-defer2-v0");
+            let (proof_on, claim_on) = prove_packed(&a_p, &b_p, &c_p, m, &mut ch_on);
+            ZC_COMPACT_DEFER2_TEST_OVERRIDE.with(|v| v.set(None));
+
+            assert_eq!(proof_on, proof_off, "m={m}");
+            assert_eq!(claim_on, claim_off, "m={m}");
+
+            let mut verifier = FsChallenger::new(b"flock-defer2-v0");
+            assert_eq!(verify(m, &proof_on, &mut verifier), Ok(claim_on), "m={m}");
+        }
     }
 
     /// **Verify rejects byte-mutated proofs.** Walk each component of the
