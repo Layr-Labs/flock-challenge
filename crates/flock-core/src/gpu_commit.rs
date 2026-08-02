@@ -413,12 +413,25 @@ pub fn gpu_recursive_merkle_blake3(
 /// timed proof may use it.
 pub const ENV_NO_GPU_GRIND: &str = "FLOCK_NO_GPU_GRIND";
 
+/// Diagnostic opt-in for bounded status-spinning the short serial PCS grind
+/// command buffers. Production blocks in `waitUntilCompleted`.
+pub const ENV_GPU_GRIND_SPIN: &str = "FLOCK_GPU_GRIND_SPIN";
+
 pub(crate) fn gpu_grind_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| match std::env::var(ENV_NO_GPU_GRIND) {
         Ok(value) => value != "1",
         Err(_) => true,
     })
+}
+
+fn gpu_grind_spin_enabled_from(value: Option<&std::ffi::OsStr>) -> bool {
+    value == Some(std::ffi::OsStr::new("1"))
+}
+
+fn gpu_grind_spin_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| gpu_grind_spin_enabled_from(std::env::var_os(ENV_GPU_GRIND_SPIN).as_deref()))
 }
 
 pub(crate) fn gpu_keepwarm_enabled() -> bool {
@@ -6140,14 +6153,15 @@ kernel void blake3_pow_scan(
                 const THREADS: u64 = 64;
                 gpu.dispatch(enc, u64::from(len).div_ceil(THREADS), THREADS);
                 gpu.end_encoding(enc);
-                // The grind sits on the transcript's serial spine: nothing
-                // else can run until the nonce is known, so the calling
-                // thread spins the sub-millisecond dispatch home instead of
-                // parking in `waitUntilCompleted` (measured ~0.5 ms of fixed
-                // roundtrip per scan, paid 7x per ranked prove). The 4 ms
-                // budget covers every observed scan wall with margin; past
-                // it the path degrades to the exact blocking wait.
-                gpu.commit_and_spin(cb, 4.0)?;
+                // Production blocks here so the grind does not contend with
+                // the E3 stripe helpers or perturb the proof's thermal state.
+                // The bounded status-spin path remains an exact-one diagnostic
+                // selector and still falls back to the same blocking wait.
+                if super::gpu_grind_spin_enabled() {
+                    gpu.commit_and_spin(cb, 4.0)?;
+                } else {
+                    gpu.commit_and_wait(cb)?;
+                }
                 let offset = out.read_volatile();
                 Ok((offset != u32::MAX).then(|| start + u64::from(offset)))
             })();
@@ -10171,6 +10185,16 @@ pub(crate) use imp::{gpu_merkle_tree_blake3, gpu_ntt_interleaved_from_layer};
 mod tests {
     use super::*;
     use crate::field::F128;
+
+    #[test]
+    fn gpu_grind_wait_is_default_and_spin_is_exact_opt_in() {
+        assert_eq!(ENV_GPU_GRIND_SPIN, "FLOCK_GPU_GRIND_SPIN");
+        assert!(!gpu_grind_spin_enabled_from(None));
+        assert!(gpu_grind_spin_enabled_from(Some("1".as_ref())));
+        for value in ["", "0", "2", "true"] {
+            assert!(!gpu_grind_spin_enabled_from(Some(value.as_ref())));
+        }
+    }
 
     /// GPU idle-decay probe at ranked size: full commit graph wall
     /// back-to-back vs after idle gaps. Ignored; run with --ignored --nocapture.
