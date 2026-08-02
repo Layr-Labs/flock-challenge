@@ -3648,6 +3648,14 @@ kernel void blake3_pow_scan(
         crate::alloc_uninit_vec(n)
     }
 
+    /// Kill switch for the latch-timer correction: `FLOCK_LATCH_TIMER_LEGACY=1`
+    /// puts the 64 MiB tree copy-out back inside `gpu_wall_ms`.
+    fn latch_timer_legacy() -> bool {
+        static ON: std::sync::LazyLock<bool> =
+            std::sync::LazyLock::new(|| std::env::var_os("FLOCK_LATCH_TIMER_LEGACY").is_some());
+        *ON
+    }
+
     fn debug_enabled() -> bool {
         std::env::var_os("FLOCK_COMMIT_TIMING").is_some()
             || std::env::var_os("FLOCK_GPU_COMMIT_DEBUG").is_some()
@@ -5112,13 +5120,39 @@ kernel void blake3_pow_scan(
                 });
                 let t0 = std::time::Instant::now();
                 run_commit_graph_from_z(gpu, z_buf, staging, tw_buf, tree_buf, log_d, n_leaves)?;
+                // Close the latch timer HERE, before the tree copy-out.
+                //
+                // `gpu_wall_ms` gates a decision about the *latched* path, and
+                // the latched path reads the tree in place out of `tree_buf`
+                // (zero-copy — see the `tree-exact -> latched ON` arm below).
+                // The 64 MiB `copy_bytes_parallel` on the next line exists only
+                // to give this warm-up run a CPU-side copy to compare against;
+                // charging it to the GPU arm makes the latch compare a graph
+                // nobody runs, and biases the comparison in one direction only
+                // (always against latching).
+                //
+                // Measured contaminant on this host: 2.23-5.98 ms (mean 3.66).
+                // Measured consequence: over 14 ranked-shape warm-ups, two
+                // processes sat within +-4 ms of the 1.10 threshold, and one
+                // (`cpu 421.84` vs `1.10 * gpu 386.66 = 425.33`) missed it by
+                // 3.49 ms — inside the contaminant band, i.e. it latches OFF
+                // solely because of this copy. An unlatched process runs a
+                // different commit path for ~54% of the proof.
+                //
+                // `FLOCK_LATCH_TIMER_LEGACY=1` restores the old contaminated
+                // timing for A/B.
+                let graph_only_ms = t0.elapsed().as_secs_f64() * 1e3;
                 copy_bytes_parallel(gpu.buffer_contents(tree_buf), {
                     core::slice::from_raw_parts_mut(
                         gpu_tree.as_mut_ptr().cast::<u8>(),
                         total_nodes * 32,
                     )
                 });
-                let gpu_wall_ms = t0.elapsed().as_secs_f64() * 1e3;
+                let gpu_wall_ms = if latch_timer_legacy() {
+                    t0.elapsed().as_secs_f64() * 1e3
+                } else {
+                    graph_only_ms
+                };
                 created.clear(); // ownership transfers to Latched
                 Ok(WarmupRun {
                     latched: Latched {
