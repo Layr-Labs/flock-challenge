@@ -479,6 +479,73 @@ pub(crate) unsafe fn fold_round2_compact_chunk_neon_unchecked_8(
     }
 }
 
+/// Anchors-and-deltas-only sibling of
+/// [`fold_round2_compact_chunk_neon_unchecked_8`]: identical anchor stores,
+/// identical delta bytes, identical padded-pair zeroing — but no `a1`/`b1`
+/// folds and no message products. Used for the chunks whose products the
+/// round-two GPU arm computes concurrently; byte-identical output is
+/// guaranteed because every store below is the same expression the fused
+/// kernel stores (the degen branch there is a value-preserving shortcut:
+/// `fold(all-ones) == fold(b0_code)` when `b0_code` is all-ones, and its
+/// delta lanes are `[a0^a1, 0] == [a0^a1, b0^b1]`).
+#[cfg(target_arch = "aarch64")]
+pub(crate) unsafe fn fold_round2_compact_chunk_neon_anchors_only_8(
+    table_data: *const u8,
+    a_packed: *const u8,
+    b_packed: *const u8,
+    anchors: *mut F128,
+    deltas: *mut u8,
+    lo_size: usize,
+    pair_idx_base: usize,
+    pair_in_block_mask: usize,
+    useful_pairs_inclusive: usize,
+) {
+    use core::arch::aarch64::*;
+
+    #[inline(always)]
+    unsafe fn store_anchor_pair_nt(dst: *mut F128, a: uint64x2_t, b: uint64x2_t) {
+        unsafe {
+            core::arch::asm!(
+                "stnp {a:q}, {b:q}, [{dst}]",
+                dst = in(reg) dst,
+                a = in(vreg) a,
+                b = in(vreg) b,
+                options(nostack, preserves_flags),
+            );
+        }
+    }
+
+    unsafe {
+        let zero = vdupq_n_u64(0);
+        for x_lo in 0..lo_size {
+            if ((pair_idx_base + x_lo) & pair_in_block_mask) >= useful_pairs_inclusive {
+                store_anchor_pair_nt(anchors.add(2 * x_lo), zero, zero);
+                vst1q_u64(deltas.add(x_lo * 16).cast::<u64>(), zero);
+                continue;
+            }
+            let row0 = 2 * x_lo;
+            let row1 = row0 + 1;
+            let a0_code = u64::from_le(core::ptr::read_unaligned(
+                a_packed.add(row0 * 8).cast::<u64>(),
+            ));
+            let a1_code = u64::from_le(core::ptr::read_unaligned(
+                a_packed.add(row1 * 8).cast::<u64>(),
+            ));
+            let b0_code = u64::from_le(core::ptr::read_unaligned(
+                b_packed.add(row0 * 8).cast::<u64>(),
+            ));
+            let b1_code = u64::from_le(core::ptr::read_unaligned(
+                b_packed.add(row1 * 8).cast::<u64>(),
+            ));
+            let (a0, b0) = fold_two_row_codes_q(table_data, a0_code, b0_code);
+            store_anchor_pair_nt(anchors.add(2 * x_lo), a0, b0);
+            let delta_pair =
+                core::mem::transmute::<[u64; 2], uint64x2_t>([a0_code ^ a1_code, b0_code ^ b1_code]);
+            vst1q_u64(deltas.add(x_lo * 16).cast::<u64>(), delta_pair);
+        }
+    }
+}
+
 /// XOR of the `L` table entries for byte lanes `lane0..lane0 + L` of `code`.
 /// One 16-byte L1 load per lane; the tree shape matches `fold_row_q` so the
 /// full-width (`L = 8`, `lane0 = 0`) case is instruction-equivalent.

@@ -103,6 +103,34 @@ pub(crate) fn gpu_lincheck_debug() -> bool {
     *ON
 }
 
+/// Kill switch for the zerocheck round-two PRODUCTS GPU arm:
+/// `FLOCK_NO_GPU_ZC_R2=1` keeps the whole round-two fused fold on the CPU
+/// (the exact incumbent). Unlike the refuted whole-phase tail offload, this
+/// arm computes ONLY the two round-two message accumulators for a measured
+/// prefix of the hi-chunks — the anchors and packed deltas that feed round
+/// three are produced by the CPU for every chunk, byte-identically, so the
+/// GPU's entire output surface is 32 bytes of reduced partials per chunk.
+/// The per-chunk partial values are bit-exact by construction (the fold is
+/// the same F2-linear byte-table XOR, the products use the oracle-proven
+/// emulated carry-less multiply, and the unreduced 256-bit accumulation is
+/// order-independent XOR), and the warmup calibration refuses to publish a
+/// share until the GPU's probe partials compare equal to the CPU's on the
+/// target machine itself.
+pub const ENV_NO_GPU_ZC_R2: &str = "FLOCK_NO_GPU_ZC_R2";
+
+pub(crate) fn gpu_zc_r2_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os(ENV_NO_GPU_ZC_R2).is_none());
+    *ON
+}
+
+/// Diagnostic trace for the round-two products arm (`FLOCK_ZC_R2_GPU_DEBUG=1`).
+pub(crate) fn gpu_zc_r2_debug() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_ZC_R2_GPU_DEBUG").is_some());
+    *ON
+}
+
 /// Kill switch for the cross-process warmup latch cache:
 /// `FLOCK_NO_WARMUP_LATCH_CACHE=1` restores the incumbent full dual-run +
 /// autotune sweep in every worker process. The cache changes **no timed
@@ -7530,6 +7558,702 @@ kernel void rec_parent_hash(device const uint* children [[buffer(0)]],
         }
         Some(tree)
     }
+
+    // -----------------------------------------------------------------------
+    // Zerocheck round-two PRODUCTS GPU arm (see `ENV_NO_GPU_ZC_R2`).
+    //
+    // The round-two fused fold sweeps 2^25 packed row pairs: per pair, four
+    // byte-table folds (F2-linear XOR gathers), the compact anchor/delta
+    // stores that feed round three, and the two message products
+    // `eq_lo ⊗ (a1·b1)` / `eq_lo ⊗ ((a0+a1)(b0+b1))` accumulated unreduced.
+    // This arm offloads ONLY the products for a measured prefix of the
+    // hi-chunks: the CPU keeps producing every anchor and delta byte
+    // (byte-identical, via an anchors-only variant of the same NEON kernel
+    // for prefix chunks), so the GPU's entire output is one reduced partial
+    // pair (32 bytes) per chunk, and the refuted whole-phase offload's
+    // 1.5 GiB output-wrap surface never exists.
+    //
+    // Bit-exactness: the fold is the same byte-table XOR (the 32 KiB table
+    // decomposes into 4 KiB of nibble tables by F2-linearity), the products
+    // use the emulated carry-less multiply already oracle-proven bit-exact
+    // on this board, and the unreduced 256-bit accumulation is
+    // order-independent XOR. Calibration additionally refuses to publish a
+    // share until the GPU probe's partials compare EQUAL to the CPU's own
+    // partials for the same chunks on the target machine itself; any
+    // mismatch or Metal failure poisons the arm for the process and every
+    // prove runs the exact incumbent.
+    // -----------------------------------------------------------------------
+
+    const ZC_R2_MSL_SOURCE: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+// 32x32 -> 64 carry-less multiply via 4-bit-spaced masked integer multiplies.
+static inline ulong clmul32(uint a, uint b) {
+    const ulong M0 = 0x1111111111111111UL, M1 = 0x2222222222222222UL,
+                M2 = 0x4444444444444444UL, M3 = 0x8888888888888888UL;
+    ulong a0 = a & 0x11111111u, a1 = a & 0x22222222u,
+          a2 = a & 0x44444444u, a3 = a & 0x88888888u;
+    ulong b0 = b & 0x11111111u, b1 = b & 0x22222222u,
+          b2 = b & 0x44444444u, b3 = b & 0x88888888u;
+    ulong r0 = (a0*b0 ^ a1*b3 ^ a2*b2 ^ a3*b1) & M0;
+    ulong r1 = (a0*b1 ^ a1*b0 ^ a2*b3 ^ a3*b2) & M1;
+    ulong r2 = (a0*b2 ^ a1*b1 ^ a2*b0 ^ a3*b3) & M2;
+    ulong r3 = (a0*b3 ^ a1*b2 ^ a2*b1 ^ a3*b0) & M3;
+    return r0 | r1 | r2 | r3;
+}
+
+struct U128k { ulong lo; ulong hi; };
+struct U256k { ulong r0; ulong r1; ulong r2; ulong r3; };
+
+static inline U128k clmul64(ulong a, ulong b) {
+    uint al = uint(a), ah = uint(a >> 32);
+    uint bl = uint(b), bh = uint(b >> 32);
+    ulong p_lo = clmul32(al, bl);
+    ulong p_hi = clmul32(ah, bh);
+    ulong p_mid = clmul32(al ^ ah, bl ^ bh) ^ p_lo ^ p_hi;
+    U128k r;
+    r.lo = p_lo ^ (p_mid << 32);
+    r.hi = p_hi ^ (p_mid >> 32);
+    return r;
+}
+
+static inline U256k clmul128(uint4 a, uint4 b) {
+    ulong al = (ulong(a.y) << 32) | a.x, ah = (ulong(a.w) << 32) | a.z;
+    ulong bl = (ulong(b.y) << 32) | b.x, bh = (ulong(b.w) << 32) | b.z;
+    U128k p0 = clmul64(al, bl);
+    U128k p2 = clmul64(ah, bh);
+    U128k pm = clmul64(al ^ ah, bl ^ bh);
+    pm.lo ^= p0.lo ^ p2.lo;
+    pm.hi ^= p0.hi ^ p2.hi;
+    U256k r;
+    r.r0 = p0.lo;
+    r.r1 = p0.hi ^ pm.lo;
+    r.r2 = p2.lo ^ pm.hi;
+    r.r3 = p2.hi;
+    return r;
+}
+
+// Reduce a 255-bit product mod x^128 + x^7 + x^2 + x + 1.
+static inline uint4 gf_reduce(U256k p) {
+    ulong h0 = p.r2, h1 = p.r3;
+    ulong t0 = h0 ^ (h0 << 1) ^ (h0 << 2) ^ (h0 << 7);
+    ulong t1 = h1 ^ (h1 << 1) ^ (h1 << 2) ^ (h1 << 7)
+             ^ (h0 >> 63) ^ (h0 >> 62) ^ (h0 >> 57);
+    ulong ov = (h1 >> 63) ^ (h1 >> 62) ^ (h1 >> 57);
+    t0 ^= ov ^ (ov << 1) ^ (ov << 2) ^ (ov << 7);
+    ulong l0 = p.r0 ^ t0, l1 = p.r1 ^ t1;
+    return uint4(uint(l0), uint(l0 >> 32), uint(l1), uint(l1 >> 32));
+}
+
+// Univariate-skip fold of one packed 8-byte row via per-bank nibble tables
+// (bank j, entries: [j*32 + n] = T_j[n], [j*32 + 16 + n] = T_j[n << 4];
+// T_j[v] = T_j[v & 15] ^ T_j[v & 0xF0] by F2-linearity of the byte banks).
+static inline uint4 zc_r2_fold8(uint lo, uint hi, threadgroup const uint4* nib) {
+    uint4 acc = uint4(0u);
+    for (uint j = 0u; j < 4u; j++) {
+        uint b = (lo >> (8u * j)) & 0xffu;
+        acc ^= nib[j * 32u + (b & 15u)] ^ nib[j * 32u + 16u + (b >> 4u)];
+    }
+    for (uint j = 0u; j < 4u; j++) {
+        uint b = (hi >> (8u * j)) & 0xffu;
+        acc ^= nib[(j + 4u) * 32u + (b & 15u)] ^ nib[(j + 4u) * 32u + 16u + (b >> 4u)];
+    }
+    return acc;
+}
+
+struct ZcR2Params { uint lo_size; uint xpt; uint mask; uint useful; };
+
+// One threadgroup per hi-chunk (256 threads, xpt = lo_size/256 x_lo groups
+// per thread). Per pair: read both packed rows of a and b (one uint4 each,
+// fully coalesced), fold all four rows via the nibble tables, message
+// products via emulated clmul, eq_lo weight via a third clmul, 256-bit
+// unreduced accumulate. Threadgroup XOR-reduce; thread 0 reduces the chunk
+// accumulators, weights by eq_hi[chunk], and writes the REDUCED partial
+// pair -- exactly the CPU's per-chunk `(eq_hi * p1, eq_hi * pinf)` values.
+kernel void zc_r2_products(
+    device const uint4* a_in  [[buffer(0)]],
+    device const uint4* b_in  [[buffer(1)]],
+    device const uint4* eq_lo [[buffer(2)]],
+    device const uint4* eq_hi [[buffer(3)]],
+    device const uint4* nib_tab_dev [[buffer(4)]],
+    device uint4*       partials    [[buffer(5)]],
+    constant ZcR2Params& p          [[buffer(6)]],
+    uint tgid [[threadgroup_position_in_grid]],
+    uint lid  [[thread_index_in_threadgroup]])
+{
+    threadgroup uint4 nib[256];
+    threadgroup ulong4 red[256];
+    nib[lid] = nib_tab_dev[lid];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    ulong4 acc1 = ulong4(0ul);
+    ulong4 acci = ulong4(0ul);
+    for (uint k = 0u; k < p.xpt; k++) {
+        uint x_lo = k * 256u + lid;
+        uint pair_idx = tgid * p.lo_size + x_lo;
+        if ((pair_idx & p.mask) >= p.useful) { continue; }
+        uint4 ar = a_in[pair_idx];
+        uint4 br = b_in[pair_idx];
+        uint4 a0 = zc_r2_fold8(ar.x, ar.y, nib);
+        uint4 a1 = zc_r2_fold8(ar.z, ar.w, nib);
+        uint4 b0 = zc_r2_fold8(br.x, br.y, nib);
+        uint4 b1 = zc_r2_fold8(br.z, br.w, nib);
+
+        uint4 g1 = gf_reduce(clmul128(a1, b1));
+        uint4 gi = gf_reduce(clmul128(a0 ^ a1, b0 ^ b1));
+        uint4 e  = eq_lo[x_lo];
+        U256k m1 = clmul128(e, g1);
+        U256k mi = clmul128(e, gi);
+        acc1 ^= ulong4(m1.r0, m1.r1, m1.r2, m1.r3);
+        acci ^= ulong4(mi.r0, mi.r1, mi.r2, mi.r3);
+    }
+
+    red[lid] = acc1;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint s = 128u; s > 0u; s >>= 1u) {
+        if (lid < s) { red[lid] ^= red[lid + s]; }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    ulong4 chunk1 = red[0];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    red[lid] = acci;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint s = 128u; s > 0u; s >>= 1u) {
+        if (lid < s) { red[lid] ^= red[lid + s]; }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (lid == 0u) {
+        ulong4 chunki = red[0];
+        U256k u1; u1.r0 = chunk1.x; u1.r1 = chunk1.y; u1.r2 = chunk1.z; u1.r3 = chunk1.w;
+        U256k ui; ui.r0 = chunki.x; ui.r1 = chunki.y; ui.r2 = chunki.z; ui.r3 = chunki.w;
+        uint4 p1 = gf_reduce(u1);
+        uint4 pi = gf_reduce(ui);
+        uint4 e = eq_hi[tgid];
+        partials[tgid * 2u]      = gf_reduce(clmul128(e, p1));
+        partials[tgid * 2u + 1u] = gf_reduce(clmul128(e, pi));
+    }
+}
+"#;
+
+    /// Process-lifetime Metal state for the round-two products arm.
+    struct ZcR2 {
+        pso: Id,
+        /// Persistent small buffers: nibble table (4 KiB), eq_lo, eq_hi,
+        /// reduced partials. Sized on first use for the ranked shape.
+        nib_buf: Id,
+        eq_lo_buf: Id,
+        eq_lo_cap: usize,
+        eq_hi_buf: Id,
+        eq_hi_cap: usize,
+        part_buf: Id,
+        part_cap: usize,
+        /// Cached no-copy wraps of the packed witness inputs `(ptr, len, buf)`.
+        wraps: Vec<(usize, usize, Id)>,
+    }
+
+    // SAFETY: the Metal pipeline and buffer handles are only touched under
+    // the state mutex; Metal objects themselves are thread-safe.
+    unsafe impl Send for ZcR2 {}
+
+    static ZC_R2_STATE: std::sync::OnceLock<Option<std::sync::Mutex<ZcR2>>> =
+        std::sync::OnceLock::new();
+    /// Published GPU chunk share. `usize::MAX` = uncalibrated (first prove
+    /// calibrates), `0` = arm off for this process.
+    static ZC_R2_TUNED: std::sync::atomic::AtomicUsize =
+        std::sync::atomic::AtomicUsize::new(usize::MAX);
+    static ZC_R2_POISONED: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
+
+    #[cfg(test)]
+    pub(crate) fn zc_r2_test_reset() {
+        use std::sync::atomic::Ordering;
+        ZC_R2_TUNED.store(usize::MAX, Ordering::Relaxed);
+        ZC_R2_POISONED.store(false, Ordering::Relaxed);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn zc_r2_test_state() -> (usize, bool) {
+        use std::sync::atomic::Ordering;
+        (
+            ZC_R2_TUNED.load(Ordering::Relaxed),
+            ZC_R2_POISONED.load(Ordering::Relaxed),
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn zc_r2_test_set_share(share: usize) {
+        ZC_R2_TUNED.store(share, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Ratio-gate override (`FLOCK_ZC_R2_GPU_FORCE_RATIO=<f64>`).
+    fn zc_r2_forced_ratio() -> Option<f64> {
+        static V: std::sync::LazyLock<Option<f64>> = std::sync::LazyLock::new(|| {
+            std::env::var("FLOCK_ZC_R2_GPU_FORCE_RATIO")
+                .ok()
+                .and_then(|s| s.parse::<f64>().ok())
+        });
+        *V
+    }
+
+    /// Anchors-only CPU work is measured locally at ~0.55x of the fused
+    /// chunk (two of four folds, no products); the share solves
+    /// `(hi - (1-ALPHA) g) c_f = g u_g` with a 0.9 CPU-ward bias and the
+    /// same n/2 clamp and 2.0 self-disable as the promoted gate pattern.
+    const ZC_R2_ALPHA: f64 = 0.55;
+    const ZC_R2_MAX_RATIO: f64 = 2.0;
+
+    pub(crate) fn zc_r2_gate_share(ratio: f64, hi_size: usize) -> usize {
+        if !ratio.is_finite() || ratio <= 0.0 || ratio > ZC_R2_MAX_RATIO {
+            return 0;
+        }
+        let g = (0.9 * hi_size as f64 / (ratio + (1.0 - ZC_R2_ALPHA))).floor();
+        (g as usize).min(hi_size / 2)
+    }
+
+    fn zc_r2_init(gpu: &'static Gpu) -> Result<ZcR2, String> {
+        unsafe {
+            let pool = gpu.pool_push();
+            let built = (|| -> Result<Id, String> {
+                let src = gpu.api.nsstring(ZC_R2_MSL_SOURCE)?;
+                let mut err: Id = NIL;
+                let library: Id = send!(
+                    gpu.api,
+                    unsafe extern "C" fn(Id, Sel, Id, Id, *mut Id) -> Id,
+                    gpu.device,
+                    c"newLibraryWithSource:options:error:",
+                    src,
+                    NIL,
+                    &mut err
+                );
+                if library.is_null() {
+                    return Err(format!(
+                        "zc-r2 shader compile failed: {}",
+                        gpu.api.error_string(err)
+                    ));
+                }
+                let ns = gpu.api.nsstring("zc_r2_products")?;
+                let f: Id = send!(
+                    gpu.api,
+                    unsafe extern "C" fn(Id, Sel, Id) -> Id,
+                    library,
+                    c"newFunctionWithName:",
+                    ns
+                );
+                if f.is_null() {
+                    send!(gpu.api, unsafe extern "C" fn(Id, Sel) -> Id, library, c"release");
+                    return Err("zc_r2_products kernel not found".into());
+                }
+                let mut perr: Id = NIL;
+                let pso: Id = send!(
+                    gpu.api,
+                    unsafe extern "C" fn(Id, Sel, Id, *mut Id) -> Id,
+                    gpu.device,
+                    c"newComputePipelineStateWithFunction:error:",
+                    f,
+                    &mut perr
+                );
+                send!(gpu.api, unsafe extern "C" fn(Id, Sel) -> Id, f, c"release");
+                send!(gpu.api, unsafe extern "C" fn(Id, Sel) -> Id, library, c"release");
+                if pso.is_null() {
+                    return Err(format!(
+                        "zc_r2_products pipeline: {}",
+                        gpu.api.error_string(perr)
+                    ));
+                }
+                Ok(pso)
+            })();
+            gpu.pool_pop(pool);
+            let pso = built?;
+            let nib_buf = gpu.new_buffer(256 * 16)?;
+            Ok(ZcR2 {
+                pso,
+                nib_buf,
+                eq_lo_buf: NIL,
+                eq_lo_cap: 0,
+                eq_hi_buf: NIL,
+                eq_hi_cap: 0,
+                part_buf: NIL,
+                part_cap: 0,
+                wraps: Vec::new(),
+            })
+        }
+    }
+
+    fn zc_r2_state() -> Option<&'static std::sync::Mutex<ZcR2>> {
+        ZC_R2_STATE
+            .get_or_init(|| {
+                let gpu = gpu().ok()?;
+                match zc_r2_init(gpu) {
+                    Ok(s) => Some(std::sync::Mutex::new(s)),
+                    Err(e) => {
+                        if super::gpu_zc_r2_debug() {
+                            eprintln!("[zc-r2] init failed: {e}");
+                        }
+                        None
+                    }
+                }
+            })
+            .as_ref()
+    }
+
+    pub(crate) struct ZcR2Job {
+        cb: Id,
+        pub chunks: usize,
+        calibration: bool,
+        lo_size: usize,
+        mask: u32,
+        useful: u32,
+        submitted: std::time::Instant,
+    }
+
+    // SAFETY: the command buffer handle is only waited/released from the
+    // launching thread; Metal command buffers are themselves thread-safe.
+    unsafe impl Send for ZcR2Job {}
+
+    impl ZcR2Job {
+        /// How many leading chunks the CPU should run anchors-only. Zero
+        /// during calibration: the CPU runs every chunk fused (the GPU
+        /// probe is compared against its values, then discarded).
+        pub(crate) fn cpu_split(&self) -> usize {
+            if self.calibration { 0 } else { self.chunks }
+        }
+
+        pub(crate) fn is_calibration(&self) -> bool {
+            self.calibration
+        }
+    }
+
+    /// Result of draining the round-two products arm.
+    pub(crate) enum ZcR2Result {
+        /// Warmup calibration completed (share published, GPU values
+        /// discarded); the caller's CPU partials are authoritative.
+        Calibrated,
+        /// Timed-prove prefix partials, bit-exact per chunk.
+        Prefix(Vec<(F128, F128)>),
+        /// Metal failed after admission; the caller must CPU-redo the
+        /// prefix products. The arm is poisoned for the process.
+        Failed,
+    }
+
+    unsafe fn zc_r2_submit(
+        gpu: &Gpu,
+        state: &ZcR2,
+        a_buf: Id,
+        b_buf: Id,
+        chunks: usize,
+        lo_size: usize,
+        mask: u32,
+        useful: u32,
+    ) -> Result<Id, String> {
+        unsafe {
+            #[repr(C)]
+            struct P {
+                lo_size: u32,
+                xpt: u32,
+                mask: u32,
+                useful: u32,
+            }
+            let params = P {
+                lo_size: lo_size as u32,
+                xpt: (lo_size / 256) as u32,
+                mask,
+                useful,
+            };
+            let pb = std::slice::from_raw_parts(
+                (&raw const params).cast::<u8>(),
+                core::mem::size_of::<P>(),
+            );
+            let cb = gpu.command_buffer()?;
+            let enc = gpu.compute_encoder(cb)?;
+            gpu.set_pipeline(enc, state.pso);
+            gpu.set_buffer(enc, a_buf, 0, 0);
+            gpu.set_buffer(enc, b_buf, 0, 1);
+            gpu.set_buffer(enc, state.eq_lo_buf, 0, 2);
+            gpu.set_buffer(enc, state.eq_hi_buf, 0, 3);
+            gpu.set_buffer(enc, state.nib_buf, 0, 4);
+            gpu.set_buffer(enc, state.part_buf, 0, 5);
+            gpu.set_bytes(enc, pb, 6);
+            gpu.dispatch(enc, chunks as u64, 256);
+            gpu.end_encoding(enc);
+            let cb = gpu.retain(cb);
+            gpu.commit_async(cb);
+            Ok(cb)
+        }
+    }
+
+    unsafe fn zc_r2_wrap(state: &mut ZcR2, gpu: &Gpu, data: &[u8]) -> Result<Id, String> {
+        let ptr = data.as_ptr() as usize;
+        let len = data.len();
+        if let Some(&(_, _, buf)) = state
+            .wraps
+            .iter()
+            .find(|&&(p, l, _)| p == ptr && l == len)
+        {
+            return Ok(buf);
+        }
+        let buf = unsafe { gpu.wrap_buffer(data.as_ptr().cast_mut(), len)? };
+        state.wraps.push((ptr, len, buf));
+        Ok(buf)
+    }
+
+    /// Launch the round-two products prefix. `None` = whole round stays on
+    /// the exact incumbent CPU path (kill switch, poisoned, share 0,
+    /// non-ranked shape, no Metal, or wrap failure).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn launch_zc_r2_products(
+        a_packed: &[u8],
+        b_packed: &[u8],
+        table_data: &[F128],
+        eq_lo: &[F128],
+        eq_hi: &[F128],
+        lo_size: usize,
+        hi_size: usize,
+        pair_in_block_mask: usize,
+        useful_pairs_inclusive: usize,
+    ) -> Option<ZcR2Job> {
+        use std::sync::atomic::Ordering;
+        if !super::gpu_zc_r2_enabled() || ZC_R2_POISONED.load(Ordering::Relaxed) {
+            return None;
+        }
+        // Fixed-shape gates: 8 byte banks, threadgroup-partitionable lo.
+        if table_data.len() != 8 * 256
+            || lo_size < 256
+            || !lo_size.is_multiple_of(256)
+            || hi_size < 8
+            || pair_in_block_mask > u32::MAX as usize
+            || useful_pairs_inclusive > u32::MAX as usize
+        {
+            return None;
+        }
+        let tuned = ZC_R2_TUNED.load(Ordering::Relaxed);
+        if tuned == 0 {
+            return None;
+        }
+        let calibration = tuned == usize::MAX;
+        let chunks = if calibration {
+            // Calibration cost is paid by EVERY worker process inside the
+            // CI job wall (~120 of them per ranked run) and this lineage
+            // already runs close to the 8-minute cap — `922fde63` scored
+            // +0.16% over its promoted base with a record p10 and still
+            // died on the cap. Keep the probe at 1/16 of the range: enough
+            // chunks for stable per-chunk pricing, ~half the wall of the
+            // 1/8 probe that shipped there.
+            (hi_size / 16).clamp(8, 128)
+        } else {
+            tuned.min(hi_size / 2)
+        };
+        if chunks == 0 {
+            return None;
+        }
+        let gpu = gpu().ok()?;
+        let state_mutex = zc_r2_state()?;
+        let mut state = state_mutex.lock().ok()?;
+        unsafe {
+            // Nibble decomposition of the 32 KiB byte table (per prove; the
+            // table depends on the round challenge z).
+            let nib = gpu.buffer_contents(state.nib_buf).cast::<F128>();
+            for j in 0..8 {
+                for n in 0..16 {
+                    *nib.add(j * 32 + n) = table_data[j * 256 + n];
+                    *nib.add(j * 32 + 16 + n) = table_data[j * 256 + (n << 4)];
+                }
+            }
+            // eq_lo / eq_hi / partials buffers (grown once, reused).
+            let need_lo = lo_size * 16;
+            if state.eq_lo_cap < need_lo {
+                if state.eq_lo_cap > 0 {
+                    gpu.release(state.eq_lo_buf);
+                }
+                state.eq_lo_buf = gpu.new_buffer(need_lo).ok()?;
+                state.eq_lo_cap = need_lo;
+            }
+            std::ptr::copy_nonoverlapping(
+                eq_lo.as_ptr().cast::<u8>(),
+                gpu.buffer_contents(state.eq_lo_buf),
+                need_lo,
+            );
+            let need_hi = hi_size * 16;
+            if state.eq_hi_cap < need_hi {
+                if state.eq_hi_cap > 0 {
+                    gpu.release(state.eq_hi_buf);
+                }
+                state.eq_hi_buf = gpu.new_buffer(need_hi).ok()?;
+                state.eq_hi_cap = need_hi;
+            }
+            std::ptr::copy_nonoverlapping(
+                eq_hi.as_ptr().cast::<u8>(),
+                gpu.buffer_contents(state.eq_hi_buf),
+                need_hi,
+            );
+            let need_part = hi_size * 32;
+            if state.part_cap < need_part {
+                if state.part_cap > 0 {
+                    gpu.release(state.part_buf);
+                }
+                state.part_buf = gpu.new_buffer(need_part).ok()?;
+                state.part_cap = need_part;
+            }
+            let a_buf = zc_r2_wrap(&mut state, gpu, a_packed).ok()?;
+            let b_buf = zc_r2_wrap(&mut state, gpu, b_packed).ok()?;
+            let cb = zc_r2_submit(
+                gpu,
+                &state,
+                a_buf,
+                b_buf,
+                chunks,
+                lo_size,
+                pair_in_block_mask as u32,
+                useful_pairs_inclusive as u32,
+            )
+            .ok()?;
+            Some(ZcR2Job {
+                cb,
+                chunks,
+                calibration,
+                lo_size,
+                mask: pair_in_block_mask as u32,
+                useful: useful_pairs_inclusive as u32,
+                submitted: std::time::Instant::now(),
+            })
+        }
+    }
+
+    /// Drain the arm. During calibration `cpu_partials` must hold the CPU's
+    /// full per-chunk partial vector and `cpu_wall_ms` the wall of the full
+    /// CPU sweep that produced it (per-chunk cost denominator).
+    pub(crate) fn zc_r2_wait(
+        job: ZcR2Job,
+        cpu_partials: Option<&[(F128, F128)]>,
+        cpu_wall_ms: f64,
+        hi_size: usize,
+    ) -> ZcR2Result {
+        use std::sync::atomic::Ordering;
+        let gpu = match gpu() {
+            Ok(g) => g,
+            Err(_) => return ZcR2Result::Failed,
+        };
+        let poison = |cb: Id| {
+            ZC_R2_POISONED.store(true, Ordering::Relaxed);
+            ZC_R2_TUNED.store(0, Ordering::Relaxed);
+            unsafe { gpu.release(cb) };
+            ZcR2Result::Failed
+        };
+        unsafe {
+            if gpu.wait_cb(job.cb).is_err() {
+                return poison(job.cb);
+            }
+            let first_wall = zc_fold_gpu_wall_ms(gpu, job.cb);
+            let state_mutex = match zc_r2_state() {
+                Some(s) => s,
+                None => return poison(job.cb),
+            };
+            let state = match state_mutex.lock() {
+                Ok(s) => s,
+                Err(_) => return poison(job.cb),
+            };
+            let parts = gpu.buffer_contents(state.part_buf).cast::<F128>();
+            let mut out = Vec::with_capacity(job.chunks);
+            for c in 0..job.chunks {
+                out.push((*parts.add(c * 2), *parts.add(c * 2 + 1)));
+            }
+            if !job.calibration {
+                gpu.release(job.cb);
+                if super::gpu_zc_r2_debug() {
+                    eprintln!(
+                        "[zc-r2] timed prefix {}/{} chunks: gpu={first_wall:.2}ms \
+                         submit-to-drain={:.2}ms",
+                        job.chunks,
+                        hi_size,
+                        job.submitted.elapsed().as_secs_f64() * 1e3,
+                    );
+                }
+                return ZcR2Result::Prefix(out);
+            }
+
+            // ---- Calibration (untimed warmup prove, once per process) ----
+            let Some(cpu_all) = cpu_partials else {
+                return poison(job.cb);
+            };
+            // Target-machine equality oracle before anything else: the GPU
+            // probe partials must equal the CPU's own values bit-for-bit.
+            for c in 0..job.chunks {
+                if out[c] != cpu_all[c] {
+                    if super::gpu_zc_r2_debug() {
+                        eprintln!(
+                            "[zc-r2] CALIBRATION MISMATCH at chunk {c}: gpu={:?} cpu={:?} — poisoned",
+                            out[c], cpu_all[c]
+                        );
+                    }
+                    return poison(job.cb);
+                }
+            }
+            // Ramp-robust GPU pricing: replay the probe back-to-back to a
+            // plateau (>=3 replays, stop when a replay stops improving the
+            // best seen by >5%), price from the minimum wall. Budget 5:
+            // every replay is job-wall time paid by ~120 processes on a
+            // cap-adjacent lineage, and the local trace plateaus by 3.
+            let mut walls = [0.0f64; 5];
+            walls[0] = first_wall.max(0.0);
+            let mut n_walls = usize::from(walls[0] > 0.0);
+            let mut w_min = if n_walls > 0 { walls[0] } else { f64::MAX };
+            gpu.release(job.cb);
+            if let (Some(&(_, _, a_buf)), Some(&(_, _, b_buf))) =
+                (state.wraps.first(), state.wraps.get(1))
+            {
+                while n_walls < walls.len() {
+                    let Ok(cb2) = zc_r2_submit(
+                        gpu, &state, a_buf, b_buf, job.chunks, job.lo_size, job.mask, job.useful,
+                    ) else {
+                        break;
+                    };
+                    let w = if gpu.wait_cb(cb2).is_ok() {
+                        zc_fold_gpu_wall_ms(gpu, cb2)
+                    } else {
+                        0.0
+                    };
+                    gpu.release(cb2);
+                    if w <= 0.0 {
+                        break;
+                    }
+                    walls[n_walls] = w;
+                    n_walls += 1;
+                    let prev_min = w_min;
+                    w_min = w_min.min(w);
+                    if n_walls >= 3 && w > 0.95 * prev_min {
+                        break;
+                    }
+                }
+            }
+            drop(state);
+            let u_gpu = if n_walls > 0 && w_min < f64::MAX {
+                w_min / job.chunks as f64
+            } else {
+                f64::INFINITY
+            };
+            let u_cpu = cpu_wall_ms / hi_size.max(1) as f64;
+            let share = if u_cpu.is_finite() && u_cpu > 0.0 && u_gpu.is_finite() {
+                let measured = u_gpu / u_cpu;
+                let ratio = zc_r2_forced_ratio().unwrap_or(measured);
+                let g = zc_r2_gate_share(ratio, hi_size);
+                if super::gpu_zc_r2_debug() {
+                    eprintln!(
+                        "[zc-r2] gate replay walls: {:?}", &walls[..n_walls]
+                    );
+                    eprintln!(
+                        "[zc-r2] gate u_gpu={u_gpu:.4}ms/chunk u_cpu={u_cpu:.4}ms/chunk \
+                         ratio={:.3} -> share {g}/{hi_size}",
+                        u_gpu / u_cpu,
+                    );
+                }
+                g
+            } else {
+                0
+            };
+            ZC_R2_TUNED.store(share, Ordering::Relaxed);
+            ZcR2Result::Calibrated
+        }
+    }
 }
 
 // Test-harness entry points (copy-in/copy-out); production goes through
@@ -7543,6 +8267,11 @@ pub(crate) use imp::{gpu_merkle_tree_blake3, gpu_ntt_interleaved_from_layer};
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[cfg_attr(not(test), allow(unused_imports))]
 pub(crate) use imp::{ZcFoldJob, launch_lincheck_fold, launch_zerocheck_c_fold, zerocheck_gpu_submits};
+
+/// Zerocheck round-two products GPU arm (see `ENV_NO_GPU_ZC_R2`).
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[cfg_attr(not(test), allow(unused_imports))]
+pub(crate) use imp::{ZcR2Job, ZcR2Result, launch_zc_r2_products, zc_r2_wait};
 
 #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
 mod imp {
@@ -9255,5 +9984,124 @@ DEF_PROBE(probe_g4_t8_p0,    8u,  0u,   tsel & 7u)
         crate::scratch::give_u8(stripe);
         assert_eq!(ptr % PAGE, 0, "ranked stripe base must be page-aligned");
         assert_eq!(len % PAGE, 0, "ranked stripe length must be a page multiple");
+    }
+
+    /// Round-two products arm oracle: the GPU's per-chunk reduced partials
+    /// must equal the CPU's `(eq_hi · p1, eq_hi · pinf)` bit-for-bit, on a
+    /// linear byte table (the real `UniSkipFoldTable` is F2-linear by
+    /// construction — the nibble decomposition the kernel uses depends on
+    /// it), including padded pairs. Exercises calibration (whose internal
+    /// equality check must pass and publish a share without poisoning) and
+    /// the timed prefix path.
+    #[test]
+    fn gpu_zc_r2_products_match_cpu_oracle() {
+        use crate::field::F256Unreduced;
+        fn xs(rng: &mut u64) -> u64 {
+            *rng ^= *rng << 13;
+            *rng ^= *rng >> 7;
+            *rng ^= *rng << 17;
+            *rng
+        }
+        fn rand_f128(rng: &mut u64) -> F128 {
+            F128 { lo: xs(rng), hi: xs(rng) }
+        }
+        let mut rng = 0x9E3779B97F4A7C15u64;
+
+        // F2-linear byte table from a random 64-element basis.
+        let mut table_data = vec![F128::ZERO; 8 * 256];
+        for j in 0..8 {
+            let basis: Vec<F128> = (0..8).map(|_| rand_f128(&mut rng)).collect();
+            for v in 1usize..256 {
+                let mut acc = F128::ZERO;
+                for b in 0..8 {
+                    if v & (1 << b) != 0 {
+                        acc += basis[b];
+                    }
+                }
+                table_data[j * 256 + v] = acc;
+            }
+        }
+        let fold_row = |code: u64| -> F128 {
+            let mut acc = F128::ZERO;
+            for j in 0..8 {
+                acc += table_data[j * 256 + ((code >> (8 * j)) & 0xff) as usize];
+            }
+            acc
+        };
+
+        let lo_size = 512usize;
+        let hi_size = 64usize;
+        let n_pairs = lo_size * hi_size;
+        // Pad the tail of every 4096-pair block: exercises the skip
+        // predicate on both engines.
+        let mask = 4095usize;
+        let useful = 3900usize;
+
+        let mut a_packed = vec![0u8; n_pairs * 16];
+        let mut b_packed = vec![0u8; n_pairs * 16];
+        for byte in a_packed.iter_mut() {
+            *byte = (xs(&mut rng) & 0xff) as u8;
+        }
+        for byte in b_packed.iter_mut() {
+            *byte = (xs(&mut rng) & 0xff) as u8;
+        }
+        let eq_lo: Vec<F128> = (0..lo_size).map(|_| rand_f128(&mut rng)).collect();
+        let eq_hi: Vec<F128> = (0..hi_size).map(|_| rand_f128(&mut rng)).collect();
+
+        // CPU reference partials, exactly the driver's non-aarch64 shape.
+        let mut cpu_partials = Vec::with_capacity(hi_size);
+        for x_hi in 0..hi_size {
+            let mut p1 = F256Unreduced::ZERO;
+            let mut pinf = F256Unreduced::ZERO;
+            for x_lo in 0..lo_size {
+                let pair_idx = x_hi * lo_size + x_lo;
+                if (pair_idx & mask) >= useful {
+                    continue;
+                }
+                let read = |packed: &[u8], row: usize| -> u64 {
+                    u64::from_le_bytes(packed[row * 8..row * 8 + 8].try_into().unwrap())
+                };
+                let a0 = fold_row(read(&a_packed, 2 * pair_idx));
+                let a1 = fold_row(read(&a_packed, 2 * pair_idx + 1));
+                let b0 = fold_row(read(&b_packed, 2 * pair_idx));
+                let b1 = fold_row(read(&b_packed, 2 * pair_idx + 1));
+                p1 ^= eq_lo[x_lo].mul_unreduced(a1 * b1);
+                pinf ^= eq_lo[x_lo].mul_unreduced((a0 + a1) * (b0 + b1));
+            }
+            let eq_h = eq_hi[x_hi];
+            cpu_partials.push((eq_h * p1.reduce(), eq_h * pinf.reduce()));
+        }
+
+        // Calibration probe: internal equality oracle + share publication.
+        imp::zc_r2_test_reset();
+        let job = imp::launch_zc_r2_products(
+            &a_packed, &b_packed, &table_data, &eq_lo, &eq_hi, lo_size, hi_size, mask, useful,
+        )
+        .expect("calibration launch must succeed on real Metal");
+        assert!(job.is_calibration());
+        assert_eq!(job.cpu_split(), 0);
+        let res = imp::zc_r2_wait(job, Some(&cpu_partials), 50.0, hi_size);
+        assert!(matches!(res, imp::ZcR2Result::Calibrated));
+        let (tuned, poisoned) = imp::zc_r2_test_state();
+        assert!(!poisoned, "probe partials must equal CPU partials bit-for-bit");
+        assert_ne!(tuned, usize::MAX, "calibration must publish a share");
+
+        // Timed prefix path at a forced share.
+        imp::zc_r2_test_set_share(hi_size / 2);
+        let job2 = imp::launch_zc_r2_products(
+            &a_packed, &b_packed, &table_data, &eq_lo, &eq_hi, lo_size, hi_size, mask, useful,
+        )
+        .expect("timed launch must succeed");
+        assert!(!job2.is_calibration());
+        let prefix = job2.cpu_split();
+        assert_eq!(prefix, hi_size / 2);
+        match imp::zc_r2_wait(job2, None, 0.0, hi_size) {
+            imp::ZcR2Result::Prefix(vals) => {
+                assert_eq!(vals.len(), prefix);
+                assert_eq!(&vals[..], &cpu_partials[..prefix], "prefix partials bit-exact");
+            }
+            _ => panic!("timed drain must return prefix partials"),
+        }
+        imp::zc_r2_test_reset();
     }
 }
