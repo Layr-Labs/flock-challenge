@@ -543,6 +543,7 @@ pub(super) unsafe fn butterfly_fused_3layer_rows(
     num_ntts: usize,
     row_start: usize,
     row_end: usize,
+    odd_tail: usize,
     twiddles: &[F128; 7],
 ) {
     use core::arch::aarch64::*;
@@ -550,7 +551,11 @@ pub(super) unsafe fn butterfly_fused_3layer_rows(
         let t: [uint64x2_t; 7] =
             core::array::from_fn(|i| vld1q_u64((&raw const twiddles[i]).cast::<u64>()));
         for r in row_start..row_end {
-            butterfly_fused_3layer_row_with_q(ptr, eighth, num_ntts, num_ntts, r, &t);
+            // Rows `{i·eighth + r}` share `r`'s parity when `eighth` is even,
+            // so an odd `r` selects eight positions whose top `odd_tail` lanes
+            // are known zero: every butterfly there is (0,0) → (0,0).
+            let lanes = if r & 1 == 1 { num_ntts - odd_tail } else { num_ntts };
+            butterfly_fused_3layer_row_with_q(ptr, eighth, num_ntts, lanes, r, &t);
         }
     }
 }
@@ -649,6 +654,7 @@ pub(super) unsafe fn butterfly_fused_3layer_zero_root_rows(
     num_ntts: usize,
     row_start: usize,
     row_end: usize,
+    odd_tail: usize,
     twiddles: &[F128; 7],
 ) {
     use core::arch::aarch64::*;
@@ -661,8 +667,10 @@ pub(super) unsafe fn butterfly_fused_3layer_zero_root_rows(
         let t5 = vld1q_u64((&raw const twiddles[5]).cast::<u64>());
         let t6 = vld1q_u64((&raw const twiddles[6]).cast::<u64>());
         for r in row_start..row_end {
+            // See `butterfly_fused_3layer_rows` for the parity argument.
+            let lanes = if r & 1 == 1 { num_ntts - odd_tail } else { num_ntts };
             butterfly_fused_3layer_zero_root_row_with_q(
-                ptr, eighth, num_ntts, num_ntts, r, t2, t4, t5, t6,
+                ptr, eighth, num_ntts, lanes, r, t2, t4, t5, t6,
             );
         }
     }
@@ -736,6 +744,79 @@ unsafe fn mul_low_pair_q(
 ///
 /// # Safety
 /// Requires the `aes` target feature.
+/// Fused final pair restricted to lanes whose `b` and `d` inputs are
+/// identically zero.
+///
+/// See `portable::butterfly_fused_2layer_low_twiddles_zero_bd` for the
+/// derivation. Only `na = xa ^ (xc·t_outer)` and `nc = xc ^ na` survive, so
+/// one low-twiddle product replaces the dense path's four. Lanes are consumed
+/// two at a time through the same [`mul_low_pair_q`] the dense kernel uses,
+/// which keeps the cost at two PMULL per lane against the dense eight and
+/// introduces no new reduction path.
+///
+/// # Safety
+/// Requires the `aes` target feature. All four slices must have equal length.
+#[target_feature(enable = "aes")]
+#[inline]
+pub(super) unsafe fn butterfly_fused_2layer_low_twiddles_zero_bd(
+    a: &mut [F128],
+    b: &mut [F128],
+    c: &mut [F128],
+    d: &mut [F128],
+    t_outer: F128,
+) {
+    use core::arch::aarch64::*;
+
+    debug_assert_eq!(a.len(), b.len());
+    debug_assert_eq!(a.len(), c.len());
+    debug_assert_eq!(a.len(), d.len());
+    debug_assert_eq!(t_outer.hi, 0);
+
+    // SAFETY: the `aes` feature is carried by this function, `t_outer.hi` is
+    // zero by the assertion above, and every index below is bounded by the
+    // asserted common length.
+    unsafe {
+        let to = vdupq_n_u64(t_outer.lo);
+        let n = a.len();
+
+        let store = |a: &mut [F128], b: &mut [F128], c: &mut [F128], d: &mut [F128],
+                     lane: usize, na: uint64x2_t, nc: uint64x2_t| {
+            vst1q_u64((&raw mut a[lane]).cast::<u64>(), na);
+            vst1q_u64((&raw mut b[lane]).cast::<u64>(), na);
+            vst1q_u64((&raw mut c[lane]).cast::<u64>(), nc);
+            vst1q_u64((&raw mut d[lane]).cast::<u64>(), nc);
+        };
+
+        let mut lane = 0usize;
+        while lane + 1 < n {
+            let xa0 = vld1q_u64((&raw const a[lane]).cast::<u64>());
+            let xc0 = vld1q_u64((&raw const c[lane]).cast::<u64>());
+            let xa1 = vld1q_u64((&raw const a[lane + 1]).cast::<u64>());
+            let xc1 = vld1q_u64((&raw const c[lane + 1]).cast::<u64>());
+
+            let (o0, o1) = mul_low_pair_q(xc0, xc1, to, to);
+            let na0 = veorq_u64(xa0, o0);
+            let nc0 = veorq_u64(xc0, na0);
+            let na1 = veorq_u64(xa1, o1);
+            let nc1 = veorq_u64(xc1, na1);
+
+            store(a, b, c, d, lane, na0, nc0);
+            store(a, b, c, d, lane + 1, na1, nc1);
+            lane += 2;
+        }
+
+        if lane < n {
+            let xa0 = vld1q_u64((&raw const a[lane]).cast::<u64>());
+            let xc0 = vld1q_u64((&raw const c[lane]).cast::<u64>());
+            // The second slot is a duplicate of the first and is discarded.
+            let (o0, _) = mul_low_pair_q(xc0, xc0, to, to);
+            let na0 = veorq_u64(xa0, o0);
+            let nc0 = veorq_u64(xc0, na0);
+            store(a, b, c, d, lane, na0, nc0);
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 #[target_feature(enable = "aes")]
 #[inline]
