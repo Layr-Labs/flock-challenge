@@ -30,10 +30,42 @@
 #![allow(clippy::missing_safety_doc)]
 
 use crate::field::F128;
+#[cfg(any(test, all(target_os = "macos", target_arch = "aarch64")))]
+use crate::field::{PHI_8_TABLE, mul_by_x};
 use crate::ntt::AdditiveNttF128;
 
 /// Env var that disables the GPU commit path entirely.
 pub const ENV_NO_GPU_COMMIT: &str = "FLOCK_NO_GPU_COMMIT";
+
+/// Same-binary control for the ranked zerocheck Round-1 AB GPU fold.  This
+/// does not affect the commitment graph: it restores the incumbent CPU AB
+/// completion while leaving every other GPU optimization enabled.
+pub const ENV_NO_GPU_AB_FOLD: &str = "FLOCK_NO_GPU_AB_FOLD";
+
+fn gpu_ab_fold_enabled() -> bool {
+    const GPU_AB_FOLD_DEFAULT: bool = true;
+    GPU_AB_FOLD_DEFAULT
+        && cfg!(all(target_os = "macos", target_arch = "aarch64"))
+        && std::env::var_os(ENV_NO_GPU_AB_FOLD).is_none()
+}
+
+#[cfg(any(test, all(target_os = "macos", target_arch = "aarch64")))]
+const RANKED_AB_BASIS_LEN: usize = 16 * 8;
+
+/// Linear bases for `gamma^b * phi8(byte)`.  The Metal table builder scales
+/// these by one equality weight and XOR-expands the eight index bits.
+#[cfg(any(test, all(target_os = "macos", target_arch = "aarch64")))]
+pub(crate) fn ranked_ab_basis() -> [F128; RANKED_AB_BASIS_LEN] {
+    let mut out = [F128::ZERO; RANKED_AB_BASIS_LEN];
+    let mut gamma = F128::ONE;
+    for b in 0..16 {
+        for bit in 0..8 {
+            out[b * 8 + bit] = gamma * PHI_8_TABLE[1usize << bit];
+        }
+        gamma = mul_by_x(gamma);
+    }
+    out
+}
 
 /// Same-binary control that preserves the CPU codeword allocation/prefault
 /// even after the ranked GPU commit has latched on.
@@ -254,6 +286,48 @@ pub(crate) fn finish_from_z_first_pass_or_fallback(
     cpu: impl FnOnce(&mut [F128]) -> Vec<crate::merkle::Hash>,
 ) -> (crate::pcs::commit::CodewordBuf, crate::pcs::commit::MerkleTreeBuf) {
     imp::finish_from_z_first_pass_or_fallback(stream.inner, z_packed, codeword, params, cpu)
+}
+
+/// In-flight ranked Round-1 AB fold.
+///
+/// The Metal command buffer reads `ab_inner` through a no-copy shared-memory
+/// view until [`RankedAbFoldTicket::finish`] (or `Drop`) waits for completion.
+/// The lifetime keeps the 512 MiB scratch allocation borrowed for that whole
+/// interval while the CPU independently derives the C message.
+pub(crate) struct RankedAbFoldTicket<'a> {
+    inner: imp::RankedAbFoldTicket,
+    _input: core::marker::PhantomData<&'a [u8]>,
+}
+
+/// Launch the source-distinct GPU AB completion for the exact ranked shape.
+///
+/// `eq_lo_scaled` is the 12-coordinate low equality table with the protocol's
+/// medium-normalization inverse already absorbed; `eq_hi` is the remaining
+/// seven-coordinate high table.  The GPU builds challenge-specific F8-to-F128
+/// tables, folds all 512 MiB of transformed AB bytes, and leaves only 128 x 64
+/// field elements for the CPU's final high-factor reduction.
+pub(crate) fn begin_ranked_ab_fold<'a>(
+    ab_inner: &'a [u8],
+    eq_lo_scaled: &[F128],
+    eq_hi: &[F128],
+) -> Option<RankedAbFoldTicket<'a>> {
+    if !gpu_ab_fold_enabled() {
+        return None;
+    }
+    imp::begin_ranked_ab_fold(ab_inner, eq_lo_scaled, eq_hi).map(|inner| {
+        RankedAbFoldTicket {
+            inner,
+            _input: core::marker::PhantomData,
+        }
+    })
+}
+
+impl RankedAbFoldTicket<'_> {
+    /// Wait for the GPU and perform the tiny exact CPU high-factor reduction.
+    /// Returns `(64-lane AB message, launch-to-finish wall milliseconds)`.
+    pub(crate) fn finish(self) -> Result<(Vec<F128>, f64), String> {
+        self.inner.finish()
+    }
 }
 
 /// A read-only view of the transformed L0 codeword living in the GPU's
@@ -773,6 +847,138 @@ mod imp {
     // -----------------------------------------------------------------------
     // Metal Shading Language kernels.
     // -----------------------------------------------------------------------
+
+    /// Auxiliary zerocheck AB library.  It is deliberately separate from
+    /// [`MSL_SOURCE`]: the shipped commitment metallib remains byte-for-byte
+    /// usable, while these three experimental kernels compile once during the
+    /// untimed warmup.  The ranked worker then reuses their persistent 256 MiB
+    /// table and 4 MiB partial buffers for every scored proof.
+    const AB_MSL_SOURCE: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+static inline uint4 ab_gf_mulx(uint4 v) {
+    uint carry = v.w >> 31;
+    uint4 r;
+    r.w = (v.w << 1) | (v.z >> 31);
+    r.z = (v.z << 1) | (v.y >> 31);
+    r.y = (v.y << 1) | (v.x >> 31);
+    r.x = (v.x << 1) ^ (carry * 0x87u);
+    return r;
+}
+
+static inline uint4 ab_gf_shl16(uint4 a) {
+    uint h = a.w >> 16;
+    uint4 r;
+    r.w = (a.w << 16) | (a.z >> 16);
+    r.z = (a.z << 16) | (a.y >> 16);
+    r.y = (a.y << 16) | (a.x >> 16);
+    r.x = (a.x << 16) ^ ((h << 7) ^ (h << 2) ^ (h << 1) ^ h);
+    return r;
+}
+
+static inline uint4 ab_gf_mul_tab4(uint4 v, threadgroup const uint4* tab) {
+    uint4 acc = uint4(0u);
+    for (int i = 7; i >= 0; i--) {
+        acc = ab_gf_shl16(acc);
+        uint h = (v[i >> 1] >> ((i & 1) * 16)) & 0xffffu;
+        acc ^= tab[h & 15u]
+             ^ tab[16u + ((h >> 4) & 15u)]
+             ^ tab[32u + ((h >> 8) & 15u)]
+             ^ tab[48u + (h >> 12)];
+    }
+    return acc;
+}
+
+// One 64-thread group per eq_lo entry.  It scales the 16*8 linear F8
+// conversion bases by this proof's eq_lo value, then expands them into all
+// 16*256 byte lookup rows.  The output is 4096 * 64 KiB = 256 MiB.
+kernel void ab_build_tables(device const uint4* eq_lo [[buffer(0)]],
+                            device const uint4* basis [[buffer(1)]],
+                            device uint4* tables      [[buffer(2)]],
+                            uint x_lo [[threadgroup_position_in_grid]],
+                            uint lid  [[thread_index_in_threadgroup]])
+{
+    threadgroup uint4 bases[4];
+    threadgroup uint4 mul_tab[64];
+    threadgroup uint4 scaled_basis[128];
+
+    if (lid < 4u) {
+        uint4 p = eq_lo[x_lo];
+        for (uint i = 0u; i < lid * 4u; i++) p = ab_gf_mulx(p);
+        bases[lid] = p;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    uint nibble = lid & 15u;
+    uint4 p = bases[lid >> 4];
+    uint4 value = uint4(0u);
+    for (uint bit = 0u; bit < 4u; bit++) {
+        if ((nibble >> bit) & 1u) value ^= p;
+        p = ab_gf_mulx(p);
+    }
+    mul_tab[lid] = value;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    scaled_basis[lid] = ab_gf_mul_tab4(basis[lid], mul_tab);
+    scaled_basis[64u + lid] = ab_gf_mul_tab4(basis[64u + lid], mul_tab);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    const ulong x_base = ((ulong)x_lo) << 12;
+    for (uint local = lid; local < 4096u; local += 64u) {
+        uint b = local >> 8;
+        uint v = local & 255u;
+        uint4 out = uint4(0u);
+        for (uint bit = 0u; bit < 8u; bit++) {
+            if ((v >> bit) & 1u) out ^= scaled_basis[b * 8u + bit];
+        }
+        tables[x_base + local] = out;
+    }
+}
+
+// 32 low-coordinate chunks * 128 high bands = 4096 workgroups.  Mapping the
+// high band in the low grid bits makes 128 groups consume the same 8 MiB
+// challenge-table chunk together, maximizing system-cache reuse.  Each lane
+// owns one of the 64 independent output evaluations.
+kernel void ab_fold(device const uchar* ab_inner [[buffer(0)]],
+                    device const uint4* tables   [[buffer(1)]],
+                    device uint4* partials       [[buffer(2)]],
+                    uint tgid [[threadgroup_position_in_grid]],
+                    uint lane [[thread_index_in_threadgroup]])
+{
+    const uint x_hi = tgid & 127u;
+    const uint chunk = tgid >> 7;
+    const uint x_lo_start = chunk << 7;
+    uint4 acc = uint4(0u);
+
+    for (uint rel = 0u; rel < 128u; rel++) {
+        const uint x_lo = x_lo_start + rel;
+        const uint x_outer = x_lo | (x_hi << 12);
+        const device uchar* row = ab_inner + (((ulong)x_outer) << 10) + lane;
+        const ulong table_base = ((ulong)x_lo) << 12;
+        for (uint b = 0u; b < 16u; b++) {
+            const uint v = row[b << 6];
+            acc ^= tables[table_base + (b << 8) + v];
+        }
+    }
+    partials[((ulong)tgid << 6) + lane] = acc;
+}
+
+// Collapse the 32 low chunks before returning to the CPU.  Only 128*64
+// F128s (128 KiB) cross the final unified-memory handoff.
+kernel void ab_reduce_chunks(device const uint4* partials [[buffer(0)]],
+                             device uint4* reduced        [[buffer(1)]],
+                             uint x_hi [[threadgroup_position_in_grid]],
+                             uint lane [[thread_index_in_threadgroup]])
+{
+    uint4 acc = uint4(0u);
+    for (uint chunk = 0u; chunk < 32u; chunk++) {
+        const ulong group = ((ulong)chunk << 7) + x_hi;
+        acc ^= partials[(group << 6) + lane];
+    }
+    reduced[((ulong)x_hi << 6) + lane] = acc;
+}
+"#;
 
     /// GF(2^128) fused-layer additive-NTT butterfly kernel + BLAKE3 tree
     /// kernels. See the extensive comments inside the source.
@@ -1639,6 +1845,11 @@ kernel void parent_hash3(device const uint* children [[buffer(0)]],
         pub(crate) pso_leaf: Id,
         pub(crate) pso_parent: Id,
         pub(crate) pso_parent3: Id,
+        /// Optional zerocheck AB pipelines.  A source-compile failure leaves
+        /// these nil and the independent CPU fallback remains authoritative.
+        pub(crate) pso_ab_build: Id,
+        pub(crate) pso_ab_fold: Id,
+        pub(crate) pso_ab_reduce: Id,
     }
     // SAFETY: MTLDevice/MTLCommandQueue/MTLComputePipelineState are
     // documented thread-safe; command buffers/encoders are created and used
@@ -1772,6 +1983,72 @@ kernel void parent_hash3(device const uint* children [[buffer(0)]],
                             p
                         }
                     };
+
+                // Compile the AB kernels as an auxiliary library so the
+                // stable commitment metallib above remains usable. Failure
+                // is intentionally non-fatal: nil PSOs make the AB launcher
+                // return `None`, preserving the exact incumbent CPU path.
+                let ab_psos = (|| -> Result<[Id; 3], String> {
+                    let src = api.nsstring(AB_MSL_SOURCE)?;
+                    let mut err: Id = NIL;
+                    let library: Id = send!(
+                        api,
+                        unsafe extern "C" fn(Id, Sel, Id, Id, *mut Id) -> Id,
+                        device,
+                        c"newLibraryWithSource:options:error:",
+                        src,
+                        NIL,
+                        &mut err
+                    );
+                    if library.is_null() {
+                        return Err(format!(
+                            "AB shader compile failed: {}",
+                            api.error_string(err)
+                        ));
+                    }
+                    let result = (|| -> Result<[Id; 3], String> {
+                        let mut out = [NIL; 3];
+                        for (slot, name) in out.iter_mut().zip([
+                            "ab_build_tables",
+                            "ab_fold",
+                            "ab_reduce_chunks",
+                        ]) {
+                            let ns = api.nsstring(name)?;
+                            let f: Id = send!(
+                                api,
+                                unsafe extern "C" fn(Id, Sel, Id) -> Id,
+                                library,
+                                c"newFunctionWithName:",
+                                ns
+                            );
+                            if f.is_null() {
+                                return Err(format!("kernel {name} not found"));
+                            }
+                            let mut err: Id = NIL;
+                            let p: Id = send!(
+                                api,
+                                unsafe extern "C" fn(Id, Sel, Id, *mut Id) -> Id,
+                                device,
+                                c"newComputePipelineStateWithFunction:error:",
+                                f,
+                                &mut err
+                            );
+                            send!(api, unsafe extern "C" fn(Id, Sel) -> Id, f, c"release");
+                            if p.is_null() {
+                                return Err(format!(
+                                    "pipeline {name}: {}",
+                                    api.error_string(err)
+                                ));
+                            }
+                            *slot = p;
+                        }
+                        Ok(out)
+                    })();
+                    send!(api, unsafe extern "C" fn(Id, Sel) -> Id, library, c"release");
+                    result
+                })()
+                .unwrap_or([NIL; 3]);
+                let [pso_ab_build, pso_ab_fold, pso_ab_reduce] = ab_psos;
                 Ok(Gpu {
                     api,
                     device,
@@ -1787,6 +2064,9 @@ kernel void parent_hash3(device const uint* children [[buffer(0)]],
                     pso_leaf,
                     pso_parent,
                     pso_parent3,
+                    pso_ab_build,
+                    pso_ab_fold,
+                    pso_ab_reduce,
                 })
             })();
             pool_pop(pool);
@@ -2432,6 +2712,230 @@ kernel void parent_hash3(device const uint* children [[buffer(0)]],
 
     use crate::merkle::Hash;
     use std::sync::Mutex;
+
+    // -------------------------------------------------------------------
+    // Ranked zerocheck Round-1 AB table-fold.
+    // -------------------------------------------------------------------
+
+    const RANKED_AB_BYTES: usize = 1usize << 29;
+    const AB_EQ_LO_LEN: usize = 1usize << 12;
+    const AB_EQ_HI_LEN: usize = 1usize << 7;
+    const AB_BASIS_LEN: usize = super::RANKED_AB_BASIS_LEN;
+    const AB_TABLE_ENTRIES: usize = AB_EQ_LO_LEN * 16 * 256;
+    const AB_GROUPS: usize = 32 * AB_EQ_HI_LEN;
+    const AB_PARTIAL_ENTRIES: usize = AB_GROUPS * 64;
+    const AB_REDUCED_ENTRIES: usize = AB_EQ_HI_LEN * 64;
+
+    #[derive(Clone, Copy)]
+    struct AbBuffers {
+        eq_lo: Id,
+        basis: Id,
+        tables: Id,
+        partials: Id,
+        reduced: Id,
+    }
+    unsafe impl Send for AbBuffers {}
+
+    static AB_BUFFERS: Mutex<Option<AbBuffers>> = Mutex::new(None);
+    static AB_IN_USE: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
+
+    fn take_or_create_ab_buffers(gpu: &Gpu) -> Result<AbBuffers, String> {
+        let mut state = AB_BUFFERS.lock().map_err(|_| "AB buffer mutex poisoned")?;
+        if let Some(buffers) = *state {
+            return Ok(buffers);
+        }
+
+        unsafe {
+            let mut created = Vec::with_capacity(5);
+            let result = (|| -> Result<AbBuffers, String> {
+                let eq_lo = gpu.new_buffer(AB_EQ_LO_LEN * core::mem::size_of::<F128>())?;
+                created.push(eq_lo);
+                let basis = gpu.new_buffer(AB_BASIS_LEN * core::mem::size_of::<F128>())?;
+                created.push(basis);
+                let tables = gpu.new_buffer(AB_TABLE_ENTRIES * core::mem::size_of::<F128>())?;
+                created.push(tables);
+                let partials =
+                    gpu.new_buffer(AB_PARTIAL_ENTRIES * core::mem::size_of::<F128>())?;
+                created.push(partials);
+                let reduced =
+                    gpu.new_buffer(AB_REDUCED_ENTRIES * core::mem::size_of::<F128>())?;
+                created.push(reduced);
+
+                let ab_basis = super::ranked_ab_basis();
+                std::ptr::copy_nonoverlapping(
+                    ab_basis.as_ptr().cast::<u8>(),
+                    gpu.buffer_contents(basis),
+                    core::mem::size_of_val(&ab_basis),
+                );
+                Ok(AbBuffers {
+                    eq_lo,
+                    basis,
+                    tables,
+                    partials,
+                    reduced,
+                })
+            })();
+            match result {
+                Ok(buffers) => {
+                    *state = Some(buffers);
+                    Ok(buffers)
+                }
+                Err(e) => {
+                    for id in created {
+                        gpu.release(id);
+                    }
+                    Err(e)
+                }
+            }
+        }
+    }
+
+    pub(crate) struct RankedAbFoldTicket {
+        gpu: &'static Gpu,
+        cb: Id,
+        input: Id,
+        reduced: Id,
+        eq_hi: Vec<F128>,
+        started: std::time::Instant,
+        live: bool,
+    }
+    unsafe impl Send for RankedAbFoldTicket {}
+
+    impl RankedAbFoldTicket {
+        fn close(&mut self) -> Result<(), String> {
+            if !self.live {
+                return Ok(());
+            }
+            let waited = unsafe { self.gpu.wait_cb(self.cb) };
+            unsafe {
+                self.gpu.release(self.cb);
+                self.gpu.release(self.input);
+            }
+            self.live = false;
+            AB_IN_USE.store(false, std::sync::atomic::Ordering::Release);
+            waited
+        }
+
+        pub(crate) fn finish(mut self) -> Result<(Vec<F128>, f64), String> {
+            self.close()?;
+            let gpu_ms = self.started.elapsed().as_secs_f64() * 1e3;
+            let reduced = unsafe {
+                core::slice::from_raw_parts(
+                    self.gpu.buffer_contents(self.reduced).cast::<F128>(),
+                    AB_REDUCED_ENTRIES,
+                )
+            };
+            let mut out = vec![F128::ZERO; 64];
+            for (x_hi, &hi) in self.eq_hi.iter().enumerate() {
+                for lane in 0..64 {
+                    out[lane] += reduced[x_hi * 64 + lane] * hi;
+                }
+            }
+            if std::env::var_os("FLOCK_ZC_TIMING").is_some() {
+                eprintln!("[zc-timing] round1 GPU AB table-fold: {gpu_ms:.2} ms");
+            }
+            Ok((out, gpu_ms))
+        }
+    }
+
+    impl Drop for RankedAbFoldTicket {
+        fn drop(&mut self) {
+            let _ = self.close();
+        }
+    }
+
+    pub(crate) fn begin_ranked_ab_fold(
+        ab_inner: &[u8],
+        eq_lo_scaled: &[F128],
+        eq_hi: &[F128],
+    ) -> Option<RankedAbFoldTicket> {
+        use std::sync::atomic::Ordering;
+
+        if ab_inner.len() != RANKED_AB_BYTES
+            || eq_lo_scaled.len() != AB_EQ_LO_LEN
+            || eq_hi.len() != AB_EQ_HI_LEN
+            || AB_IN_USE.swap(true, Ordering::Acquire)
+        {
+            return None;
+        }
+
+        let gpu = match gpu() {
+            Ok(gpu)
+                if !gpu.pso_ab_build.is_null()
+                    && !gpu.pso_ab_fold.is_null()
+                    && !gpu.pso_ab_reduce.is_null() => gpu,
+            _ => {
+                AB_IN_USE.store(false, Ordering::Release);
+                return None;
+            }
+        };
+        let buffers = match take_or_create_ab_buffers(gpu) {
+            Ok(buffers) => buffers,
+            Err(_) => {
+                AB_IN_USE.store(false, Ordering::Release);
+                return None;
+            }
+        };
+
+        unsafe {
+            let pool = gpu.pool_push();
+            let mut input = NIL;
+            let result = (|| -> Result<RankedAbFoldTicket, String> {
+                input = gpu.wrap_buffer(ab_inner.as_ptr().cast_mut(), ab_inner.len())?;
+                std::ptr::copy_nonoverlapping(
+                    eq_lo_scaled.as_ptr().cast::<u8>(),
+                    gpu.buffer_contents(buffers.eq_lo),
+                    core::mem::size_of_val(eq_lo_scaled),
+                );
+
+                let cb = gpu.command_buffer()?;
+                let enc = gpu.compute_encoder(cb)?;
+
+                gpu.set_pipeline(enc, gpu.pso_ab_build);
+                gpu.set_buffer(enc, buffers.eq_lo, 0, 0);
+                gpu.set_buffer(enc, buffers.basis, 0, 1);
+                gpu.set_buffer(enc, buffers.tables, 0, 2);
+                gpu.dispatch(enc, AB_EQ_LO_LEN as u64, 64);
+
+                gpu.set_pipeline(enc, gpu.pso_ab_fold);
+                gpu.set_buffer(enc, input, 0, 0);
+                gpu.set_buffer(enc, buffers.tables, 0, 1);
+                gpu.set_buffer(enc, buffers.partials, 0, 2);
+                gpu.dispatch(enc, AB_GROUPS as u64, 64);
+
+                gpu.set_pipeline(enc, gpu.pso_ab_reduce);
+                gpu.set_buffer(enc, buffers.partials, 0, 0);
+                gpu.set_buffer(enc, buffers.reduced, 0, 1);
+                gpu.dispatch(enc, AB_EQ_HI_LEN as u64, 64);
+                gpu.end_encoding(enc);
+
+                let cb = gpu.retain(cb);
+                let ticket = RankedAbFoldTicket {
+                    gpu,
+                    cb,
+                    input,
+                    reduced: buffers.reduced,
+                    eq_hi: eq_hi.to_vec(),
+                    started: std::time::Instant::now(),
+                    live: true,
+                };
+                gpu.commit_async(cb);
+                Ok(ticket)
+            })();
+            gpu.pool_pop(pool);
+            match result {
+                Ok(ticket) => Some(ticket),
+                Err(_) => {
+                    if !input.is_null() {
+                        gpu.release(input);
+                    }
+                    AB_IN_USE.store(false, Ordering::Release);
+                    None
+                }
+            }
+        }
+    }
 
     /// Persistent Metal state owned by the latched-on path.
     struct Latched {
@@ -4874,6 +5378,21 @@ mod imp {
     use super::*;
 
     pub(crate) struct FromZFirstPassStream;
+    pub(crate) struct RankedAbFoldTicket;
+
+    impl RankedAbFoldTicket {
+        pub(crate) fn finish(self) -> Result<(Vec<F128>, f64), String> {
+            Err("GPU AB fold is only available on macOS/aarch64".into())
+        }
+    }
+
+    pub(crate) fn begin_ranked_ab_fold(
+        _ab_inner: &[u8],
+        _eq_lo_scaled: &[F128],
+        _eq_hi: &[F128],
+    ) -> Option<RankedAbFoldTicket> {
+        None
+    }
 
     impl FromZFirstPassStream {
         pub(crate) fn submit_ready_range(&mut self, _r_start: usize, _r_count: usize) {}
