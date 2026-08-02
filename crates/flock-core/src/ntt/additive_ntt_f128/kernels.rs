@@ -110,6 +110,36 @@ pub(super) fn butterfly_fused_2layer_low_twiddles(
     portable::butterfly_fused_2layer(a, b, c, d, t_outer, t_inner_a, t_inner_b);
 }
 
+/// Fused final pair for lanes whose `b` and `d` inputs are identically zero.
+///
+/// Semantically equal to [`butterfly_fused_2layer_low_twiddles`] restricted to
+/// such lanes; see `portable::butterfly_fused_2layer_low_twiddles_zero_bd` for
+/// the collapse. The caller owns the precondition — this kernel does not read
+/// `b` or `d`, so a nonzero input there would be silently discarded.
+#[inline]
+pub(super) fn butterfly_fused_2layer_low_twiddles_zero_bd(
+    a: &mut [F128],
+    b: &mut [F128],
+    c: &mut [F128],
+    d: &mut [F128],
+    t_outer: F128,
+) {
+    debug_assert_eq!(a.len(), b.len());
+    debug_assert_eq!(a.len(), c.len());
+    debug_assert_eq!(a.len(), d.len());
+    debug_assert_eq!(t_outer.hi, 0);
+
+    #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+    // SAFETY: the cfg gate guarantees PMULL through the aes feature; lengths
+    // are asserted above.
+    unsafe {
+        aarch64::butterfly_fused_2layer_low_twiddles_zero_bd(a, b, c, d, t_outer);
+    }
+
+    #[cfg(not(all(target_arch = "aarch64", target_feature = "aes")))]
+    portable::butterfly_fused_2layer_low_twiddles_zero_bd(a, b, c, d, t_outer);
+}
+
 /// Process one fused-four-layer row group across every interleaved NTT lane.
 ///
 /// # Safety
@@ -585,6 +615,91 @@ mod aarch64_row_tests {
                 assert_eq!(gc, wc, "row c mismatch at width={width}");
                 assert_eq!(gd, wd, "row d mismatch at width={width}");
             }
+        }
+    }
+}
+
+#[cfg(all(test, target_arch = "aarch64", target_feature = "aes"))]
+mod zero_bd_oracle_tests {
+    use super::*;
+
+    fn splitmix(state: &mut u64) -> u64 {
+        *state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = *state;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
+    }
+
+    /// The NEON degenerate kernel must agree with the scalar portable
+    /// reference on every width, including the odd-lane tail its pairwise
+    /// loop has to handle separately.
+    #[test]
+    fn neon_zero_bd_matches_portable_reference() {
+        let mut state = 0x0F17_A110_5EED_0001u64;
+        for width in 1usize..=16 {
+            let t_outer = F128::new(splitmix(&mut state), 0);
+            let mk = |state: &mut u64, n: usize| {
+                (0..n)
+                    .map(|_| F128::new(splitmix(state), splitmix(state)))
+                    .collect::<Vec<_>>()
+            };
+            let a = mk(&mut state, width);
+            let c = mk(&mut state, width);
+            // b and d are zero by precondition; their input value is unread.
+            let zeros = vec![F128::ZERO; width];
+
+            let (mut wa, mut wb, mut wc, mut wd) =
+                (a.clone(), zeros.clone(), c.clone(), zeros.clone());
+            portable::butterfly_fused_2layer_low_twiddles_zero_bd(
+                &mut wa, &mut wb, &mut wc, &mut wd, t_outer,
+            );
+
+            let (mut ga, mut gb, mut gc, mut gd) = (a, zeros.clone(), c, zeros);
+            butterfly_fused_2layer_low_twiddles_zero_bd(
+                &mut ga, &mut gb, &mut gc, &mut gd, t_outer,
+            );
+
+            assert_eq!(ga, wa, "row a mismatch at width={width}");
+            assert_eq!(gb, wb, "row b mismatch at width={width}");
+            assert_eq!(gc, wc, "row c mismatch at width={width}");
+            assert_eq!(gd, wd, "row d mismatch at width={width}");
+        }
+    }
+
+    /// The degenerate kernel must equal the dense low-twiddle kernel whenever
+    /// its zero-tail precondition actually holds.
+    #[test]
+    fn zero_bd_matches_dense_low_twiddles() {
+        let mut state = 0x0F17_A110_5EED_0002u64;
+        for width in 1usize..=16 {
+            let t_outer = F128::new(splitmix(&mut state), 0);
+            let t_inner_a = F128::new(splitmix(&mut state), 0);
+            let t_inner_b = F128::new(splitmix(&mut state), 0);
+            let mk = |state: &mut u64, n: usize| {
+                (0..n)
+                    .map(|_| F128::new(splitmix(state), splitmix(state)))
+                    .collect::<Vec<_>>()
+            };
+            let a = mk(&mut state, width);
+            let c = mk(&mut state, width);
+            let zeros = vec![F128::ZERO; width];
+
+            let (mut wa, mut wb, mut wc, mut wd) =
+                (a.clone(), zeros.clone(), c.clone(), zeros.clone());
+            butterfly_fused_2layer_low_twiddles(
+                &mut wa, &mut wb, &mut wc, &mut wd, t_outer, t_inner_a, t_inner_b,
+            );
+
+            let (mut ga, mut gb, mut gc, mut gd) = (a, zeros.clone(), c, zeros);
+            butterfly_fused_2layer_low_twiddles_zero_bd(
+                &mut ga, &mut gb, &mut gc, &mut gd, t_outer,
+            );
+
+            assert_eq!(ga, wa, "row a mismatch at width={width}");
+            assert_eq!(gb, wb, "row b mismatch at width={width}");
+            assert_eq!(gc, wc, "row c mismatch at width={width}");
+            assert_eq!(gd, wd, "row d mismatch at width={width}");
         }
     }
 }

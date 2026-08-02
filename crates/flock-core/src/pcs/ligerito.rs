@@ -10480,3 +10480,6 @@ mod tests {
 // RealAdii sample 1 on 88aff39.
 // RealAdii sample 1 on 281206e.
 // RealAdii sample 2 on 281206e.
+// Echo-Merlini sample 2 of the final-pair zero-tail candidate on 74769bd
+// (sample 1 = dad1af71: 1,416,057.57, verified, -0.59% of bar). Mechanism
+// bytes unchanged from sample 1; this line only clears content dedup.
