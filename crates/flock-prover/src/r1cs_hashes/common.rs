@@ -198,6 +198,105 @@ pub(crate) fn build_block_r1cs_with_matrices(
 // buffers (z, a, b) from one input.
 // ---------------------------------------------------------------------------
 
+/// Target for the fused round-1 AB inner transform.
+///
+/// The zerocheck round-1 AB transform is challenge-independent: it can run any
+/// time after A and B exist. The incumbent runs it as a standalone pass joined
+/// against the commit, which costs a full re-read of both 512 MiB packed
+/// surfaces from DRAM — witness generation drains them non-temporally, so
+/// nothing survives in cache. Running the same transform inside the witness
+/// driver, one group at a time, reads A and B while they are still L1-hot and
+/// removes that 1 GiB of DRAM reads from the prove.
+///
+/// Only the *scheduling* changes: the per-outer-block body, its block
+/// geometry, its padding arms and its store flavor are
+/// [`flock_core::zerocheck::univariate_skip_optimized::ab_inner_outer_block`],
+/// shared verbatim with the standalone pass.
+pub(crate) struct FusedAbTarget<'a> {
+    ctx: flock_core::zerocheck::univariate_skip_optimized::AbInnerCtx<'a>,
+    base: *mut u8,
+    len: usize,
+    group_bytes: usize,
+    nt: bool,
+}
+
+// SAFETY: `base` is the sole writer of a scratch surface whose per-group
+// ranges are disjoint by construction, exactly like the driver's z/a/b
+// pointers.
+unsafe impl Send for FusedAbTarget<'_> {}
+unsafe impl Sync for FusedAbTarget<'_> {}
+
+impl<'a> FusedAbTarget<'a> {
+    /// `out` is the caller-owned transform surface — the same
+    /// `total_bytes / size_of::<F128>()` scratch allocation the standalone
+    /// precompute would have taken. `group_bytes` is one witness group's byte
+    /// span of the packed A (or B) surface.
+    pub(crate) fn new(
+        inv_table: &'a flock_core::ntt::InvNttTableByteSingleGf8,
+        padding: &flock_core::zerocheck::PaddingSpec,
+        out: &mut [F128],
+        group_bytes: usize,
+    ) -> Self {
+        use flock_core::zerocheck::univariate_skip_optimized as uso;
+        let len = std::mem::size_of_val(out);
+        assert_eq!(
+            group_bytes % uso::AB_INNER_OUTER_BYTES,
+            0,
+            "a witness group must be a whole number of x_outer blocks"
+        );
+        assert_eq!(len % group_bytes, 0, "surface must be a whole group count");
+        Self {
+            ctx: uso::AbInnerCtx::new(inv_table, padding),
+            base: out.as_mut_ptr() as *mut u8,
+            len,
+            group_bytes,
+            nt: uso::ab_inner_nt_flavor(),
+        }
+    }
+
+    /// Transform group `g`'s outer blocks out of the group's freshly written
+    /// (L1-resident) A/B bytes.
+    ///
+    /// # Safety
+    /// `g` must be scheduled exactly once; `a_grp`/`b_grp` must be that
+    /// group's `group_bytes` of the packed A/B surfaces.
+    pub(crate) unsafe fn emit_group(&self, g: usize, a_grp: &[F128], b_grp: &[F128]) {
+        use flock_core::field::F8;
+        use flock_core::zerocheck::univariate_skip_optimized as uso;
+        const OUTER: usize = uso::AB_INNER_OUTER_BYTES;
+        let a_bytes: &[u8] = unsafe {
+            std::slice::from_raw_parts(a_grp.as_ptr() as *const u8, std::mem::size_of_val(a_grp))
+        };
+        let b_bytes: &[u8] = unsafe {
+            std::slice::from_raw_parts(b_grp.as_ptr() as *const u8, std::mem::size_of_val(b_grp))
+        };
+        debug_assert_eq!(a_bytes.len(), self.group_bytes);
+        debug_assert_eq!(b_bytes.len(), self.group_bytes);
+        let group_base = g * self.group_bytes;
+        debug_assert!(group_base + self.group_bytes <= self.len);
+        // SAFETY: group `g`'s output range is disjoint from every other
+        // group's and lies inside the surface (checked above).
+        let out: &mut [u8] =
+            unsafe { std::slice::from_raw_parts_mut(self.base.add(group_base), self.group_bytes) };
+        let outer_base = group_base / OUTER;
+        let mut a_col = [F8::ZERO; 64];
+        let mut b_col = [F8::ZERO; 64];
+        for local in 0..self.group_bytes / OUTER {
+            let lo = local * OUTER;
+            uso::ab_inner_outer_block(
+                &self.ctx,
+                &a_bytes[lo..lo + OUTER],
+                &b_bytes[lo..lo + OUTER],
+                &mut out[lo..lo + OUTER],
+                outer_base + local,
+                self.nt,
+                &mut a_col,
+                &mut b_col,
+            );
+        }
+    }
+}
+
 /// Drive the parallel chunked witness build for `n_blocks` instances padded
 /// to `2^n_blocks_log` slots. Returns `(z, a, b, z_lincheck)` packed in
 /// F128 form (z/a/b) and byte-stripe form (z_lincheck).
@@ -232,6 +331,7 @@ where
         1usize << k_log,
         None,
         None,
+        None,
         per_block,
     );
     debug_assert!(stream.is_none());
@@ -262,6 +362,7 @@ where
         useful_bits,
         None,
         None,
+        None,
         per_block,
     );
     debug_assert!(stream.is_none());
@@ -278,6 +379,7 @@ pub(crate) fn drive_witness_packed_and_lincheck_full_write_streamed<S: Sync, F>(
     k_log: usize,
     useful_bits: usize,
     pcs_params: &flock_core::pcs::PcsParams,
+    fused_ab_target: Option<FusedAbTarget<'_>>,
     per_block: F,
 ) -> (
     Vec<F128>,
@@ -297,6 +399,7 @@ where
         useful_bits,
         None,
         Some(pcs_params),
+        fused_ab_target,
         per_block,
     )
 }
@@ -353,6 +456,7 @@ where
         k_log,
         useful_bits,
         Some(codeword),
+        None,
         None,
         per_block,
     );
@@ -453,6 +557,7 @@ fn drive_witness_packed_and_lincheck_impl<
     stripe_useful_bits: usize,
     rate2_codeword: Option<&mut [F128]>,
     stream_params: Option<&flock_core::pcs::PcsParams>,
+    fused_ab_target: Option<FusedAbTarget<'_>>,
     per_block: F,
 ) -> (
     Vec<F128>,
@@ -552,6 +657,7 @@ where
     let a_base = F128WritePtr(a.as_mut_ptr());
     let b_base = F128WritePtr(b.as_mut_ptr());
     let stripe_base = U8WritePtr(z_lincheck.as_mut_ptr());
+    let fused_ab = fused_ab_target.as_ref();
 
     let process_group = |g: usize| {
             // SAFETY: each scheduled group index occurs exactly once. Every
@@ -622,6 +728,23 @@ where
                     )
                 };
                 per_block(init, z_u64, a_u64, b_u64);
+            }
+
+            // Fused round-1 AB inner transform. A and B for this group were
+            // just written by the loop above and are still L1-resident, so the
+            // transform's reads are free here; the standalone precompute would
+            // instead re-read both 512 MiB surfaces from DRAM after the commit
+            // began. Arithmetic, block geometry and store flavor are the
+            // shared `ab_inner_outer_block` body — this only changes *when*
+            // the transform runs and *where* its inputs are read from.
+            if let Some(fused) = fused_ab {
+                // SAFETY: group `g` owns a disjoint output range of the same
+                // shape as its disjoint a/b ranges; every byte of that range
+                // is written (padding tails included) before the surface is
+                // read after the commit root.
+                unsafe {
+                    fused.emit_group(g, a_grp, b_grp);
+                }
             }
 
             // Bit-transpose 8 z chunks into the lincheck stripe.

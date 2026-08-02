@@ -572,6 +572,11 @@ impl Round1AbInner {
         }
     }
 
+    /// Byte view for cross-producer oracles (see the fused-driver test).
+    pub fn as_bytes_for_test(&self) -> &[u8] {
+        self.as_bytes()
+    }
+
     /// Resident scratch bytes retained until the challenge-weighted finish.
     pub fn len_bytes(&self) -> usize {
         self.storage.len() * core::mem::size_of::<F128>()
@@ -657,6 +662,155 @@ pub fn precompute_round1_ab_inner_packed_padded(
 
 /// Store-flavor-parameterized body; the public wrapper passes the latched env
 /// choice, tests compare both arms byte-for-byte in one process.
+/// Bytes of A, of B, and of transformed output that one `x_outer` block
+/// consumes/produces. The kernel reads exactly `[base, base + OUTER_BYTES)` of
+/// each packed surface (`byte_base_b = base + b_med * N_CHUNKS * 8`, eight
+/// `N_CHUNKS`-byte loads per `b_med`, `b_med < 1 << N_MEDIUM`) in every
+/// backend — portable, NEON and AVX-512 alike — which is what makes the block
+/// rebasable onto a small staging buffer.
+pub const AB_INNER_OUTER_BYTES: usize = (1 << N_MEDIUM) * 64;
+
+/// Everything [`precompute_round1_ab_inner_packed_padded`] derives from
+/// `(inv_table, padding)` before it touches one byte of A or B.
+///
+/// Exposed so the witness driver can emit the same transform per group while
+/// A and B are still L1-resident, instead of re-reading both 512 MiB surfaces
+/// from DRAM after they have been non-temporally drained.
+pub struct AbInnerCtx<'a> {
+    inv_table: &'a InvNttTableByteSingleGf8,
+    within_outer_mask: usize,
+    b_med_counts: Vec<u8>,
+    blake3_static_layout: bool,
+    static_b_context: Option<kernels::StaticBContext>,
+}
+
+impl<'a> AbInnerCtx<'a> {
+    pub fn new(inv_table: &'a InvNttTableByteSingleGf8, padding: &PaddingSpec) -> Self {
+        let (within_outer_mask, b_med_counts) = build_b_med_counts(padding);
+        // The BLAKE3 R1CS has two 8192-bit windows per 16384-bit block. Besides
+        // the full all-ones B rows at b_med 0/1 and the single-K0 tail, two mixed
+        // rows have fixed one-valued K subsets: K0..1 at first-window b_med 2 and
+        // K4..7 at second-window b_med 13. Restrict runtime sniffing to these five
+        // candidates; every other block enters the generic kernel directly.
+        let blake3_static_layout = padding.k_log == 14 && padding.useful_bits_per_block == 15_409;
+        let static_b_context = kernels::prepare_static_b_context(inv_table, blake3_static_layout);
+        Self {
+            inv_table,
+            within_outer_mask,
+            b_med_counts,
+            blake3_static_layout,
+            static_b_context,
+        }
+    }
+}
+
+/// Transform one `x_outer` block. `a_outer`/`b_outer` are that block's
+/// `AB_INNER_OUTER_BYTES` of the packed A/B surfaces — either a subslice of
+/// the full 512 MiB surface or the matching window of a staging buffer, which
+/// are indistinguishable to the kernel — and `x_outer` is the *global* outer
+/// index that selects the padding / static-B arm.
+///
+/// Single definition: the standalone precompute and the fused witness-driver
+/// producer both run this body, so no second transcription of the block
+/// geometry exists to drift.
+#[allow(clippy::too_many_arguments)]
+pub fn ab_inner_outer_block(
+    ctx: &AbInnerCtx<'_>,
+    a_outer: &[u8],
+    b_outer: &[u8],
+    out_outer: &mut [u8],
+    x_outer: usize,
+    nt: bool,
+    a_col: &mut [F8],
+    b_col: &mut [F8],
+) {
+    debug_assert_eq!(out_outer.len(), AB_INNER_OUTER_BYTES);
+    debug_assert!(a_outer.len() >= AB_INNER_OUTER_BYTES);
+    debug_assert!(b_outer.len() >= AB_INNER_OUTER_BYTES);
+    let within_hash_outer = x_outer & ctx.within_outer_mask;
+    let n_b_med = ctx.b_med_counts[within_hash_outer] as usize;
+    let blake3_static_layout = ctx.blake3_static_layout;
+
+    // NT arm: the kernel writes a stack temporary and the 64-byte
+    // block drains to the big buffer with `stnp` (write-once
+    // lines, consumer runs after the commit root). Control arm is
+    // the incumbent direct kernel write, byte-for-byte.
+    let mut tmp = [0u8; 64];
+    for b_med in 0..n_b_med {
+        let dst: &mut [u8; 64] = if nt {
+            &mut tmp
+        } else {
+            (&mut out_outer[b_med * 64..(b_med + 1) * 64])
+                .try_into()
+                .expect("one transformed b_med block")
+        };
+        shift_reduce_inner_ab(
+            a_outer,
+            b_outer,
+            ctx.inv_table,
+            0,
+            b_med,
+            dst,
+            a_col,
+            b_col,
+            !blake3_static_layout || (within_hash_outer == 0 && b_med < 2),
+            !blake3_static_layout || (within_hash_outer == 1 && b_med + 1 == n_b_med),
+            if blake3_static_layout && within_hash_outer == 0 && b_med == 2 {
+                0x03
+            } else if blake3_static_layout && within_hash_outer == 1 && b_med + 2 == n_b_med {
+                0xf0
+            } else {
+                0
+            },
+            if blake3_static_layout {
+                within_hash_outer
+            } else {
+                usize::MAX
+            },
+            ctx.static_b_context,
+        );
+        if nt {
+            // SAFETY: `b_med < n_b_med ≤ OUTER_BYTES / 64`, so the
+            // 64 destination bytes are in-bounds of `out_outer`.
+            unsafe { store_nt_64(tmp.as_ptr(), out_outer.as_mut_ptr().add(b_med * 64)) };
+        }
+    }
+    if nt {
+        let tail = &mut out_outer[n_b_med * 64..];
+        debug_assert_eq!(tail.len() % 64, 0);
+        let zero = [0u8; 64];
+        for i in 0..tail.len() / 64 {
+            // SAFETY: chunk `i` is 64 in-bounds bytes of `tail`.
+            unsafe { store_nt_64(zero.as_ptr(), tail.as_mut_ptr().add(i * 64)) };
+        }
+    } else {
+        out_outer[n_b_med * 64..].fill(0);
+    }
+}
+
+/// Whether the fused producer may replace the standalone precompute at this
+/// shape: exactly the preconditions
+/// [`precompute_round1_ab_inner_packed_padded`] asserts.
+pub fn ab_inner_supported(m: usize, k_skip: usize) -> bool {
+    k_skip == K_SKIP
+        && m >= K_SKIP + N_INNER
+        && ((1usize << m) / 8).is_multiple_of(core::mem::size_of::<F128>())
+}
+
+/// Store flavor the fused producer must use to match the standalone arm.
+pub fn ab_inner_nt_flavor() -> bool {
+    ab_pre_nt_enabled()
+}
+
+/// Wrap a fully-written transform surface produced by the witness driver.
+///
+/// The caller owns the same `total_bytes / 16` scratch F128 allocation the
+/// standalone precompute would have taken, and must have written every byte
+/// (including the per-block padding tails `ab_inner_outer_block` zero-fills).
+pub fn ab_inner_from_storage(storage: Vec<F128>) -> Round1AbInner {
+    Round1AbInner { storage }
+}
+
 fn precompute_round1_ab_inner_packed_padded_with_flavor(
     a_packed: &[u8],
     b_packed: &[u8],
@@ -680,15 +834,8 @@ fn precompute_round1_ab_inner_packed_padded_with_flavor(
     assert_eq!(inv_table.k, k_skip);
     assert_eq!(total_bytes % core::mem::size_of::<F128>(), 0);
 
-    let (within_outer_mask, b_med_counts) = build_b_med_counts(padding);
-    // The BLAKE3 R1CS has two 8192-bit windows per 16384-bit block. Besides
-    // the full all-ones B rows at b_med 0/1 and the single-K0 tail, two mixed
-    // rows have fixed one-valued K subsets: K0..1 at first-window b_med 2 and
-    // K4..7 at second-window b_med 13. Restrict runtime sniffing to these five
-    // candidates; every other block enters the generic kernel directly.
-    let blake3_static_layout = padding.k_log == 14 && padding.useful_bits_per_block == 15_409;
-    let static_b_context = kernels::prepare_static_b_context(inv_table, blake3_static_layout);
-    const OUTER_BYTES: usize = (1 << N_MEDIUM) * 64;
+    let ctx = AbInnerCtx::new(inv_table, padding);
+    const OUTER_BYTES: usize = AB_INNER_OUTER_BYTES;
     debug_assert_eq!(OUTER_BYTES, (1 << N_INNER) * N_CHUNKS);
 
     // Reuse an A-sized resident F128 allocation from the prover scratch pool.
@@ -704,70 +851,17 @@ fn precompute_round1_ab_inner_packed_padded_with_flavor(
         .for_each_init(
             || ([F8::ZERO; ELL], [F8::ZERO; ELL]),
             |(a_col, b_col), (x_outer, out_outer)| {
-                let within_hash_outer = x_outer & within_outer_mask;
-                let n_b_med = b_med_counts[within_hash_outer] as usize;
                 let chunk_byte_base = x_outer * OUTER_BYTES;
-
-                // NT arm: the kernel writes a stack temporary and the 64-byte
-                // block drains to the big buffer with `stnp` (write-once
-                // lines, consumer runs after the commit root). Control arm is
-                // the incumbent direct kernel write, byte-for-byte.
-                let mut tmp = [0u8; 64];
-                for b_med in 0..n_b_med {
-                    let dst: &mut [u8; 64] = if nt {
-                        &mut tmp
-                    } else {
-                        (&mut out_outer[b_med * 64..(b_med + 1) * 64])
-                            .try_into()
-                            .expect("one transformed b_med block")
-                    };
-                    shift_reduce_inner_ab(
-                        a_packed,
-                        b_packed,
-                        inv_table,
-                        chunk_byte_base,
-                        b_med,
-                        dst,
-                        a_col,
-                        b_col,
-                        !blake3_static_layout || (within_hash_outer == 0 && b_med < 2),
-                        !blake3_static_layout || (within_hash_outer == 1 && b_med + 1 == n_b_med),
-                        if blake3_static_layout && within_hash_outer == 0 && b_med == 2 {
-                            0x03
-                        } else if blake3_static_layout
-                            && within_hash_outer == 1
-                            && b_med + 2 == n_b_med
-                        {
-                            0xf0
-                        } else {
-                            0
-                        },
-                        if blake3_static_layout {
-                            within_hash_outer
-                        } else {
-                            usize::MAX
-                        },
-                        static_b_context,
-                    );
-                    if nt {
-                        // SAFETY: `b_med < n_b_med ≤ OUTER_BYTES / 64`, so the
-                        // 64 destination bytes are in-bounds of `out_outer`.
-                        unsafe {
-                            store_nt_64(tmp.as_ptr(), out_outer.as_mut_ptr().add(b_med * 64))
-                        };
-                    }
-                }
-                if nt {
-                    let tail = &mut out_outer[n_b_med * 64..];
-                    debug_assert_eq!(tail.len() % 64, 0);
-                    let zero = [0u8; 64];
-                    for i in 0..tail.len() / 64 {
-                        // SAFETY: chunk `i` is 64 in-bounds bytes of `tail`.
-                        unsafe { store_nt_64(zero.as_ptr(), tail.as_mut_ptr().add(i * 64)) };
-                    }
-                } else {
-                    out_outer[n_b_med * 64..].fill(0);
-                }
+                ab_inner_outer_block(
+                    &ctx,
+                    &a_packed[chunk_byte_base..chunk_byte_base + OUTER_BYTES],
+                    &b_packed[chunk_byte_base..chunk_byte_base + OUTER_BYTES],
+                    out_outer,
+                    x_outer,
+                    nt,
+                    a_col,
+                    b_col,
+                );
             },
         );
 
@@ -5007,6 +5101,103 @@ mod tests {
             assert_eq!(
                 fold4_from_8, incumbent.4,
                 "fold8 → fold4 reduction mismatch in case {case}"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod fused_ab_inner_tests {
+    use super::*;
+
+    /// Deterministic pseudo-random packed surface (no rand dependency).
+    fn fill_pseudo(buf: &mut [u8], mut state: u64) {
+        for byte in buf.iter_mut() {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            *byte = (state >> 33) as u8;
+        }
+    }
+
+    /// The fused producer's contract: the witness driver hands
+    /// [`ab_inner_outer_block`] one quad's worth of *staged* A/B bytes plus the
+    /// **global** outer index, instead of the full 512 MiB surface plus a byte
+    /// offset. Rebasing must be a no-op on the output.
+    ///
+    /// This is the local oracle for the addressing the fused path introduces:
+    /// the kernel arithmetic is shared verbatim with the standalone arm, so
+    /// the only thing that can differ between the two producers is *which*
+    /// bytes reach the kernel and *which* `x_outer` arm is selected. Both are
+    /// exercised here at the ranked BLAKE3 padding shape on a host that can
+    /// execute the portable kernel.
+    #[test]
+    fn fused_from_staged_quads_matches_standalone_precompute() {
+        // Ranked BLAKE3 padding shape (k_log = 14, useful = 15_409) drives the
+        // static-B arms; m is shrunk so the surfaces fit a unit test.
+        let padding = PaddingSpec {
+            k_log: 14,
+            useful_bits_per_block: 15_409,
+        };
+        let m = 20;
+        let total_bytes = (1usize << m) / 8;
+        let inv_table = crate::ntt::InvNttTableByteSingleGf8::cached_standard_k6();
+
+        let mut a = vec![0u8; total_bytes];
+        let mut b = vec![0u8; total_bytes];
+        fill_pseudo(&mut a, 0x5eed_0001);
+        fill_pseudo(&mut b, 0x5eed_0002);
+
+        // Both store flavors, so the fused arm is checked against whichever
+        // one the standalone arm latches at runtime.
+        for nt in [false, true] {
+            let reference = precompute_round1_ab_inner_packed_padded_with_flavor(
+                &a, &b, m, K_SKIP, inv_table, &padding, nt,
+            );
+
+            // Fused arm: walk quads of four 2^k_log-bit blocks, copy each
+            // quad's A/B bytes into staging (what the driver gets for free out
+            // of L1), and transform from there.
+            let ctx = AbInnerCtx::new(inv_table, &padding);
+            let block_bytes = (1usize << padding.k_log) / 8;
+            let outer_per_block = block_bytes / AB_INNER_OUTER_BYTES;
+            assert_eq!(outer_per_block, 2, "BLAKE3 block = two 8192-bit windows");
+            let quad_blocks = 4;
+            let quad_bytes = quad_blocks * block_bytes;
+            assert_eq!(total_bytes % quad_bytes, 0);
+
+            let mut fused = vec![0u8; total_bytes];
+            let mut a_stage = vec![0u8; quad_bytes];
+            let mut b_stage = vec![0u8; quad_bytes];
+            let mut a_col = [F8::ZERO; ELL];
+            let mut b_col = [F8::ZERO; ELL];
+            for quad in 0..total_bytes / quad_bytes {
+                let base = quad * quad_bytes;
+                a_stage.copy_from_slice(&a[base..base + quad_bytes]);
+                b_stage.copy_from_slice(&b[base..base + quad_bytes]);
+                let outer_base = quad * (quad_bytes / AB_INNER_OUTER_BYTES);
+                for local in 0..quad_bytes / AB_INNER_OUTER_BYTES {
+                    let lo = local * AB_INNER_OUTER_BYTES;
+                    let hi = lo + AB_INNER_OUTER_BYTES;
+                    let out_lo = base + lo;
+                    ab_inner_outer_block(
+                        &ctx,
+                        &a_stage[lo..hi],
+                        &b_stage[lo..hi],
+                        &mut fused[out_lo..out_lo + AB_INNER_OUTER_BYTES],
+                        outer_base + local,
+                        nt,
+                        &mut a_col,
+                        &mut b_col,
+                    );
+                }
+            }
+
+            assert_eq!(
+                fused.as_slice(),
+                reference.as_bytes(),
+                "fused staged-quad transform diverged from the standalone \
+                 precompute (nt = {nt})"
             );
         }
     }

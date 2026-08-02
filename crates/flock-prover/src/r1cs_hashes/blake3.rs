@@ -2098,6 +2098,18 @@ pub(crate) mod witgen_simd {
         }
     }
 
+    // Per-worker L1 stage for the fused round-1 AB arm. Sized on first use
+    // to `2 * group_f128` (A half, then B half) and reused for every group
+    // that worker drains.
+    thread_local! {
+        static AB_STAGE: core::cell::RefCell<Vec<F128>> =
+            const { core::cell::RefCell::new(Vec::new()) };
+    }
+
+    /// Raw stage pointer, so the borrow does not outlive the `with` closure.
+    #[derive(Clone, Copy)]
+    struct StagePtr(*mut F128);
+
     /// SIMD counterpart of `drive_witness_packed_and_lincheck_impl`
     /// (PER_BLOCK_FULLY_WRITES, no rate-2 codeword): same scratch pools, same
     /// process_group shape, same optional Metal band streaming, same stripe
@@ -2109,6 +2121,7 @@ pub(crate) mod witgen_simd {
         n_blocks_log: usize,
         stream_params: Option<&flock_core::pcs::PcsParams>,
         defer_ranked_stripe: bool,
+        fused_ab_target: Option<crate::r1cs_hashes::common::FusedAbTarget<'_>>,
     ) -> (
         Vec<F128>,
         Vec<F128>,
@@ -2183,6 +2196,7 @@ pub(crate) mod witgen_simd {
         // the full 512 MiB ranked buffer. The per-band release fence below is
         // the same visibility boundary used by the cached-store path.
         let z_nt = select_z_nt(nt, defer_ranked_stripe, z_nt_enabled());
+        let fused_ab = fused_ab_target.as_ref();
 
         let process_group = |g: usize| {
             // SAFETY: each scheduled group index occurs exactly once. Every
@@ -2194,6 +2208,41 @@ pub(crate) mod witgen_simd {
                     std::slice::from_raw_parts_mut(b_base.get().add(g * group_f128), group_f128),
                 )
             };
+            // Fused arm: build A/B into a per-worker L1 stage instead of
+            // straight into the 512 MiB surfaces, so the round-1 AB inner
+            // transform below reads them without touching DRAM. The stage then
+            // drains to the real surfaces in contiguous 64-byte `stnp` bursts
+            // — the same write-once store shape the direct arm emits, just
+            // sourced from L1 (`stripe_store_nt` is the shared burst).
+            //
+            // The stage is thread-local, not a stack array: at the ranked
+            // shape this closure runs 32,768 times, and re-zeroing 32 KiB per
+            // call would add ~1 GiB of pointless L1 stores. The quad builder
+            // full-writes every word it is given (the direct arm hands it
+            // stale scratch), so reuse across groups carries nothing forward.
+            //
+            // Both arms below take their destination through the *same*
+            // `base` expression, so no second copy of the quad geometry
+            // exists; `ab_nt = false` into the stage is the pre-existing
+            // plain-store arm (`FLOCK_WITGEN_SIMD_PLAIN_STORES`), which
+            // selects only the store instruction, never the bytes.
+            let mut stage = fused_ab.map(|_| {
+                AB_STAGE.with(|cell| {
+                    let mut v = cell.borrow_mut();
+                    if v.len() < 2 * group_f128 {
+                        v.resize(2 * group_f128, F128::ZERO);
+                    }
+                    StagePtr(v.as_mut_ptr())
+                })
+            });
+            let (a_write, b_write) = match stage.as_mut() {
+                // SAFETY: the stage holds `2 * group_f128` elements; A takes
+                // the first half, B the second. It is thread-local, so the
+                // pointer is exclusive to this worker for this call.
+                Some(stage) => (stage.0, unsafe { stage.0.add(group_f128) }),
+                None => (a_grp.as_mut_ptr(), b_grp.as_mut_ptr()),
+            };
+            let ab_nt = stage.is_none() && nt;
             for half in 0..2 {
                 let quad: [&Compression; 4] = std::array::from_fn(|j| {
                     let idx = 8 * g + 4 * half + j;
@@ -2210,11 +2259,36 @@ pub(crate) mod witgen_simd {
                     build_quad_witness_ab_stream_neon(
                         quad,
                         z_grp[base..].as_mut_ptr() as *mut u32,
-                        a_grp[base..].as_mut_ptr() as *mut u32,
-                        b_grp[base..].as_mut_ptr() as *mut u32,
+                        a_write.add(base) as *mut u32,
+                        b_write.add(base) as *mut u32,
                         z_nt,
-                        nt,
+                        ab_nt,
                     );
+                }
+            }
+            if let Some(fused) = fused_ab {
+                // SAFETY: `a_write`/`b_write` are the stage's two halves, each
+                // `group_f128` elements, fully written by the loop above.
+                let (a_stage, b_stage) = unsafe {
+                    (
+                        std::slice::from_raw_parts(a_write, group_f128),
+                        std::slice::from_raw_parts(b_write, group_f128),
+                    )
+                };
+                // Transform first, while the stage is hottest, then drain.
+                // SAFETY: group `g` is scheduled exactly once and owns the
+                // matching disjoint range of the transform surface.
+                unsafe { fused.emit_group(g, a_stage, b_stage) };
+                let bursts = group_f128 * core::mem::size_of::<F128>() / 64;
+                for (src, dst) in [
+                    (a_write as *const u8, a_grp.as_mut_ptr() as *mut u8),
+                    (b_write as *const u8, b_grp.as_mut_ptr() as *mut u8),
+                ] {
+                    for burst in 0..bursts {
+                        // SAFETY: `bursts * 64` is exactly the group's byte
+                        // span of both the stage and the destination surface.
+                        unsafe { stripe_store_nt(src.add(burst * 64), dst.add(burst * 64)) };
+                    }
                 }
             }
             if let Some(stripe_base) = stripe_base {
@@ -2322,7 +2396,7 @@ pub(crate) mod witgen_simd {
         blocks: &[Compression],
         n_blocks_log: usize,
     ) -> (Vec<F128>, Vec<F128>, Vec<F128>, Vec<u8>) {
-        let (z, a, b, stripe, stream) = generate_impl(blocks, n_blocks_log, None, false);
+        let (z, a, b, stripe, stream) = generate_impl(blocks, n_blocks_log, None, false, None);
         debug_assert!(stream.is_none());
         (
             z,
@@ -2339,6 +2413,7 @@ pub(crate) mod witgen_simd {
         n_blocks_log: usize,
         pcs_params: &flock_core::pcs::PcsParams,
         defer_ranked_stripe: bool,
+        fused_ab_target: Option<crate::r1cs_hashes::common::FusedAbTarget<'_>>,
     ) -> (
         Vec<F128>,
         Vec<F128>,
@@ -2346,7 +2421,13 @@ pub(crate) mod witgen_simd {
         Option<Vec<u8>>,
         Option<flock_core::gpu_commit::FromZFirstPassStream>,
     ) {
-        generate_impl(blocks, n_blocks_log, Some(pcs_params), defer_ranked_stripe)
+        generate_impl(
+            blocks,
+            n_blocks_log,
+            Some(pcs_params),
+            defer_ranked_stripe,
+            fused_ab_target,
+        )
     }
 }
 
@@ -2549,10 +2630,22 @@ fn should_request_ranked_exact_tune(call: usize, ranked_shape_enabled: bool) -> 
     call == 0 && ranked_shape_enabled
 }
 
+/// Kill switch for the fused round-1 AB inner transform:
+/// `FLOCK_NO_FUSED_AB_INNER=1` restores the incumbent standalone precompute
+/// joined against the commit. Both arms produce the same surface bit-for-bit
+/// (`ab_inner_outer_block` is shared); only when and from where it is
+/// produced differs.
+fn fused_ab_inner_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_FUSED_AB_INNER").is_none());
+    *ON
+}
+
 fn generate_witness_with_ab_packed_and_lincheck_streamed(
     blocks: &[Compression],
     n_blocks_log: usize,
     pcs_params: &PcsParams,
+    fused_ab_target: Option<super::common::FusedAbTarget<'_>>,
 ) -> (
     Vec<F128>,
     Vec<F128>,
@@ -2580,6 +2673,7 @@ fn generate_witness_with_ab_packed_and_lincheck_streamed(
             n_blocks_log,
             pcs_params,
             use_deferred_ranked_lincheck_stripe(n_blocks_log, pcs_params),
+            fused_ab_target,
         );
     }
     let (z, a, b, stripe, stream) =
@@ -2590,6 +2684,7 @@ fn generate_witness_with_ab_packed_and_lincheck_streamed(
             K_LOG,
             stripe_useful_bits,
             pcs_params,
+            fused_ab_target,
             per_block,
         );
     (z, a, b, Some(stripe), stream)
@@ -2883,12 +2978,46 @@ impl Blake3Setup {
                 };
                 let cpu_wit = phase_timing.then(crate::prover::process_cpu_ms);
                 let t_wit = std::time::Instant::now();
-                let (z_packed, a_packed_f128, b_packed_f128, z_packed_lincheck, gpu_first_pass) =
+                // Fused round-1 AB inner transform: produce the
+                // challenge-independent zerocheck surface here, out of the
+                // group-local A/B bytes the driver has just written, instead
+                // of re-reading both 512 MiB packed surfaces from DRAM in the
+                // commit-joined precompute. Same kernel, same geometry, same
+                // store flavor — see `common::FusedAbTarget`.
+                let fused_padding = self.r1cs.padding_spec();
+                let mut fused_ab_storage = fused_ab_inner_enabled()
+                    .then(|| {
+                        flock_core::zerocheck::univariate_skip_optimized::ab_inner_supported(
+                            self.pcs_params.m,
+                            flock_core::zerocheck::K_SKIP,
+                        )
+                        .then(|| {
+                            flock_core::scratch::take_f128(
+                                ((1usize << self.pcs_params.m) / 8)
+                                    / std::mem::size_of::<flock_core::field::F128>(),
+                            )
+                        })
+                    })
+                    .flatten();
+                let (z_packed, a_packed_f128, b_packed_f128, z_packed_lincheck, gpu_first_pass) = {
+                    let target = fused_ab_storage.as_mut().map(|buf| {
+                        super::common::FusedAbTarget::new(
+                            flock_core::ntt::InvNttTableByteSingleGf8::cached_standard_k6(),
+                            &fused_padding,
+                            buf,
+                            // One witness group is eight blocks of K bits.
+                            8 * ((1usize << K_LOG) / 8),
+                        )
+                    });
                     generate_witness_with_ab_packed_and_lincheck_streamed(
                         blocks,
                         self.n_blocks_log(),
                         &self.pcs_params,
-                    );
+                        target,
+                    )
+                };
+                let fused_ab_inner = fused_ab_storage
+                    .map(flock_core::zerocheck::univariate_skip_optimized::ab_inner_from_storage);
                 if phase_timing {
                     let wall = t_wit.elapsed().as_secs_f64() * 1e3;
                     let cpu = crate::prover::process_cpu_ms() - cpu_wit.unwrap_or(0.0);
@@ -2914,6 +3043,7 @@ impl Blake3Setup {
                                 lc_circuit,
                                 codeword,
                                 stream,
+                                fused_ab_inner,
                                 challenger,
                             )
                         }
@@ -2926,6 +3056,7 @@ impl Blake3Setup {
                             lc_circuit,
                             codeword,
                             stream,
+                            fused_ab_inner,
                             challenger,
                         ),
                     };
@@ -4456,6 +4587,84 @@ mod chain_e2e_tests {
             setup
                 .verify_chain(&comm, &proof, &cv0, &cv_last, &mut chv)
                 .is_err()
+        );
+    }
+}
+
+#[cfg(test)]
+mod fused_ab_inner_driver_tests {
+    use super::*;
+
+    /// End-to-end oracle for the fused round-1 AB inner transform *as the
+    /// witness driver actually produces it*.
+    ///
+    /// This drives the real streamed witness entry — the same function the
+    /// ranked prove calls — with a fused target attached, then checks the
+    /// surface it produced against the standalone precompute run over the A
+    /// and B the very same call emitted. It therefore covers what the unit
+    /// test in `flock-core` cannot: global group indexing across the whole
+    /// surface, padding blocks, and the driver's group scheduling.
+    ///
+    /// Host note: the ranked from-message *branch selector* is macOS/aarch64
+    /// gated, so a Linux `prove_fast` never reaches this driver. Calling the
+    /// driver directly is what makes the fused arm executable — and therefore
+    /// falsifiable — on this host.
+    #[test]
+    fn driver_fused_surface_matches_standalone_precompute() {
+        use flock_core::zerocheck::univariate_skip_optimized as uso;
+
+        let n_blocks_log = 7usize;
+        let n_blocks = 1usize << n_blocks_log;
+        let setup = Blake3Setup::new(n_blocks);
+        let m = setup.pcs_params.m;
+        assert!(uso::ab_inner_supported(m, flock_core::zerocheck::K_SKIP));
+
+        // Distinct, non-degenerate inputs: every block gets its own chaining
+        // value / message so A and B are not accidentally uniform.
+        let blocks: Vec<Compression> = (0..n_blocks)
+            .map(|i| {
+                let cv: [u32; 8] = std::array::from_fn(|j| (i as u32) * 0x9e37_79b9 + j as u32);
+                let msg: [u32; 16] = std::array::from_fn(|j| (i as u32) ^ (j as u32 * 0x85eb_ca6b));
+                (cv, msg, i as u64, 64, 11)
+            })
+            .collect();
+
+        let padding_spec = setup.r1cs.padding_spec();
+        let total_bytes = (1usize << m) / 8;
+        let mut storage =
+            flock_core::scratch::take_f128(total_bytes / std::mem::size_of::<F128>());
+        let (_z, a, b, _stripe, _stream) = {
+            let target = crate::r1cs_hashes::common::FusedAbTarget::new(
+                flock_core::ntt::InvNttTableByteSingleGf8::cached_standard_k6(),
+                &padding_spec,
+                &mut storage,
+                8 * ((1usize << K_LOG) / 8),
+            );
+            generate_witness_with_ab_packed_and_lincheck_streamed(
+                &blocks,
+                n_blocks_log,
+                &setup.pcs_params,
+                Some(target),
+            )
+        };
+
+        let as_bytes = |v: &[F128]| -> &[u8] {
+            unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, std::mem::size_of_val(v)) }
+        };
+        let reference = uso::precompute_round1_ab_inner_packed_padded(
+            as_bytes(&a),
+            as_bytes(&b),
+            m,
+            flock_core::zerocheck::K_SKIP,
+            flock_core::ntt::InvNttTableByteSingleGf8::cached_standard_k6(),
+            &padding_spec,
+        );
+        let fused = as_bytes(&storage);
+        assert_eq!(fused.len(), reference.len_bytes());
+        assert_eq!(
+            fused,
+            reference.as_bytes_for_test(),
+            "driver-fused round-1 AB surface diverged from the standalone precompute"
         );
     }
 }

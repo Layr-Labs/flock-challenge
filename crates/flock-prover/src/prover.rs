@@ -325,6 +325,7 @@ pub fn prove_fast_ligerito_from_witness<Ch: Challenger>(
         LincheckStripeInput::Ready(z_packed_lincheck),
         lincheck_circuit,
         commit_codeword,
+        None,
         challenger,
     )
 }
@@ -353,6 +354,7 @@ pub(crate) fn prove_fast_ligerito_from_preinitialized_codeword<Ch: Challenger>(
         LincheckStripeInput::Ready(z_packed_lincheck),
         lincheck_circuit,
         CommitCodeword::Preinitialized(codeword),
+        None,
         challenger,
     )
 }
@@ -371,6 +373,7 @@ pub(crate) fn prove_fast_ligerito_from_streamed_first_pass<Ch: Challenger>(
     lincheck_circuit: &dyn lincheck::LincheckCircuit,
     codeword: Vec<F128>,
     stream: flock_core::gpu_commit::FromZFirstPassStream,
+    fused_ab_inner: Option<zerocheck::univariate_skip_optimized::Round1AbInner>,
     challenger: &mut Ch,
 ) -> (R1csProofLigerito, Commitment, R1csClaim) {
     prove_fast_ligerito_from_witness_with_commit_codeword(
@@ -382,6 +385,7 @@ pub(crate) fn prove_fast_ligerito_from_streamed_first_pass<Ch: Challenger>(
         LincheckStripeInput::Ready(z_packed_lincheck),
         lincheck_circuit,
         CommitCodeword::StreamedFirstPass(codeword, stream),
+        fused_ab_inner,
         challenger,
     )
 }
@@ -403,6 +407,7 @@ pub(crate) fn prove_fast_ligerito_from_streamed_first_pass_deferred_stripe<Ch: C
     lincheck_circuit: &dyn lincheck::LincheckCircuit,
     codeword: Vec<F128>,
     stream: flock_core::gpu_commit::FromZFirstPassStream,
+    fused_ab_inner: Option<zerocheck::univariate_skip_optimized::Round1AbInner>,
     challenger: &mut Ch,
 ) -> (R1csProofLigerito, Commitment, R1csClaim) {
     prove_fast_ligerito_from_witness_with_commit_codeword(
@@ -414,6 +419,7 @@ pub(crate) fn prove_fast_ligerito_from_streamed_first_pass_deferred_stripe<Ch: C
         LincheckStripeInput::DeferredRanked,
         lincheck_circuit,
         CommitCodeword::StreamedFirstPass(codeword, stream),
+        fused_ab_inner,
         challenger,
     )
 }
@@ -428,6 +434,7 @@ fn prove_fast_ligerito_from_witness_with_commit_codeword<Ch: Challenger>(
     z_packed_lincheck: LincheckStripeInput,
     lincheck_circuit: &dyn lincheck::LincheckCircuit,
     commit_codeword: CommitCodeword,
+    fused_ab_inner: Option<zerocheck::univariate_skip_optimized::Round1AbInner>,
     challenger: &mut Ch,
 ) -> (R1csProofLigerito, Commitment, R1csClaim) {
     let lig_config = pcs_params
@@ -453,6 +460,7 @@ fn prove_fast_ligerito_from_witness_with_commit_codeword<Ch: Challenger>(
         z_packed_lincheck,
         lincheck_circuit,
         commit_codeword,
+        fused_ab_inner,
         challenger,
     );
 
@@ -714,6 +722,7 @@ fn commit_with_round1_ab_precompute(
     pcs_params: &PcsParams,
     padding: &zerocheck::PaddingSpec,
     commit_codeword: CommitCodeword,
+    fused_ab_inner: Option<zerocheck::univariate_skip_optimized::Round1AbInner>,
 ) -> (
     (Commitment, pcs::ProverData),
     zerocheck::univariate_skip_optimized::Round1AbInner,
@@ -771,7 +780,23 @@ fn commit_with_round1_ab_precompute(
         },
         || {
             let t = std::time::Instant::now();
-            let r = precompute_ab();
+            // The witness driver may already have produced this exact surface
+            // out of L1 while A and B were being written (see
+            // `FusedAbTarget`). Taking it here is what removes the 1 GiB
+            // DRAM re-read of A and B from the commit window; the arm then
+            // reports a ~0 ms wall, which is the truth the hybrid-split
+            // contention model should see.
+            let r = match fused_ab_inner {
+                Some(inner) => {
+                    assert_eq!(
+                        inner.len_bytes(),
+                        (1usize << pcs_params.m) / 8,
+                        "fused round-1 AB surface was built for a different shape"
+                    );
+                    inner
+                }
+                None => precompute_ab(),
+            };
             let wall_ms = t.elapsed().as_secs_f64() * 1e3;
             // The hybrid-commit warmup sweep sizes its contention emulation
             // from this arm's measured wall (an Instant read is free; the
@@ -819,6 +844,7 @@ pub fn prove_fast_core<Ch: Challenger>(
         LincheckStripeInput::Ready(z_packed_lincheck),
         lincheck_circuit,
         CommitCodeword::Allocate,
+        None,
         challenger,
     )
 }
@@ -853,6 +879,7 @@ pub fn prove_fast_core_with_codeword<Ch: Challenger>(
         LincheckStripeInput::Ready(z_packed_lincheck),
         lincheck_circuit,
         commit_codeword,
+        None,
         challenger,
     )
 }
@@ -867,6 +894,7 @@ fn prove_fast_core_with_commit_codeword<Ch: Challenger>(
     z_packed_lincheck: LincheckStripeInput,
     lincheck_circuit: &dyn lincheck::LincheckCircuit,
     commit_codeword: CommitCodeword,
+    fused_ab_inner: Option<zerocheck::univariate_skip_optimized::Round1AbInner>,
     challenger: &mut Ch,
 ) -> ProveCore {
     let padding = r1cs.padding_spec();
@@ -881,6 +909,7 @@ fn prove_fast_core_with_commit_codeword<Ch: Challenger>(
             pcs_params,
             &padding,
             commit_codeword,
+            fused_ab_inner,
         );
         if phase_timing {
             let wall = t_commit.elapsed().as_secs_f64() * 1e3;
@@ -1217,6 +1246,7 @@ fn prove_fast_ligerito_timed_with_commit_codeword<Ch: Challenger>(
         pcs_params,
         &padding,
         commit_codeword,
+        None,
     );
     t.commit_s = t0.elapsed().as_secs_f64();
     bind_statement(challenger, r1cs, &commitment);
