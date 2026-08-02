@@ -114,12 +114,12 @@ fn zc_tail_hetero_enabled() -> bool {
 /// a P-core's private cache.  Stop at half=2^22: below that point the chunks
 /// are already small enough that the extra claims and final partials can
 /// dominate the cache benefit.
-const LARGE_TAIL_EQ_N_HI: usize = 11;
-const LARGE_TAIL_EQ_MIN_HALF: usize = 1 << 22;
+pub(crate) const LARGE_TAIL_EQ_N_HI: usize = 11;
+pub(crate) const LARGE_TAIL_EQ_MIN_HALF: usize = 1 << 22;
 
 /// Correctness-preserving kill switch for same-binary A/B screening.
 #[cfg(target_arch = "aarch64")]
-fn zc_tail_split11_enabled() -> bool {
+pub(crate) fn zc_tail_split11_enabled() -> bool {
     use std::sync::LazyLock;
     static ENABLED: LazyLock<bool> =
         LazyLock::new(|| std::env::var_os("FLOCK_NO_ZC_TAIL_SPLIT11").is_none());
@@ -1688,6 +1688,97 @@ fn fold_and_compute_round_pair_into_with_n_hi(
     };
 
     (r_next[0] * sum1, sum_inf)
+}
+
+/// GPU-hybrid sibling of [`fold_and_compute_round_pair_into`]: computes only
+/// the chunks `[x_hi_lo, x_hi_hi)` of the same fused round and returns the
+/// XOR sum of those chunks' `eq_hi`-scaled message partials. Bit-exact with
+/// the incumbent by the same partition argument the 9-vs-11 `n_hi`
+/// regression test relies on: chunk partials are combined by XOR (abelian),
+/// so any contiguous sub-range computed on either side of a GPU/CPU split
+/// recombines to the incumbent's total. The caller supplies the already-
+/// built `eq` split table (shared with the GPU dispatch, so both sides see
+/// identical weights).
+#[cfg(target_arch = "aarch64")]
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub(crate) fn fold_and_compute_round_pair_chunk_range_into(
+    a: &[F128],
+    b: &[F128],
+    a_out: &mut [F128],
+    b_out: &mut [F128],
+    r_fold: F128,
+    eq: &SplitEqGhash,
+    x_hi_lo: usize,
+    x_hi_hi: usize,
+) -> (F128, F128) {
+    use rayon::prelude::*;
+
+    let n = a.len();
+    assert_eq!(b.len(), n);
+    assert!(n.is_power_of_two() && n >= 8);
+    let half = n / 2;
+    let lo_size = 1usize << eq.n_lo;
+    let hi_size = 1usize << eq.n_hi;
+    assert_eq!(lo_size * hi_size * 2, half);
+    assert!(x_hi_lo <= x_hi_hi && x_hi_hi <= hi_size);
+    let chunk_in = 4 * lo_size;
+    let chunk_out = 2 * lo_size;
+    // Same store policy as the incumbent round (store type does not change
+    // the written bytes, so matching it exactly is optional but free).
+    let nt_stores = {
+        use std::sync::OnceLock;
+        static NT_ENABLED: OnceLock<bool> = OnceLock::new();
+        half >= (1usize << 21)
+            && *NT_ENABLED.get_or_init(|| std::env::var_os("FLOCK_ZC_NT_LEGACY").is_none())
+    };
+    let hetero = half >= (1usize << 21) && zc_tail_hetero_enabled();
+    let eq_lo = &eq.lo;
+    let eq_hi = &eq.hi;
+    let a_out_base = crate::epool::SyncPtr(a_out.as_mut_ptr());
+    let b_out_base = crate::epool::SyncPtr(b_out.as_mut_ptr());
+    let one_chunk = move |x_hi: usize| -> (F128, F128) {
+        // SAFETY: chunks are disjoint across x_hi; each call owns
+        // [x_hi*chunk_out, (x_hi+1)*chunk_out) of both output arrays.
+        let (a_out, b_out) = unsafe {
+            (
+                std::slice::from_raw_parts_mut(a_out_base.ptr().add(x_hi * chunk_out), chunk_out),
+                std::slice::from_raw_parts_mut(b_out_base.ptr().add(x_hi * chunk_out), chunk_out),
+            )
+        };
+        let (p1, pinf) = fold_and_message_aarch64(
+            &a[x_hi * chunk_in..(x_hi + 1) * chunk_in],
+            &b[x_hi * chunk_in..(x_hi + 1) * chunk_in],
+            a_out,
+            b_out,
+            r_fold,
+            eq_lo,
+            nt_stores,
+        );
+        let eq_h = eq_hi[x_hi];
+        (eq_h * p1, eq_h * pinf)
+    };
+    if hetero {
+        // Same E-core drain contract as the incumbent's big rounds.
+        let n_range = x_hi_hi - x_hi_lo;
+        let mut partials: Vec<(F128, F128)> = vec![(F128::ZERO, F128::ZERO); n_range];
+        let partials_base = crate::epool::SyncPtr(partials.as_mut_ptr());
+        crate::epool::run_hetero_chunks(n_range, |e| {
+            // SAFETY: exclusive owner of partials[e].
+            unsafe {
+                *partials_base.ptr().add(e) = one_chunk(x_hi_lo + e);
+            }
+        });
+        partials
+            .iter()
+            .fold((F128::ZERO, F128::ZERO), |(s1, sinf), &(c1, cinf)| {
+                (s1 + c1, sinf + cinf)
+            })
+    } else {
+        (x_hi_lo..x_hi_hi).into_par_iter().map(one_chunk).reduce(
+            || (F128::ZERO, F128::ZERO),
+            |(s1, sinf), (c1, cinf)| (s1 + c1, sinf + cinf),
+        )
+    }
 }
 
 /// Serial reference — identical I/O contract to

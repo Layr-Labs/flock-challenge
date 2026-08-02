@@ -43,6 +43,22 @@ static PINNED_F128: Mutex<Option<PinnedF128>> = Mutex::new(None);
 static PINNED_F128_ADDR: AtomicUsize = AtomicUsize::new(0);
 static PINNED_F128_LEN: AtomicUsize = AtomicUsize::new(0);
 
+/// Multi-allocation variant of the [`PINNED_F128`] quarantine, for the GPU
+/// zerocheck tail's four retained no-copy wraps (the ping-pong buffers
+/// `a_mlv`/`b_mlv`/`a_nxt`/`b_nxt`). Identical contract to the single slot:
+/// a registered allocation is immune to smallest-first eviction and
+/// [`clear`] while any external Metal view names it; the owning GPU module
+/// calls [`unpin_f128_allocation_tail`] only after releasing that view.
+/// While `buffer` is `None`, the exact `Vec` is checked out by prover code.
+static PINNED_F128_TAIL: Mutex<Vec<PinnedF128>> = Mutex::new(Vec::new());
+// Fast rejection keeps ordinary scratch traffic off the tail-pin mutex.
+static PINNED_TAIL_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+/// Retained tail pins: four steady-state wraps plus headroom for warmup
+/// churn. A request beyond the cap fails closed (the GPU arm falls back to
+/// the CPU rather than risking an unpinned retained wrap).
+const MAX_TAIL_PINS: usize = 8;
+
 /// Max buffers retained. The m=29 prove cycle gives ~18 distinct buffers:
 /// witness z/a/b, the L0 codeword, zerocheck's 2 fold outputs + 2 ping-pong
 /// halves, ring-switch's per-claim rs_eq_ind vectors, b_combined, and
@@ -70,10 +86,79 @@ pub fn take_f128(n: usize) -> Vec<F128> {
     if let Some(v) = try_take_pinned_f128(n) {
         return v;
     }
+    if let Some(v) = try_take_pinned_tail_f128(n) {
+        return v;
+    }
     if let Some(v) = try_take_f128(n) {
         return v;
     }
     crate::alloc_uninit_vec(n)
+}
+
+fn try_take_pinned_tail_f128(n: usize) -> Option<Vec<F128>> {
+    if PINNED_TAIL_COUNT.load(Ordering::Acquire) == 0 {
+        return None;
+    }
+    let mut set = PINNED_F128_TAIL.lock().unwrap();
+    let idx = set
+        .iter()
+        .position(|pinned| pinned.len == n && pinned.buffer.is_some())?;
+    let mut v = set[idx].buffer.take()?;
+    debug_assert_eq!(v.as_ptr() as usize, set[idx].addr);
+    debug_assert!(v.capacity() >= n);
+    v.clear();
+    // SAFETY: the registered allocation has capacity >= n and F128 is Copy;
+    // callers retain the ordinary write-before-read contract of take_f128.
+    unsafe { v.set_len(n) };
+    Some(v)
+}
+
+/// Quarantine the allocation behind `buffer` once it next returns through
+/// [`give_f128`] — the multi-pin variant of [`pin_f128_allocation`] used by
+/// the GPU zerocheck tail's wrap cache. Re-registering the same allocation
+/// is idempotent; registrations beyond [`MAX_TAIL_PINS`] fail closed.
+pub(crate) fn pin_f128_allocation_tail(buffer: &[F128]) -> bool {
+    if buffer.is_empty() {
+        return false;
+    }
+    let addr = buffer.as_ptr() as usize;
+    let len = buffer.len();
+    let mut set = PINNED_F128_TAIL.lock().unwrap();
+    if set.iter().any(|pinned| pinned.addr == addr) {
+        return true;
+    }
+    if set.len() >= MAX_TAIL_PINS {
+        return false;
+    }
+    set.push(PinnedF128 {
+        addr,
+        len,
+        buffer: None,
+    });
+    PINNED_TAIL_COUNT.store(set.len(), Ordering::Release);
+    true
+}
+
+/// Release a tail registration after its external no-copy view has been
+/// released. Mirrors [`unpin_f128_allocation`]: a parked buffer rejoins the
+/// ordinary pool; a checked-out one follows the ordinary path on return.
+pub(crate) fn unpin_f128_allocation_tail(addr: usize, len: usize) -> bool {
+    let parked = {
+        let mut set = PINNED_F128_TAIL.lock().unwrap();
+        let Some(idx) = set
+            .iter()
+            .position(|pinned| pinned.addr == addr && pinned.len == len)
+        else {
+            return false;
+        };
+        let removed = set.remove(idx);
+        PINNED_TAIL_COUNT.store(set.len(), Ordering::Release);
+        removed.buffer
+    };
+    if let Some(v) = parked {
+        give_f128(v);
+    }
+    true
 }
 
 fn try_take_pinned_f128(n: usize) -> Option<Vec<F128>> {
@@ -193,6 +278,17 @@ pub fn give_f128(v: Vec<F128>) {
             return;
         }
     }
+    if PINNED_TAIL_COUNT.load(Ordering::Acquire) != 0 {
+        let mut set = PINNED_F128_TAIL.lock().unwrap();
+        if let Some(pinned) = set
+            .iter_mut()
+            .find(|pinned| pinned.addr == addr && v.capacity() >= pinned.len)
+            && pinned.buffer.is_none()
+        {
+            pinned.buffer = Some(v);
+            return;
+        }
+    }
     let mut pool = POOL.lock().unwrap();
     pool.push(v);
     if pool.len() > MAX_POOLED {
@@ -265,10 +361,12 @@ pub fn prewarm_prover(m: usize) {
 
 /// Release every ordinary pooled buffer back to the OS.
 ///
-/// A buffer registered through [`pin_f128_allocation`] is intentionally not
-/// released here: its external no-copy view still names that allocation.
-/// [`unpin_f128_allocation`] releases that lifetime coupling first and then
-/// returns any parked buffer to the ordinary pool.
+/// A buffer registered through [`pin_f128_allocation`] or
+/// [`pin_f128_allocation_tail`] is intentionally not released here: its
+/// external no-copy view still names that allocation.
+/// [`unpin_f128_allocation`] / [`unpin_f128_allocation_tail`] release that
+/// lifetime coupling first and then return any parked buffer to the
+/// ordinary pool.
 pub fn clear() {
     POOL.lock().unwrap().clear();
     POOL_U8.lock().unwrap().clear();
@@ -430,12 +528,15 @@ impl DerefMut for ScratchBytes {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     // Every test below mutates the same process-global pools. Serialize them
     // so pointer-identity assertions do not race another test's `clear`.
-    static SCRATCH_TEST_LOCK: Mutex<()> = Mutex::new(());
+    // pub(crate): the GPU zerocheck-tail oracle tests (gpu_commit::tests)
+    // serialize on the same lock — their wrap cache drives the shared tail
+    // pin registry this suite asserts on.
+    pub(crate) static SCRATCH_TEST_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn take_reuses_given_buffer() {
@@ -503,6 +604,45 @@ mod tests {
         assert_eq!(reused.as_ptr(), ptr);
         give_f128(reused);
         assert!(unpin_f128_allocation(ptr as usize, N));
+        clear();
+    }
+
+    #[test]
+    fn tail_pins_quarantine_each_allocation_and_rematch_by_len() {
+        let _serial = SCRATCH_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        clear();
+        // Distinctive sizes no other scratch test requests.
+        let a = take_f128(4097);
+        let b = take_f128(4097);
+        let c = take_f128(2049);
+        let (pa, pb, pc) = (a.as_ptr(), b.as_ptr(), c.as_ptr());
+        assert!(pin_f128_allocation_tail(&a));
+        assert!(pin_f128_allocation_tail(&b));
+        assert!(pin_f128_allocation_tail(&c));
+        // Idempotent re-registration of the same allocation.
+        assert!(pin_f128_allocation_tail(&a));
+        assert_eq!(PINNED_TAIL_COUNT.load(Ordering::Acquire), 3);
+        give_f128(a);
+        give_f128(b);
+        give_f128(c);
+        // The pinned set is immune to clear and rematches by requested len.
+        clear();
+        let a2 = take_f128(4097);
+        let b2 = take_f128(4097);
+        let c2 = take_f128(2049);
+        assert_eq!(a2.as_ptr(), pa);
+        assert_eq!(b2.as_ptr(), pb);
+        assert_eq!(c2.as_ptr(), pc);
+        // Returning them re-quarantines; unpin then hands the parked
+        // buffers back to the ordinary pool.
+        give_f128(a2);
+        give_f128(b2);
+        give_f128(c2);
+        assert!(unpin_f128_allocation_tail(pa as usize, 4097));
+        assert!(unpin_f128_allocation_tail(pb as usize, 4097));
+        assert!(unpin_f128_allocation_tail(pc as usize, 2049));
+        assert!(!unpin_f128_allocation_tail(pc as usize, 2049));
+        assert_eq!(PINNED_TAIL_COUNT.load(Ordering::Acquire), 0);
         clear();
     }
 

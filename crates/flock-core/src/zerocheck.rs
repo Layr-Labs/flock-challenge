@@ -649,6 +649,11 @@ fn prove_packed_padded_inner<C: Challenger>(
     // (T3's hetero drain is already behind us, so the delta is loop-only).
     let hetero_trace = std::env::var_os("FLOCK_ZC_TAIL_HETERO_TRACE").is_some();
     let hetero_claimed_before = crate::epool::helper_chunks_claimed();
+    // The GPU tail arm is gated on the ranked shape only (the same
+    // conservatism as the round-one C-fold arm); every other shape keeps the
+    // incumbent CPU loop. Round sizes inside the loop still apply the
+    // `GPU_ZC_TAIL_MIN_LOG_N` floor per round.
+    let zc_tail_gpu_ranked = m == 32 && padding.k_log == 14;
     for i in 1..(n_mlv - 1) {
         let rho_prev = mlv_rhos[i];
         let log_n_before = a_mlv.len().trailing_zeros() as usize;
@@ -661,14 +666,34 @@ fn prove_packed_padded_inner<C: Challenger>(
 
         let (m1, mi) = if log_n_before >= 15 {
             let half = a_mlv.len() / 2;
-            let (m1, mi) = fold_and_compute_round_pair_into(
-                &a_mlv,
-                &b_mlv,
-                &mut a_nxt[..half],
-                &mut b_nxt[..half],
-                rho_prev,
-                &r_next,
-            );
+            // GPU sibling dispatch (bit-exact with the incumbent round; see
+            // `launch_zerocheck_tail_round`). On `None` — kill switch,
+            // non-ranked shape, below the GPU floor, or any Metal failure —
+            // fall through to the untouched incumbent round.
+            let gpu_msg =
+                if zc_tail_gpu_ranked && log_n_before >= crate::gpu_commit::GPU_ZC_TAIL_MIN_LOG_N {
+                    crate::gpu_commit::launch_zerocheck_tail_round(
+                        crate::gpu_commit::ZcTailBuf::of(&a_mlv),
+                        crate::gpu_commit::ZcTailBuf::of(&b_mlv),
+                        crate::gpu_commit::ZcTailBuf::of_mut(&mut a_nxt),
+                        crate::gpu_commit::ZcTailBuf::of_mut(&mut b_nxt),
+                        rho_prev,
+                        &r_next,
+                    )
+                } else {
+                    None
+                };
+            let (m1, mi) = match gpu_msg {
+                Some(msg) => msg,
+                None => fold_and_compute_round_pair_into(
+                    &a_mlv,
+                    &b_mlv,
+                    &mut a_nxt[..half],
+                    &mut b_nxt[..half],
+                    rho_prev,
+                    &r_next,
+                ),
+            };
             // Swap current <-> scratch, then shrink the new current to the
             // folded size. The old (larger) buffer becomes scratch; we only
             // ever write its leading `half` slots next round, so its stale

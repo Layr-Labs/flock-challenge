@@ -77,6 +77,31 @@ pub(crate) fn gpu_zerocheck_debug() -> bool {
     *ON
 }
 
+/// Kill switch for the zerocheck tail-round (rounds 3+, dense fused path)
+/// GPU arm: `FLOCK_NO_GPU_ZC_TAIL=1` keeps every tail round on the incumbent
+/// CPU loop. Output is bit-exact either way — the kernel computes the same
+/// GF(2^128) expressions as `fold_and_compute_round_pair_into`; GF addition
+/// is XOR and reduction mod p is F2-linear, so any chunk/accumulate order
+/// reproduces the incumbent bytes exactly.
+pub const ENV_NO_GPU_ZC_TAIL: &str = "FLOCK_NO_GPU_ZC_TAIL";
+
+/// Smallest round size dispatched to the GPU: `log_n_before >= 18`
+/// (N = 2^18 elements = 4 MiB per array). Below that the per-round
+/// Fiat–Shamir handoff dominates and the CPU is fine.
+pub(crate) const GPU_ZC_TAIL_MIN_LOG_N: usize = 18;
+
+/// Pure value-level gate (testable without process-global env).
+pub(crate) fn gpu_zc_tail_enabled_value(value: Option<&std::ffi::OsStr>) -> bool {
+    value.is_none()
+}
+
+pub(crate) fn gpu_zc_tail_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        gpu_zc_tail_enabled_value(std::env::var_os(ENV_NO_GPU_ZC_TAIL).as_deref())
+    });
+    *ON
+}
+
 /// Kill switch for the cross-process warmup latch cache:
 /// `FLOCK_NO_WARMUP_LATCH_CACHE=1` restores the incumbent full dual-run +
 /// autotune sweep in every worker process. The cache changes **no timed
@@ -6130,6 +6155,26 @@ kernel void zc_fold_reduce(
         }
     }
 
+    /// Exact GPU execution wall of a completed tail command buffer, in ms
+    /// (`GPUEndTime - GPUStartTime`). Returns 0 when unavailable.
+    unsafe fn zc_tail_gpu_wall_ms(gpu: &Gpu, cb: Id) -> f64 {
+        unsafe {
+            let start: f64 = send!(
+                gpu.api,
+                unsafe extern "C" fn(Id, Sel) -> f64,
+                cb,
+                c"GPUStartTime"
+            );
+            let end: f64 = send!(
+                gpu.api,
+                unsafe extern "C" fn(Id, Sel) -> f64,
+                cb,
+                c"GPUEndTime"
+            );
+            if end > start { (end - start) * 1e3 } else { 0.0 }
+        }
+    }
+
     /// Tuned GPU claim share (sentinel `usize::MAX` = not yet tuned).
     static ZC_FOLD_TUNED_CLAIMS: std::sync::atomic::AtomicUsize =
         std::sync::atomic::AtomicUsize::new(usize::MAX);
@@ -6364,6 +6409,766 @@ kernel void zc_fold_reduce(
         })
     }
 
+    // -----------------------------------------------------------------------
+    // Zerocheck tail rounds (rounds 3+, dense fused path): one fused
+    // fold+message dispatch per round, drained synchronously so the
+    // Fiat–Shamir chain stays on the CPU. Bit-exact with
+    // `fold_and_compute_round_pair_into`: the kernel evaluates the same
+    // field expressions (fold at r_fold, then per-x_lo
+    // `eq_l·(a1·b1)` / `eq_l·((a0^a1)·(b0^b1))`, chunk partials scaled by
+    // `eq_hi`); XOR is associative and reduction mod p is F2-linear, so the
+    // GPU's per-thread accumulation + threadgroup tree reduce reproduces the
+    // incumbent's deferred-reduction chunk partials exactly.
+    // -----------------------------------------------------------------------
+
+    const ZC_TAIL_MSL_SOURCE: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+// GF(2^128), GHASH polynomial P = x^128 + x^7 + x^2 + x + 1 (same layout as
+// the commit/NTT kernels: uint4 v = (lo31..0, lo63..32, hi31..0, hi63..32)).
+
+static inline uint4 gf_mulx(uint4 v) {
+    uint carry = v.w >> 31;
+    uint4 r;
+    r.w = (v.w << 1) | (v.z >> 31);
+    r.z = (v.z << 1) | (v.y >> 31);
+    r.y = (v.y << 1) | (v.x >> 31);
+    r.x = (v.x << 1) ^ (carry * 0x87u);
+    return r;
+}
+
+static inline uint4 gf_shl16(uint4 a) {
+    uint h = a.w >> 16;
+    uint4 r;
+    r.w = (a.w << 16) | (a.z >> 16);
+    r.z = (a.z << 16) | (a.y >> 16);
+    r.y = (a.y << 16) | (a.x >> 16);
+    r.x = (a.x << 16) ^ ((h << 7) ^ (h << 2) ^ (h << 1) ^ h);
+    return r;
+}
+
+// v * tw mod P via the fixed round challenge's 64-entry threadgroup nibble
+// table: tab[16k + n] = (n * x^(4k)) * tw, 8 Horner steps of 16 bits.
+static inline uint4 gf_mul_tab4(uint4 v, threadgroup const uint4* tab) {
+    uint4 acc = uint4(0u);
+    for (int i = 7; i >= 0; i--) {
+        acc = gf_shl16(acc);
+        uint h = (v[i >> 1] >> ((i & 1) * 16)) & 0xffffu;
+        acc ^= tab[h & 15u]
+             ^ tab[16u + ((h >> 4) & 15u)]
+             ^ tab[32u + ((h >> 8) & 15u)]
+             ^ tab[48u + (h >> 12)];
+    }
+    return acc;
+}
+
+// One-off multiplier as a plain function: sixteen register powers of tw,
+// Horner over v's eight 16-bit limbs.
+static inline uint4 gf_mul_reg(uint4 v, uint4 tw) {
+    uint4 pw0 = tw;
+    uint4 pw1 = gf_mulx(pw0);
+    uint4 pw2 = gf_mulx(pw1);
+    uint4 pw3 = gf_mulx(pw2);
+    uint4 pw4 = gf_mulx(pw3);
+    uint4 pw5 = gf_mulx(pw4);
+    uint4 pw6 = gf_mulx(pw5);
+    uint4 pw7 = gf_mulx(pw6);
+    uint4 pw8 = gf_mulx(pw7);
+    uint4 pw9 = gf_mulx(pw8);
+    uint4 pwa = gf_mulx(pw9);
+    uint4 pwb = gf_mulx(pwa);
+    uint4 pwc = gf_mulx(pwb);
+    uint4 pwd = gf_mulx(pwc);
+    uint4 pwe = gf_mulx(pwd);
+    uint4 pwf = gf_mulx(pwe);
+    uint4 acc = uint4(0u);
+#define ZC_REG_STEP(WORD, SH)                                          \
+    {                                                                  \
+        acc = gf_shl16(acc);                                           \
+        uint _h = (v.WORD >> SH) & 0xffffu;                            \
+        if (_h & 0x0001u) { acc ^= pw0; }                              \
+        if (_h & 0x0002u) { acc ^= pw1; }                              \
+        if (_h & 0x0004u) { acc ^= pw2; }                              \
+        if (_h & 0x0008u) { acc ^= pw3; }                              \
+        if (_h & 0x0010u) { acc ^= pw4; }                              \
+        if (_h & 0x0020u) { acc ^= pw5; }                              \
+        if (_h & 0x0040u) { acc ^= pw6; }                              \
+        if (_h & 0x0080u) { acc ^= pw7; }                              \
+        if (_h & 0x0100u) { acc ^= pw8; }                              \
+        if (_h & 0x0200u) { acc ^= pw9; }                              \
+        if (_h & 0x0400u) { acc ^= pwa; }                              \
+        if (_h & 0x0800u) { acc ^= pwb; }                              \
+        if (_h & 0x1000u) { acc ^= pwc; }                              \
+        if (_h & 0x2000u) { acc ^= pwd; }                              \
+        if (_h & 0x4000u) { acc ^= pwe; }                              \
+        if (_h & 0x8000u) { acc ^= pwf; }                              \
+    }
+    ZC_REG_STEP(w, 16u)
+    ZC_REG_STEP(w, 0u)
+    ZC_REG_STEP(z, 16u)
+    ZC_REG_STEP(z, 0u)
+    ZC_REG_STEP(y, 16u)
+    ZC_REG_STEP(y, 0u)
+    ZC_REG_STEP(x, 16u)
+    ZC_REG_STEP(x, 0u)
+#undef ZC_REG_STEP
+    return acc;
+}
+
+
+// --- 8-bit-limb variants: half the register pressure (8 powers), 16 steps ---
+// a * x^8 mod P (the 8 shifted-out bits fold back as h * 0x87, <= bit 14).
+static inline uint4 gf_shl8(uint4 a) {
+    uint h = a.w >> 24;
+    uint4 r;
+    r.w = (a.w << 8) | (a.z >> 24);
+    r.z = (a.z << 8) | (a.y >> 24);
+    r.y = (a.y << 8) | (a.x >> 24);
+    r.x = (a.x << 8) ^ ((h << 7) ^ (h << 2) ^ (h << 1) ^ h);
+    return r;
+}
+
+#define ZC_GF_POWERS8(NAME, TW) uint4 NAME##0 = (TW); uint4 NAME##1 = gf_mulx(NAME##0); uint4 NAME##2 = gf_mulx(NAME##1); uint4 NAME##3 = gf_mulx(NAME##2); uint4 NAME##4 = gf_mulx(NAME##3); uint4 NAME##5 = gf_mulx(NAME##4); uint4 NAME##6 = gf_mulx(NAME##5); uint4 NAME##7 = gf_mulx(NAME##6);
+
+#define ZC_GF_LIMB8(ACC, V, WORD, SH, NAME) { ACC = gf_shl8(ACC); uint _h = ((V).WORD >> SH) & 0xffu; if (_h & 0x01u) { ACC ^= NAME##0; } if (_h & 0x02u) { ACC ^= NAME##1; } if (_h & 0x04u) { ACC ^= NAME##2; } if (_h & 0x08u) { ACC ^= NAME##3; } if (_h & 0x10u) { ACC ^= NAME##4; } if (_h & 0x20u) { ACC ^= NAME##5; } if (_h & 0x40u) { ACC ^= NAME##6; } if (_h & 0x80u) { ACC ^= NAME##7; } }
+
+#define ZC_GF_MUL_ACC8(ACC, V, NAME) { uint4 _t = uint4(0u); ZC_GF_LIMB8(_t, V, w, 24u, NAME) ZC_GF_LIMB8(_t, V, w, 16u, NAME) ZC_GF_LIMB8(_t, V, w, 8u, NAME) ZC_GF_LIMB8(_t, V, w, 0u, NAME) ZC_GF_LIMB8(_t, V, z, 24u, NAME) ZC_GF_LIMB8(_t, V, z, 16u, NAME) ZC_GF_LIMB8(_t, V, z, 8u, NAME) ZC_GF_LIMB8(_t, V, z, 0u, NAME) ZC_GF_LIMB8(_t, V, y, 24u, NAME) ZC_GF_LIMB8(_t, V, y, 16u, NAME) ZC_GF_LIMB8(_t, V, y, 8u, NAME) ZC_GF_LIMB8(_t, V, y, 0u, NAME) ZC_GF_LIMB8(_t, V, x, 24u, NAME) ZC_GF_LIMB8(_t, V, x, 16u, NAME) ZC_GF_LIMB8(_t, V, x, 8u, NAME) ZC_GF_LIMB8(_t, V, x, 0u, NAME) ACC ^= _t; }
+
+#define ZC_GF_MUL_DECL8(OUT, V, TW) uint4 OUT; { ZC_GF_POWERS8(_pw8_##OUT, (TW)) uint4 _acc_##OUT = uint4(0u); ZC_GF_MUL_ACC8(_acc_##OUT, (V), _pw8_##OUT) OUT = _acc_##OUT; }
+
+struct ZcTailParams {
+    uint4 r_fold; // the round's fold challenge
+    uint n;       // elements per input array this round
+    uint n_lo;    // log2 of the eq_lo table (chunk covers 4<<n_lo inputs/array)
+    uint n_hi;    // log2 of the eq_hi table (= threadgroup count)
+    uint pad0;
+};
+
+// One threadgroup per x_hi chunk: reads its disjoint 4·lo_size inputs per
+// array, writes the folded 2·lo_size outputs, and accumulates the chunk's
+// message partials. eq layout: eq_lo at [0, lo_size), eq_hi at
+// [lo_size, lo_size + hi_size). partials gets (eq_hi·p1, eq_hi·pinf) per
+// chunk; the CPU folds those into the round message.
+//
+// All multiplies stay in registers: r_fold's powers are built once per
+// thread (the challenge is round-constant), the eq_lo/product multipliers
+// get per-call power sets. No threadgroup gather tables — measured slower
+// than the pure register Horner on this class of kernel.
+kernel void zc_tail_round(
+    device const uint4* a_in     [[buffer(0)]],
+    device const uint4* b_in     [[buffer(1)]],
+    device uint4*       a_out    [[buffer(2)]],
+    device uint4*       b_out    [[buffer(3)]],
+    device const uint4* eq       [[buffer(4)]],
+    device uint4*       partials [[buffer(5)]],
+    constant ZcTailParams& p     [[buffer(6)]],
+    uint tgid [[threadgroup_position_in_grid]],
+    uint lid  [[thread_position_in_threadgroup]])
+{
+    threadgroup uint4 rtab[64];
+    // Cooperative build of r_fold's nibble table (tab[16k+n] = n·x^(4k)·r_fold).
+    if (lid < 64u) {
+        uint kk = lid >> 4;
+        uint nn = lid & 15u;
+        uint4 pw = p.r_fold;
+        for (uint j = 0; j < kk * 4u; ++j) { pw = gf_mulx(pw); }
+        uint4 p2 = gf_mulx(pw);
+        uint4 p4 = gf_mulx(p2);
+        uint4 p8 = gf_mulx(p4);
+        uint4 v = uint4(0u);
+        if (nn & 1u) { v ^= pw; }
+        if (nn & 2u) { v ^= p2; }
+        if (nn & 4u) { v ^= p4; }
+        if (nn & 8u) { v ^= p8; }
+        rtab[lid] = v;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    const uint lo_size = 1u << p.n_lo;
+    const uint x_hi = tgid;
+    const uint base_in = x_hi * 4u * lo_size;
+    const uint base_out = x_hi * 2u * lo_size;
+
+    uint4 acc1 = uint4(0u);
+    uint4 acci = uint4(0u);
+
+    for (uint x_lo = lid; x_lo < lo_size; x_lo += 256u) {
+        const uint i = base_in + 4u * x_lo;
+        const uint o = base_out + 2u * x_lo;
+        const uint4 ae0 = a_in[i];
+        const uint4 ao0 = a_in[i + 1u];
+        const uint4 ae1 = a_in[i + 2u];
+        const uint4 ao1 = a_in[i + 3u];
+        const uint4 be0 = b_in[i];
+        const uint4 bo0 = b_in[i + 1u];
+        const uint4 be1 = b_in[i + 2u];
+        const uint4 bo1 = b_in[i + 3u];
+
+        // Fold: out = a_even ^ r_fold·(a_even ^ a_odd), both arrays.
+        const uint4 a0 = ae0 ^ gf_mul_tab4(ae0 ^ ao0, rtab);
+        const uint4 a1 = ae1 ^ gf_mul_tab4(ae1 ^ ao1, rtab);
+        const uint4 b0 = be0 ^ gf_mul_tab4(be0 ^ bo0, rtab);
+        const uint4 b1 = be1 ^ gf_mul_tab4(be1 ^ bo1, rtab);
+
+        a_out[o] = a0;
+        a_out[o + 1u] = a1;
+        b_out[o] = b0;
+        b_out[o + 1u] = b1;
+
+        // Message partials: eq_l·(a1·b1) and eq_l·((a0^a1)·(b0^b1)),
+        // reduced immediately (reduction is F2-linear, so this equals the
+        // incumbent's unreduced accumulate + single reduce per chunk).
+        const uint4 eql = eq[x_lo];
+        acc1 ^= gf_mul_reg(gf_mul_reg(a1, b1), eql);
+        acci ^= gf_mul_reg(gf_mul_reg(a0 ^ a1, b0 ^ b1), eql);
+    }
+
+    // Cross-lane XOR reduce within each simdgroup, then eight warp leaders
+    // to threadgroup memory; one thread folds them and scales by eq_hi.
+    for (uint off = 16u; off != 0u; off >>= 1u) {
+        acc1.x ^= simd_shuffle_xor(acc1.x, off);
+        acc1.y ^= simd_shuffle_xor(acc1.y, off);
+        acc1.z ^= simd_shuffle_xor(acc1.z, off);
+        acc1.w ^= simd_shuffle_xor(acc1.w, off);
+        acci.x ^= simd_shuffle_xor(acci.x, off);
+        acci.y ^= simd_shuffle_xor(acci.y, off);
+        acci.z ^= simd_shuffle_xor(acci.z, off);
+        acci.w ^= simd_shuffle_xor(acci.w, off);
+    }
+    threadgroup uint4 wred1[8];
+    threadgroup uint4 wredi[8];
+    const uint warp = lid >> 5;
+    if ((lid & 31u) == 0u) {
+        wred1[warp] = acc1;
+        wredi[warp] = acci;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (lid == 0u) {
+        uint4 p1 = wred1[0];
+        uint4 pi = wredi[0];
+        for (uint w = 1u; w < 8u; ++w) {
+            p1 ^= wred1[w];
+            pi ^= wredi[w];
+        }
+        const uint4 eh = eq[lo_size + x_hi];
+        partials[2u * x_hi] = gf_mul_reg(p1, eh);
+        partials[2u * x_hi + 1u] = gf_mul_reg(pi, eh);
+    }
+}
+"#;
+
+    #[repr(C)]
+    struct ZcTailParams {
+        r_fold: [u32; 4],
+        n: u32,
+        n_lo: u32,
+        n_hi: u32,
+        pad0: u32,
+    }
+
+    /// Threads per threadgroup; one threadgroup per x_hi chunk.
+    const ZC_TAIL_TG: usize = 256;
+    /// Retained no-copy wraps: four steady-state ping-pong buffers plus
+    /// headroom for warmup churn. Eviction releases the Metal view first,
+    /// then lifts the scratch pin (never the other way around).
+    const ZC_TAIL_MAX_WRAPS: usize = 8;
+
+    /// Process-lifetime Metal state for the zerocheck tail arm.
+    struct ZcTail {
+        gpu: &'static Gpu,
+        pso: Id,
+        /// eq_lo ++ eq_hi upload (grow-only).
+        eq_buf: Id,
+        eq_cap: usize,
+        /// hi_size x 2 F128 chunk partials (grow-only).
+        part_buf: Id,
+        part_cap: usize,
+        /// Cached no-copy wraps: `(ptr, wrap_bytes, pin_len_elems, buffer)`.
+        wraps: Vec<(usize, usize, usize, Id)>,
+    }
+    // SAFETY: Metal objects are thread-safe; every access is serialized by
+    // the ZC_TAIL mutex, and the one prove in flight owns the lease.
+    unsafe impl Send for ZcTail {}
+
+    static ZC_TAIL: Mutex<Option<Result<ZcTail, String>>> = Mutex::new(None);
+
+    fn zc_tail_init(gpu: &'static Gpu) -> Result<ZcTail, String> {
+        unsafe {
+            let pool = gpu.pool_push();
+            let built = (|| -> Result<Id, String> {
+                let src = gpu.api.nsstring(ZC_TAIL_MSL_SOURCE)?;
+                let mut err: Id = NIL;
+                let library: Id = send!(
+                    gpu.api,
+                    unsafe extern "C" fn(Id, Sel, Id, Id, *mut Id) -> Id,
+                    gpu.device,
+                    c"newLibraryWithSource:options:error:",
+                    src,
+                    NIL,
+                    &mut err
+                );
+                if library.is_null() {
+                    return Err(format!(
+                        "zerocheck tail shader compile failed: {}",
+                        gpu.api.error_string(err)
+                    ));
+                }
+                let ns = gpu.api.nsstring("zc_tail_round")?;
+                let f: Id = send!(
+                    gpu.api,
+                    unsafe extern "C" fn(Id, Sel, Id) -> Id,
+                    library,
+                    c"newFunctionWithName:",
+                    ns
+                );
+                if f.is_null() {
+                    send!(
+                        gpu.api,
+                        unsafe extern "C" fn(Id, Sel) -> Id,
+                        library,
+                        c"release"
+                    );
+                    return Err("zerocheck tail kernel zc_tail_round not found".into());
+                }
+                let mut perr: Id = NIL;
+                let pso: Id = send!(
+                    gpu.api,
+                    unsafe extern "C" fn(Id, Sel, Id, *mut Id) -> Id,
+                    gpu.device,
+                    c"newComputePipelineStateWithFunction:error:",
+                    f,
+                    &mut perr
+                );
+                send!(gpu.api, unsafe extern "C" fn(Id, Sel) -> Id, f, c"release");
+                send!(
+                    gpu.api,
+                    unsafe extern "C" fn(Id, Sel) -> Id,
+                    library,
+                    c"release"
+                );
+                if pso.is_null() {
+                    Err(format!(
+                        "zerocheck tail pipeline: {}",
+                        gpu.api.error_string(perr)
+                    ))
+                } else {
+                    Ok(pso)
+                }
+            })();
+            gpu.pool_pop(pool);
+            let pso = built?;
+            Ok(ZcTail {
+                gpu,
+                pso,
+                eq_buf: NIL,
+                eq_cap: 0,
+                part_buf: NIL,
+                part_cap: 0,
+                wraps: Vec::new(),
+            })
+        }
+    }
+
+    impl ZcTail {
+        /// Grow-only shared buffer slot (same pattern as the fold arm).
+        unsafe fn ensure(&self, slot: &mut Id, cap: &mut usize, need: usize) -> Result<(), String> {
+            if *cap >= need && !slot.is_null() {
+                return Ok(());
+            }
+            unsafe {
+                let fresh = self.gpu.new_buffer(need)?;
+                self.gpu.release(*slot);
+                *slot = fresh;
+                *cap = need;
+            }
+            Ok(())
+        }
+
+        /// No-copy wrap of one ping-pong buffer's full allocation extent
+        /// (`capacity * 16` bytes — stable across the loop's truncate/swap,
+        /// so one wrap per physical buffer covers every round), cached across
+        /// proves by `(ptr, bytes)`.
+        ///
+        /// Metal wires the wrapped pages on first GPU touch — ~ms for the
+        /// 512 MiB round-3 output — so a wrap rebuilt inside a TIMED prove
+        /// would eat the arm's whole gain; the cache pins the allocation out
+        /// of the evictable scratch pool (scratch::pin_f128_allocation_tail),
+        /// which is also the soundness argument: a retained wrap can never
+        /// name memory the pool freed and handed to another allocation.
+        unsafe fn wrap_f128(
+            &mut self,
+            ptr: *mut F128,
+            len: usize,
+            capacity: usize,
+        ) -> Result<Id, String> {
+            let addr = ptr as usize;
+            let bytes = capacity * core::mem::size_of::<F128>();
+            if let Some(&(_, _, _, buf)) = self
+                .wraps
+                .iter()
+                .find(|(p, b, _, _)| *p == addr && *b == bytes)
+            {
+                return Ok(buf);
+            }
+            let buf = unsafe { self.gpu.wrap_buffer(ptr.cast::<u8>(), bytes)? };
+            ZC_TAIL_WRAPS_CREATED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            // Pin BEFORE retaining the wrap, and evict BEFORE pinning so the
+            // registry slot is already free. Fail closed: without the pin
+            // the pool could evict the allocation from under the cached view.
+            if self.wraps.len() == ZC_TAIL_MAX_WRAPS {
+                let (old_addr, _, old_len, old) = self.wraps.remove(0);
+                unsafe {
+                    self.gpu.release(old);
+                    crate::scratch::unpin_f128_allocation_tail(old_addr, old_len);
+                }
+            }
+            let pinned = crate::scratch::pin_f128_allocation_tail(unsafe {
+                std::slice::from_raw_parts(ptr, len)
+            });
+            if !pinned {
+                unsafe { self.gpu.release(buf) };
+                return Err("tail pin registry full; refusing an unpinned wrap".into());
+            }
+            self.wraps.push((addr, bytes, len, buf));
+            Ok(buf)
+        }
+    }
+
+    /// No-copy wraps created (cache misses) this process. A steady-state
+    /// prove must create ZERO — the pinned scratch buffers recur across
+    /// proves, so a rising count signals a silent always-recreating
+    /// regression (wrap creation pays Metal's page wiring inside the timed
+    /// prove).
+    static ZC_TAIL_WRAPS_CREATED: std::sync::atomic::AtomicUsize =
+        std::sync::atomic::AtomicUsize::new(0);
+
+    /// Successful GPU tail-round dispatches this process. Lets a test assert
+    /// the arm actually ran instead of silently falling back to the CPU.
+    static ZC_TAIL_SUBMITS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn zerocheck_tail_gpu_submits() -> usize {
+        ZC_TAIL_SUBMITS.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn zerocheck_tail_wraps_created() -> usize {
+        ZC_TAIL_WRAPS_CREATED.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Test-only: release every cached tail wrap and lift its pin, returning
+    /// the registry to empty so unrelated scratch-pool tests see a clean
+    /// process-global state.
+    #[cfg(test)]
+    pub(crate) fn drain_tail_wraps_for_test() {
+        if let Ok(mut guard) = ZC_TAIL.lock()
+            && let Some(Ok(state)) = guard.as_mut()
+        {
+            let gpu = state.gpu;
+            for (addr, _, len, buf) in state.wraps.drain(..) {
+                unsafe {
+                    gpu.release(buf);
+                    crate::scratch::unpin_f128_allocation_tail(addr, len);
+                }
+            }
+        }
+    }
+
+    /// Raw view of one ping-pong buffer: the live element range plus the full
+    /// allocation extent the no-copy wrap must cover.
+    #[derive(Clone, Copy)]
+    pub(crate) struct ZcTailBuf {
+        pub ptr: *mut F128,
+        pub len: usize,
+        pub capacity: usize,
+    }
+
+    impl ZcTailBuf {
+        pub(crate) fn of(v: &Vec<F128>) -> Self {
+            Self {
+                ptr: v.as_ptr().cast_mut(),
+                len: v.len(),
+                capacity: v.capacity(),
+            }
+        }
+        pub(crate) fn of_mut(v: &mut Vec<F128>) -> Self {
+            Self {
+                ptr: v.as_mut_ptr(),
+                len: v.len(),
+                capacity: v.capacity(),
+            }
+        }
+    }
+
+    /// GPU share of a round's chunks, in percent. Default 45 (GPU is
+    /// ALU-heavier per byte than the CPU; balance so both sides finish
+    /// together). `FLOCK_ZC_TAIL_GPU_CHUNK_PCT` overrides for A/B tuning.
+    /// 0 keeps the whole round on the CPU; 100 gives the GPU every chunk.
+    const ZC_TAIL_GPU_CHUNK_PCT_DEFAULT: u32 = 45;
+
+    static ZC_TAIL_GPU_CHUNK_PCT: std::sync::atomic::AtomicU32 =
+        std::sync::atomic::AtomicU32::new(u32::MAX);
+
+    fn zc_tail_gpu_chunk_pct() -> u32 {
+        let v = ZC_TAIL_GPU_CHUNK_PCT.load(std::sync::atomic::Ordering::Relaxed);
+        if v != u32::MAX {
+            return v;
+        }
+        let parsed = std::env::var("FLOCK_ZC_TAIL_GPU_CHUNK_PCT")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(ZC_TAIL_GPU_CHUNK_PCT_DEFAULT);
+        ZC_TAIL_GPU_CHUNK_PCT.store(parsed, std::sync::atomic::Ordering::Relaxed);
+        parsed
+    }
+
+    #[cfg(test)]
+    pub(crate) fn zc_tail_set_gpu_chunk_pct_for_test(pct: u32) {
+        ZC_TAIL_GPU_CHUNK_PCT.store(pct, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    fn zc_tail_gpu_chunks(hi_size: usize) -> usize {
+        let pct = zc_tail_gpu_chunk_pct().min(100) as usize;
+        hi_size * pct / 100
+    }
+
+    /// One fused tail round, split GPU-prefix + CPU-suffix over the round's
+    /// `hi_size` chunks (the round-one C-fold arm's hybrid pattern). The GPU
+    /// folds chunks `[0, g)` asynchronously while the calling thread runs
+    /// the incumbent CPU kernel over `[g, hi_size)`; both sides produce
+    /// identical chunk partials, XOR-combined here into the round message
+    /// `(r_next[0]·G(1), G(∞))`. Bit-exact with
+    /// `fold_and_compute_round_pair_into` (the XOR partition is free).
+    ///
+    /// `None` means run the whole round with the incumbent CPU function
+    /// (kill switch, sub-floor size, zero GPU share, no Metal device, or a
+    /// submit-side failure — the output buffers are untouched at that
+    /// point). A GPU completion failure after the CPU suffix has run is
+    /// repaired by recomputing the prefix chunks on the CPU from the
+    /// never-mutated inputs, so the call never reports a half-done round.
+    pub(crate) fn launch_zerocheck_tail_round(
+        a: ZcTailBuf,
+        b: ZcTailBuf,
+        a_out: ZcTailBuf,
+        b_out: ZcTailBuf,
+        r_fold: F128,
+        r_next: &[F128],
+    ) -> Option<(F128, F128)> {
+        if !super::gpu_zc_tail_enabled() {
+            return None;
+        }
+        let n = a.len;
+        if b.len != n || !n.is_power_of_two() {
+            return None;
+        }
+        let log_n = n.trailing_zeros() as usize;
+        if (1usize << log_n) != n || log_n < super::GPU_ZC_TAIL_MIN_LOG_N {
+            return None;
+        }
+        let half = n / 2;
+        if a_out.len < half || b_out.len < half || r_next.len() != log_n - 1 {
+            return None;
+        }
+        // Same n_hi policy as the incumbent round (multilinear.rs). The
+        // lo/hi split only repartitions an XOR sum (bit-exact either way —
+        // the 9-vs-11 regression test proves it), but matching the incumbent
+        // keeps the oracle comparison chunk-for-chunk identical.
+        let n_hi = if half >= crate::zerocheck::multilinear::LARGE_TAIL_EQ_MIN_HALF
+            && crate::zerocheck::multilinear::zc_tail_split11_enabled()
+        {
+            crate::zerocheck::multilinear::LARGE_TAIL_EQ_N_HI
+        } else {
+            crate::zerocheck::univariate_skip::SplitEqGhash::MAX_N_HI
+        };
+        let eq = crate::zerocheck::univariate_skip::SplitEqGhash::with_n_hi(&r_next[1..], n_hi);
+        let lo_size = 1usize << eq.n_lo;
+        let hi_size = 1usize << eq.n_hi;
+        if lo_size < 2 || lo_size * hi_size * 2 != half {
+            return None;
+        }
+        let gpu_chunks = zc_tail_gpu_chunks(hi_size);
+        if gpu_chunks == 0 {
+            return None;
+        }
+
+        let gpu = gpu().ok()?;
+        let mut guard = ZC_TAIL.lock().ok()?;
+        if guard.is_none() {
+            let t = std::time::Instant::now();
+            *guard = Some(zc_tail_init(gpu));
+            if super::gpu_zerocheck_debug() {
+                eprintln!(
+                    "[gpu-zc-tail] shader init: {:.1} ms",
+                    t.elapsed().as_secs_f64() * 1e3
+                );
+            }
+        }
+        if guard.as_ref().is_some_and(|r| r.is_err()) {
+            return None;
+        }
+        let state = guard.as_mut()?.as_mut().ok()?;
+
+        // Reconstruct the caller's slices from the raw views for the CPU
+        // suffix. The caller's Vecs are alive for the whole call and are
+        // not touched elsewhere while it runs.
+        let (a_slice, b_slice) = unsafe {
+            (
+                std::slice::from_raw_parts(a.ptr.cast_const(), a.len),
+                std::slice::from_raw_parts(b.ptr.cast_const(), b.len),
+            )
+        };
+        let (a_out_slice, b_out_slice) = unsafe {
+            (
+                std::slice::from_raw_parts_mut(a_out.ptr, a_out.len),
+                std::slice::from_raw_parts_mut(b_out.ptr, b_out.len),
+            )
+        };
+
+        let submitted = std::time::Instant::now();
+        // Async GPU prefix dispatch. On any submit-side error, no output
+        // byte has been written: report None so the caller runs the
+        // untouched incumbent round.
+        let cb: Option<Id> = unsafe {
+            let pool = gpu.pool_push();
+            let built = (|| -> Result<Id, String> {
+                let a_buf = state.wrap_f128(a.ptr, a.len, a.capacity)?;
+                let b_buf = state.wrap_f128(b.ptr, b.len, b.capacity)?;
+                let a_out_buf = state.wrap_f128(a_out.ptr, a_out.len, a_out.capacity)?;
+                let b_out_buf = state.wrap_f128(b_out.ptr, b_out.len, b_out.capacity)?;
+                let (mut eq_buf, mut eq_cap) = (state.eq_buf, state.eq_cap);
+                state.ensure(&mut eq_buf, &mut eq_cap, (lo_size + hi_size) * 16)?;
+                state.eq_buf = eq_buf;
+                state.eq_cap = eq_cap;
+                let (mut part_buf, mut part_cap) = (state.part_buf, state.part_cap);
+                state.ensure(&mut part_buf, &mut part_cap, hi_size * 2 * 16)?;
+                state.part_buf = part_buf;
+                state.part_cap = part_cap;
+                let eq_dst = gpu.buffer_contents(state.eq_buf);
+                std::ptr::copy_nonoverlapping(eq.lo.as_ptr().cast::<u8>(), eq_dst, lo_size * 16);
+                std::ptr::copy_nonoverlapping(
+                    eq.hi.as_ptr().cast::<u8>(),
+                    eq_dst.add(lo_size * 16),
+                    hi_size * 16,
+                );
+                let params = ZcTailParams {
+                    r_fold: [
+                        r_fold.lo as u32,
+                        (r_fold.lo >> 32) as u32,
+                        r_fold.hi as u32,
+                        (r_fold.hi >> 32) as u32,
+                    ],
+                    n: n as u32,
+                    n_lo: eq.n_lo as u32,
+                    n_hi: eq.n_hi as u32,
+                    pad0: 0,
+                };
+                let params_bytes = std::slice::from_raw_parts(
+                    (&raw const params).cast::<u8>(),
+                    core::mem::size_of::<ZcTailParams>(),
+                );
+                let cb = gpu.command_buffer()?;
+                let enc = gpu.compute_encoder(cb)?;
+                gpu.set_pipeline(enc, state.pso);
+                gpu.set_buffer(enc, a_buf, 0, 0);
+                gpu.set_buffer(enc, b_buf, 0, 1);
+                gpu.set_buffer(enc, a_out_buf, 0, 2);
+                gpu.set_buffer(enc, b_out_buf, 0, 3);
+                gpu.set_buffer(enc, state.eq_buf, 0, 4);
+                gpu.set_buffer(enc, state.part_buf, 0, 5);
+                gpu.set_bytes(enc, params_bytes, 6);
+                gpu.dispatch(enc, gpu_chunks as u64, ZC_TAIL_TG as u64);
+                gpu.end_encoding(enc);
+                let cb = gpu.retain(cb);
+                gpu.commit_async(cb);
+                Ok(cb)
+            })();
+            gpu.pool_pop(pool);
+            built.ok()
+        };
+        let Some(cb) = cb else {
+            if super::gpu_zerocheck_debug() {
+                eprintln!("[gpu-zc-tail] submit failed; caller runs the CPU round");
+            }
+            return None;
+        };
+        ZC_TAIL_SUBMITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+        // CPU suffix concurrently with the in-flight GPU prefix.
+        let (p1_cpu, pinf_cpu) = if gpu_chunks < hi_size {
+            crate::zerocheck::multilinear::fold_and_compute_round_pair_chunk_range_into(
+                a_slice,
+                b_slice,
+                a_out_slice,
+                b_out_slice,
+                r_fold,
+                &eq,
+                gpu_chunks,
+                hi_size,
+            )
+        } else {
+            (F128::ZERO, F128::ZERO)
+        };
+
+        // Drain the GPU prefix; on completion failure recompute the prefix
+        // chunks on the CPU (inputs were only ever read, so the redo is
+        // exact and overwrites any partial GPU output).
+        let cpu_done = std::time::Instant::now();
+        let cpu_ms = (cpu_done - submitted).as_secs_f64() * 1e3;
+        let waited = unsafe { gpu.wait_cb(cb) };
+        let gpu_ms = unsafe { zc_tail_gpu_wall_ms(gpu, cb) };
+        let (p1_gpu, pinf_gpu) = match waited {
+            Ok(()) => {
+                // The command buffer completed, so the shared-storage
+                // partials (and the prefix chunk writes) are CPU-visible.
+                let parts = unsafe {
+                    std::slice::from_raw_parts(
+                        gpu.buffer_contents(state.part_buf)
+                            .cast::<F128>()
+                            .cast_const(),
+                        gpu_chunks * 2,
+                    )
+                };
+                let mut p1 = F128::ZERO;
+                let mut pinf = F128::ZERO;
+                for x_hi in 0..gpu_chunks {
+                    p1 += parts[2 * x_hi];
+                    pinf += parts[2 * x_hi + 1];
+                }
+                unsafe { gpu.release(cb) };
+                (p1, pinf)
+            }
+            Err(e) => {
+                unsafe { gpu.release(cb) };
+                if super::gpu_zerocheck_debug() {
+                    eprintln!("[gpu-zc-tail] completion failed ({e}); CPU redoes the prefix");
+                }
+                crate::zerocheck::multilinear::fold_and_compute_round_pair_chunk_range_into(
+                    a_slice,
+                    b_slice,
+                    a_out_slice,
+                    b_out_slice,
+                    r_fold,
+                    &eq,
+                    0,
+                    gpu_chunks,
+                )
+            }
+        };
+        let m1 = r_next[0] * (p1_gpu + p1_cpu);
+        let mi = pinf_gpu + pinf_cpu;
+        if super::gpu_zerocheck_debug() {
+            eprintln!(
+                "[gpu-zc-tail] round log_n={log_n} n_lo={} n_hi={} gpu-chunks={gpu_chunks}/{}: gpu={gpu_ms:.2} submit+cpu={cpu_ms:.2} total={:.2} ms",
+                eq.n_lo,
+                eq.n_hi,
+                hi_size,
+                submitted.elapsed().as_secs_f64() * 1e3,
+            );
+        }
+        Some((m1, mi))
+    }
+
     #[cfg(test)]
     mod split_select_tests {
         use super::{
@@ -6466,6 +7271,15 @@ pub(crate) use imp::{gpu_merkle_tree_blake3, gpu_ntt_interleaved_from_layer};
 #[cfg_attr(not(test), allow(unused_imports))]
 pub(crate) use imp::{ZcFoldJob, launch_zerocheck_c_fold, zerocheck_gpu_submits};
 
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[allow(unused_imports)]
+pub(crate) use imp::zerocheck_tail_gpu_submits;
+
+/// Zerocheck tail-round GPU arm (see `ENV_NO_GPU_ZC_TAIL`).
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[cfg_attr(not(test), allow(unused_imports))]
+pub(crate) use imp::{ZcTailBuf, launch_zerocheck_tail_round};
+
 #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
 mod imp {
     use super::*;
@@ -6551,11 +7365,56 @@ mod imp {
     pub(crate) fn give_tree(_tree: Vec<crate::merkle::Hash>) {}
 
     pub(crate) fn staging_released() {}
+
+    /// Raw view of one ping-pong buffer (macOS fallback: never used, the
+    /// launch below always declines).
+    #[derive(Clone, Copy)]
+    pub(crate) struct ZcTailBuf {
+        pub ptr: *mut F128,
+        pub len: usize,
+        pub capacity: usize,
+    }
+
+    impl ZcTailBuf {
+        pub(crate) fn of(v: &Vec<F128>) -> Self {
+            Self {
+                ptr: v.as_ptr().cast_mut(),
+                len: v.len(),
+                capacity: v.capacity(),
+            }
+        }
+        pub(crate) fn of_mut(v: &mut Vec<F128>) -> Self {
+            Self {
+                ptr: v.as_mut_ptr(),
+                len: v.len(),
+                capacity: v.capacity(),
+            }
+        }
+    }
+
+    pub(crate) fn launch_zerocheck_tail_round(
+        _a: ZcTailBuf,
+        _b: ZcTailBuf,
+        _a_out: ZcTailBuf,
+        _b_out: ZcTailBuf,
+        _r_fold: F128,
+        _r_next: &[F128],
+    ) -> Option<(F128, F128)> {
+        None
+    }
+
+    pub(crate) fn zerocheck_tail_gpu_submits() -> usize {
+        0
+    }
 }
 
 #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
 #[cfg_attr(not(test), allow(unused_imports))]
 pub(crate) use imp::{gpu_merkle_tree_blake3, gpu_ntt_interleaved_from_layer};
+
+#[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+#[cfg_attr(not(test), allow(unused_imports))]
+pub(crate) use imp::{ZcTailBuf, launch_zerocheck_tail_round, zerocheck_tail_gpu_submits};
 
 #[cfg(test)]
 mod tests {
@@ -7771,5 +8630,304 @@ mod tests {
         crate::scratch::give_u8(stripe);
         assert_eq!(ptr % PAGE, 0, "ranked stripe base must be page-aligned");
         assert_eq!(len % PAGE, 0, "ranked stripe length must be a page multiple");
+    }
+
+    // -----------------------------------------------------------------------
+    // Zerocheck tail rounds: GPU dispatch vs incumbent CPU oracle.
+    // -----------------------------------------------------------------------
+
+    /// Page-aligned F128 buffer for the tail arm's no-copy wraps.
+    ///
+    /// Deliberately LEAKED (same argument as `leak_page_aligned`): the wrap
+    /// cache keys on `(ptr, bytes)` and a freed test buffer could hand its
+    /// address to a later allocation with a stale Metal view attached.
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    fn leak_f128(n: usize, seed: u64) -> (&'static mut [F128], imp::ZcTailBuf) {
+        let bytes = leak_page_aligned(n * 16);
+        let ptr = bytes.as_mut_ptr().cast::<F128>();
+        let slice = unsafe { std::slice::from_raw_parts_mut(ptr, n) };
+        let mut rng = Rng::new(seed);
+        for slot in slice.iter_mut() {
+            *slot = rng.f128();
+        }
+        (
+            slice,
+            imp::ZcTailBuf {
+                ptr,
+                len: n,
+                capacity: n,
+            },
+        )
+    }
+
+    /// GPU round == incumbent `fold_and_compute_round_pair_into` byte-exact
+    /// (folded outputs AND the round message) at several tail sizes.
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    fn gpu_zerocheck_tail_round_matches_cpu_oracle() {
+        let _serial = crate::scratch::tests::SCRATCH_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        imp::drain_tail_wraps_for_test();
+        if gpu_or_skip(imp::gpu()).is_none() {
+            return;
+        }
+        for log_n in [18usize, 19, 22, 24] {
+            let n = 1usize << log_n;
+            let half = n / 2;
+            let (a, abuf) = leak_f128(n, 0x5EED_A000 + log_n as u64);
+            let (b, bbuf) = leak_f128(n, 0x5EED_B000 + log_n as u64);
+            let (_, a_out) = leak_f128(half.max(1024), 0x5EED_C000 + log_n as u64);
+            let (_, b_out) = leak_f128(half.max(1024), 0x5EED_D000 + log_n as u64);
+            let mut rng = Rng::new(0x5EED_E000 + log_n as u64);
+            let rho = rng.f128();
+            let r_next = rng.vec(log_n - 1);
+
+            // Incumbent CPU reference on identical inputs.
+            let mut ref_a = vec![F128::ZERO; half];
+            let mut ref_b = vec![F128::ZERO; half];
+            let want = crate::zerocheck::multilinear::fold_and_compute_round_pair_into(
+                a, b, &mut ref_a, &mut ref_b, rho, &r_next,
+            );
+
+            let submits_before = imp::zerocheck_tail_gpu_submits();
+            let got = imp::launch_zerocheck_tail_round(abuf, bbuf, a_out, b_out, rho, &r_next)
+                .expect("GPU tail round must dispatch on an available device");
+            assert!(
+                imp::zerocheck_tail_gpu_submits() > submits_before,
+                "dispatch counter must advance (guards vacuous pass)"
+            );
+            let got_a = unsafe { std::slice::from_raw_parts(a_out.ptr.cast_const(), half) };
+            let got_b = unsafe { std::slice::from_raw_parts(b_out.ptr.cast_const(), half) };
+            assert_eq!(
+                got_a,
+                ref_a.as_slice(),
+                "log_n={log_n}: folded a must be bit-exact"
+            );
+            assert_eq!(
+                got_b,
+                ref_b.as_slice(),
+                "log_n={log_n}: folded b must be bit-exact"
+            );
+            assert_eq!(got, want, "log_n={log_n}: round message must be bit-exact");
+        }
+        imp::drain_tail_wraps_for_test();
+    }
+
+    /// First-round ranked size (N = 2^25, the round-3 output at m = 32,
+    /// k_skip = 6), exercising the n_hi = 11 split. Runs the launch twice on
+    /// the same buffers to exercise the cached-wrap resubmission path (the
+    /// steady-state production path).
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    fn gpu_zerocheck_tail_round_matches_cpu_at_ranked_first_round() {
+        let _serial = crate::scratch::tests::SCRATCH_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        imp::drain_tail_wraps_for_test();
+        if gpu_or_skip(imp::gpu()).is_none() {
+            return;
+        }
+        let log_n = 25usize;
+        let n = 1usize << log_n;
+        let half = n / 2;
+        let (a, abuf) = leak_f128(n, 0xA5A5_0001);
+        let (b, bbuf) = leak_f128(n, 0xA5A5_0002);
+        let (_, a_out) = leak_f128(half, 0xA5A5_0003);
+        let (_, b_out) = leak_f128(half, 0xA5A5_0004);
+        let mut rng = Rng::new(0xA5A5_0005);
+        let rho = rng.f128();
+        let r_next = rng.vec(log_n - 1);
+
+        let mut ref_a = vec![F128::ZERO; half];
+        let mut ref_b = vec![F128::ZERO; half];
+        let want = crate::zerocheck::multilinear::fold_and_compute_round_pair_into(
+            a, b, &mut ref_a, &mut ref_b, rho, &r_next,
+        );
+
+        let wraps_before = imp::zerocheck_tail_wraps_created();
+        for attempt in 0..2 {
+            let got = imp::launch_zerocheck_tail_round(abuf, bbuf, a_out, b_out, rho, &r_next)
+                .expect("GPU tail round must dispatch at the ranked first-round size");
+            let got_a = unsafe { std::slice::from_raw_parts(a_out.ptr.cast_const(), half) };
+            let got_b = unsafe { std::slice::from_raw_parts(b_out.ptr.cast_const(), half) };
+            assert_eq!(
+                got_a,
+                ref_a.as_slice(),
+                "attempt {attempt}: folded a bit-exact"
+            );
+            assert_eq!(
+                got_b,
+                ref_b.as_slice(),
+                "attempt {attempt}: folded b bit-exact"
+            );
+            assert_eq!(got, want, "attempt {attempt}: round message bit-exact");
+            let created = imp::zerocheck_tail_wraps_created() - wraps_before;
+            if attempt == 0 {
+                assert_eq!(created, 4, "first launch wraps the four ping-pong buffers");
+            } else {
+                assert_eq!(
+                    created, 4,
+                    "resubmission must hit the cached wraps (no rewiring)"
+                );
+            }
+        }
+        imp::drain_tail_wraps_for_test();
+    }
+
+    /// Negative control: poisoning one input element must change the GPU
+    /// round's outputs and message (guards against a vacuous pass where the
+    /// dispatch silently no-ops), and the poisoned run must STILL be
+    /// bit-exact against the incumbent on the poisoned inputs.
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    fn gpu_zerocheck_tail_round_poisoned_input_diverges() {
+        let _serial = crate::scratch::tests::SCRATCH_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        imp::drain_tail_wraps_for_test();
+        if gpu_or_skip(imp::gpu()).is_none() {
+            return;
+        }
+        let log_n = 19usize;
+        let n = 1usize << log_n;
+        let half = n / 2;
+        let (a, abuf) = leak_f128(n, 0xDEAD_1000);
+        let (b, bbuf) = leak_f128(n, 0xDEAD_2000);
+        let (_, a_out) = leak_f128(half, 0xDEAD_3000);
+        let (_, b_out) = leak_f128(half, 0xDEAD_4000);
+        let mut rng = Rng::new(0xDEAD_5000);
+        let rho = rng.f128();
+        let r_next = rng.vec(log_n - 1);
+
+        let clean = imp::launch_zerocheck_tail_round(abuf, bbuf, a_out, b_out, rho, &r_next)
+            .expect("baseline dispatch");
+        // Capture the clean output slot the poison will land in before the
+        // second dispatch overwrites it.
+        let poison_idx = 123_457usize;
+        let clean_slot = unsafe { *a_out.ptr.add(poison_idx / 2) };
+
+        // Poison one input element of a.
+        let poison = F128 {
+            lo: 0xFFFF_0000_1234_5678,
+            hi: 0x0F0F_5A5A_A5A5_C3C3,
+        };
+        a[poison_idx] += poison;
+
+        let mut ref_a = vec![F128::ZERO; half];
+        let mut ref_b = vec![F128::ZERO; half];
+        let want = crate::zerocheck::multilinear::fold_and_compute_round_pair_into(
+            a, b, &mut ref_a, &mut ref_b, rho, &r_next,
+        );
+        let got = imp::launch_zerocheck_tail_round(abuf, bbuf, a_out, b_out, rho, &r_next)
+            .expect("poisoned dispatch");
+        assert_ne!(got, clean, "poisoned round message must diverge");
+        assert_eq!(got, want, "poisoned message must still be bit-exact");
+        let got_a = unsafe { std::slice::from_raw_parts(a_out.ptr.cast_const(), half) };
+        assert_eq!(
+            got_a,
+            ref_a.as_slice(),
+            "poisoned outputs must stay bit-exact"
+        );
+        assert_ne!(
+            got_a[poison_idx / 2],
+            clean_slot,
+            "the poisoned pair's output slot must diverge"
+        );
+        imp::drain_tail_wraps_for_test();
+    }
+
+    /// The GPU/CPU split is algebraically free: every fraction — including
+    /// the full-GPU and ~full-CPU extremes — must stay bit-exact against the
+    /// incumbent. pct = 0 declines the dispatch (the caller's incumbent
+    /// fallback semantics).
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    fn gpu_zerocheck_tail_split_fractions_stay_bit_exact() {
+        let _serial = crate::scratch::tests::SCRATCH_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        imp::drain_tail_wraps_for_test();
+        if gpu_or_skip(imp::gpu()).is_none() {
+            return;
+        }
+        let log_n = 20usize;
+        let n = 1usize << log_n;
+        let half = n / 2;
+        let (a, abuf) = leak_f128(n, 0x5151_1000);
+        let (b, bbuf) = leak_f128(n, 0x5151_2000);
+        let (_, a_out) = leak_f128(half, 0x5151_3000);
+        let (_, b_out) = leak_f128(half, 0x5151_4000);
+        let mut rng = Rng::new(0x5151_5000);
+        let rho = rng.f128();
+        let r_next = rng.vec(log_n - 1);
+
+        let mut ref_a = vec![F128::ZERO; half];
+        let mut ref_b = vec![F128::ZERO; half];
+        let want = crate::zerocheck::multilinear::fold_and_compute_round_pair_into(
+            a, b, &mut ref_a, &mut ref_b, rho, &r_next,
+        );
+
+        for pct in [100u32, 60, 1] {
+            imp::zc_tail_set_gpu_chunk_pct_for_test(pct);
+            let got = imp::launch_zerocheck_tail_round(abuf, bbuf, a_out, b_out, rho, &r_next)
+                .expect("dispatch must succeed for pct > 0");
+            let got_a = unsafe { std::slice::from_raw_parts(a_out.ptr.cast_const(), half) };
+            let got_b = unsafe { std::slice::from_raw_parts(b_out.ptr.cast_const(), half) };
+            assert_eq!(got_a, ref_a.as_slice(), "pct={pct}: folded a bit-exact");
+            assert_eq!(got_b, ref_b.as_slice(), "pct={pct}: folded b bit-exact");
+            assert_eq!(got, want, "pct={pct}: round message bit-exact");
+        }
+        imp::zc_tail_set_gpu_chunk_pct_for_test(0);
+        assert!(
+            imp::launch_zerocheck_tail_round(abuf, bbuf, a_out, b_out, rho, &r_next).is_none(),
+            "pct=0 must decline the dispatch (caller runs the incumbent round)"
+        );
+        // Reset the production default for the rest of the process.
+        imp::zc_tail_set_gpu_chunk_pct_for_test(45);
+        imp::drain_tail_wraps_for_test();
+    }
+
+    /// The kill switch keeps every tail round on the CPU. The process-global
+    /// latch reads the env once, so the in-process assertions cover the
+    /// value-level gate and the documented name; the same-binary A/B
+    /// (`FLOCK_NO_GPU_ZC_TAIL=1` phase_profile control arm) exercises the
+    /// dispatch gate end to end.
+    #[test]
+    fn zerocheck_tail_kill_switch_is_the_documented_env() {
+        assert_eq!(ENV_NO_GPU_ZC_TAIL, "FLOCK_NO_GPU_ZC_TAIL");
+        assert!(!gpu_zc_tail_enabled_value(Some(std::ffi::OsStr::new("1"))));
+        assert!(!gpu_zc_tail_enabled_value(Some(std::ffi::OsStr::new("0"))));
+        assert!(gpu_zc_tail_enabled_value(None));
+        if std::env::var_os(ENV_NO_GPU_ZC_TAIL).is_none() {
+            assert!(gpu_zc_tail_enabled());
+        }
+    }
+
+    /// The whole arm depends on wrapping the four ping-pong buffers with
+    /// `newBufferWithBytesNoCopy`, which Metal only accepts on page-aligned
+    /// memory of a page-multiple length. Copying up to 512 MiB per buffer
+    /// per round is not an option, so a scratch allocator change that broke
+    /// page alignment would silently disable the GPU tail. Pin that here for
+    /// both ranked size classes (the 512 MiB round-3 outputs and the 256 MiB
+    /// ping-pong scratch).
+    #[test]
+    fn zerocheck_tail_buffers_are_wrappable_without_a_copy() {
+        const PAGE: usize = 16384;
+        for log_elems in [24usize, 25] {
+            let buf = crate::scratch::take_f128(1usize << log_elems);
+            let (ptr, bytes) = (buf.as_ptr() as usize, buf.len() * 16);
+            crate::scratch::give_f128(buf);
+            assert_eq!(
+                ptr % PAGE,
+                0,
+                "2^{log_elems} F128 base must be page-aligned"
+            );
+            assert_eq!(
+                bytes % PAGE,
+                0,
+                "2^{log_elems} F128 bytes must be a page multiple"
+            );
+        }
     }
 }
