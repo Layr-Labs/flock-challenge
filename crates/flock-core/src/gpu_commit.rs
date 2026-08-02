@@ -103,6 +103,120 @@ pub(crate) fn gpu_lincheck_debug() -> bool {
     *ON
 }
 
+/// Kill switch for the sumcheck fold2 GPU arm: `FLOCK_NO_GPU_FOLD2=1` keeps
+/// the two-consecutive-folds sumcheck rounds on the CPU (the exact incumbent).
+/// The arm computes a whole ranked fold2 round (wf/wb + direct and
+/// one-round-lookahead messages) on the GPU; a one-time warmup A/B (bit-exact
+/// AND wall-clock, see `imp::try_sumcheck_fold2_gpu`) admits it, exactly like
+/// the commit latch. Any Metal failure at any point falls back to the CPU fold
+/// — worst case is the status quo, never a wrong proof or a panic.
+pub const ENV_NO_GPU_FOLD2: &str = "FLOCK_NO_GPU_FOLD2";
+
+/// Env var that admits the fold2 GPU arm whenever it is bit-exact, even
+/// without a wall-clock win (A/B and test tooling; the ranked harness
+/// env-clears workers, so the wall-clock A/B default is what ships).
+pub const ENV_GPU_FOLD2_FORCE: &str = "FLOCK_GPU_FOLD2_FORCE";
+
+pub(crate) fn gpu_fold2_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os(ENV_NO_GPU_FOLD2).is_none())
+}
+
+/// Kill switch for the witgen GPU arm: `FLOCK_NO_GPU_WITGEN=1` keeps the
+/// ranked witness build (z/a/b rows) on the CPU (the exact incumbent). The
+/// arm computes the whole ranked 3 x 512 MiB witness on the GPU; a one-time
+/// warmup A/B (bit-exact checksum AND wall-clock) in flock-prover's
+/// `generate_impl` admits it. Any failure returns false and the CPU path
+/// stands — worst case is the status quo, never a wrong proof.
+pub const ENV_NO_GPU_WITGEN: &str = "FLOCK_NO_GPU_WITGEN";
+
+#[cfg_attr(
+    not(all(target_os = "macos", target_arch = "aarch64")),
+    allow(dead_code)
+)]
+pub(crate) fn gpu_witgen_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var_os(ENV_NO_GPU_WITGEN).is_none()
+            && cfg!(all(target_os = "macos", target_arch = "aarch64"))
+            && gpu_commit_enabled()
+    })
+}
+
+/// Outcome of a sumcheck fold2 GPU arm attempt (see [`try_sumcheck_fold2_gpu`]).
+#[cfg_attr(
+    not(all(target_os = "macos", target_arch = "aarch64")),
+    allow(dead_code)
+)]
+pub(crate) enum Fold2GpuResult {
+    /// The arm computed the fold outputs and messages; the caller must use
+    /// them. On the one-time warmup call this carries the CPU reference
+    /// results (the arm A/B'd both paths before trusting either); afterwards
+    /// it carries GPU results verified bit-exact on the warmup call.
+    Trusted {
+        wf: Vec<F128>,
+        wb: Vec<F128>,
+        u0: F128,
+        u2: F128,
+        c: [F128; 6],
+    },
+    /// Run the CPU fold.
+    Cpu,
+}
+
+/// Try the Ligerito sumcheck fold2 GPU arm for one round. Returns `Trusted`
+/// (results to use) only when the arm is admitted — the one-time warmup call
+/// runs both paths and compares bit-for-bit, and the GPU result is trusted
+/// only if it is bit-exact AND the GPU run won the wall-clock A/B (or
+/// `FLOCK_GPU_FOLD2_FORCE=1`). Any Metal failure, shape mismatch, or kill
+/// switch returns `Cpu` and the caller runs the normal CPU fold.
+pub(crate) fn try_sumcheck_fold2_gpu(
+    f: &[F128],
+    b: &[F128],
+    r_a: F128,
+    r_b: F128,
+) -> Fold2GpuResult {
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    {
+        imp::try_sumcheck_fold2_gpu(f, b, r_a, r_b)
+    }
+    #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+    {
+        let _ = (f, b, r_a, r_b);
+        Fold2GpuResult::Cpu
+    }
+}
+
+/// Try the ranked witgen GPU arm for one witness pass (z/a/b rows). The
+/// latch lives in flock-prover's `generate_impl`: the first ranked streamed
+/// prove runs the incumbent CPU pass, probes this arm into throwaway scratch
+/// buffers, slice-compares bit-for-bit, and latches on only when bit-exact
+/// AND the GPU wall-clock beat the CPU pass by the latch margin. This
+/// function only dispatches (zero-copy wrap of the caller's scratch); any
+/// Metal failure, shape mismatch, or kill switch returns false and the CPU
+/// path stands.
+#[cfg_attr(
+    not(all(target_os = "macos", target_arch = "aarch64")),
+    allow(dead_code)
+)]
+pub(crate) fn try_witgen_gpu(
+    packed: &[u32],
+    n_total: usize,
+    z: *mut u8,
+    a: *mut u8,
+    b: *mut u8,
+) -> bool {
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    {
+        imp::try_witgen_gpu(packed, n_total, z, a, b)
+    }
+    #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+    {
+        let _ = (packed, n_total, z, a, b);
+        false
+    }
+}
+
 /// Kill switch for the zerocheck round-two PRODUCTS GPU arm:
 /// `FLOCK_NO_GPU_ZC_R2=1` keeps the whole round-two fused fold on the CPU
 /// (the exact incumbent). Unlike the refuted whole-phase tail offload, this
@@ -2000,6 +2114,921 @@ kernel void parent_hash3(device const uint* children [[buffer(0)]],
 }
 
 "#;
+
+    /// Metal Shading Language for the Ligerito sumcheck fold2 arm, kept in
+    /// its own library so a compile error here can only disable the fold2
+    /// arm, never the commit kernels.
+    const MSL_FOLD2_SOURCE: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+// GF(2^128) GHASH polynomial P = x^128 + x^7 + x^2 + x + 1. F128 memory
+// layout (little-endian struct { uint64 lo; uint64 hi; }) as uint4:
+// v = (lo31..0, lo63..32, hi31..0, hi63..32).
+
+static inline uint4 gf_mulx(uint4 v) {
+    uint carry = v.w >> 31;
+    uint4 r;
+    r.w = (v.w << 1) | (v.z >> 31);
+    r.z = (v.z << 1) | (v.y >> 31);
+    r.y = (v.y << 1) | (v.x >> 31);
+    r.x = (v.x << 1) ^ (carry * 0x87u);
+    return r;
+}
+
+static inline uint4 gf_shl16(uint4 a) {
+    uint h = a.w >> 16;
+    uint4 r;
+    r.w = (a.w << 16) | (a.z >> 16);
+    r.z = (a.z << 16) | (a.y >> 16);
+    r.y = (a.y << 16) | (a.x >> 16);
+    r.x = (a.x << 16) ^ ((h << 7) ^ (h << 2) ^ (h << 1) ^ h);
+    return r;
+}
+
+// v * tw mod P, 16 bits of v per Horner step, reduced nibble tables
+// tab[16k + n] = (n * x^(4k)) * tw for k = 0..3, n = 0..15 (same layout and
+// arithmetic as the commit kernels' gf_mul_tab4).
+static inline uint4 gf_mul_tab4(uint4 v, threadgroup const uint4* tab) {
+    uint4 acc = uint4(0u);
+    for (int i = 7; i >= 0; i--) {
+        acc = gf_shl16(acc);
+        uint h = (v[i >> 1] >> ((i & 1) * 16)) & 0xffffu;
+        acc ^= tab[h & 15u]
+             ^ tab[16u + ((h >> 4) & 15u)]
+             ^ tab[32u + ((h >> 8) & 15u)]
+             ^ tab[48u + (h >> 12)];
+    }
+    return acc;
+}
+
+// General a * b mod P: bit-iterate over b, accumulating a*x^k mod P for each
+// set bit. GF(2^128) multiplication is canonical (carry-less product reduced
+// mod P), so this is bit-identical to the host F128 mul.
+static inline uint4 gf_mul_gen(uint4 a, uint4 b) {
+    uint4 acc = uint4(0u);
+    for (int i = 0; i < 4; i++) {
+        uint w = b[i];
+        for (int k = 0; k < 32; k++) {
+            if (w & 1u) { acc ^= a; }
+            a = gf_mulx(a);
+            w >>= 1;
+        }
+    }
+    return acc;
+}
+
+// ===========================================================================
+// Ligerito sumcheck fold2: two consecutive folds plus the direct and
+// one-round-lookahead messages. Exact transcription of the portable branch of
+// `ligerito::fold2_and_msgs_lsb` (the branch the aarch64 NEON kernel
+// bit-matches), so a correct kernel is bit-identical to the CPU by
+// construction; the host warmup A/B enforces it at runtime.
+//
+// f/b are arrays of n F128 (n % 16 == 0, power of two in production). One
+// thread owns a group of 4 consecutive outputs and the 16 consecutive inputs
+// of each polynomial:
+//   i0 = 16*g; for q in 0..4, i = i0 + 4q:
+//     vf0 = f[i]   ^ (f[i]   ^ f[i+1]) * r_a    (v = f*oa ^ f'*r_a with
+//     vf1 = f[i+2] ^ (f[i+2] ^ f[i+3]) * r_a    oa = 1 ^ r_a, by GF(2)
+//     vb0 = b[i]   ^ (b[i]   ^ b[i+1]) * r_a    distributivity)
+//     vb1 = b[i+2] ^ (b[i+2] ^ b[i+3]) * r_a
+//     wf[q] = vf0 ^ (vf0 ^ vf1) * r_b
+//     wb[q] = vb0 ^ (vb0 ^ vb1) * r_b
+// Messages (all XOR-accumulated, so reduction order is irrelevant):
+//   p0 = w0f*w0b; p1 = w2f*w2b; s0f = w0f^w1f; s0b = w0b^w1b;
+//   s1f = w2f^w3f; s1b = w2b^w3b; ps0 = s0f*s0b; ps1 = s1f*s1b;
+//   ef = w0f^w2f; of = w1f^w3f; eb = w0b^w2b; ob = w1b^w3b;
+//   sef = ef^of; seb = eb^ob; pe = ef*eb; pse = sef*seb; po = of*ob;
+//   u0 ^= p0^p1; u2 ^= ps0^ps1; c0 ^= p0;
+//   c1 ^= w1f*w1b ^ p0 ^ ps0; c2 ^= ps0;
+//   c3 ^= pe; c4 ^= po ^ pe ^ pse; c5 ^= pse.
+// Each thread XORs its 8 partials (u0, u2, c0..c5) into a 32-word device
+// atomic buffer; the host reads the 32 words back.
+// ===========================================================================
+kernel void sumcheck_fold2(device const uint4* f       [[buffer(0)]],
+                           device const uint4* b       [[buffer(1)]],
+                           device uint4* wf            [[buffer(2)]],
+                           device uint4* wb            [[buffer(3)]],
+                           device atomic_uint* msgs    [[buffer(4)]],
+                           constant uint4* challenges  [[buffer(5)]],
+                           uint tgid [[threadgroup_position_in_grid]],
+                           uint lid  [[thread_index_in_threadgroup]])
+{
+    constexpr uint TPG = 256u;
+    // Per-threadgroup reduced nibble tables for r_a and r_b (2 x 64 uint4).
+    threadgroup uint4 tabs[128u];
+    // Phase 1: base values r * x^(4k), k = 0..3 (8 entries).
+    if (lid < 8u) {
+        uint c = lid >> 2;
+        uint k = lid & 3u;
+        uint4 p = challenges[c];
+        for (uint m = 0; m < (k << 2); m++) { p = gf_mulx(p); }
+        tabs[(c << 2) | k] = p;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    // Phase 2: nibble multiples of each base (128 entries).
+    for (uint ei = lid; ei < 128u; ei += TPG) {
+        uint c = ei >> 6;
+        uint k = (ei >> 4) & 3u;
+        uint n = ei & 15u;
+        uint4 p = tabs[(c << 2) | k];
+        uint4 val = uint4(0u);
+        for (uint b = 0u; b < 4u; b++) {
+            if ((n >> b) & 1u) { val ^= p; }
+            p = gf_mulx(p);
+        }
+        tabs[ei] = val;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    threadgroup const uint4* tab_a = &tabs[0];
+    threadgroup const uint4* tab_b = &tabs[64];
+
+    const uint i0 = (tgid * TPG + lid) * 16u;   // input base for this group
+    uint4 wfv[4], wbv[4];
+    for (uint q = 0u; q < 4u; q++) {
+        uint i = i0 + (q << 2);
+        uint4 f0 = f[i], f1 = f[i + 1u], f2 = f[i + 2u], f3 = f[i + 3u];
+        uint4 vf0 = f0 ^ gf_mul_tab4(f0 ^ f1, tab_a);
+        uint4 vf1 = f2 ^ gf_mul_tab4(f2 ^ f3, tab_a);
+        uint4 b0 = b[i], b1 = b[i + 1u], b2 = b[i + 2u], b3 = b[i + 3u];
+        uint4 vb0 = b0 ^ gf_mul_tab4(b0 ^ b1, tab_a);
+        uint4 vb1 = b2 ^ gf_mul_tab4(b2 ^ b3, tab_a);
+        wfv[q] = vf0 ^ gf_mul_tab4(vf0 ^ vf1, tab_b);
+        wbv[q] = vb0 ^ gf_mul_tab4(vb0 ^ vb1, tab_b);
+    }
+    uint t0 = i0 >> 2;                            // output base (= g * 4)
+    for (uint q = 0u; q < 4u; q++) {
+        wf[t0 + q] = wfv[q];
+        wb[t0 + q] = wbv[q];
+    }
+
+    uint4 w0f = wfv[0], w1f = wfv[1], w2f = wfv[2], w3f = wfv[3];
+    uint4 w0b = wbv[0], w1b = wbv[1], w2b = wbv[2], w3b = wbv[3];
+    uint4 p0 = gf_mul_gen(w0f, w0b);
+    uint4 p1 = gf_mul_gen(w2f, w2b);
+    uint4 s0f = w0f ^ w1f, s0b = w0b ^ w1b;
+    uint4 s1f = w2f ^ w3f, s1b = w2b ^ w3b;
+    uint4 ps0 = gf_mul_gen(s0f, s0b);
+    uint4 ps1 = gf_mul_gen(s1f, s1b);
+    uint4 ef = w0f ^ w2f, of = w1f ^ w3f;
+    uint4 eb = w0b ^ w2b, ob = w1b ^ w3b;
+    uint4 sef = ef ^ of, seb = eb ^ ob;
+    uint4 pe = gf_mul_gen(ef, eb);
+    uint4 pse = gf_mul_gen(sef, seb);
+    uint4 po = gf_mul_gen(of, ob);
+    uint4 u0 = p0 ^ p1;
+    uint4 u2 = ps0 ^ ps1;
+    uint4 c0 = p0;
+    uint4 c1 = gf_mul_gen(w1f, w1b) ^ p0 ^ ps0;
+    uint4 c2 = ps0;
+    uint4 c3 = pe;
+    uint4 c4 = po ^ pe ^ pse;
+    uint4 c5 = pse;
+
+    uint4 parts[8] = { u0, u2, c0, c1, c2, c3, c4, c5 };
+    for (uint p = 0u; p < 8u; p++) {
+        atomic_fetch_xor_explicit(&msgs[(p << 2) + 0u], parts[p].x, memory_order_relaxed);
+        atomic_fetch_xor_explicit(&msgs[(p << 2) + 1u], parts[p].y, memory_order_relaxed);
+        atomic_fetch_xor_explicit(&msgs[(p << 2) + 2u], parts[p].z, memory_order_relaxed);
+        atomic_fetch_xor_explicit(&msgs[(p << 2) + 3u], parts[p].w, memory_order_relaxed);
+    }
+}
+"#;
+
+    /// Ligerito sumcheck fold2 GPU arm. The ranked sumcheck folds its working
+    /// polynomial through rounds 2..6 with `fold2_and_msgs_lsb` → NEON
+    /// `fold2_two_and_msgs` (reads f+b, writes wf+wb ≈ 3n·16B per round;
+    /// ~768 MiB across the ranked rounds). This arm runs the same arithmetic
+    /// on the GPU in its own shader library; a one-time warmup A/B (bit-exact
+    /// AND wall-clock) admits it; any failure at any point falls back to the
+    /// CPU fold. Mirrors the zc-r2/lincheck arm structure.
+    ///
+    /// Ranked geometry only: n >= 2^19 (the fold rounds are powers of two
+    /// down from the materialize output, and the warmup compare decides
+    /// correctness for every shape the kernel can see — the kernel is fully
+    /// parametric in n and the ranked dispatch is exact, so a bit-exact
+    /// warmup round proves every round).
+    const FOLD2_MIN_N: usize = 1 << 19;
+
+    struct Fold2GpuState {
+        pso: Id,
+        decided: bool,
+        on: bool,
+    }
+    // SAFETY: Metal objects are thread-safe; access is serialized by the
+    // process-global latch below (same contract as `Gpu`).
+    unsafe impl Send for Fold2GpuState {}
+    unsafe impl Sync for Fold2GpuState {}
+
+    static FOLD2_GPU_STATE: std::sync::OnceLock<Option<std::sync::Mutex<Fold2GpuState>>> =
+        std::sync::OnceLock::new();
+
+    /// Compile the fold2 kernel (own library). Any failure -> None -> the arm
+    /// stays off; the commit kernels are never touched.
+    fn build_fold2_pso(gpu: &Gpu) -> Option<Id> {
+        unsafe {
+            let pool = gpu.pool_push();
+            let r = (|| -> Option<Id> {
+                let src = gpu.api.nsstring(MSL_FOLD2_SOURCE).ok()?;
+                let mut err: Id = NIL;
+                let library: Id = send!(
+                    gpu.api,
+                    unsafe extern "C" fn(Id, Sel, Id, Id, *mut Id) -> Id,
+                    gpu.device,
+                    c"newLibraryWithSource:options:error:",
+                    src,
+                    NIL,
+                    &mut err
+                );
+                if library.is_null() {
+                    eprintln!(
+                        "[gpu-fold2] shader compile failed: {}",
+                        gpu.api.error_string(err)
+                    );
+                    return None;
+                }
+                let ns = gpu.api.nsstring("sumcheck_fold2").ok()?;
+                let f: Id = send!(
+                    gpu.api,
+                    unsafe extern "C" fn(Id, Sel, Id) -> Id,
+                    library,
+                    c"newFunctionWithName:",
+                    ns
+                );
+                if f.is_null() {
+                    send!(
+                        gpu.api,
+                        unsafe extern "C" fn(Id, Sel) -> Id,
+                        library,
+                        c"release"
+                    );
+                    return None;
+                }
+                let mut perr: Id = NIL;
+                let pso: Id = send!(
+                    gpu.api,
+                    unsafe extern "C" fn(Id, Sel, Id, *mut Id) -> Id,
+                    gpu.device,
+                    c"newComputePipelineStateWithFunction:error:",
+                    f,
+                    &mut perr
+                );
+                send!(gpu.api, unsafe extern "C" fn(Id, Sel) -> Id, f, c"release");
+                send!(gpu.api, unsafe extern "C" fn(Id, Sel) -> Id, library, c"release");
+                if pso.is_null() {
+                    eprintln!("[gpu-fold2] pipeline: {}", gpu.api.error_string(perr));
+                    return None;
+                }
+                Some(pso)
+            })();
+            gpu.pool_pop(pool);
+            r
+        }
+    }
+
+    fn init_fold2_state(gpu: &Gpu) -> Option<std::sync::Mutex<Fold2GpuState>> {
+        Some(std::sync::Mutex::new(Fold2GpuState {
+            pso: build_fold2_pso(gpu)?,
+            decided: false,
+            on: false,
+        }))
+    }
+
+    /// Full CPU reference fold for the warmup A/B: the NEON kernel the ranked
+    /// path would otherwise run (normal stores), including the messages.
+    #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+    fn fold2_cpu_reference(
+        f: &[F128],
+        b: &[F128],
+        r_a: F128,
+        r_b: F128,
+    ) -> Option<(Vec<F128>, Vec<F128>, F128, F128, [F128; 6])> {
+        let quarter = f.len() / 4;
+        let mut wf = vec![F128::ZERO; quarter];
+        let mut wb = vec![F128::ZERO; quarter];
+        let (u0, u2, c) = crate::field::f128_slice::fold2_two_and_msgs(
+            f, b, 0, &mut wf, &mut wb, r_a, r_b, false,
+        );
+        Some((wf, wb, u0, u2, c))
+    }
+
+    /// A build without PMULL cannot verify the arm; stay off.
+    #[cfg(not(all(target_arch = "aarch64", target_feature = "aes")))]
+    fn fold2_cpu_reference(
+        _f: &[F128],
+        _b: &[F128],
+        _r_a: F128,
+        _r_b: F128,
+    ) -> Option<(Vec<F128>, Vec<F128>, F128, F128, [F128; 6])> {
+        None
+    }
+
+    /// Run one fold2 round on the GPU: uploads f/b, dispatches the kernel,
+    /// reads back wf/wb and the 8 message partials (XOR-reduced on device).
+    fn run_fold2_gpu(
+        gpu: &Gpu,
+        pso: Id,
+        f: &[F128],
+        b: &[F128],
+        r_a: F128,
+        r_b: F128,
+    ) -> Option<(Vec<F128>, Vec<F128>, F128, F128, [F128; 6])> {
+        let n = f.len();
+        let quarter = n / 4;
+        let f_bytes = n * 16;
+        let w_bytes = quarter * 16;
+        unsafe {
+            let pool = gpu.pool_push();
+            let r = (|| {
+                let f_buf = gpu.new_buffer(f_bytes).ok()?;
+                let b_buf = gpu.new_buffer(f_bytes).ok()?;
+                let wf_buf = gpu.new_buffer(w_bytes).ok()?;
+                let wb_buf = gpu.new_buffer(w_bytes).ok()?;
+                let msg_buf = gpu.new_buffer(128).ok()?;
+                // Upload inputs.
+                std::ptr::copy_nonoverlapping(
+                    f.as_ptr().cast::<u8>(),
+                    gpu.buffer_contents(f_buf),
+                    f_bytes,
+                );
+                std::ptr::copy_nonoverlapping(
+                    b.as_ptr().cast::<u8>(),
+                    gpu.buffer_contents(b_buf),
+                    f_bytes,
+                );
+                // Zero the 32-word atomic message buffer.
+                std::ptr::write_bytes(gpu.buffer_contents(msg_buf), 0u8, 128);
+                // Challenges: [r_a.lo, r_a.hi, r_b.lo, r_b.hi].
+                let ch: [u64; 4] = [r_a.lo, r_a.hi, r_b.lo, r_b.hi];
+                let cb = gpu.command_buffer().ok()?;
+                let enc = gpu.compute_encoder(cb).ok()?;
+                gpu.set_pipeline(enc, pso);
+                gpu.set_buffer(enc, f_buf, 0, 0);
+                gpu.set_buffer(enc, b_buf, 0, 1);
+                gpu.set_buffer(enc, wf_buf, 0, 2);
+                gpu.set_buffer(enc, wb_buf, 0, 3);
+                gpu.set_buffer(enc, msg_buf, 0, 4);
+                gpu.set_bytes(
+                    enc,
+                    core::slice::from_raw_parts(ch.as_ptr().cast::<u8>(), 32),
+                    5,
+                );
+                let tpg = 256u64;
+                let groups = ((n as u64) / 16 + tpg - 1) / tpg;
+                gpu.dispatch(enc, groups, tpg);
+                gpu.end_encoding(enc);
+                gpu.commit_and_wait(cb).ok()?;
+                // Read back outputs.
+                let mut wf = vec![F128::ZERO; quarter];
+                let mut wb = vec![F128::ZERO; quarter];
+                std::ptr::copy_nonoverlapping(
+                    gpu.buffer_contents(wf_buf).cast(),
+                    wf.as_mut_ptr().cast::<u8>(),
+                    w_bytes,
+                );
+                std::ptr::copy_nonoverlapping(
+                    gpu.buffer_contents(wb_buf).cast(),
+                    wb.as_mut_ptr().cast::<u8>(),
+                    w_bytes,
+                );
+                // Read back the 8 message partials (32 x u32).
+                let m = gpu.buffer_contents(msg_buf).cast::<u32>();
+                let rd = |w: usize| -> u64 {
+                    // SAFETY: msg_buf holds 32 u32s; w <= 30 here (8 partials).
+                    (*m.add(w) as u64) | ((*m.add(w + 1) as u64) << 32)
+                };
+                let u0 = F128::new(rd(0), rd(2));
+                let u2 = F128::new(rd(4), rd(6));
+                let mut c = [F128::ZERO; 6];
+                for (i, slot) in c.iter_mut().enumerate() {
+                    *slot = F128::new(rd(8 + 4 * i), rd(10 + 4 * i));
+                }
+                gpu.release(f_buf);
+                gpu.release(b_buf);
+                gpu.release(wf_buf);
+                gpu.release(wb_buf);
+                gpu.release(msg_buf);
+                Some((wf, wb, u0, u2, c))
+            })();
+            gpu.pool_pop(pool);
+            r
+        }
+    }
+
+    /// The fold2 GPU arm entry (macOS/aarch64): shape-gated, env-gated,
+    /// latched. See the top-level wrapper for the public contract.
+    pub(crate) fn try_sumcheck_fold2_gpu(
+        f: &[F128],
+        b: &[F128],
+        r_a: F128,
+        r_b: F128,
+    ) -> super::Fold2GpuResult {
+        if !super::gpu_fold2_enabled() {
+            return super::Fold2GpuResult::Cpu;
+        }
+        let n = f.len();
+        if n < FOLD2_MIN_N || !n.is_power_of_two() || n % 16 != 0 || b.len() != n {
+            return super::Fold2GpuResult::Cpu;
+        }
+        let Ok(gpu) = gpu() else {
+            return super::Fold2GpuResult::Cpu;
+        };
+        let Some(state) = FOLD2_GPU_STATE.get_or_init(|| init_fold2_state(gpu)) else {
+            return super::Fold2GpuResult::Cpu;
+        };
+        let mut st = state.lock().unwrap();
+        if st.decided {
+            if !st.on {
+                return super::Fold2GpuResult::Cpu;
+            }
+            return match run_fold2_gpu(gpu, st.pso, f, b, r_a, r_b) {
+                Some((wf, wb, u0, u2, c)) => {
+                    super::Fold2GpuResult::Trusted { wf, wb, u0, u2, c }
+                }
+                None => super::Fold2GpuResult::Cpu,
+            };
+        }
+        // Warmup: run both paths once, compare bit-for-bit, wall-clock, and
+        // latch once. Returns the CPU reference results either way (they are
+        // authoritative; the caller would fold anyway, so no double work).
+        let t0 = std::time::Instant::now();
+        let gpu_res = run_fold2_gpu(gpu, st.pso, f, b, r_a, r_b);
+        let gpu_wall = t0.elapsed();
+        let t1 = std::time::Instant::now();
+        let cpu_res = fold2_cpu_reference(f, b, r_a, r_b);
+        let cpu_wall = t1.elapsed();
+        let bit_exact = match (&gpu_res, &cpu_res) {
+            (Some((gwf, gwb, gu0, gu2, gc)), Some((cwf, cwb, cu0, cu2, cc))) => {
+                gwf == cwf && gwb == cwb && gu0 == cu0 && gu2 == cu2 && gc == cc
+            }
+            _ => false,
+        };
+        let force = std::env::var_os(super::ENV_GPU_FOLD2_FORCE).is_some();
+        let faster = gpu_wall.as_secs_f64() * super::LATCH_MARGIN <= cpu_wall.as_secs_f64();
+        let promoted = bit_exact && (force || faster);
+        st.decided = true;
+        st.on = promoted;
+        if promoted {
+            let (wf, wb, u0, u2, c) = gpu_res.unwrap();
+            super::Fold2GpuResult::Trusted { wf, wb, u0, u2, c }
+        } else {
+            match cpu_res {
+                Some((wf, wb, u0, u2, c)) => {
+                    super::Fold2GpuResult::Trusted { wf, wb, u0, u2, c }
+                }
+                None => super::Fold2GpuResult::Cpu,
+            }
+        }
+    }
+
+    /// MSL source for the witgen GPU arm: bit-exact transcription of
+    /// `flock_prover::r1cs_hashes::blake3::build_block_witness_ab_stream_into`
+    /// (the scalar reference the NEON quad builder bit-matches), one thread
+    /// per block. Each thread emits its block's (z, a, b) rows of 256 u64
+    /// words (K = 16384 bits, 15409 useful), F128-packed exactly as the CPU
+    /// path leaves them. Input = 28 u32 per block:
+    /// [cv0..cv7 | m0..m15 | counter_lo | counter_hi | blen | flags]; the
+    /// host pre-pads missing blocks with the all-zero compression.
+    const MSL_WITGEN_SOURCE: &str = r#"
+using namespace metal;
+
+static constant uint witgen_iv[8] = {
+    0x6A09E667u, 0xBB67AE85u, 0x3C6EF372u, 0xA54FF53Au,
+    0x510E527Fu, 0x9B05688Cu, 0x1F83D9ABu, 0x5BE0CD19u
+};
+
+static inline uint wrotr(uint x, uint n) {
+    return (x >> n) | (x << (32u - n));
+}
+
+// add_carry_parts(x, y) -> (sum, left, right, carry); left/right/carry are
+// masked to the low 31 bits (bit 31 is the discarded mod-2^32 carry-out).
+static inline uint4 wacp(uint x, uint y) {
+    const uint M31 = 0x7FFFFFFFu;
+    uint sum = x + y;
+    uint cin = sum ^ x ^ y;
+    uint left = (x ^ cin) & M31;
+    uint right = (y ^ cin) & M31;
+    uint carry = left & right;
+    return uint4(sum, left, right, carry);
+}
+
+// PackedWordWriter state (scalar clone).
+struct WW {
+    uint64_t pending;
+    uint used;
+    uint word;
+};
+
+static inline void wpush(thread WW& w, device uint64_t* out, uint64_t value, uint width) {
+    if (width != 64u) {
+        value &= ((uint64_t)1 << width) - 1ull;
+    }
+    if (w.used == 0u && width == 64u) {
+        out[w.word] = value;
+        w.word += 1u;
+        return;
+    }
+    uint room = 64u - w.used;
+    if (width < room) {
+        w.pending |= value << w.used;
+        w.used += width;
+    } else {
+        out[w.word] = w.pending | (value << w.used);
+        w.word += 1u;
+        if (width == room) {
+            w.pending = 0ull;
+            w.used = 0u;
+        } else {
+            w.pending = value >> room;
+            w.used = width - room;
+        }
+    }
+}
+
+// Flush one 250-bit G record (six 31-bit fields at a 31-bit stride, then two
+// 32-bit lin fields) through a writer as 64/64/64/58-bit pushes.
+static inline void push_g_record(thread WW& w, device uint64_t* out,
+                                 uint f0, uint f1, uint f2, uint f3, uint f4, uint f5,
+                                 uint lin0, uint lin1) {
+    uint64_t r0 = (uint64_t)f0 | ((uint64_t)f1 << 31) | (((uint64_t)f2 & 0x3ull) << 62);
+    uint64_t r1 = ((uint64_t)f2 >> 2) | ((uint64_t)f3 << 29) | (((uint64_t)f4 & 0xFull) << 60);
+    // lin0 is a full 32-bit field at record bit 186: bits 0..5 land in
+    // word 2 (58..63), bits 6..31 spill into word 3 (0..25).
+    uint64_t r2 = ((uint64_t)f4 >> 4) | ((uint64_t)f5 << 27) | (((uint64_t)lin0 & 0x3Full) << 58);
+    uint64_t r3 = ((uint64_t)lin0 >> 6) | ((uint64_t)lin1 << 26);
+    wpush(w, out, r0, 64u);
+    wpush(w, out, r1, 64u);
+    wpush(w, out, r2, 64u);
+    wpush(w, out, r3, 58u);
+}
+
+// One BLAKE3 G with the witness add stream (scalar g! macro body).
+static inline void witgen_g(thread uint* s, const device uint* m,
+                            uint la, uint lb, uint lc, uint ld, uint mi0, uint mi1,
+                            thread WW& wz, device uint64_t* zrow,
+                            thread WW& wa, device uint64_t* arow,
+                            thread WW& wb, device uint64_t* brow) {
+    uint av = s[la], bv = s[lb], cvv = s[lc], dv = s[ld];
+    uint4 r = wacp(av, bv);
+    uint t0 = r.x, c0 = r.w, l0 = r.y, r0v = r.z;
+    uint4 r1 = wacp(t0, m[mi0]);
+    uint a1 = r1.x, c1 = r1.w, l1 = r1.y, r1b = r1.z;
+    uint d1 = wrotr(dv ^ a1, 16u);
+    uint4 r2 = wacp(cvv, d1);
+    uint c1v = r2.x, c2 = r2.w, l2 = r2.y, r2b = r2.z;
+    uint b1 = wrotr(bv ^ c1v, 12u);
+    uint4 r3 = wacp(a1, b1);
+    uint t1 = r3.x, c3 = r3.w, l3 = r3.y, r3b = r3.z;
+    uint4 r4 = wacp(t1, m[mi1]);
+    uint a2 = r4.x, c4 = r4.w, l4 = r4.y, r4b = r4.z;
+    uint d2 = wrotr(d1 ^ a2, 8u);
+    uint4 r5 = wacp(c1v, d2);
+    uint c2v = r5.x, c5 = r5.w, l5 = r5.y, r5b = r5.z;
+    uint bnew = wrotr(b1 ^ c2v, 7u);
+    uint dnew = d2;
+    // z: carries c0..c5 then b_new, d_new; a: lefts l0..l5 then b_new, d_new;
+    // b: rights r0..r5 then MAX, MAX.
+    push_g_record(wz, zrow, c0, c1, c2, c3, c4, c5, bnew, dnew);
+    push_g_record(wa, arow, l0, l1, l2, l3, l4, l5, bnew, dnew);
+    push_g_record(wb, brow, r0v, r1b, r2b, r3b, r4b, r5b, 0xFFFFFFFFu, 0xFFFFFFFFu);
+    s[la] = a2;
+    s[lb] = bnew;
+    s[lc] = c2v;
+    s[ld] = dnew;
+}
+
+kernel void witgen_quad(device const uint* in  [[buffer(0)]],
+                        device uint64_t* zout [[buffer(1)]],
+                        device uint64_t* aout [[buffer(2)]],
+                        device uint64_t* bout [[buffer(3)]],
+                        uint gid [[thread_position_in_grid]]) {
+    const device uint* blk = in + gid * 28u;
+    uint cv[8];
+    uint m[16];
+    for (uint i = 0u; i < 8u; i++) { cv[i] = blk[i]; }
+    for (uint i = 0u; i < 16u; i++) { m[i] = blk[8u + i]; }
+    uint tlo = blk[24u];
+    uint thi = blk[25u];
+    uint blen = blk[26u];
+    uint flags = blk[27u];
+
+    device uint64_t* zrow = zout + gid * 256u;
+    device uint64_t* arow = aout + gid * 256u;
+    device uint64_t* brow = bout + gid * 256u;
+
+    // ---- prefix: words 0..4 = cv pairs (z/a), MAX (b) ----
+    for (uint i = 0u; i < 4u; i++) {
+        uint64_t v = (uint64_t)cv[2u * i] | ((uint64_t)cv[2u * i + 1u] << 32);
+        zrow[i] = v;
+        arow[i] = v;
+        brow[i] = ~0ull;
+    }
+    // ---- message region: words 8..18 (z/a), MAX (b) ----
+    uint values[20];
+    for (uint i = 0u; i < 16u; i++) { values[i] = m[i]; }
+    values[16] = tlo;
+    values[17] = thi;
+    values[18] = blen;
+    values[19] = flags;
+    for (uint i = 0u; i < 10u; i++) {
+        uint64_t lo = (i == 0u) ? 1ull : (uint64_t)(values[2u * i - 1u] >> 31);
+        uint64_t v = lo | ((uint64_t)values[2u * i] << 1) | ((uint64_t)values[2u * i + 1u] << 33);
+        zrow[8u + i] = v;
+        arow[8u + i] = v;
+        brow[8u + i] = ~0ull;
+    }
+
+    // ---- compression state ----
+    uint s[16];
+    for (uint i = 0u; i < 8u; i++) { s[i] = cv[i]; }
+    for (uint i = 0u; i < 8u; i++) { s[8u + i] = witgen_iv[i]; }
+    s[12] = tlo;
+    s[13] = thi;
+    s[14] = blen;
+    s[15] = flags;
+
+    // ---- G-stream writers start at u64 word 18 with one pending bit ----
+    WW wz, wa, wb;
+    wz.pending = (uint64_t)(flags >> 31);
+    wa.pending = (uint64_t)(flags >> 31);
+    wb.pending = 1ull;
+    wz.used = 1u; wa.used = 1u; wb.used = 1u;
+    wz.word = 18u; wa.word = 18u; wb.word = 18u;
+
+    // ---- 7 rounds x 8 Gs (BLAKE3 message schedule) ----
+    // Round 0
+    witgen_g(s, m, 0,4,8,12, 0,1,  wz,zrow, wa,arow, wb,brow);
+    witgen_g(s, m, 1,5,9,13, 2,3,  wz,zrow, wa,arow, wb,brow);
+    witgen_g(s, m, 2,6,10,14, 4,5,  wz,zrow, wa,arow, wb,brow);
+    witgen_g(s, m, 3,7,11,15, 6,7,  wz,zrow, wa,arow, wb,brow);
+    witgen_g(s, m, 0,5,10,15, 8,9,  wz,zrow, wa,arow, wb,brow);
+    witgen_g(s, m, 1,6,11,12, 10,11, wz,zrow, wa,arow, wb,brow);
+    witgen_g(s, m, 2,7,8,13, 12,13, wz,zrow, wa,arow, wb,brow);
+    witgen_g(s, m, 3,4,9,14, 14,15, wz,zrow, wa,arow, wb,brow);
+    // Round 1
+    witgen_g(s, m, 0,4,8,12, 2,6,  wz,zrow, wa,arow, wb,brow);
+    witgen_g(s, m, 1,5,9,13, 3,10, wz,zrow, wa,arow, wb,brow);
+    witgen_g(s, m, 2,6,10,14, 7,0,  wz,zrow, wa,arow, wb,brow);
+    witgen_g(s, m, 3,7,11,15, 4,13, wz,zrow, wa,arow, wb,brow);
+    witgen_g(s, m, 0,5,10,15, 1,11, wz,zrow, wa,arow, wb,brow);
+    witgen_g(s, m, 1,6,11,12, 12,5, wz,zrow, wa,arow, wb,brow);
+    witgen_g(s, m, 2,7,8,13, 9,14,  wz,zrow, wa,arow, wb,brow);
+    witgen_g(s, m, 3,4,9,14, 15,8,  wz,zrow, wa,arow, wb,brow);
+    // Round 2
+    witgen_g(s, m, 0,4,8,12, 3,4,  wz,zrow, wa,arow, wb,brow);
+    witgen_g(s, m, 1,5,9,13, 10,12, wz,zrow, wa,arow, wb,brow);
+    witgen_g(s, m, 2,6,10,14, 13,2, wz,zrow, wa,arow, wb,brow);
+    witgen_g(s, m, 3,7,11,15, 7,14, wz,zrow, wa,arow, wb,brow);
+    witgen_g(s, m, 0,5,10,15, 6,5,  wz,zrow, wa,arow, wb,brow);
+    witgen_g(s, m, 1,6,11,12, 9,0,  wz,zrow, wa,arow, wb,brow);
+    witgen_g(s, m, 2,7,8,13, 11,15, wz,zrow, wa,arow, wb,brow);
+    witgen_g(s, m, 3,4,9,14, 8,1,  wz,zrow, wa,arow, wb,brow);
+    // Round 3
+    witgen_g(s, m, 0,4,8,12, 10,7, wz,zrow, wa,arow, wb,brow);
+    witgen_g(s, m, 1,5,9,13, 12,9, wz,zrow, wa,arow, wb,brow);
+    witgen_g(s, m, 2,6,10,14, 14,3, wz,zrow, wa,arow, wb,brow);
+    witgen_g(s, m, 3,7,11,15, 13,15, wz,zrow, wa,arow, wb,brow);
+    witgen_g(s, m, 0,5,10,15, 4,0,  wz,zrow, wa,arow, wb,brow);
+    witgen_g(s, m, 1,6,11,12, 11,2, wz,zrow, wa,arow, wb,brow);
+    witgen_g(s, m, 2,7,8,13, 5,8,  wz,zrow, wa,arow, wb,brow);
+    witgen_g(s, m, 3,4,9,14, 1,6,  wz,zrow, wa,arow, wb,brow);
+    // Round 4
+    witgen_g(s, m, 0,4,8,12, 12,13, wz,zrow, wa,arow, wb,brow);
+    witgen_g(s, m, 1,5,9,13, 9,11,  wz,zrow, wa,arow, wb,brow);
+    witgen_g(s, m, 2,6,10,14, 15,10, wz,zrow, wa,arow, wb,brow);
+    witgen_g(s, m, 3,7,11,15, 14,8, wz,zrow, wa,arow, wb,brow);
+    witgen_g(s, m, 0,5,10,15, 7,2,  wz,zrow, wa,arow, wb,brow);
+    witgen_g(s, m, 1,6,11,12, 5,3,  wz,zrow, wa,arow, wb,brow);
+    witgen_g(s, m, 2,7,8,13, 0,1,  wz,zrow, wa,arow, wb,brow);
+    witgen_g(s, m, 3,4,9,14, 6,4,  wz,zrow, wa,arow, wb,brow);
+    // Round 5
+    witgen_g(s, m, 0,4,8,12, 9,14,  wz,zrow, wa,arow, wb,brow);
+    witgen_g(s, m, 1,5,9,13, 11,5,  wz,zrow, wa,arow, wb,brow);
+    witgen_g(s, m, 2,6,10,14, 8,12, wz,zrow, wa,arow, wb,brow);
+    witgen_g(s, m, 3,7,11,15, 15,1, wz,zrow, wa,arow, wb,brow);
+    witgen_g(s, m, 0,5,10,15, 13,3, wz,zrow, wa,arow, wb,brow);
+    witgen_g(s, m, 1,6,11,12, 0,10, wz,zrow, wa,arow, wb,brow);
+    witgen_g(s, m, 2,7,8,13, 2,6,  wz,zrow, wa,arow, wb,brow);
+    witgen_g(s, m, 3,4,9,14, 4,7,  wz,zrow, wa,arow, wb,brow);
+    // Round 6
+    witgen_g(s, m, 0,4,8,12, 11,15, wz,zrow, wa,arow, wb,brow);
+    witgen_g(s, m, 1,5,9,13, 5,0,  wz,zrow, wa,arow, wb,brow);
+    witgen_g(s, m, 2,6,10,14, 1,9,  wz,zrow, wa,arow, wb,brow);
+    witgen_g(s, m, 3,7,11,15, 8,6,  wz,zrow, wa,arow, wb,brow);
+    witgen_g(s, m, 0,5,10,15, 14,10, wz,zrow, wa,arow, wb,brow);
+    witgen_g(s, m, 1,6,11,12, 2,12, wz,zrow, wa,arow, wb,brow);
+    witgen_g(s, m, 2,7,8,13, 3,4,  wz,zrow, wa,arow, wb,brow);
+    witgen_g(s, m, 3,4,9,14, 7,13, wz,zrow, wa,arow, wb,brow);
+
+    // ---- OUT_HI: 8 lin words state[w+8] ^ cv[w] (b gets MAX) ----
+    for (uint w = 0u; w < 8u; w++) {
+        uint v = s[w + 8u] ^ cv[w];
+        wpush(wz, zrow, (uint64_t)v, 32u);
+        wpush(wa, arow, (uint64_t)v, 32u);
+        wpush(wb, brow, ~0ull, 32u);
+    }
+
+    // ---- finish: flush pending + zero suffix ----
+    if (wz.used != 0u) { zrow[wz.word] = wz.pending; wz.word += 1u; }
+    for (uint w = wz.word; w < 256u; w++) { zrow[w] = 0ull; }
+    if (wa.used != 0u) { arow[wa.word] = wa.pending; wa.word += 1u; }
+    for (uint w = wa.word; w < 256u; w++) { arow[w] = 0ull; }
+    if (wb.used != 0u) { brow[wb.word] = wb.pending; wb.word += 1u; }
+    for (uint w = wb.word; w < 256u; w++) { brow[w] = 0ull; }
+
+    // ---- out_lo: words 4..8 (z/a only; b stays MAX) ----
+    for (uint i = 0u; i < 4u; i++) {
+        uint64_t v = (uint64_t)(s[2u * i] ^ s[8u + 2u * i])
+                   | ((uint64_t)(s[2u * i + 1u] ^ s[8u + 2u * i + 1u]) << 32);
+        zrow[4u + i] = v;
+        arow[4u + i] = v;
+        brow[4u + i] = ~0ull;
+    }
+}
+"#;
+
+    /// ------------------------------------------------------------------
+    /// Witgen GPU arm (ranked witness z/a/b rows, 3 x 512 MiB).
+    ///
+    /// Kernel = exact transcription of
+    /// `flock_prover::r1cs_hashes::blake3::build_block_witness_ab_stream_into`
+    /// (the scalar reference the aarch64 NEON quad builder bit-matches), one
+    /// thread per block. Input: 28 u32 per block
+    /// [cv0..cv7 | m0..m15 | counter_lo | counter_hi | blen | flags], padded
+    /// slots = all-zero compression. Output: 256 u64 words per block per row
+    /// (K = 16384 bits; 15409 useful), F128-packed exactly as the CPU path
+    /// leaves the scratch buffers.
+    ///
+    /// Latch discipline: the one-time warmup A/B lives in flock-prover's
+    /// generate_impl (incumbent CPU loop first, checksummed; this arm runs
+    /// against the same blocks; bit-exact checksum AND wall-clock x1.10
+    /// admits it). This function only dispatches; every failure path here
+    /// returns false and the CPU path stands.
+    /// ------------------------------------------------------------------
+    const WITGEN_MIN_N: usize = 1 << 18;
+    const WITGEN_PACKED_U32_PER_BLOCK: usize = 28;
+    const WITGEN_ROW_BYTES: usize = 256 * 8;
+
+    struct WitgenGpuState {
+        pso: Id,
+    }
+    // SAFETY: Metal objects are thread-safe; access is serialized by the
+    // process-global latch below (same contract as `Gpu`).
+    unsafe impl Send for WitgenGpuState {}
+    unsafe impl Sync for WitgenGpuState {}
+
+    static WITGEN_GPU_STATE: std::sync::OnceLock<Option<std::sync::Mutex<WitgenGpuState>>> =
+        std::sync::OnceLock::new();
+
+    /// Compile the witgen kernel (own library). Any failure -> None -> the
+    /// arm stays off; the commit kernels are never touched.
+    fn build_witgen_pso(gpu: &Gpu) -> Option<Id> {
+        unsafe {
+            let pool = gpu.pool_push();
+            let r = (|| -> Option<Id> {
+                let src = gpu.api.nsstring(MSL_WITGEN_SOURCE).ok()?;
+                let mut err: Id = NIL;
+                let library: Id = send!(
+                    gpu.api,
+                    unsafe extern "C" fn(Id, Sel, Id, Id, *mut Id) -> Id,
+                    gpu.device,
+                    c"newLibraryWithSource:options:error:",
+                    src,
+                    NIL,
+                    &mut err
+                );
+                if library.is_null() {
+                    eprintln!(
+                        "[gpu-witgen] shader compile failed: {}",
+                        gpu.api.error_string(err)
+                    );
+                    return None;
+                }
+                let ns = gpu.api.nsstring("witgen_quad").ok()?;
+                let f: Id = send!(
+                    gpu.api,
+                    unsafe extern "C" fn(Id, Sel, Id) -> Id,
+                    library,
+                    c"newFunctionWithName:",
+                    ns
+                );
+                if f.is_null() {
+                    send!(
+                        gpu.api,
+                        unsafe extern "C" fn(Id, Sel) -> Id,
+                        library,
+                        c"release"
+                    );
+                    return None;
+                }
+                let mut perr: Id = NIL;
+                let pso: Id = send!(
+                    gpu.api,
+                    unsafe extern "C" fn(Id, Sel, Id, *mut Id) -> Id,
+                    gpu.device,
+                    c"newComputePipelineStateWithFunction:error:",
+                    f,
+                    &mut perr
+                );
+                send!(gpu.api, unsafe extern "C" fn(Id, Sel) -> Id, f, c"release");
+                send!(gpu.api, unsafe extern "C" fn(Id, Sel) -> Id, library, c"release");
+                if pso.is_null() {
+                    eprintln!("[gpu-witgen] pipeline: {}", gpu.api.error_string(perr));
+                    return None;
+                }
+                Some(pso)
+            })();
+            gpu.pool_pop(pool);
+            r
+        }
+    }
+
+    /// Run one witgen pass on the GPU: uploads the packed blocks, dispatches
+    /// one thread per block, reads the three rows back into the caller's
+    /// scratch z/a/b (n_total * 2048 bytes each).
+    fn run_witgen_gpu(
+        gpu: &Gpu,
+        pso: Id,
+        packed: &[u32],
+        n_total: usize,
+        z: *mut u8,
+        a: *mut u8,
+        b: *mut u8,
+    ) -> bool {
+        let in_bytes = n_total * WITGEN_PACKED_U32_PER_BLOCK * 4;
+        let out_bytes = n_total * WITGEN_ROW_BYTES;
+        unsafe {
+            let pool = gpu.pool_push();
+            let r = (|| -> Option<bool> {
+                let in_buf = gpu.new_buffer(in_bytes).ok()?;
+                // Zero-copy output: wrap the caller's page-aligned scratch
+                // z/a/b (the same no-copy wrap the commit stream uses for z),
+                // so the kernel writes the F128 rows directly into the memory
+                // the CPU phases and the commit stream will read. DRAM ledger
+                // is byte-identical to the CPU path; the win is latency.
+                let z_buf = gpu.wrap_buffer(z, out_bytes).ok()?;
+                let a_buf = gpu.wrap_buffer(a, out_bytes).ok()?;
+                let b_buf = gpu.wrap_buffer(b, out_bytes).ok()?;
+                std::ptr::copy_nonoverlapping(
+                    packed.as_ptr().cast::<u8>(),
+                    gpu.buffer_contents(in_buf),
+                    in_bytes,
+                );
+                let cb = gpu.command_buffer().ok()?;
+                let enc = gpu.compute_encoder(cb).ok()?;
+                gpu.set_pipeline(enc, pso);
+                gpu.set_buffer(enc, in_buf, 0, 0);
+                gpu.set_buffer(enc, z_buf, 0, 1);
+                gpu.set_buffer(enc, a_buf, 0, 2);
+                gpu.set_buffer(enc, b_buf, 0, 3);
+                let tpg = 256u64;
+                let groups = ((n_total as u64) + tpg - 1) / tpg;
+                gpu.dispatch(enc, groups, tpg);
+                gpu.end_encoding(enc);
+                gpu.commit_and_wait(cb).ok()?;
+                gpu.release(in_buf);
+                gpu.release(z_buf);
+                gpu.release(a_buf);
+                gpu.release(b_buf);
+                Some(true)
+            })();
+            gpu.pool_pop(pool);
+            r.unwrap_or(false)
+        }
+    }
+
+    /// Dispatch entry for the witgen GPU arm. Shape/env-gated at the outer
+    /// wrapper; this only compiles the kernel once (own library) and runs.
+    pub(crate) fn try_witgen_gpu(
+        packed: &[u32],
+        n_total: usize,
+        z: *mut u8,
+        a: *mut u8,
+        b: *mut u8,
+    ) -> bool {
+        if !super::gpu_witgen_enabled() {
+            return false;
+        }
+        if n_total < WITGEN_MIN_N || !n_total.is_power_of_two() {
+            return false;
+        }
+        if packed.len() != n_total * WITGEN_PACKED_U32_PER_BLOCK {
+            return false;
+        }
+        let Ok(gpu) = gpu() else {
+            return false;
+        };
+        let Some(state) = WITGEN_GPU_STATE.get_or_init(|| {
+            build_witgen_pso(gpu).map(|pso| std::sync::Mutex::new(WitgenGpuState { pso }))
+        }) else {
+            return false;
+        };
+        let st = state.lock().unwrap();
+        run_witgen_gpu(gpu, st.pso, packed, n_total, z, a, b)
+    }
 
     /// Source-only ranked from-z specialization. This deliberately does not
     /// reuse the rejected device-table preload design: every group constructs

@@ -3257,6 +3257,24 @@ fn fold2_and_msgs_lsb(
     wb: &mut Vec<F128>,
 ) -> (SumcheckMessage, [F128; 6]) {
     use rayon::prelude::*;
+    // Sumcheck fold2 GPU arm: ranked-scale rounds only (n >= 2^19), latched
+    // in gpu_commit (one-time bit-exact + wall-clock A/B). The warmup call
+    // returns the verified CPU reference, so the caller never folds twice;
+    // any Metal failure falls through to the CPU fold below.
+    match crate::gpu_commit::try_sumcheck_fold2_gpu(f, b, r_a, r_b) {
+        crate::gpu_commit::Fold2GpuResult::Trusted {
+            wf: wf_v,
+            wb: wb_v,
+            u0,
+            u2,
+            c,
+        } => {
+            *wf = wf_v;
+            *wb = wb_v;
+            return (SumcheckMessage { u_0: u0, u_2: u2 }, c);
+        }
+        crate::gpu_commit::Fold2GpuResult::Cpu => {}
+    }
     let n = f.len();
     debug_assert!(n.is_power_of_two() && n >= 16);
     debug_assert_eq!(b.len(), n);
