@@ -181,20 +181,22 @@ pub(super) unsafe fn butterfly_fused_3layer_rows(
     num_ntts: usize,
     row_start: usize,
     row_end: usize,
+    odd_tail: usize,
     twiddles: &[F128; 7],
 ) {
     #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
     unsafe {
         if vector_resident_rows() {
             aarch64::butterfly_fused_3layer_rows(
-                ptr, eighth, num_ntts, row_start, row_end, twiddles,
+                ptr, eighth, num_ntts, row_start, row_end, odd_tail, twiddles,
             );
             return;
         }
     }
     unsafe {
         for r in row_start..row_end {
-            portable::butterfly_fused_3layer_row(ptr, eighth, num_ntts, num_ntts, r, twiddles);
+            let lanes = if r & 1 == 1 { num_ntts - odd_tail } else { num_ntts };
+            portable::butterfly_fused_3layer_row(ptr, eighth, num_ntts, lanes, r, twiddles);
         }
     }
 }
@@ -356,21 +358,23 @@ pub(super) unsafe fn butterfly_fused_3layer_zero_root_rows(
     num_ntts: usize,
     row_start: usize,
     row_end: usize,
+    odd_tail: usize,
     twiddles: &[F128; 7],
 ) {
     #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
     unsafe {
         if vector_resident_rows() {
             aarch64::butterfly_fused_3layer_zero_root_rows(
-                ptr, eighth, num_ntts, row_start, row_end, twiddles,
+                ptr, eighth, num_ntts, row_start, row_end, odd_tail, twiddles,
             );
             return;
         }
     }
     unsafe {
         for r in row_start..row_end {
+            let lanes = if r & 1 == 1 { num_ntts - odd_tail } else { num_ntts };
             portable::butterfly_fused_3layer_zero_root_row(
-                ptr, eighth, num_ntts, num_ntts, r, twiddles,
+                ptr, eighth, num_ntts, lanes, r, twiddles,
             );
         }
     }

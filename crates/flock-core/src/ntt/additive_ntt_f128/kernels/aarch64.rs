@@ -543,6 +543,7 @@ pub(super) unsafe fn butterfly_fused_3layer_rows(
     num_ntts: usize,
     row_start: usize,
     row_end: usize,
+    odd_tail: usize,
     twiddles: &[F128; 7],
 ) {
     use core::arch::aarch64::*;
@@ -550,7 +551,11 @@ pub(super) unsafe fn butterfly_fused_3layer_rows(
         let t: [uint64x2_t; 7] =
             core::array::from_fn(|i| vld1q_u64((&raw const twiddles[i]).cast::<u64>()));
         for r in row_start..row_end {
-            butterfly_fused_3layer_row_with_q(ptr, eighth, num_ntts, num_ntts, r, &t);
+            // Rows `{i·eighth + r}` share `r`'s parity when `eighth` is even, so
+            // an odd `r` selects eight positions whose top `odd_tail` lanes are
+            // statically zero: every butterfly there is (0,0) -> (0,0).
+            let lanes = if r & 1 == 1 { num_ntts - odd_tail } else { num_ntts };
+            butterfly_fused_3layer_row_with_q(ptr, eighth, num_ntts, lanes, r, &t);
         }
     }
 }
@@ -649,6 +654,7 @@ pub(super) unsafe fn butterfly_fused_3layer_zero_root_rows(
     num_ntts: usize,
     row_start: usize,
     row_end: usize,
+    odd_tail: usize,
     twiddles: &[F128; 7],
 ) {
     use core::arch::aarch64::*;
@@ -661,8 +667,10 @@ pub(super) unsafe fn butterfly_fused_3layer_zero_root_rows(
         let t5 = vld1q_u64((&raw const twiddles[5]).cast::<u64>());
         let t6 = vld1q_u64((&raw const twiddles[6]).cast::<u64>());
         for r in row_start..row_end {
+            // See `butterfly_fused_3layer_rows` for the parity argument.
+            let lanes = if r & 1 == 1 { num_ntts - odd_tail } else { num_ntts };
             butterfly_fused_3layer_zero_root_row_with_q(
-                ptr, eighth, num_ntts, num_ntts, r, t2, t4, t5, t6,
+                ptr, eighth, num_ntts, lanes, r, t2, t4, t5, t6,
             );
         }
     }

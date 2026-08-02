@@ -287,6 +287,22 @@ const ZERO_TAIL_LOG_D: usize = 20;
 static ZERO_ODD_TAIL_LANES: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 
+/// `FLOCK_NO_ZERO_LANE_TOP3=1` restores dense top-layer radix-8 passes.
+///
+/// The layer-wise zero-lane skip is threaded through
+/// `butterfly_interleaved_fused_3layer_par_rows`, but at the ranked geometry
+/// `use_ranked_zero_root_fusion` routes the fused-3 passes to the `all_blocks`
+/// siblings, which never accepted a tail — so layers 1..9 (nine of twenty) ran
+/// dense over provably-zero lanes. Their rows obey the same parity rule: with
+/// `eighth` even, row `r`'s eight positions all share `r`'s parity, so odd rows
+/// carry the static zero tail and every butterfly there is (0,..,0) -> (0,..,0).
+#[inline]
+fn zero_lane_top3_disabled() -> bool {
+    static OFF: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_ZERO_LANE_TOP3").is_some());
+    *OFF
+}
+
 /// `FLOCK_NO_ZERO_LANE_SKIP=1` restores the dense butterfly in the same
 /// binary, so a candidate/control pair differs only in this dispatch.
 #[inline]
@@ -784,7 +800,16 @@ impl AdditiveNttF128 {
             ));
             let twiddles: Vec<[F128; 7]> =
                 (0..num_blocks).map(|b| block_twiddles(layer, b)).collect();
-            butterfly_interleaved_fused_3layer_all_blocks_hetero(data, &twiddles, eighth, num_ntts);
+            // `eighth` is 2^13 / 2^10 at these ranked layers, so the row parity
+            // rule holds and odd rows carry the static zero tail.
+            let top3_tail = if eighth.is_multiple_of(2) && !zero_lane_top3_disabled() {
+                ranked_zero_odd_tail_lanes(log_d, num_ntts)
+            } else {
+                0
+            };
+            butterfly_interleaved_fused_3layer_all_blocks_hetero(
+                data, &twiddles, eighth, num_ntts, top3_tail,
+            );
         }
     }
 
@@ -1208,15 +1233,22 @@ impl AdditiveNttF128 {
                 };
                 if zero_root_fused3 && std::env::var_os("FLOCK_NTT_BLOCK_REGIONS").is_none() {
                     let twiddles: Vec<[F128; 7]> = (0..num_blocks).map(block_twiddles).collect();
+                    // Same parity rule the `par_rows` sibling already applies;
+                    // the `all_blocks` variants simply never took the tail.
+                    let top3_tail = if eighth.is_multiple_of(2) && !zero_lane_top3_disabled() {
+                        ranked_zero_odd_tail_lanes(log_d, num_ntts)
+                    } else {
+                        0
+                    };
                     if is_ranked_top_hetero_fused3_pass(log_d, num_ntts, start_layer, n_top, layer)
                         && std::env::var_os("FLOCK_NO_NTT_TOP_EPOOL").is_none()
                     {
                         butterfly_interleaved_fused_3layer_all_blocks_hetero(
-                            data, &twiddles, eighth, num_ntts,
+                            data, &twiddles, eighth, num_ntts, top3_tail,
                         );
                     } else {
                         butterfly_interleaved_fused_3layer_all_blocks_par_rows(
-                            data, &twiddles, eighth, num_ntts,
+                            data, &twiddles, eighth, num_ntts, top3_tail,
                         );
                     }
                 } else {
@@ -2095,6 +2127,7 @@ fn butterfly_interleaved_fused_3layer_all_blocks_par_rows(
     twiddles: &[[F128; 7]],
     eighth: usize,
     num_ntts: usize,
+    odd_tail: usize,
 ) {
     use rayon::prelude::*;
 
@@ -2106,6 +2139,10 @@ fn butterfly_interleaved_fused_3layer_all_blocks_par_rows(
     debug_assert_eq!(twiddles[0][1], F128::ZERO);
     debug_assert_eq!(twiddles[0][3], F128::ZERO);
 
+    debug_assert!(odd_tail == 0 || eighth.is_multiple_of(2));
+    // Rows `{i·eighth + r}` share `r`'s parity when `eighth` is even, so an odd
+    // `r` selects eight positions whose top `odd_tail` lanes are known zero.
+    let lanes = |r: usize| if r & 1 == 1 { num_ntts - odd_tail } else { num_ntts };
     let base = data.as_mut_ptr() as usize;
     let eighth_log = eighth.trailing_zeros() as usize;
     let eighth_mask = eighth - 1;
@@ -2122,7 +2159,7 @@ fn butterfly_interleaved_fused_3layer_all_blocks_par_rows(
                     block_base,
                     eighth,
                     num_ntts,
-                    num_ntts,
+                    lanes(row),
                     row,
                     &twiddles[block],
                 )
@@ -2131,7 +2168,7 @@ fn butterfly_interleaved_fused_3layer_all_blocks_par_rows(
                     block_base,
                     eighth,
                     num_ntts,
-                    num_ntts,
+                    lanes(row),
                     row,
                     &twiddles[block],
                 )
@@ -2159,6 +2196,7 @@ fn butterfly_interleaved_fused_3layer_all_blocks_hetero(
     twiddles: &[[F128; 7]],
     eighth: usize,
     num_ntts: usize,
+    odd_tail: usize,
 ) {
     let num_blocks = twiddles.len();
     let block_elems = 8 * eighth * num_ntts;
@@ -2185,6 +2223,7 @@ fn butterfly_interleaved_fused_3layer_all_blocks_hetero(
                     num_ntts,
                     row_start,
                     row_end,
+                    odd_tail,
                     &twiddles[block],
                 )
             } else {
@@ -2194,6 +2233,7 @@ fn butterfly_interleaved_fused_3layer_all_blocks_hetero(
                     num_ntts,
                     row_start,
                     row_end,
+                    odd_tail,
                     &twiddles[block],
                 )
             }
@@ -2623,9 +2663,98 @@ mod tests {
 
             let mut got = source;
             butterfly_interleaved_fused_3layer_all_blocks_par_rows(
-                &mut got, &twiddles, eighth, NUM_NTTS,
+                &mut got, &twiddles, eighth, NUM_NTTS, 0,
             );
             assert_eq!(got, expected, "iteration={iteration}");
+        }
+    }
+
+    /// The ranked top-layer `all_blocks` passes must honour the zero-lane tail
+    /// exactly as their `par_rows` sibling does.
+    ///
+    /// `use_ranked_zero_root_fusion` routes layers 1, 4 and 7 to these
+    /// dispatchers, which previously took no tail at all — so nine of the
+    /// twenty layers ran dense over provably-zero lanes.
+    #[test]
+    fn top3_all_blocks_honour_zero_tail() {
+        const TAIL: usize = 7;
+        const NUM_NTTS: usize = 64;
+        let mut rng = Rng::new(0x7093_0F17_A110_0001);
+        for (eighth, num_blocks) in [(2usize, 2usize), (4, 2), (8, 4)] {
+            let block_elems = 8 * eighth * NUM_NTTS;
+            let twiddles: Vec<[F128; 7]> = (0..num_blocks)
+                .map(|b| {
+                    let mut tw = [F128::ZERO; 7];
+                    for (i, t) in tw.iter_mut().enumerate() {
+                        if b == 0 && matches!(i, 0 | 1 | 3) {
+                            continue; // block zero carries the three zero roots
+                        }
+                        *t = F128::new(rng.next_u64(), rng.next_u64());
+                    }
+                    tw
+                })
+                .collect();
+
+            // Structured source: every ODD position has a zero trailing tail.
+            let mut source = rand_vec(&mut rng, num_blocks * block_elems);
+            for pos in 0..(num_blocks * 8 * eighth) {
+                if pos & 1 == 1 {
+                    for lane in (NUM_NTTS - TAIL)..NUM_NTTS {
+                        source[pos * NUM_NTTS + lane] = F128::ZERO;
+                    }
+                }
+            }
+
+            // Oracle: the already-tail-aware per-block sibling.
+            let mut want = source.clone();
+            for (block, tw) in twiddles.iter().enumerate() {
+                let bd = &mut want[block * block_elems..(block + 1) * block_elems];
+                if block == 0 {
+                    butterfly_interleaved_fused_3layer_par_rows::<true>(
+                        bd, tw, eighth, NUM_NTTS, TAIL,
+                    );
+                } else {
+                    butterfly_interleaved_fused_3layer_par_rows::<false>(
+                        bd, tw, eighth, NUM_NTTS, TAIL,
+                    );
+                }
+            }
+
+            for variant in ["par_rows", "hetero"] {
+                let mut got = source.clone();
+                if variant == "par_rows" {
+                    butterfly_interleaved_fused_3layer_all_blocks_par_rows(
+                        &mut got, &twiddles, eighth, NUM_NTTS, TAIL,
+                    );
+                } else {
+                    butterfly_interleaved_fused_3layer_all_blocks_hetero(
+                        &mut got, &twiddles, eighth, NUM_NTTS, TAIL,
+                    );
+                }
+                assert_eq!(got, want, "{variant} mismatch at eighth={eighth}");
+            }
+
+            // Byte-identity: the skip must not change the output at all.
+            let mut dense = source.clone();
+            butterfly_interleaved_fused_3layer_all_blocks_hetero(
+                &mut dense, &twiddles, eighth, NUM_NTTS, 0,
+            );
+            assert_eq!(dense, want, "skip changed output at eighth={eighth}");
+
+            // Negative control: break the zero geometry on one odd-position tail
+            // lane and the skip must become observable, else the equality above
+            // proves nothing.
+            let mut poisoned = source;
+            poisoned[NUM_NTTS + (NUM_NTTS - 1)] = F128::new(1, 0);
+            let mut pd = poisoned.clone();
+            butterfly_interleaved_fused_3layer_all_blocks_hetero(
+                &mut pd, &twiddles, eighth, NUM_NTTS, 0,
+            );
+            let mut ps = poisoned;
+            butterfly_interleaved_fused_3layer_all_blocks_hetero(
+                &mut ps, &twiddles, eighth, NUM_NTTS, TAIL,
+            );
+            assert_ne!(pd, ps, "skip never engaged at eighth={eighth}");
         }
     }
 
@@ -2673,7 +2802,7 @@ mod tests {
 
             let mut got = source;
             butterfly_interleaved_fused_3layer_all_blocks_hetero(
-                &mut got, &twiddles, eighth, NUM_NTTS,
+                &mut got, &twiddles, eighth, NUM_NTTS, 0,
             );
             assert_eq!(
                 got, expected,
