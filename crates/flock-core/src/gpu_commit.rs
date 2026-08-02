@@ -4538,16 +4538,37 @@ kernel void blake3_pow_scan(
         Some(chosen)
     }
 
-    /// Candidate set trimmed from the historical [0,2,3,4,5,6,7,8]: the
-    /// broad set's original justification — one calibration process
-    /// publishing its winner to later workers through the warmup cache — is
-    /// dead on the ranked runner (the verifier wipes the shared scratch
-    /// between trials, so EVERY worker replays this sweep itself), and the
-    /// sweep's own measurements show a flat basin across k=0..5 with the
-    /// upper candidates consistently worse. Three spanning candidates keep
-    /// the per-process contention-exact choice at ~3/8 of the job-wall
-    /// cost, which ~120 fresh workers pay against a hard 10-minute cap.
-    const RANKED_EXACT_TUNE_CANDIDATES: [usize; 3] = [0, 3, 5];
+    /// Candidate set [0,3,4,5], re-widened by one point from the [0,3,5] trim
+    /// (itself cut down from the historical [0,2,3,4,5,6,7,8]).
+    ///
+    /// The trim's justification was job-wall cost, not evidence that the
+    /// dropped candidates lose: ~120 fresh workers each replay this sweep
+    /// against a hard 10-minute cap, because the verifier wipes the shared
+    /// scratch between trials and kills the publish-once-reuse-many design.
+    /// The static warmup latch now returns ~2.5-3 s per worker (~5 min of
+    /// job wall), which buys some resolution back — one extra candidate costs
+    /// two graph runs, ~0.37 s per worker, well inside that budget.
+    ///
+    /// Why k=4 is the point worth buying: the flat-basin reading that
+    /// justified three points was taken on a 5-P-core host, and the ranked
+    /// 10-P-core runner demonstrably separates these candidates — pinning
+    /// k=5 statically cost -9.2% uniformly (`4e2d4e39`), which a genuinely
+    /// flat basin could not produce. k=4 is the default's immediate
+    /// neighbour, so with only [0,3,5] reachable a runner optimum at 4 is
+    /// rounded every single prove. The upper candidates 6/7/8 stay dropped
+    /// (consistently worse, and job wall to re-test), and k=2 stays dropped
+    /// because k=0 is already heavily penalised by the selection rule and
+    /// k=3 brackets it.
+    ///
+    /// Size is load-bearing for reasons beyond search quality: a five-point
+    /// set ([0,2,3,4,5]) tips an LLVM inlining threshold that inflates an
+    /// unrelated `r1cs_hashes::blake3` frame past 2 MiB of thread stack
+    /// (measured: baseline and this four-point set both run clean under a
+    /// 1 MiB thread stack; the five-point set needs 4 MiB). That is codegen
+    /// luck, not a semantic property, and it would not necessarily land the
+    /// same way under the ranked runner's newer toolchain — so keep this set
+    /// at four points and re-measure the stack floor before widening again.
+    const RANKED_EXACT_TUNE_CANDIDATES: [usize; 4] = [0, 3, 4, 5];
 
     /// Two samples per candidate, with the second pass in reverse order so
     /// thermal drift, queue warmup, and A/B replay cache state do not favor
@@ -7489,8 +7510,37 @@ LC_KERNEL(lc_fold_stripes, 4)
         const C: [usize; 3] = [0, 3, 5];
 
         #[test]
-        fn trimmed_candidate_set_is_stable() {
-            assert_eq!(RANKED_EXACT_TUNE_CANDIDATES, C);
+        fn candidate_set_is_stable() {
+            assert_eq!(RANKED_EXACT_TUNE_CANDIDATES, [0, 3, 4, 5]);
+        }
+
+        /// The selection contract must hold on the real (wider) candidate set,
+        /// not just the three-point set the pure-function tests below use.
+        #[test]
+        fn widened_set_reaches_its_interior_candidates() {
+            let c = RANKED_EXACT_TUNE_CANDIDATES;
+            // The point the widening exists to buy: k=4 decisively fastest,
+            // its neighbours far off -> 4 is reachable at all.
+            assert_eq!(
+                choose_hybrid_k(&c, &[200.0, 180.0, 100.0, 150.0], DEFAULT_HYBRID_K),
+                Some(4)
+            );
+            // k=3 fastest, default k=5 far off -> smallest in band still wins.
+            assert_eq!(
+                choose_hybrid_k(&c, &[200.0, 100.0, 130.0, 150.0], DEFAULT_HYBRID_K),
+                Some(3)
+            );
+            // Default still wins near-ties on the wider set (k=4 within 1.5%
+            // of the fastest must not displace the promoted default).
+            assert_eq!(
+                choose_hybrid_k(&c, &[200.0, 100.0, 101.0, 101.0], DEFAULT_HYBRID_K),
+                Some(5)
+            );
+            // k=0 still needs to beat the default by >4% on the wider set.
+            assert_eq!(
+                choose_hybrid_k(&c, &[100.0, 130.0, 130.0, 103.0], DEFAULT_HYBRID_K),
+                Some(5)
+            );
         }
 
         #[test]
@@ -7509,10 +7559,13 @@ LC_KERNEL(lc_fold_stripes, 4)
             .unwrap();
             assert_eq!(
                 *events.borrow(),
-                [-1, 0, -1, 3, -1, 5, -1, 5, -1, 3, -1, 0]
+                [
+                    -1, 0, -1, 3, -1, 4, -1, 5, // forward pass
+                    -1, 5, -1, 4, -1, 3, -1, 0, // reverse pass
+                ]
             );
             assert_eq!(samples[0], [0.0, 0.0]);
-            assert_eq!(samples[2], [5.0, 5.0]);
+            assert_eq!(samples[3], [5.0, 5.0]);
         }
 
         #[test]
