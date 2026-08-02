@@ -882,6 +882,29 @@ fn gpu_blake3_pow_nonce(state_digest: &[u8; 32], bits: u32) -> Result<u64, Strin
         let next_start = start
             .checked_add(u64::from(block_len))
             .ok_or_else(|| "GPU grind nonce range exhausted".to_string())?;
+        // The persistent-worker frontier proved that waiting for this GPU
+        // block before starting the CPU block beats the overlapped schedule
+        // on the ranked carrier. Call the scan directly on the prover thread:
+        // this preserves that serialization without a spawn/channel handoff.
+        // A hit is globally earlier than the next block; on a miss, the CPU
+        // scans that block with no stop flag because the GPU has drained.
+        if grind_direct_dispatch_enabled() {
+            if let Some(nonce) =
+                crate::gpu_commit::gpu_blake3_pow_scan(state_digest, start, block_len, bits)?
+            {
+                return Ok(nonce);
+            }
+            if let Some(nonce) =
+                cpu_blake3_pow_window(state_digest, next_start, block_len, bits)
+            {
+                return Ok(nonce);
+            }
+            start = next_start
+                .checked_add(u64::from(block_len))
+                .ok_or_else(|| "GPU grind nonce range exhausted".to_string())?;
+            continue;
+        }
+
         // The prefetch result is consumed only when the GPU block misses, so
         // the GPU thread flags a hit as soon as its spin returns and the CPU
         // window bails between chunks instead of draining a scan whose result
@@ -954,6 +977,12 @@ fn gpu_blake3_pow_nonce(state_digest: &[u8; 32], bits: u32) -> Result<u64, Strin
 fn grind_hybrid_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("FLOCK_NO_GRIND_HYBRID").is_none())
+}
+
+/// Restore the promoted carrier's persistent-worker path exactly for A/B.
+fn grind_direct_dispatch_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("FLOCK_NO_GRIND_DIRECT_DISPATCH").is_none())
 }
 
 /// `FLOCK_NO_GRIND_HYBRID_ABORT` keeps the prefetch window draining to
