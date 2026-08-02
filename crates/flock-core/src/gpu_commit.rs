@@ -663,6 +663,7 @@ fn wait_for_precompute_branch_wall_ms() -> f64 {
 }
 
 /// Returns true when the GPU commit machinery is allowed to initialize.
+#[inline(always)]
 pub(crate) fn gpu_commit_enabled() -> bool {
     // A/B-CONTROL: set to `false` to build an exact GPU-off control binary
     // (the benchmark harness env-clears workers, so the env kill switch
