@@ -718,7 +718,11 @@ fn prove_packed_padded_inner<C: Challenger>(
         );
     }
 
-    let r_rest: Vec<F128> = r[k_skip..].to_vec();
+    // Move the already-owned challenge vector into the claim instead of
+    // allocating and copying its tail.
+    r.copy_within(k_skip.., 0);
+    r.truncate(r.len() - k_skip);
+    let r_rest = r;
 
     let proof = ZerocheckProof {
         round1_ab,
