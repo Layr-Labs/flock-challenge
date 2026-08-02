@@ -7831,24 +7831,43 @@ kernel void zc_r2_products(
     /// through fused chunks — the same measured mistake the balanced
     /// lincheck split corrected at 32/64.
     ///
-    /// Ratios in `(2, 8)`: the probe's equality oracle has already proven
-    /// the kernel exact on this machine, so a slow-looking GPU gets a floor
-    /// share of `hi/8` instead of 0 — the GPU only becomes the straggler at
-    /// that share above ratio ≈ 7.5, so this is safe even when the warmup
-    /// replay budget stopped before the Metal clock finished ramping (the
-    /// suspected cause of admission failing on a majority of ranked worker
-    /// processes while every admitted process posts record p10s). Ratio ≥ 8
-    /// or unusable ⇒ 0 = exact incumbent.
+    /// Ratios above 1.5 default to the all-CPU path. The former `hi/8` floor
+    /// looked safe in the isolated per-chunk model but loses when command
+    /// drain and the anchors-only CPU work contend in the complete proof.
+    /// `FLOCK_ZC_R2_LEGACY_SLOW_FLOOR=1` restores that exact floor for a
+    /// same-binary causal control, including the incumbent 2.0 balance gate.
+    /// Ratio >= 8 remains off in both policies.
     const ZC_R2_ALPHA: f64 = 0.55;
-    const ZC_R2_MAX_RATIO: f64 = 2.0;
+    const ZC_R2_MAX_RATIO: f64 = 1.5;
+    const ZC_R2_LEGACY_MAX_RATIO: f64 = 2.0;
     const ZC_R2_FLOOR_MAX_RATIO: f64 = 8.0;
 
+    fn zc_r2_legacy_slow_floor_enabled() -> bool {
+        static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+            std::env::var_os("FLOCK_ZC_R2_LEGACY_SLOW_FLOOR").is_some()
+        });
+        *ON
+    }
+
     pub(crate) fn zc_r2_gate_share(ratio: f64, hi_size: usize) -> usize {
+        zc_r2_gate_share_policy(ratio, hi_size, zc_r2_legacy_slow_floor_enabled())
+    }
+
+    pub(crate) fn zc_r2_gate_share_policy(
+        ratio: f64,
+        hi_size: usize,
+        legacy_slow_floor: bool,
+    ) -> usize {
         if !ratio.is_finite() || ratio <= 0.0 {
             return 0;
         }
-        if ratio > ZC_R2_MAX_RATIO {
-            if ratio < ZC_R2_FLOOR_MAX_RATIO {
+        let max_ratio = if legacy_slow_floor {
+            ZC_R2_LEGACY_MAX_RATIO
+        } else {
+            ZC_R2_MAX_RATIO
+        };
+        if ratio > max_ratio {
+            if legacy_slow_floor && ratio < ZC_R2_FLOOR_MAX_RATIO {
                 return hi_size / 8;
             }
             return 0;
@@ -8288,8 +8307,9 @@ kernel void zc_r2_products(
                     );
                     eprintln!(
                         "[zc-r2] gate u_gpu={u_gpu:.4}ms/chunk u_cpu={u_cpu:.4}ms/chunk \
-                         ratio={:.3} -> share {g}/{hi_size}",
+                         ratio={:.3} legacy_slow_floor={} -> share {g}/{hi_size}",
                         u_gpu / u_cpu,
+                        zc_r2_legacy_slow_floor_enabled(),
                     );
                 }
                 g
@@ -8421,6 +8441,20 @@ pub(crate) use imp::{gpu_merkle_tree_blake3, gpu_ntt_interleaved_from_layer};
 mod tests {
     use super::*;
     use crate::field::F128;
+
+    #[test]
+    fn zc_r2_slow_gpu_defaults_off_with_legacy_floor_control() {
+        const H: usize = 2048;
+        assert_eq!(imp::zc_r2_gate_share_policy(1.51, H, false), 0);
+        assert_eq!(imp::zc_r2_gate_share_policy(1.50, H, false), 1050);
+        assert_eq!(imp::zc_r2_gate_share_policy(1.51, H, true), 1045);
+        assert_eq!(imp::zc_r2_gate_share_policy(2.01, H, false), 0);
+        assert_eq!(imp::zc_r2_gate_share_policy(7.99, H, false), 0);
+        assert_eq!(imp::zc_r2_gate_share_policy(2.01, H, true), 256);
+        assert_eq!(imp::zc_r2_gate_share_policy(7.99, H, true), 256);
+        assert_eq!(imp::zc_r2_gate_share_policy(8.0, H, true), 0);
+        assert_eq!(imp::zc_r2_gate_share_policy(2.0, H, true), 836);
+    }
 
     /// GPU idle-decay probe at ranked size: full commit graph wall
     /// back-to-back vs after idle gaps. Ignored; run with --ignored --nocapture.
