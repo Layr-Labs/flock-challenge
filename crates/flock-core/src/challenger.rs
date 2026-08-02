@@ -62,6 +62,12 @@ pub trait Challenger: Send {
         (0..n).map(|_| self.sample_f128()).collect()
     }
 
+    /// Arm an implementation-only accelerator for the exact ranked BLAKE3
+    /// proof geometry. The default is intentionally a no-op: only the ranked
+    /// BLAKE3 setup knows enough geometry to opt a challenger in, and only an
+    /// eligible [`FsChallenger`] may honor that request.
+    fn set_ranked_gpu_pow(&mut self, _enabled: bool) {}
+
     /// Prover-side PoW grinding: snapshot the current transcript state,
     /// search for a `u64` nonce such that `H(state ‖ nonce)` has at
     /// least `bits` leading zero bits, then absorb the nonce into the
@@ -207,6 +213,13 @@ enum FsState {
 #[derive(Clone)]
 pub struct FsChallenger {
     state: FsState,
+    /// Construction-time half of the optional Metal PoW gate. Domain/hash
+    /// eligibility alone is insufficient: the exact ranked BLAKE3 setup must
+    /// separately arm `ranked_gpu_pow` before proving.
+    gpu_pow_domain_eligible: bool,
+    /// Exact ranked-geometry arm. This starts false so arbitrary proof benches
+    /// sharing the benchmark domain retain the incumbent CPU path.
+    ranked_gpu_pow: bool,
     /// Running total of absorbed transcript bytes, for the `hash-count`
     /// instrumentation (read only under that feature).
     #[allow(dead_code)]
@@ -236,6 +249,8 @@ impl FsChallenger {
                 HashKind::Sha256 => FsState::Sha256(Sha256::new()),
                 HashKind::Blake3 => FsState::Blake3(Box::new(blake3::Hasher::new())),
             },
+            gpu_pow_domain_eligible: kind == HashKind::Blake3 && domain == b"flock-bench-v0",
+            ranked_gpu_pow: false,
             n_absorbed: 0,
         };
         c.absorb(&[OP_DOMAIN]);
@@ -321,6 +336,10 @@ impl FsChallenger {
 }
 
 impl Challenger for FsChallenger {
+    fn set_ranked_gpu_pow(&mut self, enabled: bool) {
+        self.ranked_gpu_pow = enabled && self.gpu_pow_domain_eligible;
+    }
+
     fn observe_label(&mut self, label: &[u8]) {
         self.absorb(&[OP_LABEL]);
         self.absorb(&(label.len() as u64).to_le_bytes());
@@ -513,14 +532,15 @@ impl Challenger for FsChallenger {
             }
             }
         };
-        let nonce = if kind == HashKind::Blake3
+        let nonce = if self.ranked_gpu_pow
+            && kind == HashKind::Blake3
             && bits >= GPU_GRIND_MIN_BITS
             && !GPU_GRIND_FAILED.load(std::sync::atomic::Ordering::Relaxed)
         {
             match GPU_GRIND_LATCH.get().copied() {
-                Some(true) => match gpu_blake3_pow_nonce(&state_digest, bits) {
-                    Ok(nonce) => nonce,
-                    Err(_) => {
+                Some(true) => match crate::gpu_commit::ranked_pow_smallest(&state_digest, bits) {
+                    Some(nonce) => nonce,
+                    None => {
                         GPU_GRIND_FAILED.store(true, std::sync::atomic::Ordering::Relaxed);
                         cpu_scan()
                     }
@@ -564,9 +584,9 @@ impl Challenger for FsChallenger {
                         && protected_gain >= GPU_GRIND_MIN_TWO_SAMPLE_GAIN;
                     let _ = GPU_GRIND_LATCH.set(enable);
                     if enable {
-                        match gpu_blake3_pow_nonce(&state_digest, bits) {
-                            Ok(nonce) => nonce,
-                            Err(_) => {
+                        match crate::gpu_commit::ranked_pow_smallest(&state_digest, bits) {
+                            Some(nonce) => nonce,
+                            None => {
                                 GPU_GRIND_FAILED
                                     .store(true, std::sync::atomic::Ordering::Relaxed);
                                 cpu_scan()
@@ -721,27 +741,6 @@ fn gpu_grind_calibration(state_digest: &[u8; 32]) -> Result<Vec<Option<u64>>, St
             result
         })
         .collect()
-}
-
-/// Metal scans fixed ascending blocks and reports the smallest match in each
-/// block.  Visiting blocks in order therefore returns the same global minimum
-/// as the CPU scan.  One expected-work block balances GPU over-scan against
-/// recurring command-buffer latency; failure is propagated to the caller's
-/// exact CPU fallback.
-fn gpu_blake3_pow_nonce(state_digest: &[u8; 32], bits: u32) -> Result<u64, String> {
-    debug_assert!((GPU_GRIND_MIN_BITS..=32).contains(&bits));
-    let block_len = 1u32 << bits.min(24);
-    let mut start = 0u64;
-    loop {
-        if let Some(nonce) =
-            crate::gpu_commit::gpu_blake3_pow_scan(state_digest, start, block_len, bits)?
-        {
-            return Ok(nonce);
-        }
-        start = start
-            .checked_add(u64::from(block_len))
-            .ok_or_else(|| "GPU grind nonce range exhausted".to_string())?;
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -944,6 +943,53 @@ mod tests {
     /// the tagging, absorption order and duplex structure are shared, and
     /// only the primitive differs.
     const KINDS: [HashKind; 2] = [HashKind::Sha256, HashKind::Blake3];
+
+    #[test]
+    fn ranked_gpu_pow_requires_exact_domain_and_explicit_geometry_arm() {
+        let mut ranked = FsChallenger::with_hash(b"flock-bench-v0", HashKind::Blake3);
+        assert!(ranked.gpu_pow_domain_eligible);
+        assert!(
+            !ranked.ranked_gpu_pow,
+            "domain alone must not arm arbitrary benches"
+        );
+        ranked.set_ranked_gpu_pow(true);
+        assert!(ranked.ranked_gpu_pow);
+        assert!(ranked.clone().ranked_gpu_pow);
+        ranked.set_ranked_gpu_pow(false);
+        assert!(!ranked.ranked_gpu_pow);
+
+        let mut wrong_hash = FsChallenger::with_hash(b"flock-bench-v0", HashKind::Sha256);
+        wrong_hash.set_ranked_gpu_pow(true);
+        assert!(!wrong_hash.gpu_pow_domain_eligible);
+        assert!(!wrong_hash.ranked_gpu_pow);
+        for domain in [
+            b"flock-bench-v".as_slice(),
+            b"flock-bench-v00".as_slice(),
+            b"pow-test".as_slice(),
+            b"".as_slice(),
+        ] {
+            let mut challenger = FsChallenger::with_hash(domain, HashKind::Blake3);
+            challenger.set_ranked_gpu_pow(true);
+            assert!(!challenger.gpu_pow_domain_eligible);
+            assert!(!challenger.ranked_gpu_pow);
+        }
+    }
+
+    #[test]
+    #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+    fn unavailable_ranked_gpu_pow_falls_back_to_identical_cpu_transcript() {
+        let mut candidate = FsChallenger::with_hash(b"flock-bench-v0", HashKind::Blake3);
+        candidate.set_ranked_gpu_pow(true);
+        candidate.observe_label(b"ranked-pow-fallback");
+        candidate.observe_bytes(b"same transcript state");
+        let mut control = candidate.clone();
+        control.ranked_gpu_pow = false;
+
+        let candidate_nonce = candidate.grind_pow(14);
+        let control_nonce = control.grind_pow(14);
+        assert_eq!(candidate_nonce, control_nonce);
+        assert_eq!(candidate.sample_f128_vec(4), control.sample_f128_vec(4));
+    }
 
     /// The two-pool early-exit grind must emit exactly the smallest
     /// satisfying nonce — proof bytes depend on it. The oracle is the

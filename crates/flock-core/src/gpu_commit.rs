@@ -50,6 +50,21 @@ pub const ENV_GPU_COMMIT_FORCE: &str = "FLOCK_GPU_COMMIT_FORCE";
 /// processes per run).
 pub const ENV_NO_GPU_METALLIB: &str = "FLOCK_NO_GPU_METALLIB";
 
+/// Exact-`1` kill switch for the ranked BLAKE3 proof-of-work Metal search.
+/// Any other value leaves the candidate enabled; every initialization,
+/// dispatch, validation, or completion failure restarts the incumbent CPU
+/// search from nonce zero.
+pub const ENV_NO_GPU_POW: &str = "FLOCK_NO_GPU_POW";
+
+fn gpu_pow_value_enabled(value: Option<&std::ffi::OsStr>) -> bool {
+    value != Some(std::ffi::OsStr::new("1"))
+}
+
+fn gpu_pow_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| gpu_pow_value_enabled(std::env::var_os(ENV_NO_GPU_POW).as_deref()))
+}
+
 pub(crate) fn gpu_metallib_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os(ENV_NO_GPU_METALLIB).is_none())
@@ -340,6 +355,268 @@ pub(crate) fn gpu_mixed_final_enabled() -> bool {
 /// Wall-clock margin the GPU must beat during the warmup dual-run: latch on
 /// only when `gpu_wall * 1.10 <= cpu_wall`.
 const LATCH_MARGIN: f64 = 1.10;
+
+// ---------------------------------------------------------------------------
+// Ranked GPU proof-of-work contract.
+// ---------------------------------------------------------------------------
+
+// One claim keeps four hashes per thread at the fixed 256-thread geometry.
+// This is large enough to amortize the atomic claim and barrier, while letting
+// the host keep each in-flight wave below the expected first-hit distance for
+// every admitted 14..=19-bit ranked grind.
+const GPU_POW_CHUNK_NONCES: u64 = 1024;
+
+/// Seven BLAKE3 message schedules, expressed once and consumed by both the
+/// portable scalar oracle and the generated Metal source. Keeping one table
+/// eliminates the previous independent shader permutation implementation.
+const GPU_POW_MESSAGE_SCHEDULE: [[u8; 16]; 7] = [
+    [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15],
+    [2, 6, 3, 10, 7, 0, 4, 13, 1, 11, 12, 5, 9, 14, 15, 8],
+    [3, 4, 10, 12, 13, 2, 7, 14, 6, 5, 9, 0, 11, 15, 8, 1],
+    [10, 7, 12, 9, 14, 3, 13, 15, 4, 0, 11, 2, 5, 8, 1, 6],
+    [12, 13, 9, 11, 15, 10, 14, 8, 7, 2, 5, 3, 0, 1, 6, 4],
+    [9, 14, 11, 5, 8, 12, 15, 1, 13, 3, 0, 10, 2, 6, 4, 7],
+    [11, 15, 5, 0, 1, 9, 8, 6, 14, 10, 2, 12, 3, 4, 7, 13],
+];
+
+fn gpu_pow_block_len(bits: u32) -> Option<u64> {
+    (1..=32).contains(&bits).then(|| 1u64 << (bits.min(24) + 1))
+}
+
+/// Length of the next retry block without wrapping the `u64` nonce space.
+fn gpu_pow_block_span(start: u64, bits: u32) -> Option<u64> {
+    let block = gpu_pow_block_len(bits)?;
+    let remaining_after_start = u64::MAX - start;
+    Some(if remaining_after_start >= block - 1 {
+        block
+    } else {
+        remaining_after_start + 1
+    })
+}
+
+/// Number of persistent threadgroups used by one ranked dispatch. Their first
+/// claims cover at most half the expected first-hit distance; later claims are
+/// issued dynamically by the same groups.
+fn gpu_pow_threadgroups(bits: u32, n_chunks: u64) -> Option<u64> {
+    let expected = 1u64.checked_shl(bits)?;
+    let expected_half = (expected / 2).max(1);
+    Some(
+        expected_half
+            .div_ceil(GPU_POW_CHUNK_NONCES)
+            .min(n_chunks)
+            .min(64)
+            .max(1),
+    )
+}
+
+/// Search the exact ranked BLAKE3 PoW space on Metal. `None` is deliberately
+/// indistinguishable from an unavailable accelerator: the challenger then
+/// executes the original CPU search from nonce zero before absorbing anything.
+pub(crate) fn ranked_pow_smallest(state_digest: &[u8; 32], bits: u32) -> Option<u64> {
+    if !gpu_pow_enabled() || !(14..=19).contains(&bits) {
+        return None;
+    }
+    imp::ranked_pow_smallest(state_digest, bits)
+}
+
+/// Serialize one optional accelerator attempt behind a permanent fail-closed
+/// latch. The second latch read is required: a waiter may pass the optimistic
+/// read, block behind a failing owner, and acquire only after that owner has
+/// disabled the resource. Failure is published while the mutex is still held.
+#[cfg(any(test, all(target_os = "macos", target_arch = "aarch64")))]
+fn gpu_pow_run_fail_closed<T, E>(
+    failed: &std::sync::atomic::AtomicBool,
+    in_use: &std::sync::Mutex<()>,
+    after_fast_check: impl FnOnce(),
+    run: impl FnOnce() -> Result<T, E>,
+) -> Option<T> {
+    use std::sync::atomic::Ordering;
+
+    if failed.load(Ordering::Acquire) {
+        return None;
+    }
+    // Production passes an empty closure. Tests use this exact point to park
+    // a waiter after its optimistic read and make the failure race deterministic.
+    after_fast_check();
+    let guard = match in_use.lock() {
+        Ok(guard) => guard,
+        Err(_) => {
+            failed.store(true, Ordering::Release);
+            return None;
+        }
+    };
+    if failed.load(Ordering::Acquire) {
+        drop(guard);
+        return None;
+    }
+    let result = match run() {
+        Ok(value) => Some(value),
+        Err(_) => {
+            failed.store(true, Ordering::Release);
+            None
+        }
+    };
+    drop(guard);
+    result
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct GpuPowChunk {
+    start: u64,
+    len: u64,
+}
+
+#[cfg(test)]
+fn gpu_pow_chunk(block_start: u64, block_span: u64, chunk_index: u64) -> Option<GpuPowChunk> {
+    let offset = chunk_index.checked_mul(GPU_POW_CHUNK_NONCES)?;
+    if offset >= block_span {
+        return None;
+    }
+    Some(GpuPowChunk {
+        start: block_start.checked_add(offset)?,
+        len: GPU_POW_CHUNK_NONCES.min(block_span - offset),
+    })
+}
+
+/// Portable model of the kernel's atomic-min publication. `claim_order` may
+/// be any completion order, but must cover every block chunk exactly once.
+#[cfg(test)]
+fn gpu_pow_model_block_min(
+    block_start: u64,
+    block_span: u64,
+    claim_order: &[u64],
+    matches: &[u64],
+) -> Option<u64> {
+    let n_chunks = block_span.div_ceil(GPU_POW_CHUNK_NONCES);
+    if claim_order.len() != n_chunks as usize {
+        return None;
+    }
+    let mut seen = vec![false; n_chunks as usize];
+    let mut best = None;
+    for &chunk_index in claim_order {
+        let slot = seen.get_mut(chunk_index as usize)?;
+        if *slot {
+            return None;
+        }
+        *slot = true;
+        let chunk = gpu_pow_chunk(block_start, block_span, chunk_index)?;
+        let end = chunk.start.checked_add(chunk.len);
+        let in_chunk = matches.iter().copied().filter(|&nonce| {
+            nonce >= chunk.start
+                && match end {
+                    Some(end) => nonce < end,
+                    None => true,
+                }
+        });
+        if let Some(found) = in_chunk.min() {
+            best = Some(best.map_or(found, |old: u64| old.min(found)));
+        }
+    }
+    seen.into_iter().all(|done| done).then_some(best).flatten()
+}
+
+/// Portable host-retry model. It is match-list based so randomized tests can
+/// cover bits 1..=32 and carry/exhaustion edges without hashing billions of
+/// nonces.
+#[cfg(test)]
+fn gpu_pow_model_retry(
+    mut start: u64,
+    bits: u32,
+    matches: &[u64],
+    max_blocks: usize,
+) -> Option<(u64, usize)> {
+    for retry in 0..max_blocks {
+        let span = gpu_pow_block_span(start, bits)?;
+        let n_chunks = span.div_ceil(GPU_POW_CHUNK_NONCES);
+        let order: Vec<u64> = (0..n_chunks).rev().collect();
+        if let Some(best) = gpu_pow_model_block_min(start, span, &order, matches) {
+            return Some((best, retry));
+        }
+        start = start.checked_add(span)?;
+    }
+    None
+}
+
+#[cfg(test)]
+fn gpu_pow_has_leading_zero_bits(hash: &[u8; 32], bits: u32) -> bool {
+    if bits > 256 {
+        return false;
+    }
+    let full_bytes = (bits / 8) as usize;
+    let extra = bits % 8;
+    hash[..full_bytes].iter().all(|&byte| byte == 0)
+        && (extra == 0 || hash[full_bytes] >> (8 - extra) == 0)
+}
+
+/// Scalar transcription of the production MSL's one-block BLAKE3 root hash.
+/// Portable tests hold this to `blake3::hash(state || nonce_le || zero[24])`.
+#[cfg(test)]
+fn gpu_pow_blake3_root(state_digest: &[u8; 32], nonce: u64) -> [u8; 32] {
+    const IV: [u32; 8] = [
+        0x6A09_E667,
+        0xBB67_AE85,
+        0x3C6E_F372,
+        0xA54F_F53A,
+        0x510E_527F,
+        0x9B05_688C,
+        0x1F83_D9AB,
+        0x5BE0_CD19,
+    ];
+    #[inline]
+    fn g(v: &mut [u32; 16], a: usize, b: usize, c: usize, d: usize, x: u32, y: u32) {
+        v[a] = v[a].wrapping_add(v[b]).wrapping_add(x);
+        v[d] = (v[d] ^ v[a]).rotate_right(16);
+        v[c] = v[c].wrapping_add(v[d]);
+        v[b] = (v[b] ^ v[c]).rotate_right(12);
+        v[a] = v[a].wrapping_add(v[b]).wrapping_add(y);
+        v[d] = (v[d] ^ v[a]).rotate_right(8);
+        v[c] = v[c].wrapping_add(v[d]);
+        v[b] = (v[b] ^ v[c]).rotate_right(7);
+    }
+
+    #[inline]
+    fn round(v: &mut [u32; 16], m: &[u32; 16]) {
+        g(v, 0, 4, 8, 12, m[0], m[1]);
+        g(v, 1, 5, 9, 13, m[2], m[3]);
+        g(v, 2, 6, 10, 14, m[4], m[5]);
+        g(v, 3, 7, 11, 15, m[6], m[7]);
+        g(v, 0, 5, 10, 15, m[8], m[9]);
+        g(v, 1, 6, 11, 12, m[10], m[11]);
+        g(v, 2, 7, 8, 13, m[12], m[13]);
+        g(v, 3, 4, 9, 14, m[14], m[15]);
+    }
+
+    let message = {
+        let mut words = [0u32; 16];
+        for (word, bytes) in words[..8]
+            .iter_mut()
+            .zip(state_digest.chunks_exact(4))
+        {
+            *word = u32::from_le_bytes(bytes.try_into().unwrap());
+        }
+        words[8] = nonce as u32;
+        words[9] = (nonce >> 32) as u32;
+        words
+    };
+
+    let mut state = [0u32; 16];
+    state[..8].copy_from_slice(&IV);
+    state[8..12].copy_from_slice(&IV[..4]);
+    state[14] = 64;
+    state[15] = 1 | 2 | 8; // CHUNK_START | CHUNK_END | ROOT
+
+    for schedule in GPU_POW_MESSAGE_SCHEDULE {
+        let scheduled = core::array::from_fn(|index| message[schedule[index] as usize]);
+        round(&mut state, &scheduled);
+    }
+
+    let mut out = [0u8; 32];
+    for i in 0..8 {
+        out[4 * i..4 * i + 4].copy_from_slice(&(state[i] ^ state[i + 8]).to_le_bytes());
+    }
+    out
+}
 
 /// The exact ranked L0 geometry the GPU graph is built for (mirrors the CPU
 /// pipeline's `is_ranked_ntt_merkle_leaf_pipeline_shape`): `log_d = 20`,
@@ -1979,6 +2256,189 @@ kernel void blake3_pow_scan(
 }
 "#;
 
+    /// Optional ranked PoW source prefix. The seven rounds are emitted from
+    /// `GPU_POW_MESSAGE_SCHEDULE`, the same certificate used by the portable
+    /// BLAKE3 oracle, so shader and host cannot drift independently.
+    const GPU_POW_MSL_PREFIX: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+struct PowParams {
+    ulong start;
+    ulong span;
+    uint bits;
+    uint chunk_nonces;
+};
+
+inline uint load32_le(device const uchar *p) {
+    return uint(p[0]) | (uint(p[1]) << 8) | (uint(p[2]) << 16) | (uint(p[3]) << 24);
+}
+
+inline uint rotr32(uint x, uint n) {
+    return (x >> n) | (x << (32 - n));
+}
+
+inline void pow_g(
+    thread uint *v,
+    uint a,
+    uint b,
+    uint c,
+    uint d,
+    uint x,
+    uint y
+) {
+    v[a] = v[a] + v[b] + x;
+    v[d] = rotr32(v[d] ^ v[a], 16);
+    v[c] = v[c] + v[d];
+    v[b] = rotr32(v[b] ^ v[c], 12);
+    v[a] = v[a] + v[b] + y;
+    v[d] = rotr32(v[d] ^ v[a], 8);
+    v[c] = v[c] + v[d];
+    v[b] = rotr32(v[b] ^ v[c], 7);
+}
+
+inline uint blake3_pow_word0(thread const uint *message, ulong nonce) {
+    constexpr uint IV[8] = {
+        0x6A09E667u, 0xBB67AE85u, 0x3C6EF372u, 0xA54FF53Au,
+        0x510E527Fu, 0x9B05688Cu, 0x1F83D9ABu, 0x5BE0CD19u
+    };
+    uint v[16] = {
+        IV[0], IV[1], IV[2], IV[3], IV[4], IV[5], IV[6], IV[7],
+        IV[0], IV[1], IV[2], IV[3], 0, 0, 64, 11
+    };
+"#;
+
+    const GPU_POW_MSL_SUFFIX: &str = r#"
+    return v[0] ^ v[8];
+}
+
+// Ranked use is restricted to 14..19 bits, so the predicate consumes exactly
+// the first little-endian output word while matching the byte-oriented CPU
+// definition for byte-aligned and partial-byte thresholds.
+inline bool pow_has_leading_zero_bits(uint word, uint bits) {
+    // Production admits only bits 14..19. Construct the exact byte-oriented
+    // mask directly instead of looping over the first four output bytes.
+    uint full_bytes = bits >> 3;
+    uint extra = bits & 7;
+    uint mask = (1u << (8u * full_bytes)) - 1u;
+    if (extra != 0) {
+        uint partial = ((0xFFu << (8u - extra)) & 0xFFu)
+            << (8u * full_bytes);
+        mask |= partial;
+    }
+    return (word & mask) == 0;
+}
+
+// state[0] = next dynamically claimed chunk; state[1] = best offset in this
+// host-bounded block; state[2] = found flag. Offsets are at most 2^25, so
+// 32-bit device atomics cover the complete u64 nonce space without requiring
+// target-specific 64-bit atomics. Command completion joins every earlier
+// claim before the host trusts the global minimum.
+kernel void ranked_pow_scan(
+    device const uchar *digest [[buffer(0)]],
+    constant PowParams &params [[buffer(1)]],
+    device atomic_uint *state [[buffer(2)]],
+    uint tid [[thread_index_in_threadgroup]]
+) {
+    constexpr uint THREADS = 256u;
+    constexpr uint NO_MATCH = ~uint(0);
+    threadgroup uint claimed_chunk;
+    threadgroup uint stop;
+
+    // The transcript digest is invariant across every nonce and dynamically
+    // claimed chunk in this dispatch. Load it once per thread instead of eight
+    // device reads inside every hash attempt.
+    uint message[8] = {
+        load32_le(digest + 0), load32_le(digest + 4),
+        load32_le(digest + 8), load32_le(digest + 12),
+        load32_le(digest + 16), load32_le(digest + 20),
+        load32_le(digest + 24), load32_le(digest + 28)
+    };
+
+    uint n_chunks = uint((params.span + ulong(params.chunk_nonces) - 1)
+        / ulong(params.chunk_nonces));
+    for (;;) {
+        if (tid == 0) {
+            claimed_chunk = atomic_fetch_add_explicit(&state[0], 1u, memory_order_relaxed);
+            uint offset = claimed_chunk * params.chunk_nonces;
+            uint best = atomic_load_explicit(&state[1], memory_order_relaxed);
+            uint found = atomic_load_explicit(&state[2], memory_order_relaxed);
+            stop = claimed_chunk >= n_chunks || (found != 0 && offset >= best);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (stop != 0) break;
+
+        uint offset = claimed_chunk * params.chunk_nonces;
+        uint chunk_len = min(params.chunk_nonces, uint(params.span - ulong(offset)));
+        uint local_best = NO_MATCH;
+        bool local_found = false;
+        for (uint lane_offset = tid; lane_offset < chunk_len; lane_offset += THREADS) {
+            uint candidate_offset = offset + lane_offset;
+            ulong nonce = params.start + ulong(candidate_offset);
+            uint word0 = blake3_pow_word0(message, nonce);
+            if (pow_has_leading_zero_bits(word0, params.bits)) {
+                local_best = min(local_best, candidate_offset);
+                local_found = true;
+            }
+        }
+        if (local_found) {
+            atomic_fetch_min_explicit(&state[1], local_best, memory_order_relaxed);
+            atomic_store_explicit(&state[2], 1u, memory_order_relaxed);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+}
+"#;
+
+    fn gpu_pow_message_token(index: u8) -> String {
+        match index {
+            0..=7 => format!("message[{index}u]"),
+            8 => "uint(nonce)".into(),
+            9 => "uint(nonce >> 32)".into(),
+            10..=15 => "0u".into(),
+            _ => unreachable!("BLAKE3 message schedule index"),
+        }
+    }
+
+    /// Generate the specialized shader once per worker. The source contains
+    /// exactly 56 direct BLAKE3 G calls and no per-hash permutation array.
+    pub(super) fn gpu_pow_msl_source() -> &'static str {
+        use std::fmt::Write as _;
+
+        const G_LANES: [[u8; 4]; 8] = [
+            [0, 4, 8, 12],
+            [1, 5, 9, 13],
+            [2, 6, 10, 14],
+            [3, 7, 11, 15],
+            [0, 5, 10, 15],
+            [1, 6, 11, 12],
+            [2, 7, 8, 13],
+            [3, 4, 9, 14],
+        ];
+
+        static SOURCE: OnceLock<String> = OnceLock::new();
+        SOURCE.get_or_init(|| {
+            let mut source = String::with_capacity(
+                GPU_POW_MSL_PREFIX.len() + GPU_POW_MSL_SUFFIX.len() + 5_000,
+            );
+            source.push_str(GPU_POW_MSL_PREFIX);
+            for schedule in super::GPU_POW_MESSAGE_SCHEDULE {
+                for (mix, lanes) in G_LANES.iter().enumerate() {
+                    let x = gpu_pow_message_token(schedule[2 * mix]);
+                    let y = gpu_pow_message_token(schedule[2 * mix + 1]);
+                    writeln!(
+                        source,
+                        "    pow_g(v, {}u, {}u, {}u, {}u, {x}, {y});",
+                        lanes[0], lanes[1], lanes[2], lanes[3]
+                    )
+                    .expect("writing generated Metal source into String cannot fail");
+                }
+            }
+            source.push_str(GPU_POW_MSL_SUFFIX);
+            source
+        })
+    }
+
     // -----------------------------------------------------------------------
     // Embedded precompiled metallib.
     //
@@ -2070,6 +2530,108 @@ kernel void blake3_pow_scan(
         }
     }
 
+    /// Build the independent ranked-PoW PSO and its two persistent shared
+    /// buffers. Failure is intentionally local to this optional resource set:
+    /// the promoted GPU commitment context must still initialize unchanged.
+    unsafe fn try_ranked_pow_resources(
+        api: &Api,
+        device: Id,
+    ) -> Result<(Id, Id, Id), String> {
+        unsafe {
+            let src = api.nsstring(gpu_pow_msl_source())?;
+            let mut library_err: Id = NIL;
+            let library: Id = send!(
+                api,
+                unsafe extern "C" fn(Id, Sel, Id, Id, *mut Id) -> Id,
+                device,
+                c"newLibraryWithSource:options:error:",
+                src,
+                NIL,
+                &mut library_err
+            );
+            if library.is_null() {
+                return Err(format!(
+                    "ranked PoW shader compile failed: {}",
+                    api.error_string(library_err)
+                ));
+            }
+
+            let result = (|| -> Result<(Id, Id, Id), String> {
+                let name = api.nsstring("ranked_pow_scan")?;
+                let function: Id = send!(
+                    api,
+                    unsafe extern "C" fn(Id, Sel, Id) -> Id,
+                    library,
+                    c"newFunctionWithName:",
+                    name
+                );
+                if function.is_null() {
+                    return Err("ranked PoW kernel not found".into());
+                }
+                let mut pso_err: Id = NIL;
+                let pso: Id = send!(
+                    api,
+                    unsafe extern "C" fn(Id, Sel, Id, *mut Id) -> Id,
+                    device,
+                    c"newComputePipelineStateWithFunction:error:",
+                    function,
+                    &mut pso_err
+                );
+                send!(
+                    api,
+                    unsafe extern "C" fn(Id, Sel) -> Id,
+                    function,
+                    c"release"
+                );
+                if pso.is_null() {
+                    return Err(format!(
+                        "ranked PoW pipeline failed: {}",
+                        api.error_string(pso_err)
+                    ));
+                }
+
+                let new_buffer = |len: usize| -> Result<Id, String> {
+                    let buffer: Id = send!(
+                        api,
+                        unsafe extern "C" fn(Id, Sel, u64, u64) -> Id,
+                        device,
+                        c"newBufferWithLength:options:",
+                        len as u64,
+                        0u64
+                    );
+                    if buffer.is_null() {
+                        Err(format!("ranked PoW shared buffer allocation {len} failed"))
+                    } else {
+                        Ok(buffer)
+                    }
+                };
+                let digest = match new_buffer(32) {
+                    Ok(buffer) => buffer,
+                    Err(error) => {
+                        send!(api, unsafe extern "C" fn(Id, Sel) -> Id, pso, c"release");
+                        return Err(error);
+                    }
+                };
+                let state = match new_buffer(3 * core::mem::size_of::<u32>()) {
+                    Ok(buffer) => buffer,
+                    Err(error) => {
+                        send!(api, unsafe extern "C" fn(Id, Sel) -> Id, digest, c"release");
+                        send!(api, unsafe extern "C" fn(Id, Sel) -> Id, pso, c"release");
+                        return Err(error);
+                    }
+                };
+                Ok((pso, digest, state))
+            })();
+            send!(
+                api,
+                unsafe extern "C" fn(Id, Sel) -> Id,
+                library,
+                c"release"
+            );
+            result
+        }
+    }
+
     // -----------------------------------------------------------------------
     // Context: device, queue, pipelines. Created once per process.
     // -----------------------------------------------------------------------
@@ -2104,10 +2666,17 @@ kernel void blake3_pow_scan(
         pub(crate) pso_pow: Id,
         pub(crate) pow_out: Id,
         pub(crate) pow_lock: std::sync::Mutex<()>,
+        /// Optional independent ranked-PoW pipeline and persistent shared
+        /// buffers. All three are `NIL` together on disable or any init error.
+        pub(crate) pso_ranked_pow: Id,
+        pub(crate) ranked_pow_digest: Id,
+        pub(crate) ranked_pow_state: Id,
     }
     // SAFETY: MTLDevice/MTLCommandQueue/MTLComputePipelineState are
     // documented thread-safe; command buffers/encoders are created and used
-    // within a single call.
+    // within a single call. The only new mutable persistent buffers are the
+    // PoW digest/state pair, whose complete write-dispatch-read lifecycle is
+    // serialized by `POW_IN_USE`.
     unsafe impl Send for Gpu {}
     unsafe impl Sync for Gpu {}
 
@@ -2302,7 +2871,6 @@ kernel void blake3_pow_scan(
                     } else {
                         (NIL, NIL)
                     };
-
                 let (pso_pow, pow_out) = if super::gpu_grind_enabled() {
                     // This optimization is supplemental: a compile/pipeline/
                     // allocation failure must not poison the already-valid
@@ -2373,6 +2941,11 @@ kernel void blake3_pow_scan(
                 } else {
                     (NIL, NIL)
                 };
+                let (pso_ranked_pow, ranked_pow_digest, ranked_pow_state) = if super::gpu_pow_enabled() {
+                    try_ranked_pow_resources(&api, device).unwrap_or((NIL, NIL, NIL))
+                } else {
+                    (NIL, NIL, NIL)
+                };
                 Ok(Gpu {
                     api,
                     device,
@@ -2393,6 +2966,9 @@ kernel void blake3_pow_scan(
                     pso_pow,
                     pow_out,
                     pow_lock: std::sync::Mutex::new(()),
+                    pso_ranked_pow,
+                    ranked_pow_digest,
+                    ranked_pow_state,
                 })
             })();
             pool_pop(pool);
@@ -2665,6 +3241,125 @@ kernel void blake3_pow_scan(
                 }
             }
         }
+    }
+
+    #[repr(C)]
+    struct PowParams {
+        start: u64,
+        span: u64,
+        bits: u32,
+        chunk_nonces: u32,
+    }
+
+    static POW_IN_USE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    static POW_FAILED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+    pub(super) unsafe fn run_ranked_pow(
+        gpu: &Gpu,
+        state_digest: &[u8; 32],
+        bits: u32,
+    ) -> Result<u64, String> {
+        unsafe {
+            if gpu.pso_ranked_pow.is_null()
+                || gpu.ranked_pow_digest.is_null()
+                || gpu.ranked_pow_state.is_null()
+            {
+                return Err("ranked PoW Metal resources unavailable".into());
+            }
+            std::ptr::copy_nonoverlapping(
+                state_digest.as_ptr(),
+                gpu.buffer_contents(gpu.ranked_pow_digest),
+                state_digest.len(),
+            );
+
+            let mut start = 0u64;
+            loop {
+                let span = super::gpu_pow_block_span(start, bits)
+                    .ok_or_else(|| "invalid ranked PoW retry geometry".to_string())?;
+                let initial_state = [0u32, u32::MAX, 0u32];
+                std::ptr::copy_nonoverlapping(
+                    initial_state.as_ptr().cast::<u8>(),
+                    gpu.buffer_contents(gpu.ranked_pow_state),
+                    core::mem::size_of_val(&initial_state),
+                );
+                let params = PowParams {
+                    start,
+                    span,
+                    bits,
+                    chunk_nonces: super::GPU_POW_CHUNK_NONCES as u32,
+                };
+                let param_bytes = core::slice::from_raw_parts(
+                    (&params as *const PowParams).cast::<u8>(),
+                    core::mem::size_of::<PowParams>(),
+                );
+                let n_chunks = span.div_ceil(super::GPU_POW_CHUNK_NONCES);
+                // Bound the first in-flight wave to half the expected search
+                // distance. At low exponents this avoids launching the full
+                // two-expected-work retry block at once; at high exponents the
+                // 64-threadgroup occupancy cap keeps the same bounded shape.
+                // Subsequent claims remain dynamic inside the command buffer.
+                let threadgroups = super::gpu_pow_threadgroups(bits, n_chunks)
+                    .ok_or_else(|| "invalid ranked PoW threadgroup geometry".to_string())?;
+
+                let pool = gpu.pool_push();
+                let dispatch = (|| -> Result<(), String> {
+                    let cb = gpu.command_buffer()?;
+                    let enc = gpu.compute_encoder(cb)?;
+                    gpu.set_pipeline(enc, gpu.pso_ranked_pow);
+                    gpu.set_buffer(enc, gpu.ranked_pow_digest, 0, 0);
+                    gpu.set_bytes(enc, param_bytes, 1);
+                    gpu.set_buffer(enc, gpu.ranked_pow_state, 0, 2);
+                    gpu.dispatch(enc, threadgroups, 256);
+                    gpu.end_encoding(enc);
+                    gpu.commit_and_wait(cb)
+                })();
+                gpu.pool_pop(pool);
+                dispatch?;
+
+                let state = core::slice::from_raw_parts(
+                    gpu.buffer_contents(gpu.ranked_pow_state).cast::<u32>(),
+                    3,
+                );
+                if state[2] > 1 {
+                    return Err("ranked PoW kernel published an invalid found flag".into());
+                }
+                if state[2] == 1 {
+                    let offset = u64::from(state[1]);
+                    if offset >= span {
+                        return Err("ranked PoW kernel published an out-of-block offset".into());
+                    }
+                    let nonce = start
+                        .checked_add(offset)
+                        .ok_or_else(|| "ranked PoW nonce overflow".to_string())?;
+                    let mut preimage = [0u8; 64];
+                    preimage[..32].copy_from_slice(state_digest);
+                    preimage[32..40].copy_from_slice(&nonce.to_le_bytes());
+                    let hash = blake3::hash(&preimage);
+                    let full_bytes = (bits / 8) as usize;
+                    let extra = bits % 8;
+                    let valid = hash.as_bytes()[..full_bytes]
+                        .iter()
+                        .all(|&byte| byte == 0)
+                        && (extra == 0
+                            || hash.as_bytes()[full_bytes] >> (8 - extra) == 0);
+                    if !valid {
+                        return Err(
+                            "ranked PoW kernel published a nonce that fails the predicate".into(),
+                        );
+                    }
+                    return Ok(nonce);
+                }
+                start = start
+                    .checked_add(span)
+                    .ok_or_else(|| "ranked PoW exhausted the nonce space".to_string())?;
+            }
+        }
+    }
+
+    pub(crate) fn ranked_pow_smallest(state_digest: &[u8; 32], bits: u32) -> Option<u64> {
+        super::gpu_pow_run_fail_closed(&POW_FAILED, &POW_IN_USE, || {}, || {
+            gpu().and_then(|gpu| unsafe { run_ranked_pow(gpu, state_digest, bits) })
+        })
     }
 
     // -----------------------------------------------------------------------
@@ -6472,6 +7167,10 @@ mod imp {
 
     pub(crate) struct FromZFirstPassStream;
 
+    pub(crate) fn ranked_pow_smallest(_state_digest: &[u8; 32], _bits: u32) -> Option<u64> {
+        None
+    }
+
     impl FromZFirstPassStream {
         pub(crate) fn submit_ready_range(&mut self, _r_start: usize, _r_count: usize) {}
     }
@@ -6680,6 +7379,256 @@ mod tests {
         fn vec(&mut self, n: usize) -> Vec<F128> {
             (0..n).map(|_| self.f128()).collect()
         }
+    }
+
+    #[test]
+    fn ranked_pow_exact_kill_switch_and_source_contract() {
+        use std::ffi::OsStr;
+
+        assert!(!gpu_pow_value_enabled(Some(OsStr::new("1"))));
+        for value in [None, Some(""), Some("0"), Some("01"), Some("true")] {
+            assert!(gpu_pow_value_enabled(value.map(OsStr::new)));
+        }
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        {
+            let source = imp::gpu_pow_msl_source();
+            assert!(source.contains("kernel void ranked_pow_scan"));
+            assert!(source.contains("device atomic_uint *state"));
+            assert!(!source.contains("atomic_ulong"));
+            assert!(source.contains("found != 0 && offset >= best"));
+            assert!(source.contains("params.start + ulong(candidate_offset)"));
+            assert!(source.contains("uint message[8]"));
+            assert!(source.contains("uint word0 = blake3_pow_word0(message, nonce)"));
+            assert_eq!(source.matches("    pow_g(v,").count(), 56);
+            assert!(!source.contains("pow_round"));
+            assert!(!source.contains("uint old[16]"));
+        }
+    }
+
+    #[test]
+    fn ranked_pow_blake3_root_and_predicate_match_scalar_contract() {
+        let mut rng = Rng::new(0xB1A3_E300_64);
+        for bits in 1..=32 {
+            for _ in 0..4 {
+                let mut digest = [0u8; 32];
+                for byte in &mut digest {
+                    *byte = rng.next_u64() as u8;
+                }
+                let nonce = rng.next_u64();
+                let got = gpu_pow_blake3_root(&digest, nonce);
+                let mut preimage = [0u8; 64];
+                preimage[..32].copy_from_slice(&digest);
+                preimage[32..40].copy_from_slice(&nonce.to_le_bytes());
+                let expected = *blake3::hash(&preimage).as_bytes();
+                assert_eq!(got, expected, "bits={bits} nonce={nonce}");
+                let full = (bits / 8) as usize;
+                let extra = bits % 8;
+                let expected_predicate = expected[..full].iter().all(|&byte| byte == 0)
+                    && (extra == 0 || expected[full] >> (8 - extra) == 0);
+                assert_eq!(
+                    gpu_pow_has_leading_zero_bits(&got, bits),
+                    expected_predicate,
+                    "bits={bits} nonce={nonce}"
+                );
+            }
+        }
+        let digest = [0xA5; 32];
+        for nonce in [0, u32::MAX as u64, u32::MAX as u64 + 1, u64::MAX] {
+            let mut preimage = [0u8; 64];
+            preimage[..32].copy_from_slice(&digest);
+            preimage[32..40].copy_from_slice(&nonce.to_le_bytes());
+            assert_eq!(
+                gpu_pow_blake3_root(&digest, nonce),
+                *blake3::hash(&preimage).as_bytes()
+            );
+        }
+    }
+
+    /// Target-native correctness oracle: unlike the portable transcription
+    /// tests, this constructs the real Metal library/PSO, dispatches the real
+    /// `ranked_pow_scan` kernel, and checks its answer against an ascending CPU
+    /// BLAKE3 search. Ignored because it requires Apple Metal; it is evidence
+    /// of shader execution and exactness only, never performance evidence.
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    #[ignore = "requires Apple Metal; correctness oracle, not a timing qualification"]
+    fn ranked_pow_metal_runtime_matches_ascending_cpu_oracle() {
+        let gpu = imp::gpu().expect("Metal GPU context must initialize");
+        let digest = *blake3::hash(b"flock-ranked-pow-metal-runtime-oracle").as_bytes();
+        for bits in [1u32, 7, 14] {
+            let got = unsafe { imp::run_ranked_pow(gpu, &digest, bits) }
+                .unwrap_or_else(|error| panic!("Metal PoW bits={bits} failed: {error}"));
+            let expected = (0..=got)
+                .find(|&nonce| {
+                    gpu_pow_has_leading_zero_bits(&gpu_pow_blake3_root(&digest, nonce), bits)
+                })
+                .expect("the returned Metal nonce must satisfy the CPU predicate");
+            assert_eq!(
+                got, expected,
+                "bits={bits}: Metal did not return the global minimum"
+            );
+        }
+    }
+
+    #[test]
+    fn ranked_pow_dynamic_claim_order_and_retry_preserve_global_minimum() {
+        let mut rng = Rng::new(0xD1A0_C1A1_0EED);
+        let start = 17_000u64;
+        let span = 8 * GPU_POW_CHUNK_NONCES;
+        let mut order: Vec<u64> = (0..8).collect();
+        for i in (1..order.len()).rev() {
+            let j = (rng.next_u64() as usize) % (i + 1);
+            order.swap(i, j);
+        }
+        let matches = [start + 7, start + 4097, start + 19_000, start + span - 1];
+        assert_eq!(
+            gpu_pow_model_block_min(start, span, &order, &matches),
+            Some(start + 7)
+        );
+        assert_eq!(
+            gpu_pow_model_block_min(start, span, &[0, 0, 2, 3, 4, 5, 6, 7], &matches),
+            None,
+            "duplicate claims must fail closed"
+        );
+
+        for bits in 1..=32 {
+            let start = u32::MAX as u64 - 257 - bits as u64;
+            let block = gpu_pow_block_len(bits).unwrap();
+            let target = start + block + bits as u64 % block;
+            let later = target + 1;
+            assert_eq!(
+                gpu_pow_model_retry(start, bits, &[later, target], 3),
+                Some((target, 1)),
+                "bits={bits}"
+            );
+        }
+        assert!(gpu_pow_block_len(0).is_none());
+        assert!(gpu_pow_block_len(33).is_none());
+    }
+
+    #[test]
+    fn ranked_pow_inflight_wave_stays_below_expected_work() {
+        let expected_groups = [(14, 8), (15, 16), (16, 32), (17, 64), (18, 64), (19, 64)];
+        for (bits, groups) in expected_groups {
+            let span = gpu_pow_block_len(bits).unwrap();
+            let n_chunks = span.div_ceil(GPU_POW_CHUNK_NONCES);
+            let got = gpu_pow_threadgroups(bits, n_chunks).unwrap();
+            assert_eq!(got, groups, "bits={bits}");
+            assert!(
+                got * GPU_POW_CHUNK_NONCES <= (1u64 << bits) / 2,
+                "bits={bits}: first wave exceeds half the expected search work"
+            );
+        }
+    }
+
+    #[test]
+    fn ranked_pow_transcribed_hash_and_scheduler_match_ascending_scalar_search() {
+        let mut rng = Rng::new(0xCA11_0CA1_5EED);
+        for bits in [1u32, 3, 7, 10] {
+            let mut digest = [0u8; 32];
+            for byte in &mut digest {
+                *byte = rng.next_u64() as u8;
+            }
+            let start = 10_000 + bits as u64 * 100;
+            let span = 2 * GPU_POW_CHUNK_NONCES;
+            let matches: Vec<u64> = (start..start + span)
+                .filter(|&nonce| {
+                    gpu_pow_has_leading_zero_bits(&gpu_pow_blake3_root(&digest, nonce), bits)
+                })
+                .collect();
+            let scalar = matches.iter().copied().min();
+            assert_eq!(
+                gpu_pow_model_block_min(start, span, &[1, 0], &matches),
+                scalar,
+                "bits={bits}"
+            );
+            assert_eq!(
+                gpu_pow_model_block_min(start, span, &[0, 1], &matches),
+                scalar,
+                "bits={bits} ascending"
+            );
+        }
+    }
+
+    #[test]
+    fn ranked_pow_geometry_handles_u32_carry_and_u64_exhaustion() {
+        let carry_start = u32::MAX as u64 - 10;
+        let second = gpu_pow_chunk(carry_start, 5000, 1).unwrap();
+        assert!(second.start > u32::MAX as u64);
+        assert_eq!(second.len, GPU_POW_CHUNK_NONCES);
+        let last = gpu_pow_chunk(carry_start, 5000, 4).unwrap();
+        assert_eq!(last.len, 5000 - 4 * GPU_POW_CHUNK_NONCES);
+
+        let end_start = u64::MAX - 5000;
+        assert_eq!(gpu_pow_block_span(end_start, 32), Some(5001));
+        assert_eq!(
+            gpu_pow_model_retry(end_start, 32, &[u64::MAX], 1),
+            Some((u64::MAX, 0)),
+            "u64::MAX is a valid canonical nonce"
+        );
+        assert_eq!(
+            gpu_pow_model_retry(end_start, 32, &[], 2),
+            None,
+            "nonce-space exhaustion must fail closed without wrap"
+        );
+    }
+
+    #[test]
+    fn ranked_pow_failure_latch_blocks_a_prechecked_waiter() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        use std::sync::{Arc, Mutex, mpsc};
+
+        let failed = Arc::new(AtomicBool::new(false));
+        let in_use = Arc::new(Mutex::new(()));
+        let waiter_runs = Arc::new(AtomicUsize::new(0));
+        let (owner_entered_tx, owner_entered_rx) = mpsc::channel();
+        let (release_owner_tx, release_owner_rx) = mpsc::channel();
+
+        let owner = {
+            let failed = Arc::clone(&failed);
+            let in_use = Arc::clone(&in_use);
+            std::thread::spawn(move || {
+                gpu_pow_run_fail_closed(
+                    &failed,
+                    &in_use,
+                    || {},
+                    || -> Result<u64, ()> {
+                        owner_entered_tx.send(()).unwrap();
+                        release_owner_rx.recv().unwrap();
+                        Err(())
+                    },
+                )
+            })
+        };
+        owner_entered_rx.recv().unwrap();
+
+        let (waiter_prechecked_tx, waiter_prechecked_rx) = mpsc::channel();
+        let waiter = {
+            let failed = Arc::clone(&failed);
+            let in_use = Arc::clone(&in_use);
+            let waiter_runs = Arc::clone(&waiter_runs);
+            std::thread::spawn(move || {
+                gpu_pow_run_fail_closed(
+                    &failed,
+                    &in_use,
+                    || waiter_prechecked_tx.send(()).unwrap(),
+                    || {
+                        waiter_runs.fetch_add(1, Ordering::Relaxed);
+                        Ok::<u64, ()>(7)
+                    },
+                )
+            })
+        };
+
+        // The waiter has observed `failed == false`, but the owner still holds
+        // the mutex. Releasing the owner makes it publish failure before unlock;
+        // the waiter's mandatory under-lock recheck must suppress its closure.
+        waiter_prechecked_rx.recv().unwrap();
+        release_owner_tx.send(()).unwrap();
+        assert_eq!(owner.join().unwrap(), None);
+        assert_eq!(waiter.join().unwrap(), None);
+        assert!(failed.load(Ordering::Acquire));
+        assert_eq!(waiter_runs.load(Ordering::Relaxed), 0);
     }
 
     /// Skip (with a note) when Metal is unavailable; fail on real GPU errors.

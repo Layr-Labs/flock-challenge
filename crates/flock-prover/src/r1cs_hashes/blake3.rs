@@ -2540,6 +2540,15 @@ fn should_request_ranked_exact_tune(call: usize, ranked_shape_enabled: bool) -> 
     call == 0 && ranked_shape_enabled
 }
 
+/// Arm GPU PoW only for the exact protected workload cardinality after the
+/// existing target/profile/layout/hash gate has accepted the setup. This
+/// keeps arbitrary `blake3_proof` benchmark sizes on the incumbent CPU path
+/// even when they reuse the benchmark transcript domain and BLAKE3 Fiat-Shamir.
+#[inline]
+fn select_ranked_gpu_pow(blocks_len: usize, ranked_shape_enabled: bool) -> bool {
+    blocks_len == (1usize << 18) && ranked_shape_enabled
+}
+
 fn generate_witness_with_ab_packed_and_lincheck_streamed(
     blocks: &[Compression],
     n_blocks_log: usize,
@@ -2827,6 +2836,10 @@ impl Blake3Setup {
         // the first ranked commit (untimed), bridging the warmup CPU tail
         // and the ready->seed gap.
         flock_core::gpu_commit::gpu_keepwarm_prove_started();
+        challenger.set_ranked_gpu_pow(select_ranked_gpu_pow(
+            blocks.len(),
+            self.use_ranked_rate2_hot_codeword(),
+        ));
         // Call zero is the untimed warmup but materializes an eager lincheck
         // stripe before the timed proof establishes streaming. Issue the
         // exact-contention ticket here, before witness generation, so only
@@ -3508,6 +3521,21 @@ mod tests {
         assert!(!should_request_ranked_exact_tune(1, true));
         assert!(!should_request_ranked_exact_tune(2, true));
         assert!(!should_request_ranked_exact_tune(0, false));
+    }
+
+    #[test]
+    fn ranked_gpu_pow_selector_rejects_arbitrary_proof_benchmark_sizes() {
+        assert!(select_ranked_gpu_pow(1usize << 18, true));
+        for blocks_len in [
+            1,
+            256,
+            (1usize << 17),
+            (1usize << 18) - 1,
+            1usize << 19,
+        ] {
+            assert!(!select_ranked_gpu_pow(blocks_len, true));
+        }
+        assert!(!select_ranked_gpu_pow(1usize << 18, false));
     }
 
     #[test]
