@@ -727,7 +727,24 @@ fn commit_with_round1_ab_precompute(
     debug_assert_eq!(k_skip, 6, "ranked protocol fixes k_skip=6");
     let inv_table = flock_core::ntt::InvNttTableByteSingleGf8::cached_standard_k6();
 
-    rayon::join(
+    let precompute_ab = || {
+        zerocheck::univariate_skip_optimized::precompute_round1_ab_inner_packed_padded(
+            a_packed,
+            b_packed,
+            pcs_params.m,
+            k_skip,
+            inv_table,
+            padding,
+        )
+    };
+    // `Blake3Setup::prove_fast` issues this ticket before call-zero witness
+    // generation. A valid cache hit may satisfy it inside the commit arm;
+    // otherwise the post-join callback claims it and replays this exact A/B
+    // closure beside the broad split sweep.
+    let run_ranked_exact_tune =
+        flock_core::gpu_commit::ranked_exact_contention_tune_pending();
+
+    let result = rayon::join(
         || match commit_codeword {
             CommitCodeword::Allocate => pcs::commit(z_packed, pcs_params),
             CommitCodeword::NeedsReplication(buf) => pcs::commit_into(z_packed, pcs_params, buf),
@@ -740,14 +757,7 @@ fn commit_with_round1_ab_precompute(
         },
         || {
             let t = std::time::Instant::now();
-            let r = zerocheck::univariate_skip_optimized::precompute_round1_ab_inner_packed_padded(
-                a_packed,
-                b_packed,
-                pcs_params.m,
-                k_skip,
-                inv_table,
-                padding,
-            );
+            let r = precompute_ab();
             let wall_ms = t.elapsed().as_secs_f64() * 1e3;
             // The hybrid-commit warmup sweep sizes its contention emulation
             // from this arm's measured wall (an Instant read is free; the
@@ -758,7 +768,20 @@ fn commit_with_round1_ab_precompute(
             }
             r
         },
-    )
+    );
+
+    if run_ranked_exact_tune {
+        flock_core::gpu_commit::retune_ranked_hybrid_with_exact_contention(
+            pcs_params,
+            &result.0.1.codeword,
+            &result.0.1.merkle_tree,
+            || {
+                let replayed = precompute_ab();
+                std::hint::black_box(&replayed);
+            },
+        );
+    }
+    result
 }
 
 /// Run commit → bind → zerocheck → lincheck and build the base claims, stopping

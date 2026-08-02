@@ -372,6 +372,114 @@ pub fn note_precompute_branch_wall_ms(ms: f64) {
     PRECOMPUTE_BRANCH_WALL_MS.store(ms.to_bits(), std::sync::atomic::Ordering::Relaxed);
 }
 
+/// Process-local lifecycle of the broad exact-contention calibration. The
+/// ranked prover requests it before entering the call-zero warmup join. A
+/// valid cross-process cache hit satisfies it in the commit arm; otherwise
+/// the post-join replay claims it exactly once.
+const RANKED_EXACT_TUNE_IDLE: u8 = 0;
+const RANKED_EXACT_TUNE_REQUESTED: u8 = 1;
+const RANKED_EXACT_TUNE_SATISFIED: u8 = 2;
+static RANKED_EXACT_TUNE_STATE: std::sync::atomic::AtomicU8 =
+    std::sync::atomic::AtomicU8::new(RANKED_EXACT_TUNE_IDLE);
+
+fn request_ranked_exact_tune_in(state: &std::sync::atomic::AtomicU8) -> bool {
+    state
+        .compare_exchange(
+            RANKED_EXACT_TUNE_IDLE,
+            RANKED_EXACT_TUNE_REQUESTED,
+            std::sync::atomic::Ordering::AcqRel,
+            std::sync::atomic::Ordering::Acquire,
+        )
+        .is_ok()
+}
+
+fn ranked_exact_tune_pending_in(state: &std::sync::atomic::AtomicU8) -> bool {
+    state.load(std::sync::atomic::Ordering::Acquire) == RANKED_EXACT_TUNE_REQUESTED
+}
+
+fn satisfy_ranked_exact_tune_in(state: &std::sync::atomic::AtomicU8) -> bool {
+    state
+        .compare_exchange(
+            RANKED_EXACT_TUNE_REQUESTED,
+            RANKED_EXACT_TUNE_SATISFIED,
+            std::sync::atomic::Ordering::AcqRel,
+            std::sync::atomic::Ordering::Acquire,
+        )
+        .is_ok()
+}
+
+/// Request the call-zero exact-AB calibration. The canonical-reprime kill
+/// switch deliberately suppresses the request, restoring the incumbent
+/// synthetic tuner and its V2 cache without changing binaries.
+#[doc(hidden)]
+pub fn request_ranked_exact_contention_tune() -> bool {
+    if std::env::var_os("FLOCK_NO_HYBRID_TUNE_CANONICAL_REPRIME").is_some() {
+        return false;
+    }
+    request_ranked_exact_tune_in(&RANKED_EXACT_TUNE_STATE)
+}
+
+/// Whether call zero requested an exact replay that a cache hit has not yet
+/// satisfied. Sampled before the warmup commit/AB join.
+#[doc(hidden)]
+pub fn ranked_exact_contention_tune_pending() -> bool {
+    ranked_exact_tune_pending_in(&RANKED_EXACT_TUNE_STATE)
+}
+
+fn satisfy_ranked_exact_contention_tune() {
+    let _ = satisfy_ranked_exact_tune_in(&RANKED_EXACT_TUNE_STATE);
+}
+
+fn claim_ranked_exact_contention_tune() -> bool {
+    satisfy_ranked_exact_tune_in(&RANKED_EXACT_TUNE_STATE)
+}
+
+#[cfg(test)]
+mod ranked_exact_tune_lifecycle_tests {
+    use super::{
+        RANKED_EXACT_TUNE_IDLE, ranked_exact_tune_pending_in, request_ranked_exact_tune_in,
+        satisfy_ranked_exact_tune_in,
+    };
+    use std::sync::atomic::AtomicU8;
+
+    #[test]
+    fn cache_miss_replay_is_claimed_only_once() {
+        let state = AtomicU8::new(RANKED_EXACT_TUNE_IDLE);
+        assert!(request_ranked_exact_tune_in(&state));
+        assert!(ranked_exact_tune_pending_in(&state));
+        assert!(satisfy_ranked_exact_tune_in(&state));
+        assert!(!ranked_exact_tune_pending_in(&state));
+        assert!(!request_ranked_exact_tune_in(&state));
+        assert!(!satisfy_ranked_exact_tune_in(&state));
+    }
+
+    #[test]
+    fn cache_hit_satisfies_before_post_join_claim() {
+        let state = AtomicU8::new(RANKED_EXACT_TUNE_IDLE);
+        assert!(request_ranked_exact_tune_in(&state));
+        assert!(satisfy_ranked_exact_tune_in(&state));
+        assert!(!ranked_exact_tune_pending_in(&state));
+        assert!(!satisfy_ranked_exact_tune_in(&state));
+    }
+}
+
+/// Run the one requested broad exact-contention calibration while the
+/// warmup's read-only A/B inputs and CPU-authoritative commit remain live.
+#[doc(hidden)]
+pub fn retune_ranked_hybrid_with_exact_contention(
+    params: &crate::pcs::commit::PcsParams,
+    cpu_codeword: &[F128],
+    cpu_tree: &[crate::merkle::Hash],
+    replay_ab: impl Fn() + Sync,
+) {
+    imp::retune_ranked_hybrid_with_exact_contention(
+        params,
+        cpu_codeword,
+        cpu_tree,
+        replay_ab,
+    );
+}
+
 #[cfg_attr(
     not(all(target_os = "macos", target_arch = "aarch64")),
     allow(dead_code)
@@ -3204,6 +3312,12 @@ kernel void parent_hash3(device const uint* children [[buffer(0)]],
     static TUNED_HYBRID_K: std::sync::atomic::AtomicUsize =
         std::sync::atomic::AtomicUsize::new(usize::MAX);
 
+    /// CPU reference-commit wall from the cache-miss warmup. Cache
+    /// publication waits for the exact-contention winner, so no cache-hit
+    /// worker can observe the untuned sentinel.
+    static RANKED_EXACT_PENDING_CPU_WALL_BITS: std::sync::atomic::AtomicU64 =
+        std::sync::atomic::AtomicU64::new(0);
+
     /// Exact override / kill-switch resolution. `FLOCK_NO_HYBRID_COMMIT`
     /// forces the pure-GPU graph; `FLOCK_HYBRID_CPU_BLOCKS` pins an exact
     /// split. Either also disables the warmup sweep.
@@ -3219,6 +3333,13 @@ kernel void parent_hash3(device const uint* children [[buffer(0)]],
                 .and_then(|v| v.parse().ok())
                 .filter(|k| *k < 16)
         })
+    }
+
+    fn ranked_exact_tune_applicable(params: &crate::pcs::commit::PcsParams) -> bool {
+        super::is_ranked_gpu_shape(params)
+            && hybrid_cpu_split_override().is_none()
+            && std::env::var_os("FLOCK_NO_HYBRID_AUTOTUNE").is_none()
+            && hybrid_tune_canonical_reprime_enabled()
     }
 
     /// Pure selection over the sweep's per-candidate best walls; `candidates`
@@ -3251,6 +3372,50 @@ kernel void parent_hash3(device const uint* children [[buffer(0)]],
         Some(chosen)
     }
 
+    /// Broad candidate set retained deliberately: the warmup cache publishes
+    /// the first process's winner to later workers, so the one calibration
+    /// process should search both pure GPU and the full observed hybrid
+    /// plateau instead of narrowing around a development-host optimum.
+    const RANKED_EXACT_TUNE_CANDIDATES: [usize; 8] = [0, 2, 3, 4, 5, 6, 7, 8];
+
+    /// Two samples per candidate, with the second pass in reverse order so
+    /// thermal drift, queue warmup, and A/B replay cache state do not favor
+    /// either end of the search range. Selection consumes the mean rather
+    /// than a noise-sensitive minimum.
+    fn collect_ranked_exact_samples<E>(
+        mut reprime: impl FnMut() -> Result<(), E>,
+        mut sample: impl FnMut(usize) -> Result<f64, E>,
+    ) -> Result<[[f64; 2]; RANKED_EXACT_TUNE_CANDIDATES.len()], E> {
+        let mut walls = [[0.0; 2]; RANKED_EXACT_TUNE_CANDIDATES.len()];
+        for (i, &k) in RANKED_EXACT_TUNE_CANDIDATES.iter().enumerate() {
+            reprime()?;
+            walls[i][0] = sample(k)?;
+        }
+        for (i, &k) in RANKED_EXACT_TUNE_CANDIDATES.iter().enumerate().rev() {
+            reprime()?;
+            walls[i][1] = sample(k)?;
+        }
+        Ok(walls)
+    }
+
+    fn mean_ranked_exact_samples(
+        samples: [[f64; 2]; RANKED_EXACT_TUNE_CANDIDATES.len()],
+    ) -> Option<[f64; RANKED_EXACT_TUNE_CANDIDATES.len()]> {
+        let mut means = [0.0; RANKED_EXACT_TUNE_CANDIDATES.len()];
+        for (mean, [a, b]) in means.iter_mut().zip(samples) {
+            if !a.is_finite() || !b.is_finite() || a < 0.0 || b < 0.0 {
+                return None;
+            }
+            *mean = (a + b) * 0.5;
+        }
+        Some(means)
+    }
+
+    #[inline]
+    fn hybrid_tune_canonical_reprime_enabled() -> bool {
+        std::env::var_os("FLOCK_NO_HYBRID_TUNE_CANONICAL_REPRIME").is_none()
+    }
+
     /// Untimed-warmup split sweep. The scoring host's CPU/GPU balance is
     /// unknown at build time: the same fixed split that wins on a small-GPU
     /// dev host over-allocates a Max-class GPU host's CPU and vice versa
@@ -3277,6 +3442,15 @@ kernel void parent_hash3(device const uint* children [[buffer(0)]],
             return;
         }
         let dbg = debug_enabled() || std::env::var_os("FLOCK_COMMIT_TIMING").is_some();
+        if super::ranked_exact_contention_tune_pending() {
+            // The outer warmup join will replay its real A/B branch beside a
+            // balanced broad sweep. Avoid double-tuning against a synthetic
+            // burn and leave publication to the verified exact winner.
+            if dbg {
+                eprintln!("[gpu-commit] autotune: deferring to broad exact-AB replay");
+            }
+            return;
+        }
         let z_buf = latched.wraps[0].2;
         let (tw_buf, tree_buf, staging) = (latched.tw_buf, latched.tree_buf, latched.staging);
         struct GraphCtx<'a> {
@@ -3394,16 +3568,18 @@ kernel void parent_hash3(device const uint* children [[buffer(0)]],
                 std::hint::black_box(x);
             });
         };
-        // Wall-safe streamed-regime correction: the per-candidate staging
-        // re-prime form runs the from-z first pass 8+ extra times per
-        // warm-up; multiplied by the harness's ~120 fresh worker processes
-        // that spends minutes of JOB wall against the ranked CI's 8-minute
-        // budget (three above-bar submissions died to it as "failed"
-        // timeouts before the mechanism was identified). The first pass is
-        // k-INDEPENDENT, so measuring its wall once and subtracting the
-        // constant from each candidate's full-graph wall yields the same
-        // corrected ranking at one extra pass total.
-        let first_pass_ms = if streamed_probe {
+        // The V2 cross-process warmup cache makes the original, protected-
+        // positive streamed tuner affordable again: only the first worker
+        // calibrates, while the remaining workers restore its verified k.
+        // Re-prime canonical post-layer-3 staging before EVERY candidate,
+        // outside the timer, then measure exactly the graph used by the
+        // scored streamed proof. The former wall-safe approximation primed
+        // once, repeatedly transformed stale staging, and subtracted a
+        // first-pass wall from an interval that did not contain that pass.
+        // Keep an exact same-binary rollback for paired measurements.
+        let canonical_reprime = streamed_probe
+            && std::env::var_os("FLOCK_NO_HYBRID_TUNE_CANONICAL_REPRIME").is_none();
+        let first_pass_ms = if streamed_probe && !canonical_reprime {
             let c = &ctx;
             let t0 = std::time::Instant::now();
             match unsafe { run_from_z_first_pass(c.gpu, c.z_buf, c.staging, c.tw_buf, log_d) } {
@@ -3421,6 +3597,12 @@ kernel void parent_hash3(device const uint* children [[buffer(0)]],
             0.0
         };
         let contended_run = |k: usize| -> Result<f64, String> {
+            if canonical_reprime {
+                let c = &ctx;
+                unsafe {
+                    run_from_z_first_pass(c.gpu, c.z_buf, c.staging, c.tw_buf, log_d)?;
+                }
+            }
             let t0 = std::time::Instant::now();
             let (r, ()) = rayon::join(|| timed_graph(k), burn_work);
             r?;
@@ -3518,6 +3700,201 @@ kernel void parent_hash3(device const uint* children [[buffer(0)]],
         TUNED_HYBRID_K.store(chosen, std::sync::atomic::Ordering::Relaxed);
     }
 
+    /// Contention-faithful broad calibration for the exact ranked prover.
+    /// The ordinary tuner can only synthesize round-1 A/B work; this path is
+    /// called after the warmup join and runs the actual read-only A/B closure
+    /// beside every candidate graph. Each sample first restores canonical
+    /// staging outside the timer, and the winner is verified against the
+    /// CPU-authoritative warmup codeword and Merkle tree before publication.
+    pub(crate) fn retune_ranked_hybrid_with_exact_contention(
+        params: &crate::pcs::commit::PcsParams,
+        cpu_codeword: &[F128],
+        cpu_tree: &[Hash],
+        replay_ab: impl Fn() + Sync,
+    ) {
+        use std::sync::atomic::Ordering;
+
+        if !ranked_exact_tune_applicable(params)
+            || !super::claim_ranked_exact_contention_tune()
+        {
+            return;
+        }
+
+        let dbg = debug_enabled() || std::env::var_os("FLOCK_COMMIT_TIMING").is_some();
+        let latch = LATCH.lock().unwrap();
+        let LatchState::On(latched) = &*latch else {
+            finish_ranked_exact_contention_tune(params, cpu_tree, 0);
+            return;
+        };
+        if STAGING_IN_USE.load(Ordering::Acquire) {
+            // This callback belongs immediately after call-zero warmup,
+            // whose ProverData is CPU-owned. Refuse any later invocation
+            // rather than overwrite a live GPU codeword view.
+            finish_ranked_exact_contention_tune(params, cpu_tree, 0);
+            return;
+        }
+        let Ok(gpu) = gpu() else {
+            finish_ranked_exact_contention_tune(params, cpu_tree, 0);
+            return;
+        };
+
+        struct GraphCtx<'a> {
+            gpu: &'a Gpu,
+            z_buf: Id,
+            staging: Id,
+            tw_buf: Id,
+            tree_buf: Id,
+        }
+        // SAFETY: the latch is held for the full calibration, Metal command
+        // submission is thread-safe, and only one graph arm runs at a time.
+        unsafe impl Send for GraphCtx<'_> {}
+        unsafe impl Sync for GraphCtx<'_> {}
+
+        let ctx = GraphCtx {
+            gpu,
+            z_buf: latched.wraps[0].2,
+            staging: latched.staging,
+            tw_buf: latched.tw_buf,
+            tree_buf: latched.tree_buf,
+        };
+        let timed_graph = |k: usize| -> Result<(), String> {
+            let c = &ctx;
+            unsafe {
+                if k == 0 {
+                    run_commit_graph_after_from_z(
+                        c.gpu,
+                        c.staging,
+                        c.tw_buf,
+                        c.tree_buf,
+                        params.k_code(),
+                        params.n_leaves(),
+                    )
+                } else {
+                    run_commit_graph_from_z_hybrid_impl(
+                        c.gpu,
+                        c.z_buf,
+                        c.staging,
+                        c.tw_buf,
+                        c.tree_buf,
+                        params.k_code(),
+                        params.n_leaves(),
+                        k,
+                        true,
+                        None,
+                    )
+                }
+            }
+        };
+        let sample = |k: usize| -> Result<f64, String> {
+            let t0 = std::time::Instant::now();
+            let (graph, ()) = rayon::join(|| timed_graph(k), || replay_ab());
+            graph?;
+            Ok(t0.elapsed().as_secs_f64() * 1e3)
+        };
+        let reprime = || unsafe {
+            run_from_z_first_pass(
+                ctx.gpu,
+                ctx.z_buf,
+                ctx.staging,
+                ctx.tw_buf,
+                params.k_code(),
+            )
+        };
+        let samples = match collect_ranked_exact_samples(reprime, sample) {
+            Ok(samples) => samples,
+            Err(e) => {
+                if dbg {
+                    eprintln!(
+                        "[gpu-commit] broad exact-AB tune failed ({e}); pinning verified k=0"
+                    );
+                }
+                finish_ranked_exact_contention_tune(params, cpu_tree, 0);
+                return;
+            }
+        };
+        let Some(means) = mean_ranked_exact_samples(samples) else {
+            finish_ranked_exact_contention_tune(params, cpu_tree, 0);
+            return;
+        };
+        let Some(chosen) = choose_hybrid_k(
+            &RANKED_EXACT_TUNE_CANDIDATES,
+            &means,
+            DEFAULT_HYBRID_K,
+        ) else {
+            finish_ranked_exact_contention_tune(params, cpu_tree, 0);
+            return;
+        };
+
+        let verified = unsafe {
+            if chosen == 0 {
+                run_commit_graph_from_z(
+                    gpu,
+                    ctx.z_buf,
+                    ctx.staging,
+                    ctx.tw_buf,
+                    ctx.tree_buf,
+                    params.k_code(),
+                    params.n_leaves(),
+                )
+            } else {
+                run_commit_graph_from_z_hybrid(
+                    gpu,
+                    ctx.z_buf,
+                    ctx.staging,
+                    ctx.tw_buf,
+                    ctx.tree_buf,
+                    params.k_code(),
+                    params.n_leaves(),
+                    chosen,
+                )
+            }
+        }
+        .is_ok()
+            && cpu_codeword.len() == params.codeword_len_f128()
+            && cpu_tree.len() == 2 * params.n_leaves() - 1
+            && unsafe {
+                bytes_equal_parallel(
+                    gpu.buffer_contents(ctx.staging),
+                    core::slice::from_raw_parts(
+                        cpu_codeword.as_ptr().cast::<u8>(),
+                        core::mem::size_of_val(cpu_codeword),
+                    ),
+                )
+            }
+            && unsafe {
+                bytes_equal_parallel(
+                    gpu.buffer_contents(ctx.tree_buf),
+                    core::slice::from_raw_parts(
+                        cpu_tree.as_ptr().cast::<u8>(),
+                        core::mem::size_of_val(cpu_tree),
+                    ),
+                )
+            };
+
+        if dbg {
+            let table: Vec<String> = RANKED_EXACT_TUNE_CANDIDATES
+                .iter()
+                .enumerate()
+                .map(|(i, k)| {
+                    format!(
+                        "k={k}:[{:.1},{:.1}] mean={:.1}ms",
+                        samples[i][0], samples[i][1], means[i]
+                    )
+                })
+                .collect();
+            eprintln!(
+                "[gpu-commit] broad exact-AB {} -> k={} verified={verified}",
+                table.join(" "),
+                if verified { chosen } else { 0 },
+            );
+        }
+        finish_ranked_exact_contention_tune(
+            params,
+            cpu_tree,
+            if verified { chosen } else { 0 },
+        );
+    }
+
     /// Use the ranked cache-local deep-pair CPU suffix and hash each finalized
     /// chunk before eviction. `FLOCK_NO_HYBRID_CPU_SUFFIX_DEEP=1` restores the
     /// original all-layer streaming suffix plus separate leaf-hash pass for an
@@ -3556,7 +3933,19 @@ kernel void parent_hash3(device const uint* children [[buffer(0)]],
     // dual-run. Nothing timed changes in any path.
     // -----------------------------------------------------------------------
 
-    const WARMUP_CACHE_MAGIC: u64 = 0x464C_4B5F_574C_4332; // "FLK_WLC2"
+    const WARMUP_CACHE_MAGIC_V2: u64 = 0x464C_4B5F_574C_4332; // "FLK_WLC2"
+    // V3 excludes V2 entries published before calibration was deferred; such
+    // entries can contain the usize::MAX untuned sentinel. The canonical
+    // reprime kill switch deliberately returns to the incumbent V2 cache.
+    const WARMUP_CACHE_MAGIC_V3: u64 = 0x464C_4B5F_574C_4333; // "FLK_WLC3"
+
+    fn warmup_cache_magic() -> u64 {
+        if hybrid_tune_canonical_reprime_enabled() {
+            WARMUP_CACHE_MAGIC_V3
+        } else {
+            WARMUP_CACHE_MAGIC_V2
+        }
+    }
 
     /// Cache key component tying entries to the exact GPU kernel source.
     const WARMUP_CACHE_MSL_FNV: u64 = fnv1a64(MSL_SOURCE);
@@ -3574,7 +3963,8 @@ kernel void parent_hash3(device const uint* children [[buffer(0)]],
     }
 
     fn warmup_cache_path() -> std::path::PathBuf {
-        std::env::temp_dir().join("flock-warmup-latch-v2.bin")
+        let version = if hybrid_tune_canonical_reprime_enabled() { 3 } else { 2 };
+        std::env::temp_dir().join(format!("flock-warmup-latch-v{version}.bin"))
     }
 
     fn read_warmup_cache(log_d: usize, n_leaves: usize) -> Option<WarmupCache> {
@@ -3585,7 +3975,7 @@ kernel void parent_hash3(device const uint* children [[buffer(0)]],
             off += 8;
             Some(v)
         };
-        if take_u64(&bytes)? != WARMUP_CACHE_MAGIC {
+        if take_u64(&bytes)? != warmup_cache_magic() {
             return None;
         }
         if take_u64(&bytes)? != WARMUP_CACHE_MSL_FNV {
@@ -3597,7 +3987,7 @@ kernel void parent_hash3(device const uint* children [[buffer(0)]],
         let latch_on = take_u64(&bytes)? == 1;
         let tuned_k = take_u64(&bytes)? as usize;
         let cpu_wall_ms = f64::from_bits(take_u64(&bytes)?);
-        if !cpu_wall_ms.is_finite() || tuned_k > 16 {
+        if !cpu_wall_ms.is_finite() || cpu_wall_ms <= 0.0 || tuned_k >= 16 {
             return None;
         }
         let root_bytes = bytes.get(off..)?;
@@ -3617,6 +4007,9 @@ kernel void parent_hash3(device const uint* children [[buffer(0)]],
         cpu_wall_ms: f64,
         cpu_tree: &[Hash],
     ) {
+        if !cpu_wall_ms.is_finite() || cpu_wall_ms <= 0.0 || tuned_k >= 16 {
+            return;
+        }
         let cpu_root: Hash = if latch_on {
             match cpu_tree.last() {
                 Some(root) => *root,
@@ -3627,7 +4020,7 @@ kernel void parent_hash3(device const uint* children [[buffer(0)]],
         };
         let mut buf = Vec::with_capacity(64 + core::mem::size_of::<Hash>());
         for v in [
-            WARMUP_CACHE_MAGIC,
+            warmup_cache_magic(),
             WARMUP_CACHE_MSL_FNV,
             log_d as u64,
             n_leaves as u64,
@@ -3642,6 +4035,31 @@ kernel void parent_hash3(device const uint* children [[buffer(0)]],
         let tmp = path.with_extension(format!("tmp{}", std::process::id()));
         if std::fs::write(&tmp, &buf).is_ok() {
             let _ = std::fs::rename(&tmp, &path);
+        }
+    }
+
+    /// Publish the terminal cache-miss outcome. k=0 is the correctness-first
+    /// fallback: warmup already byte-verified the pure-GPU graph, while a
+    /// failed hybrid sample has not earned publication.
+    fn finish_ranked_exact_contention_tune(
+        params: &crate::pcs::commit::PcsParams,
+        cpu_tree: &[Hash],
+        k: usize,
+    ) {
+        debug_assert!(RANKED_EXACT_TUNE_CANDIDATES.contains(&k));
+        TUNED_HYBRID_K.store(k, std::sync::atomic::Ordering::Release);
+        if super::warmup_latch_cache_enabled() {
+            let cpu_wall_ms = f64::from_bits(
+                RANKED_EXACT_PENDING_CPU_WALL_BITS.load(std::sync::atomic::Ordering::Acquire),
+            );
+            write_warmup_cache(
+                params.k_code(),
+                params.n_leaves(),
+                true,
+                k,
+                cpu_wall_ms,
+                cpu_tree,
+            );
         }
     }
 
@@ -3769,6 +4187,7 @@ kernel void parent_hash3(device const uint* children [[buffer(0)]],
                         eprintln!("[gpu-commit] warmup cache: latch OFF (cached)");
                     }
                     let cpu_tree = cpu(&mut codeword);
+                    super::satisfy_ranked_exact_contention_tune();
                     *latch = LatchState::Off;
                     return (CodewordBuf::Cpu(codeword), MerkleTreeBuf::Cpu(cpu_tree));
                 }
@@ -3796,6 +4215,9 @@ kernel void parent_hash3(device const uint* children [[buffer(0)]],
                         }
                         TUNED_HYBRID_K
                             .store(cache.tuned_k, std::sync::atomic::Ordering::Relaxed);
+                        // The publishing worker already completed the exact
+                        // replay; keep cache-hit workers out of calibration.
+                        super::satisfy_ranked_exact_contention_tune();
                         // The warmup prove continues on this commit's output:
                         // materialize the verified GPU codeword into the
                         // caller's CPU buffer and hand back the GPU tree.
@@ -3850,6 +4272,7 @@ kernel void parent_hash3(device const uint* children [[buffer(0)]],
                     eprintln!("[gpu-commit] warmup: GPU unavailable ({e}); latching CPU path");
                 }
                 *latch = LatchState::Off;
+                super::satisfy_ranked_exact_contention_tune();
                 if super::warmup_latch_cache_enabled() {
                     write_warmup_cache(
                         params.k_code(),
@@ -3929,15 +4352,26 @@ kernel void parent_hash3(device const uint* children [[buffer(0)]],
             release_latched(gpu, run.latched);
             *latch = LatchState::Off;
         }
-        if super::warmup_latch_cache_enabled() {
-            write_warmup_cache(
-                params.k_code(),
-                params.n_leaves(),
-                on,
-                TUNED_HYBRID_K.load(std::sync::atomic::Ordering::Relaxed),
-                cpu_wall_ms,
-                &cpu_tree,
-            );
+        let defer_ranked_cache = on
+            && super::ranked_exact_contention_tune_pending()
+            && ranked_exact_tune_applicable(params);
+        if defer_ranked_cache {
+            // The outer commit/AB join has not returned. Publish only after
+            // its exact replay has selected and byte-verified a terminal k.
+            RANKED_EXACT_PENDING_CPU_WALL_BITS
+                .store(cpu_wall_ms.to_bits(), std::sync::atomic::Ordering::Release);
+        } else {
+            super::satisfy_ranked_exact_contention_tune();
+            if super::warmup_latch_cache_enabled() {
+                write_warmup_cache(
+                    params.k_code(),
+                    params.n_leaves(),
+                    on,
+                    if on { hybrid_cpu_sixteenths() } else { 0 },
+                    cpu_wall_ms,
+                    &cpu_tree,
+                );
+            }
         }
         (CodewordBuf::Cpu(codeword), MerkleTreeBuf::Cpu(cpu_tree))
     }
@@ -4340,8 +4774,50 @@ kernel void parent_hash3(device const uint* children [[buffer(0)]],
 
     #[cfg(test)]
     mod split_select_tests {
-        use super::{DEFAULT_HYBRID_K, choose_hybrid_k};
+        use super::{
+            DEFAULT_HYBRID_K, RANKED_EXACT_TUNE_CANDIDATES, choose_hybrid_k,
+            collect_ranked_exact_samples, mean_ranked_exact_samples,
+        };
         const C: [usize; 8] = [0, 2, 3, 4, 5, 6, 7, 8];
+
+        #[test]
+        fn broad_candidate_set_is_stable() {
+            assert_eq!(RANKED_EXACT_TUNE_CANDIDATES, C);
+        }
+
+        #[test]
+        fn exact_samples_are_broad_balanced_and_each_reprimed() {
+            let events = std::cell::RefCell::new(Vec::new());
+            let samples = collect_ranked_exact_samples(
+                || {
+                    events.borrow_mut().push(-1);
+                    Ok::<(), ()>(())
+                },
+                |k| {
+                    events.borrow_mut().push(k as i32);
+                    Ok::<f64, ()>(k as f64)
+                },
+            )
+            .unwrap();
+            assert_eq!(
+                *events.borrow(),
+                [
+                    -1, 0, -1, 2, -1, 3, -1, 4, -1, 5, -1, 6, -1, 7, -1, 8, -1, 8,
+                    -1, 7, -1, 6, -1, 5, -1, 4, -1, 3, -1, 2, -1, 0,
+                ]
+            );
+            assert_eq!(samples[0], [0.0, 0.0]);
+            assert_eq!(samples[7], [8.0, 8.0]);
+        }
+
+        #[test]
+        fn exact_selection_uses_valid_balanced_means() {
+            let mut samples = [[100.0; 2]; RANKED_EXACT_TUNE_CANDIDATES.len()];
+            samples[1] = [90.0, 110.0];
+            assert_eq!(mean_ranked_exact_samples(samples).unwrap()[1], 100.0);
+            samples[1][1] = f64::NAN;
+            assert!(mean_ranked_exact_samples(samples).is_none());
+        }
 
         #[test]
         fn smallest_share_within_band_wins() {
@@ -4456,6 +4932,14 @@ mod imp {
             crate::pcs::commit::CodewordBuf::Cpu(codeword),
             crate::pcs::commit::MerkleTreeBuf::Cpu(tree),
         )
+    }
+
+    pub(crate) fn retune_ranked_hybrid_with_exact_contention(
+        _params: &crate::pcs::commit::PcsParams,
+        _cpu_codeword: &[F128],
+        _cpu_tree: &[crate::merkle::Hash],
+        _replay_ab: impl Fn() + Sync,
+    ) {
     }
 
     pub(crate) fn give_tree(_tree: Vec<crate::merkle::Hash>) {}

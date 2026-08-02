@@ -2535,6 +2535,11 @@ fn use_deferred_ranked_lincheck_stripe(n_blocks_log: usize, pcs_params: &PcsPara
     )
 }
 
+#[inline]
+fn should_request_ranked_exact_tune(call: usize, ranked_shape_enabled: bool) -> bool {
+    call == 0 && ranked_shape_enabled
+}
+
 fn generate_witness_with_ab_packed_and_lincheck_streamed(
     blocks: &[Compression],
     n_blocks_log: usize,
@@ -2817,6 +2822,13 @@ impl Blake3Setup {
         use std::sync::atomic::{AtomicUsize, Ordering};
         static PROVE_FAST_CALLS: AtomicUsize = AtomicUsize::new(0);
         let call = PROVE_FAST_CALLS.fetch_add(1, Ordering::Relaxed);
+        // Call zero is the untimed warmup but materializes an eager lincheck
+        // stripe before the timed proof establishes streaming. Issue the
+        // exact-contention ticket here, before witness generation, so only
+        // warmup can calibrate and cache-hit workers skip the replay.
+        if should_request_ranked_exact_tune(call, self.use_ranked_reverse_lincheck()) {
+            let _ = flock_core::gpu_commit::request_ranked_exact_contention_tune();
+        }
         // Keepalive nudger removed: ranked submission 51a3127 measured the
         // stack containing it at −1.4% vs base (outside the ±0.3% band) —
         // mid-proof pool nudging contends with the leaf pipeline's claims,
@@ -3356,6 +3368,14 @@ mod tests {
     const CHUNK_START: u32 = 1 << 0;
     const CHUNK_END: u32 = 1 << 1;
     const ROOT: u32 = 1 << 3;
+
+    #[test]
+    fn ranked_exact_tune_is_warmup_call_only() {
+        assert!(should_request_ranked_exact_tune(0, true));
+        assert!(!should_request_ranked_exact_tune(1, true));
+        assert!(!should_request_ranked_exact_tune(2, true));
+        assert!(!should_request_ranked_exact_tune(0, false));
+    }
 
     #[test]
     fn deferred_stripe_selector_is_exact_and_killable() {
