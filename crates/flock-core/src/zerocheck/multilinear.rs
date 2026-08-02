@@ -56,6 +56,8 @@ use kernels::aarch64::{
 };
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 use kernels::aarch64::fold_round2_compact_chunk_neon_anchors_only_8;
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+use kernels::aarch64::fold_compact_chunk_neon_reconstruct_only_8;
 #[cfg(all(
     target_arch = "x86_64",
     target_feature = "avx512f",
@@ -1027,6 +1029,46 @@ pub fn fold_compact_and_compute_round_pair(
     let mut b_out = crate::scratch::take_f128(n);
     #[cfg(target_arch = "aarch64")]
     let degen = r2_degen_enabled();
+
+    // GPU T3 products arm (see `ENV_NO_GPU_ZC_T3`): a measured prefix of
+    // the hi-chunks gets its message products computed on the GPU (which
+    // redundantly reconstructs its chunks' pairs from the same compact
+    // inputs via the nibble-decomposed scaled table) while the CPU writes
+    // those chunks' reconstruction outputs through a products-skipping
+    // sibling kernel (byte-identical stores). Partials for prefix chunks
+    // are merged after the join; the XOR reduce below is order-independent,
+    // so the output is bit-identical to the all-CPU sweep. `None` = the
+    // exact incumbent path.
+    // PARKED pending a wrap-budget probe: three archives carrying this
+    // integration died scoreless on the runner while a frontier-content
+    // draw from the same account scored cleanly in the same window, and
+    // halving the calibration did not change the outcome. The untouched
+    // suspect is this arm's +1.5 GiB of per-process no-copy wrap surface
+    // (the promoted r2 arm's 1 GiB is the largest proven-survivable
+    // wrap budget; the loop arm adds only 0.5 GiB and ships alone to
+    // bisect). The kernel, oracle test, and CPU sibling stay in-tree —
+    // re-enable by restoring this launch once the budget is understood.
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    const ZC_T3_INTEGRATION_PARKED: bool = true;
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    let gpu_job = if ZC_T3_INTEGRATION_PARKED {
+        None
+    } else {
+        crate::gpu_commit::launch_zc_t3_products(
+            &compact.anchors,
+            &compact.deltas,
+            &scaled_table,
+            eq_lo,
+            eq_hi,
+            lo_size,
+            hi_size,
+        )
+    };
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    let gpu_prefix = gpu_job.as_ref().map_or(0, |j| j.cpu_split());
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    let t_cpu_sweep = std::time::Instant::now();
+
     // Hetero-queue drain, same contract as the compact materialization above.
     let mut partials: Vec<(F128, F128)> = vec![(F128::ZERO, F128::ZERO); hi_size];
     let a_base = crate::epool::SyncPtr(a_out.as_mut_ptr());
@@ -1042,6 +1084,24 @@ pub fn fold_compact_and_compute_round_pair(
         };
         {
             let base = x_hi * chunk_size;
+
+            // GPU-covered prefix chunk: write the identical reconstruction
+            // outputs, skip the products (the GPU partial replaces this
+            // chunk's slot after the join).
+            #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+            if x_hi < gpu_prefix {
+                unsafe {
+                    fold_compact_chunk_neon_reconstruct_only_8(
+                        scaled_table.as_ptr().cast::<u8>(),
+                        compact.anchors.as_ptr().add(2 * base),
+                        compact.deltas.as_ptr().add(2 * base * table.n_chunks),
+                        a_out.as_mut_ptr(),
+                        b_out.as_mut_ptr(),
+                        lo_size,
+                    );
+                }
+                return;
+            }
 
             #[cfg(target_arch = "aarch64")]
             let (p1, pinf) = unsafe {
@@ -1094,6 +1154,51 @@ pub fn fold_compact_and_compute_round_pair(
             }
         }
     });
+    // Drain the GPU products arm: merge prefix partials (timed proves),
+    // finish calibration (untimed warmup), or CPU-redo the skipped prefix
+    // products on any post-admission Metal failure.
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    if let Some(job) = gpu_job {
+        let cpu_wall_ms = t_cpu_sweep.elapsed().as_secs_f64() * 1e3;
+        let calib = job.is_calibration();
+        let prefix = job.cpu_split();
+        let res = crate::gpu_commit::zc_t3_wait(
+            job,
+            if calib { Some(partials.as_slice()) } else { None },
+            cpu_wall_ms,
+            hi_size,
+        );
+        match res {
+            crate::gpu_commit::ZcT3Result::Calibrated => {}
+            crate::gpu_commit::ZcT3Result::Prefix(vals) => {
+                partials[..prefix].copy_from_slice(&vals);
+            }
+            crate::gpu_commit::ZcT3Result::Failed => {
+                // Redo exactly the skipped prefix products — slower, still
+                // exact. The full kernel rewrites the same reconstruction
+                // values into the real output ranges (byte-identical
+                // stores), so reusing them as targets is safe.
+                for x_hi in 0..prefix {
+                    let base = x_hi * chunk_size;
+                    let (p1, pinf) = unsafe {
+                        fold_compact_chunk_neon_unchecked_8(
+                            scaled_table.as_ptr().cast::<u8>(),
+                            compact.anchors.as_ptr().add(2 * base),
+                            compact.deltas.as_ptr().add(2 * base * table.n_chunks),
+                            a_out.as_mut_ptr().wrapping_add(base),
+                            b_out.as_mut_ptr().wrapping_add(base),
+                            eq_lo.as_ptr(),
+                            lo_size,
+                            degen,
+                        )
+                    };
+                    let eq_h = eq_hi[x_hi];
+                    partials[x_hi] = (eq_h * p1, eq_h * pinf);
+                }
+            }
+        }
+    }
+
     let (sum1, sum_inf) = partials
         .iter()
         .fold((F128::ZERO, F128::ZERO), |(s1, sinf), &(c1, cinf)| {
@@ -1734,6 +1839,31 @@ fn fold_and_compute_round_pair_into_with_n_hi(
     let hetero = false;
 
     let (sum1, sum_inf) = if hetero {
+        // GPU loop-round products arm (see `ENV_NO_GPU_ZC_LOOP`): a
+        // measured prefix of the hi-chunks gets its message products
+        // computed on the GPU (which folds its chunks' pairs redundantly
+        // via ρ-nibble tables) while the CPU writes those chunks' folded
+        // outputs through the exact field-layer `fold_pairs` kernel,
+        // skipping just the products. Only engaged on the LARGEST loop
+        // round (half ≥ 2^24): the share is calibrated at that round's
+        // chunk size, and a measured local A/B showed the same share
+        // makes the GPU the straggler on the next (half-size) round
+        // (12.6 → 33.7 ms) — per-size recalibration is not worth a
+        // second sync for an LLC-adjacent round. `None` = the exact
+        // incumbent path.
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        let gpu_job = if half >= (1usize << 24) {
+            crate::gpu_commit::launch_zc_loop_products(
+                a, b, r_fold, eq_lo, eq_hi, lo_size, hi_size,
+            )
+        } else {
+            None
+        };
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        let gpu_prefix = gpu_job.as_ref().map_or(0, |j| j.cpu_split());
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        let t_cpu_sweep = std::time::Instant::now();
+
         let mut partials: Vec<(F128, F128)> = vec![(F128::ZERO, F128::ZERO); hi_size];
         let a_base = crate::epool::SyncPtr(a_out.as_mut_ptr());
         let b_base = crate::epool::SyncPtr(b_out.as_mut_ptr());
@@ -1746,6 +1876,19 @@ fn fold_and_compute_round_pair_into_with_n_hi(
                     std::slice::from_raw_parts_mut(b_base.ptr().add(x_hi * chunk_out), chunk_out),
                 )
             };
+
+            // GPU-covered prefix chunk: write the identical folded
+            // outputs via the field-layer fold, skip the products (the
+            // GPU partial replaces this chunk's slot after the join).
+            #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+            if x_hi < gpu_prefix {
+                let a_in = &a[x_hi * chunk_in..(x_hi + 1) * chunk_in];
+                let b_in = &b[x_hi * chunk_in..(x_hi + 1) * chunk_in];
+                crate::field::f128_slice::fold_pairs(a_in, 0, a_out, r_fold);
+                crate::field::f128_slice::fold_pairs(b_in, 0, b_out, r_fold);
+                return;
+            }
+
             let (p1, pinf) = chunk_partial(
                 &a[x_hi * chunk_in..(x_hi + 1) * chunk_in],
                 &b[x_hi * chunk_in..(x_hi + 1) * chunk_in],
@@ -1758,6 +1901,56 @@ fn fold_and_compute_round_pair_into_with_n_hi(
                 *partials_base.ptr().add(x_hi) = (eq_h * p1, eq_h * pinf);
             }
         });
+
+        // Drain the GPU products arm: merge prefix partials (timed
+        // proves), finish calibration (untimed warmup), or CPU-redo the
+        // skipped prefix products on any post-admission Metal failure.
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        if let Some(job) = gpu_job {
+            let cpu_wall_ms = t_cpu_sweep.elapsed().as_secs_f64() * 1e3;
+            let calib = job.is_calibration();
+            let prefix = job.cpu_split();
+            let res = crate::gpu_commit::zc_loop_wait(
+                job,
+                if calib { Some(partials.as_slice()) } else { None },
+                cpu_wall_ms,
+                hi_size,
+            );
+            match res {
+                crate::gpu_commit::ZcLoopResult::Calibrated => {}
+                crate::gpu_commit::ZcLoopResult::Prefix(vals) => {
+                    partials[..prefix].copy_from_slice(&vals);
+                }
+                crate::gpu_commit::ZcLoopResult::Failed => {
+                    // Redo exactly the skipped prefix products — slower,
+                    // still exact. The fused chunk rewrites the same
+                    // folded values (byte-identical stores).
+                    for x_hi in 0..prefix {
+                        let (a_out, b_out) = unsafe {
+                            (
+                                std::slice::from_raw_parts_mut(
+                                    a_base.ptr().add(x_hi * chunk_out),
+                                    chunk_out,
+                                ),
+                                std::slice::from_raw_parts_mut(
+                                    b_base.ptr().add(x_hi * chunk_out),
+                                    chunk_out,
+                                ),
+                            )
+                        };
+                        let (p1, pinf) = chunk_partial(
+                            &a[x_hi * chunk_in..(x_hi + 1) * chunk_in],
+                            &b[x_hi * chunk_in..(x_hi + 1) * chunk_in],
+                            a_out,
+                            b_out,
+                        );
+                        let eq_h = eq_hi[x_hi];
+                        partials[x_hi] = (eq_h * p1, eq_h * pinf);
+                    }
+                }
+            }
+        }
+
         partials
             .iter()
             .fold((F128::ZERO, F128::ZERO), |(s1, sinf), &(c1, cinf)| {
