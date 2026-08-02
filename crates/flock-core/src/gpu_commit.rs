@@ -71,30 +71,6 @@ pub(crate) fn warmup_latch_cache_enabled() -> bool {
     *ON.get_or_init(|| std::env::var_os(ENV_NO_WARMUP_LATCH_CACHE).is_none())
 }
 
-/// Kill switch for the GPU keep-warm bridge: `FLOCK_NO_GPU_KEEPWARM=1`
-/// disables it. The bridge dispatches small untimed leaf-hash kernels on a
-/// private scratch buffer ONLY between proves (armed when the first ranked
-/// warmup commit finishes, hard-paused the moment any prove begins), so the
-/// GPU's DVFS state does not decay across the warmup prove's CPU tail and
-/// the worker's ready->seed gap. Measured on M3 Pro at ranked size: a
-/// 1 s GPU idle gap costs +6% and a 2 s gap +18-22% on the next commit
-/// graph wall; back-to-back runs are flat. Timed work is never touched:
-/// the bridge never runs while a prove is active.
-pub const ENV_NO_GPU_KEEPWARM: &str = "FLOCK_NO_GPU_KEEPWARM";
-
-pub(crate) fn gpu_keepwarm_enabled() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os(ENV_NO_GPU_KEEPWARM).is_none())
-}
-
-/// Called at the top of every prove: stops keep-warm dispatches for the
-/// prove's whole duration (timed phases must never share the GPU or the
-/// memory system with the bridge).
-pub fn gpu_keepwarm_prove_started() {
-    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-    imp::keepwarm_pause();
-}
-
 /// Env var that disables this round's NTT pass tuning (the g4 shared-table +
 /// zero-region-skip from-z kernel and the half-footprint final-pass kernel),
 /// restoring the incumbent kernel selection as the same-binary control.
@@ -215,6 +191,61 @@ fn gpu_z_pin_enabled() -> bool {
 /// Strict kill switch for the fused three-level GPU Merkle parent pass. Only
 /// exact value `1` disables it; the optimization remains ranked-tree-only.
 pub const ENV_NO_GPU_PARENT3: &str = "FLOCK_NO_GPU_PARENT3";
+
+/// Exact rollback for completing the ranked hybrid CPU suffix's Merkle
+/// subtrees on Metal as each CPU-owned sixteenth finishes its NTT.  The
+/// candidate is restricted to wider (`k >= 6`) CPU suffixes: it removes leaf
+/// hashing from the contended P-core NTT branch and overlaps those hashes with
+/// later CPU sixteenths, while the existing k=5 path remains the incumbent
+/// candidate in the split autotuner.
+pub const ENV_NO_GPU_SUFFIX_MERKLE: &str = "FLOCK_NO_GPU_SUFFIX_MERKLE";
+
+fn gpu_suffix_merkle_value_enabled(value: Option<&std::ffi::OsStr>) -> bool {
+    value != Some(std::ffi::OsStr::new("1"))
+}
+
+fn gpu_suffix_merkle_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        gpu_suffix_merkle_value_enabled(
+            std::env::var_os(ENV_NO_GPU_SUFFIX_MERKLE).as_deref(),
+        )
+    })
+}
+
+fn select_gpu_suffix_merkle(
+    log_d: usize,
+    n_leaves: usize,
+    k_cpu16: usize,
+    deep_pipeline: bool,
+    enabled: bool,
+) -> bool {
+    enabled
+        && deep_pipeline
+        && log_d == 20
+        && n_leaves == 1usize << 20
+        && (6..16).contains(&k_cpu16)
+}
+
+#[cfg(test)]
+mod gpu_suffix_merkle_gate_tests {
+    use std::ffi::OsStr;
+
+    #[test]
+    fn exact_rollback_and_wide_ranked_shape_only() {
+        assert!(!super::gpu_suffix_merkle_value_enabled(Some(OsStr::new("1"))));
+        for value in [None, Some(""), Some("0"), Some("01"), Some("true")] {
+            assert!(super::gpu_suffix_merkle_value_enabled(value.map(OsStr::new)));
+        }
+        assert!(super::select_gpu_suffix_merkle(20, 1 << 20, 6, true, true));
+        assert!(super::select_gpu_suffix_merkle(20, 1 << 20, 15, true, true));
+        assert!(!super::select_gpu_suffix_merkle(20, 1 << 20, 5, true, true));
+        assert!(!super::select_gpu_suffix_merkle(20, 1 << 20, 6, false, true));
+        assert!(!super::select_gpu_suffix_merkle(20, 1 << 20, 6, true, false));
+        assert!(!super::select_gpu_suffix_merkle(19, 1 << 20, 6, true, true));
+        assert!(!super::select_gpu_suffix_merkle(20, 1 << 19, 6, true, true));
+    }
+}
 
 fn gpu_parent3_value_enabled(value: Option<&std::ffi::OsStr>) -> bool {
     value != Some(std::ffi::OsStr::new("1"))
@@ -3498,10 +3529,11 @@ kernel void export_from_z_zero_root_tabs(
     /// (layers 0..3) over the full codeword, then owns the position prefix
     /// (first `16 - k` sixteenths: remaining NTT passes + its aligned Merkle
     /// subtrees) asynchronously while the CPU completes the suffix `k`
-    /// sixteenths (layers 4.. via the bit-exact block-range driver, suffix
-    /// leaves + subtree parents) directly in the shared staging and tree
-    /// buffers. The top 7 tree nodes are (re)computed on the CPU after the
-    /// join, covering every decomposition boundary.
+    /// sixteenths (layers 4.. via the bit-exact block-range driver) directly
+    /// in shared staging. The incumbent hashes the suffix on CPU; the wider
+    /// candidate queues each completed sixteenth's disjoint Merkle subtree on
+    /// Metal. The top 15 tree nodes are (re)computed on the CPU after the join,
+    /// covering every sixteenth boundary.
     ///
     /// Bit-exact: same kernels/twiddles on both sides, every element and
     /// tree node written exactly once (top nodes twice, identically).
@@ -3545,7 +3577,7 @@ kernel void export_from_z_zero_root_tabs(
         }
     }
 
-    unsafe fn run_commit_graph_from_z_hybrid_impl(
+    unsafe fn run_commit_graph_from_z_hybrid_impl_with_suffix_merkle_override(
         gpu: &Gpu,
         z_buf: Id,
         staging: Id,
@@ -3556,6 +3588,7 @@ kernel void export_from_z_zero_root_tabs(
         k_cpu16: usize,
         first_pass_done: bool,
         pre_cb2: Option<Id>,
+        gpu_suffix_merkle_override: Option<bool>,
     ) -> Result<(), String> {
         use rayon::prelude::*;
         debug_assert!((1..16).contains(&k_cpu16));
@@ -3599,138 +3632,219 @@ kernel void export_from_z_zero_root_tabs(
                 let suffix_leaf_start = prefix_leaves;
                 let suffix_leaves = n_leaves - prefix_leaves;
                 let deep_pipeline = hybrid_cpu_suffix_deep_pipeline_enabled();
-                let local_parent_levels = if deep_pipeline {
+                let gpu_suffix_merkle = super::select_gpu_suffix_merkle(
+                    log_d,
+                    n_leaves,
+                    k_cpu16,
+                    deep_pipeline,
+                    gpu_suffix_merkle_override
+                        .unwrap_or_else(super::gpu_suffix_merkle_enabled),
+                );
+                let local_parent_levels = if deep_pipeline && !gpu_suffix_merkle {
                     hybrid_local_parent_levels()
                 } else {
                     0
                 };
-                if deep_pipeline {
-                    // Publish and hash each finalized layer-10 chunk, then
-                    // build its local parent levels before the leaf hashes
-                    // leave cache. `elem_offset` is absolute in the shared
-                    // staging buffer, hence `leaf_start` lands directly in
-                    // the CPU-owned suffix of the shared tree. Different
-                    // callback invocations own disjoint 1,024-leaf ranges at
-                    // every local level; the GPU owns only
-                    // `0..prefix_leaves`.
-                    let finish_chunk = |elem_offset: usize, chunk: &[F128]| {
-                        debug_assert_eq!(elem_offset % 64, 0);
-                        let leaf_start = elem_offset / 64;
-                        let leaf_len = chunk.len() / 64;
-                        debug_assert!(leaf_start >= suffix_leaf_start);
-                        debug_assert!(leaf_start + leaf_len <= n_leaves);
-                        // SAFETY: the NTT callback runs only after this chunk's
-                        // last write. Callback ranges are pairwise disjoint and
-                        // disjoint from the concurrently executing GPU prefix.
-                        let bytes = core::slice::from_raw_parts(
-                            chunk.as_ptr().cast::<u8>(),
-                            core::mem::size_of_val(chunk),
-                        );
-                        hash_ranked_leaf_chunk_and_local_parents(
-                            bytes,
-                            tree_base,
-                            n_leaves,
-                            leaf_start,
-                            leaf_len,
-                            local_parent_levels,
-                        );
-                    };
-                    ntt.forward_transform_interleaved_ranked_block_range_and_then(
-                        data,
-                        64,
-                        4,
-                        log_d,
-                        16 - k_cpu16,
-                        16,
-                        finish_chunk,
-                    );
-                } else {
-                    // Exact same-binary control: the original streaming suffix
-                    // driver followed by a separate 4,096-leaf hash traversal.
-                    ntt.forward_transform_interleaved_block_range(
-                        data,
-                        64,
-                        4,
-                        log_d,
-                        16 - k_cpu16,
-                        16,
-                    );
-                    let suffix_bytes: &[u8] = core::slice::from_raw_parts(
-                        data.as_ptr().cast::<u8>().add(suffix_leaf_start * 1024),
-                        suffix_leaves * 1024,
-                    );
-                    const LEAF_JOB: usize = 1 << 12;
-                    suffix_bytes
-                        .par_chunks(LEAF_JOB * 1024)
-                        .enumerate()
-                        .for_each(|(i, bytes)| {
-                            // SAFETY: disjoint leaf output ranges per job.
-                            let outs = core::slice::from_raw_parts_mut(
-                                tree_base.ptr().add(suffix_leaf_start + i * LEAF_JOB),
-                                bytes.len() / 1024,
+                // Retained because each suffix command buffer is deliberately
+                // kept past its enqueue point.  Every result path below waits
+                // and releases every entry before the outer autorelease pool
+                // or staging lease can be released.
+                let mut suffix_cbs = Vec::<Id>::with_capacity(k_cpu16);
+                let mut graph_result = (|| -> Result<(), String> {
+                    if deep_pipeline {
+                        // Publish and hash each finalized layer-10 chunk, then
+                        // build its local parent levels before the leaf hashes
+                        // leave cache. `elem_offset` is absolute in the shared
+                        // staging buffer, hence `leaf_start` lands directly in
+                        // the CPU-owned suffix of the shared tree. Different
+                        // callback invocations own disjoint 1,024-leaf ranges at
+                        // every local level; the GPU owns only
+                        // `0..prefix_leaves`.
+                        let finish_chunk = |elem_offset: usize, chunk: &[F128]| {
+                            debug_assert_eq!(elem_offset % 64, 0);
+                            let leaf_start = elem_offset / 64;
+                            let leaf_len = chunk.len() / 64;
+                            debug_assert!(leaf_start >= suffix_leaf_start);
+                            debug_assert!(leaf_start + leaf_len <= n_leaves);
+                            // SAFETY: the NTT callback runs only after this chunk's
+                            // last write. Callback ranges are pairwise disjoint and
+                            // disjoint from the concurrently executing GPU prefix.
+                            let bytes = core::slice::from_raw_parts(
+                                chunk.as_ptr().cast::<u8>(),
+                                core::mem::size_of_val(chunk),
                             );
-                            crate::merkle::hash_ranked_blake3_leaf_chunk(bytes, outs);
-                        });
+                            hash_ranked_leaf_chunk_and_local_parents(
+                                bytes,
+                                tree_base,
+                                n_leaves,
+                                leaf_start,
+                                leaf_len,
+                                local_parent_levels,
+                            );
+                        };
+                        if gpu_suffix_merkle {
+                            // Complete one exact layer-4 block (one sixteenth)
+                            // at a time. The range call returns only after all
+                            // 64 cache-local layer-10 chunks in this sixteenth
+                            // have published their final rows. Queue its exact
+                            // 2^16-leaf subtree immediately, then let Metal hash
+                            // it while the CPU advances to later sixteenths.
+                            let sixteenth = n_leaves / 16;
+                            for b in (16 - k_cpu16)..16 {
+                                ntt.forward_transform_interleaved_ranked_block_range_and_then(
+                                    data,
+                                    64,
+                                    4,
+                                    log_d,
+                                    b,
+                                    b + 1,
+                                    |_, _| {},
+                                );
+                                // Publish every ordinary CPU store to unified
+                                // shared staging before committing a GPU reader.
+                                // The single command queue already orders this
+                                // buffer behind cb2 and all earlier subtrees.
+                                std::sync::atomic::fence(
+                                    std::sync::atomic::Ordering::Release,
+                                );
+                                let cb = gpu.command_buffer()?;
+                                let enc = gpu.compute_encoder(cb)?;
+                                encode_merkle_subtree(
+                                    gpu,
+                                    enc,
+                                    staging,
+                                    tree_buf,
+                                    n_leaves,
+                                    b * sixteenth,
+                                    sixteenth,
+                                );
+                                gpu.end_encoding(enc);
+                                let cb = gpu.retain(cb);
+                                gpu.commit_async(cb);
+                                suffix_cbs.push(cb);
+                            }
+                        } else {
+                            ntt.forward_transform_interleaved_ranked_block_range_and_then(
+                                data,
+                                64,
+                                4,
+                                log_d,
+                                16 - k_cpu16,
+                                16,
+                                finish_chunk,
+                            );
+                        }
+                    } else {
+                        // Exact same-binary control: the original streaming suffix
+                        // driver followed by a separate 4,096-leaf hash traversal.
+                        ntt.forward_transform_interleaved_block_range(
+                            data,
+                            64,
+                            4,
+                            log_d,
+                            16 - k_cpu16,
+                            16,
+                        );
+                        let suffix_bytes: &[u8] = core::slice::from_raw_parts(
+                            data.as_ptr().cast::<u8>().add(suffix_leaf_start * 1024),
+                            suffix_leaves * 1024,
+                        );
+                        const LEAF_JOB: usize = 1 << 12;
+                        suffix_bytes
+                            .par_chunks(LEAF_JOB * 1024)
+                            .enumerate()
+                            .for_each(|(i, bytes)| {
+                                // SAFETY: disjoint leaf output ranges per job.
+                                let outs = core::slice::from_raw_parts_mut(
+                                    tree_base.ptr().add(suffix_leaf_start + i * LEAF_JOB),
+                                    bytes.len() / 1024,
+                                );
+                                crate::merkle::hash_ranked_blake3_leaf_chunk(bytes, outs);
+                            });
+                    }
+                    if !gpu_suffix_merkle {
+                        // Suffix aligned subtrees' parents (greedy decomposition).
+                        let mut sstart = suffix_leaf_start;
+                        while sstart < n_leaves {
+                            let mut size = 1usize << (n_leaves - sstart).ilog2();
+                            while sstart % size != 0 {
+                                size >>= 1;
+                            }
+                            let mut level_start = 0usize;
+                            let mut level_len = n_leaves;
+                            let mut local_start = sstart;
+                            let mut local_len = size;
+                            // Each 1,024-leaf callback already populated these exact
+                            // flat-tree ranges. Resume at the first shared level
+                            // instead of traversing the cache-cold leaves again.
+                            for _ in 0..local_parent_levels {
+                                level_start += level_len;
+                                level_len /= 2;
+                                local_start /= 2;
+                                local_len /= 2;
+                            }
+                            while local_len > 1 {
+                                let write_level_start = level_start + level_len;
+                                let (r0, w0) = (
+                                    level_start + local_start,
+                                    write_level_start + local_start / 2,
+                                );
+                                let n_out = local_len / 2;
+                                // ≤1024-output jobs (the parent kernel's contract),
+                                // parallel across the level.
+                                // SAFETY: read level fully written (leaves above /
+                                // previous iteration); each job's write range is
+                                // disjoint, and all are disjoint from concurrent GPU
+                                // subtree ranges.
+                                (0..n_out.div_ceil(1024)).into_par_iter().for_each(|j| {
+                                    let o = j * 1024;
+                                    let len = 1024.min(n_out - o);
+                                    let read = core::slice::from_raw_parts(
+                                        tree_base.ptr().add(r0 + 2 * o),
+                                        2 * len,
+                                    );
+                                    let write = core::slice::from_raw_parts_mut(
+                                        tree_base.ptr().add(w0 + o),
+                                        len,
+                                    );
+                                    crate::merkle::hash_ranked_blake3_parent_chunk(read, write);
+                                });
+                                level_start = write_level_start;
+                                level_len /= 2;
+                                local_start /= 2;
+                                local_len /= 2;
+                            }
+                            sstart += size;
+                        }
+                    }
+                    Ok(())
+                })();
+
+                // Once cb2 is committed no Result exit may release the staging
+                // lease while queued work still references it. Always drain
+                // cb2 and every retained suffix buffer, preserving the first
+                // CPU/encode/status error but continuing all waits/releases.
+                let waited = gpu.wait_cb(cb2);
+                if graph_result.is_ok() {
+                    graph_result = waited;
                 }
-                // Suffix aligned subtrees' parents (greedy decomposition).
-                let mut sstart = suffix_leaf_start;
-                while sstart < n_leaves {
-                    let mut size = 1usize << (n_leaves - sstart).ilog2();
-                    while sstart % size != 0 {
-                        size >>= 1;
+                for cb in suffix_cbs.drain(..) {
+                    let waited = gpu.wait_cb(cb);
+                    gpu.release(cb);
+                    if graph_result.is_ok() {
+                        graph_result = waited;
                     }
-                    let mut level_start = 0usize;
-                    let mut level_len = n_leaves;
-                    let mut local_start = sstart;
-                    let mut local_len = size;
-                    // Each 1,024-leaf callback already populated these exact
-                    // flat-tree ranges. Resume at the first shared level
-                    // instead of traversing the cache-cold leaves again.
-                    for _ in 0..local_parent_levels {
-                        level_start += level_len;
-                        level_len /= 2;
-                        local_start /= 2;
-                        local_len /= 2;
-                    }
-                    while local_len > 1 {
-                        let write_level_start = level_start + level_len;
-                        let (r0, w0) =
-                            (level_start + local_start, write_level_start + local_start / 2);
-                        let n_out = local_len / 2;
-                        // ≤1024-output jobs (the parent kernel's contract),
-                        // parallel across the level.
-                        // SAFETY: read level fully written (leaves above /
-                        // previous iteration); each job's write range is
-                        // disjoint, and all are disjoint from concurrent GPU
-                        // subtree ranges.
-                        (0..n_out.div_ceil(1024)).into_par_iter().for_each(|j| {
-                            let o = j * 1024;
-                            let len = 1024.min(n_out - o);
-                            let read = core::slice::from_raw_parts(
-                                tree_base.ptr().add(r0 + 2 * o),
-                                2 * len,
-                            );
-                            let write = core::slice::from_raw_parts_mut(
-                                tree_base.ptr().add(w0 + o),
-                                len,
-                            );
-                            crate::merkle::hash_ranked_blake3_parent_chunk(read, write);
-                        });
-                        level_start = write_level_start;
-                        level_len /= 2;
-                        local_start /= 2;
-                        local_len /= 2;
-                    }
-                    sstart += size;
+                }
+                if let Err(e) = graph_result {
+                    return Err(e);
                 }
 
-                // Join the GPU prefix, then (re)compute every level above
+                // Join complete: (re)compute every level above
                 // the sixteenth-granularity roots. Every subtree on either
                 // side spans ≥ one sixteenth (2^16 leaves), so the 16-node
                 // level is always fully populated by subtree-internal
                 // parents; the 15 nodes above it are recomputed here,
                 // covering every decomposition boundary for any k.
-                gpu.wait_cb(cb2)?;
                 let mut level_start = 0usize;
                 let mut level_len = n_leaves;
                 while level_len > 16 {
@@ -3753,6 +3867,64 @@ kernel void export_from_z_zero_root_tabs(
             })();
             gpu.pool_pop(pool);
             r
+        }
+    }
+
+    unsafe fn run_commit_graph_from_z_hybrid_impl(
+        gpu: &Gpu,
+        z_buf: Id,
+        staging: Id,
+        tw_buf: Id,
+        tree_buf: Id,
+        log_d: usize,
+        n_leaves: usize,
+        k_cpu16: usize,
+        first_pass_done: bool,
+        pre_cb2: Option<Id>,
+    ) -> Result<(), String> {
+        unsafe {
+            run_commit_graph_from_z_hybrid_impl_with_suffix_merkle_override(
+                gpu,
+                z_buf,
+                staging,
+                tw_buf,
+                tree_buf,
+                log_d,
+                n_leaves,
+                k_cpu16,
+                first_pass_done,
+                pre_cb2,
+                None,
+            )
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) unsafe fn run_commit_graph_from_z_hybrid_for_test(
+        gpu: &Gpu,
+        z_buf: Id,
+        staging: Id,
+        tw_buf: Id,
+        tree_buf: Id,
+        log_d: usize,
+        n_leaves: usize,
+        k_cpu16: usize,
+        gpu_suffix_merkle: bool,
+    ) -> Result<(), String> {
+        unsafe {
+            run_commit_graph_from_z_hybrid_impl_with_suffix_merkle_override(
+                gpu,
+                z_buf,
+                staging,
+                tw_buf,
+                tree_buf,
+                log_d,
+                n_leaves,
+                k_cpu16,
+                false,
+                None,
+                Some(gpu_suffix_merkle),
+            )
         }
     }
 
@@ -4390,92 +4562,6 @@ kernel void export_from_z_zero_root_tabs(
         *ON.get_or_init(|| std::env::var_os("FLOCK_NO_HYBRID_CPU_SUFFIX_DEEP").is_none())
     }
 
-    // -----------------------------------------------------------------------
-    // GPU keep-warm bridge (see `ENV_NO_GPU_KEEPWARM` docs at the top).
-    // -----------------------------------------------------------------------
-
-    static KEEPWARM_PAUSED: std::sync::atomic::AtomicBool =
-        std::sync::atomic::AtomicBool::new(true);
-    static KEEPWARM_STARTED: std::sync::atomic::AtomicBool =
-        std::sync::atomic::AtomicBool::new(false);
-
-    pub(crate) fn keepwarm_pause() {
-        KEEPWARM_PAUSED.store(true, std::sync::atomic::Ordering::Release);
-    }
-
-    /// Resume (and lazily spawn) the keep-warm thread. Called only from the
-    /// first ranked warmup commit's latch-On paths, i.e. strictly inside the
-    /// untimed warmup prove.
-    pub(crate) fn keepwarm_arm() {
-        use std::sync::atomic::Ordering;
-        if !super::gpu_keepwarm_enabled() {
-            return;
-        }
-        KEEPWARM_PAUSED.store(false, Ordering::Release);
-        if KEEPWARM_STARTED.swap(true, Ordering::AcqRel) {
-            return;
-        }
-        let _ = std::thread::Builder::new()
-            .name("gpu-keepwarm".into())
-            .spawn(keepwarm_thread);
-    }
-
-    fn keepwarm_thread() {
-        use std::sync::atomic::Ordering;
-        // Utility QoS: the bridge must never contend for P-cores.
-        unsafe extern "C" {
-            fn pthread_set_qos_class_self_np(qos_class: u32, rel: i32) -> i32;
-        }
-        unsafe {
-            let _ = pthread_set_qos_class_self_np(0x11, 0);
-        }
-        let Ok(gpu) = gpu() else { return };
-        unsafe {
-            let pool = gpu.pool_push();
-            // 16 MiB of leaf input + the matching tree slice: one dispatch is
-            // ~0.2 ms of real GPU work, small enough that at most one is ever
-            // in flight when a prove pauses the bridge (its drain hides under
-            // the prove's CPU-side witness start), large enough to hold DVFS.
-            const KW_LEAVES: usize = 16_384;
-            let (Ok(data), Ok(tree)) =
-                (gpu.new_buffer(KW_LEAVES * 1024), gpu.new_buffer(KW_LEAVES * 32))
-            else {
-                gpu.pool_pop(pool);
-                return;
-            };
-            // Contents are irrelevant (private scratch, never read back), but
-            // fault the pages once so dispatches do real reads.
-            std::ptr::write_bytes(gpu.buffer_contents(data), 0xA5, KW_LEAVES * 1024);
-            let mut warmed_s = 0.0f64;
-            // Hard cap: a worker's inter-prove windows total well under a
-            // minute; anything longer means a non-worker context, stop.
-            while warmed_s < 60.0 {
-                if KEEPWARM_PAUSED.load(Ordering::Acquire) {
-                    std::thread::sleep(std::time::Duration::from_micros(500));
-                    continue;
-                }
-                let t0 = std::time::Instant::now();
-                let ok = (|| -> Result<(), String> {
-                    let cb = gpu.command_buffer()?;
-                    let enc = gpu.compute_encoder(cb)?;
-                    gpu.set_pipeline(enc, gpu.pso_leaf);
-                    gpu.set_buffer(enc, data, 0, 0);
-                    gpu.set_buffer(enc, tree, 0, 1);
-                    gpu.dispatch(enc, (KW_LEAVES / 256) as u64, 256);
-                    gpu.end_encoding(enc);
-                    gpu.commit_and_wait(cb)
-                })();
-                warmed_s += t0.elapsed().as_secs_f64();
-                if ok.is_err() {
-                    break;
-                }
-            }
-            gpu.release(data);
-            gpu.release(tree);
-            gpu.pool_pop(pool);
-        }
-    }
-
     struct WarmupRun {
         latched: Latched,
         gpu_tree: Vec<Hash>,
@@ -4508,7 +4594,6 @@ kernel void export_from_z_zero_root_tabs(
     // V3 excludes V2 entries published before calibration was deferred; such
     // entries can contain the usize::MAX untuned sentinel. The canonical
     // reprime kill switch deliberately returns to the incumbent V2 cache.
-    // (Redraw marker AUTO-1, 2026-08-02 11:19: automated same-binary redraw while the promoted bar remains the disclosed marker-only resample at 1,357,262.51. Latest account draws: 1319797.87332625 / 1317557.71279261 / 1342891.19447755. Content change required for per-account resubmission.)
     const WARMUP_CACHE_MAGIC_V3: u64 = 0x464C_4B5F_574C_4333; // "FLK_WLC3"
 
     fn warmup_cache_magic() -> u64 {
@@ -4519,37 +4604,46 @@ kernel void export_from_z_zero_root_tabs(
         }
     }
 
-    /// Cache key component tying entries to both the exact GPU source and
-    /// selected from-z mode. Candidate and exact-rollback processes must not
-    /// consume each other's latch or tuned split.
-    fn warmup_cache_msl_fnv_for(zero_root: bool) -> u64 {
-        let base = fnv1a64(MSL_SOURCE);
+    /// Cache key component tying entries to the exact GPU source and every
+    /// host-side graph mode that can change the tuned split. Candidate and
+    /// exact-rollback processes must not consume each other's latch or `k`.
+    fn warmup_cache_msl_fnv_for(zero_root: bool, gpu_suffix_merkle: bool) -> u64 {
+        let mut key = fnv1a64(MSL_SOURCE);
         if zero_root {
-            base ^ fnv1a64(FROM_Z_ZERO_ROOT_MSL_SOURCE).rotate_left(1)
-                ^ 0x5A52_4F4F_545F_3131 // "ZROOT_11"
-        } else {
-            base
+            key ^= fnv1a64(FROM_Z_ZERO_ROOT_MSL_SOURCE).rotate_left(1)
+                ^ 0x5A52_4F4F_545F_3131; // "ZROOT_11"
         }
+        if gpu_suffix_merkle {
+            key ^= 0x4750_5553_4D4B_4C37; // "GPUSMKL7": per-sixteenth enqueue
+        }
+        key
     }
 
     fn warmup_cache_msl_fnv() -> u64 {
-        warmup_cache_msl_fnv_for(super::gpu_from_z_zero_root_selected(20))
+        warmup_cache_msl_fnv_for(
+            super::gpu_from_z_zero_root_selected(20),
+            super::gpu_suffix_merkle_enabled(),
+        )
     }
 
     #[cfg(test)]
     mod zero_root_cache_key_tests {
         #[test]
         fn supplemental_source_and_mode_have_a_distinct_fingerprint() {
-            let incumbent = super::warmup_cache_msl_fnv_for(false);
-            let candidate = super::warmup_cache_msl_fnv_for(true);
+            let incumbent = super::warmup_cache_msl_fnv_for(false, false);
+            let candidate = super::warmup_cache_msl_fnv_for(true, false);
+            let suffix_merkle = super::warmup_cache_msl_fnv_for(false, true);
             assert_eq!(incumbent, super::fnv1a64(super::MSL_SOURCE));
             assert_ne!(candidate, incumbent);
+            assert_ne!(suffix_merkle, incumbent);
+            assert_ne!(suffix_merkle, candidate);
             assert_eq!(
                 candidate,
                 incumbent
                     ^ super::fnv1a64(super::FROM_Z_ZERO_ROOT_MSL_SOURCE).rotate_left(1)
                     ^ 0x5A52_4F4F_545F_3131
             );
+            assert_eq!(suffix_merkle, incumbent ^ 0x4750_5553_4D4B_4C37);
         }
 
         #[test]
@@ -4850,7 +4944,6 @@ kernel void export_from_z_zero_root_tabs(
                         }
                         let tree = run.gpu_tree;
                         *latch = LatchState::On(run.latched);
-                        keepwarm_arm();
                         return (CodewordBuf::Cpu(codeword), MerkleTreeBuf::Cpu(tree));
                     }
                     // Mismatch or wall regression: discard and fall through
@@ -4964,7 +5057,6 @@ kernel void export_from_z_zero_root_tabs(
                 &cpu_tree,
             );
             *latch = LatchState::On(run.latched);
-            keepwarm_arm();
         } else {
             release_latched(gpu, run.latched);
             *latch = LatchState::Off;
@@ -5573,83 +5665,6 @@ mod tests {
     use super::*;
     use crate::field::F128;
 
-    /// GPU idle-decay probe at ranked size: full commit graph wall
-    /// back-to-back vs after idle gaps. Ignored; run with --ignored --nocapture.
-    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-    #[test]
-    #[ignore]
-    fn gpu_idle_decay_probe() {
-        let log_d = 20usize;
-        let n_leaves = 1usize << 20;
-        let gpu = match imp::gpu() {
-            Ok(g) => g,
-            Err(e) => { eprintln!("no GPU: {e}"); return; }
-        };
-        let ntt = crate::ntt::AdditiveNttF128::standard(log_d);
-        let twiddles = flat_twiddle_table(&ntt, log_d);
-        unsafe {
-            let pool = gpu.pool_push();
-            let staging = gpu.new_buffer(n_leaves * 1024).unwrap();
-            let tree_buf = gpu.new_buffer((2 * n_leaves - 1) * 32).unwrap();
-            let tw_bytes = core::mem::size_of_val(twiddles.as_slice());
-            let tw_buf = gpu.new_buffer(tw_bytes).unwrap();
-            std::ptr::copy_nonoverlapping(twiddles.as_ptr().cast::<u8>(), gpu.buffer_contents(tw_buf), tw_bytes);
-            let base = gpu.buffer_contents(staging);
-            for i in (0..n_leaves * 1024).step_by(4096) {
-                *base.add(i) = (i as u8).wrapping_mul(31) | 1;
-            }
-            let run_full = || -> f64 {
-                let cb = gpu.command_buffer().unwrap();
-                let enc = gpu.compute_encoder(cb).unwrap();
-                imp::encode_ntt_passes(gpu, enc, staging, tw_buf, log_d, 4);
-                imp::encode_merkle(gpu, enc, staging, tree_buf, n_leaves);
-                gpu.end_encoding(enc);
-                let t0 = std::time::Instant::now();
-                gpu.commit_and_wait(cb).unwrap();
-                t0.elapsed().as_secs_f64() * 1e3
-            };
-            let _ = run_full(); // warm
-            // Keep-warm-flavored idle: small leaf dispatches for the gap
-            // instead of sleeping.
-            let kw_leaves = 65_536usize;
-            let kw_data = gpu.new_buffer(kw_leaves * 1024).unwrap();
-            let kw_tree = gpu.new_buffer(kw_leaves * 32).unwrap();
-            std::ptr::write_bytes(gpu.buffer_contents(kw_data), 0xA5, kw_leaves * 1024);
-            let warm_idle = |ms: u64| {
-                let t0 = std::time::Instant::now();
-                let mut n = 0u32;
-                while t0.elapsed().as_millis() < ms as u128 {
-                    let cb = gpu.command_buffer().unwrap();
-                    let enc = gpu.compute_encoder(cb).unwrap();
-                    gpu.set_pipeline(enc, gpu.pso_leaf);
-                    gpu.set_buffer(enc, kw_data, 0, 0);
-                    gpu.set_buffer(enc, kw_tree, 0, 1);
-                    gpu.dispatch(enc, (kw_leaves / 256) as u64, 256);
-                    gpu.end_encoding(enc);
-                    gpu.commit_and_wait(cb).unwrap();
-                    n += 1;
-                }
-                n
-            };
-            for (rep, idle_ms, warm) in [
-                (0u32, 0u64, false), (1, 2000, false), (2, 0, false),
-                (3, 2000, true), (4, 0, false), (5, 2000, false),
-                (6, 2000, true), (7, 0, false),
-            ] {
-                let mut n = 0;
-                if idle_ms > 0 {
-                    if warm { n = warm_idle(idle_ms); }
-                    else { std::thread::sleep(std::time::Duration::from_millis(idle_ms)); }
-                }
-                let ms = run_full();
-                println!("rep={rep} idle={idle_ms}ms warm={warm} dispatches={n} full={ms:.2}ms");
-            }
-            gpu.release(kw_data); gpu.release(kw_tree);
-            gpu.release(staging); gpu.release(tree_buf); gpu.release(tw_buf);
-            gpu.pool_pop(pool);
-        }
-    }
-
     #[test]
     fn precompute_wall_handoff_observes_late_store() {
         let wall_bits = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
@@ -6119,6 +6134,123 @@ mod tests {
             "ranked-shape NTT: gpu {gpu_ms:.1} ms (incl. 2 GiB copies) vs cpu {cpu_ms:.1} ms"
         );
         assert_eq!(data, expect, "GPU full NTT mismatch at ranked shape");
+    }
+
+    /// Full production-geometry oracle for Metal completion of a CPU-owned
+    /// six-sixteenth suffix.  This checks the complete 1 GiB codeword and all
+    /// `2 * 2^20 - 1` flat-tree slots against independent CPU construction.
+    /// It is ignored in ordinary test suites because of its memory footprint.
+    #[test]
+    #[ignore = "ranked 1 GiB codeword plus CPU/GPU oracle buffers"]
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    fn gpu_suffix_merkle_ranked_k678_and_rollback_match_cpu() {
+        use super::imp;
+
+        const LOG_D: usize = 20;
+        const N_LEAVES: usize = 1 << LOG_D;
+        const SPLITS: [usize; 3] = [6, 7, 8];
+
+        for k in SPLITS {
+            assert!(super::select_gpu_suffix_merkle(
+                LOG_D, N_LEAVES, k, true, true,
+            ));
+        }
+        let ntt = AdditiveNttF128::standard(LOG_D);
+        let mut rng = Rng::new(0x5A17_6D3E_4B1E_0006);
+        let z = rng.vec((64 << LOG_D) / 2);
+
+        let mut expect_codeword: Vec<F128> = crate::alloc_uninit_vec(64 << LOG_D);
+        crate::pcs::commit::replicate_message_fill(&mut expect_codeword, &z);
+        ntt.forward_transform_interleaved_from_layer(&mut expect_codeword, 64, 1);
+        let expect_bytes = unsafe {
+            core::slice::from_raw_parts(
+                expect_codeword.as_ptr().cast::<u8>(),
+                core::mem::size_of_val(expect_codeword.as_slice()),
+            )
+        };
+        let expect_tree =
+            crate::merkle::merkle_tree(expect_bytes, N_LEAVES, crate::merkle::HashKind::Blake3);
+
+        let gpu = match gpu_or_skip(imp::gpu().map(|g| g as *const imp::Gpu)) {
+            Some(g) => unsafe { &*g },
+            None => return,
+        };
+        let twiddles = flat_twiddle_table(&ntt, LOG_D);
+        unsafe {
+            let pool = gpu.pool_push();
+            let staging = gpu
+                .new_buffer(core::mem::size_of_val(expect_codeword.as_slice()))
+                .unwrap();
+            let z_buf = gpu.new_buffer(core::mem::size_of_val(z.as_slice())).unwrap();
+            let tw_buf = gpu
+                .new_buffer(core::mem::size_of_val(twiddles.as_slice()))
+                .unwrap();
+            let tree_buf = gpu
+                .new_buffer(expect_tree.len() * core::mem::size_of::<crate::merkle::Hash>())
+                .unwrap();
+            std::ptr::copy_nonoverlapping(
+                z.as_ptr().cast::<u8>(),
+                gpu.buffer_contents(z_buf),
+                core::mem::size_of_val(z.as_slice()),
+            );
+            std::ptr::copy_nonoverlapping(
+                twiddles.as_ptr().cast::<u8>(),
+                gpu.buffer_contents(tw_buf),
+                core::mem::size_of_val(twiddles.as_slice()),
+            );
+            for k_cpu16 in SPLITS {
+                for gpu_suffix_merkle in [false, true] {
+                    std::ptr::write_bytes(
+                        gpu.buffer_contents(staging),
+                        0xA5,
+                        core::mem::size_of_val(expect_codeword.as_slice()),
+                    );
+                    std::ptr::write_bytes(
+                        gpu.buffer_contents(tree_buf),
+                        0x5A,
+                        expect_tree.len() * core::mem::size_of::<crate::merkle::Hash>(),
+                    );
+
+                    imp::run_commit_graph_from_z_hybrid_for_test(
+                        gpu,
+                        z_buf,
+                        staging,
+                        tw_buf,
+                        tree_buf,
+                        LOG_D,
+                        N_LEAVES,
+                        k_cpu16,
+                        gpu_suffix_merkle,
+                    )
+                    .unwrap();
+
+                    let got_codeword = core::slice::from_raw_parts(
+                        gpu.buffer_contents(staging).cast::<F128>(),
+                        expect_codeword.len(),
+                    );
+                    let got_tree = core::slice::from_raw_parts(
+                        gpu.buffer_contents(tree_buf).cast::<crate::merkle::Hash>(),
+                        expect_tree.len(),
+                    );
+                    assert_eq!(
+                        got_codeword,
+                        expect_codeword.as_slice(),
+                        "codeword mismatch k={k_cpu16} gpu_suffix_merkle={gpu_suffix_merkle}",
+                    );
+                    assert_eq!(
+                        got_tree,
+                        expect_tree.as_slice(),
+                        "tree mismatch k={k_cpu16} gpu_suffix_merkle={gpu_suffix_merkle}",
+                    );
+                }
+            }
+
+            gpu.release(staging);
+            gpu.release(z_buf);
+            gpu.release(tw_buf);
+            gpu.release(tree_buf);
+            gpu.pool_pop(pool);
+        }
     }
 
     #[test]
