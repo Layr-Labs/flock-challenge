@@ -54,6 +54,8 @@ use kernels::aarch64::{
     fold_compact_stream_chunk_neon, fold_round2_chunk_neon_unchecked_8,
     fold_round2_compact_chunk_neon_unchecked_8, fold_round2_compact_stream_chunk_neon,
 };
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+use kernels::aarch64::fold_round2_compact_chunk_neon_anchors_only_8;
 #[cfg(all(
     target_arch = "x86_64",
     target_feature = "avx512f",
@@ -599,6 +601,30 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_with_deltas(
     #[cfg(target_arch = "aarch64")]
     let degen = r2_degen_enabled();
 
+    // GPU round-two products arm (see `ENV_NO_GPU_ZC_R2`): a measured
+    // prefix of the hi-chunks gets its message products computed on the
+    // otherwise-idle GPU while the CPU writes those chunks' anchors and
+    // deltas through the anchors-only sibling kernel (byte-identical
+    // stores). Partials for prefix chunks are merged after the join; the
+    // XOR reduce below is order-independent, so the output is bit-identical
+    // to the all-CPU sweep. `None` = the exact incumbent path.
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    let gpu_job = crate::gpu_commit::launch_zc_r2_products(
+        a_packed,
+        b_packed,
+        &table.data,
+        eq_lo,
+        eq_hi,
+        lo_size,
+        hi_size,
+        pair_in_block_mask,
+        useful_pairs_inclusive,
+    );
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    let gpu_prefix = gpu_job.as_ref().map_or(0, |j| j.cpu_split());
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    let t_cpu_sweep = std::time::Instant::now();
+
     // Chunks drain through the hetero queue so the idle efficiency cores add
     // throughput without an equal-band barrier penalty (see `epool`). Each
     // chunk writes only its own anchors/deltas ranges and partials slot; the
@@ -628,6 +654,27 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_with_deltas(
         {
             let pair_idx_base = x_hi * lo_size;
             let row_base = pair_idx_base * 2;
+
+            // GPU-covered prefix chunk: write the identical anchors and
+            // deltas, skip the products (the GPU partial replaces this
+            // chunk's slot after the join).
+            #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+            if x_hi < gpu_prefix {
+                unsafe {
+                    fold_round2_compact_chunk_neon_anchors_only_8(
+                        table.data.as_ptr().cast::<u8>(),
+                        a_packed.as_ptr().add(row_base * n_chunks),
+                        b_packed.as_ptr().add(row_base * n_chunks),
+                        anchors.as_mut_ptr(),
+                        deltas.as_mut_ptr(),
+                        lo_size,
+                        pair_idx_base,
+                        pair_in_block_mask,
+                        useful_pairs_inclusive,
+                    );
+                }
+                return;
+            }
 
             #[cfg(target_arch = "aarch64")]
             let (p1, pinf) = unsafe {
@@ -688,6 +735,56 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_with_deltas(
             }
         }
     });
+    // Drain the GPU products arm: merge prefix partials (timed proves),
+    // finish calibration (untimed warmup), or CPU-redo the skipped prefix
+    // products on any post-admission Metal failure.
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    if let Some(job) = gpu_job {
+        let cpu_wall_ms = t_cpu_sweep.elapsed().as_secs_f64() * 1e3;
+        let calib = job.is_calibration();
+        let prefix = job.cpu_split();
+        let res = crate::gpu_commit::zc_r2_wait(
+            job,
+            if calib { Some(partials.as_slice()) } else { None },
+            cpu_wall_ms,
+            hi_size,
+        );
+        match res {
+            crate::gpu_commit::ZcR2Result::Calibrated => {}
+            crate::gpu_commit::ZcR2Result::Prefix(vals) => {
+                partials[..prefix].copy_from_slice(&vals);
+            }
+            crate::gpu_commit::ZcR2Result::Failed => {
+                // Redo exactly the skipped prefix products — slower, still
+                // exact. Throwaway anchor/delta scratch: the real ranges
+                // were already written by the anchors-only pass.
+                let mut scr_anchors = vec![F128::ZERO; anchor_chunk_size];
+                let mut scr_deltas = vec![0u8; delta_chunk_size];
+                for x_hi in 0..prefix {
+                    let pair_idx_base = x_hi * lo_size;
+                    let row_base = pair_idx_base * 2;
+                    let (p1, pinf) = unsafe {
+                        fold_round2_compact_chunk_neon_unchecked_8(
+                            table.data.as_ptr().cast::<u8>(),
+                            a_packed.as_ptr().add(row_base * n_chunks),
+                            b_packed.as_ptr().add(row_base * n_chunks),
+                            scr_anchors.as_mut_ptr(),
+                            scr_deltas.as_mut_ptr(),
+                            eq_lo.as_ptr(),
+                            lo_size,
+                            pair_idx_base,
+                            pair_in_block_mask,
+                            useful_pairs_inclusive,
+                            degen,
+                        )
+                    };
+                    let eq_h = eq_hi[x_hi];
+                    partials[x_hi] = (eq_h * p1, eq_h * pinf);
+                }
+            }
+        }
+    }
+
     let (sum1, sum_inf) = partials
         .iter()
         .fold((F128::ZERO, F128::ZERO), |(s1, sinf), &(c1, cinf)| {
