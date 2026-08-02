@@ -472,99 +472,6 @@ impl AdditiveNttF128 {
         unreachable!("ranked top split requires a hardware NTT target");
     }
 
-    /// Start an interleaved transform directly from the rate-reduced message,
-    /// fusing the first three nontrivial layers into the stores that initialize
-    /// `data`, then finish the remaining layers in place.
-    ///
-    /// The ordinary path first writes `2^start_layer` replicas of `msg`, then
-    /// immediately reads and rewrites the whole codeword for the radix-8 pass
-    /// at `start_layer..start_layer + 3`. This entry point reads the same
-    /// message rows and writes the post-radix-8 values directly, so stale
-    /// destination bytes are never loaded and the replica-fill pass vanishes.
-    pub(crate) fn forward_transform_interleaved_from_message_fused3(
-        &self,
-        msg: &[F128],
-        data: &mut [F128],
-        num_ntts: usize,
-        start_layer: usize,
-    ) {
-        use rayon::prelude::*;
-
-        assert_eq!(num_ntts, 8, "recursive from-message fusion uses eight lanes");
-        let log_d = log2_pow2(data.len() / num_ntts);
-        assert!(start_layer + 3 <= log_d);
-        assert_eq!(data.len(), msg.len() << start_layer);
-
-        let num_blocks = 1usize << start_layer;
-        let block_positions = 1usize << (log_d - start_layer);
-        let block_elems = block_positions * num_ntts;
-        let eighth = block_positions >> 3;
-        assert_eq!(msg.len(), block_elems);
-        let twiddles: Vec<[F128; 7]> = (0..num_blocks)
-            .map(|block| {
-                let mut tw = [F128 { lo: 0, hi: 0 }; 7];
-                tw[0] = self.twiddle(start_layer, block);
-                for s in 0..2 {
-                    tw[1 + s] = self.twiddle(start_layer + 1, 2 * block + s);
-                }
-                for s in 0..4 {
-                    tw[3 + s] = self.twiddle(start_layer + 2, 4 * block + s);
-                }
-                tw
-            })
-            .collect();
-        debug_assert_eq!(twiddles[0][0], F128::ZERO);
-        debug_assert_eq!(twiddles[0][1], F128::ZERO);
-        debug_assert_eq!(twiddles[0][3], F128::ZERO);
-
-        const ROWS_PER_TILE: usize = 128;
-        let tiles_per_block = eighth.div_ceil(ROWS_PER_TILE);
-        let src = msg.as_ptr() as usize;
-        let dst = data.as_mut_ptr() as usize;
-        (0..num_blocks * tiles_per_block)
-            .into_par_iter()
-            .for_each(|job| {
-                let block = job / tiles_per_block;
-                let tile = job % tiles_per_block;
-                let row_start = tile * ROWS_PER_TILE;
-                let row_end = (row_start + ROWS_PER_TILE).min(eighth);
-                // SAFETY: each `(block, tile)` job owns all eight destination
-                // rows for one disjoint row interval. `msg` is immutable and
-                // has one complete layer-start block; every derived address
-                // is in the validated source/destination geometry.
-                unsafe {
-                    let dst_block = (dst as *mut F128).add(block * block_elems);
-                    for row in row_start..row_end {
-                        if block == 0 {
-                            kernels::butterfly_fused_3layer_zero_root_from_src_row(
-                                src as *const F128,
-                                dst_block,
-                                eighth,
-                                num_ntts,
-                                row,
-                                &twiddles[block],
-                            );
-                        } else {
-                            kernels::butterfly_fused_3layer_from_src_row(
-                                src as *const F128,
-                                dst_block,
-                                eighth,
-                                num_ntts,
-                                row,
-                                &twiddles[block],
-                            );
-                        }
-                    }
-                }
-            });
-
-        self.forward_transform_interleaved_from_layer(
-            data,
-            num_ntts,
-            start_layer + 3,
-        );
-    }
-
     /// Ranked L0 top passes with the layer-1 pass fused from the message:
     /// both rate-1/2 replica blocks' layer-1..3 butterflies are evaluated
     /// straight from `msg` (`replicate_message_fill` is exactly the
@@ -611,8 +518,6 @@ impl AdditiveNttF128 {
             tw
         };
 
-        let pass_timing = std::env::var_os("FLOCK_NTT_PASS_TIMING").is_some();
-        let t_l1 = std::time::Instant::now();
         // Layer-1 fused-3 pass from the message: 2 blocks, identical input.
         {
             let block_size = 1usize << (log_d - 1);
@@ -655,12 +560,6 @@ impl AdditiveNttF128 {
             });
         }
 
-        if pass_timing {
-            eprintln!(
-                "[ntt-pass] layer1-from-msg: {:.2} ms",
-                t_l1.elapsed().as_secs_f64() * 1e3
-            );
-        }
         // Layers 4 and 7: exact in-place ranked hetero passes.
         for layer in [4usize, 7] {
             let num_blocks = 1usize << layer;
@@ -677,178 +576,6 @@ impl AdditiveNttF128 {
                 (0..num_blocks).map(|b| block_twiddles(layer, b)).collect();
             butterfly_interleaved_fused_3layer_all_blocks_hetero(data, &twiddles, eighth, num_ntts);
         }
-    }
-
-    /// Complete layers `start_layer..log_d` of the big interleaved transform
-    /// for the absolute layer-`start_layer` blocks `[b_start, b_end)` only.
-    ///
-    /// Used by the hybrid GPU/CPU commit: the GPU finishes the shared top
-    /// pass, then owns a position prefix while the CPU completes the suffix
-    /// blocks with this routine. Twiddle indices are absolute (global layer
-    /// and block numbering of the full `log_d` transform), so outputs are
-    /// bit-identical to the unsplit transform on the same positions.
-    ///
-    /// Plain per-layer fused passes (fused-3 → fused-2 → single) over the
-    /// suffix slice; the suffix is a minority share sized so streaming
-    /// simplicity beats cache heroics.
-    pub(crate) fn forward_transform_interleaved_block_range(
-        &self,
-        data: &mut [F128],
-        num_ntts: usize,
-        start_layer: usize,
-        stop_layer: usize,
-        b_start: usize,
-        b_end: usize,
-    ) {
-        let log_d = log2_pow2(data.len() / num_ntts);
-        debug_assert!(stop_layer <= log_d);
-        let range_blocks = b_end - b_start;
-        debug_assert!(range_blocks > 0 && b_end <= (1usize << start_layer));
-        let top_block_positions = 1usize << (log_d - start_layer);
-        let base_pos = b_start * top_block_positions;
-
-        let mut layer = start_layer;
-        while layer < stop_layer {
-            let block_size = 1usize << (log_d - layer);
-            let block_elems = block_size * num_ntts;
-            // Absolute block index of the range's first block at this layer.
-            let abs_first = b_start << (layer - start_layer);
-            let num_blocks = range_blocks << (layer - start_layer);
-            let range_base_elem = base_pos * num_ntts;
-
-            // Never leave a lone final layer (block_size 2 ⇒ 2^19 serial
-            // kernel calls): when exactly 4 layers remain, take two fused-2
-            // passes instead of fused-3 + single.
-            if layer + 2 < stop_layer && stop_layer - layer != 4 && block_size >= 8 {
-                let eighth = block_size >> 3;
-                for local in 0..num_blocks {
-                    let abs = abs_first + local;
-                    let mut tw = [F128 { lo: 0, hi: 0 }; 7];
-                    tw[0] = self.twiddle(layer, abs);
-                    for s in 0..2 {
-                        tw[1 + s] = self.twiddle(layer + 1, 2 * abs + s);
-                    }
-                    for s in 0..4 {
-                        tw[3 + s] = self.twiddle(layer + 2, 4 * abs + s);
-                    }
-                    let start = local * block_elems;
-                    let slice =
-                        &mut data[range_base_elem + start..range_base_elem + start + block_elems];
-                    if tw[0] == F128::ZERO && tw[1] == F128::ZERO && tw[3] == F128::ZERO {
-                        butterfly_interleaved_fused_3layer_par_rows::<true>(
-                            slice, &tw, eighth, num_ntts,
-                        );
-                    } else {
-                        butterfly_interleaved_fused_3layer_par_rows::<false>(
-                            slice, &tw, eighth, num_ntts,
-                        );
-                    }
-                }
-                layer += 3;
-            } else if layer + 1 < stop_layer && block_size >= 4 {
-                let quarter = block_size >> 2;
-                for local in 0..num_blocks {
-                    let abs = abs_first + local;
-                    let start = local * block_elems;
-                    butterfly_interleaved_fused_2layer_par_rows(
-                        &mut data[range_base_elem + start..range_base_elem + start + block_elems],
-                        self.twiddle(layer, abs),
-                        self.twiddle(layer + 1, 2 * abs),
-                        self.twiddle(layer + 1, 2 * abs + 1),
-                        quarter,
-                        num_ntts,
-                    );
-                }
-                layer += 2;
-            } else {
-                let half = block_size >> 1;
-                for local in 0..num_blocks {
-                    let abs = abs_first + local;
-                    let start = local * block_elems;
-                    let t = self.twiddle(layer, abs);
-                    let chunk =
-                        &mut data[range_base_elem + start..range_base_elem + start + block_elems];
-                    // SAFETY: the fused-2 path handles all sizes ≥ 4; only
-                    // the final layer (block_size == 2) lands here, and the
-                    // NEON single-layer kernel covers it.
-                    #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
-                    unsafe {
-                        kernels::butterfly_neon_block(chunk, t, half * num_ntts);
-                    }
-                    #[cfg(not(all(target_arch = "aarch64", target_feature = "aes")))]
-                    {
-                        let (lo, hi) = chunk.split_at_mut(half * num_ntts);
-                        for (u, v) in lo.iter_mut().zip(hi.iter_mut()) {
-                            let nu = *u + *v * t;
-                            *v += nu;
-                            *u = nu;
-                        }
-                    }
-                }
-                layer += 1;
-            }
-        }
-    }
-
-    /// Complete a ranked hybrid suffix with the same cache-local schedule as
-    /// the tuned full-CPU transform, then publish each finalized 1 MiB chunk.
-    ///
-    /// The shared GPU pass has already completed layers 0..4.  This routine
-    /// runs the two remaining top radix-8 groups (layers 4..10) over the
-    /// requested absolute layer-4 blocks, then finishes layers 10..20 as five
-    /// fused pairs inside independent layer-10 sub-NTTs.  `finish_chunk`
-    /// receives an absolute element offset, so a concurrent GPU prefix and
-    /// this CPU suffix can write disjoint Merkle leaf ranges without rebasing
-    /// indices.  It runs immediately after the last pair while the 1 MiB
-    /// codeword chunk is still cache-resident.
-    ///
-    /// This deliberately has a narrow production contract.  Other shapes
-    /// keep [`Self::forward_transform_interleaved_block_range`].
-    pub(crate) fn forward_transform_interleaved_ranked_block_range_and_then<F>(
-        &self,
-        data: &mut [F128],
-        num_ntts: usize,
-        start_layer: usize,
-        stop_layer: usize,
-        b_start: usize,
-        b_end: usize,
-        finish_chunk: F,
-    ) where
-        F: Fn(usize, &[F128]) + Sync + Send,
-    {
-        const DEEP_LAYER: usize = 10;
-        let log_d = log2_pow2(data.len() / num_ntts);
-        assert_eq!(log_d, 20, "ranked hybrid suffix requires log_d=20");
-        assert_eq!(num_ntts, 64, "ranked hybrid suffix requires 64 lanes");
-        assert_eq!(start_layer, 4, "ranked hybrid suffix starts at layer 4");
-        assert_eq!(stop_layer, log_d, "ranked hybrid suffix completes the NTT");
-        assert!(b_start < b_end && b_end <= (1usize << start_layer));
-
-        // Two fused radix-8 passes.  Unlike the old all-layer range driver,
-        // this is the last streaming traversal of the complete suffix.
-        self.forward_transform_interleaved_block_range(
-            data,
-            num_ntts,
-            start_layer,
-            DEEP_LAYER,
-            b_start,
-            b_end,
-        );
-
-        // Every layer-4 block contains 2^(10-4) independent layer-10
-        // sub-NTTs.  Preserve their absolute indices so all deeper twiddles
-        // match the unsplit transform exactly.
-        let sub_start = b_start << (DEEP_LAYER - start_layer);
-        let sub_end = b_end << (DEEP_LAYER - start_layer);
-        self.forward_transform_interleaved_deep_fused_pairs_range_and_then(
-            data,
-            num_ntts,
-            DEEP_LAYER,
-            log_d,
-            sub_start,
-            sub_end,
-            &finish_chunk,
-        );
     }
 
     /// Finish the ranked L0 transform's five cache-local deep pairs and invoke
@@ -1275,50 +1002,18 @@ impl AdditiveNttF128 {
     ) where
         F: Fn(usize, &[F128]) + Sync + Send,
     {
-        self.forward_transform_interleaved_deep_fused_pairs_range_and_then(
-            data,
-            num_ntts,
-            n_top,
-            log_d,
-            0,
-            1usize << n_top,
-            finish_chunk,
-        );
-    }
-
-    /// Range form of the ranked deep-pair scheduler. `sub_start..sub_end` are
-    /// absolute layer-`n_top` block indices in the full transform; using the
-    /// absolute `sub_idx` below is what preserves every deeper twiddle index.
-    fn forward_transform_interleaved_deep_fused_pairs_range_and_then<F>(
-        &self,
-        data: &mut [F128],
-        num_ntts: usize,
-        n_top: usize,
-        log_d: usize,
-        sub_start: usize,
-        sub_end: usize,
-        finish_chunk: &F,
-    ) where
-        F: Fn(usize, &[F128]) + Sync + Send,
-    {
         use rayon::prelude::*;
 
         debug_assert!(n_top <= log_d);
         debug_assert_eq!(data.len(), (1usize << log_d) * num_ntts);
-        debug_assert!(sub_start < sub_end && sub_end <= (1usize << n_top));
         let sub_size_positions = 1usize << (log_d - n_top);
         let sub_elems = sub_size_positions * num_ntts;
         let low_twiddle_final_pair =
             use_ranked_low_twiddle_final_pair(log_d, num_ntts, n_top);
 
-        let range_start = sub_start * sub_elems;
-        let range_end = sub_end * sub_elems;
-
-        data[range_start..range_end]
-            .par_chunks_mut(sub_elems)
+        data.par_chunks_mut(sub_elems)
             .enumerate()
-            .for_each(|(local_sub_idx, sub_data)| {
-                let sub_idx = sub_start + local_sub_idx;
+            .for_each(|(sub_idx, sub_data)| {
                 let mut layer = n_top;
                 while layer + 1 < log_d {
                     let layer_in_sub = layer - n_top;
@@ -2188,7 +1883,14 @@ mod tests {
                 );
             }
         }
-        assert!(use_ranked_low_twiddle_final_pair(20, 64, 10));
+        assert_eq!(
+            use_ranked_low_twiddle_final_pair(20, 64, 10),
+            cfg!(all(
+                target_os = "macos",
+                target_arch = "aarch64",
+                target_feature = "aes"
+            ))
+        );
         assert!(!use_ranked_low_twiddle_final_pair(19, 64, 10));
         assert!(!use_ranked_low_twiddle_final_pair(20, 32, 10));
         assert!(!use_ranked_low_twiddle_final_pair(20, 64, 9));
@@ -2539,40 +2241,6 @@ mod tests {
         assert!(exercised, "test never transformed anything");
     }
 
-    /// Directly initializing the codeword with the first nontrivial radix-8
-    /// pass must match replica-fill followed by the ordinary transform, even
-    /// when every destination slot starts as poisoned scratch.
-    #[test]
-    fn recursive_from_message_fused3_matches_replicated_transform() {
-        const NUM_NTTS: usize = 8;
-        let mut rng = Rng::new(0x5241_5445_384D_5347);
-        for (log_d, start_layer) in [(12usize, 2usize), (12, 3)] {
-            let ntt = AdditiveNttF128::standard(log_d);
-            let msg_len = (1usize << (log_d - start_layer)) * NUM_NTTS;
-            let msg = rand_vec(&mut rng, msg_len);
-
-            let mut want = vec![F128::ZERO; msg_len << start_layer];
-            for replica in want.chunks_mut(msg_len) {
-                replica.copy_from_slice(&msg);
-            }
-            ntt.forward_transform_interleaved_from_layer(
-                &mut want,
-                NUM_NTTS,
-                start_layer,
-            );
-
-            let poison = F128::new(0xA5A5_A5A5_A5A5_A5A5, 0x5A5A_5A5A_5A5A_5A5A);
-            let mut got = vec![poison; msg_len << start_layer];
-            ntt.forward_transform_interleaved_from_message_fused3(
-                &msg,
-                &mut got,
-                NUM_NTTS,
-                start_layer,
-            );
-            assert_eq!(got, want, "log_d={log_d} rate_log={start_layer}");
-        }
-    }
-
     /// The ranked split extension must produce three consecutive radix-8
     /// groups (layers 1..10) that are exactly equivalent to applying those
     /// nine layers one at a time. Use a small domain here: the butterfly and
@@ -2881,149 +2549,5 @@ mod tests {
         for b in 0..8 {
             let _t = ntt.twiddle(log_d - 1, b);
         }
-    }
-}
-
-#[cfg(test)]
-mod twiddle_structure_check {
-    use super::*;
-    #[test]
-    #[ignore]
-    fn dump_top_layer_twiddle_structure() {
-        // Ranked shape: log_domain 20 positions? standard(k_code) — use 20.
-        let ntt = AdditiveNttF128::standard(20);
-        for layer in [1usize, 4, 7] {
-            let blocks = 1usize << layer;
-            let mut hi_zero = 0usize;
-            let mut lo_zero = 0usize;
-            for b in 0..blocks {
-                let t = ntt.twiddle(layer, b);
-                if t.hi == 0 {
-                    hi_zero += 1;
-                }
-                if t.lo == 0 && t.hi == 0 {
-                    lo_zero += 1;
-                }
-            }
-            println!("layer {layer}: {blocks} twiddles, hi==0: {hi_zero}, all-zero: {lo_zero}");
-            if layer == 7 {
-                for b in 0..8 {
-                    let t = ntt.twiddle(layer, b);
-                    println!("  t[{b}] = {:#018x}_{:016x}", t.hi, t.lo);
-                }
-            }
-        }
-        // also deep layers for context
-        for layer in [10usize, 15, 19] {
-            let blocks = 1usize << layer;
-            let hi_zero = (0..blocks).filter(|&b| ntt.twiddle(layer, b).hi == 0).count();
-            println!("layer {layer}: {blocks} twiddles, hi==0: {hi_zero}");
-        }
-    }
-}
-
-#[cfg(test)]
-mod block_range_equivalence {
-    use super::*;
-
-    #[test]
-    fn block_range_matches_full_transform() {
-        let num_ntts = 4usize;
-        let log_d = 10usize;
-        let n = (1usize << log_d) * num_ntts;
-        let ntt = AdditiveNttF128::standard(log_d);
-        let mut state = 0x1234_5678_9abc_def0u64;
-        let mut next = move || {
-            state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
-            state
-        };
-        let src: Vec<F128> = (0..n).map(|_| F128::new(next(), next())).collect();
-
-        let mut full = src.clone();
-        ntt.forward_transform_interleaved_from_layer(&mut full, num_ntts, 1);
-
-        // Whole range through the block-range driver.
-        let mut whole = src.clone();
-        ntt.forward_transform_interleaved_block_range(&mut whole, num_ntts, 1, log_d, 0, 2);
-        assert_eq!(full, whole, "block_range over the full range diverges");
-
-        // Split at layer 4: shared top layers 1..4, then independent
-        // per-block completion — the hybrid-commit shape.
-        let mut split = src.clone();
-        ntt.forward_transform_interleaved_block_range(&mut split, num_ntts, 1, 4, 0, 2);
-        for b in 0..16 {
-            ntt.forward_transform_interleaved_block_range(
-                &mut split,
-                num_ntts,
-                4,
-                log_d,
-                b,
-                b + 1,
-            );
-        }
-        assert_eq!(full, split, "layer-4 split diverges");
-    }
-
-    #[test]
-    fn cache_local_block_range_matches_plain_with_absolute_callbacks() {
-        // Compact analogue of ranked layers 4..10 streaming + cache-local
-        // deep pairs: six top layers followed by two fused deep pairs.
-        let num_ntts = 4usize;
-        let log_d = 12usize;
-        let start_layer = 2usize;
-        let n_top = 8usize;
-        let (b_start, b_end) = (1usize, 4usize);
-        let n = (1usize << log_d) * num_ntts;
-        let ntt = AdditiveNttF128::standard(log_d);
-        let mut state = 0x6a09_e667_f3bc_c909u64;
-        let mut next = move || {
-            state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
-            state
-        };
-        let src: Vec<F128> = (0..n).map(|_| F128::new(next(), next())).collect();
-
-        let mut plain = src.clone();
-        ntt.forward_transform_interleaved_block_range(
-            &mut plain,
-            num_ntts,
-            start_layer,
-            log_d,
-            b_start,
-            b_end,
-        );
-
-        let mut cache_local = src;
-        ntt.forward_transform_interleaved_block_range(
-            &mut cache_local,
-            num_ntts,
-            start_layer,
-            n_top,
-            b_start,
-            b_end,
-        );
-        let sub_start = b_start << (n_top - start_layer);
-        let sub_end = b_end << (n_top - start_layer);
-        let sub_elems = (1usize << (log_d - n_top)) * num_ntts;
-        let offsets = std::sync::Mutex::new(Vec::new());
-        ntt.forward_transform_interleaved_deep_fused_pairs_range_and_then(
-            &mut cache_local,
-            num_ntts,
-            n_top,
-            log_d,
-            sub_start,
-            sub_end,
-            &|elem_offset, chunk| {
-                assert_eq!(elem_offset % sub_elems, 0);
-                assert_eq!(chunk, &plain[elem_offset..elem_offset + sub_elems]);
-                offsets.lock().unwrap().push(elem_offset);
-            },
-        );
-
-        assert_eq!(cache_local, plain, "cache-local range diverges from plain driver");
-        let mut got_offsets = offsets.into_inner().unwrap();
-        got_offsets.sort_unstable();
-        let expected_offsets: Vec<usize> =
-            (sub_start..sub_end).map(|sub| sub * sub_elems).collect();
-        assert_eq!(got_offsets, expected_offsets, "callback coverage/offsets diverge");
     }
 }
