@@ -619,10 +619,19 @@ fn prove_packed_padded_inner<C: Challenger>(
     // table removes the two field multiplications per output that the generic
     // pair fold would require, while materializing exactly the ordinary
     // post-fold tables expected by all subsequent rounds.
+    let tail_round_timing = std::env::var_os("FLOCK_ZC_TAIL_ROUND_TIMING").is_some();
+    let t_t3 = std::time::Instant::now();
     let mut first_r_next = vec![F128::ONE; n_mlv - 1];
     first_r_next[1..].copy_from_slice(&r[k_skip + 2..]);
     let (mut a_mlv, mut b_mlv, first_m1, first_mi) =
         fold_compact_and_compute_round_pair(&compact_mlv, &fold_table, mlv_rhos[0], &first_r_next);
+    if tail_round_timing {
+        eprintln!(
+            "[zc-tail-rounds] T3 compact fold (out n={}): {:.2} ms",
+            a_mlv.len(),
+            t_t3.elapsed().as_secs_f64() * 1e3
+        );
+    }
     compact_mlv.recycle();
     multilinear_msgs.push((first_m1, first_mi));
     challenger.observe_f128(first_m1);
@@ -650,6 +659,7 @@ fn prove_packed_padded_inner<C: Challenger>(
     let hetero_trace = std::env::var_os("FLOCK_ZC_TAIL_HETERO_TRACE").is_some();
     let hetero_claimed_before = crate::epool::helper_chunks_claimed();
     for i in 1..(n_mlv - 1) {
+        let t_round_i = std::time::Instant::now();
         let rho_prev = mlv_rhos[i];
         let log_n_before = a_mlv.len().trailing_zeros() as usize;
 
@@ -687,6 +697,12 @@ fn prove_packed_padded_inner<C: Challenger>(
         challenger.observe_f128(m1);
         challenger.observe_f128(mi);
         mlv_rhos.push(challenger.sample_f128());
+        if tail_round_timing {
+            eprintln!(
+                "[zc-tail-rounds] loop i={i} (log_n {log_n_before}): {:.2} ms",
+                t_round_i.elapsed().as_secs_f64() * 1e3
+            );
+        }
     }
 
     if hetero_trace {
