@@ -663,6 +663,13 @@ fn fill_deferred_lincheck_stripe(
     debug_assert!(completed);
 }
 
+fn deferred_stripe_epool_workers(value: Option<&std::ffi::OsStr>) -> usize {
+    value
+        .and_then(|value| value.to_str()?.parse::<usize>().ok())
+        .filter(|workers| (1..=4).contains(workers))
+        .unwrap_or(3)
+}
+
 #[cfg(test)]
 mod deferred_stripe_tests {
     use super::*;
@@ -701,6 +708,15 @@ mod deferred_stripe_tests {
             ),
         ));
         assert_eq!(helper_actual, expected);
+    }
+
+    #[test]
+    fn ranked_deferred_stripe_defaults_to_three_helpers() {
+        assert_eq!(deferred_stripe_epool_workers(None), 3);
+        assert_eq!(deferred_stripe_epool_workers(Some("1".as_ref())), 1);
+        assert_eq!(deferred_stripe_epool_workers(Some("4".as_ref())), 4);
+        assert_eq!(deferred_stripe_epool_workers(Some("0".as_ref())), 3);
+        assert_eq!(deferred_stripe_epool_workers(Some("bogus".as_ref())), 3);
     }
 }
 
@@ -906,13 +922,13 @@ fn prove_fast_core_with_commit_codeword<Ch: Challenger>(
             assert_eq!(r1cs.useful_bits, 15_409);
             let (m, k_log, useful_bits) = (r1cs.m, r1cs.k_log, r1cs.useful_bits);
             let mut stripe = flock_core::scratch::take_u8(1usize << (m - 3));
-            // E2 is the measured contention optimum: E4 steals bandwidth from
-            // commit, while E1 lets the stripe spill into zerocheck. Keep the
-            // override for controlled same-binary diagnostics only.
-            let epool_workers = std::env::var_os("FLOCK_DEFER_STRIPE_EPOOL_THREADS")
-                .and_then(|value| value.to_str()?.parse::<usize>().ok())
-                .filter(|workers| (1..=4).contains(workers))
-                .unwrap_or(2);
+            // E3 is the current ranked contention optimum: it completes the
+            // stripe earlier without E4's commit-bandwidth regression, while
+            // E1 spills into zerocheck. Keep the override for controlled
+            // same-binary diagnostics only.
+            let epool_workers = deferred_stripe_epool_workers(
+                std::env::var_os("FLOCK_DEFER_STRIPE_EPOOL_THREADS").as_deref(),
+            );
             let pre = std::thread::scope(|scope| {
                 let stripe_job = scope.spawn(|| {
                     let started = std::time::Instant::now();

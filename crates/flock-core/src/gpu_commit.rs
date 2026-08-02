@@ -96,6 +96,34 @@ pub(crate) fn gpu_lincheck_enabled() -> bool {
     *ON
 }
 
+/// Kill switch for the experimental register-resident lincheck fold kernel.
+/// `FLOCK_NO_GPU_LINCHECK_SHUFFLE=1` keeps the inherited byte-table kernel as
+/// the only GPU candidate. The shuffle kernel is also fail-open at compile,
+/// SIMD-width, exact-output, and target-timing gates.
+pub const ENV_NO_GPU_LINCHECK_SHUFFLE: &str = "FLOCK_NO_GPU_LINCHECK_SHUFFLE";
+
+pub(crate) fn gpu_lincheck_shuffle_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        std::env::var_os(ENV_NO_GPU_LINCHECK_SHUFFLE).is_none()
+    });
+    *ON
+}
+
+/// Two-order target selector for the shuffle kernel. Each sample is the
+/// complete encode + submit + wait wall for the same full-range fold. Both
+/// paired wins reject order/DVFS accidents; a 2 ms aggregate margin protects
+/// roughly 1 ms per recurring lincheck fold before publication.
+fn lincheck_shuffle_admit(byte_ms: [f64; 2], shuffle_ms: [f64; 2], exact: bool) -> bool {
+    exact
+        && byte_ms
+            .into_iter()
+            .chain(shuffle_ms)
+            .all(|v| v.is_finite() && v > 0.0)
+        && shuffle_ms[0] < byte_ms[0]
+        && shuffle_ms[1] < byte_ms[1]
+        && (byte_ms[0] - shuffle_ms[0]) + (byte_ms[1] - shuffle_ms[1]) >= 2.0
+}
+
 /// Diagnostic trace for the lincheck fold arm (`FLOCK_LINCHECK_GPU_DEBUG=1`).
 pub(crate) fn gpu_lincheck_debug() -> bool {
     static ON: std::sync::LazyLock<bool> =
@@ -6087,6 +6115,107 @@ kernel void NAME(                                                       \
 LC_KERNEL(lc_fold_stripes, 4)
 "#;
 
+    /// Lincheck fold variant that removes the byte kernel's random
+    /// threadgroup-memory gather. Every 32-lane SIMD group holds two complete
+    /// 16-entry nibble tables in registers: lanes 0..15 hold the low-nibble
+    /// subsets and lanes 16..31 the high-nibble subsets. A witness byte is two
+    /// lane-varying `simd_shuffle(uint4, lane)` operations and one XOR.
+    ///
+    /// Only the eight basis values per stripe touch threadgroup memory. Eight
+    /// stripes share one cooperative 1 KiB basis load, so table construction
+    /// has two barriers per eight stripes and no random shared-memory access.
+    /// The host admits this pipeline only at execution width 32 and only after
+    /// exact full-output, both-order target timing beats the byte pipeline.
+    /// It is compiled separately so any language/device incompatibility leaves
+    /// the inherited byte-table kernel untouched.
+    const LC_SHUFFLE_MSL_SOURCE: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+struct LcFoldParams {
+    uint k;
+    uint useful;
+    uint stripe_hi;
+    uint stripes_per_chunk;
+    uint i_groups;
+};
+
+#define LC_SHUFFLE_LOOKUP(V, X)                                        \
+    (simd_shuffle((V), ushort((X) & 15u)) ^                            \
+     simd_shuffle((V), ushort(16u + (((X) >> 4) & 15u))))
+
+// All lanes execute every shuffle, including padded output lanes. Padded
+// lanes carry witness word zero, whose two nibble-table entries are zero;
+// keeping them active guarantees every requested source lane is active.
+#define LC_SHUFFLE_STEP(V, W) {                                        \
+    uint lc_w = (W);                                                    \
+    a0 ^= LC_SHUFFLE_LOOKUP((V), lc_w);                                 \
+    a1 ^= LC_SHUFFLE_LOOKUP((V), lc_w >> 8);                            \
+    a2 ^= LC_SHUFFLE_LOOKUP((V), lc_w >> 16);                           \
+    a3 ^= LC_SHUFFLE_LOOKUP((V), lc_w >> 24);                           \
+}
+
+kernel void lc_fold_shuffle(
+    device const uint*     z32      [[buffer(0)]],
+    device const uint4*    eq       [[buffer(1)]],
+    device uint4*          partials [[buffer(2)]],
+    constant LcFoldParams& p        [[buffer(3)]],
+    uint tgid [[threadgroup_position_in_grid]],
+    uint lid  [[thread_position_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]])
+{
+    threadgroup uint4 tg_eq[64];
+    uint chunk  = tgid / p.i_groups;
+    uint ig     = tgid - chunk * p.i_groups;
+    uint i_base = ig * 1024u;
+    uint s_lo = chunk * p.stripes_per_chunk;
+    uint s_hi = min(s_lo + p.stripes_per_chunk, p.stripe_hi);
+    uint4 a0 = uint4(0u), a1 = uint4(0u), a2 = uint4(0u), a3 = uint4(0u);
+    uint c0 = i_base + 4u * lid;
+    bool live = c0 < p.useful;
+    uint kw = p.k >> 2;
+
+    for (uint sb = s_lo; sb < s_hi; sb += 8u) {
+        uint ns = min(8u, s_hi - sb);
+        uint w[8];
+        for (uint t = 0u; t < 8u; ++t) { w[t] = 0u; }
+        if (live) {
+            uint q = (sb * p.k + c0) >> 2;
+            for (uint t = 0u; t < ns; ++t) { w[t] = z32[q + t * kw]; }
+        }
+
+        // Prevent a fast SIMD group from overwriting the previous block's
+        // bases while another group still consumes them.
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (lid < ns * 8u) { tg_eq[lid] = eq[sb * 8u + lid]; }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (uint t = 0u; t < ns; ++t) {
+            uint4 seed = lane < 8u ? tg_eq[t * 8u + lane] : uint4(0u);
+            uint base = (lane >> 4) << 2;
+            uint index = lane & 15u;
+            // Shuffle before lane predicates: source lanes must remain active.
+            uint4 e0 = simd_shuffle(seed, ushort(base));
+            uint4 e1 = simd_shuffle(seed, ushort(base + 1u));
+            uint4 e2 = simd_shuffle(seed, ushort(base + 2u));
+            uint4 e3 = simd_shuffle(seed, ushort(base + 3u));
+            uint4 v = uint4(0u);
+            if ((index & 1u) != 0u) { v ^= e0; }
+            if ((index & 2u) != 0u) { v ^= e1; }
+            if ((index & 4u) != 0u) { v ^= e2; }
+            if ((index & 8u) != 0u) { v ^= e3; }
+            LC_SHUFFLE_STEP(v, w[t]);
+        }
+    }
+
+    device uint4* out = partials + chunk * p.k + c0;
+    out[0u] = a0;
+    out[1u] = a1;
+    out[2u] = a2;
+    out[3u] = a3;
+}
+"#;
+
     /// Output partials produced by the GPU fold. Fixed so the buffer set and
     /// the reduce dispatch are size-stable across proves.
     const ZC_FOLD_CHUNKS: usize = 64;
@@ -6113,6 +6242,9 @@ LC_KERNEL(lc_fold_stripes, 4)
         /// failed to compile — the lincheck arm alone falls back to the
         /// incumbent CPU fold; the zerocheck arm is unaffected).
         pso_lc_fold: Id,
+        /// Register-resident SIMD-shuffle alternative (`NIL` unless its
+        /// separate source compiles and the pipeline execution width is 32).
+        pso_lc_shuffle: Id,
         /// eq_outer upload (n_outer x 16 B).
         eq_buf: Id,
         eq_cap: usize,
@@ -6267,11 +6399,103 @@ LC_KERNEL(lc_fold_stripes, 4)
                     }
                 }
             };
+            // Compile the register-resident candidate independently: a syntax,
+            // device-family, pipeline, or width failure must not remove the
+            // inherited byte-table path. Its lane layout is valid only for a
+            // 32-thread SIMD group, queried from the built pipeline rather than
+            // assumed from the Apple GPU family.
+            let pso_lc_shuffle = if !super::gpu_lincheck_shuffle_enabled() {
+                NIL
+            } else {
+                let pool = gpu.pool_push();
+                let built_shuffle = (|| -> Result<Id, String> {
+                    let src = gpu.api.nsstring(LC_SHUFFLE_MSL_SOURCE)?;
+                    let mut err: Id = NIL;
+                    let library: Id = send!(
+                        gpu.api,
+                        unsafe extern "C" fn(Id, Sel, Id, Id, *mut Id) -> Id,
+                        gpu.device,
+                        c"newLibraryWithSource:options:error:",
+                        src,
+                        NIL,
+                        &mut err
+                    );
+                    if library.is_null() {
+                        return Err(format!(
+                            "lincheck shuffle shader compile failed: {}",
+                            gpu.api.error_string(err)
+                        ));
+                    }
+                    let ns = gpu.api.nsstring("lc_fold_shuffle")?;
+                    let f: Id = send!(
+                        gpu.api,
+                        unsafe extern "C" fn(Id, Sel, Id) -> Id,
+                        library,
+                        c"newFunctionWithName:",
+                        ns
+                    );
+                    if f.is_null() {
+                        send!(
+                            gpu.api,
+                            unsafe extern "C" fn(Id, Sel) -> Id,
+                            library,
+                            c"release"
+                        );
+                        return Err("lincheck shuffle kernel not found".to_string());
+                    }
+                    let mut perr: Id = NIL;
+                    let pso: Id = send!(
+                        gpu.api,
+                        unsafe extern "C" fn(Id, Sel, Id, *mut Id) -> Id,
+                        gpu.device,
+                        c"newComputePipelineStateWithFunction:error:",
+                        f,
+                        &mut perr
+                    );
+                    send!(gpu.api, unsafe extern "C" fn(Id, Sel) -> Id, f, c"release");
+                    send!(
+                        gpu.api,
+                        unsafe extern "C" fn(Id, Sel) -> Id,
+                        library,
+                        c"release"
+                    );
+                    if pso.is_null() {
+                        return Err(format!(
+                            "lincheck shuffle pipeline: {}",
+                            gpu.api.error_string(perr)
+                        ));
+                    }
+                    let simd_width: u64 = send!(
+                        gpu.api,
+                        unsafe extern "C" fn(Id, Sel) -> u64,
+                        pso,
+                        c"threadExecutionWidth"
+                    );
+                    if simd_width != 32 {
+                        gpu.release(pso);
+                        return Err(format!(
+                            "lincheck shuffle requires SIMD width 32, got {simd_width}"
+                        ));
+                    }
+                    Ok(pso)
+                })();
+                gpu.pool_pop(pool);
+                match built_shuffle {
+                    Ok(pso) => pso,
+                    Err(e) => {
+                        if super::gpu_lincheck_debug() {
+                            eprintln!("[gpu-lincheck] shuffle kernel unavailable: {e}");
+                        }
+                        NIL
+                    }
+                }
+            };
             Ok(ZcFold {
                 gpu,
                 pso_fold,
                 pso_reduce,
                 pso_lc_fold,
+                pso_lc_shuffle,
                 eq_buf: NIL,
                 eq_cap: 0,
                 part_buf: NIL,
@@ -6420,7 +6644,10 @@ LC_KERNEL(lc_fold_stripes, 4)
     /// steady-state when the zerocheck arm ran first in the same process).
     static LINCHECK_FOLD_CALIBRATED: std::sync::atomic::AtomicBool =
         std::sync::atomic::AtomicBool::new(false);
-
+    /// Published by the untimed, exact, both-order byte-vs-shuffle selector.
+    /// False is the inherited byte pipeline and is the fail-open default.
+    static LINCHECK_FOLD_USE_SHUFFLE: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
     impl ZcFoldJob {
         /// Number of leading tile claims this job owns; the caller's CPU
         /// suffix MUST start at exactly this claim.
@@ -6588,6 +6815,214 @@ LC_KERNEL(lc_fold_stripes, 4)
                                     &walls[..n_walls]
                                 );
                             }
+
+                            if !state.pso_lc_shuffle.is_null()
+                                && super::gpu_lincheck_shuffle_enabled()
+                            {
+                                let shuffle = ZcFoldPlan {
+                                    pso_fold: state.pso_lc_shuffle,
+                                    ..replay
+                                };
+                                // The inherited byte replay loop above is the
+                                // clock-ramp authority. Prime both variants,
+                                // then measure byte->shuffle and
+                                // shuffle->byte. Every output must equal the
+                                // already-complete hybrid fold in `dst`.
+                                let trials = (|| -> Result<([f64; 2], [f64; 2]), String> {
+                                    zc_fold_replay_wall_exact(gpu, state, &shuffle, dst)?;
+                                    zc_fold_replay_wall_exact(gpu, state, &replay, dst)?;
+                                    let b0 = zc_fold_replay_wall_exact(gpu, state, &replay, dst)?;
+                                    let s0 =
+                                        zc_fold_replay_wall_exact(gpu, state, &shuffle, dst)?;
+                                    let s1 =
+                                        zc_fold_replay_wall_exact(gpu, state, &shuffle, dst)?;
+                                    let b1 = zc_fold_replay_wall_exact(gpu, state, &replay, dst)?;
+                                    Ok(([b0, b1], [s0, s1]))
+                                })();
+                                match trials {
+                                    Ok((byte_ms, shuffle_ms)) => {
+                                        let kernel_selected = super::lincheck_shuffle_admit(
+                                            byte_ms,
+                                            shuffle_ms,
+                                            true,
+                                        );
+                                        if self.arm.debug() {
+                                            eprintln!(
+                                                "[gpu-lincheck] shuffle A/B byte={byte_ms:?} \
+                                                 shuffle={shuffle_ms:?} exact=true \
+                                                 kernel-selected={kernel_selected}"
+                                            );
+                                        }
+                                        if kernel_selected && u_cpu.is_finite() && u_cpu > 0.0 {
+                                            let shuffle_u_gpu = (shuffle_ms[0] + shuffle_ms[1])
+                                                / (2.0 * self.n_claims as f64);
+                                            let measured = shuffle_u_gpu / u_cpu;
+                                            let ratio = lincheck_fold_forced_ratio()
+                                                .unwrap_or(measured);
+                                            let share = lincheck_gate_share_shuffle(
+                                                ratio,
+                                                self.n_claims,
+                                            );
+                                            let byte_ratio = lincheck_fold_forced_ratio()
+                                                .unwrap_or(u_gpu / u_cpu);
+                                            let byte_share = lincheck_gate_share(
+                                                byte_ratio,
+                                                self.n_claims,
+                                            );
+                                            let n_outer = replay.stripe_hi * 8;
+                                            let eq_owned = std::slice::from_raw_parts(
+                                                gpu.buffer_contents(state.eq_buf)
+                                                    .cast::<F128>()
+                                                    .cast_const(),
+                                                n_outer,
+                                            )
+                                            .to_vec();
+                                            let join_trials = (|| -> Result<
+                                                ([f64; 2], [f64; 2]),
+                                                String,
+                                            > {
+                                                if byte_share == 0
+                                                    || byte_share >= self.n_claims
+                                                    || share == 0
+                                                    || share >= self.n_claims
+                                                {
+                                                    return Err(format!(
+                                                        "lincheck join proposed invalid shares byte={byte_share} shuffle={share}/{}",
+                                                        self.n_claims,
+                                                    ));
+                                                }
+                                                // Prime both production-shaped joins equally.
+                                                // The timed proof pays neither first allocation
+                                                // nor first-touch setup after warmup.
+                                                lincheck_hybrid_join_wall_exact(
+                                                    gpu,
+                                                    state,
+                                                    &replay,
+                                                    replay.pso_fold,
+                                                    4,
+                                                    byte_share,
+                                                    self.n_claims,
+                                                    &eq_owned,
+                                                    dst,
+                                                )?;
+                                                lincheck_hybrid_join_wall_exact(
+                                                    gpu,
+                                                    state,
+                                                    &replay,
+                                                    state.pso_lc_shuffle,
+                                                    8,
+                                                    share,
+                                                    self.n_claims,
+                                                    &eq_owned,
+                                                    dst,
+                                                )?;
+                                                // Measure the incumbent byte hybrid against the
+                                                // candidate shuffle hybrid in both directions.
+                                                // CPU-only is not the production control here.
+                                                let b0 = lincheck_hybrid_join_wall_exact(
+                                                    gpu,
+                                                    state,
+                                                    &replay,
+                                                    replay.pso_fold,
+                                                    4,
+                                                    byte_share,
+                                                    self.n_claims,
+                                                    &eq_owned,
+                                                    dst,
+                                                )?;
+                                                let s0 = lincheck_hybrid_join_wall_exact(
+                                                    gpu,
+                                                    state,
+                                                    &replay,
+                                                    state.pso_lc_shuffle,
+                                                    8,
+                                                    share,
+                                                    self.n_claims,
+                                                    &eq_owned,
+                                                    dst,
+                                                )?;
+                                                let s1 = lincheck_hybrid_join_wall_exact(
+                                                    gpu,
+                                                    state,
+                                                    &replay,
+                                                    state.pso_lc_shuffle,
+                                                    8,
+                                                    share,
+                                                    self.n_claims,
+                                                    &eq_owned,
+                                                    dst,
+                                                )?;
+                                                let b1 = lincheck_hybrid_join_wall_exact(
+                                                    gpu,
+                                                    state,
+                                                    &replay,
+                                                    replay.pso_fold,
+                                                    4,
+                                                    byte_share,
+                                                    self.n_claims,
+                                                    &eq_owned,
+                                                    dst,
+                                                )?;
+                                                Ok(([b0, b1], [s0, s1]))
+                                            })();
+                                            match join_trials {
+                                                Ok((byte_hybrid_ms, shuffle_hybrid_ms)) => {
+                                                    let selected =
+                                                        super::lincheck_shuffle_admit(
+                                                            byte_hybrid_ms,
+                                                            shuffle_hybrid_ms,
+                                                            true,
+                                                        );
+                                                    LINCHECK_FOLD_USE_SHUFFLE.store(
+                                                        selected,
+                                                        std::sync::atomic::Ordering::Relaxed,
+                                                    );
+                                                    if selected {
+                                                        u_gpu = shuffle_u_gpu;
+                                                    }
+                                                    if self.arm.debug() {
+                                                        eprintln!(
+                                                            "[gpu-lincheck] shuffle join A/B \
+                                                             byte={byte_hybrid_ms:?} \
+                                                             shuffle={shuffle_hybrid_ms:?} \
+                                                             shares={byte_share}/{share}/{} \
+                                                             selected={selected}",
+                                                            self.n_claims,
+                                                        );
+                                                    }
+                                                }
+                                                Err(e) => {
+                                                    LINCHECK_FOLD_USE_SHUFFLE.store(
+                                                        false,
+                                                        std::sync::atomic::Ordering::Relaxed,
+                                                    );
+                                                    if self.arm.debug() {
+                                                        eprintln!(
+                                                            "[gpu-lincheck] shuffle join failed open: {e}"
+                                                        );
+                                                    }
+                                                }
+                                            }
+                                        } else {
+                                            LINCHECK_FOLD_USE_SHUFFLE.store(
+                                                false,
+                                                std::sync::atomic::Ordering::Relaxed,
+                                            );
+                                        }
+                                    }
+                                    Err(e) => {
+                                        LINCHECK_FOLD_USE_SHUFFLE.store(
+                                            false,
+                                            std::sync::atomic::Ordering::Relaxed,
+                                        );
+                                        if self.arm.debug() {
+                                            eprintln!(
+                                                "[gpu-lincheck] shuffle A/B failed open: {e}"
+                                            );
+                                        }
+                                    }
+                                }
+                            }
                             gpu.pool_pop(pool);
                         }
                     }
@@ -6595,7 +7030,13 @@ LC_KERNEL(lc_fold_stripes, 4)
                     {
                         let measured = u_gpu / u_cpu;
                         let ratio = lincheck_fold_forced_ratio().unwrap_or(measured);
-                        let g = lincheck_gate_share(ratio, self.n_claims);
+                        let g = if LINCHECK_FOLD_USE_SHUFFLE
+                            .load(std::sync::atomic::Ordering::Relaxed)
+                        {
+                            lincheck_gate_share_shuffle(ratio, self.n_claims)
+                        } else {
+                            lincheck_gate_share(ratio, self.n_claims)
+                        };
                         self.arm
                             .tuned()
                             .store(g, std::sync::atomic::Ordering::Relaxed);
@@ -6797,6 +7238,19 @@ LC_KERNEL(lc_fold_stripes, 4)
         share.clamp(0.0, (n_claims * 5 / 8) as f64) as usize
     }
 
+    /// A target-proven faster shuffle kernel can use the actual balance point
+    /// beyond the byte kernel's measured 39-40/64 basin. The 3n/4 ceiling
+    /// still leaves a substantial CPU suffix if the warmup CPU sample was
+    /// optimistic; a complete two-order CPU-vs-hybrid join gate separately
+    /// proves that this proposed share wins before it is published.
+    pub(crate) fn lincheck_gate_share_shuffle(ratio: f64, n_claims: usize) -> usize {
+        if !ratio.is_finite() || ratio <= 0.0 || ratio > LINCHECK_FOLD_MAX_GPU_RATIO {
+            return 0;
+        }
+        let share = (n_claims as f64 / (1.0 + ratio)).round();
+        share.clamp(0.0, (n_claims * 3 / 4) as f64) as usize
+    }
+
     pub(crate) fn lincheck_gate_share(ratio: f64, n_claims: usize) -> usize {
         if std::env::var_os("FLOCK_LINCHECK_GPU_LEGACY_SPLIT").is_some() {
             lincheck_gate_share_legacy(ratio, n_claims)
@@ -6871,6 +7325,9 @@ LC_KERNEL(lc_fold_stripes, 4)
     #[derive(Clone, Copy)]
     struct ZcFoldPlan {
         z_buf: Id,
+        /// Length of the no-copy witness stripe behind `z_buf`; retained for
+        /// the untimed whole-join selector's exact CPU control.
+        z_len: usize,
         /// Fold pipeline for this dispatch — the zerocheck arm's nibble
         /// kernel or one of the lincheck arm's byte-table kernels.
         pso_fold: Id,
@@ -6920,6 +7377,124 @@ LC_KERNEL(lc_fold_stripes, 4)
             let cb = gpu.retain(cb);
             gpu.commit_async(cb);
             Ok(cb)
+        }
+    }
+
+    /// Replay one complete fold dispatch and verify its reduced output. The
+    /// reported wall starts before command-buffer creation/encoding and stops
+    /// after completion, exactly the kernel-dependent cost a timed proof pays.
+    /// The output comparison is intentionally outside that wall: production
+    /// performs the same `k`-lane CPU XOR for either pipeline, while this extra
+    /// byte comparison exists only in the untimed selector.
+    unsafe fn zc_fold_replay_wall_exact(
+        gpu: &Gpu,
+        state: &ZcFold,
+        plan: &ZcFoldPlan,
+        want: &[F128],
+    ) -> Result<f64, String> {
+        unsafe {
+            let started = std::time::Instant::now();
+            let cb = zc_fold_submit(gpu, state, plan)?;
+            let waited = gpu.wait_cb(cb);
+            let wall_ms = started.elapsed().as_secs_f64() * 1e3;
+            gpu.release(cb);
+            waited?;
+            if !wall_ms.is_finite() || wall_ms <= 0.0 {
+                return Err("lincheck replay produced an unusable wall".to_string());
+            }
+            let got = std::slice::from_raw_parts(
+                gpu.buffer_contents(state.out_buf).cast::<F128>().cast_const(),
+                want.len(),
+            );
+            if got != want {
+                return Err("lincheck replay did not match the full fold".to_string());
+            }
+            Ok(wall_ms)
+        }
+    }
+
+    /// Time one complete recurring hybrid join for a proposed pipeline/share:
+    /// eq upload, command creation/encoding/submission, concurrent CPU suffix,
+    /// GPU drain, and output XOR. Only the final equality comparison is outside
+    /// the wall. `full_plan` must cover the whole claim range.
+    unsafe fn lincheck_hybrid_join_wall_exact(
+        gpu: &Gpu,
+        state: &ZcFold,
+        full_plan: &ZcFoldPlan,
+        pso_fold: Id,
+        stripes_multiple: usize,
+        claim_share: usize,
+        n_claims: usize,
+        eq_outer: &[F128],
+        want: &[F128],
+    ) -> Result<f64, String> {
+        unsafe {
+            if claim_share == 0
+                || claim_share >= n_claims
+                || !full_plan.z_len.is_power_of_two()
+                || !full_plan.k.is_power_of_two()
+                || pso_fold.is_null()
+                || !matches!(stripes_multiple, 4 | 8)
+            {
+                return Err("lincheck hybrid join received an invalid plan/share".to_string());
+            }
+            let m = full_plan.z_len.ilog2() as usize + 3;
+            let k_log = full_plan.k.ilog2() as usize;
+            let z = std::slice::from_raw_parts(
+                gpu.buffer_contents(full_plan.z_buf).cast::<u8>().cast_const(),
+                full_plan.z_len,
+            );
+            let stripe_hi = crate::lincheck::oblock_claim_stripe_base(claim_share);
+            let plan = ZcFoldPlan {
+                pso_fold,
+                stripe_hi,
+                stripes_per_chunk: stripe_hi
+                    .div_ceil(ZC_FOLD_CHUNKS)
+                    .next_multiple_of(stripes_multiple),
+                ..*full_plan
+            };
+
+            let started = std::time::Instant::now();
+            // Production uploads this challenge table before every dispatch.
+            std::ptr::copy_nonoverlapping(
+                eq_outer.as_ptr().cast::<u8>(),
+                gpu.buffer_contents(state.eq_buf),
+                core::mem::size_of_val(eq_outer),
+            );
+            let cb = zc_fold_submit(gpu, state, &plan)?;
+            let mut out = crate::lincheck::partial_fold_packed_z_neon_oblock_padded_suffix(
+                z,
+                m,
+                k_log,
+                full_plan.useful,
+                eq_outer,
+                claim_share,
+            );
+            let waited = gpu.wait_cb(cb);
+            gpu.release(cb);
+            waited?;
+            let prefix = std::slice::from_raw_parts(
+                gpu.buffer_contents(state.out_buf).cast::<F128>().cast_const(),
+                full_plan.k,
+            );
+            {
+                use rayon::prelude::*;
+                out.par_chunks_mut(2048)
+                    .zip(prefix.par_chunks(2048))
+                    .for_each(|(d, s)| {
+                        for (a, b) in d.iter_mut().zip(s.iter()) {
+                            *a += *b;
+                        }
+                    });
+            }
+            let wall_ms = started.elapsed().as_secs_f64() * 1e3;
+            if !wall_ms.is_finite() || wall_ms <= 0.0 {
+                return Err("lincheck hybrid join produced an unusable wall".to_string());
+            }
+            if out != want {
+                return Err("lincheck hybrid join did not match the full fold".to_string());
+            }
+            Ok(wall_ms)
         }
     }
 
@@ -7014,6 +7589,13 @@ LC_KERNEL(lc_fold_stripes, 4)
             // fold on the incumbent CPU path.
             let (pso_fold, block) = match arm {
                 FoldArm::Zc => (state.pso_fold, 8),
+                FoldArm::Lincheck
+                    if LINCHECK_FOLD_USE_SHUFFLE
+                        .load(std::sync::atomic::Ordering::Relaxed)
+                        && !state.pso_lc_shuffle.is_null() =>
+                {
+                    (state.pso_lc_shuffle, 8)
+                }
                 FoldArm::Lincheck => (state.pso_lc_fold, 4),
             };
             if pso_fold.is_null() {
@@ -7045,6 +7627,7 @@ LC_KERNEL(lc_fold_stripes, 4)
                     );
                     let plan = ZcFoldPlan {
                         z_buf,
+                        z_len: z_packed.len(),
                         pso_fold,
                         k,
                         useful,
@@ -9878,6 +10461,54 @@ DEF_PROBE(probe_g4_t8_p0,    8u,  0u,   tsel & 7u)
     fn zerocheck_gpu_kill_switch_is_the_documented_env() {
         assert_eq!(ENV_NO_GPU_ZEROCHECK, "FLOCK_NO_GPU_ZEROCHECK");
         assert_eq!(ENV_NO_GPU_LINCHECK, "FLOCK_NO_GPU_LINCHECK");
+        assert_eq!(
+            ENV_NO_GPU_LINCHECK_SHUFFLE,
+            "FLOCK_NO_GPU_LINCHECK_SHUFFLE"
+        );
+    }
+
+    #[test]
+    fn lincheck_shuffle_selector_requires_exact_two_order_protected_win() {
+        assert!(lincheck_shuffle_admit([8.0, 9.0], [6.9, 8.0], true));
+        // Aggregate gain below 2 ms is too small even when both orders win.
+        assert!(!lincheck_shuffle_admit([8.0, 9.0], [7.1, 8.1], true));
+        // A loss in either order is treated as clock/order noise.
+        assert!(!lincheck_shuffle_admit([8.0, 9.0], [5.0, 9.1], true));
+        assert!(!lincheck_shuffle_admit([8.0, 9.0], [6.0, 7.0], false));
+        assert!(!lincheck_shuffle_admit(
+            [f64::NAN, 9.0],
+            [5.0, 6.0],
+            true
+        ));
+    }
+
+    #[test]
+    fn lincheck_shuffle_lane_tables_match_byte_subset_xor() {
+        let basis: [F128; 8] = std::array::from_fn(|i| F128 {
+            lo: (i as u64 + 1).wrapping_mul(0x9E37_79B9_7F4A_7C15),
+            hi: (i as u64 + 17).wrapping_mul(0xD1B5_4A32_D192_ED03),
+        });
+        let lanes: [F128; 32] = std::array::from_fn(|lane| {
+            let half = lane / 16;
+            let index = lane & 15;
+            let mut v = F128::ZERO;
+            for bit in 0..4 {
+                if index & (1 << bit) != 0 {
+                    v += basis[half * 4 + bit];
+                }
+            }
+            v
+        });
+        for byte in 0usize..=255 {
+            let got = lanes[byte & 15] + lanes[16 + (byte >> 4)];
+            let mut want = F128::ZERO;
+            for bit in 0..8 {
+                if byte & (1 << bit) != 0 {
+                    want += basis[bit];
+                }
+            }
+            assert_eq!(got, want, "shuffle table mismatch at byte {byte}");
+        }
     }
 
     /// The warmup ratio gate: share formula, CPU-ward clamp, and the
@@ -9886,7 +10517,10 @@ DEF_PROBE(probe_g4_t8_p0,    8u,  0u,   tsel & 7u)
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     #[test]
     fn lincheck_gate_share_formula_and_disable() {
-        use imp::{lincheck_gate_share_balanced, lincheck_gate_share_legacy};
+        use imp::{
+            lincheck_gate_share_balanced, lincheck_gate_share_legacy,
+            lincheck_gate_share_shuffle,
+        };
         // Balanced default: round(64 / 2) = 32.
         assert_eq!(lincheck_gate_share_balanced(1.0, 64), 32);
         // v1's measured local ratio: round(64 / 2.52) = 25.
@@ -9917,6 +10551,15 @@ DEF_PROBE(probe_g4_t8_p0,    8u,  0u,   tsel & 7u)
         assert_eq!(lincheck_gate_share_legacy(2.01, 64), 0);
         assert_eq!(lincheck_gate_share_legacy(0.5, 64), 32);
         assert_eq!(lincheck_gate_share_legacy(1.0, 16), 7);
+        // A shuffle kernel that passed the complete join gate may use the
+        // unconstrained balance point up to the 3/4 safety ceiling.
+        assert_eq!(lincheck_gate_share_shuffle(1.0, 64), 32);
+        assert_eq!(lincheck_gate_share_shuffle(0.5, 64), 43);
+        assert_eq!(lincheck_gate_share_shuffle(0.1, 64), 48);
+        assert_eq!(lincheck_gate_share_shuffle(2.0, 64), 21);
+        assert_eq!(lincheck_gate_share_shuffle(2.01, 64), 0);
+        assert_eq!(lincheck_gate_share_shuffle(f64::NAN, 64), 0);
+        assert_eq!(lincheck_gate_share_shuffle(0.1, 16), 12);
     }
 
     /// The lincheck arm's GPU prefix equals the CPU fold over exactly the
