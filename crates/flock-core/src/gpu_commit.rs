@@ -644,6 +644,40 @@ pub(crate) fn gpu_mixed_final_enabled() -> bool {
 /// only when `gpu_wall * 1.10 <= cpu_wall`.
 const LATCH_MARGIN: f64 = 1.10;
 
+/// Exact-`1` control restoring the incumbent latch measurement, which charged
+/// the warmup's 64 MiB tree copy-out to `gpu_wall_ms`. The copy exists only to
+/// give the *untimed warmup* prove a CPU-side tree; every latched timed path
+/// returns `MerkleTreeBuf::Gpu` (a zero-copy view of the persistent Metal tree
+/// buffer), so the copy is work the gated path provably never performs and has
+/// no business inside the quantity the latch compares. Margin, comparison and
+/// every guard are unchanged — this switch only re-contaminates the measured
+/// GPU quantity for same-binary diagnostics.
+pub const ENV_NO_LATCH_MEASURE_FIX: &str = "FLOCK_NO_LATCH_MEASURE_FIX";
+
+fn latch_measure_fix_value_enabled(value: Option<&std::ffi::OsStr>) -> bool {
+    value != Some(std::ffi::OsStr::new("1"))
+}
+
+fn latch_measure_fix_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        latch_measure_fix_value_enabled(std::env::var_os(ENV_NO_LATCH_MEASURE_FIX).as_deref())
+    })
+}
+
+#[cfg(test)]
+mod latch_measure_fix_gate_tests {
+    use std::ffi::OsStr;
+
+    #[test]
+    fn exact_one_is_the_only_latch_measure_kill_value() {
+        assert!(!super::latch_measure_fix_value_enabled(Some(OsStr::new("1"))));
+        for value in [None, Some(""), Some("0"), Some("01"), Some("true")] {
+            assert!(super::latch_measure_fix_value_enabled(value.map(OsStr::new)));
+        }
+    }
+}
+
 /// The exact ranked L0 geometry the GPU graph is built for (mirrors the CPU
 /// pipeline's `is_ranked_ntt_merkle_leaf_pipeline_shape`): `log_d = 20`,
 /// 64 interleaved lanes, rate-1/2 entry at layer 1, 1 KiB BLAKE3 leaves.
@@ -5371,9 +5405,19 @@ kernel void blake3_pow_scan(
     /// GPU half of the warmup dual-run: create the persistent state (twiddle
     /// upload, staging codeword home, tree buffer, read-only z wrap), run
     /// the full from-z graph once untimed (page-wires every buffer exactly
-    /// as the timed prove will find them), then run it again timed with the
-    /// tree copy-out included (the timed path pays that too). Never mutates
-    /// z or the caller's codeword.
+    /// as the timed prove will find them), then run it again timed. Never
+    /// mutates z or the caller's codeword.
+    ///
+    /// `gpu_wall_ms` times the graph ONLY. The 64 MiB tree copy-out below is
+    /// warmup-exclusive bookkeeping — it materializes a CPU-side tree for the
+    /// warmup prove's own commitment and for the bit-exactness comparison —
+    /// and the latched timed path never performs it: both
+    /// `finish_from_z_first_pass_or_fallback` and `run_latched` return
+    /// `MerkleTreeBuf::Gpu`, a zero-copy view of `tree_buf`. Charging it to
+    /// the latch's GPU quantity measured 3.5-5.9 ms of work the gated path
+    /// does not do (audited: it flipped one process's latch by 1.44 ms).
+    /// `run_commit_graph_from_z` ends in `commit_and_wait`, so closing the
+    /// timer on its return captures the whole GPU graph and nothing else.
     fn warmup_gpu_run(
         z_packed: &[F128],
         log_d: usize,
@@ -5425,13 +5469,18 @@ kernel void blake3_pow_scan(
                 };
                 let t0 = std::time::Instant::now();
                 run_commit_graph_from_z(gpu, z_buf, staging, tw_buf, tree_buf, log_d, n_leaves)?;
+                let graph_ms = t0.elapsed().as_secs_f64() * 1e3;
                 copy_bytes_parallel(gpu.buffer_contents(tree_buf), {
                     core::slice::from_raw_parts_mut(
                         gpu_tree.as_mut_ptr().cast::<u8>(),
                         total_nodes * 32,
                     )
                 });
-                let gpu_wall_ms = t0.elapsed().as_secs_f64() * 1e3;
+                let gpu_wall_ms = if super::latch_measure_fix_enabled() {
+                    graph_ms
+                } else {
+                    t0.elapsed().as_secs_f64() * 1e3
+                };
                 created.clear(); // ownership transfers to Latched
                 Ok(WarmupRun {
                     latched: Latched {
@@ -7021,7 +7070,55 @@ LC_KERNEL(lc_fold_stripes, 4)
                 // the same scratch buffers races with nothing.
                 unsafe {
                     let pool = gpu.pool_push();
-                    if let Ok(cb2) = zc_fold_submit(gpu, state, &self.plan) {
+                    if zc_fold_measure_fix_enabled() {
+                        // MEASUREMENT CORRECTION (kill:
+                        // FLOCK_NO_ZC_FOLD_MEASURE_FIX). Two independent defects
+                        // in the legacy single replay:
+                        //  (1) it BLINDLY OVERWROTE the sample with the one
+                        //      replay, so a noisy-high replay poisoned it —
+                        //      observed here 4.7 -> 13.3 ms and 5.0 -> 13.9 ms,
+                        //      ~2.8x ramp/queue outliers on identical work;
+                        //  (2) it priced from the Metal GPU-BUSY timestamp
+                        //      (`zc_fold_gpu_wall_ms`) while `head_ms`/`suffix_ms`
+                        //      are host wall — mixing clocks (our fc985281
+                        //      error: GPU-busy time hides per-dispatch host cost).
+                        // Fix: replay a few times, time each on the SAME host
+                        // wall clock as the CPU terms, and price from the
+                        // MINIMUM. Replaying excludes the first dispatch's
+                        // one-time compile + page-wiring cost; the per-device
+                        // minimum is the least-contended (accurate) steady-state
+                        // estimate under one-sided ramp/queue noise; host wall is
+                        // exactly what the timed prove pays per dispatch. The
+                        // balanced-split formula, its 0.9 bias and its clamp are
+                        // all unchanged — only the measured GPU sample moves.
+                        let mut w_min = f64::MAX;
+                        for i in 0..8usize {
+                            let t = std::time::Instant::now();
+                            let Ok(cb2) = zc_fold_submit(gpu, state, &self.plan) else {
+                                break;
+                            };
+                            let ok = gpu.wait_cb(cb2).is_ok();
+                            let w = t.elapsed().as_secs_f64() * 1e3;
+                            gpu.release(cb2);
+                            if !ok || w <= 0.0 {
+                                break;
+                            }
+                            let prev_min = w_min;
+                            w_min = w_min.min(w);
+                            // Converged once at least three back-to-back replays
+                            // have run (~100% duty ramps the governor in 1-2)
+                            // and this one did not improve the running minimum by
+                            // more than 5% — a genuine plateau, not a first-pair
+                            // coincidence on the ramp. (Same rule the lincheck
+                            // arm already uses for its replay convergence.)
+                            if i + 1 >= 3 && w > 0.95 * prev_min {
+                                break;
+                            }
+                        }
+                        if w_min.is_finite() {
+                            sample_ms = w_min;
+                        }
+                    } else if let Ok(cb2) = zc_fold_submit(gpu, state, &self.plan) {
                         if gpu.wait_cb(cb2).is_ok() {
                             let again = zc_fold_gpu_wall_ms(gpu, cb2);
                             if again > 0.0 {
@@ -7115,6 +7212,17 @@ LC_KERNEL(lc_fold_stripes, 4)
                 .and_then(|v| v.parse().ok())
         });
         *K
+    }
+
+    /// `FLOCK_NO_ZC_FOLD_MEASURE_FIX` restores the legacy single
+    /// GPU-busy-timestamp replay for the zerocheck arm's steady-state sample
+    /// (exact rollback lever for the min-over-replays host-wall measurement
+    /// correction in [`ZcFoldJob::finish_xor_into`]).
+    fn zc_fold_measure_fix_enabled() -> bool {
+        static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+            std::env::var_os("FLOCK_NO_ZC_FOLD_MEASURE_FIX").is_none()
+        });
+        *ON
     }
 
     /// Fallback-test hook (`FLOCK_LINCHECK_GPU_FAIL_DRAIN=1`): see
