@@ -1624,6 +1624,34 @@ pub fn inner_product(a: &[F128], b: &[F128]) -> F128 {
     acc
 }
 
+/// A/B control for the exact 128-term product dots that feed the ranked
+/// direct-fold8 message matrices. The official harness clears environment
+/// variables, so flip this source default for a trusted control build;
+/// `FLOCK_NO_OPEN_DIRECT_FOLD8_DEFERRED_DOT=1` is the same-binary local
+/// rollback.
+const DIRECT_FOLD8_DEFERRED_DOT_DEFAULT: bool = true;
+const ENV_NO_DIRECT_FOLD8_DEFERRED_DOT: &str =
+    "FLOCK_NO_OPEN_DIRECT_FOLD8_DEFERRED_DOT";
+
+#[inline]
+fn direct_fold8_deferred_dot_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        DIRECT_FOLD8_DEFERRED_DOT_DEFAULT
+            && std::env::var_os(ENV_NO_DIRECT_FOLD8_DEFERRED_DOT).is_none()
+    })
+}
+
+/// Exact deferred-reduction form of a ranked 128-term product dot. The
+/// architecture helper accumulates carry-less products before one final
+/// reduction; reduction is F2-linear, so this is bit-identical to
+/// [`inner_product`].
+#[inline]
+fn direct_fold8_product_dot_deferred(a: &[F128; 128], b: &[F128]) -> F128 {
+    assert_eq!(b.len(), 128);
+    crate::field::f128_slice::fold_banked_slot::<128>(a, b)
+}
+
 /// **TensorAlgebra transpose** (a.k.a. "bit transpose" of `s_hat_v`).
 ///
 /// View `s_hat_v` (length 128) as a 128×128 binary matrix with row `i_skip` =
@@ -3048,6 +3076,9 @@ pub fn prove_batched_padded_with_precomputed<Ch: Challenger>(
         && has_quad[0]
         && !has_quad[1]
         && std::env::var_os("FLOCK_NO_OPEN_DEFERRED_C").is_none();
+    // Latch outside both Rayon and dot loops. The scalar arm is an exact
+    // same-binary rollback for local causal checks.
+    let use_direct_fold8_deferred_dot = direct_fold8_deferred_dot_enabled();
 
     // Per-opening tails are independent once every γ_rs is sampled (the
     // transcript work above is complete), so run the two openings' table and
@@ -3158,11 +3189,29 @@ pub fn prove_batched_padded_with_precomputed<Ch: Challenger>(
                         .for_each(|(e, chunk)| {
                             let bank = &fold8[e * n_packed..(e + 1) * n_packed];
                             let transposed = tensor_algebra_transpose(bank);
-                            for (d_low, out) in chunk.iter_mut().enumerate() {
-                                *out = inner_product(
-                                    &transposed,
-                                    &w_prime[d_low * n_packed..(d_low + 1) * n_packed],
-                                );
+                            // Borrow the vector allocation as a fixed-size
+                            // array: this is one length check, not a 2 KiB
+                            // stack copy. Keep the rollback branch outside the
+                            // 64-dot inner loop.
+                            let transposed_128: &[F128; 128] = transposed
+                                .as_slice()
+                                .try_into()
+                                .expect("tensor transpose has 128 elements");
+                            if use_direct_fold8_deferred_dot {
+                                for (d_low, out) in chunk.iter_mut().enumerate() {
+                                    let start = d_low * n_packed;
+                                    let w_prime_d = &w_prime[start..start + n_packed];
+                                    *out = direct_fold8_product_dot_deferred(
+                                        transposed_128,
+                                        w_prime_d,
+                                    );
+                                }
+                            } else {
+                                for (d_low, out) in chunk.iter_mut().enumerate() {
+                                    let start = d_low * n_packed;
+                                    let w_prime_d = &w_prime[start..start + n_packed];
+                                    *out = inner_product(transposed_128, w_prime_d);
+                                }
                             }
                         });
                     let tail = &suffix[6..];
@@ -3557,6 +3606,37 @@ mod tests {
                 lo: self.next_u64(),
                 hi: self.next_u64(),
             }
+        }
+    }
+
+    #[test]
+    fn direct_fold8_deferred_product_dot_matches_scalar() {
+        fn check(a: &[F128; 128], b: &[F128; 128], label: &str) {
+            assert_eq!(
+                direct_fold8_product_dot_deferred(a, b),
+                inner_product(a, b),
+                "{label}"
+            );
+        }
+
+        let zeros = [F128::ZERO; 128];
+        let ones = [F128::ONE; 128];
+        check(&zeros, &zeros, "all zero");
+        check(&ones, &ones, "all one");
+
+        let mut endpoint_a = [F128::ZERO; 128];
+        let mut endpoint_b = [F128::ZERO; 128];
+        endpoint_a[0] = F128::new(u64::MAX, 0x0123_4567_89ab_cdef);
+        endpoint_b[0] = F128::new(0xfedc_ba98_7654_3210, u64::MAX);
+        endpoint_a[127] = F128::new(0x1357_9bdf_2468_ace0, u64::MAX);
+        endpoint_b[127] = F128::new(u64::MAX, 0x0f1e_2d3c_4b5a_6978);
+        check(&endpoint_a, &endpoint_b, "endpoint terms");
+
+        let mut rng = Rng::new(0xD07D_1280_DEFE_22ED);
+        for trial in 0..64 {
+            let a = std::array::from_fn(|_| rng.f128());
+            let b = std::array::from_fn(|_| rng.f128());
+            check(&a, &b, &format!("random trial {trial}"));
         }
     }
 

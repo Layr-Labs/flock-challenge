@@ -166,6 +166,11 @@ pub const ENV_NO_GPU_KEEPWARM: &str = "FLOCK_NO_GPU_KEEPWARM";
 /// or submission failure falls back to the untouched CPU builder.
 pub const ENV_NO_GPU_RECURSIVE_MERKLE: &str = "FLOCK_NO_GPU_RECURSIVE_MERKLE";
 
+/// Exact rollback for fusing three adjacent parent levels in the recursive
+/// L1 Merkle tree: `FLOCK_NO_GPU_REC_PARENT3=1` restores the scalar parent
+/// dispatch at every level while retaining the rest of the GPU offload.
+pub const ENV_NO_GPU_REC_PARENT3: &str = "FLOCK_NO_GPU_REC_PARENT3";
+
 fn gpu_recursive_merkle_value_enabled(value: Option<&std::ffi::OsStr>) -> bool {
     value != Some(std::ffi::OsStr::new("1"))
 }
@@ -181,6 +186,45 @@ pub(crate) fn gpu_recursive_merkle_enabled() -> bool {
                 std::env::var_os(ENV_NO_GPU_RECURSIVE_MERKLE).as_deref(),
             )
     })
+}
+
+fn gpu_recursive_parent3_value_enabled(value: Option<&std::ffi::OsStr>) -> bool {
+    value != Some(std::ffi::OsStr::new("1"))
+}
+
+fn gpu_recursive_parent3_enabled() -> bool {
+    // Resolve the same-binary control once, outside the recursive parent
+    // encoder's hot loop.
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        gpu_recursive_parent3_value_enabled(
+            std::env::var_os(ENV_NO_GPU_REC_PARENT3).as_deref(),
+        )
+    })
+}
+
+fn select_gpu_recursive_parent3(num_leaves: usize, enabled: bool) -> bool {
+    enabled && num_leaves == 1usize << 18
+}
+
+#[cfg(test)]
+mod recursive_parent3_gate_tests {
+    use std::ffi::OsStr;
+
+    #[test]
+    fn exact_one_rollback_and_l1_shape_only() {
+        assert!(!super::gpu_recursive_parent3_value_enabled(Some(
+            OsStr::new("1")
+        )));
+        for value in [None, Some(""), Some("0"), Some("01"), Some("true")] {
+            assert!(super::gpu_recursive_parent3_value_enabled(
+                value.map(OsStr::new)
+            ));
+        }
+        assert!(super::select_gpu_recursive_parent3(1 << 18, true));
+        assert!(!super::select_gpu_recursive_parent3(1 << 18, false));
+        assert!(!super::select_gpu_recursive_parent3(1 << 16, true));
+    }
 }
 
 /// GPU BLAKE3 Merkle tree for the recursive Ligerito 128-byte-leaf shapes
@@ -7523,6 +7567,12 @@ kernel void rec_parent_hash(device const uint* children [[buffer(0)]],
             .expect("shape checked above");
 
         let total_nodes = 2 * num_leaves - 1;
+        let use_parent3 = super::select_gpu_recursive_parent3(
+            num_leaves,
+            super::gpu_recursive_parent3_enabled(),
+        );
+        let mut parent3_dispatches = 0usize;
+        let mut scalar_parent_dispatches = 0usize;
         let run = unsafe {
             let pool = gpu.pool_push();
             let run = (|| -> Result<(), String> {
@@ -7533,9 +7583,31 @@ kernel void rec_parent_hash(device const uint* children [[buffer(0)]],
                 gpu.set_buffer(enc, tree_buf, 0, 1);
                 let tpg = 256u64.min(num_leaves as u64);
                 gpu.dispatch(enc, num_leaves as u64 / tpg, tpg);
-                gpu.set_pipeline(enc, state.pso_parent);
                 let mut read_start = 0usize;
                 let mut read_len = num_leaves;
+
+                if use_parent3 {
+                    gpu.set_pipeline(enc, gpu.pso_parent3);
+                    while read_len >= 256 {
+                        let write1_start = read_start + read_len;
+                        let write1_len = read_len / 2;
+                        let write2_start = write1_start + write1_len;
+                        let write2_len = write1_len / 2;
+                        let write3_start = write2_start + write2_len;
+                        let write3_len = write2_len / 2;
+                        debug_assert_eq!(read_len % 256, 0);
+                        gpu.set_buffer(enc, tree_buf, read_start * 32, 0);
+                        gpu.set_buffer(enc, tree_buf, write1_start * 32, 1);
+                        gpu.set_buffer(enc, tree_buf, write2_start * 32, 2);
+                        gpu.set_buffer(enc, tree_buf, write3_start * 32, 3);
+                        gpu.dispatch(enc, (read_len / 256) as u64, 128);
+                        parent3_dispatches += 1;
+                        read_start = write3_start;
+                        read_len = write3_len;
+                    }
+                }
+
+                gpu.set_pipeline(enc, state.pso_parent);
                 while read_len > 1 {
                     let write_start = read_start + read_len;
                     let n_out = read_len / 2;
@@ -7543,6 +7615,7 @@ kernel void rec_parent_hash(device const uint* children [[buffer(0)]],
                     gpu.set_buffer(enc, tree_buf, write_start * 32, 1);
                     let tpg = 256u64.min(n_out as u64);
                     gpu.dispatch(enc, n_out as u64 / tpg, tpg);
+                    scalar_parent_dispatches += 1;
                     read_start = write_start;
                     read_len = n_out;
                 }
@@ -7562,6 +7635,12 @@ kernel void rec_parent_hash(device const uint* children [[buffer(0)]],
             *guard = Some(Err(msg));
             return None;
         }
+        if use_parent3 {
+            // L1 consumes twelve levels in four fused dispatches, then the
+            // six levels below 256 children through the scalar fallback.
+            debug_assert_eq!(parent3_dispatches, 4);
+            debug_assert_eq!(scalar_parent_dispatches, 6);
+        }
 
         let mut tree: Vec<Hash> = crate::alloc_uninit_vec(total_nodes);
         unsafe {
@@ -7573,11 +7652,14 @@ kernel void rec_parent_hash(device const uint* children [[buffer(0)]],
         }
         if let Some(t) = started {
             eprintln!(
-                "[gpu-recmerkle] n_leaves=2^{} wall {:.2} ms (wrap hits {} misses {})",
+                "[gpu-recmerkle] n_leaves=2^{} wall {:.2} ms (wrap hits {} misses {}; \
+                 parent3 dispatches {} scalar {})",
                 num_leaves.trailing_zeros(),
                 t.elapsed().as_secs_f64() * 1e3,
                 state.hits,
                 state.misses,
+                parent3_dispatches,
+                scalar_parent_dispatches,
             );
         }
         Some(tree)
@@ -9313,9 +9395,9 @@ mod tests {
         }
     }
 
-    /// The recursive-Merkle offload must reproduce the CPU flat tree
-    /// bit-for-bit at both supported 128-byte-leaf shapes, and its repeated
-    /// calls must reuse the cached input wrap.
+    /// The recursive-Merkle offload (including its default-on fused parent
+    /// encoder) must reproduce the CPU flat tree bit-for-bit at the supported
+    /// 128-byte-leaf shape, and repeated calls must reuse the cached input wrap.
     #[test]
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     fn gpu_recursive_merkle_matches_cpu_tree() {
