@@ -210,6 +210,35 @@ fn use_ranked_deep_pair_fusion(
         && n_top == 10
 }
 
+/// Whether to finish the recursive from-message commits' cache-resident tail
+/// in fused pairs. Mirrors [`use_ranked_deep_pair_fusion`] for the recursive
+/// shapes (`log_d` 18/16, eight lanes, fused-3/4 continuation at layer 5..7):
+/// each two-layer pair inside the 2 MiB sub-groups loads/stores every row once
+/// instead of twice, halving the tail's L2 round-trips. Recursive commits have
+/// no zero-tail publication (dense), and the from-src-row first pass has
+/// already consumed the shallow layers, so the pair scheduler must honor a
+/// `start_layer` above `n_top` — see
+/// [`Self::forward_transform_interleaved_deep_fused_pairs_range_and_then`].
+/// Anything outside the exact fused continuations (or a changed thread-count
+/// geometry) keeps the independently tuned single-layer tail.
+#[inline]
+fn use_recursive_deep_pair_fusion(
+    log_d: usize,
+    num_ntts: usize,
+    start_layer: usize,
+    n_top: usize,
+) -> bool {
+    cfg!(all(
+        target_os = "macos",
+        target_arch = "aarch64",
+        target_feature = "aes"
+    )) && num_ntts == 8
+        && n_top == 4
+        && ((log_d == 18 && matches!(start_layer, 5 | 6))
+            || (log_d == 16 && matches!(start_layer, 6 | 7)))
+        && std::env::var_os("FLOCK_NO_RECURSIVE_DEEP_PAIR_FUSION").is_none()
+}
+
 /// The standard dimension-20 basis has low-limb-only twiddles throughout the
 /// final two layers. This permits a two-PMULL product on AArch64 instead of the
 /// generic six-PMULL field multiply. Keep the dispatch tied to the exact
@@ -674,6 +703,107 @@ impl AdditiveNttF128 {
         );
     }
 
+    /// Start an interleaved transform directly from the rate-reduced message,
+    /// fusing the first FOUR nontrivial layers into the stores that
+    /// initialize `data`, then finish the remaining layers in place.
+    ///
+    /// One deeper than [`Self::forward_transform_interleaved_from_message_fused3`]:
+    /// the same message rows are read once and the radix-16 result is written
+    /// straight to the stale destination, deleting both the replica fill and
+    /// the first full-buffer sweep (layers `start_layer..start_layer+4`).
+    /// Fourteen concurrent row streams alias into one L1 set, so this is only
+    /// used where the eight-way L1D pressure of the from-src-row burst stores
+    /// is already paid by the fused pass's single write; the recursive
+    /// commitments are the sole callers (their one-pass 16-row tile is
+    /// 256 B per lane at num_ntts = 8, streamed once).
+    pub(crate) fn forward_transform_interleaved_from_message_fused4(
+        &self,
+        msg: &[F128],
+        data: &mut [F128],
+        num_ntts: usize,
+        start_layer: usize,
+    ) {
+        use rayon::prelude::*;
+
+        assert_eq!(num_ntts, 8, "recursive from-message fusion uses eight lanes");
+        let log_d = log2_pow2(data.len() / num_ntts);
+        assert!(start_layer + 4 <= log_d);
+        assert_eq!(data.len(), msg.len() << start_layer);
+
+        let num_blocks = 1usize << start_layer;
+        let block_positions = 1usize << (log_d - start_layer);
+        let block_elems = block_positions * num_ntts;
+        let sixteenth = block_positions >> 4;
+        assert_eq!(msg.len(), block_elems);
+        let twiddles: Vec<[F128; 15]> = (0..num_blocks)
+            .map(|block| {
+                let mut tw = [F128 { lo: 0, hi: 0 }; 15];
+                tw[0] = self.twiddle(start_layer, block);
+                for s in 0..2 {
+                    tw[1 + s] = self.twiddle(start_layer + 1, 2 * block + s);
+                }
+                for s in 0..4 {
+                    tw[3 + s] = self.twiddle(start_layer + 2, 4 * block + s);
+                }
+                for s in 0..8 {
+                    tw[7 + s] = self.twiddle(start_layer + 3, 8 * block + s);
+                }
+                tw
+            })
+            .collect();
+        debug_assert_eq!(twiddles[0][0], F128::ZERO);
+        debug_assert_eq!(twiddles[0][1], F128::ZERO);
+        debug_assert_eq!(twiddles[0][3], F128::ZERO);
+        debug_assert_eq!(twiddles[0][7], F128::ZERO);
+
+        const ROWS_PER_TILE: usize = 128;
+        let tiles_per_block = sixteenth.div_ceil(ROWS_PER_TILE);
+        let src = msg.as_ptr() as usize;
+        let dst = data.as_mut_ptr() as usize;
+        (0..num_blocks * tiles_per_block)
+            .into_par_iter()
+            .for_each(|job| {
+                let block = job / tiles_per_block;
+                let tile = job % tiles_per_block;
+                let row_start = tile * ROWS_PER_TILE;
+                let row_end = (row_start + ROWS_PER_TILE).min(sixteenth);
+                // SAFETY: each `(block, tile)` job owns all sixteen destination
+                // rows for one disjoint row interval. `msg` is immutable and
+                // has one complete layer-start block; every derived address
+                // is in the validated source/destination geometry.
+                unsafe {
+                    let dst_block = (dst as *mut F128).add(block * block_elems);
+                    for row in row_start..row_end {
+                        if block == 0 {
+                            kernels::butterfly_fused_4layer_zero_root_from_src_row(
+                                src as *const F128,
+                                dst_block,
+                                sixteenth,
+                                num_ntts,
+                                row,
+                                &twiddles[block],
+                            );
+                        } else {
+                            kernels::butterfly_fused_4layer_from_src_row(
+                                src as *const F128,
+                                dst_block,
+                                sixteenth,
+                                num_ntts,
+                                row,
+                                &twiddles[block],
+                            );
+                        }
+                    }
+                }
+            });
+
+        self.forward_transform_interleaved_from_layer(
+            data,
+            num_ntts,
+            start_layer + 4,
+        );
+    }
+
     /// Ranked L0 top passes with the layer-1 pass fused from the message:
     /// both rate-1/2 replica blocks' layer-1..3 butterflies are evaluated
     /// straight from `msg` (`replicate_message_fill` is exactly the
@@ -966,6 +1096,7 @@ impl AdditiveNttF128 {
             num_ntts,
             DEEP_LAYER,
             log_d,
+            DEEP_LAYER,
             sub_start,
             sub_end,
             odd_tail,
@@ -1343,6 +1474,24 @@ impl AdditiveNttF128 {
                 num_ntts,
                 n_top,
                 log_d,
+                start_layer,
+                ranked_zero_odd_tail_lanes(log_d, num_ntts),
+                finish_chunk,
+            );
+            return;
+        }
+        // Recursive from-message commits: the fused first pass already consumed
+        // the shallow layers, so the cache-resident tail (dense, no zero-tail
+        // publication) may start above `n_top`. Fusing it in pairs halves the
+        // per-sub-group L2 round-trips.
+        if use_recursive_deep_pair_fusion(log_d, num_ntts, start_layer, n_top) {
+            self.forward_transform_interleaved_deep_fused_pairs_and_then(
+                data,
+                num_ntts,
+                n_top,
+                log_d,
+                start_layer,
+                0,
                 finish_chunk,
             );
             return;
@@ -1390,6 +1539,8 @@ impl AdditiveNttF128 {
             num_ntts,
             n_top,
             log_d,
+            n_top,
+            0,
             &|_, _| {},
         );
     }
@@ -1400,21 +1551,21 @@ impl AdditiveNttF128 {
         num_ntts: usize,
         n_top: usize,
         log_d: usize,
+        start_layer: usize,
+        zero_tail: usize,
         finish_chunk: &F,
     ) where
         F: Fn(usize, &[F128]) + Sync + Send,
     {
-        // Reached only under `use_ranked_deep_pair_fusion`, i.e. the exact
-        // ranked production geometry, so the ambient publication applies.
-        let odd_tail = ranked_zero_odd_tail_lanes(log_d, num_ntts);
         self.forward_transform_interleaved_deep_fused_pairs_range_and_then(
             data,
             num_ntts,
             n_top,
             log_d,
+            start_layer,
             0,
             1usize << n_top,
-            odd_tail,
+            zero_tail,
             finish_chunk,
         );
     }
@@ -1428,6 +1579,7 @@ impl AdditiveNttF128 {
         num_ntts: usize,
         n_top: usize,
         log_d: usize,
+        start_layer: usize,
         sub_start: usize,
         sub_end: usize,
         // Trailing lanes known zero at every odd position; 0 = dense.
@@ -1455,7 +1607,7 @@ impl AdditiveNttF128 {
             .enumerate()
             .for_each(|(local_sub_idx, sub_data)| {
                 let sub_idx = sub_start + local_sub_idx;
-                let mut layer = n_top;
+                let mut layer = n_top.max(start_layer);
                 while layer + 1 < log_d {
                     let layer_in_sub = layer - n_top;
                     let num_blocks_in_sub = 1usize << layer_in_sub;
@@ -2408,6 +2560,48 @@ mod tests {
         }
     }
 
+    /// Recursive from-message continuation geometry: the pair scheduler must
+    /// start at `start_layer` (the from-src-row pass already consumed layers
+    /// below it) while preserving absolute twiddle indices. Runs the dense
+    /// (`zero_tail = 0`) tail with an ODD layer count so the retained
+    /// single-layer tail is covered too.
+    #[test]
+    fn recursive_start_above_n_top_fused_pairs_match_scalar() {
+        const LOG_D: usize = 13;
+        const N_TOP: usize = 4;
+        const START_LAYER: usize = 6;
+        const NUM_NTTS: usize = 8;
+
+        let mut rng = Rng::new(0xF05E_A11F_0DD1_0003);
+        let ntt = AdditiveNttF128::standard(LOG_D);
+        for iteration in 0..3 {
+            let source = rand_vec(&mut rng, (1usize << LOG_D) * NUM_NTTS);
+            let mut want = source.clone();
+            ntt.forward_transform_interleaved_scalar_from_layer(
+                &mut want,
+                NUM_NTTS,
+                START_LAYER,
+            );
+
+            let mut got = source;
+            ntt.forward_transform_interleaved_deep_fused_pairs_range_and_then(
+                &mut got,
+                NUM_NTTS,
+                N_TOP,
+                LOG_D,
+                START_LAYER,
+                0,
+                1 << N_TOP,
+                0,
+                &|_, _| {},
+            );
+            assert_eq!(
+                got, want,
+                "recursive-geometry pair fusion mismatch at iteration={iteration}"
+            );
+        }
+    }
+
     /// Every finalized-chunk callback must observe the final transform bytes,
     /// exactly once and at the advertised global element offset.
     #[test]
@@ -2507,6 +2701,28 @@ mod tests {
         assert!(!use_ranked_deep_pair_fusion(20, 8, 1, 10));
         assert!(!use_ranked_deep_pair_fusion(20, 64, 0, 10));
         assert!(!use_ranked_deep_pair_fusion(20, 64, 1, 9));
+
+        // Recursive shapes mirror the ranked gate: only the exact fused-3/4
+        // continuations (eight lanes, n_top=4) pair-fuse; anything else
+        // retains the tuned single-layer tail.
+        let recursive_enabled = cfg!(all(
+            target_os = "macos",
+            target_arch = "aarch64",
+            target_feature = "aes"
+        ));
+        assert_eq!(use_recursive_deep_pair_fusion(18, 8, 5, 4), recursive_enabled);
+        assert_eq!(use_recursive_deep_pair_fusion(18, 8, 6, 4), recursive_enabled);
+        assert_eq!(use_recursive_deep_pair_fusion(16, 8, 6, 4), recursive_enabled);
+        assert_eq!(use_recursive_deep_pair_fusion(16, 8, 7, 4), recursive_enabled);
+        assert!(!use_recursive_deep_pair_fusion(18, 8, 5, 3));
+        assert!(!use_recursive_deep_pair_fusion(18, 8, 5, 5));
+        assert!(!use_recursive_deep_pair_fusion(18, 8, 7, 4));
+        assert!(!use_recursive_deep_pair_fusion(16, 8, 5, 4));
+        assert!(!use_recursive_deep_pair_fusion(16, 8, 6, 3));
+        assert!(!use_recursive_deep_pair_fusion(18, 64, 5, 4));
+        assert!(!use_recursive_deep_pair_fusion(20, 8, 5, 4));
+        assert!(!use_recursive_deep_pair_fusion(18, 8, 2, 4));
+        assert!(!use_recursive_deep_pair_fusion(16, 8, 4, 4));
         assert_eq!(use_ranked_zero_root_fusion(20, 64, 1, 10), enabled_here);
         assert!(!use_ranked_zero_root_fusion(19, 64, 1, 10));
         assert!(!use_ranked_zero_root_fusion(20, 8, 1, 10));
@@ -3206,6 +3422,7 @@ mod block_range_equivalence {
             num_ntts,
             n_top,
             log_d,
+            n_top,
             sub_start,
             sub_end,
             0,
@@ -3301,6 +3518,7 @@ mod zero_lane_skip {
                 NUM_NTTS,
                 n_top,
                 log_d,
+                n_top,
                 0,
                 1 << n_top,
                 tail,
