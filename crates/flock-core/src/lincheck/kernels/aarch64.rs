@@ -408,7 +408,65 @@ pub fn partial_fold_packed_z_neon_oblock_padded(
     useful_bits: usize,
     eq_outer: &[F128],
 ) -> Vec<F128> {
-    oblock_padded_tiled::<NEON_TILE_T>(z_packed, m, k_log, useful_bits, eq_outer)
+    oblock_padded_tiled::<NEON_TILE_T>(z_packed, m, k_log, useful_bits, eq_outer, 0, usize::MAX)
+}
+
+/// Tile claims per queue chunk in the oblock fold. Exposed so a co-processor
+/// arm can express its stripe prefix in the same units the CPU claims use.
+pub(crate) const OBLOCK_TILES_PER_CLAIM: usize = 64;
+
+/// Number of oblock tile claims for `(m, k_log)` at the default tile factor.
+pub(crate) fn oblock_claim_count(m: usize, k_log: usize) -> usize {
+    let n_stripes = (1usize << (m - k_log)) / 8;
+    (n_stripes / NEON_TILE_T).div_ceil(OBLOCK_TILES_PER_CLAIM)
+}
+
+/// First stripe owned by claim `claim`.
+pub(crate) fn oblock_claim_stripe_base(claim: usize) -> usize {
+    claim * OBLOCK_TILES_PER_CLAIM * NEON_TILE_T
+}
+
+/// Stripe-**suffix** oblock fold: claims `[claim_lo, n_claims)` only. The
+/// skipped prefix is folded by the GPU arm of the round-one C fold and XORed
+/// in by the caller. GF(2¹²⁸) add is XOR — associative and commutative — so
+/// any partition of the stripe range reproduces the whole-range result bit
+/// for bit.
+#[cfg(target_arch = "aarch64")]
+pub(crate) fn partial_fold_packed_z_neon_oblock_padded_suffix(
+    z_packed: &[u8],
+    m: usize,
+    k_log: usize,
+    useful_bits: usize,
+    eq_outer: &[F128],
+    claim_lo: usize,
+) -> Vec<F128> {
+    oblock_padded_tiled::<NEON_TILE_T>(
+        z_packed,
+        m,
+        k_log,
+        useful_bits,
+        eq_outer,
+        claim_lo,
+        usize::MAX,
+    )
+}
+
+/// Half-open claim range `[claim_lo, claim_hi)` of the oblock fold. Used as
+/// the exact CPU oracle for the GPU prefix arm, and as the CPU redo path when
+/// a submitted GPU prefix fails.
+#[cfg(target_arch = "aarch64")]
+pub(crate) fn partial_fold_packed_z_neon_oblock_padded_range(
+    z_packed: &[u8],
+    m: usize,
+    k_log: usize,
+    useful_bits: usize,
+    eq_outer: &[F128],
+    claim_lo: usize,
+    claim_hi: usize,
+) -> Vec<F128> {
+    oblock_padded_tiled::<NEON_TILE_T>(
+        z_packed, m, k_log, useful_bits, eq_outer, claim_lo, claim_hi,
+    )
 }
 
 #[cfg(target_arch = "aarch64")]
@@ -418,6 +476,8 @@ pub(crate) fn oblock_padded_tiled<const TILE_T: usize>(
     k_log: usize,
     useful_bits: usize,
     eq_outer: &[F128],
+    claim_lo: usize,
+    claim_hi: usize,
 ) -> Vec<F128> {
     use rayon::prelude::*;
 
@@ -458,13 +518,20 @@ pub(crate) fn oblock_padded_tiled<const TILE_T: usize>(
     // is allocated uninitialized: every claim zeroes exactly its own slot
     // before its first accumulate, so there is no up-front 16 MiB fault pass
     // and first-touch lands on whichever core does the work.
-    const TILES_PER_CLAIM: usize = 64;
-    let n_claims = n_tiles.div_ceil(TILES_PER_CLAIM);
+    const TILES_PER_CLAIM: usize = OBLOCK_TILES_PER_CLAIM;
+    let n_claims_total = n_tiles.div_ceil(TILES_PER_CLAIM);
+    let claim_hi = claim_hi.min(n_claims_total);
+    let claim_lo = claim_lo.min(claim_hi);
+    let n_claims = claim_hi - claim_lo;
+    if n_claims == 0 {
+        return vec![F128::ZERO; k];
+    }
     let mut partials = crate::alloc_uninit_f128_vec(n_claims * k);
     let partials_base = crate::epool::SyncPtr(partials.as_mut_ptr());
     crate::epool::run_hetero_chunks(n_claims, |c| {
-        let tile_lo = c * TILES_PER_CLAIM;
-        let tile_hi = ((c + 1) * TILES_PER_CLAIM).min(n_tiles);
+        let claim = c + claim_lo;
+        let tile_lo = claim * TILES_PER_CLAIM;
+        let tile_hi = ((claim + 1) * TILES_PER_CLAIM).min(n_tiles);
         // SAFETY: the queue hands out each claim index exactly once; claim
         // `c` exclusively owns `partials[c·k .. (c+1)·k]`, which it fully
         // zero-initializes below before any read. The queue join publishes

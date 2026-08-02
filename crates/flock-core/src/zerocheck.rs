@@ -376,6 +376,20 @@ fn prove_packed_padded_inner<C: Challenger>(
                 crate::pcs::ranked_direct_fold4_enabled() || cfg!(test),
                 "lincheck C reuse requires ranked DirectFold4"
             );
+            // Submit the C fold's GPU prefix BEFORE the AB completion. The
+            // GPU is idle for the whole zerocheck window and round one has no
+            // Fiat-Shamir dependency inside it (r was sampled above, the
+            // transcript only advances after the round-one messages), so the
+            // prefix runs concurrently with the AB completion AND with the
+            // CPU's own share of the C fold.
+            let c_prelude =
+                crate::zerocheck::univariate_skip_optimized::round1_c_prelude(
+                    c_lincheck,
+                    m,
+                    padding.k_log,
+                    padding.useful_bits_per_block,
+                    &r,
+                );
             let cpu_ab = crate::pcs::commit::commit_cpu_ms();
             let t_ab = std::time::Instant::now();
             let ab = crate::zerocheck::univariate_skip_optimized::round1_shift_reduce_ab_packed_padded_with_precomputed(
@@ -404,6 +418,7 @@ fn prove_packed_padded_inner<C: Challenger>(
                         padding.useful_bits_per_block,
                         &r,
                         inv_table,
+                        c_prelude,
                     );
                 if zc_timing {
                     eprintln!(
@@ -432,6 +447,7 @@ fn prove_packed_padded_inner<C: Challenger>(
                         padding.useful_bits_per_block,
                         &r,
                         inv_table,
+                        c_prelude,
                     );
                 if zc_timing {
                     eprintln!(
@@ -1066,6 +1082,99 @@ mod tests {
 
         let mut verifier = FsChallenger::new(b"flock-c-stripe-proof-v0");
         assert_eq!(verify(M, &new_proof, &mut verifier), Ok(new_claim));
+    }
+
+    /// Same transcript gate as above, at a shape large enough for the GPU
+    /// round-one C-fold arm to actually submit (`n_outer = 2^13` ⇒ 1024
+    /// stripes ⇒ 2 tile claims, so the GPU takes a prefix and the CPU the
+    /// suffix). The proof, claim and every RingSwitch capture must be
+    /// byte-identical to the pure-CPU 32-bank drain.
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    fn lincheck_stripe_c_proof_is_byte_identical_with_gpu_prefix() {
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(2)
+            .stack_size(16 << 20)
+            .build()
+            .unwrap();
+        pool.install(|| {
+            const M: usize = 27;
+            const K_LOG: usize = 14;
+            let padding = PaddingSpec {
+                k_log: K_LOG,
+                useful_bits_per_block: (1 << K_LOG) - 975,
+            };
+            let mut rng = Rng::new(0x7A_C0_DE_51);
+            let a = rng.bits(1 << M);
+            let b = rng.bits(1 << M);
+            let mut c: Vec<bool> = a.iter().zip(&b).map(|(x, y)| *x & *y).collect();
+            // Honest padding: rows past `useful_bits` are zero in every block.
+            for (i, bit) in c.iter_mut().enumerate() {
+                if i % (1 << K_LOG) >= padding.useful_bits_per_block {
+                    *bit = false;
+                }
+            }
+            let a: Vec<bool> = a
+                .iter()
+                .enumerate()
+                .map(|(i, v)| *v && i % (1 << K_LOG) < padding.useful_bits_per_block)
+                .collect();
+            let b: Vec<bool> = b
+                .iter()
+                .enumerate()
+                .map(|(i, v)| *v && i % (1 << K_LOG) < padding.useful_bits_per_block)
+                .collect();
+            let c: Vec<bool> = a.iter().zip(&b).map(|(x, y)| *x & *y).collect();
+            let (a_p, b_p, c_p) = pack_abc(&a, &b, &c);
+            let inv_table = InvNttTableByteSingleGf8::cached_standard_k6();
+
+            let old_ab = univariate_skip_optimized::precompute_round1_ab_inner_packed_padded(
+                &a_p, &b_p, M, K_SKIP, inv_table, &padding,
+            );
+            let mut old_ch = FsChallenger::new(b"flock-c-stripe-gpu-v0");
+            let (old_proof, old_claim, old_capture) = prove_packed_padded_inner(
+                &a_p, &b_p, &c_p, M, &padding, true, Some(old_ab), None, &mut old_ch,
+            );
+
+            let c_words: Vec<F128> = c_p
+                .chunks_exact(16)
+                .map(|bytes| F128 {
+                    lo: u64::from_le_bytes(bytes[..8].try_into().unwrap()),
+                    hi: u64::from_le_bytes(bytes[8..].try_into().unwrap()),
+                })
+                .collect();
+            let c_lincheck = crate::lincheck::pack_z_lincheck_from_packed(&c_words, M, K_LOG);
+            let new_ab = univariate_skip_optimized::precompute_round1_ab_inner_packed_padded(
+                &a_p, &b_p, M, K_SKIP, inv_table, &padding,
+            );
+            let submits_before = crate::gpu_commit::zerocheck_gpu_submits();
+            let mut new_ch = FsChallenger::new(b"flock-c-stripe-gpu-v0");
+            let (new_proof, new_claim, new_capture) = prove_packed_padded_inner(
+                &a_p,
+                &b_p,
+                &c_p,
+                M,
+                &padding,
+                true,
+                Some(new_ab),
+                Some(&c_lincheck),
+                &mut new_ch,
+            );
+            assert!(
+                crate::gpu_commit::zerocheck_gpu_submits() > submits_before,
+                "GPU round-one C prefix never submitted — the oracle proved nothing"
+            );
+
+            assert_eq!(new_proof, old_proof);
+            assert_eq!(new_claim, old_claim);
+            let old_capture = old_capture.expect("legacy C capture");
+            let new_capture = new_capture.expect("stripe C capture");
+            assert_eq!(new_capture.s_hat_v_c, old_capture.s_hat_v_c);
+            assert_eq!(new_capture.quad, old_capture.quad);
+
+            let mut verifier = FsChallenger::new(b"flock-c-stripe-gpu-v0");
+            assert_eq!(verify(M, &new_proof, &mut verifier), Ok(new_claim));
+        });
     }
 
     /// **Verify rejects byte-mutated proofs.** Walk each component of the

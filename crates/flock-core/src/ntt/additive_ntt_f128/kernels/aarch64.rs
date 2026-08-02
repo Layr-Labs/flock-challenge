@@ -144,12 +144,13 @@ unsafe fn butterfly_fused_3layer_row_with_q(
     ptr: *mut F128,
     eighth: usize,
     num_ntts: usize,
+    lanes: usize,
     r: usize,
     t: &[core::arch::aarch64::uint64x2_t; 7],
 ) {
     use core::arch::aarch64::*;
     unsafe {
-        for lane in 0..num_ntts {
+        for lane in 0..lanes {
             let base = ptr.add(r * num_ntts + lane);
             let step = eighth * num_ntts;
 
@@ -521,6 +522,7 @@ pub(super) unsafe fn butterfly_fused_3layer_row(
     ptr: *mut F128,
     eighth: usize,
     num_ntts: usize,
+    lanes: usize,
     r: usize,
     twiddles: &[F128; 7],
 ) {
@@ -528,7 +530,7 @@ pub(super) unsafe fn butterfly_fused_3layer_row(
     unsafe {
         let t: [uint64x2_t; 7] =
             core::array::from_fn(|i| vld1q_u64((&raw const twiddles[i]).cast::<u64>()));
-        butterfly_fused_3layer_row_with_q(ptr, eighth, num_ntts, r, &t);
+        butterfly_fused_3layer_row_with_q(ptr, eighth, num_ntts, lanes, r, &t);
     }
 }
 
@@ -548,7 +550,7 @@ pub(super) unsafe fn butterfly_fused_3layer_rows(
         let t: [uint64x2_t; 7] =
             core::array::from_fn(|i| vld1q_u64((&raw const twiddles[i]).cast::<u64>()));
         for r in row_start..row_end {
-            butterfly_fused_3layer_row_with_q(ptr, eighth, num_ntts, r, &t);
+            butterfly_fused_3layer_row_with_q(ptr, eighth, num_ntts, num_ntts, r, &t);
         }
     }
 }
@@ -566,6 +568,7 @@ unsafe fn butterfly_fused_3layer_zero_root_row_with_q(
     ptr: *mut F128,
     eighth: usize,
     num_ntts: usize,
+    lanes: usize,
     r: usize,
     t2: core::arch::aarch64::uint64x2_t,
     t4: core::arch::aarch64::uint64x2_t,
@@ -574,7 +577,7 @@ unsafe fn butterfly_fused_3layer_zero_root_row_with_q(
 ) {
     use core::arch::aarch64::*;
     unsafe {
-        for lane in 0..num_ntts {
+        for lane in 0..lanes {
             let base = ptr.add(r * num_ntts + lane);
             let step = eighth * num_ntts;
 
@@ -620,6 +623,7 @@ pub(super) unsafe fn butterfly_fused_3layer_zero_root_row(
     ptr: *mut F128,
     eighth: usize,
     num_ntts: usize,
+    lanes: usize,
     r: usize,
     twiddles: &[F128; 7],
 ) {
@@ -633,7 +637,7 @@ pub(super) unsafe fn butterfly_fused_3layer_zero_root_row(
         let t5 = vld1q_u64((&raw const twiddles[5]).cast::<u64>());
         let t6 = vld1q_u64((&raw const twiddles[6]).cast::<u64>());
         butterfly_fused_3layer_zero_root_row_with_q(
-            ptr, eighth, num_ntts, r, t2, t4, t5, t6,
+            ptr, eighth, num_ntts, lanes, r, t2, t4, t5, t6,
         );
     }
 }
@@ -658,7 +662,7 @@ pub(super) unsafe fn butterfly_fused_3layer_zero_root_rows(
         let t6 = vld1q_u64((&raw const twiddles[6]).cast::<u64>());
         for r in row_start..row_end {
             butterfly_fused_3layer_zero_root_row_with_q(
-                ptr, eighth, num_ntts, r, t2, t4, t5, t6,
+                ptr, eighth, num_ntts, num_ntts, r, t2, t4, t5, t6,
             );
         }
     }

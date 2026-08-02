@@ -752,7 +752,9 @@ fn precompute_round1_ab_inner_packed_padded_with_flavor(
                     if nt {
                         // SAFETY: `b_med < n_b_med ≤ OUTER_BYTES / 64`, so the
                         // 64 destination bytes are in-bounds of `out_outer`.
-                        unsafe { store_nt_64(tmp.as_ptr(), out_outer.as_mut_ptr().add(b_med * 64)) };
+                        unsafe {
+                            store_nt_64(tmp.as_ptr(), out_outer.as_mut_ptr().add(b_med * 64))
+                        };
                     }
                 }
                 if nt {
@@ -1470,12 +1472,140 @@ pub(crate) fn round1_shift_reduce_ab_packed_padded_with_precomputed(
         .to_vec()
 }
 
+/// Challenge-derived inputs shared by both round-one C variants.
+///
+/// Built (and, at the ranked shape, submitted to the GPU) BEFORE the round-one
+/// AB completion. Nothing here depends on AB, and the GPU is idle for the
+/// whole zerocheck window, so starting the C fold's GPU prefix first lets it
+/// cover the AB completion as well as the CPU's own share of the fold.
+pub(crate) struct Round1CPrelude {
+    eq_outer: Vec<F128>,
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    gpu: Option<crate::gpu_commit::ZcFoldJob>,
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    submitted: std::time::Instant,
+}
+
+/// The one production shape the GPU C-fold arm is tuned and gated for
+/// (`m = 32`, `k_log = 14`). Everything else takes the exact CPU path.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn ranked_c_fold_shape(m: usize, k_log: usize) -> bool {
+    // `cfg!(test)` widens the gate so the end-to-end transcript oracle can
+    // drive the arm at a small shape. Production is the ranked shape only.
+    (cfg!(test) || (m == 32 && k_log == 14))
+        && !crate::lincheck::FOLD_IBLOCK.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Build `eq_outer` and submit the GPU prefix of the C fold.
+pub(crate) fn round1_c_prelude(
+    c_lincheck: &[u8],
+    m: usize,
+    k_log: usize,
+    useful_bits: usize,
+    r: &[F128],
+) -> Round1CPrelude {
+    let eq_outer = crate::lincheck::build_eq_table(&r[k_log..]);
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    {
+        let gpu = ranked_c_fold_shape(m, k_log)
+            .then(|| {
+                crate::gpu_commit::launch_zerocheck_c_fold(
+                    c_lincheck,
+                    m,
+                    k_log,
+                    useful_bits,
+                    &eq_outer,
+                )
+            })
+            .flatten();
+        Round1CPrelude {
+            eq_outer,
+            gpu,
+            submitted: std::time::Instant::now(),
+        }
+    }
+    #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+    {
+        let _ = (c_lincheck, m, k_log, useful_bits);
+        Round1CPrelude { eq_outer }
+    }
+}
+
+/// Fold the lincheck stripe against `eq_outer`, draining the GPU prefix when
+/// one is in flight. Bit-identical to `partial_fold_packed_z_best` in every
+/// case: GF(2¹²⁸) add is XOR, so splitting the stripe range between the two
+/// arms and XORing the halves reproduces the whole-range result exactly.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn round1_c_inner_fold(
+    prelude: Round1CPrelude,
+    c_lincheck: &[u8],
+    m: usize,
+    k_log: usize,
+    useful_bits: usize,
+) -> Vec<F128> {
+    let Round1CPrelude {
+        eq_outer,
+        gpu,
+        submitted,
+    } = prelude;
+    if let Some(job) = gpu {
+        let claim_lo = job.claim_lo();
+        let head_ms = submitted.elapsed().as_secs_f64() * 1e3;
+        let t_suffix = std::time::Instant::now();
+        let mut out = crate::lincheck::partial_fold_packed_z_neon_oblock_padded_suffix(
+            c_lincheck,
+            m,
+            k_log,
+            useful_bits,
+            &eq_outer,
+            claim_lo,
+        );
+        let suffix_ms = t_suffix.elapsed().as_secs_f64() * 1e3;
+        match job.finish_xor_into(&mut out, head_ms, suffix_ms) {
+            Ok(()) => return out,
+            Err(e) => {
+                // The prefix never landed and the CPU already skipped it.
+                // Redo exactly those claims here — slower, still exact.
+                if crate::gpu_commit::gpu_zerocheck_debug() {
+                    eprintln!("[gpu-zc] prefix failed, CPU redo: {e}");
+                }
+                let prefix = crate::lincheck::partial_fold_packed_z_neon_oblock_padded_range(
+                    c_lincheck, m, k_log, useful_bits, &eq_outer, 0, claim_lo,
+                );
+                for (a, b) in out.iter_mut().zip(prefix) {
+                    *a += b;
+                }
+                return out;
+            }
+        }
+    }
+    crate::lincheck::partial_fold_packed_z_best(c_lincheck, m, k_log, useful_bits, &eq_outer)
+}
+
+#[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+fn round1_c_inner_fold(
+    prelude: Round1CPrelude,
+    c_lincheck: &[u8],
+    m: usize,
+    k_log: usize,
+    useful_bits: usize,
+) -> Vec<F128> {
+    crate::lincheck::partial_fold_packed_z_best(
+        c_lincheck,
+        m,
+        k_log,
+        useful_bits,
+        &prelude.eq_outer,
+    )
+}
+
 /// Derive the exact legacy C round-one message and its existing RingSwitch
 /// helper tensors from the lincheck stripe.  The stripe represents identity C
 /// (`Cz = z`) in an outer-fold-friendly layout.  Folding it at the original
 /// zerocheck `r_outer` yields a tiny length-`2^k_log` inner table; retaining
 /// four inner coordinates from that table is algebraically identical to the
 /// row-major 32-bank Fold4 drain.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn round1_c_fold4_from_lincheck_stripe(
     c_lincheck: &[u8],
     m: usize,
@@ -1484,6 +1614,7 @@ pub(crate) fn round1_c_fold4_from_lincheck_stripe(
     useful_bits: usize,
     r: &[F128],
     inv_table: &InvNttTableByteSingleGf8,
+    prelude: Round1CPrelude,
 ) -> (Vec<F128>, Vec<F128>, Vec<F128>, Vec<F128>) {
     assert_eq!(k_skip, K_SKIP);
     assert!(
@@ -1493,9 +1624,7 @@ pub(crate) fn round1_c_fold4_from_lincheck_stripe(
     assert_eq!(r.len(), m);
     assert_eq!(c_lincheck.len(), (1usize << m) / 8);
 
-    let eq_outer = crate::lincheck::build_eq_table(&r[k_log..]);
-    let c_inner =
-        crate::lincheck::partial_fold_packed_z_best(c_lincheck, m, k_log, useful_bits, &eq_outer);
+    let c_inner = round1_c_inner_fold(prelude, c_lincheck, m, k_log, useful_bits);
     let inner_tail = &r[k_skip + 1..k_log];
     let fold4 = crate::pcs::ring_switch::s_hat_v_fold4_from_z_vec(&c_inner, inner_tail);
     let s_hat_v_c = crate::pcs::ring_switch::collapse_s_hat_v_fold4(&fold4, &inner_tail[..4]);
@@ -1536,6 +1665,7 @@ pub(crate) fn round1_c_fold4_from_lincheck_stripe(
 /// `s_hat_v_c`, `quad`) are derived by collapsing the wider statistic and are
 /// bitwise identical to the fold4 variant's — the extra two retained
 /// coordinates only widen the exported tensor.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn round1_c_fold8_from_lincheck_stripe(
     c_lincheck: &[u8],
     m: usize,
@@ -1544,6 +1674,7 @@ pub(crate) fn round1_c_fold8_from_lincheck_stripe(
     useful_bits: usize,
     r: &[F128],
     inv_table: &InvNttTableByteSingleGf8,
+    prelude: Round1CPrelude,
 ) -> (Vec<F128>, Vec<F128>, Vec<F128>, Vec<F128>) {
     assert_eq!(k_skip, K_SKIP);
     assert!(
@@ -1553,9 +1684,7 @@ pub(crate) fn round1_c_fold8_from_lincheck_stripe(
     assert_eq!(r.len(), m);
     assert_eq!(c_lincheck.len(), (1usize << m) / 8);
 
-    let eq_outer = crate::lincheck::build_eq_table(&r[k_log..]);
-    let c_inner =
-        crate::lincheck::partial_fold_packed_z_best(c_lincheck, m, k_log, useful_bits, &eq_outer);
+    let c_inner = round1_c_inner_fold(prelude, c_lincheck, m, k_log, useful_bits);
     let inner_tail = &r[k_skip + 1..k_log];
     let fold8 = crate::pcs::ring_switch::s_hat_v_fold8_from_z_vec(&c_inner, inner_tail);
     let s_hat_v_c = crate::pcs::ring_switch::collapse_s_hat_v_fold8(&fold8, &inner_tail[..6]);
@@ -3259,6 +3388,145 @@ mod tests {
         }
     }
 
+    /// The Horner kernel folds the bit leaving lane bit 15 back in as
+    /// `x^16 mod p`. Pin that constant against the scalar field arithmetic so
+    /// a wrong literal can never silently pass the vector oracle.
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn horner_carry_constant_matches_field() {
+        let x8 = F8(crate::field::gf2_8::gf8_reduce(1u16 << 8));
+        assert_eq!(x8, F8(0x1b), "x^8 mod p");
+        let x16 = x8 * x8;
+        assert_eq!(
+            u16::from(x16.0),
+            kernels::aarch64::HORNER_CARRY_X16,
+            "x^16 mod p must equal the Horner carry weight"
+        );
+    }
+
+    /// The `x^4`-scaled table images must be exactly the elementwise field
+    /// product of the plain images with `x^4`; that identity is what makes
+    /// `x^4 · T(w)` a pure table swap.
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn scaled_x4_table_images_are_x4_times_plain() {
+        let table = make_inv_table();
+        let len = 256 * table.ell;
+        let x4 = F8(1u8 << 4);
+        for (plain, scaled) in [
+            (table.data_ptr(), table.scaled_x4_data_ptr()),
+            (
+                table.half_swapped_data_ptr(),
+                table.scaled_x4_half_swapped_data_ptr(),
+            ) as (*const u8, *const u8),
+        ] {
+            for i in 0..len {
+                // SAFETY: both images are `256 * ell` bytes by construction.
+                let (p, s) = unsafe { (*plain.add(i), *scaled.add(i)) };
+                assert_eq!(F8(p) * x4, F8(s), "scaled table image mismatch at {i}");
+            }
+        }
+    }
+
+    /// Byte-exact oracle for the Horner / scaled-table kernel against both the
+    /// incumbent NEON kernel it replaces and the scalar reference, over random
+    /// witnesses, every 64-byte-block byte alignment, every `b_med` slot, and
+    /// planted degenerate rows (all-zero, all-ones, top-bit-only) that drive
+    /// the Horner carry fold on every step.
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn neon_h4_shift_reduce_is_bit_exact_with_incumbent() {
+        use kernels::aarch64::shift_reduce_inner_ab_fused_neon_h4;
+
+        let table = make_inv_table();
+        let mut rng = Rng::new(0x484F_524E_4552_5F34);
+
+        const N: usize = 8192;
+        let mut a_packed = vec![0u8; N];
+        let mut b_packed = vec![0u8; N];
+        for i in 0..N {
+            a_packed[i] = (rng.next_u64() & 0xff) as u8;
+            b_packed[i] = (rng.next_u64() >> 13 & 0xff) as u8;
+        }
+        // Degenerate 64-byte K-blocks: zero rows, const-one rows, and rows
+        // whose transform maximizes the 15-bit product degree.
+        a_packed[0..64].fill(0x00);
+        b_packed[0..64].fill(0xff);
+        a_packed[64..128].fill(0xff);
+        b_packed[64..128].fill(0x00);
+        a_packed[128..192].fill(0xff);
+        b_packed[128..192].fill(0xff);
+        a_packed[192..256].fill(0x80);
+        b_packed[192..256].fill(0x01);
+
+        let mut a_col = vec![F8::ZERO; ELL];
+        let mut b_col = vec![F8::ZERO; ELL];
+        let mut cases = 0usize;
+
+        let check =
+            |chunk_byte_base: usize, b_med: usize, a_col: &mut Vec<F8>, b_col: &mut Vec<F8>| {
+                let base = chunk_byte_base + b_med * N_CHUNKS * 8;
+                if base + 8 * N_CHUNKS > N {
+                    return false;
+                }
+                let mut out_scalar = [0u8; 64];
+                let mut out_incumbent = [0u8; 64];
+                let mut out_h4 = [0u8; 64];
+                shift_reduce_inner_ab_scalar(
+                    &a_packed,
+                    &b_packed,
+                    &table,
+                    chunk_byte_base,
+                    b_med,
+                    &mut out_scalar,
+                    a_col,
+                    b_col,
+                );
+                shift_reduce_inner_ab_fused_neon(
+                    &a_packed,
+                    &b_packed,
+                    &table,
+                    chunk_byte_base,
+                    b_med,
+                    &mut out_incumbent,
+                );
+                shift_reduce_inner_ab_fused_neon_h4(
+                    &a_packed,
+                    &b_packed,
+                    &table,
+                    chunk_byte_base,
+                    b_med,
+                    &mut out_h4,
+                );
+                assert_eq!(
+                    out_incumbent, out_scalar,
+                    "incumbent oracle drift at (base={chunk_byte_base}, b_med={b_med})"
+                );
+                assert_eq!(
+                    out_h4, out_incumbent,
+                    "h4 kernel differs from incumbent at (base={chunk_byte_base}, b_med={b_med})"
+                );
+                true
+            };
+
+        // Every byte alignment of the 64-byte K-block start.
+        for chunk_byte_base in 0..64usize {
+            for b_med in 0..8usize {
+                if check(chunk_byte_base, b_med, &mut a_col, &mut b_col) {
+                    cases += 1;
+                }
+            }
+        }
+        // Every `b_med` slot across the whole buffer, at production alignment.
+        for b_med in 0.. {
+            if !check(0, b_med, &mut a_col, &mut b_col) {
+                break;
+            }
+            cases += 1;
+        }
+        assert!(cases > 600, "oracle coverage too thin: {cases} cases");
+    }
+
     #[cfg(target_arch = "aarch64")]
     #[test]
     fn static_b_context_gate_respects_layout_and_legacy_policy() {
@@ -3376,6 +3644,109 @@ mod tests {
             .expect("spawn static-B oracle")
             .join()
             .expect("static-B oracle thread");
+    }
+
+    /// The `x^2` nibble tables used by the low-instruction static-B rows must
+    /// reproduce scalar `F8` multiplication for every byte.
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn mul_x2_nibble_tables_match_field() {
+        let x2 = F8(1u8 << 2);
+        for b in 0..=255u8 {
+            let got = F8(kernels::aarch64::MUL_X2_LO[(b & 0x0f) as usize]
+                ^ kernels::aarch64::MUL_X2_HI[(b >> 4) as usize]);
+            assert_eq!(got, F8(b) * x2, "x^2 nibble split wrong for {b:#04x}");
+        }
+    }
+
+    /// Byte-exact oracle for the low-instruction static-B kernel. Covers every
+    /// live `(window, b_med)` arm, and for each of them: raw random B (guards
+    /// broken, every row takes the generic path), fully-satisfied guards
+    /// (every row takes the static path), and each K's guard broken in turn
+    /// (mixed static/generic rows within one block).
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn bstatic_fast_kernel_is_bit_exact_with_incumbent() {
+        // Same stack headroom rationale as the guard-fallback oracle above:
+        // the generated 31-arm kernel is frame-heavy in debug builds.
+        std::thread::Builder::new()
+            .stack_size(64 << 20)
+            .spawn(|| {
+                let table = make_inv_table();
+                let mut rng = Rng::new(0xB57A_71C0_F457_0001);
+                let context = kernels::aarch64::prepare_static_b_context_with_policy(
+                    &table, true, false, false,
+                )
+                .expect("enabled static-B context");
+
+                const N: usize = 4096;
+                let a_packed: Vec<u8> = (0..N).map(|_| (rng.next_u64() & 0xff) as u8).collect();
+                let base_b: Vec<u8> = (0..N)
+                    .map(|_| (rng.next_u64() >> 17 & 0xff) as u8)
+                    .collect();
+
+                let mut a_col = vec![F8::ZERO; ELL];
+                let mut b_col = vec![F8::ZERO; ELL];
+                let mut arms = 0usize;
+
+                for w in 0..2usize {
+                    let n_b_med = if w == 0 { 16 } else { 15 };
+                    for b_med in 0..n_b_med {
+                        let blk = w * (1 << N_MEDIUM) + b_med;
+                        let byte_base_b = b_med * N_CHUNKS * 8;
+                        for variant in 0..10usize {
+                            let mut b = base_b.clone();
+                            if variant >= 1 {
+                                for k in 0..N_CHUNKS {
+                                    let off = byte_base_b + k * N_CHUNKS;
+                                    let (mask, expected) = kernels::aarch64::BSTATIC_MASKS[blk][k];
+                                    let word =
+                                        u64::from_le_bytes(b[off..off + 8].try_into().unwrap());
+                                    let mut word = (word & !mask) | expected;
+                                    if variant >= 2 && variant - 2 == k && mask != 0 {
+                                        // Flip the lowest guarded bit so this row
+                                        // alone falls back to the generic path.
+                                        word ^= mask & mask.wrapping_neg();
+                                    }
+                                    b[off..off + 8].copy_from_slice(&word.to_le_bytes());
+                                }
+                            }
+
+                            let mut want = [0u8; 64];
+                            shift_reduce_inner_ab_scalar(
+                                &a_packed, &b, &table, 0, b_med, &mut want, &mut a_col, &mut b_col,
+                            );
+                            let mut slow = [0u8; 64];
+                            assert!(
+                                kernels::aarch64::shift_reduce_inner_ab_bstatic::<false>(
+                                    &a_packed, &b, &table, 0, b_med, w, context, &mut slow,
+                                ),
+                                "arm (w={w}, b_med={b_med}) must be live"
+                            );
+                            let mut fast = [0u8; 64];
+                            assert!(
+                                kernels::aarch64::shift_reduce_inner_ab_bstatic::<true>(
+                                    &a_packed, &b, &table, 0, b_med, w, context, &mut fast,
+                                ),
+                                "arm (w={w}, b_med={b_med}) must be live"
+                            );
+                            assert_eq!(
+                                slow, want,
+                                "incumbent bstatic drift (w={w}, b_med={b_med}, variant={variant})"
+                            );
+                            assert_eq!(
+                                fast, slow,
+                                "fast bstatic differs (w={w}, b_med={b_med}, variant={variant})"
+                            );
+                        }
+                        arms += 1;
+                    }
+                }
+                assert_eq!(arms, 31, "every generated static-B arm must be covered");
+            })
+            .expect("spawn bstatic oracle")
+            .join()
+            .expect("bstatic oracle thread");
     }
 
     #[cfg(target_arch = "aarch64")]
@@ -4582,6 +4953,7 @@ mod tests {
                 padding.useful_bits_per_block,
                 &r,
                 &inv_table,
+                round1_c_prelude(&c_lincheck, M, K_LOG, padding.useful_bits_per_block, &r),
             );
             assert_eq!(got_c.0, incumbent.1, "round-one C mismatch in case {case}");
             assert_eq!(got_c.1, incumbent.2, "canonical C mismatch in case {case}");
@@ -4598,10 +4970,20 @@ mod tests {
                 padding.useful_bits_per_block,
                 &r,
                 &inv_table,
+                round1_c_prelude(&c_lincheck, M, K_LOG, padding.useful_bits_per_block, &r),
             );
-            assert_eq!(got_c8.0, incumbent.1, "fold8 round-one C mismatch in case {case}");
-            assert_eq!(got_c8.1, incumbent.2, "fold8 canonical C mismatch in case {case}");
-            assert_eq!(got_c8.2, incumbent.3, "fold8 quad C mismatch in case {case}");
+            assert_eq!(
+                got_c8.0, incumbent.1,
+                "fold8 round-one C mismatch in case {case}"
+            );
+            assert_eq!(
+                got_c8.1, incumbent.2,
+                "fold8 canonical C mismatch in case {case}"
+            );
+            assert_eq!(
+                got_c8.2, incumbent.3,
+                "fold8 quad C mismatch in case {case}"
+            );
             let inner_tail = &r[K_SKIP + 1..K_LOG];
             assert_eq!(
                 crate::pcs::ring_switch::collapse_s_hat_v_fold8(&got_c8.3, &inner_tail[..6]),

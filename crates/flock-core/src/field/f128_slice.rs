@@ -41,6 +41,47 @@ pub(crate) fn round0_and_round1_lookahead(
     unsafe { aarch64::round0_and_round1_lookahead(witness, basis) }
 }
 
+/// Deferred-reduction round-zero message `(u_0, u_2)` over paired slots.
+/// Bit-identical to the fully-reduced scalar pair loop, since reduction is
+/// F2-linear and commutes with the XOR product sum.
+#[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+#[inline]
+pub(crate) fn round0(witness: &[F128], basis: &[F128]) -> (F128, F128) {
+    assert_eq!(witness.len(), basis.len());
+    assert!(witness.len().is_multiple_of(2));
+    // SAFETY: the cfg gate supplies PMULL through `aes`; the checks above are
+    // the complete slice-shape contract of the architecture kernel.
+    unsafe { aarch64::round0(witness, basis) }
+}
+
+/// Fold one banked output slot with deferred reduction:
+/// `Σ_{k<BANKS} weight[k] · input[k]`, reduced once instead of `BANKS` times.
+///
+/// Bit-identical to
+/// `weight.iter().zip(input).fold(ZERO, |a, (w, x)| a + *w * *x)`. AArch64
+/// uses the NEON kernel; other targets keep the portable [`F256Unreduced`]
+/// accumulator, which is the same algebra with the portable primitive.
+///
+/// [`F256Unreduced`]: super::F256Unreduced
+#[inline]
+pub(crate) fn fold_banked_slot<const BANKS: usize>(weight: &[F128; BANKS], input: &[F128]) -> F128 {
+    debug_assert!(input.len() >= BANKS);
+    #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+    {
+        // SAFETY: the cfg gate supplies PMULL through `aes`; the caller's
+        // sub-slice guarantees at least `BANKS` readable elements.
+        unsafe { aarch64::fold_banked_slot::<BANKS>(weight, input) }
+    }
+    #[cfg(not(all(target_arch = "aarch64", target_feature = "aes")))]
+    {
+        let mut acc = super::F256Unreduced::ZERO;
+        for (k, w) in weight.iter().enumerate() {
+            acc ^= w.mul_unreduced(input[k]);
+        }
+        acc.reduce()
+    }
+}
+
 /// Fold adjacent pairs from `src` into `dst`, starting at pair `base`.
 ///
 /// Computes `dst[t] = src[2j] * (1 + r) + src[2j + 1] * r`, where
@@ -297,6 +338,87 @@ mod tests {
             assert_eq!(got_b, expected_b, "b trial={trial}");
             assert_eq!(got_u0, expected_u0, "u0 trial={trial}");
             assert_eq!(got_u2, expected_u2, "u2 trial={trial}");
+        }
+    }
+
+    /// Oracle for the deferred-reduction banked slot fold used by the
+    /// direct-fold4 (`fold16`) and direct-fold8 (`fold64`) materializers:
+    /// one reduction per slot must produce exactly the bits of the
+    /// per-bank fully-reduced accumulation.
+    #[test]
+    fn banked_slot_fold_matches_fully_reduced_oracle() {
+        let mut state = 0xbb67_ae85_84ca_a73b_u64;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+
+        fn oracle<const BANKS: usize>(weight: &[F128; BANKS], input: &[F128]) -> F128 {
+            let mut value = F128::ZERO;
+            for bank in 0..BANKS {
+                value += weight[bank] * input[bank];
+            }
+            value
+        }
+
+        for trial in 0..64 {
+            // Production bank counts, plus a non-multiple-of-4 width to
+            // exercise the kernel's scalar tail.
+            let w16: [F128; 16] = std::array::from_fn(|_| F128::new(next(), next()));
+            let w64: [F128; 64] = std::array::from_fn(|_| F128::new(next(), next()));
+            let w6: [F128; 6] = std::array::from_fn(|_| F128::new(next(), next()));
+            // Slot windows are read out of a longer buffer, exactly as the
+            // materializers slice `input[64 * slot..]`.
+            let buf: Vec<F128> = (0..256).map(|_| F128::new(next(), next())).collect();
+            let off16 = 16 * (trial % 8);
+            let off64 = 64 * (trial % 3);
+            let off6 = trial % 11;
+
+            assert_eq!(
+                fold_banked_slot::<16>(&w16, &buf[off16..off16 + 16]),
+                oracle(&w16, &buf[off16..off16 + 16]),
+                "banks=16 trial={trial}"
+            );
+            assert_eq!(
+                fold_banked_slot::<64>(&w64, &buf[off64..off64 + 64]),
+                oracle(&w64, &buf[off64..off64 + 64]),
+                "banks=64 trial={trial}"
+            );
+            assert_eq!(
+                fold_banked_slot::<6>(&w6, &buf[off6..off6 + 6]),
+                oracle(&w6, &buf[off6..off6 + 6]),
+                "banks=6 trial={trial}"
+            );
+        }
+    }
+
+    /// Oracle for the deferred-reduction round-zero kernel that replaces the
+    /// scalar pair loop closing each direct-fold8 block.
+    #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+    #[test]
+    fn round0_deferred_matches_fully_reduced_oracle() {
+        let mut state = 0x3c6e_f372_fe94_f82b_u64;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        for trial in 0..64 {
+            // Even lengths only; include a non-multiple-of-4 length so the
+            // kernel's two-slot tail is exercised.
+            let n = 2 * (1 + trial % 17);
+            let f: Vec<F128> = (0..n).map(|_| F128::new(next(), next())).collect();
+            let b: Vec<F128> = (0..n).map(|_| F128::new(next(), next())).collect();
+            let mut want_u0 = F128::ZERO;
+            let mut want_u2 = F128::ZERO;
+            for k in (0..n).step_by(2) {
+                want_u0 += f[k] * b[k];
+                want_u2 += (f[k] + f[k + 1]) * (b[k] + b[k + 1]);
+            }
+            assert_eq!(round0(&f, &b), (want_u0, want_u2), "n={n} trial={trial}");
         }
     }
 }

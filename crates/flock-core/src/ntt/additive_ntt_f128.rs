@@ -256,6 +256,115 @@ fn is_ranked_top_hetero_fused3_pass(
     use_ranked_deep_pair_fusion(log_d, num_ntts, start_layer, n_top) && matches!(layer, 1 | 4 | 7)
 }
 
+// ---------------------------------------------------------------------------
+// Static zero-lane skip (commit NTT).
+// ---------------------------------------------------------------------------
+
+/// The interleaved lane width the zero-odd-tail skip is defined for. The
+/// geometry that produces the pattern (one R1CS block = `2 · num_ntts` packed
+/// `F128` words, so a block's padding tail lands wholly inside the block's
+/// ODD codeword position) only holds at this width.
+const ZERO_TAIL_NUM_NTTS: usize = 64;
+
+/// The ranked commit domain the ambient publication is honored at.
+const ZERO_TAIL_LOG_D: usize = 20;
+
+/// Count of trailing SoA lanes that are identically zero at every **odd**
+/// codeword position of the message being committed (0 = none / unknown).
+///
+/// For the ranked BLAKE3 shape one R1CS block is `K = 2^14` bits = 128 packed
+/// `F128` words = exactly two SoA positions, and only `USEFUL_BITS = 15,409`
+/// of those bits are constrained; words 121..128 of every block are forced to
+/// zero by the padding rows `0·0 = z[i]`. Those words are lanes 57..63 of the
+/// block's odd position, so 7 of the 64 interleaved sub-NTTs carry a static
+/// stride-2 all-zero coefficient pattern.
+///
+/// Every forward layer except the deepest pairs positions an EVEN distance
+/// apart, so the pattern survives untouched through those layers: both inputs
+/// of such a butterfly are zero and both outputs stay zero. Skipping the tail
+/// lanes on odd rows therefore removes butterfly work without changing a
+/// single output byte.
+static ZERO_ODD_TAIL_LANES: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// `FLOCK_NO_ZERO_LANE_SKIP=1` restores the dense butterfly in the same
+/// binary, so a candidate/control pair differs only in this dispatch.
+#[inline]
+fn zero_lane_skip_disabled() -> bool {
+    static OFF: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_ZERO_LANE_SKIP").is_some());
+    *OFF
+}
+
+/// Trailing lanes the ranked commit transform may skip on odd rows, or 0.
+///
+/// The ambient publication is honored ONLY at the exact ranked production
+/// geometry. Every other transform — recursive commits, FRI folds, tests —
+/// receives its odd tail as an explicit parameter, so no unrelated buffer can
+/// ever pick up another caller's publication.
+#[inline]
+pub(crate) fn ranked_zero_odd_tail_lanes(log_d: usize, num_ntts: usize) -> usize {
+    if log_d != ZERO_TAIL_LOG_D || num_ntts != ZERO_TAIL_NUM_NTTS || zero_lane_skip_disabled() {
+        return 0;
+    }
+    let tail = ZERO_ODD_TAIL_LANES.load(std::sync::atomic::Ordering::Relaxed);
+    if tail < num_ntts { tail } else { 0 }
+}
+
+/// Scoped publication of the zero-odd-tail-lane count, restoring the previous
+/// value on drop. The committer sets this from the R1CS padding descriptor —
+/// the same source of truth zerocheck, lincheck and the ring-switch fold
+/// already skip padding with — for the duration of one commitment.
+#[must_use = "the skip is active only while the guard is alive"]
+pub struct ZeroOddTailLanes(usize);
+
+impl ZeroOddTailLanes {
+    /// Publish `lanes` trailing zero lanes for `num_ntts`-wide interleaving.
+    /// Any shape outside the supported geometry publishes 0 (no skip).
+    pub fn scope(num_ntts: usize, lanes: usize) -> Self {
+        let lanes = if num_ntts == ZERO_TAIL_NUM_NTTS && lanes < num_ntts {
+            lanes
+        } else {
+            0
+        };
+        Self(ZERO_ODD_TAIL_LANES.swap(lanes, std::sync::atomic::Ordering::Relaxed))
+    }
+
+    /// Trailing zero lanes implied by an R1CS padding descriptor, or 0 when
+    /// the block geometry does not place the padding tail in the odd position.
+    ///
+    /// Requires one block to be exactly `2 · num_ntts` packed `F128` words so
+    /// that block `b` occupies codeword positions `2b` (even) and `2b+1`
+    /// (odd), and requires the whole zero tail to fit inside that odd
+    /// position.
+    pub fn lanes_for_padding(
+        num_ntts: usize,
+        k_log: usize,
+        useful_bits_per_block: usize,
+    ) -> usize {
+        const LOG_PACKING: usize = 7;
+        if num_ntts != ZERO_TAIL_NUM_NTTS || k_log < LOG_PACKING {
+            return 0;
+        }
+        let words_per_block = 1usize << (k_log - LOG_PACKING);
+        if words_per_block != 2 * num_ntts {
+            return 0;
+        }
+        let used_words = useful_bits_per_block.div_ceil(1 << LOG_PACKING);
+        if used_words > words_per_block {
+            return 0;
+        }
+        let zero_words = words_per_block - used_words;
+        if zero_words < num_ntts { zero_words } else { 0 }
+    }
+}
+
+impl Drop for ZeroOddTailLanes {
+    fn drop(&mut self) {
+        ZERO_ODD_TAIL_LANES.store(self.0, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
 const INTERLEAVED_PHASE_ALL: u8 = 0;
 const INTERLEAVED_PHASE_TOP_ONLY: u8 = 1;
 const INTERLEAVED_PHASE_DEEP_ONLY: u8 = 2;
@@ -699,6 +808,9 @@ impl AdditiveNttF128 {
         stop_layer: usize,
         b_start: usize,
         b_end: usize,
+        // Trailing lanes known zero at every odd position of `data`; 0 for an
+        // ordinary dense transform.
+        odd_tail: usize,
     ) {
         let log_d = log2_pow2(data.len() / num_ntts);
         debug_assert!(stop_layer <= log_d);
@@ -734,13 +846,16 @@ impl AdditiveNttF128 {
                     let start = local * block_elems;
                     let slice =
                         &mut data[range_base_elem + start..range_base_elem + start + block_elems];
+                    // `eighth` even ⇒ every row group stays inside one
+                    // position parity, so the static zero tail survives.
+                    let tail = if eighth.is_multiple_of(2) { odd_tail } else { 0 };
                     if tw[0] == F128::ZERO && tw[1] == F128::ZERO && tw[3] == F128::ZERO {
                         butterfly_interleaved_fused_3layer_par_rows::<true>(
-                            slice, &tw, eighth, num_ntts,
+                            slice, &tw, eighth, num_ntts, tail,
                         );
                     } else {
                         butterfly_interleaved_fused_3layer_par_rows::<false>(
-                            slice, &tw, eighth, num_ntts,
+                            slice, &tw, eighth, num_ntts, tail,
                         );
                     }
                 }
@@ -824,6 +939,11 @@ impl AdditiveNttF128 {
         assert_eq!(stop_layer, log_d, "ranked hybrid suffix completes the NTT");
         assert!(b_start < b_end && b_end <= (1usize << start_layer));
 
+        // Only this ranked entry point (and the ranked full-CPU driver) honor
+        // the ambient zero-lane publication; every other transform gets an
+        // explicit tail.
+        let odd_tail = ranked_zero_odd_tail_lanes(log_d, num_ntts);
+
         // Two fused radix-8 passes.  Unlike the old all-layer range driver,
         // this is the last streaming traversal of the complete suffix.
         self.forward_transform_interleaved_block_range(
@@ -833,6 +953,7 @@ impl AdditiveNttF128 {
             DEEP_LAYER,
             b_start,
             b_end,
+            odd_tail,
         );
 
         // Every layer-4 block contains 2^(10-4) independent layer-10
@@ -847,6 +968,7 @@ impl AdditiveNttF128 {
             log_d,
             sub_start,
             sub_end,
+            odd_tail,
             &finish_chunk,
         );
     }
@@ -1098,6 +1220,11 @@ impl AdditiveNttF128 {
                         );
                     }
                 } else {
+                    let odd_tail = if eighth.is_multiple_of(2) {
+                        ranked_zero_odd_tail_lanes(log_d, num_ntts)
+                    } else {
+                        0
+                    };
                     for block in 0..num_blocks {
                         let tw = block_twiddles(block);
                         let start = block * block_bytes;
@@ -1107,6 +1234,7 @@ impl AdditiveNttF128 {
                                 &tw,
                                 eighth,
                                 num_ntts,
+                                odd_tail,
                             );
                         } else {
                             butterfly_interleaved_fused_3layer_par_rows::<false>(
@@ -1114,6 +1242,7 @@ impl AdditiveNttF128 {
                                 &tw,
                                 eighth,
                                 num_ntts,
+                                odd_tail,
                             );
                         }
                     }
@@ -1275,6 +1404,9 @@ impl AdditiveNttF128 {
     ) where
         F: Fn(usize, &[F128]) + Sync + Send,
     {
+        // Reached only under `use_ranked_deep_pair_fusion`, i.e. the exact
+        // ranked production geometry, so the ambient publication applies.
+        let odd_tail = ranked_zero_odd_tail_lanes(log_d, num_ntts);
         self.forward_transform_interleaved_deep_fused_pairs_range_and_then(
             data,
             num_ntts,
@@ -1282,6 +1414,7 @@ impl AdditiveNttF128 {
             log_d,
             0,
             1usize << n_top,
+            odd_tail,
             finish_chunk,
         );
     }
@@ -1297,6 +1430,8 @@ impl AdditiveNttF128 {
         log_d: usize,
         sub_start: usize,
         sub_end: usize,
+        // Trailing lanes known zero at every odd position; 0 = dense.
+        zero_tail: usize,
         finish_chunk: &F,
     ) where
         F: Fn(usize, &[F128]) + Sync + Send,
@@ -1310,6 +1445,7 @@ impl AdditiveNttF128 {
         let sub_elems = sub_size_positions * num_ntts;
         let low_twiddle_final_pair =
             use_ranked_low_twiddle_final_pair(log_d, num_ntts, n_top);
+        debug_assert!(zero_tail < num_ntts);
 
         let range_start = sub_start * sub_elems;
         let range_end = sub_end * sub_elems;
@@ -1346,6 +1482,15 @@ impl AdditiveNttF128 {
                                 num_ntts,
                             );
                         } else {
+                            // `quarter` even ⇒ each row group stays inside
+                            // one position parity and the static zero tail
+                            // survives; the final pair (quarter == 1) mixes
+                            // parities and always runs dense.
+                            let odd_tail = if quarter.is_multiple_of(2) {
+                                zero_tail
+                            } else {
+                                0
+                            };
                             butterfly_interleaved_fused_2layer_rows_seq(
                                 &mut sub_data[block_start..block_start + block_elems],
                                 t_outer,
@@ -1353,6 +1498,7 @@ impl AdditiveNttF128 {
                                 t_inner_b,
                                 quarter,
                                 num_ntts,
+                                odd_tail,
                             );
                         }
                     }
@@ -1740,6 +1886,7 @@ fn butterfly_interleaved_fused_2layer_par_rows(
 /// Used from inside the deep phase's outer Rayon jobs: adding row-level Rayon
 /// here would create a nested fork/join for every 1 MiB subtree.
 #[inline]
+#[allow(clippy::too_many_arguments)]
 fn butterfly_interleaved_fused_2layer_rows_seq(
     block: &mut [F128],
     t_outer: F128,
@@ -1747,21 +1894,41 @@ fn butterfly_interleaved_fused_2layer_rows_seq(
     t_inner_b: F128,
     quarter: usize,
     num_ntts: usize,
+    odd_tail: usize,
 ) {
     let stride = quarter * num_ntts;
     debug_assert!(num_ntts > 0);
     debug_assert_eq!(block.len(), 4 * stride);
+    // Row `r` touches positions `{r, r+quarter, r+2·quarter, r+3·quarter}`,
+    // which all share `r`'s parity only when `quarter` is even.
+    debug_assert!(odd_tail == 0 || quarter.is_multiple_of(2));
 
     let (top_half, bot_half) = block.split_at_mut(2 * stride);
     let (q1, q2) = top_half.split_at_mut(stride);
     let (q3, q4) = bot_half.split_at_mut(stride);
-    for (((row_a, row_b), row_c), row_d) in q1
+    for (r, (((row_a, row_b), row_c), row_d)) in q1
         .chunks_exact_mut(num_ntts)
         .zip(q2.chunks_exact_mut(num_ntts))
         .zip(q3.chunks_exact_mut(num_ntts))
         .zip(q4.chunks_exact_mut(num_ntts))
+        .enumerate()
     {
-        kernels::butterfly_fused_2layer(row_a, row_b, row_c, row_d, t_outer, t_inner_a, t_inner_b);
+        // Odd rows carry `odd_tail` statically-zero trailing lanes; their
+        // butterflies are (0,0) → (0,0) and are dropped.
+        let lanes = if r & 1 == 1 {
+            num_ntts - odd_tail
+        } else {
+            num_ntts
+        };
+        kernels::butterfly_fused_2layer(
+            &mut row_a[..lanes],
+            &mut row_b[..lanes],
+            &mut row_c[..lanes],
+            &mut row_d[..lanes],
+            t_outer,
+            t_inner_a,
+            t_inner_b,
+        );
     }
 }
 
@@ -1843,6 +2010,7 @@ fn butterfly_interleaved_fused_3layer_par_rows<const ZERO_ROOT: bool>(
     t: &[F128; 7],
     eighth: usize,
     num_ntts: usize,
+    odd_tail: usize,
 ) {
     use rayon::prelude::*;
     const PARALLEL_ROW_THRESHOLD: usize = 256;
@@ -1852,6 +2020,11 @@ fn butterfly_interleaved_fused_3layer_par_rows<const ZERO_ROOT: bool>(
         debug_assert_eq!(t[1], F128::ZERO);
         debug_assert_eq!(t[3], F128::ZERO);
     }
+    debug_assert!(odd_tail == 0 || eighth.is_multiple_of(2));
+    // Rows `{i·eighth + r}` all share `r`'s parity when `eighth` is even, so
+    // an odd `r` selects eight positions whose top `odd_tail` lanes are known
+    // zero — the butterfly maps (0,0) → (0,0) there and can be dropped.
+    let lanes = |r: usize| if r & 1 == 1 { num_ntts - odd_tail } else { num_ntts };
     // Carry the base as `usize` (Send+Sync) so rayon's per-`r` closure can hold
     // it without a raw-pointer `Sync` shim. Each `r` writes the disjoint rows
     // `{i*eighth + r : i ∈ 0..8}`, so concurrent writes never alias.
@@ -1865,11 +2038,19 @@ fn butterfly_interleaved_fused_3layer_par_rows<const ZERO_ROOT: bool>(
                         base as *mut F128,
                         eighth,
                         num_ntts,
+                        lanes(r),
                         r,
                         t,
                     )
                 } else {
-                    kernels::butterfly_fused_3layer_row(base as *mut F128, eighth, num_ntts, r, t)
+                    kernels::butterfly_fused_3layer_row(
+                        base as *mut F128,
+                        eighth,
+                        num_ntts,
+                        lanes(r),
+                        r,
+                        t,
+                    )
                 }
             };
         }
@@ -1882,11 +2063,19 @@ fn butterfly_interleaved_fused_3layer_par_rows<const ZERO_ROOT: bool>(
                         base as *mut F128,
                         eighth,
                         num_ntts,
+                        lanes(r),
                         r,
                         t,
                     )
                 } else {
-                    kernels::butterfly_fused_3layer_row(base as *mut F128, eighth, num_ntts, r, t)
+                    kernels::butterfly_fused_3layer_row(
+                        base as *mut F128,
+                        eighth,
+                        num_ntts,
+                        lanes(r),
+                        r,
+                        t,
+                    )
                 }
             };
         });
@@ -1933,6 +2122,7 @@ fn butterfly_interleaved_fused_3layer_all_blocks_par_rows(
                     block_base,
                     eighth,
                     num_ntts,
+                    num_ntts,
                     row,
                     &twiddles[block],
                 )
@@ -1940,6 +2130,7 @@ fn butterfly_interleaved_fused_3layer_all_blocks_par_rows(
                 kernels::butterfly_fused_3layer_row(
                     block_base,
                     eighth,
+                    num_ntts,
                     num_ntts,
                     row,
                     &twiddles[block],
@@ -2133,7 +2324,7 @@ mod tests {
 
                 let mut got = source;
                 butterfly_interleaved_fused_2layer_rows_seq(
-                    &mut got, t_outer, t_inner_a, t_inner_b, quarter, num_ntts,
+                    &mut got, t_outer, t_inner_a, t_inner_b, quarter, num_ntts, 0,
                 );
                 assert_eq!(
                     got, want,
@@ -2159,7 +2350,7 @@ mod tests {
 
                 let mut want = source.clone();
                 butterfly_interleaved_fused_2layer_rows_seq(
-                    &mut want, t_outer, t_inner_a, t_inner_b, quarter, num_ntts,
+                    &mut want, t_outer, t_inner_a, t_inner_b, quarter, num_ntts, 0,
                 );
                 let mut got = source;
                 butterfly_interleaved_fused_2layer_low_twiddles_rows_seq(
@@ -2368,7 +2559,7 @@ mod tests {
                         assert_eq!(twiddles[1], F128::ZERO);
                         assert_eq!(twiddles[3], F128::ZERO);
                         butterfly_interleaved_fused_3layer_par_rows::<true>(
-                            &mut got, &twiddles, eighth, NUM_NTTS,
+                            &mut got, &twiddles, eighth, NUM_NTTS, 0,
                         );
                         // The omitted stream-zero stores are valid only because
                         // this whole row stream is mathematically unchanged.
@@ -2376,7 +2567,7 @@ mod tests {
                         assert_eq!(&got[..stream_len], &source[..stream_len]);
                     } else {
                         butterfly_interleaved_fused_3layer_par_rows::<false>(
-                            &mut got, &twiddles, eighth, NUM_NTTS,
+                            &mut got, &twiddles, eighth, NUM_NTTS, 0,
                         );
                     }
                     assert_eq!(
@@ -2421,11 +2612,11 @@ mod tests {
                 let block_data = &mut expected[block * block_elems..(block + 1) * block_elems];
                 if block == 0 {
                     butterfly_interleaved_fused_3layer_par_rows::<true>(
-                        block_data, tw, eighth, NUM_NTTS,
+                        block_data, tw, eighth, NUM_NTTS, 0,
                     );
                 } else {
                     butterfly_interleaved_fused_3layer_par_rows::<false>(
-                        block_data, tw, eighth, NUM_NTTS,
+                        block_data, tw, eighth, NUM_NTTS, 0,
                     );
                 }
             }
@@ -2616,6 +2807,7 @@ mod tests {
                         &tw,
                         eighth,
                         NUM_NTTS,
+                        0,
                     );
                 } else {
                     butterfly_interleaved_fused_3layer_par_rows::<false>(
@@ -2623,6 +2815,7 @@ mod tests {
                         &tw,
                         eighth,
                         NUM_NTTS,
+                        0,
                     );
                 }
             }
@@ -2944,13 +3137,13 @@ mod block_range_equivalence {
 
         // Whole range through the block-range driver.
         let mut whole = src.clone();
-        ntt.forward_transform_interleaved_block_range(&mut whole, num_ntts, 1, log_d, 0, 2);
+        ntt.forward_transform_interleaved_block_range(&mut whole, num_ntts, 1, log_d, 0, 2, 0);
         assert_eq!(full, whole, "block_range over the full range diverges");
 
         // Split at layer 4: shared top layers 1..4, then independent
         // per-block completion — the hybrid-commit shape.
         let mut split = src.clone();
-        ntt.forward_transform_interleaved_block_range(&mut split, num_ntts, 1, 4, 0, 2);
+        ntt.forward_transform_interleaved_block_range(&mut split, num_ntts, 1, 4, 0, 2, 0);
         for b in 0..16 {
             ntt.forward_transform_interleaved_block_range(
                 &mut split,
@@ -2959,6 +3152,7 @@ mod block_range_equivalence {
                 log_d,
                 b,
                 b + 1,
+                0,
             );
         }
         assert_eq!(full, split, "layer-4 split diverges");
@@ -2990,6 +3184,7 @@ mod block_range_equivalence {
             log_d,
             b_start,
             b_end,
+            0,
         );
 
         let mut cache_local = src;
@@ -3000,6 +3195,7 @@ mod block_range_equivalence {
             n_top,
             b_start,
             b_end,
+            0,
         );
         let sub_start = b_start << (n_top - start_layer);
         let sub_end = b_end << (n_top - start_layer);
@@ -3012,6 +3208,7 @@ mod block_range_equivalence {
             log_d,
             sub_start,
             sub_end,
+            0,
             &|elem_offset, chunk| {
                 assert_eq!(elem_offset % sub_elems, 0);
                 assert_eq!(chunk, &plain[elem_offset..elem_offset + sub_elems]);
@@ -3025,5 +3222,134 @@ mod block_range_equivalence {
         let expected_offsets: Vec<usize> =
             (sub_start..sub_end).map(|sub| sub * sub_elems).collect();
         assert_eq!(got_offsets, expected_offsets, "callback coverage/offsets diverge");
+    }
+}
+
+/// Bit-exactness oracle for the static zero-lane skip.
+#[cfg(test)]
+mod zero_lane_skip {
+    use super::*;
+
+    /// The skip is published through a process-global; serialize the cases so
+    /// concurrently running tests never observe another case's publication.
+    static PUBLISH: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    const NUM_NTTS: usize = 64;
+    const TAIL: usize = 7;
+
+    /// Codeword with the ranked BLAKE3 zero geometry: lanes `64 - TAIL .. 64`
+    /// are zero at every odd position, everything else pseudorandom.
+    fn structured(log_d: usize) -> Vec<F128> {
+        let mut state = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = move || {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            state
+        };
+        (0..(1usize << log_d) * NUM_NTTS)
+            .map(|i| {
+                let odd_pos = (i / NUM_NTTS) & 1 == 1;
+                if odd_pos && i % NUM_NTTS >= NUM_NTTS - TAIL {
+                    F128::ZERO
+                } else {
+                    F128::new(next(), next())
+                }
+            })
+            .collect()
+    }
+
+    /// The ranked BLAKE3 padding descriptor must yield exactly seven lanes;
+    /// every other geometry must yield none.
+    #[test]
+    fn padding_descriptor_yields_seven_lanes() {
+        // K_LOG = 14, USEFUL_BITS = 15,409.
+        assert_eq!(ZeroOddTailLanes::lanes_for_padding(64, 14, 15_409), 7);
+        // Dense witness: nothing to skip.
+        assert_eq!(ZeroOddTailLanes::lanes_for_padding(64, 14, 16_384), 0);
+        // Batch-major coalesces padding into one giant block: unsupported.
+        assert_eq!(ZeroOddTailLanes::lanes_for_padding(64, 32, 1 << 31), 0);
+        // Recursive commits interleave eight lanes.
+        assert_eq!(ZeroOddTailLanes::lanes_for_padding(8, 14, 15_409), 0);
+        // A tail wider than one position cannot be expressed as a lane skip.
+        assert_eq!(ZeroOddTailLanes::lanes_for_padding(64, 14, 8_000), 0);
+    }
+
+    /// Hybrid-commit schedule (top block range + cache-local deep pairs) must
+    /// produce byte-identical output with and without the skip.
+    #[test]
+    fn hybrid_suffix_schedule_is_bit_identical() {
+        let log_d = 13usize;
+        let start_layer = 4usize;
+        let n_top = 10usize;
+        let ntt = AdditiveNttF128::standard(log_d);
+        let src = structured(log_d);
+
+        let run = |input: &[F128], tail: usize| {
+            let mut data = input.to_vec();
+            ntt.forward_transform_interleaved_block_range(
+                &mut data,
+                NUM_NTTS,
+                start_layer,
+                n_top,
+                0,
+                1 << start_layer,
+                tail,
+            );
+            ntt.forward_transform_interleaved_deep_fused_pairs_range_and_then(
+                &mut data,
+                NUM_NTTS,
+                n_top,
+                log_d,
+                0,
+                1 << n_top,
+                tail,
+                &|_, _| {},
+            );
+            data
+        };
+
+        let dense = run(&src, 0);
+        let skipped = run(&src, TAIL);
+        assert_eq!(dense, skipped, "zero-lane skip changed the codeword");
+
+        // The schedule itself must still be the true transform.
+        let mut oracle = src.clone();
+        ntt.forward_transform_interleaved_scalar_from_layer(&mut oracle, NUM_NTTS, start_layer);
+        assert_eq!(dense, oracle, "hybrid schedule diverges from the scalar oracle");
+
+        // Negative control: the equality above must come from the skip being
+        // ACTIVE on provably-zero data, not from it being a no-op. Break the
+        // zero geometry on one odd-position tail lane and the two runs must
+        // now diverge.
+        let mut poisoned = src;
+        poisoned[NUM_NTTS + (NUM_NTTS - 1)] = F128::new(1, 0);
+        assert_ne!(
+            run(&poisoned, 0),
+            run(&poisoned, TAIL),
+            "skip never engaged — the oracle above proves nothing"
+        );
+    }
+
+    /// The ambient publication is honored ONLY at the ranked production
+    /// geometry, and never leaks past its guard.
+    #[test]
+    fn ambient_publication_is_ranked_only_and_scoped() {
+        let _serial = PUBLISH.lock().unwrap_or_else(|e| e.into_inner());
+        let live = usize::from(!zero_lane_skip_disabled());
+        assert_eq!(ranked_zero_odd_tail_lanes(ZERO_TAIL_LOG_D, NUM_NTTS), 0);
+        {
+            let _outer = ZeroOddTailLanes::scope(NUM_NTTS, TAIL);
+            assert_eq!(ranked_zero_odd_tail_lanes(ZERO_TAIL_LOG_D, NUM_NTTS), TAIL * live);
+            // Any non-ranked domain or lane width ignores the publication.
+            assert_eq!(ranked_zero_odd_tail_lanes(12, NUM_NTTS), 0);
+            assert_eq!(ranked_zero_odd_tail_lanes(ZERO_TAIL_LOG_D, 8), 0);
+            {
+                let _inner = ZeroOddTailLanes::scope(8, TAIL);
+                assert_eq!(ranked_zero_odd_tail_lanes(ZERO_TAIL_LOG_D, NUM_NTTS), 0);
+            }
+            assert_eq!(ranked_zero_odd_tail_lanes(ZERO_TAIL_LOG_D, NUM_NTTS), TAIL * live);
+        }
+        assert_eq!(ranked_zero_odd_tail_lanes(ZERO_TAIL_LOG_D, NUM_NTTS), 0);
     }
 }

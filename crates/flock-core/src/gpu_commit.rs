@@ -55,6 +55,28 @@ pub(crate) fn gpu_metallib_enabled() -> bool {
     *ON.get_or_init(|| std::env::var_os(ENV_NO_GPU_METALLIB).is_none())
 }
 
+/// Kill switch for the zerocheck round-one C-fold GPU arm:
+/// `FLOCK_NO_GPU_ZEROCHECK=1` keeps the whole fold on the CPU. The GPU is
+/// otherwise idle for the entire zerocheck window (every Metal submission in
+/// this module sits inside a commit-graph function), so the arm folds a
+/// prefix of the same tile claims the CPU queue drains. Output is bit-exact
+/// either way — GF(2^128) add is XOR, so any partition of the stripe range
+/// reproduces the whole-range fold.
+pub const ENV_NO_GPU_ZEROCHECK: &str = "FLOCK_NO_GPU_ZEROCHECK";
+
+pub(crate) fn gpu_zerocheck_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os(ENV_NO_GPU_ZEROCHECK).is_none());
+    *ON
+}
+
+/// Diagnostic trace for the zerocheck fold arm (`FLOCK_ZC_GPU_DEBUG=1`).
+pub(crate) fn gpu_zerocheck_debug() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_ZC_GPU_DEBUG").is_some());
+    *ON
+}
+
 /// Kill switch for the cross-process warmup latch cache:
 /// `FLOCK_NO_WARMUP_LATCH_CACHE=1` restores the incumbent full dual-run +
 /// autotune sweep in every worker process. The cache changes **no timed
@@ -3654,6 +3676,7 @@ kernel void export_from_z_zero_root_tabs(
                         log_d,
                         16 - k_cpu16,
                         16,
+                        crate::ntt::additive_ntt_f128::ranked_zero_odd_tail_lanes(log_d, 64),
                     );
                     let suffix_bytes: &[u8] = core::slice::from_raw_parts(
                         data.as_ptr().cast::<u8>().add(suffix_leaf_start * 1024),
@@ -5389,6 +5412,709 @@ kernel void export_from_z_zero_root_tabs(
         }
     }
 
+    // -----------------------------------------------------------------------
+    // Zerocheck round-1 C fold — GPU arm.
+    //
+    // The ranked round-one C message is derived from ONE fold of the lincheck
+    // stripe (`partial_fold_packed_z_best`, 512 MiB at m=32) against the outer
+    // eq table. That fold is pure GF(2^128) ADDITION — i.e. 128-bit XOR — of
+    // eq-derived table entries selected by bit-packed witness bytes. There is
+    // no carry-less multiply anywhere in it, so the usual reason zerocheck is
+    // GPU-hostile (Metal has no PMULL; GF(2^128) mul needs per-element nibble
+    // tables) does not apply: the GPU kernel is a byte load, two threadgroup
+    // lookups and two XORs.
+    //
+    // The GPU takes a PREFIX of the same tile claims the CPU queue drains, so
+    // the two arms partition the stripe range. XOR is associative and
+    // commutative, so the union is bit-identical to the whole-range CPU fold
+    // regardless of the split point.
+    //
+    // The commit stage's staging buffer is still leased by the live
+    // `GpuCodeword` at this point (`STAGING_IN_USE`, released on
+    // `ProverData::drop`), so this arm owns its own small buffer set and a
+    // cached no-copy wrap of the caller's stripe.
+    // -----------------------------------------------------------------------
+
+    const ZC_FOLD_MSL_SOURCE: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+struct ZcFoldParams {
+    uint k;                 // bytes per stripe (= 1 << k_log)
+    uint useful;            // columns [0, useful) fold; [useful, k) forced 0
+    uint stripe_hi;         // exclusive stripe bound of the GPU prefix
+    uint stripes_per_chunk; // stripes owned by one output partial
+    uint i_groups;          // k / 1024 column groups
+};
+
+// 256 threads x 4 adjacent columns each = 1024 columns per threadgroup, so a
+// threadgroup reads one contiguous 1024-byte run per stripe as 256 coalesced
+// 32-bit words. Eight stripes share one cooperative nibble-table build
+// (2 x 16 entries per stripe, 4 KiB of threadgroup memory).
+//
+// The eight stripe words are loaded UP FRONT, before any lookup consumes
+// them: the naive per-stripe loop issues one dependent load at a time and
+// runs at a fraction of achievable bandwidth.
+#define ZC_STEP(TT, W) {                                             \
+    uint _b0 = (W) & 255u,        _b1 = ((W) >> 8) & 255u;           \
+    uint _b2 = ((W) >> 16) & 255u, _b3 = (W) >> 24;                  \
+    a0 ^= (TT)[_b0 & 15u] ^ (TT)[16u + (_b0 >> 4)];                  \
+    a1 ^= (TT)[_b1 & 15u] ^ (TT)[16u + (_b1 >> 4)];                  \
+    a2 ^= (TT)[_b2 & 15u] ^ (TT)[16u + (_b2 >> 4)];                  \
+    a3 ^= (TT)[_b3 & 15u] ^ (TT)[16u + (_b3 >> 4)];                  \
+}
+
+kernel void zc_fold_stripes(
+    device const uint*     z32      [[buffer(0)]],
+    device const uint4*    eq       [[buffer(1)]],
+    device uint4*          partials [[buffer(2)]],
+    constant ZcFoldParams& p        [[buffer(3)]],
+    uint tgid [[threadgroup_position_in_grid]],
+    uint lid  [[thread_position_in_threadgroup]])
+{
+    threadgroup uint4 tg_eq[64];
+    threadgroup uint4 tab[256];
+
+    uint chunk  = tgid / p.i_groups;
+    uint ig     = tgid - chunk * p.i_groups;
+    uint i_base = ig * 1024u;
+
+    uint s_lo = chunk * p.stripes_per_chunk;
+    uint s_hi = min(s_lo + p.stripes_per_chunk, p.stripe_hi);
+
+    uint4 a0 = uint4(0u), a1 = uint4(0u), a2 = uint4(0u), a3 = uint4(0u);
+    // This thread owns columns [c0, c0+4). `useful` is a multiple of 8, so
+    // all four are useful or none are.
+    uint c0 = i_base + 4u * lid;
+    bool live = c0 < p.useful;
+    // k and i_base are multiples of 4, so every byte offset below is
+    // word-aligned and each stripe costs exactly one 32-bit load.
+    uint kw = p.k >> 2;
+
+    for (uint sb = s_lo; sb < s_hi; sb += 8u) {
+        uint ns = min(8u, s_hi - sb);
+        uint w0 = 0u, w1 = 0u, w2 = 0u, w3 = 0u;
+        uint w4 = 0u, w5 = 0u, w6 = 0u, w7 = 0u;
+        if (live && ns == 8u) {
+            uint q = (sb * p.k + c0) >> 2;
+            w0 = z32[q];          w1 = z32[q + kw];
+            w2 = z32[q + 2u * kw]; w3 = z32[q + 3u * kw];
+            w4 = z32[q + 4u * kw]; w5 = z32[q + 5u * kw];
+            w6 = z32[q + 6u * kw]; w7 = z32[q + 7u * kw];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (lid < ns * 8u) {
+            tg_eq[lid] = eq[sb * 8u + lid];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (lid < ns * 32u) {
+            uint t    = lid >> 5;
+            uint hlf  = (lid >> 4) & 1u;
+            uint idx  = lid & 15u;
+            uint base = t * 8u + hlf * 4u;
+            uint4 v = uint4(0u);
+            if (idx & 1u) v ^= tg_eq[base + 0u];
+            if (idx & 2u) v ^= tg_eq[base + 1u];
+            if (idx & 4u) v ^= tg_eq[base + 2u];
+            if (idx & 8u) v ^= tg_eq[base + 3u];
+            tab[lid] = v;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (live) {
+            if (ns == 8u) {
+                ZC_STEP(&tab[0u],   w0);
+                ZC_STEP(&tab[32u],  w1);
+                ZC_STEP(&tab[64u],  w2);
+                ZC_STEP(&tab[96u],  w3);
+                ZC_STEP(&tab[128u], w4);
+                ZC_STEP(&tab[160u], w5);
+                ZC_STEP(&tab[192u], w6);
+                ZC_STEP(&tab[224u], w7);
+            } else {
+                for (uint t = 0u; t < ns; ++t) {
+                    uint w = z32[((sb + t) * p.k + c0) >> 2];
+                    threadgroup const uint4* tt = &tab[t * 32u];
+                    ZC_STEP(tt, w);
+                }
+            }
+        }
+    }
+
+    device uint4* out = partials + chunk * p.k + c0;
+    out[0u] = a0;
+    out[1u] = a1;
+    out[2u] = a2;
+    out[3u] = a3;
+}
+
+// XOR-reduce the per-chunk partials into one length-k accumulator, on the
+// GPU, so the CPU only ever reads 16 bytes per output column.
+kernel void zc_fold_reduce(
+    device const uint4* partials [[buffer(0)]],
+    device uint4*       out      [[buffer(1)]],
+    constant uint2&     p        [[buffer(2)]],
+    uint gid [[thread_position_in_grid]])
+{
+    if (gid >= p.x) { return; }
+    uint4 a = uint4(0u);
+    for (uint c = 0u; c < p.y; ++c) {
+        a ^= partials[c * p.x + gid];
+    }
+    out[gid] = a;
+}
+"#;
+
+    /// Output partials produced by the GPU fold. Fixed so the buffer set and
+    /// the reduce dispatch are size-stable across proves.
+    const ZC_FOLD_CHUNKS: usize = 64;
+    /// Threads per threadgroup in both zerocheck fold kernels.
+    const ZC_FOLD_TG: usize = 256;
+    /// Output columns owned by one threadgroup (4 per thread).
+    const ZC_FOLD_COLS_PER_TG: usize = 1024;
+
+    #[repr(C)]
+    struct ZcFoldParams {
+        k: u32,
+        useful: u32,
+        stripe_hi: u32,
+        stripes_per_chunk: u32,
+        i_groups: u32,
+    }
+
+    /// Process-lifetime Metal state for the zerocheck fold arm.
+    struct ZcFold {
+        gpu: &'static Gpu,
+        pso_fold: Id,
+        pso_reduce: Id,
+        /// eq_outer upload (n_outer x 16 B).
+        eq_buf: Id,
+        eq_cap: usize,
+        /// ZC_FOLD_CHUNKS x k x 16 B scratch.
+        part_buf: Id,
+        part_cap: usize,
+        /// k x 16 B reduced result.
+        out_buf: Id,
+        out_cap: usize,
+        /// Cached no-copy wraps of caller stripes: `(ptr, len, buffer)`.
+        z_wraps: Vec<(usize, usize, Id)>,
+    }
+    // SAFETY: Metal objects are thread-safe; every access is serialized by
+    // the ZC_FOLD mutex, and the one prove in flight owns the lease.
+    unsafe impl Send for ZcFold {}
+
+    static ZC_FOLD: Mutex<Option<Result<ZcFold, String>>> = Mutex::new(None);
+
+    fn zc_fold_init(gpu: &'static Gpu) -> Result<ZcFold, String> {
+        unsafe {
+            let pool = gpu.pool_push();
+            let built = (|| -> Result<(Id, Id), String> {
+                let src = gpu.api.nsstring(ZC_FOLD_MSL_SOURCE)?;
+                let mut err: Id = NIL;
+                let library: Id = send!(
+                    gpu.api,
+                    unsafe extern "C" fn(Id, Sel, Id, Id, *mut Id) -> Id,
+                    gpu.device,
+                    c"newLibraryWithSource:options:error:",
+                    src,
+                    NIL,
+                    &mut err
+                );
+                if library.is_null() {
+                    return Err(format!(
+                        "zerocheck fold shader compile failed: {}",
+                        gpu.api.error_string(err)
+                    ));
+                }
+                let build = |name: &str| -> Result<Id, String> {
+                    let ns = gpu.api.nsstring(name)?;
+                    let f: Id = send!(
+                        gpu.api,
+                        unsafe extern "C" fn(Id, Sel, Id) -> Id,
+                        library,
+                        c"newFunctionWithName:",
+                        ns
+                    );
+                    if f.is_null() {
+                        return Err(format!("zerocheck fold kernel {name} not found"));
+                    }
+                    let mut perr: Id = NIL;
+                    let pso: Id = send!(
+                        gpu.api,
+                        unsafe extern "C" fn(Id, Sel, Id, *mut Id) -> Id,
+                        gpu.device,
+                        c"newComputePipelineStateWithFunction:error:",
+                        f,
+                        &mut perr
+                    );
+                    send!(gpu.api, unsafe extern "C" fn(Id, Sel) -> Id, f, c"release");
+                    if pso.is_null() {
+                        Err(format!(
+                            "zerocheck fold pipeline {name}: {}",
+                            gpu.api.error_string(perr)
+                        ))
+                    } else {
+                        Ok(pso)
+                    }
+                };
+                let fold = build("zc_fold_stripes")?;
+                let reduce = match build("zc_fold_reduce") {
+                    Ok(r) => r,
+                    Err(e) => {
+                        gpu.release(fold);
+                        send!(gpu.api, unsafe extern "C" fn(Id, Sel) -> Id, library, c"release");
+                        return Err(e);
+                    }
+                };
+                send!(gpu.api, unsafe extern "C" fn(Id, Sel) -> Id, library, c"release");
+                Ok((fold, reduce))
+            })();
+            gpu.pool_pop(pool);
+            let (pso_fold, pso_reduce) = built?;
+            Ok(ZcFold {
+                gpu,
+                pso_fold,
+                pso_reduce,
+                eq_buf: NIL,
+                eq_cap: 0,
+                part_buf: NIL,
+                part_cap: 0,
+                out_buf: NIL,
+                out_cap: 0,
+                z_wraps: Vec::new(),
+            })
+        }
+    }
+
+    impl ZcFold {
+        /// Grow-only shared buffer slot.
+        unsafe fn ensure(&self, slot: &mut Id, cap: &mut usize, need: usize) -> Result<(), String> {
+            if *cap >= need && !slot.is_null() {
+                return Ok(());
+            }
+            unsafe {
+                let fresh = self.gpu.new_buffer(need)?;
+                self.gpu.release(*slot);
+                *slot = fresh;
+                *cap = need;
+            }
+            Ok(())
+        }
+
+        /// No-copy wrap of the caller's stripe, cached across proves by
+        /// `(ptr, len)`.
+        ///
+        /// Metal wires the wrapped pages on first GPU touch — several ms for
+        /// the ranked 512 MiB stripe — so a wrap that had to be rebuilt inside
+        /// the TIMED prove would eat the arm's whole gain. The prover recycles
+        /// its stripe through `scratch`, but the pool may alternate between a
+        /// small number of allocations, so keep the last few wraps rather than
+        /// evicting on every address change.
+        ///
+        /// Correctness note: a retained wrap names caller memory. This is
+        /// sound because the pooled stripe allocations live for the process;
+        /// nothing here may be pointed at memory that can be freed and
+        /// re-allocated at the same address.
+        unsafe fn wrap_z(&mut self, z: &[u8]) -> Result<Id, String> {
+            const MAX_WRAPS: usize = 3;
+            let ptr = z.as_ptr() as usize;
+            let len = z.len();
+            if let Some(&(_, _, buf)) = self
+                .z_wraps
+                .iter()
+                .find(|(p, l, _)| *p == ptr && *l == len)
+            {
+                return Ok(buf);
+            }
+            let buf = unsafe { self.gpu.wrap_buffer(z.as_ptr() as *mut u8, len)? };
+            if self.z_wraps.len() == MAX_WRAPS {
+                let (_, _, old) = self.z_wraps.remove(0);
+                unsafe { self.gpu.release(old) };
+            }
+            self.z_wraps.push((ptr, len, buf));
+            Ok(buf)
+        }
+    }
+
+    /// A submitted GPU prefix fold. The caller runs the CPU claim suffix while
+    /// this is in flight, then drains it with [`ZcFoldJob::finish_xor_into`].
+    pub(crate) struct ZcFoldJob {
+        guard: std::sync::MutexGuard<'static, Option<Result<ZcFold, String>>>,
+        cb: Id,
+        plan: ZcFoldPlan,
+        k: usize,
+        claim_lo: usize,
+        n_claims: usize,
+        submitted: std::time::Instant,
+    }
+
+    /// Set once the split autotune has consumed a steady-state GPU sample.
+    static ZC_FOLD_CALIBRATED: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
+
+    impl ZcFoldJob {
+        /// Number of leading tile claims this job owns; the caller's CPU
+        /// suffix MUST start at exactly this claim.
+        pub(crate) fn claim_lo(&self) -> usize {
+            self.claim_lo
+        }
+
+        /// Wait for the prefix and XOR it into `dst` (length `k`). `head_ms`
+        /// is the wall between submission and the start of the CPU suffix,
+        /// `suffix_ms` the CPU suffix wall; both feed the split autotune.
+        pub(crate) fn finish_xor_into(
+            mut self,
+            dst: &mut [F128],
+            head_ms: f64,
+            suffix_ms: f64,
+        ) -> Result<(), String> {
+            let state = self
+                .guard
+                .as_ref()
+                .and_then(|r| r.as_ref().ok())
+                .ok_or_else(|| "zerocheck fold state vanished".to_string())?;
+            let gpu = state.gpu;
+            let out_buf = state.out_buf;
+            let cb = self.cb;
+            self.cb = NIL;
+            let wait = unsafe { gpu.wait_cb(cb) };
+            let gpu_ms = unsafe { zc_fold_gpu_wall_ms(gpu, cb) };
+            let wall_ms = self.submitted.elapsed().as_secs_f64() * 1e3;
+            unsafe { gpu.release(cb) };
+            wait?;
+            assert_eq!(dst.len(), self.k);
+            // SAFETY: the command buffer completed, so the shared-storage
+            // result is visible to the CPU; `out_buf` holds exactly `k`
+            // 16-byte lanes and is not aliased by `dst`.
+            let src = unsafe {
+                std::slice::from_raw_parts(
+                    gpu.buffer_contents(out_buf).cast::<F128>().cast_const(),
+                    self.k,
+                )
+            };
+            {
+                use rayon::prelude::*;
+                dst.par_chunks_mut(2048)
+                    .zip(src.par_chunks(2048))
+                    .for_each(|(d, s)| {
+                        for (a, b) in d.iter_mut().zip(s.iter()) {
+                            *a += *b;
+                        }
+                    });
+            }
+            if super::gpu_zerocheck_debug() {
+                eprintln!(
+                    "[gpu-zc] prefix {}/{} claims: gpu={gpu_ms:.2}ms submit-to-drain={wall_ms:.2}ms \
+                     head={head_ms:.2}ms cpu-suffix={suffix_ms:.2}ms",
+                    self.claim_lo, self.n_claims,
+                );
+            }
+            // The FIRST dispatch in a process also pays Metal's one-time
+            // costs — GPU binary compile for the two pipelines and page
+            // wiring of the freshly wrapped 512 MiB stripe — which would make
+            // the tuner believe the GPU arm is far slower than it is in
+            // steady state. Replay the identical dispatch once, synchronously,
+            // and tune from that. This lands in the UNTIMED warmup prove (the
+            // ranked runner's call 0); every later prove reuses the published
+            // split and never replays.
+            let mut sample_ms = if gpu_ms > 0.0 { gpu_ms } else { wall_ms };
+            if !ZC_FOLD_CALIBRATED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                // SAFETY: the first dispatch completed and its result is
+                // already consumed above, so re-encoding the same plan over
+                // the same scratch buffers races with nothing.
+                unsafe {
+                    let pool = gpu.pool_push();
+                    if let Ok(cb2) = zc_fold_submit(gpu, state, &self.plan) {
+                        if gpu.wait_cb(cb2).is_ok() {
+                            let again = zc_fold_gpu_wall_ms(gpu, cb2);
+                            if again > 0.0 {
+                                sample_ms = again;
+                            }
+                        }
+                        gpu.release(cb2);
+                    }
+                    gpu.pool_pop(pool);
+                }
+            }
+            zc_fold_note_sample(
+                self.claim_lo,
+                self.n_claims,
+                sample_ms,
+                head_ms,
+                suffix_ms,
+            );
+            Ok(())
+        }
+    }
+
+    impl Drop for ZcFoldJob {
+        fn drop(&mut self) {
+            if !self.cb.is_null()
+                && let Some(Ok(state)) = self.guard.as_ref()
+            {
+                let gpu = state.gpu;
+                unsafe {
+                    let _ = gpu.wait_cb(self.cb);
+                    gpu.release(self.cb);
+                }
+                self.cb = NIL;
+            }
+        }
+    }
+
+    /// Exact GPU execution wall of a completed command buffer, in ms
+    /// (`GPUEndTime - GPUStartTime`). Returns 0 when unavailable.
+    unsafe fn zc_fold_gpu_wall_ms(gpu: &Gpu, cb: Id) -> f64 {
+        unsafe {
+            let start: f64 = send!(
+                gpu.api,
+                unsafe extern "C" fn(Id, Sel) -> f64,
+                cb,
+                c"GPUStartTime"
+            );
+            let end: f64 = send!(
+                gpu.api,
+                unsafe extern "C" fn(Id, Sel) -> f64,
+                cb,
+                c"GPUEndTime"
+            );
+            if end > start { (end - start) * 1e3 } else { 0.0 }
+        }
+    }
+
+    /// Tuned GPU claim share (sentinel `usize::MAX` = not yet tuned).
+    static ZC_FOLD_TUNED_CLAIMS: std::sync::atomic::AtomicUsize =
+        std::sync::atomic::AtomicUsize::new(usize::MAX);
+
+    /// First-prove share, in eighths of the claim range. The untimed warmup
+    /// prove runs at this split and publishes a balanced one for the timed
+    /// prove; it only has to be close enough to measure both arms.
+    const ZC_FOLD_WARMUP_EIGHTHS: usize = 3;
+
+    /// Exact split override (`FLOCK_ZC_GPU_CLAIMS=<claims>`); also pins the
+    /// autotune off so a controlled A/B keeps the requested share.
+    fn zc_fold_claim_override() -> Option<usize> {
+        static K: std::sync::LazyLock<Option<usize>> = std::sync::LazyLock::new(|| {
+            std::env::var("FLOCK_ZC_GPU_CLAIMS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+        });
+        *K
+    }
+
+    fn zc_fold_claims_for(n_claims: usize) -> usize {
+        if let Some(k) = zc_fold_claim_override() {
+            return k.min(n_claims);
+        }
+        match ZC_FOLD_TUNED_CLAIMS.load(std::sync::atomic::Ordering::Relaxed) {
+            usize::MAX => (n_claims * ZC_FOLD_WARMUP_EIGHTHS / 8).max(1),
+            k => k.min(n_claims),
+        }
+    }
+
+    /// Publish a balanced split from one observed prove.
+    ///
+    /// The GPU arm starts at submission and runs `g` claims; the CPU arm only
+    /// reaches its claims after `head_ms` (the round-one AB completion runs
+    /// first, deliberately, so the GPU covers it) and then runs `n - g`
+    /// claims. Equalizing the two finish times gives
+    /// `g* = (head + n·u_cpu) / (u_gpu + u_cpu)`.
+    fn zc_fold_note_sample(
+        claim_lo: usize,
+        n_claims: usize,
+        gpu_ms: f64,
+        head_ms: f64,
+        suffix_ms: f64,
+    ) {
+        if zc_fold_claim_override().is_some() || claim_lo == 0 || claim_lo >= n_claims {
+            return;
+        }
+        let u_gpu = gpu_ms / claim_lo as f64;
+        let u_cpu = suffix_ms / (n_claims - claim_lo) as f64;
+        if !(u_gpu.is_finite() && u_cpu.is_finite()) || u_gpu <= 0.0 || u_cpu <= 0.0 {
+            return;
+        }
+        // Bias 10% toward the CPU. Overshooting makes the GPU the straggler,
+        // which costs wall directly; undershooting only leaves a little of
+        // the otherwise-free window unused, and the GPU arm's wall is the
+        // noisier of the two (clock ramp, queue latency).
+        let balanced =
+            0.9 * (head_ms.max(0.0) + n_claims as f64 * u_cpu) / (u_gpu + u_cpu);
+        let g = (balanced.round() as i64).clamp(1, n_claims as i64 - 1) as usize;
+        ZC_FOLD_TUNED_CLAIMS.store(g, std::sync::atomic::Ordering::Relaxed);
+        if super::gpu_zerocheck_debug() {
+            eprintln!(
+                "[gpu-zc] split {claim_lo}/{n_claims} gpu={gpu_ms:.2}ms head={head_ms:.2}ms \
+                 suffix={suffix_ms:.2}ms -> {g}/{n_claims}"
+            );
+        }
+    }
+
+    /// Successful GPU prefix submissions this process. Lets a test assert the
+    /// arm actually ran instead of silently falling back to the CPU, and lets
+    /// an in-process A/B confirm which arm produced a prove.
+    static ZC_FOLD_SUBMITS: std::sync::atomic::AtomicUsize =
+        std::sync::atomic::AtomicUsize::new(0);
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn zerocheck_gpu_submits() -> usize {
+        ZC_FOLD_SUBMITS.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Everything needed to (re-)encode one prefix dispatch. Kept so the
+    /// untimed calibration pass can replay the identical work.
+    #[derive(Clone, Copy)]
+    struct ZcFoldPlan {
+        z_buf: Id,
+        k: usize,
+        useful: usize,
+        stripe_hi: usize,
+        stripes_per_chunk: usize,
+        i_groups: usize,
+    }
+
+    unsafe fn zc_fold_submit(gpu: &Gpu, state: &ZcFold, plan: &ZcFoldPlan) -> Result<Id, String> {
+        unsafe {
+            let params = ZcFoldParams {
+                k: plan.k as u32,
+                useful: plan.useful as u32,
+                stripe_hi: plan.stripe_hi as u32,
+                stripes_per_chunk: plan.stripes_per_chunk as u32,
+                i_groups: plan.i_groups as u32,
+            };
+            let params_bytes = std::slice::from_raw_parts(
+                (&raw const params).cast::<u8>(),
+                core::mem::size_of::<ZcFoldParams>(),
+            );
+            let reduce_params: [u32; 2] = [plan.k as u32, ZC_FOLD_CHUNKS as u32];
+            let reduce_bytes = std::slice::from_raw_parts(
+                reduce_params.as_ptr().cast::<u8>(),
+                core::mem::size_of_val(&reduce_params),
+            );
+            let cb = gpu.command_buffer()?;
+            let enc = gpu.compute_encoder(cb)?;
+            gpu.set_pipeline(enc, state.pso_fold);
+            gpu.set_buffer(enc, plan.z_buf, 0, 0);
+            gpu.set_buffer(enc, state.eq_buf, 0, 1);
+            gpu.set_buffer(enc, state.part_buf, 0, 2);
+            gpu.set_bytes(enc, params_bytes, 3);
+            gpu.dispatch(
+                enc,
+                (ZC_FOLD_CHUNKS * plan.i_groups) as u64,
+                ZC_FOLD_TG as u64,
+            );
+            gpu.set_pipeline(enc, state.pso_reduce);
+            gpu.set_buffer(enc, state.part_buf, 0, 0);
+            gpu.set_buffer(enc, state.out_buf, 0, 1);
+            gpu.set_bytes(enc, reduce_bytes, 2);
+            gpu.dispatch(enc, (plan.k / ZC_FOLD_TG) as u64, ZC_FOLD_TG as u64);
+            gpu.end_encoding(enc);
+            let cb = gpu.retain(cb);
+            gpu.commit_async(cb);
+            Ok(cb)
+        }
+    }
+
+    /// Submit the GPU prefix of the round-one C fold. `None` means the whole
+    /// fold stays on the CPU (kill switch, non-ranked shape, no Metal device,
+    /// or a stripe allocation Metal cannot wrap without a copy).
+    pub(crate) fn launch_zerocheck_c_fold(
+        z_packed: &[u8],
+        m: usize,
+        k_log: usize,
+        useful_bits: usize,
+        eq_outer: &[F128],
+    ) -> Option<ZcFoldJob> {
+        if !super::gpu_zerocheck_enabled() {
+            return None;
+        }
+        let k = 1usize << k_log;
+        if !k.is_multiple_of(ZC_FOLD_COLS_PER_TG) || m <= k_log + 3 {
+            return None;
+        }
+        let n_claims = crate::lincheck::oblock_claim_count(m, k_log);
+        let claim_lo = zc_fold_claims_for(n_claims);
+        if claim_lo == 0 || claim_lo > n_claims {
+            return None;
+        }
+        let stripe_hi = crate::lincheck::oblock_claim_stripe_base(claim_lo);
+        let gpu = gpu().ok()?;
+        let mut guard = ZC_FOLD.lock().ok()?;
+        if guard.is_none() {
+            let t = std::time::Instant::now();
+            *guard = Some(zc_fold_init(gpu));
+            if super::gpu_zerocheck_debug() {
+                eprintln!(
+                    "[gpu-zc] shader init: {:.1} ms",
+                    t.elapsed().as_secs_f64() * 1e3
+                );
+            }
+        }
+        if guard.as_ref().is_some_and(|r| r.is_err()) {
+            return None;
+        }
+
+        let submitted = std::time::Instant::now();
+        let (cb, plan) = {
+            let state = guard.as_mut()?.as_mut().ok()?;
+            let n_outer = 1usize << (m - k_log);
+            let useful = (useful_bits.div_ceil(8) * 8).min(k);
+            unsafe {
+                let pool = gpu.pool_push();
+                let built = (|| -> Result<(Id, ZcFoldPlan), String> {
+                    let z_buf = state.wrap_z(z_packed)?;
+                    let (mut eq_buf, mut eq_cap) = (state.eq_buf, state.eq_cap);
+                    state.ensure(&mut eq_buf, &mut eq_cap, n_outer * 16)?;
+                    state.eq_buf = eq_buf;
+                    state.eq_cap = eq_cap;
+                    let (mut part_buf, mut part_cap) = (state.part_buf, state.part_cap);
+                    state.ensure(&mut part_buf, &mut part_cap, ZC_FOLD_CHUNKS * k * 16)?;
+                    state.part_buf = part_buf;
+                    state.part_cap = part_cap;
+                    let (mut out_buf, mut out_cap) = (state.out_buf, state.out_cap);
+                    state.ensure(&mut out_buf, &mut out_cap, k * 16)?;
+                    state.out_buf = out_buf;
+                    state.out_cap = out_cap;
+                    std::ptr::copy_nonoverlapping(
+                        eq_outer.as_ptr().cast::<u8>(),
+                        gpu.buffer_contents(state.eq_buf),
+                        n_outer * 16,
+                    );
+                    let plan = ZcFoldPlan {
+                        z_buf,
+                        k,
+                        useful,
+                        stripe_hi,
+                        stripes_per_chunk: stripe_hi
+                            .div_ceil(ZC_FOLD_CHUNKS)
+                            .next_multiple_of(8),
+                        i_groups: k / ZC_FOLD_COLS_PER_TG,
+                    };
+                    Ok((zc_fold_submit(gpu, state, &plan)?, plan))
+                })();
+                gpu.pool_pop(pool);
+                match built {
+                    Ok(v) => v,
+                    Err(e) => {
+                        if super::gpu_zerocheck_debug() {
+                            eprintln!("[gpu-zc] submit failed, CPU-only fold: {e}");
+                        }
+                        return None;
+                    }
+                }
+            }
+        };
+        ZC_FOLD_SUBMITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Some(ZcFoldJob {
+            guard,
+            cb,
+            plan,
+            k,
+            claim_lo,
+            n_claims,
+            submitted,
+        })
+    }
+
     #[cfg(test)]
     mod split_select_tests {
         use super::{
@@ -5485,6 +6211,11 @@ kernel void export_from_z_zero_root_tabs(
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[cfg_attr(not(test), allow(unused_imports))]
 pub(crate) use imp::{gpu_merkle_tree_blake3, gpu_ntt_interleaved_from_layer};
+
+/// Zerocheck round-one C-fold GPU arm (see `ENV_NO_GPU_ZEROCHECK`).
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[cfg_attr(not(test), allow(unused_imports))]
+pub(crate) use imp::{ZcFoldJob, launch_zerocheck_c_fold, zerocheck_gpu_submits};
 
 #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
 mod imp {
@@ -5813,7 +6544,7 @@ mod tests {
 
         let mut expect_first = vec![F128::ZERO; 64 << log_d];
         crate::pcs::commit::replicate_message_fill(&mut expect_first, &z);
-        ntt.forward_transform_interleaved_block_range(&mut expect_first, 64, 1, 4, 0, 2);
+        ntt.forward_transform_interleaved_block_range(&mut expect_first, 64, 1, 4, 0, 2, 0);
 
         let mut expect_full = vec![F128::ZERO; 64 << log_d];
         crate::pcs::commit::replicate_message_fill(&mut expect_full, &z);
@@ -6597,5 +7328,156 @@ mod tests {
             }
         }
         assert_eq!(plan_passes(20, 1), vec![(1, 4), (5, 4), (9, 4), (13, 4), (17, 3)]);
+    }
+
+    // -----------------------------------------------------------------------
+    // Zerocheck round-1 C fold: GPU prefix vs CPU oracle.
+    // -----------------------------------------------------------------------
+
+    /// Page-aligned byte buffer for `newBufferWithBytesNoCopy`.
+    ///
+    /// Deliberately LEAKED: the fold arm caches its no-copy wrap by
+    /// `(ptr, len)`, and the production stripe is a pooled allocation that
+    /// lives for the process. A test that freed its buffer could hand the
+    /// same address back to a later test with a stale Metal wrap attached.
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    fn leak_page_aligned(len: usize) -> &'static mut [u8] {
+        let layout = std::alloc::Layout::from_size_align(len, 16384).unwrap();
+        // SAFETY: non-zero layout; the allocation is never freed, and every
+        // byte is written by the caller before it is read.
+        let ptr = unsafe { std::alloc::alloc(layout) };
+        assert!(!ptr.is_null(), "page-aligned alloc of {len} failed");
+        unsafe { std::slice::from_raw_parts_mut(ptr, len) }
+    }
+
+    /// Fill a stripe with pseudorandom bytes — INCLUDING the padded columns
+    /// `[useful_bits, k)`, so the test proves the GPU zeroes exactly the
+    /// columns the CPU kernel skips instead of folding garbage into them.
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    fn fill_stripe(z: &mut [u8], seed: u64) {
+        use rayon::prelude::*;
+        z.par_chunks_mut(1 << 16).enumerate().for_each(|(c, dst)| {
+            let mut rng = Rng::new(seed ^ (c as u64).wrapping_mul(0x51_7C_C1_B7_27_22_0A_95));
+            for byte in dst.iter_mut() {
+                *byte = rng.next_u64() as u8;
+            }
+        });
+    }
+
+    /// The GPU prefix equals the CPU fold over exactly the claims it owns,
+    /// and prefix ⊕ CPU-suffix equals the whole-range production fold.
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    fn gpu_zerocheck_c_fold_prefix_matches_cpu_oracle() {
+        // n_outer = 2^16 ⇒ 8192 stripes ⇒ 1024 tiles ⇒ 16 claims, so the
+        // default warmup split is a genuine partial prefix (6/16).
+        let (m, k_log, useful_bits) = (26usize, 10usize, 997usize);
+        let k = 1usize << k_log;
+        if gpu_or_skip(imp::gpu()).is_none() {
+            return;
+        }
+        let z = leak_page_aligned((1usize << m) / 8);
+        fill_stripe(z, 0xC0FF_EE12_3456_789D);
+        let mut rng = Rng::new(0x5EED_0001);
+        let eq = rng.vec(1usize << (m - k_log));
+
+        let job = imp::launch_zerocheck_c_fold(z, m, k_log, useful_bits, &eq)
+            .expect("GPU fold arm must submit on an available device");
+        let claim_lo = job.claim_lo();
+        assert!(
+            claim_lo > 0 && claim_lo < crate::lincheck::oblock_claim_count(m, k_log),
+            "expected a partial prefix, got {claim_lo}"
+        );
+        let mut got = vec![F128::ZERO; k];
+        job.finish_xor_into(&mut got, 0.0, 0.0).unwrap();
+
+        let want = crate::lincheck::partial_fold_packed_z_neon_oblock_padded_range(
+            z,
+            m,
+            k_log,
+            useful_bits,
+            &eq,
+            0,
+            claim_lo,
+        );
+        assert_eq!(got, want, "GPU prefix must be bit-exact");
+        assert!(
+            got[useful_bits.div_ceil(8) * 8..].iter().all(|v| *v == F128::ZERO),
+            "padded columns must stay zero"
+        );
+
+        let suffix = crate::lincheck::partial_fold_packed_z_neon_oblock_padded_suffix(
+            z, m, k_log, useful_bits, &eq, claim_lo,
+        );
+        for (a, b) in got.iter_mut().zip(suffix) {
+            *a += b;
+        }
+        let whole = crate::lincheck::partial_fold_packed_z_best(z, m, k_log, useful_bits, &eq);
+        assert_eq!(got, whole, "hybrid union must equal the whole-range fold");
+    }
+
+    /// Same oracle at the ranked production shape (m = 32, k_log = 14,
+    /// useful_bits = 15409) — the only shape the arm is gated on.
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    fn gpu_zerocheck_c_fold_matches_cpu_at_ranked_shape() {
+        let (m, k_log, useful_bits) = (32usize, 14usize, 15_409usize);
+        if gpu_or_skip(imp::gpu()).is_none() {
+            return;
+        }
+        let z = leak_page_aligned((1usize << m) / 8);
+        fill_stripe(z, 0xA5A5_0F0F_1234_5678);
+        let mut rng = Rng::new(0x5EED_0002);
+        let eq = rng.vec(1usize << (m - k_log));
+
+        let job = imp::launch_zerocheck_c_fold(z, m, k_log, useful_bits, &eq)
+            .expect("GPU fold arm must submit at the ranked shape");
+        let claim_lo = job.claim_lo();
+        let mut hybrid = vec![F128::ZERO; 1usize << k_log];
+        let suffix = crate::lincheck::partial_fold_packed_z_neon_oblock_padded_suffix(
+            z, m, k_log, useful_bits, &eq, claim_lo,
+        );
+        job.finish_xor_into(&mut hybrid, 0.0, 0.0).unwrap();
+        for (a, b) in hybrid.iter_mut().zip(suffix) {
+            *a += b;
+        }
+        let whole = crate::lincheck::partial_fold_packed_z_best(z, m, k_log, useful_bits, &eq);
+        assert_eq!(hybrid, whole, "ranked hybrid fold must be bit-exact");
+
+        // Second submission on the SAME stripe: exercises the cached no-copy
+        // wrap (the steady-state production path — the ranked prover recycles
+        // one pooled 512 MiB stripe, so only the untimed warmup prove pays
+        // Metal's first-touch page wiring).
+        let job = imp::launch_zerocheck_c_fold(z, m, k_log, useful_bits, &eq)
+            .expect("cached-wrap resubmission must succeed");
+        let claim_lo2 = job.claim_lo();
+        let mut again = vec![F128::ZERO; 1usize << k_log];
+        job.finish_xor_into(&mut again, 0.0, 0.0).unwrap();
+        let want = crate::lincheck::partial_fold_packed_z_neon_oblock_padded_range(
+            z, m, k_log, useful_bits, &eq, 0, claim_lo2,
+        );
+        assert_eq!(again, want, "resubmitted prefix must stay bit-exact");
+    }
+
+    /// The kill switch keeps the whole fold on the CPU.
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    fn zerocheck_gpu_kill_switch_is_the_documented_env() {
+        assert_eq!(ENV_NO_GPU_ZEROCHECK, "FLOCK_NO_GPU_ZEROCHECK");
+    }
+
+    /// The whole arm depends on wrapping the ranked lincheck stripe with
+    /// `newBufferWithBytesNoCopy`, which Metal only accepts on page-aligned
+    /// memory of a page-multiple length. Copying 512 MiB instead is not an
+    /// option, so a scratch allocator that stopped returning page-aligned
+    /// blocks would silently disable the GPU fold. Pin that here.
+    #[test]
+    fn ranked_lincheck_stripe_is_wrappable_without_a_copy() {
+        const PAGE: usize = 16384;
+        let stripe = crate::scratch::take_u8(1usize << 29);
+        let (ptr, len) = (stripe.as_ptr() as usize, stripe.len());
+        crate::scratch::give_u8(stripe);
+        assert_eq!(ptr % PAGE, 0, "ranked stripe base must be page-aligned");
+        assert_eq!(len % PAGE, 0, "ranked stripe length must be a page multiple");
     }
 }

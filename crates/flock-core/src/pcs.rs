@@ -319,6 +319,56 @@ fn round0_and_round1_lookahead_ranked(
     round0_and_round1_lookahead_scalar(witness, basis)
 }
 
+/// Kill switch for the direct-materializer deferred-reduction fast paths:
+/// the banked `fold16`/`fold64` slot folds and the round-0 message kernels
+/// that close each direct fold block. Every one of them is bit-identical to
+/// the fully-reduced scalar loop it replaces (reduction mod p is F2-linear,
+/// so it commutes with the XOR product sum), so this is a pure A/B escape
+/// hatch rather than a correctness condition.
+#[inline]
+pub(crate) fn use_fold_deferred_reduce() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_FOLD_DEFERRED_REDUCE").is_none());
+    *ON
+}
+
+/// Deferred-reduction dispatcher for the direct-fold4 materializer's block
+/// tail. The `_ranked` sibling is pinned to the 2^15-slot combine geometry;
+/// the direct-fold4 materializer's blocks are 2^13 slots, so it needs its own
+/// gate. Both arms return the same bits.
+#[inline]
+pub(crate) fn round0_and_round1_lookahead_deferred(
+    witness: &[F128],
+    basis: &[F128],
+) -> ((F128, F128), [F128; 6]) {
+    assert_eq!(witness.len(), basis.len());
+    assert!(witness.len().is_multiple_of(4));
+
+    #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+    if use_fold_deferred_reduce() {
+        return crate::field::f128_slice::round0_and_round1_lookahead(witness, basis);
+    }
+
+    round0_and_round1_lookahead_scalar(witness, basis)
+}
+
+/// Deferred-reduction dispatcher for the direct-fold8 materializer's block
+/// tail. Routing fold8 through the six-coefficient lookahead kernel would be
+/// a regression: fold8 consumes only `(u_0, u_2)`, and the lookahead scan
+/// spends eight unreduced products per four slots where round-zero needs
+/// four.
+#[inline]
+pub(crate) fn round0_deferred(witness: &[F128], basis: &[F128]) -> (F128, F128) {
+    assert_eq!(witness.len(), basis.len());
+
+    #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+    if use_fold_deferred_reduce() && witness.len().is_multiple_of(2) {
+        return crate::field::f128_slice::round0(witness, basis);
+    }
+
+    round0_scalar(witness, basis)
+}
+
 /// Round-0 message `(u_0, u_2)` over paired slots, without the round-1
 /// lookahead coefficients. Sums the same pair products as
 /// [`round0_and_round1_lookahead_scalar`], so the values agree with it
@@ -2009,6 +2059,51 @@ mod tests {
             );
             assert_eq!(actual, expected, "deferred reduction at log_n={log_n}");
         }
+    }
+
+    /// Oracle for the two rerouted direct-materializer block tails. Both
+    /// dispatchers must return exactly the bits their scalar predecessors
+    /// returned, at the block widths the fold4/fold8 materializers actually
+    /// use (2^13 and 2^11 slots) as well as at small widths.
+    ///
+    /// It also pins the semantic precondition of the fold8 reroute:
+    /// `round0_scalar` and the `(u_0, u_2)` half of the lookahead scan agree
+    /// bitwise, so swapping in a round-0-only deferred kernel cannot change
+    /// the transcript.
+    #[test]
+    fn fold_deferred_reduce_dispatchers_match_scalar() {
+        let mut rng = Rng::new(0xF01D_DEFD);
+        for log_n in [2usize, 5, 9, 11, 13] {
+            let n = 1usize << log_n;
+            let witness: Vec<F128> = (0..n).map(|_| rng.f128()).collect();
+            let basis: Vec<F128> = (0..n).map(|_| rng.f128()).collect();
+
+            let want_lookahead = round0_and_round1_lookahead_scalar(&witness, &basis);
+            assert_eq!(
+                round0_and_round1_lookahead_deferred(&witness, &basis),
+                want_lookahead,
+                "fold4 block tail at log_n={log_n}"
+            );
+
+            let want_round0 = round0_scalar(&witness, &basis);
+            assert_eq!(
+                want_round0, want_lookahead.0,
+                "round0_scalar must agree with the lookahead (u_0, u_2) at log_n={log_n}"
+            );
+            assert_eq!(
+                round0_deferred(&witness, &basis),
+                want_round0,
+                "fold8 block tail at log_n={log_n}"
+            );
+        }
+    }
+
+    #[test]
+    fn fold_deferred_reduce_gate_follows_env() {
+        assert_eq!(
+            use_fold_deferred_reduce(),
+            std::env::var_os("FLOCK_NO_FOLD_DEFERRED_REDUCE").is_none()
+        );
     }
 
     #[test]

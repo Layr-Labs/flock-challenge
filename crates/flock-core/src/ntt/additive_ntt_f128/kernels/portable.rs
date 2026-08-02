@@ -223,12 +223,13 @@ pub(super) unsafe fn butterfly_fused_3layer_row(
     ptr: *mut F128,
     eighth: usize,
     num_ntts: usize,
+    lanes: usize,
     r: usize,
     twiddles: &[F128; 7],
 ) {
     // SAFETY: caller supplies the pointer geometry and disjointness contract.
     unsafe {
-        for lane in 0..num_ntts {
+        for lane in 0..lanes {
             let mut values = [F128::ZERO; 8];
             for (i, value) in values.iter_mut().enumerate() {
                 *value = *ptr.add((i * eighth + r) * num_ntts + lane);
@@ -254,12 +255,13 @@ pub(super) unsafe fn butterfly_fused_3layer_zero_root_row(
     ptr: *mut F128,
     eighth: usize,
     num_ntts: usize,
+    lanes: usize,
     r: usize,
     twiddles: &[F128; 7],
 ) {
     // SAFETY: caller supplies the pointer geometry and disjointness contract.
     unsafe {
-        for lane in 0..num_ntts {
+        for lane in 0..lanes {
             let mut values = [F128::ZERO; 8];
             for (i, value) in values.iter_mut().enumerate() {
                 *value = *ptr.add((i * eighth + r) * num_ntts + lane);

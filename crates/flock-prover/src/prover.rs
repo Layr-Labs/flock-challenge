@@ -744,6 +744,20 @@ fn commit_with_round1_ab_precompute(
     let run_ranked_exact_tune =
         flock_core::gpu_commit::ranked_exact_contention_tune_pending();
 
+    // The BLAKE3 padding rows force every block's tail words to zero, which
+    // in the SoA codeword is a static all-zero pattern on the top lanes of
+    // every odd position. Publish it for the duration of this commitment so
+    // the NTT can drop those butterflies; the guard restores the previous
+    // value (recursive PCS commits run at eight lanes and never match).
+    let _zero_lane_skip = flock_core::ntt::additive_ntt_f128::ZeroOddTailLanes::scope(
+        pcs_params.num_ntts(),
+        flock_core::ntt::additive_ntt_f128::ZeroOddTailLanes::lanes_for_padding(
+            pcs_params.num_ntts(),
+            padding.k_log,
+            padding.useful_bits_per_block,
+        ),
+    );
+
     let result = rayon::join(
         || match commit_codeword {
             CommitCodeword::Allocate => pcs::commit(z_packed, pcs_params),
