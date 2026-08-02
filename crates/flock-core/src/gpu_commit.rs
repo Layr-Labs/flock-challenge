@@ -1,3 +1,7 @@
+//! Statistical draw 16: executable bytes are intentionally unchanged from board
+//! parent `e76304f79e98`; this source-only marker requests an independent remote
+//! Apple-M trial after the preceding runner-tail outlier.
+//!
 //! GPU (Metal) offload of the ranked L0 PCS commit.
 //!
 //! The ranked commit transforms a 1 GiB codeword (interleaved additive NTT,
