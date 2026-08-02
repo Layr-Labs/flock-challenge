@@ -10463,3 +10463,4 @@ mod tests {
 // angelX disclosed draw 3 on 39541e2 (draws 1-2: 1,252,541 / 1,241,514; zero-diff marker per board protocol).
 // angelX disclosed draw 7 of the tree on 775378c (prior: 1,252,541 / 1,241,514 / 1,255,076 P / 1,245,411 / 1,249,152 / pending; zero-diff marker).
 // RealAdii sample 1 on beeedc6.
+// angelX disclosed draw 10 of the eb1646f tree (sample 10; prior draws: 1,313,967 / 1,314,261 / 1,316,011 / 1,317,904 / 1,316,893 / 1,316,211 / 1,316,606 / 1,317,011 / 1,315,098).
