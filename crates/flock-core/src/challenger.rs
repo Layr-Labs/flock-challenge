@@ -496,8 +496,27 @@ impl Challenger for FsChallenger {
                         // The scoped thread parks in `broadcast` while the
                         // E-workers drain; the scope join bounds the tail wait
                         // at one chunk on one efficiency core.
-                        s.spawn(|| ep.broadcast(|_| worker()));
+                        let epool_job = s.spawn(|| ep.broadcast(|_| worker()));
                         drain_main();
+                        // Thread-join wake-tail, CPU two-pool grind site: the
+                        // main-pool drain runs on P-cores and typically finishes
+                        // before the E-core broadcast, so the implicit scope-end
+                        // join parks this thread and pays the E-core completion
+                        // wake tail -- the same wait class the window-inner site
+                        // (ac37b05, promoted) and the lincheck stripe join cut.
+                        // Poll `is_finished` first (zero cost when done), then
+                        // yield for a bounded budget before degrading to the
+                        // exact incumbent blocking scope-end join.
+                        // Byte-identical either way.
+                        if !epool_job.is_finished() && grind_join_spin_enabled() {
+                            let spin_deadline =
+                                std::time::Instant::now() + std::time::Duration::from_millis(2);
+                            while !epool_job.is_finished()
+                                && std::time::Instant::now() < spin_deadline
+                            {
+                                std::thread::yield_now();
+                            }
+                        }
                     }),
                     None => drain_main(),
                 }
@@ -962,6 +981,14 @@ fn grind_hybrid_enabled() -> bool {
 fn grind_hybrid_abort_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("FLOCK_NO_GRIND_HYBRID_ABORT").is_none())
+}
+
+/// `FLOCK_NO_GRIND_JOIN_SPIN` restores the exact incumbent blocking
+/// scoped-thread joins in the hybrid grind (no first-check yield), a
+/// runner-side rollback lever for the two-pool CPU grind scope-end cut.
+fn grind_join_spin_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("FLOCK_NO_GRIND_JOIN_SPIN").is_none())
 }
 
 // ---------------------------------------------------------------------------
