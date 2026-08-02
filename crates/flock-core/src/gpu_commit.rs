@@ -4547,7 +4547,7 @@ kernel void blake3_pow_scan(
     /// upper candidates consistently worse. Three spanning candidates keep
     /// the per-process contention-exact choice at ~3/8 of the job-wall
     /// cost, which ~120 fresh workers pay against a hard 10-minute cap.
-    const RANKED_EXACT_TUNE_CANDIDATES: [usize; 3] = [0, 3, 5];
+    const RANKED_EXACT_TUNE_CANDIDATES: [usize; 3] = [0, 1, 5];
 
     /// Two samples per candidate, with the second pass in reverse order so
     /// thermal drift, queue warmup, and A/B replay cache state do not favor
@@ -7486,7 +7486,7 @@ LC_KERNEL(lc_fold_stripes, 4)
             DEFAULT_HYBRID_K, RANKED_EXACT_TUNE_CANDIDATES, choose_hybrid_k,
             collect_ranked_exact_samples, mean_ranked_exact_samples,
         };
-        const C: [usize; 3] = [0, 3, 5];
+        const C: [usize; 3] = [0, 1, 5];
 
         #[test]
         fn trimmed_candidate_set_is_stable() {
@@ -7509,7 +7509,7 @@ LC_KERNEL(lc_fold_stripes, 4)
             .unwrap();
             assert_eq!(
                 *events.borrow(),
-                [-1, 0, -1, 3, -1, 5, -1, 5, -1, 3, -1, 0]
+                [-1, 0, -1, 1, -1, 5, -1, 5, -1, 1, -1, 0]
             );
             assert_eq!(samples[0], [0.0, 0.0]);
             assert_eq!(samples[2], [5.0, 5.0]);
@@ -7526,14 +7526,17 @@ LC_KERNEL(lc_fold_stripes, 4)
 
         #[test]
         fn smallest_share_within_band_wins() {
-            // k=3 fastest; default k=5 far off → smallest in band.
+            // k=1 fastest; default k=5 far off → smallest in band.
             let ms = [200.0, 100.0, 150.0];
-            assert_eq!(choose_hybrid_k(&C, &ms, DEFAULT_HYBRID_K), Some(3));
+            assert_eq!(
+                choose_hybrid_k(&RANKED_EXACT_TUNE_CANDIDATES, &ms, DEFAULT_HYBRID_K),
+                Some(1)
+            );
         }
 
         #[test]
         fn default_near_tie_keeps_default() {
-            // k=3 fastest but default k=5 within 1.5% → default retained.
+            // k=1 fastest but default k=5 within 1.5% → default retained.
             let ms = [200.0, 100.0, 101.0];
             assert_eq!(choose_hybrid_k(&C, &ms, DEFAULT_HYBRID_K), Some(5));
         }
