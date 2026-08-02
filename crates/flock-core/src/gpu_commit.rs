@@ -4287,11 +4287,16 @@ kernel void blake3_pow_scan(
         Some(chosen)
     }
 
-    /// Broad candidate set retained deliberately: the warmup cache publishes
-    /// the first process's winner to later workers, so the one calibration
-    /// process should search both pure GPU and the full observed hybrid
-    /// plateau instead of narrowing around a development-host optimum.
-    const RANKED_EXACT_TUNE_CANDIDATES: [usize; 8] = [0, 2, 3, 4, 5, 6, 7, 8];
+    /// Candidate set trimmed from the historical [0,2,3,4,5,6,7,8]: the
+    /// broad set's original justification — one calibration process
+    /// publishing its winner to later workers through the warmup cache — is
+    /// dead on the ranked runner (the verifier wipes the shared scratch
+    /// between trials, so EVERY worker replays this sweep itself), and the
+    /// sweep's own measurements show a flat basin across k=0..5 with the
+    /// upper candidates consistently worse. Three spanning candidates keep
+    /// the per-process contention-exact choice at ~3/8 of the job-wall
+    /// cost, which ~120 fresh workers pay against a hard 10-minute cap.
+    const RANKED_EXACT_TUNE_CANDIDATES: [usize; 3] = [0, 3, 5];
 
     /// Two samples per candidate, with the second pass in reverse order so
     /// thermal drift, queue warmup, and A/B replay cache state do not favor
@@ -7137,15 +7142,15 @@ LC_KERNEL(lc_fold_stripes, 4)
             DEFAULT_HYBRID_K, RANKED_EXACT_TUNE_CANDIDATES, choose_hybrid_k,
             collect_ranked_exact_samples, mean_ranked_exact_samples,
         };
-        const C: [usize; 8] = [0, 2, 3, 4, 5, 6, 7, 8];
+        const C: [usize; 3] = [0, 3, 5];
 
         #[test]
-        fn broad_candidate_set_is_stable() {
+        fn trimmed_candidate_set_is_stable() {
             assert_eq!(RANKED_EXACT_TUNE_CANDIDATES, C);
         }
 
         #[test]
-        fn exact_samples_are_broad_balanced_and_each_reprimed() {
+        fn exact_samples_are_balanced_and_each_reprimed() {
             let events = std::cell::RefCell::new(Vec::new());
             let samples = collect_ranked_exact_samples(
                 || {
@@ -7160,13 +7165,10 @@ LC_KERNEL(lc_fold_stripes, 4)
             .unwrap();
             assert_eq!(
                 *events.borrow(),
-                [
-                    -1, 0, -1, 2, -1, 3, -1, 4, -1, 5, -1, 6, -1, 7, -1, 8, -1, 8,
-                    -1, 7, -1, 6, -1, 5, -1, 4, -1, 3, -1, 2, -1, 0,
-                ]
+                [-1, 0, -1, 3, -1, 5, -1, 5, -1, 3, -1, 0]
             );
             assert_eq!(samples[0], [0.0, 0.0]);
-            assert_eq!(samples[7], [8.0, 8.0]);
+            assert_eq!(samples[2], [5.0, 5.0]);
         }
 
         #[test]
