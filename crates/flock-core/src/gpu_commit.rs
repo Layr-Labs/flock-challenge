@@ -6567,7 +6567,11 @@ LC_KERNEL(lc_fold_stripes, 4)
                     {
                         let measured = u_gpu / u_cpu;
                         let ratio = lincheck_fold_forced_ratio().unwrap_or(measured);
-                        let g = lincheck_gate_share(ratio, self.n_claims);
+                        let g = if lincheck_legacy_split_enabled() {
+                            lincheck_gate_share_legacy(ratio, self.n_claims)
+                        } else {
+                            lincheck_gate_share(ratio, self.n_claims)
+                        };
                         self.arm
                             .tuned()
                             .store(g, std::sync::atomic::Ordering::Relaxed);
@@ -6725,6 +6729,16 @@ LC_KERNEL(lc_fold_stripes, 4)
         *R
     }
 
+    /// Same-binary rollback for the promoted 0.9-biased, half-range-clamped
+    /// split policy. The ranked environment is cleared, so production uses
+    /// the balanced policy below.
+    fn lincheck_legacy_split_enabled() -> bool {
+        static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+            std::env::var_os("FLOCK_LINCHECK_GPU_LEGACY_SPLIT").is_some()
+        });
+        *ON
+    }
+
     /// Probe share for the lincheck arm's first in-process prove (always
     /// the untimed warmup prove in the benchmark worker): 8 claims on the
     /// GPU, the rest on the CPU. Safe at any plausible ratio — even a 5x
@@ -6739,13 +6753,31 @@ LC_KERNEL(lc_fold_stripes, 4)
     /// share 0 = exact incumbent; the only cost is the untimed probe).
     const LINCHECK_FOLD_MAX_GPU_RATIO: f64 = 2.0;
 
-    /// The warmup ratio gate, pure: from the measured per-claim ratio to
-    /// the GPU claim share published for the rest of the process.
-    /// `c_g = clamp(floor(0.9 * n / (1 + ratio)), 0, n/2)`; a ratio above
-    /// [`LINCHECK_FOLD_MAX_GPU_RATIO`] (or an unusable sample) yields 0 =
-    /// off. The 0.9 biases CPU-ward: overshooting makes the GPU the
-    /// straggler, which costs wall directly.
+    /// The warmup ratio gate, pure: from measured per-claim GPU:CPU cost to
+    /// the GPU claim share published for the rest of the process. Parallel
+    /// completion is minimized where `g*u_gpu = (n-g)*u_cpu`, hence
+    /// `g = n/(1+ratio)`. Round to the nearest whole claim and cap at 5/8 of
+    /// the range: on the ranked M3 Max, repeated exact split probes put the
+    /// balance at 39--40/64, while a noisy warmup CPU sample can otherwise
+    /// overshoot to 42 and make the GPU the straggler. Keeping both arms
+    /// non-empty preserves the hybrid contract. A ratio above
+    /// [`LINCHECK_FOLD_MAX_GPU_RATIO`] (or an unusable sample) still yields 0
+    /// = off.
     pub(crate) fn lincheck_gate_share(ratio: f64, n_claims: usize) -> usize {
+        if n_claims <= 1
+            || !ratio.is_finite()
+            || ratio <= 0.0
+            || ratio > LINCHECK_FOLD_MAX_GPU_RATIO
+        {
+            return 0;
+        }
+        let share = (n_claims as f64 / (1.0 + ratio)).round();
+        let max_gpu = (n_claims * 5 / 8).clamp(1, n_claims.saturating_sub(1));
+        share.clamp(1.0, max_gpu as f64) as usize
+    }
+
+    /// Exact promoted policy retained for causal A/B.
+    pub(crate) fn lincheck_gate_share_legacy(ratio: f64, n_claims: usize) -> usize {
         if !ratio.is_finite() || ratio <= 0.0 || ratio > LINCHECK_FOLD_MAX_GPU_RATIO {
             return 0;
         }
@@ -9111,26 +9143,32 @@ DEF_PROBE(probe_g4_t8_p0,    8u,  0u,   tsel & 7u)
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     #[test]
     fn lincheck_gate_share_formula_and_disable() {
-        use imp::lincheck_gate_share;
-        // ratio 1.0: floor(0.9 * 64 / 2) = 28.
-        assert_eq!(lincheck_gate_share(1.0, 64), 28);
-        // v1's measured local ratio: floor(0.9 * 64 / 2.52) = 22.
-        assert_eq!(lincheck_gate_share(1.52, 64), 22);
-        // The threshold itself still runs: floor(0.9 * 64 / 3) = 19.
-        assert_eq!(lincheck_gate_share(2.0, 64), 19);
+        use imp::{lincheck_gate_share, lincheck_gate_share_legacy};
+        // Equal per-claim costs balance at half the range.
+        assert_eq!(lincheck_gate_share(1.0, 64), 32);
+        // v1's measured local ratio: round(64 / 2.52) = 25.
+        assert_eq!(lincheck_gate_share(1.52, 64), 25);
+        // The threshold itself still runs: round(64 / 3) = 21.
+        assert_eq!(lincheck_gate_share(2.0, 64), 21);
         // Above it the arm is OFF (0 = exact incumbent).
         assert_eq!(lincheck_gate_share(2.01, 64), 0);
         assert_eq!(lincheck_gate_share(3.0, 64), 0);
-        // Fast GPU: clamped at half the claims (CPU-ward bias).
-        assert_eq!(lincheck_gate_share(0.5, 64), 32);
-        assert_eq!(lincheck_gate_share(0.1, 64), 32);
+        // A faster GPU owns proportionally more claims, capped at 5/8 so a
+        // noisy CPU probe cannot turn the GPU into the timed straggler.
+        assert_eq!(lincheck_gate_share(0.5, 64), 40);
+        assert_eq!(lincheck_gate_share(0.1, 64), 40);
         // Unusable samples disable rather than guess.
         assert_eq!(lincheck_gate_share(f64::NAN, 64), 0);
         assert_eq!(lincheck_gate_share(f64::INFINITY, 64), 0);
         assert_eq!(lincheck_gate_share(0.0, 64), 0);
         assert_eq!(lincheck_gate_share(-1.0, 64), 0);
-        // Small test shapes scale (16 claims: ratio 1 -> floor(7.2) = 7).
-        assert_eq!(lincheck_gate_share(1.0, 16), 7);
+        // Small test shapes scale (16 claims: ratio 1 -> 8).
+        assert_eq!(lincheck_gate_share(1.0, 16), 8);
+
+        // The same-binary rollback remains the exact promoted policy.
+        assert_eq!(lincheck_gate_share_legacy(1.0, 64), 28);
+        assert_eq!(lincheck_gate_share_legacy(1.52, 64), 22);
+        assert_eq!(lincheck_gate_share_legacy(0.5, 64), 32);
     }
 
     /// The lincheck arm's GPU prefix equals the CPU fold over exactly the
