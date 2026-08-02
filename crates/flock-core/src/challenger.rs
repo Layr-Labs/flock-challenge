@@ -808,6 +808,28 @@ fn gpu_blake3_pow_nonce(state_digest: &[u8; 32], bits: u32) -> Result<u64, Strin
                 bits,
                 abort.then_some(&stop),
             );
+            // Spin-family completion, grind side: the calling thread has just
+            // finished its CPU prefetch window (~0.8 ms) synchronously, so by
+            // the time we reach this join the concurrent GPU scan is usually
+            // already home or microseconds away — yet a blocking scoped-thread
+            // join still pays the park + completion-wake tail whenever the GPU
+            // round trip races the join call. Same class of tail the prover's
+            // deferred-stripe join already fixed (see prover.rs). Poll
+            // `is_finished` first (zero cost when done), then yield for a
+            // budget sized to the GPU's own ~0.8 ms fixed round trip (yield,
+            // not spin: the GPU-scan owner is a sibling CPU thread driving the
+            // command buffer and must keep its core), then degrade to the exact
+            // incumbent blocking join. Byte-identical either way: the join
+            // consumes the same completed thread and returns the same nonce.
+            if !gpu_scan.is_finished() {
+                let spin_deadline =
+                    std::time::Instant::now() + std::time::Duration::from_micros(900);
+                while !gpu_scan.is_finished()
+                    && std::time::Instant::now() < spin_deadline
+                {
+                    std::thread::yield_now();
+                }
+            }
             let gpu = gpu_scan
                 .join()
                 .unwrap_or_else(|_| Err("GPU grind scan thread panicked".to_string()));
