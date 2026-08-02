@@ -14,7 +14,7 @@ concurrency:
 jobs:
   benchmark:
     runs-on: [self-hosted, m3-max-36gb]
-    timeout-minutes: 8
+    timeout-minutes: 10
     env:
       BLAKE3_LOG2: "18"
       BLAKE3_THREADS: auto
