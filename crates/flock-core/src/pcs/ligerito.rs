@@ -3872,7 +3872,6 @@ fn materialize_direct_fold4(
     assert!(claims.iter().all(|claim| {
         claim.eq_lo.len() == block_len && claim.eq_hi.len() * block_len == out_len
     }));
-    let deferred_reduce = super::use_fold_deferred_reduce();
 
     type FoldStats = ((F128, F128), [F128; 6]);
     let empty_stats = || ((F128::ZERO, F128::ZERO), [F128::ZERO; 6]);
@@ -3901,12 +3900,6 @@ fn materialize_direct_fold4(
                 };
                 let fold16 = |input: &[F128], slot: usize| {
                     let base = 16 * slot;
-                    if deferred_reduce {
-                        return crate::field::f128_slice::fold_banked_slot::<16>(
-                            &fold_weight,
-                            &input[base..base + 16],
-                        );
-                    }
                     let mut value = F128::ZERO;
                     for bank in 0..16 {
                         value += fold_weight[bank] * input[base + bank];
@@ -3941,7 +3934,7 @@ fn materialize_direct_fold4(
                         *out += super::ring_switch::fold_one_slot(claim.eq_lo[slot], scratch);
                     }
                 }
-                super::round0_and_round1_lookahead_deferred(f_out, b_out)
+                super::round0_and_round1_lookahead_scalar(f_out, b_out)
             },
         )
         .reduce(empty_stats, merge_stats);
@@ -4007,7 +4000,6 @@ fn materialize_direct_fold8(
     assert!(claims.iter().all(|claim| {
         claim.eq_lo.len() == block_len && claim.eq_hi.len() * block_len == out_len
     }));
-    let deferred_reduce = super::use_fold_deferred_reduce();
 
     let mut folded_f = crate::scratch::take_f128(out_len);
     let mut folded_b = crate::scratch::take_f128(out_len);
@@ -4027,12 +4019,6 @@ fn materialize_direct_fold8(
                 };
                 let fold64 = |input: &[F128], slot: usize| {
                     let base = 64 * slot;
-                    if deferred_reduce {
-                        return crate::field::f128_slice::fold_banked_slot::<64>(
-                            &fold_weight,
-                            &input[base..base + 64],
-                        );
-                    }
                     let mut value = F128::ZERO;
                     for bank in 0..64 {
                         value += fold_weight[bank] * input[base + bank];
@@ -4067,7 +4053,7 @@ fn materialize_direct_fold8(
                         *out += super::ring_switch::fold_one_slot(claim.eq_lo[slot], scratch);
                     }
                 }
-                super::round0_deferred(f_out, b_out)
+                super::round0_scalar(f_out, b_out)
             },
         )
         .reduce(
@@ -10478,5 +10464,4 @@ mod tests {
 // angelX disclosed draw 7 of the tree on 775378c (prior: 1,252,541 / 1,241,514 / 1,255,076 P / 1,245,411 / 1,249,152 / pending; zero-diff marker).
 // RealAdii sample 1 on beeedc6.
 // RealAdii sample 1 on 88aff39.
-// RealAdii sample 1 on 281206e.
-// RealAdii sample 2 on 281206e.
+// numinous draw 6 1785658371971629651
