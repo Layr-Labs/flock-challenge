@@ -2116,6 +2116,12 @@ kernel void export_from_z_zero_root_tabs(
                 // selects the incumbent pso_ntt4zg4 below.
                 let (pso_ntt4zg4_zero_root, pso_export_from_z_zero_root_tabs) =
                     if cfg!(test) || super::gpu_from_z_zero_root_selected(20) {
+                        // FAIL-OPEN: any supplemental-library build failure
+                        // degrades to the incumbent pso_ntt4zg4 path below
+                        // instead of poisoning process-wide `init_gpu` (which
+                        // latched the whole job onto the CPU L0 path in the
+                        // e0-family submissions).
+                        let built = (|| -> Result<(Id, Id), String> {
                         let src = api.nsstring(FROM_Z_ZERO_ROOT_MSL_SOURCE)?;
                         let mut err: Id = NIL;
                         let library: Id = send!(
@@ -2171,7 +2177,9 @@ kernel void export_from_z_zero_root_tabs(
                             NIL
                         };
                         send!(api, unsafe extern "C" fn(Id, Sel) -> Id, library, c"release");
-                        (candidate, export)
+                        Ok((candidate, export))
+                        })();
+                        built.unwrap_or((NIL, NIL))
                     } else {
                         (NIL, NIL)
                     };
