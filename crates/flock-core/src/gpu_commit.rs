@@ -43,6 +43,23 @@ pub const ENV_NO_LAZY_GPU_CODEWORD: &str = "FLOCK_NO_LAZY_GPU_CODEWORD";
 /// wall-clock win (A/B and test tooling).
 pub const ENV_GPU_COMMIT_FORCE: &str = "FLOCK_GPU_COMMIT_FORCE";
 
+/// Env var that forces the fused-leaf graph variant on (1) or off (0). The
+/// benchmark harness env-clears workers (`benchmark-tools/harness`'s
+/// `.env_clear`), so the ranked run always sees the A/B default below; this
+/// override is for local A/B and tooling only.
+pub const ENV_GPU_FUSE_LEAF: &str = "FLOCK_GPU_FUSE_LEAF";
+
+/// Fused-leaf graph variant selection: `None` = the warmup A/Bs both graph
+/// variants (plain final pass + leaf dispatch vs fused final pass + leaf
+/// hashing) and latches the faster bit-exact one; `Some(true/false)` = force
+/// one variant (local A/B only — the ranked harness env-clears workers).
+pub(crate) fn gpu_fuse_leaf_mode() -> Option<bool> {
+    match std::env::var_os(ENV_GPU_FUSE_LEAF) {
+        None => None,
+        Some(v) => Some(v == "1"),
+    }
+}
+
 /// Kill switch for the embedded-metallib library load: `FLOCK_NO_GPU_METALLIB=1`
 /// restores the incumbent runtime MSL source compile as a same-binary control.
 /// The metallib path changes *no* timed work — it only removes the per-process
@@ -1450,6 +1467,122 @@ kernel void leaf_hash(device const uint* codeword [[buffer(0)]],
     for (int i = 0; i < 8; i++) out[id * 8u + i] = cv[i];
 }
 
+// Fused final NTT pass + BLAKE3 leaf hashing (DRAM-bytes family). Wired as a
+// warmup-A/B'd graph variant: `run_commit_graph_from_z(fuse_leaf=true)` when
+// the warmup's bit-exact byte-compare + wall-clock A/B latch it; `None` PSO
+// state (threadgroup-memory limit) degrades to the unfused variant.
+//
+// Ledger: the commit graph reads z once (0.5 GiB), writes the post-layer-3
+// codeword (1.0 GiB), runs four in-place fused passes (8.0 GiB), then
+// leaf_hash re-reads the WHOLE 1 GiB staging that pass (16,4) just wrote
+// (encode_merkle's leaf dispatch). At the final pass l = log_d-4, f = 4,
+// s = 0 each 64-thread threadgroup owns positions pos_base..pos_base+15;
+// with 64 lanes x 16 B per position that is exactly 16 contiguous 1 KiB
+// leaves (leaf id = position) -- the threadgroup's own working set. Fusing
+// removes the 1 GiB re-read with ZERO added ALU (the 16 compressions/leaf
+// already run in leaf_hash) and only a threadgroup-memory stage: bases 60 +
+// tabs 960 + tile 1024 uint4 = 2044 x 16 B = 32,704 B <= the 32 KiB
+// threadgroup limit. Block b of leaf p = uints p*256 + b*16 + i, which in
+// SoA terms is lane b*4 + i/4, uint j = i%4 -- that bijection is verified on
+// x86 by fused_leaf_block_lane_mapping_bijects_leaf_uints. Bit-exactness is
+// gated by the warmup dual-run byte-compare; a mismatch falls back to CPU.
+// MUST only be wired at a pass with P.s == 0 (final fused pass of the ranked
+// geometry, log_d = 20 -> l = 16).
+// ===========================================================================
+kernel void ntt4_fused_leaf(device uint4* data                [[buffer(0)]],
+                            device const uint4* twiddles      [[buffer(1)]],
+                            constant NttParams& P             [[buffer(2)]],
+                            device uint* tree                 [[buffer(3)]],
+                            uint tgid [[threadgroup_position_in_grid]],
+                            uint lid  [[thread_index_in_threadgroup]])
+{
+    constexpr uint F   = 4u;
+    constexpr uint NF  = 1u << F;
+    constexpr uint NTW = NF - 1u;
+    threadgroup uint4 bases[NTW * 4u];
+    threadgroup uint4 tabs[NTW * 64u];
+    threadgroup uint4 tile[NF * 64u];
+
+    const uint lane = lid & 63u;
+    const uint r    = tgid & ((1u << P.s) - 1u);
+    const uint B    = tgid >> P.s;
+    const uint pos_base = (B << (P.log_d - P.l)) + r;
+
+    // Phase 1: base values tw * x^(4k), one entry per thread (<= 60).
+    if (lid < NTW * 4u) {
+        uint t = lid >> 2;
+        uint k = lid & 3u;
+        uint j = 31u - clz(t + 1u);
+        uint c = t + 1u - (1u << j);
+        uint4 p = twiddles[(1u << (P.l + j)) - 1u + (B << j) + c];
+        for (uint m = 0; m < k * 4u; m++) { p = gf_mulx(p); }
+        bases[lid] = p;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint ei = lid; ei < NTW * 64u; ei += 64u) {
+        uint t   = ei >> 6;
+        uint sub = ei & 63u;
+        uint n   = sub & 15u;
+        uint4 p  = bases[(t << 2) | (sub >> 4)];
+        uint4 val = uint4(0u);
+        for (uint k = 0; k < 4u; k++) {
+            if ((n >> k) & 1u) { val ^= p; }
+            p = gf_mulx(p);
+        }
+        tabs[ei] = val;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    uint4 elems[NF];
+    for (uint e = 0; e < NF; e++) {
+        elems[e] = data[((pos_base + (e << P.s)) << 6) + lane];
+    }
+
+    // Butterfly arithmetic copied verbatim from ntt_fused_reg4/from_z (share
+    // the register chain; no per-variant copy of the 21 multiplies).
+    for (uint j = 0; j < F; j++) {
+        uint bpos = F - 1u - j;
+        for (uint b = 0; b < (NF >> 1); b++) {
+            uint low = b & ((1u << bpos) - 1u);
+            uint eu  = ((b >> bpos) << (bpos + 1u)) | low;
+            uint ev  = eu | (1u << bpos);
+            uint tsel = ((1u << j) - 1u) + (eu >> (F - j));
+            uint4 nu = elems[eu] ^ gf_mul_tab4(elems[ev], &tabs[tsel << 6]);
+            elems[eu] = nu;
+            elems[ev] ^= nu;
+        }
+    }
+
+    // Write the transformed codeword back (the CPU open reads it later via
+    // ProverData.codeword's staging deref; parent hashing reads `tree`, not
+    // this buffer -- leaf hashing is the only GPU reader being fused away) and
+    // stage the tile: tile[p*64 + lane] = position p, this lane's 16 bytes.
+    for (uint e = 0; e < NF; e++) {
+        uint4 v = elems[e];
+        tile[e * 64u + lane] = v;
+        data[((pos_base + (e << P.s)) << 6) + lane] = v;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // 16 threads hash one leaf each (leaf at position pos_base + lid); the
+    // BLAKE3 chunk CV chain is sequential within a leaf, so one thread per
+    // leaf is the required shape (same total compressions as leaf_hash).
+    if (lid < 16u) {
+        uint leaf_pos = pos_base + lid;
+        uint cv[8];
+        for (int i = 0; i < 8; i++) cv[i] = B3_IV[i];
+        for (uint b = 0; b < 16u; b++) {
+            uint block[16];
+            for (uint i = 0; i < 16u; i++) {
+                block[i] = tile[lid * 64u + b * 4u + i / 4u][i % 4u];
+            }
+            uint flags = (b == 0u ? B3_CHUNK_START : 0u) | (b == 15u ? B3_CHUNK_END : 0u);
+            b3_compress(cv, block, 64u, flags);
+        }
+        for (int i = 0; i < 8; i++) tree[leaf_pos * 8u + i] = cv[i];
+    }
+}
+
 kernel void parent_hash(device const uint* children [[buffer(0)]],
                         device uint* parents        [[buffer(1)]],
                         uint id [[thread_position_in_grid]])
@@ -1631,6 +1764,11 @@ kernel void parent_hash3(device const uint* children [[buffer(0)]],
         pub(crate) pso_ntt4: Id,
         pub(crate) pso_ntt3: Id,
         pub(crate) pso_ntt4z: Id,
+        /// Fused final-pass + leaf-hash kernel (`ntt4_fused_leaf`); `None`
+        /// when its pipeline state could not be created (e.g. threadgroup-
+        /// memory limit at PSO creation), which degrades the warmup A/B to
+        /// the unfused variant instead of failing the whole GPU path.
+        pub(crate) pso_ntt4leaf: Option<Id>,
         /// Pass-tuned variants: g4 shared-table from-z with the zero-region
         /// sub-layer skipped, and the half-footprint final-pass kernel.
         pub(crate) pso_ntt4zg4: Id,
@@ -1738,40 +1876,93 @@ kernel void parent_hash3(device const uint* children [[buffer(0)]],
                     }
                     Ok(out)
                 };
-                let mut psos: Option<[Id; 11]> = None;
-                let prebuilt = try_embedded_metallib(&api, device);
-                if !prebuilt.is_null() {
-                    if let Ok(p) = build_psos(prebuilt) {
-                        psos = Some(p);
-                    }
-                    send!(api, unsafe extern "C" fn(Id, Sel) -> Id, prebuilt, c"release");
-                }
-                let [pso_ntt, pso_ntt4g4, pso_ntt4, pso_ntt3, pso_ntt4z, pso_ntt4zg4, pso_ntt4h8, pso_ntt5mix, pso_leaf, pso_parent, pso_parent3] =
-                    match psos {
-                        Some(p) => p,
-                        None => {
-                            let src = api.nsstring(MSL_SOURCE)?;
-                            let mut err: Id = NIL;
-                            let library: Id = send!(
-                                api,
-                                unsafe extern "C" fn(Id, Sel, Id, Id, *mut Id) -> Id,
-                                device,
-                                c"newLibraryWithSource:options:error:",
-                                src,
-                                NIL,
-                                &mut err
-                            );
-                            if library.is_null() {
-                                return Err(format!(
-                                    "shader compile failed: {}",
-                                    api.error_string(err)
-                                ));
-                            }
-                            let p = build_psos(library)?;
-                            send!(api, unsafe extern "C" fn(Id, Sel) -> Id, library, c"release");
-                            p
+                // One-pipeline builder for the optional fused kernel.
+                let build_one = |library: Id, name: &str| -> Result<Id, String> {
+                    unsafe {
+                        let ns = api.nsstring(name)?;
+                        let f: Id = send!(
+                            api,
+                            unsafe extern "C" fn(Id, Sel, Id) -> Id,
+                            library,
+                            c"newFunctionWithName:",
+                            ns
+                        );
+                        if f.is_null() {
+                            return Err(format!("kernel {name} not found"));
                         }
-                    };
+                        let mut err: Id = NIL;
+                        let p: Id = send!(
+                            api,
+                            unsafe extern "C" fn(Id, Sel, Id, *mut Id) -> Id,
+                            device,
+                            c"newComputePipelineStateWithFunction:error:",
+                            f,
+                            &mut err
+                        );
+                        send!(api, unsafe extern "C" fn(Id, Sel) -> Id, f, c"release");
+                        if p.is_null() {
+                            return Err(format!("pipeline {name}: {}", api.error_string(err)));
+                        }
+                        Ok(p)
+                    }
+                };
+                // Try the embedded metallib first (no MSL frontend compile).
+                // Accept it only when it contains every kernel the graph can
+                // dispatch, including `ntt4_fused_leaf`; a stale metallib
+                // (predating the fused variant) falls through to the MSL
+                // source compile, the incumbent supported path.
+                let prebuilt = try_embedded_metallib(&api, device);
+                let use_prebuilt = if prebuilt.is_null() {
+                    false
+                } else {
+                    build_psos(prebuilt).is_ok() && build_one(prebuilt, "ntt4_fused_leaf").is_ok()
+                };
+                let library = if use_prebuilt {
+                    prebuilt
+                } else {
+                    let src = api.nsstring(MSL_SOURCE)?;
+                    let mut err: Id = NIL;
+                    let library: Id = send!(
+                        api,
+                        unsafe extern "C" fn(Id, Sel, Id, Id, *mut Id) -> Id,
+                        device,
+                        c"newLibraryWithSource:options:error:",
+                        src,
+                        NIL,
+                        &mut err
+                    );
+                    if library.is_null() {
+                        return Err(format!(
+                            "shader compile failed: {}",
+                            api.error_string(err)
+                        ));
+                    }
+                    library
+                };
+                let [pso_ntt, pso_ntt4g4, pso_ntt4, pso_ntt3, pso_ntt4z, pso_ntt4zg4, pso_ntt4h8, pso_ntt5mix, pso_leaf, pso_parent, pso_parent3] =
+                    build_psos(library)?;
+                // The fused final-pass + leaf-hash kernel is optional: a PSO
+                // creation failure (e.g. threadgroup-memory limit) degrades
+                // the warmup A/B to the unfused variant instead of failing
+                // the whole GPU path.
+                let pso_ntt4leaf = match build_one(library, "ntt4_fused_leaf") {
+                    Ok(p) => Some(p),
+                    Err(e) => {
+                        eprintln!(
+                            "[gpu-commit] fused leaf kernel unavailable ({e}); \
+                             A/B will use the unfused variant"
+                        );
+                        None
+                    }
+                };
+                if use_prebuilt {
+                    send!(api, unsafe extern "C" fn(Id, Sel) -> Id, prebuilt, c"release");
+                } else {
+                    send!(api, unsafe extern "C" fn(Id, Sel) -> Id, library, c"release");
+                    if !prebuilt.is_null() {
+                        send!(api, unsafe extern "C" fn(Id, Sel) -> Id, prebuilt, c"release");
+                    }
+                }
                 Ok(Gpu {
                     api,
                     device,
@@ -1784,6 +1975,7 @@ kernel void parent_hash3(device const uint* children [[buffer(0)]],
                     pso_ntt4zg4,
                     pso_ntt4h8,
                     pso_ntt5mix,
+                    pso_ntt4leaf,
                     pso_leaf,
                     pso_parent,
                     pso_parent3,
@@ -2057,6 +2249,7 @@ kernel void parent_hash3(device const uint* children [[buffer(0)]],
         tw_buf: Id,
         log_d: usize,
         start_layer: usize,
+        stop_before: Option<usize>,
     ) {
         unsafe {
             gpu.set_buffer(enc, data_buf, 0, 0);
@@ -2067,6 +2260,11 @@ kernel void parent_hash3(device const uint* children [[buffer(0)]],
                 2usize
             };
             for (l, f) in super::plan_passes(log_d, start_layer) {
+                // `stop_before`: skip every pass at or above this layer (the
+                // fused-leaf variant replaces the final pass itself).
+                if stop_before.is_some_and(|s| l >= s) {
+                    continue;
+                }
                 // Register-resident specializations for the production pass
                 // widths; the generic staged kernel covers the rest. At
                 // production passes with s >= 2, one 64-thread group builds
@@ -2317,7 +2515,22 @@ kernel void parent_hash3(device const uint* children [[buffer(0)]],
             gpu.set_buffer(enc, tree_buf, 0, 1);
             let tpg = 256u64.min(n_leaves as u64);
             gpu.dispatch(enc, n_leaves as u64 / tpg, tpg);
+        }
+        encode_merkle_parents(gpu, enc, tree_buf, n_leaves, parent3);
+    }
 
+    /// Encode the parent levels of the BLAKE3 tree (leaves already present in
+    /// `tree_buf`): fused three-level dispatches while a whole 256-child
+    /// group fits, then pairwise. Shared by the plain leaf+parents encoder
+    /// and the fused-leaf graph variant (whose kernel writes the leaves).
+    pub(crate) unsafe fn encode_merkle_parents(
+        gpu: &Gpu,
+        enc: Id,
+        tree_buf: Id,
+        n_leaves: usize,
+        parent3: bool,
+    ) {
+        unsafe {
             let mut read_start = 0usize; // node index
             let mut read_len = n_leaves;
 
@@ -2352,6 +2565,46 @@ kernel void parent_hash3(device const uint* children [[buffer(0)]],
                 read_start = write_start;
                 read_len = n_out;
             }
+        }
+    }
+
+
+    /// Encode the fused final NTT pass + BLAKE3 leaf hashing (kernel
+    /// `ntt4_fused_leaf`, 64 threads/group, one group per 16 contiguous
+    /// positions — the ranked final-pass geometry with `s = 0`). Leaves land
+    /// at `tree[leaf*8..leaf*8+8)` exactly like the `leaf_hash` dispatch, so
+    /// `encode_merkle_parents` can follow unchanged.
+    pub(crate) unsafe fn encode_fused_leaf_pass(
+        gpu: &Gpu,
+        enc: Id,
+        data_buf: Id,
+        tw_buf: Id,
+        tree_buf: Id,
+        log_d: usize,
+        l: usize,
+        f: usize,
+    ) {
+        unsafe {
+            gpu.set_pipeline(
+                enc,
+                gpu.pso_ntt4leaf.expect("fused leaf PSO was created"),
+            );
+            gpu.set_buffer(enc, data_buf, 0, 0);
+            gpu.set_buffer(enc, tw_buf, 0, 1);
+            gpu.set_buffer(enc, tree_buf, 0, 3);
+            let s = log_d - l - f;
+            let p = NttParams {
+                log_d: log_d as u32,
+                l: l as u32,
+                f: f as u32,
+                s: s as u32,
+            };
+            let bytes = core::slice::from_raw_parts(
+                (&p as *const NttParams).cast::<u8>(),
+                core::mem::size_of::<NttParams>(),
+            );
+            gpu.set_bytes(enc, bytes, 2);
+            gpu.dispatch(enc, 1u64 << (log_d - f), 64);
         }
     }
 
@@ -2407,7 +2660,7 @@ kernel void parent_hash3(device const uint* children [[buffer(0)]],
                 let run = (|| -> Result<(), String> {
                     let cb = gpu.command_buffer()?;
                     let enc = gpu.compute_encoder(cb)?;
-                    encode_ntt_passes(gpu, enc, data_buf, tw_buf, log_d, start_layer);
+                    encode_ntt_passes(gpu, enc, data_buf, tw_buf, log_d, start_layer, None);
                     gpu.end_encoding(enc);
                     gpu.commit_and_wait(cb)?;
                     std::ptr::copy_nonoverlapping(
@@ -2451,6 +2704,11 @@ kernel void parent_hash3(device const uint* children [[buffer(0)]],
         /// during untimed warmup. The kill-switched incumbent behavior can
         /// still append a wrap when scratch chooses a different address.
         wraps: Vec<(usize, usize, Id)>,
+        /// Graph variant latched by the warmup A/B: `true` runs the fused
+        /// final-pass + leaf-hash dispatch (`ntt4_fused_leaf`), `false` the
+        /// plain final pass + `leaf_hash` re-read. Set only when the chosen
+        /// variant was bit-exact; otherwise the whole GPU path is off.
+        fuse_leaf: bool,
     }
     // SAFETY: Metal objects are thread-safe; access is serialized by LATCH.
     unsafe impl Send for Latched {}
@@ -2887,6 +3145,7 @@ kernel void parent_hash3(device const uint* children [[buffer(0)]],
         tree_buf: Id,
         log_d: usize,
         n_leaves: usize,
+        fuse_leaf: bool,
     ) -> Result<(), String> {
         unsafe {
             let pool = gpu.pool_push();
@@ -2918,9 +3177,25 @@ kernel void parent_hash3(device const uint* children [[buffer(0)]],
                 } else {
                     gpu.dispatch(enc, 1u64 << (log_d - 4), 64);
                 }
-                // Passes 2..: layers 4..log_d in place over staging.
-                encode_ntt_passes(gpu, enc, staging, tw_buf, log_d, 4);
-                encode_merkle(gpu, enc, staging, tree_buf, n_leaves);
+                // Passes 2..: layers 4..log_d in place over staging. The
+                // fused-leaf variant replaces the final pass (l = log_d - 4,
+                // s = 0) with `ntt4_fused_leaf`, which also writes the leaves
+                // into `tree_buf`; parents then run exactly as before.
+                let final_l = log_d - 4;
+                if fuse_leaf && gpu.pso_ntt4leaf.is_some() {
+                    encode_ntt_passes(gpu, enc, staging, tw_buf, log_d, 4, Some(final_l));
+                    encode_fused_leaf_pass(gpu, enc, staging, tw_buf, tree_buf, log_d, final_l, 4);
+                    encode_merkle_parents(
+                        gpu,
+                        enc,
+                        tree_buf,
+                        n_leaves,
+                        super::select_gpu_parent3(n_leaves, super::gpu_parent3_enabled()),
+                    );
+                } else {
+                    encode_ntt_passes(gpu, enc, staging, tw_buf, log_d, 4, None);
+                    encode_merkle(gpu, enc, staging, tree_buf, n_leaves);
+                }
                 gpu.end_encoding(enc);
                 gpu.commit_and_wait(cb)
             })();
@@ -2938,14 +3213,32 @@ kernel void parent_hash3(device const uint* children [[buffer(0)]],
         tree_buf: Id,
         log_d: usize,
         n_leaves: usize,
+        fuse_leaf: bool,
     ) -> Result<(), String> {
         unsafe {
             let pool = gpu.pool_push();
             let r = (|| {
                 let cb = gpu.command_buffer()?;
                 let enc = gpu.compute_encoder(cb)?;
-                encode_ntt_passes(gpu, enc, staging, tw_buf, log_d, 4);
-                encode_merkle(gpu, enc, staging, tree_buf, n_leaves);
+                // Passes 2..: layers 4..log_d in place over staging. The
+                // fused-leaf variant replaces the final pass (l = log_d - 4,
+                // s = 0) with `ntt4_fused_leaf`, which also writes the leaves
+                // into `tree_buf`; parents then run exactly as before.
+                let final_l = log_d - 4;
+                if fuse_leaf && gpu.pso_ntt4leaf.is_some() {
+                    encode_ntt_passes(gpu, enc, staging, tw_buf, log_d, 4, Some(final_l));
+                    encode_fused_leaf_pass(gpu, enc, staging, tw_buf, tree_buf, log_d, final_l, 4);
+                    encode_merkle_parents(
+                        gpu,
+                        enc,
+                        tree_buf,
+                        n_leaves,
+                        super::select_gpu_parent3(n_leaves, super::gpu_parent3_enabled()),
+                    );
+                } else {
+                    encode_ntt_passes(gpu, enc, staging, tw_buf, log_d, 4, None);
+                    encode_merkle(gpu, enc, staging, tree_buf, n_leaves);
+                }
                 gpu.end_encoding(enc);
                 gpu.commit_and_wait(cb)
             })();
@@ -3435,6 +3728,7 @@ kernel void parent_hash3(device const uint* children [[buffer(0)]],
         n_leaves: usize,
         codeword: &[F128],
         cpu_tree: &[Hash],
+        fuse_leaf: bool,
     ) {
         if hybrid_cpu_split_override().is_some()
             || std::env::var_os("FLOCK_NO_HYBRID_AUTOTUNE").is_some()
@@ -3459,6 +3753,7 @@ kernel void parent_hash3(device const uint* children [[buffer(0)]],
             staging: Id,
             tw_buf: Id,
             tree_buf: Id,
+            fuse_leaf: bool,
         }
         // SAFETY: Metal command-buffer creation/commit is thread-safe and
         // the wrapped ids are the process-persistent latched buffers, driven
@@ -3466,13 +3761,14 @@ kernel void parent_hash3(device const uint* children [[buffer(0)]],
         // so the sweep's `rayon::join` arm is `Send`.
         unsafe impl Send for GraphCtx<'_> {}
         unsafe impl Sync for GraphCtx<'_> {}
-        let ctx = GraphCtx { gpu, z_buf, staging, tw_buf, tree_buf };
+        let ctx = GraphCtx { gpu, z_buf, staging, tw_buf, tree_buf, fuse_leaf };
         let run_graph = |k: usize| -> Result<(), String> {
             let c = &ctx;
             unsafe {
                 if k == 0 {
                     run_commit_graph_from_z(
                         c.gpu, c.z_buf, c.staging, c.tw_buf, c.tree_buf, log_d, n_leaves,
+                        c.fuse_leaf,
                     )
                 } else {
                     run_commit_graph_from_z_hybrid(
@@ -3501,7 +3797,7 @@ kernel void parent_hash3(device const uint* children [[buffer(0)]],
             unsafe {
                 if k == 0 {
                     run_commit_graph_after_from_z(
-                        c.gpu, c.staging, c.tw_buf, c.tree_buf, log_d, n_leaves,
+                        c.gpu, c.staging, c.tw_buf, c.tree_buf, log_d, n_leaves, c.fuse_leaf,
                     )
                 } else {
                     run_commit_graph_from_z_hybrid_impl(
@@ -3744,6 +4040,7 @@ kernel void parent_hash3(device const uint* children [[buffer(0)]],
             staging: Id,
             tw_buf: Id,
             tree_buf: Id,
+            fuse_leaf: bool,
         }
         // SAFETY: the latch is held for the full calibration, Metal command
         // submission is thread-safe, and only one graph arm runs at a time.
@@ -3756,6 +4053,7 @@ kernel void parent_hash3(device const uint* children [[buffer(0)]],
             staging: latched.staging,
             tw_buf: latched.tw_buf,
             tree_buf: latched.tree_buf,
+            fuse_leaf: latched.fuse_leaf,
         };
         let timed_graph = |k: usize| -> Result<(), String> {
             let c = &ctx;
@@ -3768,6 +4066,7 @@ kernel void parent_hash3(device const uint* children [[buffer(0)]],
                         c.tree_buf,
                         params.k_code(),
                         params.n_leaves(),
+                        c.fuse_leaf,
                     )
                 } else {
                     run_commit_graph_from_z_hybrid_impl(
@@ -3835,6 +4134,7 @@ kernel void parent_hash3(device const uint* children [[buffer(0)]],
                     ctx.tree_buf,
                     params.k_code(),
                     params.n_leaves(),
+                    ctx.fuse_leaf,
                 )
             } else {
                 run_commit_graph_from_z_hybrid(
@@ -3907,8 +4207,10 @@ kernel void parent_hash3(device const uint* children [[buffer(0)]],
 
     struct WarmupRun {
         latched: Latched,
-        gpu_tree: Vec<Hash>,
-        gpu_wall_ms: f64,
+        gpu_tree_plain: Vec<Hash>,
+        gpu_wall_plain_ms: f64,
+        gpu_tree_fused: Option<Vec<Hash>>,
+        gpu_wall_fused_ms: Option<f64>,
     }
 
     // -----------------------------------------------------------------------
@@ -4063,6 +4365,25 @@ kernel void parent_hash3(device const uint* children [[buffer(0)]],
         }
     }
 
+    /// Warmup A/B between the plain graph and the fused-leaf graph. Returns
+    /// `(best_wall_ms, fuse_leaf)` for the faster bit-exact variant; the
+    /// fused variant must reproduce the CPU reference tree (its leaves hash
+    /// the entire codeword, so tree equality commits to every codeword
+    /// byte).
+    fn fused_ab_choice(run: &WarmupRun, cpu_root: Option<&Hash>) -> (f64, bool) {
+        match (run.gpu_tree_fused.as_ref(), run.gpu_wall_fused_ms) {
+            (Some(ft), Some(fw)) if cpu_root.is_none() || ft.last() == cpu_root => {
+                match super::gpu_fuse_leaf_mode() {
+                    Some(true) => (fw, true),
+                    Some(false) => (run.gpu_wall_plain_ms, false),
+                    None if fw < run.gpu_wall_plain_ms => (fw, true),
+                    None => (run.gpu_wall_plain_ms, false),
+                }
+            }
+            _ => (run.gpu_wall_plain_ms, false),
+        }
+    }
+
     /// GPU half of the warmup dual-run: create the persistent state (twiddle
     /// upload, staging codeword home, tree buffer, read-only z wrap), run
     /// the full from-z graph once untimed (page-wires every buffer exactly
@@ -4101,24 +4422,44 @@ kernel void parent_hash3(device const uint* children [[buffer(0)]],
                     gpu.wrap_buffer(z_packed.as_ptr().cast_mut().cast::<u8>(), z_bytes)?;
                 created.push(z_buf);
 
-                // Untimed wiring run, then the identical timed run.
-                run_commit_graph_from_z(gpu, z_buf, staging, tw_buf, tree_buf, log_d, n_leaves)?;
-                let mut gpu_tree = take_tree(total_nodes);
-                copy_bytes_parallel(gpu.buffer_contents(tree_buf), {
-                    core::slice::from_raw_parts_mut(
-                        gpu_tree.as_mut_ptr().cast::<u8>(),
-                        total_nodes * 32,
-                    )
-                });
-                let t0 = std::time::Instant::now();
-                run_commit_graph_from_z(gpu, z_buf, staging, tw_buf, tree_buf, log_d, n_leaves)?;
-                copy_bytes_parallel(gpu.buffer_contents(tree_buf), {
-                    core::slice::from_raw_parts_mut(
-                        gpu_tree.as_mut_ptr().cast::<u8>(),
-                        total_nodes * 32,
-                    )
-                });
-                let gpu_wall_ms = t0.elapsed().as_secs_f64() * 1e3;
+                // Untimed wiring runs, then the identical timed runs, for
+                // each graph variant the warmup A/B must consider. The
+                // fused-leaf variant is skipped when its PSO could not be
+                // created (threadgroup-memory limit etc.).
+                let run_variant = |fuse_leaf: bool| -> Result<(f64, Vec<Hash>), String> {
+                    unsafe {
+                        run_commit_graph_from_z(
+                            gpu, z_buf, staging, tw_buf, tree_buf, log_d, n_leaves, fuse_leaf,
+                        )?;
+                    }
+                    let mut gpu_tree = take_tree(total_nodes);
+                    copy_bytes_parallel(gpu.buffer_contents(tree_buf), {
+                        core::slice::from_raw_parts_mut(
+                            gpu_tree.as_mut_ptr().cast::<u8>(),
+                            total_nodes * 32,
+                        )
+                    });
+                    let t0 = std::time::Instant::now();
+                    unsafe {
+                        run_commit_graph_from_z(
+                            gpu, z_buf, staging, tw_buf, tree_buf, log_d, n_leaves, fuse_leaf,
+                        )?;
+                    }
+                    copy_bytes_parallel(gpu.buffer_contents(tree_buf), {
+                        core::slice::from_raw_parts_mut(
+                            gpu_tree.as_mut_ptr().cast::<u8>(),
+                            total_nodes * 32,
+                        )
+                    });
+                    let gpu_wall_ms = t0.elapsed().as_secs_f64() * 1e3;
+                    Ok((gpu_wall_ms, gpu_tree))
+                };
+                let (gpu_wall_plain_ms, gpu_tree_plain) = run_variant(false)?;
+                let fused = if gpu.pso_ntt4leaf.is_some() {
+                    Some(run_variant(true)?)
+                } else {
+                    None
+                };
                 created.clear(); // ownership transfers to Latched
                 Ok(WarmupRun {
                     latched: Latched {
@@ -4126,9 +4467,12 @@ kernel void parent_hash3(device const uint* children [[buffer(0)]],
                         tree_buf,
                         staging,
                         wraps: vec![(z_packed.as_ptr() as usize, z_bytes, z_buf)],
+                        fuse_leaf: false, // decided by the A/B in warmup_and_decide
                     },
-                    gpu_tree,
-                    gpu_wall_ms,
+                    gpu_tree_plain,
+                    gpu_wall_plain_ms,
+                    gpu_tree_fused: fused.as_ref().map(|(_, t)| t.clone()),
+                    gpu_wall_fused_ms: fused.as_ref().map(|(w, _)| *w),
                 })
             })(&mut created);
             for id in created {
@@ -4191,13 +4535,20 @@ kernel void parent_hash3(device const uint* children [[buffer(0)]],
                     *latch = LatchState::Off;
                     return (CodewordBuf::Cpu(codeword), MerkleTreeBuf::Cpu(cpu_tree));
                 }
-                if let Ok(run) =
+                if let Ok(mut run) =
                     warmup_gpu_run(z_packed, params.k_code(), params.n_leaves())
                 {
-                    let tree_ok = run.gpu_tree.last() == Some(&cache.cpu_root);
+                    // Warmup A/B: pick the faster bit-exact variant (fused
+                    // must reproduce the cached CPU root).
+                    let (best_wall_ms, fuse_leaf) =
+                        fused_ab_choice(&run, Some(&cache.cpu_root));
+                    let tree_ok = match fuse_leaf {
+                        true => true,
+                        false => run.gpu_tree_plain.last() == Some(&cache.cpu_root),
+                    };
                     let force = std::env::var_os(super::ENV_GPU_COMMIT_FORCE).is_some();
                     let fast =
-                        run.gpu_wall_ms * super::LATCH_MARGIN <= cache.cpu_wall_ms;
+                        best_wall_ms * super::LATCH_MARGIN <= cache.cpu_wall_ms;
                     // Mirror the incumbent latch contract: latching ON also
                     // pins the warmup z allocation to its retained no-copy
                     // Metal view (the promoted z-pin mechanism). On pin
@@ -4209,8 +4560,8 @@ kernel void parent_hash3(device const uint* children [[buffer(0)]],
                         if dbg {
                             eprintln!(
                                 "[gpu-commit] warmup cache: gpu {:.2} ms vs cached cpu \
-                                 {:.2} ms, tree-exact -> latched ON (k={})",
-                                run.gpu_wall_ms, cache.cpu_wall_ms, cache.tuned_k
+                                 {:.2} ms, tree-exact -> latched ON (k={}, fuse_leaf={})",
+                                best_wall_ms, cache.cpu_wall_ms, cache.tuned_k, fuse_leaf
                             );
                         }
                         TUNED_HYBRID_K
@@ -4233,7 +4584,14 @@ kernel void parent_hash3(device const uint* children [[buffer(0)]],
                                 ),
                             );
                         }
-                        let tree = run.gpu_tree;
+                        let tree = match fuse_leaf {
+                            true => run
+                                .gpu_tree_fused
+                                .take()
+                                .expect("fused tree present after A/B choice"),
+                            false => run.gpu_tree_plain,
+                        };
+                        run.latched.fuse_leaf = fuse_leaf;
                         *latch = LatchState::On(run.latched);
                         return (CodewordBuf::Cpu(codeword), MerkleTreeBuf::Cpu(tree));
                     }
@@ -4243,11 +4601,14 @@ kernel void parent_hash3(device const uint* children [[buffer(0)]],
                         eprintln!(
                             "[gpu-commit] warmup cache: rejected (tree_ok={tree_ok}, \
                              gpu {:.2} ms vs cached cpu {:.2} ms); full dual-run",
-                            run.gpu_wall_ms, cache.cpu_wall_ms
+                            best_wall_ms, cache.cpu_wall_ms
                         );
                     }
                     let gpu = gpu().expect("gpu() succeeded during warmup_gpu_run");
-                    give_tree(run.gpu_tree);
+                    give_tree(run.gpu_tree_plain);
+                    if let Some(t) = run.gpu_tree_fused {
+                        give_tree(t);
+                    }
                     release_latched(gpu, run.latched);
                 }
             }
@@ -4265,7 +4626,7 @@ kernel void parent_hash3(device const uint* children [[buffer(0)]],
 
         let outcome = warmup_gpu_run(z_packed, params.k_code(), params.n_leaves());
 
-        let run = match outcome {
+        let mut run = match outcome {
             Ok(run) => run,
             Err(e) => {
                 if dbg {
@@ -4298,7 +4659,15 @@ kernel void parent_hash3(device const uint* children [[buffer(0)]],
                 ),
             )
         };
-        let tree_ok = run.gpu_tree == cpu_tree;
+        // Warmup A/B: pick the faster bit-exact variant. `codeword_ok`
+        // above compares the staging buffer (it holds whichever variant ran
+        // last), and the fused variant's tree commits to every codeword byte
+        // via its leaf hashes, so the chosen variant is fully pinned.
+        let (best_wall_ms, fuse_leaf) = fused_ab_choice(&run, cpu_tree.last());
+        let tree_ok = match fuse_leaf {
+            true => true,
+            false => run.gpu_tree_plain == cpu_tree,
+        };
         let exact = codeword_ok && tree_ok;
         if !exact {
             eprintln!(
@@ -4308,7 +4677,7 @@ kernel void parent_hash3(device const uint* children [[buffer(0)]],
         }
 
         let force = std::env::var_os(super::ENV_GPU_COMMIT_FORCE).is_some();
-        let fast = run.gpu_wall_ms * super::LATCH_MARGIN <= cpu_wall_ms;
+        let fast = best_wall_ms * super::LATCH_MARGIN <= cpu_wall_ms;
         let would_latch_on = exact && (fast || force);
         // `scratch::prewarm_prover` deliberately parks six equal 512 MiB
         // allocations at the ranked shape. Smallest-fit + swap-remove,
@@ -4328,17 +4697,22 @@ kernel void parent_hash3(device const uint* children [[buffer(0)]],
         }
         if dbg {
             eprintln!(
-                "[gpu-commit] warmup: gpu {:.2} ms vs cpu {:.2} ms, bit-exact={exact}, \
-                 force={force} -> latched {}",
-                run.gpu_wall_ms,
+                "[gpu-commit] warmup: gpu plain {:.2} ms vs fused {:.2} ms vs cpu {:.2} ms, \
+                 bit-exact={exact}, force={force} -> latched {}, fuse_leaf={fuse_leaf}",
+                run.gpu_wall_plain_ms,
+                run.gpu_wall_fused_ms.unwrap_or(f64::NAN),
                 cpu_wall_ms,
                 if on { "ON" } else { "OFF" }
             );
         }
-        give_tree(run.gpu_tree);
+        give_tree(run.gpu_tree_plain);
+        if let Some(t) = run.gpu_tree_fused {
+            give_tree(t);
+        }
         if on {
             // Still inside the untimed warmup prove: sweep the hybrid split
             // on this host before the first timed prove can consume it.
+            run.latched.fuse_leaf = fuse_leaf;
             autotune_hybrid_split(
                 gpu,
                 &run.latched,
@@ -4346,6 +4720,7 @@ kernel void parent_hash3(device const uint* children [[buffer(0)]],
                 params.n_leaves(),
                 &codeword,
                 &cpu_tree,
+                fuse_leaf,
             );
             *latch = LatchState::On(run.latched);
         } else {
@@ -4418,7 +4793,7 @@ kernel void parent_hash3(device const uint* children [[buffer(0)]],
         // Resolve the read-only z wrap (normally cached from the warmup).
         let z_ptr = z_packed.as_ptr() as usize;
         let z_bytes = core::mem::size_of_val(z_packed);
-        let (tw_buf, tree_buf, staging, z_buf) = {
+        let (tw_buf, tree_buf, staging, z_buf, fuse_leaf) = {
             let LatchState::On(state) = &mut *latch else {
                 unreachable!("run_latched requires LatchState::On")
             };
@@ -4448,7 +4823,13 @@ kernel void parent_hash3(device const uint* children [[buffer(0)]],
                     }
                 },
             };
-            (state.tw_buf, state.tree_buf, state.staging, z_buf)
+            (
+                state.tw_buf,
+                state.tree_buf,
+                state.staging,
+                z_buf,
+                state.fuse_leaf,
+            )
         };
 
         let t0 = std::time::Instant::now();
@@ -4459,7 +4840,9 @@ kernel void parent_hash3(device const uint* children [[buffer(0)]],
                     gpu, z_buf, staging, tw_buf, tree_buf, log_d, n_leaves, k_cpu16,
                 )
             } else {
-                run_commit_graph_from_z(gpu, z_buf, staging, tw_buf, tree_buf, log_d, n_leaves)
+                run_commit_graph_from_z(
+                    gpu, z_buf, staging, tw_buf, tree_buf, log_d, n_leaves, fuse_leaf
+                )
             }
         };
         if let Err(e) = run {
@@ -4537,7 +4920,7 @@ kernel void parent_hash3(device const uint* children [[buffer(0)]],
                 unsafe { stream.gpu.release(cb2) };
             }
         };
-        let run = if let Err(e) = first_pass {
+        let mut run = if let Err(e) = first_pass {
             drain_early(early);
             Err(e)
         } else if !state_matches
@@ -4549,6 +4932,10 @@ kernel void parent_hash3(device const uint* children [[buffer(0)]],
             Err("streamed GPU latch or z allocation changed before finish".into())
         } else {
             let k_cpu16 = hybrid_cpu_sixteenths();
+            let fuse_leaf = match &*latch {
+                LatchState::On(state) => state.fuse_leaf,
+                _ => false,
+            };
             unsafe {
                 match early {
                     Some((cb2, k_early)) if k_early == k_cpu16 => {
@@ -4604,6 +4991,7 @@ kernel void parent_hash3(device const uint* children [[buffer(0)]],
                                     stream.tree_buf,
                                     stream.log_d,
                                     stream.n_leaves,
+                                    fuse_leaf,
                                 )
                             }
                         })
@@ -4630,6 +5018,7 @@ kernel void parent_hash3(device const uint* children [[buffer(0)]],
                                 stream.tree_buf,
                                 stream.log_d,
                                 stream.n_leaves,
+                                fuse_leaf,
                             )
                         }
                     }
@@ -5725,5 +6114,285 @@ mod tests {
             }
         }
         assert_eq!(plan_passes(20, 1), vec![(1, 4), (5, 4), (9, 4), (13, 4), (17, 3)]);
+    }
+
+    const B3_IV: [u32; 8] = [
+        0x6A09E667, 0xBB67AE85, 0x3C6EF372, 0xA54FF53A, 0x510E527F, 0x9B05688C,
+        0x1F83D9AB, 0x5BE0CD19,
+    ];
+    const B3_PERM: [usize; 16] = [2, 6, 3, 10, 7, 0, 4, 13, 1, 11, 12, 5, 9, 14, 15, 8];
+    const B3_CHUNK_START: u32 = 1;
+    const B3_CHUNK_END: u32 = 2;
+
+    fn fused_leaf_block_lane_mapping_bijects_leaf_uints() {
+        // Final-pass fusion (l = log_d - 4, f = 4, s = 0): a threadgroup owns
+        // positions pos_base..pos_base + 15, i.e. 16 contiguous BLAKE3 leaves
+        // (leaf id = position; 1 KiB = 256 uints = 64 lanes x 4 uints).
+        // leaf_hash reads leaf uints linearly: leaf[b * 16 + i]. The fused
+        // kernel must assemble block b of leaf p as uints p*256 + b*16 + i,
+        // which in the SoA layout is lane b*4 + i/4, uint j = i%4. Prove the
+        // two indexes coincide and cover the leaf exactly (bijection).
+        for p in 0..16u32 {
+            let mut seen = [false; 256];
+            for b in 0..16u32 {
+                for i in 0..16u32 {
+                    let lane = b * 4 + i / 4;
+                    let j = i % 4;
+                    assert!(lane < 64);
+                    let flat = p * 256 + lane * 4 + j; // SoA leaf index
+                    let linear = p * 256 + b * 16 + i; // leaf_hash index
+                    assert_eq!(flat, linear, "SoA fetch must equal leaf_hash linear read");
+                    seen[(b * 16 + i) as usize] = true;
+                }
+            }
+            assert!(seen.iter().all(|&s| s), "leaf {p} not fully covered");
+        }
+    }
+
+    fn xor4(a: [u32; 4], b: [u32; 4]) -> [u32; 4] {
+        [a[0] ^ b[0], a[1] ^ b[1], a[2] ^ b[2], a[3] ^ b[3]]
+    }
+
+    fn f128_limbs(f: F128) -> [u32; 4] {
+        [f.lo as u32, (f.lo >> 32) as u32, f.hi as u32, (f.hi >> 32) as u32]
+    }
+
+    fn limbs_f128(w: [u32; 4]) -> F128 {
+        F128 { lo: (w[1] as u64) << 32 | w[0] as u64, hi: (w[3] as u64) << 32 | w[2] as u64 }
+    }
+
+    fn gf_mulx(v: [u32; 4]) -> [u32; 4] {
+        let carry = v[3] >> 31;
+        [
+            (v[0] << 1) ^ (carry * 0x87u32),
+            (v[1] << 1) | (v[0] >> 31),
+            (v[2] << 1) | (v[1] >> 31),
+            (v[3] << 1) | (v[2] >> 31),
+        ]
+    }
+
+    fn gf_shl16(a: [u32; 4]) -> [u32; 4] {
+        let h = a[3] >> 16;
+        [
+            (a[0] << 16) ^ ((h << 7) ^ (h << 2) ^ (h << 1) ^ h),
+            (a[1] << 16) | (a[0] >> 16),
+            (a[2] << 16) | (a[1] >> 16),
+            (a[3] << 16) | (a[2] >> 16),
+        ]
+    }
+
+    fn gf_mul_tab4(v: [u32; 4], tab: &[[u32; 4]]) -> [u32; 4] {
+        let mut acc = [0u32; 4];
+        for i in (0..8).rev() {
+            acc = gf_shl16(acc);
+            let h = (v[i >> 1] >> ((i & 1) * 16)) & 0xffff;
+            acc = xor4(acc, tab[(h & 15) as usize]);
+            acc = xor4(acc, tab[16 + ((h >> 4) & 15) as usize]);
+            acc = xor4(acc, tab[32 + ((h >> 8) & 15) as usize]);
+            acc = xor4(acc, tab[48 + (h >> 12) as usize]);
+        }
+        acc
+    }
+
+    fn b3_compress(cv: &mut [u32; 8], m_in: &[u32; 16], block_len: u32, flags: u32) {
+        let mut v = [0u32; 16];
+        let mut m = [0u32; 16];
+        for i in 0..8 {
+            v[i] = cv[i];
+        }
+        for i in 0..4 {
+            v[8 + i] = B3_IV[i];
+        }
+        v[12] = 0;
+        v[13] = 0;
+        v[14] = block_len;
+        v[15] = flags;
+        for i in 0..16 {
+            m[i] = m_in[i];
+        }
+        for r in 0..7 {
+            // G(a,b,c,d,x,y): v[a]+=v[b]+x; v[d]=rotr32(v[d]^v[a],16); ...
+            macro_rules! g {
+                ($a:expr, $b:expr, $c:expr, $d:expr, $x:expr, $y:expr) => {
+                    v[$a] = v[$a].wrapping_add(v[$b]).wrapping_add(m[$x]);
+                    v[$d] = (v[$d] ^ v[$a]).rotate_right(16);
+                    v[$c] = v[$c].wrapping_add(v[$d]);
+                    v[$b] = (v[$b] ^ v[$c]).rotate_right(12);
+                    v[$a] = v[$a].wrapping_add(v[$b]).wrapping_add(m[$y]);
+                    v[$d] = (v[$d] ^ v[$a]).rotate_right(8);
+                    v[$c] = v[$c].wrapping_add(v[$d]);
+                    v[$b] = (v[$b] ^ v[$c]).rotate_right(7);
+                };
+            }
+            g!(0, 4, 8, 12, 0, 1);
+            g!(1, 5, 9, 13, 2, 3);
+            g!(2, 6, 10, 14, 4, 5);
+            g!(3, 7, 11, 15, 6, 7);
+            g!(0, 5, 10, 15, 8, 9);
+            g!(1, 6, 11, 12, 10, 11);
+            g!(2, 7, 8, 13, 12, 13);
+            g!(3, 4, 9, 14, 14, 15);
+            if r < 6 {
+                let t = m;
+                for i in 0..16 {
+                    m[i] = t[B3_PERM[i]];
+                }
+            }
+        }
+        for i in 0..8 {
+            cv[i] = v[i] ^ v[8 + i];
+        }
+    }
+
+    fn sim_fused_leaf_pass(
+        data: &mut [F128],
+        twiddles: &[F128],
+        log_d: usize,
+        l: usize,
+    ) -> Vec<crate::merkle::Hash> {
+        let f = 4usize;
+        let nf = 16usize;
+        let ntw = 15usize;
+        let n_leaves = 1usize << log_d;
+        let n_tg = 1usize << (log_d - f);
+        let mut tree = vec![[0u8; 32]; n_leaves];
+        for tg in 0..n_tg {
+            // s = 0: B = tgid >> 0 = tg, r = 0 -> pos_base = B << (log_d - l).
+            let pos_base = tg << (log_d - l);
+            // Phase 1: bases[lid] = tw * x^(4k), lid = 4t + k.
+            let mut bases = vec![[0u32; 4]; ntw * 4];
+            for lid in 0..ntw * 4 {
+                let t = lid >> 2;
+                let k = lid & 3;
+                let j = 31 - ((t + 1) as u32).leading_zeros() as usize; // 31 - clz(t+1)
+                let c = t + 1 - (1 << j);
+                let mut p = f128_limbs(twiddles[(1usize << (l + j)) - 1 + (tg << j) + c]);
+                for _ in 0..k * 4 {
+                    p = gf_mulx(p);
+                }
+                bases[lid] = p;
+            }
+            // Phase 2: tabs[ei] = nibble multiples of the bases.
+            let mut tabs = vec![[0u32; 4]; ntw * 64];
+            for ei in 0..ntw * 64 {
+                let t = ei >> 6;
+                let sub = ei & 63;
+                let n = sub & 15;
+                let mut p = bases[(t << 2) | (sub >> 4)];
+                let mut val = [0u32; 4];
+                for k in 0..4 {
+                    if (n >> k) & 1 != 0 {
+                        val = xor4(val, p);
+                    }
+                    p = gf_mulx(p);
+                }
+                tabs[ei] = val;
+            }
+            // Per-lane register butterfly + tile staging + write-back.
+            let mut tile = vec![[0u32; 4]; nf * 64];
+            for lane in 0..64usize {
+                let mut elems = [[0u32; 4]; 16];
+                for e in 0..nf {
+                    elems[e] = f128_limbs(data[(pos_base + e) * 64 + lane]);
+                }
+                for j in 0..f {
+                    let bpos = f - 1 - j;
+                    for b in 0..(nf >> 1) {
+                        let low = b & ((1 << bpos) - 1);
+                        let eu = ((b >> bpos) << (bpos + 1)) | low;
+                        let ev = eu | (1 << bpos);
+                        let tsel = ((1 << j) - 1) + (eu >> (f - j));
+                        let nu = xor4(elems[eu], gf_mul_tab4(elems[ev], &tabs[tsel << 6..]));
+                        elems[eu] = nu;
+                        elems[ev] = xor4(elems[ev], nu);
+                    }
+                }
+                for e in 0..nf {
+                    tile[e * 64 + lane] = elems[e];
+                    data[(pos_base + e) * 64 + lane] = limbs_f128(elems[e]);
+                }
+            }
+            // Leaf phase: 16 threads, one leaf each, block b of leaf lid
+            // assembled as tile[lid*64 + b*4 + i/4][i%4] (the pinned
+            // bijection), BLAKE3 chunk CV -> tree[leaf_pos*8 + i].
+            for lid in 0..16usize {
+                let leaf_pos = pos_base + lid;
+                let mut cv = B3_IV;
+                for b in 0..16usize {
+                    let mut block = [0u32; 16];
+                    for i in 0..16 {
+                        block[i] = tile[lid * 64 + b * 4 + i / 4][i % 4];
+                    }
+                    let flags = (if b == 0 { B3_CHUNK_START } else { 0 })
+                        | (if b == 15 { B3_CHUNK_END } else { 0 });
+                    b3_compress(&mut cv, &block, 64, flags);
+                }
+                for i in 0..8 {
+                    tree[leaf_pos][i * 4..i * 4 + 4].copy_from_slice(&cv[i].to_le_bytes());
+                }
+            }
+        }
+        tree
+    }
+
+    fn fused_leaf_pass_and_tree_match_cpu_reference() {
+        let log_d = 8usize;
+        let l = log_d - 4; // final pass: l = log_d - f, s = 0
+        let n_leaves = 1usize << log_d;
+        let ntt = AdditiveNttF128::standard(log_d);
+        let twiddles = super::flat_twiddle_table(&ntt, log_d);
+
+        let mut rng = Rng::new(0xF051F);
+        let mut data = rng.vec(64 << log_d); // post-layer-l state, random
+
+        // CPU reference: scalar NTT layers l..log_d, then the real blake3
+        // tree on the resulting 1 KiB leaves.
+        let mut expect_data = data.clone();
+        ntt.forward_transform_interleaved_scalar_from_layer(&mut expect_data, 64, l);
+        let expect_bytes: Vec<u8> = expect_data
+            .iter()
+            .flat_map(|f| f.lo.to_le_bytes().into_iter().chain(f.hi.to_le_bytes()))
+            .collect();
+        let expect_tree =
+            crate::merkle::merkle_tree(&expect_bytes, n_leaves, crate::merkle::HashKind::Blake3);
+
+        // Fused kernel transcription.
+        let mut sim_data = data.clone();
+        let fused_leaves = sim_fused_leaf_pass(&mut sim_data, &twiddles, log_d, l);
+
+        // (a) Codeword bit-exactness after the fused butterfly.
+        assert_eq!(sim_data, expect_data, "fused butterfly != scalar NTT layers");
+
+        // (b) Full tree bit-exactness: fused leaves + CPU parents.
+        let mut flat = fused_leaves.clone();
+        let mut level = fused_leaves;
+        while level.len() > 1 {
+            let mut next = Vec::with_capacity(level.len() / 2);
+            for pair in level.chunks(2) {
+                next.push(crate::merkle::hash_pair(
+                    &pair[0],
+                    &pair[1],
+                    crate::merkle::HashKind::Blake3,
+                ));
+            }
+            flat.extend_from_slice(&next);
+            level = next;
+        }
+        assert_eq!(flat, expect_tree, "fused tree != CPU reference tree");
+    }
+
+    fn fused_leaf_geometry_requires_s_zero() {
+        let log_d = 20usize;
+        let f = 4usize;
+        // Final pass: l = log_d - f -> s = 0 -> coverage is exact.
+        let l = log_d - f;
+        let s = log_d - l - f;
+        assert_eq!(s, 0);
+        let span_per_tg = (16usize << s) * 1024; // 16 positions x 1 KiB
+        let total = (1usize << (log_d - f)) * span_per_tg;
+        assert_eq!(total, 1usize << 30, "s = 0 grid covers the 1 GiB staging exactly");
+        // Hypothetical s = 1 would overshoot by 2x.
+        let s1_total = (1usize << (log_d - f)) * (16usize << 1) * 1024;
+        assert_eq!(s1_total, 1usize << 31, "s = 1 grid covers 2 GiB > 1 GiB staging");
     }
 }
