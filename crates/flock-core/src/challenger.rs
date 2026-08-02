@@ -698,22 +698,8 @@ fn cpu_blake3_pow_window_inner(
     };
     match crate::epool::epool().filter(|_| main_threads > 1 && n_chunks >= 16) {
         Some(ep) => std::thread::scope(|scope| {
-            let epool_job = scope.spawn(|| ep.broadcast(|_| worker()));
+            scope.spawn(|| ep.broadcast(|_| worker()));
             drain_main();
-            // Thread-join wake-tail, grind site (inner): the main-pool share
-            // of this window runs on P-cores and typically finishes before
-            // the E-core broadcast, so the implicit scope-end join parks this
-            // thread and pays the E-core completion wake tail. First-check +
-            // bounded yield (same pattern as the outer GPU-scan join and the
-            // promoted ranked lincheck stripe join) before the scope-end
-            // wait; degrade to the exact incumbent blocking join.
-            if !epool_job.is_finished() && grind_join_spin_enabled() {
-                let spin_deadline =
-                    std::time::Instant::now() + std::time::Duration::from_millis(2);
-                while !epool_job.is_finished() && std::time::Instant::now() < spin_deadline {
-                    std::thread::yield_now();
-                }
-            }
         }),
         None => drain_main(),
     }
@@ -778,6 +764,104 @@ fn gpu_grind_calibration(state_digest: &[u8; 32]) -> Result<Vec<Option<u64>>, St
 /// block was exhausted empty, so its nonce is the global minimum; if the GPU
 /// block is empty and the CPU window hit, the same argument gives the CPU
 /// minimum.  Byte-identical to the sequential search either way.
+/// Persistent single-thread GPU-dispatch worker for the hybrid grind.
+///
+/// The grind sits on the transcript's serial spine; the incumbent hybrid path
+/// `thread::scope`-spawns one OS thread per iteration (~11 per ranked prove)
+/// and that spawn latency delays the GPU launch on the spine. A reused thread
+/// (one per process, woken by an mpsc channel) removes the spawn cost and
+/// starts the dispatch slightly earlier (a channel send is cheaper than a
+/// spawn). Semantics are identical to the spawned path: one `pow_scan` per
+/// job, the abort flag set on hit when enabled, the result delivered on the
+/// job's own channel. `FLOCK_NO_GRIND_WORKER=1` (or any worker setup failure)
+/// falls back to the exact incumbent scope-spawn path; a worker failure
+/// mid-job degrades to the same `Err` the spawned path would propagate (CPU
+/// grind fallback upstream). No GPU work is added or removed — only the
+/// thread-creation latency is.
+mod grind_worker {
+    use std::sync::atomic::AtomicBool;
+    use std::sync::mpsc::{channel, Receiver, Sender};
+    use std::sync::{Arc, OnceLock};
+
+    struct Job {
+        digest: [u8; 32],
+        start: u64,
+        len: u32,
+        bits: u32,
+        stop: Arc<AtomicBool>,
+        abort: bool,
+        done: Sender<Result<Option<u64>, String>>,
+    }
+
+    struct Worker {
+        tx: Sender<Job>,
+        _thread: std::thread::JoinHandle<()>,
+    }
+
+    fn worker() -> Option<&'static Worker> {
+        static W: OnceLock<Option<Worker>> = OnceLock::new();
+        if std::env::var_os("FLOCK_NO_GRIND_WORKER").is_some() {
+            return None;
+        }
+        W.get_or_init(|| {
+            let (tx, rx): (Sender<Job>, Receiver<Job>) = channel();
+            std::thread::Builder::new()
+                .name("flock-grind-dispatch".into())
+                .spawn(move || {
+                    while let Ok(job) = rx.recv() {
+                        let res = crate::gpu_commit::gpu_blake3_pow_scan(
+                            &job.digest,
+                            job.start,
+                            job.len,
+                            job.bits,
+                        );
+                        if job.abort && matches!(&res, Ok(Some(_))) {
+                            job.stop
+                                .store(true, std::sync::atomic::Ordering::Release);
+                        }
+                        let _ = job.done.send(res);
+                    }
+                })
+                .ok()
+                .map(|thread| Worker { tx, _thread: thread })
+        })
+        .as_ref()
+    }
+
+    /// Dispatch one GPU grind scan through the persistent worker. Returns
+    /// `None` when the worker is unavailable (kill switch or setup failure)
+    /// and the caller must run the incumbent scope-spawn path; `Some(result)`
+    /// is the scan outcome with the same `Err` surface as a direct
+    /// `gpu_blake3_pow_scan` call.
+    pub(super) fn dispatch(
+        state_digest: &[u8; 32],
+        start: u64,
+        len: u32,
+        bits: u32,
+        stop: Arc<AtomicBool>,
+        abort: bool,
+    ) -> Option<Result<Option<u64>, String>> {
+        let w = worker()?;
+        let (done_tx, done_rx) = channel();
+        let job = Job {
+            digest: *state_digest,
+            start,
+            len,
+            bits,
+            stop,
+            abort,
+            done: done_tx,
+        };
+        if w.tx.send(job).is_err() {
+            return Some(Err("GPU grind worker channel closed".to_string()));
+        }
+        match done_rx.recv() {
+            Ok(res) => Some(res),
+            Err(_) => Some(Err("GPU grind worker channel closed".to_string())),
+        }
+    }
+}
+
 fn gpu_blake3_pow_nonce(state_digest: &[u8; 32], bits: u32) -> Result<u64, String> {
     debug_assert!((GPU_GRIND_MIN_BITS..=32).contains(&bits));
     let block_len = 1u32 << bits.min(24);
@@ -804,45 +888,55 @@ fn gpu_blake3_pow_nonce(state_digest: &[u8; 32], bits: u32) -> Result<u64, Strin
         // is already dead. On a GPU miss the flag is never set and the window
         // drains fully — byte-identical to the unflagged search either way
         // (`FLOCK_NO_GRIND_HYBRID_ABORT` restores the unconditional drain).
-        let stop = std::sync::atomic::AtomicBool::new(false);
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let abort = grind_hybrid_abort_enabled();
-        let (gpu_result, cpu_next) = std::thread::scope(|s| {
-            let gpu_scan = s.spawn(|| {
-                let gpu =
-                    crate::gpu_commit::gpu_blake3_pow_scan(state_digest, start, block_len, bits);
-                if abort && matches!(&gpu, Ok(Some(_))) {
-                    stop.store(true, std::sync::atomic::Ordering::Release);
-                }
-                gpu
-            });
-            let cpu = cpu_blake3_pow_window_inner(
+        // Persistent dispatch worker when available; the incumbent
+        // scope-spawn path otherwise (see `grind_worker`).
+        let (gpu_result, cpu_next) =
+            match grind_worker::dispatch(
                 state_digest,
-                next_start,
+                start,
                 block_len,
                 bits,
-                abort.then_some(&stop),
-            );
-            // Thread-join wake-tail, grind site (outer): the CPU prefetch
-            // window and the GPU scan race; the second finisher pays the
-            // scoped-thread join's park + completion-wake tail -- the same
-            // wait class the ranked lincheck stripe join first-check cut
-            // (b6e12dab, promoted). Poll `is_finished` first (zero cost when
-            // the GPU arm has already landed), then yield for a bounded
-            // budget before degrading to the exact incumbent blocking join.
-            // Byte-identical either way: the join consumes the same
-            // completed thread.
-            if !gpu_scan.is_finished() && grind_join_spin_enabled() {
-                let spin_deadline =
-                    std::time::Instant::now() + std::time::Duration::from_millis(2);
-                while !gpu_scan.is_finished() && std::time::Instant::now() < spin_deadline {
-                    std::thread::yield_now();
+                std::sync::Arc::clone(&stop),
+                abort,
+            ) {
+                Some(gpu) => {
+                    let cpu = cpu_blake3_pow_window_inner(
+                        state_digest,
+                        next_start,
+                        block_len,
+                        bits,
+                        abort.then_some(stop.as_ref()),
+                    );
+                    (gpu, cpu)
                 }
-            }
-            let gpu = gpu_scan
-                .join()
-                .unwrap_or_else(|_| Err("GPU grind scan thread panicked".to_string()));
-            (gpu, cpu)
-        });
+                None => std::thread::scope(|s| {
+                    let gpu_scan = s.spawn(|| {
+                        let gpu = crate::gpu_commit::gpu_blake3_pow_scan(
+                            state_digest,
+                            start,
+                            block_len,
+                            bits,
+                        );
+                        if abort && matches!(&gpu, Ok(Some(_))) {
+                            stop.store(true, std::sync::atomic::Ordering::Release);
+                        }
+                        gpu
+                    });
+                    let cpu = cpu_blake3_pow_window_inner(
+                        state_digest,
+                        next_start,
+                        block_len,
+                        bits,
+                        abort.then_some(stop.as_ref()),
+                    );
+                    let gpu = gpu_scan
+                        .join()
+                        .unwrap_or_else(|_| Err("GPU grind scan thread panicked".to_string()));
+                    (gpu, cpu)
+                }),
+            };
         if let Some(nonce) = gpu_result? {
             return Ok(nonce);
         }
@@ -868,14 +962,6 @@ fn grind_hybrid_enabled() -> bool {
 fn grind_hybrid_abort_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("FLOCK_NO_GRIND_HYBRID_ABORT").is_none())
-}
-
-/// `FLOCK_NO_GRIND_JOIN_SPIN` restores the exact incumbent blocking
-/// scoped-thread joins in the hybrid grind (no first-check yield), a
-/// runner-side rollback lever for the two join wake-tail cuts.
-fn grind_join_spin_enabled() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("FLOCK_NO_GRIND_JOIN_SPIN").is_none())
 }
 
 // ---------------------------------------------------------------------------
