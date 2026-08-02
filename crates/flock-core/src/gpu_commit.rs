@@ -3394,16 +3394,18 @@ kernel void parent_hash3(device const uint* children [[buffer(0)]],
                 std::hint::black_box(x);
             });
         };
-        // Wall-safe streamed-regime correction: the per-candidate staging
-        // re-prime form runs the from-z first pass 8+ extra times per
-        // warm-up; multiplied by the harness's ~120 fresh worker processes
-        // that spends minutes of JOB wall against the ranked CI's 8-minute
-        // budget (three above-bar submissions died to it as "failed"
-        // timeouts before the mechanism was identified). The first pass is
-        // k-INDEPENDENT, so measuring its wall once and subtracting the
-        // constant from each candidate's full-graph wall yields the same
-        // corrected ranking at one extra pass total.
-        let first_pass_ms = if streamed_probe {
+        // The V2 cross-process warmup cache makes the original, protected-
+        // positive streamed tuner affordable again: only the first worker
+        // calibrates, while the remaining workers restore its verified k.
+        // Re-prime canonical post-layer-3 staging before EVERY candidate,
+        // outside the timer, then measure exactly the graph used by the
+        // scored streamed proof. The former wall-safe approximation primed
+        // once, repeatedly transformed stale staging, and subtracted a
+        // first-pass wall from an interval that did not contain that pass.
+        // Keep an exact same-binary rollback for paired measurements.
+        let canonical_reprime = streamed_probe
+            && std::env::var_os("FLOCK_NO_HYBRID_TUNE_CANONICAL_REPRIME").is_none();
+        let first_pass_ms = if streamed_probe && !canonical_reprime {
             let c = &ctx;
             let t0 = std::time::Instant::now();
             match unsafe { run_from_z_first_pass(c.gpu, c.z_buf, c.staging, c.tw_buf, log_d) } {
@@ -3421,6 +3423,12 @@ kernel void parent_hash3(device const uint* children [[buffer(0)]],
             0.0
         };
         let contended_run = |k: usize| -> Result<f64, String> {
+            if canonical_reprime {
+                let c = &ctx;
+                unsafe {
+                    run_from_z_first_pass(c.gpu, c.z_buf, c.staging, c.tw_buf, log_d)?;
+                }
+            }
             let t0 = std::time::Instant::now();
             let (r, ()) = rayon::join(|| timed_graph(k), burn_work);
             r?;
