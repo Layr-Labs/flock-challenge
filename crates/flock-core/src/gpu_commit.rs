@@ -141,6 +141,14 @@ mod z_pin_gate_tests {
     }
 }
 
+/// Disable packing the proven short twiddles used by ranked layers 18/19.
+/// The incumbent mixed kernel remains the same-binary fallback.
+pub const ENV_NO_GPU_PACKED_SHORT: &str = "FLOCK_NO_GPU_PACKED_SHORT";
+
+/// Disable the direct-schedule BLAKE3 GPU kernels and restore the incumbent
+/// runtime message-permutation kernels for a same-binary comparison.
+pub const ENV_NO_GPU_B3_DIRECT: &str = "FLOCK_NO_GPU_B3_DIRECT";
+
 /// Latched once: pass tuning enabled unless the kill switch is set.
 pub(crate) fn pass_tune_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -157,6 +165,23 @@ mod mixed_final_gate_tests {
         assert!(!super::select_gpu_mixed_final(20, 12, 4, true, true));
         assert!(!super::select_gpu_mixed_final(20, 17, 3, true, true));
     }
+
+    #[test]
+    fn packed_short_selector_is_exact_and_honors_gate() {
+        assert!(super::select_gpu_packed_short(20, 16, 4, true, true, true));
+        assert!(!super::select_gpu_packed_short(
+            20, 16, 4, true, true, false
+        ));
+        assert!(!super::select_gpu_packed_short(
+            20, 16, 4, true, false, true
+        ));
+        assert!(!super::select_gpu_packed_short(
+            20, 16, 4, false, true, true
+        ));
+        assert!(!super::select_gpu_packed_short(
+            20, 12, 4, true, true, true
+        ));
+    }
 }
 
 /// Cached outside graph encoding so the narrow control adds no environment
@@ -164,6 +189,20 @@ mod mixed_final_gate_tests {
 pub(crate) fn gpu_mixed_final_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os(ENV_NO_GPU_MIXED_FINAL).is_none())
+}
+
+/// Cached outside graph encoding so the narrow control adds no environment
+/// lookup to the per-proof dispatch path.
+pub(crate) fn gpu_packed_short_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os(ENV_NO_GPU_PACKED_SHORT).is_none())
+}
+
+/// Latched once outside the GPU hot path. Both implementations are compiled
+/// into the same Metal library; graph encoding pays only this cached branch.
+pub(crate) fn gpu_b3_direct_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os(ENV_NO_GPU_B3_DIRECT).is_none())
 }
 
 /// Wall-clock margin the GPU must beat during the warmup dual-run: latch on
@@ -577,9 +616,33 @@ pub(crate) fn select_gpu_mixed_final(
     pass_tune && mixed_enabled && pass5_mixed_ok(log_d, l, f)
 }
 
+/// Pure selector shared by the full and early/hybrid-prefix dispatch sites.
+pub(crate) fn select_gpu_packed_short(
+    log_d: usize,
+    l: usize,
+    f: usize,
+    pass_tune: bool,
+    mixed_enabled: bool,
+    packed_enabled: bool,
+) -> bool {
+    pass_tune && mixed_enabled && packed_enabled && pass5_mixed_ok(log_d, l, f)
+}
+
 #[inline]
 fn gpu_mixed_final_selected(log_d: usize, l: usize, f: usize) -> bool {
     select_gpu_mixed_final(log_d, l, f, true, gpu_mixed_final_enabled())
+}
+
+#[inline]
+fn gpu_packed_short_selected(log_d: usize, l: usize, f: usize) -> bool {
+    select_gpu_packed_short(
+        log_d,
+        l,
+        f,
+        true,
+        gpu_mixed_final_enabled(),
+        gpu_packed_short_enabled(),
+    )
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -1216,6 +1279,144 @@ kernel void ntt_pass5_mixed(device uint4* data                [[buffer(0)]],
     }
 }
 
+// Multiply by a <=40-bit twiddle packed in two low-to-high 32-bit words.
+// Splitting the fixed ten-nibble scan at the word boundary avoids 64-bit
+// shifts and lets the compiler use immediate 32-bit shifts after unrolling.
+static inline uint4 gf_mul_short40_packed(uint4 v, uint2 bits) {
+    uint4 V0 = v;
+    uint4 V1 = gf_mulx(V0), V2 = gf_mulx(V1), V3 = gf_mulx(V2);
+    uint4 acc = uint4(0u);
+    for (int q = 1; q >= 0; q--) {
+        acc = gf_shl4(acc);
+        uint n = (bits.y >> (q * 4)) & 15u;
+        if (n & 1u) acc ^= V0;
+        if (n & 2u) acc ^= V1;
+        if (n & 4u) acc ^= V2;
+        if (n & 8u) acc ^= V3;
+    }
+    for (int q = 7; q >= 0; q--) {
+        acc = gf_shl4(acc);
+        uint n = (bits.x >> (q * 4)) & 15u;
+        if (n & 1u) acc ^= V0;
+        if (n & 2u) acc ^= V1;
+        if (n & 4u) acc ^= V2;
+        if (n & 8u) acc ^= V3;
+    }
+    return acc;
+}
+
+// Multiply by a <=20-bit twiddle packed in one low 32-bit word.
+static inline uint4 gf_mul_short20_packed(uint4 v, uint bits) {
+    uint4 V0 = v;
+    uint4 V1 = gf_mulx(V0), V2 = gf_mulx(V1), V3 = gf_mulx(V2);
+    uint4 acc = uint4(0u);
+    for (int q = 4; q >= 0; q--) {
+        acc = gf_shl4(acc);
+        uint n = (bits >> (q * 4)) & 15u;
+        if (n & 1u) acc ^= V0;
+        if (n & 2u) acc ^= V1;
+        if (n & 4u) acc ^= V2;
+        if (n & 8u) acc ^= V3;
+    }
+    return acc;
+}
+
+// Experimental sibling of ntt_pass5_mixed. It preserves the successful
+// table/table/direct/direct arithmetic split, but stages each short twiddle
+// once as packed words instead of staging one uint per nibble. Layer 18 loads
+// four uint2 values (reused by two butterflies each); layer 19 loads eight
+// uint values. This replaces 80 cooperative device reads and roughly 120
+// threadgroup nibble reads per lane with 12 cooperative reads and 12 packed
+// threadgroup reads, while leaving the Horner work and dense tables unchanged.
+kernel void ntt_pass5_mixed_packed(device uint4* data                [[buffer(0)]],
+                                   device const uint4* twiddles      [[buffer(1)]],
+                                   constant NttParams& P             [[buffer(2)]],
+                                   uint tgid [[threadgroup_position_in_grid]],
+                                   uint lid  [[thread_index_in_threadgroup]])
+{
+    constexpr uint F = 4u, NF = 1u << F;
+    threadgroup uint4 bases[3u * 4u];
+    threadgroup uint4 tabs[3u * 64u];
+    threadgroup uint2 shortA[4u];
+    threadgroup uint  shortB[8u];
+
+    const uint lane = lid & 63u;
+    const uint B = tgid >> P.s;
+    const uint r = tgid & ((1u << P.s) - 1u);
+    const uint pos_base = (B << (P.log_d - P.l)) + r;
+
+    if (lid < 12u) {
+        uint t = lid >> 2, k = lid & 3u;
+        uint j = 31u - clz(t + 1u), c = t + 1u - (1u << j);
+        uint4 p = twiddles[(1u << (P.l + j)) - 1u + (B << j) + c];
+        for (uint m = 0; m < k * 4u; m++) p = gf_mulx(p);
+        bases[lid] = p;
+    }
+    if (lid < 8u) {
+        if (lid < 4u) {
+            uint4 twA = twiddles[(1u << (P.l + 2u)) - 1u + (B << 2) + lid];
+            shortA[lid] = twA.xy;
+        }
+        uint4 twB = twiddles[(1u << (P.l + 3u)) - 1u + (B << 3) + lid];
+        shortB[lid] = twB.x;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint ei = lid; ei < 3u * 64u; ei += 64u) {
+        uint t = ei >> 6, sub = ei & 63u, n = sub & 15u;
+        uint4 p = bases[(t << 2) | (sub >> 4)];
+        uint4 val = uint4(0u);
+        for (uint k = 0; k < 4u; k++) {
+            if ((n >> k) & 1u) val ^= p;
+            p = gf_mulx(p);
+        }
+        tabs[ei] = val;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    uint4 elems[NF];
+    for (uint e = 0; e < NF; e++) {
+        elems[e] = data[((pos_base + (e << P.s)) << 6) + lane];
+    }
+
+    // The two dense stages are byte-for-byte the promoted mixed schedule.
+    for (uint j = 0; j < 2u; j++) {
+        uint bpos = F - 1u - j;
+        for (uint b = 0; b < (NF >> 1); b++) {
+            uint low = b & ((1u << bpos) - 1u);
+            uint eu = ((b >> bpos) << (bpos + 1u)) | low;
+            uint ev = eu | (1u << bpos);
+            uint tsel = ((1u << j) - 1u) + (eu >> (F - j));
+            uint4 nu = elems[eu] ^ gf_mul_tab4(elems[ev], &tabs[tsel << 6]);
+            elems[eu] = nu;
+            elems[ev] ^= nu;
+        }
+    }
+
+    // Layer 18: four twiddles, each shared by two adjacent butterflies.
+    for (uint c = 0; c < 4u; c++) {
+        uint2 bits = shortA[c];
+        for (uint low = 0; low < 2u; low++) {
+            uint eu = (c << 2) | low;
+            uint ev = eu | 2u;
+            uint4 nu = elems[eu] ^ gf_mul_short40_packed(elems[ev], bits);
+            elems[eu] = nu;
+            elems[ev] ^= nu;
+        }
+    }
+
+    // Layer 19: eight independent adjacent butterflies.
+    for (uint c = 0; c < 8u; c++) {
+        uint eu = c << 1, ev = eu | 1u;
+        uint4 nu = elems[eu] ^ gf_mul_short20_packed(elems[ev], shortB[c]);
+        elems[eu] = nu;
+        elems[ev] ^= nu;
+    }
+
+    for (uint e = 0; e < NF; e++) {
+        data[((pos_base + (e << P.s)) << 6) + lane] = elems[e];
+    }
+}
+
 // ===========================================================================
 // From-z first pass: fuses the RS zero-padding into the first four layers.
 //
@@ -1434,6 +1635,47 @@ static void b3_compress(thread uint* cv, thread const uint* m_in,
     for (int i = 0; i < 8; i++) cv[i] = v[i] ^ v[8 + i];
 }
 
+// Direct seven-round schedule for the fixed leaf/parent compression shape.
+// The incumbent routine above carries two 16-word arrays and permutes/copies
+// the message after six rounds. Every message index is compile-time constant
+// here, so those 192 local-word moves and their dynamic indexing disappear
+// from each compression. A ranked tree executes 16 leaf compressions plus
+// almost one parent compression per leaf, making this a broad graph lever.
+static inline void b3_compress_direct(thread uint* cv,
+                                      thread const uint* m,
+                                      uint flags) {
+    uint v[16];
+    for (int i = 0; i < 8; i++) v[i] = cv[i];
+    for (int i = 0; i < 4; i++) v[8 + i] = B3_IV[i];
+    v[12] = 0u;
+    v[13] = 0u;
+    v[14] = 64u;
+    v[15] = flags;
+
+    #define B3_GD(a,b,c,d,x,y) \
+        v[a] = v[a] + v[b] + x; v[d] = ((v[d]^v[a])>>16)|((v[d]^v[a])<<16); \
+        v[c] = v[c] + v[d];     v[b] = ((v[b]^v[c])>>12)|((v[b]^v[c])<<20); \
+        v[a] = v[a] + v[b] + y; v[d] = ((v[d]^v[a])>>8) |((v[d]^v[a])<<24); \
+        v[c] = v[c] + v[d];     v[b] = ((v[b]^v[c])>>7) |((v[b]^v[c])<<25);
+    #define B3_RD(i0,i1,i2,i3,i4,i5,i6,i7,i8,i9,i10,i11,i12,i13,i14,i15) \
+        B3_GD(0,4,8,12,  m[i0], m[i1]);   B3_GD(1,5,9,13,  m[i2], m[i3]); \
+        B3_GD(2,6,10,14, m[i4], m[i5]);   B3_GD(3,7,11,15, m[i6], m[i7]); \
+        B3_GD(0,5,10,15, m[i8], m[i9]);   B3_GD(1,6,11,12, m[i10],m[i11]); \
+        B3_GD(2,7,8,13,  m[i12],m[i13]);  B3_GD(3,4,9,14,  m[i14],m[i15]);
+
+    B3_RD(0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15)
+    B3_RD(2,6,3,10,7,0,4,13,1,11,12,5,9,14,15,8)
+    B3_RD(3,4,10,12,13,2,7,14,6,5,9,0,11,15,8,1)
+    B3_RD(10,7,12,9,14,3,13,15,4,0,11,2,5,8,1,6)
+    B3_RD(12,13,9,11,15,10,14,8,7,2,5,3,0,1,6,4)
+    B3_RD(9,14,11,5,8,12,15,1,13,3,0,10,2,6,4,7)
+    B3_RD(11,15,5,0,1,9,8,6,14,10,2,12,3,4,7,13)
+
+    #undef B3_RD
+    #undef B3_GD
+    for (int i = 0; i < 8; i++) cv[i] = v[i] ^ v[8 + i];
+}
+
 kernel void leaf_hash(device const uint* codeword [[buffer(0)]],
                       device uint* out            [[buffer(1)]],
                       uint id [[thread_position_in_grid]])
@@ -1520,6 +1762,93 @@ kernel void parent_hash3(device const uint* children [[buffer(0)]],
         uint cv[8];
         for (uint i = 0u; i < 8u; i++) cv[i] = B3_IV[i];
         b3_compress(cv, block, 64u, B3_PARENT);
+        const uint id = tgid * 32u + lid;
+        for (uint i = 0u; i < 8u; i++) parents3[id * 8u + i] = cv[i];
+    }
+}
+
+kernel void leaf_hash_direct(device const uint* codeword [[buffer(0)]],
+                             device uint* out            [[buffer(1)]],
+                             uint id [[thread_position_in_grid]])
+{
+    device const uint* leaf = codeword + id * 256u;
+    uint cv[8];
+    for (int i = 0; i < 8; i++) cv[i] = B3_IV[i];
+    for (uint b = 0; b < 16u; b++) {
+        uint block[16];
+        for (uint i = 0; i < 16u; i++) block[i] = leaf[b * 16u + i];
+        uint flags = (b == 0u ? B3_CHUNK_START : 0u) | (b == 15u ? B3_CHUNK_END : 0u);
+        b3_compress_direct(cv, block, flags);
+    }
+    for (int i = 0; i < 8; i++) out[id * 8u + i] = cv[i];
+}
+
+kernel void parent_hash_direct(device const uint* children [[buffer(0)]],
+                               device uint* parents        [[buffer(1)]],
+                               uint id [[thread_position_in_grid]])
+{
+    uint block[16];
+    for (uint i = 0; i < 16u; i++) block[i] = children[id * 16u + i];
+    uint cv[8];
+    for (int i = 0; i < 8; i++) cv[i] = B3_IV[i];
+    b3_compress_direct(cv, block, B3_PARENT);
+    for (int i = 0; i < 8; i++) parents[id * 8u + i] = cv[i];
+}
+
+// Direct-schedule sibling of the fused three-level parent path. Keeping both
+// kernels in the library preserves the exact same-binary controls: the
+// parent3 gate can restore one-parent dispatches, while the B3-direct gate can
+// restore the incumbent dynamic message-permutation compressor independently.
+kernel void parent_hash3_direct(device const uint* children [[buffer(0)]],
+                                device uint* parents1      [[buffer(1)]],
+                                device uint* parents2      [[buffer(2)]],
+                                device uint* parents3      [[buffer(3)]],
+                                uint tgid [[threadgroup_position_in_grid]],
+                                uint lid [[thread_index_in_threadgroup]])
+{
+    threadgroup uint level1[128u * 8u];
+    threadgroup uint level2[64u * 8u];
+
+    {
+        uint block[16];
+        const uint id = tgid * 128u + lid;
+        for (uint i = 0u; i < 16u; i++) block[i] = children[id * 16u + i];
+        uint cv[8];
+        for (uint i = 0u; i < 8u; i++) cv[i] = B3_IV[i];
+        b3_compress_direct(cv, block, B3_PARENT);
+        for (uint i = 0u; i < 8u; i++) {
+            parents1[id * 8u + i] = cv[i];
+            level1[lid * 8u + i] = cv[i];
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (lid < 64u) {
+        uint block[16];
+        for (uint i = 0u; i < 8u; i++) {
+            block[i] = level1[(2u * lid) * 8u + i];
+            block[8u + i] = level1[(2u * lid + 1u) * 8u + i];
+        }
+        uint cv[8];
+        for (uint i = 0u; i < 8u; i++) cv[i] = B3_IV[i];
+        b3_compress_direct(cv, block, B3_PARENT);
+        const uint id = tgid * 64u + lid;
+        for (uint i = 0u; i < 8u; i++) {
+            parents2[id * 8u + i] = cv[i];
+            level2[lid * 8u + i] = cv[i];
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (lid < 32u) {
+        uint block[16];
+        for (uint i = 0u; i < 8u; i++) {
+            block[i] = level2[(2u * lid) * 8u + i];
+            block[8u + i] = level2[(2u * lid + 1u) * 8u + i];
+        }
+        uint cv[8];
+        for (uint i = 0u; i < 8u; i++) cv[i] = B3_IV[i];
+        b3_compress_direct(cv, block, B3_PARENT);
         const uint id = tgid * 32u + lid;
         for (uint i = 0u; i < 8u; i++) parents3[id * 8u + i] = cv[i];
     }
@@ -1636,9 +1965,13 @@ kernel void parent_hash3(device const uint* children [[buffer(0)]],
         pub(crate) pso_ntt4zg4: Id,
         pub(crate) pso_ntt4h8: Id,
         pub(crate) pso_ntt5mix: Id,
+        pub(crate) pso_ntt5mix_packed: Id,
         pub(crate) pso_leaf: Id,
         pub(crate) pso_parent: Id,
         pub(crate) pso_parent3: Id,
+        pub(crate) pso_leaf_direct: Id,
+        pub(crate) pso_parent_direct: Id,
+        pub(crate) pso_parent3_direct: Id,
     }
     // SAFETY: MTLDevice/MTLCommandQueue/MTLComputePipelineState are
     // documented thread-safe; command buffers/encoders are created and used
@@ -1694,7 +2027,7 @@ kernel void parent_hash3(device const uint* children [[buffer(0)]],
                 // missing, pipeline error — rebuild everything from the MSL
                 // source exactly as the incumbent path did. The source compile
                 // is never reached when the metallib pipelines all build.
-                const KERNELS: [&str; 11] = [
+                const KERNELS: [&str; 15] = [
                     "ntt_fused",
                     "ntt_fused_reg4g4",
                     "ntt_fused_reg4",
@@ -1703,12 +2036,16 @@ kernel void parent_hash3(device const uint* children [[buffer(0)]],
                     "ntt_fused_reg4_from_zg4",
                     "ntt_fused_reg4h8",
                     "ntt_pass5_mixed",
+                    "ntt_pass5_mixed_packed",
                     "leaf_hash",
                     "parent_hash",
                     "parent_hash3",
+                    "leaf_hash_direct",
+                    "parent_hash_direct",
+                    "parent_hash3_direct",
                 ];
-                let build_psos = |library: Id| -> Result<[Id; 11], String> {
-                    let mut out = [NIL; 11];
+                let build_psos = |library: Id| -> Result<[Id; 15], String> {
+                    let mut out = [NIL; 15];
                     for (slot, name) in out.iter_mut().zip(KERNELS) {
                         let ns = api.nsstring(name)?;
                         let f: Id = send!(
@@ -1738,7 +2075,7 @@ kernel void parent_hash3(device const uint* children [[buffer(0)]],
                     }
                     Ok(out)
                 };
-                let mut psos: Option<[Id; 11]> = None;
+                let mut psos: Option<[Id; 15]> = None;
                 let prebuilt = try_embedded_metallib(&api, device);
                 if !prebuilt.is_null() {
                     if let Ok(p) = build_psos(prebuilt) {
@@ -1746,7 +2083,7 @@ kernel void parent_hash3(device const uint* children [[buffer(0)]],
                     }
                     send!(api, unsafe extern "C" fn(Id, Sel) -> Id, prebuilt, c"release");
                 }
-                let [pso_ntt, pso_ntt4g4, pso_ntt4, pso_ntt3, pso_ntt4z, pso_ntt4zg4, pso_ntt4h8, pso_ntt5mix, pso_leaf, pso_parent, pso_parent3] =
+                let [pso_ntt, pso_ntt4g4, pso_ntt4, pso_ntt3, pso_ntt4z, pso_ntt4zg4, pso_ntt4h8, pso_ntt5mix, pso_ntt5mix_packed, pso_leaf, pso_parent, pso_parent3, pso_leaf_direct, pso_parent_direct, pso_parent3_direct] =
                     match psos {
                         Some(p) => p,
                         None => {
@@ -1784,9 +2121,13 @@ kernel void parent_hash3(device const uint* children [[buffer(0)]],
                     pso_ntt4zg4,
                     pso_ntt4h8,
                     pso_ntt5mix,
+                    pso_ntt5mix_packed,
                     pso_leaf,
                     pso_parent,
                     pso_parent3,
+                    pso_leaf_direct,
+                    pso_parent_direct,
+                    pso_parent3_direct,
                 })
             })();
             pool_pop(pool);
@@ -2082,6 +2423,15 @@ kernel void parent_hash3(device const uint* children [[buffer(0)]],
                         1u64 << (log_d - f - share_log),
                     ),
                     4 if super::pass_tune_enabled()
+                        && super::gpu_packed_short_selected(log_d, l, f) =>
+                    {
+                        (
+                            gpu.pso_ntt5mix_packed,
+                            64u64,
+                            1u64 << (log_d - f),
+                        )
+                    }
+                    4 if super::pass_tune_enabled()
                         && super::gpu_mixed_final_selected(log_d, l, f) =>
                     {
                         (gpu.pso_ntt5mix, 64u64, 1u64 << (log_d - f))
@@ -2146,6 +2496,15 @@ kernel void parent_hash3(device const uint* children [[buffer(0)]],
                         64u64,
                         1u64 << (log_d - f - share_log),
                     ),
+                    4 if super::pass_tune_enabled()
+                        && super::gpu_packed_short_selected(log_d, l, f) =>
+                    {
+                        (
+                            gpu.pso_ntt5mix_packed,
+                            64u64,
+                            1u64 << (log_d - f),
+                        )
+                    }
                     4 if super::pass_tune_enabled()
                         && super::gpu_mixed_final_selected(log_d, l, f) =>
                     {
@@ -2219,7 +2578,15 @@ kernel void parent_hash3(device const uint* children [[buffer(0)]],
         debug_assert!(subtree_leaves.is_power_of_two());
         debug_assert_eq!(leaf_start % subtree_leaves, 0);
         unsafe {
-            gpu.set_pipeline(enc, gpu.pso_leaf);
+            let direct = super::gpu_b3_direct_enabled();
+            gpu.set_pipeline(
+                enc,
+                if direct {
+                    gpu.pso_leaf_direct
+                } else {
+                    gpu.pso_leaf
+                },
+            );
             gpu.set_buffer(enc, codeword_buf, leaf_start * 1024, 0);
             gpu.set_buffer(enc, tree_buf, leaf_start * 32, 1);
             let tpg = 256u64.min(subtree_leaves as u64);
@@ -2234,7 +2601,14 @@ kernel void parent_hash3(device const uint* children [[buffer(0)]],
             // ranges contain whole 256-child groups. Each output retains its
             // ordinary global flat-tree slot, so opening is unchanged.
             if parent3 {
-                gpu.set_pipeline(enc, gpu.pso_parent3);
+                gpu.set_pipeline(
+                    enc,
+                    if direct {
+                        gpu.pso_parent3_direct
+                    } else {
+                        gpu.pso_parent3
+                    },
+                );
                 while local_len >= 256 {
                     let level1_start = level_start + level_len;
                     let level1_len = level_len / 2;
@@ -2261,7 +2635,14 @@ kernel void parent_hash3(device const uint* children [[buffer(0)]],
                 }
             }
 
-            gpu.set_pipeline(enc, gpu.pso_parent);
+            gpu.set_pipeline(
+                enc,
+                if direct {
+                    gpu.pso_parent_direct
+                } else {
+                    gpu.pso_parent
+                },
+            );
             while local_len > 1 {
                 let write_level_start = level_start + level_len;
                 let n_out = local_len / 2;
@@ -2312,7 +2693,15 @@ kernel void parent_hash3(device const uint* children [[buffer(0)]],
         parent3: bool,
     ) {
         unsafe {
-            gpu.set_pipeline(enc, gpu.pso_leaf);
+            let direct = super::gpu_b3_direct_enabled();
+            gpu.set_pipeline(
+                enc,
+                if direct {
+                    gpu.pso_leaf_direct
+                } else {
+                    gpu.pso_leaf
+                },
+            );
             gpu.set_buffer(enc, codeword_buf, 0, 0);
             gpu.set_buffer(enc, tree_buf, 0, 1);
             let tpg = 256u64.min(n_leaves as u64);
@@ -2322,7 +2711,14 @@ kernel void parent_hash3(device const uint* children [[buffer(0)]],
             let mut read_len = n_leaves;
 
             if parent3 {
-                gpu.set_pipeline(enc, gpu.pso_parent3);
+                gpu.set_pipeline(
+                    enc,
+                    if direct {
+                        gpu.pso_parent3_direct
+                    } else {
+                        gpu.pso_parent3
+                    },
+                );
                 while read_len >= 256 {
                     let write1_start = read_start + read_len;
                     let write1_len = read_len / 2;
@@ -2341,7 +2737,14 @@ kernel void parent_hash3(device const uint* children [[buffer(0)]],
                 }
             }
 
-            gpu.set_pipeline(enc, gpu.pso_parent);
+            gpu.set_pipeline(
+                enc,
+                if direct {
+                    gpu.pso_parent_direct
+                } else {
+                    gpu.pso_parent
+                },
+            );
             while read_len > 1 {
                 let write_start = read_start + read_len;
                 let n_out = read_len / 2;
@@ -5161,6 +5564,108 @@ mod tests {
             let prefix_len = input.len() / 16 * prefix16 as usize;
             assert_eq!(&got[..prefix_len], &expect[..prefix_len]);
             assert_eq!(&got[prefix_len..], &input[prefix_len..]);
+            gpu.release(data_buf);
+            gpu.release(tw_buf);
+            gpu.pool_pop(pool);
+        }
+    }
+
+    /// Compact real-Metal arithmetic oracle for the packed short-twiddle
+    /// sibling. Production selection stays exact-ranked-only; this geometry
+    /// exercises the same table/table/packed-direct/packed-direct stages.
+    #[test]
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    fn gpu_packed_short_kernel_matches_cpu_small_shape() {
+        use super::imp;
+
+        let log_d = 8usize;
+        let start_layer = 4usize;
+        let ntt = AdditiveNttF128::standard(log_d);
+        let mut rng = Rng::new(0x5A07_7A1D);
+        let input = rng.vec(64 << log_d);
+        let mut expect = input.clone();
+        let mut twiddles = flat_twiddle_table(&ntt, log_d);
+        // Force the packed paths' high supported nibbles to be live. Small
+        // standard-basis shapes otherwise leave the upper word of layer A
+        // zero, so they would not validate q=8/9 extraction.
+        for block in 0..1usize << (start_layer + 2) {
+            twiddles[(1usize << (start_layer + 2)) - 1 + block] = F128 {
+                lo: (1u64 << 39) | (block as u64 + 1),
+                hi: 0,
+            };
+        }
+        for block in 0..1usize << (start_layer + 3) {
+            twiddles[(1usize << (start_layer + 3)) - 1 + block] = F128 {
+                lo: (1u64 << 19) | (block as u64 + 1),
+                hi: 0,
+            };
+        }
+        for layer in start_layer..log_d {
+            let block_size = 1usize << (log_d - layer);
+            let half = block_size >> 1;
+            for block in 0..1usize << layer {
+                let twiddle = twiddles[(1usize << layer) - 1 + block];
+                let base = block * block_size * 64;
+                for row in 0..half {
+                    for lane in 0..64 {
+                        let top = base + row * 64 + lane;
+                        let bottom = top + half * 64;
+                        let v = expect[bottom];
+                        let new_top = expect[top] + v * twiddle;
+                        expect[top] = new_top;
+                        expect[bottom] = v + new_top;
+                    }
+                }
+            }
+        }
+
+        let gpu = match gpu_or_skip(imp::gpu().map(|g| g as *const imp::Gpu)) {
+            Some(g) => unsafe { &*g },
+            None => return,
+        };
+        unsafe {
+            let pool = gpu.pool_push();
+            let data_bytes = core::mem::size_of_val(input.as_slice());
+            let data_buf = gpu.new_buffer(data_bytes).unwrap();
+            let tw_buf = gpu
+                .new_buffer(core::mem::size_of_val(twiddles.as_slice()))
+                .unwrap();
+            std::ptr::copy_nonoverlapping(
+                input.as_ptr().cast::<u8>(),
+                gpu.buffer_contents(data_buf),
+                data_bytes,
+            );
+            std::ptr::copy_nonoverlapping(
+                twiddles.as_ptr().cast::<u8>(),
+                gpu.buffer_contents(tw_buf),
+                core::mem::size_of_val(twiddles.as_slice()),
+            );
+
+            let cb = gpu.command_buffer().unwrap();
+            let enc = gpu.compute_encoder(cb).unwrap();
+            gpu.set_pipeline(enc, gpu.pso_ntt5mix_packed);
+            gpu.set_buffer(enc, data_buf, 0, 0);
+            gpu.set_buffer(enc, tw_buf, 0, 1);
+            let params = imp::NttParams {
+                log_d: log_d as u32,
+                l: start_layer as u32,
+                f: 4,
+                s: (log_d - start_layer - 4) as u32,
+            };
+            let bytes = core::slice::from_raw_parts(
+                (&raw const params).cast::<u8>(),
+                core::mem::size_of::<imp::NttParams>(),
+            );
+            gpu.set_bytes(enc, bytes, 2);
+            gpu.dispatch(enc, 1u64 << (log_d - 4), 64);
+            gpu.end_encoding(enc);
+            gpu.commit_and_wait(cb).unwrap();
+
+            let got = core::slice::from_raw_parts(
+                gpu.buffer_contents(data_buf).cast::<F128>(),
+                input.len(),
+            );
+            assert_eq!(got, expect.as_slice());
             gpu.release(data_buf);
             gpu.release(tw_buf);
             gpu.pool_pop(pool);
