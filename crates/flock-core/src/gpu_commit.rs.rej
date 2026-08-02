@@ -1,0 +1,49 @@
+diff a/crates/flock-core/src/gpu_commit.rs b/crates/flock-core/src/gpu_commit.rs	(rejected hunks)
+@@ -2485,10 +2485,14 @@ kernel void ntt_fused_reg4g4_b0_zinput(
+                             Ok(pso)
+                         };
+                         let lib_e0 = build_lib(FROM_Z_ZERO_ROOT_E0SKIP_MSL_SOURCE)?;
+-                        let e0 = build_fn(lib_e0, "ntt_fused_reg4_from_zg4_zero_root_e0skip")?;
++                        let e0 = build_fn(lib_e0, "ntt_fused_reg4_from_zg4_zero_root_e0skip")
++                            .ok()
++                            .unwrap_or(NIL);
+                         send!(api, unsafe extern "C" fn(Id, Sel) -> Id, lib_e0, c"release");
+                         let lib_b0 = build_lib(L4_B0_ZINPUT_MSL_SOURCE)?;
+-                        let b0 = build_fn(lib_b0, "ntt_fused_reg4g4_b0_zinput")?;
++                        let b0 = build_fn(lib_b0, "ntt_fused_reg4g4_b0_zinput")
++                            .ok()
++                            .unwrap_or(NIL);
+                         send!(api, unsafe extern "C" fn(Id, Sel) -> Id, lib_b0, c"release");
+                         (e0, b0)
+                     } else {
+@@ -2834,8 +2838,10 @@ kernel void ntt_fused_reg4g4_b0_zinput(
+                 let pso = if self.zero_root {
+                     // E0 elision reuses the identical butterfly network but
+                     // skips the e=0 store column (bit-identical to `z`).
+-                    if super::gpu_from_z_e0_selected(log_d) {
+-                        debug_assert!(!gpu.pso_from_z_zero_root_e0skip.is_null());
++                    if super::gpu_from_z_e0_selected(log_d)
++                        && !gpu.pso_from_z_zero_root_e0skip.is_null()
++                        && !gpu.pso_ntt4g4_b0_zinput.is_null()
++                    {
+                         gpu.pso_from_z_zero_root_e0skip
+                     } else {
+                         debug_assert!(!gpu.pso_ntt4zg4_zero_root.is_null());
+@@ -2984,6 +2990,8 @@ kernel void ntt_fused_reg4g4_b0_zinput(
+                     && share_log > 0
+                     && s >= share_log
+                     && super::gpu_from_z_e0_selected(log_d)
++                    && !gpu.pso_from_z_zero_root_e0skip.is_null()
++                    && !gpu.pso_ntt4g4_b0_zinput.is_null()
+                     && z_buf.is_some();
+                 if b0_split {
+                     let b0_groups = 1u64 << (s - share_log);
+@@ -3071,6 +3079,8 @@ kernel void ntt_fused_reg4g4_b0_zinput(
+                     && share_log > 0
+                     && s >= share_log
+                     && super::gpu_from_z_e0_selected(log_d)
++                    && !gpu.pso_from_z_zero_root_e0skip.is_null()
++                    && !gpu.pso_ntt4g4_b0_zinput.is_null()
+                     && z_buf.is_some();
+                 if b0_split {
+                     let b0_groups = 1u64 << (s - share_log);
