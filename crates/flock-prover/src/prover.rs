@@ -957,6 +957,26 @@ fn prove_fast_core_with_commit_codeword<Ch: Challenger>(
                 });
                 let pre = run_commit();
                 let join_started = std::time::Instant::now();
+                // Spin-family completion, prover side: this is the last timed
+                // production join in the prove path (the gpu_commit.rs joins
+                // already poll command-buffer status). The deferred fill is
+                // scheduled to finish before commit+AB at the target shape,
+                // so the worker is usually ALREADY complete when this join
+                // runs — yet a blocking scoped-thread join still pays the
+                // park + completion-wake tail whenever the worker races the
+                // join call. Poll `is_finished` first (zero cost when done),
+                // then yield for a bounded budget (yield, not spin: the
+                // worker is a sibling CPU thread and must keep its core —
+                // same rationale as the warmup AB-wait), then degrade to the
+                // exact incumbent blocking join. Byte-identical either way:
+                // the join consumes the same completed thread.
+                if !stripe_job.is_finished() {
+                    let spin_deadline =
+                        std::time::Instant::now() + std::time::Duration::from_millis(2);
+                    while !stripe_job.is_finished() && std::time::Instant::now() < spin_deadline {
+                        std::thread::yield_now();
+                    }
+                }
                 stripe_job
                     .join()
                     .expect("deferred ranked lincheck stripe worker panicked");
