@@ -25,22 +25,6 @@ mod aarch64;
 ))]
 mod x86_64;
 
-/// AArch64 deferred-reduction kernel for the ranked opening lookahead scan.
-/// The caller retains the scalar implementation as the portable and exact
-/// same-binary fallback.
-#[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
-#[inline]
-pub(crate) fn round0_and_round1_lookahead(
-    witness: &[F128],
-    basis: &[F128],
-) -> ((F128, F128), [F128; 6]) {
-    assert_eq!(witness.len(), basis.len());
-    assert!(witness.len().is_multiple_of(4));
-    // SAFETY: the cfg gate supplies PMULL through `aes`; the checks above are
-    // the complete slice-shape contract of the architecture kernel.
-    unsafe { aarch64::round0_and_round1_lookahead(witness, basis) }
-}
-
 /// Fold adjacent pairs from `src` into `dst`, starting at pair `base`.
 ///
 /// Computes `dst[t] = src[2j] * (1 + r) + src[2j + 1] * r`, where
@@ -131,30 +115,6 @@ pub(crate) fn fold2_two_and_msgs(
     unsafe { aarch64::fold2_two_and_msgs(f, b, base, wf, wb, r_a, r_b, nt_stores) }
 }
 
-/// AArch64 fused final-pair kernel: bind two challenges and return only the
-/// direct next message. The final initial-lane pair has no consumer for the
-/// ordinary six-coefficient lookahead.
-#[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
-#[inline]
-pub(crate) fn fold2_two_and_msg(
-    f: &[F128],
-    b: &[F128],
-    base: usize,
-    wf: &mut [F128],
-    wb: &mut [F128],
-    r_a: F128,
-    r_b: F128,
-    nt_stores: bool,
-) -> (F128, F128) {
-    assert_eq!(f.len(), b.len());
-    assert_eq!(wf.len(), wb.len());
-    assert!(base.is_multiple_of(4));
-    assert!(wf.len().is_multiple_of(4));
-    assert!(4 * (base + wf.len()) <= f.len());
-    // SAFETY: cfg supplies PMULL; the checks establish bounds and alignment.
-    unsafe { aarch64::fold2_two_and_msg(f, b, base, wf, wb, r_a, r_b, nt_stores) }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -217,50 +177,6 @@ mod tests {
             assert_eq!(wf_normal, wf_nt, "wf trial={trial}");
             assert_eq!(wb_normal, wb_nt, "wb trial={trial}");
             assert_eq!((u0_n, u2_n, c_n), (u0_t, u2_t, c_t), "msgs trial={trial}");
-        }
-    }
-
-    /// The final-pair kernel must materialize the same state and direct
-    /// message as the full fold2 kernel; only the unused lookahead is absent.
-    #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
-    #[test]
-    fn fold2_direct_only_matches_full_kernel() {
-        let mut state = 0x6a09_e667_f3bc_c909_u64;
-        let mut next = || {
-            state ^= state << 13;
-            state ^= state >> 7;
-            state ^= state << 17;
-            state
-        };
-        for trial in 0..64 {
-            let base = 4 * (trial % 3);
-            let n_out = 4 * (1 + (trial % 9));
-            let input_len = 4 * (base + n_out);
-            let f: Vec<F128> = (0..input_len).map(|_| F128::new(next(), next())).collect();
-            let b: Vec<F128> = (0..input_len).map(|_| F128::new(next(), next())).collect();
-            let r_a = F128::new(next(), next());
-            let r_b = F128::new(next(), next());
-            let mut full_f = vec![F128::ZERO; n_out];
-            let mut full_b = vec![F128::ZERO; n_out];
-            let mut direct_f = vec![F128::ZERO; n_out];
-            let mut direct_b = vec![F128::ZERO; n_out];
-            let nt_stores = trial % 2 == 1;
-
-            let (want_u0, want_u2, _) =
-                fold2_two_and_msgs(&f, &b, base, &mut full_f, &mut full_b, r_a, r_b, nt_stores);
-            let got = fold2_two_and_msg(
-                &f,
-                &b,
-                base,
-                &mut direct_f,
-                &mut direct_b,
-                r_a,
-                r_b,
-                nt_stores,
-            );
-            assert_eq!(direct_f, full_f, "f trial={trial}");
-            assert_eq!(direct_b, full_b, "b trial={trial}");
-            assert_eq!(got, (want_u0, want_u2), "message trial={trial}");
         }
     }
 

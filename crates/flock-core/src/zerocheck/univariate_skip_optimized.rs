@@ -30,13 +30,13 @@
 //!
 //! This variant is hardcoded for `k_skip = 6` (ell=64, n_chunks=8, N_INNER=7).
 
-use std::sync::OnceLock;
+use std::sync::{LazyLock, OnceLock};
 
 use crate::field::{F8, F128, PHI_8_TABLE, mul_by_x, phi8};
 use crate::ntt::InvNttTableByteSingleGf8;
 
 use super::PaddingSpec;
-use super::univariate_skip::{SplitEqGhash, build_eq, ntt_extend_f128_vec_ghash, pack_bits};
+use super::univariate_skip::{SplitEqGhash, ntt_extend_f128_vec_ghash, pack_bits};
 
 mod kernels;
 
@@ -193,26 +193,6 @@ fn d_inv() -> F128 {
     *D_INV_CACHE.get_or_init(compute_d_inv)
 }
 
-/// `D_hi = (1+gamma^4)(1+gamma^8)`.  Direct-fold4 retains the two low
-/// medium coordinates instead of collapsing all four here, so its C banks
-/// absorb only the normalization belonging to the two high coordinates.
-fn compute_d_hi_inv() -> F128 {
-    let g4 = F128 {
-        lo: 1u64 << 4,
-        hi: 0,
-    };
-    let g8 = F128 {
-        lo: 1u64 << 8,
-        hi: 0,
-    };
-    ((F128::ONE + g4) * (F128::ONE + g8)).inv()
-}
-
-static D_HI_INV_CACHE: OnceLock<F128> = OnceLock::new();
-fn d_hi_inv() -> F128 {
-    *D_HI_INV_CACHE.get_or_init(compute_d_hi_inv)
-}
-
 // ---------------------------------------------------------------------------
 // Convert table: γ^b · φ_8(v) for b ∈ [0, 16), v ∈ [0, 256).
 // 16 × 256 × 16 bytes = 64 KB. Computed once, cached via OnceLock.
@@ -243,307 +223,47 @@ fn convert_table() -> &'static [F128] {
 }
 
 // ---------------------------------------------------------------------------
-// Mask → field tables for the eight-bank C drain.
+// Paired c-bank convert tables (aarch64 gather-halving).
 //
-// The C banks reduce to u16 masks (see `kernels::accumulate_c_banks`), so the
-// only field work left on the C side is `F128 { lo: mask } * eq_lo_scaled[x]`.
-// That map is F2-linear in the mask's 16 bits, so it is a pair of 256-row
-// lookups instead of a multiply:
+// The two C banks select `c & 0x55` and `c & 0xaa`, so each carries only 4
+// live index bits while spending a full 256-row lookup. Two adjacent `b_med`
+// can therefore share ONE lookup per bank if their 4-bit fields are placed in
+// disjoint bit positions — a shift, not a bit-gather.
 //
-//     F128 { lo: m } * eq  ==  T_lo[m & 0xff] + T_hi[m >> 8]
-//     T_lo[v] = F128 { lo: v } * eq,   T_hi[v] = F128 { lo: v << 8 } * eq
+// For pair `p` covering `b_med = 2p, 2p+1`:
+//     i0 = (c_2p & 0x55) | ((c_2p1 << 1) & 0xaa)
+//     i1 = (c_2p & 0xaa) | ((c_2p1 >> 1) & 0x55)
+//     M0_p[x] = T_2p[x & 0x55] ^ T_2p1[(x & 0xaa) >> 1]
+//     M1_p[y] = T_2p[y & 0xaa] ^ T_2p1[(y & 0x55) << 1]
+// so `M0_p[i0] == T_2p[c_2p & 0x55] ^ T_2p1[c_2p1 & 0x55]`, exactly the two
+// bank-0 terms the per-`b_med` loop would XOR, and likewise for bank 1. The
+// masks recover each operand because the second term of `i0` sets only odd
+// bits and the first only even ones.
 //
-// `eq_lo_scaled` is fixed for the whole round-1 sweep, so the tables are built
-// ONCE per prove (not per kernel call) and shared read-only across every x_hi
-// worker: 2^n_lo * 512 * 16 B = 8 MiB at the ranked shape, of which only the
-// 8 KiB slice for the current `x_outer_lo` is hot. Building per call instead
-// would cost ~4 GiB of L1 stores per prove.
+// Correctness rests on `convert` being F2-linear in its index bits,
+// `T_b[u ^ v] == T_b[u] ^ T_b[v]`, which holds because φ_8 is an F2-linear
+// embedding and scaling by the constant γ^b is F2-linear. Verified
+// exhaustively by `convert_table_index_linear` over all 16·256·256 triples.
 //
-// Each row is built from the 16 basis elements `X^b * eq` by XOR doubling —
-// `X^b * eq` is `mul_by_x` applied b times, so the whole build is 15 shifts +
-// 510 XORs per `x_outer_lo`, ~0.5 M stores per prove.
+// 8 pairs × 2 banks × 256 × 16 B = 64 KiB, on top of the 64 KiB base table.
 // ---------------------------------------------------------------------------
 
-/// F128 entries per `x_outer_lo`: two 256-row halves (low mask byte, high).
-const C_MASK_TABLE_STRIDE: usize = 512;
+const PAIRED_C_TABLE_SIZE: usize = 8 * 256;
 
-fn build_c_mask_tables(eq_lo_scaled: &[F128]) -> Vec<F128> {
-    use rayon::prelude::*;
-
-    // Fully overwritten below (every index of both halves is written before it
-    // is read), so an uninitialized scratch buffer is sound and skips an 8 MiB
-    // zeroing pass.
-    let mut tables = crate::scratch::take_f128(eq_lo_scaled.len() * C_MASK_TABLE_STRIDE);
-    tables
-        .par_chunks_mut(C_MASK_TABLE_STRIDE)
-        .zip(eq_lo_scaled.par_iter())
-        .for_each(|(slot, eq)| {
-            let mut basis = [F128::ZERO; 16];
-            basis[0] = *eq;
-            for b in 1..16 {
-                basis[b] = mul_by_x(basis[b - 1]);
-            }
-            let (t_lo, t_hi) = slot.split_at_mut(256);
-            for (half, table) in [t_lo, t_hi].into_iter().enumerate() {
-                table[0] = F128::ZERO;
-                for b in 0..8 {
-                    let (done, rest) = table.split_at_mut(1 << b);
-                    let add = basis[half * 8 + b];
-                    for (out, seen) in rest[..1 << b].iter_mut().zip(done.iter()) {
-                        *out = *seen + add;
-                    }
-                }
-            }
-        });
-    tables
-}
-
-// ---------------------------------------------------------------------------
-// Four-retained-coordinate C statistic for experimental direct-fold4.
-//
-// The incumbent eight banks retain the two small suffix coordinates.  The
-// direct-fold4 consumer needs the next two (the low medium coordinates) as
-// well.  Write b_med = q + 4h, q,h in [0,4).  For each q and small-bit bank K
-// we accumulate
-//
-//   eq_outer / D_hi * sum_h gamma^(4h) bit_K(C[q + 4h]).
-//
-// Re-applying eq([beta_0,beta_1], q) = gamma^q / D_lo collapses these 32
-// banks exactly to the incumbent eight-bank statistic.  Keeping this
-// identity explicit gives the Fold4 experiment a strong local oracle before
-// it is allowed onto the ranked proof path.
-// ---------------------------------------------------------------------------
-
-const N_C_FOLD4_GROUPS: usize = 4;
-const N_C_FOLD4_BANKS: usize = N_C_FOLD4_GROUPS * N_C_BANKS;
-const C_FOLD4_MASK_TABLE_STRIDE: usize = 16;
-const C_FOLD4_PAIR_MASK_TABLE_STRIDE: usize = 256;
-
-/// Build the tiny mask table for the retained-medium C drain.  A four-bit
-/// index selects polynomial-basis exponents {0,4,8,12}, not {0,1,2,3}.
-#[cfg_attr(not(test), allow(dead_code))]
-fn build_c_fold4_mask_tables(eq_lo_hi_scaled: &[F128]) -> Vec<F128> {
-    use rayon::prelude::*;
-
-    let mut tables = crate::scratch::take_f128(eq_lo_hi_scaled.len() * C_FOLD4_MASK_TABLE_STRIDE);
-    tables
-        .par_chunks_mut(C_FOLD4_MASK_TABLE_STRIDE)
-        .zip(eq_lo_hi_scaled.par_iter())
-        .for_each(|(slot, eq)| {
-            let mut basis = [F128::ZERO; N_C_FOLD4_GROUPS];
-            basis[0] = *eq;
-            for h in 1..N_C_FOLD4_GROUPS {
-                let mut next = basis[h - 1];
-                for _ in 0..N_C_FOLD4_GROUPS {
-                    next = mul_by_x(next);
-                }
-                basis[h] = next;
-            }
-
-            slot[0] = F128::ZERO;
-            for h in 0..N_C_FOLD4_GROUPS {
-                let (done, rest) = slot.split_at_mut(1 << h);
-                let add = basis[h];
-                for (out, seen) in rest[..1 << h].iter_mut().zip(done.iter()) {
-                    *out = *seen + add;
-                }
-            }
-        });
-    tables
-}
-
-/// Fuse two adjacent low-coordinate Fold4 tables.  If their four-bit masks
-/// are `a` and `b`, respectively, entry `a | (b << 4)` is exactly
-/// `T_even[a] + T_odd[b]`.  The paired C kernel can therefore replace two
-/// field-table loads and two accumulator read/modify/writes with one of each.
-/// A final unpaired low slot uses an all-zero odd table.
-fn build_c_fold4_pair_mask_tables(eq_lo_hi_scaled: &[F128]) -> Vec<F128> {
-    use rayon::prelude::*;
-
-    let n_pairs = eq_lo_hi_scaled.len().div_ceil(2);
-    let mut tables = crate::scratch::take_f128(n_pairs * C_FOLD4_PAIR_MASK_TABLE_STRIDE);
-    tables
-        .par_chunks_mut(C_FOLD4_PAIR_MASK_TABLE_STRIDE)
-        .enumerate()
-        .for_each(|(pair, slot)| {
-            let mut singles = [[F128::ZERO; C_FOLD4_MASK_TABLE_STRIDE]; 2];
-            for side in 0..2 {
-                let Some(eq) = eq_lo_hi_scaled.get(2 * pair + side).copied() else {
-                    continue;
-                };
-                let mut basis = [F128::ZERO; N_C_FOLD4_GROUPS];
-                basis[0] = eq;
-                for h in 1..N_C_FOLD4_GROUPS {
-                    let mut next = basis[h - 1];
-                    for _ in 0..N_C_FOLD4_GROUPS {
-                        next = mul_by_x(next);
-                    }
-                    basis[h] = next;
-                }
-                for h in 0..N_C_FOLD4_GROUPS {
-                    let (done, rest) = singles[side].split_at_mut(1 << h);
-                    let add = basis[h];
-                    for (out, seen) in rest[..1 << h].iter_mut().zip(done.iter()) {
-                        *out = *seen + add;
-                    }
-                }
-            }
-
-            for b in 0..C_FOLD4_MASK_TABLE_STRIDE {
-                for a in 0..C_FOLD4_MASK_TABLE_STRIDE {
-                    slot[a | (b << 4)] = singles[0][a] + singles[1][b];
-                }
-            }
-        });
-    tables
-}
-
-/// Portable correctness kernel for the 32-bank direct-fold4 C statistic.
-/// Architecture-specific acceleration is deliberately downstream of the
-/// collapse oracle: this version is simple enough to audit instruction by
-/// instruction and is also useful as a differential reference.
-#[cfg_attr(target_arch = "aarch64", allow(dead_code))]
-fn accumulate_c_fold4_banks_scalar(
-    c_block: &[u8; (1 << N_MEDIUM) * ELL],
-    n_b_med: usize,
-    mask_table: &[F128],
-    partial_c: &mut [[F128; ELL]; N_C_FOLD4_BANKS],
-) {
-    debug_assert!(n_b_med <= 1 << N_MEDIUM);
-    debug_assert_eq!(mask_table.len(), C_FOLD4_MASK_TABLE_STRIDE);
-
-    let mut transposed = [[0u8; ELL]; 1 << N_MEDIUM];
-    for b_med in 0..n_b_med {
-        let row: &[u8; ELL] = c_block[b_med * ELL..(b_med + 1) * ELL]
-            .try_into()
-            .expect("64 c-bytes per medium position");
-        bit_transpose_64bytes(row, &mut transposed[b_med]);
-    }
-
-    for lane in 0..ELL {
-        let mut masks = [0u16; N_C_BANKS];
-        for (b_med, row) in transposed.iter().enumerate().take(n_b_med) {
-            let c = row[lane];
-            for (k, mask) in masks.iter_mut().enumerate() {
-                *mask |= u16::from((c >> k) & 1) << b_med;
-            }
-        }
-
-        for q in 0..N_C_FOLD4_GROUPS {
-            for (k, mask) in masks.iter().copied().enumerate() {
-                let mut nibble = 0usize;
-                for h in 0..N_C_FOLD4_GROUPS {
-                    nibble |= usize::from((mask >> (q + N_C_FOLD4_GROUPS * h)) & 1) << h;
-                }
-                partial_c[q * N_C_BANKS + k][lane] += mask_table[nibble];
-            }
+/// `(bank0, bank1)` paired tables, indexed `p * 256 + i`.
+static PAIRED_C_TABLES: LazyLock<(Vec<F128>, Vec<F128>)> = LazyLock::new(|| {
+    let base = convert_table();
+    let mut m0 = vec![F128::ZERO; PAIRED_C_TABLE_SIZE];
+    let mut m1 = vec![F128::ZERO; PAIRED_C_TABLE_SIZE];
+    for p in 0..8 {
+        let (even, odd) = (2 * p * 256, (2 * p + 1) * 256);
+        for x in 0..256 {
+            m0[p * 256 + x] = base[even + (x & 0x55)] + base[odd + ((x & 0xaa) >> 1)];
+            m1[p * 256 + x] = base[even + (x & 0xaa)] + base[odd + ((x & 0x55) << 1)];
         }
     }
-}
-
-/// Portable reference for one retained-medium `q` group.  Unlike the
-/// 32-bank oracle above, this touches only rows `q + 4h` and maintains only
-/// the eight small-bit banks that belong to that group.
-#[cfg_attr(target_arch = "aarch64", allow(dead_code))]
-fn accumulate_c_fold4_q_banks_scalar(
-    c_block: &[u8; (1 << N_MEDIUM) * ELL],
-    n_b_med: usize,
-    q: usize,
-    mask_table: &[F128],
-    partial_c: &mut [[F128; ELL]; N_C_BANKS],
-) {
-    debug_assert!(n_b_med <= 1 << N_MEDIUM);
-    debug_assert!(q < N_C_FOLD4_GROUPS);
-    debug_assert_eq!(mask_table.len(), C_FOLD4_MASK_TABLE_STRIDE);
-
-    let mut transposed = [[0u8; ELL]; N_C_FOLD4_GROUPS];
-    for (h, row_out) in transposed.iter_mut().enumerate() {
-        let b_med = q + N_C_FOLD4_GROUPS * h;
-        if b_med < n_b_med {
-            let row: &[u8; ELL] = c_block[b_med * ELL..(b_med + 1) * ELL]
-                .try_into()
-                .expect("64 c-bytes per medium position");
-            bit_transpose_64bytes(row, row_out);
-        }
-    }
-
-    for lane in 0..ELL {
-        for (k, bank) in partial_c.iter_mut().enumerate() {
-            let mut nibble = 0usize;
-            for (h, row) in transposed.iter().enumerate() {
-                nibble |= usize::from((row[lane] >> k) & 1) << h;
-            }
-            bank[lane] += mask_table[nibble];
-        }
-    }
-}
-
-/// Portable differential reference for the paired q-local drain. Padding for
-/// the two adjacent blocks remains independent; a missing row contributes a
-/// zero nibble on only its own half of the eight-bit table index.
-#[cfg_attr(target_arch = "aarch64", allow(dead_code))]
-#[allow(clippy::too_many_arguments)]
-fn accumulate_c_fold4_q_pair_banks_scalar(
-    c_block_even: &[u8; (1 << N_MEDIUM) * ELL],
-    n_b_med_even: usize,
-    c_block_odd: &[u8; (1 << N_MEDIUM) * ELL],
-    n_b_med_odd: usize,
-    q: usize,
-    pair_mask_table: &[F128],
-    partial_c: &mut [[F128; ELL]; N_C_BANKS],
-) {
-    debug_assert!(n_b_med_even <= 1 << N_MEDIUM);
-    debug_assert!(n_b_med_odd <= 1 << N_MEDIUM);
-    debug_assert!(q < N_C_FOLD4_GROUPS);
-    debug_assert_eq!(pair_mask_table.len(), C_FOLD4_PAIR_MASK_TABLE_STRIDE);
-
-    let mut transposed = [[[0u8; ELL]; N_C_FOLD4_GROUPS]; 2];
-    for (side, (c_block, n_b_med)) in [(c_block_even, n_b_med_even), (c_block_odd, n_b_med_odd)]
-        .into_iter()
-        .enumerate()
-    {
-        for (h, row_out) in transposed[side].iter_mut().enumerate() {
-            let b_med = q + N_C_FOLD4_GROUPS * h;
-            if b_med < n_b_med {
-                let row: &[u8; ELL] = c_block[b_med * ELL..(b_med + 1) * ELL]
-                    .try_into()
-                    .expect("64 c-bytes per medium position");
-                bit_transpose_64bytes(row, row_out);
-            }
-        }
-    }
-
-    for lane in 0..ELL {
-        for (k, bank) in partial_c.iter_mut().enumerate() {
-            let mut index = 0usize;
-            for (side, rows) in transposed.iter().enumerate() {
-                let mut nibble = 0usize;
-                for (h, row) in rows.iter().enumerate() {
-                    nibble |= usize::from((row[lane] >> k) & 1) << h;
-                }
-                index |= nibble << (4 * side);
-            }
-            bank[lane] += pair_mask_table[index];
-        }
-    }
-}
-
-/// Re-apply the two retained medium-coordinate eq weights.  The output must
-/// be byte-identical to the incumbent full-medium eight-bank accumulator.
-fn collapse_c_fold4_banks(banks: &[[F128; ELL]; N_C_FOLD4_BANKS]) -> [[F128; ELL]; N_C_BANKS] {
-    let medium = medium_challenges_ghash();
-    let low_eq = build_eq(&medium[..2]);
-    let mut out = [[F128::ZERO; ELL]; N_C_BANKS];
-    for q in 0..N_C_FOLD4_GROUPS {
-        for k in 0..N_C_BANKS {
-            let src = &banks[q * N_C_BANKS + k];
-            for lane in 0..ELL {
-                out[k][lane] += low_eq[q] * src[lane];
-            }
-        }
-    }
-    out
-}
+    (m0, m1)
+});
 
 #[inline]
 pub fn bit_transpose_64bytes(input: &[u8; 64], output: &mut [u8; 64]) {
@@ -590,48 +310,6 @@ impl Drop for Round1AbInner {
     }
 }
 
-/// Kill switch for the non-temporal store flavor of the deferred AB
-/// precompute output: `FLOCK_NO_ZC_AB_PRE_NT=1` restores the incumbent plain
-/// cached stores as a same-binary control. Store flavor only — the bytes
-/// written are identical.
-pub const ENV_NO_ZC_AB_PRE_NT: &str = "FLOCK_NO_ZC_AB_PRE_NT";
-
-fn ab_pre_nt_enabled() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os(ENV_NO_ZC_AB_PRE_NT).is_none())
-}
-
-/// Non-temporal 64-byte store (L1 stack bounce → `stnp` pair burst), the same
-/// best-effort cache-bypass idiom as the witness stripe drain. The precompute
-/// output is a 512 MiB write-once surface whose consumer runs tens of
-/// milliseconds later (after the commitment root), so its lines are never
-/// usefully cache-resident; plain stores cost a write-allocate RFO read of
-/// every line while the streamed GPU commit is saturating the same memory
-/// system.
-#[cfg(target_arch = "aarch64")]
-#[inline(always)]
-unsafe fn store_nt_64(src: *const u8, dst: *mut u8) {
-    unsafe {
-        core::arch::asm!(
-            "ldp {t0:q}, {t1:q}, [{src}]",
-            "stnp {t0:q}, {t1:q}, [{dst}]",
-            "ldp {t0:q}, {t1:q}, [{src}, #32]",
-            "stnp {t0:q}, {t1:q}, [{dst}, #32]",
-            src = in(reg) src,
-            dst = in(reg) dst,
-            t0 = out(vreg) _,
-            t1 = out(vreg) _,
-            options(nostack)
-        );
-    }
-}
-
-#[cfg(not(target_arch = "aarch64"))]
-#[inline(always)]
-unsafe fn store_nt_64(src: *const u8, dst: *mut u8) {
-    unsafe { core::ptr::copy_nonoverlapping(src, dst, 64) };
-}
-
 /// Precompute the challenge-independent inverse-NTT/product/shift-reduce AB
 /// transform. The result can be produced before the commitment root is
 /// available and consumed later by
@@ -643,28 +321,6 @@ pub fn precompute_round1_ab_inner_packed_padded(
     k_skip: usize,
     inv_table: &InvNttTableByteSingleGf8,
     padding: &PaddingSpec,
-) -> Round1AbInner {
-    precompute_round1_ab_inner_packed_padded_with_flavor(
-        a_packed,
-        b_packed,
-        m,
-        k_skip,
-        inv_table,
-        padding,
-        ab_pre_nt_enabled(),
-    )
-}
-
-/// Store-flavor-parameterized body; the public wrapper passes the latched env
-/// choice, tests compare both arms byte-for-byte in one process.
-fn precompute_round1_ab_inner_packed_padded_with_flavor(
-    a_packed: &[u8],
-    b_packed: &[u8],
-    m: usize,
-    k_skip: usize,
-    inv_table: &InvNttTableByteSingleGf8,
-    padding: &PaddingSpec,
-    nt: bool,
 ) -> Round1AbInner {
     use rayon::prelude::*;
 
@@ -687,7 +343,6 @@ fn precompute_round1_ab_inner_packed_padded_with_flavor(
     // K4..7 at second-window b_med 13. Restrict runtime sniffing to these five
     // candidates; every other block enters the generic kernel directly.
     let blake3_static_layout = padding.k_log == 14 && padding.useful_bits_per_block == 15_409;
-    let static_b_context = kernels::prepare_static_b_context(inv_table, blake3_static_layout);
     const OUTER_BYTES: usize = (1 << N_MEDIUM) * 64;
     debug_assert_eq!(OUTER_BYTES, (1 << N_INNER) * N_CHUNKS);
 
@@ -708,19 +363,10 @@ fn precompute_round1_ab_inner_packed_padded_with_flavor(
                 let n_b_med = b_med_counts[within_hash_outer] as usize;
                 let chunk_byte_base = x_outer * OUTER_BYTES;
 
-                // NT arm: the kernel writes a stack temporary and the 64-byte
-                // block drains to the big buffer with `stnp` (write-once
-                // lines, consumer runs after the commit root). Control arm is
-                // the incumbent direct kernel write, byte-for-byte.
-                let mut tmp = [0u8; 64];
                 for b_med in 0..n_b_med {
-                    let dst: &mut [u8; 64] = if nt {
-                        &mut tmp
-                    } else {
-                        (&mut out_outer[b_med * 64..(b_med + 1) * 64])
-                            .try_into()
-                            .expect("one transformed b_med block")
-                    };
+                    let dst: &mut [u8; 64] = (&mut out_outer[b_med * 64..(b_med + 1) * 64])
+                        .try_into()
+                        .expect("one transformed b_med block");
                     shift_reduce_inner_ab(
                         a_packed,
                         b_packed,
@@ -747,25 +393,9 @@ fn precompute_round1_ab_inner_packed_padded_with_flavor(
                         } else {
                             usize::MAX
                         },
-                        static_b_context,
                     );
-                    if nt {
-                        // SAFETY: `b_med < n_b_med ≤ OUTER_BYTES / 64`, so the
-                        // 64 destination bytes are in-bounds of `out_outer`.
-                        unsafe { store_nt_64(tmp.as_ptr(), out_outer.as_mut_ptr().add(b_med * 64)) };
-                    }
                 }
-                if nt {
-                    let tail = &mut out_outer[n_b_med * 64..];
-                    debug_assert_eq!(tail.len() % 64, 0);
-                    let zero = [0u8; 64];
-                    for i in 0..tail.len() / 64 {
-                        // SAFETY: chunk `i` is 64 in-bounds bytes of `tail`.
-                        unsafe { store_nt_64(zero.as_ptr(), tail.as_mut_ptr().add(i * 64)) };
-                    }
-                } else {
-                    out_outer[n_b_med * 64..].fill(0);
-                }
+                out_outer[n_b_med * 64..].fill(0);
             },
         );
 
@@ -797,7 +427,6 @@ fn shift_reduce_inner_ab(
     check_single_k0: bool,
     const_one_mask: u8,
     bstatic_w: usize,
-    static_b_context: Option<kernels::StaticBContext>,
 ) {
     kernels::shift_reduce_inner_ab(
         a_packed,
@@ -812,7 +441,6 @@ fn shift_reduce_inner_ab(
         check_single_k0,
         const_one_mask,
         bstatic_w,
-        static_b_context,
     );
 }
 
@@ -946,7 +574,6 @@ fn process_one_x_hi(
                     true,
                     0,
                     usize::MAX,
-                    None,
                 );
                 let byte_base_b = chunk_byte_base + b_med * N_CHUNKS * 8;
                 let c_in: &[u8; 64] = (&c_packed[byte_base_b..byte_base_b + 64])
@@ -983,7 +610,6 @@ fn process_one_x_hi(
                     true,
                     0,
                     usize::MAX,
-                    None,
                 );
                 let byte_base_b = chunk_byte_base + b_med * N_CHUNKS * 8;
                 let c_in: &[u8; 64] = (&c_packed[byte_base_b..byte_base_b + 64])
@@ -1012,89 +638,57 @@ fn process_one_x_hi(
 }
 
 // ---------------------------------------------------------------------------
-// Fusion: eight-bank C accumulator that produces s_hat_v_c AND the four-bank
-// (quad) sufficient statistic alongside round 1.
+// Fusion: two-bank C accumulator that produces s_hat_v_c alongside round 1.
 //
 // The only structural change from `process_one_x_hi` is in the C-side inner
-// loop: instead of one `cf_c` accumulator collapsing all 3 small bits, all
-// three are kept as routing dims — `K = b_3[0] + 2 b_3[1] + 4 b_3[2]`, i.e.
-// eight single-bit banks instead of the previous even/odd (`0x55`/`0xAA`)
-// split on `b_3[0]` alone. `b_3[0]` is ring-switch's packed-prefix bit `b_7`;
-// `b_3[1]`, `b_3[2]` are the two PCS suffix coordinates the C claim retains.
+// loop: instead of one `cf_c` accumulator collapsing all 3 small bits, we
+// keep `b_3[0]` (= bit `k_skip` of the witness, = `b_7` in ring-switch's
+// packed-prefix index) as a routing dim. Two `cf_c` banks: bank 0 takes
+// the K-even contributions (`v_c & 0x55`), bank 1 takes K-odd (`v_c & 0xAA`).
+// By F_2-linearity of φ_8, `PHI_8(v) == PHI_8(v & 0x55) + PHI_8(v & 0xAA)`,
+// so summing the two banks reconstructs the original `cf_c` → wire `res_c_s`.
 //
-// The banks are accumulated **α-free** (see `kernels::accumulate_c_banks`):
-// bank `K`'s raw value over the 16 `b_med` is just the u16 mask of bit `K`,
-// so the C side spends no convert-table gather at all. Re-applying `α^K` and
-// summing over the parity classes of `K` reconstructs the previous two banks
-// exactly — the same F_2-linearity of φ_8 the `0x55`/`0xAA` split relied on,
-// one level finer — so the wire `res_c_s` and `s_hat_v_c` are unchanged.
+// Per chunk-lane-b_med, this costs +1 `vld1q_u8` + +1 `veorq_u8`. Everything
+// else (shift_reduce_inner_ab, bit_transpose, partial_ab/c fold, eq_hi
+// outer fold) is unchanged.
 // ---------------------------------------------------------------------------
 
-/// Number of α-free single-bit-`K` C banks: `K = b_3[0] + 2 b_3[1] + 4 b_3[2]`.
-const N_C_BANKS: usize = 8;
-
-/// Per-worker scratch + local accumulator for the eight-bank C variant.
+/// Per-worker scratch + local accumulator for the two-bank C variant.
 /// Identical to [`WorkerState`] except `partial_c` and `local_res_c_s` are
-/// split per `K`.
+/// split into bank 0 / bank 1.
 struct WorkerStateWithSHatV {
     partial_ab: [F128; ELL],
-    partial_c: [[F128; ELL]; N_C_BANKS],
+    partial_c_0: [F128; ELL],
+    partial_c_1: [F128; ELL],
     chunk_ab_bytes: [[u8; 64]; 1 << N_MEDIUM],
+    chunk_c_bytes: [[u8; 64]; 1 << N_MEDIUM],
     a_col: [F8; ELL],
     b_col: [F8; ELL],
     local_res_ab: [F128; ELL],
-    local_res_c_s: [[F128; ELL]; N_C_BANKS],
-}
-
-/// Allocate the widened Fold4 banks directly on the heap. Constructing the
-/// complete 32 KiB array as a `Box::new` argument can first materialize it on
-/// an epool helper's smaller stack; the boxed-slice conversion allocates and
-/// initializes in heap storage before the zero-copy fixed-length conversion.
-fn zero_c_fold4_banks() -> Box<[[F128; ELL]; N_C_FOLD4_BANKS]> {
-    let banks = vec![[F128::ZERO; ELL]; N_C_FOLD4_BANKS].into_boxed_slice();
-    match banks.try_into() {
-        Ok(banks) => banks,
-        Err(_) => unreachable!("fixed direct-fold4 bank count"),
-    }
-}
-
-/// Allocate one retained-medium group directly on the heap.  Each C worker
-/// owns only 8 KiB of accumulator state, leaving room in a performance core's
-/// L1 data cache for masks, table lines, and the current witness rows.
-fn zero_c_fold4_q_banks() -> Box<[[F128; ELL]; N_C_BANKS]> {
-    let banks = vec![[F128::ZERO; ELL]; N_C_BANKS].into_boxed_slice();
-    match banks.try_into() {
-        Ok(banks) => banks,
-        Err(_) => unreachable!("fixed direct-fold4 q-bank count"),
-    }
-}
-
-#[inline]
-fn precomputed_ab_rows(ab_inner: &[u8], byte_base: usize) -> &[[u8; 64]; 1 << N_MEDIUM] {
-    let bytes = &ab_inner[byte_base..byte_base + (1 << N_MEDIUM) * 64];
-    // SAFETY: both source and target have alignment one and the slice above
-    // proves the complete 1024-byte extent. `[[u8; 64]; 16]` has no padding,
-    // so this changes only the borrow's shape, not its byte representation.
-    unsafe { &*bytes.as_ptr().cast::<[[u8; 64]; 1 << N_MEDIUM]>() }
+    local_res_c_s_0: [F128; ELL],
+    local_res_c_s_1: [F128; ELL],
 }
 
 impl WorkerStateWithSHatV {
     fn new() -> Self {
         Self {
             partial_ab: [F128::ZERO; ELL],
-            partial_c: [[F128::ZERO; ELL]; N_C_BANKS],
+            partial_c_0: [F128::ZERO; ELL],
+            partial_c_1: [F128::ZERO; ELL],
             chunk_ab_bytes: [[0u8; 64]; 1 << N_MEDIUM],
+            chunk_c_bytes: [[0u8; 64]; 1 << N_MEDIUM],
             a_col: [F8::ZERO; ELL],
             b_col: [F8::ZERO; ELL],
             local_res_ab: [F128::ZERO; ELL],
-            local_res_c_s: [[F128::ZERO; ELL]; N_C_BANKS],
+            local_res_c_s_0: [F128::ZERO; ELL],
+            local_res_c_s_1: [F128::ZERO; ELL],
         }
     }
 }
 
-/// Eight-bank C variant of [`process_one_x_hi`]. AB-side and witness traffic
+/// Two-bank C variant of [`process_one_x_hi`]. AB-side and witness traffic
 /// unchanged; the only modification is the C-side inner loop now maintains
-/// eight α-free single-bit-`K` banks instead of one convert-table sum.
+/// `cf_c_0` and `cf_c_1` via masked convert-table lookups.
 #[inline]
 #[allow(clippy::too_many_arguments)]
 fn process_one_x_hi_with_s_hat_v(
@@ -1110,14 +704,12 @@ fn process_one_x_hi_with_s_hat_v(
     eq_lo_scaled: &[F128],
     eq_hi_val: F128,
     convert: &[F128],
-    mask_tables: &[F128],
+    paired_c: &(Vec<F128>, Vec<F128>),
     state: &mut WorkerStateWithSHatV,
 ) {
     state.partial_ab.iter_mut().for_each(|p| *p = F128::ZERO);
-    state
-        .partial_c
-        .iter_mut()
-        .for_each(|bank| bank.iter_mut().for_each(|p| *p = F128::ZERO));
+    state.partial_c_0.iter_mut().for_each(|p| *p = F128::ZERO);
+    state.partial_c_1.iter_mut().for_each(|p| *p = F128::ZERO);
 
     let n_lo = n_lo_and_inner - N_INNER;
 
@@ -1131,14 +723,6 @@ fn process_one_x_hi_with_s_hat_v(
 
         let chunk_byte_base = ((x_outer_lo << N_INNER) | (x_hi << n_lo_and_inner)) * N_CHUNKS;
         let eq_lo_val = eq_lo_scaled[x_outer_lo];
-        let c_tables =
-            &mask_tables[x_outer_lo * C_MASK_TABLE_STRIDE..(x_outer_lo + 1) * C_MASK_TABLE_STRIDE];
-        // The C side reads the packed witness directly: the fused mask kernel
-        // subsumes the per-`b_med` `bit_transpose_64bytes` this path used to run.
-        let c_rows: &[u8; (1 << N_MEDIUM) * 64] = (&c_packed
-            [chunk_byte_base..chunk_byte_base + (1 << N_MEDIUM) * 64])
-            .try_into()
-            .expect("sixteen 64-byte c rows per x_outer_lo");
 
         if n_b_med == (1 << N_MEDIUM) {
             for b_med in 0..(1 << N_MEDIUM) {
@@ -1155,19 +739,24 @@ fn process_one_x_hi_with_s_hat_v(
                     true,
                     0,
                     usize::MAX,
-                    None,
                 );
+                let byte_base_b = chunk_byte_base + b_med * N_CHUNKS * 8;
+                let c_in: &[u8; 64] = (&c_packed[byte_base_b..byte_base_b + 64])
+                    .try_into()
+                    .expect("64 c-bytes per medium position");
+                bit_transpose_64bytes(c_in, &mut state.chunk_c_bytes[b_med]);
             }
 
             kernels::accumulate_convert_with_s_hat_v(
                 &state.chunk_ab_bytes,
-                c_rows,
+                &state.chunk_c_bytes,
                 1 << N_MEDIUM,
                 convert,
+                paired_c,
                 eq_lo_val,
-                c_tables,
                 &mut state.partial_ab,
-                &mut state.partial_c,
+                &mut state.partial_c_0,
+                &mut state.partial_c_1,
             );
         } else {
             for b_med in 0..n_b_med {
@@ -1184,19 +773,24 @@ fn process_one_x_hi_with_s_hat_v(
                     true,
                     0,
                     usize::MAX,
-                    None,
                 );
+                let byte_base_b = chunk_byte_base + b_med * N_CHUNKS * 8;
+                let c_in: &[u8; 64] = (&c_packed[byte_base_b..byte_base_b + 64])
+                    .try_into()
+                    .expect("64 c-bytes per medium position");
+                bit_transpose_64bytes(c_in, &mut state.chunk_c_bytes[b_med]);
             }
 
             kernels::accumulate_convert_with_s_hat_v(
                 &state.chunk_ab_bytes,
-                c_rows,
+                &state.chunk_c_bytes,
                 n_b_med,
                 convert,
+                paired_c,
                 eq_lo_val,
-                c_tables,
                 &mut state.partial_ab,
-                &mut state.partial_c,
+                &mut state.partial_c_0,
+                &mut state.partial_c_1,
             );
         }
     }
@@ -1204,11 +798,8 @@ fn process_one_x_hi_with_s_hat_v(
     // Outer fold by eq_hi (per bank).
     for lane in 0..ELL {
         state.local_res_ab[lane] += eq_hi_val * state.partial_ab[lane];
-    }
-    for (res, partial) in state.local_res_c_s.iter_mut().zip(&state.partial_c) {
-        for lane in 0..ELL {
-            res[lane] += eq_hi_val * partial[lane];
-        }
+        state.local_res_c_s_0[lane] += eq_hi_val * state.partial_c_0[lane];
+        state.local_res_c_s_1[lane] += eq_hi_val * state.partial_c_1[lane];
     }
 }
 
@@ -1228,610 +819,52 @@ fn process_one_x_hi_with_precomputed_ab(
     eq_lo_scaled: &[F128],
     eq_hi_val: F128,
     convert: &[F128],
-    mask_tables: &[F128],
-    split_ab_c: bool,
-    direct_ab_rows: bool,
-    c_drain4: bool,
+    paired_c: &(Vec<F128>, Vec<F128>),
     state: &mut WorkerStateWithSHatV,
 ) {
     state.partial_ab.iter_mut().for_each(|p| *p = F128::ZERO);
-    state
-        .partial_c
-        .iter_mut()
-        .for_each(|bank| bank.iter_mut().for_each(|p| *p = F128::ZERO));
+    state.partial_c_0.iter_mut().for_each(|p| *p = F128::ZERO);
+    state.partial_c_1.iter_mut().for_each(|p| *p = F128::ZERO);
 
     let n_lo = n_lo_and_inner - N_INNER;
 
-    if split_ab_c {
-        // AB's 64 KiB convert table is exactly the cache-residency boundary on
-        // the efficiency cores.  The old per-window AB→C alternation touched
-        // a disjoint 8 KiB C table between every two AB uses.  Complete the AB
-        // population first, then drain C in a second linear pass; the witness
-        // bytes read are unchanged and characteristic-two accumulation makes
-        // the reordering bit-exact.
-        for x_outer_lo in 0..big_lo_size {
-            let x_outer = x_outer_lo | (x_hi << n_lo);
-            let within_hash_outer = x_outer & within_outer_mask;
-            let n_b_med = b_med_counts[within_hash_outer] as usize;
-            if n_b_med == 0 {
-                continue;
-            }
-
-            let chunk_byte_base = ((x_outer_lo << N_INNER) | (x_hi << n_lo_and_inner)) * N_CHUNKS;
-            let chunk_ab_bytes = if direct_ab_rows {
-                precomputed_ab_rows(ab_inner, chunk_byte_base)
-            } else {
-                for b_med in 0..n_b_med {
-                    let byte_base_b = chunk_byte_base + b_med * N_CHUNKS * 8;
-                    state.chunk_ab_bytes[b_med]
-                        .copy_from_slice(&ab_inner[byte_base_b..byte_base_b + 64]);
-                }
-                &state.chunk_ab_bytes
-            };
-            kernels::accumulate_convert_ab(
-                chunk_ab_bytes,
-                n_b_med,
-                convert,
-                eq_lo_scaled[x_outer_lo],
-                &mut state.partial_ab,
-            );
+    for x_outer_lo in 0..big_lo_size {
+        let x_outer = x_outer_lo | (x_hi << n_lo);
+        let within_hash_outer = x_outer & within_outer_mask;
+        let n_b_med = b_med_counts[within_hash_outer] as usize;
+        if n_b_med == 0 {
+            continue;
         }
 
-        for x_outer_lo in 0..big_lo_size {
-            let x_outer = x_outer_lo | (x_hi << n_lo);
-            let within_hash_outer = x_outer & within_outer_mask;
-            let n_b_med = b_med_counts[within_hash_outer] as usize;
-            if n_b_med == 0 {
-                continue;
-            }
+        let chunk_byte_base = ((x_outer_lo << N_INNER) | (x_hi << n_lo_and_inner)) * N_CHUNKS;
+        let eq_lo_val = eq_lo_scaled[x_outer_lo];
 
-            let chunk_byte_base = ((x_outer_lo << N_INNER) | (x_hi << n_lo_and_inner)) * N_CHUNKS;
-            let c_rows: &[u8; (1 << N_MEDIUM) * 64] = (&c_packed
-                [chunk_byte_base..chunk_byte_base + (1 << N_MEDIUM) * 64])
+        for b_med in 0..n_b_med {
+            let byte_base_b = chunk_byte_base + b_med * N_CHUNKS * 8;
+            state.chunk_ab_bytes[b_med].copy_from_slice(&ab_inner[byte_base_b..byte_base_b + 64]);
+            let c_in: &[u8; 64] = (&c_packed[byte_base_b..byte_base_b + 64])
                 .try_into()
-                .expect("sixteen 64-byte c rows per x_outer_lo");
-            let c_tables = &mask_tables
-                [x_outer_lo * C_MASK_TABLE_STRIDE..(x_outer_lo + 1) * C_MASK_TABLE_STRIDE];
-            kernels::accumulate_c_banks_with_policy(
-                c_rows,
-                n_b_med,
-                c_tables,
-                &mut state.partial_c,
-                c_drain4,
-            );
+                .expect("64 c-bytes per medium position");
+            bit_transpose_64bytes(c_in, &mut state.chunk_c_bytes[b_med]);
         }
-    } else {
-        for x_outer_lo in 0..big_lo_size {
-            let x_outer = x_outer_lo | (x_hi << n_lo);
-            let within_hash_outer = x_outer & within_outer_mask;
-            let n_b_med = b_med_counts[within_hash_outer] as usize;
-            if n_b_med == 0 {
-                continue;
-            }
 
-            let chunk_byte_base = ((x_outer_lo << N_INNER) | (x_hi << n_lo_and_inner)) * N_CHUNKS;
-            let eq_lo_val = eq_lo_scaled[x_outer_lo];
-            let c_tables = &mask_tables
-                [x_outer_lo * C_MASK_TABLE_STRIDE..(x_outer_lo + 1) * C_MASK_TABLE_STRIDE];
-            // The C side reads the packed witness directly: the fused mask kernel
-            // subsumes the per-`b_med` `bit_transpose_64bytes` this path used to run.
-            let c_rows: &[u8; (1 << N_MEDIUM) * 64] = (&c_packed
-                [chunk_byte_base..chunk_byte_base + (1 << N_MEDIUM) * 64])
-                .try_into()
-                .expect("sixteen 64-byte c rows per x_outer_lo");
-
-            let chunk_ab_bytes = if direct_ab_rows {
-                precomputed_ab_rows(ab_inner, chunk_byte_base)
-            } else {
-                for b_med in 0..n_b_med {
-                    let byte_base_b = chunk_byte_base + b_med * N_CHUNKS * 8;
-                    state.chunk_ab_bytes[b_med]
-                        .copy_from_slice(&ab_inner[byte_base_b..byte_base_b + 64]);
-                }
-                &state.chunk_ab_bytes
-            };
-
-            kernels::accumulate_convert_with_s_hat_v(
-                chunk_ab_bytes,
-                c_rows,
-                n_b_med,
-                convert,
-                eq_lo_val,
-                c_tables,
-                &mut state.partial_ab,
-                &mut state.partial_c,
-            );
-        }
+        kernels::accumulate_convert_with_s_hat_v(
+            &state.chunk_ab_bytes,
+            &state.chunk_c_bytes,
+            n_b_med,
+            convert,
+            paired_c,
+            eq_lo_val,
+            &mut state.partial_ab,
+            &mut state.partial_c_0,
+            &mut state.partial_c_1,
+        );
     }
 
     for lane in 0..ELL {
         state.local_res_ab[lane] += eq_hi_val * state.partial_ab[lane];
-    }
-    for (res, partial) in state.local_res_c_s.iter_mut().zip(&state.partial_c) {
-        for lane in 0..ELL {
-            res[lane] += eq_hi_val * partial[lane];
-        }
-    }
-}
-
-/// AB job for the experimental direct-fold4 capture.  It remains one pass per
-/// `x_hi`; splitting C into four q-local jobs must not multiply AB traffic.
-#[inline]
-#[allow(clippy::too_many_arguments)]
-fn process_one_x_hi_with_precomputed_ab_fold4_ab(
-    x_hi: usize,
-    big_lo_size: usize,
-    n_lo_and_inner: usize,
-    within_outer_mask: usize,
-    b_med_counts: &[u8],
-    ab_inner: &[u8],
-    eq_lo_scaled: &[F128],
-    eq_hi_val: F128,
-    convert: &[F128],
-    timing_cpu_ns: Option<&[std::sync::atomic::AtomicU64; 3]>,
-    partial_ab: &mut [F128; ELL],
-) {
-    partial_ab.fill(F128::ZERO);
-
-    let n_lo = n_lo_and_inner - N_INNER;
-
-    // Ranked AB policy: its 64 KiB table stays resident for the complete band.
-    let t_ab = timing_cpu_ns.map(|_| std::time::Instant::now());
-    for x_outer_lo in 0..big_lo_size {
-        let x_outer = x_outer_lo | (x_hi << n_lo);
-        let n_b_med = b_med_counts[x_outer & within_outer_mask] as usize;
-        if n_b_med == 0 {
-            continue;
-        }
-        let chunk_byte_base = ((x_outer_lo << N_INNER) | (x_hi << n_lo_and_inner)) * N_CHUNKS;
-        kernels::accumulate_convert_ab(
-            precomputed_ab_rows(ab_inner, chunk_byte_base),
-            n_b_med,
-            convert,
-            eq_lo_scaled[x_outer_lo],
-            partial_ab,
-        );
-    }
-    if let (Some(totals), Some(start)) = (timing_cpu_ns, t_ab) {
-        totals[0].fetch_add(
-            start.elapsed().as_nanos() as u64,
-            std::sync::atomic::Ordering::Relaxed,
-        );
-    }
-
-    let t_high = timing_cpu_ns.map(|_| std::time::Instant::now());
-    for value in partial_ab {
-        *value *= eq_hi_val;
-    }
-    if let (Some(totals), Some(start)) = (timing_cpu_ns, t_high) {
-        totals[2].fetch_add(
-            start.elapsed().as_nanos() as u64,
-            std::sync::atomic::Ordering::Relaxed,
-        );
-    }
-}
-
-/// Challenge-weighted AB completion for the retained-coordinate ranked path,
-/// without the independent C drain.  The legacy wire AB message is unchanged;
-/// callers that can derive C from another honest representation use this to
-/// avoid touching the 32-bank Fold4 C accumulator.
-pub(crate) fn round1_shift_reduce_ab_packed_padded_with_precomputed(
-    ab_inner: &Round1AbInner,
-    m: usize,
-    k_skip: usize,
-    r: &[F128],
-    padding: &PaddingSpec,
-) -> Vec<F128> {
-    assert_eq!(k_skip, K_SKIP, "optimized variant is k_skip=6 only");
-    let total_bytes = (1usize << m) / 8;
-    assert_eq!(ab_inner.len_bytes(), total_bytes);
-    assert_eq!(r.len(), m);
-
-    let fold4_n_hi = fold4_n_hi_from_env();
-    let eq = SplitEqGhash::with_n_hi(&r[k_skip + N_INNER..], fold4_n_hi);
-    let big_lo_size = 1usize << eq.n_lo;
-    let hi_size = 1usize << eq.n_hi;
-    let n_lo_and_inner = eq.n_lo + N_INNER;
-    let eq_lo_scaled: Vec<F128> = eq.lo.iter().map(|v| *v * d_inv()).collect();
-    let convert = convert_table();
-    let (within_outer_mask, b_med_counts) = build_b_med_counts(padding);
-    let ab_inner_bytes = ab_inner.as_bytes();
-
-    let mut partials = vec![[F128::ZERO; ELL]; hi_size];
-    let partials_base = crate::epool::SyncPtr(partials.as_mut_ptr());
-    crate::epool::run_hetero_chunks(hi_size, |x_hi| {
-        let mut partial = [F128::ZERO; ELL];
-        process_one_x_hi_with_precomputed_ab_fold4_ab(
-            x_hi,
-            big_lo_size,
-            n_lo_and_inner,
-            within_outer_mask,
-            &b_med_counts,
-            ab_inner_bytes,
-            &eq_lo_scaled,
-            eq.hi[x_hi],
-            convert,
-            None,
-            &mut partial,
-        );
-        // SAFETY: each queue index owns one disjoint output slot and the
-        // synchronous queue join publishes all writes before reduction.
-        unsafe { *partials_base.ptr().add(x_hi) = partial };
-    });
-
-    partials
-        .into_iter()
-        .fold([F128::ZERO; ELL], |mut left, right| {
-            for lane in 0..ELL {
-                left[lane] += right[lane];
-            }
-            left
-        })
-        .to_vec()
-}
-
-/// Derive the exact legacy C round-one message and its existing RingSwitch
-/// helper tensors from the lincheck stripe.  The stripe represents identity C
-/// (`Cz = z`) in an outer-fold-friendly layout.  Folding it at the original
-/// zerocheck `r_outer` yields a tiny length-`2^k_log` inner table; retaining
-/// four inner coordinates from that table is algebraically identical to the
-/// row-major 32-bank Fold4 drain.
-pub(crate) fn round1_c_fold4_from_lincheck_stripe(
-    c_lincheck: &[u8],
-    m: usize,
-    k_log: usize,
-    k_skip: usize,
-    useful_bits: usize,
-    r: &[F128],
-    inv_table: &InvNttTableByteSingleGf8,
-) -> (Vec<F128>, Vec<F128>, Vec<F128>, Vec<F128>) {
-    assert_eq!(k_skip, K_SKIP);
-    assert!(
-        k_log >= k_skip + 5,
-        "Fold4 needs four retained tail coordinates"
-    );
-    assert_eq!(r.len(), m);
-    assert_eq!(c_lincheck.len(), (1usize << m) / 8);
-
-    let eq_outer = crate::lincheck::build_eq_table(&r[k_log..]);
-    let c_inner =
-        crate::lincheck::partial_fold_packed_z_best(c_lincheck, m, k_log, useful_bits, &eq_outer);
-    let inner_tail = &r[k_skip + 1..k_log];
-    let fold4 = crate::pcs::ring_switch::s_hat_v_fold4_from_z_vec(&c_inner, inner_tail);
-    let s_hat_v_c = crate::pcs::ring_switch::collapse_s_hat_v_fold4(&fold4, &inner_tail[..4]);
-
-    // Fold only retained coordinates 2 and 3 to recover the incumbent
-    // four-bank tensor (coordinates 0 and 1 remain bank selectors).
-    let retained_hi_eq = build_eq(&inner_tail[2..4]);
-    let n_packed = 1usize << crate::pcs::LOG_PACKING;
-    let mut quad = vec![F128::ZERO; 4 * n_packed];
-    for q in 0..4 {
-        for e in 0..4 {
-            let src = (e + 4 * q) * n_packed;
-            let dst = e * n_packed;
-            for packed in 0..n_packed {
-                quad[dst + packed] += retained_hi_eq[q] * fold4[src + packed];
-            }
-        }
-    }
-
-    // RingSwitch leaves global bit k_skip as its 128-way prefix. Fold that
-    // bit at the original C point to recover C's 64 S-domain evaluations.
-    // The optimized round-one convention omits C_s; the common caller restores
-    // it before placing the message on the transcript.
-    let prefix = r[k_skip];
-    let mut res_c_s = [F128::ZERO; ELL];
-    let c_s_inv = c_s_f128().inv();
-    for lane in 0..ELL {
-        let naive = (F128::ONE + prefix) * s_hat_v_c[lane] + prefix * s_hat_v_c[ELL + lane];
-        res_c_s[lane] = c_s_inv * naive;
-    }
-    let round1_c_opt = ntt_extend_f128_vec_ghash(&res_c_s, inv_table);
-    (round1_c_opt, s_hat_v_c, quad, fold4)
-}
-
-/// Fold8 sibling of [`round1_c_fold4_from_lincheck_stripe`]: same single
-/// stripe fold, but six inner coordinates are retained (64 banks) for the
-/// direct-fold8 PCS consumer. The wire outputs (`round1_c_opt`, canonical
-/// `s_hat_v_c`, `quad`) are derived by collapsing the wider statistic and are
-/// bitwise identical to the fold4 variant's — the extra two retained
-/// coordinates only widen the exported tensor.
-pub(crate) fn round1_c_fold8_from_lincheck_stripe(
-    c_lincheck: &[u8],
-    m: usize,
-    k_log: usize,
-    k_skip: usize,
-    useful_bits: usize,
-    r: &[F128],
-    inv_table: &InvNttTableByteSingleGf8,
-) -> (Vec<F128>, Vec<F128>, Vec<F128>, Vec<F128>) {
-    assert_eq!(k_skip, K_SKIP);
-    assert!(
-        k_log >= k_skip + 7,
-        "Fold8 needs six retained tail coordinates"
-    );
-    assert_eq!(r.len(), m);
-    assert_eq!(c_lincheck.len(), (1usize << m) / 8);
-
-    let eq_outer = crate::lincheck::build_eq_table(&r[k_log..]);
-    let c_inner =
-        crate::lincheck::partial_fold_packed_z_best(c_lincheck, m, k_log, useful_bits, &eq_outer);
-    let inner_tail = &r[k_skip + 1..k_log];
-    let fold8 = crate::pcs::ring_switch::s_hat_v_fold8_from_z_vec(&c_inner, inner_tail);
-    let s_hat_v_c = crate::pcs::ring_switch::collapse_s_hat_v_fold8(&fold8, &inner_tail[..6]);
-
-    // Fold retained coordinates 2..6 to recover the incumbent four-bank
-    // tensor (coordinates 0 and 1 remain bank selectors).
-    let retained_hi_eq = build_eq(&inner_tail[2..6]);
-    let n_packed = 1usize << crate::pcs::LOG_PACKING;
-    let mut quad = vec![F128::ZERO; 4 * n_packed];
-    for q in 0..16 {
-        for e in 0..4 {
-            let src = (e + 4 * q) * n_packed;
-            let dst = e * n_packed;
-            for packed in 0..n_packed {
-                quad[dst + packed] += retained_hi_eq[q] * fold8[src + packed];
-            }
-        }
-    }
-
-    // RingSwitch leaves global bit k_skip as its 128-way prefix. Fold that
-    // bit at the original C point to recover C's 64 S-domain evaluations.
-    // The optimized round-one convention omits C_s; the common caller restores
-    // it before placing the message on the transcript.
-    let prefix = r[k_skip];
-    let mut res_c_s = [F128::ZERO; ELL];
-    let c_s_inv = c_s_f128().inv();
-    for lane in 0..ELL {
-        let naive = (F128::ONE + prefix) * s_hat_v_c[lane] + prefix * s_hat_v_c[ELL + lane];
-        res_c_s[lane] = c_s_inv * naive;
-    }
-    let round1_c_opt = ntt_extend_f128_vec_ghash(&res_c_s, inv_table);
-    (round1_c_opt, s_hat_v_c, quad, fold8)
-}
-
-/// Pair-fused C job with the original 32-bank accumulator and one job per
-/// `x_hi`. This isolates the benefit of halving field-table/state updates
-/// from the q-local scheduling experiment below.
-#[inline]
-#[allow(clippy::too_many_arguments)]
-fn process_one_x_hi_with_precomputed_ab_fold4_c_pair(
-    x_hi: usize,
-    big_lo_size: usize,
-    n_lo_and_inner: usize,
-    within_outer_mask: usize,
-    b_med_counts: &[u8],
-    c_packed: &[u8],
-    eq_hi_val: F128,
-    c_fold4_pair_mask_tables: &[F128],
-    timing_cpu_ns: Option<&[std::sync::atomic::AtomicU64; 3]>,
-    partial_c: &mut [[F128; ELL]; N_C_FOLD4_BANKS],
-) {
-    partial_c.iter_mut().for_each(|bank| bank.fill(F128::ZERO));
-
-    let n_lo = n_lo_and_inner - N_INNER;
-    let t_c = timing_cpu_ns.map(|_| std::time::Instant::now());
-    for pair in 0..big_lo_size.div_ceil(2) {
-        let x_outer_lo_even = 2 * pair;
-        let x_outer_lo_odd = x_outer_lo_even + 1;
-        let x_outer_even = x_outer_lo_even | (x_hi << n_lo);
-        let n_b_med_even = b_med_counts[x_outer_even & within_outer_mask] as usize;
-        let n_b_med_odd = if x_outer_lo_odd < big_lo_size {
-            let x_outer_odd = x_outer_lo_odd | (x_hi << n_lo);
-            b_med_counts[x_outer_odd & within_outer_mask] as usize
-        } else {
-            0
-        };
-        if n_b_med_even == 0 && n_b_med_odd == 0 {
-            continue;
-        }
-
-        let even_byte_base = ((x_outer_lo_even << N_INNER) | (x_hi << n_lo_and_inner)) * N_CHUNKS;
-        let odd_byte_base = if x_outer_lo_odd < big_lo_size {
-            ((x_outer_lo_odd << N_INNER) | (x_hi << n_lo_and_inner)) * N_CHUNKS
-        } else {
-            even_byte_base
-        };
-        let c_rows_even: &[u8; (1 << N_MEDIUM) * ELL] = (&c_packed
-            [even_byte_base..even_byte_base + (1 << N_MEDIUM) * ELL])
-            .try_into()
-            .expect("sixteen 64-byte c rows per even x_outer_lo");
-        let c_rows_odd: &[u8; (1 << N_MEDIUM) * ELL] = (&c_packed
-            [odd_byte_base..odd_byte_base + (1 << N_MEDIUM) * ELL])
-            .try_into()
-            .expect("sixteen 64-byte c rows per odd x_outer_lo");
-        let table: &[F128; C_FOLD4_PAIR_MASK_TABLE_STRIDE] = (&c_fold4_pair_mask_tables
-            [pair * C_FOLD4_PAIR_MASK_TABLE_STRIDE..(pair + 1) * C_FOLD4_PAIR_MASK_TABLE_STRIDE])
-            .try_into()
-            .expect("one 256-entry Fold4 pair table");
-        kernels::accumulate_c_fold4_pair_banks(
-            c_rows_even,
-            n_b_med_even,
-            c_rows_odd,
-            n_b_med_odd,
-            table,
-            partial_c,
-        );
-    }
-    if let (Some(totals), Some(start)) = (timing_cpu_ns, t_c) {
-        totals[1].fetch_add(
-            start.elapsed().as_nanos() as u64,
-            std::sync::atomic::Ordering::Relaxed,
-        );
-    }
-
-    let t_high = timing_cpu_ns.map(|_| std::time::Instant::now());
-    for bank in partial_c {
-        for value in bank {
-            *value *= eq_hi_val;
-        }
-    }
-    if let (Some(totals), Some(start)) = (timing_cpu_ns, t_high) {
-        totals[2].fetch_add(
-            start.elapsed().as_nanos() as u64,
-            std::sync::atomic::Ordering::Relaxed,
-        );
-    }
-}
-
-/// Four-block follow-on to pair fusion. Two pair-table values are combined
-/// before one 32-bank accumulator update, while retaining the same monolithic
-/// per-x_hi scheduling and deterministic reduction shape.
-#[inline]
-#[allow(clippy::too_many_arguments)]
-fn process_one_x_hi_with_precomputed_ab_fold4_c_four(
-    x_hi: usize,
-    big_lo_size: usize,
-    n_lo_and_inner: usize,
-    within_outer_mask: usize,
-    b_med_counts: &[u8],
-    c_packed: &[u8],
-    eq_hi_val: F128,
-    c_fold4_pair_mask_tables: &[F128],
-    timing_cpu_ns: Option<&[std::sync::atomic::AtomicU64; 3]>,
-    partial_c: &mut [[F128; ELL]; N_C_FOLD4_BANKS],
-) {
-    assert!(big_lo_size >= 4 && big_lo_size % 4 == 0);
-    partial_c.iter_mut().for_each(|bank| bank.fill(F128::ZERO));
-
-    let n_lo = n_lo_and_inner - N_INNER;
-    let t_c = timing_cpu_ns.map(|_| std::time::Instant::now());
-    for quartet in 0..big_lo_size / 4 {
-        let lo_base = 4 * quartet;
-        let n_b_med: [usize; 4] = std::array::from_fn(|side| {
-            let x_outer_lo = lo_base + side;
-            let x_outer = x_outer_lo | (x_hi << n_lo);
-            b_med_counts[x_outer & within_outer_mask] as usize
-        });
-        if n_b_med.into_iter().all(|count| count == 0) {
-            continue;
-        }
-
-        let c_blocks: [&[u8; (1 << N_MEDIUM) * ELL]; 4] = std::array::from_fn(|side| {
-            let x_outer_lo = lo_base + side;
-            let byte_base = ((x_outer_lo << N_INNER) | (x_hi << n_lo_and_inner)) * N_CHUNKS;
-            (&c_packed[byte_base..byte_base + (1 << N_MEDIUM) * ELL])
-                .try_into()
-                .expect("sixteen 64-byte c rows per x_outer_lo")
-        });
-        let pair_mask_tables: [&[F128; C_FOLD4_PAIR_MASK_TABLE_STRIDE]; 2] =
-            std::array::from_fn(|pair_in_quartet| {
-                let pair = 2 * quartet + pair_in_quartet;
-                (&c_fold4_pair_mask_tables[pair * C_FOLD4_PAIR_MASK_TABLE_STRIDE
-                    ..(pair + 1) * C_FOLD4_PAIR_MASK_TABLE_STRIDE])
-                    .try_into()
-                    .expect("one 256-entry Fold4 pair table")
-            });
-        kernels::accumulate_c_fold4_four_banks(c_blocks, n_b_med, pair_mask_tables, partial_c);
-    }
-    if let (Some(totals), Some(start)) = (timing_cpu_ns, t_c) {
-        totals[1].fetch_add(
-            start.elapsed().as_nanos() as u64,
-            std::sync::atomic::Ordering::Relaxed,
-        );
-    }
-
-    let t_high = timing_cpu_ns.map(|_| std::time::Instant::now());
-    for bank in partial_c {
-        for value in bank {
-            *value *= eq_hi_val;
-        }
-    }
-    if let (Some(totals), Some(start)) = (timing_cpu_ns, t_high) {
-        totals[2].fetch_add(
-            start.elapsed().as_nanos() as u64,
-            std::sync::atomic::Ordering::Relaxed,
-        );
-    }
-}
-
-/// One q-local paired C job.  Adjacent `x_outer_lo` blocks are drained
-/// together through a 256-entry table, halving field-table and accumulator
-/// updates.  Four independent jobs cover q=0..3, each with an 8 KiB live
-/// accumulator and only the four witness rows belonging to its q group.
-#[inline]
-#[allow(clippy::too_many_arguments)]
-fn process_one_x_hi_with_precomputed_ab_fold4_c_q_pair(
-    x_hi: usize,
-    q: usize,
-    big_lo_size: usize,
-    n_lo_and_inner: usize,
-    within_outer_mask: usize,
-    b_med_counts: &[u8],
-    c_packed: &[u8],
-    eq_hi_val: F128,
-    c_fold4_pair_mask_tables: &[F128],
-    timing_cpu_ns: Option<&[std::sync::atomic::AtomicU64; 3]>,
-    partial_c: &mut [[F128; ELL]; N_C_BANKS],
-) {
-    debug_assert!(q < N_C_FOLD4_GROUPS);
-    partial_c.iter_mut().for_each(|bank| bank.fill(F128::ZERO));
-
-    let n_lo = n_lo_and_inner - N_INNER;
-    let t_c = timing_cpu_ns.map(|_| std::time::Instant::now());
-    for pair in 0..big_lo_size.div_ceil(2) {
-        let x_outer_lo_even = 2 * pair;
-        let x_outer_lo_odd = x_outer_lo_even + 1;
-        let x_outer_even = x_outer_lo_even | (x_hi << n_lo);
-        let n_b_med_even = b_med_counts[x_outer_even & within_outer_mask] as usize;
-        let n_b_med_odd = if x_outer_lo_odd < big_lo_size {
-            let x_outer_odd = x_outer_lo_odd | (x_hi << n_lo);
-            b_med_counts[x_outer_odd & within_outer_mask] as usize
-        } else {
-            0
-        };
-        if n_b_med_even == 0 && n_b_med_odd == 0 {
-            continue;
-        }
-
-        let even_byte_base = ((x_outer_lo_even << N_INNER) | (x_hi << n_lo_and_inner)) * N_CHUNKS;
-        let odd_byte_base = if x_outer_lo_odd < big_lo_size {
-            ((x_outer_lo_odd << N_INNER) | (x_hi << n_lo_and_inner)) * N_CHUNKS
-        } else {
-            // The paired kernel is told the odd block has zero live rows, so
-            // aliasing the even in-bounds block here is semantically inert.
-            even_byte_base
-        };
-        let c_rows_even: &[u8; (1 << N_MEDIUM) * ELL] = (&c_packed
-            [even_byte_base..even_byte_base + (1 << N_MEDIUM) * ELL])
-            .try_into()
-            .expect("sixteen 64-byte c rows per even x_outer_lo");
-        let c_rows_odd: &[u8; (1 << N_MEDIUM) * ELL] = (&c_packed
-            [odd_byte_base..odd_byte_base + (1 << N_MEDIUM) * ELL])
-            .try_into()
-            .expect("sixteen 64-byte c rows per odd x_outer_lo");
-        let table: &[F128; C_FOLD4_PAIR_MASK_TABLE_STRIDE] = (&c_fold4_pair_mask_tables
-            [pair * C_FOLD4_PAIR_MASK_TABLE_STRIDE..(pair + 1) * C_FOLD4_PAIR_MASK_TABLE_STRIDE])
-            .try_into()
-            .expect("one 256-entry Fold4 pair table");
-        kernels::accumulate_c_fold4_q_pair_banks(
-            c_rows_even,
-            n_b_med_even,
-            c_rows_odd,
-            n_b_med_odd,
-            q,
-            table,
-            partial_c,
-        );
-    }
-    if let (Some(totals), Some(start)) = (timing_cpu_ns, t_c) {
-        totals[1].fetch_add(
-            start.elapsed().as_nanos() as u64,
-            std::sync::atomic::Ordering::Relaxed,
-        );
-    }
-
-    let t_high = timing_cpu_ns.map(|_| std::time::Instant::now());
-    for bank in partial_c {
-        for value in bank {
-            *value *= eq_hi_val;
-        }
-    }
-    if let (Some(totals), Some(start)) = (timing_cpu_ns, t_high) {
-        totals[2].fetch_add(
-            start.elapsed().as_nanos() as u64,
-            std::sync::atomic::Ordering::Relaxed,
-        );
+        state.local_res_c_s_0[lane] += eq_hi_val * state.partial_c_0[lane];
+        state.local_res_c_s_1[lane] += eq_hi_val * state.partial_c_1[lane];
     }
 }
 
@@ -1983,105 +1016,6 @@ pub fn round1_shift_reduce_extract_c_packed_padded(
     (res_ab.to_vec(), res_c_lifted)
 }
 
-/// Reduce the eight α-free C banks into everything downstream needs.
-///
-/// Returns `(res_c_s, s_hat_v_c, quad_c)`:
-/// * `res_c_s` — the wire accumulator, `Σ_K α^K · bank_K`. Bank `K` was
-///   accumulated α-free, so re-applying `α^K` reproduces exactly what the
-///   incumbent single/two-bank convert-table fold accumulated.
-/// * `s_hat_v_c` — canonical length-128 form, `C_2 · α^{-b_3[0]} · Σ_{K ≡
-///   b_3[0] (mod 2)} α^K · bank_K`, i.e. the incumbent post-scaling applied to
-///   the parity-class sums.
-/// * `quad_c` — the length-512 four-bank sufficient statistic,
-///   `quad_c[e·128 + 64·b_3[0] + lane] = bank_{b_3[0] + 2e}[lane]`. **α-free
-///   and `C_2`-free**: both constants are `low_eq`'s, and `low_eq` is
-///   re-applied downstream (`collapse_s_hat_v_quad` on intake and
-///   `build_direct_fold2_table` at materialize time).
-///
-/// `collapse_s_hat_v_quad(quad_c, [φ₈(0x53), φ₈(0xB5)]) == s_hat_v_c` by
-/// construction: `low_eq[e] = C_2 · α^{2e}`, so the collapse re-weights bank
-/// `2e + b_3[0]` by `C_2 · α^{2e}` and the two forms differ only by the shared
-/// `α^{-b_3[0]}`. Asserted by `quad_collapses_to_wire_s_hat_v_c`.
-fn finish_c_banks(banks: &[[F128; ELL]; N_C_BANKS]) -> ([F128; ELL], Vec<F128>, Vec<F128>) {
-    let alpha = phi8(F8(0x02));
-    let mut alpha_pow = [F128::ONE; N_C_BANKS];
-    for k in 1..N_C_BANKS {
-        alpha_pow[k] = alpha_pow[k - 1] * alpha;
-    }
-
-    let mut res_c_s_0 = [F128::ZERO; ELL];
-    let mut res_c_s_1 = [F128::ZERO; ELL];
-    for (k, bank) in banks.iter().enumerate() {
-        let weight = alpha_pow[k];
-        let target = if k & 1 == 0 {
-            &mut res_c_s_0
-        } else {
-            &mut res_c_s_1
-        };
-        for lane in 0..ELL {
-            target[lane] += weight * bank[lane];
-        }
-    }
-
-    let mut res_c_s = [F128::ZERO; ELL];
-    for lane in 0..ELL {
-        res_c_s[lane] = res_c_s_0[lane] + res_c_s_1[lane];
-    }
-
-    let c_2 = c_2_small_f128();
-    let c_2_alpha_inv = c_2 * alpha_inv_f128();
-    let mut s_hat_v_c = vec![F128::ZERO; 2 * ELL];
-    for lane in 0..ELL {
-        s_hat_v_c[lane] = c_2 * res_c_s_0[lane];
-        s_hat_v_c[ELL + lane] = c_2_alpha_inv * res_c_s_1[lane];
-    }
-
-    let mut quad_c = vec![F128::ZERO; 4 * 2 * ELL];
-    for e in 0..4 {
-        for b_0 in 0..2 {
-            let base = e * 2 * ELL + b_0 * ELL;
-            quad_c[base..base + ELL].copy_from_slice(&banks[b_0 + 2 * e]);
-        }
-    }
-
-    (res_c_s, s_hat_v_c, quad_c)
-}
-
-/// Finish the retained-medium Fold4 statistic while preserving the incumbent
-/// outputs.  `fold4_c` is bank-major in the exact order consumed by the PCS:
-///
-/// ```text
-/// low = e_small + 4*q_medium
-/// fold4_c[low * 128 + b_prefix * 64 + lane]
-///     = banks[q_medium][b_prefix + 2*e_small][lane].
-/// ```
-///
-/// It is alpha-free and carries neither C_2 nor the low-medium eq weights;
-/// all four retained suffix weights are re-applied by the direct-fold4
-/// consumer.  Collapsing there with `build_eq(suffix[..4])` therefore gives
-/// the same canonical `s_hat_v_c` returned here.
-fn finish_c_fold4_banks(
-    banks: &[[F128; ELL]; N_C_FOLD4_BANKS],
-) -> ([F128; ELL], Vec<F128>, Vec<F128>, Vec<F128>) {
-    let collapsed = collapse_c_fold4_banks(banks);
-    let (res_c_s, s_hat_v_c, quad_c) = finish_c_banks(&collapsed);
-
-    let n_packed = 2 * ELL;
-    let mut fold4_c = vec![F128::ZERO; 16 * n_packed];
-    for q in 0..N_C_FOLD4_GROUPS {
-        for e in 0..4 {
-            let low = e + 4 * q;
-            for b_prefix in 0..2 {
-                let dst = low * n_packed + b_prefix * ELL;
-                let k = b_prefix + 2 * e;
-                fold4_c[dst..dst + ELL].copy_from_slice(&banks[q * N_C_BANKS + k]);
-            }
-        }
-    }
-
-    (res_c_s, s_hat_v_c, quad_c, fold4_c)
-}
-
 /// Same as [`round1_shift_reduce_extract_c_packed_padded`] but **also returns
 /// `s_hat_v_c`** — the length-128 vector ring-switch would otherwise produce
 /// via `fold_1b_rows` for the c-claim's PCS opening at suffix `r[k_skip+1..m]`.
@@ -2093,10 +1027,11 @@ fn finish_c_fold4_banks(
 /// applied internally so the caller can feed it straight into
 /// `pcs::ring_switch::prove_batched_padded_with_precomputed`.
 ///
-/// Also returns `quad_c`, the length-512 α-free four-bank sufficient statistic
-/// for the same claim — see [`finish_c_banks`]. Both are produced from the same
-/// eight banks, so shipping either costs the same sweep.
-pub fn round1_shift_reduce_extract_c_packed_padded_with_s_hat_v_quad(
+/// Cost vs the original: per chunk-lane-`b_med`, +1 `vld1q_u8` + +1 `veorq_u8`
+/// (the bank-split convert lookup). bit_transpose, shift_reduce, eq folds
+/// are unchanged. See module-level docs for the F_2-linearity argument that
+/// makes `s_hat_v_c[(λ, 0)] + s_hat_v_c[(λ, 1)] · α == res_c_s_opt[λ]`.
+pub fn round1_shift_reduce_extract_c_packed_padded_with_s_hat_v(
     a_packed: &[u8],
     b_packed: &[u8],
     c_packed: &[u8],
@@ -2105,7 +1040,7 @@ pub fn round1_shift_reduce_extract_c_packed_padded_with_s_hat_v_quad(
     r: &[F128],
     inv_table: &InvNttTableByteSingleGf8,
     padding: &PaddingSpec,
-) -> (Vec<F128>, Vec<F128>, Vec<F128>, Vec<F128>) {
+) -> (Vec<F128>, Vec<F128>, Vec<F128>) {
     use rayon::prelude::*;
 
     assert_eq!(k_skip, K_SKIP, "optimized variant is k_skip=6 only");
@@ -2129,12 +1064,12 @@ pub fn round1_shift_reduce_extract_c_packed_padded_with_s_hat_v_quad(
     let d_inv_val = d_inv();
     let eq_lo_scaled: Vec<F128> = eq.lo.iter().map(|v| *v * d_inv_val).collect();
     let convert = convert_table();
-    let mask_tables = build_c_mask_tables(&eq_lo_scaled);
+    let paired_c = &*PAIRED_C_TABLES;
     let eq_hi = &eq.hi;
 
     let (within_outer_mask, b_med_counts) = build_b_med_counts(padding);
 
-    let (res_ab, banks) = (0..hi_size)
+    let (res_ab, res_c_s_0, res_c_s_1) = (0..hi_size)
         .into_par_iter()
         .fold(WorkerStateWithSHatV::new, |mut state, x_hi| {
             let eq_hi_val = eq_hi[x_hi];
@@ -2151,58 +1086,50 @@ pub fn round1_shift_reduce_extract_c_packed_padded_with_s_hat_v_quad(
                 &eq_lo_scaled,
                 eq_hi_val,
                 convert,
-                &mask_tables,
+                paired_c,
                 &mut state,
             );
             state
         })
-        .map(|s| (s.local_res_ab, s.local_res_c_s))
+        .map(|s| (s.local_res_ab, s.local_res_c_s_0, s.local_res_c_s_1))
         .reduce(
-            || ([F128::ZERO; ELL], [[F128::ZERO; ELL]; N_C_BANKS]),
-            |(mut ab1, mut c1), (ab2, c2)| {
+            || ([F128::ZERO; ELL], [F128::ZERO; ELL], [F128::ZERO; ELL]),
+            |(mut ab1, mut c0_1, mut c1_1), (ab2, c0_2, c1_2)| {
                 for i in 0..ELL {
                     ab1[i] += ab2[i];
+                    c0_1[i] += c0_2[i];
+                    c1_1[i] += c1_2[i];
                 }
-                for (left, right) in c1.iter_mut().zip(c2) {
-                    for i in 0..ELL {
-                        left[i] += right[i];
-                    }
-                }
-                (ab1, c1)
+                (ab1, c0_1, c1_1)
             },
         );
 
-    crate::scratch::give_f128(mask_tables);
-    let (res_c_s, s_hat_v_c, quad_c) = finish_c_banks(&banks);
-    let res_c_lifted = ntt_extend_f128_vec_ghash(&res_c_s, inv_table);
+    // Wire output: bank_0 + bank_1 reconstructs the original `res_c_s` (by
+    // F_2-linearity of φ_8 over the masked-byte sum).
+    let mut res_c_s_combined = [F128::ZERO; ELL];
+    for i in 0..ELL {
+        res_c_s_combined[i] = res_c_s_0[i] + res_c_s_1[i];
+    }
+    let res_c_lifted = ntt_extend_f128_vec_ghash(&res_c_s_combined, inv_table);
 
-    (res_ab.to_vec(), res_c_lifted, s_hat_v_c, quad_c)
-}
+    // s_hat_v_c canonical form: apply residual C_2 (small-eq constant for
+    // r[k_skip+1..k_skip+3]) and α⁻¹ (strips bank 1's extra α factor).
+    let c_2 = c_2_small_f128();
+    let alpha_inv = alpha_inv_f128();
+    let c_2_alpha_inv = c_2 * alpha_inv;
+    let mut s_hat_v_c = vec![F128::ZERO; 2 * ELL];
+    for lane in 0..ELL {
+        s_hat_v_c[lane] = c_2 * res_c_s_0[lane];
+        s_hat_v_c[ELL + lane] = c_2_alpha_inv * res_c_s_1[lane];
+    }
 
-/// [`round1_shift_reduce_extract_c_packed_padded_with_s_hat_v_quad`] without the
-/// quad. Retained as the stable three-output entry point for the round-1
-/// benchmarks.
-pub fn round1_shift_reduce_extract_c_packed_padded_with_s_hat_v(
-    a_packed: &[u8],
-    b_packed: &[u8],
-    c_packed: &[u8],
-    m: usize,
-    k_skip: usize,
-    r: &[F128],
-    inv_table: &InvNttTableByteSingleGf8,
-    padding: &PaddingSpec,
-) -> (Vec<F128>, Vec<F128>, Vec<F128>) {
-    let (res_ab, res_c_lifted, s_hat_v_c, _quad_c) =
-        round1_shift_reduce_extract_c_packed_padded_with_s_hat_v_quad(
-            a_packed, b_packed, c_packed, m, k_skip, r, inv_table, padding,
-        );
-    (res_ab, res_c_lifted, s_hat_v_c)
+    (res_ab.to_vec(), res_c_lifted, s_hat_v_c)
 }
 
 /// Challenge-weighted completion of round 1 using AB blocks returned by
 /// [`precompute_round1_ab_inner_packed_padded`]. This is byte-identical to
-/// [`round1_shift_reduce_extract_c_packed_padded_with_s_hat_v_quad`], while
-/// keeping the original A and B packed buffers available for zerocheck round 2.
+/// [`round1_shift_reduce_extract_c_packed_padded_with_s_hat_v`], while keeping
+/// the original A and B packed buffers available for zerocheck round 2.
 pub fn round1_shift_reduce_extract_c_packed_padded_with_precomputed_ab(
     ab_inner: &Round1AbInner,
     c_packed: &[u8],
@@ -2211,7 +1138,7 @@ pub fn round1_shift_reduce_extract_c_packed_padded_with_precomputed_ab(
     r: &[F128],
     inv_table: &InvNttTableByteSingleGf8,
     padding: &PaddingSpec,
-) -> (Vec<F128>, Vec<F128>, Vec<F128>, Vec<F128>) {
+) -> (Vec<F128>, Vec<F128>, Vec<F128>) {
     assert_eq!(k_skip, K_SKIP, "optimized variant is k_skip=6 only");
     assert!(
         m >= k_skip + N_INNER,
@@ -2232,13 +1159,10 @@ pub fn round1_shift_reduce_extract_c_packed_padded_with_precomputed_ab(
     let d_inv_val = d_inv();
     let eq_lo_scaled: Vec<F128> = eq.lo.iter().map(|v| *v * d_inv_val).collect();
     let convert = convert_table();
-    let mask_tables = build_c_mask_tables(&eq_lo_scaled);
+    let paired_c = &*PAIRED_C_TABLES;
     let eq_hi = &eq.hi;
     let (within_outer_mask, b_med_counts) = build_b_med_counts(padding);
     let ab_inner_bytes = ab_inner.as_bytes();
-    let split_ab_c = std::env::var_os("FLOCK_NO_ZC_SPLIT_AB_C").is_none();
-    let direct_ab_rows = std::env::var_os("FLOCK_NO_ZC_DIRECT_AB_ROWS").is_none();
-    let c_drain4 = std::env::var_os("FLOCK_NO_ZC_C_DRAIN4").is_none();
 
     // The challenge-independent AB transform finishes while the commitment is
     // still running. Its challenge-weighted completion is therefore a live
@@ -2246,8 +1170,8 @@ pub fn round1_shift_reduce_extract_c_packed_padded_with_precomputed_ab(
     // the shared P/E-core queue without changing the hot conversion kernel.
     // A fixed per-index partial keeps the nondeterministic claim order out of
     // the output; the final operation is XOR, so serial reduction is exact.
-    let mut partials: Vec<([F128; ELL], [[F128; ELL]; N_C_BANKS])> =
-        vec![([F128::ZERO; ELL], [[F128::ZERO; ELL]; N_C_BANKS]); hi_size];
+    let mut partials: Vec<([F128; ELL], [F128; ELL], [F128; ELL])> =
+        vec![([F128::ZERO; ELL], [F128::ZERO; ELL], [F128::ZERO; ELL],); hi_size];
     let partials_base = crate::epool::SyncPtr(partials.as_mut_ptr());
     crate::epool::run_hetero_chunks(hi_size, |x_hi| {
         let mut state = WorkerStateWithSHatV::new();
@@ -2262,363 +1186,47 @@ pub fn round1_shift_reduce_extract_c_packed_padded_with_precomputed_ab(
             &eq_lo_scaled,
             eq_hi[x_hi],
             convert,
-            &mask_tables,
-            split_ab_c,
-            direct_ab_rows,
-            c_drain4,
+            paired_c,
             &mut state,
         );
         // SAFETY: the queue hands out each x_hi exactly once, so this task is
         // the exclusive owner of partials[x_hi]. The queue's completion join
         // publishes every write before the reduction below reads the vector.
         unsafe {
-            *partials_base.ptr().add(x_hi) = (state.local_res_ab, state.local_res_c_s);
+            *partials_base.ptr().add(x_hi) = (
+                state.local_res_ab,
+                state.local_res_c_s_0,
+                state.local_res_c_s_1,
+            );
         }
     });
-    let (res_ab, banks) = partials.into_iter().fold(
-        ([F128::ZERO; ELL], [[F128::ZERO; ELL]; N_C_BANKS]),
-        |(mut ab1, mut c1), (ab2, c2)| {
+    let (res_ab, res_c_s_0, res_c_s_1) = partials.into_iter().fold(
+        ([F128::ZERO; ELL], [F128::ZERO; ELL], [F128::ZERO; ELL]),
+        |(mut ab1, mut c0_1, mut c1_1), (ab2, c0_2, c1_2)| {
             for i in 0..ELL {
                 ab1[i] += ab2[i];
+                c0_1[i] += c0_2[i];
+                c1_1[i] += c1_2[i];
             }
-            for (left, right) in c1.iter_mut().zip(c2) {
-                for i in 0..ELL {
-                    left[i] += right[i];
-                }
-            }
-            (ab1, c1)
+            (ab1, c0_1, c1_1)
         },
     );
 
-    crate::scratch::give_f128(mask_tables);
-    let (res_c_s, s_hat_v_c, quad_c) = finish_c_banks(&banks);
-    let res_c_lifted = ntt_extend_f128_vec_ghash(&res_c_s, inv_table);
-
-    (res_ab.to_vec(), res_c_lifted, s_hat_v_c, quad_c)
-}
-
-/// Resolve the Fold4-only lo/hi split tuning seam. Invalid values fail loudly:
-/// silently accepting a typo would make component profiles incomparable.
-fn fold4_n_hi_from_env() -> usize {
-    match std::env::var_os("FLOCK_EXPERIMENTAL_FOLD4_N_HI") {
-        None => 7,
-        Some(value) => match value.to_str() {
-            Some("5") => 5,
-            Some("6") => 6,
-            Some("7") => 7,
-            _ => panic!("FLOCK_EXPERIMENTAL_FOLD4_N_HI must be exactly 5, 6, or 7"),
-        },
+    let mut res_c_s_combined = [F128::ZERO; ELL];
+    for i in 0..ELL {
+        res_c_s_combined[i] = res_c_s_0[i] + res_c_s_1[i];
     }
-}
+    let res_c_lifted = ntt_extend_f128_vec_ghash(&res_c_s_combined, inv_table);
 
-/// Second-stage producer A/B seam. Pair fusion stays active on both arms;
-/// exact `=1` additionally partitions each 32-bank C job into four q-local
-/// 8-bank jobs. Other values retain the monolithic 128-job schedule.
-fn fold4_q_partition_from_value(value: Option<&std::ffi::OsStr>) -> bool {
-    value == Some(std::ffi::OsStr::new("1"))
-}
-
-fn fold4_q_partition_from_env() -> bool {
-    let value = std::env::var_os("FLOCK_EXPERIMENTAL_FOLD4_Q_PARTITION");
-    fold4_q_partition_from_value(value.as_deref())
-}
-
-/// Monolithic producer follow-on. By default, fuse four adjacent low slots
-/// into two pair-table loads and one accumulator update. Any value for the
-/// emergency kill switch restores the two-block pair-fused drain.
-fn fold4_pair4_from_kill_value(value: Option<&std::ffi::OsStr>) -> bool {
-    value.is_none()
-}
-
-fn fold4_pair4_from_env() -> bool {
-    let value = std::env::var_os("FLOCK_NO_OPEN_DIRECT_FOLD4_PAIR4");
-    fold4_pair4_from_kill_value(value.as_deref())
-}
-
-/// Experimental direct-fold4 counterpart of
-/// [`round1_shift_reduce_extract_c_packed_padded_with_precomputed_ab`].
-/// Besides the incumbent four outputs it returns C's raw 16x128 retained-bank
-/// tensor for the PCS direct-fold4 consumer.  Callers must gate this entry
-/// behind [`crate::pcs::ranked_direct_fold4_enabled`]; it is a separate symbol
-/// so the kill switch can restore the previous path instruction-for-instruction.
-pub fn round1_shift_reduce_extract_c_packed_padded_with_precomputed_ab_fold4(
-    ab_inner: &Round1AbInner,
-    c_packed: &[u8],
-    m: usize,
-    k_skip: usize,
-    r: &[F128],
-    inv_table: &InvNttTableByteSingleGf8,
-    padding: &PaddingSpec,
-) -> (Vec<F128>, Vec<F128>, Vec<F128>, Vec<F128>, Vec<F128>) {
-    round1_shift_reduce_extract_c_packed_padded_with_precomputed_ab_fold4_n_hi(
-        ab_inner,
-        c_packed,
-        m,
-        k_skip,
-        r,
-        inv_table,
-        padding,
-        fold4_n_hi_from_env(),
-        fold4_q_partition_from_env(),
-        fold4_pair4_from_env(),
-    )
-}
-
-#[allow(clippy::too_many_arguments)]
-fn round1_shift_reduce_extract_c_packed_padded_with_precomputed_ab_fold4_n_hi(
-    ab_inner: &Round1AbInner,
-    c_packed: &[u8],
-    m: usize,
-    k_skip: usize,
-    r: &[F128],
-    inv_table: &InvNttTableByteSingleGf8,
-    padding: &PaddingSpec,
-    fold4_n_hi: usize,
-    q_partition: bool,
-    pair4: bool,
-) -> (Vec<F128>, Vec<F128>, Vec<F128>, Vec<F128>, Vec<F128>) {
-    let profile =
-        std::env::var_os("FLOCK_FOLD4_TIMING").as_deref() == Some(std::ffi::OsStr::new("1"));
-    let t_total = std::time::Instant::now();
-    assert!((5..=7).contains(&fold4_n_hi));
-    assert!(
-        !(q_partition && pair4),
-        "FLOCK_EXPERIMENTAL_FOLD4_Q_PARTITION and default pair4 are mutually exclusive; set FLOCK_NO_OPEN_DIRECT_FOLD4_PAIR4"
-    );
-    assert_eq!(k_skip, K_SKIP, "optimized variant is k_skip=6 only");
-    assert!(
-        m >= k_skip + N_INNER,
-        "m must be >= k_skip + N_INNER ({}) for the shift_reduce optimization",
-        k_skip + N_INNER
-    );
-    let total_bytes = (1usize << m) / 8;
-    assert_eq!(ab_inner.len_bytes(), total_bytes);
-    assert_eq!(c_packed.len(), total_bytes);
-    assert_eq!(r.len(), m);
-    assert_eq!(inv_table.k, k_skip);
-
-    // The 32-bank high fold is four times wider than the incumbent C fold.
-    // Keep only seven coordinates in the high factor: ranked work still has
-    // 128 independently scheduled chunks, while the final high scaling and
-    // deterministic partial storage shrink 4x versus the global n_hi=9 split
-    // (262,144 rather than 1,048,576 C-bank field mul-adds at the ranked
-    // shape). The low table remains small because Fold4 uses only 16 entries
-    // per x_outer_lo.
-    let t_eq_setup = std::time::Instant::now();
-    let eq = SplitEqGhash::with_n_hi(&r[k_skip + N_INNER..], fold4_n_hi);
-    let big_lo_size = 1usize << eq.n_lo;
-    let hi_size = 1usize << eq.n_hi;
-    let n_lo_and_inner = eq.n_lo + N_INNER;
-
-    // AB still folds all four medium coordinates. C retains the low two and
-    // therefore absorbs only D_hi^-1; the local collapse oracle proves that
-    // re-applying the omitted low eq produces the incumbent D^-1 result.
-    let eq_lo_scaled: Vec<F128> = eq.lo.iter().map(|v| *v * d_inv()).collect();
-    let eq_lo_hi_scaled: Vec<F128> = eq.lo.iter().map(|v| *v * d_hi_inv()).collect();
-    let convert = convert_table();
-    let eq_setup_ms = t_eq_setup.elapsed().as_secs_f64() * 1e3;
-    let t_c_table = std::time::Instant::now();
-    let c_fold4_pair_mask_tables = build_c_fold4_pair_mask_tables(&eq_lo_hi_scaled);
-    let c_table_ms = t_c_table.elapsed().as_secs_f64() * 1e3;
-    let eq_hi = &eq.hi;
-    let (within_outer_mask, b_med_counts) = build_b_med_counts(padding);
-    let ab_inner_bytes = ab_inner.as_bytes();
-
-    let timing_cpu_ns: [std::sync::atomic::AtomicU64; 3] =
-        std::array::from_fn(|_| std::sync::atomic::AtomicU64::new(0));
-    let timing_cpu_ns_ref = profile.then_some(&timing_cpu_ns);
-    let (res_ab, banks, queue_jobs, queue_ms, reduce_ms) = if q_partition {
-        type Fold4QPartial = Box<[[F128; ELL]; N_C_BANKS]>;
-        // Five interleaved jobs per x_hi keep AB single-pass while giving C
-        // four q-local 8 KiB working sets. Indexed slots preserve deterministic
-        // x_hi-major reduction regardless of epool completion order.
-        let mut ab_partials: Vec<Option<[F128; ELL]>> =
-            std::iter::repeat_with(|| None).take(hi_size).collect();
-        let mut c_partials: Vec<Option<Fold4QPartial>> = std::iter::repeat_with(|| None)
-            .take(hi_size * N_C_FOLD4_GROUPS)
-            .collect();
-        let ab_partials_base = crate::epool::SyncPtr(ab_partials.as_mut_ptr());
-        let c_partials_base = crate::epool::SyncPtr(c_partials.as_mut_ptr());
-        let queue_jobs = hi_size * (1 + N_C_FOLD4_GROUPS);
-        let t_queue = std::time::Instant::now();
-        crate::epool::run_hetero_chunks(queue_jobs, |job| {
-            // Put all AB jobs first so a heterogeneous pool cannot leave a
-            // lone heavy AB job as the final E-core tail. The remaining tail
-            // consists entirely of uniform q-local C jobs.
-            if job < hi_size {
-                let x_hi = job;
-                let mut partial_ab = [F128::ZERO; ELL];
-                process_one_x_hi_with_precomputed_ab_fold4_ab(
-                    x_hi,
-                    big_lo_size,
-                    n_lo_and_inner,
-                    within_outer_mask,
-                    &b_med_counts,
-                    ab_inner_bytes,
-                    &eq_lo_scaled,
-                    eq_hi[x_hi],
-                    convert,
-                    timing_cpu_ns_ref,
-                    &mut partial_ab,
-                );
-                // SAFETY: one AB subjob owns each x_hi slot.
-                unsafe {
-                    *ab_partials_base.clone().ptr().add(x_hi) = Some(partial_ab);
-                }
-            } else {
-                let c_job = job - hi_size;
-                let x_hi = c_job / N_C_FOLD4_GROUPS;
-                let q = c_job % N_C_FOLD4_GROUPS;
-                let mut partial_c = zero_c_fold4_q_banks();
-                process_one_x_hi_with_precomputed_ab_fold4_c_q_pair(
-                    x_hi,
-                    q,
-                    big_lo_size,
-                    n_lo_and_inner,
-                    within_outer_mask,
-                    &b_med_counts,
-                    c_packed,
-                    eq_hi[x_hi],
-                    &c_fold4_pair_mask_tables,
-                    timing_cpu_ns_ref,
-                    &mut partial_c,
-                );
-                let c_index = x_hi * N_C_FOLD4_GROUPS + q;
-                // SAFETY: each (x_hi,q) subjob owns one C slot.
-                unsafe {
-                    *c_partials_base.clone().ptr().add(c_index) = Some(partial_c);
-                }
-            }
-        });
-        let queue_ms = t_queue.elapsed().as_secs_f64() * 1e3;
-
-        let t_reduce = std::time::Instant::now();
-        let res_ab = ab_partials.into_iter().map(Option::unwrap).fold(
-            [F128::ZERO; ELL],
-            |mut left, right| {
-                for lane in 0..ELL {
-                    left[lane] += right[lane];
-                }
-                left
-            },
-        );
-        let mut banks = zero_c_fold4_banks();
-        for (c_index, partial) in c_partials.into_iter().map(Option::unwrap).enumerate() {
-            let q = c_index % N_C_FOLD4_GROUPS;
-            for (k, right) in partial.iter().enumerate() {
-                let left = &mut banks[q * N_C_BANKS + k];
-                for lane in 0..ELL {
-                    left[lane] += right[lane];
-                }
-            }
-        }
-        let reduce_ms = t_reduce.elapsed().as_secs_f64() * 1e3;
-        (res_ab, banks, queue_jobs, queue_ms, reduce_ms)
-    } else {
-        type Fold4Partial = ([F128; ELL], Box<[[F128; ELL]; N_C_FOLD4_BANKS]>);
-        let mut partials: Vec<Option<Fold4Partial>> =
-            std::iter::repeat_with(|| None).take(hi_size).collect();
-        let partials_base = crate::epool::SyncPtr(partials.as_mut_ptr());
-        let t_queue = std::time::Instant::now();
-        crate::epool::run_hetero_chunks(hi_size, |x_hi| {
-            let mut partial_ab = [F128::ZERO; ELL];
-            process_one_x_hi_with_precomputed_ab_fold4_ab(
-                x_hi,
-                big_lo_size,
-                n_lo_and_inner,
-                within_outer_mask,
-                &b_med_counts,
-                ab_inner_bytes,
-                &eq_lo_scaled,
-                eq_hi[x_hi],
-                convert,
-                timing_cpu_ns_ref,
-                &mut partial_ab,
-            );
-            let mut partial_c = zero_c_fold4_banks();
-            if pair4 && big_lo_size >= 4 {
-                process_one_x_hi_with_precomputed_ab_fold4_c_four(
-                    x_hi,
-                    big_lo_size,
-                    n_lo_and_inner,
-                    within_outer_mask,
-                    &b_med_counts,
-                    c_packed,
-                    eq_hi[x_hi],
-                    &c_fold4_pair_mask_tables,
-                    timing_cpu_ns_ref,
-                    &mut partial_c,
-                );
-            } else {
-                process_one_x_hi_with_precomputed_ab_fold4_c_pair(
-                    x_hi,
-                    big_lo_size,
-                    n_lo_and_inner,
-                    within_outer_mask,
-                    &b_med_counts,
-                    c_packed,
-                    eq_hi[x_hi],
-                    &c_fold4_pair_mask_tables,
-                    timing_cpu_ns_ref,
-                    &mut partial_c,
-                );
-            }
-            // SAFETY: each x_hi owns one indexed slot; the epool join
-            // publishes it before deterministic reduction.
-            unsafe {
-                *partials_base.clone().ptr().add(x_hi) = Some((partial_ab, partial_c));
-            }
-        });
-        let queue_ms = t_queue.elapsed().as_secs_f64() * 1e3;
-
-        let t_reduce = std::time::Instant::now();
-        let (res_ab, banks) = partials.into_iter().map(Option::unwrap).fold(
-            ([F128::ZERO; ELL], zero_c_fold4_banks()),
-            |(mut ab1, mut c1), (ab2, c2)| {
-                for lane in 0..ELL {
-                    ab1[lane] += ab2[lane];
-                }
-                for (left, right) in c1.iter_mut().zip(c2.iter()) {
-                    for lane in 0..ELL {
-                        left[lane] += right[lane];
-                    }
-                }
-                (ab1, c1)
-            },
-        );
-        let reduce_ms = t_reduce.elapsed().as_secs_f64() * 1e3;
-        (res_ab, banks, hi_size, queue_ms, reduce_ms)
-    };
-
-    crate::scratch::give_f128(c_fold4_pair_mask_tables);
-    let t_finish = std::time::Instant::now();
-    let (res_c_s, s_hat_v_c, quad_c, fold4_c) = finish_c_fold4_banks(&banks);
-    let res_c_lifted = ntt_extend_f128_vec_ghash(&res_c_s, inv_table);
-    let finish_ms = t_finish.elapsed().as_secs_f64() * 1e3;
-    if profile {
-        use std::sync::atomic::Ordering;
-        let ns_to_ms = |ns: u64| ns as f64 / 1e6;
-        eprintln!(
-            "[fold4-c-timing] n_hi={} q_partition={} pair4={} hi_chunks={} queue_jobs={} lo_slots={} lo_pairs={} eq_setup={:.3}ms c_pair_table={:.3}ms queue_wall={:.3}ms ab_cpu={:.3}ms c_cpu={:.3}ms high_cpu={:.3}ms reduce={:.3}ms finish={:.3}ms total={:.3}ms",
-            fold4_n_hi,
-            q_partition,
-            pair4 && big_lo_size >= 4,
-            hi_size,
-            queue_jobs,
-            big_lo_size,
-            big_lo_size.div_ceil(2),
-            eq_setup_ms,
-            c_table_ms,
-            queue_ms,
-            ns_to_ms(timing_cpu_ns[0].load(Ordering::Relaxed)),
-            ns_to_ms(timing_cpu_ns[1].load(Ordering::Relaxed)),
-            ns_to_ms(timing_cpu_ns[2].load(Ordering::Relaxed)),
-            reduce_ms,
-            finish_ms,
-            t_total.elapsed().as_secs_f64() * 1e3,
-        );
+    let c_2 = c_2_small_f128();
+    let c_2_alpha_inv = c_2 * alpha_inv_f128();
+    let mut s_hat_v_c = vec![F128::ZERO; 2 * ELL];
+    for lane in 0..ELL {
+        s_hat_v_c[lane] = c_2 * res_c_s_0[lane];
+        s_hat_v_c[ELL + lane] = c_2_alpha_inv * res_c_s_1[lane];
     }
-    (res_ab.to_vec(), res_c_lifted, s_hat_v_c, quad_c, fold4_c)
+
+    (res_ab.to_vec(), res_c_lifted, s_hat_v_c)
 }
 
 /// Serial reference — same I/O as [`round1_shift_reduce_extract_c_packed`],
@@ -3007,192 +1615,6 @@ mod tests {
         }
     }
 
-    /// **Requirement C-QUAD.** The four-bank statistic the capture ships for the
-    /// c-claim must collapse, under the *protocol* low point
-    /// `suffix_C[..2] = [φ₈(0x53), φ₈(0xB5)]` that ring-switch builds on intake,
-    /// to exactly the wire `s_hat_v_c` the incumbent path observes. Checked on
-    /// both entry points and on the padded (b_med-skipping) shapes, since a
-    /// quad that treated padding differently would be a different object.
-    #[test]
-    fn quad_collapses_to_wire_s_hat_v_c() {
-        use crate::pcs::ring_switch::collapse_s_hat_v_quad;
-        use crate::zerocheck::PaddingSpec;
-        use crate::zerocheck::univariate_skip::pack_bits;
-
-        // Exactly how `prove_batched_padded_with_precomputed` derives the low
-        // point: `dense_suffixes[1][..2]` = `r_rest[1..3]` = the second and
-        // third protocol small challenges.
-        let small = small_challenges_ghash();
-        let low_point = [small[1], small[2]];
-
-        // (k_log, useful_bits, n_blocks_log); `None` = dense.
-        let cases: [(usize, Option<(usize, usize)>); 5] = [
-            (13, None),
-            (15, None),
-            (14, Some((14, 15_409))), // BLAKE3 block shape (one b_med window skipped)
-            (17, Some((14, 15_409))), // …across several blocks, both eq halves live
-            (15, Some((15, 31_401))), // SHA-2 block shape
-        ];
-
-        for (m, padded) in cases {
-            let mut rng = Rng::new(0x9AD_C011_u64.wrapping_add(m as u64));
-            let total_bits = 1usize << m;
-            let mut a = rng.bits(total_bits);
-            let mut b = rng.bits(total_bits);
-            let mut c = rng.bits(total_bits);
-            let padding = match padded {
-                None => PaddingSpec::dense(m),
-                Some((k_log, useful_bits)) => {
-                    let block_size = 1usize << k_log;
-                    for blk in 0..(total_bits / block_size) {
-                        for j in useful_bits..block_size {
-                            let idx = blk * block_size + j;
-                            a[idx] = false;
-                            b[idx] = false;
-                            c[idx] = false;
-                        }
-                    }
-                    PaddingSpec {
-                        k_log,
-                        useful_bits_per_block: useful_bits,
-                    }
-                }
-            };
-            let (a_p, b_p, c_p) = (pack_bits(&a), pack_bits(&b), pack_bits(&c));
-            let outer = rng.f128_vec(m - K_SKIP - N_INNER);
-            let r = build_protocol_r(m, &outer);
-            let table = make_inv_table();
-
-            let (fused_ab, fused_c, s_hat_v_c, quad) =
-                round1_shift_reduce_extract_c_packed_padded_with_s_hat_v_quad(
-                    &a_p, &b_p, &c_p, m, K_SKIP, &r, &table, &padding,
-                );
-            assert_eq!(quad.len(), 4 * 2 * ELL, "quad length at m={m}");
-            assert_eq!(
-                collapse_s_hat_v_quad(&quad, &low_point),
-                s_hat_v_c,
-                "C-QUAD collapse mismatch at m={m}, padded={}",
-                padded.is_some()
-            );
-
-            // The precomputed-AB entry point (the one the ranked prove runs)
-            // must agree on all four outputs.
-            let precomputed =
-                precompute_round1_ab_inner_packed_padded(&a_p, &b_p, m, K_SKIP, &table, &padding);
-            let (pre_ab, pre_c, pre_s_hat_v, pre_quad) =
-                round1_shift_reduce_extract_c_packed_padded_with_precomputed_ab(
-                    &precomputed,
-                    &c_p,
-                    m,
-                    K_SKIP,
-                    &r,
-                    &table,
-                    &padding,
-                );
-            assert_eq!(pre_ab, fused_ab, "res_ab mismatch at m={m}");
-            assert_eq!(pre_c, fused_c, "res_c_lifted mismatch at m={m}");
-            assert_eq!(pre_s_hat_v, s_hat_v_c, "s_hat_v_c mismatch at m={m}");
-            assert_eq!(pre_quad, quad, "quad mismatch at m={m}");
-        }
-    }
-
-    #[test]
-    fn ab_precompute_nt_flavor_is_byte_identical() {
-        use crate::zerocheck::univariate_skip::pack_bits;
-        // Same padded/dense case matrix as the precompute oracle above: the
-        // NT drain (stack bounce + stnp) and the incumbent direct kernel
-        // write must produce identical storage bytes, including zeroed
-        // padding holes.
-        let cases: [(usize, Option<(usize, usize)>); 3] = [
-            (13, None),
-            (14, Some((14, 15_409))), // BLAKE3 block shape
-            (17, Some((14, 15_409))),
-        ];
-        for (m, padded) in cases {
-            let mut rng = Rng::new(0xAB_57_0F14_u64 ^ (m as u64));
-            let total_bits = 1usize << m;
-            let mut a = rng.bits(total_bits);
-            let mut b = rng.bits(total_bits);
-            let padding = match padded {
-                None => PaddingSpec::dense(m),
-                Some((k_log, useful_bits)) => {
-                    let block_size = 1usize << k_log;
-                    for blk in 0..(total_bits / block_size) {
-                        for j in useful_bits..block_size {
-                            let idx = blk * block_size + j;
-                            a[idx] = false;
-                            b[idx] = false;
-                        }
-                    }
-                    PaddingSpec {
-                        k_log,
-                        useful_bits_per_block: useful_bits,
-                    }
-                }
-            };
-            let (a_p, b_p) = (pack_bits(&a), pack_bits(&b));
-            let table = make_inv_table();
-            let plain = precompute_round1_ab_inner_packed_padded_with_flavor(
-                &a_p, &b_p, m, K_SKIP, &table, &padding, false,
-            );
-            let nt = precompute_round1_ab_inner_packed_padded_with_flavor(
-                &a_p, &b_p, m, K_SKIP, &table, &padding, true,
-            );
-            assert_eq!(
-                plain.as_bytes(),
-                nt.as_bytes(),
-                "store flavor changed bytes at m={m}, padded={}",
-                padded.is_some()
-            );
-        }
-    }
-
-    /// Owned-kernel interleaved A/B of the store flavor at the ranked
-    /// geometry (m=32, BLAKE3 padding). Ignored: ~1.5 GiB and seconds of
-    /// wall; run explicitly with `--ignored --nocapture`.
-    #[test]
-    #[ignore]
-    fn ab_precompute_nt_bench() {
-        use crate::zerocheck::univariate_skip::pack_bits;
-        let m = 32usize;
-        let total_bits = 1usize << m;
-        let padding = PaddingSpec {
-            k_log: 14,
-            useful_bits_per_block: 15_409,
-        };
-        let mut rng = Rng::new(0xBE9C4);
-        let mut a = rng.bits(total_bits);
-        let mut b = rng.bits(total_bits);
-        let block_size = 1usize << padding.k_log;
-        for blk in 0..(total_bits / block_size) {
-            for j in padding.useful_bits_per_block..block_size {
-                a[blk * block_size + j] = false;
-                b[blk * block_size + j] = false;
-            }
-        }
-        let (a_p, b_p) = (pack_bits(&a), pack_bits(&b));
-        drop(a);
-        drop(b);
-        let table = make_inv_table();
-        // Warmup one of each, then interleave measured reps.
-        for nt in [false, true] {
-            let _ = precompute_round1_ab_inner_packed_padded_with_flavor(
-                &a_p, &b_p, m, K_SKIP, &table, &padding, nt,
-            );
-        }
-        for rep in 0..4 {
-            for nt in [rep % 2 == 1, rep % 2 == 0] {
-                let t0 = std::time::Instant::now();
-                let out = precompute_round1_ab_inner_packed_padded_with_flavor(
-                    &a_p, &b_p, m, K_SKIP, &table, &padding, nt,
-                );
-                let ms = t0.elapsed().as_secs_f64() * 1e3;
-                println!("rep={rep} nt={nt}: {ms:.2} ms");
-                drop(out);
-            }
-        }
-    }
-
     #[cfg(target_arch = "aarch64")]
     #[test]
     fn neon_bit_transpose_matches_scalar() {
@@ -3261,125 +1683,6 @@ mod tests {
 
     #[cfg(target_arch = "aarch64")]
     #[test]
-    fn static_b_context_gate_respects_layout_and_legacy_policy() {
-        let table = make_inv_table();
-        assert!(
-            kernels::aarch64::prepare_static_b_context_with_policy(&table, false, false, false)
-                .is_none(),
-            "non-BLAKE3 layouts must not prepare the generated static-B plan"
-        );
-        assert!(
-            kernels::aarch64::prepare_static_b_context_with_policy(&table, true, true, false)
-                .is_none(),
-            "the legacy control must retain the generic fallback"
-        );
-        assert!(
-            matches!(
-                kernels::aarch64::prepare_static_b_context_with_policy(&table, true, false, true),
-                Some(kernels::aarch64::StaticBContext::LegacyPerCall)
-            ),
-            "the context control must retain per-call lookups and static-B"
-        );
-        assert!(
-            matches!(
-                kernels::aarch64::prepare_static_b_context_with_policy(&table, true, false, false),
-                Some(kernels::aarch64::StaticBContext::Prepared { .. })
-            ),
-            "the checked static-B plan should be prepared for its exact layout"
-        );
-    }
-
-    #[cfg(target_arch = "aarch64")]
-    #[test]
-    fn prepared_static_b_context_matches_scalar_and_guard_fallback() {
-        // The generated debug kernel keeps every match arm's SIMD locals in
-        // the frame; give this direct-kernel oracle more than libtest's small
-        // worker stack. Release builds reuse the slots aggressively.
-        std::thread::Builder::new()
-            .stack_size(16 << 20)
-            .spawn(|| {
-                let mut rng = Rng::new(0xB57A_71C0);
-                let table = make_inv_table();
-                let a_packed = pack_bits(&rng.bits(1 << 14));
-                let mut b_packed = pack_bits(&rng.bits(1 << 14));
-                let w = 0usize;
-                let b_med = 3usize;
-                let blk = w * (1 << N_MEDIUM) + b_med;
-                let byte_base_b = b_med * N_CHUNKS * 8;
-
-                // Force every generated static position to its expected value while
-                // retaining random bytes in the dynamic positions.
-                for k in 0..N_CHUNKS {
-                    let off = byte_base_b + k * N_CHUNKS;
-                    let (mask, expected) = kernels::aarch64::BSTATIC_MASKS[blk][k];
-                    let word = u64::from_le_bytes(b_packed[off..off + 8].try_into().unwrap());
-                    let word = (word & !mask) | expected;
-                    b_packed[off..off + 8].copy_from_slice(&word.to_le_bytes());
-                }
-
-                let context = kernels::aarch64::prepare_static_b_context_with_policy(
-                    &table, true, false, false,
-                )
-                .expect("enabled static-B context");
-                let legacy_context = kernels::aarch64::prepare_static_b_context_with_policy(
-                    &table, true, false, true,
-                )
-                .expect("per-call static-B control");
-                let run_scalar = |b: &[u8]| {
-                    let mut out = [0u8; 64];
-                    let mut a_col = [F8::ZERO; ELL];
-                    let mut b_col = [F8::ZERO; ELL];
-                    shift_reduce_inner_ab_scalar(
-                        &a_packed, b, &table, 0, b_med, &mut out, &mut a_col, &mut b_col,
-                    );
-                    out
-                };
-                let run_context = |b: &[u8], context| {
-                    let mut out = [0u8; 64];
-                    shift_reduce_inner_ab_fused_neon_checked(
-                        &a_packed,
-                        b,
-                        &table,
-                        0,
-                        b_med,
-                        &mut out,
-                        false,
-                        false,
-                        0,
-                        w,
-                        Some(context),
-                    );
-                    out
-                };
-
-                assert_eq!(run_context(&b_packed, context), run_scalar(&b_packed));
-                assert_eq!(
-                    run_context(&b_packed, legacy_context),
-                    run_scalar(&b_packed)
-                );
-
-                // Break one guarded static bit. The prepared plan must still take its
-                // row-local generic fallback and remain identical to the scalar oracle.
-                let guarded_k = 1usize;
-                let (guard_mask, _) = kernels::aarch64::BSTATIC_MASKS[blk][guarded_k];
-                assert_ne!(guard_mask, 0);
-                let off = byte_base_b + guarded_k * N_CHUNKS;
-                let mut word = u64::from_le_bytes(b_packed[off..off + 8].try_into().unwrap());
-                word ^= guard_mask & guard_mask.wrapping_neg();
-                b_packed[off..off + 8].copy_from_slice(&word.to_le_bytes());
-                assert_eq!(run_context(&b_packed, context), run_scalar(&b_packed));
-                assert_eq!(
-                    run_context(&b_packed, legacy_context),
-                    run_scalar(&b_packed)
-                );
-            })
-            .expect("spawn static-B oracle")
-            .join()
-            .expect("static-B oracle thread");
-    }
-
-    #[cfg(target_arch = "aarch64")]
-    #[test]
     fn neon_mixed_const_one_inner_matches_scalar_inner() {
         let mut rng = Rng::new(0xC057_01E5);
         let m = 14;
@@ -3404,17 +1707,7 @@ mod tests {
                 &a_packed, &b_mixed, &table, 0, 0, &mut want, &mut a_col, &mut b_col,
             );
             shift_reduce_inner_ab_fused_neon_checked(
-                &a_packed,
-                &b_mixed,
-                &table,
-                0,
-                0,
-                &mut got,
-                false,
-                false,
-                mask,
-                usize::MAX,
-                None,
+                &a_packed, &b_mixed, &table, 0, 0, &mut got, false, false, mask, usize::MAX,
             );
             assert_eq!(got, want, "mixed const-one mask {mask:#04x}");
         }
@@ -3644,8 +1937,8 @@ mod tests {
                 round1_extract_c_packed_with_s_hat_v(&a, &b, &c, m, K_SKIP, &r, &inv_table);
 
             // System under test.
-            let (got_ab, got_c, got_s_hat_v, got_quad) =
-                round1_shift_reduce_extract_c_packed_padded_with_s_hat_v_quad(
+            let (got_ab, got_c, got_s_hat_v) =
+                round1_shift_reduce_extract_c_packed_padded_with_s_hat_v(
                     &a,
                     &b,
                     &c,
@@ -3662,30 +1955,6 @@ mod tests {
             assert_eq!(
                 got_s_hat_v, oracle_s_hat_v,
                 "s_hat_v_c mismatch vs scalar oracle at m={m}"
-            );
-
-            // Requirement C-QUAD: what ring-switch collapses the quad into on
-            // intake must be exactly the wire `s_hat_v_c`.
-            assert_eq!(got_quad.len(), 4 * 2 * ELL, "quad length at m={m}");
-            assert_eq!(
-                crate::pcs::ring_switch::collapse_s_hat_v_quad(
-                    &got_quad,
-                    &r[K_SKIP + 1..K_SKIP + 3]
-                ),
-                got_s_hat_v,
-                "quad collapse mismatch at m={m}"
-            );
-
-            // The generic 8-bank scalar oracle: independent of the α algebra
-            // (it divides by the literal eq weights), so it pins the α-free
-            // convention the quad is defined in.
-            let oracle_quad =
-                crate::zerocheck::univariate_skip::round1_extract_c_packed_quad_oracle(
-                    &a, &b, &c, m, K_SKIP, &r, &inv_table,
-                );
-            assert_eq!(
-                got_quad, oracle_quad,
-                "quad mismatch vs scalar oracle at m={m}"
             );
         }
     }
@@ -3707,7 +1976,7 @@ mod tests {
             let inv_table = make_inv_table();
             let padding = PaddingSpec::dense(m);
 
-            let expected = round1_shift_reduce_extract_c_packed_padded_with_s_hat_v_quad(
+            let expected = round1_shift_reduce_extract_c_packed_padded_with_s_hat_v(
                 &a, &b, &c, m, K_SKIP, &r, &inv_table, &padding,
             );
             let precomputed =
@@ -3724,134 +1993,6 @@ mod tests {
             );
 
             assert_eq!(got, expected, "split round-1 mismatch at m={m}");
-        }
-    }
-
-    /// End-to-end producer gate for the opt-in entry point.  It must preserve
-    /// every incumbent round-1/capture output and its extra 16x128 tensor must
-    /// independently collapse to the same canonical C vector.
-    #[test]
-    fn precomputed_ab_fold4_c_capture_matches_incumbent() {
-        // The incumbent padded debug kernel exceeds Rayon's default worker
-        // stack on AArch64. Keep that test-only frame expansion isolated from
-        // production workers while still exercising the complete cross-path
-        // oracle below.
-        let pool = rayon::ThreadPoolBuilder::new()
-            .num_threads(2)
-            .stack_size(16 << 20)
-            .build()
-            .unwrap();
-        pool.install(precomputed_ab_fold4_c_capture_matches_incumbent_inner);
-    }
-
-    fn precomputed_ab_fold4_c_capture_matches_incumbent_inner() {
-        let cases: [(usize, PaddingSpec); 5] = [
-            (13, PaddingSpec::dense(13)),
-            (15, PaddingSpec::dense(15)),
-            // Eight sampled outer coordinates make the Fold4-specific n_hi=7
-            // split differ from the incumbent split, proving regrouping exact.
-            (21, PaddingSpec::dense(21)),
-            (
-                14,
-                PaddingSpec {
-                    k_log: 14,
-                    useful_bits_per_block: 15_409,
-                },
-            ),
-            (
-                17,
-                PaddingSpec {
-                    k_log: 14,
-                    useful_bits_per_block: 15_409,
-                },
-            ),
-        ];
-
-        for (m, padding) in cases {
-            let mut rng = Rng::new(0xF01D_4C00_u64.wrapping_add(m as u64));
-            let total_bits = 1usize << m;
-            let mut a = rng.bits(total_bits);
-            let mut b = rng.bits(total_bits);
-            let mut c = rng.bits(total_bits);
-            if padding.useful_bits_per_block < (1usize << padding.k_log) {
-                let block_size = 1usize << padding.k_log;
-                for block in 0..(total_bits / block_size) {
-                    for bit in padding.useful_bits_per_block..block_size {
-                        let index = block * block_size + bit;
-                        a[index] = false;
-                        b[index] = false;
-                        c[index] = false;
-                    }
-                }
-            }
-
-            let a = pack_bits(&a);
-            let b = pack_bits(&b);
-            let c = pack_bits(&c);
-            let outer = rng.f128_vec(m - K_SKIP - N_INNER);
-            let r = build_protocol_r(m, &outer);
-            let inv_table = make_inv_table();
-            let precomputed =
-                precompute_round1_ab_inner_packed_padded(&a, &b, m, K_SKIP, &inv_table, &padding);
-
-            let incumbent = round1_shift_reduce_extract_c_packed_padded_with_precomputed_ab(
-                &precomputed,
-                &c,
-                m,
-                K_SKIP,
-                &r,
-                &inv_table,
-                &padding,
-            );
-            for n_hi in 5..=7 {
-                for (q_partition, pair4) in [(false, false), (false, true), (true, false)] {
-                    let fold4 =
-                        round1_shift_reduce_extract_c_packed_padded_with_precomputed_ab_fold4_n_hi(
-                            &precomputed,
-                            &c,
-                            m,
-                            K_SKIP,
-                            &r,
-                            &inv_table,
-                            &padding,
-                            n_hi,
-                            q_partition,
-                            pair4,
-                        );
-
-                    assert_eq!(
-                        fold4.0, incumbent.0,
-                        "round1 AB mismatch at m={m}, n_hi={n_hi}, q_partition={q_partition}, pair4={pair4}"
-                    );
-                    assert_eq!(
-                        fold4.1, incumbent.1,
-                        "round1 C mismatch at m={m}, n_hi={n_hi}, q_partition={q_partition}, pair4={pair4}"
-                    );
-                    assert_eq!(
-                        fold4.2, incumbent.2,
-                        "canonical C mismatch at m={m}, n_hi={n_hi}, q_partition={q_partition}, pair4={pair4}"
-                    );
-                    assert_eq!(
-                        fold4.3, incumbent.3,
-                        "quad C mismatch at m={m}, n_hi={n_hi}, q_partition={q_partition}, pair4={pair4}"
-                    );
-                    assert_eq!(fold4.4.len(), 16 * 2 * ELL);
-
-                    let small = small_challenges_ghash();
-                    let medium = medium_challenges_ghash();
-                    let low_eq = build_eq(&[small[1], small[2], medium[0], medium[1]]);
-                    let mut collapsed = vec![F128::ZERO; 2 * ELL];
-                    for low in 0..16 {
-                        for packed in 0..2 * ELL {
-                            collapsed[packed] += low_eq[low] * fold4.4[low * 2 * ELL + packed];
-                        }
-                    }
-                    assert_eq!(
-                        collapsed, incumbent.2,
-                        "fold4 C collapse mismatch at m={m}, n_hi={n_hi}, q_partition={q_partition}, pair4={pair4}"
-                    );
-                }
-            }
         }
     }
 
@@ -3882,49 +2023,32 @@ mod tests {
         }
     }
 
-    /// Eight-bank oracle, same construction as [`accumulate_convert_oracle`].
-    ///
-    /// Deliberately routed through the **convert table** rather than the mask
-    /// shortcut the kernel uses: bank `s` sums `convert[b·256 + (c & (1<<s))]`
-    /// = `α^s · Σ_b γ^b · bit_s(c_b)` and is then stripped of `α^s`. Agreement
-    /// with the kernel is therefore an independent check of the collapse
-    /// `Σ_b γ^b · bit_s(c_b) == F128 { lo: mask_s }`, not a restatement of it.
+    /// Two-bank oracle, same construction as [`accumulate_convert_oracle`].
+    #[cfg(target_arch = "aarch64")]
     fn accumulate_convert_with_s_hat_v_oracle(
         chunk_ab_bytes: &[[u8; 64]; 1 << N_MEDIUM],
-        c_block: &[u8; (1 << N_MEDIUM) * 64],
+        chunk_c_bytes: &[[u8; 64]; 1 << N_MEDIUM],
         n_b_med: usize,
         convert: &[F128],
         eq_lo_val: F128,
         partial_ab: &mut [F128; ELL],
-        partial_c: &mut [[F128; ELL]; N_C_BANKS],
+        partial_c_0: &mut [F128; ELL],
+        partial_c_1: &mut [F128; ELL],
     ) {
-        // The kernel fuses the per-`b_med` transpose into its mask build; the
-        // oracle keeps them separate, so this is also a transpose cross-check.
-        let mut chunk_c_bytes = [[0u8; 64]; 1 << N_MEDIUM];
-        for b_med in 0..n_b_med {
-            let row: &[u8; 64] = c_block[b_med * 64..(b_med + 1) * 64].try_into().unwrap();
-            bit_transpose_64bytes(row, &mut chunk_c_bytes[b_med]);
-        }
-        let alpha_inv = alpha_inv_f128();
-        let mut alpha_inv_pow = [F128::ONE; N_C_BANKS];
-        for s in 1..N_C_BANKS {
-            alpha_inv_pow[s] = alpha_inv_pow[s - 1] * alpha_inv;
-        }
         for lane in 0..ELL {
             let mut cf_ab = F128::ZERO;
-            let mut cf_c = [F128::ZERO; N_C_BANKS];
+            let mut cf_c_0 = F128::ZERO;
+            let mut cf_c_1 = F128::ZERO;
             for b_med in 0..n_b_med {
                 let base = b_med * 256;
                 let v_c = chunk_c_bytes[b_med][lane] as usize;
                 cf_ab += convert[base + chunk_ab_bytes[b_med][lane] as usize];
-                for (s, acc) in cf_c.iter_mut().enumerate() {
-                    *acc += convert[base + (v_c & (1 << s))];
-                }
+                cf_c_0 += convert[base + (v_c & 0x55)];
+                cf_c_1 += convert[base + (v_c & 0xaa)];
             }
             partial_ab[lane] += cf_ab * eq_lo_val;
-            for (s, bank) in partial_c.iter_mut().enumerate() {
-                bank[lane] += (cf_c[s] * alpha_inv_pow[s]) * eq_lo_val;
-            }
+            partial_c_0[lane] += cf_c_0 * eq_lo_val;
+            partial_c_1[lane] += cf_c_1 * eq_lo_val;
         }
     }
 
@@ -3986,437 +2110,6 @@ mod tests {
         }
     }
 
-    /// **The fused-transpose gate.** The kernel now reads the packed witness
-    /// directly and does one cross-`b_med` transpose; the reference still goes
-    /// the long way round — sixteen per-`b_med` [`bit_transpose_64bytes`] calls
-    /// into scratch rows, then the mask scatter. Two genuinely different routes
-    /// to the same bytes, compared for every `n_b_med` (0..=16, covering the
-    /// full path and the padded boundary window) over random blocks, from
-    /// non-zero partials so `+=` semantics are exercised too.
-    #[cfg(target_arch = "aarch64")]
-    #[test]
-    fn fused_c_masks_match_composed_transpose() {
-        let mut rng = Rng::new(0xC0DE_BA5E);
-        for round in 0..4 {
-            for n_b_med in 0..=(1 << N_MEDIUM) {
-                let mut c_block = [0u8; (1 << N_MEDIUM) * 64];
-                for byte in c_block.iter_mut() {
-                    *byte = (rng.next_u64() & 0xff) as u8;
-                }
-                let mask_tables = build_c_mask_tables(&[rng.f128()]);
-                let seed: [[F128; ELL]; N_C_BANKS] =
-                    core::array::from_fn(|_| core::array::from_fn(|_| rng.f128()));
-
-                let mut got = seed;
-                kernels::accumulate_c_banks(&c_block, n_b_med, &mask_tables, &mut got);
-                let mut want = seed;
-                kernels::accumulate_c_banks_scalar(&c_block, n_b_med, &mask_tables, &mut want);
-
-                for s in 0..N_C_BANKS {
-                    assert_eq!(
-                        got[s], want[s],
-                        "bank {s} mismatch at n_b_med={n_b_med}, round={round}"
-                    );
-                }
-            }
-        }
-    }
-
-    /// The mask tables must reproduce `F128 { lo: m } * eq` for every 16-bit
-    /// mask — this is the F2-linearity that removes the multiply from the C
-    /// drain. Checked against the multiply itself over all 65_536 masks, for
-    /// several `eq`, plus the two halves' defining identities.
-    #[test]
-    fn c_mask_tables_reproduce_masked_multiply() {
-        let mut rng = Rng::new(0x7AB1E_5EED);
-        let eqs: Vec<F128> = (0..4).map(|_| rng.f128()).collect();
-        let tables = build_c_mask_tables(&eqs);
-        for (x, eq) in eqs.iter().enumerate() {
-            let slot = &tables[x * C_MASK_TABLE_STRIDE..(x + 1) * C_MASK_TABLE_STRIDE];
-            let (t_lo, t_hi) = slot.split_at(256);
-            for v in 0..256usize {
-                assert_eq!(
-                    t_lo[v],
-                    F128 {
-                        lo: v as u64,
-                        hi: 0
-                    } * *eq,
-                    "t_lo[{v}]"
-                );
-                assert_eq!(
-                    t_hi[v],
-                    F128 {
-                        lo: (v as u64) << 8,
-                        hi: 0
-                    } * *eq,
-                    "t_hi[{v}]"
-                );
-            }
-            for m in 0..=u16::MAX {
-                assert_eq!(
-                    t_lo[usize::from(m & 0xff)] + t_hi[usize::from(m >> 8)],
-                    F128 {
-                        lo: u64::from(m),
-                        hi: 0
-                    } * *eq,
-                    "mask {m} at x={x}"
-                );
-            }
-        }
-    }
-
-    /// The Fold4 C table keeps q=b_med mod 4 as a bank coordinate and folds
-    /// only h=floor(b_med/4).  Its four index bits therefore select exponents
-    /// 0,4,8,12.  Check the compact lookup against the defining field
-    /// multiply for every mask.
-    #[test]
-    fn c_fold4_mask_tables_reproduce_strided_masked_multiply() {
-        let mut rng = Rng::new(0xF01D_4004);
-        let eqs: Vec<F128> = (0..8).map(|_| rng.f128()).collect();
-        let tables = build_c_fold4_mask_tables(&eqs);
-        for (x, eq) in eqs.iter().enumerate() {
-            let slot = &tables[x * C_FOLD4_MASK_TABLE_STRIDE..(x + 1) * C_FOLD4_MASK_TABLE_STRIDE];
-            for nibble in 0..16usize {
-                let mut spread = 0u64;
-                for h in 0..N_C_FOLD4_GROUPS {
-                    spread |= (((nibble >> h) & 1) as u64) << (N_C_FOLD4_GROUPS * h);
-                }
-                assert_eq!(
-                    slot[nibble],
-                    F128 { lo: spread, hi: 0 } * *eq,
-                    "strided mask {nibble:#x} at x={x}"
-                );
-            }
-        }
-        crate::scratch::give_f128(tables);
-    }
-
-    /// Every composed table entry must be the exact sum of its two source
-    /// entries. An odd number of low slots additionally pins the zero-table
-    /// sentinel used by the singleton tail.
-    #[test]
-    fn c_fold4_pair_tables_compose_all_256_indices() {
-        let mut rng = Rng::new(0xF01D_2A17_0256);
-        let eqs: Vec<F128> = (0..5).map(|_| rng.f128()).collect();
-        let singles = build_c_fold4_mask_tables(&eqs);
-        let pairs = build_c_fold4_pair_mask_tables(&eqs);
-        for pair in 0..eqs.len().div_ceil(2) {
-            let even = &singles[(2 * pair) * C_FOLD4_MASK_TABLE_STRIDE
-                ..(2 * pair + 1) * C_FOLD4_MASK_TABLE_STRIDE];
-            let odd = (2 * pair + 1 < eqs.len()).then(|| {
-                &singles[(2 * pair + 1) * C_FOLD4_MASK_TABLE_STRIDE
-                    ..(2 * pair + 2) * C_FOLD4_MASK_TABLE_STRIDE]
-            });
-            let composed = &pairs[pair * C_FOLD4_PAIR_MASK_TABLE_STRIDE
-                ..(pair + 1) * C_FOLD4_PAIR_MASK_TABLE_STRIDE];
-            for b in 0..C_FOLD4_MASK_TABLE_STRIDE {
-                for a in 0..C_FOLD4_MASK_TABLE_STRIDE {
-                    let want = even[a] + odd.map_or(F128::ZERO, |table| table[b]);
-                    assert_eq!(
-                        composed[a | (b << 4)],
-                        want,
-                        "pair={pair}, even_mask={a:#x}, odd_mask={b:#x}"
-                    );
-                }
-            }
-        }
-        crate::scratch::give_f128(singles);
-        crate::scratch::give_f128(pairs);
-    }
-
-    /// Differential gate for the paired q-local kernel. Both blocks range
-    /// independently over every legal padding boundary, which catches any
-    /// accidental sharing of `n_b_med` between the two mask halves.
-    #[test]
-    fn c_fold4_q_pair_kernel_matches_two_independent_drains() {
-        let mut rng = Rng::new(0xF01D_0A17_1717);
-        for round in 0..2 {
-            let mut c_even = [0u8; (1 << N_MEDIUM) * ELL];
-            let mut c_odd = [0u8; (1 << N_MEDIUM) * ELL];
-            for byte in &mut c_even {
-                *byte = (rng.next_u64() & 0xff) as u8;
-            }
-            for byte in &mut c_odd {
-                *byte = (rng.next_u64() & 0xff) as u8;
-            }
-            let eqs = [rng.f128(), rng.f128()];
-            let singles = build_c_fold4_mask_tables(&eqs);
-            let pairs = build_c_fold4_pair_mask_tables(&eqs);
-            let pair_table: &[F128; C_FOLD4_PAIR_MASK_TABLE_STRIDE] = pairs
-                .as_slice()
-                .try_into()
-                .expect("one composed pair table");
-            for n_even in 0..=(1 << N_MEDIUM) {
-                for n_odd in 0..=(1 << N_MEDIUM) {
-                    for q in 0..N_C_FOLD4_GROUPS {
-                        let seed: [[F128; ELL]; N_C_BANKS] =
-                            core::array::from_fn(|_| core::array::from_fn(|_| rng.f128()));
-                        let mut got = seed;
-                        kernels::accumulate_c_fold4_q_pair_banks(
-                            &c_even, n_even, &c_odd, n_odd, q, pair_table, &mut got,
-                        );
-                        let mut want = seed;
-                        accumulate_c_fold4_q_banks_scalar(
-                            &c_even,
-                            n_even,
-                            q,
-                            &singles[..C_FOLD4_MASK_TABLE_STRIDE],
-                            &mut want,
-                        );
-                        accumulate_c_fold4_q_banks_scalar(
-                            &c_odd,
-                            n_odd,
-                            q,
-                            &singles[C_FOLD4_MASK_TABLE_STRIDE..],
-                            &mut want,
-                        );
-                        assert_eq!(
-                            got, want,
-                            "pair drain mismatch round={round}, n_even={n_even}, n_odd={n_odd}, q={q}"
-                        );
-                    }
-                }
-            }
-            crate::scratch::give_f128(singles);
-            crate::scratch::give_f128(pairs);
-        }
-    }
-
-    /// Four-block differential oracle. The expected value performs four
-    /// independent scalar 16-entry drains; the candidate performs two
-    /// pair-table loads and one accumulator RMW. Vary every block's padding
-    /// count independently and cross the two pair boundaries.
-    #[test]
-    fn c_fold4_four_kernel_matches_four_independent_drains() {
-        let mut rng = Rng::new(0xF01D_4004_1717);
-        let mut c_blocks = [[0u8; (1 << N_MEDIUM) * ELL]; 4];
-        for block in &mut c_blocks {
-            for byte in block {
-                *byte = (rng.next_u64() & 0xff) as u8;
-            }
-        }
-        let eqs: [F128; 4] = std::array::from_fn(|_| rng.f128());
-        let singles = build_c_fold4_mask_tables(&eqs);
-        let pairs = build_c_fold4_pair_mask_tables(&eqs);
-        let block_refs: [&[u8; (1 << N_MEDIUM) * ELL]; 4] =
-            std::array::from_fn(|side| &c_blocks[side]);
-        let pair_tables: [&[F128; C_FOLD4_PAIR_MASK_TABLE_STRIDE]; 2] =
-            std::array::from_fn(|pair| {
-                (&pairs[pair * C_FOLD4_PAIR_MASK_TABLE_STRIDE
-                    ..(pair + 1) * C_FOLD4_PAIR_MASK_TABLE_STRIDE])
-                    .try_into()
-                    .expect("one 256-entry Fold4 pair table")
-            });
-
-        let mut cases = vec![[0usize; 4], [16usize; 4], [0, 16, 0, 16], [16, 0, 16, 0]];
-        let fixed = [3usize, 7, 11, 15];
-        for side in 0..4 {
-            for count in 0..=16 {
-                let mut case = fixed;
-                case[side] = count;
-                cases.push(case);
-            }
-        }
-        for left in 0..=16 {
-            for right in 0..=16 {
-                cases.push([left, 5, right, 13]);
-                cases.push([3, left, 11, right]);
-            }
-        }
-
-        for (case_index, counts) in cases.into_iter().enumerate() {
-            let seed: [[F128; ELL]; N_C_FOLD4_BANKS] =
-                core::array::from_fn(|_| core::array::from_fn(|_| rng.f128()));
-            let mut got = seed;
-            kernels::accumulate_c_fold4_four_banks(block_refs, counts, pair_tables, &mut got);
-
-            let mut want = seed;
-            for side in 0..4 {
-                accumulate_c_fold4_banks_scalar(
-                    block_refs[side],
-                    counts[side],
-                    &singles
-                        [side * C_FOLD4_MASK_TABLE_STRIDE..(side + 1) * C_FOLD4_MASK_TABLE_STRIDE],
-                    &mut want,
-                );
-            }
-            assert_eq!(
-                got, want,
-                "four-block drain mismatch case={case_index}, counts={counts:?}"
-            );
-        }
-
-        crate::scratch::give_f128(singles);
-        crate::scratch::give_f128(pairs);
-    }
-
-    #[test]
-    fn fold4_q_partition_requires_exact_one() {
-        use std::ffi::OsStr;
-
-        assert!(!fold4_q_partition_from_value(None));
-        assert!(fold4_q_partition_from_value(Some(OsStr::new("1"))));
-        for rejected in ["", "0", "4", "true", "yes"] {
-            assert!(
-                !fold4_q_partition_from_value(Some(OsStr::new(rejected))),
-                "non-exact opt-in {rejected:?} must retain monolithic pair fusion"
-            );
-        }
-    }
-
-    #[test]
-    fn fold4_pair4_defaults_on_and_any_kill_value_disables() {
-        use std::ffi::OsStr;
-
-        assert!(fold4_pair4_from_kill_value(None));
-        for kill_value in ["", "0", "1", "2", "4", "true", "yes"] {
-            assert!(
-                !fold4_pair4_from_kill_value(Some(OsStr::new(kill_value))),
-                "kill-switch value {kill_value:?} must retain two-block pair fusion"
-            );
-        }
-    }
-
-    /// Core Direct-C Fold4 oracle.  The 32 retained-coordinate banks, once
-    /// collapsed under the first two protocol medium challenges, must equal
-    /// the incumbent eight-bank accumulator for every legal padding boundary.
-    /// Random non-zero seeds also exercise the += contract.
-    #[test]
-    fn c_fold4_banks_collapse_to_incumbent_banks() {
-        let mut rng = Rng::new(0xC004_C011_A95E);
-
-        for round in 0..4 {
-            for n_b_med in 0..=(1 << N_MEDIUM) {
-                let mut c_block = [0u8; (1 << N_MEDIUM) * ELL];
-                for byte in &mut c_block {
-                    *byte = (rng.next_u64() & 0xff) as u8;
-                }
-                let eq_outer = rng.f128();
-                let current_tables = build_c_mask_tables(&[eq_outer * d_inv()]);
-                let fold4_tables = build_c_fold4_mask_tables(&[eq_outer * d_hi_inv()]);
-
-                let seed_fold4: [[F128; ELL]; N_C_FOLD4_BANKS] =
-                    core::array::from_fn(|_| core::array::from_fn(|_| rng.f128()));
-                let mut got_fold4 = seed_fold4;
-                accumulate_c_fold4_banks_scalar(&c_block, n_b_med, &fold4_tables, &mut got_fold4);
-
-                let mut want = collapse_c_fold4_banks(&seed_fold4);
-                kernels::accumulate_c_banks_scalar(&c_block, n_b_med, &current_tables, &mut want);
-                assert_eq!(
-                    collapse_c_fold4_banks(&got_fold4),
-                    want,
-                    "collapse mismatch at n_b_med={n_b_med}, round={round}"
-                );
-
-                crate::scratch::give_f128(current_tables);
-                crate::scratch::give_f128(fold4_tables);
-            }
-        }
-    }
-
-    /// AArch64 fused transpose/drain gate.  The optimized kernel consumes raw
-    /// packed rows, while the oracle composes sixteen ordinary bit transposes
-    /// and scalar mask routing.  Exercise every padding boundary from non-zero
-    /// accumulators so both coordinate mapping and += semantics are pinned.
-    #[cfg(target_arch = "aarch64")]
-    #[test]
-    fn fused_c_fold4_masks_match_scalar() {
-        let mut rng = Rng::new(0xF04D_A64C_0DE5);
-        for round in 0..8 {
-            for n_b_med in 0..=(1 << N_MEDIUM) {
-                let mut c_block = [0u8; (1 << N_MEDIUM) * ELL];
-                for byte in &mut c_block {
-                    *byte = (rng.next_u64() & 0xff) as u8;
-                }
-                let tables = build_c_fold4_mask_tables(&[rng.f128()]);
-                let seed: [[F128; ELL]; N_C_FOLD4_BANKS] =
-                    core::array::from_fn(|_| core::array::from_fn(|_| rng.f128()));
-                let mut got = seed;
-                kernels::accumulate_c_fold4_banks(&c_block, n_b_med, &tables, &mut got);
-                let mut want = seed;
-                accumulate_c_fold4_banks_scalar(&c_block, n_b_med, &tables, &mut want);
-                assert_eq!(
-                    got, want,
-                    "Fold4 fused C mismatch at n_b_med={n_b_med}, round={round}"
-                );
-                crate::scratch::give_f128(tables);
-            }
-        }
-    }
-
-    /// Exhaustive coordinate-routing oracle over every medium row and K bank,
-    /// sampled across byte-chunk and bit-lane boundaries.  A one-hot witness
-    /// at `(b_med,K,lane)` must land only in `[q=b_med&3][K][lane]` with table
-    /// index `1 << (b_med>>2)`.
-    #[cfg(target_arch = "aarch64")]
-    #[test]
-    fn fused_c_fold4_one_hot_routes_every_coordinate() {
-        let eq = F128 {
-            lo: 0x8f31_17e2_906b_42d5,
-            hi: 0x6ca8_01dd_7314_b9ef,
-        };
-        let tables = build_c_fold4_mask_tables(&[eq]);
-        for b_med in 0..(1 << N_MEDIUM) {
-            let q = b_med & 3;
-            let h = b_med >> 2;
-            for k in 0..N_C_BANKS {
-                for lane in [0usize, 7, 8, 31, 63] {
-                    let mut c_block = [0u8; (1 << N_MEDIUM) * ELL];
-                    c_block[b_med * ELL + k * 8 + lane / 8] = 1 << (lane & 7);
-                    let mut got = [[F128::ZERO; ELL]; N_C_FOLD4_BANKS];
-                    kernels::accumulate_c_fold4_banks(&c_block, 1 << N_MEDIUM, &tables, &mut got);
-                    for bank in 0..N_C_FOLD4_BANKS {
-                        for out_lane in 0..ELL {
-                            let want = if bank == q * N_C_BANKS + k && out_lane == lane {
-                                tables[1 << h]
-                            } else {
-                                F128::ZERO
-                            };
-                            assert_eq!(
-                                got[bank][out_lane], want,
-                                "route b_med={b_med}, k={k}, lane={lane}, bank={bank}, out_lane={out_lane}"
-                            );
-                        }
-                    }
-                }
-            }
-        }
-        crate::scratch::give_f128(tables);
-    }
-
-    /// The exported 16x128 layout must collapse under the exact four suffix
-    /// challenges used by ring-switch to the canonical C vector.  This also
-    /// pins the shared producer/consumer ordering `low=e_small+4*q_medium`.
-    #[test]
-    fn c_fold4_layout_collapses_to_wire_s_hat_v_c() {
-        let mut rng = Rng::new(0xC004_16B4_1280);
-        for round in 0..16 {
-            let banks: [[F128; ELL]; N_C_FOLD4_BANKS] =
-                core::array::from_fn(|_| core::array::from_fn(|_| rng.f128()));
-            let (res_c_s, s_hat_v_c, quad_c, fold4_c) = finish_c_fold4_banks(&banks);
-            let collapsed = collapse_c_fold4_banks(&banks);
-            let (want_res, want_s_hat_v, want_quad) = finish_c_banks(&collapsed);
-            assert_eq!(res_c_s, want_res, "wire bank finish at round={round}");
-            assert_eq!(quad_c, want_quad, "quad bank finish at round={round}");
-            assert_eq!(s_hat_v_c, want_s_hat_v, "canonical finish at round={round}");
-            assert_eq!(fold4_c.len(), 16 * 2 * ELL);
-
-            let small = small_challenges_ghash();
-            let medium = medium_challenges_ghash();
-            let low_eq = build_eq(&[small[1], small[2], medium[0], medium[1]]);
-            let mut from_fold4 = vec![F128::ZERO; 2 * ELL];
-            for low in 0..16 {
-                for packed in 0..2 * ELL {
-                    from_fold4[packed] += low_eq[low] * fold4_c[low * 2 * ELL + packed];
-                }
-            }
-            assert_eq!(
-                from_fold4, s_hat_v_c,
-                "16-bank layout collapse at round={round}"
-            );
-        }
-    }
-
     /// The gather-halving kernel is only bit-exact because `convert` is
     /// **F2-linear in its index bits**: `T_b[u ^ v] == T_b[u] ^ T_b[v]`. That
     /// is what lets one paired lookup stand in for two per-`b_med` lookups.
@@ -4439,193 +2132,92 @@ mod tests {
         }
     }
 
-    /// Same contract for the eight-bank variant — this is the kernel the prover
+    /// The paired tables must reproduce, in one lookup, exactly the two
+    /// per-`b_med` bank terms they replace — for every pair and every pair of
+    /// input bytes. This is the identity the kernel's correctness rests on.
+    #[test]
+    fn paired_c_tables_reproduce_both_banks() {
+        let base = convert_table();
+        let (m0, m1) = &*PAIRED_C_TABLES;
+        for p in 0..8 {
+            let (even, odd) = (2 * p * 256, (2 * p + 1) * 256);
+            for ce in 0..256usize {
+                for co in 0..256usize {
+                    let i0 = (ce & 0x55) | ((co << 1) & 0xaa);
+                    let i1 = (ce & 0xaa) | ((co >> 1) & 0x55);
+                    assert_eq!(
+                        m0[p * 256 + i0],
+                        base[even + (ce & 0x55)] + base[odd + (co & 0x55)],
+                        "bank0 pair p={p}, ce={ce}, co={co}"
+                    );
+                    assert_eq!(
+                        m1[p * 256 + i1],
+                        base[even + (ce & 0xaa)] + base[odd + (co & 0xaa)],
+                        "bank1 pair p={p}, ce={ce}, co={co}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Same contract for the two-bank variant — this is the kernel the prover
     /// actually runs (`prove_packed_padded_capture_s_hat_v_c` always sets
     /// `capture = true`), so it gets the same bit-exactness guard.
+    #[cfg(target_arch = "aarch64")]
     #[test]
-    fn accumulate_convert_with_s_hat_v_matches_scalar_oracle() {
+    fn neon_accumulate_convert_with_s_hat_v_matches_scalar_oracle() {
         let convert = convert_table();
         let mut rng = Rng::new(0x5A17_C0DE);
 
         for n_b_med in 0..=(1 << N_MEDIUM) {
             let mut chunk_ab = [[0u8; 64]; 1 << N_MEDIUM];
-            let mut c_block = [0u8; (1 << N_MEDIUM) * 64];
+            let mut chunk_c = [[0u8; 64]; 1 << N_MEDIUM];
             for b_med in 0..(1 << N_MEDIUM) {
                 for lane in 0..ELL {
                     chunk_ab[b_med][lane] = (rng.next_u64() & 0xff) as u8;
-                    c_block[b_med * 64 + lane] = (rng.next_u64() & 0xff) as u8;
+                    chunk_c[b_med][lane] = (rng.next_u64() & 0xff) as u8;
                 }
             }
             let eq_lo_val = rng.f128();
 
             let seed_ab: [F128; ELL] = core::array::from_fn(|_| rng.f128());
-            let seed_c: [[F128; ELL]; N_C_BANKS] =
-                core::array::from_fn(|_| core::array::from_fn(|_| rng.f128()));
+            let seed_c0: [F128; ELL] = core::array::from_fn(|_| rng.f128());
+            let seed_c1: [F128; ELL] = core::array::from_fn(|_| rng.f128());
 
-            // The kernel drains through the mask tables; the oracle multiplies.
-            // Building the tables from a one-entry `eq_lo_scaled` is exactly
-            // what the prove does per `x_outer_lo`.
-            let mask_tables = build_c_mask_tables(&[eq_lo_val]);
+            let (mut got_ab, mut got_c0, mut got_c1) = (seed_ab, seed_c0, seed_c1);
+            // SAFETY: aarch64 target; arrays are the exact sizes the kernel
+            // indexes, and `convert` is the full 16*256-entry table.
+            unsafe {
+                let paired_c = &*PAIRED_C_TABLES;
+                kernels::aarch64::accumulate_convert_with_s_hat_v(
+                    &chunk_ab,
+                    &chunk_c,
+                    n_b_med,
+                    convert,
+                    &paired_c.0,
+                    &paired_c.1,
+                    eq_lo_val,
+                    &mut got_ab,
+                    &mut got_c0,
+                    &mut got_c1,
+                );
+            }
 
-            let (mut got_ab, mut got_c) = (seed_ab, seed_c);
-            kernels::accumulate_convert_with_s_hat_v(
-                &chunk_ab,
-                &c_block,
-                n_b_med,
-                convert,
-                eq_lo_val,
-                &mask_tables,
-                &mut got_ab,
-                &mut got_c,
-            );
-
-            let (mut want_ab, mut want_c) = (seed_ab, seed_c);
+            let (mut want_ab, mut want_c0, mut want_c1) = (seed_ab, seed_c0, seed_c1);
             accumulate_convert_with_s_hat_v_oracle(
                 &chunk_ab,
-                &c_block,
+                &chunk_c,
                 n_b_med,
                 convert,
                 eq_lo_val,
                 &mut want_ab,
-                &mut want_c,
+                &mut want_c0,
+                &mut want_c1,
             );
 
             assert_eq!(got_ab, want_ab, "partial_ab mismatch at n_b_med={n_b_med}");
-            for s in 0..N_C_BANKS {
-                assert_eq!(
-                    got_c[s], want_c[s],
-                    "partial_c bank {s} mismatch at n_b_med={n_b_med}"
-                );
-            }
-        }
-    }
-
-    /// The ranked identity-C shortcut must reproduce every value emitted by
-    /// the incumbent 32-bank C producer.  Build the alternate lincheck stripe
-    /// from the same packed witness, then compare AB, the round-one C wire
-    /// contribution, and all three captured RingSwitch tensors independently.
-    #[test]
-    fn lincheck_stripe_c_fold4_matches_incumbent() {
-        let pool = rayon::ThreadPoolBuilder::new()
-            .num_threads(2)
-            .stack_size(16 << 20)
-            .build()
-            .unwrap();
-        pool.install(lincheck_stripe_c_fold4_matches_incumbent_inner);
-    }
-
-    fn lincheck_stripe_c_fold4_matches_incumbent_inner() {
-        const M: usize = 17;
-        const K_LOG: usize = 14;
-        let cases = [
-            PaddingSpec {
-                k_log: K_LOG,
-                useful_bits_per_block: 1 << K_LOG,
-            },
-            PaddingSpec {
-                k_log: K_LOG,
-                useful_bits_per_block: 15_409,
-            },
-        ];
-
-        for (case, padding) in cases.into_iter().enumerate() {
-            let mut rng = Rng::new(0xC57A_1F00_u64.wrapping_add(case as u64));
-            let total_bits = 1usize << M;
-            let mut a = rng.bits(total_bits);
-            let mut b = rng.bits(total_bits);
-            let mut c = rng.bits(total_bits);
-            if padding.useful_bits_per_block < (1usize << K_LOG) {
-                for block in 0..(total_bits >> K_LOG) {
-                    for bit in padding.useful_bits_per_block..(1usize << K_LOG) {
-                        let index = (block << K_LOG) + bit;
-                        a[index] = false;
-                        b[index] = false;
-                        c[index] = false;
-                    }
-                }
-            }
-
-            let a = pack_bits(&a);
-            let b = pack_bits(&b);
-            let c = pack_bits(&c);
-            let outer = rng.f128_vec(M - K_SKIP - N_INNER);
-            let r = build_protocol_r(M, &outer);
-            let inv_table = make_inv_table();
-            let ab_inner =
-                precompute_round1_ab_inner_packed_padded(&a, &b, M, K_SKIP, &inv_table, &padding);
-            let incumbent = round1_shift_reduce_extract_c_packed_padded_with_precomputed_ab_fold4(
-                &ab_inner, &c, M, K_SKIP, &r, &inv_table, &padding,
-            );
-
-            let got_ab = round1_shift_reduce_ab_packed_padded_with_precomputed(
-                &ab_inner, M, K_SKIP, &r, &padding,
-            );
-            assert_eq!(got_ab, incumbent.0, "AB mismatch in case {case}");
-
-            // `pack_bits` uses the same little-endian polynomial-basis layout
-            // as packed F128 witnesses. Materialize aligned words for the
-            // public lincheck stripe converter rather than transmuting a
-            // byte-aligned allocation.
-            let c_words: Vec<F128> = c
-                .chunks_exact(16)
-                .map(|bytes| F128 {
-                    lo: u64::from_le_bytes(bytes[..8].try_into().unwrap()),
-                    hi: u64::from_le_bytes(bytes[8..].try_into().unwrap()),
-                })
-                .collect();
-            let c_lincheck = crate::lincheck::pack_z_lincheck_from_packed(&c_words, M, K_LOG);
-            let got_c = round1_c_fold4_from_lincheck_stripe(
-                &c_lincheck,
-                M,
-                K_LOG,
-                K_SKIP,
-                padding.useful_bits_per_block,
-                &r,
-                &inv_table,
-            );
-            assert_eq!(got_c.0, incumbent.1, "round-one C mismatch in case {case}");
-            assert_eq!(got_c.1, incumbent.2, "canonical C mismatch in case {case}");
-            assert_eq!(got_c.2, incumbent.3, "quad C mismatch in case {case}");
-            assert_eq!(got_c.3, incumbent.4, "fold4 C mismatch in case {case}");
-
-            // Fold8 sibling: identical wire outputs from the wider statistic,
-            // and the 64-bank tensor must collapse to every narrower form.
-            let got_c8 = round1_c_fold8_from_lincheck_stripe(
-                &c_lincheck,
-                M,
-                K_LOG,
-                K_SKIP,
-                padding.useful_bits_per_block,
-                &r,
-                &inv_table,
-            );
-            assert_eq!(got_c8.0, incumbent.1, "fold8 round-one C mismatch in case {case}");
-            assert_eq!(got_c8.1, incumbent.2, "fold8 canonical C mismatch in case {case}");
-            assert_eq!(got_c8.2, incumbent.3, "fold8 quad C mismatch in case {case}");
-            let inner_tail = &r[K_SKIP + 1..K_LOG];
-            assert_eq!(
-                crate::pcs::ring_switch::collapse_s_hat_v_fold8(&got_c8.3, &inner_tail[..6]),
-                incumbent.2,
-                "fold8 suffix[..6] collapse mismatch in case {case}"
-            );
-            // Folding retained coordinates 4 and 5 must reproduce the
-            // incumbent 16-bank fold4 tensor exactly.
-            let hi_eq = build_eq(&inner_tail[4..6]);
-            let n_packed = 1usize << crate::pcs::LOG_PACKING;
-            let mut fold4_from_8 = vec![F128::ZERO; 16 * n_packed];
-            for q in 0..4 {
-                for e in 0..16 {
-                    let src = (e + 16 * q) * n_packed;
-                    let dst = e * n_packed;
-                    for packed in 0..n_packed {
-                        fold4_from_8[dst + packed] += hi_eq[q] * got_c8.3[src + packed];
-                    }
-                }
-            }
-            assert_eq!(
-                fold4_from_8, incumbent.4,
-                "fold8 → fold4 reduction mismatch in case {case}"
-            );
+            assert_eq!(got_c0, want_c0, "partial_c_0 mismatch at n_b_med={n_b_med}");
+            assert_eq!(got_c1, want_c1, "partial_c_1 mismatch at n_b_med={n_b_med}");
         }
     }
 }

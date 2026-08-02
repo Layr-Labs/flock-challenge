@@ -41,103 +41,6 @@ fn ranked_direct_ab_precompute_enabled(r1cs: &BlockR1cs) -> bool {
         && std::env::var_os("FLOCK_NO_LIG_FOLD2").is_none()
 }
 
-/// Whether the c-claim ships its four-bank sufficient statistic instead of the
-/// canonical `s_hat_v_c`. Same shape conditions as the AB quad plus the single
-/// process-wide direct-C predicate `pcs`'s consumer reads, so capture and
-/// consumer can never disagree; a shape miss simply keeps the 128-vector and
-/// the incumbent deferred-C path.
-#[inline]
-fn ranked_direct_c_precompute_enabled(r1cs: &BlockR1cs) -> bool {
-    ranked_direct_ab_precompute_enabled(r1cs) && pcs::ranked_direct_c_enabled()
-}
-
-#[inline]
-fn ranked_direct_fold4_precompute_enabled(r1cs: &BlockR1cs) -> bool {
-    ranked_direct_ab_precompute_enabled(r1cs)
-        && pcs::ranked_direct_fold4_enabled()
-}
-
-/// Direct-fold8 capture/consumer predicate: the fold4 chain plus the shared
-/// fold8 latch and six retainable tail coordinates (k_log >= k_skip + 7).
-/// Read by BOTH the AB/C producers and (transitively) the pcs consumer gate,
-/// so capture and consumer cannot disagree; a shape miss simply keeps the
-/// 16-bank tensor and the incumbent fold4 route.
-#[inline]
-fn ranked_direct_fold8_precompute_enabled(r1cs: &BlockR1cs) -> bool {
-    ranked_direct_fold4_precompute_enabled(r1cs)
-        && pcs::ranked_direct_fold8_enabled()
-        && r1cs.k_log >= r1cs.k_skip + 7
-}
-
-/// Exact-shape gate for deriving identity C from the already-materialized
-/// lincheck stripe. Keep this narrower than the generic DirectFold4 gate:
-/// the shortcut relies on ranked BLAKE3's block geometry and honest padding,
-/// while every miss retains the incumbent row-major C producer.
-#[inline]
-fn ranked_lincheck_c_reuse_enabled(r1cs: &BlockR1cs) -> bool {
-    ranked_direct_fold4_precompute_enabled(r1cs)
-        && r1cs.m == 32
-        && r1cs.k_log == 14
-        && r1cs.k_skip == zerocheck::K_SKIP
-        && r1cs.useful_bits == 15_409
-        && r1cs.layout == flock_core::r1cs::WitnessLayout::RowMajor
-        && r1cs.c0_is_identity()
-        && std::env::var_os("FLOCK_NO_ZC_LINCHECK_C_REUSE").is_none()
-}
-
-fn precompute_ab_s_hat_v(
-    r1cs: &BlockR1cs,
-    z_vec: &[F128],
-    inner_rest_tail: &[F128],
-) -> Option<Vec<F128>> {
-    if ranked_direct_fold8_precompute_enabled(r1cs) {
-        Some(pcs::ring_switch::s_hat_v_fold8_from_z_vec(
-            z_vec,
-            inner_rest_tail,
-        ))
-    } else if ranked_direct_fold4_precompute_enabled(r1cs) {
-        Some(pcs::ring_switch::s_hat_v_fold4_from_z_vec(
-            z_vec,
-            inner_rest_tail,
-        ))
-    } else if ranked_direct_ab_precompute_enabled(r1cs) {
-        Some(pcs::ring_switch::s_hat_v_quad_from_z_vec(
-            z_vec,
-            inner_rest_tail,
-        ))
-    } else if r1cs.k_log >= pcs::LOG_PACKING {
-        Some(pcs::ring_switch::s_hat_v_from_z_vec(
-            z_vec,
-            inner_rest_tail,
-        ))
-    } else {
-        None
-    }
-}
-
-/// Pick C's precomputed slot. The DirectFold8 route takes the sixty-four-bank
-/// tensor; the strict DirectFold4 experiment takes the sixteen-bank tensor;
-/// the incumbent ranked path takes the four-bank tensor; every other shape
-/// takes the canonical transcript-visible statistic. Falls back through
-/// narrower captures by presence, so a producer shape miss (e.g. no lincheck
-/// stripe) degrades to a still-correct route instead of panicking.
-#[inline]
-fn pre_c_slot<'a>(
-    r1cs: &BlockR1cs,
-    captured: &'a zerocheck::CapturedSHatVC,
-) -> Option<&'a [F128]> {
-    Some(
-        if ranked_direct_fold8_precompute_enabled(r1cs) && captured.fold8.is_some() {
-            captured.fold8.as_deref().unwrap()
-        } else if ranked_direct_fold4_precompute_enabled(r1cs) && captured.fold4.is_some() {
-            captured.fold4.as_deref().unwrap()
-        } else if ranked_direct_c_precompute_enabled(r1cs) {
-        captured.quad.as_slice()
-    } else {
-        captured.s_hat_v_c.as_slice()
-    })
-}
-
 /// Construct a multilinear `x_outer_full` of length `m − k_skip` from a
 /// QuirkyPoint: concatenate `x_inner_rest` and `x_outer`. This is the format
 /// the PCS expects (k_skip = 6 absorbed via `z_skip`; everything else is
@@ -269,12 +172,21 @@ pub fn prove_ligerito<Ch: Challenger>(
         value: zc_claim.c_eval,
     };
 
-    let s_hat_v_ab =
-        precompute_ab_s_hat_v(r1cs, &z_vec_pre, &lc_claim.r_inner_rest[1..]);
-        // z_vec_pre only fed s_hat_v_ab; recycle before PCS open residency.
-        flock_core::scratch::give_f128(z_vec_pre);
+    let s_hat_v_ab = if ranked_direct_ab_precompute_enabled(r1cs) {
+        Some(pcs::ring_switch::s_hat_v_quad_from_z_vec(
+            &z_vec_pre,
+            &lc_claim.r_inner_rest[1..],
+        ))
+    } else if r1cs.k_log >= pcs::LOG_PACKING {
+        Some(pcs::ring_switch::s_hat_v_from_z_vec(
+            &z_vec_pre,
+            &lc_claim.r_inner_rest[1..],
+        ))
+    } else {
+        None
+    };
     let pre_ab: Option<&[F128]> = s_hat_v_ab.as_deref();
-    let pre_c: Option<&[F128]> = pre_c_slot(r1cs, &s_hat_v_c);
+    let pre_c: Option<&[F128]> = Some(s_hat_v_c.as_slice());
     let pcs_open = open_claims_with_precomputed_ligerito(
         z_packed,
         &prover_data,
@@ -322,7 +234,7 @@ pub fn prove_fast_ligerito_from_witness<Ch: Challenger>(
         z_packed,
         a_packed_f128,
         b_packed_f128,
-        LincheckStripeInput::Ready(z_packed_lincheck),
+        z_packed_lincheck,
         lincheck_circuit,
         commit_codeword,
         challenger,
@@ -350,70 +262,9 @@ pub(crate) fn prove_fast_ligerito_from_preinitialized_codeword<Ch: Challenger>(
         z_packed,
         a_packed_f128,
         b_packed_f128,
-        LincheckStripeInput::Ready(z_packed_lincheck),
+        z_packed_lincheck,
         lincheck_circuit,
         CommitCodeword::Preinitialized(codeword),
-        challenger,
-    )
-}
-
-/// Ranked from-message path whose first GPU NTT pass was launched in bands
-/// during witness generation. The remaining graph still runs in the commit
-/// arm concurrently with round-1 AB precomputation.
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn prove_fast_ligerito_from_streamed_first_pass<Ch: Challenger>(
-    r1cs: &BlockR1cs,
-    pcs_params: &PcsParams,
-    z_packed: Vec<F128>,
-    a_packed_f128: Vec<F128>,
-    b_packed_f128: Vec<F128>,
-    z_packed_lincheck: Vec<u8>,
-    lincheck_circuit: &dyn lincheck::LincheckCircuit,
-    codeword: Vec<F128>,
-    stream: flock_core::gpu_commit::FromZFirstPassStream,
-    challenger: &mut Ch,
-) -> (R1csProofLigerito, Commitment, R1csClaim) {
-    prove_fast_ligerito_from_witness_with_commit_codeword(
-        r1cs,
-        pcs_params,
-        z_packed,
-        a_packed_f128,
-        b_packed_f128,
-        LincheckStripeInput::Ready(z_packed_lincheck),
-        lincheck_circuit,
-        CommitCodeword::StreamedFirstPass(codeword, stream),
-        challenger,
-    )
-}
-
-/// Ranked path that moves the 512 MiB lincheck transpose out of
-/// witness generation. Two utility-pool workers transpose the immutable
-/// packed witness behind a scoped coordinator while commit, round-1 AB
-/// preprocessing, and zerocheck run; the scope is joined immediately before
-/// lincheck can read the stripe. The caller's exact-shape/helper-availability
-/// gate is deliberately kept in the BLAKE3 witness driver, where omission of
-/// the eager stripe is decided.
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn prove_fast_ligerito_from_streamed_first_pass_deferred_stripe<Ch: Challenger>(
-    r1cs: &BlockR1cs,
-    pcs_params: &PcsParams,
-    z_packed: Vec<F128>,
-    a_packed_f128: Vec<F128>,
-    b_packed_f128: Vec<F128>,
-    lincheck_circuit: &dyn lincheck::LincheckCircuit,
-    codeword: Vec<F128>,
-    stream: flock_core::gpu_commit::FromZFirstPassStream,
-    challenger: &mut Ch,
-) -> (R1csProofLigerito, Commitment, R1csClaim) {
-    prove_fast_ligerito_from_witness_with_commit_codeword(
-        r1cs,
-        pcs_params,
-        z_packed,
-        a_packed_f128,
-        b_packed_f128,
-        LincheckStripeInput::DeferredRanked,
-        lincheck_circuit,
-        CommitCodeword::StreamedFirstPass(codeword, stream),
         challenger,
     )
 }
@@ -425,7 +276,7 @@ fn prove_fast_ligerito_from_witness_with_commit_codeword<Ch: Challenger>(
     z_packed: Vec<F128>,
     a_packed_f128: Vec<F128>,
     b_packed_f128: Vec<F128>,
-    z_packed_lincheck: LincheckStripeInput,
+    z_packed_lincheck: Vec<u8>,
     lincheck_circuit: &dyn lincheck::LincheckCircuit,
     commit_codeword: CommitCodeword,
     challenger: &mut Ch,
@@ -458,7 +309,7 @@ fn prove_fast_ligerito_from_witness_with_commit_codeword<Ch: Challenger>(
 
     let padding = r1cs.padding_spec();
     let pre_ab: Option<&[F128]> = s_hat_v_ab.as_deref();
-    let pre_c: Option<&[F128]> = pre_c_slot(r1cs, &s_hat_v_c);
+    let pre_c: Option<&[F128]> = Some(s_hat_v_c.as_slice());
     let phase_timing = std::env::var_os("FLOCK_PHASE_TIMING").is_some();
     let cpu_open0 = phase_timing.then(process_cpu_ms);
     let t_open = std::time::Instant::now();
@@ -514,11 +365,11 @@ pub struct ProveCore {
     /// Real R1CS instances have `k_log >= 16` so this branch only fires in
     /// tiny test setups.
     pub s_hat_v_ab: Option<Vec<F128>>,
-    /// Precomputed opening statistics for the C claim — produced by zerocheck
-    /// round 1's eight-bank fusion kernel. Skips `fold_1b_rows` for the C claim
-    /// at PCS-open time; [`ranked_direct_c_precompute_enabled`] decides which of
-    /// the two forms goes into the open.
-    pub s_hat_v_c: zerocheck::CapturedSHatVC,
+    /// Precomputed `s_hat_v` for the C claim — produced by zerocheck round 1's
+    /// two-bank fusion kernel (one extra `vld1q+veorq` per chunk-lane-b_med
+    /// vs the original single-bank C-side). Skips `fold_1b_rows` for the C
+    /// claim at PCS-open time.
+    pub s_hat_v_c: Vec<F128>,
 }
 
 /// Ownership and initialization state of the commit codeword buffer.
@@ -529,179 +380,6 @@ enum CommitCodeword {
     Allocate,
     NeedsReplication(Vec<F128>),
     Preinitialized(Vec<F128>),
-    StreamedFirstPass(Vec<F128>, flock_core::gpu_commit::FromZFirstPassStream),
-}
-
-/// Lincheck stripe ownership at the commit boundary. `DeferredRanked` is
-/// constructed only by the exact BLAKE3 streamed-GPU selector; all generic
-/// and fallback paths carry the already-materialized byte stripe.
-enum LincheckStripeInput {
-    Ready(Vec<u8>),
-    DeferredRanked,
-}
-
-const DEFERRED_STRIPE_GROUPS_PER_JOB: usize = 64;
-
-fn fill_deferred_lincheck_stripe_group(
-    z_packed: &[F128],
-    stripe: &mut [u8],
-    group: usize,
-    group_f128: usize,
-    u64_per_block: usize,
-    useful_words: usize,
-) {
-    let group_start = group * group_f128;
-    let z_group = &z_packed[group_start..group_start + group_f128];
-    // SAFETY: F128 is repr(C) as two little-endian u64 halves; this is the
-    // same read-only view used by the eager witness transpose.
-    let z_u64: &[u64] =
-        unsafe { std::slice::from_raw_parts(z_group.as_ptr().cast::<u64>(), z_group.len() * 2) };
-    let mut transposed = [0u8; 64];
-    for word in 0..useful_words {
-        let lanes: [u64; 8] = std::array::from_fn(|lane| z_u64[lane * u64_per_block + word]);
-        flock_core::bits::transpose_8_u64s_to_64_bytes(&lanes, &mut transposed);
-        let dst = &mut stripe[word * 64..word * 64 + 64];
-        #[cfg(target_arch = "aarch64")]
-        unsafe {
-            // The stripe is not read until after commit+zerocheck, so use the
-            // same cache-bypassing store flavor as the eager SIMD witness
-            // path. `ldp/stnp` permit these 64-byte slices and the stack
-            // temporary without an extra alignment contract.
-            core::arch::asm!(
-                "ldp {t0:q}, {t1:q}, [{src}]",
-                "stnp {t0:q}, {t1:q}, [{dst}]",
-                "ldp {t0:q}, {t1:q}, [{src}, #32]",
-                "stnp {t0:q}, {t1:q}, [{dst}, #32]",
-                src = in(reg) transposed.as_ptr(),
-                dst = in(reg) dst.as_mut_ptr(),
-                t0 = out(vreg) _,
-                t1 = out(vreg) _,
-                options(nostack)
-            );
-        }
-        #[cfg(not(target_arch = "aarch64"))]
-        dst.copy_from_slice(&transposed);
-    }
-    // The ranked padded fold never observes the tail. Keeping the honest
-    // full-stripe contract in tests catches accidental selector widening.
-    #[cfg(test)]
-    stripe[useful_words * 64..].fill(0);
-}
-
-/// Materialize a BLAKE3-style lincheck stripe from immutable row-major packed
-/// `z`, dispatching coarse, pairwise-disjoint stripe slabs through `dispatch`.
-/// Production calls only the asserted ranked geometry below; compact
-/// congruent shapes give the exact fill oracle a cheap unit-test surface.
-fn fill_deferred_lincheck_stripe_with_dispatch(
-    z_packed: &[F128],
-    z_lincheck: &mut [u8],
-    m: usize,
-    k_log: usize,
-    useful_bits: usize,
-    dispatch: impl FnOnce(usize, &(dyn Fn(usize) + Sync)) -> bool,
-) -> bool {
-    assert!(k_log >= 7, "packed block must contain whole F128 words");
-    assert!(
-        m >= k_log + 3,
-        "lincheck layout needs at least eight blocks"
-    );
-    let k = 1usize << k_log;
-    let n_total = 1usize << m;
-    assert!(useful_bits <= k);
-    let f128_per_block = k / 128;
-    let u64_per_block = k / 64;
-    let group_f128 = 8 * f128_per_block;
-    let useful_words = useful_bits.div_ceil(64);
-    assert_eq!(z_packed.len(), n_total / 128);
-    assert_eq!(z_lincheck.len(), n_total / 8);
-
-    let n_groups = z_lincheck.len() / k;
-    let n_jobs = n_groups.div_ceil(DEFERRED_STRIPE_GROUPS_PER_JOB);
-    let stripe_base = flock_core::epool::SyncPtr(z_lincheck.as_mut_ptr());
-    dispatch(n_jobs, &|job| {
-        let group_start = job * DEFERRED_STRIPE_GROUPS_PER_JOB;
-        let group_end = (group_start + DEFERRED_STRIPE_GROUPS_PER_JOB).min(n_groups);
-        for group in group_start..group_end {
-            // SAFETY: every dispatched job owns a distinct contiguous set of
-            // groups, and each group maps to one disjoint k-byte stripe.
-            let stripe =
-                unsafe { std::slice::from_raw_parts_mut(stripe_base.ptr().add(group * k), k) };
-            fill_deferred_lincheck_stripe_group(
-                z_packed,
-                stripe,
-                group,
-                group_f128,
-                u64_per_block,
-                useful_words,
-            );
-        }
-    })
-}
-
-/// Safe sequential fallback if the utility pool becomes unavailable after the
-/// witness driver selected deferred materialization.
-fn fill_deferred_lincheck_stripe(
-    z_packed: &[F128],
-    z_lincheck: &mut [u8],
-    m: usize,
-    k_log: usize,
-    useful_bits: usize,
-) {
-    let completed = fill_deferred_lincheck_stripe_with_dispatch(
-        z_packed,
-        z_lincheck,
-        m,
-        k_log,
-        useful_bits,
-        |n_jobs, job| {
-            for i in 0..n_jobs {
-                job(i);
-            }
-            true
-        },
-    );
-    debug_assert!(completed);
-}
-
-#[cfg(test)]
-mod deferred_stripe_tests {
-    use super::*;
-
-    #[test]
-    fn deferred_fill_modes_match_canonical_packed_stripe() {
-        const M: usize = 20;
-        const K_LOG: usize = 8;
-        let z: Vec<F128> = (0..1usize << (M - 7))
-            .map(|i| {
-                let x = (i as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15);
-                F128::new(x ^ x.rotate_left(17), (!x).rotate_right(11))
-            })
-            .collect();
-        let expected = pack_z_lincheck_from_packed(&z, M, K_LOG);
-        let mut actual = vec![0xa5; expected.len()];
-        fill_deferred_lincheck_stripe(&z, &mut actual, M, K_LOG, 1 << K_LOG);
-        assert_eq!(actual, expected);
-
-        let helper = rayon::ThreadPoolBuilder::new()
-            .num_threads(4)
-            .build()
-            .unwrap();
-        let mut helper_actual = vec![0xa5; expected.len()];
-        assert!(fill_deferred_lincheck_stripe_with_dispatch(
-            &z,
-            &mut helper_actual,
-            M,
-            K_LOG,
-            1 << K_LOG,
-            |n_jobs, job| flock_core::epool::run_chunks_with_helper_only(
-                n_jobs,
-                4,
-                job,
-                Some(&helper),
-            ),
-        ));
-        assert_eq!(helper_actual, expected);
-    }
 }
 
 /// Build the witness commitment and the challenge-independent half of
@@ -727,61 +405,33 @@ fn commit_with_round1_ab_precompute(
     debug_assert_eq!(k_skip, 6, "ranked protocol fixes k_skip=6");
     let inv_table = flock_core::ntt::InvNttTableByteSingleGf8::cached_standard_k6();
 
-    let precompute_ab = || {
-        zerocheck::univariate_skip_optimized::precompute_round1_ab_inner_packed_padded(
-            a_packed,
-            b_packed,
-            pcs_params.m,
-            k_skip,
-            inv_table,
-            padding,
-        )
-    };
-    // `Blake3Setup::prove_fast` issues this ticket before call-zero witness
-    // generation. A valid cache hit may satisfy it inside the commit arm;
-    // otherwise the post-join callback claims it and replays this exact A/B
-    // closure beside the broad split sweep.
-    let run_ranked_exact_tune =
-        flock_core::gpu_commit::ranked_exact_contention_tune_pending();
-
-    let result = rayon::join(
+    rayon::join(
         || match commit_codeword {
             CommitCodeword::Allocate => pcs::commit(z_packed, pcs_params),
             CommitCodeword::NeedsReplication(buf) => pcs::commit_into(z_packed, pcs_params, buf),
             CommitCodeword::Preinitialized(buf) => {
                 pcs::commit_preinitialized(z_packed, buf, pcs_params)
             }
-            CommitCodeword::StreamedFirstPass(buf, stream) => {
-                pcs::commit_from_streamed_first_pass(z_packed, buf, pcs_params, stream)
-            }
         },
         || {
             let t = std::time::Instant::now();
-            let r = precompute_ab();
-            let wall_ms = t.elapsed().as_secs_f64() * 1e3;
-            // The hybrid-commit warmup sweep sizes its contention emulation
-            // from this arm's measured wall (an Instant read is free; the
-            // store is one relaxed atomic per prove).
-            flock_core::gpu_commit::note_precompute_branch_wall_ms(wall_ms);
+            let r = zerocheck::univariate_skip_optimized::precompute_round1_ab_inner_packed_padded(
+                a_packed,
+                b_packed,
+                pcs_params.m,
+                k_skip,
+                inv_table,
+                padding,
+            );
             if std::env::var_os("FLOCK_PHASE_TIMING").is_some() {
-                eprintln!("[phase-timing] ab-precompute branch wall: {wall_ms:.2} ms");
+                eprintln!(
+                    "[phase-timing] ab-precompute branch wall: {:.2} ms",
+                    t.elapsed().as_secs_f64() * 1e3
+                );
             }
             r
         },
-    );
-
-    if run_ranked_exact_tune {
-        flock_core::gpu_commit::retune_ranked_hybrid_with_exact_contention(
-            pcs_params,
-            &result.0.1.codeword,
-            &result.0.1.merkle_tree,
-            || {
-                let replayed = precompute_ab();
-                std::hint::black_box(&replayed);
-            },
-        );
-    }
-    result
+    )
 }
 
 /// Run commit → bind → zerocheck → lincheck and build the base claims, stopping
@@ -802,7 +452,7 @@ pub fn prove_fast_core<Ch: Challenger>(
         z_packed,
         a_packed_f128,
         b_packed_f128,
-        LincheckStripeInput::Ready(z_packed_lincheck),
+        z_packed_lincheck,
         lincheck_circuit,
         CommitCodeword::Allocate,
         challenger,
@@ -836,7 +486,7 @@ pub fn prove_fast_core_with_codeword<Ch: Challenger>(
         z_packed,
         a_packed_f128,
         b_packed_f128,
-        LincheckStripeInput::Ready(z_packed_lincheck),
+        z_packed_lincheck,
         lincheck_circuit,
         commit_codeword,
         challenger,
@@ -850,107 +500,31 @@ fn prove_fast_core_with_commit_codeword<Ch: Challenger>(
     z_packed: Vec<F128>,
     a_packed_f128: Vec<F128>,
     b_packed_f128: Vec<F128>,
-    z_packed_lincheck: LincheckStripeInput,
+    z_packed_lincheck: Vec<u8>,
     lincheck_circuit: &dyn lincheck::LincheckCircuit,
     commit_codeword: CommitCodeword,
     challenger: &mut Ch,
 ) -> ProveCore {
     let padding = r1cs.padding_spec();
     let phase_timing = std::env::var_os("FLOCK_PHASE_TIMING").is_some();
-    let run_commit = || {
-        let cpu0 = phase_timing.then(process_cpu_ms);
-        let t_commit = std::time::Instant::now();
-        let ((commitment, prover_data), ab_inner) = commit_with_round1_ab_precompute(
-            &z_packed,
-            &a_packed_f128,
-            &b_packed_f128,
-            pcs_params,
-            &padding,
-            commit_codeword,
+    let cpu0 = phase_timing.then(process_cpu_ms);
+    let t_commit = std::time::Instant::now();
+    let ((commitment, prover_data), ab_inner) = commit_with_round1_ab_precompute(
+        &z_packed,
+        &a_packed_f128,
+        &b_packed_f128,
+        pcs_params,
+        &padding,
+        commit_codeword,
+    );
+    if phase_timing {
+        let wall = t_commit.elapsed().as_secs_f64() * 1e3;
+        let cpu = process_cpu_ms() - cpu0.unwrap_or(0.0);
+        eprintln!(
+            "[phase-timing] commit+ab-precompute: {wall:.2} ms cpu={cpu:.1} util={:.1}",
+            cpu / wall
         );
-        if phase_timing {
-            let wall = t_commit.elapsed().as_secs_f64() * 1e3;
-            let cpu = process_cpu_ms() - cpu0.unwrap_or(0.0);
-            eprintln!(
-                "[phase-timing] commit+ab-precompute: {wall:.2} ms cpu={cpu:.1} util={:.1}",
-                cpu / wall
-            );
-        }
-        (commitment, prover_data, ab_inner)
-    };
-
-    // Publish the stripe before zerocheck: the ranked identity-C producer now
-    // consumes it immediately after the commitment challenge is available.
-    // Deferred fill is shorter than commit+AB at the target shape, so moving
-    // this join earlier adds no measured tail while eliminating C's 32-bank
-    // row-major drain.
-    let (pre_zerocheck, z_packed_lincheck) = match z_packed_lincheck {
-        LincheckStripeInput::Ready(stripe) => (run_commit(), stripe),
-        LincheckStripeInput::DeferredRanked => {
-            assert_eq!(r1cs.m, 32);
-            assert_eq!(r1cs.k_log, 14);
-            assert_eq!(r1cs.useful_bits, 15_409);
-            let (m, k_log, useful_bits) = (r1cs.m, r1cs.k_log, r1cs.useful_bits);
-            let mut stripe = flock_core::scratch::take_u8(1usize << (m - 3));
-            // E2 is the measured contention optimum: E4 steals bandwidth from
-            // commit, while E1 lets the stripe spill into zerocheck. Keep the
-            // override for controlled same-binary diagnostics only.
-            let epool_workers = std::env::var_os("FLOCK_DEFER_STRIPE_EPOOL_THREADS")
-                .and_then(|value| value.to_str()?.parse::<usize>().ok())
-                .filter(|workers| (1..=4).contains(workers))
-                .unwrap_or(2);
-            let pre = std::thread::scope(|scope| {
-                let stripe_job = scope.spawn(|| {
-                    let started = std::time::Instant::now();
-                    let filled_on_epool = fill_deferred_lincheck_stripe_with_dispatch(
-                        &z_packed,
-                        &mut stripe,
-                        m,
-                        k_log,
-                        useful_bits,
-                        |n_jobs, job| {
-                            flock_core::epool::run_helper_only_chunks(n_jobs, epool_workers, job)
-                        },
-                    );
-                    if !filled_on_epool {
-                        fill_deferred_lincheck_stripe(
-                            &z_packed,
-                            &mut stripe,
-                            m,
-                            k_log,
-                            useful_bits,
-                        );
-                    }
-                    if phase_timing {
-                        eprintln!(
-                            "[phase-timing] deferred lincheck stripe: {:.2} ms mode={} workers={}",
-                            started.elapsed().as_secs_f64() * 1e3,
-                            if filled_on_epool {
-                                "epool"
-                            } else {
-                                "sequential"
-                            },
-                            if filled_on_epool { epool_workers } else { 0 },
-                        );
-                    }
-                });
-                let pre = run_commit();
-                let join_started = std::time::Instant::now();
-                stripe_job
-                    .join()
-                    .expect("deferred ranked lincheck stripe worker panicked");
-                if phase_timing {
-                    eprintln!(
-                        "[phase-timing] deferred lincheck stripe join tail: {:.2} ms",
-                        join_started.elapsed().as_secs_f64() * 1e3
-                    );
-                }
-                pre
-            });
-            (pre, stripe)
-        }
-    };
-    let (commitment, prover_data, ab_inner) = pre_zerocheck;
+    }
     bind_statement(challenger, r1cs, &commitment);
     let cpu_zc0 = phase_timing.then(process_cpu_ms);
     let t_zc = std::time::Instant::now();
@@ -975,22 +549,9 @@ fn prove_fast_core_with_commit_codeword<Ch: Challenger>(
                 z_packed.len() * core::mem::size_of::<F128>(),
             )
         };
-        if ranked_lincheck_c_reuse_enabled(r1cs) {
-            zerocheck::prove_packed_padded_capture_s_hat_v_c_with_precomputed_ab_and_lincheck_c(
-                a_packed,
-                b_packed,
-                c_packed,
-                &z_packed_lincheck,
-                r1cs.m,
-                &padding,
-                ab_inner,
-                challenger,
-            )
-        } else {
-            zerocheck::prove_packed_padded_capture_s_hat_v_c_with_precomputed_ab(
-                a_packed, b_packed, c_packed, r1cs.m, &padding, ab_inner, challenger,
-            )
-        }
+        zerocheck::prove_packed_padded_capture_s_hat_v_c_with_precomputed_ab(
+            a_packed, b_packed, c_packed, r1cs.m, &padding, ab_inner, challenger,
+        )
     };
     if phase_timing {
         let wall = t_zc.elapsed().as_secs_f64() * 1e3;
@@ -1040,10 +601,19 @@ fn prove_fast_core_with_commit_codeword<Ch: Challenger>(
     // (everything past prefix0). Byte-identical to `fold_1b_rows` on the AB
     // suffix tensor — see `s_hat_v_from_z_vec`. Skip when k_log < LOG_PACKING
     // (only test setups; real R1CS has k_log >= 16).
-    let s_hat_v_ab =
-        precompute_ab_s_hat_v(r1cs, &z_vec_pre, &lc_claim.r_inner_rest[1..]);
-        // z_vec_pre only fed s_hat_v_ab; recycle before PCS open residency.
-        flock_core::scratch::give_f128(z_vec_pre);
+    let s_hat_v_ab = if ranked_direct_ab_precompute_enabled(r1cs) {
+        Some(pcs::ring_switch::s_hat_v_quad_from_z_vec(
+            &z_vec_pre,
+            &lc_claim.r_inner_rest[1..],
+        ))
+    } else if r1cs.k_log >= pcs::LOG_PACKING {
+        Some(pcs::ring_switch::s_hat_v_from_z_vec(
+            &z_vec_pre,
+            &lc_claim.r_inner_rest[1..],
+        ))
+    } else {
+        None
+    };
     if phase_timing {
         let wall = t_lc.elapsed().as_secs_f64() * 1e3;
         let cpu = process_cpu_ms() - cpu_lc0.unwrap_or(0.0);
@@ -1259,15 +829,24 @@ fn prove_fast_ligerito_timed_with_commit_codeword<Ch: Challenger>(
         point: r1cs.c_claim_point(zc_claim.z, &zc_claim.r_rest),
         value: zc_claim.c_eval,
     };
-    let s_hat_v_ab =
-        precompute_ab_s_hat_v(r1cs, &z_vec_pre, &lc_claim.r_inner_rest[1..]);
-        // z_vec_pre only fed s_hat_v_ab; recycle before PCS open residency.
-        flock_core::scratch::give_f128(z_vec_pre);
+    let s_hat_v_ab = if ranked_direct_ab_precompute_enabled(r1cs) {
+        Some(pcs::ring_switch::s_hat_v_quad_from_z_vec(
+            &z_vec_pre,
+            &lc_claim.r_inner_rest[1..],
+        ))
+    } else if r1cs.k_log >= pcs::LOG_PACKING {
+        Some(pcs::ring_switch::s_hat_v_from_z_vec(
+            &z_vec_pre,
+            &lc_claim.r_inner_rest[1..],
+        ))
+    } else {
+        None
+    };
     t.lincheck_s = t0.elapsed().as_secs_f64();
 
     // --- Ligerito recursive PCS open ---
     let pre_ab: Option<&[F128]> = s_hat_v_ab.as_deref();
-    let pre_c: Option<&[F128]> = pre_c_slot(r1cs, &s_hat_v_c);
+    let pre_c: Option<&[F128]> = Some(s_hat_v_c.as_slice());
     let t0 = Instant::now();
     let pcs_open = open_claims_with_precomputed_ligerito(
         z_packed,
