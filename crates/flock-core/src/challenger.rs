@@ -402,7 +402,8 @@ impl Challenger for FsChallenger {
         // scanned/`find_first`ed in ascending order and each returns its
         // smallest match, so the result stays the globally smallest.
         const GRIND_CHUNK: u64 = 960;
-        let nonce = if bits == 0 {
+        let cpu_scan = || {
+            if bits == 0 {
             0
         } else if (1u64 << bits.min(63)) < PARALLEL_GRIND_MIN_HASHES {
             // Sequential search: scan ascending blocks until a nonce lands.
@@ -510,6 +511,75 @@ impl Challenger for FsChallenger {
                 }
                 start = start.saturating_add(block);
             }
+            }
+        };
+        let nonce = if kind == HashKind::Blake3
+            && bits >= GPU_GRIND_MIN_BITS
+            && !GPU_GRIND_FAILED.load(std::sync::atomic::Ordering::Relaxed)
+        {
+            match GPU_GRIND_LATCH.get().copied() {
+                Some(true) => match gpu_blake3_pow_nonce(&state_digest, bits) {
+                    Ok(nonce) => nonce,
+                    Err(_) => {
+                        GPU_GRIND_FAILED.store(true, std::sync::atomic::Ordering::Relaxed);
+                        cpu_scan()
+                    }
+                },
+                Some(false) => cpu_scan(),
+                None if bits == GPU_GRIND_CALIBRATION_BITS
+                    && crate::gpu_commit::gpu_grind_enabled() =>
+                {
+                    // The warm proof reaches the 19-bit L0 grind before the
+                    // worker publishes readiness.  Benchmark the exact seven
+                    // high-cost ranked dispatch sizes in both orders on this
+                    // transcript state.  Fixed windows remove the warm seed's
+                    // random first-hit distance from the admission decision.
+                    let cpu_1_started = std::time::Instant::now();
+                    let cpu_1 = cpu_gpu_grind_calibration(&state_digest);
+                    let cpu_1_time = cpu_1_started.elapsed();
+                    let gpu_1_started = std::time::Instant::now();
+                    let gpu_1 = gpu_grind_calibration(&state_digest);
+                    let gpu_1_time = gpu_1_started.elapsed();
+
+                    let gpu_2_started = std::time::Instant::now();
+                    let gpu_2 = gpu_grind_calibration(&state_digest);
+                    let gpu_2_time = gpu_2_started.elapsed();
+                    let cpu_2_started = std::time::Instant::now();
+                    let cpu_2 = cpu_gpu_grind_calibration(&state_digest);
+                    let cpu_2_time = cpu_2_started.elapsed();
+
+                    let exact = matches!((&gpu_1, &gpu_2), (Ok(a), Ok(b)) if *a == cpu_1 && *b == cpu_1)
+                        && cpu_2 == cpu_1;
+                    let cpu_total = cpu_1_time + cpu_2_time;
+                    let gpu_total = gpu_1_time + gpu_2_time;
+                    // A fixed N-nonce Metal block succeeds with probability
+                    // 1-e^-1, so an unbounded grind consumes 1/(1-e^-1) =
+                    // 1.582 blocks on average.  Charge that overdraw (including
+                    // recurring command costs) before comparing with CPU.
+                    let projected_gpu_total = gpu_total.mul_f64(GPU_GRIND_BLOCK_OVERDRAW);
+                    let protected_gain = cpu_total.saturating_sub(projected_gpu_total);
+                    let enable = exact
+                        && gpu_1_time.mul_f64(GPU_GRIND_BLOCK_OVERDRAW) < cpu_1_time
+                        && gpu_2_time.mul_f64(GPU_GRIND_BLOCK_OVERDRAW) < cpu_2_time
+                        && protected_gain >= GPU_GRIND_MIN_TWO_SAMPLE_GAIN;
+                    let _ = GPU_GRIND_LATCH.set(enable);
+                    if enable {
+                        match gpu_blake3_pow_nonce(&state_digest, bits) {
+                            Ok(nonce) => nonce,
+                            Err(_) => {
+                                GPU_GRIND_FAILED
+                                    .store(true, std::sync::atomic::Ordering::Relaxed);
+                                cpu_scan()
+                            }
+                        }
+                    } else {
+                        cpu_scan()
+                    }
+                }
+                None => cpu_scan(),
+            }
+        } else {
+            cpu_scan()
         };
         // Absorb the nonce so subsequent transcript state binds to it.
         // Verifier mirrors via verify_pow.
@@ -538,6 +608,139 @@ impl Challenger for FsChallenger {
         // nonce); a failed check rejects the proof at the call site anyway.
         self.observe_bytes(&nonce.to_le_bytes());
         ok
+    }
+}
+
+// ---------------------------------------------------------------------------
+
+const GPU_GRIND_CALIBRATION_BITS: u32 = 19;
+const GPU_GRIND_MIN_BITS: u32 = 14;
+const GPU_GRIND_CALIBRATION_PREDICATE_BITS: u32 = 17;
+const GPU_GRIND_CALIBRATION_LENGTHS: [u32; 7] = [
+    1 << 19,
+    1 << 18,
+    1 << 17,
+    1 << 16,
+    1 << 15,
+    1 << 14,
+    1 << 14,
+];
+const GPU_GRIND_BLOCK_OVERDRAW: f64 = 1.581_976_706_869_326_5;
+const GPU_GRIND_MIN_TWO_SAMPLE_GAIN: std::time::Duration =
+    std::time::Duration::from_micros(1_500);
+static GPU_GRIND_LATCH: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+static GPU_GRIND_FAILED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// CPU oracle/throughput arm for one fixed calibration window.  Unlike the
+/// production search it intentionally drains every chunk, making runtime
+/// independent of the first matching nonce while retaining the same P+E-core
+/// hash kernel and queue shape.
+fn cpu_blake3_pow_window(
+    state_digest: &[u8; 32],
+    start: u64,
+    len: u32,
+    bits: u32,
+) -> Option<u64> {
+    use rayon::prelude::*;
+    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+
+    const CHUNK: u64 = 960;
+    const NO_MATCH: u64 = u64::MAX;
+    let n_chunks = usize::try_from(u64::from(len).div_ceil(CHUNK)).expect("chunk count");
+    let results: Vec<AtomicU64> = (0..n_chunks)
+        .map(|_| AtomicU64::new(NO_MATCH))
+        .collect();
+    let next = AtomicUsize::new(0);
+    let worker = || loop {
+        let chunk = next.fetch_add(1, Ordering::Relaxed);
+        if chunk >= n_chunks {
+            break;
+        }
+        let offset = chunk as u64 * CHUNK;
+        let chunk_len = CHUNK.min(u64::from(len) - offset);
+        if let Some(nonce) = blake3_pow_scan(
+            state_digest,
+            start.saturating_add(offset),
+            chunk_len,
+            bits,
+        ) {
+            results[chunk].store(nonce, Ordering::Release);
+        }
+    };
+    let main_threads = rayon::current_num_threads();
+    let drain_main = || {
+        (0..main_threads)
+            .into_par_iter()
+            .with_max_len(1)
+            .for_each(|_| worker());
+    };
+    match crate::epool::epool().filter(|_| main_threads > 1 && n_chunks >= 16) {
+        Some(ep) => std::thread::scope(|scope| {
+            scope.spawn(|| ep.broadcast(|_| worker()));
+            drain_main();
+        }),
+        None => drain_main(),
+    }
+    results
+        .iter()
+        .map(|result| result.load(Ordering::Acquire))
+        .filter(|&nonce| nonce != NO_MATCH)
+        .min()
+}
+
+fn cpu_gpu_grind_calibration(state_digest: &[u8; 32]) -> Vec<Option<u64>> {
+    let mut start = 0u64;
+    GPU_GRIND_CALIBRATION_LENGTHS
+        .into_iter()
+        .map(|len| {
+            let result = cpu_blake3_pow_window(
+                state_digest,
+                start,
+                len,
+                GPU_GRIND_CALIBRATION_PREDICATE_BITS,
+            );
+            start += u64::from(len);
+            result
+        })
+        .collect()
+}
+
+fn gpu_grind_calibration(state_digest: &[u8; 32]) -> Result<Vec<Option<u64>>, String> {
+    let mut start = 0u64;
+    GPU_GRIND_CALIBRATION_LENGTHS
+        .into_iter()
+        .map(|len| {
+            let result = crate::gpu_commit::gpu_blake3_pow_scan(
+                state_digest,
+                start,
+                len,
+                GPU_GRIND_CALIBRATION_PREDICATE_BITS,
+            );
+            start += u64::from(len);
+            result
+        })
+        .collect()
+}
+
+/// Metal scans fixed ascending blocks and reports the smallest match in each
+/// block.  Visiting blocks in order therefore returns the same global minimum
+/// as the CPU scan.  One expected-work block balances GPU over-scan against
+/// recurring command-buffer latency; failure is propagated to the caller's
+/// exact CPU fallback.
+fn gpu_blake3_pow_nonce(state_digest: &[u8; 32], bits: u32) -> Result<u64, String> {
+    debug_assert!((GPU_GRIND_MIN_BITS..=32).contains(&bits));
+    let block_len = 1u32 << bits.min(24);
+    let mut start = 0u64;
+    loop {
+        if let Some(nonce) =
+            crate::gpu_commit::gpu_blake3_pow_scan(state_digest, start, block_len, bits)?
+        {
+            return Ok(nonce);
+        }
+        start = start
+            .checked_add(u64::from(block_len))
+            .ok_or_else(|| "GPU grind nonce range exhausted".to_string())?;
     }
 }
 
@@ -726,6 +929,16 @@ fn pow_scan(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn gpu_grind_calibration_covers_ranked_high_cost_schedule() {
+        assert_eq!(GPU_GRIND_CALIBRATION_LENGTHS.iter().sum::<u32>(), 1 << 20);
+        assert_eq!(GPU_GRIND_CALIBRATION_LENGTHS.len(), 7);
+        assert_eq!(GPU_GRIND_MIN_BITS, 14);
+        assert_eq!(GPU_GRIND_CALIBRATION_BITS, 19);
+        let exact_geometric = 1.0 / (1.0 - (-1.0f64).exp());
+        assert!((GPU_GRIND_BLOCK_OVERDRAW - exact_geometric).abs() < 1e-12);
+    }
 
     /// Every FsChallenger property must hold under both transcript hashes:
     /// the tagging, absorption order and duplex structure are shared, and

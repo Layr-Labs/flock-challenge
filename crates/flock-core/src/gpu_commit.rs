@@ -104,6 +104,20 @@ pub(crate) fn warmup_latch_cache_enabled() -> bool {
 /// the bridge never runs while a prove is active.
 pub const ENV_NO_GPU_KEEPWARM: &str = "FLOCK_NO_GPU_KEEPWARM";
 
+/// Exact rollback for the PCS Fiat--Shamir BLAKE3 grind scanner.  The first
+/// untimed ranked grind still has to prove that Metal returns the same
+/// globally-smallest nonce and clears the target-side timing gate before the
+/// timed proof may use it.
+pub const ENV_NO_GPU_GRIND: &str = "FLOCK_NO_GPU_GRIND";
+
+pub(crate) fn gpu_grind_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| match std::env::var(ENV_NO_GPU_GRIND) {
+        Ok(value) => value != "1",
+        Err(_) => true,
+    })
+}
+
 pub(crate) fn gpu_keepwarm_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os(ENV_NO_GPU_KEEPWARM).is_none())
@@ -115,6 +129,22 @@ pub(crate) fn gpu_keepwarm_enabled() -> bool {
 pub fn gpu_keepwarm_prove_started() {
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     imp::keepwarm_pause();
+}
+
+/// Scan one ascending nonce block with the retained Metal PCS-grind state.
+/// Returns the smallest satisfying nonce in the block, or `None` when the
+/// block has no match.  All recurring work (output reset, command creation,
+/// encoding, submission, wait, and result read) happens inside this call.
+pub(crate) fn gpu_blake3_pow_scan(
+    state_digest: &[u8; 32],
+    start: u64,
+    len: u32,
+    bits: u32,
+) -> Result<Option<u64>, String> {
+    if !gpu_grind_enabled() {
+        return Err("GPU grind disabled".into());
+    }
+    imp::gpu_blake3_pow_scan(state_digest, start, len, bits)
 }
 
 /// Env var that disables this round's NTT pass tuning (the g4 shared-table +
@@ -1857,6 +1887,98 @@ kernel void export_from_z_zero_root_tabs(
 }
 "#;
 
+    // One BLAKE3 compression per nonce.  The protocol hashes the exact
+    // 64-byte single-chunk message `state_digest || nonce_le || 24*0`; ROOT is
+    // therefore set together with CHUNK_START/CHUNK_END.  Each dispatch owns
+    // one bounded ascending block and atomically records the smallest matching
+    // offset, so the host can advance block-by-block without weakening the
+    // challenger's globally-smallest-nonce rule.
+    const POW_MSL_SOURCE: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+constant uint POW_IV[8] = {
+    0x6A09E667u, 0xBB67AE85u, 0x3C6EF372u, 0xA54FF53Au,
+    0x510E527Fu, 0x9B05688Cu, 0x1F83D9ABu, 0x5BE0CD19u
+};
+constant uchar POW_PERM[16] = {2,6,3,10,7,0,4,13,1,11,12,5,9,14,15,8};
+
+struct PowParams {
+    uint start_lo;
+    uint start_hi;
+    uint len;
+    uint bits;
+};
+
+static inline bool pow_has_leading_zero_bits(thread const uint* cv, uint bits) {
+    uint full_bytes = bits >> 3;
+    uint extra = bits & 7u;
+    for (uint i = 0u; i < full_bytes; i++) {
+        uint byte_value = (cv[i >> 2] >> ((i & 3u) << 3)) & 0xffu;
+        if (byte_value != 0u) return false;
+    }
+    if (extra != 0u) {
+        uint i = full_bytes;
+        uint byte_value = (cv[i >> 2] >> ((i & 3u) << 3)) & 0xffu;
+        if ((byte_value >> (8u - extra)) != 0u) return false;
+    }
+    return true;
+}
+
+static inline void pow_compress(thread uint* cv, thread const uint* m_in) {
+    uint v[16];
+    uint m[16];
+    for (uint i = 0u; i < 8u; i++) v[i] = cv[i];
+    for (uint i = 0u; i < 4u; i++) v[8u + i] = POW_IV[i];
+    v[12] = 0u;
+    v[13] = 0u;
+    v[14] = 64u;
+    v[15] = 11u; // CHUNK_START | CHUNK_END | ROOT
+    for (uint i = 0u; i < 16u; i++) m[i] = m_in[i];
+    for (uint round = 0u; round < 7u; round++) {
+        #define POW_G(a,b,c,d,x,y) \
+            v[a] = v[a] + v[b] + x; v[d] = rotate(v[d]^v[a], 16u); \
+            v[c] = v[c] + v[d];     v[b] = rotate(v[b]^v[c], 20u); \
+            v[a] = v[a] + v[b] + y; v[d] = rotate(v[d]^v[a], 24u); \
+            v[c] = v[c] + v[d];     v[b] = rotate(v[b]^v[c], 25u);
+        POW_G(0,4,8,12,  m[0], m[1]);  POW_G(1,5,9,13,  m[2], m[3]);
+        POW_G(2,6,10,14, m[4], m[5]);  POW_G(3,7,11,15, m[6], m[7]);
+        POW_G(0,5,10,15, m[8], m[9]);  POW_G(1,6,11,12, m[10],m[11]);
+        POW_G(2,7,8,13,  m[12],m[13]); POW_G(3,4,9,14,  m[14],m[15]);
+        #undef POW_G
+        if (round < 6u) {
+            uint next[16];
+            for (uint i = 0u; i < 16u; i++) next[i] = m[POW_PERM[i]];
+            for (uint i = 0u; i < 16u; i++) m[i] = next[i];
+        }
+    }
+    for (uint i = 0u; i < 8u; i++) cv[i] = v[i] ^ v[8u + i];
+}
+
+kernel void blake3_pow_scan(
+    constant uint* state_words [[buffer(0)]],
+    device atomic_uint* best   [[buffer(1)]],
+    constant PowParams& params [[buffer(2)]],
+    uint id [[thread_position_in_grid]])
+{
+    if (id >= params.len || id >= atomic_load_explicit(best, memory_order_relaxed)) return;
+    uint nonce_lo = params.start_lo + id;
+    uint carry = nonce_lo < params.start_lo ? 1u : 0u;
+    uint nonce_hi = params.start_hi + carry;
+    uint block[16];
+    for (uint i = 0u; i < 8u; i++) block[i] = state_words[i];
+    block[8] = nonce_lo;
+    block[9] = nonce_hi;
+    for (uint i = 10u; i < 16u; i++) block[i] = 0u;
+    uint cv[8];
+    for (uint i = 0u; i < 8u; i++) cv[i] = POW_IV[i];
+    pow_compress(cv, block);
+    if (pow_has_leading_zero_bits(cv, params.bits)) {
+        atomic_fetch_min_explicit(best, id, memory_order_relaxed);
+    }
+}
+"#;
+
     // -----------------------------------------------------------------------
     // Embedded precompiled metallib.
     //
@@ -1977,6 +2099,11 @@ kernel void export_from_z_zero_root_tabs(
         pub(crate) pso_leaf: Id,
         pub(crate) pso_parent: Id,
         pub(crate) pso_parent3: Id,
+        /// Supplemental PCS Fiat--Shamir BLAKE3 nonce scanner.  Its single
+        /// shared result word is protected because `Gpu` itself is global.
+        pub(crate) pso_pow: Id,
+        pub(crate) pow_out: Id,
+        pub(crate) pow_lock: std::sync::Mutex<()>,
     }
     // SAFETY: MTLDevice/MTLCommandQueue/MTLComputePipelineState are
     // documented thread-safe; command buffers/encoders are created and used
@@ -2175,6 +2302,77 @@ kernel void export_from_z_zero_root_tabs(
                     } else {
                         (NIL, NIL)
                     };
+
+                let (pso_pow, pow_out) = if super::gpu_grind_enabled() {
+                    // This optimization is supplemental: a compile/pipeline/
+                    // allocation failure must not poison the already-valid
+                    // ranked commitment GPU.  The grind gate will see NIL and
+                    // permanently retain the exact CPU implementation.
+                    (|| -> Result<(Id, Id), String> {
+                        let src = api.nsstring(POW_MSL_SOURCE)?;
+                        let mut err: Id = NIL;
+                        let library: Id = send!(
+                            api,
+                            unsafe extern "C" fn(Id, Sel, Id, Id, *mut Id) -> Id,
+                            device,
+                            c"newLibraryWithSource:options:error:",
+                            src,
+                            NIL,
+                            &mut err
+                        );
+                        if library.is_null() {
+                            return Err(format!(
+                                "PCS grind shader compile failed: {}",
+                                api.error_string(err)
+                            ));
+                        }
+                        let ns = api.nsstring("blake3_pow_scan")?;
+                        let function: Id = send!(
+                            api,
+                            unsafe extern "C" fn(Id, Sel, Id) -> Id,
+                            library,
+                            c"newFunctionWithName:",
+                            ns
+                        );
+                        if function.is_null() {
+                            send!(api, unsafe extern "C" fn(Id, Sel) -> Id, library, c"release");
+                            return Err("PCS grind kernel blake3_pow_scan not found".into());
+                        }
+                        let mut pso_err: Id = NIL;
+                        let pso: Id = send!(
+                            api,
+                            unsafe extern "C" fn(Id, Sel, Id, *mut Id) -> Id,
+                            device,
+                            c"newComputePipelineStateWithFunction:error:",
+                            function,
+                            &mut pso_err
+                        );
+                        send!(api, unsafe extern "C" fn(Id, Sel) -> Id, function, c"release");
+                        send!(api, unsafe extern "C" fn(Id, Sel) -> Id, library, c"release");
+                        if pso.is_null() {
+                            return Err(format!(
+                                "PCS grind pipeline blake3_pow_scan: {}",
+                                api.error_string(pso_err)
+                            ));
+                        }
+                        let out: Id = send!(
+                            api,
+                            unsafe extern "C" fn(Id, Sel, u64, u64) -> Id,
+                            device,
+                            c"newBufferWithLength:options:",
+                            4u64,
+                            0u64
+                        );
+                        if out.is_null() {
+                            send!(api, unsafe extern "C" fn(Id, Sel) -> Id, pso, c"release");
+                            return Err("PCS grind result buffer allocation failed".into());
+                        }
+                        Ok((pso, out))
+                    })()
+                    .unwrap_or((NIL, NIL))
+                } else {
+                    (NIL, NIL)
+                };
                 Ok(Gpu {
                     api,
                     device,
@@ -2192,6 +2390,9 @@ kernel void export_from_z_zero_root_tabs(
                     pso_leaf,
                     pso_parent,
                     pso_parent3,
+                    pso_pow,
+                    pow_out,
+                    pow_lock: std::sync::Mutex::new(()),
                 })
             })();
             pool_pop(pool);
@@ -5361,6 +5562,54 @@ kernel void export_from_z_zero_root_tabs(
         }
     }
 
+    pub(crate) fn gpu_blake3_pow_scan(
+        state_digest: &[u8; 32],
+        start: u64,
+        len: u32,
+        bits: u32,
+    ) -> Result<Option<u64>, String> {
+        if len == 0 || !(1..=32).contains(&bits) {
+            return Err(format!("invalid GPU grind block len={len} bits={bits}"));
+        }
+        let gpu = gpu()?;
+        if gpu.pso_pow.is_null() || gpu.pow_out.is_null() {
+            return Err("GPU grind pipeline unavailable".into());
+        }
+        let _guard = gpu
+            .pow_lock
+            .lock()
+            .map_err(|_| "GPU grind result lock poisoned".to_string())?;
+        unsafe {
+            let pool = gpu.pool_push();
+            let result = (|| -> Result<Option<u64>, String> {
+                let out = gpu.buffer_contents(gpu.pow_out).cast::<u32>();
+                out.write_volatile(u32::MAX);
+                let params = [start as u32, (start >> 32) as u32, len, bits];
+                let params_bytes = core::slice::from_raw_parts(
+                    params.as_ptr().cast::<u8>(),
+                    core::mem::size_of_val(&params),
+                );
+                let cb = gpu.command_buffer()?;
+                let enc = gpu.compute_encoder(cb)?;
+                gpu.set_pipeline(enc, gpu.pso_pow);
+                gpu.set_bytes(enc, state_digest, 0);
+                gpu.set_buffer(enc, gpu.pow_out, 0, 1);
+                gpu.set_bytes(enc, params_bytes, 2);
+                // A 64-thread group keeps useful SIMD occupancy without
+                // assuming this register-heavy BLAKE3 pipeline admits a
+                // 256-thread group on every measured worker.
+                const THREADS: u64 = 64;
+                gpu.dispatch(enc, u64::from(len).div_ceil(THREADS), THREADS);
+                gpu.end_encoding(enc);
+                gpu.commit_and_wait(cb)?;
+                let offset = out.read_volatile();
+                Ok((offset != u32::MAX).then(|| start + u64::from(offset)))
+            })();
+            gpu.pool_pop(pool);
+            result
+        }
+    }
+
     /// Build the full BLAKE3 Merkle tree (1 KiB leaves) for `data` on the
     /// GPU. Copy-in/copy-out; bit-gate test harness.
     #[cfg_attr(not(test), allow(dead_code))]
@@ -6265,6 +6514,15 @@ mod imp {
         Err("GPU commit is only available on macOS/aarch64".into())
     }
 
+    pub(crate) fn gpu_blake3_pow_scan(
+        _state_digest: &[u8; 32],
+        _start: u64,
+        _len: u32,
+        _bits: u32,
+    ) -> Result<Option<u64>, String> {
+        Err("GPU grind is only available on macOS/aarch64".into())
+    }
+
     pub(crate) fn gpu_commit_latched_on() -> bool {
         false
     }
@@ -6437,6 +6695,40 @@ mod tests {
                 None
             }
             Err(e) => panic!("GPU error: {e}"),
+        }
+    }
+
+    #[test]
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    fn gpu_pow_scan_matches_blake3_and_crosses_u32_nonce_boundary() {
+        fn leading_zero_bits(bytes: &[u8; 32], bits: u32) -> bool {
+            let full = (bits / 8) as usize;
+            let extra = bits % 8;
+            bytes[..full].iter().all(|&byte| byte == 0)
+                && (extra == 0 || bytes[full] >> (8 - extra) == 0)
+        }
+        fn cpu(digest: &[u8; 32], start: u64, len: u32, bits: u32) -> Option<u64> {
+            (start..start + u64::from(len)).find(|&nonce| {
+                let mut preimage = [0u8; 64];
+                preimage[..32].copy_from_slice(digest);
+                preimage[32..40].copy_from_slice(&nonce.to_le_bytes());
+                leading_zero_bits(blake3::hash(&preimage).as_bytes(), bits)
+            })
+        }
+
+        let digest = core::array::from_fn(|i| (i as u8).wrapping_mul(37).wrapping_add(11));
+        for (start, len, bits) in [
+            (0u64, 1u32 << 12, 8u32),
+            (91_000, 1u32 << 17, 12u32),
+            (u64::from(u32::MAX) - 257, 1u32 << 12, 8u32),
+            (0, 1u32 << 19, 17u32),
+        ] {
+            let expected = cpu(&digest, start, len, bits);
+            let got = match gpu_or_skip(gpu_blake3_pow_scan(&digest, start, len, bits)) {
+                Some(result) => result,
+                None => return,
+            };
+            assert_eq!(got, expected, "start={start} len={len} bits={bits}");
         }
     }
 
