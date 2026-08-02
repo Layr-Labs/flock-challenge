@@ -690,6 +690,60 @@ pub struct FromZFirstPassStream {
     inner: imp::FromZFirstPassStream,
 }
 
+/// One BLAKE3 compression input in the explicit Metal ABI used by the
+/// speculative split-witness arm.  `Compression` is a Rust tuple alias in
+/// flock-prover, so passing it directly across the crate/device boundary
+/// would make its layout an accidental contract; this representation is
+/// deliberately `repr(C)` and consists only of 32-bit lanes.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct GpuWitgenInput {
+    pub cv: [u32; 8],
+    pub message: [u32; 16],
+    pub counter_lo: u32,
+    pub counter_hi: u32,
+    pub block_len: u32,
+    pub flags: u32,
+}
+const _: () = assert!(core::mem::size_of::<GpuWitgenInput>() == 112);
+const _: () = assert!(core::mem::align_of::<GpuWitgenInput>() == 4);
+
+/// In-flight full-rank `z` witness dispatch.  It owns the Metal command
+/// buffer and the serialized supplemental-kernel state until the caller has
+/// made the CPU-visible output safe to consume.
+#[doc(hidden)]
+pub struct GpuWitgenZJob {
+    inner: imp::GpuWitgenZJob,
+}
+
+impl GpuWitgenZJob {
+    /// Wait for the producer and release its command-buffer resources.
+    /// Failure is deliberately fail-open: callers retain their CPU witness.
+    #[doc(hidden)]
+    pub fn wait(self) -> bool {
+        self.inner.wait().is_ok()
+    }
+}
+
+/// Submit one thread per BLAKE3 compression to materialize the packed `z`
+/// row.  The caller supplies a 2^18-slot output on the ranked shape; padding
+/// inputs are represented explicitly in `inputs`.  A `None` result leaves
+/// the incumbent CPU witness path untouched.
+#[doc(hidden)]
+pub fn launch_ranked_witgen_z(
+    inputs: &[GpuWitgenInput],
+    z_out: &mut [F128],
+) -> Option<GpuWitgenZJob> {
+    imp::launch_ranked_witgen_z(inputs, z_out).map(|inner| GpuWitgenZJob { inner })
+}
+
+/// Compile the supplemental split-witness library during untimed warmup.
+/// This avoids charging frontend startup to the process-local A/B decision.
+#[doc(hidden)]
+pub fn prepare_ranked_witgen_z() -> bool {
+    imp::prepare_ranked_witgen_z()
+}
+
 /// Reserve the latched ranked GPU staging buffer before `z` is initialized.
 /// Returns `None` during warmup, on unsupported targets/shapes, or whenever
 /// the ordinary CPU/GPU fallback machinery should remain in control.
@@ -6230,6 +6284,150 @@ kernel void blake3_pow_scan(
     // cached no-copy wrap of the caller's stripe.
     // -----------------------------------------------------------------------
 
+    // -----------------------------------------------------------------------
+    // Split witness: GPU z producer.
+    //
+    // This deliberately lives in a supplemental library.  A Metal frontend
+    // failure must never poison the already-promoted commitment library: the
+    // caller simply retains the CPU witness after its warmup comparison.
+    // One GPU thread owns one compression's 2 KiB z block, which preserves
+    // the CPU layout consumed by the existing from-z first NTT pass.
+    // -----------------------------------------------------------------------
+    const WITGEN_Z_MSL_SOURCE: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+struct WitgenInput {
+    uint cv[8];
+    uint message[16];
+    uint counter_lo;
+    uint counter_hi;
+    uint block_len;
+    uint flags;
+};
+
+struct WitgenWriter {
+    device uint* out;
+    uint word;
+    uint pending;
+    uint used;
+};
+
+static inline void witgen_push(thread WitgenWriter& w, uint value, uint width) {
+    value &= (width == 31u) ? 0x7fffffffu : 0xffffffffu;
+    uint room = 32u - w.used;
+    if (width < room) {
+        w.pending |= value << w.used;
+        w.used += width;
+    } else {
+        w.out[w.word++] = w.pending | (value << w.used);
+        if (width == room) {
+            w.pending = 0u;
+            w.used = 0u;
+        } else {
+            w.pending = value >> room;
+            w.used = width - room;
+        }
+    }
+}
+
+static inline uint witgen_ror(uint x, uint n) {
+    return (x >> n) | (x << (32u - n));
+}
+
+// Expand the BLAKE3 G chain with literal state/message indices.  The scalar
+// z writer follows the exact packed stream layout used by the portable and
+// NEON witness builders: six 31-bit carry rows then two 32-bit linear rows.
+#define WITGEN_G(BASE, LA, LB, LC, LD, MX, MY) {                              \
+    uint _x0 = state[LA], _y0 = state[LB];                                     \
+    uint _t0 = _x0 + _y0, _cin0 = _t0 ^ _x0 ^ _y0;                             \
+    uint _l0 = _x0 ^ _cin0, _r0 = _y0 ^ _cin0, _c0 = _l0 & _r0;                \
+    witgen_push(writer, _c0, 31u);                                             \
+    uint _x1 = _t0, _y1 = message[MX];                                        \
+    uint _a1 = _x1 + _y1, _cin1 = _a1 ^ _x1 ^ _y1;                             \
+    uint _l1 = _x1 ^ _cin1, _r1 = _y1 ^ _cin1, _c1 = _l1 & _r1;                \
+    witgen_push(writer, _c1, 31u);                                             \
+    uint _d1 = witgen_ror(state[LD] ^ _a1, 16u);                               \
+    uint _x2 = state[LC], _y2 = _d1;                                          \
+    uint _c1s = _x2 + _y2, _cin2 = _c1s ^ _x2 ^ _y2;                           \
+    uint _l2 = _x2 ^ _cin2, _r2 = _y2 ^ _cin2, _c2 = _l2 & _r2;                \
+    witgen_push(writer, _c2, 31u);                                             \
+    uint _b1 = witgen_ror(state[LB] ^ _c1s, 12u);                              \
+    uint _x3 = _a1, _y3 = _b1;                                                \
+    uint _t1 = _x3 + _y3, _cin3 = _t1 ^ _x3 ^ _y3;                             \
+    uint _l3 = _x3 ^ _cin3, _r3 = _y3 ^ _cin3, _c3 = _l3 & _r3;                \
+    witgen_push(writer, _c3, 31u);                                             \
+    uint _x4 = _t1, _y4 = message[MY];                                        \
+    uint _a2 = _x4 + _y4, _cin4 = _a2 ^ _x4 ^ _y4;                             \
+    uint _l4 = _x4 ^ _cin4, _r4 = _y4 ^ _cin4, _c4 = _l4 & _r4;                \
+    witgen_push(writer, _c4, 31u);                                             \
+    uint _d2 = witgen_ror(_d1 ^ _a2, 8u);                                     \
+    uint _x5 = _c1s, _y5 = _d2;                                               \
+    uint _c2s = _x5 + _y5, _cin5 = _c2s ^ _x5 ^ _y5;                           \
+    uint _l5 = _x5 ^ _cin5, _r5 = _y5 ^ _cin5, _c5 = _l5 & _r5;                \
+    witgen_push(writer, _c5, 31u);                                             \
+    uint _bn = witgen_ror(_b1 ^ _c2s, 7u);                                    \
+    witgen_push(writer, _bn, 32u);                                            \
+    witgen_push(writer, _d2, 32u);                                            \
+    state[LA] = _a2; state[LB] = _bn; state[LC] = _c2s; state[LD] = _d2;      \
+}
+
+#define WITGEN_ROUND(BASE, M0,M1,M2,M3,M4,M5,M6,M7,M8,M9,M10,M11,M12,M13,M14,M15) { \
+    WITGEN_G(BASE,    0,4,8,12,M0,M1);  WITGEN_G(BASE + 1u,1,5,9,13,M2,M3);    \
+    WITGEN_G(BASE + 2u,2,6,10,14,M4,M5); WITGEN_G(BASE + 3u,3,7,11,15,M6,M7);  \
+    WITGEN_G(BASE + 4u,0,5,10,15,M8,M9); WITGEN_G(BASE + 5u,1,6,11,12,M10,M11);\
+    WITGEN_G(BASE + 6u,2,7,8,13,M12,M13);WITGEN_G(BASE + 7u,3,4,9,14,M14,M15); \
+}
+
+kernel void witgen_z(device const WitgenInput* inputs [[buffer(0)]],
+                     device uint* z                 [[buffer(1)]],
+                     uint id [[thread_position_in_grid]])
+{
+    device const WitgenInput* input = inputs + id;
+    device uint* out = z + id * 512u;
+    uint message[16];
+    uint state[16];
+    for (uint i = 0u; i < 16u; ++i) message[i] = input->message[i];
+    for (uint i = 0u; i < 8u; ++i) out[i] = input->cv[i];
+    for (uint i = 8u; i < 16u; ++i) out[i] = 0u;
+    uint prefix[20] = {
+        message[0], message[1], message[2], message[3],
+        message[4], message[5], message[6], message[7],
+        message[8], message[9], message[10], message[11],
+        message[12], message[13], message[14], message[15],
+        input->counter_lo, input->counter_hi, input->block_len, input->flags
+    };
+    for (uint i = 0u; i < 10u; ++i) {
+        uint low = (i == 0u) ? 1u : (prefix[2u * i - 1u] >> 31u);
+        out[16u + 2u * i] = low | (prefix[2u * i] << 1u);
+        out[17u + 2u * i] = (prefix[2u * i] >> 31u) | (prefix[2u * i + 1u] << 1u);
+    }
+    state[0] = input->cv[0]; state[1] = input->cv[1];
+    state[2] = input->cv[2]; state[3] = input->cv[3];
+    state[4] = input->cv[4]; state[5] = input->cv[5];
+    state[6] = input->cv[6]; state[7] = input->cv[7];
+    state[8] = 0x6A09E667u; state[9] = 0xBB67AE85u;
+    state[10] = 0x3C6EF372u; state[11] = 0xA54FF53Au;
+    state[12] = input->counter_lo; state[13] = input->counter_hi;
+    state[14] = input->block_len; state[15] = input->flags;
+    WitgenWriter writer = { out, 36u, input->flags >> 31u, 1u };
+    WITGEN_ROUND(0u,  0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15);
+    WITGEN_ROUND(8u,  2,6,3,10,7,0,4,13,1,11,12,5,9,14,15,8);
+    WITGEN_ROUND(16u, 3,4,10,12,13,2,7,14,6,5,9,0,11,15,8,1);
+    WITGEN_ROUND(24u, 10,7,12,9,14,3,13,15,4,0,11,2,5,8,1,6);
+    WITGEN_ROUND(32u, 12,13,9,11,15,10,14,8,7,2,5,3,0,1,6,4);
+    WITGEN_ROUND(40u, 9,14,11,5,8,12,15,1,13,3,0,10,2,6,4,7);
+    WITGEN_ROUND(48u, 11,15,5,0,1,9,8,6,14,10,2,12,3,4,7,13);
+    for (uint i = 0u; i < 8u; ++i) witgen_push(writer, state[8u + i] ^ input->cv[i], 32u);
+    if (writer.used != 0u) out[writer.word++] = writer.pending;
+    for (uint i = writer.word; i < 512u; ++i) out[i] = 0u;
+    for (uint i = 0u; i < 8u; ++i) out[8u + i] = state[i] ^ state[8u + i];
+}
+
+#undef WITGEN_G
+#undef WITGEN_ROUND
+"#;
+
     const ZC_FOLD_MSL_SOURCE: &str = r#"
 #include <metal_stdlib>
 using namespace metal;
@@ -6471,6 +6669,217 @@ kernel void NAME(                                                       \
 
 LC_KERNEL(lc_fold_stripes, 4)
 "#;
+
+    // -----------------------------------------------------------------------
+    // Split-witness z producer state.
+    // -----------------------------------------------------------------------
+
+    struct WitgenZ {
+        gpu: &'static Gpu,
+        pso: Id,
+        input_buf: Id,
+        input_cap: usize,
+        /// Cached no-copy wraps of packed z outputs: `(ptr, len, buffer)`.
+        z_wraps: Vec<(usize, usize, Id)>,
+    }
+    unsafe impl Send for WitgenZ {}
+
+    static WITGEN_Z: Mutex<Option<Result<WitgenZ, String>>> = Mutex::new(None);
+
+    impl WitgenZ {
+        unsafe fn ensure_input(&mut self, need: usize) -> Result<(), String> {
+            if self.input_cap >= need {
+                return Ok(());
+            }
+            let next = unsafe { self.gpu.new_buffer(need)? };
+            if !self.input_buf.is_null() {
+                unsafe { self.gpu.release(self.input_buf) };
+            }
+            self.input_buf = next;
+            self.input_cap = need;
+            Ok(())
+        }
+
+        unsafe fn wrap_z(&mut self, z_out: &mut [F128]) -> Result<Id, String> {
+            let ptr = z_out.as_mut_ptr().cast::<u8>();
+            let len = std::mem::size_of_val(z_out);
+            if let Some((_, _, buf)) = self
+                .z_wraps
+                .iter()
+                .find(|(p, l, _)| *p == ptr as usize && *l == len)
+            {
+                return Ok(*buf);
+            }
+            let buf = unsafe { self.gpu.wrap_buffer(ptr, len)? };
+            self.z_wraps.push((ptr as usize, len, buf));
+            Ok(buf)
+        }
+    }
+
+    fn witgen_z_init(gpu: &'static Gpu) -> Result<WitgenZ, String> {
+        unsafe {
+            let pool = gpu.pool_push();
+            let result = (|| -> Result<WitgenZ, String> {
+                let src = gpu.api.nsstring(WITGEN_Z_MSL_SOURCE)?;
+                let mut err: Id = NIL;
+                let library: Id = send!(
+                    gpu.api,
+                    unsafe extern "C" fn(Id, Sel, Id, Id, *mut Id) -> Id,
+                    gpu.device,
+                    c"newLibraryWithSource:options:error:",
+                    src,
+                    NIL,
+                    &mut err
+                );
+                if library.is_null() {
+                    return Err(format!(
+                        "split-witness z shader compile failed: {}",
+                        gpu.api.error_string(err)
+                    ));
+                }
+                let name = gpu.api.nsstring("witgen_z")?;
+                let function: Id = send!(
+                    gpu.api,
+                    unsafe extern "C" fn(Id, Sel, Id) -> Id,
+                    library,
+                    c"newFunctionWithName:",
+                    name
+                );
+                if function.is_null() {
+                    gpu.release(library);
+                    return Err("split-witness z kernel witgen_z not found".into());
+                }
+                let mut pso_err: Id = NIL;
+                let pso: Id = send!(
+                    gpu.api,
+                    unsafe extern "C" fn(Id, Sel, Id, *mut Id) -> Id,
+                    gpu.device,
+                    c"newComputePipelineStateWithFunction:error:",
+                    function,
+                    &mut pso_err
+                );
+                gpu.release(function);
+                gpu.release(library);
+                if pso.is_null() {
+                    return Err(format!(
+                        "split-witness z pipeline failed: {}",
+                        gpu.api.error_string(pso_err)
+                    ));
+                }
+                Ok(WitgenZ {
+                    gpu,
+                    pso,
+                    input_buf: NIL,
+                    input_cap: 0,
+                    z_wraps: Vec::new(),
+                })
+            })();
+            gpu.pool_pop(pool);
+            result
+        }
+    }
+
+    pub(crate) struct GpuWitgenZJob {
+        guard: std::sync::MutexGuard<'static, Option<Result<WitgenZ, String>>>,
+        cb: Id,
+    }
+
+    impl GpuWitgenZJob {
+        pub(crate) fn wait(mut self) -> Result<(), String> {
+            let state = self
+                .guard
+                .as_ref()
+                .and_then(|r| r.as_ref().ok())
+                .ok_or_else(|| "split-witness z state vanished".to_string())?;
+            let cb = std::mem::replace(&mut self.cb, NIL);
+            let result = unsafe { state.gpu.wait_cb(cb) };
+            unsafe { state.gpu.release(cb) };
+            result
+        }
+    }
+
+    impl Drop for GpuWitgenZJob {
+        fn drop(&mut self) {
+            if self.cb.is_null() {
+                return;
+            }
+            if let Some(state) = self.guard.as_ref().and_then(|r| r.as_ref().ok()) {
+                unsafe {
+                    let _ = state.gpu.wait_cb(self.cb);
+                    state.gpu.release(self.cb);
+                }
+            }
+            self.cb = NIL;
+        }
+    }
+
+    pub(crate) fn prepare_ranked_witgen_z() -> bool {
+        if std::env::var_os("FLOCK_NO_GPU_WITGEN_Z").is_some() {
+            return false;
+        }
+        let Ok(gpu) = gpu() else {
+            return false;
+        };
+        let Ok(mut guard) = WITGEN_Z.lock() else {
+            return false;
+        };
+        if guard.is_none() {
+            *guard = Some(witgen_z_init(gpu));
+        }
+        guard.as_ref().is_some_and(|result| result.is_ok())
+    }
+
+    pub(crate) fn launch_ranked_witgen_z(
+        inputs: &[super::GpuWitgenInput],
+        z_out: &mut [F128],
+    ) -> Option<GpuWitgenZJob> {
+        const RANKED_SLOTS: usize = 1 << 18;
+        const RANKED_Z_F128: usize = RANKED_SLOTS * (1 << 7);
+        if std::env::var_os("FLOCK_NO_GPU_WITGEN_Z").is_some()
+            || inputs.len() != RANKED_SLOTS
+            || z_out.len() != RANKED_Z_F128
+        {
+            return None;
+        }
+        let gpu = gpu().ok()?;
+        let mut guard = WITGEN_Z.lock().ok()?;
+        if guard.is_none() {
+            *guard = Some(witgen_z_init(gpu));
+        }
+        if guard.as_ref().is_some_and(|result| result.is_err()) {
+            return None;
+        }
+        let cb = unsafe {
+            let pool = gpu.pool_push();
+            let result = (|| -> Result<Id, String> {
+                let state = guard
+                    .as_mut()
+                    .and_then(|r| r.as_mut().ok())
+                    .ok_or_else(|| "split-witness z state unavailable".to_string())?;
+                state.ensure_input(std::mem::size_of_val(inputs))?;
+                std::ptr::copy_nonoverlapping(
+                    inputs.as_ptr().cast::<u8>(),
+                    state.gpu.buffer_contents(state.input_buf),
+                    std::mem::size_of_val(inputs),
+                );
+                let z_buf = state.wrap_z(z_out)?;
+                let cb = state.gpu.command_buffer()?;
+                let enc = state.gpu.compute_encoder(cb)?;
+                state.gpu.set_pipeline(enc, state.pso);
+                state.gpu.set_buffer(enc, state.input_buf, 0, 0);
+                state.gpu.set_buffer(enc, z_buf, 0, 1);
+                state.gpu.dispatch(enc, (RANKED_SLOTS / 64) as u64, 64);
+                state.gpu.end_encoding(enc);
+                let cb = state.gpu.retain(cb);
+                state.gpu.commit_async(cb);
+                Ok(cb)
+            })();
+            gpu.pool_pop(pool);
+            result
+        }
+        .ok()?;
+        Some(GpuWitgenZJob { guard, cb })
+    }
 
     /// Output partials produced by the GPU fold. Fixed so the buffer set and
     /// the reduce dispatch are size-stable across proves.
@@ -10092,6 +10501,25 @@ mod imp {
         _params: &crate::pcs::commit::PcsParams,
     ) -> Option<FromZFirstPassStream> {
         None
+    }
+
+    pub(crate) struct GpuWitgenZJob;
+
+    impl GpuWitgenZJob {
+        pub(crate) fn wait(self) -> Result<(), String> {
+            Err("GPU split witness is only available on macOS/aarch64".into())
+        }
+    }
+
+    pub(crate) fn launch_ranked_witgen_z(
+        _inputs: &[super::GpuWitgenInput],
+        _z_out: &mut [F128],
+    ) -> Option<GpuWitgenZJob> {
+        None
+    }
+
+    pub(crate) fn prepare_ranked_witgen_z() -> bool {
+        false
     }
 
     pub(crate) fn finish_from_z_first_pass_or_fallback(
