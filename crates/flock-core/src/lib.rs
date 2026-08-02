@@ -90,6 +90,15 @@ pub fn init_perf_thread_pool() -> Option<usize> {
 /// Flip the keepalive nudger to proving mode (helper pool only); see
 /// [`epool::keepalive_proving`]. Call as soon as the timed seed arrives.
 
+/// Apply the prover's QoS class to the calling thread.
+///
+/// Threads this crate's consumers spawn outside the Rayon pool (the ranked
+/// worker's seed-pipeline thread) still run timed serial work, so they need
+/// the same P-cluster pin [`init_perf_thread_pool`] gives the main thread.
+pub fn set_calling_thread_prover_qos() {
+    set_prover_thread_qos();
+}
+
 /// Mark Rayon prover workers as latency-sensitive on macOS. A bare Rayon pool
 /// inherits default QoS, which lets sustained jobs drift onto efficiency cores
 /// even when the pool was deliberately sized to the performance-core count.
