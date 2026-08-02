@@ -3331,53 +3331,6 @@ mod zero_lane_skip {
         );
     }
 
-    /// Diagnostic dump of the ranked twiddle-tree structure: per-layer
-    /// linearity constants E_{l,j} (tw(l,b) = XOR of bit_j(b)*E_{l,j}) and
-    /// which 32-bit words are live per layer. Probe only.
-    #[test]
-    #[ignore = "diagnostic dump; run explicitly with --ignored --nocapture"]
-    fn twiddle_structure_probe() {
-        let ntt = AdditiveNttF128::standard(20);
-        let tw = ntt
-            .precomputed_twiddle_table()
-            .expect("dim 20 is cached");
-        for layer in 0..20usize {
-            let start = (1usize << layer) - 1;
-            let blocks = 1usize << layer;
-            // Verify GF(2)-linearity in the block index and collect E values.
-            let mut es: Vec<F128> = Vec::new();
-            for j in 0..layer {
-                es.push(tw[start + (1 << j)]);
-            }
-            let mut linear = true;
-            let sample = blocks.min(4096);
-            for b in 0..sample {
-                let mut acc = F128::ZERO;
-                for (j, e) in es.iter().enumerate() {
-                    if (b >> j) & 1 == 1 {
-                        acc = acc + *e;
-                    }
-                }
-                if acc != tw[start + b] {
-                    linear = false;
-                    break;
-                }
-            }
-            // Word liveness across the whole layer.
-            let (mut lo_or, mut hi_or) = (0u64, 0u64);
-            for b in 0..blocks {
-                lo_or |= tw[start + b].lo;
-                hi_or |= tw[start + b].hi;
-            }
-            eprintln!(
-                "layer {layer:2}: linear={linear} lo_or={lo_or:016x} hi_or={hi_or:016x}"
-            );
-            for (j, e) in es.iter().enumerate() {
-                eprintln!("    E[{j}] = {:016x}_{:016x}", e.hi, e.lo);
-            }
-        }
-    }
-
     /// The ambient publication is honored ONLY at the ranked production
     /// geometry, and never leaks past its guard.
     #[test]

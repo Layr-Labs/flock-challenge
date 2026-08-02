@@ -77,32 +77,6 @@ pub(crate) fn gpu_zerocheck_debug() -> bool {
     *ON
 }
 
-/// Kill switch for the lincheck witness-stripe gather-fold GPU arm:
-/// `FLOCK_NO_GPU_LINCHECK=1` keeps the whole fold on the CPU (the exact
-/// incumbent). The fold is a pure gather + XOR reduction — the eq weight is
-/// folded into the per-stripe sum tables, which are subset XORs of eight eq
-/// values, and the accumulation is XOR only; there is no carry-less
-/// multiply anywhere in it, so the zerocheck round-two GPU refutation
-/// (Metal has no PMULL) does not apply. The GPU is idle from post-commit
-/// through the lincheck window, so the arm folds a prefix of the same
-/// oblock tile claims the CPU hetero queue drains and the halves are
-/// XOR-combined — bit-identical to the whole-range CPU fold (GF(2^128) add
-/// is XOR: associative and commutative, so any claim partition works).
-pub const ENV_NO_GPU_LINCHECK: &str = "FLOCK_NO_GPU_LINCHECK";
-
-pub(crate) fn gpu_lincheck_enabled() -> bool {
-    static ON: std::sync::LazyLock<bool> =
-        std::sync::LazyLock::new(|| std::env::var_os(ENV_NO_GPU_LINCHECK).is_none());
-    *ON
-}
-
-/// Diagnostic trace for the lincheck fold arm (`FLOCK_LINCHECK_GPU_DEBUG=1`).
-pub(crate) fn gpu_lincheck_debug() -> bool {
-    static ON: std::sync::LazyLock<bool> =
-        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_LINCHECK_GPU_DEBUG").is_some());
-    *ON
-}
-
 /// Kill switch for the cross-process warmup latch cache:
 /// `FLOCK_NO_WARMUP_LATCH_CACHE=1` restores the incumbent full dual-run +
 /// autotune sweep in every worker process. The cache changes **no timed
@@ -129,43 +103,6 @@ pub(crate) fn warmup_latch_cache_enabled() -> bool {
 /// graph wall; back-to-back runs are flat. Timed work is never touched:
 /// the bridge never runs while a prove is active.
 pub const ENV_NO_GPU_KEEPWARM: &str = "FLOCK_NO_GPU_KEEPWARM";
-
-/// Kill switch for the recursive Ligerito GPU Merkle (128-byte-leaf L1/L2
-/// commitment trees, built while the GPU is otherwise idle in the post-commit
-/// opening spine): `FLOCK_NO_GPU_RECURSIVE_MERKLE=1` keeps those trees on the
-/// CPU. Output is bit-exact either way — the kernel computes the same BLAKE3
-/// chunk/parent chaining values into the same flat layout, and any GPU setup
-/// or submission failure falls back to the untouched CPU builder.
-pub const ENV_NO_GPU_RECURSIVE_MERKLE: &str = "FLOCK_NO_GPU_RECURSIVE_MERKLE";
-
-fn gpu_recursive_merkle_value_enabled(value: Option<&std::ffi::OsStr>) -> bool {
-    value != Some(std::ffi::OsStr::new("1"))
-}
-
-pub(crate) fn gpu_recursive_merkle_enabled() -> bool {
-    // A/B-CONTROL: set to `false` for the official-harness control build. The
-    // env kill switch exists only for faster same-binary diagnostic trials.
-    const GPU_RECURSIVE_MERKLE_DEFAULT: bool = true;
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| {
-        GPU_RECURSIVE_MERKLE_DEFAULT
-            && gpu_recursive_merkle_value_enabled(
-                std::env::var_os(ENV_NO_GPU_RECURSIVE_MERKLE).as_deref(),
-            )
-    })
-}
-
-/// GPU BLAKE3 Merkle tree for the recursive Ligerito 128-byte-leaf shapes
-/// (2^18 or 2^16 leaves). Returns `None` whenever the GPU path is disabled,
-/// unavailable, or fails — the caller then builds the identical tree on the
-/// CPU. `Some(tree)` is bit-identical to `merkle::merkle_tree(data,
-/// num_leaves, HashKind::Blake3)`.
-pub fn gpu_recursive_merkle_blake3(
-    data: &[u8],
-    num_leaves: usize,
-) -> Option<Vec<crate::merkle::Hash>> {
-    imp::gpu_recursive_merkle_blake3(data, num_leaves)
-}
 
 /// Exact rollback for the PCS Fiat--Shamir BLAKE3 grind scanner.  The first
 /// untimed ranked grind still has to prove that Metal returns the same
@@ -3281,34 +3218,6 @@ kernel void blake3_pow_scan(
     /// dispatches. Each dispatch uses buffer offsets, so the existing tuned
     /// kernel sees a local `r = 0..r_count` while reading/writing the desired
     /// global range in all eight message segments.
-    /// Diagnostic-only: `FLOCK_GPU_WINDOW_TRACE=1` prints per-command-buffer
-    /// GPU execution intervals for the ranked streamed commit window. Local
-    /// tooling; ranked workers never set it.
-    fn window_trace_enabled() -> bool {
-        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        *ON.get_or_init(|| std::env::var_os("FLOCK_GPU_WINDOW_TRACE").is_some())
-    }
-
-    /// (GPUStartTime, GPUEndTime) of a completed command buffer, in seconds
-    /// of the shared Metal/host timebase (0.0 when unavailable). Trace-only.
-    unsafe fn cb_gpu_interval(gpu: &Gpu, cb: Id) -> (f64, f64) {
-        unsafe {
-            let start: f64 = send!(
-                gpu.api,
-                unsafe extern "C" fn(Id, Sel) -> f64,
-                cb,
-                c"GPUStartTime"
-            );
-            let end: f64 = send!(
-                gpu.api,
-                unsafe extern "C" fn(Id, Sel) -> f64,
-                cb,
-                c"GPUEndTime"
-            );
-            (start, end)
-        }
-    }
-
     pub(crate) struct FromZFirstPassStream {
         gpu: &'static Gpu,
         z_buf: Id,
@@ -3453,44 +3362,12 @@ kernel void blake3_pow_scan(
 
         fn wait_pending(&mut self) -> Result<(), String> {
             let mut result = self.failed.take().map_or(Ok(()), Err);
-            let trace = window_trace_enabled();
-            let host_at_entry = self.started.elapsed().as_secs_f64() * 1e3;
-            let mut busy = 0.0f64;
-            let mut gaps = 0.0f64;
-            let mut prev_end: Option<f64> = None;
-            let mut first_start = 0.0f64;
-            let mut last_end = 0.0f64;
-            let n_bands = self.pending.len();
             for cb in self.pending.drain(..) {
                 let waited = unsafe { self.gpu.wait_cb(cb) };
-                if trace {
-                    let (s, e) = unsafe { cb_gpu_interval(self.gpu, cb) };
-                    if e > s {
-                        busy += e - s;
-                        if let Some(p) = prev_end {
-                            gaps += (s - p).max(0.0);
-                        } else {
-                            first_start = s;
-                        }
-                        prev_end = Some(e);
-                        last_end = e;
-                    }
-                }
                 unsafe { self.gpu.release(cb) };
                 if result.is_ok() {
                     result = waited;
                 }
-            }
-            if trace && prev_end.is_some() {
-                eprintln!(
-                    "[gpu-window] bands n={n_bands}: busy {:.2} ms, inter-band gaps {:.2} ms, \
-                     span {:.2} ms; host wall at wait-entry {host_at_entry:.2} ms, at drain \
-                     {:.2} ms; last band gpu-end raw {last_end:.6}",
-                    busy * 1e3,
-                    gaps * 1e3,
-                    (last_end - first_start) * 1e3,
-                    self.started.elapsed().as_secs_f64() * 1e3,
-                );
             }
             result
         }
@@ -4077,17 +3954,7 @@ kernel void blake3_pow_scan(
                 // level is always fully populated by subtree-internal
                 // parents; the 15 nodes above it are recomputed here,
                 // covering every decomposition boundary for any k.
-                let t_wait_cb2 = window_trace_enabled().then(std::time::Instant::now);
                 gpu.wait_cb(cb2)?;
-                if let Some(t) = t_wait_cb2 {
-                    let (s, e) = cb_gpu_interval(gpu, cb2);
-                    eprintln!(
-                        "[gpu-window] cb2 (deep prefix + gpu merkle): gpu dur {:.2} ms, \
-                         host blocked waiting {:.2} ms, gpu start raw {s:.6} end raw {e:.6}",
-                        (e - s) * 1e3,
-                        t.elapsed().as_secs_f64() * 1e3,
-                    );
-                }
                 let mut level_start = 0usize;
                 let mut level_len = n_leaves;
                 while level_len > 16 {
@@ -5946,119 +5813,6 @@ kernel void zc_fold_reduce(
 }
 "#;
 
-    /// Lincheck-window gather-fold kernel (v2). Same decomposition as the
-    /// zerocheck arm's `zc_fold_stripes` — 256 threads x 4 adjacent columns
-    /// = 1024 columns per threadgroup, one output partial per chunk — but
-    /// the per-stripe lookup tables are indexed BY BYTE (256 entries, one
-    /// threadgroup uint4 lookup per stripe byte) instead of BY NIBBLE
-    /// (2x16 entries, two lookups per byte). The fold's dominant cost is
-    /// threadgroup-memory lookup traffic (the stripe stream itself is
-    /// coalesced and small by comparison): the nibble form moves 2 x 16 B
-    /// per stripe byte, this form moves 16 B. Bank-conflict statistics per
-    /// lookup are identical — uniform-random indices are invariant under
-    /// any fixed table permutation, so layout swizzles cannot help random
-    /// gathers; only fewer/smaller lookups can.
-    ///
-    /// Byte tables cost 4 KiB per covered stripe, so the build covers B = 4
-    /// stripes per block: 16.5 KiB of threadgroup memory, one resident
-    /// group/core against the 32 KiB budget. The kernel-shape sweep
-    /// (forced whole-fold GPU wall on the M4 Pro, 64/64 claims) measured
-    /// nibble 13.91–14.06 ms, B = 2 9.03–14.12 (bimodal), B = 3 8.85–8.89,
-    /// **B = 4 8.41–8.49**, B = 6 8.81–8.89 — this kernel is
-    /// lookup-throughput-bound, not occupancy-bound: the single-resident-
-    /// group variant is both fastest and most stable (contrast failed.md
-    /// §17's DRAM-streaming NTT pass, which needed resident-group depth for
-    /// latency hiding). The CPU pool folds the same 64 claims in
-    /// 9.16–9.49 ms, so the local GPU:CPU per-claim ratio is ≈ 0.91.
-    const LC_FOLD_MSL_SOURCE: &str = r#"
-#include <metal_stdlib>
-using namespace metal;
-
-struct LcFoldParams {
-    uint k;                 // bytes per stripe (= 1 << k_log)
-    uint useful;            // columns [0, useful) fold; [useful, k) forced 0
-    uint stripe_hi;         // exclusive stripe bound of the GPU prefix
-    uint stripes_per_chunk; // stripes owned by one output partial
-    uint i_groups;          // k / 1024 column groups
-};
-
-// One 16-byte table entry per stripe byte — half the threadgroup traffic
-// of the nibble form's two lookups.
-#define LC_STEP(TT, W) {                         \
-    a0 ^= (TT)[(W) & 255u];                      \
-    a1 ^= (TT)[((W) >> 8) & 255u];               \
-    a2 ^= (TT)[((W) >> 16) & 255u];              \
-    a3 ^= (TT)[(W) >> 24];                       \
-}
-
-// Byte-table variant covering B stripes per cooperative table build. Each
-// thread builds one entry per stripe: the subset XOR of the stripe's eight
-// eq values selected by its own index's set bits (entry 0 = 0), so the
-// build needs no serial prefix pass.
-#define LC_KERNEL(NAME, B)                                              \
-kernel void NAME(                                                       \
-    device const uint*     z32      [[buffer(0)]],                      \
-    device const uint4*    eq       [[buffer(1)]],                      \
-    device uint4*          partials [[buffer(2)]],                      \
-    constant LcFoldParams& p        [[buffer(3)]],                      \
-    uint tgid [[threadgroup_position_in_grid]],                         \
-    uint lid  [[thread_position_in_threadgroup]])                       \
-{                                                                       \
-    threadgroup uint4 tg_eq[B * 8];                                     \
-    threadgroup uint4 tab[B * 256];                                     \
-    uint chunk  = tgid / p.i_groups;                                    \
-    uint ig     = tgid - chunk * p.i_groups;                            \
-    uint i_base = ig * 1024u;                                           \
-    uint s_lo = chunk * p.stripes_per_chunk;                            \
-    uint s_hi = min(s_lo + p.stripes_per_chunk, p.stripe_hi);           \
-    uint4 a0 = uint4(0u), a1 = uint4(0u), a2 = uint4(0u), a3 = uint4(0u); \
-    uint c0 = i_base + 4u * lid;                                        \
-    bool live = c0 < p.useful;                                          \
-    uint kw = p.k >> 2;                                                 \
-    for (uint sb = s_lo; sb < s_hi; sb += B) {                          \
-        uint ns = min(uint(B), s_hi - sb);                              \
-        uint w[B];                                                      \
-        for (uint t = 0u; t < uint(B); ++t) { w[t] = 0u; }              \
-        if (live && ns == uint(B)) {                                    \
-            uint q = (sb * p.k + c0) >> 2;                              \
-            for (uint t = 0u; t < uint(B); ++t) { w[t] = z32[q + t * kw]; } \
-        }                                                               \
-        threadgroup_barrier(mem_flags::mem_threadgroup);                \
-        if (lid < ns * 8u) { tg_eq[lid] = eq[sb * 8u + lid]; }          \
-        threadgroup_barrier(mem_flags::mem_threadgroup);                \
-        for (uint s = 0u; s < ns; ++s) {                                \
-            uint4 v = uint4(0u);                                        \
-            uint m = lid;                                               \
-            while (m != 0u) {                                           \
-                v ^= tg_eq[s * 8u + ctz(m)];                            \
-                m &= m - 1u;                                            \
-            }                                                           \
-            tab[s * 256u + lid] = v;                                    \
-        }                                                               \
-        threadgroup_barrier(mem_flags::mem_threadgroup);                \
-        if (live) {                                                     \
-            if (ns == uint(B)) {                                        \
-                for (uint t = 0u; t < uint(B); ++t) {                   \
-                    LC_STEP(&tab[t * 256u], w[t]);                      \
-                }                                                       \
-            } else {                                                    \
-                for (uint t = 0u; t < ns; ++t) {                        \
-                    uint wt = z32[((sb + t) * p.k + c0) >> 2];          \
-                    LC_STEP(&tab[t * 256u], wt);                        \
-                }                                                       \
-            }                                                           \
-        }                                                               \
-    }                                                                   \
-    device uint4* out = partials + chunk * p.k + c0;                    \
-    out[0u] = a0;                                                       \
-    out[1u] = a1;                                                       \
-    out[2u] = a2;                                                       \
-    out[3u] = a3;                                                       \
-}
-
-LC_KERNEL(lc_fold_stripes, 4)
-"#;
-
     /// Output partials produced by the GPU fold. Fixed so the buffer set and
     /// the reduce dispatch are size-stable across proves.
     const ZC_FOLD_CHUNKS: usize = 64;
@@ -6081,10 +5835,6 @@ LC_KERNEL(lc_fold_stripes, 4)
         gpu: &'static Gpu,
         pso_fold: Id,
         pso_reduce: Id,
-        /// Lincheck-arm byte-table fold kernel (`NIL` when the LC source
-        /// failed to compile — the lincheck arm alone falls back to the
-        /// incumbent CPU fold; the zerocheck arm is unaffected).
-        pso_lc_fold: Id,
         /// eq_outer upload (n_outer x 16 B).
         eq_buf: Id,
         eq_cap: usize,
@@ -6169,81 +5919,10 @@ LC_KERNEL(lc_fold_stripes, 4)
             })();
             gpu.pool_pop(pool);
             let (pso_fold, pso_reduce) = built?;
-            // The lincheck arm's byte-table kernels compile from their own
-            // source; a failure here must NOT take down the shipped
-            // zerocheck arm, so it degrades to NIL pipelines (the lincheck
-            // launcher treats NIL as "stay on the incumbent CPU fold").
-            let pso_lc_fold = {
-                let pool = gpu.pool_push();
-                let built_lc = (|| -> Result<Id, String> {
-                    let src = gpu.api.nsstring(LC_FOLD_MSL_SOURCE)?;
-                    let mut err: Id = NIL;
-                    let library: Id = send!(
-                        gpu.api,
-                        unsafe extern "C" fn(Id, Sel, Id, Id, *mut Id) -> Id,
-                        gpu.device,
-                        c"newLibraryWithSource:options:error:",
-                        src,
-                        NIL,
-                        &mut err
-                    );
-                    if library.is_null() {
-                        return Err(format!(
-                            "lincheck fold shader compile failed: {}",
-                            gpu.api.error_string(err)
-                        ));
-                    }
-                    let build = |name: &str| -> Result<Id, String> {
-                        let ns = gpu.api.nsstring(name)?;
-                        let f: Id = send!(
-                            gpu.api,
-                            unsafe extern "C" fn(Id, Sel, Id) -> Id,
-                            library,
-                            c"newFunctionWithName:",
-                            ns
-                        );
-                        if f.is_null() {
-                            return Err(format!("lincheck fold kernel {name} not found"));
-                        }
-                        let mut perr: Id = NIL;
-                        let pso: Id = send!(
-                            gpu.api,
-                            unsafe extern "C" fn(Id, Sel, Id, *mut Id) -> Id,
-                            gpu.device,
-                            c"newComputePipelineStateWithFunction:error:",
-                            f,
-                            &mut perr
-                        );
-                        send!(gpu.api, unsafe extern "C" fn(Id, Sel) -> Id, f, c"release");
-                        if pso.is_null() {
-                            Err(format!(
-                                "lincheck fold pipeline {name}: {}",
-                                gpu.api.error_string(perr)
-                            ))
-                        } else {
-                            Ok(pso)
-                        }
-                    };
-                    let out = build("lc_fold_stripes");
-                    send!(gpu.api, unsafe extern "C" fn(Id, Sel) -> Id, library, c"release");
-                    out
-                })();
-                gpu.pool_pop(pool);
-                match built_lc {
-                    Ok(pso) => pso,
-                    Err(e) => {
-                        if super::gpu_lincheck_debug() {
-                            eprintln!("[gpu-lincheck] byte-table kernel unavailable: {e}");
-                        }
-                        NIL
-                    }
-                }
-            };
             Ok(ZcFold {
                 gpu,
                 pso_fold,
                 pso_reduce,
-                pso_lc_fold,
                 eq_buf: NIL,
                 eq_cap: 0,
                 part_buf: NIL,
@@ -6305,73 +5984,6 @@ LC_KERNEL(lc_fold_stripes, 4)
         }
     }
 
-    /// Which window a submitted fold prefix belongs to. The two arms share
-    /// the MSL kernels, the cached no-copy stripe wrap, and the buffer set;
-    /// only the kill switch, the split tuner, the submit counter, and the
-    /// debug tag differ. The windows are serial (Fiat–Shamir order), so the
-    /// shared state is never live in both at once.
-    #[derive(Clone, Copy, PartialEq, Eq)]
-    enum FoldArm {
-        Zc,
-        Lincheck,
-    }
-
-    impl FoldArm {
-        fn debug(self) -> bool {
-            match self {
-                FoldArm::Zc => super::gpu_zerocheck_debug(),
-                FoldArm::Lincheck => super::gpu_lincheck_debug(),
-            }
-        }
-        fn tag(self) -> &'static str {
-            match self {
-                FoldArm::Zc => "[gpu-zc]",
-                FoldArm::Lincheck => "[gpu-lincheck]",
-            }
-        }
-        fn calibrated(self) -> &'static std::sync::atomic::AtomicBool {
-            match self {
-                FoldArm::Zc => &ZC_FOLD_CALIBRATED,
-                FoldArm::Lincheck => &LINCHECK_FOLD_CALIBRATED,
-            }
-        }
-        fn tuned(self) -> &'static std::sync::atomic::AtomicUsize {
-            match self {
-                FoldArm::Zc => &ZC_FOLD_TUNED_CLAIMS,
-                FoldArm::Lincheck => &LINCHECK_FOLD_TUNED_CLAIMS,
-            }
-        }
-        fn submits(self) -> &'static std::sync::atomic::AtomicUsize {
-            match self {
-                FoldArm::Zc => &ZC_FOLD_SUBMITS,
-                FoldArm::Lincheck => &LINCHECK_FOLD_SUBMITS,
-            }
-        }
-        fn claim_override(self) -> Option<usize> {
-            match self {
-                FoldArm::Zc => zc_fold_claim_override(),
-                FoldArm::Lincheck => lincheck_fold_claim_override(),
-            }
-        }
-        fn claims_for(self, n_claims: usize) -> usize {
-            if let Some(k) = self.claim_override() {
-                return k.min(n_claims);
-            }
-            match self.tuned().load(std::sync::atomic::Ordering::Relaxed) {
-                usize::MAX => match self {
-                    FoldArm::Zc => (n_claims * ZC_FOLD_WARMUP_EIGHTHS / 8).max(1),
-                    // First prove: run the measurement probe (8 GPU claims),
-                    // then the warmup ratio gate publishes the process's
-                    // share — or 0 = off when the GPU is too slow here.
-                    FoldArm::Lincheck => LINCHECK_FOLD_PROBE_CLAIMS
-                        .min(n_claims.saturating_sub(1))
-                        .max(1),
-                },
-                k => k.min(n_claims),
-            }
-        }
-    }
-
     /// A submitted GPU prefix fold. The caller runs the CPU claim suffix while
     /// this is in flight, then drains it with [`ZcFoldJob::finish_xor_into`].
     pub(crate) struct ZcFoldJob {
@@ -6382,15 +5994,10 @@ LC_KERNEL(lc_fold_stripes, 4)
         claim_lo: usize,
         n_claims: usize,
         submitted: std::time::Instant,
-        arm: FoldArm,
     }
 
     /// Set once the split autotune has consumed a steady-state GPU sample.
     static ZC_FOLD_CALIBRATED: std::sync::atomic::AtomicBool =
-        std::sync::atomic::AtomicBool::new(false);
-    /// Same for the lincheck arm (its first dispatch is only guaranteed
-    /// steady-state when the zerocheck arm ran first in the same process).
-    static LINCHECK_FOLD_CALIBRATED: std::sync::atomic::AtomicBool =
         std::sync::atomic::AtomicBool::new(false);
 
     impl ZcFoldJob {
@@ -6423,13 +6030,6 @@ LC_KERNEL(lc_fold_stripes, 4)
             let wall_ms = self.submitted.elapsed().as_secs_f64() * 1e3;
             unsafe { gpu.release(cb) };
             wait?;
-            // A/B + fallback-test hook (`FLOCK_LINCHECK_GPU_FAIL_DRAIN=1`):
-            // the lincheck arm's drain reports failure AFTER the command
-            // buffer completed (its output is simply never consumed), so
-            // the caller redoes the prefix claims on the CPU exactly.
-            if self.arm == FoldArm::Lincheck && lincheck_fold_fail_drain() {
-                return Err("FLOCK_LINCHECK_GPU_FAIL_DRAIN injected".to_string());
-            }
             assert_eq!(dst.len(), self.k);
             // SAFETY: the command buffer completed, so the shared-storage
             // result is visible to the CPU; `out_buf` holds exactly `k`
@@ -6450,143 +6050,12 @@ LC_KERNEL(lc_fold_stripes, 4)
                         }
                     });
             }
-            if self.arm.debug() {
+            if super::gpu_zerocheck_debug() {
                 eprintln!(
-                    "{} prefix {}/{} claims: gpu={gpu_ms:.2}ms submit-to-drain={wall_ms:.2}ms \
+                    "[gpu-zc] prefix {}/{} claims: gpu={gpu_ms:.2}ms submit-to-drain={wall_ms:.2}ms \
                      head={head_ms:.2}ms cpu-suffix={suffix_ms:.2}ms",
-                    self.arm.tag(),
                     self.claim_lo, self.n_claims,
                 );
-            }
-            if self.arm == FoldArm::Lincheck {
-                // WARMUP RATIO GATE (failed.md §24 — an idle-GPU split
-                // ratio is a TARGET-MACHINE fact): the first in-process
-                // prove (always the benchmark worker's untimed warmup
-                // prove) measures both engines' per-claim walls on THIS
-                // kernel and publishes the process's share — or 0 = off.
-                //
-                // u_cpu comes from the probe's CPU claim suffix. u_gpu
-                // must be measured at STEADY GPU CLOCK: the GPU governor
-                // drops clocks within tens of ms of idleness and ramps
-                // over ~10-20 ms of sustained work, so the 8-claim probe
-                // (~1 ms) prices the ramp, not the kernel (measured
-                // locally: probe 0.65, single full replay 0.31-0.34,
-                // steady state 0.132 ms/claim). Replay the full-range
-                // plan BACK-TO-BACK until consecutive walls converge —
-                // ~100% duty cycle ramps the clock in 1-2 iterations —
-                // and price u_gpu from the converged wall. Once per
-                // process, untimed warmup prove only.
-                if self.arm.claim_override().is_none()
-                    && self.arm.tuned().load(std::sync::atomic::Ordering::Relaxed)
-                        == usize::MAX
-                    && self.claim_lo > 0
-                    && self.claim_lo < self.n_claims
-                {
-                    let u_cpu = suffix_ms / (self.n_claims - self.claim_lo) as f64;
-                    let mut u_gpu = if gpu_ms > 0.0 {
-                        gpu_ms / self.claim_lo as f64
-                    } else {
-                        wall_ms / self.claim_lo as f64
-                    };
-                    if !self
-                        .arm
-                        .calibrated()
-                        .swap(true, std::sync::atomic::Ordering::Relaxed)
-                    {
-                        let full_hi =
-                            crate::lincheck::oblock_claim_stripe_base(self.n_claims);
-                        let replay = ZcFoldPlan {
-                            stripe_hi: full_hi,
-                            stripes_per_chunk: full_hi
-                                .div_ceil(ZC_FOLD_CHUNKS)
-                                .next_multiple_of(4),
-                            ..self.plan
-                        };
-                        // SAFETY: the probe dispatch completed and its
-                        // result is already consumed above, so re-encoding
-                        // over the same scratch buffers races with nothing.
-                        unsafe {
-                            let pool = gpu.pool_push();
-                            // A first-pair 10% delta cannot distinguish a
-                            // flat ramp plateau from steady state (the
-                            // governor's ramp curve is machine-specific), so
-                            // an early latch here prices the kernel at a
-                            // mid-ramp clock and turns the gate off on
-                            // machines where the offload would win. Require
-                            // at least three replays, keep going while the
-                            // wall is still improving on the running
-                            // minimum, and price from the minimum: the
-                            // timed-window dispatches run against the
-                            // keep-warm-bridged clock, which is the steady
-                            // one, and the 0.9 CPU-ward bias plus the n/2
-                            // clamp in the share formula already absorb
-                            // per-dispatch jitter around that price.
-                            let mut walls = [0.0f64; 8];
-                            let mut n_walls = 0usize;
-                            let mut w_min = f64::MAX;
-                            for slot in &mut walls {
-                                let Ok(cb2) = zc_fold_submit(gpu, state, &replay) else {
-                                    break;
-                                };
-                                let w = if gpu.wait_cb(cb2).is_ok() {
-                                    zc_fold_gpu_wall_ms(gpu, cb2)
-                                } else {
-                                    0.0
-                                };
-                                gpu.release(cb2);
-                                if w <= 0.0 {
-                                    break;
-                                }
-                                *slot = w;
-                                n_walls += 1;
-                                let prev_min = w_min;
-                                w_min = w_min.min(w);
-                                // Converged: at least three back-to-back
-                                // replays (~100% duty ramps the governor in
-                                // 1-2) and this wall did not improve the
-                                // best seen by more than 5% — a genuine
-                                // plateau, not a first-pair coincidence on
-                                // the ramp.
-                                if n_walls >= 3 && w > 0.95 * prev_min {
-                                    break;
-                                }
-                            }
-                            if n_walls > 0 {
-                                u_gpu = w_min / self.n_claims as f64;
-                            }
-                            if self.arm.debug() {
-                                eprintln!(
-                                    "[gpu-lincheck] gate replay walls: {:?}",
-                                    &walls[..n_walls]
-                                );
-                            }
-                            gpu.pool_pop(pool);
-                        }
-                    }
-                    if u_cpu.is_finite() && u_cpu > 0.0 && u_gpu.is_finite() && u_gpu > 0.0
-                    {
-                        let measured = u_gpu / u_cpu;
-                        let ratio = lincheck_fold_forced_ratio().unwrap_or(measured);
-                        let g = lincheck_gate_share(ratio, self.n_claims);
-                        self.arm
-                            .tuned()
-                            .store(g, std::sync::atomic::Ordering::Relaxed);
-                        if self.arm.debug() {
-                            let src = if lincheck_fold_forced_ratio().is_some() {
-                                "forced"
-                            } else {
-                                "measured"
-                            };
-                            eprintln!(
-                                "[gpu-lincheck] gate u_gpu={u_gpu:.4}ms/claim \
-                                 u_cpu={u_cpu:.4}ms/claim ratio={ratio:.3} ({src}) \
-                                 -> share {g}/{}",
-                                self.n_claims,
-                            );
-                        }
-                    }
-                }
-                return Ok(());
             }
             // The FIRST dispatch in a process also pays Metal's one-time
             // costs — GPU binary compile for the two pipelines and page
@@ -6595,14 +6064,9 @@ LC_KERNEL(lc_fold_stripes, 4)
             // steady state. Replay the identical dispatch once, synchronously,
             // and tune from that. This lands in the UNTIMED warmup prove (the
             // ranked runner's call 0); every later prove reuses the published
-            // split and never replays. (Zerocheck arm only — the lincheck
-            // arm's ratio gate returned above.)
+            // split and never replays.
             let mut sample_ms = if gpu_ms > 0.0 { gpu_ms } else { wall_ms };
-            if !self
-                .arm
-                .calibrated()
-                .swap(true, std::sync::atomic::Ordering::Relaxed)
-            {
+            if !ZC_FOLD_CALIBRATED.swap(true, std::sync::atomic::Ordering::Relaxed) {
                 // SAFETY: the first dispatch completed and its result is
                 // already consumed above, so re-encoding the same plan over
                 // the same scratch buffers races with nothing.
@@ -6620,8 +6084,7 @@ LC_KERNEL(lc_fold_stripes, 4)
                     gpu.pool_pop(pool);
                 }
             }
-            fold_note_sample(
-                self.arm,
+            zc_fold_note_sample(
                 self.claim_lo,
                 self.n_claims,
                 sample_ms,
@@ -6670,10 +6133,6 @@ LC_KERNEL(lc_fold_stripes, 4)
     /// Tuned GPU claim share (sentinel `usize::MAX` = not yet tuned).
     static ZC_FOLD_TUNED_CLAIMS: std::sync::atomic::AtomicUsize =
         std::sync::atomic::AtomicUsize::new(usize::MAX);
-    /// Same for the lincheck arm — same kernel and claim partition, but its
-    /// window has no AB head to cover, so it keeps its own sample.
-    static LINCHECK_FOLD_TUNED_CLAIMS: std::sync::atomic::AtomicUsize =
-        std::sync::atomic::AtomicUsize::new(usize::MAX);
 
     /// First-prove share, in eighths of the claim range. The untimed warmup
     /// prove runs at this split and publishes a balanced one for the timed
@@ -6691,85 +6150,31 @@ LC_KERNEL(lc_fold_stripes, 4)
         *K
     }
 
-    /// Exact split override for the lincheck arm
-    /// (`FLOCK_LINCHECK_GPU_CLAIMS=<claims>`); also pins the autotune off so
-    /// a controlled A/B keeps the requested share. `= n_claims` forces the
-    /// whole fold onto the GPU (empty CPU suffix).
-    fn lincheck_fold_claim_override() -> Option<usize> {
-        static K: std::sync::LazyLock<Option<usize>> = std::sync::LazyLock::new(|| {
-            std::env::var("FLOCK_LINCHECK_GPU_CLAIMS")
-                .ok()
-                .and_then(|v| v.parse().ok())
-        });
-        *K
-    }
-
-    /// Fallback-test hook (`FLOCK_LINCHECK_GPU_FAIL_DRAIN=1`): see
-    /// [`ZcFoldJob::finish_xor_into`].
-    fn lincheck_fold_fail_drain() -> bool {
-        static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
-            std::env::var_os("FLOCK_LINCHECK_GPU_FAIL_DRAIN").is_some()
-        });
-        *ON
-    }
-
-    /// Ratio-gate override (`FLOCK_LINCHECK_GPU_FORCE_RATIO=<f64>`):
-    /// replaces the warmup-measured u_gpu/u_cpu in the gate decision, to
-    /// exercise the offload-disabled path end-to-end on any machine.
-    fn lincheck_fold_forced_ratio() -> Option<f64> {
-        static R: std::sync::LazyLock<Option<f64>> = std::sync::LazyLock::new(|| {
-            std::env::var("FLOCK_LINCHECK_GPU_FORCE_RATIO")
-                .ok()
-                .and_then(|v| v.parse().ok())
-        });
-        *R
-    }
-
-    /// Probe share for the lincheck arm's first in-process prove (always
-    /// the untimed warmup prove in the benchmark worker): 8 claims on the
-    /// GPU, the rest on the CPU. Safe at any plausible ratio — even a 5x
-    /// slower GPU finishes 8 claims before the CPU drains 56 — and enough
-    /// to measure both arms' per-claim walls.
-    const LINCHECK_FOLD_PROBE_CLAIMS: usize = 8;
-
-    /// Ratio gate (failed.md §24 — an idle-GPU split ratio is a
-    /// TARGET-MACHINE fact): when the warmup-measured per-claim GPU:CPU
-    /// ratio on this kernel exceeds this, the GPU is too slow on this
-    /// machine and the arm disables itself for the process (published
-    /// share 0 = exact incumbent; the only cost is the untimed probe).
-    const LINCHECK_FOLD_MAX_GPU_RATIO: f64 = 2.0;
-
-    /// The warmup ratio gate, pure: from the measured per-claim ratio to
-    /// the GPU claim share published for the rest of the process.
-    /// `c_g = clamp(floor(0.9 * n / (1 + ratio)), 0, n/2)`; a ratio above
-    /// [`LINCHECK_FOLD_MAX_GPU_RATIO`] (or an unusable sample) yields 0 =
-    /// off. The 0.9 biases CPU-ward: overshooting makes the GPU the
-    /// straggler, which costs wall directly.
-    pub(crate) fn lincheck_gate_share(ratio: f64, n_claims: usize) -> usize {
-        if !ratio.is_finite() || ratio <= 0.0 || ratio > LINCHECK_FOLD_MAX_GPU_RATIO {
-            return 0;
+    fn zc_fold_claims_for(n_claims: usize) -> usize {
+        if let Some(k) = zc_fold_claim_override() {
+            return k.min(n_claims);
         }
-        let share = (0.9 * n_claims as f64 / (1.0 + ratio)).floor();
-        share.clamp(0.0, (n_claims / 2) as f64) as usize
+        match ZC_FOLD_TUNED_CLAIMS.load(std::sync::atomic::Ordering::Relaxed) {
+            usize::MAX => (n_claims * ZC_FOLD_WARMUP_EIGHTHS / 8).max(1),
+            k => k.min(n_claims),
+        }
     }
 
-    /// Publish a balanced split from one observed prove (zerocheck arm —
-    /// the lincheck arm's ratio gate publishes from `finish_xor_into`).
+    /// Publish a balanced split from one observed prove.
     ///
     /// The GPU arm starts at submission and runs `g` claims; the CPU arm only
     /// reaches its claims after `head_ms` (the round-one AB completion runs
     /// first, deliberately, so the GPU covers it) and then runs `n - g`
     /// claims. Equalizing the two finish times gives
     /// `g* = (head + n·u_cpu) / (u_gpu + u_cpu)`.
-    fn fold_note_sample(
-        arm: FoldArm,
+    fn zc_fold_note_sample(
         claim_lo: usize,
         n_claims: usize,
         gpu_ms: f64,
         head_ms: f64,
         suffix_ms: f64,
     ) {
-        if arm.claim_override().is_some() || claim_lo == 0 || claim_lo >= n_claims {
+        if zc_fold_claim_override().is_some() || claim_lo == 0 || claim_lo >= n_claims {
             return;
         }
         let u_gpu = gpu_ms / claim_lo as f64;
@@ -6784,13 +6189,11 @@ LC_KERNEL(lc_fold_stripes, 4)
         let balanced =
             0.9 * (head_ms.max(0.0) + n_claims as f64 * u_cpu) / (u_gpu + u_cpu);
         let g = (balanced.round() as i64).clamp(1, n_claims as i64 - 1) as usize;
-        arm.tuned()
-            .store(g, std::sync::atomic::Ordering::Relaxed);
-        if arm.debug() {
+        ZC_FOLD_TUNED_CLAIMS.store(g, std::sync::atomic::Ordering::Relaxed);
+        if super::gpu_zerocheck_debug() {
             eprintln!(
-                "{} split {claim_lo}/{n_claims} gpu={gpu_ms:.2}ms head={head_ms:.2}ms \
-                 suffix={suffix_ms:.2}ms -> {g}/{n_claims}",
-                arm.tag(),
+                "[gpu-zc] split {claim_lo}/{n_claims} gpu={gpu_ms:.2}ms head={head_ms:.2}ms \
+                 suffix={suffix_ms:.2}ms -> {g}/{n_claims}"
             );
         }
     }
@@ -6800,18 +6203,10 @@ LC_KERNEL(lc_fold_stripes, 4)
     /// an in-process A/B confirm which arm produced a prove.
     static ZC_FOLD_SUBMITS: std::sync::atomic::AtomicUsize =
         std::sync::atomic::AtomicUsize::new(0);
-    /// Same for the lincheck arm.
-    static LINCHECK_FOLD_SUBMITS: std::sync::atomic::AtomicUsize =
-        std::sync::atomic::AtomicUsize::new(0);
 
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn zerocheck_gpu_submits() -> usize {
         ZC_FOLD_SUBMITS.load(std::sync::atomic::Ordering::Relaxed)
-    }
-
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub(crate) fn lincheck_gpu_submits() -> usize {
-        LINCHECK_FOLD_SUBMITS.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Everything needed to (re-)encode one prefix dispatch. Kept so the
@@ -6819,9 +6214,6 @@ LC_KERNEL(lc_fold_stripes, 4)
     #[derive(Clone, Copy)]
     struct ZcFoldPlan {
         z_buf: Id,
-        /// Fold pipeline for this dispatch — the zerocheck arm's nibble
-        /// kernel or one of the lincheck arm's byte-table kernels.
-        pso_fold: Id,
         k: usize,
         useful: usize,
         stripe_hi: usize,
@@ -6849,7 +6241,7 @@ LC_KERNEL(lc_fold_stripes, 4)
             );
             let cb = gpu.command_buffer()?;
             let enc = gpu.compute_encoder(cb)?;
-            gpu.set_pipeline(enc, plan.pso_fold);
+            gpu.set_pipeline(enc, state.pso_fold);
             gpu.set_buffer(enc, plan.z_buf, 0, 0);
             gpu.set_buffer(enc, state.eq_buf, 0, 1);
             gpu.set_buffer(enc, state.part_buf, 0, 2);
@@ -6884,51 +6276,12 @@ LC_KERNEL(lc_fold_stripes, 4)
         if !super::gpu_zerocheck_enabled() {
             return None;
         }
-        launch_fold_prefix(FoldArm::Zc, z_packed, m, k_log, useful_bits, eq_outer)
-    }
-
-    /// Submit the GPU prefix of the LINCHECK window's witness-stripe fold —
-    /// the same gather+XOR kernel over the same no-copy wrapped stripe and
-    /// the same oblock claim partition as the round-one C fold, gated by
-    /// [`super::ENV_NO_GPU_LINCHECK`] with its own split tuner. Fiat–Shamir
-    /// order puts this launch strictly after the zerocheck job drained, so
-    /// the shared buffer set and wrap cache are free; `eq_outer` here is the
-    /// lincheck outer challenge's table, re-uploaded over the zerocheck one.
-    /// `None` means the whole fold stays on the CPU (exact incumbent).
-    pub(crate) fn launch_lincheck_fold(
-        z_packed: &[u8],
-        m: usize,
-        k_log: usize,
-        useful_bits: usize,
-        eq_outer: &[F128],
-    ) -> Option<ZcFoldJob> {
-        if !super::gpu_lincheck_enabled() {
-            return None;
-        }
-        launch_fold_prefix(
-            FoldArm::Lincheck,
-            z_packed,
-            m,
-            k_log,
-            useful_bits,
-            eq_outer,
-        )
-    }
-
-    fn launch_fold_prefix(
-        arm: FoldArm,
-        z_packed: &[u8],
-        m: usize,
-        k_log: usize,
-        useful_bits: usize,
-        eq_outer: &[F128],
-    ) -> Option<ZcFoldJob> {
         let k = 1usize << k_log;
         if !k.is_multiple_of(ZC_FOLD_COLS_PER_TG) || m <= k_log + 3 {
             return None;
         }
         let n_claims = crate::lincheck::oblock_claim_count(m, k_log);
-        let claim_lo = arm.claims_for(n_claims);
+        let claim_lo = zc_fold_claims_for(n_claims);
         if claim_lo == 0 || claim_lo > n_claims {
             return None;
         }
@@ -6938,10 +6291,9 @@ LC_KERNEL(lc_fold_stripes, 4)
         if guard.is_none() {
             let t = std::time::Instant::now();
             *guard = Some(zc_fold_init(gpu));
-            if arm.debug() {
+            if super::gpu_zerocheck_debug() {
                 eprintln!(
-                    "{} shader init: {:.1} ms",
-                    arm.tag(),
+                    "[gpu-zc] shader init: {:.1} ms",
                     t.elapsed().as_secs_f64() * 1e3
                 );
             }
@@ -6955,21 +6307,6 @@ LC_KERNEL(lc_fold_stripes, 4)
             let state = guard.as_mut()?.as_mut().ok()?;
             let n_outer = 1usize << (m - k_log);
             let useful = (useful_bits.div_ceil(8) * 8).min(k);
-            // Fold pipeline + stripe-block size for this arm. The zerocheck
-            // arm always runs its shipped nibble kernel (8-stripe blocks);
-            // the lincheck arm runs its byte-table kernel (4-stripe
-            // blocks). A NIL pipeline (compile failure) keeps the whole
-            // fold on the incumbent CPU path.
-            let (pso_fold, block) = match arm {
-                FoldArm::Zc => (state.pso_fold, 8),
-                FoldArm::Lincheck => (state.pso_lc_fold, 4),
-            };
-            if pso_fold.is_null() {
-                if arm.debug() {
-                    eprintln!("{} fold pipeline unavailable, CPU-only fold", arm.tag());
-                }
-                return None;
-            }
             unsafe {
                 let pool = gpu.pool_push();
                 let built = (|| -> Result<(Id, ZcFoldPlan), String> {
@@ -6993,13 +6330,12 @@ LC_KERNEL(lc_fold_stripes, 4)
                     );
                     let plan = ZcFoldPlan {
                         z_buf,
-                        pso_fold,
                         k,
                         useful,
                         stripe_hi,
                         stripes_per_chunk: stripe_hi
                             .div_ceil(ZC_FOLD_CHUNKS)
-                            .next_multiple_of(block),
+                            .next_multiple_of(8),
                         i_groups: k / ZC_FOLD_COLS_PER_TG,
                     };
                     Ok((zc_fold_submit(gpu, state, &plan)?, plan))
@@ -7008,16 +6344,15 @@ LC_KERNEL(lc_fold_stripes, 4)
                 match built {
                     Ok(v) => v,
                     Err(e) => {
-                        if arm.debug() {
-                            eprintln!("{} submit failed, CPU-only fold: {e}", arm.tag());
+                        if super::gpu_zerocheck_debug() {
+                            eprintln!("[gpu-zc] submit failed, CPU-only fold: {e}");
                         }
                         return None;
                     }
                 }
             }
         };
-        arm.submits()
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        ZC_FOLD_SUBMITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         Some(ZcFoldJob {
             guard,
             cb,
@@ -7026,7 +6361,6 @@ LC_KERNEL(lc_fold_stripes, 4)
             claim_lo,
             n_claims,
             submitted,
-            arm,
         })
     }
 
@@ -7119,417 +6453,6 @@ LC_KERNEL(lc_fold_stripes, 4)
             let _ = choose_hybrid_k(&[0, 2], &ms, DEFAULT_HYBRID_K);
         }
     }
-
-    /// Compile one kernel from supplemental MSL source into a compute
-    /// pipeline. Diagnostic helper for ignored GPU probes; production
-    /// supplemental kernels keep their dedicated builders above.
-    #[allow(dead_code)]
-    pub(crate) unsafe fn compile_supplemental_pipeline(
-        gpu: &Gpu,
-        source: &str,
-        name: &str,
-    ) -> Result<Id, String> {
-        unsafe {
-            let src = gpu.api.nsstring(source)?;
-            let mut err: Id = NIL;
-            let library: Id = send!(
-                gpu.api,
-                unsafe extern "C" fn(Id, Sel, Id, Id, *mut Id) -> Id,
-                gpu.device,
-                c"newLibraryWithSource:options:error:",
-                src,
-                NIL,
-                &mut err
-            );
-            if library.is_null() {
-                return Err(format!(
-                    "supplemental shader compile failed: {}",
-                    gpu.api.error_string(err)
-                ));
-            }
-            let ns = gpu.api.nsstring(name)?;
-            let f: Id = send!(
-                gpu.api,
-                unsafe extern "C" fn(Id, Sel, Id) -> Id,
-                library,
-                c"newFunctionWithName:",
-                ns
-            );
-            if f.is_null() {
-                send!(gpu.api, unsafe extern "C" fn(Id, Sel) -> Id, library, c"release");
-                return Err(format!("supplemental kernel {name} not found"));
-            }
-            let mut perr: Id = NIL;
-            let pso: Id = send!(
-                gpu.api,
-                unsafe extern "C" fn(Id, Sel, Id, *mut Id) -> Id,
-                gpu.device,
-                c"newComputePipelineStateWithFunction:error:",
-                f,
-                &mut perr
-            );
-            send!(gpu.api, unsafe extern "C" fn(Id, Sel) -> Id, f, c"release");
-            send!(gpu.api, unsafe extern "C" fn(Id, Sel) -> Id, library, c"release");
-            if pso.is_null() {
-                Err(format!(
-                    "supplemental pipeline {name}: {}",
-                    gpu.api.error_string(perr)
-                ))
-            } else {
-                Ok(pso)
-            }
-        }
-    }
-
-    // =======================================================================
-    // Recursive Ligerito Merkle offload (128-byte leaves).
-    //
-    // The L1/L2 recursive commitment trees are the only serial CPU BLAKE3
-    // blocks in the opening spine while the GPU sits idle (the commit graph
-    // ended long before; the grind scans are sub-millisecond). One dispatch
-    // chain — a two-block chunk kernel over 128-byte leaves plus the ordinary
-    // parent ladder — replaces them with bit-identical bytes. The input
-    // matrix is wrapped no-copy (cached by address; creation cost lands on
-    // the untimed warmup prove in the common case), the flat tree is built in
-    // a persistent shared buffer and copied out in one parallel pass.
-    // =======================================================================
-
-    /// Leaf kernel for 128-byte leaves (one BLAKE3 chunk of exactly two
-    /// blocks: CHUNK_START on block 0, CHUNK_END on block 1, never ROOT —
-    /// matches `Hasher::update(128B).finalize_non_root`) plus the standard
-    /// parent kernel, compiled as a supplemental library so the embedded
-    /// incumbent metallib stays byte-for-byte intact.
-    const REC_MERKLE_MSL_SOURCE: &str = r#"
-#include <metal_stdlib>
-using namespace metal;
-
-constant uint B3_IV[8] = {
-    0x6A09E667u, 0xBB67AE85u, 0x3C6EF372u, 0xA54FF53Au,
-    0x510E527Fu, 0x9B05688Cu, 0x1F83D9ABu, 0x5BE0CD19u
-};
-constant uchar B3_PERM[16] = {2,6,3,10,7,0,4,13,1,11,12,5,9,14,15,8};
-
-#define B3_CHUNK_START 1u
-#define B3_CHUNK_END   2u
-#define B3_PARENT      4u
-
-static void b3_compress(thread uint* cv, thread const uint* m_in,
-                        uint block_len, uint flags) {
-    uint v[16];
-    uint m[16];
-    for (int i = 0; i < 8; i++) v[i] = cv[i];
-    for (int i = 0; i < 4; i++) v[8 + i] = B3_IV[i];
-    v[12] = 0u;
-    v[13] = 0u;
-    v[14] = block_len;
-    v[15] = flags;
-    for (int i = 0; i < 16; i++) m[i] = m_in[i];
-    for (int r = 0; r < 7; r++) {
-        #define G(a,b,c,d,x,y) \
-            v[a] = v[a] + v[b] + x; v[d] = ((v[d]^v[a])>>16)|((v[d]^v[a])<<16); \
-            v[c] = v[c] + v[d];     v[b] = ((v[b]^v[c])>>12)|((v[b]^v[c])<<20); \
-            v[a] = v[a] + v[b] + y; v[d] = ((v[d]^v[a])>>8) |((v[d]^v[a])<<24); \
-            v[c] = v[c] + v[d];     v[b] = ((v[b]^v[c])>>7) |((v[b]^v[c])<<25);
-        G(0,4,8,12,  m[0], m[1]);  G(1,5,9,13,  m[2], m[3]);
-        G(2,6,10,14, m[4], m[5]);  G(3,7,11,15, m[6], m[7]);
-        G(0,5,10,15, m[8], m[9]);  G(1,6,11,12, m[10],m[11]);
-        G(2,7,8,13,  m[12],m[13]); G(3,4,9,14,  m[14],m[15]);
-        #undef G
-        if (r < 6) {
-            uint t[16];
-            for (int i = 0; i < 16; i++) t[i] = m[B3_PERM[i]];
-            for (int i = 0; i < 16; i++) m[i] = t[i];
-        }
-    }
-    for (int i = 0; i < 8; i++) cv[i] = v[i] ^ v[8 + i];
-}
-
-kernel void leaf_hash128(device const uint* codeword [[buffer(0)]],
-                         device uint* out            [[buffer(1)]],
-                         uint id [[thread_position_in_grid]])
-{
-    device const uint* leaf = codeword + id * 32u;   // 128 bytes
-    uint cv[8];
-    for (int i = 0; i < 8; i++) cv[i] = B3_IV[i];
-    uint block[16];
-    for (uint i = 0; i < 16u; i++) block[i] = leaf[i];
-    b3_compress(cv, block, 64u, B3_CHUNK_START);
-    for (uint i = 0; i < 16u; i++) block[i] = leaf[16u + i];
-    b3_compress(cv, block, 64u, B3_CHUNK_END);
-    for (int i = 0; i < 8; i++) out[id * 8u + i] = cv[i];
-}
-
-kernel void rec_parent_hash(device const uint* children [[buffer(0)]],
-                            device uint* parents        [[buffer(1)]],
-                            uint id [[thread_position_in_grid]])
-{
-    uint block[16];
-    for (uint i = 0u; i < 16u; i++) block[i] = children[id * 16u + i];
-    uint cv[8];
-    for (int i = 0; i < 8; i++) cv[i] = B3_IV[i];
-    b3_compress(cv, block, 64u, B3_PARENT);
-    for (int i = 0; i < 8; i++) parents[id * 8u + i] = cv[i];
-}
-"#;
-
-    /// The exact recursive shapes worth offloading. L1 (2^18 leaves) wins
-    /// ~0.9 ms per timed prove; L2 (2^16 leaves) was measured NET NEGATIVE
-    /// (GPU 1.06 ms vs CPU 0.81 ms — the fixed wrap/submit/wait roundtrip
-    /// dominates at 16 MiB) and is deliberately excluded.
-    const REC_MERKLE_SHAPES: [usize; 1] = [1usize << 18];
-
-    /// Process-lifetime Metal state for the recursive Merkle offload.
-    struct RecMerkle {
-        pso_leaf128: Id,
-        pso_parent: Id,
-        /// Persistent flat-tree output buffers, one per supported shape
-        /// (`2 * n - 1` nodes each); allocated once, untimed.
-        tree_bufs: [(usize, Id); REC_MERKLE_SHAPES.len()],
-        /// Cached no-copy wraps of caller matrices: `(ptr, len, buffer)`.
-        wraps: Vec<(usize, usize, Id)>,
-        hits: usize,
-        misses: usize,
-    }
-    // SAFETY: Metal objects are thread-safe; every access is serialized by
-    // the REC_MERKLE mutex.
-    unsafe impl Send for RecMerkle {}
-
-    static REC_MERKLE: Mutex<Option<Result<RecMerkle, String>>> = Mutex::new(None);
-
-    fn rec_merkle_debug() -> bool {
-        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        *ON.get_or_init(|| std::env::var_os("FLOCK_GPU_RECMERKLE_DEBUG").is_some())
-    }
-
-    fn rec_merkle_init(gpu: &'static Gpu) -> Result<RecMerkle, String> {
-        unsafe {
-            let pool = gpu.pool_push();
-            let built = (|| -> Result<RecMerkle, String> {
-                let pso_leaf128 =
-                    compile_supplemental_pipeline(gpu, REC_MERKLE_MSL_SOURCE, "leaf_hash128")?;
-                let pso_parent = match compile_supplemental_pipeline(
-                    gpu,
-                    REC_MERKLE_MSL_SOURCE,
-                    "rec_parent_hash",
-                ) {
-                    Ok(p) => p,
-                    Err(e) => {
-                        gpu.release(pso_leaf128);
-                        return Err(e);
-                    }
-                };
-                let mut tree_bufs = [(0usize, NIL); REC_MERKLE_SHAPES.len()];
-                for (slot, &n) in tree_bufs.iter_mut().zip(REC_MERKLE_SHAPES.iter()) {
-                    match gpu.new_buffer((2 * n - 1) * 32) {
-                        Ok(buf) => *slot = (n, buf),
-                        Err(e) => {
-                            gpu.release(pso_leaf128);
-                            gpu.release(pso_parent);
-                            for &(_, b) in tree_bufs.iter() {
-                                if !b.is_null() {
-                                    gpu.release(b);
-                                }
-                            }
-                            return Err(e);
-                        }
-                    }
-                }
-                let mut state = RecMerkle {
-                    pso_leaf128,
-                    pso_parent,
-                    tree_bufs,
-                    wraps: Vec::new(),
-                    hits: 0,
-                    misses: 0,
-                };
-                // Pin one exact-fit L1 matrix allocation into the scratch
-                // pool's dedicated second slot, then wrap and wire it here
-                // (untimed, first offload call = the warmup prove). The L1
-                // matrix is the only exact-2^21-F128 `take_f128` in the
-                // prove, so every later prove's matrix lands at this same
-                // address and hits the wrap cache — the timed path pays
-                // neither wrap creation nor first-GPU-touch page wiring.
-                // If some other phase ever steals the pinned buffer, the
-                // ordinary miss path (create-and-cache) still works.
-                let l1_mat_f128 = REC_MERKLE_SHAPES[0] * 8;
-                let mut seed: Vec<F128> = crate::alloc_uninit_vec(l1_mat_f128);
-                let seed_bytes = l1_mat_f128 * core::mem::size_of::<F128>();
-                {
-                    // CPU-first-touch every page (parallel) so the timed
-                    // prove's NTT never pays this buffer's fault storm; the
-                    // GPU wiring below then maps already-resident pages.
-                    use rayon::prelude::*;
-                    seed.par_chunks_mut(1 << 18)
-                        .for_each(|chunk| chunk.fill(F128::ZERO));
-                }
-                if crate::scratch::pin2_f128_allocation(&seed) {
-                    match gpu.wrap_buffer(seed.as_ptr().cast_mut().cast::<u8>(), seed_bytes)
-                    {
-                        Ok(buf) => {
-                            // Wire the pages with one throwaway leaf pass
-                            // into the persistent tree buffer (overwritten by
-                            // every real call before being read). A wiring
-                            // failure is non-fatal: the wrap is kept and the
-                            // pages wire on its first real use instead.
-                            let wired = (|| -> Result<(), String> {
-                                let cb = gpu.command_buffer()?;
-                                let enc = gpu.compute_encoder(cb)?;
-                                gpu.set_pipeline(enc, state.pso_leaf128);
-                                gpu.set_buffer(enc, buf, 0, 0);
-                                gpu.set_buffer(enc, state.tree_bufs[0].1, 0, 1);
-                                gpu.dispatch(enc, REC_MERKLE_SHAPES[0] as u64 / 256, 256);
-                                gpu.end_encoding(enc);
-                                gpu.commit_and_wait(cb)
-                            })();
-                            if let Err(e) = wired
-                                && rec_merkle_debug()
-                            {
-                                eprintln!("[gpu-recmerkle] seed wiring failed ({e})");
-                            }
-                            state
-                                .wraps
-                                .push((seed.as_ptr() as usize, seed_bytes, buf));
-                        }
-                        Err(e) => {
-                            if rec_merkle_debug() {
-                                eprintln!("[gpu-recmerkle] seed wrap failed ({e})");
-                            }
-                        }
-                    }
-                }
-                // Routes into the pinned second slot (or the ordinary pool
-                // if pinning failed) — either way take_f128 serves it.
-                crate::scratch::give_f128(seed);
-                Ok(state)
-            })();
-            gpu.pool_pop(pool);
-            built
-        }
-    }
-
-    pub(crate) fn gpu_recursive_merkle_blake3(
-        data: &[u8],
-        num_leaves: usize,
-    ) -> Option<Vec<Hash>> {
-        if !super::gpu_recursive_merkle_enabled()
-            || !REC_MERKLE_SHAPES.contains(&num_leaves)
-            || data.len() != num_leaves * 128
-        {
-            return None;
-        }
-        let gpu = gpu().ok()?;
-        let started = rec_merkle_debug().then(std::time::Instant::now);
-        let mut guard = REC_MERKLE.lock().ok()?;
-        if guard.is_none() {
-            *guard = Some(rec_merkle_init(gpu));
-        }
-        let state = match guard.as_mut() {
-            Some(Ok(state)) => state,
-            Some(Err(e)) => {
-                if rec_merkle_debug() {
-                    eprintln!("[gpu-recmerkle] unavailable ({e})");
-                }
-                return None;
-            }
-            None => unreachable!("initialized above"),
-        };
-
-        let data_addr = data.as_ptr() as usize;
-        if rec_merkle_debug() {
-            eprintln!("[gpu-recmerkle] call: mat at {data_addr:#x} len {} MiB", data.len() >> 20);
-        }
-        let cached = state
-            .wraps
-            .iter()
-            .find(|(p, l, _)| *p == data_addr && *l == data.len())
-            .map(|&(_, _, buf)| buf);
-        let data_buf = match cached {
-            Some(buf) => {
-                state.hits += 1;
-                buf
-            }
-            // The wrap API takes `*mut` (Metal buffers are generically
-            // writable); this kernel chain only ever reads the matrix.
-            None => match unsafe { gpu.wrap_buffer(data.as_ptr().cast_mut(), data.len()) } {
-                Ok(buf) => {
-                    state.misses += 1;
-                    state.wraps.push((data_addr, data.len(), buf));
-                    buf
-                }
-                Err(e) => {
-                    if rec_merkle_debug() {
-                        eprintln!("[gpu-recmerkle] wrap failed ({e})");
-                    }
-                    return None;
-                }
-            },
-        };
-        let &(_, tree_buf) = state
-            .tree_bufs
-            .iter()
-            .find(|(n, _)| *n == num_leaves)
-            .expect("shape checked above");
-
-        let total_nodes = 2 * num_leaves - 1;
-        let run = unsafe {
-            let pool = gpu.pool_push();
-            let run = (|| -> Result<(), String> {
-                let cb = gpu.command_buffer()?;
-                let enc = gpu.compute_encoder(cb)?;
-                gpu.set_pipeline(enc, state.pso_leaf128);
-                gpu.set_buffer(enc, data_buf, 0, 0);
-                gpu.set_buffer(enc, tree_buf, 0, 1);
-                let tpg = 256u64.min(num_leaves as u64);
-                gpu.dispatch(enc, num_leaves as u64 / tpg, tpg);
-                gpu.set_pipeline(enc, state.pso_parent);
-                let mut read_start = 0usize;
-                let mut read_len = num_leaves;
-                while read_len > 1 {
-                    let write_start = read_start + read_len;
-                    let n_out = read_len / 2;
-                    gpu.set_buffer(enc, tree_buf, read_start * 32, 0);
-                    gpu.set_buffer(enc, tree_buf, write_start * 32, 1);
-                    let tpg = 256u64.min(n_out as u64);
-                    gpu.dispatch(enc, n_out as u64 / tpg, tpg);
-                    read_start = write_start;
-                    read_len = n_out;
-                }
-                gpu.end_encoding(enc);
-                gpu.commit_and_wait(cb)
-            })();
-            gpu.pool_pop(pool);
-            run
-        };
-        if let Err(e) = run {
-            // Poison the state: a mid-prove Metal failure is not a shape to
-            // retry against; every later call falls back to the CPU builder.
-            let msg = format!("submit failed ({e})");
-            if rec_merkle_debug() {
-                eprintln!("[gpu-recmerkle] {msg}");
-            }
-            *guard = Some(Err(msg));
-            return None;
-        }
-
-        let mut tree: Vec<Hash> = crate::alloc_uninit_vec(total_nodes);
-        unsafe {
-            let dst = core::slice::from_raw_parts_mut(
-                tree.as_mut_ptr().cast::<u8>(),
-                total_nodes * 32,
-            );
-            copy_bytes_parallel(gpu.buffer_contents(tree_buf), dst);
-        }
-        if let Some(t) = started {
-            eprintln!(
-                "[gpu-recmerkle] n_leaves=2^{} wall {:.2} ms (wrap hits {} misses {})",
-                num_leaves.trailing_zeros(),
-                t.elapsed().as_secs_f64() * 1e3,
-                state.hits,
-                state.misses,
-            );
-        }
-        Some(tree)
-    }
 }
 
 // Test-harness entry points (copy-in/copy-out); production goes through
@@ -7538,22 +6461,14 @@ kernel void rec_parent_hash(device const uint* children [[buffer(0)]],
 #[cfg_attr(not(test), allow(unused_imports))]
 pub(crate) use imp::{gpu_merkle_tree_blake3, gpu_ntt_interleaved_from_layer};
 
-/// Zerocheck round-one C-fold GPU arm (see `ENV_NO_GPU_ZEROCHECK`) and the
-/// lincheck gather-fold GPU arm (see `ENV_NO_GPU_LINCHECK`).
+/// Zerocheck round-one C-fold GPU arm (see `ENV_NO_GPU_ZEROCHECK`).
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[cfg_attr(not(test), allow(unused_imports))]
-pub(crate) use imp::{ZcFoldJob, launch_lincheck_fold, launch_zerocheck_c_fold, zerocheck_gpu_submits};
+pub(crate) use imp::{ZcFoldJob, launch_zerocheck_c_fold, zerocheck_gpu_submits};
 
 #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
 mod imp {
     use super::*;
-
-    pub(crate) fn gpu_recursive_merkle_blake3(
-        _data: &[u8],
-        _num_leaves: usize,
-    ) -> Option<Vec<crate::merkle::Hash>> {
-        None
-    }
 
     pub(crate) struct FromZFirstPassStream;
 
@@ -8538,267 +7453,6 @@ mod tests {
         }
     }
 
-    /// The recursive-Merkle offload must reproduce the CPU flat tree
-    /// bit-for-bit at both supported 128-byte-leaf shapes, and its repeated
-    /// calls must reuse the cached input wrap.
-    #[test]
-    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-    fn gpu_recursive_merkle_matches_cpu_tree() {
-        let mut rng = Rng::new(0x51AB);
-        for log_leaves in [18usize] {
-            let n_leaves = 1usize << log_leaves;
-            let data_f128 = rng.vec(n_leaves * 8); // 128 B per leaf
-            let data: &[u8] = unsafe {
-                core::slice::from_raw_parts(
-                    data_f128.as_ptr().cast::<u8>(),
-                    data_f128.len() * core::mem::size_of::<F128>(),
-                )
-            };
-            let Some(gpu_tree) = super::gpu_recursive_merkle_blake3(data, n_leaves) else {
-                match imp::gpu().map(|_| ()) {
-                    Ok(()) => panic!("GPU available but recursive merkle returned None"),
-                    Err(e) => {
-                        eprintln!("skipping GPU test: {e}");
-                        return;
-                    }
-                }
-            };
-            let cpu_tree =
-                crate::merkle::merkle_tree(data, n_leaves, crate::merkle::HashKind::Blake3);
-            assert_eq!(gpu_tree.len(), cpu_tree.len());
-            assert!(gpu_tree == cpu_tree, "GPU tree diverges at 2^{log_leaves} leaves");
-            // Second call on the same allocation: cached wrap, same bytes.
-            let again = super::gpu_recursive_merkle_blake3(data, n_leaves)
-                .expect("second call must succeed");
-            assert!(again == cpu_tree);
-        }
-        // Unsupported shapes refuse: below the gate list and the measured
-        // net-negative L2 (2^16) both fall back to the CPU builder.
-        for log_leaves in [10usize, 16] {
-            let n = 1usize << log_leaves;
-            let small = rng.vec(n * 8);
-            let small_bytes: &[u8] = unsafe {
-                core::slice::from_raw_parts(
-                    small.as_ptr().cast::<u8>(),
-                    small.len() * core::mem::size_of::<F128>(),
-                )
-            };
-            assert!(super::gpu_recursive_merkle_blake3(small_bytes, n).is_none());
-        }
-    }
-
-    /// Occupancy-sensitivity probe for the g4 mid-pass kernel: identical
-    /// butterfly math with the threadgroup table footprint artificially
-    /// padded up (24 KiB / 31 KiB) or shrunk to eight tables (footprint of a
-    /// sibling-table variant; its outputs are deliberately WRONG — timing
-    /// signal only). If pass time is flat in footprint, occupancy is not
-    /// threadgroup-memory-limited and shrinking tables buys nothing. Run
-    /// with `--ignored --nocapture`.
-    #[test]
-    #[ignore = "1 GiB buffers; run explicitly with --ignored"]
-    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-    fn gpu_g4_footprint_probe() {
-        use super::imp;
-        const PROBE_MSL: &str = r#"
-#include <metal_stdlib>
-using namespace metal;
-
-static inline uint4 gf_mulx(uint4 v) {
-    uint carry = v.w >> 31;
-    uint4 r;
-    r.w = (v.w << 1) | (v.z >> 31);
-    r.z = (v.z << 1) | (v.y >> 31);
-    r.y = (v.y << 1) | (v.x >> 31);
-    r.x = (v.x << 1) ^ (carry * 0x87u);
-    return r;
-}
-
-static inline uint4 gf_shl16(uint4 a) {
-    uint h = a.w >> 16;
-    uint4 r;
-    r.w = (a.w << 16) | (a.z >> 16);
-    r.z = (a.z << 16) | (a.y >> 16);
-    r.y = (a.y << 16) | (a.x >> 16);
-    r.x = (a.x << 16) ^ ((h << 7) ^ (h << 2) ^ (h << 1) ^ h);
-    return r;
-}
-
-static inline uint4 gf_mul_tab4(uint4 v, threadgroup const uint4* tab) {
-    uint4 acc = uint4(0u);
-    for (int i = 7; i >= 0; i--) {
-        acc = gf_shl16(acc);
-        uint h = (v[i >> 1] >> ((i & 1) * 16)) & 0xffffu;
-        acc ^= tab[h & 15u]
-             ^ tab[16u + ((h >> 4) & 15u)]
-             ^ tab[32u + ((h >> 8) & 15u)]
-             ^ tab[48u + (h >> 12)];
-    }
-    return acc;
-}
-
-struct NttParams {
-    uint log_d;
-    uint l;
-    uint f;
-    uint s;
-};
-
-#define DEF_PROBE(NAME, NTABS, PADU4, TSEL_EXPR)                               \
-kernel void NAME(device uint4* data                [[buffer(0)]],              \
-                 device const uint4* twiddles      [[buffer(1)]],              \
-                 constant NttParams& P             [[buffer(2)]],              \
-                 uint tgid [[threadgroup_position_in_grid]],                   \
-                 uint lid  [[thread_index_in_threadgroup]])                    \
-{                                                                              \
-    constexpr uint F   = 4u;                                                   \
-    constexpr uint NF  = 1u << F;                                              \
-    constexpr uint LOG_G = 2u;                                                 \
-    threadgroup uint4 bases[(NTABS) * 4u];                                     \
-    threadgroup uint4 tabs[(NTABS) * 64u];                                     \
-    threadgroup uint4 pad[(PADU4) + 1u];                                       \
-                                                                               \
-    const uint lane = lid;                                                     \
-    const uint B = tgid >> (P.s - LOG_G);                                      \
-    const uint r_base =                                                        \
-        (tgid & ((1u << (P.s - LOG_G)) - 1u)) << LOG_G;                        \
-                                                                               \
-    if (lid < (NTABS) * 4u) {                                                  \
-        uint t = lid >> 2;                                                     \
-        uint k = lid & 3u;                                                     \
-        uint j = 31u - clz(t + 1u);                                            \
-        uint c = t + 1u - (1u << j);                                           \
-        uint4 p = twiddles[(1u << (P.l + j)) - 1u + (B << j) + c];             \
-        for (uint m = 0; m < k * 4u; m++) { p = gf_mulx(p); }                  \
-        bases[lid] = p;                                                        \
-    }                                                                          \
-    threadgroup_barrier(mem_flags::mem_threadgroup);                           \
-                                                                               \
-    for (uint ei = lid; ei < (NTABS) * 64u; ei += 64u) {                       \
-        uint t   = ei >> 6;                                                    \
-        uint sub = ei & 63u;                                                   \
-        uint n   = sub & 15u;                                                  \
-        uint4 p  = bases[(t << 2) | (sub >> 4)];                               \
-        uint4 val = uint4(0u);                                                 \
-        for (uint k = 0; k < 4u; k++) {                                        \
-            if ((n >> k) & 1u) { val ^= p; }                                   \
-            p = gf_mulx(p);                                                    \
-        }                                                                      \
-        tabs[ei] = val;                                                        \
-    }                                                                          \
-    threadgroup_barrier(mem_flags::mem_threadgroup);                           \
-                                                                               \
-    for (uint rr = 0; rr < (1u << LOG_G); rr++) {                              \
-        const uint r = r_base + rr;                                            \
-        const uint pos_base = (B << (P.log_d - P.l)) + r;                      \
-        uint4 elems[NF];                                                       \
-        for (uint e = 0; e < NF; e++) {                                        \
-            elems[e] = data[((pos_base + (e << P.s)) << 6) + lane];            \
-        }                                                                      \
-        for (uint j = 0; j < F; j++) {                                         \
-            uint bpos = F - 1u - j;                                            \
-            for (uint b = 0; b < (NF >> 1); b++) {                             \
-                uint low = b & ((1u << bpos) - 1u);                            \
-                uint eu  = ((b >> bpos) << (bpos + 1u)) | low;                 \
-                uint ev  = eu | (1u << bpos);                                  \
-                uint tsel = ((1u << j) - 1u) + (eu >> (F - j));                \
-                tsel = (TSEL_EXPR);                                            \
-                uint4 nu = elems[eu]                                           \
-                    ^ gf_mul_tab4(elems[ev], &tabs[tsel << 6]);                \
-                elems[eu] = nu;                                                \
-                elems[ev] ^= nu;                                               \
-            }                                                                  \
-        }                                                                      \
-        if (P.log_d == 77u) {                                                  \
-            pad[lid % ((PADU4) + 1u)] = elems[0];                              \
-            threadgroup_barrier(mem_flags::mem_threadgroup);                   \
-            elems[0] ^= pad[(lid + 1u) % ((PADU4) + 1u)];                      \
-        }                                                                      \
-        for (uint e = 0; e < NF; e++) {                                        \
-            data[((pos_base + (e << P.s)) << 6) + lane] = elems[e];            \
-        }                                                                      \
-    }                                                                          \
-}
-
-DEF_PROBE(probe_g4_t15_p0,   15u, 0u,   tsel)
-DEF_PROBE(probe_g4_t15_p8k,  15u, 512u, tsel)
-DEF_PROBE(probe_g4_t15_p15k, 15u, 928u, tsel)
-DEF_PROBE(probe_g4_t8_p0,    8u,  0u,   tsel & 7u)
-"#;
-        let log_d = 20usize;
-        let ntt = AdditiveNttF128::standard(log_d);
-        let mut rng = Rng::new(0xF007);
-        let input = rng.vec(64 << log_d);
-        let gpu = match gpu_or_skip(imp::gpu().map(|g| g as *const imp::Gpu)) {
-            Some(g) => unsafe { &*g },
-            None => return,
-        };
-        let twiddles = flat_twiddle_table(&ntt, log_d);
-        unsafe {
-            let pool = gpu.pool_push();
-            let data_bytes = core::mem::size_of_val(input.as_slice());
-            let data_buf = gpu.new_buffer(data_bytes).unwrap();
-            let tw_buf = gpu
-                .new_buffer(core::mem::size_of_val(twiddles.as_slice()))
-                .unwrap();
-            std::ptr::copy_nonoverlapping(
-                input.as_ptr().cast::<u8>(),
-                gpu.buffer_contents(data_buf),
-                data_bytes,
-            );
-            std::ptr::copy_nonoverlapping(
-                twiddles.as_ptr().cast::<u8>(),
-                gpu.buffer_contents(tw_buf),
-                core::mem::size_of_val(twiddles.as_slice()),
-            );
-            let time_pass = |pso: imp::Id, l: usize| -> f64 {
-                let mut best = f64::MAX;
-                for _ in 0..5 {
-                    let t = std::time::Instant::now();
-                    let cb = gpu.command_buffer().unwrap();
-                    let enc = gpu.compute_encoder(cb).unwrap();
-                    gpu.set_buffer(enc, data_buf, 0, 0);
-                    gpu.set_buffer(enc, tw_buf, 0, 1);
-                    gpu.set_pipeline(enc, pso);
-                    let p = imp::NttParams {
-                        log_d: log_d as u32,
-                        l: l as u32,
-                        f: 4,
-                        s: (log_d - l - 4) as u32,
-                    };
-                    let bytes = core::slice::from_raw_parts(
-                        (&p as *const imp::NttParams).cast::<u8>(),
-                        core::mem::size_of::<imp::NttParams>(),
-                    );
-                    gpu.set_bytes(enc, bytes, 2);
-                    gpu.dispatch(enc, 1u64 << (log_d - 4 - 2), 64);
-                    gpu.end_encoding(enc);
-                    gpu.commit_and_wait(cb).unwrap();
-                    best = best.min(t.elapsed().as_secs_f64() * 1e3);
-                }
-                best
-            };
-            let variants = [
-                ("t15_p0 (16.3 KiB, control)", "probe_g4_t15_p0"),
-                ("t15_p8k (24.3 KiB)", "probe_g4_t15_p8k"),
-                ("t15_p15k (30.8 KiB)", "probe_g4_t15_p15k"),
-                ("t8_p0 (8.7 KiB, fake math)", "probe_g4_t8_p0"),
-            ];
-            let incumbent8 = time_pass(gpu.pso_ntt4g4, 8);
-            let incumbent12 = time_pass(gpu.pso_ntt4g4, 12);
-            eprintln!("incumbent pso_ntt4g4: l=8 {incumbent8:.2} ms, l=12 {incumbent12:.2} ms");
-            for (label, name) in variants {
-                let pso = imp::compile_supplemental_pipeline(gpu, PROBE_MSL, name).unwrap();
-                let t8 = time_pass(pso, 8);
-                let t12 = time_pass(pso, 12);
-                eprintln!("{label}: l=8 {t8:.2} ms, l=12 {t12:.2} ms");
-                gpu.release(pso);
-            }
-            gpu.release(data_buf);
-            gpu.release(tw_buf);
-            gpu.pool_pop(pool);
-        }
-    }
-
     /// Timing probe for the full warm commit graph (5 fused NTT passes +
     /// leaves + 20 parent levels, ONE command buffer) on persistent
     /// already-touched buffers — the shape the latched production path runs.
@@ -9102,144 +7756,6 @@ DEF_PROBE(probe_g4_t8_p0,    8u,  0u,   tsel & 7u)
     #[test]
     fn zerocheck_gpu_kill_switch_is_the_documented_env() {
         assert_eq!(ENV_NO_GPU_ZEROCHECK, "FLOCK_NO_GPU_ZEROCHECK");
-        assert_eq!(ENV_NO_GPU_LINCHECK, "FLOCK_NO_GPU_LINCHECK");
-    }
-
-    /// The warmup ratio gate: share formula, CPU-ward clamp, and the
-    /// disable threshold — the §24 fix that keeps a slow-GPU machine on the
-    /// exact incumbent.
-    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-    #[test]
-    fn lincheck_gate_share_formula_and_disable() {
-        use imp::lincheck_gate_share;
-        // ratio 1.0: floor(0.9 * 64 / 2) = 28.
-        assert_eq!(lincheck_gate_share(1.0, 64), 28);
-        // v1's measured local ratio: floor(0.9 * 64 / 2.52) = 22.
-        assert_eq!(lincheck_gate_share(1.52, 64), 22);
-        // The threshold itself still runs: floor(0.9 * 64 / 3) = 19.
-        assert_eq!(lincheck_gate_share(2.0, 64), 19);
-        // Above it the arm is OFF (0 = exact incumbent).
-        assert_eq!(lincheck_gate_share(2.01, 64), 0);
-        assert_eq!(lincheck_gate_share(3.0, 64), 0);
-        // Fast GPU: clamped at half the claims (CPU-ward bias).
-        assert_eq!(lincheck_gate_share(0.5, 64), 32);
-        assert_eq!(lincheck_gate_share(0.1, 64), 32);
-        // Unusable samples disable rather than guess.
-        assert_eq!(lincheck_gate_share(f64::NAN, 64), 0);
-        assert_eq!(lincheck_gate_share(f64::INFINITY, 64), 0);
-        assert_eq!(lincheck_gate_share(0.0, 64), 0);
-        assert_eq!(lincheck_gate_share(-1.0, 64), 0);
-        // Small test shapes scale (16 claims: ratio 1 -> floor(7.2) = 7).
-        assert_eq!(lincheck_gate_share(1.0, 16), 7);
-    }
-
-    /// The lincheck arm's GPU prefix equals the CPU fold over exactly the
-    /// claims it owns, and prefix ⊕ CPU-suffix equals the whole-range
-    /// production fold — the same discipline the zerocheck arm is held to.
-    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-    #[test]
-    fn gpu_lincheck_fold_prefix_matches_cpu_oracle() {
-        // n_outer = 2^16 ⇒ 8192 stripes ⇒ 1024 tiles ⇒ 16 claims, so the
-        // first-prove probe split is a genuine partial prefix (8/16).
-        let (m, k_log, useful_bits) = (26usize, 10usize, 997usize);
-        let k = 1usize << k_log;
-        if gpu_or_skip(imp::gpu()).is_none() {
-            return;
-        }
-        let z = leak_page_aligned((1usize << m) / 8);
-        fill_stripe(z, 0x1C0F_FEE1_2345_6789);
-        let mut rng = Rng::new(0x5EED_0011);
-        let eq = rng.vec(1usize << (m - k_log));
-
-        let submits = imp::lincheck_gpu_submits();
-        let job = imp::launch_lincheck_fold(z, m, k_log, useful_bits, &eq)
-            .expect("lincheck GPU fold arm must submit on an available device");
-        assert_eq!(
-            imp::lincheck_gpu_submits(),
-            submits + 1,
-            "the arm must actually engage, not silently fall back"
-        );
-        let claim_lo = job.claim_lo();
-        assert!(
-            claim_lo > 0 && claim_lo < crate::lincheck::oblock_claim_count(m, k_log),
-            "expected a partial prefix, got {claim_lo}"
-        );
-        let mut got = vec![F128::ZERO; k];
-        job.finish_xor_into(&mut got, 0.0, 0.0).unwrap();
-
-        let want = crate::lincheck::partial_fold_packed_z_neon_oblock_padded_range(
-            z,
-            m,
-            k_log,
-            useful_bits,
-            &eq,
-            0,
-            claim_lo,
-        );
-        assert_eq!(got, want, "lincheck GPU prefix must be bit-exact");
-        assert!(
-            got[useful_bits.div_ceil(8) * 8..]
-                .iter()
-                .all(|v| *v == F128::ZERO),
-            "padded columns must stay zero"
-        );
-
-        let suffix = crate::lincheck::partial_fold_packed_z_neon_oblock_padded_suffix(
-            z, m, k_log, useful_bits, &eq, claim_lo,
-        );
-        for (a, b) in got.iter_mut().zip(suffix) {
-            *a += b;
-        }
-        let whole = crate::lincheck::partial_fold_packed_z_best(z, m, k_log, useful_bits, &eq);
-        assert_eq!(got, whole, "hybrid union must equal the whole-range fold");
-    }
-
-    /// Same oracle at the ranked production shape (m = 32, k_log = 14,
-    /// useful_bits = 15409) — the only shape the arm is gated on — plus a
-    /// cached-wrap resubmission (the steady-state production path).
-    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-    #[test]
-    fn gpu_lincheck_fold_matches_cpu_at_ranked_shape() {
-        let (m, k_log, useful_bits) = (32usize, 14usize, 15_409usize);
-        if gpu_or_skip(imp::gpu()).is_none() {
-            return;
-        }
-        let z = leak_page_aligned((1usize << m) / 8);
-        fill_stripe(z, 0xB5B5_0F0F_1234_5678);
-        let mut rng = Rng::new(0x5EED_0012);
-        let eq = rng.vec(1usize << (m - k_log));
-
-        let job = imp::launch_lincheck_fold(z, m, k_log, useful_bits, &eq)
-            .expect("lincheck GPU fold arm must submit at the ranked shape");
-        let claim_lo = job.claim_lo();
-        let mut hybrid = vec![F128::ZERO; 1usize << k_log];
-        let suffix = crate::lincheck::partial_fold_packed_z_neon_oblock_padded_suffix(
-            z, m, k_log, useful_bits, &eq, claim_lo,
-        );
-        job.finish_xor_into(&mut hybrid, 0.0, 0.0).unwrap();
-        for (a, b) in hybrid.iter_mut().zip(suffix) {
-            *a += b;
-        }
-        let whole = crate::lincheck::partial_fold_packed_z_best(z, m, k_log, useful_bits, &eq);
-        assert_eq!(hybrid, whole, "ranked hybrid fold must be bit-exact");
-
-        // Second submission on the SAME stripe: exercises the cached no-copy
-        // wrap (the zerocheck arm's earlier submission may hold wrap slot 0).
-        let job = imp::launch_lincheck_fold(z, m, k_log, useful_bits, &eq)
-            .expect("cached-wrap resubmission must succeed");
-        let claim_lo2 = job.claim_lo();
-        let mut again = vec![F128::ZERO; 1usize << k_log];
-        job.finish_xor_into(&mut again, 0.0, 0.0).unwrap();
-        let want = crate::lincheck::partial_fold_packed_z_neon_oblock_padded_range(
-            z,
-            m,
-            k_log,
-            useful_bits,
-            &eq,
-            0,
-            claim_lo2,
-        );
-        assert_eq!(again, want, "resubmitted prefix must stay bit-exact");
     }
 
     /// The whole arm depends on wrapping the ranked lincheck stripe with
