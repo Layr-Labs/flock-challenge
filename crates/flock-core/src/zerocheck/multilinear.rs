@@ -453,7 +453,9 @@ impl UniSkipFoldTable {
     /// are rebuilt by XOR instead of performing 2,048 independent products.
     fn scaled_linear(&self, rho: F128) -> Vec<F128> {
         assert_eq!(self.data.len(), self.n_chunks * 256);
-        let mut scaled = self.data.clone();
+        let n = self.data.len();
+        let mut scaled = crate::scratch::take_f128(n);
+        scaled[..n].copy_from_slice(&self.data);
         for chunk in 0..self.n_chunks {
             let base = chunk * 256;
             for bit in 0..8 {
