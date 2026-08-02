@@ -2822,6 +2822,11 @@ impl Blake3Setup {
         use std::sync::atomic::{AtomicUsize, Ordering};
         static PROVE_FAST_CALLS: AtomicUsize = AtomicUsize::new(0);
         let call = PROVE_FAST_CALLS.fetch_add(1, Ordering::Relaxed);
+        // The GPU keep-warm bridge must never overlap a prove: pause it for
+        // the whole prove; the warmup latch paths re-arm it on completion of
+        // the first ranked commit (untimed), bridging the warmup CPU tail
+        // and the ready->seed gap.
+        flock_core::gpu_commit::gpu_keepwarm_prove_started();
         // Call zero is the untimed warmup but materializes an eager lincheck
         // stripe before the timed proof establishes streaming. Issue the
         // exact-contention ticket here, before witness generation, so only

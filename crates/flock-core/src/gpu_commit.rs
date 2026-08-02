@@ -71,6 +71,30 @@ pub(crate) fn warmup_latch_cache_enabled() -> bool {
     *ON.get_or_init(|| std::env::var_os(ENV_NO_WARMUP_LATCH_CACHE).is_none())
 }
 
+/// Kill switch for the GPU keep-warm bridge: `FLOCK_NO_GPU_KEEPWARM=1`
+/// disables it. The bridge dispatches small untimed leaf-hash kernels on a
+/// private scratch buffer ONLY between proves (armed when the first ranked
+/// warmup commit finishes, hard-paused the moment any prove begins), so the
+/// GPU's DVFS state does not decay across the warmup prove's CPU tail and
+/// the worker's ready->seed gap. Measured on M3 Pro at ranked size: a
+/// 1 s GPU idle gap costs +6% and a 2 s gap +18-22% on the next commit
+/// graph wall; back-to-back runs are flat. Timed work is never touched:
+/// the bridge never runs while a prove is active.
+pub const ENV_NO_GPU_KEEPWARM: &str = "FLOCK_NO_GPU_KEEPWARM";
+
+pub(crate) fn gpu_keepwarm_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os(ENV_NO_GPU_KEEPWARM).is_none())
+}
+
+/// Called at the top of every prove: stops keep-warm dispatches for the
+/// prove's whole duration (timed phases must never share the GPU or the
+/// memory system with the bridge).
+pub fn gpu_keepwarm_prove_started() {
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    imp::keepwarm_pause();
+}
+
 /// Env var that disables this round's NTT pass tuning (the g4 shared-table +
 /// zero-region-skip from-z kernel and the half-footprint final-pass kernel),
 /// restoring the incumbent kernel selection as the same-binary control.
@@ -4366,6 +4390,92 @@ kernel void export_from_z_zero_root_tabs(
         *ON.get_or_init(|| std::env::var_os("FLOCK_NO_HYBRID_CPU_SUFFIX_DEEP").is_none())
     }
 
+    // -----------------------------------------------------------------------
+    // GPU keep-warm bridge (see `ENV_NO_GPU_KEEPWARM` docs at the top).
+    // -----------------------------------------------------------------------
+
+    static KEEPWARM_PAUSED: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(true);
+    static KEEPWARM_STARTED: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
+
+    pub(crate) fn keepwarm_pause() {
+        KEEPWARM_PAUSED.store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    /// Resume (and lazily spawn) the keep-warm thread. Called only from the
+    /// first ranked warmup commit's latch-On paths, i.e. strictly inside the
+    /// untimed warmup prove.
+    pub(crate) fn keepwarm_arm() {
+        use std::sync::atomic::Ordering;
+        if !super::gpu_keepwarm_enabled() {
+            return;
+        }
+        KEEPWARM_PAUSED.store(false, Ordering::Release);
+        if KEEPWARM_STARTED.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let _ = std::thread::Builder::new()
+            .name("gpu-keepwarm".into())
+            .spawn(keepwarm_thread);
+    }
+
+    fn keepwarm_thread() {
+        use std::sync::atomic::Ordering;
+        // Utility QoS: the bridge must never contend for P-cores.
+        unsafe extern "C" {
+            fn pthread_set_qos_class_self_np(qos_class: u32, rel: i32) -> i32;
+        }
+        unsafe {
+            let _ = pthread_set_qos_class_self_np(0x11, 0);
+        }
+        let Ok(gpu) = gpu() else { return };
+        unsafe {
+            let pool = gpu.pool_push();
+            // 16 MiB of leaf input + the matching tree slice: one dispatch is
+            // ~0.2 ms of real GPU work, small enough that at most one is ever
+            // in flight when a prove pauses the bridge (its drain hides under
+            // the prove's CPU-side witness start), large enough to hold DVFS.
+            const KW_LEAVES: usize = 16_384;
+            let (Ok(data), Ok(tree)) =
+                (gpu.new_buffer(KW_LEAVES * 1024), gpu.new_buffer(KW_LEAVES * 32))
+            else {
+                gpu.pool_pop(pool);
+                return;
+            };
+            // Contents are irrelevant (private scratch, never read back), but
+            // fault the pages once so dispatches do real reads.
+            std::ptr::write_bytes(gpu.buffer_contents(data), 0xA5, KW_LEAVES * 1024);
+            let mut warmed_s = 0.0f64;
+            // Hard cap: a worker's inter-prove windows total well under a
+            // minute; anything longer means a non-worker context, stop.
+            while warmed_s < 60.0 {
+                if KEEPWARM_PAUSED.load(Ordering::Acquire) {
+                    std::thread::sleep(std::time::Duration::from_micros(500));
+                    continue;
+                }
+                let t0 = std::time::Instant::now();
+                let ok = (|| -> Result<(), String> {
+                    let cb = gpu.command_buffer()?;
+                    let enc = gpu.compute_encoder(cb)?;
+                    gpu.set_pipeline(enc, gpu.pso_leaf);
+                    gpu.set_buffer(enc, data, 0, 0);
+                    gpu.set_buffer(enc, tree, 0, 1);
+                    gpu.dispatch(enc, (KW_LEAVES / 256) as u64, 256);
+                    gpu.end_encoding(enc);
+                    gpu.commit_and_wait(cb)
+                })();
+                warmed_s += t0.elapsed().as_secs_f64();
+                if ok.is_err() {
+                    break;
+                }
+            }
+            gpu.release(data);
+            gpu.release(tree);
+            gpu.pool_pop(pool);
+        }
+    }
+
     struct WarmupRun {
         latched: Latched,
         gpu_tree: Vec<Hash>,
@@ -4739,6 +4849,7 @@ kernel void export_from_z_zero_root_tabs(
                         }
                         let tree = run.gpu_tree;
                         *latch = LatchState::On(run.latched);
+                        keepwarm_arm();
                         return (CodewordBuf::Cpu(codeword), MerkleTreeBuf::Cpu(tree));
                     }
                     // Mismatch or wall regression: discard and fall through
@@ -4852,6 +4963,7 @@ kernel void export_from_z_zero_root_tabs(
                 &cpu_tree,
             );
             *latch = LatchState::On(run.latched);
+            keepwarm_arm();
         } else {
             release_latched(gpu, run.latched);
             *latch = LatchState::Off;
@@ -5459,6 +5571,83 @@ pub(crate) use imp::{gpu_merkle_tree_blake3, gpu_ntt_interleaved_from_layer};
 mod tests {
     use super::*;
     use crate::field::F128;
+
+    /// GPU idle-decay probe at ranked size: full commit graph wall
+    /// back-to-back vs after idle gaps. Ignored; run with --ignored --nocapture.
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    #[ignore]
+    fn gpu_idle_decay_probe() {
+        let log_d = 20usize;
+        let n_leaves = 1usize << 20;
+        let gpu = match imp::gpu() {
+            Ok(g) => g,
+            Err(e) => { eprintln!("no GPU: {e}"); return; }
+        };
+        let ntt = crate::ntt::AdditiveNttF128::standard(log_d);
+        let twiddles = flat_twiddle_table(&ntt, log_d);
+        unsafe {
+            let pool = gpu.pool_push();
+            let staging = gpu.new_buffer(n_leaves * 1024).unwrap();
+            let tree_buf = gpu.new_buffer((2 * n_leaves - 1) * 32).unwrap();
+            let tw_bytes = core::mem::size_of_val(twiddles.as_slice());
+            let tw_buf = gpu.new_buffer(tw_bytes).unwrap();
+            std::ptr::copy_nonoverlapping(twiddles.as_ptr().cast::<u8>(), gpu.buffer_contents(tw_buf), tw_bytes);
+            let base = gpu.buffer_contents(staging);
+            for i in (0..n_leaves * 1024).step_by(4096) {
+                *base.add(i) = (i as u8).wrapping_mul(31) | 1;
+            }
+            let run_full = || -> f64 {
+                let cb = gpu.command_buffer().unwrap();
+                let enc = gpu.compute_encoder(cb).unwrap();
+                imp::encode_ntt_passes(gpu, enc, staging, tw_buf, log_d, 4);
+                imp::encode_merkle(gpu, enc, staging, tree_buf, n_leaves);
+                gpu.end_encoding(enc);
+                let t0 = std::time::Instant::now();
+                gpu.commit_and_wait(cb).unwrap();
+                t0.elapsed().as_secs_f64() * 1e3
+            };
+            let _ = run_full(); // warm
+            // Keep-warm-flavored idle: small leaf dispatches for the gap
+            // instead of sleeping.
+            let kw_leaves = 65_536usize;
+            let kw_data = gpu.new_buffer(kw_leaves * 1024).unwrap();
+            let kw_tree = gpu.new_buffer(kw_leaves * 32).unwrap();
+            std::ptr::write_bytes(gpu.buffer_contents(kw_data), 0xA5, kw_leaves * 1024);
+            let warm_idle = |ms: u64| {
+                let t0 = std::time::Instant::now();
+                let mut n = 0u32;
+                while t0.elapsed().as_millis() < ms as u128 {
+                    let cb = gpu.command_buffer().unwrap();
+                    let enc = gpu.compute_encoder(cb).unwrap();
+                    gpu.set_pipeline(enc, gpu.pso_leaf);
+                    gpu.set_buffer(enc, kw_data, 0, 0);
+                    gpu.set_buffer(enc, kw_tree, 0, 1);
+                    gpu.dispatch(enc, (kw_leaves / 256) as u64, 256);
+                    gpu.end_encoding(enc);
+                    gpu.commit_and_wait(cb).unwrap();
+                    n += 1;
+                }
+                n
+            };
+            for (rep, idle_ms, warm) in [
+                (0u32, 0u64, false), (1, 2000, false), (2, 0, false),
+                (3, 2000, true), (4, 0, false), (5, 2000, false),
+                (6, 2000, true), (7, 0, false),
+            ] {
+                let mut n = 0;
+                if idle_ms > 0 {
+                    if warm { n = warm_idle(idle_ms); }
+                    else { std::thread::sleep(std::time::Duration::from_millis(idle_ms)); }
+                }
+                let ms = run_full();
+                println!("rep={rep} idle={idle_ms}ms warm={warm} dispatches={n} full={ms:.2}ms");
+            }
+            gpu.release(kw_data); gpu.release(kw_tree);
+            gpu.release(staging); gpu.release(tree_buf); gpu.release(tw_buf);
+            gpu.pool_pop(pool);
+        }
+    }
 
     #[test]
     fn precompute_wall_handoff_observes_late_store() {
