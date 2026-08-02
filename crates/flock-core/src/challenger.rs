@@ -537,19 +537,52 @@ impl Challenger for FsChallenger {
                     let cpu_1_started = std::time::Instant::now();
                     let cpu_1 = cpu_gpu_grind_calibration(&state_digest);
                     let cpu_1_time = cpu_1_started.elapsed();
-                    let gpu_1_started = std::time::Instant::now();
-                    let gpu_1 = gpu_grind_calibration(&state_digest);
-                    let gpu_1_time = gpu_1_started.elapsed();
+                    let incumbent_gpu_1_started = std::time::Instant::now();
+                    let incumbent_gpu_1 = gpu_grind_calibration(&state_digest, false);
+                    let incumbent_gpu_1_time = incumbent_gpu_1_started.elapsed();
+                    let specialized_gpu_1_started = std::time::Instant::now();
+                    let specialized_gpu_1 = gpu_grind_calibration(&state_digest, true);
+                    let specialized_gpu_1_time = specialized_gpu_1_started.elapsed();
 
-                    let gpu_2_started = std::time::Instant::now();
-                    let gpu_2 = gpu_grind_calibration(&state_digest);
-                    let gpu_2_time = gpu_2_started.elapsed();
+                    let specialized_gpu_2_started = std::time::Instant::now();
+                    let specialized_gpu_2 = gpu_grind_calibration(&state_digest, true);
+                    let specialized_gpu_2_time = specialized_gpu_2_started.elapsed();
+                    let incumbent_gpu_2_started = std::time::Instant::now();
+                    let incumbent_gpu_2 = gpu_grind_calibration(&state_digest, false);
+                    let incumbent_gpu_2_time = incumbent_gpu_2_started.elapsed();
                     let cpu_2_started = std::time::Instant::now();
                     let cpu_2 = cpu_gpu_grind_calibration(&state_digest);
                     let cpu_2_time = cpu_2_started.elapsed();
 
-                    let exact = matches!((&gpu_1, &gpu_2), (Ok(a), Ok(b)) if *a == cpu_1 && *b == cpu_1)
-                        && cpu_2 == cpu_1;
+                    let specialized_enable = admit_specialized_gpu_grind(
+                        crate::gpu_commit::gpu_grind_specialized_enabled(),
+                        &cpu_1,
+                        [&incumbent_gpu_1, &incumbent_gpu_2],
+                        [&specialized_gpu_1, &specialized_gpu_2],
+                        [incumbent_gpu_1_time, incumbent_gpu_2_time],
+                        [specialized_gpu_1_time, specialized_gpu_2_time],
+                    );
+                    let _ = GPU_GRIND_SPECIAL_LATCH.set(specialized_enable);
+                    let (gpu_1, gpu_1_time, gpu_2, gpu_2_time) = if specialized_enable {
+                        (
+                            &specialized_gpu_1,
+                            specialized_gpu_1_time,
+                            &specialized_gpu_2,
+                            specialized_gpu_2_time,
+                        )
+                    } else {
+                        (
+                            &incumbent_gpu_1,
+                            incumbent_gpu_1_time,
+                            &incumbent_gpu_2,
+                            incumbent_gpu_2_time,
+                        )
+                    };
+                    let exact = matches!((gpu_1, gpu_2), (Ok(a), Ok(b)) if *a == cpu_1 && *b == cpu_1)
+                        && cpu_2 == cpu_1
+                        // A pathological all-`None` CPU vector must never
+                        // admit a shader that silently reports no matches.
+                        && cpu_1.iter().any(Option::is_some);
                     let cpu_total = cpu_1_time + cpu_2_time;
                     let gpu_total = gpu_1_time + gpu_2_time;
                     // A fixed N-nonce Metal block succeeds with probability
@@ -628,9 +661,37 @@ const GPU_GRIND_CALIBRATION_LENGTHS: [u32; 7] = [
 const GPU_GRIND_BLOCK_OVERDRAW: f64 = 1.581_976_706_869_326_5;
 const GPU_GRIND_MIN_TWO_SAMPLE_GAIN: std::time::Duration =
     std::time::Duration::from_micros(1_500);
+const GPU_GRIND_SPECIAL_MIN_TWO_SAMPLE_GAIN: std::time::Duration =
+    std::time::Duration::from_micros(500);
 static GPU_GRIND_LATCH: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+static GPU_GRIND_SPECIAL_LATCH: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
 static GPU_GRIND_FAILED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
+
+/// Target-side admission for the candidate PCS grind kernel. Two opposed
+/// sample orders reject simple thermal/order bias; exact vectors reject a
+/// source/compiler mismatch before a timed proof can use the candidate.
+fn admit_specialized_gpu_grind(
+    enabled: bool,
+    cpu: &[Option<u64>],
+    incumbent: [&Result<Vec<Option<u64>>, String>; 2],
+    specialized: [&Result<Vec<Option<u64>>, String>; 2],
+    incumbent_time: [std::time::Duration; 2],
+    specialized_time: [std::time::Duration; 2],
+) -> bool {
+    let exact = |samples: [&Result<Vec<Option<u64>>, String>; 2]| {
+        matches!((samples[0], samples[1]), (Ok(a), Ok(b)) if a == cpu && b == cpu)
+    };
+    let gain = (incumbent_time[0] + incumbent_time[1])
+        .saturating_sub(specialized_time[0] + specialized_time[1]);
+    enabled
+        && cpu.iter().any(Option::is_some)
+        && exact(incumbent)
+        && exact(specialized)
+        && specialized_time[0] < incumbent_time[0]
+        && specialized_time[1] < incumbent_time[1]
+        && gain >= GPU_GRIND_SPECIAL_MIN_TWO_SAMPLE_GAIN
+}
 
 /// CPU oracle/throughput arm for one fixed calibration window.  Unlike the
 /// production search it intentionally drains every chunk, making runtime
@@ -706,16 +767,20 @@ fn cpu_gpu_grind_calibration(state_digest: &[u8; 32]) -> Vec<Option<u64>> {
         .collect()
 }
 
-fn gpu_grind_calibration(state_digest: &[u8; 32]) -> Result<Vec<Option<u64>>, String> {
+fn gpu_grind_calibration(
+    state_digest: &[u8; 32],
+    specialized: bool,
+) -> Result<Vec<Option<u64>>, String> {
     let mut start = 0u64;
     GPU_GRIND_CALIBRATION_LENGTHS
         .into_iter()
         .map(|len| {
-            let result = crate::gpu_commit::gpu_blake3_pow_scan(
+            let result = crate::gpu_commit::gpu_blake3_pow_scan_mode(
                 state_digest,
                 start,
                 len,
                 GPU_GRIND_CALIBRATION_PREDICATE_BITS,
+                specialized,
             );
             start += u64::from(len);
             result
@@ -733,8 +798,13 @@ fn gpu_blake3_pow_nonce(state_digest: &[u8; 32], bits: u32) -> Result<u64, Strin
     let block_len = 1u32 << bits.min(24);
     let mut start = 0u64;
     loop {
-        if let Some(nonce) =
-            crate::gpu_commit::gpu_blake3_pow_scan(state_digest, start, block_len, bits)?
+        if let Some(nonce) = crate::gpu_commit::gpu_blake3_pow_scan_mode(
+            state_digest,
+            start,
+            block_len,
+            bits,
+            GPU_GRIND_SPECIAL_LATCH.get().copied().unwrap_or(false),
+        )?
         {
             return Ok(nonce);
         }
@@ -938,6 +1008,76 @@ mod tests {
         assert_eq!(GPU_GRIND_CALIBRATION_BITS, 19);
         let exact_geometric = 1.0 / (1.0 - (-1.0f64).exp());
         assert!((GPU_GRIND_BLOCK_OVERDRAW - exact_geometric).abs() < 1e-12);
+    }
+
+    #[test]
+    fn specialized_gpu_grind_admission_is_exact_and_margin_protected() {
+        use std::time::Duration;
+
+        let cpu = vec![None, Some(17), None];
+        let exact_1 = Ok(cpu.clone());
+        let exact_2 = Ok(cpu.clone());
+        let incumbent = [&exact_1, &exact_2];
+        let specialized = [&exact_1, &exact_2];
+        let incumbent_time = [Duration::from_micros(2_000); 2];
+        let qualifying_time = [Duration::from_micros(1_700); 2];
+        assert!(admit_specialized_gpu_grind(
+            true,
+            &cpu,
+            incumbent,
+            specialized,
+            incumbent_time,
+            qualifying_time,
+        ));
+        assert!(!admit_specialized_gpu_grind(
+            false,
+            &cpu,
+            incumbent,
+            specialized,
+            incumbent_time,
+            qualifying_time,
+        ));
+
+        // Both samples must win, and their protected aggregate must reach the
+        // exact 500 us floor (250 + 249 is deliberately one microsecond shy).
+        assert!(!admit_specialized_gpu_grind(
+            true,
+            &cpu,
+            incumbent,
+            specialized,
+            incumbent_time,
+            [Duration::from_micros(1_750), Duration::from_micros(1_751)],
+        ));
+        assert!(!admit_specialized_gpu_grind(
+            true,
+            &cpu,
+            incumbent,
+            specialized,
+            incumbent_time,
+            [Duration::from_micros(2_000), Duration::from_micros(1_000)],
+        ));
+
+        let wrong_1 = Ok(vec![None, Some(18), None]);
+        let wrong_2 = Ok(vec![None, Some(18), None]);
+        assert!(!admit_specialized_gpu_grind(
+            true,
+            &cpu,
+            incumbent,
+            [&wrong_1, &wrong_2],
+            incumbent_time,
+            qualifying_time,
+        ));
+        let no_match = vec![None, None];
+        let no_match_1 = Ok(no_match.clone());
+        let no_match_2 = Ok(no_match.clone());
+        assert!(!admit_specialized_gpu_grind(
+            true,
+            &no_match,
+            [&no_match_1, &no_match_2],
+            [&no_match_1, &no_match_2],
+            incumbent_time,
+            qualifying_time,
+        ));
     }
 
     /// Every FsChallenger property must hold under both transcript hashes:

@@ -110,9 +110,23 @@ pub const ENV_NO_GPU_KEEPWARM: &str = "FLOCK_NO_GPU_KEEPWARM";
 /// timed proof may use it.
 pub const ENV_NO_GPU_GRIND: &str = "FLOCK_NO_GPU_GRIND";
 
+/// Exact rollback for the register-light PCS grind shader.  The incumbent
+/// one-nonce/one-compression Metal kernel remains compiled and is the fallback
+/// unless the untimed target-side admission proves that this specialization is
+/// byte-exact and faster in both sample orders.
+pub const ENV_NO_GPU_GRIND_SPECIALIZED: &str = "FLOCK_NO_GPU_GRIND_SPECIALIZED";
+
 pub(crate) fn gpu_grind_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| match std::env::var(ENV_NO_GPU_GRIND) {
+        Ok(value) => value != "1",
+        Err(_) => true,
+    })
+}
+
+pub(crate) fn gpu_grind_specialized_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| match std::env::var(ENV_NO_GPU_GRIND_SPECIALIZED) {
         Ok(value) => value != "1",
         Err(_) => true,
     })
@@ -141,10 +155,108 @@ pub(crate) fn gpu_blake3_pow_scan(
     len: u32,
     bits: u32,
 ) -> Result<Option<u64>, String> {
+    gpu_blake3_pow_scan_mode(state_digest, start, len, bits, false)
+}
+
+/// Mode-explicit grind entry used only by the untimed A/B admission and its
+/// production latch. `specialized = false` is the exact promoted Metal kernel.
+pub(crate) fn gpu_blake3_pow_scan_mode(
+    state_digest: &[u8; 32],
+    start: u64,
+    len: u32,
+    bits: u32,
+    specialized: bool,
+) -> Result<Option<u64>, String> {
     if !gpu_grind_enabled() {
         return Err("GPU grind disabled".into());
     }
-    imp::gpu_blake3_pow_scan(state_digest, start, len, bits)
+    if specialized && !gpu_grind_specialized_enabled() {
+        return Err("specialized GPU grind disabled".into());
+    }
+    imp::gpu_blake3_pow_scan(state_digest, start, len, bits, specialized)
+}
+
+#[cfg(any(test, all(target_os = "macos", target_arch = "aarch64")))]
+#[inline]
+fn pow_special_g(
+    state: &mut [u32; 16],
+    a: usize,
+    b: usize,
+    c: usize,
+    d: usize,
+    mx: u32,
+    my: u32,
+) {
+    state[a] = state[a].wrapping_add(state[b]).wrapping_add(mx);
+    state[d] = (state[d] ^ state[a]).rotate_right(16);
+    state[c] = state[c].wrapping_add(state[d]);
+    state[b] = (state[b] ^ state[c]).rotate_right(12);
+    state[a] = state[a].wrapping_add(state[b]).wrapping_add(my);
+    state[d] = (state[d] ^ state[a]).rotate_right(8);
+    state[c] = state[c].wrapping_add(state[d]);
+    state[b] = (state[b] ^ state[c]).rotate_right(7);
+}
+
+/// Host image consumed by `blake3_pow_scan_specialized`; see the MSL layout
+/// comment beside that kernel. Everything after the first four words is
+/// invariant over the dispatch's complete nonce range.
+#[cfg(any(test, all(target_os = "macos", target_arch = "aarch64")))]
+fn pow_special_params(
+    state_digest: &[u8; 32],
+    start: u64,
+    len: u32,
+    bits: u32,
+) -> [u32; 29] {
+    debug_assert!((1..=32).contains(&bits));
+    const IV: [u32; 8] = [
+        0x6A09_E667,
+        0xBB67_AE85,
+        0x3C6E_F372,
+        0xA54F_F53A,
+        0x510E_527F,
+        0x9B05_688C,
+        0x1F83_D9AB,
+        0x5BE0_CD19,
+    ];
+    let digest_words: [u32; 8] = core::array::from_fn(|i| {
+        u32::from_le_bytes(state_digest[4 * i..4 * i + 4].try_into().unwrap())
+    });
+    let mut state = [
+        IV[0], IV[1], IV[2], IV[3], IV[4], IV[5], IV[6], IV[7], IV[0], IV[1], IV[2], IV[3], 0,
+        0, 64, 11,
+    ];
+    // Round 0 columns consume the eight fixed digest words.
+    pow_special_g(&mut state, 0, 4, 8, 12, digest_words[0], digest_words[1]);
+    pow_special_g(&mut state, 1, 5, 9, 13, digest_words[2], digest_words[3]);
+    pow_special_g(&mut state, 2, 6, 10, 14, digest_words[4], digest_words[5]);
+    pow_special_g(&mut state, 3, 7, 11, 15, digest_words[6], digest_words[7]);
+    let p05 = state[0].wrapping_add(state[5]);
+    // The other three round-0 diagonals consume only zero message words and
+    // are disjoint from the nonce diagonal (0,5,10,15).
+    pow_special_g(&mut state, 1, 6, 11, 12, 0, 0);
+    pow_special_g(&mut state, 2, 7, 8, 13, 0, 0);
+    pow_special_g(&mut state, 3, 4, 9, 14, 0, 0);
+
+    let full_bytes = bits >> 3;
+    let extra = bits & 7;
+    let mut mask = if full_bytes == 4 {
+        u32::MAX
+    } else {
+        (1u32 << (full_bytes * 8)) - 1
+    };
+    if extra != 0 {
+        mask |= ((0xffu32 << (8 - extra)) & 0xff) << (full_bytes * 8);
+    }
+
+    let mut out = [0u32; 29];
+    out[0] = start as u32;
+    out[1] = (start >> 32) as u32;
+    out[2] = len;
+    out[3] = mask;
+    out[4..12].copy_from_slice(&digest_words);
+    out[12..28].copy_from_slice(&state);
+    out[28] = p05;
+    out
 }
 
 /// Env var that disables this round's NTT pass tuning (the g4 shared-table +
@@ -1979,6 +2091,140 @@ kernel void blake3_pow_scan(
 }
 "#;
 
+    // Register-light specialization of the same exact one-block BLAKE3 hash.
+    // The host supplies the nonce-independent first-round state.  Per nonce we
+    // execute only its one round-0 G, hard-coded rounds 1..5 with zero message
+    // additions folded away, and the live dependency cone of output word 0 in
+    // the last round.  This mirrors `merkle::blake3_neon_apple::pow_scan_reg`;
+    // unlike the incumbent shader it has no message/permutation arrays and no
+    // 32-byte digest output.
+    const POW_SPECIAL_MSL_SOURCE: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+// uint layout:
+//   0..4   = start_lo, start_hi, len, predicate mask
+//   4..12  = fixed digest message words
+//   12..28 = state after round-0 columns + the three fixed diagonals
+//   28     = precomputed c[0] + c[5]
+
+#define PSG(a,b,c,d,x,y) {                                  \
+    (a) = (a) + (b) + (x); (d) = rotate((d) ^ (a), 16u);    \
+    (c) = (c) + (d);       (b) = rotate((b) ^ (c), 20u);    \
+    (a) = (a) + (b) + (y); (d) = rotate((d) ^ (a), 24u);    \
+    (c) = (c) + (d);       (b) = rotate((b) ^ (c), 25u);    \
+}
+
+#define PSG_A_ONLY(a,b,c,d,x,y) {                           \
+    (a) = (a) + (b) + (x); (d) = rotate((d) ^ (a), 16u);    \
+    (c) = (c) + (d);       (b) = rotate((b) ^ (c), 20u);    \
+    (a) = (a) + (b) + (y);                                  \
+}
+
+#define PSG_C_ONLY(a,b,c,d,x,y) {                           \
+    (a) = (a) + (b) + (x); (d) = rotate((d) ^ (a), 16u);    \
+    (c) = (c) + (d);       (b) = rotate((b) ^ (c), 20u);    \
+    (a) = (a) + (b) + (y); (d) = rotate((d) ^ (a), 24u);    \
+    (c) = (c) + (d);                                        \
+}
+
+kernel void blake3_pow_scan_specialized(
+    constant uint* p          [[buffer(0)]],
+    device atomic_uint* best  [[buffer(1)]],
+    uint id [[thread_position_in_grid]])
+{
+    if (id >= p[2] || id >= atomic_load_explicit(best, memory_order_relaxed)) return;
+
+    uint nonce_lo = p[0] + id;
+    uint nonce_hi = p[1] + (nonce_lo < p[0] ? 1u : 0u);
+    // Explicit scalars prevent an addressable thread array from surviving
+    // Metal front-end lowering and forcing register spills.
+    uint v0 = p[12], v1 = p[13], v2 = p[14], v3 = p[15];
+    uint v4 = p[16], v5 = p[17], v6 = p[18], v7 = p[19];
+    uint v8 = p[20], v9 = p[21], v10 = p[22], v11 = p[23];
+    uint v12 = p[24], v13 = p[25], v14 = p[26], v15 = p[27];
+
+    // Round 0's sole nonce-dependent diagonal G (0,5,10,15). The other
+    // seven Gs were evaluated once on the host.
+    uint a = p[28] + nonce_lo;
+    uint d = rotate(v15 ^ a, 16u);
+    uint c = v10 + d;
+    uint b = rotate(v5 ^ c, 20u);
+    a = a + b + nonce_hi;
+    d = rotate(d ^ a, 24u);
+    c = c + d;
+    b = rotate(b ^ c, 25u);
+    v0 = a; v5 = b; v10 = c; v15 = d;
+
+    // Round 1 (BLAKE3 schedule row 1).
+    PSG(v0,v4,v8,v12,   p[6],  p[10]);
+    PSG(v1,v5,v9,v13,   p[7],  0u);
+    PSG(v2,v6,v10,v14,  p[11], p[4]);
+    PSG(v3,v7,v11,v15,  p[8],  0u);
+    PSG(v0,v5,v10,v15,  p[5],  0u);
+    PSG(v1,v6,v11,v12,  0u,    p[9]);
+    PSG(v2,v7,v8,v13,   nonce_hi, 0u);
+    PSG(v3,v4,v9,v14,   0u, nonce_lo);
+
+    // Round 2 (schedule row 2).
+    PSG(v0,v4,v8,v12,   p[7],  p[8]);
+    PSG(v1,v5,v9,v13,   0u,    0u);
+    PSG(v2,v6,v10,v14,  0u,    p[6]);
+    PSG(v3,v7,v11,v15,  p[11], 0u);
+    PSG(v0,v5,v10,v15,  p[10], p[9]);
+    PSG(v1,v6,v11,v12,  nonce_hi, p[4]);
+    PSG(v2,v7,v8,v13,   0u,    0u);
+    PSG(v3,v4,v9,v14,   nonce_lo, p[5]);
+
+    // Round 3 (schedule row 3).
+    PSG(v0,v4,v8,v12,   0u,    p[11]);
+    PSG(v1,v5,v9,v13,   0u,    nonce_hi);
+    PSG(v2,v6,v10,v14,  0u,    p[7]);
+    PSG(v3,v7,v11,v15,  0u,    0u);
+    PSG(v0,v5,v10,v15,  p[8],  p[4]);
+    PSG(v1,v6,v11,v12,  0u,    p[6]);
+    PSG(v2,v7,v8,v13,   p[9],  nonce_lo);
+    PSG(v3,v4,v9,v14,   p[5],  p[10]);
+
+    // Round 4 (schedule row 4).
+    PSG(v0,v4,v8,v12,   0u,    0u);
+    PSG(v1,v5,v9,v13,   nonce_hi, 0u);
+    PSG(v2,v6,v10,v14,  0u,    0u);
+    PSG(v3,v7,v11,v15,  0u,    nonce_lo);
+    PSG(v0,v5,v10,v15,  p[11], p[6]);
+    PSG(v1,v6,v11,v12,  p[9],  p[7]);
+    PSG(v2,v7,v8,v13,   p[4],  p[5]);
+    PSG(v3,v4,v9,v14,   p[10], p[8]);
+
+    // Round 5 (schedule row 5).
+    PSG(v0,v4,v8,v12,   nonce_hi, 0u);
+    PSG(v1,v5,v9,v13,   0u,    p[9]);
+    PSG(v2,v6,v10,v14,  nonce_lo, 0u);
+    PSG(v3,v7,v11,v15,  0u,    p[5]);
+    PSG(v0,v5,v10,v15,  0u,    p[7]);
+    PSG(v1,v6,v11,v12,  p[4],  0u);
+    PSG(v2,v7,v8,v13,   p[6],  p[10]);
+    PSG(v3,v4,v9,v14,   p[8],  p[11]);
+
+    // Round 6: only output word 0 = v[0] ^ v[8] is live. All columns feed
+    // that dependency cone; two diagonals are dead and the survivors truncate.
+    PSG(v0,v4,v8,v12,   0u,    0u);
+    PSG(v1,v5,v9,v13,   p[9],  p[4]);
+    PSG(v2,v6,v10,v14,  p[5],  nonce_hi);
+    PSG(v3,v7,v11,v15,  nonce_lo, p[10]);
+    PSG_A_ONLY(v0,v5,v10,v15, 0u, 0u);
+    PSG_C_ONLY(v2,v7,v8,v13, p[7], p[8]);
+
+    if (((v0 ^ v8) & p[3]) == 0u) {
+        atomic_fetch_min_explicit(best, id, memory_order_relaxed);
+    }
+}
+
+#undef PSG
+#undef PSG_A_ONLY
+#undef PSG_C_ONLY
+"#;
+
     // -----------------------------------------------------------------------
     // Embedded precompiled metallib.
     //
@@ -2102,6 +2348,9 @@ kernel void blake3_pow_scan(
         /// Supplemental PCS Fiat--Shamir BLAKE3 nonce scanner.  Its single
         /// shared result word is protected because `Gpu` itself is global.
         pub(crate) pso_pow: Id,
+        /// Register-light specialization. This is compiled independently so a
+        /// source/compiler failure cannot disturb the promoted `pso_pow`.
+        pub(crate) pso_pow_special: Id,
         pub(crate) pow_out: Id,
         pub(crate) pow_lock: std::sync::Mutex<()>,
     }
@@ -2373,6 +2622,66 @@ kernel void blake3_pow_scan(
                 } else {
                     (NIL, NIL)
                 };
+                let pso_pow_special = if !pso_pow.is_null()
+                    && super::gpu_grind_specialized_enabled()
+                {
+                    // Compile the candidate in a separate library. The exact
+                    // promoted shader above remains usable on every failure.
+                    (|| -> Result<Id, String> {
+                        let src = api.nsstring(POW_SPECIAL_MSL_SOURCE)?;
+                        let mut err: Id = NIL;
+                        let library: Id = send!(
+                            api,
+                            unsafe extern "C" fn(Id, Sel, Id, Id, *mut Id) -> Id,
+                            device,
+                            c"newLibraryWithSource:options:error:",
+                            src,
+                            NIL,
+                            &mut err
+                        );
+                        if library.is_null() {
+                            return Err(format!(
+                                "specialized PCS grind shader compile failed: {}",
+                                api.error_string(err)
+                            ));
+                        }
+                        let ns = api.nsstring("blake3_pow_scan_specialized")?;
+                        let function: Id = send!(
+                            api,
+                            unsafe extern "C" fn(Id, Sel, Id) -> Id,
+                            library,
+                            c"newFunctionWithName:",
+                            ns
+                        );
+                        if function.is_null() {
+                            send!(api, unsafe extern "C" fn(Id, Sel) -> Id, library, c"release");
+                            return Err(
+                                "PCS grind kernel blake3_pow_scan_specialized not found".into(),
+                            );
+                        }
+                        let mut pso_err: Id = NIL;
+                        let pso: Id = send!(
+                            api,
+                            unsafe extern "C" fn(Id, Sel, Id, *mut Id) -> Id,
+                            device,
+                            c"newComputePipelineStateWithFunction:error:",
+                            function,
+                            &mut pso_err
+                        );
+                        send!(api, unsafe extern "C" fn(Id, Sel) -> Id, function, c"release");
+                        send!(api, unsafe extern "C" fn(Id, Sel) -> Id, library, c"release");
+                        if pso.is_null() {
+                            return Err(format!(
+                                "specialized PCS grind pipeline: {}",
+                                api.error_string(pso_err)
+                            ));
+                        }
+                        Ok(pso)
+                    })()
+                    .unwrap_or(NIL)
+                } else {
+                    NIL
+                };
                 Ok(Gpu {
                     api,
                     device,
@@ -2391,6 +2700,7 @@ kernel void blake3_pow_scan(
                     pso_parent,
                     pso_parent3,
                     pso_pow,
+                    pso_pow_special,
                     pow_out,
                     pow_lock: std::sync::Mutex::new(()),
                 })
@@ -5567,12 +5877,18 @@ kernel void blake3_pow_scan(
         start: u64,
         len: u32,
         bits: u32,
+        specialized: bool,
     ) -> Result<Option<u64>, String> {
         if len == 0 || !(1..=32).contains(&bits) {
             return Err(format!("invalid GPU grind block len={len} bits={bits}"));
         }
         let gpu = gpu()?;
-        if gpu.pso_pow.is_null() || gpu.pow_out.is_null() {
+        let pso = if specialized {
+            gpu.pso_pow_special
+        } else {
+            gpu.pso_pow
+        };
+        if pso.is_null() || gpu.pow_out.is_null() {
             return Err("GPU grind pipeline unavailable".into());
         }
         let _guard = gpu
@@ -5584,17 +5900,32 @@ kernel void blake3_pow_scan(
             let result = (|| -> Result<Option<u64>, String> {
                 let out = gpu.buffer_contents(gpu.pow_out).cast::<u32>();
                 out.write_volatile(u32::MAX);
-                let params = [start as u32, (start >> 32) as u32, len, bits];
-                let params_bytes = core::slice::from_raw_parts(
-                    params.as_ptr().cast::<u8>(),
-                    core::mem::size_of_val(&params),
-                );
                 let cb = gpu.command_buffer()?;
                 let enc = gpu.compute_encoder(cb)?;
-                gpu.set_pipeline(enc, gpu.pso_pow);
-                gpu.set_bytes(enc, state_digest, 0);
+                gpu.set_pipeline(enc, pso);
+                let incumbent_params;
+                let special_params;
+                let params_bytes = if specialized {
+                    special_params = super::pow_special_params(state_digest, start, len, bits);
+                    core::slice::from_raw_parts(
+                        special_params.as_ptr().cast::<u8>(),
+                        core::mem::size_of_val(&special_params),
+                    )
+                } else {
+                    incumbent_params = [start as u32, (start >> 32) as u32, len, bits];
+                    gpu.set_bytes(enc, state_digest, 0);
+                    core::slice::from_raw_parts(
+                        incumbent_params.as_ptr().cast::<u8>(),
+                        core::mem::size_of_val(&incumbent_params),
+                    )
+                };
+                if specialized {
+                    gpu.set_bytes(enc, params_bytes, 0);
+                }
                 gpu.set_buffer(enc, gpu.pow_out, 0, 1);
-                gpu.set_bytes(enc, params_bytes, 2);
+                if !specialized {
+                    gpu.set_bytes(enc, params_bytes, 2);
+                }
                 // A 64-thread group keeps useful SIMD occupancy without
                 // assuming this register-heavy BLAKE3 pipeline admits a
                 // 256-thread group on every measured worker.
@@ -6519,6 +6850,7 @@ mod imp {
         _start: u64,
         _len: u32,
         _bits: u32,
+        _specialized: bool,
     ) -> Result<Option<u64>, String> {
         Err("GPU grind is only available on macOS/aarch64".into())
     }
@@ -6698,6 +7030,129 @@ mod tests {
         }
     }
 
+    /// Rust transcription of the register-light MSL dependency graph. This is
+    /// deliberately scalar: it validates the host precompute, hard-coded
+    /// message schedule, zero operands, and last-round truncation against the
+    /// authoritative `blake3::hash` implementation on every development host.
+    fn pow_specialized_word0(digest: &[u8; 32], nonce: u64) -> u32 {
+        let p = pow_special_params(digest, nonce, 1, 32);
+        let nonce_lo = nonce as u32;
+        let nonce_hi = (nonce >> 32) as u32;
+        let mut v: [u32; 16] = p[12..28].try_into().unwrap();
+
+        let mut a = p[28].wrapping_add(nonce_lo);
+        let mut d = (v[15] ^ a).rotate_right(16);
+        let mut c = v[10].wrapping_add(d);
+        let mut b = (v[5] ^ c).rotate_right(12);
+        a = a.wrapping_add(b).wrapping_add(nonce_hi);
+        d = (d ^ a).rotate_right(8);
+        c = c.wrapping_add(d);
+        b = (b ^ c).rotate_right(7);
+        v[0] = a;
+        v[5] = b;
+        v[10] = c;
+        v[15] = d;
+
+        // Rounds 1..5, matching the literal operands in the MSL source.
+        for &(a, b, c, d, x, y) in &[
+            (0, 4, 8, 12, p[6], p[10]),
+            (1, 5, 9, 13, p[7], 0),
+            (2, 6, 10, 14, p[11], p[4]),
+            (3, 7, 11, 15, p[8], 0),
+            (0, 5, 10, 15, p[5], 0),
+            (1, 6, 11, 12, 0, p[9]),
+            (2, 7, 8, 13, nonce_hi, 0),
+            (3, 4, 9, 14, 0, nonce_lo),
+            (0, 4, 8, 12, p[7], p[8]),
+            (1, 5, 9, 13, 0, 0),
+            (2, 6, 10, 14, 0, p[6]),
+            (3, 7, 11, 15, p[11], 0),
+            (0, 5, 10, 15, p[10], p[9]),
+            (1, 6, 11, 12, nonce_hi, p[4]),
+            (2, 7, 8, 13, 0, 0),
+            (3, 4, 9, 14, nonce_lo, p[5]),
+            (0, 4, 8, 12, 0, p[11]),
+            (1, 5, 9, 13, 0, nonce_hi),
+            (2, 6, 10, 14, 0, p[7]),
+            (3, 7, 11, 15, 0, 0),
+            (0, 5, 10, 15, p[8], p[4]),
+            (1, 6, 11, 12, 0, p[6]),
+            (2, 7, 8, 13, p[9], nonce_lo),
+            (3, 4, 9, 14, p[5], p[10]),
+            (0, 4, 8, 12, 0, 0),
+            (1, 5, 9, 13, nonce_hi, 0),
+            (2, 6, 10, 14, 0, 0),
+            (3, 7, 11, 15, 0, nonce_lo),
+            (0, 5, 10, 15, p[11], p[6]),
+            (1, 6, 11, 12, p[9], p[7]),
+            (2, 7, 8, 13, p[4], p[5]),
+            (3, 4, 9, 14, p[10], p[8]),
+            (0, 4, 8, 12, nonce_hi, 0),
+            (1, 5, 9, 13, 0, p[9]),
+            (2, 6, 10, 14, nonce_lo, 0),
+            (3, 7, 11, 15, 0, p[5]),
+            (0, 5, 10, 15, 0, p[7]),
+            (1, 6, 11, 12, p[4], 0),
+            (2, 7, 8, 13, p[6], p[10]),
+            (3, 4, 9, 14, p[8], p[11]),
+        ] {
+            pow_special_g(&mut v, a, b, c, d, x, y);
+        }
+
+        // Last-round columns.
+        pow_special_g(&mut v, 0, 4, 8, 12, 0, 0);
+        pow_special_g(&mut v, 1, 5, 9, 13, p[9], p[4]);
+        pow_special_g(&mut v, 2, 6, 10, 14, p[5], nonce_hi);
+        pow_special_g(&mut v, 3, 7, 11, 15, nonce_lo, p[10]);
+
+        // Diagonal (0,5,10,15), with only `v[0]` live.
+        v[0] = v[0].wrapping_add(v[5]);
+        v[15] = (v[15] ^ v[0]).rotate_right(16);
+        v[10] = v[10].wrapping_add(v[15]);
+        v[5] = (v[5] ^ v[10]).rotate_right(12);
+        v[0] = v[0].wrapping_add(v[5]);
+
+        // Diagonal (2,7,8,13), with only `v[8]` live.
+        v[2] = v[2].wrapping_add(v[7]).wrapping_add(p[7]);
+        v[13] = (v[13] ^ v[2]).rotate_right(16);
+        v[8] = v[8].wrapping_add(v[13]);
+        v[7] = (v[7] ^ v[8]).rotate_right(12);
+        v[2] = v[2].wrapping_add(v[7]).wrapping_add(p[8]);
+        v[13] = (v[13] ^ v[2]).rotate_right(8);
+        v[8] = v[8].wrapping_add(v[13]);
+        v[0] ^ v[8]
+    }
+
+    #[test]
+    fn pow_specialized_schedule_matches_blake3_word0() {
+        for case in 0u64..64 {
+            let digest = core::array::from_fn(|i| {
+                (case as u8)
+                    .wrapping_mul(29)
+                    .wrapping_add((i as u8).wrapping_mul(37))
+                    .wrapping_add(11)
+            });
+            for nonce in [
+                case,
+                case.wrapping_mul(0x9e37_79b9_7f4a_7c15),
+                u64::from(u32::MAX).wrapping_sub(case),
+                u64::from(u32::MAX).wrapping_add(case + 1),
+            ] {
+                let mut preimage = [0u8; 64];
+                preimage[..32].copy_from_slice(&digest);
+                preimage[32..40].copy_from_slice(&nonce.to_le_bytes());
+                let expected = u32::from_le_bytes(
+                    blake3::hash(&preimage).as_bytes()[..4].try_into().unwrap(),
+                );
+                assert_eq!(
+                    pow_specialized_word0(&digest, nonce),
+                    expected,
+                    "case={case} nonce={nonce}"
+                );
+            }
+        }
+    }
+
     #[test]
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     fn gpu_pow_scan_matches_blake3_and_crosses_u32_nonce_boundary() {
@@ -6729,6 +7184,16 @@ mod tests {
                 None => return,
             };
             assert_eq!(got, expected, "start={start} len={len} bits={bits}");
+            let specialized = match gpu_or_skip(gpu_blake3_pow_scan_mode(
+                &digest, start, len, bits, true,
+            )) {
+                Some(result) => result,
+                None => return,
+            };
+            assert_eq!(
+                specialized, expected,
+                "specialized start={start} len={len} bits={bits}"
+            );
         }
     }
 
