@@ -239,6 +239,55 @@ fn use_ranked_zero_root_fusion(
     use_ranked_deep_pair_fusion(log_d, num_ntts, start_layer, n_top)
 }
 
+/// Select the dependency-aware scheduler only for the ranked hybrid suffix.
+///
+/// The GPU has already completed layers 0..4 and owns the prefix. The narrow
+/// wavefront retains the incumbent layers-4..6 barrier, then advances each
+/// independent 8 MiB layer-7 child through the middle radix-8 group and its
+/// eight 1 MiB deep descendants. Keep the shape gate pure so its production
+/// scope is directly testable; the wrapper below adds an exact same-binary
+/// opt-out that falls through to the literal incumbent driver.
+#[inline]
+fn select_ranked_hybrid_middle_deep_wavefront(
+    log_d: usize,
+    num_ntts: usize,
+    start_layer: usize,
+    stop_layer: usize,
+    b_start: usize,
+    b_end: usize,
+) -> bool {
+    cfg!(all(
+        target_os = "macos",
+        target_arch = "aarch64",
+        target_feature = "aes"
+    )) && log_d == 20
+        && num_ntts == 64
+        && start_layer == 4
+        && stop_layer == 20
+        && b_start > 0
+        && b_start < b_end
+        && b_end == 16
+}
+
+#[inline]
+fn use_ranked_hybrid_middle_deep_wavefront(
+    log_d: usize,
+    num_ntts: usize,
+    start_layer: usize,
+    stop_layer: usize,
+    b_start: usize,
+    b_end: usize,
+) -> bool {
+    select_ranked_hybrid_middle_deep_wavefront(
+        log_d,
+        num_ntts,
+        start_layer,
+        stop_layer,
+        b_start,
+        b_end,
+    ) && std::env::var_os("FLOCK_NO_NTT_MIDDLE_DEEP_WAVEFRONT").is_none()
+}
+
 /// The three ranked radix-8 passes share fixed one-MiB row tiles with the
 /// efficiency-core pool. Layer 1 has only two outer blocks, but flattening
 /// `(block, row-tile)` still exposes the same 1024 claims as layers 4 and 7.
@@ -824,6 +873,27 @@ impl AdditiveNttF128 {
         assert_eq!(stop_layer, log_d, "ranked hybrid suffix completes the NTT");
         assert!(b_start < b_end && b_end <= (1usize << start_layer));
 
+        if use_ranked_hybrid_middle_deep_wavefront(
+            log_d,
+            num_ntts,
+            start_layer,
+            stop_layer,
+            b_start,
+            b_end,
+        ) {
+            self.forward_transform_interleaved_middle_deep_wavefront_and_then(
+                data,
+                num_ntts,
+                start_layer,
+                DEEP_LAYER,
+                log_d,
+                b_start,
+                b_end,
+                &finish_chunk,
+            );
+            return;
+        }
+
         // Two fused radix-8 passes.  Unlike the old all-layer range driver,
         // this is the last streaming traversal of the complete suffix.
         self.forward_transform_interleaved_block_range(
@@ -849,6 +919,130 @@ impl AdditiveNttF128 {
             sub_end,
             &finish_chunk,
         );
+    }
+
+    /// Preserve the first broad suffix pass, then advance each independent
+    /// layer-`start_layer + 3` child through the second radix-8 group and its
+    /// cache-local deep tail as soon as that child's dependencies are ready.
+    ///
+    /// The literal incumbent range driver performs layers `start_layer..7`
+    /// first. This keeps the broad phase that lets the concurrently-running AB
+    /// branch make stable progress. The second half exposes forty uniform
+    /// 8 MiB children at ranked k=5 instead of five 64 MiB outer regions. Each
+    /// child runs its radix-8 rows serially (retaining the seven twiddles in
+    /// registers) and then publishes eight nested 1 MiB deep jobs. There are
+    /// no channels or dependency counters, and every mutable slice is disjoint.
+    fn forward_transform_interleaved_middle_deep_wavefront_and_then<F>(
+        &self,
+        data: &mut [F128],
+        num_ntts: usize,
+        start_layer: usize,
+        deep_layer: usize,
+        log_d: usize,
+        b_start: usize,
+        b_end: usize,
+        finish_chunk: &F,
+    ) where
+        F: Fn(usize, &[F128]) + Sync + Send,
+    {
+        use rayon::prelude::*;
+
+        const FUSED_LAYERS: usize = 3;
+        let middle_layer = start_layer + FUSED_LAYERS;
+        debug_assert_eq!(deep_layer, middle_layer + FUSED_LAYERS);
+        debug_assert!(deep_layer <= log_d);
+        debug_assert_eq!(data.len(), (1usize << log_d) * num_ntts);
+        debug_assert!(b_start < b_end && b_end <= (1usize << start_layer));
+
+        let middle_blocks_per_region = 1usize << FUSED_LAYERS;
+        let middle_block_positions = 1usize << (log_d - middle_layer);
+        let middle_block_elems = middle_block_positions * num_ntts;
+        let deep_blocks_per_middle = 1usize << (deep_layer - middle_layer);
+        let deep_positions = 1usize << (log_d - deep_layer);
+        let deep_elems = deep_positions * num_ntts;
+
+        // Deliberately retain the exact e763 first-pass driver and its barrier.
+        // The retired all-region wavefront moved this pass behind five nested
+        // 64 MiB region roots and delayed the sibling AB branch by 25--30 ms.
+        self.forward_transform_interleaved_block_range(
+            data,
+            num_ntts,
+            start_layer,
+            middle_layer,
+            b_start,
+            b_end,
+        );
+
+        let fused3_twiddles = |layer: usize, block: usize| {
+            let mut tw = [F128 { lo: 0, hi: 0 }; 7];
+            tw[0] = self.twiddle(layer, block);
+            for s in 0..2 {
+                tw[1 + s] = self.twiddle(layer + 1, 2 * block + s);
+            }
+            for s in 0..4 {
+                tw[3 + s] = self.twiddle(layer + 2, 4 * block + s);
+            }
+            tw
+        };
+        let mut middle_twiddles = Vec::with_capacity((b_end - b_start) * middle_blocks_per_region);
+        for region in b_start..b_end {
+            for child in 0..middle_blocks_per_region {
+                middle_twiddles.push(fused3_twiddles(
+                    middle_layer,
+                    region * middle_blocks_per_region + child,
+                ));
+            }
+        }
+
+        let low_twiddle_final_pair = use_ranked_low_twiddle_final_pair(log_d, num_ntts, deep_layer);
+        let middle_start = b_start * middle_blocks_per_region;
+        let middle_end = b_end * middle_blocks_per_region;
+        let range_start = middle_start * middle_block_elems;
+        let range_end = middle_end * middle_block_elems;
+        data[range_start..range_end]
+            .par_chunks_mut(middle_block_elems)
+            .enumerate()
+            .zip(middle_twiddles.par_iter())
+            .for_each(|((local_middle, middle_data), twiddles)| {
+                // One 8 MiB middle child is a single outer job. Avoid another
+                // row-level Rayon region: the forty ranked children provide
+                // four balanced claims per P-core worker at k=5, and the range
+                // kernel keeps all seven twiddles resident across its rows.
+                let eighth = middle_block_positions >> FUSED_LAYERS;
+                // SAFETY: `middle_data` is exactly one eight-way block;
+                // `0..eighth` partitions all of its row groups, and sibling
+                // outer jobs own disjoint blocks.
+                unsafe {
+                    kernels::butterfly_fused_3layer_rows(
+                        middle_data.as_mut_ptr(),
+                        eighth,
+                        num_ntts,
+                        0,
+                        eighth,
+                        twiddles,
+                    );
+                }
+
+                // This child's eight layer-deep descendants are independent.
+                // Retain 1 MiB granularity for the longer deep+leaf work so AB
+                // and sibling children can still steal around a slow worker.
+                let absolute_middle = middle_start + local_middle;
+                let deep_start = absolute_middle * deep_blocks_per_middle;
+                middle_data.par_chunks_mut(deep_elems).enumerate().for_each(
+                    |(local_deep, deep_data)| {
+                        let deep_idx = deep_start + local_deep;
+                        self.forward_transform_interleaved_wavefront_deep_fused_pairs_one(
+                            deep_data,
+                            num_ntts,
+                            deep_layer,
+                            log_d,
+                            deep_idx,
+                            low_twiddle_final_pair,
+                        );
+                        finish_chunk(deep_idx * deep_elems, deep_data);
+                    },
+                );
+            });
     }
 
     /// Finish the ranked L0 transform's five cache-local deep pairs and invoke
@@ -1284,6 +1478,84 @@ impl AdditiveNttF128 {
             1usize << n_top,
             finish_chunk,
         );
+    }
+
+    /// Transform one absolute layer-`n_top` subtree through the exact fused
+    /// deep-pair kernel sequence used by the incumbent range driver.
+    #[inline]
+    fn forward_transform_interleaved_wavefront_deep_fused_pairs_one(
+        &self,
+        sub_data: &mut [F128],
+        num_ntts: usize,
+        n_top: usize,
+        log_d: usize,
+        sub_idx: usize,
+        low_twiddle_final_pair: bool,
+    ) {
+        let sub_size_positions = 1usize << (log_d - n_top);
+        debug_assert_eq!(sub_data.len(), sub_size_positions * num_ntts);
+
+        let mut layer = n_top;
+        while layer + 1 < log_d {
+            let layer_in_sub = layer - n_top;
+            let num_blocks_in_sub = 1usize << layer_in_sub;
+            let block_size_positions = 1usize << (log_d - layer);
+            let quarter = block_size_positions >> 2;
+            let block_elems = block_size_positions * num_ntts;
+
+            for block_in_sub in 0..num_blocks_in_sub {
+                let global_block = sub_idx * num_blocks_in_sub + block_in_sub;
+                let t_outer = self.twiddle(layer, global_block);
+                let t_inner_a = self.twiddle(layer + 1, 2 * global_block);
+                let t_inner_b = self.twiddle(layer + 1, 2 * global_block + 1);
+                let block_start = block_in_sub * block_elems;
+                if low_twiddle_final_pair && layer + 2 == log_d {
+                    debug_assert_eq!(t_outer.hi, 0);
+                    debug_assert_eq!(t_inner_a.hi, 0);
+                    debug_assert_eq!(t_inner_b.hi, 0);
+                    butterfly_interleaved_fused_2layer_low_twiddles_rows_seq(
+                        &mut sub_data[block_start..block_start + block_elems],
+                        t_outer,
+                        t_inner_a,
+                        t_inner_b,
+                        quarter,
+                        num_ntts,
+                    );
+                } else {
+                    butterfly_interleaved_fused_2layer_rows_seq(
+                        &mut sub_data[block_start..block_start + block_elems],
+                        t_outer,
+                        t_inner_a,
+                        t_inner_b,
+                        quarter,
+                        num_ntts,
+                    );
+                }
+            }
+            layer += 2;
+        }
+
+        // The ranked path has ten deep layers and therefore no tail. Retain
+        // the scalar single-layer tail so reduced exact-test shapes can cover
+        // odd deep-layer counts as well.
+        if layer < log_d {
+            let layer_in_sub = layer - n_top;
+            let num_blocks_in_sub = 1usize << layer_in_sub;
+            let block_size_positions = 1usize << (log_d - layer);
+            let block_size_half = block_size_positions >> 1;
+            let block_elems = block_size_positions * num_ntts;
+            for block_in_sub in 0..num_blocks_in_sub {
+                let global_block = sub_idx * num_blocks_in_sub + block_in_sub;
+                let twiddle = self.twiddle(layer, global_block);
+                let block_start = block_in_sub * block_elems;
+                butterfly_interleaved_block(
+                    &mut sub_data[block_start..block_start + block_elems],
+                    twiddle,
+                    block_size_half,
+                    num_ntts,
+                );
+            }
+        }
     }
 
     /// Range form of the ranked deep-pair scheduler. `sub_start..sub_end` are
@@ -2301,11 +2573,12 @@ mod tests {
         assert!(observed.1.iter().all(|&count| count == 1));
     }
 
-    /// Only the ranked macOS/AArch64 L0 transform may use the new tail
-    /// schedule; all recursive, diagnostic, and cross-platform shapes retain
-    /// the existing single-layer deep loop.
+    /// Only the exact ranked macOS/AArch64 shapes may use the specialized deep
+    /// pair, heterogeneous top, and hybrid middle/deep wavefront schedules.
+    /// Recursive, diagnostic, cross-platform, and non-suffix range shapes keep
+    /// their incumbent drivers.
     #[test]
-    fn ranked_deep_pair_fusion_gate_is_narrow() {
+    fn ranked_specialized_schedule_gates_are_narrow() {
         let enabled_here = cfg!(all(
             target_os = "macos",
             target_arch = "aarch64",
@@ -2333,6 +2606,29 @@ mod tests {
         assert!(!is_ranked_top_hetero_fused3_pass(20, 8, 1, 10, 4));
         assert!(!is_ranked_top_hetero_fused3_pass(20, 64, 0, 10, 4));
         assert!(!is_ranked_top_hetero_fused3_pass(20, 64, 1, 9, 4));
+
+        assert_eq!(
+            select_ranked_hybrid_middle_deep_wavefront(20, 64, 4, 20, 11, 16),
+            enabled_here
+        );
+        assert!(!select_ranked_hybrid_middle_deep_wavefront(
+            19, 64, 4, 20, 11, 16
+        ));
+        assert!(!select_ranked_hybrid_middle_deep_wavefront(
+            20, 8, 4, 20, 11, 16
+        ));
+        assert!(!select_ranked_hybrid_middle_deep_wavefront(
+            20, 64, 1, 20, 11, 16
+        ));
+        assert!(!select_ranked_hybrid_middle_deep_wavefront(
+            20, 64, 4, 19, 11, 16
+        ));
+        assert!(!select_ranked_hybrid_middle_deep_wavefront(
+            20, 64, 4, 20, 0, 16
+        ));
+        assert!(!select_ranked_hybrid_middle_deep_wavefront(
+            20, 64, 4, 20, 11, 15
+        ));
     }
 
     /// Exercise the block-zero specialization and the ordinary nonzero-block
@@ -3025,5 +3321,80 @@ mod block_range_equivalence {
         let expected_offsets: Vec<usize> =
             (sub_start..sub_end).map(|sub| sub * sub_elems).collect();
         assert_eq!(got_offsets, expected_offsets, "callback coverage/offsets diverge");
+    }
+
+    #[test]
+    fn middle_deep_wavefront_matches_control_and_completes_in_small_pools() {
+        // Reduced analogue of the ranked suffix: retain the first radix-8
+        // barrier, then advance each middle child and its eight deep chunks.
+        // A one-thread pool exercises nested Rayon liveness; two- and
+        // ten-thread pools exercise stealing between children and deep jobs.
+        const LOG_D: usize = 14;
+        const NUM_NTTS: usize = 4;
+        const START_LAYER: usize = 2;
+        const DEEP_LAYER: usize = 8;
+        const B_START: usize = 1;
+        const B_END: usize = 4;
+
+        let ntt = AdditiveNttF128::standard(LOG_D);
+        let mut state = 0xbb67_ae85_84ca_a73bu64;
+        let mut next = move || {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            state
+        };
+        let source: Vec<F128> = (0..(1usize << LOG_D) * NUM_NTTS)
+            .map(|_| F128::new(next(), next()))
+            .collect();
+
+        let mut control = source.clone();
+        ntt.forward_transform_interleaved_block_range(
+            &mut control,
+            NUM_NTTS,
+            START_LAYER,
+            LOG_D,
+            B_START,
+            B_END,
+        );
+
+        let deep_elems = (1usize << (LOG_D - DEEP_LAYER)) * NUM_NTTS;
+        let deep_start = B_START << (DEEP_LAYER - START_LAYER);
+        let deep_end = B_END << (DEEP_LAYER - START_LAYER);
+        let expected_offsets: Vec<usize> =
+            (deep_start..deep_end).map(|deep| deep * deep_elems).collect();
+
+        for threads in [1usize, 2, 10] {
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .unwrap();
+            let offsets = std::sync::Mutex::new(Vec::new());
+            let mut wavefront = source.clone();
+            pool.install(|| {
+                ntt.forward_transform_interleaved_middle_deep_wavefront_and_then(
+                    &mut wavefront,
+                    NUM_NTTS,
+                    START_LAYER,
+                    DEEP_LAYER,
+                    LOG_D,
+                    B_START,
+                    B_END,
+                    &|elem_offset, chunk| {
+                        assert_eq!(elem_offset % deep_elems, 0);
+                        assert_eq!(chunk, &control[elem_offset..elem_offset + deep_elems]);
+                        offsets.lock().unwrap().push(elem_offset);
+                    },
+                );
+            });
+
+            assert_eq!(wavefront, control, "wavefront mismatch with {threads} workers");
+            let mut got_offsets = offsets.into_inner().unwrap();
+            got_offsets.sort_unstable();
+            assert_eq!(
+                got_offsets, expected_offsets,
+                "callback coverage mismatch with {threads} workers"
+            );
+        }
     }
 }
