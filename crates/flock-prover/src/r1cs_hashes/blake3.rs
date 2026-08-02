@@ -2098,6 +2098,20 @@ pub(crate) mod witgen_simd {
         }
     }
 
+    /// Band-major group scheduling identical to
+    /// `common::ranked_stream_group_index` (Metal from-`z` readiness bands).
+    #[inline(always)]
+    fn stream_group_index(
+        job: usize,
+        band: usize,
+        groups_per_segment: usize,
+        groups_per_band: usize,
+    ) -> usize {
+        let segment = job / groups_per_band;
+        let local = job % groups_per_band;
+        segment * groups_per_segment + band * groups_per_band + local
+    }
+
     /// SIMD counterpart of `drive_witness_packed_and_lincheck_impl`
     /// (PER_BLOCK_FULLY_WRITES, no rate-2 codeword): same scratch pools, same
     /// process_group shape, same optional Metal band streaming, same stripe
@@ -2259,50 +2273,27 @@ pub(crate) mod witgen_simd {
             .then(flock_core::epool::helper_chunks_claimed);
         if let Some(stream) = &mut stream {
             const SEGMENTS: usize = 8;
+            const BANDS: usize = 8;
             let groups_per_segment = n_groups / SEGMENTS;
+            let groups_per_band = groups_per_segment / BANDS;
+            let r_total = 1usize << 16;
+            let r_per_band = r_total / BANDS;
             debug_assert_eq!(groups_per_segment, 4096);
-            // Band schedule in groups-per-segment units (each unit maps to 16
-            // streamed r tiles across all 8 segments). The GPU consumes the
-            // first NTT pass at witness-production pace with zero inter-band
-            // gaps, so the window's head segment ends at (last submit) +
-            // (final band's GPU slice). Tapering the trailing bands shrinks
-            // that final slice from 1/8 of the pass to 1/256 of it, pulling
-            // the whole downstream GPU chain earlier by the difference. The
-            // uniform 8-band control remains selectable for exact same-binary
-            // A/B (`FLOCK_NO_STREAM_TAPER=1`).
-            // Tail band of 64 gps keeps 8 hetero slabs (WITGEN_HETERO_SLAB =
-            // 64 jobs) so its drain still parallelizes across the pool.
-            const UNIFORM_SCHEDULE: &[usize] = &[512; 8];
-            const TAPERED_SCHEDULE: &[usize] = &[512, 512, 512, 512, 512, 512, 512, 448, 64];
-            // A/B-CONTROL: set to `false` for the official-harness control
-            // build. The env kill switch exists for same-binary diagnostics.
-            const STREAM_TAPER_DEFAULT: bool = true;
-            let tapered = STREAM_TAPER_DEFAULT
-                && std::env::var_os("FLOCK_NO_STREAM_TAPER").is_none();
-            let schedule = if tapered {
-                TAPERED_SCHEDULE
-            } else {
-                UNIFORM_SCHEDULE
-            };
-            debug_assert_eq!(schedule.iter().sum::<usize>(), groups_per_segment);
-            let mut offset = 0usize;
-            for &band_gps in schedule {
+            debug_assert_eq!(groups_per_band, 512);
+            for band in 0..BANDS {
                 // W-H1: the band's jobs drain through the same slab shim as
                 // the generic driver (a slab never straddles a segment).
                 let band_job = |job: usize| {
-                    let segment = job / band_gps;
-                    let local = job % band_gps;
-                    let g = segment * groups_per_segment + offset + local;
+                    let g = stream_group_index(job, band, groups_per_segment, groups_per_band);
                     process_group(g);
                 };
-                super::super::common::drain_group_jobs(SEGMENTS * band_gps, &band_job);
+                super::super::common::drain_group_jobs(SEGMENTS * groups_per_band, &band_job);
                 // The queue/Rayon join above publishes every CPU write in
                 // this band; command-buffer submission then makes those
                 // shared-memory pages visible to Metal before it starts the
                 // range.
                 std::sync::atomic::fence(std::sync::atomic::Ordering::Release);
-                stream.submit_ready_range(offset * 16, band_gps * 16);
-                offset += band_gps;
+                stream.submit_ready_range(band * r_per_band, r_per_band);
             }
         } else {
             super::super::common::drain_group_jobs(n_groups, &process_group);
