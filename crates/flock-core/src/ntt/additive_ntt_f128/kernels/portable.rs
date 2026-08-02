@@ -10,6 +10,47 @@ pub(super) fn butterfly_row_pair(top: &mut [F128], bot: &mut [F128], twiddle: F1
     }
 }
 
+/// Degenerate fused pair for lanes where `b` and `d` are identically zero.
+///
+/// Reference semantics for the ranked final-pair tail skip. Substituting
+/// `xb = xd = 0` into [`butterfly_fused_2layer`] collapses its body: three of
+/// the four multiplies acquire a zero operand, and both inner-layer results
+/// become copies of their outer-layer partners.
+///
+/// ```text
+/// nb  = 0 + 0·t_outer   = 0            xb, xd stay zero through layer L
+/// na2 = xa + 0·t_inner_a = xa          so b receives a's value
+/// nc2 = xc + 0·t_inner_b = xc          and d receives c's value
+/// ```
+///
+/// leaving `na = xa + xc·t_outer`, `nc = xc + na`, `a = b = na`, `c = d = nc`.
+/// The identity is ring-general: it uses only `0·t = 0` and `x + 0 = x`.
+///
+/// On AArch64 the dispatcher always selects the NEON kernel, so this body is
+/// reachable only from the differential test that uses it as an independent
+/// scalar oracle. It is retained as the portable fallback for other targets.
+#[cfg_attr(
+    all(target_arch = "aarch64", target_feature = "aes"),
+    allow(dead_code)
+)]
+#[inline]
+pub(super) fn butterfly_fused_2layer_low_twiddles_zero_bd(
+    a: &mut [F128],
+    b: &mut [F128],
+    c: &mut [F128],
+    d: &mut [F128],
+    t_outer: F128,
+) {
+    for lane in 0..a.len() {
+        let na = a[lane] + c[lane] * t_outer;
+        let nc = c[lane] + na;
+        a[lane] = na;
+        b[lane] = na;
+        c[lane] = nc;
+        d[lane] = nc;
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 #[inline]
 pub(super) fn butterfly_fused_2layer(

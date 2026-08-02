@@ -10480,3 +10480,7 @@ mod tests {
 // RealAdii sample 1 on 88aff39.
 // RealAdii sample 1 on 281206e.
 // RealAdii sample 2 on 281206e.
+// Echo-Merlini sample 2 of the TOP3+FINAL_PAIR stack on 74769bd.
+// Stack sample 1 = 14daca83: 1,417,377.57 (-0.12% of bar, best of this account).
+// Final-pair alone (n=2): 1,416,057.57 / 1,414,187.24, mean 1,415,122.41.
+// Mechanism bytes unchanged; this comment only clears content dedup.
