@@ -43,16 +43,6 @@ static PINNED_F128: Mutex<Option<PinnedF128>> = Mutex::new(None);
 static PINNED_F128_ADDR: AtomicUsize = AtomicUsize::new(0);
 static PINNED_F128_LEN: AtomicUsize = AtomicUsize::new(0);
 
-/// Second, independent pinned slot with the same semantics, registered once
-/// by the recursive-Merkle GPU offload for the L1 matrix class (its no-copy
-/// Metal view must keep naming one process-lifetime address so the timed
-/// prove never re-pays wrap creation or page wiring). Deliberately a
-/// duplicate rather than a generalization: the promoted z-pin lifecycle
-/// above stays byte-for-byte untouched.
-static PINNED2_F128: Mutex<Option<PinnedF128>> = Mutex::new(None);
-static PINNED2_F128_ADDR: AtomicUsize = AtomicUsize::new(0);
-static PINNED2_F128_LEN: AtomicUsize = AtomicUsize::new(0);
-
 /// Max buffers retained. The m=29 prove cycle gives ~18 distinct buffers:
 /// witness z/a/b, the L0 codeword, zerocheck's 2 fold outputs + 2 ping-pong
 /// halves, ring-switch's per-claim rs_eq_ind vectors, b_combined, and
@@ -80,9 +70,6 @@ pub fn take_f128(n: usize) -> Vec<F128> {
     if let Some(v) = try_take_pinned_f128(n) {
         return v;
     }
-    if let Some(v) = try_take_pinned2_f128(n) {
-        return v;
-    }
     if let Some(v) = try_take_f128(n) {
         return v;
     }
@@ -106,50 +93,6 @@ fn try_take_pinned_f128(n: usize) -> Option<Vec<F128>> {
     // callers retain the ordinary write-before-read contract of take_f128.
     unsafe { v.set_len(n) };
     Some(v)
-}
-
-fn try_take_pinned2_f128(n: usize) -> Option<Vec<F128>> {
-    if PINNED2_F128_LEN.load(Ordering::Acquire) != n {
-        return None;
-    }
-    let mut slot = PINNED2_F128.lock().unwrap();
-    let pinned = slot.as_mut()?;
-    if pinned.len != n {
-        return None;
-    }
-    let mut v = pinned.buffer.take()?;
-    debug_assert_eq!(v.as_ptr() as usize, pinned.addr);
-    debug_assert!(v.capacity() >= n);
-    v.clear();
-    // SAFETY: the registered allocation has capacity >= n and F128 is Copy;
-    // callers retain the ordinary write-before-read contract of take_f128.
-    unsafe { v.set_len(n) };
-    Some(v)
-}
-
-/// [`pin_f128_allocation`] for the second slot. Registered once per process
-/// (the recursive-Merkle offload's init); there is no unpin — the Metal view
-/// lives for the process.
-pub(crate) fn pin2_f128_allocation(buffer: &[F128]) -> bool {
-    if buffer.is_empty() {
-        return false;
-    }
-    let addr = buffer.as_ptr() as usize;
-    let len = buffer.len();
-    let mut slot = PINNED2_F128.lock().unwrap();
-    match slot.as_ref() {
-        Some(pinned) => pinned.addr == addr && pinned.len == len,
-        None => {
-            *slot = Some(PinnedF128 {
-                addr,
-                len,
-                buffer: None,
-            });
-            PINNED2_F128_ADDR.store(addr, Ordering::Release);
-            PINNED2_F128_LEN.store(len, Ordering::Release);
-            true
-        }
-    }
 }
 
 /// Quarantine the allocation behind `buffer` once it next returns through
@@ -241,17 +184,6 @@ pub fn give_f128(v: Vec<F128>) {
     let addr = v.as_ptr() as usize;
     if PINNED_F128_ADDR.load(Ordering::Acquire) == addr {
         let mut slot = PINNED_F128.lock().unwrap();
-        if let Some(pinned) = slot.as_mut()
-            && pinned.addr == addr
-            && v.capacity() >= pinned.len
-            && pinned.buffer.is_none()
-        {
-            pinned.buffer = Some(v);
-            return;
-        }
-    }
-    if PINNED2_F128_ADDR.load(Ordering::Acquire) == addr {
-        let mut slot = PINNED2_F128.lock().unwrap();
         if let Some(pinned) = slot.as_mut()
             && pinned.addr == addr
             && v.capacity() >= pinned.len
