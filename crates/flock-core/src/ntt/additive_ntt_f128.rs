@@ -210,6 +210,29 @@ fn use_ranked_deep_pair_fusion(
         && n_top == 10
 }
 
+/// Whether to fuse the recursive Ligerito commits' deep tail layers in
+/// pairs. The recursive from-message fused-3 pass writes layers
+/// `start_layer..start_layer+3` straight from the message into stale
+/// codeword storage; the remainder (`start_layer+3..log_d`) is the timed
+/// CPU NTT tail, processed per cache-resident 2 MiB sub-NTT (n_top = 4 at
+/// 8 lanes). Fusing each consecutive layer pair halves the per-sub-group
+/// read/write sweeps; the scheduler's single-layer remainder handles odd
+/// layer counts. Keyed to the 8-lane deep shapes so diagnostic and
+/// inner-recursion transforms keep their tuned single-layer tail.
+#[inline]
+fn use_recursive_deep_pair_fusion(
+    log_d: usize,
+    num_ntts: usize,
+    start_layer: usize,
+    n_top: usize,
+) -> bool {
+    num_ntts == 8
+        && n_top == 4
+        && log_d >= 14
+        && start_layer > n_top
+        && start_layer < log_d
+}
+
 /// The standard dimension-20 basis has low-limb-only twiddles throughout the
 /// final two layers. This permits a two-PMULL product on AArch64 instead of the
 /// generic six-PMULL field multiply. Keep the dispatch tied to the exact
@@ -966,6 +989,7 @@ impl AdditiveNttF128 {
             num_ntts,
             DEEP_LAYER,
             log_d,
+            DEEP_LAYER,
             sub_start,
             sub_end,
             odd_tail,
@@ -1337,12 +1361,15 @@ impl AdditiveNttF128 {
         // Ranked L0: layers 10..20 form five exact pairs. Fuse each pair inside
         // the existing outer chunk job so every row is loaded/stored once per
         // two layers and no nested Rayon region is created.
-        if use_ranked_deep_pair_fusion(log_d, num_ntts, start_layer, n_top) {
+        if use_ranked_deep_pair_fusion(log_d, num_ntts, start_layer, n_top)
+            || use_recursive_deep_pair_fusion(log_d, num_ntts, start_layer, n_top)
+        {
             self.forward_transform_interleaved_deep_fused_pairs_and_then(
                 data,
                 num_ntts,
                 n_top,
                 log_d,
+                start_layer,
                 finish_chunk,
             );
             return;
@@ -1384,12 +1411,14 @@ impl AdditiveNttF128 {
         num_ntts: usize,
         n_top: usize,
         log_d: usize,
+        start_layer: usize,
     ) {
         self.forward_transform_interleaved_deep_fused_pairs_and_then(
             data,
             num_ntts,
             n_top,
             log_d,
+            start_layer,
             &|_, _| {},
         );
     }
@@ -1400,18 +1429,21 @@ impl AdditiveNttF128 {
         num_ntts: usize,
         n_top: usize,
         log_d: usize,
+        start_layer: usize,
         finish_chunk: &F,
     ) where
         F: Fn(usize, &[F128]) + Sync + Send,
     {
-        // Reached only under `use_ranked_deep_pair_fusion`, i.e. the exact
-        // ranked production geometry, so the ambient publication applies.
+        // Reached under `use_ranked_deep_pair_fusion` or the recursive deep
+        // pair-fusion gate. The ranked geometry (num_ntts == 64) publishes
+        // the zero-odd-tail lane skip; recursive 8-lane shapes publish 0.
         let odd_tail = ranked_zero_odd_tail_lanes(log_d, num_ntts);
         self.forward_transform_interleaved_deep_fused_pairs_range_and_then(
             data,
             num_ntts,
             n_top,
             log_d,
+            start_layer,
             0,
             1usize << n_top,
             odd_tail,
@@ -1428,6 +1460,7 @@ impl AdditiveNttF128 {
         num_ntts: usize,
         n_top: usize,
         log_d: usize,
+        start_layer: usize,
         sub_start: usize,
         sub_end: usize,
         // Trailing lanes known zero at every odd position; 0 = dense.
@@ -1455,7 +1488,7 @@ impl AdditiveNttF128 {
             .enumerate()
             .for_each(|(local_sub_idx, sub_data)| {
                 let sub_idx = sub_start + local_sub_idx;
-                let mut layer = n_top;
+                let mut layer = start_layer.max(n_top);
                 while layer + 1 < log_d {
                     let layer_in_sub = layer - n_top;
                     let num_blocks_in_sub = 1usize << layer_in_sub;
@@ -2403,8 +2436,65 @@ mod tests {
             ntt.forward_transform_interleaved_scalar_from_layer(&mut want, NUM_NTTS, N_TOP);
 
             let mut got = source;
-            ntt.forward_transform_interleaved_deep_fused_pairs(&mut got, NUM_NTTS, N_TOP, LOG_D);
+            ntt.forward_transform_interleaved_deep_fused_pairs(&mut got, NUM_NTTS, N_TOP, LOG_D, N_TOP);
             assert_eq!(got, want, "five-pair mismatch at iteration={iteration}");
+        }
+    }
+
+    /// The recursive deep pair-fusion scheduler must equal the generic
+    /// per-sub-group single-layer driver on the exact production recursive
+    /// shapes (L1: log_d 18, remainder entry 9; L2: log_d 16, entry 10;
+    /// n_top 4 = the 2 MiB sub-group split at 8 lanes). The L1 shape's nine
+    /// layers exercise the scheduler's odd single-layer tail.
+    #[test]
+    fn recursive_deep_pairs_match_generic_driver_for_production_shapes() {
+        for (log_d, start_layer) in [(18usize, 9usize), (16usize, 10usize)] {
+            let num_ntts = 8usize;
+            let n_top = 4usize;
+            assert!(use_recursive_deep_pair_fusion(log_d, num_ntts, start_layer, n_top));
+            let ntt = AdditiveNttF128::standard(log_d);
+            let mut rng = Rng::new(0xDEAD_0001 + log_d as u64);
+            let src = rand_vec(&mut rng, (1usize << log_d) * num_ntts);
+
+            // Reference: the generic driver this replaces (single layer per
+            // sub-group sweep), with the same sub-group and twiddle geometry.
+            let mut plain = src.clone();
+            let sub_elems = (1usize << (log_d - n_top)) * num_ntts;
+            for sub_idx in 0..(1usize << n_top) {
+                let sub_data = &mut plain[sub_idx * sub_elems..(sub_idx + 1) * sub_elems];
+                for layer in n_top.max(start_layer)..log_d {
+                    let layer_in_sub = layer - n_top;
+                    let num_blocks_in_sub = 1usize << layer_in_sub;
+                    let block_size = 1usize << (log_d - layer);
+                    let block_size_half = block_size >> 1;
+                    let block_bytes = block_size * num_ntts;
+                    for block_in_sub in 0..num_blocks_in_sub {
+                        let global_block = sub_idx * num_blocks_in_sub + block_in_sub;
+                        let twiddle = ntt.twiddle(layer, global_block);
+                        let block_start = block_in_sub * block_bytes;
+                        butterfly_interleaved_block(
+                            &mut sub_data[block_start..block_start + block_bytes],
+                            twiddle,
+                            block_size_half,
+                            num_ntts,
+                        );
+                    }
+                }
+            }
+
+            let mut got = src;
+            ntt.forward_transform_interleaved_deep_from_layer_and_then(
+                &mut got,
+                num_ntts,
+                start_layer,
+                n_top,
+                log_d,
+                &|_, _| {},
+            );
+            assert_eq!(
+                got, plain,
+                "recursive deep pairs diverge at log_d={log_d} start_layer={start_layer}"
+            );
         }
     }
 
@@ -3206,6 +3296,7 @@ mod block_range_equivalence {
             num_ntts,
             n_top,
             log_d,
+            start_layer,
             sub_start,
             sub_end,
             0,
@@ -3301,6 +3392,7 @@ mod zero_lane_skip {
                 NUM_NTTS,
                 n_top,
                 log_d,
+                start_layer,
                 0,
                 1 << n_top,
                 tail,
