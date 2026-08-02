@@ -82,6 +82,34 @@ pub(crate) fn fold_banked_slot<const BANKS: usize>(weight: &[F128; BANKS], input
     }
 }
 
+/// Fold four adjacent banked output slots while loading each shared weight
+/// once. The ranked DirectFold8 materializer stores the input slot-major, so
+/// `input[s * BANKS + k]` is bank `k` of slot `s`.
+///
+/// The AArch64 kernel preserves the incumbent deferred-reduction arithmetic:
+/// each slot has an independent 256-bit accumulator and is reduced exactly
+/// once. Only the load schedule changes. Other targets use four calls to the
+/// exact single-slot oracle.
+#[inline]
+pub(crate) fn fold_banked_slots4<const BANKS: usize>(
+    weight: &[F128; BANKS],
+    input: &[F128],
+) -> [F128; 4] {
+    debug_assert!(input.len() >= 4 * BANKS);
+    #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+    {
+        // SAFETY: the cfg gate supplies PMULL through `aes`; the caller's
+        // contiguous four-slot window contains at least `4 * BANKS` values.
+        unsafe { aarch64::fold_banked_slots4::<BANKS>(weight, input) }
+    }
+    #[cfg(not(all(target_arch = "aarch64", target_feature = "aes")))]
+    {
+        std::array::from_fn(|slot| {
+            fold_banked_slot::<BANKS>(weight, &input[slot * BANKS..(slot + 1) * BANKS])
+        })
+    }
+}
+
 /// Fold adjacent pairs from `src` into `dst`, starting at pair `base`.
 ///
 /// Computes `dst[t] = src[2j] * (1 + r) + src[2j + 1] * r`, where
@@ -386,6 +414,14 @@ mod tests {
                 oracle(&w64, &buf[off64..off64 + 64]),
                 "banks=64 trial={trial}"
             );
+            let folded4 = fold_banked_slots4::<64>(&w64, &buf[..256]);
+            for slot in 0..4 {
+                assert_eq!(
+                    folded4[slot],
+                    oracle(&w64, &buf[64 * slot..64 * (slot + 1)]),
+                    "banks=64 slots4 slot={slot} trial={trial}"
+                );
+            }
             assert_eq!(
                 fold_banked_slot::<6>(&w6, &buf[off6..off6 + 6]),
                 oracle(&w6, &buf[off6..off6 + 6]),

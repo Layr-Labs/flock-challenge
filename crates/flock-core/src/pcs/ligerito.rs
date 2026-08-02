@@ -3978,6 +3978,21 @@ fn materialize_direct_fold4(
 /// 2^19 state — fused into the same pass; no lookahead follows because the
 /// initial cadence is exhausted (the fold2 pair of the fold4 route never
 /// runs and the 2^21/2^20 states never exist).
+#[inline]
+fn direct_fold8_slots4_value_enabled(value: Option<&std::ffi::OsStr>) -> bool {
+    value != Some(std::ffi::OsStr::new("1"))
+}
+
+#[inline]
+fn direct_fold8_slots4_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        direct_fold8_slots4_value_enabled(
+            std::env::var_os("FLOCK_NO_DIRECT_FOLD8_SLOTS4").as_deref(),
+        )
+    })
+}
+
 fn materialize_direct_fold8(
     packed_witness: Vec<F128>,
     ordinary_basis: Vec<F128>,
@@ -4021,6 +4036,7 @@ fn materialize_direct_fold8(
         claim.eq_lo.len() == block_len && claim.eq_hi.len() * block_len == out_len
     }));
     let deferred_reduce = super::use_fold_deferred_reduce();
+    let fold_slots4 = deferred_reduce && !has_ordinary && direct_fold8_slots4_enabled();
 
     let mut folded_f = crate::scratch::take_f128(out_len);
     let mut folded_b = crate::scratch::take_f128(out_len);
@@ -4060,15 +4076,35 @@ fn materialize_direct_fold8(
                     first_table,
                     scratch,
                 );
-                for slot in 0..block_len {
-                    f_out[slot] = fold64(f_in, slot);
-                    let direct =
-                        super::ring_switch::fold_one_slot(first_claim.eq_lo[slot], scratch);
-                    b_out[slot] = if has_ordinary {
-                        direct + fold64(b_in, slot)
-                    } else {
-                        direct
-                    };
+                if fold_slots4 {
+                    // Ranked all-direct shape: four slot folds share the same
+                    // 64 weights. Reuse each weight load across four witness
+                    // streams while retaining one deferred reduction per
+                    // output. `block_len` is guaranteed divisible by four.
+                    for slot in (0..block_len).step_by(4) {
+                        let folded = crate::field::f128_slice::fold_banked_slots4::<64>(
+                            &fold_weight,
+                            &f_in[64 * slot..64 * (slot + 4)],
+                        );
+                        f_out[slot..slot + 4].copy_from_slice(&folded);
+                        for lane in 0..4 {
+                            b_out[slot + lane] = super::ring_switch::fold_one_slot(
+                                first_claim.eq_lo[slot + lane],
+                                scratch,
+                            );
+                        }
+                    }
+                } else {
+                    for slot in 0..block_len {
+                        f_out[slot] = fold64(f_in, slot);
+                        let direct =
+                            super::ring_switch::fold_one_slot(first_claim.eq_lo[slot], scratch);
+                        b_out[slot] = if has_ordinary {
+                            direct + fold64(b_in, slot)
+                        } else {
+                            direct
+                        };
+                    }
                 }
                 for (claim, table) in rest_claims.iter().zip(rest_tables.iter()) {
                     super::ring_switch::compose_fold_byte_table_into(
@@ -7060,6 +7096,18 @@ pub fn recursive_verifier<Ch: Challenger>(
 mod tests {
     // Disclosed zero-mechanism redraw marker (draw 2 of the latch tree,
     // fa433990 drew 1,449,917 in-band): resampling the median lottery.
+    #[test]
+    fn direct_fold8_slots4_kill_switch_is_exact_one() {
+        use std::ffi::OsStr;
+
+        assert!(super::direct_fold8_slots4_value_enabled(None));
+        assert!(super::direct_fold8_slots4_value_enabled(Some(OsStr::new(""))));
+        assert!(super::direct_fold8_slots4_value_enabled(Some(OsStr::new("0"))));
+        assert!(super::direct_fold8_slots4_value_enabled(Some(OsStr::new("01"))));
+        assert!(super::direct_fold8_slots4_value_enabled(Some(OsStr::new("true"))));
+        assert!(!super::direct_fold8_slots4_value_enabled(Some(OsStr::new("1"))));
+    }
+
     /// The paired fold must reproduce two sequential state binds, the direct
     /// message, and the coefficient-evaluated following message bit-for-bit.
     #[test]

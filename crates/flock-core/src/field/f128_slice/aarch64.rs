@@ -280,6 +280,54 @@ pub(super) unsafe fn fold_banked_slot<const BANKS: usize>(
     }
 }
 
+/// Deferred-reduction folds for four adjacent slot-major inputs. Each bank's
+/// common weight is loaded once and multiplied into four independent input
+/// streams. Four wide accumulators provide the same PMULL/XOR independence as
+/// the single-slot kernel's four-way bank unroll while deleting three of four
+/// repeated weight loads.
+///
+/// # Safety
+/// Requires the `aes` target feature (PMULL). `input` must hold at least
+/// `4 * BANKS` elements laid out as four consecutive BANKS-wide slots.
+#[inline]
+#[target_feature(enable = "aes")]
+pub(super) unsafe fn fold_banked_slots4<const BANKS: usize>(
+    weight: &[F128; BANKS],
+    input: &[F128],
+) -> [F128; 4] {
+    unsafe {
+        debug_assert!(input.len() >= 4 * BANKS);
+        let zero = vdupq_n_u64(0);
+        let mut a0 = WideNeon { lo: zero, hi: zero };
+        let mut a1 = WideNeon { lo: zero, hi: zero };
+        let mut a2 = WideNeon { lo: zero, hi: zero };
+        let mut a3 = WideNeon { lo: zero, hi: zero };
+
+        let w = weight.as_ptr();
+        let x = input.as_ptr();
+        let mut k = 0usize;
+        while k < BANKS {
+            let wk = vld1q_u64(w.add(k).cast::<u64>());
+            let x0 = vld1q_u64(x.add(k).cast::<u64>());
+            let x1 = vld1q_u64(x.add(BANKS + k).cast::<u64>());
+            let x2 = vld1q_u64(x.add(2 * BANKS + k).cast::<u64>());
+            let x3 = vld1q_u64(x.add(3 * BANKS + k).cast::<u64>());
+            xor_wide(&mut a0, mul_unreduced(wk, x0));
+            xor_wide(&mut a1, mul_unreduced(wk, x1));
+            xor_wide(&mut a2, mul_unreduced(wk, x2));
+            xor_wide(&mut a3, mul_unreduced(wk, x3));
+            k += 1;
+        }
+
+        [
+            transmute::<uint64x2_t, F128>(reduce_wide(a0)),
+            transmute::<uint64x2_t, F128>(reduce_wide(a1)),
+            transmute::<uint64x2_t, F128>(reduce_wide(a2)),
+            transmute::<uint64x2_t, F128>(reduce_wide(a3)),
+        ]
+    }
+}
+
 /// Deferred-reduction round-zero message `(u_0, u_2)` over paired slots.
 ///
 /// Bitwise-identical to the scalar pair loop: both accumulate
