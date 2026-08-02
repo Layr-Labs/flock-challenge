@@ -256,6 +256,16 @@ fn is_ranked_top_hetero_fused3_pass(
     use_ranked_deep_pair_fusion(log_d, num_ntts, start_layer, n_top) && matches!(layer, 1 | 4 | 7)
 }
 
+/// Default-on ranked CPU suffix wavefront. `FLOCK_NO_NTT_MIDDLE_DEEP_WAVEFRONT`
+/// is an A/B control only; ranked workers run with a cleared environment.
+#[inline]
+fn ranked_middle_deep_wavefront_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        std::env::var_os("FLOCK_NO_NTT_MIDDLE_DEEP_WAVEFRONT").is_none()
+    });
+    *ON
+}
+
 // ---------------------------------------------------------------------------
 // Static zero-lane skip (commit NTT).
 // ---------------------------------------------------------------------------
@@ -944,6 +954,22 @@ impl AdditiveNttF128 {
         // explicit tail.
         let odd_tail = ranked_zero_odd_tail_lanes(log_d, num_ntts);
 
+        if ranked_middle_deep_wavefront_enabled() {
+            self.forward_transform_interleaved_middle_deep_wavefront_range_and_then(
+                data,
+                num_ntts,
+                start_layer,
+                7,
+                DEEP_LAYER,
+                log_d,
+                b_start,
+                b_end,
+                odd_tail,
+                &finish_chunk,
+            );
+            return;
+        }
+
         // Two fused radix-8 passes.  Unlike the old all-layer range driver,
         // this is the last streaming traversal of the complete suffix.
         self.forward_transform_interleaved_block_range(
@@ -971,6 +997,120 @@ impl AdditiveNttF128 {
             odd_tail,
             &finish_chunk,
         );
+    }
+
+    /// Apply one absolute radix-8 block while owning only that block's slice.
+    #[inline]
+    fn forward_transform_interleaved_fused_3layer_absolute_block(
+        &self,
+        block: &mut [F128],
+        num_ntts: usize,
+        layer: usize,
+        block_idx: usize,
+        log_d: usize,
+        zero_tail: usize,
+    ) {
+        let block_positions = 1usize << (log_d - layer);
+        let eighth = block_positions >> 3;
+        debug_assert_eq!(block.len(), block_positions * num_ntts);
+        let mut tw = [F128 { lo: 0, hi: 0 }; 7];
+        tw[0] = self.twiddle(layer, block_idx);
+        for s in 0..2 {
+            tw[1 + s] = self.twiddle(layer + 1, 2 * block_idx + s);
+        }
+        for s in 0..4 {
+            tw[3 + s] = self.twiddle(layer + 2, 4 * block_idx + s);
+        }
+        let odd_tail = if eighth.is_multiple_of(2) {
+            zero_tail
+        } else {
+            0
+        };
+        if tw[0] == F128::ZERO && tw[1] == F128::ZERO && tw[3] == F128::ZERO {
+            butterfly_interleaved_fused_3layer_par_rows::<true>(
+                block, &tw, eighth, num_ntts, odd_tail,
+            );
+        } else {
+            butterfly_interleaved_fused_3layer_par_rows::<false>(
+                block, &tw, eighth, num_ntts, odd_tail,
+            );
+        }
+    }
+
+    /// Pipeline a three-layer middle pass into the cache-local deep pass.
+    ///
+    /// The ordinary range driver puts a global barrier between every broad
+    /// radix-8 pass and the deep layer-`n_top` jobs.  Once one disjoint
+    /// layer-`middle_layer` child has completed its radix-8 pass, however,
+    /// all of its layer-`n_top` descendants are ready.  Publish those jobs
+    /// immediately instead of waiting for unrelated middle children.  The
+    /// outer `par_chunks_mut` proves that concurrent children cannot alias;
+    /// absolute indices preserve the original twiddle tree and callbacks.
+    fn forward_transform_interleaved_middle_deep_wavefront_range_and_then<F>(
+        &self,
+        data: &mut [F128],
+        num_ntts: usize,
+        start_layer: usize,
+        middle_layer: usize,
+        n_top: usize,
+        log_d: usize,
+        b_start: usize,
+        b_end: usize,
+        zero_tail: usize,
+        finish_chunk: &F,
+    ) where
+        F: Fn(usize, &[F128]) + Sync + Send,
+    {
+        use rayon::prelude::*;
+
+        debug_assert_eq!(log2_pow2(data.len() / num_ntts), log_d);
+        debug_assert_eq!(n_top, middle_layer + 3);
+        debug_assert!(start_layer < middle_layer && n_top <= log_d);
+
+        // Retain the barrier only for the first broad radix-8 pass.  Its
+        // output blocks are precisely the independent middle children below.
+        self.forward_transform_interleaved_block_range(
+            data,
+            num_ntts,
+            start_layer,
+            middle_layer,
+            b_start,
+            b_end,
+            zero_tail,
+        );
+
+        let middle_start = b_start << (middle_layer - start_layer);
+        let middle_end = b_end << (middle_layer - start_layer);
+        let middle_positions = 1usize << (log_d - middle_layer);
+        let middle_elems = middle_positions * num_ntts;
+        let range_start = middle_start * middle_elems;
+        let range_end = middle_end * middle_elems;
+
+        data[range_start..range_end]
+            .par_chunks_mut(middle_elems)
+            .enumerate()
+            .for_each(|(local_middle, middle_data)| {
+                let middle_idx = middle_start + local_middle;
+                self.forward_transform_interleaved_fused_3layer_absolute_block(
+                    middle_data,
+                    num_ntts,
+                    middle_layer,
+                    middle_idx,
+                    log_d,
+                    zero_tail,
+                );
+
+                let sub_start = middle_idx << (n_top - middle_layer);
+                self.forward_transform_interleaved_deep_fused_pairs_slice_and_then(
+                    middle_data,
+                    num_ntts,
+                    n_top,
+                    log_d,
+                    sub_start,
+                    zero_tail,
+                    finish_chunk,
+                );
+            });
     }
 
     /// Finish the ranked L0 transform's five cache-local deep pairs and invoke
@@ -1436,21 +1576,52 @@ impl AdditiveNttF128 {
     ) where
         F: Fn(usize, &[F128]) + Sync + Send,
     {
-        use rayon::prelude::*;
-
         debug_assert!(n_top <= log_d);
         debug_assert_eq!(data.len(), (1usize << log_d) * num_ntts);
         debug_assert!(sub_start < sub_end && sub_end <= (1usize << n_top));
         let sub_size_positions = 1usize << (log_d - n_top);
         let sub_elems = sub_size_positions * num_ntts;
-        let low_twiddle_final_pair =
-            use_ranked_low_twiddle_final_pair(log_d, num_ntts, n_top);
         debug_assert!(zero_tail < num_ntts);
 
         let range_start = sub_start * sub_elems;
         let range_end = sub_end * sub_elems;
+        self.forward_transform_interleaved_deep_fused_pairs_slice_and_then(
+            &mut data[range_start..range_end],
+            num_ntts,
+            n_top,
+            log_d,
+            sub_start,
+            zero_tail,
+            finish_chunk,
+        );
+    }
 
-        data[range_start..range_end]
+    /// Slice-owned implementation used by both the ordinary range scheduler
+    /// and the middle-to-deep wavefront. `sub_start` remains absolute even
+    /// though `data` begins at that sub-NTT.
+    fn forward_transform_interleaved_deep_fused_pairs_slice_and_then<F>(
+        &self,
+        data: &mut [F128],
+        num_ntts: usize,
+        n_top: usize,
+        log_d: usize,
+        sub_start: usize,
+        zero_tail: usize,
+        finish_chunk: &F,
+    ) where
+        F: Fn(usize, &[F128]) + Sync + Send,
+    {
+        use rayon::prelude::*;
+
+        let sub_size_positions = 1usize << (log_d - n_top);
+        let sub_elems = sub_size_positions * num_ntts;
+        debug_assert_eq!(data.len() % sub_elems, 0);
+        debug_assert!(sub_start + data.len() / sub_elems <= (1usize << n_top));
+        debug_assert!(zero_tail < num_ntts);
+        let low_twiddle_final_pair =
+            use_ranked_low_twiddle_final_pair(log_d, num_ntts, n_top);
+
+        data
             .par_chunks_mut(sub_elems)
             .enumerate()
             .for_each(|(local_sub_idx, sub_data)| {
@@ -3187,7 +3358,7 @@ mod block_range_equivalence {
             0,
         );
 
-        let mut cache_local = src;
+        let mut cache_local = src.clone();
         ntt.forward_transform_interleaved_block_range(
             &mut cache_local,
             num_ntts,
@@ -3222,6 +3393,34 @@ mod block_range_equivalence {
         let expected_offsets: Vec<usize> =
             (sub_start..sub_end).map(|sub| sub * sub_elems).collect();
         assert_eq!(got_offsets, expected_offsets, "callback coverage/offsets diverge");
+
+        // Same dependency graph with the second broad radix-8 pass released
+        // one middle child at a time into its deep descendants.
+        let mut wavefront = src;
+        let wavefront_offsets = std::sync::Mutex::new(Vec::new());
+        ntt.forward_transform_interleaved_middle_deep_wavefront_range_and_then(
+            &mut wavefront,
+            num_ntts,
+            start_layer,
+            5,
+            n_top,
+            log_d,
+            b_start,
+            b_end,
+            0,
+            &|elem_offset, chunk| {
+                assert_eq!(elem_offset % sub_elems, 0);
+                assert_eq!(chunk, &plain[elem_offset..elem_offset + sub_elems]);
+                wavefront_offsets.lock().unwrap().push(elem_offset);
+            },
+        );
+        assert_eq!(wavefront, plain, "middle/deep wavefront diverges from plain driver");
+        let mut wavefront_offsets = wavefront_offsets.into_inner().unwrap();
+        wavefront_offsets.sort_unstable();
+        assert_eq!(
+            wavefront_offsets, expected_offsets,
+            "wavefront callback coverage/offsets diverge"
+        );
     }
 }
 

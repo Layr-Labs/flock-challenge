@@ -6680,6 +6680,26 @@ LC_KERNEL(lc_fold_stripes, 4)
     /// prove; it only has to be close enough to measure both arms.
     const ZC_FOLD_WARMUP_EIGHTHS: usize = 3;
 
+    /// The 24-claim warmup probe cannot be extrapolated linearly across the
+    /// whole GPU range: at the ranked 64-claim shape, memory-system pressure
+    /// bends the curve sharply above 36 claims. `FLOCK_NO_ZC_GPU_CLAIM_CAP=1`
+    /// restores the original unconstrained extrapolation for same-binary A/B.
+    fn zc_fold_cap_enabled() -> bool {
+        static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+            std::env::var_os("FLOCK_NO_ZC_GPU_CLAIM_CAP").is_none()
+        });
+        *ON
+    }
+
+    #[inline]
+    pub(super) fn cap_zc_fold_claims(raw: usize, n_claims: usize, enabled: bool) -> usize {
+        if enabled {
+            raw.min(n_claims * 9 / 16)
+        } else {
+            raw
+        }
+    }
+
     /// Exact split override (`FLOCK_ZC_GPU_CLAIMS=<claims>`); also pins the
     /// autotune off so a controlled A/B keeps the requested share.
     fn zc_fold_claim_override() -> Option<usize> {
@@ -6783,7 +6803,10 @@ LC_KERNEL(lc_fold_stripes, 4)
         // noisier of the two (clock ramp, queue latency).
         let balanced =
             0.9 * (head_ms.max(0.0) + n_claims as f64 * u_cpu) / (u_gpu + u_cpu);
-        let g = (balanced.round() as i64).clamp(1, n_claims as i64 - 1) as usize;
+        let mut g = (balanced.round() as i64).clamp(1, n_claims as i64 - 1) as usize;
+        if arm == FoldArm::Zc {
+            g = cap_zc_fold_claims(g, n_claims, zc_fold_cap_enabled());
+        }
         arm.tuned()
             .store(g, std::sync::atomic::Ordering::Relaxed);
         if arm.debug() {
@@ -9131,6 +9154,17 @@ DEF_PROBE(probe_g4_t8_p0,    8u,  0u,   tsel & 7u)
         assert_eq!(lincheck_gate_share(-1.0, 64), 0);
         // Small test shapes scale (16 claims: ratio 1 -> floor(7.2) = 7).
         assert_eq!(lincheck_gate_share(1.0, 16), 7);
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    fn zerocheck_warmup_extrapolation_is_capped_at_nine_sixteenths() {
+        use imp::cap_zc_fold_claims;
+        assert_eq!(cap_zc_fold_claims(49, 64, true), 36);
+        assert_eq!(cap_zc_fold_claims(35, 64, true), 35);
+        assert_eq!(cap_zc_fold_claims(49, 64, false), 49);
+        assert_eq!(cap_zc_fold_claims(12, 32, true), 12);
+        assert_eq!(cap_zc_fold_claims(30, 32, true), 18);
     }
 
     /// The lincheck arm's GPU prefix equals the CPU fold over exactly the
