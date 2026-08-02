@@ -1450,6 +1450,43 @@ kernel void leaf_hash(device const uint* codeword [[buffer(0)]],
     for (int i = 0; i < 8; i++) out[id * 8u + i] = cv[i];
 }
 
+// Fuse ranked leaf hashing with the first parent level. One 256-thread
+// group hashes 256 adjacent 1 KiB leaves, publishes every leaf CV in the flat
+// tree, then consumes those CVs from 8 KiB of threadgroup memory to publish
+// 128 parents. This removes the ranked tree's 32 MiB leaf-CV DRAM reread with
+// no extra BLAKE3 work and preserves the ordinary flat-tree layout.
+kernel void leaf_parent(device const uint* input [[buffer(0)]],
+                        device uint* leaves      [[buffer(1)]],
+                        device uint* parents     [[buffer(2)]],
+                        uint tgid [[threadgroup_position_in_grid]],
+                        uint lid [[thread_index_in_threadgroup]])
+{
+    threadgroup uint leaf_cvs[256u * 8u];
+    const uint leaf_id = tgid * 256u + lid;
+    uint cv[8];
+    for (uint i = 0u; i < 8u; i++) cv[i] = B3_IV[i];
+    for (uint b = 0u; b < 16u; b++) {
+        uint block[16];
+        for (uint i = 0u; i < 16u; i++) block[i] = input[leaf_id * 256u + b * 16u + i];
+        uint flags = (b == 0u ? B3_CHUNK_START : 0u) | (b == 15u ? B3_CHUNK_END : 0u);
+        b3_compress(cv, block, 64u, flags);
+    }
+    for (uint i = 0u; i < 8u; i++) {
+        leaves[leaf_id * 8u + i] = cv[i];
+        leaf_cvs[lid * 8u + i] = cv[i];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (lid < 128u) {
+        uint block[16];
+        for (uint i = 0u; i < 16u; i++) block[i] = leaf_cvs[lid * 16u + i];
+        uint parent_cv[8];
+        for (uint i = 0u; i < 8u; i++) parent_cv[i] = B3_IV[i];
+        b3_compress(parent_cv, block, 64u, B3_PARENT);
+        const uint parent_id = tgid * 128u + lid;
+        for (uint i = 0u; i < 8u; i++) parents[parent_id * 8u + i] = parent_cv[i];
+    }
+}
+
 kernel void parent_hash(device const uint* children [[buffer(0)]],
                         device uint* parents        [[buffer(1)]],
                         uint id [[thread_position_in_grid]])
@@ -1637,6 +1674,7 @@ kernel void parent_hash3(device const uint* children [[buffer(0)]],
         pub(crate) pso_ntt4h8: Id,
         pub(crate) pso_ntt5mix: Id,
         pub(crate) pso_leaf: Id,
+        pub(crate) pso_leaf_parent: Id,
         pub(crate) pso_parent: Id,
         pub(crate) pso_parent3: Id,
     }
@@ -1694,7 +1732,7 @@ kernel void parent_hash3(device const uint* children [[buffer(0)]],
                 // missing, pipeline error — rebuild everything from the MSL
                 // source exactly as the incumbent path did. The source compile
                 // is never reached when the metallib pipelines all build.
-                const KERNELS: [&str; 11] = [
+                const KERNELS: [&str; 12] = [
                     "ntt_fused",
                     "ntt_fused_reg4g4",
                     "ntt_fused_reg4",
@@ -1704,11 +1742,12 @@ kernel void parent_hash3(device const uint* children [[buffer(0)]],
                     "ntt_fused_reg4h8",
                     "ntt_pass5_mixed",
                     "leaf_hash",
+                    "leaf_parent",
                     "parent_hash",
                     "parent_hash3",
                 ];
-                let build_psos = |library: Id| -> Result<[Id; 11], String> {
-                    let mut out = [NIL; 11];
+                let build_psos = |library: Id| -> Result<[Id; 12], String> {
+                    let mut out = [NIL; 12];
                     for (slot, name) in out.iter_mut().zip(KERNELS) {
                         let ns = api.nsstring(name)?;
                         let f: Id = send!(
@@ -1738,7 +1777,7 @@ kernel void parent_hash3(device const uint* children [[buffer(0)]],
                     }
                     Ok(out)
                 };
-                let mut psos: Option<[Id; 11]> = None;
+                let mut psos: Option<[Id; 12]> = None;
                 let prebuilt = try_embedded_metallib(&api, device);
                 if !prebuilt.is_null() {
                     if let Ok(p) = build_psos(prebuilt) {
@@ -1746,7 +1785,7 @@ kernel void parent_hash3(device const uint* children [[buffer(0)]],
                     }
                     send!(api, unsafe extern "C" fn(Id, Sel) -> Id, prebuilt, c"release");
                 }
-                let [pso_ntt, pso_ntt4g4, pso_ntt4, pso_ntt3, pso_ntt4z, pso_ntt4zg4, pso_ntt4h8, pso_ntt5mix, pso_leaf, pso_parent, pso_parent3] =
+                let [pso_ntt, pso_ntt4g4, pso_ntt4, pso_ntt3, pso_ntt4z, pso_ntt4zg4, pso_ntt4h8, pso_ntt5mix, pso_leaf, pso_leaf_parent, pso_parent, pso_parent3] =
                     match psos {
                         Some(p) => p,
                         None => {
@@ -1785,6 +1824,7 @@ kernel void parent_hash3(device const uint* children [[buffer(0)]],
                     pso_ntt4h8,
                     pso_ntt5mix,
                     pso_leaf,
+                    pso_leaf_parent,
                     pso_parent,
                     pso_parent3,
                 })
@@ -2312,14 +2352,25 @@ kernel void parent_hash3(device const uint* children [[buffer(0)]],
         parent3: bool,
     ) {
         unsafe {
-            gpu.set_pipeline(enc, gpu.pso_leaf);
-            gpu.set_buffer(enc, codeword_buf, 0, 0);
-            gpu.set_buffer(enc, tree_buf, 0, 1);
-            let tpg = 256u64.min(n_leaves as u64);
-            gpu.dispatch(enc, n_leaves as u64 / tpg, tpg);
-
-            let mut read_start = 0usize; // node index
-            let mut read_len = n_leaves;
+            // The ranked full tree fuses leaf hashing with level 1. The
+            // non-ranked and explicit fallback paths retain the incumbent
+            // leaf dispatch unchanged.
+            let (mut read_start, mut read_len) = if parent3 {
+                debug_assert_eq!(n_leaves % 256, 0);
+                gpu.set_pipeline(enc, gpu.pso_leaf_parent);
+                gpu.set_buffer(enc, codeword_buf, 0, 0);
+                gpu.set_buffer(enc, tree_buf, 0, 1);
+                gpu.set_buffer(enc, tree_buf, n_leaves * 32, 2);
+                gpu.dispatch(enc, (n_leaves / 256) as u64, 256);
+                (n_leaves, n_leaves / 2)
+            } else {
+                gpu.set_pipeline(enc, gpu.pso_leaf);
+                gpu.set_buffer(enc, codeword_buf, 0, 0);
+                gpu.set_buffer(enc, tree_buf, 0, 1);
+                let tpg = 256u64.min(n_leaves as u64);
+                gpu.dispatch(enc, n_leaves as u64 / tpg, tpg);
+                (0usize, n_leaves)
+            };
 
             if parent3 {
                 gpu.set_pipeline(enc, gpu.pso_parent3);
