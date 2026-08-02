@@ -2725,6 +2725,51 @@ kernel void blake3_pow_scan(
             }
         }
 
+        /// Commit and spin-poll `status` to completion. For sub-millisecond
+        /// dispatches on the prove's serial spine (the PCS grind scans),
+        /// `waitUntilCompleted` pays a thread park plus a completion-handler
+        /// wake on every call; polling the status property from the calling
+        /// thread skips both. Bounded: past `budget_ms` of spinning it falls
+        /// back to the blocking wait, so a long or hung dispatch costs one
+        /// spin budget and then behaves exactly like [`commit_and_wait`].
+        pub(crate) unsafe fn commit_and_spin(
+            &self,
+            cb: Id,
+            budget_ms: f64,
+        ) -> Result<(), String> {
+            unsafe {
+                send!(self.api, unsafe extern "C" fn(Id, Sel), cb, c"commit");
+                let start = std::time::Instant::now();
+                loop {
+                    let status: u64 = send!(
+                        self.api,
+                        unsafe extern "C" fn(Id, Sel) -> u64,
+                        cb,
+                        c"status"
+                    );
+                    if status >= 4 {
+                        if status == 4 {
+                            return Ok(());
+                        }
+                        let err: Id = send!(
+                            self.api,
+                            unsafe extern "C" fn(Id, Sel) -> Id,
+                            cb,
+                            c"error"
+                        );
+                        return Err(format!(
+                            "command buffer status {status}: {}",
+                            self.api.error_string(err)
+                        ));
+                    }
+                    if start.elapsed().as_secs_f64() * 1e3 > budget_ms {
+                        return self.wait_cb(cb);
+                    }
+                    std::hint::spin_loop();
+                }
+            }
+        }
+
         pub(crate) unsafe fn commit_and_wait(&self, cb: Id) -> Result<(), String> {
             unsafe {
                 send!(self.api, unsafe extern "C" fn(Id, Sel), cb, c"commit");
@@ -5762,7 +5807,14 @@ kernel void blake3_pow_scan(
                 const THREADS: u64 = 64;
                 gpu.dispatch(enc, u64::from(len).div_ceil(THREADS), THREADS);
                 gpu.end_encoding(enc);
-                gpu.commit_and_wait(cb)?;
+                // The grind sits on the transcript's serial spine: nothing
+                // else can run until the nonce is known, so the calling
+                // thread spins the sub-millisecond dispatch home instead of
+                // parking in `waitUntilCompleted` (measured ~0.5 ms of fixed
+                // roundtrip per scan, paid 7x per ranked prove). The 4 ms
+                // budget covers every observed scan wall with margin; past
+                // it the path degrades to the exact blocking wait.
+                gpu.commit_and_spin(cb, 4.0)?;
                 let offset = out.read_volatile();
                 Ok((offset != u32::MAX).then(|| start + u64::from(offset)))
             })();
@@ -8590,6 +8642,47 @@ mod tests {
             };
             assert_eq!(got, expected, "start={start} len={len} bits={bits}");
         }
+    }
+
+    /// Profile the grind scan's fixed submit/wait overhead vs kernel time.
+    /// The ranked prove issues 7 serial transcript-dependent scans, so the
+    /// per-call roundtrip (encode + commit + `waitUntilCompleted` park/wake)
+    /// is paid 7×. Solving wall(2^23) = fixed + 8·k and wall(2^20) =
+    /// fixed + k separates the two. Run with
+    /// `cargo test --release gpu_grind_roundtrip_profile -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "profiling only"]
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    fn gpu_grind_roundtrip_profile() {
+        let digest = core::array::from_fn(|i| (i as u8).wrapping_mul(151).wrapping_add(3));
+        let min_wall = |len: u32, n: usize| -> f64 {
+            let mut best = f64::MAX;
+            for _ in 0..n {
+                let t = std::time::Instant::now();
+                let r = gpu_blake3_pow_scan(&digest, 0, len, 32);
+                let w = t.elapsed().as_secs_f64() * 1e3;
+                if gpu_or_skip(r).is_none() {
+                    return f64::NAN;
+                }
+                best = best.min(w);
+            }
+            best
+        };
+        // Warm the pipeline and clocks off the record.
+        let _ = min_wall(1 << 20, 5);
+        let small = min_wall(1 << 20, 20);
+        let large = min_wall(1 << 23, 10);
+        if small.is_nan() || large.is_nan() {
+            return;
+        }
+        let kernel = (large - small) / 7.0;
+        let fixed = small - kernel;
+        eprintln!(
+            "[grind-profile] wall(2^20)={small:.3}ms wall(2^23)={large:.3}ms \
+             => kernel(2^20)~{kernel:.3}ms fixed-roundtrip~{fixed:.3}ms \
+             (x7 serial per prove ~{:.3}ms)",
+            fixed * 7.0
+        );
     }
 
     /// A latched caller is allowed to pass an empty marker instead of the
