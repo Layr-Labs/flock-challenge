@@ -71,30 +71,6 @@ pub(crate) fn warmup_latch_cache_enabled() -> bool {
     *ON.get_or_init(|| std::env::var_os(ENV_NO_WARMUP_LATCH_CACHE).is_none())
 }
 
-/// Kill switch for the GPU keep-warm bridge: `FLOCK_NO_GPU_KEEPWARM=1`
-/// disables it. The bridge dispatches small untimed leaf-hash kernels on a
-/// private scratch buffer ONLY between proves (armed when the first ranked
-/// warmup commit finishes, hard-paused the moment any prove begins), so the
-/// GPU's DVFS state does not decay across the warmup prove's CPU tail and
-/// the worker's ready->seed gap. Measured on M3 Pro at ranked size: a
-/// 1 s GPU idle gap costs +6% and a 2 s gap +18-22% on the next commit
-/// graph wall; back-to-back runs are flat. Timed work is never touched:
-/// the bridge never runs while a prove is active.
-pub const ENV_NO_GPU_KEEPWARM: &str = "FLOCK_NO_GPU_KEEPWARM";
-
-pub(crate) fn gpu_keepwarm_enabled() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os(ENV_NO_GPU_KEEPWARM).is_none())
-}
-
-/// Called at the top of every prove: stops keep-warm dispatches for the
-/// prove's whole duration (timed phases must never share the GPU or the
-/// memory system with the bridge).
-pub fn gpu_keepwarm_prove_started() {
-    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-    imp::keepwarm_pause();
-}
-
 /// Env var that disables this round's NTT pass tuning (the g4 shared-table +
 /// zero-region-skip from-z kernel and the half-footprint final-pass kernel),
 /// restoring the incumbent kernel selection as the same-binary control.
@@ -140,6 +116,31 @@ fn gpu_from_z_zero_root_selected(log_d: usize) -> bool {
         pass_tune_enabled(),
         gpu_from_z_zero_root_enabled(),
     )
+}
+
+/// Exact-`1` rollback for the ranked from-`z` element-0 elision. The from-z
+/// pass's post-layer-3 output column e=0 is bit-identical to the message `z`
+/// (verified portably by `from_z_structure_probe` at log_d=4 and log_d=8),
+/// so the tuned kernel skips those 64 MiB of stores and the layer-4 B=0
+/// tiles — which read exactly those positions — source them from `z`
+/// directly with a z-input kernel. The two halves are coupled: disabling
+/// either restores the full-store/full-read graph.
+pub const ENV_NO_GPU_FROM_Z_E0: &str = "FLOCK_NO_GPU_FROM_Z_E0";
+
+fn gpu_from_z_e0_value_enabled(value: Option<&std::ffi::OsStr>) -> bool {
+    value != Some(std::ffi::OsStr::new("1"))
+}
+
+fn gpu_from_z_e0_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        gpu_from_z_e0_value_enabled(std::env::var_os(ENV_NO_GPU_FROM_Z_E0).as_deref())
+    })
+}
+
+#[inline]
+fn gpu_from_z_e0_selected(log_d: usize) -> bool {
+    gpu_from_z_e0_enabled() && gpu_from_z_zero_root_selected(log_d)
 }
 
 #[cfg(test)]
@@ -1835,6 +1836,253 @@ kernel void export_from_z_zero_root_tabs(
 }
 "#;
 
+    /// E0-elision twin of the zero-root from-z kernel: identical butterfly
+    /// network, but the store loop starts at e=1. The e=0 column (64 MiB at
+    /// the ranked shape) is bit-identical to `z` and is re-sourced by the
+    /// layer-4 B=0 z-input kernel, so the write is pure waste traffic.
+    const FROM_Z_ZERO_ROOT_E0SKIP_MSL_SOURCE: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+struct NttParams {
+    uint log_d;
+    uint l;
+    uint f;
+    uint s;
+};
+
+static inline uint4 gf_mulx_zero_root(uint4 v) {
+    uint carry = v.w >> 31;
+    uint4 r;
+    r.w = (v.w << 1) | (v.z >> 31);
+    r.z = (v.z << 1) | (v.y >> 31);
+    r.y = (v.y << 1) | (v.x >> 31);
+    r.x = (v.x << 1) ^ (carry * 0x87u);
+    return r;
+}
+
+static inline uint4 gf_shl16_zero_root(uint4 a) {
+    uint h = a.w >> 16;
+    uint4 r;
+    r.w = (a.w << 16) | (a.z >> 16);
+    r.z = (a.z << 16) | (a.y >> 16);
+    r.y = (a.y << 16) | (a.x >> 16);
+    r.x = (a.x << 16) ^ ((h << 7) ^ (h << 2) ^ (h << 1) ^ h);
+    return r;
+}
+
+static inline uint4 gf_mul_tab4_zero_root(
+    uint4 v,
+    threadgroup const uint4* tab)
+{
+    uint4 acc = uint4(0u);
+    for (int i = 7; i >= 0; i--) {
+        acc = gf_shl16_zero_root(acc);
+        uint h = (v[i >> 1] >> ((i & 1) * 16)) & 0xffffu;
+        acc ^= tab[h & 15u]
+             ^ tab[16u + ((h >> 4) & 15u)]
+             ^ tab[32u + ((h >> 8) & 15u)]
+             ^ tab[48u + (h >> 12)];
+    }
+    return acc;
+}
+
+static inline uint zero_root_raw_twiddle(uint compact) {
+    return compact == 0u ? 2u : (compact < 4u ? compact + 3u : compact + 4u);
+}
+
+static inline void build_zero_root_tabs(
+    device const uint4* twiddles,
+    threadgroup uint4* bases,
+    threadgroup uint4* tabs,
+    uint lid)
+{
+    constexpr uint NTW = 11u;
+    if (lid < NTW * 4u) {
+        uint compact = lid >> 2;
+        uint bank = lid & 3u;
+        uint4 p = twiddles[zero_root_raw_twiddle(compact)];
+        for (uint m = 0u; m < bank * 4u; m++) {
+            p = gf_mulx_zero_root(p);
+        }
+        bases[lid] = p;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint ei = lid; ei < NTW * 64u; ei += 64u) {
+        uint compact = ei >> 6;
+        uint sub = ei & 63u;
+        uint nibble = sub & 15u;
+        uint4 p = bases[(compact << 2) | (sub >> 4)];
+        uint4 value = uint4(0u);
+        for (uint bit = 0u; bit < 4u; bit++) {
+            if ((nibble >> bit) & 1u) {
+                value ^= p;
+            }
+            p = gf_mulx_zero_root(p);
+        }
+        tabs[ei] = value;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+}
+
+kernel void ntt_fused_reg4_from_zg4_zero_root_e0skip(
+    device uint4* data             [[buffer(0)]],
+    device const uint4* twiddles   [[buffer(1)]],
+    constant NttParams& P          [[buffer(2)]],
+    device const uint4* z          [[buffer(3)]],
+    uint tgid [[threadgroup_position_in_grid]],
+    uint lid  [[thread_index_in_threadgroup]])
+{
+    constexpr uint NF = 16u;
+    constexpr uint LOG_G = 2u;
+    threadgroup uint4 bases[11u * 4u];
+    threadgroup uint4 tabs[11u * 64u];
+    build_zero_root_tabs(twiddles, bases, tabs, lid);
+
+    const uint lane = lid & 63u;
+    const uint r_base = tgid << LOG_G;
+    for (uint rr = 0u; rr < (1u << LOG_G); rr++) {
+        const uint r = r_base + rr;
+        uint4 elems[NF];
+
+        for (uint e = 0u; e < NF / 2u; e++) {
+            elems[e] = z[(((e << P.s) + r) << 6) + lane];
+            elems[e + NF / 2u] = elems[e];
+        }
+
+        #define ZERO_BFLY(EU, EV) \
+            elems[EV] ^= elems[EU];
+        #define TAB_BFLY(EU, EV, CT) { \
+            uint4 nu = elems[EU] \
+                ^ gf_mul_tab4_zero_root(elems[EV], &tabs[(CT) * 64u]); \
+            elems[EU] = nu; \
+            elems[EV] ^= nu; \
+        }
+
+        ZERO_BFLY(0, 4)
+        ZERO_BFLY(1, 5)
+        ZERO_BFLY(2, 6)
+        ZERO_BFLY(3, 7)
+        TAB_BFLY(8, 12, 0)
+        TAB_BFLY(9, 13, 0)
+        TAB_BFLY(10, 14, 0)
+        TAB_BFLY(11, 15, 0)
+
+        ZERO_BFLY(0, 2)
+        ZERO_BFLY(1, 3)
+        TAB_BFLY(4, 6, 1)
+        TAB_BFLY(5, 7, 1)
+        TAB_BFLY(8, 10, 2)
+        TAB_BFLY(9, 11, 2)
+        TAB_BFLY(12, 14, 3)
+        TAB_BFLY(13, 15, 3)
+
+        ZERO_BFLY(0, 1)
+        TAB_BFLY(2, 3, 4)
+        TAB_BFLY(4, 5, 5)
+        TAB_BFLY(6, 7, 6)
+        TAB_BFLY(8, 9, 7)
+        TAB_BFLY(10, 11, 8)
+        TAB_BFLY(12, 13, 9)
+        TAB_BFLY(14, 15, 10)
+
+        #undef TAB_BFLY
+        #undef ZERO_BFLY
+
+        for (uint e = 1u; e < NF; e++) {
+            data[((r + (e << P.s)) << 6) + lane] = elems[e];
+        }
+    }
+}
+"#;
+
+    /// Layer-4 B=0 z-input kernel: the (4,4) ranked pass tiles with B == 0
+    /// read positions 0..2^16-1 of the codeword, which are bit-identical to
+    /// the message `z` (from-z e=0 column). This kernel reads those tiles
+    /// straight from `z` (buffer 3) instead of the staging buffer whose e=0
+    /// stores the from-z pass elided. Same 64-thread g4 shape (4 tiles per
+    /// group, one shared table build), B fixed to 0.
+    const L4_B0_ZINPUT_MSL_SOURCE: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+struct NttParams {
+    uint log_d;
+    uint l;
+    uint f;
+    uint s;
+};
+
+kernel void ntt_fused_reg4g4_b0_zinput(
+    device uint4* data             [[buffer(0)]],
+    device const uint4* twiddles   [[buffer(1)]],
+    constant NttParams& P          [[buffer(2)]],
+    device const uint4* z          [[buffer(3)]],
+    uint tgid [[threadgroup_position_in_grid]],
+    uint lid  [[thread_index_in_threadgroup]])
+{
+    constexpr uint F   = 4u;
+    constexpr uint NF  = 1u << F;
+    constexpr uint NTW = NF - 1u;
+    constexpr uint LOG_G = 2u;
+    threadgroup uint4 bases[NTW * 4u];
+    threadgroup uint4 tabs[NTW * 64u];
+
+    const uint lane = lid;
+    // B == 0 fixed: this dispatch covers only tgid < 2^(P.s - LOG_G).
+    const uint r_base = tgid << LOG_G;
+
+    if (lid < NTW * 4u) {
+        uint t = lid >> 2;
+        uint k = lid & 3u;
+        uint j = 31u - clz(t + 1u);
+        uint c = t + 1u - (1u << j);
+        uint4 p = twiddles[(1u << (P.l + j)) - 1u + c];
+        for (uint m = 0; m < k * 4u; m++) { p = gf_mulx(p); }
+        bases[lid] = p;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint ei = lid; ei < NTW * 64u; ei += 64u) {
+        uint t   = ei >> 6;
+        uint sub = ei & 63u;
+        uint n   = sub & 15u;
+        uint4 p  = bases[(t << 2) | (sub >> 4)];
+        uint4 val = uint4(0u);
+        for (uint k = 0; k < 4u; k++) {
+            if ((n >> k) & 1u) { val ^= p; }
+            p = gf_mulx(p);
+        }
+        tabs[ei] = val;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint rr = 0; rr < (1u << LOG_G); rr++) {
+        const uint r = r_base + rr;
+        const uint pos_base = r;   // B == 0
+        uint4 elems[NF];
+        for (uint e = 0; e < NF; e++) {
+            elems[e] = z[((pos_base + (e << P.s)) << 6) + lane];
+        }
+        for (uint j = 0; j < F; j++) {
+            uint bpos = F - 1u - j;
+            for (uint b = 0; b < (NF >> 1); b++) {
+                uint low = b & ((1u << bpos) - 1u);
+                uint eu  = ((b >> bpos) << (bpos + 1u)) | low;
+                uint ev  = eu | (1u << bpos);
+                uint tsel = ((1u << j) - 1u) + (eu >> (F - j));
+                uint4 nu = elems[eu] ^ gf_mul_tab4(elems[ev], &tabs[tsel << 6]);
+                elems[eu] = nu;
+                elems[ev] ^= nu;
+            }
+        }
+        for (uint e = 0; e < NF; e++) {
+            data[((pos_base + (e << P.s)) << 6) + lane] = elems[e];
+        }
+    }
+}
+"#;
+
     // -----------------------------------------------------------------------
     // Embedded precompiled metallib.
     //
@@ -1950,6 +2198,13 @@ kernel void export_from_z_zero_root_tabs(
         /// `NIL` outside `cfg(test)`.
         #[cfg_attr(not(test), allow(dead_code))]
         pub(crate) pso_export_from_z_zero_root_tabs: Id,
+        /// E0-elision twin of the zero-root from-z kernel (skips the e=0
+        /// store column, which is bit-identical to `z`). `NIL` when elision
+        /// is disabled.
+        pub(crate) pso_from_z_zero_root_e0skip: Id,
+        /// Layer-4 B=0 z-input kernel: reads the elided column from `z`.
+        /// `NIL` when elision is disabled.
+        pub(crate) pso_ntt4g4_b0_zinput: Id,
         pub(crate) pso_ntt4h8: Id,
         pub(crate) pso_ntt5mix: Id,
         pub(crate) pso_leaf: Id,
@@ -2153,6 +2408,68 @@ kernel void export_from_z_zero_root_tabs(
                     } else {
                         (NIL, NIL)
                     };
+                let (pso_from_z_zero_root_e0skip, pso_ntt4g4_b0_zinput) =
+                    if cfg!(test) || super::gpu_from_z_e0_selected(20) {
+                        let build_lib = |src: &str| -> Result<Id, String> {
+                            let s = api.nsstring(src)?;
+                            let mut err: Id = NIL;
+                            let lib: Id = send!(
+                                api,
+                                unsafe extern "C" fn(Id, Sel, Id, Id, *mut Id) -> Id,
+                                device,
+                                c"newLibraryWithSource:options:error:",
+                                s,
+                                NIL,
+                                &mut err
+                            );
+                            if lib.is_null() {
+                                return Err(format!(
+                                    "from-z e0 shader compile failed: {}",
+                                    api.error_string(err)
+                                ));
+                            }
+                            Ok(lib)
+                        };
+                        let build_fn = |lib: Id, name: &str| -> Result<Id, String> {
+                            let ns = api.nsstring(name)?;
+                            let f: Id = send!(
+                                api,
+                                unsafe extern "C" fn(Id, Sel, Id) -> Id,
+                                lib,
+                                c"newFunctionWithName:",
+                                ns
+                            );
+                            if f.is_null() {
+                                return Err(format!("from-z e0 kernel {name} not found"));
+                            }
+                            let mut pso_err: Id = NIL;
+                            let pso: Id = send!(
+                                api,
+                                unsafe extern "C" fn(Id, Sel, Id, *mut Id) -> Id,
+                                device,
+                                c"newComputePipelineStateWithFunction:error:",
+                                f,
+                                &mut pso_err
+                            );
+                            send!(api, unsafe extern "C" fn(Id, Sel) -> Id, f, c"release");
+                            if pso.is_null() {
+                                return Err(format!(
+                                    "from-z e0 pipeline {name}: {}",
+                                    api.error_string(pso_err)
+                                ));
+                            }
+                            Ok(pso)
+                        };
+                        let lib_e0 = build_lib(FROM_Z_ZERO_ROOT_E0SKIP_MSL_SOURCE)?;
+                        let e0 = build_fn(lib_e0, "ntt_fused_reg4_from_zg4_zero_root_e0skip")?;
+                        send!(api, unsafe extern "C" fn(Id, Sel) -> Id, lib_e0, c"release");
+                        let lib_b0 = build_lib(L4_B0_ZINPUT_MSL_SOURCE)?;
+                        let b0 = build_fn(lib_b0, "ntt_fused_reg4g4_b0_zinput")?;
+                        send!(api, unsafe extern "C" fn(Id, Sel) -> Id, lib_b0, c"release");
+                        (e0, b0)
+                    } else {
+                        (NIL, NIL)
+                    };
                 Ok(Gpu {
                     api,
                     device,
@@ -2165,6 +2482,8 @@ kernel void export_from_z_zero_root_tabs(
                     pso_ntt4zg4,
                     pso_ntt4zg4_zero_root,
                     pso_export_from_z_zero_root_tabs,
+                    pso_from_z_zero_root_e0skip,
+                    pso_ntt4g4_b0_zinput,
                     pso_ntt4h8,
                     pso_ntt5mix,
                     pso_leaf,
@@ -2489,8 +2808,15 @@ kernel void export_from_z_zero_root_tabs(
             debug_assert!(!self.grouped || r_count.is_multiple_of(4));
             unsafe {
                 let pso = if self.zero_root {
-                    debug_assert!(!gpu.pso_ntt4zg4_zero_root.is_null());
-                    gpu.pso_ntt4zg4_zero_root
+                    // E0 elision reuses the identical butterfly network but
+                    // skips the e=0 store column (bit-identical to `z`).
+                    if super::gpu_from_z_e0_selected(log_d) {
+                        debug_assert!(!gpu.pso_from_z_zero_root_e0skip.is_null());
+                        gpu.pso_from_z_zero_root_e0skip
+                    } else {
+                        debug_assert!(!gpu.pso_ntt4zg4_zero_root.is_null());
+                        gpu.pso_ntt4zg4_zero_root
+                    }
                 } else if self.grouped {
                     gpu.pso_ntt4zg4
                 } else {
@@ -2574,6 +2900,7 @@ kernel void export_from_z_zero_root_tabs(
         tw_buf: Id,
         log_d: usize,
         start_layer: usize,
+        z_buf: Option<Id>,
     ) {
         unsafe {
             gpu.set_buffer(enc, data_buf, 0, 0);
@@ -2626,7 +2953,26 @@ kernel void export_from_z_zero_root_tabs(
                     core::mem::size_of::<NttParams>(),
                 );
                 gpu.set_bytes(enc, bytes, 2);
-                gpu.dispatch(enc, groups, tpg);
+                // From-z e0 elision: the (4,4) pass's B=0 tiles read the
+                // elided column from `z` (buffer 3) instead of `data`.
+                let b0_split = l == 4
+                    && f == 4
+                    && share_log > 0
+                    && s >= share_log
+                    && super::gpu_from_z_e0_selected(log_d)
+                    && z_buf.is_some();
+                if b0_split {
+                    let b0_groups = 1u64 << (s - share_log);
+                    debug_assert!(b0_groups <= groups);
+                    gpu.set_pipeline(enc, gpu.pso_ntt4g4_b0_zinput);
+                    gpu.set_buffer(enc, z_buf.unwrap(), 0, 3);
+                    gpu.dispatch(enc, b0_groups, 64);
+                    gpu.set_pipeline(enc, gpu.pso_ntt4g4);
+                    gpu.dispatch(enc, groups - b0_groups, 64);
+                } else {
+                    gpu.set_pipeline(enc, pso);
+                    gpu.dispatch(enc, groups, tpg);
+                }
             }
         }
     }
@@ -2645,6 +2991,7 @@ kernel void export_from_z_zero_root_tabs(
         log_d: usize,
         start_layer: usize,
         prefix16: u64,
+        z_buf: Option<Id>,
     ) {
         unsafe {
             gpu.set_buffer(enc, data_buf, 0, 0);
@@ -2692,7 +3039,28 @@ kernel void export_from_z_zero_root_tabs(
                 );
                 gpu.set_bytes(enc, bytes, 2);
                 debug_assert_eq!(groups % 16, 0);
-                gpu.dispatch(enc, groups / 16 * prefix16, tpg);
+                // From-z e0 elision: B=0 (4,4)-pass tiles read the elided
+                // e=0 column from `z`. The B=0 groups are exactly the first
+                // sixteenth (groups/16), always inside the prefix.
+                let b0_split = l == 4
+                    && f == 4
+                    && share_log > 0
+                    && s >= share_log
+                    && super::gpu_from_z_e0_selected(log_d)
+                    && z_buf.is_some();
+                if b0_split {
+                    let b0_groups = 1u64 << (s - share_log);
+                    debug_assert!(b0_groups == groups / 16);
+                    let total = groups / 16 * prefix16;
+                    gpu.set_pipeline(enc, gpu.pso_ntt4g4_b0_zinput);
+                    gpu.set_buffer(enc, z_buf.unwrap(), 0, 3);
+                    gpu.dispatch(enc, b0_groups, 64);
+                    gpu.set_pipeline(enc, gpu.pso_ntt4g4);
+                    gpu.dispatch(enc, total - b0_groups, 64);
+                } else {
+                    gpu.set_pipeline(enc, pso);
+                    gpu.dispatch(enc, groups / 16 * prefix16, tpg);
+                }
             }
         }
     }
@@ -2924,7 +3292,7 @@ kernel void export_from_z_zero_root_tabs(
                 let run = (|| -> Result<(), String> {
                     let cb = gpu.command_buffer()?;
                     let enc = gpu.compute_encoder(cb)?;
-                    encode_ntt_passes(gpu, enc, data_buf, tw_buf, log_d, start_layer);
+                    encode_ntt_passes(gpu, enc, data_buf, tw_buf, log_d, start_layer, None);
                     gpu.end_encoding(enc);
                     gpu.commit_and_wait(cb)?;
                     std::ptr::copy_nonoverlapping(
@@ -3103,6 +3471,7 @@ kernel void export_from_z_zero_root_tabs(
                             self.staging,
                             self.tw_buf,
                             self.tree_buf,
+                            Some(self.z_buf),
                             self.log_d,
                             self.n_leaves,
                             self.early_k,
@@ -3415,7 +3784,7 @@ kernel void export_from_z_zero_root_tabs(
                     1usize << (log_d - 4),
                 );
                 // Passes 2..: layers 4..log_d in place over staging.
-                encode_ntt_passes(gpu, enc, staging, tw_buf, log_d, 4);
+                encode_ntt_passes(gpu, enc, staging, tw_buf, log_d, 4, Some(z_buf));
                 encode_merkle(gpu, enc, staging, tree_buf, n_leaves);
                 gpu.end_encoding(enc);
                 gpu.commit_and_wait(cb)
@@ -3432,6 +3801,7 @@ kernel void export_from_z_zero_root_tabs(
         staging: Id,
         tw_buf: Id,
         tree_buf: Id,
+        z_buf: Option<Id>,
         log_d: usize,
         n_leaves: usize,
     ) -> Result<(), String> {
@@ -3440,7 +3810,7 @@ kernel void export_from_z_zero_root_tabs(
             let r = (|| {
                 let cb = gpu.command_buffer()?;
                 let enc = gpu.compute_encoder(cb)?;
-                encode_ntt_passes(gpu, enc, staging, tw_buf, log_d, 4);
+                encode_ntt_passes(gpu, enc, staging, tw_buf, log_d, 4, z_buf);
                 encode_merkle(gpu, enc, staging, tree_buf, n_leaves);
                 gpu.end_encoding(enc);
                 gpu.commit_and_wait(cb)
@@ -3517,6 +3887,7 @@ kernel void export_from_z_zero_root_tabs(
         staging: Id,
         tw_buf: Id,
         tree_buf: Id,
+        z_buf: Option<Id>,
         log_d: usize,
         n_leaves: usize,
         k_cpu16: usize,
@@ -3526,7 +3897,7 @@ kernel void export_from_z_zero_root_tabs(
             let prefix16 = (16 - k_cpu16) as u64;
             let cb2 = gpu.command_buffer()?;
             let enc = gpu.compute_encoder(cb2)?;
-            encode_ntt_passes_prefix(gpu, enc, staging, tw_buf, log_d, 4, prefix16);
+            encode_ntt_passes_prefix(gpu, enc, staging, tw_buf, log_d, 4, prefix16, z_buf);
             // Greedy aligned power-of-two subtree decomposition of the
             // leaf prefix.
             let sixteenth = n_leaves / 16;
@@ -3575,7 +3946,7 @@ kernel void export_from_z_zero_root_tabs(
                     Some(cb2) => cb2,
                     None => {
                         let cb2 = encode_hybrid_prefix_cb2(
-                            gpu, staging, tw_buf, tree_buf, log_d, n_leaves, k_cpu16,
+                            gpu, staging, tw_buf, tree_buf, Some(z_buf), log_d, n_leaves, k_cpu16,
                         )?;
                         gpu.commit_async(cb2);
                         cb2
@@ -3986,7 +4357,7 @@ kernel void export_from_z_zero_root_tabs(
             unsafe {
                 if k == 0 {
                     run_commit_graph_after_from_z(
-                        c.gpu, c.staging, c.tw_buf, c.tree_buf, log_d, n_leaves,
+                        c.gpu, c.staging, c.tw_buf, c.tree_buf, Some(c.z_buf), log_d, n_leaves,
                     )
                 } else {
                     run_commit_graph_from_z_hybrid_impl(
@@ -4251,6 +4622,7 @@ kernel void export_from_z_zero_root_tabs(
                         c.staging,
                         c.tw_buf,
                         c.tree_buf,
+                        Some(c.z_buf),
                         params.k_code(),
                         params.n_leaves(),
                     )
@@ -4390,92 +4762,6 @@ kernel void export_from_z_zero_root_tabs(
         *ON.get_or_init(|| std::env::var_os("FLOCK_NO_HYBRID_CPU_SUFFIX_DEEP").is_none())
     }
 
-    // -----------------------------------------------------------------------
-    // GPU keep-warm bridge (see `ENV_NO_GPU_KEEPWARM` docs at the top).
-    // -----------------------------------------------------------------------
-
-    static KEEPWARM_PAUSED: std::sync::atomic::AtomicBool =
-        std::sync::atomic::AtomicBool::new(true);
-    static KEEPWARM_STARTED: std::sync::atomic::AtomicBool =
-        std::sync::atomic::AtomicBool::new(false);
-
-    pub(crate) fn keepwarm_pause() {
-        KEEPWARM_PAUSED.store(true, std::sync::atomic::Ordering::Release);
-    }
-
-    /// Resume (and lazily spawn) the keep-warm thread. Called only from the
-    /// first ranked warmup commit's latch-On paths, i.e. strictly inside the
-    /// untimed warmup prove.
-    pub(crate) fn keepwarm_arm() {
-        use std::sync::atomic::Ordering;
-        if !super::gpu_keepwarm_enabled() {
-            return;
-        }
-        KEEPWARM_PAUSED.store(false, Ordering::Release);
-        if KEEPWARM_STARTED.swap(true, Ordering::AcqRel) {
-            return;
-        }
-        let _ = std::thread::Builder::new()
-            .name("gpu-keepwarm".into())
-            .spawn(keepwarm_thread);
-    }
-
-    fn keepwarm_thread() {
-        use std::sync::atomic::Ordering;
-        // Utility QoS: the bridge must never contend for P-cores.
-        unsafe extern "C" {
-            fn pthread_set_qos_class_self_np(qos_class: u32, rel: i32) -> i32;
-        }
-        unsafe {
-            let _ = pthread_set_qos_class_self_np(0x11, 0);
-        }
-        let Ok(gpu) = gpu() else { return };
-        unsafe {
-            let pool = gpu.pool_push();
-            // 16 MiB of leaf input + the matching tree slice: one dispatch is
-            // ~0.2 ms of real GPU work, small enough that at most one is ever
-            // in flight when a prove pauses the bridge (its drain hides under
-            // the prove's CPU-side witness start), large enough to hold DVFS.
-            const KW_LEAVES: usize = 16_384;
-            let (Ok(data), Ok(tree)) =
-                (gpu.new_buffer(KW_LEAVES * 1024), gpu.new_buffer(KW_LEAVES * 32))
-            else {
-                gpu.pool_pop(pool);
-                return;
-            };
-            // Contents are irrelevant (private scratch, never read back), but
-            // fault the pages once so dispatches do real reads.
-            std::ptr::write_bytes(gpu.buffer_contents(data), 0xA5, KW_LEAVES * 1024);
-            let mut warmed_s = 0.0f64;
-            // Hard cap: a worker's inter-prove windows total well under a
-            // minute; anything longer means a non-worker context, stop.
-            while warmed_s < 60.0 {
-                if KEEPWARM_PAUSED.load(Ordering::Acquire) {
-                    std::thread::sleep(std::time::Duration::from_micros(500));
-                    continue;
-                }
-                let t0 = std::time::Instant::now();
-                let ok = (|| -> Result<(), String> {
-                    let cb = gpu.command_buffer()?;
-                    let enc = gpu.compute_encoder(cb)?;
-                    gpu.set_pipeline(enc, gpu.pso_leaf);
-                    gpu.set_buffer(enc, data, 0, 0);
-                    gpu.set_buffer(enc, tree, 0, 1);
-                    gpu.dispatch(enc, (KW_LEAVES / 256) as u64, 256);
-                    gpu.end_encoding(enc);
-                    gpu.commit_and_wait(cb)
-                })();
-                warmed_s += t0.elapsed().as_secs_f64();
-                if ok.is_err() {
-                    break;
-                }
-            }
-            gpu.release(data);
-            gpu.release(tree);
-            gpu.pool_pop(pool);
-        }
-    }
-
     struct WarmupRun {
         latched: Latched,
         gpu_tree: Vec<Hash>,
@@ -4508,7 +4794,6 @@ kernel void export_from_z_zero_root_tabs(
     // V3 excludes V2 entries published before calibration was deferred; such
     // entries can contain the usize::MAX untuned sentinel. The canonical
     // reprime kill switch deliberately returns to the incumbent V2 cache.
-    // (Redraw marker AUTO-1, 2026-08-02 11:19: automated same-binary redraw while the promoted bar remains the disclosed marker-only resample at 1,357,262.51. Latest account draws: 1319797.87332625 / 1317557.71279261 / 1342891.19447755. Content change required for per-account resubmission.)
     const WARMUP_CACHE_MAGIC_V3: u64 = 0x464C_4B5F_574C_4333; // "FLK_WLC3"
 
     fn warmup_cache_magic() -> u64 {
@@ -4850,7 +5135,6 @@ kernel void export_from_z_zero_root_tabs(
                         }
                         let tree = run.gpu_tree;
                         *latch = LatchState::On(run.latched);
-                        keepwarm_arm();
                         return (CodewordBuf::Cpu(codeword), MerkleTreeBuf::Cpu(tree));
                     }
                     // Mismatch or wall regression: discard and fall through
@@ -4964,7 +5248,6 @@ kernel void export_from_z_zero_root_tabs(
                 &cpu_tree,
             );
             *latch = LatchState::On(run.latched);
-            keepwarm_arm();
         } else {
             release_latched(gpu, run.latched);
             *latch = LatchState::Off;
@@ -5219,6 +5502,7 @@ kernel void export_from_z_zero_root_tabs(
                                     stream.staging,
                                     stream.tw_buf,
                                     stream.tree_buf,
+                                    Some(stream.z_buf),
                                     stream.log_d,
                                     stream.n_leaves,
                                 )
@@ -5245,6 +5529,7 @@ kernel void export_from_z_zero_root_tabs(
                                 stream.staging,
                                 stream.tw_buf,
                                 stream.tree_buf,
+                                Some(stream.z_buf),
                                 stream.log_d,
                                 stream.n_leaves,
                             )
@@ -5573,83 +5858,6 @@ mod tests {
     use super::*;
     use crate::field::F128;
 
-    /// GPU idle-decay probe at ranked size: full commit graph wall
-    /// back-to-back vs after idle gaps. Ignored; run with --ignored --nocapture.
-    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-    #[test]
-    #[ignore]
-    fn gpu_idle_decay_probe() {
-        let log_d = 20usize;
-        let n_leaves = 1usize << 20;
-        let gpu = match imp::gpu() {
-            Ok(g) => g,
-            Err(e) => { eprintln!("no GPU: {e}"); return; }
-        };
-        let ntt = crate::ntt::AdditiveNttF128::standard(log_d);
-        let twiddles = flat_twiddle_table(&ntt, log_d);
-        unsafe {
-            let pool = gpu.pool_push();
-            let staging = gpu.new_buffer(n_leaves * 1024).unwrap();
-            let tree_buf = gpu.new_buffer((2 * n_leaves - 1) * 32).unwrap();
-            let tw_bytes = core::mem::size_of_val(twiddles.as_slice());
-            let tw_buf = gpu.new_buffer(tw_bytes).unwrap();
-            std::ptr::copy_nonoverlapping(twiddles.as_ptr().cast::<u8>(), gpu.buffer_contents(tw_buf), tw_bytes);
-            let base = gpu.buffer_contents(staging);
-            for i in (0..n_leaves * 1024).step_by(4096) {
-                *base.add(i) = (i as u8).wrapping_mul(31) | 1;
-            }
-            let run_full = || -> f64 {
-                let cb = gpu.command_buffer().unwrap();
-                let enc = gpu.compute_encoder(cb).unwrap();
-                imp::encode_ntt_passes(gpu, enc, staging, tw_buf, log_d, 4);
-                imp::encode_merkle(gpu, enc, staging, tree_buf, n_leaves);
-                gpu.end_encoding(enc);
-                let t0 = std::time::Instant::now();
-                gpu.commit_and_wait(cb).unwrap();
-                t0.elapsed().as_secs_f64() * 1e3
-            };
-            let _ = run_full(); // warm
-            // Keep-warm-flavored idle: small leaf dispatches for the gap
-            // instead of sleeping.
-            let kw_leaves = 65_536usize;
-            let kw_data = gpu.new_buffer(kw_leaves * 1024).unwrap();
-            let kw_tree = gpu.new_buffer(kw_leaves * 32).unwrap();
-            std::ptr::write_bytes(gpu.buffer_contents(kw_data), 0xA5, kw_leaves * 1024);
-            let warm_idle = |ms: u64| {
-                let t0 = std::time::Instant::now();
-                let mut n = 0u32;
-                while t0.elapsed().as_millis() < ms as u128 {
-                    let cb = gpu.command_buffer().unwrap();
-                    let enc = gpu.compute_encoder(cb).unwrap();
-                    gpu.set_pipeline(enc, gpu.pso_leaf);
-                    gpu.set_buffer(enc, kw_data, 0, 0);
-                    gpu.set_buffer(enc, kw_tree, 0, 1);
-                    gpu.dispatch(enc, (kw_leaves / 256) as u64, 256);
-                    gpu.end_encoding(enc);
-                    gpu.commit_and_wait(cb).unwrap();
-                    n += 1;
-                }
-                n
-            };
-            for (rep, idle_ms, warm) in [
-                (0u32, 0u64, false), (1, 2000, false), (2, 0, false),
-                (3, 2000, true), (4, 0, false), (5, 2000, false),
-                (6, 2000, true), (7, 0, false),
-            ] {
-                let mut n = 0;
-                if idle_ms > 0 {
-                    if warm { n = warm_idle(idle_ms); }
-                    else { std::thread::sleep(std::time::Duration::from_millis(idle_ms)); }
-                }
-                let ms = run_full();
-                println!("rep={rep} idle={idle_ms}ms warm={warm} dispatches={n} full={ms:.2}ms");
-            }
-            gpu.release(kw_data); gpu.release(kw_tree);
-            gpu.release(staging); gpu.release(tree_buf); gpu.release(tw_buf);
-            gpu.pool_pop(pool);
-        }
-    }
-
     #[test]
     fn precompute_wall_handoff_observes_late_store() {
         let wall_bits = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
@@ -5946,7 +6154,7 @@ mod tests {
 
             let cb = gpu.command_buffer().unwrap();
             let enc = gpu.compute_encoder(cb).unwrap();
-            imp::encode_ntt_passes(gpu, enc, candidate, tw_buf, log_d, 4);
+            imp::encode_ntt_passes(gpu, enc, candidate, tw_buf, log_d, 4, None);
             imp::encode_merkle(gpu, enc, candidate, tree_buf, n_leaves);
             gpu.end_encoding(enc);
             gpu.commit_and_wait(cb).unwrap();
@@ -6022,6 +6230,7 @@ mod tests {
                 log_d,
                 start_layer,
                 prefix16,
+                None,
             );
             gpu.end_encoding(enc);
             gpu.commit_and_wait(cb).unwrap();
@@ -6477,7 +6686,7 @@ mod tests {
                 let t = std::time::Instant::now();
                 let cb = gpu.command_buffer().unwrap();
                 let enc = gpu.compute_encoder(cb).unwrap();
-                imp::encode_ntt_passes(gpu, enc, data_buf, tw_buf, log_d, 1);
+                imp::encode_ntt_passes(gpu, enc, data_buf, tw_buf, log_d, 1, None);
                 gpu.end_encoding(enc);
                 gpu.commit_and_wait(cb).unwrap();
                 let ntt_ms = t.elapsed().as_secs_f64() * 1e3;
