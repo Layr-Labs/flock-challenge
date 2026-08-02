@@ -165,9 +165,7 @@ fn gpu_from_z_zero_root_value_enabled(value: Option<&std::ffi::OsStr>) -> bool {
 fn gpu_from_z_zero_root_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
-        gpu_from_z_zero_root_value_enabled(
-            std::env::var_os(ENV_NO_GPU_FROM_Z_ZERO_ROOT).as_deref(),
-        )
+        gpu_from_z_zero_root_value_enabled(std::env::var_os(ENV_NO_GPU_FROM_Z_ZERO_ROOT).as_deref())
     })
 }
 
@@ -182,16 +180,19 @@ fn select_gpu_from_z_zero_root(
     enabled && pass_tune && log_d == 20 && num_ntts == 64 && l == 0 && f == 4
 }
 
-#[inline]
+static GPU_FROM_Z_ZERO_ROOT_AVAILABLE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(true);
+
 fn gpu_from_z_zero_root_selected(log_d: usize) -> bool {
-    select_gpu_from_z_zero_root(
-        log_d,
-        64,
-        0,
-        4,
-        pass_tune_enabled(),
-        gpu_from_z_zero_root_enabled(),
-    )
+    GPU_FROM_Z_ZERO_ROOT_AVAILABLE.load(std::sync::atomic::Ordering::Acquire)
+        && select_gpu_from_z_zero_root(
+            log_d,
+            64,
+            0,
+            4,
+            pass_tune_enabled(),
+            gpu_from_z_zero_root_enabled(),
+        )
 }
 
 #[cfg(test)]
@@ -200,17 +201,33 @@ mod from_z_zero_root_gate_tests {
 
     #[test]
     fn exact_one_rollback_and_ranked_shape_only() {
-        assert!(!super::gpu_from_z_zero_root_value_enabled(Some(OsStr::new("1"))));
+        assert!(!super::gpu_from_z_zero_root_value_enabled(Some(
+            OsStr::new("1")
+        )));
         for value in [None, Some(""), Some("0"), Some("01"), Some("true")] {
-            assert!(super::gpu_from_z_zero_root_value_enabled(value.map(OsStr::new)));
+            assert!(super::gpu_from_z_zero_root_value_enabled(
+                value.map(OsStr::new)
+            ));
         }
         assert!(super::select_gpu_from_z_zero_root(20, 64, 0, 4, true, true));
-        assert!(!super::select_gpu_from_z_zero_root(20, 64, 0, 4, false, true));
-        assert!(!super::select_gpu_from_z_zero_root(20, 64, 0, 4, true, false));
-        assert!(!super::select_gpu_from_z_zero_root(19, 64, 0, 4, true, true));
-        assert!(!super::select_gpu_from_z_zero_root(20, 32, 0, 4, true, true));
-        assert!(!super::select_gpu_from_z_zero_root(20, 64, 1, 4, true, true));
-        assert!(!super::select_gpu_from_z_zero_root(20, 64, 0, 3, true, true));
+        assert!(!super::select_gpu_from_z_zero_root(
+            20, 64, 0, 4, false, true
+        ));
+        assert!(!super::select_gpu_from_z_zero_root(
+            20, 64, 0, 4, true, false
+        ));
+        assert!(!super::select_gpu_from_z_zero_root(
+            19, 64, 0, 4, true, true
+        ));
+        assert!(!super::select_gpu_from_z_zero_root(
+            20, 32, 0, 4, true, true
+        ));
+        assert!(!super::select_gpu_from_z_zero_root(
+            20, 64, 1, 4, true, true
+        ));
+        assert!(!super::select_gpu_from_z_zero_root(
+            20, 64, 0, 3, true, true
+        ));
     }
 
     #[test]
@@ -232,7 +249,10 @@ mod from_z_zero_root_gate_tests {
         const COMPACT_BUILD_MULX: usize = 11 * (0 + 4 + 8 + 12) + 11 * 64 * 4;
         assert_eq!(INCUMBENT_BUILD_MULX, 4_200);
         assert_eq!(COMPACT_BUILD_MULX, 3_080);
-        assert_eq!((INCUMBENT_BUILD_MULX - COMPACT_BUILD_MULX) * GROUPS, 18_350_080);
+        assert_eq!(
+            (INCUMBENT_BUILD_MULX - COMPACT_BUILD_MULX) * GROUPS,
+            18_350_080
+        );
 
         // Layer zero is already a copy. In layers 1..3 the zero root occurs
         // 4+2+1 times per tile and lane; four tiles and 64 lanes share each
@@ -274,9 +294,7 @@ fn gpu_parent3_value_enabled(value: Option<&std::ffi::OsStr>) -> bool {
 
 fn gpu_parent3_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| {
-        gpu_parent3_value_enabled(std::env::var_os(ENV_NO_GPU_PARENT3).as_deref())
-    })
+    *ON.get_or_init(|| gpu_parent3_value_enabled(std::env::var_os(ENV_NO_GPU_PARENT3).as_deref()))
 }
 
 fn select_gpu_parent3(n_leaves_total: usize, enabled: bool) -> bool {
@@ -371,7 +389,10 @@ pub(crate) fn commit_l0_or_fallback(
     codeword: Vec<F128>,
     params: &crate::pcs::commit::PcsParams,
     cpu: impl FnOnce(&mut [F128]) -> Vec<crate::merkle::Hash>,
-) -> (crate::pcs::commit::CodewordBuf, crate::pcs::commit::MerkleTreeBuf) {
+) -> (
+    crate::pcs::commit::CodewordBuf,
+    crate::pcs::commit::MerkleTreeBuf,
+) {
     imp::commit_l0_or_fallback(z_packed, codeword, params, cpu)
 }
 
@@ -423,7 +444,10 @@ pub(crate) fn finish_from_z_first_pass_or_fallback(
     codeword: Vec<F128>,
     params: &crate::pcs::commit::PcsParams,
     cpu: impl FnOnce(&mut [F128]) -> Vec<crate::merkle::Hash>,
-) -> (crate::pcs::commit::CodewordBuf, crate::pcs::commit::MerkleTreeBuf) {
+) -> (
+    crate::pcs::commit::CodewordBuf,
+    crate::pcs::commit::MerkleTreeBuf,
+) {
     imp::finish_from_z_first_pass_or_fallback(stream.inner, z_packed, codeword, params, cpu)
 }
 
@@ -515,8 +539,7 @@ static PRECOMPUTE_BRANCH_WALL_MS: std::sync::atomic::AtomicU64 =
 /// every scored prove and prevents the sweep from silently substituting its
 /// 100 ms fallback when the commit arm reaches tuning just before the sibling
 /// `rayon::join` arm publishes its measurement.
-const PRECOMPUTE_WALL_HANDOFF_TIMEOUT: std::time::Duration =
-    std::time::Duration::from_secs(2);
+const PRECOMPUTE_WALL_HANDOFF_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 
 fn wait_for_nonzero_wall_ms(
     wall_bits: &std::sync::atomic::AtomicU64,
@@ -643,12 +666,7 @@ pub fn retune_ranked_hybrid_with_exact_contention(
     cpu_tree: &[crate::merkle::Hash],
     replay_ab: impl Fn() + Sync,
 ) {
-    imp::retune_ranked_hybrid_with_exact_contention(
-        params,
-        cpu_codeword,
-        cpu_tree,
-        replay_ab,
-    );
+    imp::retune_ranked_hybrid_with_exact_contention(params, cpu_codeword, cpu_tree, replay_ab);
 }
 
 #[cfg_attr(
@@ -656,13 +674,11 @@ pub fn retune_ranked_hybrid_with_exact_contention(
     allow(dead_code)
 )]
 fn wait_for_precompute_branch_wall_ms() -> f64 {
-    wait_for_nonzero_wall_ms(
-        &PRECOMPUTE_BRANCH_WALL_MS,
-        PRECOMPUTE_WALL_HANDOFF_TIMEOUT,
-    )
+    wait_for_nonzero_wall_ms(&PRECOMPUTE_BRANCH_WALL_MS, PRECOMPUTE_WALL_HANDOFF_TIMEOUT)
 }
 
 /// Returns true when the GPU commit machinery is allowed to initialize.
+#[inline(always)]
 pub(crate) fn gpu_commit_enabled() -> bool {
     // A/B-CONTROL: set to `false` to build an exact GPU-off control binary
     // (the benchmark harness env-clears workers, so the env kill switch
@@ -853,7 +869,11 @@ mod imp {
                 // fast path.
                 let libsystem = dlopen(c"/usr/lib/libSystem.B.dylib".as_ptr().cast(), RTLD_NOW);
                 let opt_sym = |h: *mut c_void, name: &core::ffi::CStr| -> *mut c_void {
-                    if h.is_null() { std::ptr::null_mut() } else { dlsym(h, name.as_ptr()) }
+                    if h.is_null() {
+                        std::ptr::null_mut()
+                    } else {
+                        dlsym(h, name.as_ptr())
+                    }
                 };
                 let ddc = opt_sym(libsystem, c"dispatch_data_create");
                 let drel = opt_sym(libsystem, c"dispatch_release");
@@ -867,10 +887,7 @@ mod imp {
                         metal,
                         c"MTLCreateSystemDefaultDevice",
                     )?),
-                    copy_all_devices: core::mem::transmute(sym(
-                        metal,
-                        c"MTLCopyAllDevices",
-                    )?),
+                    copy_all_devices: core::mem::transmute(sym(metal, c"MTLCopyAllDevices")?),
                     dispatch_data_create: if ddc.is_null() {
                         None
                     } else {
@@ -2209,40 +2226,68 @@ kernel void blake3_pow_scan(
                     if let Ok(p) = build_psos(prebuilt) {
                         psos = Some(p);
                     }
-                    send!(api, unsafe extern "C" fn(Id, Sel) -> Id, prebuilt, c"release");
+                    send!(
+                        api,
+                        unsafe extern "C" fn(Id, Sel) -> Id,
+                        prebuilt,
+                        c"release"
+                    );
                 }
-                let [pso_ntt, pso_ntt4g4, pso_ntt4, pso_ntt3, pso_ntt4z, pso_ntt4zg4, pso_ntt4h8, pso_ntt5mix, pso_leaf, pso_parent, pso_parent3] =
-                    match psos {
-                        Some(p) => p,
-                        None => {
-                            let src = api.nsstring(MSL_SOURCE)?;
-                            let mut err: Id = NIL;
-                            let library: Id = send!(
-                                api,
-                                unsafe extern "C" fn(Id, Sel, Id, Id, *mut Id) -> Id,
-                                device,
-                                c"newLibraryWithSource:options:error:",
-                                src,
-                                NIL,
-                                &mut err
-                            );
-                            if library.is_null() {
-                                return Err(format!(
-                                    "shader compile failed: {}",
-                                    api.error_string(err)
-                                ));
-                            }
-                            let p = build_psos(library)?;
-                            send!(api, unsafe extern "C" fn(Id, Sel) -> Id, library, c"release");
-                            p
+                let [
+                    pso_ntt,
+                    pso_ntt4g4,
+                    pso_ntt4,
+                    pso_ntt3,
+                    pso_ntt4z,
+                    pso_ntt4zg4,
+                    pso_ntt4h8,
+                    pso_ntt5mix,
+                    pso_leaf,
+                    pso_parent,
+                    pso_parent3,
+                ] = match psos {
+                    Some(p) => p,
+                    None => {
+                        let src = api.nsstring(MSL_SOURCE)?;
+                        let mut err: Id = NIL;
+                        let library: Id = send!(
+                            api,
+                            unsafe extern "C" fn(Id, Sel, Id, Id, *mut Id) -> Id,
+                            device,
+                            c"newLibraryWithSource:options:error:",
+                            src,
+                            NIL,
+                            &mut err
+                        );
+                        if library.is_null() {
+                            return Err(format!(
+                                "shader compile failed: {}",
+                                api.error_string(err)
+                            ));
                         }
-                    };
+                        let p = build_psos(library)?;
+                        send!(
+                            api,
+                            unsafe extern "C" fn(Id, Sel) -> Id,
+                            library,
+                            c"release"
+                        );
+                        p
+                    }
+                };
 
                 // Keep the embedded incumbent metallib byte-for-byte intact.
                 // The exact rollback skips this supplemental compile and
                 // selects the incumbent pso_ntt4zg4 below.
-                let (pso_ntt4zg4_zero_root, pso_export_from_z_zero_root_tabs) =
-                    if cfg!(test) || super::gpu_from_z_zero_root_selected(20) {
+                let (pso_ntt4zg4_zero_root, pso_export_from_z_zero_root_tabs) = if cfg!(test)
+                    || super::gpu_from_z_zero_root_selected(20)
+                {
+                    // FAIL-OPEN: any supplemental-library build failure
+                    // degrades to the incumbent pso_ntt4zg4 path below
+                    // instead of poisoning process-wide `init_gpu` (which
+                    // latched the whole job onto the CPU L0 path in the
+                    // e0-family submissions).
+                    let built = (|| -> Result<(Id, Id), String> {
                         let src = api.nsstring(FROM_Z_ZERO_ROOT_MSL_SOURCE)?;
                         let mut err: Id = NIL;
                         let library: Id = send!(
@@ -2297,11 +2342,25 @@ kernel void blake3_pow_scan(
                         } else {
                             NIL
                         };
-                        send!(api, unsafe extern "C" fn(Id, Sel) -> Id, library, c"release");
-                        (candidate, export)
-                    } else {
-                        (NIL, NIL)
-                    };
+                        send!(
+                            api,
+                            unsafe extern "C" fn(Id, Sel) -> Id,
+                            library,
+                            c"release"
+                        );
+                        Ok((candidate, export))
+                    })();
+                    match built {
+                        Ok(psos) => psos,
+                        Err(_) => {
+                            super::GPU_FROM_Z_ZERO_ROOT_AVAILABLE
+                                .store(false, std::sync::atomic::Ordering::Release);
+                            (NIL, NIL)
+                        }
+                    }
+                } else {
+                    (NIL, NIL)
+                };
 
                 let (pso_pow, pow_out) = if super::gpu_grind_enabled() {
                     // This optimization is supplemental: a compile/pipeline/
@@ -2335,7 +2394,12 @@ kernel void blake3_pow_scan(
                             ns
                         );
                         if function.is_null() {
-                            send!(api, unsafe extern "C" fn(Id, Sel) -> Id, library, c"release");
+                            send!(
+                                api,
+                                unsafe extern "C" fn(Id, Sel) -> Id,
+                                library,
+                                c"release"
+                            );
                             return Err("PCS grind kernel blake3_pow_scan not found".into());
                         }
                         let mut pso_err: Id = NIL;
@@ -2347,8 +2411,18 @@ kernel void blake3_pow_scan(
                             function,
                             &mut pso_err
                         );
-                        send!(api, unsafe extern "C" fn(Id, Sel) -> Id, function, c"release");
-                        send!(api, unsafe extern "C" fn(Id, Sel) -> Id, library, c"release");
+                        send!(
+                            api,
+                            unsafe extern "C" fn(Id, Sel) -> Id,
+                            function,
+                            c"release"
+                        );
+                        send!(
+                            api,
+                            unsafe extern "C" fn(Id, Sel) -> Id,
+                            library,
+                            c"release"
+                        );
                         if pso.is_null() {
                             return Err(format!(
                                 "PCS grind pipeline blake3_pow_scan: {}",
@@ -2475,7 +2549,12 @@ kernel void blake3_pow_scan(
         pub(crate) unsafe fn release(&self, obj: Id) {
             if !obj.is_null() {
                 unsafe {
-                    send!(self.api, unsafe extern "C" fn(Id, Sel) -> Id, obj, c"release");
+                    send!(
+                        self.api,
+                        unsafe extern "C" fn(Id, Sel) -> Id,
+                        obj,
+                        c"release"
+                    );
                 }
             }
         }
@@ -2484,7 +2563,14 @@ kernel void blake3_pow_scan(
         /// autorelease pool is popped. Paired with [`Self::release`] after the
         /// stream waits for completion.
         pub(crate) unsafe fn retain(&self, obj: Id) -> Id {
-            unsafe { send!(self.api, unsafe extern "C" fn(Id, Sel) -> Id, obj, c"retain") }
+            unsafe {
+                send!(
+                    self.api,
+                    unsafe extern "C" fn(Id, Sel) -> Id,
+                    obj,
+                    c"retain"
+                )
+            }
         }
 
         pub(crate) unsafe fn command_buffer(&self) -> Result<Id, String> {
@@ -2566,8 +2652,16 @@ kernel void blake3_pow_scan(
                     unsafe extern "C" fn(Id, Sel, MtlSize, MtlSize),
                     enc,
                     c"dispatchThreadgroups:threadsPerThreadgroup:",
-                    MtlSize { width: groups, height: 1, depth: 1 },
-                    MtlSize { width: threads_per_group, height: 1, depth: 1 }
+                    MtlSize {
+                        width: groups,
+                        height: 1,
+                        depth: 1
+                    },
+                    MtlSize {
+                        width: threads_per_group,
+                        height: 1,
+                        depth: 1
+                    }
                 );
             }
         }
@@ -2652,12 +2746,8 @@ kernel void blake3_pow_scan(
                 if status == 4 {
                     Ok(())
                 } else {
-                    let err: Id = send!(
-                        self.api,
-                        unsafe extern "C" fn(Id, Sel) -> Id,
-                        cb,
-                        c"error"
-                    );
+                    let err: Id =
+                        send!(self.api, unsafe extern "C" fn(Id, Sel) -> Id, cb, c"error");
                     Err(format!(
                         "command buffer status {status}: {}",
                         self.api.error_string(err)
@@ -2816,11 +2906,9 @@ kernel void blake3_pow_scan(
                 // loses badly because each lane keeps 16 F128s live.
                 let s = log_d - l - f;
                 let (pso, tpg, groups) = match f {
-                    4 if share_log > 0 && s >= share_log => (
-                        gpu.pso_ntt4g4,
-                        64u64,
-                        1u64 << (log_d - f - share_log),
-                    ),
+                    4 if share_log > 0 && s >= share_log => {
+                        (gpu.pso_ntt4g4, 64u64, 1u64 << (log_d - f - share_log))
+                    }
                     4 if super::pass_tune_enabled()
                         && super::gpu_mixed_final_selected(log_d, l, f) =>
                     {
@@ -2830,9 +2918,7 @@ kernel void blake3_pow_scan(
                     // share, so spend the same occupancy currency the other
                     // way — halve the per-tile table footprint (byte-Horner
                     // 32-entry tables) so twice the tiles fit a core.
-                    4 if super::pass_tune_enabled() => {
-                        (gpu.pso_ntt4h8, 64u64, 1u64 << (log_d - f))
-                    }
+                    4 if super::pass_tune_enabled() => (gpu.pso_ntt4h8, 64u64, 1u64 << (log_d - f)),
                     4 => (gpu.pso_ntt4, 64u64, 1u64 << (log_d - f)),
                     3 => (gpu.pso_ntt3, 64u64, 1u64 << (log_d - f)),
                     _ => (gpu.pso_ntt, 1u64 << (f + 5), 1u64 << (log_d - f)),
@@ -2881,11 +2967,9 @@ kernel void blake3_pow_scan(
                 debug_assert!(l >= 4, "prefix passes require layer >= 4 blocks");
                 let s = log_d - l - f;
                 let (pso, tpg, groups) = match f {
-                    4 if share_log > 0 && s >= share_log => (
-                        gpu.pso_ntt4g4,
-                        64u64,
-                        1u64 << (log_d - f - share_log),
-                    ),
+                    4 if share_log > 0 && s >= share_log => {
+                        (gpu.pso_ntt4g4, 64u64, 1u64 << (log_d - f - share_log))
+                    }
                     4 if super::pass_tune_enabled()
                         && super::gpu_mixed_final_selected(log_d, l, f) =>
                     {
@@ -2895,9 +2979,7 @@ kernel void blake3_pow_scan(
                     // share, so spend the same occupancy currency the other
                     // way — halve the per-tile table footprint (byte-Horner
                     // 32-entry tables) so twice the tiles fit a core.
-                    4 if super::pass_tune_enabled() => {
-                        (gpu.pso_ntt4h8, 64u64, 1u64 << (log_d - f))
-                    }
+                    4 if super::pass_tune_enabled() => (gpu.pso_ntt4h8, 64u64, 1u64 << (log_d - f)),
                     4 => (gpu.pso_ntt4, 64u64, 1u64 << (log_d - f)),
                     3 => (gpu.pso_ntt3, 64u64, 1u64 << (log_d - f)),
                     _ => (gpu.pso_ntt, 1u64 << (f + 5), 1u64 << (log_d - f)),
@@ -3006,12 +3088,7 @@ kernel void blake3_pow_scan(
                 let write_level_start = level_start + level_len;
                 let n_out = local_len / 2;
                 gpu.set_buffer(enc, tree_buf, (level_start + local_start) * 32, 0);
-                gpu.set_buffer(
-                    enc,
-                    tree_buf,
-                    (write_level_start + local_start / 2) * 32,
-                    1,
-                );
+                gpu.set_buffer(enc, tree_buf, (write_level_start + local_start / 2) * 32, 1);
                 let tpg = 256u64.min(n_out as u64);
                 gpu.dispatch(enc, n_out as u64 / tpg, tpg);
                 level_start = write_level_start;
@@ -3519,17 +3596,19 @@ kernel void blake3_pow_scan(
     fn copy_bytes_parallel(src: *const u8, dst: &mut [u8]) {
         use rayon::prelude::*;
         let src_addr = src as usize;
-        dst.par_chunks_mut(1 << 22).enumerate().for_each(|(i, chunk)| {
-            // SAFETY: caller guarantees `src` points at least `dst.len()`
-            // bytes; chunks are disjoint.
-            unsafe {
-                std::ptr::copy_nonoverlapping(
-                    (src_addr as *const u8).add(i << 22),
-                    chunk.as_mut_ptr(),
-                    chunk.len(),
-                );
-            }
-        });
+        dst.par_chunks_mut(1 << 22)
+            .enumerate()
+            .for_each(|(i, chunk)| {
+                // SAFETY: caller guarantees `src` points at least `dst.len()`
+                // bytes; chunks are disjoint.
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        (src_addr as *const u8).add(i << 22),
+                        chunk.as_mut_ptr(),
+                        chunk.len(),
+                    );
+                }
+            });
     }
 
     /// Parent levels built by each finalized 1,024-leaf CPU-suffix chunk.
@@ -3918,8 +3997,10 @@ kernel void blake3_pow_scan(
                     }
                     while local_len > 1 {
                         let write_level_start = level_start + level_len;
-                        let (r0, w0) =
-                            (level_start + local_start, write_level_start + local_start / 2);
+                        let (r0, w0) = (
+                            level_start + local_start,
+                            write_level_start + local_start / 2,
+                        );
                         let n_out = local_len / 2;
                         // ≤1024-output jobs (the parent kernel's contract),
                         // parallel across the level.
@@ -3934,10 +4015,8 @@ kernel void blake3_pow_scan(
                                 tree_base.ptr().add(r0 + 2 * o),
                                 2 * len,
                             );
-                            let write = core::slice::from_raw_parts_mut(
-                                tree_base.ptr().add(w0 + o),
-                                len,
-                            );
+                            let write =
+                                core::slice::from_raw_parts_mut(tree_base.ptr().add(w0 + o), len);
                             crate::merkle::hash_ranked_blake3_parent_chunk(read, write);
                         });
                         level_start = write_level_start;
@@ -4175,7 +4254,13 @@ kernel void blake3_pow_scan(
         // so the sweep's `rayon::join` arm is `Send`.
         unsafe impl Send for GraphCtx<'_> {}
         unsafe impl Sync for GraphCtx<'_> {}
-        let ctx = GraphCtx { gpu, z_buf, staging, tw_buf, tree_buf };
+        let ctx = GraphCtx {
+            gpu,
+            z_buf,
+            staging,
+            tw_buf,
+            tree_buf,
+        };
         let run_graph = |k: usize| -> Result<(), String> {
             let c = &ctx;
             unsafe {
@@ -4286,8 +4371,8 @@ kernel void blake3_pow_scan(
         // once, repeatedly transformed stale staging, and subtracted a
         // first-pass wall from an interval that did not contain that pass.
         // Keep an exact same-binary rollback for paired measurements.
-        let canonical_reprime = streamed_probe
-            && std::env::var_os("FLOCK_NO_HYBRID_TUNE_CANONICAL_REPRIME").is_none();
+        let canonical_reprime =
+            streamed_probe && std::env::var_os("FLOCK_NO_HYBRID_TUNE_CANONICAL_REPRIME").is_none();
         let first_pass_ms = if streamed_probe && !canonical_reprime {
             let c = &ctx;
             let t0 = std::time::Instant::now();
@@ -4423,9 +4508,7 @@ kernel void blake3_pow_scan(
     ) {
         use std::sync::atomic::Ordering;
 
-        if !ranked_exact_tune_applicable(params)
-            || !super::claim_ranked_exact_contention_tune()
-        {
+        if !ranked_exact_tune_applicable(params) || !super::claim_ranked_exact_contention_tune() {
             return;
         }
 
@@ -4501,13 +4584,7 @@ kernel void blake3_pow_scan(
             Ok(t0.elapsed().as_secs_f64() * 1e3)
         };
         let reprime = || unsafe {
-            run_from_z_first_pass(
-                ctx.gpu,
-                ctx.z_buf,
-                ctx.staging,
-                ctx.tw_buf,
-                params.k_code(),
-            )
+            run_from_z_first_pass(ctx.gpu, ctx.z_buf, ctx.staging, ctx.tw_buf, params.k_code())
         };
         let samples = match collect_ranked_exact_samples(reprime, sample) {
             Ok(samples) => samples,
@@ -4525,11 +4602,8 @@ kernel void blake3_pow_scan(
             finish_ranked_exact_contention_tune(params, cpu_tree, 0);
             return;
         };
-        let Some(chosen) = choose_hybrid_k(
-            &RANKED_EXACT_TUNE_CANDIDATES,
-            &means,
-            DEFAULT_HYBRID_K,
-        ) else {
+        let Some(chosen) = choose_hybrid_k(&RANKED_EXACT_TUNE_CANDIDATES, &means, DEFAULT_HYBRID_K)
+        else {
             finish_ranked_exact_contention_tune(params, cpu_tree, 0);
             return;
         };
@@ -4597,11 +4671,7 @@ kernel void blake3_pow_scan(
                 if verified { chosen } else { 0 },
             );
         }
-        finish_ranked_exact_contention_tune(
-            params,
-            cpu_tree,
-            if verified { chosen } else { 0 },
-        );
+        finish_ranked_exact_contention_tune(params, cpu_tree, if verified { chosen } else { 0 });
     }
 
     /// Use the ranked cache-local deep-pair CPU suffix and hash each finalized
@@ -4661,9 +4731,10 @@ kernel void blake3_pow_scan(
             // in flight when a prove pauses the bridge (its drain hides under
             // the prove's CPU-side witness start), large enough to hold DVFS.
             const KW_LEAVES: usize = 16_384;
-            let (Ok(data), Ok(tree)) =
-                (gpu.new_buffer(KW_LEAVES * 1024), gpu.new_buffer(KW_LEAVES * 32))
-            else {
+            let (Ok(data), Ok(tree)) = (
+                gpu.new_buffer(KW_LEAVES * 1024),
+                gpu.new_buffer(KW_LEAVES * 32),
+            ) else {
                 gpu.pool_pop(pool);
                 return;
             };
@@ -4749,8 +4820,7 @@ kernel void blake3_pow_scan(
     fn warmup_cache_msl_fnv_for(zero_root: bool) -> u64 {
         let base = fnv1a64(MSL_SOURCE);
         if zero_root {
-            base ^ fnv1a64(FROM_Z_ZERO_ROOT_MSL_SOURCE).rotate_left(1)
-                ^ 0x5A52_4F4F_545F_3131 // "ZROOT_11"
+            base ^ fnv1a64(FROM_Z_ZERO_ROOT_MSL_SOURCE).rotate_left(1) ^ 0x5A52_4F4F_545F_3131 // "ZROOT_11"
         } else {
             base
         }
@@ -4802,7 +4872,11 @@ kernel void blake3_pow_scan(
     }
 
     fn warmup_cache_path() -> std::path::PathBuf {
-        let version = if hybrid_tune_canonical_reprime_enabled() { 3 } else { 2 };
+        let version = if hybrid_tune_canonical_reprime_enabled() {
+            3
+        } else {
+            2
+        };
         std::env::temp_dir().join(format!("flock-warmup-latch-v{version}.bin"))
     }
 
@@ -4835,7 +4909,12 @@ kernel void blake3_pow_scan(
         }
         let mut cpu_root: Hash = [0u8; 32];
         cpu_root.copy_from_slice(root_bytes);
-        Some(WarmupCache { latch_on, tuned_k, cpu_wall_ms, cpu_root })
+        Some(WarmupCache {
+            latch_on,
+            tuned_k,
+            cpu_wall_ms,
+            cpu_root,
+        })
     }
 
     fn write_warmup_cache(
@@ -4936,8 +5015,7 @@ kernel void blake3_pow_scan(
                 // Read-only no-copy wrap of the caller's z buffer. The GPU
                 // never writes it; the pooled allocation is page-aligned.
                 let z_bytes = core::mem::size_of_val(z_packed);
-                let z_buf =
-                    gpu.wrap_buffer(z_packed.as_ptr().cast_mut().cast::<u8>(), z_bytes)?;
+                let z_buf = gpu.wrap_buffer(z_packed.as_ptr().cast_mut().cast::<u8>(), z_bytes)?;
                 created.push(z_buf);
 
                 // Untimed wiring run, then the identical timed run.
@@ -5007,7 +5085,10 @@ kernel void blake3_pow_scan(
         mut codeword: Vec<F128>,
         params: &crate::pcs::commit::PcsParams,
         cpu: impl FnOnce(&mut [F128]) -> Vec<Hash>,
-    ) -> (crate::pcs::commit::CodewordBuf, crate::pcs::commit::MerkleTreeBuf) {
+    ) -> (
+        crate::pcs::commit::CodewordBuf,
+        crate::pcs::commit::MerkleTreeBuf,
+    ) {
         use crate::pcs::commit::{CodewordBuf, MerkleTreeBuf};
         let dbg = debug_enabled();
 
@@ -5030,13 +5111,10 @@ kernel void blake3_pow_scan(
                     *latch = LatchState::Off;
                     return (CodewordBuf::Cpu(codeword), MerkleTreeBuf::Cpu(cpu_tree));
                 }
-                if let Ok(run) =
-                    warmup_gpu_run(z_packed, params.k_code(), params.n_leaves())
-                {
+                if let Ok(run) = warmup_gpu_run(z_packed, params.k_code(), params.n_leaves()) {
                     let tree_ok = run.gpu_tree.last() == Some(&cache.cpu_root);
                     let force = std::env::var_os(super::ENV_GPU_COMMIT_FORCE).is_some();
-                    let fast =
-                        run.gpu_wall_ms * super::LATCH_MARGIN <= cache.cpu_wall_ms;
+                    let fast = run.gpu_wall_ms * super::LATCH_MARGIN <= cache.cpu_wall_ms;
                     // Mirror the incumbent latch contract: latching ON also
                     // pins the warmup z allocation to its retained no-copy
                     // Metal view (the promoted z-pin mechanism). On pin
@@ -5052,8 +5130,7 @@ kernel void blake3_pow_scan(
                                 run.gpu_wall_ms, cache.cpu_wall_ms, cache.tuned_k
                             );
                         }
-                        TUNED_HYBRID_K
-                            .store(cache.tuned_k, std::sync::atomic::Ordering::Relaxed);
+                        TUNED_HYBRID_K.store(cache.tuned_k, std::sync::atomic::Ordering::Relaxed);
                         // The publishing worker already completed the exact
                         // replay; keep cache-hit workers out of calibration.
                         super::satisfy_ranked_exact_contention_tune();
@@ -5228,7 +5305,10 @@ kernel void blake3_pow_scan(
         mut codeword: Vec<F128>,
         params: &crate::pcs::commit::PcsParams,
         cpu: impl FnOnce(&mut [F128]) -> Vec<Hash>,
-    ) -> (crate::pcs::commit::CodewordBuf, crate::pcs::commit::MerkleTreeBuf) {
+    ) -> (
+        crate::pcs::commit::CodewordBuf,
+        crate::pcs::commit::MerkleTreeBuf,
+    ) {
         use crate::pcs::commit::{CodewordBuf, MerkleTreeBuf};
         use std::sync::atomic::Ordering;
         let log_d = params.k_code();
@@ -5342,7 +5422,10 @@ kernel void blake3_pow_scan(
         mut codeword: Vec<F128>,
         params: &crate::pcs::commit::PcsParams,
         cpu: impl FnOnce(&mut [F128]) -> Vec<Hash>,
-    ) -> (crate::pcs::commit::CodewordBuf, crate::pcs::commit::MerkleTreeBuf) {
+    ) -> (
+        crate::pcs::commit::CodewordBuf,
+        crate::pcs::commit::MerkleTreeBuf,
+    ) {
         use crate::pcs::commit::{CodewordBuf, MerkleTreeBuf};
         use std::sync::atomic::Ordering;
 
@@ -5537,7 +5620,10 @@ kernel void blake3_pow_scan(
         mut codeword: Vec<F128>,
         params: &crate::pcs::commit::PcsParams,
         cpu: impl FnOnce(&mut [F128]) -> Vec<Hash>,
-    ) -> (crate::pcs::commit::CodewordBuf, crate::pcs::commit::MerkleTreeBuf) {
+    ) -> (
+        crate::pcs::commit::CodewordBuf,
+        crate::pcs::commit::MerkleTreeBuf,
+    ) {
         use crate::pcs::commit::{CodewordBuf, MerkleTreeBuf};
         if !super::gpu_commit_enabled()
             || !super::is_ranked_gpu_shape(params)
@@ -5555,9 +5641,7 @@ kernel void blake3_pow_scan(
                 let tree = cpu(&mut codeword);
                 (CodewordBuf::Cpu(codeword), MerkleTreeBuf::Cpu(tree))
             }
-            LatchState::Undecided => {
-                warmup_and_decide(&mut latch, z_packed, codeword, params, cpu)
-            }
+            LatchState::Undecided => warmup_and_decide(&mut latch, z_packed, codeword, params, cpu),
             LatchState::On(_) => run_latched(&mut latch, z_packed, codeword, params, cpu),
         }
     }
@@ -5643,8 +5727,7 @@ kernel void blake3_pow_scan(
                     encode_merkle(gpu, enc, data_buf, tree_buf, n_leaves);
                     gpu.end_encoding(enc);
                     gpu.commit_and_wait(cb)?;
-                    let mut tree: Vec<crate::merkle::Hash> =
-                        crate::alloc_uninit_vec(total_nodes);
+                    let mut tree: Vec<crate::merkle::Hash> = crate::alloc_uninit_vec(total_nodes);
                     std::ptr::copy_nonoverlapping(
                         gpu.buffer_contents(tree_buf),
                         tree.as_mut_ptr().cast::<u8>(),
@@ -5910,11 +5993,21 @@ kernel void zc_fold_reduce(
                     Ok(r) => r,
                     Err(e) => {
                         gpu.release(fold);
-                        send!(gpu.api, unsafe extern "C" fn(Id, Sel) -> Id, library, c"release");
+                        send!(
+                            gpu.api,
+                            unsafe extern "C" fn(Id, Sel) -> Id,
+                            library,
+                            c"release"
+                        );
                         return Err(e);
                     }
                 };
-                send!(gpu.api, unsafe extern "C" fn(Id, Sel) -> Id, library, c"release");
+                send!(
+                    gpu.api,
+                    unsafe extern "C" fn(Id, Sel) -> Id,
+                    library,
+                    c"release"
+                );
                 Ok((fold, reduce))
             })();
             gpu.pool_pop(pool);
@@ -5967,10 +6060,7 @@ kernel void zc_fold_reduce(
             const MAX_WRAPS: usize = 3;
             let ptr = z.as_ptr() as usize;
             let len = z.len();
-            if let Some(&(_, _, buf)) = self
-                .z_wraps
-                .iter()
-                .find(|(p, l, _)| *p == ptr && *l == len)
+            if let Some(&(_, _, buf)) = self.z_wraps.iter().find(|(p, l, _)| *p == ptr && *l == len)
             {
                 return Ok(buf);
             }
@@ -6084,13 +6174,7 @@ kernel void zc_fold_reduce(
                     gpu.pool_pop(pool);
                 }
             }
-            zc_fold_note_sample(
-                self.claim_lo,
-                self.n_claims,
-                sample_ms,
-                head_ms,
-                suffix_ms,
-            );
+            zc_fold_note_sample(self.claim_lo, self.n_claims, sample_ms, head_ms, suffix_ms);
             Ok(())
         }
     }
@@ -6126,7 +6210,11 @@ kernel void zc_fold_reduce(
                 cb,
                 c"GPUEndTime"
             );
-            if end > start { (end - start) * 1e3 } else { 0.0 }
+            if end > start {
+                (end - start) * 1e3
+            } else {
+                0.0
+            }
         }
     }
 
@@ -6186,8 +6274,7 @@ kernel void zc_fold_reduce(
         // which costs wall directly; undershooting only leaves a little of
         // the otherwise-free window unused, and the GPU arm's wall is the
         // noisier of the two (clock ramp, queue latency).
-        let balanced =
-            0.9 * (head_ms.max(0.0) + n_claims as f64 * u_cpu) / (u_gpu + u_cpu);
+        let balanced = 0.9 * (head_ms.max(0.0) + n_claims as f64 * u_cpu) / (u_gpu + u_cpu);
         let g = (balanced.round() as i64).clamp(1, n_claims as i64 - 1) as usize;
         ZC_FOLD_TUNED_CLAIMS.store(g, std::sync::atomic::Ordering::Relaxed);
         if super::gpu_zerocheck_debug() {
@@ -6201,8 +6288,7 @@ kernel void zc_fold_reduce(
     /// Successful GPU prefix submissions this process. Lets a test assert the
     /// arm actually ran instead of silently falling back to the CPU, and lets
     /// an in-process A/B confirm which arm produced a prove.
-    static ZC_FOLD_SUBMITS: std::sync::atomic::AtomicUsize =
-        std::sync::atomic::AtomicUsize::new(0);
+    static ZC_FOLD_SUBMITS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn zerocheck_gpu_submits() -> usize {
@@ -6333,9 +6419,7 @@ kernel void zc_fold_reduce(
                         k,
                         useful,
                         stripe_hi,
-                        stripes_per_chunk: stripe_hi
-                            .div_ceil(ZC_FOLD_CHUNKS)
-                            .next_multiple_of(8),
+                        stripes_per_chunk: stripe_hi.div_ceil(ZC_FOLD_CHUNKS).next_multiple_of(8),
                         i_groups: k / ZC_FOLD_COLS_PER_TG,
                     };
                     Ok((zc_fold_submit(gpu, state, &plan)?, plan))
@@ -6394,8 +6478,8 @@ kernel void zc_fold_reduce(
             assert_eq!(
                 *events.borrow(),
                 [
-                    -1, 0, -1, 2, -1, 3, -1, 4, -1, 5, -1, 6, -1, 7, -1, 8, -1, 8,
-                    -1, 7, -1, 6, -1, 5, -1, 4, -1, 3, -1, 2, -1, 0,
+                    -1, 0, -1, 2, -1, 3, -1, 4, -1, 5, -1, 6, -1, 7, -1, 8, -1, 8, -1, 7, -1, 6,
+                    -1, 5, -1, 4, -1, 3, -1, 2, -1, 0,
                 ]
             );
             assert_eq!(samples[0], [0.0, 0.0]);
@@ -6490,7 +6574,10 @@ mod imp {
         mut codeword: Vec<F128>,
         _params: &crate::pcs::commit::PcsParams,
         cpu: impl FnOnce(&mut [F128]) -> Vec<crate::merkle::Hash>,
-    ) -> (crate::pcs::commit::CodewordBuf, crate::pcs::commit::MerkleTreeBuf) {
+    ) -> (
+        crate::pcs::commit::CodewordBuf,
+        crate::pcs::commit::MerkleTreeBuf,
+    ) {
         let tree = cpu(&mut codeword);
         (
             crate::pcs::commit::CodewordBuf::Cpu(codeword),
@@ -6532,7 +6619,10 @@ mod imp {
         mut codeword: Vec<F128>,
         _params: &crate::pcs::commit::PcsParams,
         cpu: impl FnOnce(&mut [F128]) -> Vec<crate::merkle::Hash>,
-    ) -> (crate::pcs::commit::CodewordBuf, crate::pcs::commit::MerkleTreeBuf) {
+    ) -> (
+        crate::pcs::commit::CodewordBuf,
+        crate::pcs::commit::MerkleTreeBuf,
+    ) {
         let tree = cpu(&mut codeword);
         (
             crate::pcs::commit::CodewordBuf::Cpu(codeword),
@@ -6572,7 +6662,10 @@ mod tests {
         let n_leaves = 1usize << 20;
         let gpu = match imp::gpu() {
             Ok(g) => g,
-            Err(e) => { eprintln!("no GPU: {e}"); return; }
+            Err(e) => {
+                eprintln!("no GPU: {e}");
+                return;
+            }
         };
         let ntt = crate::ntt::AdditiveNttF128::standard(log_d);
         let twiddles = flat_twiddle_table(&ntt, log_d);
@@ -6582,7 +6675,11 @@ mod tests {
             let tree_buf = gpu.new_buffer((2 * n_leaves - 1) * 32).unwrap();
             let tw_bytes = core::mem::size_of_val(twiddles.as_slice());
             let tw_buf = gpu.new_buffer(tw_bytes).unwrap();
-            std::ptr::copy_nonoverlapping(twiddles.as_ptr().cast::<u8>(), gpu.buffer_contents(tw_buf), tw_bytes);
+            std::ptr::copy_nonoverlapping(
+                twiddles.as_ptr().cast::<u8>(),
+                gpu.buffer_contents(tw_buf),
+                tw_bytes,
+            );
             let base = gpu.buffer_contents(staging);
             for i in (0..n_leaves * 1024).step_by(4096) {
                 *base.add(i) = (i as u8).wrapping_mul(31) | 1;
@@ -6621,20 +6718,31 @@ mod tests {
                 n
             };
             for (rep, idle_ms, warm) in [
-                (0u32, 0u64, false), (1, 2000, false), (2, 0, false),
-                (3, 2000, true), (4, 0, false), (5, 2000, false),
-                (6, 2000, true), (7, 0, false),
+                (0u32, 0u64, false),
+                (1, 2000, false),
+                (2, 0, false),
+                (3, 2000, true),
+                (4, 0, false),
+                (5, 2000, false),
+                (6, 2000, true),
+                (7, 0, false),
             ] {
                 let mut n = 0;
                 if idle_ms > 0 {
-                    if warm { n = warm_idle(idle_ms); }
-                    else { std::thread::sleep(std::time::Duration::from_millis(idle_ms)); }
+                    if warm {
+                        n = warm_idle(idle_ms);
+                    } else {
+                        std::thread::sleep(std::time::Duration::from_millis(idle_ms));
+                    }
                 }
                 let ms = run_full();
                 println!("rep={rep} idle={idle_ms}ms warm={warm} dispatches={n} full={ms:.2}ms");
             }
-            gpu.release(kw_data); gpu.release(kw_tree);
-            gpu.release(staging); gpu.release(tree_buf); gpu.release(tw_buf);
+            gpu.release(kw_data);
+            gpu.release(kw_tree);
+            gpu.release(staging);
+            gpu.release(tree_buf);
+            gpu.release(tw_buf);
             gpu.pool_pop(pool);
         }
     }
@@ -6687,9 +6795,7 @@ mod tests {
         match r {
             Ok(v) => Some(v),
             Err(e)
-                if e.contains("disabled")
-                    || e.contains("dlopen")
-                    || e.contains("returned nil") =>
+                if e.contains("disabled") || e.contains("dlopen") || e.contains("returned nil") =>
             {
                 eprintln!("skipping GPU test: {e}");
                 None
@@ -6847,11 +6953,8 @@ mod tests {
                 core::mem::size_of_val(expect_full.as_slice()),
             )
         };
-        let expect_tree = crate::merkle::merkle_tree(
-            expect_bytes,
-            n_leaves,
-            crate::merkle::HashKind::Blake3,
-        );
+        let expect_tree =
+            crate::merkle::merkle_tree(expect_bytes, n_leaves, crate::merkle::HashKind::Blake3);
 
         let gpu = match gpu_or_skip(imp::gpu().map(|g| g as *const imp::Gpu)) {
             Some(g) => unsafe { &*g },
@@ -6916,9 +7019,7 @@ mod tests {
             // shared verbatim with its production PSO.
             let cb = gpu.command_buffer().unwrap();
             let enc = gpu.compute_encoder(cb).unwrap();
-            imp::encode_from_z_zero_root_for_test(
-                gpu, enc, candidate, tw_buf, z_buf, log_d,
-            );
+            imp::encode_from_z_zero_root_for_test(gpu, enc, candidate, tw_buf, z_buf, log_d);
             imp::encode_zero_root_table_export_for_test(gpu, enc, tw_buf, table_buf);
             gpu.end_encoding(enc);
             gpu.commit_and_wait(cb).unwrap();
@@ -6958,8 +7059,16 @@ mod tests {
                 expect_first.len(),
             );
             assert_eq!(got_table, expect_table.as_slice(), "compact table mismatch");
-            assert_eq!(candidate_first, expect_first.as_slice(), "candidate first pass mismatch");
-            assert_eq!(incumbent_first, expect_first.as_slice(), "incumbent first pass mismatch");
+            assert_eq!(
+                candidate_first,
+                expect_first.as_slice(),
+                "candidate first pass mismatch"
+            );
+            assert_eq!(
+                incumbent_first,
+                expect_first.as_slice(),
+                "incumbent first pass mismatch"
+            );
             assert_eq!(candidate_first, incumbent_first);
             assert_eq!(
                 gpu.pipeline_resources(gpu.pso_ntt4zg4_zero_root).0,
@@ -6981,7 +7090,11 @@ mod tests {
                 gpu.buffer_contents(tree_buf).cast::<crate::merkle::Hash>(),
                 expect_tree.len(),
             );
-            assert_eq!(candidate_full, expect_full.as_slice(), "full codeword mismatch");
+            assert_eq!(
+                candidate_full,
+                expect_full.as_slice(),
+                "full codeword mismatch"
+            );
             assert_eq!(got_tree, expect_tree.as_slice(), "full tree mismatch");
 
             gpu.release(candidate);
@@ -7037,15 +7150,7 @@ mod tests {
 
             let cb = gpu.command_buffer().unwrap();
             let enc = gpu.compute_encoder(cb).unwrap();
-            imp::encode_ntt_passes_prefix(
-                gpu,
-                enc,
-                data_buf,
-                tw_buf,
-                log_d,
-                start_layer,
-                prefix16,
-            );
+            imp::encode_ntt_passes_prefix(gpu, enc, data_buf, tw_buf, log_d, start_layer, prefix16);
             gpu.end_encoding(enc);
             gpu.commit_and_wait(cb).unwrap();
 
@@ -7175,8 +7280,7 @@ mod tests {
         let data: Vec<u8> = (0..n_leaves * 1024)
             .map(|_| (rng.next_u64() & 0xff) as u8)
             .collect();
-        let expect =
-            crate::merkle::merkle_tree(&data, n_leaves, crate::merkle::HashKind::Blake3);
+        let expect = crate::merkle::merkle_tree(&data, n_leaves, crate::merkle::HashKind::Blake3);
         let gpu = match gpu_or_skip(imp::gpu().map(|g| g as *const imp::Gpu)) {
             Some(g) => unsafe { &*g },
             None => return,
@@ -7187,11 +7291,7 @@ mod tests {
             let data_buf = gpu.new_buffer(data.len()).unwrap();
             let tree_bytes = expect.len() * core::mem::size_of::<crate::merkle::Hash>();
             let tree_buf = gpu.new_buffer(tree_bytes).unwrap();
-            std::ptr::copy_nonoverlapping(
-                data.as_ptr(),
-                gpu.buffer_contents(data_buf),
-                data.len(),
-            );
+            std::ptr::copy_nonoverlapping(data.as_ptr(), gpu.buffer_contents(data_buf), data.len());
             let cb = gpu.command_buffer().unwrap();
             let enc = gpu.compute_encoder(cb).unwrap();
             imp::encode_merkle_impl(gpu, enc, data_buf, tree_buf, n_leaves, true);
@@ -7224,8 +7324,7 @@ mod tests {
         let data: Vec<u8> = (0..N_LEAVES * 1024)
             .map(|_| (rng.next_u64() & 0xff) as u8)
             .collect();
-        let expect =
-            crate::merkle::merkle_tree(&data, N_LEAVES, crate::merkle::HashKind::Blake3);
+        let expect = crate::merkle::merkle_tree(&data, N_LEAVES, crate::merkle::HashKind::Blake3);
         let mut initial = vec![SENTINEL; expect.len()];
         let gpu = match gpu_or_skip(imp::gpu().map(|g| g as *const imp::Gpu)) {
             Some(g) => unsafe { &*g },
@@ -7237,11 +7336,7 @@ mod tests {
             let data_buf = gpu.new_buffer(data.len()).unwrap();
             let tree_bytes = core::mem::size_of_val(initial.as_slice());
             let tree_buf = gpu.new_buffer(tree_bytes).unwrap();
-            std::ptr::copy_nonoverlapping(
-                data.as_ptr(),
-                gpu.buffer_contents(data_buf),
-                data.len(),
-            );
+            std::ptr::copy_nonoverlapping(data.as_ptr(), gpu.buffer_contents(data_buf), data.len());
             std::ptr::copy_nonoverlapping(
                 initial.as_ptr().cast::<u8>(),
                 gpu.buffer_contents(tree_buf),
@@ -7367,9 +7462,7 @@ mod tests {
         let t_cpu = std::time::Instant::now();
         let expect = crate::merkle::merkle_tree(&data, n_leaves, crate::merkle::HashKind::Blake3);
         let cpu_ms = t_cpu.elapsed().as_secs_f64() * 1e3;
-        eprintln!(
-            "ranked-shape Merkle: gpu {gpu_ms:.1} ms (incl. copies) vs cpu {cpu_ms:.1} ms"
-        );
+        eprintln!("ranked-shape Merkle: gpu {gpu_ms:.1} ms (incl. copies) vs cpu {cpu_ms:.1} ms");
         assert_eq!(got, expect, "GPU Merkle mismatch at ranked shape");
     }
 
@@ -7529,11 +7622,8 @@ mod tests {
                 expect.as_ptr().cast::<u8>(),
                 core::mem::size_of_val(expect.as_slice()),
             );
-            let expect_tree = crate::merkle::merkle_tree(
-                expect_bytes,
-                n_leaves,
-                crate::merkle::HashKind::Blake3,
-            );
+            let expect_tree =
+                crate::merkle::merkle_tree(expect_bytes, n_leaves, crate::merkle::HashKind::Blake3);
             let got_tree = core::slice::from_raw_parts(
                 gpu.buffer_contents(tree_buf).cast::<crate::merkle::Hash>(),
                 2 * n_leaves - 1,
@@ -7544,7 +7634,9 @@ mod tests {
             gpu.release(tree_buf);
             gpu.pool_pop(pool);
             let best = walls.iter().skip(1).cloned().fold(f64::MAX, f64::min);
-            eprintln!("warm commit graph best: {best:.2} ms (NTT layers 1..20 + leaves + parents, 1 GiB)");
+            eprintln!(
+                "warm commit graph best: {best:.2} ms (NTT layers 1..20 + leaves + parents, 1 GiB)"
+            );
         }
     }
 
@@ -7598,10 +7690,7 @@ mod tests {
             oracle[..] == pd2.codeword[..],
             "codeword differs from CPU oracle"
         );
-        assert_eq!(
-            oracle_tree, pd2.merkle_tree,
-            "tree differs from CPU oracle"
-        );
+        assert_eq!(oracle_tree, pd2.merkle_tree, "tree differs from CPU oracle");
     }
 
     #[test]
@@ -7619,7 +7708,10 @@ mod tests {
                 assert_eq!(l, log_d);
             }
         }
-        assert_eq!(plan_passes(20, 1), vec![(1, 4), (5, 4), (9, 4), (13, 4), (17, 3)]);
+        assert_eq!(
+            plan_passes(20, 1),
+            vec![(1, 4), (5, 4), (9, 4), (13, 4), (17, 3)]
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -7694,12 +7786,19 @@ mod tests {
         );
         assert_eq!(got, want, "GPU prefix must be bit-exact");
         assert!(
-            got[useful_bits.div_ceil(8) * 8..].iter().all(|v| *v == F128::ZERO),
+            got[useful_bits.div_ceil(8) * 8..]
+                .iter()
+                .all(|v| *v == F128::ZERO),
             "padded columns must stay zero"
         );
 
         let suffix = crate::lincheck::partial_fold_packed_z_neon_oblock_padded_suffix(
-            z, m, k_log, useful_bits, &eq, claim_lo,
+            z,
+            m,
+            k_log,
+            useful_bits,
+            &eq,
+            claim_lo,
         );
         for (a, b) in got.iter_mut().zip(suffix) {
             *a += b;
@@ -7727,7 +7826,12 @@ mod tests {
         let claim_lo = job.claim_lo();
         let mut hybrid = vec![F128::ZERO; 1usize << k_log];
         let suffix = crate::lincheck::partial_fold_packed_z_neon_oblock_padded_suffix(
-            z, m, k_log, useful_bits, &eq, claim_lo,
+            z,
+            m,
+            k_log,
+            useful_bits,
+            &eq,
+            claim_lo,
         );
         job.finish_xor_into(&mut hybrid, 0.0, 0.0).unwrap();
         for (a, b) in hybrid.iter_mut().zip(suffix) {
@@ -7746,7 +7850,13 @@ mod tests {
         let mut again = vec![F128::ZERO; 1usize << k_log];
         job.finish_xor_into(&mut again, 0.0, 0.0).unwrap();
         let want = crate::lincheck::partial_fold_packed_z_neon_oblock_padded_range(
-            z, m, k_log, useful_bits, &eq, 0, claim_lo2,
+            z,
+            m,
+            k_log,
+            useful_bits,
+            &eq,
+            0,
+            claim_lo2,
         );
         assert_eq!(again, want, "resubmitted prefix must stay bit-exact");
     }
@@ -7770,6 +7880,10 @@ mod tests {
         let (ptr, len) = (stripe.as_ptr() as usize, stripe.len());
         crate::scratch::give_u8(stripe);
         assert_eq!(ptr % PAGE, 0, "ranked stripe base must be page-aligned");
-        assert_eq!(len % PAGE, 0, "ranked stripe length must be a page multiple");
+        assert_eq!(
+            len % PAGE,
+            0,
+            "ranked stripe length must be a page multiple"
+        );
     }
 }
