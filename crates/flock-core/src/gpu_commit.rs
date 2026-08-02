@@ -201,12 +201,23 @@ pub fn gpu_recursive_merkle_blake3(
 /// timed proof may use it.
 pub const ENV_NO_GPU_GRIND: &str = "FLOCK_NO_GPU_GRIND";
 
+/// Exact rollback for status-spinning the short serial PCS grind command
+/// buffers. `FLOCK_NO_GPU_GRIND_SPIN=1` retains the promoted Metal scanner but
+/// parks and wakes the calling thread with `waitUntilCompleted`.
+pub const ENV_NO_GPU_GRIND_SPIN: &str = "FLOCK_NO_GPU_GRIND_SPIN";
+// Status-spin official draw 2: executable-identical resample after f288d5a3.
+
 pub(crate) fn gpu_grind_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| match std::env::var(ENV_NO_GPU_GRIND) {
         Ok(value) => value != "1",
         Err(_) => true,
     })
+}
+
+fn gpu_grind_spin_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var(ENV_NO_GPU_GRIND_SPIN).as_deref() != Ok("1"))
 }
 
 pub(crate) fn gpu_keepwarm_enabled() -> bool {
@@ -2740,6 +2751,40 @@ kernel void blake3_pow_scan(
                     cb,
                     c"status"
                 );
+                if status == 4 {
+                    Ok(())
+                } else {
+                    let err: Id = send!(
+                        self.api,
+                        unsafe extern "C" fn(Id, Sel) -> Id,
+                        cb,
+                        c"error"
+                    );
+                    Err(format!(
+                        "command buffer status {status}: {}",
+                        self.api.error_string(err)
+                    ))
+                }
+            }
+        }
+
+        /// Commit a very short command buffer and poll its status from the
+        /// calling performance core instead of parking and waking the thread.
+        pub(crate) unsafe fn commit_and_spin(&self, cb: Id) -> Result<(), String> {
+            unsafe {
+                send!(self.api, unsafe extern "C" fn(Id, Sel), cb, c"commit");
+                let status = loop {
+                    let status: u64 = send!(
+                        self.api,
+                        unsafe extern "C" fn(Id, Sel) -> u64,
+                        cb,
+                        c"status"
+                    );
+                    if status >= 4 {
+                        break status;
+                    }
+                    std::hint::spin_loop();
+                };
                 if status == 4 {
                     Ok(())
                 } else {
@@ -5762,7 +5807,11 @@ kernel void blake3_pow_scan(
                 const THREADS: u64 = 64;
                 gpu.dispatch(enc, u64::from(len).div_ceil(THREADS), THREADS);
                 gpu.end_encoding(enc);
-                gpu.commit_and_wait(cb)?;
+                if super::gpu_grind_spin_enabled() {
+                    gpu.commit_and_spin(cb)?;
+                } else {
+                    gpu.commit_and_wait(cb)?;
+                }
                 let offset = out.read_volatile();
                 Ok((offset != u32::MAX).then(|| start + u64::from(offset)))
             })();
