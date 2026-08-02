@@ -3572,7 +3572,27 @@ fn direct_ab_fuse_init_enabled() -> bool {
 /// Algebra: `0 + D_0 + … + D_n + fold4(C)` becomes `D_0 + fold4(C) + D_1 + …`.
 /// Exact ranked direct-AB materialization can distribute its 256 independent
 /// 2 MiB blocks across the existing P/E stateful queue. Each worker retains
-/// one private fold table; the queue changes only block ownership.
+/// one private fold table; the queue changes only block ownership. Ranked
+/// measurements show that the E-core queue loses to the main pool here, so it
+/// is now an explicit diagnostic opt-in rather than the production default.
+fn direct_ab_hetero_policy(
+    opt_in: Option<&std::ffi::OsStr>,
+    killed: Option<&std::ffi::OsStr>,
+) -> bool {
+    opt_in == Some(std::ffi::OsStr::new("1")) && killed.is_none()
+}
+
+fn direct_ab_hetero_materialize_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        direct_ab_hetero_policy(
+            std::env::var_os("FLOCK_DIRECT_AB_HETERO_MATERIALIZE").as_deref(),
+            std::env::var_os("FLOCK_NO_DIRECT_AB_HETERO_MATERIALIZE").as_deref(),
+        )
+    })
+}
+
 #[inline]
 fn use_ranked_direct_ab_hetero_materialize(
     packed_len: usize,
@@ -3588,7 +3608,7 @@ fn use_ranked_direct_ab_hetero_materialize(
             claim_count,
             has_ordinary,
         )
-        && std::env::var_os("FLOCK_NO_DIRECT_AB_HETERO_MATERIALIZE").is_none()
+        && direct_ab_hetero_materialize_enabled()
         && crate::epool::epool().is_some()
 }
 
@@ -7060,6 +7080,19 @@ pub fn recursive_verifier<Ch: Challenger>(
 mod tests {
     // Disclosed zero-mechanism redraw marker (draw 2 of the latch tree,
     // fa433990 drew 1,449,917 in-band): resampling the median lottery.
+    #[test]
+    fn ranked_direct_ab_hetero_materialize_is_opt_in() {
+        use std::ffi::OsStr;
+
+        assert!(!super::direct_ab_hetero_policy(None, None));
+        assert!(super::direct_ab_hetero_policy(Some(OsStr::new("1")), None));
+        assert!(!super::direct_ab_hetero_policy(Some(OsStr::new("0")), None));
+        assert!(!super::direct_ab_hetero_policy(
+            Some(OsStr::new("1")),
+            Some(OsStr::new("1")),
+        ));
+    }
+
     /// The paired fold must reproduce two sequential state binds, the direct
     /// message, and the coefficient-evaluated following message bit-for-bit.
     #[test]
