@@ -2036,12 +2036,9 @@ fn finish_c_banks(banks: &[[F128; ELL]; N_C_BANKS]) -> ([F128; ELL], Vec<F128>, 
         s_hat_v_c[ELL + lane] = c_2_alpha_inv * res_c_s_1[lane];
     }
 
-    let mut quad_c = vec![F128::ZERO; 4 * 2 * ELL];
-    for e in 0..4 {
-        for b_0 in 0..2 {
-            let base = e * 2 * ELL + b_0 * ELL;
-            quad_c[base..base + ELL].copy_from_slice(&banks[b_0 + 2 * e]);
-        }
+    let mut quad_c = Vec::with_capacity(8 * ELL);
+    for bank in banks.iter() {
+        quad_c.extend_from_slice(bank);
     }
 
     (res_c_s, s_hat_v_c, quad_c)
