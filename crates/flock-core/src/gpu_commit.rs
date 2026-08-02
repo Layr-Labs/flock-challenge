@@ -1354,67 +1354,46 @@ kernel void parent_hash(device const uint* children [[buffer(0)]],
     for (int i = 0; i < 8; i++) parents[id * 8u + i] = cv[i];
 }
 
-// Three adjacent parent levels in one dispatch. A 128-thread group consumes
-// 256 children, emits 128 / 64 / 32 parents into their ordinary flat-tree
-// levels, and keeps the two intermediate read sets in 6 KiB of threadgroup
-// memory. Every active phase is a whole number of 32-lane SIMD groups, so the
-// fusion deletes two global read passes without a partially active SIMDgroup.
+// Eight adjacent parent levels in one dispatch. A 128-thread group consumes
+// 256 children and emits every ordinary flat-tree node while keeping the seven
+// intermediate read sets in 6 KiB of threadgroup memory.
 kernel void parent_hash3(device const uint* children [[buffer(0)]],
-                         device uint* parents1      [[buffer(1)]],
-                         device uint* parents2      [[buffer(2)]],
-                         device uint* parents3      [[buffer(3)]],
+                         device uint* p1 [[buffer(1)]], device uint* p2 [[buffer(2)]],
+                         device uint* p3 [[buffer(3)]], device uint* p4 [[buffer(4)]],
+                         device uint* p5 [[buffer(5)]], device uint* p6 [[buffer(6)]],
+                         device uint* p7 [[buffer(7)]], device uint* p8 [[buffer(8)]],
                          uint tgid [[threadgroup_position_in_grid]],
                          uint lid [[thread_index_in_threadgroup]])
 {
-    threadgroup uint level1[128u * 8u];
-    threadgroup uint level2[64u * 8u];
-
-    // Level 1: all 128 threads consume one pair of global children.
-    {
-        uint block[16];
-        const uint id = tgid * 128u + lid;
-        for (uint i = 0u; i < 16u; i++) block[i] = children[id * 16u + i];
-        uint cv[8];
-        for (uint i = 0u; i < 8u; i++) cv[i] = B3_IV[i];
-        b3_compress(cv, block, 64u, B3_PARENT);
-        for (uint i = 0u; i < 8u; i++) {
-            parents1[id * 8u + i] = cv[i];
-            level1[lid * 8u + i] = cv[i];
-        }
+    threadgroup uint a[128u * 8u];
+    threadgroup uint b[64u * 8u];
+    uint block[16]; uint cv[8];
+#define HASH_LEVEL(N, SRC, DST, OUT, COUNT) \
+    if (lid < COUNT) { \
+        for (uint i=0u;i<8u;i++){ block[i]=SRC[(2u*lid)*8u+i]; block[8u+i]=SRC[(2u*lid+1u)*8u+i]; } \
+        for (uint i=0u;i<8u;i++) cv[i]=B3_IV[i]; b3_compress(cv,block,64u,B3_PARENT); \
+        const uint id=tgid*COUNT+lid; for(uint i=0u;i<8u;i++){ OUT[id*8u+i]=cv[i]; DST[lid*8u+i]=cv[i]; } \
+    } \
+    threadgroup_barrier(mem_flags::mem_threadgroup)
+    if (lid < 128u) {
+        const uint id=tgid*128u+lid;
+        for(uint i=0u;i<16u;i++) block[i]=children[id*16u+i];
+        for(uint i=0u;i<8u;i++) cv[i]=B3_IV[i]; b3_compress(cv,block,64u,B3_PARENT);
+        for(uint i=0u;i<8u;i++){p1[id*8u+i]=cv[i];a[lid*8u+i]=cv[i];}
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    // Level 2: exactly two complete SIMD groups consume level1 locally.
-    if (lid < 64u) {
-        uint block[16];
-        for (uint i = 0u; i < 8u; i++) {
-            block[i] = level1[(2u * lid) * 8u + i];
-            block[8u + i] = level1[(2u * lid + 1u) * 8u + i];
-        }
-        uint cv[8];
-        for (uint i = 0u; i < 8u; i++) cv[i] = B3_IV[i];
-        b3_compress(cv, block, 64u, B3_PARENT);
-        const uint id = tgid * 64u + lid;
-        for (uint i = 0u; i < 8u; i++) {
-            parents2[id * 8u + i] = cv[i];
-            level2[lid * 8u + i] = cv[i];
-        }
+    HASH_LEVEL(2, a, b, p2, 64u);
+    HASH_LEVEL(3, b, a, p3, 32u);
+    HASH_LEVEL(4, a, b, p4, 16u);
+    HASH_LEVEL(5, b, a, p5, 8u);
+    HASH_LEVEL(6, a, b, p6, 4u);
+    HASH_LEVEL(7, b, a, p7, 2u);
+    if (lid < 1u) {
+        for(uint i=0u;i<8u;i++){block[i]=a[i];block[8u+i]=a[8u+i];}
+        for(uint i=0u;i<8u;i++) cv[i]=B3_IV[i]; b3_compress(cv,block,64u,B3_PARENT);
+        for(uint i=0u;i<8u;i++) p8[tgid*8u+i]=cv[i];
     }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    // Level 3: one complete SIMD group consumes level2 locally.
-    if (lid < 32u) {
-        uint block[16];
-        for (uint i = 0u; i < 8u; i++) {
-            block[i] = level2[(2u * lid) * 8u + i];
-            block[8u + i] = level2[(2u * lid + 1u) * 8u + i];
-        }
-        uint cv[8];
-        for (uint i = 0u; i < 8u; i++) cv[i] = B3_IV[i];
-        b3_compress(cv, block, 64u, B3_PARENT);
-        const uint id = tgid * 32u + lid;
-        for (uint i = 0u; i < 8u; i++) parents3[id * 8u + i] = cv[i];
-    }
+#undef HASH_LEVEL
 }
 
 "#;
@@ -2216,20 +2195,22 @@ kernel void parent_hash3(device const uint* children [[buffer(0)]],
             if parent3 {
                 gpu.set_pipeline(enc, gpu.pso_parent3);
                 while read_len >= 256 {
-                    let write1_start = read_start + read_len;
-                    let write1_len = read_len / 2;
-                    let write2_start = write1_start + write1_len;
-                    let write2_len = write1_len / 2;
-                    let write3_start = write2_start + write2_len;
-                    let write3_len = write2_len / 2;
+                    let mut starts = [0usize; 8];
+                    let mut next_start = read_start + read_len;
+                    let mut next_len = read_len / 2;
+                    for start in &mut starts {
+                        *start = next_start;
+                        next_start += next_len;
+                        next_len /= 2;
+                    }
                     debug_assert_eq!(read_len % 256, 0);
                     gpu.set_buffer(enc, tree_buf, read_start * 32, 0);
-                    gpu.set_buffer(enc, tree_buf, write1_start * 32, 1);
-                    gpu.set_buffer(enc, tree_buf, write2_start * 32, 2);
-                    gpu.set_buffer(enc, tree_buf, write3_start * 32, 3);
+                    for (level, start) in starts.into_iter().enumerate() {
+                        gpu.set_buffer(enc, tree_buf, start * 32, level + 1);
+                    }
                     gpu.dispatch(enc, (read_len / 256) as u64, 128);
-                    read_start = write3_start;
-                    read_len = write3_len;
+                    read_start = starts[7];
+                    read_len /= 256;
                 }
             }
 
