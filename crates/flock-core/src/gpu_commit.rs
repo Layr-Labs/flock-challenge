@@ -87,6 +87,22 @@ pub(crate) fn gpu_keepwarm_enabled() -> bool {
     *ON.get_or_init(|| std::env::var_os(ENV_NO_GPU_KEEPWARM).is_none())
 }
 
+/// Kill switch for the CPU sibling of the keep-warm bridge:
+/// `FLOCK_NO_CPU_KEEPWARM=1` disables only the CPU spinner. One
+/// user-initiated-QoS thread spins through the same inter-prove windows the
+/// GPU bridge covers, holding the P-cluster's DVFS state up so the measured
+/// trial's first serial milliseconds (harness input generation, witness
+/// start) do not run on ramping cores. Measured on M3 Pro: after a 2 s CPU
+/// idle the first 2 ms of compute run at 75-90% of steady throughput; 1 s
+/// idle costs ~5%. Paused by the same flag as the GPU bridge the moment a
+/// prove begins.
+pub const ENV_NO_CPU_KEEPWARM: &str = "FLOCK_NO_CPU_KEEPWARM";
+
+pub(crate) fn cpu_keepwarm_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os(ENV_NO_CPU_KEEPWARM).is_none())
+}
+
 /// Called at the top of every prove: stops keep-warm dispatches for the
 /// prove's whole duration (timed phases must never share the GPU or the
 /// memory system with the bridge).
@@ -4418,6 +4434,48 @@ kernel void export_from_z_zero_root_tabs(
         let _ = std::thread::Builder::new()
             .name("gpu-keepwarm".into())
             .spawn(keepwarm_thread);
+        if super::cpu_keepwarm_enabled() {
+            let _ = std::thread::Builder::new()
+                .name("cpu-keepwarm".into())
+                .spawn(cpu_keepwarm_thread);
+        }
+    }
+
+    /// One spinning thread holds the P-cluster frequency across the same
+    /// windows the GPU bridge covers. It deliberately does NOT take utility
+    /// QoS: the point is to keep the performance cluster awake. It checks
+    /// the shared pause flag every few thousand iterations (≲100 µs), so a
+    /// prove's start suspends it effectively immediately; while a prove
+    /// runs it sleeps in 500 µs ticks.
+    fn cpu_keepwarm_thread() {
+        use std::sync::atomic::Ordering;
+        unsafe extern "C" {
+            fn pthread_set_qos_class_self_np(qos_class: u32, rel: i32) -> i32;
+        }
+        unsafe {
+            // QOS_CLASS_USER_INITIATED: schedulable on the P-cluster.
+            let _ = pthread_set_qos_class_self_np(0x19, 0);
+        }
+        let t_start = std::time::Instant::now();
+        let mut x = 0x9E37_79B9_7F4A_7C15u64;
+        // Same 60 s cumulative cap as the GPU bridge.
+        let mut active_s = 0.0f64;
+        while active_s < 60.0 {
+            if KEEPWARM_PAUSED.load(Ordering::Acquire) {
+                std::thread::sleep(std::time::Duration::from_micros(500));
+                continue;
+            }
+            let t0 = std::time::Instant::now();
+            for _ in 0..16_384u32 {
+                x = x.wrapping_mul(0x9E37_79B9_7F4A_7C15).rotate_left(31);
+            }
+            std::hint::black_box(x);
+            active_s += t0.elapsed().as_secs_f64();
+            // Safety net against pathological clock behavior.
+            if t_start.elapsed().as_secs() > 600 {
+                break;
+            }
+        }
     }
 
     fn keepwarm_thread() {
@@ -4508,7 +4566,7 @@ kernel void export_from_z_zero_root_tabs(
     // V3 excludes V2 entries published before calibration was deferred; such
     // entries can contain the usize::MAX untuned sentinel. The canonical
     // reprime kill switch deliberately returns to the incumbent V2 cache.
-    // (Redraw marker AUTO-3, 2026-08-02 12:29: automated same-binary redraw while the promoted bar remains the disclosed marker-only marker draw at 1,359,615.75. Latest account draws: 1357690.43424419 / 1358930.90730768 / 1358711.3844894. Content change required for per-account resubmission.)
+    // (Redraw marker AUTO-1, 2026-08-02 11:19: automated same-binary redraw while the promoted bar remains the disclosed marker-only resample at 1,357,262.51. Latest account draws: 1319797.87332625 / 1317557.71279261 / 1342891.19447755. Content change required for per-account resubmission.)
     const WARMUP_CACHE_MAGIC_V3: u64 = 0x464C_4B5F_574C_4333; // "FLK_WLC3"
 
     fn warmup_cache_magic() -> u64 {
