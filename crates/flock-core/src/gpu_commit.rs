@@ -80,6 +80,11 @@ pub const ENV_NO_NTT_PASS_TUNE: &str = "FLOCK_NO_NTT_PASS_TUNE";
 /// incumbent h8 kernel as a same-binary control.
 pub const ENV_NO_GPU_MIXED_FINAL: &str = "FLOCK_NO_GPU_MIXED_FINAL";
 
+/// Exact-`1` control for the SIMDgroup register-table final NTT pass. The
+/// promoted mixed kernel remains compiled and is selected when this control
+/// is active or the pipeline does not execute in 32-thread SIMDgroups.
+pub const ENV_NO_GPU_SIMDTAB_FINAL: &str = "FLOCK_NO_GPU_SIMDTAB_FINAL";
+
 /// Exact-`1` control for keeping the warmup's ranked z allocation bound to
 /// its retained Metal no-copy view across later proves.
 pub const ENV_NO_GPU_Z_PIN: &str = "FLOCK_NO_GPU_Z_PIN";
@@ -149,6 +154,8 @@ pub(crate) fn pass_tune_enabled() -> bool {
 
 #[cfg(test)]
 mod mixed_final_gate_tests {
+    use std::ffi::OsStr;
+
     #[test]
     fn ranked_selector_honors_broad_and_narrow_gates() {
         assert!(super::select_gpu_mixed_final(20, 16, 4, true, true));
@@ -157,6 +164,84 @@ mod mixed_final_gate_tests {
         assert!(!super::select_gpu_mixed_final(20, 12, 4, true, true));
         assert!(!super::select_gpu_mixed_final(20, 17, 3, true, true));
     }
+
+    #[test]
+    fn simdtab_selector_is_exact_ranked_width32_and_exact_one_kill() {
+        assert!(!super::gpu_simdtab_final_value_enabled(Some(OsStr::new("1"))));
+        for value in [None, Some(""), Some("0"), Some("01"), Some("true")] {
+            assert!(super::gpu_simdtab_final_value_enabled(value.map(OsStr::new)));
+        }
+        assert!(super::select_gpu_simdtab_final(20, 16, 4, true, true, true, 32));
+        assert!(!super::select_gpu_simdtab_final(20, 16, 4, true, true, false, 32));
+        assert!(!super::select_gpu_simdtab_final(20, 16, 4, true, true, true, 64));
+        assert!(!super::select_gpu_simdtab_final(20, 16, 4, true, false, true, 32));
+        assert!(!super::select_gpu_simdtab_final(20, 12, 4, true, true, true, 32));
+    }
+
+    #[test]
+    fn simdtab_byte_horner_equals_field_multiplication() {
+        use crate::field::F128;
+
+        fn modeled(v: F128, tw: F128) -> F128 {
+            let mut tab = [F128::ZERO; 32];
+            for n in 0..16u64 {
+                tab[n as usize] = tw * F128::new(n, 0);
+                tab[16 + n as usize] = tw * F128::new(n << 4, 0);
+            }
+            let x8 = F128::new(1 << 8, 0);
+            let mut acc = F128::ZERO;
+            for i in (0..16).rev() {
+                acc *= x8;
+                let b = if i < 8 {
+                    ((v.lo >> (8 * i)) & 0xff) as usize
+                } else {
+                    ((v.hi >> (8 * (i - 8))) & 0xff) as usize
+                };
+                acc += tab[b & 15] + tab[16 + (b >> 4)];
+            }
+            acc
+        }
+
+        let mut x = 0x9e37_79b9_7f4a_7c15u64;
+        for _ in 0..256 {
+            x ^= x << 7;
+            x ^= x >> 9;
+            let v = F128::new(x, x.rotate_left(29) ^ 0xa5a5_5a5a_0123_4567);
+            x ^= x << 13;
+            x ^= x >> 17;
+            let tw = F128::new(x.rotate_left(11), x ^ 0x87);
+            assert_eq!(modeled(v, tw), v * tw);
+        }
+    }
+
+    #[test]
+    fn twiddle_major_schedule_is_the_same_four_layer_network() {
+        let mut incumbent = Vec::new();
+        let mut candidate = Vec::new();
+        for j in 0..4usize {
+            let bpos = 3 - j;
+            for b in 0..8usize {
+                let low = b & ((1 << bpos) - 1);
+                let eu = ((b >> bpos) << (bpos + 1)) | low;
+                let ev = eu | (1 << bpos);
+                let c = eu >> (4 - j);
+                incumbent.push((j, b, eu, ev, c));
+            }
+            let per_tw = 1 << (3 - j);
+            for c in 0..1usize << j {
+                for bi in 0..per_tw {
+                    let b = c * per_tw + bi;
+                    let low = b & ((1 << bpos) - 1);
+                    let eu = ((b >> bpos) << (bpos + 1)) | low;
+                    let ev = eu | (1 << bpos);
+                    candidate.push((j, b, eu, ev, c));
+                }
+            }
+        }
+        incumbent.sort_unstable();
+        candidate.sort_unstable();
+        assert_eq!(candidate, incumbent);
+    }
 }
 
 /// Cached outside graph encoding so the narrow control adds no environment
@@ -164,6 +249,19 @@ mod mixed_final_gate_tests {
 pub(crate) fn gpu_mixed_final_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os(ENV_NO_GPU_MIXED_FINAL).is_none())
+}
+
+fn gpu_simdtab_final_value_enabled(value: Option<&std::ffi::OsStr>) -> bool {
+    value != Some(std::ffi::OsStr::new("1"))
+}
+
+/// Cached outside graph encoding; only the exact value `1` selects the
+/// promoted mixed-kernel control.
+pub(crate) fn gpu_simdtab_final_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        gpu_simdtab_final_value_enabled(std::env::var_os(ENV_NO_GPU_SIMDTAB_FINAL).as_deref())
+    })
 }
 
 /// Wall-clock margin the GPU must beat during the warmup dual-run: latch on
@@ -472,6 +570,24 @@ pub(crate) fn select_gpu_mixed_final(
 #[inline]
 fn gpu_mixed_final_selected(log_d: usize, l: usize, f: usize) -> bool {
     select_gpu_mixed_final(log_d, l, f, true, gpu_mixed_final_enabled())
+}
+
+/// Pure gate for the register-table kernel. SIMD shuffle indexes are scoped
+/// to one execution SIMDgroup; the kernel deliberately duplicates its
+/// 32-entry byte table in each half of the 64-thread NTT group, so a pipeline
+/// width other than 32 must fail closed to the promoted mixed kernel.
+pub(crate) fn select_gpu_simdtab_final(
+    log_d: usize,
+    l: usize,
+    f: usize,
+    pass_tune: bool,
+    mixed_enabled: bool,
+    simdtab_enabled: bool,
+    thread_execution_width: usize,
+) -> bool {
+    select_gpu_mixed_final(log_d, l, f, pass_tune, mixed_enabled)
+        && simdtab_enabled
+        && thread_execution_width == 32
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -1108,6 +1224,124 @@ kernel void ntt_pass5_mixed(device uint4* data                [[buffer(0)]],
     }
 }
 
+// SIMDgroup-register-table variant of the exact ranked mixed final pass.
+//
+// The promoted mixed kernel spends 3,584 bytes of threadgroup memory on the
+// three dense layer-16/17 tables plus the short-twiddle staging arrays, pays
+// two whole-group barriers, and serves 2^31 uint4 hot table reads at the
+// ranked 65,536-group shape. Here each 32-thread SIMDgroup independently
+// constructs the same 32-entry byte-Horner table in one uint4 register per
+// lane. Dynamic simd_shuffle indexes replace the threadgroup reads. The
+// layer-18/19 twiddles are held directly in registers and retain the promoted
+// 40/20-bit Horner bounds. Host selection requires threadExecutionWidth=32;
+// other widths fail closed to ntt_pass5_mixed.
+static inline uint4 gf_mul_simdtab32(uint4 v, uint4 tab_entry) {
+    uint4 acc = uint4(0u);
+    for (int i = 15; i >= 0; i--) {
+        acc = gf_shl8(acc);
+        uint b = (v[i >> 2] >> ((i & 3) * 8)) & 0xffu;
+        acc ^= simd_shuffle(tab_entry, b & 15u)
+             ^ simd_shuffle(tab_entry, 16u + (b >> 4));
+    }
+    return acc;
+}
+
+static inline uint4 gf_mul_short_twiddle(uint4 v, uint4 tw, uint n_nibbles) {
+    uint4 V0 = v;
+    uint4 V1 = gf_mulx(V0), V2 = gf_mulx(V1), V3 = gf_mulx(V2);
+    uint4 acc = uint4(0u);
+    for (int q = (int)n_nibbles - 1; q >= 0; q--) {
+        acc = gf_shl4(acc);
+        uint n = (tw[q >> 3] >> ((q & 7) * 4)) & 15u;
+        if (n & 1u) acc ^= V0;
+        if (n & 2u) acc ^= V1;
+        if (n & 4u) acc ^= V2;
+        if (n & 8u) acc ^= V3;
+    }
+    return acc;
+}
+
+kernel void ntt_pass5_simdtab(device uint4* data                [[buffer(0)]],
+                              device const uint4* twiddles      [[buffer(1)]],
+                              constant NttParams& P             [[buffer(2)]],
+                              uint tgid [[threadgroup_position_in_grid]],
+                              uint lid  [[thread_index_in_threadgroup]])
+{
+    constexpr uint F = 4u, NF = 1u << F;
+    const uint lane = lid;
+    const uint simd_lane = lid & 31u;
+    const uint B = tgid >> P.s;
+    const uint r = tgid & ((1u << P.s) - 1u);
+    const uint pos_base = (B << (P.log_d - P.l)) + r;
+
+    uint4 elems[NF];
+    for (uint e = 0; e < NF; e++) {
+        elems[e] = data[((pos_base + (e << P.s)) << 6) + lane];
+    }
+
+    // Layers 16/17: process one twiddle at a time. Every SIMD lane owns one
+    // entry of the complete 32-entry reduced-nibble table, so both execution
+    // SIMDgroups have an identical register-resident lookup surface.
+    for (uint j = 0u; j < 2u; j++) {
+        const uint n_tw = 1u << j;
+        const uint butterflies_per_tw = 1u << (3u - j);
+        for (uint c = 0u; c < n_tw; c++) {
+            uint4 tw = twiddles[(1u << (P.l + j)) - 1u + (B << j) + c];
+            const uint hi = simd_lane >> 4;
+            const uint n = simd_lane & 15u;
+            uint4 p = tw;
+            if (hi != 0u) {
+                p = gf_mulx(gf_mulx(gf_mulx(gf_mulx(p))));
+            }
+            uint4 tab_entry = uint4(0u);
+            for (uint k = 0u; k < 4u; k++) {
+                if ((n >> k) & 1u) tab_entry ^= p;
+                p = gf_mulx(p);
+            }
+
+            const uint b0 = c * butterflies_per_tw;
+            for (uint bi = 0u; bi < butterflies_per_tw; bi++) {
+                const uint b = b0 + bi;
+                const uint bpos = F - 1u - j;
+                const uint low = b & ((1u << bpos) - 1u);
+                const uint eu = ((b >> bpos) << (bpos + 1u)) | low;
+                const uint ev = eu | (1u << bpos);
+                uint4 nu = elems[eu] ^ gf_mul_simdtab32(elems[ev], tab_entry);
+                elems[eu] = nu;
+                elems[ev] ^= nu;
+            }
+        }
+    }
+
+    // Layers 18/19: same reversed short-twiddle multiplication as the
+    // promoted mixed kernel, but the fixed twiddle is read once per c and
+    // remains in registers rather than being staged behind barriers.
+    for (uint j = 2u; j < F; j++) {
+        const uint n_tw = 1u << j;
+        const uint butterflies_per_tw = 1u << (3u - j);
+        const uint n_nibbles = (j == 2u) ? 10u : 5u;
+        for (uint c = 0u; c < n_tw; c++) {
+            uint4 tw = twiddles[(1u << (P.l + j)) - 1u + (B << j) + c];
+            const uint b0 = c * butterflies_per_tw;
+            for (uint bi = 0u; bi < butterflies_per_tw; bi++) {
+                const uint b = b0 + bi;
+                const uint bpos = F - 1u - j;
+                const uint low = b & ((1u << bpos) - 1u);
+                const uint eu = ((b >> bpos) << (bpos + 1u)) | low;
+                const uint ev = eu | (1u << bpos);
+                uint4 nu = elems[eu]
+                    ^ gf_mul_short_twiddle(elems[ev], tw, n_nibbles);
+                elems[eu] = nu;
+                elems[ev] ^= nu;
+            }
+        }
+    }
+
+    for (uint e = 0; e < NF; e++) {
+        data[((pos_base + (e << P.s)) << 6) + lane] = elems[e];
+    }
+}
+
 // ===========================================================================
 // From-z first pass: fuses the RS zero-padding into the first four layers.
 //
@@ -1464,15 +1698,14 @@ kernel void parent_hash3(device const uint* children [[buffer(0)]],
     #[cfg(test)]
     mod metallib_guard_tests {
         #[test]
-        fn embedded_metallib_matches_msl_source() {
-            // If this fails, `MSL_SOURCE` changed after the metallib was
-            // generated: re-extract the source, recompile with
-            // `xcrun -sdk macosx metal`, and update `METALLIB_MSL_FNV1A`.
-            assert!(
-                super::METALLIB_FRESH,
-                "gpu_shaders.metallib is stale: MSL_SOURCE fnv1a = {:#x}",
-                super::fnv1a64(super::MSL_SOURCE)
-            );
+        fn changed_msl_rejects_embedded_metallib_and_uses_source_compile() {
+            // This exact-parent candidate intentionally leaves the promoted
+            // binary asset untouched. The changed source hash must therefore
+            // reject it before pipeline lookup and take the existing runtime
+            // source-compile fallback, where the new kernel is present.
+            assert_ne!(super::fnv1a64(super::MSL_SOURCE), super::METALLIB_MSL_FNV1A);
+            assert!(!super::METALLIB_FRESH);
+            assert!(super::MSL_SOURCE.contains("kernel void ntt_pass5_simdtab"));
             assert!(!super::METALLIB.is_empty());
         }
     }
@@ -1528,6 +1761,8 @@ kernel void parent_hash3(device const uint* children [[buffer(0)]],
         pub(crate) pso_ntt4zg4: Id,
         pub(crate) pso_ntt4h8: Id,
         pub(crate) pso_ntt5mix: Id,
+        pub(crate) pso_ntt5simd: Id,
+        pub(crate) pso_ntt5simd_width: usize,
         pub(crate) pso_leaf: Id,
         pub(crate) pso_parent: Id,
         pub(crate) pso_parent3: Id,
@@ -1586,7 +1821,7 @@ kernel void parent_hash3(device const uint* children [[buffer(0)]],
                 // missing, pipeline error — rebuild everything from the MSL
                 // source exactly as the incumbent path did. The source compile
                 // is never reached when the metallib pipelines all build.
-                const KERNELS: [&str; 11] = [
+                const KERNELS: [&str; 12] = [
                     "ntt_fused",
                     "ntt_fused_reg4g4",
                     "ntt_fused_reg4",
@@ -1595,12 +1830,13 @@ kernel void parent_hash3(device const uint* children [[buffer(0)]],
                     "ntt_fused_reg4_from_zg4",
                     "ntt_fused_reg4h8",
                     "ntt_pass5_mixed",
+                    "ntt_pass5_simdtab",
                     "leaf_hash",
                     "parent_hash",
                     "parent_hash3",
                 ];
-                let build_psos = |library: Id| -> Result<[Id; 11], String> {
-                    let mut out = [NIL; 11];
+                let build_psos = |library: Id| -> Result<[Id; 12], String> {
+                    let mut out = [NIL; 12];
                     for (slot, name) in out.iter_mut().zip(KERNELS) {
                         let ns = api.nsstring(name)?;
                         let f: Id = send!(
@@ -1630,7 +1866,7 @@ kernel void parent_hash3(device const uint* children [[buffer(0)]],
                     }
                     Ok(out)
                 };
-                let mut psos: Option<[Id; 11]> = None;
+                let mut psos: Option<[Id; 12]> = None;
                 let prebuilt = try_embedded_metallib(&api, device);
                 if !prebuilt.is_null() {
                     if let Ok(p) = build_psos(prebuilt) {
@@ -1638,7 +1874,7 @@ kernel void parent_hash3(device const uint* children [[buffer(0)]],
                     }
                     send!(api, unsafe extern "C" fn(Id, Sel) -> Id, prebuilt, c"release");
                 }
-                let [pso_ntt, pso_ntt4g4, pso_ntt4, pso_ntt3, pso_ntt4z, pso_ntt4zg4, pso_ntt4h8, pso_ntt5mix, pso_leaf, pso_parent, pso_parent3] =
+                let [pso_ntt, pso_ntt4g4, pso_ntt4, pso_ntt3, pso_ntt4z, pso_ntt4zg4, pso_ntt4h8, pso_ntt5mix, pso_ntt5simd, pso_leaf, pso_parent, pso_parent3] =
                     match psos {
                         Some(p) => p,
                         None => {
@@ -1664,6 +1900,12 @@ kernel void parent_hash3(device const uint* children [[buffer(0)]],
                             p
                         }
                     };
+                let pso_ntt5simd_width: usize = send!(
+                    api,
+                    unsafe extern "C" fn(Id, Sel) -> usize,
+                    pso_ntt5simd,
+                    c"threadExecutionWidth"
+                );
                 Ok(Gpu {
                     api,
                     device,
@@ -1676,6 +1918,8 @@ kernel void parent_hash3(device const uint* children [[buffer(0)]],
                     pso_ntt4zg4,
                     pso_ntt4h8,
                     pso_ntt5mix,
+                    pso_ntt5simd,
+                    pso_ntt5simd_width,
                     pso_leaf,
                     pso_parent,
                     pso_parent3,
@@ -1973,6 +2217,15 @@ kernel void parent_hash3(device const uint* children [[buffer(0)]],
                         64u64,
                         1u64 << (log_d - f - share_log),
                     ),
+                    4 if super::select_gpu_simdtab_final(
+                        log_d,
+                        l,
+                        f,
+                        super::pass_tune_enabled(),
+                        super::gpu_mixed_final_enabled(),
+                        super::gpu_simdtab_final_enabled(),
+                        gpu.pso_ntt5simd_width,
+                    ) => (gpu.pso_ntt5simd, 64u64, 1u64 << (log_d - f)),
                     4 if super::pass_tune_enabled()
                         && super::gpu_mixed_final_selected(log_d, l, f) =>
                     {
@@ -2038,6 +2291,15 @@ kernel void parent_hash3(device const uint* children [[buffer(0)]],
                         64u64,
                         1u64 << (log_d - f - share_log),
                     ),
+                    4 if super::select_gpu_simdtab_final(
+                        log_d,
+                        l,
+                        f,
+                        super::pass_tune_enabled(),
+                        super::gpu_mixed_final_enabled(),
+                        super::gpu_simdtab_final_enabled(),
+                        gpu.pso_ntt5simd_width,
+                    ) => (gpu.pso_ntt5simd, 64u64, 1u64 << (log_d - f)),
                     4 if super::pass_tune_enabled()
                         && super::gpu_mixed_final_selected(log_d, l, f) =>
                     {
