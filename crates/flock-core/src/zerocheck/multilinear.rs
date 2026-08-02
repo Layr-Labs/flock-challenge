@@ -83,6 +83,16 @@ fn r2_degen_enabled() -> bool {
     std::env::var_os("FLOCK_NO_R2_DEGEN").is_none_or(|v| v != *"1")
 }
 
+/// Exact rollback for writing the GPU-produced R2 prefix directly into the
+/// ordinary compact anchor/delta representation.
+pub const ENV_NO_GPU_ZC_R2_COMPACT_OUTPUT: &str = "FLOCK_NO_GPU_ZC_R2_COMPACT_OUTPUT";
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn gpu_r2_compact_output_enabled() -> bool {
+    std::env::var_os(ENV_NO_GPU_ZC_R2_COMPACT_OUTPUT).as_deref()
+        != Some(std::ffi::OsStr::new("1"))
+}
+
 fn round2_pair_skip(padding: &PaddingSpec, k_skip: usize) -> (usize, usize) {
     if padding.k_log <= k_skip + 1 {
         return (0, usize::MAX);
@@ -612,6 +622,8 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_with_deltas(
     let gpu_job = crate::gpu_commit::launch_zc_r2_products(
         a_packed,
         b_packed,
+        &mut compact.anchors,
+        &mut compact.deltas,
         &table.data,
         eq_lo,
         eq_hi,
@@ -619,9 +631,14 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_with_deltas(
         hi_size,
         pair_in_block_mask,
         useful_pairs_inclusive,
+        gpu_r2_compact_output_enabled(),
     );
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     let gpu_prefix = gpu_job.as_ref().map_or(0, |j| j.cpu_split());
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    let gpu_compact_prefix = gpu_job
+        .as_ref()
+        .is_some_and(crate::gpu_commit::ZcR2Job::materializes_compact);
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     let t_cpu_sweep = std::time::Instant::now();
 
@@ -660,6 +677,9 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_with_deltas(
             // chunk's slot after the join).
             #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
             if x_hi < gpu_prefix {
+                if gpu_compact_prefix {
+                    return;
+                }
                 unsafe {
                     fold_round2_compact_chunk_neon_anchors_only_8(
                         table.data.as_ptr().cast::<u8>(),
@@ -756,20 +776,31 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_with_deltas(
             }
             crate::gpu_commit::ZcR2Result::Failed => {
                 // Redo exactly the skipped prefix products — slower, still
-                // exact. Throwaway anchor/delta scratch: the real ranges
-                // were already written by the anchors-only pass.
+                // exact. If the GPU was also responsible for materializing
+                // this prefix, write into the real compact ranges; otherwise
+                // the incumbent anchors-only pass already filled them.
                 let mut scr_anchors = vec![F128::ZERO; anchor_chunk_size];
                 let mut scr_deltas = vec![0u8; delta_chunk_size];
                 for x_hi in 0..prefix {
                     let pair_idx_base = x_hi * lo_size;
                     let row_base = pair_idx_base * 2;
+                    let anchors = if gpu_compact_prefix {
+                        unsafe { compact.anchors.as_mut_ptr().add(x_hi * anchor_chunk_size) }
+                    } else {
+                        scr_anchors.as_mut_ptr()
+                    };
+                    let deltas = if gpu_compact_prefix {
+                        unsafe { compact.deltas.as_mut_ptr().add(x_hi * delta_chunk_size) }
+                    } else {
+                        scr_deltas.as_mut_ptr()
+                    };
                     let (p1, pinf) = unsafe {
                         fold_round2_compact_chunk_neon_unchecked_8(
                             table.data.as_ptr().cast::<u8>(),
                             a_packed.as_ptr().add(row_base * n_chunks),
                             b_packed.as_ptr().add(row_base * n_chunks),
-                            scr_anchors.as_mut_ptr(),
-                            scr_deltas.as_mut_ptr(),
+                            anchors,
+                            deltas,
                             eq_lo.as_ptr(),
                             lo_size,
                             pair_idx_base,
