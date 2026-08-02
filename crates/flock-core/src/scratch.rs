@@ -89,6 +89,49 @@ pub fn take_f128(n: usize) -> Vec<F128> {
     crate::alloc_uninit_vec(n)
 }
 
+/// [`take_f128`] variant that never returns a pinned allocation. The pinned
+/// slots carry process-lifetime external no-copy Metal views; a caller that
+/// intends to create its OWN no-copy view over the returned buffer (the
+/// zerocheck tail products arms) must not receive a range that is already
+/// wrapped — overlapping `newBufferWithBytesNoCopy` views are not legal, and
+/// on a worker where the pin is parked at take time the ordinary
+/// pinned-first preference hands out exactly that collision.
+pub(crate) fn take_f128_unpinned(n: usize) -> Vec<F128> {
+    if let Some(v) = try_take_f128(n) {
+        // The evictable pool never holds a pinned allocation (give_f128
+        // parks those in their dedicated slots), so this cannot alias.
+        return v;
+    }
+    crate::alloc_uninit_vec(n)
+}
+
+/// Whether `[addr, addr + len_bytes)` overlaps either pinned registration's
+/// byte range. Belt-and-braces for wrap sites: even a buffer obtained
+/// through an ordinary take must refuse a second no-copy view if it aliases
+/// a pinned (already-wrapped) allocation.
+pub(crate) fn f128_range_overlaps_pin(addr: usize, len_bytes: usize) -> bool {
+    let end = addr.saturating_add(len_bytes);
+    for (a, l) in [
+        (
+            PINNED_F128_ADDR.load(Ordering::Acquire),
+            PINNED_F128_LEN.load(Ordering::Acquire),
+        ),
+        (
+            PINNED2_F128_ADDR.load(Ordering::Acquire),
+            PINNED2_F128_LEN.load(Ordering::Acquire),
+        ),
+    ] {
+        if a == 0 || l == 0 {
+            continue;
+        }
+        let pin_end = a + l * core::mem::size_of::<F128>();
+        if addr < pin_end && a < end {
+            return true;
+        }
+    }
+    false
+}
+
 fn try_take_pinned_f128(n: usize) -> Option<Vec<F128>> {
     if PINNED_F128_LEN.load(Ordering::Acquire) != n {
         return None;
