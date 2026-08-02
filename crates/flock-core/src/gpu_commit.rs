@@ -3786,7 +3786,12 @@ kernel void blake3_pow_scan(
             let mut last_end = 0.0f64;
             let n_bands = self.pending.len();
             for cb in self.pending.drain(..) {
-                let waited = unsafe { self.gpu.wait_cb(cb) };
+                // Each band was committed async during witness generation
+                // (9-band tapered z stream); by finish the GPU is long done
+                // with every band but the last, so the blocking wait pays a
+                // park+wake per already-complete buffer. Spin with a bounded
+                // budget (falls back to the blocking wait past it).
+                let waited = unsafe { self.gpu.spin_wait_cb(cb, 2.0) };
                 if trace {
                     let (s, e) = unsafe { cb_gpu_interval(self.gpu, cb) };
                     if e > s {
