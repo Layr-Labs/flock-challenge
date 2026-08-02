@@ -105,6 +105,89 @@ unsafe fn mul_unreduced_q(
     }
 }
 
+/// One shared GF(2^128) multiplier, split once per tail worker chunk.
+#[cfg(target_arch = "aarch64")]
+#[derive(Clone, Copy)]
+struct ConstMulQ {
+    lo: u64,
+    hi: u64,
+    mid: u64,
+}
+
+#[cfg(target_arch = "aarch64")]
+impl ConstMulQ {
+    #[inline(always)]
+    fn new(c: F128) -> Self {
+        Self {
+            lo: c.lo,
+            hi: c.hi,
+            mid: c.lo ^ c.hi,
+        }
+    }
+}
+
+/// Multiply two independent q-register field values by one shared constant.
+/// Six PMULLs replace the twelve used by two scalar Binius products, and the
+/// paired reduction keeps both products in vector lanes until the final unzip.
+#[cfg(target_arch = "aarch64")]
+#[inline]
+#[target_feature(enable = "aes")]
+unsafe fn mul_const_pair_q(
+    c: ConstMulQ,
+    x0: core::arch::aarch64::uint64x2_t,
+    x1: core::arch::aarch64::uint64x2_t,
+) -> (
+    core::arch::aarch64::uint64x2_t,
+    core::arch::aarch64::uint64x2_t,
+) {
+    use core::arch::aarch64::*;
+    unsafe {
+        let x0_lo = vgetq_lane_u64::<0>(x0);
+        let x0_hi = vgetq_lane_u64::<1>(x0);
+        let x1_lo = vgetq_lane_u64::<0>(x1);
+        let x1_hi = vgetq_lane_u64::<1>(x1);
+
+        let p0_ll = pmull_lane(x0_lo, c.lo);
+        let p0_hh = pmull_lane(x0_hi, c.hi);
+        let p0_mm = pmull_lane(x0_lo ^ x0_hi, c.mid);
+        let p1_ll = pmull_lane(x1_lo, c.lo);
+        let p1_hh = pmull_lane(x1_hi, c.hi);
+        let p1_mm = pmull_lane(x1_lo ^ x1_hi, c.mid);
+        let cross0 = xor3_u64(p0_mm, p0_ll, p0_hh);
+        let cross1 = xor3_u64(p1_mm, p1_ll, p1_hh);
+
+        // Pair the corresponding 64-bit words of both 256-bit products.
+        let r0 = vzip1q_u64(p0_ll, p1_ll);
+        let r1 = veorq_u64(vzip2q_u64(p0_ll, p1_ll), vzip1q_u64(cross0, cross1));
+        let r2 = veorq_u64(vzip1q_u64(p0_hh, p1_hh), vzip2q_u64(cross0, cross1));
+        let r3 = vzip2q_u64(p0_hh, p1_hh);
+
+        // Lane-parallel GHASH reduction modulo x^128+x^7+x^2+x+1.
+        let s1_lo = vshlq_n_u64::<1>(r2);
+        let s1_hi = veorq_u64(vshlq_n_u64::<1>(r3), vshrq_n_u64::<63>(r2));
+        let s2_lo = vshlq_n_u64::<2>(r2);
+        let s2_hi = veorq_u64(vshlq_n_u64::<2>(r3), vshrq_n_u64::<62>(r2));
+        let s7_lo = vshlq_n_u64::<7>(r2);
+        let s7_hi = veorq_u64(vshlq_n_u64::<7>(r3), vshrq_n_u64::<57>(r2));
+        let folded_lo = xor3_u64(r2, s1_lo, veorq_u64(s2_lo, s7_lo));
+        let folded_hi = xor3_u64(r3, s1_hi, veorq_u64(s2_hi, s7_hi));
+        let overflow = xor3_u64(
+            vshrq_n_u64::<63>(r3),
+            vshrq_n_u64::<62>(r3),
+            vshrq_n_u64::<57>(r3),
+        );
+        let correction = xor3_u64(
+            overflow,
+            vshlq_n_u64::<1>(overflow),
+            veorq_u64(vshlq_n_u64::<2>(overflow), vshlq_n_u64::<7>(overflow)),
+        );
+        let lo = xor3_u64(r0, folded_lo, correction);
+        let hi = veorq_u64(r1, folded_hi);
+
+        (vzip1q_u64(lo, hi), vzip2q_u64(lo, hi))
+    }
+}
+
 #[cfg(target_arch = "aarch64")]
 #[inline(always)]
 unsafe fn wide_xor(acc: &mut WideNeon, value: WideNeon) {
@@ -931,6 +1014,13 @@ pub(crate) unsafe fn fold_one_row_neon_unchecked_8(
 /// Keeping each four-value folded pair live until its message contribution is
 /// accumulated removes that full output readback while preserving the exact
 /// canonical output tables for the next round.
+#[inline]
+fn tail_const_pmull_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("FLOCK_NO_ZC_TAIL_CONST_PMULL").is_none())
+}
+
 #[cfg(target_arch = "aarch64")]
 pub(crate) fn fold_and_message_aarch64(
     a_in: &[F128],
@@ -946,7 +1036,21 @@ pub(crate) fn fold_and_message_aarch64(
     // elides the write-allocate RFO reads; small rounds keep normal stores so
     // LLC-resident outputs stay hot). Per-chunk callers must not decide this
     // from their sub-slice length.
-    if nt_stores {
+    if tail_const_pmull_enabled() {
+        // SAFETY: every Apple Silicon target used by the ranked worker has
+        // AES/PMULL. The target-feature body keeps non-AES cross builds valid.
+        unsafe {
+            if nt_stores {
+                fold_and_message_const_pmull_body::<true>(
+                    a_in, b_in, a_out, b_out, r_fold, eq_lo,
+                )
+            } else {
+                fold_and_message_const_pmull_body::<false>(
+                    a_in, b_in, a_out, b_out, r_fold, eq_lo,
+                )
+            }
+        }
+    } else if nt_stores {
         fold_and_message_body::<true>(a_in, b_in, a_out, b_out, r_fold, eq_lo)
     } else {
         fold_and_message_body::<false>(a_in, b_in, a_out, b_out, r_fold, eq_lo)
@@ -1036,6 +1140,100 @@ fn fold_and_message_body<const NT: bool>(
     (p1_acc.reduce(), pinf_acc.reduce())
 }
 
+/// q-register-native tail worker. The round challenge is shared by every fold
+/// in the chunk, so four folds use two paired constant multiplies. Message
+/// products and equality weighting use the existing three-product q forms.
+#[cfg(target_arch = "aarch64")]
+#[inline]
+#[target_feature(enable = "aes")]
+unsafe fn fold_and_message_const_pmull_body<const NT: bool>(
+    a_in: &[F128],
+    b_in: &[F128],
+    a_out: &mut [F128],
+    b_out: &mut [F128],
+    r_fold: F128,
+    eq_lo: &[F128],
+) -> (F128, F128) {
+    use core::arch::aarch64::*;
+
+    debug_assert_eq!(a_in.len(), 2 * a_out.len());
+    debug_assert_eq!(b_in.len(), 2 * b_out.len());
+    debug_assert_eq!(a_out.len(), 2 * eq_lo.len());
+
+    #[inline(always)]
+    unsafe fn store_pair_nt(dst: *mut F128, x: uint64x2_t, y: uint64x2_t) {
+        unsafe {
+            core::arch::asm!(
+                "stnp {x:q}, {y:q}, [{dst}]",
+                dst = in(reg) dst,
+                x = in(vreg) x,
+                y = in(vreg) y,
+                options(nostack, preserves_flags),
+            );
+        }
+    }
+
+    unsafe {
+        let zero = vdupq_n_u64(0);
+        let mut p1_acc = WideNeon { lo: zero, hi: zero };
+        let mut pinf_acc = WideNeon { lo: zero, hi: zero };
+        let multiplier = ConstMulQ::new(r_fold);
+        let a_in_ptr = a_in.as_ptr();
+        let b_in_ptr = b_in.as_ptr();
+        let a_out_ptr = a_out.as_mut_ptr();
+        let b_out_ptr = b_out.as_mut_ptr();
+
+        for x_lo in 0..eq_lo.len() {
+            let i = 4 * x_lo;
+            let o = 2 * x_lo;
+            let a_even_0 = vld1q_u64(a_in_ptr.add(i).cast::<u64>());
+            let a_odd_0 = vld1q_u64(a_in_ptr.add(i + 1).cast::<u64>());
+            let a_even_1 = vld1q_u64(a_in_ptr.add(i + 2).cast::<u64>());
+            let a_odd_1 = vld1q_u64(a_in_ptr.add(i + 3).cast::<u64>());
+            let b_even_0 = vld1q_u64(b_in_ptr.add(i).cast::<u64>());
+            let b_odd_0 = vld1q_u64(b_in_ptr.add(i + 1).cast::<u64>());
+            let b_even_1 = vld1q_u64(b_in_ptr.add(i + 2).cast::<u64>());
+            let b_odd_1 = vld1q_u64(b_in_ptr.add(i + 3).cast::<u64>());
+
+            let (a_prod_0, a_prod_1) = mul_const_pair_q(
+                multiplier,
+                veorq_u64(a_even_0, a_odd_0),
+                veorq_u64(a_even_1, a_odd_1),
+            );
+            let (b_prod_0, b_prod_1) = mul_const_pair_q(
+                multiplier,
+                veorq_u64(b_even_0, b_odd_0),
+                veorq_u64(b_even_1, b_odd_1),
+            );
+            let a0 = veorq_u64(a_even_0, a_prod_0);
+            let a1 = veorq_u64(a_even_1, a_prod_1);
+            let b0 = veorq_u64(b_even_0, b_prod_0);
+            let b1 = veorq_u64(b_even_1, b_prod_1);
+
+            if NT {
+                store_pair_nt(a_out_ptr.add(o), a0, a1);
+                store_pair_nt(b_out_ptr.add(o), b0, b1);
+            } else {
+                vst1q_u64(a_out_ptr.add(o).cast::<u64>(), a0);
+                vst1q_u64(a_out_ptr.add(o + 1).cast::<u64>(), a1);
+                vst1q_u64(b_out_ptr.add(o).cast::<u64>(), b0);
+                vst1q_u64(b_out_ptr.add(o + 1).cast::<u64>(), b1);
+            }
+
+            let g1 = mul_q(a1, b1);
+            let g_inf = mul_q(veorq_u64(a0, a1), veorq_u64(b0, b1));
+            let eq_l = vld1q_u64(eq_lo.as_ptr().add(x_lo).cast::<u64>());
+            wide_xor(&mut p1_acc, mul_unreduced_q(eq_l, g1));
+            wide_xor(&mut pinf_acc, mul_unreduced_q(eq_l, g_inf));
+        }
+
+        (
+            core::mem::transmute::<uint64x2_t, F128>(reduce_wide_q(p1_acc)),
+            core::mem::transmute::<uint64x2_t, F128>(reduce_wide_q(pinf_acc)),
+        )
+    }
+}
+
 #[cfg(all(test, target_arch = "aarch64", target_feature = "aes"))]
 mod tests {
     use super::*;
@@ -1108,6 +1306,89 @@ mod tests {
                     expected_unreduced
                 );
             }
+        }
+    }
+
+    #[test]
+    fn shared_constant_pair_matches_scalar_field_products() {
+        let mut state = 0x434f_4e53_5450_4149;
+        unsafe {
+            for _ in 0..256 {
+                let c = F128::new(splitmix64(&mut state), splitmix64(&mut state));
+                let x0 = F128::new(splitmix64(&mut state), splitmix64(&mut state));
+                let x1 = F128::new(splitmix64(&mut state), splitmix64(&mut state));
+                let (got0, got1) = mul_const_pair_q(
+                    ConstMulQ::new(c),
+                    core::mem::transmute::<F128, uint64x2_t>(x0),
+                    core::mem::transmute::<F128, uint64x2_t>(x1),
+                );
+                assert_eq!(core::mem::transmute::<uint64x2_t, F128>(got0), c * x0);
+                assert_eq!(core::mem::transmute::<uint64x2_t, F128>(got1), c * x1);
+            }
+        }
+    }
+
+    #[test]
+    fn tail_const_pmull_body_matches_incumbent() {
+        const EQ_LEN: usize = 16;
+        const OUT_LEN: usize = 2 * EQ_LEN;
+        const IN_LEN: usize = 2 * OUT_LEN;
+        let mut state = 0x5441_494c_434f_4e53;
+        let mut next = || F128::new(splitmix64(&mut state), splitmix64(&mut state));
+        let a_in: Vec<F128> = (0..IN_LEN).map(|_| next()).collect();
+        let b_in: Vec<F128> = (0..IN_LEN).map(|_| next()).collect();
+        let eq_lo: Vec<F128> = (0..EQ_LEN).map(|_| next()).collect();
+        let r_fold = next();
+
+        for nt in [false, true] {
+            let mut want_a = vec![F128::ZERO; OUT_LEN];
+            let mut want_b = vec![F128::ZERO; OUT_LEN];
+            let mut got_a = vec![F128::ZERO; OUT_LEN];
+            let mut got_b = vec![F128::ZERO; OUT_LEN];
+            let want = if nt {
+                fold_and_message_body::<true>(
+                    &a_in,
+                    &b_in,
+                    &mut want_a,
+                    &mut want_b,
+                    r_fold,
+                    &eq_lo,
+                )
+            } else {
+                fold_and_message_body::<false>(
+                    &a_in,
+                    &b_in,
+                    &mut want_a,
+                    &mut want_b,
+                    r_fold,
+                    &eq_lo,
+                )
+            };
+            let got = unsafe {
+                if nt {
+                    fold_and_message_const_pmull_body::<true>(
+                        &a_in,
+                        &b_in,
+                        &mut got_a,
+                        &mut got_b,
+                        r_fold,
+                        &eq_lo,
+                    )
+                } else {
+                    fold_and_message_const_pmull_body::<false>(
+                        &a_in,
+                        &b_in,
+                        &mut got_a,
+                        &mut got_b,
+                        r_fold,
+                        &eq_lo,
+                    )
+                }
+            };
+
+            assert_eq!(got_a, want_a, "A output mismatch nt={nt}");
+            assert_eq!(got_b, want_b, "B output mismatch nt={nt}");
+            assert_eq!(got, want, "message mismatch nt={nt}");
         }
     }
 }
