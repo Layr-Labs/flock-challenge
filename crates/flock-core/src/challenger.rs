@@ -784,6 +784,20 @@ fn gpu_blake3_pow_nonce(state_digest: &[u8; 32], bits: u32) -> Result<u64, Strin
         let next_start = start
             .checked_add(u64::from(block_len))
             .ok_or_else(|| "GPU grind nonce range exhausted".to_string())?;
+        // Depth-2 prefetch: the CPU window covers TWO blocks ahead while the
+        // GPU scans the current one. On a GPU miss AND a first-block CPU miss
+        // (e^-2 ≈ 0.135 of all grind walks), the depth-1 arm would pay a
+        // second full GPU round trip (~0.8 ms fixed+kernel) for the block
+        // after the prefetched one; depth-2 has it already scanned on the
+        // otherwise-idle cores, and the double-miss advances 3 blocks instead
+        // of 2. Determinism is unchanged: blocks are visited in ascending
+        // order, the GPU reports the smallest match in its block, and the CPU
+        // window returns the smallest in the next two blocks — if the GPU
+        // block is empty, every earlier block was exhausted, so the window's
+        // minimum is the global minimum (same argument as depth-1, extended
+        // by one block). Byte-identical to the sequential search either way.
+        let prefetch_blocks = if grind_hybrid_depth2_enabled() { 2u32 } else { 1u32 };
+        let prefetch_len = block_len * prefetch_blocks;
         // The prefetch result is consumed only when the GPU block misses, so
         // the GPU thread flags a hit as soon as its spin returns and the CPU
         // window bails between chunks instead of draining a scan whose result
@@ -804,7 +818,7 @@ fn gpu_blake3_pow_nonce(state_digest: &[u8; 32], bits: u32) -> Result<u64, Strin
             let cpu = cpu_blake3_pow_window_inner(
                 state_digest,
                 next_start,
-                block_len,
+                prefetch_len,
                 bits,
                 abort.then_some(&stop),
             );
@@ -820,7 +834,7 @@ fn gpu_blake3_pow_nonce(state_digest: &[u8; 32], bits: u32) -> Result<u64, Strin
             return Ok(nonce);
         }
         start = next_start
-            .checked_add(u64::from(block_len))
+            .checked_add(u64::from(prefetch_len))
             .ok_or_else(|| "GPU grind nonce range exhausted".to_string())?;
     }
 }
@@ -830,6 +844,14 @@ fn gpu_blake3_pow_nonce(state_digest: &[u8; 32], bits: u32) -> Result<u64, Strin
 fn grind_hybrid_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("FLOCK_NO_GRIND_HYBRID").is_none())
+}
+
+/// `FLOCK_NO_GRIND_HYBRID_DEPTH2` restores the depth-1 single-block
+/// prefetch (exact rollback lever for the two-block extension; the returned
+/// nonce is identical either way).
+fn grind_hybrid_depth2_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("FLOCK_NO_GRIND_HYBRID_DEPTH2").is_none())
 }
 
 /// `FLOCK_NO_GRIND_HYBRID_ABORT` keeps the prefetch window draining to
