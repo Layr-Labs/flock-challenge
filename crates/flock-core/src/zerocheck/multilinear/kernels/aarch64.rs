@@ -813,6 +813,69 @@ pub(crate) unsafe fn fold_compact_stream_chunk_neon<const L: usize>(
     }
 }
 
+/// Reconstruction-only sibling of [`fold_compact_chunk_neon_unchecked_8`]:
+/// writes byte-identical `a_out`/`b_out` values and skips the message
+/// products entirely. Used for the chunk prefix whose products the GPU T3
+/// arm owns — the CPU must still materialize every reconstructed value for
+/// the later tail rounds, but the two message muls and two eq-weight muls
+/// per pair move to the GPU.
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "aes")]
+pub(crate) unsafe fn fold_compact_chunk_neon_reconstruct_only_8(
+    scaled_table: *const u8,
+    anchors: *const F128,
+    deltas: *const u8,
+    a_out: *mut F128,
+    b_out: *mut F128,
+    lo_size: usize,
+) {
+    use core::arch::aarch64::*;
+
+    #[inline(always)]
+    unsafe fn store_pair_nt(dst: *mut F128, x: uint64x2_t, y: uint64x2_t) {
+        unsafe {
+            core::arch::asm!(
+                "stnp {x:q}, {y:q}, [{dst}]",
+                dst = in(reg) dst,
+                x = in(vreg) x,
+                y = in(vreg) y,
+                options(nostack, preserves_flags),
+            );
+        }
+    }
+
+    unsafe {
+        for x_lo in 0..lo_size {
+            let out = 2 * x_lo;
+            let delta = deltas.add(out * 16);
+            let a0_code = u64::from_le(core::ptr::read_unaligned(delta.cast::<u64>()));
+            let b0_code = u64::from_le(core::ptr::read_unaligned(delta.add(8).cast::<u64>()));
+            let a1_code = u64::from_le(core::ptr::read_unaligned(delta.add(16).cast::<u64>()));
+            let b1_code = u64::from_le(core::ptr::read_unaligned(delta.add(24).cast::<u64>()));
+
+            let a0 = veorq_u64(
+                vld1q_u64(anchors.add(2 * out).cast::<u64>()),
+                lookup_lanes_q::<8>(scaled_table, a0_code, 0),
+            );
+            let b0 = veorq_u64(
+                vld1q_u64(anchors.add(2 * out + 1).cast::<u64>()),
+                lookup_lanes_q::<8>(scaled_table, b0_code, 0),
+            );
+            let a1 = veorq_u64(
+                vld1q_u64(anchors.add(2 * (out + 1)).cast::<u64>()),
+                lookup_lanes_q::<8>(scaled_table, a1_code, 0),
+            );
+            let b1 = veorq_u64(
+                vld1q_u64(anchors.add(2 * (out + 1) + 1).cast::<u64>()),
+                lookup_lanes_q::<8>(scaled_table, b1_code, 0),
+            );
+
+            store_pair_nt(a_out.add(out), a0, a1);
+            store_pair_nt(b_out.add(out), b0, b1);
+        }
+    }
+}
+
 /// Reconstruct one compact round-two level at the sampled challenge and form
 /// the next sumcheck message. `scaled_table` is the univariate fold table with
 /// every entry multiplied by that challenge, so reconstruction needs only

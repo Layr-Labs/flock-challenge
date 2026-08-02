@@ -906,13 +906,20 @@ fn prove_fast_core_with_commit_codeword<Ch: Challenger>(
             assert_eq!(r1cs.useful_bits, 15_409);
             let (m, k_log, useful_bits) = (r1cs.m, r1cs.k_log, r1cs.useful_bits);
             let mut stripe = flock_core::scratch::take_u8(1usize << (m - 3));
-            // E2 is the measured contention optimum: E4 steals bandwidth from
-            // commit, while E1 lets the stripe spill into zerocheck. Keep the
-            // override for controlled same-binary diagnostics only.
+            // E3, not E2, is the ranked contention optimum. The E2 default came
+            // from a local 5-P-core reading; on the ranked 10-P-core M3 Max the
+            // stripe fill has more E-side slack than that reading implied.
+            // Credit: welttowelt's public candidate `4e30884` (submission
+            // `6cd24839`) measured E3 at 1,467,688.35 cps on the ranked runner,
+            // +0.95% over the `c8aba2a` bar, and gnuchev's `6ad9781` reproduced
+            // the direction; both scored positive and then lost the run to the
+            // 10-minute job cap rather than to the mechanism. E4 still steals
+            // bandwidth from commit and E1 lets the stripe spill into zerocheck,
+            // so the 1..=4 override stays for controlled same-binary diagnostics.
             let epool_workers = std::env::var_os("FLOCK_DEFER_STRIPE_EPOOL_THREADS")
                 .and_then(|value| value.to_str()?.parse::<usize>().ok())
                 .filter(|workers| (1..=4).contains(workers))
-                .unwrap_or(2);
+                .unwrap_or(3);
             let pre = std::thread::scope(|scope| {
                 let stripe_job = scope.spawn(|| {
                     let started = std::time::Instant::now();
