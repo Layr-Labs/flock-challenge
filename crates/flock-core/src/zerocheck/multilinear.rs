@@ -85,6 +85,43 @@ fn r2_degen_enabled() -> bool {
     std::env::var_os("FLOCK_NO_R2_DEGEN").is_none_or(|v| v != *"1")
 }
 
+/// Exact rollback for writing the GPU-produced R2 prefix directly into the
+/// ordinary compact anchor/delta representation.
+pub const ENV_NO_GPU_ZC_R2_COMPACT_OUTPUT: &str = "FLOCK_NO_GPU_ZC_R2_COMPACT_OUTPUT";
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn gpu_r2_compact_output_allowed() -> bool {
+    std::env::var_os(ENV_NO_GPU_ZC_R2_COMPACT_OUTPUT).as_deref()
+        != Some(std::ffi::OsStr::new("1"))
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+const GPU_R2_COMPACT_GATE_UNKNOWN: u8 = 0;
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+const GPU_R2_COMPACT_GATE_CONTROL: u8 = 1;
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+const GPU_R2_COMPACT_GATE_ON: u8 = 2;
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+static GPU_R2_COMPACT_GATE: std::sync::atomic::AtomicU8 =
+    std::sync::atomic::AtomicU8::new(GPU_R2_COMPACT_GATE_UNKNOWN);
+
+/// The full both-orders gate exceeded the ten-minute workflow wall because
+/// every fresh worker paid four recurring round-two timing calls after two
+/// primers. A single post-calibration control->candidate pair is admitted only
+/// when the candidate owns the entire old aggregate margin in that one draw.
+const GPU_R2_COMPACT_MARGIN_MS: f64 = 4.0;
+
+fn gpu_r2_compact_gate_accept(
+    control_ms: f64,
+    compact_ms: f64,
+    exact: bool,
+) -> bool {
+    let samples = [control_ms, compact_ms];
+    exact
+        && samples.iter().all(|v| v.is_finite() && *v > 0.0)
+        && control_ms - compact_ms >= GPU_R2_COMPACT_MARGIN_MS
+}
+
 fn round2_pair_skip(padding: &PaddingSpec, k_skip: usize) -> (usize, usize) {
     if padding.k_log <= k_skip + 1 {
         return (0, usize::MAX);
@@ -509,6 +546,37 @@ pub struct UniSkipCompactFold {
     pub deltas: ScratchBytes,
 }
 
+struct CompactRound2Run {
+    compact: UniSkipCompactFold,
+    msg_1: F128,
+    msg_inf: F128,
+    /// Complete recurring function wall through message formation, excluding
+    /// only the optional warmup-only byte oracle that follows it.
+    recurring_ms: f64,
+    /// True only when the Metal job completed and supplied the compact
+    /// prefix. A post-admission failure is CPU-repaired but cannot qualify
+    /// the materializing schedule.
+    used_gpu_compact: bool,
+    /// Challenge-specific, byte-for-byte CPU oracle result for that prefix.
+    compact_prefix_exact: bool,
+}
+
+impl CompactRound2Run {
+    #[inline]
+    fn into_tuple(self) -> (UniSkipCompactFold, F128, F128) {
+        (self.compact, self.msg_1, self.msg_inf)
+    }
+
+    /// Reuse the caller's donated delta allocation throughout warmup
+    /// admission. The anchors return to their normal scratch pool, so each
+    /// timed sample still pays the same take/setup cost as a real proof.
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    fn reclaim_for_gate(self) -> ScratchBytes {
+        crate::scratch::give_f128(self.compact.anchors);
+        self.compact.deltas
+    }
+}
+
 impl UniSkipCompactFold {
     #[inline]
     pub fn len(&self) -> usize {
@@ -567,6 +635,146 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_with_deltas(
     padding: &PaddingSpec,
     deltas_backing: Option<ScratchBytes>,
 ) -> (UniSkipCompactFold, F128, F128) {
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    if m == 32 && k_skip == 6 && gpu_r2_compact_output_allowed() {
+        return gated_gpu_r2_compact_output(
+            a_packed,
+            b_packed,
+            m,
+            k_skip,
+            table,
+            mlv_challenges,
+            padding,
+            deltas_backing,
+        )
+        .into_tuple();
+    }
+
+    uni_skip_fold_and_round_pair_compact_padded_once(
+        a_packed,
+        b_packed,
+        m,
+        k_skip,
+        table,
+        mlv_challenges,
+        padding,
+        deltas_backing,
+        false,
+        false,
+    )
+    .into_tuple()
+}
+
+/// Warmup-only admission for GPU compact output. The first incumbent call
+/// initializes the existing products-arm share tuner and the shared Metal
+/// pipeline. We then time one recurring control followed by one candidate.
+/// The candidate's full-prefix oracle runs after its recurring wall is
+/// captured, and the exact candidate output is returned directly on success.
+/// This removes three full round-two calls per worker relative to V8, the
+/// source of its workflow timeout. Per-proof output-view creation/release
+/// remains inside the candidate sample.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[allow(clippy::too_many_arguments)]
+fn gated_gpu_r2_compact_output(
+    a_packed: &[u8],
+    b_packed: &[u8],
+    m: usize,
+    k_skip: usize,
+    table: &UniSkipFoldTable,
+    mlv_challenges: &[F128],
+    padding: &PaddingSpec,
+    deltas_backing: Option<ScratchBytes>,
+) -> CompactRound2Run {
+    use std::sync::atomic::Ordering;
+
+    let run = |backing, materialize, verify| {
+        uni_skip_fold_and_round_pair_compact_padded_once(
+            a_packed,
+            b_packed,
+            m,
+            k_skip,
+            table,
+            mlv_challenges,
+            padding,
+            backing,
+            materialize,
+            verify,
+        )
+    };
+
+    match GPU_R2_COMPACT_GATE.load(Ordering::Relaxed) {
+        GPU_R2_COMPACT_GATE_ON => return run(deltas_backing, true, false),
+        GPU_R2_COMPACT_GATE_CONTROL => return run(deltas_backing, false, false),
+        _ => {}
+    }
+
+    // Untimed incumbent calibration/prime. This publishes both the
+    // products-only and materializing shares from the same target-local
+    // ratio, initializes the one shared shader/pipeline, and returns a
+    // CPU-authoritative compact representation.
+    let control_prime = run(deltas_backing, false, false);
+    let canonical = (control_prime.msg_1, control_prime.msg_inf);
+    let mut backing = Some(control_prime.reclaim_for_gate());
+
+    // One post-calibration control -> candidate pair. The shared Metal state
+    // is already warm. Candidate output views cannot be primed or retained:
+    // they wrap pooled scratch addresses and are recurring per-proof costs.
+    let control = run(backing.take(), false, false);
+    let control_ms = control.recurring_ms;
+    let samples_exact = (control.msg_1, control.msg_inf) == canonical;
+    backing = Some(control.reclaim_for_gate());
+
+    // The recurring timer stops before the expensive exact oracle, which a
+    // measured proof never pays. The oracle still covers every GPU-owned
+    // output byte and message partial before the gate may latch on.
+    let compact = run(backing.take(), true, true);
+    let compact_ms = compact.recurring_ms;
+    let samples_exact = samples_exact
+        && compact.used_gpu_compact
+        && compact.compact_prefix_exact
+        && (compact.msg_1, compact.msg_inf) == canonical;
+
+    let win = control_ms - compact_ms;
+    let accept = gpu_r2_compact_gate_accept(control_ms, compact_ms, samples_exact);
+
+    if crate::gpu_commit::gpu_zc_r2_debug() {
+        eprintln!(
+            "[zc-r2-compact] workflow-safe whole-join gate: compact={compact_ms:.2}ms \
+             control={control_ms:.2}ms win={win:.2}ms exact={samples_exact} -> {}",
+            if accept { "ON" } else { "OFF" }
+        );
+    }
+
+    GPU_R2_COMPACT_GATE.store(
+        if accept {
+            GPU_R2_COMPACT_GATE_ON
+        } else {
+            GPU_R2_COMPACT_GATE_CONTROL
+        },
+        Ordering::Relaxed,
+    );
+    if accept {
+        compact
+    } else {
+        backing = Some(compact.reclaim_for_gate());
+        run(backing.take(), false, false)
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn uni_skip_fold_and_round_pair_compact_padded_once(
+    a_packed: &[u8],
+    b_packed: &[u8],
+    m: usize,
+    k_skip: usize,
+    table: &UniSkipFoldTable,
+    mlv_challenges: &[F128],
+    padding: &PaddingSpec,
+    deltas_backing: Option<ScratchBytes>,
+    materialize_gpu_prefix: bool,
+    verify_gpu_prefix: bool,
+) -> CompactRound2Run {
+    let recurring_t = std::time::Instant::now();
     assert_eq!(
         k_skip, 6,
         "optimized compact fold-and-round_pair variant is k_skip=6 only"
@@ -611,9 +819,11 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_with_deltas(
     // XOR reduce below is order-independent, so the output is bit-identical
     // to the all-CPU sweep. `None` = the exact incumbent path.
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-    let gpu_job = crate::gpu_commit::launch_zc_r2_products(
+    let mut gpu_job = crate::gpu_commit::launch_zc_r2_products(
         a_packed,
         b_packed,
+        &mut compact.anchors,
+        &mut compact.deltas,
         &table.data,
         eq_lo,
         eq_hi,
@@ -621,9 +831,45 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_with_deltas(
         hi_size,
         pair_in_block_mask,
         useful_pairs_inclusive,
+        materialize_gpu_prefix,
     );
+    // A different scratch address in the measured proof may make a pooled
+    // output overlap another pinned no-copy view. Fall back in-place to the
+    // incumbent products-only split instead of turning that proof into an
+    // all-CPU outlier (or redoing the whole round).
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    if materialize_gpu_prefix && gpu_job.is_none() {
+        GPU_R2_COMPACT_GATE.store(
+            GPU_R2_COMPACT_GATE_CONTROL,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        gpu_job = crate::gpu_commit::launch_zc_r2_products(
+            a_packed,
+            b_packed,
+            &mut compact.anchors,
+            &mut compact.deltas,
+            &table.data,
+            eq_lo,
+            eq_hi,
+            lo_size,
+            hi_size,
+            pair_in_block_mask,
+            useful_pairs_inclusive,
+            false,
+        );
+    }
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     let gpu_prefix = gpu_job.as_ref().map_or(0, |j| j.cpu_split());
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    let gpu_compact_prefix = gpu_job
+        .as_ref()
+        .is_some_and(crate::gpu_commit::ZcR2Job::materializes_compact);
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    let mut gpu_compact_succeeded = gpu_compact_prefix;
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    let mut compact_prefix_exact = !verify_gpu_prefix;
+    #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+    let (gpu_compact_succeeded, compact_prefix_exact) = (false, true);
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     let t_cpu_sweep = std::time::Instant::now();
 
@@ -662,6 +908,9 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_with_deltas(
             // chunk's slot after the join).
             #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
             if x_hi < gpu_prefix {
+                if gpu_compact_prefix {
+                    return;
+                }
                 unsafe {
                     fold_round2_compact_chunk_neon_anchors_only_8(
                         table.data.as_ptr().cast::<u8>(),
@@ -757,21 +1006,38 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_with_deltas(
                 partials[..prefix].copy_from_slice(&vals);
             }
             crate::gpu_commit::ZcR2Result::Failed => {
+                gpu_compact_succeeded = false;
+                compact_prefix_exact = false;
+                GPU_R2_COMPACT_GATE.store(
+                    GPU_R2_COMPACT_GATE_CONTROL,
+                    std::sync::atomic::Ordering::Relaxed,
+                );
                 // Redo exactly the skipped prefix products — slower, still
-                // exact. Throwaway anchor/delta scratch: the real ranges
-                // were already written by the anchors-only pass.
+                // exact. If the GPU was also responsible for materializing
+                // this prefix, write into the real compact ranges; otherwise
+                // the incumbent anchors-only pass already filled them.
                 let mut scr_anchors = vec![F128::ZERO; anchor_chunk_size];
                 let mut scr_deltas = vec![0u8; delta_chunk_size];
                 for x_hi in 0..prefix {
                     let pair_idx_base = x_hi * lo_size;
                     let row_base = pair_idx_base * 2;
+                    let anchors = if gpu_compact_prefix {
+                        unsafe { compact.anchors.as_mut_ptr().add(x_hi * anchor_chunk_size) }
+                    } else {
+                        scr_anchors.as_mut_ptr()
+                    };
+                    let deltas = if gpu_compact_prefix {
+                        unsafe { compact.deltas.as_mut_ptr().add(x_hi * delta_chunk_size) }
+                    } else {
+                        scr_deltas.as_mut_ptr()
+                    };
                     let (p1, pinf) = unsafe {
                         fold_round2_compact_chunk_neon_unchecked_8(
                             table.data.as_ptr().cast::<u8>(),
                             a_packed.as_ptr().add(row_base * n_chunks),
                             b_packed.as_ptr().add(row_base * n_chunks),
-                            scr_anchors.as_mut_ptr(),
-                            scr_deltas.as_mut_ptr(),
+                            anchors,
+                            deltas,
                             eq_lo.as_ptr(),
                             lo_size,
                             pair_idx_base,
@@ -792,8 +1058,96 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_with_deltas(
         .fold((F128::ZERO, F128::ZERO), |(s1, sinf), &(c1, cinf)| {
             (s1 + c1, sinf + cinf)
         });
+    let recurring_ms = recurring_t.elapsed().as_secs_f64() * 1e3;
 
-    (compact, mlv_challenges[0] * sum1, sum_inf)
+    // Full target-local oracle is deliberately outside `recurring_ms`: only
+    // the first unscored worker call requests it. The production proof pays
+    // everything measured above, including output-view setup and release.
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    if verify_gpu_prefix && gpu_compact_prefix && gpu_compact_succeeded {
+        compact_prefix_exact = verify_gpu_r2_compact_prefix(
+            a_packed,
+            b_packed,
+            table,
+            eq_lo,
+            eq_hi,
+            lo_size,
+            gpu_prefix,
+            pair_in_block_mask,
+            useful_pairs_inclusive,
+            degen,
+            &compact,
+            &partials,
+        );
+    }
+
+    CompactRound2Run {
+        compact,
+        msg_1: mlv_challenges[0] * sum1,
+        msg_inf: sum_inf,
+        recurring_ms,
+        used_gpu_compact: gpu_compact_succeeded,
+        compact_prefix_exact,
+    }
+}
+
+/// Target-local oracle for the only bytes whose producer changes. CPU
+/// suffix chunks already execute the incumbent kernel; recomputing the GPU
+/// prefix here proves anchors, deltas, and reduced message partials exact
+/// before the warmup gate is allowed to time or latch the candidate.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[allow(clippy::too_many_arguments)]
+fn verify_gpu_r2_compact_prefix(
+    a_packed: &[u8],
+    b_packed: &[u8],
+    table: &UniSkipFoldTable,
+    eq_lo: &[F128],
+    eq_hi: &[F128],
+    lo_size: usize,
+    prefix: usize,
+    pair_in_block_mask: usize,
+    useful_pairs_inclusive: usize,
+    degen: bool,
+    compact: &UniSkipCompactFold,
+    partials: &[(F128, F128)],
+) -> bool {
+    let n_chunks = table.n_chunks;
+    let anchor_chunk_size = 2 * lo_size;
+    let delta_chunk_size = 2 * lo_size * n_chunks;
+    let mut expected_anchors = vec![F128::ZERO; anchor_chunk_size];
+    let mut expected_deltas = vec![0u8; delta_chunk_size];
+
+    for x_hi in 0..prefix {
+        let pair_idx_base = x_hi * lo_size;
+        let row_base = pair_idx_base * 2;
+        let (p1, pinf) = unsafe {
+            fold_round2_compact_chunk_neon_unchecked_8(
+                table.data.as_ptr().cast::<u8>(),
+                a_packed.as_ptr().add(row_base * n_chunks),
+                b_packed.as_ptr().add(row_base * n_chunks),
+                expected_anchors.as_mut_ptr(),
+                expected_deltas.as_mut_ptr(),
+                eq_lo.as_ptr(),
+                lo_size,
+                pair_idx_base,
+                pair_in_block_mask,
+                useful_pairs_inclusive,
+                degen,
+            )
+        };
+        let anchor_start = x_hi * anchor_chunk_size;
+        let delta_start = x_hi * delta_chunk_size;
+        if compact.anchors[anchor_start..anchor_start + anchor_chunk_size] != expected_anchors
+            || compact.deltas[delta_start..delta_start + delta_chunk_size] != expected_deltas
+            || partials[x_hi] != (eq_hi[x_hi] * p1, eq_hi[x_hi] * pinf)
+        {
+            if crate::gpu_commit::gpu_zc_r2_debug() {
+                eprintln!("[zc-r2-compact] oracle mismatch at prefix chunk {x_hi}");
+            }
+            return false;
+        }
+    }
+    prefix != 0
 }
 
 /// Byte-lane-outer streaming variant of
@@ -2083,6 +2437,15 @@ pub fn uni_skip_fold_and_round_pair_optimized(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn gpu_r2_compact_gate_requires_owned_workflow_safe_margin() {
+        assert!(gpu_r2_compact_gate_accept(24.0, 20.0, true));
+        assert!(!gpu_r2_compact_gate_accept(23.9, 20.0, true));
+        assert!(!gpu_r2_compact_gate_accept(24.0, 20.0, false));
+        assert!(!gpu_r2_compact_gate_accept(f64::NAN, 20.0, true));
+        assert!(!gpu_r2_compact_gate_accept(24.0, f64::INFINITY, true));
+    }
 
     struct Rng(u64);
     impl Rng {
