@@ -106,6 +106,12 @@ pub const ENV_NO_NTT_PASS_TUNE: &str = "FLOCK_NO_NTT_PASS_TUNE";
 /// Exact `1` restores the untouched incumbent g4 pipeline state.
 pub const ENV_NO_GPU_FROM_Z_ZERO_ROOT: &str = "FLOCK_NO_GPU_FROM_Z_ZERO_ROOT";
 
+/// Exact-`1` rollback from the mixed-width Horner specialization to the
+/// promoted compact zero-root kernel. The wider tables are restricted to the
+/// four twiddles reused in layers one and two; the seven layer-three tables
+/// retain their compact four-bank representation.
+pub const ENV_NO_GPU_FROM_Z_WIDE_HORNER: &str = "FLOCK_NO_GPU_FROM_Z_WIDE_HORNER";
+
 fn gpu_from_z_zero_root_value_enabled(value: Option<&std::ffi::OsStr>) -> bool {
     value != Some(std::ffi::OsStr::new("1"))
 }
@@ -117,6 +123,44 @@ fn gpu_from_z_zero_root_enabled() -> bool {
             std::env::var_os(ENV_NO_GPU_FROM_Z_ZERO_ROOT).as_deref(),
         )
     })
+}
+
+fn gpu_from_z_wide_horner_value_enabled(value: Option<&std::ffi::OsStr>) -> bool {
+    value != Some(std::ffi::OsStr::new("1"))
+}
+
+fn gpu_from_z_wide_horner_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        gpu_from_z_wide_horner_value_enabled(
+            std::env::var_os(ENV_NO_GPU_FROM_Z_WIDE_HORNER).as_deref(),
+        )
+    })
+}
+
+const FROM_Z_WIDE_UNDECIDED: u8 = 0;
+const FROM_Z_WIDE_COMPACT: u8 = 1;
+const FROM_Z_WIDE_SELECTED: u8 = 2;
+static FROM_Z_WIDE_MODE: std::sync::atomic::AtomicU8 =
+    std::sync::atomic::AtomicU8::new(FROM_Z_WIDE_UNDECIDED);
+
+fn admit_gpu_from_z_wide_horner(compact_ms: [f64; 2], wide_ms: [f64; 2]) -> bool {
+    const MIN_MEAN_WIN_MS: f64 = 1.0;
+    let both_win = wide_ms[0] < compact_ms[0] && wide_ms[1] < compact_ms[1];
+    let compact_mean = (compact_ms[0] + compact_ms[1]) * 0.5;
+    let wide_mean = (wide_ms[0] + wide_ms[1]) * 0.5;
+    both_win && compact_mean - wide_mean >= MIN_MEAN_WIN_MS
+}
+
+fn publish_gpu_from_z_wide_horner(selected: bool) {
+    FROM_Z_WIDE_MODE.store(
+        if selected {
+            FROM_Z_WIDE_SELECTED
+        } else {
+            FROM_Z_WIDE_COMPACT
+        },
+        std::sync::atomic::Ordering::Release,
+    );
 }
 
 fn select_gpu_from_z_zero_root(
@@ -142,6 +186,13 @@ fn gpu_from_z_zero_root_selected(log_d: usize) -> bool {
     )
 }
 
+#[inline]
+fn gpu_from_z_wide_horner_selected(log_d: usize) -> bool {
+    gpu_from_z_zero_root_selected(log_d)
+        && gpu_from_z_wide_horner_enabled()
+        && FROM_Z_WIDE_MODE.load(std::sync::atomic::Ordering::Acquire) != FROM_Z_WIDE_COMPACT
+}
+
 #[cfg(test)]
 mod from_z_zero_root_gate_tests {
     use std::ffi::OsStr;
@@ -159,6 +210,34 @@ mod from_z_zero_root_gate_tests {
         assert!(!super::select_gpu_from_z_zero_root(20, 32, 0, 4, true, true));
         assert!(!super::select_gpu_from_z_zero_root(20, 64, 1, 4, true, true));
         assert!(!super::select_gpu_from_z_zero_root(20, 64, 0, 3, true, true));
+    }
+
+
+    #[test]
+    fn wide_horner_has_an_exact_one_rollback() {
+        assert!(!super::gpu_from_z_wide_horner_value_enabled(Some(OsStr::new("1"))));
+        for value in [None, Some(""), Some("0"), Some("01"), Some("true")] {
+            assert!(super::gpu_from_z_wide_horner_value_enabled(
+                value.map(OsStr::new)
+            ));
+        }
+    }
+
+
+    #[test]
+    fn wide_horner_admission_requires_two_wins_and_one_ms_mean() {
+        assert!(super::admit_gpu_from_z_wide_horner(
+            [9.0, 9.4],
+            [7.9, 8.3]
+        ));
+        assert!(!super::admit_gpu_from_z_wide_horner(
+            [9.0, 9.4],
+            [8.2, 8.5]
+        ));
+        assert!(!super::admit_gpu_from_z_wide_horner(
+            [9.0, 9.4],
+            [7.8, 9.5]
+        ));
     }
 
     #[test]
@@ -192,6 +271,15 @@ mod from_z_zero_root_gate_tests {
         assert_eq!(ZERO_PRODUCTS * 8, 234_881_024);
         assert_eq!(ZERO_PRODUCTS * 32, 939_524_096);
         assert_eq!((11 * 4 + 11 * 64) * 16, 11_968);
+
+        // Compact twiddles 0..3 occur ten times in the hot network. Widening
+        // only those tables from four to eight nibble banks shortens their
+        // Horner chain while keeping the seven once-used layer-three tables
+        // narrow. The resulting footprint exactly matches the already-proven
+        // pre-compaction 16,320-byte threadgroup allocation.
+        const WIDE_PRODUCTS_PER_TILE: usize = 4 + 2 + 2 + 2;
+        assert_eq!(WIDE_PRODUCTS_PER_TILE, 10);
+        assert_eq!((4 * 8 + 7 * 4 + 4 * 128 + 7 * 64) * 16, 16_320);
     }
 }
 
@@ -1681,6 +1769,18 @@ static inline uint4 gf_shl16_zero_root(uint4 a) {
     return r;
 }
 
+static inline uint4 gf_shl32_zero_root(uint4 a) {
+    uint h = a.w;
+    uint lo = (h << 7) ^ (h << 2) ^ (h << 1) ^ h;
+    uint hi = (h >> 25) ^ (h >> 30) ^ (h >> 31);
+    uint4 r;
+    r.w = a.z;
+    r.z = a.y;
+    r.y = a.x ^ hi;
+    r.x = lo;
+    return r;
+}
+
 static inline uint4 gf_mul_tab4_zero_root(
     uint4 v,
     threadgroup const uint4* tab)
@@ -1694,6 +1794,34 @@ static inline uint4 gf_mul_tab4_zero_root(
              ^ tab[32u + ((h >> 8) & 15u)]
              ^ tab[48u + (h >> 12)];
     }
+    return acc;
+}
+
+static inline uint4 gf_tab8_word_zero_root(
+    uint word,
+    threadgroup const uint4* tab)
+{
+    return tab[word & 15u]
+         ^ tab[16u + ((word >> 4) & 15u)]
+         ^ tab[32u + ((word >> 8) & 15u)]
+         ^ tab[48u + ((word >> 12) & 15u)]
+         ^ tab[64u + ((word >> 16) & 15u)]
+         ^ tab[80u + ((word >> 20) & 15u)]
+         ^ tab[96u + ((word >> 24) & 15u)]
+         ^ tab[112u + (word >> 28)];
+}
+
+static inline uint4 gf_mul_tab8_zero_root(
+    uint4 v,
+    threadgroup const uint4* tab)
+{
+    // Four 32-bit Horner digits replace eight 16-bit digits without adding
+    // table gathers. Spell the chain out so the compiler never materializes
+    // a dynamic uint4 index or the redundant initial shift of zero.
+    uint4 acc = gf_tab8_word_zero_root(v.w, tab);
+    acc = gf_shl32_zero_root(acc) ^ gf_tab8_word_zero_root(v.z, tab);
+    acc = gf_shl32_zero_root(acc) ^ gf_tab8_word_zero_root(v.y, tab);
+    acc = gf_shl32_zero_root(acc) ^ gf_tab8_word_zero_root(v.x, tab);
     return acc;
 }
 
@@ -1729,6 +1857,69 @@ static inline void build_zero_root_tabs(
         uint sub = ei & 63u;
         uint nibble = sub & 15u;
         uint4 p = bases[(compact << 2) | (sub >> 4)];
+        uint4 value = uint4(0u);
+        for (uint bit = 0u; bit < 4u; bit++) {
+            if ((nibble >> bit) & 1u) {
+                value ^= p;
+            }
+            p = gf_mulx_zero_root(p);
+        }
+        tabs[ei] = value;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+}
+
+// Mixed-width image for the four twiddles reused in layers one and two.
+// Compact 0..3 receive eight banks (128 entries) while compact 4..10 keep
+// four banks (64 entries). The 60 bases + 960 entries occupy 16,320 bytes,
+// exactly the footprint of the old proven fifteen-table kernel.
+static inline void build_zero_root_wide_tabs(
+    device const uint4* twiddles,
+    threadgroup uint4* bases,
+    threadgroup uint4* tabs,
+    uint lid)
+{
+    constexpr uint NBASE = 60u;
+    constexpr uint NTAB = 960u;
+    if (lid < NBASE) {
+        uint compact;
+        uint bank;
+        if (lid < 32u) {
+            compact = lid >> 3;
+            bank = lid & 7u;
+        } else {
+            compact = 4u + ((lid - 32u) >> 2);
+            bank = (lid - 32u) & 3u;
+        }
+        uint4 p = twiddles[zero_root_raw_twiddle(compact)];
+        // Reuse the single-step x^16 reducer for the upper four banks. This
+        // keeps every builder lane at <=12 serial mulx steps rather than 28.
+        if (bank >= 4u) {
+            p = gf_shl16_zero_root(p);
+            bank -= 4u;
+        }
+        for (uint m = 0u; m < bank * 4u; m++) {
+            p = gf_mulx_zero_root(p);
+        }
+        bases[lid] = p;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint ei = lid; ei < NTAB; ei += 64u) {
+        uint compact;
+        uint sub;
+        uint base_offset;
+        if (ei < 512u) {
+            compact = ei >> 7;
+            sub = ei & 127u;
+            base_offset = compact << 3;
+        } else {
+            compact = 4u + ((ei - 512u) >> 6);
+            sub = (ei - 512u) & 63u;
+            base_offset = 32u + ((compact - 4u) << 2);
+        }
+        uint nibble = sub & 15u;
+        uint4 p = bases[base_offset + (sub >> 4)];
         uint4 value = uint4(0u);
         for (uint bit = 0u; bit < 4u; bit++) {
             if ((nibble >> bit) & 1u) {
@@ -1819,6 +2010,83 @@ kernel void ntt_fused_reg4_from_zg4_zero_root(
     }
 }
 
+kernel void ntt_fused_reg4_from_zg4_zero_root_wide(
+    device uint4* data             [[buffer(0)]],
+    device const uint4* twiddles   [[buffer(1)]],
+    constant NttParams& P          [[buffer(2)]],
+    device const uint4* z          [[buffer(3)]],
+    uint tgid [[threadgroup_position_in_grid]],
+    uint lid  [[thread_index_in_threadgroup]])
+{
+    constexpr uint NF = 16u;
+    constexpr uint LOG_G = 2u;
+    threadgroup uint4 bases[60u];
+    threadgroup uint4 tabs[960u];
+    build_zero_root_wide_tabs(twiddles, bases, tabs, lid);
+
+    const uint lane = lid & 63u;
+    const uint r_base = tgid << LOG_G;
+    for (uint rr = 0u; rr < (1u << LOG_G); rr++) {
+        const uint r = r_base + rr;
+        uint4 elems[NF];
+
+        for (uint e = 0u; e < NF / 2u; e++) {
+            elems[e] = z[(((e << P.s) + r) << 6) + lane];
+            elems[e + NF / 2u] = elems[e];
+        }
+
+        #define ZERO_WIDE_BFLY(EU, EV) \
+            elems[EV] ^= elems[EU];
+        #define TAB8_WIDE_BFLY(EU, EV, OFF) { \
+            uint4 nu = elems[EU] \
+                ^ gf_mul_tab8_zero_root(elems[EV], &tabs[(OFF)]); \
+            elems[EU] = nu; \
+            elems[EV] ^= nu; \
+        }
+        #define TAB4_WIDE_BFLY(EU, EV, OFF) { \
+            uint4 nu = elems[EU] \
+                ^ gf_mul_tab4_zero_root(elems[EV], &tabs[(OFF)]); \
+            elems[EU] = nu; \
+            elems[EV] ^= nu; \
+        }
+
+        ZERO_WIDE_BFLY(0, 4)
+        ZERO_WIDE_BFLY(1, 5)
+        ZERO_WIDE_BFLY(2, 6)
+        ZERO_WIDE_BFLY(3, 7)
+        TAB8_WIDE_BFLY(8, 12, 0)
+        TAB8_WIDE_BFLY(9, 13, 0)
+        TAB8_WIDE_BFLY(10, 14, 0)
+        TAB8_WIDE_BFLY(11, 15, 0)
+
+        ZERO_WIDE_BFLY(0, 2)
+        ZERO_WIDE_BFLY(1, 3)
+        TAB8_WIDE_BFLY(4, 6, 128)
+        TAB8_WIDE_BFLY(5, 7, 128)
+        TAB8_WIDE_BFLY(8, 10, 256)
+        TAB8_WIDE_BFLY(9, 11, 256)
+        TAB8_WIDE_BFLY(12, 14, 384)
+        TAB8_WIDE_BFLY(13, 15, 384)
+
+        ZERO_WIDE_BFLY(0, 1)
+        TAB4_WIDE_BFLY(2, 3, 512)
+        TAB4_WIDE_BFLY(4, 5, 576)
+        TAB4_WIDE_BFLY(6, 7, 640)
+        TAB4_WIDE_BFLY(8, 9, 704)
+        TAB4_WIDE_BFLY(10, 11, 768)
+        TAB4_WIDE_BFLY(12, 13, 832)
+        TAB4_WIDE_BFLY(14, 15, 896)
+
+        #undef TAB4_WIDE_BFLY
+        #undef TAB8_WIDE_BFLY
+        #undef ZERO_WIDE_BFLY
+
+        for (uint e = 0u; e < NF; e++) {
+            data[((r + (e << P.s)) << 6) + lane] = elems[e];
+        }
+    }
+}
+
 // Test-only PSO. It exports the exact table image built by the shared
 // helper above so a real-Metal oracle can compare every compact entry.
 kernel void export_from_z_zero_root_tabs(
@@ -1830,6 +2098,20 @@ kernel void export_from_z_zero_root_tabs(
     threadgroup uint4 tabs[11u * 64u];
     build_zero_root_tabs(twiddles, bases, tabs, lid);
     for (uint ei = lid; ei < 11u * 64u; ei += 64u) {
+        out[ei] = tabs[ei];
+    }
+}
+
+
+kernel void export_from_z_zero_root_wide_tabs(
+    device const uint4* twiddles [[buffer(0)]],
+    device uint4* out            [[buffer(1)]],
+    uint lid [[thread_index_in_threadgroup]])
+{
+    threadgroup uint4 bases[60u];
+    threadgroup uint4 tabs[960u];
+    build_zero_root_wide_tabs(twiddles, bases, tabs, lid);
+    for (uint ei = lid; ei < 960u; ei += 64u) {
         out[ei] = tabs[ei];
     }
 }
@@ -1946,10 +2228,17 @@ kernel void export_from_z_zero_root_tabs(
         /// PSO constructs eleven compact tables per group; it never reads a
         /// prebuilt device table.
         pub(crate) pso_ntt4zg4_zero_root: Id,
+        /// Mixed-width successor: eight nibble banks for compact twiddles
+        /// 0..3, four banks for the seven once-used layer-three twiddles.
+        pub(crate) pso_ntt4zg4_zero_root_wide: Id,
         /// Real-Metal oracle exporter for the shared compact table builder.
         /// `NIL` outside `cfg(test)`.
         #[cfg_attr(not(test), allow(dead_code))]
         pub(crate) pso_export_from_z_zero_root_tabs: Id,
+        /// Real-Metal oracle exporter for the mixed-width table builder.
+        /// `NIL` outside `cfg(test)`.
+        #[cfg_attr(not(test), allow(dead_code))]
+        pub(crate) pso_export_from_z_zero_root_wide_tabs: Id,
         pub(crate) pso_ntt4h8: Id,
         pub(crate) pso_ntt5mix: Id,
         pub(crate) pso_leaf: Id,
@@ -2092,7 +2381,12 @@ kernel void export_from_z_zero_root_tabs(
                 // Keep the embedded incumbent metallib byte-for-byte intact.
                 // The exact rollback skips this supplemental compile and
                 // selects the incumbent pso_ntt4zg4 below.
-                let (pso_ntt4zg4_zero_root, pso_export_from_z_zero_root_tabs) =
+                let (
+                    pso_ntt4zg4_zero_root,
+                    pso_ntt4zg4_zero_root_wide,
+                    pso_export_from_z_zero_root_tabs,
+                    pso_export_from_z_zero_root_wide_tabs,
+                ) =
                     if cfg!(test) || super::gpu_from_z_zero_root_selected(20) {
                         let src = api.nsstring(FROM_Z_ZERO_ROOT_MSL_SOURCE)?;
                         let mut err: Id = NIL;
@@ -2143,15 +2437,19 @@ kernel void export_from_z_zero_root_tabs(
                             }
                         };
                         let candidate = build("ntt_fused_reg4_from_zg4_zero_root")?;
-                        let export = if cfg!(test) {
-                            build("export_from_z_zero_root_tabs")?
+                        let wide = build("ntt_fused_reg4_from_zg4_zero_root_wide")?;
+                        let (export, wide_export) = if cfg!(test) {
+                            (
+                                build("export_from_z_zero_root_tabs")?,
+                                build("export_from_z_zero_root_wide_tabs")?,
+                            )
                         } else {
-                            NIL
+                            (NIL, NIL)
                         };
                         send!(api, unsafe extern "C" fn(Id, Sel) -> Id, library, c"release");
-                        (candidate, export)
+                        (candidate, wide, export, wide_export)
                     } else {
-                        (NIL, NIL)
+                        (NIL, NIL, NIL, NIL)
                     };
                 Ok(Gpu {
                     api,
@@ -2164,7 +2462,9 @@ kernel void export_from_z_zero_root_tabs(
                     pso_ntt4z,
                     pso_ntt4zg4,
                     pso_ntt4zg4_zero_root,
+                    pso_ntt4zg4_zero_root_wide,
                     pso_export_from_z_zero_root_tabs,
+                    pso_export_from_z_zero_root_wide_tabs,
                     pso_ntt4h8,
                     pso_ntt5mix,
                     pso_leaf,
@@ -2463,14 +2763,17 @@ kernel void export_from_z_zero_root_tabs(
     struct FromZFirstPassPlan {
         grouped: bool,
         zero_root: bool,
+        wide_horner: bool,
     }
 
     impl FromZFirstPassPlan {
         fn new(log_d: usize) -> Self {
             let grouped = super::pass_tune_enabled();
+            let zero_root = grouped && super::gpu_from_z_zero_root_selected(log_d);
             Self {
                 grouped,
-                zero_root: grouped && super::gpu_from_z_zero_root_selected(log_d),
+                zero_root,
+                wide_horner: zero_root && super::gpu_from_z_wide_horner_selected(log_d),
             }
         }
 
@@ -2485,10 +2788,14 @@ kernel void export_from_z_zero_root_tabs(
             byte_offset: usize,
             r_count: usize,
         ) {
+            debug_assert!(!self.wide_horner || self.zero_root);
             debug_assert!(!self.zero_root || self.grouped);
             debug_assert!(!self.grouped || r_count.is_multiple_of(4));
             unsafe {
-                let pso = if self.zero_root {
+                let pso = if self.wide_horner {
+                    debug_assert!(!gpu.pso_ntt4zg4_zero_root_wide.is_null());
+                    gpu.pso_ntt4zg4_zero_root_wide
+                } else if self.zero_root {
                     debug_assert!(!gpu.pso_ntt4zg4_zero_root.is_null());
                     gpu.pso_ntt4zg4_zero_root
                 } else if self.grouped {
@@ -2530,11 +2837,13 @@ kernel void export_from_z_zero_root_tabs(
         tw_buf: Id,
         z_buf: Id,
         log_d: usize,
+        wide_horner: bool,
     ) {
         unsafe {
             FromZFirstPassPlan {
                 grouped: true,
                 zero_root: true,
+                wide_horner,
             }
             .encode_range(
                 gpu,
@@ -2559,6 +2868,23 @@ kernel void export_from_z_zero_root_tabs(
         unsafe {
             debug_assert!(!gpu.pso_export_from_z_zero_root_tabs.is_null());
             gpu.set_pipeline(enc, gpu.pso_export_from_z_zero_root_tabs);
+            gpu.set_buffer(enc, tw_buf, 0, 0);
+            gpu.set_buffer(enc, out, 0, 1);
+            gpu.dispatch(enc, 1, 64);
+        }
+    }
+
+
+    #[cfg(test)]
+    pub(crate) unsafe fn encode_zero_root_wide_table_export_for_test(
+        gpu: &Gpu,
+        enc: Id,
+        tw_buf: Id,
+        out: Id,
+    ) {
+        unsafe {
+            debug_assert!(!gpu.pso_export_from_z_zero_root_wide_tabs.is_null());
+            gpu.set_pipeline(enc, gpu.pso_export_from_z_zero_root_wide_tabs);
             gpu.set_buffer(enc, tw_buf, 0, 0);
             gpu.set_buffer(enc, out, 0, 1);
             gpu.dispatch(enc, 1, 64);
@@ -3466,12 +3792,13 @@ kernel void export_from_z_zero_root_tabs(
     /// stream runs before the timed prove; the autotune sweep uses it as an
     /// untimed staging re-prime so each candidate times only the
     /// after-first-pass graph the timed prove actually dispatches.
-    unsafe fn run_from_z_first_pass(
+    unsafe fn run_from_z_first_pass_with_plan(
         gpu: &Gpu,
         z_buf: Id,
         staging: Id,
         tw_buf: Id,
         log_d: usize,
+        plan: FromZFirstPassPlan,
     ) -> Result<(), String> {
         unsafe {
             let cb1 = gpu.command_buffer()?;
@@ -3479,7 +3806,7 @@ kernel void export_from_z_zero_root_tabs(
             // From-z tiles all live in block B = 0 (l = 0), so the g4
             // table-reuse idiom applies; the tuned kernel also skips
             // the zero-region sub-layer (a pure copy).
-            FromZFirstPassPlan::new(log_d).encode_range(
+            plan.encode_range(
                 gpu,
                 enc,
                 staging,
@@ -3491,6 +3818,94 @@ kernel void export_from_z_zero_root_tabs(
             );
             gpu.end_encoding(enc);
             gpu.commit_and_wait(cb1)
+        }
+    }
+
+    unsafe fn run_from_z_first_pass(
+        gpu: &Gpu,
+        z_buf: Id,
+        staging: Id,
+        tw_buf: Id,
+        log_d: usize,
+    ) -> Result<(), String> {
+        unsafe {
+            run_from_z_first_pass_with_plan(
+                gpu,
+                z_buf,
+                staging,
+                tw_buf,
+                log_d,
+                FromZFirstPassPlan::new(log_d),
+            )
+        }
+    }
+
+    /// Per-worker, untimed admission gate for the mixed-width first pass.
+    /// Persistent buffers/views are already created and page-wired. Each
+    /// sample includes command-buffer creation, encoding, submission, and
+    /// completion wait; only the warm-up runs themselves sit outside the
+    /// timer. Reversed order plus a two-win/one-ms rule prevents one cold or
+    /// noisy draw from selecting a sub-noise kernel.
+    unsafe fn calibrate_from_z_wide_horner(
+        gpu: &Gpu,
+        z_buf: Id,
+        staging: Id,
+        tw_buf: Id,
+        log_d: usize,
+    ) {
+        if !super::gpu_from_z_zero_root_selected(log_d)
+            || !super::gpu_from_z_wide_horner_enabled()
+        {
+            super::publish_gpu_from_z_wide_horner(false);
+            return;
+        }
+
+        let compact = FromZFirstPassPlan {
+            grouped: true,
+            zero_root: true,
+            wide_horner: false,
+        };
+        let wide = FromZFirstPassPlan {
+            grouped: true,
+            zero_root: true,
+            wide_horner: true,
+        };
+        let run = |plan| unsafe {
+            run_from_z_first_pass_with_plan(gpu, z_buf, staging, tw_buf, log_d, plan)
+        };
+        let sample = |plan| -> Result<f64, String> {
+            let t0 = std::time::Instant::now();
+            run(plan)?;
+            Ok(t0.elapsed().as_secs_f64() * 1e3)
+        };
+
+        // Equal untimed warming before the two reversed-order samples.
+        if run(compact).is_err() || run(wide).is_err() {
+            super::publish_gpu_from_z_wide_horner(false);
+            return;
+        }
+        let measured = (|| -> Result<([f64; 2], [f64; 2]), String> {
+            let compact_first = sample(compact)?;
+            let wide_second = sample(wide)?;
+            let wide_first = sample(wide)?;
+            let compact_second = sample(compact)?;
+            Ok(([compact_first, compact_second], [wide_second, wide_first]))
+        })();
+        let (compact_ms, wide_ms) = match measured {
+            Ok(v) => v,
+            Err(_) => {
+                super::publish_gpu_from_z_wide_horner(false);
+                return;
+            }
+        };
+        let selected = super::admit_gpu_from_z_wide_horner(compact_ms, wide_ms);
+        super::publish_gpu_from_z_wide_horner(selected);
+        if debug_enabled() || std::env::var_os("FLOCK_COMMIT_TIMING").is_some() {
+            eprintln!(
+                "[gpu-commit] from-z wide Horner: compact={compact_ms:?} ms \
+                 wide={wide_ms:?} ms -> {}",
+                if selected { "WIDE" } else { "COMPACT" }
+            );
         }
     }
 
@@ -4521,34 +4936,48 @@ kernel void export_from_z_zero_root_tabs(
     /// Cache key component tying entries to both the exact GPU source and
     /// selected from-z mode. Candidate and exact-rollback processes must not
     /// consume each other's latch or tuned split.
-    fn warmup_cache_msl_fnv_for(zero_root: bool) -> u64 {
+    fn warmup_cache_msl_fnv_for(zero_root: bool, wide_horner: bool) -> u64 {
+        debug_assert!(!wide_horner || zero_root);
         let base = fnv1a64(MSL_SOURCE);
         if zero_root {
-            base ^ fnv1a64(FROM_Z_ZERO_ROOT_MSL_SOURCE).rotate_left(1)
-                ^ 0x5A52_4F4F_545F_3131 // "ZROOT_11"
+            let compact = base
+                ^ fnv1a64(FROM_Z_ZERO_ROOT_MSL_SOURCE).rotate_left(1)
+                ^ 0x5A52_4F4F_545F_3131; // "ZROOT_11"
+            if wide_horner {
+                compact ^ 0x5749_4445_5F48_3332 // "WIDE_H32"
+            } else {
+                compact
+            }
         } else {
             base
         }
     }
 
     fn warmup_cache_msl_fnv() -> u64 {
-        warmup_cache_msl_fnv_for(super::gpu_from_z_zero_root_selected(20))
+        let zero_root = super::gpu_from_z_zero_root_selected(20);
+        warmup_cache_msl_fnv_for(
+            zero_root,
+            zero_root && super::gpu_from_z_wide_horner_enabled(),
+        )
     }
 
     #[cfg(test)]
     mod zero_root_cache_key_tests {
         #[test]
         fn supplemental_source_and_mode_have_a_distinct_fingerprint() {
-            let incumbent = super::warmup_cache_msl_fnv_for(false);
-            let candidate = super::warmup_cache_msl_fnv_for(true);
+            let incumbent = super::warmup_cache_msl_fnv_for(false, false);
+            let candidate = super::warmup_cache_msl_fnv_for(true, false);
+            let wide = super::warmup_cache_msl_fnv_for(true, true);
             assert_eq!(incumbent, super::fnv1a64(super::MSL_SOURCE));
             assert_ne!(candidate, incumbent);
+            assert_ne!(wide, candidate);
             assert_eq!(
                 candidate,
                 incumbent
                     ^ super::fnv1a64(super::FROM_Z_ZERO_ROOT_MSL_SOURCE).rotate_left(1)
                     ^ 0x5A52_4F4F_545F_3131
             );
+            assert_eq!(wide, candidate ^ 0x5749_4445_5F48_3332);
         }
 
         #[test]
@@ -4561,6 +4990,13 @@ kernel void export_from_z_zero_root_tabs(
             assert!(!src.contains("device const uint4* tabs"));
             assert!(src.contains("threadgroup uint4 tabs[11u * 64u]"));
             assert!(src.contains("twiddles[zero_root_raw_twiddle(compact)]"));
+
+            // The mixed-width network has ten wide products and seven narrow
+            // products, with no replacement device table.
+            assert_eq!(src.matches("TAB8_WIDE_BFLY(").count(), 11);
+            assert_eq!(src.matches("TAB4_WIDE_BFLY(").count(), 8);
+            assert!(src.contains("threadgroup uint4 tabs[960u]"));
+            assert!(!src.contains("device const uint4* wide_tabs"));
         }
     }
 
@@ -4714,6 +5150,12 @@ kernel void export_from_z_zero_root_tabs(
                 let z_buf =
                     gpu.wrap_buffer(z_packed.as_ptr().cast_mut().cast::<u8>(), z_bytes)?;
                 created.push(z_buf);
+
+                // Decide between the promoted compact kernel and its
+                // mixed-width successor on this worker before the ordinary
+                // full-graph warmup/oracle runs. The gate writes staging only;
+                // each following graph overwrites it from immutable z.
+                calibrate_from_z_wide_horner(gpu, z_buf, staging, tw_buf, log_d);
 
                 // Untimed wiring run, then the identical timed run.
                 run_commit_graph_from_z(gpu, z_buf, staging, tw_buf, tree_buf, log_d, n_leaves)?;
@@ -5835,9 +6277,16 @@ mod tests {
         };
         let twiddles = flat_twiddle_table(&ntt, log_d);
         let mut expect_table = vec![F128::ZERO; 11 * 64];
+        let mut expect_wide_table = vec![F128::ZERO; 4 * 128 + 7 * 64];
         for (compact, raw) in RAW_TWIDDLES.into_iter().enumerate() {
             let mut base = twiddles[raw];
-            for bank in 0..4 {
+            let banks = if compact < 4 { 8 } else { 4 };
+            let wide_offset = if compact < 4 {
+                compact * 128
+            } else {
+                512 + (compact - 4) * 64
+            };
+            for bank in 0..banks {
                 let mut powers = [F128::ZERO; 4];
                 powers[0] = base;
                 for bit in 1..4 {
@@ -5850,7 +6299,10 @@ mod tests {
                             value += power;
                         }
                     }
-                    expect_table[compact * 64 + bank * 16 + nibble] = value;
+                    if bank < 4 {
+                        expect_table[compact * 64 + bank * 16 + nibble] = value;
+                    }
+                    expect_wide_table[wide_offset + bank * 16 + nibble] = value;
                 }
                 for _ in 0..4 {
                     base = mul_by_x(base);
@@ -5863,7 +6315,9 @@ mod tests {
             let data_bytes = core::mem::size_of_val(expect_first.as_slice());
             let tree_bytes = (2 * n_leaves - 1) * core::mem::size_of::<crate::merkle::Hash>();
             let table_bytes = core::mem::size_of_val(expect_table.as_slice());
-            let candidate = gpu.new_buffer(data_bytes).unwrap();
+            let wide_table_bytes = core::mem::size_of_val(expect_wide_table.as_slice());
+            let compact = gpu.new_buffer(data_bytes).unwrap();
+            let wide = gpu.new_buffer(data_bytes).unwrap();
             let incumbent = gpu.new_buffer(data_bytes).unwrap();
             let tw_buf = gpu
                 .new_buffer(core::mem::size_of_val(twiddles.as_slice()))
@@ -5872,6 +6326,7 @@ mod tests {
                 .new_buffer(core::mem::size_of_val(z.as_slice()))
                 .unwrap();
             let table_buf = gpu.new_buffer(table_bytes).unwrap();
+            let wide_table_buf = gpu.new_buffer(wide_table_bytes).unwrap();
             let tree_buf = gpu.new_buffer(tree_bytes).unwrap();
             std::ptr::copy_nonoverlapping(
                 twiddles.as_ptr().cast::<u8>(),
@@ -5883,19 +6338,34 @@ mod tests {
                 gpu.buffer_contents(z_buf),
                 core::mem::size_of_val(z.as_slice()),
             );
-            std::ptr::write_bytes(gpu.buffer_contents(candidate), 0xA5, data_bytes);
+            std::ptr::write_bytes(gpu.buffer_contents(compact), 0xA5, data_bytes);
+            std::ptr::write_bytes(gpu.buffer_contents(wide), 0xB6, data_bytes);
             std::ptr::write_bytes(gpu.buffer_contents(incumbent), 0x5A, data_bytes);
             std::ptr::write_bytes(gpu.buffer_contents(table_buf), 0xC3, table_bytes);
+            std::ptr::write_bytes(
+                gpu.buffer_contents(wide_table_buf),
+                0xD4,
+                wide_table_bytes,
+            );
             std::ptr::write_bytes(gpu.buffer_contents(tree_buf), 0x3C, tree_bytes);
 
-            // Force the candidate and export the table through the helper
-            // shared verbatim with its production PSO.
+            // Force both supplemental modes and export both table images
+            // through the helpers shared verbatim with their production PSOs.
             let cb = gpu.command_buffer().unwrap();
             let enc = gpu.compute_encoder(cb).unwrap();
             imp::encode_from_z_zero_root_for_test(
-                gpu, enc, candidate, tw_buf, z_buf, log_d,
+                gpu, enc, compact, tw_buf, z_buf, log_d, false,
+            );
+            imp::encode_from_z_zero_root_for_test(
+                gpu, enc, wide, tw_buf, z_buf, log_d, true,
             );
             imp::encode_zero_root_table_export_for_test(gpu, enc, tw_buf, table_buf);
+            imp::encode_zero_root_wide_table_export_for_test(
+                gpu,
+                enc,
+                tw_buf,
+                wide_table_buf,
+            );
             gpu.end_encoding(enc);
             gpu.commit_and_wait(cb).unwrap();
 
@@ -5925,8 +6395,16 @@ mod tests {
                 gpu.buffer_contents(table_buf).cast::<F128>(),
                 expect_table.len(),
             );
-            let candidate_first = core::slice::from_raw_parts(
-                gpu.buffer_contents(candidate).cast::<F128>(),
+            let got_wide_table = core::slice::from_raw_parts(
+                gpu.buffer_contents(wide_table_buf).cast::<F128>(),
+                expect_wide_table.len(),
+            );
+            let compact_first = core::slice::from_raw_parts(
+                gpu.buffer_contents(compact).cast::<F128>(),
+                expect_first.len(),
+            );
+            let wide_first = core::slice::from_raw_parts(
+                gpu.buffer_contents(wide).cast::<F128>(),
                 expect_first.len(),
             );
             let incumbent_first = core::slice::from_raw_parts(
@@ -5934,23 +6412,35 @@ mod tests {
                 expect_first.len(),
             );
             assert_eq!(got_table, expect_table.as_slice(), "compact table mismatch");
-            assert_eq!(candidate_first, expect_first.as_slice(), "candidate first pass mismatch");
+            assert_eq!(
+                got_wide_table,
+                expect_wide_table.as_slice(),
+                "mixed-width table mismatch"
+            );
+            assert_eq!(compact_first, expect_first.as_slice(), "compact first pass mismatch");
+            assert_eq!(wide_first, expect_first.as_slice(), "wide first pass mismatch");
             assert_eq!(incumbent_first, expect_first.as_slice(), "incumbent first pass mismatch");
-            assert_eq!(candidate_first, incumbent_first);
+            assert_eq!(compact_first, incumbent_first);
+            assert_eq!(wide_first, incumbent_first);
             assert_eq!(
                 gpu.pipeline_resources(gpu.pso_ntt4zg4_zero_root).0,
                 11_968,
-                "candidate static threadgroup footprint"
+                "compact static threadgroup footprint"
+            );
+            assert_eq!(
+                gpu.pipeline_resources(gpu.pso_ntt4zg4_zero_root_wide).0,
+                16_320,
+                "mixed-width static threadgroup footprint"
             );
 
             let cb = gpu.command_buffer().unwrap();
             let enc = gpu.compute_encoder(cb).unwrap();
-            imp::encode_ntt_passes(gpu, enc, candidate, tw_buf, log_d, 4);
-            imp::encode_merkle(gpu, enc, candidate, tree_buf, n_leaves);
+            imp::encode_ntt_passes(gpu, enc, wide, tw_buf, log_d, 4);
+            imp::encode_merkle(gpu, enc, wide, tree_buf, n_leaves);
             gpu.end_encoding(enc);
             gpu.commit_and_wait(cb).unwrap();
             let candidate_full = core::slice::from_raw_parts(
-                gpu.buffer_contents(candidate).cast::<F128>(),
+                gpu.buffer_contents(wide).cast::<F128>(),
                 expect_full.len(),
             );
             let got_tree = core::slice::from_raw_parts(
@@ -5960,11 +6450,13 @@ mod tests {
             assert_eq!(candidate_full, expect_full.as_slice(), "full codeword mismatch");
             assert_eq!(got_tree, expect_tree.as_slice(), "full tree mismatch");
 
-            gpu.release(candidate);
+            gpu.release(compact);
+            gpu.release(wide);
             gpu.release(incumbent);
             gpu.release(tw_buf);
             gpu.release(z_buf);
             gpu.release(table_buf);
+            gpu.release(wide_table_buf);
             gpu.release(tree_buf);
             gpu.pool_pop(pool);
         }
