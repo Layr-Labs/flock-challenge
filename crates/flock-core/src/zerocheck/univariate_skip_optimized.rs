@@ -563,7 +563,7 @@ pub struct Round1AbInner {
 
 impl Round1AbInner {
     #[inline]
-    fn as_bytes(&self) -> &[u8] {
+    pub(crate) fn as_bytes(&self) -> &[u8] {
         unsafe {
             core::slice::from_raw_parts(
                 self.storage.as_ptr() as *const u8,
@@ -580,14 +580,46 @@ impl Round1AbInner {
     /// Donate the now-dead transform to a byte-oriented scratch consumer
     /// without changing the allocation's element type or deallocation layout.
     pub(crate) fn into_scratch_bytes(mut self) -> crate::scratch::ScratchBytes {
-        crate::scratch::ScratchBytes::from_initialized_f128(core::mem::take(&mut self.storage))
+        crate::scratch::ScratchBytes::from_round1_ab_f128(core::mem::take(&mut self.storage))
     }
 }
 
 impl Drop for Round1AbInner {
     fn drop(&mut self) {
-        crate::scratch::give_f128(core::mem::take(&mut self.storage));
+        let storage = core::mem::take(&mut self.storage);
+        if !storage.is_empty() {
+            let bytes = crate::scratch::ScratchBytes::from_round1_ab_f128(storage);
+            bytes.recycle();
+        }
     }
+}
+
+/// Couple a ranked AB allocation to a retained no-copy Metal view. The byte
+/// slice originates from [`Round1AbInner::as_bytes`], so its address and length
+/// retain the F128 allocation's alignment and exact object representation.
+pub(crate) fn pin_round1_ab_storage(bytes: &[u8]) -> bool {
+    if bytes.is_empty()
+        || !bytes.len().is_multiple_of(core::mem::size_of::<F128>())
+        || !(bytes.as_ptr() as usize).is_multiple_of(core::mem::align_of::<F128>())
+    {
+        return false;
+    }
+    let storage = unsafe {
+        core::slice::from_raw_parts(
+            bytes.as_ptr().cast::<F128>(),
+            bytes.len() / core::mem::size_of::<F128>(),
+        )
+    };
+    crate::scratch::pin_round1_ab_f128_allocation(storage)
+}
+
+/// Release the role pin after the retained Metal object has been destroyed.
+pub(crate) fn unpin_round1_ab_storage(addr: usize, bytes: usize) -> bool {
+    bytes.is_multiple_of(core::mem::size_of::<F128>())
+        && crate::scratch::unpin_round1_ab_f128_allocation(
+            addr,
+            bytes / core::mem::size_of::<F128>(),
+        )
 }
 
 /// Kill switch for the non-temporal store flavor of the deferred AB
@@ -694,7 +726,8 @@ fn precompute_round1_ab_inner_packed_padded_with_flavor(
     // Reuse an A-sized resident F128 allocation from the prover scratch pool.
     // Treating it as bytes is valid because every byte is written below before
     // the storage is read (including explicit zero writes for padding holes).
-    let mut storage = crate::scratch::take_f128(total_bytes / core::mem::size_of::<F128>());
+    let mut storage =
+        crate::scratch::take_round1_ab_f128(total_bytes / core::mem::size_of::<F128>());
     let out_bytes: &mut [u8] =
         unsafe { core::slice::from_raw_parts_mut(storage.as_mut_ptr() as *mut u8, total_bytes) };
 
@@ -1408,6 +1441,128 @@ fn process_one_x_hi_with_precomputed_ab_fold4_ab(
             start.elapsed().as_nanos() as u64,
             std::sync::atomic::Ordering::Relaxed,
         );
+    }
+}
+
+const GPU_AB_UNDECIDED: u8 = 0;
+const GPU_AB_ON: u8 = 1;
+const GPU_AB_OFF: u8 = 2;
+static GPU_AB_DECISION: std::sync::atomic::AtomicU8 =
+    std::sync::atomic::AtomicU8::new(GPU_AB_UNDECIDED);
+
+/// Conservative warmup gate. The incumbent ranked Round-1 serializes roughly
+/// 8 ms of AB and 9.5 ms of C. The warmup launches AB before the real C Fold8,
+/// so this is a direct bound on the candidate's overlapped critical path. A
+/// 14 ms ceiling preserves a multi-millisecond margin over the incumbent.
+const GPU_AB_WARMUP_MAX_MS: f64 = 14.0;
+
+pub(crate) enum Round1AbCompletion<'a> {
+    Cpu,
+    Gpu {
+        ticket: crate::gpu_commit::RankedAbFoldTicket<'a>,
+        warmup_oracle: bool,
+    },
+}
+
+impl Round1AbCompletion<'_> {
+    /// Complete an asynchronous GPU arm after the caller has computed the
+    /// independent C message. During the untimed worker proof, run `cpu` only
+    /// after Metal finishes and require exact equality before latching the
+    /// measured GPU+C overlap for the worker's one scored proof.
+    pub(crate) fn finish_with_cpu<F>(self, cpu: F) -> Vec<F128>
+    where
+        F: FnOnce() -> Vec<F128>,
+    {
+        match self {
+            Self::Cpu => cpu(),
+            Self::Gpu {
+                ticket,
+                warmup_oracle,
+            } => match ticket.finish() {
+                Ok((value, gpu_ms)) => {
+                    if !warmup_oracle {
+                        return value;
+                    }
+
+                    let cpu_start = std::time::Instant::now();
+                    let oracle = cpu();
+                    let cpu_ms = cpu_start.elapsed().as_secs_f64() * 1e3;
+                    let exact = value == oracle;
+                    let useful = gpu_ms <= GPU_AB_WARMUP_MAX_MS;
+                    if std::env::var_os("FLOCK_ZC_TIMING").is_some() || !exact {
+                        eprintln!(
+                            "[gpu-ab] warmup overlap={gpu_ms:.2} ms oracle={cpu_ms:.2} ms exact={exact} useful={useful}"
+                        );
+                    }
+                    if exact && useful {
+                        GPU_AB_DECISION.store(
+                            GPU_AB_ON,
+                            std::sync::atomic::Ordering::Release,
+                        );
+                        value
+                    } else {
+                        GPU_AB_DECISION.store(
+                            GPU_AB_OFF,
+                            std::sync::atomic::Ordering::Release,
+                        );
+                        crate::gpu_commit::retire_ranked_ab_input();
+                        oracle
+                    }
+                }
+                Err(e) => {
+                    eprintln!("[gpu-ab] timed fold failed ({e}); latching CPU fallback");
+                    GPU_AB_DECISION.store(GPU_AB_OFF, std::sync::atomic::Ordering::Release);
+                    crate::gpu_commit::retire_ranked_ab_input();
+                    cpu()
+                }
+            },
+        }
+    }
+}
+
+/// Begin the ranked AB completion early enough to overlap the independent CPU
+/// C Fold8. The first (untimed) proof measures that real overlap, then runs the
+/// exact incumbent AB as an oracle and compares all 64 output elements. The GPU
+/// latches only when both correctness and the useful wall-time bound hold. Any
+/// unsupported shape or failure is a closed CPU fallback.
+pub(crate) fn begin_round1_ranked_ab_completion<'a>(
+    ab_inner: &'a Round1AbInner,
+    m: usize,
+    k_skip: usize,
+    r: &[F128],
+    padding: &PaddingSpec,
+) -> Round1AbCompletion<'a> {
+    use std::sync::atomic::Ordering;
+
+    if m != 32
+        || k_skip != K_SKIP
+        || padding.k_log != 14
+        || padding.useful_bits_per_block != 15_409
+    {
+        return Round1AbCompletion::Cpu;
+    }
+    let decision = GPU_AB_DECISION.load(Ordering::Acquire);
+    if decision == GPU_AB_OFF {
+        return Round1AbCompletion::Cpu;
+    }
+
+    // Fixed 7/12 split: the same exact tensor factorization as the incumbent
+    // ranked default, while making the GPU table and high-reduction geometries
+    // compile-time constants (4096 low rows, 128 high bands).
+    let eq = SplitEqGhash::with_n_hi(&r[k_skip + N_INNER..], 7);
+    let eq_lo_scaled: Vec<F128> = eq.lo.iter().map(|v| *v * d_inv()).collect();
+    let Some(ticket) = crate::gpu_commit::begin_ranked_ab_fold(
+        ab_inner.as_bytes(),
+        &eq_lo_scaled,
+        &eq.hi,
+    ) else {
+        GPU_AB_DECISION.store(GPU_AB_OFF, Ordering::Release);
+        return Round1AbCompletion::Cpu;
+    };
+
+    Round1AbCompletion::Gpu {
+        ticket,
+        warmup_oracle: decision == GPU_AB_UNDECIDED,
     }
 }
 
@@ -3589,6 +3744,31 @@ mod tests {
                 assert_eq!(t[b * 256 + v as usize], expected, "b={b}, v={v}");
             }
             g_pow = mul_by_x(g_pow);
+        }
+    }
+
+    /// The source-distinct GPU AB table uses eight linear bases per medium
+    /// row instead of materializing the incumbent 256-entry conversion table.
+    /// Exhaustively prove that XOR-expanding those bases reconstructs every
+    /// incumbent `(b, byte)` entry before any Metal work can be trusted.
+    #[test]
+    fn gpu_ab_basis_reconstructs_convert_table() {
+        let basis = crate::gpu_commit::ranked_ab_basis();
+        let table = convert_table();
+        for b in 0..16 {
+            for v in 0..256usize {
+                let mut reconstructed = F128::ZERO;
+                for bit in 0..8 {
+                    if (v >> bit) & 1 != 0 {
+                        reconstructed += basis[b * 8 + bit];
+                    }
+                }
+                assert_eq!(
+                    reconstructed,
+                    table[b * 256 + v],
+                    "GPU AB basis mismatch at b={b}, v={v}"
+                );
+            }
         }
     }
 

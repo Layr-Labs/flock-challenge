@@ -43,6 +43,13 @@ static PINNED_F128: Mutex<Option<PinnedF128>> = Mutex::new(None);
 static PINNED_F128_ADDR: AtomicUsize = AtomicUsize::new(0);
 static PINNED_F128_LEN: AtomicUsize = AtomicUsize::new(0);
 
+/// Role-specific sibling of the z pin for the ranked Round-1 AB transform.
+/// The z and AB allocations are both 512 MiB, so AB cannot use the generic
+/// preferred-allocation slot: whichever caller requested that size first
+/// would steal the other's retained Metal view. Only the AB producer and its
+/// donated [`ScratchBytes`] call the role-specific take/give functions below.
+static PINNED_ROUND1_AB_F128: Mutex<Option<PinnedF128>> = Mutex::new(None);
+
 /// Max buffers retained. The m=29 prove cycle gives ~18 distinct buffers:
 /// witness z/a/b, the L0 codeword, zerocheck's 2 fold outputs + 2 ping-pong
 /// halves, ring-switch's per-claim rs_eq_ind vectors, b_combined, and
@@ -146,6 +153,89 @@ pub(crate) fn unpin_f128_allocation(addr: usize, len: usize) -> bool {
         give_f128(v);
     }
     true
+}
+
+/// Take the exact allocation retained for the ranked Round-1 AB Metal view,
+/// or fall back to the ordinary scratch policy before the first registration.
+pub(crate) fn take_round1_ab_f128(n: usize) -> Vec<F128> {
+    let pinned = {
+        let mut slot = PINNED_ROUND1_AB_F128.lock().unwrap();
+        slot.as_mut().and_then(|pinned| {
+            if pinned.len == n {
+                pinned.buffer.take()
+            } else {
+                None
+            }
+        })
+    };
+    if let Some(mut v) = pinned {
+        debug_assert!(v.capacity() >= n);
+        v.clear();
+        // SAFETY: capacity >= n and F128 is Copy. The caller retains the
+        // ordinary scratch write-before-read contract.
+        unsafe { v.set_len(n) };
+        return v;
+    }
+    take_f128(n)
+}
+
+/// Register the exact AB allocation behind a process-lifetime Metal no-copy
+/// view. Unlike the generic z pin, this role is retrieved only by
+/// [`take_round1_ab_f128`].
+pub(crate) fn pin_round1_ab_f128_allocation(buffer: &[F128]) -> bool {
+    if buffer.is_empty() {
+        return false;
+    }
+    let addr = buffer.as_ptr() as usize;
+    let len = buffer.len();
+    let mut slot = PINNED_ROUND1_AB_F128.lock().unwrap();
+    match slot.as_ref() {
+        Some(pinned) => pinned.addr == addr && pinned.len == len,
+        None => {
+            *slot = Some(PinnedF128 {
+                addr,
+                len,
+                buffer: None,
+            });
+            true
+        }
+    }
+}
+
+/// Release the AB role after its retained Metal view has been destroyed.
+pub(crate) fn unpin_round1_ab_f128_allocation(addr: usize, len: usize) -> bool {
+    let parked = {
+        let mut slot = PINNED_ROUND1_AB_F128.lock().unwrap();
+        let matches = slot
+            .as_ref()
+            .is_some_and(|pinned| pinned.addr == addr && pinned.len == len);
+        if !matches {
+            return false;
+        }
+        slot.take().and_then(|pinned| pinned.buffer)
+    };
+    if let Some(v) = parked {
+        give_f128(v);
+    }
+    true
+}
+
+fn give_round1_ab_f128(v: Vec<F128>) {
+    if v.capacity() == 0 {
+        return;
+    }
+    let addr = v.as_ptr() as usize;
+    let mut slot = PINNED_ROUND1_AB_F128.lock().unwrap();
+    if let Some(pinned) = slot.as_mut()
+        && pinned.addr == addr
+        && v.capacity() >= pinned.len
+        && pinned.buffer.is_none()
+    {
+        pinned.buffer = Some(v);
+        return;
+    }
+    drop(slot);
+    give_f128(v);
 }
 
 /// Pool-only variant of [`take_f128`]: returns `None` instead of falling
@@ -349,6 +439,7 @@ pub struct ScratchBytes {
 enum ScratchBytesBacking {
     U8(Vec<u8>),
     F128(Vec<F128>),
+    Round1AbF128(Vec<F128>),
 }
 
 impl ScratchBytes {
@@ -368,11 +459,22 @@ impl ScratchBytes {
         }
     }
 
+    /// Donate the ranked Round-1 AB allocation while preserving its dedicated
+    /// role pin when this byte scratch is recycled after compact round two.
+    pub(crate) fn from_round1_ab_f128(storage: Vec<F128>) -> Self {
+        Self {
+            backing: ScratchBytesBacking::Round1AbF128(storage),
+        }
+    }
+
     #[inline]
     pub fn len(&self) -> usize {
         match &self.backing {
             ScratchBytesBacking::U8(v) => v.len(),
             ScratchBytesBacking::F128(v) => v.len() * core::mem::size_of::<F128>(),
+            ScratchBytesBacking::Round1AbF128(v) => {
+                v.len() * core::mem::size_of::<F128>()
+            }
         }
     }
 
@@ -386,6 +488,7 @@ impl ScratchBytes {
         match self.backing {
             ScratchBytesBacking::U8(v) => give_u8(v),
             ScratchBytesBacking::F128(v) => give_f128(v),
+            ScratchBytesBacking::Round1AbF128(v) => give_round1_ab_f128(v),
         }
     }
 }
@@ -396,7 +499,7 @@ impl Deref for ScratchBytes {
     fn deref(&self) -> &Self::Target {
         match &self.backing {
             ScratchBytesBacking::U8(v) => v,
-            ScratchBytesBacking::F128(v) => {
+            ScratchBytesBacking::F128(v) | ScratchBytesBacking::Round1AbF128(v) => {
                 // SAFETY: F128 consists of two u64s, has no padding, and every
                 // bit pattern is valid. The slice covers the initialized
                 // object representation without changing ownership/layout.
@@ -415,7 +518,7 @@ impl DerefMut for ScratchBytes {
     fn deref_mut(&mut self) -> &mut Self::Target {
         match &mut self.backing {
             ScratchBytesBacking::U8(v) => v,
-            ScratchBytesBacking::F128(v) => {
+            ScratchBytesBacking::F128(v) | ScratchBytesBacking::Round1AbF128(v) => {
                 // SAFETY: same representation argument as `Deref`; the
                 // exclusive borrow of `self` makes the byte view exclusive.
                 unsafe {
@@ -524,6 +627,39 @@ mod tests {
         // The buffer is now ordinary scratch, so clear is allowed to drop it.
         assert_eq!(PINNED_F128_ADDR.load(Ordering::Acquire), 0);
         assert_eq!(PINNED_F128_LEN.load(Ordering::Acquire), 0);
+        clear();
+    }
+
+    #[test]
+    fn round1_ab_role_pin_coexists_with_equal_sized_generic_pin() {
+        let _serial = SCRATCH_TEST_LOCK.lock().unwrap();
+        const N: usize = 269;
+        clear();
+
+        let z = take_f128(N);
+        let z_ptr = z.as_ptr();
+        assert!(pin_f128_allocation(&z));
+
+        let ab = take_round1_ab_f128(N);
+        let ab_ptr = ab.as_ptr();
+        assert_ne!(ab_ptr, z_ptr);
+        assert!(pin_round1_ab_f128_allocation(&ab));
+
+        give_f128(z);
+        ScratchBytes::from_round1_ab_f128(ab).recycle();
+        // Ordinary pool eviction must not destroy either retained role.
+        clear();
+
+        let z_reused = take_f128(N);
+        let ab_reused = take_round1_ab_f128(N);
+        assert_eq!(z_reused.as_ptr(), z_ptr);
+        assert_eq!(ab_reused.as_ptr(), ab_ptr);
+        assert_ne!(z_reused.as_ptr(), ab_reused.as_ptr());
+
+        assert!(unpin_f128_allocation(z_ptr as usize, N));
+        assert!(unpin_round1_ab_f128_allocation(ab_ptr as usize, N));
+        give_f128(z_reused);
+        give_round1_ab_f128(ab_reused);
         clear();
     }
 }

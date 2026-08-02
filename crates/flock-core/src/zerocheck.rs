@@ -376,25 +376,42 @@ fn prove_packed_padded_inner<C: Challenger>(
                 crate::pcs::ranked_direct_fold4_enabled() || cfg!(test),
                 "lincheck C reuse requires ranked DirectFold4"
             );
-            let cpu_ab = crate::pcs::commit::commit_cpu_ms();
-            let t_ab = std::time::Instant::now();
-            let ab = crate::zerocheck::univariate_skip_optimized::round1_shift_reduce_ab_packed_padded_with_precomputed(
+            // Launch the exact GPU AB table-fold before C. During the scored
+            // proofs Metal consumes the transformed A/B checkpoint while the
+            // CPU independently folds the lincheck C stripe; warmup either
+            // proves this arm bit-exact/useful or permanently selects `Cpu`.
+            let ab_start = crate::zerocheck::univariate_skip_optimized::begin_round1_ranked_ab_completion(
                 ab_inner,
                 m,
                 k_skip,
                 &r,
                 padding,
             );
-            if zc_timing {
-                eprintln!(
-                    "[zc-timing] round1 AB completion: {:.2} ms cpu={:.1}",
-                    t_ab.elapsed().as_secs_f64() * 1e3,
-                    crate::pcs::commit::commit_cpu_ms() - cpu_ab,
-                );
-            }
+            let (pending_ab, early_ab) = match ab_start {
+                crate::zerocheck::univariate_skip_optimized::Round1AbCompletion::Cpu => {
+                    let cpu_ab = crate::pcs::commit::commit_cpu_ms();
+                    let t_ab = std::time::Instant::now();
+                    let ab = crate::zerocheck::univariate_skip_optimized::round1_shift_reduce_ab_packed_padded_with_precomputed(
+                        ab_inner,
+                        m,
+                        k_skip,
+                        &r,
+                        padding,
+                    );
+                    if zc_timing {
+                        eprintln!(
+                            "[zc-timing] round1 AB completion: {:.2} ms cpu={:.1}",
+                            t_ab.elapsed().as_secs_f64() * 1e3,
+                            crate::pcs::commit::commit_cpu_ms() - cpu_ab,
+                        );
+                    }
+                    (None, Some(ab))
+                }
+                pending => (Some(pending), None),
+            };
             let cpu_c = crate::pcs::commit::commit_cpu_ms();
             let t_c = std::time::Instant::now();
-            if crate::pcs::ranked_direct_fold8_enabled() {
+            let (c, captured) = if crate::pcs::ranked_direct_fold8_enabled() {
                 let (c, s_hat_v_c, quad, fold8) =
                     crate::zerocheck::univariate_skip_optimized::round1_c_fold8_from_lincheck_stripe(
                         c_lincheck,
@@ -413,14 +430,13 @@ fn prove_packed_padded_inner<C: Challenger>(
                     );
                 }
                 (
-                    ab,
                     c,
-                    Some(CapturedSHatVC {
+                    CapturedSHatVC {
                         s_hat_v_c,
                         quad,
                         fold4: None,
                         fold8: Some(fold8),
-                    }),
+                    },
                 )
             } else {
                 let (c, s_hat_v_c, quad, fold4) =
@@ -441,16 +457,31 @@ fn prove_packed_padded_inner<C: Challenger>(
                     );
                 }
                 (
-                    ab,
                     c,
-                    Some(CapturedSHatVC {
+                    CapturedSHatVC {
                         s_hat_v_c,
                         quad,
                         fold4: Some(fold4),
                         fold8: None,
-                    }),
+                    },
                 )
-            }
+            };
+            let cpu_ab_fallback = || {
+                crate::zerocheck::univariate_skip_optimized::round1_shift_reduce_ab_packed_padded_with_precomputed(
+                    ab_inner,
+                    m,
+                    k_skip,
+                    &r,
+                    padding,
+                )
+            };
+            let ab = match early_ab {
+                Some(ab) => ab,
+                None => pending_ab
+                    .expect("non-CPU AB start must remain pending")
+                    .finish_with_cpu(cpu_ab_fallback),
+            };
+            (ab, c, Some(captured))
         } else if m == 32 && crate::pcs::ranked_direct_fold4_enabled() {
             let (ab, c, s_hat_v_c, quad, fold4) =
                 crate::zerocheck::univariate_skip_optimized::round1_shift_reduce_extract_c_packed_padded_with_precomputed_ab_fold4(
