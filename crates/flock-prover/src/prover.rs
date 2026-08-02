@@ -79,7 +79,7 @@ fn ranked_lincheck_c_reuse_enabled(r1cs: &BlockR1cs) -> bool {
         && r1cs.m == 32
         && r1cs.k_log == 14
         && r1cs.k_skip == zerocheck::K_SKIP
-        && r1cs.useful_bits == 15_409
+        && r1cs.useful_bits == 15_472
         && r1cs.layout == flock_core::r1cs::WitnessLayout::RowMajor
         && r1cs.c0_is_identity()
         && std::env::var_os("FLOCK_NO_ZC_LINCHECK_C_REUSE").is_none()
@@ -889,7 +889,7 @@ fn prove_fast_core_with_commit_codeword<Ch: Challenger>(
         LincheckStripeInput::DeferredRanked => {
             assert_eq!(r1cs.m, 32);
             assert_eq!(r1cs.k_log, 14);
-            assert_eq!(r1cs.useful_bits, 15_409);
+            assert_eq!(r1cs.useful_bits, 15_472);
             let (m, k_log, useful_bits) = (r1cs.m, r1cs.k_log, r1cs.useful_bits);
             let mut stripe = flock_core::scratch::take_u8(1usize << (m - 3));
             // E2 is the measured contention optimum: E4 steals bandwidth from

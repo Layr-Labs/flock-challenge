@@ -32,20 +32,18 @@
 //! ## Witness layout per compression block (`k_log = 14`, `k = 16,384`)
 //!
 //! ```text
-//!   z[0]                       = 1                    (constant)
-//!   z[1     ..    257)         = cv[0..8]   (8 × 32-bit words)
-//!   z[257   ..    769)         = m[0..16]   (16 × 32-bit words)
-//!   z[769   ..    801)         = counter_lo
-//!   z[801   ..    833)         = counter_hi
-//!   z[833   ..    865)         = block_len
-//!   z[865   ..    897)         = flags
-//!   z[897   .. 14,897)         = 56 G blocks × 250 bits each
-//!   z[14,897 .. 15,153)        = out_lo[0..8] = state[0..8] ^ state[8..16]
-//!   z[15,153 .. 15,409)        = out_hi[0..8] = state[8..16] ^ cv[0..8]
-//!   z[15,409 .. 16,384)        = padding (forced to 0 by empty rows)
+//!   z[0      ..    256)        = cv[0..8] (chain input; aligned slot 0)
+//!   z[256    ..    512)        = out_lo[0..8] (chain output; aligned slot 1)
+//!   z[512]                     = 1 (constant)
+//!   z[513    ..  1,153)        = m, counter, block_len, flags inputs
+//!   z[1,153  ..  4,737)        = all 56 G lin-id pairs (64 bits per G)
+//!   z[4,737  ..  4,993)        = out_hi[0..8] = state[8..16] ^ cv[0..8]
+//!   z[4,993  ..  5,056)        = internal zero alignment gap
+//!   z[5,056  .. 15,472)        = all 56 G carry rows (186 bits per G)
+//!   z[15,472 .. 16,384)        = padding (forced to 0 by empty rows)
 //! ```
 //!
-//! Per G block layout (250 bits):
+//! Each G owns a 186-bit carry record and a separate 64-bit lin-id record:
 //! ```text
 //!   [0   .. 31)    carry_aux for ADD_TMP0  = a + b
 //!   [31  .. 62)    carry_aux for ADD_A1    = ADD_TMP0 + mx        (→ a_1)
@@ -124,9 +122,6 @@ pub const CARRY_BITS_PER_ADD: usize = WORD_BITS - 1; // 31
 pub const ADDS_PER_G: usize = 6;
 /// Lin-id 32-bit words per G (b_new, d_new).
 pub const LIN_WORDS_PER_G: usize = 2;
-/// Bits per G block (no sum-bit slots — see module docs).
-pub const G_STRIDE: usize = ADDS_PER_G * CARRY_BITS_PER_ADD + LIN_WORDS_PER_G * WORD_BITS; // 250
-
 /// BLAKE3 initial hash values (identical to SHA-256 IV).
 pub const BLAKE3_IV: [u32; 8] = [
     0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19,
@@ -170,9 +165,9 @@ pub const G_MSG_IDX: [[usize; 2]; N_G_PER_ROUND] = [
 // `out_lo` (= state[0..8] ^ state[8..16]) in aligned slot 1 — each a clean
 // 256-bit (`2^8`) window, so the chain shift argument folds them via a single
 // tensor opening. cv/out_lo are *exactly* 256 bits, so the slots have NO
-// interior padding. Everything else (const, m, counters, flags, G-blocks,
-// out_hi) packs after the two slots. The re-layout is purely a change of these
-// base offsets — all bit placement goes through the `*_bit` accessors below.
+// interior padding. Everything else follows the two slots, with generated
+// lin-id and carry rows split into their respective banks below. All bit
+// placement goes through the `*_bit` accessors.
 pub const SLOT_BITS: usize = 256; // 2^8, one 256-bit chaining value
 pub const CV_BASE: usize = 0; // input region, slot 0: [0, 256)
 pub const OUT_LO_BASE: usize = SLOT_BITS; // output region, slot 1: [256, 512)
@@ -182,9 +177,20 @@ pub const T_LO_BASE: usize = M_BASE + 16 * WORD_BITS; // 1025
 pub const T_HI_BASE: usize = T_LO_BASE + WORD_BITS; // 1057
 pub const BLEN_BASE: usize = T_HI_BASE + WORD_BITS; // 1089
 pub const FLAGS_BASE: usize = BLEN_BASE + WORD_BITS; // 1121
-pub const GS_BASE: usize = FLAGS_BASE + WORD_BITS; // 1153
-pub const OUT_HI_BASE: usize = GS_BASE + N_G * G_STRIDE; // 15,153
-pub const USEFUL_BITS: usize = OUT_HI_BASE + 8 * WORD_BITS; // 15,409
+
+// Keep every B=1 row in one 64-row-aligned prefix. CV and OUT_LO retain
+// their public chain-compatible positions; the remaining input rows already
+// extend through bit 1152. The 64 lin-id bits from every G and OUT_HI follow
+// contiguously, producing 78 complete all-one 64-bit row codes. A short
+// internal zero gap then aligns the dynamic carry stream to a machine word.
+// Zerocheck's existing value-forced B=1 path can consequently cover 39
+// compact pairs per block instead of 11, without an irregular encoding.
+pub const G_LIN_BASE: usize = FLAGS_BASE + WORD_BITS; // 1,153
+pub const G_LIN_STRIDE: usize = LIN_WORDS_PER_G * WORD_BITS; // 64
+pub const OUT_HI_BASE: usize = G_LIN_BASE + N_G * G_LIN_STRIDE; // 4,737
+pub const G_CARRY_BASE: usize = 79 * 64; // 5,056 (63 zero rows after OUT_HI)
+pub const G_CARRY_STRIDE: usize = ADDS_PER_G * CARRY_BITS_PER_ADD; // 186
+pub const USEFUL_BITS: usize = G_CARRY_BASE + N_G * G_CARRY_STRIDE; // 15,472
 
 // G sub-block: ADD `add_idx` ∈ 0..6 (carry_aux only), then lin-id
 // `which` ∈ 0..2.
@@ -210,12 +216,12 @@ fn m_bit(i: usize, b: usize) -> usize {
 #[inline]
 fn g_add_carry_bit(g: usize, add_idx: usize, b: usize) -> usize {
     debug_assert!(g < N_G && add_idx < ADDS_PER_G && b < CARRY_BITS_PER_ADD);
-    GS_BASE + G_STRIDE * g + CARRY_BITS_PER_ADD * add_idx + b
+    G_CARRY_BASE + G_CARRY_STRIDE * g + CARRY_BITS_PER_ADD * add_idx + b
 }
 #[inline]
 fn g_lin_bit(g: usize, which: usize, b: usize) -> usize {
     debug_assert!(g < N_G && which < LIN_WORDS_PER_G && b < WORD_BITS);
-    GS_BASE + G_STRIDE * g + ADDS_PER_G * CARRY_BITS_PER_ADD + WORD_BITS * which + b
+    G_LIN_BASE + G_LIN_STRIDE * g + WORD_BITS * which + b
 }
 #[inline]
 fn out_lo_bit(w: usize, b: usize) -> usize {
@@ -617,8 +623,9 @@ pub fn build_matrices() -> (SparseBinaryMatrix, SparseBinaryMatrix) {
         }
     }
 
-    // Padding rows [USEFUL_BITS..K): A = B = []. Constraint 0·0 = z[i]
-    // forces z[i] = 0 for all padding bits.
+    // The internal alignment gap [4993, 5056) and trailing padding rows
+    // [USEFUL_BITS, K) retain their initialized empty A/B rows. Constraint
+    // 0·0 = z[i] forces every such witness slot to zero.
 
     let to_mat = |rows| SparseBinaryMatrix {
         num_rows: K,
@@ -1097,15 +1104,13 @@ pub fn generate_witness(blocks: &[Compression], n_blocks_log: usize) -> Vec<bool
 /// ```
 /// Bit 31 is the discarded mod-2³² carry-out and is masked off so the
 /// record push doesn't spill into the next slot.
-// Record-relative positions: carries at 31·i, lin words after all carries.
+// Record-relative carry positions.
 const REC_C0: usize = 0;
 const REC_C1: usize = CARRY_BITS_PER_ADD;
 const REC_C2: usize = 2 * CARRY_BITS_PER_ADD;
 const REC_C3: usize = 3 * CARRY_BITS_PER_ADD;
 const REC_C4: usize = 4 * CARRY_BITS_PER_ADD;
 const REC_C5: usize = 5 * CARRY_BITS_PER_ADD;
-const REC_LIN0: usize = ADDS_PER_G * CARRY_BITS_PER_ADD;
-const REC_LIN1: usize = REC_LIN0 + WORD_BITS;
 
 /// Write a 32-bit lin-id (or input) slot: (z, a) = val, b = all-ones.
 /// **c is not written** — same `c == z` aliasing trick as above.
@@ -1114,116 +1119,6 @@ fn write_lin_word_ab_packed(bit_off: usize, val: u32, z: &mut [u64], a: &mut [u6
     or_u32_at_bit(z, bit_off, val);
     or_u32_at_bit(a, bit_off, val);
     or_u32_at_bit(b, bit_off, 0xFFFF_FFFF);
-}
-
-/// Sequential full-word writer for one packed block. Unlike the generic
-/// OR-based helpers, this never reads the destination and initializes every
-/// word, allowing the outer driver to skip its 1.5-GiB ranked zero pass.
-struct PackedWordWriter {
-    out: *mut u64,
-    word: usize,
-    pending: u64,
-    used: usize,
-}
-
-impl PackedWordWriter {
-    #[inline(always)]
-    fn at(out: *mut u64, word: usize, pending: u64, used: usize) -> Self {
-        Self {
-            out,
-            word,
-            pending,
-            used,
-        }
-    }
-
-    #[inline(always)]
-    fn push(&mut self, value: u64, width: usize) {
-        debug_assert!((1..=64).contains(&width));
-        let value = if width == 64 {
-            value
-        } else {
-            value & ((1u64 << width) - 1)
-        };
-        if self.used == 0 && width == 64 {
-            // SAFETY: the fixed BLAKE3 layout emits exactly `K / 64` words;
-            // the caller supplies a distinct block-sized destination.
-            unsafe {
-                self.out.add(self.word).write(value);
-            }
-            self.word += 1;
-            return;
-        }
-        let room = 64 - self.used;
-        if width < room {
-            self.pending |= value << self.used;
-            self.used += width;
-        } else {
-            // SAFETY: the fixed BLAKE3 layout emits exactly `K / 64` words;
-            // the caller supplies a distinct block-sized destination.
-            unsafe {
-                self.out
-                    .add(self.word)
-                    .write(self.pending | (value << self.used));
-            }
-            self.word += 1;
-            if width == room {
-                self.pending = 0;
-                self.used = 0;
-            } else {
-                self.pending = value >> room;
-                self.used = width - room;
-            }
-        }
-    }
-
-    #[inline(always)]
-    fn push_record<const N: usize>(&mut self, record: &BitRecord<N>, bits: usize) {
-        let mut left = bits;
-        for &value in record.words() {
-            if left == 0 {
-                break;
-            }
-            let width = left.min(64);
-            self.push(value, width);
-            left -= width;
-        }
-        debug_assert_eq!(left, 0);
-    }
-
-    #[inline(always)]
-    fn position(&self) -> usize {
-        self.word * 64 + self.used
-    }
-
-    #[inline]
-    fn finish(mut self, total_words: usize) {
-        if self.used != 0 {
-            // SAFETY: see `push`; a partial final word is still within the
-            // fixed-size block.
-            unsafe {
-                self.out.add(self.word).write(self.pending);
-            }
-            self.word += 1;
-        }
-        debug_assert!(self.word <= total_words);
-        // SAFETY: the unwritten suffix is within the same block-sized output.
-        unsafe {
-            std::ptr::write_bytes(self.out.add(self.word), 0, total_words - self.word);
-        }
-    }
-}
-
-#[inline(always)]
-fn stream_lin_word(
-    value: u32,
-    z: &mut PackedWordWriter,
-    a: &mut PackedWordWriter,
-    b: &mut PackedWordWriter,
-) {
-    z.push(value as u64, 32);
-    a.push(value as u64, 32);
-    b.push(u32::MAX as u64, 32);
 }
 
 /// Build the (z, a, b) blocks for ONE compression instance, into u64 views
@@ -1299,9 +1194,9 @@ fn build_block_witness_ab_packed_into(
             let c_val = state[lc];
             let d_val = state[ld];
 
-            let mut rz = BitRecord::<4>::new();
-            let mut ra = BitRecord::<4>::new();
-            let mut rb = BitRecord::<4>::new();
+            let mut rz = BitRecord::<3>::new();
+            let mut ra = BitRecord::<3>::new();
+            let mut rb = BitRecord::<3>::new();
 
             macro_rules! add_into {
                 ($pos:ident, $x:expr, $y:expr) => {{
@@ -1324,17 +1219,13 @@ fn build_block_witness_ab_packed_into(
             let c_2 = add_into!(REC_C5, c_1, d_2);
             let b_new = (b_1 ^ c_2).rotate_right(7);
             let d_new = d_2;
-            rz.push::<REC_LIN0>(b_new);
-            ra.push::<REC_LIN0>(b_new);
-            rb.push::<REC_LIN0>(0xFFFF_FFFF);
-            rz.push::<REC_LIN1>(d_new);
-            ra.push::<REC_LIN1>(d_new);
-            rb.push::<REC_LIN1>(0xFFFF_FFFF);
 
-            let g_base = GS_BASE + G_STRIDE * g;
-            rz.flush(z, g_base);
-            ra.flush(a, g_base);
-            rb.flush(b, g_base);
+            let carry_base = G_CARRY_BASE + G_CARRY_STRIDE * g;
+            rz.flush(z, carry_base);
+            ra.flush(a, carry_base);
+            rb.flush(b, carry_base);
+            write_lin_word_ab_packed(g_lin_bit(g, LIN_B_NEW, 0), b_new, z, a, b);
+            write_lin_word_ab_packed(g_lin_bit(g, LIN_D_NEW, 0), d_new, z, a, b);
 
             state[la] = a_2;
             state[lb] = b_new;
@@ -1353,10 +1244,10 @@ fn build_block_witness_ab_packed_into(
 }
 
 /// Full-write counterpart of [`build_block_witness_ab_packed_into`]. The
-/// circuit rows are contiguous through `USEFUL_BITS`, so three streaming bit
-/// writers can publish complete u64s without a destination read-modify-write.
-/// The only out-of-order region is the aligned `out_lo` slot, reserved while
-/// the compression runs and overwritten once the final state is known.
+/// aligned structural layout has two generated streams (lin-id and carry)
+/// separated by a zero gap. The portable fallback initializes its block and
+/// reuses the accessor-driven builder; the ranked AArch64 path below writes
+/// the same layout directly from its L1 staging arrays.
 fn build_block_witness_ab_stream_into(
     cv: &[u32; 8],
     m: &[u32; 16],
@@ -1367,173 +1258,10 @@ fn build_block_witness_ab_stream_into(
     a: &mut [u64],
     b: &mut [u64],
 ) {
-    const U64_PER_BLOCK: usize = K / 64;
-    debug_assert_eq!(z.len(), U64_PER_BLOCK);
-    debug_assert_eq!(a.len(), U64_PER_BLOCK);
-    debug_assert_eq!(b.len(), U64_PER_BLOCK);
-
-    let counter_lo = counter as u32;
-    let counter_hi = (counter >> 32) as u32;
-
-    // Initialize the fixed 1,153-bit prefix directly. This leaves each writer
-    // at word 18 with exactly one pending bit, which makes the subsequent
-    // generated G sequence start from a compile-time-known packing phase.
-    let z_ptr = z.as_mut_ptr();
-    let a_ptr = a.as_mut_ptr();
-    let b_ptr = b.as_mut_ptr();
-    unsafe {
-        for i in 0..4 {
-            let value = (cv[2 * i] as u64) | ((cv[2 * i + 1] as u64) << 32);
-            z_ptr.add(i).write(value);
-            a_ptr.add(i).write(value);
-            b_ptr.add(i).write(u64::MAX);
-        }
-        std::ptr::write_bytes(z_ptr.add(4), 0, 4);
-        std::ptr::write_bytes(a_ptr.add(4), 0, 4);
-        std::ptr::write_bytes(b_ptr.add(4), 0, 4);
-
-        let values = [
-            m[0], m[1], m[2], m[3], m[4], m[5], m[6], m[7], m[8], m[9], m[10], m[11],
-            m[12], m[13], m[14], m[15], counter_lo, counter_hi, block_len, flags,
-        ];
-        for i in 0..10 {
-            let low = if i == 0 {
-                1
-            } else {
-                (values[2 * i - 1] >> 31) as u64
-            };
-            let value = low
-                | ((values[2 * i] as u64) << 1)
-                | ((values[2 * i + 1] as u64) << 33);
-            z_ptr.add(8 + i).write(value);
-            a_ptr.add(8 + i).write(value);
-            b_ptr.add(8 + i).write(u64::MAX);
-        }
-    }
-    let pending = (flags >> 31) as u64;
-    let mut wz = PackedWordWriter::at(z_ptr, 18, pending, 1);
-    let mut wa = PackedWordWriter::at(a_ptr, 18, pending, 1);
-    let mut wb = PackedWordWriter::at(b_ptr, 18, 1, 1);
-    debug_assert_eq!(wz.position(), GS_BASE);
-
-    let mut state: [u32; 16] = [
-        cv[0],
-        cv[1],
-        cv[2],
-        cv[3],
-        cv[4],
-        cv[5],
-        cv[6],
-        cv[7],
-        BLAKE3_IV[0],
-        BLAKE3_IV[1],
-        BLAKE3_IV[2],
-        BLAKE3_IV[3],
-        counter_lo,
-        counter_hi,
-        block_len,
-        flags,
-    ];
-    // The circuit shape and message schedule are fixed. Expanding all 56 Gs
-    // gives LLVM literal state/message indices and exposes the complete
-    // dependency graph to register allocation. This is also the source-level
-    // model for a generated AArch64 kernel: allocation and Rayon stay in Rust,
-    // while only this fixed inner computation is specialized.
-    macro_rules! g {
-        ($la:literal, $lb:literal, $lc:literal, $ld:literal, $mx:literal, $my:literal) => {{
-            let mx = m[$mx];
-            let my = m[$my];
-            let a_val = state[$la];
-            let b_val = state[$lb];
-            let c_val = state[$lc];
-            let d_val = state[$ld];
-
-            let mut rz = BitRecord::<4>::new();
-            let mut ra = BitRecord::<4>::new();
-            let mut rb = BitRecord::<4>::new();
-
-            macro_rules! add_into_stream {
-                ($pos:ident, $x:expr, $y:expr) => {{
-                    let (sum, left, right, carry) = add_carry_parts($x, $y);
-                    rz.push::<$pos>(carry);
-                    ra.push::<$pos>(left);
-                    rb.push::<$pos>(right);
-                    sum
-                }};
-            }
-
-            let tmp_0 = add_into_stream!(REC_C0, a_val, b_val);
-            let a_1 = add_into_stream!(REC_C1, tmp_0, mx);
-            let d_1 = (d_val ^ a_1).rotate_right(16);
-            let c_1 = add_into_stream!(REC_C2, c_val, d_1);
-            let b_1 = (b_val ^ c_1).rotate_right(12);
-            let tmp_1 = add_into_stream!(REC_C3, a_1, b_1);
-            let a_2 = add_into_stream!(REC_C4, tmp_1, my);
-            let d_2 = (d_1 ^ a_2).rotate_right(8);
-            let c_2 = add_into_stream!(REC_C5, c_1, d_2);
-            let b_new = (b_1 ^ c_2).rotate_right(7);
-            let d_new = d_2;
-            rz.push::<REC_LIN0>(b_new);
-            ra.push::<REC_LIN0>(b_new);
-            rb.push::<REC_LIN0>(u32::MAX);
-            rz.push::<REC_LIN1>(d_new);
-            ra.push::<REC_LIN1>(d_new);
-            rb.push::<REC_LIN1>(u32::MAX);
-
-            wz.push_record(&rz, G_STRIDE);
-            wa.push_record(&ra, G_STRIDE);
-            wb.push_record(&rb, G_STRIDE);
-
-            state[$la] = a_2;
-            state[$lb] = b_new;
-            state[$lc] = c_2;
-            state[$ld] = d_new;
-        }};
-    }
-    macro_rules! round {
-        ($m0:literal, $m1:literal, $m2:literal, $m3:literal,
-         $m4:literal, $m5:literal, $m6:literal, $m7:literal,
-         $m8:literal, $m9:literal, $m10:literal, $m11:literal,
-         $m12:literal, $m13:literal, $m14:literal, $m15:literal) => {{
-            g!(0, 4, 8, 12, $m0, $m1);
-            g!(1, 5, 9, 13, $m2, $m3);
-            g!(2, 6, 10, 14, $m4, $m5);
-            g!(3, 7, 11, 15, $m6, $m7);
-            g!(0, 5, 10, 15, $m8, $m9);
-            g!(1, 6, 11, 12, $m10, $m11);
-            g!(2, 7, 8, 13, $m12, $m13);
-            g!(3, 4, 9, 14, $m14, $m15);
-        }};
-    }
-    round!(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15);
-    round!(2, 6, 3, 10, 7, 0, 4, 13, 1, 11, 12, 5, 9, 14, 15, 8);
-    round!(3, 4, 10, 12, 13, 2, 7, 14, 6, 5, 9, 0, 11, 15, 8, 1);
-    round!(10, 7, 12, 9, 14, 3, 13, 15, 4, 0, 11, 2, 5, 8, 1, 6);
-    round!(12, 13, 9, 11, 15, 10, 14, 8, 7, 2, 5, 3, 0, 1, 6, 4);
-    round!(9, 14, 11, 5, 8, 12, 15, 1, 13, 3, 0, 10, 2, 6, 4, 7);
-    round!(11, 15, 5, 0, 1, 9, 8, 6, 14, 10, 2, 12, 3, 4, 7, 13);
-    debug_assert_eq!(wz.position(), OUT_HI_BASE);
-
-    let out_lo: [u32; 8] = std::array::from_fn(|w| state[w] ^ state[w + 8]);
-    for w in 0..8 {
-        stream_lin_word(state[w + 8] ^ cv[w], &mut wz, &mut wa, &mut wb);
-    }
-    debug_assert_eq!(wz.position(), USEFUL_BITS);
-
-    wz.finish(U64_PER_BLOCK);
-    wa.finish(U64_PER_BLOCK);
-    wb.finish(U64_PER_BLOCK);
-
-    // OUT_LO_BASE is 256-bit aligned, so the four reserved words can be
-    // replaced without touching neighboring rows.
-    const OUT_LO_WORD: usize = OUT_LO_BASE / 64;
-    debug_assert_eq!(OUT_LO_BASE % 64, 0);
-    for i in 0..4 {
-        let value = (out_lo[2 * i] as u64) | ((out_lo[2 * i + 1] as u64) << 32);
-        z[OUT_LO_WORD + i] = value;
-        a[OUT_LO_WORD + i] = value;
-        b[OUT_LO_WORD + i] = u64::MAX;
-    }
+    z.fill(0);
+    a.fill(0);
+    b.fill(0);
+    build_block_witness_ab_packed_into(cv, m, counter, block_len, flags, z, a, b);
 }
 
 // ---------------------------------------------------------------------------
@@ -1544,7 +1272,7 @@ fn build_block_witness_ab_stream_into(
 // [`build_block_witness_ab_stream_into`]: `vaddq_u32` wraps mod 2^32 per lane
 // (no arithmetic wider than u32 exists, so carries never cross lanes),
 // rotate-XOR is shr/shl/or, and the bit packing is a const-shift sequential
-// push network mirroring `PackedWordWriter`'s algebra lane-wise.
+// push network mirroring the scalar bit-packing algebra lane-wise.
 // Kill switch: `FLOCK_NO_WITGEN_SIMD=1` restores the scalar driver.
 // `FLOCK_WITGEN_SIMD_PLAIN_STORES=1` replaces every z/a/b NT drain with plain
 // stores (same-binary store-flavor A/B). `FLOCK_NO_WITGEN_Z_NT=1` disables
@@ -1554,8 +1282,8 @@ fn build_block_witness_ab_stream_into(
 #[cfg(target_arch = "aarch64")]
 pub(crate) mod witgen_simd {
     use super::{
-        BLAKE3_IV, Compression, GS_BASE, G_STRIDE, K, OUT_HI_BASE, REC_C0, REC_C1, REC_C2, REC_C3,
-        REC_C4, REC_C5, REC_LIN0, REC_LIN1, USEFUL_BITS,
+        BLAKE3_IV, Compression, G_CARRY_BASE, G_CARRY_STRIDE, G_LIN_BASE, G_LIN_STRIDE, K,
+        OUT_HI_BASE, REC_C0, REC_C1, REC_C2, REC_C3, REC_C4, REC_C5, USEFUL_BITS,
     };
     use core::arch::aarch64::*;
     use flock_core::bits::transpose_8_u64s_to_64_bytes;
@@ -1641,9 +1369,6 @@ pub(crate) mod witgen_simd {
         }
     }
 
-    /// Last useful word (bit 15408 → word 481, 17 bits used).
-    const LAST_WORD: usize = (USEFUL_BITS - 1) / 32; // 481
-
     /// NT 64-byte stripe chunk store (via an L1 stack bounce): the lincheck
     /// stripe passes the failed.md §14 never-read test (read ~85 ms later,
     /// 512 MiB ≫ SLC), so it stores non-temporally like a/b.
@@ -1664,7 +1389,7 @@ pub(crate) mod witgen_simd {
         }
     }
 
-    /// u32-granular lane-wise `PackedWordWriter`: `pending` plus the
+    /// u32-granular lane-wise packed writer: `pending` plus the
     /// absolute-word L1 stage. Every push site is monomorphized with its
     /// stream offset (USED), the straddle back-shift (BACK), and — when it
     /// completes a word — the ABSOLUTE word index (WORD), so completed words
@@ -1732,12 +1457,22 @@ pub(crate) mod witgen_simd {
             }
         }
 
-        /// `PackedWordWriter::finish` semantics: the partial final word 481
-        /// (upper bits zero by construction) joins the stage.
+        /// Publish a stream's partial final word. Separate lin-id and carry
+        /// streams end at different absolute words and bit offsets in the
+        /// aligned layout. Masking is required for the carry stream because
+        /// its last 31-bit field deliberately leaves its high bit dirty.
         #[inline(always)]
-        unsafe fn finish(&mut self) {
+        unsafe fn finish<const WORD: usize, const USED: usize>(&mut self) {
+            const {
+                assert!(WORD < U32_PER_BLOCK);
+                assert!(USED > 0 && USED < 32);
+            }
             unsafe {
-                vst1q_u32(self.stage.add(LAST_WORD) as *mut u32, self.pending);
+                let mask = vdupq_n_u32((1u32 << USED) - 1);
+                vst1q_u32(
+                    self.stage.add(WORD) as *mut u32,
+                    vandq_u32(self.pending, mask),
+                );
             }
         }
     }
@@ -1918,9 +1653,10 @@ pub(crate) mod witgen_simd {
             // ---- L1 stages (block-lane words; drained by `dump` at the
             // end so each block's 2 KiB is one ascending burst) ----
             // Every element is written before it is read: prefix/out_lo own
-            // words 0..35, W32 owns 36..481, and the explicit suffix owns
-            // 482..511. Keep the stages uninitialized so each quad avoids
-            // three redundant 8 KiB bzero calls before those full writes.
+            // words 0..35, the lin-id stream owns 36..156, the explicit
+            // alignment gap owns 157, the carry stream owns 158..483, and
+            // the explicit suffix owns 484..511. Keep the stages uninitialized
+            // so each quad avoids three redundant 8 KiB bzero calls.
             let zero = vdupq_n_u32(0);
             let mut zs = core::mem::MaybeUninit::<[V4; U32_PER_BLOCK]>::uninit();
             let mut ast = core::mem::MaybeUninit::<[V4; U32_PER_BLOCK]>::uninit();
@@ -1936,9 +1672,10 @@ pub(crate) mod witgen_simd {
                 vst1q_u32(ast.add(w) as *mut u32, cv_v[w]);
             }
             let maxv = vdupq_n_u32(u32::MAX);
-            // b prefix words 0..36 = MAX (the out_lo slot is MAX too — the
-            // scalar writes MAX over MAX, so b needs no out_lo pass).
-            for w in 0..36usize {
+            // B is structurally one through row 4992: inputs, every G lin-id,
+            // and OUT_HI form 156 full u32 words plus bit zero of word 156.
+            // The internal alignment gap and carry stream remain zero/dynamic.
+            for w in 0..156usize {
                 vst1q_u32(bs.add(w) as *mut u32, maxv);
             }
             // Message region words 16..36: word16 = 1|m0<<1, then
@@ -1966,51 +1703,58 @@ pub(crate) mod witgen_simd {
                 vst1q_u32(ast.add(w) as *mut u32, v);
             }
 
-            // ---- G stream (bits 1153..15409): sequential push network ----
-            // Writers start at u32 word 36 with one pending bit (flags>>31
-            // for z/a, 1 for b) — the scalar writer's u64-word-18 state.
+            vst1q_u32(bs.add(156) as *mut u32, one);
+            vst1q_u32(zs.add(157) as *mut u32, zero);
+            vst1q_u32(ast.add(157) as *mut u32, zero);
+            vst1q_u32(bs.add(157) as *mut u32, zero);
+
+            // ---- split G streams ----
+            // z/a lin-id values continue at bit 1153 with the pending high
+            // flags bit. B needs no writer for that stream because the whole
+            // prefix was filled with ones above. Carries begin at aligned bit
+            // 5056 and use independent zero-pending writers.
             let pending_bit = vshrq_n_u32::<31>(flags);
-            let mut wz = W32::at(zs, pending_bit);
-            let mut wa = W32::at(ast, pending_bit);
-            let mut wb = W32::at(bs, one);
+            let mut wz_lin = W32::at(zs, pending_bit);
+            let mut wa_lin = W32::at(ast, pending_bit);
+            let mut wz_carry = W32::at(zs, zero);
+            let mut wa_carry = W32::at(ast, zero);
+            let mut wb_carry = W32::at(bs, zero);
 
             macro_rules! g {
                 ($g:expr, $la:literal, $lb:literal, $lc:literal, $ld:literal,
                  $mx:literal, $my:literal) => {{
                     let (t0, l0, r0, c0) = add_carry_parts_v(state[$la], state[$lb]);
-                    pushf!(wz, GS_BASE + G_STRIDE * $g + REC_C0, 31, c0);
-                    pushf!(wa, GS_BASE + G_STRIDE * $g + REC_C0, 31, l0);
-                    pushf!(wb, GS_BASE + G_STRIDE * $g + REC_C0, 31, r0);
+                    pushf!(wz_carry, G_CARRY_BASE + G_CARRY_STRIDE * $g + REC_C0, 31, c0);
+                    pushf!(wa_carry, G_CARRY_BASE + G_CARRY_STRIDE * $g + REC_C0, 31, l0);
+                    pushf!(wb_carry, G_CARRY_BASE + G_CARRY_STRIDE * $g + REC_C0, 31, r0);
                     let (a1, l1, r1, c1) = add_carry_parts_v(t0, m[$mx]);
-                    pushf!(wz, GS_BASE + G_STRIDE * $g + REC_C1, 31, c1);
-                    pushf!(wa, GS_BASE + G_STRIDE * $g + REC_C1, 31, l1);
-                    pushf!(wb, GS_BASE + G_STRIDE * $g + REC_C1, 31, r1);
+                    pushf!(wz_carry, G_CARRY_BASE + G_CARRY_STRIDE * $g + REC_C1, 31, c1);
+                    pushf!(wa_carry, G_CARRY_BASE + G_CARRY_STRIDE * $g + REC_C1, 31, l1);
+                    pushf!(wb_carry, G_CARRY_BASE + G_CARRY_STRIDE * $g + REC_C1, 31, r1);
                     let d1 = xor_rotr::<16, 16>(state[$ld], a1);
                     let (c1s, l2, r2, c2) = add_carry_parts_v(state[$lc], d1);
-                    pushf!(wz, GS_BASE + G_STRIDE * $g + REC_C2, 31, c2);
-                    pushf!(wa, GS_BASE + G_STRIDE * $g + REC_C2, 31, l2);
-                    pushf!(wb, GS_BASE + G_STRIDE * $g + REC_C2, 31, r2);
+                    pushf!(wz_carry, G_CARRY_BASE + G_CARRY_STRIDE * $g + REC_C2, 31, c2);
+                    pushf!(wa_carry, G_CARRY_BASE + G_CARRY_STRIDE * $g + REC_C2, 31, l2);
+                    pushf!(wb_carry, G_CARRY_BASE + G_CARRY_STRIDE * $g + REC_C2, 31, r2);
                     let b1 = xor_rotr::<12, 20>(state[$lb], c1s);
                     let (t1, l3, r3, c3) = add_carry_parts_v(a1, b1);
-                    pushf!(wz, GS_BASE + G_STRIDE * $g + REC_C3, 31, c3);
-                    pushf!(wa, GS_BASE + G_STRIDE * $g + REC_C3, 31, l3);
-                    pushf!(wb, GS_BASE + G_STRIDE * $g + REC_C3, 31, r3);
+                    pushf!(wz_carry, G_CARRY_BASE + G_CARRY_STRIDE * $g + REC_C3, 31, c3);
+                    pushf!(wa_carry, G_CARRY_BASE + G_CARRY_STRIDE * $g + REC_C3, 31, l3);
+                    pushf!(wb_carry, G_CARRY_BASE + G_CARRY_STRIDE * $g + REC_C3, 31, r3);
                     let (a2, l4, r4, c4) = add_carry_parts_v(t1, m[$my]);
-                    pushf!(wz, GS_BASE + G_STRIDE * $g + REC_C4, 31, c4);
-                    pushf!(wa, GS_BASE + G_STRIDE * $g + REC_C4, 31, l4);
-                    pushf!(wb, GS_BASE + G_STRIDE * $g + REC_C4, 31, r4);
+                    pushf!(wz_carry, G_CARRY_BASE + G_CARRY_STRIDE * $g + REC_C4, 31, c4);
+                    pushf!(wa_carry, G_CARRY_BASE + G_CARRY_STRIDE * $g + REC_C4, 31, l4);
+                    pushf!(wb_carry, G_CARRY_BASE + G_CARRY_STRIDE * $g + REC_C4, 31, r4);
                     let d2 = xor_rotr::<8, 24>(d1, a2);
                     let (c2s, l5, r5, c5) = add_carry_parts_v(c1s, d2);
-                    pushf!(wz, GS_BASE + G_STRIDE * $g + REC_C5, 31, c5);
-                    pushf!(wa, GS_BASE + G_STRIDE * $g + REC_C5, 31, l5);
-                    pushf!(wb, GS_BASE + G_STRIDE * $g + REC_C5, 31, r5);
+                    pushf!(wz_carry, G_CARRY_BASE + G_CARRY_STRIDE * $g + REC_C5, 31, c5);
+                    pushf!(wa_carry, G_CARRY_BASE + G_CARRY_STRIDE * $g + REC_C5, 31, l5);
+                    pushf!(wb_carry, G_CARRY_BASE + G_CARRY_STRIDE * $g + REC_C5, 31, r5);
                     let bn = xor_rotr::<7, 25>(b1, c2s);
-                    pushf!(wz, GS_BASE + G_STRIDE * $g + REC_LIN0, 32, bn);
-                    pushf!(wa, GS_BASE + G_STRIDE * $g + REC_LIN0, 32, bn);
-                    pushf!(wb, GS_BASE + G_STRIDE * $g + REC_LIN0, 32, maxv);
-                    pushf!(wz, GS_BASE + G_STRIDE * $g + REC_LIN1, 32, d2);
-                    pushf!(wa, GS_BASE + G_STRIDE * $g + REC_LIN1, 32, d2);
-                    pushf!(wb, GS_BASE + G_STRIDE * $g + REC_LIN1, 32, maxv);
+                    pushf!(wz_lin, G_LIN_BASE + G_LIN_STRIDE * $g, 32, bn);
+                    pushf!(wa_lin, G_LIN_BASE + G_LIN_STRIDE * $g, 32, bn);
+                    pushf!(wz_lin, G_LIN_BASE + G_LIN_STRIDE * $g + 32, 32, d2);
+                    pushf!(wa_lin, G_LIN_BASE + G_LIN_STRIDE * $g + 32, 32, d2);
                     state[$la] = a2;
                     state[$lb] = bn;
                     state[$lc] = c2s;
@@ -2040,16 +1784,15 @@ pub(crate) mod witgen_simd {
             round!(40, 9, 14, 11, 5, 8, 12, 15, 1, 13, 3, 0, 10, 2, 6, 4, 7);
             round!(48, 11, 15, 5, 0, 1, 9, 8, 6, 14, 10, 2, 12, 3, 4, 7, 13);
 
-            // ---- out_hi (bits 15153..15409), stream-sequential ----
+            // ---- out_hi (bits 4737..4993), continues the lin-id stream ----
             const {
-                assert!(OUT_HI_BASE % 32 == 17);
+                assert!(OUT_HI_BASE % 32 == 1);
             }
             macro_rules! oh {
                 ($w:literal) => {{
                     let hv = veorq_u32(state[$w + 8], cv_v[$w]);
-                    pushf!(wz, OUT_HI_BASE + 32 * $w, 32, hv);
-                    pushf!(wa, OUT_HI_BASE + 32 * $w, 32, hv);
-                    pushf!(wb, OUT_HI_BASE + 32 * $w, 32, maxv);
+                    pushf!(wz_lin, OUT_HI_BASE + 32 * $w, 32, hv);
+                    pushf!(wa_lin, OUT_HI_BASE + 32 * $w, 32, hv);
                 }};
             }
             oh!(0);
@@ -2060,16 +1803,18 @@ pub(crate) mod witgen_simd {
             oh!(5);
             oh!(6);
             oh!(7);
-            wz.finish();
-            wa.finish();
-            wb.finish();
+            wz_lin.finish::<156, 1>();
+            wa_lin.finish::<156, 1>();
+            wz_carry.finish::<483, 16>();
+            wa_carry.finish::<483, 16>();
+            wb_carry.finish::<483, 16>();
 
-            // ---- zero fill, words 482..512 (finish() 241..256 semantics) ----
-            const ZF: usize = USEFUL_BITS.div_ceil(32); // 482
+            // ---- zero fill, words 484..512 ----
+            const ZF: usize = USEFUL_BITS.div_ceil(32); // 484
             const {
-                assert!(U32_PER_BLOCK - ZF == 30);
+                assert!(U32_PER_BLOCK - ZF == 28);
             }
-            for w in 0..30usize {
+            for w in 0..28usize {
                 vst1q_u32(zs.add(ZF + w) as *mut u32, zero);
                 vst1q_u32(ast.add(ZF + w) as *mut u32, zero);
                 vst1q_u32(bs.add(ZF + w) as *mut u32, zero);
@@ -3519,14 +3264,71 @@ mod tests {
         assert_eq!(OUT_LO_BASE, 256);
         assert_eq!(Z_CONST_POS, 512);
         assert_eq!(M_BASE, 513);
-        assert_eq!(GS_BASE, 1153);
-        assert_eq!(G_STRIDE, 250);
+        assert_eq!(G_LIN_BASE, 1_153);
+        assert_eq!(G_LIN_STRIDE, 64);
         assert_eq!(N_G, 56);
-        assert_eq!(OUT_HI_BASE, 15_153);
-        assert_eq!(USEFUL_BITS, 15_409);
+        assert_eq!(OUT_HI_BASE, 4_737);
+        assert_eq!(G_CARRY_BASE, 5_056);
+        assert_eq!(G_CARRY_STRIDE, 186);
+        assert_eq!(USEFUL_BITS, 15_472);
+        assert_eq!(OUT_HI_BASE + 8 * WORD_BITS, 4_993);
+        assert_eq!(G_CARRY_BASE - (OUT_HI_BASE + 8 * WORD_BITS), 63);
         assert!(USEFUL_BITS <= K);
         assert_eq!(CV_BASE % SLOT_BITS, 0);
         assert_eq!(OUT_LO_BASE % SLOT_BITS, 0);
+        assert_eq!(G_CARRY_BASE % 64, 0);
+    }
+
+    #[test]
+    fn aligned_b_one_prefix_has_39_compact_pairs() {
+        let (_, b_matrix) = build_matrices();
+        let one_row = [Z_CONST_POS];
+        let full_one_codes: Vec<usize> = b_matrix
+            .rows
+            .chunks_exact(64)
+            .enumerate()
+            .filter_map(|(code, rows)| {
+                rows.iter()
+                    .all(|row| row.as_slice() == one_row)
+                    .then_some(code)
+            })
+            .collect();
+        assert_eq!(full_one_codes, (0usize..78).collect::<Vec<_>>());
+        assert_eq!(full_one_codes.len() / 2, 39);
+
+        for row in OUT_HI_BASE + 8 * WORD_BITS..G_CARRY_BASE {
+            assert!(b_matrix.rows[row].is_empty(), "B gap row {row} was nonzero");
+        }
+
+        let mut z = vec![0u64; K / 64];
+        let mut a = vec![0u64; K / 64];
+        let mut b = vec![0u64; K / 64];
+        build_block_witness_ab_packed_into(
+            &[0x0123_4567; 8],
+            &[0x89ab_cdef; 16],
+            0x1020_3040_5060_7080,
+            64,
+            0x0b,
+            &mut z,
+            &mut a,
+            &mut b,
+        );
+        let b_bytes = unsafe {
+            std::slice::from_raw_parts(b.as_ptr().cast::<u8>(), K / 8)
+        };
+        for code in 0..78 {
+            assert!(
+                b_bytes[code * 8..code * 8 + 8]
+                    .iter()
+                    .all(|&byte| byte == u8::MAX),
+                "B code {code} was not all-one"
+            );
+        }
+        for row in OUT_HI_BASE + 8 * WORD_BITS..G_CARRY_BASE {
+            assert!(!((z[row / 64] >> (row % 64)) & 1 != 0));
+            assert!(!((a[row / 64] >> (row % 64)) & 1 != 0));
+            assert!(!((b[row / 64] >> (row % 64)) & 1 != 0));
+        }
     }
 
     /// Reference compression matches the `blake3` crate for empty input

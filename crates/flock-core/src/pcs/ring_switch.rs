@@ -3897,8 +3897,8 @@ mod tests {
     fn fold_1b_padded_matches_dense() {
         // (m, k_log, useful_bits)
         let cases: &[(usize, usize, usize)] = &[
-            // BLAKE3: k_log=14, useful=15409 (boundary not 128-aligned)
-            (17, 14, 15_409),
+            // BLAKE3: k_log=14, useful=15472 (boundary not 128-aligned)
+            (17, 14, 15_472),
             // SHA-2:  k_log=15, useful=31401 (boundary not 128-aligned)
             (18, 15, 31_401),
             // Keccak: k_log=16, useful=42560 (128-aligned; 35% of chunks skip)
@@ -3977,7 +3977,7 @@ mod tests {
         // (m, k_log, useful_bits): same padding shapes as
         // `fold_1b_padded_matches_dense`, so chunk-skip actually engages.
         let cases: &[(usize, usize, usize)] =
-            &[(17, 14, 15_409), (18, 15, 31_401), (19, 16, 42_560)];
+            &[(17, 14, 15_472), (18, 15, 31_401), (19, 16, 42_560)];
         for &(m, k_log, useful_bits) in cases {
             let l = m - LOG_PACKING;
             let len = 1usize << l;
@@ -4016,7 +4016,7 @@ mod tests {
     #[test]
     fn fold_1b_rows_split_2way_matches_per_claim() {
         let cases: &[(usize, usize, usize)] =
-            &[(17, 14, 15_409), (18, 15, 31_401), (19, 16, 42_560)];
+            &[(17, 14, 15_472), (18, 15, 31_401), (19, 16, 42_560)];
         for &(m, k_log, useful_bits) in cases {
             let l = m - LOG_PACKING;
             let len = 1usize << l;

@@ -2153,7 +2153,17 @@ pub(crate) fn shift_reduce_inner_ab_fused_neon_checked(
             );
             return;
         }
-        0x03 | 0xf0 => {}
+        0x3f if bw(0) & bw(1) & bw(2) & bw(3) & bw(4) & bw(5) == u64::MAX => {
+            shift_reduce_inner_mixed_const_b::<0x3f>(
+                a_packed,
+                b_packed,
+                inv_table,
+                byte_base_b,
+                out,
+            );
+            return;
+        }
+        0x03 | 0x3f | 0xf0 => {}
         _ => unreachable!("unsupported static-one mask"),
     }
     if bstatic_w <= 1

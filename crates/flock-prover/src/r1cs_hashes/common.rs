@@ -45,11 +45,6 @@ impl<const NW: usize> BitRecord<NW> {
         Self { w: [0u64; NW] }
     }
 
-    #[inline(always)]
-    pub(crate) fn words(&self) -> &[u64; NW] {
-        &self.w
-    }
-
     /// OR a (pre-masked) value into record bits `[POS, POS + width)`.
     /// `POS` is const so the straddle branch and shifts fold at compile time.
     #[inline(always)]
@@ -630,7 +625,7 @@ where
             };
             // Padded lincheck fold reads only stripe[..useful_bits]
             // (`partial_fold_packed_z_fast_padded`). Ranked Blake3 defaults
-            // useful_bits=USEFUL_BITS (15409) with k=16384, so the tail past
+            // useful_bits=USEFUL_BITS (15472) with k=16384, so the tail past
             // useful_words*64 is never observed on the timed path.
             //
             // `take_u8` is write-before-read / stale-pool (scratch.rs): skipping
