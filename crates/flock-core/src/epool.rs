@@ -129,6 +129,14 @@ pub fn helper_pool_available() -> bool {
 /// Ligerito levels) drain faster than the cross-pool kickoff amortizes.
 const EPOOL_MIN_CHUNKS: usize = 16;
 
+/// `FLOCK_NO_EPOOL_JOIN_SPIN` restores the exact incumbent blocking
+/// scope-end join in the hetero chunk drains (no first-check yield), a
+/// runner-side rollback lever for the two wake-tail cuts here.
+fn epool_join_spin_enabled() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("FLOCK_NO_EPOOL_JOIN_SPIN").is_none())
+}
+
 /// Process chunks `0..n_chunks` exactly once each, in parallel, drawing from
 /// a shared atomic queue drained by the main rayon pool plus (when present
 /// and the job is large enough) the efficiency-core helper pool.
@@ -268,7 +276,7 @@ where
             // The scoped thread parks inside `broadcast` while the E-workers
             // drain; it costs no main-pool worker. The scope join bounds the
             // tail wait at one chunk on one efficiency core.
-            s.spawn(|| {
+            let epool_job = s.spawn(|| {
                 ep.broadcast(|_| loop {
                     let i = next.fetch_add(1, Ordering::Relaxed);
                     if i >= n_chunks {
@@ -279,6 +287,20 @@ where
                 })
             });
             drain_main();
+            // Thread-join wake-tail, hetero-drain site: the P-core share of
+            // the queue typically finishes before the E-core share, so the
+            // implicit scope-end join parks this thread and pays the E-core
+            // completion wake tail. First-check + bounded yield (same
+            // pattern as the promoted ranked lincheck stripe join and the
+            // grind joins) before the scope-end wait; degrade to the exact
+            // incumbent blocking join. Byte-identical either way.
+            if !epool_job.is_finished() && epool_join_spin_enabled() {
+                let spin_deadline =
+                    std::time::Instant::now() + std::time::Duration::from_millis(2);
+                while !epool_job.is_finished() && std::time::Instant::now() < spin_deadline {
+                    std::thread::yield_now();
+                }
+            }
         }),
         None => drain_main(),
     }
@@ -325,7 +347,7 @@ pub(crate) fn run_chunks_with_helper_stateful<S, I, F>(
     };
     match helper.filter(|_| n_chunks >= EPOOL_MIN_CHUNKS) {
         Some(ep) => std::thread::scope(|s| {
-            s.spawn(|| {
+            let epool_job = s.spawn(|| {
                 ep.broadcast(|_| {
                     let mut state = init();
                     loop {
@@ -339,6 +361,15 @@ pub(crate) fn run_chunks_with_helper_stateful<S, I, F>(
                 })
             });
             drain_main();
+            // Same first-check + bounded yield as the non-stateful drain
+            // above: cut the scope-end park + E-core completion wake tail.
+            if !epool_job.is_finished() && epool_join_spin_enabled() {
+                let spin_deadline =
+                    std::time::Instant::now() + std::time::Duration::from_millis(2);
+                while !epool_job.is_finished() && std::time::Instant::now() < spin_deadline {
+                    std::thread::yield_now();
+                }
+            }
         }),
         None => drain_main(),
     }
