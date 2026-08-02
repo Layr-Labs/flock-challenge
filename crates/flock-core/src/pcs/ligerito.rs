@@ -10464,5 +10464,4 @@ mod tests {
 // angelX disclosed draw 7 of the tree on 775378c (prior: 1,252,541 / 1,241,514 / 1,255,076 P / 1,245,411 / 1,249,152 / pending; zero-diff marker).
 // RealAdii sample 1 on beeedc6.
 // RealAdii sample 1 on 88aff39.
-// RealAdii sample 1 on 281206e.
-// RealAdii sample 2 on 281206e.
+// numinous draw 2 1785654733163254228
