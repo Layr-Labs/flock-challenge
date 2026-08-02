@@ -10480,3 +10480,14 @@ mod tests {
 // RealAdii sample 1 on 88aff39.
 // RealAdii sample 1 on 281206e.
 // RealAdii sample 2 on 281206e.
+// RealAdii sample 1 on 74769bd.
+// RealAdii sample 2 on 74769bd.
+// RealAdii sample 3 on 74769bd.
+// RealAdii sample 4 on 74769bd.
+// RealAdii sample 5 on 74769bd.
+// RealAdii sample 6 on 74769bd.
+// RealAdii sample 7 on 74769bd.
+// RealAdii sample 8 on 74769bd.
+// RealAdii sample 9 on 74769bd.
+// RealAdii sample 10 on 74769bd.
+// RealAdii sample 11 on 74769bd.
