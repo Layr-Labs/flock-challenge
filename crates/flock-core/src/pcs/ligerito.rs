@@ -10480,3 +10480,4 @@ mod tests {
 // RealAdii sample 1 on 88aff39.
 // RealAdii sample 1 on 281206e.
 // RealAdii sample 2 on 281206e.
+// Akashneelesh draw M9: zero-diff of the live frontier; 16 prior same-content draws mean 1337384.22, spread 13.300%, bar 1419087.58770084 (+6.100%).
