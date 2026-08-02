@@ -103,24 +103,24 @@ fn d_inv() -> F128 {
 
 /// Convert table γ^b · φ_8(v) for b ∈ [0, 16), v ∈ [0, 256). Same as the
 /// degree-2 path — protocol-fixed once. Cached after the first call.
-fn build_convert_table() -> Vec<F128> {
+fn build_convert_table() -> Box<[F128]> {
     use crate::field::PHI_8_TABLE;
     let mut gamma_pow = [F128::ZERO; 16];
     gamma_pow[0] = F128::ONE;
     for b in 1..16 {
         gamma_pow[b] = mul_by_x(gamma_pow[b - 1]);
     }
-    let mut table = vec![F128::ZERO; 16 * 256];
+    let mut table = Vec::with_capacity(16 * 256);
     for b in 0..16 {
         let g_b = gamma_pow[b];
         for v in 0..256 {
-            table[b * 256 + v] = g_b * PHI_8_TABLE[v];
+            table.push(g_b * PHI_8_TABLE[v]);
         }
     }
-    table
+    table.into_boxed_slice()
 }
 
-static CONVERT_TABLE_CACHE: OnceLock<Vec<F128>> = OnceLock::new();
+static CONVERT_TABLE_CACHE: OnceLock<Box<[F128]>> = OnceLock::new();
 fn convert_table() -> &'static [F128] {
     CONVERT_TABLE_CACHE.get_or_init(build_convert_table)
 }

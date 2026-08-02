@@ -76,101 +76,6 @@ pub(crate) fn warmup_latch_cache_enabled() -> bool {
 /// restoring the incumbent kernel selection as the same-binary control.
 pub const ENV_NO_NTT_PASS_TUNE: &str = "FLOCK_NO_NTT_PASS_TUNE";
 
-/// Exact-`1` rollback for the ranked from-`z` compact zero-root kernel. The
-/// candidate constructs only the eleven nonzero l=0/B=0 twiddle tables in
-/// each threadgroup and spells the seven zero-root butterflies as XORs.
-/// Exact `1` restores the untouched incumbent g4 pipeline state.
-pub const ENV_NO_GPU_FROM_Z_ZERO_ROOT: &str = "FLOCK_NO_GPU_FROM_Z_ZERO_ROOT";
-
-fn gpu_from_z_zero_root_value_enabled(value: Option<&std::ffi::OsStr>) -> bool {
-    value != Some(std::ffi::OsStr::new("1"))
-}
-
-fn gpu_from_z_zero_root_enabled() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| {
-        gpu_from_z_zero_root_value_enabled(
-            std::env::var_os(ENV_NO_GPU_FROM_Z_ZERO_ROOT).as_deref(),
-        )
-    })
-}
-
-fn select_gpu_from_z_zero_root(
-    log_d: usize,
-    num_ntts: usize,
-    l: usize,
-    f: usize,
-    pass_tune: bool,
-    enabled: bool,
-) -> bool {
-    enabled && pass_tune && log_d == 20 && num_ntts == 64 && l == 0 && f == 4
-}
-
-#[inline]
-fn gpu_from_z_zero_root_selected(log_d: usize) -> bool {
-    select_gpu_from_z_zero_root(
-        log_d,
-        64,
-        0,
-        4,
-        pass_tune_enabled(),
-        gpu_from_z_zero_root_enabled(),
-    )
-}
-
-#[cfg(test)]
-mod from_z_zero_root_gate_tests {
-    use std::ffi::OsStr;
-
-    #[test]
-    fn exact_one_rollback_and_ranked_shape_only() {
-        assert!(!super::gpu_from_z_zero_root_value_enabled(Some(OsStr::new("1"))));
-        for value in [None, Some(""), Some("0"), Some("01"), Some("true")] {
-            assert!(super::gpu_from_z_zero_root_value_enabled(value.map(OsStr::new)));
-        }
-        assert!(super::select_gpu_from_z_zero_root(20, 64, 0, 4, true, true));
-        assert!(!super::select_gpu_from_z_zero_root(20, 64, 0, 4, false, true));
-        assert!(!super::select_gpu_from_z_zero_root(20, 64, 0, 4, true, false));
-        assert!(!super::select_gpu_from_z_zero_root(19, 64, 0, 4, true, true));
-        assert!(!super::select_gpu_from_z_zero_root(20, 32, 0, 4, true, true));
-        assert!(!super::select_gpu_from_z_zero_root(20, 64, 1, 4, true, true));
-        assert!(!super::select_gpu_from_z_zero_root(20, 64, 0, 3, true, true));
-    }
-
-    #[test]
-    fn compact_mapping_and_ranked_work_accounting() {
-        const RAW: [usize; 11] = [2, 4, 5, 6, 8, 9, 10, 11, 12, 13, 14];
-        for (compact, raw) in RAW.into_iter().enumerate() {
-            let mapped = if compact == 0 {
-                2
-            } else if compact < 4 {
-                compact + 3
-            } else {
-                compact + 4
-            };
-            assert_eq!(mapped, raw);
-        }
-
-        const GROUPS: usize = 1 << (20 - 6);
-        const INCUMBENT_BUILD_MULX: usize = 15 * (0 + 4 + 8 + 12) + 15 * 64 * 4;
-        const COMPACT_BUILD_MULX: usize = 11 * (0 + 4 + 8 + 12) + 11 * 64 * 4;
-        assert_eq!(INCUMBENT_BUILD_MULX, 4_200);
-        assert_eq!(COMPACT_BUILD_MULX, 3_080);
-        assert_eq!((INCUMBENT_BUILD_MULX - COMPACT_BUILD_MULX) * GROUPS, 18_350_080);
-
-        // Layer zero is already a copy. In layers 1..3 the zero root occurs
-        // 4+2+1 times per tile and lane; four tiles and 64 lanes share each
-        // ranked group. Each deleted tab4 call contains eight shl16 steps and
-        // 32 uint4 threadgroup gathers.
-        const ZERO_PRODUCTS_PER_GROUP: usize = (4 + 2 + 1) * 4 * 64;
-        const ZERO_PRODUCTS: usize = ZERO_PRODUCTS_PER_GROUP * GROUPS;
-        assert_eq!(ZERO_PRODUCTS, 29_360_128);
-        assert_eq!(ZERO_PRODUCTS * 8, 234_881_024);
-        assert_eq!(ZERO_PRODUCTS * 32, 939_524_096);
-        assert_eq!((11 * 4 + 11 * 64) * 16, 11_968);
-    }
-}
-
 /// Disable only the mixed-algebra ranked final NTT pass, restoring the
 /// incumbent h8 kernel as a same-binary control.
 pub const ENV_NO_GPU_MIXED_FINAL: &str = "FLOCK_NO_GPU_MIXED_FINAL";
@@ -1622,195 +1527,6 @@ kernel void parent_hash3(device const uint* children [[buffer(0)]],
 
 "#;
 
-    /// Source-only ranked from-z specialization. This deliberately does not
-    /// reuse the rejected device-table preload design: every group constructs
-    /// its own compact 11-table image directly from the existing raw twiddle
-    /// buffer, then executes explicit zero/nonzero butterflies.
-    const FROM_Z_ZERO_ROOT_MSL_SOURCE: &str = r#"
-#include <metal_stdlib>
-using namespace metal;
-
-struct NttParams {
-    uint log_d;
-    uint l;
-    uint f;
-    uint s;
-};
-
-static inline uint4 gf_mulx_zero_root(uint4 v) {
-    uint carry = v.w >> 31;
-    uint4 r;
-    r.w = (v.w << 1) | (v.z >> 31);
-    r.z = (v.z << 1) | (v.y >> 31);
-    r.y = (v.y << 1) | (v.x >> 31);
-    r.x = (v.x << 1) ^ (carry * 0x87u);
-    return r;
-}
-
-static inline uint4 gf_shl16_zero_root(uint4 a) {
-    uint h = a.w >> 16;
-    uint4 r;
-    r.w = (a.w << 16) | (a.z >> 16);
-    r.z = (a.z << 16) | (a.y >> 16);
-    r.y = (a.y << 16) | (a.x >> 16);
-    r.x = (a.x << 16) ^ ((h << 7) ^ (h << 2) ^ (h << 1) ^ h);
-    return r;
-}
-
-static inline uint4 gf_mul_tab4_zero_root(
-    uint4 v,
-    threadgroup const uint4* tab)
-{
-    uint4 acc = uint4(0u);
-    for (int i = 7; i >= 0; i--) {
-        acc = gf_shl16_zero_root(acc);
-        uint h = (v[i >> 1] >> ((i & 1) * 16)) & 0xffffu;
-        acc ^= tab[h & 15u]
-             ^ tab[16u + ((h >> 4) & 15u)]
-             ^ tab[32u + ((h >> 8) & 15u)]
-             ^ tab[48u + (h >> 12)];
-    }
-    return acc;
-}
-
-// Compact index -> ordinary flat l=0/B=0 twiddle selector. Selectors
-// 0,1,3,7 are the zero roots; selector 0 belongs to the already-elided
-// layer-zero copy, while 1,3,7 are handled by literal XOR butterflies.
-static inline uint zero_root_raw_twiddle(uint compact) {
-    return compact == 0u ? 2u : (compact < 4u ? compact + 3u : compact + 4u);
-}
-
-// The production kernel and test exporter call this exact same builder.
-// Static threadgroup memory is 44 bases + 704 table entries = 11,968 B.
-static inline void build_zero_root_tabs(
-    device const uint4* twiddles,
-    threadgroup uint4* bases,
-    threadgroup uint4* tabs,
-    uint lid)
-{
-    constexpr uint NTW = 11u;
-    if (lid < NTW * 4u) {
-        uint compact = lid >> 2;
-        uint bank = lid & 3u;
-        uint4 p = twiddles[zero_root_raw_twiddle(compact)];
-        for (uint m = 0u; m < bank * 4u; m++) {
-            p = gf_mulx_zero_root(p);
-        }
-        bases[lid] = p;
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    for (uint ei = lid; ei < NTW * 64u; ei += 64u) {
-        uint compact = ei >> 6;
-        uint sub = ei & 63u;
-        uint nibble = sub & 15u;
-        uint4 p = bases[(compact << 2) | (sub >> 4)];
-        uint4 value = uint4(0u);
-        for (uint bit = 0u; bit < 4u; bit++) {
-            if ((nibble >> bit) & 1u) {
-                value ^= p;
-            }
-            p = gf_mulx_zero_root(p);
-        }
-        tabs[ei] = value;
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-}
-
-kernel void ntt_fused_reg4_from_zg4_zero_root(
-    device uint4* data             [[buffer(0)]],
-    device const uint4* twiddles   [[buffer(1)]],
-    constant NttParams& P          [[buffer(2)]],
-    device const uint4* z          [[buffer(3)]],
-    uint tgid [[threadgroup_position_in_grid]],
-    uint lid  [[thread_index_in_threadgroup]])
-{
-    constexpr uint NF = 16u;
-    constexpr uint LOG_G = 2u;
-    threadgroup uint4 bases[11u * 4u];
-    threadgroup uint4 tabs[11u * 64u];
-    build_zero_root_tabs(twiddles, bases, tabs, lid);
-
-    const uint lane = lid & 63u;
-    const uint r_base = tgid << LOG_G;
-    for (uint rr = 0u; rr < (1u << LOG_G); rr++) {
-        const uint r = r_base + rr;
-        uint4 elems[NF];
-
-        // Layer zero has v=0: load the message half once and duplicate it.
-        for (uint e = 0u; e < NF / 2u; e++) {
-            elems[e] = z[(((e << P.s) + r) << 6) + lane];
-            elems[e + NF / 2u] = elems[e];
-        }
-
-        // Literal indices are deliberate: a dynamic register-array index in
-        // this hot network can spill the sixteen F128 values. Seven ZERO
-        // calls replace c=0 multiplication; seventeen TAB calls cover every
-        // remaining butterfly with a compile-time compact-table offset.
-        #define ZERO_BFLY(EU, EV) \
-            elems[EV] ^= elems[EU];
-        #define TAB_BFLY(EU, EV, CT) { \
-            uint4 nu = elems[EU] \
-                ^ gf_mul_tab4_zero_root(elems[EV], &tabs[(CT) * 64u]); \
-            elems[EU] = nu; \
-            elems[EV] ^= nu; \
-        }
-
-        // Layer one: raw zero selector 1; compact selector 0 -> raw 2.
-        ZERO_BFLY(0, 4)
-        ZERO_BFLY(1, 5)
-        ZERO_BFLY(2, 6)
-        ZERO_BFLY(3, 7)
-        TAB_BFLY(8, 12, 0)
-        TAB_BFLY(9, 13, 0)
-        TAB_BFLY(10, 14, 0)
-        TAB_BFLY(11, 15, 0)
-
-        // Layer two: raw zero selector 3; compact 1..3 -> raw 4..6.
-        ZERO_BFLY(0, 2)
-        ZERO_BFLY(1, 3)
-        TAB_BFLY(4, 6, 1)
-        TAB_BFLY(5, 7, 1)
-        TAB_BFLY(8, 10, 2)
-        TAB_BFLY(9, 11, 2)
-        TAB_BFLY(12, 14, 3)
-        TAB_BFLY(13, 15, 3)
-
-        // Layer three: raw zero selector 7; compact 4..10 -> raw 8..14.
-        ZERO_BFLY(0, 1)
-        TAB_BFLY(2, 3, 4)
-        TAB_BFLY(4, 5, 5)
-        TAB_BFLY(6, 7, 6)
-        TAB_BFLY(8, 9, 7)
-        TAB_BFLY(10, 11, 8)
-        TAB_BFLY(12, 13, 9)
-        TAB_BFLY(14, 15, 10)
-
-        #undef TAB_BFLY
-        #undef ZERO_BFLY
-
-        for (uint e = 0u; e < NF; e++) {
-            data[((r + (e << P.s)) << 6) + lane] = elems[e];
-        }
-    }
-}
-
-// Test-only PSO. It exports the exact table image built by the shared
-// helper above so a real-Metal oracle can compare every compact entry.
-kernel void export_from_z_zero_root_tabs(
-    device const uint4* twiddles [[buffer(0)]],
-    device uint4* out            [[buffer(1)]],
-    uint lid [[thread_index_in_threadgroup]])
-{
-    threadgroup uint4 bases[11u * 4u];
-    threadgroup uint4 tabs[11u * 64u];
-    build_zero_root_tabs(twiddles, bases, tabs, lid);
-    for (uint ei = lid; ei < 11u * 64u; ei += 64u) {
-        out[ei] = tabs[ei];
-    }
-}
-"#;
-
     // -----------------------------------------------------------------------
     // Embedded precompiled metallib.
     //
@@ -1918,14 +1634,6 @@ kernel void export_from_z_zero_root_tabs(
         /// Pass-tuned variants: g4 shared-table from-z with the zero-region
         /// sub-layer skipped, and the half-footprint final-pass kernel.
         pub(crate) pso_ntt4zg4: Id,
-        /// Ranked-only direct zero-root specialization. This supplemental
-        /// PSO constructs eleven compact tables per group; it never reads a
-        /// prebuilt device table.
-        pub(crate) pso_ntt4zg4_zero_root: Id,
-        /// Real-Metal oracle exporter for the shared compact table builder.
-        /// `NIL` outside `cfg(test)`.
-        #[cfg_attr(not(test), allow(dead_code))]
-        pub(crate) pso_export_from_z_zero_root_tabs: Id,
         pub(crate) pso_ntt4h8: Id,
         pub(crate) pso_ntt5mix: Id,
         pub(crate) pso_leaf: Id,
@@ -2064,71 +1772,6 @@ kernel void export_from_z_zero_root_tabs(
                             p
                         }
                     };
-
-                // Keep the embedded incumbent metallib byte-for-byte intact.
-                // The exact rollback skips this supplemental compile and
-                // selects the incumbent pso_ntt4zg4 below.
-                let (pso_ntt4zg4_zero_root, pso_export_from_z_zero_root_tabs) =
-                    if cfg!(test) || super::gpu_from_z_zero_root_selected(20) {
-                        let src = api.nsstring(FROM_Z_ZERO_ROOT_MSL_SOURCE)?;
-                        let mut err: Id = NIL;
-                        let library: Id = send!(
-                            api,
-                            unsafe extern "C" fn(Id, Sel, Id, Id, *mut Id) -> Id,
-                            device,
-                            c"newLibraryWithSource:options:error:",
-                            src,
-                            NIL,
-                            &mut err
-                        );
-                        if library.is_null() {
-                            return Err(format!(
-                                "from-z zero-root shader compile failed: {}",
-                                api.error_string(err)
-                            ));
-                        }
-                        let build = |name: &str| -> Result<Id, String> {
-                            let ns = api.nsstring(name)?;
-                            let f: Id = send!(
-                                api,
-                                unsafe extern "C" fn(Id, Sel, Id) -> Id,
-                                library,
-                                c"newFunctionWithName:",
-                                ns
-                            );
-                            if f.is_null() {
-                                return Err(format!("from-z zero-root kernel {name} not found"));
-                            }
-                            let mut pso_err: Id = NIL;
-                            let pso: Id = send!(
-                                api,
-                                unsafe extern "C" fn(Id, Sel, Id, *mut Id) -> Id,
-                                device,
-                                c"newComputePipelineStateWithFunction:error:",
-                                f,
-                                &mut pso_err
-                            );
-                            send!(api, unsafe extern "C" fn(Id, Sel) -> Id, f, c"release");
-                            if pso.is_null() {
-                                Err(format!(
-                                    "from-z zero-root pipeline {name}: {}",
-                                    api.error_string(pso_err)
-                                ))
-                            } else {
-                                Ok(pso)
-                            }
-                        };
-                        let candidate = build("ntt_fused_reg4_from_zg4_zero_root")?;
-                        let export = if cfg!(test) {
-                            build("export_from_z_zero_root_tabs")?
-                        } else {
-                            NIL
-                        };
-                        send!(api, unsafe extern "C" fn(Id, Sel) -> Id, library, c"release");
-                        (candidate, export)
-                    } else {
-                        (NIL, NIL)
-                    };
                 Ok(Gpu {
                     api,
                     device,
@@ -2139,8 +1782,6 @@ kernel void export_from_z_zero_root_tabs(
                     pso_ntt3,
                     pso_ntt4z,
                     pso_ntt4zg4,
-                    pso_ntt4zg4_zero_root,
-                    pso_export_from_z_zero_root_tabs,
                     pso_ntt4h8,
                     pso_ntt5mix,
                     pso_leaf,
@@ -2325,31 +1966,6 @@ kernel void export_from_z_zero_root_tabs(
             }
         }
 
-        #[cfg(test)]
-        pub(crate) unsafe fn pipeline_resources(&self, pso: Id) -> (u64, u64, u64) {
-            unsafe {
-                let static_tg: u64 = send!(
-                    self.api,
-                    unsafe extern "C" fn(Id, Sel) -> u64,
-                    pso,
-                    c"staticThreadgroupMemoryLength"
-                );
-                let simd_width: u64 = send!(
-                    self.api,
-                    unsafe extern "C" fn(Id, Sel) -> u64,
-                    pso,
-                    c"threadExecutionWidth"
-                );
-                let max_threads: u64 = send!(
-                    self.api,
-                    unsafe extern "C" fn(Id, Sel) -> u64,
-                    pso,
-                    c"maxTotalThreadsPerThreadgroup"
-                );
-                (static_tg, simd_width, max_threads)
-            }
-        }
-
         pub(crate) unsafe fn end_encoding(&self, enc: Id) {
             unsafe {
                 send!(self.api, unsafe extern "C" fn(Id, Sel), enc, c"endEncoding");
@@ -2430,115 +2046,6 @@ kernel void export_from_z_zero_root_tabs(
         pub(crate) l: u32,
         pub(crate) f: u32,
         pub(crate) s: u32,
-    }
-
-    /// Immutable selection for one logical from-z first pass. Every full,
-    /// streamed, and blocking/reprime dispatch goes through this helper, so
-    /// the candidate and exact rollback cannot silently diverge by path.
-    #[derive(Clone, Copy)]
-    struct FromZFirstPassPlan {
-        grouped: bool,
-        zero_root: bool,
-    }
-
-    impl FromZFirstPassPlan {
-        fn new(log_d: usize) -> Self {
-            let grouped = super::pass_tune_enabled();
-            Self {
-                grouped,
-                zero_root: grouped && super::gpu_from_z_zero_root_selected(log_d),
-            }
-        }
-
-        unsafe fn encode_range(
-            self,
-            gpu: &Gpu,
-            enc: Id,
-            staging: Id,
-            tw_buf: Id,
-            z_buf: Id,
-            log_d: usize,
-            byte_offset: usize,
-            r_count: usize,
-        ) {
-            debug_assert!(!self.zero_root || self.grouped);
-            debug_assert!(!self.grouped || r_count.is_multiple_of(4));
-            unsafe {
-                let pso = if self.zero_root {
-                    debug_assert!(!gpu.pso_ntt4zg4_zero_root.is_null());
-                    gpu.pso_ntt4zg4_zero_root
-                } else if self.grouped {
-                    gpu.pso_ntt4zg4
-                } else {
-                    gpu.pso_ntt4z
-                };
-                gpu.set_pipeline(enc, pso);
-                gpu.set_buffer(enc, staging, byte_offset, 0);
-                gpu.set_buffer(enc, tw_buf, 0, 1);
-                let p = NttParams {
-                    log_d: log_d as u32,
-                    l: 0,
-                    f: 4,
-                    s: (log_d - 4) as u32,
-                };
-                let bytes = core::slice::from_raw_parts(
-                    (&p as *const NttParams).cast::<u8>(),
-                    core::mem::size_of::<NttParams>(),
-                );
-                gpu.set_bytes(enc, bytes, 2);
-                gpu.set_buffer(enc, z_buf, byte_offset, 3);
-                gpu.dispatch(
-                    enc,
-                    (r_count >> if self.grouped { 2 } else { 0 }) as u64,
-                    64,
-                );
-            }
-        }
-    }
-
-    /// Scaled real-Metal oracle entrypoint. Production selection remains
-    /// ranked-only; tests force the identical candidate PSO at log_d=8.
-    #[cfg(test)]
-    pub(crate) unsafe fn encode_from_z_zero_root_for_test(
-        gpu: &Gpu,
-        enc: Id,
-        staging: Id,
-        tw_buf: Id,
-        z_buf: Id,
-        log_d: usize,
-    ) {
-        unsafe {
-            FromZFirstPassPlan {
-                grouped: true,
-                zero_root: true,
-            }
-            .encode_range(
-                gpu,
-                enc,
-                staging,
-                tw_buf,
-                z_buf,
-                log_d,
-                0,
-                1usize << (log_d - 4),
-            );
-        }
-    }
-
-    #[cfg(test)]
-    pub(crate) unsafe fn encode_zero_root_table_export_for_test(
-        gpu: &Gpu,
-        enc: Id,
-        tw_buf: Id,
-        out: Id,
-    ) {
-        unsafe {
-            debug_assert!(!gpu.pso_export_from_z_zero_root_tabs.is_null());
-            gpu.set_pipeline(enc, gpu.pso_export_from_z_zero_root_tabs);
-            gpu.set_buffer(enc, tw_buf, 0, 0);
-            gpu.set_buffer(enc, out, 0, 1);
-            gpu.dispatch(enc, 1, 64);
-        }
     }
 
     /// Encode the fused NTT passes for `layers [start_layer, log_d)` over a
@@ -3028,16 +2535,26 @@ kernel void export_from_z_zero_root_tabs(
                 let result = (|| -> Result<Id, String> {
                     let cb = self.gpu.command_buffer()?;
                     let enc = self.gpu.compute_encoder(cb)?;
-                    FromZFirstPassPlan::new(self.log_d).encode_range(
-                        self.gpu,
+                    let zg4 = super::pass_tune_enabled();
+                    self.gpu.set_pipeline(
                         enc,
-                        self.staging,
-                        self.tw_buf,
-                        self.z_buf,
-                        self.log_d,
-                        byte_offset,
-                        r_count,
+                        if zg4 { self.gpu.pso_ntt4zg4 } else { self.gpu.pso_ntt4z },
                     );
+                    self.gpu.set_buffer(enc, self.staging, byte_offset, 0);
+                    self.gpu.set_buffer(enc, self.tw_buf, 0, 1);
+                    let p = NttParams {
+                        log_d: self.log_d as u32,
+                        l: 0,
+                        f: 4,
+                        s: (self.log_d - 4) as u32,
+                    };
+                    let bytes = core::slice::from_raw_parts(
+                        (&p as *const NttParams).cast::<u8>(),
+                        core::mem::size_of::<NttParams>(),
+                    );
+                    self.gpu.set_bytes(enc, bytes, 2);
+                    self.gpu.set_buffer(enc, self.z_buf, byte_offset, 3);
+                    self.gpu.dispatch(enc, (r_count >> if zg4 { 2 } else { 0 }) as u64, 64);
                     self.gpu.end_encoding(enc);
                     // `commandBuffer` is autoreleased. Retain it before
                     // popping this short-lived pool because completion is
@@ -3380,16 +2897,27 @@ kernel void export_from_z_zero_root_tabs(
                 // From-z tiles all live in block B = 0 (l = 0), so the g4
                 // table-reuse idiom applies; the tuned kernel also skips the
                 // zero-region sub-layer (a pure copy).
-                FromZFirstPassPlan::new(log_d).encode_range(
-                    gpu,
-                    enc,
-                    staging,
-                    tw_buf,
-                    z_buf,
-                    log_d,
-                    0,
-                    1usize << (log_d - 4),
+                let zg4 = super::pass_tune_enabled();
+                gpu.set_pipeline(enc, if zg4 { gpu.pso_ntt4zg4 } else { gpu.pso_ntt4z });
+                gpu.set_buffer(enc, staging, 0, 0);
+                gpu.set_buffer(enc, tw_buf, 0, 1);
+                let p = NttParams {
+                    log_d: log_d as u32,
+                    l: 0,
+                    f: 4,
+                    s: (log_d - 4) as u32,
+                };
+                let bytes = core::slice::from_raw_parts(
+                    (&p as *const NttParams).cast::<u8>(),
+                    core::mem::size_of::<NttParams>(),
                 );
+                gpu.set_bytes(enc, bytes, 2);
+                gpu.set_buffer(enc, z_buf, 0, 3);
+                if zg4 {
+                    gpu.dispatch(enc, 1u64 << (log_d - 6), 64);
+                } else {
+                    gpu.dispatch(enc, 1u64 << (log_d - 4), 64);
+                }
                 // Passes 2..: layers 4..log_d in place over staging.
                 encode_ntt_passes(gpu, enc, staging, tw_buf, log_d, 4);
                 encode_merkle(gpu, enc, staging, tree_buf, n_leaves);
@@ -3455,16 +2983,27 @@ kernel void export_from_z_zero_root_tabs(
             // From-z tiles all live in block B = 0 (l = 0), so the g4
             // table-reuse idiom applies; the tuned kernel also skips
             // the zero-region sub-layer (a pure copy).
-            FromZFirstPassPlan::new(log_d).encode_range(
-                gpu,
-                enc,
-                staging,
-                tw_buf,
-                z_buf,
-                log_d,
-                0,
-                1usize << (log_d - 4),
+            let zg4 = super::pass_tune_enabled();
+            gpu.set_pipeline(enc, if zg4 { gpu.pso_ntt4zg4 } else { gpu.pso_ntt4z });
+            gpu.set_buffer(enc, staging, 0, 0);
+            gpu.set_buffer(enc, tw_buf, 0, 1);
+            let p = NttParams {
+                log_d: log_d as u32,
+                l: 0,
+                f: 4,
+                s: (log_d - 4) as u32,
+            };
+            let bytes = core::slice::from_raw_parts(
+                (&p as *const NttParams).cast::<u8>(),
+                core::mem::size_of::<NttParams>(),
             );
+            gpu.set_bytes(enc, bytes, 2);
+            gpu.set_buffer(enc, z_buf, 0, 3);
+            if zg4 {
+                gpu.dispatch(enc, 1u64 << (log_d - 6), 64);
+            } else {
+                gpu.dispatch(enc, 1u64 << (log_d - 4), 64);
+            }
             gpu.end_encoding(enc);
             gpu.commit_and_wait(cb1)
         }
@@ -4408,51 +3947,8 @@ kernel void export_from_z_zero_root_tabs(
         }
     }
 
-    /// Cache key component tying entries to both the exact GPU source and
-    /// selected from-z mode. Candidate and exact-rollback processes must not
-    /// consume each other's latch or tuned split.
-    fn warmup_cache_msl_fnv_for(zero_root: bool) -> u64 {
-        let base = fnv1a64(MSL_SOURCE);
-        if zero_root {
-            base ^ fnv1a64(FROM_Z_ZERO_ROOT_MSL_SOURCE).rotate_left(1)
-                ^ 0x5A52_4F4F_545F_3131 // "ZROOT_11"
-        } else {
-            base
-        }
-    }
-
-    fn warmup_cache_msl_fnv() -> u64 {
-        warmup_cache_msl_fnv_for(super::gpu_from_z_zero_root_selected(20))
-    }
-
-    #[cfg(test)]
-    mod zero_root_cache_key_tests {
-        #[test]
-        fn supplemental_source_and_mode_have_a_distinct_fingerprint() {
-            let incumbent = super::warmup_cache_msl_fnv_for(false);
-            let candidate = super::warmup_cache_msl_fnv_for(true);
-            assert_eq!(incumbent, super::fnv1a64(super::MSL_SOURCE));
-            assert_ne!(candidate, incumbent);
-            assert_eq!(
-                candidate,
-                incumbent
-                    ^ super::fnv1a64(super::FROM_Z_ZERO_ROOT_MSL_SOURCE).rotate_left(1)
-                    ^ 0x5A52_4F4F_545F_3131
-            );
-        }
-
-        #[test]
-        fn hot_network_is_literal_and_has_no_device_table_preload() {
-            let src = super::FROM_Z_ZERO_ROOT_MSL_SOURCE;
-            // One macro definition plus exactly 7/17 literal call sites.
-            assert_eq!(src.matches("ZERO_BFLY(").count(), 8);
-            assert_eq!(src.matches("TAB_BFLY(").count(), 18);
-            assert!(!src.contains("fixed_tabs"));
-            assert!(!src.contains("device const uint4* tabs"));
-            assert!(src.contains("threadgroup uint4 tabs[11u * 64u]"));
-            assert!(src.contains("twiddles[zero_root_raw_twiddle(compact)]"));
-        }
-    }
+    /// Cache key component tying entries to the exact GPU kernel source.
+    const WARMUP_CACHE_MSL_FNV: u64 = fnv1a64(MSL_SOURCE);
 
     struct WarmupCache {
         latch_on: bool,
@@ -4482,7 +3978,7 @@ kernel void export_from_z_zero_root_tabs(
         if take_u64(&bytes)? != warmup_cache_magic() {
             return None;
         }
-        if take_u64(&bytes)? != warmup_cache_msl_fnv() {
+        if take_u64(&bytes)? != WARMUP_CACHE_MSL_FNV {
             return None;
         }
         if take_u64(&bytes)? != log_d as u64 || take_u64(&bytes)? != n_leaves as u64 {
@@ -4525,7 +4021,7 @@ kernel void export_from_z_zero_root_tabs(
         let mut buf = Vec::with_capacity(64 + core::mem::size_of::<Hash>());
         for v in [
             warmup_cache_magic(),
-            warmup_cache_msl_fnv(),
+            WARMUP_CACHE_MSL_FNV,
             log_d as u64,
             n_leaves as u64,
             u64::from(latch_on),
@@ -5600,184 +5096,6 @@ mod tests {
                 data, expect,
                 "GPU NTT mismatch at log_d={log_d} start={start_layer}"
             );
-        }
-    }
-
-    /// Compact real-Metal oracle for the direct zero-root specialization. It
-    /// exports every entry from the exact shared threadgroup builder, forces
-    /// the production candidate PSO at log_d=8, compares candidate,
-    /// incumbent, and scalar first passes, then completes the NTT+Merkle graph
-    /// and checks the entire codeword and tree.
-    #[test]
-    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-    fn gpu_from_z_zero_root_table_codeword_and_tree_match_scaled() {
-        use super::imp;
-        use crate::field::mul_by_x;
-
-        const RAW_TWIDDLES: [usize; 11] = [2, 4, 5, 6, 8, 9, 10, 11, 12, 13, 14];
-        let log_d = 8usize;
-        let n_leaves = 1usize << log_d;
-        let ntt = AdditiveNttF128::standard(log_d);
-        let mut rng = Rng::new(0xA11C_0B00_7A11_E008);
-        let z = rng.vec(64 << (log_d - 1));
-
-        let mut expect_first = vec![F128::ZERO; 64 << log_d];
-        crate::pcs::commit::replicate_message_fill(&mut expect_first, &z);
-        ntt.forward_transform_interleaved_block_range(&mut expect_first, 64, 1, 4, 0, 2);
-
-        let mut expect_full = vec![F128::ZERO; 64 << log_d];
-        crate::pcs::commit::replicate_message_fill(&mut expect_full, &z);
-        ntt.forward_transform_interleaved_scalar_from_layer(&mut expect_full, 64, 1);
-        let expect_bytes = unsafe {
-            core::slice::from_raw_parts(
-                expect_full.as_ptr().cast::<u8>(),
-                core::mem::size_of_val(expect_full.as_slice()),
-            )
-        };
-        let expect_tree = crate::merkle::merkle_tree(
-            expect_bytes,
-            n_leaves,
-            crate::merkle::HashKind::Blake3,
-        );
-
-        let gpu = match gpu_or_skip(imp::gpu().map(|g| g as *const imp::Gpu)) {
-            Some(g) => unsafe { &*g },
-            None => return,
-        };
-        let twiddles = flat_twiddle_table(&ntt, log_d);
-        let mut expect_table = vec![F128::ZERO; 11 * 64];
-        for (compact, raw) in RAW_TWIDDLES.into_iter().enumerate() {
-            let mut base = twiddles[raw];
-            for bank in 0..4 {
-                let mut powers = [F128::ZERO; 4];
-                powers[0] = base;
-                for bit in 1..4 {
-                    powers[bit] = mul_by_x(powers[bit - 1]);
-                }
-                for nibble in 0..16 {
-                    let mut value = F128::ZERO;
-                    for (bit, &power) in powers.iter().enumerate() {
-                        if nibble & (1 << bit) != 0 {
-                            value += power;
-                        }
-                    }
-                    expect_table[compact * 64 + bank * 16 + nibble] = value;
-                }
-                for _ in 0..4 {
-                    base = mul_by_x(base);
-                }
-            }
-        }
-
-        unsafe {
-            let pool = gpu.pool_push();
-            let data_bytes = core::mem::size_of_val(expect_first.as_slice());
-            let tree_bytes = (2 * n_leaves - 1) * core::mem::size_of::<crate::merkle::Hash>();
-            let table_bytes = core::mem::size_of_val(expect_table.as_slice());
-            let candidate = gpu.new_buffer(data_bytes).unwrap();
-            let incumbent = gpu.new_buffer(data_bytes).unwrap();
-            let tw_buf = gpu
-                .new_buffer(core::mem::size_of_val(twiddles.as_slice()))
-                .unwrap();
-            let z_buf = gpu
-                .new_buffer(core::mem::size_of_val(z.as_slice()))
-                .unwrap();
-            let table_buf = gpu.new_buffer(table_bytes).unwrap();
-            let tree_buf = gpu.new_buffer(tree_bytes).unwrap();
-            std::ptr::copy_nonoverlapping(
-                twiddles.as_ptr().cast::<u8>(),
-                gpu.buffer_contents(tw_buf),
-                core::mem::size_of_val(twiddles.as_slice()),
-            );
-            std::ptr::copy_nonoverlapping(
-                z.as_ptr().cast::<u8>(),
-                gpu.buffer_contents(z_buf),
-                core::mem::size_of_val(z.as_slice()),
-            );
-            std::ptr::write_bytes(gpu.buffer_contents(candidate), 0xA5, data_bytes);
-            std::ptr::write_bytes(gpu.buffer_contents(incumbent), 0x5A, data_bytes);
-            std::ptr::write_bytes(gpu.buffer_contents(table_buf), 0xC3, table_bytes);
-            std::ptr::write_bytes(gpu.buffer_contents(tree_buf), 0x3C, tree_bytes);
-
-            // Force the candidate and export the table through the helper
-            // shared verbatim with its production PSO.
-            let cb = gpu.command_buffer().unwrap();
-            let enc = gpu.compute_encoder(cb).unwrap();
-            imp::encode_from_z_zero_root_for_test(
-                gpu, enc, candidate, tw_buf, z_buf, log_d,
-            );
-            imp::encode_zero_root_table_export_for_test(gpu, enc, tw_buf, table_buf);
-            gpu.end_encoding(enc);
-            gpu.commit_and_wait(cb).unwrap();
-
-            // Untouched incumbent g4 first pass.
-            let cb = gpu.command_buffer().unwrap();
-            let enc = gpu.compute_encoder(cb).unwrap();
-            gpu.set_pipeline(enc, gpu.pso_ntt4zg4);
-            gpu.set_buffer(enc, incumbent, 0, 0);
-            gpu.set_buffer(enc, tw_buf, 0, 1);
-            let p = imp::NttParams {
-                log_d: log_d as u32,
-                l: 0,
-                f: 4,
-                s: (log_d - 4) as u32,
-            };
-            let p_bytes = core::slice::from_raw_parts(
-                (&p as *const imp::NttParams).cast::<u8>(),
-                core::mem::size_of::<imp::NttParams>(),
-            );
-            gpu.set_bytes(enc, p_bytes, 2);
-            gpu.set_buffer(enc, z_buf, 0, 3);
-            gpu.dispatch(enc, 1u64 << (log_d - 6), 64);
-            gpu.end_encoding(enc);
-            gpu.commit_and_wait(cb).unwrap();
-
-            let got_table = core::slice::from_raw_parts(
-                gpu.buffer_contents(table_buf).cast::<F128>(),
-                expect_table.len(),
-            );
-            let candidate_first = core::slice::from_raw_parts(
-                gpu.buffer_contents(candidate).cast::<F128>(),
-                expect_first.len(),
-            );
-            let incumbent_first = core::slice::from_raw_parts(
-                gpu.buffer_contents(incumbent).cast::<F128>(),
-                expect_first.len(),
-            );
-            assert_eq!(got_table, expect_table.as_slice(), "compact table mismatch");
-            assert_eq!(candidate_first, expect_first.as_slice(), "candidate first pass mismatch");
-            assert_eq!(incumbent_first, expect_first.as_slice(), "incumbent first pass mismatch");
-            assert_eq!(candidate_first, incumbent_first);
-            assert_eq!(
-                gpu.pipeline_resources(gpu.pso_ntt4zg4_zero_root).0,
-                11_968,
-                "candidate static threadgroup footprint"
-            );
-
-            let cb = gpu.command_buffer().unwrap();
-            let enc = gpu.compute_encoder(cb).unwrap();
-            imp::encode_ntt_passes(gpu, enc, candidate, tw_buf, log_d, 4);
-            imp::encode_merkle(gpu, enc, candidate, tree_buf, n_leaves);
-            gpu.end_encoding(enc);
-            gpu.commit_and_wait(cb).unwrap();
-            let candidate_full = core::slice::from_raw_parts(
-                gpu.buffer_contents(candidate).cast::<F128>(),
-                expect_full.len(),
-            );
-            let got_tree = core::slice::from_raw_parts(
-                gpu.buffer_contents(tree_buf).cast::<crate::merkle::Hash>(),
-                expect_tree.len(),
-            );
-            assert_eq!(candidate_full, expect_full.as_slice(), "full codeword mismatch");
-            assert_eq!(got_tree, expect_tree.as_slice(), "full tree mismatch");
-
-            gpu.release(candidate);
-            gpu.release(incumbent);
-            gpu.release(tw_buf);
-            gpu.release(z_buf);
-            gpu.release(table_buf);
-            gpu.release(tree_buf);
-            gpu.pool_pop(pool);
         }
     }
 
