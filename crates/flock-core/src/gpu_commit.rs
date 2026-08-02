@@ -3937,6 +3937,11 @@ kernel void parent_hash3(device const uint* children [[buffer(0)]],
     // V3 excludes V2 entries published before calibration was deferred; such
     // entries can contain the usize::MAX untuned sentinel. The canonical
     // reprime kill switch deliberately returns to the incumbent V2 cache.
+    // (Redraw marker #3, 2026-08-02 ~07:5x: post-repair draws of the
+    // 88aff39 binary — 1,318,534.37 P / 1,323,344.57 P (bar) / 1,319,717.87
+    // / 1,314,259.47 (this account) / 1,316,642.56 / 1,318,449.41. Band is
+    // wide (±0.35%) and the bar is again the high-side extreme. Content
+    // change required for per-account resubmission.)
     const WARMUP_CACHE_MAGIC_V3: u64 = 0x464C_4B5F_574C_4333; // "FLK_WLC3"
 
     fn warmup_cache_magic() -> u64 {
