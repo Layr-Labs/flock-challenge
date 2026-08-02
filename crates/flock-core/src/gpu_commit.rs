@@ -5727,3 +5727,5 @@ mod tests {
         assert_eq!(plan_passes(20, 1), vec![(1, 4), (5, 4), (9, 4), (13, 4), (17, 3)]);
     }
 }
+
+// r157 draw 14: zero-diff marker on frontier bytes 88aff39 (no functional change)
