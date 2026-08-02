@@ -318,6 +318,74 @@ pub(super) unsafe fn butterfly_fused_3layer_zero_root_from_src_row(
     }
 }
 
+/// Process one fused-four-layer row group straight from the message into a
+/// stale destination block (recursive commitment first pass).
+///
+/// # Safety
+/// The caller guarantees valid source/destination row geometry, disjoint
+/// destination row groups across concurrent calls, and (for the zero-root
+/// twin) `twiddles[0] == twiddles[1] == twiddles[3] == twiddles[7] == 0`.
+#[inline]
+pub(super) unsafe fn butterfly_fused_4layer_from_src_row(
+    src: *const F128,
+    dst: *mut F128,
+    sixteenth: usize,
+    num_ntts: usize,
+    r: usize,
+    twiddles: &[F128; 15],
+) {
+    #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+    // SAFETY: forwarded caller contract; the cfg gate supplies `aes`.
+    unsafe {
+        if vector_resident_rows() {
+            aarch64::butterfly_fused_4layer_from_src_row(
+                src, dst, sixteenth, num_ntts, r, twiddles,
+            );
+            return;
+        }
+    }
+
+    // SAFETY: forwarded caller contract.
+    unsafe {
+        portable::butterfly_fused_4layer_from_src_row(
+            src, dst, sixteenth, num_ntts, r, twiddles,
+        );
+    }
+}
+
+/// Zero-root specialization of [`butterfly_fused_4layer_from_src_row`].
+///
+/// # Safety
+/// As the general form, plus `twiddles[0] == twiddles[1] == twiddles[3] ==
+/// twiddles[7] == 0`.
+#[inline]
+pub(super) unsafe fn butterfly_fused_4layer_zero_root_from_src_row(
+    src: *const F128,
+    dst: *mut F128,
+    sixteenth: usize,
+    num_ntts: usize,
+    r: usize,
+    twiddles: &[F128; 15],
+) {
+    #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+    // SAFETY: forwarded caller contract; the cfg gate supplies `aes`.
+    unsafe {
+        if vector_resident_rows() {
+            aarch64::butterfly_fused_4layer_zero_root_from_src_row(
+                src, dst, sixteenth, num_ntts, r, twiddles,
+            );
+            return;
+        }
+    }
+
+    // SAFETY: forwarded caller contract.
+    unsafe {
+        portable::butterfly_fused_4layer_zero_root_from_src_row(
+            src, dst, sixteenth, num_ntts, r, twiddles,
+        );
+    }
+}
+
 /// Root-block specialization of [`butterfly_fused_3layer_row`].
 ///
 /// # Safety

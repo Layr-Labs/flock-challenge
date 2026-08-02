@@ -331,3 +331,109 @@ pub(super) unsafe fn butterfly_fused_4layer_row(
         }
     }
 }
+
+/// Fused-four-layer out-of-place row used by the recursive commitment's
+/// from-message first pass. `dst` may contain stale bytes; every selected
+/// slot is initialized from the corresponding radix-16 row group in `src`.
+///
+/// # Safety
+/// The caller supplies valid source/destination row geometry and ensures
+/// concurrent calls own disjoint destination row groups.
+/// Fused-four-layer row chain specialized to a zero root: the layer-L..L+3
+/// twiddles at block zero's origin (`twiddles[0]`, `twiddles[1]`,
+/// `twiddles[3]`, `twiddles[7]`) are all zero, so those butterflies are
+/// XOR-only. Row zero is provably unchanged.
+pub(super) fn butterfly_fused_4layer_zero_root(values: &mut [F128; 16], twiddles: &[F128; 15]) {
+    #[inline(always)]
+    fn butterfly(values: &mut [F128; 16], u: usize, v: usize, twiddle: F128) {
+        let new_u = values[u] + values[v] * twiddle;
+        values[v] += new_u;
+        values[u] = new_u;
+    }
+
+    // Layer L, t[0] = 0: eight XOR-only butterflies (rows 8..15 updated).
+    for i in 0..8 {
+        let u = values[i];
+        values[i + 8] += u;
+    }
+
+    // Layer L+1. The bottom-half twiddle t[1] is zero; t[2] is general.
+    for i in 0..4 {
+        let u = values[i];
+        values[i + 4] += u;
+    }
+    for i in 0..4 {
+        butterfly(values, 8 + i, 12 + i, twiddles[2]);
+    }
+
+    // Layer L+2. The first quarter's twiddle t[3] is zero; t[4..7] general.
+    for i in 0..2 {
+        let u = values[i];
+        values[i + 2] += u;
+    }
+    for s in 1..4 {
+        for i in 0..2 {
+            butterfly(values, 4 * s + i, 4 * s + i + 2, twiddles[3 + s]);
+        }
+    }
+
+    // Layer L+3. The first pair's twiddle t[7] is zero; t[8..14] general.
+    let u = values[0];
+    values[1] += u;
+    for s in 1..8 {
+        butterfly(values, 2 * s, 2 * s + 1, twiddles[7 + s]);
+    }
+}
+
+pub(super) unsafe fn butterfly_fused_4layer_from_src_row(
+    src: *const F128,
+    dst: *mut F128,
+    sixteenth: usize,
+    num_ntts: usize,
+    r: usize,
+    twiddles: &[F128; 15],
+) {
+    // SAFETY: caller supplies the pointer geometry and disjointness contract.
+    unsafe {
+        for lane in 0..num_ntts {
+            let mut values = [F128::ZERO; 16];
+            for (i, value) in values.iter_mut().enumerate() {
+                *value = *src.add((i * sixteenth + r) * num_ntts + lane);
+            }
+            butterfly_fused_4layer(&mut values, twiddles);
+            for (i, value) in values.iter().enumerate() {
+                *dst.add((i * sixteenth + r) * num_ntts + lane) = *value;
+            }
+        }
+    }
+}
+
+/// Zero-root specialization of [`butterfly_fused_4layer_from_src_row`]:
+/// block zero's layer-L..L+3 twiddles at the origin are all zero, so the
+/// chain degenerates to XOR-only butterflies wherever the twiddle is zero.
+///
+/// # Safety
+/// As the general form, plus `twiddles[0] == twiddles[1] == twiddles[3] ==
+/// twiddles[7] == 0`.
+pub(super) unsafe fn butterfly_fused_4layer_zero_root_from_src_row(
+    src: *const F128,
+    dst: *mut F128,
+    sixteenth: usize,
+    num_ntts: usize,
+    r: usize,
+    twiddles: &[F128; 15],
+) {
+    // SAFETY: caller supplies the pointer geometry and zero-root contract.
+    unsafe {
+        for lane in 0..num_ntts {
+            let mut values = [F128::ZERO; 16];
+            for (i, value) in values.iter_mut().enumerate() {
+                *value = *src.add((i * sixteenth + r) * num_ntts + lane);
+            }
+            butterfly_fused_4layer_zero_root(&mut values, twiddles);
+            for (i, value) in values.iter().enumerate() {
+                *dst.add((i * sixteenth + r) * num_ntts + lane) = *value;
+            }
+        }
+    }
+}

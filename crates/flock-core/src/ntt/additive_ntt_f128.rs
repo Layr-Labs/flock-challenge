@@ -674,6 +674,113 @@ impl AdditiveNttF128 {
         );
     }
 
+    /// Start an interleaved transform directly from the rate-reduced message,
+    /// fusing the first FOUR nontrivial layers into the stores that
+    /// initialize `data`, then finish the remaining layers in place.
+    ///
+    /// One deeper than [`Self::forward_transform_interleaved_from_message_fused3`]:
+    /// the same message rows are read once and the radix-16 result is written
+    /// straight to the stale destination, deleting both the replica fill and
+    /// the first full-buffer sweep (layers `start_layer..start_layer+4`).
+    /// Fourteen concurrent row streams alias into one L1 set, so this is only
+    /// used where the eight-way L1D pressure of the from-src-row burst stores
+    /// is already paid by the fused pass's single write; the recursive
+    /// commitments are the sole callers (their one-pass 16-row tile is
+    /// 256 B per lane at num_ntts = 8, streamed once).
+    pub(crate) fn forward_transform_interleaved_from_message_fused4(
+        &self,
+        msg: &[F128],
+        data: &mut [F128],
+        num_ntts: usize,
+        start_layer: usize,
+    ) {
+        use rayon::prelude::*;
+
+        assert_eq!(num_ntts, 8, "recursive from-message fusion uses eight lanes");
+        let log_d = log2_pow2(data.len() / num_ntts);
+        assert!(start_layer + 4 <= log_d);
+        assert_eq!(data.len(), msg.len() << start_layer);
+
+        let num_blocks = 1usize << start_layer;
+        let block_positions = 1usize << (log_d - start_layer);
+        let block_elems = block_positions * num_ntts;
+        let sixteenth = block_positions >> 4;
+        assert_eq!(msg.len(), block_elems);
+        let twiddles: Vec<[F128; 15]> = (0..num_blocks)
+            .map(|block| {
+                let mut tw = [F128 { lo: 0, hi: 0 }; 15];
+                tw[0] = self.twiddle(start_layer, block);
+                for s in 0..2 {
+                    tw[1 + s] = self.twiddle(start_layer + 1, 2 * block + s);
+                }
+                for s in 0..4 {
+                    tw[3 + s] = self.twiddle(start_layer + 2, 4 * block + s);
+                }
+                for s in 0..8 {
+                    tw[7 + s] = self.twiddle(start_layer + 3, 8 * block + s);
+                }
+                tw
+            })
+            .collect();
+        debug_assert_eq!(twiddles[0][0], F128::ZERO);
+        debug_assert_eq!(twiddles[0][1], F128::ZERO);
+        debug_assert_eq!(twiddles[0][3], F128::ZERO);
+        debug_assert_eq!(twiddles[0][7], F128::ZERO);
+
+        const ROWS_PER_TILE: usize = 128;
+        let tiles_per_block = sixteenth.div_ceil(ROWS_PER_TILE);
+        let src = msg.as_ptr() as usize;
+        let dst = data.as_mut_ptr() as usize;
+        // Tile-major job order: every block is written from the same compact
+        // message, so grouping `(tile, block)` jobs keeps one ~512 KiB message
+        // window resident in L2 while all `num_blocks` blocks read it.
+        // Block-major order re-streamed the whole message once per block
+        // (~48 MiB of avoidable DRAM reads at the L1 geometry) through a
+        // cache window already contended by the codeword store bursts.
+        (0..num_blocks * tiles_per_block)
+            .into_par_iter()
+            .for_each(|job| {
+                let tile = job / num_blocks;
+                let block = job % num_blocks;
+                let row_start = tile * ROWS_PER_TILE;
+                let row_end = (row_start + ROWS_PER_TILE).min(sixteenth);
+                // SAFETY: each `(block, tile)` job owns all sixteen destination
+                // rows for one disjoint row interval. `msg` is immutable and
+                // has one complete layer-start block; every derived address
+                // is in the validated source/destination geometry.
+                unsafe {
+                    let dst_block = (dst as *mut F128).add(block * block_elems);
+                    for row in row_start..row_end {
+                        if block == 0 {
+                            kernels::butterfly_fused_4layer_zero_root_from_src_row(
+                                src as *const F128,
+                                dst_block,
+                                sixteenth,
+                                num_ntts,
+                                row,
+                                &twiddles[block],
+                            );
+                        } else {
+                            kernels::butterfly_fused_4layer_from_src_row(
+                                src as *const F128,
+                                dst_block,
+                                sixteenth,
+                                num_ntts,
+                                row,
+                                &twiddles[block],
+                            );
+                        }
+                    }
+                }
+            });
+
+        self.forward_transform_interleaved_from_layer(
+            data,
+            num_ntts,
+            start_layer + 4,
+        );
+    }
+
     /// Ranked L0 top passes with the layer-1 pass fused from the message:
     /// both rate-1/2 replica blocks' layer-1..3 butterflies are evaluated
     /// straight from `msg` (`replicate_message_fill` is exactly the
