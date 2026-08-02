@@ -666,8 +666,6 @@ fn precompute_round1_ab_inner_packed_padded_with_flavor(
     padding: &PaddingSpec,
     nt: bool,
 ) -> Round1AbInner {
-    use rayon::prelude::*;
-
     assert_eq!(k_skip, K_SKIP, "optimized variant is k_skip=6 only");
     assert!(
         m >= k_skip + N_INNER,
@@ -681,32 +679,331 @@ fn precompute_round1_ab_inner_packed_padded_with_flavor(
     assert_eq!(total_bytes % core::mem::size_of::<F128>(), 0);
 
     let (within_outer_mask, b_med_counts) = build_b_med_counts(padding);
-    // The BLAKE3 R1CS has two 8192-bit windows per 16384-bit block. Besides
-    // the full all-ones B rows at b_med 0/1 and the single-K0 tail, two mixed
-    // rows have fixed one-valued K subsets: K0..1 at first-window b_med 2 and
-    // K4..7 at second-window b_med 13. Restrict runtime sniffing to these five
-    // candidates; every other block enters the generic kernel directly.
-    let blake3_static_layout = padding.k_log == 14 && padding.useful_bits_per_block == 15_409;
-    let static_b_context = kernels::prepare_static_b_context(inv_table, blake3_static_layout);
-    const OUTER_BYTES: usize = (1 << N_MEDIUM) * 64;
-    debug_assert_eq!(OUTER_BYTES, (1 << N_INNER) * N_CHUNKS);
+    let ctx = AbCpuCtx::new(
+        a_packed,
+        b_packed,
+        inv_table,
+        padding,
+        &b_med_counts,
+        within_outer_mask,
+        nt,
+    );
 
     // Reuse an A-sized resident F128 allocation from the prover scratch pool.
     // Treating it as bytes is valid because every byte is written below before
     // the storage is read (including explicit zero writes for padding holes).
-    let mut storage = crate::scratch::take_f128(total_bytes / core::mem::size_of::<F128>());
-    let out_bytes: &mut [u8] =
-        unsafe { core::slice::from_raw_parts_mut(storage.as_mut_ptr() as *mut u8, total_bytes) };
+    //
+    // The allocation is OWNER-EXCLUSIVE. The GPU arm below keeps a
+    // `newBufferWithBytesNoCopy` view of it for the life of the process, and at
+    // the ranked m = 32 several other consumers request the identical 512 MiB
+    // size class; a poached allocation would move this buffer's address between
+    // proves and force a fresh 512 MiB wrap — plus its page wiring — inside
+    // every timed prove. With the GPU arm off this is just a pooled buffer that
+    // happens to have a reserved slot: byte-for-byte the incumbent.
+    let mut storage = crate::scratch::take_f128_exclusive(
+        crate::scratch::ExclusiveOwner::AbPrecomputeOut,
+        total_bytes / core::mem::size_of::<F128>(),
+    );
+    let out_ptr = storage.as_mut_ptr().cast::<u8>();
 
-    out_bytes
-        .par_chunks_mut(OUTER_BYTES)
+    // GPU prefix. `None` — kill switch, published share 0, non-ranked shape,
+    // no Metal device, wrap churn, shader/dispatch error — leaves the whole
+    // range to the CPU loop below, which is the untouched incumbent.
+    //
+    // SAFETY: `storage` stays alive at this address for the whole function;
+    // the job owns `[0, outer_hi * OUTER_BYTES)` until it is finished or
+    // dropped, and the CPU loop below writes only past that bound.
+    let job = if ab_buffers_are_owner_exclusive(a_packed, b_packed, out_ptr) {
+        unsafe {
+            crate::gpu_commit::launch_ab_precompute_prefix(&crate::gpu_commit::AbShape {
+                a_packed,
+                b_packed,
+                out_ptr,
+                out_len: total_bytes,
+                table_image: inv_table.table_image_bytes(),
+                within_outer_mask,
+                b_med_counts: &b_med_counts,
+            })
+        }
+    } else {
+        None
+    };
+    let gpu_bytes = job.as_ref().map_or(0, |j| j.outer_hi()) * AB_OUTER_BYTES;
+
+    // CPU suffix: the incumbent kernel over the chunks the GPU did not take.
+    //
+    // SAFETY: disjoint from the GPU's `[0, gpu_bytes)` prefix, in bounds of
+    // `storage`, and the only live reference to that range.
+    let (cpu_suffix_ms, n_cpu_chunks) = {
+        let suffix = unsafe {
+            core::slice::from_raw_parts_mut(out_ptr.add(gpu_bytes), total_bytes - gpu_bytes)
+        };
+        let n = suffix.len() / AB_OUTER_BYTES;
+        let t = std::time::Instant::now();
+        ab_chunks_cpu(suffix, gpu_bytes / AB_OUTER_BYTES, &ctx);
+        (t.elapsed().as_secs_f64() * 1e3, n)
+    };
+
+    if let Some(job) = job
+        && let Err(e) = job.finish(cpu_suffix_ms, n_cpu_chunks)
+    {
+        // Mid-flight GPU failure. Redo the prefix on the CPU, exactly; the arm
+        // has already latched itself off for the rest of the process.
+        if crate::gpu_commit::gpu_ab_precompute_debug() {
+            eprintln!("[gpu-ab] prefix drain failed, recomputing on the CPU: {e}");
+        }
+        // SAFETY: the command buffer completed, so nothing else names this
+        // range; it is in bounds of `storage`.
+        let prefix = unsafe { core::slice::from_raw_parts_mut(out_ptr, gpu_bytes) };
+        ab_chunks_cpu(prefix, 0, &ctx);
+    }
+
+    Round1AbInner { storage }
+}
+
+/// Whether all three buffers of this call are the owner-exclusive allocations
+/// the GPU arm's no-copy views name.
+///
+/// The ranked prover runs the AB precompute more than once per prove: the
+/// post-join exact-contention tuner replays it (17 times on a warmup-latch
+/// cache miss) while the join's own `Round1AbInner` is still alive, so the
+/// replay is handed an ORDINARY pooled buffer at a different address. That is
+/// not wrap churn — it is a second, concurrent user — and treating it as churn
+/// would latch the arm off on every process whose warmup cache missed. Replays
+/// simply run the incumbent.
+fn ab_buffers_are_owner_exclusive(a_packed: &[u8], b_packed: &[u8], out_ptr: *const u8) -> bool {
+    use crate::scratch::{ExclusiveOwner, is_exclusive_allocation};
+    is_exclusive_allocation(ExclusiveOwner::AbPrecomputeOut, out_ptr as usize)
+        && is_exclusive_allocation(ExclusiveOwner::AbPrecomputeA, a_packed.as_ptr() as usize)
+        && is_exclusive_allocation(ExclusiveOwner::AbPrecomputeB, b_packed.as_ptr() as usize)
+}
+
+/// Bytes one `x_outer` chunk of A, B and the transform each occupy.
+const AB_OUTER_BYTES: usize = (1 << N_MEDIUM) * 64;
+
+/// Close the AB-precompute GPU arm's per-host warmup, once per process.
+///
+/// Call this AFTER the commit `rayon::join` returns, with the two arms' walls.
+/// Post-join is load-bearing: the gate's whole input is
+/// `ab_arm_ms - commit_arm_ms`, the measured GPU slack in that window, and a
+/// calibration dispatch running INSIDE the window would inflate both walls by
+/// a contention-dependent amount — corrupting exactly the measurement it
+/// exists to serve. Afterwards the commit graph is finished, so the kernel is
+/// priced on an idle GPU and neither arm wall is disturbed.
+///
+/// What it does, in order:
+/// 1. checksum the CPU-authoritative transform,
+/// 2. run the GPU over the FULL range — this wires every page of all three
+///    512 MiB no-copy wraps in the untimed warmup prove, so a later timed
+///    prove at any share pays no wiring, and prices the kernel at steady
+///    clock via back-to-back replays,
+/// 3. checksum what the GPU wrote,
+/// 4. **unconditionally** recompute the whole range with the incumbent, so
+///    `inner` holds authoritative bytes whatever the GPU did,
+/// 5. latch the arm off if the two checksums disagree,
+/// 6. publish the share the rest of the process runs at.
+///
+/// Step 4 is why step 2 may safely clobber a live `Round1AbInner`: the arm
+/// never depends on the calibration's output bytes. Step 5 is defence in
+/// depth on top of the byte-exact oracles in the test suite.
+pub fn calibrate_round1_ab_gpu_arm(
+    inner: &mut Round1AbInner,
+    a_packed: &[u8],
+    b_packed: &[u8],
+    m: usize,
+    k_skip: usize,
+    inv_table: &InvNttTableByteSingleGf8,
+    padding: &PaddingSpec,
+    commit_arm_ms: f64,
+    ab_arm_ms: f64,
+) {
+    if !crate::gpu_commit::gpu_ab_precompute_enabled()
+        || crate::gpu_commit::ab_calibration_done()
+        || k_skip != K_SKIP
+        || m < k_skip + N_INNER
+    {
+        return;
+    }
+    let total_bytes = (1usize << m) / 8;
+    if inner.len_bytes() != total_bytes
+        || a_packed.len() != total_bytes
+        || b_packed.len() != total_bytes
+    {
+        return;
+    }
+
+    let (within_outer_mask, b_med_counts) = build_b_med_counts(padding);
+    let out_ptr = inner.storage.as_mut_ptr().cast::<u8>();
+    let shape = crate::gpu_commit::AbShape {
+        a_packed,
+        b_packed,
+        out_ptr,
+        out_len: total_bytes,
+        table_image: inv_table.table_image_bytes(),
+        within_outer_mask,
+        b_med_counts: &b_med_counts,
+    };
+    let n_outer = total_bytes / AB_OUTER_BYTES;
+    // Settle the arm at 0 without paying for a measurement that cannot change
+    // the answer: either there is no kernel for this geometry, or the commit
+    // arm is so far ahead of the AB arm that no share could shorten the
+    // window. Skipping here avoids a full-range dispatch, its replays, two
+    // checksums, a full CPU restore pass, and 1.5 GiB of page wiring — which
+    // is the whole cost of the arm on a host that will never use it.
+    if !crate::gpu_commit::ab_shape_supported(&shape)
+        || !ab_buffers_are_owner_exclusive(a_packed, b_packed, out_ptr)
+        || crate::gpu_commit::ab_slack_is_hopeless(commit_arm_ms, ab_arm_ms)
+    {
+        crate::gpu_commit::publish_ab_share(crate::gpu_commit::AbGateSample {
+            commit_arm_ms,
+            ab_arm_ms,
+            gpu_full_ms: 0.0,
+            n_outer,
+        });
+        return;
+    }
+
+    // SAFETY: `inner` is borrowed mutably for the whole call, so nothing else
+    // reads or writes the transform while the dispatch runs; the wrap names
+    // exactly the storage that `inner` owns.
+    let before = ab_checksum(inner.as_bytes());
+    let gpu_full_ms = unsafe { crate::gpu_commit::calibrate_ab_precompute(&shape) };
+    let after = ab_checksum(inner.as_bytes());
+
+    // Authoritative restore — runs whatever the dispatch did.
+    {
+        let ctx = AbCpuCtx::new(
+            a_packed,
+            b_packed,
+            inv_table,
+            padding,
+            &b_med_counts,
+            within_outer_mask,
+            ab_pre_nt_enabled(),
+        );
+        // SAFETY: exclusive borrow of `inner`; in bounds of its storage.
+        let all = unsafe { core::slice::from_raw_parts_mut(out_ptr, total_bytes) };
+        ab_chunks_cpu(all, 0, &ctx);
+    }
+    debug_assert_eq!(ab_checksum(inner.as_bytes()), before, "restore must be exact");
+
+    if gpu_full_ms.is_some() && after != before {
+        crate::gpu_commit::ab_latch_off(
+            "calibration checksum mismatch: GPU transform is not bit-exact on this host",
+        );
+    }
+    crate::gpu_commit::publish_ab_share(crate::gpu_commit::AbGateSample {
+        commit_arm_ms,
+        ab_arm_ms,
+        gpu_full_ms: gpu_full_ms.unwrap_or(0.0),
+        n_outer,
+    });
+}
+
+/// Order-sensitive parallel checksum of the transform. Cheap enough
+/// (memory-bound) to run twice in the untimed warmup prove, and unlike a
+/// sampled comparison it covers every byte.
+fn ab_checksum(bytes: &[u8]) -> u64 {
+    use rayon::prelude::*;
+    bytes
+        .par_chunks(1 << 20)
+        .enumerate()
+        .map(|(i, chunk)| {
+            let mut h =
+                0xcbf2_9ce4_8422_2325u64 ^ (i as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+            let (words, tail) = chunk.as_chunks::<8>();
+            for w in words {
+                h ^= u64::from_le_bytes(*w);
+                h = h.wrapping_mul(0x0000_0100_0000_01b3);
+                h ^= h >> 29;
+            }
+            for &b in tail {
+                h = (h ^ u64::from(b)).wrapping_mul(0x0000_0100_0000_01b3);
+            }
+            h
+        })
+        .reduce(|| 0u64, |a, b| a ^ b)
+}
+
+/// Everything the incumbent per-chunk kernel needs that does not vary with the
+/// chunk. Extracted so the GPU arm's CPU suffix, its exact-recompute fallback
+/// and the calibration restore all run the SAME code as the incumbent.
+#[derive(Clone, Copy)]
+struct AbCpuCtx<'a> {
+    a_packed: &'a [u8],
+    b_packed: &'a [u8],
+    inv_table: &'a InvNttTableByteSingleGf8,
+    within_outer_mask: usize,
+    b_med_counts: &'a [u8],
+    blake3_static_layout: bool,
+    static_b_context: Option<kernels::StaticBContext>,
+    nt: bool,
+}
+
+impl<'a> AbCpuCtx<'a> {
+    fn new(
+        a_packed: &'a [u8],
+        b_packed: &'a [u8],
+        inv_table: &'a InvNttTableByteSingleGf8,
+        padding: &PaddingSpec,
+        b_med_counts: &'a [u8],
+        within_outer_mask: usize,
+        nt: bool,
+    ) -> Self {
+        // The BLAKE3 R1CS has two 8192-bit windows per 16384-bit block. Besides
+        // the full all-ones B rows at b_med 0/1 and the single-K0 tail, two
+        // mixed rows have fixed one-valued K subsets: K0..1 at first-window
+        // b_med 2 and K4..7 at second-window b_med 13. Restrict runtime
+        // sniffing to these five candidates; every other block enters the
+        // generic kernel directly.
+        let blake3_static_layout =
+            padding.k_log == 14 && padding.useful_bits_per_block == 15_409;
+        Self {
+            a_packed,
+            b_packed,
+            inv_table,
+            within_outer_mask,
+            b_med_counts,
+            blake3_static_layout,
+            static_b_context: kernels::prepare_static_b_context(inv_table, blake3_static_layout),
+            nt,
+        }
+    }
+}
+
+/// The incumbent AB transform over `out_region`, whose first 1 KiB chunk is
+/// `x_outer_base`. Byte-for-byte the loop that shipped before the GPU arm; the
+/// only change is that the absolute chunk index is an explicit base rather
+/// than the enumerate index, so a suffix can be computed on its own.
+fn ab_chunks_cpu(out_region: &mut [u8], x_outer_base: usize, ctx: &AbCpuCtx<'_>) {
+    use rayon::prelude::*;
+    debug_assert_eq!(out_region.len() % AB_OUTER_BYTES, 0);
+
+    // Destructure into locals so the worker closure captures values, exactly
+    // as the pre-arm loop captured them from its enclosing scope. Reading the
+    // invariants through `&ctx` inside the hot loop measured ~0.3% slower on
+    // the ranked shape — small, but on the target this arm IS the window tail.
+    let AbCpuCtx {
+        a_packed,
+        b_packed,
+        inv_table,
+        within_outer_mask,
+        b_med_counts,
+        blake3_static_layout,
+        static_b_context,
+        nt,
+    } = *ctx;
+
+    out_region
+        .par_chunks_mut(AB_OUTER_BYTES)
         .enumerate()
         .for_each_init(
             || ([F8::ZERO; ELL], [F8::ZERO; ELL]),
-            |(a_col, b_col), (x_outer, out_outer)| {
+            |(a_col, b_col), (i, out_outer)| {
+                let x_outer = x_outer_base + i;
                 let within_hash_outer = x_outer & within_outer_mask;
                 let n_b_med = b_med_counts[within_hash_outer] as usize;
-                let chunk_byte_base = x_outer * OUTER_BYTES;
+                let chunk_byte_base = x_outer * AB_OUTER_BYTES;
 
                 // NT arm: the kernel writes a stack temporary and the 64-byte
                 // block drains to the big buffer with `stnp` (write-once
@@ -731,7 +1028,8 @@ fn precompute_round1_ab_inner_packed_padded_with_flavor(
                         a_col,
                         b_col,
                         !blake3_static_layout || (within_hash_outer == 0 && b_med < 2),
-                        !blake3_static_layout || (within_hash_outer == 1 && b_med + 1 == n_b_med),
+                        !blake3_static_layout
+                            || (within_hash_outer == 1 && b_med + 1 == n_b_med),
                         if blake3_static_layout && within_hash_outer == 0 && b_med == 2 {
                             0x03
                         } else if blake3_static_layout
@@ -750,8 +1048,8 @@ fn precompute_round1_ab_inner_packed_padded_with_flavor(
                         static_b_context,
                     );
                     if nt {
-                        // SAFETY: `b_med < n_b_med ≤ OUTER_BYTES / 64`, so the
-                        // 64 destination bytes are in-bounds of `out_outer`.
+                        // SAFETY: `b_med < n_b_med ≤ AB_OUTER_BYTES / 64`, so
+                        // the 64 destination bytes are in-bounds of `out_outer`.
                         unsafe {
                             store_nt_64(tmp.as_ptr(), out_outer.as_mut_ptr().add(b_med * 64))
                         };
@@ -770,8 +1068,6 @@ fn precompute_round1_ab_inner_packed_padded_with_flavor(
                 }
             },
         );
-
-    Round1AbInner { storage }
 }
 
 // ---------------------------------------------------------------------------
@@ -5007,6 +5303,663 @@ mod tests {
             assert_eq!(
                 fold4_from_8, incumbent.4,
                 "fold8 → fold4 reduction mismatch in case {case}"
+            );
+        }
+    }
+}
+
+/// Byte-exact oracles for the AB-precompute GPU arm.
+///
+/// The oracle is the UNTOUCHED incumbent: `precompute_round1_ab_inner_packed_
+/// padded` with the arm's published share at 0, which is bit-for-bit the
+/// pre-arm code path (including its NEON static-B fast paths). Every test here
+/// asserts full byte equality of the 512-bit-per-chunk transform, not a
+/// checksum.
+#[cfg(all(test, target_os = "macos", target_arch = "aarch64"))]
+mod gpu_ab_precompute_tests {
+    use super::*;
+    use crate::ntt::InvNttTableByteSingleGf8;
+
+    const PAGE: usize = 16384;
+
+    /// Every test here mutates the arm's process-global state (wrap cache,
+    /// published share, churn latch). `cargo test` runs them on parallel
+    /// threads in ONE process, so they serialize and reset: a leaked non-zero
+    /// share would make another test's "untouched incumbent" oracle silently
+    /// run on the GPU.
+    static ARM_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    struct ArmGuard(#[allow(dead_code)] std::sync::MutexGuard<'static, ()>);
+
+    impl ArmGuard {
+        fn new() -> Self {
+            let g = ARM_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            crate::gpu_commit::ab_reset_for_test();
+            Self(g)
+        }
+    }
+
+    impl Drop for ArmGuard {
+        fn drop(&mut self) {
+            // Order matters: release the Metal views BEFORE dropping the
+            // exclusive registration they name.
+            crate::gpu_commit::ab_reset_for_test();
+            crate::scratch::clear_exclusive_for_tests();
+        }
+    }
+
+    /// Page-aligned scratch: `newBufferWithBytesNoCopy` refuses anything else,
+    /// and the production buffers get this for free from the large-allocation
+    /// path (pinned by `scratch::ranked_ab_f128_class_is_wrappable_without_a_copy`).
+    struct Aligned {
+        raw: Vec<u8>,
+        off: usize,
+        len: usize,
+    }
+
+    impl Aligned {
+        fn new(len: usize) -> Self {
+            assert_eq!(len % PAGE, 0, "wrap length must be a page multiple");
+            let raw = vec![0u8; len + PAGE];
+            let off = (PAGE - (raw.as_ptr() as usize % PAGE)) % PAGE;
+            Self { raw, off, len }
+        }
+        fn s(&self) -> &[u8] {
+            &self.raw[self.off..self.off + self.len]
+        }
+        fn m(&mut self) -> &mut [u8] {
+            &mut self.raw[self.off..self.off + self.len]
+        }
+        fn ptr(&mut self) -> *mut u8 {
+            // SAFETY: `off + len <= raw.len()` by construction.
+            unsafe { self.raw.as_mut_ptr().add(self.off) }
+        }
+    }
+
+    fn fill_pseudorandom(buf: &mut [u8], seed: u64) {
+        use rayon::prelude::*;
+        // Per-block seeding keeps this deterministic while letting the ranked
+        // shape's 512 MiB fill run on every core.
+        buf.par_chunks_mut(1 << 16).enumerate().for_each(|(i, blk)| {
+            let mut x = (seed | 1) ^ (i as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+            for chunk in blk.chunks_mut(8) {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                let bytes = x.to_le_bytes();
+                chunk.copy_from_slice(&bytes[..chunk.len()]);
+            }
+        });
+    }
+
+    /// The untouched incumbent transform, as a plain byte vector.
+    ///
+    /// Taken through the real entry point so the oracle exercises the shipped
+    /// NEON kernel and its static-B specializations. The arm cannot engage
+    /// here: its published share starts at the "not calibrated" sentinel,
+    /// which `ab_share_for` maps to 0.
+    fn incumbent(
+        a: &[u8],
+        b: &[u8],
+        m: usize,
+        table: &InvNttTableByteSingleGf8,
+        padding: &PaddingSpec,
+    ) -> Vec<u8> {
+        let inner = precompute_round1_ab_inner_packed_padded(a, b, m, K_SKIP, table, padding);
+        let out = inner.as_bytes().to_vec();
+        drop(inner);
+        out
+    }
+
+    /// `pct` of the chunks on the GPU, the rest on the incumbent CPU kernel —
+    /// the exact production composition, driven through the test seam so one
+    /// process can sweep many fractions.
+    fn hybrid(
+        a: &mut Aligned,
+        b: &mut Aligned,
+        m: usize,
+        table: &InvNttTableByteSingleGf8,
+        padding: &PaddingSpec,
+        pct: usize,
+    ) -> Aligned {
+        let total = (1usize << m) / 8;
+        let n_outer = total / AB_OUTER_BYTES;
+        let g = n_outer * pct / 100;
+        let (within_outer_mask, b_med_counts) = build_b_med_counts(padding);
+
+        let mut out = Aligned::new(total);
+        // Poison every byte so a chunk the split forgets to cover cannot pass
+        // by accidentally holding a correct zero.
+        out.m().fill(0xA5);
+
+        // Checksums rather than copies: the ranked shape's A and B are
+        // 512 MiB each.
+        let (a_sum, b_sum) = (ab_checksum(a.s()), ab_checksum(b.s()));
+        let shape = crate::gpu_commit::AbShape {
+            a_packed: unsafe { core::slice::from_raw_parts(a.ptr(), total) },
+            b_packed: unsafe { core::slice::from_raw_parts(b.ptr(), total) },
+            out_ptr: out.ptr(),
+            out_len: total,
+            table_image: table.table_image_bytes(),
+            within_outer_mask,
+            b_med_counts: &b_med_counts,
+        };
+        // SAFETY: `out` outlives the synchronous dispatch and nothing else
+        // names `[0, g)` while it runs.
+        let gpu_ms = unsafe { crate::gpu_commit::ab_gpu_range_for_test(&shape, 0, g) }
+            .expect("GPU AB range dispatch");
+        if std::env::var_os("FLOCK_AB_GPU_DEBUG").is_some() {
+            eprintln!(
+                "[ab-test] m={m} pct={pct} gpu={g}/{n_outer} chunks wall={gpu_ms:.2} ms"
+            );
+        }
+        assert_eq!(ab_checksum(a.s()), a_sum, "kernel must not disturb A");
+        assert_eq!(ab_checksum(b.s()), b_sum, "kernel must not disturb B");
+
+        let ctx = AbCpuCtx::new(
+            a.s(),
+            b.s(),
+            table,
+            padding,
+            &b_med_counts,
+            within_outer_mask,
+            ab_pre_nt_enabled(),
+        );
+        ab_chunks_cpu(&mut out.m()[g * AB_OUTER_BYTES..], g, &ctx);
+        out
+    }
+
+    fn shapes() -> Vec<(usize, PaddingSpec, &'static str)> {
+        vec![
+            // Smaller shapes, dense and padded, including the k_log = 14 /
+            // 15_409 layout that selects the BLAKE3 static-B fast paths in the
+            // CPU kernel — the GPU runs the generic algebra, so this is where
+            // the two would diverge if those paths were not equivalent.
+            (18, PaddingSpec::dense(18), "m18 dense"),
+            (
+                18,
+                PaddingSpec {
+                    k_log: 14,
+                    useful_bits_per_block: 15_409,
+                },
+                "m18 blake3-padded",
+            ),
+            (
+                18,
+                PaddingSpec {
+                    k_log: 14,
+                    useful_bits_per_block: 8_193,
+                },
+                "m18 padded (b_med boundary)",
+            ),
+            (20, PaddingSpec::dense(20), "m20 dense"),
+            (
+                20,
+                PaddingSpec {
+                    k_log: 15,
+                    useful_bits_per_block: 15_409,
+                },
+                "m20 padded k_log15",
+            ),
+            (
+                22,
+                PaddingSpec {
+                    k_log: 14,
+                    useful_bits_per_block: 15_409,
+                },
+                "m22 blake3-padded",
+            ),
+        ]
+    }
+
+    #[test]
+    fn hybrid_split_is_byte_exact_across_shapes_paddings_and_fractions() {
+        let _arm = ArmGuard::new();
+        let table = InvNttTableByteSingleGf8::cached_standard_k6();
+        for (m, padding, name) in shapes() {
+            let total = (1usize << m) / 8;
+            let mut a = Aligned::new(total);
+            let mut b = Aligned::new(total);
+            fill_pseudorandom(a.m(), 0x5EED_0001 ^ m as u64);
+            fill_pseudorandom(b.m(), 0xB0B0_0002 ^ (m as u64) << 7);
+
+            let want = incumbent(a.s(), b.s(), m, table, &padding);
+            for pct in [100usize, 45, 1, 50, 99, 7] {
+                let got = hybrid(&mut a, &mut b, m, table, &padding, pct);
+                let got = got.s();
+                assert_eq!(
+                    got.len(),
+                    want.len(),
+                    "{name} pct={pct}: length changed"
+                );
+                if got != want {
+                    let at = got
+                        .iter()
+                        .zip(&want)
+                        .position(|(x, y)| x != y)
+                        .expect("difference exists");
+                    panic!(
+                        "{name} pct={pct}: first mismatch at byte {at} \
+                         (chunk {}, b_med {}, lane {}): got {:#04x} want {:#04x}",
+                        at / AB_OUTER_BYTES,
+                        (at % AB_OUTER_BYTES) / 64,
+                        at % 64,
+                        got[at],
+                        want[at],
+                    );
+                }
+            }
+        }
+    }
+
+    /// **The ranked shape.** m = 32 with the BLAKE3 padding (`k_log = 14`,
+    /// `useful_bits_per_block = 15_409`): a 512 MiB transform over 1 GiB of
+    /// packed A/B, i.e. the exact geometry the arm ships for, including the
+    /// static-B specializations the CPU kernel takes on that layout and the
+    /// GPU does not. ~2.5 GiB resident; the sibling GPU arms carry ranked
+    /// tests of the same weight.
+    #[test]
+    fn hybrid_split_is_byte_exact_at_the_ranked_shape() {
+        let _arm = ArmGuard::new();
+        let table = InvNttTableByteSingleGf8::cached_standard_k6();
+        let m = 32usize;
+        let padding = PaddingSpec {
+            k_log: 14,
+            useful_bits_per_block: 15_409,
+        };
+        let total = (1usize << m) / 8;
+        let mut a = Aligned::new(total);
+        let mut b = Aligned::new(total);
+        fill_pseudorandom(a.m(), 0x5EED_0032);
+        fill_pseudorandom(b.m(), 0xB0B0_0032);
+
+        let want = incumbent(a.s(), b.s(), m, table, &padding);
+        let n_outer = total / AB_OUTER_BYTES;
+        assert_eq!(n_outer, 1 << 19, "ranked chunk count");
+        for pct in [100usize, 45, 1] {
+            let got = hybrid(&mut a, &mut b, m, table, &padding, pct);
+            let got = got.s();
+            if got != want {
+                let at = got
+                    .iter()
+                    .zip(&want)
+                    .position(|(x, y)| x != y)
+                    .expect("difference exists");
+                panic!(
+                    "ranked pct={pct}: first mismatch at byte {at} \
+                     (chunk {} of {n_outer}, b_med {}, lane {}): got {:#04x} want {:#04x}",
+                    at / AB_OUTER_BYTES,
+                    (at % AB_OUTER_BYTES) / 64,
+                    at % 64,
+                    got[at],
+                    want[at],
+                );
+            }
+        }
+    }
+
+    /// A 0% share must leave the CPU with the entire range — the arm's
+    /// "decline" state has to be a real no-op, not a silently skipped prefix.
+    #[test]
+    fn zero_share_declines_and_leaves_the_whole_range_to_the_cpu() {
+        let _arm = ArmGuard::new();
+        let table = InvNttTableByteSingleGf8::cached_standard_k6();
+        let m = 20;
+        let padding = PaddingSpec::dense(m);
+        let total = (1usize << m) / 8;
+        let mut a = Aligned::new(total);
+        let mut b = Aligned::new(total);
+        fill_pseudorandom(a.m(), 0xDEC1_11E0);
+        fill_pseudorandom(b.m(), 0x0FF0_0FF0);
+
+        let want = incumbent(a.s(), b.s(), m, table, &padding);
+        let got = hybrid(&mut a, &mut b, m, table, &padding, 0);
+        assert_eq!(got.s(), &want[..], "a declined dispatch must be the exact incumbent");
+    }
+
+    /// Negative control: the oracle above is only meaningful if a single
+    /// perturbed input byte actually changes the GPU output. Without this a
+    /// kernel that wrote nothing (or wrote the CPU's own bytes) would pass.
+    #[test]
+    fn poisoned_input_diverges() {
+        let _arm = ArmGuard::new();
+        let table = InvNttTableByteSingleGf8::cached_standard_k6();
+        let m = 18;
+        let padding = PaddingSpec::dense(m);
+        let total = (1usize << m) / 8;
+        let mut a = Aligned::new(total);
+        let mut b = Aligned::new(total);
+        fill_pseudorandom(a.m(), 0x0501_5011);
+        fill_pseudorandom(b.m(), 0x1234_5678);
+
+        let clean = ab_checksum(hybrid(&mut a, &mut b, m, table, &padding, 100).s());
+
+        // Flip one bit of A inside the FIRST chunk, which the 100% GPU split
+        // owns, and one inside a later chunk.
+        for poison_at in [3usize, 5 * AB_OUTER_BYTES + 17] {
+            let mut a2 = Aligned::new(total);
+            a2.m().copy_from_slice(a.s());
+            a2.m()[poison_at] ^= 0x01;
+            let dirty = ab_checksum(hybrid(&mut a2, &mut b, m, table, &padding, 100).s());
+            assert_ne!(
+                dirty, clean,
+                "poisoning A byte {poison_at} did not change the GPU transform"
+            );
+        }
+        // ...and the same through B.
+        let mut b2 = Aligned::new(total);
+        b2.m().copy_from_slice(b.s());
+        b2.m()[9] ^= 0x80;
+        assert_ne!(
+            ab_checksum(hybrid(&mut a, &mut b2, m, table, &padding, 100).s()),
+            clean
+        );
+    }
+
+    /// **The −16.95% regression, as a test.**
+    ///
+    /// That arm was rejected because a same-size-class consumer poached the
+    /// pooled allocation between proves, so a fresh 512 MiB
+    /// `newBufferWithBytesNoCopy` — and its page wiring — was built inside
+    /// every timed prove. `scratch::take_f128_exclusive` now prevents the
+    /// poaching; this asserts the second line of defence, for the case where
+    /// something else moves an address anyway:
+    ///
+    /// * the dispatch is declined BEFORE any wrap is created, so no wiring
+    ///   cost is paid inside the prove that noticed;
+    /// * `wraps_after_warmup` stays at 0 — the counter that would have caught
+    ///   the original bug;
+    /// * the arm latches off permanently, so it cannot churn once per prove
+    ///   for the rest of the process.
+    #[test]
+    fn wrap_churn_declines_before_wiring_and_latches_off() {
+        let _arm = ArmGuard::new();
+        let table = InvNttTableByteSingleGf8::cached_standard_k6();
+        let m = 20usize;
+        let padding = PaddingSpec::dense(m);
+        let total = (1usize << m) / 8;
+        let n_outer = total / AB_OUTER_BYTES;
+        let (within_outer_mask, b_med_counts) = build_b_med_counts(&padding);
+
+        let mut a = Aligned::new(total);
+        let mut b = Aligned::new(total);
+        let mut out = Aligned::new(total);
+        fill_pseudorandom(a.m(), 0xC0FF_EE01);
+        fill_pseudorandom(b.m(), 0xC0FF_EE02);
+
+        let mk = |a: &mut Aligned, b: &mut Aligned, out: &mut Aligned| {
+            // SAFETY: the returned shape is used only while all three
+            // `Aligned` buffers are alive and untouched by anything else.
+            crate::gpu_commit::AbShape {
+                a_packed: unsafe { core::slice::from_raw_parts(a.ptr(), total) },
+                b_packed: unsafe { core::slice::from_raw_parts(b.ptr(), total) },
+                out_ptr: out.ptr(),
+                out_len: total,
+                table_image: table.table_image_bytes(),
+                within_outer_mask,
+                b_med_counts: &b_med_counts,
+            }
+        };
+
+        // Warmup: the calibration creates all three wraps, once.
+        let warm = mk(&mut a, &mut b, &mut out);
+        unsafe { crate::gpu_commit::ab_gpu_range_for_test(&warm, 0, n_outer) }
+            .expect("warmup dispatch");
+        drop(warm);
+        let after_warmup = crate::gpu_commit::ab_precompute_stats();
+        assert_eq!(after_warmup.wraps_warmup, 3, "one wrap per role in warmup");
+        assert_eq!(after_warmup.wraps_after_warmup, 0);
+
+        // Enter the timed-prove regime at a real share.
+        crate::gpu_commit::ab_force_calibrated_share_for_test(n_outer / 4);
+
+        // Same three allocations: the arm runs, creating nothing.
+        {
+            let same = mk(&mut a, &mut b, &mut out);
+            // SAFETY: `out` outlives the job, which is finished below.
+            let job = unsafe { crate::gpu_commit::launch_ab_precompute_prefix(&same) }
+                .expect("cached wraps must not decline");
+            assert_eq!(job.outer_hi(), n_outer / 4);
+            job.finish(1.0, n_outer - n_outer / 4).expect("dispatch");
+        }
+        let steady = crate::gpu_commit::ab_precompute_stats();
+        assert_eq!(steady.submits, 1);
+        assert_eq!(steady.declines, 0);
+        assert_eq!(
+            steady.wraps_after_warmup, 0,
+            "a steady-state prove must create no wrap"
+        );
+        assert!(!steady.latched_off);
+
+        // Now poach: the output lands at a different address, exactly as a
+        // same-size-class consumer stealing the pooled buffer would cause.
+        let mut poached = Aligned::new(total);
+        assert_ne!(poached.ptr(), out.ptr());
+        {
+            let moved = mk(&mut a, &mut b, &mut poached);
+            // SAFETY: the call declines without touching the buffer.
+            let job = unsafe { crate::gpu_commit::launch_ab_precompute_prefix(&moved) };
+            assert!(job.is_none(), "a moved allocation must decline the dispatch");
+        }
+        let churn = crate::gpu_commit::ab_precompute_stats();
+        assert_eq!(churn.declines, 1, "the decline must be counted");
+        assert_eq!(
+            churn.wraps_after_warmup, 0,
+            "DECLINED BEFORE WIRING: no wrap may be built in a timed prove"
+        );
+        assert!(churn.latched_off, "churn must latch the arm off");
+
+        // Latched off is permanent: even the original, still-cached addresses
+        // no longer engage.
+        {
+            let same_again = mk(&mut a, &mut b, &mut out);
+            let job = unsafe { crate::gpu_commit::launch_ab_precompute_prefix(&same_again) };
+            assert!(job.is_none(), "the latch must be permanent");
+        }
+        assert_eq!(crate::gpu_commit::ab_precompute_stats().submits, 1);
+    }
+
+    /// End-to-end warmup calibration at the ranked shape, driven with
+    /// SYNTHETIC arm walls.
+    ///
+    /// This is the only way to exercise the engaged path on a host whose real
+    /// commit window has no GPU slack. It covers what the pure gate test
+    /// cannot: that the calibration prices the kernel, that its full-range
+    /// dispatch over a LIVE `Round1AbInner` is undone exactly by the restore
+    /// pass, that the checksum comparison agrees (so the arm is not latched
+    /// off), and that a target-like slack publishes a usable share.
+    #[test]
+    fn ranked_calibration_prices_restores_and_publishes() {
+        use crate::scratch::{ExclusiveOwner, give_f128, take_f128_exclusive};
+        let _arm = ArmGuard::new();
+        crate::scratch::clear_exclusive_for_tests();
+        let table = InvNttTableByteSingleGf8::cached_standard_k6();
+        let m = 32usize;
+        let padding = PaddingSpec {
+            k_log: 14,
+            useful_bits_per_block: 15_409,
+        };
+        let total = (1usize << m) / 8;
+        let n_f128 = total / core::mem::size_of::<F128>();
+
+        // A and B come from the SAME owner-exclusive slots the prover uses,
+        // so the calibration sees production's exact ownership picture.
+        let mut a = take_f128_exclusive(ExclusiveOwner::AbPrecomputeA, n_f128);
+        let mut b = take_f128_exclusive(ExclusiveOwner::AbPrecomputeB, n_f128);
+        let as_bytes_mut = |v: &mut Vec<F128>| -> &mut [u8] {
+            // SAFETY: F128 has no padding and every bit pattern is valid.
+            unsafe { core::slice::from_raw_parts_mut(v.as_mut_ptr().cast::<u8>(), total) }
+        };
+        fill_pseudorandom(as_bytes_mut(&mut a), 0xCA11_B0A7);
+        fill_pseudorandom(as_bytes_mut(&mut b), 0xCA11_B0A8);
+        // SAFETY: as above, and the borrows below are read-only.
+        let a_bytes: &[u8] = unsafe { core::slice::from_raw_parts(a.as_ptr().cast::<u8>(), total) };
+        let b_bytes: &[u8] = unsafe { core::slice::from_raw_parts(b.as_ptr().cast::<u8>(), total) };
+
+        let mut inner =
+            precompute_round1_ab_inner_packed_padded(a_bytes, b_bytes, m, K_SKIP, table, &padding);
+        let want = ab_checksum(inner.as_bytes());
+
+        // Target-like: the AB arm is the tail of the window by ~4.4 ms.
+        calibrate_round1_ab_gpu_arm(
+            &mut inner, a_bytes, b_bytes, m, K_SKIP, table, &padding, 82.0, 86.41,
+        );
+
+        assert_eq!(
+            ab_checksum(inner.as_bytes()),
+            want,
+            "the calibration dispatch clobbered the transform and the restore \
+             pass did not put it back"
+        );
+        let st = crate::gpu_commit::ab_precompute_stats();
+        assert!(
+            !st.latched_off,
+            "checksum comparison says the GPU transform is not bit-exact here"
+        );
+        assert!(
+            st.gpu_full_ms > 0.0,
+            "the calibration did not price the kernel"
+        );
+        assert!(
+            st.tuned_chunks > 0 && st.tuned_chunks < (1 << 19),
+            "target-like slack must publish a minority share, got {}",
+            st.tuned_chunks
+        );
+        if std::env::var_os("FLOCK_AB_GPU_DEBUG").is_some() {
+            eprintln!(
+                "[ab-test] ranked calibration: gpu_full={:.2} ms -> share {}/{}",
+                st.gpu_full_ms,
+                st.tuned_chunks,
+                1 << 19
+            );
+        }
+
+        // Once per process: a second call, even with different walls, is inert.
+        let before = st.tuned_chunks;
+        calibrate_round1_ab_gpu_arm(
+            &mut inner, a_bytes, b_bytes, m, K_SKIP, table, &padding, 200.0, 1.0,
+        );
+        assert_eq!(
+            crate::gpu_commit::ab_precompute_stats().tuned_chunks,
+            before,
+            "calibration must run exactly once per process"
+        );
+        drop(inner);
+        give_f128(a);
+        give_f128(b);
+    }
+
+    /// Regression: the post-join exact-contention tuner replays the AB
+    /// precompute while the join's own `Round1AbInner` is still alive, so the
+    /// replay is handed an ordinary pooled buffer at a different address.
+    ///
+    /// Caught by the fresh-process wrap trace under
+    /// `FLOCK_NO_WARMUP_LATCH_CACHE=1` (the tuner's cache-miss path, i.e. what
+    /// a fresh runner process actually does): every replay was scored as wrap
+    /// churn and latched the arm off on prove 2 of every process. The replay
+    /// must be recognised as a non-owner and sit the dispatch out instead.
+    #[test]
+    fn tuner_replay_buffers_are_not_owned_and_do_not_look_like_churn() {
+        use crate::scratch::{ExclusiveOwner, give_f128, take_f128_exclusive};
+        let _arm = ArmGuard::new();
+        crate::scratch::clear_exclusive_for_tests();
+        const N: usize = 1 << 12;
+
+        let a = take_f128_exclusive(ExclusiveOwner::AbPrecomputeA, N);
+        let b = take_f128_exclusive(ExclusiveOwner::AbPrecomputeB, N);
+        let owned = take_f128_exclusive(ExclusiveOwner::AbPrecomputeOut, N);
+        let bytes = |v: &Vec<F128>| -> &[u8] {
+            // SAFETY: F128 has no padding and every bit pattern is valid.
+            unsafe {
+                core::slice::from_raw_parts(
+                    v.as_ptr().cast::<u8>(),
+                    std::mem::size_of_val(&v[..]),
+                )
+            }
+        };
+        assert!(ab_buffers_are_owner_exclusive(
+            bytes(&a),
+            bytes(&b),
+            owned.as_ptr().cast::<u8>()
+        ));
+
+        // The tuner's replay, while `owned` is still alive.
+        let replay = take_f128_exclusive(ExclusiveOwner::AbPrecomputeOut, N);
+        assert_ne!(replay.as_ptr(), owned.as_ptr());
+        assert!(
+            !ab_buffers_are_owner_exclusive(
+                bytes(&a),
+                bytes(&b),
+                replay.as_ptr().cast::<u8>()
+            ),
+            "a replay buffer must not be treated as the owner's allocation"
+        );
+
+        give_f128(replay);
+        // ...and the owner still owns its address afterwards.
+        assert!(ab_buffers_are_owner_exclusive(
+            bytes(&a),
+            bytes(&b),
+            owned.as_ptr().cast::<u8>()
+        ));
+        give_f128(owned);
+        give_f128(a);
+        give_f128(b);
+    }
+
+    /// The kill switch and the share override are the controlled-A/B surface;
+    /// both must be able to produce a completely untouched incumbent.
+    #[test]
+    fn declined_arm_produces_the_incumbent_transform() {
+        let _arm = ArmGuard::new();
+        let table = InvNttTableByteSingleGf8::cached_standard_k6();
+        let m = 20usize;
+        let padding = PaddingSpec {
+            k_log: 14,
+            useful_bits_per_block: 15_409,
+        };
+        let total = (1usize << m) / 8;
+        let mut a = Aligned::new(total);
+        let mut b = Aligned::new(total);
+        fill_pseudorandom(a.m(), 0x1111_2222);
+        fill_pseudorandom(b.m(), 0x3333_4444);
+
+        // The published share starts at the "not calibrated" sentinel, which
+        // maps to 0, so this is the shipped default before any warmup.
+        let baseline = incumbent(a.s(), b.s(), m, table, &padding);
+        // Forcing a calibrated share of 0 must be identical.
+        crate::gpu_commit::ab_force_calibrated_share_for_test(0);
+        assert_eq!(incumbent(a.s(), b.s(), m, table, &padding), baseline);
+        // ...and so must a latched-off arm.
+        crate::gpu_commit::ab_latch_off("test");
+        assert_eq!(incumbent(a.s(), b.s(), m, table, &padding), baseline);
+    }
+
+    /// Every split fraction must partition the range exactly: no chunk
+    /// computed twice with different bytes, none left poisoned.
+    #[test]
+    fn split_fractions_partition_the_range_without_gaps_or_overlap() {
+        let _arm = ArmGuard::new();
+        let table = InvNttTableByteSingleGf8::cached_standard_k6();
+        let m = 18;
+        let padding = PaddingSpec {
+            k_log: 14,
+            useful_bits_per_block: 15_409,
+        };
+        let total = (1usize << m) / 8;
+        let mut a = Aligned::new(total);
+        let mut b = Aligned::new(total);
+        fill_pseudorandom(a.m(), 0xA11_5EED);
+        fill_pseudorandom(b.m(), 0xB11_5EED);
+        let want = incumbent(a.s(), b.s(), m, table, &padding);
+        let n_outer = total / AB_OUTER_BYTES;
+        for pct in 0..=100 {
+            let got = hybrid(&mut a, &mut b, m, table, &padding, pct);
+            assert_eq!(
+                got.s(),
+                &want[..],
+                "pct={pct} ({} of {n_outer} chunks) diverged",
+                n_outer * pct / 100
             );
         }
     }

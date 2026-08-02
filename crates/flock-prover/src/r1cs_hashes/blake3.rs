@@ -2131,8 +2131,23 @@ pub(crate) mod witgen_simd {
         let padding: Compression = ([0u32; 8], [0u32; 16], 0u64, 0u32, 0u32);
         let total_f128 = n_total * F128_PER_BLOCK;
         let mut z = flock_core::scratch::take_f128(total_f128);
-        let mut a = flock_core::scratch::take_f128(total_f128);
-        let mut b = flock_core::scratch::take_f128(total_f128);
+        // `a` and `b` are OWNER-EXCLUSIVE: the AB-precompute GPU arm keeps a
+        // process-lifetime `newBufferWithBytesNoCopy` view of each, and at the
+        // ranked m = 32 they share the 512 MiB size class with `z`, the
+        // `Round1AbInner` transform and several PCS transients. Ordinary
+        // `take_f128` is smallest-fit, so those three consecutive takes can
+        // permute across proves — which would move a wrapped address and force
+        // a fresh 512 MiB wrap (and its page wiring) inside a timed prove.
+        // With the arm off these are ordinary pooled buffers with a reserved
+        // slot; nothing about their contents or use changes.
+        let mut a = flock_core::scratch::take_f128_exclusive(
+            flock_core::scratch::ExclusiveOwner::AbPrecomputeA,
+            total_f128,
+        );
+        let mut b = flock_core::scratch::take_f128_exclusive(
+            flock_core::scratch::ExclusiveOwner::AbPrecomputeB,
+            total_f128,
+        );
 
         let mut stream = stream_params.and_then(|params| {
             // SAFETY: z's allocation/address stays fixed until the returned

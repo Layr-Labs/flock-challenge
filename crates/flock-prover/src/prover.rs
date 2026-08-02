@@ -758,16 +758,22 @@ fn commit_with_round1_ab_precompute(
         ),
     );
 
-    let result = rayon::join(
-        || match commit_codeword {
-            CommitCodeword::Allocate => pcs::commit(z_packed, pcs_params),
-            CommitCodeword::NeedsReplication(buf) => pcs::commit_into(z_packed, pcs_params, buf),
-            CommitCodeword::Preinitialized(buf) => {
-                pcs::commit_preinitialized(z_packed, buf, pcs_params)
-            }
-            CommitCodeword::StreamedFirstPass(buf, stream) => {
-                pcs::commit_from_streamed_first_pass(z_packed, buf, pcs_params, stream)
-            }
+    let ((commit_arm_ms, commit_out), (ab_arm_ms, ab_out)) = rayon::join(
+        || {
+            let t = std::time::Instant::now();
+            let r = match commit_codeword {
+                CommitCodeword::Allocate => pcs::commit(z_packed, pcs_params),
+                CommitCodeword::NeedsReplication(buf) => {
+                    pcs::commit_into(z_packed, pcs_params, buf)
+                }
+                CommitCodeword::Preinitialized(buf) => {
+                    pcs::commit_preinitialized(z_packed, buf, pcs_params)
+                }
+                CommitCodeword::StreamedFirstPass(buf, stream) => {
+                    pcs::commit_from_streamed_first_pass(z_packed, buf, pcs_params, stream)
+                }
+            };
+            (t.elapsed().as_secs_f64() * 1e3, r)
         },
         || {
             let t = std::time::Instant::now();
@@ -780,8 +786,30 @@ fn commit_with_round1_ab_precompute(
             if std::env::var_os("FLOCK_PHASE_TIMING").is_some() {
                 eprintln!("[phase-timing] ab-precompute branch wall: {wall_ms:.2} ms");
             }
-            r
+            (wall_ms, r)
         },
+    );
+    let mut result = (commit_out, ab_out);
+
+    // Per-host warmup for the AB-precompute GPU arm — once per process, and
+    // deliberately HERE rather than inside the join. The arm's whole gate is
+    // the measured slack `ab_arm_ms - commit_arm_ms` of this window; a
+    // calibration dispatch running inside the window would inflate both arms
+    // by a contention-dependent amount and corrupt that measurement. No-op
+    // under the kill switch, on non-ranked shapes, and after the first prove.
+    if std::env::var_os("FLOCK_PHASE_TIMING").is_some() {
+        eprintln!("[phase-timing] commit branch wall: {commit_arm_ms:.2} ms");
+    }
+    zerocheck::univariate_skip_optimized::calibrate_round1_ab_gpu_arm(
+        &mut result.1,
+        a_packed,
+        b_packed,
+        pcs_params.m,
+        k_skip,
+        inv_table,
+        padding,
+        commit_arm_ms,
+        ab_arm_ms,
     );
 
     if run_ranked_exact_tune {
