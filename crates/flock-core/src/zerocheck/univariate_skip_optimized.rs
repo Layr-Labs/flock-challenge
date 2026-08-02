@@ -3224,8 +3224,10 @@ mod tests {
         let a_packed = super::super::univariate_skip::pack_bits(&a_bits);
         let b_packed = super::super::univariate_skip::pack_bits(&b_bits);
 
-        let mut a_col = vec![F8::ZERO; ELL];
-        let mut b_col = vec![F8::ZERO; ELL];
+        // Fixed-size column scratch belongs in each Rayon worker's stack frame;
+        // avoid two heap allocations in every worker invocation.
+        let mut a_col = [F8::ZERO; ELL];
+        let mut b_col = [F8::ZERO; ELL];
 
         for &(chunk_byte_base, b_med) in &[(0usize, 0usize), (64, 5), (1024, 7), (4096, 15)] {
             let needed = chunk_byte_base + b_med * N_CHUNKS * 8 + 8 * N_CHUNKS;
@@ -3432,8 +3434,10 @@ mod tests {
         let a_packed = super::super::univariate_skip::pack_bits(&a_bits);
         let b_packed = super::super::univariate_skip::pack_bits(&b_bits);
 
-        let mut a_col = vec![F8::ZERO; ELL];
-        let mut b_col = vec![F8::ZERO; ELL];
+        // Fixed-size column scratch belongs in each Rayon worker's stack frame;
+        // avoid two heap allocations in every worker invocation.
+        let mut a_col = [F8::ZERO; ELL];
+        let mut b_col = [F8::ZERO; ELL];
 
         for &(chunk_byte_base, b_med) in &[(0usize, 0usize), (64, 5), (1024, 7), (4096, 15)] {
             let needed = chunk_byte_base + b_med * N_CHUNKS * 8 + 8 * N_CHUNKS;
@@ -3487,8 +3491,10 @@ mod tests {
         let b_bits = rng.bits(1 << m);
         let a_packed = super::super::univariate_skip::pack_bits(&a_bits);
         let b_packed = super::super::univariate_skip::pack_bits(&b_bits);
-        let mut a_col = vec![F8::ZERO; ELL];
-        let mut b_col = vec![F8::ZERO; ELL];
+        // Fixed-size column scratch belongs in each Rayon worker's stack frame;
+        // avoid two heap allocations in every worker invocation.
+        let mut a_col = [F8::ZERO; ELL];
+        let mut b_col = [F8::ZERO; ELL];
 
         for &(chunk_byte_base, b_med) in &[(0usize, 0usize), (64, 5), (1024, 7), (4096, 15)] {
             let needed = chunk_byte_base + b_med * N_CHUNKS * 8 + 8 * N_CHUNKS;
@@ -3539,8 +3545,10 @@ mod tests {
         let a_packed = super::super::univariate_skip::pack_bits(&a_bits);
         let b_packed = super::super::univariate_skip::pack_bits(&b_bits);
 
-        let mut a_col = vec![F8::ZERO; ELL];
-        let mut b_col = vec![F8::ZERO; ELL];
+        // Fixed-size column scratch belongs in each Rayon worker's stack frame;
+        // avoid two heap allocations in every worker invocation.
+        let mut a_col = [F8::ZERO; ELL];
+        let mut b_col = [F8::ZERO; ELL];
 
         // A few representative (chunk_byte_base, b_med) values.
         for &(chunk_byte_base, b_med) in &[(0usize, 0usize), (64, 5), (1024, 7), (4096, 15)] {
