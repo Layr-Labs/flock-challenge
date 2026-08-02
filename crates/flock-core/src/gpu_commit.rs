@@ -201,6 +201,20 @@ pub fn gpu_recursive_merkle_blake3(
 /// timed proof may use it.
 pub const ENV_NO_GPU_GRIND: &str = "FLOCK_NO_GPU_GRIND";
 
+/// Exact rollback for the ranked induced-basis dense transpose. The first
+/// untimed ranked proof byte-compares Metal and CPU results and measures the
+/// complete recurring host+GPU wall before the caller may latch this path on.
+pub const ENV_NO_GPU_INDUCE_TRANSPOSE: &str = "FLOCK_NO_GPU_INDUCE_TRANSPOSE";
+
+pub(crate) fn gpu_induce_transpose_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var_os(ENV_NO_GPU_INDUCE_TRANSPOSE)
+            .as_deref()
+            != Some(std::ffi::OsStr::new("1"))
+    })
+}
+
 pub(crate) fn gpu_grind_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| match std::env::var(ENV_NO_GPU_GRIND) {
@@ -787,6 +801,231 @@ pub(crate) fn flat_twiddle_table(ntt: &AdditiveNttF128, log_d: usize) -> Vec<F12
         }
     }
     out
+}
+
+// ---------------------------------------------------------------------------
+// Ranked induced-basis transpose plan and portable byte ledger.
+//
+// Keeping the plan and ledger target-independent lets portable checks audit
+// the exact dispatch geometry even though they cannot execute Metal or make
+// Apple performance claims. Production selection remains target-native and
+// fail-closed behind an untimed exactness/performance latch.
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum GpuInduceTransposeProbePass {
+    Fused4 {
+        layer: usize,
+        threadgroups: usize,
+        truncate_root: bool,
+    },
+    /// Ranked `log_d=18` retains only `2^16` coefficients.  The last reverse
+    /// layers 1,0 reduce each four-value row to its low-quarter XOR, so their
+    /// twiddle products and the other three stores are dead.
+    LowQuarter2 { threadgroups: usize },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct GpuInduceTransposeProbeLedger {
+    pub data_bytes: usize,
+    pub retained_bytes: usize,
+    pub twiddle_count: usize,
+    pub twiddle_bytes: usize,
+    pub minimum_device_rw_bytes: usize,
+    pub upload_bytes: usize,
+    pub oracle_readback_bytes: usize,
+    pub dispatches: usize,
+    pub threadgroups: usize,
+}
+
+pub(crate) fn gpu_induce_transpose_probe_plan(
+    log_d: usize,
+    prefix_k: usize,
+    truncate_final_group: bool,
+) -> Result<Vec<GpuInduceTransposeProbePass>, String> {
+    match (log_d, prefix_k, truncate_final_group) {
+        // Ranked L0 induction: 2^20 rate-two domain, retain the low half.
+        (20, 8, true) => {}
+        // Ranked recursive special case: 2^18 domain, retain the low quarter.
+        (18, 8, false) => {}
+        _ => {
+            return Err(format!(
+                "induced-transpose probe rejects non-ranked shape log_d={log_d} prefix_k={prefix_k} truncate={truncate_final_group}"
+            ));
+        }
+    }
+
+    let mut passes = Vec::new();
+    let mut remaining = log_d - prefix_k;
+    while remaining >= 4 {
+        let layer = remaining - 4;
+        // A fused4 threadgroup owns 64 independent sixteen-value rows.  The
+        // ranked domains therefore use n/1024 groups per full pass.
+        let row_log = log_d - layer - 4;
+        if row_log < 6 {
+            return Err("fused4 probe requires at least 64 rows per block".into());
+        }
+        let threadgroups = (1usize << layer) * (1usize << (row_log - 6));
+        passes.push(GpuInduceTransposeProbePass::Fused4 {
+            layer,
+            threadgroups,
+            truncate_root: truncate_final_group && layer == 0,
+        });
+        remaining -= 4;
+    }
+    match remaining {
+        0 => {}
+        2 if (log_d, prefix_k, truncate_final_group) == (18, 8, false) => {
+            passes.push(GpuInduceTransposeProbePass::LowQuarter2 {
+                threadgroups: (1usize << (log_d - 2)).div_ceil(64),
+            });
+        }
+        _ => return Err("ranked probe plan left an unsupported suffix tail".into()),
+    }
+    Ok(passes)
+}
+
+pub(crate) fn gpu_induce_transpose_probe_ledger(
+    log_d: usize,
+    prefix_k: usize,
+    truncate_final_group: bool,
+) -> Result<GpuInduceTransposeProbeLedger, String> {
+    let passes = gpu_induce_transpose_probe_plan(log_d, prefix_k, truncate_final_group)?;
+    let data_bytes = (1usize << log_d) * core::mem::size_of::<F128>();
+    let retained_bytes = match (log_d, prefix_k, truncate_final_group) {
+        (20, 8, true) => data_bytes / 2,
+        // The special recursive caller asks for 2^16 coefficients from its
+        // 2^18 rate-four transform, even though the incumbent computes the
+        // full transform before the caller truncates it.
+        (18, 8, false) => data_bytes / 4,
+        _ => unreachable!("plan rejected every other shape"),
+    };
+    // The dense suffix touches global layers `0..log_d-prefix_k`, which are
+    // exactly the corresponding breadth-first heap prefix. Uploading the
+    // unused sparse-prefix layers would pollute the kernel rejection screen's
+    // cache state even though no diagnostic kernel can address them.
+    let twiddle_count = (1usize << (log_d - prefix_k)) - 1;
+    let twiddle_bytes = twiddle_count * core::mem::size_of::<F128>();
+    let mut minimum_device_rw_bytes = 0usize;
+    let mut threadgroups = 0usize;
+    for pass in &passes {
+        match *pass {
+            GpuInduceTransposeProbePass::Fused4 {
+                threadgroups: groups,
+                truncate_root,
+                ..
+            } => {
+                minimum_device_rw_bytes += data_bytes;
+                minimum_device_rw_bytes += if truncate_root {
+                    retained_bytes
+                } else {
+                    data_bytes
+                };
+                threadgroups += groups;
+            }
+            GpuInduceTransposeProbePass::LowQuarter2 {
+                threadgroups: groups,
+            } => {
+                minimum_device_rw_bytes += data_bytes + retained_bytes;
+                threadgroups += groups;
+            }
+        }
+    }
+    Ok(GpuInduceTransposeProbeLedger {
+        data_bytes,
+        retained_bytes,
+        twiddle_count,
+        twiddle_bytes,
+        minimum_device_rw_bytes,
+        upload_bytes: data_bytes + twiddle_bytes,
+        // Only caller-visible coefficients are read back.  The optimized
+        // final pass intentionally leaves dead suffix slots at an earlier
+        // layer state, so comparing them to the full CPU transform would be
+        // neither required nor meaningful.
+        oracle_readback_bytes: retained_bytes,
+        dispatches: passes.len(),
+        threadgroups,
+    })
+}
+
+#[cfg(all(test, target_os = "macos", target_arch = "aarch64"))]
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct GpuInduceTransposeProbeTiming {
+    pub init_compile_ms: f64,
+    pub twiddle_build_ms: f64,
+    pub allocate_ms: f64,
+    pub upload_ms: f64,
+    /// Kernel-only screen: host wall from command-buffer creation through the
+    /// completed-status check. Passing this screen cannot qualify a production
+    /// path because this copy-based harness does not measure zero-copy buffer
+    /// wrapping, release, or publication.
+    pub kernel_dispatch_wait_ms: f64,
+    pub oracle_readback_ms: f64,
+    /// Copy-harness wall through CPU oracle readback, before buffer release.
+    /// This is diagnostic context, not the production feasibility metric.
+    pub copy_harness_pre_release_ms: f64,
+}
+
+#[cfg(all(test, target_os = "macos", target_arch = "aarch64"))]
+pub(crate) fn gpu_induce_transpose_dense_suffix_probe(
+    ntt: &AdditiveNttF128,
+    input: &[F128],
+    log_d: usize,
+    prefix_k: usize,
+    truncate_final_group: bool,
+) -> Result<(Vec<F128>, GpuInduceTransposeProbeTiming), String> {
+    imp::gpu_induce_transpose_dense_suffix_probe(ntt, input, log_d, prefix_k, truncate_final_group)
+}
+
+/// Prepare the supplemental pipelines and exact suffix-twiddle buffer outside
+/// any measurement. Only the two ranked shapes are admitted.
+pub(crate) fn gpu_induce_transpose_prepare(
+    ntt: &AdditiveNttF128,
+    log_d: usize,
+    prefix_k: usize,
+    truncate_final_group: bool,
+) -> Result<(), String> {
+    if !gpu_induce_transpose_enabled() {
+        return Err("GPU induced transpose disabled".into());
+    }
+    gpu_induce_transpose_probe_plan(log_d, prefix_k, truncate_final_group)?;
+    if ntt.log_domain_size() != log_d {
+        return Err(format!(
+            "GPU induced transpose NTT domain {} != requested {log_d}",
+            ntt.log_domain_size()
+        ));
+    }
+    imp::gpu_induce_transpose_prepare(ntt, log_d, prefix_k, truncate_final_group)
+}
+
+/// Execute the recurring no-copy ranked suffix graph in place. The caller
+/// owns exactness admission and retains an authoritative input/output backup
+/// so any returned error can fall back after restoring pristine input.
+pub(crate) fn gpu_induce_transpose_run(
+    ntt: &AdditiveNttF128,
+    data: &mut [F128],
+    log_d: usize,
+    prefix_k: usize,
+    truncate_final_group: bool,
+) -> Result<std::time::Duration, String> {
+    if !gpu_induce_transpose_enabled() {
+        return Err("GPU induced transpose disabled".into());
+    }
+    let ledger = gpu_induce_transpose_probe_ledger(log_d, prefix_k, truncate_final_group)?;
+    if data.len() * core::mem::size_of::<F128>() != ledger.data_bytes {
+        return Err(format!(
+            "GPU induced transpose data bytes {} != ranked ledger {}",
+            data.len() * core::mem::size_of::<F128>(),
+            ledger.data_bytes
+        ));
+    }
+    if ntt.log_domain_size() != log_d {
+        return Err(format!(
+            "GPU induced transpose NTT domain {} != requested {log_d}",
+            ntt.log_domain_size()
+        ));
+    }
+    imp::gpu_induce_transpose_run(ntt, data, log_d, prefix_k, truncate_final_group)
 }
 
 /// Group the layers `[start_layer, log_d)` into fused passes of at most 4
@@ -3187,8 +3426,555 @@ kernel void blake3_pow_scan(
     }
 
     // -----------------------------------------------------------------------
-    // Copy-in/copy-out harness (tests and the warmup dual-run).
+    // Supplemental induced-basis transpose graph.
     // -----------------------------------------------------------------------
+
+    // Kept supplemental rather than changing the incumbent embedded
+    // metallib. A compile or pipeline failure therefore disables only this
+    // candidate and leaves every promoted GPU path intact.
+    const INDUCE_TRANSPOSE_PROBE_MSL: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+static inline uint4 probe_gf_mulx(uint4 v) {
+    uint carry = v.w >> 31;
+    uint4 r;
+    r.w = (v.w << 1) | (v.z >> 31);
+    r.z = (v.z << 1) | (v.y >> 31);
+    r.y = (v.y << 1) | (v.x >> 31);
+    r.x = (v.x << 1) ^ (carry * 0x87u);
+    return r;
+}
+
+static inline uint4 probe_gf_shl16(uint4 a) {
+    uint h = a.w >> 16;
+    uint4 r;
+    r.w = (a.w << 16) | (a.z >> 16);
+    r.z = (a.z << 16) | (a.y >> 16);
+    r.y = (a.y << 16) | (a.x >> 16);
+    r.x = (a.x << 16) ^ ((h << 7) ^ (h << 2) ^ (h << 1) ^ h);
+    return r;
+}
+
+static inline uint4 probe_gf_mul_tab4(
+    uint4 v,
+    threadgroup const uint4* tab
+) {
+    uint4 acc = uint4(0u);
+    for (int i = 7; i >= 0; i--) {
+        acc = probe_gf_shl16(acc);
+        uint h = (v[i >> 1] >> ((i & 1) * 16)) & 0xffffu;
+        acc ^= tab[h & 15u]
+             ^ tab[16u + ((h >> 4) & 15u)]
+             ^ tab[32u + ((h >> 8) & 15u)]
+             ^ tab[48u + (h >> 12)];
+    }
+    return acc;
+}
+
+struct ProbeParams {
+    uint log_d;
+    uint layer;
+    uint group_shift;
+    uint truncate_root;
+};
+
+// Reverse radix-16 transpose pass.  One 64-thread group owns 64 independent
+// rows of one block; every thread keeps its sixteen values in registers while
+// all threads share the block's fifteen twiddle tables.
+kernel void induce_transpose_fused4(
+    device uint4* data [[buffer(0)]],
+    device const uint4* twiddles [[buffer(1)]],
+    constant ProbeParams& P [[buffer(2)]],
+    uint tgid [[threadgroup_position_in_grid]],
+    uint lid [[thread_index_in_threadgroup]]
+) {
+    constexpr uint F = 4u;
+    constexpr uint NF = 16u;
+    constexpr uint NTW = 15u;
+    threadgroup uint4 bases[NTW * 4u];
+    threadgroup uint4 tabs[NTW * 64u];
+
+    const uint group_mask = (1u << P.group_shift) - 1u;
+    const uint block = tgid >> P.group_shift;
+    const uint row = ((tgid & group_mask) << 6) + lid;
+
+    if (lid < NTW * 4u) {
+        uint t = lid >> 2;
+        uint k = lid & 3u;
+        uint depth = 31u - clz(t + 1u);
+        uint in_depth = t + 1u - (1u << depth);
+        uint4 p = twiddles[(1u << (P.layer + depth)) - 1u
+                           + (block << depth) + in_depth];
+        for (uint m = 0; m < k * 4u; m++) p = probe_gf_mulx(p);
+        bases[lid] = p;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint ei = lid; ei < NTW * 64u; ei += 64u) {
+        uint t = ei >> 6;
+        uint sub = ei & 63u;
+        uint n = sub & 15u;
+        uint4 p = bases[(t << 2) | (sub >> 4)];
+        uint4 val = uint4(0u);
+        for (uint k = 0; k < 4u; k++) {
+            if ((n >> k) & 1u) val ^= p;
+            p = probe_gf_mulx(p);
+        }
+        tabs[ei] = val;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    const uint stride_log = P.log_d - P.layer - F;
+    const uint stride = 1u << stride_log;
+    const uint base = (block << (P.log_d - P.layer)) + row;
+    uint4 elems[NF];
+    for (uint e = 0; e < NF; e++) {
+        elems[e] = data[base + e * stride];
+    }
+
+    // Transpose applies global layers layer+3, layer+2, layer+1, layer.
+    for (uint stage = 0; stage < F; stage++) {
+        uint pair_bit = stage;
+        uint depth = F - 1u - stage;
+        for (uint b = 0; b < NF / 2u; b++) {
+            uint low = b & ((1u << pair_bit) - 1u);
+            uint top = ((b >> pair_bit) << (pair_bit + 1u)) | low;
+            uint bottom = top | (1u << pair_bit);
+            uint tsel = ((1u << depth) - 1u) + (top >> (stage + 1u));
+            uint4 bottom_before = elems[bottom];
+            uint4 sum = elems[top] ^ bottom_before;
+            elems[top] = sum;
+            if (!(P.truncate_root != 0u && stage == F - 1u)) {
+                elems[bottom] = probe_gf_mul_tab4(sum, &tabs[tsel << 6])
+                              ^ bottom_before;
+            }
+        }
+    }
+
+    const uint output_elems = P.truncate_root != 0u ? NF / 2u : NF;
+    for (uint e = 0; e < output_elems; e++) {
+        data[base + e * stride] = elems[e];
+    }
+}
+
+// The ranked log_d=18 special caller retains only its low quarter.  Across
+// reverse layers 1 then 0 that output is simply a^b^c^d; all twiddle products
+// and the other three stores are dead.
+kernel void induce_transpose_low_quarter2(
+    device uint4* data [[buffer(0)]],
+    constant ProbeParams& P [[buffer(2)]],
+    uint tgid [[threadgroup_position_in_grid]],
+    uint lid [[thread_index_in_threadgroup]]
+) {
+    const uint row = (tgid << 6) + lid;
+    const uint quarter = 1u << (P.log_d - 2u);
+    data[row] = data[row]
+              ^ data[row + quarter]
+              ^ data[row + 2u * quarter]
+              ^ data[row + 3u * quarter];
+}
+"#;
+
+    #[derive(Clone, Copy)]
+    struct InduceTransposeProbePsos {
+        fused4: usize,
+        low_quarter2: usize,
+    }
+
+    fn induce_transpose_probe_psos(gpu: &Gpu) -> Result<InduceTransposeProbePsos, String> {
+        static PSOS: OnceLock<Result<InduceTransposeProbePsos, String>> = OnceLock::new();
+        PSOS.get_or_init(|| unsafe {
+            let src = gpu.api.nsstring(INDUCE_TRANSPOSE_PROBE_MSL)?;
+            let mut err: Id = NIL;
+            let library: Id = send!(
+                gpu.api,
+                unsafe extern "C" fn(Id, Sel, Id, Id, *mut Id) -> Id,
+                gpu.device,
+                c"newLibraryWithSource:options:error:",
+                src,
+                NIL,
+                &mut err
+            );
+            if library.is_null() {
+                return Err(format!(
+                    "induced-transpose probe shader compile failed: {}",
+                    gpu.api.error_string(err)
+                ));
+            }
+
+            let build = |name: &str| -> Result<usize, String> {
+                let ns = gpu.api.nsstring(name)?;
+                let function: Id = send!(
+                    gpu.api,
+                    unsafe extern "C" fn(Id, Sel, Id) -> Id,
+                    library,
+                    c"newFunctionWithName:",
+                    ns
+                );
+                if function.is_null() {
+                    return Err(format!("induced-transpose probe kernel {name} not found"));
+                }
+                let mut pso_err: Id = NIL;
+                let pso: Id = send!(
+                    gpu.api,
+                    unsafe extern "C" fn(Id, Sel, Id, *mut Id) -> Id,
+                    gpu.device,
+                    c"newComputePipelineStateWithFunction:error:",
+                    function,
+                    &mut pso_err
+                );
+                gpu.release(function);
+                if pso.is_null() {
+                    Err(format!(
+                        "induced-transpose probe pipeline {name}: {}",
+                        gpu.api.error_string(pso_err)
+                    ))
+                } else {
+                    Ok(pso as usize)
+                }
+            };
+
+            let result = match build("induce_transpose_fused4") {
+                Err(error) => Err(error),
+                Ok(fused4) => match build("induce_transpose_low_quarter2") {
+                    Ok(low_quarter2) => Ok(InduceTransposeProbePsos {
+                        fused4,
+                        low_quarter2,
+                    }),
+                    Err(error) => {
+                        gpu.release(fused4 as Id);
+                        Err(error)
+                    }
+                },
+            };
+            gpu.release(library);
+            result
+        })
+        .as_ref()
+        .copied()
+        .map_err(Clone::clone)
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct InduceTransposeProbeParams {
+        log_d: u32,
+        layer: u32,
+        group_shift: u32,
+        truncate_root: u32,
+    }
+
+    fn induce_transpose_twiddle_buffer(
+        gpu: &Gpu,
+        ntt: &AdditiveNttF128,
+        suffix_layers: usize,
+    ) -> Result<Id, String> {
+        static L0: OnceLock<Result<usize, String>> = OnceLock::new();
+        static L1: OnceLock<Result<usize, String>> = OnceLock::new();
+        let slot = match suffix_layers {
+            12 => &L0,
+            10 => &L1,
+            _ => return Err(format!("unsupported induced-transpose suffix {suffix_layers}")),
+        };
+        slot.get_or_init(|| unsafe {
+            let twiddles = super::flat_twiddle_table(ntt, suffix_layers);
+            let bytes = twiddles.len() * core::mem::size_of::<F128>();
+            let buffer = gpu.new_buffer(bytes)?;
+            std::ptr::copy_nonoverlapping(
+                twiddles.as_ptr().cast::<u8>(),
+                gpu.buffer_contents(buffer),
+                bytes,
+            );
+            Ok(buffer as usize)
+        })
+        .as_ref()
+        .copied()
+        .map(|buffer| buffer as Id)
+        .map_err(Clone::clone)
+    }
+
+    pub(crate) fn gpu_induce_transpose_prepare(
+        ntt: &AdditiveNttF128,
+        log_d: usize,
+        prefix_k: usize,
+        truncate_final_group: bool,
+    ) -> Result<(), String> {
+        super::gpu_induce_transpose_probe_plan(log_d, prefix_k, truncate_final_group)?;
+        let gpu = gpu()?;
+        let _ = induce_transpose_probe_psos(gpu)?;
+        let _ = induce_transpose_twiddle_buffer(gpu, ntt, log_d - prefix_k)?;
+        Ok(())
+    }
+
+    struct InduceTransposeDataBuffer<'a> {
+        gpu: &'a Gpu,
+        data: Id,
+    }
+
+    impl Drop for InduceTransposeDataBuffer<'_> {
+        fn drop(&mut self) {
+            // SAFETY: `data` is the unique retained no-copy MTLBuffer object;
+            // the caller keeps the underlying slice alive through this guard.
+            unsafe { self.gpu.release(self.data) }
+        }
+    }
+
+    pub(crate) fn gpu_induce_transpose_run(
+        ntt: &AdditiveNttF128,
+        data: &mut [F128],
+        log_d: usize,
+        prefix_k: usize,
+        truncate_final_group: bool,
+    ) -> Result<std::time::Duration, String> {
+        let plan = super::gpu_induce_transpose_probe_plan(
+            log_d,
+            prefix_k,
+            truncate_final_group,
+        )?;
+        let started = std::time::Instant::now();
+        let gpu = gpu()?;
+        unsafe {
+            let pool = gpu.pool_push();
+            let result = (|| -> Result<(), String> {
+                let psos = induce_transpose_probe_psos(gpu)?;
+                let twiddles =
+                    induce_transpose_twiddle_buffer(gpu, ntt, log_d - prefix_k)?;
+                let data_bytes = std::mem::size_of_val(data);
+                let data_buffer = gpu.wrap_buffer(data.as_mut_ptr().cast::<u8>(), data_bytes)?;
+                let _data_guard = InduceTransposeDataBuffer {
+                    gpu,
+                    data: data_buffer,
+                };
+
+                let command_buffer = gpu.command_buffer()?;
+                let encoder = gpu.compute_encoder(command_buffer)?;
+                for pass in &plan {
+                    match *pass {
+                        super::GpuInduceTransposeProbePass::Fused4 {
+                            layer,
+                            threadgroups,
+                            truncate_root,
+                        } => {
+                            let row_log = log_d - layer - 4;
+                            let params = InduceTransposeProbeParams {
+                                log_d: log_d as u32,
+                                layer: layer as u32,
+                                group_shift: (row_log - 6) as u32,
+                                truncate_root: u32::from(truncate_root),
+                            };
+                            let params_bytes = std::slice::from_raw_parts(
+                                (&params as *const InduceTransposeProbeParams).cast::<u8>(),
+                                core::mem::size_of::<InduceTransposeProbeParams>(),
+                            );
+                            gpu.set_pipeline(encoder, psos.fused4 as Id);
+                            gpu.set_buffer(encoder, data_buffer, 0, 0);
+                            gpu.set_buffer(encoder, twiddles, 0, 1);
+                            gpu.set_bytes(encoder, params_bytes, 2);
+                            gpu.dispatch(encoder, threadgroups as u64, 64);
+                        }
+                        super::GpuInduceTransposeProbePass::LowQuarter2 { threadgroups } => {
+                            let params = InduceTransposeProbeParams {
+                                log_d: log_d as u32,
+                                layer: 0,
+                                group_shift: 0,
+                                truncate_root: 0,
+                            };
+                            let params_bytes = std::slice::from_raw_parts(
+                                (&params as *const InduceTransposeProbeParams).cast::<u8>(),
+                                core::mem::size_of::<InduceTransposeProbeParams>(),
+                            );
+                            gpu.set_pipeline(encoder, psos.low_quarter2 as Id);
+                            gpu.set_buffer(encoder, data_buffer, 0, 0);
+                            gpu.set_bytes(encoder, params_bytes, 2);
+                            gpu.dispatch(encoder, threadgroups as u64, 64);
+                        }
+                    }
+                }
+                gpu.end_encoding(encoder);
+                gpu.commit_async(command_buffer);
+                gpu.wait_cb(command_buffer)
+            })();
+            gpu.pool_pop(pool);
+            result?;
+        }
+        Ok(started.elapsed())
+    }
+
+    #[cfg(test)]
+    struct InduceTransposeProbeBuffers<'a> {
+        gpu: &'a Gpu,
+        data: Id,
+        twiddles: Id,
+    }
+
+    #[cfg(test)]
+    impl Drop for InduceTransposeProbeBuffers<'_> {
+        fn drop(&mut self) {
+            // SAFETY: both objects were returned retained by `new_buffer` and
+            // this guard is their unique releasing owner.
+            unsafe {
+                self.gpu.release(self.data);
+                self.gpu.release(self.twiddles);
+            }
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn gpu_induce_transpose_dense_suffix_probe(
+        ntt: &AdditiveNttF128,
+        input: &[F128],
+        log_d: usize,
+        prefix_k: usize,
+        truncate_final_group: bool,
+    ) -> Result<(Vec<F128>, super::GpuInduceTransposeProbeTiming), String> {
+        let total_started = std::time::Instant::now();
+        let plan = super::gpu_induce_transpose_probe_plan(log_d, prefix_k, truncate_final_group)?;
+        let ledger =
+            super::gpu_induce_transpose_probe_ledger(log_d, prefix_k, truncate_final_group)?;
+        if input.len() != 1usize << log_d {
+            return Err(format!(
+                "induced-transpose probe input len {} != 2^{log_d}",
+                input.len()
+            ));
+        }
+        if ntt.log_domain_size() != log_d {
+            return Err(format!(
+                "induced-transpose probe NTT domain {} != exact ranked domain {log_d}",
+                ntt.log_domain_size()
+            ));
+        }
+
+        let init_started = std::time::Instant::now();
+        let gpu = gpu()?;
+        unsafe {
+            let pool = gpu.pool_push();
+            let result = (|| -> Result<_, String> {
+                let psos = induce_transpose_probe_psos(gpu)?;
+                let init_compile_ms = init_started.elapsed().as_secs_f64() * 1e3;
+                let twiddle_started = std::time::Instant::now();
+                let suffix_layers = log_d - prefix_k;
+                let twiddles = super::flat_twiddle_table(ntt, suffix_layers);
+                let twiddle_build_ms = twiddle_started.elapsed().as_secs_f64() * 1e3;
+                if twiddles.len() * core::mem::size_of::<F128>() != ledger.twiddle_bytes {
+                    return Err(format!(
+                        "induced-transpose probe twiddle bytes {} != ledger {}",
+                        twiddles.len() * core::mem::size_of::<F128>(),
+                        ledger.twiddle_bytes
+                    ));
+                }
+
+                let allocate_started = std::time::Instant::now();
+                let data_buf = gpu.new_buffer(ledger.data_bytes)?;
+                let twiddle_buf = match gpu.new_buffer(ledger.twiddle_bytes) {
+                    Ok(buffer) => buffer,
+                    Err(error) => {
+                        gpu.release(data_buf);
+                        return Err(error);
+                    }
+                };
+                let buffers = InduceTransposeProbeBuffers {
+                    gpu,
+                    data: data_buf,
+                    twiddles: twiddle_buf,
+                };
+                let allocate_ms = allocate_started.elapsed().as_secs_f64() * 1e3;
+
+                let upload_started = std::time::Instant::now();
+                std::ptr::copy_nonoverlapping(
+                    input.as_ptr().cast::<u8>(),
+                    gpu.buffer_contents(data_buf),
+                    ledger.data_bytes,
+                );
+                std::ptr::copy_nonoverlapping(
+                    twiddles.as_ptr().cast::<u8>(),
+                    gpu.buffer_contents(twiddle_buf),
+                    ledger.twiddle_bytes,
+                );
+                let upload_ms = upload_started.elapsed().as_secs_f64() * 1e3;
+
+                let dispatch_started = std::time::Instant::now();
+                let command_buffer = gpu.command_buffer()?;
+                let encoder = gpu.compute_encoder(command_buffer)?;
+                for pass in &plan {
+                    match *pass {
+                        super::GpuInduceTransposeProbePass::Fused4 {
+                            layer,
+                            threadgroups,
+                            truncate_root,
+                        } => {
+                            let row_log = log_d - layer - 4;
+                            let params = InduceTransposeProbeParams {
+                                log_d: log_d as u32,
+                                layer: layer as u32,
+                                group_shift: (row_log - 6) as u32,
+                                truncate_root: u32::from(truncate_root),
+                            };
+                            let params_bytes = std::slice::from_raw_parts(
+                                (&params as *const InduceTransposeProbeParams).cast::<u8>(),
+                                core::mem::size_of::<InduceTransposeProbeParams>(),
+                            );
+                            gpu.set_pipeline(encoder, psos.fused4 as Id);
+                            gpu.set_buffer(encoder, data_buf, 0, 0);
+                            gpu.set_buffer(encoder, twiddle_buf, 0, 1);
+                            gpu.set_bytes(encoder, params_bytes, 2);
+                            gpu.dispatch(encoder, threadgroups as u64, 64);
+                        }
+                        super::GpuInduceTransposeProbePass::LowQuarter2 { threadgroups } => {
+                            let params = InduceTransposeProbeParams {
+                                log_d: log_d as u32,
+                                layer: 0,
+                                group_shift: 0,
+                                truncate_root: 0,
+                            };
+                            let params_bytes = std::slice::from_raw_parts(
+                                (&params as *const InduceTransposeProbeParams).cast::<u8>(),
+                                core::mem::size_of::<InduceTransposeProbeParams>(),
+                            );
+                            gpu.set_pipeline(encoder, psos.low_quarter2 as Id);
+                            gpu.set_buffer(encoder, data_buf, 0, 0);
+                            gpu.set_bytes(encoder, params_bytes, 2);
+                            gpu.dispatch(encoder, threadgroups as u64, 64);
+                        }
+                    }
+                }
+                gpu.end_encoding(encoder);
+                gpu.commit_async(command_buffer);
+                gpu.wait_cb(command_buffer)?;
+                let kernel_dispatch_wait_ms = dispatch_started.elapsed().as_secs_f64() * 1e3;
+
+                let readback_started = std::time::Instant::now();
+                let mut output: Vec<F128> =
+                    crate::alloc_uninit_vec(ledger.retained_bytes / core::mem::size_of::<F128>());
+                std::ptr::copy_nonoverlapping(
+                    gpu.buffer_contents(data_buf),
+                    output.as_mut_ptr().cast::<u8>(),
+                    ledger.retained_bytes,
+                );
+                let oracle_readback_ms = readback_started.elapsed().as_secs_f64() * 1e3;
+                let copy_harness_pre_release_ms = total_started.elapsed().as_secs_f64() * 1e3;
+
+                let result = (
+                    output,
+                    super::GpuInduceTransposeProbeTiming {
+                        init_compile_ms,
+                        twiddle_build_ms,
+                        allocate_ms,
+                        upload_ms,
+                        kernel_dispatch_wait_ms,
+                        oracle_readback_ms,
+                        copy_harness_pre_release_ms,
+                    },
+                );
+                // Release after completed-status and readback; on any earlier
+                // `?` path the same guard drops during unwinding of the closure.
+                drop(buffers);
+                Ok(result)
+            })();
+            gpu.pool_pop(pool);
+            result
+        }
+    }
 
     /// Run the fused NTT passes on a copy of `data`, writing the result back.
     /// Copy-in/copy-out; bit-gate test harness.
@@ -8383,6 +9169,25 @@ mod imp {
         Err("GPU grind is only available on macOS/aarch64".into())
     }
 
+    pub(crate) fn gpu_induce_transpose_prepare(
+        _ntt: &AdditiveNttF128,
+        _log_d: usize,
+        _prefix_k: usize,
+        _truncate_final_group: bool,
+    ) -> Result<(), String> {
+        Err("GPU induced transpose is only available on macOS/aarch64".into())
+    }
+
+    pub(crate) fn gpu_induce_transpose_run(
+        _ntt: &AdditiveNttF128,
+        _data: &mut [F128],
+        _log_d: usize,
+        _prefix_k: usize,
+        _truncate_final_group: bool,
+    ) -> Result<std::time::Duration, String> {
+        Err("GPU induced transpose is only available on macOS/aarch64".into())
+    }
+
     pub(crate) fn gpu_commit_latched_on() -> bool {
         false
     }
@@ -8421,6 +9226,91 @@ pub(crate) use imp::{gpu_merkle_tree_blake3, gpu_ntt_interleaved_from_layer};
 mod tests {
     use super::*;
     use crate::field::F128;
+
+    #[test]
+    fn induced_transpose_probe_ranked_plan_and_ledger_are_exact() {
+        let l0_plan = gpu_induce_transpose_probe_plan(20, 8, true).unwrap();
+        assert_eq!(
+            l0_plan,
+            vec![
+                GpuInduceTransposeProbePass::Fused4 {
+                    layer: 8,
+                    threadgroups: 1024,
+                    truncate_root: false,
+                },
+                GpuInduceTransposeProbePass::Fused4 {
+                    layer: 4,
+                    threadgroups: 1024,
+                    truncate_root: false,
+                },
+                GpuInduceTransposeProbePass::Fused4 {
+                    layer: 0,
+                    threadgroups: 1024,
+                    truncate_root: true,
+                },
+            ]
+        );
+        assert_eq!(
+            gpu_induce_transpose_probe_ledger(20, 8, true).unwrap(),
+            GpuInduceTransposeProbeLedger {
+                data_bytes: 16 << 20,
+                retained_bytes: 8 << 20,
+                twiddle_count: 4095,
+                twiddle_bytes: (64 << 10) - 16,
+                minimum_device_rw_bytes: 88 << 20,
+                upload_bytes: (16 << 20) + (64 << 10) - 16,
+                oracle_readback_bytes: 8 << 20,
+                dispatches: 3,
+                threadgroups: 3072,
+            }
+        );
+
+        let l1_plan = gpu_induce_transpose_probe_plan(18, 8, false).unwrap();
+        assert_eq!(
+            l1_plan,
+            vec![
+                GpuInduceTransposeProbePass::Fused4 {
+                    layer: 6,
+                    threadgroups: 256,
+                    truncate_root: false,
+                },
+                GpuInduceTransposeProbePass::Fused4 {
+                    layer: 2,
+                    threadgroups: 256,
+                    truncate_root: false,
+                },
+                GpuInduceTransposeProbePass::LowQuarter2 { threadgroups: 1024 },
+            ]
+        );
+        assert_eq!(
+            gpu_induce_transpose_probe_ledger(18, 8, false).unwrap(),
+            GpuInduceTransposeProbeLedger {
+                data_bytes: 4 << 20,
+                retained_bytes: 1 << 20,
+                twiddle_count: 1023,
+                twiddle_bytes: (16 << 10) - 16,
+                minimum_device_rw_bytes: 21 << 20,
+                upload_bytes: (4 << 20) + (16 << 10) - 16,
+                oracle_readback_bytes: 1 << 20,
+                dispatches: 3,
+                threadgroups: 1536,
+            }
+        );
+    }
+
+    #[test]
+    fn induced_transpose_probe_rejects_every_non_ranked_shape() {
+        for shape in [
+            (20, 8, false),
+            (20, 7, true),
+            (19, 8, true),
+            (18, 8, true),
+            (18, 7, false),
+            (17, 8, false),
+        ] {
+            assert!(gpu_induce_transpose_probe_plan(shape.0, shape.1, shape.2).is_err());
+        }
+    }
 
     /// GPU idle-decay probe at ranked size: full commit graph wall
     /// back-to-back vs after idle gaps. Ignored; run with --ignored --nocapture.
