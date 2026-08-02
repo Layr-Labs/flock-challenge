@@ -518,14 +518,44 @@ impl Challenger for FsChallenger {
             && !GPU_GRIND_FAILED.load(std::sync::atomic::Ordering::Relaxed)
         {
             match GPU_GRIND_LATCH.get().copied() {
-                Some(true) => match gpu_blake3_pow_nonce(&state_digest, bits) {
-                    Ok(nonce) => nonce,
-                    Err(_) => {
-                        GPU_GRIND_FAILED.store(true, std::sync::atomic::Ordering::Relaxed);
+                Some(gpu_enabled) => {
+                    if let Some(split) = GPU_CPU_GRIND_SPLIT.get().copied().flatten()
+                        && !GPU_CPU_GRIND_FAILED.load(std::sync::atomic::Ordering::Relaxed)
+                    {
+                        match gpu_cpu_blake3_pow_nonce(&state_digest, bits, split) {
+                            Ok(nonce) => nonce,
+                            Err(_) => {
+                                GPU_CPU_GRIND_FAILED
+                                    .store(true, std::sync::atomic::Ordering::Relaxed);
+                                if gpu_enabled {
+                                    match gpu_blake3_pow_nonce(&state_digest, bits) {
+                                        Ok(nonce) => nonce,
+                                        Err(_) => {
+                                            GPU_GRIND_FAILED.store(
+                                                true,
+                                                std::sync::atomic::Ordering::Relaxed,
+                                            );
+                                            cpu_scan()
+                                        }
+                                    }
+                                } else {
+                                    cpu_scan()
+                                }
+                            }
+                        }
+                    } else if gpu_enabled {
+                        match gpu_blake3_pow_nonce(&state_digest, bits) {
+                            Ok(nonce) => nonce,
+                            Err(_) => {
+                                GPU_GRIND_FAILED
+                                    .store(true, std::sync::atomic::Ordering::Relaxed);
+                                cpu_scan()
+                            }
+                        }
+                    } else {
                         cpu_scan()
                     }
-                },
-                Some(false) => cpu_scan(),
+                }
                 None if bits == GPU_GRIND_CALIBRATION_BITS
                     && crate::gpu_commit::gpu_grind_enabled() =>
                 {
@@ -540,6 +570,25 @@ impl Challenger for FsChallenger {
                     let gpu_1_started = std::time::Instant::now();
                     let gpu_1 = gpu_grind_calibration(&state_digest);
                     let gpu_1_time = gpu_1_started.elapsed();
+
+                    // Candidate production composes the retained Metal scan
+                    // with the P+E CPU scanner over disjoint ascending ranges.
+                    // Derive a one-sixteenth split from the first standalone
+                    // throughput pair, then time the exact recurring
+                    // composition twice between the two control samples. The
+                    // OS-thread creation, CPU result allocation/drain, Metal
+                    // command setup/submit/wait, and result merge are all
+                    // inside both candidate timers.
+                    let gpu_cpu_split =
+                        gpu_cpu_grind_split_from_times(cpu_1_time, gpu_1_time);
+                    let gpu_cpu_1_started = std::time::Instant::now();
+                    let gpu_cpu_1 =
+                        gpu_cpu_grind_calibration(&state_digest, gpu_cpu_split);
+                    let gpu_cpu_1_time = gpu_cpu_1_started.elapsed();
+                    let gpu_cpu_2_started = std::time::Instant::now();
+                    let gpu_cpu_2 =
+                        gpu_cpu_grind_calibration(&state_digest, gpu_cpu_split);
+                    let gpu_cpu_2_time = gpu_cpu_2_started.elapsed();
 
                     let gpu_2_started = std::time::Instant::now();
                     let gpu_2 = gpu_grind_calibration(&state_digest);
@@ -563,7 +612,56 @@ impl Challenger for FsChallenger {
                         && gpu_2_time.mul_f64(GPU_GRIND_BLOCK_OVERDRAW) < cpu_2_time
                         && protected_gain >= GPU_GRIND_MIN_TWO_SAMPLE_GAIN;
                     let _ = GPU_GRIND_LATCH.set(enable);
-                    if enable {
+
+                    // A cooperative expected-work block has the same
+                    // 1/(1-e^-1) retry factor as the GPU-only block. Compare
+                    // it only with the projected GPU incumbent after that
+                    // incumbent's own gate has selected it. Both candidate
+                    // result vectors must equal both CPU oracles, both orders
+                    // must win, and the protected two-sample aggregate must
+                    // clear the existing 1.5 ms bar. CPU-selected workers keep
+                    // their exact promoted production scheduler: its dynamic
+                    // cancellation shape is not the fixed CPU oracle below.
+                    let gpu_cpu_exact = matches!((&gpu_cpu_1, &gpu_cpu_2), (Ok(a), Ok(b)) if *a == cpu_1 && *b == cpu_1)
+                        && cpu_2 == cpu_1;
+                    let candidate_1 = gpu_cpu_1_time.mul_f64(GPU_GRIND_BLOCK_OVERDRAW);
+                    let candidate_2 = gpu_cpu_2_time.mul_f64(GPU_GRIND_BLOCK_OVERDRAW);
+                    let control_1 = gpu_1_time.mul_f64(GPU_GRIND_BLOCK_OVERDRAW);
+                    let control_2 = gpu_2_time.mul_f64(GPU_GRIND_BLOCK_OVERDRAW);
+                    let gpu_cpu_enable = gpu_cpu_grind_enabled()
+                        && enable
+                        && select_gpu_cpu_grind(
+                            gpu_cpu_exact,
+                            control_1,
+                            candidate_1,
+                            candidate_2,
+                            control_2,
+                        );
+                    let _ = GPU_CPU_GRIND_SPLIT.set(gpu_cpu_enable.then_some(gpu_cpu_split));
+
+                    if gpu_cpu_enable {
+                        match gpu_cpu_blake3_pow_nonce(&state_digest, bits, gpu_cpu_split) {
+                            Ok(nonce) => nonce,
+                            Err(_) => {
+                                GPU_CPU_GRIND_FAILED
+                                    .store(true, std::sync::atomic::Ordering::Relaxed);
+                                if enable {
+                                    match gpu_blake3_pow_nonce(&state_digest, bits) {
+                                        Ok(nonce) => nonce,
+                                        Err(_) => {
+                                            GPU_GRIND_FAILED.store(
+                                                true,
+                                                std::sync::atomic::Ordering::Relaxed,
+                                            );
+                                            cpu_scan()
+                                        }
+                                    }
+                                } else {
+                                    cpu_scan()
+                                }
+                            }
+                        }
+                    } else if enable {
                         match gpu_blake3_pow_nonce(&state_digest, bits) {
                             Ok(nonce) => nonce,
                             Err(_) => {
@@ -631,6 +729,76 @@ const GPU_GRIND_MIN_TWO_SAMPLE_GAIN: std::time::Duration =
 static GPU_GRIND_LATCH: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
 static GPU_GRIND_FAILED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
+const GPU_CPU_GRIND_SPLIT_DENOMINATOR: u32 = 16;
+static GPU_CPU_GRIND_SPLIT: std::sync::OnceLock<Option<u8>> = std::sync::OnceLock::new();
+static GPU_CPU_GRIND_FAILED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+const ENV_NO_GPU_CPU_GRIND: &str = "FLOCK_NO_GPU_CPU_GRIND";
+
+fn gpu_cpu_grind_value_enabled(value: Option<&std::ffi::OsStr>) -> bool {
+    value != Some(std::ffi::OsStr::new("1"))
+}
+
+fn gpu_cpu_grind_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        gpu_cpu_grind_value_enabled(std::env::var_os(ENV_NO_GPU_CPU_GRIND).as_deref())
+    })
+}
+
+/// Balance one fixed nonce interval between GPU (the lower prefix) and CPU
+/// (the upper suffix) from their standalone fixed-work times. If CPU needs
+/// more time for the same work, Metal receives proportionally more of the
+/// interval. Quantizing to sixteenths keeps every ranked partition aligned to
+/// the 64-thread Metal dispatch while the CPU scanner safely handles its
+/// ordinary ragged final batch.
+fn gpu_cpu_grind_split_from_times(
+    cpu_time: std::time::Duration,
+    gpu_time: std::time::Duration,
+) -> u8 {
+    let cpu = cpu_time.as_nanos().max(1);
+    let total = cpu.saturating_add(gpu_time.as_nanos().max(1));
+    let rounded = cpu
+        .saturating_mul(u128::from(GPU_CPU_GRIND_SPLIT_DENOMINATOR))
+        .saturating_add(total / 2)
+        / total;
+    rounded.clamp(1, u128::from(GPU_CPU_GRIND_SPLIT_DENOMINATOR - 1)) as u8
+}
+
+fn gpu_cpu_grind_gpu_len(len: u32, gpu_sixteenths: u8) -> Option<u32> {
+    if len < 2
+        || gpu_sixteenths == 0
+        || u32::from(gpu_sixteenths) >= GPU_CPU_GRIND_SPLIT_DENOMINATOR
+    {
+        return None;
+    }
+    Some(
+        (len / GPU_CPU_GRIND_SPLIT_DENOMINATOR * u32::from(gpu_sixteenths))
+            .clamp(1, len - 1),
+    )
+}
+
+#[inline]
+fn merge_gpu_cpu_grind_results(gpu: Option<u64>, cpu: Option<u64>) -> Option<u64> {
+    // The device ranges are disjoint and Metal always owns the lower prefix.
+    // Therefore any GPU match precedes every possible CPU match.
+    gpu.or(cpu)
+}
+
+fn select_gpu_cpu_grind(
+    exact: bool,
+    control_1: std::time::Duration,
+    candidate_1: std::time::Duration,
+    candidate_2: std::time::Duration,
+    control_2: std::time::Duration,
+) -> bool {
+    let control_total = control_1 + control_2;
+    let candidate_total = candidate_1 + candidate_2;
+    exact
+        && candidate_1 < control_1
+        && candidate_2 < control_2
+        && control_total.saturating_sub(candidate_total) >= GPU_GRIND_MIN_TWO_SAMPLE_GAIN
+}
 
 /// CPU oracle/throughput arm for one fixed calibration window.  Unlike the
 /// production search it intentionally drains every chunk, making runtime
@@ -723,6 +891,57 @@ fn gpu_grind_calibration(state_digest: &[u8; 32]) -> Result<Vec<Option<u64>>, St
         .collect()
 }
 
+/// Drain one fixed interval on both devices at once. Metal owns the lower
+/// prefix and CPU owns the upper suffix, so a Metal match is necessarily the
+/// global minimum; the CPU result is used only when the complete prefix has no
+/// match. Joining both arms before returning proves that every nonce below the
+/// selected result was examined regardless of device completion order.
+fn gpu_cpu_grind_window(
+    state_digest: &[u8; 32],
+    start: u64,
+    len: u32,
+    bits: u32,
+    gpu_sixteenths: u8,
+) -> Result<Option<u64>, String> {
+    let gpu_len = gpu_cpu_grind_gpu_len(len, gpu_sixteenths)
+        .ok_or_else(|| format!("invalid cooperative GPU grind len={len} split={gpu_sixteenths}"))?;
+    let cpu_start = start
+        .checked_add(u64::from(gpu_len))
+        .ok_or_else(|| "cooperative GPU grind CPU-range overflow".to_string())?;
+    let cpu_len = len - gpu_len;
+    std::thread::scope(|scope| {
+        let gpu = scope.spawn(|| {
+            crate::gpu_commit::gpu_blake3_pow_scan(state_digest, start, gpu_len, bits)
+        });
+        let cpu = cpu_blake3_pow_window(state_digest, cpu_start, cpu_len, bits);
+        let gpu = gpu
+            .join()
+            .map_err(|_| "cooperative GPU grind thread panicked".to_string())??;
+        Ok(merge_gpu_cpu_grind_results(gpu, cpu))
+    })
+}
+
+fn gpu_cpu_grind_calibration(
+    state_digest: &[u8; 32],
+    gpu_sixteenths: u8,
+) -> Result<Vec<Option<u64>>, String> {
+    let mut start = 0u64;
+    GPU_GRIND_CALIBRATION_LENGTHS
+        .into_iter()
+        .map(|len| {
+            let result = gpu_cpu_grind_window(
+                state_digest,
+                start,
+                len,
+                GPU_GRIND_CALIBRATION_PREDICATE_BITS,
+                gpu_sixteenths,
+            );
+            start += u64::from(len);
+            result
+        })
+        .collect()
+}
+
 /// Metal scans fixed ascending blocks and reports the smallest match in each
 /// block.  Visiting blocks in order therefore returns the same global minimum
 /// as the CPU scan.  One expected-work block balances GPU over-scan against
@@ -741,6 +960,29 @@ fn gpu_blake3_pow_nonce(state_digest: &[u8; 32], bits: u32) -> Result<u64, Strin
         start = start
             .checked_add(u64::from(block_len))
             .ok_or_else(|| "GPU grind nonce range exhausted".to_string())?;
+    }
+}
+
+/// Production form of [`gpu_cpu_grind_window`]. One combined expected-work
+/// block is visited at a time in ascending order. The target-side calibration
+/// charges the exact geometric retry factor before this mode can be selected.
+fn gpu_cpu_blake3_pow_nonce(
+    state_digest: &[u8; 32],
+    bits: u32,
+    gpu_sixteenths: u8,
+) -> Result<u64, String> {
+    debug_assert!((GPU_GRIND_MIN_BITS..=32).contains(&bits));
+    let block_len = 1u32 << bits.min(24);
+    let mut start = 0u64;
+    loop {
+        if let Some(nonce) =
+            gpu_cpu_grind_window(state_digest, start, block_len, bits, gpu_sixteenths)?
+        {
+            return Ok(nonce);
+        }
+        start = start
+            .checked_add(u64::from(block_len))
+            .ok_or_else(|| "cooperative GPU grind nonce range exhausted".to_string())?;
     }
 }
 
@@ -938,6 +1180,100 @@ mod tests {
         assert_eq!(GPU_GRIND_CALIBRATION_BITS, 19);
         let exact_geometric = 1.0 / (1.0 - (-1.0f64).exp());
         assert!((GPU_GRIND_BLOCK_OVERDRAW - exact_geometric).abs() < 1e-12);
+    }
+
+    #[test]
+    fn gpu_cpu_grind_split_balances_equal_work_and_stays_exact() {
+        use std::ffi::OsStr;
+        use std::time::Duration;
+
+        assert!(!gpu_cpu_grind_value_enabled(Some(OsStr::new("1"))));
+        for value in [None, Some(""), Some("0"), Some("01"), Some("true")] {
+            assert!(gpu_cpu_grind_value_enabled(value.map(OsStr::new)));
+        }
+
+        assert_eq!(
+            gpu_cpu_grind_split_from_times(
+                Duration::from_millis(10),
+                Duration::from_millis(10)
+            ),
+            8
+        );
+        assert_eq!(
+            gpu_cpu_grind_split_from_times(
+                Duration::from_millis(20),
+                Duration::from_millis(10)
+            ),
+            11
+        );
+        assert_eq!(
+            gpu_cpu_grind_split_from_times(
+                Duration::from_millis(10),
+                Duration::from_millis(20)
+            ),
+            5
+        );
+        assert_eq!(gpu_cpu_grind_gpu_len(1 << 19, 11), Some(360_448));
+        assert_eq!(gpu_cpu_grind_gpu_len(1 << 14, 5), Some(5_120));
+        assert_eq!(gpu_cpu_grind_gpu_len(1, 8), None);
+        assert_eq!(gpu_cpu_grind_gpu_len(1 << 14, 0), None);
+        assert_eq!(gpu_cpu_grind_gpu_len(1 << 14, 16), None);
+        assert_eq!(merge_gpu_cpu_grind_results(Some(7), Some(90)), Some(7));
+        assert_eq!(merge_gpu_cpu_grind_results(Some(7), None), Some(7));
+        assert_eq!(merge_gpu_cpu_grind_results(None, Some(90)), Some(90));
+        assert_eq!(merge_gpu_cpu_grind_results(None, None), None);
+
+        let digest = *blake3::hash(b"cooperative-grind-partition-oracle").as_bytes();
+        for start in [0u64, 17, u32::MAX as u64 - 2048] {
+            for bits in [1u32, 6, 10] {
+                for split in 1..16 {
+                    let len = 4096u32;
+                    let gpu_len = gpu_cpu_grind_gpu_len(len, split).unwrap();
+                    let gpu = blake3_pow_scan_generic(
+                        &digest,
+                        start,
+                        u64::from(gpu_len),
+                        bits,
+                    );
+                    let cpu = blake3_pow_scan_generic(
+                        &digest,
+                        start + u64::from(gpu_len),
+                        u64::from(len - gpu_len),
+                        bits,
+                    );
+                    assert_eq!(
+                        merge_gpu_cpu_grind_results(gpu, cpu),
+                        blake3_pow_scan_generic(&digest, start, u64::from(len), bits),
+                        "start={start} bits={bits} split={split}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn gpu_cpu_grind_selector_requires_two_wins_and_protected_gain() {
+        use std::time::Duration;
+
+        let ms = Duration::from_millis;
+        assert!(select_gpu_cpu_grind(true, ms(10), ms(9), ms(9), ms(10)));
+        assert!(!select_gpu_cpu_grind(false, ms(10), ms(8), ms(8), ms(10)));
+        assert!(!select_gpu_cpu_grind(true, ms(10), ms(10), ms(8), ms(10)));
+        assert!(!select_gpu_cpu_grind(true, ms(10), ms(8), ms(10), ms(10)));
+        assert!(!select_gpu_cpu_grind(
+            true,
+            Duration::from_micros(10_000),
+            Duration::from_micros(9_300),
+            Duration::from_micros(9_300),
+            Duration::from_micros(10_000),
+        ));
+        assert!(select_gpu_cpu_grind(
+            true,
+            Duration::from_micros(10_000),
+            Duration::from_micros(9_200),
+            Duration::from_micros(9_200),
+            Duration::from_micros(10_000),
+        ));
     }
 
     /// Every FsChallenger property must hold under both transcript hashes:
