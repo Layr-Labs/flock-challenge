@@ -8228,29 +8228,16 @@ kernel void zc_r2_products(
     /// Anchors-only CPU work is measured locally at ~0.55x of the fused
     /// chunk (two of four folds, no products); the share solves
     /// `(hi - (1-ALPHA) g) c_f = g u_g` — balanced, no CPU-ward bias — and
-    /// caps at `15·hi/16` as the overshoot guard (an optimistic warmup ratio
+    /// caps at `7·hi/8` as the overshoot guard (an optimistic warmup ratio
     /// must not make the GPU the timed straggler; at this cap the GPU only
-    /// straggles once the true timed ratio exceeds `(1-0.45·15/16)/(15/16)` ≈
-    /// 0.617, still above the ~0.57 measured on the ranked M3 Max).
+    /// straggles once the true timed ratio exceeds `(1-0.45·7/8)/(7/8)` ≈
+    /// 0.69, a 21% overshoot above the ~0.57 measured on the ranked M3 Max).
     /// History of this clamp: `hi/2` always bound (promoted fix → 3·hi/4,
     /// +5.19%), and at every observed ratio (0.33–0.83 across hosts) the
     /// 3·hi/4 cap was *still* what bound the share — the balance point
-    /// `hi/(ratio+0.45)` sits at 0.98·hi at ratio 0.57 — so the cap moved
-    /// to 7·hi/8, the same measured mistake the balanced lincheck split
-    /// corrected at 32/64.
-    ///
-    /// **It bound a third time.** Instrumented on the v16 tree
-    /// (`FLOCK_ZC_R2_GPU_DEBUG=1`, timed prove): the gate measured
-    /// `u_gpu=0.0690` vs `u_cpu=0.5521 ms/chunk`, i.e. ratio `0.125`, solved
-    /// for `3562` chunks and was clamped to `1792/2048` — and in the timed
-    /// round the GPU drained its prefix in `116 ms` inside a `372 ms`
-    /// round-two wall, so it sat idle for ~256 ms of it. The clamp, not the
-    /// calibration, is the binding constraint on both hosts. Moving to
-    /// `15·hi/16` takes the balanced solution's remaining reachable ground
-    /// while keeping the straggle threshold (0.617) above the ranked ratio.
-    /// Deliberately *not* uncapped: at `hi` the threshold falls to
-    /// `1-0.45 = 0.55`, which is **below** the 0.57 measured on the ranked
-    /// M3 Max, so full offload would make the GPU the straggler.
+    /// `hi/(ratio+0.45)` sits at 0.98·hi at ratio 0.57 — so the cap moves
+    /// again to 7·hi/8, the same measured mistake the balanced lincheck
+    /// split corrected at 32/64.
     ///
     /// Ratios in `(2, 8)`: the probe's equality oracle has already proven
     /// the kernel exact on this machine, so a slow-looking GPU gets a floor
@@ -8275,7 +8262,7 @@ kernel void zc_r2_products(
             return 0;
         }
         let g = (hi_size as f64 / (ratio + (1.0 - ZC_R2_ALPHA))).round();
-        (g as usize).min(hi_size * 15 / 16)
+        (g as usize).min(hi_size * 7 / 8)
     }
 
     fn zc_r2_init(gpu: &'static Gpu) -> Result<ZcR2, String> {
@@ -8508,7 +8495,7 @@ kernel void zc_r2_products(
             // 1/8 probe that shipped there.
             (hi_size / 16).clamp(8, 128)
         } else {
-            tuned.min(hi_size * 15 / 16)
+            tuned.min(hi_size * 7 / 8)
         };
         if chunks == 0 {
             return None;
@@ -11728,12 +11715,9 @@ DEF_PROBE(probe_g4_t8_p0,    8u,  0u,   tsel & 7u)
     fn zc_r2_gate_share_policy() {
         use imp::zc_r2_gate_share;
         // Balance point hi/(ratio+0.45); ranked-observed ratios land above
-        // the 15·hi/16 cap, which is the binding overshoot guard.
-        assert_eq!(zc_r2_gate_share(0.57, 2048), 1920);
-        assert_eq!(zc_r2_gate_share(0.38, 2048), 1920);
-        // The guard still binds before the GPU can straggle: at 15/16 the
-        // crossover is (1-0.45·15/16)/(15/16) ≈ 0.617, above the ranked 0.57.
-        assert!(zc_r2_gate_share(0.62, 2048) < 2048);
+        // the 7·hi/8 cap, which is the binding overshoot guard.
+        assert_eq!(zc_r2_gate_share(0.57, 2048), 1792);
+        assert_eq!(zc_r2_gate_share(0.38, 2048), 1792);
         // Slow-but-usable GPU: the formula takes over below the cap.
         assert_eq!(zc_r2_gate_share(1.0, 2048), 1412); // 2048/1.45
         assert_eq!(zc_r2_gate_share(2.0, 2048), 836); // 2048/2.45
