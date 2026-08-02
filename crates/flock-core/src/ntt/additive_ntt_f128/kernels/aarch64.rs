@@ -512,6 +512,177 @@ pub(super) unsafe fn butterfly_fused_3layer_zero_root_from_src_row(
     }
 }
 
+/// Vector-resident twin of `portable::butterfly_fused_4layer_from_src_row`:
+/// sixteen row values plus every intermediate stay in `uint64x2_t` for the
+/// whole four-layer chain, entered/exited once per row group. The chain and
+/// twiddle order mirror the portable 16-point butterfly exactly, so output
+/// is bit-identical.
+///
+/// # Safety
+/// Same contract as the portable form: the caller guarantees every selected
+/// row and lane is valid and that concurrent calls own disjoint destination
+/// row groups.
+#[allow(clippy::too_many_arguments)]
+unsafe fn butterfly_fused_4layer_from_src_row_impl<const ZERO_ROOT: bool>(
+    src: *const F128,
+    dst: *mut F128,
+    sixteenth: usize,
+    num_ntts: usize,
+    r: usize,
+    twiddles: &[F128; 15],
+) {
+    use core::arch::aarch64::*;
+
+    #[inline(always)]
+    unsafe fn store_pair_nt(dst: *mut F128, x: uint64x2_t, y: uint64x2_t) {
+        unsafe {
+            core::arch::asm!(
+                "stnp {x:q}, {y:q}, [{dst}]",
+                dst = in(reg) dst,
+                x = in(vreg) x,
+                y = in(vreg) y,
+                options(nostack, preserves_flags),
+            );
+        }
+    }
+
+    unsafe {
+        debug_assert_eq!(num_ntts, 8);
+        if ZERO_ROOT {
+            debug_assert_eq!(twiddles[0], F128::ZERO);
+            debug_assert_eq!(twiddles[1], F128::ZERO);
+            debug_assert_eq!(twiddles[3], F128::ZERO);
+            debug_assert_eq!(twiddles[7], F128::ZERO);
+        }
+        let t: [uint64x2_t; 15] =
+            core::array::from_fn(|i| vld1q_u64((&raw const twiddles[i]).cast::<u64>()));
+        let mut stage = [F128 { lo: 0, hi: 0 }; 128];
+        let off = r * num_ntts;
+        let step = sixteenth * num_ntts;
+
+        for lane in 0..num_ntts {
+            let src_base = src.add(off + lane);
+            let mut v: [uint64x2_t; 16] =
+                core::array::from_fn(|i| vld1q_u64(src_base.add(i * step).cast::<u64>()));
+
+            if ZERO_ROOT {
+                // Layer L, t[0] = 0: eight XOR-only butterflies (rows 8..15).
+                for i in 0..8 {
+                    v[i + 8] = butterfly_zero_q(v[i], v[i + 8]);
+                }
+                // Layer L+1: bottom-half twiddle t[1] is zero; t[2] general.
+                for i in 0..4 {
+                    v[i + 4] = butterfly_zero_q(v[i], v[i + 4]);
+                }
+                for i in 0..4 {
+                    let (a, b) = butterfly_q(v[8 + i], v[12 + i], t[2]);
+                    v[8 + i] = a;
+                    v[12 + i] = b;
+                }
+                // Layer L+2: first quarter's twiddle t[3] is zero.
+                for i in 0..2 {
+                    v[i + 2] = butterfly_zero_q(v[i], v[i + 2]);
+                }
+                for s in 1..4 {
+                    for i in 0..2 {
+                        let (u, w) = (4 * s + i, 4 * s + i + 2);
+                        let (a, b) = butterfly_q(v[u], v[w], t[3 + s]);
+                        v[u] = a;
+                        v[w] = b;
+                    }
+                }
+                // Layer L+3: first pair's twiddle t[7] is zero.
+                v[1] = butterfly_zero_q(v[0], v[1]);
+                for s in 1..8 {
+                    let (a, b) = butterfly_q(v[2 * s], v[2 * s + 1], t[7 + s]);
+                    v[2 * s] = a;
+                    v[2 * s + 1] = b;
+                }
+            } else {
+                for i in 0..8 {
+                    let (a, b) = butterfly_q(v[i], v[i + 8], t[0]);
+                    v[i] = a;
+                    v[i + 8] = b;
+                }
+                for s in 0..2 {
+                    for i in 0..4 {
+                        let (u, w) = (8 * s + i, 8 * s + i + 4);
+                        let (a, b) = butterfly_q(v[u], v[w], t[1 + s]);
+                        v[u] = a;
+                        v[w] = b;
+                    }
+                }
+                for s in 0..4 {
+                    for i in 0..2 {
+                        let (u, w) = (4 * s + i, 4 * s + i + 2);
+                        let (a, b) = butterfly_q(v[u], v[w], t[3 + s]);
+                        v[u] = a;
+                        v[w] = b;
+                    }
+                }
+                for s in 0..8 {
+                    let (a, b) = butterfly_q(v[2 * s], v[2 * s + 1], t[7 + s]);
+                    v[2 * s] = a;
+                    v[2 * s + 1] = b;
+                }
+            }
+
+            for (i, value) in v.iter().enumerate() {
+                vst1q_u64(
+                    stage.as_mut_ptr().add(i * num_ntts + lane).cast::<u64>(),
+                    *value,
+                );
+            }
+        }
+
+        // Sixteen contiguous per-row bursts (128 B each at the recursive
+        // geometry); the stale allocation is written without an RFO read.
+        for i in 0..16 {
+            let src_row = stage.as_ptr().add(i * num_ntts);
+            let dst_row = dst.add(off + i * step);
+            let mut lane = 0;
+            while lane < num_ntts {
+                let x = vld1q_u64(src_row.add(lane).cast::<u64>());
+                let y = vld1q_u64(src_row.add(lane + 1).cast::<u64>());
+                store_pair_nt(dst_row.add(lane), x, y);
+                lane += 2;
+            }
+        }
+    }
+}
+
+#[target_feature(enable = "aes")]
+pub(super) unsafe fn butterfly_fused_4layer_from_src_row(
+    src: *const F128,
+    dst: *mut F128,
+    sixteenth: usize,
+    num_ntts: usize,
+    r: usize,
+    twiddles: &[F128; 15],
+) {
+    unsafe {
+        butterfly_fused_4layer_from_src_row_impl::<false>(
+            src, dst, sixteenth, num_ntts, r, twiddles,
+        );
+    }
+}
+
+#[target_feature(enable = "aes")]
+pub(super) unsafe fn butterfly_fused_4layer_zero_root_from_src_row(
+    src: *const F128,
+    dst: *mut F128,
+    sixteenth: usize,
+    num_ntts: usize,
+    r: usize,
+    twiddles: &[F128; 15],
+) {
+    unsafe {
+        butterfly_fused_4layer_from_src_row_impl::<true>(
+            src, dst, sixteenth, num_ntts, r, twiddles,
+        );
+    }
+}
+
 /// Vector-resident twin of `portable::butterfly_fused_3layer_row`.
 ///
 /// # Safety
