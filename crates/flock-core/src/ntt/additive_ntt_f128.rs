@@ -1761,7 +1761,15 @@ fn butterfly_interleaved_fused_2layer_rows_seq(
         .zip(q3.chunks_exact_mut(num_ntts))
         .zip(q4.chunks_exact_mut(num_ntts))
     {
-        kernels::butterfly_fused_2layer(row_a, row_b, row_c, row_d, t_outer, t_inner_a, t_inner_b);
+        kernels::butterfly_fused_2layer_karatsuba(
+            row_a,
+            row_b,
+            row_c,
+            row_d,
+            t_outer,
+            t_inner_a,
+            t_inner_b,
+        );
     }
 }
 

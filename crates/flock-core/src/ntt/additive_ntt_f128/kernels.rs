@@ -81,6 +81,34 @@ pub(super) fn butterfly_fused_2layer(
     portable::butterfly_fused_2layer(a, b, c, d, t_outer, t_inner_a, t_inner_b);
 }
 
+/// Ranked deep-pair variant that uses a three-PMULL Karatsuba product at each
+/// butterfly. Other targets and either kill switch retain the incumbent
+/// fused-two-layer kernel.
+#[allow(clippy::too_many_arguments)]
+#[inline]
+pub(super) fn butterfly_fused_2layer_karatsuba(
+    a: &mut [F128],
+    b: &mut [F128],
+    c: &mut [F128],
+    d: &mut [F128],
+    t_outer: F128,
+    t_inner_a: F128,
+    t_inner_b: F128,
+) {
+    #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+    // SAFETY: the cfg gate supplies `aes`; callers supply equal row lengths.
+    unsafe {
+        if vector_resident_rows() && generic_karatsuba() {
+            aarch64::butterfly_fused_2layer_karatsuba(
+                a, b, c, d, t_outer, t_inner_a, t_inner_b,
+            );
+            return;
+        }
+    }
+
+    butterfly_fused_2layer(a, b, c, d, t_outer, t_inner_a, t_inner_b);
+}
+
 /// AArch64 specialization for a fused pair whose three twiddles all have a
 /// zero high limb. Other targets retain the ordinary field-multiply kernel.
 #[allow(clippy::too_many_arguments)]
@@ -210,6 +238,17 @@ fn vector_resident_rows() -> bool {
     use std::sync::OnceLock;
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("FLOCK_NO_NTT_NEON_ROWS").is_none())
+}
+
+/// Use a Karatsuba product in each generic AArch64 fused-two-layer butterfly.
+/// `FLOCK_NO_NTT_GENERIC_KARATSUBA=1` restores the frontier's schoolbook
+/// product in the same executable.
+#[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+#[inline]
+fn generic_karatsuba() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("FLOCK_NO_NTT_GENERIC_KARATSUBA").is_none())
 }
 
 /// Rate-1/2 first-pass row kernel: one load of the radix-8 row group from
@@ -527,9 +566,9 @@ mod aarch64_row_tests {
         }
     }
 
-    /// The vector-resident deep fused-pair kernel must be **bit-identical**
-    /// to the portable `F128`-typed chain across the row widths the ranked
-    /// deep transform uses (`num_ntts = 64` rows) plus narrow/odd widths.
+    /// The Karatsuba vector-resident deep kernel must be **bit-identical** to
+    /// the portable `F128`-typed chain across the row widths the ranked deep
+    /// transform uses (`num_ntts = 64` rows) plus narrow/odd widths.
     #[test]
     fn neon_fused_2layer_matches_portable() {
         let mut state = 0x4645_5350_4149_5232;
@@ -552,7 +591,7 @@ mod aarch64_row_tests {
                 let (mut ga, mut gb, mut gc, mut gd) = (a0, b0, c0, d0);
                 // SAFETY: this module carries `aes` via cfg; equal lengths.
                 unsafe {
-                    aarch64::butterfly_fused_2layer(
+                    aarch64::butterfly_fused_2layer_karatsuba(
                         &mut ga, &mut gb, &mut gc, &mut gd, t_outer, t_inner_a, t_inner_b,
                     );
                 }

@@ -722,6 +722,40 @@ unsafe fn mul_low_pair_q(
     }
 }
 
+/// GHASH multiply using a three-PMULL Karatsuba product and the incumbent
+/// two-PMULL recursive reduction. Operands and output remain in q registers.
+#[inline(always)]
+unsafe fn mul_q_karatsuba(
+    a: core::arch::aarch64::uint64x2_t,
+    b: core::arch::aarch64::uint64x2_t,
+) -> core::arch::aarch64::uint64x2_t {
+    use core::arch::aarch64::*;
+    unsafe {
+        let zero = vdupq_n_u64(0);
+        let lo = pmull_ll(a, b);
+        let hi = core::mem::transmute::<u128, uint64x2_t>(vmull_high_p64(
+            vreinterpretq_p64_u64(a),
+            vreinterpretq_p64_u64(b),
+        ));
+        let middle = pmull_ll(
+            veorq_u64(a, vextq_u64::<1>(a, a)),
+            veorq_u64(b, vextq_u64::<1>(b, b)),
+        );
+        let cross = xor3(middle, lo, hi);
+
+        let folded_hi = xor3(
+            cross,
+            vextq_u64::<1>(zero, hi),
+            pmull_87(vgetq_lane_u64::<1>(hi)),
+        );
+        xor3(
+            lo,
+            vextq_u64::<1>(zero, folded_hi),
+            pmull_87(vgetq_lane_u64::<1>(folded_hi)),
+        )
+    }
+}
+
 /// Fused two-layer butterfly specialized for three low-limb-only twiddles.
 /// Two products are issued together at each stage, using four PMULLs instead
 /// of twelve for the pair under the generic Binius field multiplier, and —
@@ -921,6 +955,53 @@ pub(super) unsafe fn butterfly_fused_2layer(
             vst1q_u64((&raw mut b[lane]).cast::<u64>(), fb);
             vst1q_u64((&raw mut c[lane]).cast::<u64>(), fc);
             vst1q_u64((&raw mut d[lane]).cast::<u64>(), fd);
+        }
+    }
+}
+
+/// Generic fused-two-layer butterfly using the five-PMULL Karatsuba multiply.
+/// Four products therefore require twenty PMULLs instead of the frontier
+/// kernel's twenty-four while retaining its compact recursive reduction.
+#[target_feature(enable = "aes")]
+#[allow(clippy::too_many_arguments)]
+pub(super) unsafe fn butterfly_fused_2layer_karatsuba(
+    a: &mut [F128],
+    b: &mut [F128],
+    c: &mut [F128],
+    d: &mut [F128],
+    t_outer: F128,
+    t_inner_a: F128,
+    t_inner_b: F128,
+) {
+    use core::arch::aarch64::*;
+    unsafe {
+        let to = vld1q_u64((&raw const t_outer).cast::<u64>());
+        let ta = vld1q_u64((&raw const t_inner_a).cast::<u64>());
+        let tb = vld1q_u64((&raw const t_inner_b).cast::<u64>());
+        for lane in 0..a.len() {
+            let mut xa = vld1q_u64((&raw const a[lane]).cast::<u64>());
+            let mut xb = vld1q_u64((&raw const b[lane]).cast::<u64>());
+            let mut xc = vld1q_u64((&raw const c[lane]).cast::<u64>());
+            let mut xd = vld1q_u64((&raw const d[lane]).cast::<u64>());
+
+            let outer_c = mul_q_karatsuba(xc, to);
+            let outer_d = mul_q_karatsuba(xd, to);
+            xa = veorq_u64(xa, outer_c);
+            xc = veorq_u64(xc, xa);
+            xb = veorq_u64(xb, outer_d);
+            xd = veorq_u64(xd, xb);
+
+            let inner_b = mul_q_karatsuba(xb, ta);
+            let inner_d = mul_q_karatsuba(xd, tb);
+            xa = veorq_u64(xa, inner_b);
+            xb = veorq_u64(xb, xa);
+            xc = veorq_u64(xc, inner_d);
+            xd = veorq_u64(xd, xc);
+
+            vst1q_u64((&raw mut a[lane]).cast::<u64>(), xa);
+            vst1q_u64((&raw mut b[lane]).cast::<u64>(), xb);
+            vst1q_u64((&raw mut c[lane]).cast::<u64>(), xc);
+            vst1q_u64((&raw mut d[lane]).cast::<u64>(), xd);
         }
     }
 }
