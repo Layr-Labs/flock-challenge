@@ -3768,6 +3768,180 @@ kernel void blake3_pow_scan(
         }
     }
 
+    /// CPU arm of the hybrid commit, standalone: NTT layers 4.. over the
+    /// trailing `k_cpu16` sixteenths of the position range, that suffix's leaf
+    /// hashes, and its aligned subtree parents — written directly into the
+    /// shared staging and tree buffers.
+    ///
+    /// Extracted verbatim from `run_commit_graph_from_z_hybrid_impl` (same
+    /// code, same order) so the exact-contention calibration can wall-clock
+    /// this arm ALONE. A separately timed arm is far less noisy than one
+    /// recovered by differencing a `max()` of two racing arms, which is what
+    /// a whole-graph candidate scan is forced to do.
+    ///
+    /// # Safety
+    ///
+    /// `staging` / `tree_buf` must be the latched ranked-geometry buffers, and
+    /// no other writer may own the CPU suffix ranges for the duration. The GPU
+    /// prefix command buffer (`encode_hybrid_prefix_cb2`) touches only
+    /// `0..prefix_leaves`, so the two may run concurrently.
+    unsafe fn hybrid_cpu_suffix(
+        gpu: &Gpu,
+        staging: Id,
+        tree_buf: Id,
+        log_d: usize,
+        n_leaves: usize,
+        k_cpu16: usize,
+    ) {
+        use rayon::prelude::*;
+        debug_assert!((1..16).contains(&k_cpu16));
+        unsafe {
+            let prefix_leaves = (16 - k_cpu16) * (n_leaves / 16);
+
+            // CPU: suffix NTT completion + leaves + subtree parents.
+            // The twiddle table is deterministic per log_d; built once per
+            // process (the autotune sweep prebuilds it untimed).
+            let ntt = hybrid_suffix_ntt(log_d);
+            let data: &mut [F128] = core::slice::from_raw_parts_mut(
+                gpu.buffer_contents(staging).cast::<F128>(),
+                n_leaves * 64,
+            );
+            let tree: &mut [Hash] = core::slice::from_raw_parts_mut(
+                gpu.buffer_contents(tree_buf).cast::<Hash>(),
+                2 * n_leaves - 1,
+            );
+            let tree_base = crate::epool::SyncPtr(tree.as_mut_ptr());
+            let suffix_leaf_start = prefix_leaves;
+            let suffix_leaves = n_leaves - prefix_leaves;
+            let deep_pipeline = hybrid_cpu_suffix_deep_pipeline_enabled();
+            let local_parent_levels = if deep_pipeline {
+                hybrid_local_parent_levels()
+            } else {
+                0
+            };
+            if deep_pipeline {
+                // Publish and hash each finalized layer-10 chunk, then
+                // build its local parent levels before the leaf hashes
+                // leave cache. `elem_offset` is absolute in the shared
+                // staging buffer, hence `leaf_start` lands directly in
+                // the CPU-owned suffix of the shared tree. Different
+                // callback invocations own disjoint 1,024-leaf ranges at
+                // every local level; the GPU owns only
+                // `0..prefix_leaves`.
+                let finish_chunk = |elem_offset: usize, chunk: &[F128]| {
+                    debug_assert_eq!(elem_offset % 64, 0);
+                    let leaf_start = elem_offset / 64;
+                    let leaf_len = chunk.len() / 64;
+                    debug_assert!(leaf_start >= suffix_leaf_start);
+                    debug_assert!(leaf_start + leaf_len <= n_leaves);
+                    // SAFETY: the NTT callback runs only after this chunk's
+                    // last write. Callback ranges are pairwise disjoint and
+                    // disjoint from the concurrently executing GPU prefix.
+                    let bytes = core::slice::from_raw_parts(
+                        chunk.as_ptr().cast::<u8>(),
+                        core::mem::size_of_val(chunk),
+                    );
+                    hash_ranked_leaf_chunk_and_local_parents(
+                        bytes,
+                        tree_base,
+                        n_leaves,
+                        leaf_start,
+                        leaf_len,
+                        local_parent_levels,
+                    );
+                };
+                ntt.forward_transform_interleaved_ranked_block_range_and_then(
+                    data,
+                    64,
+                    4,
+                    log_d,
+                    16 - k_cpu16,
+                    16,
+                    finish_chunk,
+                );
+            } else {
+                // Exact same-binary control: the original streaming suffix
+                // driver followed by a separate 4,096-leaf hash traversal.
+                ntt.forward_transform_interleaved_block_range(
+                    data,
+                    64,
+                    4,
+                    log_d,
+                    16 - k_cpu16,
+                    16,
+                    crate::ntt::additive_ntt_f128::ranked_zero_odd_tail_lanes(log_d, 64),
+                );
+                let suffix_bytes: &[u8] = core::slice::from_raw_parts(
+                    data.as_ptr().cast::<u8>().add(suffix_leaf_start * 1024),
+                    suffix_leaves * 1024,
+                );
+                const LEAF_JOB: usize = 1 << 12;
+                suffix_bytes
+                    .par_chunks(LEAF_JOB * 1024)
+                    .enumerate()
+                    .for_each(|(i, bytes)| {
+                        // SAFETY: disjoint leaf output ranges per job.
+                        let outs = core::slice::from_raw_parts_mut(
+                            tree_base.ptr().add(suffix_leaf_start + i * LEAF_JOB),
+                            bytes.len() / 1024,
+                        );
+                        crate::merkle::hash_ranked_blake3_leaf_chunk(bytes, outs);
+                    });
+            }
+            // Suffix aligned subtrees' parents (greedy decomposition).
+            let mut sstart = suffix_leaf_start;
+            while sstart < n_leaves {
+                let mut size = 1usize << (n_leaves - sstart).ilog2();
+                while sstart % size != 0 {
+                    size >>= 1;
+                }
+                let mut level_start = 0usize;
+                let mut level_len = n_leaves;
+                let mut local_start = sstart;
+                let mut local_len = size;
+                // Each 1,024-leaf callback already populated these exact
+                // flat-tree ranges. Resume at the first shared level
+                // instead of traversing the cache-cold leaves again.
+                for _ in 0..local_parent_levels {
+                    level_start += level_len;
+                    level_len /= 2;
+                    local_start /= 2;
+                    local_len /= 2;
+                }
+                while local_len > 1 {
+                    let write_level_start = level_start + level_len;
+                    let (r0, w0) =
+                        (level_start + local_start, write_level_start + local_start / 2);
+                    let n_out = local_len / 2;
+                    // ≤1024-output jobs (the parent kernel's contract),
+                    // parallel across the level.
+                    // SAFETY: read level fully written (leaves above /
+                    // previous iteration); each job's write range is
+                    // disjoint, and all are disjoint from concurrent GPU
+                    // subtree ranges.
+                    (0..n_out.div_ceil(1024)).into_par_iter().for_each(|j| {
+                        let o = j * 1024;
+                        let len = 1024.min(n_out - o);
+                        let read = core::slice::from_raw_parts(
+                            tree_base.ptr().add(r0 + 2 * o),
+                            2 * len,
+                        );
+                        let write = core::slice::from_raw_parts_mut(
+                            tree_base.ptr().add(w0 + o),
+                            len,
+                        );
+                        crate::merkle::hash_ranked_blake3_parent_chunk(read, write);
+                    });
+                    level_start = write_level_start;
+                    level_len /= 2;
+                    local_start /= 2;
+                    local_len /= 2;
+                }
+                sstart += size;
+            }
+        }
+    }
+
     unsafe fn run_commit_graph_from_z_hybrid_impl(
         gpu: &Gpu,
         z_buf: Id,
@@ -3780,7 +3954,6 @@ kernel void blake3_pow_scan(
         first_pass_done: bool,
         pre_cb2: Option<Id>,
     ) -> Result<(), String> {
-        use rayon::prelude::*;
         debug_assert!((1..16).contains(&k_cpu16));
         unsafe {
             let pool = gpu.pool_push();
@@ -3804,149 +3977,10 @@ kernel void blake3_pow_scan(
                         cb2
                     }
                 };
-                let prefix_leaves = (16 - k_cpu16) * (n_leaves / 16);
+                // CPU arm: suffix NTT + leaves + aligned subtree parents,
+                // concurrent with the GPU prefix command buffer above.
+                hybrid_cpu_suffix(gpu, staging, tree_buf, log_d, n_leaves, k_cpu16);
 
-                // CPU: suffix NTT completion + leaves + subtree parents.
-                // The twiddle table is deterministic per log_d; built once per
-                // process (the autotune sweep prebuilds it untimed).
-                let ntt = hybrid_suffix_ntt(log_d);
-                let data: &mut [F128] = core::slice::from_raw_parts_mut(
-                    gpu.buffer_contents(staging).cast::<F128>(),
-                    n_leaves * 64,
-                );
-                let tree: &mut [Hash] = core::slice::from_raw_parts_mut(
-                    gpu.buffer_contents(tree_buf).cast::<Hash>(),
-                    2 * n_leaves - 1,
-                );
-                let tree_base = crate::epool::SyncPtr(tree.as_mut_ptr());
-                let suffix_leaf_start = prefix_leaves;
-                let suffix_leaves = n_leaves - prefix_leaves;
-                let deep_pipeline = hybrid_cpu_suffix_deep_pipeline_enabled();
-                let local_parent_levels = if deep_pipeline {
-                    hybrid_local_parent_levels()
-                } else {
-                    0
-                };
-                if deep_pipeline {
-                    // Publish and hash each finalized layer-10 chunk, then
-                    // build its local parent levels before the leaf hashes
-                    // leave cache. `elem_offset` is absolute in the shared
-                    // staging buffer, hence `leaf_start` lands directly in
-                    // the CPU-owned suffix of the shared tree. Different
-                    // callback invocations own disjoint 1,024-leaf ranges at
-                    // every local level; the GPU owns only
-                    // `0..prefix_leaves`.
-                    let finish_chunk = |elem_offset: usize, chunk: &[F128]| {
-                        debug_assert_eq!(elem_offset % 64, 0);
-                        let leaf_start = elem_offset / 64;
-                        let leaf_len = chunk.len() / 64;
-                        debug_assert!(leaf_start >= suffix_leaf_start);
-                        debug_assert!(leaf_start + leaf_len <= n_leaves);
-                        // SAFETY: the NTT callback runs only after this chunk's
-                        // last write. Callback ranges are pairwise disjoint and
-                        // disjoint from the concurrently executing GPU prefix.
-                        let bytes = core::slice::from_raw_parts(
-                            chunk.as_ptr().cast::<u8>(),
-                            core::mem::size_of_val(chunk),
-                        );
-                        hash_ranked_leaf_chunk_and_local_parents(
-                            bytes,
-                            tree_base,
-                            n_leaves,
-                            leaf_start,
-                            leaf_len,
-                            local_parent_levels,
-                        );
-                    };
-                    ntt.forward_transform_interleaved_ranked_block_range_and_then(
-                        data,
-                        64,
-                        4,
-                        log_d,
-                        16 - k_cpu16,
-                        16,
-                        finish_chunk,
-                    );
-                } else {
-                    // Exact same-binary control: the original streaming suffix
-                    // driver followed by a separate 4,096-leaf hash traversal.
-                    ntt.forward_transform_interleaved_block_range(
-                        data,
-                        64,
-                        4,
-                        log_d,
-                        16 - k_cpu16,
-                        16,
-                        crate::ntt::additive_ntt_f128::ranked_zero_odd_tail_lanes(log_d, 64),
-                    );
-                    let suffix_bytes: &[u8] = core::slice::from_raw_parts(
-                        data.as_ptr().cast::<u8>().add(suffix_leaf_start * 1024),
-                        suffix_leaves * 1024,
-                    );
-                    const LEAF_JOB: usize = 1 << 12;
-                    suffix_bytes
-                        .par_chunks(LEAF_JOB * 1024)
-                        .enumerate()
-                        .for_each(|(i, bytes)| {
-                            // SAFETY: disjoint leaf output ranges per job.
-                            let outs = core::slice::from_raw_parts_mut(
-                                tree_base.ptr().add(suffix_leaf_start + i * LEAF_JOB),
-                                bytes.len() / 1024,
-                            );
-                            crate::merkle::hash_ranked_blake3_leaf_chunk(bytes, outs);
-                        });
-                }
-                // Suffix aligned subtrees' parents (greedy decomposition).
-                let mut sstart = suffix_leaf_start;
-                while sstart < n_leaves {
-                    let mut size = 1usize << (n_leaves - sstart).ilog2();
-                    while sstart % size != 0 {
-                        size >>= 1;
-                    }
-                    let mut level_start = 0usize;
-                    let mut level_len = n_leaves;
-                    let mut local_start = sstart;
-                    let mut local_len = size;
-                    // Each 1,024-leaf callback already populated these exact
-                    // flat-tree ranges. Resume at the first shared level
-                    // instead of traversing the cache-cold leaves again.
-                    for _ in 0..local_parent_levels {
-                        level_start += level_len;
-                        level_len /= 2;
-                        local_start /= 2;
-                        local_len /= 2;
-                    }
-                    while local_len > 1 {
-                        let write_level_start = level_start + level_len;
-                        let (r0, w0) =
-                            (level_start + local_start, write_level_start + local_start / 2);
-                        let n_out = local_len / 2;
-                        // ≤1024-output jobs (the parent kernel's contract),
-                        // parallel across the level.
-                        // SAFETY: read level fully written (leaves above /
-                        // previous iteration); each job's write range is
-                        // disjoint, and all are disjoint from concurrent GPU
-                        // subtree ranges.
-                        (0..n_out.div_ceil(1024)).into_par_iter().for_each(|j| {
-                            let o = j * 1024;
-                            let len = 1024.min(n_out - o);
-                            let read = core::slice::from_raw_parts(
-                                tree_base.ptr().add(r0 + 2 * o),
-                                2 * len,
-                            );
-                            let write = core::slice::from_raw_parts_mut(
-                                tree_base.ptr().add(w0 + o),
-                                len,
-                            );
-                            crate::merkle::hash_ranked_blake3_parent_chunk(read, write);
-                        });
-                        level_start = write_level_start;
-                        level_len /= 2;
-                        local_start /= 2;
-                        local_len /= 2;
-                    }
-                    sstart += size;
-                }
 
                 // Join the GPU prefix, then (re)compute every level above
                 // the sixteenth-granularity roots. Every subtree on either
@@ -3955,6 +3989,8 @@ kernel void blake3_pow_scan(
                 // parents; the 15 nodes above it are recomputed here,
                 // covering every decomposition boundary for any k.
                 gpu.wait_cb(cb2)?;
+                let tree_base =
+                    crate::epool::SyncPtr(gpu.buffer_contents(tree_buf).cast::<Hash>());
                 let mut level_start = 0usize;
                 let mut level_len = n_leaves;
                 while level_len > 16 {
@@ -4107,22 +4143,220 @@ kernel void blake3_pow_scan(
         Ok(walls)
     }
 
-    fn mean_ranked_exact_samples(
+    /// Reduce each candidate's two draws to one cost estimate.
+    ///
+    /// The noise on these samples is **one-sided**: a candidate's true cost is
+    /// a fixed amount of GPU and CPU work, and any interference — a stray
+    /// process, a DVFS dip, an unlucky work-stealing interleave — can only
+    /// make a draw slower, never faster. Under one-sided contamination the
+    /// minimum is the consistent estimator of the true cost and the mean is
+    /// not: the mean carries half of every outlier into the ranking.
+    ///
+    /// Measured on this host, the two draws of a single candidate differ by a
+    /// median of 1.21x, p90 1.90x, max 2.94x — so this is not a theoretical
+    /// distinction. One process scored k=7 at 822 ms because a single 1292 ms
+    /// draw was averaged with a 352 ms one; min would have scored it 352 and
+    /// ranked it correctly. `FLOCK_HYBRID_TUNE_MEAN=1` restores the mean.
+    fn reduce_ranked_exact_samples(
         samples: [[f64; 2]; RANKED_EXACT_TUNE_CANDIDATES.len()],
     ) -> Option<[f64; RANKED_EXACT_TUNE_CANDIDATES.len()]> {
-        let mut means = [0.0; RANKED_EXACT_TUNE_CANDIDATES.len()];
-        for (mean, [a, b]) in means.iter_mut().zip(samples) {
+        let use_mean = std::env::var_os("FLOCK_HYBRID_TUNE_MEAN").is_some();
+        let mut out = [0.0; RANKED_EXACT_TUNE_CANDIDATES.len()];
+        for (slot, [a, b]) in out.iter_mut().zip(samples) {
             if !a.is_finite() || !b.is_finite() || a < 0.0 || b < 0.0 {
                 return None;
             }
-            *mean = (a + b) * 0.5;
+            *slot = if use_mean { (a + b) * 0.5 } else { a.min(b) };
         }
-        Some(means)
+        Some(out)
     }
 
     #[inline]
     fn hybrid_tune_canonical_reprime_enabled() -> bool {
         std::env::var_os("FLOCK_NO_HYBRID_TUNE_CANONICAL_REPRIME").is_none()
+    }
+
+    /// Linear model of the hybrid commit's two arms, in milliseconds, fitted
+    /// from separately timed arms rather than from raced whole-graph draws.
+    ///
+    /// ```text
+    ///   G(k) = c_g + g*(16 - k)     GPU prefix;  G(0) = g0, measured directly
+    ///   C(k) = b + i_s + s*k        CPU side;    C(0) = b
+    /// ```
+    ///
+    /// `b` is the measured wall of the real round-1 A/B replay run alone — not
+    /// a modelled contention term. `g0` is measured rather than extrapolated
+    /// because `k = 0` dispatches the whole-range graph, which is cheaper per
+    /// sixteenth than the prefix graph's greedy aligned-subtree decomposition
+    /// (275 vs ~350 ms extrapolated on the previous base); extrapolating it
+    /// biased the selector against the pure-GPU schedule.
+    #[derive(Clone, Copy, Debug)]
+    struct BalanceFit {
+        g: f64,
+        c_g: f64,
+        g0: f64,
+        s: f64,
+        i_s: f64,
+        b: f64,
+    }
+
+    impl BalanceFit {
+        fn from_probes(
+            (k_g0, gpu0): (usize, f64),
+            (k_g1, gpu1): (usize, f64),
+            g0: f64,
+            (k_c0, cpu0): (usize, f64),
+            (k_c1, cpu1): (usize, f64),
+            b: f64,
+        ) -> Self {
+            let g = (gpu0 - gpu1) / (k_g1 as f64 - k_g0 as f64);
+            let c_g = gpu0 - g * (16 - k_g0) as f64;
+            let s = (cpu1 - cpu0) / (k_c1 as f64 - k_c0 as f64);
+            // A CPU suffix sixteenth is pure streaming work: the arm's fixed
+            // cost is small and cannot be negative. An intercept outside
+            // [0, s] means the two points disagree with linearity, i.e. one
+            // draw was contaminated; clamping bounds the damage to under one
+            // sixteenth without discarding the sample.
+            let i_s = (cpu0 - s * k_c0 as f64).clamp(0.0, s.max(0.0));
+            Self { g, c_g, g0, s, i_s, b }
+        }
+
+        fn gpu_ms(&self, k: usize) -> f64 {
+            if k == 0 {
+                self.g0
+            } else {
+                self.c_g + self.g * (16 - k) as f64
+            }
+        }
+
+        fn cpu_ms(&self, k: usize) -> f64 {
+            if k == 0 {
+                self.b
+            } else {
+                self.b + self.i_s + self.s * k as f64
+            }
+        }
+
+        fn wall_ms(&self, k: usize) -> f64 {
+            self.gpu_ms(k).max(self.cpu_ms(k))
+        }
+
+        /// Real-valued split where the two arms are equal.
+        fn balance_k(&self) -> f64 {
+            (self.c_g + 16.0 * self.g - self.b - self.i_s) / (self.g + self.s)
+        }
+
+        #[cfg(test)]
+        fn probe(g: f64, c_g: f64, g0: f64, s: f64, b: f64) -> Self {
+            let gpu = |k: usize| c_g + g * (16 - k) as f64;
+            let cpu = |k: usize| s * k as f64;
+            Self::from_probes((2, gpu(2)), (10, gpu(10)), g0, (2, cpu(2)), (6, cpu(6)), b)
+        }
+
+        fn is_well_posed(&self) -> bool {
+            self.g.is_finite()
+                && self.g > 0.0
+                && self.s.is_finite()
+                && self.s > 0.0
+                && self.g0.is_finite()
+                && self.g0 > 0.0
+                && self.b.is_finite()
+                && self.b >= 0.0
+                && self.balance_k().is_finite()
+        }
+    }
+
+    /// Time each arm of the hybrid commit alone and fit [`BalanceFit`].
+    ///
+    /// Five probe points, min over repeats (contamination is one-sided, so the
+    /// fastest draw is the least contaminated): the GPU prefix at 14/16 and
+    /// 6/16 of the range, the whole-range GPU graph, and the CPU suffix at
+    /// 2/16 and 6/16 — plus the real A/B replay timed alone. Nothing is raced,
+    /// so no estimate carries another arm's noise.
+    ///
+    /// The probes leave `staging` holding re-transformed garbage; that is
+    /// harmless (these kernels are data-independent in time) and the caller's
+    /// trust-but-verify run re-primes from `z` and byte-compares before any
+    /// split is published.
+    ///
+    /// # Safety
+    ///
+    /// The latched buffers must be exclusively owned for the duration.
+    unsafe fn calibrate_ranked_exact_arms(
+        gpu: &Gpu,
+        staging: Id,
+        tw_buf: Id,
+        tree_buf: Id,
+        log_d: usize,
+        n_leaves: usize,
+        replay_ab: &(impl Fn() + Sync),
+        dbg: bool,
+    ) -> Option<BalanceFit> {
+        // Well-separated points on each arm.
+        const K_G: (usize, usize) = (2, 10);
+        const K_C: (usize, usize) = (2, 6);
+        // The GPU arm reproduces to well under 1%; the CPU arm and the A/B
+        // replay are the noisy ones, so they get the extra draw.
+        const GPU_REPEATS: usize = 2;
+        const CPU_REPEATS: usize = 3;
+
+        let gpu_prefix_ms = |k: usize| -> Option<f64> {
+            let t0 = std::time::Instant::now();
+            let r = unsafe {
+                let pool = gpu.pool_push();
+                let r = (|| {
+                    let cb =
+                        encode_hybrid_prefix_cb2(gpu, staging, tw_buf, tree_buf, log_d, n_leaves, k)?;
+                    gpu.commit_async(cb);
+                    gpu.wait_cb(cb)
+                })();
+                gpu.pool_pop(pool);
+                r
+            };
+            r.ok().map(|()| t0.elapsed().as_secs_f64() * 1e3)
+        };
+        let gpu_whole_ms = || -> Option<f64> {
+            let t0 = std::time::Instant::now();
+            let r = unsafe {
+                run_commit_graph_after_from_z(gpu, staging, tw_buf, tree_buf, log_d, n_leaves)
+            };
+            r.ok().map(|()| t0.elapsed().as_secs_f64() * 1e3)
+        };
+        let cpu_suffix_ms = |k: usize| -> f64 {
+            let t0 = std::time::Instant::now();
+            unsafe { hybrid_cpu_suffix(gpu, staging, tree_buf, log_d, n_leaves, k) };
+            t0.elapsed().as_secs_f64() * 1e3
+        };
+        let ab_ms = || -> f64 {
+            let t0 = std::time::Instant::now();
+            replay_ab();
+            t0.elapsed().as_secs_f64() * 1e3
+        };
+
+        // Prebuild the CPU suffix twiddle table untimed.
+        let _ = hybrid_suffix_ntt(log_d);
+        let (mut g0p, mut g1p, mut gwh) = (f64::INFINITY, f64::INFINITY, f64::INFINITY);
+        let (mut c0, mut c1, mut b) = (f64::INFINITY, f64::INFINITY, f64::INFINITY);
+        for r in 0..CPU_REPEATS {
+            if r < GPU_REPEATS {
+                // Interleaved so drift biases every point alike.
+                g0p = g0p.min(gpu_prefix_ms(K_G.0)?);
+                g1p = g1p.min(gpu_prefix_ms(K_G.1)?);
+                gwh = gwh.min(gpu_whole_ms()?);
+            }
+            c0 = c0.min(cpu_suffix_ms(K_C.0));
+            c1 = c1.min(cpu_suffix_ms(K_C.1));
+            b = b.min(ab_ms());
+        }
+        let fit =
+            BalanceFit::from_probes((K_G.0, g0p), (K_G.1, g1p), gwh, (K_C.0, c0), (K_C.1, c1), b);
+        if !fit.is_well_posed() {
+            if dbg {
+                eprintln!("[gpu-commit] arm-rate calibration degenerate ({fit:?}); using scan");
+            }
+            return None;
+        }
+        Some(fit)
     }
 
     /// Untimed-warmup split sweep. The scoring host's CPU/GPU balance is
@@ -4509,25 +4743,122 @@ kernel void blake3_pow_scan(
                 params.k_code(),
             )
         };
-        let samples = match collect_ranked_exact_samples(reprime, sample) {
-            Ok(samples) => samples,
-            Err(e) => {
-                if dbg {
-                    eprintln!(
-                        "[gpu-commit] broad exact-AB tune failed ({e}); pinning verified k=0"
-                    );
+        // ---- arm-rate calibration (default) ----------------------------
+        // The scan above asks a hard question 16 times: it races the GPU
+        // prefix against the CPU suffix AND the A/B replay, then reads the
+        // `max()` of three interacting piles once per draw. Every candidate's
+        // estimate therefore carries the full noise of the slowest arm, and
+        // the plateau it must resolve is thinner than that noise — measured
+        // here, the two draws of one candidate differ by a median 1.30x and up
+        // to 3.55x, and the resulting pick lands anywhere in {0,2,3,4,5}.
+        //
+        // The arms are separable, so ask the easy question instead. The GPU
+        // owns `16 - k` sixteenths and the CPU owns `k`, each affine in its
+        // share, and the A/B pile is a fixed cost on the CPU side:
+        //
+        //     G(k) = c_g + g*(16 - k)        G(0) measured directly
+        //     C(k) = b + i_s + s*k           C(0) = b
+        //
+        // Wall = max(G, C), a `V` whose minimum is the crossing — so one RATE
+        // per arm determines it and the statistical power goes into repeats of
+        // three cheap points instead of one draw of eight expensive ones.
+        //
+        // What makes this better than the same trick applied to the old
+        // synthetic-burn tuner: `b` is no longer modelled. `replay_ab` is the
+        // real round-1 A/B closure, so timing it ALONE measures the exact pile
+        // the timed prove will run beside the commit. The contention fidelity
+        // that motivated this tuner is kept in full; only the estimator
+        // changes. Selection is then handed to the incumbent
+        // `choose_hybrid_k` over the modelled costs, so every promoted guard
+        // (1.5% near-tie band, default snap, 4% k=0 asymmetry) is byte-identical.
+        //
+        // `FLOCK_NO_HYBRID_ANALYTIC_K=1` restores the 8-candidate scan.
+        let analytic = std::env::var_os("FLOCK_NO_HYBRID_ANALYTIC_K").is_none();
+        let costs = if analytic {
+            match unsafe {
+                calibrate_ranked_exact_arms(
+                    ctx.gpu,
+                    ctx.staging,
+                    ctx.tw_buf,
+                    ctx.tree_buf,
+                    params.k_code(),
+                    params.n_leaves(),
+                    &replay_ab,
+                    dbg,
+                )
+            } {
+                Some(fit) => {
+                    let mut modelled = [0.0; RANKED_EXACT_TUNE_CANDIDATES.len()];
+                    for (slot, &k) in modelled.iter_mut().zip(&RANKED_EXACT_TUNE_CANDIDATES) {
+                        *slot = fit.wall_ms(k);
+                    }
+                    if dbg {
+                        let table: Vec<String> = RANKED_EXACT_TUNE_CANDIDATES
+                            .iter()
+                            .zip(modelled.iter())
+                            .map(|(k, ms)| format!("k={k}:{ms:.1}ms"))
+                            .collect();
+                        eprintln!(
+                            "[gpu-commit] arm-rate calibration: gpu {:.2} ms/16th + {:.1} ms \
+                             (k=0 graph {:.1} ms) | cpu {:.2} ms/16th + {:.1} ms | ab replay \
+                             {:.1} ms | balance k*={:.2} | modelled {}",
+                            fit.g,
+                            fit.c_g,
+                            fit.g0,
+                            fit.s,
+                            fit.i_s,
+                            fit.b,
+                            fit.balance_k(),
+                            table.join(" ")
+                        );
+                    }
+                    Some(modelled)
                 }
-                finish_ranked_exact_contention_tune(params, cpu_tree, 0);
-                return;
+                None => None,
             }
+        } else {
+            None
         };
-        let Some(means) = mean_ranked_exact_samples(samples) else {
-            finish_ranked_exact_contention_tune(params, cpu_tree, 0);
-            return;
+        let costs = match costs {
+            Some(c) => c,
+            None => {
+                // Degenerate fit, or the scan explicitly requested: fall back
+                // to the incumbent 8-candidate exact-contention sweep.
+                let samples = match collect_ranked_exact_samples(reprime, sample) {
+                    Ok(samples) => samples,
+                    Err(e) => {
+                        if dbg {
+                            eprintln!(
+                                "[gpu-commit] broad exact-AB tune failed ({e}); \
+                                 pinning verified k=0"
+                            );
+                        }
+                        finish_ranked_exact_contention_tune(params, cpu_tree, 0);
+                        return;
+                    }
+                };
+                if dbg {
+                    let table: Vec<String> = RANKED_EXACT_TUNE_CANDIDATES
+                        .iter()
+                        .enumerate()
+                        .map(|(i, k)| {
+                            format!("k={k}:[{:.1},{:.1}]", samples[i][0], samples[i][1])
+                        })
+                        .collect();
+                    eprintln!("[gpu-commit] broad exact-AB {}", table.join(" "));
+                }
+                match reduce_ranked_exact_samples(samples) {
+                    Some(c) => c,
+                    None => {
+                        finish_ranked_exact_contention_tune(params, cpu_tree, 0);
+                        return;
+                    }
+                }
+            }
         };
         let Some(chosen) = choose_hybrid_k(
             &RANKED_EXACT_TUNE_CANDIDATES,
-            &means,
+            &costs,
             DEFAULT_HYBRID_K,
         ) else {
             finish_ranked_exact_contention_tune(params, cpu_tree, 0);
@@ -4583,16 +4914,11 @@ kernel void blake3_pow_scan(
         if dbg {
             let table: Vec<String> = RANKED_EXACT_TUNE_CANDIDATES
                 .iter()
-                .enumerate()
-                .map(|(i, k)| {
-                    format!(
-                        "k={k}:[{:.1},{:.1}] mean={:.1}ms",
-                        samples[i][0], samples[i][1], means[i]
-                    )
-                })
+                .zip(costs.iter())
+                .map(|(k, ms)| format!("k={k}:{ms:.1}ms"))
                 .collect();
             eprintln!(
-                "[gpu-commit] broad exact-AB {} -> k={} verified={verified}",
+                "[gpu-commit] hybrid split costs {} -> k={} verified={verified}",
                 table.join(" "),
                 if verified { chosen } else { 0 },
             );
@@ -6368,7 +6694,7 @@ kernel void zc_fold_reduce(
     mod split_select_tests {
         use super::{
             DEFAULT_HYBRID_K, RANKED_EXACT_TUNE_CANDIDATES, choose_hybrid_k,
-            collect_ranked_exact_samples, mean_ranked_exact_samples,
+            collect_ranked_exact_samples, reduce_ranked_exact_samples,
         };
         const C: [usize; 8] = [0, 2, 3, 4, 5, 6, 7, 8];
 
@@ -6403,12 +6729,122 @@ kernel void zc_fold_reduce(
         }
 
         #[test]
-        fn exact_selection_uses_valid_balanced_means() {
+        fn exact_selection_takes_the_min_and_rejects_invalid() {
             let mut samples = [[100.0; 2]; RANKED_EXACT_TUNE_CANDIDATES.len()];
             samples[1] = [90.0, 110.0];
-            assert_eq!(mean_ranked_exact_samples(samples).unwrap()[1], 100.0);
+            // Contamination is one-sided, so the faster draw is the estimate.
+            assert_eq!(reduce_ranked_exact_samples(samples).unwrap()[1], 90.0);
             samples[1][1] = f64::NAN;
-            assert!(mean_ranked_exact_samples(samples).is_none());
+            assert!(reduce_ranked_exact_samples(samples).is_none());
+        }
+
+        #[test]
+        fn min_ranks_a_singly_contaminated_candidate_correctly() {
+            // The measured pathology: k=7 drew [352.0, 1292.7] and the mean
+            // (822.3) buried it behind candidates it actually beat.
+            let mut samples = [[400.0; 2]; RANKED_EXACT_TUNE_CANDIDATES.len()];
+            samples[6] = [352.0, 1292.7];
+            let reduced = reduce_ranked_exact_samples(samples).unwrap();
+            assert_eq!(reduced[6], 352.0);
+            assert!(
+                reduced[6] < reduced[0],
+                "contaminated candidate must still rank on its clean draw"
+            );
+        }
+
+        // ---- arm-rate calibration ----
+
+        use super::BalanceFit;
+
+        /// Selection exactly as the calibration path performs it: model every
+        /// candidate's wall from the fit, then hand it to the incumbent
+        /// selector so all promoted guards apply unchanged.
+        fn pick(fit: &BalanceFit) -> Option<usize> {
+            let mut modelled = [0.0; 8];
+            for (slot, &k) in modelled.iter_mut().zip(&C) {
+                *slot = fit.wall_ms(k);
+            }
+            choose_hybrid_k(&C, &modelled, DEFAULT_HYBRID_K)
+        }
+
+        #[test]
+        fn probes_recover_the_rates_exactly() {
+            let f = BalanceFit::probe(20.0, 15.0, 300.0, 30.0, 100.0);
+            assert!((f.g - 20.0).abs() < 1e-9, "{f:?}");
+            assert!((f.c_g - 15.0).abs() < 1e-9, "{f:?}");
+            assert!((f.s - 30.0).abs() < 1e-9, "{f:?}");
+            assert!(f.i_s.abs() < 1e-9, "{f:?}");
+            assert!(f.is_well_posed());
+        }
+
+        #[test]
+        fn balance_point_equalizes_the_arms() {
+            let f = BalanceFit::probe(20.0, 15.0, 300.0, 30.0, 100.0);
+            // G(k) = 335 - 20k ; C(k) = 100 + 30k ; crossing 235/50 = 4.7
+            assert!((f.balance_k() - 4.7).abs() < 1e-9, "{}", f.balance_k());
+            assert!((f.gpu_ms(5) - f.cpu_ms(5)).abs() < 60.0);
+        }
+
+        #[test]
+        fn k0_uses_the_measured_whole_range_graph_not_the_prefix_line() {
+            // The prefix line would extrapolate G(0) = 15 + 320 = 335, but the
+            // whole-range graph really costs 275: extrapolation would hide a
+            // decisive pure-GPU win behind the 4% asymmetry guard.
+            let f = BalanceFit::probe(20.0, 15.0, 275.0, 120.0, 60.0);
+            assert_eq!(f.gpu_ms(0), 275.0);
+            assert!(f.gpu_ms(0) < f.c_g + f.g * 16.0);
+            assert_eq!(pick(&f), Some(0));
+        }
+
+        #[test]
+        fn a_fast_cpu_moves_the_split_off_the_default() {
+            // Cheap suffix against an expensive GPU prefix: the balance runs
+            // past the default and out to the top of the candidate band.
+            let f = BalanceFit::probe(60.0, 20.0, 980.0, 10.0, 50.0);
+            assert!(f.balance_k() > 8.0, "{}", f.balance_k());
+            assert_eq!(pick(&f), Some(8));
+        }
+
+        #[test]
+        fn contaminated_cpu_intercept_is_clamped() {
+            // A real contaminated draw: k=2 at 64.4 ms (clean draws on the
+            // same host are 43-47) against k=6 at 117.4 fits i_s = 37.9 ms,
+            // which alone walks the balance point by ~0.9 sixteenths.
+            let f = BalanceFit::from_probes(
+                (2, 306.5),
+                (10, 131.3),
+                400.0,
+                (2, 64.4),
+                (6, 117.4),
+                200.0,
+            );
+            assert!(f.i_s >= 0.0 && f.i_s <= f.s, "i_s {} vs s {}", f.i_s, f.s);
+        }
+
+        #[test]
+        fn degenerate_fits_are_rejected() {
+            // Flat arms carry no rate, so there is no crossing to solve for.
+            let flat =
+                BalanceFit::from_probes((2, 100.0), (10, 100.0), 100.0, (2, 50.0), (6, 50.0), 100.0);
+            assert!(!flat.is_well_posed());
+            // A failed A/B replay timing must not be treated as free.
+            let bad = BalanceFit::probe(20.0, 15.0, 300.0, 30.0, f64::NAN);
+            assert!(!bad.is_well_posed());
+        }
+
+        #[test]
+        fn modelled_costs_are_a_v_around_the_balance_point() {
+            // max(decreasing, increasing) must be unimodal, which is what
+            // makes one rate per arm sufficient to locate the optimum.
+            let f = BalanceFit::probe(40.0, 10.0, 660.0, 20.0, 30.0);
+            let walls: Vec<f64> = (0..=15).map(|k| f.wall_ms(k)).collect();
+            let argmin = (1..=15).min_by(|&a, &b| walls[a].total_cmp(&walls[b])).unwrap();
+            for k in 1..argmin {
+                assert!(walls[k] >= walls[k + 1], "not decreasing at k={k}");
+            }
+            for k in argmin..15 {
+                assert!(walls[k] <= walls[k + 1], "not increasing at k={k}");
+            }
         }
 
         #[test]
