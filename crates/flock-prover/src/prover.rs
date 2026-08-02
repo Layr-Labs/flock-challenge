@@ -85,6 +85,23 @@ fn ranked_lincheck_c_reuse_enabled(r1cs: &BlockR1cs) -> bool {
         && std::env::var_os("FLOCK_NO_ZC_LINCHECK_C_REUSE").is_none()
 }
 
+/// Gather-fold latch: when set (default), the ranked `DeferredRanked` path
+/// skips the lincheck stripe fill entirely. Zerocheck folds identity C from
+/// the packed words via the incumbent direct-C route, and the lincheck
+/// round-one fold gathers from the words on the fly
+/// (`prove_padded_capture_z_vec_from_words`), so the fill's 512 MiB stripe
+/// write plus its two fold-time reads (~1 GiB DRAM) disappear.
+/// `FLOCK_NO_GATHER_LINCHECK_FOLD=1` restores the exact incumbent stripe
+/// path. Bit-exactness: the direct-C zerocheck route is byte-identical to
+/// the stripe-C route (`lincheck_stripe_c_proof_is_byte_identical`), and the
+/// gather-fold is byte-identical to folding the materialized stripe
+/// (`gather_fold_from_words_matches_stripe_fold` /
+/// `prove_from_words_matches_stripe_prove`).
+#[inline]
+fn gather_lincheck_fold_enabled() -> bool {
+    std::env::var_os("FLOCK_NO_GATHER_LINCHECK_FOLD").is_none()
+}
+
 fn precompute_ab_s_hat_v(
     r1cs: &BlockR1cs,
     z_vec: &[F128],
@@ -899,13 +916,22 @@ fn prove_fast_core_with_commit_codeword<Ch: Challenger>(
     // this join earlier adds no measured tail while eliminating C's 32-bank
     // row-major drain.
     let (pre_zerocheck, z_packed_lincheck) = match z_packed_lincheck {
-        LincheckStripeInput::Ready(stripe) => (run_commit(), stripe),
+        LincheckStripeInput::Ready(stripe) => (run_commit(), Some(stripe)),
         LincheckStripeInput::DeferredRanked => {
             assert_eq!(r1cs.m, 32);
             assert_eq!(r1cs.k_log, 14);
             assert_eq!(r1cs.useful_bits, 15_409);
-            let (m, k_log, useful_bits) = (r1cs.m, r1cs.k_log, r1cs.useful_bits);
-            let mut stripe = flock_core::scratch::take_u8(1usize << (m - 3));
+            if gather_lincheck_fold_enabled() {
+                // Gather-fold: no stripe. Zerocheck takes the incumbent
+                // direct-C route (byte-identical per
+                // lincheck_stripe_c_proof_is_byte_identical) and the lincheck
+                // fold gathers from the packed words on the fly, so the
+                // fill's 512 MiB stripe write and its two fold-time reads
+                // (~1 GiB DRAM) disappear from the timed region.
+                (run_commit(), None)
+            } else {
+                let (m, k_log, useful_bits) = (r1cs.m, r1cs.k_log, r1cs.useful_bits);
+                let mut stripe = flock_core::scratch::take_u8(1usize << (m - 3));
             // E2 is the measured contention optimum: E4 steals bandwidth from
             // commit, while E1 lets the stripe spill into zerocheck. Keep the
             // override for controlled same-binary diagnostics only.
@@ -961,7 +987,8 @@ fn prove_fast_core_with_commit_codeword<Ch: Challenger>(
                 }
                 pre
             });
-            (pre, stripe)
+                (pre, Some(stripe))
+            }
         }
     };
     let (commitment, prover_data, ab_inner) = pre_zerocheck;
@@ -989,21 +1016,25 @@ fn prove_fast_core_with_commit_codeword<Ch: Challenger>(
                 z_packed.len() * core::mem::size_of::<F128>(),
             )
         };
-        if ranked_lincheck_c_reuse_enabled(r1cs) {
-            zerocheck::prove_packed_padded_capture_s_hat_v_c_with_precomputed_ab_and_lincheck_c(
-                a_packed,
-                b_packed,
-                c_packed,
-                &z_packed_lincheck,
-                r1cs.m,
-                &padding,
-                ab_inner,
-                challenger,
-            )
-        } else {
-            zerocheck::prove_packed_padded_capture_s_hat_v_c_with_precomputed_ab(
+        match z_packed_lincheck.as_deref() {
+            Some(stripe) if ranked_lincheck_c_reuse_enabled(r1cs) => {
+                zerocheck::prove_packed_padded_capture_s_hat_v_c_with_precomputed_ab_and_lincheck_c(
+                    a_packed,
+                    b_packed,
+                    c_packed,
+                    stripe,
+                    r1cs.m,
+                    &padding,
+                    ab_inner,
+                    challenger,
+                )
+            }
+            // Gather-fold: no stripe, so the incumbent direct-C route (which
+            // folds the packed words) is used; byte-identical to the
+            // stripe-C route per lincheck_stripe_c_proof_is_byte_identical.
+            _ => zerocheck::prove_packed_padded_capture_s_hat_v_c_with_precomputed_ab(
                 a_packed, b_packed, c_packed, r1cs.m, &padding, ab_inner, challenger,
-            )
+            ),
         }
     };
     if phase_timing {
@@ -1026,20 +1057,42 @@ fn prove_fast_core_with_commit_codeword<Ch: Challenger>(
 
     // Capture lincheck's pre-sumcheck z_vec so the PCS open can derive the
     // AB-claim's `s_hat_v` from it (skips fold_1b_rows for AB).
-    let (lc_proof, lc_claim, z_vec_pre) = lincheck::prove_padded_capture_z_vec(
-        &z_packed_lincheck,
-        r1cs.m,
-        r1cs.k_log,
-        r1cs.k_skip,
-        r1cs.useful_bits,
-        lincheck_circuit,
-        &x_ab,
-        challenger,
-    );
+    let (lc_proof, lc_claim, z_vec_pre) = if let Some(stripe) = z_packed_lincheck.as_deref() {
+        lincheck::prove_padded_capture_z_vec(
+            stripe,
+            r1cs.m,
+            r1cs.k_log,
+            r1cs.k_skip,
+            r1cs.useful_bits,
+            lincheck_circuit,
+            &x_ab,
+            challenger,
+        )
+    } else {
+        // Gather-fold: the witness words ARE the packed z (no stripe).
+        let z_words: &[u8] = unsafe {
+            std::slice::from_raw_parts(
+                z_packed.as_ptr() as *const u8,
+                z_packed.len() * core::mem::size_of::<F128>(),
+            )
+        };
+        lincheck::prove_padded_capture_z_vec_from_words(
+            z_words,
+            r1cs.m,
+            r1cs.k_log,
+            r1cs.k_skip,
+            r1cs.useful_bits,
+            lincheck_circuit,
+            &x_ab,
+            challenger,
+        )
+    };
     // The lincheck stripe copy of z is dead from here on; return it to the
     // scratch byte pool before the PCS open (2^(m-3) bytes — 512 MB at
     // m = 32) so the next prove reuses its resident pages.
-    flock_core::scratch::give_u8(z_packed_lincheck);
+    if let Some(stripe) = z_packed_lincheck {
+        flock_core::scratch::give_u8(stripe);
+    }
 
     let ab = ZClaim {
         point: r1cs.ab_claim_point(lc_claim.r_inner_skip, &lc_claim.r_inner_rest, &x_ab.x_outer),

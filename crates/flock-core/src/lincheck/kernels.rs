@@ -7,7 +7,8 @@ pub use aarch64::{
 };
 #[cfg(target_arch = "aarch64")]
 pub(crate) use aarch64::{
-    oblock_claim_count, oblock_claim_stripe_base, partial_fold_packed_z_neon_oblock_padded_range,
+    oblock_claim_count, oblock_claim_stripe_base, partial_fold_packed_z_neon_oblock_padded_from_words,
+    partial_fold_packed_z_neon_oblock_padded_range,
     partial_fold_packed_z_neon_oblock_padded_suffix,
 };
 

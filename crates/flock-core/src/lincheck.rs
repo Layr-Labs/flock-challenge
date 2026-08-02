@@ -135,7 +135,8 @@ pub use kernels::{
 #[cfg(target_arch = "aarch64")]
 #[cfg_attr(not(target_os = "macos"), allow(unused_imports))]
 pub(crate) use kernels::{
-    oblock_claim_count, oblock_claim_stripe_base, partial_fold_packed_z_neon_oblock_padded_range,
+    oblock_claim_count, oblock_claim_stripe_base, partial_fold_packed_z_neon_oblock_padded_from_words,
+    partial_fold_packed_z_neon_oblock_padded_range,
     partial_fold_packed_z_neon_oblock_padded_suffix,
 };
 
@@ -727,6 +728,63 @@ pub fn partial_fold_packed_z_fast_padded(
         )
 }
 
+/// **Gather-fold reference**: fold the lincheck stripe directly from the
+/// F_{2^128}-packed witness, skipping stripe materialization entirely.
+///
+/// The deferred ranked fill (`fill_deferred_lincheck_stripe_group` in
+/// flock-prover) re-layouts the packed witness into byte stripes: stripe
+/// byte `(g, i)` holds bits of outers `8g..8g+8` at inner `i`. For a 64-bit
+/// word offset `word`, the 8 lanes `z_u64[(8g + r)·u64_per_block + word]`
+/// transpose (8×64 → 64 bytes) into exactly `stripe[g·k + 64·word .. +64]`.
+/// A fold can therefore gather those bytes on the fly: each 64-byte chunk
+/// costs the same 512 witness bits the fill reads (1:1 byte amplification),
+/// but the 512 MiB stripe write and its later fold-time read both disappear.
+///
+/// This is the **portable reference contract** the aarch64 gather-fold
+/// kernel must mirror: bit-identical to
+/// [`partial_fold_packed_z_fast_padded`] over the materialized stripe on
+/// honestly padded witnesses. Lane indexing `(8g + r)·u64_per_block + word`
+/// and [`crate::bits::transpose_8_u64s_to_64_bytes`] output order are the
+/// same expressions the deferred fill already uses, so a NEON twin that
+/// matches the fill's gather byte-for-byte is correct by construction.
+pub fn partial_fold_packed_z_from_words_padded(
+    z_u64: &[u64],
+    m: usize,
+    k_log: usize,
+    useful_bits: usize,
+    eq_outer: &[F128],
+) -> Vec<F128> {
+    let n_log = m - k_log;
+    let k = 1usize << k_log;
+    let n_outer = 1usize << n_log;
+    let u64_per_block = k / 64;
+    assert_eq!(z_u64.len(), n_outer * u64_per_block);
+    assert_eq!(eq_outer.len(), n_outer);
+    assert!(n_log >= 3, "need n_outer ≥ 8 for byte stripes");
+    assert!(useful_bits <= k);
+    let n_stripes = n_outer / 8;
+    let useful_words = useful_bits.div_ceil(64);
+
+    let mut out = vec![F128::ZERO; k];
+    let mut chunk = [0u8; 64];
+    let mut table = [F128::ZERO; 256];
+    for byte_idx in 0..n_stripes {
+        build_sum_table(&eq_outer[8 * byte_idx..8 * byte_idx + 8], &mut table);
+        for word in 0..useful_words {
+            let lanes: [u64; 8] =
+                std::array::from_fn(|r| z_u64[(8 * byte_idx + r) * u64_per_block + word]);
+            crate::bits::transpose_8_u64s_to_64_bytes(&lanes, &mut chunk);
+            let base = word * 64;
+            for (j, &byte) in chunk.iter().enumerate() {
+                if byte != 0 {
+                    out[base + j] += table[byte as usize];
+                }
+            }
+        }
+    }
+    out
+}
+
 /// Stripes swept per accumulator touch in the NEON tiled partial fold.
 /// Larger ⇒ the length-`k` accumulator is re-streamed fewer times
 /// (`n_stripes / NEON_TILE_T`), but the per-tile sum tables grow
@@ -784,6 +842,50 @@ pub(crate) fn partial_fold_packed_z_best(
     } else {
         partial_fold_packed_z_fast_padded(z_packed, m, k_log, useful_bits, eq_outer)
     }
+}
+
+/// Dispatch helper for the **gather-fold**: fold the oblock range directly
+/// from the F128-packed witness words (`z_words` = byte view of the packed
+/// `F128`/`u64` words), skipping stripe materialization. Bit-identical to
+/// [`partial_fold_packed_z_best`] over the materialized stripe (see
+/// [`partial_fold_packed_z_from_words_padded`] for the portable contract).
+/// The ranked shape (m=32, k_log=14, n_log=18) takes the NEON
+/// from-words oblock kernel; everything else uses the portable gather
+/// reference (correct on every host; only aarch64 is scored).
+pub(crate) fn partial_fold_packed_z_best_from_words(
+    z_words: &[u8],
+    m: usize,
+    k_log: usize,
+    useful_bits: usize,
+    eq_outer: &[F128],
+) -> Vec<F128> {
+    let words = words_as_u64(z_words);
+    if k_log >= 6 && n_log_ok_for_tile(m, k_log, NEON_TILE_T) {
+        #[cfg(target_arch = "aarch64")]
+        {
+            return partial_fold_packed_z_neon_oblock_padded_from_words(
+                z_words,
+                m,
+                k_log,
+                useful_bits,
+                eq_outer,
+            );
+        }
+        #[cfg(not(target_arch = "aarch64"))]
+        {
+            return partial_fold_packed_z_from_words_padded(words, m, k_log, useful_bits, eq_outer);
+        }
+    }
+    partial_fold_packed_z_from_words_padded(words, m, k_log, useful_bits, eq_outer)
+}
+
+/// Little-endian u64 view of the packed witness bytes (8-aligned, as the
+/// F128-packed buffers always are). Same cast the fill and the reference
+/// gather use.
+fn words_as_u64(z_words: &[u8]) -> &[u64] {
+    assert_eq!(z_words.len() % 8, 0);
+    // SAFETY: u64 is 8-aligned and has no invalid bit patterns.
+    unsafe { std::slice::from_raw_parts(z_words.as_ptr() as *const u64, z_words.len() / 8) }
 }
 
 /// Outer-dimension threshold (`n_log = m − k_log`) at/above which the
@@ -1323,6 +1425,7 @@ pub fn prove_padded<Ch: Challenger>(
         circuit,
         x_ab,
         false,
+        false,
         challenger,
     );
     (proof, claim)
@@ -1356,6 +1459,44 @@ pub fn prove_padded_capture_z_vec<Ch: Challenger>(
         circuit,
         x_ab,
         true,
+        false,
+        challenger,
+    );
+    (
+        proof,
+        claim,
+        captured.expect("capture=true must produce z_vec"),
+    )
+}
+
+/// Gather-fold variant of [`prove_padded_capture_z_vec`]: folds the
+/// lincheck round-one witness directly from the F128-packed words
+/// (`z_words` = byte view of the packed witness, NOT the materialized
+/// stripe), so the caller can skip `pack_z_lincheck_from_packed` and its
+/// 512 MiB stripe write + fold-time read entirely. Bit-identical to
+/// [`prove_padded_capture_z_vec`] on honestly padded witnesses — the
+/// portable contract is [`partial_fold_packed_z_from_words_padded`], and the
+/// NEON gather-fold mirrors the fill's own gather expressions.
+pub fn prove_padded_capture_z_vec_from_words<Ch: Challenger>(
+    z_words: &[u8],
+    m: usize,
+    k_log: usize,
+    k_skip: usize,
+    useful_bits: usize,
+    circuit: &dyn LincheckCircuit,
+    x_ab: &QuirkyPoint,
+    challenger: &mut Ch,
+) -> (LincheckProof, LincheckClaim, Vec<F128>) {
+    let (proof, claim, captured) = prove_padded_inner(
+        z_words,
+        m,
+        k_log,
+        k_skip,
+        useful_bits,
+        circuit,
+        x_ab,
+        true,
+        true,
         challenger,
     );
     (
@@ -1375,6 +1516,7 @@ fn prove_padded_inner<Ch: Challenger>(
     circuit: &dyn LincheckCircuit,
     x_ab: &QuirkyPoint,
     capture_z_vec: bool,
+    from_words: bool,
     challenger: &mut Ch,
 ) -> (LincheckProof, LincheckClaim, Option<Vec<F128>>) {
     let k = 1usize << k_log;
@@ -1445,8 +1587,11 @@ fn prove_padded_inner<Ch: Challenger>(
             None
         };
         let eq_x_outer = build_eq_table(&x_ab.x_outer);
-        let z_vec =
-            partial_fold_packed_z_best_gpu_split(z_packed, m, k_log, useful_bits, &eq_x_outer);
+        let z_vec = if from_words {
+            partial_fold_packed_z_best_from_words(z_packed, m, k_log, useful_bits, &eq_x_outer)
+        } else {
+            partial_fold_packed_z_best_gpu_split(z_packed, m, k_log, useful_bits, &eq_x_outer)
+        };
         if let Some(t) = t {
             eprintln!(
                 "[lc] {:<26} {:>7.2} ms",
@@ -2047,6 +2192,113 @@ mod tests {
                 partial_fold_packed_z_neon_oblock_padded(&z_packed, m, k_log, useful_bits, &eq);
             assert_eq!(want, got, "m={m} k_log={k_log} useful={useful_bits}");
         }
+    }
+
+    /// The gather-fold reference (fold directly from F128-packed words,
+    /// skipping stripe materialization) must reproduce the incumbent
+    /// stripe fold bit-for-bit on honestly padded witnesses. This is the
+    /// portable contract the lincheck fusion's aarch64 kernel will mirror.
+    #[test]
+    fn gather_fold_from_words_matches_stripe_fold() {
+        for &(m, k_log, useful) in &[
+            (14usize, 6, 64),
+            (16, 8, 256),
+            (18, 8, 256),
+            (18, 10, 1024),
+            (20, 14, 15_409),
+        ] {
+            let k = 1usize << k_log;
+            let n_outer = 1usize << (m - k_log);
+            assert!(useful <= k);
+            let mut rng = Rng::new(
+                0x5EED_CAFE_u64.wrapping_add((m * 131 + k_log * 17 + useful) as u64),
+            );
+            let mut z = rng.bits(1 << m);
+            for blk in 0..n_outer {
+                for j in useful..k {
+                    z[blk * k + j] = false;
+                }
+            }
+            // Same u64 view the deferred ranked fill gathers from.
+            let z_words: Vec<u64> = z
+                .chunks_exact(64)
+                .map(|bits| {
+                    bits.iter()
+                        .enumerate()
+                        .fold(0u64, |acc, (j, &b)| acc | ((b as u64) << j))
+                })
+                .collect();
+            let eq = build_eq_table(&rng.f128_vec(m - k_log));
+            let stripe = pack_z_lincheck(&z, m, k_log);
+            let want = partial_fold_packed_z_fast_padded(&stripe, m, k_log, useful, &eq);
+            let got = partial_fold_packed_z_from_words_padded(&z_words, m, k_log, useful, &eq);
+            assert_eq!(want, got, "m={m} k_log={k_log} useful={useful}");
+        }
+    }
+
+    /// Prove-level gather-fold oracle: `prove_padded_capture_z_vec_from_words`
+    /// is byte-identical to `prove_padded_capture_z_vec` over the materialized
+    /// stripe on an honestly zero-padded witness (same circuit, point, and
+    /// challenger seed; transcript, claim, and captured z_vec must all match).
+    #[test]
+    fn prove_from_words_matches_stripe_prove() {
+        const M: usize = 16;
+        const K_LOG: usize = 8;
+        const K_SKIP: usize = 6;
+        const USEFUL: usize = 256;
+        let mut rng = Rng::new(0xBEEF_2026);
+        let k = 1usize << K_LOG;
+        let a_0 = random_sparse_matrix(k, k * 2, &mut rng);
+        let b_0 = random_sparse_matrix(k, k * 2, &mut rng);
+        let mut z = rng.bits(1 << M);
+        // Honestly zero-pad rows [USEFUL, k) of every block.
+        let n_outer = 1usize << (M - K_LOG);
+        for blk in 0..n_outer {
+            for j in USEFUL..k {
+                z[blk * k + j] = false;
+            }
+        }
+        let x_ab = random_quirky_point(M, K_LOG, K_SKIP, &mut rng);
+        let circuit = SparseMatrixCircuit::new(&a_0, &b_0);
+        let stripe = pack_z_lincheck(&z, M, K_LOG);
+        let z_words: Vec<u64> = z
+            .chunks_exact(64)
+            .map(|bits| {
+                bits.iter()
+                    .enumerate()
+                    .fold(0u64, |acc, (j, &b)| acc | ((b as u64) << j))
+            })
+            .collect();
+        // SAFETY: u64-aligned; same byte view the prover passes (cast of the
+        // F128-packed witness).
+        let z_words_bytes: &[u8] = unsafe {
+            std::slice::from_raw_parts(z_words.as_ptr() as *const u8, z_words.len() * 8)
+        };
+        let mut ch1 = FsChallenger::new(b"flock-gather-v0");
+        let (proof1, claim1, zvec1) = prove_padded_capture_z_vec(
+            &stripe,
+            M,
+            K_LOG,
+            K_SKIP,
+            USEFUL,
+            &circuit,
+            &x_ab,
+            &mut ch1,
+        );
+        let mut ch2 = FsChallenger::new(b"flock-gather-v0");
+        let (proof2, claim2, zvec2) = prove_padded_capture_z_vec_from_words(
+            z_words_bytes,
+            M,
+            K_LOG,
+            K_SKIP,
+            USEFUL,
+            &circuit,
+            &x_ab,
+            &mut ch2,
+        );
+        assert_eq!(proof1, proof2, "transcript differs");
+        assert_eq!(claim1, claim2, "claim differs");
+        assert_eq!(zvec1, zvec2, "z_vec differs");
     }
 
     /// `useful_bits = k`, several tile-eligible sizes).

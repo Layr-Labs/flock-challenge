@@ -594,3 +594,165 @@ pub(crate) fn oblock_padded_tiled<const TILE_T: usize>(
     });
     out
 }
+
+/// **Gather-fold twin** of [`oblock_padded_tiled`]: folds the oblock range
+/// directly from the F128-packed witness words, skipping stripe
+/// materialization entirely. Stripe byte `(g, i)` = bit `i` of outers
+/// `8g..8g+8`, which is exactly `z_u64[(8g + r)·u64_per_block + word]`
+/// bit `i%64` transposed — the same expression the deferred fill gathers
+/// from ([`crate::bits::transpose_8_u64s_to_64_bytes`], same NEON kernel),
+/// so a fold that gathers on the fly is bit-identical to folding the
+/// materialized stripe.
+///
+/// Ledger: the stripe's 512 MiB write and its fold-time read both disappear
+/// (the fill is eliminated); the witness words are read once, sequentially,
+/// in per-tile 128 KiB regions (each tile's 64 consecutive outer rows are
+/// contiguous in `z_u64` at `k_log = 14`) — one sequential DRAM stream per
+/// tile instead of a 64-stream strided gather, then transpose + fold from
+/// cache. The per-tile table build and the `process_block_neon_single`
+/// accumulator sweep are byte-identical to the stripe fold's.
+#[cfg(target_arch = "aarch64")]
+pub(crate) fn partial_fold_packed_z_neon_oblock_padded_from_words(
+    z_words: &[u8],
+    m: usize,
+    k_log: usize,
+    useful_bits: usize,
+    eq_outer: &[F128],
+) -> Vec<F128> {
+    oblock_padded_tiled_from_words::<NEON_TILE_T>(z_words, m, k_log, useful_bits, eq_outer)
+}
+
+#[cfg(target_arch = "aarch64")]
+pub(crate) fn oblock_padded_tiled_from_words<const TILE_T: usize>(
+    z_words: &[u8],
+    m: usize,
+    k_log: usize,
+    useful_bits: usize,
+    eq_outer: &[F128],
+) -> Vec<F128> {
+    use rayon::prelude::*;
+
+    const BLOCK_K: usize = 8;
+
+    let n_log = m - k_log;
+    let k = 1usize << k_log;
+    let n_outer = 1usize << n_log;
+    let u64_per_block = k / 64;
+    assert_eq!(z_words.len(), n_outer * u64_per_block * 8);
+    assert_eq!(eq_outer.len(), n_outer);
+    assert!(
+        n_log >= 3 + TILE_T.trailing_zeros() as usize,
+        "need n_outer ≥ 8·TILE_T stripes"
+    );
+    assert!(k_log >= 6, "need u64 words (k ≥ 64)");
+    assert!(useful_bits <= k);
+    let n_stripes = n_outer / 8;
+    assert_eq!(n_stripes % TILE_T, 0);
+    assert_eq!(k % BLOCK_K, 0);
+    let n_tiles = n_stripes / TILE_T;
+
+    // Only i_inner < useful_bits can be nonzero (padded rows fold to 0).
+    // Rounded up to BLOCK_K; columns [useful, k) stay zero from the partial
+    // init, exactly as in the stripe twin's `bs < useful` bound.
+    let useful = (useful_bits.div_ceil(BLOCK_K) * BLOCK_K).min(k);
+    if useful == 0 {
+        return vec![F128::ZERO; k];
+    }
+    // SAFETY: the caller hands the byte view of a `Vec<F128>`/`Vec<u64>`
+    // (little-endian, 8-aligned). The reference gather uses the same cast.
+    let z_u64: &[u64] = unsafe {
+        std::slice::from_raw_parts(z_words.as_ptr() as *const u64, z_words.len() / 8)
+    };
+
+    const TILES_PER_CLAIM: usize = OBLOCK_TILES_PER_CLAIM;
+    let n_claims_total = n_tiles.div_ceil(TILES_PER_CLAIM);
+    let n_claims = n_claims_total;
+    if n_claims == 0 {
+        return vec![F128::ZERO; k];
+    }
+    let mut partials = crate::alloc_uninit_f128_vec(n_claims * k);
+    let partials_base = crate::epool::SyncPtr(partials.as_mut_ptr());
+    crate::epool::run_hetero_chunks(n_claims, |c| {
+        let claim = c;
+        let tile_lo = claim * TILES_PER_CLAIM;
+        let tile_hi = ((claim + 1) * TILES_PER_CLAIM).min(n_tiles);
+        // SAFETY: the queue hands out each claim index exactly once; claim
+        // `c` exclusively owns `partials[c·k .. (c+1)·k]`, which it fully
+        // zero-initializes below before any read. The queue join publishes
+        // all writes before the reduction reads them.
+        let partial = unsafe { std::slice::from_raw_parts_mut(partials_base.ptr().add(c * k), k) };
+        // SAFETY: F128 is Copy and all-zero bytes are valid F128::ZERO.
+        unsafe {
+            std::ptr::write_bytes(partial.as_mut_ptr(), 0, k);
+        }
+        // TILE_T × 256 F128 tables, L1-resident, built once per tile.
+        let mut tables = vec![F128::ZERO; TILE_T * 256];
+        // Per-block gather staging: chunks[g] = the 64 transposed bytes of
+        // stripe group g for the current column word; bytes8 = one block's
+        // 8×8 byte tile fed to the register-accumulator kernel.
+        let mut chunks = [[0u8; 64]; 8];
+        let mut bytes8 = [0u64; 8];
+        for tile in tile_lo..tile_hi {
+            let stripe_base = tile * TILE_T;
+            for t in 0..TILE_T {
+                let eq_off = 8 * (stripe_base + t);
+                build_sum_table(
+                    &eq_outer[eq_off..eq_off + 8],
+                    &mut tables[t * 256..(t + 1) * 256],
+                );
+            }
+            let tables_ptr = tables.as_ptr() as *const u8;
+            // First outer row of the tile = tile·TILE_T·8. The tile's 64
+            // consecutive outer rows are contiguous in z_u64: one sequential
+            // 128 KiB DRAM stream at k_log = 14, then gather+transpose from
+            // cache (L1/L2-resident after the first few words).
+            let outer_lo = stripe_base * 8;
+            let z_tile = &z_u64[outer_lo * u64_per_block..(outer_lo + 64) * u64_per_block];
+            for w in 0..useful.div_ceil(64) {
+                for g in 0..8 {
+                    let mut lanes = [0u64; 8];
+                    for r in 0..8 {
+                        lanes[r] = z_tile[(8 * g + r) * u64_per_block + w];
+                    }
+                    crate::bits::transpose_8_u64s_to_64_bytes(&lanes, &mut chunks[g]);
+                }
+                for b in 0..8 {
+                    let col = w * 64 + b * 8;
+                    if col >= useful {
+                        continue;
+                    }
+                    for g in 0..8 {
+                        bytes8[g] = u64::from_le_bytes(
+                            chunks[g][b * 8..b * 8 + 8].try_into().unwrap(),
+                        );
+                    }
+                    unsafe {
+                        process_block_neon_single::<TILE_T>(
+                            bytes8.as_ptr() as *const u8,
+                            8,
+                            0,
+                            tables_ptr,
+                            partial.as_mut_ptr().add(col),
+                        );
+                    }
+                }
+            }
+        }
+    });
+    let n_workers = n_claims;
+
+    // XOR-reduce the per-worker partials in ONE parallel pass over column
+    // bands (identical structure to [`oblock_padded_tiled`]).
+    let band = k.div_ceil(rayon::current_num_threads().max(1)).max(1024);
+    let mut out = vec![F128::ZERO; k];
+    out.par_chunks_mut(band).enumerate().for_each(|(bi, dst)| {
+        let lo = bi * band;
+        for w in 0..n_workers {
+            let src = &partials[w * k + lo..w * k + lo + dst.len()];
+            for (o, s) in dst.iter_mut().zip(src.iter()) {
+                *o += *s;
+            }
+        }
+    });
+    out
+}
