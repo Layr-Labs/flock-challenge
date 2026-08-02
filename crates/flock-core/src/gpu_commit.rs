@@ -43,34 +43,6 @@ pub const ENV_NO_LAZY_GPU_CODEWORD: &str = "FLOCK_NO_LAZY_GPU_CODEWORD";
 /// wall-clock win (A/B and test tooling).
 pub const ENV_GPU_COMMIT_FORCE: &str = "FLOCK_GPU_COMMIT_FORCE";
 
-/// Kill switch for the embedded-metallib library load: `FLOCK_NO_GPU_METALLIB=1`
-/// restores the incumbent runtime MSL source compile as a same-binary control.
-/// The metallib path changes *no* timed work — it only removes the per-process
-/// MSL frontend compile from the untimed init (job wall seconds, ×120 worker
-/// processes per run).
-pub const ENV_NO_GPU_METALLIB: &str = "FLOCK_NO_GPU_METALLIB";
-
-pub(crate) fn gpu_metallib_enabled() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os(ENV_NO_GPU_METALLIB).is_none())
-}
-
-/// Kill switch for the cross-process warmup latch cache:
-/// `FLOCK_NO_WARMUP_LATCH_CACHE=1` restores the incumbent full dual-run +
-/// autotune sweep in every worker process. The cache changes **no timed
-/// work**: it only lets worker processes after the first skip the untimed
-/// CPU reference commit and the untimed autotune sweep by byte-comparing
-/// their own GPU warmup output against the first worker's published CPU
-/// reference tree (same fixed warmup seed in every worker ⇒ identical
-/// bytes). The ranked CI job pays the warmup in ~120 fresh processes
-/// against a hard 8-minute wall; this deletes the redundant ~119 repeats.
-pub const ENV_NO_WARMUP_LATCH_CACHE: &str = "FLOCK_NO_WARMUP_LATCH_CACHE";
-
-pub(crate) fn warmup_latch_cache_enabled() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os(ENV_NO_WARMUP_LATCH_CACHE).is_none())
-}
-
 /// Env var that disables this round's NTT pass tuning (the g4 shared-table +
 /// zero-region-skip from-z kernel and the half-footprint final-pass kernel),
 /// restoring the incumbent kernel selection as the same-binary control.
@@ -79,19 +51,6 @@ pub const ENV_NO_NTT_PASS_TUNE: &str = "FLOCK_NO_NTT_PASS_TUNE";
 /// Disable only the mixed-algebra ranked final NTT pass, restoring the
 /// incumbent h8 kernel as a same-binary control.
 pub const ENV_NO_GPU_MIXED_FINAL: &str = "FLOCK_NO_GPU_MIXED_FINAL";
-
-/// Exact-`1` control for keeping the warmup's ranked z allocation bound to
-/// its retained Metal no-copy view across later proves.
-pub const ENV_NO_GPU_Z_PIN: &str = "FLOCK_NO_GPU_Z_PIN";
-
-fn gpu_z_pin_value_enabled(value: Option<&std::ffi::OsStr>) -> bool {
-    value != Some(std::ffi::OsStr::new("1"))
-}
-
-fn gpu_z_pin_enabled() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| gpu_z_pin_value_enabled(std::env::var_os(ENV_NO_GPU_Z_PIN).as_deref()))
-}
 
 /// Strict kill switch for the fused three-level GPU Merkle parent pass. Only
 /// exact value `1` disables it; the optimization remains ranked-tree-only.
@@ -125,19 +84,6 @@ mod parent3_gate_tests {
         assert!(super::select_gpu_parent3(1 << 20, true));
         assert!(!super::select_gpu_parent3(1 << 20, false));
         assert!(!super::select_gpu_parent3(1 << 19, true));
-    }
-}
-
-#[cfg(test)]
-mod z_pin_gate_tests {
-    use std::ffi::OsStr;
-
-    #[test]
-    fn exact_one_is_the_only_z_pin_kill_value() {
-        assert!(!super::gpu_z_pin_value_enabled(Some(OsStr::new("1"))));
-        for value in [None, Some(""), Some("0"), Some("01"), Some("true")] {
-            assert!(super::gpu_z_pin_value_enabled(value.map(OsStr::new)));
-        }
     }
 }
 
@@ -372,114 +318,6 @@ pub fn note_precompute_branch_wall_ms(ms: f64) {
     PRECOMPUTE_BRANCH_WALL_MS.store(ms.to_bits(), std::sync::atomic::Ordering::Relaxed);
 }
 
-/// Process-local lifecycle of the broad exact-contention calibration. The
-/// ranked prover requests it before entering the call-zero warmup join. A
-/// valid cross-process cache hit satisfies it in the commit arm; otherwise
-/// the post-join replay claims it exactly once.
-const RANKED_EXACT_TUNE_IDLE: u8 = 0;
-const RANKED_EXACT_TUNE_REQUESTED: u8 = 1;
-const RANKED_EXACT_TUNE_SATISFIED: u8 = 2;
-static RANKED_EXACT_TUNE_STATE: std::sync::atomic::AtomicU8 =
-    std::sync::atomic::AtomicU8::new(RANKED_EXACT_TUNE_IDLE);
-
-fn request_ranked_exact_tune_in(state: &std::sync::atomic::AtomicU8) -> bool {
-    state
-        .compare_exchange(
-            RANKED_EXACT_TUNE_IDLE,
-            RANKED_EXACT_TUNE_REQUESTED,
-            std::sync::atomic::Ordering::AcqRel,
-            std::sync::atomic::Ordering::Acquire,
-        )
-        .is_ok()
-}
-
-fn ranked_exact_tune_pending_in(state: &std::sync::atomic::AtomicU8) -> bool {
-    state.load(std::sync::atomic::Ordering::Acquire) == RANKED_EXACT_TUNE_REQUESTED
-}
-
-fn satisfy_ranked_exact_tune_in(state: &std::sync::atomic::AtomicU8) -> bool {
-    state
-        .compare_exchange(
-            RANKED_EXACT_TUNE_REQUESTED,
-            RANKED_EXACT_TUNE_SATISFIED,
-            std::sync::atomic::Ordering::AcqRel,
-            std::sync::atomic::Ordering::Acquire,
-        )
-        .is_ok()
-}
-
-/// Request the call-zero exact-AB calibration. The canonical-reprime kill
-/// switch deliberately suppresses the request, restoring the incumbent
-/// synthetic tuner and its V2 cache without changing binaries.
-#[doc(hidden)]
-pub fn request_ranked_exact_contention_tune() -> bool {
-    if std::env::var_os("FLOCK_NO_HYBRID_TUNE_CANONICAL_REPRIME").is_some() {
-        return false;
-    }
-    request_ranked_exact_tune_in(&RANKED_EXACT_TUNE_STATE)
-}
-
-/// Whether call zero requested an exact replay that a cache hit has not yet
-/// satisfied. Sampled before the warmup commit/AB join.
-#[doc(hidden)]
-pub fn ranked_exact_contention_tune_pending() -> bool {
-    ranked_exact_tune_pending_in(&RANKED_EXACT_TUNE_STATE)
-}
-
-fn satisfy_ranked_exact_contention_tune() {
-    let _ = satisfy_ranked_exact_tune_in(&RANKED_EXACT_TUNE_STATE);
-}
-
-fn claim_ranked_exact_contention_tune() -> bool {
-    satisfy_ranked_exact_tune_in(&RANKED_EXACT_TUNE_STATE)
-}
-
-#[cfg(test)]
-mod ranked_exact_tune_lifecycle_tests {
-    use super::{
-        RANKED_EXACT_TUNE_IDLE, ranked_exact_tune_pending_in, request_ranked_exact_tune_in,
-        satisfy_ranked_exact_tune_in,
-    };
-    use std::sync::atomic::AtomicU8;
-
-    #[test]
-    fn cache_miss_replay_is_claimed_only_once() {
-        let state = AtomicU8::new(RANKED_EXACT_TUNE_IDLE);
-        assert!(request_ranked_exact_tune_in(&state));
-        assert!(ranked_exact_tune_pending_in(&state));
-        assert!(satisfy_ranked_exact_tune_in(&state));
-        assert!(!ranked_exact_tune_pending_in(&state));
-        assert!(!request_ranked_exact_tune_in(&state));
-        assert!(!satisfy_ranked_exact_tune_in(&state));
-    }
-
-    #[test]
-    fn cache_hit_satisfies_before_post_join_claim() {
-        let state = AtomicU8::new(RANKED_EXACT_TUNE_IDLE);
-        assert!(request_ranked_exact_tune_in(&state));
-        assert!(satisfy_ranked_exact_tune_in(&state));
-        assert!(!ranked_exact_tune_pending_in(&state));
-        assert!(!satisfy_ranked_exact_tune_in(&state));
-    }
-}
-
-/// Run the one requested broad exact-contention calibration while the
-/// warmup's read-only A/B inputs and CPU-authoritative commit remain live.
-#[doc(hidden)]
-pub fn retune_ranked_hybrid_with_exact_contention(
-    params: &crate::pcs::commit::PcsParams,
-    cpu_codeword: &[F128],
-    cpu_tree: &[crate::merkle::Hash],
-    replay_ab: impl Fn() + Sync,
-) {
-    imp::retune_ranked_hybrid_with_exact_contention(
-        params,
-        cpu_codeword,
-        cpu_tree,
-        replay_ab,
-    );
-}
-
 #[cfg_attr(
     not(all(target_os = "macos", target_arch = "aarch64")),
     allow(dead_code)
@@ -612,15 +450,6 @@ mod imp {
         pool_pop: unsafe extern "C" fn(*mut c_void),
         create_system_default_device: unsafe extern "C" fn() -> Id,
         copy_all_devices: unsafe extern "C" fn() -> Id,
-        /// `dispatch_data_create` from libSystem, used only to wrap the
-        /// embedded metallib for `newLibraryWithData:error:`. Optional so a
-        /// resolution failure can never break the incumbent source-compile
-        /// path.
-        dispatch_data_create:
-            Option<unsafe extern "C" fn(*const c_void, usize, *mut c_void, *mut c_void) -> Id>,
-        /// `dispatch_release` (skipping the release leaks one ~e2 KiB data
-        /// object once per process — harmless — so this too is optional).
-        dispatch_release: Option<unsafe extern "C" fn(Id)>,
     }
     // SAFETY: all fields are process-global immutable function pointers.
     unsafe impl Send for Api {}
@@ -676,16 +505,6 @@ mod imp {
                         Ok(p)
                     }
                 };
-                // libSystem is already loaded in every process; dlopen only
-                // bumps its refcount and hands back the handle. Failures here
-                // must not fail Api::load — they only disable the metallib
-                // fast path.
-                let libsystem = dlopen(c"/usr/lib/libSystem.B.dylib".as_ptr().cast(), RTLD_NOW);
-                let opt_sym = |h: *mut c_void, name: &core::ffi::CStr| -> *mut c_void {
-                    if h.is_null() { std::ptr::null_mut() } else { dlsym(h, name.as_ptr()) }
-                };
-                let ddc = opt_sym(libsystem, c"dispatch_data_create");
-                let drel = opt_sym(libsystem, c"dispatch_release");
                 Ok(Api {
                     msg_send: sym(objc, c"objc_msgSend")?,
                     get_class: core::mem::transmute(sym(objc, c"objc_getClass")?),
@@ -700,16 +519,6 @@ mod imp {
                         metal,
                         c"MTLCopyAllDevices",
                     )?),
-                    dispatch_data_create: if ddc.is_null() {
-                        None
-                    } else {
-                        Some(core::mem::transmute(ddc))
-                    },
-                    dispatch_release: if drel.is_null() {
-                        None
-                    } else {
-                        Some(core::mem::transmute(drel))
-                    },
                 })
             }
         }
@@ -1528,97 +1337,6 @@ kernel void parent_hash3(device const uint* children [[buffer(0)]],
 "#;
 
     // -----------------------------------------------------------------------
-    // Embedded precompiled metallib.
-    //
-    // The MSL source above is compiled offline (`xcrun metal` → `metallib`)
-    // and the resulting library shipped as bytes. At init the library is
-    // created with `newLibraryWithData:error:`, skipping the per-process MSL
-    // frontend compile (~1e2 ms). This changes no timed work — init happens
-    // before the untimed warmup prove — but each benchmark run pays init in
-    // 120 fresh worker processes, and the job wall-clock those processes
-    // consume is capped. The backend (AIR → GPU binary) compile in
-    // `newComputePipelineStateWithFunction:` still runs per process either
-    // way, so pipeline behavior is unchanged.
-    //
-    // Staleness guard: `METALLIB_MSL_FNV1A` records the FNV-1a hash of
-    // `MSL_SOURCE` at the moment the metallib was generated. The const
-    // comparison below (and the unit test) force the embedded binary to be
-    // regenerated whenever the source string changes; on mismatch the loader
-    // compiles from source exactly as before. Any load failure — wrong OS,
-    // rejected container, missing kernel — falls back to the incumbent source
-    // path, whose code is byte-for-byte untouched.
-    // -----------------------------------------------------------------------
-
-    const METALLIB: &[u8] = include_bytes!("gpu_shaders.metallib");
-
-    /// FNV-1a (64-bit) of `MSL_SOURCE` when `gpu_shaders.metallib` was built.
-    const METALLIB_MSL_FNV1A: u64 = 0x7566daf1e26ffbf1;
-
-    const fn fnv1a64(s: &str) -> u64 {
-        let bytes = s.as_bytes();
-        let mut hash: u64 = 0xcbf29ce484222325;
-        let mut i = 0;
-        while i < bytes.len() {
-            hash ^= bytes[i] as u64;
-            hash = hash.wrapping_mul(0x100000001b3);
-            i += 1;
-        }
-        hash
-    }
-
-    /// Compile-time: does the embedded metallib correspond to `MSL_SOURCE`?
-    const METALLIB_FRESH: bool = fnv1a64(MSL_SOURCE) == METALLIB_MSL_FNV1A;
-
-    #[cfg(test)]
-    mod metallib_guard_tests {
-        #[test]
-        fn embedded_metallib_matches_msl_source() {
-            // If this fails, `MSL_SOURCE` changed after the metallib was
-            // generated: re-extract the source, recompile with
-            // `xcrun -sdk macosx metal`, and update `METALLIB_MSL_FNV1A`.
-            assert!(
-                super::METALLIB_FRESH,
-                "gpu_shaders.metallib is stale: MSL_SOURCE fnv1a = {:#x}",
-                super::fnv1a64(super::MSL_SOURCE)
-            );
-            assert!(!super::METALLIB.is_empty());
-        }
-    }
-
-    /// Try to create the MTLLibrary from the embedded metallib. Returns
-    /// `NIL` on any failure so the caller falls back to the source compile.
-    unsafe fn try_embedded_metallib(api: &Api, device: Id) -> Id {
-        if !METALLIB_FRESH || !super::gpu_metallib_enabled() {
-            return NIL;
-        }
-        let Some(create) = api.dispatch_data_create else {
-            return NIL;
-        };
-        unsafe {
-            // NULL queue + NULL destructor = DISPATCH_DATA_DESTRUCTOR_DEFAULT:
-            // dispatch copies the bytes, so the static slice's lifetime is
-            // irrelevant to Metal.
-            let data = create(METALLIB.as_ptr().cast(), METALLIB.len(), NIL, NIL);
-            if data.is_null() {
-                return NIL;
-            }
-            let mut err: Id = NIL;
-            let library: Id = send!(
-                api,
-                unsafe extern "C" fn(Id, Sel, Id, *mut Id) -> Id,
-                device,
-                c"newLibraryWithData:error:",
-                data,
-                &mut err
-            );
-            if let Some(release) = api.dispatch_release {
-                release(data);
-            }
-            library
-        }
-    }
-
-    // -----------------------------------------------------------------------
     // Context: device, queue, pipelines. Created once per process.
     // -----------------------------------------------------------------------
 
@@ -1689,89 +1407,59 @@ kernel void parent_hash3(device const uint* children [[buffer(0)]],
                 if queue.is_null() {
                     return Err("newCommandQueue failed".into());
                 }
-                // Library + pipelines: try the embedded metallib first (no MSL
-                // frontend compile); on ANY failure — load rejected, kernel
-                // missing, pipeline error — rebuild everything from the MSL
-                // source exactly as the incumbent path did. The source compile
-                // is never reached when the metallib pipelines all build.
-                const KERNELS: [&str; 11] = [
-                    "ntt_fused",
-                    "ntt_fused_reg4g4",
-                    "ntt_fused_reg4",
-                    "ntt_fused_reg3",
-                    "ntt_fused_reg4_from_z",
-                    "ntt_fused_reg4_from_zg4",
-                    "ntt_fused_reg4h8",
-                    "ntt_pass5_mixed",
-                    "leaf_hash",
-                    "parent_hash",
-                    "parent_hash3",
-                ];
-                let build_psos = |library: Id| -> Result<[Id; 11], String> {
-                    let mut out = [NIL; 11];
-                    for (slot, name) in out.iter_mut().zip(KERNELS) {
-                        let ns = api.nsstring(name)?;
-                        let f: Id = send!(
-                            api,
-                            unsafe extern "C" fn(Id, Sel, Id) -> Id,
-                            library,
-                            c"newFunctionWithName:",
-                            ns
-                        );
-                        if f.is_null() {
-                            return Err(format!("kernel {name} not found"));
-                        }
-                        let mut err: Id = NIL;
-                        let p: Id = send!(
-                            api,
-                            unsafe extern "C" fn(Id, Sel, Id, *mut Id) -> Id,
-                            device,
-                            c"newComputePipelineStateWithFunction:error:",
-                            f,
-                            &mut err
-                        );
-                        send!(api, unsafe extern "C" fn(Id, Sel) -> Id, f, c"release");
-                        if p.is_null() {
-                            return Err(format!("pipeline {name}: {}", api.error_string(err)));
-                        }
-                        *slot = p;
-                    }
-                    Ok(out)
-                };
-                let mut psos: Option<[Id; 11]> = None;
-                let prebuilt = try_embedded_metallib(&api, device);
-                if !prebuilt.is_null() {
-                    if let Ok(p) = build_psos(prebuilt) {
-                        psos = Some(p);
-                    }
-                    send!(api, unsafe extern "C" fn(Id, Sel) -> Id, prebuilt, c"release");
+                let src = api.nsstring(MSL_SOURCE)?;
+                let mut err: Id = NIL;
+                let library: Id = send!(
+                    api,
+                    unsafe extern "C" fn(Id, Sel, Id, Id, *mut Id) -> Id,
+                    device,
+                    c"newLibraryWithSource:options:error:",
+                    src,
+                    NIL,
+                    &mut err
+                );
+                if library.is_null() {
+                    return Err(format!("shader compile failed: {}", api.error_string(err)));
                 }
-                let [pso_ntt, pso_ntt4g4, pso_ntt4, pso_ntt3, pso_ntt4z, pso_ntt4zg4, pso_ntt4h8, pso_ntt5mix, pso_leaf, pso_parent, pso_parent3] =
-                    match psos {
-                        Some(p) => p,
-                        None => {
-                            let src = api.nsstring(MSL_SOURCE)?;
-                            let mut err: Id = NIL;
-                            let library: Id = send!(
-                                api,
-                                unsafe extern "C" fn(Id, Sel, Id, Id, *mut Id) -> Id,
-                                device,
-                                c"newLibraryWithSource:options:error:",
-                                src,
-                                NIL,
-                                &mut err
-                            );
-                            if library.is_null() {
-                                return Err(format!(
-                                    "shader compile failed: {}",
-                                    api.error_string(err)
-                                ));
-                            }
-                            let p = build_psos(library)?;
-                            send!(api, unsafe extern "C" fn(Id, Sel) -> Id, library, c"release");
-                            p
-                        }
-                    };
+                let pso = |name: &str| -> Result<Id, String> {
+                    let ns = api.nsstring(name)?;
+                    let f: Id = send!(
+                        api,
+                        unsafe extern "C" fn(Id, Sel, Id) -> Id,
+                        library,
+                        c"newFunctionWithName:",
+                        ns
+                    );
+                    if f.is_null() {
+                        return Err(format!("kernel {name} not found"));
+                    }
+                    let mut err: Id = NIL;
+                    let p: Id = send!(
+                        api,
+                        unsafe extern "C" fn(Id, Sel, Id, *mut Id) -> Id,
+                        device,
+                        c"newComputePipelineStateWithFunction:error:",
+                        f,
+                        &mut err
+                    );
+                    send!(api, unsafe extern "C" fn(Id, Sel) -> Id, f, c"release");
+                    if p.is_null() {
+                        return Err(format!("pipeline {name}: {}", api.error_string(err)));
+                    }
+                    Ok(p)
+                };
+                let pso_ntt = pso("ntt_fused")?;
+                let pso_ntt4g4 = pso("ntt_fused_reg4g4")?;
+                let pso_ntt4 = pso("ntt_fused_reg4")?;
+                let pso_ntt3 = pso("ntt_fused_reg3")?;
+                let pso_ntt4z = pso("ntt_fused_reg4_from_z")?;
+                let pso_ntt4zg4 = pso("ntt_fused_reg4_from_zg4")?;
+                let pso_ntt4h8 = pso("ntt_fused_reg4h8")?;
+                let pso_ntt5mix = pso("ntt_pass5_mixed")?;
+                let pso_leaf = pso("leaf_hash")?;
+                let pso_parent = pso("parent_hash")?;
+                let pso_parent3 = pso("parent_hash3")?;
+                send!(api, unsafe extern "C" fn(Id, Sel) -> Id, library, c"release");
                 Ok(Gpu {
                     api,
                     device,
@@ -2446,10 +2134,9 @@ kernel void parent_hash3(device const uint* children [[buffer(0)]],
         /// Metal memory during the open are ordinary cached reads).
         staging: Id,
         /// No-copy read-only wraps of caller z buffers: `(ptr, len, buffer)`.
-        /// The default ranked latch pins the warmup z allocation across
-        /// proves, so steady state holds the one entry created and page-wired
-        /// during untimed warmup. The kill-switched incumbent behavior can
-        /// still append a wrap when scratch chooses a different address.
+        /// The pooled z allocation is stable across the worker's warmup and
+        /// timed proves, so this normally holds one entry created AND
+        /// page-wired during the untimed warmup.
         wraps: Vec<(usize, usize, Id)>,
     }
     // SAFETY: Metal objects are thread-safe; access is serialized by LATCH.
@@ -3312,12 +2999,6 @@ kernel void parent_hash3(device const uint* children [[buffer(0)]],
     static TUNED_HYBRID_K: std::sync::atomic::AtomicUsize =
         std::sync::atomic::AtomicUsize::new(usize::MAX);
 
-    /// CPU reference-commit wall from the cache-miss warmup. Cache
-    /// publication waits for the exact-contention winner, so no cache-hit
-    /// worker can observe the untuned sentinel.
-    static RANKED_EXACT_PENDING_CPU_WALL_BITS: std::sync::atomic::AtomicU64 =
-        std::sync::atomic::AtomicU64::new(0);
-
     /// Exact override / kill-switch resolution. `FLOCK_NO_HYBRID_COMMIT`
     /// forces the pure-GPU graph; `FLOCK_HYBRID_CPU_BLOCKS` pins an exact
     /// split. Either also disables the warmup sweep.
@@ -3333,13 +3014,6 @@ kernel void parent_hash3(device const uint* children [[buffer(0)]],
                 .and_then(|v| v.parse().ok())
                 .filter(|k| *k < 16)
         })
-    }
-
-    fn ranked_exact_tune_applicable(params: &crate::pcs::commit::PcsParams) -> bool {
-        super::is_ranked_gpu_shape(params)
-            && hybrid_cpu_split_override().is_none()
-            && std::env::var_os("FLOCK_NO_HYBRID_AUTOTUNE").is_none()
-            && hybrid_tune_canonical_reprime_enabled()
     }
 
     /// Pure selection over the sweep's per-candidate best walls; `candidates`
@@ -3372,50 +3046,6 @@ kernel void parent_hash3(device const uint* children [[buffer(0)]],
         Some(chosen)
     }
 
-    /// Broad candidate set retained deliberately: the warmup cache publishes
-    /// the first process's winner to later workers, so the one calibration
-    /// process should search both pure GPU and the full observed hybrid
-    /// plateau instead of narrowing around a development-host optimum.
-    const RANKED_EXACT_TUNE_CANDIDATES: [usize; 8] = [0, 2, 3, 4, 5, 6, 7, 8];
-
-    /// Two samples per candidate, with the second pass in reverse order so
-    /// thermal drift, queue warmup, and A/B replay cache state do not favor
-    /// either end of the search range. Selection consumes the mean rather
-    /// than a noise-sensitive minimum.
-    fn collect_ranked_exact_samples<E>(
-        mut reprime: impl FnMut() -> Result<(), E>,
-        mut sample: impl FnMut(usize) -> Result<f64, E>,
-    ) -> Result<[[f64; 2]; RANKED_EXACT_TUNE_CANDIDATES.len()], E> {
-        let mut walls = [[0.0; 2]; RANKED_EXACT_TUNE_CANDIDATES.len()];
-        for (i, &k) in RANKED_EXACT_TUNE_CANDIDATES.iter().enumerate() {
-            reprime()?;
-            walls[i][0] = sample(k)?;
-        }
-        for (i, &k) in RANKED_EXACT_TUNE_CANDIDATES.iter().enumerate().rev() {
-            reprime()?;
-            walls[i][1] = sample(k)?;
-        }
-        Ok(walls)
-    }
-
-    fn mean_ranked_exact_samples(
-        samples: [[f64; 2]; RANKED_EXACT_TUNE_CANDIDATES.len()],
-    ) -> Option<[f64; RANKED_EXACT_TUNE_CANDIDATES.len()]> {
-        let mut means = [0.0; RANKED_EXACT_TUNE_CANDIDATES.len()];
-        for (mean, [a, b]) in means.iter_mut().zip(samples) {
-            if !a.is_finite() || !b.is_finite() || a < 0.0 || b < 0.0 {
-                return None;
-            }
-            *mean = (a + b) * 0.5;
-        }
-        Some(means)
-    }
-
-    #[inline]
-    fn hybrid_tune_canonical_reprime_enabled() -> bool {
-        std::env::var_os("FLOCK_NO_HYBRID_TUNE_CANONICAL_REPRIME").is_none()
-    }
-
     /// Untimed-warmup split sweep. The scoring host's CPU/GPU balance is
     /// unknown at build time: the same fixed split that wins on a small-GPU
     /// dev host over-allocates a Max-class GPU host's CPU and vice versa
@@ -3442,15 +3072,6 @@ kernel void parent_hash3(device const uint* children [[buffer(0)]],
             return;
         }
         let dbg = debug_enabled() || std::env::var_os("FLOCK_COMMIT_TIMING").is_some();
-        if super::ranked_exact_contention_tune_pending() {
-            // The outer warmup join will replay its real A/B branch beside a
-            // balanced broad sweep. Avoid double-tuning against a synthetic
-            // burn and leave publication to the verified exact winner.
-            if dbg {
-                eprintln!("[gpu-commit] autotune: deferring to broad exact-AB replay");
-            }
-            return;
-        }
         let z_buf = latched.wraps[0].2;
         let (tw_buf, tree_buf, staging) = (latched.tw_buf, latched.tree_buf, latched.staging);
         struct GraphCtx<'a> {
@@ -3568,18 +3189,16 @@ kernel void parent_hash3(device const uint* children [[buffer(0)]],
                 std::hint::black_box(x);
             });
         };
-        // The V2 cross-process warmup cache makes the original, protected-
-        // positive streamed tuner affordable again: only the first worker
-        // calibrates, while the remaining workers restore its verified k.
-        // Re-prime canonical post-layer-3 staging before EVERY candidate,
-        // outside the timer, then measure exactly the graph used by the
-        // scored streamed proof. The former wall-safe approximation primed
-        // once, repeatedly transformed stale staging, and subtracted a
-        // first-pass wall from an interval that did not contain that pass.
-        // Keep an exact same-binary rollback for paired measurements.
-        let canonical_reprime = streamed_probe
-            && std::env::var_os("FLOCK_NO_HYBRID_TUNE_CANONICAL_REPRIME").is_none();
-        let first_pass_ms = if streamed_probe && !canonical_reprime {
+        // Wall-safe streamed-regime correction: the per-candidate staging
+        // re-prime form runs the from-z first pass 8+ extra times per
+        // warm-up; multiplied by the harness's ~120 fresh worker processes
+        // that spends minutes of JOB wall against the ranked CI's 8-minute
+        // budget (three above-bar submissions died to it as "failed"
+        // timeouts before the mechanism was identified). The first pass is
+        // k-INDEPENDENT, so measuring its wall once and subtracting the
+        // constant from each candidate's full-graph wall yields the same
+        // corrected ranking at one extra pass total.
+        let first_pass_ms = if streamed_probe {
             let c = &ctx;
             let t0 = std::time::Instant::now();
             match unsafe { run_from_z_first_pass(c.gpu, c.z_buf, c.staging, c.tw_buf, log_d) } {
@@ -3597,12 +3216,6 @@ kernel void parent_hash3(device const uint* children [[buffer(0)]],
             0.0
         };
         let contended_run = |k: usize| -> Result<f64, String> {
-            if canonical_reprime {
-                let c = &ctx;
-                unsafe {
-                    run_from_z_first_pass(c.gpu, c.z_buf, c.staging, c.tw_buf, log_d)?;
-                }
-            }
             let t0 = std::time::Instant::now();
             let (r, ()) = rayon::join(|| timed_graph(k), burn_work);
             r?;
@@ -3700,201 +3313,6 @@ kernel void parent_hash3(device const uint* children [[buffer(0)]],
         TUNED_HYBRID_K.store(chosen, std::sync::atomic::Ordering::Relaxed);
     }
 
-    /// Contention-faithful broad calibration for the exact ranked prover.
-    /// The ordinary tuner can only synthesize round-1 A/B work; this path is
-    /// called after the warmup join and runs the actual read-only A/B closure
-    /// beside every candidate graph. Each sample first restores canonical
-    /// staging outside the timer, and the winner is verified against the
-    /// CPU-authoritative warmup codeword and Merkle tree before publication.
-    pub(crate) fn retune_ranked_hybrid_with_exact_contention(
-        params: &crate::pcs::commit::PcsParams,
-        cpu_codeword: &[F128],
-        cpu_tree: &[Hash],
-        replay_ab: impl Fn() + Sync,
-    ) {
-        use std::sync::atomic::Ordering;
-
-        if !ranked_exact_tune_applicable(params)
-            || !super::claim_ranked_exact_contention_tune()
-        {
-            return;
-        }
-
-        let dbg = debug_enabled() || std::env::var_os("FLOCK_COMMIT_TIMING").is_some();
-        let latch = LATCH.lock().unwrap();
-        let LatchState::On(latched) = &*latch else {
-            finish_ranked_exact_contention_tune(params, cpu_tree, 0);
-            return;
-        };
-        if STAGING_IN_USE.load(Ordering::Acquire) {
-            // This callback belongs immediately after call-zero warmup,
-            // whose ProverData is CPU-owned. Refuse any later invocation
-            // rather than overwrite a live GPU codeword view.
-            finish_ranked_exact_contention_tune(params, cpu_tree, 0);
-            return;
-        }
-        let Ok(gpu) = gpu() else {
-            finish_ranked_exact_contention_tune(params, cpu_tree, 0);
-            return;
-        };
-
-        struct GraphCtx<'a> {
-            gpu: &'a Gpu,
-            z_buf: Id,
-            staging: Id,
-            tw_buf: Id,
-            tree_buf: Id,
-        }
-        // SAFETY: the latch is held for the full calibration, Metal command
-        // submission is thread-safe, and only one graph arm runs at a time.
-        unsafe impl Send for GraphCtx<'_> {}
-        unsafe impl Sync for GraphCtx<'_> {}
-
-        let ctx = GraphCtx {
-            gpu,
-            z_buf: latched.wraps[0].2,
-            staging: latched.staging,
-            tw_buf: latched.tw_buf,
-            tree_buf: latched.tree_buf,
-        };
-        let timed_graph = |k: usize| -> Result<(), String> {
-            let c = &ctx;
-            unsafe {
-                if k == 0 {
-                    run_commit_graph_after_from_z(
-                        c.gpu,
-                        c.staging,
-                        c.tw_buf,
-                        c.tree_buf,
-                        params.k_code(),
-                        params.n_leaves(),
-                    )
-                } else {
-                    run_commit_graph_from_z_hybrid_impl(
-                        c.gpu,
-                        c.z_buf,
-                        c.staging,
-                        c.tw_buf,
-                        c.tree_buf,
-                        params.k_code(),
-                        params.n_leaves(),
-                        k,
-                        true,
-                        None,
-                    )
-                }
-            }
-        };
-        let sample = |k: usize| -> Result<f64, String> {
-            let t0 = std::time::Instant::now();
-            let (graph, ()) = rayon::join(|| timed_graph(k), || replay_ab());
-            graph?;
-            Ok(t0.elapsed().as_secs_f64() * 1e3)
-        };
-        let reprime = || unsafe {
-            run_from_z_first_pass(
-                ctx.gpu,
-                ctx.z_buf,
-                ctx.staging,
-                ctx.tw_buf,
-                params.k_code(),
-            )
-        };
-        let samples = match collect_ranked_exact_samples(reprime, sample) {
-            Ok(samples) => samples,
-            Err(e) => {
-                if dbg {
-                    eprintln!(
-                        "[gpu-commit] broad exact-AB tune failed ({e}); pinning verified k=0"
-                    );
-                }
-                finish_ranked_exact_contention_tune(params, cpu_tree, 0);
-                return;
-            }
-        };
-        let Some(means) = mean_ranked_exact_samples(samples) else {
-            finish_ranked_exact_contention_tune(params, cpu_tree, 0);
-            return;
-        };
-        let Some(chosen) = choose_hybrid_k(
-            &RANKED_EXACT_TUNE_CANDIDATES,
-            &means,
-            DEFAULT_HYBRID_K,
-        ) else {
-            finish_ranked_exact_contention_tune(params, cpu_tree, 0);
-            return;
-        };
-
-        let verified = unsafe {
-            if chosen == 0 {
-                run_commit_graph_from_z(
-                    gpu,
-                    ctx.z_buf,
-                    ctx.staging,
-                    ctx.tw_buf,
-                    ctx.tree_buf,
-                    params.k_code(),
-                    params.n_leaves(),
-                )
-            } else {
-                run_commit_graph_from_z_hybrid(
-                    gpu,
-                    ctx.z_buf,
-                    ctx.staging,
-                    ctx.tw_buf,
-                    ctx.tree_buf,
-                    params.k_code(),
-                    params.n_leaves(),
-                    chosen,
-                )
-            }
-        }
-        .is_ok()
-            && cpu_codeword.len() == params.codeword_len_f128()
-            && cpu_tree.len() == 2 * params.n_leaves() - 1
-            && unsafe {
-                bytes_equal_parallel(
-                    gpu.buffer_contents(ctx.staging),
-                    core::slice::from_raw_parts(
-                        cpu_codeword.as_ptr().cast::<u8>(),
-                        core::mem::size_of_val(cpu_codeword),
-                    ),
-                )
-            }
-            && unsafe {
-                bytes_equal_parallel(
-                    gpu.buffer_contents(ctx.tree_buf),
-                    core::slice::from_raw_parts(
-                        cpu_tree.as_ptr().cast::<u8>(),
-                        core::mem::size_of_val(cpu_tree),
-                    ),
-                )
-            };
-
-        if dbg {
-            let table: Vec<String> = RANKED_EXACT_TUNE_CANDIDATES
-                .iter()
-                .enumerate()
-                .map(|(i, k)| {
-                    format!(
-                        "k={k}:[{:.1},{:.1}] mean={:.1}ms",
-                        samples[i][0], samples[i][1], means[i]
-                    )
-                })
-                .collect();
-            eprintln!(
-                "[gpu-commit] broad exact-AB {} -> k={} verified={verified}",
-                table.join(" "),
-                if verified { chosen } else { 0 },
-            );
-        }
-        finish_ranked_exact_contention_tune(
-            params,
-            cpu_tree,
-            if verified { chosen } else { 0 },
-        );
-    }
-
     /// Use the ranked cache-local deep-pair CPU suffix and hash each finalized
     /// chunk before eviction. `FLOCK_NO_HYBRID_CPU_SUFFIX_DEEP=1` restores the
     /// original all-layer streaming suffix plus separate leaf-hash pass for an
@@ -3909,158 +3327,6 @@ kernel void parent_hash3(device const uint* children [[buffer(0)]],
         latched: Latched,
         gpu_tree: Vec<Hash>,
         gpu_wall_ms: f64,
-    }
-
-    // -----------------------------------------------------------------------
-    // Cross-process warmup latch cache.
-    //
-    // Every worker process proves the same fixed warmup seed, so the CPU
-    // reference commit is byte-identical across all ~120 processes of a
-    // ranked run. The first process performs the incumbent full dual-run
-    // (CPU arm under real precompute contention, GPU arm, full codeword +
-    // tree byte compare, autotune sweep with its trust-but-verify compare)
-    // and publishes {latch decision, tuned k, CPU wall, full CPU reference
-    // tree} to the shared scratch directory (`TMPDIR`, the only writable
-    // path inside the ranked Seatbelt profile). Later processes run only
-    // their own GPU warmup graph and byte-compare their complete Merkle
-    // tree against the published CPU reference: the tree commits to every
-    // codeword byte, so per-process bit-exactness enforcement is preserved
-    // at full strength, while the redundant CPU arm and the ~12-graph-run
-    // autotune sweep are skipped. The latch wall margin is re-applied per
-    // process with the worker's own GPU wall against the cached CPU wall.
-    //
-    // Any read/validate/compare failure falls back to the incumbent full
-    // dual-run. Nothing timed changes in any path.
-    // -----------------------------------------------------------------------
-
-    const WARMUP_CACHE_MAGIC_V2: u64 = 0x464C_4B5F_574C_4332; // "FLK_WLC2"
-    // V3 excludes V2 entries published before calibration was deferred; such
-    // entries can contain the usize::MAX untuned sentinel. The canonical
-    // reprime kill switch deliberately returns to the incumbent V2 cache.
-    const WARMUP_CACHE_MAGIC_V3: u64 = 0x464C_4B5F_574C_4333; // "FLK_WLC3"
-
-    fn warmup_cache_magic() -> u64 {
-        if hybrid_tune_canonical_reprime_enabled() {
-            WARMUP_CACHE_MAGIC_V3
-        } else {
-            WARMUP_CACHE_MAGIC_V2
-        }
-    }
-
-    /// Cache key component tying entries to the exact GPU kernel source.
-    const WARMUP_CACHE_MSL_FNV: u64 = fnv1a64(MSL_SOURCE);
-
-    struct WarmupCache {
-        latch_on: bool,
-        tuned_k: usize,
-        cpu_wall_ms: f64,
-        /// Root node of the CPU reference tree (`tree[2·n_leaves − 2]`). The
-        /// root commits to every codeword byte and every tree node through
-        /// BLAKE3 parent compression, so a per-process root compare enforces
-        /// the same bit-exactness the full-buffer compare did, at 32 bytes
-        /// instead of a 64 MiB scratch round-trip per worker.
-        cpu_root: Hash,
-    }
-
-    fn warmup_cache_path() -> std::path::PathBuf {
-        let version = if hybrid_tune_canonical_reprime_enabled() { 3 } else { 2 };
-        std::env::temp_dir().join(format!("flock-warmup-latch-v{version}.bin"))
-    }
-
-    fn read_warmup_cache(log_d: usize, n_leaves: usize) -> Option<WarmupCache> {
-        let bytes = std::fs::read(warmup_cache_path()).ok()?;
-        let mut off = 0usize;
-        let mut take_u64 = |bytes: &[u8]| -> Option<u64> {
-            let v = u64::from_le_bytes(bytes.get(off..off + 8)?.try_into().ok()?);
-            off += 8;
-            Some(v)
-        };
-        if take_u64(&bytes)? != warmup_cache_magic() {
-            return None;
-        }
-        if take_u64(&bytes)? != WARMUP_CACHE_MSL_FNV {
-            return None;
-        }
-        if take_u64(&bytes)? != log_d as u64 || take_u64(&bytes)? != n_leaves as u64 {
-            return None;
-        }
-        let latch_on = take_u64(&bytes)? == 1;
-        let tuned_k = take_u64(&bytes)? as usize;
-        let cpu_wall_ms = f64::from_bits(take_u64(&bytes)?);
-        if !cpu_wall_ms.is_finite() || cpu_wall_ms <= 0.0 || tuned_k >= 16 {
-            return None;
-        }
-        let root_bytes = bytes.get(off..)?;
-        if root_bytes.len() != core::mem::size_of::<Hash>() {
-            return None;
-        }
-        let mut cpu_root: Hash = [0u8; 32];
-        cpu_root.copy_from_slice(root_bytes);
-        Some(WarmupCache { latch_on, tuned_k, cpu_wall_ms, cpu_root })
-    }
-
-    fn write_warmup_cache(
-        log_d: usize,
-        n_leaves: usize,
-        latch_on: bool,
-        tuned_k: usize,
-        cpu_wall_ms: f64,
-        cpu_tree: &[Hash],
-    ) {
-        if !cpu_wall_ms.is_finite() || cpu_wall_ms <= 0.0 || tuned_k >= 16 {
-            return;
-        }
-        let cpu_root: Hash = if latch_on {
-            match cpu_tree.last() {
-                Some(root) => *root,
-                None => return,
-            }
-        } else {
-            [0u8; 32]
-        };
-        let mut buf = Vec::with_capacity(64 + core::mem::size_of::<Hash>());
-        for v in [
-            warmup_cache_magic(),
-            WARMUP_CACHE_MSL_FNV,
-            log_d as u64,
-            n_leaves as u64,
-            u64::from(latch_on),
-            tuned_k as u64,
-            cpu_wall_ms.to_bits(),
-        ] {
-            buf.extend_from_slice(&v.to_le_bytes());
-        }
-        buf.extend_from_slice(&cpu_root);
-        let path = warmup_cache_path();
-        let tmp = path.with_extension(format!("tmp{}", std::process::id()));
-        if std::fs::write(&tmp, &buf).is_ok() {
-            let _ = std::fs::rename(&tmp, &path);
-        }
-    }
-
-    /// Publish the terminal cache-miss outcome. k=0 is the correctness-first
-    /// fallback: warmup already byte-verified the pure-GPU graph, while a
-    /// failed hybrid sample has not earned publication.
-    fn finish_ranked_exact_contention_tune(
-        params: &crate::pcs::commit::PcsParams,
-        cpu_tree: &[Hash],
-        k: usize,
-    ) {
-        debug_assert!(RANKED_EXACT_TUNE_CANDIDATES.contains(&k));
-        TUNED_HYBRID_K.store(k, std::sync::atomic::Ordering::Release);
-        if super::warmup_latch_cache_enabled() {
-            let cpu_wall_ms = f64::from_bits(
-                RANKED_EXACT_PENDING_CPU_WALL_BITS.load(std::sync::atomic::Ordering::Acquire),
-            );
-            write_warmup_cache(
-                params.k_code(),
-                params.n_leaves(),
-                true,
-                k,
-                cpu_wall_ms,
-                cpu_tree,
-            );
-        }
     }
 
     /// GPU half of the warmup dual-run: create the persistent state (twiddle
@@ -4144,18 +3410,8 @@ kernel void parent_hash3(device const uint* children [[buffer(0)]],
             gpu.release(latched.tw_buf);
             gpu.release(latched.tree_buf);
             gpu.release(latched.staging);
-            for (addr, bytes, buf) in latched.wraps {
-                // The Metal object must die before its caller-owned storage
-                // can leave scratch's non-evictable pin. A checked-out z Vec
-                // remains owned by its caller and becomes ordinary scratch
-                // again when it is eventually returned.
+            for (_, _, buf) in latched.wraps {
                 gpu.release(buf);
-                if bytes.is_multiple_of(core::mem::size_of::<F128>()) {
-                    crate::scratch::unpin_f128_allocation(
-                        addr,
-                        bytes / core::mem::size_of::<F128>(),
-                    );
-                }
             }
         }
     }
@@ -4171,87 +3427,6 @@ kernel void parent_hash3(device const uint* children [[buffer(0)]],
     ) -> (crate::pcs::commit::CodewordBuf, crate::pcs::commit::MerkleTreeBuf) {
         use crate::pcs::commit::{CodewordBuf, MerkleTreeBuf};
         let dbg = debug_enabled();
-
-        // Cross-process fast path: a previous worker of this run published
-        // its dual-run verdict and CPU reference tree. Byte-compare our own
-        // GPU output's complete tree against that reference (the tree
-        // commits to every codeword byte) and re-apply the wall margin with
-        // this process's GPU wall. Any failure falls through to the
-        // incumbent full dual-run below.
-        if super::warmup_latch_cache_enabled() {
-            if let Some(cache) = read_warmup_cache(params.k_code(), params.n_leaves()) {
-                if !cache.latch_on {
-                    // The first worker proved the GPU not worth latching on
-                    // this host; skip the GPU arm entirely.
-                    if dbg {
-                        eprintln!("[gpu-commit] warmup cache: latch OFF (cached)");
-                    }
-                    let cpu_tree = cpu(&mut codeword);
-                    super::satisfy_ranked_exact_contention_tune();
-                    *latch = LatchState::Off;
-                    return (CodewordBuf::Cpu(codeword), MerkleTreeBuf::Cpu(cpu_tree));
-                }
-                if let Ok(run) =
-                    warmup_gpu_run(z_packed, params.k_code(), params.n_leaves())
-                {
-                    let tree_ok = run.gpu_tree.last() == Some(&cache.cpu_root);
-                    let force = std::env::var_os(super::ENV_GPU_COMMIT_FORCE).is_some();
-                    let fast =
-                        run.gpu_wall_ms * super::LATCH_MARGIN <= cache.cpu_wall_ms;
-                    // Mirror the incumbent latch contract: latching ON also
-                    // pins the warmup z allocation to its retained no-copy
-                    // Metal view (the promoted z-pin mechanism). On pin
-                    // failure fall through to the full dual-run, which
-                    // applies the same policy and its fallbacks.
-                    let z_pinned = !super::gpu_z_pin_enabled()
-                        || crate::scratch::pin_f128_allocation(z_packed);
-                    if tree_ok && (fast || force) && z_pinned {
-                        if dbg {
-                            eprintln!(
-                                "[gpu-commit] warmup cache: gpu {:.2} ms vs cached cpu \
-                                 {:.2} ms, tree-exact -> latched ON (k={})",
-                                run.gpu_wall_ms, cache.cpu_wall_ms, cache.tuned_k
-                            );
-                        }
-                        TUNED_HYBRID_K
-                            .store(cache.tuned_k, std::sync::atomic::Ordering::Relaxed);
-                        // The publishing worker already completed the exact
-                        // replay; keep cache-hit workers out of calibration.
-                        super::satisfy_ranked_exact_contention_tune();
-                        // The warmup prove continues on this commit's output:
-                        // materialize the verified GPU codeword into the
-                        // caller's CPU buffer and hand back the GPU tree.
-                        let len = params.codeword_len_f128();
-                        codeword = ensure_cpu_codeword(codeword, len);
-                        let gpu = gpu().expect("gpu() succeeded during warmup_gpu_run");
-                        unsafe {
-                            copy_bytes_parallel(
-                                gpu.buffer_contents(run.latched.staging),
-                                core::slice::from_raw_parts_mut(
-                                    codeword.as_mut_ptr().cast::<u8>(),
-                                    core::mem::size_of_val(codeword.as_slice()),
-                                ),
-                            );
-                        }
-                        let tree = run.gpu_tree;
-                        *latch = LatchState::On(run.latched);
-                        return (CodewordBuf::Cpu(codeword), MerkleTreeBuf::Cpu(tree));
-                    }
-                    // Mismatch or wall regression: discard and fall through
-                    // to the incumbent full dual-run.
-                    if dbg || !tree_ok {
-                        eprintln!(
-                            "[gpu-commit] warmup cache: rejected (tree_ok={tree_ok}, \
-                             gpu {:.2} ms vs cached cpu {:.2} ms); full dual-run",
-                            run.gpu_wall_ms, cache.cpu_wall_ms
-                        );
-                    }
-                    let gpu = gpu().expect("gpu() succeeded during warmup_gpu_run");
-                    give_tree(run.gpu_tree);
-                    release_latched(gpu, run.latched);
-                }
-            }
-        }
 
         // CPU first: the warmup prove's commit arm runs concurrently with the
         // round-1 AB precompute (rayon::join), exactly like the timed prove,
@@ -4272,17 +3447,6 @@ kernel void parent_hash3(device const uint* children [[buffer(0)]],
                     eprintln!("[gpu-commit] warmup: GPU unavailable ({e}); latching CPU path");
                 }
                 *latch = LatchState::Off;
-                super::satisfy_ranked_exact_contention_tune();
-                if super::warmup_latch_cache_enabled() {
-                    write_warmup_cache(
-                        params.k_code(),
-                        params.n_leaves(),
-                        false,
-                        0,
-                        cpu_wall_ms,
-                        &[],
-                    );
-                }
                 return (CodewordBuf::Cpu(codeword), MerkleTreeBuf::Cpu(cpu_tree));
             }
         };
@@ -4309,23 +3473,7 @@ kernel void parent_hash3(device const uint* children [[buffer(0)]],
 
         let force = std::env::var_os(super::ENV_GPU_COMMIT_FORCE).is_some();
         let fast = run.gpu_wall_ms * super::LATCH_MARGIN <= cpu_wall_ms;
-        let would_latch_on = exact && (fast || force);
-        // `scratch::prewarm_prover` deliberately parks six equal 512 MiB
-        // allocations at the ranked shape. Smallest-fit + swap-remove,
-        // followed by early a/b recycling, does not guarantee that the next
-        // proof's z receives this warmup address. Bind this exact allocation
-        // to the retained no-copy Metal view instead: once z returns through
-        // `give_f128`, it is kept outside the evictable pool and is the first
-        // equal-size allocation handed out by the next prove. The Vec owns
-        // the allocation while checked out; the pin owns it otherwise,
-        // including across `scratch::clear`.
-        let z_pinned = !would_latch_on
-            || !super::gpu_z_pin_enabled()
-            || crate::scratch::pin_f128_allocation(z_packed);
-        let on = would_latch_on && z_pinned;
-        if would_latch_on && !z_pinned && dbg {
-            eprintln!("[gpu-commit] warmup z allocation pin unavailable; latching CPU path");
-        }
+        let on = exact && (fast || force);
         if dbg {
             eprintln!(
                 "[gpu-commit] warmup: gpu {:.2} ms vs cpu {:.2} ms, bit-exact={exact}, \
@@ -4351,27 +3499,6 @@ kernel void parent_hash3(device const uint* children [[buffer(0)]],
         } else {
             release_latched(gpu, run.latched);
             *latch = LatchState::Off;
-        }
-        let defer_ranked_cache = on
-            && super::ranked_exact_contention_tune_pending()
-            && ranked_exact_tune_applicable(params);
-        if defer_ranked_cache {
-            // The outer commit/AB join has not returned. Publish only after
-            // its exact replay has selected and byte-verified a terminal k.
-            RANKED_EXACT_PENDING_CPU_WALL_BITS
-                .store(cpu_wall_ms.to_bits(), std::sync::atomic::Ordering::Release);
-        } else {
-            super::satisfy_ranked_exact_contention_tune();
-            if super::warmup_latch_cache_enabled() {
-                write_warmup_cache(
-                    params.k_code(),
-                    params.n_leaves(),
-                    on,
-                    if on { hybrid_cpu_sixteenths() } else { 0 },
-                    cpu_wall_ms,
-                    &cpu_tree,
-                );
-            }
         }
         (CodewordBuf::Cpu(codeword), MerkleTreeBuf::Cpu(cpu_tree))
     }
@@ -4774,50 +3901,8 @@ kernel void parent_hash3(device const uint* children [[buffer(0)]],
 
     #[cfg(test)]
     mod split_select_tests {
-        use super::{
-            DEFAULT_HYBRID_K, RANKED_EXACT_TUNE_CANDIDATES, choose_hybrid_k,
-            collect_ranked_exact_samples, mean_ranked_exact_samples,
-        };
+        use super::{DEFAULT_HYBRID_K, choose_hybrid_k};
         const C: [usize; 8] = [0, 2, 3, 4, 5, 6, 7, 8];
-
-        #[test]
-        fn broad_candidate_set_is_stable() {
-            assert_eq!(RANKED_EXACT_TUNE_CANDIDATES, C);
-        }
-
-        #[test]
-        fn exact_samples_are_broad_balanced_and_each_reprimed() {
-            let events = std::cell::RefCell::new(Vec::new());
-            let samples = collect_ranked_exact_samples(
-                || {
-                    events.borrow_mut().push(-1);
-                    Ok::<(), ()>(())
-                },
-                |k| {
-                    events.borrow_mut().push(k as i32);
-                    Ok::<f64, ()>(k as f64)
-                },
-            )
-            .unwrap();
-            assert_eq!(
-                *events.borrow(),
-                [
-                    -1, 0, -1, 2, -1, 3, -1, 4, -1, 5, -1, 6, -1, 7, -1, 8, -1, 8,
-                    -1, 7, -1, 6, -1, 5, -1, 4, -1, 3, -1, 2, -1, 0,
-                ]
-            );
-            assert_eq!(samples[0], [0.0, 0.0]);
-            assert_eq!(samples[7], [8.0, 8.0]);
-        }
-
-        #[test]
-        fn exact_selection_uses_valid_balanced_means() {
-            let mut samples = [[100.0; 2]; RANKED_EXACT_TUNE_CANDIDATES.len()];
-            samples[1] = [90.0, 110.0];
-            assert_eq!(mean_ranked_exact_samples(samples).unwrap()[1], 100.0);
-            samples[1][1] = f64::NAN;
-            assert!(mean_ranked_exact_samples(samples).is_none());
-        }
 
         #[test]
         fn smallest_share_within_band_wins() {
@@ -4932,14 +4017,6 @@ mod imp {
             crate::pcs::commit::CodewordBuf::Cpu(codeword),
             crate::pcs::commit::MerkleTreeBuf::Cpu(tree),
         )
-    }
-
-    pub(crate) fn retune_ranked_hybrid_with_exact_contention(
-        _params: &crate::pcs::commit::PcsParams,
-        _cpu_codeword: &[F128],
-        _cpu_tree: &[crate::merkle::Hash],
-        _replay_ab: impl Fn() + Sync,
-    ) {
     }
 
     pub(crate) fn give_tree(_tree: Vec<crate::merkle::Hash>) {}

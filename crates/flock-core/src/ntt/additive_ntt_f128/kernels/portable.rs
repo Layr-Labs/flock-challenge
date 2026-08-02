@@ -152,63 +152,6 @@ pub(super) unsafe fn butterfly_fused_3layer_dual_from_src_row(
     }
 }
 
-/// Out-of-place fused-three-layer row used by the recursive commitment's
-/// from-message first pass. `dst` may contain stale bytes; every selected
-/// slot is initialized from the corresponding radix-8 row group in `src`.
-///
-/// # Safety
-/// The caller supplies valid source/destination row geometry and ensures
-/// concurrent calls own disjoint destination row groups.
-pub(super) unsafe fn butterfly_fused_3layer_from_src_row(
-    src: *const F128,
-    dst: *mut F128,
-    eighth: usize,
-    num_ntts: usize,
-    r: usize,
-    twiddles: &[F128; 7],
-) {
-    // SAFETY: caller supplies the pointer geometry and disjointness contract.
-    unsafe {
-        for lane in 0..num_ntts {
-            let mut values = [F128::ZERO; 8];
-            for (i, value) in values.iter_mut().enumerate() {
-                *value = *src.add((i * eighth + r) * num_ntts + lane);
-            }
-            butterfly_fused_3layer(&mut values, twiddles);
-            for (i, value) in values.iter().enumerate() {
-                *dst.add((i * eighth + r) * num_ntts + lane) = *value;
-            }
-        }
-    }
-}
-
-/// Zero-root specialization of [`butterfly_fused_3layer_from_src_row`].
-///
-/// # Safety
-/// As the general form, plus `twiddles[0] == twiddles[1] == twiddles[3] == 0`.
-pub(super) unsafe fn butterfly_fused_3layer_zero_root_from_src_row(
-    src: *const F128,
-    dst: *mut F128,
-    eighth: usize,
-    num_ntts: usize,
-    r: usize,
-    twiddles: &[F128; 7],
-) {
-    // SAFETY: caller supplies the pointer geometry and zero-root contract.
-    unsafe {
-        for lane in 0..num_ntts {
-            let mut values = [F128::ZERO; 8];
-            for (i, value) in values.iter_mut().enumerate() {
-                *value = *src.add((i * eighth + r) * num_ntts + lane);
-            }
-            butterfly_fused_3layer_zero_root(&mut values, twiddles);
-            for (i, value) in values.iter().enumerate() {
-                *dst.add((i * eighth + r) * num_ntts + lane) = *value;
-            }
-        }
-    }
-}
-
 /// Process one fused-three-layer row group across every interleaved lane.
 ///
 /// Eight row streams at stride `eighth * num_ntts` elements. Every such

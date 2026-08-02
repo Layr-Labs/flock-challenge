@@ -106,26 +106,6 @@ fn zc_tail_hetero_enabled() -> bool {
     *ENABLED
 }
 
-/// Give the three largest ordinary tail rounds 2,048 independent chunks.
-///
-/// At log_n=25 this reduces each worker claim from roughly 3 MiB to 768 KiB
-/// and shrinks the repeatedly-read eq_lo table from 256 KiB to 64 KiB.  The
-/// accompanying 32 KiB eq_hi table keeps the complete equality state within
-/// a P-core's private cache.  Stop at half=2^22: below that point the chunks
-/// are already small enough that the extra claims and final partials can
-/// dominate the cache benefit.
-const LARGE_TAIL_EQ_N_HI: usize = 11;
-const LARGE_TAIL_EQ_MIN_HALF: usize = 1 << 22;
-
-/// Correctness-preserving kill switch for same-binary A/B screening.
-#[cfg(target_arch = "aarch64")]
-fn zc_tail_split11_enabled() -> bool {
-    use std::sync::LazyLock;
-    static ENABLED: LazyLock<bool> =
-        LazyLock::new(|| std::env::var_os("FLOCK_NO_ZC_TAIL_SPLIT11").is_none());
-    *ENABLED
-}
-
 // ---------------------------------------------------------------------------
 // Lagrange weights for the univariate-skip fold at z.
 // ---------------------------------------------------------------------------
@@ -1389,29 +1369,6 @@ pub fn fold_and_compute_round_pair_into(
     r_fold: F128,
     r_next: &[F128],
 ) -> (F128, F128) {
-    #[cfg(target_arch = "aarch64")]
-    let n_hi = if a.len() / 2 >= LARGE_TAIL_EQ_MIN_HALF && zc_tail_split11_enabled() {
-        LARGE_TAIL_EQ_N_HI
-    } else {
-        SplitEqGhash::MAX_N_HI
-    };
-    #[cfg(not(target_arch = "aarch64"))]
-    let n_hi = SplitEqGhash::MAX_N_HI;
-
-    fold_and_compute_round_pair_into_with_n_hi(a, b, a_out, b_out, r_fold, r_next, n_hi)
-}
-
-/// Split-explicit implementation used by the public policy wrapper and by the
-/// exact n_hi=9 versus n_hi=11 regression test.
-fn fold_and_compute_round_pair_into_with_n_hi(
-    a: &[F128],
-    b: &[F128],
-    a_out: &mut [F128],
-    b_out: &mut [F128],
-    r_fold: F128,
-    r_next: &[F128],
-    n_hi: usize,
-) -> (F128, F128) {
     use rayon::prelude::*;
 
     let n = a.len();
@@ -1423,7 +1380,7 @@ fn fold_and_compute_round_pair_into_with_n_hi(
     let log_n = n.trailing_zeros() as usize;
     assert_eq!(r_next.len(), log_n - 1);
 
-    let eq = SplitEqGhash::with_n_hi(&r_next[1..], n_hi);
+    let eq = SplitEqGhash::new(&r_next[1..]);
     let lo_size = 1usize << eq.n_lo;
     let hi_size = 1usize << eq.n_hi;
     assert!(lo_size >= 2, "fold_and_compute requires lo_size ≥ 2");
@@ -2139,48 +2096,6 @@ mod tests {
             assert_eq!(m1_fused, m1_unf, "msg_1 mismatch at log_n={log_n}");
             assert_eq!(minf_fused, minf_unf, "msg_inf mismatch at log_n={log_n}");
         }
-    }
-
-    /// Moving two equality variables from eq_lo to eq_hi only regroups an
-    /// exact tensor factorization.  It must leave both folded buffers and both
-    /// wire-message field elements bit-identical.
-    #[test]
-    fn large_tail_split11_matches_default_split9() {
-        let mut rng = Rng::new(0x5A11_7A11);
-        let log_n = 14usize;
-        let n = 1usize << log_n;
-        let a: Vec<F128> = (0..n).map(|_| rng.f128()).collect();
-        let b: Vec<F128> = (0..n).map(|_| rng.f128()).collect();
-        let r_fold = rng.f128();
-        let r_next = rng.f128_vec(log_n - 1);
-
-        let mut a9 = vec![F128::ZERO; n / 2];
-        let mut b9 = vec![F128::ZERO; n / 2];
-        let msg9 = fold_and_compute_round_pair_into_with_n_hi(
-            &a,
-            &b,
-            &mut a9,
-            &mut b9,
-            r_fold,
-            &r_next,
-            SplitEqGhash::MAX_N_HI,
-        );
-
-        let mut a11 = vec![F128::ZERO; n / 2];
-        let mut b11 = vec![F128::ZERO; n / 2];
-        let msg11 = fold_and_compute_round_pair_into_with_n_hi(
-            &a,
-            &b,
-            &mut a11,
-            &mut b11,
-            r_fold,
-            &r_next,
-            LARGE_TAIL_EQ_N_HI,
-        );
-
-        assert_eq!(a11, a9, "folded a differs across equality splits");
-        assert_eq!(b11, b9, "folded b differs across equality splits");
-        assert_eq!(msg11, msg9, "round message differs across equality splits");
     }
 
     /// Full compact-path oracle against the legacy materialized round two.

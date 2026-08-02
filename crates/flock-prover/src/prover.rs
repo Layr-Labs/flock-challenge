@@ -57,18 +57,6 @@ fn ranked_direct_fold4_precompute_enabled(r1cs: &BlockR1cs) -> bool {
         && pcs::ranked_direct_fold4_enabled()
 }
 
-/// Direct-fold8 capture/consumer predicate: the fold4 chain plus the shared
-/// fold8 latch and six retainable tail coordinates (k_log >= k_skip + 7).
-/// Read by BOTH the AB/C producers and (transitively) the pcs consumer gate,
-/// so capture and consumer cannot disagree; a shape miss simply keeps the
-/// 16-bank tensor and the incumbent fold4 route.
-#[inline]
-fn ranked_direct_fold8_precompute_enabled(r1cs: &BlockR1cs) -> bool {
-    ranked_direct_fold4_precompute_enabled(r1cs)
-        && pcs::ranked_direct_fold8_enabled()
-        && r1cs.k_log >= r1cs.k_skip + 7
-}
-
 /// Exact-shape gate for deriving identity C from the already-materialized
 /// lincheck stripe. Keep this narrower than the generic DirectFold4 gate:
 /// the shortcut relies on ranked BLAKE3's block geometry and honest padding,
@@ -90,12 +78,7 @@ fn precompute_ab_s_hat_v(
     z_vec: &[F128],
     inner_rest_tail: &[F128],
 ) -> Option<Vec<F128>> {
-    if ranked_direct_fold8_precompute_enabled(r1cs) {
-        Some(pcs::ring_switch::s_hat_v_fold8_from_z_vec(
-            z_vec,
-            inner_rest_tail,
-        ))
-    } else if ranked_direct_fold4_precompute_enabled(r1cs) {
+    if ranked_direct_fold4_precompute_enabled(r1cs) {
         Some(pcs::ring_switch::s_hat_v_fold4_from_z_vec(
             z_vec,
             inner_rest_tail,
@@ -115,23 +98,20 @@ fn precompute_ab_s_hat_v(
     }
 }
 
-/// Pick C's precomputed slot. The DirectFold8 route takes the sixty-four-bank
-/// tensor; the strict DirectFold4 experiment takes the sixteen-bank tensor;
-/// the incumbent ranked path takes the four-bank tensor; every other shape
-/// takes the canonical transcript-visible statistic. Falls back through
-/// narrower captures by presence, so a producer shape miss (e.g. no lincheck
-/// stripe) degrades to a still-correct route instead of panicking.
+/// Pick C's precomputed slot. The strict DirectFold4 experiment takes the
+/// sixteen-bank tensor; the incumbent ranked path takes the four-bank tensor;
+/// every other shape takes the canonical transcript-visible statistic.
 #[inline]
 fn pre_c_slot<'a>(
     r1cs: &BlockR1cs,
     captured: &'a zerocheck::CapturedSHatVC,
 ) -> Option<&'a [F128]> {
-    Some(
-        if ranked_direct_fold8_precompute_enabled(r1cs) && captured.fold8.is_some() {
-            captured.fold8.as_deref().unwrap()
-        } else if ranked_direct_fold4_precompute_enabled(r1cs) && captured.fold4.is_some() {
-            captured.fold4.as_deref().unwrap()
-        } else if ranked_direct_c_precompute_enabled(r1cs) {
+    Some(if ranked_direct_fold4_precompute_enabled(r1cs) {
+        captured
+            .fold4
+            .as_deref()
+            .expect("DirectFold4 capture and consumer gates must agree")
+    } else if ranked_direct_c_precompute_enabled(r1cs) {
         captured.quad.as_slice()
     } else {
         captured.s_hat_v_c.as_slice()
@@ -727,24 +707,7 @@ fn commit_with_round1_ab_precompute(
     debug_assert_eq!(k_skip, 6, "ranked protocol fixes k_skip=6");
     let inv_table = flock_core::ntt::InvNttTableByteSingleGf8::cached_standard_k6();
 
-    let precompute_ab = || {
-        zerocheck::univariate_skip_optimized::precompute_round1_ab_inner_packed_padded(
-            a_packed,
-            b_packed,
-            pcs_params.m,
-            k_skip,
-            inv_table,
-            padding,
-        )
-    };
-    // `Blake3Setup::prove_fast` issues this ticket before call-zero witness
-    // generation. A valid cache hit may satisfy it inside the commit arm;
-    // otherwise the post-join callback claims it and replays this exact A/B
-    // closure beside the broad split sweep.
-    let run_ranked_exact_tune =
-        flock_core::gpu_commit::ranked_exact_contention_tune_pending();
-
-    let result = rayon::join(
+    rayon::join(
         || match commit_codeword {
             CommitCodeword::Allocate => pcs::commit(z_packed, pcs_params),
             CommitCodeword::NeedsReplication(buf) => pcs::commit_into(z_packed, pcs_params, buf),
@@ -757,7 +720,14 @@ fn commit_with_round1_ab_precompute(
         },
         || {
             let t = std::time::Instant::now();
-            let r = precompute_ab();
+            let r = zerocheck::univariate_skip_optimized::precompute_round1_ab_inner_packed_padded(
+                a_packed,
+                b_packed,
+                pcs_params.m,
+                k_skip,
+                inv_table,
+                padding,
+            );
             let wall_ms = t.elapsed().as_secs_f64() * 1e3;
             // The hybrid-commit warmup sweep sizes its contention emulation
             // from this arm's measured wall (an Instant read is free; the
@@ -768,20 +738,7 @@ fn commit_with_round1_ab_precompute(
             }
             r
         },
-    );
-
-    if run_ranked_exact_tune {
-        flock_core::gpu_commit::retune_ranked_hybrid_with_exact_contention(
-            pcs_params,
-            &result.0.1.codeword,
-            &result.0.1.merkle_tree,
-            || {
-                let replayed = precompute_ab();
-                std::hint::black_box(&replayed);
-            },
-        );
-    }
-    result
+    )
 }
 
 /// Run commit → bind → zerocheck → lincheck and build the base claims, stopping

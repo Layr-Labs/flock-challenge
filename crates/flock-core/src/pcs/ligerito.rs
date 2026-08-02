@@ -2128,70 +2128,6 @@ fn transpose_forward_ntt_fused_3layer(
     });
 }
 
-/// Final three transpose layers when the caller retains only the low half.
-/// The first two layers still contribute to both root inputs, but the root
-/// butterfly's retained output is just `top = a + b`. Its discarded output
-/// `bottom = t * (a + b) + b` therefore needs neither the field product nor
-/// the store. The four writes per row cover exactly `data[..data.len() / 2]`.
-fn transpose_forward_ntt_fused_final_3layer_low_half(
-    ntt: &AdditiveNttF128,
-    data: &mut [F128],
-    log_d: usize,
-) {
-    use rayon::prelude::*;
-
-    #[cfg(test)]
-    TEST_TRUNCATED_FINAL_NTT_HITS.with(|hits| hits.set(hits.get() + 1));
-
-    #[inline(always)]
-    fn butterfly(values: &mut [F128; 8], a: usize, b: usize, twiddle: F128) {
-        let sum = values[a] + values[b];
-        values[a] = sum;
-        values[b] = twiddle * sum + values[b];
-    }
-
-    assert!(log_d >= 3);
-    assert_eq!(data.len(), 1usize << log_d);
-    let eighth = data.len() >> 3;
-    let mut layer_1_twiddles = [F128::ZERO; 2];
-    let mut layer_2_twiddles = [F128::ZERO; 4];
-    for (block, twiddle) in layer_1_twiddles.iter_mut().enumerate() {
-        *twiddle = ntt.twiddle(1, block);
-    }
-    for (block, twiddle) in layer_2_twiddles.iter_mut().enumerate() {
-        *twiddle = ntt.twiddle(2, block);
-    }
-
-    let data_ptr = data.as_mut_ptr() as usize;
-    (0..eighth).into_par_iter().for_each(|row| {
-        let mut values = [F128::ZERO; 8];
-        // SAFETY: each row owns the eight positions `row + i*eighth`.
-        // Different rows never overlap. Only positions i=0..4 are written;
-        // together those positions are exactly the retained low half.
-        unsafe {
-            let ptr = data_ptr as *mut F128;
-            for (i, value) in values.iter_mut().enumerate() {
-                *value = *ptr.add(row + i * eighth);
-            }
-            for pair in 0..4 {
-                butterfly(&mut values, 2 * pair, 2 * pair + 1, layer_2_twiddles[pair]);
-            }
-            for half in 0..2 {
-                butterfly(&mut values, 4 * half, 4 * half + 2, layer_1_twiddles[half]);
-                butterfly(
-                    &mut values,
-                    4 * half + 1,
-                    4 * half + 3,
-                    layer_1_twiddles[half],
-                );
-            }
-            for i in 0..4 {
-                *ptr.add(row + i * eighth) = values[i] + values[i + 4];
-            }
-        }
-    });
-}
-
 /// Transposed forward additive NTT, `Fᵀ`, in place over `2^log_d` coefficients.
 /// Forward butterfly is `M=[[1,t],[1,t+1]]`; transpose `Mᵀ=[[1,1],[t,t+1]]` is
 /// `s=a+b; top=s; bot=t·s+b`, applied in **reverse** layer order. (Baseline:
@@ -2245,74 +2181,6 @@ fn transpose_forward_ntt(ntt: &AdditiveNttF128, data: &mut [F128], log_d: usize)
     }
 }
 
-/// Exact ranked top-level induction shape. It transforms a 2^20 rate-two
-/// codeword, keeps 2^19 coefficients, folds 64 lanes, and batches 218 opens.
-#[inline]
-fn is_ranked_induce_truncated_final_ntt_shape(
-    log_msg_cols: usize,
-    log_inv_rate: usize,
-    log_num_interleaved: usize,
-    n_queries: usize,
-    alpha_len: usize,
-) -> bool {
-    log_msg_cols == 19
-        && log_inv_rate == 1
-        && log_num_interleaved == 6
-        && n_queries == 218
-        && alpha_len == 8
-}
-
-#[cfg(test)]
-std::thread_local! {
-    static TEST_TRUNCATED_FINAL_NTT_OVERRIDE: std::cell::Cell<Option<bool>> =
-        const { std::cell::Cell::new(None) };
-    static TEST_TRUNCATED_FINAL_NTT_HITS: std::cell::Cell<usize> =
-        const { std::cell::Cell::new(0) };
-}
-
-#[inline]
-fn use_ranked_induce_truncated_final_ntt(
-    log_msg_cols: usize,
-    log_inv_rate: usize,
-    log_num_interleaved: usize,
-    n_queries: usize,
-    alpha_len: usize,
-) -> bool {
-    #[cfg(test)]
-    if let Some(enabled) = TEST_TRUNCATED_FINAL_NTT_OVERRIDE.with(|slot| slot.get()) {
-        return enabled;
-    }
-
-    cfg!(all(target_os = "macos", target_arch = "aarch64"))
-        && is_ranked_induce_truncated_final_ntt_shape(
-            log_msg_cols,
-            log_inv_rate,
-            log_num_interleaved,
-            n_queries,
-            alpha_len,
-        )
-        && std::env::var_os("FLOCK_NO_LIG_INDUCE_TRUNCATED_NTT").is_none()
-}
-
-#[cfg(test)]
-fn with_truncated_final_ntt_override<T>(enabled: bool, f: impl FnOnce() -> T) -> T {
-    TEST_TRUNCATED_FINAL_NTT_OVERRIDE.with(|slot| {
-        struct Reset<'a> {
-            slot: &'a std::cell::Cell<Option<bool>>,
-            previous: Option<bool>,
-        }
-        impl Drop for Reset<'_> {
-            fn drop(&mut self) {
-                self.slot.set(self.previous);
-            }
-        }
-
-        let previous = slot.replace(Some(enabled));
-        let _reset = Reset { slot, previous };
-        f()
-    })
-}
-
 /// `Fᵀ`-based fast path for [`induce_sumcheck_poly`]: scatter per-query weights
 /// into the codeword domain, apply `Fᵀ`, keep the low `2^log_msg_cols` outputs.
 /// Byte-identical output to [`induce_sumcheck_poly`].
@@ -2329,13 +2197,6 @@ pub(crate) fn induce_sumcheck_poly_via_ntt(
     let block_len = 1usize << log_block;
     let n_queries = queries.len();
     assert_eq!(opened_rows.len(), n_queries);
-    let truncate_final_group = use_ranked_induce_truncated_final_ntt(
-        log_msg_cols,
-        log_inv_rate,
-        v_challenges.len(),
-        n_queries,
-        alpha.len(),
-    );
 
     let eq = build_eq_table(v_challenges);
     let alpha_pows: Vec<F128> = if n_queries == 0 {
@@ -2380,13 +2241,7 @@ pub(crate) fn induce_sumcheck_poly_via_ntt(
         c
     } else {
         let ntt = AdditiveNttF128::standard(log_block);
-        transpose_forward_ntt_sparse(
-            &ntt,
-            queries,
-            &alpha_pows,
-            log_block,
-            truncate_final_group,
-        )
+        transpose_forward_ntt_sparse(&ntt, queries, &alpha_pows, log_block)
     };
     coeffs.truncate(n);
     (coeffs, enforced_sum)
@@ -2582,24 +2437,13 @@ fn transpose_forward_ntt_dense_suffix(
     data: &mut [F128],
     log_d: usize,
     prefix_k: usize,
-    truncate_final_group: bool,
 ) {
     use rayon::prelude::*;
     let n_threads = rayon::current_num_threads().max(1);
     let mut remaining = log_d - prefix_k;
-    if truncate_final_group {
-        // The optimized ranked schedule ends in the fused layers 2,1,0.
-        // Keep the gate explicit so another sparse geometry cannot silently
-        // skip outputs from a differently shaped suffix schedule.
-        assert!(remaining >= 3 && remaining.is_multiple_of(3));
-    }
     while remaining >= 3 {
         let layer = remaining - 3;
-        if truncate_final_group && layer == 0 {
-            transpose_forward_ntt_fused_final_3layer_low_half(ntt, data, log_d);
-        } else {
-            transpose_forward_ntt_fused_3layer(ntt, data, log_d, layer);
-        }
+        transpose_forward_ntt_fused_3layer(ntt, data, log_d, layer);
         remaining -= 3;
     }
     for layer in (0..remaining).rev() {
@@ -2644,14 +2488,12 @@ fn transpose_forward_ntt_sparse(
     positions: &[usize],
     values: &[F128],
     log_d: usize,
-    truncate_final_group: bool,
 ) -> Vec<F128> {
     let n = 1usize << log_d;
     // No prefix for small domains — just scatter + full dense transpose.
     let k = if log_d >= 12 { 8usize.min(log_d) } else { 0 };
 
     if k == 0 {
-        assert!(!truncate_final_group);
         let mut data = vec![F128::ZERO; n];
         for (&p, &v) in positions.iter().zip(values) {
             data[p] += v;
@@ -2667,14 +2509,7 @@ fn transpose_forward_ntt_sparse(
         && *LINEAR_WINDOWS_ENABLED
             .get_or_init(|| std::env::var_os("FLOCK_NO_INDUCE_LINEAR_WINDOWS").is_none());
     if !use_linear_windows {
-        return transpose_forward_ntt_sparse_hashmap(
-            ntt,
-            positions,
-            values,
-            log_d,
-            k,
-            truncate_final_group,
-        );
+        return transpose_forward_ntt_sparse_hashmap(ntt, positions, values, log_d, k);
     }
 
     let groups = group_sorted_positions(positions, k);
@@ -2685,10 +2520,7 @@ fn transpose_forward_ntt_sparse(
 
     let mut data = densify_active_windows(&arena, &groups, log_d, k);
 
-    transpose_forward_ntt_dense_suffix(ntt, &mut data, log_d, k, truncate_final_group);
-    if truncate_final_group {
-        data.truncate(n >> 1);
-    }
+    transpose_forward_ntt_dense_suffix(ntt, &mut data, log_d, k);
     data
 }
 
@@ -2698,7 +2530,6 @@ fn transpose_forward_ntt_sparse_hashmap(
     values: &[F128],
     log_d: usize,
     prefix_k: usize,
-    truncate_final_group: bool,
 ) -> Vec<F128> {
     use rayon::prelude::*;
     use std::collections::HashMap;
@@ -2729,16 +2560,7 @@ fn transpose_forward_ntt_sparse_hashmap(
         data[start..start + window_len].copy_from_slice(&window);
     }
 
-    transpose_forward_ntt_dense_suffix(
-        ntt,
-        &mut data,
-        log_d,
-        prefix_k,
-        truncate_final_group,
-    );
-    if truncate_final_group {
-        data.truncate(n >> 1);
-    }
+    transpose_forward_ntt_dense_suffix(ntt, &mut data, log_d, prefix_k);
     data
 }
 
@@ -2808,43 +2630,6 @@ pub(crate) fn ligero_commit(
     ntt: &AdditiveNttF128,
     kind: HashKind,
 ) -> LigeroWitness {
-    let level_opt_out = match (log_msg_cols, log_num_interleaved, log_inv_rate) {
-        (16, 3, 2) => Some("FLOCK_NO_RECURSIVE_FROM_MESSAGE_L1"),
-        (13, 3, 3) => Some("FLOCK_NO_RECURSIVE_FROM_MESSAGE_L2"),
-        _ => None,
-    };
-    let recursive_from_message_shape = kind == HashKind::Blake3 && level_opt_out.is_some();
-    let level_enabled = level_opt_out.is_some_and(|name| std::env::var_os(name).is_none());
-    let fuse_from_message = cfg!(all(
-        target_os = "macos",
-        target_arch = "aarch64",
-        target_feature = "aes"
-    )) && recursive_from_message_shape
-        && level_enabled
-        && std::env::var_os("FLOCK_NO_RECURSIVE_FROM_MESSAGE").is_none();
-    ligero_commit_impl(
-        poly,
-        log_msg_cols,
-        log_num_interleaved,
-        log_inv_rate,
-        ntt,
-        kind,
-        fuse_from_message,
-    )
-}
-
-/// Implementation split so the exact matrix/tree oracle can force the new
-/// path independently of target-feature and environment dispatch.
-#[allow(clippy::too_many_arguments)]
-fn ligero_commit_impl(
-    poly: &[F128],
-    log_msg_cols: usize,
-    log_num_interleaved: usize,
-    log_inv_rate: usize,
-    ntt: &AdditiveNttF128,
-    kind: HashKind,
-    fuse_from_message: bool,
-) -> LigeroWitness {
     let msg_cols = 1usize << log_msg_cols;
     let num_interleaved = 1usize << log_num_interleaved;
     let block_len = msg_cols << log_inv_rate;
@@ -2852,47 +2637,19 @@ fn ligero_commit_impl(
     assert_eq!(poly.len(), num_interleaved * msg_cols);
     assert!(log_block_len <= ntt.log_domain_size());
 
-    let timing = std::env::var_os("LIG_PROVE_TRACE").is_some()
-        || std::env::var_os("FLOCK_OPEN_TIMING").is_some();
-    let total_start = timing.then(std::time::Instant::now);
-
-    // LSB-lane layout: input matches `data[pos * num_interleaved + lane]`.
-    // The first `log_inv_rate` layers on zero-padded coefficients are pure
-    // copies. The ordinary path materializes those replicas; the exact ranked
-    // recursive shapes fuse that logical state into their first radix-8 pass.
+    // LSB-lane layout: input matches the SoA layout `data[pos * num_interleaved + lane]`
+    // directly. The first `log_inv_rate` NTT layers on the zero-padded
+    // coefficients are pure copies, so fill the matrix with 2^log_inv_rate
+    // replicas of `poly` (same write cost as copy + zero-fill) and start the
+    // transform past those layers — see `pcs::commit::replicate_message_fill`.
     let codeword_len = block_len * num_interleaved;
-    let alloc_start = timing.then(std::time::Instant::now);
     let mut mat = crate::scratch::take_f128(codeword_len);
-    let alloc_elapsed = alloc_start.map_or(std::time::Duration::ZERO, |t| t.elapsed());
-    let mut fill_elapsed = std::time::Duration::ZERO;
-    let ntt_start = timing.then(std::time::Instant::now);
-    if fuse_from_message {
-        // Write the first nontrivial radix-8 result straight from the compact
-        // message into stale codeword storage. This deletes the full replica
-        // fill and the first pass's destination reads/RFOs.
-        ntt.forward_transform_interleaved_from_message_fused3(
-            poly,
-            &mut mat,
-            num_interleaved,
-            log_inv_rate,
-        );
-    } else {
-        let fill_start = timing.then(std::time::Instant::now);
-        super::commit::replicate_message_fill(&mut mat, poly);
-        fill_elapsed = fill_start.map_or(std::time::Duration::ZERO, |t| t.elapsed());
-        // RS-encode every lane in one call (each lane is one independent NTT).
-        ntt.forward_transform_interleaved_from_layer(
-            &mut mat,
-            num_interleaved,
-            log_inv_rate,
-        );
-    }
-    let ntt_elapsed = ntt_start
-        .map_or(std::time::Duration::ZERO, |t| t.elapsed())
-        .saturating_sub(fill_elapsed);
+    super::commit::replicate_message_fill(&mut mat, poly);
+
+    // RS-encode every lane in one call (each lane is one independent NTT).
+    ntt.forward_transform_interleaved_from_layer(&mut mat, num_interleaved, log_inv_rate);
 
     // Merkle over rows. One leaf = `num_interleaved` consecutive F128 = 16·num_interleaved bytes.
-    let merkle_start = timing.then(std::time::Instant::now);
     let leaf_size_bytes = num_interleaved * core::mem::size_of::<F128>();
     let data_bytes: &[u8] = unsafe {
         core::slice::from_raw_parts(
@@ -2902,26 +2659,6 @@ fn ligero_commit_impl(
     };
     debug_assert_eq!(data_bytes.len(), block_len * leaf_size_bytes);
     let tree = merkle::merkle_tree(data_bytes, block_len, kind);
-    let merkle_elapsed = merkle_start.map_or(std::time::Duration::ZERO, |t| t.elapsed());
-
-    if timing {
-        let level = match (log_msg_cols, log_num_interleaved, log_inv_rate) {
-            (16, 3, 2) => Some("L1"),
-            (13, 3, 3) => Some("L2"),
-            _ => None,
-        };
-        if let Some(level) = level {
-            let total_elapsed = total_start.expect("timing start").elapsed();
-            eprintln!(
-                "    [recursive-commit {level}] fused={fuse_from_message} alloc={:.2} ms fill={:.2} ms ntt={:.2} ms merkle={:.2} ms total={:.2} ms",
-                alloc_elapsed.as_secs_f64() * 1e3,
-                fill_elapsed.as_secs_f64() * 1e3,
-                ntt_elapsed.as_secs_f64() * 1e3,
-                merkle_elapsed.as_secs_f64() * 1e3,
-                total_elapsed.as_secs_f64() * 1e3,
-            );
-        }
-    }
 
     LigeroWitness {
         mat,
@@ -3499,35 +3236,6 @@ fn eval_fold4_lookahead3(
     }
 }
 
-#[inline]
-fn eval_fold8_lookahead4(
-    coefficients: &super::Fold8Lookahead4,
-    r0: F128,
-    r1: F128,
-    r2: F128,
-    r3: F128,
-) -> SumcheckMessage {
-    SumcheckMessage {
-        u_0: eval_quadratic_tensor(&coefficients[..81], &[r0, r1, r2, r3]),
-        u_2: eval_quadratic_tensor(&coefficients[81..], &[r0, r1, r2, r3]),
-    }
-}
-
-#[inline]
-fn eval_fold8_lookahead5(
-    coefficients: &super::Fold8Lookahead5,
-    r0: F128,
-    r1: F128,
-    r2: F128,
-    r3: F128,
-    r4: F128,
-) -> SumcheckMessage {
-    SumcheckMessage {
-        u_0: eval_quadratic_tensor(&coefficients[..243], &[r0, r1, r2, r3, r4]),
-        u_2: eval_quadratic_tensor(&coefficients[243..], &[r0, r1, r2, r3, r4]),
-    }
-}
-
 /// Exact fallback for the final-pair specialization. With the opt-out set,
 /// the prover computes and discards the incumbent lookahead as before.
 fn fold2_final_enabled() -> bool {
@@ -3952,127 +3660,6 @@ fn materialize_direct_fold4(
     )
 }
 
-/// Sixty-four-bank materializer. Six challenges are sampled from direct
-/// product statistics before this function binds the witness and combined
-/// basis in one N→N/64 pass. It emits M6 — the round message of the folded
-/// 2^19 state — fused into the same pass; no lookahead follows because the
-/// initial cadence is exhausted (the fold2 pair of the fold4 route never
-/// runs and the 2^21/2^20 states never exist).
-fn materialize_direct_fold8(
-    packed_witness: Vec<F128>,
-    ordinary_basis: Vec<F128>,
-    claims: &[super::ring_switch::DirectFold8Factors],
-    challenges: [F128; 6],
-) -> (Vec<F128>, Vec<F128>, SumcheckMessage) {
-    use rayon::prelude::*;
-
-    assert!(!claims.is_empty());
-    let has_ordinary = !ordinary_basis.is_empty();
-    assert!(!has_ordinary || ordinary_basis.len() == packed_witness.len());
-    assert!(packed_witness.len().is_multiple_of(64));
-
-    let fold_weight: [F128; 64] = std::array::from_fn(|bank| {
-        let mut weight = F128::ONE;
-        for (bit, &challenge) in challenges.iter().enumerate() {
-            weight *= if (bank >> bit) & 1 == 0 {
-                F128::ONE + challenge
-            } else {
-                challenge
-            };
-        }
-        weight
-    });
-    let direct_tables: Vec<Vec<F128>> = claims
-        .iter()
-        .map(|claim| {
-            super::ring_switch::build_direct_fold8_table(
-                &claim.low_eq,
-                &fold_weight,
-                &claim.table,
-            )
-        })
-        .collect();
-
-    let out_len = packed_witness.len() / 64;
-    let block_len = claims[0].eq_lo.len();
-    assert!(block_len.is_multiple_of(4));
-    assert_eq!(out_len, block_len * claims[0].eq_hi.len());
-    assert!(claims.iter().all(|claim| {
-        claim.eq_lo.len() == block_len && claim.eq_hi.len() * block_len == out_len
-    }));
-
-    let mut folded_f = crate::scratch::take_f128(out_len);
-    let mut folded_b = crate::scratch::take_f128(out_len);
-    let stats = folded_b
-        .par_chunks_mut(block_len)
-        .zip(folded_f.par_chunks_mut(block_len))
-        .enumerate()
-        .map_init(
-            || vec![F128::ZERO; super::ring_switch::FOLD_TABLE_LEN],
-            |scratch, (block, (b_out, f_out))| {
-                let start = 64 * block * block_len;
-                let f_in = &packed_witness[start..start + 64 * block_len];
-                let b_in: &[F128] = if has_ordinary {
-                    &ordinary_basis[start..start + 64 * block_len]
-                } else {
-                    &[]
-                };
-                let fold64 = |input: &[F128], slot: usize| {
-                    let base = 64 * slot;
-                    let mut value = F128::ZERO;
-                    for bank in 0..64 {
-                        value += fold_weight[bank] * input[base + bank];
-                    }
-                    value
-                };
-
-                let (first_claim, rest_claims) = claims.split_first().unwrap();
-                let (first_table, rest_tables) = direct_tables.split_first().unwrap();
-                super::ring_switch::compose_fold_byte_table_into(
-                    first_claim.eq_hi[block],
-                    first_table,
-                    scratch,
-                );
-                for slot in 0..block_len {
-                    f_out[slot] = fold64(f_in, slot);
-                    let direct =
-                        super::ring_switch::fold_one_slot(first_claim.eq_lo[slot], scratch);
-                    b_out[slot] = if has_ordinary {
-                        direct + fold64(b_in, slot)
-                    } else {
-                        direct
-                    };
-                }
-                for (claim, table) in rest_claims.iter().zip(rest_tables.iter()) {
-                    super::ring_switch::compose_fold_byte_table_into(
-                        claim.eq_hi[block],
-                        table,
-                        scratch,
-                    );
-                    for (slot, out) in b_out.iter_mut().enumerate() {
-                        *out += super::ring_switch::fold_one_slot(claim.eq_lo[slot], scratch);
-                    }
-                }
-                super::round0_scalar(f_out, b_out)
-            },
-        )
-        .reduce(
-            || (F128::ZERO, F128::ZERO),
-            |(x0, x2), (y0, y2)| (x0 + y0, x2 + y2),
-        );
-
-    crate::scratch::give_f128(packed_witness);
-    crate::scratch::give_f128(ordinary_basis);
-    (
-        folded_f,
-        folded_b,
-        SumcheckMessage {
-            u_0: stats.0,
-            u_2: stats.1,
-        },
-    )
-}
-
 pub struct SumcheckProver {
     f: Vec<F128>,
     /// Single combined basis poly. After every `glue(β)`, the introduced
@@ -4174,24 +3761,6 @@ impl SumcheckProver {
         basis: Vec<F128>,
         target: F128,
         transcript: [SumcheckMessage; 5],
-    ) -> Self {
-        assert_eq!(f.len(), basis.len());
-        Self {
-            spare_f: Self::new_spare(f.len()),
-            spare_b: Self::new_spare(f.len()),
-            f,
-            combined_basis: basis,
-            t_r: target,
-            transcript: transcript.to_vec(),
-            pending_glue: None,
-        }
-    }
-
-    fn new_after_direct_fold8(
-        f: Vec<F128>,
-        basis: Vec<F128>,
-        target: F128,
-        transcript: [SumcheckMessage; 7],
     ) -> Self {
         assert_eq!(f.len(), basis.len());
         Self {
@@ -4549,9 +4118,6 @@ pub fn recursive_prover_with_basis<Ch: Challenger>(
         None,
         None,
         None,
-        None,
-        None,
-        None,
         challenger,
     )
 }
@@ -4589,9 +4155,6 @@ pub fn recursive_prover_with_basis_precomputed_round0<Ch: Challenger>(
         None,
         None,
         None,
-        None,
-        None,
-        None,
         challenger,
     )
 }
@@ -4625,10 +4188,7 @@ pub(crate) fn recursive_prover_with_basis_direct_ab_fold2<Ch: Challenger>(
         Some(round1_lookahead),
         None,
         None,
-        None,
-        None,
         Some(direct),
-        None,
         None,
         challenger,
     )
@@ -4668,54 +4228,6 @@ pub(crate) fn recursive_prover_with_basis_direct_fold4<Ch: Challenger>(
         Some(round2_lookahead),
         Some(round3_lookahead),
         None,
-        None,
-        None,
-        Some(direct),
-        None,
-        challenger,
-    )
-}
-/// Direct-fold8 entry. The first six transcript messages come entirely from
-/// `direct` 64×64 product matrices; after six sequential FS samples the state
-/// is materialized at N/64 = 2^19 in ONE pass and the incumbent cadence
-/// resumes — the fold2 pair of the fold4 route never runs (the 2^21 and
-/// 2^20 states never exist).
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn recursive_prover_with_basis_direct_fold8<Ch: Challenger>(
-    config: &ProverConfig,
-    packed_witness: Vec<F128>,
-    ordinary_basis: Vec<F128>,
-    direct: Vec<super::ring_switch::DirectFold8Factors>,
-    target: F128,
-    l0_codeword: &[F128],
-    l0_tree: &[Hash],
-    round0_uv: (F128, F128),
-    round1_lookahead: [F128; 6],
-    round2_lookahead: super::Fold4Lookahead2,
-    round3_lookahead: super::Fold4Lookahead3,
-    round4_lookahead: super::Fold8Lookahead4,
-    round5_lookahead: super::Fold8Lookahead5,
-    challenger: &mut Ch,
-) -> LigeritoProof {
-    assert_eq!(config.initial_k, 6, "direct-fold8 scaffold requires initial_k=6");
-    recursive_prover_with_basis_impl(
-        config,
-        packed_witness,
-        ordinary_basis,
-        target,
-        l0_codeword,
-        l0_tree,
-        Some(SumcheckMessage {
-            u_0: round0_uv.0,
-            u_2: round0_uv.1,
-        }),
-        Some(round1_lookahead),
-        Some(round2_lookahead),
-        Some(round3_lookahead),
-        Some(round4_lookahead),
-        Some(round5_lookahead),
-        None,
-        None,
         Some(direct),
         challenger,
     )
@@ -4732,11 +4244,8 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
     round1_lookahead: Option<[F128; 6]>,
     round2_lookahead: Option<super::Fold4Lookahead2>,
     round3_lookahead: Option<super::Fold4Lookahead3>,
-    round4_lookahead: Option<super::Fold8Lookahead4>,
-    round5_lookahead: Option<super::Fold8Lookahead5>,
     direct_fold2: Option<Vec<super::ring_switch::DirectFold2Factors>>,
     direct_fold4: Option<Vec<super::ring_switch::DirectFold4Factors>>,
-    direct_fold8: Option<Vec<super::ring_switch::DirectFold8Factors>>,
     challenger: &mut Ch,
 ) -> LigeritoProof {
     let log_n = packed_witness.len().trailing_zeros() as usize;
@@ -4745,22 +4254,17 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
 
     assert_eq!(packed_witness.len(), 1usize << log_n);
     assert!(
-        direct_fold2.is_none() || (direct_fold4.is_none() && direct_fold8.is_none()),
-        "direct-fold2 and direct-fold4/fold8 modes are mutually exclusive"
-    );
-    assert!(
-        direct_fold4.is_none() || direct_fold8.is_none(),
-        "direct-fold4 and direct-fold8 modes are mutually exclusive"
+        direct_fold2.is_none() || direct_fold4.is_none(),
+        "direct-fold2 and direct-fold4 modes are mutually exclusive"
     );
     // Direct mode may carry every claim in its factor bundle, in which case
     // there is no materialized basis at all.
     assert!(
         b_initial.len() == 1usize << log_n
-            || ((direct_fold2.is_some() || direct_fold4.is_some() || direct_fold8.is_some())
-                && b_initial.is_empty())
+            || ((direct_fold2.is_some() || direct_fold4.is_some()) && b_initial.is_empty())
     );
-    if direct_fold4.is_some() || direct_fold8.is_some() {
-        assert_eq!(initial_k, 6, "direct-fold4/fold8 scaffold requires initial_k=6");
+    if direct_fold4.is_some() {
+        assert_eq!(initial_k, 6, "direct-fold4 scaffold requires initial_k=6");
     }
     assert_eq!(config.recursive_ks.len(), r);
     assert_eq!(config.log_inv_rates.len(), r + 1);
@@ -4819,10 +4323,8 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
     let mut b_initial = Some(b_initial);
     let mut direct_fold2 = direct_fold2;
     let mut direct_fold4 = direct_fold4;
-    let mut direct_fold8 = direct_fold8;
     let direct_fold4_mode = direct_fold4.is_some();
-    let direct_fold8_mode = direct_fold8.is_some();
-    let direct_mode = direct_fold2.is_some() || direct_fold4_mode || direct_fold8_mode;
+    let direct_mode = direct_fold2.is_some() || direct_fold4_mode;
     let (mut sc_prover, start_msg) = if direct_mode {
         (
             None,
@@ -4854,7 +4356,7 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
     // A lookahead message is evaluated at the first challenge, allowing that
     // challenge's state bind to wait for the next one. Odd rounds then bind
     // both challenges together and refresh the next lookahead coefficients.
-    let mut fold2_lookahead = if use_fold2 && !direct_fold4_mode && !direct_fold8_mode {
+    let mut fold2_lookahead = if use_fold2 && !direct_fold4_mode {
         round1_lookahead
     } else {
         None
@@ -4862,13 +4364,8 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
     let fold4_round1 = direct_fold4_mode.then_some(round1_lookahead).flatten();
     let fold4_round2 = direct_fold4_mode.then_some(round2_lookahead).flatten();
     let fold4_round3 = direct_fold4_mode.then_some(round3_lookahead).flatten();
-    let fold8_round1 = direct_fold8_mode.then_some(round1_lookahead).flatten();
-    let fold8_round2 = direct_fold8_mode.then_some(round2_lookahead).flatten();
-    let fold8_round3 = direct_fold8_mode.then_some(round3_lookahead).flatten();
-    let fold8_round4 = direct_fold8_mode.then_some(round4_lookahead).flatten();
-    let fold8_round5 = direct_fold8_mode.then_some(round5_lookahead).flatten();
-    let mut fold4_challenges = Vec::with_capacity(5);
-    let mut fold4_initial_msgs = Vec::with_capacity(5);
+    let mut fold4_challenges = Vec::with_capacity(3);
+    let mut fold4_initial_msgs = Vec::with_capacity(3);
     let mut deferred_challenge = None;
     let mut deferred_msg = None;
     for j in 0..initial_k {
@@ -4889,108 +4386,7 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
         }
         let r = challenger.sample_f128();
         let _tf = std::time::Instant::now();
-        let msg = if direct_fold8.is_some() {
-            match fold4_challenges.len() {
-                0 => {
-                    let msg = eval_lookahead(
-                        fold8_round1
-                            .as_ref()
-                            .expect("direct-fold8 round-1 lookahead"),
-                        r,
-                    );
-                    fold4_challenges.push(r);
-                    fold4_initial_msgs.push(msg);
-                    msg
-                }
-                1 => {
-                    let msg = eval_fold4_lookahead2(
-                        fold8_round2
-                            .as_ref()
-                            .expect("direct-fold8 round-2 lookahead"),
-                        fold4_challenges[0],
-                        r,
-                    );
-                    fold4_challenges.push(r);
-                    fold4_initial_msgs.push(msg);
-                    msg
-                }
-                2 => {
-                    let msg = eval_fold4_lookahead3(
-                        fold8_round3
-                            .as_ref()
-                            .expect("direct-fold8 round-3 lookahead"),
-                        fold4_challenges[0],
-                        fold4_challenges[1],
-                        r,
-                    );
-                    fold4_challenges.push(r);
-                    fold4_initial_msgs.push(msg);
-                    msg
-                }
-                3 => {
-                    let msg = eval_fold8_lookahead4(
-                        fold8_round4
-                            .as_ref()
-                            .expect("direct-fold8 round-4 lookahead"),
-                        fold4_challenges[0],
-                        fold4_challenges[1],
-                        fold4_challenges[2],
-                        r,
-                    );
-                    fold4_challenges.push(r);
-                    fold4_initial_msgs.push(msg);
-                    msg
-                }
-                4 => {
-                    let msg = eval_fold8_lookahead5(
-                        fold8_round5
-                            .as_ref()
-                            .expect("direct-fold8 round-5 lookahead"),
-                        fold4_challenges[0],
-                        fold4_challenges[1],
-                        fold4_challenges[2],
-                        fold4_challenges[3],
-                        r,
-                    );
-                    fold4_challenges.push(r);
-                    fold4_initial_msgs.push(msg);
-                    msg
-                }
-                5 => {
-                    let (f8, b8, msg) = materialize_direct_fold8(
-                        packed_witness.take().unwrap(),
-                        b_initial.take().unwrap(),
-                        direct_fold8.take().unwrap().as_slice(),
-                        [
-                            fold4_challenges[0],
-                            fold4_challenges[1],
-                            fold4_challenges[2],
-                            fold4_challenges[3],
-                            fold4_challenges[4],
-                            r,
-                        ],
-                    );
-                    sc_prover = Some(SumcheckProver::new_after_direct_fold8(
-                        f8,
-                        b8,
-                        target,
-                        [
-                            start_msg,
-                            fold4_initial_msgs[0],
-                            fold4_initial_msgs[1],
-                            fold4_initial_msgs[2],
-                            fold4_initial_msgs[3],
-                            fold4_initial_msgs[4],
-                            msg,
-                        ],
-                    ));
-                    fold4_challenges.clear();
-                    fold4_initial_msgs.clear();
-                    msg
-                }
-                _ => unreachable!(),
-            }
-        } else if direct_fold4.is_some() {
+        let msg = if direct_fold4.is_some() {
             match fold4_challenges.len() {
                 0 => {
                     let msg = eval_lookahead(
@@ -5112,7 +4508,7 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
         deferred_challenge.is_none(),
         "ranked initial_k must be even"
     );
-    debug_assert!(fold4_challenges.is_empty(), "direct-fold4/fold8 must materialize");
+    debug_assert!(fold4_challenges.is_empty(), "direct-fold4 must materialize");
     let mut sc_prover = sc_prover.expect("initial direct mode must materialize");
     if trace {
         t_init_sumcheck += _t.elapsed();
@@ -7179,44 +6575,6 @@ mod tests {
 
     use super::*;
 
-    /// The recursive from-message first pass preserves every encoded element
-    /// and every node of the ordinary Merkle tree for both production rates.
-    #[test]
-    fn recursive_from_message_commit_matches_replica_oracle() {
-        use crate::challenger::Challenger;
-
-        for (log_msg_cols, log_inv_rate, seed) in [
-            (16usize, 2usize, 0xF14C_0002_u64),
-            (13usize, 3usize, 0xF14C_0003_u64),
-        ] {
-            let log_num_interleaved = 3usize;
-            let mut rng = crate::challenger::RandomChallenger::new(seed);
-            let poly = rng.sample_f128_vec(1usize << (log_msg_cols + log_num_interleaved));
-            let ntt = AdditiveNttF128::standard(log_msg_cols + log_inv_rate);
-            let ordinary = ligero_commit_impl(
-                &poly,
-                log_msg_cols,
-                log_num_interleaved,
-                log_inv_rate,
-                &ntt,
-                HashKind::Blake3,
-                false,
-            );
-            let fused = ligero_commit_impl(
-                &poly,
-                log_msg_cols,
-                log_num_interleaved,
-                log_inv_rate,
-                &ntt,
-                HashKind::Blake3,
-                true,
-            );
-            assert_eq!(fused.mat, ordinary.mat, "encoded matrix changed");
-            assert_eq!(fused.tree, ordinary.tree, "flat Merkle tree changed");
-            assert_eq!(fused.root(), ordinary.root(), "Merkle root changed");
-        }
-    }
-
     /// Worked example: `LigeritoSecurityConfig` for BLAKE3 m=29 at rate 1/2.
     /// Paper-compatible m=29 fast example, mechanically derived in the
     /// unique-decoding regime (Theorem 1.4, ε* = 10⁻³) targeting 100-bit
@@ -8030,8 +7388,7 @@ mod tests {
                     dense[p] += v;
                 }
                 transpose_forward_ntt(&ntt, &mut dense, log_d);
-                let sparse =
-                    transpose_forward_ntt_sparse(&ntt, &positions, &values, log_d, false);
+                let sparse = transpose_forward_ntt_sparse(&ntt, &positions, &values, log_d);
                 assert_eq!(sparse, dense, "log_d={log_d}, nq={nq}");
             }
         }
@@ -8064,16 +7421,9 @@ mod tests {
                 }
                 transpose_forward_ntt(&ntt, &mut dense, log_d);
 
-                let legacy = transpose_forward_ntt_sparse_hashmap(
-                    &ntt,
-                    &positions,
-                    &values,
-                    log_d,
-                    8,
-                    false,
-                );
-                let linear =
-                    transpose_forward_ntt_sparse(&ntt, &positions, &values, log_d, false);
+                let legacy =
+                    transpose_forward_ntt_sparse_hashmap(&ntt, &positions, &values, log_d, 8);
+                let linear = transpose_forward_ntt_sparse(&ntt, &positions, &values, log_d);
                 assert_eq!(
                     linear, legacy,
                     "linear != hashmap at log_d={log_d}, nq={n_queries}"
@@ -8097,120 +7447,15 @@ mod tests {
             F128::new(5, 0),
             F128::new(6, 0),
         ];
-        let legacy =
-            transpose_forward_ntt_sparse_hashmap(&ntt, &positions, &values, log_d, 8, false);
-        let linear = transpose_forward_ntt_sparse(&ntt, &positions, &values, log_d, false);
+        let legacy = transpose_forward_ntt_sparse_hashmap(&ntt, &positions, &values, log_d, 8);
+        let linear = transpose_forward_ntt_sparse(&ntt, &positions, &values, log_d);
         assert_eq!(linear, legacy, "duplicate-position accumulation changed");
 
         let positions: Vec<usize> = (0..1usize << log_d).step_by(1 << 8).collect();
         let values = vec![F128::ONE; positions.len()];
-        let legacy =
-            transpose_forward_ntt_sparse_hashmap(&ntt, &positions, &values, log_d, 8, false);
-        let linear = transpose_forward_ntt_sparse(&ntt, &positions, &values, log_d, false);
+        let legacy = transpose_forward_ntt_sparse_hashmap(&ntt, &positions, &values, log_d, 8);
+        let linear = transpose_forward_ntt_sparse(&ntt, &positions, &values, log_d);
         assert_eq!(linear, legacy, "all-active-window case changed");
-    }
-
-    #[test]
-    fn ranked_induce_truncated_final_ntt_shape_gate_is_narrow() {
-        assert!(is_ranked_induce_truncated_final_ntt_shape(19, 1, 6, 218, 8));
-        for shape in [
-            (18, 1, 6, 218, 8),
-            (19, 2, 6, 218, 8),
-            (19, 1, 5, 218, 8),
-            (19, 1, 6, 217, 8),
-            (19, 1, 6, 218, 7),
-        ] {
-            assert!(!is_ranked_induce_truncated_final_ntt_shape(
-                shape.0, shape.1, shape.2, shape.3, shape.4,
-            ));
-        }
-    }
-
-    #[test]
-    fn ranked_induce_truncated_final_ntt_gate_tracks_optout() {
-        let expected = cfg!(all(target_os = "macos", target_arch = "aarch64"))
-            && std::env::var_os("FLOCK_NO_LIG_INDUCE_TRUNCATED_NTT").is_none();
-        assert_eq!(
-            use_ranked_induce_truncated_final_ntt(19, 1, 6, 218, 8),
-            expected,
-        );
-    }
-
-    /// Independent oracle for the final fused group. The optimized kernel
-    /// must reproduce the retained half while leaving every discarded slot
-    /// untouched, proving that the dead root stores are absent.
-    #[test]
-    fn transpose_truncated_final_group_matches_reference_low_half() {
-        use crate::challenger::Challenger;
-
-        fn final_three_layer_reference(ntt: &AdditiveNttF128, data: &mut [F128], log_d: usize) {
-            for layer in (0..3).rev() {
-                let num_blocks = 1usize << layer;
-                let block_size = 1usize << (log_d - layer);
-                let half = block_size >> 1;
-                for block in 0..num_blocks {
-                    let twiddle = ntt.twiddle(layer, block);
-                    let start = block * block_size;
-                    for row in 0..half {
-                        let a = data[start + row];
-                        let b = data[start + half + row];
-                        let sum = a + b;
-                        data[start + row] = sum;
-                        data[start + half + row] = twiddle * sum + b;
-                    }
-                }
-            }
-        }
-
-        for &log_d in &[3usize, 6, 9, 14] {
-            let mut challenger =
-                crate::challenger::RandomChallenger::new(0x7A11_F17E ^ log_d as u64);
-            let before = challenger.sample_f128_vec(1usize << log_d);
-            let mut expected = before.clone();
-            let mut actual = before.clone();
-            let ntt = AdditiveNttF128::standard(log_d);
-
-            final_three_layer_reference(&ntt, &mut expected, log_d);
-            transpose_forward_ntt_fused_final_3layer_low_half(&ntt, &mut actual, log_d);
-
-            let half = actual.len() >> 1;
-            assert_eq!(&actual[..half], &expected[..half], "log_d={log_d}");
-            assert_eq!(
-                &actual[half..],
-                &before[half..],
-                "discarded-half write at log_d={log_d}",
-            );
-        }
-    }
-
-    /// Exercise the complete sparse-prefix schedule at sizes where its final
-    /// dense group is layers 2,1,0. The truncated result must equal the low
-    /// half of the untouched frontier transform.
-    #[test]
-    fn transpose_sparse_truncated_final_group_matches_full_transform() {
-        use crate::challenger::Challenger;
-
-        for &log_d in &[14usize, 17] {
-            let n = 1usize << log_d;
-            let mut challenger =
-                crate::challenger::RandomChallenger::new(0x5A95_EF17 ^ log_d as u64);
-            let mut pairs = Vec::new();
-            while pairs.len() < 43 {
-                let position = (challenger.sample_f128().lo as usize) % n;
-                if !pairs.iter().any(|&(p, _)| p == position) {
-                    pairs.push((position, challenger.sample_f128()));
-                }
-            }
-            pairs.sort_unstable_by_key(|&(position, _)| position);
-            let (positions, values): (Vec<_>, Vec<_>) = pairs.into_iter().unzip();
-            let ntt = AdditiveNttF128::standard(log_d);
-            let mut expected =
-                transpose_forward_ntt_sparse(&ntt, &positions, &values, log_d, false);
-            expected.truncate(n >> 1);
-            let actual =
-                transpose_forward_ntt_sparse(&ntt, &positions, &values, log_d, true);
-            assert_eq!(actual, expected, "log_d={log_d}");
-        }
     }
 
     /// The fused production kernel must be byte-identical to the original
@@ -8881,122 +8126,6 @@ mod tests {
         eprintln!("LigeritoProof bincode size: {} bytes", bytes.len());
     }
 
-    /// Full-prover control for the truncated final F^T group. This uses a
-    /// smaller domain whose sparse suffix still ends in fused layers 2,1,0;
-    /// a test-only policy selects candidate/control without weakening the
-    /// exact production gate.
-    #[test]
-    fn truncated_final_ntt_full_proof_and_claim_bytes_match_control() {
-        use crate::challenger::Challenger;
-
-        let log_n = 16;
-        let initial_k = 3;
-        let k_0 = 3;
-        let log_inv_rate = 1;
-        let log_msg_cols_0 = log_n - initial_k;
-        let mut rng = crate::challenger::RandomChallenger::new(0xF17E_BA5E);
-        let poly: Vec<F128> = (0..(1usize << log_n)).map(|_| rng.sample_f128()).collect();
-        let point: Vec<F128> = (0..log_n).map(|_| rng.sample_f128()).collect();
-        let basis = build_eq_table(&point);
-        let target = poly
-            .iter()
-            .zip(basis.iter())
-            .map(|(&f, &b)| f * b)
-            .fold(F128::ZERO, |acc, value| acc + value);
-
-        let log_inv_rates = vec![log_inv_rate, log_inv_rate];
-        let queries = vec![218, 106];
-        let cfg = ProverConfig {
-            log_inv_rates: log_inv_rates.clone(),
-            recursive_steps: 1,
-            initial_log_msg_cols: log_msg_cols_0,
-            initial_log_num_interleaved: initial_k,
-            initial_k,
-            recursive_log_msg_cols: vec![log_msg_cols_0 - k_0],
-            recursive_ks: vec![k_0],
-            queries: queries.clone(),
-            grinding_bits: vec![0; log_inv_rates.len()],
-            fold_grinding_bits: vec![0; 2],
-            ood_samples: vec![0; 2],
-            merkle_hash: HashKind::Sha256,
-        };
-        let verifier_cfg = VerifierConfig {
-            log_inv_rates: log_inv_rates.clone(),
-            recursive_steps: 1,
-            initial_log_msg_cols: log_msg_cols_0,
-            initial_log_num_interleaved: initial_k,
-            initial_k,
-            recursive_log_msg_cols: vec![log_msg_cols_0 - k_0],
-            recursive_ks: vec![k_0],
-            queries,
-            grinding_bits: vec![0; log_inv_rates.len()],
-            fold_grinding_bits: vec![0; 2],
-            ood_samples: vec![0; 2],
-            merkle_hash: HashKind::Sha256,
-        };
-
-        let ntt_0 = AdditiveNttF128::standard(log_msg_cols_0 + log_inv_rate);
-        let wtns_0 = ligero_commit(
-            &poly,
-            log_msg_cols_0,
-            initial_k,
-            log_inv_rate,
-            &ntt_0,
-            HashKind::Sha256,
-        );
-        let initial_root = wtns_0.root();
-
-        let prove = |truncate_final_group: bool| {
-            with_truncated_final_ntt_override(truncate_final_group, || {
-                TEST_TRUNCATED_FINAL_NTT_HITS.with(|hits| hits.set(0));
-                assert_eq!(
-                    use_ranked_induce_truncated_final_ntt(
-                        log_msg_cols_0,
-                        log_inv_rate,
-                        initial_k,
-                        218,
-                        8,
-                    ),
-                    truncate_final_group,
-                );
-                let mut challenger =
-                    crate::challenger::FsChallenger::new(b"truncated-final-ntt-proof-oracle");
-                let proof = recursive_prover_with_basis(
-                    &cfg,
-                    poly.clone(),
-                    basis.clone(),
-                    target,
-                    &wtns_0.mat,
-                    &wtns_0.tree,
-                    &mut challenger,
-                );
-                let hits = TEST_TRUNCATED_FINAL_NTT_HITS.with(|hits| hits.get());
-                (proof, hits)
-            })
-        };
-
-        let (control, control_hits) = prove(false);
-        let (truncated, truncated_hits) = prove(true);
-        assert_eq!(control_hits, 0);
-        assert_eq!(truncated_hits, 1);
-        assert_eq!(truncated, control);
-        assert_eq!(
-            bincode::serialize(&(&truncated, target)).expect("serialize truncated proof/claim"),
-            bincode::serialize(&(&control, target)).expect("serialize control proof/claim"),
-        );
-
-        let mut verifier_challenger =
-            crate::challenger::FsChallenger::new(b"truncated-final-ntt-proof-oracle");
-        assert!(recursive_verifier_with_basis(
-            &verifier_cfg,
-            &truncated,
-            &basis,
-            target,
-            &initial_root,
-            &mut verifier_challenger,
-        ));
-    }
-
     /// `recursive_prover_with_basis` + `recursive_verifier_with_basis`
     /// roundtrip — this is the basefold-compatible signature that
     /// `pcs::open_batch` will call. Single-claim case (`b = eq(z, ·)`,
@@ -9340,144 +8469,6 @@ mod tests {
         };
         let mut verifier_challenger =
             crate::challenger::FsChallenger::new(b"direct-fold4-proof-byte-oracle");
-        assert!(recursive_verifier_with_basis(
-            &v_cfg,
-            &got,
-            &combined_basis,
-            target,
-            &wtns_0.root(),
-            &mut verifier_challenger,
-        ));
-    }
-
-    #[test]
-    fn direct_fold8_full_proof_and_claim_bytes_match_ordinary_fold2() {
-        use crate::challenger::Challenger;
-
-        let log_n = 12;
-        let initial_k = 6;
-        let k_0 = 2;
-        let log_inv_rate = 3;
-        let mut rng = crate::challenger::RandomChallenger::new(0xD1CE_F008);
-        let poly: Vec<F128> = (0..(1usize << log_n))
-            .map(|_| rng.sample_f128())
-            .collect();
-        let suffix: Vec<F128> = (0..log_n).map(|_| rng.sample_f128()).collect();
-        let scaled_rdp: Vec<F128> = build_eq_table(
-            &(0..crate::pcs::LOG_PACKING)
-                .map(|_| rng.sample_f128())
-                .collect::<Vec<_>>(),
-        );
-        let combined_basis = super::super::ring_switch::fold_b128_elems(
-            &build_eq_table(&suffix),
-            &scaled_rdp,
-        );
-        let target = poly
-            .iter()
-            .zip(combined_basis.iter())
-            .map(|(&f, &b)| f * b)
-            .fold(F128::ZERO, |acc, value| acc + value);
-
-        let mut products = [F128::ZERO; 4096];
-        for high in 0..poly.len() / 64 {
-            for e in 0..64 {
-                for d in 0..64 {
-                    products[64 * e + d] +=
-                        poly[64 * high + e] * combined_basis[64 * high + d];
-                }
-            }
-        }
-        let (eq_lo, eq_hi) =
-            super::super::ring_switch::build_eq_split(&suffix[6..], (log_n - 6) / 2);
-        let direct = vec![super::super::ring_switch::DirectFold8Factors {
-            eq_lo,
-            eq_hi,
-            low_eq: build_eq_table(&suffix[..6]).try_into().unwrap(),
-            table: super::super::ring_switch::build_fold_byte_table(&scaled_rdp),
-            products,
-        }];
-        let (round0, round1, round2, round3, round4, round5) =
-            super::super::messages_from_direct_products_fold8(&direct);
-
-        let log_inv_rates = vec![log_inv_rate, log_inv_rate];
-        let cfg = ProverConfig {
-            log_inv_rates: log_inv_rates.clone(),
-            recursive_steps: 1,
-            initial_log_msg_cols: log_n - initial_k,
-            initial_log_num_interleaved: initial_k,
-            initial_k,
-            recursive_log_msg_cols: vec![log_n - initial_k - k_0],
-            recursive_ks: vec![k_0],
-            queries: log_inv_rates.iter().map(|&rate| udr_queries(rate)).collect(),
-            grinding_bits: vec![0; log_inv_rates.len()],
-            fold_grinding_bits: vec![0; 2],
-            ood_samples: vec![0; 2],
-            merkle_hash: Default::default(),
-        };
-        let ntt_0 = AdditiveNttF128::standard(log_n - initial_k + log_inv_rate);
-        let wtns_0 = ligero_commit(
-            &poly,
-            log_n - initial_k,
-            initial_k,
-            log_inv_rate,
-            &ntt_0,
-            HashKind::Sha256,
-        );
-
-        let mut ordinary_challenger =
-            crate::challenger::FsChallenger::new(b"direct-fold8-proof-byte-oracle");
-        let ordinary = recursive_prover_with_basis_precomputed_round0(
-            &cfg,
-            poly.clone(),
-            combined_basis.clone(),
-            target,
-            &wtns_0.mat,
-            &wtns_0.tree,
-            round0,
-            Some(round1),
-            &mut ordinary_challenger,
-        );
-        let mut direct_challenger =
-            crate::challenger::FsChallenger::new(b"direct-fold8-proof-byte-oracle");
-        let got = recursive_prover_with_basis_direct_fold8(
-            &cfg,
-            poly,
-            Vec::new(),
-            direct,
-            target,
-            &wtns_0.mat,
-            &wtns_0.tree,
-            round0,
-            round1,
-            round2,
-            round3,
-            round4,
-            round5,
-            &mut direct_challenger,
-        );
-
-        assert_eq!(got, ordinary);
-        assert_eq!(
-            bincode::serialize(&(got.clone(), target)).expect("serialize direct-fold8 proof/claim"),
-            bincode::serialize(&(ordinary, target)).expect("serialize ordinary proof/claim"),
-        );
-
-        let v_cfg = VerifierConfig {
-            log_inv_rates: log_inv_rates.clone(),
-            recursive_steps: 1,
-            initial_log_msg_cols: log_n - initial_k,
-            initial_log_num_interleaved: initial_k,
-            initial_k,
-            recursive_log_msg_cols: vec![log_n - initial_k - k_0],
-            recursive_ks: vec![k_0],
-            queries: log_inv_rates.iter().map(|&rate| udr_queries(rate)).collect(),
-            grinding_bits: vec![0; log_inv_rates.len()],
-            fold_grinding_bits: vec![0; 2],
-            ood_samples: vec![0; 2],
-            merkle_hash: Default::default(),
-        };
-        let mut verifier_challenger =
-            crate::challenger::FsChallenger::new(b"direct-fold8-proof-byte-oracle");
         assert!(recursive_verifier_with_basis(
             &v_cfg,
             &got,
@@ -10457,10 +9448,3 @@ mod tests {
 }
 // Redraw marker 4 (drift probe): zero-diff; prior draws 1,205,646 / 1,205,107 / 1,206,245.
 // RealAdii draw 1 on 1a6ad0e.
-// RealAdii draw 1 on 76f9e98.
-// RealAdii draw 2 on 76f9e98 (draw 1: 1,250,243.88).
-// RealAdii draw 3 on 76f9e98.
-// angelX disclosed draw 3 on 39541e2 (draws 1-2: 1,252,541 / 1,241,514; zero-diff marker per board protocol).
-// angelX disclosed draw 7 of the tree on 775378c (prior: 1,252,541 / 1,241,514 / 1,255,076 P / 1,245,411 / 1,249,152 / pending; zero-diff marker).
-// RealAdii sample 1 on beeedc6.
-// RealAdii sample 1 on 88aff39.
