@@ -4484,6 +4484,9 @@ kernel void blake3_pow_scan(
     static RANKED_EXACT_PENDING_CPU_WALL_BITS: std::sync::atomic::AtomicU64 =
         std::sync::atomic::AtomicU64::new(0);
 
+    /// Exclusive upper bound on a hybrid CPU-block share.
+    const HYBRID_K_LIMIT: usize = 16;
+
     /// Exact override / kill-switch resolution. `FLOCK_NO_HYBRID_COMMIT`
     /// forces the pure-GPU graph; `FLOCK_HYBRID_CPU_BLOCKS` pins an exact
     /// split. Either also disables the warmup sweep.
@@ -4497,8 +4500,16 @@ kernel void blake3_pow_scan(
             std::env::var("FLOCK_HYBRID_CPU_BLOCKS")
                 .ok()
                 .and_then(|v| v.parse().ok())
-                .filter(|k| *k < 16)
+                .filter(|k| *k < HYBRID_K_LIMIT)
         })
+    }
+
+    /// `FLOCK_NO_HYBRID_LADDER_EXTEND=1` restores the exact incumbent
+    /// behaviour: the coarse ladder's top rung is also the highest split the
+    /// tune can ever select. Rollback lever for the conditional upward probe.
+    fn hybrid_ladder_extend_enabled() -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var_os("FLOCK_NO_HYBRID_LADDER_EXTEND").is_none())
     }
 
     fn ranked_exact_tune_applicable(params: &crate::pcs::commit::PcsParams) -> bool {
@@ -4956,13 +4967,13 @@ kernel void blake3_pow_scan(
                 }
             }
         };
-        let sample = |k: usize| -> Result<f64, String> {
+        let mut sample = |k: usize| -> Result<f64, String> {
             let t0 = std::time::Instant::now();
             let (graph, ()) = rayon::join(|| timed_graph(k), || replay_ab());
             graph?;
             Ok(t0.elapsed().as_secs_f64() * 1e3)
         };
-        let reprime = || unsafe {
+        let mut reprime = || unsafe {
             run_from_z_first_pass(
                 ctx.gpu,
                 ctx.z_buf,
@@ -4971,7 +4982,7 @@ kernel void blake3_pow_scan(
                 params.k_code(),
             )
         };
-        let samples = match collect_ranked_exact_samples(reprime, sample) {
+        let samples = match collect_ranked_exact_samples(&mut reprime, &mut sample) {
             Ok(samples) => samples,
             Err(e) => {
                 if dbg {
@@ -4987,7 +4998,7 @@ kernel void blake3_pow_scan(
             finish_ranked_exact_contention_tune(params, cpu_tree, 0);
             return;
         };
-        let Some(chosen) = choose_hybrid_k(
+        let Some(coarse) = choose_hybrid_k(
             &RANKED_EXACT_TUNE_CANDIDATES,
             &means,
             DEFAULT_HYBRID_K,
@@ -4995,6 +5006,83 @@ kernel void blake3_pow_scan(
             finish_ranked_exact_contention_tune(params, cpu_tree, 0);
             return;
         };
+
+        // Conditional upward extension of the ladder.
+        //
+        // The ladder's top rung is also the highest split the tune can ever
+        // select, so if the true optimum lies above it the sweep cannot reach
+        // it no matter how clean its samples are. That is a reachability
+        // limit, not a precision one, and extra sampling between existing
+        // rungs does not address it.
+        //
+        // It matters because the ladder was trimmed from [0,2,3,4,5,6,7,8] on
+        // the grounds that "the upper candidates [are] consistently worse" --
+        // an observation that can only have come from a local host, since the
+        // ranked worker's stdout and stderr are discarded and nobody can see
+        // which k the runner actually picks. On a CPU-starved host the upper
+        // rungs *are* consistently worse: k is CPU blocks stolen from the
+        // round-1 AB precompute sharing that window, and when the two arms are
+        // near-balanced every extra block hurts. With more P-cores the
+        // precompute finishes well inside the GPU window and leaves the CPU
+        // idle, which is exactly when a higher k pays.
+        //
+        // So probe upward only on evidence that the ceiling binds: the coarse
+        // winner landing on the top rung. On a host whose optimum is interior
+        // this costs literally nothing -- no extra graph runs at all -- which
+        // matters because the three-candidate ladder is deliberately sized at
+        // ~3/8 of the job-wall cost that ~120 fresh workers pay against a hard
+        // 10-minute cap. Each step must beat the incumbent by the same 1.5%
+        // `choose_hybrid_k` treats as a tie, and the climb is capped at two
+        // steps, so the worst case is four extra graph runs and only on a host
+        // that keeps asking for more CPU.
+        let top_rung = RANKED_EXACT_TUNE_CANDIDATES[RANKED_EXACT_TUNE_CANDIDATES.len() - 1];
+        let coarse_i = RANKED_EXACT_TUNE_CANDIDATES
+            .iter()
+            .position(|&k| k == coarse)
+            .expect("choose_hybrid_k returns one of its own candidates");
+        let mut chosen = coarse;
+        let mut chosen_ms = means[coarse_i];
+        if hybrid_ladder_extend_enabled() && coarse == top_rung {
+            for _ in 0..2 {
+                let next = chosen + 2;
+                if next >= HYBRID_K_LIMIT {
+                    break;
+                }
+                let mut walls = [0.0f64; 2];
+                let mut usable = true;
+                for wall in walls.iter_mut() {
+                    if reprime().is_err() {
+                        usable = false;
+                        break;
+                    }
+                    match sample(next) {
+                        Ok(ms) if ms.is_finite() && ms >= 0.0 => *wall = ms,
+                        _ => {
+                            usable = false;
+                            break;
+                        }
+                    }
+                }
+                // A failed probe is not fatal -- the coarse ladder already
+                // produced a selectable candidate. Stop climbing and keep it.
+                if !usable {
+                    break;
+                }
+                let mean = (walls[0] + walls[1]) * 0.5;
+                let adopt = mean < chosen_ms * (1.0 - 0.015);
+                if dbg {
+                    eprintln!(
+                        "[gpu-commit] ladder-extend k={next}:[{:.1},{:.1}] mean={:.1}ms vs k={chosen}={:.1}ms adopt={adopt}",
+                        walls[0], walls[1], mean, chosen_ms
+                    );
+                }
+                if !adopt {
+                    break;
+                }
+                chosen = next;
+                chosen_ms = mean;
+            }
+        }
 
         let verified = unsafe {
             if chosen == 0 {
