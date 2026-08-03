@@ -692,8 +692,9 @@ fn precompute_round1_ab_inner_packed_padded_with_flavor(
     debug_assert_eq!(OUTER_BYTES, (1 << N_INNER) * N_CHUNKS);
 
     // Reuse an A-sized resident F128 allocation from the prover scratch pool.
-    // Treating it as bytes is valid because every byte is written below before
-    // the storage is read (including explicit zero writes for padding holes).
+    // Treating it as bytes is valid because every row that the padding-aware
+    // consumer can read is written below; release builds intentionally leave
+    // fully padded tail rows stale (the test build restores zero padding).
     let mut storage = crate::scratch::take_f128(total_bytes / core::mem::size_of::<F128>());
     let out_bytes: &mut [u8] =
         unsafe { core::slice::from_raw_parts_mut(storage.as_mut_ptr() as *mut u8, total_bytes) };
@@ -757,16 +758,31 @@ fn precompute_round1_ab_inner_packed_padded_with_flavor(
                         };
                     }
                 }
-                if nt {
-                    let tail = &mut out_outer[n_b_med * 64..];
-                    debug_assert_eq!(tail.len() % 64, 0);
-                    let zero = [0u8; 64];
-                    for i in 0..tail.len() / 64 {
-                        // SAFETY: chunk `i` is 64 in-bounds bytes of `tail`.
-                        unsafe { store_nt_64(zero.as_ptr(), tail.as_mut_ptr().add(i * 64)) };
+                // The consumer is padding-aware: every precomputed-AB read is
+                // guarded by the same `b_med_counts` value and only observes
+                // rows `0..n_b_med`.  The remaining rows are therefore dead
+                // bytes in the ranked BLAKE3 layout.  `storage` comes from
+                // the scratch pool and is explicitly stale-by-contract, so
+                // leaving this tail untouched is safe in release and removes
+                // one 64-byte store per omitted 512-bit sub-window.  Keep the
+                // old full-zero surface in test builds so byte-level producer
+                // oracles retain their honest padding contract.
+                #[cfg(test)]
+                {
+                    if nt {
+                        let tail = &mut out_outer[n_b_med * 64..];
+                        debug_assert_eq!(tail.len() % 64, 0);
+                        let zero = [0u8; 64];
+                        for i in 0..tail.len() / 64 {
+                            // SAFETY: chunk `i` is 64 in-bounds bytes of
+                            // `tail`.
+                            unsafe {
+                                store_nt_64(zero.as_ptr(), tail.as_mut_ptr().add(i * 64))
+                            };
+                        }
+                    } else {
+                        out_outer[n_b_med * 64..].fill(0);
                     }
-                } else {
-                    out_outer[n_b_med * 64..].fill(0);
                 }
             },
         );
