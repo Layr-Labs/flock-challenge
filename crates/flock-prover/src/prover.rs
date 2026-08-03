@@ -325,6 +325,39 @@ pub fn prove_fast_ligerito_from_witness<Ch: Challenger>(
         LincheckStripeInput::Ready(z_packed_lincheck),
         lincheck_circuit,
         commit_codeword,
+        false,
+        challenger,
+    )
+}
+
+/// Ranked from-message fallback whose SIMD witness builder already emitted
+/// A/B in block-split pair-delta form.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn prove_fast_ligerito_from_witness_with_preformed_pair_deltas<Ch: Challenger>(
+    r1cs: &BlockR1cs,
+    pcs_params: &PcsParams,
+    z_packed: Vec<F128>,
+    a_packed_f128: Vec<F128>,
+    b_packed_f128: Vec<F128>,
+    z_packed_lincheck: Vec<u8>,
+    lincheck_circuit: &dyn lincheck::LincheckCircuit,
+    prefaulted_codeword: Option<Vec<F128>>,
+    challenger: &mut Ch,
+) -> (R1csProofLigerito, Commitment, R1csClaim) {
+    let commit_codeword = match prefaulted_codeword {
+        Some(codeword) => CommitCodeword::NeedsReplication(codeword),
+        None => CommitCodeword::Allocate,
+    };
+    prove_fast_ligerito_from_witness_with_commit_codeword(
+        r1cs,
+        pcs_params,
+        z_packed,
+        a_packed_f128,
+        b_packed_f128,
+        LincheckStripeInput::Ready(z_packed_lincheck),
+        lincheck_circuit,
+        commit_codeword,
+        true,
         challenger,
     )
 }
@@ -353,6 +386,7 @@ pub(crate) fn prove_fast_ligerito_from_preinitialized_codeword<Ch: Challenger>(
         LincheckStripeInput::Ready(z_packed_lincheck),
         lincheck_circuit,
         CommitCodeword::Preinitialized(codeword),
+        false,
         challenger,
     )
 }
@@ -371,6 +405,7 @@ pub(crate) fn prove_fast_ligerito_from_streamed_first_pass<Ch: Challenger>(
     lincheck_circuit: &dyn lincheck::LincheckCircuit,
     codeword: Vec<F128>,
     stream: flock_core::gpu_commit::FromZFirstPassStream,
+    ab_pair_deltas_preformed: bool,
     challenger: &mut Ch,
 ) -> (R1csProofLigerito, Commitment, R1csClaim) {
     prove_fast_ligerito_from_witness_with_commit_codeword(
@@ -382,6 +417,7 @@ pub(crate) fn prove_fast_ligerito_from_streamed_first_pass<Ch: Challenger>(
         LincheckStripeInput::Ready(z_packed_lincheck),
         lincheck_circuit,
         CommitCodeword::StreamedFirstPass(codeword, stream),
+        ab_pair_deltas_preformed,
         challenger,
     )
 }
@@ -403,6 +439,7 @@ pub(crate) fn prove_fast_ligerito_from_streamed_first_pass_deferred_stripe<Ch: C
     lincheck_circuit: &dyn lincheck::LincheckCircuit,
     codeword: Vec<F128>,
     stream: flock_core::gpu_commit::FromZFirstPassStream,
+    ab_pair_deltas_preformed: bool,
     challenger: &mut Ch,
 ) -> (R1csProofLigerito, Commitment, R1csClaim) {
     prove_fast_ligerito_from_witness_with_commit_codeword(
@@ -414,6 +451,7 @@ pub(crate) fn prove_fast_ligerito_from_streamed_first_pass_deferred_stripe<Ch: C
         LincheckStripeInput::DeferredRanked,
         lincheck_circuit,
         CommitCodeword::StreamedFirstPass(codeword, stream),
+        ab_pair_deltas_preformed,
         challenger,
     )
 }
@@ -428,6 +466,7 @@ fn prove_fast_ligerito_from_witness_with_commit_codeword<Ch: Challenger>(
     z_packed_lincheck: LincheckStripeInput,
     lincheck_circuit: &dyn lincheck::LincheckCircuit,
     commit_codeword: CommitCodeword,
+    ab_pair_deltas_preformed: bool,
     challenger: &mut Ch,
 ) -> (R1csProofLigerito, Commitment, R1csClaim) {
     let lig_config = pcs_params
@@ -453,6 +492,7 @@ fn prove_fast_ligerito_from_witness_with_commit_codeword<Ch: Challenger>(
         z_packed_lincheck,
         lincheck_circuit,
         commit_codeword,
+        ab_pair_deltas_preformed,
         challenger,
     );
 
@@ -705,15 +745,19 @@ mod deferred_stripe_tests {
 }
 
 /// Build the witness commitment and the challenge-independent half of
-/// zerocheck round 1 on the same fixed Rayon pool. A/B are only borrowed:
-/// their original packed values remain live for zerocheck round 2.
+/// zerocheck round 1 on the same fixed Rayon pool.  At the ranked BLAKE3 shape
+/// the precompute rewrites each consumed 1 KiB A/B block as 64 even rows plus
+/// 64 adjacent-row XOR deltas; `FLOCK_NO_ZC_IN_PLACE_PAIR_DELTAS=1` restores the
+/// exact immutable incumbent representation. Other shapes always keep the
+/// incumbent representation.
 fn commit_with_round1_ab_precompute(
     z_packed: &[F128],
-    a_packed_f128: &[F128],
-    b_packed_f128: &[F128],
+    a_packed_f128: &mut [F128],
+    b_packed_f128: &mut [F128],
     pcs_params: &PcsParams,
     padding: &zerocheck::PaddingSpec,
     commit_codeword: CommitCodeword,
+    ab_pair_deltas_preformed: bool,
 ) -> (
     (Commitment, pcs::ProverData),
     zerocheck::univariate_skip_optimized::Round1AbInner,
@@ -721,22 +765,26 @@ fn commit_with_round1_ab_precompute(
     let as_bytes = |v: &[F128]| -> &[u8] {
         unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, std::mem::size_of_val(v)) }
     };
-    let a_packed = as_bytes(a_packed_f128);
-    let b_packed = as_bytes(b_packed_f128);
+    let as_bytes_mut = |v: &mut [F128]| -> &mut [u8] {
+        unsafe {
+            std::slice::from_raw_parts_mut(
+                v.as_mut_ptr() as *mut u8,
+                std::mem::size_of_val(v),
+            )
+        }
+    };
     let k_skip = zerocheck::K_SKIP;
     debug_assert_eq!(k_skip, 6, "ranked protocol fixes k_skip=6");
     let inv_table = flock_core::ntt::InvNttTableByteSingleGf8::cached_standard_k6();
-
-    let precompute_ab = || {
-        zerocheck::univariate_skip_optimized::precompute_round1_ab_inner_packed_padded(
-            a_packed,
-            b_packed,
-            pcs_params.m,
-            k_skip,
-            inv_table,
-            padding,
-        )
-    };
+    let ranked_blake3_shape = pcs_params.m == 32
+        && padding.k_log == 14
+        && padding.useful_bits_per_block == 15_409;
+    let in_place_pair_deltas = ranked_blake3_shape
+        && std::env::var_os("FLOCK_NO_ZC_IN_PLACE_PAIR_DELTAS").is_none_or(|v| v != *"1");
+    assert!(
+        !ab_pair_deltas_preformed || in_place_pair_deltas,
+        "preformed A/B pair deltas require the ranked block-split layout"
+    );
     // `Blake3Setup::prove_fast` issues this ticket before call-zero witness
     // generation. A valid cache hit may satisfy it inside the commit arm;
     // otherwise the post-join callback claims it and replays this exact A/B
@@ -758,8 +806,7 @@ fn commit_with_round1_ab_precompute(
         ),
     );
 
-    let result = rayon::join(
-        || match commit_codeword {
+    let commit = || match commit_codeword {
             CommitCodeword::Allocate => pcs::commit(z_packed, pcs_params),
             CommitCodeword::NeedsReplication(buf) => pcs::commit_into(z_packed, pcs_params, buf),
             CommitCodeword::Preinitialized(buf) => {
@@ -768,10 +815,41 @@ fn commit_with_round1_ab_precompute(
             CommitCodeword::StreamedFirstPass(buf, stream) => {
                 pcs::commit_from_streamed_first_pass(z_packed, buf, pcs_params, stream)
             }
-        },
-        || {
+        };
+
+    let mut result = if ab_pair_deltas_preformed {
+        let a_packed = as_bytes(a_packed_f128);
+        let b_packed = as_bytes(b_packed_f128);
+        rayon::join(commit, || {
             let t = std::time::Instant::now();
-            let r = precompute_ab();
+            let r = zerocheck::univariate_skip_optimized::precompute_round1_ab_inner_packed_padded_from_pair_deltas(
+                a_packed,
+                b_packed,
+                pcs_params.m,
+                k_skip,
+                inv_table,
+                padding,
+            );
+            let wall_ms = t.elapsed().as_secs_f64() * 1e3;
+            flock_core::gpu_commit::note_precompute_branch_wall_ms(wall_ms);
+            if std::env::var_os("FLOCK_PHASE_TIMING").is_some() {
+                eprintln!("[phase-timing] ab-precompute branch wall: {wall_ms:.2} ms");
+            }
+            r
+        })
+    } else if in_place_pair_deltas && !run_ranked_exact_tune {
+        let a_packed = as_bytes_mut(a_packed_f128);
+        let b_packed = as_bytes_mut(b_packed_f128);
+        rayon::join(commit, || {
+            let t = std::time::Instant::now();
+            let r = zerocheck::univariate_skip_optimized::precompute_round1_ab_inner_packed_padded_with_in_place_pair_deltas(
+                a_packed,
+                b_packed,
+                pcs_params.m,
+                k_skip,
+                inv_table,
+                padding,
+            );
             let wall_ms = t.elapsed().as_secs_f64() * 1e3;
             // The hybrid-commit warmup sweep sizes its contention emulation
             // from this arm's measured wall (an Instant read is free; the
@@ -781,19 +859,70 @@ fn commit_with_round1_ab_precompute(
                 eprintln!("[phase-timing] ab-precompute branch wall: {wall_ms:.2} ms");
             }
             r
-        },
-    );
+        })
+    } else {
+        let a_packed = as_bytes(a_packed_f128);
+        let b_packed = as_bytes(b_packed_f128);
+        rayon::join(commit, || {
+            let t = std::time::Instant::now();
+            let r = zerocheck::univariate_skip_optimized::precompute_round1_ab_inner_packed_padded(
+                a_packed,
+                b_packed,
+                pcs_params.m,
+                k_skip,
+                inv_table,
+                padding,
+            );
+            let wall_ms = t.elapsed().as_secs_f64() * 1e3;
+            flock_core::gpu_commit::note_precompute_branch_wall_ms(wall_ms);
+            if std::env::var_os("FLOCK_PHASE_TIMING").is_some() {
+                eprintln!("[phase-timing] ab-precompute branch wall: {wall_ms:.2} ms");
+            }
+            r
+        })
+    };
 
     if run_ranked_exact_tune {
+        let a_packed = as_bytes(a_packed_f128);
+        let b_packed = as_bytes(b_packed_f128);
         flock_core::gpu_commit::retune_ranked_hybrid_with_exact_contention(
             pcs_params,
             &result.0.1.codeword,
             &result.0.1.merkle_tree,
             || {
-                let replayed = precompute_ab();
+                let replayed = if ab_pair_deltas_preformed {
+                    zerocheck::univariate_skip_optimized::precompute_round1_ab_inner_packed_padded_from_pair_deltas(
+                        a_packed,
+                        b_packed,
+                        pcs_params.m,
+                        k_skip,
+                        inv_table,
+                        padding,
+                    )
+                } else {
+                    zerocheck::univariate_skip_optimized::precompute_round1_ab_inner_packed_padded(
+                        a_packed,
+                        b_packed,
+                        pcs_params.m,
+                        k_skip,
+                        inv_table,
+                        padding,
+                    )
+                };
                 std::hint::black_box(&replayed);
             },
         );
+        if in_place_pair_deltas && !ab_pair_deltas_preformed {
+            let a_packed = as_bytes_mut(a_packed_f128);
+            let b_packed = as_bytes_mut(b_packed_f128);
+            zerocheck::univariate_skip_optimized::form_in_place_pair_deltas_padded(
+                a_packed,
+                b_packed,
+                k_skip,
+                padding,
+            );
+            result.1.mark_pair_deltas_in_place();
+        }
     }
     result
 }
@@ -819,6 +948,7 @@ pub fn prove_fast_core<Ch: Challenger>(
         LincheckStripeInput::Ready(z_packed_lincheck),
         lincheck_circuit,
         CommitCodeword::Allocate,
+        false,
         challenger,
     )
 }
@@ -853,6 +983,7 @@ pub fn prove_fast_core_with_codeword<Ch: Challenger>(
         LincheckStripeInput::Ready(z_packed_lincheck),
         lincheck_circuit,
         commit_codeword,
+        false,
         challenger,
     )
 }
@@ -862,11 +993,12 @@ fn prove_fast_core_with_commit_codeword<Ch: Challenger>(
     r1cs: &BlockR1cs,
     pcs_params: &PcsParams,
     z_packed: Vec<F128>,
-    a_packed_f128: Vec<F128>,
-    b_packed_f128: Vec<F128>,
+    mut a_packed_f128: Vec<F128>,
+    mut b_packed_f128: Vec<F128>,
     z_packed_lincheck: LincheckStripeInput,
     lincheck_circuit: &dyn lincheck::LincheckCircuit,
     commit_codeword: CommitCodeword,
+    ab_pair_deltas_preformed: bool,
     challenger: &mut Ch,
 ) -> ProveCore {
     let padding = r1cs.padding_spec();
@@ -876,11 +1008,12 @@ fn prove_fast_core_with_commit_codeword<Ch: Challenger>(
         let t_commit = std::time::Instant::now();
         let ((commitment, prover_data), ab_inner) = commit_with_round1_ab_precompute(
             &z_packed,
-            &a_packed_f128,
-            &b_packed_f128,
+            &mut a_packed_f128,
+            &mut b_packed_f128,
             pcs_params,
             &padding,
             commit_codeword,
+            ab_pair_deltas_preformed,
         );
         if phase_timing {
             let wall = t_commit.elapsed().as_secs_f64() * 1e3;
@@ -1219,8 +1352,8 @@ fn prove_fast_ligerito_timed_with_commit_codeword<Ch: Challenger>(
     r1cs: &BlockR1cs,
     pcs_params: &PcsParams,
     z_packed: Vec<F128>,
-    a_packed_f128: Vec<F128>,
-    b_packed_f128: Vec<F128>,
+    mut a_packed_f128: Vec<F128>,
+    mut b_packed_f128: Vec<F128>,
     z_packed_lincheck: Vec<u8>,
     lincheck_circuit: &dyn lincheck::LincheckCircuit,
     commit_codeword: CommitCodeword,
@@ -1239,11 +1372,12 @@ fn prove_fast_ligerito_timed_with_commit_codeword<Ch: Challenger>(
     let t0 = Instant::now();
     let ((commitment, prover_data), ab_inner) = commit_with_round1_ab_precompute(
         &z_packed,
-        &a_packed_f128,
-        &b_packed_f128,
+        &mut a_packed_f128,
+        &mut b_packed_f128,
         pcs_params,
         &padding,
         commit_codeword,
+        false,
     );
     t.commit_s = t0.elapsed().as_secs_f64();
     bind_statement(challenger, r1cs, &commitment);

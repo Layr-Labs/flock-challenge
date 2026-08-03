@@ -8091,7 +8091,7 @@ static inline uint4 zc_r2_fold8(uint lo, uint hi, threadgroup const uint4* nib) 
     return acc;
 }
 
-struct ZcR2Params { uint lo_size; uint xpt; uint mask; uint useful; };
+struct ZcR2Params { uint lo_size; uint xpt; uint mask; uint useful; uint in_place; };
 
 // One threadgroup per hi-chunk (256 threads, xpt = lo_size/256 x_lo groups
 // per thread). Per pair: read both packed rows of a and b (one uint4 each,
@@ -8101,8 +8101,8 @@ struct ZcR2Params { uint lo_size; uint xpt; uint mask; uint useful; };
 // accumulators, weights by eq_hi[chunk], and writes the REDUCED partial
 // pair -- exactly the CPU's per-chunk `(eq_hi * p1, eq_hi * pinf)` values.
 kernel void zc_r2_products(
-    device const uint4* a_in  [[buffer(0)]],
-    device const uint4* b_in  [[buffer(1)]],
+    device const uint2* a_in  [[buffer(0)]],
+    device const uint2* b_in  [[buffer(1)]],
     device const uint4* eq_lo [[buffer(2)]],
     device const uint4* eq_hi [[buffer(3)]],
     device const uint4* nib_tab_dev [[buffer(4)]],
@@ -8122,12 +8122,28 @@ kernel void zc_r2_products(
         uint x_lo = k * 256u + lid;
         uint pair_idx = tgid * p.lo_size + x_lo;
         if ((pair_idx & p.mask) >= p.useful) { continue; }
-        uint4 ar = a_in[pair_idx];
-        uint4 br = b_in[pair_idx];
-        uint4 a0 = zc_r2_fold8(ar.x, ar.y, nib);
-        uint4 a1 = zc_r2_fold8(ar.z, ar.w, nib);
-        uint4 b0 = zc_r2_fold8(br.x, br.y, nib);
-        uint4 b1 = zc_r2_fold8(br.z, br.w, nib);
+        uint even_row = pair_idx * 2u;
+        uint odd_or_delta_row = even_row + 1u;
+        if (p.in_place != 0u) {
+            uint block = pair_idx >> 6u;
+            uint within = pair_idx & 63u;
+            even_row = block * 128u + within;
+            odd_or_delta_row = block * 128u + 64u + within;
+        }
+        uint2 ae = a_in[even_row];
+        uint2 ax = a_in[odd_or_delta_row];
+        uint2 be = b_in[even_row];
+        uint2 bx = b_in[odd_or_delta_row];
+        uint4 a0 = zc_r2_fold8(ae.x, ae.y, nib);
+        uint4 a1 = zc_r2_fold8(
+            p.in_place != 0u ? ae.x ^ ax.x : ax.x,
+            p.in_place != 0u ? ae.y ^ ax.y : ax.y,
+            nib);
+        uint4 b0 = zc_r2_fold8(be.x, be.y, nib);
+        uint4 b1 = zc_r2_fold8(
+            p.in_place != 0u ? be.x ^ bx.x : bx.x,
+            p.in_place != 0u ? be.y ^ bx.y : bx.y,
+            nib);
 
         uint4 g1 = gf_reduce(clmul128(a1, b1));
         uint4 gi = gf_reduce(clmul128(a0 ^ a1, b0 ^ b1));
@@ -8371,6 +8387,7 @@ kernel void zc_r2_products(
         lo_size: usize,
         mask: u32,
         useful: u32,
+        in_place: bool,
         submitted: std::time::Instant,
     }
 
@@ -8412,6 +8429,7 @@ kernel void zc_r2_products(
         lo_size: usize,
         mask: u32,
         useful: u32,
+        in_place: bool,
     ) -> Result<Id, String> {
         unsafe {
             #[repr(C)]
@@ -8420,12 +8438,14 @@ kernel void zc_r2_products(
                 xpt: u32,
                 mask: u32,
                 useful: u32,
+                in_place: u32,
             }
             let params = P {
                 lo_size: lo_size as u32,
                 xpt: (lo_size / 256) as u32,
                 mask,
                 useful,
+                in_place: u32::from(in_place),
             };
             let pb = std::slice::from_raw_parts(
                 (&raw const params).cast::<u8>(),
@@ -8478,6 +8498,7 @@ kernel void zc_r2_products(
         hi_size: usize,
         pair_in_block_mask: usize,
         useful_pairs_inclusive: usize,
+        in_place: bool,
     ) -> Option<ZcR2Job> {
         use std::sync::atomic::Ordering;
         if !super::gpu_zc_r2_enabled() || ZC_R2_POISONED.load(Ordering::Relaxed) {
@@ -8572,6 +8593,7 @@ kernel void zc_r2_products(
                 lo_size,
                 pair_in_block_mask as u32,
                 useful_pairs_inclusive as u32,
+                in_place,
             )
             .ok()?;
             Some(ZcR2Job {
@@ -8581,6 +8603,7 @@ kernel void zc_r2_products(
                 lo_size,
                 mask: pair_in_block_mask as u32,
                 useful: useful_pairs_inclusive as u32,
+                in_place,
                 submitted: std::time::Instant::now(),
             })
         }
@@ -8675,7 +8698,15 @@ kernel void zc_r2_products(
             {
                 while n_walls < walls.len() {
                     let Ok(cb2) = zc_r2_submit(
-                        gpu, &state, a_buf, b_buf, job.chunks, job.lo_size, job.mask, job.useful,
+                        gpu,
+                        &state,
+                        a_buf,
+                        b_buf,
+                        job.chunks,
+                        job.lo_size,
+                        job.mask,
+                        job.useful,
+                        job.in_place,
                     ) else {
                         break;
                     };
@@ -11962,6 +11993,7 @@ DEF_PROBE(probe_g4_t8_p0,    8u,  0u,   tsel & 7u)
         imp::zc_r2_test_reset();
         let job = imp::launch_zc_r2_products(
             &a_packed, &b_packed, &table_data, &eq_lo, &eq_hi, lo_size, hi_size, mask, useful,
+            false,
         )
         .expect("calibration launch must succeed on real Metal");
         assert!(job.is_calibration());
@@ -11976,6 +12008,7 @@ DEF_PROBE(probe_g4_t8_p0,    8u,  0u,   tsel & 7u)
         imp::zc_r2_test_set_share(hi_size / 2);
         let job2 = imp::launch_zc_r2_products(
             &a_packed, &b_packed, &table_data, &eq_lo, &eq_hi, lo_size, hi_size, mask, useful,
+            false,
         )
         .expect("timed launch must succeed");
         assert!(!job2.is_calibration());
@@ -11987,6 +12020,39 @@ DEF_PROBE(probe_g4_t8_p0,    8u,  0u,   tsel & 7u)
                 assert_eq!(&vals[..], &cpu_partials[..prefix], "prefix partials bit-exact");
             }
             _ => panic!("timed drain must return prefix partials"),
+        }
+
+        // The V14 representation block-splits each 1 KiB region into 64
+        // even rows followed by 64 adjacent-row deltas. The same shader
+        // reconstructs row1 under its uniform flag; both calibration and
+        // timed-prefix outputs must remain the original CPU oracle values.
+        crate::zerocheck::univariate_skip_optimized::form_in_place_pair_deltas_padded(
+            &mut a_packed,
+            &mut b_packed,
+            6,
+            &crate::zerocheck::PaddingSpec::dense(22),
+        );
+        imp::zc_r2_test_reset();
+        let in_place_job = imp::launch_zc_r2_products(
+            &a_packed, &b_packed, &table_data, &eq_lo, &eq_hi, lo_size, hi_size, mask, useful,
+            true,
+        )
+        .expect("in-place calibration launch must succeed");
+        assert!(matches!(
+            imp::zc_r2_wait(in_place_job, Some(&cpu_partials), 50.0, hi_size),
+            imp::ZcR2Result::Calibrated
+        ));
+        imp::zc_r2_test_set_share(hi_size / 2);
+        let in_place_job = imp::launch_zc_r2_products(
+            &a_packed, &b_packed, &table_data, &eq_lo, &eq_hi, lo_size, hi_size, mask, useful,
+            true,
+        )
+        .expect("in-place timed launch must succeed");
+        match imp::zc_r2_wait(in_place_job, None, 0.0, hi_size) {
+            imp::ZcR2Result::Prefix(vals) => {
+                assert_eq!(&vals[..], &cpu_partials[..vals.len()]);
+            }
+            _ => panic!("in-place timed drain must return prefix partials"),
         }
         imp::zc_r2_test_reset();
     }

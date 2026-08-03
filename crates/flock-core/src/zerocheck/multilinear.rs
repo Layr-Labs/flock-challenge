@@ -51,11 +51,16 @@ use kernels::aarch64::fold_one_row_neon_unchecked_8;
 #[cfg(target_arch = "aarch64")]
 use kernels::aarch64::{
     fold_and_message_aarch64, fold_compact_chunk_neon_unchecked_8,
-    fold_compact_stream_chunk_neon, fold_round2_chunk_neon_unchecked_8,
+    fold_compact_stream_chunk_neon, fold_in_place_deltas_chunk_neon_unchecked_8,
+    fold_round2_chunk_neon_unchecked_8,
     fold_round2_compact_chunk_neon_unchecked_8, fold_round2_compact_stream_chunk_neon,
+    fold_round2_in_place_deltas_chunk_neon_unchecked_8,
 };
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-use kernels::aarch64::fold_round2_compact_chunk_neon_anchors_only_8;
+use kernels::aarch64::{
+    fold_round2_compact_chunk_neon_anchors_only_8,
+    fold_round2_in_place_deltas_chunk_neon_anchors_only_8,
+};
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 use kernels::aarch64::fold_compact_chunk_neon_reconstruct_only_8;
 #[cfg(all(
@@ -96,6 +101,20 @@ fn round2_pair_skip(padding: &PaddingSpec, k_skip: usize) -> (usize, usize) {
         return (0, usize::MAX);
     }
     (pairs_per_block - 1, useful_pairs)
+}
+
+const IN_PLACE_PAIRS_PER_BLOCK: usize = 64;
+const IN_PLACE_BLOCK_BYTES: usize = IN_PLACE_PAIRS_PER_BLOCK * 16;
+
+#[inline(always)]
+fn in_place_pair_offsets(pair_idx: usize) -> (usize, usize) {
+    let block = pair_idx / IN_PLACE_PAIRS_PER_BLOCK;
+    let within = pair_idx % IN_PLACE_PAIRS_PER_BLOCK;
+    let block_base = block * IN_PLACE_BLOCK_BYTES;
+    (
+        block_base + within * 8,
+        block_base + IN_PLACE_BLOCK_BYTES / 2 + within * 8,
+    )
 }
 
 /// Kill switch for draining the DRAM-bound tail loop rounds (half ≥ 2^21)
@@ -621,6 +640,7 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_with_deltas(
         hi_size,
         pair_in_block_mask,
         useful_pairs_inclusive,
+        false,
     );
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     let gpu_prefix = gpu_job.as_ref().map_or(0, |j| j.cpu_split());
@@ -794,6 +814,189 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_with_deltas(
         });
 
     (compact, mlv_challenges[0] * sum1, sum_inf)
+}
+
+/// Round-two compact producer for packed inputs whose 1 KiB blocks hold 64
+/// even rows followed by 64 adjacent-row XOR deltas. It writes only the folded
+/// even-row anchors; the A/B delta halves remain the backing through T3.
+pub(crate) fn uni_skip_fold_and_round_pair_in_place_deltas_padded(
+    a_packed: &[u8],
+    b_packed: &[u8],
+    m: usize,
+    k_skip: usize,
+    table: &UniSkipFoldTable,
+    mlv_challenges: &[F128],
+    padding: &PaddingSpec,
+) -> (Vec<F128>, F128, F128) {
+    assert_eq!(k_skip, 6);
+    assert_eq!(table.n_chunks, 8);
+    let n_chunks = table.n_chunks;
+    let n_out = 1usize << (m - k_skip);
+    let n_pairs = n_out / 2;
+    assert_eq!(a_packed.len(), n_out * n_chunks);
+    assert_eq!(b_packed.len(), n_out * n_chunks);
+    assert_eq!(mlv_challenges.len(), m - k_skip);
+
+    let mut anchors = crate::scratch::take_f128(2 * n_pairs);
+    let eq = SplitEqGhash::with_n_hi(&mlv_challenges[1..], COMPACT_RECONSTRUCTION_N_HI);
+    let lo_size = 1usize << eq.n_lo;
+    let hi_size = 1usize << eq.n_hi;
+    assert_eq!(lo_size * hi_size, n_pairs);
+    let eq_hi = &eq.hi;
+    let eq_lo = &eq.lo;
+    let anchor_chunk_size = 2 * lo_size;
+    let (pair_in_block_mask, useful_pairs_inclusive) = round2_pair_skip(padding, k_skip);
+    #[cfg(target_arch = "aarch64")]
+    let degen = r2_degen_enabled();
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    let gpu_job = crate::gpu_commit::launch_zc_r2_products(
+        a_packed,
+        b_packed,
+        &table.data,
+        eq_lo,
+        eq_hi,
+        lo_size,
+        hi_size,
+        pair_in_block_mask,
+        useful_pairs_inclusive,
+        true,
+    );
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    let gpu_prefix = gpu_job.as_ref().map_or(0, |j| j.cpu_split());
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    let t_cpu_sweep = std::time::Instant::now();
+
+    let mut partials = vec![(F128::ZERO, F128::ZERO); hi_size];
+    let anchors_base = crate::epool::SyncPtr(anchors.as_mut_ptr());
+    let partials_base = crate::epool::SyncPtr(partials.as_mut_ptr());
+    crate::epool::run_hetero_chunks(hi_size, |x_hi| {
+        let anchors = unsafe {
+            std::slice::from_raw_parts_mut(
+                anchors_base.ptr().add(x_hi * anchor_chunk_size),
+                anchor_chunk_size,
+            )
+        };
+        let pair_idx_base = x_hi * lo_size;
+
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        if x_hi < gpu_prefix {
+            unsafe {
+                fold_round2_in_place_deltas_chunk_neon_anchors_only_8(
+                    table.data.as_ptr().cast::<u8>(),
+                    a_packed.as_ptr(),
+                    b_packed.as_ptr(),
+                    anchors.as_mut_ptr(),
+                    lo_size,
+                    pair_idx_base,
+                    pair_in_block_mask,
+                    useful_pairs_inclusive,
+                );
+            }
+            return;
+        }
+
+        #[cfg(target_arch = "aarch64")]
+        let (p1, pinf) = unsafe {
+            fold_round2_in_place_deltas_chunk_neon_unchecked_8(
+                table.data.as_ptr().cast::<u8>(),
+                a_packed.as_ptr(),
+                b_packed.as_ptr(),
+                anchors.as_mut_ptr(),
+                eq_lo.as_ptr(),
+                lo_size,
+                pair_idx_base,
+                pair_in_block_mask,
+                useful_pairs_inclusive,
+                degen,
+            )
+        };
+
+        #[cfg(not(target_arch = "aarch64"))]
+        let (p1, pinf) = {
+            let mut p1_acc = F256Unreduced::ZERO;
+            let mut pinf_acc = F256Unreduced::ZERO;
+            for x_lo in 0..lo_size {
+                if ((pair_idx_base + x_lo) & pair_in_block_mask) >= useful_pairs_inclusive {
+                    anchors[2 * x_lo] = F128::ZERO;
+                    anchors[2 * x_lo + 1] = F128::ZERO;
+                    continue;
+                }
+                let (even_off, delta_off) = in_place_pair_offsets(pair_idx_base + x_lo);
+                let a0_bytes = &a_packed[even_off..even_off + n_chunks];
+                let da_bytes = &a_packed[delta_off..delta_off + n_chunks];
+                let b0_bytes = &b_packed[even_off..even_off + n_chunks];
+                let db_bytes = &b_packed[delta_off..delta_off + n_chunks];
+                let mut a1_bytes = [0u8; 8];
+                let mut b1_bytes = [0u8; 8];
+                for j in 0..8 {
+                    a1_bytes[j] = a0_bytes[j] ^ da_bytes[j];
+                    b1_bytes[j] = b0_bytes[j] ^ db_bytes[j];
+                }
+                let a0 = table.fold_one_row(a0_bytes);
+                let a1 = table.fold_one_row(&a1_bytes);
+                let b0 = table.fold_one_row(b0_bytes);
+                let b1 = table.fold_one_row(&b1_bytes);
+                anchors[2 * x_lo] = a0;
+                anchors[2 * x_lo + 1] = b0;
+                let eq_l = eq_lo[x_lo];
+                p1_acc ^= eq_l.mul_unreduced(a1 * b1);
+                pinf_acc ^= eq_l.mul_unreduced((a0 + a1) * (b0 + b1));
+            }
+            (p1_acc.reduce(), pinf_acc.reduce())
+        };
+        let eq_h = eq_hi[x_hi];
+        unsafe {
+            *partials_base.ptr().add(x_hi) = (eq_h * p1, eq_h * pinf);
+        }
+    });
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    if let Some(job) = gpu_job {
+        let cpu_wall_ms = t_cpu_sweep.elapsed().as_secs_f64() * 1e3;
+        let calib = job.is_calibration();
+        let prefix = job.cpu_split();
+        match crate::gpu_commit::zc_r2_wait(
+            job,
+            if calib { Some(partials.as_slice()) } else { None },
+            cpu_wall_ms,
+            hi_size,
+        ) {
+            crate::gpu_commit::ZcR2Result::Calibrated => {}
+            crate::gpu_commit::ZcR2Result::Prefix(vals) => {
+                partials[..prefix].copy_from_slice(&vals);
+            }
+            crate::gpu_commit::ZcR2Result::Failed => {
+                let mut scr_anchors = vec![F128::ZERO; anchor_chunk_size];
+                for x_hi in 0..prefix {
+                    let pair_idx_base = x_hi * lo_size;
+                    let (p1, pinf) = unsafe {
+                        fold_round2_in_place_deltas_chunk_neon_unchecked_8(
+                            table.data.as_ptr().cast::<u8>(),
+                            a_packed.as_ptr(),
+                            b_packed.as_ptr(),
+                            scr_anchors.as_mut_ptr(),
+                            eq_lo.as_ptr(),
+                            lo_size,
+                            pair_idx_base,
+                            pair_in_block_mask,
+                            useful_pairs_inclusive,
+                            degen,
+                        )
+                    };
+                    let eq_h = eq_hi[x_hi];
+                    partials[x_hi] = (eq_h * p1, eq_h * pinf);
+                }
+            }
+        }
+    }
+
+    let (sum1, sum_inf) = partials
+        .iter()
+        .fold((F128::ZERO, F128::ZERO), |(s1, si), &(p1, pi)| {
+            (s1 + p1, si + pi)
+        });
+    (anchors, mlv_challenges[0] * sum1, sum_inf)
 }
 
 /// Byte-lane-outer streaming variant of
@@ -1215,6 +1418,116 @@ pub fn fold_compact_and_compute_round_pair(
             (s1 + c1, sinf + cinf)
         });
 
+    (a_out, b_out, r_next[0] * sum1, sum_inf)
+}
+
+/// Bind the first multilinear challenge from even-row anchors plus the compact
+/// delta halves retained in the block-split A/B allocations.
+pub(crate) fn fold_in_place_deltas_and_compute_round_pair(
+    anchors: &[F128],
+    a_packed: &[u8],
+    b_packed: &[u8],
+    table: &UniSkipFoldTable,
+    r_fold: F128,
+    r_next: &[F128],
+) -> (Vec<F128>, Vec<F128>, F128, F128) {
+    let n = anchors.len() / 2;
+    assert!(n.is_power_of_two() && n >= 4);
+    assert_eq!(anchors.len(), 2 * n);
+    assert_eq!(a_packed.len(), n * 16);
+    assert_eq!(b_packed.len(), n * 16);
+    assert_eq!(table.n_chunks, 8);
+    assert_eq!(r_next.len(), n.trailing_zeros() as usize);
+
+    let scaled_table = table.scaled_linear(r_fold);
+    let eq = SplitEqGhash::with_n_hi(&r_next[1..], COMPACT_RECONSTRUCTION_N_HI);
+    let lo_size = 1usize << eq.n_lo;
+    let hi_size = 1usize << eq.n_hi;
+    assert_eq!(lo_size * hi_size * 2, n);
+    let chunk_size = 2 * lo_size;
+    let eq_hi = &eq.hi;
+    let eq_lo = &eq.lo;
+
+    let mut a_out = crate::scratch::take_f128_unpinned(n);
+    let mut b_out = crate::scratch::take_f128_unpinned(n);
+    #[cfg(target_arch = "aarch64")]
+    let degen = r2_degen_enabled();
+    let mut partials = vec![(F128::ZERO, F128::ZERO); hi_size];
+    let a_base = crate::epool::SyncPtr(a_out.as_mut_ptr());
+    let b_base = crate::epool::SyncPtr(b_out.as_mut_ptr());
+    let partials_base = crate::epool::SyncPtr(partials.as_mut_ptr());
+
+    crate::epool::run_hetero_chunks(hi_size, |x_hi| {
+        let (a_chunk, b_chunk) = unsafe {
+            (
+                std::slice::from_raw_parts_mut(
+                    a_base.ptr().add(x_hi * chunk_size),
+                    chunk_size,
+                ),
+                std::slice::from_raw_parts_mut(
+                    b_base.ptr().add(x_hi * chunk_size),
+                    chunk_size,
+                ),
+            )
+        };
+        let base = x_hi * chunk_size;
+
+        #[cfg(target_arch = "aarch64")]
+        let (p1, pinf) = unsafe {
+            fold_in_place_deltas_chunk_neon_unchecked_8(
+                scaled_table.as_ptr().cast::<u8>(),
+                anchors.as_ptr().add(2 * base),
+                a_packed.as_ptr(),
+                b_packed.as_ptr(),
+                a_chunk.as_mut_ptr(),
+                b_chunk.as_mut_ptr(),
+                eq_lo.as_ptr(),
+                lo_size,
+                base,
+                degen,
+            )
+        };
+
+        #[cfg(not(target_arch = "aarch64"))]
+        let (p1, pinf) = {
+            let mut p1_acc = F256Unreduced::ZERO;
+            let mut pinf_acc = F256Unreduced::ZERO;
+            for x_lo in 0..lo_size {
+                let out = 2 * x_lo;
+                for lane in 0..2 {
+                    let index = base + out + lane;
+                    let (_, delta_off) = in_place_pair_offsets(index);
+                    let mut a = anchors[2 * index];
+                    let mut b = anchors[2 * index + 1];
+                    for j in 0..8 {
+                        a += scaled_table[j * 256 + a_packed[delta_off + j] as usize];
+                        b += scaled_table[j * 256 + b_packed[delta_off + j] as usize];
+                    }
+                    a_chunk[out + lane] = a;
+                    b_chunk[out + lane] = b;
+                }
+                let a0 = a_chunk[out];
+                let a1 = a_chunk[out + 1];
+                let b0 = b_chunk[out];
+                let b1 = b_chunk[out + 1];
+                let eq_l = eq_lo[x_lo];
+                p1_acc ^= eq_l.mul_unreduced(a1 * b1);
+                pinf_acc ^= eq_l.mul_unreduced((a0 + a1) * (b0 + b1));
+            }
+            (p1_acc.reduce(), pinf_acc.reduce())
+        };
+
+        let eq_h = eq_hi[x_hi];
+        unsafe {
+            *partials_base.ptr().add(x_hi) = (eq_h * p1, eq_h * pinf);
+        }
+    });
+
+    let (sum1, sum_inf) = partials
+        .iter()
+        .fold((F128::ZERO, F128::ZERO), |(s1, si), &(p1, pi)| {
+            (s1 + p1, si + pi)
+        });
     (a_out, b_out, r_next[0] * sum1, sum_inf)
 }
 
@@ -2594,6 +2907,30 @@ mod tests {
                 "round-two message mismatch; donate_f128={donate_f128}"
             );
 
+            let mut a_in_place = a_packed.clone();
+            let mut b_in_place = b_packed.clone();
+            crate::zerocheck::univariate_skip_optimized::form_in_place_pair_deltas_padded(
+                &mut a_in_place,
+                &mut b_in_place,
+                K_SKIP,
+                &padding,
+            );
+            let (in_place_anchors, in_place_m1, in_place_mi) =
+                uni_skip_fold_and_round_pair_in_place_deltas_padded(
+                    &a_in_place,
+                    &b_in_place,
+                    M,
+                    K_SKIP,
+                    &table,
+                    &mlv_challenges,
+                    &padding,
+                );
+            assert_eq!(
+                (in_place_m1, in_place_mi),
+                (legacy_m1, legacy_mi),
+                "in-place round-two message mismatch; donate_f128={donate_f128}"
+            );
+
             for &rho in &rhos {
                 let mut expected_a = legacy_a.clone();
                 let mut expected_b = legacy_b.clone();
@@ -2618,9 +2955,29 @@ mod tests {
 
                 crate::scratch::give_f128(actual_a);
                 crate::scratch::give_f128(actual_b);
+
+                let (in_place_a, in_place_b, in_place_m1, in_place_mi) =
+                    fold_in_place_deltas_and_compute_round_pair(
+                        &in_place_anchors,
+                        &a_in_place,
+                        &b_in_place,
+                        &table,
+                        rho,
+                        &r_next,
+                    );
+                assert_eq!(in_place_a, expected_a, "in-place reconstructed A mismatch");
+                assert_eq!(in_place_b, expected_b, "in-place reconstructed B mismatch");
+                assert_eq!(
+                    (in_place_m1, in_place_mi),
+                    expected_msg,
+                    "in-place post-reconstruction message mismatch"
+                );
+                crate::scratch::give_f128(in_place_a);
+                crate::scratch::give_f128(in_place_b);
             }
 
             compact.recycle();
+            crate::scratch::give_f128(in_place_anchors);
             crate::scratch::give_f128(legacy_a);
             crate::scratch::give_f128(legacy_b);
             crate::scratch::clear();

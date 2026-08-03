@@ -1584,6 +1584,40 @@ pub(crate) mod witgen_simd {
         *ON
     }
 
+    /// Direct A/B emission is intentionally narrower than the SIMD selector:
+    /// only the ranked from-message PCS path has a downstream consumer that
+    /// carries the block-split layout marker. The shared zerocheck kill switch
+    /// restores ordinary witness rows end-to-end.
+    fn direct_pair_deltas_enabled(
+        n_blocks_log: usize,
+        stream_params: Option<&flock_core::pcs::PcsParams>,
+    ) -> bool {
+        select_direct_pair_deltas(
+            n_blocks_log,
+            stream_params,
+            std::env::var_os("FLOCK_NO_ZC_IN_PLACE_PAIR_DELTAS")
+                .is_some_and(|value| value == *"1"),
+        )
+    }
+
+    #[inline]
+    pub(super) fn select_direct_pair_deltas(
+        n_blocks_log: usize,
+        stream_params: Option<&flock_core::pcs::PcsParams>,
+        disabled: bool,
+    ) -> bool {
+        let Some(params) = stream_params else {
+            return false;
+        };
+        !disabled
+            && n_blocks_log == 18
+            && params.m == 32
+            && params.log_inv_rate == 1
+            && params.log_batch_size == 6
+            && params.profile == flock_core::pcs::ligerito::LigeritoProfile::Fast
+            && params.merkle_hash == flock_core::merkle::HashKind::Blake3
+    }
+
     #[inline(always)]
     pub(super) const fn select_z_nt(
         nt_enabled: bool,
@@ -1778,6 +1812,102 @@ pub(crate) mod witgen_simd {
         }
     }
 
+    #[inline(always)]
+    unsafe fn dump_stage_words<const NT: bool>(words: [V4; 8], dst: *mut u32, w: usize) {
+        unsafe {
+            let x = tr4(words[0], words[1], words[2], words[3]);
+            let y = tr4(words[4], words[5], words[6], words[7]);
+            let p0 = dst.add(w);
+            let p1 = dst.add(U32_PER_BLOCK + w);
+            let p2 = dst.add(2 * U32_PER_BLOCK + w);
+            let p3 = dst.add(3 * U32_PER_BLOCK + w);
+            if NT {
+                store_nt_pair(x.0, y.0, p0);
+                store_nt_pair(x.1, y.1, p1);
+                store_nt_pair(x.2, y.2, p2);
+                store_nt_pair(x.3, y.3, p3);
+            } else {
+                vst1q_u32(p0, x.0);
+                vst1q_u32(p0.add(4), y.0);
+                vst1q_u32(p1, x.1);
+                vst1q_u32(p1.add(4), y.1);
+                vst1q_u32(p2, x.2);
+                vst1q_u32(p2.add(4), y.2);
+                vst1q_u32(p3, x.3);
+                vst1q_u32(p3.add(4), y.3);
+            }
+        }
+    }
+
+    /// Drain one four-block A/B stage directly into the zerocheck round-two
+    /// representation. Each 1 KiB half becomes
+    /// `[64 even rows][64 even XOR odd deltas]`. The selected stage vectors
+    /// are transposed straight to their final row-major destinations, so no
+    /// temporary stage or post-generation full-buffer rewrite is needed.
+    #[inline(always)]
+    unsafe fn dump_split_ab<const NT: bool>(stage: *const V4, dst: *mut u32) {
+        unsafe {
+            const U32_PER_OUTER: usize = 256;
+            for half in 0..2 {
+                let base = half * U32_PER_OUTER;
+                // Preserve the incumbent's ascending 32-byte drain bursts:
+                // finish the complete 512-byte even half before starting the
+                // complete 512-byte delta half. The second L1 read of `stage`
+                // is cheaper than turning four long output streams into eight
+                // alternating streams at the NT store point.
+                for group in 0..16 {
+                    let src = base + group * 16;
+                    let e0 = vld1q_u32(stage.add(src) as *const u32);
+                    let e1 = vld1q_u32(stage.add(src + 1) as *const u32);
+                    let e2 = vld1q_u32(stage.add(src + 4) as *const u32);
+                    let e3 = vld1q_u32(stage.add(src + 5) as *const u32);
+                    let e4 = vld1q_u32(stage.add(src + 8) as *const u32);
+                    let e5 = vld1q_u32(stage.add(src + 9) as *const u32);
+                    let e6 = vld1q_u32(stage.add(src + 12) as *const u32);
+                    let e7 = vld1q_u32(stage.add(src + 13) as *const u32);
+                    dump_stage_words::<NT>(
+                        [e0, e1, e2, e3, e4, e5, e6, e7],
+                        dst,
+                        base + group * 8,
+                    );
+                }
+                for group in 0..16 {
+                    let src = base + group * 16;
+                    let e0 = vld1q_u32(stage.add(src) as *const u32);
+                    let e1 = vld1q_u32(stage.add(src + 1) as *const u32);
+                    let o0 = vld1q_u32(stage.add(src + 2) as *const u32);
+                    let o1 = vld1q_u32(stage.add(src + 3) as *const u32);
+                    let e2 = vld1q_u32(stage.add(src + 4) as *const u32);
+                    let e3 = vld1q_u32(stage.add(src + 5) as *const u32);
+                    let o2 = vld1q_u32(stage.add(src + 6) as *const u32);
+                    let o3 = vld1q_u32(stage.add(src + 7) as *const u32);
+                    let e4 = vld1q_u32(stage.add(src + 8) as *const u32);
+                    let e5 = vld1q_u32(stage.add(src + 9) as *const u32);
+                    let o4 = vld1q_u32(stage.add(src + 10) as *const u32);
+                    let o5 = vld1q_u32(stage.add(src + 11) as *const u32);
+                    let e6 = vld1q_u32(stage.add(src + 12) as *const u32);
+                    let e7 = vld1q_u32(stage.add(src + 13) as *const u32);
+                    let o6 = vld1q_u32(stage.add(src + 14) as *const u32);
+                    let o7 = vld1q_u32(stage.add(src + 15) as *const u32);
+                    dump_stage_words::<NT>(
+                        [
+                            veorq_u32(e0, o0),
+                            veorq_u32(e1, o1),
+                            veorq_u32(e2, o2),
+                            veorq_u32(e3, o3),
+                            veorq_u32(e4, o4),
+                            veorq_u32(e5, o5),
+                            veorq_u32(e6, o6),
+                            veorq_u32(e7, o7),
+                        ],
+                        dst,
+                        base + U32_PER_OUTER / 2 + group * 8,
+                    );
+                }
+            }
+        }
+    }
+
     /// Stream-sequential field push at absolute bit position `$pos`: computes
     /// all four monomorphization consts at the call site. BACK is the
     /// straddle back-shift `room = 32 − USED` (clamped to the legal immediate
@@ -1840,6 +1970,7 @@ pub(crate) mod witgen_simd {
         b: *mut u32,
         z_nt: bool,
         ab_nt: bool,
+        ab_pair_deltas: bool,
     ) {
         unsafe {
             // ---- gather: SoA block-lane vectors via 4x4 transposes ----
@@ -2088,7 +2219,15 @@ pub(crate) mod witgen_simd {
             } else {
                 dump::<false>(zs, z);
             }
-            if ab_nt {
+            if ab_pair_deltas {
+                if ab_nt {
+                    dump_split_ab::<true>(ast, a);
+                    dump_split_ab::<true>(bs, b);
+                } else {
+                    dump_split_ab::<false>(ast, a);
+                    dump_split_ab::<false>(bs, b);
+                }
+            } else if ab_nt {
                 dump::<true>(ast, a);
                 dump::<true>(bs, b);
             } else {
@@ -2115,6 +2254,7 @@ pub(crate) mod witgen_simd {
         Vec<F128>,
         Option<Vec<u8>>,
         Option<flock_core::gpu_commit::FromZFirstPassStream>,
+        bool,
     ) {
         let n_total = 1usize << n_blocks_log;
         let n_blocks = blocks.len();
@@ -2183,6 +2323,7 @@ pub(crate) mod witgen_simd {
         // the full 512 MiB ranked buffer. The per-band release fence below is
         // the same visibility boundary used by the cached-store path.
         let z_nt = select_z_nt(nt, defer_ranked_stripe, z_nt_enabled());
+        let ab_pair_deltas = direct_pair_deltas_enabled(n_blocks_log, stream_params);
 
         let process_group = |g: usize| {
             // SAFETY: each scheduled group index occurs exactly once. Every
@@ -2214,6 +2355,7 @@ pub(crate) mod witgen_simd {
                         b_grp[base..].as_mut_ptr() as *mut u32,
                         z_nt,
                         nt,
+                        ab_pair_deltas,
                     );
                 }
             }
@@ -2314,7 +2456,7 @@ pub(crate) mod witgen_simd {
             );
         }
 
-        (z, a, b, z_lincheck, stream)
+        (z, a, b, z_lincheck, stream, ab_pair_deltas)
     }
 
     /// Non-streamed entry (matches `drive_witness_packed_and_lincheck_full_write`).
@@ -2322,8 +2464,10 @@ pub(crate) mod witgen_simd {
         blocks: &[Compression],
         n_blocks_log: usize,
     ) -> (Vec<F128>, Vec<F128>, Vec<F128>, Vec<u8>) {
-        let (z, a, b, stripe, stream) = generate_impl(blocks, n_blocks_log, None, false);
+        let (z, a, b, stripe, stream, ab_pair_deltas) =
+            generate_impl(blocks, n_blocks_log, None, false);
         debug_assert!(stream.is_none());
+        debug_assert!(!ab_pair_deltas);
         (
             z,
             a,
@@ -2345,6 +2489,7 @@ pub(crate) mod witgen_simd {
         Vec<F128>,
         Option<Vec<u8>>,
         Option<flock_core::gpu_commit::FromZFirstPassStream>,
+        bool,
     ) {
         generate_impl(blocks, n_blocks_log, Some(pcs_params), defer_ranked_stripe)
     }
@@ -2559,6 +2704,7 @@ fn generate_witness_with_ab_packed_and_lincheck_streamed(
     Vec<F128>,
     Option<Vec<u8>>,
     Option<flock_core::gpu_commit::FromZFirstPassStream>,
+    bool,
 ) {
     let padding: Compression = ([0u32; 8], [0u32; 16], 0u64, 0u32, 0u32);
     let stripe_useful_bits = if std::env::var_os("FLOCK_FULL_STRIPE").is_some() {
@@ -2592,7 +2738,7 @@ fn generate_witness_with_ab_packed_and_lincheck_streamed(
             pcs_params,
             per_block,
         );
-    (z, a, b, Some(stripe), stream)
+    (z, a, b, Some(stripe), stream, false)
 }
 
 // ---------------------------------------------------------------------------
@@ -2931,12 +3077,18 @@ impl Blake3Setup {
                 };
                 let cpu_wit = phase_timing.then(crate::prover::process_cpu_ms);
                 let t_wit = std::time::Instant::now();
-                let (z_packed, a_packed_f128, b_packed_f128, z_packed_lincheck, gpu_first_pass) =
-                    generate_witness_with_ab_packed_and_lincheck_streamed(
-                        blocks,
-                        self.n_blocks_log(),
-                        &self.pcs_params,
-                    );
+                let (
+                    z_packed,
+                    a_packed_f128,
+                    b_packed_f128,
+                    z_packed_lincheck,
+                    gpu_first_pass,
+                    ab_pair_deltas_preformed,
+                ) = generate_witness_with_ab_packed_and_lincheck_streamed(
+                    blocks,
+                    self.n_blocks_log(),
+                    &self.pcs_params,
+                );
                 if phase_timing {
                     let wall = t_wit.elapsed().as_secs_f64() * 1e3;
                     let cpu = crate::prover::process_cpu_ms() - cpu_wit.unwrap_or(0.0);
@@ -2962,6 +3114,7 @@ impl Blake3Setup {
                                 lc_circuit,
                                 codeword,
                                 stream,
+                                ab_pair_deltas_preformed,
                                 challenger,
                             )
                         }
@@ -2974,22 +3127,38 @@ impl Blake3Setup {
                             lc_circuit,
                             codeword,
                             stream,
+                            ab_pair_deltas_preformed,
                             challenger,
                         ),
                     };
                 }
-                return crate::prover::prove_fast_ligerito_from_witness(
-                    &self.r1cs,
-                    &self.pcs_params,
-                    z_packed,
-                    a_packed_f128,
-                    b_packed_f128,
-                    z_packed_lincheck
-                        .expect("non-streamed witness fallback must materialize lincheck stripe"),
-                    lc_circuit,
-                    codeword,
-                    challenger,
-                );
+                let stripe = z_packed_lincheck
+                    .expect("non-streamed witness fallback must materialize lincheck stripe");
+                return if ab_pair_deltas_preformed {
+                    crate::prover::prove_fast_ligerito_from_witness_with_preformed_pair_deltas(
+                        &self.r1cs,
+                        &self.pcs_params,
+                        z_packed,
+                        a_packed_f128,
+                        b_packed_f128,
+                        stripe,
+                        lc_circuit,
+                        codeword,
+                        challenger,
+                    )
+                } else {
+                    crate::prover::prove_fast_ligerito_from_witness(
+                        &self.r1cs,
+                        &self.pcs_params,
+                        z_packed,
+                        a_packed_f128,
+                        b_packed_f128,
+                        stripe,
+                        lc_circuit,
+                        codeword,
+                        challenger,
+                    )
+                };
             }
             let cpu_wit = phase_timing.then(crate::prover::process_cpu_ms);
             let t_wit = std::time::Instant::now();
@@ -3567,6 +3736,42 @@ mod tests {
         assert!(!should_request_ranked_exact_tune(0, false));
     }
 
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn direct_pair_delta_selector_is_exact_and_killable() {
+        let ranked = PcsParams {
+            m: 32,
+            log_inv_rate: 1,
+            log_batch_size: 6,
+            profile: flock_core::pcs::ligerito::LigeritoProfile::Fast,
+            merkle_hash: flock_core::merkle::HashKind::Blake3,
+        };
+        assert!(witgen_simd::select_direct_pair_deltas(
+            18,
+            Some(&ranked),
+            false
+        ));
+        assert!(!witgen_simd::select_direct_pair_deltas(
+            18,
+            Some(&ranked),
+            true
+        ));
+        assert!(!witgen_simd::select_direct_pair_deltas(
+            17,
+            Some(&ranked),
+            false
+        ));
+        assert!(!witgen_simd::select_direct_pair_deltas(18, None, false));
+
+        let mut wrong = ranked;
+        wrong.log_batch_size = 5;
+        assert!(!witgen_simd::select_direct_pair_deltas(
+            18,
+            Some(&wrong),
+            false
+        ));
+    }
+
     #[test]
     fn deferred_stripe_selector_is_exact_and_killable() {
         let ranked = PcsParams {
@@ -3905,8 +4110,29 @@ mod tests {
             let counter = ((rng.next_u32() as u64) << 32) | rng.next_u32() as u64;
             (cv, m, counter, rng.next_u32(), rng.next_u32())
         };
+        let split_ref = |rows: &mut [u64]| {
+            let ordinary = rows.to_vec();
+            for half in 0..2 {
+                let base = half * 128;
+                for pair in 0..64 {
+                    let even = ordinary[base + 2 * pair];
+                    let odd = ordinary[base + 2 * pair + 1];
+                    rows[base + pair] = even;
+                    rows[base + 64 + pair] = even ^ odd;
+                }
+            }
+        };
         // Per-block kernel equality, all independently selectable store modes.
-        for (z_nt, ab_nt) in [(false, false), (false, true), (true, false), (true, true)] {
+        for (z_nt, ab_nt, ab_pair_deltas) in [
+            (false, false, false),
+            (false, true, false),
+            (true, false, false),
+            (true, true, false),
+            (false, false, true),
+            (false, true, true),
+            (true, false, true),
+            (true, true, true),
+        ] {
             for _ in 0..8 {
                 let inputs: [Compression; 4] = std::array::from_fn(|_| mk(&mut rng));
                 let mut zq = [u64::MAX; 4 * WORDS];
@@ -3920,6 +4146,7 @@ mod tests {
                         bq.as_mut_ptr() as *mut u32,
                         z_nt,
                         ab_nt,
+                        ab_pair_deltas,
                     );
                 }
                 for (j, inp) in inputs.iter().enumerate() {
@@ -3930,6 +4157,10 @@ mod tests {
                     build_block_witness_ab_stream_into(
                         cv, m, *t, *bl, *fl, &mut z_ref, &mut a_ref, &mut b_ref,
                     );
+                    if ab_pair_deltas {
+                        split_ref(&mut a_ref);
+                        split_ref(&mut b_ref);
+                    }
                     for (name, got, want) in [
                         ("z", &zq[j * WORDS..(j + 1) * WORDS], &z_ref[..]),
                         ("a", &aq[j * WORDS..(j + 1) * WORDS], &a_ref[..]),
@@ -3938,7 +4169,7 @@ mod tests {
                         if got != want {
                             let w = got.iter().zip(want).position(|(x, y)| x != y).unwrap();
                             panic!(
-                                "{name} lane {j} z_nt={z_nt} ab_nt={ab_nt}: first diff u64 word {w} (u32 word {}):\
+                                "{name} lane {j} z_nt={z_nt} ab_nt={ab_nt} pair_deltas={ab_pair_deltas}: first diff u64 word {w} (u32 word {}):\
                                  got {:#018x} want {:#018x}",
                                 2 * w,
                                 got[w],

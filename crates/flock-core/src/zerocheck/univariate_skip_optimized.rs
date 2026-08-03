@@ -554,11 +554,13 @@ pub fn bit_transpose_64bytes(input: &[u8; 64], output: &mut [u8; 64]) {
 ///
 /// The storage has exactly the same byte length and block layout as either
 /// packed input: every `(x_outer, b_med)` consumes one 64-byte A block and one
-/// 64-byte B block and produces one 64-byte transformed block. Keeping this
-/// in a separate scratch allocation is intentional: round 2 still needs the
-/// original A and B tables after the round-1 transcript challenge is sampled.
+/// 64-byte B block and produces one 64-byte transformed block. The storage is
+/// separate because round 2 still needs the A/B allocations after the round-1
+/// transcript challenge is sampled; a representation flag records whether
+/// they retain ordinary interleaved rows or block-split even rows and deltas.
 pub struct Round1AbInner {
     storage: Vec<F128>,
+    pair_deltas_in_place: bool,
 }
 
 impl Round1AbInner {
@@ -575,6 +577,20 @@ impl Round1AbInner {
     /// Resident scratch bytes retained until the challenge-weighted finish.
     pub fn len_bytes(&self) -> usize {
         self.storage.len() * core::mem::size_of::<F128>()
+    }
+
+    /// Whether each packed 1 KiB A/B block was rewritten as 64 retained even
+    /// rows followed by 64 adjacent-row XOR deltas while this transform was
+    /// produced. The transform itself is unchanged; only the
+    /// challenge-dependent round-two representation differs.
+    #[inline]
+    pub(crate) fn pair_deltas_in_place(&self) -> bool {
+        self.pair_deltas_in_place
+    }
+
+    #[inline]
+    pub fn mark_pair_deltas_in_place(&mut self) {
+        self.pair_deltas_in_place = true;
     }
 
     /// Donate the now-dead transform to a byte-oriented scratch consumer
@@ -653,6 +669,157 @@ pub fn precompute_round1_ab_inner_packed_padded(
         padding,
         ab_pre_nt_enabled(),
     )
+}
+
+/// Challenge-independent AB precompute which additionally rewrites every 1
+/// KiB packed block as `[64 even rows][64 even XOR odd deltas]` after the block
+/// has been fully consumed. The extra stores therefore hit the same
+/// private-cache lines already read by the precompute, and round two can retain
+/// the delta halves instead of serially writing a separate 512 MiB surface.
+///
+/// The caller must not use the packed inputs as ordinary row tables after this
+/// call.  Round-one consumption is safe because [`Round1AbInner`] contains the
+/// complete challenge-independent transform.
+pub fn precompute_round1_ab_inner_packed_padded_with_in_place_pair_deltas(
+    a_packed: &mut [u8],
+    b_packed: &mut [u8],
+    m: usize,
+    k_skip: usize,
+    inv_table: &InvNttTableByteSingleGf8,
+    padding: &PaddingSpec,
+) -> Round1AbInner {
+    precompute_round1_ab_inner_packed_padded_with_in_place_pair_deltas_flavor(
+        a_packed,
+        b_packed,
+        m,
+        k_skip,
+        inv_table,
+        padding,
+        ab_pre_nt_enabled(),
+    )
+}
+
+/// Challenge-independent AB precompute for inputs that the witness generator
+/// already emitted as `[64 even rows][64 even XOR odd deltas]` per 1 KiB
+/// block. The optimized round-one kernels still consume ordinary row order,
+/// so each worker reconstructs one A/B block in private L1 scratch. Unlike
+/// the post-precompute conversion path, this never dirties the resident packed
+/// inputs and therefore adds no full-buffer writeback pass.
+pub fn precompute_round1_ab_inner_packed_padded_from_pair_deltas(
+    a_packed: &[u8],
+    b_packed: &[u8],
+    m: usize,
+    k_skip: usize,
+    inv_table: &InvNttTableByteSingleGf8,
+    padding: &PaddingSpec,
+) -> Round1AbInner {
+    precompute_round1_ab_inner_packed_padded_from_pair_deltas_flavor(
+        a_packed,
+        b_packed,
+        m,
+        k_skip,
+        inv_table,
+        padding,
+        ab_pre_nt_enabled(),
+    )
+}
+
+/// Warm-up-only companion used when the exact commit-contention tuner must
+/// replay the ordinary immutable AB precompute before A/B may be changed.
+/// Timed proves use the cache-local fused variant above.
+pub fn form_in_place_pair_deltas_padded(
+    a_packed: &mut [u8],
+    b_packed: &mut [u8],
+    k_skip: usize,
+    padding: &PaddingSpec,
+) {
+    use rayon::prelude::*;
+    const OUTER_BYTES: usize = (1 << N_MEDIUM) * 64;
+    assert_eq!(a_packed.len(), b_packed.len());
+    assert_eq!(a_packed.len() % OUTER_BYTES, 0);
+    let pairs_per_block = if padding.k_log > k_skip + 1 {
+        1usize << (padding.k_log - k_skip - 1)
+    } else {
+        0
+    };
+    let useful_pairs = if pairs_per_block == 0 {
+        usize::MAX
+    } else {
+        padding
+            .useful_bits_per_block
+            .div_ceil(2 * (1usize << k_skip))
+    };
+    let pair_mask = pairs_per_block.saturating_sub(1);
+    a_packed
+        .par_chunks_mut(OUTER_BYTES)
+        .zip(b_packed.par_chunks_mut(OUTER_BYTES))
+        .enumerate()
+        .for_each(|(x_outer, (a_outer, b_outer))| {
+            form_outer_pair_deltas(
+                a_outer,
+                b_outer,
+                x_outer,
+                pairs_per_block,
+                pair_mask,
+                useful_pairs,
+            );
+        });
+}
+
+#[inline]
+fn form_outer_pair_deltas(
+    a_outer: &mut [u8],
+    b_outer: &mut [u8],
+    x_outer: usize,
+    pairs_per_block: usize,
+    pair_mask: usize,
+    useful_pairs: usize,
+) {
+    const OUTER_BYTES: usize = (1 << N_MEDIUM) * 64;
+    const PAIRS_PER_OUTER: usize = OUTER_BYTES / 16;
+    const HALF_BYTES: usize = OUTER_BYTES / 2;
+    debug_assert_eq!(a_outer.len(), OUTER_BYTES);
+    debug_assert_eq!(b_outer.len(), OUTER_BYTES);
+    let mut a_split = [0u8; OUTER_BYTES];
+    let mut b_split = [0u8; OUTER_BYTES];
+    for local_pair in 0..PAIRS_PER_OUTER {
+        let global_pair = x_outer * PAIRS_PER_OUTER + local_pair;
+        let padded = pairs_per_block != 0 && (global_pair & pair_mask) >= useful_pairs;
+        let src = local_pair * 16;
+        let even_dst = local_pair * 8;
+        let delta_dst = HALF_BYTES + even_dst;
+        for lane in 0..8 {
+            let a_even = a_outer[src + lane];
+            let b_even = b_outer[src + lane];
+            a_split[even_dst + lane] = a_even;
+            b_split[even_dst + lane] = b_even;
+            if !padded {
+                a_split[delta_dst + lane] = a_even ^ a_outer[src + 8 + lane];
+                b_split[delta_dst + lane] = b_even ^ b_outer[src + 8 + lane];
+            }
+        }
+    }
+    a_outer.copy_from_slice(&a_split);
+    b_outer.copy_from_slice(&b_split);
+}
+
+#[inline]
+fn reconstruct_outer_from_pair_deltas(split: &[u8], ordinary: &mut [u8]) {
+    const OUTER_BYTES: usize = (1 << N_MEDIUM) * 64;
+    const PAIRS_PER_OUTER: usize = OUTER_BYTES / 16;
+    const HALF_BYTES: usize = OUTER_BYTES / 2;
+    debug_assert_eq!(split.len(), OUTER_BYTES);
+    debug_assert_eq!(ordinary.len(), OUTER_BYTES);
+    for local_pair in 0..PAIRS_PER_OUTER {
+        let even_src = local_pair * 8;
+        let delta_src = HALF_BYTES + even_src;
+        let dst = local_pair * 16;
+        for lane in 0..8 {
+            let even = split[even_src + lane];
+            ordinary[dst + lane] = even;
+            ordinary[dst + 8 + lane] = even ^ split[delta_src + lane];
+        }
+    }
 }
 
 /// Store-flavor-parameterized body; the public wrapper passes the latched env
@@ -768,10 +935,244 @@ fn precompute_round1_ab_inner_packed_padded_with_flavor(
                 } else {
                     out_outer[n_b_med * 64..].fill(0);
                 }
+
             },
         );
 
-    Round1AbInner { storage }
+    Round1AbInner {
+        storage,
+        pair_deltas_in_place: false,
+    }
+}
+
+fn precompute_round1_ab_inner_packed_padded_with_in_place_pair_deltas_flavor(
+    a_packed: &mut [u8],
+    b_packed: &mut [u8],
+    m: usize,
+    k_skip: usize,
+    inv_table: &InvNttTableByteSingleGf8,
+    padding: &PaddingSpec,
+    nt: bool,
+) -> Round1AbInner {
+    use rayon::prelude::*;
+
+    assert_eq!(k_skip, K_SKIP, "optimized variant is k_skip=6 only");
+    assert!(m >= k_skip + N_INNER);
+    let total_bytes = (1usize << m) / 8;
+    assert_eq!(a_packed.len(), total_bytes);
+    assert_eq!(b_packed.len(), total_bytes);
+    assert_eq!(inv_table.k, k_skip);
+    assert_eq!(total_bytes % core::mem::size_of::<F128>(), 0);
+
+    let (within_outer_mask, b_med_counts) = build_b_med_counts(padding);
+    let blake3_static_layout = padding.k_log == 14 && padding.useful_bits_per_block == 15_409;
+    let static_b_context = kernels::prepare_static_b_context(inv_table, blake3_static_layout);
+    const OUTER_BYTES: usize = (1 << N_MEDIUM) * 64;
+    let pairs_per_block = if padding.k_log > k_skip + 1 {
+        1usize << (padding.k_log - k_skip - 1)
+    } else {
+        0
+    };
+    let useful_pairs = if pairs_per_block == 0 {
+        usize::MAX
+    } else {
+        padding
+            .useful_bits_per_block
+            .div_ceil(2 * (1usize << k_skip))
+    };
+    let pair_mask = pairs_per_block.saturating_sub(1);
+
+    let mut storage = crate::scratch::take_f128(total_bytes / core::mem::size_of::<F128>());
+    let out_bytes: &mut [u8] =
+        unsafe { core::slice::from_raw_parts_mut(storage.as_mut_ptr() as *mut u8, total_bytes) };
+
+    out_bytes
+        .par_chunks_mut(OUTER_BYTES)
+        .zip(a_packed.par_chunks_mut(OUTER_BYTES))
+        .zip(b_packed.par_chunks_mut(OUTER_BYTES))
+        .enumerate()
+        .for_each_init(
+            || ([F8::ZERO; ELL], [F8::ZERO; ELL]),
+            |(a_col, b_col), (x_outer, ((out_outer, a_outer), b_outer))| {
+                let within_hash_outer = x_outer & within_outer_mask;
+                let n_b_med = b_med_counts[within_hash_outer] as usize;
+                let mut tmp = [0u8; 64];
+                for b_med in 0..n_b_med {
+                    let dst: &mut [u8; 64] = if nt {
+                        &mut tmp
+                    } else {
+                        (&mut out_outer[b_med * 64..(b_med + 1) * 64])
+                            .try_into()
+                            .expect("one transformed b_med block")
+                    };
+                    shift_reduce_inner_ab(
+                        a_outer,
+                        b_outer,
+                        inv_table,
+                        0,
+                        b_med,
+                        dst,
+                        a_col,
+                        b_col,
+                        !blake3_static_layout || (within_hash_outer == 0 && b_med < 2),
+                        !blake3_static_layout || (within_hash_outer == 1 && b_med + 1 == n_b_med),
+                        if blake3_static_layout && within_hash_outer == 0 && b_med == 2 {
+                            0x03
+                        } else if blake3_static_layout
+                            && within_hash_outer == 1
+                            && b_med + 2 == n_b_med
+                        {
+                            0xf0
+                        } else {
+                            0
+                        },
+                        if blake3_static_layout {
+                            within_hash_outer
+                        } else {
+                            usize::MAX
+                        },
+                        static_b_context,
+                    );
+                    if nt {
+                        unsafe {
+                            store_nt_64(tmp.as_ptr(), out_outer.as_mut_ptr().add(b_med * 64))
+                        };
+                    }
+                }
+                if nt {
+                    let tail = &mut out_outer[n_b_med * 64..];
+                    let zero = [0u8; 64];
+                    for i in 0..tail.len() / 64 {
+                        unsafe { store_nt_64(zero.as_ptr(), tail.as_mut_ptr().add(i * 64)) };
+                    }
+                } else {
+                    out_outer[n_b_med * 64..].fill(0);
+                }
+
+                form_outer_pair_deltas(
+                    a_outer,
+                    b_outer,
+                    x_outer,
+                    pairs_per_block,
+                    pair_mask,
+                    useful_pairs,
+                );
+            },
+        );
+
+    Round1AbInner {
+        storage,
+        pair_deltas_in_place: true,
+    }
+}
+
+fn precompute_round1_ab_inner_packed_padded_from_pair_deltas_flavor(
+    a_packed: &[u8],
+    b_packed: &[u8],
+    m: usize,
+    k_skip: usize,
+    inv_table: &InvNttTableByteSingleGf8,
+    padding: &PaddingSpec,
+    nt: bool,
+) -> Round1AbInner {
+    use rayon::prelude::*;
+
+    assert_eq!(k_skip, K_SKIP, "optimized variant is k_skip=6 only");
+    assert!(m >= k_skip + N_INNER);
+    let total_bytes = (1usize << m) / 8;
+    assert_eq!(a_packed.len(), total_bytes);
+    assert_eq!(b_packed.len(), total_bytes);
+    assert_eq!(inv_table.k, k_skip);
+    assert_eq!(total_bytes % core::mem::size_of::<F128>(), 0);
+
+    let (within_outer_mask, b_med_counts) = build_b_med_counts(padding);
+    let blake3_static_layout = padding.k_log == 14 && padding.useful_bits_per_block == 15_409;
+    let static_b_context = kernels::prepare_static_b_context(inv_table, blake3_static_layout);
+    const OUTER_BYTES: usize = (1 << N_MEDIUM) * 64;
+
+    let mut storage = crate::scratch::take_f128(total_bytes / core::mem::size_of::<F128>());
+    let out_bytes: &mut [u8] =
+        unsafe { core::slice::from_raw_parts_mut(storage.as_mut_ptr() as *mut u8, total_bytes) };
+
+    out_bytes
+        .par_chunks_mut(OUTER_BYTES)
+        .zip(a_packed.par_chunks(OUTER_BYTES))
+        .zip(b_packed.par_chunks(OUTER_BYTES))
+        .enumerate()
+        .for_each_init(
+            || {
+                (
+                    [F8::ZERO; ELL],
+                    [F8::ZERO; ELL],
+                    [0u8; OUTER_BYTES],
+                    [0u8; OUTER_BYTES],
+                )
+            },
+            |(a_col, b_col, a_ordinary, b_ordinary),
+             (x_outer, ((out_outer, a_outer), b_outer))| {
+                reconstruct_outer_from_pair_deltas(a_outer, a_ordinary);
+                reconstruct_outer_from_pair_deltas(b_outer, b_ordinary);
+                let within_hash_outer = x_outer & within_outer_mask;
+                let n_b_med = b_med_counts[within_hash_outer] as usize;
+                let mut tmp = [0u8; 64];
+                for b_med in 0..n_b_med {
+                    let dst: &mut [u8; 64] = if nt {
+                        &mut tmp
+                    } else {
+                        (&mut out_outer[b_med * 64..(b_med + 1) * 64])
+                            .try_into()
+                            .expect("one transformed b_med block")
+                    };
+                    shift_reduce_inner_ab(
+                        a_ordinary,
+                        b_ordinary,
+                        inv_table,
+                        0,
+                        b_med,
+                        dst,
+                        a_col,
+                        b_col,
+                        !blake3_static_layout || (within_hash_outer == 0 && b_med < 2),
+                        !blake3_static_layout || (within_hash_outer == 1 && b_med + 1 == n_b_med),
+                        if blake3_static_layout && within_hash_outer == 0 && b_med == 2 {
+                            0x03
+                        } else if blake3_static_layout
+                            && within_hash_outer == 1
+                            && b_med + 2 == n_b_med
+                        {
+                            0xf0
+                        } else {
+                            0
+                        },
+                        if blake3_static_layout {
+                            within_hash_outer
+                        } else {
+                            usize::MAX
+                        },
+                        static_b_context,
+                    );
+                    if nt {
+                        unsafe {
+                            store_nt_64(tmp.as_ptr(), out_outer.as_mut_ptr().add(b_med * 64))
+                        };
+                    }
+                }
+                if nt {
+                    let tail = &mut out_outer[n_b_med * 64..];
+                    let zero = [0u8; 64];
+                    for i in 0..tail.len() / 64 {
+                        unsafe { store_nt_64(zero.as_ptr(), tail.as_mut_ptr().add(i * 64)) };
+                    }
+                } else {
+                    out_outer[n_b_med * 64..].fill(0);
+                }
+            },
+        );
+
+    Round1AbInner {
+        storage,
+        pair_deltas_in_place: true,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2331,7 +2732,8 @@ pub fn round1_shift_reduce_extract_c_packed_padded_with_s_hat_v(
 /// Challenge-weighted completion of round 1 using AB blocks returned by
 /// [`precompute_round1_ab_inner_packed_padded`]. This is byte-identical to
 /// [`round1_shift_reduce_extract_c_packed_padded_with_s_hat_v_quad`], while
-/// keeping the original A and B packed buffers available for zerocheck round 2.
+/// leaving the caller-selected A/B row representation available for zerocheck
+/// round 2.
 pub fn round1_shift_reduce_extract_c_packed_padded_with_precomputed_ab(
     ab_inner: &Round1AbInner,
     c_packed: &[u8],
@@ -4095,6 +4497,43 @@ mod tests {
             );
 
             assert_eq!(got, expected, "split round-1 mismatch at m={m}");
+        }
+    }
+
+    /// A/B emitted in block-split pair-delta form must reconstruct the exact
+    /// same challenge-independent round-one transform as ordinary row-major
+    /// inputs. This pins the representation boundary independently of the
+    /// round-two consumer oracle.
+    #[test]
+    fn precomputed_ab_from_pair_deltas_matches_ordinary() {
+        for m in 13usize..=17 {
+            let mut rng = Rng::new(0xAB5E_1000_u64.wrapping_add(m as u64));
+            let a = pack_bits(&rng.bits(1 << m));
+            let b = pack_bits(&rng.bits(1 << m));
+            let inv_table = make_inv_table();
+            let padding = PaddingSpec::dense(m);
+
+            let ordinary = precompute_round1_ab_inner_packed_padded(
+                &a, &b, m, K_SKIP, &inv_table, &padding,
+            );
+            let mut a_split = a.clone();
+            let mut b_split = b.clone();
+            form_in_place_pair_deltas_padded(&mut a_split, &mut b_split, K_SKIP, &padding);
+            let split = precompute_round1_ab_inner_packed_padded_from_pair_deltas(
+                &a_split,
+                &b_split,
+                m,
+                K_SKIP,
+                &inv_table,
+                &padding,
+            );
+
+            assert!(split.pair_deltas_in_place());
+            assert_eq!(
+                split.as_bytes(),
+                ordinary.as_bytes(),
+                "pair-delta round-one transform mismatch at m={m}"
+            );
         }
     }
 
