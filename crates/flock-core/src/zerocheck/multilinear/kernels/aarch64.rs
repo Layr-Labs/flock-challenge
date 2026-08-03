@@ -1577,6 +1577,156 @@ mod tests {
         z ^ (z >> 31)
     }
 
+    /// Measures `α` — the constant the round-two GPU gate's balance model is
+    /// built on: the CPU cost of an **offloaded** chunk (whose products the
+    /// GPU arm owns) as a fraction of a **full** chunk.
+    ///
+    /// The gate solves `s = hi / (ratio + 1 - α)` for the share that makes the
+    /// GPU wall `s·u_gpu` meet the CPU wall `(hi-s)·u_cpu + α·s·u_cpu`, so a
+    /// wrong `α` mis-sizes every share it ever publishes. `α` is a pure-CPU
+    /// quantity — it is the ratio of two monomorphizations of one kernel over
+    /// identical inputs — so unlike the GPU `ratio` it is measurable on any
+    /// aarch64 host without Metal.
+    ///
+    /// `cargo test -p flock-core --release zc_r2_offloaded_chunk_alpha_probe
+    ///  -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn zc_r2_offloaded_chunk_alpha_probe() {
+        use std::hint::black_box;
+        use std::time::Instant;
+
+        let mut state = 0x5eed_1234_9abc_def0u64;
+
+        // F2-linear byte table over a random basis: the exact shape the
+        // round-two sweep folds row codes through (8 chunks x 256 entries).
+        let mut table = vec![F128::ZERO; 8 * 256];
+        for j in 0..8 {
+            let basis: [F128; 8] =
+                core::array::from_fn(|_| F128::new(splitmix64(&mut state), splitmix64(&mut state)));
+            for v in 1usize..256 {
+                let mut acc = F128::ZERO;
+                for (b, e) in basis.iter().enumerate() {
+                    if v & (1 << b) != 0 {
+                        acc += *e;
+                    }
+                }
+                table[j * 256 + v] = acc;
+            }
+        }
+
+        // No padding: `(pair_idx & mask) >= useful` never fires, so both
+        // variants walk every group. Padded groups short-circuit identically
+        // in both and would only dilute the ratio toward 1.
+        // No padding: `(pair_idx & mask) >= useful` never fires, so both
+        // variants walk every group. Padded groups short-circuit identically
+        // in both and would only dilute the ratio toward 1.
+        const MASK: usize = 4095;
+        const USEFUL: usize = 4096;
+
+        // The ranked zerocheck runs `m = 32`, `k_skip = 6`, `n_hi = 11`:
+        // `n_pairs = 2^25` over `hi_size = 2048` chunks is `lo_size = 16384`
+        // — 1.3 MiB of live footprint per chunk, so the ranked chunk streams
+        // from DRAM and the small sizes below are shown only to expose the
+        // trend. Chunk counts hold each sweep's working set near 32 MiB so
+        // no size is measured out of L2.
+        println!(
+            "[alpha] lo_size chunks  LOOKAHEAD SWEEP (live at m=32) ------------------------\
+             |  PLAIN SWEEP (fallback) -------------"
+        );
+        println!(
+            "[alpha]                 full(us/chk)  odd_on_gpu  even_only  a_odd  a_even \
+             |  full(us/chk)  anchors_only  alpha"
+        );
+        for &lo_size in &[256usize, 1024, 4096, 16384] {
+            let chunks = (32 << 20) / (80 * lo_size);
+            let chunks = chunks.max(8);
+            let reps = if lo_size >= 4096 { 7 } else { 25 };
+            let n_pairs = lo_size * chunks;
+            let mut a_packed = vec![0u8; n_pairs * 16];
+            let mut b_packed = vec![0u8; n_pairs * 16];
+            for byte in a_packed.iter_mut().chain(b_packed.iter_mut()) {
+                *byte = (splitmix64(&mut state) & 0xff) as u8;
+            }
+            let eq_lo: Vec<F128> = (0..lo_size)
+                .map(|_| F128::new(splitmix64(&mut state), splitmix64(&mut state)))
+                .collect();
+            let mut anchors = vec![F128::ZERO; 2 * lo_size * chunks];
+            let mut deltas = vec![0u8; 16 * lo_size * chunks];
+
+            // One sweep of every chunk at one monomorphization.
+            // `variant`: 0 = full, 1 = offloaded with the odd parity on the
+            // GPU (the shipped division of labour), 2 = offloaded with only
+            // the even parity on the GPU (the pre-parity-split incumbent).
+            let mut sweep = |variant: u8, sink: &mut [F128; 8]| -> f64 {
+                let t0 = Instant::now();
+                for x_hi in 0..chunks {
+                    let mut out = [F128::ZERO; 8];
+                    let pair_idx_base = x_hi * lo_size;
+                    let row_base = pair_idx_base * 2;
+                    unsafe {
+                        let t = table.as_ptr().cast::<u8>();
+                        let ap = a_packed.as_ptr().add(row_base * 8);
+                        let bp = b_packed.as_ptr().add(row_base * 8);
+                        let an = anchors.as_mut_ptr().add(x_hi * 2 * lo_size);
+                        let de = deltas.as_mut_ptr().add(x_hi * 16 * lo_size);
+                        match variant {
+                            0 => fold_round2_compact_chunk_neon_lookahead_8::<true, false>(
+                                t, ap, bp, an, de, eq_lo.as_ptr(), lo_size, pair_idx_base,
+                                MASK, USEFUL, false, out.as_mut_ptr(),
+                            ),
+                            1 => fold_round2_compact_chunk_neon_lookahead_8::<false, true>(
+                                t, ap, bp, an, de, eq_lo.as_ptr(), lo_size, pair_idx_base,
+                                MASK, USEFUL, false, out.as_mut_ptr(),
+                            ),
+                            2 => fold_round2_compact_chunk_neon_lookahead_8::<false, false>(
+                                t, ap, bp, an, de, eq_lo.as_ptr(), lo_size, pair_idx_base,
+                                MASK, USEFUL, false, out.as_mut_ptr(),
+                            ),
+                            3 => {
+                                let (p1, pinf) = fold_round2_compact_chunk_neon_unchecked_8(
+                                    t, ap, bp, an, de, eq_lo.as_ptr(), lo_size, pair_idx_base,
+                                    MASK, USEFUL, false,
+                                );
+                                out[0] = p1;
+                                out[1] = pinf;
+                            }
+                            _ => fold_round2_compact_chunk_neon_anchors_only_8(
+                                t, ap, bp, an, de, lo_size, pair_idx_base, MASK, USEFUL,
+                            ),
+                        }
+                    }
+                    for (s, o) in sink.iter_mut().zip(out.iter()) {
+                        *s += *o;
+                    }
+                }
+                black_box(&sink);
+                t0.elapsed().as_secs_f64() * 1e6 / chunks as f64
+            };
+
+            let mut sink = [F128::ZERO; 8];
+            let mut best = [f64::MAX; 5];
+            for rep in 0..reps {
+                // Alternate the order every rep so neither variant
+                // systematically owns the cold-cache slot.
+                let order: [u8; 5] =
+                    if rep % 2 == 0 { [0, 1, 2, 3, 4] } else { [4, 3, 2, 1, 0] };
+                for v in order {
+                    let us = sweep(v, &mut sink);
+                    best[v as usize] = best[v as usize].min(us);
+                }
+            }
+            black_box(&sink);
+            println!(
+                "[alpha] {lo_size:7} {chunks:6}  {:11.3}  {:10.3}  {:9.3}  {:5.3}  {:5.3} \
+                 |  {:11.3}  {:12.3}  {:5.3}",
+                best[0], best[1], best[2],
+                best[1] / best[0], best[2] / best[0],
+                best[3], best[4], best[4] / best[3],
+            );
+        }
+    }
+
     #[test]
     fn karatsuba_q_products_match_scalar_field_products() {
         let mut state = 0x4b41_5241_5453_5542;

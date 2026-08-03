@@ -768,6 +768,7 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_with_deltas(
             None,
             cpu_wall_ms,
             hi_size,
+            crate::gpu_commit::ZC_R2_ALPHA_ANCHORS_ONLY,
         );
         match res {
             crate::gpu_commit::ZcR2Result::Calibrated => {}
@@ -1522,6 +1523,11 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead(
             if calib { Some(la_partials.as_slice()) } else { None },
             cpu_wall_ms,
             hi_size,
+            if odd_on_gpu {
+                crate::gpu_commit::ZC_R2_ALPHA_LOOKAHEAD
+            } else {
+                crate::gpu_commit::ZC_R2_ALPHA_LOOKAHEAD_EVEN_ONLY
+            },
         );
         match res {
             crate::gpu_commit::ZcR2Result::Calibrated => {}

@@ -8240,32 +8240,69 @@ kernel void zc_r2_products(
         *V
     }
 
-    /// Anchors-only CPU work is measured locally at ~0.55x of the fused
-    /// chunk (two of four folds, no products); the share solves
-    /// `(hi - (1-ALPHA) g) c_f = g u_g` — balanced, no CPU-ward bias — and
-    /// caps at `15·hi/16` as the overshoot guard (an optimistic warmup ratio
-    /// must not make the GPU the timed straggler; at this cap the GPU only
-    /// straggles once the true timed ratio exceeds `(1-0.45·15/16)/(15/16)` ≈
-    /// 0.617, still above the ~0.57 measured on the ranked M3 Max).
-    /// History of this clamp: `hi/2` always bound (promoted fix → 3·hi/4,
-    /// +5.19%), and at every observed ratio (0.33–0.83 across hosts) the
-    /// 3·hi/4 cap was *still* what bound the share — the balance point
-    /// `hi/(ratio+0.45)` sits at 0.98·hi at ratio 0.57 — so the cap moved
-    /// to 7·hi/8, the same measured mistake the balanced lincheck split
-    /// corrected at 32/64.
+    /// `ALPHA` is the CPU cost of an **offloaded** chunk as a fraction of a
+    /// **full** one, and the share solves `(hi - (1-ALPHA) g) c_f = g u_g` —
+    /// balanced, no CPU-ward bias — for `g* = hi/(ratio + 1 - ALPHA)`.
     ///
-    /// **It bound a third time.** Instrumented on the v16 tree
-    /// (`FLOCK_ZC_R2_GPU_DEBUG=1`, timed prove): the gate measured
-    /// `u_gpu=0.0690` vs `u_cpu=0.5521 ms/chunk`, i.e. ratio `0.125`, solved
-    /// for `3562` chunks and was clamped to `1792/2048` — and in the timed
-    /// round the GPU drained its prefix in `116 ms` inside a `372 ms`
-    /// round-two wall, so it sat idle for ~256 ms of it. The clamp, not the
-    /// calibration, is the binding constraint on both hosts. Moving to
-    /// `15·hi/16` takes the balanced solution's remaining reachable ground
-    /// while keeping the straggle threshold (0.617) above the ranked ratio.
-    /// Deliberately *not* uncapped: at `hi` the threshold falls to
-    /// `1-0.45 = 0.55`, which is **below** the 0.57 measured on the ranked
-    /// M3 Max, so full offload would make the GPU the straggler.
+    /// **There are two round-two sweeps and they have different residuals.**
+    /// The single `0.55` this gate used to carry was calibrated against the
+    /// *plain* sweep, whose offloaded chunk runs
+    /// `fold_round2_compact_chunk_neon_anchors_only_8` — two of four folds
+    /// and no products at all. The *lookahead* sweep, which is the only one
+    /// the ranked `m = 32` path ever takes
+    /// (`zerocheck.rs`: `use_lookahead = m == 32 && ...`), keeps all four
+    /// folds and 32 of its 38 PMULL on an offloaded chunk, because the
+    /// round-three aggregates `W0`/`W3`/`W4`/`W5` still need all four scaled
+    /// rows. One constant cannot serve both, so each sweep now passes its
+    /// own, and both are measured rather than estimated
+    /// (`zc_r2_offloaded_chunk_alpha_probe`, min-of-N, interleaved order,
+    /// working set held near 32 MiB so no size is measured out of L2):
+    ///
+    /// | `lo_size` | lookahead full | offloaded | α | plain full | anchors-only | α |
+    /// | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+    /// | 256 | 2.464 | 1.977 | 0.802 | 1.780 | 0.762 | 0.428 |
+    /// | 1024 | 9.866 | 7.894 | 0.800 | 7.047 | 2.911 | 0.413 |
+    /// | 4096 | 39.098 | 31.598 | 0.808 | 28.189 | 11.741 | 0.417 |
+    /// | **16384** (ranked) | 156.775 | 125.968 | **0.803** | 112.485 | 45.820 | **0.407** |
+    ///
+    /// µs/chunk on an M3 Pro P-core. The ranked `lo_size` is `16384`
+    /// (`m=32`, `k_skip=6`, `n_hi=11` ⇒ `n_pairs = 2^25` over `2048` chunks),
+    /// where a chunk's 1.3 MiB footprint streams from DRAM — and α is flat to
+    /// ±0.01 across a 64× working-set range, so it is an instruction-mix
+    /// ratio, not a cache artifact. Under the real 10-thread sweep any
+    /// bandwidth saturation moves both variants together, so the measured
+    /// **0.80 is a lower bound** on the live α and the share below stays on
+    /// the conservative side of the balance point.
+    ///
+    /// **What that fixes.** At `0.55` the live sweep's balance point was
+    /// computed as `hi/(ratio+0.45)` — solving past `hi` everywhere in the
+    /// ranked band and then clipped by a `15·hi/16` overshoot guard, so the
+    /// gate published `1920/2048` at *every* ranked ratio and the guard, not
+    /// the calibration, set the share. That guard existed because at α=0.55
+    /// full offload would straggle above ratio `0.55`, under the `~0.57`
+    /// measured on the ranked M3 Max. With the live α measured at `0.80` the
+    /// straggle threshold *is* `0.80`, a 40% margin over the ranked band, and
+    /// the guard is dominated: the formula backs the share off on its own
+    /// before the GPU can ever become the straggler, which is what the
+    /// balance model is for. So the cap is now the physical `hi`.
+    ///
+    /// In units of a full CPU chunk at ratio `0.475`, α `0.803`:
+    ///   share `15/16` → GPU `0.445`, CPU `0.0625 + 0.753 = 0.815` (wall `0.815`)
+    ///   share `1`     → GPU `0.475`, CPU `0.803`                  (wall `0.803`)
+    /// −1.5% of the round-two sweep, flat across the whole ranked band, with
+    /// no kernel change. The exposure is a GPU that straggles past `0.80`,
+    /// and the arm's Metal-failure path already redoes the prefix exactly.
+    ///
+    /// History of the clamp this replaces: `hi/2` always bound (promoted fix
+    /// → 3·hi/4, +5.19%); at every observed ratio (0.33–0.83 across hosts)
+    /// the 3·hi/4 cap was *still* what bound the share, so it moved to
+    /// 7·hi/8 and then 15·hi/16 — three successive corrections of a clamp
+    /// that was standing in for a mis-measured α, the same mistake the
+    /// balanced lincheck split corrected at 32/64. Instrumented on the v16
+    /// tree (`FLOCK_ZC_R2_GPU_DEBUG=1`, timed prove) the gate measured
+    /// `u_gpu=0.0690` vs `u_cpu=0.5521 ms/chunk`, solved for `3562` chunks,
+    /// was clamped to `1792/2048`, and the GPU drained its prefix in `116 ms`
+    /// inside a `372 ms` round-two wall — idle for ~256 ms of it.
     ///
     /// Ratios in `(2, 8)`: the probe's equality oracle has already proven
     /// the kernel exact on this machine, so a slow-looking GPU gets a floor
@@ -8275,11 +8312,21 @@ kernel void zc_r2_products(
     /// suspected cause of admission failing on a majority of ranked worker
     /// processes while every admitted process posts record p10s). Ratio ≥ 8
     /// or unusable ⇒ 0 = exact incumbent.
-    const ZC_R2_ALPHA: f64 = 0.55;
+    /// Live at the ranked `m = 32`: all four folds and 32/38 PMULL survive on
+    /// an offloaded chunk. Measured `0.803`; carried one notch conservative.
+    pub(crate) const ZC_R2_ALPHA_LOOKAHEAD: f64 = 0.80;
+    /// The lookahead sweep under `FLOCK_NO_ZC_R2_ODD_OFFLOAD=1`: the CPU
+    /// recomputes the odd parity for `W1`/`W2`, so only two of the eight
+    /// products leave. Measured `0.883`.
+    pub(crate) const ZC_R2_ALPHA_LOOKAHEAD_EVEN_ONLY: f64 = 0.88;
+    /// The plain sweep's `anchors_only` residual — reachable only through
+    /// `FLOCK_NO_ZC_LOOKAHEAD` or `r[k_skip+1] = 0` (probability 2⁻¹²⁸).
+    /// Measured `0.407`.
+    pub(crate) const ZC_R2_ALPHA_ANCHORS_ONLY: f64 = 0.41;
     const ZC_R2_MAX_RATIO: f64 = 2.0;
     const ZC_R2_FLOOR_MAX_RATIO: f64 = 8.0;
 
-    pub(crate) fn zc_r2_gate_share(ratio: f64, hi_size: usize) -> usize {
+    pub(crate) fn zc_r2_gate_share(ratio: f64, hi_size: usize, alpha: f64) -> usize {
         if !ratio.is_finite() || ratio <= 0.0 {
             return 0;
         }
@@ -8289,8 +8336,12 @@ kernel void zc_r2_products(
             }
             return 0;
         }
-        let g = (hi_size as f64 / (ratio + (1.0 - ZC_R2_ALPHA))).round();
-        (g as usize).min(hi_size * 15 / 16)
+        let g = (hi_size as f64 / (ratio + (1.0 - alpha))).round();
+        // Cap at the physical maximum. With a measured α the formula's own
+        // crossover (`ratio = alpha`) is the straggle threshold, so an
+        // additional haircut can only fire where the model has already
+        // concluded that every chunk belongs on the GPU.
+        (g as usize).min(hi_size)
     }
 
     fn zc_r2_init(gpu: &'static Gpu) -> Result<ZcR2, String> {
@@ -8524,7 +8575,16 @@ kernel void zc_r2_products(
             // 1/8 probe that shipped there.
             (hi_size / 16).clamp(8, 128)
         } else {
-            tuned.min(hi_size * 15 / 16)
+            // The published share is already the gate's balanced solution
+            // capped at `hi_size` (see `zc_r2_gate_share`). This site used to
+            // re-apply an identical `15·hi/16` overshoot guard, which was
+            // invisible while the policy capped there too — both produced
+            // `1920/2048` at every ranked ratio, so the *duplicate* clamp was
+            // what actually bound the timed prefix. Clamp only to the physical
+            // range: `ZC_R2_TUNED` is a process-global published once at
+            // calibration, so a prove reaching this arm at a smaller `hi_size`
+            // than the calibrating one must still not overrun its chunk count.
+            tuned.min(hi_size)
         };
         if chunks == 0 {
             return None;
@@ -8610,12 +8670,16 @@ kernel void zc_r2_products(
     /// `cpu_la` carries the CPU's six per-chunk round-three lookahead
     /// aggregates; slots 0 and 1 are the odd-parity round-two products, so
     /// the oracle can check the parity split and not merely its sum.
+    /// `alpha` is the calling sweep's own offloaded-chunk residual — see
+    /// [`ZC_R2_ALPHA_LOOKAHEAD`] and its siblings. It is only read on the
+    /// calibration drain, where the share is solved and published.
     pub(crate) fn zc_r2_wait(
         job: ZcR2Job,
         cpu_partials: Option<&[(F128, F128)]>,
         cpu_la: Option<&[[F128; 6]]>,
         cpu_wall_ms: f64,
         hi_size: usize,
+        alpha: f64,
     ) -> ZcR2Result {
         use std::sync::atomic::Ordering;
         let gpu = match gpu() {
@@ -8745,7 +8809,7 @@ kernel void zc_r2_products(
             let share = if u_cpu.is_finite() && u_cpu > 0.0 && u_gpu.is_finite() {
                 let measured = u_gpu / u_cpu;
                 let ratio = zc_r2_forced_ratio().unwrap_or(measured);
-                let g = zc_r2_gate_share(ratio, hi_size);
+                let g = zc_r2_gate_share(ratio, hi_size, alpha);
                 if super::gpu_zc_r2_debug() {
                     eprintln!(
                         "[zc-r2] gate replay walls: {:?}", &walls[..n_walls]
@@ -10108,7 +10172,10 @@ pub(crate) use imp::{ZcFoldJob, launch_lincheck_fold, launch_zerocheck_c_fold, z
 /// Zerocheck round-two products GPU arm (see `ENV_NO_GPU_ZC_R2`).
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[cfg_attr(not(test), allow(unused_imports))]
-pub(crate) use imp::{ZcR2Job, ZcR2Result, launch_zc_r2_products, zc_r2_wait};
+pub(crate) use imp::{
+    ZC_R2_ALPHA_ANCHORS_ONLY, ZC_R2_ALPHA_LOOKAHEAD, ZC_R2_ALPHA_LOOKAHEAD_EVEN_ONLY, ZcR2Job,
+    ZcR2Result, launch_zc_r2_products, zc_r2_wait,
+};
 
 /// Zerocheck first-tail-round products GPU arm (see `ENV_NO_GPU_ZC_T3`).
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -11764,26 +11831,38 @@ DEF_PROBE(probe_g4_t8_p0,    8u,  0u,   tsel & 7u)
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     #[test]
     fn zc_r2_gate_share_policy() {
-        use imp::zc_r2_gate_share;
-        // Balance point hi/(ratio+0.45); ranked-observed ratios land above
-        // the 15·hi/16 cap, which is the binding overshoot guard.
-        assert_eq!(zc_r2_gate_share(0.57, 2048), 1920);
-        assert_eq!(zc_r2_gate_share(0.38, 2048), 1920);
-        // The guard still binds before the GPU can straggle: at 15/16 the
-        // crossover is (1-0.45·15/16)/(15/16) ≈ 0.617, above the ranked 0.57.
-        assert!(zc_r2_gate_share(0.62, 2048) < 2048);
-        // Slow-but-usable GPU: the formula takes over below the cap.
-        assert_eq!(zc_r2_gate_share(1.0, 2048), 1412); // 2048/1.45
-        assert_eq!(zc_r2_gate_share(2.0, 2048), 836); // 2048/2.45
+        use imp::{
+            ZC_R2_ALPHA_ANCHORS_ONLY, ZC_R2_ALPHA_LOOKAHEAD, zc_r2_gate_share,
+        };
+        let live = |ratio: f64| zc_r2_gate_share(ratio, 2048, ZC_R2_ALPHA_LOOKAHEAD);
+        // Live (lookahead) sweep, alpha 0.80 measured: balance point is
+        // hi/(ratio+0.20), so the whole ranked band (0.38..0.57) solves past
+        // every chunk and takes the physical cap. The old 0.55 clipped all of
+        // these to 1920 through a 15/16 haircut.
+        assert_eq!(live(0.38), 2048); // 2048/0.58 = 3531
+        assert_eq!(live(0.57), 2048); // 2048/0.77 = 2660
+        // The crossover is alpha itself: at ratio 0.80 the balanced share is
+        // exactly hi, and above it the formula — not a haircut — backs off.
+        assert_eq!(live(0.80), 2048);
+        assert_eq!(live(0.85), 1950); // 2048/1.05
+        assert_eq!(live(1.0), 1707); // 2048/1.20
+        assert_eq!(live(2.0), 931); // 2048/2.20
+        // The plain sweep's anchors-only residual is half as heavy, so the
+        // same ratio earns it a strictly smaller share — the mis-service the
+        // single shared constant used to hide.
+        let plain = |ratio: f64| zc_r2_gate_share(ratio, 2048, ZC_R2_ALPHA_ANCHORS_ONLY);
+        assert_eq!(plain(0.38), 2048); // 2048/0.97 = 2111
+        assert_eq!(plain(0.57), 1766); // 2048/1.16
+        assert!(plain(0.57) < live(0.57));
         // Admission floor for ratios in (2, 8): the equality oracle already
         // proved the kernel, so pricing failures get hi/8, not 0.
-        assert_eq!(zc_r2_gate_share(2.01, 2048), 256);
-        assert_eq!(zc_r2_gate_share(7.9, 2048), 256);
+        assert_eq!(live(2.01), 256);
+        assert_eq!(live(7.9), 256);
         // Past the floor ceiling, or unusable: exact incumbent.
-        assert_eq!(zc_r2_gate_share(8.0, 2048), 0);
-        assert_eq!(zc_r2_gate_share(f64::NAN, 2048), 0);
-        assert_eq!(zc_r2_gate_share(0.0, 2048), 0);
-        assert_eq!(zc_r2_gate_share(-1.0, 2048), 0);
+        assert_eq!(live(8.0), 0);
+        assert_eq!(live(f64::NAN), 0);
+        assert_eq!(live(0.0), 0);
+        assert_eq!(live(-1.0), 0);
     }
 
     /// The lincheck arm's GPU prefix equals the CPU fold over exactly the
@@ -12016,7 +12095,14 @@ DEF_PROBE(probe_g4_t8_p0,    8u,  0u,   tsel & 7u)
         .expect("calibration launch must succeed on real Metal");
         assert!(job.is_calibration());
         assert_eq!(job.cpu_split(), 0);
-        let res = imp::zc_r2_wait(job, Some(&cpu_partials), Some(&cpu_la), 50.0, hi_size);
+        let res = imp::zc_r2_wait(
+            job,
+            Some(&cpu_partials),
+            Some(&cpu_la),
+            50.0,
+            hi_size,
+            imp::ZC_R2_ALPHA_LOOKAHEAD,
+        );
         assert!(matches!(res, imp::ZcR2Result::Calibrated));
         let (tuned, poisoned) = imp::zc_r2_test_state();
         assert!(!poisoned, "probe partials must equal CPU partials bit-for-bit");
@@ -12031,7 +12117,7 @@ DEF_PROBE(probe_g4_t8_p0,    8u,  0u,   tsel & 7u)
         assert!(!job2.is_calibration());
         let prefix = job2.cpu_split();
         assert_eq!(prefix, hi_size / 2);
-        match imp::zc_r2_wait(job2, None, None, 0.0, hi_size) {
+        match imp::zc_r2_wait(job2, None, None, 0.0, hi_size, imp::ZC_R2_ALPHA_LOOKAHEAD) {
             imp::ZcR2Result::Prefix(vals) => {
                 assert_eq!(vals.len(), prefix);
                 assert_eq!(
