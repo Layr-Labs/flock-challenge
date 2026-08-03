@@ -670,6 +670,12 @@ unsafe fn r2_pair_fold_and_store(
 /// products: **32 PMULL per group instead of 38** on every offloaded chunk.
 /// The four `mul_q` row weightings survive because `W0`/`W3`/`W4`/`W5` still
 /// need all four scaled rows.
+///
+/// The W-offload tier (`FLOCK_NO_ZC_R2_W_OFFLOAD`, see gpu_commit) goes one
+/// step further and bypasses this kernel entirely on offloaded chunks: the GPU
+/// returns `W0`/`W3`/`W4`/`W5` too, so the driver runs the anchors-only
+/// sibling [`fold_round2_compact_chunk_neon_anchors_only_8`] there — zero
+/// products, zero weightings, two folds per pair, byte-identical stores.
 #[cfg(target_arch = "aarch64")]
 #[target_feature(enable = "aes")]
 pub(crate) unsafe fn fold_round2_compact_chunk_neon_lookahead_8<
@@ -1637,5 +1643,124 @@ mod tests {
                 );
             }
         }
+    }
+}
+
+/// Derivation probe for the zc-r2 gate's offloaded-chunk pricing constants
+/// (`ZC_R2_ALPHA_*` in `gpu_commit`): times one CPU sweep over a ranked-shaped
+/// chunk range for each of the three offload-era chunk tiers, interleaved
+/// A/B/C per rep with min-of-reps (the min is the unloaded quantum on a busy
+/// box), and prints each offloaded tier's per-chunk cost as a fraction of the
+/// fused full-lookahead chunk. Single-threaded on purpose: the pricing model
+/// only consumes the *ratio* of per-chunk costs inside one parallel sweep,
+/// and this is the same instrument that produced the original "anchors-only
+/// ≈ 0.55× fused" figure the gate shipped with (see the `ZC_R2_ALPHA` history
+/// comment). Random codes mean the `degen` shortcut never fires, so the fused
+/// cost is priced without the b≡1 discount — that overstates the fused
+/// denominator slightly and thus *understates* both residuals, which is the
+/// safe direction for the share solver (a low residual can only shrink the
+/// GPU share, never push the GPU toward being the timed straggler).
+#[cfg(all(test, target_arch = "aarch64", target_feature = "aes"))]
+mod offload_residual_probe {
+    use super::*;
+
+    fn xs(state: &mut u64) -> u64 {
+        *state ^= *state << 13;
+        *state ^= *state >> 7;
+        *state ^= *state << 17;
+        *state
+    }
+
+    #[test]
+    #[ignore = "timing probe: run manually with --nocapture to re-derive the zc-r2 ALPHA constants"]
+    fn zc_r2_offload_tier_residual_probe() {
+        const LO_SIZE: usize = 512;
+        const CHUNKS: usize = 256;
+        const N_CHUNK_BYTES: usize = 8;
+        const MASK: usize = 4095;
+        const USEFUL: usize = 3900;
+        const REPS: usize = 15;
+
+        let mut rng = 0x5eed_cafe_f00d_beefu64;
+        let mut table_data = vec![F128::ZERO; 8 * 256];
+        for v in table_data.iter_mut().skip(1) {
+            *v = F128::new(xs(&mut rng), xs(&mut rng));
+        }
+        let n_pairs = LO_SIZE * CHUNKS;
+        let mut a_packed = vec![0u8; 2 * n_pairs * N_CHUNK_BYTES];
+        let mut b_packed = vec![0u8; 2 * n_pairs * N_CHUNK_BYTES];
+        for byte in a_packed.iter_mut() {
+            *byte = (xs(&mut rng) & 0xff) as u8;
+        }
+        for byte in b_packed.iter_mut() {
+            *byte = (xs(&mut rng) & 0xff) as u8;
+        }
+        let eq_lo: Vec<F128> = (0..LO_SIZE)
+            .map(|_| F128::new(xs(&mut rng), xs(&mut rng)))
+            .collect();
+        let mut anchors = vec![F128::ZERO; 2 * LO_SIZE];
+        let mut deltas = vec![0u8; 2 * LO_SIZE * N_CHUNK_BYTES];
+        let mut out = [F128::ZERO; 8];
+
+        // tier 0: fused full lookahead (<true, false>); tier 1: pre-W-offload
+        // offloaded tier (<false, true>, odd products on GPU); tier 2:
+        // anchors-only sibling (W-offload armed).
+        let mut mins = [f64::MAX; 3];
+        let mut sweep = |tier: usize, sink: &mut F128| -> f64 {
+            let t0 = std::time::Instant::now();
+            for x_hi in 0..CHUNKS {
+                let pair_idx_base = x_hi * LO_SIZE;
+                let row_base = 2 * pair_idx_base;
+                unsafe {
+                    let t = table_data.as_ptr().cast::<u8>();
+                    let ap = a_packed.as_ptr().add(row_base * N_CHUNK_BYTES);
+                    let bp = b_packed.as_ptr().add(row_base * N_CHUNK_BYTES);
+                    match tier {
+                        0 => fold_round2_compact_chunk_neon_lookahead_8::<true, false>(
+                            t, ap, bp, anchors.as_mut_ptr(), deltas.as_mut_ptr(),
+                            eq_lo.as_ptr(), LO_SIZE, pair_idx_base, MASK, USEFUL,
+                            true, out.as_mut_ptr(),
+                        ),
+                        1 => fold_round2_compact_chunk_neon_lookahead_8::<false, true>(
+                            t, ap, bp, anchors.as_mut_ptr(), deltas.as_mut_ptr(),
+                            eq_lo.as_ptr(), LO_SIZE, pair_idx_base, MASK, USEFUL,
+                            true, out.as_mut_ptr(),
+                        ),
+                        _ => fold_round2_compact_chunk_neon_anchors_only_8(
+                            t, ap, bp, anchors.as_mut_ptr(), deltas.as_mut_ptr(),
+                            LO_SIZE, pair_idx_base, MASK, USEFUL,
+                        ),
+                    }
+                }
+                *sink += out[0] + anchors[0];
+            }
+            t0.elapsed().as_secs_f64() * 1e3
+        };
+
+        let mut sink = F128::ZERO;
+        for _ in 0..REPS {
+            for tier in 0..3 {
+                let w = sweep(tier, &mut sink);
+                if w < mins[tier] {
+                    mins[tier] = w;
+                }
+            }
+        }
+        std::hint::black_box(sink);
+        let per_chunk = |w: f64| w / CHUNKS as f64;
+        println!(
+            "zc-r2 tier probe (min of {REPS} interleaved reps, {CHUNKS} chunks x lo={LO_SIZE}):"
+        );
+        println!("  fused full lookahead : {:.4} ms/chunk", per_chunk(mins[0]));
+        println!(
+            "  odd-on-gpu (pre-W)   : {:.4} ms/chunk  residual {:.3}",
+            per_chunk(mins[1]),
+            mins[1] / mins[0]
+        );
+        println!(
+            "  anchors-only (W-off) : {:.4} ms/chunk  residual {:.3}",
+            per_chunk(mins[2]),
+            mins[2] / mins[0]
+        );
     }
 }

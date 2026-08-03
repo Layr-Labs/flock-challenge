@@ -504,6 +504,22 @@ impl UniSkipFoldTable {
 /// the schedule-tuned global split.
 const COMPACT_RECONSTRUCTION_N_HI: usize = 11;
 
+/// Chunk split for the K double-fold pass ([`fold2_compact_and_round4_into`])
+/// only. That pass differs from the single-fold reconstruction the note above
+/// was tuned for: it carries TWO scaled 32 KiB tables (λ₁ and λ₃) — a 64 KiB
+/// hot set per worker instead of 32 KiB — while still streaming the 1.5 GiB
+/// compact state and writing 512 MiB, so the 11-bit choice was re-screened
+/// rather than inherited. Screened 10 vs 11 vs 12 locally (M4-base seat,
+/// min-of-5 per value on the `[zc-tail-rounds] K double fold + round4` line,
+/// interleaved 10,11,12 rotation, proof bytes exact for every value): mins
+/// 93.5 / 78.4 / 101.0 ms — 11 wins outright, so the doubled hot set does not
+/// shift the optimum. Pre-declared gate was "move only on a ≥5% win over 11";
+/// screen closed keeping 11. Numbers are from the local seat — the ranked
+/// M3 Max runner could order 10/12 differently, but 11 is also the incumbent
+/// split, so keeping it carries zero regression risk. The split is an exact
+/// lo/hi tensor factorisation: any admissible value is bit-identical.
+const K_PASS_N_HI: usize = 11;
+
 /// Compact materialization of the first multilinear level.
 ///
 /// For each adjacent post-URM row pair this keeps the folded even-row anchor
@@ -636,6 +652,15 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_with_deltas(
         hi_size,
         pair_in_block_mask,
         useful_pairs_inclusive,
+        // κ = eq_lo[2y]/eq_lo[2y+1] = (1+r1)/r1 of the first low eq
+        // variable, for the armed kernel's weight-shared even-parity
+        // restore (this sweep never consumes the W slots, but a uniform
+        // protocol keeps the calibration pricing identical across paths).
+        // `None` (r1 = 0) keeps the four-partial protocol for this job.
+        {
+            let r1 = mlv_challenges[1];
+            (r1 != F128::ZERO).then(|| (F128::ONE + r1) * r1.inv())
+        },
     );
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     let gpu_prefix = gpu_job.as_ref().map_or(0, |j| j.cpu_split());
@@ -1359,10 +1384,10 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead(
     let degen = r2_degen_enabled();
 
     // Same GPU round-two products arm as the incumbent sweep: it still
-    // receives byte-identical anchors/deltas for every chunk and still owns
-    // the *summed* `(p1, pinf)` for its prefix. The CPU keeps producing the
-    // odd-parity halves on those chunks (the GPU's sums are not parity-split),
-    // which is what makes `W1`/`W2` recoverable everywhere.
+    // receives byte-identical anchors/deltas for every chunk and owns the
+    // parity-split `(p1, pinf)` for its prefix — the odd halves double as the
+    // lookahead's `W1`/`W2` — plus, when the W-offload tier is armed, the four
+    // deferred `W0`/`W3`/`W4`/`W5` aggregates as well.
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     let gpu_job = crate::gpu_commit::launch_zc_r2_products(
         a_packed,
@@ -1374,6 +1399,9 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead(
         hi_size,
         pair_in_block_mask,
         useful_pairs_inclusive,
+        // κ for the armed kernel's weight-shared even-parity restore; this
+        // path already asserted r1 ≠ 0.
+        Some(kappa),
     );
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     let gpu_prefix = gpu_job.as_ref().map_or(0, |j| j.cpu_split());
@@ -1385,6 +1413,15 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead(
     let odd_on_gpu = gpu_prefix > 0 && zc_r2_odd_offload_enabled();
     #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
     let odd_on_gpu = false;
+    // W-offload tier (`FLOCK_NO_ZC_R2_W_OFFLOAD`, see gpu_commit): the kernel
+    // additionally returns the four deferred W-aggregates per offloaded chunk,
+    // so those chunks drop to the anchors-only sibling kernel — zero products,
+    // zero `mul_q` row weightings, and only the two anchor-row folds, with
+    // byte-identical anchor/delta stores (the same tier the incumbent sweep
+    // uses). Keyed off the job's own flag so the CPU tier, the drain's slot
+    // adoption, and the kernel's protocol can never disagree.
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    let w_on = odd_on_gpu && gpu_job.as_ref().is_some_and(|j| j.w_offload());
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     let t_cpu_sweep = std::time::Instant::now();
 
@@ -1407,6 +1444,28 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead(
         let pair_idx_base = x_hi * lo_size;
         let row_base = pair_idx_base * 2;
         let mut out = [F128::ZERO; 8];
+
+        // W-offloaded chunk: the GPU owns every product AND all six lookahead
+        // aggregates, so the CPU only writes anchors+deltas (byte-identical
+        // stores) and leaves this chunk's partials/la slots at zero for the
+        // drain (or the Failed redo) to fill.
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        if w_on && x_hi < gpu_prefix {
+            unsafe {
+                fold_round2_compact_chunk_neon_anchors_only_8(
+                    table.data.as_ptr().cast::<u8>(),
+                    a_packed.as_ptr().add(row_base * n_chunks),
+                    b_packed.as_ptr().add(row_base * n_chunks),
+                    anchors,
+                    deltas,
+                    lo_size,
+                    pair_idx_base,
+                    pair_in_block_mask,
+                    useful_pairs_inclusive,
+                );
+            }
+            return;
+        }
 
         #[cfg(target_arch = "aarch64")]
         {
@@ -1507,10 +1566,11 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead(
     });
 
     // Drain the GPU products arm. The arm returns `[p1_even, pinf_even,
-    // p1_odd, pinf_odd]`; XORing the parities back together reproduces the
-    // summed pair the incumbent contract delivered, and the odd half is
-    // adopted as the lookahead's `W1`/`W2` state exactly when the CPU was told
-    // to skip it.
+    // p1_odd, pinf_odd, W0, W3, W4, W5]`; XORing the parities back together
+    // reproduces the summed pair the incumbent contract delivered, the odd
+    // half is adopted as the lookahead's `W1`/`W2` state exactly when the CPU
+    // was told to skip it, and the four W-aggregate slots are adopted exactly
+    // when the W-offload tier ran (they are stale buffer bytes otherwise).
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     if let Some(job) = gpu_job {
         let cpu_wall_ms = t_cpu_sweep.elapsed().as_secs_f64() * 1e3;
@@ -1531,6 +1591,12 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead(
                     if odd_on_gpu {
                         la_partials[x_hi][0] = v[2];
                         la_partials[x_hi][1] = v[3];
+                    }
+                    if w_on {
+                        la_partials[x_hi][2] = v[4];
+                        la_partials[x_hi][3] = v[5];
+                        la_partials[x_hi][4] = v[6];
+                        la_partials[x_hi][5] = v[7];
                     }
                 }
             }
@@ -1570,6 +1636,14 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead(
                     if odd_on_gpu {
                         la_partials[x_hi][0] = eq_h * out[2];
                         la_partials[x_hi][1] = eq_h * out[3];
+                    }
+                    // Under the W-offload tier the sweep left this chunk's
+                    // W slots at zero too — the full redo recovers them.
+                    if w_on {
+                        la_partials[x_hi][2] = eq_h * out[4];
+                        la_partials[x_hi][3] = eq_h * out[5];
+                        la_partials[x_hi][4] = eq_h * out[6];
+                        la_partials[x_hi][5] = eq_h * out[7];
                     }
                 }
             }
@@ -1725,7 +1799,7 @@ pub(crate) fn fold2_compact_and_round4_into(
     let table_l1 = table.scaled_linear(lambda1);
     let table_l3 = table.scaled_linear(lambda3);
 
-    let eq = SplitEqGhash::with_n_hi(&r_next4[1..], COMPACT_RECONSTRUCTION_N_HI);
+    let eq = SplitEqGhash::with_n_hi(&r_next4[1..], K_PASS_N_HI);
     let lo_size = 1usize << eq.n_lo;
     let hi_size = 1usize << eq.n_hi;
     assert_eq!(lo_size * hi_size * 2, n_groups);

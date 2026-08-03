@@ -103,6 +103,41 @@ pub(crate) fn gpu_lincheck_debug() -> bool {
     *ON
 }
 
+/// Strict kill switch for eq-direct staging (`FLOCK_NO_EQ_DIRECT=1` restores
+/// the incumbent owned-Vec eq build plus the 4 MiB upload memcpy inside each
+/// fold-arm launch). When the switch is off, the eq_outer table for the
+/// zerocheck C fold and the lincheck gather fold is built IN PLACE in the
+/// arms' persistent shared-storage upload buffer, so `launch_fold_prefix`
+/// skips the copy. Staging changes only WHERE the table is built — the
+/// construction, the bytes, and every CPU consumer's view are identical.
+pub const ENV_NO_EQ_DIRECT: &str = "FLOCK_NO_EQ_DIRECT";
+
+fn eq_direct_value_enabled(value: Option<&std::ffi::OsStr>) -> bool {
+    value != Some(std::ffi::OsStr::new("1"))
+}
+
+#[cfg_attr(
+    not(all(target_os = "macos", target_arch = "aarch64")),
+    allow(dead_code)
+)]
+pub(crate) fn eq_direct_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| eq_direct_value_enabled(std::env::var_os(ENV_NO_EQ_DIRECT).as_deref()))
+}
+
+#[cfg(test)]
+mod eq_direct_gate_tests {
+    use std::ffi::OsStr;
+
+    #[test]
+    fn exact_one_is_the_only_eq_direct_kill_value() {
+        assert!(!super::eq_direct_value_enabled(Some(OsStr::new("1"))));
+        for value in [None, Some(""), Some("0"), Some("01"), Some("true")] {
+            assert!(super::eq_direct_value_enabled(value.map(OsStr::new)));
+        }
+    }
+}
+
 /// Kill switch for the zerocheck round-two PRODUCTS GPU arm:
 /// `FLOCK_NO_GPU_ZC_R2=1` keeps the whole round-two fused fold on the CPU
 /// (the exact incumbent). Unlike the refuted whole-phase tail offload, this
@@ -129,6 +164,118 @@ pub(crate) fn gpu_zc_r2_debug() -> bool {
     static ON: std::sync::LazyLock<bool> =
         std::sync::LazyLock::new(|| std::env::var_os("FLOCK_ZC_R2_GPU_DEBUG").is_some());
     *ON
+}
+
+/// Kill switch for the round-two arm's lookahead W-offload:
+/// `FLOCK_NO_ZC_R2_W_OFFLOAD=1` restores the four-partial protocol (the GPU
+/// returns only the parity-split round-two products; the CPU keeps computing
+/// the four deferred round-three W-aggregates on offloaded chunks). With the
+/// offload armed the kernel additionally returns the eq_hi-weighted
+/// `[W0, W3, W4, W5]` per chunk — the exact sums the CPU lookahead kernel
+/// forms (see `fold_round2_compact_chunk_neon_lookahead_8`) — and offloaded
+/// CPU chunks drop to the anchors-only sibling kernel: zero products, zero
+/// row weightings, byte-identical anchor/delta stores. Composes with
+/// `FLOCK_NO_ZC_R2_ODD_OFFLOAD`: the W-aggregates ride the same parity-split
+/// contract, so killing the odd offload also disarms this one (its OFF state
+/// must behave exactly as the incumbent, GPU wall included). Output is
+/// bit-identical either way; the calibration oracle byte-compares all four
+/// W-sums on the probe range before the arm is ever admitted.
+/// DEMOTED TO OPT-IN by ranked evidence (submission 94a5b188: 1,399,266,
+/// −9.5% vs bar, p10 +10.4% uniformly across workers — a deterministic
+/// per-process cost). Two consistent hypotheses, published for the board:
+/// (a) the W-extended kernel fails its calibration byte-oracle on the M3 Max
+/// GPU (Metal codegen difference vs the M4 dev seat) and the failure poisons
+/// the ENTIRE zc-r2 arm → full-CPU round-2 every timed trial (arithmetic
+/// fits −8..10%); (b) the +43% u_gpu makes the GPU the round-2 straggler on
+/// the runner (fits only if the runner's r2 GPU wall vastly exceeds local
+/// scaling). Either way the safe default is the incumbent promoted protocol.
+/// DESIGN LESSON ENCODED HERE: a W mismatch should degrade to the 4-partial
+/// protocol, never poison the promoted arm — fix before re-arming.
+/// Opt-in via `FLOCK_ZC_R2_W_OFFLOAD=1` (exact string) for runner A/Bs;
+/// still requires the odd-offload to be live.
+pub const ENV_ZC_R2_W_OFFLOAD: &str = "FLOCK_ZC_R2_W_OFFLOAD";
+
+pub(crate) fn zc_r2_w_offload_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        std::env::var_os(ENV_ZC_R2_W_OFFLOAD).is_some_and(|v| v == *"1")
+            && std::env::var_os("FLOCK_NO_ZC_R2_ODD_OFFLOAD").is_none_or(|v| v != *"1")
+    });
+    *ON
+}
+
+/// Kill switch for the zc-r2 share retune: `FLOCK_NO_ZC_R2_RETUNE=1` prices
+/// offloaded chunks with the pre-W-offload `ALPHA = 0.55` for every tier
+/// (the exact shipped gate; the 15·hi/16 cap is unchanged by the retune at
+/// both clamp sites, see the `ZC_R2_ALPHA` derivation comment). The retune
+/// touches only the share *pricing* — which chunks the GPU owns — never the
+/// values: every path stays bit-exact at any share by the arm's existing
+/// contract, so this switch is a pure performance A/B lever.
+/// DEMOTED TO OPT-IN alongside the W-offload (submission 94a5b188, −9.5%):
+/// the rejection cannot be attributed between the three zc-r2 components
+/// from one draw, so all three revert to the incumbent promoted behaviour.
+/// The measured tier residuals (0.852 pre-W, 0.340 anchors-only) remain
+/// documented at the `ZC_R2_ALPHA` derivation; opt in via
+/// `FLOCK_ZC_R2_RETUNE=1` for single-variable runner A/Bs.
+pub const ENV_ZC_R2_RETUNE: &str = "FLOCK_ZC_R2_RETUNE";
+
+fn zc_r2_retune_value_enabled(value: Option<&std::ffi::OsStr>) -> bool {
+    value == Some(std::ffi::OsStr::new("1"))
+}
+
+#[cfg_attr(
+    not(all(target_os = "macos", target_arch = "aarch64")),
+    allow(dead_code)
+)]
+pub(crate) fn zc_r2_retune_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| zc_r2_retune_value_enabled(std::env::var_os(ENV_ZC_R2_RETUNE).as_deref()))
+}
+
+/// Kill switch for the zc-r2 bounded share re-convergence:
+/// `FLOCK_NO_ZC_R2_RECONVERGE=1` freezes the published share at whatever the
+/// cold warmup calibration produced (the exact shipped behaviour). With the
+/// switch off, each timed prove feeds its own measured GPU/CPU ratio into a
+/// bounded adjuster that can move the published share by at most `hi/32` per
+/// prove (see the re-convergence block in `zc_r2_wait`). Like the retune,
+/// this only redistributes chunks between two bit-exact engines.
+/// DEMOTED TO OPT-IN alongside the W-offload (submission 94a5b188, −9.5%;
+/// see `ENV_ZC_R2_W_OFFLOAD` for the attribution reasoning). Opt in via
+/// `FLOCK_ZC_R2_RECONVERGE=1`.
+pub const ENV_ZC_R2_RECONVERGE: &str = "FLOCK_ZC_R2_RECONVERGE";
+
+fn zc_r2_reconverge_value_enabled(value: Option<&std::ffi::OsStr>) -> bool {
+    value == Some(std::ffi::OsStr::new("1"))
+}
+
+#[cfg_attr(
+    not(all(target_os = "macos", target_arch = "aarch64")),
+    allow(dead_code)
+)]
+pub(crate) fn zc_r2_reconverge_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        zc_r2_reconverge_value_enabled(std::env::var_os(ENV_ZC_R2_RECONVERGE).as_deref())
+    })
+}
+
+#[cfg(test)]
+mod zc_r2_retune_gate_tests {
+    use std::ffi::OsStr;
+
+    #[test]
+    fn retune_and_reconverge_are_exact_one_opt_ins() {
+        assert_eq!(super::ENV_ZC_R2_RETUNE, "FLOCK_ZC_R2_RETUNE");
+        assert_eq!(super::ENV_ZC_R2_RECONVERGE, "FLOCK_ZC_R2_RECONVERGE");
+        for value_enabled in [
+            super::zc_r2_retune_value_enabled as fn(Option<&OsStr>) -> bool,
+            super::zc_r2_reconverge_value_enabled,
+        ] {
+            assert!(value_enabled(Some(OsStr::new("1"))));
+            for value in [None, Some(""), Some("0"), Some("01"), Some("true")] {
+                assert!(!value_enabled(value.map(OsStr::new)));
+            }
+        }
+    }
 }
 
 /// Kill switch for the zerocheck first-tail-round (T3 compact reconstruction)
@@ -602,6 +749,50 @@ mod parent3_gate_tests {
     }
 }
 
+/// Strict kill switch for the vectorized (uint4 load/store) Merkle tree
+/// kernels: only exact value `1` disables them, restoring the incumbent
+/// scalar-load `leaf_hash`/`parent_hash3` pipelines from the untouched
+/// embedded metallib. The vec4 variants change ONLY the memory access width
+/// (64 uint4 loads per 1 KiB leaf instead of 256 scalar loads — the leaf
+/// pass re-reads the full 1 GiB codeword and is request-count-bound, not
+/// bandwidth-bound); the BLAKE3 message schedule, compression, and output
+/// layout are word-identical, so the chaining values are bit-exact by
+/// construction and the warmup dual-run byte compare enforces it at runtime.
+/// DEMOTED TO OPT-IN by ranked n=2 evidence (submissions 508ecb2e /
+/// 31338634): two draws of the default-on tree scored 1,538,763 / 1,536,713
+/// with p10s agreeing to 0.016% (0.1691142 / 0.1691409), both below the same
+/// content's seven-sample third-party band (1,538,490–1,543,023, p10 ~0.1686)
+/// — a consistent ~+0.28% p10 shift that local M4 A/Bs could not see (leaf
+/// pass 12.56 ms both arms). The kernels remain word-identical and bit-exact
+/// (warmup dual-run byte compare); set `FLOCK_LEAF_VEC4=1` (exact string) for
+/// runner-matched A/B.
+pub const ENV_LEAF_VEC4: &str = "FLOCK_LEAF_VEC4";
+
+fn gpu_leaf_vec4_value_enabled(value: Option<&std::ffi::OsStr>) -> bool {
+    value == Some(std::ffi::OsStr::new("1"))
+}
+
+pub(crate) fn gpu_leaf_vec4_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        gpu_leaf_vec4_value_enabled(std::env::var_os(ENV_LEAF_VEC4).as_deref())
+    })
+}
+
+#[cfg(test)]
+mod leaf_vec4_gate_tests {
+    use std::ffi::OsStr;
+
+    #[test]
+    fn default_off_exact_one_opt_in() {
+        assert_eq!(super::ENV_LEAF_VEC4, "FLOCK_LEAF_VEC4");
+        assert!(super::gpu_leaf_vec4_value_enabled(Some(OsStr::new("1"))));
+        for value in [None, Some(""), Some("0"), Some("01"), Some("true")] {
+            assert!(!super::gpu_leaf_vec4_value_enabled(value.map(OsStr::new)));
+        }
+    }
+}
+
 #[cfg(test)]
 mod z_pin_gate_tests {
     use std::ffi::OsStr;
@@ -611,6 +802,115 @@ mod z_pin_gate_tests {
         assert!(!super::gpu_z_pin_value_enabled(Some(OsStr::new("1"))));
         for value in [None, Some(""), Some("0"), Some("01"), Some("true")] {
             assert!(super::gpu_z_pin_value_enabled(value.map(OsStr::new)));
+        }
+    }
+}
+
+/// Strict kill switch for the bounded yield-spin drains on the hybrid
+/// commit's GPU waits: the streamed per-band drain at finish entry and the
+/// cb2 deep-prefix join after the CPU suffix. Only exact value `1` restores
+/// the incumbent blocking `waitUntilCompleted` at both sites. The spin
+/// consumes the same completed command buffers in the same order with the
+/// same status check, and past its budget degrades to the exact blocking
+/// wait — proof bytes are untouched either way; the switch is purely the
+/// same-binary latency control.
+pub const ENV_NO_HYBRID_CB2_SPIN: &str = "FLOCK_NO_HYBRID_CB2_SPIN";
+
+fn hybrid_cb2_spin_value_enabled(value: Option<&std::ffi::OsStr>) -> bool {
+    value != Some(std::ffi::OsStr::new("1"))
+}
+
+#[cfg_attr(not(all(target_os = "macos", target_arch = "aarch64")), allow(dead_code))]
+fn hybrid_cb2_spin_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        hybrid_cb2_spin_value_enabled(std::env::var_os(ENV_NO_HYBRID_CB2_SPIN).as_deref())
+    })
+}
+
+#[cfg(test)]
+mod hybrid_cb2_spin_gate_tests {
+    use std::ffi::OsStr;
+
+    #[test]
+    fn exact_one_is_the_only_cb2_spin_kill_value() {
+        assert_eq!(super::ENV_NO_HYBRID_CB2_SPIN, "FLOCK_NO_HYBRID_CB2_SPIN");
+        assert!(!super::hybrid_cb2_spin_value_enabled(Some(OsStr::new("1"))));
+        for value in [None, Some(""), Some("0"), Some("01"), Some("true")] {
+            assert!(super::hybrid_cb2_spin_value_enabled(value.map(OsStr::new)));
+        }
+    }
+}
+
+/// Strict kill switch for the third ranked-tree pool slot: only exact
+/// value `1` restores the incumbent two-slot cap (see `give_tree`). The
+/// pool is reuse plumbing for the 64 MiB L0 tree allocation — cap choice
+/// changes only when pages are returned to the OS, never proof bytes.
+pub const ENV_NO_TREE_POOL3: &str = "FLOCK_NO_TREE_POOL3";
+
+#[cfg_attr(not(all(target_os = "macos", target_arch = "aarch64")), allow(dead_code))]
+fn tree_pool_cap_for(value: Option<&std::ffi::OsStr>) -> usize {
+    if value == Some(std::ffi::OsStr::new("1")) { 2 } else { 3 }
+}
+
+#[cfg(test)]
+mod tree_pool3_gate_tests {
+    use std::ffi::OsStr;
+
+    #[test]
+    fn exact_one_is_the_only_two_slot_value() {
+        assert_eq!(super::ENV_NO_TREE_POOL3, "FLOCK_NO_TREE_POOL3");
+        assert_eq!(super::tree_pool_cap_for(Some(OsStr::new("1"))), 2);
+        for value in [None, Some(""), Some("0"), Some("01"), Some("true")] {
+            assert_eq!(super::tree_pool_cap_for(value.map(OsStr::new)), 3);
+        }
+    }
+}
+
+/// Strict kill switch for the hybrid-k tuner's scoring statistic: only exact
+/// value `1` restores scoring each candidate by the tuner join's wall (max of
+/// the graph arm and the contention arm). Both warmup tuners keep their
+/// `rayon::join` against real (exact-AB replay) or synthetic (burn pile)
+/// round-1 contention — that contention is the measurement's whole point —
+/// but the contention arm is k-independent: whenever it outlasts the graph,
+/// the join wall carries zero information about k and injects the replay's
+/// own variance into a selection resolving near-ties at 1.5% margins. The
+/// graph arm's own wall is the strictly better statistic: where the graph is
+/// critical it equals the join; where it is not, it still ranks candidates.
+/// Warmup-only either way — selection quality changes, proof bytes never do.
+/// DEMOTED TO OPT-IN by ranked n=2 evidence (submissions 508ecb2e /
+/// 31338634; see the leaf-vec4 gate above for the full numbers): this is the
+/// only component of that stack that changes runner DECISIONS (per-worker
+/// hybrid-k selection) rather than deleting fixed work, making it the prime
+/// suspect for the consistent ~+0.28% p10 shift both draws showed. The
+/// arm-vs-join instrumentation stays (both walls print under
+/// `FLOCK_GPU_COMMIT_DEBUG`); set `FLOCK_TUNER_ARM_TIMING=1` (exact string)
+/// to score by the graph arm on runner-matched hardware.
+pub const ENV_TUNER_ARM_TIMING: &str = "FLOCK_TUNER_ARM_TIMING";
+
+#[cfg_attr(not(all(target_os = "macos", target_arch = "aarch64")), allow(dead_code))]
+fn tuner_arm_timing_value_enabled(value: Option<&std::ffi::OsStr>) -> bool {
+    value == Some(std::ffi::OsStr::new("1"))
+}
+
+#[cfg_attr(not(all(target_os = "macos", target_arch = "aarch64")), allow(dead_code))]
+fn tuner_arm_timing_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        tuner_arm_timing_value_enabled(std::env::var_os(ENV_TUNER_ARM_TIMING).as_deref())
+    })
+}
+
+#[cfg(test)]
+mod tuner_arm_timing_gate_tests {
+    use std::ffi::OsStr;
+
+    #[test]
+    fn default_off_exact_one_opt_in() {
+        assert_eq!(super::ENV_TUNER_ARM_TIMING, "FLOCK_TUNER_ARM_TIMING");
+        assert!(super::tuner_arm_timing_value_enabled(Some(OsStr::new("1"))));
+        for value in [None, Some(""), Some("0"), Some("01"), Some("true")] {
+            assert!(!super::tuner_arm_timing_value_enabled(value.map(OsStr::new)));
         }
     }
 }
@@ -2001,6 +2301,175 @@ kernel void parent_hash3(device const uint* children [[buffer(0)]],
 
 "#;
 
+    /// Vectorized-load Merkle tree kernels, compiled as a supplemental
+    /// library so the embedded incumbent metallib stays byte-for-byte intact
+    /// (editing `MSL_SOURCE` would trip its FNV staleness guard and force a
+    /// full runtime source compile in every process).
+    ///
+    /// `leaf_hash_v4`: one thread still hashes one 1 KiB leaf (16 BLAKE3
+    /// compressions), but reads it as 64 uint4 loads instead of 256 scalar
+    /// loads. Consecutive threads' leaves are 1 KiB apart, so every load
+    /// instruction in a 32-lane SIMD group touches 32 distinct cache lines
+    /// regardless of width — quartering the load-instruction count quarters
+    /// the outstanding-request pressure on the same resident data.
+    /// `parent_hash3_v4`: same conversion for the fused three-level parent
+    /// kernel's global 64 B child reads and CV writes; the intermediate
+    /// levels stay in threadgroup memory exactly as in the incumbent.
+    ///
+    /// Word order is preserved everywhere (uint4 lanes x,y,z,w are
+    /// consecutive device words; all bound offsets are 32 B-aligned, above
+    /// uint4's 16 B requirement), and `b3_compress` is copied verbatim from
+    /// `MSL_SOURCE`, so the emitted CVs are bit-identical by construction.
+    const LEAF_VEC4_MSL_SOURCE: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+constant uint B3_IV[8] = {
+    0x6A09E667u, 0xBB67AE85u, 0x3C6EF372u, 0xA54FF53Au,
+    0x510E527Fu, 0x9B05688Cu, 0x1F83D9ABu, 0x5BE0CD19u
+};
+constant uchar B3_PERM[16] = {2,6,3,10,7,0,4,13,1,11,12,5,9,14,15,8};
+
+#define B3_CHUNK_START 1u
+#define B3_CHUNK_END   2u
+#define B3_PARENT      4u
+
+static void b3_compress(thread uint* cv, thread const uint* m_in,
+                        uint block_len, uint flags) {
+    uint v[16];
+    uint m[16];
+    for (int i = 0; i < 8; i++) v[i] = cv[i];
+    for (int i = 0; i < 4; i++) v[8 + i] = B3_IV[i];
+    v[12] = 0u;         // counter lo (always 0 for our leaves/parents)
+    v[13] = 0u;         // counter hi
+    v[14] = block_len;
+    v[15] = flags;
+    for (int i = 0; i < 16; i++) m[i] = m_in[i];
+    for (int r = 0; r < 7; r++) {
+        #define G(a,b,c,d,x,y) \
+            v[a] = v[a] + v[b] + x; v[d] = ((v[d]^v[a])>>16)|((v[d]^v[a])<<16); \
+            v[c] = v[c] + v[d];     v[b] = ((v[b]^v[c])>>12)|((v[b]^v[c])<<20); \
+            v[a] = v[a] + v[b] + y; v[d] = ((v[d]^v[a])>>8) |((v[d]^v[a])<<24); \
+            v[c] = v[c] + v[d];     v[b] = ((v[b]^v[c])>>7) |((v[b]^v[c])<<25);
+        G(0,4,8,12,  m[0], m[1]);  G(1,5,9,13,  m[2], m[3]);
+        G(2,6,10,14, m[4], m[5]);  G(3,7,11,15, m[6], m[7]);
+        G(0,5,10,15, m[8], m[9]);  G(1,6,11,12, m[10],m[11]);
+        G(2,7,8,13,  m[12],m[13]); G(3,4,9,14,  m[14],m[15]);
+        #undef G
+        if (r < 6) {
+            uint t[16];
+            for (int i = 0; i < 16; i++) t[i] = m[B3_PERM[i]];
+            for (int i = 0; i < 16; i++) m[i] = t[i];
+        }
+    }
+    for (int i = 0; i < 8; i++) cv[i] = v[i] ^ v[8 + i];
+}
+
+// Unpack four uint4 device loads into one 16-word BLAKE3 block, preserving
+// device word order (lane j of vector q is device word 4q + j).
+static void b3_load_block4(device const uint4* src, thread uint* block) {
+    for (uint q = 0u; q < 4u; q++) {
+        const uint4 w = src[q];
+        block[q * 4u + 0u] = w.x;
+        block[q * 4u + 1u] = w.y;
+        block[q * 4u + 2u] = w.z;
+        block[q * 4u + 3u] = w.w;
+    }
+}
+
+kernel void leaf_hash_v4(device const uint4* codeword [[buffer(0)]],
+                         device uint4* out            [[buffer(1)]],
+                         uint id [[thread_position_in_grid]])
+{
+    device const uint4* leaf = codeword + id * 64u;   // 1024 bytes
+    uint cv[8];
+    for (int i = 0; i < 8; i++) cv[i] = B3_IV[i];
+    for (uint b = 0; b < 16u; b++) {
+        uint block[16];
+        b3_load_block4(leaf + b * 4u, block);
+        uint flags = (b == 0u ? B3_CHUNK_START : 0u) | (b == 15u ? B3_CHUNK_END : 0u);
+        b3_compress(cv, block, 64u, flags);
+    }
+    out[id * 2u + 0u] = uint4(cv[0], cv[1], cv[2], cv[3]);
+    out[id * 2u + 1u] = uint4(cv[4], cv[5], cv[6], cv[7]);
+}
+
+// Fused three-level parent pass, identical structure and dispatch geometry
+// to the incumbent `parent_hash3` (128-thread groups: 256 children in,
+// 128/64/32 parents out into their ordinary flat-tree levels); only the
+// global loads/stores and the threadgroup staging are widened to uint4.
+kernel void parent_hash3_v4(device const uint4* children [[buffer(0)]],
+                            device uint4* parents1      [[buffer(1)]],
+                            device uint4* parents2      [[buffer(2)]],
+                            device uint4* parents3      [[buffer(3)]],
+                            uint tgid [[threadgroup_position_in_grid]],
+                            uint lid [[thread_index_in_threadgroup]])
+{
+    threadgroup uint4 level1[128u * 2u];
+    threadgroup uint4 level2[64u * 2u];
+
+    // Level 1: all 128 threads consume one pair of global children (64 B).
+    {
+        const uint id = tgid * 128u + lid;
+        uint block[16];
+        b3_load_block4(children + id * 4u, block);
+        uint cv[8];
+        for (uint i = 0u; i < 8u; i++) cv[i] = B3_IV[i];
+        b3_compress(cv, block, 64u, B3_PARENT);
+        const uint4 lo = uint4(cv[0], cv[1], cv[2], cv[3]);
+        const uint4 hi = uint4(cv[4], cv[5], cv[6], cv[7]);
+        parents1[id * 2u + 0u] = lo;
+        parents1[id * 2u + 1u] = hi;
+        level1[lid * 2u + 0u] = lo;
+        level1[lid * 2u + 1u] = hi;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Level 2: exactly two complete SIMD groups consume level1 locally.
+    if (lid < 64u) {
+        uint4 w[4];
+        for (uint q = 0u; q < 4u; q++) w[q] = level1[(2u * lid) * 2u + q];
+        uint block[16];
+        for (uint q = 0u; q < 4u; q++) {
+            block[q * 4u + 0u] = w[q].x;
+            block[q * 4u + 1u] = w[q].y;
+            block[q * 4u + 2u] = w[q].z;
+            block[q * 4u + 3u] = w[q].w;
+        }
+        uint cv[8];
+        for (uint i = 0u; i < 8u; i++) cv[i] = B3_IV[i];
+        b3_compress(cv, block, 64u, B3_PARENT);
+        const uint id = tgid * 64u + lid;
+        const uint4 lo = uint4(cv[0], cv[1], cv[2], cv[3]);
+        const uint4 hi = uint4(cv[4], cv[5], cv[6], cv[7]);
+        parents2[id * 2u + 0u] = lo;
+        parents2[id * 2u + 1u] = hi;
+        level2[lid * 2u + 0u] = lo;
+        level2[lid * 2u + 1u] = hi;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Level 3: one complete SIMD group consumes level2 locally.
+    if (lid < 32u) {
+        uint4 w[4];
+        for (uint q = 0u; q < 4u; q++) w[q] = level2[(2u * lid) * 2u + q];
+        uint block[16];
+        for (uint q = 0u; q < 4u; q++) {
+            block[q * 4u + 0u] = w[q].x;
+            block[q * 4u + 1u] = w[q].y;
+            block[q * 4u + 2u] = w[q].z;
+            block[q * 4u + 3u] = w[q].w;
+        }
+        uint cv[8];
+        for (uint i = 0u; i < 8u; i++) cv[i] = B3_IV[i];
+        b3_compress(cv, block, 64u, B3_PARENT);
+        const uint id = tgid * 32u + lid;
+        parents3[id * 2u + 0u] = uint4(cv[0], cv[1], cv[2], cv[3]);
+        parents3[id * 2u + 1u] = uint4(cv[4], cv[5], cv[6], cv[7]);
+    }
+}
+"#;
+
     /// Source-only ranked from-z specialization. This deliberately does not
     /// reuse the rejected device-table preload design: every group constructs
     /// its own compact 11-table image directly from the existing raw twiddle
@@ -2402,6 +2871,13 @@ kernel void blake3_pow_scan(
         pub(crate) pso_leaf: Id,
         pub(crate) pso_parent: Id,
         pub(crate) pso_parent3: Id,
+        /// Vectorized (uint4) supplemental variants of `pso_leaf` /
+        /// `pso_parent3`. `NIL` unless `FLOCK_LEAF_VEC4=1` opts in (demoted
+        /// to opt-in; see `ENV_LEAF_VEC4`) or when their supplemental compile
+        /// failed — the Merkle encoders then keep the incumbent pipelines
+        /// (both emit bit-identical trees).
+        pub(crate) pso_leaf_v4: Id,
+        pub(crate) pso_parent3_v4: Id,
         /// Supplemental PCS Fiat--Shamir BLAKE3 nonce scanner.  Its single
         /// shared result word is protected because `Gpu` itself is global.
         pub(crate) pso_pow: Id,
@@ -2606,6 +3082,104 @@ kernel void blake3_pow_scan(
                         (NIL, NIL)
                     };
 
+                // Supplemental vectorized Merkle kernels (uint4 loads/stores),
+                // kept out of the embedded metallib so the incumbent library
+                // stays byte-for-byte intact. A compile/pipeline failure must
+                // not poison the already-valid GPU: the Merkle encoders see
+                // NIL and retain the incumbent scalar kernels, whose output
+                // is bit-identical.
+                let (pso_leaf_v4, pso_parent3_v4) = if super::gpu_leaf_vec4_enabled() {
+                    let t0 = std::time::Instant::now();
+                    let built = (|| -> Result<(Id, Id), String> {
+                        let src = api.nsstring(LEAF_VEC4_MSL_SOURCE)?;
+                        let mut err: Id = NIL;
+                        let library: Id = send!(
+                            api,
+                            unsafe extern "C" fn(Id, Sel, Id, Id, *mut Id) -> Id,
+                            device,
+                            c"newLibraryWithSource:options:error:",
+                            src,
+                            NIL,
+                            &mut err
+                        );
+                        if library.is_null() {
+                            return Err(format!(
+                                "leaf-vec4 shader compile failed: {}",
+                                api.error_string(err)
+                            ));
+                        }
+                        let build = |name: &str| -> Result<Id, String> {
+                            let ns = api.nsstring(name)?;
+                            let f: Id = send!(
+                                api,
+                                unsafe extern "C" fn(Id, Sel, Id) -> Id,
+                                library,
+                                c"newFunctionWithName:",
+                                ns
+                            );
+                            if f.is_null() {
+                                return Err(format!("leaf-vec4 kernel {name} not found"));
+                            }
+                            let mut pso_err: Id = NIL;
+                            let pso: Id = send!(
+                                api,
+                                unsafe extern "C" fn(Id, Sel, Id, *mut Id) -> Id,
+                                device,
+                                c"newComputePipelineStateWithFunction:error:",
+                                f,
+                                &mut pso_err
+                            );
+                            send!(api, unsafe extern "C" fn(Id, Sel) -> Id, f, c"release");
+                            if pso.is_null() {
+                                Err(format!(
+                                    "leaf-vec4 pipeline {name}: {}",
+                                    api.error_string(pso_err)
+                                ))
+                            } else {
+                                Ok(pso)
+                            }
+                        };
+                        let leaf = match build("leaf_hash_v4") {
+                            Ok(l) => l,
+                            Err(e) => {
+                                send!(api, unsafe extern "C" fn(Id, Sel) -> Id, library, c"release");
+                                return Err(e);
+                            }
+                        };
+                        let parent3 = match build("parent_hash3_v4") {
+                            Ok(p) => p,
+                            Err(e) => {
+                                send!(api, unsafe extern "C" fn(Id, Sel) -> Id, leaf, c"release");
+                                send!(api, unsafe extern "C" fn(Id, Sel) -> Id, library, c"release");
+                                return Err(e);
+                            }
+                        };
+                        send!(api, unsafe extern "C" fn(Id, Sel) -> Id, library, c"release");
+                        Ok((leaf, parent3))
+                    })();
+                    match built {
+                        Ok(pair) => {
+                            if debug_enabled() {
+                                eprintln!(
+                                    "[gpu-commit] leaf-vec4 supplemental compile: {:.1} ms",
+                                    t0.elapsed().as_secs_f64() * 1e3
+                                );
+                            }
+                            pair
+                        }
+                        Err(e) => {
+                            if debug_enabled() {
+                                eprintln!(
+                                    "[gpu-commit] leaf-vec4 unavailable ({e}); keeping incumbent kernels"
+                                );
+                            }
+                            (NIL, NIL)
+                        }
+                    }
+                } else {
+                    (NIL, NIL)
+                };
+
                 let (pso_pow, pow_out) = if super::gpu_grind_enabled() {
                     // This optimization is supplemental: a compile/pipeline/
                     // allocation failure must not poison the already-valid
@@ -2693,6 +3267,8 @@ kernel void blake3_pow_scan(
                     pso_leaf,
                     pso_parent,
                     pso_parent3,
+                    pso_leaf_v4,
+                    pso_parent3_v4,
                     pso_pow,
                     pow_out,
                     pow_lock: std::sync::Mutex::new(()),
@@ -3017,6 +3593,52 @@ kernel void blake3_pow_scan(
                         return self.wait_cb(cb);
                     }
                     std::hint::spin_loop();
+                }
+            }
+        }
+
+        /// Yield-based bounded status poll on an already-committed command
+        /// buffer, deadline form for draining several buffers under one
+        /// budget: the caller fixes a single deadline, so a drain of N
+        /// buffers pays at most one spin budget in total. `yield_now`
+        /// rather than `spin_loop` because the callers sit on rayon workers
+        /// inside the commit arm of the prove join — a sibling thread that
+        /// still has work must be able to take the core (same rationale as
+        /// the prover's deferred-stripe join poll). A completed buffer is
+        /// consumed by the first status poll at zero cost even past the
+        /// deadline; an in-flight one degrades to the exact blocking wait.
+        pub(crate) unsafe fn yield_wait_cb_until(
+            &self,
+            cb: Id,
+            deadline: std::time::Instant,
+        ) -> Result<(), String> {
+            unsafe {
+                loop {
+                    let status: u64 = send!(
+                        self.api,
+                        unsafe extern "C" fn(Id, Sel) -> u64,
+                        cb,
+                        c"status"
+                    );
+                    if status >= 4 {
+                        if status == 4 {
+                            return Ok(());
+                        }
+                        let err: Id = send!(
+                            self.api,
+                            unsafe extern "C" fn(Id, Sel) -> Id,
+                            cb,
+                            c"error"
+                        );
+                        return Err(format!(
+                            "command buffer status {status}: {}",
+                            self.api.error_string(err)
+                        ));
+                    }
+                    if std::time::Instant::now() >= deadline {
+                        return self.wait_cb(cb);
+                    }
+                    std::thread::yield_now();
                 }
             }
         }
@@ -3346,7 +3968,13 @@ kernel void blake3_pow_scan(
         debug_assert!(subtree_leaves.is_power_of_two());
         debug_assert_eq!(leaf_start % subtree_leaves, 0);
         unsafe {
-            gpu.set_pipeline(enc, gpu.pso_leaf);
+            // Vectorized-kernel swap: identical dispatch geometry and output
+            // bytes; NIL (kill switch / compile failure) keeps the incumbent.
+            let pso_leaf =
+                if gpu.pso_leaf_v4.is_null() { gpu.pso_leaf } else { gpu.pso_leaf_v4 };
+            let pso_parent3 =
+                if gpu.pso_parent3_v4.is_null() { gpu.pso_parent3 } else { gpu.pso_parent3_v4 };
+            gpu.set_pipeline(enc, pso_leaf);
             gpu.set_buffer(enc, codeword_buf, leaf_start * 1024, 0);
             gpu.set_buffer(enc, tree_buf, leaf_start * 32, 1);
             let tpg = 256u64.min(subtree_leaves as u64);
@@ -3361,7 +3989,7 @@ kernel void blake3_pow_scan(
             // ranges contain whole 256-child groups. Each output retains its
             // ordinary global flat-tree slot, so opening is unchanged.
             if parent3 {
-                gpu.set_pipeline(enc, gpu.pso_parent3);
+                gpu.set_pipeline(enc, pso_parent3);
                 while local_len >= 256 {
                     let level1_start = level_start + level_len;
                     let level1_len = level_len / 2;
@@ -3439,7 +4067,13 @@ kernel void blake3_pow_scan(
         parent3: bool,
     ) {
         unsafe {
-            gpu.set_pipeline(enc, gpu.pso_leaf);
+            // Vectorized-kernel swap: identical dispatch geometry and output
+            // bytes; NIL (kill switch / compile failure) keeps the incumbent.
+            let pso_leaf =
+                if gpu.pso_leaf_v4.is_null() { gpu.pso_leaf } else { gpu.pso_leaf_v4 };
+            let pso_parent3 =
+                if gpu.pso_parent3_v4.is_null() { gpu.pso_parent3 } else { gpu.pso_parent3_v4 };
+            gpu.set_pipeline(enc, pso_leaf);
             gpu.set_buffer(enc, codeword_buf, 0, 0);
             gpu.set_buffer(enc, tree_buf, 0, 1);
             let tpg = 256u64.min(n_leaves as u64);
@@ -3449,7 +4083,7 @@ kernel void blake3_pow_scan(
             let mut read_len = n_leaves;
 
             if parent3 {
-                gpu.set_pipeline(enc, gpu.pso_parent3);
+                gpu.set_pipeline(enc, pso_parent3);
                 while read_len >= 256 {
                     let write1_start = read_start + read_len;
                     let write1_len = read_len / 2;
@@ -3615,7 +4249,7 @@ kernel void blake3_pow_scan(
 
     /// (GPUStartTime, GPUEndTime) of a completed command buffer, in seconds
     /// of the shared Metal/host timebase (0.0 when unavailable). Trace-only.
-    unsafe fn cb_gpu_interval(gpu: &Gpu, cb: Id) -> (f64, f64) {
+    pub(crate) unsafe fn cb_gpu_interval(gpu: &Gpu, cb: Id) -> (f64, f64) {
         unsafe {
             let start: f64 = send!(
                 gpu.api,
@@ -3785,8 +4419,22 @@ kernel void blake3_pow_scan(
             let mut first_start = 0.0f64;
             let mut last_end = 0.0f64;
             let n_bands = self.pending.len();
+            // The streamed bands were committed behind CPU-side tile work
+            // and are usually all complete by the time finish drains them —
+            // yet each blocking wait still pays Metal's fixed park +
+            // completion-handler wake (~0.5 ms measured for this pattern on
+            // the grind spine). One shared deadline bounds the whole drain
+            // to a single spin budget; a band still in flight when it
+            // expires degrades to the exact blocking wait, and completed
+            // bands keep consuming at zero cost on the first status poll.
+            // Same buffers, same order, same status check either way.
+            let spin_deadline = super::hybrid_cb2_spin_enabled()
+                .then(|| std::time::Instant::now() + std::time::Duration::from_millis(4));
             for cb in self.pending.drain(..) {
-                let waited = unsafe { self.gpu.wait_cb(cb) };
+                let waited = match spin_deadline {
+                    Some(deadline) => unsafe { self.gpu.yield_wait_cb_until(cb, deadline) },
+                    None => unsafe { self.gpu.wait_cb(cb) },
+                };
                 if trace {
                     let (s, e) = unsafe { cb_gpu_interval(self.gpu, cb) };
                     if e > s {
@@ -3848,7 +4496,7 @@ kernel void blake3_pow_scan(
             return None;
         }
         let gpu = gpu().ok()?;
-        let mut latch = LATCH.lock().ok()?;
+        let mut latch = latch_lock();
         let LatchState::On(state) = &mut *latch else {
             // The first proof must still run the ordinary dual-path warmup.
             return None;
@@ -3915,19 +4563,54 @@ kernel void blake3_pow_scan(
     /// Ranked tree node count; only allocations this large are pooled.
     const RANKED_TREE_NODES: usize = (1 << 21) - 1;
 
+    /// Poison-tolerant pool acquisition: the pool's critical sections only
+    /// `push`/`swap_remove` a `Vec<Vec<Hash>>` (unwind-atomic), so a guard
+    /// recovered after a caught panic (seed-pipe speculation runs under
+    /// `catch_unwind`) cannot observe torn state — while `unwrap()` would
+    /// turn one caught panic into a dead worker at the next prove's
+    /// `give_tree`/`take_tree`.
+    fn tree_pool_lock() -> std::sync::MutexGuard<'static, Vec<Vec<Hash>>> {
+        TREE_POOL.lock().unwrap_or_else(|e| {
+            TREE_POOL.clear_poison();
+            note_poisoned_lock("tree-pool", true);
+            e.into_inner()
+        })
+    }
+
     pub(crate) fn give_tree(tree: Vec<Hash>) {
         if tree.capacity() < RANKED_TREE_NODES {
             return;
         }
-        let mut pool = TREE_POOL.lock().unwrap();
-        if pool.len() < 2 {
+        // Cap 3 (default): the untimed warmup parks two ranked trees here
+        // (the warmup GPU tree at latch decision plus the warmup
+        // `ProverData`'s CPU tree at its drop), so with a cap of 2 a
+        // latch-OFF timed prove's tree always overflows and munmaps 64 MiB
+        // inside the scored window (board: 6 of 8 processes). One timed
+        // prove per worker process ⇒ one extra slot absorbs it; the pages
+        // are returned at process exit, outside the window.
+        // `FLOCK_NO_TREE_POOL3=1` restores the incumbent cap of 2.
+        static CAP: OnceLock<usize> = OnceLock::new();
+        let cap = *CAP.get_or_init(|| {
+            super::tree_pool_cap_for(std::env::var_os(super::ENV_NO_TREE_POOL3).as_deref())
+        });
+        let mut pool = tree_pool_lock();
+        if pool.len() < cap {
             pool.push(tree);
+            return;
         }
+        drop(pool);
+        if debug_enabled() {
+            eprintln!(
+                "[gpu-commit] tree pool full; freeing {} MiB tree in-prove",
+                (tree.capacity() * core::mem::size_of::<Hash>()) >> 20
+            );
+        }
+        // `tree` drops (munmaps) here, outside the pool lock.
     }
 
     #[allow(clippy::uninit_vec)]
     fn take_tree(n: usize) -> Vec<Hash> {
-        let mut pool = TREE_POOL.lock().unwrap();
+        let mut pool = tree_pool_lock();
         for i in 0..pool.len() {
             if pool[i].capacity() >= n {
                 let mut v = pool.swap_remove(i);
@@ -3944,9 +4627,58 @@ kernel void blake3_pow_scan(
         crate::alloc_uninit_vec(n)
     }
 
+    #[cfg(test)]
+    mod tree_pool_poison_tests {
+        use super::*;
+
+        /// A panic on any thread while the pool guard is held must not
+        /// disable pooling (or worse, panic the next prove) for the rest
+        /// of the process: the critical sections are unwind-atomic, so
+        /// `tree_pool_lock` recovers the guard.
+        #[test]
+        fn pool_survives_poisoning_panic() {
+            let _ = std::thread::spawn(|| {
+                let _g = TREE_POOL.lock().unwrap();
+                panic!("poison TREE_POOL deliberately");
+            })
+            .join();
+            give_tree(Vec::with_capacity(RANKED_TREE_NODES));
+            let t = take_tree(RANKED_TREE_NODES);
+            assert_eq!(t.len(), RANKED_TREE_NODES);
+        }
+    }
+
     fn debug_enabled() -> bool {
         std::env::var_os("FLOCK_COMMIT_TIMING").is_some()
             || std::env::var_os("FLOCK_GPU_COMMIT_DEBUG").is_some()
+    }
+
+    /// Observability for poisoned process-global locks. The poisoning panic
+    /// itself is caught elsewhere (seed-pipe speculation runs under
+    /// `catch_unwind`); the score-relevant symptom — a GPU arm silently
+    /// degraded or recovered — must be visible under FLOCK_GPU_COMMIT_DEBUG.
+    fn note_poisoned_lock(tag: &str, recovered: bool) {
+        if std::env::var_os("FLOCK_GPU_COMMIT_DEBUG").is_some() {
+            eprintln!(
+                "[gpu-commit] {tag}: poisoned lock {}",
+                if recovered { "recovered" } else { "left disabled" }
+            );
+        }
+    }
+
+    /// Poison-tolerant LATCH acquisition. Every LATCH critical section
+    /// mutates the guarded state only via whole-enum assignment,
+    /// `mem::replace`, or `Vec::push` — all unwind-atomic — so a guard
+    /// recovered from a caught panic can never observe torn state. Treating
+    /// poison as fatal would instead turn one caught panic into either a
+    /// dead worker (the `unwrap` sites, reached by every subsequent commit)
+    /// or a silently disabled stream arm (the old `ok()?` site).
+    fn latch_lock() -> std::sync::MutexGuard<'static, LatchState> {
+        LATCH.lock().unwrap_or_else(|e| {
+            LATCH.clear_poison();
+            note_poisoned_lock("latch", true);
+            e.into_inner()
+        })
     }
 
     /// Parallel byte compare of a raw GPU buffer against a slice.
@@ -4402,7 +5134,23 @@ kernel void blake3_pow_scan(
                 // parents; the 15 nodes above it are recomputed here,
                 // covering every decomposition boundary for any k.
                 let t_wait_cb2 = window_trace_enabled().then(std::time::Instant::now);
-                gpu.wait_cb(cb2)?;
+                // The warmup tuner balances the split so the GPU prefix and
+                // the CPU suffix finish together: the residual wait here is
+                // typically sub-millisecond, which the blocking wait rounds
+                // up by the fixed park + completion-handler wake. Poll the
+                // status from this thread instead — yield, not spin: this
+                // is a rayon worker inside the commit arm of the prove
+                // join, and a sibling thread that still has work must be
+                // able to take the core (deferred-stripe join rationale).
+                // Past the budget it degrades to the exact blocking wait.
+                if super::hybrid_cb2_spin_enabled() {
+                    gpu.yield_wait_cb_until(
+                        cb2,
+                        std::time::Instant::now() + std::time::Duration::from_millis(4),
+                    )?;
+                } else {
+                    gpu.wait_cb(cb2)?;
+                }
                 if let Some(t) = t_wait_cb2 {
                     let (s, e) = cb_gpu_interval(gpu, cb2);
                     eprintln!(
@@ -4774,10 +5522,31 @@ kernel void blake3_pow_scan(
                     run_from_z_first_pass(c.gpu, c.z_buf, c.staging, c.tw_buf, log_d)?;
                 }
             }
+            // Join against the synthetic burn stays (the contention is the
+            // regime being probed), but the burn is a fixed k-independent
+            // work pile: when `FLOCK_TUNER_ARM_TIMING=1` opts in, score by
+            // the graph arm's own wall so a burn-critical join cannot flatten
+            // every candidate to the burn floor (`ENV_TUNER_ARM_TIMING` docs;
+            // default = incumbent join wall).
             let t0 = std::time::Instant::now();
-            let (r, ()) = rayon::join(|| timed_graph(k), burn_work);
+            let (graph, ()) = rayon::join(
+                || {
+                    let t_arm = std::time::Instant::now();
+                    (timed_graph(k), t_arm.elapsed().as_secs_f64() * 1e3)
+                },
+                burn_work,
+            );
+            let join_ms = t0.elapsed().as_secs_f64() * 1e3;
+            let (r, arm_ms) = graph;
             r?;
-            Ok((t0.elapsed().as_secs_f64() * 1e3 - first_pass_ms).max(0.0))
+            if dbg {
+                eprintln!(
+                    "[gpu-commit] autotune sample k={k}: \
+                     graph-arm {arm_ms:.1} ms join {join_ms:.1} ms"
+                );
+            }
+            let scored = if super::tuner_arm_timing_enabled() { arm_ms } else { join_ms };
+            Ok((scored - first_pass_ms).max(0.0))
         };
         const CANDIDATES: [usize; 8] = [0, 2, 3, 4, 5, 6, 7, 8];
         let mut best_ms = [f64::INFINITY; CANDIDATES.len()];
@@ -4892,7 +5661,7 @@ kernel void blake3_pow_scan(
         }
 
         let dbg = debug_enabled() || std::env::var_os("FLOCK_COMMIT_TIMING").is_some();
-        let latch = LATCH.lock().unwrap();
+        let latch = latch_lock();
         let LatchState::On(latched) = &*latch else {
             finish_ranked_exact_contention_tune(params, cpu_tree, 0);
             return;
@@ -4957,10 +5726,29 @@ kernel void blake3_pow_scan(
             }
         };
         let sample = |k: usize| -> Result<f64, String> {
+            // The join against the real AB replay stays: its core contention
+            // IS the regime being probed. But the replay arm is k-independent,
+            // so `FLOCK_TUNER_ARM_TIMING=1` opts into scoring by the graph
+            // arm's own wall (`ENV_TUNER_ARM_TIMING` docs) — the join wall is
+            // the default statistic and always printed for the debug delta.
             let t0 = std::time::Instant::now();
-            let (graph, ()) = rayon::join(|| timed_graph(k), || replay_ab());
-            graph?;
-            Ok(t0.elapsed().as_secs_f64() * 1e3)
+            let (graph, ()) = rayon::join(
+                || {
+                    let t_arm = std::time::Instant::now();
+                    (timed_graph(k), t_arm.elapsed().as_secs_f64() * 1e3)
+                },
+                || replay_ab(),
+            );
+            let join_ms = t0.elapsed().as_secs_f64() * 1e3;
+            let (r, arm_ms) = graph;
+            r?;
+            if dbg {
+                eprintln!(
+                    "[gpu-commit] broad exact-AB sample k={k}: \
+                     graph-arm {arm_ms:.1} ms join {join_ms:.1} ms"
+                );
+            }
+            Ok(if super::tuner_arm_timing_enabled() { arm_ms } else { join_ms })
         };
         let reprime = || unsafe {
             run_from_z_first_pass(
@@ -5212,26 +6000,31 @@ kernel void blake3_pow_scan(
     /// Cache key component tying entries to both the exact GPU source and
     /// selected from-z mode. Candidate and exact-rollback processes must not
     /// consume each other's latch or tuned split.
-    fn warmup_cache_msl_fnv_for(zero_root: bool) -> u64 {
-        let base = fnv1a64(MSL_SOURCE);
+    fn warmup_cache_msl_fnv_for(zero_root: bool, leaf_vec4: bool) -> u64 {
+        let mut key = fnv1a64(MSL_SOURCE);
         if zero_root {
-            base ^ fnv1a64(FROM_Z_ZERO_ROOT_MSL_SOURCE).rotate_left(1)
-                ^ 0x5A52_4F4F_545F_3131 // "ZROOT_11"
-        } else {
-            base
+            key ^= fnv1a64(FROM_Z_ZERO_ROOT_MSL_SOURCE).rotate_left(1)
+                ^ 0x5A52_4F4F_545F_3131; // "ZROOT_11"
         }
+        if leaf_vec4 {
+            key ^= fnv1a64(LEAF_VEC4_MSL_SOURCE).rotate_left(2) ^ 0x4C45_4146_5F56_3431; // "LEAF_V41"
+        }
+        key
     }
 
     fn warmup_cache_msl_fnv() -> u64 {
-        warmup_cache_msl_fnv_for(super::gpu_from_z_zero_root_selected(20))
+        warmup_cache_msl_fnv_for(
+            super::gpu_from_z_zero_root_selected(20),
+            super::gpu_leaf_vec4_enabled(),
+        )
     }
 
     #[cfg(test)]
     mod zero_root_cache_key_tests {
         #[test]
         fn supplemental_source_and_mode_have_a_distinct_fingerprint() {
-            let incumbent = super::warmup_cache_msl_fnv_for(false);
-            let candidate = super::warmup_cache_msl_fnv_for(true);
+            let incumbent = super::warmup_cache_msl_fnv_for(false, false);
+            let candidate = super::warmup_cache_msl_fnv_for(true, false);
             assert_eq!(incumbent, super::fnv1a64(super::MSL_SOURCE));
             assert_ne!(candidate, incumbent);
             assert_eq!(
@@ -5239,6 +6032,17 @@ kernel void blake3_pow_scan(
                 incumbent
                     ^ super::fnv1a64(super::FROM_Z_ZERO_ROOT_MSL_SOURCE).rotate_left(1)
                     ^ 0x5A52_4F4F_545F_3131
+            );
+            // The leaf-vec4 dimension is independent and non-degenerate:
+            // candidate and exact-rollback processes never share a latch.
+            let vec4 = super::warmup_cache_msl_fnv_for(false, true);
+            assert_ne!(vec4, incumbent);
+            assert_ne!(super::warmup_cache_msl_fnv_for(true, true), candidate);
+            assert_eq!(
+                vec4,
+                incumbent
+                    ^ super::fnv1a64(super::LEAF_VEC4_MSL_SOURCE).rotate_left(2)
+                    ^ 0x4C45_4146_5F56_3431
             );
         }
 
@@ -5897,7 +6701,7 @@ kernel void blake3_pow_scan(
             }
         });
 
-        let mut latch = LATCH.lock().unwrap();
+        let mut latch = latch_lock();
         let state_matches = matches!(
             &*latch,
             LatchState::On(state)
@@ -6061,7 +6865,7 @@ kernel void blake3_pow_scan(
     }
 
     pub(crate) fn gpu_commit_latched_on() -> bool {
-        matches!(*LATCH.lock().unwrap(), LatchState::On(_))
+        matches!(*latch_lock(), LatchState::On(_))
     }
 
     fn ensure_cpu_codeword(mut codeword: Vec<F128>, len: usize) -> Vec<F128> {
@@ -6086,7 +6890,7 @@ kernel void blake3_pow_scan(
             let tree = cpu(&mut codeword);
             return (CodewordBuf::Cpu(codeword), MerkleTreeBuf::Cpu(tree));
         }
-        let mut latch = LATCH.lock().unwrap();
+        let mut latch = latch_lock();
         match &*latch {
             LatchState::Off => {
                 drop(latch);
@@ -6114,10 +6918,15 @@ kernel void blake3_pow_scan(
         if gpu.pso_pow.is_null() || gpu.pow_out.is_null() {
             return Err("GPU grind pipeline unavailable".into());
         }
-        let _guard = gpu
-            .pow_lock
-            .lock()
-            .map_err(|_| "GPU grind result lock poisoned".to_string())?;
+        // Poison-tolerant: the guarded state is `()` (pure exclusion over
+        // `pow_out`), and the result slot is re-initialized below before
+        // every scan, so a recovered guard cannot observe torn state —
+        // while failing here would push every later grind onto the CPU.
+        let _guard = gpu.pow_lock.lock().unwrap_or_else(|e| {
+            gpu.pow_lock.clear_poison();
+            note_poisoned_lock("pow-lock", true);
+            e.into_inner()
+        });
         unsafe {
             let pool = gpu.pool_push();
             let result = (|| -> Result<Option<u64>, String> {
@@ -6716,6 +7525,113 @@ LC_KERNEL(lc_fold_stripes, 4)
             self.z_wraps.push((ptr, len, buf));
             Ok(buf)
         }
+    }
+
+    /// Lease on the fold arms' persistent shared-storage `eq_buf`, sized for
+    /// `len` 16-byte lanes. The producer builds its eq table directly into
+    /// this memory; the following `launch_fold_prefix` sees the source
+    /// pointer equal to the buffer contents and skips the upload memcpy
+    /// (4 MiB at the ranked shape, once per fold window on the timed spine).
+    /// CPU fold consumers read the same bytes through
+    /// [`FoldEqTable::as_slice`] — the table's location changes, its bytes
+    /// and layout do not.
+    pub(crate) struct FoldEqStage {
+        ptr: *mut F128,
+        len: usize,
+    }
+    // SAFETY: `ptr` names the contents of a shared-storage MTLBuffer held by
+    // the process-lifetime ZC_FOLD state. `ensure` is grow-only and a stage
+    // is minted for the exact size its window's launch re-ensures, so the
+    // buffer is never reallocated (hence never released) under a live stage;
+    // the two fold windows are serial (Fiat–Shamir order), so no second
+    // writer exists while one is live. GPU and CPU both only READ the bytes
+    // once the producer's build has completed.
+    unsafe impl Send for FoldEqStage {}
+    unsafe impl Sync for FoldEqStage {}
+
+    /// An eq table destined for a fold-arm launch: either the incumbent
+    /// owned Vec (uploaded by memcpy at launch) or built in place in the
+    /// arms' persistent upload buffer (launch skips the copy). Identical
+    /// bytes in the same LSB-first lane order either way.
+    pub(crate) enum FoldEqTable {
+        Owned(Vec<F128>),
+        Staged(FoldEqStage),
+    }
+
+    impl FoldEqTable {
+        pub(crate) fn as_slice(&self) -> &[F128] {
+            match self {
+                FoldEqTable::Owned(v) => v,
+                // SAFETY: see `FoldEqStage` — the backing buffer outlives
+                // the stage and nothing rewrites it while the stage is live.
+                FoldEqTable::Staged(s) => unsafe {
+                    std::slice::from_raw_parts(s.ptr.cast_const(), s.len)
+                },
+            }
+        }
+    }
+
+    /// Reserve `eq_buf` for `n_outer` lanes and expose its contents for an
+    /// in-place eq build. `None` (no Metal device, state-init failure, or
+    /// `FLOCK_NO_EQ_DIRECT=1`) keeps the producer on the incumbent
+    /// Vec-then-memcpy path. The ZC_FOLD guard is NOT held by the returned
+    /// stage; the single prove in flight owns the window between staging and
+    /// its launch, exactly as it owns the cached no-copy z wraps.
+    fn fold_eq_stage(n_outer: usize) -> Option<FoldEqStage> {
+        if !super::eq_direct_enabled() {
+            return None;
+        }
+        let gpu = gpu().ok()?;
+        // Same poison discipline as `launch_fold_prefix`: never reuse state
+        // a panic may have torn.
+        let mut guard = match ZC_FOLD.lock() {
+            Ok(g) => g,
+            Err(poisoned) => {
+                ZC_FOLD.clear_poison();
+                note_poisoned_lock("zc-fold", true);
+                let mut g = poisoned.into_inner();
+                *g = None;
+                g
+            }
+        };
+        if guard.is_none() {
+            *guard = Some(zc_fold_init(gpu));
+        }
+        let state = guard.as_mut()?.as_mut().ok()?;
+        unsafe {
+            let (mut eq_buf, mut eq_cap) = (state.eq_buf, state.eq_cap);
+            state.ensure(&mut eq_buf, &mut eq_cap, n_outer * 16).ok()?;
+            state.eq_buf = eq_buf;
+            state.eq_cap = eq_cap;
+            Some(FoldEqStage {
+                ptr: gpu.buffer_contents(state.eq_buf).cast::<F128>(),
+                len: n_outer,
+            })
+        }
+    }
+
+    /// Build eq(point, ·) for the zerocheck C-fold window — in place in the
+    /// arm's upload buffer when the arm and staging are both available.
+    pub(crate) fn zc_fold_eq_table(point: &[F128]) -> FoldEqTable {
+        fold_eq_table(super::gpu_zerocheck_enabled(), point)
+    }
+
+    /// Same for the lincheck gather-fold window.
+    pub(crate) fn lincheck_fold_eq_table(point: &[F128]) -> FoldEqTable {
+        fold_eq_table(super::gpu_lincheck_enabled(), point)
+    }
+
+    fn fold_eq_table(arm_enabled: bool, point: &[F128]) -> FoldEqTable {
+        if arm_enabled {
+            if let Some(stage) = fold_eq_stage(1usize << point.len()) {
+                // SAFETY: the stage covers exactly `1 << point.len()` lanes
+                // and no other reader exists until this build returns.
+                let out = unsafe { std::slice::from_raw_parts_mut(stage.ptr, stage.len) };
+                crate::lincheck::build_eq_table_into(point, out);
+                return FoldEqTable::Staged(stage);
+            }
+        }
+        FoldEqTable::Owned(crate::lincheck::build_eq_table(point))
     }
 
     /// Which window a submitted fold prefix belongs to. The two arms share
@@ -7380,6 +8296,10 @@ LC_KERNEL(lc_fold_stripes, 4)
         let mut guard = match ZC_FOLD.lock() {
             Ok(g) => g,
             Err(poisoned) => {
+                // Un-poison so later locks take the Ok arm instead of
+                // re-initializing the shader on every launch.
+                ZC_FOLD.clear_poison();
+                note_poisoned_lock("zc-fold", true);
                 let mut g = poisoned.into_inner();
                 *g = None;
                 g
@@ -7436,11 +8356,21 @@ LC_KERNEL(lc_fold_stripes, 4)
                     state.ensure(&mut out_buf, &mut out_cap, k * 16)?;
                     state.out_buf = out_buf;
                     state.out_cap = out_cap;
-                    std::ptr::copy_nonoverlapping(
-                        eq_outer.as_ptr().cast::<u8>(),
-                        gpu.buffer_contents(state.eq_buf),
-                        n_outer * 16,
-                    );
+                    // eq-direct (see `fold_eq_stage`): a staged table was
+                    // built in place in `eq_buf`, so src == dst and the
+                    // upload already happened at build time — an overlapping
+                    // copy_nonoverlapping would be UB, not a no-op. The
+                    // grow-only `ensure` above re-requests the exact size the
+                    // stage reserved, so it cannot have moved the buffer out
+                    // from under a staged pointer.
+                    let eq_dst = gpu.buffer_contents(state.eq_buf);
+                    if !std::ptr::eq(eq_outer.as_ptr().cast::<u8>(), eq_dst.cast_const()) {
+                        std::ptr::copy_nonoverlapping(
+                            eq_outer.as_ptr().cast::<u8>(),
+                            eq_dst,
+                            n_outer * 16,
+                        );
+                    }
                     let plan = ZcFoldPlan {
                         z_buf,
                         pso_fold,
@@ -7872,6 +8802,10 @@ kernel void rec_parent_hash(device const uint* children [[buffer(0)]],
         let mut guard = match REC_MERKLE.lock() {
             Ok(g) => g,
             Err(poisoned) => {
+                // Un-poison so later locks take the Ok arm instead of
+                // re-initializing the pipelines on every call.
+                REC_MERKLE.clear_poison();
+                note_poisoned_lock("rec-merkle", true);
                 let mut g = poisoned.into_inner();
                 *g = None;
                 g
@@ -8091,18 +9025,48 @@ static inline uint4 zc_r2_fold8(uint lo, uint hi, threadgroup const uint4* nib) 
     return acc;
 }
 
-struct ZcR2Params { uint lo_size; uint xpt; uint mask; uint useful; };
+struct ZcR2Params { uint lo_size; uint xpt; uint mask; uint useful; uint w_off; };
 
 // One threadgroup per hi-chunk (256 threads, xpt = lo_size/256 x_lo groups
 // per thread). Per pair: read both packed rows of a and b (one uint4 each,
 // fully coalesced), fold all four rows via the nibble tables, message
 // products via emulated clmul, eq_lo weight via a third clmul, 256-bit
 // unreduced accumulate. Threadgroup XOR-reduce, stopped one step short so the
-// even and odd x_lo halves stay apart; thread 0 reduces the four chunk
-// accumulators, weights by eq_hi[chunk], and writes four REDUCED partials
-// `[p1_even, pinf_even, p1_odd, pinf_odd]`. Slot0^slot2 and slot1^slot3 are
-// exactly the CPU's per-chunk `(eq_hi * p1, eq_hi * pinf)`; slots 2 and 3 are
-// its `eq_hi * out[2]` and `eq_hi * out[3]` round-three lookahead state.
+// even and odd x_lo halves stay apart; thread 0 reduces the chunk
+// accumulators, weights by eq_hi[chunk], and writes REDUCED partials at a
+// fixed stride of eight:
+// `[p1_even, pinf_even, p1_odd, pinf_odd, W0, W3, W4, W5]`. Slot0^slot2 and
+// slot1^slot3 are exactly the CPU's per-chunk `(eq_hi * p1, eq_hi * pinf)`;
+// slots 2 and 3 are its `eq_hi * out[2]` and `eq_hi * out[3]` round-three
+// lookahead state. Slots 4..8 (written only when `w_off != 0`) are the four
+// deferred round-three W-aggregates the CPU lookahead kernel otherwise
+// recomputes per offloaded chunk: with group y = x_lo/2 holding pairs
+// (2y, 2y+1) with rows (a0,a1,b0,b1)/(a2,a3,b2,b3) and the group weight
+// w = eq_lo[2y+1] (the odd lane — identical to the CPU's weight-sharing
+// reshape; the driver's single r1^-1 rescale happens on the aggregate),
+//   W0 = Σ w·a2·b2                W3 = Σ w·(a0+a2)(b0+b2)
+//   W4 = Σ w·(a1+a3)(b1+b3)       W5 = Σ w·(a0+a1+a2+a3)(b0+b1+b2+b3)
+// Lane parity == x_lo parity, so a pair's two lanes sit adjacent in one
+// SIMD-group: `simd_shuffle_xor(·, 1)` moves make the group values visible
+// to both lanes, and operand selection by parity splits the four products
+// two per thread with **no divergence** (even lane → W3, W5; odd lane →
+// W0, W4 — W0 needs only the odd lane's own rows). Padded pairs contribute
+// zero rows, which reproduces the CPU's padding algebra exactly (the group
+// weight stays eq_lo[2y+1] even when the odd pair is the padded one). Two
+// extra parity-split reductions then land [W3|W0] and [W5|W4] in
+// red[0]/red[1].
+//
+// Weight-shared scaling (armed mode only): instead of weighting each pair's
+// two reduced products by eq_lo (2 clmuls) and each W product by w
+// (2 more), the two a-rows are pre-scaled by w with 2 reduced clmuls and
+// every product then costs one unreduced clmul with no weighting pass —
+// exactly the CPU kernel's reshape — for 6 clmuls per thread instead of 8.
+// Both round-two parities land on the odd lane's weight; the odd sums are
+// exactly right (eq_lo[2y+1] = w), and thread 0 restores the even sums with
+// one reduced `κ = eq_lo[2y]/eq_lo[2y+1] = (1+r1)/r1` multiply per chunk
+// accumulator (buffer 7; a global constant of the eq table's first low
+// variable). Field-exact, so the reduced partials stay bit-identical to the
+// incumbent weighting.
 kernel void zc_r2_products(
     device const uint4* a_in  [[buffer(0)]],
     device const uint4* b_in  [[buffer(1)]],
@@ -8111,6 +9075,7 @@ kernel void zc_r2_products(
     device const uint4* nib_tab_dev [[buffer(4)]],
     device uint4*       partials    [[buffer(5)]],
     constant ZcR2Params& p          [[buffer(6)]],
+    constant uint4&      kap        [[buffer(7)]],
     uint tgid [[threadgroup_position_in_grid]],
     uint lid  [[thread_index_in_threadgroup]])
 {
@@ -8121,24 +9086,87 @@ kernel void zc_r2_products(
 
     ulong4 acc1 = ulong4(0ul);
     ulong4 acci = ulong4(0ul);
+    ulong4 accwa = ulong4(0ul);
+    ulong4 accwb = ulong4(0ul);
+    const bool w_on = p.w_off != 0u;
+    const bool odd = (lid & 1u) != 0u;
     for (uint k = 0u; k < p.xpt; k++) {
         uint x_lo = k * 256u + lid;
         uint pair_idx = tgid * p.lo_size + x_lo;
-        if ((pair_idx & p.mask) >= p.useful) { continue; }
-        uint4 ar = a_in[pair_idx];
-        uint4 br = b_in[pair_idx];
-        uint4 a0 = zc_r2_fold8(ar.x, ar.y, nib);
-        uint4 a1 = zc_r2_fold8(ar.z, ar.w, nib);
-        uint4 b0 = zc_r2_fold8(br.x, br.y, nib);
-        uint4 b1 = zc_r2_fold8(br.z, br.w, nib);
-
-        uint4 g1 = gf_reduce(clmul128(a1, b1));
-        uint4 gi = gf_reduce(clmul128(a0 ^ a1, b0 ^ b1));
+        bool pad = (pair_idx & p.mask) >= p.useful;
+        if (!w_on) {
+            // Incumbent protocol: padded pairs are skipped outright.
+            if (pad) { continue; }
+        } else if (simd_all(pad)) {
+            // Whole SIMD-group padded: nothing to fold, weight, or shuffle.
+            // The branch is simdgroup-uniform, so the shuffles below never
+            // observe an inactive partner lane.
+            continue;
+        }
+        // Padded pairs fold to zero rows (the nibble tables are F2-linear
+        // with T_j[0] = 0), matching the CPU's zeroed padded-pair algebra,
+        // but the loads, folds, and products are still skipped for them.
         uint4 e  = eq_lo[x_lo];
-        U256k m1 = clmul128(e, g1);
-        U256k mi = clmul128(e, gi);
-        acc1 ^= ulong4(m1.r0, m1.r1, m1.r2, m1.r3);
-        acci ^= ulong4(mi.r0, mi.r1, mi.r2, mi.r3);
+        uint4 a0 = uint4(0u), a1 = uint4(0u), b0 = uint4(0u), b1 = uint4(0u);
+        if (!w_on) {
+            // Incumbent weighting, untouched (`pad` is impossible here).
+            uint4 ar = a_in[pair_idx];
+            uint4 br = b_in[pair_idx];
+            a0 = zc_r2_fold8(ar.x, ar.y, nib);
+            a1 = zc_r2_fold8(ar.z, ar.w, nib);
+            b0 = zc_r2_fold8(br.x, br.y, nib);
+            b1 = zc_r2_fold8(br.z, br.w, nib);
+
+            uint4 g1 = gf_reduce(clmul128(a1, b1));
+            uint4 gi = gf_reduce(clmul128(a0 ^ a1, b0 ^ b1));
+            U256k m1 = clmul128(e, g1);
+            U256k mi = clmul128(e, gi);
+            acc1 ^= ulong4(m1.r0, m1.r1, m1.r2, m1.r3);
+            acci ^= ulong4(mi.r0, mi.r1, mi.r2, mi.r3);
+            continue;
+        }
+
+        // ---- armed mode: weight-shared scaling (see the kernel doc) ----
+        // Group weight w = the odd lane's eq_lo, on both lanes.
+        uint4 we = simd_shuffle_xor(e, 1);
+        uint4 wv = odd ? e : we;
+        uint4 aw0 = uint4(0u), aw1 = uint4(0u);
+        if (!pad) {
+            uint4 ar = a_in[pair_idx];
+            uint4 br = b_in[pair_idx];
+            a0 = zc_r2_fold8(ar.x, ar.y, nib);
+            a1 = zc_r2_fold8(ar.z, ar.w, nib);
+            b0 = zc_r2_fold8(br.x, br.y, nib);
+            b1 = zc_r2_fold8(br.z, br.w, nib);
+            aw0 = gf_reduce(clmul128(wv, a0));
+            aw1 = gf_reduce(clmul128(wv, a1));
+
+            // Round-two products on w-scaled rows: the odd-lane sums are
+            // already exact; thread 0 κ-restores the even ones per chunk.
+            U256k m1 = clmul128(aw1, b1);
+            U256k mi = clmul128(aw0 ^ aw1, b0 ^ b1);
+            acc1 ^= ulong4(m1.r0, m1.r1, m1.r2, m1.r3);
+            acci ^= ulong4(mi.r0, mi.r1, mi.r2, mi.r3);
+        }
+
+        // ---- deferred round-three W-aggregates (see the kernel doc) ----
+        // Group values via partner-lane shuffles; identical on both lanes
+        // (the partner scaled with the same w, so xa* are w-scaled XORs).
+        uint4 xa0 = aw0 ^ simd_shuffle_xor(aw0, 1);
+        uint4 xa1 = aw1 ^ simd_shuffle_xor(aw1, 1);
+        uint4 xb0 = b0 ^ simd_shuffle_xor(b0, 1);
+        uint4 xb1 = b1 ^ simd_shuffle_xor(b1, 1);
+        // Two products per thread, selected by parity (no divergence):
+        // even lane → (W3, W5); odd lane → (W0, W4). A padded odd pair has
+        // zero rows, so its W0 term vanishes exactly like the CPU's guard.
+        uint4 pa = odd ? aw0 : xa0;
+        uint4 pb = odd ? b0 : xb0;
+        uint4 qa = odd ? xa1 : (xa0 ^ xa1);
+        uint4 qb = odd ? xb1 : (xb0 ^ xb1);
+        U256k ta = clmul128(pa, pb);
+        U256k tb = clmul128(qa, qb);
+        accwa ^= ulong4(ta.r0, ta.r1, ta.r2, ta.r3);
+        accwb ^= ulong4(tb.r0, tb.r1, tb.r2, tb.r3);
     }
 
     // Parity-split reduce. `x_lo = k*256 + lid` and 256 is even, so a thread
@@ -8157,6 +9185,33 @@ kernel void zc_r2_products(
     }
     ulong4 chunk1e = red[0];
     ulong4 chunk1o = red[1];
+    // W-aggregate passes (armed only): the same parity-split reduce lands
+    // the even-lid sums in red[0] and the odd-lid ones in red[1], i.e.
+    // [W3 | W0] for accwa and [W5 | W4] for accwb. `p.w_off` comes from a
+    // constant buffer, so both branches are threadgroup-uniform and the
+    // barriers inside are legal.
+    ulong4 chunkwae = ulong4(0ul); ulong4 chunkwao = ulong4(0ul);
+    ulong4 chunkwbe = ulong4(0ul); ulong4 chunkwbo = ulong4(0ul);
+    if (w_on) {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        red[lid] = accwa;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint s = 128u; s > 1u; s >>= 1u) {
+            if (lid < s) { red[lid] ^= red[lid + s]; }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+        chunkwae = red[0];
+        chunkwao = red[1];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        red[lid] = accwb;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint s = 128u; s > 1u; s >>= 1u) {
+            if (lid < s) { red[lid] ^= red[lid + s]; }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+        chunkwbe = red[0];
+        chunkwbo = red[1];
+    }
     threadgroup_barrier(mem_flags::mem_threadgroup);
     red[lid] = acci;
     threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -8172,10 +9227,29 @@ kernel void zc_r2_products(
         U256k uie; uie.r0 = chunkie.x; uie.r1 = chunkie.y; uie.r2 = chunkie.z; uie.r3 = chunkie.w;
         U256k uio; uio.r0 = chunkio.x; uio.r1 = chunkio.y; uio.r2 = chunkio.z; uio.r3 = chunkio.w;
         uint4 e = eq_hi[tgid];
-        partials[tgid * 4u]      = gf_reduce(clmul128(e, gf_reduce(u1e)));
-        partials[tgid * 4u + 1u] = gf_reduce(clmul128(e, gf_reduce(uie)));
-        partials[tgid * 4u + 2u] = gf_reduce(clmul128(e, gf_reduce(u1o)));
-        partials[tgid * 4u + 3u] = gf_reduce(clmul128(e, gf_reduce(uio)));
+        // Armed mode accumulated the even parity on the odd lane's weight;
+        // one reduced κ multiply per accumulator restores `eq_lo[2y]`
+        // exactly (field arithmetic — bit-identical reduced partials).
+        uint4 p1e = gf_reduce(u1e);
+        uint4 pie = gf_reduce(uie);
+        if (w_on) {
+            p1e = gf_reduce(clmul128(kap, p1e));
+            pie = gf_reduce(clmul128(kap, pie));
+        }
+        partials[tgid * 8u]      = gf_reduce(clmul128(e, p1e));
+        partials[tgid * 8u + 1u] = gf_reduce(clmul128(e, pie));
+        partials[tgid * 8u + 2u] = gf_reduce(clmul128(e, gf_reduce(u1o)));
+        partials[tgid * 8u + 3u] = gf_reduce(clmul128(e, gf_reduce(uio)));
+        if (w_on) {
+            U256k uw0; uw0.r0 = chunkwao.x; uw0.r1 = chunkwao.y; uw0.r2 = chunkwao.z; uw0.r3 = chunkwao.w;
+            U256k uw3; uw3.r0 = chunkwae.x; uw3.r1 = chunkwae.y; uw3.r2 = chunkwae.z; uw3.r3 = chunkwae.w;
+            U256k uw4; uw4.r0 = chunkwbo.x; uw4.r1 = chunkwbo.y; uw4.r2 = chunkwbo.z; uw4.r3 = chunkwbo.w;
+            U256k uw5; uw5.r0 = chunkwbe.x; uw5.r1 = chunkwbe.y; uw5.r2 = chunkwbe.z; uw5.r3 = chunkwbe.w;
+            partials[tgid * 8u + 4u] = gf_reduce(clmul128(e, gf_reduce(uw0)));
+            partials[tgid * 8u + 5u] = gf_reduce(clmul128(e, gf_reduce(uw3)));
+            partials[tgid * 8u + 6u] = gf_reduce(clmul128(e, gf_reduce(uw4)));
+            partials[tgid * 8u + 7u] = gf_reduce(clmul128(e, gf_reduce(uw5)));
+        }
     }
 }
 "#;
@@ -8208,12 +9282,20 @@ kernel void zc_r2_products(
         std::sync::atomic::AtomicUsize::new(usize::MAX);
     static ZC_R2_POISONED: std::sync::atomic::AtomicBool =
         std::sync::atomic::AtomicBool::new(false);
+    /// f64 bits of the EMA of timed-prove measured ratios (u_gpu over the
+    /// full-chunk-equivalent u_cpu); 0 = no timed sample yet. Written only
+    /// from the drain of a timed prove (one writer at a time — proves are
+    /// serialized through the sweep), so relaxed atomics suffice; see the
+    /// re-convergence block in [`zc_r2_wait`].
+    static ZC_R2_RATIO_EMA: std::sync::atomic::AtomicU64 =
+        std::sync::atomic::AtomicU64::new(0);
 
     #[cfg(test)]
     pub(crate) fn zc_r2_test_reset() {
         use std::sync::atomic::Ordering;
         ZC_R2_TUNED.store(usize::MAX, Ordering::Relaxed);
         ZC_R2_POISONED.store(false, Ordering::Relaxed);
+        ZC_R2_RATIO_EMA.store(0, Ordering::Relaxed);
     }
 
     #[cfg(test)]
@@ -8275,11 +9357,64 @@ kernel void zc_r2_products(
     /// suspected cause of admission failing on a majority of ranked worker
     /// processes while every admitted process posts record p10s). Ratio ≥ 8
     /// or unusable ⇒ 0 = exact incumbent.
+    ///
+    /// **W-offload retune** (`FLOCK_NO_ZC_R2_RETUNE`): the 0.55 figure priced
+    /// the anchors-only tier against the *pre-lookahead* fused chunk. The
+    /// lookahead sweep's fused chunk is ~1.6× dearer (38 vs 12 PMULL-class
+    /// ops per group), so with the W-offload armed — offloaded chunks
+    /// genuinely anchors-only again — the interleaved min-of-15 kernel probe
+    /// (`zc_r2_offload_tier_residual_probe`, kernels/aarch64.rs) measures the
+    /// residual at **0.340×** the fused lookahead chunk (and 0.55/1.6 ≈ 0.34
+    /// reproduces the shipped figure exactly — two instruments, one number).
+    /// The same probe prices the non-W offloaded tier (odd products on GPU,
+    /// 32 of 38 PMULL retained) at 0.852; that tier and the retune kill
+    /// switch keep the shipped 0.55 rather than adopt 0.852 so the OFF state
+    /// is the exact incumbent gate (the plain non-lookahead sweep also keeps
+    /// 0.55 through the `w_off=false` key — its fused denominator is the
+    /// cheap kernel the 0.55 was measured against). A lower α only ever
+    /// *shrinks* the solved share (`hi/(ratio + 1-α)`), so mispricing in
+    /// this direction can cost CPU-side balance but can never push the GPU
+    /// toward being the timed straggler.
+    ///
+    /// **The cap deliberately stays 15·hi/16 at both clamp sites.** At cap
+    /// fraction `f` the GPU becomes the timed straggler once the true ratio
+    /// exceeds `1/f − (1−α)`; that is also exactly the calibrated ratio
+    /// below which the cap binds. Corrected for α = 0.34: `16/15 − 0.66 =
+    /// 0.407` (a 31/32 cap would lower it to `32/31 − 0.66 = 0.372`). The
+    /// armed kernel's extra W products raised u_gpu ~1.48× (timed prefix
+    /// 208.6 ms vs 141.3 ms at 1920 chunks locally), which lifts the ranked
+    /// ratio estimate from the measured 0.57 to ~0.84 — far above 0.407, so
+    /// post-offload the *balance point* (~2048/1.50 ≈ 1365), not the cap, is
+    /// what binds at ranked, and raising the cap buys nothing while widening
+    /// the cold-calibration overshoot window (locally observed post-offload:
+    /// share 1118 published from a cold ratio of 1.38, then the timed prove
+    /// measured ~3.9 and the GPU straggled 98 ms past a 45 ms CPU sweep).
     const ZC_R2_ALPHA: f64 = 0.55;
+    /// Measured anchors-only residual under the armed W-offload (see above).
+    const ZC_R2_ALPHA_ANCHORS: f64 = 0.34;
     const ZC_R2_MAX_RATIO: f64 = 2.0;
     const ZC_R2_FLOOR_MAX_RATIO: f64 = 8.0;
 
-    pub(crate) fn zc_r2_gate_share(ratio: f64, hi_size: usize) -> usize {
+    /// Residual pricing key: the W-offload tier leaves offloaded chunks
+    /// anchors-only (α = 0.34); every other tier — and the retune kill
+    /// switch — keeps the shipped 0.55.
+    fn zc_r2_alpha(w_off: bool) -> f64 {
+        if w_off && super::zc_r2_retune_enabled() {
+            ZC_R2_ALPHA_ANCHORS
+        } else {
+            ZC_R2_ALPHA
+        }
+    }
+
+    pub(crate) fn zc_r2_gate_share(ratio: f64, hi_size: usize, w_off: bool) -> usize {
+        zc_r2_gate_share_with_alpha(ratio, hi_size, zc_r2_alpha(w_off))
+    }
+
+    pub(crate) fn zc_r2_gate_share_with_alpha(
+        ratio: f64,
+        hi_size: usize,
+        alpha: f64,
+    ) -> usize {
         if !ratio.is_finite() || ratio <= 0.0 {
             return 0;
         }
@@ -8289,8 +9424,51 @@ kernel void zc_r2_products(
             }
             return 0;
         }
-        let g = (hi_size as f64 / (ratio + (1.0 - ZC_R2_ALPHA))).round();
+        let g = (hi_size as f64 / (ratio + (1.0 - alpha))).round();
         (g as usize).min(hi_size * 15 / 16)
+    }
+
+    /// One bounded re-convergence step (`FLOCK_NO_ZC_R2_RECONVERGE`): given
+    /// the published share, the share the timed-ratio EMA implies, and
+    /// whether THIS prove's GPU straggled past the CPU sweep, return the
+    /// next share to publish, or `None` to leave it alone. Policy, each rule
+    /// tied to an observed signal:
+    /// - Hysteresis band and step size are both `hi/32` (64 chunks at the
+    ///   ranked 2048): the adjuster must never oscillate on noise, and the
+    ///   ranked worker runs exactly ONE timed prove after warmup, so the
+    ///   whole runner-side effect is bounded to correcting a badly-cold
+    ///   calibration by a single step — p10 insurance, not a controller
+    ///   (local cold-vs-timed u_cpu disperses ~2.5×across processes).
+    /// - Up-steps additionally require the current prove to have NOT
+    ///   straggled (submit-to-drain ≤ 1.02× the CPU sweep): post-W-offload
+    ///   the GPU straggles for real on cold-overshot shares (observed
+    ///   locally: drain 143 ms vs 45 ms sweep at share 1118), so "the EMA
+    ///   says grow" is only trusted when the direct signal agrees.
+    /// - A straggling prove steps DOWN even when the EMA is still inside
+    ///   the band — shedding `hi/32` of GPU work is bounded CPU cost, while
+    ///   a straggling GPU is an unbounded round-wall loss.
+    /// - Clamped to the gate's own floor (`hi/8`, the oracle-admitted
+    ///   minimum) and cap (`15·hi/16`), so the adjuster can never publish a
+    ///   share the calibration gate itself could not have.
+    pub(crate) fn zc_r2_reconverge_step(
+        published: usize,
+        implied: usize,
+        straggled: bool,
+        hi_size: usize,
+    ) -> Option<usize> {
+        let band = hi_size / 32;
+        if band == 0 {
+            return None;
+        }
+        let stepped = if !straggled && implied >= published + band {
+            published + band
+        } else if implied + band <= published || straggled {
+            published.saturating_sub(band)
+        } else {
+            return None;
+        };
+        let stepped = stepped.clamp(hi_size / 8, hi_size * 15 / 16);
+        (stepped != published).then_some(stepped)
     }
 
     fn zc_r2_init(gpu: &'static Gpu) -> Result<ZcR2, String> {
@@ -8386,6 +9564,16 @@ kernel void zc_r2_products(
         lo_size: usize,
         mask: u32,
         useful: u32,
+        /// Kernel computed the four lookahead W-aggregates (slots 4..8 of
+        /// the stride-8 partials) for this job. Requires both
+        /// `super::zc_r2_w_offload_enabled()` and a caller-supplied κ at
+        /// launch; the CPU sweep keys its anchors-only tier and the drain
+        /// its slot adoption off this same bit so the two sides can never
+        /// disagree.
+        w_off: bool,
+        /// `(1 + r1) / r1` for the armed mode's even-parity restore (zero
+        /// when unarmed; only re-bound for calibration replays).
+        kappa: F128,
         submitted: std::time::Instant,
     }
 
@@ -8404,6 +9592,12 @@ kernel void zc_r2_products(
         pub(crate) fn is_calibration(&self) -> bool {
             self.calibration
         }
+
+        /// Whether this job's kernel also returned the four lookahead
+        /// W-aggregates (see [`super::ENV_ZC_R2_W_OFFLOAD`]).
+        pub(crate) fn w_offload(&self) -> bool {
+            self.w_off
+        }
     }
 
     /// Result of draining the round-two products arm.
@@ -8412,13 +9606,18 @@ kernel void zc_r2_products(
         /// discarded); the caller's CPU partials are authoritative.
         Calibrated,
         /// Timed-prove prefix partials, bit-exact per chunk, parity-split as
-        /// `[p1_even, pinf_even, p1_odd, pinf_odd]` (all eq_hi-weighted).
-        Prefix(Vec<[F128; 4]>),
+        /// `[p1_even, pinf_even, p1_odd, pinf_odd, W0, W3, W4, W5]` (all
+        /// eq_hi-weighted). Slots 4..8 are the deferred round-three
+        /// W-aggregates and are only valid when the job was launched with
+        /// the W-offload armed ([`ZcR2Job::w_offload`]); otherwise they are
+        /// stale buffer bytes the caller must not read.
+        Prefix(Vec<[F128; 8]>),
         /// Metal failed after admission; the caller must CPU-redo the
         /// prefix products. The arm is poisoned for the process.
         Failed,
     }
 
+    #[allow(clippy::too_many_arguments)]
     unsafe fn zc_r2_submit(
         gpu: &Gpu,
         state: &ZcR2,
@@ -8428,6 +9627,8 @@ kernel void zc_r2_products(
         lo_size: usize,
         mask: u32,
         useful: u32,
+        w_off: bool,
+        kappa: F128,
     ) -> Result<Id, String> {
         unsafe {
             #[repr(C)]
@@ -8436,12 +9637,14 @@ kernel void zc_r2_products(
                 xpt: u32,
                 mask: u32,
                 useful: u32,
+                w_off: u32,
             }
             let params = P {
                 lo_size: lo_size as u32,
                 xpt: (lo_size / 256) as u32,
                 mask,
                 useful,
+                w_off: u32::from(w_off),
             };
             let pb = std::slice::from_raw_parts(
                 (&raw const params).cast::<u8>(),
@@ -8457,6 +9660,13 @@ kernel void zc_r2_products(
             gpu.set_buffer(enc, state.nib_buf, 0, 4);
             gpu.set_buffer(enc, state.part_buf, 0, 5);
             gpu.set_bytes(enc, pb, 6);
+            // κ for the armed mode's even-parity restore (bound always so
+            // the pipeline's argument table is complete either way).
+            let kb = std::slice::from_raw_parts(
+                (&raw const kappa).cast::<u8>(),
+                core::mem::size_of::<F128>(),
+            );
+            gpu.set_bytes(enc, kb, 7);
             gpu.dispatch(enc, chunks as u64, 256);
             gpu.end_encoding(enc);
             let cb = gpu.retain(cb);
@@ -8494,6 +9704,7 @@ kernel void zc_r2_products(
         hi_size: usize,
         pair_in_block_mask: usize,
         useful_pairs_inclusive: usize,
+        kappa: Option<F128>,
     ) -> Option<ZcR2Job> {
         use std::sync::atomic::Ordering;
         if !super::gpu_zc_r2_enabled() || ZC_R2_POISONED.load(Ordering::Relaxed) {
@@ -8531,7 +9742,18 @@ kernel void zc_r2_products(
         }
         let gpu = gpu().ok()?;
         let state_mutex = zc_r2_state()?;
-        let mut state = state_mutex.lock().ok()?;
+        // Deliberately NOT poison-tolerant: the grow sequences below
+        // (release -> new_buffer -> cap update) are not unwind-atomic, so a
+        // guard recovered after a caught panic could observe a released
+        // buffer behind a stale cap. Declining keeps the incumbent
+        // fail-safe (arm off for the process) but makes it observable.
+        let mut state = match state_mutex.lock() {
+            Ok(s) => s,
+            Err(_) => {
+                note_poisoned_lock("zc-r2 launch", false);
+                return None;
+            }
+        };
         unsafe {
             // Nibble decomposition of the 32 KiB byte table (per prove; the
             // table depends on the round challenge z).
@@ -8569,9 +9791,12 @@ kernel void zc_r2_products(
                 gpu.buffer_contents(state.eq_hi_buf),
                 need_hi,
             );
-            // Four F128 per chunk: the parity-split
-            // `[p1_even, pinf_even, p1_odd, pinf_odd]`.
-            let need_part = hi_size * 64;
+            // Eight F128 per chunk at a fixed stride: the parity-split
+            // `[p1_even, pinf_even, p1_odd, pinf_odd]` plus the lookahead
+            // `[W0, W3, W4, W5]` (slots 4..8 only written when the
+            // W-offload is armed; the stride stays 8 either way so the
+            // drain never depends on the flag for its layout).
+            let need_part = hi_size * 128;
             if state.part_cap < need_part {
                 if state.part_cap > 0 {
                     gpu.release(state.part_buf);
@@ -8581,6 +9806,11 @@ kernel void zc_r2_products(
             }
             let a_buf = zc_r2_wrap(&mut state, gpu, a_packed).ok()?;
             let b_buf = zc_r2_wrap(&mut state, gpu, b_packed).ok()?;
+            // The armed mode needs κ for its even-parity restore, so a
+            // caller that cannot supply one (r1 = 0) keeps the incumbent
+            // four-partial protocol for this job.
+            let w_off = super::zc_r2_w_offload_enabled() && kappa.is_some();
+            let kappa = kappa.unwrap_or(F128::ZERO);
             let cb = zc_r2_submit(
                 gpu,
                 &state,
@@ -8590,6 +9820,8 @@ kernel void zc_r2_products(
                 lo_size,
                 pair_in_block_mask as u32,
                 useful_pairs_inclusive as u32,
+                w_off,
+                kappa,
             )
             .ok()?;
             Some(ZcR2Job {
@@ -8599,6 +9831,8 @@ kernel void zc_r2_products(
                 lo_size,
                 mask: pair_in_block_mask as u32,
                 useful: useful_pairs_inclusive as u32,
+                w_off,
+                kappa,
                 submitted: std::time::Instant::now(),
             })
         }
@@ -8609,7 +9843,11 @@ kernel void zc_r2_products(
     /// CPU sweep that produced it (per-chunk cost denominator).
     /// `cpu_la` carries the CPU's six per-chunk round-three lookahead
     /// aggregates; slots 0 and 1 are the odd-parity round-two products, so
-    /// the oracle can check the parity split and not merely its sum.
+    /// the oracle can check the parity split and not merely its sum. Slots
+    /// 2..6 are the CPU's eq_hi-weighted `[W0, W3, W4, W5]`, byte-compared
+    /// against the kernel's slots 4..8 whenever the job ran with the
+    /// W-offload armed — a kernel wrong in any W-sum is refused admission
+    /// exactly like a wrong parity split.
     pub(crate) fn zc_r2_wait(
         job: ZcR2Job,
         cpu_partials: Option<&[(F128, F128)]>,
@@ -8644,27 +9882,74 @@ kernel void zc_r2_products(
             };
             let state = match state_mutex.lock() {
                 Ok(s) => s,
-                Err(_) => return poison(job.cb),
+                Err(_) => {
+                    // The launching section is not unwind-atomic (see the
+                    // zc-r2 launch note): in-flight state may be torn, so
+                    // fail the job — the caller CPU-redoes the prefix.
+                    note_poisoned_lock("zc-r2 wait", false);
+                    return poison(job.cb);
+                }
             };
             let parts = gpu.buffer_contents(state.part_buf).cast::<F128>();
-            let mut out: Vec<[F128; 4]> = Vec::with_capacity(job.chunks);
+            let mut out: Vec<[F128; 8]> = Vec::with_capacity(job.chunks);
             for c in 0..job.chunks {
-                out.push([
-                    *parts.add(c * 4),
-                    *parts.add(c * 4 + 1),
-                    *parts.add(c * 4 + 2),
-                    *parts.add(c * 4 + 3),
-                ]);
+                out.push(std::array::from_fn(|i| *parts.add(c * 8 + i)));
             }
             if !job.calibration {
                 gpu.release(job.cb);
+                let s2d_ms = job.submitted.elapsed().as_secs_f64() * 1e3;
+                // Bounded re-convergence (`FLOCK_NO_ZC_R2_RECONVERGE`): the
+                // share is published ONCE from the cold warmup calibration,
+                // but this drain already holds a far better-conditioned
+                // sample — the timed GPU wall over `chunks` and the timed
+                // CPU sweep over `(hi-g) + α·g` full-chunk equivalents, both
+                // measured hot and under the round's real contention. Feed
+                // an EMA (λ=½: with one timed prove per ranked worker the
+                // first sample must carry weight) and let
+                // `zc_r2_reconverge_step` move the published share by at
+                // most hi/32 inside the gate's own floor/cap. Skipped when
+                // the ratio is pinned (`FLOCK_ZC_R2_GPU_FORCE_RATIO` is an
+                // experiment control, not a signal source) and on degenerate
+                // walls (the oracle tests drain with cpu_wall_ms = 0).
+                if super::zc_r2_reconverge_enabled()
+                    && zc_r2_forced_ratio().is_none()
+                    && first_wall > 0.0
+                    && cpu_wall_ms > 0.0
+                    && job.chunks < hi_size
+                {
+                    let alpha = zc_r2_alpha(job.w_off);
+                    let full_equiv =
+                        (hi_size - job.chunks) as f64 + alpha * job.chunks as f64;
+                    let ratio =
+                        (first_wall / job.chunks as f64) / (cpu_wall_ms / full_equiv);
+                    if ratio.is_finite() && ratio > 0.0 {
+                        let prev = f64::from_bits(ZC_R2_RATIO_EMA.load(Ordering::Relaxed));
+                        let ema = if prev > 0.0 { 0.5 * (prev + ratio) } else { ratio };
+                        ZC_R2_RATIO_EMA.store(ema.to_bits(), Ordering::Relaxed);
+                        let published = ZC_R2_TUNED.load(Ordering::Relaxed);
+                        if published != 0 && published != usize::MAX {
+                            let implied = zc_r2_gate_share(ema, hi_size, job.w_off);
+                            let straggled = s2d_ms > 1.02 * cpu_wall_ms;
+                            if let Some(next) =
+                                zc_r2_reconverge_step(published, implied, straggled, hi_size)
+                            {
+                                ZC_R2_TUNED.store(next, Ordering::Relaxed);
+                                if super::gpu_zc_r2_debug() {
+                                    eprintln!(
+                                        "[zc-r2] reconverge ratio={ratio:.3} ema={ema:.3} \
+                                         implied {implied}/{hi_size} straggled={straggled}: \
+                                         share {published} -> {next}"
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
                 if super::gpu_zc_r2_debug() {
                     eprintln!(
                         "[zc-r2] timed prefix {}/{} chunks: gpu={first_wall:.2}ms \
-                         cpu-sweep={cpu_wall_ms:.2}ms submit-to-drain={:.2}ms",
-                        job.chunks,
-                        hi_size,
-                        job.submitted.elapsed().as_secs_f64() * 1e3,
+                         cpu-sweep={cpu_wall_ms:.2}ms submit-to-drain={s2d_ms:.2}ms",
+                        job.chunks, hi_size,
                     );
                 }
                 return ZcR2Result::Prefix(out);
@@ -8685,14 +9970,26 @@ kernel void zc_r2_products(
                 let split_ok = cpu_la.is_none_or(|la| {
                     la[c][0] == out[c][2] && la[c][1] == out[c][3]
                 });
-                if summed != cpu_all[c] || !split_ok {
+                // W-offload admission: all four returned lookahead
+                // aggregates must equal the CPU's own eq_hi-weighted
+                // `[W0, W3, W4, W5]` bit-for-bit on the probe range, so a
+                // kernel wrong only in W can never be admitted (fallback is
+                // the incumbent path, same as a wrong parity split).
+                let w_ok = !job.w_off
+                    || cpu_la.is_none_or(|la| {
+                        la[c][2] == out[c][4]
+                            && la[c][3] == out[c][5]
+                            && la[c][4] == out[c][6]
+                            && la[c][5] == out[c][7]
+                    });
+                if summed != cpu_all[c] || !split_ok || !w_ok {
                     if super::gpu_zc_r2_debug() {
                         eprintln!(
                             "[zc-r2] CALIBRATION MISMATCH at chunk {c}: gpu={:?} \
-                             gpu_summed={summed:?} cpu={:?} cpu_la_odd={:?} — poisoned",
+                             gpu_summed={summed:?} cpu={:?} cpu_la={:?} — poisoned",
                             out[c],
                             cpu_all[c],
-                            cpu_la.map(|la| (la[c][0], la[c][1])),
+                            cpu_la.map(|la| la[c]),
                         );
                     }
                     return poison(job.cb);
@@ -8713,7 +10010,8 @@ kernel void zc_r2_products(
             {
                 while n_walls < walls.len() {
                     let Ok(cb2) = zc_r2_submit(
-                        gpu, &state, a_buf, b_buf, job.chunks, job.lo_size, job.mask, job.useful,
+                        gpu, &state, a_buf, b_buf, job.chunks, job.lo_size, job.mask,
+                        job.useful, job.w_off, job.kappa,
                     ) else {
                         break;
                     };
@@ -8745,7 +10043,10 @@ kernel void zc_r2_products(
             let share = if u_cpu.is_finite() && u_cpu > 0.0 && u_gpu.is_finite() {
                 let measured = u_gpu / u_cpu;
                 let ratio = zc_r2_forced_ratio().unwrap_or(measured);
-                let g = zc_r2_gate_share(ratio, hi_size);
+                // Priced with the job's own tier key: a W-offload-armed
+                // calibration prices offloaded chunks anchors-only (0.34),
+                // anything else keeps the shipped 0.55 (see `zc_r2_alpha`).
+                let g = zc_r2_gate_share(ratio, hi_size, job.w_off);
                 if super::gpu_zc_r2_debug() {
                     eprintln!(
                         "[zc-r2] gate replay walls: {:?}", &walls[..n_walls]
@@ -9236,7 +10537,15 @@ kernel void zc_t3_products(
         }
         let gpu = gpu().ok()?;
         let state_mutex = zc_t3_state()?;
-        let mut state = state_mutex.lock().ok()?;
+        // See the zc-r2 launch note: grow sequences below are not
+        // unwind-atomic; decline poisoned state, observably.
+        let mut state = match state_mutex.lock() {
+            Ok(s) => s,
+            Err(_) => {
+                note_poisoned_lock("zc-t3 launch", false);
+                return None;
+            }
+        };
         unsafe {
             // Nibble decomposition of the ρ-composed 32 KiB table (per
             // prove; the table depends on the sampled challenge).
@@ -9326,7 +10635,13 @@ kernel void zc_t3_products(
             };
             let state = match state_mutex.lock() {
                 Ok(s) => s,
-                Err(_) => return poison(job.cb),
+                Err(_) => {
+                    // The launching section is not unwind-atomic (see the
+                    // zc-r2 launch note): in-flight state may be torn, so
+                    // fail the job — the caller CPU-redoes the prefix.
+                    note_poisoned_lock("zc-t3 wait", false);
+                    return poison(job.cb);
+                }
             };
             let parts = gpu.buffer_contents(state.part_buf).cast::<F128>();
             let mut out = Vec::with_capacity(job.chunks);
@@ -9893,7 +11208,15 @@ kernel void zc_loop_products(
         }
         let gpu = gpu().ok()?;
         let state_mutex = zc_loop_state()?;
-        let mut state = state_mutex.lock().ok()?;
+        // See the zc-r2 launch note: grow sequences below are not
+        // unwind-atomic; decline poisoned state, observably.
+        let mut state = match state_mutex.lock() {
+            Ok(s) => s,
+            Err(_) => {
+                note_poisoned_lock("zc-loop launch", false);
+                return None;
+            }
+        };
         unsafe {
             // 16 byte-bank nibble tables of `v ↦ ρ·v` (F2-linear in v):
             // bank b holds ρ·(n at byte b) and ρ·((n<<4) at byte b).
@@ -9996,7 +11319,13 @@ kernel void zc_loop_products(
             };
             let state = match state_mutex.lock() {
                 Ok(s) => s,
-                Err(_) => return poison(job.cb),
+                Err(_) => {
+                    // The launching section is not unwind-atomic (see the
+                    // zc-r2 launch note): in-flight state may be torn, so
+                    // fail the job — the caller CPU-redoes the prefix.
+                    note_poisoned_lock("zc-loop wait", false);
+                    return poison(job.cb);
+                }
             };
             let parts = gpu.buffer_contents(state.part_buf).cast::<F128>();
             let mut out = Vec::with_capacity(job.chunks);
@@ -10104,6 +11433,13 @@ pub(crate) use imp::{gpu_merkle_tree_blake3, gpu_ntt_interleaved_from_layer};
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[cfg_attr(not(test), allow(unused_imports))]
 pub(crate) use imp::{ZcFoldJob, launch_lincheck_fold, launch_zerocheck_c_fold, zerocheck_gpu_submits};
+
+/// eq-direct staging for the two fold arms (see `ENV_NO_EQ_DIRECT`): the
+/// producers build eq_outer straight into the arms' persistent upload
+/// buffer, and the launch skips its 4 MiB memcpy.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[cfg_attr(not(test), allow(unused_imports))]
+pub(crate) use imp::{FoldEqTable, lincheck_fold_eq_table, zc_fold_eq_table};
 
 /// Zerocheck round-two products GPU arm (see `ENV_NO_GPU_ZC_R2`).
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -10861,6 +12197,140 @@ mod tests {
             let expect =
                 crate::merkle::merkle_tree(&data, n_leaves, crate::merkle::HashKind::Blake3);
             assert_eq!(got, expect, "GPU Merkle mismatch at n_leaves={n_leaves}");
+        }
+    }
+
+    /// Ranked-shape A/B probe for the vectorized Merkle kernels: times the
+    /// 1 GiB leaf pass and the full parent ladder with the incumbent and the
+    /// vec4 pipelines in the SAME process, reading per-command-buffer GPU
+    /// intervals (the least noisy signal on shared seats). Diagnostic only;
+    /// run with --ignored --nocapture.
+    #[test]
+    #[ignore]
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    fn gpu_leaf_vec4_ab_probe() {
+        use super::imp;
+
+        let n_leaves = 1usize << 20;
+        let gpu = match gpu_or_skip(imp::gpu().map(|g| g as *const imp::Gpu)) {
+            Some(g) => unsafe { &*g },
+            None => return,
+        };
+        assert!(
+            !gpu.pso_leaf_v4.is_null() && !gpu.pso_parent3_v4.is_null(),
+            "vec4 pipelines unavailable (kill switch set or compile failed)"
+        );
+        unsafe {
+            let pool = gpu.pool_push();
+            let staging = gpu.new_buffer(n_leaves * 1024).unwrap();
+            let tree_buf = gpu.new_buffer((2 * n_leaves - 1) * 32).unwrap();
+            std::ptr::write_bytes(gpu.buffer_contents(staging), 0xA5, n_leaves * 1024);
+            // (leaf ms, parent-ladder ms) with the given pipelines; two
+            // command buffers so each segment gets its own GPU interval.
+            let time_graph = |pso_leaf, pso_parent3| -> (f64, f64) {
+                let cb = gpu.command_buffer().unwrap();
+                let enc = gpu.compute_encoder(cb).unwrap();
+                gpu.set_pipeline(enc, pso_leaf);
+                gpu.set_buffer(enc, staging, 0, 0);
+                gpu.set_buffer(enc, tree_buf, 0, 1);
+                gpu.dispatch(enc, (n_leaves / 256) as u64, 256);
+                gpu.end_encoding(enc);
+                gpu.commit_and_wait(cb).unwrap();
+                let (s, e) = imp::cb_gpu_interval(gpu, cb);
+                let leaf_ms = (e - s) * 1e3;
+                let cb = gpu.command_buffer().unwrap();
+                let enc = gpu.compute_encoder(cb).unwrap();
+                let mut read_start = 0usize;
+                let mut read_len = n_leaves;
+                gpu.set_pipeline(enc, pso_parent3);
+                while read_len >= 256 {
+                    let write1_start = read_start + read_len;
+                    let write1_len = read_len / 2;
+                    let write2_start = write1_start + write1_len;
+                    let write2_len = write1_len / 2;
+                    let write3_start = write2_start + write2_len;
+                    let write3_len = write2_len / 2;
+                    gpu.set_buffer(enc, tree_buf, read_start * 32, 0);
+                    gpu.set_buffer(enc, tree_buf, write1_start * 32, 1);
+                    gpu.set_buffer(enc, tree_buf, write2_start * 32, 2);
+                    gpu.set_buffer(enc, tree_buf, write3_start * 32, 3);
+                    gpu.dispatch(enc, (read_len / 256) as u64, 128);
+                    read_start = write3_start;
+                    read_len = write3_len;
+                }
+                gpu.set_pipeline(enc, gpu.pso_parent);
+                while read_len > 1 {
+                    let write_start = read_start + read_len;
+                    let n_out = read_len / 2;
+                    gpu.set_buffer(enc, tree_buf, read_start * 32, 0);
+                    gpu.set_buffer(enc, tree_buf, write_start * 32, 1);
+                    let tpg = 256u64.min(n_out as u64);
+                    gpu.dispatch(enc, n_out as u64 / tpg, tpg);
+                    read_start = write_start;
+                    read_len = n_out;
+                }
+                gpu.end_encoding(enc);
+                gpu.commit_and_wait(cb).unwrap();
+                let (s, e) = imp::cb_gpu_interval(gpu, cb);
+                (leaf_ms, (e - s) * 1e3)
+            };
+            let _ = time_graph(gpu.pso_leaf, gpu.pso_parent3);
+            let _ = time_graph(gpu.pso_leaf_v4, gpu.pso_parent3_v4);
+            let (mut la_min, mut lb_min, mut pa_min, mut pb_min) =
+                (f64::MAX, f64::MAX, f64::MAX, f64::MAX);
+            for rep in 0..5 {
+                let (la, pa) = time_graph(gpu.pso_leaf, gpu.pso_parent3);
+                let (lb, pb) = time_graph(gpu.pso_leaf_v4, gpu.pso_parent3_v4);
+                la_min = la_min.min(la);
+                lb_min = lb_min.min(lb);
+                pa_min = pa_min.min(pa);
+                pb_min = pb_min.min(pb);
+                println!(
+                    "rep={rep} leaf: scalar {la:.2} ms vs vec4 {lb:.2} ms | parents: scalar {pa:.2} ms vs vec4 {pb:.2} ms"
+                );
+            }
+            println!(
+                "min-of-5 leaf: scalar {la_min:.2} ms vs vec4 {lb_min:.2} ms | parents: scalar {pa_min:.2} ms vs vec4 {pb_min:.2} ms"
+            );
+            // Cache-resident sweep: 4 MiB codeword (2^12 leaves), 32
+            // back-to-back dispatches per command buffer (the tree_buf WAW
+            // hazard serializes them). DRAM bandwidth cannot be the limit
+            // here, so a scalar-vs-vec4 gap isolates the load-request-rate
+            // mechanism that a higher bandwidth-to-core-ratio seat (the
+            // ranked M3 Max) exposes at the full 1 GiB shape.
+            let small_leaves = 1usize << 12;
+            let time_small = |pso_leaf| -> f64 {
+                let cb = gpu.command_buffer().unwrap();
+                let enc = gpu.compute_encoder(cb).unwrap();
+                gpu.set_pipeline(enc, pso_leaf);
+                for _ in 0..32 {
+                    gpu.set_buffer(enc, staging, 0, 0);
+                    gpu.set_buffer(enc, tree_buf, 0, 1);
+                    gpu.dispatch(enc, (small_leaves / 256) as u64, 256);
+                }
+                gpu.end_encoding(enc);
+                gpu.commit_and_wait(cb).unwrap();
+                let (s, e) = imp::cb_gpu_interval(gpu, cb);
+                (e - s) * 1e3
+            };
+            let _ = time_small(gpu.pso_leaf);
+            let _ = time_small(gpu.pso_leaf_v4);
+            let (mut sa_min, mut sb_min) = (f64::MAX, f64::MAX);
+            for rep in 0..5 {
+                let sa = time_small(gpu.pso_leaf);
+                let sb = time_small(gpu.pso_leaf_v4);
+                sa_min = sa_min.min(sa);
+                sb_min = sb_min.min(sb);
+                println!(
+                    "rep={rep} cache-resident leaf x32: scalar {sa:.3} ms vs vec4 {sb:.3} ms"
+                );
+            }
+            println!(
+                "min-of-5 cache-resident leaf x32: scalar {sa_min:.3} ms vs vec4 {sb_min:.3} ms"
+            );
+            gpu.release(staging);
+            gpu.release(tree_buf);
+            gpu.pool_pop(pool);
         }
     }
 
@@ -11764,26 +13234,70 @@ DEF_PROBE(probe_g4_t8_p0,    8u,  0u,   tsel & 7u)
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     #[test]
     fn zc_r2_gate_share_policy() {
-        use imp::zc_r2_gate_share;
-        // Balance point hi/(ratio+0.45); ranked-observed ratios land above
-        // the 15·hi/16 cap, which is the binding overshoot guard.
-        assert_eq!(zc_r2_gate_share(0.57, 2048), 1920);
-        assert_eq!(zc_r2_gate_share(0.38, 2048), 1920);
+        use imp::{zc_r2_gate_share, zc_r2_gate_share_with_alpha};
+        // Legacy pricing (α = 0.55): non-W tiers, and the exact shipped gate
+        // the retune kill switch restores. Balance point hi/(ratio+0.45);
+        // the ranked-observed pre-offload ratios land above the 15·hi/16
+        // cap, which is the binding overshoot guard there.
+        assert_eq!(zc_r2_gate_share_with_alpha(0.57, 2048, 0.55), 1920);
+        assert_eq!(zc_r2_gate_share_with_alpha(0.38, 2048, 0.55), 1920);
         // The guard still binds before the GPU can straggle: at 15/16 the
         // crossover is (1-0.45·15/16)/(15/16) ≈ 0.617, above the ranked 0.57.
-        assert!(zc_r2_gate_share(0.62, 2048) < 2048);
+        assert!(zc_r2_gate_share_with_alpha(0.62, 2048, 0.55) < 2048);
         // Slow-but-usable GPU: the formula takes over below the cap.
-        assert_eq!(zc_r2_gate_share(1.0, 2048), 1412); // 2048/1.45
-        assert_eq!(zc_r2_gate_share(2.0, 2048), 836); // 2048/2.45
+        assert_eq!(zc_r2_gate_share_with_alpha(1.0, 2048, 0.55), 1412); // 2048/1.45
+        assert_eq!(zc_r2_gate_share_with_alpha(2.0, 2048, 0.55), 836); // 2048/2.45
+        // `w_off = false` keys the legacy α exactly.
+        assert_eq!(zc_r2_gate_share(0.57, 2048, false), 1920);
+        assert_eq!(zc_r2_gate_share(1.0, 2048, false), 1412);
+        // Retuned W-offload pricing (α = 0.34, the measured anchors-only
+        // residual): balance point hi/(ratio+0.66).
+        assert_eq!(zc_r2_gate_share(0.57, 2048, true), 1665); // 2048/1.23
+        assert_eq!(zc_r2_gate_share(0.84, 2048, true), 1365); // 2048/1.50
+        assert_eq!(zc_r2_gate_share_with_alpha(1.0, 2048, 0.34), 1234); // 2048/1.66
+        // Cap crossover corrected for α = 0.34: 16/15 - 0.66 ≈ 0.407.
+        assert_eq!(zc_r2_gate_share(0.38, 2048, true), 1920);
+        assert_eq!(zc_r2_gate_share(0.40, 2048, true), 1920);
+        assert_eq!(zc_r2_gate_share(0.41, 2048, true), 1914);
         // Admission floor for ratios in (2, 8): the equality oracle already
-        // proved the kernel, so pricing failures get hi/8, not 0.
-        assert_eq!(zc_r2_gate_share(2.01, 2048), 256);
-        assert_eq!(zc_r2_gate_share(7.9, 2048), 256);
+        // proved the kernel, so pricing failures get hi/8, not 0 — α-free.
+        assert_eq!(zc_r2_gate_share(2.01, 2048, true), 256);
+        assert_eq!(zc_r2_gate_share(2.01, 2048, false), 256);
+        assert_eq!(zc_r2_gate_share(7.9, 2048, false), 256);
         // Past the floor ceiling, or unusable: exact incumbent.
-        assert_eq!(zc_r2_gate_share(8.0, 2048), 0);
-        assert_eq!(zc_r2_gate_share(f64::NAN, 2048), 0);
-        assert_eq!(zc_r2_gate_share(0.0, 2048), 0);
-        assert_eq!(zc_r2_gate_share(-1.0, 2048), 0);
+        assert_eq!(zc_r2_gate_share(8.0, 2048, true), 0);
+        assert_eq!(zc_r2_gate_share(f64::NAN, 2048, false), 0);
+        assert_eq!(zc_r2_gate_share(0.0, 2048, true), 0);
+        assert_eq!(zc_r2_gate_share(-1.0, 2048, false), 0);
+    }
+
+    /// Bounded re-convergence policy (see `zc_r2_reconverge_step`): band and
+    /// step are hi/32, up-steps need a non-straggling prove, straggling
+    /// proves shed load even inside the band, and the result is clamped to
+    /// the gate's own floor/cap.
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    fn zc_r2_reconverge_step_policy() {
+        use imp::zc_r2_reconverge_step;
+        // Inside the hysteresis band: hold.
+        assert_eq!(zc_r2_reconverge_step(1024, 1087, false, 2048), None);
+        assert_eq!(zc_r2_reconverge_step(1024, 961, false, 2048), None);
+        // EMA says grow, prove agrees (no straggle): one band up, no more.
+        assert_eq!(zc_r2_reconverge_step(1024, 1088, false, 2048), Some(1088));
+        assert_eq!(zc_r2_reconverge_step(1024, 1920, false, 2048), Some(1088));
+        // A straggling prove never grows the share — it sheds a band, even
+        // when the EMA disagrees or is still inside the band.
+        assert_eq!(zc_r2_reconverge_step(1024, 1920, true, 2048), Some(960));
+        assert_eq!(zc_r2_reconverge_step(1024, 1024, true, 2048), Some(960));
+        // EMA says shrink: one band down.
+        assert_eq!(zc_r2_reconverge_step(1024, 960, false, 2048), Some(960));
+        assert_eq!(zc_r2_reconverge_step(320, 0, false, 2048), Some(256));
+        // Clamped to the gate's cap and floor: a clamp that lands back on
+        // the published share is a hold, not a republish.
+        assert_eq!(zc_r2_reconverge_step(1920, 2047, false, 2048), None);
+        assert_eq!(zc_r2_reconverge_step(256, 0, true, 2048), None);
+        // Degenerate hi (band rounds to 0): never adjust.
+        assert_eq!(zc_r2_reconverge_step(8, 16, false, 16), None);
     }
 
     /// The lincheck arm's GPU prefix equals the CPU fold over exactly the
@@ -11969,31 +13483,68 @@ DEF_PROBE(probe_g4_t8_p0,    8u,  0u,   tsel & 7u)
         for byte in b_packed.iter_mut() {
             *byte = (xs(&mut rng) & 0xff) as u8;
         }
-        let eq_lo: Vec<F128> = (0..lo_size).map(|_| rand_f128(&mut rng)).collect();
+        // eq_lo carries the production eq table's first-variable structure
+        // `eq_lo[2y] = κ · eq_lo[2y+1]` with `κ = (1+r1)/r1` — the armed
+        // kernel's weight-shared even-parity restore relies on exactly that
+        // relation (the rest of each entry stays random).
+        let r1 = rand_f128(&mut rng);
+        assert_ne!(r1, F128::ZERO);
+        let kappa = (F128::ONE + r1) * r1.inv();
+        let mut eq_lo = vec![F128::ZERO; lo_size];
+        for y in 0..lo_size / 2 {
+            let w = rand_f128(&mut rng);
+            eq_lo[2 * y + 1] = w;
+            eq_lo[2 * y] = kappa * w;
+        }
         let eq_hi: Vec<F128> = (0..hi_size).map(|_| rand_f128(&mut rng)).collect();
 
         // CPU reference partials, exactly the driver's non-aarch64 shape, kept
         // split by x_lo parity so the arm's parity contract is checked and not
-        // just the sum a wrong split could still reproduce.
-        let mut cpu_split: Vec<[F128; 4]> = Vec::with_capacity(hi_size);
+        // just the sum a wrong split could still reproduce. Slots 4..8 are the
+        // deferred round-three W-aggregates in the arm's stride-8 layout
+        // `[p1_e, pinf_e, p1_o, pinf_o, W0, W3, W4, W5]`: group y pairs
+        // (2y, 2y+1), the group weight is the odd lane's eq_lo, and padded
+        // pairs contribute zero rows (their W0 term is skipped like the
+        // driver's guard — same value, the rows are zero).
+        let mut cpu_split: Vec<[F128; 8]> = Vec::with_capacity(hi_size);
         for x_hi in 0..hi_size {
-            // [p1_even, pinf_even, p1_odd, pinf_odd]
-            let mut acc = [F256Unreduced::ZERO; 4];
-            for x_lo in 0..lo_size {
-                let pair_idx = x_hi * lo_size + x_lo;
-                if (pair_idx & mask) >= useful {
-                    continue;
-                }
+            let mut acc = [F256Unreduced::ZERO; 8];
+            for y in 0..lo_size / 2 {
                 let read = |packed: &[u8], row: usize| -> u64 {
                     u64::from_le_bytes(packed[row * 8..row * 8 + 8].try_into().unwrap())
                 };
-                let a0 = fold_row(read(&a_packed, 2 * pair_idx));
-                let a1 = fold_row(read(&a_packed, 2 * pair_idx + 1));
-                let b0 = fold_row(read(&b_packed, 2 * pair_idx));
-                let b1 = fold_row(read(&b_packed, 2 * pair_idx + 1));
-                let base = 2 * (x_lo & 1);
-                acc[base] ^= eq_lo[x_lo].mul_unreduced(a1 * b1);
-                acc[base + 1] ^= eq_lo[x_lo].mul_unreduced((a0 + a1) * (b0 + b1));
+                let rows = |x_lo: usize| -> Option<[F128; 4]> {
+                    let pair_idx = x_hi * lo_size + x_lo;
+                    if (pair_idx & mask) >= useful {
+                        return None;
+                    }
+                    Some([
+                        fold_row(read(&a_packed, 2 * pair_idx)),
+                        fold_row(read(&a_packed, 2 * pair_idx + 1)),
+                        fold_row(read(&b_packed, 2 * pair_idx)),
+                        fold_row(read(&b_packed, 2 * pair_idx + 1)),
+                    ])
+                };
+                let even = rows(2 * y);
+                let odd = rows(2 * y + 1);
+                if even.is_none() && odd.is_none() {
+                    continue;
+                }
+                let [a0, a1, b0, b1] = even.unwrap_or([F128::ZERO; 4]);
+                let [a2, a3, b2, b3] = odd.unwrap_or([F128::ZERO; 4]);
+                let w = eq_lo[2 * y + 1];
+                if even.is_some() {
+                    acc[0] ^= eq_lo[2 * y].mul_unreduced(a1 * b1);
+                    acc[1] ^= eq_lo[2 * y].mul_unreduced((a0 + a1) * (b0 + b1));
+                }
+                if odd.is_some() {
+                    acc[2] ^= w.mul_unreduced(a3 * b3);
+                    acc[3] ^= w.mul_unreduced((a2 + a3) * (b2 + b3));
+                    acc[4] ^= w.mul_unreduced(a2 * b2);
+                }
+                acc[5] ^= w.mul_unreduced((a0 + a2) * (b0 + b2));
+                acc[6] ^= w.mul_unreduced((a1 + a3) * (b1 + b3));
+                acc[7] ^= w.mul_unreduced((a0 + a1 + a2 + a3) * (b0 + b1 + b2 + b3));
             }
             let eq_h = eq_hi[x_hi];
             cpu_split.push(std::array::from_fn(|i| eq_h * acc[i].reduce()));
@@ -12002,16 +13553,18 @@ DEF_PROBE(probe_g4_t8_p0,    8u,  0u,   tsel & 7u)
             .iter()
             .map(|v| (v[0] + v[2], v[1] + v[3]))
             .collect();
-        // Slots 0/1 of the lookahead state are exactly the odd-parity pair.
+        // Slots 0/1 of the lookahead state are exactly the odd-parity pair;
+        // slots 2..6 the W-aggregates the calibration oracle byte-compares.
         let cpu_la: Vec<[F128; 6]> = cpu_split
             .iter()
-            .map(|v| [v[2], v[3], F128::ZERO, F128::ZERO, F128::ZERO, F128::ZERO])
+            .map(|v| [v[2], v[3], v[4], v[5], v[6], v[7]])
             .collect();
 
         // Calibration probe: internal equality oracle + share publication.
         imp::zc_r2_test_reset();
         let job = imp::launch_zc_r2_products(
             &a_packed, &b_packed, &table_data, &eq_lo, &eq_hi, lo_size, hi_size, mask, useful,
+            Some(kappa),
         )
         .expect("calibration launch must succeed on real Metal");
         assert!(job.is_calibration());
@@ -12026,19 +13579,26 @@ DEF_PROBE(probe_g4_t8_p0,    8u,  0u,   tsel & 7u)
         imp::zc_r2_test_set_share(hi_size / 2);
         let job2 = imp::launch_zc_r2_products(
             &a_packed, &b_packed, &table_data, &eq_lo, &eq_hi, lo_size, hi_size, mask, useful,
+            Some(kappa),
         )
         .expect("timed launch must succeed");
         assert!(!job2.is_calibration());
         let prefix = job2.cpu_split();
         assert_eq!(prefix, hi_size / 2);
+        // Slots 4..8 are only produced when the W-offload is armed (default;
+        // a kill-switched test process still checks the four-slot contract).
+        let w_armed = job2.w_offload();
         match imp::zc_r2_wait(job2, None, None, 0.0, hi_size) {
             imp::ZcR2Result::Prefix(vals) => {
                 assert_eq!(vals.len(), prefix);
-                assert_eq!(
-                    &vals[..],
-                    &cpu_split[..prefix],
-                    "prefix partials bit-exact, per parity"
-                );
+                let checked = if w_armed { 8 } else { 4 };
+                for (c, (v, r)) in vals.iter().zip(cpu_split.iter()).enumerate() {
+                    assert_eq!(
+                        v[..checked],
+                        r[..checked],
+                        "prefix partials bit-exact, per parity and W slot (chunk {c})"
+                    );
+                }
                 // The summed contract the round-two message consumes.
                 for (v, c) in vals.iter().zip(cpu_partials.iter()) {
                     assert_eq!((v[0] + v[2], v[1] + v[3]), *c, "summed pair bit-exact");
@@ -12046,6 +13606,37 @@ DEF_PROBE(probe_g4_t8_p0,    8u,  0u,   tsel & 7u)
             }
             _ => panic!("timed drain must return prefix partials"),
         }
+
+        // Bounded re-convergence fires end-to-end through a real timed drain
+        // (policy pinned in `zc_r2_reconverge_step_policy`; this proves the
+        // hook in `zc_r2_wait` feeds it real walls). A prove whose CPU sweep
+        // wall is far below the drain latency reads as a straggling GPU and
+        // sheds one band; a prove with an enormous sweep wall reads as a
+        // comfortably-fast GPU and grows one band.
+        imp::zc_r2_test_reset();
+        imp::zc_r2_test_set_share(hi_size / 2);
+        let job3 = imp::launch_zc_r2_products(
+            &a_packed, &b_packed, &table_data, &eq_lo, &eq_hi, lo_size, hi_size, mask, useful,
+            Some(kappa),
+        )
+        .expect("re-convergence down-step launch must succeed");
+        let res = imp::zc_r2_wait(job3, None, None, 0.001, hi_size);
+        assert!(matches!(res, imp::ZcR2Result::Prefix(_)));
+        let (tuned, _) = imp::zc_r2_test_state();
+        assert_eq!(tuned, hi_size / 2 - hi_size / 32, "straggling prove sheds one band");
+
+        imp::zc_r2_test_reset();
+        imp::zc_r2_test_set_share(hi_size / 4);
+        let job4 = imp::launch_zc_r2_products(
+            &a_packed, &b_packed, &table_data, &eq_lo, &eq_hi, lo_size, hi_size, mask, useful,
+            Some(kappa),
+        )
+        .expect("re-convergence up-step launch must succeed");
+        let res = imp::zc_r2_wait(job4, None, None, 1.0e4, hi_size);
+        assert!(matches!(res, imp::ZcR2Result::Prefix(_)));
+        let (tuned, _) = imp::zc_r2_test_state();
+        assert_eq!(tuned, hi_size / 4 + hi_size / 32, "fast-GPU prove grows one band");
+
         imp::zc_r2_test_reset();
     }
 
