@@ -8290,7 +8290,7 @@ kernel void zc_r2_products(
             return 0;
         }
         let g = (hi_size as f64 / (ratio + (1.0 - ZC_R2_ALPHA))).round();
-        (g as usize).min(hi_size * 15 / 16)
+        (g as usize).min(hi_size * 7 / 8)
     }
 
     fn zc_r2_init(gpu: &'static Gpu) -> Result<ZcR2, String> {
