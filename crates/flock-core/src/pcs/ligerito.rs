@@ -10498,3 +10498,10 @@ mod tests {
 // RealAdii sample 1 on 31a9c72.
 // numinous draw 8 1785734384494936424
 // RealAdii sample 1 on f6e921b.
+// RealAdii sample 1 on 474b720.
+// RealAdii sample 2 on 474b720.
+// RealAdii sample 3 on 474b720.
+// RealAdii sample 4 on 474b720.
+// RealAdii sample 5 on 474b720.
+// RealAdii sample 6 on 474b720.
+// RealAdii sample 7 on 474b720.
