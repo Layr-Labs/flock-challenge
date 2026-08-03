@@ -131,6 +131,27 @@ pub(crate) fn gpu_zc_r2_debug() -> bool {
     *ON
 }
 
+/// Kill switch for the fused packed-tail GPU fold arm
+/// (`FLOCK_NO_GPU_ZC_TAILFOLD=1` restores the all-CPU fused tail sweep as a
+/// same-binary control). Like every arm, admission additionally requires the
+/// untimed warm-up calibration to prove bit-exact partials and output
+/// checksums on the target machine itself.
+pub const ENV_NO_GPU_ZC_TAILFOLD: &str = "FLOCK_NO_GPU_ZC_TAILFOLD";
+
+pub(crate) fn gpu_zc_tailfold_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os(ENV_NO_GPU_ZC_TAILFOLD).is_none());
+    *ON
+}
+
+/// Diagnostic trace for the packed-tail fold arm
+/// (`FLOCK_ZC_TAILFOLD_GPU_DEBUG=1`).
+pub(crate) fn gpu_zc_tailfold_debug() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_ZC_TAILFOLD_GPU_DEBUG").is_some());
+    *ON
+}
+
 /// Kill switch for the zerocheck first-tail-round (T3 compact reconstruction)
 /// products GPU arm.
 pub const ENV_NO_GPU_ZC_T3: &str = "FLOCK_NO_GPU_ZC_T3";
@@ -8728,6 +8749,750 @@ kernel void zc_r2_products(
     }
 
     // -----------------------------------------------------------------------
+    // Fused packed-tail GPU fold arm (see `ENV_NO_GPU_ZC_TAILFOLD`).
+    //
+    // With the round-two compact level elided, the first tail round folds the
+    // still-live packed rows through two challenge-scaled byte tables and
+    // forms the next message. This arm computes a measured prefix of those
+    // hi-chunks entirely on the device: it reuses the round-two arm's cached
+    // no-copy wraps of the packed inputs (zero new input transfer), folds
+    // each output through the two nibble-decomposed tables, stores the
+    // reconstructed level directly into no-copy wraps of the CPU output
+    // buffers, and returns one reduced partial pair plus two output XOR
+    // checksums per chunk. Calibration (untimed warm-up, once per process)
+    // runs with output stores disabled and requires the partials AND the
+    // checksums to equal the CPU's own values bit-for-bit before any share
+    // is published; any later Metal failure poisons the arm and the caller
+    // CPU-redoes the prefix through the exact fused NEON kernel.
+    const ZC_TAILFOLD_MSL_SOURCE: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+static inline ulong clmul32(uint a, uint b) {
+    const ulong M0 = 0x1111111111111111UL, M1 = 0x2222222222222222UL,
+                M2 = 0x4444444444444444UL, M3 = 0x8888888888888888UL;
+    ulong a0 = a & 0x11111111u, a1 = a & 0x22222222u,
+          a2 = a & 0x44444444u, a3 = a & 0x88888888u;
+    ulong b0 = b & 0x11111111u, b1 = b & 0x22222222u,
+          b2 = b & 0x44444444u, b3 = b & 0x88888888u;
+    ulong r0 = (a0*b0 ^ a1*b3 ^ a2*b2 ^ a3*b1) & M0;
+    ulong r1 = (a0*b1 ^ a1*b0 ^ a2*b3 ^ a3*b2) & M1;
+    ulong r2 = (a0*b2 ^ a1*b1 ^ a2*b0 ^ a3*b3) & M2;
+    ulong r3 = (a0*b3 ^ a1*b2 ^ a2*b1 ^ a3*b0) & M3;
+    return r0 | r1 | r2 | r3;
+}
+
+struct U128k { ulong lo; ulong hi; };
+struct U256k { ulong r0; ulong r1; ulong r2; ulong r3; };
+
+static inline U128k clmul64(ulong a, ulong b) {
+    uint al = uint(a), ah = uint(a >> 32);
+    uint bl = uint(b), bh = uint(b >> 32);
+    ulong p_lo = clmul32(al, bl);
+    ulong p_hi = clmul32(ah, bh);
+    ulong p_mid = clmul32(al ^ ah, bl ^ bh) ^ p_lo ^ p_hi;
+    U128k r;
+    r.lo = p_lo ^ (p_mid << 32);
+    r.hi = p_hi ^ (p_mid >> 32);
+    return r;
+}
+
+static inline U256k clmul128(uint4 a, uint4 b) {
+    ulong al = (ulong(a.y) << 32) | a.x, ah = (ulong(a.w) << 32) | a.z;
+    ulong bl = (ulong(b.y) << 32) | b.x, bh = (ulong(b.w) << 32) | b.z;
+    U128k p0 = clmul64(al, bl);
+    U128k p2 = clmul64(ah, bh);
+    U128k pm = clmul64(al ^ ah, bl ^ bh);
+    pm.lo ^= p0.lo ^ p2.lo;
+    pm.hi ^= p0.hi ^ p2.hi;
+    U256k r;
+    r.r0 = p0.lo;
+    r.r1 = p0.hi ^ pm.lo;
+    r.r2 = p2.lo ^ pm.hi;
+    r.r3 = p2.hi;
+    return r;
+}
+
+static inline uint4 gf_reduce(U256k p) {
+    ulong h0 = p.r2, h1 = p.r3;
+    ulong t0 = h0 ^ (h0 << 1) ^ (h0 << 2) ^ (h0 << 7);
+    ulong t1 = h1 ^ (h1 << 1) ^ (h1 << 2) ^ (h1 << 7)
+             ^ (h0 >> 63) ^ (h0 >> 62) ^ (h0 >> 57);
+    ulong ov = (h1 >> 63) ^ (h1 >> 62) ^ (h1 >> 57);
+    t0 ^= ov ^ (ov << 1) ^ (ov << 2) ^ (ov << 7);
+    ulong l0 = p.r0 ^ t0, l1 = p.r1 ^ t1;
+    return uint4(uint(l0), uint(l0 >> 32), uint(l1), uint(l1 >> 32));
+}
+
+// Fold one packed 8-byte row via the nibble decomposition of one of the two
+// challenge-scaled byte tables (`base` 0 selects (1+rho)-scaled, 256 selects
+// rho-scaled; bank layout identical to the round-two arm).
+static inline uint4 zc_tf_fold8(uint lo, uint hi, threadgroup const uint4* nib, uint base) {
+    uint4 acc = uint4(0u);
+    for (uint j = 0u; j < 4u; j++) {
+        uint b = (lo >> (8u * j)) & 0xffu;
+        acc ^= nib[base + j * 32u + (b & 15u)] ^ nib[base + j * 32u + 16u + (b >> 4u)];
+    }
+    for (uint j = 0u; j < 4u; j++) {
+        uint b = (hi >> (8u * j)) & 0xffu;
+        acc ^= nib[base + (j + 4u) * 32u + (b & 15u)]
+             ^ nib[base + (j + 4u) * 32u + 16u + (b >> 4u)];
+    }
+    return acc;
+}
+
+struct ZcTfParams {
+    uint lo_pairs; uint xpt; uint mask; uint useful; uint write_outputs;
+};
+
+// One threadgroup per hi-chunk (256 threads). Each x_lo owns two adjacent
+// outputs (one input uint4 per matrix per output: row0 in .x/.y, row1 in
+// .z/.w). `out = fold_(1+rho)(row0) ^ fold_rho(row1)`, padded outputs zero
+// through the same round-two pair mask, message products over the two
+// reconstructed outputs, one 256-bit unreduced accumulator pair, and two
+// running XOR checksums of the output values. Per chunk the kernel writes
+// four reduced uint4s: (eq_hi*p1, eq_hi*pinf, checksum_a, checksum_b).
+kernel void zc_tailfold(
+    device const uint4* a_in  [[buffer(0)]],
+    device const uint4* b_in  [[buffer(1)]],
+    device uint4*       a_out [[buffer(2)]],
+    device uint4*       b_out [[buffer(3)]],
+    device const uint4* eq_lo [[buffer(4)]],
+    device const uint4* eq_hi [[buffer(5)]],
+    device const uint4* nib_tab_dev [[buffer(6)]],
+    device uint4*       partials    [[buffer(7)]],
+    constant ZcTfParams& p          [[buffer(8)]],
+    uint tgid [[threadgroup_position_in_grid]],
+    uint lid  [[thread_index_in_threadgroup]])
+{
+    threadgroup uint4 nib[512];
+    threadgroup ulong4 red[256];
+    nib[lid] = nib_tab_dev[lid];
+    nib[256u + lid] = nib_tab_dev[256u + lid];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    ulong4 acc1 = ulong4(0ul);
+    ulong4 acci = ulong4(0ul);
+    uint4 cka = uint4(0u);
+    uint4 ckb = uint4(0u);
+    for (uint k = 0u; k < p.xpt; k++) {
+        uint x_lo = k * 256u + lid;
+        uint out0 = tgid * (2u * p.lo_pairs) + 2u * x_lo;
+        uint out1 = out0 + 1u;
+        bool pad0 = (out0 & p.mask) >= p.useful;
+        bool pad1 = (out1 & p.mask) >= p.useful;
+
+        uint4 ap0 = a_in[out0];
+        uint4 ap1 = a_in[out1];
+        uint4 bp0 = b_in[out0];
+        uint4 bp1 = b_in[out1];
+
+        uint4 a0 = pad0 ? uint4(0u)
+            : (zc_tf_fold8(ap0.x, ap0.y, nib, 0u) ^ zc_tf_fold8(ap0.z, ap0.w, nib, 256u));
+        uint4 a1 = pad1 ? uint4(0u)
+            : (zc_tf_fold8(ap1.x, ap1.y, nib, 0u) ^ zc_tf_fold8(ap1.z, ap1.w, nib, 256u));
+        uint4 b0 = pad0 ? uint4(0u)
+            : (zc_tf_fold8(bp0.x, bp0.y, nib, 0u) ^ zc_tf_fold8(bp0.z, bp0.w, nib, 256u));
+        uint4 b1 = pad1 ? uint4(0u)
+            : (zc_tf_fold8(bp1.x, bp1.y, nib, 0u) ^ zc_tf_fold8(bp1.z, bp1.w, nib, 256u));
+
+        if (p.write_outputs != 0u) {
+            a_out[out0] = a0;
+            a_out[out1] = a1;
+            b_out[out0] = b0;
+            b_out[out1] = b1;
+        }
+        cka ^= a0 ^ a1;
+        ckb ^= b0 ^ b1;
+
+        uint4 g1 = gf_reduce(clmul128(a1, b1));
+        uint4 gi = gf_reduce(clmul128(a0 ^ a1, b0 ^ b1));
+        uint4 e  = eq_lo[x_lo];
+        U256k m1 = clmul128(e, g1);
+        U256k mi = clmul128(e, gi);
+        acc1 ^= ulong4(m1.r0, m1.r1, m1.r2, m1.r3);
+        acci ^= ulong4(mi.r0, mi.r1, mi.r2, mi.r3);
+    }
+
+    red[lid] = acc1;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint s = 128u; s > 0u; s >>= 1u) {
+        if (lid < s) { red[lid] ^= red[lid + s]; }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    ulong4 chunk1 = red[0];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    red[lid] = acci;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint s = 128u; s > 0u; s >>= 1u) {
+        if (lid < s) { red[lid] ^= red[lid + s]; }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    ulong4 chunki = red[0];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    red[lid] = ulong4((ulong(cka.y) << 32) | cka.x, (ulong(cka.w) << 32) | cka.z,
+                      (ulong(ckb.y) << 32) | ckb.x, (ulong(ckb.w) << 32) | ckb.z);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint s = 128u; s > 0u; s >>= 1u) {
+        if (lid < s) { red[lid] ^= red[lid + s]; }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (lid == 0u) {
+        U256k u1; u1.r0 = chunk1.x; u1.r1 = chunk1.y; u1.r2 = chunk1.z; u1.r3 = chunk1.w;
+        U256k ui; ui.r0 = chunki.x; ui.r1 = chunki.y; ui.r2 = chunki.z; ui.r3 = chunki.w;
+        uint4 p1 = gf_reduce(u1);
+        uint4 pi = gf_reduce(ui);
+        uint4 e = eq_hi[tgid];
+        ulong4 cks = red[0];
+        partials[tgid * 4u]      = gf_reduce(clmul128(e, p1));
+        partials[tgid * 4u + 1u] = gf_reduce(clmul128(e, pi));
+        partials[tgid * 4u + 2u] =
+            uint4(uint(cks.x), uint(cks.x >> 32), uint(cks.y), uint(cks.y >> 32));
+        partials[tgid * 4u + 3u] =
+            uint4(uint(cks.z), uint(cks.z >> 32), uint(cks.w), uint(cks.w >> 32));
+    }
+}
+"#;
+
+    /// Process-lifetime Metal state for the packed-tail fold arm.
+    struct ZcTailFold {
+        pso: Id,
+        /// Two nibble-decomposed tables (8 KiB), eq buffers, and the
+        /// per-chunk (partial pair + output checksums) buffer.
+        nib_buf: Id,
+        eq_lo_buf: Id,
+        eq_lo_cap: usize,
+        eq_hi_buf: Id,
+        eq_hi_cap: usize,
+        part_buf: Id,
+        part_cap: usize,
+        /// Cached no-copy wraps `(ptr, len, buf)` of the packed inputs and
+        /// the tail output buffers.
+        wraps: Vec<(usize, usize, Id)>,
+    }
+
+    // SAFETY: handles are only touched under the state mutex; Metal objects
+    // are thread-safe.
+    unsafe impl Send for ZcTailFold {}
+
+    static ZC_TAILFOLD_STATE: std::sync::OnceLock<Option<std::sync::Mutex<ZcTailFold>>> =
+        std::sync::OnceLock::new();
+    static ZC_TAILFOLD_TUNED: std::sync::atomic::AtomicUsize =
+        std::sync::atomic::AtomicUsize::new(usize::MAX);
+    static ZC_TAILFOLD_POISONED: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
+
+    fn zc_tailfold_forced_ratio() -> Option<f64> {
+        static V: std::sync::OnceLock<Option<f64>> = std::sync::OnceLock::new();
+        *V.get_or_init(|| {
+            std::env::var("FLOCK_ZC_TAILFOLD_GPU_FORCE_RATIO")
+                .ok()?
+                .parse::<f64>()
+                .ok()
+                .filter(|r| r.is_finite() && *r > 0.0)
+        })
+    }
+
+    fn zc_tailfold_init(gpu: &'static Gpu) -> Result<ZcTailFold, String> {
+        unsafe {
+            let pool = gpu.pool_push();
+            let built = (|| -> Result<Id, String> {
+                let src = gpu.api.nsstring(ZC_TAILFOLD_MSL_SOURCE)?;
+                let mut err: Id = NIL;
+                let library: Id = send!(
+                    gpu.api,
+                    unsafe extern "C" fn(Id, Sel, Id, Id, *mut Id) -> Id,
+                    gpu.device,
+                    c"newLibraryWithSource:options:error:",
+                    src,
+                    NIL,
+                    &mut err
+                );
+                if library.is_null() {
+                    return Err(format!(
+                        "zc-tailfold shader compile failed: {}",
+                        gpu.api.error_string(err)
+                    ));
+                }
+                let ns = gpu.api.nsstring("zc_tailfold")?;
+                let f: Id = send!(
+                    gpu.api,
+                    unsafe extern "C" fn(Id, Sel, Id) -> Id,
+                    library,
+                    c"newFunctionWithName:",
+                    ns
+                );
+                if f.is_null() {
+                    send!(
+                        gpu.api,
+                        unsafe extern "C" fn(Id, Sel) -> Id,
+                        library,
+                        c"release"
+                    );
+                    return Err("zc_tailfold kernel not found".into());
+                }
+                let mut perr: Id = NIL;
+                let pso: Id = send!(
+                    gpu.api,
+                    unsafe extern "C" fn(Id, Sel, Id, *mut Id) -> Id,
+                    gpu.device,
+                    c"newComputePipelineStateWithFunction:error:",
+                    f,
+                    &mut perr
+                );
+                send!(gpu.api, unsafe extern "C" fn(Id, Sel) -> Id, f, c"release");
+                send!(
+                    gpu.api,
+                    unsafe extern "C" fn(Id, Sel) -> Id,
+                    library,
+                    c"release"
+                );
+                if pso.is_null() {
+                    return Err(format!(
+                        "zc_tailfold pipeline: {}",
+                        gpu.api.error_string(perr)
+                    ));
+                }
+                Ok(pso)
+            })();
+            gpu.pool_pop(pool);
+            let pso = built?;
+            let nib_buf = gpu.new_buffer(512 * 16)?;
+            Ok(ZcTailFold {
+                pso,
+                nib_buf,
+                eq_lo_buf: NIL,
+                eq_lo_cap: 0,
+                eq_hi_buf: NIL,
+                eq_hi_cap: 0,
+                part_buf: NIL,
+                part_cap: 0,
+                wraps: Vec::new(),
+            })
+        }
+    }
+
+    fn zc_tailfold_state() -> Option<&'static std::sync::Mutex<ZcTailFold>> {
+        ZC_TAILFOLD_STATE
+            .get_or_init(|| {
+                let gpu = gpu().ok()?;
+                match zc_tailfold_init(gpu) {
+                    Ok(s) => Some(std::sync::Mutex::new(s)),
+                    Err(e) => {
+                        if super::gpu_zc_tailfold_debug() {
+                            eprintln!("[zc-tailfold] init failed: {e}");
+                        }
+                        None
+                    }
+                }
+            })
+            .as_ref()
+    }
+
+    pub(crate) struct ZcTailFoldJob {
+        cb: Id,
+        pub chunks: usize,
+        calibration: bool,
+        lo_pairs: usize,
+        mask: u32,
+        useful: u32,
+        submitted: std::time::Instant,
+    }
+
+    // SAFETY: the command buffer is waited/released from the launching
+    // thread only.
+    unsafe impl Send for ZcTailFoldJob {}
+
+    impl ZcTailFoldJob {
+        /// Leading chunks the CPU must skip entirely (the device writes their
+        /// outputs). Zero during calibration: the CPU runs every chunk and
+        /// the store-free probe is compared against it.
+        pub(crate) fn cpu_split(&self) -> usize {
+            if self.calibration { 0 } else { self.chunks }
+        }
+
+        pub(crate) fn is_calibration(&self) -> bool {
+            self.calibration
+        }
+    }
+
+    /// Result of draining the packed-tail fold arm.
+    pub(crate) enum ZcTailFoldResult {
+        /// Calibration completed (share published, probe discarded); the
+        /// caller's CPU outputs and partials are authoritative.
+        Calibrated,
+        /// Timed-prove prefix partial pairs; the device has already written
+        /// those chunks' outputs bit-exactly.
+        Prefix(Vec<(F128, F128)>),
+        /// Metal failed after admission; the caller must CPU-redo the prefix
+        /// (outputs and products). The arm is poisoned for the process.
+        Failed,
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn zc_tailfold_submit(
+        gpu: &Gpu,
+        state: &ZcTailFold,
+        a_buf: Id,
+        b_buf: Id,
+        a_out_buf: Id,
+        b_out_buf: Id,
+        chunks: usize,
+        lo_pairs: usize,
+        mask: u32,
+        useful: u32,
+        write_outputs: bool,
+    ) -> Result<Id, String> {
+        unsafe {
+            #[repr(C)]
+            struct P {
+                lo_pairs: u32,
+                xpt: u32,
+                mask: u32,
+                useful: u32,
+                write_outputs: u32,
+            }
+            let params = P {
+                lo_pairs: lo_pairs as u32,
+                xpt: (lo_pairs / 256) as u32,
+                mask,
+                useful,
+                write_outputs: u32::from(write_outputs),
+            };
+            let pb = std::slice::from_raw_parts(
+                (&raw const params).cast::<u8>(),
+                core::mem::size_of::<P>(),
+            );
+            let cb = gpu.command_buffer()?;
+            let enc = gpu.compute_encoder(cb)?;
+            gpu.set_pipeline(enc, state.pso);
+            gpu.set_buffer(enc, a_buf, 0, 0);
+            gpu.set_buffer(enc, b_buf, 0, 1);
+            gpu.set_buffer(enc, a_out_buf, 0, 2);
+            gpu.set_buffer(enc, b_out_buf, 0, 3);
+            gpu.set_buffer(enc, state.eq_lo_buf, 0, 4);
+            gpu.set_buffer(enc, state.eq_hi_buf, 0, 5);
+            gpu.set_buffer(enc, state.nib_buf, 0, 6);
+            gpu.set_buffer(enc, state.part_buf, 0, 7);
+            gpu.set_bytes(enc, pb, 8);
+            gpu.dispatch(enc, chunks as u64, 256);
+            gpu.end_encoding(enc);
+            let cb = gpu.retain(cb);
+            gpu.commit_async(cb);
+            Ok(cb)
+        }
+    }
+
+    unsafe fn zc_tailfold_wrap(
+        state: &mut ZcTailFold,
+        gpu: &Gpu,
+        ptr: *mut u8,
+        len: usize,
+    ) -> Result<Id, String> {
+        let key = ptr as usize;
+        if let Some(&(_, _, buf)) = state.wraps.iter().find(|&&(p, l, _)| p == key && l == len) {
+            return Ok(buf);
+        }
+        let buf = unsafe { gpu.wrap_buffer(ptr, len)? };
+        state.wraps.push((key, len, buf));
+        Ok(buf)
+    }
+
+    /// Launch the packed-tail fold prefix. `None` = the whole tail round
+    /// stays on the exact all-CPU fused path.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn launch_zc_tailfold(
+        a_packed: &[u8],
+        b_packed: &[u8],
+        t_one_rho: &[F128],
+        t_rho: &[F128],
+        eq_lo: &[F128],
+        eq_hi: &[F128],
+        a_out: &mut [F128],
+        b_out: &mut [F128],
+        lo_pairs: usize,
+        hi_size: usize,
+        pair_in_block_mask: usize,
+        useful_pairs_inclusive: usize,
+    ) -> Option<ZcTailFoldJob> {
+        use std::sync::atomic::Ordering;
+        if !super::gpu_zc_tailfold_enabled() || ZC_TAILFOLD_POISONED.load(Ordering::Relaxed) {
+            return None;
+        }
+        if t_one_rho.len() != 8 * 256
+            || t_rho.len() != 8 * 256
+            || lo_pairs < 256
+            || !lo_pairs.is_multiple_of(256)
+            || hi_size < 8
+            || a_out.len() != 2 * lo_pairs * hi_size
+            || b_out.len() != 2 * lo_pairs * hi_size
+            || pair_in_block_mask > u32::MAX as usize
+            || useful_pairs_inclusive > u32::MAX as usize
+        {
+            return None;
+        }
+        let tuned = ZC_TAILFOLD_TUNED.load(Ordering::Relaxed);
+        if tuned == 0 {
+            return None;
+        }
+        let calibration = tuned == usize::MAX;
+        let chunks = if calibration {
+            (hi_size / 16).clamp(8, 128)
+        } else {
+            tuned.min(hi_size * 15 / 16)
+        };
+        if chunks == 0 {
+            return None;
+        }
+        let gpu = gpu().ok()?;
+        let state_mutex = zc_tailfold_state()?;
+        let mut state = state_mutex.lock().ok()?;
+        unsafe {
+            // Nibble decomposition of both challenge-scaled tables (per
+            // prove; they depend on the sampled rho).
+            let nib = gpu.buffer_contents(state.nib_buf).cast::<F128>();
+            for (t, base) in [(t_one_rho, 0usize), (t_rho, 256usize)] {
+                for j in 0..8 {
+                    for n in 0..16 {
+                        *nib.add(base + j * 32 + n) = t[j * 256 + n];
+                        *nib.add(base + j * 32 + 16 + n) = t[j * 256 + (n << 4)];
+                    }
+                }
+            }
+            let need_lo = lo_pairs * 16;
+            if state.eq_lo_cap < need_lo {
+                if state.eq_lo_cap > 0 {
+                    gpu.release(state.eq_lo_buf);
+                }
+                state.eq_lo_buf = gpu.new_buffer(need_lo).ok()?;
+                state.eq_lo_cap = need_lo;
+            }
+            std::ptr::copy_nonoverlapping(
+                eq_lo.as_ptr().cast::<u8>(),
+                gpu.buffer_contents(state.eq_lo_buf),
+                need_lo,
+            );
+            let need_hi = hi_size * 16;
+            if state.eq_hi_cap < need_hi {
+                if state.eq_hi_cap > 0 {
+                    gpu.release(state.eq_hi_buf);
+                }
+                state.eq_hi_buf = gpu.new_buffer(need_hi).ok()?;
+                state.eq_hi_cap = need_hi;
+            }
+            std::ptr::copy_nonoverlapping(
+                eq_hi.as_ptr().cast::<u8>(),
+                gpu.buffer_contents(state.eq_hi_buf),
+                need_hi,
+            );
+            let need_part = hi_size * 64;
+            if state.part_cap < need_part {
+                if state.part_cap > 0 {
+                    gpu.release(state.part_buf);
+                }
+                state.part_buf = gpu.new_buffer(need_part).ok()?;
+                state.part_cap = need_part;
+            }
+            let a_buf = zc_tailfold_wrap(
+                &mut state,
+                gpu,
+                a_packed.as_ptr().cast_mut(),
+                a_packed.len(),
+            )
+            .ok()?;
+            let b_buf = zc_tailfold_wrap(
+                &mut state,
+                gpu,
+                b_packed.as_ptr().cast_mut(),
+                b_packed.len(),
+            )
+            .ok()?;
+            let a_out_buf = zc_tailfold_wrap(
+                &mut state,
+                gpu,
+                a_out.as_mut_ptr().cast::<u8>(),
+                core::mem::size_of_val(a_out),
+            )
+            .ok()?;
+            let b_out_buf = zc_tailfold_wrap(
+                &mut state,
+                gpu,
+                b_out.as_mut_ptr().cast::<u8>(),
+                core::mem::size_of_val(b_out),
+            )
+            .ok()?;
+            let cb = zc_tailfold_submit(
+                gpu,
+                &state,
+                a_buf,
+                b_buf,
+                a_out_buf,
+                b_out_buf,
+                chunks,
+                lo_pairs,
+                pair_in_block_mask as u32,
+                useful_pairs_inclusive as u32,
+                !calibration,
+            )
+            .ok()?;
+            Some(ZcTailFoldJob {
+                cb,
+                chunks,
+                calibration,
+                lo_pairs,
+                mask: pair_in_block_mask as u32,
+                useful: useful_pairs_inclusive as u32,
+                submitted: std::time::Instant::now(),
+            })
+        }
+    }
+
+    /// Drain the packed-tail fold arm. During calibration `cpu_check` must
+    /// hold the CPU's full per-chunk partial pairs and the probe chunks'
+    /// output checksums `(xor_a, xor_b)` computed from the CPU's own output
+    /// buffers, and `cpu_wall_ms` the wall of the full CPU sweep.
+    pub(crate) fn zc_tailfold_wait(
+        job: ZcTailFoldJob,
+        cpu_check: Option<(&[(F128, F128)], &[(F128, F128)])>,
+        cpu_wall_ms: f64,
+        hi_size: usize,
+    ) -> ZcTailFoldResult {
+        use std::sync::atomic::Ordering;
+        let gpu = match gpu() {
+            Ok(g) => g,
+            Err(_) => return ZcTailFoldResult::Failed,
+        };
+        let poison = |cb: Id| {
+            ZC_TAILFOLD_POISONED.store(true, Ordering::Relaxed);
+            ZC_TAILFOLD_TUNED.store(0, Ordering::Relaxed);
+            unsafe { gpu.release(cb) };
+            ZcTailFoldResult::Failed
+        };
+        unsafe {
+            if gpu.spin_wait_cb(job.cb, 2.0).is_err() {
+                return poison(job.cb);
+            }
+            let first_wall = zc_fold_gpu_wall_ms(gpu, job.cb);
+            let state_mutex = match zc_tailfold_state() {
+                Some(s) => s,
+                None => return poison(job.cb),
+            };
+            let state = match state_mutex.lock() {
+                Ok(s) => s,
+                Err(_) => return poison(job.cb),
+            };
+            let parts = gpu.buffer_contents(state.part_buf).cast::<F128>();
+            let mut out = Vec::with_capacity(job.chunks);
+            let mut checks = Vec::with_capacity(job.chunks);
+            for c in 0..job.chunks {
+                out.push((*parts.add(c * 4), *parts.add(c * 4 + 1)));
+                checks.push((*parts.add(c * 4 + 2), *parts.add(c * 4 + 3)));
+            }
+            if !job.calibration {
+                gpu.release(job.cb);
+                if super::gpu_zc_tailfold_debug() {
+                    eprintln!(
+                        "[zc-tailfold] timed prefix {}/{} chunks: gpu={first_wall:.2}ms \
+                         submit-to-drain={:.2}ms",
+                        job.chunks,
+                        hi_size,
+                        job.submitted.elapsed().as_secs_f64() * 1e3,
+                    );
+                }
+                return ZcTailFoldResult::Prefix(out);
+            }
+
+            // ---- Calibration (untimed warmup prove, once per process) ----
+            let Some((cpu_partials, cpu_checksums)) = cpu_check else {
+                return poison(job.cb);
+            };
+            if cpu_checksums.len() < job.chunks || cpu_partials.len() < job.chunks {
+                return poison(job.cb);
+            }
+            for c in 0..job.chunks {
+                if out[c] != cpu_partials[c] || checks[c] != cpu_checksums[c] {
+                    if super::gpu_zc_tailfold_debug() {
+                        eprintln!(
+                            "[zc-tailfold] CALIBRATION MISMATCH at chunk {c}: \
+                             gpu=({:?},{:?}) cpu=({:?},{:?}) — poisoned",
+                            out[c], checks[c], cpu_partials[c], cpu_checksums[c]
+                        );
+                    }
+                    return poison(job.cb);
+                }
+            }
+            let mut walls = [0.0f64; 5];
+            walls[0] = first_wall.max(0.0);
+            let mut n_walls = usize::from(walls[0] > 0.0);
+            let mut w_min = if n_walls > 0 { walls[0] } else { f64::MAX };
+            gpu.release(job.cb);
+            {
+                let bufs: Vec<Id> = state.wraps.iter().map(|&(_, _, b)| b).collect();
+                if bufs.len() >= 4 {
+                    while n_walls < walls.len() {
+                        let Ok(cb2) = zc_tailfold_submit(
+                            gpu,
+                            &state,
+                            bufs[0],
+                            bufs[1],
+                            bufs[2],
+                            bufs[3],
+                            job.chunks,
+                            job.lo_pairs,
+                            job.mask,
+                            job.useful,
+                            false,
+                        ) else {
+                            break;
+                        };
+                        let w = if gpu.wait_cb(cb2).is_ok() {
+                            zc_fold_gpu_wall_ms(gpu, cb2)
+                        } else {
+                            0.0
+                        };
+                        gpu.release(cb2);
+                        if w <= 0.0 {
+                            break;
+                        }
+                        walls[n_walls] = w;
+                        n_walls += 1;
+                        let prev_min = w_min;
+                        w_min = w_min.min(w);
+                        if n_walls >= 3 && w > 0.95 * prev_min {
+                            break;
+                        }
+                    }
+                }
+            }
+            drop(state);
+            let u_gpu = if n_walls > 0 && w_min < f64::MAX {
+                w_min / job.chunks as f64
+            } else {
+                f64::INFINITY
+            };
+            let u_cpu = cpu_wall_ms / hi_size.max(1) as f64;
+            let share = if u_cpu.is_finite() && u_cpu > 0.0 && u_gpu.is_finite() {
+                let measured = u_gpu / u_cpu;
+                let ratio = zc_tailfold_forced_ratio().unwrap_or(measured);
+                let g = zc_r2_gate_share(ratio, hi_size);
+                if super::gpu_zc_tailfold_debug() {
+                    eprintln!("[zc-tailfold] gate replay walls: {:?}", &walls[..n_walls]);
+                    eprintln!(
+                        "[zc-tailfold] gate u_gpu={u_gpu:.4}ms/chunk u_cpu={u_cpu:.4}ms/chunk \
+                         ratio={:.3} -> share {g}/{hi_size}",
+                        u_gpu / u_cpu,
+                    );
+                }
+                g
+            } else {
+                0
+            };
+            ZC_TAILFOLD_TUNED.store(share, Ordering::Relaxed);
+            ZcTailFoldResult::Calibrated
+        }
+    }
+
+    // -----------------------------------------------------------------------
     // Zerocheck first-tail-round (T3) compact-reconstruction products GPU
     // arm (see `ENV_NO_GPU_ZC_T3`).
     //
@@ -10071,6 +10836,11 @@ pub(crate) use imp::{ZcFoldJob, launch_lincheck_fold, launch_zerocheck_c_fold, z
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[cfg_attr(not(test), allow(unused_imports))]
 pub(crate) use imp::{ZcR2Job, ZcR2Result, launch_zc_r2_products, zc_r2_wait};
+
+/// Fused packed-tail GPU fold arm (see `ENV_NO_GPU_ZC_TAILFOLD`).
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[cfg_attr(not(test), allow(unused_imports))]
+pub(crate) use imp::{ZcTailFoldJob, ZcTailFoldResult, launch_zc_tailfold, zc_tailfold_wait};
 
 /// Zerocheck first-tail-round products GPU arm (see `ENV_NO_GPU_ZC_T3`).
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]

@@ -796,6 +796,428 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_with_deltas(
     (compact, mlv_challenges[0] * sum1, sum_inf)
 }
 
+/// Kill switch for the round-two compact-materialization elision:
+/// `FLOCK_NO_ZC_R2_COMPACT_ELIDE=1` restores the exact incumbent
+/// anchor/delta materialization and the compact tail fold as a same-binary
+/// control.
+pub const ENV_NO_ZC_R2_COMPACT_ELIDE: &str = "FLOCK_NO_ZC_R2_COMPACT_ELIDE";
+
+pub(crate) fn zc_r2_compact_elide_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os(ENV_NO_ZC_R2_COMPACT_ELIDE).is_none())
+}
+
+/// Products-only round-two message: identical `(G(1), G(inf))` to
+/// [`uni_skip_fold_and_round_pair_compact_padded`] without materializing the
+/// compact anchor/delta level at all.
+///
+/// The GPU products arm is unchanged. Chunks it covers need no CPU pass here
+/// (the incumbent ran the anchors-only store sweep over them); CPU chunks run
+/// the same fold/product schedule as the fused kernel minus every anchor and
+/// delta store. The packed inputs stay borrowed by the caller, so the first
+/// tail round can reconstruct the identical level directly from them via
+/// [`fold_packed_and_compute_round_pair`].
+pub fn uni_skip_round_pair_products_only_padded(
+    a_packed: &[u8],
+    b_packed: &[u8],
+    m: usize,
+    k_skip: usize,
+    table: &UniSkipFoldTable,
+    mlv_challenges: &[F128],
+    padding: &PaddingSpec,
+) -> (F128, F128) {
+    assert_eq!(
+        k_skip, 6,
+        "optimized products-only round-pair variant is k_skip=6 only"
+    );
+    assert_eq!(table.n_chunks, 8);
+    let n_chunks = table.n_chunks;
+    let n_out = 1usize << (m - k_skip);
+    let n_pairs = n_out / 2;
+    assert_eq!(a_packed.len(), n_out * n_chunks);
+    assert_eq!(b_packed.len(), n_out * n_chunks);
+    assert_eq!(mlv_challenges.len(), m - k_skip);
+
+    let eq = SplitEqGhash::with_n_hi(&mlv_challenges[1..], COMPACT_RECONSTRUCTION_N_HI);
+    let lo_size = 1usize << eq.n_lo;
+    let hi_size = 1usize << eq.n_hi;
+    assert_eq!(lo_size * hi_size, n_pairs);
+    let eq_hi = &eq.hi;
+    let eq_lo = &eq.lo;
+    let (pair_in_block_mask, useful_pairs_inclusive) = round2_pair_skip(padding, k_skip);
+    #[cfg(target_arch = "aarch64")]
+    let degen = r2_degen_enabled();
+
+    // GPU round-two products arm: identical launch and drain contract to the
+    // compact producer; only the CPU-side stores are gone.
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    let gpu_job = crate::gpu_commit::launch_zc_r2_products(
+        a_packed,
+        b_packed,
+        &table.data,
+        eq_lo,
+        eq_hi,
+        lo_size,
+        hi_size,
+        pair_in_block_mask,
+        useful_pairs_inclusive,
+    );
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    let gpu_prefix = gpu_job.as_ref().map_or(0, |j| j.cpu_split());
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    let t_cpu_sweep = std::time::Instant::now();
+
+    let mut partials: Vec<(F128, F128)> = vec![(F128::ZERO, F128::ZERO); hi_size];
+    let partials_base = crate::epool::SyncPtr(partials.as_mut_ptr());
+    crate::epool::run_hetero_chunks(hi_size, |x_hi| {
+        // GPU-covered prefix chunk: nothing to do at all — the GPU partial
+        // replaces this chunk's slot after the join and no compact level is
+        // materialized.
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        if x_hi < gpu_prefix {
+            return;
+        }
+        let pair_idx_base = x_hi * lo_size;
+        let row_base = pair_idx_base * 2;
+
+        #[cfg(target_arch = "aarch64")]
+        let (p1, pinf) = unsafe {
+            kernels::aarch64::fold_round2_products_only_chunk_neon_8(
+                table.data.as_ptr().cast::<u8>(),
+                a_packed.as_ptr().add(row_base * n_chunks),
+                b_packed.as_ptr().add(row_base * n_chunks),
+                eq_lo.as_ptr(),
+                lo_size,
+                pair_idx_base,
+                pair_in_block_mask,
+                useful_pairs_inclusive,
+                degen,
+            )
+        };
+
+        #[cfg(not(target_arch = "aarch64"))]
+        let (p1, pinf) = {
+            let mut p1_acc = F256Unreduced::ZERO;
+            let mut pinf_acc = F256Unreduced::ZERO;
+            for x_lo in 0..lo_size {
+                if ((pair_idx_base + x_lo) & pair_in_block_mask) >= useful_pairs_inclusive {
+                    continue;
+                }
+                let x0g = row_base + 2 * x_lo;
+                let x1g = x0g + 1;
+                let a0 = table.fold_one_row(&a_packed[x0g * n_chunks..(x0g + 1) * n_chunks]);
+                let a1 = table.fold_one_row(&a_packed[x1g * n_chunks..(x1g + 1) * n_chunks]);
+                let b0 = table.fold_one_row(&b_packed[x0g * n_chunks..(x0g + 1) * n_chunks]);
+                let b1 = table.fold_one_row(&b_packed[x1g * n_chunks..(x1g + 1) * n_chunks]);
+                let eq_l = eq_lo[x_lo];
+                p1_acc ^= eq_l.mul_unreduced(a1 * b1);
+                pinf_acc ^= eq_l.mul_unreduced((a0 + a1) * (b0 + b1));
+            }
+            (p1_acc.reduce(), pinf_acc.reduce())
+        };
+
+        let eq_h = eq_hi[x_hi];
+        // SAFETY: exclusive owner of partials[x_hi]; the queue join publishes
+        // the write before the reduction reads it.
+        unsafe {
+            *partials_base.ptr().add(x_hi) = (eq_h * p1, eq_h * pinf);
+        }
+    });
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    if let Some(job) = gpu_job {
+        let cpu_wall_ms = t_cpu_sweep.elapsed().as_secs_f64() * 1e3;
+        let calib = job.is_calibration();
+        let prefix = job.cpu_split();
+        let res = crate::gpu_commit::zc_r2_wait(
+            job,
+            if calib {
+                Some(partials.as_slice())
+            } else {
+                None
+            },
+            cpu_wall_ms,
+            hi_size,
+        );
+        match res {
+            crate::gpu_commit::ZcR2Result::Calibrated => {}
+            crate::gpu_commit::ZcR2Result::Prefix(vals) => {
+                partials[..prefix].copy_from_slice(&vals);
+            }
+            crate::gpu_commit::ZcR2Result::Failed => {
+                // Redo exactly the skipped prefix products — slower, still
+                // exact, and store-free.
+                for x_hi in 0..prefix {
+                    let pair_idx_base = x_hi * lo_size;
+                    let row_base = pair_idx_base * 2;
+                    let (p1, pinf) = unsafe {
+                        kernels::aarch64::fold_round2_products_only_chunk_neon_8(
+                            table.data.as_ptr().cast::<u8>(),
+                            a_packed.as_ptr().add(row_base * n_chunks),
+                            b_packed.as_ptr().add(row_base * n_chunks),
+                            eq_lo.as_ptr(),
+                            lo_size,
+                            pair_idx_base,
+                            pair_in_block_mask,
+                            useful_pairs_inclusive,
+                            degen,
+                        )
+                    };
+                    let eq_h = eq_hi[x_hi];
+                    partials[x_hi] = (eq_h * p1, eq_h * pinf);
+                }
+            }
+        }
+    }
+
+    let (sum1, sum_inf) = partials
+        .iter()
+        .fold((F128::ZERO, F128::ZERO), |(s1, sinf), &(c1, cinf)| {
+            (s1 + c1, sinf + cinf)
+        });
+
+    (mlv_challenges[0] * sum1, sum_inf)
+}
+
+/// Fused packed-input first tail round: bind the sampled challenge directly
+/// from the packed post-URM rows and compute the following round message,
+/// producing the identical `(a, b)` level that
+/// [`fold_compact_and_compute_round_pair`] reconstructs from the compact
+/// anchor/delta materialization.
+///
+/// Bit-identity follows from the XOR-linearity of the fold table
+/// (`table[x ^ y] = table[x] + table[y]`):
+///
+/// `anchor + fold_rho(row0 XOR row1)
+///    = fold(row0) + rho*fold(row0) + rho*fold(row1)
+///    = fold_(1+rho)(row0) + fold_rho(row1)`,
+///
+/// so two challenge-scaled 32 KiB tables over the raw rows produce exactly
+/// the compact reconstruction's bytes, padding pairs zero identically through
+/// the same `round2_pair_skip` mask the producer used, and the message
+/// accumulators consume identical values in the identical order.
+pub fn fold_packed_and_compute_round_pair(
+    a_packed: &[u8],
+    b_packed: &[u8],
+    m: usize,
+    k_skip: usize,
+    table: &UniSkipFoldTable,
+    r_fold: F128,
+    r_next: &[F128],
+    padding: &PaddingSpec,
+) -> (Vec<F128>, Vec<F128>, F128, F128) {
+    assert_eq!(k_skip, 6, "fused packed tail variant is k_skip=6 only");
+    assert_eq!(table.n_chunks, 8);
+    let n_chunks = table.n_chunks;
+    let n_out = 1usize << (m - k_skip);
+    let n = n_out / 2;
+    assert_eq!(a_packed.len(), n_out * n_chunks);
+    assert_eq!(b_packed.len(), n_out * n_chunks);
+    assert!(n.is_power_of_two() && n >= 4);
+    assert_eq!(r_next.len(), n.trailing_zeros() as usize);
+
+    // Compose the sampled challenge into two resident 32 KiB byte tables:
+    // `t_one_rho` carries `(1 + rho)`-scaled entries (the anchor-plus-delta
+    // share of the even row) and `t_rho` carries `rho`-scaled entries (the
+    // odd row's share).
+    let t_one_rho = table.scaled_linear(F128::ONE + r_fold);
+    let t_rho = table.scaled_linear(r_fold);
+
+    let eq = SplitEqGhash::with_n_hi(&r_next[1..], COMPACT_RECONSTRUCTION_N_HI);
+    let lo_size = 1usize << eq.n_lo;
+    let hi_size = 1usize << eq.n_hi;
+    assert_eq!(lo_size * hi_size * 2, n);
+    let chunk_size = 2 * lo_size;
+    let eq_hi = &eq.hi;
+    let eq_lo = &eq.lo;
+    let (pair_in_block_mask, useful_pairs_inclusive) = round2_pair_skip(padding, k_skip);
+
+    // Same unpinned-take contract as the compact tail (no-copy wrap targets
+    // for the later rounds).
+    let mut a_out = crate::scratch::take_f128_unpinned(n);
+    let mut b_out = crate::scratch::take_f128_unpinned(n);
+
+    // Packed-tail GPU fold arm (see `ENV_NO_GPU_ZC_TAILFOLD`): a measured
+    // prefix of the hi-chunks is folded entirely on the device, which reuses
+    // the round-two arm's no-copy input wraps and stores the reconstructed
+    // level straight into these output buffers. Calibration runs store-free
+    // in the untimed warm-up and must match the CPU's partials and output
+    // checksums bit-for-bit; any later failure poisons the arm and the
+    // prefix is CPU-redone through the exact fused kernel. `None` = the
+    // exact all-CPU sweep.
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    let gpu_job = crate::gpu_commit::launch_zc_tailfold(
+        a_packed,
+        b_packed,
+        &t_one_rho,
+        &t_rho,
+        eq_lo,
+        eq_hi,
+        &mut a_out,
+        &mut b_out,
+        lo_size,
+        hi_size,
+        pair_in_block_mask,
+        useful_pairs_inclusive,
+    );
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    let gpu_prefix = gpu_job.as_ref().map_or(0, |j| j.cpu_split());
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    let t_cpu_sweep = std::time::Instant::now();
+
+    let mut partials: Vec<(F128, F128)> = vec![(F128::ZERO, F128::ZERO); hi_size];
+    let a_base = crate::epool::SyncPtr(a_out.as_mut_ptr());
+    let b_base = crate::epool::SyncPtr(b_out.as_mut_ptr());
+    let partials_base = crate::epool::SyncPtr(partials.as_mut_ptr());
+    crate::epool::run_hetero_chunks(hi_size, |x_hi| {
+        // GPU-covered prefix chunk: the device writes these outputs and its
+        // reduced partials replace the slots after the join.
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        if x_hi < gpu_prefix {
+            return;
+        }
+        // SAFETY: exclusive per-chunk ownership; queue join publishes writes.
+        let (a_out, b_out) = unsafe {
+            (
+                std::slice::from_raw_parts_mut(a_base.ptr().add(x_hi * chunk_size), chunk_size),
+                std::slice::from_raw_parts_mut(b_base.ptr().add(x_hi * chunk_size), chunk_size),
+            )
+        };
+        let out_idx_base = x_hi * chunk_size;
+
+        #[cfg(target_arch = "aarch64")]
+        let (p1, pinf) = unsafe {
+            kernels::aarch64::fold_packed_tail_chunk_neon_unchecked_8(
+                t_one_rho.as_ptr().cast::<u8>(),
+                t_rho.as_ptr().cast::<u8>(),
+                a_packed.as_ptr().add(out_idx_base * 2 * n_chunks),
+                b_packed.as_ptr().add(out_idx_base * 2 * n_chunks),
+                a_out.as_mut_ptr(),
+                b_out.as_mut_ptr(),
+                eq_lo.as_ptr(),
+                lo_size,
+                out_idx_base,
+                pair_in_block_mask,
+                useful_pairs_inclusive,
+            )
+        };
+
+        #[cfg(not(target_arch = "aarch64"))]
+        let (p1, pinf) = {
+            let fold2 = |packed: &[u8], out_index: usize| -> F128 {
+                if (out_index & pair_in_block_mask) >= useful_pairs_inclusive {
+                    return F128::ZERO;
+                }
+                let r0 = 2 * out_index;
+                let r1 = r0 + 1;
+                let mut acc = F128::ZERO;
+                for j in 0..n_chunks {
+                    acc += t_one_rho[j * 256 + packed[r0 * n_chunks + j] as usize];
+                    acc += t_rho[j * 256 + packed[r1 * n_chunks + j] as usize];
+                }
+                acc
+            };
+            let mut p1_acc = F256Unreduced::ZERO;
+            let mut pinf_acc = F256Unreduced::ZERO;
+            for x_lo in 0..lo_size {
+                let out = 2 * x_lo;
+                for lane in 0..2 {
+                    let index = out_idx_base + out + lane;
+                    a_out[out + lane] = fold2(a_packed, index);
+                    b_out[out + lane] = fold2(b_packed, index);
+                }
+                let a0 = a_out[out];
+                let a1 = a_out[out + 1];
+                let b0 = b_out[out];
+                let b1 = b_out[out + 1];
+                let eq_l = eq_lo[x_lo];
+                p1_acc ^= eq_l.mul_unreduced(a1 * b1);
+                pinf_acc ^= eq_l.mul_unreduced((a0 + a1) * (b0 + b1));
+            }
+            (p1_acc.reduce(), pinf_acc.reduce())
+        };
+
+        let eq_h = eq_hi[x_hi];
+        // SAFETY: exclusive owner of partials[x_hi] (see above).
+        unsafe {
+            *partials_base.ptr().add(x_hi) = (eq_h * p1, eq_h * pinf);
+        }
+    });
+    // Drain the packed-tail GPU arm: merge prefix partials (timed proves),
+    // finish calibration against the CPU's partials and output checksums
+    // (untimed warm-up), or CPU-redo the skipped prefix on any post-admission
+    // Metal failure.
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    if let Some(job) = gpu_job {
+        let cpu_wall_ms = t_cpu_sweep.elapsed().as_secs_f64() * 1e3;
+        let calib = job.is_calibration();
+        let prefix = job.cpu_split();
+        let probe = job.chunks;
+        let checks: Vec<(F128, F128)> = if calib {
+            (0..probe)
+                .map(|c| {
+                    let base = c * chunk_size;
+                    let xa = a_out[base..base + chunk_size]
+                        .iter()
+                        .fold(F128::ZERO, |s, &v| s + v);
+                    let xb = b_out[base..base + chunk_size]
+                        .iter()
+                        .fold(F128::ZERO, |s, &v| s + v);
+                    (xa, xb)
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let res = crate::gpu_commit::zc_tailfold_wait(
+            job,
+            if calib {
+                Some((partials.as_slice(), checks.as_slice()))
+            } else {
+                None
+            },
+            cpu_wall_ms,
+            hi_size,
+        );
+        match res {
+            crate::gpu_commit::ZcTailFoldResult::Calibrated => {}
+            crate::gpu_commit::ZcTailFoldResult::Prefix(vals) => {
+                partials[..prefix].copy_from_slice(&vals);
+            }
+            crate::gpu_commit::ZcTailFoldResult::Failed => {
+                // Redo exactly the skipped prefix — outputs and products —
+                // through the exact fused kernel. Slower, still exact.
+                for x_hi in 0..prefix {
+                    let out_idx_base = x_hi * chunk_size;
+                    let (p1, pinf) = unsafe {
+                        kernels::aarch64::fold_packed_tail_chunk_neon_unchecked_8(
+                            t_one_rho.as_ptr().cast::<u8>(),
+                            t_rho.as_ptr().cast::<u8>(),
+                            a_packed.as_ptr().add(out_idx_base * 2 * n_chunks),
+                            b_packed.as_ptr().add(out_idx_base * 2 * n_chunks),
+                            a_out.as_mut_ptr().wrapping_add(out_idx_base),
+                            b_out.as_mut_ptr().wrapping_add(out_idx_base),
+                            eq_lo.as_ptr(),
+                            lo_size,
+                            out_idx_base,
+                            pair_in_block_mask,
+                            useful_pairs_inclusive,
+                        )
+                    };
+                    let eq_h = eq_hi[x_hi];
+                    partials[x_hi] = (eq_h * p1, eq_h * pinf);
+                }
+            }
+        }
+    }
+    let (sum1, sum_inf) = partials
+        .iter()
+        .fold((F128::ZERO, F128::ZERO), |(s1, sinf), &(c1, cinf)| {
+            (s1 + c1, sinf + cinf)
+        });
+
+    (a_out, b_out, r_next[0] * sum1, sum_inf)
+}
+
 /// Byte-lane-outer streaming variant of
 /// [`uni_skip_fold_and_round_pair_compact_padded`]. Bit-identical outputs
 /// (fold XOR trees are merely reassociated). `lanes_per_pass ∈ {1, 2, 4, 8}`
@@ -2488,6 +2910,85 @@ mod tests {
         assert_eq!(a11, a9, "folded a differs across equality splits");
         assert_eq!(b11, b9, "folded b differs across equality splits");
         assert_eq!(msg11, msg9, "round message differs across equality splits");
+    }
+
+    /// Elision oracle: the products-only round-two message and the fused
+    /// packed-input first tail round must be bit-identical to the compact
+    /// pathway on a padded shape that contains a static b≡1 mass (all-ones
+    /// fast path), mixed rows (generic path), and padding pairs (zeroing),
+    /// across rho = 0, 1, and a random challenge.
+    #[test]
+    fn products_only_and_fused_packed_tail_match_compact_pathway() {
+        const K_SKIP: usize = 6;
+        const M: usize = 20;
+        const K_LOG: usize = 14;
+        const USEFUL_BITS: usize = 15_409;
+
+        crate::scratch::clear();
+        let mut rng = Rng::new(0xE11D_E);
+        let mut a = rng.bits(1 << M);
+        let mut b = rng.bits(1 << M);
+        let block_size = 1usize << K_LOG;
+        for block in 0..(1usize << (M - K_LOG)) {
+            a[block * block_size + USEFUL_BITS..(block + 1) * block_size].fill(false);
+            b[block * block_size + USEFUL_BITS..(block + 1) * block_size].fill(false);
+        }
+        // Static b≡1 mass in the first two blocks' useful region so the
+        // all-ones fast path and the mixed tail row both execute.
+        for block in 0..2 {
+            b[block * block_size..block * block_size + USEFUL_BITS].fill(true);
+        }
+        let a_packed = pack_bits(&a);
+        let b_packed = pack_bits(&b);
+        let z = rng.f128();
+        let mlv_challenges = rng.f128_vec(M - K_SKIP);
+        let r_next = rng.f128_vec(M - K_SKIP - 1);
+        let random_rho = rng.f128();
+        let table = UniSkipFoldTable::new(K_SKIP, z);
+        let padding = PaddingSpec {
+            k_log: K_LOG,
+            useful_bits_per_block: USEFUL_BITS,
+        };
+
+        let (compact, compact_m1, compact_mi) = uni_skip_fold_and_round_pair_compact_padded(
+            &a_packed,
+            &b_packed,
+            M,
+            K_SKIP,
+            &table,
+            &mlv_challenges,
+            &padding,
+        );
+        let (po_m1, po_mi) = uni_skip_round_pair_products_only_padded(
+            &a_packed,
+            &b_packed,
+            M,
+            K_SKIP,
+            &table,
+            &mlv_challenges,
+            &padding,
+        );
+        assert_eq!(
+            (po_m1, po_mi),
+            (compact_m1, compact_mi),
+            "products-only round-two message mismatch"
+        );
+
+        for &rho in &[F128::ZERO, F128::ONE, random_rho] {
+            let (ca, cb, cm1, cmi) =
+                fold_compact_and_compute_round_pair(&compact, &table, rho, &r_next);
+            let (fa, fb, fm1, fmi) = fold_packed_and_compute_round_pair(
+                &a_packed, &b_packed, M, K_SKIP, &table, rho, &r_next, &padding,
+            );
+            assert_eq!(fa, ca, "fused a level mismatch at rho={rho:?}");
+            assert_eq!(fb, cb, "fused b level mismatch at rho={rho:?}");
+            assert_eq!(
+                (fm1, fmi),
+                (cm1, cmi),
+                "fused next message mismatch at rho={rho:?}"
+            );
+        }
+        compact.recycle();
     }
 
     /// Full compact-path oracle against the legacy materialized round two.
