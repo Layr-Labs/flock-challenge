@@ -8091,7 +8091,7 @@ static inline uint4 zc_r2_fold8(uint lo, uint hi, threadgroup const uint4* nib) 
     return acc;
 }
 
-struct ZcR2Params { uint lo_size; uint xpt; uint mask; uint useful; };
+struct ZcR2Params { uint lo_size; uint xpt; uint mask; uint useful; uint in_place; };
 
 // One threadgroup per hi-chunk (256 threads, xpt = lo_size/256 x_lo groups
 // per thread). Per pair: read both packed rows of a and b (one uint4 each,
@@ -8125,9 +8125,15 @@ kernel void zc_r2_products(
         uint4 ar = a_in[pair_idx];
         uint4 br = b_in[pair_idx];
         uint4 a0 = zc_r2_fold8(ar.x, ar.y, nib);
-        uint4 a1 = zc_r2_fold8(ar.z, ar.w, nib);
+        uint4 a1 = zc_r2_fold8(
+            p.in_place != 0u ? ar.x ^ ar.z : ar.z,
+            p.in_place != 0u ? ar.y ^ ar.w : ar.w,
+            nib);
         uint4 b0 = zc_r2_fold8(br.x, br.y, nib);
-        uint4 b1 = zc_r2_fold8(br.z, br.w, nib);
+        uint4 b1 = zc_r2_fold8(
+            p.in_place != 0u ? br.x ^ br.z : br.z,
+            p.in_place != 0u ? br.y ^ br.w : br.w,
+            nib);
 
         uint4 g1 = gf_reduce(clmul128(a1, b1));
         uint4 gi = gf_reduce(clmul128(a0 ^ a1, b0 ^ b1));
@@ -8371,6 +8377,7 @@ kernel void zc_r2_products(
         lo_size: usize,
         mask: u32,
         useful: u32,
+        in_place: bool,
         submitted: std::time::Instant,
     }
 
@@ -8412,6 +8419,7 @@ kernel void zc_r2_products(
         lo_size: usize,
         mask: u32,
         useful: u32,
+        in_place: bool,
     ) -> Result<Id, String> {
         unsafe {
             #[repr(C)]
@@ -8420,12 +8428,14 @@ kernel void zc_r2_products(
                 xpt: u32,
                 mask: u32,
                 useful: u32,
+                in_place: u32,
             }
             let params = P {
                 lo_size: lo_size as u32,
                 xpt: (lo_size / 256) as u32,
                 mask,
                 useful,
+                in_place: u32::from(in_place),
             };
             let pb = std::slice::from_raw_parts(
                 (&raw const params).cast::<u8>(),
@@ -8478,6 +8488,7 @@ kernel void zc_r2_products(
         hi_size: usize,
         pair_in_block_mask: usize,
         useful_pairs_inclusive: usize,
+        in_place: bool,
     ) -> Option<ZcR2Job> {
         use std::sync::atomic::Ordering;
         if !super::gpu_zc_r2_enabled() || ZC_R2_POISONED.load(Ordering::Relaxed) {
@@ -8572,6 +8583,7 @@ kernel void zc_r2_products(
                 lo_size,
                 pair_in_block_mask as u32,
                 useful_pairs_inclusive as u32,
+                in_place,
             )
             .ok()?;
             Some(ZcR2Job {
@@ -8581,6 +8593,7 @@ kernel void zc_r2_products(
                 lo_size,
                 mask: pair_in_block_mask as u32,
                 useful: useful_pairs_inclusive as u32,
+                in_place,
                 submitted: std::time::Instant::now(),
             })
         }
@@ -8675,7 +8688,15 @@ kernel void zc_r2_products(
             {
                 while n_walls < walls.len() {
                     let Ok(cb2) = zc_r2_submit(
-                        gpu, &state, a_buf, b_buf, job.chunks, job.lo_size, job.mask, job.useful,
+                        gpu,
+                        &state,
+                        a_buf,
+                        b_buf,
+                        job.chunks,
+                        job.lo_size,
+                        job.mask,
+                        job.useful,
+                        job.in_place,
                     ) else {
                         break;
                     };
@@ -11962,6 +11983,7 @@ DEF_PROBE(probe_g4_t8_p0,    8u,  0u,   tsel & 7u)
         imp::zc_r2_test_reset();
         let job = imp::launch_zc_r2_products(
             &a_packed, &b_packed, &table_data, &eq_lo, &eq_hi, lo_size, hi_size, mask, useful,
+            false,
         )
         .expect("calibration launch must succeed on real Metal");
         assert!(job.is_calibration());
@@ -11976,6 +11998,7 @@ DEF_PROBE(probe_g4_t8_p0,    8u,  0u,   tsel & 7u)
         imp::zc_r2_test_set_share(hi_size / 2);
         let job2 = imp::launch_zc_r2_products(
             &a_packed, &b_packed, &table_data, &eq_lo, &eq_hi, lo_size, hi_size, mask, useful,
+            false,
         )
         .expect("timed launch must succeed");
         assert!(!job2.is_calibration());
@@ -11987,6 +12010,45 @@ DEF_PROBE(probe_g4_t8_p0,    8u,  0u,   tsel & 7u)
                 assert_eq!(&vals[..], &cpu_partials[..prefix], "prefix partials bit-exact");
             }
             _ => panic!("timed drain must return prefix partials"),
+        }
+
+        // The V13 representation keeps row0 and replaces row1 by row0 XOR
+        // row1.  The same shader reconstructs row1 under its uniform flag;
+        // both calibration and timed-prefix outputs must remain the original
+        // CPU oracle values.
+        for pair in a_packed.chunks_exact_mut(16) {
+            let (even, delta) = pair.split_at_mut(8);
+            for j in 0..8 {
+                delta[j] ^= even[j];
+            }
+        }
+        for pair in b_packed.chunks_exact_mut(16) {
+            let (even, delta) = pair.split_at_mut(8);
+            for j in 0..8 {
+                delta[j] ^= even[j];
+            }
+        }
+        imp::zc_r2_test_reset();
+        let in_place_job = imp::launch_zc_r2_products(
+            &a_packed, &b_packed, &table_data, &eq_lo, &eq_hi, lo_size, hi_size, mask, useful,
+            true,
+        )
+        .expect("in-place calibration launch must succeed");
+        assert!(matches!(
+            imp::zc_r2_wait(in_place_job, Some(&cpu_partials), 50.0, hi_size),
+            imp::ZcR2Result::Calibrated
+        ));
+        imp::zc_r2_test_set_share(hi_size / 2);
+        let in_place_job = imp::launch_zc_r2_products(
+            &a_packed, &b_packed, &table_data, &eq_lo, &eq_hi, lo_size, hi_size, mask, useful,
+            true,
+        )
+        .expect("in-place timed launch must succeed");
+        match imp::zc_r2_wait(in_place_job, None, 0.0, hi_size) {
+            imp::ZcR2Result::Prefix(vals) => {
+                assert_eq!(&vals[..], &cpu_partials[..vals.len()]);
+            }
+            _ => panic!("in-place timed drain must return prefix partials"),
         }
         imp::zc_r2_test_reset();
     }

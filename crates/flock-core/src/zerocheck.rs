@@ -28,8 +28,10 @@ pub mod univariate_skip_optimized;
 
 use multilinear::{
     UniSkipFoldTable, fold_and_compute_round_pair_into, fold_compact_and_compute_round_pair,
-    fold_in_place_pair, interpolate_at_z_combined, interpolate_at_z_on_lambda, round_pair_naive,
+    fold_in_place_deltas_and_compute_round_pair, fold_in_place_pair, interpolate_at_z_combined,
+    interpolate_at_z_on_lambda, round_pair_naive,
     uni_skip_fold_and_round_pair_compact_padded_with_deltas,
+    uni_skip_fold_and_round_pair_in_place_deltas_padded,
 };
 use univariate_skip_optimized::{
     c_s_f128, medium_challenges_ghash, round1_shift_reduce_extract_c_packed_padded,
@@ -239,9 +241,10 @@ pub struct CapturedSHatVC {
 }
 
 /// Capture-`s_hat_v_c` prover that consumes a challenge-independent AB inner
-/// transform prepared while the witness commitment was being built. The
-/// original A and B buffers are still required and remain untouched for the
-/// challenge-dependent round-2 fold.
+/// transform prepared while the witness commitment was being built. The A and
+/// B buffers are still required for the challenge-dependent round-2 fold. They
+/// either retain ordinary rows or carry adjacent-row deltas in dead odd rows,
+/// as recorded by the precomputed transform.
 pub fn prove_packed_padded_capture_s_hat_v_c_with_precomputed_ab<C: Challenger>(
     a_packed: &[u8],
     b_packed: &[u8],
@@ -312,7 +315,7 @@ fn prove_packed_padded_inner<C: Challenger>(
     m: usize,
     padding: &PaddingSpec,
     capture_s_hat_v_c: bool,
-    precomputed_ab: Option<univariate_skip_optimized::Round1AbInner>,
+    mut precomputed_ab: Option<univariate_skip_optimized::Round1AbInner>,
     c_lincheck: Option<&[u8]>,
     challenger: &mut C,
 ) -> (ZerocheckProof, ZerocheckClaim, Option<CapturedSHatVC>) {
@@ -538,11 +541,20 @@ fn prove_packed_padded_inner<C: Challenger>(
         );
         (ab, c, None)
     };
-    // The A-sized transform is dead after the round-1 message. Its byte length
-    // exactly matches compact round two's delta storage, so retain its F128
-    // allocation/layout and donate it instead of taking a fresh Vec<u8>.
-    let compact_deltas =
-        precomputed_ab.map(univariate_skip_optimized::Round1AbInner::into_scratch_bytes);
+    let pair_deltas_in_place = precomputed_ab
+        .as_ref()
+        .is_some_and(univariate_skip_optimized::Round1AbInner::pair_deltas_in_place);
+    // Incumbent: donate the dead round-one transform as contiguous delta
+    // backing. Candidate: the deltas already occupy A/B odd rows, so recycle
+    // the transform now and avoid materializing a second 512 MiB surface.
+    let compact_deltas = if pair_deltas_in_place {
+        drop(precomputed_ab.take());
+        None
+    } else {
+        precomputed_ab
+            .take()
+            .map(univariate_skip_optimized::Round1AbInner::into_scratch_bytes)
+    };
     let c_s = c_s_f128();
     let round1_ab: Vec<F128> = round1_ab_opt.iter().map(|x| c_s * *x).collect();
     let round1_c: Vec<F128> = round1_c_opt.iter().map(|x| c_s * *x).collect();
@@ -578,16 +590,32 @@ fn prove_packed_padded_inner<C: Challenger>(
     let fold_table = UniSkipFoldTable::new(k_skip, z);
     let mut mlv_arg = vec![F128::ONE; n_mlv];
     mlv_arg[1..].copy_from_slice(&r[k_skip + 1..]);
-    let (compact_mlv, msg_1, msg_inf) = uni_skip_fold_and_round_pair_compact_padded_with_deltas(
-        a_packed,
-        b_packed,
-        m,
-        k_skip,
-        &fold_table,
-        &mlv_arg,
-        padding,
-        compact_deltas,
-    );
+    let (compact_mlv, in_place_anchors, msg_1, msg_inf) = if pair_deltas_in_place {
+        let (anchors, msg_1, msg_inf) =
+            uni_skip_fold_and_round_pair_in_place_deltas_padded(
+                a_packed,
+                b_packed,
+                m,
+                k_skip,
+                &fold_table,
+                &mlv_arg,
+                padding,
+            );
+        (None, Some(anchors), msg_1, msg_inf)
+    } else {
+        let (compact, msg_1, msg_inf) =
+            uni_skip_fold_and_round_pair_compact_padded_with_deltas(
+                a_packed,
+                b_packed,
+                m,
+                k_skip,
+                &fold_table,
+                &mlv_arg,
+                padding,
+                compact_deltas,
+            );
+        (Some(compact), None, msg_1, msg_inf)
+    };
 
     if zc_timing {
         eprintln!(
@@ -623,8 +651,25 @@ fn prove_packed_padded_inner<C: Challenger>(
     let t_t3 = std::time::Instant::now();
     let mut first_r_next = vec![F128::ONE; n_mlv - 1];
     first_r_next[1..].copy_from_slice(&r[k_skip + 2..]);
-    let (mut a_mlv, mut b_mlv, first_m1, first_mi) =
-        fold_compact_and_compute_round_pair(&compact_mlv, &fold_table, mlv_rhos[0], &first_r_next);
+    let (mut a_mlv, mut b_mlv, first_m1, first_mi) = if let Some(anchors) =
+        in_place_anchors.as_ref()
+    {
+        fold_in_place_deltas_and_compute_round_pair(
+            anchors,
+            a_packed,
+            b_packed,
+            &fold_table,
+            mlv_rhos[0],
+            &first_r_next,
+        )
+    } else {
+        fold_compact_and_compute_round_pair(
+            compact_mlv.as_ref().expect("separate compact representation"),
+            &fold_table,
+            mlv_rhos[0],
+            &first_r_next,
+        )
+    };
     if tail_round_timing {
         eprintln!(
             "[zc-tail-rounds] T3 compact fold (out n={}): {:.2} ms",
@@ -632,7 +677,12 @@ fn prove_packed_padded_inner<C: Challenger>(
             t_t3.elapsed().as_secs_f64() * 1e3
         );
     }
-    compact_mlv.recycle();
+    if let Some(compact) = compact_mlv {
+        compact.recycle();
+    }
+    if let Some(anchors) = in_place_anchors {
+        crate::scratch::give_f128(anchors);
+    }
     multilinear_msgs.push((first_m1, first_mi));
     challenger.observe_f128(first_m1);
     challenger.observe_f128(first_mi);
