@@ -4549,15 +4549,26 @@ kernel void blake3_pow_scan(
     /// cost, which ~120 fresh workers pay against a hard 10-minute cap.
     const RANKED_EXACT_TUNE_CANDIDATES: [usize; 3] = [0, 3, 5];
 
+    /// One sweep observation: the `rayon::join` wall the incumbent scores on,
+    /// plus the wall of the **k-dependent graph arm alone** measured inside
+    /// the same join (so the contention the tuner exists to reproduce is
+    /// bit-for-bit unchanged — only the stopwatch is added).
+    #[derive(Clone, Copy, Default, PartialEq, Debug)]
+    struct ExactSample {
+        /// Wall of the whole `join(graph, replay_ab)` — i.e. `max(arm)`.
+        join_ms: f64,
+        /// Wall of the graph arm on its own.
+        graph_ms: f64,
+    }
+
     /// Two samples per candidate, with the second pass in reverse order so
     /// thermal drift, queue warmup, and A/B replay cache state do not favor
-    /// either end of the search range. Selection consumes the mean rather
-    /// than a noise-sensitive minimum.
+    /// either end of the search range.
     fn collect_ranked_exact_samples<E>(
         mut reprime: impl FnMut() -> Result<(), E>,
-        mut sample: impl FnMut(usize) -> Result<f64, E>,
-    ) -> Result<[[f64; 2]; RANKED_EXACT_TUNE_CANDIDATES.len()], E> {
-        let mut walls = [[0.0; 2]; RANKED_EXACT_TUNE_CANDIDATES.len()];
+        mut sample: impl FnMut(usize) -> Result<ExactSample, E>,
+    ) -> Result<[[ExactSample; 2]; RANKED_EXACT_TUNE_CANDIDATES.len()], E> {
+        let mut walls = [[ExactSample::default(); 2]; RANKED_EXACT_TUNE_CANDIDATES.len()];
         for (i, &k) in RANKED_EXACT_TUNE_CANDIDATES.iter().enumerate() {
             reprime()?;
             walls[i][0] = sample(k)?;
@@ -4569,17 +4580,85 @@ kernel void blake3_pow_scan(
         Ok(walls)
     }
 
-    fn mean_ranked_exact_samples(
-        samples: [[f64; 2]; RANKED_EXACT_TUNE_CANDIDATES.len()],
+    /// Opt-in (`FLOCK_HYBRID_TUNE_ARM=1`) scoring on the k-dependent graph arm
+    /// alone instead of the join wall. **Off by default, deliberately.**
+    ///
+    /// This is `gopikannappan`'s F2. Its premise — "minimising the graph arm is
+    /// never the wrong objective, because where it is critical it also
+    /// minimises the join, and where it is not it is harmless" — holds only for
+    /// *independent* arms, and these two are not: the graph arm's CPU share and
+    /// the A/B replay draw from the same pool. Lowering the graph arm's wall is
+    /// achieved precisely by handing it more CPU, which slows the co-resident
+    /// replay. The prove pays `max(arm)`, so the join wall is the correct
+    /// objective and the incumbent was right to score it. Retained as a switch
+    /// only so the arm walls stay measurable on a runner-class host.
+    #[inline]
+    fn hybrid_tune_arm_scoring_enabled() -> bool {
+        use std::sync::OnceLock;
+        static ON: OnceLock<bool> = OnceLock::new();
+        *ON.get_or_init(|| std::env::var_os("FLOCK_HYBRID_TUNE_ARM").is_some())
+    }
+
+    /// `FLOCK_NO_HYBRID_TUNE_MIN=1` restores the incumbent mean-of-two
+    /// estimator instead of the per-candidate minimum.
+    #[inline]
+    fn hybrid_tune_min_scoring_enabled() -> bool {
+        use std::sync::OnceLock;
+        static ON: OnceLock<bool> = OnceLock::new();
+        *ON.get_or_init(|| std::env::var_os("FLOCK_NO_HYBRID_TUNE_MIN").is_none())
+    }
+
+    /// Reduce each candidate's two observations to the single wall
+    /// [`choose_hybrid_k`] selects on.
+    ///
+    /// The shipped correction is (2) alone; (1) is off by default — see
+    /// [`hybrid_tune_arm_scoring_enabled`] for why its premise fails on
+    /// resource-coupled arms.
+    ///
+    /// 1. *(opt-in, refuted)* Score the k-dependent graph arm rather than the
+    ///    join.
+    ///
+    /// 2. **Reduce with the minimum, not the mean.** Sweep pollution is
+    ///    *one-sided* — a cold Metal queue, GPU clock ramp and first-touch of
+    ///    the staging/tree views only ever make a pass slower, never faster,
+    ///    and cold-process ratio readings on this hardware run 2–4× high. The
+    ///    first pass eats essentially all of it, so a mean drags each
+    ///    candidate toward its own worst observation and the winner becomes
+    ///    whichever candidate happened to be sampled after the queue warmed.
+    ///    The minimum is the maximum-likelihood estimate of the true wall
+    ///    under one-sided contamination, and it is also what
+    ///    [`choose_hybrid_k`]'s `best_ms` parameter and the plain sweep's
+    ///    documented "per-candidate min" already contract for. Costs no extra
+    ///    sample, so the 10-minute job wall is untouched.
+    fn score_ranked_exact_samples(
+        samples: [[ExactSample; 2]; RANKED_EXACT_TUNE_CANDIDATES.len()],
     ) -> Option<[f64; RANKED_EXACT_TUNE_CANDIDATES.len()]> {
-        let mut means = [0.0; RANKED_EXACT_TUNE_CANDIDATES.len()];
-        for (mean, [a, b]) in means.iter_mut().zip(samples) {
-            if !a.is_finite() || !b.is_finite() || a < 0.0 || b < 0.0 {
+        let arm = hybrid_tune_arm_scoring_enabled();
+        let robust = hybrid_tune_min_scoring_enabled();
+        let mut out = [0.0; RANKED_EXACT_TUNE_CANDIDATES.len()];
+        for (slot, [p, q]) in out.iter_mut().zip(samples) {
+            let (a, b) = if arm {
+                (p.graph_ms, q.graph_ms)
+            } else {
+                (p.join_ms, q.join_ms)
+            };
+            // Any non-finite or negative observation in EITHER statistic
+            // aborts the sweep exactly as the incumbent did, so a broken
+            // clock can never silently reshape the choice.
+            if !p.join_ms.is_finite()
+                || !q.join_ms.is_finite()
+                || !p.graph_ms.is_finite()
+                || !q.graph_ms.is_finite()
+                || p.join_ms < 0.0
+                || q.join_ms < 0.0
+                || p.graph_ms < 0.0
+                || q.graph_ms < 0.0
+            {
                 return None;
             }
-            *mean = (a + b) * 0.5;
+            *slot = if robust { a.min(b) } else { (a + b) * 0.5 };
         }
-        Some(means)
+        Some(out)
     }
 
     #[inline]
@@ -4956,11 +5035,24 @@ kernel void blake3_pow_scan(
                 }
             }
         };
-        let sample = |k: usize| -> Result<f64, String> {
+        let sample = |k: usize| -> Result<ExactSample, String> {
             let t0 = std::time::Instant::now();
-            let (graph, ()) = rayon::join(|| timed_graph(k), || replay_ab());
+            // The join, its two closures and their scheduling are unchanged;
+            // the inner Instant only observes the k-dependent arm.
+            let (graph, ()) = rayon::join(
+                || {
+                    let g0 = std::time::Instant::now();
+                    let r = timed_graph(k);
+                    (r, g0.elapsed().as_secs_f64() * 1e3)
+                },
+                || replay_ab(),
+            );
+            let (graph, graph_ms) = graph;
             graph?;
-            Ok(t0.elapsed().as_secs_f64() * 1e3)
+            Ok(ExactSample {
+                join_ms: t0.elapsed().as_secs_f64() * 1e3,
+                graph_ms,
+            })
         };
         let reprime = || unsafe {
             run_from_z_first_pass(
@@ -4983,13 +5075,13 @@ kernel void blake3_pow_scan(
                 return;
             }
         };
-        let Some(means) = mean_ranked_exact_samples(samples) else {
+        let Some(scores) = score_ranked_exact_samples(samples) else {
             finish_ranked_exact_contention_tune(params, cpu_tree, 0);
             return;
         };
         let Some(chosen) = choose_hybrid_k(
             &RANKED_EXACT_TUNE_CANDIDATES,
-            &means,
+            &scores,
             DEFAULT_HYBRID_K,
         ) else {
             finish_ranked_exact_contention_tune(params, cpu_tree, 0);
@@ -5048,15 +5140,46 @@ kernel void blake3_pow_scan(
                 .enumerate()
                 .map(|(i, k)| {
                     format!(
-                        "k={k}:[{:.1},{:.1}] mean={:.1}ms",
-                        samples[i][0], samples[i][1], means[i]
+                        "k={k}:join[{:.1},{:.1}] arm[{:.1},{:.1}] score={:.1}ms",
+                        samples[i][0].join_ms,
+                        samples[i][1].join_ms,
+                        samples[i][0].graph_ms,
+                        samples[i][1].graph_ms,
+                        scores[i]
                     )
                 })
                 .collect();
+            // Counterfactual picks for every estimator, so a single sweep
+            // shows whether the arm fix, the min fix, or both moved the
+            // decision. Purely diagnostic: `chosen` above is what runs.
+            let alt = |arm: bool, robust: bool| -> String {
+                let mut v = [0.0; RANKED_EXACT_TUNE_CANDIDATES.len()];
+                for (slot, [p, q]) in v.iter_mut().zip(samples) {
+                    let (a, b) = if arm {
+                        (p.graph_ms, q.graph_ms)
+                    } else {
+                        (p.join_ms, q.join_ms)
+                    };
+                    *slot = if robust { a.min(b) } else { (a + b) * 0.5 };
+                }
+                match choose_hybrid_k(
+                    &RANKED_EXACT_TUNE_CANDIDATES,
+                    &v,
+                    DEFAULT_HYBRID_K,
+                ) {
+                    Some(k) => k.to_string(),
+                    None => "-".to_string(),
+                }
+            };
             eprintln!(
-                "[gpu-commit] broad exact-AB {} -> k={} verified={verified}",
+                "[gpu-commit] broad exact-AB {} -> k={} verified={verified} \
+                 picks(join/mean={} join/min={} arm/mean={} arm/min={})",
                 table.join(" "),
                 if verified { chosen } else { 0 },
+                alt(false, false),
+                alt(false, true),
+                alt(true, false),
+                alt(true, true),
             );
         }
         finish_ranked_exact_contention_tune(
@@ -7483,10 +7606,14 @@ LC_KERNEL(lc_fold_stripes, 4)
     #[cfg(test)]
     mod split_select_tests {
         use super::{
-            DEFAULT_HYBRID_K, RANKED_EXACT_TUNE_CANDIDATES, choose_hybrid_k,
-            collect_ranked_exact_samples, mean_ranked_exact_samples,
+            DEFAULT_HYBRID_K, ExactSample, RANKED_EXACT_TUNE_CANDIDATES, choose_hybrid_k,
+            collect_ranked_exact_samples, score_ranked_exact_samples,
         };
         const C: [usize; 3] = [0, 3, 5];
+
+        fn s(join_ms: f64, graph_ms: f64) -> ExactSample {
+            ExactSample { join_ms, graph_ms }
+        }
 
         #[test]
         fn trimmed_candidate_set_is_stable() {
@@ -7503,7 +7630,7 @@ LC_KERNEL(lc_fold_stripes, 4)
                 },
                 |k| {
                     events.borrow_mut().push(k as i32);
-                    Ok::<f64, ()>(k as f64)
+                    Ok::<ExactSample, ()>(s(k as f64, k as f64))
                 },
             )
             .unwrap();
@@ -7511,17 +7638,49 @@ LC_KERNEL(lc_fold_stripes, 4)
                 *events.borrow(),
                 [-1, 0, -1, 3, -1, 5, -1, 5, -1, 3, -1, 0]
             );
-            assert_eq!(samples[0], [0.0, 0.0]);
-            assert_eq!(samples[2], [5.0, 5.0]);
+            assert_eq!(samples[0], [s(0.0, 0.0), s(0.0, 0.0)]);
+            assert_eq!(samples[2], [s(5.0, 5.0), s(5.0, 5.0)]);
+        }
+
+        /// Default scoring is the JOIN wall reduced by the per-candidate
+        /// minimum: the prove pays `max(arm)`, and the two arms share a CPU
+        /// pool, so the join is the objective. The arm wall is recorded but
+        /// must not drive the choice unless explicitly opted in.
+        #[test]
+        fn exact_selection_reduces_join_with_minimum() {
+            let mut samples = [[s(100.0, 100.0); 2]; RANKED_EXACT_TUNE_CANDIDATES.len()];
+            samples[1] = [s(97.0, 90.0), s(95.0, 92.0)];
+            assert_eq!(score_ranked_exact_samples(samples).unwrap()[1], 95.0);
+        }
+
+        /// A single cold pass must not drag a candidate's score: the sweep's
+        /// contamination is one-sided, so the minimum survives it and a mean
+        /// would not.
+        #[test]
+        fn exact_selection_survives_one_sided_cold_pass() {
+            let mut samples = [[s(160.0, 155.0); 2]; RANKED_EXACT_TUNE_CANDIDATES.len()];
+            // Real observed shape: pass 1 cold at ~2.4x, pass 2 warm.
+            samples[1] = [s(385.0, 380.0), s(139.6, 138.0)];
+            let scores = score_ranked_exact_samples(samples).unwrap();
+            assert_eq!(scores[1], 139.6);
+            // …and the warm truth wins the selection, where a mean of the
+            // join wall (262.3 vs 160.0) would have discarded it.
+            assert_eq!(
+                choose_hybrid_k(&C, &scores, DEFAULT_HYBRID_K),
+                Some(3)
+            );
         }
 
         #[test]
-        fn exact_selection_uses_valid_balanced_means() {
-            let mut samples = [[100.0; 2]; RANKED_EXACT_TUNE_CANDIDATES.len()];
-            samples[1] = [90.0, 110.0];
-            assert_eq!(mean_ranked_exact_samples(samples).unwrap()[1], 100.0);
-            samples[1][1] = f64::NAN;
-            assert!(mean_ranked_exact_samples(samples).is_none());
+        fn exact_selection_rejects_non_finite_in_either_statistic() {
+            let mut samples = [[s(100.0, 100.0); 2]; RANKED_EXACT_TUNE_CANDIDATES.len()];
+            samples[1][1].graph_ms = f64::NAN;
+            assert!(score_ranked_exact_samples(samples).is_none());
+            samples[1][1].graph_ms = 100.0;
+            samples[1][1].join_ms = f64::NAN;
+            assert!(score_ranked_exact_samples(samples).is_none());
+            samples[1][1].join_ms = -1.0;
+            assert!(score_ranked_exact_samples(samples).is_none());
         }
 
         #[test]
@@ -8290,7 +8449,16 @@ kernel void zc_r2_products(
             return 0;
         }
         let g = (hi_size as f64 / (ratio + (1.0 - ZC_R2_ALPHA))).round();
-        (g as usize).min(hi_size * 15 / 16)
+        // Cap at the physical maximum only. The old `15·hi/16` haircut was an
+        // overshoot guard sized for α = 0.55 making full offload straggle
+        // above ratio 0.55 (under the ranked ~0.57 band). In the live ranked
+        // band the formula itself solves to ≤ hi (at ratio 0.57: ≈ 0.980·hi),
+        // so the haircut was deleting ~4% of the GPU prefix on every trial
+        // without buying straggle protection. When the formula does solve
+        // past hi (fast GPU / low ratio), the physical cap is the correct
+        // ceiling: every chunk is already on the GPU and the residual is
+        // pure α·hi on the CPU.
+        (g as usize).min(hi_size)
     }
 
     fn zc_r2_init(gpu: &'static Gpu) -> Result<ZcR2, String> {
@@ -8524,7 +8692,11 @@ kernel void zc_r2_products(
             // 1/8 probe that shipped there.
             (hi_size / 16).clamp(8, 128)
         } else {
-            tuned.min(hi_size * 15 / 16)
+            // Physical range only — the published share is already the
+            // balanced solution capped at `hi_size` in `zc_r2_gate_share`.
+            // Re-applying `15·hi/16` here was a second, identical haircut that
+            // bound the timed prefix even when the policy wanted more.
+            tuned.min(hi_size)
         };
         if chunks == 0 {
             return None;
@@ -11765,14 +11937,14 @@ DEF_PROBE(probe_g4_t8_p0,    8u,  0u,   tsel & 7u)
     #[test]
     fn zc_r2_gate_share_policy() {
         use imp::zc_r2_gate_share;
-        // Balance point hi/(ratio+0.45); ranked-observed ratios land above
-        // the 15·hi/16 cap, which is the binding overshoot guard.
-        assert_eq!(zc_r2_gate_share(0.57, 2048), 1920);
-        assert_eq!(zc_r2_gate_share(0.38, 2048), 1920);
-        // The guard still binds before the GPU can straggle: at 15/16 the
-        // crossover is (1-0.45·15/16)/(15/16) ≈ 0.617, above the ranked 0.57.
+        // Balance point hi/(ratio+0.45), physical cap at hi. Ranked ratio
+        // 0.57 solves to ≈0.980·hi (2008/2048), not past hi — the old 15/16
+        // haircut was leaving 88 chunks on the CPU for no straggle reason.
+        assert_eq!(zc_r2_gate_share(0.57, 2048), 2008); // 2048/1.02
+        assert_eq!(zc_r2_gate_share(0.38, 2048), 2048); // 2048/0.83 → past hi
+        // Above the α = 0.55 straggle threshold the formula backs the share
+        // off on its own (no haircut required).
         assert!(zc_r2_gate_share(0.62, 2048) < 2048);
-        // Slow-but-usable GPU: the formula takes over below the cap.
         assert_eq!(zc_r2_gate_share(1.0, 2048), 1412); // 2048/1.45
         assert_eq!(zc_r2_gate_share(2.0, 2048), 836); // 2048/2.45
         // Admission floor for ratios in (2, 8): the equality oracle already
