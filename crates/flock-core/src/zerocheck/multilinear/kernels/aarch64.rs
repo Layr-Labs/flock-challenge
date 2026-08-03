@@ -667,9 +667,14 @@ unsafe fn r2_pair_fold_and_store(
 /// threadgroup reduction and hand back only the sum, which forced the CPU to
 /// recompute the odd half for the lookahead's `W1`/`W2`. Keeping that split
 /// costs the GPU nothing, and lets this kernel drop two more of its eight
-/// products: **32 PMULL per group instead of 38** on every offloaded chunk.
-/// The four `mul_q` row weightings survive because `W0`/`W3`/`W4`/`W5` still
-/// need all four scaled rows.
+/// products: 32 PMULL per group instead of 38 on every offloaded chunk.
+///
+/// With both parities off the GPU, `a0`, `a1` and `a3` are no longer consumed
+/// individually anywhere in the arm — only through the XOR pairs `e_aw` and
+/// `o_aw` — and multiplication by `w` distributes over XOR bit-exactly, so the
+/// arm folds the XOR before the multiply and pre-scales **three** rows instead
+/// of four: **27 PMULL per group instead of 32**. Only `a2w` keeps its own
+/// reduced multiply, because `W0` consumes it individually.
 #[cfg(target_arch = "aarch64")]
 #[target_feature(enable = "aes")]
 pub(crate) unsafe fn fold_round2_compact_chunk_neon_lookahead_8<
@@ -756,6 +761,31 @@ pub(crate) unsafe fn fold_round2_compact_chunk_neon_lookahead_8<
                     wide_xor(&mut p1_odd, mul_unreduced_q(w, a3));
                 }
                 wide_xor(&mut w0, mul_unreduced_q(w, a2));
+                continue;
+            }
+
+            if !FULL && ODD_ON_GPU {
+                // Neither parity's round-two products run on this chunk, so
+                // `a0`/`a1`/`a3` are only ever consumed through the XOR pairs
+                // below. `mul_q(w, x) ^ mul_q(w, y) == mul_q(w, x ^ y)`
+                // bit-exactly (both sides are the canonical reduced
+                // representative of `w·(x + y)`), so fold the XOR first and
+                // spend three reduced multiplies on the group instead of
+                // four. `a2w` keeps its own product: `w0` consumes it alone.
+                if !pad1 {
+                    let a2w = mul_q(w, a2);
+                    wide_xor(&mut w0, mul_unreduced_q(a2w, b2));
+                }
+                let e_aw = mul_q(w, veorq_u64(a0, a2));
+                let o_aw = mul_q(w, veorq_u64(a1, a3));
+                let e_b = veorq_u64(b0, b2);
+                let o_b = veorq_u64(b1, b3);
+                wide_xor(&mut w3, mul_unreduced_q(e_aw, e_b));
+                wide_xor(&mut w4, mul_unreduced_q(o_aw, o_b));
+                wide_xor(
+                    &mut w5,
+                    mul_unreduced_q(veorq_u64(e_aw, o_aw), veorq_u64(e_b, o_b)),
+                );
                 continue;
             }
 
