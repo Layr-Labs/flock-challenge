@@ -1411,7 +1411,10 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead(
         #[cfg(target_arch = "aarch64")]
         {
             #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-            let full = x_hi >= gpu_prefix;
+                let full = x_hi >= gpu_prefix;
+            // The device arm now returns all six deferred aggregates, so a
+            // covered chunk keeps only its folds and stores.
+            const ALL8: bool = true;
             #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
             let full = true;
             unsafe {
@@ -1419,7 +1422,7 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead(
                 let ap = a_packed.as_ptr().add(row_base * n_chunks);
                 let bp = b_packed.as_ptr().add(row_base * n_chunks);
                 if full {
-                    fold_round2_compact_chunk_neon_lookahead_8::<true, false>(
+                    fold_round2_compact_chunk_neon_lookahead_8::<true, false, false>(
                         t,
                         ap,
                         bp,
@@ -1434,7 +1437,7 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead(
                         out.as_mut_ptr(),
                     );
                 } else if odd_on_gpu {
-                    fold_round2_compact_chunk_neon_lookahead_8::<false, true>(
+                    fold_round2_compact_chunk_neon_lookahead_8::<false, true, ALL8>(
                         t,
                         ap,
                         bp,
@@ -1449,7 +1452,7 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead(
                         out.as_mut_ptr(),
                     );
                 } else {
-                    fold_round2_compact_chunk_neon_lookahead_8::<false, false>(
+                    fold_round2_compact_chunk_neon_lookahead_8::<false, false, false>(
                         t,
                         ap,
                         bp,
@@ -1529,8 +1532,9 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead(
                 for (x_hi, v) in vals.iter().enumerate() {
                     partials[x_hi] = (v[0] + v[2], v[1] + v[3]);
                     if odd_on_gpu {
-                        la_partials[x_hi][0] = v[2];
-                        la_partials[x_hi][1] = v[3];
+                        // Every aggregate is device-computed; the CPU
+                        // skipped all six on these chunks.
+                        la_partials[x_hi] = [v[2], v[3], v[4], v[5], v[6], v[7]];
                     }
                 }
             }
@@ -1547,7 +1551,7 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead(
                     let row_base = pair_idx_base * 2;
                     let mut out = [F128::ZERO; 8];
                     unsafe {
-                        fold_round2_compact_chunk_neon_lookahead_8::<true, false>(
+                        fold_round2_compact_chunk_neon_lookahead_8::<true, false, false>(
                             table.data.as_ptr().cast::<u8>(),
                             a_packed.as_ptr().add(row_base * n_chunks),
                             b_packed.as_ptr().add(row_base * n_chunks),
@@ -1568,8 +1572,14 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead(
                         eq_h * (kappa * out[1] + out[3]),
                     );
                     if odd_on_gpu {
-                        la_partials[x_hi][0] = eq_h * out[2];
-                        la_partials[x_hi][1] = eq_h * out[3];
+                        la_partials[x_hi] = [
+                            eq_h * out[2],
+                            eq_h * out[3],
+                            eq_h * out[4],
+                            eq_h * out[5],
+                            eq_h * out[6],
+                            eq_h * out[7],
+                        ];
                     }
                 }
             }

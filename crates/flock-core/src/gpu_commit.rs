@@ -8121,17 +8121,26 @@ kernel void zc_r2_products(
 
     ulong4 acc1 = ulong4(0ul);
     ulong4 acci = ulong4(0ul);
+    ulong4 accc = ulong4(0ul);
+    ulong4 accd = ulong4(0ul);
+    bool odd_lane = (lid & 1u) != 0u;
     for (uint k = 0u; k < p.xpt; k++) {
         uint x_lo = k * 256u + lid;
         uint pair_idx = tgid * p.lo_size + x_lo;
-        if ((pair_idx & p.mask) >= p.useful) { continue; }
-        uint4 ar = a_in[pair_idx];
-        uint4 br = b_in[pair_idx];
+        // Padded pairs zero-FILL rather than `continue`: the simd shuffles
+        // below must stay uniform across the group's two lanes, and a zero
+        // row code folds to zero through the table's zero entry, so the
+        // accumulated contribution is unchanged.
+        bool pad = ((pair_idx & p.mask) >= p.useful);
+        uint4 ar = pad ? uint4(0u) : a_in[pair_idx];
+        uint4 br = pad ? uint4(0u) : b_in[pair_idx];
         uint4 a0 = zc_r2_fold8(ar.x, ar.y, nib);
         uint4 a1 = zc_r2_fold8(ar.z, ar.w, nib);
         uint4 b0 = zc_r2_fold8(br.x, br.y, nib);
         uint4 b1 = zc_r2_fold8(br.z, br.w, nib);
+        if (pad) { a0 = uint4(0u); a1 = uint4(0u); b0 = uint4(0u); b1 = uint4(0u); }
 
+        // Round-two products on this lane's own eq_lo, exactly as before.
         uint4 g1 = gf_reduce(clmul128(a1, b1));
         uint4 gi = gf_reduce(clmul128(a0 ^ a1, b0 ^ b1));
         uint4 e  = eq_lo[x_lo];
@@ -8139,6 +8148,40 @@ kernel void zc_r2_products(
         U256k mi = clmul128(e, gi);
         acc1 ^= ulong4(m1.r0, m1.r1, m1.r2, m1.r3);
         acci ^= ulong4(mi.r0, mi.r1, mi.r2, mi.r3);
+
+        // Lookahead aggregates. Lanes `lid` and `lid^1` are the two pairs of
+        // one round-three group and share a SIMD group, so the partner's
+        // folded rows arrive with no threadgroup traffic. The cross-pair sums
+        // are symmetric - the even lane sees (a0,a2) and the odd (a2,a0) -
+        // so both lanes derive identical `e_*`/`o_*` from their own rows XOR
+        // the partner's.
+        uint4 pa0 = simd_shuffle_xor(a0, 1u);
+        uint4 pa1 = simd_shuffle_xor(a1, 1u);
+        uint4 pb0 = simd_shuffle_xor(b0, 1u);
+        uint4 pb1 = simd_shuffle_xor(b1, 1u);
+        uint4 ea = a0 ^ pa0;
+        uint4 oa = a1 ^ pa1;
+        uint4 eb = b0 ^ pb0;
+        uint4 ob = b1 ^ pb1;
+        // Every aggregate rides the group's single weight: the ODD lane's
+        // eq_lo. The even lane therefore weights by its partner's entry.
+        uint4 w = odd_lane ? e : eq_lo[x_lo + 1u];
+
+        uint4 c_val;
+        uint4 d_val;
+        if (odd_lane) {
+            // W0 = a2*b2 is this lane's own row-0 product; W5 = (ea+oa)(eb+ob).
+            c_val = gf_reduce(clmul128(a0, b0));
+            d_val = gf_reduce(clmul128(ea ^ oa, eb ^ ob));
+        } else {
+            // W3 = ea*eb, W4 = oa*ob.
+            c_val = gf_reduce(clmul128(ea, eb));
+            d_val = gf_reduce(clmul128(oa, ob));
+        }
+        U256k mc = clmul128(w, c_val);
+        U256k md = clmul128(w, d_val);
+        accc ^= ulong4(mc.r0, mc.r1, mc.r2, mc.r3);
+        accd ^= ulong4(md.r0, md.r1, md.r2, md.r3);
     }
 
     // Parity-split reduce. `x_lo = k*256 + lid` and 256 is even, so a thread
@@ -8164,18 +8207,47 @@ kernel void zc_r2_products(
         if (lid < s) { red[lid] ^= red[lid + s]; }
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
+    ulong4 chunkie = red[0];
+    ulong4 chunkio = red[1];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    red[lid] = accc;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint s = 128u; s > 1u; s >>= 1u) {
+        if (lid < s) { red[lid] ^= red[lid + s]; }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    ulong4 chunkce = red[0];
+    ulong4 chunkco = red[1];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    red[lid] = accd;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint s = 128u; s > 1u; s >>= 1u) {
+        if (lid < s) { red[lid] ^= red[lid + s]; }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
     if (lid == 0u) {
-        ulong4 chunkie = red[0];
-        ulong4 chunkio = red[1];
+        ulong4 chunkde = red[0];
+        ulong4 chunkdo = red[1];
         U256k u1e; u1e.r0 = chunk1e.x; u1e.r1 = chunk1e.y; u1e.r2 = chunk1e.z; u1e.r3 = chunk1e.w;
         U256k u1o; u1o.r0 = chunk1o.x; u1o.r1 = chunk1o.y; u1o.r2 = chunk1o.z; u1o.r3 = chunk1o.w;
         U256k uie; uie.r0 = chunkie.x; uie.r1 = chunkie.y; uie.r2 = chunkie.z; uie.r3 = chunkie.w;
         U256k uio; uio.r0 = chunkio.x; uio.r1 = chunkio.y; uio.r2 = chunkio.z; uio.r3 = chunkio.w;
+        U256k uce; uce.r0 = chunkce.x; uce.r1 = chunkce.y; uce.r2 = chunkce.z; uce.r3 = chunkce.w;
+        U256k uco; uco.r0 = chunkco.x; uco.r1 = chunkco.y; uco.r2 = chunkco.z; uco.r3 = chunkco.w;
+        U256k ude; ude.r0 = chunkde.x; ude.r1 = chunkde.y; ude.r2 = chunkde.z; ude.r3 = chunkde.w;
+        U256k udo; udo.r0 = chunkdo.x; udo.r1 = chunkdo.y; udo.r2 = chunkdo.z; udo.r3 = chunkdo.w;
         uint4 e = eq_hi[tgid];
-        partials[tgid * 4u]      = gf_reduce(clmul128(e, gf_reduce(u1e)));
-        partials[tgid * 4u + 1u] = gf_reduce(clmul128(e, gf_reduce(uie)));
-        partials[tgid * 4u + 2u] = gf_reduce(clmul128(e, gf_reduce(u1o)));
-        partials[tgid * 4u + 3u] = gf_reduce(clmul128(e, gf_reduce(uio)));
+        // Slot order matches the CPU kernel's `out[0..8]`:
+        // 0,1 even p1/pinf; 2,3 odd p1/pinf (= r1*W1, r1*W2);
+        // 4 = r1*W0; 5,6,7 = r1*W3, r1*W4, r1*W5.
+        partials[tgid * 8u]      = gf_reduce(clmul128(e, gf_reduce(u1e)));
+        partials[tgid * 8u + 1u] = gf_reduce(clmul128(e, gf_reduce(uie)));
+        partials[tgid * 8u + 2u] = gf_reduce(clmul128(e, gf_reduce(u1o)));
+        partials[tgid * 8u + 3u] = gf_reduce(clmul128(e, gf_reduce(uio)));
+        partials[tgid * 8u + 4u] = gf_reduce(clmul128(e, gf_reduce(uco)));
+        partials[tgid * 8u + 5u] = gf_reduce(clmul128(e, gf_reduce(uce)));
+        partials[tgid * 8u + 6u] = gf_reduce(clmul128(e, gf_reduce(ude)));
+        partials[tgid * 8u + 7u] = gf_reduce(clmul128(e, gf_reduce(udo)));
     }
 }
 "#;
@@ -8275,7 +8347,10 @@ kernel void zc_r2_products(
     /// suspected cause of admission failing on a majority of ranked worker
     /// processes while every admitted process posts record p10s). Ratio ≥ 8
     /// or unusable ⇒ 0 = exact incumbent.
-    const ZC_R2_ALPHA: f64 = 0.55;
+    /// With every group product device-side, an offloaded chunk keeps only
+    /// its folds and its anchor/delta stores and performs no field
+    /// multiplies at all, so the CPU retains about half of a full chunk.
+    const ZC_R2_ALPHA: f64 = 0.50;
     const ZC_R2_MAX_RATIO: f64 = 2.0;
     const ZC_R2_FLOOR_MAX_RATIO: f64 = 8.0;
 
@@ -8413,7 +8488,7 @@ kernel void zc_r2_products(
         Calibrated,
         /// Timed-prove prefix partials, bit-exact per chunk, parity-split as
         /// `[p1_even, pinf_even, p1_odd, pinf_odd]` (all eq_hi-weighted).
-        Prefix(Vec<[F128; 4]>),
+        Prefix(Vec<[F128; 8]>),
         /// Metal failed after admission; the caller must CPU-redo the
         /// prefix products. The arm is poisoned for the process.
         Failed,
@@ -8571,7 +8646,7 @@ kernel void zc_r2_products(
             );
             // Four F128 per chunk: the parity-split
             // `[p1_even, pinf_even, p1_odd, pinf_odd]`.
-            let need_part = hi_size * 64;
+            let need_part = hi_size * 128;
             if state.part_cap < need_part {
                 if state.part_cap > 0 {
                     gpu.release(state.part_buf);
@@ -8647,13 +8722,17 @@ kernel void zc_r2_products(
                 Err(_) => return poison(job.cb),
             };
             let parts = gpu.buffer_contents(state.part_buf).cast::<F128>();
-            let mut out: Vec<[F128; 4]> = Vec::with_capacity(job.chunks);
+            let mut out: Vec<[F128; 8]> = Vec::with_capacity(job.chunks);
             for c in 0..job.chunks {
                 out.push([
-                    *parts.add(c * 4),
-                    *parts.add(c * 4 + 1),
-                    *parts.add(c * 4 + 2),
-                    *parts.add(c * 4 + 3),
+                    *parts.add(c * 8),
+                    *parts.add(c * 8 + 1),
+                    *parts.add(c * 8 + 2),
+                    *parts.add(c * 8 + 3),
+                    *parts.add(c * 8 + 4),
+                    *parts.add(c * 8 + 5),
+                    *parts.add(c * 8 + 6),
+                    *parts.add(c * 8 + 7),
                 ]);
             }
             if !job.calibration {
@@ -8682,8 +8761,15 @@ kernel void zc_r2_products(
             // cannot be admitted.
             for c in 0..job.chunks {
                 let summed = (out[c][0] + out[c][2], out[c][1] + out[c][3]);
+                // All six deferred aggregates are device-computed now, so
+                // the oracle checks every one against the CPU's values.
                 let split_ok = cpu_la.is_none_or(|la| {
-                    la[c][0] == out[c][2] && la[c][1] == out[c][3]
+                    la[c][0] == out[c][2]
+                        && la[c][1] == out[c][3]
+                        && la[c][2] == out[c][4]
+                        && la[c][3] == out[c][5]
+                        && la[c][4] == out[c][6]
+                        && la[c][5] == out[c][7]
                 });
                 if summed != cpu_all[c] || !split_ok {
                     if super::gpu_zc_r2_debug() {

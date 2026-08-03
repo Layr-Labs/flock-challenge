@@ -675,6 +675,7 @@ unsafe fn r2_pair_fold_and_store(
 pub(crate) unsafe fn fold_round2_compact_chunk_neon_lookahead_8<
     const FULL: bool,
     const ODD_ON_GPU: bool,
+    const ALL_ON_GPU: bool,
 >(
     table_data: *const u8,
     a_packed: *const u8,
@@ -755,52 +756,56 @@ pub(crate) unsafe fn fold_round2_compact_chunk_neon_lookahead_8<
                 if !ODD_ON_GPU {
                     wide_xor(&mut p1_odd, mul_unreduced_q(w, a3));
                 }
-                wide_xor(&mut w0, mul_unreduced_q(w, a2));
+                if !ALL_ON_GPU {
+                    wide_xor(&mut w0, mul_unreduced_q(w, a2));
+                }
                 continue;
             }
 
-            let a0w = mul_q(w, a0);
-            let a1w = mul_q(w, a1);
-            let (a2w, a3w) = if pad1 {
-                (zero, zero)
-            } else {
-                (mul_q(w, a2), mul_q(w, a3))
-            };
+            if !ALL_ON_GPU {
+                let a0w = mul_q(w, a0);
+                let a1w = mul_q(w, a1);
+                let (a2w, a3w) = if pad1 {
+                    (zero, zero)
+                } else {
+                    (mul_q(w, a2), mul_q(w, a3))
+                };
 
-            // ---- round-two products, split by the parity of x' ----
-            if FULL {
-                wide_xor(&mut p1_even, mul_unreduced_q(a1w, b1));
-                if !deg0 {
-                    wide_xor(
-                        &mut pinf_even,
-                        mul_unreduced_q(veorq_u64(a0w, a1w), veorq_u64(b0, b1)),
-                    );
-                }
-            }
-            if !pad1 {
-                if !ODD_ON_GPU {
-                    wide_xor(&mut p1_odd, mul_unreduced_q(a3w, b3));
-                    if !deg1 {
+                // ---- round-two products, split by the parity of x' ----
+                if FULL {
+                    wide_xor(&mut p1_even, mul_unreduced_q(a1w, b1));
+                    if !deg0 {
                         wide_xor(
-                            &mut pinf_odd,
-                            mul_unreduced_q(veorq_u64(a2w, a3w), veorq_u64(b2, b3)),
+                            &mut pinf_even,
+                            mul_unreduced_q(veorq_u64(a0w, a1w), veorq_u64(b0, b1)),
                         );
                     }
                 }
-                wide_xor(&mut w0, mul_unreduced_q(a2w, b2));
-            }
+                if !pad1 {
+                    if !ODD_ON_GPU {
+                        wide_xor(&mut p1_odd, mul_unreduced_q(a3w, b3));
+                        if !deg1 {
+                            wide_xor(
+                                &mut pinf_odd,
+                                mul_unreduced_q(veorq_u64(a2w, a3w), veorq_u64(b2, b3)),
+                            );
+                        }
+                    }
+                    wide_xor(&mut w0, mul_unreduced_q(a2w, b2));
+                }
 
-            // ---- deferred round-three aggregates (no extra lookups) ----
-            let e_aw = veorq_u64(a0w, a2w);
-            let o_aw = veorq_u64(a1w, a3w);
-            let e_b = veorq_u64(b0, b2);
-            let o_b = veorq_u64(b1, b3);
-            wide_xor(&mut w3, mul_unreduced_q(e_aw, e_b));
-            wide_xor(&mut w4, mul_unreduced_q(o_aw, o_b));
-            wide_xor(
-                &mut w5,
-                mul_unreduced_q(veorq_u64(e_aw, o_aw), veorq_u64(e_b, o_b)),
-            );
+                // ---- deferred round-three aggregates (no extra lookups) ----
+                let e_aw = veorq_u64(a0w, a2w);
+                let o_aw = veorq_u64(a1w, a3w);
+                let e_b = veorq_u64(b0, b2);
+                let o_b = veorq_u64(b1, b3);
+                wide_xor(&mut w3, mul_unreduced_q(e_aw, e_b));
+                wide_xor(&mut w4, mul_unreduced_q(o_aw, o_b));
+                wide_xor(
+                    &mut w5,
+                    mul_unreduced_q(veorq_u64(e_aw, o_aw), veorq_u64(e_b, o_b)),
+                );
+            }
         }
 
         *out.add(0) = core::mem::transmute::<uint64x2_t, F128>(reduce_wide_q(p1_even));
