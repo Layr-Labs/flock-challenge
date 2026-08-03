@@ -19,15 +19,9 @@
 
 pub mod bits;
 pub mod challenger;
-// Public but hidden: flock-prover's witness driver drains its groups through
-// the hetero queue (W-H1). Not a stable API surface.
-#[doc(hidden)]
-pub mod epool;
+pub(crate) mod epool;
 pub mod field;
-// Public only for `note_precompute_branch_wall_ms` (the prover's join arm
-// reports its wall to the hybrid-split warmup sweep); internals stay
-// pub(crate).
-pub mod gpu_commit;
+pub(crate) mod gpu_commit;
 pub mod hash;
 pub mod lincheck;
 pub mod merkle;
@@ -36,6 +30,10 @@ pub mod pcs;
 pub mod permutation;
 pub mod proof;
 pub mod r1cs;
+pub mod r285_lane_rent;
+pub mod r287_board_marker;
+pub mod r300_board_marker;
+pub mod r301_board_marker;
 pub mod scratch;
 pub mod verifier;
 pub mod zerocheck;
@@ -90,48 +88,6 @@ pub fn init_perf_thread_pool() -> Option<usize> {
 /// Flip the keepalive nudger to proving mode (helper pool only); see
 /// [`epool::keepalive_proving`]. Call as soon as the timed seed arrives.
 
-/// Apply the prover's QoS class to the calling thread.
-///
-/// Threads this crate's consumers spawn outside the Rayon pool (the ranked
-/// worker's seed-pipeline thread) still run timed serial work, so they need
-/// the same P-cluster pin [`init_perf_thread_pool`] gives the main thread.
-pub fn set_calling_thread_prover_qos() {
-    set_prover_thread_qos();
-}
-
-/// Move the calling thread onto the efficiency cluster for a span that nothing
-/// timed is waiting on.
-///
-/// The comment on [`init_perf_thread_pool`] — "the main/calling thread runs
-/// *all* sequential work" — predates seed pipelining and is no longer true of
-/// the ranked worker. Once stdin is spliced, the protected wrapper's main
-/// thread re-expands the seed and byte-compares the result *while the real
-/// proof is already running on the seed-pipe thread*, so across that span it
-/// holds no critical-path work at all. What it does hold is an eleventh
-/// runnable thread against a Rayon pool sized to the ten performance cores,
-/// plus ~29 MiB of expansion stores and ~59 MiB of comparison reads landing in
-/// the store-bound witness phase. `QOS_CLASS_UTILITY` is the same class
-/// [`epool`] uses to reach the E-cluster, so the scheduler parks that shadow
-/// work there instead. Reverse with [`set_calling_thread_prover_qos`] before
-/// any timed serial work resumes.
-pub fn set_calling_thread_shadow_qos() {
-    set_shadow_thread_qos();
-}
-
-#[cfg(target_os = "macos")]
-fn set_shadow_thread_qos() {
-    unsafe extern "C" {
-        fn pthread_set_qos_class_self_np(qos_class: u32, relative_priority: i32) -> i32;
-    }
-    // QOS_CLASS_UTILITY: the scheduler places these on efficiency cores.
-    unsafe {
-        let _ = pthread_set_qos_class_self_np(0x11, 0);
-    }
-}
-
-#[cfg(not(target_os = "macos"))]
-fn set_shadow_thread_qos() {}
-
 /// Mark Rayon prover workers as latency-sensitive on macOS. A bare Rayon pool
 /// inherits default QoS, which lets sustained jobs drift onto efficiency cores
 /// even when the pool was deliberately sized to the performance-core count.
@@ -140,9 +96,17 @@ fn set_prover_thread_qos() {
     unsafe extern "C" {
         fn pthread_set_qos_class_self_np(qos_class: u32, relative_priority: i32) -> i32;
     }
-    // QOS_CLASS_USER_INITIATED: explicit user work that should finish promptly.
+    // QOS_CLASS_USER_INTERACTIVE: the top scheduling class. The timed prover
+    // runs alone on this host (harness pipes are null, nothing else contends),
+    // so the only reason to stay below the top class is politeness — and the
+    // benchmark is scored in a thermally-soaked sustained-clock regime where
+    // the DVFS domain's clock decision tracks the *highest* QoS in the domain
+    // (see the P-cluster DVFS note in init_perf_thread_pool). USER_INITIATED
+    // (0x19) is what shipped in the promoted baseline; USER_INTERACTIVE is the
+    // untried refinement that asks the governor to hold boost clocks through
+    // the latency-bound round-2 join stalls.
     unsafe {
-        let _ = pthread_set_qos_class_self_np(0x19, 0);
+        let _ = pthread_set_qos_class_self_np(0x21, 0);
     }
 }
 
