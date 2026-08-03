@@ -657,6 +657,8 @@ fn is_ranked_gpu_shape(params: &crate::pcs::commit::PcsParams) -> bool {
 
 /// Build the L0 commitment tree, on the GPU when the shape matches and the
 /// warmup latch decided for it; otherwise (and on any failure) via `cpu`.
+/// The selected ranked path remains intentionally byte-identical here; this
+/// frontier draw records remote-run variance without changing its semantics.
 ///
 /// State machine, decided once per process during the worker's untimed
 /// warmup prove (the first ranked-shape commit):
