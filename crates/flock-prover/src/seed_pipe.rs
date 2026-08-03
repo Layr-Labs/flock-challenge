@@ -455,10 +455,21 @@ pub(crate) fn arm(
     // Everything this thread does from here until adoption is shadow work that
     // no measured interval waits on: write the ready file, block on stdin, then
     // re-expand the seed and byte-compare it against ours while the real proof
-    // is already in flight elsewhere. Park it on the E-cluster so it stops
-    // competing with a pool sized to the performance cores. `try_adopt` hands
-    // the thread back before the publication tail.
-    if std::env::var_os("FLOCK_NO_SHADOW_QOS").is_none() {
+    // is already in flight elsewhere. Parking it on the E-cluster stops it
+    // competing with a pool sized to the performance cores, and `try_adopt`
+    // hands the thread back before the publication tail.
+    //
+    // OFF BY DEFAULT on ranked evidence. Three ranked samples carrying this
+    // demotion each set a record p10 but also widened the p10→median spread
+    // from the 0.754% of the tree that preceded them to 1.07–1.20%. The
+    // suspected cause is the E-cluster itself: the ranked M3 Max has only FOUR
+    // efficiency cores and `epool`'s hetero drain is already using them, so the
+    // shadow span buys P-core headroom for the fastest trials and adds a tail
+    // to the typical one. The two deletions that ship unconditionally — the
+    // warm-up generator check and the pre-faulted block buffer — remove that
+    // work outright rather than relocating it, and need no such trade. Set
+    // `FLOCK_SHADOW_QOS=1` to re-arm the demotion for an A/B.
+    if std::env::var_os("FLOCK_SHADOW_QOS").is_some() {
         SHADOW_QOS.store(true, Ordering::SeqCst);
         flock_core::set_calling_thread_shadow_qos();
     }
