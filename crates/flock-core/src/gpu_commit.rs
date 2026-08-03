@@ -4538,16 +4538,20 @@ kernel void blake3_pow_scan(
         Some(chosen)
     }
 
-    /// Candidate set trimmed from the historical [0,2,3,4,5,6,7,8]: the
-    /// broad set's original justification — one calibration process
-    /// publishing its winner to later workers through the warmup cache — is
-    /// dead on the ranked runner (the verifier wipes the shared scratch
-    /// between trials, so EVERY worker replays this sweep itself), and the
-    /// sweep's own measurements show a flat basin across k=0..5 with the
-    /// upper candidates consistently worse. Three spanning candidates keep
-    /// the per-process contention-exact choice at ~3/8 of the job-wall
-    /// cost, which ~120 fresh workers pay against a hard 10-minute cap.
-    const RANKED_EXACT_TUNE_CANDIDATES: [usize; 3] = [0, 3, 5];
+    /// Candidate set for the ranked exact-contention hybrid-k tuner.
+    ///
+    /// History: trimmed from [0,2,3,4,5,6,7,8] to [0,3,5] because every ranked
+    /// worker re-runs the sweep (the verifier wipes shared scratch between
+    /// trials) and three spanning points kept per-process calibration inside
+    /// the 10-minute job wall. bermota's note `cd1077a` flags that "upper
+    /// candidates consistently worse" was measured on a 4-P-core M4 host
+    /// whose optimum was k=3; the ranked M3 Max has 10 P-cores during the
+    /// commit window and may prefer a higher CPU share. Adding k=7 re-opens
+    /// the upper half of the ladder without restoring the full 8-point
+    /// sweep (4 candidates × 2 samples = 8 probes vs 6). Kill switch:
+    /// `FLOCK_NO_HYBRID_K7=1` is not needed — the tuner can still pick 0/3/5
+    /// when 7 is slower; k=7 is only *offered*.
+    const RANKED_EXACT_TUNE_CANDIDATES: [usize; 4] = [0, 3, 5, 7];
 
     /// Two samples per candidate, with the second pass in reverse order so
     /// thermal drift, queue warmup, and A/B replay cache state do not favor
@@ -7486,7 +7490,7 @@ LC_KERNEL(lc_fold_stripes, 4)
             DEFAULT_HYBRID_K, RANKED_EXACT_TUNE_CANDIDATES, choose_hybrid_k,
             collect_ranked_exact_samples, mean_ranked_exact_samples,
         };
-        const C: [usize; 3] = [0, 3, 5];
+        const C: [usize; 4] = [0, 3, 5, 7];
 
         #[test]
         fn trimmed_candidate_set_is_stable() {
@@ -7507,12 +7511,15 @@ LC_KERNEL(lc_fold_stripes, 4)
                 },
             )
             .unwrap();
+            // Forward pass then reverse: 0,3,5,7 then 7,5,3,0; each sample
+            // is preceded by a reprime event (-1).
             assert_eq!(
                 *events.borrow(),
-                [-1, 0, -1, 3, -1, 5, -1, 5, -1, 3, -1, 0]
+                [-1, 0, -1, 3, -1, 5, -1, 7, -1, 7, -1, 5, -1, 3, -1, 0]
             );
             assert_eq!(samples[0], [0.0, 0.0]);
             assert_eq!(samples[2], [5.0, 5.0]);
+            assert_eq!(samples[3], [7.0, 7.0]);
         }
 
         #[test]
