@@ -771,12 +771,29 @@ fn commit_with_round1_ab_precompute(
         },
         || {
             let t = std::time::Instant::now();
-            let r = precompute_ab();
+            let mut r = precompute_ab();
             let wall_ms = t.elapsed().as_secs_f64() * 1e3;
             // The hybrid-commit warmup sweep sizes its contention emulation
             // from this arm's measured wall (an Instant read is free; the
             // store is one relaxed atomic per prove).
             flock_core::gpu_commit::note_precompute_branch_wall_ms(wall_ms);
+            // Measurement probe, controlled draw (`FLOCK_NO_AB_PROBE=1`
+            // restores the single pass): rerun the challenge-independent AB
+            // transform and keep only the rerun's byte-identical result. The
+            // wall reported above covers the first pass alone — it starts
+            // beside the commit arm exactly as in the unperturbed tree — so
+            // the adaptive splits downstream see a baseline-matched input
+            // and the published score isolates the join-arm exposure itself.
+            // A flat score means this region absorbs one extra AB wall of
+            // work; a drop measures the conversion rate of this arm's work
+            // into wall directly, pricing the named materialization cut.
+            // The first result is dropped before the rerun so its scratch
+            // buffer is reused, exactly as in this probe's first draw.
+            let probe = std::env::var_os("FLOCK_NO_AB_PROBE").is_none();
+            if probe {
+                drop(r);
+                r = precompute_ab();
+            }
             if std::env::var_os("FLOCK_PHASE_TIMING").is_some() {
                 eprintln!("[phase-timing] ab-precompute branch wall: {wall_ms:.2} ms");
             }
