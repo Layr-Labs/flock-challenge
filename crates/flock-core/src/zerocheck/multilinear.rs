@@ -85,7 +85,7 @@ fn r2_degen_enabled() -> bool {
     std::env::var_os("FLOCK_NO_R2_DEGEN").is_none_or(|v| v != *"1")
 }
 
-fn round2_pair_skip(padding: &PaddingSpec, k_skip: usize) -> (usize, usize) {
+pub(crate) fn round2_pair_skip(padding: &PaddingSpec, k_skip: usize) -> (usize, usize) {
     if padding.k_log <= k_skip + 1 {
         return (0, usize::MAX);
     }
@@ -96,6 +96,56 @@ fn round2_pair_skip(padding: &PaddingSpec, k_skip: usize) -> (usize, usize) {
         return (0, usize::MAX);
     }
     (pairs_per_block - 1, useful_pairs)
+}
+
+/// Kill switch for the tail padding-skip (rounds 3+): `FLOCK_NO_ZC_TAIL_PADSKIP=1`
+/// restores the legacy full-fold path (every pair reconstructed, no skipping).
+/// Default = skip on. The skipped pairs are exactly those round two wrote as
+/// zero anchors + zero deltas for the honest zero padding of every block, so
+/// their reconstruction and message contribution are provably zero either way
+/// — the two paths are byte-identical.
+pub(crate) fn tail_padskip_enabled() -> bool {
+    use std::sync::LazyLock;
+    static ENABLED: LazyLock<bool> =
+        LazyLock::new(|| std::env::var_os("FLOCK_NO_ZC_TAIL_PADSKIP").is_none());
+    *ENABLED
+}
+
+/// Padding-skip descriptor `(within_block_mask, useful_inclusive)` for a tail
+/// round whose *input* value array has `n_in` entries, at instance size `m`
+/// with the given padding. The tail folds adjacent pairs `(2·x_lo, 2·x_lo+1)`;
+/// a pair contributes nothing and reconstructs to zero exactly when both of its
+/// elements fall in the honest zero padding of their block. Returns a mask +
+/// inclusive-useful bound tested against the *input* index of the even element:
+/// `(idx & within_block_mask) >= useful_inclusive` ⇒ the whole pair is zero.
+///
+/// `(0, usize::MAX)` means "never skip" — returned when the kill switch is set,
+/// when there is no per-block padding, or when the (halved) block is already
+/// small enough that no aligned pair lands fully in the zero region (so the
+/// deeper rounds pay no branch). Byte-identical to the full path because round
+/// two wrote exact zeros for those slots and the fold/message of a zero pair is
+/// zero.
+pub(crate) fn tail_pair_skip(padding: &PaddingSpec, n_in: usize, m: usize) -> (usize, usize) {
+    const NONE: (usize, usize) = (0, usize::MAX);
+    if !tail_padskip_enabled() || padding.k_log >= m || !n_in.is_power_of_two() {
+        return NONE;
+    }
+    let n_blocks = 1usize << (m - padding.k_log);
+    if n_in <= n_blocks {
+        return NONE; // folded past the within-block dimension entirely
+    }
+    let wb = n_in / n_blocks; // within-block value width (power of two)
+    let block = 1usize << padding.k_log;
+    if block % wb != 0 {
+        return NONE;
+    }
+    let uv = padding.useful_bits_per_block.div_ceil(block / wb); // nonzero count
+    // Largest even input index within a block is `wb - 2`; a fully-zero aligned
+    // pair exists only when `uv <= wb - 2`.
+    if uv > wb.saturating_sub(2) {
+        return NONE;
+    }
+    (wb - 1, uv)
 }
 
 /// Kill switch for draining the DRAM-bound tail loop rounds (half ≥ 2^21)
@@ -922,7 +972,7 @@ pub fn fold_compact_and_compute_round_pair_stream(
     #[cfg(not(target_arch = "aarch64"))]
     {
         let _ = lanes_per_pass;
-        return fold_compact_and_compute_round_pair(compact, table, r_fold, r_next);
+        return fold_compact_and_compute_round_pair(compact, table, r_fold, r_next, (0, usize::MAX));
     }
     #[cfg(target_arch = "aarch64")]
     {
@@ -1000,12 +1050,21 @@ pub fn fold_compact_and_compute_round_pair_stream(
 /// `r_next` describes the post-fold table, matching the contract of
 /// [`fold_and_compute_round_pair_into`].  The returned tables have
 /// `compact.len()` entries each.
+///
+/// `pad_skip = (within_block_mask, useful_inclusive)` lets the caller skip the
+/// honest zero-padding pairs round two wrote as zero anchors + zero deltas: for
+/// any pair whose even input index satisfies `(idx & mask) >= useful`, both
+/// reconstructed rows are zero and the message contribution is zero, so the
+/// kernel stores zeros and skips its lookups+products. `(0, usize::MAX)` = never
+/// skip (byte-identical to the legacy full-fold path). See [`tail_pair_skip`].
 pub fn fold_compact_and_compute_round_pair(
     compact: &UniSkipCompactFold,
     table: &UniSkipFoldTable,
     r_fold: F128,
     r_next: &[F128],
+    pad_skip: (usize, usize),
 ) -> (Vec<F128>, Vec<F128>, F128, F128) {
+    let (pad_mask, pad_useful) = pad_skip;
     let n = compact.len();
     assert!(!compact.is_empty() && n.is_power_of_two() && n >= 4);
     assert_eq!(compact.anchors.len(), 2 * n);
@@ -1108,6 +1167,9 @@ pub fn fold_compact_and_compute_round_pair(
                         a_out.as_mut_ptr(),
                         b_out.as_mut_ptr(),
                         lo_size,
+                        base,
+                        pad_mask,
+                        pad_useful,
                     );
                 }
                 return;
@@ -1124,6 +1186,9 @@ pub fn fold_compact_and_compute_round_pair(
                     eq_lo.as_ptr(),
                     lo_size,
                     degen,
+                    base,
+                    pad_mask,
+                    pad_useful,
                 )
             };
 
@@ -1133,6 +1198,17 @@ pub fn fold_compact_and_compute_round_pair(
                 let mut pinf_acc = F256Unreduced::ZERO;
                 for x_lo in 0..lo_size {
                     let out = 2 * x_lo;
+                    // Honest zero-padding pair: both rows reconstruct to zero and
+                    // contribute nothing. Store zeros and skip (byte-identical to
+                    // the full path). Mirrors `fold_round2_compact` and the NEON
+                    // kernel's skip.
+                    if ((base + out) & pad_mask) >= pad_useful {
+                        a_out[out] = F128::ZERO;
+                        a_out[out + 1] = F128::ZERO;
+                        b_out[out] = F128::ZERO;
+                        b_out[out + 1] = F128::ZERO;
+                        continue;
+                    }
                     for lane in 0..2 {
                         let index = base + out + lane;
                         let mut a = compact.anchors[2 * index];
@@ -1200,6 +1276,9 @@ pub fn fold_compact_and_compute_round_pair(
                             eq_lo.as_ptr(),
                             lo_size,
                             degen,
+                            base,
+                            pad_mask,
+                            pad_useful,
                         )
                     };
                     let eq_h = eq_hi[x_hi];
@@ -2601,7 +2680,7 @@ mod tests {
                 let expected_msg = round_pair_naive(&expected_a, &expected_b, &r_next);
 
                 let (actual_a, actual_b, actual_m1, actual_mi) =
-                    fold_compact_and_compute_round_pair(&compact, &table, rho, &r_next);
+                    fold_compact_and_compute_round_pair(&compact, &table, rho, &r_next, (0, usize::MAX));
                 assert_eq!(
                     actual_a, expected_a,
                     "reconstructed A mismatch; donate_f128={donate_f128}, rho={rho:?}"

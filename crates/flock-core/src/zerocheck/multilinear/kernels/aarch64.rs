@@ -828,6 +828,9 @@ pub(crate) unsafe fn fold_compact_chunk_neon_reconstruct_only_8(
     a_out: *mut F128,
     b_out: *mut F128,
     lo_size: usize,
+    pair_idx_base: usize,
+    pad_mask: usize,
+    pad_useful: usize,
 ) {
     use core::arch::aarch64::*;
 
@@ -845,8 +848,15 @@ pub(crate) unsafe fn fold_compact_chunk_neon_reconstruct_only_8(
     }
 
     unsafe {
+        let zero = vdupq_n_u64(0);
         for x_lo in 0..lo_size {
             let out = 2 * x_lo;
+            // Honest zero-padding pair: both reconstructed rows are zero.
+            if ((pair_idx_base + out) & pad_mask) >= pad_useful {
+                store_pair_nt(a_out.add(out), zero, zero);
+                store_pair_nt(b_out.add(out), zero, zero);
+                continue;
+            }
             let delta = deltas.add(out * 16);
             let a0_code = u64::from_le(core::ptr::read_unaligned(delta.cast::<u64>()));
             let b0_code = u64::from_le(core::ptr::read_unaligned(delta.add(8).cast::<u64>()));
@@ -899,6 +909,9 @@ pub(crate) unsafe fn fold_compact_chunk_neon_unchecked_8(
     eq_lo: *const F128,
     lo_size: usize,
     degen: bool,
+    pair_idx_base: usize,
+    pad_mask: usize,
+    pad_useful: usize,
 ) -> (F128, F128) {
     use core::arch::aarch64::*;
 
@@ -924,6 +937,15 @@ pub(crate) unsafe fn fold_compact_chunk_neon_unchecked_8(
 
         for x_lo in 0..lo_size {
             let out = 2 * x_lo;
+            // Honest zero-padding pair: round two wrote zero anchors + zero
+            // deltas, so both rows reconstruct to zero and add nothing to the
+            // message. Store zeros, skip the lookups+products (byte-identical to
+            // the full path, whose degen branch would produce the same zeros).
+            if ((pair_idx_base + out) & pad_mask) >= pad_useful {
+                store_pair_nt(a_out.add(out), zero, zero);
+                store_pair_nt(b_out.add(out), zero, zero);
+                continue;
+            }
             let delta = deltas.add(out * 16);
             let a0_code = u64::from_le(core::ptr::read_unaligned(delta.cast::<u64>()));
             let b0_code = u64::from_le(core::ptr::read_unaligned(delta.add(8).cast::<u64>()));

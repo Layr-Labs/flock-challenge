@@ -623,8 +623,19 @@ fn prove_packed_padded_inner<C: Challenger>(
     let t_t3 = std::time::Instant::now();
     let mut first_r_next = vec![F128::ONE; n_mlv - 1];
     first_r_next[1..].copy_from_slice(&r[k_skip + 2..]);
-    let (mut a_mlv, mut b_mlv, first_m1, first_mi) =
-        fold_compact_and_compute_round_pair(&compact_mlv, &fold_table, mlv_rhos[0], &first_r_next);
+    // Padding-skip for the first tail round (T3): the compact's within-block
+    // zero suffix (rows round two wrote as zero) reconstructs to zero and adds
+    // nothing to the message. `tail_pair_skip` returns `(0, usize::MAX)` when
+    // the kill switch `FLOCK_NO_ZC_TAIL_PADSKIP=1` is set or there is no
+    // padding, restoring the legacy full-fold path byte-for-byte.
+    let t3_pad_skip = multilinear::tail_pair_skip(padding, compact_mlv.len(), m);
+    let (mut a_mlv, mut b_mlv, first_m1, first_mi) = fold_compact_and_compute_round_pair(
+        &compact_mlv,
+        &fold_table,
+        mlv_rhos[0],
+        &first_r_next,
+        t3_pad_skip,
+    );
     if tail_round_timing {
         eprintln!(
             "[zc-tail-rounds] T3 compact fold (out n={}): {:.2} ms",
