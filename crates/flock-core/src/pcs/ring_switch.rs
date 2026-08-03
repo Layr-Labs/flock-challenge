@@ -1472,6 +1472,31 @@ pub(crate) fn collapse_s_hat_v_fold4(
 /// `bank = e_small + 4 * q_med + 16 * q_high`, followed by the 128
 /// packed-prefix entries. Same intake layout as the fold4 statistic, one
 /// level wider; every `z_vec` element is touched exactly once.
+const FOLD8_OUTPUT_LEN: usize = 64 * (1usize << LOG_PACKING);
+
+/// Exact ranked shape after retaining six coordinates: one coordinate remains
+/// to fold, so `z_vec` is precisely two contiguous Fold8 output planes.
+#[inline]
+const fn fold8_two_source_shape(z_vec_len: usize, tail_len: usize) -> bool {
+    tail_len == 7 && z_vec_len == 2 * FOLD8_OUTPUT_LEN
+}
+
+/// Fold the ranked two-plane shape directly. In characteristic two,
+/// `(1 + r) * lo + r * hi == lo + r * (lo + hi)`, so this uses one field
+/// multiply per output instead of two. A tight serial pass also avoids the
+/// generic path's two 64-bank accumulators, final vector reduce, and Rayon
+/// scheduling for this small fixed-size fold.
+#[inline(never)]
+fn s_hat_v_fold8_two_source(z_vec: &[F128], r: F128) -> Vec<F128> {
+    debug_assert_eq!(z_vec.len(), 2 * FOLD8_OUTPUT_LEN);
+    let (lo, hi) = z_vec.split_at(FOLD8_OUTPUT_LEN);
+    let mut out = crate::alloc_uninit_f128_vec(FOLD8_OUTPUT_LEN);
+    for ((dst, &lo_value), &hi_value) in out.iter_mut().zip(lo).zip(hi) {
+        *dst = lo_value + r * (lo_value + hi_value);
+    }
+    out
+}
+
 pub fn s_hat_v_fold8_from_z_vec(
     z_vec: &[F128],
     x_inner_rest_tail: &[F128],
@@ -1491,6 +1516,10 @@ pub fn s_hat_v_fold8_from_z_vec(
         z_vec.len(),
         n_packed * n_tail,
     );
+
+    if fold8_two_source_shape(z_vec.len(), x_inner_rest_tail.len()) {
+        return s_hat_v_fold8_two_source(z_vec, x_inner_rest_tail[6]);
+    }
 
     let eq_tail = build_eq_parallel(&x_inner_rest_tail[6..]);
     eq_tail
@@ -4278,6 +4307,39 @@ mod tests {
             }
         }
         assert_eq!(factors.products, product_oracle);
+    }
+
+    #[test]
+    fn fold8_two_source_selector_is_exact() {
+        assert!(fold8_two_source_shape(2 * FOLD8_OUTPUT_LEN, 7));
+        assert!(!fold8_two_source_shape(2 * FOLD8_OUTPUT_LEN, 6));
+        assert!(!fold8_two_source_shape(2 * FOLD8_OUTPUT_LEN, 8));
+        assert!(!fold8_two_source_shape(FOLD8_OUTPUT_LEN, 7));
+        assert!(!fold8_two_source_shape(4 * FOLD8_OUTPUT_LEN, 7));
+    }
+
+    /// The ranked direct path must be byte-identical to the generic eq-tensor
+    /// algebra, including the endpoint challenges that expose plane ordering.
+    #[test]
+    fn fold8_two_source_matches_eq_tensor_oracle() {
+        let mut rng = Rng::new(0xF01D_8002);
+        let z_vec: Vec<F128> = (0..2 * FOLD8_OUTPUT_LEN)
+            .map(|_| rng.f128())
+            .collect();
+        let mut tail: Vec<F128> = (0..7).map(|_| rng.f128()).collect();
+
+        for r in [F128::ZERO, F128::ONE, rng.f128()] {
+            tail[6] = r;
+            let got = s_hat_v_fold8_from_z_vec(&z_vec, &tail);
+            let weights = build_eq(&tail[6..]);
+            let mut expected = vec![F128::ZERO; FOLD8_OUTPUT_LEN];
+            for k in 0..2 {
+                for i in 0..FOLD8_OUTPUT_LEN {
+                    expected[i] += weights[k] * z_vec[k * FOLD8_OUTPUT_LEN + i];
+                }
+            }
+            assert_eq!(got, expected, "two-source fold mismatch at r={r:?}");
+        }
     }
 
     #[test]
