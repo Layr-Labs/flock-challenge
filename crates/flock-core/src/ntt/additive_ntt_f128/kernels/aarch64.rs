@@ -139,18 +139,26 @@ unsafe fn butterfly_zero_q(
     unsafe { core::arch::aarch64::veorq_u64(v, u) }
 }
 
+/// Vector-resident twin of `portable::butterfly_fused_3layer_row`.
+///
+/// # Safety
+/// Same contract as the portable form: the caller guarantees every selected
+/// row and lane is valid and that concurrent calls own disjoint row groups.
 #[target_feature(enable = "aes")]
-unsafe fn butterfly_fused_3layer_row_with_q(
+pub(super) unsafe fn butterfly_fused_3layer_row(
     ptr: *mut F128,
     eighth: usize,
     num_ntts: usize,
-    lanes: usize,
     r: usize,
-    t: &[core::arch::aarch64::uint64x2_t; 7],
+    twiddles: &[F128; 7],
 ) {
     use core::arch::aarch64::*;
     unsafe {
-        for lane in 0..lanes {
+        let t: [uint64x2_t; 7] = core::array::from_fn(|i| {
+            vld1q_u64((&raw const twiddles[i]).cast::<u64>())
+        });
+
+        for lane in 0..num_ntts {
             let base = ptr.add(r * num_ntts + lane);
             let step = eighth * num_ntts;
 
@@ -186,375 +194,6 @@ unsafe fn butterfly_fused_3layer_row_with_q(
     }
 }
 
-/// Vector-resident rate-1/2 first-pass row kernel with staged streaming
-/// stores. Loads the radix-8 row group from `src` once, evaluates both
-/// layer-1 blocks' fused-3 butterflies on those registers (zero-root set for
-/// `dst0`, general set for `dst1`), staging all outputs in two L1-resident
-/// stack tiles, then emits every destination row's lane run as one
-/// contiguous `stnp` burst.
-///
-/// The staging exists for the store microarchitecture, not the arithmetic:
-/// per-lane scatter stores interleave sixteen 16 B streams spaced 64 MiB
-/// apart, which defeats the streaming-store detector and pays a full RFO
-/// read on ~1 GiB of destination lines (measured −4% end-to-end, note
-/// `516b4da`). Sequential 1 KiB non-temporal bursts per row restore the
-/// fill-like store behavior the replicate path enjoyed.
-///
-/// # Safety
-/// Row/lane geometry valid for all three pointers, disjoint row groups
-/// across concurrent calls, `num_ntts ≤ 64`, 16 B-aligned destinations, and
-/// `t_zero[0] == t_zero[1] == t_zero[3] == 0`.
-#[target_feature(enable = "aes")]
-#[allow(clippy::too_many_arguments)]
-pub(super) unsafe fn butterfly_fused_3layer_dual_from_src_row(
-    src: *const F128,
-    dst0: *mut F128,
-    dst1: *mut F128,
-    eighth: usize,
-    num_ntts: usize,
-    r: usize,
-    t_zero: &[F128; 7],
-    t_gen: &[F128; 7],
-) {
-    use core::arch::aarch64::*;
-
-    #[inline(always)]
-    fn nt_bursts() -> bool {
-        use std::sync::OnceLock;
-        static ON: OnceLock<bool> = OnceLock::new();
-        // Diagnostics toggle while pricing the burst store flavor:
-        // FLOCK_FROM_MSG_PLAIN_ST=1 uses ordinary vector stores.
-        *ON.get_or_init(|| std::env::var_os("FLOCK_FROM_MSG_PLAIN_ST").is_none())
-    }
-
-    #[inline(always)]
-    unsafe fn store_pair_nt(dst: *mut F128, x: uint64x2_t, y: uint64x2_t) {
-        // Best-effort non-temporal pair hint; same idiom as the zerocheck
-        // fold kernels' `stnp` arm.
-        unsafe {
-            core::arch::asm!(
-                "stnp {x:q}, {y:q}, [{dst}]",
-                dst = in(reg) dst,
-                x = in(vreg) x,
-                y = in(vreg) y,
-                options(nostack, preserves_flags),
-            );
-        }
-    }
-
-    unsafe {
-        debug_assert_eq!(t_zero[0], F128::ZERO);
-        debug_assert_eq!(t_zero[1], F128::ZERO);
-        debug_assert_eq!(t_zero[3], F128::ZERO);
-        debug_assert!(num_ntts <= 64 && num_ntts.is_multiple_of(2));
-
-        let z2 = vld1q_u64((&raw const t_zero[2]).cast::<u64>());
-        let z4 = vld1q_u64((&raw const t_zero[4]).cast::<u64>());
-        let z5 = vld1q_u64((&raw const t_zero[5]).cast::<u64>());
-        let z6 = vld1q_u64((&raw const t_zero[6]).cast::<u64>());
-        let g: [uint64x2_t; 7] =
-            core::array::from_fn(|i| vld1q_u64((&raw const t_gen[i]).cast::<u64>()));
-
-        // Two 8 KiB staging tiles (8 rows × ≤64 lanes × 16 B): L1-resident,
-        // written per lane, read back once for the sequential row bursts.
-        let mut stage0 = [F128 { lo: 0, hi: 0 }; 512];
-        let mut stage1 = [F128 { lo: 0, hi: 0 }; 512];
-
-        let off = r * num_ntts;
-        let step = eighth * num_ntts;
-        // The store flavor is process-constant. Resolve the diagnostic
-        // killswitch once per row group rather than re-reading the OnceLock
-        // for every destination pair in the burst loop below.
-        let use_nt_bursts = nt_bursts();
-        for lane in 0..num_ntts {
-            let src_base = src.add(off + lane);
-            let loaded: [uint64x2_t; 8] =
-                core::array::from_fn(|i| vld1q_u64(src_base.add(i * step).cast::<u64>()));
-
-            // Block 0: zero-root chain (mirrors
-            // `butterfly_fused_3layer_zero_root_row`, but keeps v[0]).
-            {
-                let mut v = loaded;
-                for i in 0..4 {
-                    v[i + 4] = butterfly_zero_q(v[i], v[i + 4]);
-                }
-                for i in 0..2 {
-                    v[i + 2] = butterfly_zero_q(v[i], v[i + 2]);
-                }
-                let (a, b) = butterfly_q(v[4], v[6], z2);
-                v[4] = a;
-                v[6] = b;
-                let (a, b) = butterfly_q(v[5], v[7], z2);
-                v[5] = a;
-                v[7] = b;
-                v[1] = butterfly_zero_q(v[0], v[1]);
-                let (a, b) = butterfly_q(v[2], v[3], z4);
-                v[2] = a;
-                v[3] = b;
-                let (a, b) = butterfly_q(v[4], v[5], z5);
-                v[4] = a;
-                v[5] = b;
-                let (a, b) = butterfly_q(v[6], v[7], z6);
-                v[6] = a;
-                v[7] = b;
-                for (i, value) in v.iter().enumerate() {
-                    vst1q_u64(
-                        stage0.as_mut_ptr().add(i * num_ntts + lane).cast::<u64>(),
-                        *value,
-                    );
-                }
-            }
-
-            // Block 1: general chain (mirrors `butterfly_fused_3layer_row`).
-            {
-                let mut v = loaded;
-                for i in 0..4 {
-                    let (a, b) = butterfly_q(v[i], v[i + 4], g[0]);
-                    v[i] = a;
-                    v[i + 4] = b;
-                }
-                for s in 0..2 {
-                    for i in 0..2 {
-                        let (u, w) = (4 * s + i, 4 * s + i + 2);
-                        let (a, b) = butterfly_q(v[u], v[w], g[1 + s]);
-                        v[u] = a;
-                        v[w] = b;
-                    }
-                }
-                for s in 0..4 {
-                    let (a, b) = butterfly_q(v[2 * s], v[2 * s + 1], g[3 + s]);
-                    v[2 * s] = a;
-                    v[2 * s + 1] = b;
-                }
-                for (i, value) in v.iter().enumerate() {
-                    vst1q_u64(
-                        stage1.as_mut_ptr().add(i * num_ntts + lane).cast::<u64>(),
-                        *value,
-                    );
-                }
-            }
-        }
-
-        // Emit each destination row's full lane run as one sequential
-        // non-temporal burst (num_ntts/2 store-pairs of 32 B each).
-        for i in 0..8 {
-            let s0 = stage0.as_ptr().add(i * num_ntts);
-            let s1 = stage1.as_ptr().add(i * num_ntts);
-            let d0 = dst0.add(off + i * step);
-            let d1 = dst1.add(off + i * step);
-            let mut lane = 0;
-            while lane < num_ntts {
-                let x = vld1q_u64(s0.add(lane).cast::<u64>());
-                let y = vld1q_u64(s0.add(lane + 1).cast::<u64>());
-                if use_nt_bursts {
-                    store_pair_nt(d0.add(lane), x, y);
-                } else {
-                    vst1q_u64(d0.add(lane).cast::<u64>(), x);
-                    vst1q_u64(d0.add(lane + 1).cast::<u64>(), y);
-                }
-                let x = vld1q_u64(s1.add(lane).cast::<u64>());
-                let y = vld1q_u64(s1.add(lane + 1).cast::<u64>());
-                if use_nt_bursts {
-                    store_pair_nt(d1.add(lane), x, y);
-                } else {
-                    vst1q_u64(d1.add(lane).cast::<u64>(), x);
-                    vst1q_u64(d1.add(lane + 1).cast::<u64>(), y);
-                }
-                lane += 2;
-            }
-        }
-    }
-}
-
-/// Out-of-place radix-8 row used by recursive from-message commitments.
-/// Values are staged as one contiguous lane run per output row before the
-/// non-temporal stores, avoiding a read-for-ownership of the stale codeword.
-#[target_feature(enable = "aes")]
-unsafe fn butterfly_fused_3layer_from_src_row_impl<const ZERO_ROOT: bool>(
-    src: *const F128,
-    dst: *mut F128,
-    eighth: usize,
-    num_ntts: usize,
-    r: usize,
-    twiddles: &[F128; 7],
-) {
-    use core::arch::aarch64::*;
-
-    #[inline(always)]
-    unsafe fn store_pair_nt(dst: *mut F128, x: uint64x2_t, y: uint64x2_t) {
-        unsafe {
-            core::arch::asm!(
-                "stnp {x:q}, {y:q}, [{dst}]",
-                dst = in(reg) dst,
-                x = in(vreg) x,
-                y = in(vreg) y,
-                options(nostack, preserves_flags),
-            );
-        }
-    }
-
-    unsafe {
-        debug_assert_eq!(num_ntts, 8);
-        if ZERO_ROOT {
-            debug_assert_eq!(twiddles[0], F128::ZERO);
-            debug_assert_eq!(twiddles[1], F128::ZERO);
-            debug_assert_eq!(twiddles[3], F128::ZERO);
-        }
-        let t: [uint64x2_t; 7] =
-            core::array::from_fn(|i| vld1q_u64((&raw const twiddles[i]).cast::<u64>()));
-        let mut stage = [F128 { lo: 0, hi: 0 }; 64];
-        let off = r * num_ntts;
-        let step = eighth * num_ntts;
-
-        for lane in 0..num_ntts {
-            let src_base = src.add(off + lane);
-            let mut v: [uint64x2_t; 8] =
-                core::array::from_fn(|i| vld1q_u64(src_base.add(i * step).cast::<u64>()));
-
-            if ZERO_ROOT {
-                for i in 0..4 {
-                    v[i + 4] = butterfly_zero_q(v[i], v[i + 4]);
-                }
-                for i in 0..2 {
-                    v[i + 2] = butterfly_zero_q(v[i], v[i + 2]);
-                }
-                let (a, b) = butterfly_q(v[4], v[6], t[2]);
-                v[4] = a;
-                v[6] = b;
-                let (a, b) = butterfly_q(v[5], v[7], t[2]);
-                v[5] = a;
-                v[7] = b;
-                v[1] = butterfly_zero_q(v[0], v[1]);
-                let (a, b) = butterfly_q(v[2], v[3], t[4]);
-                v[2] = a;
-                v[3] = b;
-                let (a, b) = butterfly_q(v[4], v[5], t[5]);
-                v[4] = a;
-                v[5] = b;
-                let (a, b) = butterfly_q(v[6], v[7], t[6]);
-                v[6] = a;
-                v[7] = b;
-            } else {
-                for i in 0..4 {
-                    let (a, b) = butterfly_q(v[i], v[i + 4], t[0]);
-                    v[i] = a;
-                    v[i + 4] = b;
-                }
-                for s in 0..2 {
-                    for i in 0..2 {
-                        let (u, w) = (4 * s + i, 4 * s + i + 2);
-                        let (a, b) = butterfly_q(v[u], v[w], t[1 + s]);
-                        v[u] = a;
-                        v[w] = b;
-                    }
-                }
-                for s in 0..4 {
-                    let (a, b) = butterfly_q(v[2 * s], v[2 * s + 1], t[3 + s]);
-                    v[2 * s] = a;
-                    v[2 * s + 1] = b;
-                }
-            }
-
-            for (i, value) in v.iter().enumerate() {
-                vst1q_u64(
-                    stage.as_mut_ptr().add(i * num_ntts + lane).cast::<u64>(),
-                    *value,
-                );
-            }
-        }
-
-        // Every destination row is a short contiguous burst (128 B for the
-        // ranked recursive geometry), so the stale allocation is written
-        // without an RFO read.
-        for i in 0..8 {
-            let src_row = stage.as_ptr().add(i * num_ntts);
-            let dst_row = dst.add(off + i * step);
-            let mut lane = 0;
-            while lane < num_ntts {
-                let x = vld1q_u64(src_row.add(lane).cast::<u64>());
-                let y = vld1q_u64(src_row.add(lane + 1).cast::<u64>());
-                store_pair_nt(dst_row.add(lane), x, y);
-                lane += 2;
-            }
-        }
-    }
-}
-
-#[target_feature(enable = "aes")]
-pub(super) unsafe fn butterfly_fused_3layer_from_src_row(
-    src: *const F128,
-    dst: *mut F128,
-    eighth: usize,
-    num_ntts: usize,
-    r: usize,
-    twiddles: &[F128; 7],
-) {
-    unsafe {
-        butterfly_fused_3layer_from_src_row_impl::<false>(
-            src, dst, eighth, num_ntts, r, twiddles,
-        );
-    }
-}
-
-#[target_feature(enable = "aes")]
-pub(super) unsafe fn butterfly_fused_3layer_zero_root_from_src_row(
-    src: *const F128,
-    dst: *mut F128,
-    eighth: usize,
-    num_ntts: usize,
-    r: usize,
-    twiddles: &[F128; 7],
-) {
-    unsafe {
-        butterfly_fused_3layer_from_src_row_impl::<true>(
-            src, dst, eighth, num_ntts, r, twiddles,
-        );
-    }
-}
-
-/// Vector-resident twin of `portable::butterfly_fused_3layer_row`.
-///
-/// # Safety
-/// Same contract as the portable form: the caller guarantees every selected
-/// row and lane is valid and that concurrent calls own disjoint row groups.
-#[target_feature(enable = "aes")]
-pub(super) unsafe fn butterfly_fused_3layer_row(
-    ptr: *mut F128,
-    eighth: usize,
-    num_ntts: usize,
-    lanes: usize,
-    r: usize,
-    twiddles: &[F128; 7],
-) {
-    use core::arch::aarch64::*;
-    unsafe {
-        let t: [uint64x2_t; 7] =
-            core::array::from_fn(|i| vld1q_u64((&raw const twiddles[i]).cast::<u64>()));
-        butterfly_fused_3layer_row_with_q(ptr, eighth, num_ntts, lanes, r, &t);
-    }
-}
-
-/// Process a contiguous tile of row groups while keeping the seven twiddles
-/// in vector registers across the tile.
-#[target_feature(enable = "aes")]
-pub(super) unsafe fn butterfly_fused_3layer_rows(
-    ptr: *mut F128,
-    eighth: usize,
-    num_ntts: usize,
-    row_start: usize,
-    row_end: usize,
-    twiddles: &[F128; 7],
-) {
-    use core::arch::aarch64::*;
-    unsafe {
-        let t: [uint64x2_t; 7] =
-            core::array::from_fn(|i| vld1q_u64((&raw const twiddles[i]).cast::<u64>()));
-        for r in row_start..row_end {
-            butterfly_fused_3layer_row_with_q(ptr, eighth, num_ntts, num_ntts, r, &t);
-        }
-    }
-}
-
 /// Vector-resident twin of `portable::butterfly_fused_3layer_zero_root_row`.
 ///
 /// Twiddles 0, 1 and 3 are zero on the root spine, so those butterflies are
@@ -564,20 +203,25 @@ pub(super) unsafe fn butterfly_fused_3layer_rows(
 /// As [`butterfly_fused_3layer_row`], and the caller additionally guarantees
 /// `twiddles[0] == twiddles[1] == twiddles[3] == 0`.
 #[target_feature(enable = "aes")]
-unsafe fn butterfly_fused_3layer_zero_root_row_with_q(
+pub(super) unsafe fn butterfly_fused_3layer_zero_root_row(
     ptr: *mut F128,
     eighth: usize,
     num_ntts: usize,
-    lanes: usize,
     r: usize,
-    t2: core::arch::aarch64::uint64x2_t,
-    t4: core::arch::aarch64::uint64x2_t,
-    t5: core::arch::aarch64::uint64x2_t,
-    t6: core::arch::aarch64::uint64x2_t,
+    twiddles: &[F128; 7],
 ) {
     use core::arch::aarch64::*;
     unsafe {
-        for lane in 0..lanes {
+        debug_assert_eq!(twiddles[0], F128::ZERO);
+        debug_assert_eq!(twiddles[1], F128::ZERO);
+        debug_assert_eq!(twiddles[3], F128::ZERO);
+
+        let t2 = vld1q_u64((&raw const twiddles[2]).cast::<u64>());
+        let t4 = vld1q_u64((&raw const twiddles[4]).cast::<u64>());
+        let t5 = vld1q_u64((&raw const twiddles[5]).cast::<u64>());
+        let t6 = vld1q_u64((&raw const twiddles[6]).cast::<u64>());
+
+        for lane in 0..num_ntts {
             let base = ptr.add(r * num_ntts + lane);
             let step = eighth * num_ntts;
 
@@ -618,121 +262,9 @@ unsafe fn butterfly_fused_3layer_zero_root_row_with_q(
     }
 }
 
-#[target_feature(enable = "aes")]
-pub(super) unsafe fn butterfly_fused_3layer_zero_root_row(
-    ptr: *mut F128,
-    eighth: usize,
-    num_ntts: usize,
-    lanes: usize,
-    r: usize,
-    twiddles: &[F128; 7],
-) {
-    use core::arch::aarch64::*;
-    unsafe {
-        debug_assert_eq!(twiddles[0], F128::ZERO);
-        debug_assert_eq!(twiddles[1], F128::ZERO);
-        debug_assert_eq!(twiddles[3], F128::ZERO);
-        let t2 = vld1q_u64((&raw const twiddles[2]).cast::<u64>());
-        let t4 = vld1q_u64((&raw const twiddles[4]).cast::<u64>());
-        let t5 = vld1q_u64((&raw const twiddles[5]).cast::<u64>());
-        let t6 = vld1q_u64((&raw const twiddles[6]).cast::<u64>());
-        butterfly_fused_3layer_zero_root_row_with_q(
-            ptr, eighth, num_ntts, lanes, r, t2, t4, t5, t6,
-        );
-    }
-}
-
-#[target_feature(enable = "aes")]
-pub(super) unsafe fn butterfly_fused_3layer_zero_root_rows(
-    ptr: *mut F128,
-    eighth: usize,
-    num_ntts: usize,
-    row_start: usize,
-    row_end: usize,
-    twiddles: &[F128; 7],
-) {
-    use core::arch::aarch64::*;
-    unsafe {
-        debug_assert_eq!(twiddles[0], F128::ZERO);
-        debug_assert_eq!(twiddles[1], F128::ZERO);
-        debug_assert_eq!(twiddles[3], F128::ZERO);
-        let t2 = vld1q_u64((&raw const twiddles[2]).cast::<u64>());
-        let t4 = vld1q_u64((&raw const twiddles[4]).cast::<u64>());
-        let t5 = vld1q_u64((&raw const twiddles[5]).cast::<u64>());
-        let t6 = vld1q_u64((&raw const twiddles[6]).cast::<u64>());
-        for r in row_start..row_end {
-            butterfly_fused_3layer_zero_root_row_with_q(
-                ptr, eighth, num_ntts, num_ntts, r, t2, t4, t5, t6,
-            );
-        }
-    }
-}
-
-/// Two low-constant products with everything held in q registers: product
-/// `i` is `v_i · t_i` where `t_i.hi == 0` and `ts_i` holds `t_i.lo` in both
-/// lanes. Same unreduced-word layout and shift-fold reduction as
-/// [`crate::field::gf2_128::aarch64::ghash_mul_low_constants_vec2_neon`]
-/// (`r3 = 0`, single fold, no overflow correction), but the operands arrive
-/// as `uint64x2_t` and the products leave as `uint64x2_t`, so no lane ever
-/// visits a general-purpose register.
-#[inline(always)]
-unsafe fn mul_low_pair_q(
-    v0: core::arch::aarch64::uint64x2_t,
-    v1: core::arch::aarch64::uint64x2_t,
-    ts0: core::arch::aarch64::uint64x2_t,
-    ts1: core::arch::aarch64::uint64x2_t,
-) -> (
-    core::arch::aarch64::uint64x2_t,
-    core::arch::aarch64::uint64x2_t,
-) {
-    use core::arch::aarch64::*;
-    unsafe {
-        // With t.hi == 0 each product needs only ll = v.lo·t.lo and
-        // hl = v.hi·t.lo; `vmull_high_p64` reads v.hi in place.
-        let p0_ll = pmull_ll(v0, ts0);
-        let p0_hl = core::mem::transmute::<u128, uint64x2_t>(vmull_high_p64(
-            vreinterpretq_p64_u64(v0),
-            vreinterpretq_p64_u64(ts0),
-        ));
-        let p1_ll = pmull_ll(v1, ts1);
-        let p1_hl = core::mem::transmute::<u128, uint64x2_t>(vmull_high_p64(
-            vreinterpretq_p64_u64(v1),
-            vreinterpretq_p64_u64(ts1),
-        ));
-
-        // Lane-paired unreduced words: r0 = ll.lo, r1 = ll.hi ^ hl.lo,
-        // r2 = hl.hi, r3 = 0.
-        let r0 = vzip1q_u64(p0_ll, p1_ll);
-        let r1 = veorq_u64(vzip2q_u64(p0_ll, p1_ll), vzip1q_u64(p0_hl, p1_hl));
-        let r2 = vzip2q_u64(p0_hl, p1_hl);
-
-        // Fold r2·x^128 with x^128 = x^7 + x^2 + x + 1. Since r3 is zero,
-        // there is no second overflow correction.
-        let folded_lo = xor3(
-            r2,
-            vshlq_n_u64::<1>(r2),
-            veorq_u64(vshlq_n_u64::<2>(r2), vshlq_n_u64::<7>(r2)),
-        );
-        let folded_hi = xor3(
-            vshrq_n_u64::<63>(r2),
-            vshrq_n_u64::<62>(r2),
-            vshrq_n_u64::<57>(r2),
-        );
-        let out_lo = veorq_u64(r0, folded_lo);
-        let out_hi = veorq_u64(r1, folded_hi);
-
-        // Unzip back to per-product `{ lo, hi }` lane order.
-        (vzip1q_u64(out_lo, out_hi), vzip2q_u64(out_lo, out_hi))
-    }
-}
-
 /// Fused two-layer butterfly specialized for three low-limb-only twiddles.
 /// Two products are issued together at each stage, using four PMULLs instead
-/// of twelve for the pair under the generic Binius field multiplier, and —
-/// like [`butterfly_fused_2layer`] below — the four row values and every
-/// intermediate stay in `uint64x2_t` across both layers, so the butterfly
-/// XORs are `veorq_u64` rather than scalar `u64` pairs. Same multiplies,
-/// same butterfly order, bit-identical output.
+/// of twelve for the pair under the generic Binius field multiplier.
 ///
 /// # Safety
 /// Requires the `aes` target feature.
@@ -748,7 +280,7 @@ pub(super) unsafe fn butterfly_fused_2layer_low_twiddles(
     t_inner_a: F128,
     t_inner_b: F128,
 ) {
-    use core::arch::aarch64::*;
+    use crate::field::gf2_128::aarch64::ghash_mul_low_constants_vec2_neon;
 
     debug_assert_eq!(a.len(), b.len());
     debug_assert_eq!(a.len(), c.len());
@@ -757,37 +289,34 @@ pub(super) unsafe fn butterfly_fused_2layer_low_twiddles(
     debug_assert_eq!(t_inner_a.hi, 0);
     debug_assert_eq!(t_inner_b.hi, 0);
 
-    // SAFETY: this function carries aes and all constants have zero high
-    // limbs by the ranked gate and assertions above.
-    unsafe {
-        let to = vdupq_n_u64(t_outer.lo);
-        let ta = vdupq_n_u64(t_inner_a.lo);
-        let tb = vdupq_n_u64(t_inner_b.lo);
-        for lane in 0..a.len() {
-            let mut xa = vld1q_u64((&raw const a[lane]).cast::<u64>());
-            let mut xb = vld1q_u64((&raw const b[lane]).cast::<u64>());
-            let mut xc = vld1q_u64((&raw const c[lane]).cast::<u64>());
-            let mut xd = vld1q_u64((&raw const d[lane]).cast::<u64>());
+    for lane in 0..a.len() {
+        let mut xa = a[lane];
+        let mut xb = b[lane];
+        let mut xc = c[lane];
+        let mut xd = d[lane];
 
-            // Layer L: (a,c) and (b,d) share t_outer.
-            let (o0, o1) = mul_low_pair_q(xc, xd, to, to);
-            xa = veorq_u64(xa, o0);
-            xc = veorq_u64(xc, xa);
-            xb = veorq_u64(xb, o1);
-            xd = veorq_u64(xd, xb);
+        // SAFETY: this function carries aes and all constants have zero high
+        // limbs by the ranked gate and assertions above.
+        let outer = unsafe {
+            ghash_mul_low_constants_vec2_neon([t_outer, t_outer], [xc, xd])
+        };
+        xa += outer[0];
+        xc += xa;
+        xb += outer[1];
+        xd += xb;
 
-            // Layer L+1: (a,b) under t_inner_a, (c,d) under t_inner_b.
-            let (i0, i1) = mul_low_pair_q(xb, xd, ta, tb);
-            xa = veorq_u64(xa, i0);
-            xb = veorq_u64(xb, xa);
-            xc = veorq_u64(xc, i1);
-            xd = veorq_u64(xd, xc);
+        let inner = unsafe {
+            ghash_mul_low_constants_vec2_neon([t_inner_a, t_inner_b], [xb, xd])
+        };
+        xa += inner[0];
+        xb += xa;
+        xc += inner[1];
+        xd += xc;
 
-            vst1q_u64((&raw mut a[lane]).cast::<u64>(), xa);
-            vst1q_u64((&raw mut b[lane]).cast::<u64>(), xb);
-            vst1q_u64((&raw mut c[lane]).cast::<u64>(), xc);
-            vst1q_u64((&raw mut d[lane]).cast::<u64>(), xd);
-        }
+        a[lane] = xa;
+        b[lane] = xb;
+        c[lane] = xc;
+        d[lane] = xd;
     }
 }
 
