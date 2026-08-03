@@ -4088,7 +4088,7 @@ kernel void blake3_pow_scan(
                 encode_ntt_passes(gpu, enc, staging, tw_buf, log_d, 4);
                 encode_merkle(gpu, enc, staging, tree_buf, n_leaves);
                 gpu.end_encoding(enc);
-                gpu.commit_and_wait(cb)
+                gpu.commit_and_spin(cb, 30.0)
             })();
             gpu.pool_pop(pool);
             r
@@ -4113,7 +4113,7 @@ kernel void blake3_pow_scan(
                 encode_ntt_passes(gpu, enc, staging, tw_buf, log_d, 4);
                 encode_merkle(gpu, enc, staging, tree_buf, n_leaves);
                 gpu.end_encoding(enc);
-                gpu.commit_and_wait(cb)
+                gpu.commit_and_spin(cb, 30.0)
             })();
             gpu.pool_pop(pool);
             r
@@ -4160,7 +4160,7 @@ kernel void blake3_pow_scan(
                 1usize << (log_d - 4),
             );
             gpu.end_encoding(enc);
-            gpu.commit_and_wait(cb1)
+            gpu.commit_and_spin(cb1, 30.0)
         }
     }
 
@@ -4402,7 +4402,7 @@ kernel void blake3_pow_scan(
                 // parents; the 15 nodes above it are recomputed here,
                 // covering every decomposition boundary for any k.
                 let t_wait_cb2 = window_trace_enabled().then(std::time::Instant::now);
-                gpu.wait_cb(cb2)?;
+                gpu.spin_wait_cb(cb2, 2.0)?;
                 if let Some(t) = t_wait_cb2 {
                     let (s, e) = cb_gpu_interval(gpu, cb2);
                     eprintln!(
@@ -7952,7 +7952,7 @@ kernel void rec_parent_hash(device const uint* children [[buffer(0)]],
                     read_len = n_out;
                 }
                 gpu.end_encoding(enc);
-                gpu.commit_and_wait(cb)
+                gpu.commit_and_spin(cb, 4.0)
             })();
             gpu.pool_pop(pool);
             run
