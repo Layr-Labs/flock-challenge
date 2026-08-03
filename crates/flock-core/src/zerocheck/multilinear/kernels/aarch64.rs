@@ -825,7 +825,7 @@ pub(crate) unsafe fn fold_round2_compact_chunk_neon_lookahead_8<
 /// zero delta code folds to zero through the table's zero entry.
 #[cfg(target_arch = "aarch64")]
 #[target_feature(enable = "aes")]
-pub(crate) unsafe fn fold2_compact_and_round4_chunk_neon_8(
+pub(crate) unsafe fn fold2_compact_and_round4_chunk_neon_8<const SKIP_PADDED: bool>(
     table_l1: *const u8,
     table_l3: *const u8,
     rho2: F128,
@@ -836,6 +836,9 @@ pub(crate) unsafe fn fold2_compact_and_round4_chunk_neon_8(
     eq_lo: *const F128,
     out_pairs: usize,
     degen: bool,
+    out_pair_idx_base: usize,
+    out_pair_in_block_mask: usize,
+    useful_out_pairs: usize,
 ) -> (F128, F128) {
     use core::arch::aarch64::*;
 
@@ -860,6 +863,13 @@ pub(crate) unsafe fn fold2_compact_and_round4_chunk_neon_8(
         let mut pinf_acc = WideNeon { lo: zero, hi: zero };
 
         for u in 0..out_pairs {
+            if SKIP_PADDED
+                && ((out_pair_idx_base + u) & out_pair_in_block_mask) >= useful_out_pairs
+            {
+                store_pair_nt(a_out.add(2 * u), zero, zero);
+                store_pair_nt(b_out.add(2 * u), zero, zero);
+                continue;
+            }
             let mut av = [zero; 2];
             let mut bv = [zero; 2];
             let mut b_flat = true;

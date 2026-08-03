@@ -113,6 +113,31 @@ fn round2_pair_skip(padding: &PaddingSpec, k_skip: usize) -> (usize, usize) {
     (pairs_per_block - 1, useful_pairs)
 }
 
+/// Returns the periodic suffix of output-pairs that is already known to be
+/// zero after the compact lookahead binds two multilinear variables. One
+/// output-pair covers eight post-URM chunks, so the returned geometry is the
+/// compact consumer's `u` index rather than the producer's pair index.
+///
+/// The mixed boundary pair is retained: it contains the final useful chunk and
+/// cannot be skipped. Only a pair whose eight chunks are all padding is omitted
+/// from compact reconstruction; its two output slots are still explicitly
+/// zeroed so the subsequent tail sees the canonical table.
+fn fold2_output_pair_skip(padding: &PaddingSpec, k_skip: usize) -> Option<(usize, usize)> {
+    if padding.k_log <= k_skip + 3 {
+        return None;
+    }
+    let pairs_per_block = 1usize << (padding.k_log - k_skip - 3);
+    let chunk_bits = 1usize << k_skip;
+    let useful_pairs = padding
+        .useful_bits_per_block
+        .div_ceil(8 * chunk_bits);
+    if useful_pairs >= pairs_per_block {
+        None
+    } else {
+        Some((pairs_per_block - 1, useful_pairs))
+    }
+}
+
 /// Kill switch for draining the DRAM-bound tail loop rounds (half ≥ 2^21)
 /// through the hetero E-core queue (H2). `FLOCK_NO_ZC_TAIL_HETERO=1` keeps
 /// them on the main rayon pool. Bit-identical either way — chunk ownership
@@ -1707,6 +1732,7 @@ pub(crate) fn fold2_compact_and_round4_into(
     r_next4: &[F128],
     a_out: &mut [F128],
     b_out: &mut [F128],
+    padding: &PaddingSpec,
 ) -> (F128, F128) {
     let n_pairs = compact.len();
     let n_groups = n_pairs / 2;
@@ -1734,6 +1760,9 @@ pub(crate) fn fold2_compact_and_round4_into(
     let out_chunk = 2 * lo_size;
     #[cfg(target_arch = "aarch64")]
     let degen = r2_degen_enabled();
+    let (skip_pair_mask, useful_pairs) =
+        fold2_output_pair_skip(padding, 6).map_or((0, usize::MAX), |v| v);
+    let skip_padded_pairs = useful_pairs != usize::MAX;
 
     let mut partials: Vec<(F128, F128)> = vec![(F128::ZERO, F128::ZERO); hi_size];
     let a_base = crate::epool::SyncPtr(a_out.as_mut_ptr());
@@ -1749,22 +1778,45 @@ pub(crate) fn fold2_compact_and_round4_into(
             )
         };
         // Each output chunk covers `out_chunk` groups = 2·out_chunk pairs.
+        #[cfg(target_arch = "aarch64")]
         let pair_base = 2 * x_hi * out_chunk;
+        let out_pair_idx_base = x_hi * (out_chunk / 2);
 
         #[cfg(target_arch = "aarch64")]
         let (p1, pinf) = unsafe {
-            fold2_compact_and_round4_chunk_neon_8(
-                table_l1.as_ptr().cast::<u8>(),
-                table_l3.as_ptr().cast::<u8>(),
-                rho2,
-                compact.anchors.as_ptr().add(2 * pair_base),
-                compact.deltas.as_ptr().add(pair_base * table.n_chunks * 2),
-                a_ptr,
-                b_ptr,
-                eq_lo.as_ptr(),
-                lo_size,
-                degen,
-            )
+            if skip_padded_pairs {
+                fold2_compact_and_round4_chunk_neon_8::<true>(
+                    table_l1.as_ptr().cast::<u8>(),
+                    table_l3.as_ptr().cast::<u8>(),
+                    rho2,
+                    compact.anchors.as_ptr().add(2 * pair_base),
+                    compact.deltas.as_ptr().add(pair_base * table.n_chunks * 2),
+                    a_ptr,
+                    b_ptr,
+                    eq_lo.as_ptr(),
+                    lo_size,
+                    degen,
+                    out_pair_idx_base,
+                    skip_pair_mask,
+                    useful_pairs,
+                )
+            } else {
+                fold2_compact_and_round4_chunk_neon_8::<false>(
+                    table_l1.as_ptr().cast::<u8>(),
+                    table_l3.as_ptr().cast::<u8>(),
+                    rho2,
+                    compact.anchors.as_ptr().add(2 * pair_base),
+                    compact.deltas.as_ptr().add(pair_base * table.n_chunks * 2),
+                    a_ptr,
+                    b_ptr,
+                    eq_lo.as_ptr(),
+                    lo_size,
+                    degen,
+                    out_pair_idx_base,
+                    0,
+                    usize::MAX,
+                )
+            }
         };
 
         #[cfg(not(target_arch = "aarch64"))]
@@ -1775,6 +1827,14 @@ pub(crate) fn fold2_compact_and_round4_into(
             let mut pinf_acc = F256Unreduced::ZERO;
             let nc = table.n_chunks;
             for g_local in 0..out_chunk {
+                let out_pair_idx = out_pair_idx_base + g_local / 2;
+                if skip_padded_pairs
+                    && (out_pair_idx & skip_pair_mask) >= useful_pairs
+                {
+                    a_out[g_local] = F128::ZERO;
+                    b_out[g_local] = F128::ZERO;
+                    continue;
+                }
                 let g = x_hi * out_chunk + g_local;
                 let anc = &compact.anchors[4 * g..4 * g + 4];
                 let d = &compact.deltas[32 * g..32 * g + 32];
@@ -1790,6 +1850,11 @@ pub(crate) fn fold2_compact_and_round4_into(
                 b_out[g_local] = b;
             }
             for x_lo in 0..lo_size {
+                if skip_padded_pairs
+                    && ((out_pair_idx_base + x_lo) & skip_pair_mask) >= useful_pairs
+                {
+                    continue;
+                }
                 let o = 2 * x_lo;
                 let (a0, a1) = (a_out[o], a_out[o + 1]);
                 let (b0, b1) = (b_out[o], b_out[o + 1]);
@@ -3475,7 +3540,14 @@ mod tests {
                         a_n.fill(LA_POISON);
                         b_n.fill(LA_POISON);
                         let msg_n = fold2_compact_and_round4_into(
-                            &compact, &f.table, rho1, rho2, &r_next4, &mut a_n, &mut b_n,
+                            &compact,
+                            &f.table,
+                            rho1,
+                            rho2,
+                            &r_next4,
+                            &mut a_n,
+                            &mut b_n,
+                            &f.padding,
                         );
                         assert_eq!(a_n, a_l, "A'' m={m} rho1={rho1:?} rho2={rho2:?}");
                         assert_eq!(b_n, b_l, "B'' m={m} rho1={rho1:?} rho2={rho2:?}");
