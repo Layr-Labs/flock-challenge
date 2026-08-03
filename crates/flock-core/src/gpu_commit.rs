@@ -8275,11 +8275,62 @@ kernel void zc_r2_products(
     /// suspected cause of admission failing on a majority of ranked worker
     /// processes while every admitted process posts record p10s). Ratio ≥ 8
     /// or unusable ⇒ 0 = exact incumbent.
-    const ZC_R2_ALPHA: f64 = 0.55;
+    /// Fraction of a covered chunk's CPU cost the arm actually *removes*.
+    ///
+    /// The balance equation is `(hi - (1-ALPHA)*g) * c_full = g * u_gpu`, so
+    /// `1-ALPHA` is the fraction the CPU still pays on an offloaded chunk.
+    /// This is the one term in the model that is assumed rather than
+    /// measured: calibration runs every chunk FULL, so it observes `c_full`
+    /// and `u_gpu` and never observes the residual.
+    ///
+    /// `0.55` was correct when an offloaded chunk ran the anchors-only
+    /// kernel — no field products at all. Two promoted mechanisms have
+    /// changed the residual since, and neither re-derived the constant:
+    ///
+    /// * the two-challenge lookahead made the CPU keep six of the kernel's
+    ///   eight products on an offloaded chunk, because the round-three
+    ///   aggregates need the odd-parity pair that the arm did not return;
+    /// * the odd-parity offload then handed that pair back, taking the
+    ///   offloaded chunk from 38 to 32 PMULL per group.
+    ///
+    /// Against the full kernel's 44 PMULL per group the residual is
+    /// therefore `32/44 = 0.727` of the product work — and *all* 64 table
+    /// lookups and *all* anchor/delta stores are unconditional in both
+    /// monomorphizations, so they are retained in full. With products
+    /// between half and three quarters of chunk cost the retained fraction
+    /// lands in `[0.73, 0.87]`; `1-ALPHA = 0.80` is its midpoint, which
+    /// improves the round-two wall across that entire interval rather than
+    /// only at its own point estimate.
+    ///
+    /// At the ranked ratio `0.57` this moves the share off the `15/16` cap
+    /// to `hi/1.37 ≈ 0.73*hi`, which is the balance point: the previous
+    /// setting left the device carrying `0.534` units against the CPU's
+    /// `0.222`, i.e. straggling by more than a factor of two, and the wall
+    /// is the max of the two.
+    ///
+    /// `FLOCK_ZC_R2_LEGACY_ALPHA=1` restores the pre-lookahead constant as
+    /// an exact same-binary control.
+    const ZC_R2_ALPHA: f64 = 0.20;
+    const ZC_R2_LEGACY_ALPHA: f64 = 0.55;
     const ZC_R2_MAX_RATIO: f64 = 2.0;
     const ZC_R2_FLOOR_MAX_RATIO: f64 = 8.0;
 
+    fn zc_r2_alpha() -> f64 {
+        static A: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
+        *A.get_or_init(|| {
+            if std::env::var_os("FLOCK_ZC_R2_LEGACY_ALPHA").is_some() {
+                ZC_R2_LEGACY_ALPHA
+            } else {
+                ZC_R2_ALPHA
+            }
+        })
+    }
+
     pub(crate) fn zc_r2_gate_share(ratio: f64, hi_size: usize) -> usize {
+        zc_r2_gate_share_with_alpha(ratio, hi_size, zc_r2_alpha())
+    }
+
+    pub(crate) fn zc_r2_gate_share_with_alpha(ratio: f64, hi_size: usize, alpha: f64) -> usize {
         if !ratio.is_finite() || ratio <= 0.0 {
             return 0;
         }
@@ -8289,7 +8340,7 @@ kernel void zc_r2_products(
             }
             return 0;
         }
-        let g = (hi_size as f64 / (ratio + (1.0 - ZC_R2_ALPHA))).round();
+        let g = (hi_size as f64 / (ratio + (1.0 - alpha))).round();
         (g as usize).min(hi_size * 15 / 16)
     }
 
@@ -8703,14 +8754,52 @@ kernel void zc_r2_products(
             // best seen by >5%), price from the minimum wall. Budget 5:
             // every replay is job-wall time paid by ~120 processes on a
             // cap-adjacent lineage, and the local trace plateaus by 3.
+            //
+            // Clock pre-ramp (`FLOCK_NO_ZC_R2_CAL_RAMP=1` restores the
+            // incumbent pricing exactly): admission is suspected to fail on
+            // a majority of ranked worker processes because the probe and
+            // its replays run while the device clock is still ramping — the
+            // inflated walls push the measured ratio past the admission
+            // ceiling and the arm is disabled for that whole process, while
+            // every admitted process posts record p10s. Two changes, both
+            // confined to this untimed calibration: (1) the equality probe's
+            // own wall — the coldest dispatch of the process — no longer
+            // participates in pricing; (2) two unrecorded ramp dispatches of
+            // the same probe run first, so pricing begins at operating
+            // clocks. Cost: ~2 probe walls of untimed job-wall per process.
+            let cal_ramp = {
+                static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+                *ON.get_or_init(|| std::env::var_os("FLOCK_NO_ZC_R2_CAL_RAMP").is_none())
+            };
             let mut walls = [0.0f64; 5];
-            walls[0] = first_wall.max(0.0);
-            let mut n_walls = usize::from(walls[0] > 0.0);
+            let mut n_walls = 0usize;
+            if !cal_ramp {
+                walls[0] = first_wall.max(0.0);
+                n_walls = usize::from(walls[0] > 0.0);
+            }
             let mut w_min = if n_walls > 0 { walls[0] } else { f64::MAX };
             gpu.release(job.cb);
             if let (Some(&(_, _, a_buf)), Some(&(_, _, b_buf))) =
                 (state.wraps.first(), state.wraps.get(1))
             {
+                if cal_ramp {
+                    for _ in 0..2 {
+                        let Ok(cb2) = zc_r2_submit(
+                            gpu,
+                            &state,
+                            a_buf,
+                            b_buf,
+                            job.chunks,
+                            job.lo_size,
+                            job.mask,
+                            job.useful,
+                        ) else {
+                            break;
+                        };
+                        let _ = gpu.wait_cb(cb2);
+                        gpu.release(cb2);
+                    }
+                }
                 while n_walls < walls.len() {
                     let Ok(cb2) = zc_r2_submit(
                         gpu, &state, a_buf, b_buf, job.chunks, job.lo_size, job.mask, job.useful,
@@ -8734,6 +8823,14 @@ kernel void zc_r2_products(
                         break;
                     }
                 }
+            }
+            // Pricing fallback: if every post-ramp replay failed, fall back
+            // to the probe's own wall rather than reporting an unusable
+            // ratio — admission then follows the incumbent floor rules.
+            if cal_ramp && n_walls == 0 && first_wall > 0.0 {
+                walls[0] = first_wall;
+                n_walls = 1;
+                w_min = first_wall;
             }
             drop(state);
             let u_gpu = if n_walls > 0 && w_min < f64::MAX {
@@ -11764,17 +11861,53 @@ DEF_PROBE(probe_g4_t8_p0,    8u,  0u,   tsel & 7u)
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     #[test]
     fn zc_r2_gate_share_policy() {
-        use imp::zc_r2_gate_share;
-        // Balance point hi/(ratio+0.45); ranked-observed ratios land above
-        // the 15·hi/16 cap, which is the binding overshoot guard.
-        assert_eq!(zc_r2_gate_share(0.57, 2048), 1920);
-        assert_eq!(zc_r2_gate_share(0.38, 2048), 1920);
-        // The guard still binds before the GPU can straggle: at 15/16 the
-        // crossover is (1-0.45·15/16)/(15/16) ≈ 0.617, above the ranked 0.57.
-        assert!(zc_r2_gate_share(0.62, 2048) < 2048);
-        // Slow-but-usable GPU: the formula takes over below the cap.
-        assert_eq!(zc_r2_gate_share(1.0, 2048), 1412); // 2048/1.45
-        assert_eq!(zc_r2_gate_share(2.0, 2048), 836); // 2048/2.45
+        use imp::{zc_r2_gate_share, zc_r2_gate_share_with_alpha};
+        // Balance point hi/(ratio+0.80) under the post-lookahead residual.
+        // The ranked ratio now resolves through the formula rather than
+        // sitting on the 15/16 cap.
+        assert_eq!(zc_r2_gate_share(0.57, 2048), 1495); // 2048/1.37
+        assert_eq!(zc_r2_gate_share(0.38, 2048), 1736); // 2048/1.18
+        assert!(zc_r2_gate_share(0.57, 2048) < 2048 * 15 / 16);
+
+        // The share must be the balance point: CPU residual work and device
+        // work are equal there, so neither side straggles. Checked directly
+        // against the model rather than against a remembered literal.
+        for &(ratio, retained) in &[(0.57_f64, 0.80_f64), (0.38, 0.80), (1.0, 0.80)] {
+            let hi = 2048.0_f64;
+            let g = zc_r2_gate_share(ratio, 2048) as f64;
+            let cpu = hi - retained * g;
+            let gpu = g * ratio;
+            assert!(
+                (cpu - gpu).abs() <= 1.0 + hi * 1e-9,
+                "share {g} is not the balance point at ratio {ratio}: cpu={cpu} gpu={gpu}"
+            );
+        }
+
+        // Correcting the constant must lower the wall at the ranked ratio for
+        // every retained fraction the source composition admits, not merely
+        // at the midpoint the constant encodes.
+        let wall = |g: f64, retained: f64, ratio: f64| {
+            let hi = 2048.0_f64;
+            (hi - retained * g).max(g * ratio)
+        };
+        for &retained in &[0.73_f64, 0.80, 0.87] {
+            let new = wall(zc_r2_gate_share(0.57, 2048) as f64, retained, 0.57);
+            let old = wall(
+                zc_r2_gate_share_with_alpha(0.57, 2048, 0.55) as f64,
+                retained,
+                0.57,
+            );
+            assert!(
+                new < old,
+                "retained {retained}: corrected wall {new} not below legacy {old}"
+            );
+        }
+
+        // The legacy constant remains reachable as an exact control.
+        assert_eq!(zc_r2_gate_share_with_alpha(0.57, 2048, 0.55), 1920);
+        // Slow-but-usable GPU: the formula still takes over below the cap.
+        assert_eq!(zc_r2_gate_share(1.0, 2048), 1138); // 2048/1.80
+        assert_eq!(zc_r2_gate_share(2.0, 2048), 731); // 2048/2.80
         // Admission floor for ratios in (2, 8): the equality oracle already
         // proved the kernel, so pricing failures get hi/8, not 0.
         assert_eq!(zc_r2_gate_share(2.01, 2048), 256);
