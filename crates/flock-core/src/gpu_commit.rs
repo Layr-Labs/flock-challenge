@@ -8191,13 +8191,25 @@ kernel void zc_r2_products(
     /// calibrates), `0` = arm off for this process.
     static ZC_R2_TUNED: std::sync::atomic::AtomicUsize =
         std::sync::atomic::AtomicUsize::new(usize::MAX);
+    /// Separate share publication for the no-checkpoint path. Its CPU does no
+    /// work for GPU-owned chunks, so the incumbent anchors-only balance model
+    /// is not applicable.
+    static ZC_R2_DIRECT_TUNED: std::sync::atomic::AtomicUsize =
+        std::sync::atomic::AtomicUsize::new(usize::MAX);
     static ZC_R2_POISONED: std::sync::atomic::AtomicBool =
         std::sync::atomic::AtomicBool::new(false);
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum ZcR2CpuMode {
+        CompactAnchors,
+        DirectMessageOnly,
+    }
 
     #[cfg(test)]
     pub(crate) fn zc_r2_test_reset() {
         use std::sync::atomic::Ordering;
         ZC_R2_TUNED.store(usize::MAX, Ordering::Relaxed);
+        ZC_R2_DIRECT_TUNED.store(usize::MAX, Ordering::Relaxed);
         ZC_R2_POISONED.store(false, Ordering::Relaxed);
     }
 
@@ -8213,6 +8225,16 @@ kernel void zc_r2_products(
     #[cfg(test)]
     pub(crate) fn zc_r2_test_set_share(share: usize) {
         ZC_R2_TUNED.store(share, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn zc_r2_direct_test_state() -> usize {
+        ZC_R2_DIRECT_TUNED.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn zc_r2_direct_test_set_share(share: usize) {
+        ZC_R2_DIRECT_TUNED.store(share, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Ratio-gate override (`FLOCK_ZC_R2_GPU_FORCE_RATIO=<f64>`).
@@ -8276,6 +8298,34 @@ kernel void zc_r2_products(
         }
         let g = (hi_size as f64 / (ratio + (1.0 - ZC_R2_ALPHA))).round();
         (g as usize).min(hi_size * 15 / 16)
+    }
+
+    /// No-checkpoint balance: the CPU runs full message-only chunks only on
+    /// the suffix and does zero work for the GPU prefix, so
+    /// `(hi-g)c_msg = g u_gpu` and `g = hi/(ratio+1)`. The floor remains safe
+    /// only below ratio 7: at `hi/8`, CPU and GPU tie exactly at ratio 7.
+    pub(crate) fn zc_r2_direct_gate_share(ratio: f64, hi_size: usize) -> usize {
+        if !ratio.is_finite() || ratio <= 0.0 {
+            return 0;
+        }
+        if ratio > ZC_R2_MAX_RATIO {
+            if ratio < 7.0 {
+                return hi_size / 8;
+            }
+            return 0;
+        }
+        let g = (hi_size as f64 / (ratio + 1.0)).round();
+        (g as usize).min(hi_size * 15 / 16)
+    }
+
+    /// Whether a published no-checkpoint share is strong enough to pay for
+    /// direct packed T3 reconstruction. `usize::MAX` is the first-prove
+    /// calibration sentinel and must always be admitted. A real share equal to
+    /// `hi/8` is only the slow-GPU/ramp hedge from
+    /// [`zc_r2_direct_gate_share`], not a balance-derived win; keep the exact
+    /// compact path for that floor and for zero.
+    pub(crate) fn zc_r2_direct_share_profitable(share: usize, hi_size: usize) -> bool {
+        share == usize::MAX || share > hi_size / 8
     }
 
     fn zc_r2_init(gpu: &'static Gpu) -> Result<ZcR2, String> {
@@ -8368,6 +8418,7 @@ kernel void zc_r2_products(
         cb: Id,
         pub chunks: usize,
         calibration: bool,
+        cpu_mode: ZcR2CpuMode,
         lo_size: usize,
         mask: u32,
         useful: u32,
@@ -8379,9 +8430,10 @@ kernel void zc_r2_products(
     unsafe impl Send for ZcR2Job {}
 
     impl ZcR2Job {
-        /// How many leading chunks the CPU should run anchors-only. Zero
-        /// during calibration: the CPU runs every chunk fused (the GPU
-        /// probe is compared against its values, then discarded).
+        /// How many leading chunks the GPU owns. The compact caller runs those
+        /// chunks anchors-only; the direct caller does no CPU work for them.
+        /// Zero during calibration, when either CPU path runs every chunk and
+        /// the GPU probe is compared against its values, then discarded.
         pub(crate) fn cpu_split(&self) -> usize {
             if self.calibration { 0 } else { self.chunks }
         }
@@ -8479,6 +8531,62 @@ kernel void zc_r2_products(
         pair_in_block_mask: usize,
         useful_pairs_inclusive: usize,
     ) -> Option<ZcR2Job> {
+        launch_zc_r2_products_mode(
+            a_packed,
+            b_packed,
+            table_data,
+            eq_lo,
+            eq_hi,
+            lo_size,
+            hi_size,
+            pair_in_block_mask,
+            useful_pairs_inclusive,
+            ZcR2CpuMode::CompactAnchors,
+        )
+    }
+
+    /// Same products shader and exact partial contract as
+    /// [`launch_zc_r2_products`], with an independent share calibrated for a
+    /// CPU that does zero prefix work and runs message-only suffix chunks.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn launch_zc_r2_products_direct(
+        a_packed: &[u8],
+        b_packed: &[u8],
+        table_data: &[F128],
+        eq_lo: &[F128],
+        eq_hi: &[F128],
+        lo_size: usize,
+        hi_size: usize,
+        pair_in_block_mask: usize,
+        useful_pairs_inclusive: usize,
+    ) -> Option<ZcR2Job> {
+        launch_zc_r2_products_mode(
+            a_packed,
+            b_packed,
+            table_data,
+            eq_lo,
+            eq_hi,
+            lo_size,
+            hi_size,
+            pair_in_block_mask,
+            useful_pairs_inclusive,
+            ZcR2CpuMode::DirectMessageOnly,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn launch_zc_r2_products_mode(
+        a_packed: &[u8],
+        b_packed: &[u8],
+        table_data: &[F128],
+        eq_lo: &[F128],
+        eq_hi: &[F128],
+        lo_size: usize,
+        hi_size: usize,
+        pair_in_block_mask: usize,
+        useful_pairs_inclusive: usize,
+        cpu_mode: ZcR2CpuMode,
+    ) -> Option<ZcR2Job> {
         use std::sync::atomic::Ordering;
         if !super::gpu_zc_r2_enabled() || ZC_R2_POISONED.load(Ordering::Relaxed) {
             return None;
@@ -8493,8 +8601,19 @@ kernel void zc_r2_products(
         {
             return None;
         }
-        let tuned = ZC_R2_TUNED.load(Ordering::Relaxed);
+        let tuned = match cpu_mode {
+            ZcR2CpuMode::CompactAnchors => ZC_R2_TUNED.load(Ordering::Relaxed),
+            ZcR2CpuMode::DirectMessageOnly => ZC_R2_DIRECT_TUNED.load(Ordering::Relaxed),
+        };
         if tuned == 0 {
+            return None;
+        }
+        if cpu_mode == ZcR2CpuMode::DirectMessageOnly
+            && !zc_r2_direct_share_profitable(tuned, hi_size)
+        {
+            // Reject before Metal init/wrap/submission. The caller still owns
+            // its donated round-one AB allocation and can hand it unchanged to
+            // the incumbent compact producer.
             return None;
         }
         let calibration = tuned == usize::MAX;
@@ -8578,6 +8697,7 @@ kernel void zc_r2_products(
                 cb,
                 chunks,
                 calibration,
+                cpu_mode,
                 lo_size,
                 mask: pair_in_block_mask as u32,
                 useful: useful_pairs_inclusive as u32,
@@ -8603,6 +8723,7 @@ kernel void zc_r2_products(
         let poison = |cb: Id| {
             ZC_R2_POISONED.store(true, Ordering::Relaxed);
             ZC_R2_TUNED.store(0, Ordering::Relaxed);
+            ZC_R2_DIRECT_TUNED.store(0, Ordering::Relaxed);
             unsafe { gpu.release(cb) };
             ZcR2Result::Failed
         };
@@ -8707,14 +8828,18 @@ kernel void zc_r2_products(
             let share = if u_cpu.is_finite() && u_cpu > 0.0 && u_gpu.is_finite() {
                 let measured = u_gpu / u_cpu;
                 let ratio = zc_r2_forced_ratio().unwrap_or(measured);
-                let g = zc_r2_gate_share(ratio, hi_size);
+                let g = match job.cpu_mode {
+                    ZcR2CpuMode::CompactAnchors => zc_r2_gate_share(ratio, hi_size),
+                    ZcR2CpuMode::DirectMessageOnly => zc_r2_direct_gate_share(ratio, hi_size),
+                };
                 if super::gpu_zc_r2_debug() {
                     eprintln!(
                         "[zc-r2] gate replay walls: {:?}", &walls[..n_walls]
                     );
                     eprintln!(
-                        "[zc-r2] gate u_gpu={u_gpu:.4}ms/chunk u_cpu={u_cpu:.4}ms/chunk \
-                         ratio={:.3} -> share {g}/{hi_size}",
+                        "[zc-r2] gate mode={:?} u_gpu={u_gpu:.4}ms/chunk \
+                         u_cpu={u_cpu:.4}ms/chunk ratio={:.3} -> share {g}/{hi_size}",
+                        job.cpu_mode,
                         u_gpu / u_cpu,
                     );
                 }
@@ -8722,7 +8847,21 @@ kernel void zc_r2_products(
             } else {
                 0
             };
-            ZC_R2_TUNED.store(share, Ordering::Relaxed);
+            match job.cpu_mode {
+                ZcR2CpuMode::CompactAnchors => ZC_R2_TUNED.store(share, Ordering::Relaxed),
+                ZcR2CpuMode::DirectMessageOnly => {
+                    ZC_R2_DIRECT_TUNED.store(share, Ordering::Relaxed);
+                    // The same shader/prefix just passed the equality oracle.
+                    // At this share the compact CPU arm performs the direct
+                    // suffix's message work plus its own materialization and
+                    // prefix anchors, so reusing the direct share is a
+                    // conservative compact split. Publishing it avoids a
+                    // second calibration in the measured proof when the
+                    // adaptive gate rejects the direct floor (or direct is
+                    // otherwise unavailable).
+                    ZC_R2_TUNED.store(share, Ordering::Relaxed);
+                }
+            }
             ZcR2Result::Calibrated
         }
     }
@@ -10070,7 +10209,9 @@ pub(crate) use imp::{ZcFoldJob, launch_lincheck_fold, launch_zerocheck_c_fold, z
 /// Zerocheck round-two products GPU arm (see `ENV_NO_GPU_ZC_R2`).
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[cfg_attr(not(test), allow(unused_imports))]
-pub(crate) use imp::{ZcR2Job, ZcR2Result, launch_zc_r2_products, zc_r2_wait};
+pub(crate) use imp::{
+    ZcR2Job, ZcR2Result, launch_zc_r2_products, launch_zc_r2_products_direct, zc_r2_wait,
+};
 
 /// Zerocheck first-tail-round products GPU arm (see `ENV_NO_GPU_ZC_T3`).
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -11726,7 +11867,9 @@ DEF_PROBE(probe_g4_t8_p0,    8u,  0u,   tsel & 7u)
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     #[test]
     fn zc_r2_gate_share_policy() {
-        use imp::zc_r2_gate_share;
+        use imp::{
+            zc_r2_direct_gate_share, zc_r2_direct_share_profitable, zc_r2_gate_share,
+        };
         // Balance point hi/(ratio+0.45); ranked-observed ratios land above
         // the 15·hi/16 cap, which is the binding overshoot guard.
         assert_eq!(zc_r2_gate_share(0.57, 2048), 1920);
@@ -11746,6 +11889,24 @@ DEF_PROBE(probe_g4_t8_p0,    8u,  0u,   tsel & 7u)
         assert_eq!(zc_r2_gate_share(f64::NAN, 2048), 0);
         assert_eq!(zc_r2_gate_share(0.0, 2048), 0);
         assert_eq!(zc_r2_gate_share(-1.0, 2048), 0);
+
+        // Direct mode has no anchors-only CPU prefix: its exact balance is
+        // hi/(ratio+1), with a floor only while hi/8 cannot straggle.
+        assert_eq!(zc_r2_direct_gate_share(0.57, 2048), 1304);
+        assert_eq!(zc_r2_direct_gate_share(1.0, 2048), 1024);
+        assert_eq!(zc_r2_direct_gate_share(2.0, 2048), 683);
+        assert_eq!(zc_r2_direct_gate_share(2.01, 2048), 256);
+        assert_eq!(zc_r2_direct_gate_share(6.99, 2048), 256);
+        assert_eq!(zc_r2_direct_gate_share(7.0, 2048), 0);
+        assert_eq!(zc_r2_direct_gate_share(f64::NAN, 2048), 0);
+
+        // Calibration is always admitted. The speculative hi/8 floor is not;
+        // any balance-derived share (at least 683 here) is.
+        assert!(zc_r2_direct_share_profitable(usize::MAX, 2048));
+        assert!(!zc_r2_direct_share_profitable(0, 2048));
+        assert!(!zc_r2_direct_share_profitable(256, 2048));
+        assert!(zc_r2_direct_share_profitable(257, 2048));
+        assert!(zc_r2_direct_share_profitable(683, 2048));
     }
 
     /// The lincheck arm's GPU prefix equals the CPU fold over exactly the
@@ -11987,6 +12148,91 @@ DEF_PROBE(probe_g4_t8_p0,    8u,  0u,   tsel & 7u)
                 assert_eq!(&vals[..], &cpu_partials[..prefix], "prefix partials bit-exact");
             }
             _ => panic!("timed drain must return prefix partials"),
+        }
+
+        // Calibrate the no-checkpoint mode independently. Its exact published
+        // share must also seed the compact tuner so a measured-proof floor
+        // fallback does not pay a second calibration.
+        imp::zc_r2_test_reset();
+        let direct_calibration = imp::launch_zc_r2_products_direct(
+            &a_packed,
+            &b_packed,
+            &table_data,
+            &eq_lo,
+            &eq_hi,
+            lo_size,
+            hi_size,
+            mask,
+            useful,
+        )
+        .expect("direct calibration launch must succeed on real Metal");
+        assert!(direct_calibration.is_calibration());
+        assert_eq!(direct_calibration.cpu_split(), 0);
+        let res = imp::zc_r2_wait(
+            direct_calibration,
+            Some(&cpu_partials),
+            50.0,
+            hi_size,
+        );
+        assert!(matches!(res, imp::ZcR2Result::Calibrated));
+        let direct_tuned = imp::zc_r2_direct_test_state();
+        let (compact_from_direct, poisoned) = imp::zc_r2_test_state();
+        assert!(!poisoned, "direct calibration equality oracle must pass");
+        assert_ne!(direct_tuned, usize::MAX, "direct share must be published");
+        assert_eq!(
+            compact_from_direct, direct_tuned,
+            "direct calibration must seed the conservative compact fallback"
+        );
+
+        // The exact speculative floor is rejected before submission. The
+        // already-published compact fallback remains intact.
+        imp::zc_r2_direct_test_set_share(hi_size / 8);
+        assert!(
+            imp::launch_zc_r2_products_direct(
+                &a_packed,
+                &b_packed,
+                &table_data,
+                &eq_lo,
+                &eq_hi,
+                lo_size,
+                hi_size,
+                mask,
+                useful,
+            )
+            .is_none(),
+            "direct hi/8 floor must fall back before Metal submission"
+        );
+        assert_eq!(imp::zc_r2_test_state().0, compact_from_direct);
+
+        // An above-floor direct split still reuses the exact same Metal shader
+        // and partial contract, independent of the compact tuner.
+        imp::zc_r2_direct_test_set_share(hi_size / 2);
+        assert_eq!(imp::zc_r2_direct_test_state(), hi_size / 2);
+        let job3 = imp::launch_zc_r2_products_direct(
+            &a_packed,
+            &b_packed,
+            &table_data,
+            &eq_lo,
+            &eq_hi,
+            lo_size,
+            hi_size,
+            mask,
+            useful,
+        )
+        .expect("direct-mode timed launch must succeed");
+        assert!(!job3.is_calibration());
+        let direct_prefix = job3.cpu_split();
+        assert_eq!(direct_prefix, hi_size / 2);
+        match imp::zc_r2_wait(job3, None, 0.0, hi_size) {
+            imp::ZcR2Result::Prefix(vals) => {
+                assert_eq!(vals.len(), direct_prefix);
+                assert_eq!(
+                    &vals[..],
+                    &cpu_partials[..direct_prefix],
+                    "direct-mode prefix partials bit-exact"
+                );
+            }
+            _ => panic!("direct-mode drain must return prefix partials"),
         }
         imp::zc_r2_test_reset();
     }

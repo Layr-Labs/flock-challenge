@@ -1041,7 +1041,8 @@ fn prove_fast_core_with_commit_codeword<Ch: Challenger>(
             cpu / wall
         );
     }
-    // Nothing downstream reads a/b (zerocheck consumed them in rounds 1–2);
+    // Nothing downstream reads a/b (zerocheck may consume them through the
+    // first tail reconstruction round);
     // recycle the two buffers (2 × 2^(m-3) bytes — 128 MB at m = 29) instead
     // of carrying them through lincheck and the PCS open.
     flock_core::scratch::give_f128(a_packed_f128);

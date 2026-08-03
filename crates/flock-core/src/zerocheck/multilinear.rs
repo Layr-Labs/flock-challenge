@@ -51,8 +51,9 @@ use kernels::aarch64::fold_one_row_neon_unchecked_8;
 #[cfg(target_arch = "aarch64")]
 use kernels::aarch64::{
     fold_and_message_aarch64, fold_compact_chunk_neon_unchecked_8,
-    fold_compact_stream_chunk_neon, fold_round2_chunk_neon_unchecked_8,
-    fold_round2_compact_chunk_neon_unchecked_8, fold_round2_compact_stream_chunk_neon,
+    fold_compact_stream_chunk_neon, fold_packed_t3_chunk_neon_unchecked_8,
+    fold_round2_chunk_neon_unchecked_8, fold_round2_compact_chunk_neon_unchecked_8,
+    fold_round2_compact_stream_chunk_neon, fold_round2_message_chunk_neon_unchecked_8,
 };
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 use kernels::aarch64::fold_round2_compact_chunk_neon_anchors_only_8;
@@ -796,6 +797,231 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_with_deltas(
     (compact, mlv_challenges[0] * sum1, sum_inf)
 }
 
+/// Fill round-two message partials for the half-open hi-chunk range
+/// `x_hi_start..x_hi_end` without materializing any folded rows.  This is the
+/// CPU suffix paired with the existing Metal products prefix in the ranked
+/// no-checkpoint experiment; keeping the range explicit also makes prefix
+/// redo after a Metal failure exact and independently testable.
+#[allow(clippy::too_many_arguments)]
+fn round2_message_only_fill_partials(
+    a_packed: &[u8],
+    b_packed: &[u8],
+    table: &UniSkipFoldTable,
+    eq_lo: &[F128],
+    eq_hi: &[F128],
+    lo_size: usize,
+    pair_in_block_mask: usize,
+    useful_pairs_inclusive: usize,
+    partials: &mut [(F128, F128)],
+    x_hi_start: usize,
+    x_hi_end: usize,
+) {
+    assert!(x_hi_start <= x_hi_end && x_hi_end <= eq_hi.len());
+    assert_eq!(partials.len(), eq_hi.len());
+    let n_chunks = table.n_chunks;
+    #[cfg(target_arch = "aarch64")]
+    let degen = r2_degen_enabled();
+    let partials_base = crate::epool::SyncPtr(partials.as_mut_ptr());
+    crate::epool::run_hetero_chunks(x_hi_end - x_hi_start, |offset| {
+        let x_hi = x_hi_start + offset;
+        let pair_idx_base = x_hi * lo_size;
+        let row_base = pair_idx_base * 2;
+
+        #[cfg(target_arch = "aarch64")]
+        let (p1, pinf) = unsafe {
+            fold_round2_message_chunk_neon_unchecked_8(
+                table.data.as_ptr().cast::<u8>(),
+                a_packed.as_ptr().add(row_base * n_chunks),
+                b_packed.as_ptr().add(row_base * n_chunks),
+                eq_lo.as_ptr(),
+                lo_size,
+                pair_idx_base,
+                pair_in_block_mask,
+                useful_pairs_inclusive,
+                degen,
+            )
+        };
+
+        #[cfg(not(target_arch = "aarch64"))]
+        let (p1, pinf) = {
+            let mut p1_acc = F256Unreduced::ZERO;
+            let mut pinf_acc = F256Unreduced::ZERO;
+            for x_lo in 0..lo_size {
+                if ((pair_idx_base + x_lo) & pair_in_block_mask) >= useful_pairs_inclusive {
+                    continue;
+                }
+                let row0 = row_base + 2 * x_lo;
+                let row1 = row0 + 1;
+                let a0 = table.fold_one_row(&a_packed[row0 * n_chunks..(row0 + 1) * n_chunks]);
+                let a1 = table.fold_one_row(&a_packed[row1 * n_chunks..(row1 + 1) * n_chunks]);
+                let b0 = table.fold_one_row(&b_packed[row0 * n_chunks..(row0 + 1) * n_chunks]);
+                let b1 = table.fold_one_row(&b_packed[row1 * n_chunks..(row1 + 1) * n_chunks]);
+                let eq_l = eq_lo[x_lo];
+                p1_acc ^= eq_l.mul_unreduced(a1 * b1);
+                pinf_acc ^= eq_l.mul_unreduced((a0 + a1) * (b0 + b1));
+            }
+            (p1_acc.reduce(), pinf_acc.reduce())
+        };
+
+        let eq_h = eq_hi[x_hi];
+        // SAFETY: the hetero queue hands out each offset once, and therefore
+        // each absolute partial slot once.
+        unsafe {
+            *partials_base.ptr().add(x_hi) = (eq_h * p1, eq_h * pinf);
+        }
+    });
+}
+
+/// CPU-all reference for storeless packed round two.  Production direct mode
+/// uses the same range worker for only the suffix not owned by Metal.
+#[cfg(test)]
+pub(crate) fn uni_skip_round2_message_only_cpu_padded(
+    a_packed: &[u8],
+    b_packed: &[u8],
+    m: usize,
+    k_skip: usize,
+    table: &UniSkipFoldTable,
+    mlv_challenges: &[F128],
+    padding: &PaddingSpec,
+) -> (F128, F128) {
+    assert_eq!(k_skip, 6);
+    assert_eq!(table.n_chunks, 8);
+    let n_pairs = 1usize << (m - k_skip - 1);
+    assert_eq!(a_packed.len(), 2 * n_pairs * table.n_chunks);
+    assert_eq!(b_packed.len(), 2 * n_pairs * table.n_chunks);
+    let eq = SplitEqGhash::with_n_hi(&mlv_challenges[1..], COMPACT_RECONSTRUCTION_N_HI);
+    let lo_size = 1usize << eq.n_lo;
+    let hi_size = 1usize << eq.n_hi;
+    assert_eq!(lo_size * hi_size, n_pairs);
+    let (mask, useful) = round2_pair_skip(padding, k_skip);
+    let mut partials = vec![(F128::ZERO, F128::ZERO); hi_size];
+    round2_message_only_fill_partials(
+        a_packed,
+        b_packed,
+        table,
+        &eq.lo,
+        &eq.hi,
+        lo_size,
+        mask,
+        useful,
+        &mut partials,
+        0,
+        hi_size,
+    );
+    let (sum1, sum_inf) = partials
+        .iter()
+        .fold((F128::ZERO, F128::ZERO), |(s1, si), &(p1, pi)| {
+            (s1 + p1, si + pi)
+        });
+    (mlv_challenges[0] * sum1, sum_inf)
+}
+
+/// Attempt the ranked storeless R2 path. `None` means no profitable Metal job
+/// was admitted (including a calibrated share stuck at the speculative floor),
+/// and the caller must run the incumbent compact producer with its donor still
+/// intact. Once a job is admitted, every later failure is handled here by exact
+/// CPU prefix redo; returning `Some` commits the caller to direct packed T3
+/// reconstruction.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn try_uni_skip_round2_message_only_gpu_padded(
+    a_packed: &[u8],
+    b_packed: &[u8],
+    m: usize,
+    k_skip: usize,
+    table: &UniSkipFoldTable,
+    mlv_challenges: &[F128],
+    padding: &PaddingSpec,
+) -> Option<(F128, F128)> {
+    #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+    {
+        let _ = (
+            a_packed,
+            b_packed,
+            m,
+            k_skip,
+            table,
+            mlv_challenges,
+            padding,
+        );
+        None
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    {
+        assert_eq!(k_skip, 6);
+        assert_eq!(table.n_chunks, 8);
+        let n_pairs = 1usize << (m - k_skip - 1);
+        assert_eq!(a_packed.len(), 2 * n_pairs * table.n_chunks);
+        assert_eq!(b_packed.len(), 2 * n_pairs * table.n_chunks);
+        let eq = SplitEqGhash::with_n_hi(&mlv_challenges[1..], COMPACT_RECONSTRUCTION_N_HI);
+        let lo_size = 1usize << eq.n_lo;
+        let hi_size = 1usize << eq.n_hi;
+        assert_eq!(lo_size * hi_size, n_pairs);
+        let (mask, useful) = round2_pair_skip(padding, k_skip);
+        let job = crate::gpu_commit::launch_zc_r2_products_direct(
+            a_packed,
+            b_packed,
+            &table.data,
+            &eq.lo,
+            &eq.hi,
+            lo_size,
+            hi_size,
+            mask,
+            useful,
+        )?;
+        let gpu_prefix = job.cpu_split();
+        let calibration = job.is_calibration();
+        let mut partials = vec![(F128::ZERO, F128::ZERO); hi_size];
+        let t_cpu = std::time::Instant::now();
+        round2_message_only_fill_partials(
+            a_packed,
+            b_packed,
+            table,
+            &eq.lo,
+            &eq.hi,
+            lo_size,
+            mask,
+            useful,
+            &mut partials,
+            gpu_prefix,
+            hi_size,
+        );
+        let cpu_wall_ms = t_cpu.elapsed().as_secs_f64() * 1e3;
+        match crate::gpu_commit::zc_r2_wait(
+            job,
+            calibration.then_some(partials.as_slice()),
+            cpu_wall_ms,
+            hi_size,
+        ) {
+            crate::gpu_commit::ZcR2Result::Calibrated => {}
+            crate::gpu_commit::ZcR2Result::Prefix(vals) => {
+                partials[..gpu_prefix].copy_from_slice(&vals);
+            }
+            crate::gpu_commit::ZcR2Result::Failed => {
+                round2_message_only_fill_partials(
+                    a_packed,
+                    b_packed,
+                    table,
+                    &eq.lo,
+                    &eq.hi,
+                    lo_size,
+                    mask,
+                    useful,
+                    &mut partials,
+                    0,
+                    gpu_prefix,
+                );
+            }
+        }
+        let (sum1, sum_inf) = partials
+            .iter()
+            .fold((F128::ZERO, F128::ZERO), |(s1, si), &(p1, pi)| {
+                (s1 + p1, si + pi)
+            });
+        Some((mlv_challenges[0] * sum1, sum_inf))
+    }
+}
+
 /// Byte-lane-outer streaming variant of
 /// [`uni_skip_fold_and_round_pair_compact_padded`]. Bit-identical outputs
 /// (fold XOR trees are merely reassociated). `lanes_per_pass ∈ {1, 2, 4, 8}`
@@ -1215,6 +1441,132 @@ pub fn fold_compact_and_compute_round_pair(
             (s1 + c1, sinf + cinf)
         });
 
+    (a_out, b_out, r_next[0] * sum1, sum_inf)
+}
+
+/// Bind the first multilinear challenge directly from the still-live packed
+/// witnesses, materialize the ordinary post-bind A/B level, and compute the
+/// following message. This is transcript-identical to compact
+/// anchor-plus-delta reconstruction because `T` is F2-linear:
+///
+/// `T(row0) + rho*T(row0 XOR row1)`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn fold_packed_direct_and_compute_round_pair(
+    a_packed: &[u8],
+    b_packed: &[u8],
+    m: usize,
+    k_skip: usize,
+    table: &UniSkipFoldTable,
+    r_fold: F128,
+    r_next: &[F128],
+    padding: &PaddingSpec,
+) -> (Vec<F128>, Vec<F128>, F128, F128) {
+    assert_eq!(k_skip, 6);
+    assert_eq!(table.n_chunks, 8);
+    let n_rows = 1usize << (m - k_skip);
+    let n = n_rows / 2;
+    assert_eq!(a_packed.len(), n_rows * table.n_chunks);
+    assert_eq!(b_packed.len(), n_rows * table.n_chunks);
+    assert!(n >= 4 && n.is_power_of_two());
+    assert_eq!(r_next.len(), n.trailing_zeros() as usize);
+
+    let scaled_table = table.scaled_linear(r_fold);
+    let eq = SplitEqGhash::with_n_hi(&r_next[1..], COMPACT_RECONSTRUCTION_N_HI);
+    let lo_size = 1usize << eq.n_lo;
+    let hi_size = 1usize << eq.n_hi;
+    assert_eq!(lo_size * hi_size * 2, n);
+    let chunk_size = 2 * lo_size;
+    let (pair_in_block_mask, useful_pairs_inclusive) = round2_pair_skip(padding, k_skip);
+
+    // Preserve the incumbent allocation contract. These arrays feed the loop
+    // products arm next round and therefore must not alias a process-lifetime
+    // pinned Metal view.
+    let mut a_out = crate::scratch::take_f128_unpinned(n);
+    let mut b_out = crate::scratch::take_f128_unpinned(n);
+    #[cfg(target_arch = "aarch64")]
+    let degen = r2_degen_enabled();
+
+    let mut partials = vec![(F128::ZERO, F128::ZERO); hi_size];
+    let a_base = crate::epool::SyncPtr(a_out.as_mut_ptr());
+    let b_base = crate::epool::SyncPtr(b_out.as_mut_ptr());
+    let partials_base = crate::epool::SyncPtr(partials.as_mut_ptr());
+    crate::epool::run_hetero_chunks(hi_size, |x_hi| {
+        let base = x_hi * chunk_size;
+        let row_base = 2 * base;
+
+        #[cfg(target_arch = "aarch64")]
+        let (p1, pinf) = unsafe {
+            fold_packed_t3_chunk_neon_unchecked_8(
+                table.data.as_ptr().cast::<u8>(),
+                scaled_table.as_ptr().cast::<u8>(),
+                a_packed.as_ptr().add(row_base * table.n_chunks),
+                b_packed.as_ptr().add(row_base * table.n_chunks),
+                a_base.ptr().add(base),
+                b_base.ptr().add(base),
+                eq.lo.as_ptr(),
+                lo_size,
+                base,
+                pair_in_block_mask,
+                useful_pairs_inclusive,
+                degen,
+            )
+        };
+
+        #[cfg(not(target_arch = "aarch64"))]
+        let (p1, pinf) = {
+            let mut p1_acc = F256Unreduced::ZERO;
+            let mut pinf_acc = F256Unreduced::ZERO;
+            for x_lo in 0..lo_size {
+                let out = 2 * x_lo;
+                for lane in 0..2 {
+                    let index = base + out + lane;
+                    let dst = out + lane;
+                    if (index & pair_in_block_mask) >= useful_pairs_inclusive {
+                        unsafe {
+                            *a_base.ptr().add(base + dst) = F128::ZERO;
+                            *b_base.ptr().add(base + dst) = F128::ZERO;
+                        }
+                        continue;
+                    }
+                    let row0 = 2 * index;
+                    let row1 = row0 + 1;
+                    let a0_bytes = &a_packed[row0 * table.n_chunks..(row0 + 1) * table.n_chunks];
+                    let a1_bytes = &a_packed[row1 * table.n_chunks..(row1 + 1) * table.n_chunks];
+                    let b0_bytes = &b_packed[row0 * table.n_chunks..(row0 + 1) * table.n_chunks];
+                    let b1_bytes = &b_packed[row1 * table.n_chunks..(row1 + 1) * table.n_chunks];
+                    let mut a = table.fold_one_row(a0_bytes);
+                    let mut b = table.fold_one_row(b0_bytes);
+                    for j in 0..table.n_chunks {
+                        a += scaled_table[j * 256 + (a0_bytes[j] ^ a1_bytes[j]) as usize];
+                        b += scaled_table[j * 256 + (b0_bytes[j] ^ b1_bytes[j]) as usize];
+                    }
+                    unsafe {
+                        *a_base.ptr().add(base + dst) = a;
+                        *b_base.ptr().add(base + dst) = b;
+                    }
+                }
+                let a0 = unsafe { *a_base.ptr().add(base + out) };
+                let a1 = unsafe { *a_base.ptr().add(base + out + 1) };
+                let b0 = unsafe { *b_base.ptr().add(base + out) };
+                let b1 = unsafe { *b_base.ptr().add(base + out + 1) };
+                let eq_l = eq.lo[x_lo];
+                p1_acc ^= eq_l.mul_unreduced(a1 * b1);
+                pinf_acc ^= eq_l.mul_unreduced((a0 + a1) * (b0 + b1));
+            }
+            (p1_acc.reduce(), pinf_acc.reduce())
+        };
+
+        let eq_h = eq.hi[x_hi];
+        unsafe {
+            *partials_base.ptr().add(x_hi) = (eq_h * p1, eq_h * pinf);
+        }
+    });
+
+    let (sum1, sum_inf) = partials
+        .iter()
+        .fold((F128::ZERO, F128::ZERO), |(s1, si), &(p1, pi)| {
+            (s1 + p1, si + pi)
+        });
     (a_out, b_out, r_next[0] * sum1, sum_inf)
 }
 
@@ -2516,6 +2868,7 @@ mod tests {
             a[block * block_size + USEFUL_BITS..(block + 1) * block_size].fill(false);
             b[block * block_size + USEFUL_BITS..(block + 1) * block_size].fill(false);
         }
+
         let a_packed = pack_bits(&a);
         let b_packed = pack_bits(&b);
         let z = rng.f128();
@@ -2625,6 +2978,437 @@ mod tests {
             crate::scratch::give_f128(legacy_b);
             crate::scratch::clear();
         }
+    }
+
+    /// The no-checkpoint experiment must reproduce both transcript-separated
+    /// messages and the complete ordinary T3 level. This oracle uses the real
+    /// BLAKE3 padding boundary (pair 120 mixed, 121..127 fully padded), poisoned
+    /// output scratch, edge rho values, and an independently regrouped scalar
+    /// materialize-then-fold reference.
+    #[test]
+    fn packed_direct_r2_t3_matches_compact_and_scalar_with_padding() {
+        const K_SKIP: usize = 6;
+        const M: usize = 20;
+        const K_LOG: usize = 14;
+        const USEFUL_BITS: usize = 15_409;
+        const POISON: F128 = F128 {
+            lo: 0xd3d3_d3d3_d3d3_d3d3,
+            hi: 0x3d3d_3d3d_3d3d_3d3d,
+        };
+
+        let mut rng = Rng::new(0xD1EC_7A3);
+        let mut a = rng.bits(1 << M);
+        let mut b = rng.bits(1 << M);
+        let block_size = 1usize << K_LOG;
+        for block in 0..(1usize << (M - K_LOG)) {
+            a[block * block_size + USEFUL_BITS..(block + 1) * block_size].fill(false);
+            b[block * block_size + USEFUL_BITS..(block + 1) * block_size].fill(false);
+        }
+
+        // Force all direct-T3 degeneration shapes in useful data. One R2
+        // pair is two 64-bit packed rows. Consecutive R2 pairs (10,11),
+        // (12,13), and (14,15) therefore exercise static/nonstatic,
+        // static/static, and nonstatic/static respectively in the kernel's
+        // two-output hot group. The explicit false bits make the nonstatic
+        // partners deterministic instead of relying on random input.
+        let mut set_static_b_pair = |pair: usize| {
+            let bit = pair * 2 * (1usize << K_SKIP);
+            b[bit..bit + 2 * (1usize << K_SKIP)].fill(true);
+        };
+        for pair in [10usize, 12, 13, 15] {
+            set_static_b_pair(pair);
+        }
+        for pair in [11usize, 14] {
+            b[pair * 2 * (1usize << K_SKIP)] = false;
+        }
+        #[cfg(target_arch = "aarch64")]
+        assert!(
+            r2_degen_enabled(),
+            "this oracle explicitly covers the degen-on b=1 shortcuts"
+        );
+        let a_packed = pack_bits(&a);
+        let b_packed = pack_bits(&b);
+        let padding = PaddingSpec {
+            k_log: K_LOG,
+            useful_bits_per_block: USEFUL_BITS,
+        };
+        let table = UniSkipFoldTable::new(K_SKIP, rng.f128());
+        let mlv_challenges = rng.f128_vec(M - K_SKIP);
+        let r_next = rng.f128_vec(M - K_SKIP - 1);
+        let n_rows = 1usize << (M - K_SKIP);
+        let n_pairs = n_rows / 2;
+
+        let (legacy_a, legacy_b, legacy_m1, legacy_mi) =
+            uni_skip_fold_and_round_pair_optimized_packed_padded(
+                &a_packed,
+                &b_packed,
+                M,
+                K_SKIP,
+                &table,
+                &mlv_challenges,
+                &padding,
+            );
+        let (direct_m1, direct_mi) = uni_skip_round2_message_only_cpu_padded(
+            &a_packed,
+            &b_packed,
+            M,
+            K_SKIP,
+            &table,
+            &mlv_challenges,
+            &padding,
+        );
+        assert_eq!((direct_m1, direct_mi), (legacy_m1, legacy_mi));
+
+        // Partition oracle: disjoint prefix/suffix fills must reconstruct the
+        // same per-chunk vector as one CPU-all sweep. This is exactly the merge
+        // shape used by Metal prefix + CPU suffix and by failure redo.
+        let eq = SplitEqGhash::with_n_hi(&mlv_challenges[1..], COMPACT_RECONSTRUCTION_N_HI);
+        let lo_size = 1usize << eq.n_lo;
+        let hi_size = 1usize << eq.n_hi;
+        let (mask, useful) = round2_pair_skip(&padding, K_SKIP);
+        let mut full = vec![(F128::ZERO, F128::ZERO); hi_size];
+        let mut split = vec![(F128::ZERO, F128::ZERO); hi_size];
+        let mut failure_redo = vec![(POISON, POISON); hi_size];
+        round2_message_only_fill_partials(
+            &a_packed, &b_packed, &table, &eq.lo, &eq.hi, lo_size, mask, useful, &mut full, 0,
+            hi_size,
+        );
+        let split_at = hi_size * 15 / 16;
+        round2_message_only_fill_partials(
+            &a_packed, &b_packed, &table, &eq.lo, &eq.hi, lo_size, mask, useful, &mut split, 0,
+            split_at,
+        );
+        round2_message_only_fill_partials(
+            &a_packed, &b_packed, &table, &eq.lo, &eq.hi, lo_size, mask, useful, &mut split,
+            split_at, hi_size,
+        );
+        assert_eq!(split, full, "prefix/suffix partial partition mismatch");
+
+        // Metal failure shape: the CPU suffix has already completed while
+        // GPU-owned prefix slots remain untouched, then the exact same range
+        // worker redoes only that poisoned prefix. This pins the recovery
+        // contract used by `ZcR2Result::Failed`.
+        round2_message_only_fill_partials(
+            &a_packed,
+            &b_packed,
+            &table,
+            &eq.lo,
+            &eq.hi,
+            lo_size,
+            mask,
+            useful,
+            &mut failure_redo,
+            split_at,
+            hi_size,
+        );
+        assert!(
+            failure_redo[..split_at]
+                .iter()
+                .all(|partial| *partial == (POISON, POISON))
+        );
+        round2_message_only_fill_partials(
+            &a_packed,
+            &b_packed,
+            &table,
+            &eq.lo,
+            &eq.hi,
+            lo_size,
+            mask,
+            useful,
+            &mut failure_redo,
+            0,
+            split_at,
+        );
+        assert_eq!(failure_redo, full, "Metal-failure CPU prefix redo mismatch");
+
+        let (compact, compact_m1, compact_mi) = uni_skip_fold_and_round_pair_compact_padded(
+            &a_packed,
+            &b_packed,
+            M,
+            K_SKIP,
+            &table,
+            &mlv_challenges,
+            &padding,
+        );
+        assert_eq!((compact_m1, compact_mi), (legacy_m1, legacy_mi));
+
+        for rho in [
+            F128::ZERO,
+            F128::ONE,
+            F128 {
+                lo: u64::MAX,
+                hi: u64::MAX,
+            },
+            rng.f128(),
+        ] {
+            let mut expected_a = legacy_a.clone();
+            let mut expected_b = legacy_b.clone();
+            fold_in_place_pair(&mut expected_a, &mut expected_b, rho);
+            let expected_msg = round_pair_naive(&expected_a, &expected_b, &r_next);
+
+            let (compact_a, compact_b, compact_m1, compact_mi) =
+                fold_compact_and_compute_round_pair(&compact, &table, rho, &r_next);
+            assert_eq!(compact_a, expected_a);
+            assert_eq!(compact_b, expected_b);
+            assert_eq!((compact_m1, compact_mi), expected_msg);
+            crate::scratch::give_f128(compact_a);
+            crate::scratch::give_f128(compact_b);
+
+            // Poison both exact output-size allocations simultaneously so a
+            // missing zero store cannot be masked by smallest-fit reuse.
+            let mut poison_a = crate::scratch::take_f128(n_pairs);
+            let mut poison_b = crate::scratch::take_f128(n_pairs);
+            poison_a.fill(POISON);
+            poison_b.fill(POISON);
+            crate::scratch::give_f128(poison_a);
+            crate::scratch::give_f128(poison_b);
+
+            let (direct_a, direct_b, direct_m1, direct_mi) =
+                fold_packed_direct_and_compute_round_pair(
+                    &a_packed, &b_packed, M, K_SKIP, &table, rho, &r_next, &padding,
+                );
+            assert_eq!(direct_a, expected_a, "direct A mismatch at rho={rho:?}");
+            assert_eq!(direct_b, expected_b, "direct B mismatch at rho={rho:?}");
+            assert_eq!(
+                (direct_m1, direct_mi),
+                expected_msg,
+                "direct T3 message mismatch at rho={rho:?}"
+            );
+
+            let pairs_per_block = 1usize << (K_LOG - K_SKIP - 1);
+            for block in 0..(n_pairs / pairs_per_block) {
+                let base = block * pairs_per_block;
+                assert_eq!(direct_a[base + 120], expected_a[base + 120]);
+                assert_eq!(direct_b[base + 120], expected_b[base + 120]);
+                for pair in 121..128 {
+                    assert_eq!(direct_a[base + pair], F128::ZERO);
+                    assert_eq!(direct_b[base + pair], F128::ZERO);
+                }
+            }
+            crate::scratch::give_f128(direct_a);
+            crate::scratch::give_f128(direct_b);
+        }
+
+        compact.recycle();
+        crate::scratch::give_f128(legacy_a);
+        crate::scratch::give_f128(legacy_b);
+        crate::scratch::clear();
+    }
+
+    /// Allocation-heavy ranked-shape oracle. Run explicitly in release mode:
+    ///
+    /// `RAYON_NUM_THREADS=10 FLOCK_NO_GPU_ZC_R2=1 FLOCK_NO_GPU_ZC_T3=1 \
+    ///  cargo test --release -p flock-core --locked \
+    ///  zerocheck::multilinear::tests::ranked_direct_r2_t3_full_component_oracle \
+    ///  -- --ignored --exact --nocapture --test-threads=1`
+    ///
+    /// The compact producer proves the full R2 message, then its ordinary T3
+    /// materialization is retained as the 1 GiB control. Compact storage is
+    /// recycled and cleared before constructing the 1 GiB direct result, so
+    /// peak live source/control storage stays near 3.5 GiB rather than keeping
+    /// both reconstruction representations resident.
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    #[ignore = "ranked m32 oracle allocates several GiB; run explicitly in release mode"]
+    fn ranked_direct_r2_t3_full_component_oracle() {
+        use rayon::prelude::*;
+
+        const M: usize = 32;
+        const K_SKIP: usize = 6;
+        const K_LOG: usize = 14;
+        const USEFUL_BITS: usize = 15_409;
+        const BLOCK_BYTES: usize = 1usize << (K_LOG - 3);
+        const USEFUL_BYTES_CEIL: usize = USEFUL_BITS.div_ceil(8);
+        const PACKED_BYTES: usize = 1usize << (M - 3);
+        const BLOCKS: usize = 1usize << (M - K_LOG);
+
+        assert!(!cfg!(debug_assertions), "this GiB-scale oracle requires --release");
+        assert_eq!(rayon::current_num_threads(), 10, "ranked pool width");
+        assert!(r2_degen_enabled(), "ranked direct degeneration must be on");
+        assert!(
+            !crate::gpu_commit::gpu_zc_r2_enabled(),
+            "set FLOCK_NO_GPU_ZC_R2=1 so compact storage has no cached Metal wrap"
+        );
+        assert!(
+            !crate::gpu_commit::gpu_zc_t3_enabled(),
+            "set FLOCK_NO_GPU_ZC_T3=1 so compact storage can be released early"
+        );
+
+        fn fill_ranked_packed(dst: &mut [u8], salt: u64, static_b: bool) {
+            const BLOCK_BYTES: usize = 1usize << (K_LOG - 3);
+            const USEFUL_BYTES_CEIL: usize = USEFUL_BITS.div_ceil(8);
+            assert_eq!(dst.len(), PACKED_BYTES);
+            dst.par_chunks_mut(BLOCK_BYTES)
+                .enumerate()
+                .for_each(|(block_idx, block)| {
+                    assert_eq!(block.len(), BLOCK_BYTES);
+                    let mut state = salt
+                        ^ (block_idx as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15)
+                        ^ 0xD1B5_4A32_D192_ED03;
+                    for lane in block[..USEFUL_BYTES_CEIL].chunks_mut(8) {
+                        state ^= state << 13;
+                        state ^= state >> 7;
+                        state ^= state << 17;
+                        let bytes = state.to_le_bytes();
+                        lane.copy_from_slice(&bytes[..lane.len()]);
+                    }
+                    // Exactly 15,409 useful bits: only bit zero of byte 1926
+                    // survives; byte 1927 and every following byte are padding.
+                    block[USEFUL_BITS / 8] &= 1;
+                    block[USEFUL_BYTES_CEIL..].fill(0);
+                    // Make the mixed boundary row observably nonzero while its
+                    // odd sibling (raw row 241) remains fully padded.
+                    block[240 * 8] |= 1;
+
+                    if static_b {
+                        // Exercise static/nonstatic, static/static, and
+                        // nonstatic/static adjacent direct-T3 groups.
+                        for pair in [10usize, 12, 13, 15] {
+                            block[pair * 16..pair * 16 + 16].fill(0xff);
+                        }
+                        for pair in [11usize, 14] {
+                            block[pair * 16] = 0;
+                        }
+                    }
+                });
+        }
+
+        fn first_mismatch(actual: &[F128], expected: &[F128]) -> Option<usize> {
+            assert_eq!(actual.len(), expected.len());
+            actual.iter().zip(expected).position(|(a, b)| a != b)
+        }
+
+        crate::scratch::clear();
+        let t_inputs = std::time::Instant::now();
+        let mut a_packed = crate::scratch::take_u8(PACKED_BYTES);
+        let mut b_packed = crate::scratch::take_u8(PACKED_BYTES);
+        rayon::join(
+            || fill_ranked_packed(&mut a_packed, 0xA128_0000_0000_0001, false),
+            || fill_ranked_packed(&mut b_packed, 0xB128_0000_0000_0001, true),
+        );
+        eprintln!(
+            "[ranked-direct-oracle] packed inputs: {:.2}s",
+            t_inputs.elapsed().as_secs_f64()
+        );
+
+        for block_idx in [0usize, BLOCKS - 1] {
+            let base = block_idx * BLOCK_BYTES;
+            for packed in [&a_packed, &b_packed] {
+                assert!(packed[base + 240 * 8..base + USEFUL_BYTES_CEIL]
+                    .iter()
+                    .any(|byte| *byte != 0));
+                assert!(packed[base + USEFUL_BYTES_CEIL..base + BLOCK_BYTES]
+                    .iter()
+                    .all(|byte| *byte == 0));
+            }
+        }
+
+        let mut rng = Rng::new(0xD1EC_7A32_0000_0001);
+        let table = UniSkipFoldTable::new(K_SKIP, rng.f128());
+        let mlv_challenges = rng.f128_vec(M - K_SKIP);
+        let rho = rng.f128();
+        let r_next = rng.f128_vec(M - K_SKIP - 1);
+        let padding = PaddingSpec {
+            k_log: K_LOG,
+            useful_bits_per_block: USEFUL_BITS,
+        };
+
+        let t_r2_direct = std::time::Instant::now();
+        let direct_r2 = uni_skip_round2_message_only_cpu_padded(
+            &a_packed,
+            &b_packed,
+            M,
+            K_SKIP,
+            &table,
+            &mlv_challenges,
+            &padding,
+        );
+        eprintln!(
+            "[ranked-direct-oracle] storeless R2: {:.2}s",
+            t_r2_direct.elapsed().as_secs_f64()
+        );
+
+        let t_compact = std::time::Instant::now();
+        let (compact, compact_m1, compact_mi) = uni_skip_fold_and_round_pair_compact_padded(
+            &a_packed,
+            &b_packed,
+            M,
+            K_SKIP,
+            &table,
+            &mlv_challenges,
+            &padding,
+        );
+        assert_eq!(direct_r2, (compact_m1, compact_mi), "full R2 message");
+        eprintln!(
+            "[ranked-direct-oracle] compact R2 + message equality: {:.2}s",
+            t_compact.elapsed().as_secs_f64()
+        );
+
+        let t_control = std::time::Instant::now();
+        let (control_a, control_b, control_m1, control_mi) =
+            fold_compact_and_compute_round_pair(&compact, &table, rho, &r_next);
+        compact.recycle();
+        crate::scratch::clear();
+        eprintln!(
+            "[ranked-direct-oracle] compact T3 control + compact release: {:.2}s",
+            t_control.elapsed().as_secs_f64()
+        );
+
+        let t_direct = std::time::Instant::now();
+        let (direct_a, direct_b, direct_m1, direct_mi) =
+            fold_packed_direct_and_compute_round_pair(
+                &a_packed,
+                &b_packed,
+                M,
+                K_SKIP,
+                &table,
+                rho,
+                &r_next,
+                &padding,
+            );
+        assert_eq!(
+            (direct_m1, direct_mi),
+            (control_m1, control_mi),
+            "full T3 message"
+        );
+        crate::scratch::give_u8(a_packed);
+        crate::scratch::give_u8(b_packed);
+        crate::scratch::clear();
+        eprintln!(
+            "[ranked-direct-oracle] direct T3 + packed-input release: {:.2}s",
+            t_direct.elapsed().as_secs_f64()
+        );
+
+        if let Some(i) = first_mismatch(&direct_a, &control_a) {
+            panic!(
+                "complete direct A mismatch at {i}: direct={:?}, control={:?}",
+                direct_a[i], control_a[i]
+            );
+        }
+        if let Some(i) = first_mismatch(&direct_b, &control_b) {
+            panic!(
+                "complete direct B mismatch at {i}: direct={:?}, control={:?}",
+                direct_b[i], control_b[i]
+            );
+        }
+
+        let pairs_per_block = 1usize << (K_LOG - K_SKIP - 1);
+        assert_eq!(pairs_per_block, 128);
+        for block in 0..BLOCKS {
+            let base = block * pairs_per_block;
+            assert_eq!(direct_a[base + 120], control_a[base + 120]);
+            assert_eq!(direct_b[base + 120], control_b[base + 120]);
+            for pair in 121..128 {
+                assert_eq!(direct_a[base + pair], F128::ZERO);
+                assert_eq!(direct_b[base + pair], F128::ZERO);
+            }
+        }
+
+        crate::scratch::give_f128(direct_a);
+        crate::scratch::give_f128(direct_b);
+        crate::scratch::give_f128(control_a);
+        crate::scratch::give_f128(control_b);
+        crate::scratch::clear();
     }
 
     /// Parallel `uni_skip_fold_and_round_pair_optimized_packed` produces

@@ -479,6 +479,287 @@ pub(crate) unsafe fn fold_round2_compact_chunk_neon_unchecked_8(
     }
 }
 
+/// Storeless round-two sibling used when the packed witnesses remain the
+/// reconstruction source through the first tail round.  It computes exactly
+/// the same per-chunk message partials as
+/// [`fold_round2_compact_chunk_neon_unchecked_8`], including padding and the
+/// ranked `b == 1` degeneration, but does not materialize anchors or deltas.
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "aes")]
+pub(crate) unsafe fn fold_round2_message_chunk_neon_unchecked_8(
+    table_data: *const u8,
+    a_packed: *const u8,
+    b_packed: *const u8,
+    eq_lo: *const F128,
+    lo_size: usize,
+    pair_idx_base: usize,
+    pair_in_block_mask: usize,
+    useful_pairs_inclusive: usize,
+    degen: bool,
+) -> (F128, F128) {
+    use core::arch::aarch64::*;
+
+    unsafe {
+        let zero = vdupq_n_u64(0);
+        let mut p1_acc = WideNeon { lo: zero, hi: zero };
+        let mut pinf_acc = WideNeon { lo: zero, hi: zero };
+
+        let ones_bytes = [0xFFu8; 8];
+        let b_ones = fold_row_q(table_data, ones_bytes.as_ptr());
+        let ones_is_one = is_zero_q(veorq_u64(
+            b_ones,
+            core::mem::transmute::<F128, uint64x2_t>(F128::ONE),
+        ));
+
+        for x_lo in 0..lo_size {
+            if ((pair_idx_base + x_lo) & pair_in_block_mask) >= useful_pairs_inclusive {
+                continue;
+            }
+
+            let row0 = 2 * x_lo;
+            let row1 = row0 + 1;
+            let a0_code = u64::from_le(core::ptr::read_unaligned(
+                a_packed.add(row0 * 8).cast::<u64>(),
+            ));
+            let a1_code = u64::from_le(core::ptr::read_unaligned(
+                a_packed.add(row1 * 8).cast::<u64>(),
+            ));
+            let b0_code = u64::from_le(core::ptr::read_unaligned(
+                b_packed.add(row0 * 8).cast::<u64>(),
+            ));
+            let b1_code = u64::from_le(core::ptr::read_unaligned(
+                b_packed.add(row1 * 8).cast::<u64>(),
+            ));
+
+            if degen && (b0_code & b1_code) == u64::MAX {
+                let (_, a1) = fold_two_row_codes_q(table_data, a0_code, a1_code);
+                let g1 = if ones_is_one { a1 } else { mul_q(a1, b_ones) };
+                let eq_l = vld1q_u64(eq_lo.add(x_lo).cast::<u64>());
+                wide_xor(&mut p1_acc, mul_unreduced_q(eq_l, g1));
+                continue;
+            }
+
+            let (a0, a1, b0, b1) =
+                fold_four_row_codes_q(table_data, a0_code, a1_code, b0_code, b1_code);
+            let g1 = mul_q(a1, b1);
+            let g_inf = mul_q(veorq_u64(a0, a1), veorq_u64(b0, b1));
+            let eq_l = vld1q_u64(eq_lo.add(x_lo).cast::<u64>());
+            wide_xor(&mut p1_acc, mul_unreduced_q(eq_l, g1));
+            wide_xor(&mut pinf_acc, mul_unreduced_q(eq_l, g_inf));
+        }
+
+        (
+            core::mem::transmute::<uint64x2_t, F128>(reduce_wide_q(p1_acc)),
+            core::mem::transmute::<uint64x2_t, F128>(reduce_wide_q(pinf_acc)),
+        )
+    }
+}
+
+/// Reconstruct the ordinary post-rho A/B level directly from packed rows and
+/// compute its following round message.  For one packed adjacent-row pair,
+/// F2-linearity gives the exact binding identity
+///
+/// `T(a0) + rho*T(a0 XOR a1)`.
+///
+/// `table_data` is `T`; `scaled_table` is `rho*T`.  The hot, fully-useful path
+/// groups the four independent A/B output chains by table bank, matching the
+/// compact kernels' gather shape.  Fully padded output pairs are explicitly
+/// zero-written because scratch output is intentionally stale on checkout.
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "aes")]
+pub(crate) unsafe fn fold_packed_t3_chunk_neon_unchecked_8(
+    table_data: *const u8,
+    scaled_table: *const u8,
+    a_packed: *const u8,
+    b_packed: *const u8,
+    a_out: *mut F128,
+    b_out: *mut F128,
+    eq_lo: *const F128,
+    lo_size: usize,
+    pair_idx_base: usize,
+    pair_in_block_mask: usize,
+    useful_pairs_inclusive: usize,
+    degen: bool,
+) -> (F128, F128) {
+    use core::arch::aarch64::*;
+
+    #[inline(always)]
+    unsafe fn store_pair_nt(dst: *mut F128, x: uint64x2_t, y: uint64x2_t) {
+        unsafe {
+            core::arch::asm!(
+                "stnp {x:q}, {y:q}, [{dst}]",
+                dst = in(reg) dst,
+                x = in(vreg) x,
+                y = in(vreg) y,
+                options(nostack, preserves_flags),
+            );
+        }
+    }
+
+    #[inline(always)]
+    unsafe fn bind_one(
+        table_data: *const u8,
+        scaled_table: *const u8,
+        a0_code: u64,
+        a1_code: u64,
+        b0_code: u64,
+        b1_code: u64,
+        b_ones: uint64x2_t,
+        degen: bool,
+    ) -> (uint64x2_t, uint64x2_t) {
+        unsafe {
+            let da = a0_code ^ a1_code;
+            if degen && (b0_code & b1_code) == u64::MAX {
+                let a = veorq_u64(
+                    lookup_lanes_q::<8>(table_data, a0_code, 0),
+                    lookup_lanes_q::<8>(scaled_table, da, 0),
+                );
+                return (a, b_ones);
+            }
+            let db = b0_code ^ b1_code;
+            let (a_anchor, b_anchor) = fold_two_row_codes_q(table_data, a0_code, b0_code);
+            let (a_delta, b_delta) = fold_two_row_codes_q(scaled_table, da, db);
+            (veorq_u64(a_anchor, a_delta), veorq_u64(b_anchor, b_delta))
+        }
+    }
+
+    unsafe {
+        let zero = vdupq_n_u64(0);
+        let one = core::mem::transmute::<F128, uint64x2_t>(F128::ONE);
+        let mut p1_acc = WideNeon { lo: zero, hi: zero };
+        let mut pinf_acc = WideNeon { lo: zero, hi: zero };
+
+        let ones_bytes = [0xFFu8; 8];
+        let b_ones = fold_row_q(table_data, ones_bytes.as_ptr());
+
+        for x_lo in 0..lo_size {
+            let out = 2 * x_lo;
+            let pair0 = pair_idx_base + out;
+            let pair1 = pair0 + 1;
+            let useful0 = (pair0 & pair_in_block_mask) < useful_pairs_inclusive;
+            let useful1 = (pair1 & pair_in_block_mask) < useful_pairs_inclusive;
+
+            let (a0, a1, b0, b1) = if useful0 && useful1 {
+                // Four raw rows: two rows for each of the two challenge-bound
+                // outputs that form this next-message pair.
+                let row = 2 * out;
+                let ae0 = u64::from_le(core::ptr::read_unaligned(
+                    a_packed.add(row * 8).cast::<u64>(),
+                ));
+                let ao0 = u64::from_le(core::ptr::read_unaligned(
+                    a_packed.add((row + 1) * 8).cast::<u64>(),
+                ));
+                let ae1 = u64::from_le(core::ptr::read_unaligned(
+                    a_packed.add((row + 2) * 8).cast::<u64>(),
+                ));
+                let ao1 = u64::from_le(core::ptr::read_unaligned(
+                    a_packed.add((row + 3) * 8).cast::<u64>(),
+                ));
+                let be0 = u64::from_le(core::ptr::read_unaligned(
+                    b_packed.add(row * 8).cast::<u64>(),
+                ));
+                let bo0 = u64::from_le(core::ptr::read_unaligned(
+                    b_packed.add((row + 1) * 8).cast::<u64>(),
+                ));
+                let be1 = u64::from_le(core::ptr::read_unaligned(
+                    b_packed.add((row + 2) * 8).cast::<u64>(),
+                ));
+                let bo1 = u64::from_le(core::ptr::read_unaligned(
+                    b_packed.add((row + 3) * 8).cast::<u64>(),
+                ));
+
+                let static0 = degen && (be0 & bo0) == u64::MAX;
+                let static1 = degen && (be1 & bo1) == u64::MAX;
+                if !static0 && !static1 {
+                    let (aa0, aa1, bb0, bb1) =
+                        fold_four_row_codes_q(table_data, ae0, ae1, be0, be1);
+                    let (ad0, ad1, bd0, bd1) = fold_four_row_codes_q(
+                        scaled_table,
+                        ae0 ^ ao0,
+                        ae1 ^ ao1,
+                        be0 ^ bo0,
+                        be1 ^ bo1,
+                    );
+                    (
+                        veorq_u64(aa0, ad0),
+                        veorq_u64(aa1, ad1),
+                        veorq_u64(bb0, bd0),
+                        veorq_u64(bb1, bd1),
+                    )
+                } else {
+                    let (a0, b0) =
+                        bind_one(table_data, scaled_table, ae0, ao0, be0, bo0, b_ones, degen);
+                    let (a1, b1) =
+                        bind_one(table_data, scaled_table, ae1, ao1, be1, bo1, b_ones, degen);
+                    (a0, a1, b0, b1)
+                }
+            } else {
+                let mut a0 = zero;
+                let mut a1 = zero;
+                let mut b0 = zero;
+                let mut b1 = zero;
+                if useful0 {
+                    let row = 2 * out;
+                    let ae = u64::from_le(core::ptr::read_unaligned(
+                        a_packed.add(row * 8).cast::<u64>(),
+                    ));
+                    let ao = u64::from_le(core::ptr::read_unaligned(
+                        a_packed.add((row + 1) * 8).cast::<u64>(),
+                    ));
+                    let be = u64::from_le(core::ptr::read_unaligned(
+                        b_packed.add(row * 8).cast::<u64>(),
+                    ));
+                    let bo = u64::from_le(core::ptr::read_unaligned(
+                        b_packed.add((row + 1) * 8).cast::<u64>(),
+                    ));
+                    (a0, b0) = bind_one(table_data, scaled_table, ae, ao, be, bo, b_ones, degen);
+                }
+                if useful1 {
+                    let row = 2 * (out + 1);
+                    let ae = u64::from_le(core::ptr::read_unaligned(
+                        a_packed.add(row * 8).cast::<u64>(),
+                    ));
+                    let ao = u64::from_le(core::ptr::read_unaligned(
+                        a_packed.add((row + 1) * 8).cast::<u64>(),
+                    ));
+                    let be = u64::from_le(core::ptr::read_unaligned(
+                        b_packed.add(row * 8).cast::<u64>(),
+                    ));
+                    let bo = u64::from_le(core::ptr::read_unaligned(
+                        b_packed.add((row + 1) * 8).cast::<u64>(),
+                    ));
+                    (a1, b1) = bind_one(table_data, scaled_table, ae, ao, be, bo, b_ones, degen);
+                }
+                (a0, a1, b0, b1)
+            };
+
+            store_pair_nt(a_out.add(out), a0, a1);
+            store_pair_nt(b_out.add(out), b0, b1);
+            if !useful0 && !useful1 {
+                continue;
+            }
+
+            let g1 = if degen && is_zero_q(veorq_u64(b1, one)) {
+                a1
+            } else {
+                mul_q(a1, b1)
+            };
+            let eq_l = vld1q_u64(eq_lo.add(x_lo).cast::<u64>());
+            wide_xor(&mut p1_acc, mul_unreduced_q(eq_l, g1));
+            let b_sum = veorq_u64(b0, b1);
+            if !degen || !is_zero_q(b_sum) {
+                let g_inf = mul_q(veorq_u64(a0, a1), b_sum);
+                wide_xor(&mut pinf_acc, mul_unreduced_q(eq_l, g_inf));
+            }
+        }
+
+        (
+            core::mem::transmute::<uint64x2_t, F128>(reduce_wide_q(p1_acc)),
+            core::mem::transmute::<uint64x2_t, F128>(reduce_wide_q(pinf_acc)),
+        )
+    }
+}
+
 /// Anchors-and-deltas-only sibling of
 /// [`fold_round2_compact_chunk_neon_unchecked_8`]: identical anchor stores,
 /// identical delta bytes, identical padded-pair zeroing — but no `a1`/`b1`

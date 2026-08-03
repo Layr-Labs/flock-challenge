@@ -27,8 +27,10 @@ pub mod univariate_skip_deg4_optimized;
 pub mod univariate_skip_optimized;
 
 use multilinear::{
-    UniSkipFoldTable, fold_and_compute_round_pair_into, fold_compact_and_compute_round_pair,
-    fold_in_place_pair, interpolate_at_z_combined, interpolate_at_z_on_lambda, round_pair_naive,
+    UniSkipCompactFold, UniSkipFoldTable, fold_and_compute_round_pair_into,
+    fold_compact_and_compute_round_pair, fold_in_place_pair,
+    fold_packed_direct_and_compute_round_pair, interpolate_at_z_combined,
+    interpolate_at_z_on_lambda, round_pair_naive, try_uni_skip_round2_message_only_gpu_padded,
     uni_skip_fold_and_round_pair_compact_padded_with_deltas,
 };
 use univariate_skip_optimized::{
@@ -40,6 +42,48 @@ use univariate_skip_optimized::{
 /// |Λ| = 2^K_SKIP = 64 elements; the round-1 prover message is two length-64
 /// vectors of F128.
 pub const K_SKIP: usize = 6;
+
+/// Direct-worker diagnostic only. The canonical benchmark launcher clears
+/// arbitrary environment variables before starting a worker, so this cannot
+/// select official candidate behavior; it exists solely for same-binary local
+/// proof/component controls.
+const ENV_DIAG_NO_ZC_R2_DIRECT: &str = "FLOCK_DIAG_NO_ZC_R2_DIRECT";
+
+fn ranked_r2_direct_shape(m: usize, k_skip: usize, padding: &PaddingSpec) -> bool {
+    ranked_r2_direct_shape_inputs(
+        cfg!(all(target_os = "macos", target_arch = "aarch64")),
+        m,
+        k_skip,
+        padding,
+        rayon::current_num_threads(),
+        std::env::var_os(ENV_DIAG_NO_ZC_R2_DIRECT).is_none(),
+    )
+}
+
+/// Pure half of [`ranked_r2_direct_shape`]. Keeping the runtime thread-count
+/// and diagnostic inputs explicit makes every admission condition testable
+/// without mutating the process environment or the global Rayon pool.
+fn ranked_r2_direct_shape_inputs(
+    supported_target: bool,
+    m: usize,
+    k_skip: usize,
+    padding: &PaddingSpec,
+    current_threads: usize,
+    diagnostic_enabled: bool,
+) -> bool {
+    supported_target
+        && m == 32
+        && k_skip == 6
+        && padding.k_log == 14
+        && padding.useful_bits_per_block == 15_409
+        && current_threads == 10
+        && diagnostic_enabled
+}
+
+enum Round2Level {
+    Compact(UniSkipCompactFold),
+    PackedDirect,
+}
 
 /// Witness padding descriptor for URM work-skipping.
 ///
@@ -578,16 +622,40 @@ fn prove_packed_padded_inner<C: Challenger>(
     let fold_table = UniSkipFoldTable::new(k_skip, z);
     let mut mlv_arg = vec![F128::ONE; n_mlv];
     mlv_arg[1..].copy_from_slice(&r[k_skip + 1..]);
-    let (compact_mlv, msg_1, msg_inf) = uni_skip_fold_and_round_pair_compact_padded_with_deltas(
-        a_packed,
-        b_packed,
-        m,
-        k_skip,
-        &fold_table,
-        &mlv_arg,
-        padding,
-        compact_deltas,
-    );
+    let direct_msg = ranked_r2_direct_shape(m, k_skip, padding).then(|| {
+        try_uni_skip_round2_message_only_gpu_padded(
+            a_packed,
+            b_packed,
+            m,
+            k_skip,
+            &fold_table,
+            &mlv_arg,
+            padding,
+        )
+    });
+    let direct_msg = direct_msg.flatten();
+    let (round2_level, msg_1, msg_inf) = if let Some((msg_1, msg_inf)) = direct_msg {
+        // Metal admission is the commit point: before it, the exact incumbent
+        // can still consume this allocation as compact deltas. Once admitted,
+        // the direct path needs no checkpoint and returns the dead R1 backing
+        // to its original F128 pool immediately.
+        if let Some(deltas) = compact_deltas {
+            deltas.recycle();
+        }
+        (Round2Level::PackedDirect, msg_1, msg_inf)
+    } else {
+        let (compact, msg_1, msg_inf) = uni_skip_fold_and_round_pair_compact_padded_with_deltas(
+            a_packed,
+            b_packed,
+            m,
+            k_skip,
+            &fold_table,
+            &mlv_arg,
+            padding,
+            compact_deltas,
+        );
+        (Round2Level::Compact(compact), msg_1, msg_inf)
+    };
 
     if zc_timing {
         eprintln!(
@@ -623,16 +691,35 @@ fn prove_packed_padded_inner<C: Challenger>(
     let t_t3 = std::time::Instant::now();
     let mut first_r_next = vec![F128::ONE; n_mlv - 1];
     first_r_next[1..].copy_from_slice(&r[k_skip + 2..]);
-    let (mut a_mlv, mut b_mlv, first_m1, first_mi) =
-        fold_compact_and_compute_round_pair(&compact_mlv, &fold_table, mlv_rhos[0], &first_r_next);
+    let (mut a_mlv, mut b_mlv, first_m1, first_mi) = match round2_level {
+        Round2Level::Compact(compact) => {
+            let out = fold_compact_and_compute_round_pair(
+                &compact,
+                &fold_table,
+                mlv_rhos[0],
+                &first_r_next,
+            );
+            compact.recycle();
+            out
+        }
+        Round2Level::PackedDirect => fold_packed_direct_and_compute_round_pair(
+            a_packed,
+            b_packed,
+            m,
+            k_skip,
+            &fold_table,
+            mlv_rhos[0],
+            &first_r_next,
+            padding,
+        ),
+    };
     if tail_round_timing {
         eprintln!(
-            "[zc-tail-rounds] T3 compact fold (out n={}): {:.2} ms",
+            "[zc-tail-rounds] T3 first fold (out n={}): {:.2} ms",
             a_mlv.len(),
             t_t3.elapsed().as_secs_f64() * 1e3
         );
     }
-    compact_mlv.recycle();
     multilinear_msgs.push((first_m1, first_mi));
     challenger.observe_f128(first_m1);
     challenger.observe_f128(first_mi);
@@ -939,6 +1026,75 @@ pub fn verify<C: Challenger>(
 mod tests {
     use super::*;
     use crate::challenger::FsChallenger;
+
+    #[test]
+    fn ranked_r2_direct_gate_requires_exact_target_shape_threads_and_diag_state() {
+        let ranked = PaddingSpec {
+            k_log: 14,
+            useful_bits_per_block: 15_409,
+        };
+        assert!(ranked_r2_direct_shape_inputs(
+            true, 32, 6, &ranked, 10, true
+        ));
+
+        // Every production admission dimension is independently binding.
+        assert!(!ranked_r2_direct_shape_inputs(
+            false, 32, 6, &ranked, 10, true
+        ));
+        assert!(!ranked_r2_direct_shape_inputs(
+            true, 31, 6, &ranked, 10, true
+        ));
+        assert!(!ranked_r2_direct_shape_inputs(
+            true, 32, 5, &ranked, 10, true
+        ));
+        assert!(!ranked_r2_direct_shape_inputs(
+            true,
+            32,
+            6,
+            &PaddingSpec {
+                k_log: 13,
+                ..ranked
+            },
+            10,
+            true,
+        ));
+        assert!(!ranked_r2_direct_shape_inputs(
+            true,
+            32,
+            6,
+            &PaddingSpec {
+                useful_bits_per_block: 15_408,
+                ..ranked
+            },
+            10,
+            true,
+        ));
+        assert!(!ranked_r2_direct_shape_inputs(
+            true, 32, 6, &ranked, 9, true
+        ));
+        assert!(!ranked_r2_direct_shape_inputs(
+            true, 32, 6, &ranked, 11, true
+        ));
+        assert!(!ranked_r2_direct_shape_inputs(
+            true, 32, 6, &ranked, 10, false
+        ));
+        assert_eq!(ENV_DIAG_NO_ZC_R2_DIRECT, "FLOCK_DIAG_NO_ZC_R2_DIRECT");
+
+        // Exercise the production wrapper under real local Rayon pools: it
+        // must read the current pool width, not the host's/global default.
+        let runtime_gate = |threads| {
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .unwrap()
+                .install(|| ranked_r2_direct_shape(32, 6, &ranked))
+        };
+        let target_and_diag = cfg!(all(target_os = "macos", target_arch = "aarch64"))
+            && std::env::var_os(ENV_DIAG_NO_ZC_R2_DIRECT).is_none();
+        assert_eq!(runtime_gate(10), target_and_diag);
+        assert!(!runtime_gate(9));
+        assert!(!runtime_gate(11));
+    }
 
     /// SplitMix64 PRNG, deterministic.
     struct Rng(u64);
