@@ -546,6 +546,389 @@ pub(crate) unsafe fn fold_round2_compact_chunk_neon_anchors_only_8(
     }
 }
 
+/// Fold one round-two pair and emit its compact anchor + delta stores.
+///
+/// Every store below is the *same expression* the incumbent
+/// [`fold_round2_compact_chunk_neon_unchecked_8`] emits for the same pair
+/// (padded pairs zeroed, degenerate pairs shortcut with the identical
+/// `[a0^a1, 0] == [a0^a1, b0^b1]` delta), so the compact state produced by
+/// the lookahead kernel is byte-identical to the incumbent's.
+///
+/// Returns the four folded rows plus whether the b≡1 shortcut was taken.
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn r2_pair_fold_and_store(
+    table_data: *const u8,
+    a_packed: *const u8,
+    b_packed: *const u8,
+    anchors: *mut F128,
+    deltas: *mut u8,
+    x_lo: usize,
+    padded: bool,
+    degen: bool,
+    b_ones: core::arch::aarch64::uint64x2_t,
+) -> (
+    core::arch::aarch64::uint64x2_t,
+    core::arch::aarch64::uint64x2_t,
+    core::arch::aarch64::uint64x2_t,
+    core::arch::aarch64::uint64x2_t,
+    bool,
+) {
+    use core::arch::aarch64::*;
+
+    #[inline(always)]
+    unsafe fn store_anchor_pair_nt(dst: *mut F128, a: uint64x2_t, b: uint64x2_t) {
+        unsafe {
+            core::arch::asm!(
+                "stnp {a:q}, {b:q}, [{dst}]",
+                dst = in(reg) dst,
+                a = in(vreg) a,
+                b = in(vreg) b,
+                options(nostack, preserves_flags),
+            );
+        }
+    }
+
+    unsafe {
+        let zero = vdupq_n_u64(0);
+        if padded {
+            store_anchor_pair_nt(anchors.add(2 * x_lo), zero, zero);
+            vst1q_u64(deltas.add(x_lo * 16).cast::<u64>(), zero);
+            return (zero, zero, zero, zero, false);
+        }
+
+        let row0 = 2 * x_lo;
+        let row1 = row0 + 1;
+        let a0_code = u64::from_le(core::ptr::read_unaligned(
+            a_packed.add(row0 * 8).cast::<u64>(),
+        ));
+        let a1_code = u64::from_le(core::ptr::read_unaligned(
+            a_packed.add(row1 * 8).cast::<u64>(),
+        ));
+        let b0_code = u64::from_le(core::ptr::read_unaligned(
+            b_packed.add(row0 * 8).cast::<u64>(),
+        ));
+        let b1_code = u64::from_le(core::ptr::read_unaligned(
+            b_packed.add(row1 * 8).cast::<u64>(),
+        ));
+
+        if degen && (b0_code & b1_code) == u64::MAX {
+            let (a0, a1) = fold_two_row_codes_q(table_data, a0_code, a1_code);
+            store_anchor_pair_nt(anchors.add(2 * x_lo), a0, b_ones);
+            let delta_pair = core::mem::transmute::<[u64; 2], uint64x2_t>([a0_code ^ a1_code, 0]);
+            vst1q_u64(deltas.add(x_lo * 16).cast::<u64>(), delta_pair);
+            return (a0, a1, b_ones, b_ones, true);
+        }
+
+        let (a0, a1, b0, b1) =
+            fold_four_row_codes_q(table_data, a0_code, a1_code, b0_code, b1_code);
+        store_anchor_pair_nt(anchors.add(2 * x_lo), a0, b0);
+        let delta_pair = core::mem::transmute::<[u64; 2], uint64x2_t>([
+            a0_code ^ a1_code,
+            b0_code ^ b1_code,
+        ]);
+        vst1q_u64(deltas.add(x_lo * 16).cast::<u64>(), delta_pair);
+        (a0, a1, b0, b1, false)
+    }
+}
+
+/// Round-two compact producer extended with the deferred round-three
+/// lookahead accumulators (variant K).
+///
+/// Anchors, deltas, padded-pair zeroing and the round-two products are the
+/// same expressions the incumbent kernel emits; the only structural change is
+/// that pairs are visited two at a time — one round-three group `y = x'/2` —
+/// so a group's four rows are live together and the six deferred round-three
+/// aggregates can be formed with **no extra table lookups**.
+///
+/// **One weight per group, one scaling per row.** The two eq2 lanes of a group
+/// and eq3 itself are constant multiples of one another —
+/// `eq2(2y) = (1+r1)*eq3(y)` and `eq2(2y+1) = r1*eq3(y)` — so the whole group is
+/// accumulated against the single weight `w = eq2_lo[2u+1]`, the four rows are
+/// pre-scaled by `w` with **four** reduced multiplies, and all eight products
+/// then cost one unreduced multiply each: 44 PMULL per group against the
+/// incumbent's 32 for half as many products. The constant rescalings
+/// (`kappa = (1+r1)/r1` on the even sums, `r1^-1` on the six deferred
+/// aggregates) are applied once by the driver, off the hot path.
+///
+/// Writes eight F128 slots to `out`, every one of them `w`-weighted:
+///
+/// | slot | value |
+/// |---|---|
+/// | 0, 1 | `sum_{x' even} w*a1*b1`, `sum_{x' even} w*(a0+a1)(b0+b1)` |
+/// | 2, 3 | the same two sums over **odd** `x'` — i.e. `r1*W1`, `r1*W2` |
+/// | 4..8 | `r1*W0`, `r1*W3`, `r1*W4`, `r1*W5` |
+///
+/// With `FULL = false` slots 0/1 stay zero: the round-two GPU arm owns this
+/// chunk's summed products, so the even pair's two products are skipped and
+/// only the lookahead state is produced.
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "aes")]
+pub(crate) unsafe fn fold_round2_compact_chunk_neon_lookahead_8<const FULL: bool>(
+    table_data: *const u8,
+    a_packed: *const u8,
+    b_packed: *const u8,
+    anchors: *mut F128,
+    deltas: *mut u8,
+    eq_lo: *const F128,
+    lo_size: usize,
+    pair_idx_base: usize,
+    pair_in_block_mask: usize,
+    useful_pairs_inclusive: usize,
+    degen: bool,
+    out: *mut F128,
+) {
+    use core::arch::aarch64::*;
+
+    #[inline(always)]
+    unsafe fn store_anchor_pair_nt(dst: *mut F128, a: uint64x2_t, b: uint64x2_t) {
+        unsafe {
+            core::arch::asm!(
+                "stnp {a:q}, {b:q}, [{dst}]",
+                dst = in(reg) dst,
+                a = in(vreg) a,
+                b = in(vreg) b,
+                options(nostack, preserves_flags),
+            );
+        }
+    }
+
+    unsafe {
+        let zero = vdupq_n_u64(0);
+        let mut p1_even = WideNeon { lo: zero, hi: zero };
+        let mut pinf_even = WideNeon { lo: zero, hi: zero };
+        let mut p1_odd = WideNeon { lo: zero, hi: zero };
+        let mut pinf_odd = WideNeon { lo: zero, hi: zero };
+        let mut w0 = WideNeon { lo: zero, hi: zero };
+        let mut w3 = WideNeon { lo: zero, hi: zero };
+        let mut w4 = WideNeon { lo: zero, hi: zero };
+        let mut w5 = WideNeon { lo: zero, hi: zero };
+
+        let ones_bytes = [0xFFu8; 8];
+        let b_ones = fold_row_q(table_data, ones_bytes.as_ptr());
+        let ones_is_one = is_zero_q(veorq_u64(
+            b_ones,
+            core::mem::transmute::<F128, uint64x2_t>(F128::ONE),
+        ));
+
+        let n_groups = lo_size / 2;
+        for u in 0..n_groups {
+            let x_lo0 = 2 * u;
+            let x_lo1 = x_lo0 + 1;
+            let pad0 = ((pair_idx_base + x_lo0) & pair_in_block_mask) >= useful_pairs_inclusive;
+            let pad1 = ((pair_idx_base + x_lo1) & pair_in_block_mask) >= useful_pairs_inclusive;
+            if pad0 & pad1 {
+                store_anchor_pair_nt(anchors.add(2 * x_lo0), zero, zero);
+                vst1q_u64(deltas.add(x_lo0 * 16).cast::<u64>(), zero);
+                store_anchor_pair_nt(anchors.add(2 * x_lo1), zero, zero);
+                vst1q_u64(deltas.add(x_lo1 * 16).cast::<u64>(), zero);
+                continue;
+            }
+
+            let (a0, a1, b0, b1, deg0) = r2_pair_fold_and_store(
+                table_data, a_packed, b_packed, anchors, deltas, x_lo0, pad0, degen, b_ones,
+            );
+            let (a2, a3, b2, b3, deg1) = r2_pair_fold_and_store(
+                table_data, a_packed, b_packed, anchors, deltas, x_lo1, pad1, degen, b_ones,
+            );
+
+            // The odd lane's weight drives the whole group; see the doc above.
+            let w = vld1q_u64(eq_lo.add(x_lo1).cast::<u64>());
+
+            if deg0 & deg1 & ones_is_one {
+                // b === 1 across the group: e_b = o_b = 0 kills W3/W4/W5 and
+                // both G(inf) chains, and every surviving product is `w * a_i`.
+                if FULL {
+                    wide_xor(&mut p1_even, mul_unreduced_q(w, a1));
+                }
+                wide_xor(&mut p1_odd, mul_unreduced_q(w, a3));
+                wide_xor(&mut w0, mul_unreduced_q(w, a2));
+                continue;
+            }
+
+            let a0w = mul_q(w, a0);
+            let a1w = mul_q(w, a1);
+            let (a2w, a3w) = if pad1 {
+                (zero, zero)
+            } else {
+                (mul_q(w, a2), mul_q(w, a3))
+            };
+
+            // ---- round-two products, split by the parity of x' ----
+            if FULL {
+                wide_xor(&mut p1_even, mul_unreduced_q(a1w, b1));
+                if !deg0 {
+                    wide_xor(
+                        &mut pinf_even,
+                        mul_unreduced_q(veorq_u64(a0w, a1w), veorq_u64(b0, b1)),
+                    );
+                }
+            }
+            if !pad1 {
+                wide_xor(&mut p1_odd, mul_unreduced_q(a3w, b3));
+                if !deg1 {
+                    wide_xor(
+                        &mut pinf_odd,
+                        mul_unreduced_q(veorq_u64(a2w, a3w), veorq_u64(b2, b3)),
+                    );
+                }
+                wide_xor(&mut w0, mul_unreduced_q(a2w, b2));
+            }
+
+            // ---- deferred round-three aggregates (no extra lookups) ----
+            let e_aw = veorq_u64(a0w, a2w);
+            let o_aw = veorq_u64(a1w, a3w);
+            let e_b = veorq_u64(b0, b2);
+            let o_b = veorq_u64(b1, b3);
+            wide_xor(&mut w3, mul_unreduced_q(e_aw, e_b));
+            wide_xor(&mut w4, mul_unreduced_q(o_aw, o_b));
+            wide_xor(
+                &mut w5,
+                mul_unreduced_q(veorq_u64(e_aw, o_aw), veorq_u64(e_b, o_b)),
+            );
+        }
+
+        *out.add(0) = core::mem::transmute::<uint64x2_t, F128>(reduce_wide_q(p1_even));
+        *out.add(1) = core::mem::transmute::<uint64x2_t, F128>(reduce_wide_q(pinf_even));
+        *out.add(2) = core::mem::transmute::<uint64x2_t, F128>(reduce_wide_q(p1_odd));
+        *out.add(3) = core::mem::transmute::<uint64x2_t, F128>(reduce_wide_q(pinf_odd));
+        *out.add(4) = core::mem::transmute::<uint64x2_t, F128>(reduce_wide_q(w0));
+        *out.add(5) = core::mem::transmute::<uint64x2_t, F128>(reduce_wide_q(w3));
+        *out.add(6) = core::mem::transmute::<uint64x2_t, F128>(reduce_wide_q(w4));
+        *out.add(7) = core::mem::transmute::<uint64x2_t, F128>(reduce_wide_q(w5));
+    }
+}
+
+/// Bind **both** ρ₁ and ρ₂ straight out of the compact round-two state and
+/// emit the round-four message in the same pass (variant K).
+///
+/// `A''[y] = [anc0 + ρ₂(anc0+anc1)] + fold_{λ₁}(δ0) + fold_{λ₃}(δ1)` with
+/// `λ₁ = ρ₁(1+ρ₂)`, `λ₃ = ρ₁ρ₂` — in characteristic two `λ₀+λ₁ = 1+ρ₂` and
+/// `λ₂+λ₃ = ρ₂`, so the two anchors collapse into one ordinary ρ₂ fold and
+/// only the two deltas need λ-scaled tables. Padding needs no predicate: the
+/// compact state already carries zero anchors and zero deltas there, and a
+/// zero delta code folds to zero through the table's zero entry.
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "aes")]
+pub(crate) unsafe fn fold2_compact_and_round4_chunk_neon_8(
+    table_l1: *const u8,
+    table_l3: *const u8,
+    rho2: F128,
+    anchors: *const F128,
+    deltas: *const u8,
+    a_out: *mut F128,
+    b_out: *mut F128,
+    eq_lo: *const F128,
+    out_pairs: usize,
+    degen: bool,
+) -> (F128, F128) {
+    use core::arch::aarch64::*;
+
+    #[inline(always)]
+    unsafe fn store_pair_nt(dst: *mut F128, x: uint64x2_t, y: uint64x2_t) {
+        unsafe {
+            core::arch::asm!(
+                "stnp {x:q}, {y:q}, [{dst}]",
+                dst = in(reg) dst,
+                x = in(vreg) x,
+                y = in(vreg) y,
+                options(nostack, preserves_flags),
+            );
+        }
+    }
+
+    unsafe {
+        let zero = vdupq_n_u64(0);
+        let rho2_q = core::mem::transmute::<F128, uint64x2_t>(rho2);
+        let one_q = core::mem::transmute::<F128, uint64x2_t>(F128::ONE);
+        let mut p1_acc = WideNeon { lo: zero, hi: zero };
+        let mut pinf_acc = WideNeon { lo: zero, hi: zero };
+
+        for u in 0..out_pairs {
+            let mut av = [zero; 2];
+            let mut bv = [zero; 2];
+            let mut b_flat = true;
+            for lane in 0..2usize {
+                let g = 2 * u + lane;
+                let ap = anchors.add(4 * g).cast::<u64>();
+                let anc_a0 = vld1q_u64(ap);
+                let anc_b0 = vld1q_u64(ap.add(2));
+                let anc_a1 = vld1q_u64(ap.add(4));
+                let anc_b1 = vld1q_u64(ap.add(6));
+
+                let dp = deltas.add(32 * g);
+                let da0 = u64::from_le(core::ptr::read_unaligned(dp.cast::<u64>()));
+                let db0 = u64::from_le(core::ptr::read_unaligned(dp.add(8).cast::<u64>()));
+                let da1 = u64::from_le(core::ptr::read_unaligned(dp.add(16).cast::<u64>()));
+                let db1 = u64::from_le(core::ptr::read_unaligned(dp.add(24).cast::<u64>()));
+
+                let a_delta = veorq_u64(
+                    lookup_lanes_q::<8>(table_l1, da0, 0),
+                    lookup_lanes_q::<8>(table_l3, da1, 0),
+                );
+                av[lane] = xor3_u64(
+                    anc_a0,
+                    mul_q(rho2_q, veorq_u64(anc_a0, anc_a1)),
+                    a_delta,
+                );
+
+                if degen && (db0 | db1) == 0 {
+                    // b rows are constant across the group: zero deltas mean
+                    // both b halves equal their anchors.
+                    let bd = veorq_u64(anc_b0, anc_b1);
+                    bv[lane] = if is_zero_q(bd) {
+                        anc_b0
+                    } else {
+                        b_flat = false;
+                        veorq_u64(anc_b0, mul_q(rho2_q, bd))
+                    };
+                } else {
+                    b_flat = false;
+                    let b_delta = veorq_u64(
+                        lookup_lanes_q::<8>(table_l1, db0, 0),
+                        lookup_lanes_q::<8>(table_l3, db1, 0),
+                    );
+                    bv[lane] = xor3_u64(
+                        anc_b0,
+                        mul_q(rho2_q, veorq_u64(anc_b0, anc_b1)),
+                        b_delta,
+                    );
+                }
+            }
+
+            store_pair_nt(a_out.add(2 * u), av[0], av[1]);
+            store_pair_nt(b_out.add(2 * u), bv[0], bv[1]);
+
+            let eq_l = vld1q_u64(eq_lo.add(u).cast::<u64>());
+            if b_flat {
+                // Value-forced shortcuts on the static b≡1 mass, gated on the
+                // loaded values so they stay bit-exact.
+                let g1 = if is_zero_q(veorq_u64(bv[1], one_q)) {
+                    av[1]
+                } else {
+                    mul_q(av[1], bv[1])
+                };
+                wide_xor(&mut p1_acc, mul_unreduced_q(eq_l, g1));
+                let b_sum = veorq_u64(bv[0], bv[1]);
+                if !is_zero_q(b_sum) {
+                    let g_inf = mul_q(veorq_u64(av[0], av[1]), b_sum);
+                    wide_xor(&mut pinf_acc, mul_unreduced_q(eq_l, g_inf));
+                }
+            } else {
+                let g1 = mul_q(av[1], bv[1]);
+                let g_inf = mul_q(veorq_u64(av[0], av[1]), veorq_u64(bv[0], bv[1]));
+                wide_xor(&mut p1_acc, mul_unreduced_q(eq_l, g1));
+                wide_xor(&mut pinf_acc, mul_unreduced_q(eq_l, g_inf));
+            }
+        }
+
+        (
+            core::mem::transmute::<uint64x2_t, F128>(reduce_wide_q(p1_acc)),
+            core::mem::transmute::<uint64x2_t, F128>(reduce_wide_q(pinf_acc)),
+        )
+    }
+}
+
 /// XOR of the `L` table entries for byte lanes `lane0..lane0 + L` of `code`.
 /// One 16-byte L1 load per lane; the tree shape matches `fold_row_q` so the
 /// full-width (`L = 8`, `lane0 = 0`) case is instruction-equivalent.
