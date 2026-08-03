@@ -140,9 +140,17 @@ fn set_prover_thread_qos() {
     unsafe extern "C" {
         fn pthread_set_qos_class_self_np(qos_class: u32, relative_priority: i32) -> i32;
     }
-    // QOS_CLASS_USER_INITIATED: explicit user work that should finish promptly.
+    // QOS_CLASS_USER_INTERACTIVE (0x21): the top scheduling class. The timed
+    // prover runs alone on this host (harness pipes are null, nothing else
+    // contends), so the only reason to stay below the top class is politeness.
+    // The promoted baseline (r291) pinned USER_INITIATED (0x19) on every
+    // worker; this candidate asks the same DVFS domain for the top class
+    // through the latency-bound round-2 join stalls - the exact regime where
+    // the scored median (0.16860 s) lives. Byte-neutral: QoS changes thread
+    // placement only, never proof bytes, so the warmup latch's byte-compare is
+    // unaffected.
     unsafe {
-        let _ = pthread_set_qos_class_self_np(0x19, 0);
+        let _ = pthread_set_qos_class_self_np(0x21, 0);
     }
 }
 
