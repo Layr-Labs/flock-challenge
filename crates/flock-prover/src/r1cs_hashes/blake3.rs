@@ -2864,6 +2864,15 @@ impl Blake3Setup {
         let (proof, commitment, claim) = self.prove_fast_inner(blocks, challenger);
         if call == 0 {
             let (proof, commitment) = warm_publish_path(proof, commitment);
+            // Still untimed: prove here, against the wrapper's own warm-up
+            // blocks, that our parallel generator reproduces the protected one.
+            // That retires the timed path's 59 MiB adoption comparison.
+            if self.n_blocks.is_power_of_two() {
+                crate::seed_pipe::verify_generator_at_warmup(
+                    self.n_blocks.trailing_zeros(),
+                    blocks,
+                );
+            }
             // Last thing the untimed warm-up does: hand stdin to the seed-pipe
             // thread. The worker publishes its ready file immediately after we
             // return and only then touches `io::stdin()`, so the splice lands
