@@ -480,6 +480,7 @@ fn prove_fast_ligerito_from_witness_with_commit_codeword<Ch: Challenger>(
             cpu / wall
         );
     }
+    if std::env::var_os("FLOCK_PHASE_TIMING").is_none() { eprintln!("[angel-observe] FLOCK_PHASE_TIMING unset on runner"); }
 
     let proof = R1csProofLigerito {
         zerocheck: zc_proof,
@@ -1226,6 +1227,9 @@ fn prove_fast_ligerito_timed_with_commit_codeword<Ch: Challenger>(
     commit_codeword: CommitCodeword,
     challenger: &mut Ch,
 ) -> (R1csProofLigerito, Commitment, R1csClaim, ProvePhaseTimings) {
+    if std::env::var_os("FLOCK_R269_PROBE").is_some() {
+        eprintln!("[r269-probe] timed commit entry (no-op observability)");
+    }
     use std::time::Instant;
     let mut t = ProvePhaseTimings::default();
 
