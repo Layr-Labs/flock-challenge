@@ -2544,6 +2544,23 @@ fn use_deferred_ranked_lincheck_stripe(n_blocks_log: usize, pcs_params: &PcsPara
     )
 }
 
+/// Stripe-free ranked selector: the lincheck fold and the identity-C fold read
+/// the F_{2^128}-packed witness directly (`partial_fold_packed_z_from_f128`),
+/// so the ~2^(m-3)-byte byte-stripe is never written in the timed region.
+/// Requires the exact ranked PCS geometry (shared shape gate with the deferred
+/// selector). `FLOCK_NO_F128_FOLD=1` restores the deferred stripe as the exact
+/// same-binary control; on the scored run (env cleared) the new path is live.
+fn use_f128_fold_lincheck(n_blocks_log: usize, pcs_params: &PcsParams) -> bool {
+    select_deferred_ranked_lincheck_stripe(
+        n_blocks_log,
+        pcs_params,
+        cfg!(all(target_os = "macos", target_arch = "aarch64")),
+        true, // the CPU fold needs no helper pool
+        std::env::var_os("FLOCK_NO_F128_FOLD").is_some(),
+        std::env::var_os("FLOCK_FULL_STRIPE").is_some(),
+    )
+}
+
 #[inline]
 fn should_request_ranked_exact_tune(call: usize, ranked_shape_enabled: bool) -> bool {
     call == 0 && ranked_shape_enabled
@@ -2575,11 +2592,12 @@ fn generate_witness_with_ab_packed_and_lincheck_streamed(
     // with the scalar driver, incl. the Metal band-streaming protocol.
     #[cfg(target_arch = "aarch64")]
     if witgen_simd::enabled() {
+        let f128_fold = use_f128_fold_lincheck(n_blocks_log, pcs_params);
         return witgen_simd::generate_streamed(
             blocks,
             n_blocks_log,
             pcs_params,
-            use_deferred_ranked_lincheck_stripe(n_blocks_log, pcs_params),
+            use_deferred_ranked_lincheck_stripe(n_blocks_log, pcs_params) || f128_fold,
         );
     }
     let (z, a, b, stripe, stream) =
@@ -2959,6 +2977,7 @@ impl Blake3Setup {
                     // A live stream implies the GPU latch is on; the empty
                     // marker is hydrated only if the Metal finish fails.
                     let codeword = codeword.unwrap_or_default();
+                    let f128_fold = use_f128_fold_lincheck(self.n_blocks_log(), &self.pcs_params);
                     return match z_packed_lincheck {
                         Some(stripe) => {
                             crate::prover::prove_fast_ligerito_from_streamed_first_pass(
@@ -2974,6 +2993,17 @@ impl Blake3Setup {
                                 challenger,
                             )
                         }
+                        None if f128_fold => crate::prover::prove_fast_ligerito_from_streamed_first_pass_f128_fold(
+                            &self.r1cs,
+                            &self.pcs_params,
+                            z_packed,
+                            a_packed_f128,
+                            b_packed_f128,
+                            lc_circuit,
+                            codeword,
+                            stream,
+                            challenger,
+                        ),
                         None => crate::prover::prove_fast_ligerito_from_streamed_first_pass_deferred_stripe(
                             &self.r1cs,
                             &self.pcs_params,
@@ -2986,6 +3016,20 @@ impl Blake3Setup {
                             challenger,
                         ),
                     };
+                }
+                if use_f128_fold_lincheck(self.n_blocks_log(), &self.pcs_params) {
+                    return crate::prover::prove_fast_ligerito_from_witness_f128_fold(
+                        &self.r1cs,
+                        &self.pcs_params,
+                        z_packed,
+                        a_packed_f128,
+                        b_packed_f128,
+                        lc_circuit,
+                        codeword.expect(
+                            "non-streamed F128-fold fallback: codeword is allocated when the GPU latch is off",
+                        ),
+                        challenger,
+                    );
                 }
                 return crate::prover::prove_fast_ligerito_from_witness(
                     &self.r1cs,
@@ -4185,6 +4229,112 @@ mod tests {
         assert!(
             hot_bytes == filled_bytes,
             "ranked hot-row codeword differs from replicate_message_fill"
+        );
+    }
+
+    /// **Stripe-free oracle.** The `SkipF128` prover entry (`lincheck` +
+    /// zerocheck identity-C folds read the F_{2^128}-packed witness directly,
+    /// never materializing the ~512 MiB byte-stripe) must produce a
+    /// byte-identical proof to the incumbent stripe path at the exact ranked
+    /// geometry (m = 32, k_log = 14). The ranked `use_f128_fold_lincheck`
+    /// selector is macOS/aarch64-gated, so this oracle calls the prover seam
+    /// directly on x86 to force the new path — same inputs, same challenger
+    /// seed, same expectations.
+    #[test]
+    #[ignore = "ranked-shape oracle needs ~3 GiB of working memory"]
+    fn ranked_f128_fold_matches_stripe_proof_bytes() {
+        use flock_core::challenger::FsChallenger;
+        use flock_core::merkle::HashKind;
+
+        const RANKED_N_BLOCKS_LOG: usize = 18;
+        const RANKED_N_BLOCKS: usize = 1 << RANKED_N_BLOCKS_LOG;
+        const RANKED_M: usize = K_LOG + RANKED_N_BLOCKS_LOG;
+        const RANKED_MSG_LEN: usize = 1 << (RANKED_M - flock_core::pcs::LOG_PACKING);
+
+        let mut setup = Blake3Setup::new(RANKED_N_BLOCKS);
+        setup.pcs_params.merkle_hash = HashKind::Blake3;
+        assert_eq!(setup.pcs_params.m, 32, "expected the ranked geometry");
+        assert_eq!(setup.r1cs.k_log, K_LOG);
+
+        let mut rng = Rng::new(0x0F12_8F0_0D ^ RANKED_N_BLOCKS as u64);
+        let blocks: Vec<Compression> = (0..RANKED_N_BLOCKS)
+            .map(|_| {
+                let cv = std::array::from_fn(|_| rng.next_u32());
+                let m = std::array::from_fn(|_| rng.next_u32());
+                (cv, m, rng.next_u32() as u64, 64, 11)
+            })
+            .collect();
+
+        let mut hot_codeword = flock_core::scratch::take_f128(2 * RANKED_MSG_LEN);
+        let (z, a, b, stripe) =
+            generate_witness_with_ab_packed_and_lincheck_rate2_codeword(
+                &blocks,
+                RANKED_N_BLOCKS_LOG,
+                &mut hot_codeword,
+            );
+        drop(hot_codeword);
+        assert_eq!(z.len(), RANKED_MSG_LEN);
+
+        // Control: the incumbent stripe path (CommitCodeword::Allocate).
+        let control_started = std::time::Instant::now();
+        let mut ch_a = FsChallenger::with_hash(b"flock-bench-v0", HashKind::Blake3);
+        let (proof_a, commitment_a, claim_a) = crate::prover::prove_fast_ligerito_from_witness(
+            &setup.r1cs,
+            &setup.pcs_params,
+            z.clone(),
+            a.clone(),
+            b.clone(),
+            stripe,
+            setup.lincheck_circuit(),
+            None,
+            &mut ch_a,
+        );
+
+        eprintln!(
+            "[oracle-timing] control (stripe path) total: {:.2} ms",
+            control_started.elapsed().as_secs_f64() * 1e3
+        );
+        // Treatment: stripe-free fold from F128 (CommitCodeword::NeedsReplication).
+        let treatment_started = std::time::Instant::now();
+        let mut ch_b = FsChallenger::with_hash(b"flock-bench-v0", HashKind::Blake3);
+        let mut treatment_codeword = flock_core::scratch::take_f128(2 * RANKED_MSG_LEN);
+        let (proof_b, commitment_b, claim_b) =
+            crate::prover::prove_fast_ligerito_from_witness_f128_fold(
+                &setup.r1cs,
+                &setup.pcs_params,
+                z.clone(),
+                a.clone(),
+                b.clone(),
+                setup.lincheck_circuit(),
+                treatment_codeword,
+                &mut ch_b,
+            );
+
+        let bundle_a = crate::proof_io::R1csProofBundleLigerito {
+            commitment: commitment_a,
+            proof: proof_a.clone(),
+        }
+        .to_bytes();
+        let bundle_b = crate::proof_io::R1csProofBundleLigerito {
+            commitment: commitment_b.clone(),
+            proof: proof_b.clone(),
+        }
+        .to_bytes();
+        assert_eq!(
+            bundle_a, bundle_b,
+            "stripe-free F128 fold produced different proof bytes"
+        );
+        assert_eq!(claim_a, claim_b, "claims differ between paths");
+
+        // Both must verify under their own claims.
+        let mut verifier = FsChallenger::with_hash(b"flock-bench-v0", HashKind::Blake3);
+        let verified = setup
+            .verify(&commitment_b, &proof_b, &mut verifier)
+            .expect("stripe-free proof must verify");
+        assert_eq!(verified, claim_b, "verified claim mismatch");
+        eprintln!(
+            "[oracle-timing] treatment (F128 fold) total: {:.2} ms",
+            treatment_started.elapsed().as_secs_f64() * 1e3
         );
     }
 

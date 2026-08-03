@@ -1531,6 +1531,44 @@ pub(crate) fn round1_c_prelude(
     }
 }
 
+/// CPU-only prelude for the F_{2^128}-packed C source (the stripe-free
+/// sibling of [`round1_c_prelude`]). No GPU arm: the Metal C-fold kernels
+/// read the byte-stripe layout, and the stripe-free path folds from the
+/// packed witness instead, so the fold itself is the portable
+/// [`crate::lincheck::partial_fold_packed_z_from_f128`].
+pub(crate) fn round1_c_prelude_from_f128(m: usize, k_log: usize, r: &[F128]) -> Round1CPrelude {
+    let eq_outer = crate::lincheck::build_eq_table(&r[k_log..]);
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    {
+        let _ = (m, k_log);
+        Round1CPrelude {
+            eq_outer,
+            gpu: None,
+            submitted: std::time::Instant::now(),
+        }
+    }
+    #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+    {
+        let _ = (m, k_log);
+        Round1CPrelude { eq_outer }
+    }
+}
+
+/// Fold the F_{2^128}-packed witness against `eq_outer` for the C phase,
+/// skipping the byte-stripe materialization. Bit-identical to
+/// [`round1_c_inner_fold`] on honestly padded witnesses: both are the same
+/// subset-sum-table fold over the same witness bits, differing only in the
+/// input layout (see [`crate::lincheck::partial_fold_packed_z_from_f128`]).
+fn round1_c_inner_fold_from_f128(
+    prelude: Round1CPrelude,
+    z_f128: &[F128],
+    m: usize,
+    k_log: usize,
+    useful_bits: usize,
+) -> Vec<F128> {
+    crate::lincheck::partial_fold_packed_z_from_f128(z_f128, m, k_log, useful_bits, &prelude.eq_outer)
+}
+
 /// Fold the lincheck stripe against `eq_outer`, draining the GPU prefix when
 /// one is in flight. Bit-identical to `partial_fold_packed_z_best` in every
 /// case: GF(2¹²⁸) add is XOR, so splitting the stripe range between the two
@@ -1625,6 +1663,21 @@ pub(crate) fn round1_c_fold4_from_lincheck_stripe(
     assert_eq!(c_lincheck.len(), (1usize << m) / 8);
 
     let c_inner = round1_c_inner_fold(prelude, c_lincheck, m, k_log, useful_bits);
+    round1_c_fold4_from_inner(c_inner, k_log, k_skip, r, inv_table)
+}
+
+/// Shared post-fold core of the fold4 C producer: derives the round-one
+/// message, canonical `s_hat_v_c`, and the four-bank `quad` tensor from the
+/// single outer fold. Bit-identical across the stripe and packed-witness
+/// sources because both compute the same `c_inner`.
+#[allow(clippy::too_many_arguments)]
+fn round1_c_fold4_from_inner(
+    c_inner: Vec<F128>,
+    k_log: usize,
+    k_skip: usize,
+    r: &[F128],
+    inv_table: &InvNttTableByteSingleGf8,
+) -> (Vec<F128>, Vec<F128>, Vec<F128>, Vec<F128>) {
     let inner_tail = &r[k_skip + 1..k_log];
     let fold4 = crate::pcs::ring_switch::s_hat_v_fold4_from_z_vec(&c_inner, inner_tail);
     let s_hat_v_c = crate::pcs::ring_switch::collapse_s_hat_v_fold4(&fold4, &inner_tail[..4]);
@@ -1659,6 +1712,32 @@ pub(crate) fn round1_c_fold4_from_lincheck_stripe(
     (round1_c_opt, s_hat_v_c, quad, fold4)
 }
 
+/// Stripe-free sibling of [`round1_c_fold4_from_lincheck_stripe`]: folds the
+/// F_{2^128}-packed witness directly (no byte-stripe materialization), then
+/// the shared [`round1_c_fold4_from_inner`] core. Output is bit-identical.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn round1_c_fold4_from_f128(
+    z_f128: &[F128],
+    m: usize,
+    k_log: usize,
+    k_skip: usize,
+    useful_bits: usize,
+    r: &[F128],
+    inv_table: &InvNttTableByteSingleGf8,
+    prelude: Round1CPrelude,
+) -> (Vec<F128>, Vec<F128>, Vec<F128>, Vec<F128>) {
+    assert_eq!(k_skip, K_SKIP);
+    assert!(
+        k_log >= k_skip + 5,
+        "Fold4 needs four retained tail coordinates"
+    );
+    assert_eq!(r.len(), m);
+    assert_eq!(z_f128.len(), (1usize << m) / 128);
+
+    let c_inner = round1_c_inner_fold_from_f128(prelude, z_f128, m, k_log, useful_bits);
+    round1_c_fold4_from_inner(c_inner, k_log, k_skip, r, inv_table)
+}
+
 /// Fold8 sibling of [`round1_c_fold4_from_lincheck_stripe`]: same single
 /// stripe fold, but six inner coordinates are retained (64 banks) for the
 /// direct-fold8 PCS consumer. The wire outputs (`round1_c_opt`, canonical
@@ -1685,6 +1764,19 @@ pub(crate) fn round1_c_fold8_from_lincheck_stripe(
     assert_eq!(c_lincheck.len(), (1usize << m) / 8);
 
     let c_inner = round1_c_inner_fold(prelude, c_lincheck, m, k_log, useful_bits);
+    round1_c_fold8_from_inner(c_inner, k_log, k_skip, r, inv_table)
+}
+
+/// Shared post-fold core of the fold8 C producer (the fold8 sibling of
+/// [`round1_c_fold4_from_inner`]). Bit-identical across input sources.
+#[allow(clippy::too_many_arguments)]
+fn round1_c_fold8_from_inner(
+    c_inner: Vec<F128>,
+    k_log: usize,
+    k_skip: usize,
+    r: &[F128],
+    inv_table: &InvNttTableByteSingleGf8,
+) -> (Vec<F128>, Vec<F128>, Vec<F128>, Vec<F128>) {
     let inner_tail = &r[k_skip + 1..k_log];
     let fold8 = crate::pcs::ring_switch::s_hat_v_fold8_from_z_vec(&c_inner, inner_tail);
     let s_hat_v_c = crate::pcs::ring_switch::collapse_s_hat_v_fold8(&fold8, &inner_tail[..6]);
@@ -1717,6 +1809,32 @@ pub(crate) fn round1_c_fold8_from_lincheck_stripe(
     }
     let round1_c_opt = ntt_extend_f128_vec_ghash(&res_c_s, inv_table);
     (round1_c_opt, s_hat_v_c, quad, fold8)
+}
+
+/// Stripe-free sibling of [`round1_c_fold8_from_lincheck_stripe`]: folds the
+/// F_{2^128}-packed witness directly, then the shared
+/// [`round1_c_fold8_from_inner`] core. Output is bit-identical.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn round1_c_fold8_from_f128(
+    z_f128: &[F128],
+    m: usize,
+    k_log: usize,
+    k_skip: usize,
+    useful_bits: usize,
+    r: &[F128],
+    inv_table: &InvNttTableByteSingleGf8,
+    prelude: Round1CPrelude,
+) -> (Vec<F128>, Vec<F128>, Vec<F128>, Vec<F128>) {
+    assert_eq!(k_skip, K_SKIP);
+    assert!(
+        k_log >= k_skip + 7,
+        "Fold8 needs six retained tail coordinates"
+    );
+    assert_eq!(r.len(), m);
+    assert_eq!(z_f128.len(), (1usize << m) / 128);
+
+    let c_inner = round1_c_inner_fold_from_f128(prelude, z_f128, m, k_log, useful_bits);
+    round1_c_fold8_from_inner(c_inner, k_log, k_skip, r, inv_table)
 }
 
 /// Pair-fused C job with the original 32-bank accumulator and one job per

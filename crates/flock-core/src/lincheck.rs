@@ -727,6 +727,155 @@ pub fn partial_fold_packed_z_fast_padded(
         )
 }
 
+/// Fold `ẑ(·, x_outer)` directly from the F_{2^128}-packed witness, skipping the
+/// byte-stripe transpose materialization entirely.
+///
+/// Layout: `z_f128[f_idx]` holds logical witness bits `[128·f_idx, 128·f_idx+128)`
+/// with `z_logical[i_inner + i_outer·k]`. With `k = 2^k_log`, word
+/// `f_idx = 128·w_hi + rb` (`w_hi = f_idx >> 7`, `rb = f_idx & 127`) holds rows
+/// `i_inner = 128·rb + p` (p ∈ 0..128) at column `i_outer = w_hi` — this follows
+/// from [`pack_z_lincheck_from_packed`]'s indexing: bit `p` of word `w` is
+/// logical index `128·w + p = i_inner + i_outer·k`.
+///
+/// Stripe `byte_idx` (outer indices `8·byte_idx..8·byte_idx+8`) for row-block
+/// `rb` is the 8×128 bit-transpose of the 8 words
+/// `f_idx = 128·(8·byte_idx + r) + rb`, r ∈ 0..8. This kernel reads each word
+/// exactly once (a stripe's useful words are the contiguous range
+/// `[1024·byte_idx, 1024·byte_idx + 8·(full_row_blocks + 1))`), transposes
+/// in L1, and folds with the same 256-entry subset-sum tables as
+/// [`partial_fold_packed_z_fast_padded`] — output is bit-identical.
+///
+/// DRAM ledger: the stripe fold reads the ~2^(m-3)-byte stripe buffer that a
+/// separate witgen pass materialized (transpose write + fold re-read = double
+/// touch). This kernel removes that write from the timed region: the fold read
+/// cost is the same, but now over `z_f128`, which is already in DRAM for the
+/// commit. Rows `[useful_bits, k)` are never read (zero-fold, matching the
+/// padded stripe contract).
+pub fn partial_fold_packed_z_from_f128(
+    z_f128: &[F128],
+    m: usize,
+    k_log: usize,
+    useful_bits: usize,
+    eq_outer: &[F128],
+) -> Vec<F128> {
+    let n_log = m - k_log;
+    let k = 1usize << k_log;
+    let n_outer = 1usize << n_log;
+    assert_eq!(z_f128.len(), (1usize << m) / 128);
+    assert_eq!(eq_outer.len(), n_outer);
+    assert!(n_log >= 3, "need n_outer ≥ 8 for byte stripes");
+    assert!(useful_bits <= k);
+    let n_stripes = n_outer / 8;
+    // An F128 word holds 128 bits of one column, so `words_per_column`
+    // row-blocks (of 128 rows each) fit per column, and a byte-stripe spans
+    // 8 columns × words_per_column words. Stride is `words_per_column` words.
+    let words_per_column = k / 128;
+    let full_row_blocks = useful_bits / 128;
+    let tail_rows = useful_bits % 128;
+    // A stripe's useful words live at column-stride `words_per_column`
+    // (word offset `words_per_column·r + rb` for column r, row-block rb), so
+    // the last read offset is `words_per_column·7 + rb_max`; the stripe's
+    // contiguous span up to that offset is that index + 1 words (the
+    // 8·(words_per_column − rb_max − 1) padding words past rb_max in each
+    // column are never read).
+    let rb_max = full_row_blocks + usize::from(tail_rows > 0) - 1;
+    let words_per_stripe = words_per_column * 7 + rb_max + 1;
+    let stripe_word_span = words_per_column * 8;
+
+    // Stripes own contiguous but gap-padded word ranges (`words_per_stripe`
+    // useful words; the remaining `stripe_word_span − words_per_stripe`
+    // padding words per stripe are never read), so iterate stripes by index
+    // rather than chunking the input slice. One accumulator per rayon worker;
+    // results XOR-reduced.
+    use rayon::prelude::*;
+
+    (0..n_stripes)
+        .into_par_iter()
+        .with_max_len(256)
+        .fold(
+            || vec![F128::ZERO; k],
+            |mut acc, byte_idx| {
+                let base = stripe_word_span * byte_idx;
+                let stripe_words = &z_f128[base..base + words_per_stripe];
+                let mut table = vec![F128::ZERO; 256];
+                build_sum_table(&eq_outer[8 * byte_idx..8 * byte_idx + 8], &mut table);
+                // Column-buffered reads: each column's useful words are read as
+                // one contiguous run (`words_per_column` words at column stride
+                // `words_per_column`), rather than as 8 interleaved streams that
+                // advance 16 B per row-block step. 8×128×16 B fits L1, and the
+                // per-row-block transpose then runs from the buffer.
+                let mut cols = [[0u64; 8]; 128]; // [rb][r] lo halves
+                let mut colh = [[0u64; 8]; 128]; // [rb][r] hi halves
+                let useful_rb = full_row_blocks + usize::from(tail_rows > 0);
+                for r in 0..8 {
+                    let col = &stripe_words[r * words_per_column..r * words_per_column + useful_rb];
+                    for rb in 0..useful_rb {
+                        cols[rb][r] = col[rb].lo;
+                        colh[rb][r] = col[rb].hi;
+                    }
+                }
+                let mut bytes = [0u8; 128];
+                for rb in 0..full_row_blocks {
+                    fold_f128_row_block_from_cols(&cols, &colh, rb, 128, &table, &mut bytes, &mut acc);
+                }
+                if tail_rows > 0 {
+                    fold_f128_row_block_from_cols(
+                        &cols,
+                        &colh,
+                        full_row_blocks,
+                        tail_rows,
+                        &table,
+                        &mut bytes,
+                        &mut acc,
+                    );
+                }
+                acc
+            },
+        )
+        .reduce(
+            || vec![F128::ZERO; k],
+            |mut a, b| {
+                for (x, y) in a.iter_mut().zip(b.iter()) {
+                    *x += *y;
+                }
+                a
+            },
+        )
+}
+
+/// Fold one 128-row block of a stripe directly from the packed witness,
+/// reading the 8 columns' words from the per-stripe L1 column buffer
+/// (`cols[rb][r]` = column `r`, row-block `rb`; lo/hi halves split).
+///
+/// Row-block `rb` = the 8×128 bit-transpose of the 8 words: byte `p` of the
+/// transpose holds the 8 witness bits of row `128·rb + p` across the stripe's
+/// 8 columns, exactly the stripe byte the tabled fold consumes. `rows ≤ 128`
+/// lets the caller fold a partial trailing block (padding rows are never
+/// read).
+#[inline]
+fn fold_f128_row_block_from_cols(
+    cols: &[[u64; 8]; 128],
+    colh: &[[u64; 8]; 128],
+    rb: usize,
+    rows: usize,
+    table: &[F128],
+    bytes: &mut [u8; 128],
+    acc: &mut [F128],
+) {
+    let mut lanes_lo = [0u64; 8];
+    let mut lanes_hi = [0u64; 8];
+    for r in 0..8 {
+        lanes_lo[r] = cols[rb][r];
+        lanes_hi[r] = colh[rb][r];
+    }
+    crate::bits::transpose_8_u64s_to_64_bytes(&lanes_lo, &mut bytes[0..64]);
+    crate::bits::transpose_8_u64s_to_64_bytes(&lanes_hi, &mut bytes[64..128]);
+    let row_base = 128 * rb;
+    for p in 0..rows {
+        acc[row_base + p] += table[bytes[p] as usize];
+    }
+}
+
 /// Stripes swept per accumulator touch in the NEON tiled partial fold.
 /// Larger ⇒ the length-`k` accumulator is re-streamed fewer times
 /// (`n_stripes / NEON_TILE_T`), but the per-tile sum tables grow
@@ -1323,6 +1472,7 @@ pub fn prove_padded<Ch: Challenger>(
         circuit,
         x_ab,
         false,
+        ZLayout::Stripes,
         challenger,
     );
     (proof, claim)
@@ -1356,6 +1506,7 @@ pub fn prove_padded_capture_z_vec<Ch: Challenger>(
         circuit,
         x_ab,
         true,
+        ZLayout::Stripes,
         challenger,
     );
     (
@@ -1363,6 +1514,58 @@ pub fn prove_padded_capture_z_vec<Ch: Challenger>(
         claim,
         captured.expect("capture=true must produce z_vec"),
     )
+}
+
+/// Variant of [`prove_padded_capture_z_vec`] whose z input is the
+/// F_{2^128}-packed witness instead of the byte-stripe layout: folds directly
+/// from it via [`partial_fold_packed_z_from_f128`], so the caller can skip the
+/// ~2^(m-3)-byte stripe transpose entirely. Proof is bit-identical to the
+/// stripe-input variant on honestly padded witnesses.
+pub fn prove_padded_capture_z_vec_from_f128<Ch: Challenger>(
+    z_f128: &[F128],
+    m: usize,
+    k_log: usize,
+    k_skip: usize,
+    useful_bits: usize,
+    circuit: &dyn LincheckCircuit,
+    x_ab: &QuirkyPoint,
+    challenger: &mut Ch,
+) -> (LincheckProof, LincheckClaim, Vec<F128>) {
+    // SAFETY: F128 is `Copy`, repr(C) with no padding, align 16 — its byte
+    // image is exactly `len * 16` bytes, reinterpreted back inside the fold.
+    let z_bytes: &[u8] = unsafe {
+        std::slice::from_raw_parts(
+            z_f128.as_ptr() as *const u8,
+            z_f128.len() * std::mem::size_of::<F128>(),
+        )
+    };
+    let (proof, claim, captured) = prove_padded_inner(
+        z_bytes,
+        m,
+        k_log,
+        k_skip,
+        useful_bits,
+        circuit,
+        x_ab,
+        true,
+        ZLayout::F128Packed,
+        challenger,
+    );
+    (
+        proof,
+        claim,
+        captured.expect("capture=true must produce z_vec"),
+    )
+}
+
+/// Which packed representation the lincheck z-input is in. The byte-stripe
+/// layout is the historical input; `F128Packed` lets the fold run directly on
+/// the F_{2^128}-packed witness (see [`partial_fold_packed_z_from_f128`]),
+/// skipping the stripe materialization on the timed path.
+#[derive(Clone, Copy)]
+enum ZLayout {
+    Stripes,
+    F128Packed,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1375,6 +1578,7 @@ fn prove_padded_inner<Ch: Challenger>(
     circuit: &dyn LincheckCircuit,
     x_ab: &QuirkyPoint,
     capture_z_vec: bool,
+    z_layout: ZLayout,
     challenger: &mut Ch,
 ) -> (LincheckProof, LincheckClaim, Option<Vec<F128>>) {
     let k = 1usize << k_log;
@@ -1445,8 +1649,23 @@ fn prove_padded_inner<Ch: Challenger>(
             None
         };
         let eq_x_outer = build_eq_table(&x_ab.x_outer);
-        let z_vec =
-            partial_fold_packed_z_best_gpu_split(z_packed, m, k_log, useful_bits, &eq_x_outer);
+        let z_vec = match z_layout {
+            ZLayout::Stripes => {
+                partial_fold_packed_z_best_gpu_split(z_packed, m, k_log, useful_bits, &eq_x_outer)
+            }
+            ZLayout::F128Packed => {
+                // SAFETY: the F128Packed entry points guarantee z_packed is the
+                // byte image of `len/16` F128 words; F128 is `Copy`, repr(C),
+                // align(16), no padding.
+                let f128: &[F128] = unsafe {
+                    std::slice::from_raw_parts(
+                        z_packed.as_ptr() as *const F128,
+                        z_packed.len() / std::mem::size_of::<F128>(),
+                    )
+                };
+                partial_fold_packed_z_from_f128(f128, m, k_log, useful_bits, &eq_x_outer)
+            }
+        };
         if let Some(t) = t {
             eprintln!(
                 "[lc] {:<26} {:>7.2} ms",
@@ -2400,4 +2619,198 @@ mod tests {
             Err(VerifyError::KSkipExceedsKLog { .. })
         ));
     }
+    /// The stripe-free fold must equal the reference tabled fold bit-for-bit
+    /// across the exact ranked geometry shape (m=32, k_log=14, useful=15409),
+    /// plus a geometry sweep covering dense tails, exact block boundaries,
+    /// and single-block cases. Builds the F128-packed witness from a random
+    /// stripe (inverse of `pack_z_lincheck_from_packed`'s indexing), so both
+    /// kernels see identical bits.
+    #[test]
+    fn f128_fold_matches_stripe_fold() {
+        use crate::field::F128;
+        let mut state = 0xDEAD_BEEF_CAFE_F00Du64;
+        let mut next = || {
+            state = state.wrapping_add(0x9E3779B97F4A7C15);
+            let mut z = state;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D049BB133111EB);
+            z ^ (z >> 31)
+        };
+
+        // (m, k_log, useful_bits) sweep: ranked shape, dense, boundary, tiny.
+        let cases: &[(usize, usize, usize)] = &[
+            (32, 14, 15_409), // exact ranked geometry
+            (32, 14, 1 << 14), // dense (useful = k)
+            (32, 14, 128 * 120 + 49), // mid-block boundary (49-row tail)
+            (32, 14, 128), // single full block
+            (32, 14, 64), // partial single block
+            (20, 14, 15_409), // small outer dim, same block structure
+            (18, 11, 1 << 11), // dense small
+            (26, 8, 197), // odd tail
+        ];
+        for &(m, k_log, useful_bits) in cases {
+            let k = 1usize << k_log;
+            let n_total = 1usize << m;
+            let n_outer = n_total / k;
+            assert!(n_outer >= 8 && n_outer % 8 == 0);
+            let n_stripes = n_outer / 8;
+            let stripe_bytes = (n_total / 8) as usize;
+            let mut stripe: Vec<u8> = (0..stripe_bytes).map(|_| next() as u8).collect();
+            // Build the F128 witness from the stripe: word w's bit p is
+            // logical 128w+p = i_inner + i_outer*k, and the stripe byte for
+            // row i_inner at byte_idx holds bits i_outer = 8*byte_idx + r.
+            let n_words = (n_total / 128) as usize;
+            let mut z_f128: Vec<F128> = vec![F128::ZERO; n_words];
+            for w in 0..n_words {
+                let logical_base = 128 * w;
+                let i_inner = logical_base % k;
+                let i_outer = logical_base / k;
+                debug_assert_eq!(i_inner, 128 * (w & (k / 128 - 1)));
+                let byte_idx = i_outer / 8;
+                let r = i_outer % 8;
+                let mut lo = 0u64;
+                let mut hi = 0u64;
+                for p in 0..128 {
+                    let bit = (stripe[byte_idx * k + i_inner + p] >> r) & 1;
+                    if bit == 1 {
+                        if p < 64 {
+                            lo |= 1u64 << p;
+                        } else {
+                            hi |= 1u64 << (p - 64);
+                        }
+                    }
+                }
+                z_f128[w] = F128 { lo, hi };
+            }
+            let eq_outer: Vec<F128> = (0..n_outer)
+                .map(|_| F128 { lo: next(), hi: next() })
+                .collect();
+            let reference = partial_fold_packed_z_fast_padded(
+                &stripe,
+                m,
+                k_log,
+                useful_bits,
+                &eq_outer,
+            );
+            let f128_fold = partial_fold_packed_z_from_f128(
+                &z_f128,
+                m,
+                k_log,
+                useful_bits,
+                &eq_outer,
+            );
+            assert_eq!(
+                reference, f128_fold,
+                "m={m} k_log={k_log} useful_bits={useful_bits}"
+            );
+        }
+    }
+
+    /// Local kernel bench: stripe fold vs F128 fold at the exact ranked
+    /// geometry (m=32, k_log=14, useful=15409). Not a target prediction —
+    /// the board is the instrument — but an honest same-host measurement of
+    /// the kernel delta the note can cite alongside the byte ledger.
+    #[test]
+    #[ignore = "ranked-shape bench: ~1.2 GiB working set"]
+    fn f128_fold_vs_stripe_fold_ranked_shape() {
+        use crate::field::F128;
+        use std::time::Instant;
+        const M: usize = 32;
+        const K_LOG: usize = 14;
+        const USEFUL: usize = 15_409;
+        let k = 1usize << K_LOG;
+        let n_outer = 1usize << (M - K_LOG);
+        let stripe_bytes = 1usize << (M - 3);
+        let n_words = (1usize << M) / 128;
+
+        let mut state = 0x9E3779B97F4A7C15u64;
+        let mut next = || {
+            state = state.wrapping_add(0x9E3779B97F4A7C15);
+            let mut z = state;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D049BB133111EB);
+            z ^ (z >> 31)
+        };
+        let mut stripe: Vec<u8> = (0..stripe_bytes).map(|_| next() as u8).collect();
+        // Derive the packed witness from the stripe (inverse of the packed →
+        // stripe transpose) so both kernels fold the same logical data.
+        let mut z_f128: Vec<F128> = vec![F128::ZERO; n_words];
+        for w in 0..n_words {
+            let logical_base = 128 * w;
+            let i_inner = logical_base % k;
+            let i_outer = logical_base / k;
+            let byte_idx = i_outer / 8;
+            let r = i_outer % 8;
+            let mut lo = 0u64;
+            let mut hi = 0u64;
+            for p in 0..128 {
+                if (stripe[byte_idx * k + i_inner + p] >> r) & 1 == 1 {
+                    if p < 64 {
+                        lo |= 1u64 << p;
+                    } else {
+                        hi |= 1u64 << (p - 64);
+                    }
+                }
+            }
+            z_f128[w] = F128 { lo, hi };
+        }
+        let eq_outer: Vec<F128> = (0..n_outer)
+            .map(|_| F128 { lo: next(), hi: next() })
+            .collect();
+
+        // Stripe-fill timing: the transpose work the F128 fold replaces
+        // (same transpose kernel, same call count, minus the 512 MiB write).
+        let mut t_fill = Vec::new();
+        let mut t_ref = Vec::new();
+        let mut t_f128 = Vec::new();
+        for rep in 0..4 {
+            let mut scratch = vec![0u8; stripe_bytes];
+            let tf = Instant::now();
+            for byte_idx in 0..(n_outer / 8) {
+                let base = 1024 * byte_idx;
+                let mut table_scratch = [0u8; 128];
+                for rb in 0..=120 {
+                    let mut lanes_lo = [0u64; 8];
+                    let mut lanes_hi = [0u64; 8];
+                    for r in 0..8 {
+                        let w = z_f128[base + 128 * r + rb];
+                        lanes_lo[r] = w.lo;
+                        lanes_hi[r] = w.hi;
+                    }
+                    crate::bits::transpose_8_u64s_to_64_bytes(&lanes_lo, &mut table_scratch[0..64]);
+                    crate::bits::transpose_8_u64s_to_64_bytes(&lanes_hi, &mut table_scratch[64..128]);
+                    let dst = 16384 * byte_idx + 128 * rb;
+                    scratch[dst..dst + 128].copy_from_slice(&table_scratch);
+                }
+            }
+            let e_fill = tf.elapsed().as_secs_f64() * 1e3;
+            let t0 = Instant::now();
+            let r0 = partial_fold_packed_z_fast_padded(&stripe, M, K_LOG, USEFUL, &eq_outer);
+            let e0 = t0.elapsed().as_secs_f64() * 1e3;
+            let t1 = Instant::now();
+            let r1 = partial_fold_packed_z_from_f128(&z_f128, M, K_LOG, USEFUL, &eq_outer);
+            let e1 = t1.elapsed().as_secs_f64() * 1e3;
+            assert_eq!(r0, r1, "rep {rep}: bit-exactness broken");
+            if rep > 0 {
+                t_fill.push(e_fill);
+                t_ref.push(e0);
+                t_f128.push(e1);
+            }
+            eprintln!(
+                "[bench] rep {rep}: fill={e_fill:.2} ms  stripe_fold={e0:.2} ms  f128_fold={e1:.2} ms"
+            );
+        }
+        let m_fill = t_fill.iter().sum::<f64>() / t_fill.len() as f64;
+        let m_ref = t_ref.iter().sum::<f64>() / t_ref.len() as f64;
+        let m_f128 = t_f128.iter().sum::<f64>() / t_f128.len() as f64;
+        let stripe_total = m_fill + m_ref;
+        eprintln!(
+            "[bench] ranked shape: fill={m_fill:.2} ms  stripe_fold={m_ref:.2} ms  f128_fold={m_f128:.2} ms"
+        );
+        eprintln!(
+            "[bench] stripe-path total (fill+fold)={stripe_total:.2} ms vs f128_fold={m_f128:.2} ms  delta={:.2}%",
+            (m_f128 - stripe_total) / stripe_total * 100.0
+        );
+    }
+
 }

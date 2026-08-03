@@ -34,7 +34,7 @@ use flock_core::r1cs::BlockR1cs;
 use flock_core::zerocheck;
 #[inline]
 fn ranked_direct_ab_precompute_enabled(r1cs: &BlockR1cs) -> bool {
-    cfg!(all(target_os = "macos", target_arch = "aarch64"))
+    (cfg!(all(target_os = "macos", target_arch = "aarch64")) || cfg!(test))
         && r1cs.m == 32
         && r1cs.k_log >= pcs::LOG_PACKING + 2
         && std::env::var_os("FLOCK_NO_OPEN_DIRECT_AB").is_none()
@@ -394,6 +394,62 @@ pub(crate) fn prove_fast_ligerito_from_streamed_first_pass<Ch: Challenger>(
 /// gate is deliberately kept in the BLAKE3 witness driver, where omission of
 /// the eager stripe is decided.
 #[allow(clippy::too_many_arguments)]
+/// Stripe-free ranked path (see `LincheckStripeInput::SkipF128`): the
+/// lincheck and identity-C folds read the F_{2^128}-packed witness directly,
+/// so the ~2^(m-3)-byte byte-stripe is never written or read. Proof bytes are
+/// identical to the eager/deferred paths.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn prove_fast_ligerito_from_streamed_first_pass_f128_fold<Ch: Challenger>(
+    r1cs: &BlockR1cs,
+    pcs_params: &PcsParams,
+    z_packed: Vec<F128>,
+    a_packed_f128: Vec<F128>,
+    b_packed_f128: Vec<F128>,
+    lincheck_circuit: &dyn lincheck::LincheckCircuit,
+    codeword: Vec<F128>,
+    stream: flock_core::gpu_commit::FromZFirstPassStream,
+    challenger: &mut Ch,
+) -> (R1csProofLigerito, Commitment, R1csClaim) {
+    prove_fast_ligerito_from_witness_with_commit_codeword(
+        r1cs,
+        pcs_params,
+        z_packed,
+        a_packed_f128,
+        b_packed_f128,
+        LincheckStripeInput::SkipF128,
+        lincheck_circuit,
+        CommitCodeword::StreamedFirstPass(codeword, stream),
+        challenger,
+    )
+}
+
+/// Non-streamed sibling of
+/// [`prove_fast_ligerito_from_streamed_first_pass_f128_fold`] (GPU-latch-off
+/// fallback): same stripe-free path with the codeword handed in by value.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn prove_fast_ligerito_from_witness_f128_fold<Ch: Challenger>(
+    r1cs: &BlockR1cs,
+    pcs_params: &PcsParams,
+    z_packed: Vec<F128>,
+    a_packed_f128: Vec<F128>,
+    b_packed_f128: Vec<F128>,
+    lincheck_circuit: &dyn lincheck::LincheckCircuit,
+    codeword: Vec<F128>,
+    challenger: &mut Ch,
+) -> (R1csProofLigerito, Commitment, R1csClaim) {
+    prove_fast_ligerito_from_witness_with_commit_codeword(
+        r1cs,
+        pcs_params,
+        z_packed,
+        a_packed_f128,
+        b_packed_f128,
+        LincheckStripeInput::SkipF128,
+        lincheck_circuit,
+        CommitCodeword::NeedsReplication(codeword),
+        challenger,
+    )
+}
+
 pub(crate) fn prove_fast_ligerito_from_streamed_first_pass_deferred_stripe<Ch: Challenger>(
     r1cs: &BlockR1cs,
     pcs_params: &PcsParams,
@@ -538,6 +594,11 @@ enum CommitCodeword {
 enum LincheckStripeInput {
     Ready(Vec<u8>),
     DeferredRanked,
+    /// Stripe-free ranked path: the lincheck fold (and the identity-C fold)
+    /// read the F_{2^128}-packed witness directly via
+    /// `partial_fold_packed_z_from_f128`, so the ~2^(m-3)-byte stripe is never
+    /// written. Proof bytes are identical to the stripe paths.
+    SkipF128,
 }
 
 const DEFERRED_STRIPE_GROUPS_PER_JOB: usize = 64;
@@ -864,13 +925,15 @@ fn prove_fast_core_with_commit_codeword<Ch: Challenger>(
     z_packed: Vec<F128>,
     a_packed_f128: Vec<F128>,
     b_packed_f128: Vec<F128>,
-    z_packed_lincheck: LincheckStripeInput,
+    z_packed_lincheck_input: LincheckStripeInput,
     lincheck_circuit: &dyn lincheck::LincheckCircuit,
     commit_codeword: CommitCodeword,
     challenger: &mut Ch,
 ) -> ProveCore {
     let padding = r1cs.padding_spec();
     let phase_timing = std::env::var_os("FLOCK_PHASE_TIMING").is_some();
+    // Capture before the match below moves the enum (Ready owns a Vec).
+    let f128_fold = matches!(&z_packed_lincheck_input, LincheckStripeInput::SkipF128);
     let run_commit = || {
         let cpu0 = phase_timing.then(process_cpu_ms);
         let t_commit = std::time::Instant::now();
@@ -898,8 +961,14 @@ fn prove_fast_core_with_commit_codeword<Ch: Challenger>(
     // Deferred fill is shorter than commit+AB at the target shape, so moving
     // this join earlier adds no measured tail while eliminating C's 32-bank
     // row-major drain.
-    let (pre_zerocheck, z_packed_lincheck) = match z_packed_lincheck {
+    let (pre_zerocheck, z_packed_lincheck) = match z_packed_lincheck_input {
         LincheckStripeInput::Ready(stripe) => (run_commit(), stripe),
+        LincheckStripeInput::SkipF128 => {
+            // No stripe to materialize and no join: the C fold and the
+            // lincheck fold both read z_packed directly. run_commit() alone.
+            let pre = run_commit();
+            (pre, Vec::new())
+        }
         LincheckStripeInput::DeferredRanked => {
             assert_eq!(r1cs.m, 32);
             assert_eq!(r1cs.k_log, 14);
@@ -1017,16 +1086,29 @@ fn prove_fast_core_with_commit_codeword<Ch: Challenger>(
             )
         };
         if ranked_lincheck_c_reuse_enabled(r1cs) {
-            zerocheck::prove_packed_padded_capture_s_hat_v_c_with_precomputed_ab_and_lincheck_c(
-                a_packed,
-                b_packed,
-                c_packed,
-                &z_packed_lincheck,
-                r1cs.m,
-                &padding,
-                ab_inner,
-                challenger,
-            )
+            if f128_fold {
+                zerocheck::prove_packed_padded_capture_s_hat_v_c_with_precomputed_ab_and_f128_c(
+                    a_packed,
+                    b_packed,
+                    c_packed,
+                    &z_packed,
+                    r1cs.m,
+                    &padding,
+                    ab_inner,
+                    challenger,
+                )
+            } else {
+                zerocheck::prove_packed_padded_capture_s_hat_v_c_with_precomputed_ab_and_lincheck_c(
+                    a_packed,
+                    b_packed,
+                    c_packed,
+                    &z_packed_lincheck,
+                    r1cs.m,
+                    &padding,
+                    ab_inner,
+                    challenger,
+                )
+            }
         } else {
             zerocheck::prove_packed_padded_capture_s_hat_v_c_with_precomputed_ab(
                 a_packed, b_packed, c_packed, r1cs.m, &padding, ab_inner, challenger,
@@ -1052,21 +1134,38 @@ fn prove_fast_core_with_commit_codeword<Ch: Challenger>(
     let x_ab = r1cs.x_ab_from_mlv(zc_claim.z, &zc_claim.mlv_challenges);
 
     // Capture lincheck's pre-sumcheck z_vec so the PCS open can derive the
-    // AB-claim's `s_hat_v` from it (skips fold_1b_rows for AB).
-    let (lc_proof, lc_claim, z_vec_pre) = lincheck::prove_padded_capture_z_vec(
-        &z_packed_lincheck,
-        r1cs.m,
-        r1cs.k_log,
-        r1cs.k_skip,
-        r1cs.useful_bits,
-        lincheck_circuit,
-        &x_ab,
-        challenger,
-    );
+    // AB-claim's `s_hat_v` from it (skips fold_1b_rows for AB). The
+    // stripe-free ranked path folds the F_{2^128}-packed witness directly.
+    let (lc_proof, lc_claim, z_vec_pre) = if f128_fold {
+            lincheck::prove_padded_capture_z_vec_from_f128(
+                &z_packed,
+                r1cs.m,
+                r1cs.k_log,
+                r1cs.k_skip,
+                r1cs.useful_bits,
+                lincheck_circuit,
+                &x_ab,
+                challenger,
+            )
+        } else {
+            lincheck::prove_padded_capture_z_vec(
+                &z_packed_lincheck,
+                r1cs.m,
+                r1cs.k_log,
+                r1cs.k_skip,
+                r1cs.useful_bits,
+                lincheck_circuit,
+                &x_ab,
+                challenger,
+            )
+        };
     // The lincheck stripe copy of z is dead from here on; return it to the
     // scratch byte pool before the PCS open (2^(m-3) bytes — 512 MB at
-    // m = 32) so the next prove reuses its resident pages.
-    flock_core::scratch::give_u8(z_packed_lincheck);
+    // m = 32) so the next prove reuses its resident pages. The stripe-free
+    // path never took a buffer, so nothing to return.
+    if !f128_fold {
+        flock_core::scratch::give_u8(z_packed_lincheck);
+    }
 
     let ab = ZClaim {
         point: r1cs.ab_claim_point(lc_claim.r_inner_skip, &lc_claim.r_inner_rest, &x_ab.x_outer),

@@ -208,7 +208,7 @@ pub fn prove_packed_padded<C: Challenger>(
     challenger: &mut C,
 ) -> (ZerocheckProof, ZerocheckClaim) {
     let (proof, claim, _) = prove_packed_padded_inner(
-        a_packed, b_packed, c_packed, m, padding, false, None, None, challenger,
+        a_packed, b_packed, c_packed, m, padding, false, None, CSource::None, challenger,
     );
     (proof, claim)
 }
@@ -229,7 +229,7 @@ pub fn prove_packed_padded_capture_s_hat_v_c<C: Challenger>(
     challenger: &mut C,
 ) -> (ZerocheckProof, ZerocheckClaim, CapturedSHatVC) {
     let (proof, claim, captured) = prove_packed_padded_inner(
-        a_packed, b_packed, c_packed, m, padding, true, None, None, challenger,
+        a_packed, b_packed, c_packed, m, padding, true, None, CSource::None, challenger,
     );
     (
         proof,
@@ -279,7 +279,7 @@ pub fn prove_packed_padded_capture_s_hat_v_c_with_precomputed_ab<C: Challenger>(
         padding,
         true,
         Some(ab_inner),
-        None,
+        CSource::None,
         challenger,
     );
     (
@@ -314,7 +314,7 @@ pub fn prove_packed_padded_capture_s_hat_v_c_with_precomputed_ab_and_lincheck_c<
         padding,
         true,
         Some(ab_inner),
-        Some(c_lincheck),
+        CSource::Stripe(c_lincheck),
         challenger,
     );
     (
@@ -322,6 +322,57 @@ pub fn prove_packed_padded_capture_s_hat_v_c_with_precomputed_ab_and_lincheck_c<
         claim,
         captured.expect("capture=true must produce s_hat_v_c"),
     )
+}
+
+/// Stripe-free sibling of
+/// [`prove_packed_padded_capture_s_hat_v_c_with_precomputed_ab_and_lincheck_c`]:
+/// folds identity C directly from the F_{2^128}-packed witness, so the caller
+/// can skip the ~2^(m-3)-byte lincheck stripe materialization. Proof and
+/// transcript are byte-identical to the stripe variant on honestly padded
+/// witnesses (the fold arithmetic is the same subset-sum construction, the
+/// input layout differs only).
+#[allow(clippy::too_many_arguments)]
+pub fn prove_packed_padded_capture_s_hat_v_c_with_precomputed_ab_and_f128_c<C: Challenger>(
+    a_packed: &[u8],
+    b_packed: &[u8],
+    c_packed: &[u8],
+    z_f128: &[F128],
+    m: usize,
+    padding: &PaddingSpec,
+    ab_inner: univariate_skip_optimized::Round1AbInner,
+    challenger: &mut C,
+) -> (ZerocheckProof, ZerocheckClaim, CapturedSHatVC) {
+    if std::env::var_os("FLOCK_ZC_TRACE").is_some() {
+        eprintln!("[zc-trace] C folded from F128-packed witness");
+    }
+    let (proof, claim, captured) = prove_packed_padded_inner(
+        a_packed,
+        b_packed,
+        c_packed,
+        m,
+        padding,
+        true,
+        Some(ab_inner),
+        CSource::F128Packed(z_f128),
+        challenger,
+    );
+    (
+        proof,
+        claim,
+        captured.expect("capture=true must produce s_hat_v_c"),
+    )
+}
+
+/// Which representation the identity-C fold reads. `Stripe` is the
+/// materialized lincheck byte stripe (GPU-arm capable); `F128Packed` folds the
+/// F_{2^128}-packed witness directly via
+/// [`crate::lincheck::partial_fold_packed_z_from_f128`], skipping the stripe
+/// write on the timed path. Outputs are bit-identical.
+#[derive(Clone, Copy)]
+pub(crate) enum CSource<'a> {
+    None,
+    Stripe(&'a [u8]),
+    F128Packed(&'a [F128]),
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -333,7 +384,7 @@ fn prove_packed_padded_inner<C: Challenger>(
     padding: &PaddingSpec,
     capture_s_hat_v_c: bool,
     precomputed_ab: Option<univariate_skip_optimized::Round1AbInner>,
-    c_lincheck: Option<&[u8]>,
+    c_source: CSource<'_>,
     challenger: &mut C,
 ) -> (ZerocheckProof, ZerocheckClaim, Option<CapturedSHatVC>) {
     let k_skip = K_SKIP;
@@ -389,7 +440,7 @@ fn prove_packed_padded_inner<C: Challenger>(
             capture_s_hat_v_c,
             "precomputed AB path currently requires s_hat_v capture"
         );
-        if let Some(c_lincheck) = c_lincheck {
+        if let CSource::Stripe(c_lincheck) = c_source {
             assert!(m == 32 || cfg!(test), "lincheck C reuse is ranked-only");
             assert_eq!(padding.k_log, 14, "lincheck C reuse fixes k_log=14");
             assert!(
@@ -476,6 +527,83 @@ fn prove_packed_padded_inner<C: Challenger>(
                         crate::pcs::commit::commit_cpu_ms() - cpu_c,
                     );
                 }
+                (
+                    ab,
+                    c,
+                    Some(CapturedSHatVC {
+                        s_hat_v_c,
+                        quad,
+                        fold4: Some(fold4),
+                        fold8: None,
+                    }),
+                )
+            }
+        } else if let CSource::F128Packed(z_f128) = c_source {
+            assert!(m == 32 || cfg!(test), "F128 C reuse is ranked-only");
+            assert_eq!(padding.k_log, 14, "F128 C reuse fixes k_log=14");
+            assert!(
+                crate::pcs::ranked_direct_fold4_enabled() || cfg!(test),
+                "F128 C reuse requires ranked DirectFold4"
+            );
+            // Stripe-free C fold: no GPU arm (the Metal C kernels read the
+            // byte-stripe layout); the fold runs entirely on CPU from the
+            // packed witness. The prelude carries no GPU job.
+            let c_prelude =
+                crate::zerocheck::univariate_skip_optimized::round1_c_prelude_from_f128(
+                    m,
+                    padding.k_log,
+                    &r,
+                );
+            let cpu_ab = crate::pcs::commit::commit_cpu_ms();
+            let t_ab = std::time::Instant::now();
+            let ab = crate::zerocheck::univariate_skip_optimized::round1_shift_reduce_ab_packed_padded_with_precomputed(
+                ab_inner,
+                m,
+                k_skip,
+                &r,
+                padding,
+            );
+            if zc_timing {
+                eprintln!(
+                    "[zc-timing] round1 AB completion: {:.2} ms cpu={:.1}",
+                    t_ab.elapsed().as_secs_f64() * 1e3,
+                    crate::pcs::commit::commit_cpu_ms() - cpu_ab,
+                );
+            }
+            if crate::pcs::ranked_direct_fold8_enabled() {
+                let (c, s_hat_v_c, quad, fold8) =
+                    crate::zerocheck::univariate_skip_optimized::round1_c_fold8_from_f128(
+                        z_f128,
+                        m,
+                        padding.k_log,
+                        k_skip,
+                        padding.useful_bits_per_block,
+                        &r,
+                        inv_table,
+                        c_prelude,
+                    );
+                (
+                    ab,
+                    c,
+                    Some(CapturedSHatVC {
+                        s_hat_v_c,
+                        quad,
+                        fold4: None,
+                        fold8: Some(fold8),
+                    }),
+                )
+            } else {
+                let (c, s_hat_v_c, quad, fold4) =
+                    crate::zerocheck::univariate_skip_optimized::round1_c_fold4_from_f128(
+                        z_f128,
+                        m,
+                        padding.k_log,
+                        k_skip,
+                        padding.useful_bits_per_block,
+                        &r,
+                        inv_table,
+                        c_prelude,
+                    );
                 (
                     ab,
                     c,
@@ -1161,7 +1289,7 @@ mod tests {
             &padding,
             true,
             Some(old_ab),
-            None,
+            CSource::None,
             &mut old_ch,
         );
 
@@ -1185,7 +1313,7 @@ mod tests {
             &padding,
             true,
             Some(new_ab),
-            Some(&c_lincheck),
+            CSource::Stripe(&c_lincheck),
             &mut new_ch,
         );
 
@@ -1249,7 +1377,7 @@ mod tests {
             );
             let mut old_ch = FsChallenger::new(b"flock-c-stripe-gpu-v0");
             let (old_proof, old_claim, old_capture) = prove_packed_padded_inner(
-                &a_p, &b_p, &c_p, M, &padding, true, Some(old_ab), None, &mut old_ch,
+                &a_p, &b_p, &c_p, M, &padding, true, Some(old_ab), CSource::None, &mut old_ch,
             );
 
             let c_words: Vec<F128> = c_p
@@ -1273,7 +1401,7 @@ mod tests {
                 &padding,
                 true,
                 Some(new_ab),
-                Some(&c_lincheck),
+                CSource::Stripe(&c_lincheck),
                 &mut new_ch,
             );
             assert!(
