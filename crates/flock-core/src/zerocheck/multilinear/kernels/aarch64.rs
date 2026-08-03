@@ -660,11 +660,22 @@ unsafe fn r2_pair_fold_and_store(
 /// | 4..8 | `r1*W0`, `r1*W3`, `r1*W4`, `r1*W5` |
 ///
 /// With `FULL = false` slots 0/1 stay zero: the round-two GPU arm owns this
-/// chunk's summed products, so the even pair's two products are skipped and
-/// only the lookahead state is produced.
+/// chunk's even-parity products, so the even pair's two products are skipped.
+///
+/// With `ODD_ON_GPU = true` slots 2/3 stay zero as well. The GPU arm computes
+/// both parities anyway — it used to XOR them together in the last step of its
+/// threadgroup reduction and hand back only the sum, which forced the CPU to
+/// recompute the odd half for the lookahead's `W1`/`W2`. Keeping that split
+/// costs the GPU nothing, and lets this kernel drop two more of its eight
+/// products: **32 PMULL per group instead of 38** on every offloaded chunk.
+/// The four `mul_q` row weightings survive because `W0`/`W3`/`W4`/`W5` still
+/// need all four scaled rows.
 #[cfg(target_arch = "aarch64")]
 #[target_feature(enable = "aes")]
-pub(crate) unsafe fn fold_round2_compact_chunk_neon_lookahead_8<const FULL: bool>(
+pub(crate) unsafe fn fold_round2_compact_chunk_neon_lookahead_8<
+    const FULL: bool,
+    const ODD_ON_GPU: bool,
+>(
     table_data: *const u8,
     a_packed: *const u8,
     b_packed: *const u8,
@@ -741,7 +752,9 @@ pub(crate) unsafe fn fold_round2_compact_chunk_neon_lookahead_8<const FULL: bool
                 if FULL {
                     wide_xor(&mut p1_even, mul_unreduced_q(w, a1));
                 }
-                wide_xor(&mut p1_odd, mul_unreduced_q(w, a3));
+                if !ODD_ON_GPU {
+                    wide_xor(&mut p1_odd, mul_unreduced_q(w, a3));
+                }
                 wide_xor(&mut w0, mul_unreduced_q(w, a2));
                 continue;
             }
@@ -765,12 +778,14 @@ pub(crate) unsafe fn fold_round2_compact_chunk_neon_lookahead_8<const FULL: bool
                 }
             }
             if !pad1 {
-                wide_xor(&mut p1_odd, mul_unreduced_q(a3w, b3));
-                if !deg1 {
-                    wide_xor(
-                        &mut pinf_odd,
-                        mul_unreduced_q(veorq_u64(a2w, a3w), veorq_u64(b2, b3)),
-                    );
+                if !ODD_ON_GPU {
+                    wide_xor(&mut p1_odd, mul_unreduced_q(a3w, b3));
+                    if !deg1 {
+                        wide_xor(
+                            &mut pinf_odd,
+                            mul_unreduced_q(veorq_u64(a2w, a3w), veorq_u64(b2, b3)),
+                        );
+                    }
                 }
                 wide_xor(&mut w0, mul_unreduced_q(a2w, b2));
             }

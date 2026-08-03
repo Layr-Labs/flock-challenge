@@ -86,6 +86,20 @@ fn r2_degen_enabled() -> bool {
     std::env::var_os("FLOCK_NO_R2_DEGEN").is_none_or(|v| v != *"1")
 }
 
+/// Kill switch for adopting the round-two GPU arm's odd-parity products as the
+/// round-three lookahead's `W1`/`W2`: `FLOCK_NO_ZC_R2_ODD_OFFLOAD=1` makes the
+/// CPU recompute the odd pair on offloaded chunks, which is the incumbent
+/// division of labour. Output is bit-identical either way — the GPU's
+/// odd-parity half is the same sum the CPU would form, and the calibration
+/// oracle verifies that on the target before the arm is ever admitted.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn zc_r2_odd_offload_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        std::env::var_os("FLOCK_NO_ZC_R2_ODD_OFFLOAD").is_none_or(|v| v != *"1")
+    });
+    *ON
+}
+
 fn round2_pair_skip(padding: &PaddingSpec, k_skip: usize) -> (usize, usize) {
     if padding.k_log <= k_skip + 1 {
         return (0, usize::MAX);
@@ -749,13 +763,20 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_with_deltas(
         let res = crate::gpu_commit::zc_r2_wait(
             job,
             if calib { Some(partials.as_slice()) } else { None },
+            // This sweep has no lookahead state, so there is no parity split
+            // to cross-check; the summed oracle is the whole contract here.
+            None,
             cpu_wall_ms,
             hi_size,
         );
         match res {
             crate::gpu_commit::ZcR2Result::Calibrated => {}
             crate::gpu_commit::ZcR2Result::Prefix(vals) => {
-                partials[..prefix].copy_from_slice(&vals);
+                // XOR the parities back together: this sweep only ever wanted
+                // the summed pair the arm used to return.
+                for (x_hi, v) in vals.iter().enumerate() {
+                    partials[x_hi] = (v[0] + v[2], v[1] + v[3]);
+                }
             }
             crate::gpu_commit::ZcR2Result::Failed => {
                 // Redo exactly the skipped prefix products — slower, still
@@ -1356,6 +1377,14 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead(
     );
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     let gpu_prefix = gpu_job.as_ref().map_or(0, |j| j.cpu_split());
+    // The GPU arm now returns its round-two products parity-split, so on an
+    // offloaded chunk the CPU can skip the odd-parity pair as well as the even
+    // one instead of recomputing the odd half for `W1`/`W2`. The kill switch
+    // restores the incumbent division of labour within the same binary.
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    let odd_on_gpu = gpu_prefix > 0 && zc_r2_odd_offload_enabled();
+    #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+    let odd_on_gpu = false;
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     let t_cpu_sweep = std::time::Instant::now();
 
@@ -1390,7 +1419,22 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead(
                 let ap = a_packed.as_ptr().add(row_base * n_chunks);
                 let bp = b_packed.as_ptr().add(row_base * n_chunks);
                 if full {
-                    fold_round2_compact_chunk_neon_lookahead_8::<true>(
+                    fold_round2_compact_chunk_neon_lookahead_8::<true, false>(
+                        t,
+                        ap,
+                        bp,
+                        anchors,
+                        deltas,
+                        eq_lo.as_ptr(),
+                        lo_size,
+                        pair_idx_base,
+                        pair_in_block_mask,
+                        useful_pairs_inclusive,
+                        degen,
+                        out.as_mut_ptr(),
+                    );
+                } else if odd_on_gpu {
+                    fold_round2_compact_chunk_neon_lookahead_8::<false, true>(
                         t,
                         ap,
                         bp,
@@ -1405,7 +1449,7 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead(
                         out.as_mut_ptr(),
                     );
                 } else {
-                    fold_round2_compact_chunk_neon_lookahead_8::<false>(
+                    fold_round2_compact_chunk_neon_lookahead_8::<false, false>(
                         t,
                         ap,
                         bp,
@@ -1462,9 +1506,11 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead(
         }
     });
 
-    // Drain the GPU products arm — identical contract to the incumbent sweep;
-    // only the `(p1, pinf)` slots are affected, the lookahead state was
-    // produced by the CPU on every chunk.
+    // Drain the GPU products arm. The arm returns `[p1_even, pinf_even,
+    // p1_odd, pinf_odd]`; XORing the parities back together reproduces the
+    // summed pair the incumbent contract delivered, and the odd half is
+    // adopted as the lookahead's `W1`/`W2` state exactly when the CPU was told
+    // to skip it.
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     if let Some(job) = gpu_job {
         let cpu_wall_ms = t_cpu_sweep.elapsed().as_secs_f64() * 1e3;
@@ -1473,25 +1519,35 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead(
         let res = crate::gpu_commit::zc_r2_wait(
             job,
             if calib { Some(partials.as_slice()) } else { None },
+            if calib { Some(la_partials.as_slice()) } else { None },
             cpu_wall_ms,
             hi_size,
         );
         match res {
             crate::gpu_commit::ZcR2Result::Calibrated => {}
             crate::gpu_commit::ZcR2Result::Prefix(vals) => {
-                partials[..prefix].copy_from_slice(&vals);
+                for (x_hi, v) in vals.iter().enumerate() {
+                    partials[x_hi] = (v[0] + v[2], v[1] + v[3]);
+                    if odd_on_gpu {
+                        la_partials[x_hi][0] = v[2];
+                        la_partials[x_hi][1] = v[3];
+                    }
+                }
             }
             crate::gpu_commit::ZcR2Result::Failed => {
                 // Redo exactly the skipped prefix products — slower, still
                 // exact. Throwaway anchor/delta scratch: the real ranges were
-                // already written by the lookahead pass.
+                // already written by the lookahead pass. The full-lookahead
+                // monomorphization is used so the odd-parity slots are
+                // recovered too when the CPU sweep skipped them.
                 let mut scr_anchors = vec![F128::ZERO; anchor_chunk_size];
                 let mut scr_deltas = vec![0u8; delta_chunk_size];
                 for x_hi in 0..prefix {
                     let pair_idx_base = x_hi * lo_size;
                     let row_base = pair_idx_base * 2;
-                    let (p1, pinf) = unsafe {
-                        fold_round2_compact_chunk_neon_unchecked_8(
+                    let mut out = [F128::ZERO; 8];
+                    unsafe {
+                        fold_round2_compact_chunk_neon_lookahead_8::<true, false>(
                             table.data.as_ptr().cast::<u8>(),
                             a_packed.as_ptr().add(row_base * n_chunks),
                             b_packed.as_ptr().add(row_base * n_chunks),
@@ -1503,10 +1559,18 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead(
                             pair_in_block_mask,
                             useful_pairs_inclusive,
                             degen,
-                        )
-                    };
+                            out.as_mut_ptr(),
+                        );
+                    }
                     let eq_h = eq_hi[x_hi];
-                    partials[x_hi] = (eq_h * p1, eq_h * pinf);
+                    partials[x_hi] = (
+                        eq_h * (kappa * out[0] + out[2]),
+                        eq_h * (kappa * out[1] + out[3]),
+                    );
+                    if odd_on_gpu {
+                        la_partials[x_hi][0] = eq_h * out[2];
+                        la_partials[x_hi][1] = eq_h * out[3];
+                    }
                 }
             }
         }

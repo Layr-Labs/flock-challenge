@@ -8097,9 +8097,12 @@ struct ZcR2Params { uint lo_size; uint xpt; uint mask; uint useful; };
 // per thread). Per pair: read both packed rows of a and b (one uint4 each,
 // fully coalesced), fold all four rows via the nibble tables, message
 // products via emulated clmul, eq_lo weight via a third clmul, 256-bit
-// unreduced accumulate. Threadgroup XOR-reduce; thread 0 reduces the chunk
-// accumulators, weights by eq_hi[chunk], and writes the REDUCED partial
-// pair -- exactly the CPU's per-chunk `(eq_hi * p1, eq_hi * pinf)` values.
+// unreduced accumulate. Threadgroup XOR-reduce, stopped one step short so the
+// even and odd x_lo halves stay apart; thread 0 reduces the four chunk
+// accumulators, weights by eq_hi[chunk], and writes four REDUCED partials
+// `[p1_even, pinf_even, p1_odd, pinf_odd]`. Slot0^slot2 and slot1^slot3 are
+// exactly the CPU's per-chunk `(eq_hi * p1, eq_hi * pinf)`; slots 2 and 3 are
+// its `eq_hi * out[2]` and `eq_hi * out[3]` round-three lookahead state.
 kernel void zc_r2_products(
     device const uint4* a_in  [[buffer(0)]],
     device const uint4* b_in  [[buffer(1)]],
@@ -8138,29 +8141,41 @@ kernel void zc_r2_products(
         acci ^= ulong4(mi.r0, mi.r1, mi.r2, mi.r3);
     }
 
+    // Parity-split reduce. `x_lo = k*256 + lid` and 256 is even, so a thread
+    // only ever visits x_lo of a single parity. Every halving step from 128
+    // down to 2 pairs indices of equal parity; only the discarded `s == 1`
+    // step would mix them. Stopping one step early therefore leaves `red[0]`
+    // holding the even-x_lo sum and `red[1]` the odd one, and their XOR is
+    // bit-identical to the single sum this kernel used to emit. The odd half
+    // is exactly the round-three lookahead's `W1`/`W2` state, which the CPU
+    // otherwise recomputes on every offloaded chunk.
     red[lid] = acc1;
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    for (uint s = 128u; s > 0u; s >>= 1u) {
+    for (uint s = 128u; s > 1u; s >>= 1u) {
         if (lid < s) { red[lid] ^= red[lid + s]; }
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
-    ulong4 chunk1 = red[0];
+    ulong4 chunk1e = red[0];
+    ulong4 chunk1o = red[1];
     threadgroup_barrier(mem_flags::mem_threadgroup);
     red[lid] = acci;
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    for (uint s = 128u; s > 0u; s >>= 1u) {
+    for (uint s = 128u; s > 1u; s >>= 1u) {
         if (lid < s) { red[lid] ^= red[lid + s]; }
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
     if (lid == 0u) {
-        ulong4 chunki = red[0];
-        U256k u1; u1.r0 = chunk1.x; u1.r1 = chunk1.y; u1.r2 = chunk1.z; u1.r3 = chunk1.w;
-        U256k ui; ui.r0 = chunki.x; ui.r1 = chunki.y; ui.r2 = chunki.z; ui.r3 = chunki.w;
-        uint4 p1 = gf_reduce(u1);
-        uint4 pi = gf_reduce(ui);
+        ulong4 chunkie = red[0];
+        ulong4 chunkio = red[1];
+        U256k u1e; u1e.r0 = chunk1e.x; u1e.r1 = chunk1e.y; u1e.r2 = chunk1e.z; u1e.r3 = chunk1e.w;
+        U256k u1o; u1o.r0 = chunk1o.x; u1o.r1 = chunk1o.y; u1o.r2 = chunk1o.z; u1o.r3 = chunk1o.w;
+        U256k uie; uie.r0 = chunkie.x; uie.r1 = chunkie.y; uie.r2 = chunkie.z; uie.r3 = chunkie.w;
+        U256k uio; uio.r0 = chunkio.x; uio.r1 = chunkio.y; uio.r2 = chunkio.z; uio.r3 = chunkio.w;
         uint4 e = eq_hi[tgid];
-        partials[tgid * 2u]      = gf_reduce(clmul128(e, p1));
-        partials[tgid * 2u + 1u] = gf_reduce(clmul128(e, pi));
+        partials[tgid * 4u]      = gf_reduce(clmul128(e, gf_reduce(u1e)));
+        partials[tgid * 4u + 1u] = gf_reduce(clmul128(e, gf_reduce(uie)));
+        partials[tgid * 4u + 2u] = gf_reduce(clmul128(e, gf_reduce(u1o)));
+        partials[tgid * 4u + 3u] = gf_reduce(clmul128(e, gf_reduce(uio)));
     }
 }
 "#;
@@ -8396,8 +8411,9 @@ kernel void zc_r2_products(
         /// Warmup calibration completed (share published, GPU values
         /// discarded); the caller's CPU partials are authoritative.
         Calibrated,
-        /// Timed-prove prefix partials, bit-exact per chunk.
-        Prefix(Vec<(F128, F128)>),
+        /// Timed-prove prefix partials, bit-exact per chunk, parity-split as
+        /// `[p1_even, pinf_even, p1_odd, pinf_odd]` (all eq_hi-weighted).
+        Prefix(Vec<[F128; 4]>),
         /// Metal failed after admission; the caller must CPU-redo the
         /// prefix products. The arm is poisoned for the process.
         Failed,
@@ -8553,7 +8569,9 @@ kernel void zc_r2_products(
                 gpu.buffer_contents(state.eq_hi_buf),
                 need_hi,
             );
-            let need_part = hi_size * 32;
+            // Four F128 per chunk: the parity-split
+            // `[p1_even, pinf_even, p1_odd, pinf_odd]`.
+            let need_part = hi_size * 64;
             if state.part_cap < need_part {
                 if state.part_cap > 0 {
                     gpu.release(state.part_buf);
@@ -8589,9 +8607,13 @@ kernel void zc_r2_products(
     /// Drain the arm. During calibration `cpu_partials` must hold the CPU's
     /// full per-chunk partial vector and `cpu_wall_ms` the wall of the full
     /// CPU sweep that produced it (per-chunk cost denominator).
+    /// `cpu_la` carries the CPU's six per-chunk round-three lookahead
+    /// aggregates; slots 0 and 1 are the odd-parity round-two products, so
+    /// the oracle can check the parity split and not merely its sum.
     pub(crate) fn zc_r2_wait(
         job: ZcR2Job,
         cpu_partials: Option<&[(F128, F128)]>,
+        cpu_la: Option<&[[F128; 6]]>,
         cpu_wall_ms: f64,
         hi_size: usize,
     ) -> ZcR2Result {
@@ -8625,16 +8647,21 @@ kernel void zc_r2_products(
                 Err(_) => return poison(job.cb),
             };
             let parts = gpu.buffer_contents(state.part_buf).cast::<F128>();
-            let mut out = Vec::with_capacity(job.chunks);
+            let mut out: Vec<[F128; 4]> = Vec::with_capacity(job.chunks);
             for c in 0..job.chunks {
-                out.push((*parts.add(c * 2), *parts.add(c * 2 + 1)));
+                out.push([
+                    *parts.add(c * 4),
+                    *parts.add(c * 4 + 1),
+                    *parts.add(c * 4 + 2),
+                    *parts.add(c * 4 + 3),
+                ]);
             }
             if !job.calibration {
                 gpu.release(job.cb);
                 if super::gpu_zc_r2_debug() {
                     eprintln!(
                         "[zc-r2] timed prefix {}/{} chunks: gpu={first_wall:.2}ms \
-                         submit-to-drain={:.2}ms",
+                         cpu-sweep={cpu_wall_ms:.2}ms submit-to-drain={:.2}ms",
                         job.chunks,
                         hi_size,
                         job.submitted.elapsed().as_secs_f64() * 1e3,
@@ -8649,12 +8676,23 @@ kernel void zc_r2_products(
             };
             // Target-machine equality oracle before anything else: the GPU
             // probe partials must equal the CPU's own values bit-for-bit.
+            // Both the summed pair the round-two message consumes AND the
+            // odd-parity half the round-three lookahead consumes are checked,
+            // so a kernel that got the right total from the wrong split
+            // cannot be admitted.
             for c in 0..job.chunks {
-                if out[c] != cpu_all[c] {
+                let summed = (out[c][0] + out[c][2], out[c][1] + out[c][3]);
+                let split_ok = cpu_la.is_none_or(|la| {
+                    la[c][0] == out[c][2] && la[c][1] == out[c][3]
+                });
+                if summed != cpu_all[c] || !split_ok {
                     if super::gpu_zc_r2_debug() {
                         eprintln!(
-                            "[zc-r2] CALIBRATION MISMATCH at chunk {c}: gpu={:?} cpu={:?} — poisoned",
-                            out[c], cpu_all[c]
+                            "[zc-r2] CALIBRATION MISMATCH at chunk {c}: gpu={:?} \
+                             gpu_summed={summed:?} cpu={:?} cpu_la_odd={:?} — poisoned",
+                            out[c],
+                            cpu_all[c],
+                            cpu_la.map(|la| (la[c][0], la[c][1])),
                         );
                     }
                     return poison(job.cb);
@@ -11934,11 +11972,13 @@ DEF_PROBE(probe_g4_t8_p0,    8u,  0u,   tsel & 7u)
         let eq_lo: Vec<F128> = (0..lo_size).map(|_| rand_f128(&mut rng)).collect();
         let eq_hi: Vec<F128> = (0..hi_size).map(|_| rand_f128(&mut rng)).collect();
 
-        // CPU reference partials, exactly the driver's non-aarch64 shape.
-        let mut cpu_partials = Vec::with_capacity(hi_size);
+        // CPU reference partials, exactly the driver's non-aarch64 shape, kept
+        // split by x_lo parity so the arm's parity contract is checked and not
+        // just the sum a wrong split could still reproduce.
+        let mut cpu_split: Vec<[F128; 4]> = Vec::with_capacity(hi_size);
         for x_hi in 0..hi_size {
-            let mut p1 = F256Unreduced::ZERO;
-            let mut pinf = F256Unreduced::ZERO;
+            // [p1_even, pinf_even, p1_odd, pinf_odd]
+            let mut acc = [F256Unreduced::ZERO; 4];
             for x_lo in 0..lo_size {
                 let pair_idx = x_hi * lo_size + x_lo;
                 if (pair_idx & mask) >= useful {
@@ -11951,12 +11991,22 @@ DEF_PROBE(probe_g4_t8_p0,    8u,  0u,   tsel & 7u)
                 let a1 = fold_row(read(&a_packed, 2 * pair_idx + 1));
                 let b0 = fold_row(read(&b_packed, 2 * pair_idx));
                 let b1 = fold_row(read(&b_packed, 2 * pair_idx + 1));
-                p1 ^= eq_lo[x_lo].mul_unreduced(a1 * b1);
-                pinf ^= eq_lo[x_lo].mul_unreduced((a0 + a1) * (b0 + b1));
+                let base = 2 * (x_lo & 1);
+                acc[base] ^= eq_lo[x_lo].mul_unreduced(a1 * b1);
+                acc[base + 1] ^= eq_lo[x_lo].mul_unreduced((a0 + a1) * (b0 + b1));
             }
             let eq_h = eq_hi[x_hi];
-            cpu_partials.push((eq_h * p1.reduce(), eq_h * pinf.reduce()));
+            cpu_split.push(std::array::from_fn(|i| eq_h * acc[i].reduce()));
         }
+        let cpu_partials: Vec<(F128, F128)> = cpu_split
+            .iter()
+            .map(|v| (v[0] + v[2], v[1] + v[3]))
+            .collect();
+        // Slots 0/1 of the lookahead state are exactly the odd-parity pair.
+        let cpu_la: Vec<[F128; 6]> = cpu_split
+            .iter()
+            .map(|v| [v[2], v[3], F128::ZERO, F128::ZERO, F128::ZERO, F128::ZERO])
+            .collect();
 
         // Calibration probe: internal equality oracle + share publication.
         imp::zc_r2_test_reset();
@@ -11966,7 +12016,7 @@ DEF_PROBE(probe_g4_t8_p0,    8u,  0u,   tsel & 7u)
         .expect("calibration launch must succeed on real Metal");
         assert!(job.is_calibration());
         assert_eq!(job.cpu_split(), 0);
-        let res = imp::zc_r2_wait(job, Some(&cpu_partials), 50.0, hi_size);
+        let res = imp::zc_r2_wait(job, Some(&cpu_partials), Some(&cpu_la), 50.0, hi_size);
         assert!(matches!(res, imp::ZcR2Result::Calibrated));
         let (tuned, poisoned) = imp::zc_r2_test_state();
         assert!(!poisoned, "probe partials must equal CPU partials bit-for-bit");
@@ -11981,10 +12031,18 @@ DEF_PROBE(probe_g4_t8_p0,    8u,  0u,   tsel & 7u)
         assert!(!job2.is_calibration());
         let prefix = job2.cpu_split();
         assert_eq!(prefix, hi_size / 2);
-        match imp::zc_r2_wait(job2, None, 0.0, hi_size) {
+        match imp::zc_r2_wait(job2, None, None, 0.0, hi_size) {
             imp::ZcR2Result::Prefix(vals) => {
                 assert_eq!(vals.len(), prefix);
-                assert_eq!(&vals[..], &cpu_partials[..prefix], "prefix partials bit-exact");
+                assert_eq!(
+                    &vals[..],
+                    &cpu_split[..prefix],
+                    "prefix partials bit-exact, per parity"
+                );
+                // The summed contract the round-two message consumes.
+                for (v, c) in vals.iter().zip(cpu_partials.iter()) {
+                    assert_eq!((v[0] + v[2], v[1] + v[3]), *c, "summed pair bit-exact");
+                }
             }
             _ => panic!("timed drain must return prefix partials"),
         }
