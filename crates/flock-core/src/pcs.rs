@@ -156,6 +156,7 @@ pub fn open_batch_mixed_ligerito_with_precomputed_s_hat_v<Ch: Challenger>(
             combined.target_combined,
             &prover_data.codeword,
             &*prover_data.merkle_tree,
+            prover_data.merkle_tree.leafless_prefix(),
             combined.round0_prime,
             combined
                 .round1_lookahead

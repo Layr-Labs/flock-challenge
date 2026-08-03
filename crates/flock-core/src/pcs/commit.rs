@@ -180,6 +180,18 @@ impl core::ops::Deref for MerkleTreeBuf {
     }
 }
 
+impl MerkleTreeBuf {
+    /// Number of ranked L0 leaves intentionally omitted from a GPU-backed
+    /// tree. Their codeword rows remain resident and are regenerated only if
+    /// an opening needs a leaf-level sibling.
+    pub fn leafless_prefix(&self) -> usize {
+        match self {
+            Self::Cpu(_) => 0,
+            Self::Gpu(tree) => tree.leafless_prefix(),
+        }
+    }
+}
+
 impl core::fmt::Debug for MerkleTreeBuf {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("MerkleTreeBuf").field("len", &self.len()).finish()
