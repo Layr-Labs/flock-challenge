@@ -758,31 +758,36 @@ fn commit_with_round1_ab_precompute(
         ),
     );
 
-    let result = rayon::join(
-        || match commit_codeword {
-            CommitCodeword::Allocate => pcs::commit(z_packed, pcs_params),
-            CommitCodeword::NeedsReplication(buf) => pcs::commit_into(z_packed, pcs_params, buf),
-            CommitCodeword::Preinitialized(buf) => {
-                pcs::commit_preinitialized(z_packed, buf, pcs_params)
-            }
-            CommitCodeword::StreamedFirstPass(buf, stream) => {
-                pcs::commit_from_streamed_first_pass(z_packed, buf, pcs_params, stream)
-            }
-        },
-        || {
-            let t = std::time::Instant::now();
-            let r = precompute_ab();
-            let wall_ms = t.elapsed().as_secs_f64() * 1e3;
-            // The hybrid-commit warmup sweep sizes its contention emulation
-            // from this arm's measured wall (an Instant read is free; the
-            // store is one relaxed atomic per prove).
-            flock_core::gpu_commit::note_precompute_branch_wall_ms(wall_ms);
-            if std::env::var_os("FLOCK_PHASE_TIMING").is_some() {
-                eprintln!("[phase-timing] ab-precompute branch wall: {wall_ms:.2} ms");
-            }
-            r
-        },
-    );
+    let result = {
+        let t = std::time::Instant::now();
+        let r = rayon::join(
+            || match commit_codeword {
+                CommitCodeword::Allocate => pcs::commit(z_packed, pcs_params),
+                CommitCodeword::NeedsReplication(buf) => {
+                    pcs::commit_into(z_packed, pcs_params, buf)
+                }
+                CommitCodeword::Preinitialized(buf) => {
+                    pcs::commit_preinitialized(z_packed, buf, pcs_params)
+                }
+                CommitCodeword::StreamedFirstPass(buf, stream) => {
+                    pcs::commit_from_streamed_first_pass(z_packed, buf, pcs_params, stream)
+                }
+            },
+            || {
+                let r = precompute_ab();
+                let wall_ms = t.elapsed().as_secs_f64() * 1e3;
+                // The hybrid-commit warmup sweep sizes its contention emulation
+                // from this arm's measured wall (an Instant read is free; the
+                // store is one relaxed atomic per prove).
+                flock_core::gpu_commit::note_precompute_branch_wall_ms(wall_ms);
+                if std::env::var_os("FLOCK_PHASE_TIMING").is_some() {
+                    eprintln!("[phase-timing] ab-precompute branch wall: {wall_ms:.2} ms");
+                }
+                r
+            },
+        );
+        r
+    };
 
     if run_ranked_exact_tune {
         flock_core::gpu_commit::retune_ranked_hybrid_with_exact_contention(
