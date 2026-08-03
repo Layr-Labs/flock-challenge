@@ -1453,6 +1453,138 @@ pub(crate) unsafe fn fold_one_row_neon_unchecked_8(
     }
 }
 
+/// Ranked post-K tail stage: every 64-record witness block consists of fifteen
+/// ordinary four-record groups and one `(value, 0, 0, 0)` boundary group.
+/// The caller selects this only for the ranked m=32 `i=2` NT-store round.
+#[cfg(target_arch = "aarch64")]
+pub(crate) fn fold_and_message_aarch64_ranked_padprop_stage2(
+    a_in: &[F128],
+    b_in: &[F128],
+    a_out: &mut [F128],
+    b_out: &mut [F128],
+    r_fold: F128,
+    eq_lo: &[F128],
+) -> (F128, F128) {
+    fold_and_message_ranked_padprop_stage2_body(a_in, b_in, a_out, b_out, r_fold, eq_lo)
+}
+
+/// Const-shaped NT kernel for width-64/useful-61 ranked blocks. Padding is
+/// represented by loop bounds rather than a per-record predicate.
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+fn fold_and_message_ranked_padprop_stage2_body(
+    a_in: &[F128],
+    b_in: &[F128],
+    a_out: &mut [F128],
+    b_out: &mut [F128],
+    r_fold: F128,
+    eq_lo: &[F128],
+) -> (F128, F128) {
+    use core::arch::aarch64::{uint64x2_t, vdupq_n_u64};
+
+    const GROUPS_PER_BLOCK: usize = 16;
+    const FULL_GROUPS: usize = 15;
+
+    debug_assert_eq!(a_in.len(), 4 * eq_lo.len());
+    debug_assert_eq!(b_in.len(), 4 * eq_lo.len());
+    debug_assert_eq!(a_out.len(), 2 * eq_lo.len());
+    debug_assert_eq!(b_out.len(), 2 * eq_lo.len());
+    debug_assert!(eq_lo.len().is_multiple_of(GROUPS_PER_BLOCK));
+
+    #[inline(always)]
+    unsafe fn store_pair_nt(dst: *mut F128, x: uint64x2_t, y: uint64x2_t) {
+        unsafe {
+            core::arch::asm!(
+                "stnp {x:q}, {y:q}, [{dst}]",
+                dst = in(reg) dst,
+                x = in(vreg) x,
+                y = in(vreg) y,
+                options(nostack, preserves_flags),
+            );
+        }
+    }
+
+    let mut p1_acc = F256Unreduced::ZERO;
+    let mut pinf_acc = F256Unreduced::ZERO;
+    let zero_q = unsafe { vdupq_n_u64(0) };
+    let a_in_ptr = a_in.as_ptr();
+    let b_in_ptr = b_in.as_ptr();
+    let a_out_ptr = a_out.as_mut_ptr();
+    let b_out_ptr = b_out.as_mut_ptr();
+    let eq_ptr = eq_lo.as_ptr();
+    let n_blocks = eq_lo.len() / GROUPS_PER_BLOCK;
+
+    for block in 0..n_blocks {
+        let eq_base = block * GROUPS_PER_BLOCK;
+        let in_base = 4 * eq_base;
+        let out_base = 2 * eq_base;
+
+        // All four inputs are potentially nonzero in these groups. The bound
+        // excludes the ranked boundary, so this hot loop has no padding test.
+        for group in 0..FULL_GROUPS {
+            let i = in_base + 4 * group;
+            let o = out_base + 2 * group;
+            unsafe {
+                let a_even_0 = *a_in_ptr.add(i);
+                let a_odd_0 = *a_in_ptr.add(i + 1);
+                let a_even_1 = *a_in_ptr.add(i + 2);
+                let a_odd_1 = *a_in_ptr.add(i + 3);
+                let b_even_0 = *b_in_ptr.add(i);
+                let b_odd_0 = *b_in_ptr.add(i + 1);
+                let b_even_1 = *b_in_ptr.add(i + 2);
+                let b_odd_1 = *b_in_ptr.add(i + 3);
+
+                let a0 = a_even_0 + r_fold * (a_even_0 + a_odd_0);
+                let a1 = a_even_1 + r_fold * (a_even_1 + a_odd_1);
+                let b0 = b_even_0 + r_fold * (b_even_0 + b_odd_0);
+                let b1 = b_even_1 + r_fold * (b_even_1 + b_odd_1);
+
+                store_pair_nt(
+                    a_out_ptr.add(o),
+                    core::mem::transmute::<F128, uint64x2_t>(a0),
+                    core::mem::transmute::<F128, uint64x2_t>(a1),
+                );
+                store_pair_nt(
+                    b_out_ptr.add(o),
+                    core::mem::transmute::<F128, uint64x2_t>(b0),
+                    core::mem::transmute::<F128, uint64x2_t>(b1),
+                );
+
+                let eq_l = *eq_ptr.add(eq_base + group);
+                p1_acc ^= eq_l.mul_unreduced(a1 * b1);
+                pinf_acc ^= eq_l.mul_unreduced((a0 + a1) * (b0 + b1));
+            }
+        }
+
+        // Only record 60 may be nonzero. Ignore the guaranteed-zero records
+        // 61..63 even if their scratch slots are poisoned, zero-store output
+        // record 31, omit g1, and keep only g_inf = eq * a0 * b0.
+        let i = in_base + 4 * FULL_GROUPS;
+        let o = out_base + 2 * FULL_GROUPS;
+        unsafe {
+            let a_even_0 = *a_in_ptr.add(i);
+            let b_even_0 = *b_in_ptr.add(i);
+            let a0 = a_even_0 + r_fold * a_even_0;
+            let b0 = b_even_0 + r_fold * b_even_0;
+            store_pair_nt(
+                a_out_ptr.add(o),
+                core::mem::transmute::<F128, uint64x2_t>(a0),
+                zero_q,
+            );
+            store_pair_nt(
+                b_out_ptr.add(o),
+                core::mem::transmute::<F128, uint64x2_t>(b0),
+                zero_q,
+            );
+
+            let eq_l = *eq_ptr.add(eq_base + FULL_GROUPS);
+            pinf_acc ^= eq_l.mul_unreduced(a0 * b0);
+        }
+    }
+
+    (p1_acc.reduce(), pinf_acc.reduce())
+}
+
 /// Fuse one multilinear tail fold with construction of the following round's
 /// message. The previous AArch64 path first streamed all of `a_in`/`b_in` into
 /// `a_out`/`b_out`, then immediately reread both outputs in a second pass.
@@ -1575,6 +1707,90 @@ mod tests {
         z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
         z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
         z ^ (z >> 31)
+    }
+
+    fn random_f128(state: &mut u64) -> F128 {
+        F128::new(splitmix64(state), splitmix64(state))
+    }
+
+    #[test]
+    fn ranked_padprop_stage2_matches_honest_legacy_and_ignores_padding_poison() {
+        const N_BLOCKS: usize = 3;
+        const INPUT_WIDTH: usize = 64;
+        const USEFUL_INPUTS: usize = 61;
+        const OUTPUT_WIDTH: usize = 32;
+        const OUTPUT_POISON: F128 = F128 {
+            lo: 0x5a5a_5a5a_5a5a_5a5a,
+            hi: 0xa5a5_a5a5_a5a5_a5a5,
+        };
+
+        let mut state = 0x5041_4450_524f_5032;
+        let mut a_in = vec![F128::ZERO; N_BLOCKS * INPUT_WIDTH];
+        let mut b_in = vec![F128::ZERO; N_BLOCKS * INPUT_WIDTH];
+        for block in 0..N_BLOCKS {
+            for x in 0..USEFUL_INPUTS {
+                a_in[block * INPUT_WIDTH + x] = random_f128(&mut state);
+                b_in[block * INPUT_WIDTH + x] = random_f128(&mut state);
+            }
+        }
+        let eq_lo: Vec<F128> = (0..N_BLOCKS * 16)
+            .map(|_| random_f128(&mut state))
+            .collect();
+        let r_fold = random_f128(&mut state);
+
+        // Honest-zero oracle: the generic incumbent must agree on every
+        // output record and both message elements.
+        let mut legacy_a = vec![OUTPUT_POISON; N_BLOCKS * OUTPUT_WIDTH];
+        let mut legacy_b = vec![OUTPUT_POISON; N_BLOCKS * OUTPUT_WIDTH];
+        let legacy_msg = fold_and_message_body::<true>(
+            &a_in,
+            &b_in,
+            &mut legacy_a,
+            &mut legacy_b,
+            r_fold,
+            &eq_lo,
+        );
+        let mut specialized_a = vec![OUTPUT_POISON; N_BLOCKS * OUTPUT_WIDTH];
+        let mut specialized_b = vec![OUTPUT_POISON; N_BLOCKS * OUTPUT_WIDTH];
+        let specialized_msg = fold_and_message_ranked_padprop_stage2_body(
+            &a_in,
+            &b_in,
+            &mut specialized_a,
+            &mut specialized_b,
+            r_fold,
+            &eq_lo,
+        );
+        assert_eq!(specialized_a, legacy_a);
+        assert_eq!(specialized_b, legacy_b);
+        assert_eq!(specialized_msg, legacy_msg);
+
+        // Poison the three guaranteed-zero inputs in every block. The ranked
+        // kernel must not consume them and must still overwrite stale output.
+        let mut poison_a = a_in.clone();
+        let mut poison_b = b_in.clone();
+        for block in 0..N_BLOCKS {
+            for x in USEFUL_INPUTS..INPUT_WIDTH {
+                poison_a[block * INPUT_WIDTH + x] = random_f128(&mut state);
+                poison_b[block * INPUT_WIDTH + x] = random_f128(&mut state);
+            }
+        }
+        let mut poison_out_a = vec![OUTPUT_POISON; N_BLOCKS * OUTPUT_WIDTH];
+        let mut poison_out_b = vec![OUTPUT_POISON; N_BLOCKS * OUTPUT_WIDTH];
+        let poison_msg = fold_and_message_ranked_padprop_stage2_body(
+            &poison_a,
+            &poison_b,
+            &mut poison_out_a,
+            &mut poison_out_b,
+            r_fold,
+            &eq_lo,
+        );
+        assert_eq!(poison_out_a, legacy_a);
+        assert_eq!(poison_out_b, legacy_b);
+        assert_eq!(poison_msg, legacy_msg);
+        for block in 0..N_BLOCKS {
+            assert_eq!(poison_out_a[block * OUTPUT_WIDTH + 31], F128::ZERO);
+            assert_eq!(poison_out_b[block * OUTPUT_WIDTH + 31], F128::ZERO);
+        }
     }
 
     #[test]

@@ -51,6 +51,7 @@ use kernels::aarch64::fold_one_row_neon_unchecked_8;
 #[cfg(target_arch = "aarch64")]
 use kernels::aarch64::{
     fold2_compact_and_round4_chunk_neon_8, fold_and_message_aarch64,
+    fold_and_message_aarch64_ranked_padprop_stage2,
     fold_compact_chunk_neon_unchecked_8, fold_compact_stream_chunk_neon,
     fold_round2_chunk_neon_unchecked_8, fold_round2_compact_chunk_neon_lookahead_8,
     fold_round2_compact_chunk_neon_unchecked_8, fold_round2_compact_stream_chunk_neon,
@@ -111,6 +112,63 @@ fn round2_pair_skip(padding: &PaddingSpec, k_skip: usize) -> (usize, usize) {
         return (0, usize::MAX);
     }
     (pairs_per_block - 1, useful_pairs)
+}
+
+/// Exact ranked zero suffix presented to the first ordinary round after the
+/// K double fold.  Each 64-record witness block has records `0..=60`
+/// potentially nonzero and records `61..=63` identically zero.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RankedTailPadPropStage {
+    None,
+    InputWidth64,
+}
+
+#[inline]
+fn tail_padprop_env_enabled(value: Option<&std::ffi::OsStr>) -> bool {
+    value.is_none_or(|v| v != "1")
+}
+
+/// Independent same-binary rollback for the post-K padding specialization.
+/// The generic tail implementation itself is left untouched.
+#[inline]
+fn tail_padprop_enabled() -> bool {
+    use std::sync::LazyLock;
+    static ENABLED: LazyLock<bool> = LazyLock::new(|| {
+        tail_padprop_env_enabled(std::env::var_os("FLOCK_NO_ZC_TAIL_PADPROP").as_deref())
+    });
+    *ENABLED
+}
+
+#[inline]
+fn ranked_tail_padprop_stage_enabled(
+    padding: &PaddingSpec,
+    m: usize,
+    i: usize,
+    k_composed: bool,
+    enabled: bool,
+) -> RankedTailPadPropStage {
+    if enabled
+        && k_composed
+        && i == 2
+        && m == 32
+        && padding.k_log == 14
+        && padding.useful_bits_per_block == 15_409
+    {
+        RankedTailPadPropStage::InputWidth64
+    } else {
+        RankedTailPadPropStage::None
+    }
+}
+
+/// Select the once-per-round specialization.  The low-level driver repeats
+/// the concrete length, equality and NT-store guards before using it.
+pub(crate) fn ranked_tail_padprop_stage(
+    padding: &PaddingSpec,
+    m: usize,
+    i: usize,
+    k_composed: bool,
+) -> RankedTailPadPropStage {
+    ranked_tail_padprop_stage_enabled(padding, m, i, k_composed, tail_padprop_enabled())
 }
 
 /// Kill switch for draining the DRAM-bound tail loop rounds (half ≥ 2^21)
@@ -2211,6 +2269,143 @@ pub fn fold_and_compute_round_pair_into(
     fold_and_compute_round_pair_into_with_n_hi(a, b, a_out, b_out, r_fold, r_next, n_hi)
 }
 
+/// Ranked-padding-aware entry point used by the zerocheck transcript driver.
+/// The incumbent [`fold_and_compute_round_pair_into`] remains the fallback so
+/// `FLOCK_NO_ZC_TAIL_PADPROP=1`, non-K routes, and every non-ranked shape keep
+/// its exact code path.
+pub(crate) fn fold_and_compute_round_pair_into_ranked_padprop(
+    a: &[F128],
+    b: &[F128],
+    a_out: &mut [F128],
+    b_out: &mut [F128],
+    r_fold: F128,
+    r_next: &[F128],
+    padprop: RankedTailPadPropStage,
+) -> (F128, F128) {
+    #[cfg(target_arch = "aarch64")]
+    if padprop == RankedTailPadPropStage::InputWidth64
+        && a.len() == (1usize << 24)
+        && b.len() == a.len()
+        && a_out.len() == (1usize << 23)
+        && b_out.len() == a_out.len()
+        && r_next.len() == 23
+        && std::env::var_os("FLOCK_ZC_NT_LEGACY").is_none()
+    {
+        return fold_and_compute_round_pair_into_ranked_padprop_stage2(
+            a, b, a_out, b_out, r_fold, r_next,
+        );
+    }
+
+    let _ = padprop;
+    fold_and_compute_round_pair_into(a, b, a_out, b_out, r_fold, r_next)
+}
+
+/// Exact width-64/useful-61 ranked sweep.  This deliberately lives beside,
+/// rather than inside, the generic implementation: the rollback therefore
+/// retains the incumbent generic closure and kernel byte-for-byte.
+#[cfg(target_arch = "aarch64")]
+fn fold_and_compute_round_pair_into_ranked_padprop_stage2(
+    a: &[F128],
+    b: &[F128],
+    a_out: &mut [F128],
+    b_out: &mut [F128],
+    r_fold: F128,
+    r_next: &[F128],
+) -> (F128, F128) {
+    use rayon::prelude::*;
+
+    let n = a.len();
+    assert_eq!(b.len(), n);
+    assert_eq!(n, 1usize << 24);
+    let half = n / 2;
+    assert_eq!(a_out.len(), half);
+    assert_eq!(b_out.len(), half);
+    assert_eq!(r_next.len(), 23);
+
+    let n_hi = if half >= LARGE_TAIL_EQ_MIN_HALF && zc_tail_split11_enabled() {
+        LARGE_TAIL_EQ_N_HI
+    } else {
+        SplitEqGhash::MAX_N_HI
+    };
+    let eq = SplitEqGhash::with_n_hi(&r_next[1..], n_hi);
+    let lo_size = 1usize << eq.n_lo;
+    let hi_size = 1usize << eq.n_hi;
+    assert!(lo_size.is_multiple_of(16));
+    assert_eq!(lo_size * hi_size * 2, half);
+
+    let chunk_in = 4 * lo_size;
+    let chunk_out = 2 * lo_size;
+    let eq_lo = &eq.lo;
+    let eq_hi = &eq.hi;
+    let chunk_partial = |a_in: &[F128],
+                         b_in: &[F128],
+                         a_out: &mut [F128],
+                         b_out: &mut [F128]| {
+        fold_and_message_aarch64_ranked_padprop_stage2(
+            a_in, b_in, a_out, b_out, r_fold, eq_lo,
+        )
+    };
+
+    let (sum1, sum_inf) = if zc_tail_hetero_enabled() {
+        let mut partials = vec![(F128::ZERO, F128::ZERO); hi_size];
+        let a_base = crate::epool::SyncPtr(a_out.as_mut_ptr());
+        let b_base = crate::epool::SyncPtr(b_out.as_mut_ptr());
+        let partials_base = crate::epool::SyncPtr(partials.as_mut_ptr());
+        crate::epool::run_hetero_chunks(hi_size, |x_hi| {
+            // SAFETY: the queue owns each x_hi exactly once; every worker gets
+            // disjoint input/output slices and one exclusive partial slot.
+            let (a_chunk, b_chunk) = unsafe {
+                (
+                    std::slice::from_raw_parts_mut(
+                        a_base.ptr().add(x_hi * chunk_out),
+                        chunk_out,
+                    ),
+                    std::slice::from_raw_parts_mut(
+                        b_base.ptr().add(x_hi * chunk_out),
+                        chunk_out,
+                    ),
+                )
+            };
+            let (p1, pinf) = chunk_partial(
+                &a[x_hi * chunk_in..(x_hi + 1) * chunk_in],
+                &b[x_hi * chunk_in..(x_hi + 1) * chunk_in],
+                a_chunk,
+                b_chunk,
+            );
+            let eq_h = eq_hi[x_hi];
+            unsafe {
+                *partials_base.ptr().add(x_hi) = (eq_h * p1, eq_h * pinf);
+            }
+        });
+        partials
+            .iter()
+            .fold((F128::ZERO, F128::ZERO), |(s1, sinf), &(p1, pinf)| {
+                (s1 + p1, sinf + pinf)
+            })
+    } else {
+        a_out
+            .par_chunks_mut(chunk_out)
+            .zip(b_out.par_chunks_mut(chunk_out))
+            .enumerate()
+            .map(|(x_hi, (a_chunk, b_chunk))| {
+                let (p1, pinf) = chunk_partial(
+                    &a[x_hi * chunk_in..(x_hi + 1) * chunk_in],
+                    &b[x_hi * chunk_in..(x_hi + 1) * chunk_in],
+                    a_chunk,
+                    b_chunk,
+                );
+                let eq_h = eq_hi[x_hi];
+                (eq_h * p1, eq_h * pinf)
+            })
+            .reduce(
+                || (F128::ZERO, F128::ZERO),
+                |(s1, sinf), (p1, pinf)| (s1 + p1, sinf + pinf),
+            )
+    };
+
+    (r_next[0] * sum1, sum_inf)
+}
+
 /// Split-explicit implementation used by the public policy wrapper and by the
 /// exact n_hi=9 versus n_hi=11 regression test.
 fn fold_and_compute_round_pair_into_with_n_hi(
@@ -3046,6 +3241,54 @@ mod tests {
         }
     }
 
+    #[test]
+    fn ranked_tail_padprop_selector_is_env_shape_route_and_iteration_guarded() {
+        use std::ffi::OsStr;
+
+        assert!(tail_padprop_env_enabled(None));
+        assert!(tail_padprop_env_enabled(Some(OsStr::new(""))));
+        assert!(tail_padprop_env_enabled(Some(OsStr::new("0"))));
+        assert!(!tail_padprop_env_enabled(Some(OsStr::new("1"))));
+
+        let ranked = PaddingSpec {
+            k_log: 14,
+            useful_bits_per_block: 15_409,
+        };
+        assert_eq!(
+            ranked_tail_padprop_stage_enabled(&ranked, 32, 2, true, true),
+            RankedTailPadPropStage::InputWidth64
+        );
+        for (m, i, k_composed, enabled) in [
+            (31, 2, true, true),
+            (32, 1, true, true),
+            (32, 3, true, true),
+            (32, 2, false, true),
+            (32, 2, true, false),
+        ] {
+            assert_eq!(
+                ranked_tail_padprop_stage_enabled(&ranked, m, i, k_composed, enabled),
+                RankedTailPadPropStage::None
+            );
+        }
+
+        let wrong_useful = PaddingSpec {
+            useful_bits_per_block: 15_408,
+            ..ranked
+        };
+        let wrong_block = PaddingSpec {
+            k_log: 13,
+            ..ranked
+        };
+        assert_eq!(
+            ranked_tail_padprop_stage_enabled(&wrong_useful, 32, 2, true, true),
+            RankedTailPadPropStage::None
+        );
+        assert_eq!(
+            ranked_tail_padprop_stage_enabled(&wrong_block, 32, 2, true, true),
+            RankedTailPadPropStage::None
+        );
+    }
+
     /// Moving two equality variables from eq_lo to eq_hi only regroups an
     /// exact tensor factorization.  It must leave both folded buffers and both
     /// wire-message field elements bit-identical.
@@ -3480,6 +3723,14 @@ mod tests {
                         assert_eq!(a_n, a_l, "A'' m={m} rho1={rho1:?} rho2={rho2:?}");
                         assert_eq!(b_n, b_l, "B'' m={m} rho1={rho1:?} rho2={rho2:?}");
                         assert_eq!(msg_n, msg_l, "round-four message m={m}");
+                        if ranked {
+                            for block in a_n.chunks_exact(64) {
+                                assert!(block[61..].iter().all(|&x| x == F128::ZERO));
+                            }
+                            for block in b_n.chunks_exact(64) {
+                                assert!(block[61..].iter().all(|&x| x == F128::ZERO));
+                            }
+                        }
 
                         crate::scratch::give_f128(a_l);
                         crate::scratch::give_f128(b_l);
