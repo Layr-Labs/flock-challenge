@@ -1286,6 +1286,13 @@ fn lookahead_n_hi(n_vars: usize) -> usize {
     COMPACT_RECONSTRUCTION_N_HI.min(n_vars.saturating_sub(1))
 }
 
+/// Pack the sole weight consumed by each two-pair lookahead group.
+#[cfg(any(test, target_arch = "aarch64"))]
+fn lookahead_odd_weights(eq_lo: &[F128]) -> Vec<F128> {
+    assert_eq!(eq_lo.len() & 1, 0, "lookahead eq_lo must contain pairs");
+    eq_lo.chunks_exact(2).map(|pair| pair[1]).collect()
+}
+
 /// Round-two compact producer **plus** the deferred round-three coefficients.
 ///
 /// The compact state, the round-two wire message and every store are
@@ -1352,6 +1359,14 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead(
     let kappa = (F128::ONE + r1) * r1.inv();
     let eq_hi = &eq.hi;
     let eq_lo = &eq.lo;
+    // The NEON lookahead consumes only the odd member of each adjacent
+    // eq_lo pair. Pack those weights once so every chunk scans 128 KiB of
+    // contiguous weights instead of touching 256 KiB of half-used cache
+    // lines. Keep the full table for the GPU arm and portable oracle.
+    #[cfg(target_arch = "aarch64")]
+    let eq_lo_odd = lookahead_odd_weights(eq_lo);
+    #[cfg(target_arch = "aarch64")]
+    debug_assert_eq!(eq_lo_odd.len(), lo_size / 2);
     let anchor_chunk_size = 2 * lo_size;
     let delta_chunk_size = 2 * lo_size * n_chunks;
     let (pair_in_block_mask, useful_pairs_inclusive) = round2_pair_skip(padding, k_skip);
@@ -1425,7 +1440,7 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead(
                         bp,
                         anchors,
                         deltas,
-                        eq_lo.as_ptr(),
+                        eq_lo_odd.as_ptr(),
                         lo_size,
                         pair_idx_base,
                         pair_in_block_mask,
@@ -1440,7 +1455,7 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead(
                         bp,
                         anchors,
                         deltas,
-                        eq_lo.as_ptr(),
+                        eq_lo_odd.as_ptr(),
                         lo_size,
                         pair_idx_base,
                         pair_in_block_mask,
@@ -1455,7 +1470,7 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead(
                         bp,
                         anchors,
                         deltas,
-                        eq_lo.as_ptr(),
+                        eq_lo_odd.as_ptr(),
                         lo_size,
                         pair_idx_base,
                         pair_in_block_mask,
@@ -2681,6 +2696,18 @@ pub fn uni_skip_fold_and_round_pair_optimized(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn lookahead_odd_weight_pack_matches_strided_contract() {
+        let eq_lo: Vec<F128> = (0..32)
+            .map(|i| F128 { lo: i, hi: !i })
+            .collect();
+        let packed = lookahead_odd_weights(&eq_lo);
+        assert_eq!(packed.len(), eq_lo.len() / 2);
+        for (u, weight) in packed.iter().enumerate() {
+            assert_eq!(*weight, eq_lo[2 * u + 1]);
+        }
+    }
 
     struct Rng(u64);
     impl Rng {

@@ -681,7 +681,7 @@ pub(crate) unsafe fn fold_round2_compact_chunk_neon_lookahead_8<
     b_packed: *const u8,
     anchors: *mut F128,
     deltas: *mut u8,
-    eq_lo: *const F128,
+    eq_lo_odd: *const F128,
     lo_size: usize,
     pair_idx_base: usize,
     pair_in_block_mask: usize,
@@ -743,8 +743,10 @@ pub(crate) unsafe fn fold_round2_compact_chunk_neon_lookahead_8<
                 table_data, a_packed, b_packed, anchors, deltas, x_lo1, pad1, degen, b_ones,
             );
 
-            // The odd lane's weight drives the whole group; see the doc above.
-            let w = vld1q_u64(eq_lo.add(x_lo1).cast::<u64>());
+            // The odd lane's weight drives the whole group; the driver packs
+            // exactly eq_lo[2*u+1] contiguously so this repeatedly-read table
+            // occupies half as many cache lines on every worker.
+            let w = vld1q_u64(eq_lo_odd.add(u).cast::<u64>());
 
             if deg0 & deg1 & ones_is_one {
                 // b === 1 across the group: e_b = o_b = 0 kills W3/W4/W5 and
