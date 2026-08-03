@@ -601,6 +601,19 @@ fn ab_pre_nt_enabled() -> bool {
     *ON.get_or_init(|| std::env::var_os(ENV_NO_ZC_AB_PRE_NT).is_none())
 }
 
+/// Route the round-1 AB precompute's disjoint chunks through the two-pool
+/// hetero queue (main pool + efficiency-core helper) instead of the main
+/// pool alone. The precompute is the straggler of the commit `rayon::join`
+/// (it is L1/compute-bound, not bandwidth-bound), and the helper cores are
+/// otherwise nearly idle during that window — the same mechanism the C-side
+/// drains below already use. `FLOCK_NO_ZC_AB_HETERO=1` restores the
+/// incumbent main-pool-only drain in the same binary.
+fn ab_hetero_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_ZC_AB_HETERO").is_none());
+    *ON
+}
+
 /// Non-temporal 64-byte store (L1 stack bounce → `stnp` pair burst), the same
 /// best-effort cache-bypass idiom as the witness stripe drain. The precompute
 /// output is a 512 MiB write-once surface whose consumer runs tens of
@@ -698,78 +711,110 @@ fn precompute_round1_ab_inner_packed_padded_with_flavor(
     let out_bytes: &mut [u8] =
         unsafe { core::slice::from_raw_parts_mut(storage.as_mut_ptr() as *mut u8, total_bytes) };
 
-    out_bytes
-        .par_chunks_mut(OUTER_BYTES)
-        .enumerate()
-        .for_each_init(
-            || ([F8::ZERO; ELL], [F8::ZERO; ELL]),
-            |(a_col, b_col), (x_outer, out_outer)| {
-                let within_hash_outer = x_outer & within_outer_mask;
-                let n_b_med = b_med_counts[within_hash_outer] as usize;
-                let chunk_byte_base = x_outer * OUTER_BYTES;
+    // One chunk per `OUTER_BYTES` range; chunk `x_outer` exclusively owns
+    // `out_bytes[x_outer * OUTER_BYTES..(x_outer + 1) * OUTER_BYTES)`, reads
+    // only the immutable published inputs, and writes only its own range
+    // (including its padding zero-fill). The output therefore depends on no
+    // property of the executing pool or thread, so the hetero drain below is
+    // bit-identical to the incumbent `par_chunks_mut` arm by construction —
+    // the exact contract [`crate::epool`] documents and the C-side drains in
+    // this module already rely on.
+    let n_chunks = total_bytes / OUTER_BYTES;
+    let out_base = crate::epool::SyncPtr(out_bytes.as_mut_ptr());
+    let process_chunk =
+        |(a_col, b_col): &mut ([F8; ELL], [F8; ELL]), x_outer: usize, out_outer: &mut [u8]| {
+            let within_hash_outer = x_outer & within_outer_mask;
+            let n_b_med = b_med_counts[within_hash_outer] as usize;
+            let chunk_byte_base = x_outer * OUTER_BYTES;
 
-                // NT arm: the kernel writes a stack temporary and the 64-byte
-                // block drains to the big buffer with `stnp` (write-once
-                // lines, consumer runs after the commit root). Control arm is
-                // the incumbent direct kernel write, byte-for-byte.
-                let mut tmp = [0u8; 64];
-                for b_med in 0..n_b_med {
-                    let dst: &mut [u8; 64] = if nt {
-                        &mut tmp
-                    } else {
-                        (&mut out_outer[b_med * 64..(b_med + 1) * 64])
-                            .try_into()
-                            .expect("one transformed b_med block")
-                    };
-                    shift_reduce_inner_ab(
-                        a_packed,
-                        b_packed,
-                        inv_table,
-                        chunk_byte_base,
-                        b_med,
-                        dst,
-                        a_col,
-                        b_col,
-                        !blake3_static_layout || (within_hash_outer == 0 && b_med < 2),
-                        !blake3_static_layout || (within_hash_outer == 1 && b_med + 1 == n_b_med),
-                        if blake3_static_layout && within_hash_outer == 0 && b_med == 2 {
-                            0x03
-                        } else if blake3_static_layout
-                            && within_hash_outer == 1
-                            && b_med + 2 == n_b_med
-                        {
-                            0xf0
-                        } else {
-                            0
-                        },
-                        if blake3_static_layout {
-                            within_hash_outer
-                        } else {
-                            usize::MAX
-                        },
-                        static_b_context,
-                    );
-                    if nt {
-                        // SAFETY: `b_med < n_b_med ≤ OUTER_BYTES / 64`, so the
-                        // 64 destination bytes are in-bounds of `out_outer`.
-                        unsafe {
-                            store_nt_64(tmp.as_ptr(), out_outer.as_mut_ptr().add(b_med * 64))
-                        };
-                    }
-                }
-                if nt {
-                    let tail = &mut out_outer[n_b_med * 64..];
-                    debug_assert_eq!(tail.len() % 64, 0);
-                    let zero = [0u8; 64];
-                    for i in 0..tail.len() / 64 {
-                        // SAFETY: chunk `i` is 64 in-bounds bytes of `tail`.
-                        unsafe { store_nt_64(zero.as_ptr(), tail.as_mut_ptr().add(i * 64)) };
-                    }
+            // NT arm: the kernel writes a stack temporary and the 64-byte
+            // block drains to the big buffer with `stnp` (write-once
+            // lines, consumer runs after the commit root). Control arm is
+            // the incumbent direct kernel write, byte-for-byte.
+            let mut tmp = [0u8; 64];
+            for b_med in 0..n_b_med {
+                let dst: &mut [u8; 64] = if nt {
+                    &mut tmp
                 } else {
-                    out_outer[n_b_med * 64..].fill(0);
+                    (&mut out_outer[b_med * 64..(b_med + 1) * 64])
+                        .try_into()
+                        .expect("one transformed b_med block")
+                };
+                shift_reduce_inner_ab(
+                    a_packed,
+                    b_packed,
+                    inv_table,
+                    chunk_byte_base,
+                    b_med,
+                    dst,
+                    a_col,
+                    b_col,
+                    !blake3_static_layout || (within_hash_outer == 0 && b_med < 2),
+                    !blake3_static_layout || (within_hash_outer == 1 && b_med + 1 == n_b_med),
+                    if blake3_static_layout && within_hash_outer == 0 && b_med == 2 {
+                        0x03
+                    } else if blake3_static_layout
+                        && within_hash_outer == 1
+                        && b_med + 2 == n_b_med
+                    {
+                        0xf0
+                    } else {
+                        0
+                    },
+                    if blake3_static_layout {
+                        within_hash_outer
+                    } else {
+                        usize::MAX
+                    },
+                    static_b_context,
+                );
+                if nt {
+                    // SAFETY: `b_med < n_b_med ≤ OUTER_BYTES / 64`, so the
+                    // 64 destination bytes are in-bounds of `out_outer`.
+                    unsafe {
+                        store_nt_64(tmp.as_ptr(), out_outer.as_mut_ptr().add(b_med * 64))
+                    };
                 }
+            }
+            if nt {
+                let tail = &mut out_outer[n_b_med * 64..];
+                debug_assert_eq!(tail.len() % 64, 0);
+                let zero = [0u8; 64];
+                for i in 0..tail.len() / 64 {
+                    // SAFETY: chunk `i` is 64 in-bounds bytes of `tail`.
+                    unsafe { store_nt_64(zero.as_ptr(), tail.as_mut_ptr().add(i * 64)) };
+                }
+            } else {
+                out_outer[n_b_med * 64..].fill(0);
+            }
+        };
+
+    if ab_hetero_enabled() {
+        crate::epool::run_hetero_chunks_stateful(
+            n_chunks,
+            || ([F8::ZERO; ELL], [F8::ZERO; ELL]),
+            |state, x_outer| {
+                // SAFETY: chunk `x_outer` exclusively owns this range (see
+                // the contract comment above); the queue's join publishes
+                // every write before the buffer is read.
+                let out_outer = unsafe {
+                    core::slice::from_raw_parts_mut(
+                        out_base.ptr().add(x_outer * OUTER_BYTES),
+                        OUTER_BYTES,
+                    )
+                };
+                process_chunk(state, x_outer, out_outer);
             },
         );
+    } else {
+        out_bytes
+            .par_chunks_mut(OUTER_BYTES)
+            .enumerate()
+            .for_each_init(
+                || ([F8::ZERO; ELL], [F8::ZERO; ELL]),
+                |state, (x_outer, out_outer)| process_chunk(state, x_outer, out_outer),
+            );
+    }
 
     Round1AbInner { storage }
 }
