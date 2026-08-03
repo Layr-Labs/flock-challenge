@@ -4215,6 +4215,257 @@ kernel void blake3_pow_scan(
         }
     }
 
+    /// E-core offload of the hybrid suffix's leaf hashing: finalized 1,024-leaf
+    /// chunks stream into per-chunk finalized flags; the helper pool drains
+    /// them while the NTT threads keep publishing and then join the queue.
+    /// Diagnostic-only engagement (`FLOCK_ZC_SUFFIX_OFFLOAD=1`): automatic
+    /// calibration is disabled until one exists that is unbiased by the
+    /// GPU's cold/warm asymmetry between an actual commit and its replay.
+    fn suffix_offload_env_override() -> Option<bool> {
+        if std::env::var_os("FLOCK_ZC_SUFFIX_OFFLOAD").is_some() {
+            return Some(true);
+        }
+        if std::env::var_os("FLOCK_NO_ZC_SUFFIX_OFFLOAD").is_some() {
+            return Some(false);
+        }
+        None
+    }
+
+    fn suffix_offload_env() -> bool {
+        matches!(suffix_offload_env_override(), Some(true))
+            && crate::epool::helper_pool_available()
+    }
+
+    fn suffix_offload_latched() -> bool {
+        use std::sync::atomic::Ordering;
+        SUFFIX_OFFLOAD_LATCH.load(Ordering::Relaxed) == SUFFIX_ON
+    }
+
+    static SUFFIX_OFFLOAD_LATCH: std::sync::atomic::AtomicUsize =
+        std::sync::atomic::AtomicUsize::new(0);
+    const SUFFIX_UNDECIDED: usize = 0;
+    const SUFFIX_OFF: usize = 1;
+    const SUFFIX_ON: usize = 2;
+    static SUFFIX_CAL_PENDING: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
+
+    fn suffix_offload_calibration_pending() -> bool {
+        use std::sync::atomic::Ordering;
+        suffix_offload_env_override().is_none()
+            && crate::epool::helper_pool_available()
+            && SUFFIX_OFFLOAD_LATCH.load(Ordering::Relaxed) == SUFFIX_UNDECIDED
+            && !SUFFIX_CAL_PENDING.swap(true, Ordering::Relaxed)
+    }
+
+    fn publish_suffix_offload(wall_off_ms: f64, wall_on_ms: f64) {
+        use std::sync::atomic::Ordering;
+        // Absolute 1.0 ms noise floor on the warm/warm graph wall.
+        let on = wall_on_ms + 1.0 < wall_off_ms;
+        if std::env::var_os("FLOCK_ZC_SUFFIX_OFFLOAD_TRACE").is_some() {
+            eprintln!(
+                "[zc-suffix-offload] calibrate: off {wall_off_ms:.2} ms, on {wall_on_ms:.2} ms -> {}",
+                if on { "ON" } else { "OFF" }
+            );
+        }
+        SUFFIX_OFFLOAD_LATCH.store(if on { SUFFIX_ON } else { SUFFIX_OFF }, Ordering::Relaxed);
+    }
+
+    /// The CPU half of the hybrid commit: suffix NTT completion, leaf hashing
+    /// (optionally E-core-offloaded through a streaming queue), aligned
+    /// subtree parents. Returns the suffix wall in ms.
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn run_hybrid_cpu_suffix(
+        ntt: &crate::ntt::additive_ntt_f128::AdditiveNttF128,
+        data: &mut [F128],
+        tree_base: crate::epool::SyncPtr<Hash>,
+        n_leaves: usize,
+        suffix_leaf_start: usize,
+        suffix_leaves: usize,
+        k_cpu16: usize,
+        deep_pipeline: bool,
+        local_parent_levels: usize,
+        offload: bool,
+    ) -> f64 {
+        use rayon::prelude::*;
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        let t0 = std::time::Instant::now();
+        let log_d = (data.len() / 64).trailing_zeros() as usize;
+
+        // Streaming offload queue: per-chunk finalized flags; claimants spin
+        // until the NTT thread finalizes their chunk (Release/Acquire gives
+        // the happens-before edge for reading the chunk's bytes).
+        let n_chunks = suffix_leaves / 1024;
+        let offload_on = offload && n_chunks >= 4;
+        let flags: Vec<AtomicBool> = (0..n_chunks).map(|_| AtomicBool::new(false)).collect();
+        let next_claim = AtomicUsize::new(0);
+        let data_base = crate::epool::SyncPtr(data.as_ptr() as *mut u8);
+
+        let hash_chunk = |chunk_idx: usize| {
+            let leaf_start = suffix_leaf_start + chunk_idx * 1024;
+            let leaf_len = 1024.min(n_leaves - leaf_start);
+            // SAFETY: each chunk index is claimed exactly once; its leaf
+            // range and every local-parent level range are disjoint from all
+            // other chunks' and from the GPU prefix. The flag's acquire
+            // orders after the chunk's final write.
+            let bytes = unsafe {
+                core::slice::from_raw_parts(data_base.ptr().add(leaf_start * 1024), leaf_len * 1024)
+            };
+            unsafe {
+                hash_ranked_leaf_chunk_and_local_parents(
+                    bytes,
+                    tree_base,
+                    n_leaves,
+                    leaf_start,
+                    leaf_len,
+                    local_parent_levels,
+                );
+            }
+        };
+
+        let drain = || {
+            loop {
+                let i = next_claim.fetch_add(1, Ordering::Relaxed);
+                if i >= n_chunks {
+                    break;
+                }
+                while !flags[i].load(Ordering::Acquire) {
+                    std::hint::spin_loop();
+                }
+                hash_chunk(i);
+            }
+        };
+
+        if deep_pipeline {
+            let finish_chunk = |elem_offset: usize, chunk: &[F128]| {
+                debug_assert_eq!(elem_offset % 64, 0);
+                let leaf_start = elem_offset / 64;
+                let leaf_len = chunk.len() / 64;
+                debug_assert!(leaf_start >= suffix_leaf_start);
+                debug_assert!(leaf_start + leaf_len <= n_leaves);
+                if offload_on {
+                    debug_assert_eq!(leaf_len, 1024);
+                    let chunk_idx = (leaf_start - suffix_leaf_start) / 1024;
+                    flags[chunk_idx].store(true, Ordering::Release);
+                } else {
+                    // SAFETY: the NTT callback runs only after this chunk's
+                    // last write. Callback ranges are pairwise disjoint and
+                    // disjoint from the concurrently executing GPU prefix.
+                    let bytes = core::slice::from_raw_parts(
+                        chunk.as_ptr().cast::<u8>(),
+                        core::mem::size_of_val(chunk),
+                    );
+                    unsafe {
+                        hash_ranked_leaf_chunk_and_local_parents(
+                            bytes,
+                            tree_base,
+                            n_leaves,
+                            leaf_start,
+                            leaf_len,
+                            local_parent_levels,
+                        );
+                    }
+                }
+            };
+            if offload_on {
+                // E-cores start claiming immediately; the NTT threads publish
+                // and, once the transform returns, join the drain.
+                let drain_ref = &drain;
+                std::thread::scope(|s| {
+                    s.spawn(move || {
+                        if let Some(ep) = crate::epool::epool() {
+                            ep.broadcast(|_| drain_ref());
+                        }
+                    });
+                    ntt.forward_transform_interleaved_ranked_block_range_and_then(
+                        data, 64, 4, log_d, 16 - k_cpu16, 16, finish_chunk,
+                    );
+                    drain();
+                });
+            } else {
+                ntt.forward_transform_interleaved_ranked_block_range_and_then(
+                    data, 64, 4, log_d, 16 - k_cpu16, 16, finish_chunk,
+                );
+            }
+        } else {
+            // Exact same-binary control: the original streaming suffix
+            // driver followed by a separate 4,096-leaf hash traversal.
+            ntt.forward_transform_interleaved_block_range(
+                data,
+                64,
+                4,
+                log_d,
+                16 - k_cpu16,
+                16,
+                crate::ntt::additive_ntt_f128::ranked_zero_odd_tail_lanes(log_d, 64),
+            );
+            let suffix_bytes: &[u8] = unsafe {
+                core::slice::from_raw_parts(
+                    data_base.ptr().add(suffix_leaf_start * 1024),
+                    suffix_leaves * 1024,
+                )
+            };
+            const LEAF_JOB: usize = 1 << 12;
+            suffix_bytes
+                .par_chunks(LEAF_JOB * 1024)
+                .enumerate()
+                .for_each(|(i, bytes)| {
+                    // SAFETY: disjoint leaf output ranges per job.
+                    let outs = unsafe {
+                        core::slice::from_raw_parts_mut(
+                            tree_base.ptr().add(suffix_leaf_start + i * LEAF_JOB),
+                            bytes.len() / 1024,
+                        )
+                    };
+                    crate::merkle::hash_ranked_blake3_leaf_chunk(bytes, outs);
+                });
+        }
+        // Suffix aligned subtrees' parents (greedy decomposition).
+        let mut sstart = suffix_leaf_start;
+        while sstart < n_leaves {
+            let mut size = 1usize << (n_leaves - sstart).ilog2();
+            while sstart % size != 0 {
+                size >>= 1;
+            }
+            let mut level_start = 0usize;
+            let mut level_len = n_leaves;
+            let mut local_start = sstart;
+            let mut local_len = size;
+            for _ in 0..local_parent_levels {
+                level_start += level_len;
+                level_len /= 2;
+                local_start /= 2;
+                local_len /= 2;
+            }
+            while local_len > 1 {
+                let write_level_start = level_start + level_len;
+                let (r0, w0) =
+                    (level_start + local_start, write_level_start + local_start / 2);
+                let n_out = local_len / 2;
+                // SAFETY: read level fully written (leaves above /
+                // previous iteration); each job's write range is
+                // disjoint, and all are disjoint from concurrent GPU
+                // subtree ranges.
+                (0..n_out.div_ceil(1024)).into_par_iter().for_each(|j| {
+                    let o = j * 1024;
+                    let len = 1024.min(n_out - o);
+                    let read = unsafe {
+                        core::slice::from_raw_parts(tree_base.ptr().add(r0 + 2 * o), 2 * len)
+                    };
+                    let write = unsafe {
+                        core::slice::from_raw_parts_mut(tree_base.ptr().add(w0 + o), len)
+                    };
+                    crate::merkle::hash_ranked_blake3_parent_chunk(read, write);
+                });
+                level_start = write_level_start;
+                level_len /= 2;
+                local_start /= 2;
+                local_len /= 2;
+            }
+            sstart += size;
+        }
+        t0.elapsed().as_secs_f64() * 1e3
+    }
+
     unsafe fn run_commit_graph_from_z_hybrid_impl(
         gpu: &Gpu,
         z_buf: Id,
@@ -4274,133 +4525,45 @@ kernel void blake3_pow_scan(
                 } else {
                     0
                 };
-                if deep_pipeline {
-                    // Publish and hash each finalized layer-10 chunk, then
-                    // build its local parent levels before the leaf hashes
-                    // leave cache. `elem_offset` is absolute in the shared
-                    // staging buffer, hence `leaf_start` lands directly in
-                    // the CPU-owned suffix of the shared tree. Different
-                    // callback invocations own disjoint 1,024-leaf ranges at
-                    // every local level; the GPU owns only
-                    // `0..prefix_leaves`.
-                    let finish_chunk = |elem_offset: usize, chunk: &[F128]| {
-                        debug_assert_eq!(elem_offset % 64, 0);
-                        let leaf_start = elem_offset / 64;
-                        let leaf_len = chunk.len() / 64;
-                        debug_assert!(leaf_start >= suffix_leaf_start);
-                        debug_assert!(leaf_start + leaf_len <= n_leaves);
-                        // SAFETY: the NTT callback runs only after this chunk's
-                        // last write. Callback ranges are pairwise disjoint and
-                        // disjoint from the concurrently executing GPU prefix.
-                        let bytes = core::slice::from_raw_parts(
-                            chunk.as_ptr().cast::<u8>(),
-                            core::mem::size_of_val(chunk),
-                        );
-                        hash_ranked_leaf_chunk_and_local_parents(
-                            bytes,
-                            tree_base,
-                            n_leaves,
-                            leaf_start,
-                            leaf_len,
-                            local_parent_levels,
-                        );
+                // E-core engagement is diagnostic-only on the ranked runner:
+                // every auto-engaging E-core lever has regressed there
+                // (uniform bandwidth tax), so calibration never runs by
+                // default. FLOCK_ZC_SUFFIX_OFFLOAD=1 forces it for diagnostics.
+                let calibrate = false && suffix_offload_calibration_pending();
+                let suffix_off = suffix_offload_env();
+                run_hybrid_cpu_suffix(
+                    ntt,
+                    data,
+                    tree_base,
+                    n_leaves,
+                    suffix_leaf_start,
+                    suffix_leaves,
+                    k_cpu16,
+                    deep_pipeline,
+                    local_parent_levels,
+                    suffix_off,
+                );
+                let mut level_start = 0usize;
+                let mut level_len = n_leaves;
+                while level_len > 16 {
+                    level_start += level_len;
+                    level_len /= 2;
+                }
+                while level_len > 1 {
+                    let write_start = level_start + level_len;
+                    let read = unsafe {
+                        core::slice::from_raw_parts(tree_base.ptr().add(level_start), level_len)
                     };
-                    ntt.forward_transform_interleaved_ranked_block_range_and_then(
-                        data,
-                        64,
-                        4,
-                        log_d,
-                        16 - k_cpu16,
-                        16,
-                        finish_chunk,
-                    );
-                } else {
-                    // Exact same-binary control: the original streaming suffix
-                    // driver followed by a separate 4,096-leaf hash traversal.
-                    ntt.forward_transform_interleaved_block_range(
-                        data,
-                        64,
-                        4,
-                        log_d,
-                        16 - k_cpu16,
-                        16,
-                        crate::ntt::additive_ntt_f128::ranked_zero_odd_tail_lanes(log_d, 64),
-                    );
-                    let suffix_bytes: &[u8] = core::slice::from_raw_parts(
-                        data.as_ptr().cast::<u8>().add(suffix_leaf_start * 1024),
-                        suffix_leaves * 1024,
-                    );
-                    const LEAF_JOB: usize = 1 << 12;
-                    suffix_bytes
-                        .par_chunks(LEAF_JOB * 1024)
-                        .enumerate()
-                        .for_each(|(i, bytes)| {
-                            // SAFETY: disjoint leaf output ranges per job.
-                            let outs = core::slice::from_raw_parts_mut(
-                                tree_base.ptr().add(suffix_leaf_start + i * LEAF_JOB),
-                                bytes.len() / 1024,
-                            );
-                            crate::merkle::hash_ranked_blake3_leaf_chunk(bytes, outs);
-                        });
+                    let write = unsafe {
+                        core::slice::from_raw_parts_mut(
+                            tree_base.ptr().add(write_start),
+                            level_len / 2,
+                        )
+                    };
+                    crate::merkle::hash_ranked_blake3_parent_chunk(read, write);
+                    level_start = write_start;
+                    level_len /= 2;
                 }
-                // Suffix aligned subtrees' parents (greedy decomposition).
-                let mut sstart = suffix_leaf_start;
-                while sstart < n_leaves {
-                    let mut size = 1usize << (n_leaves - sstart).ilog2();
-                    while sstart % size != 0 {
-                        size >>= 1;
-                    }
-                    let mut level_start = 0usize;
-                    let mut level_len = n_leaves;
-                    let mut local_start = sstart;
-                    let mut local_len = size;
-                    // Each 1,024-leaf callback already populated these exact
-                    // flat-tree ranges. Resume at the first shared level
-                    // instead of traversing the cache-cold leaves again.
-                    for _ in 0..local_parent_levels {
-                        level_start += level_len;
-                        level_len /= 2;
-                        local_start /= 2;
-                        local_len /= 2;
-                    }
-                    while local_len > 1 {
-                        let write_level_start = level_start + level_len;
-                        let (r0, w0) =
-                            (level_start + local_start, write_level_start + local_start / 2);
-                        let n_out = local_len / 2;
-                        // ≤1024-output jobs (the parent kernel's contract),
-                        // parallel across the level.
-                        // SAFETY: read level fully written (leaves above /
-                        // previous iteration); each job's write range is
-                        // disjoint, and all are disjoint from concurrent GPU
-                        // subtree ranges.
-                        (0..n_out.div_ceil(1024)).into_par_iter().for_each(|j| {
-                            let o = j * 1024;
-                            let len = 1024.min(n_out - o);
-                            let read = core::slice::from_raw_parts(
-                                tree_base.ptr().add(r0 + 2 * o),
-                                2 * len,
-                            );
-                            let write = core::slice::from_raw_parts_mut(
-                                tree_base.ptr().add(w0 + o),
-                                len,
-                            );
-                            crate::merkle::hash_ranked_blake3_parent_chunk(read, write);
-                        });
-                        level_start = write_level_start;
-                        level_len /= 2;
-                        local_start /= 2;
-                        local_len /= 2;
-                    }
-                    sstart += size;
-                }
-
-                // Join the GPU prefix, then (re)compute every level above
-                // the sixteenth-granularity roots. Every subtree on either
-                // side spans ≥ one sixteenth (2^16 leaves), so the 16-node
-                // level is always fully populated by subtree-internal
-                // parents; the 15 nodes above it are recomputed here,
-                // covering every decomposition boundary for any k.
                 let t_wait_cb2 = window_trace_enabled().then(std::time::Instant::now);
                 gpu.wait_cb(cb2)?;
                 if let Some(t) = t_wait_cb2 {
@@ -4412,23 +4575,66 @@ kernel void blake3_pow_scan(
                         t.elapsed().as_secs_f64() * 1e3,
                     );
                 }
-                let mut level_start = 0usize;
-                let mut level_len = n_leaves;
-                while level_len > 16 {
-                    level_start += level_len;
-                    level_len /= 2;
-                }
-                while level_len > 1 {
-                    let write_start = level_start + level_len;
-                    let read =
-                        core::slice::from_raw_parts(tree_base.ptr().add(level_start), level_len);
-                    let write = core::slice::from_raw_parts_mut(
-                        tree_base.ptr().add(write_start),
-                        level_len / 2,
-                    );
-                    crate::merkle::hash_ranked_blake3_parent_chunk(read, write);
-                    level_start = write_start;
-                    level_len /= 2;
+                if calibrate {
+                    // Three warm/warm full-graph arms ([on, off, off]); the
+                    // actual (cold-GPU) graph above is the GPU warm-up, so
+                    // every arm's cb2 runs warm and the walls are symmetric
+                    // max(gpu, suffix) samples under live contention. Each
+                    // arm re-encodes a byte-identical cb2 and rewrites the
+                    // tree bit-identically; no allocations.
+                    let mut wall_on = f64::MAX;
+                    let mut wall_off = f64::MAX;
+                    for on in [true, false, false] {
+                        let cb2x = encode_hybrid_prefix_cb2(
+                            gpu, staging, tw_buf, tree_buf, log_d, n_leaves, k_cpu16,
+                        )?;
+                        gpu.commit_async(cb2x);
+                        let t = std::time::Instant::now();
+                        run_hybrid_cpu_suffix(
+                            ntt,
+                            data,
+                            tree_base,
+                            n_leaves,
+                            suffix_leaf_start,
+                            suffix_leaves,
+                            k_cpu16,
+                            deep_pipeline,
+                            local_parent_levels,
+                            on,
+                        );
+                        let mut level_start = 0usize;
+                        let mut level_len = n_leaves;
+                        while level_len > 16 {
+                            level_start += level_len;
+                            level_len /= 2;
+                        }
+                        while level_len > 1 {
+                            let write_start = level_start + level_len;
+                            let read = unsafe {
+                                core::slice::from_raw_parts(
+                                    tree_base.ptr().add(level_start),
+                                    level_len,
+                                )
+                            };
+                            let write = unsafe {
+                                core::slice::from_raw_parts_mut(
+                                    tree_base.ptr().add(write_start),
+                                    level_len / 2,
+                                )
+                            };
+                            crate::merkle::hash_ranked_blake3_parent_chunk(read, write);
+                            level_start = write_start;
+                            level_len /= 2;
+                        }
+                        gpu.wait_cb(cb2x)?;
+                        let w = t.elapsed().as_secs_f64() * 1e3;
+                        if on {
+                            wall_on = wall_on.min(w);
+                        } else {
+                            wall_off = wall_off.min(w);
+                        }
+                    }
+                    publish_suffix_offload(wall_off, wall_on);
                 }
                 Ok(())
             })();
@@ -4447,11 +4653,9 @@ kernel void blake3_pow_scan(
         n_leaves: usize,
         k_cpu16: usize,
     ) -> Result<(), String> {
-        unsafe {
-            run_commit_graph_from_z_hybrid_impl(
-                gpu, z_buf, staging, tw_buf, tree_buf, log_d, n_leaves, k_cpu16, false, None,
-            )
-        }
+        run_commit_graph_from_z_hybrid_impl(
+            gpu, z_buf, staging, tw_buf, tree_buf, log_d, n_leaves, k_cpu16, false, None,
+        )
     }
 
     /// CPU share of the hybrid commit in sixteenths of the position range.
@@ -8075,6 +8279,11 @@ static inline uint4 gf_reduce(U256k p) {
     return uint4(uint(l0), uint(l0 >> 32), uint(l1), uint(l1 >> 32));
 }
 
+static inline U256k mk256(ulong4 v) {
+    U256k r; r.r0 = v.x; r.r1 = v.y; r.r2 = v.z; r.r3 = v.w;
+    return r;
+}
+
 // Univariate-skip fold of one packed 8-byte row via per-bank nibble tables
 // (bank j, entries: [j*32 + n] = T_j[n], [j*32 + 16 + n] = T_j[n << 4];
 // T_j[v] = T_j[v & 15] ^ T_j[v & 0xF0] by F2-linearity of the byte banks).
@@ -8178,6 +8387,7 @@ kernel void zc_r2_products(
         partials[tgid * 4u + 3u] = gf_reduce(clmul128(e, gf_reduce(uio)));
     }
 }
+
 "#;
 
     /// Process-lifetime Metal state for the round-two products arm.
@@ -8314,36 +8524,39 @@ kernel void zc_r2_products(
                         gpu.api.error_string(err)
                     ));
                 }
-                let ns = gpu.api.nsstring("zc_r2_products")?;
-                let f: Id = send!(
-                    gpu.api,
-                    unsafe extern "C" fn(Id, Sel, Id) -> Id,
-                    library,
-                    c"newFunctionWithName:",
-                    ns
-                );
-                if f.is_null() {
-                    send!(gpu.api, unsafe extern "C" fn(Id, Sel) -> Id, library, c"release");
-                    return Err("zc_r2_products kernel not found".into());
-                }
-                let mut perr: Id = NIL;
-                let pso: Id = send!(
-                    gpu.api,
-                    unsafe extern "C" fn(Id, Sel, Id, *mut Id) -> Id,
-                    gpu.device,
-                    c"newComputePipelineStateWithFunction:error:",
-                    f,
-                    &mut perr
-                );
-                send!(gpu.api, unsafe extern "C" fn(Id, Sel) -> Id, f, c"release");
+                let make = |name: &str| -> Result<Id, String> {
+                    let ns = gpu.api.nsstring(name)?;
+                    let f: Id = send!(
+                        gpu.api,
+                        unsafe extern "C" fn(Id, Sel, Id) -> Id,
+                        library,
+                        c"newFunctionWithName:",
+                        ns
+                    );
+                    if f.is_null() {
+                        return Err(format!("{name} kernel not found"));
+                    }
+                    let mut perr: Id = NIL;
+                    let pso: Id = send!(
+                        gpu.api,
+                        unsafe extern "C" fn(Id, Sel, Id, *mut Id) -> Id,
+                        gpu.device,
+                        c"newComputePipelineStateWithFunction:error:",
+                        f,
+                        &mut perr
+                    );
+                    send!(gpu.api, unsafe extern "C" fn(Id, Sel) -> Id, f, c"release");
+                    if pso.is_null() {
+                        return Err(format!(
+                            "{name} pipeline: {}",
+                            gpu.api.error_string(perr)
+                        ));
+                    }
+                    Ok(pso)
+                };
+                let pso = make("zc_r2_products");
                 send!(gpu.api, unsafe extern "C" fn(Id, Sel) -> Id, library, c"release");
-                if pso.is_null() {
-                    return Err(format!(
-                        "zc_r2_products pipeline: {}",
-                        gpu.api.error_string(perr)
-                    ));
-                }
-                Ok(pso)
+                Ok(pso?)
             })();
             gpu.pool_pop(pool);
             let pso = built?;
@@ -8603,6 +8816,7 @@ kernel void zc_r2_products(
             })
         }
     }
+
 
     /// Drain the arm. During calibration `cpu_partials` must hold the CPU's
     /// full per-chunk partial vector and `cpu_wall_ms` the wall of the full

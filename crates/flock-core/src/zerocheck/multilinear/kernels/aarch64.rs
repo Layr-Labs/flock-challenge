@@ -1564,6 +1564,185 @@ fn fold_and_message_body<const NT: bool>(
     (p1_acc.reduce(), pinf_acc.reduce())
 }
 
+/// One multilinear tail fold fused with the following round's message
+/// **and** the deferred round-`(i+4)` message coefficients — the round-6
+/// lookahead, one inductive level below the round-two/round-three variant-K
+/// lookahead. Used at tail iteration `i = 2`.
+///
+/// `x_lo` is visited two at a time: group `u` folds the eight input rows
+/// into `(P,Q,R,S)` and computes the deferred products from the register-
+/// resident folded values (no output readback). The round-six message's eq
+/// is the driver's `eq6` (challenges shifted by two), so the group weight is
+/// `eq6_lo[u]` and the driver scales the partial by `eq6_hi[x_hi]`. Exact,
+/// no rescale.
+#[cfg(target_arch = "aarch64")]
+pub(crate) fn fold_and_message_l5_aarch64(
+    a_in: &[F128],
+    b_in: &[F128],
+    a_out: &mut [F128],
+    b_out: &mut [F128],
+    r_fold: F128,
+    eq_lo: &[F128],
+    eq6_lo: &[F128],
+    nt_stores: bool,
+    l5: &mut [F128; 6],
+) -> (F128, F128) {
+    debug_assert_eq!(eq_lo.len() % 2, 0, "l5 groups two x_lo slots");
+    debug_assert_eq!(eq6_lo.len(), eq_lo.len() / 2);
+    l5.fill(F128::ZERO);
+
+    #[inline(always)]
+    unsafe fn store_pair_nt(dst: *mut F128, x: core::arch::aarch64::uint64x2_t, y: core::arch::aarch64::uint64x2_t) {
+        unsafe {
+            core::arch::asm!(
+                "stnp {x:q}, {y:q}, [{dst}]",
+                dst = in(reg) dst,
+                x = in(vreg) x,
+                y = in(vreg) y,
+                options(nostack, preserves_flags),
+            );
+        }
+    }
+    let a_out_ptr = a_out.as_mut_ptr();
+    let b_out_ptr = b_out.as_mut_ptr();
+
+    let mut p1_acc = F256Unreduced::ZERO;
+    let mut pinf_acc = F256Unreduced::ZERO;
+
+    for u in 0..eq_lo.len() / 2 {
+        let i = 8 * u;
+        let o = 4 * u;
+        let w = eq6_lo[u];
+
+        // x_lo = 2u: fold (P,Q).
+        let pa = a_in[i] + r_fold * (a_in[i] + a_in[i + 1]);
+        let qa = a_in[i + 2] + r_fold * (a_in[i + 2] + a_in[i + 3]);
+        let pb = b_in[i] + r_fold * (b_in[i] + b_in[i + 1]);
+        let qb = b_in[i + 2] + r_fold * (b_in[i + 2] + b_in[i + 3]);
+        // x_lo = 2u+1: fold (R,S).
+        let ra = a_in[i + 4] + r_fold * (a_in[i + 4] + a_in[i + 5]);
+        let sa = a_in[i + 6] + r_fold * (a_in[i + 6] + a_in[i + 7]);
+        let rb = b_in[i + 4] + r_fold * (b_in[i + 4] + b_in[i + 5]);
+        let sb = b_in[i + 6] + r_fold * (b_in[i + 6] + b_in[i + 7]);
+
+        if nt_stores {
+            unsafe {
+                store_pair_nt(
+                    a_out_ptr.add(o),
+                    core::mem::transmute::<F128, core::arch::aarch64::uint64x2_t>(pa),
+                    core::mem::transmute::<F128, core::arch::aarch64::uint64x2_t>(qa),
+                );
+                store_pair_nt(
+                    a_out_ptr.add(o + 2),
+                    core::mem::transmute::<F128, core::arch::aarch64::uint64x2_t>(ra),
+                    core::mem::transmute::<F128, core::arch::aarch64::uint64x2_t>(sa),
+                );
+                store_pair_nt(
+                    b_out_ptr.add(o),
+                    core::mem::transmute::<F128, core::arch::aarch64::uint64x2_t>(pb),
+                    core::mem::transmute::<F128, core::arch::aarch64::uint64x2_t>(qb),
+                );
+                store_pair_nt(
+                    b_out_ptr.add(o + 2),
+                    core::mem::transmute::<F128, core::arch::aarch64::uint64x2_t>(rb),
+                    core::mem::transmute::<F128, core::arch::aarch64::uint64x2_t>(sb),
+                );
+            }
+        } else {
+            a_out[o] = pa;
+            a_out[o + 1] = qa;
+            a_out[o + 2] = ra;
+            a_out[o + 3] = sa;
+            b_out[o] = pb;
+            b_out[o + 1] = qb;
+            b_out[o + 2] = rb;
+            b_out[o + 3] = sb;
+        }
+
+        // Ordinary round-(i+3) message products on the odd folded pair.
+        let e2u = eq_lo[2 * u];
+        let e2u1 = eq_lo[2 * u + 1];
+        p1_acc ^= e2u.mul_unreduced(qa * qb);
+        pinf_acc ^= e2u.mul_unreduced((pa + qa) * (pb + qb));
+        p1_acc ^= e2u1.mul_unreduced(sa * sb);
+        pinf_acc ^= e2u1.mul_unreduced((ra + sa) * (rb + sb));
+
+        // Deferred round-(i+4) quadratic-in-ρ coefficients, register-resident.
+        let q0 = ra * rb;
+        let q1 = ra * sb + sa * rb;
+        let q2 = (ra + sa) * (rb + sb);
+        let (e, o_) = (pa + ra, pa + qa + ra + sa);
+        let (eb, ob) = (pb + rb, pb + qb + rb + sb);
+        let r0 = e * eb;
+        let r1 = e * ob + o_ * eb;
+        let r2 = o_ * ob;
+        l5[0] += w * q0;
+        l5[1] += w * q1;
+        l5[2] += w * q2;
+        l5[3] += w * r0;
+        l5[4] += w * r1;
+        l5[5] += w * r2;
+    }
+
+    (p1_acc.reduce(), pinf_acc.reduce())
+}
+
+/// Composed double fold (at ρ₃ then ρ₄) straight out of the round-`i+2`
+/// state, emitting the round-`(i+5)` message in the same pass — the consumer
+/// of the round-6 lookahead. Eight input rows yield two outputs
+/// `a6 = e4 + ρ4(e4+f4)` with `e4 = P+ρ3(P+Q)`, `f4 = R+ρ3(R+S)`, and the
+/// message products run on the odd `a6` of each pair — the exact
+/// [`round_pair_naive`] expressions on the composed state, so the result is
+/// value-identical to two incumbent iterations while reading the `i+2`
+/// state once and writing only the `i+5` state.
+#[cfg(target_arch = "aarch64")]
+pub(crate) fn fold3_and_message_aarch64(
+    a_in: &[F128],
+    b_in: &[F128],
+    a_out: &mut [F128],
+    b_out: &mut [F128],
+    rho3: F128,
+    rho4: F128,
+    eq_lo: &[F128],
+) -> (F128, F128) {
+    debug_assert_eq!(a_in.len(), 8 * eq_lo.len());
+    debug_assert_eq!(b_in.len(), 8 * eq_lo.len());
+    debug_assert_eq!(a_out.len(), 2 * eq_lo.len());
+    debug_assert_eq!(b_out.len(), 2 * eq_lo.len());
+
+    let mut p1_acc = F256Unreduced::ZERO;
+    let mut pinf_acc = F256Unreduced::ZERO;
+    for (g, &eq_l) in eq_lo.iter().enumerate() {
+        let i = 8 * g;
+        let (pa, qa, ra, sa, ta, ua, va, wa_) = (
+            a_in[i], a_in[i + 1], a_in[i + 2], a_in[i + 3],
+            a_in[i + 4], a_in[i + 5], a_in[i + 6], a_in[i + 7],
+        );
+        let (pb, qb, rb, sb, tb, ub, vb, wb) = (
+            b_in[i], b_in[i + 1], b_in[i + 2], b_in[i + 3],
+            b_in[i + 4], b_in[i + 5], b_in[i + 6], b_in[i + 7],
+        );
+        let e4a = pa + rho3 * (pa + qa);
+        let e4b = pb + rho3 * (pb + qb);
+        let f4a = ra + rho3 * (ra + sa);
+        let f4b = rb + rho3 * (rb + sb);
+        let o4a = ta + rho3 * (ta + ua);
+        let o4b = tb + rho3 * (tb + ub);
+        let g4a = va + rho3 * (va + wa_);
+        let g4b = vb + rho3 * (vb + wb);
+        let a60 = e4a + rho4 * (e4a + f4a);
+        let a61 = o4a + rho4 * (o4a + g4a);
+        let b60 = e4b + rho4 * (e4b + f4b);
+        let b61 = o4b + rho4 * (o4b + g4b);
+        a_out[2 * g] = a60;
+        a_out[2 * g + 1] = a61;
+        b_out[2 * g] = b60;
+        b_out[2 * g + 1] = b61;
+        p1_acc ^= eq_l.mul_unreduced(a61 * b61);
+        pinf_acc ^= eq_l.mul_unreduced((a60 + a61) * (b60 + b61));
+    }
+    (p1_acc.reduce(), pinf_acc.reduce())
+}
 #[cfg(all(test, target_arch = "aarch64", target_feature = "aes"))]
 mod tests {
     use super::*;

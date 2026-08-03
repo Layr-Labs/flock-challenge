@@ -27,9 +27,11 @@ pub mod univariate_skip_deg4_optimized;
 pub mod univariate_skip_optimized;
 
 use multilinear::{
-    UniSkipFoldTable, eval_round3_lookahead, fold2_compact_and_round4_into,
-    fold_and_compute_round_pair_into, fold_compact_and_compute_round_pair, fold_in_place_pair,
-    interpolate_at_z_combined, interpolate_at_z_on_lambda, round_pair_naive,
+    UniSkipFoldTable, eval_round3_lookahead, eval_round5_lookahead,
+    fold2_compact_and_round4_into, fold3_and_message_into,
+    fold_and_compute_round_pair_into, fold_and_compute_round_pair_into_with_l5,
+    fold_compact_and_compute_round_pair, fold_in_place_pair, interpolate_at_z_combined,
+    interpolate_at_z_on_lambda, round_pair_naive,
     uni_skip_fold_and_round_pair_compact_padded_lookahead,
     uni_skip_fold_and_round_pair_compact_padded_with_deltas,
 };
@@ -54,6 +56,23 @@ fn lookahead_off() -> bool {
         return true;
     }
     std::env::var_os("FLOCK_NO_ZC_LOOKAHEAD").is_some()
+}
+/// Test-only forced-off latch for the round-6 lookahead cascade; production
+/// reads `FLOCK_NO_ZC_L5`.
+#[cfg(test)]
+pub(crate) static ZC_L5_FORCED_OFF: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Kill switch for the round-6 lookahead cascade (l5 accumulation at i=2 +
+/// composed fold3): `FLOCK_NO_ZC_L5=1` restores the incumbent tail loop in
+/// the same binary for A/B screening.
+#[inline]
+fn l5_off() -> bool {
+    #[cfg(test)]
+    if ZC_L5_FORCED_OFF.load(std::sync::atomic::Ordering::Relaxed) {
+        return true;
+    }
+    std::env::var_os("FLOCK_NO_ZC_L5").is_some()
 }
 
 /// Number of variables folded in round 1 via the additive-NTT univariate skip.
@@ -712,7 +731,75 @@ fn prove_packed_padded_inner<C: Challenger>(
         challenger.observe_f128(m4_1);
         challenger.observe_f128(m4_inf);
         mlv_rhos.push(challenger.sample_f128());
-        (a_out, b_out, 2usize)
+
+        // Round-6 lookahead cascade: iteration i = 2 accumulates the
+        // deferred round-six message (quadratic in ρ₄) inside its fused
+        // fold, and a composed double fold at (ρ₄, ρ₅) then replaces
+        // iterations i = 3 and i = 4. Gated like the round-3 lookahead:
+        // same-binary kill switch, and the incumbent route stays in the
+        // tree as the fallback.
+        let use_l5 = !l5_off()
+            && n_mlv >= 8
+            && r[k_skip + 4] != F128::ONE
+            && a_out.len() >= 1 << 12;
+        if use_l5 {
+            let log_n2 = a_out.len().trailing_zeros() as usize;
+            let mut r_next5 = vec![F128::ONE; log_n2 - 1];
+            r_next5[1..].copy_from_slice(&r[k_skip + 4..]);
+            let mut a3 = crate::scratch::take_f128_unpinned(a_out.len() / 2);
+            let mut b3 = crate::scratch::take_f128_unpinned(a_out.len() / 2);
+            let t_l5 = std::time::Instant::now();
+            let ((m5_1, m5_inf), la6) = fold_and_compute_round_pair_into_with_l5(
+                &a_out, &b_out, &mut a3, &mut b3, mlv_rhos[2], &r_next5,
+            );
+            if tail_round_timing {
+                eprintln!(
+                    "[zc-tail-rounds] l5 fold + round5 (out n={}): {:.2} ms",
+                    a3.len(),
+                    t_l5.elapsed().as_secs_f64() * 1e3
+                );
+            }
+            crate::scratch::give_f128(a_out);
+            crate::scratch::give_f128(b_out);
+            multilinear_msgs.push((m5_1, m5_inf));
+            challenger.observe_f128(m5_1);
+            challenger.observe_f128(m5_inf);
+            mlv_rhos.push(challenger.sample_f128());
+
+            // Round six: evaluate the deferred quadratic. No pass at all.
+            let (m6_1, m6_inf) = eval_round5_lookahead(&la6, mlv_rhos[3]);
+            multilinear_msgs.push((m6_1, m6_inf));
+            challenger.observe_f128(m6_1);
+            challenger.observe_f128(m6_inf);
+            mlv_rhos.push(challenger.sample_f128());
+
+            // Rounds six and seven fold together out of the i=2 state,
+            // replacing tail iterations i = 3 and i = 4.
+            let mut r7 = vec![F128::ONE; log_n2 - 3];
+            r7[1..].copy_from_slice(&r[k_skip + 6..]);
+            let mut a5 = crate::scratch::take_f128_unpinned(a3.len() / 4);
+            let mut b5 = crate::scratch::take_f128_unpinned(a3.len() / 4);
+            let t_f3 = std::time::Instant::now();
+            let (m7_1, m7_inf) = fold3_and_message_into(
+                &a3, &b3, &mut a5, &mut b5, mlv_rhos[3], mlv_rhos[4], &r7,
+            );
+            if tail_round_timing {
+                eprintln!(
+                    "[zc-tail-rounds] fold3 + round7 (out n={}): {:.2} ms",
+                    a5.len(),
+                    t_f3.elapsed().as_secs_f64() * 1e3
+                );
+            }
+            crate::scratch::give_f128(a3);
+            crate::scratch::give_f128(b3);
+            multilinear_msgs.push((m7_1, m7_inf));
+            challenger.observe_f128(m7_1);
+            challenger.observe_f128(m7_inf);
+            mlv_rhos.push(challenger.sample_f128());
+            (a5, b5, 5usize)
+        } else {
+            (a_out, b_out, 2usize)
+        }
     } else {
         let t_t3 = std::time::Instant::now();
         let mut first_r_next = vec![F128::ONE; n_mlv - 1];
@@ -1680,5 +1767,43 @@ mod tests {
                 "mlv_challenges m={m}"
             );
         }
+    }
+
+    /// The round-6 lookahead cascade must emit the identical transcript as
+    /// the incumbent tail loop at a size that exercises it (m = 21 ⇒ the
+    /// i = 2 state is 2^14, so l5 + fold3 engage).
+    #[test]
+    fn prove_transcript_identical_with_and_without_l5() {
+        use std::sync::atomic::Ordering;
+        let m = 21usize;
+        let mut rng = Rng::new(0x15_0000 ^ m as u64);
+        let a = rng.bits(1 << m);
+        let b = rng.bits(1 << m);
+        let c: Vec<bool> = a.iter().zip(&b).map(|(x, y)| *x & *y).collect();
+        let (a_p, b_p, c_p) = pack_abc(&a, &b, &c);
+
+        ZC_L5_FORCED_OFF.store(false, Ordering::Relaxed);
+        let mut ch_on = FsChallenger::new(b"flock-test-v0");
+        let (proof_on, claim_on) = prove_packed(&a_p, &b_p, &c_p, m, &mut ch_on);
+
+        ZC_L5_FORCED_OFF.store(true, Ordering::Relaxed);
+        let mut ch_off = FsChallenger::new(b"flock-test-v0");
+        let (proof_off, claim_off) = prove_packed(&a_p, &b_p, &c_p, m, &mut ch_off);
+        ZC_L5_FORCED_OFF.store(false, Ordering::Relaxed);
+
+        assert_eq!(proof_on.round1_ab, proof_off.round1_ab, "round1_ab");
+        assert_eq!(proof_on.round1_c, proof_off.round1_c, "round1_c");
+        assert_eq!(
+            proof_on.multilinear_rounds, proof_off.multilinear_rounds,
+            "multilinear_rounds"
+        );
+        assert_eq!(proof_on.final_a_eval, proof_off.final_a_eval, "a_eval");
+        assert_eq!(proof_on.final_b_eval, proof_off.final_b_eval, "b_eval");
+        assert_eq!(proof_on.final_c_eval, proof_off.final_c_eval, "c_eval");
+        assert_eq!(claim_on.z, claim_off.z, "z");
+        assert_eq!(
+            claim_on.mlv_challenges, claim_off.mlv_challenges,
+            "mlv_challenges"
+        );
     }
 }
