@@ -36,6 +36,7 @@ pub mod pcs;
 pub mod permutation;
 pub mod proof;
 pub mod r1cs;
+pub mod r284_lane_rent;
 pub mod scratch;
 pub mod verifier;
 pub mod zerocheck;
