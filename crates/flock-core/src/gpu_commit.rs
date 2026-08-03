@@ -106,10 +106,11 @@ pub(crate) fn gpu_lincheck_debug() -> bool {
 /// Kill switch for the zerocheck round-two PRODUCTS GPU arm:
 /// `FLOCK_NO_GPU_ZC_R2=1` keeps the whole round-two fused fold on the CPU
 /// (the exact incumbent). Unlike the refuted whole-phase tail offload, this
-/// arm computes ONLY the two round-two message accumulators for a measured
-/// prefix of the hi-chunks — the anchors and packed deltas that feed round
-/// three are produced by the CPU for every chunk, byte-identically, so the
-/// GPU's entire output surface is 32 bytes of reduced partials per chunk.
+/// arm computes ONLY reduced product accumulators for a measured prefix of
+/// the hi-chunks — the anchors and packed deltas that feed round three are
+/// produced by the CPU for every chunk, byte-identically. The promoted mode
+/// emits four parity-split round-two partials (64 bytes/chunk); the lookahead
+/// extension emits all eight needed products (128 bytes/chunk).
 /// The per-chunk partial values are bit-exact by construction (the fold is
 /// the same F2-linear byte-table XOR, the products use the oracle-proven
 /// emulated carry-less multiply, and the unreduced 256-bit accumulation is
@@ -121,6 +122,19 @@ pub const ENV_NO_GPU_ZC_R2: &str = "FLOCK_NO_GPU_ZC_R2";
 pub(crate) fn gpu_zc_r2_enabled() -> bool {
     static ON: std::sync::LazyLock<bool> =
         std::sync::LazyLock::new(|| std::env::var_os(ENV_NO_GPU_ZC_R2).is_none());
+    *ON
+}
+
+/// Kill switch for the all-eight-products extension of the round-two GPU arm.
+/// `FLOCK_NO_ZC_R2_FULL_OFFLOAD=1` retains the promoted parity-split kernel and
+/// CPU lookahead division of labour. The generic/non-lookahead round-two path
+/// also always uses that promoted kernel because it has no eight-slot
+/// lookahead contract to consume.
+pub const ENV_NO_ZC_R2_FULL_OFFLOAD: &str = "FLOCK_NO_ZC_R2_FULL_OFFLOAD";
+
+pub(crate) fn gpu_zc_r2_full_offload_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os(ENV_NO_ZC_R2_FULL_OFFLOAD).is_none());
     *ON
 }
 
@@ -7993,14 +8007,15 @@ kernel void rec_parent_hash(device const uint* children [[buffer(0)]],
     //
     // The round-two fused fold sweeps 2^25 packed row pairs: per pair, four
     // byte-table folds (F2-linear XOR gathers), the compact anchor/delta
-    // stores that feed round three, and the two message products
+    // stores that feed round three, and the two round-two message products
     // `eq_lo ⊗ (a1·b1)` / `eq_lo ⊗ ((a0+a1)(b0+b1))` accumulated unreduced.
-    // This arm offloads ONLY the products for a measured prefix of the
+    // This arm offloads ONLY reduced products for a measured prefix of the
     // hi-chunks: the CPU keeps producing every anchor and delta byte
-    // (byte-identical, via an anchors-only variant of the same NEON kernel
-    // for prefix chunks), so the GPU's entire output is one reduced partial
-    // pair (32 bytes) per chunk, and the refuted whole-phase offload's
-    // 1.5 GiB output-wrap surface never exists.
+    // (byte-identical, via products-skipping variants of the same NEON
+    // kernel for prefix chunks). The promoted kernel emits four parity-split
+    // partials (64 bytes/chunk); the lookahead extension emits its full eight
+    // products (128 bytes/chunk). The refuted whole-phase offload's 1.5 GiB
+    // output-wrap surface never exists.
     //
     // Bit-exactness: the fold is the same byte-table XOR (the 32 KiB table
     // decomposes into 4 KiB of nibble tables by F2-linearity), the products
@@ -8008,9 +8023,10 @@ kernel void rec_parent_hash(device const uint* children [[buffer(0)]],
     // on this board, and the unreduced 256-bit accumulation is
     // order-independent XOR. Calibration additionally refuses to publish a
     // share until the GPU probe's partials compare EQUAL to the CPU's own
-    // partials for the same chunks on the target machine itself; any
-    // mismatch or Metal failure poisons the arm for the process and every
-    // prove runs the exact incumbent.
+    // partials for the same chunks on the target machine itself. A full-mode
+    // rejection disables only that extension and falls back to the promoted
+    // kernel; a promoted mismatch or Metal infrastructure failure poisons
+    // the shared arm for the process.
     // -----------------------------------------------------------------------
 
     const ZC_R2_MSL_SOURCE: &str = r#"
@@ -8178,11 +8194,129 @@ kernel void zc_r2_products(
         partials[tgid * 4u + 3u] = gf_reduce(clmul128(e, gf_reduce(uio)));
     }
 }
+
+struct U256v { uint4 lo; uint4 hi; };
+
+static inline U256v u256v(U256k p) {
+    U256v v;
+    v.lo = as_type<uint4>(ulong2(p.r0, p.r1));
+    v.hi = as_type<uint4>(ulong2(p.r2, p.r3));
+    return v;
+}
+
+static inline U256k u256k(U256v v) {
+    ulong2 lo = as_type<ulong2>(v.lo);
+    ulong2 hi = as_type<ulong2>(v.hi);
+    U256k p;
+    p.r0 = lo.x; p.r1 = lo.y; p.r2 = hi.x; p.r3 = hi.y;
+    return p;
+}
+
+// Lookahead-only extension: four adjacent lanes own the four rows of one
+// lookahead group and branchlessly select two products each. Every lane has
+// the same preweight-plus-two-products instruction sites: 12 clmul128 per
+// group instead of independently weighting all eight products (16). Keeping
+// two U256 accumulators per lane limits register pressure; SIMD XOR masks
+// 4/8/16 reduce each row independently. With the nibble table and reduction
+// scratch, the kernel declares 6 KiB of threadgroup memory.
+kernel void zc_r2_products_full(
+    device const uint2* a_in  [[buffer(0)]],
+    device const uint2* b_in  [[buffer(1)]],
+    device const uint4* eq_lo [[buffer(2)]],
+    device const uint4* eq_hi [[buffer(3)]],
+    device const uint4* nib_tab_dev [[buffer(4)]],
+    device uint4*       partials    [[buffer(5)]],
+    constant ZcR2Params& p          [[buffer(6)]],
+    uint tgid [[threadgroup_position_in_grid]],
+    uint lid  [[thread_index_in_threadgroup]],
+    uint sgid [[simdgroup_index_in_threadgroup]],
+    uint slid [[thread_index_in_simdgroup]])
+{
+    threadgroup uint4 nib[256];
+    threadgroup ulong4 red[2][32];
+    nib[lid] = nib_tab_dev[lid];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    U256v acc0 = { uint4(0u), uint4(0u) };
+    U256v acc1 = { uint4(0u), uint4(0u) };
+    uint sub = lid & 3u;
+    for (uint k = 0u; k < p.xpt; k++) {
+        uint group = k * 64u + (lid >> 2u);
+        uint x_lo = 2u * group + (sub >> 1u);
+        uint pair_idx = tgid * p.lo_size + x_lo;
+        bool padded = (pair_idx & p.mask) >= p.useful;
+        uint row_idx = 2u * pair_idx + (sub & 1u);
+        uint2 ar = padded ? uint2(0u) : a_in[row_idx];
+        uint2 br = padded ? uint2(0u) : b_in[row_idx];
+        uint4 av = zc_r2_fold8(ar.x, ar.y, nib);
+        uint4 bv = zc_r2_fold8(br.x, br.y, nib);
+        uint4 w = eq_lo[2u * group + 1u];
+        uint4 aw = gf_reduce(clmul128(w, av));
+
+        uint4 aw1 = simd_shuffle_xor(aw, ushort(1));
+        uint4 aw2 = simd_shuffle_xor(aw, ushort(2));
+        uint4 aw3 = simd_shuffle_xor(aw, ushort(3));
+        uint4 bv1 = simd_shuffle_xor(bv, ushort(1));
+        uint4 bv2 = simd_shuffle_xor(bv, ushort(2));
+        uint4 bv3 = simd_shuffle_xor(bv, ushort(3));
+
+        uint4 q0a = aw1;
+        uint4 q0b = bv1;
+        q0a = select(q0a, aw2, sub == 1u);
+        q0b = select(q0b, bv2, sub == 1u);
+        q0a = select(q0a, aw, sub == 2u);
+        q0b = select(q0b, bv, sub == 2u);
+        q0a = select(q0a, aw ^ aw2, sub == 3u);
+        q0b = select(q0b, bv ^ bv2, sub == 3u);
+        U256v q0 = u256v(clmul128(q0a, q0b));
+        acc0.lo ^= q0.lo; acc0.hi ^= q0.hi;
+
+        uint4 q1a = aw ^ aw1;
+        uint4 q1b = bv ^ bv1;
+        q1a = select(q1a, aw3 ^ aw2, sub == 1u);
+        q1b = select(q1b, bv3 ^ bv2, sub == 1u);
+        q1a = select(q1a, aw ^ aw2, sub == 2u);
+        q1b = select(q1b, bv ^ bv2, sub == 2u);
+        q1a = select(q1a, aw ^ aw1 ^ aw2 ^ aw3, sub == 3u);
+        q1b = select(q1b, bv ^ bv1 ^ bv2 ^ bv3, sub == 3u);
+        U256v q1 = u256v(clmul128(q1a, q1b));
+        acc1.lo ^= q1.lo; acc1.hi ^= q1.hi;
+    }
+
+    for (ushort s = 4; s <= 16; s <<= 1) {
+        acc0.lo ^= simd_shuffle_xor(acc0.lo, s); acc0.hi ^= simd_shuffle_xor(acc0.hi, s);
+        acc1.lo ^= simd_shuffle_xor(acc1.lo, s); acc1.hi ^= simd_shuffle_xor(acc1.hi, s);
+    }
+    if (slid < 4u) {
+        uint dst = 4u * sgid + slid;
+        U256k a0 = u256k(acc0), a1 = u256k(acc1);
+        red[0][dst] = ulong4(a0.r0, a0.r1, a0.r2, a0.r3);
+        red[1][dst] = ulong4(a1.r0, a1.r1, a1.r2, a1.r3);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (lid == 0u) {
+        uint4 e = eq_hi[tgid];
+        for (uint lane = 0u; lane < 4u; lane++) {
+            for (uint a = 0u; a < 2u; a++) {
+                ulong4 chunk = ulong4(0ul);
+                for (uint sg = 0u; sg < 8u; sg++) {
+                    chunk ^= red[a][4u * sg + lane];
+                }
+                U256k u;
+                u.r0 = chunk.x; u.r1 = chunk.y; u.r2 = chunk.z; u.r3 = chunk.w;
+                partials[tgid * 8u + 2u * lane + a] =
+                    gf_reduce(clmul128(e, gf_reduce(u)));
+            }
+        }
+    }
+}
 "#;
 
     /// Process-lifetime Metal state for the round-two products arm.
     struct ZcR2 {
         pso: Id,
+        pso_full: Id,
         /// Persistent small buffers: nibble table (4 KiB), eq_lo, eq_hi,
         /// reduced partials. Sized on first use for the ranked shape.
         nib_buf: Id,
@@ -8202,32 +8336,60 @@ kernel void zc_r2_products(
 
     static ZC_R2_STATE: std::sync::OnceLock<Option<std::sync::Mutex<ZcR2>>> =
         std::sync::OnceLock::new();
-    /// Published GPU chunk share. `usize::MAX` = uncalibrated (first prove
-    /// calibrates), `0` = arm off for this process.
-    static ZC_R2_TUNED: std::sync::atomic::AtomicUsize =
+    /// Published GPU chunk shares. The promoted and full-product kernels
+    /// have different costs and equality oracles, so each mode must perform
+    /// its own first-prove calibration. `usize::MAX` = uncalibrated, `0` =
+    /// that mode is off for this process.
+    static ZC_R2_TUNED_PROMOTED: std::sync::atomic::AtomicUsize =
+        std::sync::atomic::AtomicUsize::new(usize::MAX);
+    static ZC_R2_TUNED_FULL: std::sync::atomic::AtomicUsize =
         std::sync::atomic::AtomicUsize::new(usize::MAX);
     static ZC_R2_POISONED: std::sync::atomic::AtomicBool =
         std::sync::atomic::AtomicBool::new(false);
 
+    fn zc_r2_tuned(full_products: bool) -> &'static std::sync::atomic::AtomicUsize {
+        if full_products {
+            &ZC_R2_TUNED_FULL
+        } else {
+            &ZC_R2_TUNED_PROMOTED
+        }
+    }
+
     #[cfg(test)]
     pub(crate) fn zc_r2_test_reset() {
         use std::sync::atomic::Ordering;
-        ZC_R2_TUNED.store(usize::MAX, Ordering::Relaxed);
+        ZC_R2_TUNED_PROMOTED.store(usize::MAX, Ordering::Relaxed);
+        ZC_R2_TUNED_FULL.store(usize::MAX, Ordering::Relaxed);
         ZC_R2_POISONED.store(false, Ordering::Relaxed);
     }
 
     #[cfg(test)]
-    pub(crate) fn zc_r2_test_state() -> (usize, bool) {
+    pub(crate) fn zc_r2_test_state(full_products: bool) -> (usize, bool) {
         use std::sync::atomic::Ordering;
         (
-            ZC_R2_TUNED.load(Ordering::Relaxed),
+            zc_r2_tuned(full_products).load(Ordering::Relaxed),
             ZC_R2_POISONED.load(Ordering::Relaxed),
         )
     }
 
     #[cfg(test)]
-    pub(crate) fn zc_r2_test_set_share(share: usize) {
-        ZC_R2_TUNED.store(share, std::sync::atomic::Ordering::Relaxed);
+    pub(crate) fn zc_r2_test_set_share(full_products: bool, share: usize) {
+        zc_r2_tuned(full_products).store(share, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn zc_r2_test_pipeline_resources() -> Option<[(u64, u64, u64); 2]> {
+        let gpu = gpu().ok()?;
+        let state = zc_r2_state()?.lock().ok()?;
+        if state.pso_full.is_null() {
+            return None;
+        }
+        unsafe {
+            Some([
+                gpu.pipeline_resources(state.pso),
+                gpu.pipeline_resources(state.pso_full),
+            ])
+        }
     }
 
     /// Ratio-gate override (`FLOCK_ZC_R2_GPU_FORCE_RATIO=<f64>`).
@@ -8276,10 +8438,14 @@ kernel void zc_r2_products(
     /// processes while every admitted process posts record p10s). Ratio ≥ 8
     /// or unusable ⇒ 0 = exact incumbent.
     const ZC_R2_ALPHA: f64 = 0.55;
+    // With all eight lookahead products offloaded the CPU prefix is the
+    // anchors/deltas-only kernel. Direct sweep measurements put that residual
+    // at 0.32--0.38 of a full lookahead chunk; use the conservative midpoint.
+    const ZC_R2_FULL_ALPHA: f64 = 0.35;
     const ZC_R2_MAX_RATIO: f64 = 2.0;
     const ZC_R2_FLOOR_MAX_RATIO: f64 = 8.0;
 
-    pub(crate) fn zc_r2_gate_share(ratio: f64, hi_size: usize) -> usize {
+    fn zc_r2_gate_share_with_alpha(ratio: f64, hi_size: usize, alpha: f64) -> usize {
         if !ratio.is_finite() || ratio <= 0.0 {
             return 0;
         }
@@ -8289,14 +8455,22 @@ kernel void zc_r2_products(
             }
             return 0;
         }
-        let g = (hi_size as f64 / (ratio + (1.0 - ZC_R2_ALPHA))).round();
+        let g = (hi_size as f64 / (ratio + (1.0 - alpha))).round();
         (g as usize).min(hi_size * 15 / 16)
+    }
+
+    pub(crate) fn zc_r2_gate_share(ratio: f64, hi_size: usize) -> usize {
+        zc_r2_gate_share_with_alpha(ratio, hi_size, ZC_R2_ALPHA)
+    }
+
+    pub(crate) fn zc_r2_full_gate_share(ratio: f64, hi_size: usize) -> usize {
+        zc_r2_gate_share_with_alpha(ratio, hi_size, ZC_R2_FULL_ALPHA)
     }
 
     fn zc_r2_init(gpu: &'static Gpu) -> Result<ZcR2, String> {
         unsafe {
             let pool = gpu.pool_push();
-            let built = (|| -> Result<Id, String> {
+            let built = (|| -> Result<(Id, Id), String> {
                 let src = gpu.api.nsstring(ZC_R2_MSL_SOURCE)?;
                 let mut err: Id = NIL;
                 let library: Id = send!(
@@ -8314,42 +8488,88 @@ kernel void zc_r2_products(
                         gpu.api.error_string(err)
                     ));
                 }
-                let ns = gpu.api.nsstring("zc_r2_products")?;
-                let f: Id = send!(
-                    gpu.api,
-                    unsafe extern "C" fn(Id, Sel, Id) -> Id,
-                    library,
-                    c"newFunctionWithName:",
-                    ns
-                );
-                if f.is_null() {
-                    send!(gpu.api, unsafe extern "C" fn(Id, Sel) -> Id, library, c"release");
-                    return Err("zc_r2_products kernel not found".into());
-                }
-                let mut perr: Id = NIL;
-                let pso: Id = send!(
-                    gpu.api,
-                    unsafe extern "C" fn(Id, Sel, Id, *mut Id) -> Id,
-                    gpu.device,
-                    c"newComputePipelineStateWithFunction:error:",
-                    f,
-                    &mut perr
-                );
-                send!(gpu.api, unsafe extern "C" fn(Id, Sel) -> Id, f, c"release");
+                let make_pso = |name: &str| -> Result<Id, String> {
+                    let ns = gpu.api.nsstring(name)?;
+                    let f: Id = send!(
+                        gpu.api,
+                        unsafe extern "C" fn(Id, Sel, Id) -> Id,
+                        library,
+                        c"newFunctionWithName:",
+                        ns
+                    );
+                    if f.is_null() {
+                        return Err(format!("{name} kernel not found"));
+                    }
+                    let mut perr: Id = NIL;
+                    let pso: Id = send!(
+                        gpu.api,
+                        unsafe extern "C" fn(Id, Sel, Id, *mut Id) -> Id,
+                        gpu.device,
+                        c"newComputePipelineStateWithFunction:error:",
+                        f,
+                        &mut perr
+                    );
+                    send!(gpu.api, unsafe extern "C" fn(Id, Sel) -> Id, f, c"release");
+                    if pso.is_null() {
+                        return Err(format!(
+                            "{name} pipeline: {}",
+                            gpu.api.error_string(perr)
+                        ));
+                    }
+                    Ok(pso)
+                };
+                let pair = (|| {
+                    let pso = make_pso("zc_r2_products")?;
+                    let pso_full = match make_pso("zc_r2_products_full") {
+                        Ok(p) => p,
+                        Err(e) => {
+                            if super::gpu_zc_r2_debug() {
+                                eprintln!("[zc-r2] full kernel unavailable: {e}");
+                            }
+                            NIL
+                        }
+                    };
+                    Ok((pso, pso_full))
+                })();
                 send!(gpu.api, unsafe extern "C" fn(Id, Sel) -> Id, library, c"release");
-                if pso.is_null() {
-                    return Err(format!(
-                        "zc_r2_products pipeline: {}",
-                        gpu.api.error_string(perr)
-                    ));
-                }
-                Ok(pso)
+                pair
             })();
             gpu.pool_pop(pool);
-            let pso = built?;
+            let (pso, pso_full) = built?;
+            let validate_full = |candidate: Id, label: &str| {
+                if candidate.is_null() {
+                    return NIL;
+                }
+                let simd_width: u64 = send!(
+                    gpu.api,
+                    unsafe extern "C" fn(Id, Sel) -> u64,
+                    candidate,
+                    c"threadExecutionWidth"
+                );
+                let max_threads: u64 = send!(
+                    gpu.api,
+                    unsafe extern "C" fn(Id, Sel) -> u64,
+                    candidate,
+                    c"maxTotalThreadsPerThreadgroup"
+                );
+                if simd_width == 32 && max_threads >= 256 {
+                    candidate
+                } else {
+                    if super::gpu_zc_r2_debug() {
+                        eprintln!(
+                            "[zc-r2] {label} kernel unsupported: simd={simd_width} \
+                             max_threads={max_threads}"
+                        );
+                    }
+                    gpu.release(candidate);
+                    NIL
+                }
+            };
+            let pso_full = validate_full(pso_full, "full");
             let nib_buf = gpu.new_buffer(256 * 16)?;
             Ok(ZcR2 {
                 pso,
+                pso_full,
                 nib_buf,
                 eq_lo_buf: NIL,
                 eq_lo_cap: 0,
@@ -8383,6 +8603,7 @@ kernel void zc_r2_products(
         cb: Id,
         pub chunks: usize,
         calibration: bool,
+        full_products: bool,
         lo_size: usize,
         mask: u32,
         useful: u32,
@@ -8404,6 +8625,10 @@ kernel void zc_r2_products(
         pub(crate) fn is_calibration(&self) -> bool {
             self.calibration
         }
+
+        pub(crate) fn full_products(&self) -> bool {
+            self.full_products
+        }
     }
 
     /// Result of draining the round-two products arm.
@@ -8414,8 +8639,13 @@ kernel void zc_r2_products(
         /// Timed-prove prefix partials, bit-exact per chunk, parity-split as
         /// `[p1_even, pinf_even, p1_odd, pinf_odd]` (all eq_hi-weighted).
         Prefix(Vec<[F128; 4]>),
-        /// Metal failed after admission; the caller must CPU-redo the
-        /// prefix products. The arm is poisoned for the process.
+        /// Lookahead-only full-product partials in canonical order
+        /// `[p1e, pinfe, p1o, pinfo, W0, W3, W4, W5]`. Every slot uses the
+        /// odd lane's eq_lo weight and is eq_hi-weighted.
+        FullPrefix(Vec<[F128; 8]>),
+        /// GPU output was rejected or Metal failed after admission; the
+        /// caller must CPU-redo the prefix products. A full-oracle rejection
+        /// disables only that mode; infrastructure/base failures poison both.
         Failed,
     }
 
@@ -8428,6 +8658,7 @@ kernel void zc_r2_products(
         lo_size: usize,
         mask: u32,
         useful: u32,
+        full_products: bool,
     ) -> Result<Id, String> {
         unsafe {
             #[repr(C)]
@@ -8439,7 +8670,7 @@ kernel void zc_r2_products(
             }
             let params = P {
                 lo_size: lo_size as u32,
-                xpt: (lo_size / 256) as u32,
+                xpt: (lo_size / if full_products { 128 } else { 256 }) as u32,
                 mask,
                 useful,
             };
@@ -8449,7 +8680,12 @@ kernel void zc_r2_products(
             );
             let cb = gpu.command_buffer()?;
             let enc = gpu.compute_encoder(cb)?;
-            gpu.set_pipeline(enc, state.pso);
+            let pso = if full_products {
+                state.pso_full
+            } else {
+                state.pso
+            };
+            gpu.set_pipeline(enc, pso);
             gpu.set_buffer(enc, a_buf, 0, 0);
             gpu.set_buffer(enc, b_buf, 0, 1);
             gpu.set_buffer(enc, state.eq_lo_buf, 0, 2);
@@ -8494,6 +8730,7 @@ kernel void zc_r2_products(
         hi_size: usize,
         pair_in_block_mask: usize,
         useful_pairs_inclusive: usize,
+        full_products: bool,
     ) -> Option<ZcR2Job> {
         use std::sync::atomic::Ordering;
         if !super::gpu_zc_r2_enabled() || ZC_R2_POISONED.load(Ordering::Relaxed) {
@@ -8509,7 +8746,24 @@ kernel void zc_r2_products(
         {
             return None;
         }
-        let tuned = ZC_R2_TUNED.load(Ordering::Relaxed);
+        let gpu = gpu().ok()?;
+        let state_mutex = zc_r2_state()?;
+        let mut state = state_mutex.lock().ok()?;
+        let mut full_products = full_products && !state.pso_full.is_null();
+        // Resolve PSO fallback before selecting a tuning slot: promoted and
+        // full-product kernels have different prices and calibration oracles.
+        let mut tuned = zc_r2_tuned(full_products).load(Ordering::Relaxed);
+        if full_products && tuned == 0 {
+            // This target rejected the optional all-products extension. Keep
+            // the promoted parity-split frontier available under its own
+            // calibration and gate instead of dropping the entire round to
+            // the CPU.
+            full_products = false;
+            tuned = ZC_R2_TUNED_PROMOTED.load(Ordering::Relaxed);
+            if super::gpu_zc_r2_debug() {
+                eprintln!("[zc-r2] full mode rejected; falling back to promoted");
+            }
+        }
         if tuned == 0 {
             return None;
         }
@@ -8529,9 +8783,6 @@ kernel void zc_r2_products(
         if chunks == 0 {
             return None;
         }
-        let gpu = gpu().ok()?;
-        let state_mutex = zc_r2_state()?;
-        let mut state = state_mutex.lock().ok()?;
         unsafe {
             // Nibble decomposition of the 32 KiB byte table (per prove; the
             // table depends on the round challenge z).
@@ -8569,9 +8820,9 @@ kernel void zc_r2_products(
                 gpu.buffer_contents(state.eq_hi_buf),
                 need_hi,
             );
-            // Four F128 per chunk: the parity-split
-            // `[p1_even, pinf_even, p1_odd, pinf_odd]`.
-            let need_part = hi_size * 64;
+            // Four F128 per promoted-kernel chunk, eight for the full
+            // lookahead-product extension.
+            let need_part = hi_size * if full_products { 128 } else { 64 };
             if state.part_cap < need_part {
                 if state.part_cap > 0 {
                     gpu.release(state.part_buf);
@@ -8590,12 +8841,14 @@ kernel void zc_r2_products(
                 lo_size,
                 pair_in_block_mask as u32,
                 useful_pairs_inclusive as u32,
+                full_products,
             )
             .ok()?;
             Some(ZcR2Job {
                 cb,
                 chunks,
                 calibration,
+                full_products,
                 lo_size,
                 mask: pair_in_block_mask as u32,
                 useful: useful_pairs_inclusive as u32,
@@ -8614,6 +8867,7 @@ kernel void zc_r2_products(
         job: ZcR2Job,
         cpu_partials: Option<&[(F128, F128)]>,
         cpu_la: Option<&[[F128; 6]]>,
+        cpu_full: Option<&[[F128; 8]]>,
         cpu_wall_ms: f64,
         hi_size: usize,
     ) -> ZcR2Result {
@@ -8624,7 +8878,13 @@ kernel void zc_r2_products(
         };
         let poison = |cb: Id| {
             ZC_R2_POISONED.store(true, Ordering::Relaxed);
-            ZC_R2_TUNED.store(0, Ordering::Relaxed);
+            ZC_R2_TUNED_PROMOTED.store(0, Ordering::Relaxed);
+            ZC_R2_TUNED_FULL.store(0, Ordering::Relaxed);
+            unsafe { gpu.release(cb) };
+            ZcR2Result::Failed
+        };
+        let reject_full = |cb: Id| {
+            ZC_R2_TUNED_FULL.store(0, Ordering::Relaxed);
             unsafe { gpu.release(cb) };
             ZcR2Result::Failed
         };
@@ -8647,55 +8907,79 @@ kernel void zc_r2_products(
                 Err(_) => return poison(job.cb),
             };
             let parts = gpu.buffer_contents(state.part_buf).cast::<F128>();
-            let mut out: Vec<[F128; 4]> = Vec::with_capacity(job.chunks);
-            for c in 0..job.chunks {
-                out.push([
-                    *parts.add(c * 4),
-                    *parts.add(c * 4 + 1),
-                    *parts.add(c * 4 + 2),
-                    *parts.add(c * 4 + 3),
-                ]);
+            let mut out4 = Vec::new();
+            let mut out8 = Vec::new();
+            if job.full_products {
+                out8.reserve(job.chunks);
+                for c in 0..job.chunks {
+                    out8.push(std::array::from_fn(|i| *parts.add(c * 8 + i)));
+                }
+            } else {
+                out4.reserve(job.chunks);
+                for c in 0..job.chunks {
+                    out4.push(std::array::from_fn(|i| *parts.add(c * 4 + i)));
+                }
             }
             if !job.calibration {
                 gpu.release(job.cb);
                 if super::gpu_zc_r2_debug() {
+                    let kernel = if job.full_products { "full" } else { "promoted" };
                     eprintln!(
-                        "[zc-r2] timed prefix {}/{} chunks: gpu={first_wall:.2}ms \
+                        "[zc-r2] timed kernel={kernel} prefix {}/{} chunks: gpu={first_wall:.2}ms \
                          cpu-sweep={cpu_wall_ms:.2}ms submit-to-drain={:.2}ms",
                         job.chunks,
                         hi_size,
                         job.submitted.elapsed().as_secs_f64() * 1e3,
                     );
                 }
-                return ZcR2Result::Prefix(out);
+                return if job.full_products {
+                    ZcR2Result::FullPrefix(out8)
+                } else {
+                    ZcR2Result::Prefix(out4)
+                };
             }
 
             // ---- Calibration (untimed warmup prove, once per process) ----
-            let Some(cpu_all) = cpu_partials else {
-                return poison(job.cb);
-            };
-            // Target-machine equality oracle before anything else: the GPU
-            // probe partials must equal the CPU's own values bit-for-bit.
-            // Both the summed pair the round-two message consumes AND the
-            // odd-parity half the round-three lookahead consumes are checked,
-            // so a kernel that got the right total from the wrong split
-            // cannot be admitted.
-            for c in 0..job.chunks {
-                let summed = (out[c][0] + out[c][2], out[c][1] + out[c][3]);
-                let split_ok = cpu_la.is_none_or(|la| {
-                    la[c][0] == out[c][2] && la[c][1] == out[c][3]
-                });
-                if summed != cpu_all[c] || !split_ok {
-                    if super::gpu_zc_r2_debug() {
-                        eprintln!(
-                            "[zc-r2] CALIBRATION MISMATCH at chunk {c}: gpu={:?} \
-                             gpu_summed={summed:?} cpu={:?} cpu_la_odd={:?} — poisoned",
-                            out[c],
-                            cpu_all[c],
-                            cpu_la.map(|la| (la[c][0], la[c][1])),
-                        );
+            if job.full_products {
+                let Some(expected) = cpu_full else {
+                    return reject_full(job.cb);
+                };
+                for c in 0..job.chunks {
+                    if out8[c] != expected[c] {
+                        if super::gpu_zc_r2_debug() {
+                            eprintln!(
+                                "[zc-r2] FULL CALIBRATION MISMATCH at chunk {c}: \
+                                 gpu={:?} cpu={:?} — full mode rejected",
+                                out8[c], expected[c],
+                            );
+                        }
+                        return reject_full(job.cb);
                     }
+                }
+            } else {
+                let Some(cpu_all) = cpu_partials else {
                     return poison(job.cb);
+                };
+                // Target-machine equality oracle before anything else: the GPU
+                // probe partials must equal the CPU's own values bit-for-bit.
+                // Both the summed pair and odd-parity half are checked.
+                for c in 0..job.chunks {
+                    let summed = (out4[c][0] + out4[c][2], out4[c][1] + out4[c][3]);
+                    let split_ok = cpu_la.is_none_or(|la| {
+                        la[c][0] == out4[c][2] && la[c][1] == out4[c][3]
+                    });
+                    if summed != cpu_all[c] || !split_ok {
+                        if super::gpu_zc_r2_debug() {
+                            eprintln!(
+                                "[zc-r2] CALIBRATION MISMATCH at chunk {c}: gpu={:?} \
+                                 gpu_summed={summed:?} cpu={:?} cpu_la_odd={:?} — poisoned",
+                                out4[c],
+                                cpu_all[c],
+                                cpu_la.map(|la| (la[c][0], la[c][1])),
+                            );
+                        }
+                        return poison(job.cb);
+                    }
                 }
             }
             // Ramp-robust GPU pricing: replay the probe back-to-back to a
@@ -8714,6 +8998,7 @@ kernel void zc_r2_products(
                 while n_walls < walls.len() {
                     let Ok(cb2) = zc_r2_submit(
                         gpu, &state, a_buf, b_buf, job.chunks, job.lo_size, job.mask, job.useful,
+                        job.full_products,
                     ) else {
                         break;
                     };
@@ -8745,13 +9030,18 @@ kernel void zc_r2_products(
             let share = if u_cpu.is_finite() && u_cpu > 0.0 && u_gpu.is_finite() {
                 let measured = u_gpu / u_cpu;
                 let ratio = zc_r2_forced_ratio().unwrap_or(measured);
-                let g = zc_r2_gate_share(ratio, hi_size);
+                let g = if job.full_products {
+                    zc_r2_full_gate_share(ratio, hi_size)
+                } else {
+                    zc_r2_gate_share(ratio, hi_size)
+                };
                 if super::gpu_zc_r2_debug() {
+                    let kernel = if job.full_products { "full" } else { "promoted" };
                     eprintln!(
                         "[zc-r2] gate replay walls: {:?}", &walls[..n_walls]
                     );
                     eprintln!(
-                        "[zc-r2] gate u_gpu={u_gpu:.4}ms/chunk u_cpu={u_cpu:.4}ms/chunk \
+                        "[zc-r2] gate kernel={kernel} u_gpu={u_gpu:.4}ms/chunk u_cpu={u_cpu:.4}ms/chunk \
                          ratio={:.3} -> share {g}/{hi_size}",
                         u_gpu / u_cpu,
                     );
@@ -8760,7 +9050,7 @@ kernel void zc_r2_products(
             } else {
                 0
             };
-            ZC_R2_TUNED.store(share, Ordering::Relaxed);
+            zc_r2_tuned(job.full_products).store(share, Ordering::Relaxed);
             ZcR2Result::Calibrated
         }
     }
@@ -11764,7 +12054,7 @@ DEF_PROBE(probe_g4_t8_p0,    8u,  0u,   tsel & 7u)
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     #[test]
     fn zc_r2_gate_share_policy() {
-        use imp::zc_r2_gate_share;
+        use imp::{zc_r2_full_gate_share, zc_r2_gate_share};
         // Balance point hi/(ratio+0.45); ranked-observed ratios land above
         // the 15·hi/16 cap, which is the binding overshoot guard.
         assert_eq!(zc_r2_gate_share(0.57, 2048), 1920);
@@ -11784,6 +12074,17 @@ DEF_PROBE(probe_g4_t8_p0,    8u,  0u,   tsel & 7u)
         assert_eq!(zc_r2_gate_share(f64::NAN, 2048), 0);
         assert_eq!(zc_r2_gate_share(0.0, 2048), 0);
         assert_eq!(zc_r2_gate_share(-1.0, 2048), 0);
+
+        // Full eight-product mode leaves only the measured anchors/deltas
+        // residual (alpha ~= 0.35), so the balance denominator is ratio+0.65.
+        // Unlike the promoted kernel, plausible ranked ratios do not hit the
+        // overshoot cap and must not use the stale 0.55 residual.
+        assert_eq!(zc_r2_full_gate_share(0.57, 2048), 1679);
+        assert_eq!(zc_r2_full_gate_share(0.70, 2048), 1517);
+        assert_eq!(zc_r2_full_gate_share(1.0, 2048), 1241);
+        assert_eq!(zc_r2_full_gate_share(0.38, 2048), 1920);
+        assert_eq!(zc_r2_full_gate_share(8.0, 2048), 0);
+        assert_eq!(zc_r2_full_gate_share(f64::NAN, 2048), 0);
     }
 
     /// The lincheck arm's GPU prefix equals the CPU fold over exactly the
@@ -11969,83 +12270,175 @@ DEF_PROBE(probe_g4_t8_p0,    8u,  0u,   tsel & 7u)
         for byte in b_packed.iter_mut() {
             *byte = (xs(&mut rng) & 0xff) as u8;
         }
-        let eq_lo: Vec<F128> = (0..lo_size).map(|_| rand_f128(&mut rng)).collect();
+        let r1 = loop {
+            let x = rand_f128(&mut rng);
+            if x != F128::ZERO {
+                break x;
+            }
+        };
+        let kappa = (F128::ONE + r1) * r1.inv();
+        let mut eq_lo = vec![F128::ZERO; lo_size];
+        for u in 0..lo_size / 2 {
+            let w = rand_f128(&mut rng);
+            eq_lo[2 * u] = kappa * w;
+            eq_lo[2 * u + 1] = w;
+        }
         let eq_hi: Vec<F128> = (0..hi_size).map(|_| rand_f128(&mut rng)).collect();
 
-        // CPU reference partials, exactly the driver's non-aarch64 shape, kept
-        // split by x_lo parity so the arm's parity contract is checked and not
-        // just the sum a wrong split could still reproduce.
-        let mut cpu_split: Vec<[F128; 4]> = Vec::with_capacity(hi_size);
+        // Independent eight-slot CPU reference. Every form is accumulated on
+        // the odd pair's eq_lo weight, exactly as the lookahead driver does.
+        let read = |packed: &[u8], row: usize| -> u64 {
+            u64::from_le_bytes(packed[row * 8..row * 8 + 8].try_into().unwrap())
+        };
+        let mut cpu_full: Vec<[F128; 8]> = Vec::with_capacity(hi_size);
         for x_hi in 0..hi_size {
-            // [p1_even, pinf_even, p1_odd, pinf_odd]
-            let mut acc = [F256Unreduced::ZERO; 4];
-            for x_lo in 0..lo_size {
-                let pair_idx = x_hi * lo_size + x_lo;
-                if (pair_idx & mask) >= useful {
-                    continue;
+            let mut acc = [F256Unreduced::ZERO; 8];
+            for u in 0..lo_size / 2 {
+                let mut rows = [F128::ZERO; 8];
+                for pair_lane in 0..2 {
+                    let x_lo = 2 * u + pair_lane;
+                    let pair_idx = x_hi * lo_size + x_lo;
+                    if (pair_idx & mask) < useful {
+                        rows[4 * pair_lane] = fold_row(read(&a_packed, 2 * pair_idx));
+                        rows[4 * pair_lane + 1] =
+                            fold_row(read(&a_packed, 2 * pair_idx + 1));
+                        rows[4 * pair_lane + 2] = fold_row(read(&b_packed, 2 * pair_idx));
+                        rows[4 * pair_lane + 3] =
+                            fold_row(read(&b_packed, 2 * pair_idx + 1));
+                    }
                 }
-                let read = |packed: &[u8], row: usize| -> u64 {
-                    u64::from_le_bytes(packed[row * 8..row * 8 + 8].try_into().unwrap())
-                };
-                let a0 = fold_row(read(&a_packed, 2 * pair_idx));
-                let a1 = fold_row(read(&a_packed, 2 * pair_idx + 1));
-                let b0 = fold_row(read(&b_packed, 2 * pair_idx));
-                let b1 = fold_row(read(&b_packed, 2 * pair_idx + 1));
-                let base = 2 * (x_lo & 1);
-                acc[base] ^= eq_lo[x_lo].mul_unreduced(a1 * b1);
-                acc[base + 1] ^= eq_lo[x_lo].mul_unreduced((a0 + a1) * (b0 + b1));
+                let [a0, a1, b0, b1, a2, a3, b2, b3] = rows;
+                let w = eq_lo[2 * u + 1];
+                let [a0w, a1w, a2w, a3w] = [w * a0, w * a1, w * a2, w * a3];
+                acc[0] ^= a1w.mul_unreduced(b1);
+                acc[1] ^= (a0w + a1w).mul_unreduced(b0 + b1);
+                acc[2] ^= a3w.mul_unreduced(b3);
+                acc[3] ^= (a2w + a3w).mul_unreduced(b2 + b3);
+                acc[4] ^= a2w.mul_unreduced(b2);
+                acc[5] ^= (a0w + a2w).mul_unreduced(b0 + b2);
+                acc[6] ^= (a1w + a3w).mul_unreduced(b1 + b3);
+                acc[7] ^= (a0w + a1w + a2w + a3w)
+                    .mul_unreduced(b0 + b1 + b2 + b3);
             }
             let eq_h = eq_hi[x_hi];
-            cpu_split.push(std::array::from_fn(|i| eq_h * acc[i].reduce()));
+            cpu_full.push(std::array::from_fn(|i| eq_h * acc[i].reduce()));
         }
+        let cpu_split: Vec<[F128; 4]> = cpu_full
+            .iter()
+            .map(|v| [kappa * v[0], kappa * v[1], v[2], v[3]])
+            .collect();
         let cpu_partials: Vec<(F128, F128)> = cpu_split
             .iter()
             .map(|v| (v[0] + v[2], v[1] + v[3]))
             .collect();
-        // Slots 0/1 of the lookahead state are exactly the odd-parity pair.
-        let cpu_la: Vec<[F128; 6]> = cpu_split
+        let cpu_la: Vec<[F128; 6]> = cpu_full
             .iter()
-            .map(|v| [v[2], v[3], F128::ZERO, F128::ZERO, F128::ZERO, F128::ZERO])
+            .map(|v| v[2..].try_into().unwrap())
             .collect();
 
-        // Calibration probe: internal equality oracle + share publication.
+        let [promoted_res, full_res] = imp::zc_r2_test_pipeline_resources()
+            .expect("both round-two pipelines must compile on the test device");
+        assert_eq!(promoted_res.0, 12 * 1024);
+        assert_eq!(full_res.0, 6 * 1024);
+        assert_eq!(full_res.1, 32);
+        assert!(full_res.2 >= 256);
+
+        // Full-kernel calibration: all eight slots are checked independently.
         imp::zc_r2_test_reset();
         let job = imp::launch_zc_r2_products(
             &a_packed, &b_packed, &table_data, &eq_lo, &eq_hi, lo_size, hi_size, mask, useful,
+            true,
         )
         .expect("calibration launch must succeed on real Metal");
         assert!(job.is_calibration());
         assert_eq!(job.cpu_split(), 0);
-        let res = imp::zc_r2_wait(job, Some(&cpu_partials), Some(&cpu_la), 50.0, hi_size);
+        let res = imp::zc_r2_wait(
+            job,
+            Some(&cpu_partials),
+            Some(&cpu_la),
+            Some(&cpu_full),
+            50.0,
+            hi_size,
+        );
         assert!(matches!(res, imp::ZcR2Result::Calibrated));
-        let (tuned, poisoned) = imp::zc_r2_test_state();
+        let (tuned, poisoned) = imp::zc_r2_test_state(true);
         assert!(!poisoned, "probe partials must equal CPU partials bit-for-bit");
         assert_ne!(tuned, usize::MAX, "calibration must publish a share");
+        assert_eq!(
+            imp::zc_r2_test_state(false).0,
+            usize::MAX,
+            "full calibration must not bypass the promoted oracle"
+        );
 
         // Timed prefix path at a forced share.
-        imp::zc_r2_test_set_share(hi_size / 2);
+        imp::zc_r2_test_set_share(true, hi_size / 2);
         let job2 = imp::launch_zc_r2_products(
             &a_packed, &b_packed, &table_data, &eq_lo, &eq_hi, lo_size, hi_size, mask, useful,
+            true,
         )
         .expect("timed launch must succeed");
         assert!(!job2.is_calibration());
         let prefix = job2.cpu_split();
         assert_eq!(prefix, hi_size / 2);
-        match imp::zc_r2_wait(job2, None, None, 0.0, hi_size) {
-            imp::ZcR2Result::Prefix(vals) => {
+        match imp::zc_r2_wait(job2, None, None, None, 0.0, hi_size) {
+            imp::ZcR2Result::FullPrefix(vals) => {
                 assert_eq!(vals.len(), prefix);
                 assert_eq!(
                     &vals[..],
-                    &cpu_split[..prefix],
-                    "prefix partials bit-exact, per parity"
+                    &cpu_full[..prefix],
+                    "full prefix partials bit-exact, all eight forms"
                 );
-                // The summed contract the round-two message consumes.
-                for (v, c) in vals.iter().zip(cpu_partials.iter()) {
-                    assert_eq!((v[0] + v[2], v[1] + v[3]), *c, "summed pair bit-exact");
-                }
             }
-            _ => panic!("timed drain must return prefix partials"),
+            _ => panic!("timed drain must return full prefix partials"),
         }
+
+        // A target-side full-oracle rejection disables only that mode, then
+        // a requested full launch falls back to an independent promoted
+        // calibration instead of disabling the whole GPU frontier.
+        imp::zc_r2_test_reset();
+        let bad_job = imp::launch_zc_r2_products(
+            &a_packed, &b_packed, &table_data, &eq_lo, &eq_hi, lo_size, hi_size, mask, useful,
+            true,
+        )
+        .expect("full calibration launch must succeed");
+        let mut bad_full = cpu_full.clone();
+        bad_full[0][0] += F128 { lo: 1, hi: 0 };
+        assert!(matches!(
+            imp::zc_r2_wait(
+                bad_job,
+                Some(&cpu_partials),
+                Some(&cpu_la),
+                Some(&bad_full),
+                50.0,
+                hi_size,
+            ),
+            imp::ZcR2Result::Failed
+        ));
+        assert!(!imp::zc_r2_test_state(true).1);
+        assert_eq!(imp::zc_r2_test_state(true).0, 0);
+        assert_eq!(imp::zc_r2_test_state(false).0, usize::MAX);
+
+        let old = imp::launch_zc_r2_products(
+            &a_packed, &b_packed, &table_data, &eq_lo, &eq_hi, lo_size, hi_size, mask, useful,
+            true,
+        )
+        .expect("full rejection must admit the promoted calibration");
+        assert!(old.is_calibration());
+        assert!(!old.full_products());
+        assert!(matches!(
+            imp::zc_r2_wait(old, Some(&cpu_partials), Some(&cpu_la), None, 50.0, hi_size),
+            imp::ZcR2Result::Calibrated
+        ));
+        assert_ne!(
+            imp::zc_r2_test_state(false).0,
+            usize::MAX,
+            "promoted calibration must publish its own share"
+        );
+        assert_eq!(
+            imp::zc_r2_test_state(true).0,
+            0,
+            "promoted fallback must leave the rejected full mode disabled"
+        );
         imp::zc_r2_test_reset();
     }
 
