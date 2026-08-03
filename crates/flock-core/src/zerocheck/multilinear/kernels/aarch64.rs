@@ -479,6 +479,87 @@ pub(crate) unsafe fn fold_round2_compact_chunk_neon_unchecked_8(
     }
 }
 
+/// Products-only sibling of [`fold_round2_compact_chunk_neon_unchecked_8`]:
+/// the identical message accumulation with **no materialization at all**.
+///
+/// This is the anchorless round-two kernel. The compact anchor+delta form
+/// exists only so the first tail round can rebuild `a0/a1/b0/b1`; but that
+/// form is a re-encoding of bytes the tail round can read straight out of
+/// `a_packed`/`b_packed`, which are still live. Dropping the stores removes
+/// 1.5 GiB of round-two write traffic and — for the chunks whose products the
+/// GPU arm owns — removes the CPU's sweep over them entirely.
+///
+/// Every arithmetic step below is copied verbatim from the fused kernel
+/// (including the `degen` shortcut and the padded-pair skip), so the two
+/// chunk sums are bit-identical.
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "aes")]
+pub(crate) unsafe fn fold_round2_products_only_8(
+    table_data: *const u8,
+    a_packed: *const u8,
+    b_packed: *const u8,
+    eq_lo: *const F128,
+    lo_size: usize,
+    pair_idx_base: usize,
+    pair_in_block_mask: usize,
+    useful_pairs_inclusive: usize,
+    degen: bool,
+) -> (F128, F128) {
+    use core::arch::aarch64::*;
+
+    unsafe {
+        let zero = vdupq_n_u64(0);
+        let mut p1_acc = WideNeon { lo: zero, hi: zero };
+        let mut pinf_acc = WideNeon { lo: zero, hi: zero };
+
+        let ones_bytes = [0xFFu8; 8];
+        let b_ones = fold_row_q(table_data, ones_bytes.as_ptr());
+        let ones_is_one = is_zero_q(veorq_u64(
+            b_ones,
+            core::mem::transmute::<F128, uint64x2_t>(F128::ONE),
+        ));
+
+        for x_lo in 0..lo_size {
+            if ((pair_idx_base + x_lo) & pair_in_block_mask) >= useful_pairs_inclusive {
+                continue;
+            }
+
+            let row0 = 2 * x_lo;
+            let row1 = row0 + 1;
+            let a0_code =
+                u64::from_le(core::ptr::read_unaligned(a_packed.add(row0 * 8).cast::<u64>()));
+            let a1_code =
+                u64::from_le(core::ptr::read_unaligned(a_packed.add(row1 * 8).cast::<u64>()));
+            let b0_code =
+                u64::from_le(core::ptr::read_unaligned(b_packed.add(row0 * 8).cast::<u64>()));
+            let b1_code =
+                u64::from_le(core::ptr::read_unaligned(b_packed.add(row1 * 8).cast::<u64>()));
+
+            if degen && (b0_code & b1_code) == u64::MAX {
+                let (_a0, a1) = fold_two_row_codes_q(table_data, a0_code, a1_code);
+                let g1 = if ones_is_one { a1 } else { mul_q(a1, b_ones) };
+                let eq_l = vld1q_u64(eq_lo.add(x_lo).cast::<u64>());
+                wide_xor(&mut p1_acc, mul_unreduced_q(eq_l, g1));
+                continue;
+            }
+
+            let (a0, a1, b0, b1) =
+                fold_four_row_codes_q(table_data, a0_code, a1_code, b0_code, b1_code);
+
+            let g1 = mul_q(a1, b1);
+            let g_inf = mul_q(veorq_u64(a0, a1), veorq_u64(b0, b1));
+            let eq_l = vld1q_u64(eq_lo.add(x_lo).cast::<u64>());
+            wide_xor(&mut p1_acc, mul_unreduced_q(eq_l, g1));
+            wide_xor(&mut pinf_acc, mul_unreduced_q(eq_l, g_inf));
+        }
+
+        (
+            core::mem::transmute::<uint64x2_t, F128>(reduce_wide_q(p1_acc)),
+            core::mem::transmute::<uint64x2_t, F128>(reduce_wide_q(pinf_acc)),
+        )
+    }
+}
+
 /// Anchors-and-deltas-only sibling of
 /// [`fold_round2_compact_chunk_neon_unchecked_8`]: identical anchor stores,
 /// identical delta bytes, identical padded-pair zeroing — but no `a1`/`b1`
@@ -991,6 +1072,208 @@ pub(crate) unsafe fn fold_compact_chunk_neon_unchecked_8(
             let eq_l = vld1q_u64(eq_lo.add(x_lo).cast::<u64>());
             wide_xor(&mut p1_acc, mul_unreduced_q(eq_l, g1));
             wide_xor(&mut pinf_acc, mul_unreduced_q(eq_l, g_inf));
+        }
+
+        (
+            core::mem::transmute::<uint64x2_t, F128>(reduce_wide_q(p1_acc)),
+            core::mem::transmute::<uint64x2_t, F128>(reduce_wide_q(pinf_acc)),
+        )
+    }
+}
+
+/// Fold two adjacent row *pairs* straight out of the packed witness, using one
+/// table per parity.
+///
+/// The compact form stores `anchor = fold_T(row0)` and `delta = row0 ^ row1`,
+/// and the first tail round rebuilds `fold = anchor + rho * fold_T(delta)`.
+/// Expanding that in the raw rows and using GF(2)-linearity of the byte-table
+/// fold:
+///
+/// `fold = (1 + rho) * fold_T(row0)  +  rho * fold_T(row1)`
+///        `= fold_{(1+rho)T}(row0) + fold_{rho·T}(row1)`
+///
+/// so the whole 1.5 GiB intermediate can be skipped in favour of two resident
+/// 32 KiB tables. Returns `(pair0, pair1)`.
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn fold_two_pairs_2t(
+    even_table: *const u8,
+    odd_table: *const u8,
+    row0: u64,
+    row1: u64,
+    row2: u64,
+    row3: u64,
+) -> (
+    core::arch::aarch64::uint64x2_t,
+    core::arch::aarch64::uint64x2_t,
+) {
+    use core::arch::aarch64::*;
+    unsafe {
+        const STRIDE: usize = 256 * 16;
+        let load = |table: *const u8, row: u64, chunk: usize| {
+            let index = ((row >> (8 * chunk)) & 0xff) as usize;
+            vld1q_u64(
+                table
+                    .add(chunk * STRIDE + index * core::mem::size_of::<F128>())
+                    .cast::<u64>(),
+            )
+        };
+
+        // Four independent lookup chains, same shape as `fold_four_row_codes_q`
+        // — only the table base alternates with the row parity.
+        let mut acc0 = load(even_table, row0, 0);
+        let mut acc1 = load(odd_table, row1, 0);
+        let mut acc2 = load(even_table, row2, 0);
+        let mut acc3 = load(odd_table, row3, 0);
+        for chunk in (1..7).step_by(2) {
+            acc0 = xor3_u64(
+                acc0,
+                load(even_table, row0, chunk),
+                load(even_table, row0, chunk + 1),
+            );
+            acc1 = xor3_u64(
+                acc1,
+                load(odd_table, row1, chunk),
+                load(odd_table, row1, chunk + 1),
+            );
+            acc2 = xor3_u64(
+                acc2,
+                load(even_table, row2, chunk),
+                load(even_table, row2, chunk + 1),
+            );
+            acc3 = xor3_u64(
+                acc3,
+                load(odd_table, row3, chunk),
+                load(odd_table, row3, chunk + 1),
+            );
+        }
+        acc0 = veorq_u64(acc0, load(even_table, row0, 7));
+        acc1 = veorq_u64(acc1, load(odd_table, row1, 7));
+        acc2 = veorq_u64(acc2, load(even_table, row2, 7));
+        acc3 = veorq_u64(acc3, load(odd_table, row3, 7));
+        (veorq_u64(acc0, acc1), veorq_u64(acc2, acc3))
+    }
+}
+
+/// Anchorless counterpart of [`fold_compact_chunk_neon_unchecked_8`]: bind the
+/// first multilinear challenge and form the next sumcheck message directly from
+/// the packed witness rows, with no round-two materialization in between.
+///
+/// `even_table` is `(1 + rho)·T`, `odd_table` is `rho·T`, and `table_data` is
+/// the unscaled `T` used by the degenerate branch (`even ^ odd == T`
+/// entry-by-entry, so a pair whose two b rows are equal folds with one table
+/// instead of two — exactly the `b`-delta-is-zero case the compact kernel
+/// shortcuts).
+///
+/// Padded pairs are forced to zero here instead of being read back as the zeros
+/// the compact producer stored, so both paths feed identical values into the
+/// message accumulators. The two message shortcuts (`b1 == 1 ⇒ a1·b1 = a1`,
+/// `b0 + b1 == 0 ⇒ G(∞) term vanishes`) are gated on the reconstructed values,
+/// so they are bit-exact wherever they fire.
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "aes")]
+#[allow(clippy::too_many_arguments)]
+pub(crate) unsafe fn fold_packed_chunk_neon_unchecked_8(
+    table_data: *const u8,
+    even_table: *const u8,
+    odd_table: *const u8,
+    a_packed: *const u8,
+    b_packed: *const u8,
+    a_out: *mut F128,
+    b_out: *mut F128,
+    eq_lo: *const F128,
+    lo_size: usize,
+    pair_idx_base: usize,
+    pair_in_block_mask: usize,
+    useful_pairs_inclusive: usize,
+    degen: bool,
+) -> (F128, F128) {
+    use core::arch::aarch64::*;
+
+    #[inline(always)]
+    unsafe fn store_pair_nt(dst: *mut F128, x: uint64x2_t, y: uint64x2_t) {
+        unsafe {
+            core::arch::asm!(
+                "stnp {x:q}, {y:q}, [{dst}]",
+                dst = in(reg) dst,
+                x = in(vreg) x,
+                y = in(vreg) y,
+                options(nostack, preserves_flags),
+            );
+        }
+    }
+
+    #[inline(always)]
+    unsafe fn row_code(base: *const u8, index: usize) -> u64 {
+        unsafe { u64::from_le(core::ptr::read_unaligned(base.add(index * 8).cast::<u64>())) }
+    }
+
+    unsafe {
+        let zero = vdupq_n_u64(0);
+        let mut p1_acc = WideNeon { lo: zero, hi: zero };
+        let mut pinf_acc = WideNeon { lo: zero, hi: zero };
+        let one_q = core::mem::transmute::<F128, uint64x2_t>(F128::ONE);
+
+        for x_lo in 0..lo_size {
+            let out = 2 * x_lo;
+            let skip0 =
+                ((pair_idx_base + out) & pair_in_block_mask) >= useful_pairs_inclusive;
+            let skip1 =
+                ((pair_idx_base + out + 1) & pair_in_block_mask) >= useful_pairs_inclusive;
+            if skip0 && skip1 {
+                // Both pairs are pure padding: the compact producer stored zero
+                // anchors and zero deltas here, so both reconstructions are
+                // zero and neither message term contributes.
+                store_pair_nt(a_out.add(out), zero, zero);
+                store_pair_nt(b_out.add(out), zero, zero);
+                continue;
+            }
+
+            // The two pairs occupy four consecutive packed rows of each
+            // polynomial: `2·p0, 2·p0+1, 2·p1, 2·p1+1`.
+            let row = 4 * x_lo;
+            let ra0 = row_code(a_packed, row);
+            let ra1 = row_code(a_packed, row + 1);
+            let ra2 = row_code(a_packed, row + 2);
+            let ra3 = row_code(a_packed, row + 3);
+            let rb0 = row_code(b_packed, row);
+            let rb1 = row_code(b_packed, row + 1);
+            let rb2 = row_code(b_packed, row + 2);
+            let rb3 = row_code(b_packed, row + 3);
+
+            let (mut a0, mut a1) = fold_two_pairs_2t(even_table, odd_table, ra0, ra1, ra2, ra3);
+            let (mut b0, mut b1) = if degen && rb0 == rb1 && rb2 == rb3 {
+                // Zero b delta on both pairs: `(1+rho)·T ^ rho·T == T`, so each
+                // b reconstruction is the plain unscaled fold of its row.
+                fold_two_row_codes_q(table_data, rb0, rb2)
+            } else {
+                fold_two_pairs_2t(even_table, odd_table, rb0, rb1, rb2, rb3)
+            };
+
+            if skip0 {
+                a0 = zero;
+                b0 = zero;
+            }
+            if skip1 {
+                a1 = zero;
+                b1 = zero;
+            }
+
+            store_pair_nt(a_out.add(out), a0, a1);
+            store_pair_nt(b_out.add(out), b0, b1);
+
+            let eq_l = vld1q_u64(eq_lo.add(x_lo).cast::<u64>());
+            let g1 = if is_zero_q(veorq_u64(b1, one_q)) {
+                a1
+            } else {
+                mul_q(a1, b1)
+            };
+            wide_xor(&mut p1_acc, mul_unreduced_q(eq_l, g1));
+            let b_sum = veorq_u64(b0, b1);
+            if !is_zero_q(b_sum) {
+                let g_inf = mul_q(veorq_u64(a0, a1), b_sum);
+                wide_xor(&mut pinf_acc, mul_unreduced_q(eq_l, g_inf));
+            }
         }
 
         (

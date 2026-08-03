@@ -796,6 +796,326 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_with_deltas(
     (compact, mlv_challenges[0] * sum1, sum_inf)
 }
 
+/// Kill switch for the anchorless round-two / first-tail-round pair.
+/// `FLOCK_NO_R2_ANCHORLESS=1` restores the compact anchor+delta
+/// materialization as the exact A/B control. Bit-identical either way.
+#[cfg(target_arch = "aarch64")]
+pub(crate) fn r2_anchorless_enabled() -> bool {
+    use std::sync::LazyLock;
+    static ENABLED: LazyLock<bool> =
+        LazyLock::new(|| std::env::var_os("FLOCK_NO_R2_ANCHORLESS").is_none());
+    *ENABLED
+}
+
+#[cfg(not(target_arch = "aarch64"))]
+pub(crate) fn r2_anchorless_enabled() -> bool {
+    false
+}
+
+/// Anchorless round two: the identical `(G(1), G(∞))` message with **no**
+/// compact materialization.
+///
+/// The compact anchor+delta form is a re-encoding of `a_packed`/`b_packed`
+/// rows that are still live when the first tail round runs, so
+/// [`fold_packed_and_compute_round_pair`] can rebuild the folded rows from the
+/// witness directly. Dropping it removes 1.5 GiB of round-two stores and the
+/// matching 1.5 GiB of tail-round loads, and — decisively — it removes the
+/// CPU's *entire* sweep over the chunks whose products the GPU arm owns. The
+/// anchors-only sibling those chunks used to run was share-independent work
+/// that pinned the phase's floor no matter how the CPU/GPU split was tuned.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn uni_skip_round_pair_products_padded(
+    a_packed: &[u8],
+    b_packed: &[u8],
+    m: usize,
+    k_skip: usize,
+    table: &UniSkipFoldTable,
+    mlv_challenges: &[F128],
+    padding: &PaddingSpec,
+) -> (F128, F128) {
+    assert_eq!(k_skip, 6, "anchorless round two is k_skip=6 only");
+    assert_eq!(table.n_chunks, 8);
+    let n_chunks = table.n_chunks;
+    let n_out = 1usize << (m - k_skip);
+    let n_pairs = n_out / 2;
+    assert_eq!(a_packed.len(), n_out * n_chunks);
+    assert_eq!(b_packed.len(), n_out * n_chunks);
+    assert_eq!(mlv_challenges.len(), m - k_skip);
+
+    let eq = SplitEqGhash::with_n_hi(&mlv_challenges[1..], COMPACT_RECONSTRUCTION_N_HI);
+    let lo_size = 1usize << eq.n_lo;
+    let hi_size = 1usize << eq.n_hi;
+    assert_eq!(lo_size * hi_size, n_pairs);
+    let eq_hi = &eq.hi;
+    let eq_lo = &eq.lo;
+    let (pair_in_block_mask, useful_pairs_inclusive) = round2_pair_skip(padding, k_skip);
+    #[cfg(target_arch = "aarch64")]
+    let degen = r2_degen_enabled();
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    let gpu_job = crate::gpu_commit::launch_zc_r2_products(
+        a_packed,
+        b_packed,
+        &table.data,
+        eq_lo,
+        eq_hi,
+        lo_size,
+        hi_size,
+        pair_in_block_mask,
+        useful_pairs_inclusive,
+    );
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    let gpu_prefix = gpu_job.as_ref().map_or(0, |j| j.cpu_split());
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    let t_cpu_sweep = std::time::Instant::now();
+
+    let mut partials: Vec<(F128, F128)> = vec![(F128::ZERO, F128::ZERO); hi_size];
+    let partials_base = crate::epool::SyncPtr(partials.as_mut_ptr());
+    crate::epool::run_hetero_chunks(hi_size, |x_hi| {
+        // GPU-covered prefix chunk: nothing at all for the CPU to do — there
+        // is no materialization left to write.
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        if x_hi < gpu_prefix {
+            return;
+        }
+
+        let pair_idx_base = x_hi * lo_size;
+        let row_base = pair_idx_base * 2;
+
+        #[cfg(target_arch = "aarch64")]
+        // SAFETY: reads only this chunk's packed rows; writes only
+        // `partials[x_hi]`, which the queue hands out exactly once.
+        let (p1, pinf) = unsafe {
+            kernels::aarch64::fold_round2_products_only_8(
+                table.data.as_ptr().cast::<u8>(),
+                a_packed.as_ptr().add(row_base * n_chunks),
+                b_packed.as_ptr().add(row_base * n_chunks),
+                eq_lo.as_ptr(),
+                lo_size,
+                pair_idx_base,
+                pair_in_block_mask,
+                useful_pairs_inclusive,
+            degen,
+            )
+        };
+
+        #[cfg(not(target_arch = "aarch64"))]
+        let (p1, pinf) = {
+            let mut p1_acc = F256Unreduced::ZERO;
+            let mut pinf_acc = F256Unreduced::ZERO;
+            for x_lo in 0..lo_size {
+                if ((pair_idx_base + x_lo) & pair_in_block_mask) >= useful_pairs_inclusive {
+                    continue;
+                }
+                let x0g = row_base + 2 * x_lo;
+                let x1g = x0g + 1;
+                let a0 = table.fold_one_row(&a_packed[x0g * n_chunks..(x0g + 1) * n_chunks]);
+                let a1 = table.fold_one_row(&a_packed[x1g * n_chunks..(x1g + 1) * n_chunks]);
+                let b0 = table.fold_one_row(&b_packed[x0g * n_chunks..(x0g + 1) * n_chunks]);
+                let b1 = table.fold_one_row(&b_packed[x1g * n_chunks..(x1g + 1) * n_chunks]);
+                let eq_l = eq_lo[x_lo];
+                p1_acc ^= eq_l.mul_unreduced(a1 * b1);
+                pinf_acc ^= eq_l.mul_unreduced((a0 + a1) * (b0 + b1));
+            }
+            (p1_acc.reduce(), pinf_acc.reduce())
+        };
+
+        let eq_h = eq_hi[x_hi];
+        // SAFETY: exclusive owner of partials[x_hi].
+        unsafe {
+            *partials_base.ptr().add(x_hi) = (eq_h * p1, eq_h * pinf);
+        }
+    });
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    if let Some(job) = gpu_job {
+        let cpu_wall_ms = t_cpu_sweep.elapsed().as_secs_f64() * 1e3;
+        let calib = job.is_calibration();
+        let prefix = job.cpu_split();
+        let res = crate::gpu_commit::zc_r2_wait(
+            job,
+            if calib { Some(partials.as_slice()) } else { None },
+            cpu_wall_ms,
+            hi_size,
+        );
+        match res {
+            crate::gpu_commit::ZcR2Result::Calibrated => {}
+            crate::gpu_commit::ZcR2Result::Prefix(vals) => {
+                partials[..prefix].copy_from_slice(&vals);
+            }
+            crate::gpu_commit::ZcR2Result::Failed => {
+                // Redo exactly the skipped prefix products on the CPU. With no
+                // materialization there is nothing to rewrite, so this is the
+                // same kernel over the same rows.
+                for x_hi in 0..prefix {
+                    let pair_idx_base = x_hi * lo_size;
+                    let row_base = pair_idx_base * 2;
+                    let (p1, pinf) = unsafe {
+                        kernels::aarch64::fold_round2_products_only_8(
+                            table.data.as_ptr().cast::<u8>(),
+                            a_packed.as_ptr().add(row_base * n_chunks),
+                            b_packed.as_ptr().add(row_base * n_chunks),
+                            eq_lo.as_ptr(),
+                            lo_size,
+                            pair_idx_base,
+                            pair_in_block_mask,
+                            useful_pairs_inclusive,
+                            degen,
+                        )
+                    };
+                    let eq_h = eq_hi[x_hi];
+                    partials[x_hi] = (eq_h * p1, eq_h * pinf);
+                }
+            }
+        }
+    }
+
+    let (sum1, sum_inf) = partials
+        .iter()
+        .fold((F128::ZERO, F128::ZERO), |(s1, sinf), &(c1, cinf)| {
+            (s1 + c1, sinf + cinf)
+        });
+
+    (mlv_challenges[0] * sum1, sum_inf)
+}
+
+/// Anchorless first tail round: bind `r_fold` and emit the next message,
+/// reading the packed witness instead of a compact round-two materialization.
+///
+/// Output tables are bit-identical to
+/// [`fold_compact_and_compute_round_pair`]; see
+/// [`kernels::aarch64::fold_packed_chunk_neon_unchecked_8`] for the linearity
+/// identity that makes the two-table reconstruction exact.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn fold_packed_and_compute_round_pair(
+    a_packed: &[u8],
+    b_packed: &[u8],
+    m: usize,
+    k_skip: usize,
+    table: &UniSkipFoldTable,
+    r_fold: F128,
+    r_next: &[F128],
+    padding: &PaddingSpec,
+) -> (Vec<F128>, Vec<F128>, F128, F128) {
+    assert_eq!(k_skip, 6, "anchorless first tail round is k_skip=6 only");
+    assert_eq!(table.n_chunks, 8);
+    let n_chunks = table.n_chunks;
+    let n_out = 1usize << (m - k_skip);
+    let n = n_out / 2;
+    assert!(n.is_power_of_two() && n >= 4);
+    assert_eq!(r_next.len(), n.trailing_zeros() as usize);
+
+    // `rho·T`, then `(1+rho)·T` as its entry-wise XOR with the base table.
+    let odd_table = table.scaled_linear(r_fold);
+    let mut even_table = odd_table.clone();
+    for (dst, src) in even_table.iter_mut().zip(table.data.iter()) {
+        *dst += *src;
+    }
+
+    let eq = SplitEqGhash::with_n_hi(&r_next[1..], COMPACT_RECONSTRUCTION_N_HI);
+    let lo_size = 1usize << eq.n_lo;
+    let hi_size = 1usize << eq.n_hi;
+    assert_eq!(lo_size * hi_size * 2, n);
+    let chunk_size = 2 * lo_size;
+    let eq_hi = &eq.hi;
+    let eq_lo = &eq.lo;
+    let (pair_in_block_mask, useful_pairs_inclusive) = round2_pair_skip(padding, k_skip);
+    #[cfg(target_arch = "aarch64")]
+    let degen = r2_degen_enabled();
+
+    let mut a_out = crate::scratch::take_f128_unpinned(n);
+    let mut b_out = crate::scratch::take_f128_unpinned(n);
+    let mut partials: Vec<(F128, F128)> = vec![(F128::ZERO, F128::ZERO); hi_size];
+    let a_base = crate::epool::SyncPtr(a_out.as_mut_ptr());
+    let b_base = crate::epool::SyncPtr(b_out.as_mut_ptr());
+    let partials_base = crate::epool::SyncPtr(partials.as_mut_ptr());
+    crate::epool::run_hetero_chunks(hi_size, |x_hi| {
+        let pair_idx_base = x_hi * chunk_size;
+        let row_base = pair_idx_base * 2;
+        // SAFETY: exclusive per-chunk ownership of the output ranges and of
+        // `partials[x_hi]`; the queue's completion join publishes the writes.
+        let (a_ptr, b_ptr) = unsafe {
+            (
+                a_base.ptr().add(pair_idx_base),
+                b_base.ptr().add(pair_idx_base),
+            )
+        };
+
+        #[cfg(target_arch = "aarch64")]
+        let (p1, pinf) = unsafe {
+            kernels::aarch64::fold_packed_chunk_neon_unchecked_8(
+                table.data.as_ptr().cast::<u8>(),
+                even_table.as_ptr().cast::<u8>(),
+                odd_table.as_ptr().cast::<u8>(),
+                a_packed.as_ptr().add(row_base * n_chunks),
+                b_packed.as_ptr().add(row_base * n_chunks),
+                a_ptr,
+                b_ptr,
+                eq_lo.as_ptr(),
+                lo_size,
+                pair_idx_base,
+                pair_in_block_mask,
+                useful_pairs_inclusive,
+                degen,
+            )
+        };
+
+        #[cfg(not(target_arch = "aarch64"))]
+        let (p1, pinf) = {
+            let mut p1_acc = F256Unreduced::ZERO;
+            let mut pinf_acc = F256Unreduced::ZERO;
+            for x_lo in 0..lo_size {
+                let out = 2 * x_lo;
+                let mut vals = [F128::ZERO; 4];
+                for lane in 0..2 {
+                    let pair = pair_idx_base + out + lane;
+                    if (pair & pair_in_block_mask) >= useful_pairs_inclusive {
+                        continue;
+                    }
+                    let r0 = 2 * pair;
+                    let r1 = r0 + 1;
+                    let mut a = F128::ZERO;
+                    let mut b = F128::ZERO;
+                    for j in 0..n_chunks {
+                        a += even_table[j * 256 + a_packed[r0 * n_chunks + j] as usize];
+                        a += odd_table[j * 256 + a_packed[r1 * n_chunks + j] as usize];
+                        b += even_table[j * 256 + b_packed[r0 * n_chunks + j] as usize];
+                        b += odd_table[j * 256 + b_packed[r1 * n_chunks + j] as usize];
+                    }
+                    vals[lane] = a;
+                    vals[2 + lane] = b;
+                }
+                // SAFETY: exclusive per-chunk output range (see above).
+                unsafe {
+                    *a_ptr.add(out) = vals[0];
+                    *a_ptr.add(out + 1) = vals[1];
+                    *b_ptr.add(out) = vals[2];
+                    *b_ptr.add(out + 1) = vals[3];
+                }
+                let (a0, a1, b0, b1) = (vals[0], vals[1], vals[2], vals[3]);
+                let eq_l = eq_lo[x_lo];
+                p1_acc ^= eq_l.mul_unreduced(a1 * b1);
+                pinf_acc ^= eq_l.mul_unreduced((a0 + a1) * (b0 + b1));
+            }
+            (p1_acc.reduce(), pinf_acc.reduce())
+        };
+
+        let eq_h = eq_hi[x_hi];
+        // SAFETY: exclusive owner of partials[x_hi].
+        unsafe {
+            *partials_base.ptr().add(x_hi) = (eq_h * p1, eq_h * pinf);
+        }
+    });
+
+    let (sum1, sum_inf) = partials
+        .iter()
+        .fold((F128::ZERO, F128::ZERO), |(s1, sinf), &(c1, cinf)| {
+            (s1 + c1, sinf + cinf)
+        });
+
+    (a_out, b_out, r_next[0] * sum1, sum_inf)
+}
+
 /// Byte-lane-outer streaming variant of
 /// [`uni_skip_fold_and_round_pair_compact_padded`]. Bit-identical outputs
 /// (fold XOR trees are merely reassociated). `lanes_per_pass ∈ {1, 2, 4, 8}`
@@ -2623,6 +2943,96 @@ mod tests {
             compact.recycle();
             crate::scratch::give_f128(legacy_a);
             crate::scratch::give_f128(legacy_b);
+            crate::scratch::clear();
+        }
+    }
+
+    /// The anchorless pair (round-two products + packed first tail round) is
+    /// bit-identical to the compact materialization it replaces: same round-two
+    /// message, same folded tables, same round-three message — including across
+    /// the padded-pair boundary and the degenerate `b`-row class.
+    #[test]
+    fn anchorless_round2_matches_compact_materialization() {
+        const K_SKIP: usize = 6;
+        const M: usize = 20;
+        const K_LOG: usize = 14;
+        const USEFUL_BITS: usize = 15_409;
+
+        let mut rng = Rng::new(0x0A0C_4012);
+        let mut a = rng.bits(1 << M);
+        let mut b = rng.bits(1 << M);
+        let block_size = 1usize << K_LOG;
+        for block in 0..(1usize << (M - K_LOG)) {
+            a[block * block_size + USEFUL_BITS..(block + 1) * block_size].fill(false);
+            b[block * block_size + USEFUL_BITS..(block + 1) * block_size].fill(false);
+            // Force the b ≡ 1 degenerate chunk class onto a whole pair so both
+            // kernels' value-forced shortcuts are exercised.
+            b[block * block_size..block * block_size + 2 * (1 << K_SKIP)].fill(true);
+        }
+        let a_packed = pack_bits(&a);
+        let b_packed = pack_bits(&b);
+        let z = rng.f128();
+        let mlv_challenges = rng.f128_vec(M - K_SKIP);
+        let r_next = rng.f128_vec(M - K_SKIP - 1);
+        let random_rho = rng.f128();
+        let table = UniSkipFoldTable::new(K_SKIP, z);
+        let padding = PaddingSpec {
+            k_log: K_LOG,
+            useful_bits_per_block: USEFUL_BITS,
+        };
+
+        for rho in [F128::ZERO, F128::ONE, random_rho] {
+            crate::scratch::clear();
+            let (compact, expected_m1, expected_mi) = uni_skip_fold_and_round_pair_compact_padded(
+                &a_packed,
+                &b_packed,
+                M,
+                K_SKIP,
+                &table,
+                &mlv_challenges,
+                &padding,
+            );
+            let (expected_a, expected_b, expected_f1, expected_fi) =
+                fold_compact_and_compute_round_pair(&compact, &table, rho, &r_next);
+            compact.recycle();
+
+            let (actual_m1, actual_mi) = uni_skip_round_pair_products_padded(
+                &a_packed,
+                &b_packed,
+                M,
+                K_SKIP,
+                &table,
+                &mlv_challenges,
+                &padding,
+            );
+            let (actual_a, actual_b, actual_f1, actual_fi) = fold_packed_and_compute_round_pair(
+                &a_packed,
+                &b_packed,
+                M,
+                K_SKIP,
+                &table,
+                rho,
+                &r_next,
+                &padding,
+            );
+
+            assert_eq!(
+                (actual_m1, actual_mi),
+                (expected_m1, expected_mi),
+                "round-two message mismatch; rho={rho:?}"
+            );
+            assert_eq!(actual_a, expected_a, "folded A mismatch; rho={rho:?}");
+            assert_eq!(actual_b, expected_b, "folded B mismatch; rho={rho:?}");
+            assert_eq!(
+                (actual_f1, actual_fi),
+                (expected_f1, expected_fi),
+                "round-three message mismatch; rho={rho:?}"
+            );
+
+            crate::scratch::give_f128(expected_a);
+            crate::scratch::give_f128(expected_b);
+            crate::scratch::give_f128(actual_a);
+            crate::scratch::give_f128(actual_b);
             crate::scratch::clear();
         }
     }
