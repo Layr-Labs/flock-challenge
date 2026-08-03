@@ -27,8 +27,9 @@ pub mod univariate_skip_deg4_optimized;
 pub mod univariate_skip_optimized;
 
 use multilinear::{
-    UniSkipFoldTable, fold_and_compute_round_pair_into, fold_compact_and_compute_round_pair,
-    fold_in_place_pair, interpolate_at_z_combined, interpolate_at_z_on_lambda, round_pair_naive,
+    UniSkipFoldTable, fold_and_compute_round_pair_into_ranked_padprop,
+    fold_compact_and_compute_round_pair, fold_in_place_pair, interpolate_at_z_combined,
+    interpolate_at_z_on_lambda, round_pair_naive,
     uni_skip_fold_and_round_pair_compact_padded_with_deltas,
 };
 use univariate_skip_optimized::{
@@ -623,8 +624,19 @@ fn prove_packed_padded_inner<C: Challenger>(
     let t_t3 = std::time::Instant::now();
     let mut first_r_next = vec![F128::ONE; n_mlv - 1];
     first_r_next[1..].copy_from_slice(&r[k_skip + 2..]);
-    let (mut a_mlv, mut b_mlv, first_m1, first_mi) =
-        fold_compact_and_compute_round_pair(&compact_mlv, &fold_table, mlv_rhos[0], &first_r_next);
+    // Padding-skip for the first tail round (T3): the compact's within-block
+    // zero suffix (rows round two wrote as zero) reconstructs to zero and adds
+    // nothing to the message. `tail_pair_skip` returns `(0, usize::MAX)` when
+    // the kill switch `FLOCK_NO_ZC_TAIL_PADSKIP=1` is set or there is no
+    // padding, restoring the legacy full-fold path byte-for-byte.
+    let t3_pad_skip = multilinear::tail_pair_skip(padding, compact_mlv.len(), m);
+    let (mut a_mlv, mut b_mlv, first_m1, first_mi) = fold_compact_and_compute_round_pair(
+        &compact_mlv,
+        &fold_table,
+        mlv_rhos[0],
+        &first_r_next,
+        t3_pad_skip,
+    );
     if tail_round_timing {
         eprintln!(
             "[zc-tail-rounds] T3 compact fold (out n={}): {:.2} ms",
@@ -671,13 +683,18 @@ fn prove_packed_padded_inner<C: Challenger>(
 
         let (m1, mi) = if log_n_before >= 15 {
             let half = a_mlv.len() / 2;
-            let (m1, mi) = fold_and_compute_round_pair_into(
+            // T3 carries the ranked block's exact zero suffix into the first
+            // two ordinary fused rounds. Dispatch once per round; all other
+            // shapes/iterations and the rollback use the generic kernel.
+            let padprop = multilinear::ranked_tail_padprop_stage(padding, m, i);
+            let (m1, mi) = fold_and_compute_round_pair_into_ranked_padprop(
                 &a_mlv,
                 &b_mlv,
                 &mut a_nxt[..half],
                 &mut b_nxt[..half],
                 rho_prev,
                 &r_next,
+                padprop,
             );
             // Swap current <-> scratch, then shrink the new current to the
             // folded size. The old (larger) buffer becomes scratch; we only

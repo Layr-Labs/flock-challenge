@@ -50,14 +50,19 @@ mod kernels;
 use kernels::aarch64::fold_one_row_neon_unchecked_8;
 #[cfg(target_arch = "aarch64")]
 use kernels::aarch64::{
-    fold_and_message_aarch64, fold_compact_chunk_neon_unchecked_8,
+    fold_and_message_aarch64, fold_and_message_aarch64_ranked_padprop_stage1,
+    fold_and_message_aarch64_ranked_padprop_stage2,
+    fold_compact_chunk_neon_ranked_padseg_8, fold_compact_chunk_neon_unchecked_8,
     fold_compact_stream_chunk_neon, fold_round2_chunk_neon_unchecked_8,
     fold_round2_compact_chunk_neon_unchecked_8, fold_round2_compact_stream_chunk_neon,
 };
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 use kernels::aarch64::fold_round2_compact_chunk_neon_anchors_only_8;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-use kernels::aarch64::fold_compact_chunk_neon_reconstruct_only_8;
+use kernels::aarch64::{
+    fold_compact_chunk_neon_reconstruct_only_8,
+    fold_compact_chunk_neon_reconstruct_only_ranked_padseg_8,
+};
 #[cfg(all(
     target_arch = "x86_64",
     target_feature = "avx512f",
@@ -85,7 +90,7 @@ fn r2_degen_enabled() -> bool {
     std::env::var_os("FLOCK_NO_R2_DEGEN").is_none_or(|v| v != *"1")
 }
 
-fn round2_pair_skip(padding: &PaddingSpec, k_skip: usize) -> (usize, usize) {
+pub(crate) fn round2_pair_skip(padding: &PaddingSpec, k_skip: usize) -> (usize, usize) {
     if padding.k_log <= k_skip + 1 {
         return (0, usize::MAX);
     }
@@ -96,6 +101,117 @@ fn round2_pair_skip(padding: &PaddingSpec, k_skip: usize) -> (usize, usize) {
         return (0, usize::MAX);
     }
     (pairs_per_block - 1, useful_pairs)
+}
+
+/// Kill switch for the tail padding-skip (rounds 3+): `FLOCK_NO_ZC_TAIL_PADSKIP=1`
+/// restores the legacy full-fold path (every pair reconstructed, no skipping).
+/// Default = skip on. The skipped pairs are exactly those round two wrote as
+/// zero anchors + zero deltas for the honest zero padding of every block, so
+/// their reconstruction and message contribution are provably zero either way
+/// — the two paths are byte-identical.
+pub(crate) fn tail_padskip_enabled() -> bool {
+    use std::sync::LazyLock;
+    static ENABLED: LazyLock<bool> = LazyLock::new(|| {
+        std::env::var_os("FLOCK_NO_ZC_TAIL_PADSKIP").is_none_or(|v| v != *"1")
+    });
+    *ENABLED
+}
+
+/// Padding-skip descriptor `(within_block_mask, useful_inclusive)` for a tail
+/// round whose *input* value array has `n_in` entries, at instance size `m`
+/// with the given padding. The tail folds adjacent pairs `(2·x_lo, 2·x_lo+1)`;
+/// a pair contributes nothing and reconstructs to zero exactly when both of its
+/// elements fall in the honest zero padding of their block. Returns a mask +
+/// inclusive-useful bound tested against the *input* index of the even element:
+/// `(idx & within_block_mask) >= useful_inclusive` ⇒ the whole pair is zero.
+///
+/// `(0, usize::MAX)` means "never skip" — returned when the kill switch is set,
+/// when there is no per-block padding, or when the (halved) block is already
+/// small enough that no aligned pair lands fully in the zero region (so the
+/// deeper rounds pay no branch). Byte-identical to the full path because round
+/// two wrote exact zeros for those slots and the fold/message of a zero pair is
+/// zero.
+pub(crate) fn tail_pair_skip(padding: &PaddingSpec, n_in: usize, m: usize) -> (usize, usize) {
+    const NONE: (usize, usize) = (0, usize::MAX);
+    if !tail_padskip_enabled() || padding.k_log >= m || !n_in.is_power_of_two() {
+        return NONE;
+    }
+    let n_blocks = 1usize << (m - padding.k_log);
+    if n_in <= n_blocks {
+        return NONE; // folded past the within-block dimension entirely
+    }
+    let wb = n_in / n_blocks; // within-block value width (power of two)
+    let block = 1usize << padding.k_log;
+    if block % wb != 0 {
+        return NONE;
+    }
+    let uv = padding.useful_bits_per_block.div_ceil(block / wb); // nonzero count
+    // Largest even input index within a block is `wb - 2`; a fully-zero aligned
+    // pair exists only when `uv <= wb - 2`.
+    if uv > wb.saturating_sub(2) {
+        return NONE;
+    }
+    (wb - 1, uv)
+}
+
+/// Exact ranked BLAKE3 padding state carried into the first two ordinary
+/// fused tail rounds after T3.  T3 leaves 128 records per witness block with
+/// records `121..128` equal to zero.  The next fold leaves 64 records with
+/// `61..64` zero.  From the third ordinary round onward the boundary group has
+/// two potentially nonzero folds, so the generic kernel is retained.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RankedTailPadPropStage {
+    None,
+    InputWidth128,
+    InputWidth64,
+}
+
+#[inline]
+fn tail_padprop_env_enabled(value: Option<&std::ffi::OsStr>) -> bool {
+    value.is_none_or(|v| v != "1")
+}
+
+/// Independent rollback for the post-T3 padding propagation kernels.
+/// `FLOCK_NO_ZC_TAIL_PADPROP=1` restores the generic fused loop byte-for-byte.
+#[inline]
+fn tail_padprop_enabled() -> bool {
+    use std::sync::LazyLock;
+    static ENABLED: LazyLock<bool> = LazyLock::new(|| {
+        tail_padprop_env_enabled(std::env::var_os("FLOCK_NO_ZC_TAIL_PADPROP").as_deref())
+    });
+    *ENABLED
+}
+
+#[inline]
+fn ranked_tail_padprop_stage_enabled(
+    padding: &PaddingSpec,
+    m: usize,
+    i: usize,
+    enabled: bool,
+) -> RankedTailPadPropStage {
+    if !enabled
+        || m != 32
+        || padding.k_log != 14
+        || padding.useful_bits_per_block != 15_409
+    {
+        return RankedTailPadPropStage::None;
+    }
+    match i {
+        1 => RankedTailPadPropStage::InputWidth128,
+        2 => RankedTailPadPropStage::InputWidth64,
+        _ => RankedTailPadPropStage::None,
+    }
+}
+
+/// Select the once-dispatched padding specialization for an ordinary fused
+/// tail iteration.  The exact ranked shape and iteration are checked here;
+/// chunk alignment and NT-store eligibility are checked by the fused driver.
+pub(crate) fn ranked_tail_padprop_stage(
+    padding: &PaddingSpec,
+    m: usize,
+    i: usize,
+) -> RankedTailPadPropStage {
+    ranked_tail_padprop_stage_enabled(padding, m, i, tail_padprop_enabled())
 }
 
 /// Kill switch for draining the DRAM-bound tail loop rounds (half ≥ 2^21)
@@ -128,6 +244,16 @@ fn zc_tail_split11_enabled() -> bool {
     static ENABLED: LazyLock<bool> =
         LazyLock::new(|| std::env::var_os("FLOCK_NO_ZC_TAIL_SPLIT11").is_none());
     *ENABLED
+}
+
+/// Process-lifetime NT-store policy shared by the generic tail and the exact
+/// ranked padding dispatcher.
+#[cfg(target_arch = "aarch64")]
+#[inline]
+fn zc_tail_nt_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("FLOCK_ZC_NT_LEGACY").is_none())
 }
 
 // ---------------------------------------------------------------------------
@@ -922,7 +1048,7 @@ pub fn fold_compact_and_compute_round_pair_stream(
     #[cfg(not(target_arch = "aarch64"))]
     {
         let _ = lanes_per_pass;
-        return fold_compact_and_compute_round_pair(compact, table, r_fold, r_next);
+        return fold_compact_and_compute_round_pair(compact, table, r_fold, r_next, (0, usize::MAX));
     }
     #[cfg(target_arch = "aarch64")]
     {
@@ -994,13 +1120,56 @@ pub fn fold_compact_and_compute_round_pair_stream(
     }
 }
 
+#[inline]
+fn use_ranked_tail_padseg(pad_skip: (usize, usize), n: usize, r_next_len: usize) -> bool {
+    if pad_skip != (127, 121)
+        || n < 4
+        || !n.is_power_of_two()
+        || r_next_len != n.trailing_zeros() as usize
+    {
+        return false;
+    }
+    let eq_bits = r_next_len - 1;
+    let n_hi = COMPACT_RECONSTRUCTION_N_HI.min(eq_bits);
+    let lo_size = 1usize << (eq_bits - n_hi);
+    lo_size.is_multiple_of(64)
+}
+
 /// Bind the first multilinear challenge from a compact round-two
 /// materialization and compute the following round message.
 ///
 /// `r_next` describes the post-fold table, matching the contract of
 /// [`fold_and_compute_round_pair_into`].  The returned tables have
 /// `compact.len()` entries each.
+///
+/// `pad_skip = (within_block_mask, useful_exclusive)` describes the honest
+/// zero-padding suffix round two wrote as zero anchors + zero deltas. The
+/// ranked descriptor `(127, 121)` selects a once-dispatched block-segmented
+/// kernel: 61 useful/mixed pairs followed by three zero pairs in every block.
+/// Any other descriptor, including `(0, usize::MAX)`, uses the untouched legacy
+/// full-compute kernel. The fallback is exact because padding skipping is only
+/// an optimization. See [`tail_pair_skip`].
 pub fn fold_compact_and_compute_round_pair(
+    compact: &UniSkipCompactFold,
+    table: &UniSkipFoldTable,
+    r_fold: F128,
+    r_next: &[F128],
+    pad_skip: (usize, usize),
+) -> (Vec<F128>, Vec<F128>, F128, F128) {
+    // Keep the official AArch64 hot loops as two compile-time-distinct arms.
+    // The disabled/dense/non-ranked arm therefore carries no padding state and
+    // retains the legacy kernel signature/codegen. `lo_size % 64 == 0` also
+    // proves every chunk starts on a 128-record witness-block boundary because
+    // `chunk_size = 2 * lo_size`.
+    let ranked_padseg = use_ranked_tail_padseg(pad_skip, compact.len(), r_next.len());
+    if ranked_padseg {
+        fold_compact_and_compute_round_pair_body::<true>(compact, table, r_fold, r_next)
+    } else {
+        fold_compact_and_compute_round_pair_body::<false>(compact, table, r_fold, r_next)
+    }
+}
+
+fn fold_compact_and_compute_round_pair_body<const RANKED_PADSEG: bool>(
     compact: &UniSkipCompactFold,
     table: &UniSkipFoldTable,
     r_fold: F128,
@@ -1101,30 +1270,54 @@ pub fn fold_compact_and_compute_round_pair(
             #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
             if x_hi < gpu_prefix {
                 unsafe {
-                    fold_compact_chunk_neon_reconstruct_only_8(
-                        scaled_table.as_ptr().cast::<u8>(),
-                        compact.anchors.as_ptr().add(2 * base),
-                        compact.deltas.as_ptr().add(2 * base * table.n_chunks),
-                        a_out.as_mut_ptr(),
-                        b_out.as_mut_ptr(),
-                        lo_size,
-                    );
+                    if RANKED_PADSEG {
+                        fold_compact_chunk_neon_reconstruct_only_ranked_padseg_8(
+                            scaled_table.as_ptr().cast::<u8>(),
+                            compact.anchors.as_ptr().add(2 * base),
+                            compact.deltas.as_ptr().add(2 * base * table.n_chunks),
+                            a_out.as_mut_ptr(),
+                            b_out.as_mut_ptr(),
+                            lo_size,
+                        );
+                    } else {
+                        fold_compact_chunk_neon_reconstruct_only_8(
+                            scaled_table.as_ptr().cast::<u8>(),
+                            compact.anchors.as_ptr().add(2 * base),
+                            compact.deltas.as_ptr().add(2 * base * table.n_chunks),
+                            a_out.as_mut_ptr(),
+                            b_out.as_mut_ptr(),
+                            lo_size,
+                        );
+                    }
                 }
                 return;
             }
 
             #[cfg(target_arch = "aarch64")]
             let (p1, pinf) = unsafe {
-                fold_compact_chunk_neon_unchecked_8(
-                    scaled_table.as_ptr().cast::<u8>(),
-                    compact.anchors.as_ptr().add(2 * base),
-                    compact.deltas.as_ptr().add(2 * base * table.n_chunks),
-                    a_out.as_mut_ptr(),
-                    b_out.as_mut_ptr(),
-                    eq_lo.as_ptr(),
-                    lo_size,
-                    degen,
-                )
+                if RANKED_PADSEG {
+                    fold_compact_chunk_neon_ranked_padseg_8(
+                        scaled_table.as_ptr().cast::<u8>(),
+                        compact.anchors.as_ptr().add(2 * base),
+                        compact.deltas.as_ptr().add(2 * base * table.n_chunks),
+                        a_out.as_mut_ptr(),
+                        b_out.as_mut_ptr(),
+                        eq_lo.as_ptr(),
+                        lo_size,
+                        degen,
+                    )
+                } else {
+                    fold_compact_chunk_neon_unchecked_8(
+                        scaled_table.as_ptr().cast::<u8>(),
+                        compact.anchors.as_ptr().add(2 * base),
+                        compact.deltas.as_ptr().add(2 * base * table.n_chunks),
+                        a_out.as_mut_ptr(),
+                        b_out.as_mut_ptr(),
+                        eq_lo.as_ptr(),
+                        lo_size,
+                        degen,
+                    )
+                }
             };
 
             #[cfg(not(target_arch = "aarch64"))]
@@ -1133,6 +1326,17 @@ pub fn fold_compact_and_compute_round_pair(
                 let mut pinf_acc = F256Unreduced::ZERO;
                 for x_lo in 0..lo_size {
                     let out = 2 * x_lo;
+                    // Honest zero-padding pair: both rows reconstruct to zero and
+                    // contribute nothing. Store zeros and skip (byte-identical to
+                    // the full path). Mirrors `fold_round2_compact` and the NEON
+                    // kernel's skip.
+                    if RANKED_PADSEG && ((base + out) & 127) >= 121 {
+                        a_out[out] = F128::ZERO;
+                        a_out[out + 1] = F128::ZERO;
+                        b_out[out] = F128::ZERO;
+                        b_out[out + 1] = F128::ZERO;
+                        continue;
+                    }
                     for lane in 0..2 {
                         let index = base + out + lane;
                         let mut a = compact.anchors[2 * index];
@@ -1191,16 +1395,29 @@ pub fn fold_compact_and_compute_round_pair(
                 for x_hi in 0..prefix {
                     let base = x_hi * chunk_size;
                     let (p1, pinf) = unsafe {
-                        fold_compact_chunk_neon_unchecked_8(
-                            scaled_table.as_ptr().cast::<u8>(),
-                            compact.anchors.as_ptr().add(2 * base),
-                            compact.deltas.as_ptr().add(2 * base * table.n_chunks),
-                            a_out.as_mut_ptr().wrapping_add(base),
-                            b_out.as_mut_ptr().wrapping_add(base),
-                            eq_lo.as_ptr(),
-                            lo_size,
-                            degen,
-                        )
+                        if RANKED_PADSEG {
+                            fold_compact_chunk_neon_ranked_padseg_8(
+                                scaled_table.as_ptr().cast::<u8>(),
+                                compact.anchors.as_ptr().add(2 * base),
+                                compact.deltas.as_ptr().add(2 * base * table.n_chunks),
+                                a_out.as_mut_ptr().wrapping_add(base),
+                                b_out.as_mut_ptr().wrapping_add(base),
+                                eq_lo.as_ptr(),
+                                lo_size,
+                                degen,
+                            )
+                        } else {
+                            fold_compact_chunk_neon_unchecked_8(
+                                scaled_table.as_ptr().cast::<u8>(),
+                                compact.anchors.as_ptr().add(2 * base),
+                                compact.deltas.as_ptr().add(2 * base * table.n_chunks),
+                                a_out.as_mut_ptr().wrapping_add(base),
+                                b_out.as_mut_ptr().wrapping_add(base),
+                                eq_lo.as_ptr(),
+                                lo_size,
+                                degen,
+                            )
+                        }
                     };
                     let eq_h = eq_hi[x_hi];
                     partials[x_hi] = (eq_h * p1, eq_h * pinf);
@@ -1613,9 +1830,103 @@ pub fn fold_and_compute_round_pair_into(
     fold_and_compute_round_pair_into_with_n_hi(a, b, a_out, b_out, r_fold, r_next, n_hi)
 }
 
+/// Ranked-padding-aware sibling of [`fold_and_compute_round_pair_into`].  Only
+/// the zerocheck driver supplies a non-`None` stage; all public/general callers
+/// retain the original branch-free AArch64 kernel.
+pub(crate) fn fold_and_compute_round_pair_into_ranked_padprop(
+    a: &[F128],
+    b: &[F128],
+    a_out: &mut [F128],
+    b_out: &mut [F128],
+    r_fold: F128,
+    r_next: &[F128],
+    padprop: RankedTailPadPropStage,
+) -> (F128, F128) {
+    #[cfg(target_arch = "aarch64")]
+    let n_hi = if a.len() / 2 >= LARGE_TAIL_EQ_MIN_HALF && zc_tail_split11_enabled() {
+        LARGE_TAIL_EQ_N_HI
+    } else {
+        SplitEqGhash::MAX_N_HI
+    };
+    #[cfg(not(target_arch = "aarch64"))]
+    let n_hi = SplitEqGhash::MAX_N_HI;
+
+    fold_and_compute_round_pair_into_with_n_hi_and_padprop(
+        a, b, a_out, b_out, r_fold, r_next, n_hi, padprop,
+    )
+}
+
 /// Split-explicit implementation used by the public policy wrapper and by the
 /// exact n_hi=9 versus n_hi=11 regression test.
 fn fold_and_compute_round_pair_into_with_n_hi(
+    a: &[F128],
+    b: &[F128],
+    a_out: &mut [F128],
+    b_out: &mut [F128],
+    r_fold: F128,
+    r_next: &[F128],
+    n_hi: usize,
+) -> (F128, F128) {
+    fold_and_compute_round_pair_into_with_n_hi_body::<0>(
+        a, b, a_out, b_out, r_fold, r_next, n_hi,
+    )
+}
+
+fn fold_and_compute_round_pair_into_with_n_hi_and_padprop(
+    a: &[F128],
+    b: &[F128],
+    a_out: &mut [F128],
+    b_out: &mut [F128],
+    r_fold: F128,
+    r_next: &[F128],
+    n_hi: usize,
+    padprop: RankedTailPadPropStage,
+) -> (F128, F128) {
+    #[cfg(target_arch = "aarch64")]
+    {
+        let eq_bits = r_next.len().saturating_sub(1);
+        let n_lo = eq_bits - n_hi.min(eq_bits);
+        let lo_size = 1usize << n_lo;
+        let nt_stores = a.len() / 2 >= (1usize << 21) && zc_tail_nt_enabled();
+        return match padprop {
+            RankedTailPadPropStage::InputWidth128
+                if a.len() == (1usize << 25)
+                    && r_next.len() == 24
+                    && nt_stores
+                    && lo_size.is_multiple_of(32) =>
+            {
+                fold_and_compute_round_pair_into_with_n_hi_body::<1>(
+                    a, b, a_out, b_out, r_fold, r_next, n_hi,
+                )
+            }
+            RankedTailPadPropStage::InputWidth64
+                if a.len() == (1usize << 24)
+                    && r_next.len() == 23
+                    && nt_stores
+                    && lo_size.is_multiple_of(16) =>
+            {
+                fold_and_compute_round_pair_into_with_n_hi_body::<2>(
+                    a, b, a_out, b_out, r_fold, r_next, n_hi,
+                )
+            }
+            _ => fold_and_compute_round_pair_into_with_n_hi_body::<0>(
+                a, b, a_out, b_out, r_fold, r_next, n_hi,
+            ),
+        };
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        let _ = padprop;
+        fold_and_compute_round_pair_into_with_n_hi_body::<0>(
+            a, b, a_out, b_out, r_fold, r_next, n_hi,
+        )
+    }
+}
+
+/// Const-dispatched whole-round body.  `PADPROP=0` retains the incumbent
+/// closure capture and generic-kernel call exactly; values 1 and 2 select the
+/// stage kernels without carrying a runtime enum or branch into each chunk.
+fn fold_and_compute_round_pair_into_with_n_hi_body<const PADPROP: u8>(
     a: &[F128],
     b: &[F128],
     a_out: &mut [F128],
@@ -1646,13 +1957,7 @@ fn fold_and_compute_round_pair_into_with_n_hi(
     // round-2 producer uses); LLC-resident later rounds keep normal stores so
     // their outputs stay hot for the next round. 2^22 F128 = 64 MiB per array.
     #[cfg(target_arch = "aarch64")]
-    let nt_stores = {
-        use std::sync::OnceLock;
-        static NT_ENABLED: OnceLock<bool> = OnceLock::new();
-        half >= (1usize << 21)
-            && *NT_ENABLED
-                .get_or_init(|| std::env::var_os("FLOCK_ZC_NT_LEGACY").is_none())
-    };
+    let nt_stores = half >= (1usize << 21) && zc_tail_nt_enabled();
     // Total non-bound multilinear vars is log_n - 1; eq covers log_n - 2 of those.
     assert_eq!(lo_size * hi_size * 2, half);
 
@@ -1682,8 +1987,19 @@ fn fold_and_compute_round_pair_into_with_n_hi(
                 unsafe { fold_and_message_x86_avx512(a_in, b_in, a_out, b_out, r_fold, eq_lo) };
 
             #[cfg(target_arch = "aarch64")]
-            let (p1, pinf) =
-                fold_and_message_aarch64(a_in, b_in, a_out, b_out, r_fold, eq_lo, nt_stores);
+            let (p1, pinf) = if PADPROP == 1 {
+                fold_and_message_aarch64_ranked_padprop_stage1(
+                    a_in, b_in, a_out, b_out, r_fold, eq_lo,
+                )
+            } else if PADPROP == 2 {
+                fold_and_message_aarch64_ranked_padprop_stage2(
+                    a_in, b_in, a_out, b_out, r_fold, eq_lo,
+                )
+            } else {
+                fold_and_message_aarch64(
+                    a_in, b_in, a_out, b_out, r_fold, eq_lo, nt_stores,
+                )
+            };
 
             #[cfg(not(any(
                 target_arch = "aarch64",
@@ -2490,6 +2806,191 @@ mod tests {
         assert_eq!(msg11, msg9, "round message differs across equality splits");
     }
 
+    #[test]
+    fn compact_ranked_padseg_dispatch_is_shape_guarded() {
+        // log_n=18 gives n_hi=11 and lo_size=64: exactly one 128-record
+        // witness block per CPU chunk. Larger ranked inputs remain aligned.
+        assert!(use_ranked_tail_padseg((127, 121), 1 << 18, 18));
+        assert!(use_ranked_tail_padseg((127, 121), 1 << 25, 25));
+
+        // The existing small compact oracle has lo_size=2 and must use the
+        // generic full-compute fallback; so must every non-ranked descriptor.
+        assert!(!use_ranked_tail_padseg((127, 121), 1 << 13, 13));
+        assert!(!use_ranked_tail_padseg((0, usize::MAX), 1 << 25, 25));
+        assert!(!use_ranked_tail_padseg((127, 120), 1 << 25, 25));
+        assert!(!use_ranked_tail_padseg((127, 121), 1 << 25, 24));
+    }
+
+    #[test]
+    fn ranked_tail_padprop_selector_is_env_shape_and_iteration_guarded() {
+        use std::ffi::OsStr;
+
+        assert!(tail_padprop_env_enabled(None));
+        assert!(tail_padprop_env_enabled(Some(OsStr::new(""))));
+        assert!(tail_padprop_env_enabled(Some(OsStr::new("0"))));
+        assert!(!tail_padprop_env_enabled(Some(OsStr::new("1"))));
+
+        let ranked = PaddingSpec {
+            k_log: 14,
+            useful_bits_per_block: 15_409,
+        };
+        assert_eq!(
+            ranked_tail_padprop_stage_enabled(&ranked, 32, 1, true),
+            RankedTailPadPropStage::InputWidth128
+        );
+        assert_eq!(
+            ranked_tail_padprop_stage_enabled(&ranked, 32, 2, true),
+            RankedTailPadPropStage::InputWidth64
+        );
+        assert_eq!(
+            ranked_tail_padprop_stage_enabled(&ranked, 32, 0, true),
+            RankedTailPadPropStage::None
+        );
+        assert_eq!(
+            ranked_tail_padprop_stage_enabled(&ranked, 32, 3, true),
+            RankedTailPadPropStage::None
+        );
+        assert_eq!(
+            ranked_tail_padprop_stage_enabled(&ranked, 32, 1, false),
+            RankedTailPadPropStage::None
+        );
+
+        let wrong_useful = PaddingSpec {
+            useful_bits_per_block: 15_408,
+            ..ranked
+        };
+        let wrong_block = PaddingSpec {
+            k_log: 13,
+            ..ranked
+        };
+        assert_eq!(
+            ranked_tail_padprop_stage_enabled(&ranked, 31, 1, true),
+            RankedTailPadPropStage::None
+        );
+        assert_eq!(
+            ranked_tail_padprop_stage_enabled(&wrong_useful, 32, 1, true),
+            RankedTailPadPropStage::None
+        );
+        assert_eq!(
+            ranked_tail_padprop_stage_enabled(&wrong_block, 32, 1, true),
+            RankedTailPadPropStage::None
+        );
+    }
+
+    /// The official ranked T3 shape has 128 compact records (64 adjacent
+    /// message pairs) per witness block. Record 121 is the zero side of the
+    /// final mixed pair; records 122..127 form three fully-zero pairs. Compare
+    /// two complete blocks so the segmented loop's boundary transition and
+    /// equality-table indexing are both exercised.
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    fn compact_ranked_padseg_kernels_match_legacy() {
+        const LO_SIZE: usize = 128;
+        const RECORDS: usize = 2 * LO_SIZE;
+        const RECORDS_PER_BLOCK: usize = 128;
+        const USEFUL_RECORDS: usize = 121;
+        const POISON: F128 = F128 {
+            lo: 0x5a5a_5a5a_5a5a_5a5a,
+            hi: 0xa5a5_a5a5_a5a5_a5a5,
+        };
+
+        let mut rng = Rng::new(0xA11C_E5E6_003D);
+        let table = UniSkipFoldTable::new(6, rng.f128());
+        let scaled_table = table.scaled_linear(rng.f128());
+        let mut anchors = rng.f128_vec(2 * RECORDS);
+        let mut deltas = vec![0u8; 16 * RECORDS];
+        for word in deltas.chunks_exact_mut(8) {
+            word.copy_from_slice(&rng.next_u64().to_le_bytes());
+        }
+        let eq_lo = rng.f128_vec(LO_SIZE);
+
+        // Exercise both value-gated degen subcases on useful pairs: b deltas
+        // are zero, with alternating b=1 and arbitrary b anchors.
+        for x_lo in 0..LO_SIZE {
+            if x_lo % 7 == 0 && x_lo % 64 < 61 {
+                for record in [2 * x_lo, 2 * x_lo + 1] {
+                    deltas[16 * record + 8..16 * record + 16].fill(0);
+                    if x_lo % 14 == 0 {
+                        anchors[2 * record + 1] = F128::ONE;
+                    }
+                }
+            }
+        }
+
+        // Exact compact zeros emitted by round two for the honest padding
+        // suffix. Record 121 remains present as the zero half of pair 60.
+        for block in 0..(RECORDS / RECORDS_PER_BLOCK) {
+            let first = block * RECORDS_PER_BLOCK + USEFUL_RECORDS;
+            let end = (block + 1) * RECORDS_PER_BLOCK;
+            for record in first..end {
+                anchors[2 * record] = F128::ZERO;
+                anchors[2 * record + 1] = F128::ZERO;
+                deltas[16 * record..16 * (record + 1)].fill(0);
+            }
+        }
+
+        for degen in [false, true] {
+            let mut legacy_a = vec![POISON; RECORDS];
+            let mut legacy_b = vec![POISON; RECORDS];
+            let mut segmented_a = vec![POISON; RECORDS];
+            let mut segmented_b = vec![POISON; RECORDS];
+
+            let legacy_msg = unsafe {
+                fold_compact_chunk_neon_unchecked_8(
+                    scaled_table.as_ptr().cast::<u8>(),
+                    anchors.as_ptr(),
+                    deltas.as_ptr(),
+                    legacy_a.as_mut_ptr(),
+                    legacy_b.as_mut_ptr(),
+                    eq_lo.as_ptr(),
+                    LO_SIZE,
+                    degen,
+                )
+            };
+            let segmented_msg = unsafe {
+                fold_compact_chunk_neon_ranked_padseg_8(
+                    scaled_table.as_ptr().cast::<u8>(),
+                    anchors.as_ptr(),
+                    deltas.as_ptr(),
+                    segmented_a.as_mut_ptr(),
+                    segmented_b.as_mut_ptr(),
+                    eq_lo.as_ptr(),
+                    LO_SIZE,
+                    degen,
+                )
+            };
+
+            assert_eq!(segmented_a, legacy_a, "A mismatch; degen={degen}");
+            assert_eq!(segmented_b, legacy_b, "B mismatch; degen={degen}");
+            assert_eq!(segmented_msg, legacy_msg, "message mismatch; degen={degen}");
+        }
+
+        let mut legacy_a = vec![POISON; RECORDS];
+        let mut legacy_b = vec![POISON; RECORDS];
+        let mut segmented_a = vec![POISON; RECORDS];
+        let mut segmented_b = vec![POISON; RECORDS];
+        unsafe {
+            fold_compact_chunk_neon_reconstruct_only_8(
+                scaled_table.as_ptr().cast::<u8>(),
+                anchors.as_ptr(),
+                deltas.as_ptr(),
+                legacy_a.as_mut_ptr(),
+                legacy_b.as_mut_ptr(),
+                LO_SIZE,
+            );
+            fold_compact_chunk_neon_reconstruct_only_ranked_padseg_8(
+                scaled_table.as_ptr().cast::<u8>(),
+                anchors.as_ptr(),
+                deltas.as_ptr(),
+                segmented_a.as_mut_ptr(),
+                segmented_b.as_mut_ptr(),
+                LO_SIZE,
+            );
+        }
+        assert_eq!(segmented_a, legacy_a, "reconstruct-only A mismatch");
+        assert_eq!(segmented_b, legacy_b, "reconstruct-only B mismatch");
+    }
+
     /// Full compact-path oracle against the legacy materialized round two.
     ///
     /// Covers both byte-pool and donated-F128 delta backing, forces all large
@@ -2601,7 +3102,7 @@ mod tests {
                 let expected_msg = round_pair_naive(&expected_a, &expected_b, &r_next);
 
                 let (actual_a, actual_b, actual_m1, actual_mi) =
-                    fold_compact_and_compute_round_pair(&compact, &table, rho, &r_next);
+                    fold_compact_and_compute_round_pair(&compact, &table, rho, &r_next, (0, usize::MAX));
                 assert_eq!(
                     actual_a, expected_a,
                     "reconstructed A mismatch; donate_f128={donate_f128}, rho={rho:?}"
