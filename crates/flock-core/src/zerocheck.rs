@@ -28,8 +28,8 @@ pub mod univariate_skip_optimized;
 
 use multilinear::{
     UniSkipFoldTable, eval_round3_lookahead, fold2_compact_and_round4_into,
-    fold_and_compute_round_pair_into, fold_compact_and_compute_round_pair, fold_in_place_pair,
-    interpolate_at_z_combined, interpolate_at_z_on_lambda, round_pair_naive,
+    fold_and_compute_round_pair_into_ranked_padprop, fold_compact_and_compute_round_pair,
+    fold_in_place_pair, interpolate_at_z_combined, interpolate_at_z_on_lambda, round_pair_naive,
     uni_skip_fold_and_round_pair_compact_padded_lookahead,
     uni_skip_fold_and_round_pair_compact_padded_with_deltas,
 };
@@ -698,6 +698,7 @@ fn prove_packed_padded_inner<C: Challenger>(
             mlv_rhos[0],
             mlv_rhos[1],
             &r_next4,
+            padding,
             &mut a_out,
             &mut b_out,
         );
@@ -771,13 +772,24 @@ fn prove_packed_padded_inner<C: Challenger>(
 
         let (m1, mi) = if log_n_before >= 15 {
             let half = a_mlv.len() / 2;
-            let (m1, mi) = fold_and_compute_round_pair_into(
+            // The K double fold leaves exactly 64 records per ranked witness
+            // block, of which only 0..=60 can be nonzero.  Dispatch the one
+            // remaining partial-boundary round once here; every other route,
+            // iteration and shape retains the incumbent generic kernel.
+            let padprop = multilinear::ranked_tail_padprop_stage(
+                padding,
+                m,
+                i,
+                loop_start == 2,
+            );
+            let (m1, mi) = fold_and_compute_round_pair_into_ranked_padprop(
                 &a_mlv,
                 &b_mlv,
                 &mut a_nxt[..half],
                 &mut b_nxt[..half],
                 rho_prev,
                 &r_next,
+                padprop,
             );
             // Swap current <-> scratch, then shrink the new current to the
             // folded size. The old (larger) buffer becomes scratch; we only
