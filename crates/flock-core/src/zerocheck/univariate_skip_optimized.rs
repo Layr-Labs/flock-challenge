@@ -1479,6 +1479,14 @@ pub(crate) fn round1_shift_reduce_ab_packed_padded_with_precomputed(
 /// whole zerocheck window, so starting the C fold's GPU prefix first lets it
 /// cover the AB completion as well as the CPU's own share of the fold.
 pub(crate) struct Round1CPrelude {
+    /// eq(r_outer, ·) — owned, or built in place in the GPU fold arm's
+    /// persistent upload buffer so the launch skips its 4 MiB memcpy (see
+    /// `gpu_commit::zc_fold_eq_table`; `FLOCK_NO_EQ_DIRECT=1` restores the
+    /// owned build). Same bytes either way; every CPU consumer reads it
+    /// through `as_slice`.
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    eq_outer: crate::gpu_commit::FoldEqTable,
+    #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
     eq_outer: Vec<F128>,
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     gpu: Option<crate::gpu_commit::ZcFoldJob>,
@@ -1504,9 +1512,15 @@ pub(crate) fn round1_c_prelude(
     useful_bits: usize,
     r: &[F128],
 ) -> Round1CPrelude {
-    let eq_outer = crate::lincheck::build_eq_table(&r[k_log..]);
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     {
+        // Off the arm's shape no launch will consume a staged table, so keep
+        // the incumbent owned build there (same gate as the launch below).
+        let eq_outer = if ranked_c_fold_shape(m, k_log) {
+            crate::gpu_commit::zc_fold_eq_table(&r[k_log..])
+        } else {
+            crate::gpu_commit::FoldEqTable::Owned(crate::lincheck::build_eq_table(&r[k_log..]))
+        };
         let gpu = ranked_c_fold_shape(m, k_log)
             .then(|| {
                 crate::gpu_commit::launch_zerocheck_c_fold(
@@ -1514,7 +1528,7 @@ pub(crate) fn round1_c_prelude(
                     m,
                     k_log,
                     useful_bits,
-                    &eq_outer,
+                    eq_outer.as_slice(),
                 )
             })
             .flatten();
@@ -1527,7 +1541,9 @@ pub(crate) fn round1_c_prelude(
     #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
     {
         let _ = (c_lincheck, m, k_log, useful_bits);
-        Round1CPrelude { eq_outer }
+        Round1CPrelude {
+            eq_outer: crate::lincheck::build_eq_table(&r[k_log..]),
+        }
     }
 }
 
@@ -1557,7 +1573,7 @@ fn round1_c_inner_fold(
             m,
             k_log,
             useful_bits,
-            &eq_outer,
+            eq_outer.as_slice(),
             claim_lo,
         );
         let suffix_ms = t_suffix.elapsed().as_secs_f64() * 1e3;
@@ -1570,7 +1586,13 @@ fn round1_c_inner_fold(
                     eprintln!("[gpu-zc] prefix failed, CPU redo: {e}");
                 }
                 let prefix = crate::lincheck::partial_fold_packed_z_neon_oblock_padded_range(
-                    c_lincheck, m, k_log, useful_bits, &eq_outer, 0, claim_lo,
+                    c_lincheck,
+                    m,
+                    k_log,
+                    useful_bits,
+                    eq_outer.as_slice(),
+                    0,
+                    claim_lo,
                 );
                 for (a, b) in out.iter_mut().zip(prefix) {
                     *a += b;
@@ -1579,7 +1601,7 @@ fn round1_c_inner_fold(
             }
         }
     }
-    crate::lincheck::partial_fold_packed_z_best(c_lincheck, m, k_log, useful_bits, &eq_outer)
+    crate::lincheck::partial_fold_packed_z_best(c_lincheck, m, k_log, useful_bits, eq_outer.as_slice())
 }
 
 #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
