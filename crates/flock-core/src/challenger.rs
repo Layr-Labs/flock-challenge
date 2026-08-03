@@ -550,18 +550,49 @@ impl Challenger for FsChallenger {
 
                     let exact = matches!((&gpu_1, &gpu_2), (Ok(a), Ok(b)) if *a == cpu_1 && *b == cpu_1)
                         && cpu_2 == cpu_1;
-                    let cpu_total = cpu_1_time + cpu_2_time;
-                    let gpu_total = gpu_1_time + gpu_2_time;
                     // A fixed N-nonce Metal block succeeds with probability
                     // 1-e^-1, so an unbounded grind consumes 1/(1-e^-1) =
                     // 1.582 blocks on average.  Charge that overdraw (including
                     // recurring command costs) before comparing with CPU.
-                    let projected_gpu_total = gpu_total.mul_f64(GPU_GRIND_BLOCK_OVERDRAW);
-                    let protected_gain = cpu_total.saturating_sub(projected_gpu_total);
-                    let enable = exact
-                        && gpu_1_time.mul_f64(GPU_GRIND_BLOCK_OVERDRAW) < cpu_1_time
-                        && gpu_2_time.mul_f64(GPU_GRIND_BLOCK_OVERDRAW) < cpu_2_time
-                        && protected_gain >= GPU_GRIND_MIN_TWO_SAMPLE_GAIN;
+                    let enable = if grind_latch_min_enabled() {
+                        // MEASUREMENT CORRECTION (kill: FLOCK_NO_GRIND_LATCH_MIN).
+                        // Each device is timed twice; the calibration's
+                        // contention (shared rayon pool, GPU governor ramp, and
+                        // one-shot page wiring) is strictly ONE-SIDED — it only
+                        // ever makes a draw slower, never faster — so the lesser
+                        // of the two draws is the least-contended, most accurate
+                        // estimate of each device's true cost. Price both arms
+                        // from their per-device minimum. The legacy rule instead
+                        // required BOTH per-sample GPU wins (an AND) and summed
+                        // the two draws for the gain, so one unlucky-high GPU
+                        // draw vetoed the whole process's latch for its lifetime
+                        // (hunt4 F1: a draw 7.8x its sibling). The 1.582 overdraw
+                        // factor, the `gpu*overdraw < cpu` comparison direction,
+                        // and the 1.5 ms two-sample gain threshold are ALL
+                        // unchanged — only the estimator over the repeats moves.
+                        let cpu_est = cpu_1_time.min(cpu_2_time);
+                        let gpu_est = gpu_1_time.min(gpu_2_time);
+                        let projected_gpu = gpu_est.mul_f64(GPU_GRIND_BLOCK_OVERDRAW);
+                        // Keep the gain on the two-sample scale the
+                        // GPU_GRIND_MIN_TWO_SAMPLE_GAIN constant was set for: the
+                        // two-pass total is estimated as twice the best pass, so
+                        // the literal 1.5 ms threshold keeps its meaning.
+                        let protected_gain = cpu_est
+                            .saturating_sub(projected_gpu)
+                            .saturating_mul(2);
+                        exact
+                            && projected_gpu < cpu_est
+                            && protected_gain >= GPU_GRIND_MIN_TWO_SAMPLE_GAIN
+                    } else {
+                        let cpu_total = cpu_1_time + cpu_2_time;
+                        let gpu_total = gpu_1_time + gpu_2_time;
+                        let projected_gpu_total = gpu_total.mul_f64(GPU_GRIND_BLOCK_OVERDRAW);
+                        let protected_gain = cpu_total.saturating_sub(projected_gpu_total);
+                        exact
+                            && gpu_1_time.mul_f64(GPU_GRIND_BLOCK_OVERDRAW) < cpu_1_time
+                            && gpu_2_time.mul_f64(GPU_GRIND_BLOCK_OVERDRAW) < cpu_2_time
+                            && protected_gain >= GPU_GRIND_MIN_TWO_SAMPLE_GAIN
+                    };
                     let _ = GPU_GRIND_LATCH.set(enable);
                     if enable {
                         match gpu_blake3_pow_nonce(&state_digest, bits) {
@@ -947,6 +978,16 @@ fn gpu_blake3_pow_nonce(state_digest: &[u8; 32], bits: u32) -> Result<u64, Strin
             .checked_add(u64::from(block_len))
             .ok_or_else(|| "GPU grind nonce range exhausted".to_string())?;
     }
+}
+
+/// `FLOCK_NO_GRIND_LATCH_MIN` restores the legacy grind-latch admission rule
+/// that AND-ed both per-sample GPU/CPU comparisons and summed the two draws
+/// for the gain (exact rollback lever for the per-device min-estimator
+/// measurement correction).
+fn grind_latch_min_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    // Coin-flip variant: grind-min defaults OFF (degradation-guard preferred; enable with FLOCK_GRIND_LATCH_MIN_ON).
+    *ON.get_or_init(|| std::env::var_os("FLOCK_GRIND_LATCH_MIN_ON").is_some())
 }
 
 /// `FLOCK_NO_GRIND_HYBRID` kills the CPU-prefetch arm of the GPU grind,
