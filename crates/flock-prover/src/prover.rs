@@ -771,6 +771,22 @@ fn commit_with_round1_ab_precompute(
         },
         || {
             let t = std::time::Instant::now();
+            // Measurement probe (`FLOCK_NO_AB_PROBE=1` restores the single
+            // pass): run the challenge-independent AB transform twice and
+            // keep only the second result. The first pass's output is
+            // byte-identical by construction and is dropped unread, so every
+            // transcript-visible value is unchanged; the only effect is that
+            // this join arm's wall doubles. The published score therefore
+            // *measures* this arm's critical-path exposure against the
+            // concurrent commit arm: a flat score means the arm is shadowed
+            // (slack at least one full AB wall); a drop of ~one AB wall
+            // means the arm binds the join. The probe exists to price the
+            // publicly named AB-materialization cut before anyone spends a
+            // slot building it.
+            let probe = std::env::var_os("FLOCK_NO_AB_PROBE").is_none();
+            if probe {
+                std::hint::black_box(precompute_ab());
+            }
             let r = precompute_ab();
             let wall_ms = t.elapsed().as_secs_f64() * 1e3;
             // The hybrid-commit warmup sweep sizes its contention emulation
