@@ -662,6 +662,16 @@ unsafe fn r2_pair_fold_and_store(
 /// With `FULL = false` slots 0/1 stay zero: the round-two GPU arm owns this
 /// chunk's summed products, so the even pair's two products are skipped and
 /// only the lookahead state is produced.
+///
+/// **Accumulator footprint.** Eight `F256Unreduced` accumulators need sixteen
+/// q registers, which leaves too few for the `FULL = true` body's live rows —
+/// the loop spilled five vector registers per iteration. `W0`/`W3`/`W4`/`W5`
+/// are therefore reduced *per product* on the `FULL = true` arm, so they
+/// occupy one q register each instead of two. `reduce_wide_q` is F₂-linear, so
+/// `Σ reduce(pᵢ) = reduce(Σ pᵢ)`: the slot values are bit-identical either way
+/// (see `deferred_aggregate_reduction_is_linear`). The cost is two extra PMULL
+/// per reduced product; the `FULL = false` arm keeps the wide form, which
+/// already fits without spilling.
 #[cfg(target_arch = "aarch64")]
 #[target_feature(enable = "aes")]
 pub(crate) unsafe fn fold_round2_compact_chunk_neon_lookahead_8<const FULL: bool>(
@@ -699,10 +709,31 @@ pub(crate) unsafe fn fold_round2_compact_chunk_neon_lookahead_8<const FULL: bool
         let mut pinf_even = WideNeon { lo: zero, hi: zero };
         let mut p1_odd = WideNeon { lo: zero, hi: zero };
         let mut pinf_odd = WideNeon { lo: zero, hi: zero };
+        // Deferred aggregates: wide on the `FULL = false` arm, reduced-per-product
+        // (one q register each) on the `FULL = true` arm. `FULL` is const, so only
+        // one of each pair survives monomorphisation.
         let mut w0 = WideNeon { lo: zero, hi: zero };
         let mut w3 = WideNeon { lo: zero, hi: zero };
         let mut w4 = WideNeon { lo: zero, hi: zero };
         let mut w5 = WideNeon { lo: zero, hi: zero };
+        let mut w0r = zero;
+        let mut w3r = zero;
+        let mut w4r = zero;
+        let mut w5r = zero;
+
+        /// Accumulate `x * y` into the deferred aggregate held by `$wide`
+        /// (`FULL = false`) or `$red` (`FULL = true`). Value-identical: the
+        /// final reduction is linear over F₂.
+        macro_rules! acc_deferred {
+            ($wide:expr, $red:expr, $x:expr, $y:expr) => {{
+                let (x, y) = ($x, $y);
+                if FULL {
+                    $red = veorq_u64($red, mul_q(x, y));
+                } else {
+                    wide_xor(&mut $wide, mul_unreduced_q(x, y));
+                }
+            }};
+        }
 
         let ones_bytes = [0xFFu8; 8];
         let b_ones = fold_row_q(table_data, ones_bytes.as_ptr());
@@ -742,7 +773,7 @@ pub(crate) unsafe fn fold_round2_compact_chunk_neon_lookahead_8<const FULL: bool
                     wide_xor(&mut p1_even, mul_unreduced_q(w, a1));
                 }
                 wide_xor(&mut p1_odd, mul_unreduced_q(w, a3));
-                wide_xor(&mut w0, mul_unreduced_q(w, a2));
+                acc_deferred!(w0, w0r, w, a2);
                 continue;
             }
 
@@ -772,7 +803,7 @@ pub(crate) unsafe fn fold_round2_compact_chunk_neon_lookahead_8<const FULL: bool
                         mul_unreduced_q(veorq_u64(a2w, a3w), veorq_u64(b2, b3)),
                     );
                 }
-                wide_xor(&mut w0, mul_unreduced_q(a2w, b2));
+                acc_deferred!(w0, w0r, a2w, b2);
             }
 
             // ---- deferred round-three aggregates (no extra lookups) ----
@@ -780,22 +811,22 @@ pub(crate) unsafe fn fold_round2_compact_chunk_neon_lookahead_8<const FULL: bool
             let o_aw = veorq_u64(a1w, a3w);
             let e_b = veorq_u64(b0, b2);
             let o_b = veorq_u64(b1, b3);
-            wide_xor(&mut w3, mul_unreduced_q(e_aw, e_b));
-            wide_xor(&mut w4, mul_unreduced_q(o_aw, o_b));
-            wide_xor(
-                &mut w5,
-                mul_unreduced_q(veorq_u64(e_aw, o_aw), veorq_u64(e_b, o_b)),
-            );
+            acc_deferred!(w3, w3r, e_aw, e_b);
+            acc_deferred!(w4, w4r, o_aw, o_b);
+            acc_deferred!(w5, w5r, veorq_u64(e_aw, o_aw), veorq_u64(e_b, o_b));
         }
 
         *out.add(0) = core::mem::transmute::<uint64x2_t, F128>(reduce_wide_q(p1_even));
         *out.add(1) = core::mem::transmute::<uint64x2_t, F128>(reduce_wide_q(pinf_even));
         *out.add(2) = core::mem::transmute::<uint64x2_t, F128>(reduce_wide_q(p1_odd));
         *out.add(3) = core::mem::transmute::<uint64x2_t, F128>(reduce_wide_q(pinf_odd));
-        *out.add(4) = core::mem::transmute::<uint64x2_t, F128>(reduce_wide_q(w0));
-        *out.add(5) = core::mem::transmute::<uint64x2_t, F128>(reduce_wide_q(w3));
-        *out.add(6) = core::mem::transmute::<uint64x2_t, F128>(reduce_wide_q(w4));
-        *out.add(7) = core::mem::transmute::<uint64x2_t, F128>(reduce_wide_q(w5));
+        let fin = |wide: WideNeon, red: uint64x2_t| -> F128 {
+            core::mem::transmute::<uint64x2_t, F128>(if FULL { red } else { reduce_wide_q(wide) })
+        };
+        *out.add(4) = fin(w0, w0r);
+        *out.add(5) = fin(w3, w3r);
+        *out.add(6) = fin(w4, w4r);
+        *out.add(7) = fin(w5, w5r);
     }
 }
 
@@ -1619,6 +1650,47 @@ mod tests {
                         r3: unreduced_hi[1],
                     },
                     expected_unreduced
+                );
+            }
+        }
+    }
+
+    /// The `FULL = true` arm of the round-two lookahead kernel reduces its
+    /// deferred aggregates per product instead of accumulating them wide.
+    /// That is value-exact only because `reduce_wide_q` is F₂-linear and
+    /// agrees with `mul_q` on a single product; assert both directly.
+    #[test]
+    fn deferred_aggregate_reduction_is_linear() {
+        let mut state = 0x5245_4455_4345_4c49;
+
+        unsafe {
+            let mut wide = WideNeon {
+                lo: core::arch::aarch64::vdupq_n_u64(0),
+                hi: core::arch::aarch64::vdupq_n_u64(0),
+            };
+            let mut reduced = core::arch::aarch64::vdupq_n_u64(0);
+
+            for _ in 0..256 {
+                let a = F128::new(splitmix64(&mut state), splitmix64(&mut state));
+                let b = F128::new(splitmix64(&mut state), splitmix64(&mut state));
+                let a_q = core::mem::transmute::<F128, uint64x2_t>(a);
+                let b_q = core::mem::transmute::<F128, uint64x2_t>(b);
+
+                // Per-product reduction == the reduced product.
+                assert_eq!(
+                    core::mem::transmute::<uint64x2_t, F128>(reduce_wide_q(mul_unreduced_q(
+                        a_q, b_q
+                    ))),
+                    core::mem::transmute::<uint64x2_t, F128>(mul_q(a_q, b_q)),
+                );
+
+                wide_xor(&mut wide, mul_unreduced_q(a_q, b_q));
+                reduced = core::arch::aarch64::veorq_u64(reduced, mul_q(a_q, b_q));
+
+                // Reduce-then-sum == sum-then-reduce, at every prefix.
+                assert_eq!(
+                    core::mem::transmute::<uint64x2_t, F128>(reduce_wide_q(wide)),
+                    core::mem::transmute::<uint64x2_t, F128>(reduced),
                 );
             }
         }
