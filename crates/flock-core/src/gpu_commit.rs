@@ -644,6 +644,18 @@ pub(crate) fn gpu_mixed_final_enabled() -> bool {
 /// only when `gpu_wall * 1.10 <= cpu_wall`.
 const LATCH_MARGIN: f64 = 1.10;
 
+/// Kill switch for the latch-timing correction: `FLOCK_NO_LATCH_TIMING_FIX=1`
+/// restores the incumbent measurement, which charged the warm-up's
+/// verification-only 64 MiB tree copy-out to `gpu_wall_ms` even though the
+/// latched timed path returns a zero-copy tree and never pays it. Proof bytes
+/// are identical either way — the latch only selects which of two
+/// bit-exactness-enforced commit implementations runs.
+pub(crate) fn latch_timing_fix_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_LATCH_TIMING_FIX").is_none());
+    *ON
+}
+
 /// The exact ranked L0 geometry the GPU graph is built for (mirrors the CPU
 /// pipeline's `is_ranked_ntt_merkle_leaf_pipeline_shape`): `log_d = 20`,
 /// 64 interleaved lanes, rate-1/2 entry at layer 1, 1 KiB BLAKE3 leaves.
@@ -5423,15 +5435,44 @@ kernel void blake3_pow_scan(
                     Some(r) => *r,
                     None => return Err("warmup tree empty".into()),
                 };
+                // The latch compares this wall against the CPU commit's and
+                // decides which implementation the *timed* proves run. So it
+                // must time exactly what the latched timed path does — and
+                // that path returns a zero-copy `MerkleTreeBuf::Gpu` view of
+                // `tree_buf`. It never copies the tree out.
+                //
+                // The `copy_bytes_parallel` below exists only to feed the
+                // warm-up's bit-exactness compare against `cpu_tree`. At the
+                // ranked shape it is a 64 MiB parallel CPU copy — several
+                // milliseconds of work that no timed prove pays. Leaving it
+                // inside the measured region inflated `gpu_wall_ms` and biased
+                // the `gpu_wall * 1.10 <= cpu_wall` test toward OFF, and an
+                // OFF process runs an entirely different commit path for the
+                // whole ranked run. That makes the contaminant a per-process
+                // coin flip on the majority of the commit wall — precisely the
+                // heavy tail a median-scored benchmark punishes, while leaving
+                // the fastest (latched) processes untouched, which is why it
+                // hides from p10 and shows up in the median.
+                //
+                // `run_commit_graph_from_z` ends in `commit_and_wait`, so it
+                // blocks until the GPU is done: stopping the clock here still
+                // measures the complete graph, just not the verification-only
+                // copy. `FLOCK_NO_LATCH_TIMING_FIX=1` restores the incumbent
+                // contaminated measurement as the exact A/B control.
                 let t0 = std::time::Instant::now();
                 run_commit_graph_from_z(gpu, z_buf, staging, tw_buf, tree_buf, log_d, n_leaves)?;
+                let graph_only_ms = t0.elapsed().as_secs_f64() * 1e3;
                 copy_bytes_parallel(gpu.buffer_contents(tree_buf), {
                     core::slice::from_raw_parts_mut(
                         gpu_tree.as_mut_ptr().cast::<u8>(),
                         total_nodes * 32,
                     )
                 });
-                let gpu_wall_ms = t0.elapsed().as_secs_f64() * 1e3;
+                let gpu_wall_ms = if super::latch_timing_fix_enabled() {
+                    graph_only_ms
+                } else {
+                    t0.elapsed().as_secs_f64() * 1e3
+                };
                 created.clear(); // ownership transfers to Latched
                 Ok(WarmupRun {
                     latched: Latched {
