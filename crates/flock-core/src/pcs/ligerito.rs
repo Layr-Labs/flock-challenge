@@ -2058,6 +2058,94 @@ pub(crate) fn induce_sumcheck_poly(
 /// Apply three consecutive transpose layers in one read/write pass. `layer`
 /// is the lowest (root-most) of the three; the transpose executes forward
 /// layers `layer+2`, `layer+1`, then `layer`.
+/// Whether the AArch64 vector-resident path of
+/// [`transpose_forward_ntt_fused_3layer`] is used.
+///
+/// `FLOCK_NO_TRANSPOSE_NEON=1` restores the scalar `F128` butterfly chain in
+/// the same binary. Compiled only on AArch64+AES; other hosts always take the
+/// scalar path below.
+#[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+#[inline]
+fn transpose_neon_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("FLOCK_NO_TRANSPOSE_NEON").is_none())
+}
+
+/// Transposed butterfly `s = a+b; a' = s; b' = t·s + b` with all values held
+/// in q registers. Same field arithmetic as the scalar form; `+` is XOR.
+#[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+#[inline(always)]
+unsafe fn transpose_butterfly_q(
+    a: core::arch::aarch64::uint64x2_t,
+    b: core::arch::aarch64::uint64x2_t,
+    t: core::arch::aarch64::uint64x2_t,
+) -> (
+    core::arch::aarch64::uint64x2_t,
+    core::arch::aarch64::uint64x2_t,
+) {
+    use core::arch::aarch64::*;
+    // Local copy of the proven NTT `mul_q` (ghash_mul_binius in q regs with
+    // `vmull_high_p64` so high lanes never leave the vector file).
+    #[inline(always)]
+    unsafe fn pmull_ll(x: uint64x2_t, y: uint64x2_t) -> uint64x2_t {
+        unsafe {
+            core::mem::transmute::<u128, uint64x2_t>(vmull_p64(
+                vgetq_lane_u64::<0>(x),
+                vgetq_lane_u64::<0>(y),
+            ))
+        }
+    }
+    #[inline(always)]
+    unsafe fn pmull_87(x: u64) -> uint64x2_t {
+        unsafe { core::mem::transmute::<u128, uint64x2_t>(vmull_p64(x, 0x87)) }
+    }
+    #[cfg(target_feature = "sha3")]
+    #[inline(always)]
+    unsafe fn xor3(x: uint64x2_t, y: uint64x2_t, z: uint64x2_t) -> uint64x2_t {
+        unsafe { veor3q_u64(x, y, z) }
+    }
+    #[cfg(not(target_feature = "sha3"))]
+    #[inline(always)]
+    unsafe fn xor3(x: uint64x2_t, y: uint64x2_t, z: uint64x2_t) -> uint64x2_t {
+        unsafe { veorq_u64(x, veorq_u64(y, z)) }
+    }
+    #[inline(always)]
+    unsafe fn mul_q(x: uint64x2_t, y: uint64x2_t) -> uint64x2_t {
+        unsafe {
+            let zero = vdupq_n_u64(0);
+            let t0 = pmull_ll(x, y);
+            let t1a = core::mem::transmute::<u128, uint64x2_t>(vmull_p64(
+                vgetq_lane_u64::<0>(x),
+                vgetq_lane_u64::<1>(y),
+            ));
+            let t1b = core::mem::transmute::<u128, uint64x2_t>(vmull_p64(
+                vgetq_lane_u64::<1>(x),
+                vgetq_lane_u64::<0>(y),
+            ));
+            let t2 = core::mem::transmute::<u128, uint64x2_t>(vmull_high_p64(
+                vreinterpretq_p64_u64(x),
+                vreinterpretq_p64_u64(y),
+            ));
+            let t1_cross = veorq_u64(t1a, t1b);
+            let t1 = xor3(
+                t1_cross,
+                vextq_u64::<1>(zero, t2),
+                pmull_87(vgetq_lane_u64::<1>(t2)),
+            );
+            xor3(
+                t0,
+                vextq_u64::<1>(zero, t1),
+                pmull_87(vgetq_lane_u64::<1>(t1)),
+            )
+        }
+    }
+    unsafe {
+        let s = veorq_u64(a, b);
+        (s, veorq_u64(mul_q(t, s), b))
+    }
+}
+
 fn transpose_forward_ntt_fused_3layer(
     ntt: &AdditiveNttF128,
     data: &mut [F128],
@@ -2096,21 +2184,64 @@ fn transpose_forward_ntt_fused_3layer(
     // even for the final few large blocks without opening nested parallel
     // regions, which caused long-tail scheduler stalls in this phase.
     let data_ptr = data.as_mut_ptr() as usize;
+    #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+    let use_neon = transpose_neon_enabled();
     (0..num_blocks * eighth).into_par_iter().for_each(|job| {
         // `eighth` is always a power of two. Spell out the quotient/remainder
         // so rustc does not emit UDIV+MSUB in every eight-value row job.
         let block = job >> eighth_log;
         let row = job & row_mask;
         let base = block * block_size + row;
-        let mut values = [F128::ZERO; 8];
         // SAFETY: each `(block,row)` owns the eight distinct positions
         // `base + i*eighth`, and different jobs never overlap.
         unsafe {
             let ptr = data_ptr as *mut F128;
+            let tw = &twiddles[block];
+
+            #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+            if use_neon {
+                use core::arch::aarch64::*;
+                // Load eight values + seven twiddles into q registers once.
+                let mut v: [uint64x2_t; 8] = core::array::from_fn(|i| {
+                    vld1q_u64(ptr.add(base + i * eighth) as *const u64)
+                });
+                let tq: [uint64x2_t; 7] =
+                    core::array::from_fn(|i| vld1q_u64((&raw const tw[i]).cast::<u64>()));
+                // Layer layer+2 (distance 1 in the 8-pack): four butterflies.
+                for pair in 0..4 {
+                    let (na, nb) =
+                        transpose_butterfly_q(v[2 * pair], v[2 * pair + 1], tq[3 + pair]);
+                    v[2 * pair] = na;
+                    v[2 * pair + 1] = nb;
+                }
+                // Layer layer+1 (distance 2).
+                for half in 0..2 {
+                    let (na, nb) =
+                        transpose_butterfly_q(v[4 * half], v[4 * half + 2], tq[1 + half]);
+                    v[4 * half] = na;
+                    v[4 * half + 2] = nb;
+                    let (na, nb) =
+                        transpose_butterfly_q(v[4 * half + 1], v[4 * half + 3], tq[1 + half]);
+                    v[4 * half + 1] = na;
+                    v[4 * half + 3] = nb;
+                }
+                // Layer layer (distance 4).
+                for i in 0..4 {
+                    let (na, nb) = transpose_butterfly_q(v[i], v[i + 4], tq[0]);
+                    v[i] = na;
+                    v[i + 4] = nb;
+                }
+                for (i, &qi) in v.iter().enumerate() {
+                    vst1q_u64(ptr.add(base + i * eighth) as *mut u64, qi);
+                }
+                return;
+            }
+
+            // Scalar chain (frontier control / non-AArch64).
+            let mut values = [F128::ZERO; 8];
             for (i, value) in values.iter_mut().enumerate() {
                 *value = *ptr.add(base + i * eighth);
             }
-            let tw = &twiddles[block];
             for pair in 0..4 {
                 butterfly(&mut values, 2 * pair, 2 * pair + 1, tw[3 + pair]);
             }
