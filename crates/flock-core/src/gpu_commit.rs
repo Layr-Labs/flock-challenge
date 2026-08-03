@@ -43,6 +43,17 @@ pub const ENV_NO_LAZY_GPU_CODEWORD: &str = "FLOCK_NO_LAZY_GPU_CODEWORD";
 /// wall-clock win (A/B and test tooling).
 pub const ENV_GPU_COMMIT_FORCE: &str = "FLOCK_GPU_COMMIT_FORCE";
 
+/// Kill switch for the ranked hybrid graph's final-pass/leaf-hash fusion.
+/// The candidate eliminates the GPU prefix's leaf-hash reread, but it is
+/// admitted only after the target's exact-contention calibration byte-compares
+/// the complete codeword and tree produced by that graph.
+pub const ENV_NO_GPU_FUSED_LEAF: &str = "FLOCK_NO_GPU_FUSED_LEAF";
+
+pub(crate) fn gpu_fused_leaf_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os(ENV_NO_GPU_FUSED_LEAF).is_none())
+}
+
 /// Kill switch for the embedded-metallib library load: `FLOCK_NO_GPU_METALLIB=1`
 /// restores the incumbent runtime MSL source compile as a same-binary control.
 /// The metallib path changes *no* timed work — it only removes the per-process
@@ -630,6 +641,36 @@ mod mixed_final_gate_tests {
         assert!(!super::select_gpu_mixed_final(20, 16, 4, false, true));
         assert!(!super::select_gpu_mixed_final(20, 12, 4, true, true));
         assert!(!super::select_gpu_mixed_final(20, 17, 3, true, true));
+    }
+}
+
+#[cfg(test)]
+mod fused_leaf_geometry_tests {
+    #[test]
+    fn final_tile_bijects_to_contiguous_blake3_leaf_words() {
+        // `ntt4_fused_leaf` stages `tile[position * 64 + lane]` as uint4.
+        // Its BLAKE3 block reader maps `(block, word)` back through
+        // `lane = block * 4 + word / 4`, `lane_word = word % 4`.
+        for position in 0..16usize {
+            let mut seen = [false; 256];
+            for block in 0..16usize {
+                for word in 0..16usize {
+                    let lane = block * 4 + word / 4;
+                    let lane_word = word % 4;
+                    let from_tile = (position * 64 + lane) * 4 + lane_word;
+                    let linear_leaf = position * 256 + block * 16 + word;
+                    assert_eq!(from_tile, linear_leaf);
+                    assert!(!seen[block * 16 + word]);
+                    seen[block * 16 + word] = true;
+                }
+            }
+            assert!(seen.into_iter().all(|entry| entry));
+        }
+
+        // 60 base + 960 table + 1024 tile uint4s, all 16 bytes. Apple's
+        // 32 KiB threadgroup allocation limit leaves exactly 64 bytes slack.
+        assert_eq!((60 + 960 + 1024) * 16, 32_704);
+        assert!(32_704 <= 32 * 1024);
     }
 }
 
@@ -2001,6 +2042,101 @@ kernel void parent_hash3(device const uint* children [[buffer(0)]],
 
 "#;
 
+    // Appended to `MSL_SOURCE` only for the supplemental candidate library.
+    // Keeping the incumbent source literal unchanged preserves the embedded
+    // metallib fast path for every existing pipeline.
+    const FUSED_LEAF_MSL_KERNEL: &str = r#"
+// The final ranked pass has P.s == 0, so one 64-thread group owns exactly
+// sixteen contiguous 1 KiB leaves. It performs the same register-resident
+// radix-16 NTT as `ntt_fused_reg4`, writes the codeword normally, and feeds
+// the already-resident tile to the unchanged BLAKE3 chunk chain. This deletes
+// the subsequent leaf_hash read of the GPU prefix without changing either
+// arithmetic chain or output layout.
+kernel void ntt4_fused_leaf(device uint4* data                [[buffer(0)]],
+                            device const uint4* twiddles      [[buffer(1)]],
+                            constant NttParams& P             [[buffer(2)]],
+                            device uint* tree                 [[buffer(3)]],
+                            uint tgid [[threadgroup_position_in_grid]],
+                            uint lid  [[thread_index_in_threadgroup]])
+{
+    constexpr uint F   = 4u;
+    constexpr uint NF  = 1u << F;
+    constexpr uint NTW = NF - 1u;
+    threadgroup uint4 bases[NTW * 4u];
+    threadgroup uint4 tabs[NTW * 64u];
+    threadgroup uint4 tile[NF * 64u];
+
+    const uint lane = lid;
+    const uint B = tgid >> P.s;
+    const uint r = tgid & ((1u << P.s) - 1u);
+    const uint pos_base = (B << (P.log_d - P.l)) + r;
+
+    if (lid < NTW * 4u) {
+        uint t = lid >> 2;
+        uint k = lid & 3u;
+        uint j = 31u - clz(t + 1u);
+        uint c = t + 1u - (1u << j);
+        uint4 p = twiddles[(1u << (P.l + j)) - 1u + (B << j) + c];
+        for (uint m = 0; m < k * 4u; m++) p = gf_mulx(p);
+        bases[lid] = p;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint ei = lid; ei < NTW * 64u; ei += 64u) {
+        uint t = ei >> 6;
+        uint sub = ei & 63u;
+        uint n = sub & 15u;
+        uint4 p = bases[(t << 2) | (sub >> 4)];
+        uint4 val = uint4(0u);
+        for (uint k = 0; k < 4u; k++) {
+            if ((n >> k) & 1u) val ^= p;
+            p = gf_mulx(p);
+        }
+        tabs[ei] = val;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    uint4 elems[NF];
+    for (uint e = 0; e < NF; e++) {
+        elems[e] = data[((pos_base + (e << P.s)) << 6) + lane];
+    }
+    for (uint j = 0; j < F; j++) {
+        uint bpos = F - 1u - j;
+        for (uint b = 0; b < (NF >> 1); b++) {
+            uint low = b & ((1u << bpos) - 1u);
+            uint eu = ((b >> bpos) << (bpos + 1u)) | low;
+            uint ev = eu | (1u << bpos);
+            uint tsel = ((1u << j) - 1u) + (eu >> (F - j));
+            uint4 nu = elems[eu] ^ gf_mul_tab4(elems[ev], &tabs[tsel << 6]);
+            elems[eu] = nu;
+            elems[ev] ^= nu;
+        }
+    }
+
+    for (uint e = 0; e < NF; e++) {
+        uint4 v = elems[e];
+        tile[e * 64u + lane] = v;
+        data[((pos_base + (e << P.s)) << 6) + lane] = v;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (lid < 16u) {
+        uint cv[8];
+        for (uint i = 0; i < 8u; i++) cv[i] = B3_IV[i];
+        for (uint b = 0; b < 16u; b++) {
+            uint block[16];
+            for (uint i = 0; i < 16u; i++) {
+                block[i] = tile[lid * 64u + b * 4u + i / 4u][i % 4u];
+            }
+            uint flags = (b == 0u ? B3_CHUNK_START : 0u)
+                | (b == 15u ? B3_CHUNK_END : 0u);
+            b3_compress(cv, block, 64u, flags);
+        }
+        uint leaf_pos = pos_base + lid;
+        for (uint i = 0; i < 8u; i++) tree[leaf_pos * 8u + i] = cv[i];
+    }
+}
+"#;
+
     /// Source-only ranked from-z specialization. This deliberately does not
     /// reuse the rejected device-table preload design: every group constructs
     /// its own compact 11-table image directly from the existing raw twiddle
@@ -3255,6 +3391,7 @@ kernel void blake3_pow_scan(
         log_d: usize,
         start_layer: usize,
         prefix16: u64,
+        fused_leaf: Option<(Id, Id)>,
     ) {
         unsafe {
             gpu.set_buffer(enc, data_buf, 0, 0);
@@ -3267,27 +3404,31 @@ kernel void blake3_pow_scan(
             for (l, f) in super::plan_passes(log_d, start_layer) {
                 debug_assert!(l >= 4, "prefix passes require layer >= 4 blocks");
                 let s = log_d - l - f;
-                let (pso, tpg, groups) = match f {
-                    4 if share_log > 0 && s >= share_log => (
-                        gpu.pso_ntt4g4,
-                        64u64,
-                        1u64 << (log_d - f - share_log),
-                    ),
-                    4 if super::pass_tune_enabled()
-                        && super::gpu_mixed_final_selected(log_d, l, f) =>
-                    {
-                        (gpu.pso_ntt5mix, 64u64, 1u64 << (log_d - f))
-                    }
-                    // s < 2 (the final pass): no same-B tiles exist to
-                    // share, so spend the same occupancy currency the other
-                    // way — halve the per-tile table footprint (byte-Horner
-                    // 32-entry tables) so twice the tiles fit a core.
-                    4 if super::pass_tune_enabled() => {
-                        (gpu.pso_ntt4h8, 64u64, 1u64 << (log_d - f))
-                    }
-                    4 => (gpu.pso_ntt4, 64u64, 1u64 << (log_d - f)),
-                    3 => (gpu.pso_ntt3, 64u64, 1u64 << (log_d - f)),
-                    _ => (gpu.pso_ntt, 1u64 << (f + 5), 1u64 << (log_d - f)),
+                let fused_final = fused_leaf.filter(|_| f == 4 && l + f == log_d && s == 0);
+                let (pso, tpg, groups) = match fused_final {
+                    Some((pso, _)) => (pso, 64u64, 1u64 << (log_d - f)),
+                    None => match f {
+                        4 if share_log > 0 && s >= share_log => (
+                            gpu.pso_ntt4g4,
+                            64u64,
+                            1u64 << (log_d - f - share_log),
+                        ),
+                        4 if super::pass_tune_enabled()
+                            && super::gpu_mixed_final_selected(log_d, l, f) =>
+                        {
+                            (gpu.pso_ntt5mix, 64u64, 1u64 << (log_d - f))
+                        }
+                        // s < 2 (the final pass): no same-B tiles exist to
+                        // share, so spend the same occupancy currency the other
+                        // way — halve the per-tile table footprint (byte-Horner
+                        // 32-entry tables) so twice the tiles fit a core.
+                        4 if super::pass_tune_enabled() => {
+                            (gpu.pso_ntt4h8, 64u64, 1u64 << (log_d - f))
+                        }
+                        4 => (gpu.pso_ntt4, 64u64, 1u64 << (log_d - f)),
+                        3 => (gpu.pso_ntt3, 64u64, 1u64 << (log_d - f)),
+                        _ => (gpu.pso_ntt, 1u64 << (f + 5), 1u64 << (log_d - f)),
+                    },
                 };
                 gpu.set_pipeline(enc, pso);
                 let p = NttParams {
@@ -3301,6 +3442,9 @@ kernel void blake3_pow_scan(
                     core::mem::size_of::<NttParams>(),
                 );
                 gpu.set_bytes(enc, bytes, 2);
+                if let Some((_, tree_buf)) = fused_final {
+                    gpu.set_buffer(enc, tree_buf, 0, 3);
+                }
                 debug_assert_eq!(groups % 16, 0);
                 gpu.dispatch(enc, groups / 16 * prefix16, tpg);
             }
@@ -3329,6 +3473,34 @@ kernel void blake3_pow_scan(
                 leaf_start,
                 subtree_leaves,
                 super::select_gpu_parent3(n_leaves_total, super::gpu_parent3_enabled()),
+                false,
+            )
+        }
+    }
+
+    /// Finish the parent levels of an aligned subtree whose leaf level was
+    /// already written by the fused final NTT pass. The global flat-tree
+    /// layout is unchanged, so the opening path continues to address the
+    /// same nodes as the ordinary leaf-then-parent encoder.
+    pub(crate) unsafe fn encode_merkle_subtree_from_leaves(
+        gpu: &Gpu,
+        enc: Id,
+        tree_buf: Id,
+        n_leaves_total: usize,
+        leaf_start: usize,
+        subtree_leaves: usize,
+    ) {
+        unsafe {
+            encode_merkle_subtree_impl(
+                gpu,
+                enc,
+                NIL,
+                tree_buf,
+                n_leaves_total,
+                leaf_start,
+                subtree_leaves,
+                super::select_gpu_parent3(n_leaves_total, super::gpu_parent3_enabled()),
+                true,
             )
         }
     }
@@ -3342,15 +3514,18 @@ kernel void blake3_pow_scan(
         leaf_start: usize,
         subtree_leaves: usize,
         parent3: bool,
+        leaves_already_present: bool,
     ) {
         debug_assert!(subtree_leaves.is_power_of_two());
         debug_assert_eq!(leaf_start % subtree_leaves, 0);
         unsafe {
-            gpu.set_pipeline(enc, gpu.pso_leaf);
-            gpu.set_buffer(enc, codeword_buf, leaf_start * 1024, 0);
-            gpu.set_buffer(enc, tree_buf, leaf_start * 32, 1);
-            let tpg = 256u64.min(subtree_leaves as u64);
-            gpu.dispatch(enc, subtree_leaves as u64 / tpg, tpg);
+            if !leaves_already_present {
+                gpu.set_pipeline(enc, gpu.pso_leaf);
+                gpu.set_buffer(enc, codeword_buf, leaf_start * 1024, 0);
+                gpu.set_buffer(enc, tree_buf, leaf_start * 32, 1);
+                let tpg = 256u64.min(subtree_leaves as u64);
+                gpu.dispatch(enc, subtree_leaves as u64 / tpg, tpg);
+            }
 
             let mut level_start = 0usize; // global node index of level base
             let mut level_len = n_leaves_total;
@@ -3744,6 +3919,7 @@ kernel void blake3_pow_scan(
                             self.log_d,
                             self.n_leaves,
                             self.early_k,
+                            fused_leaf_is_verified(),
                         )?;
                         // Retain across the pool: completion is consumed by
                         // `finish` (same idiom as the streamed tiles above).
@@ -4190,13 +4366,30 @@ kernel void blake3_pow_scan(
         log_d: usize,
         n_leaves: usize,
         k_cpu16: usize,
+        use_fused_leaf: bool,
     ) -> Result<Id, String> {
         debug_assert!((1..16).contains(&k_cpu16));
         unsafe {
             let prefix16 = (16 - k_cpu16) as u64;
             let cb2 = gpu.command_buffer()?;
             let enc = gpu.compute_encoder(cb2)?;
-            encode_ntt_passes_prefix(gpu, enc, staging, tw_buf, log_d, 4, prefix16);
+            // The supplemental kernel is valid only for the ranked final
+            // radix-16 pass. A failed compile leaves `fused_leaf` as None and
+            // encodes the exact incumbent graph instead.
+            let fused_leaf = use_fused_leaf
+                .then(|| fused_leaf_pso(gpu))
+                .flatten()
+                .filter(|_| log_d == 20 && n_leaves == (1usize << 20));
+            encode_ntt_passes_prefix(
+                gpu,
+                enc,
+                staging,
+                tw_buf,
+                log_d,
+                4,
+                prefix16,
+                fused_leaf.map(|pso| (pso, tree_buf)),
+            );
             // Greedy aligned power-of-two subtree decomposition of the
             // leaf prefix.
             let sixteenth = n_leaves / 16;
@@ -4207,7 +4400,11 @@ kernel void blake3_pow_scan(
                 while start % size != 0 {
                     size >>= 1;
                 }
-                encode_merkle_subtree(gpu, enc, staging, tree_buf, n_leaves, start, size);
+                if fused_leaf.is_some() {
+                    encode_merkle_subtree_from_leaves(gpu, enc, tree_buf, n_leaves, start, size);
+                } else {
+                    encode_merkle_subtree(gpu, enc, staging, tree_buf, n_leaves, start, size);
+                }
                 start += size;
             }
             gpu.end_encoding(enc);
@@ -4226,6 +4423,7 @@ kernel void blake3_pow_scan(
         k_cpu16: usize,
         first_pass_done: bool,
         pre_cb2: Option<Id>,
+        use_fused_leaf: bool,
     ) -> Result<(), String> {
         use rayon::prelude::*;
         debug_assert!((1..16).contains(&k_cpu16));
@@ -4245,7 +4443,14 @@ kernel void blake3_pow_scan(
                     Some(cb2) => cb2,
                     None => {
                         let cb2 = encode_hybrid_prefix_cb2(
-                            gpu, staging, tw_buf, tree_buf, log_d, n_leaves, k_cpu16,
+                            gpu,
+                            staging,
+                            tw_buf,
+                            tree_buf,
+                            log_d,
+                            n_leaves,
+                            k_cpu16,
+                            use_fused_leaf,
                         )?;
                         gpu.commit_async(cb2);
                         cb2
@@ -4446,10 +4651,21 @@ kernel void blake3_pow_scan(
         log_d: usize,
         n_leaves: usize,
         k_cpu16: usize,
+        use_fused_leaf: bool,
     ) -> Result<(), String> {
         unsafe {
             run_commit_graph_from_z_hybrid_impl(
-                gpu, z_buf, staging, tw_buf, tree_buf, log_d, n_leaves, k_cpu16, false, None,
+                gpu,
+                z_buf,
+                staging,
+                tw_buf,
+                tree_buf,
+                log_d,
+                n_leaves,
+                k_cpu16,
+                false,
+                None,
+                use_fused_leaf,
             )
         }
     }
@@ -4647,7 +4863,15 @@ kernel void blake3_pow_scan(
                     )
                 } else {
                     run_commit_graph_from_z_hybrid(
-                        c.gpu, c.z_buf, c.staging, c.tw_buf, c.tree_buf, log_d, n_leaves, k,
+                        c.gpu,
+                        c.z_buf,
+                        c.staging,
+                        c.tw_buf,
+                        c.tree_buf,
+                        log_d,
+                        n_leaves,
+                        k,
+                        false,
                     )
                 }
             }
@@ -4677,7 +4901,7 @@ kernel void blake3_pow_scan(
                 } else {
                     run_commit_graph_from_z_hybrid_impl(
                         c.gpu, c.z_buf, c.staging, c.tw_buf, c.tree_buf, log_d, n_leaves, k, true,
-                        None,
+                        None, false,
                     )
                 }
             }
@@ -4952,6 +5176,7 @@ kernel void blake3_pow_scan(
                         k,
                         true,
                         None,
+                        true,
                     )
                 }
             }
@@ -5017,6 +5242,7 @@ kernel void blake3_pow_scan(
                     params.k_code(),
                     params.n_leaves(),
                     chosen,
+                    true,
                 )
             }
         }
@@ -5042,6 +5268,15 @@ kernel void blake3_pow_scan(
                 )
             };
 
+        // The candidate is permitted in timed prefix graphs only after this
+        // exact target-machine full-buffer compare. A pure-GPU winner has no
+        // hybrid prefix to fuse, so it intentionally leaves the candidate
+        // inactive.
+        let fused_leaf_verified = verified
+            && chosen > 0
+            && fused_leaf_pso(gpu).is_some();
+        publish_fused_leaf_verdict(fused_leaf_verified);
+
         if dbg {
             let table: Vec<String> = RANKED_EXACT_TUNE_CANDIDATES
                 .iter()
@@ -5054,7 +5289,7 @@ kernel void blake3_pow_scan(
                 })
                 .collect();
             eprintln!(
-                "[gpu-commit] broad exact-AB {} -> k={} verified={verified}",
+                "[gpu-commit] broad exact-AB {} -> k={} verified={verified} fused_leaf={fused_leaf_verified}",
                 table.join(" "),
                 if verified { chosen } else { 0 },
             );
@@ -5380,6 +5615,10 @@ kernel void blake3_pow_scan(
         n_leaves: usize,
     ) -> Result<WarmupRun, String> {
         let gpu = gpu()?;
+        // Build the optional candidate before any timed graph. A failure is
+        // intentionally non-fatal: all graph encoders retain the incumbent
+        // final pass plus ordinary leaf dispatch when this returns None.
+        prepare_fused_leaf_pipeline(gpu);
         let ntt = AdditiveNttF128::standard(log_d);
         let twiddles = super::flat_twiddle_table(&ntt, log_d);
         let total_nodes = 2 * n_leaves - 1;
@@ -5836,7 +6075,15 @@ kernel void blake3_pow_scan(
         let run = unsafe {
             if k_cpu16 > 0 {
                 run_commit_graph_from_z_hybrid(
-                    gpu, z_buf, staging, tw_buf, tree_buf, log_d, n_leaves, k_cpu16,
+                    gpu,
+                    z_buf,
+                    staging,
+                    tw_buf,
+                    tree_buf,
+                    log_d,
+                    n_leaves,
+                    k_cpu16,
+                    fused_leaf_is_verified(),
                 )
             } else {
                 run_commit_graph_from_z(gpu, z_buf, staging, tw_buf, tree_buf, log_d, n_leaves)
@@ -5943,6 +6190,7 @@ kernel void blake3_pow_scan(
                             k_cpu16,
                             true,
                             Some(cb2),
+                            fused_leaf_is_verified(),
                         );
                         stream.gpu.release(cb2);
                         r
@@ -5975,6 +6223,7 @@ kernel void blake3_pow_scan(
                                     k_cpu16,
                                     true,
                                     None,
+                                    fused_leaf_is_verified(),
                                 )
                             } else {
                                 run_commit_graph_after_from_z(
@@ -6001,6 +6250,7 @@ kernel void blake3_pow_scan(
                                 k_cpu16,
                                 true,
                                 None,
+                                fused_leaf_is_verified(),
                             )
                         } else {
                             run_commit_graph_after_from_z(
@@ -7626,6 +7876,43 @@ LC_KERNEL(lc_fold_stripes, 4)
                 Ok(pso)
             }
         }
+    }
+
+    // The fused kernel is deliberately a supplemental library: changing the
+    // main source literal would invalidate the checked-in metallib and charge
+    // every worker a full incumbent shader compile. `usize` is used in the
+    // OnceLock because Objective-C handles are raw pointers and this state is
+    // immutable after initialization; `Gpu` already serializes Metal use.
+    static FUSED_LEAF_PSO: OnceLock<Result<usize, String>> = OnceLock::new();
+    static FUSED_LEAF_VERIFIED: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
+
+    fn fused_leaf_pso(gpu: &Gpu) -> Option<Id> {
+        if !super::gpu_fused_leaf_enabled() {
+            return None;
+        }
+        let state = FUSED_LEAF_PSO.get_or_init(|| {
+            let source = format!("{MSL_SOURCE}\n{FUSED_LEAF_MSL_KERNEL}");
+            unsafe {
+                compile_supplemental_pipeline(gpu, &source, "ntt4_fused_leaf")
+                    .map(|pso| pso as usize)
+            }
+        });
+        state.as_ref().ok().copied().map(|pso| pso as Id)
+    }
+
+    /// Compile the candidate during warmup, never on a timed dispatch.
+    fn prepare_fused_leaf_pipeline(gpu: &Gpu) {
+        let _ = fused_leaf_pso(gpu);
+    }
+
+    fn fused_leaf_is_verified() -> bool {
+        super::gpu_fused_leaf_enabled()
+            && FUSED_LEAF_VERIFIED.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    fn publish_fused_leaf_verdict(verified: bool) {
+        FUSED_LEAF_VERIFIED.store(verified, std::sync::atomic::Ordering::Release);
     }
 
     // =======================================================================
@@ -10709,6 +10996,7 @@ mod tests {
                 log_d,
                 start_layer,
                 prefix16,
+                None,
             );
             gpu.end_encoding(enc);
             gpu.commit_and_wait(cb).unwrap();
@@ -10922,6 +11210,7 @@ mod tests {
                 LEAF_START,
                 SUBTREE_LEAVES,
                 true,
+                false,
             );
             gpu.end_encoding(enc);
             gpu.commit_and_wait(cb).unwrap();
