@@ -2882,6 +2882,236 @@ mod tests {
         }
     }
 
+    /// Portable algebra mirror of the offloaded-arm restructure: the merged
+    /// odd fold + three-multiply form equals the original four-fold,
+    /// four-multiply form, across padded and degenerate-b cases. Runs on any
+    /// host (scalar table + F128 ops), so the aarch64-only kernel's algebra
+    /// is pinned even where the NEON code cannot execute.
+    #[test]
+    fn lookahead_offloaded_algebra_scalar_mirror() {
+        let mut rng = Rng::new(303);
+        let table = UniSkipFoldTable::new(6, rng.f128());
+        let fold = |code: u64| table.fold_one_row(&code.to_le_bytes());
+        let b_ones = fold(u64::MAX);
+
+        for case in 0..2000usize {
+            let w = rng.f128();
+            let degen = case % 2 == 1;
+            let pad0 = case % 8 == 6; // pad0 ⇒ pad1 at the ranked shape
+            let pad1 = pad0 || case % 8 == 7;
+            let mut codes = [0u64; 8]; // a0 a1 b0 b1 a2 a3 b2 b3
+            for c in codes.iter_mut() {
+                *c = rng.next_u64();
+            }
+            if degen && case % 4 == 1 {
+                codes[2] = u64::MAX;
+                codes[3] = u64::MAX;
+            }
+            if degen && case % 8 == 5 {
+                codes[6] = u64::MAX;
+                codes[7] = u64::MAX;
+            }
+
+            // Original arm: per-pair four-row folds, four w-multiplies.
+            let pair = |a0c: u64, a1c: u64, b0c: u64, b1c: u64, padded: bool| {
+                if padded {
+                    return (F128::ZERO, F128::ZERO, F128::ZERO, F128::ZERO, false);
+                }
+                if degen && (b0c & b1c) == u64::MAX {
+                    return (fold(a0c), fold(a1c), b_ones, b_ones, true);
+                }
+                (fold(a0c), fold(a1c), fold(b0c), fold(b1c), false)
+            };
+            let (a0, a1, b0, b1, deg0) = pair(codes[0], codes[1], codes[2], codes[3], pad0);
+            let (a2, a3, b2, b3, deg1) = pair(codes[4], codes[5], codes[6], codes[7], pad1);
+
+            let (old_w0, old_w3, old_w4, old_w5);
+            if deg0 && deg1 {
+                // ones_is_one holds for every Lagrange table (partition of
+                // unity), so the kernel always takes the group shortcut here.
+                old_w0 = w * a2;
+                old_w3 = F128::ZERO;
+                old_w4 = F128::ZERO;
+                old_w5 = F128::ZERO;
+            } else {
+                let a0w = w * a0;
+                let a1w = w * a1;
+                let (a2w, a3w) = if pad1 {
+                    (F128::ZERO, F128::ZERO)
+                } else {
+                    (w * a2, w * a3)
+                };
+                old_w0 = if pad1 { F128::ZERO } else { a2w * b2 };
+                let e_aw = a0w + a2w;
+                let o_aw = a1w + a3w;
+                let e_b = b0 + b2;
+                let o_b = b1 + b3;
+                old_w3 = e_aw * e_b;
+                old_w4 = o_aw * o_b;
+                old_w5 = (e_aw + o_aw) * (e_b + o_b);
+            }
+
+            // Restructured arm: even folds, merged odd fold, three multiplies.
+            let even = |a0c: u64, b0c: u64, a1c: u64, b1c: u64, padded: bool| {
+                if padded {
+                    return (F128::ZERO, F128::ZERO, 0u64, 0u64, false);
+                }
+                if degen && (b0c & b1c) == u64::MAX {
+                    return (fold(a0c), b_ones, a1c, b1c, true);
+                }
+                (fold(a0c), fold(b0c), a1c, b1c, false)
+            };
+            let (na0, nb0, a1_code, b1_code, ndeg0) =
+                even(codes[0], codes[2], codes[1], codes[3], pad0);
+            let (na2, nb2, a3_code, b3_code, ndeg1) =
+                even(codes[4], codes[6], codes[5], codes[7], pad1);
+            assert_eq!((deg0, deg1), (ndeg0, ndeg1), "deg flags case={case}");
+            let (new_w0, new_w3, new_w4, new_w5);
+            if ndeg0 && ndeg1 {
+                new_w0 = w * na2;
+                new_w3 = F128::ZERO;
+                new_w4 = F128::ZERO;
+                new_w5 = F128::ZERO;
+            } else {
+                new_w0 = if pad1 { F128::ZERO } else { (w * na2) * nb2 };
+                let o_a = fold(a1_code ^ a3_code);
+                let o_b = fold(b1_code ^ b3_code);
+                let e_aw = w * (na0 + na2);
+                let o_aw = w * o_a;
+                let e_b = nb0 + nb2;
+                new_w3 = e_aw * e_b;
+                new_w4 = o_aw * o_b;
+                new_w5 = (e_aw + o_aw) * (e_b + o_b);
+            }
+
+            assert_eq!(old_w0, new_w0, "w0 case={case}");
+            assert_eq!(old_w3, new_w3, "w3 case={case}");
+            assert_eq!(old_w4, new_w4, "w4 case={case}");
+            assert_eq!(old_w5, new_w5, "w5 case={case}");
+        }
+    }
+
+    /// The three lookahead monomorphizations agree wherever their outputs
+    /// overlap. The GPU-offloaded `<false, true>` arm has no other in-process
+    /// oracle (the GPU calibration sweep runs `<true, false>` on every chunk),
+    /// so this pins it against the full arm: bit-identical `W0/W3/W4/W5`
+    /// slots, zeros in every product slot it cedes to the GPU, byte-identical
+    /// anchors and deltas. Runs the padded tail, the b≡1 group shortcut, and
+    /// the mixed one-pair-degenerate case.
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn lookahead_monomorphizations_agree() {
+        const N_CHUNKS: usize = 8;
+        let lo_size = 256usize;
+        let (mask, useful) = (127usize, 121usize);
+        let mut rng = Rng::new(302);
+        let table = UniSkipFoldTable::new(6, rng.f128());
+        let eq_lo = rng.f128_vec(lo_size);
+
+        for &degen in &[false, true] {
+            for &pair_idx_base in &[0usize, 3 * lo_size] {
+                let mut a_packed = vec![0u8; 2 * lo_size * N_CHUNKS];
+                let mut b_packed = vec![0u8; 2 * lo_size * N_CHUNKS];
+                for byte in a_packed.iter_mut() {
+                    *byte = (rng.next_u64() & 0xff) as u8;
+                }
+                for byte in b_packed.iter_mut() {
+                    *byte = (rng.next_u64() & 0xff) as u8;
+                }
+                if degen {
+                    // Group 0 (rows 0..4): both pairs b≡1 — the group
+                    // shortcut. Group 1 (rows 4..8): first pair b≡1 only —
+                    // the mixed fall-through.
+                    b_packed[0..6 * N_CHUNKS].fill(0xff);
+                }
+
+                let run = |full: bool, odd_on_gpu: bool| {
+                    let mut anchors = vec![F128::ZERO; 2 * lo_size];
+                    let mut deltas = vec![0u8; lo_size * 16];
+                    let mut out = [F128::ZERO; 8];
+                    // SAFETY: on aarch64; every buffer matches the kernel's
+                    // documented lo_size-derived bounds; the table has
+                    // 8 × 256 F128 entries.
+                    unsafe {
+                        let t = table.data.as_ptr() as *const u8;
+                        match (full, odd_on_gpu) {
+                            (true, false) => {
+                                fold_round2_compact_chunk_neon_lookahead_8::<true, false>(
+                                    t,
+                                    a_packed.as_ptr(),
+                                    b_packed.as_ptr(),
+                                    anchors.as_mut_ptr(),
+                                    deltas.as_mut_ptr(),
+                                    eq_lo.as_ptr(),
+                                    lo_size,
+                                    pair_idx_base,
+                                    mask,
+                                    useful,
+                                    degen,
+                                    out.as_mut_ptr(),
+                                )
+                            }
+                            (false, true) => {
+                                fold_round2_compact_chunk_neon_lookahead_8::<false, true>(
+                                    t,
+                                    a_packed.as_ptr(),
+                                    b_packed.as_ptr(),
+                                    anchors.as_mut_ptr(),
+                                    deltas.as_mut_ptr(),
+                                    eq_lo.as_ptr(),
+                                    lo_size,
+                                    pair_idx_base,
+                                    mask,
+                                    useful,
+                                    degen,
+                                    out.as_mut_ptr(),
+                                )
+                            }
+                            _ => fold_round2_compact_chunk_neon_lookahead_8::<false, false>(
+                                t,
+                                a_packed.as_ptr(),
+                                b_packed.as_ptr(),
+                                anchors.as_mut_ptr(),
+                                deltas.as_mut_ptr(),
+                                eq_lo.as_ptr(),
+                                lo_size,
+                                pair_idx_base,
+                                mask,
+                                useful,
+                                degen,
+                                out.as_mut_ptr(),
+                            ),
+                        }
+                    }
+                    (out, anchors, deltas)
+                };
+
+                let (full_out, full_anchors, full_deltas) = run(true, false);
+                let (offl_out, offl_anchors, offl_deltas) = run(false, true);
+                let (half_out, half_anchors, half_deltas) = run(false, false);
+
+                let ctx = format!("degen={degen} pair_idx_base={pair_idx_base}");
+                for slot in 0..4 {
+                    assert_eq!(offl_out[slot], F128::ZERO, "offl slot {slot} ({ctx})");
+                }
+                for slot in 0..2 {
+                    assert_eq!(half_out[slot], F128::ZERO, "half slot {slot} ({ctx})");
+                }
+                for slot in 2..4 {
+                    assert_eq!(half_out[slot], full_out[slot], "odd slot {slot} ({ctx})");
+                }
+                for slot in 4..8 {
+                    assert_eq!(offl_out[slot], full_out[slot], "W slot {slot} ({ctx})");
+                    assert_eq!(half_out[slot], full_out[slot], "W slot {slot} half ({ctx})");
+                }
+                assert_eq!(offl_anchors, full_anchors, "anchors ({ctx})");
+                assert_eq!(half_anchors, full_anchors, "anchors half ({ctx})");
+                assert_eq!(offl_deltas, full_deltas, "deltas ({ctx})");
+                assert_eq!(half_deltas, full_deltas, "deltas half ({ctx})");
+            }
+        }
+    }
+
     /// Four-row x86 lookup fold matches four independent scalar folds.
     #[cfg(all(
         target_arch = "x86_64",
