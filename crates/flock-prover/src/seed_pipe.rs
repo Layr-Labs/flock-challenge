@@ -162,6 +162,18 @@ fn blocks_eq(a: &[Compression], b: &[Compression]) -> bool {
         .all(|(x, y)| bytes_of(x) == bytes_of(y))
 }
 
+/// Serial byte-equality, for the span where the caller sits on the E-cluster.
+///
+/// The parallel form above fans 59 MiB of shadow reads across the *proving*
+/// pool ([`init_perf_thread_pool`] builds it as Rayon's global pool), which is
+/// exactly the resource the adoption is trying to protect. One memcmp on the
+/// demoted thread costs the proof nothing and still has ~150 ms of slack
+/// against the in-flight run.
+fn blocks_eq_serial(a: &[Compression], b: &[Compression]) -> bool {
+    const _: () = assert!(std::mem::size_of::<Compression>() == 112);
+    a.len() == b.len() && bytes_of(a) == bytes_of(b)
+}
+
 fn bytes_of(v: &[Compression]) -> &[u8] {
     // SAFETY: `Compression` is a padding-free tuple of `Copy` scalars, so its
     // representation is fully initialized bytes; the slice borrow keeps the
@@ -192,6 +204,21 @@ struct Pipe {
 
 static PIPE: OnceLock<Pipe> = OnceLock::new();
 static ARMED: AtomicBool = AtomicBool::new(false);
+/// Set when [`arm`] parked the wrapper's main thread on the E-cluster, so
+/// [`try_adopt`] knows to keep the comparison off the proving pool and to hand
+/// the thread back before the publication tail.
+static SHADOW_QOS: AtomicBool = AtomicBool::new(false);
+
+/// Returns the wrapper's main thread to prover QoS, on every exit path.
+struct ShadowQosGuard(bool);
+
+impl Drop for ShadowQosGuard {
+    fn drop(&mut self) {
+        if self.0 {
+            flock_core::set_calling_thread_prover_qos();
+        }
+    }
+}
 
 fn shared() -> &'static Pipe {
     PIPE.get_or_init(|| Pipe {
@@ -348,6 +375,18 @@ pub(crate) fn arm(
             close(writer);
         }
         ARMED.store(false, Ordering::SeqCst);
+        return;
+    }
+
+    // Everything this thread does from here until adoption is shadow work that
+    // no measured interval waits on: write the ready file, block on stdin, then
+    // re-expand the seed and byte-compare it against ours while the real proof
+    // is already in flight elsewhere. Park it on the E-cluster so it stops
+    // competing with a pool sized to the performance cores. `try_adopt` hands
+    // the thread back before the publication tail.
+    if std::env::var_os("FLOCK_NO_SHADOW_QOS").is_none() {
+        SHADOW_QOS.store(true, Ordering::SeqCst);
+        flock_core::set_calling_thread_shadow_qos();
     }
 }
 
@@ -432,6 +471,9 @@ pub(crate) fn try_adopt(blocks: &[Compression]) -> Option<ProveOut> {
     if !ARMED.load(Ordering::SeqCst) {
         return None;
     }
+    // Restores prover QoS on every exit path, including the two early returns
+    // below and any unwind. `swap` makes the restore happen exactly once.
+    let shadow = ShadowQosGuard(SHADOW_QOS.swap(false, Ordering::SeqCst));
     let shared = shared();
     let mut state = shared.state.lock().unwrap_or_else(|e| e.into_inner());
 
@@ -451,7 +493,15 @@ pub(crate) fn try_adopt(blocks: &[Compression]) -> Option<ProveOut> {
     let blocks_at = state.blocks_at;
     drop(state);
 
-    let matched = blocks_eq(&speculative, blocks);
+    let matched = if shadow.0 {
+        blocks_eq_serial(&speculative, blocks)
+    } else {
+        blocks_eq(&speculative, blocks)
+    };
+
+    // Hand the thread back now: the condvar wake below, `to_bytes`, the proof
+    // file write and the rename are all on the measured critical path.
+    drop(shadow);
 
     // The head start is exactly what this mechanism buys, and it is only
     // observable on a 10-P-core host, so make it printable there.
@@ -541,6 +591,21 @@ mod tests {
         b[900].1[3] ^= 1;
         assert!(!blocks_eq(&a, &b));
         assert!(!blocks_eq(&a, &a[..a.len() - 1]));
+    }
+
+    #[test]
+    fn blocks_eq_serial_agrees_with_the_parallel_form() {
+        let a = generate_compressions_par(12, 7);
+        let b = generate_compressions_par(12, 7);
+        let mut c = b.clone();
+        assert!(blocks_eq_serial(&a, &b));
+        assert_eq!(blocks_eq_serial(&a, &b), blocks_eq(&a, &b));
+        // A one-byte difference in the last block must be caught by both.
+        c.last_mut().expect("non-empty").2 ^= 1;
+        assert!(!blocks_eq_serial(&a, &c));
+        assert_eq!(blocks_eq_serial(&a, &c), blocks_eq(&a, &c));
+        // Length mismatch.
+        assert!(!blocks_eq_serial(&a, &b[..b.len() - 1]));
     }
 
     #[test]
