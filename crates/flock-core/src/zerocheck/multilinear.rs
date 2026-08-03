@@ -50,7 +50,11 @@ mod kernels;
 use kernels::aarch64::fold_one_row_neon_unchecked_8;
 #[cfg(target_arch = "aarch64")]
 use kernels::aarch64::{
-    fold2_compact_and_round4_chunk_neon_8, fold_and_message_aarch64,
+    fold2_compact_and_round4_chunk_neon_8,
+    fold2_compact_and_round4_chunk_neon_ranked_padseg_8,
+    fold2_compact_and_round4_chunk_neon_ranked_padseg_sparse_output_8,
+    fold_and_message_aarch64,
+    fold_and_message_aarch64_ranked_padprop_stage2,
     fold_compact_chunk_neon_unchecked_8, fold_compact_stream_chunk_neon,
     fold_round2_chunk_neon_unchecked_8, fold_round2_compact_chunk_neon_lookahead_8,
     fold_round2_compact_chunk_neon_unchecked_8, fold_round2_compact_stream_chunk_neon,
@@ -113,6 +117,63 @@ fn round2_pair_skip(padding: &PaddingSpec, k_skip: usize) -> (usize, usize) {
     (pairs_per_block - 1, useful_pairs)
 }
 
+/// Exact ranked zero suffix presented to the first ordinary round after the
+/// K double fold.  Each 64-record witness block has records `0..=60`
+/// potentially nonzero and records `61..=63` identically zero.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RankedTailPadPropStage {
+    None,
+    InputWidth64,
+}
+
+#[inline]
+fn tail_padprop_env_enabled(value: Option<&std::ffi::OsStr>) -> bool {
+    value.is_none_or(|v| v != "1")
+}
+
+/// Independent same-binary rollback for the post-K padding specialization.
+/// The generic tail implementation itself is left untouched.
+#[inline]
+fn tail_padprop_enabled() -> bool {
+    use std::sync::LazyLock;
+    static ENABLED: LazyLock<bool> = LazyLock::new(|| {
+        tail_padprop_env_enabled(std::env::var_os("FLOCK_NO_ZC_TAIL_PADPROP").as_deref())
+    });
+    *ENABLED
+}
+
+#[inline]
+fn ranked_tail_padprop_stage_enabled(
+    padding: &PaddingSpec,
+    m: usize,
+    i: usize,
+    k_composed: bool,
+    enabled: bool,
+) -> RankedTailPadPropStage {
+    if enabled
+        && k_composed
+        && i == 2
+        && m == 32
+        && padding.k_log == 14
+        && padding.useful_bits_per_block == 15_409
+    {
+        RankedTailPadPropStage::InputWidth64
+    } else {
+        RankedTailPadPropStage::None
+    }
+}
+
+/// Select the once-per-round specialization.  The low-level driver repeats
+/// the concrete length, equality and NT-store guards before using it.
+pub(crate) fn ranked_tail_padprop_stage(
+    padding: &PaddingSpec,
+    m: usize,
+    i: usize,
+    k_composed: bool,
+) -> RankedTailPadPropStage {
+    ranked_tail_padprop_stage_enabled(padding, m, i, k_composed, tail_padprop_enabled())
+}
+
 /// Kill switch for draining the DRAM-bound tail loop rounds (half ≥ 2^21)
 /// through the hetero E-core queue (H2). `FLOCK_NO_ZC_TAIL_HETERO=1` keeps
 /// them on the main rayon pool. Bit-identical either way — chunk ownership
@@ -143,6 +204,106 @@ fn zc_tail_split11_enabled() -> bool {
     static ENABLED: LazyLock<bool> =
         LazyLock::new(|| std::env::var_os("FLOCK_NO_ZC_TAIL_SPLIT11").is_none());
     *ENABLED
+}
+
+/// The one compact-state geometry for which the K double-fold may elide
+/// padding work.  This is selected from the authenticated witness padding
+/// descriptor as well as the complete ranked call shape; table length alone
+/// is deliberately insufficient to authorize zero-forcing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum KFoldPadSeg {
+    None,
+    Ranked121Of128,
+}
+
+#[inline]
+fn kfold_padseg_shape(
+    padding: &PaddingSpec,
+    compact_len: usize,
+    n_chunks: usize,
+    lo_size: usize,
+) -> KFoldPadSeg {
+    const RANKED_COMPACT_LEN: usize = 1usize << (32 - 6 - 1);
+    if padding.k_log == 14
+        && padding.useful_bits_per_block == 15_409
+        && compact_len == RANKED_COMPACT_LEN
+        && n_chunks == 8
+        && lo_size == 4_096
+    {
+        KFoldPadSeg::Ranked121Of128
+    } else {
+        KFoldPadSeg::None
+    }
+}
+
+/// The round-two producer may leave descriptor-dead compact records untouched
+/// only when the exact ranked K consumer is armed.  Generic K reads every
+/// compact record, so both the producer's own rollback and K's rollback must
+/// restore the incumbent zero stores. Round two and K split their equality
+/// tables at different dimensions (16,384 versus 4,096 low entries), so both
+/// call shapes are checked explicitly rather than reusing one `lo_size`.
+#[inline]
+fn r2_skip_dead_stores_shape(
+    padding: &PaddingSpec,
+    m: usize,
+    k_skip: usize,
+    compact_len: usize,
+    n_chunks: usize,
+    lo_size: usize,
+    producer_enabled: bool,
+    k_enabled: bool,
+) -> bool {
+    const RANKED_R2_LO_SIZE: usize = 1 << 14;
+    const RANKED_K_LO_SIZE: usize = 1 << 12;
+    producer_enabled
+        && k_enabled
+        && m == 32
+        && k_skip == 6
+        && lo_size == RANKED_R2_LO_SIZE
+        && kfold_padseg_shape(padding, compact_len, n_chunks, RANKED_K_LO_SIZE)
+            == KFoldPadSeg::Ranked121Of128
+}
+
+/// Independent same-binary rollback for the producer-side store elision.
+/// The downstream K rollback is checked separately by the exact selector.
+#[cfg(target_arch = "aarch64")]
+fn zc_r2_skip_dead_stores_enabled() -> bool {
+    use std::sync::LazyLock;
+    static ENABLED: LazyLock<bool> =
+        LazyLock::new(|| std::env::var_os("FLOCK_NO_ZC_R2_SKIPSTORES").is_none());
+    *ENABLED
+}
+
+/// Independent same-binary rollback for the ranked K-fold segmentation.
+/// Read once outside all worker loops.
+#[cfg(target_arch = "aarch64")]
+fn zc_kfold_padseg_enabled() -> bool {
+    use std::sync::LazyLock;
+    static ENABLED: LazyLock<bool> =
+        LazyLock::new(|| std::env::var_os("FLOCK_NO_ZC_K_PADSEG").is_none());
+    *ENABLED
+}
+
+/// Same-binary rollback for the codegen-refined sibling while retaining the
+/// original ranked K padseg kernel and its explicit output-zero stores.
+#[cfg(target_arch = "aarch64")]
+fn zc_kfold_codegen_refine_enabled() -> bool {
+    use std::sync::LazyLock;
+    static ENABLED: LazyLock<bool> =
+        LazyLock::new(|| std::env::var_os("FLOCK_NO_ZC_K_CODEGEN_REFINE").is_none());
+    *ENABLED
+}
+
+/// Whether the K output's guaranteed-zero suffix may be left unwritten.  The
+/// sparse-output contract is sound only when the immediately following exact
+/// padprop sweep is armed; both rollback switches retain canonical explicit
+/// zero stores for the generic consumer.
+#[cfg(target_arch = "aarch64")]
+#[inline]
+fn zc_kfold_sparse_output_enabled() -> bool {
+    zc_kfold_codegen_refine_enabled()
+        && tail_padprop_enabled()
+        && std::env::var_os("FLOCK_ZC_NT_LEGACY").is_none()
 }
 
 // ---------------------------------------------------------------------------
@@ -1288,11 +1449,12 @@ fn lookahead_n_hi(n_vars: usize) -> usize {
 
 /// Round-two compact producer **plus** the deferred round-three coefficients.
 ///
-/// The compact state, the round-two wire message and every store are
+/// The round-two wire message and every useful-record compact value/store are
 /// bit-identical to
-/// [`uni_skip_fold_and_round_pair_compact_padded_with_deltas`]; the sweep
-/// merely also accumulates six aggregates over round-three groups
-/// `y = x'/2`:
+/// [`uni_skip_fold_and_round_pair_compact_padded_with_deltas`]. At the exact
+/// ranked shape, records 121..127 of each 128-record block may retain scratch
+/// bytes because the coupled K consumer is proven not to read them. The sweep
+/// also accumulates six aggregates over round-three groups `y = x'/2`:
 ///
 /// ```text
 /// W0 = Σ_y eq₃(y)·a2b2   W1 = Σ eq₃·a3b3        W2 = Σ eq₃·(a2+a3)(b2+b3)
@@ -1357,12 +1519,22 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead(
     let (pair_in_block_mask, useful_pairs_inclusive) = round2_pair_skip(padding, k_skip);
     #[cfg(target_arch = "aarch64")]
     let degen = r2_degen_enabled();
+    #[cfg(target_arch = "aarch64")]
+    let skip_dead_stores = r2_skip_dead_stores_shape(
+        padding,
+        m,
+        k_skip,
+        n_pairs,
+        n_chunks,
+        lo_size,
+        zc_r2_skip_dead_stores_enabled(),
+        zc_kfold_padseg_enabled(),
+    );
 
-    // Same GPU round-two products arm as the incumbent sweep: it still
-    // receives byte-identical anchors/deltas for every chunk and still owns
-    // the *summed* `(p1, pinf)` for its prefix. The CPU keeps producing the
-    // odd-parity halves on those chunks (the GPU's sums are not parity-split),
-    // which is what makes `W1`/`W2` recoverable everywhere.
+    // Same GPU round-two products arm as the incumbent sweep: it receives
+    // byte-identical inputs but now returns its prefix products parity-split.
+    // When that split is adopted below, the CPU may omit the odd `p1`/`pinf`
+    // pair and recover the lookahead's `W1`/`W2` directly from the GPU result.
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     let gpu_job = crate::gpu_commit::launch_zc_r2_products(
         a_packed,
@@ -1430,6 +1602,7 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead(
                         pair_idx_base,
                         pair_in_block_mask,
                         useful_pairs_inclusive,
+                        skip_dead_stores,
                         degen,
                         out.as_mut_ptr(),
                     );
@@ -1445,6 +1618,7 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead(
                         pair_idx_base,
                         pair_in_block_mask,
                         useful_pairs_inclusive,
+                        skip_dead_stores,
                         degen,
                         out.as_mut_ptr(),
                     );
@@ -1460,6 +1634,7 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead(
                         pair_idx_base,
                         pair_in_block_mask,
                         useful_pairs_inclusive,
+                        skip_dead_stores,
                         degen,
                         out.as_mut_ptr(),
                     );
@@ -1558,6 +1733,7 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead(
                             pair_idx_base,
                             pair_in_block_mask,
                             useful_pairs_inclusive,
+                            false,
                             degen,
                             out.as_mut_ptr(),
                         );
@@ -1705,6 +1881,7 @@ pub(crate) fn fold2_compact_and_round4_into(
     rho1: F128,
     rho2: F128,
     r_next4: &[F128],
+    padding: &PaddingSpec,
     a_out: &mut [F128],
     b_out: &mut [F128],
 ) -> (F128, F128) {
@@ -1734,6 +1911,17 @@ pub(crate) fn fold2_compact_and_round4_into(
     let out_chunk = 2 * lo_size;
     #[cfg(target_arch = "aarch64")]
     let degen = r2_degen_enabled();
+    #[cfg(target_arch = "aarch64")]
+    let padseg = if zc_kfold_padseg_enabled() {
+        kfold_padseg_shape(padding, n_pairs, table.n_chunks, lo_size)
+    } else {
+        KFoldPadSeg::None
+    };
+    #[cfg(target_arch = "aarch64")]
+    let sparse_padseg_output =
+        padseg == KFoldPadSeg::Ranked121Of128 && zc_kfold_sparse_output_enabled();
+    #[cfg(not(target_arch = "aarch64"))]
+    let _ = padding;
 
     let mut partials: Vec<(F128, F128)> = vec![(F128::ZERO, F128::ZERO); hi_size];
     let a_base = crate::epool::SyncPtr(a_out.as_mut_ptr());
@@ -1753,7 +1941,7 @@ pub(crate) fn fold2_compact_and_round4_into(
 
         #[cfg(target_arch = "aarch64")]
         let (p1, pinf) = unsafe {
-            fold2_compact_and_round4_chunk_neon_8(
+            let args = (
                 table_l1.as_ptr().cast::<u8>(),
                 table_l3.as_ptr().cast::<u8>(),
                 rho2,
@@ -1764,7 +1952,25 @@ pub(crate) fn fold2_compact_and_round4_into(
                 eq_lo.as_ptr(),
                 lo_size,
                 degen,
-            )
+            );
+            match (padseg, sparse_padseg_output) {
+                (KFoldPadSeg::Ranked121Of128, true) => {
+                    fold2_compact_and_round4_chunk_neon_ranked_padseg_sparse_output_8(
+                        args.0, args.1, args.2, args.3, args.4, args.5, args.6, args.7,
+                        args.8, args.9,
+                    )
+                }
+                (KFoldPadSeg::Ranked121Of128, false) => {
+                    fold2_compact_and_round4_chunk_neon_ranked_padseg_8(
+                        args.0, args.1, args.2, args.3, args.4, args.5, args.6, args.7,
+                        args.8, args.9,
+                    )
+                }
+                (KFoldPadSeg::None, _) => fold2_compact_and_round4_chunk_neon_8(
+                    args.0, args.1, args.2, args.3, args.4, args.5, args.6, args.7,
+                    args.8, args.9,
+                ),
+            }
         };
 
         #[cfg(not(target_arch = "aarch64"))]
@@ -2209,6 +2415,143 @@ pub fn fold_and_compute_round_pair_into(
     let n_hi = SplitEqGhash::MAX_N_HI;
 
     fold_and_compute_round_pair_into_with_n_hi(a, b, a_out, b_out, r_fold, r_next, n_hi)
+}
+
+/// Ranked-padding-aware entry point used by the zerocheck transcript driver.
+/// The incumbent [`fold_and_compute_round_pair_into`] remains the fallback so
+/// `FLOCK_NO_ZC_TAIL_PADPROP=1`, non-K routes, and every non-ranked shape keep
+/// its exact code path.
+pub(crate) fn fold_and_compute_round_pair_into_ranked_padprop(
+    a: &[F128],
+    b: &[F128],
+    a_out: &mut [F128],
+    b_out: &mut [F128],
+    r_fold: F128,
+    r_next: &[F128],
+    padprop: RankedTailPadPropStage,
+) -> (F128, F128) {
+    #[cfg(target_arch = "aarch64")]
+    if padprop == RankedTailPadPropStage::InputWidth64
+        && a.len() == (1usize << 24)
+        && b.len() == a.len()
+        && a_out.len() == (1usize << 23)
+        && b_out.len() == a_out.len()
+        && r_next.len() == 23
+        && std::env::var_os("FLOCK_ZC_NT_LEGACY").is_none()
+    {
+        return fold_and_compute_round_pair_into_ranked_padprop_stage2(
+            a, b, a_out, b_out, r_fold, r_next,
+        );
+    }
+
+    let _ = padprop;
+    fold_and_compute_round_pair_into(a, b, a_out, b_out, r_fold, r_next)
+}
+
+/// Exact width-64/useful-61 ranked sweep.  This deliberately lives beside,
+/// rather than inside, the generic implementation: the rollback therefore
+/// retains the incumbent generic closure and kernel byte-for-byte.
+#[cfg(target_arch = "aarch64")]
+fn fold_and_compute_round_pair_into_ranked_padprop_stage2(
+    a: &[F128],
+    b: &[F128],
+    a_out: &mut [F128],
+    b_out: &mut [F128],
+    r_fold: F128,
+    r_next: &[F128],
+) -> (F128, F128) {
+    use rayon::prelude::*;
+
+    let n = a.len();
+    assert_eq!(b.len(), n);
+    assert_eq!(n, 1usize << 24);
+    let half = n / 2;
+    assert_eq!(a_out.len(), half);
+    assert_eq!(b_out.len(), half);
+    assert_eq!(r_next.len(), 23);
+
+    let n_hi = if half >= LARGE_TAIL_EQ_MIN_HALF && zc_tail_split11_enabled() {
+        LARGE_TAIL_EQ_N_HI
+    } else {
+        SplitEqGhash::MAX_N_HI
+    };
+    let eq = SplitEqGhash::with_n_hi(&r_next[1..], n_hi);
+    let lo_size = 1usize << eq.n_lo;
+    let hi_size = 1usize << eq.n_hi;
+    assert!(lo_size.is_multiple_of(16));
+    assert_eq!(lo_size * hi_size * 2, half);
+
+    let chunk_in = 4 * lo_size;
+    let chunk_out = 2 * lo_size;
+    let eq_lo = &eq.lo;
+    let eq_hi = &eq.hi;
+    let chunk_partial = |a_in: &[F128],
+                         b_in: &[F128],
+                         a_out: &mut [F128],
+                         b_out: &mut [F128]| {
+        fold_and_message_aarch64_ranked_padprop_stage2(
+            a_in, b_in, a_out, b_out, r_fold, eq_lo,
+        )
+    };
+
+    let (sum1, sum_inf) = if zc_tail_hetero_enabled() {
+        let mut partials = vec![(F128::ZERO, F128::ZERO); hi_size];
+        let a_base = crate::epool::SyncPtr(a_out.as_mut_ptr());
+        let b_base = crate::epool::SyncPtr(b_out.as_mut_ptr());
+        let partials_base = crate::epool::SyncPtr(partials.as_mut_ptr());
+        crate::epool::run_hetero_chunks(hi_size, |x_hi| {
+            // SAFETY: the queue owns each x_hi exactly once; every worker gets
+            // disjoint input/output slices and one exclusive partial slot.
+            let (a_chunk, b_chunk) = unsafe {
+                (
+                    std::slice::from_raw_parts_mut(
+                        a_base.ptr().add(x_hi * chunk_out),
+                        chunk_out,
+                    ),
+                    std::slice::from_raw_parts_mut(
+                        b_base.ptr().add(x_hi * chunk_out),
+                        chunk_out,
+                    ),
+                )
+            };
+            let (p1, pinf) = chunk_partial(
+                &a[x_hi * chunk_in..(x_hi + 1) * chunk_in],
+                &b[x_hi * chunk_in..(x_hi + 1) * chunk_in],
+                a_chunk,
+                b_chunk,
+            );
+            let eq_h = eq_hi[x_hi];
+            unsafe {
+                *partials_base.ptr().add(x_hi) = (eq_h * p1, eq_h * pinf);
+            }
+        });
+        partials
+            .iter()
+            .fold((F128::ZERO, F128::ZERO), |(s1, sinf), &(p1, pinf)| {
+                (s1 + p1, sinf + pinf)
+            })
+    } else {
+        a_out
+            .par_chunks_mut(chunk_out)
+            .zip(b_out.par_chunks_mut(chunk_out))
+            .enumerate()
+            .map(|(x_hi, (a_chunk, b_chunk))| {
+                let (p1, pinf) = chunk_partial(
+                    &a[x_hi * chunk_in..(x_hi + 1) * chunk_in],
+                    &b[x_hi * chunk_in..(x_hi + 1) * chunk_in],
+                    a_chunk,
+                    b_chunk,
+                );
+                let eq_h = eq_hi[x_hi];
+                (eq_h * p1, eq_h * pinf)
+            })
+            .reduce(
+                || (F128::ZERO, F128::ZERO),
+                |(s1, sinf), (p1, pinf)| (s1 + p1, sinf + pinf),
+            )
+    };
+
+    (r_next[0] * sum1, sum_inf)
 }
 
 /// Split-explicit implementation used by the public policy wrapper and by the
@@ -3046,6 +3389,54 @@ mod tests {
         }
     }
 
+    #[test]
+    fn ranked_tail_padprop_selector_is_env_shape_route_and_iteration_guarded() {
+        use std::ffi::OsStr;
+
+        assert!(tail_padprop_env_enabled(None));
+        assert!(tail_padprop_env_enabled(Some(OsStr::new(""))));
+        assert!(tail_padprop_env_enabled(Some(OsStr::new("0"))));
+        assert!(!tail_padprop_env_enabled(Some(OsStr::new("1"))));
+
+        let ranked = PaddingSpec {
+            k_log: 14,
+            useful_bits_per_block: 15_409,
+        };
+        assert_eq!(
+            ranked_tail_padprop_stage_enabled(&ranked, 32, 2, true, true),
+            RankedTailPadPropStage::InputWidth64
+        );
+        for (m, i, k_composed, enabled) in [
+            (31, 2, true, true),
+            (32, 1, true, true),
+            (32, 3, true, true),
+            (32, 2, false, true),
+            (32, 2, true, false),
+        ] {
+            assert_eq!(
+                ranked_tail_padprop_stage_enabled(&ranked, m, i, k_composed, enabled),
+                RankedTailPadPropStage::None
+            );
+        }
+
+        let wrong_useful = PaddingSpec {
+            useful_bits_per_block: 15_408,
+            ..ranked
+        };
+        let wrong_block = PaddingSpec {
+            k_log: 13,
+            ..ranked
+        };
+        assert_eq!(
+            ranked_tail_padprop_stage_enabled(&wrong_useful, 32, 2, true, true),
+            RankedTailPadPropStage::None
+        );
+        assert_eq!(
+            ranked_tail_padprop_stage_enabled(&wrong_block, 32, 2, true, true),
+            RankedTailPadPropStage::None
+        );
+    }
+
     /// Moving two equality variables from eq_lo to eq_hi only regroups an
     /// exact tensor factorization.  It must leave both folded buffers and both
     /// wire-message field elements bit-identical.
@@ -3330,6 +3721,516 @@ mod tests {
         }
     }
 
+    #[test]
+    fn ranked_kfold_padseg_selector_requires_padding_and_full_shape() {
+        let ranked = PaddingSpec {
+            k_log: 14,
+            useful_bits_per_block: 15_409,
+        };
+        let compact_len = 1usize << (32 - 6 - 1);
+        assert_eq!(
+            kfold_padseg_shape(&ranked, compact_len, 8, 4_096),
+            KFoldPadSeg::Ranked121Of128
+        );
+
+        let mut rejected = [ranked; 3];
+        rejected[0].k_log = 13;
+        rejected[1].useful_bits_per_block -= 1;
+        rejected[2].useful_bits_per_block += 1;
+        for padding in rejected {
+            assert_eq!(
+                kfold_padseg_shape(&padding, compact_len, 8, 4_096),
+                KFoldPadSeg::None
+            );
+        }
+        assert_eq!(
+            kfold_padseg_shape(&ranked, compact_len - 1, 8, 4_096),
+            KFoldPadSeg::None
+        );
+        assert_eq!(
+            kfold_padseg_shape(&ranked, compact_len, 7, 4_096),
+            KFoldPadSeg::None
+        );
+        assert_eq!(
+            kfold_padseg_shape(&ranked, compact_len, 8, 2_048),
+            KFoldPadSeg::None
+        );
+    }
+
+    #[test]
+    fn ranked_r2_skip_dead_stores_selector_is_exact_and_k_coupled() {
+        let ranked = PaddingSpec {
+            k_log: 14,
+            useful_bits_per_block: 15_409,
+        };
+        let compact_len = 1usize << (32 - 6 - 1);
+        assert!(r2_skip_dead_stores_shape(
+            &ranked,
+            32,
+            6,
+            compact_len,
+            8,
+            16_384,
+            true,
+            true,
+        ));
+
+        for (m, k_skip, len, chunks, lo, producer_enabled, k_enabled) in [
+            (31, 6, compact_len, 8, 16_384, true, true),
+            (32, 5, compact_len, 8, 16_384, true, true),
+            (32, 6, compact_len - 1, 8, 16_384, true, true),
+            (32, 6, compact_len, 7, 16_384, true, true),
+            (32, 6, compact_len, 8, 4_096, true, true),
+            (32, 6, compact_len, 8, 16_384, false, true),
+            (32, 6, compact_len, 8, 16_384, true, false),
+        ] {
+            assert!(!r2_skip_dead_stores_shape(
+                &ranked,
+                m,
+                k_skip,
+                len,
+                chunks,
+                lo,
+                producer_enabled,
+                k_enabled,
+            ));
+        }
+
+        let wrong_padding = PaddingSpec {
+            useful_bits_per_block: 15_408,
+            ..ranked
+        };
+        assert!(!r2_skip_dead_stores_shape(
+            &wrong_padding,
+            32,
+            6,
+            compact_len,
+            8,
+            16_384,
+            true,
+            true,
+        ));
+    }
+
+    /// Direct producer/consumer oracle for the ranked `121/128` compact
+    /// shape. The incumbent arm must overwrite poison with zeros in records
+    /// 121..127, while the store-eliding arm must leave that poison untouched.
+    /// Useful records and all lookahead accumulators remain identical, and the
+    /// ranked K consumer must produce the same outputs/message from both
+    /// compact states. The incumbent state is also checked against generic K,
+    /// which is the state restored by either rollback.
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn ranked_r2_skip_dead_stores_preserves_messages_and_composes_with_k() {
+        const BLOCKS: usize = 2;
+        const RECORDS_PER_BLOCK: usize = 128;
+        const USEFUL_RECORDS: usize = 121;
+        const RECORDS: usize = BLOCKS * RECORDS_PER_BLOCK;
+        const PACKED_BYTES_PER_RECORD: usize = 16;
+        const DELTA_POISON: u8 = 0xA5;
+
+        let mut rng = Rng::new(0x52_32_53_4B_49_50_53_54);
+        let table = UniSkipFoldTable::new(6, rng.f128());
+        let mut a_packed = vec![0u8; RECORDS * PACKED_BYTES_PER_RECORD];
+        let mut b_packed = vec![0u8; RECORDS * PACKED_BYTES_PER_RECORD];
+        for byte in &mut a_packed {
+            *byte = rng.next_u64() as u8;
+        }
+        for byte in &mut b_packed {
+            *byte = rng.next_u64() as u8;
+        }
+        // Exercise the b≡1 shortcut in useful complete groups and record 120's
+        // mixed group without changing the descriptor-dead suffix.
+        for block in 0..BLOCKS {
+            for record in (0..USEFUL_RECORDS).step_by(17) {
+                let global = block * RECORDS_PER_BLOCK + record;
+                b_packed[global * PACKED_BYTES_PER_RECORD
+                    ..(global + 1) * PACKED_BYTES_PER_RECORD]
+                    .fill(0xFF);
+            }
+            let mixed_useful = block * RECORDS_PER_BLOCK + USEFUL_RECORDS - 1;
+            b_packed[mixed_useful * PACKED_BYTES_PER_RECORD
+                ..(mixed_useful + 1) * PACKED_BYTES_PER_RECORD]
+                .fill(0xFF);
+        }
+
+        let eq_r2 = rng.f128_vec(RECORDS);
+        let rho1 = rng.f128();
+        let rho2 = rng.f128();
+        let table_l1 = table.scaled_linear(rho1 * (F128::ONE + rho2));
+        let table_l3 = table.scaled_linear(rho1 * rho2);
+        let k_out_pairs = RECORDS / 4;
+        let eq_k = rng.f128_vec(k_out_pairs);
+
+        for full in [false, true] {
+            for degen in [false, true] {
+                let mut incumbent_anchors = vec![LA_POISON; 2 * RECORDS];
+                let mut incumbent_deltas = vec![DELTA_POISON; 16 * RECORDS];
+                let mut incumbent_acc = [LA_POISON; 8];
+                let mut elided_anchors = vec![LA_POISON; 2 * RECORDS];
+                let mut elided_deltas = vec![DELTA_POISON; 16 * RECORDS];
+                let mut elided_acc = [LA_POISON; 8];
+
+                unsafe {
+                    if full {
+                        fold_round2_compact_chunk_neon_lookahead_8::<true, false>(
+                            table.data.as_ptr().cast::<u8>(),
+                            a_packed.as_ptr(),
+                            b_packed.as_ptr(),
+                            incumbent_anchors.as_mut_ptr(),
+                            incumbent_deltas.as_mut_ptr(),
+                            eq_r2.as_ptr(),
+                            RECORDS,
+                            0,
+                            RECORDS_PER_BLOCK - 1,
+                            USEFUL_RECORDS,
+                            false,
+                            degen,
+                            incumbent_acc.as_mut_ptr(),
+                        );
+                        fold_round2_compact_chunk_neon_lookahead_8::<true, false>(
+                            table.data.as_ptr().cast::<u8>(),
+                            a_packed.as_ptr(),
+                            b_packed.as_ptr(),
+                            elided_anchors.as_mut_ptr(),
+                            elided_deltas.as_mut_ptr(),
+                            eq_r2.as_ptr(),
+                            RECORDS,
+                            0,
+                            RECORDS_PER_BLOCK - 1,
+                            USEFUL_RECORDS,
+                            true,
+                            degen,
+                            elided_acc.as_mut_ptr(),
+                        );
+                    } else {
+                        fold_round2_compact_chunk_neon_lookahead_8::<false, false>(
+                            table.data.as_ptr().cast::<u8>(),
+                            a_packed.as_ptr(),
+                            b_packed.as_ptr(),
+                            incumbent_anchors.as_mut_ptr(),
+                            incumbent_deltas.as_mut_ptr(),
+                            eq_r2.as_ptr(),
+                            RECORDS,
+                            0,
+                            RECORDS_PER_BLOCK - 1,
+                            USEFUL_RECORDS,
+                            false,
+                            degen,
+                            incumbent_acc.as_mut_ptr(),
+                        );
+                        fold_round2_compact_chunk_neon_lookahead_8::<false, false>(
+                            table.data.as_ptr().cast::<u8>(),
+                            a_packed.as_ptr(),
+                            b_packed.as_ptr(),
+                            elided_anchors.as_mut_ptr(),
+                            elided_deltas.as_mut_ptr(),
+                            eq_r2.as_ptr(),
+                            RECORDS,
+                            0,
+                            RECORDS_PER_BLOCK - 1,
+                            USEFUL_RECORDS,
+                            true,
+                            degen,
+                            elided_acc.as_mut_ptr(),
+                        );
+                    }
+                }
+                assert_eq!(elided_acc, incumbent_acc, "full={full} degen={degen}");
+
+                for block in 0..BLOCKS {
+                    let base = block * RECORDS_PER_BLOCK;
+                    for record in 0..USEFUL_RECORDS {
+                        let global = base + record;
+                        assert_eq!(
+                            &elided_anchors[2 * global..2 * global + 2],
+                            &incumbent_anchors[2 * global..2 * global + 2],
+                            "useful anchor record={record} block={block} full={full} degen={degen}"
+                        );
+                        assert_eq!(
+                            &elided_deltas[16 * global..16 * global + 16],
+                            &incumbent_deltas[16 * global..16 * global + 16],
+                            "useful delta record={record} block={block} full={full} degen={degen}"
+                        );
+                    }
+                    for record in USEFUL_RECORDS..RECORDS_PER_BLOCK {
+                        let global = base + record;
+                        assert!(
+                            incumbent_anchors[2 * global..2 * global + 2]
+                                .iter()
+                                .all(|&value| value == F128::ZERO),
+                            "rollback anchor was not zeroed: record={record} block={block}"
+                        );
+                        assert!(
+                            incumbent_deltas[16 * global..16 * global + 16]
+                                .iter()
+                                .all(|&byte| byte == 0),
+                            "rollback delta was not zeroed: record={record} block={block}"
+                        );
+                        assert_eq!(
+                            &elided_anchors[2 * global..2 * global + 2],
+                            &[LA_POISON; 2],
+                            "dead anchor was written: record={record} block={block}"
+                        );
+                        assert!(
+                            elided_deltas[16 * global..16 * global + 16]
+                                .iter()
+                                .all(|&byte| byte == DELTA_POISON),
+                            "dead delta was written: record={record} block={block}"
+                        );
+                    }
+                }
+
+                let mut generic_a = vec![LA_POISON; 2 * k_out_pairs];
+                let mut generic_b = vec![LA_POISON; 2 * k_out_pairs];
+                let generic_msg = unsafe {
+                    fold2_compact_and_round4_chunk_neon_8(
+                        table_l1.as_ptr().cast::<u8>(),
+                        table_l3.as_ptr().cast::<u8>(),
+                        rho2,
+                        incumbent_anchors.as_ptr(),
+                        incumbent_deltas.as_ptr(),
+                        generic_a.as_mut_ptr(),
+                        generic_b.as_mut_ptr(),
+                        eq_k.as_ptr(),
+                        k_out_pairs,
+                        degen,
+                    )
+                };
+                let mut incumbent_k_a = vec![LA_POISON; 2 * k_out_pairs];
+                let mut incumbent_k_b = vec![LA_POISON; 2 * k_out_pairs];
+                let incumbent_k_msg = unsafe {
+                    fold2_compact_and_round4_chunk_neon_ranked_padseg_8(
+                        table_l1.as_ptr().cast::<u8>(),
+                        table_l3.as_ptr().cast::<u8>(),
+                        rho2,
+                        incumbent_anchors.as_ptr(),
+                        incumbent_deltas.as_ptr(),
+                        incumbent_k_a.as_mut_ptr(),
+                        incumbent_k_b.as_mut_ptr(),
+                        eq_k.as_ptr(),
+                        k_out_pairs,
+                        degen,
+                    )
+                };
+                assert_eq!(incumbent_k_a, generic_a, "rollback K A degen={degen}");
+                assert_eq!(incumbent_k_b, generic_b, "rollback K B degen={degen}");
+                assert_eq!(incumbent_k_msg, generic_msg, "rollback K msg degen={degen}");
+
+                let mut elided_k_a = vec![LA_POISON; 2 * k_out_pairs];
+                let mut elided_k_b = vec![LA_POISON; 2 * k_out_pairs];
+                let elided_k_msg = unsafe {
+                    fold2_compact_and_round4_chunk_neon_ranked_padseg_8(
+                        table_l1.as_ptr().cast::<u8>(),
+                        table_l3.as_ptr().cast::<u8>(),
+                        rho2,
+                        elided_anchors.as_ptr(),
+                        elided_deltas.as_ptr(),
+                        elided_k_a.as_mut_ptr(),
+                        elided_k_b.as_mut_ptr(),
+                        eq_k.as_ptr(),
+                        k_out_pairs,
+                        degen,
+                    )
+                };
+                assert_eq!(elided_k_a, generic_a, "elided K A full={full} degen={degen}");
+                assert_eq!(elided_k_b, generic_b, "elided K B full={full} degen={degen}");
+                assert_eq!(
+                    elided_k_msg, generic_msg,
+                    "elided K msg full={full} degen={degen}"
+                );
+            }
+        }
+    }
+
+    /// Direct K-kernel oracle for the ranked 121/128 compact-record shape.
+    /// First compare honest zeros to the incumbent kernel, then poison every
+    /// descriptor-guaranteed-zero compact record (including record 121, the
+    /// hidden half of g60). The segmented kernel must ignore that poison,
+    /// write every zero output explicitly, and preserve both message words.
+    /// Its coupled sparse-output sibling may leave those output slots poisoned
+    /// only because the exact next padprop sweep must ignore them as well.
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn ranked_kfold_padseg_matches_legacy_and_ignores_compact_padding_poison() {
+        const BLOCKS: usize = 2;
+        const RECORDS_PER_BLOCK: usize = 128;
+        const USEFUL_RECORDS: usize = 121;
+        const OUT_PAIRS: usize = BLOCKS * 32;
+        const GROUPS: usize = 2 * OUT_PAIRS;
+        const RECORDS: usize = 2 * GROUPS;
+
+        let mut rng = Rng::new(0x4B_F0_1D_5E_61);
+        let table = UniSkipFoldTable::new(6, rng.f128());
+        let rho1 = rng.f128();
+        let rho2 = rng.f128();
+        let table_l1 = table.scaled_linear(rho1 * (F128::ONE + rho2));
+        let table_l3 = table.scaled_linear(rho1 * rho2);
+        let mut anchors = rng.f128_vec(2 * RECORDS);
+        let mut deltas = vec![0u8; 16 * RECORDS];
+        for byte in &mut deltas {
+            *byte = rng.next_u64() as u8;
+        }
+        for block in 0..BLOCKS {
+            for record_in_block in USEFUL_RECORDS..RECORDS_PER_BLOCK {
+                let record = block * RECORDS_PER_BLOCK + record_in_block;
+                anchors[2 * record..2 * record + 2].fill(F128::ZERO);
+                deltas[16 * record..16 * record + 16].fill(0);
+            }
+        }
+        let eq_lo = rng.f128_vec(OUT_PAIRS);
+
+        for degen in [false, true] {
+            let mut legacy_a = vec![LA_POISON; GROUPS];
+            let mut legacy_b = vec![LA_POISON; GROUPS];
+            let legacy_msg = unsafe {
+                fold2_compact_and_round4_chunk_neon_8(
+                    table_l1.as_ptr().cast::<u8>(),
+                    table_l3.as_ptr().cast::<u8>(),
+                    rho2,
+                    anchors.as_ptr(),
+                    deltas.as_ptr(),
+                    legacy_a.as_mut_ptr(),
+                    legacy_b.as_mut_ptr(),
+                    eq_lo.as_ptr(),
+                    OUT_PAIRS,
+                    degen,
+                )
+            };
+
+            let mut segmented_a = vec![LA_POISON; GROUPS];
+            let mut segmented_b = vec![LA_POISON; GROUPS];
+            let segmented_msg = unsafe {
+                fold2_compact_and_round4_chunk_neon_ranked_padseg_8(
+                    table_l1.as_ptr().cast::<u8>(),
+                    table_l3.as_ptr().cast::<u8>(),
+                    rho2,
+                    anchors.as_ptr(),
+                    deltas.as_ptr(),
+                    segmented_a.as_mut_ptr(),
+                    segmented_b.as_mut_ptr(),
+                    eq_lo.as_ptr(),
+                    OUT_PAIRS,
+                    degen,
+                )
+            };
+            assert_eq!(segmented_a, legacy_a, "honest A, degen={degen}");
+            assert_eq!(segmented_b, legacy_b, "honest B, degen={degen}");
+            assert_eq!(segmented_msg, legacy_msg, "honest msg, degen={degen}");
+
+            let mut poisoned_anchors = anchors.clone();
+            let mut poisoned_deltas = deltas.clone();
+            for block in 0..BLOCKS {
+                for record_in_block in USEFUL_RECORDS..RECORDS_PER_BLOCK {
+                    let record = block * RECORDS_PER_BLOCK + record_in_block;
+                    poisoned_anchors[2 * record] = rng.f128();
+                    poisoned_anchors[2 * record + 1] = rng.f128();
+                    for byte in &mut poisoned_deltas[16 * record..16 * record + 16] {
+                        *byte = rng.next_u64() as u8;
+                    }
+                }
+            }
+            let mut poisoned_a = vec![LA_POISON; GROUPS];
+            let mut poisoned_b = vec![LA_POISON; GROUPS];
+            let poisoned_msg = unsafe {
+                fold2_compact_and_round4_chunk_neon_ranked_padseg_8(
+                    table_l1.as_ptr().cast::<u8>(),
+                    table_l3.as_ptr().cast::<u8>(),
+                    rho2,
+                    poisoned_anchors.as_ptr(),
+                    poisoned_deltas.as_ptr(),
+                    poisoned_a.as_mut_ptr(),
+                    poisoned_b.as_mut_ptr(),
+                    eq_lo.as_ptr(),
+                    OUT_PAIRS,
+                    degen,
+                )
+            };
+            assert_eq!(poisoned_a, legacy_a, "poisoned A, degen={degen}");
+            assert_eq!(poisoned_b, legacy_b, "poisoned B, degen={degen}");
+            assert_eq!(poisoned_msg, legacy_msg, "poisoned msg, degen={degen}");
+            for block in 0..BLOCKS {
+                let base = 64 * block;
+                assert!(
+                    poisoned_a[base + 61..base + 64]
+                        .iter()
+                        .all(|value| value.is_zero())
+                );
+                assert!(
+                    poisoned_b[base + 61..base + 64]
+                        .iter()
+                        .all(|value| value.is_zero())
+                );
+            }
+
+            let mut sparse_a = vec![LA_POISON; GROUPS];
+            let mut sparse_b = vec![LA_POISON; GROUPS];
+            let sparse_msg = unsafe {
+                fold2_compact_and_round4_chunk_neon_ranked_padseg_sparse_output_8(
+                    table_l1.as_ptr().cast::<u8>(),
+                    table_l3.as_ptr().cast::<u8>(),
+                    rho2,
+                    poisoned_anchors.as_ptr(),
+                    poisoned_deltas.as_ptr(),
+                    sparse_a.as_mut_ptr(),
+                    sparse_b.as_mut_ptr(),
+                    eq_lo.as_ptr(),
+                    OUT_PAIRS,
+                    degen,
+                )
+            };
+            assert_eq!(sparse_msg, legacy_msg, "sparse msg, degen={degen}");
+            for block in 0..BLOCKS {
+                let base = 64 * block;
+                assert_eq!(
+                    &sparse_a[base..base + 61],
+                    &legacy_a[base..base + 61],
+                    "sparse useful A, block={block}, degen={degen}"
+                );
+                assert_eq!(
+                    &sparse_b[base..base + 61],
+                    &legacy_b[base..base + 61],
+                    "sparse useful B, block={block}, degen={degen}"
+                );
+                assert!(sparse_a[base + 61..base + 64]
+                    .iter()
+                    .all(|&value| value == LA_POISON));
+                assert!(sparse_b[base + 61..base + 64]
+                    .iter()
+                    .all(|&value| value == LA_POISON));
+            }
+
+            let tail_rho = rng.f128();
+            let tail_eq = rng.f128_vec(GROUPS / 4);
+            let mut legacy_tail_a = vec![LA_POISON; GROUPS / 2];
+            let mut legacy_tail_b = vec![LA_POISON; GROUPS / 2];
+            let legacy_tail_msg = fold_and_message_aarch64_ranked_padprop_stage2(
+                &legacy_a,
+                &legacy_b,
+                &mut legacy_tail_a,
+                &mut legacy_tail_b,
+                tail_rho,
+                &tail_eq,
+            );
+            let mut sparse_tail_a = vec![LA_POISON; GROUPS / 2];
+            let mut sparse_tail_b = vec![LA_POISON; GROUPS / 2];
+            let sparse_tail_msg = fold_and_message_aarch64_ranked_padprop_stage2(
+                &sparse_a,
+                &sparse_b,
+                &mut sparse_tail_a,
+                &mut sparse_tail_b,
+                tail_rho,
+                &tail_eq,
+            );
+            assert_eq!(sparse_tail_a, legacy_tail_a, "coupled tail A, degen={degen}");
+            assert_eq!(sparse_tail_b, legacy_tail_b, "coupled tail B, degen={degen}");
+            assert_eq!(
+                sparse_tail_msg, legacy_tail_msg,
+                "coupled tail message, degen={degen}"
+            );
+        }
+    }
+
     /// T1 — the core oracle. Round-two message identical, and the deferred
     /// quadratic evaluates to the incumbent round-three message at every ρ₁.
     /// Four distinct ρ₁ over-determine a quadratic, so agreement at all of
@@ -3475,11 +4376,26 @@ mod tests {
                         a_n.fill(LA_POISON);
                         b_n.fill(LA_POISON);
                         let msg_n = fold2_compact_and_round4_into(
-                            &compact, &f.table, rho1, rho2, &r_next4, &mut a_n, &mut b_n,
+                            &compact,
+                            &f.table,
+                            rho1,
+                            rho2,
+                            &r_next4,
+                            &f.padding,
+                            &mut a_n,
+                            &mut b_n,
                         );
                         assert_eq!(a_n, a_l, "A'' m={m} rho1={rho1:?} rho2={rho2:?}");
                         assert_eq!(b_n, b_l, "B'' m={m} rho1={rho1:?} rho2={rho2:?}");
                         assert_eq!(msg_n, msg_l, "round-four message m={m}");
+                        if ranked {
+                            for block in a_n.chunks_exact(64) {
+                                assert!(block[61..].iter().all(|&x| x == F128::ZERO));
+                            }
+                            for block in b_n.chunks_exact(64) {
+                                assert!(block[61..].iter().all(|&x| x == F128::ZERO));
+                            }
+                        }
 
                         crate::scratch::give_f128(a_l);
                         crate::scratch::give_f128(b_l);

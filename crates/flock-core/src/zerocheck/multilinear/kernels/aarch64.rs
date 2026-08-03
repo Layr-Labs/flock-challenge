@@ -552,7 +552,9 @@ pub(crate) unsafe fn fold_round2_compact_chunk_neon_anchors_only_8(
 /// [`fold_round2_compact_chunk_neon_unchecked_8`] emits for the same pair
 /// (padded pairs zeroed, degenerate pairs shortcut with the identical
 /// `[a0^a1, 0] == [a0^a1, b0^b1]` delta), so the compact state produced by
-/// the lookahead kernel is byte-identical to the incumbent's.
+/// the lookahead kernel is byte-identical to the incumbent's unless the caller
+/// explicitly suppresses stores for descriptor-dead records consumed by the
+/// ranked K specialization.
 ///
 /// Returns the four folded rows plus whether the b≡1 shortcut was taken.
 #[cfg(target_arch = "aarch64")]
@@ -565,6 +567,7 @@ unsafe fn r2_pair_fold_and_store(
     deltas: *mut u8,
     x_lo: usize,
     padded: bool,
+    skip_dead_store: bool,
     degen: bool,
     b_ones: core::arch::aarch64::uint64x2_t,
 ) -> (
@@ -592,8 +595,10 @@ unsafe fn r2_pair_fold_and_store(
     unsafe {
         let zero = vdupq_n_u64(0);
         if padded {
-            store_anchor_pair_nt(anchors.add(2 * x_lo), zero, zero);
-            vst1q_u64(deltas.add(x_lo * 16).cast::<u64>(), zero);
+            if !skip_dead_store {
+                store_anchor_pair_nt(anchors.add(2 * x_lo), zero, zero);
+                vst1q_u64(deltas.add(x_lo * 16).cast::<u64>(), zero);
+            }
             return (zero, zero, zero, zero, false);
         }
 
@@ -639,7 +644,11 @@ unsafe fn r2_pair_fold_and_store(
 /// same expressions the incumbent kernel emits; the only structural change is
 /// that pairs are visited two at a time — one round-three group `y = x'/2` —
 /// so a group's four rows are live together and the six deferred round-three
-/// aggregates can be formed with **no extra table lookups**.
+/// aggregates can be formed with **no extra table lookups**. When
+/// `skip_dead_stores` is set by the exact producer/consumer shape guard, only
+/// the existing padded branches omit their zero stores; traversal and padding
+/// predicates are otherwise unchanged. Seven 48-byte compact records across
+/// each of 2^18 ranked blocks remove exactly 84 MiB of writes.
 ///
 /// **One weight per group, one scaling per row.** The two eq2 lanes of a group
 /// and eq3 itself are constant multiples of one another —
@@ -686,6 +695,7 @@ pub(crate) unsafe fn fold_round2_compact_chunk_neon_lookahead_8<
     pair_idx_base: usize,
     pair_in_block_mask: usize,
     useful_pairs_inclusive: usize,
+    skip_dead_stores: bool,
     degen: bool,
     out: *mut F128,
 ) {
@@ -729,18 +739,38 @@ pub(crate) unsafe fn fold_round2_compact_chunk_neon_lookahead_8<
             let pad0 = ((pair_idx_base + x_lo0) & pair_in_block_mask) >= useful_pairs_inclusive;
             let pad1 = ((pair_idx_base + x_lo1) & pair_in_block_mask) >= useful_pairs_inclusive;
             if pad0 & pad1 {
-                store_anchor_pair_nt(anchors.add(2 * x_lo0), zero, zero);
-                vst1q_u64(deltas.add(x_lo0 * 16).cast::<u64>(), zero);
-                store_anchor_pair_nt(anchors.add(2 * x_lo1), zero, zero);
-                vst1q_u64(deltas.add(x_lo1 * 16).cast::<u64>(), zero);
+                if !skip_dead_stores {
+                    store_anchor_pair_nt(anchors.add(2 * x_lo0), zero, zero);
+                    vst1q_u64(deltas.add(x_lo0 * 16).cast::<u64>(), zero);
+                    store_anchor_pair_nt(anchors.add(2 * x_lo1), zero, zero);
+                    vst1q_u64(deltas.add(x_lo1 * 16).cast::<u64>(), zero);
+                }
                 continue;
             }
 
             let (a0, a1, b0, b1, deg0) = r2_pair_fold_and_store(
-                table_data, a_packed, b_packed, anchors, deltas, x_lo0, pad0, degen, b_ones,
+                table_data,
+                a_packed,
+                b_packed,
+                anchors,
+                deltas,
+                x_lo0,
+                pad0,
+                skip_dead_stores,
+                degen,
+                b_ones,
             );
             let (a2, a3, b2, b3, deg1) = r2_pair_fold_and_store(
-                table_data, a_packed, b_packed, anchors, deltas, x_lo1, pad1, degen, b_ones,
+                table_data,
+                a_packed,
+                b_packed,
+                anchors,
+                deltas,
+                x_lo1,
+                pad1,
+                skip_dead_stores,
+                degen,
+                b_ones,
             );
 
             // The odd lane's weight drives the whole group; see the doc above.
@@ -935,6 +965,378 @@ pub(crate) unsafe fn fold2_compact_and_round4_chunk_neon_8(
                 wide_xor(&mut p1_acc, mul_unreduced_q(eq_l, g1));
                 wide_xor(&mut pinf_acc, mul_unreduced_q(eq_l, g_inf));
             }
+        }
+
+        (
+            core::mem::transmute::<uint64x2_t, F128>(reduce_wide_q(p1_acc)),
+            core::mem::transmute::<uint64x2_t, F128>(reduce_wide_q(pinf_acc)),
+        )
+    }
+}
+
+/// Ranked `121 useful compact records / 128` sibling of
+/// [`fold2_compact_and_round4_chunk_neon_8`].  Every 64-output block has 61
+/// potentially non-zero outputs: thirty full output pairs, one mixed pair,
+/// and one fully-zero pair.  Keeping those regions as separate fixed loops
+/// removes the padding predicate from the useful body while making the
+/// declared zeros independent of the bytes left in compact scratch.
+///
+/// The caller must authorize this kernel from `PaddingSpec`; this function
+/// intentionally accepts no length-derived padding inference.
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "aes")]
+pub(crate) unsafe fn fold2_compact_and_round4_chunk_neon_ranked_padseg_8(
+    table_l1: *const u8,
+    table_l3: *const u8,
+    rho2: F128,
+    anchors: *const F128,
+    deltas: *const u8,
+    a_out: *mut F128,
+    b_out: *mut F128,
+    eq_lo: *const F128,
+    out_pairs: usize,
+    degen: bool,
+) -> (F128, F128) {
+    use core::arch::aarch64::*;
+
+    #[inline(always)]
+    unsafe fn store_pair_nt(dst: *mut F128, x: uint64x2_t, y: uint64x2_t) {
+        unsafe {
+            core::arch::asm!(
+                "stnp {x:q}, {y:q}, [{dst}]",
+                dst = in(reg) dst,
+                x = in(vreg) x,
+                y = in(vreg) y,
+                options(nostack, preserves_flags),
+            );
+        }
+    }
+
+    unsafe {
+        debug_assert_eq!(out_pairs % 32, 0);
+        let zero = vdupq_n_u64(0);
+        let rho2_q = core::mem::transmute::<F128, uint64x2_t>(rho2);
+        let one_q = core::mem::transmute::<F128, uint64x2_t>(F128::ONE);
+        let mut p1_acc = WideNeon { lo: zero, hi: zero };
+        let mut pinf_acc = WideNeon { lo: zero, hi: zero };
+
+        for block in 0..(out_pairs / 32) {
+            let pair_base = 32 * block;
+
+            // Outputs g0..g59: no padding checks in the useful loop.
+            for u_in_block in 0..30usize {
+                let u = pair_base + u_in_block;
+                let mut av = [zero; 2];
+                let mut bv = [zero; 2];
+                let mut b_flat = true;
+                for lane in 0..2usize {
+                    let g = 2 * u + lane;
+                    let ap = anchors.add(4 * g).cast::<u64>();
+                    let anc_a0 = vld1q_u64(ap);
+                    let anc_b0 = vld1q_u64(ap.add(2));
+                    let anc_a1 = vld1q_u64(ap.add(4));
+                    let anc_b1 = vld1q_u64(ap.add(6));
+
+                    let dp = deltas.add(32 * g);
+                    let da0 = u64::from_le(core::ptr::read_unaligned(dp.cast::<u64>()));
+                    let db0 =
+                        u64::from_le(core::ptr::read_unaligned(dp.add(8).cast::<u64>()));
+                    let da1 =
+                        u64::from_le(core::ptr::read_unaligned(dp.add(16).cast::<u64>()));
+                    let db1 =
+                        u64::from_le(core::ptr::read_unaligned(dp.add(24).cast::<u64>()));
+
+                    let a_delta = veorq_u64(
+                        lookup_lanes_q::<8>(table_l1, da0, 0),
+                        lookup_lanes_q::<8>(table_l3, da1, 0),
+                    );
+                    av[lane] = xor3_u64(
+                        anc_a0,
+                        mul_q(rho2_q, veorq_u64(anc_a0, anc_a1)),
+                        a_delta,
+                    );
+
+                    if degen && (db0 | db1) == 0 {
+                        let bd = veorq_u64(anc_b0, anc_b1);
+                        bv[lane] = if is_zero_q(bd) {
+                            anc_b0
+                        } else {
+                            b_flat = false;
+                            veorq_u64(anc_b0, mul_q(rho2_q, bd))
+                        };
+                    } else {
+                        b_flat = false;
+                        let b_delta = veorq_u64(
+                            lookup_lanes_q::<8>(table_l1, db0, 0),
+                            lookup_lanes_q::<8>(table_l3, db1, 0),
+                        );
+                        bv[lane] = xor3_u64(
+                            anc_b0,
+                            mul_q(rho2_q, veorq_u64(anc_b0, anc_b1)),
+                            b_delta,
+                        );
+                    }
+                }
+
+                store_pair_nt(a_out.add(2 * u), av[0], av[1]);
+                store_pair_nt(b_out.add(2 * u), bv[0], bv[1]);
+
+                let eq_l = vld1q_u64(eq_lo.add(u).cast::<u64>());
+                if b_flat {
+                    let g1 = if is_zero_q(veorq_u64(bv[1], one_q)) {
+                        av[1]
+                    } else {
+                        mul_q(av[1], bv[1])
+                    };
+                    wide_xor(&mut p1_acc, mul_unreduced_q(eq_l, g1));
+                    let b_sum = veorq_u64(bv[0], bv[1]);
+                    if !is_zero_q(b_sum) {
+                        let g_inf = mul_q(veorq_u64(av[0], av[1]), b_sum);
+                        wide_xor(&mut pinf_acc, mul_unreduced_q(eq_l, g_inf));
+                    }
+                } else {
+                    let g1 = mul_q(av[1], bv[1]);
+                    let g_inf =
+                        mul_q(veorq_u64(av[0], av[1]), veorq_u64(bv[0], bv[1]));
+                    wide_xor(&mut p1_acc, mul_unreduced_q(eq_l, g1));
+                    wide_xor(&mut pinf_acc, mul_unreduced_q(eq_l, g_inf));
+                }
+            }
+
+            // Mixed pair u30: g60 uses compact record 120; record 121 and
+            // output g61 are descriptor-guaranteed zero.  Ignore their
+            // scratch bytes entirely, write only record 60, and emit only
+            // g_inf = A60*B60 (g1 is zero).
+            let u = pair_base + 30;
+            let g = 2 * u;
+            let ap = anchors.add(4 * g).cast::<u64>();
+            let anc_a0 = vld1q_u64(ap);
+            let anc_b0 = vld1q_u64(ap.add(2));
+            let dp = deltas.add(32 * g);
+            let da0 = u64::from_le(core::ptr::read_unaligned(dp.cast::<u64>()));
+            let db0 = u64::from_le(core::ptr::read_unaligned(dp.add(8).cast::<u64>()));
+
+            let a60 = xor3_u64(
+                anc_a0,
+                mul_q(rho2_q, anc_a0),
+                lookup_lanes_q::<8>(table_l1, da0, 0),
+            );
+            let b60 = if degen && db0 == 0 {
+                if is_zero_q(anc_b0) {
+                    zero
+                } else {
+                    veorq_u64(anc_b0, mul_q(rho2_q, anc_b0))
+                }
+            } else {
+                xor3_u64(
+                    anc_b0,
+                    mul_q(rho2_q, anc_b0),
+                    lookup_lanes_q::<8>(table_l1, db0, 0),
+                )
+            };
+            store_pair_nt(a_out.add(2 * u), a60, zero);
+            store_pair_nt(b_out.add(2 * u), b60, zero);
+
+            if !is_zero_q(b60) {
+                let g_inf = if is_zero_q(veorq_u64(b60, one_q)) {
+                    a60
+                } else {
+                    mul_q(a60, b60)
+                };
+                let eq_l = vld1q_u64(eq_lo.add(u).cast::<u64>());
+                wide_xor(&mut pinf_acc, mul_unreduced_q(eq_l, g_inf));
+            }
+
+            // Full-zero pair u31: g62/g63 require four output zeros and no
+            // compact, table, or equality reads.
+            let u = pair_base + 31;
+            store_pair_nt(a_out.add(2 * u), zero, zero);
+            store_pair_nt(b_out.add(2 * u), zero, zero);
+        }
+
+        (
+            core::mem::transmute::<uint64x2_t, F128>(reduce_wide_q(p1_acc)),
+            core::mem::transmute::<uint64x2_t, F128>(reduce_wide_q(pinf_acc)),
+        )
+    }
+}
+
+/// Coupled ranked K/post-K-tail variant.  The output records 61..63 of every
+/// width-64 block are left untouched because the immediately following exact
+/// ranked padprop sweep ignores them by contract.  Callers must retain the
+/// explicit-zero sibling whenever that downstream sweep is not guaranteed.
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "aes")]
+pub(crate) unsafe fn fold2_compact_and_round4_chunk_neon_ranked_padseg_sparse_output_8(
+    table_l1: *const u8,
+    table_l3: *const u8,
+    rho2: F128,
+    anchors: *const F128,
+    deltas: *const u8,
+    a_out: *mut F128,
+    b_out: *mut F128,
+    eq_lo: *const F128,
+    out_pairs: usize,
+    degen: bool,
+) -> (F128, F128) {
+    use core::arch::aarch64::*;
+
+    #[inline(always)]
+    unsafe fn store_pair_nt(dst: *mut F128, x: uint64x2_t, y: uint64x2_t) {
+        unsafe {
+            core::arch::asm!(
+                "stnp {x:q}, {y:q}, [{dst}]",
+                dst = in(reg) dst,
+                x = in(vreg) x,
+                y = in(vreg) y,
+                options(nostack, preserves_flags),
+            );
+        }
+    }
+
+    unsafe {
+        debug_assert_eq!(out_pairs % 32, 0);
+        let zero = vdupq_n_u64(0);
+        let rho2_q = core::mem::transmute::<F128, uint64x2_t>(rho2);
+        let one_q = core::mem::transmute::<F128, uint64x2_t>(F128::ONE);
+        let mut p1_acc = WideNeon { lo: zero, hi: zero };
+        let mut pinf_acc = WideNeon { lo: zero, hi: zero };
+
+        // Expand the two lanes at each call site.  Keeping the values as
+        // named q-register candidates avoids the small stack arrays and the
+        // two-trip inner loop that LLVM otherwise retained in this kernel.
+        macro_rules! fold_lane {
+            ($g:expr) => {{
+                let g = $g;
+                let ap = anchors.add(4 * g).cast::<u64>();
+                let anc_a0 = vld1q_u64(ap);
+                let anc_b0 = vld1q_u64(ap.add(2));
+                let anc_a1 = vld1q_u64(ap.add(4));
+                let anc_b1 = vld1q_u64(ap.add(6));
+
+                let dp = deltas.add(32 * g);
+                let da0 = u64::from_le(core::ptr::read_unaligned(dp.cast::<u64>()));
+                let db0 = u64::from_le(core::ptr::read_unaligned(dp.add(8).cast::<u64>()));
+                let da1 = u64::from_le(core::ptr::read_unaligned(dp.add(16).cast::<u64>()));
+                let db1 = u64::from_le(core::ptr::read_unaligned(dp.add(24).cast::<u64>()));
+
+                let a_delta = veorq_u64(
+                    lookup_lanes_q::<8>(table_l1, da0, 0),
+                    lookup_lanes_q::<8>(table_l3, da1, 0),
+                );
+                let a = xor3_u64(
+                    anc_a0,
+                    mul_q(rho2_q, veorq_u64(anc_a0, anc_a1)),
+                    a_delta,
+                );
+
+                let (b, b_flat) = if degen && (db0 | db1) == 0 {
+                    let bd = veorq_u64(anc_b0, anc_b1);
+                    if is_zero_q(bd) {
+                        (anc_b0, true)
+                    } else {
+                        (veorq_u64(anc_b0, mul_q(rho2_q, bd)), false)
+                    }
+                } else {
+                    let b_delta = veorq_u64(
+                        lookup_lanes_q::<8>(table_l1, db0, 0),
+                        lookup_lanes_q::<8>(table_l3, db1, 0),
+                    );
+                    (
+                        xor3_u64(
+                            anc_b0,
+                            mul_q(rho2_q, veorq_u64(anc_b0, anc_b1)),
+                            b_delta,
+                        ),
+                        false,
+                    )
+                };
+                (a, b, b_flat)
+            }};
+        }
+
+        for block in 0..(out_pairs / 32) {
+            let pair_base = 32 * block;
+
+            // Outputs g0..g59: no padding checks in the useful loop.
+            for u_in_block in 0..30usize {
+                let u = pair_base + u_in_block;
+                let (a0, b0, b0_flat) = fold_lane!(2 * u);
+                let (a1, b1, b1_flat) = fold_lane!(2 * u + 1);
+                store_pair_nt(a_out.add(2 * u), a0, a1);
+                store_pair_nt(b_out.add(2 * u), b0, b1);
+
+                let eq_l = vld1q_u64(eq_lo.add(u).cast::<u64>());
+                if b0_flat && b1_flat {
+                    let g1 = if is_zero_q(veorq_u64(b1, one_q)) {
+                        a1
+                    } else {
+                        mul_q(a1, b1)
+                    };
+                    wide_xor(&mut p1_acc, mul_unreduced_q(eq_l, g1));
+                    let b_sum = veorq_u64(b0, b1);
+                    if !is_zero_q(b_sum) {
+                        let g_inf = mul_q(veorq_u64(a0, a1), b_sum);
+                        wide_xor(&mut pinf_acc, mul_unreduced_q(eq_l, g_inf));
+                    }
+                } else {
+                    let g1 = mul_q(a1, b1);
+                    let g_inf = mul_q(veorq_u64(a0, a1), veorq_u64(b0, b1));
+                    wide_xor(&mut p1_acc, mul_unreduced_q(eq_l, g1));
+                    wide_xor(&mut pinf_acc, mul_unreduced_q(eq_l, g_inf));
+                }
+            }
+
+            // Mixed pair u30: g60 uses compact record 120; record 121 and
+            // output g61 are descriptor-guaranteed zero.  Ignore their
+            // scratch bytes entirely, force the second stores, and emit only
+            // g_inf = A60*B60 (g1 is zero).
+            let u = pair_base + 30;
+            let g = 2 * u;
+            let ap = anchors.add(4 * g).cast::<u64>();
+            let anc_a0 = vld1q_u64(ap);
+            let anc_b0 = vld1q_u64(ap.add(2));
+            let dp = deltas.add(32 * g);
+            let da0 = u64::from_le(core::ptr::read_unaligned(dp.cast::<u64>()));
+            let db0 = u64::from_le(core::ptr::read_unaligned(dp.add(8).cast::<u64>()));
+
+            let a60 = xor3_u64(
+                anc_a0,
+                mul_q(rho2_q, anc_a0),
+                lookup_lanes_q::<8>(table_l1, da0, 0),
+            );
+            let b60 = if degen && db0 == 0 {
+                if is_zero_q(anc_b0) {
+                    zero
+                } else {
+                    veorq_u64(anc_b0, mul_q(rho2_q, anc_b0))
+                }
+            } else {
+                xor3_u64(
+                    anc_b0,
+                    mul_q(rho2_q, anc_b0),
+                    lookup_lanes_q::<8>(table_l1, db0, 0),
+                )
+            };
+            // The coupled downstream padprop sweep consumes record 60
+            // and deliberately ignores records 61..63.  Write only the
+            // two live values, avoiding 96 bytes of dead output traffic
+            // per width-64 block across A and B.
+            vst1q_u64(a_out.add(2 * u).cast::<u64>(), a60);
+            vst1q_u64(b_out.add(2 * u).cast::<u64>(), b60);
+
+            if !is_zero_q(b60) {
+                let g_inf = if is_zero_q(veorq_u64(b60, one_q)) {
+                    a60
+                } else {
+                    mul_q(a60, b60)
+                };
+                let eq_l = vld1q_u64(eq_lo.add(u).cast::<u64>());
+                wide_xor(&mut pinf_acc, mul_unreduced_q(eq_l, g_inf));
+            }
+
+            // Full-zero pair u31 is left untouched; the coupled padprop
+            // consumer ignores both records without reading equality state.
         }
 
         (
@@ -1453,6 +1855,138 @@ pub(crate) unsafe fn fold_one_row_neon_unchecked_8(
     }
 }
 
+/// Ranked post-K tail stage: every 64-record witness block consists of fifteen
+/// ordinary four-record groups and one `(value, 0, 0, 0)` boundary group.
+/// The caller selects this only for the ranked m=32 `i=2` NT-store round.
+#[cfg(target_arch = "aarch64")]
+pub(crate) fn fold_and_message_aarch64_ranked_padprop_stage2(
+    a_in: &[F128],
+    b_in: &[F128],
+    a_out: &mut [F128],
+    b_out: &mut [F128],
+    r_fold: F128,
+    eq_lo: &[F128],
+) -> (F128, F128) {
+    fold_and_message_ranked_padprop_stage2_body(a_in, b_in, a_out, b_out, r_fold, eq_lo)
+}
+
+/// Const-shaped NT kernel for width-64/useful-61 ranked blocks. Padding is
+/// represented by loop bounds rather than a per-record predicate.
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+fn fold_and_message_ranked_padprop_stage2_body(
+    a_in: &[F128],
+    b_in: &[F128],
+    a_out: &mut [F128],
+    b_out: &mut [F128],
+    r_fold: F128,
+    eq_lo: &[F128],
+) -> (F128, F128) {
+    use core::arch::aarch64::{uint64x2_t, vdupq_n_u64};
+
+    const GROUPS_PER_BLOCK: usize = 16;
+    const FULL_GROUPS: usize = 15;
+
+    debug_assert_eq!(a_in.len(), 4 * eq_lo.len());
+    debug_assert_eq!(b_in.len(), 4 * eq_lo.len());
+    debug_assert_eq!(a_out.len(), 2 * eq_lo.len());
+    debug_assert_eq!(b_out.len(), 2 * eq_lo.len());
+    debug_assert!(eq_lo.len().is_multiple_of(GROUPS_PER_BLOCK));
+
+    #[inline(always)]
+    unsafe fn store_pair_nt(dst: *mut F128, x: uint64x2_t, y: uint64x2_t) {
+        unsafe {
+            core::arch::asm!(
+                "stnp {x:q}, {y:q}, [{dst}]",
+                dst = in(reg) dst,
+                x = in(vreg) x,
+                y = in(vreg) y,
+                options(nostack, preserves_flags),
+            );
+        }
+    }
+
+    let mut p1_acc = F256Unreduced::ZERO;
+    let mut pinf_acc = F256Unreduced::ZERO;
+    let zero_q = unsafe { vdupq_n_u64(0) };
+    let a_in_ptr = a_in.as_ptr();
+    let b_in_ptr = b_in.as_ptr();
+    let a_out_ptr = a_out.as_mut_ptr();
+    let b_out_ptr = b_out.as_mut_ptr();
+    let eq_ptr = eq_lo.as_ptr();
+    let n_blocks = eq_lo.len() / GROUPS_PER_BLOCK;
+
+    for block in 0..n_blocks {
+        let eq_base = block * GROUPS_PER_BLOCK;
+        let in_base = 4 * eq_base;
+        let out_base = 2 * eq_base;
+
+        // All four inputs are potentially nonzero in these groups. The bound
+        // excludes the ranked boundary, so this hot loop has no padding test.
+        for group in 0..FULL_GROUPS {
+            let i = in_base + 4 * group;
+            let o = out_base + 2 * group;
+            unsafe {
+                let a_even_0 = *a_in_ptr.add(i);
+                let a_odd_0 = *a_in_ptr.add(i + 1);
+                let a_even_1 = *a_in_ptr.add(i + 2);
+                let a_odd_1 = *a_in_ptr.add(i + 3);
+                let b_even_0 = *b_in_ptr.add(i);
+                let b_odd_0 = *b_in_ptr.add(i + 1);
+                let b_even_1 = *b_in_ptr.add(i + 2);
+                let b_odd_1 = *b_in_ptr.add(i + 3);
+
+                let a0 = a_even_0 + r_fold * (a_even_0 + a_odd_0);
+                let a1 = a_even_1 + r_fold * (a_even_1 + a_odd_1);
+                let b0 = b_even_0 + r_fold * (b_even_0 + b_odd_0);
+                let b1 = b_even_1 + r_fold * (b_even_1 + b_odd_1);
+
+                store_pair_nt(
+                    a_out_ptr.add(o),
+                    core::mem::transmute::<F128, uint64x2_t>(a0),
+                    core::mem::transmute::<F128, uint64x2_t>(a1),
+                );
+                store_pair_nt(
+                    b_out_ptr.add(o),
+                    core::mem::transmute::<F128, uint64x2_t>(b0),
+                    core::mem::transmute::<F128, uint64x2_t>(b1),
+                );
+
+                let eq_l = *eq_ptr.add(eq_base + group);
+                p1_acc ^= eq_l.mul_unreduced(a1 * b1);
+                pinf_acc ^= eq_l.mul_unreduced((a0 + a1) * (b0 + b1));
+            }
+        }
+
+        // Only record 60 may be nonzero. Ignore the guaranteed-zero records
+        // 61..63 even if their scratch slots are poisoned, zero-store output
+        // record 31, omit g1, and keep only g_inf = eq * a0 * b0.
+        let i = in_base + 4 * FULL_GROUPS;
+        let o = out_base + 2 * FULL_GROUPS;
+        unsafe {
+            let a_even_0 = *a_in_ptr.add(i);
+            let b_even_0 = *b_in_ptr.add(i);
+            let a0 = a_even_0 + r_fold * a_even_0;
+            let b0 = b_even_0 + r_fold * b_even_0;
+            store_pair_nt(
+                a_out_ptr.add(o),
+                core::mem::transmute::<F128, uint64x2_t>(a0),
+                zero_q,
+            );
+            store_pair_nt(
+                b_out_ptr.add(o),
+                core::mem::transmute::<F128, uint64x2_t>(b0),
+                zero_q,
+            );
+
+            let eq_l = *eq_ptr.add(eq_base + FULL_GROUPS);
+            pinf_acc ^= eq_l.mul_unreduced(a0 * b0);
+        }
+    }
+
+    (p1_acc.reduce(), pinf_acc.reduce())
+}
+
 /// Fuse one multilinear tail fold with construction of the following round's
 /// message. The previous AArch64 path first streamed all of `a_in`/`b_in` into
 /// `a_out`/`b_out`, then immediately reread both outputs in a second pass.
@@ -1575,6 +2109,90 @@ mod tests {
         z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
         z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
         z ^ (z >> 31)
+    }
+
+    fn random_f128(state: &mut u64) -> F128 {
+        F128::new(splitmix64(state), splitmix64(state))
+    }
+
+    #[test]
+    fn ranked_padprop_stage2_matches_honest_legacy_and_ignores_padding_poison() {
+        const N_BLOCKS: usize = 3;
+        const INPUT_WIDTH: usize = 64;
+        const USEFUL_INPUTS: usize = 61;
+        const OUTPUT_WIDTH: usize = 32;
+        const OUTPUT_POISON: F128 = F128 {
+            lo: 0x5a5a_5a5a_5a5a_5a5a,
+            hi: 0xa5a5_a5a5_a5a5_a5a5,
+        };
+
+        let mut state = 0x5041_4450_524f_5032;
+        let mut a_in = vec![F128::ZERO; N_BLOCKS * INPUT_WIDTH];
+        let mut b_in = vec![F128::ZERO; N_BLOCKS * INPUT_WIDTH];
+        for block in 0..N_BLOCKS {
+            for x in 0..USEFUL_INPUTS {
+                a_in[block * INPUT_WIDTH + x] = random_f128(&mut state);
+                b_in[block * INPUT_WIDTH + x] = random_f128(&mut state);
+            }
+        }
+        let eq_lo: Vec<F128> = (0..N_BLOCKS * 16)
+            .map(|_| random_f128(&mut state))
+            .collect();
+        let r_fold = random_f128(&mut state);
+
+        // Honest-zero oracle: the generic incumbent must agree on every
+        // output record and both message elements.
+        let mut legacy_a = vec![OUTPUT_POISON; N_BLOCKS * OUTPUT_WIDTH];
+        let mut legacy_b = vec![OUTPUT_POISON; N_BLOCKS * OUTPUT_WIDTH];
+        let legacy_msg = fold_and_message_body::<true>(
+            &a_in,
+            &b_in,
+            &mut legacy_a,
+            &mut legacy_b,
+            r_fold,
+            &eq_lo,
+        );
+        let mut specialized_a = vec![OUTPUT_POISON; N_BLOCKS * OUTPUT_WIDTH];
+        let mut specialized_b = vec![OUTPUT_POISON; N_BLOCKS * OUTPUT_WIDTH];
+        let specialized_msg = fold_and_message_ranked_padprop_stage2_body(
+            &a_in,
+            &b_in,
+            &mut specialized_a,
+            &mut specialized_b,
+            r_fold,
+            &eq_lo,
+        );
+        assert_eq!(specialized_a, legacy_a);
+        assert_eq!(specialized_b, legacy_b);
+        assert_eq!(specialized_msg, legacy_msg);
+
+        // Poison the three guaranteed-zero inputs in every block. The ranked
+        // kernel must not consume them and must still overwrite stale output.
+        let mut poison_a = a_in.clone();
+        let mut poison_b = b_in.clone();
+        for block in 0..N_BLOCKS {
+            for x in USEFUL_INPUTS..INPUT_WIDTH {
+                poison_a[block * INPUT_WIDTH + x] = random_f128(&mut state);
+                poison_b[block * INPUT_WIDTH + x] = random_f128(&mut state);
+            }
+        }
+        let mut poison_out_a = vec![OUTPUT_POISON; N_BLOCKS * OUTPUT_WIDTH];
+        let mut poison_out_b = vec![OUTPUT_POISON; N_BLOCKS * OUTPUT_WIDTH];
+        let poison_msg = fold_and_message_ranked_padprop_stage2_body(
+            &poison_a,
+            &poison_b,
+            &mut poison_out_a,
+            &mut poison_out_b,
+            r_fold,
+            &eq_lo,
+        );
+        assert_eq!(poison_out_a, legacy_a);
+        assert_eq!(poison_out_b, legacy_b);
+        assert_eq!(poison_msg, legacy_msg);
+        for block in 0..N_BLOCKS {
+            assert_eq!(poison_out_a[block * OUTPUT_WIDTH + 31], F128::ZERO);
+            assert_eq!(poison_out_b[block * OUTPUT_WIDTH + 31], F128::ZERO);
+        }
     }
 
     #[test]
