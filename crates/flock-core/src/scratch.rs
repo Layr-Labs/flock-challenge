@@ -89,6 +89,24 @@ pub fn take_f128(n: usize) -> Vec<F128> {
     crate::alloc_uninit_vec(n)
 }
 
+/// Take initialized length-`n` storage, preserving stale contents when a
+/// resident allocation is available and zeroing only a fresh fallback.
+///
+/// This is the allocation seam for sparse producers: every element is a valid
+/// `F128`, but proven-dead regions need not be rewritten on each use.
+pub(crate) fn take_f128_initialized(n: usize) -> Vec<F128> {
+    if let Some(v) = try_take_pinned_f128(n) {
+        return v;
+    }
+    if let Some(v) = try_take_pinned2_f128(n) {
+        return v;
+    }
+    if let Some(v) = try_take_f128(n) {
+        return v;
+    }
+    vec![F128::ZERO; n]
+}
+
 /// [`take_f128`] variant that never returns a pinned allocation. The pinned
 /// slots carry process-lifetime external no-copy Metal views; a caller that
 /// intends to create its OWN no-copy view over the returned buffer (the

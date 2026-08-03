@@ -596,9 +596,31 @@ impl Drop for Round1AbInner {
 /// written are identical.
 pub const ENV_NO_ZC_AB_PRE_NT: &str = "FLOCK_NO_ZC_AB_PRE_NT";
 
+/// Restore the untouched general AB producer.  The ranked arm processes one
+/// complete BLAKE3 block (`[16, 15]` live medium rows) per work item, so the
+/// padding row is never written and the hot loop needs no count-table lookup.
+pub const ENV_NO_ZC_AB_PRE_RANKED_BLOCKS: &str = "FLOCK_NO_ZC_AB_PRE_RANKED_BLOCKS";
+
 fn ab_pre_nt_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os(ENV_NO_ZC_AB_PRE_NT).is_none())
+}
+
+#[inline]
+fn ab_pre_ranked_blocks_from_value(value: Option<&std::ffi::OsStr>) -> bool {
+    value != Some(std::ffi::OsStr::new("1"))
+}
+
+#[inline]
+fn ab_pre_ranked_blocks_enabled(m: usize, k_skip: usize, padding: &PaddingSpec) -> bool {
+    cfg!(all(target_os = "macos", target_arch = "aarch64"))
+        && m == 32
+        && k_skip == K_SKIP
+        && padding.k_log == 14
+        && padding.useful_bits_per_block == 15_409
+        && ab_pre_ranked_blocks_from_value(
+            std::env::var_os(ENV_NO_ZC_AB_PRE_RANKED_BLOCKS).as_deref(),
+        )
 }
 
 /// Non-temporal 64-byte store (L1 stack bounce → `stnp` pair burst), the same
@@ -644,15 +666,195 @@ pub fn precompute_round1_ab_inner_packed_padded(
     inv_table: &InvNttTableByteSingleGf8,
     padding: &PaddingSpec,
 ) -> Round1AbInner {
-    precompute_round1_ab_inner_packed_padded_with_flavor(
-        a_packed,
-        b_packed,
-        m,
-        k_skip,
-        inv_table,
-        padding,
-        ab_pre_nt_enabled(),
+    let nt = ab_pre_nt_enabled();
+    if ab_pre_ranked_blocks_enabled(m, k_skip, padding) {
+        precompute_round1_ab_inner_blake3_blocks_with_flavor(
+            a_packed, b_packed, m, k_skip, inv_table, padding, nt,
+        )
+    } else {
+        // Keep the rollback's producer body identical to the parent.  The
+        // policy decision happens before this call and never enters its hot
+        // `par_chunks_mut` closure.
+        precompute_round1_ab_inner_packed_padded_with_flavor(
+            a_packed, b_packed, m, k_skip, inv_table, padding, nt,
+        )
+    }
+}
+
+/// Produce one BLAKE3 8192-bit window with compile-time live-row and store
+/// policies.  `WITHIN=0` has 16 rows; `WITHIN=1` has 15, leaving its last
+/// 64-byte padding row untouched.  Const specialization removes all policy
+/// branches from the loop body while preserving the incumbent kernels.
+#[inline(always)]
+#[allow(clippy::too_many_arguments)]
+fn produce_round1_ab_blake3_window<
+    const WITHIN: usize,
+    const N_B_MED: usize,
+    const NT: bool,
+>(
+    a_packed: &[u8],
+    b_packed: &[u8],
+    inv_table: &InvNttTableByteSingleGf8,
+    chunk_byte_base: usize,
+    out_outer: &mut [u8],
+    a_col: &mut [F8; ELL],
+    b_col: &mut [F8; ELL],
+    static_b_context: Option<kernels::StaticBContext>,
+) {
+    debug_assert!(WITHIN < 2);
+    debug_assert_eq!(N_B_MED, 16 - WITHIN);
+    debug_assert_eq!(out_outer.len(), (1 << N_MEDIUM) * 64);
+
+    let mut tmp = [0u8; 64];
+    for b_med in 0..N_B_MED {
+        let dst: &mut [u8; 64] = if NT {
+            &mut tmp
+        } else {
+            (&mut out_outer[b_med * 64..(b_med + 1) * 64])
+                .try_into()
+                .expect("one transformed b_med block")
+        };
+        shift_reduce_inner_ab(
+            a_packed,
+            b_packed,
+            inv_table,
+            chunk_byte_base,
+            b_med,
+            dst,
+            a_col,
+            b_col,
+            WITHIN == 0 && b_med < 2,
+            WITHIN == 1 && b_med + 1 == N_B_MED,
+            if WITHIN == 0 && b_med == 2 {
+                0x03
+            } else if WITHIN == 1 && b_med + 2 == N_B_MED {
+                0xf0
+            } else {
+                0
+            },
+            WITHIN,
+            static_b_context,
+        );
+        if NT {
+            // SAFETY: `b_med < N_B_MED <= 16`; this writes one complete live
+            // row inside the 1024-byte window.  The omitted odd row is never
+            // addressed.
+            unsafe { store_nt_64(tmp.as_ptr(), out_outer.as_mut_ptr().add(b_med * 64)) };
+        }
+    }
+}
+
+/// Ranked BLAKE3 producer.  Grouping both windows of a hash block gives the
+/// closure a fixed `[16, 15]` shape: no padding table, mask, dynamic loop
+/// bound, per-window work-item, or padding-tail store remains in the hot path.
+#[allow(clippy::too_many_arguments)]
+fn precompute_round1_ab_inner_blake3_blocks_with_flavor(
+    a_packed: &[u8],
+    b_packed: &[u8],
+    m: usize,
+    k_skip: usize,
+    inv_table: &InvNttTableByteSingleGf8,
+    padding: &PaddingSpec,
+    nt: bool,
+) -> Round1AbInner {
+    let total_bytes = (1usize << m) / 8;
+    let storage =
+        crate::scratch::take_f128_initialized(total_bytes / core::mem::size_of::<F128>());
+    precompute_round1_ab_inner_blake3_blocks_into_storage(
+        a_packed, b_packed, m, k_skip, inv_table, padding, nt, storage,
     )
+}
+
+/// Storage-injected body used by the poison oracle to prove that the sparse
+/// producer itself leaves every dead row untouched.
+#[inline(always)]
+#[allow(clippy::too_many_arguments)]
+fn precompute_round1_ab_inner_blake3_blocks_into_storage(
+    a_packed: &[u8],
+    b_packed: &[u8],
+    m: usize,
+    k_skip: usize,
+    inv_table: &InvNttTableByteSingleGf8,
+    padding: &PaddingSpec,
+    nt: bool,
+    mut storage: Vec<F128>,
+) -> Round1AbInner {
+    use rayon::prelude::*;
+
+    assert_eq!(k_skip, K_SKIP, "optimized variant is k_skip=6 only");
+    assert!(m >= padding.k_log);
+    assert_eq!(padding.k_log, 14);
+    assert_eq!(padding.useful_bits_per_block, 15_409);
+    let total_bytes = (1usize << m) / 8;
+    assert_eq!(a_packed.len(), total_bytes);
+    assert_eq!(b_packed.len(), total_bytes);
+    assert_eq!(inv_table.k, k_skip);
+    assert_eq!(total_bytes % core::mem::size_of::<F128>(), 0);
+    assert_eq!(storage.len(), total_bytes / core::mem::size_of::<F128>());
+
+    const OUTER_BYTES: usize = (1 << N_MEDIUM) * 64;
+    const BLOCK_BYTES: usize = 2 * OUTER_BYTES;
+    assert_eq!(total_bytes % BLOCK_BYTES, 0);
+    let static_b_context = kernels::prepare_static_b_context(inv_table, true);
+    let out_bytes: &mut [u8] =
+        unsafe { core::slice::from_raw_parts_mut(storage.as_mut_ptr().cast(), total_bytes) };
+
+    out_bytes
+        .par_chunks_mut(BLOCK_BYTES)
+        .enumerate()
+        .for_each_init(
+            || ([F8::ZERO; ELL], [F8::ZERO; ELL]),
+            |(a_col, b_col), (block, out_block)| {
+                let (even, odd) = out_block.split_at_mut(OUTER_BYTES);
+                let even_base = block * BLOCK_BYTES;
+                let odd_base = even_base + OUTER_BYTES;
+                if nt {
+                    produce_round1_ab_blake3_window::<0, 16, true>(
+                        a_packed,
+                        b_packed,
+                        inv_table,
+                        even_base,
+                        even,
+                        a_col,
+                        b_col,
+                        static_b_context,
+                    );
+                    produce_round1_ab_blake3_window::<1, 15, true>(
+                        a_packed,
+                        b_packed,
+                        inv_table,
+                        odd_base,
+                        odd,
+                        a_col,
+                        b_col,
+                        static_b_context,
+                    );
+                } else {
+                    produce_round1_ab_blake3_window::<0, 16, false>(
+                        a_packed,
+                        b_packed,
+                        inv_table,
+                        even_base,
+                        even,
+                        a_col,
+                        b_col,
+                        static_b_context,
+                    );
+                    produce_round1_ab_blake3_window::<1, 15, false>(
+                        a_packed,
+                        b_packed,
+                        inv_table,
+                        odd_base,
+                        odd,
+                        a_col,
+                        b_col,
+                        static_b_context,
+                    );
+                }
+            },
+        );
+
+    Round1AbInner { storage }
 }
 
 /// Store-flavor-parameterized body; the public wrapper passes the latched env
@@ -3223,6 +3425,188 @@ mod tests {
             assert_eq!(pre_s_hat_v, s_hat_v_c, "s_hat_v_c mismatch at m={m}");
             assert_eq!(pre_quad, quad, "quad mismatch at m={m}");
         }
+    }
+
+    #[test]
+    fn ab_precompute_ranked_blocks_rollback_is_exact_one() {
+        use std::ffi::OsStr;
+
+        assert!(ab_pre_ranked_blocks_from_value(None));
+        assert!(ab_pre_ranked_blocks_from_value(Some(OsStr::new(""))));
+        assert!(ab_pre_ranked_blocks_from_value(Some(OsStr::new("0"))));
+        assert!(ab_pre_ranked_blocks_from_value(Some(OsStr::new("true"))));
+        assert!(!ab_pre_ranked_blocks_from_value(Some(OsStr::new("1"))));
+    }
+
+    /// Seed every omitted row with two different byte patterns.  The sparse
+    /// producer must preserve those bytes while matching the incumbent on all
+    /// 31 live rows, and every possible round-one consumer must remain
+    /// value-identical.  Donating the buffers to compact round two then proves
+    /// that its producer overwrites the complete allocation before any read.
+    #[test]
+    fn ranked_blake3_block_producer_omits_only_unread_rows() {
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(2)
+            .stack_size(16 << 20)
+            .build()
+            .unwrap();
+        pool.install(ranked_blake3_block_producer_omits_only_unread_rows_inner);
+    }
+
+    fn ranked_blake3_block_producer_omits_only_unread_rows_inner() {
+        use crate::zerocheck::multilinear::{
+            UniSkipFoldTable, uni_skip_fold_and_round_pair_compact_padded_with_deltas,
+        };
+        use crate::zerocheck::univariate_skip::pack_bits;
+
+        const M: usize = 17;
+        const OUTER_BYTES: usize = (1 << N_MEDIUM) * 64;
+        const BLOCK_BYTES: usize = 2 * OUTER_BYTES;
+        let padding = PaddingSpec {
+            k_log: 14,
+            useful_bits_per_block: 15_409,
+        };
+        let total_bits = 1usize << M;
+        let total_bytes = total_bits / 8;
+        let mut rng = Rng::new(0xB10C_15A1);
+        let mut a = rng.bits(total_bits);
+        let mut b = rng.bits(total_bits);
+        let mut c = rng.bits(total_bits);
+        let block_size = 1usize << padding.k_log;
+        for block in 0..(total_bits / block_size) {
+            let tail = block * block_size + padding.useful_bits_per_block;
+            let end = (block + 1) * block_size;
+            a[tail..end].fill(false);
+            b[tail..end].fill(false);
+            c[tail..end].fill(false);
+        }
+        let (a, b, c) = (pack_bits(&a), pack_bits(&b), pack_bits(&c));
+        let inv_table = make_inv_table();
+        let r = build_protocol_r(M, &rng.f128_vec(M - K_SKIP - N_INNER));
+
+        let full = precompute_round1_ab_inner_packed_padded_with_flavor(
+            &a, &b, M, K_SKIP, &inv_table, &padding, false,
+        );
+        let poison_storage = |byte: u8| {
+            let word = u64::from_ne_bytes([byte; 8]);
+            vec![F128 { lo: word, hi: word }; total_bytes / core::mem::size_of::<F128>()]
+        };
+        let sparse_a5 = precompute_round1_ab_inner_blake3_blocks_into_storage(
+            &a,
+            &b,
+            M,
+            K_SKIP,
+            &inv_table,
+            &padding,
+            false,
+            poison_storage(0xa5),
+        );
+        let sparse_5a = precompute_round1_ab_inner_blake3_blocks_into_storage(
+            &a,
+            &b,
+            M,
+            K_SKIP,
+            &inv_table,
+            &padding,
+            true,
+            poison_storage(0x5a),
+        );
+
+        for (block, ((full_block, a5_block), x5a_block)) in full
+            .as_bytes()
+            .chunks_exact(BLOCK_BYTES)
+            .zip(sparse_a5.as_bytes().chunks_exact(BLOCK_BYTES))
+            .zip(sparse_5a.as_bytes().chunks_exact(BLOCK_BYTES))
+            .enumerate()
+        {
+            let live = OUTER_BYTES + 15 * 64;
+            assert_eq!(&a5_block[..live], &full_block[..live], "plain live rows, block {block}");
+            assert_eq!(&x5a_block[..live], &full_block[..live], "NT live rows, block {block}");
+            assert!(
+                a5_block[live..].iter().all(|&byte| byte == 0xa5),
+                "plain sparse producer touched the dead row in block {block}"
+            );
+            assert!(
+                x5a_block[live..].iter().all(|&byte| byte == 0x5a),
+                "NT sparse producer touched the dead row in block {block}"
+            );
+        }
+
+        let full_ab = round1_shift_reduce_ab_packed_padded_with_precomputed(
+            &full, M, K_SKIP, &r, &padding,
+        );
+        let sparse_ab = round1_shift_reduce_ab_packed_padded_with_precomputed(
+            &sparse_a5,
+            M,
+            K_SKIP,
+            &r,
+            &padding,
+        );
+        assert_eq!(sparse_ab, full_ab, "AB-only consumer read an omitted row");
+
+        let full_combined = round1_shift_reduce_extract_c_packed_padded_with_precomputed_ab(
+            &full, &c, M, K_SKIP, &r, &inv_table, &padding,
+        );
+        let sparse_combined = round1_shift_reduce_extract_c_packed_padded_with_precomputed_ab(
+            &sparse_a5,
+            &c,
+            M,
+            K_SKIP,
+            &r,
+            &inv_table,
+            &padding,
+        );
+        assert_eq!(
+            sparse_combined, full_combined,
+            "combined AB/C consumer read an omitted row"
+        );
+
+        let full_fold4 =
+            round1_shift_reduce_extract_c_packed_padded_with_precomputed_ab_fold4_n_hi(
+                &full, &c, M, K_SKIP, &r, &inv_table, &padding, 5, false, true,
+            );
+        let sparse_fold4 =
+            round1_shift_reduce_extract_c_packed_padded_with_precomputed_ab_fold4_n_hi(
+                &sparse_a5,
+                &c,
+                M,
+                K_SKIP,
+                &r,
+                &inv_table,
+                &padding,
+                5,
+                false,
+                true,
+            );
+        assert_eq!(sparse_fold4, full_fold4, "Fold4 consumer read an omitted row");
+
+        let table = UniSkipFoldTable::new(K_SKIP, rng.f128());
+        let mlv_challenges = rng.f128_vec(M - K_SKIP);
+        let run_round2 = |donor: Round1AbInner| {
+            uni_skip_fold_and_round_pair_compact_padded_with_deltas(
+                &a,
+                &b,
+                M,
+                K_SKIP,
+                &table,
+                &mlv_challenges,
+                &padding,
+                Some(donor.into_scratch_bytes()),
+            )
+        };
+        let (compact_full, msg1_full, msgi_full) = run_round2(full);
+        let (compact_a5, msg1_a5, msgi_a5) = run_round2(sparse_a5);
+        let (compact_5a, msg1_5a, msgi_5a) = run_round2(sparse_5a);
+        assert_eq!((msg1_a5, msgi_a5), (msg1_full, msgi_full));
+        assert_eq!((msg1_5a, msgi_5a), (msg1_full, msgi_full));
+        assert_eq!(compact_a5.anchors, compact_full.anchors);
+        assert_eq!(compact_5a.anchors, compact_full.anchors);
+        assert_eq!(&*compact_a5.deltas, &*compact_full.deltas);
+        assert_eq!(&*compact_5a.deltas, &*compact_full.deltas);
+
+        compact_full.recycle();
+        compact_a5.recycle();
+        compact_5a.recycle();
     }
 
     #[test]
