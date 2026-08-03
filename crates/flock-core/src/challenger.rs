@@ -496,8 +496,9 @@ impl Challenger for FsChallenger {
                         // The scoped thread parks in `broadcast` while the
                         // E-workers drain; the scope join bounds the tail wait
                         // at one chunk on one efficiency core.
-                        s.spawn(|| ep.broadcast(|_| worker()));
+                        let helpers = s.spawn(|| ep.broadcast(|_| worker()));
                         drain_main();
+                        grind_join_first_check(&helpers);
                     }),
                     None => drain_main(),
                 }
@@ -698,8 +699,9 @@ fn cpu_blake3_pow_window_inner(
     };
     match crate::epool::epool().filter(|_| main_threads > 1 && n_chunks >= 16) {
         Some(ep) => std::thread::scope(|scope| {
-            scope.spawn(|| ep.broadcast(|_| worker()));
+            let helpers = scope.spawn(|| ep.broadcast(|_| worker()));
             drain_main();
+            grind_join_first_check(&helpers);
         }),
         None => drain_main(),
     }
@@ -767,6 +769,42 @@ fn gpu_grind_calibration(state_digest: &[u8; 32]) -> Result<Vec<Option<u64>>, St
 /// Persistent single-thread GPU-dispatch worker for the hybrid grind.
 ///
 /// The grind sits on the transcript's serial spine; the incumbent hybrid path
+/// Bounded first-check before a scoped-thread join, applied at the grind's
+/// E-core helper-pool broadcast joins.
+///
+/// After `drain_main` returns, the scope's implicit join waits on the helper
+/// thread parked in `broadcast`. When the E-workers have already finished — the
+/// common case, since the join is documented as bounding the tail at one chunk
+/// on one efficiency core — that join still pays a futex park plus a completion
+/// wake for nothing. Poll `is_finished` first (free when already done), then
+/// yield for a bounded budget, then fall through to the ordinary implicit join.
+///
+/// `yield_now`, not `spin_loop`: a lagging helper is a sibling CPU thread that
+/// needs its core, and the caller has no work left to overlap.
+///
+/// This is the same wait class that promoted twice on this benchmark — at the
+/// deferred lincheck stripe join (newjordan `b6e12da`, +0.14%) and at the grind
+/// joins (newjordan `87353cc`). Their grind version also covered the per-scan
+/// GPU-PoW scan join, which the persistent grind-dispatch worker in this tree
+/// already removes outright; this covers the half that survives it. Note that
+/// the class does **not** apply to `rayon::join`, whose waiter spins on a
+/// SpinLatch and never parks. `FLOCK_NO_GRIND_JOIN_SPIN=1` restores the exact
+/// incumbent join.
+fn grind_join_first_check<T>(handle: &std::thread::ScopedJoinHandle<'_, T>) {
+    if handle.is_finished() {
+        return;
+    }
+    static DISABLED: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_GRIND_JOIN_SPIN").is_some());
+    if *DISABLED {
+        return;
+    }
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(2);
+    while !handle.is_finished() && std::time::Instant::now() < deadline {
+        std::thread::yield_now();
+    }
+}
+
 /// `thread::scope`-spawns one OS thread per iteration (~11 per ranked prove)
 /// and that spawn latency delays the GPU launch on the spine. A reused thread
 /// (one per process, woken by an mpsc channel) removes the spawn cost and
