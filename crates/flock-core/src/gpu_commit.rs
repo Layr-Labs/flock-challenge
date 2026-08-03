@@ -640,6 +640,16 @@ pub(crate) fn gpu_mixed_final_enabled() -> bool {
     *ON.get_or_init(|| std::env::var_os(ENV_NO_GPU_MIXED_FINAL).is_none())
 }
 
+/// Disable the ranked hybrid GPU prefix's leafless Merkle layout. The
+/// candidate retains all parent nodes but omits leaf hashes that can be
+/// regenerated from the still-retained codeword for the small L0 multi-proof.
+pub const ENV_NO_GPU_LEAFLESS_L0: &str = "FLOCK_NO_GPU_LEAFLESS_L0";
+
+fn gpu_leafless_l0_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os(ENV_NO_GPU_LEAFLESS_L0).is_none())
+}
+
 /// Wall-clock margin the GPU must beat during the warmup dual-run: latch on
 /// only when `gpu_wall * 1.10 <= cpu_wall`.
 const LATCH_MARGIN: f64 = 1.10;
@@ -743,6 +753,10 @@ pub struct GpuCodeword {
 pub struct GpuMerkleTree {
     ptr: *const crate::merkle::Hash,
     len: usize,
+    /// Prefix of leaf slots intentionally absent from the backing tree. The
+    /// corresponding codeword rows remain available and opening regenerates
+    /// only the sibling leaves it actually needs.
+    leafless_prefix: usize,
 }
 unsafe impl Send for GpuMerkleTree {}
 unsafe impl Sync for GpuMerkleTree {}
@@ -754,8 +768,20 @@ impl GpuMerkleTree {
         not(all(target_os = "macos", target_arch = "aarch64")),
         allow(dead_code)
     )]
-    pub(crate) unsafe fn new(ptr: *const crate::merkle::Hash, len: usize) -> Self {
-        Self { ptr, len }
+    pub(crate) unsafe fn new(
+        ptr: *const crate::merkle::Hash,
+        len: usize,
+        leafless_prefix: usize,
+    ) -> Self {
+        Self {
+            ptr,
+            len,
+            leafless_prefix,
+        }
+    }
+
+    pub(crate) fn leafless_prefix(&self) -> usize {
+        self.leafless_prefix
     }
 }
 impl core::ops::Deref for GpuMerkleTree {
@@ -2005,6 +2031,46 @@ kernel void parent_hash3(device const uint* children [[buffer(0)]],
     /// reuse the rejected device-table preload design: every group constructs
     /// its own compact 11-table image directly from the existing raw twiddle
     /// buffer, then executes explicit zero/nonzero butterflies.
+    // Supplemental only: the checked-in metallib remains the incumbent. This
+    // kernel hashes two adjacent 1 KiB leaves and immediately forms their
+    // level-one parent, so the leaf level never reaches device memory.
+    const LEAFLESS_L0_MSL_SOURCE: &str = r#"
+kernel void leaf_hash_parent(device const uint* codeword [[buffer(0)]],
+                             device uint* parents1      [[buffer(1)]],
+                             uint id [[thread_position_in_grid]])
+{
+    uint left[8];
+    uint right[8];
+    device const uint* leaf0 = codeword + id * 512u;
+    for (uint i = 0u; i < 8u; i++) left[i] = B3_IV[i];
+    for (uint b = 0u; b < 16u; b++) {
+        uint block[16];
+        for (uint i = 0u; i < 16u; i++) block[i] = leaf0[b * 16u + i];
+        b3_compress(left, block, 64u,
+                    (b == 0u ? B3_CHUNK_START : 0u) |
+                    (b == 15u ? B3_CHUNK_END : 0u));
+    }
+    device const uint* leaf1 = leaf0 + 256u;
+    for (uint i = 0u; i < 8u; i++) right[i] = B3_IV[i];
+    for (uint b = 0u; b < 16u; b++) {
+        uint block[16];
+        for (uint i = 0u; i < 16u; i++) block[i] = leaf1[b * 16u + i];
+        b3_compress(right, block, 64u,
+                    (b == 0u ? B3_CHUNK_START : 0u) |
+                    (b == 15u ? B3_CHUNK_END : 0u));
+    }
+    uint block[16];
+    for (uint i = 0u; i < 8u; i++) {
+        block[i] = left[i];
+        block[8u + i] = right[i];
+    }
+    uint parent[8];
+    for (uint i = 0u; i < 8u; i++) parent[i] = B3_IV[i];
+    b3_compress(parent, block, 64u, B3_PARENT);
+    for (uint i = 0u; i < 8u; i++) parents1[id * 8u + i] = parent[i];
+}
+"#;
+
     const FROM_Z_ZERO_ROOT_MSL_SOURCE: &str = r#"
 #include <metal_stdlib>
 using namespace metal;
@@ -3329,7 +3395,53 @@ kernel void blake3_pow_scan(
                 leaf_start,
                 subtree_leaves,
                 super::select_gpu_parent3(n_leaves_total, super::gpu_parent3_enabled()),
+                false,
             )
+        }
+    }
+
+    /// Encode an aligned subtree while retaining only level-one-and-up tree
+    /// nodes. Leaf hashes are consumed directly into their parents and are
+    /// regenerated from the codeword only for L0 proof siblings.
+    pub(crate) unsafe fn encode_merkle_subtree_leafless(
+        gpu: &Gpu,
+        enc: Id,
+        codeword_buf: Id,
+        tree_buf: Id,
+        n_leaves_total: usize,
+        leaf_start: usize,
+        subtree_leaves: usize,
+    ) -> Result<(), String> {
+        let Some(pso) = leafless_l0_pso(gpu) else {
+            return Err("leafless L0 pipeline unavailable".into());
+        };
+        debug_assert!(subtree_leaves.is_power_of_two());
+        debug_assert_eq!(leaf_start % subtree_leaves, 0);
+        debug_assert!(subtree_leaves >= 2);
+        unsafe {
+            gpu.set_pipeline(enc, pso);
+            gpu.set_buffer(enc, codeword_buf, leaf_start * 1024, 0);
+            gpu.set_buffer(
+                enc,
+                tree_buf,
+                (n_leaves_total + leaf_start / 2) * 32,
+                1,
+            );
+            let parents = subtree_leaves / 2;
+            let tpg = 128u64.min(parents as u64);
+            gpu.dispatch(enc, (parents as u64).div_ceil(tpg), tpg);
+            encode_merkle_subtree_impl(
+                gpu,
+                enc,
+                codeword_buf,
+                tree_buf,
+                n_leaves_total,
+                leaf_start,
+                subtree_leaves,
+                super::select_gpu_parent3(n_leaves_total, super::gpu_parent3_enabled()),
+                true,
+            );
+            Ok(())
         }
     }
 
@@ -3342,20 +3454,31 @@ kernel void blake3_pow_scan(
         leaf_start: usize,
         subtree_leaves: usize,
         parent3: bool,
+        leafless_start: bool,
     ) {
         debug_assert!(subtree_leaves.is_power_of_two());
         debug_assert_eq!(leaf_start % subtree_leaves, 0);
         unsafe {
-            gpu.set_pipeline(enc, gpu.pso_leaf);
-            gpu.set_buffer(enc, codeword_buf, leaf_start * 1024, 0);
-            gpu.set_buffer(enc, tree_buf, leaf_start * 32, 1);
-            let tpg = 256u64.min(subtree_leaves as u64);
-            gpu.dispatch(enc, subtree_leaves as u64 / tpg, tpg);
+            if !leafless_start {
+                gpu.set_pipeline(enc, gpu.pso_leaf);
+                gpu.set_buffer(enc, codeword_buf, leaf_start * 1024, 0);
+                gpu.set_buffer(enc, tree_buf, leaf_start * 32, 1);
+                let tpg = 256u64.min(subtree_leaves as u64);
+                gpu.dispatch(enc, subtree_leaves as u64 / tpg, tpg);
+            }
 
-            let mut level_start = 0usize; // global node index of level base
-            let mut level_len = n_leaves_total;
-            let mut local_start = leaf_start;
-            let mut local_len = subtree_leaves;
+            let mut level_start = if leafless_start { n_leaves_total } else { 0usize };
+            let mut level_len = if leafless_start {
+                n_leaves_total / 2
+            } else {
+                n_leaves_total
+            };
+            let mut local_start = if leafless_start { leaf_start / 2 } else { leaf_start };
+            let mut local_len = if leafless_start {
+                subtree_leaves / 2
+            } else {
+                subtree_leaves
+            };
 
             // Consume three parent levels per dispatch while all three local
             // ranges contain whole 256-child groups. Each output retains its
@@ -3559,6 +3682,129 @@ kernel void blake3_pow_scan(
 
     use crate::merkle::Hash;
     use std::sync::Mutex;
+
+    static LEAFLESS_L0_PSO: std::sync::OnceLock<Result<usize, String>> =
+        std::sync::OnceLock::new();
+    static LEAFLESS_L0_VERIFIED: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
+
+    unsafe fn compile_leafless_l0_pipeline(gpu: &Gpu) -> Result<Id, String> {
+        unsafe {
+            let source = format!("{MSL_SOURCE}\n{LEAFLESS_L0_MSL_SOURCE}");
+            let src = gpu.api.nsstring(&source)?;
+            let mut err: Id = NIL;
+            let library: Id = send!(
+                gpu.api,
+                unsafe extern "C" fn(Id, Sel, Id, Id, *mut Id) -> Id,
+                gpu.device,
+                c"newLibraryWithSource:options:error:",
+                src,
+                NIL,
+                &mut err
+            );
+            if library.is_null() {
+                return Err(format!(
+                    "leafless L0 shader compile failed: {}",
+                    gpu.api.error_string(err)
+                ));
+            }
+            let name = gpu.api.nsstring("leaf_hash_parent")?;
+            let function: Id = send!(
+                gpu.api,
+                unsafe extern "C" fn(Id, Sel, Id) -> Id,
+                library,
+                c"newFunctionWithName:",
+                name
+            );
+            if function.is_null() {
+                send!(gpu.api, unsafe extern "C" fn(Id, Sel) -> Id, library, c"release");
+                return Err("leafless L0 kernel not found".into());
+            }
+            let mut perr: Id = NIL;
+            let pso: Id = send!(
+                gpu.api,
+                unsafe extern "C" fn(Id, Sel, Id, *mut Id) -> Id,
+                gpu.device,
+                c"newComputePipelineStateWithFunction:error:",
+                function,
+                &mut perr
+            );
+            send!(gpu.api, unsafe extern "C" fn(Id, Sel) -> Id, function, c"release");
+            send!(gpu.api, unsafe extern "C" fn(Id, Sel) -> Id, library, c"release");
+            if pso.is_null() {
+                Err(format!("leafless L0 pipeline: {}", gpu.api.error_string(perr)))
+            } else {
+                Ok(pso)
+            }
+        }
+    }
+
+    fn leafless_l0_pso(gpu: &Gpu) -> Option<Id> {
+        if !super::gpu_leafless_l0_enabled() {
+            return None;
+        }
+        LEAFLESS_L0_PSO
+            .get_or_init(|| unsafe { compile_leafless_l0_pipeline(gpu).map(|pso| pso as usize) })
+            .as_ref()
+            .ok()
+            .copied()
+            .map(|pso| pso as Id)
+    }
+
+    fn leafless_l0_is_verified() -> bool {
+        super::gpu_leafless_l0_enabled()
+            && LEAFLESS_L0_VERIFIED.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    fn publish_leafless_l0_verdict(verified: bool) {
+        LEAFLESS_L0_VERIFIED.store(verified, std::sync::atomic::Ordering::Release);
+    }
+
+    /// Warmup-only exact check for the leafless graph. The ordinary full GPU
+    /// graph has already produced `reference_tree`; replay the actual hybrid
+    /// split with leafless mode temporarily armed and compare every retained
+    /// parent node. Leaf-level proof siblings are regenerated by the CPU from
+    /// the codeword, so parent equality is the complete commitment contract.
+    unsafe fn validate_leafless_l0(
+        gpu: &Gpu,
+        latched: &Latched,
+        reference_tree: &[Hash],
+        log_d: usize,
+        n_leaves: usize,
+    ) -> bool {
+        if !super::gpu_leafless_l0_enabled() || leafless_l0_pso(gpu).is_none() {
+            return false;
+        }
+        let Some((_, _, z_buf)) = latched.wraps.first().copied() else {
+            return false;
+        };
+        publish_leafless_l0_verdict(true);
+        let run = unsafe {
+            run_commit_graph_from_z_hybrid(
+                gpu,
+                z_buf,
+                latched.staging,
+                latched.tw_buf,
+                latched.tree_buf,
+                log_d,
+                n_leaves,
+                hybrid_cpu_sixteenths(),
+            )
+        };
+        publish_leafless_l0_verdict(false);
+        if run.is_err() {
+            return false;
+        }
+        unsafe {
+            bytes_equal_parallel(
+                gpu.buffer_contents(latched.tree_buf).add(n_leaves * 32),
+                core::slice::from_raw_parts(
+                    reference_tree[n_leaves..].as_ptr().cast::<u8>(),
+                    (n_leaves - 1) * 32,
+                ),
+            )
+        }
+    }
 
     /// Persistent Metal state owned by the latched-on path.
     struct Latched {
@@ -4207,7 +4453,13 @@ kernel void blake3_pow_scan(
                 while start % size != 0 {
                     size >>= 1;
                 }
-                encode_merkle_subtree(gpu, enc, staging, tree_buf, n_leaves, start, size);
+                if leafless_l0_is_verified() {
+                    encode_merkle_subtree_leafless(
+                        gpu, enc, staging, tree_buf, n_leaves, start, size,
+                    )?;
+                } else {
+                    encode_merkle_subtree(gpu, enc, staging, tree_buf, n_leaves, start, size);
+                }
                 start += size;
             }
             gpu.end_encoding(enc);
@@ -5586,12 +5838,23 @@ kernel void blake3_pow_scan(
                 let z_pinned = !super::gpu_z_pin_enabled()
                     || crate::scratch::pin_f128_allocation(z_packed);
                 if deterministic && sane && z_pinned {
+                    let leafless_ok = unsafe {
+                        validate_leafless_l0(
+                            gpu().expect("gpu() succeeded during warmup_gpu_run"),
+                            &run.latched,
+                            &run.gpu_tree,
+                            params.k_code(),
+                            params.n_leaves(),
+                        )
+                    };
+                    publish_leafless_l0_verdict(leafless_ok);
                     if dbg {
                         eprintln!(
                             "[gpu-commit] static warmup latch: gpu {:.2} ms, \
                              root-deterministic -> latched ON (k deferred to exact replay)",
                             run.gpu_wall_ms,
                         );
+                        eprintln!("[gpu-commit] leafless L0 parent-exact={leafless_ok}");
                     }
                     // Deliberately DO NOT satisfy the ranked exact-contention
                     // tune and DO NOT store a k: the outer commit/AB join
@@ -5857,8 +6120,17 @@ kernel void blake3_pow_scan(
         let graph_ms = t0.elapsed().as_secs_f64() * 1e3;
         // Zero-copy: opening only needs a query-dependent subset of the 64 MiB
         // tree; keep it in the persistent shared Metal buffer.
+        let leafless_prefix = if leafless_l0_is_verified() && k_cpu16 > 0 {
+            (16 - k_cpu16) * (n_leaves / 16)
+        } else {
+            0
+        };
         let tree = unsafe {
-            super::GpuMerkleTree::new(gpu.buffer_contents(tree_buf).cast::<Hash>(), total_nodes)
+            super::GpuMerkleTree::new(
+                gpu.buffer_contents(tree_buf).cast::<Hash>(),
+                total_nodes,
+                leafless_prefix,
+            )
         };
         if std::env::var_os("FLOCK_COMMIT_TIMING").is_some() || debug_enabled() {
             eprintln!("[commit-timing] gpu-commit: graph {graph_ms:.2} ms + zero-copy tree");
@@ -6036,6 +6308,7 @@ kernel void blake3_pow_scan(
             super::GpuMerkleTree::new(
                 stream.gpu.buffer_contents(stream.tree_buf).cast::<Hash>(),
                 total_nodes,
+                0,
             )
         };
         if std::env::var_os("FLOCK_COMMIT_TIMING").is_some() || debug_enabled() {

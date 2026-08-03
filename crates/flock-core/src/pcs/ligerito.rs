@@ -4384,6 +4384,104 @@ fn merkle_multi_proof_for(tree: &[Hash], block_len: usize, queries: &[usize]) ->
     merkle::merkle_multi_proof(tree, block_len, queries)
 }
 
+/// L0's ranked GPU prefix may retain only parent levels. The rows themselves
+/// stay in the codeword, so a leaf-level sibling absent from the tree can be
+/// regenerated on demand. The normal octopus traversal and output order are
+/// otherwise identical to [`merkle_multi_proof_for`].
+fn merkle_multi_proof_for_leafless_prefix(
+    tree: &[Hash],
+    codeword: &[F128],
+    block_len: usize,
+    queries: &[usize],
+    leafless_prefix: usize,
+) -> Vec<Hash> {
+    if leafless_prefix == 0 {
+        return merkle_multi_proof_for(tree, block_len, queries);
+    }
+    assert!(block_len.is_power_of_two() && block_len > 0);
+    assert_eq!(tree.len(), 2 * block_len - 1);
+    assert_eq!(codeword.len() % block_len, 0);
+    if queries.is_empty() || block_len == 1 {
+        return Vec::new();
+    }
+
+    let leafless_prefix = leafless_prefix.min(block_len);
+    let row_width = codeword.len() / block_len;
+    let mut active = queries.to_vec();
+    active.sort_unstable();
+    active.dedup();
+    debug_assert!(active.iter().all(|&p| p < block_len));
+
+    let mut proof = Vec::new();
+    let mut level_start = 0usize;
+    let mut level_len = block_len;
+    while level_len > 1 {
+        let mut next = Vec::with_capacity(active.len());
+        let mut i = 0;
+        while i < active.len() {
+            let p = active[i];
+            let sib_active = i + 1 < active.len() && active[i + 1] == (p ^ 1);
+            if sib_active {
+                i += 2;
+            } else {
+                let sibling = p ^ 1;
+                if level_start == 0 && sibling < leafless_prefix {
+                    let row = &codeword[sibling * row_width..(sibling + 1) * row_width];
+                    let bytes = unsafe {
+                        core::slice::from_raw_parts(
+                            row.as_ptr().cast::<u8>(),
+                            core::mem::size_of_val(row),
+                        )
+                    };
+                    let mut hash = [0u8; 32];
+                    crate::merkle::hash_ranked_blake3_leaf_chunk(
+                        bytes,
+                        core::slice::from_mut(&mut hash),
+                    );
+                    proof.push(hash);
+                } else {
+                    proof.push(tree[level_start + sibling]);
+                }
+                i += 1;
+            }
+            next.push(p >> 1);
+        }
+        active = next;
+        level_start += level_len;
+        level_len >>= 1;
+    }
+    proof
+}
+
+#[cfg(test)]
+mod leafless_l0_tree_tests {
+    use super::*;
+
+    #[test]
+    fn regenerates_only_missing_leaf_siblings_in_canonical_octopus_order() {
+        const LEAVES: usize = 8;
+        const ROW: usize = 64;
+        let codeword: Vec<F128> = (0..LEAVES * ROW)
+            .map(|i| F128::new(i as u64, (i as u64).rotate_left(19)))
+            .collect();
+        let bytes = unsafe {
+            core::slice::from_raw_parts(
+                codeword.as_ptr().cast::<u8>(),
+                core::mem::size_of_val(codeword.as_slice()),
+            )
+        };
+        let tree = merkle::merkle_tree(bytes, LEAVES, crate::merkle::HashKind::Blake3);
+        let queries = [0usize, 2, 5];
+        let expected = merkle_multi_proof_for(&tree, LEAVES, &queries);
+        let mut leafless = tree.clone();
+        leafless[..4].fill([0u8; 32]);
+        assert_eq!(
+            merkle_multi_proof_for_leafless_prefix(&leafless, &codeword, LEAVES, &queries, 4),
+            expected,
+        );
+    }
+}
+
 /// Drive the recursive Ligerito prover to prove `poly(eval_point) = claimed_value`.
 ///
 /// Protocol structure (unique-decoding regime, no OOD samples yet):
@@ -4570,6 +4668,7 @@ pub fn recursive_prover_with_basis<Ch: Challenger>(
         target,
         l0_codeword,
         l0_tree,
+        0,
         None,
         None,
         None,
@@ -4607,6 +4706,7 @@ pub fn recursive_prover_with_basis_precomputed_round0<Ch: Challenger>(
         target,
         l0_codeword,
         l0_tree,
+        0,
         Some(SumcheckMessage {
             u_0: round0_uv.0,
             u_2: round0_uv.1,
@@ -4645,6 +4745,7 @@ pub(crate) fn recursive_prover_with_basis_direct_ab_fold2<Ch: Challenger>(
         target,
         l0_codeword,
         l0_tree,
+        0,
         Some(SumcheckMessage {
             u_0: round0_uv.0,
             u_2: round0_uv.1,
@@ -4687,6 +4788,7 @@ pub(crate) fn recursive_prover_with_basis_direct_fold4<Ch: Challenger>(
         target,
         l0_codeword,
         l0_tree,
+        0,
         Some(SumcheckMessage {
             u_0: round0_uv.0,
             u_2: round0_uv.1,
@@ -4716,6 +4818,7 @@ pub(crate) fn recursive_prover_with_basis_direct_fold8<Ch: Challenger>(
     target: F128,
     l0_codeword: &[F128],
     l0_tree: &[Hash],
+    l0_leafless_prefix: usize,
     round0_uv: (F128, F128),
     round1_lookahead: [F128; 6],
     round2_lookahead: super::Fold4Lookahead2,
@@ -4732,6 +4835,7 @@ pub(crate) fn recursive_prover_with_basis_direct_fold8<Ch: Challenger>(
         target,
         l0_codeword,
         l0_tree,
+        l0_leafless_prefix,
         Some(SumcheckMessage {
             u_0: round0_uv.0,
             u_2: round0_uv.1,
@@ -4755,6 +4859,7 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
     target: F128,
     l0_codeword: &[F128],
     l0_tree: &[Hash],
+    l0_leafless_prefix: usize,
     first_msg: Option<SumcheckMessage>,
     round1_lookahead: Option<[F128; 6]>,
     round2_lookahead: Option<super::Fold4Lookahead2>,
@@ -5220,7 +5325,13 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
         // the serial map; each row copy is independent of the challenger.
         queries_0.par_iter().map(|&q| l0_row(q).to_vec()).collect()
     };
-    let merkle_proof_0 = merkle_multi_proof_for(l0_tree, l0_block_len, &queries_0);
+    let merkle_proof_0 = merkle_multi_proof_for_leafless_prefix(
+        l0_tree,
+        l0_codeword,
+        l0_block_len,
+        &queries_0,
+        l0_leafless_prefix,
+    );
     if trace {
         t_opens += _t.elapsed();
     }
@@ -9476,6 +9587,7 @@ mod tests {
             target,
             &wtns_0.mat,
             &wtns_0.tree,
+            0,
             round0,
             round1,
             round2,
