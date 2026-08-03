@@ -632,6 +632,117 @@ unsafe fn store_nt_64(src: *const u8, dst: *mut u8) {
     unsafe { core::ptr::copy_nonoverlapping(src, dst, 64) };
 }
 
+/// Which pool topology drains the round-1 AB precompute outers.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum HeteroDrain {
+    /// Incumbent main-pool `par_chunks_mut` enumeration.
+    Main,
+    /// Coarse atomic queue drained by the main pool plus the E-core helper
+    /// pool (128 outers per claim).
+    Hetero,
+}
+
+/// first precompute call in the process times both drains over the identical
+/// buffer under the real commit-window contention; `Calibrating` blocks
+/// concurrent calibration; `Off`/`On` publish the verdict. Timed proves read
+/// one atomic; the calibration's second drain overwrites the first with
+/// bit-identical bytes, so the returned storage is correct either way.
+static AB_HETERO_LATCH: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+const LATCH_UNDECIDED: usize = 0;
+const LATCH_OFF: usize = 1;
+const LATCH_ON: usize = 2;
+/// One-shot join-wall calibration request: the prover's untimed warm-up
+/// commit replays its (replayable) commit arm under both drains while the
+/// AB drain runs forced, and publishes the join-wall verdict here.
+static AB_HETERO_CAL_PENDING: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Diagnostics overrides: `FLOCK_ZC_AB_HETERO=1` forces the hetero drain,
+/// `FLOCK_NO_ZC_AB_HETERO=1` forces the incumbent main-pool drain. Without
+/// either, the latch self-calibrates.
+fn ab_hetero_env_override() -> Option<bool> {
+    if std::env::var_os("FLOCK_ZC_AB_HETERO").is_some() {
+        return Some(true);
+    }
+    if std::env::var_os("FLOCK_NO_ZC_AB_HETERO").is_some() {
+        return Some(false);
+    }
+    None
+}
+
+fn ab_hetero_drain() -> HeteroDrain {
+    match ab_hetero_env_override() {
+        Some(true) => return HeteroDrain::Hetero,
+        Some(false) => return HeteroDrain::Main,
+        None => {}
+    }
+    // Without a helper pool the hetero shape degenerates to the main-pool
+    // queue; skip it (and the calibration) entirely.
+    if !crate::epool::helper_pool_available() {
+        return HeteroDrain::Main;
+    }
+    match AB_HETERO_LATCH.load(std::sync::atomic::Ordering::Relaxed) {
+        LATCH_ON => HeteroDrain::Hetero,
+        _ => HeteroDrain::Main,
+    }
+}
+#[cfg(test)]
+pub(crate) fn ab_hetero_test_reset() {
+    AB_HETERO_LATCH.store(LATCH_UNDECIDED, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Whether join-wall calibration is still outstanding (no env override,
+/// helper pool present, latch undecided). The ranked prover's warm-up commit
+/// uses this to schedule a commit-replay calibration that measures the
+/// `rayon::join(commit, ab)` wall — the metric that actually bounds the
+/// commit phase — instead of the AB drain wall alone.
+pub fn ab_hetero_calibration_pending() -> bool {
+    use std::sync::atomic::Ordering;
+    ab_hetero_env_override().is_none()
+        && crate::epool::helper_pool_available()
+        && AB_HETERO_LATCH.load(Ordering::Relaxed) == LATCH_UNDECIDED
+        && !AB_HETERO_CAL_PENDING.swap(true, Ordering::Relaxed)
+}
+
+/// Force a drain for the AB precompute regardless of the latch (calibration
+/// arms and diagnostics).
+pub fn precompute_round1_ab_inner_packed_padded_forced(
+    a_packed: &[u8],
+    b_packed: &[u8],
+    m: usize,
+    k_skip: usize,
+    inv_table: &InvNttTableByteSingleGf8,
+    padding: &PaddingSpec,
+    hetero: bool,
+) -> Round1AbInner {
+    precompute_round1_ab_inner_packed_padded_with_flavor(
+        a_packed,
+        b_packed,
+        m,
+        k_skip,
+        inv_table,
+        padding,
+        ab_pre_nt_enabled(),
+        if hetero { HeteroDrain::Hetero } else { HeteroDrain::Main },
+    )
+}
+
+/// Publish the join-wall verdict: hetero engages only when it beats the main
+/// drain by more than a 1.5 ms absolute noise floor of join wall. Any caller
+/// error path simply never publishes, leaving the latch undecided (incumbent
+/// behavior forever).
+pub fn ab_hetero_publish_join_wall(main_join_ms: f64, hetero_join_ms: f64) {
+    use std::sync::atomic::Ordering;
+    let on = hetero_join_ms + 1.5 < main_join_ms;
+    if std::env::var_os("FLOCK_ZC_AB_HETERO_TRACE").is_some() {
+        eprintln!(
+            "[zc-ab-hetero] join-wall calibrate: main {main_join_ms:.2} ms, hetero {hetero_join_ms:.2} ms -> {}",
+            if on { "ON" } else { "OFF" }
+        );
+    }
+    AB_HETERO_LATCH.store(if on { LATCH_ON } else { LATCH_OFF }, Ordering::Relaxed);
+}
+
 /// Precompute the challenge-independent inverse-NTT/product/shift-reduce AB
 /// transform. The result can be produced before the commitment root is
 /// available and consumed later by
@@ -652,6 +763,7 @@ pub fn precompute_round1_ab_inner_packed_padded(
         inv_table,
         padding,
         ab_pre_nt_enabled(),
+        ab_hetero_drain(),
     )
 }
 
@@ -665,8 +777,9 @@ fn precompute_round1_ab_inner_packed_padded_with_flavor(
     inv_table: &InvNttTableByteSingleGf8,
     padding: &PaddingSpec,
     nt: bool,
+    drain: HeteroDrain,
 ) -> Round1AbInner {
-    use rayon::prelude::*;
+
 
     assert_eq!(k_skip, K_SKIP, "optimized variant is k_skip=6 only");
     assert!(
@@ -698,81 +811,165 @@ fn precompute_round1_ab_inner_packed_padded_with_flavor(
     let out_bytes: &mut [u8] =
         unsafe { core::slice::from_raw_parts_mut(storage.as_mut_ptr() as *mut u8, total_bytes) };
 
-    out_bytes
-        .par_chunks_mut(OUTER_BYTES)
-        .enumerate()
-        .for_each_init(
-            || ([F8::ZERO; ELL], [F8::ZERO; ELL]),
-            |(a_col, b_col), (x_outer, out_outer)| {
-                let within_hash_outer = x_outer & within_outer_mask;
-                let n_b_med = b_med_counts[within_hash_outer] as usize;
-                let chunk_byte_base = x_outer * OUTER_BYTES;
+    let n_outers = total_bytes / OUTER_BYTES;
+    let out_base = out_bytes.as_mut_ptr();
 
-                // NT arm: the kernel writes a stack temporary and the 64-byte
-                // block drains to the big buffer with `stnp` (write-once
-                // lines, consumer runs after the commit root). Control arm is
-                // the incumbent direct kernel write, byte-for-byte.
-                let mut tmp = [0u8; 64];
-                for b_med in 0..n_b_med {
-                    let dst: &mut [u8; 64] = if nt {
-                        &mut tmp
-                    } else {
-                        (&mut out_outer[b_med * 64..(b_med + 1) * 64])
-                            .try_into()
-                            .expect("one transformed b_med block")
-                    };
-                    shift_reduce_inner_ab(
-                        a_packed,
-                        b_packed,
-                        inv_table,
-                        chunk_byte_base,
-                        b_med,
-                        dst,
-                        a_col,
-                        b_col,
-                        !blake3_static_layout || (within_hash_outer == 0 && b_med < 2),
-                        !blake3_static_layout || (within_hash_outer == 1 && b_med + 1 == n_b_med),
-                        if blake3_static_layout && within_hash_outer == 0 && b_med == 2 {
-                            0x03
-                        } else if blake3_static_layout
-                            && within_hash_outer == 1
-                            && b_med + 2 == n_b_med
-                        {
-                            0xf0
-                        } else {
-                            0
-                        },
-                        if blake3_static_layout {
-                            within_hash_outer
-                        } else {
-                            usize::MAX
-                        },
-                        static_b_context,
-                    );
-                    if nt {
-                        // SAFETY: `b_med < n_b_med ≤ OUTER_BYTES / 64`, so the
-                        // 64 destination bytes are in-bounds of `out_outer`.
-                        unsafe {
-                            store_nt_64(tmp.as_ptr(), out_outer.as_mut_ptr().add(b_med * 64))
-                        };
-                    }
-                }
-                if nt {
-                    let tail = &mut out_outer[n_b_med * 64..];
-                    debug_assert_eq!(tail.len() % 64, 0);
-                    let zero = [0u8; 64];
-                    for i in 0..tail.len() / 64 {
-                        // SAFETY: chunk `i` is 64 in-bounds bytes of `tail`.
-                        unsafe { store_nt_64(zero.as_ptr(), tail.as_mut_ptr().add(i * 64)) };
-                    }
-                } else {
-                    out_outer[n_b_med * 64..].fill(0);
-                }
-            },
-        );
+    // The per-outer body shared by both drains: output depends only on the
+    let process_outer =
+        |state: &mut ([F8; ELL], [F8; ELL]), x_outer: usize, out_outer: &mut [u8]| {
+            ab_process_outer(
+                a_packed,
+                b_packed,
+                inv_table,
+                within_outer_mask,
+                &b_med_counts,
+                blake3_static_layout,
+                static_b_context,
+                nt,
+                state,
+                x_outer,
+                out_outer,
+            );
+        };
+
+    run_ab_drain(drain, n_outers, out_base, &process_outer);
 
     Round1AbInner { storage }
 }
+
+/// Each hetero queue job covers this many outers (~128 KiB of output),
+/// keeping the atomic claim traffic 128x below one-outer-per-claim while
+/// preserving the disjoint-output invariant.
+const HETERO_OUTERS_PER_JOB: usize = 128;
+
+/// Run the chosen drain over `out_base[0..n_outers*OUTER_BYTES]`.
+fn run_ab_drain<F>(drain: HeteroDrain, n_outers: usize, out_base: *mut u8, process_outer: &F)
+where
+    F: Fn(&mut ([F8; ELL], [F8; ELL]), usize, &mut [u8]) + Sync,
+{
+    use rayon::prelude::*;
+    const OUTER_BYTES: usize = (1 << N_MEDIUM) * 64;
+
+    let drain_main = || {
+        let out = unsafe { core::slice::from_raw_parts_mut(out_base, n_outers * OUTER_BYTES) };
+        out.par_chunks_mut(OUTER_BYTES)
+            .enumerate()
+            .for_each_init(
+                || ([F8::ZERO; ELL], [F8::ZERO; ELL]),
+                |state, (x_outer, out_outer)| process_outer(state, x_outer, out_outer),
+            );
+    };
+
+    let drain_hetero = || {
+        let n_jobs = n_outers.div_ceil(HETERO_OUTERS_PER_JOB);
+
+        let base = crate::epool::SyncPtr(out_base);
+        crate::epool::run_hetero_chunks_stateful(
+            n_jobs,
+            || ([F8::ZERO; ELL], [F8::ZERO; ELL]),
+            &move |state: &mut ([F8; ELL], [F8; ELL]), job: usize| {
+                let first = job * HETERO_OUTERS_PER_JOB;
+                let last = (first + HETERO_OUTERS_PER_JOB).min(n_outers);
+                for x_outer in first..last {
+                    // SAFETY: the queue hands each job out exactly once and
+                    // jobs own disjoint outer ranges, so this thread
+                    // exclusively owns these OUTER_BYTES slices.
+                    let out_outer = unsafe {
+                        core::slice::from_raw_parts_mut(
+                            base.ptr().add(x_outer * OUTER_BYTES),
+                            OUTER_BYTES,
+                        )
+                    };
+                    process_outer(state, x_outer, out_outer);
+                }
+            },
+        );
+    };
+
+    match drain {
+        HeteroDrain::Main => drain_main(),
+        HeteroDrain::Hetero => drain_hetero(),
+    }
+}
+/// One outer's transform: depends only on the immutable published inputs
+/// and the outer index, never on the executing pool or thread. Shared by
+/// both drains and the bit-identity test.
+#[allow(clippy::too_many_arguments)]
+fn ab_process_outer(
+    a_packed: &[u8],
+    b_packed: &[u8],
+    inv_table: &InvNttTableByteSingleGf8,
+    within_outer_mask: usize,
+    b_med_counts: &[u8],
+    blake3_static_layout: bool,
+    static_b_context: Option<kernels::StaticBContext>,
+    nt: bool,
+    (a_col, b_col): &mut ([F8; ELL], [F8; ELL]),
+    x_outer: usize,
+    out_outer: &mut [u8],
+) {
+    const OUTER_BYTES: usize = (1 << N_MEDIUM) * 64;
+    let within_hash_outer = x_outer & within_outer_mask;
+    let n_b_med = b_med_counts[within_hash_outer] as usize;
+    let chunk_byte_base = x_outer * OUTER_BYTES;
+
+    // NT arm: the kernel writes a stack temporary and the 64-byte
+    // block drains to the big buffer with `stnp` (write-once
+    // lines, consumer runs after the commit root). Control arm is
+    // the incumbent direct kernel write, byte-for-byte.
+    let mut tmp = [0u8; 64];
+    for b_med in 0..n_b_med {
+        let dst: &mut [u8; 64] = if nt {
+            &mut tmp
+        } else {
+            (&mut out_outer[b_med * 64..(b_med + 1) * 64])
+                .try_into()
+                .expect("one transformed b_med block")
+        };
+        shift_reduce_inner_ab(
+            a_packed,
+            b_packed,
+            inv_table,
+            chunk_byte_base,
+            b_med,
+            dst,
+            a_col,
+            b_col,
+            !blake3_static_layout || (within_hash_outer == 0 && b_med < 2),
+            !blake3_static_layout || (within_hash_outer == 1 && b_med + 1 == n_b_med),
+            if blake3_static_layout && within_hash_outer == 0 && b_med == 2 {
+                0x03
+            } else if blake3_static_layout && within_hash_outer == 1 && b_med + 2 == n_b_med {
+                0xf0
+            } else {
+                0
+            },
+            if blake3_static_layout {
+                within_hash_outer
+            } else {
+                usize::MAX
+            },
+            static_b_context,
+        );
+        if nt {
+            // SAFETY: `b_med < n_b_med ≤ OUTER_BYTES / 64`, so the
+            // 64 destination bytes are in-bounds of `out_outer`.
+            unsafe { store_nt_64(tmp.as_ptr(), out_outer.as_mut_ptr().add(b_med * 64)) };
+        }
+    }
+    if nt {
+        let tail = &mut out_outer[n_b_med * 64..];
+        debug_assert_eq!(tail.len() % 64, 0);
+        let zero = [0u8; 64];
+        for i in 0..tail.len() / 64 {
+            // SAFETY: chunk `i` is 64 in-bounds bytes of `tail`.
+            unsafe { store_nt_64(zero.as_ptr(), tail.as_mut_ptr().add(i * 64)) };
+        }
+    } else {
+        out_outer[n_b_med * 64..].fill(0);
+    }
+}
+
 
 // ---------------------------------------------------------------------------
 // Shift_reduce inner kernel (AB only — extract_c handles C separately).
@@ -3262,10 +3459,10 @@ mod tests {
             let (a_p, b_p) = (pack_bits(&a), pack_bits(&b));
             let table = make_inv_table();
             let plain = precompute_round1_ab_inner_packed_padded_with_flavor(
-                &a_p, &b_p, m, K_SKIP, &table, &padding, false,
+                &a_p, &b_p, m, K_SKIP, &table, &padding, false, HeteroDrain::Main,
             );
             let nt = precompute_round1_ab_inner_packed_padded_with_flavor(
-                &a_p, &b_p, m, K_SKIP, &table, &padding, true,
+                &a_p, &b_p, m, K_SKIP, &table, &padding, true, HeteroDrain::Main,
             );
             assert_eq!(
                 plain.as_bytes(),
@@ -3274,6 +3471,86 @@ mod tests {
                 padded.is_some()
             );
         }
+    }
+
+    /// The two-pool hetero queue and the incumbent main-pool enumeration must
+    /// write byte-identical AB storage: each outer's bytes depend only on the
+    /// immutable inputs and the outer index, and the queue hands each job
+    /// (128 outers) out exactly once.
+    #[test]
+    fn ab_hetero_drain_is_byte_identical() {
+        const OUTER_BYTES: usize = (1 << N_MEDIUM) * 64;
+        use crate::zerocheck::univariate_skip::pack_bits;
+        let cases: [(usize, Option<(usize, usize)>); 4] = [
+            (13, None),
+            (14, Some((14, 15_409))), // BLAKE3 block shape
+            (17, Some((14, 15_409))),
+            (21, Some((14, 15_409))), // 256 outers -> multiple hetero jobs
+        ];
+        for (m, padded) in cases {
+            let mut rng = Rng::new(0x7E_7E_0001_u64 ^ (m as u64));
+            let total_bits = 1usize << m;
+            let mut a = rng.bits(total_bits);
+            let mut b = rng.bits(total_bits);
+            let padding = match padded {
+                None => PaddingSpec::dense(m),
+                Some((k_log, useful_bits)) => {
+                    let block_size = 1usize << k_log;
+                    for blk in 0..(total_bits / block_size) {
+                        for j in useful_bits..block_size {
+                            let idx = blk * block_size + j;
+                            a[idx] = false;
+                            b[idx] = false;
+                        }
+                    }
+                    PaddingSpec {
+                        k_log,
+                        useful_bits_per_block: useful_bits,
+                    }
+                }
+            };
+            let (a_p, b_p) = (pack_bits(&a), pack_bits(&b));
+            let table = make_inv_table();
+
+            let total_bytes = total_bytes_for(m);
+            let (within_outer_mask, b_med_counts) = build_b_med_counts(&padding);
+            let blake3_static_layout =
+                padding.k_log == 14 && padding.useful_bits_per_block == 15_409;
+            let static_b_context =
+                kernels::prepare_static_b_context(&table, blake3_static_layout);
+            let n_outers = total_bytes / OUTER_BYTES;
+
+            for nt in [false, true] {
+                let f = |state: &mut ([F8; ELL], [F8; ELL]), x_outer: usize, out_outer: &mut [u8]| {
+                    ab_process_outer(
+                        &a_p,
+                        &b_p,
+                        &table,
+                        within_outer_mask,
+                        &b_med_counts,
+                        blake3_static_layout,
+                        static_b_context,
+                        nt,
+                        state,
+                        x_outer,
+                        out_outer,
+                    );
+                };
+                let mut main_buf = vec![0u8; total_bytes];
+                run_ab_drain(HeteroDrain::Main, n_outers, main_buf.as_mut_ptr(), &f);
+                let mut hetero_buf = vec![0u8; total_bytes];
+                run_ab_drain(HeteroDrain::Hetero, n_outers, hetero_buf.as_mut_ptr(), &f);
+                assert_eq!(
+                    main_buf, hetero_buf,
+                    "hetero drain changed bytes at m={m}, nt={nt}"
+                );
+            }
+
+        }
+    }
+
+    fn total_bytes_for(m: usize) -> usize {
+        (1usize << m) / 8
     }
 
     /// Owned-kernel interleaved A/B of the store flavor at the ranked
@@ -3306,14 +3583,14 @@ mod tests {
         // Warmup one of each, then interleave measured reps.
         for nt in [false, true] {
             let _ = precompute_round1_ab_inner_packed_padded_with_flavor(
-                &a_p, &b_p, m, K_SKIP, &table, &padding, nt,
+                &a_p, &b_p, m, K_SKIP, &table, &padding, nt, HeteroDrain::Main,
             );
         }
         for rep in 0..4 {
             for nt in [rep % 2 == 1, rep % 2 == 0] {
                 let t0 = std::time::Instant::now();
                 let out = precompute_round1_ab_inner_packed_padded_with_flavor(
-                    &a_p, &b_p, m, K_SKIP, &table, &padding, nt,
+                    &a_p, &b_p, m, K_SKIP, &table, &padding, nt, HeteroDrain::Main,
                 );
                 let ms = t0.elapsed().as_secs_f64() * 1e3;
                 println!("rep={rep} nt={nt}: {ms:.2} ms");
