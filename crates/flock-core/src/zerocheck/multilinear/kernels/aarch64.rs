@@ -668,13 +668,19 @@ unsafe fn r2_pair_fold_and_store(
 /// recompute the odd half for the lookahead's `W1`/`W2`. Keeping that split
 /// costs the GPU nothing, and lets this kernel drop two more of its eight
 /// products: **32 PMULL per group instead of 38** on every offloaded chunk.
-/// The four `mul_q` row weightings survive because `W0`/`W3`/`W4`/`W5` still
-/// need all four scaled rows.
+///
+/// With `W_ON_GPU = true` (implies the GPU also emits `W0`/`W3`/`W4`/`W5`)
+/// slots 4..8 stay zero too: the CPU residual on an offloaded chunk collapses
+/// to pure anchor/delta stores — the original anchors-only residual the
+/// share gate was calibrated against. Const-generic so the product path is
+/// monomorphized away rather than predicated (runtime bools spill the
+/// product-register state; see the R2 dead-store regression note).
 #[cfg(target_arch = "aarch64")]
 #[target_feature(enable = "aes")]
 pub(crate) unsafe fn fold_round2_compact_chunk_neon_lookahead_8<
     const FULL: bool,
     const ODD_ON_GPU: bool,
+    const W_ON_GPU: bool,
 >(
     table_data: *const u8,
     a_packed: *const u8,
@@ -742,6 +748,11 @@ pub(crate) unsafe fn fold_round2_compact_chunk_neon_lookahead_8<
             let (a2, a3, b2, b3, deg1) = r2_pair_fold_and_store(
                 table_data, a_packed, b_packed, anchors, deltas, x_lo1, pad1, degen, b_ones,
             );
+
+            // GPU owns every product on this chunk: residual is anchors only.
+            if W_ON_GPU {
+                continue;
+            }
 
             // The odd lane's weight drives the whole group; see the doc above.
             let w = vld1q_u64(eq_lo.add(x_lo1).cast::<u64>());
