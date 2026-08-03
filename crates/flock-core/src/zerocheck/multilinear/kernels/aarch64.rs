@@ -691,19 +691,6 @@ pub(crate) unsafe fn fold_round2_compact_chunk_neon_lookahead_8<
 ) {
     use core::arch::aarch64::*;
 
-    #[inline(always)]
-    unsafe fn store_anchor_pair_nt(dst: *mut F128, a: uint64x2_t, b: uint64x2_t) {
-        unsafe {
-            core::arch::asm!(
-                "stnp {a:q}, {b:q}, [{dst}]",
-                dst = in(reg) dst,
-                a = in(vreg) a,
-                b = in(vreg) b,
-                options(nostack, preserves_flags),
-            );
-        }
-    }
-
     unsafe {
         let zero = vdupq_n_u64(0);
         let mut p1_even = WideNeon { lo: zero, hi: zero };
@@ -729,10 +716,12 @@ pub(crate) unsafe fn fold_round2_compact_chunk_neon_lookahead_8<
             let pad0 = ((pair_idx_base + x_lo0) & pair_in_block_mask) >= useful_pairs_inclusive;
             let pad1 = ((pair_idx_base + x_lo1) & pair_in_block_mask) >= useful_pairs_inclusive;
             if pad0 & pad1 {
-                store_anchor_pair_nt(anchors.add(2 * x_lo0), zero, zero);
-                vst1q_u64(deltas.add(x_lo0 * 16).cast::<u64>(), zero);
-                store_anchor_pair_nt(anchors.add(2 * x_lo1), zero, zero);
-                vst1q_u64(deltas.add(x_lo1 * 16).cast::<u64>(), zero);
+                // Pure-pad group: compact slots are unread by the ranked K
+                // pass (it emits zeros without loading them). Skipping the
+                // 48-byte zero stores × 2 pairs removes ~84 MiB of ranked
+                // R2 write traffic. Compile-time always-on — not a runtime
+                // bool into this register-saturated body (see the R2
+                // dead-store regression note).
                 continue;
             }
 
@@ -820,9 +809,12 @@ pub(crate) unsafe fn fold_round2_compact_chunk_neon_lookahead_8<
 /// `A''[y] = [anc0 + ρ₂(anc0+anc1)] + fold_{λ₁}(δ0) + fold_{λ₃}(δ1)` with
 /// `λ₁ = ρ₁(1+ρ₂)`, `λ₃ = ρ₁ρ₂` — in characteristic two `λ₀+λ₁ = 1+ρ₂` and
 /// `λ₂+λ₃ = ρ₂`, so the two anchors collapse into one ordinary ρ₂ fold and
-/// only the two deltas need λ-scaled tables. Padding needs no predicate: the
-/// compact state already carries zero anchors and zero deltas there, and a
-/// zero delta code folds to zero through the table's zero entry.
+/// only the two deltas need λ-scaled tables.
+///
+/// Pure-pad groups (both pairs past `useful_pairs_inclusive`) are emitted as
+/// zeros without loading compact state: the ranked R2 producer skips writing
+/// those slots, so they may hold uninit/stale bytes. Mixed groups still load
+/// compact (the useful side is live; the pad side was zeroed by R2).
 #[cfg(target_arch = "aarch64")]
 #[target_feature(enable = "aes")]
 pub(crate) unsafe fn fold2_compact_and_round4_chunk_neon_8(
@@ -836,6 +828,9 @@ pub(crate) unsafe fn fold2_compact_and_round4_chunk_neon_8(
     eq_lo: *const F128,
     out_pairs: usize,
     degen: bool,
+    pair_idx_base: usize,
+    pair_in_block_mask: usize,
+    useful_pairs_inclusive: usize,
 ) -> (F128, F128) {
     use core::arch::aarch64::*;
 
@@ -865,6 +860,16 @@ pub(crate) unsafe fn fold2_compact_and_round4_chunk_neon_8(
             let mut b_flat = true;
             for lane in 0..2usize {
                 let g = 2 * u + lane;
+                // Global pair indices for this group's two compact pairs.
+                let pair0 = pair_idx_base + 2 * g;
+                let group_pad = ((pair0) & pair_in_block_mask) >= useful_pairs_inclusive
+                    && ((pair0 + 1) & pair_in_block_mask) >= useful_pairs_inclusive;
+                if group_pad {
+                    // R2 skipped compact stores; emit zeros without loading.
+                    av[lane] = zero;
+                    bv[lane] = zero;
+                    continue;
+                }
                 let ap = anchors.add(4 * g).cast::<u64>();
                 let anc_a0 = vld1q_u64(ap);
                 let anc_b0 = vld1q_u64(ap.add(2));

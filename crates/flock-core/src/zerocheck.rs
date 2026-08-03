@@ -700,6 +700,8 @@ fn prove_packed_padded_inner<C: Challenger>(
             &r_next4,
             &mut a_out,
             &mut b_out,
+            padding,
+            k_skip,
         );
         if tail_round_timing {
             eprintln!(

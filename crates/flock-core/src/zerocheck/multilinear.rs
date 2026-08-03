@@ -1707,6 +1707,8 @@ pub(crate) fn fold2_compact_and_round4_into(
     r_next4: &[F128],
     a_out: &mut [F128],
     b_out: &mut [F128],
+    padding: &crate::zerocheck::PaddingSpec,
+    k_skip: usize,
 ) -> (F128, F128) {
     let n_pairs = compact.len();
     let n_groups = n_pairs / 2;
@@ -1734,6 +1736,9 @@ pub(crate) fn fold2_compact_and_round4_into(
     let out_chunk = 2 * lo_size;
     #[cfg(target_arch = "aarch64")]
     let degen = r2_degen_enabled();
+    // Same pad map the R2 producer used so pure-pad groups never load the
+    // compact slots R2 left unwritten.
+    let (pair_in_block_mask, useful_pairs_inclusive) = round2_pair_skip(padding, k_skip);
 
     let mut partials: Vec<(F128, F128)> = vec![(F128::ZERO, F128::ZERO); hi_size];
     let a_base = crate::epool::SyncPtr(a_out.as_mut_ptr());
@@ -1764,6 +1769,9 @@ pub(crate) fn fold2_compact_and_round4_into(
                 eq_lo.as_ptr(),
                 lo_size,
                 degen,
+                pair_base,
+                pair_in_block_mask,
+                useful_pairs_inclusive,
             )
         };
 
@@ -1776,6 +1784,14 @@ pub(crate) fn fold2_compact_and_round4_into(
             let nc = table.n_chunks;
             for g_local in 0..out_chunk {
                 let g = x_hi * out_chunk + g_local;
+                let pair0 = 2 * g;
+                let group_pad = ((pair0) & pair_in_block_mask) >= useful_pairs_inclusive
+                    && ((pair0 + 1) & pair_in_block_mask) >= useful_pairs_inclusive;
+                if group_pad {
+                    a_out[g_local] = F128::ZERO;
+                    b_out[g_local] = F128::ZERO;
+                    continue;
+                }
                 let anc = &compact.anchors[4 * g..4 * g + 4];
                 let d = &compact.deltas[32 * g..32 * g + 32];
                 let mut a = anc[0] + rho2 * (anc[0] + anc[2]);
@@ -3362,8 +3378,28 @@ mod tests {
                         None,
                     );
                 assert_eq!((m1_n, mi_n), (m1_l, mi_l), "round-two message, m={m}");
-                assert_eq!(compact_n.anchors, compact.anchors, "anchors, m={m}");
-                assert_eq!(&compact_n.deltas[..], &compact.deltas[..], "deltas, m={m}");
+                // Pure-pad compact slots are intentionally unwritten by the
+                // lookahead producer (K emits zeros without loading them).
+                // Compare only useful / mixed-pair slots against the
+                // zero-writing incumbent.
+                let (mask, useful) = round2_pair_skip(&f.padding, 6);
+                let n_pairs = compact.len();
+                for p in 0..n_pairs {
+                    if (p & mask) >= useful {
+                        continue;
+                    }
+                    assert_eq!(
+                        compact_n.anchors[2 * p..2 * p + 2],
+                        compact.anchors[2 * p..2 * p + 2],
+                        "anchors pair {p}, m={m}"
+                    );
+                    let d0 = p * 16;
+                    assert_eq!(
+                        &compact_n.deltas[d0..d0 + 16],
+                        &compact.deltas[d0..d0 + 16],
+                        "deltas pair {p}, m={m}"
+                    );
+                }
 
                 for &rho1 in &f.rho_grid {
                     let (a3, b3, e1, ei) = fold_compact_and_compute_round_pair(
@@ -3475,7 +3511,15 @@ mod tests {
                         a_n.fill(LA_POISON);
                         b_n.fill(LA_POISON);
                         let msg_n = fold2_compact_and_round4_into(
-                            &compact, &f.table, rho1, rho2, &r_next4, &mut a_n, &mut b_n,
+                            &compact,
+                            &f.table,
+                            rho1,
+                            rho2,
+                            &r_next4,
+                            &mut a_n,
+                            &mut b_n,
+                            &f.padding,
+                            6,
                         );
                         assert_eq!(a_n, a_l, "A'' m={m} rho1={rho1:?} rho2={rho2:?}");
                         assert_eq!(b_n, b_l, "B'' m={m} rho1={rho1:?} rho2={rho2:?}");
