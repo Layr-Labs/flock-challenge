@@ -593,7 +593,7 @@ unsafe fn r2_pair_fold_and_store(
         let zero = vdupq_n_u64(0);
         if padded {
             store_anchor_pair_nt(anchors.add(2 * x_lo), zero, zero);
-            vst1q_u64(deltas.add(x_lo * 16).cast::<u64>(), zero);
+            store_delta_pair_nt(deltas.add(x_lo * 16), 0, 0);
             return (zero, zero, zero, zero, false);
         }
 
@@ -615,23 +615,39 @@ unsafe fn r2_pair_fold_and_store(
         if degen && (b0_code & b1_code) == u64::MAX {
             let (a0, a1) = fold_two_row_codes_q(table_data, a0_code, a1_code);
             store_anchor_pair_nt(anchors.add(2 * x_lo), a0, b_ones);
-            let delta_pair = core::mem::transmute::<[u64; 2], uint64x2_t>([a0_code ^ a1_code, 0]);
-            vst1q_u64(deltas.add(x_lo * 16).cast::<u64>(), delta_pair);
+            store_delta_pair_nt(deltas.add(x_lo * 16), a0_code ^ a1_code, 0);
             return (a0, a1, b_ones, b_ones, true);
         }
 
         let (a0, a1, b0, b1) =
             fold_four_row_codes_q(table_data, a0_code, a1_code, b0_code, b1_code);
         store_anchor_pair_nt(anchors.add(2 * x_lo), a0, b0);
-        let delta_pair = core::mem::transmute::<[u64; 2], uint64x2_t>([
-            a0_code ^ a1_code,
-            b0_code ^ b1_code,
-        ]);
-        vst1q_u64(deltas.add(x_lo * 16).cast::<u64>(), delta_pair);
+        store_delta_pair_nt(deltas.add(x_lo * 16), a0_code ^ a1_code, b0_code ^ b1_code);
         (a0, a1, b0, b1, false)
     }
 }
 
+/// 16-byte non-temporal delta store (`stnp` X-form). The delta stream is a
+/// write-once surface consumed a full phase later by the round-3/4 compact
+/// reconstruction, so its lines are never usefully cache-resident; plain
+/// `vst1q` stores pay a write-allocate RFO read of every line while the
+/// sweep is bandwidth-contended (the anchor stream already streams through
+/// `stnp` for the same reason). The stored values originate in general
+/// registers (XORs of the raw row codes), so the X-form store also removes
+/// the two GPR-to-vector moves the vector store required.
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn store_delta_pair_nt(dst: *mut u8, lo: u64, hi: u64) {
+    unsafe {
+        core::arch::asm!(
+            "stnp {lo}, {hi}, [{dst}]",
+            dst = in(reg) dst,
+            lo = in(reg) lo,
+            hi = in(reg) hi,
+            options(nostack, preserves_flags),
+        );
+    }
+}
 /// Round-two compact producer extended with the deferred round-three
 /// lookahead accumulators (variant K).
 ///
@@ -730,9 +746,9 @@ pub(crate) unsafe fn fold_round2_compact_chunk_neon_lookahead_8<
             let pad1 = ((pair_idx_base + x_lo1) & pair_in_block_mask) >= useful_pairs_inclusive;
             if pad0 & pad1 {
                 store_anchor_pair_nt(anchors.add(2 * x_lo0), zero, zero);
-                vst1q_u64(deltas.add(x_lo0 * 16).cast::<u64>(), zero);
+                store_delta_pair_nt(deltas.add(x_lo0 * 16), 0, 0);
                 store_anchor_pair_nt(anchors.add(2 * x_lo1), zero, zero);
-                vst1q_u64(deltas.add(x_lo1 * 16).cast::<u64>(), zero);
+                store_delta_pair_nt(deltas.add(x_lo1 * 16), 0, 0);
                 continue;
             }
 
