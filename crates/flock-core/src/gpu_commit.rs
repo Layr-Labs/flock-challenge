@@ -8516,13 +8516,21 @@ kernel void zc_r2_products(
         let calibration = tuned == usize::MAX;
         let chunks = if calibration {
             // Calibration cost is paid by EVERY worker process inside the
-            // CI job wall (~120 of them per ranked run) and this lineage
-            // already runs close to the 8-minute cap — `922fde63` scored
-            // +0.16% over its promoted base with a record p10 and still
-            // died on the cap. Keep the probe at 1/16 of the range: enough
-            // chunks for stable per-chunk pricing, ~half the wall of the
-            // 1/8 probe that shipped there.
-            (hi_size / 16).clamp(8, 128)
+            // CI job wall (~120 of them per ranked run), so probe width is
+            // job-wall spend, never timed-window spend. `922fde63` shipped
+            // this 1/8 probe and scored +0.16% with a record p10 but died
+            // on the 8-minute cap, and the probe was halved to 1/16 as cap
+            // insurance. That insurance priced the cap for a slower
+            // lineage: the current one completes with minutes of margin
+            // (zero timeout deaths across the last 60 board runs, ~7-10 s
+            // marginal spend from this width). Take the admission quality
+            // back: twice the chunks per replay carries the Metal clock
+            // further toward its timed operating point and halves the
+            // per-chunk pricing noise, and those two decide admission —
+            // a cold-clock measurement at ratio >= 8 turns the arm off
+            // for the whole process (share 0), which the floor share only
+            // partially rescues in the (2, 8) band at hi/8.
+            (hi_size / 8).clamp(8, 256)
         } else {
             tuned.min(hi_size * 15 / 16)
         };
