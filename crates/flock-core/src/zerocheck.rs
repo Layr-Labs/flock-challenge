@@ -609,6 +609,15 @@ fn prove_packed_padded_inner<C: Challenger>(
     // `r[k_skip+1] = 0` (probability 2⁻¹²⁸) makes W1/W2 unrecoverable from the
     // parity split; that case falls back to the incumbent route, which stays
     // in the tree as the oracle anyway.
+    //
+    // Sizing note, measured on the incumbent route this replaces
+    // (`FLOCK_ZC_TAIL_ROUND_TIMING=1`, ranked shape, 5-P-core M3 Pro): the two
+    // passes deleted here were the two largest items in the whole tail —
+    // T3 compact fold 203.1 ms and tail iteration i=1 (log_n 25) 50.9 ms,
+    // against 10.7 / 4.5 / 3.5 ms for i=2/3/4 and ~0.16 ms for *every* round
+    // below log_n 15 combined. So the remaining tail is now dominated by
+    // i=2..4, and the next application of this same trick has roughly an
+    // order of magnitude less to claim than this one did.
     let use_lookahead =
         (m == 32 || cfg!(test)) && n_mlv >= 6 && r[k_skip + 1] != F128::ZERO && !lookahead_off();
 
