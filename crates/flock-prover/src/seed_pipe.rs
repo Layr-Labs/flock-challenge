@@ -190,8 +190,12 @@ fn blocks_eq(a: &[Compression], b: &[Compression]) -> bool {
     if a.len() != b.len() {
         return false;
     }
-    a.par_chunks(8192)
-        .zip(b.par_chunks(8192))
+    // 2048 elements = 229 KiB per chunk: byte-aligned (112 B x 2048 is a
+    // cache-line multiple) granularity yielding 128 chunks -> ~12.8 per
+    // worker on the 10-core pool, versus 3.2 per worker at 917 KiB (33%
+    // worst-case load imbalance). Same acceptance semantics, better balance.
+    a.par_chunks(2048)
+        .zip(b.par_chunks(2048))
         .all(|(x, y)| bytes_of(x) == bytes_of(y))
 }
 
