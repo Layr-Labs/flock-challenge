@@ -19,39 +19,9 @@
 
 use crate::field::F128;
 use core::ops::{Deref, DerefMut};
-use std::sync::{
-    Mutex,
-    atomic::{AtomicUsize, Ordering},
-};
+use std::sync::Mutex;
 
 static POOL: Mutex<Vec<Vec<F128>>> = Mutex::new(Vec::new());
-
-/// One process-lifetime allocation whose address is consumed by a retained
-/// external no-copy view. Unlike [`POOL`], this slot is deliberately immune
-/// to smallest-first eviction and [`clear`]: the owner of that view calls
-/// [`unpin_f128_allocation`] before the allocation may rejoin the ordinary
-/// pool. While `buffer` is `None`, the exact `Vec` is checked out by prover
-/// code, so ownership still exists outside this slot.
-struct PinnedF128 {
-    addr: usize,
-    len: usize,
-    buffer: Option<Vec<F128>>,
-}
-
-static PINNED_F128: Mutex<Option<PinnedF128>> = Mutex::new(None);
-// Fast rejection keeps ordinary scratch traffic off the pin mutex.
-static PINNED_F128_ADDR: AtomicUsize = AtomicUsize::new(0);
-static PINNED_F128_LEN: AtomicUsize = AtomicUsize::new(0);
-
-/// Second, independent pinned slot with the same semantics, registered once
-/// by the recursive-Merkle GPU offload for the L1 matrix class (its no-copy
-/// Metal view must keep naming one process-lifetime address so the timed
-/// prove never re-pays wrap creation or page wiring). Deliberately a
-/// duplicate rather than a generalization: the promoted z-pin lifecycle
-/// above stays byte-for-byte untouched.
-static PINNED2_F128: Mutex<Option<PinnedF128>> = Mutex::new(None);
-static PINNED2_F128_ADDR: AtomicUsize = AtomicUsize::new(0);
-static PINNED2_F128_LEN: AtomicUsize = AtomicUsize::new(0);
 
 /// Max buffers retained. The m=29 prove cycle gives ~18 distinct buffers:
 /// witness z/a/b, the L0 codeword, zerocheck's 2 fold outputs + 2 ping-pong
@@ -77,175 +47,10 @@ const MAX_POOLED: usize = 48;
 /// data from a previous use. Caller MUST write every slot before reading it
 /// (same contract as [`crate::alloc_uninit_vec`]).
 pub fn take_f128(n: usize) -> Vec<F128> {
-    if let Some(v) = try_take_pinned_f128(n) {
-        return v;
-    }
-    if let Some(v) = try_take_pinned2_f128(n) {
-        return v;
-    }
     if let Some(v) = try_take_f128(n) {
         return v;
     }
     crate::alloc_uninit_vec(n)
-}
-
-/// [`take_f128`] variant that never returns a pinned allocation. The pinned
-/// slots carry process-lifetime external no-copy Metal views; a caller that
-/// intends to create its OWN no-copy view over the returned buffer (the
-/// zerocheck tail products arms) must not receive a range that is already
-/// wrapped — overlapping `newBufferWithBytesNoCopy` views are not legal, and
-/// on a worker where the pin is parked at take time the ordinary
-/// pinned-first preference hands out exactly that collision.
-pub(crate) fn take_f128_unpinned(n: usize) -> Vec<F128> {
-    if let Some(v) = try_take_f128(n) {
-        // The evictable pool never holds a pinned allocation (give_f128
-        // parks those in their dedicated slots), so this cannot alias.
-        return v;
-    }
-    crate::alloc_uninit_vec(n)
-}
-
-/// Whether `[addr, addr + len_bytes)` overlaps either pinned registration's
-/// byte range. Belt-and-braces for wrap sites: even a buffer obtained
-/// through an ordinary take must refuse a second no-copy view if it aliases
-/// a pinned (already-wrapped) allocation.
-pub(crate) fn f128_range_overlaps_pin(addr: usize, len_bytes: usize) -> bool {
-    let end = addr.saturating_add(len_bytes);
-    for (a, l) in [
-        (
-            PINNED_F128_ADDR.load(Ordering::Acquire),
-            PINNED_F128_LEN.load(Ordering::Acquire),
-        ),
-        (
-            PINNED2_F128_ADDR.load(Ordering::Acquire),
-            PINNED2_F128_LEN.load(Ordering::Acquire),
-        ),
-    ] {
-        if a == 0 || l == 0 {
-            continue;
-        }
-        let pin_end = a + l * core::mem::size_of::<F128>();
-        if addr < pin_end && a < end {
-            return true;
-        }
-    }
-    false
-}
-
-fn try_take_pinned_f128(n: usize) -> Option<Vec<F128>> {
-    if PINNED_F128_LEN.load(Ordering::Acquire) != n {
-        return None;
-    }
-    let mut slot = PINNED_F128.lock().unwrap();
-    let pinned = slot.as_mut()?;
-    if pinned.len != n {
-        return None;
-    }
-    let mut v = pinned.buffer.take()?;
-    debug_assert_eq!(v.as_ptr() as usize, pinned.addr);
-    debug_assert!(v.capacity() >= n);
-    v.clear();
-    // SAFETY: the registered allocation has capacity >= n and F128 is Copy;
-    // callers retain the ordinary write-before-read contract of take_f128.
-    unsafe { v.set_len(n) };
-    Some(v)
-}
-
-fn try_take_pinned2_f128(n: usize) -> Option<Vec<F128>> {
-    if PINNED2_F128_LEN.load(Ordering::Acquire) != n {
-        return None;
-    }
-    let mut slot = PINNED2_F128.lock().unwrap();
-    let pinned = slot.as_mut()?;
-    if pinned.len != n {
-        return None;
-    }
-    let mut v = pinned.buffer.take()?;
-    debug_assert_eq!(v.as_ptr() as usize, pinned.addr);
-    debug_assert!(v.capacity() >= n);
-    v.clear();
-    // SAFETY: the registered allocation has capacity >= n and F128 is Copy;
-    // callers retain the ordinary write-before-read contract of take_f128.
-    unsafe { v.set_len(n) };
-    Some(v)
-}
-
-/// [`pin_f128_allocation`] for the second slot. Registered once per process
-/// (the recursive-Merkle offload's init); there is no unpin — the Metal view
-/// lives for the process.
-pub(crate) fn pin2_f128_allocation(buffer: &[F128]) -> bool {
-    if buffer.is_empty() {
-        return false;
-    }
-    let addr = buffer.as_ptr() as usize;
-    let len = buffer.len();
-    let mut slot = PINNED2_F128.lock().unwrap();
-    match slot.as_ref() {
-        Some(pinned) => pinned.addr == addr && pinned.len == len,
-        None => {
-            *slot = Some(PinnedF128 {
-                addr,
-                len,
-                buffer: None,
-            });
-            PINNED2_F128_ADDR.store(addr, Ordering::Release);
-            PINNED2_F128_LEN.store(len, Ordering::Release);
-            true
-        }
-    }
-}
-
-/// Quarantine the allocation behind `buffer` once it next returns through
-/// [`give_f128`]. Until then the caller still owns the exact `Vec`; after it
-/// returns, [`take_f128`] preferentially hands that same allocation back for
-/// an equal-length request.
-///
-/// Only one external no-copy view is supported. Re-registering the same
-/// allocation is idempotent; a different live registration fails closed.
-pub(crate) fn pin_f128_allocation(buffer: &[F128]) -> bool {
-    if buffer.is_empty() {
-        return false;
-    }
-    let addr = buffer.as_ptr() as usize;
-    let len = buffer.len();
-    let mut slot = PINNED_F128.lock().unwrap();
-    match slot.as_ref() {
-        Some(pinned) => pinned.addr == addr && pinned.len == len,
-        None => {
-            *slot = Some(PinnedF128 {
-                addr,
-                len,
-                buffer: None,
-            });
-            PINNED_F128_ADDR.store(addr, Ordering::Release);
-            PINNED_F128_LEN.store(len, Ordering::Release);
-            true
-        }
-    }
-}
-
-/// Release a registration after its external no-copy view has been released.
-/// If the allocation is parked, it rejoins the ordinary evictable pool; if it
-/// is checked out, its eventual [`give_f128`] follows the ordinary path.
-pub(crate) fn unpin_f128_allocation(addr: usize, len: usize) -> bool {
-    let parked = {
-        let mut slot = PINNED_F128.lock().unwrap();
-        let matches = slot
-            .as_ref()
-            .is_some_and(|pinned| pinned.addr == addr && pinned.len == len);
-        if !matches {
-            return false;
-        }
-        // Clear the fast-path keys while holding the slot lock. A racing
-        // take/give rechecks the guarded record before acting.
-        PINNED_F128_LEN.store(0, Ordering::Release);
-        PINNED_F128_ADDR.store(0, Ordering::Release);
-        slot.take().and_then(|pinned| pinned.buffer)
-    };
-    if let Some(v) = parked {
-        give_f128(v);
-    }
-    true
 }
 
 /// Pool-only variant of [`take_f128`]: returns `None` instead of falling
@@ -280,29 +85,6 @@ pub(crate) fn try_take_f128(n: usize) -> Option<Vec<F128>> {
 pub fn give_f128(v: Vec<F128>) {
     if v.capacity() == 0 {
         return;
-    }
-    let addr = v.as_ptr() as usize;
-    if PINNED_F128_ADDR.load(Ordering::Acquire) == addr {
-        let mut slot = PINNED_F128.lock().unwrap();
-        if let Some(pinned) = slot.as_mut()
-            && pinned.addr == addr
-            && v.capacity() >= pinned.len
-            && pinned.buffer.is_none()
-        {
-            pinned.buffer = Some(v);
-            return;
-        }
-    }
-    if PINNED2_F128_ADDR.load(Ordering::Acquire) == addr {
-        let mut slot = PINNED2_F128.lock().unwrap();
-        if let Some(pinned) = slot.as_mut()
-            && pinned.addr == addr
-            && v.capacity() >= pinned.len
-            && pinned.buffer.is_none()
-        {
-            pinned.buffer = Some(v);
-            return;
-        }
     }
     let mut pool = POOL.lock().unwrap();
     pool.push(v);
@@ -374,12 +156,7 @@ pub fn prewarm_prover(m: usize) {
     give_u8(stripe);
 }
 
-/// Release every ordinary pooled buffer back to the OS.
-///
-/// A buffer registered through [`pin_f128_allocation`] is intentionally not
-/// released here: its external no-copy view still names that allocation.
-/// [`unpin_f128_allocation`] releases that lifetime coupling first and then
-/// returns any parked buffer to the ordinary pool.
+/// Release every pooled buffer back to the OS.
 pub fn clear() {
     POOL.lock().unwrap().clear();
     POOL_U8.lock().unwrap().clear();
@@ -544,13 +321,8 @@ impl DerefMut for ScratchBytes {
 mod tests {
     use super::*;
 
-    // Every test below mutates the same process-global pools. Serialize them
-    // so pointer-identity assertions do not race another test's `clear`.
-    static SCRATCH_TEST_LOCK: Mutex<()> = Mutex::new(());
-
     #[test]
     fn take_reuses_given_buffer() {
-        let _serial = SCRATCH_TEST_LOCK.lock().unwrap();
         clear();
         let mut v = take_f128(1024);
         for slot in v.iter_mut() {
@@ -567,7 +339,6 @@ mod tests {
 
     #[test]
     fn pool_is_bounded() {
-        let _serial = SCRATCH_TEST_LOCK.lock().unwrap();
         clear();
         for _ in 0..(MAX_POOLED + 4) {
             give_f128(take_f128(16));
@@ -578,7 +349,6 @@ mod tests {
 
     #[test]
     fn donated_f128_bytes_recycle_with_original_layout() {
-        let _serial = SCRATCH_TEST_LOCK.lock().unwrap();
         clear();
         let storage = vec![F128::ZERO; 64];
         let ptr = storage.as_ptr();
@@ -590,51 +360,6 @@ mod tests {
         let recycled = take_f128(64);
         assert_eq!(recycled.as_ptr(), ptr);
         give_f128(recycled);
-        clear();
-    }
-
-    #[test]
-    fn pinned_f128_is_preferred_and_survives_clear_until_unpinned() {
-        let _serial = SCRATCH_TEST_LOCK.lock().unwrap();
-        const N: usize = 257;
-        clear();
-        let pinned = take_f128(N);
-        let ptr = pinned.as_ptr();
-        assert!(pin_f128_allocation(&pinned));
-
-        // A same-size competitor returns first, but the registered allocation
-        // is quarantined separately when it later comes back.
-        let competitor = take_f128(N);
-        assert_ne!(competitor.as_ptr(), ptr);
-        give_f128(competitor);
-        give_f128(pinned);
-        clear();
-
-        let reused = take_f128(N);
-        assert_eq!(reused.as_ptr(), ptr);
-        give_f128(reused);
-        assert!(unpin_f128_allocation(ptr as usize, N));
-        clear();
-    }
-
-    #[test]
-    fn unpin_while_checked_out_makes_the_later_return_ordinary() {
-        let _serial = SCRATCH_TEST_LOCK.lock().unwrap();
-        const N: usize = 263;
-        clear();
-        let pinned = take_f128(N);
-        let ptr = pinned.as_ptr();
-        assert!(pin_f128_allocation(&pinned));
-        give_f128(pinned);
-
-        let checked_out = take_f128(N);
-        assert_eq!(checked_out.as_ptr(), ptr);
-        assert!(unpin_f128_allocation(ptr as usize, N));
-        give_f128(checked_out);
-
-        // The buffer is now ordinary scratch, so clear is allowed to drop it.
-        assert_eq!(PINNED_F128_ADDR.load(Ordering::Acquire), 0);
-        assert_eq!(PINNED_F128_LEN.load(Ordering::Acquire), 0);
         clear();
     }
 }
