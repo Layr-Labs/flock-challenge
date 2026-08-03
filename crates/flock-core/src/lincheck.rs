@@ -132,12 +132,6 @@ pub use kernels::{
     partial_fold_packed_z_neon_iblock_padded, partial_fold_packed_z_neon_oblock_padded,
     partial_fold_packed_z_neon_single, partial_fold_packed_z_neon_single_padded,
 };
-#[cfg(target_arch = "aarch64")]
-#[cfg_attr(not(target_os = "macos"), allow(unused_imports))]
-pub(crate) use kernels::{
-    oblock_claim_count, oblock_claim_stripe_base, partial_fold_packed_z_neon_oblock_padded_range,
-    partial_fold_packed_z_neon_oblock_padded_suffix,
-};
 
 /// Bench-only A/B toggle: when set, [`partial_fold_packed_z_best`] uses the legacy
 /// `i_inner`-partitioned `partial_fold_packed_z_neon_iblock_padded` instead of the
@@ -742,7 +736,7 @@ pub(crate) const NEON_TILE_T: usize = 8;
 /// for the given (m, k_log). Threads `useful_bits` through so the kernel
 /// can skip blocks past the useful region of each block (byte-identical to
 /// the dense path on honestly-padded witnesses).
-pub(crate) fn partial_fold_packed_z_best(
+fn partial_fold_packed_z_best(
     z_packed: &[u8],
     m: usize,
     k_log: usize,
@@ -791,92 +785,6 @@ pub(crate) fn partial_fold_packed_z_best(
 /// [`partial_fold_packed_z_best`] for the crossover calibration.
 #[cfg(target_arch = "aarch64")]
 const OBLOCK_MIN_N_LOG: usize = 16;
-
-/// The one production shape the lincheck GPU fold arm is tuned and gated
-/// for (`m = 32`, `k_log = 14`). Everything else takes the exact CPU path.
-/// `n_log ≥ 6` keeps the CPU claim suffix's structural preconditions
-/// (`n_stripes % NEON_TILE_T == 0`) satisfied on every shape the GPU
-/// launcher can accept, including the small shapes tests drive.
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-fn ranked_lincheck_fold_gpu_shape(m: usize, k_log: usize) -> bool {
-    // `cfg!(test)` widens the gate so end-to-end oracles can drive the arm
-    // at a small shape. Production is the ranked shape only.
-    (cfg!(test) || (m == 32 && k_log == 14))
-        && m >= k_log + 6
-        && !FOLD_IBLOCK.load(std::sync::atomic::Ordering::Relaxed)
-}
-
-/// Fold the witness stripe against `eq_outer`, draining the GPU prefix when
-/// one is in flight. Bit-identical to [`partial_fold_packed_z_best`] in
-/// every case: GF(2¹²⁸) add is XOR — associative and commutative — so
-/// splitting the oblock claim range between the GPU prefix and the CPU
-/// hetero-queue suffix and XORing the halves reproduces the whole-range
-/// result exactly. Any GPU-side failure makes the CPU redo exactly the
-/// skipped prefix claims (launch failure ⇒ the whole fold stays on the
-/// incumbent path) — slower, still exact.
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-fn partial_fold_packed_z_best_gpu_split(
-    z_packed: &[u8],
-    m: usize,
-    k_log: usize,
-    useful_bits: usize,
-    eq_outer: &[F128],
-) -> Vec<F128> {
-    let gpu = ranked_lincheck_fold_gpu_shape(m, k_log)
-        .then(|| {
-            crate::gpu_commit::launch_lincheck_fold(z_packed, m, k_log, useful_bits, eq_outer)
-        })
-        .flatten();
-    if let Some(job) = gpu {
-        let claim_lo = job.claim_lo();
-        let t_suffix = std::time::Instant::now();
-        let mut out = partial_fold_packed_z_neon_oblock_padded_suffix(
-            z_packed,
-            m,
-            k_log,
-            useful_bits,
-            eq_outer,
-            claim_lo,
-        );
-        let suffix_ms = t_suffix.elapsed().as_secs_f64() * 1e3;
-        // No head in this window: the CPU suffix starts at submission.
-        match job.finish_xor_into(&mut out, 0.0, suffix_ms) {
-            Ok(()) => return out,
-            Err(e) => {
-                // The prefix never landed and the CPU already skipped it.
-                // Redo exactly those claims here — slower, still exact.
-                if crate::gpu_commit::gpu_lincheck_debug() {
-                    eprintln!("[gpu-lincheck] prefix failed, CPU redo: {e}");
-                }
-                let prefix = partial_fold_packed_z_neon_oblock_padded_range(
-                    z_packed,
-                    m,
-                    k_log,
-                    useful_bits,
-                    eq_outer,
-                    0,
-                    claim_lo,
-                );
-                for (a, b) in out.iter_mut().zip(prefix) {
-                    *a += b;
-                }
-                return out;
-            }
-        }
-    }
-    partial_fold_packed_z_best(z_packed, m, k_log, useful_bits, eq_outer)
-}
-
-#[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
-fn partial_fold_packed_z_best_gpu_split(
-    z_packed: &[u8],
-    m: usize,
-    k_log: usize,
-    useful_bits: usize,
-    eq_outer: &[F128],
-) -> Vec<F128> {
-    partial_fold_packed_z_best(z_packed, m, k_log, useful_bits, eq_outer)
-}
 
 /// Quick test for "can we use the tiled fast path?". Tile uses `TILE_T`
 /// stripes; we need `n_stripes` divisible by TILE_T and enough outer dim.
@@ -1445,8 +1353,7 @@ fn prove_padded_inner<Ch: Challenger>(
             None
         };
         let eq_x_outer = build_eq_table(&x_ab.x_outer);
-        let z_vec =
-            partial_fold_packed_z_best_gpu_split(z_packed, m, k_log, useful_bits, &eq_x_outer);
+        let z_vec = partial_fold_packed_z_best(z_packed, m, k_log, useful_bits, &eq_x_outer);
         if let Some(t) = t {
             eprintln!(
                 "[lc] {:<26} {:>7.2} ms",

@@ -138,23 +138,25 @@ pub(crate) unsafe fn shift_reduce_inner_ab_x86_avx512(
         _mm512_storeu_si512(out.as_mut_ptr() as *mut __m512i, acc);
     }
 }
-/// x86 AVX-512 convert-table fold, AB half of the eight-bank C variant. Table
-/// lookups stay scalar because their byte-selected addresses are irregular,
-/// while four lanes of the resulting F128 accumulator are multiplied by
-/// `eq_lo_val` in one VPCLMULQDQ batch before being XORed into the worker
-/// partials. The C side is table-free (see `kernels::accumulate_c_banks`).
+/// x86 AVX-512 convert-table fold for the two-bank C path. Table lookups stay
+/// scalar because their byte-selected addresses are irregular, while four
+/// lanes of each resulting F128 accumulator are multiplied by `eq_lo_val` in
+/// one VPCLMULQDQ batch before being XORed into the worker partials.
 #[cfg(all(
     target_arch = "x86_64",
     target_feature = "avx512f",
     target_feature = "vpclmulqdq"
 ))]
 #[target_feature(enable = "avx512f,vpclmulqdq")]
-pub(crate) unsafe fn accumulate_convert_ab_x86_avx512(
+pub(crate) unsafe fn accumulate_convert_with_s_hat_v_x86_avx512(
     chunk_ab_bytes: &[[u8; ELL]; 1 << N_MEDIUM],
+    chunk_c_bytes: &[[u8; ELL]; 1 << N_MEDIUM],
     n_b_med: usize,
     convert: &[F128],
     eq_lo_val: F128,
     partial_ab: &mut [F128; ELL],
+    partial_c_0: &mut [F128; ELL],
+    partial_c_1: &mut [F128; ELL],
 ) {
     use crate::field::gf2_128::x86_64::{f128x4_set, ghash_mul_x4};
     use core::arch::x86_64::*;
@@ -168,20 +170,39 @@ pub(crate) unsafe fn accumulate_convert_ab_x86_avx512(
         let eq = f128x4_set(eq_lo_val, eq_lo_val, eq_lo_val, eq_lo_val);
         for lane in (0..ELL).step_by(4) {
             let mut cf_ab = [F128::ZERO; 4];
+            let mut cf_c_0 = [F128::ZERO; 4];
+            let mut cf_c_1 = [F128::ZERO; 4];
             for b_med in 0..n_b_med {
                 let table_base = b_med * 256;
                 for j in 0..4 {
                     let v_ab = chunk_ab_bytes[b_med][lane + j] as usize;
+                    let v_c = chunk_c_bytes[b_med][lane + j] as usize;
                     cf_ab[j] += convert[table_base + v_ab];
+                    cf_c_0[j] += convert[table_base + (v_c & 0x55)];
+                    cf_c_1[j] += convert[table_base + (v_c & 0xAA)];
                 }
             }
 
             let scaled_ab = ghash_mul_x4(f128x4_set(cf_ab[0], cf_ab[1], cf_ab[2], cf_ab[3]), eq);
+            let scaled_c_0 =
+                ghash_mul_x4(f128x4_set(cf_c_0[0], cf_c_0[1], cf_c_0[2], cf_c_0[3]), eq);
+            let scaled_c_1 =
+                ghash_mul_x4(f128x4_set(cf_c_1[0], cf_c_1[1], cf_c_1[2], cf_c_1[3]), eq);
 
             let ab_ptr = partial_ab.as_mut_ptr().add(lane) as *mut __m512i;
+            let c0_ptr = partial_c_0.as_mut_ptr().add(lane) as *mut __m512i;
+            let c1_ptr = partial_c_1.as_mut_ptr().add(lane) as *mut __m512i;
             _mm512_storeu_si512(
                 ab_ptr,
                 _mm512_xor_si512(_mm512_loadu_si512(ab_ptr), scaled_ab),
+            );
+            _mm512_storeu_si512(
+                c0_ptr,
+                _mm512_xor_si512(_mm512_loadu_si512(c0_ptr), scaled_c_0),
+            );
+            _mm512_storeu_si512(
+                c1_ptr,
+                _mm512_xor_si512(_mm512_loadu_si512(c1_ptr), scaled_c_1),
             );
         }
     }
