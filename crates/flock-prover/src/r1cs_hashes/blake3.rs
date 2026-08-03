@@ -1564,6 +1564,10 @@ pub(crate) mod witgen_simd {
 
     const U32_PER_BLOCK: usize = K / 32; // 512
     const F128_PER_BLOCK: usize = K / 128;
+    // USEFUL_BITS ends in word 481. Keep a whole additional group (words
+    // 480..487) in the a/b drain so the producer/consumer boundary remains
+    // deliberately boring; groups 61..63 are padding only.
+    const AB_DUMP_GROUPS: usize = 61;
 
     pub(crate) fn enabled() -> bool {
         static ON: LazyLock<bool> =
@@ -1742,16 +1746,16 @@ pub(crate) mod witgen_simd {
         }
     }
 
-    /// Drain a 512-word block-lane stage to the four row-major block
-    /// destinations. `ld4` deinterleaves four block-lane words into
-    /// per-block 16-B runs (the register transpose the batch-major layout
-    /// dodged), so each block's 2 KiB drains as ONE long ascending burst:
+    /// Drain a selected prefix of a 512-word block-lane stage to the four
+    /// row-major block destinations. `ld4` deinterleaves four block-lane
+    /// words into per-block 16-B runs (the register transpose the batch-major
+    /// layout dodged), so every selected prefix is one long ascending burst:
     /// stnp pairs for the §14-passing buffers (a/b), plain stores for z
     /// (§16 in-closure stripe re-read).
     #[inline(always)]
-    unsafe fn dump<const NT: bool>(stage: *const V4, dst: *mut u32) {
+    unsafe fn dump<const NT: bool, const GROUPS: usize>(stage: *const V4, dst: *mut u32) {
         unsafe {
-            for g in 0..64 {
+            for g in 0..GROUPS {
                 let w = 8 * g;
                 let x = vld4q_u32(stage.add(w) as *const u32);
                 let y = vld4q_u32(stage.add(w + 4) as *const u32);
@@ -1827,9 +1831,12 @@ pub(crate) mod witgen_simd {
         }
     }
 
-    /// Build the (z, a, b) blocks for FOUR compressions in u32-lane lockstep,
-    /// fully writing every word (stale scratch). `z`/`a`/`b` point at the
-    /// quad's first block; block j occupies `dst + j*512 .. +512` u32 words.
+    /// Build the (z, a, b) blocks for FOUR compressions in u32-lane lockstep.
+    /// `z`/`a`/`b` point at the quad's first block; block j occupies
+    /// `dst + j*512 .. +512` u32 words. `z` is always fully written. On the
+    /// exact ranked deferred-stripe path, `sparse_ab_tail` leaves the final
+    /// padding-only a/b groups stale in the scratch allocation; zerocheck's
+    /// padded readers never consume them.
     /// `z_nt` and `ab_nt` independently select non-temporal drain stores for
     /// z and for the a/b pair, respectively.
     /// Bit-exact with [`super::build_block_witness_ab_stream_into`] x4.
@@ -1840,6 +1847,7 @@ pub(crate) mod witgen_simd {
         b: *mut u32,
         z_nt: bool,
         ab_nt: bool,
+        sparse_ab_tail: bool,
     ) {
         unsafe {
             // ---- gather: SoA block-lane vectors via 4x4 transposes ----
@@ -2084,25 +2092,36 @@ pub(crate) mod witgen_simd {
 
             // ---- drain stages: per-block 2 KiB ascending bursts ----
             if z_nt {
-                dump::<true>(zs, z);
+                dump::<true, 64>(zs, z);
             } else {
-                dump::<false>(zs, z);
+                dump::<false, 64>(zs, z);
             }
             if ab_nt {
-                dump::<true>(ast, a);
-                dump::<true>(bs, b);
+                if sparse_ab_tail {
+                    dump::<true, AB_DUMP_GROUPS>(ast, a);
+                    dump::<true, AB_DUMP_GROUPS>(bs, b);
+                } else {
+                    dump::<true, 64>(ast, a);
+                    dump::<true, 64>(bs, b);
+                }
             } else {
-                dump::<false>(ast, a);
-                dump::<false>(bs, b);
+                if sparse_ab_tail {
+                    dump::<false, AB_DUMP_GROUPS>(ast, a);
+                    dump::<false, AB_DUMP_GROUPS>(bs, b);
+                } else {
+                    dump::<false, 64>(ast, a);
+                    dump::<false, 64>(bs, b);
+                }
             }
         }
     }
 
     /// SIMD counterpart of `drive_witness_packed_and_lincheck_impl`
-    /// (PER_BLOCK_FULLY_WRITES, no rate-2 codeword): same scratch pools, same
-    /// process_group shape, same optional Metal band streaming, same stripe
-    /// pass; the per-block builder runs as two NEON quads per group and the
-    /// a/b/stripe stores are non-temporal (§14; z stays plain, §16).
+    /// (PER_BLOCK_FULLY_WRITES for z, no rate-2 codeword): same scratch pools,
+    /// same process_group shape, same optional Metal band streaming, same
+    /// stripe pass; the per-block builder runs as two NEON quads per group.
+    /// On the exact ranked deferred-stripe path only, a/b's padding-only tail
+    /// is left stale while z remains complete.
     #[allow(clippy::type_complexity)]
     fn generate_impl(
         blocks: &[Compression],
@@ -2183,6 +2202,9 @@ pub(crate) mod witgen_simd {
         // the full 512 MiB ranked buffer. The per-band release fence below is
         // the same visibility boundary used by the cached-store path.
         let z_nt = select_z_nt(nt, defer_ranked_stripe, z_nt_enabled());
+        let sparse_ab_tail = defer_ranked_stripe
+            && n_total == (1 << 18)
+            && stripe_useful_bits == USEFUL_BITS;
 
         let process_group = |g: usize| {
             // SAFETY: each scheduled group index occurs exactly once. Every
@@ -2214,6 +2236,7 @@ pub(crate) mod witgen_simd {
                         b_grp[base..].as_mut_ptr() as *mut u32,
                         z_nt,
                         nt,
+                        sparse_ab_tail,
                     );
                 }
             }
@@ -3929,6 +3952,7 @@ mod tests {
                         bq.as_mut_ptr() as *mut u32,
                         z_nt,
                         ab_nt,
+                        false,
                     );
                 }
                 for (j, inp) in inputs.iter().enumerate() {
@@ -3958,6 +3982,54 @@ mod tests {
                 }
             }
         }
+
+        // Ranked deferred-stripe mode deliberately leaves only padding-only
+        // a/b groups stale. This poison-buffer oracle keeps that store
+        // contract explicit on the target implementation: z is still fully
+        // initialized, the conservative a/b prefix is exact, and the omitted
+        // suffix is untouched rather than accidentally zero-filled.
+        const AB_DUMP_U64: usize = 61 * 4;
+        let inputs: [Compression; 4] = std::array::from_fn(|_| mk(&mut rng));
+        let mut z_sparse = [u64::MAX; 4 * WORDS];
+        let mut a_sparse = [u64::MAX; 4 * WORDS];
+        let mut b_sparse = [u64::MAX; 4 * WORDS];
+        unsafe {
+            witgen_simd::build_quad_witness_ab_stream_neon(
+                [&inputs[0], &inputs[1], &inputs[2], &inputs[3]],
+                z_sparse.as_mut_ptr() as *mut u32,
+                a_sparse.as_mut_ptr() as *mut u32,
+                b_sparse.as_mut_ptr() as *mut u32,
+                false,
+                false,
+                true,
+            );
+        }
+        for (j, inp) in inputs.iter().enumerate() {
+            let (cv, m, t, bl, fl) = inp;
+            let mut z_ref = [0u64; WORDS];
+            let mut a_ref = [0u64; WORDS];
+            let mut b_ref = [0u64; WORDS];
+            build_block_witness_ab_stream_into(
+                cv, m, *t, *bl, *fl, &mut z_ref, &mut a_ref, &mut b_ref,
+            );
+            let base = j * WORDS;
+            assert_eq!(&z_sparse[base..base + WORDS], &z_ref);
+            assert_eq!(
+                &a_sparse[base..base + AB_DUMP_U64],
+                &a_ref[..AB_DUMP_U64]
+            );
+            assert_eq!(
+                &b_sparse[base..base + AB_DUMP_U64],
+                &b_ref[..AB_DUMP_U64]
+            );
+            assert!(a_sparse[base + AB_DUMP_U64..base + WORDS]
+                .iter()
+                .all(|v| *v == u64::MAX));
+            assert!(b_sparse[base + AB_DUMP_U64..base + WORDS]
+                .iter()
+                .all(|v| *v == u64::MAX));
+        }
+
         // Driver equality incl. padding slots and the stripe.
         for &n_blocks in &[1usize, 4, 5, 8, 13, 16] {
             let n_log = min_n_blocks_log(n_blocks).max(3);
