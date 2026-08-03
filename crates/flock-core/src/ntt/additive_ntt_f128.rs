@@ -210,6 +210,35 @@ fn use_ranked_deep_pair_fusion(
         && n_top == 10
 }
 
+/// Recursive Ligerito commits enter the NTT after their from-message radix-8
+/// prefix, so their cache-resident suffix begins below `n_top`.  The two
+/// ranked recursive geometries still have an even (or final-single) deep
+/// suffix and use the same already-oracled fused-2 rows kernel as L0.  Keep
+/// this distinct from L0: its surfaces fit in the 2 MiB subgroup cache, so
+/// this is a cache-traffic experiment, not a claim about L0's GPU path.
+#[inline]
+fn use_recursive_deep_pair_fusion(
+    log_d: usize,
+    num_ntts: usize,
+    start_layer: usize,
+    n_top: usize,
+) -> bool {
+    cfg!(all(
+        target_os = "macos",
+        target_arch = "aarch64",
+        target_feature = "aes"
+    )) && num_ntts == 8
+        && n_top == 4
+        && matches!((log_d, start_layer), (18, 5) | (16, 6))
+        && std::env::var_os("FLOCK_NO_RECURSIVE_DEEP_PAIR").is_none()
+}
+
+#[inline]
+fn use_deep_pair_fusion(log_d: usize, num_ntts: usize, start_layer: usize, n_top: usize) -> bool {
+    use_ranked_deep_pair_fusion(log_d, num_ntts, start_layer, n_top)
+        || use_recursive_deep_pair_fusion(log_d, num_ntts, start_layer, n_top)
+}
+
 /// The standard dimension-20 basis has low-limb-only twiddles throughout the
 /// final two layers. This permits a two-PMULL product on AArch64 instead of the
 /// generic six-PMULL field multiply. Keep the dispatch tied to the exact
@@ -966,6 +995,7 @@ impl AdditiveNttF128 {
             num_ntts,
             DEEP_LAYER,
             log_d,
+            DEEP_LAYER,
             sub_start,
             sub_end,
             odd_tail,
@@ -1337,12 +1367,13 @@ impl AdditiveNttF128 {
         // Ranked L0: layers 10..20 form five exact pairs. Fuse each pair inside
         // the existing outer chunk job so every row is loaded/stored once per
         // two layers and no nested Rayon region is created.
-        if use_ranked_deep_pair_fusion(log_d, num_ntts, start_layer, n_top) {
+        if use_deep_pair_fusion(log_d, num_ntts, start_layer, n_top) {
             self.forward_transform_interleaved_deep_fused_pairs_and_then(
                 data,
                 num_ntts,
                 n_top,
                 log_d,
+                n_top.max(start_layer),
                 finish_chunk,
             );
             return;
@@ -1390,6 +1421,7 @@ impl AdditiveNttF128 {
             num_ntts,
             n_top,
             log_d,
+            n_top,
             &|_, _| {},
         );
     }
@@ -1400,18 +1432,20 @@ impl AdditiveNttF128 {
         num_ntts: usize,
         n_top: usize,
         log_d: usize,
+        deep_start: usize,
         finish_chunk: &F,
     ) where
         F: Fn(usize, &[F128]) + Sync + Send,
     {
-        // Reached only under `use_ranked_deep_pair_fusion`, i.e. the exact
-        // ranked production geometry, so the ambient publication applies.
+        // L0 has the ambient static zero tail; recursive shapes return zero
+        // from this narrowly keyed helper and remain dense.
         let odd_tail = ranked_zero_odd_tail_lanes(log_d, num_ntts);
         self.forward_transform_interleaved_deep_fused_pairs_range_and_then(
             data,
             num_ntts,
             n_top,
             log_d,
+            deep_start,
             0,
             1usize << n_top,
             odd_tail,
@@ -1428,6 +1462,7 @@ impl AdditiveNttF128 {
         num_ntts: usize,
         n_top: usize,
         log_d: usize,
+        deep_start: usize,
         sub_start: usize,
         sub_end: usize,
         // Trailing lanes known zero at every odd position; 0 = dense.
@@ -1439,6 +1474,7 @@ impl AdditiveNttF128 {
         use rayon::prelude::*;
 
         debug_assert!(n_top <= log_d);
+        debug_assert!(deep_start >= n_top && deep_start <= log_d);
         debug_assert_eq!(data.len(), (1usize << log_d) * num_ntts);
         debug_assert!(sub_start < sub_end && sub_end <= (1usize << n_top));
         let sub_size_positions = 1usize << (log_d - n_top);
@@ -1455,7 +1491,7 @@ impl AdditiveNttF128 {
             .enumerate()
             .for_each(|(local_sub_idx, sub_data)| {
                 let sub_idx = sub_start + local_sub_idx;
-                let mut layer = n_top;
+                let mut layer = deep_start;
                 while layer + 1 < log_d {
                     let layer_in_sub = layer - n_top;
                     let num_blocks_in_sub = 1usize << layer_in_sub;
@@ -2408,6 +2444,44 @@ mod tests {
         }
     }
 
+    /// Recursive commits start below the cache split. Exercise their exact
+    /// `deep_start` values so the pair scheduler cannot re-run a prefix that
+    /// the from-message fused radix-8 producer already completed.
+    #[test]
+    fn recursive_deep_fused_pairs_match_scalar_reference() {
+        for (log_d, num_ntts, start_layer, n_top) in
+            [(18usize, 8usize, 5usize, 4usize), (16, 8, 6, 4)]
+        {
+            let ntt = AdditiveNttF128::standard(log_d);
+            let mut state = 0xa409_3822_299f_31d0u64 ^ log_d as u64;
+            let mut next = || {
+                state = state
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                state
+            };
+            let source: Vec<F128> = (0..(1usize << log_d) * num_ntts)
+                .map(|_| F128::new(next(), next()))
+                .collect();
+            let mut want = source.clone();
+            ntt.forward_transform_interleaved_scalar_from_layer(
+                &mut want,
+                num_ntts,
+                start_layer,
+            );
+            let mut got = source;
+            ntt.forward_transform_interleaved_deep_fused_pairs_and_then(
+                &mut got,
+                num_ntts,
+                n_top,
+                log_d,
+                start_layer,
+                &|_, _| {},
+            );
+            assert_eq!(got, want, "recursive geometry log_d={log_d}");
+        }
+    }
+
     /// Every finalized-chunk callback must observe the final transform bytes,
     /// exactly once and at the advertised global element offset.
     #[test]
@@ -2524,6 +2598,21 @@ mod tests {
         assert!(!is_ranked_top_hetero_fused3_pass(20, 8, 1, 10, 4));
         assert!(!is_ranked_top_hetero_fused3_pass(20, 64, 0, 10, 4));
         assert!(!is_ranked_top_hetero_fused3_pass(20, 64, 1, 9, 4));
+    }
+
+    #[test]
+    fn recursive_deep_pair_fusion_gate_is_narrow() {
+        let enabled_here = cfg!(all(
+            target_os = "macos",
+            target_arch = "aarch64",
+            target_feature = "aes"
+        ));
+        assert_eq!(use_recursive_deep_pair_fusion(18, 8, 5, 4), enabled_here);
+        assert_eq!(use_recursive_deep_pair_fusion(16, 8, 6, 4), enabled_here);
+        assert!(!use_recursive_deep_pair_fusion(18, 8, 6, 4));
+        assert!(!use_recursive_deep_pair_fusion(18, 8, 5, 3));
+        assert!(!use_recursive_deep_pair_fusion(18, 16, 5, 4));
+        assert!(!use_recursive_deep_pair_fusion(17, 8, 5, 4));
     }
 
     /// Exercise the block-zero specialization and the ordinary nonzero-block
@@ -3206,6 +3295,7 @@ mod block_range_equivalence {
             num_ntts,
             n_top,
             log_d,
+            n_top,
             sub_start,
             sub_end,
             0,
@@ -3301,6 +3391,7 @@ mod zero_lane_skip {
                 NUM_NTTS,
                 n_top,
                 log_d,
+                n_top,
                 0,
                 1 << n_top,
                 tail,
