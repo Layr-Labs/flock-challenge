@@ -480,6 +480,7 @@ fn prove_fast_ligerito_from_witness_with_commit_codeword<Ch: Challenger>(
             cpu / wall
         );
     }
+    if std::env::var_os("FLOCK_PHASE_TIMING").is_none() { eprintln!("[angel-observe] FLOCK_PHASE_TIMING unset on runner"); }
 
     let proof = R1csProofLigerito {
         zerocheck: zc_proof,
