@@ -670,11 +670,24 @@ unsafe fn r2_pair_fold_and_store(
 /// products: **32 PMULL per group instead of 38** on every offloaded chunk.
 /// The four `mul_q` row weightings survive because `W0`/`W3`/`W4`/`W5` still
 /// need all four scaled rows.
+///
+/// With `SKIP_PAD_STORES = true`, a fully-padding pair group (`pad0 & pad1`)
+/// does **not** write the four zero anchor/delta slots. Ranked BLAKE3 has
+/// `useful_pairs = 121` of 128 pairs per block, so pairs 121–127 are pure
+/// padding — 7/128 of the compact surface, exactly **84 MiB** of zero
+/// `stnp`/`vst1` traffic per prove. Those slots are unread by the matching
+/// double-fold consumer (which itself skips fully-padding groups and emits
+/// zeros into `a_out`/`b_out`), so the writes are dead. Kept as a **const
+/// generic**, not a runtime bool: a runtime flag into this register-saturated
+/// kernel was measured to grow the monomorphization by ~400 B and triple
+/// loop stack-reference sites (PhantasticUniverse post-mortem). Const
+/// rollback (`false`) is code-identical to the pre-change kernel.
 #[cfg(target_arch = "aarch64")]
 #[target_feature(enable = "aes")]
 pub(crate) unsafe fn fold_round2_compact_chunk_neon_lookahead_8<
     const FULL: bool,
     const ODD_ON_GPU: bool,
+    const SKIP_PAD_STORES: bool,
 >(
     table_data: *const u8,
     a_packed: *const u8,
@@ -729,10 +742,17 @@ pub(crate) unsafe fn fold_round2_compact_chunk_neon_lookahead_8<
             let pad0 = ((pair_idx_base + x_lo0) & pair_in_block_mask) >= useful_pairs_inclusive;
             let pad1 = ((pair_idx_base + x_lo1) & pair_in_block_mask) >= useful_pairs_inclusive;
             if pad0 & pad1 {
-                store_anchor_pair_nt(anchors.add(2 * x_lo0), zero, zero);
-                vst1q_u64(deltas.add(x_lo0 * 16).cast::<u64>(), zero);
-                store_anchor_pair_nt(anchors.add(2 * x_lo1), zero, zero);
-                vst1q_u64(deltas.add(x_lo1 * 16).cast::<u64>(), zero);
+                // Fully-padding group: message contribution is zero and the
+                // double-fold consumer skips these slots. The four zero
+                // stores are dead under SKIP_PAD_STORES; keep them under the
+                // rollback monomorph so the compact buffer stays a pure
+                // zero-init contract for any other reader.
+                if !SKIP_PAD_STORES {
+                    store_anchor_pair_nt(anchors.add(2 * x_lo0), zero, zero);
+                    vst1q_u64(deltas.add(x_lo0 * 16).cast::<u64>(), zero);
+                    store_anchor_pair_nt(anchors.add(2 * x_lo1), zero, zero);
+                    vst1q_u64(deltas.add(x_lo1 * 16).cast::<u64>(), zero);
+                }
                 continue;
             }
 
@@ -836,6 +856,15 @@ pub(crate) unsafe fn fold2_compact_and_round4_chunk_neon_8(
     eq_lo: *const F128,
     out_pairs: usize,
     degen: bool,
+    // Global pair index of the first pair this chunk owns (see call site).
+    pair_idx_base: usize,
+    pair_in_block_mask: usize,
+    useful_pairs_inclusive: usize,
+    // When true, fully-padding groups neither load the compact state nor
+    // accumulate into the message — they emit zeros into `a_out`/`b_out`.
+    // Pairs with the round-two SKIP_PAD_STORES producer so those slots may
+    // hold uninit garbage after the sweep.
+    skip_pad: bool,
 ) -> (F128, F128) {
     use core::arch::aarch64::*;
 
@@ -865,6 +894,20 @@ pub(crate) unsafe fn fold2_compact_and_round4_chunk_neon_8(
             let mut b_flat = true;
             for lane in 0..2usize {
                 let g = 2 * u + lane;
+                // Group `g` owns consecutive pairs `pair_idx_base + 2g` and
+                // `+ 2g + 1` (see the 4-F128 stride below).
+                if skip_pad {
+                    let p0 = pair_idx_base + 2 * g;
+                    let p1 = p0 + 1;
+                    let pad0 = (p0 & pair_in_block_mask) >= useful_pairs_inclusive;
+                    let pad1 = (p1 & pair_in_block_mask) >= useful_pairs_inclusive;
+                    if pad0 & pad1 {
+                        // Zero outputs; no message contribution (eq · 0 = 0).
+                        av[lane] = zero;
+                        bv[lane] = zero;
+                        continue;
+                    }
+                }
                 let ap = anchors.add(4 * g).cast::<u64>();
                 let anc_a0 = vld1q_u64(ap);
                 let anc_b0 = vld1q_u64(ap.add(2));
