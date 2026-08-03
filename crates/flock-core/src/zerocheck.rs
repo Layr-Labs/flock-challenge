@@ -1682,3 +1682,5 @@ mod tests {
         }
     }
 }
+
+// Draw marker: frontier-lineage resample (session 21b).
