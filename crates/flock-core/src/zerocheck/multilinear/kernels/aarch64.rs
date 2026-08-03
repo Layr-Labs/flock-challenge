@@ -115,6 +115,50 @@ unsafe fn wide_xor(acc: &mut WideNeon, value: WideNeon) {
     }
 }
 
+/// Kill switch for the deferred-aggregate spill fix.
+///
+/// The variant-K lookahead kernel carries eight wide (two-q-register)
+/// `WideNeon` accumulators, exceeding the 32-register AArch64 file and forcing
+/// the compiler to spill accumulators to the stack every group iteration
+/// (`str q`/`ldr q` to `[sp,...]`). Reducing the four *deferred round-three
+/// aggregates* (`w0`, `w3`, `w4`, `w5`) once per product — carrying a single
+/// reduced q-register each instead of a wide two-register sum — frees four
+/// q-registers and removes those spills.
+///
+/// This is bit-exact: GF(2^128) reduction is F2-linear, so
+/// `Σ reduce(pᵢ) == reduce(Σ pᵢ)`. Accumulating reduced products and
+/// accumulating wide products then reducing once yield the identical canonical
+/// field element (see `deferred_aggregate_reduction_is_linear`).
+///
+/// Flip to `false` to restore the byte-identical wide-accumulator path.
+#[cfg(target_arch = "aarch64")]
+const REDUCE_DEFERRED_AGGREGATES: bool = true;
+
+/// Accumulate one GF(2^128) product `a*b` into a deferred-aggregate `acc`.
+///
+/// With `R = true` the running sum is kept reduced in `acc.lo` (per-product
+/// reduction via [`mul_q`]) and `acc.hi` stays zero, so the shared
+/// [`reduce_wide_q`] finalization collapses to `acc.lo`. With `R = false` the
+/// original wide accumulation (`mul_unreduced_q` + [`wide_xor`]) is emitted
+/// unchanged. Both paths finalize to the same field element.
+#[cfg(target_arch = "aarch64")]
+#[inline]
+#[target_feature(enable = "aes")]
+unsafe fn agg_add_product<const R: bool>(
+    acc: &mut WideNeon,
+    a: core::arch::aarch64::uint64x2_t,
+    b: core::arch::aarch64::uint64x2_t,
+) {
+    use core::arch::aarch64::*;
+    unsafe {
+        if R {
+            acc.lo = veorq_u64(acc.lo, mul_q(a, b));
+        } else {
+            wide_xor(acc, mul_unreduced_q(a, b));
+        }
+    }
+}
+
 #[cfg(target_arch = "aarch64")]
 #[inline(always)]
 unsafe fn reduce_wide_q(value: WideNeon) -> core::arch::aarch64::uint64x2_t {
@@ -742,7 +786,7 @@ pub(crate) unsafe fn fold_round2_compact_chunk_neon_lookahead_8<const FULL: bool
                     wide_xor(&mut p1_even, mul_unreduced_q(w, a1));
                 }
                 wide_xor(&mut p1_odd, mul_unreduced_q(w, a3));
-                wide_xor(&mut w0, mul_unreduced_q(w, a2));
+                agg_add_product::<REDUCE_DEFERRED_AGGREGATES>(&mut w0, w, a2);
                 continue;
             }
 
@@ -772,7 +816,7 @@ pub(crate) unsafe fn fold_round2_compact_chunk_neon_lookahead_8<const FULL: bool
                         mul_unreduced_q(veorq_u64(a2w, a3w), veorq_u64(b2, b3)),
                     );
                 }
-                wide_xor(&mut w0, mul_unreduced_q(a2w, b2));
+                agg_add_product::<REDUCE_DEFERRED_AGGREGATES>(&mut w0, a2w, b2);
             }
 
             // ---- deferred round-three aggregates (no extra lookups) ----
@@ -780,11 +824,12 @@ pub(crate) unsafe fn fold_round2_compact_chunk_neon_lookahead_8<const FULL: bool
             let o_aw = veorq_u64(a1w, a3w);
             let e_b = veorq_u64(b0, b2);
             let o_b = veorq_u64(b1, b3);
-            wide_xor(&mut w3, mul_unreduced_q(e_aw, e_b));
-            wide_xor(&mut w4, mul_unreduced_q(o_aw, o_b));
-            wide_xor(
+            agg_add_product::<REDUCE_DEFERRED_AGGREGATES>(&mut w3, e_aw, e_b);
+            agg_add_product::<REDUCE_DEFERRED_AGGREGATES>(&mut w4, o_aw, o_b);
+            agg_add_product::<REDUCE_DEFERRED_AGGREGATES>(
                 &mut w5,
-                mul_unreduced_q(veorq_u64(e_aw, o_aw), veorq_u64(e_b, o_b)),
+                veorq_u64(e_aw, o_aw),
+                veorq_u64(e_b, o_b),
             );
         }
 
@@ -1620,6 +1665,50 @@ mod tests {
                     },
                     expected_unreduced
                 );
+            }
+        }
+    }
+
+    /// The deferred-aggregate spill fix reduces each product before summing
+    /// (`agg_add_product::<true>`) instead of summing wide then reducing once
+    /// (`agg_add_product::<false>`). Because GF(2^128) reduction is F2-linear,
+    /// `Σ reduce(pᵢ) == reduce(Σ pᵢ)`, so both accumulation strategies must
+    /// finalize (via `reduce_wide_q`) to the identical canonical field element.
+    #[test]
+    fn deferred_aggregate_reduction_is_linear() {
+        let mut state = 0x5350_494c_4c48_554e;
+
+        unsafe {
+            let zero = core::arch::aarch64::vdupq_n_u64(0);
+            for _ in 0..256 {
+                // Build a random batch of products and accumulate it both ways.
+                let n = 1 + (splitmix64(&mut state) % 12) as usize;
+                let mut acc_reduced = WideNeon { lo: zero, hi: zero };
+                let mut acc_wide = WideNeon { lo: zero, hi: zero };
+                let mut expected = F128::ZERO;
+
+                for _ in 0..n {
+                    let a = F128::new(splitmix64(&mut state), splitmix64(&mut state));
+                    let b = F128::new(splitmix64(&mut state), splitmix64(&mut state));
+                    let a_q = core::mem::transmute::<F128, uint64x2_t>(a);
+                    let b_q = core::mem::transmute::<F128, uint64x2_t>(b);
+
+                    agg_add_product::<true>(&mut acc_reduced, a_q, b_q);
+                    agg_add_product::<false>(&mut acc_wide, a_q, b_q);
+                    expected += a * b;
+                }
+
+                // The reduced path must keep `hi` zero so the shared
+                // finalization collapses to `lo`.
+                let hi = core::mem::transmute::<uint64x2_t, [u64; 2]>(acc_reduced.hi);
+                assert_eq!(hi, [0u64, 0u64], "reduced path must leave hi == 0");
+
+                let out_reduced =
+                    core::mem::transmute::<uint64x2_t, F128>(reduce_wide_q(acc_reduced));
+                let out_wide = core::mem::transmute::<uint64x2_t, F128>(reduce_wide_q(acc_wide));
+
+                assert_eq!(out_reduced, out_wide, "reduce-then-sum != sum-then-reduce");
+                assert_eq!(out_reduced, expected, "aggregate != scalar field sum");
             }
         }
     }
