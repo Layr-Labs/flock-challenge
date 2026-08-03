@@ -593,7 +593,7 @@ unsafe fn r2_pair_fold_and_store(
         let zero = vdupq_n_u64(0);
         if padded {
             store_anchor_pair_nt(anchors.add(2 * x_lo), zero, zero);
-            vst1q_u64(deltas.add(x_lo * 16).cast::<u64>(), zero);
+            store_delta_pair_nt(deltas.add(x_lo * 16), 0, 0);
             return (zero, zero, zero, zero, false);
         }
 
@@ -615,20 +615,117 @@ unsafe fn r2_pair_fold_and_store(
         if degen && (b0_code & b1_code) == u64::MAX {
             let (a0, a1) = fold_two_row_codes_q(table_data, a0_code, a1_code);
             store_anchor_pair_nt(anchors.add(2 * x_lo), a0, b_ones);
-            let delta_pair = core::mem::transmute::<[u64; 2], uint64x2_t>([a0_code ^ a1_code, 0]);
-            vst1q_u64(deltas.add(x_lo * 16).cast::<u64>(), delta_pair);
+            store_delta_pair_nt(deltas.add(x_lo * 16), a0_code ^ a1_code, 0);
             return (a0, a1, b_ones, b_ones, true);
         }
 
         let (a0, a1, b0, b1) =
             fold_four_row_codes_q(table_data, a0_code, a1_code, b0_code, b1_code);
         store_anchor_pair_nt(anchors.add(2 * x_lo), a0, b0);
-        let delta_pair = core::mem::transmute::<[u64; 2], uint64x2_t>([
-            a0_code ^ a1_code,
-            b0_code ^ b1_code,
-        ]);
-        vst1q_u64(deltas.add(x_lo * 16).cast::<u64>(), delta_pair);
+        store_delta_pair_nt(deltas.add(x_lo * 16), a0_code ^ a1_code, b0_code ^ b1_code);
         (a0, a1, b0, b1, false)
+    }
+}
+
+/// 16-byte non-temporal delta store (`stnp` X-form). The delta stream is a
+/// write-once surface consumed a full phase later by the round-3/4 compact
+/// reconstruction, so its lines are never usefully cache-resident; plain
+/// `vst1q` stores pay a write-allocate RFO read of every line while the
+/// sweep is bandwidth-contended (the anchor stream already streams through
+/// `stnp` for the same reason). The stored values originate in general
+/// registers (XORs of the raw row codes), so the X-form store also removes
+/// the two GPR-to-vector moves the vector store required.
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn store_delta_pair_nt(dst: *mut u8, lo: u64, hi: u64) {
+    unsafe {
+        core::arch::asm!(
+            "stnp {lo}, {hi}, [{dst}]",
+            dst = in(reg) dst,
+            lo = in(reg) lo,
+            hi = in(reg) hi,
+            options(nostack, preserves_flags),
+        );
+    }
+}
+
+/// Even-row sibling of [`r2_pair_fold_and_store`] for the GPU-offloaded
+/// lookahead arm. Anchor and delta stores are the same expressions at the
+/// same addresses; the difference is which rows get folded. The offloaded
+/// arm consumes the odd rows (`a1`, `b1`) only through the group's XOR pairs,
+/// and every byte bank of the fold table is F2-linear
+/// (`T[v] = T[v ^ lo] + T[lo]`, built by XOR-composition), so
+/// `fold(c1) ^ fold(c3) == fold(c1 ^ c3)` — the caller merges the two odd
+/// codes and pays one fold for both pairs. This helper therefore folds only
+/// the even rows and hands the odd rows back as raw codes.
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn r2_pair_fold_even_store(
+    table_data: *const u8,
+    a_packed: *const u8,
+    b_packed: *const u8,
+    anchors: *mut F128,
+    deltas: *mut u8,
+    x_lo: usize,
+    padded: bool,
+    degen: bool,
+    b_ones: core::arch::aarch64::uint64x2_t,
+) -> (
+    core::arch::aarch64::uint64x2_t,
+    core::arch::aarch64::uint64x2_t,
+    u64,
+    u64,
+    bool,
+) {
+    use core::arch::aarch64::*;
+
+    #[inline(always)]
+    unsafe fn store_anchor_pair_nt(dst: *mut F128, a: uint64x2_t, b: uint64x2_t) {
+        unsafe {
+            core::arch::asm!(
+                "stnp {a:q}, {b:q}, [{dst}]",
+                dst = in(reg) dst,
+                a = in(vreg) a,
+                b = in(vreg) b,
+                options(nostack, preserves_flags),
+            );
+        }
+    }
+
+    unsafe {
+        let zero = vdupq_n_u64(0);
+        if padded {
+            store_anchor_pair_nt(anchors.add(2 * x_lo), zero, zero);
+            store_delta_pair_nt(deltas.add(x_lo * 16), 0, 0);
+            return (zero, zero, 0, 0, false);
+        }
+
+        let row0 = 2 * x_lo;
+        let row1 = row0 + 1;
+        let a0_code = u64::from_le(core::ptr::read_unaligned(
+            a_packed.add(row0 * 8).cast::<u64>(),
+        ));
+        let a1_code = u64::from_le(core::ptr::read_unaligned(
+            a_packed.add(row1 * 8).cast::<u64>(),
+        ));
+        let b0_code = u64::from_le(core::ptr::read_unaligned(
+            b_packed.add(row0 * 8).cast::<u64>(),
+        ));
+        let b1_code = u64::from_le(core::ptr::read_unaligned(
+            b_packed.add(row1 * 8).cast::<u64>(),
+        ));
+
+        if degen && (b0_code & b1_code) == u64::MAX {
+            let (a0, _a1) = fold_two_row_codes_q(table_data, a0_code, a1_code);
+            store_anchor_pair_nt(anchors.add(2 * x_lo), a0, b_ones);
+            store_delta_pair_nt(deltas.add(x_lo * 16), a0_code ^ a1_code, 0);
+            return (a0, b_ones, a1_code, b1_code, true);
+        }
+
+        let (a0, b0) = fold_two_row_codes_q(table_data, a0_code, b0_code);
+        store_anchor_pair_nt(anchors.add(2 * x_lo), a0, b0);
+        store_delta_pair_nt(deltas.add(x_lo * 16), a0_code ^ a1_code, b0_code ^ b1_code);
+        (a0, b0, a1_code, b1_code, false)
     }
 }
 
@@ -667,9 +764,19 @@ unsafe fn r2_pair_fold_and_store(
 /// threadgroup reduction and hand back only the sum, which forced the CPU to
 /// recompute the odd half for the lookahead's `W1`/`W2`. Keeping that split
 /// costs the GPU nothing, and lets this kernel drop two more of its eight
-/// products: **32 PMULL per group instead of 38** on every offloaded chunk.
-/// The four `mul_q` row weightings survive because `W0`/`W3`/`W4`/`W5` still
-/// need all four scaled rows.
+/// products: 32 PMULL per group instead of 38 on every offloaded chunk.
+///
+/// With both parities off the GPU, the odd rows `a1`/`a3`/`b1`/`b3` are no
+/// longer consumed individually anywhere in the arm — only through the group
+/// XOR pairs `o_aw`/`o_b` (and `a0` only through `e_aw`). Both the byte-bank
+/// row fold and multiplication by `w` are F2-linear, so the arm folds the XOR
+/// *before* the work on both surfaces: the two odd rows of a group cost one
+/// merged fold of their XORed codes (**six row folds / 48 table loads per
+/// group instead of eight / 64**, via [`r2_pair_fold_even_store`]), and three
+/// reduced multiplies replace four (**27 PMULL per group instead of 32**).
+/// Only `a2w` keeps its own reduced multiply, because `W0` consumes it
+/// individually. Anchors and deltas are unchanged bytes at unchanged
+/// addresses.
 #[cfg(target_arch = "aarch64")]
 #[target_feature(enable = "aes")]
 pub(crate) unsafe fn fold_round2_compact_chunk_neon_lookahead_8<
@@ -730,9 +837,53 @@ pub(crate) unsafe fn fold_round2_compact_chunk_neon_lookahead_8<
             let pad1 = ((pair_idx_base + x_lo1) & pair_in_block_mask) >= useful_pairs_inclusive;
             if pad0 & pad1 {
                 store_anchor_pair_nt(anchors.add(2 * x_lo0), zero, zero);
-                vst1q_u64(deltas.add(x_lo0 * 16).cast::<u64>(), zero);
+                store_delta_pair_nt(deltas.add(x_lo0 * 16), 0, 0);
                 store_anchor_pair_nt(anchors.add(2 * x_lo1), zero, zero);
-                vst1q_u64(deltas.add(x_lo1 * 16).cast::<u64>(), zero);
+                store_delta_pair_nt(deltas.add(x_lo1 * 16), 0, 0);
+                continue;
+            }
+
+            if !FULL && ODD_ON_GPU {
+                // Neither parity's round-two products run on this chunk, and
+                // the odd rows are only ever consumed through the group XOR
+                // pairs, so both redundancies collapse at once. Fold merge:
+                // the byte-bank table is F2-linear, so the two odd rows of
+                // the group cost ONE fold of their XORed codes — six row
+                // folds (48 table loads) per group instead of eight (64).
+                // Multiply merge: `mul_q(w, x) ^ mul_q(w, y) ==
+                // mul_q(w, x ^ y)` bit-exactly, so three reduced multiplies
+                // replace four — 27 PMULL per group instead of 32. Anchors
+                // and deltas are stored by the sibling helper with the same
+                // expressions at the same addresses; `a2w` keeps its own
+                // product because `w0` consumes it alone.
+                let (a0, b0, a1_code, b1_code, deg0) = r2_pair_fold_even_store(
+                    table_data, a_packed, b_packed, anchors, deltas, x_lo0, pad0, degen, b_ones,
+                );
+                let (a2, b2, a3_code, b3_code, deg1) = r2_pair_fold_even_store(
+                    table_data, a_packed, b_packed, anchors, deltas, x_lo1, pad1, degen, b_ones,
+                );
+                let w = vld1q_u64(eq_lo.add(x_lo1).cast::<u64>());
+                if deg0 & deg1 & ones_is_one {
+                    // b === 1 across the group: the only surviving product
+                    // is `w * a2` (see the shortcut below).
+                    wide_xor(&mut w0, mul_unreduced_q(w, a2));
+                    continue;
+                }
+                if !pad1 {
+                    let a2w = mul_q(w, a2);
+                    wide_xor(&mut w0, mul_unreduced_q(a2w, b2));
+                }
+                let (o_a, o_b) =
+                    fold_two_row_codes_q(table_data, a1_code ^ a3_code, b1_code ^ b3_code);
+                let e_aw = mul_q(w, veorq_u64(a0, a2));
+                let o_aw = mul_q(w, o_a);
+                let e_b = veorq_u64(b0, b2);
+                wide_xor(&mut w3, mul_unreduced_q(e_aw, e_b));
+                wide_xor(&mut w4, mul_unreduced_q(o_aw, o_b));
+                wide_xor(
+                    &mut w5,
+                    mul_unreduced_q(veorq_u64(e_aw, o_aw), veorq_u64(e_b, o_b)),
+                );
                 continue;
             }
 
