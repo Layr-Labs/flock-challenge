@@ -698,8 +698,19 @@ fn cpu_blake3_pow_window_inner(
     };
     match crate::epool::epool().filter(|_| main_threads > 1 && n_chunks >= 16) {
         Some(ep) => std::thread::scope(|scope| {
-            scope.spawn(|| ep.broadcast(|_| worker()));
+            let epool_job = scope.spawn(|| ep.broadcast(|_| worker()));
             drain_main();
+            // Thread-join wake-tail, grind site (inner): the main-pool share
+            // typically finishes before the E-core broadcast, so the implicit
+            // scope-end join parks this thread and pays the completion wake
+            // tail. First-check + bounded yield (the promoted 87353cc
+            // pattern), then degrade to the exact incumbent blocking join.
+            if !epool_job.is_finished() && grind_join_spin_enabled() {
+                let spin_deadline = std::time::Instant::now() + std::time::Duration::from_millis(2);
+                while !epool_job.is_finished() && std::time::Instant::now() < spin_deadline {
+                    std::thread::yield_now();
+                }
+            }
         }),
         None => drain_main(),
     }
@@ -855,6 +866,30 @@ mod grind_worker {
         if w.tx.send(job).is_err() {
             return Some(Err("GPU grind worker channel closed".to_string()));
         }
+        // Thread-join wake-tail, grind site (outer): the caller parks in
+        // `recv` for the worker's scan and pays the completion wake tail —
+        // the same wait class the promoted lincheck-stripe and grind-join
+        // first-checks cut. Poll `try_recv` first (zero cost when the scan
+        // has already landed), then yield for a bounded budget before
+        // degrading to the exact incumbent blocking `recv`. The consumed
+        // message is identical either way.
+        if super::grind_join_spin_enabled() {
+            let spin_deadline = std::time::Instant::now() + std::time::Duration::from_millis(2);
+            loop {
+                match done_rx.try_recv() {
+                    Ok(res) => return Some(res),
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                        return Some(Err("GPU grind worker channel closed".to_string()));
+                    }
+                    Err(std::sync::mpsc::TryRecvError::Empty) => {
+                        if std::time::Instant::now() >= spin_deadline {
+                            break;
+                        }
+                        std::thread::yield_now();
+                    }
+                }
+            }
+        }
         match done_rx.recv() {
             Ok(res) => Some(res),
             Err(_) => Some(Err("GPU grind worker channel closed".to_string())),
@@ -931,6 +966,17 @@ fn gpu_blake3_pow_nonce(state_digest: &[u8; 32], bits: u32) -> Result<u64, Strin
                         bits,
                         abort.then_some(stop.as_ref()),
                     );
+                    // Thread-join wake-tail, grind site (outer fallback):
+                    // first-check + bounded yield, then the exact incumbent
+                    // blocking join. Byte-identical either way.
+                    if !gpu_scan.is_finished() && grind_join_spin_enabled() {
+                        let spin_deadline =
+                            std::time::Instant::now() + std::time::Duration::from_millis(2);
+                        while !gpu_scan.is_finished() && std::time::Instant::now() < spin_deadline
+                        {
+                            std::thread::yield_now();
+                        }
+                    }
                     let gpu = gpu_scan
                         .join()
                         .unwrap_or_else(|_| Err("GPU grind scan thread panicked".to_string()));
@@ -954,6 +1000,15 @@ fn gpu_blake3_pow_nonce(state_digest: &[u8; 32], bits: u32) -> Result<u64, Strin
 fn grind_hybrid_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("FLOCK_NO_GRIND_HYBRID").is_none())
+}
+
+/// `FLOCK_NO_GRIND_JOIN_SPIN` restores the exact incumbent blocking waits at
+/// the hybrid grind's completion sites (no first-check yield): the inner
+/// E-pool broadcast scope-end join, the persistent-worker result `recv`, and
+/// the scoped-fallback scan join. Rollback lever for the join wake-tail cuts.
+fn grind_join_spin_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("FLOCK_NO_GRIND_JOIN_SPIN").is_none())
 }
 
 /// `FLOCK_NO_GRIND_HYBRID_ABORT` keeps the prefetch window draining to
