@@ -27,7 +27,7 @@ pub mod univariate_skip_deg4_optimized;
 pub mod univariate_skip_optimized;
 
 use multilinear::{
-    UniSkipFoldTable, eval_round3_lookahead, fold2_compact_and_round4_into,
+    UniSkipFoldTable, eval_round3_lookahead, fold2_compact_and_round4_into_padded,
     fold_and_compute_round_pair_into, fold_compact_and_compute_round_pair, fold_in_place_pair,
     interpolate_at_z_combined, interpolate_at_z_on_lambda, round_pair_naive,
     uni_skip_fold_and_round_pair_compact_padded_lookahead,
@@ -692,7 +692,11 @@ fn prove_packed_padded_inner<C: Challenger>(
         // Metal views (see `fold_compact_and_compute_round_pair`).
         let mut a_out = crate::scratch::take_f128_unpinned(n_groups);
         let mut b_out = crate::scratch::take_f128_unpinned(n_groups);
-        let (m4_1, m4_inf) = fold2_compact_and_round4_into(
+        // Same padding mask the round-two sweep used: under the dead-store
+        // elision, fully-padding compact slots may be uninit and must not be
+        // loaded here.
+        let (pair_mask, useful_pairs) = multilinear::round2_pair_skip_pub(padding, k_skip);
+        let (m4_1, m4_inf) = fold2_compact_and_round4_into_padded(
             &compact_mlv,
             &fold_table,
             mlv_rhos[0],
@@ -700,6 +704,8 @@ fn prove_packed_padded_inner<C: Challenger>(
             &r_next4,
             &mut a_out,
             &mut b_out,
+            pair_mask,
+            useful_pairs,
         );
         if tail_round_timing {
             eprintln!(

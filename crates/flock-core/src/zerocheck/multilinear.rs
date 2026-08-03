@@ -100,7 +100,26 @@ fn zc_r2_odd_offload_enabled() -> bool {
     *ON
 }
 
+/// Kill switch for the ranked padding-slot dead-store elision. Default ON:
+/// fully-padding pair groups (pairs 121–127 of every 128-pair BLAKE3 block at
+/// `k_skip = 6`) skip their four zero compact stores, and the double-fold
+/// consumer skips those slots too. `FLOCK_NO_ZC_SKIP_PAD_STORES=1` restores
+/// the incumbent "always write zeros" contract in the same binary.
+fn zc_skip_pad_stores_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        std::env::var_os("FLOCK_NO_ZC_SKIP_PAD_STORES").is_none_or(|v| v != *"1")
+    });
+    *ON
+}
+
 fn round2_pair_skip(padding: &PaddingSpec, k_skip: usize) -> (usize, usize) {
+    round2_pair_skip_pub(padding, k_skip)
+}
+
+/// Public so the production double-fold can reuse the exact padding mask the
+/// round-two sweep used (required once fully-padding compact slots may be
+/// uninit under the dead-store elision).
+pub(crate) fn round2_pair_skip_pub(padding: &PaddingSpec, k_skip: usize) -> (usize, usize) {
     if padding.k_log <= k_skip + 1 {
         return (0, usize::MAX);
     }
@@ -1385,6 +1404,9 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead(
     let odd_on_gpu = gpu_prefix > 0 && zc_r2_odd_offload_enabled();
     #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
     let odd_on_gpu = false;
+    // Const-dispatched: the SKIP_PAD_STORES monomorph must be selected outside
+    // the hot kernel so the register allocator never sees a runtime bool.
+    let skip_pad = zc_skip_pad_stores_enabled();
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     let t_cpu_sweep = std::time::Instant::now();
 
@@ -1418,51 +1440,35 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead(
                 let t = table.data.as_ptr().cast::<u8>();
                 let ap = a_packed.as_ptr().add(row_base * n_chunks);
                 let bp = b_packed.as_ptr().add(row_base * n_chunks);
-                if full {
-                    fold_round2_compact_chunk_neon_lookahead_8::<true, false>(
-                        t,
-                        ap,
-                        bp,
-                        anchors,
-                        deltas,
-                        eq_lo.as_ptr(),
-                        lo_size,
-                        pair_idx_base,
-                        pair_in_block_mask,
-                        useful_pairs_inclusive,
-                        degen,
-                        out.as_mut_ptr(),
-                    );
-                } else if odd_on_gpu {
-                    fold_round2_compact_chunk_neon_lookahead_8::<false, true>(
-                        t,
-                        ap,
-                        bp,
-                        anchors,
-                        deltas,
-                        eq_lo.as_ptr(),
-                        lo_size,
-                        pair_idx_base,
-                        pair_in_block_mask,
-                        useful_pairs_inclusive,
-                        degen,
-                        out.as_mut_ptr(),
-                    );
-                } else {
-                    fold_round2_compact_chunk_neon_lookahead_8::<false, false>(
-                        t,
-                        ap,
-                        bp,
-                        anchors,
-                        deltas,
-                        eq_lo.as_ptr(),
-                        lo_size,
-                        pair_idx_base,
-                        pair_in_block_mask,
-                        useful_pairs_inclusive,
-                        degen,
-                        out.as_mut_ptr(),
-                    );
+                // Eight monomorphs: FULL × ODD_ON_GPU × SKIP_PAD_STORES. The
+                // skip flag is fixed for the whole prove, so only two of the
+                // eight are live per process; the rest are not codegen'd into
+                // the timed path's cold-start if LTO folds the dead arms.
+                match (full, odd_on_gpu, skip_pad) {
+                    (true, _, true) => fold_round2_compact_chunk_neon_lookahead_8::<true, false, true>(
+                        t, ap, bp, anchors, deltas, eq_lo.as_ptr(), lo_size, pair_idx_base,
+                        pair_in_block_mask, useful_pairs_inclusive, degen, out.as_mut_ptr(),
+                    ),
+                    (true, _, false) => fold_round2_compact_chunk_neon_lookahead_8::<true, false, false>(
+                        t, ap, bp, anchors, deltas, eq_lo.as_ptr(), lo_size, pair_idx_base,
+                        pair_in_block_mask, useful_pairs_inclusive, degen, out.as_mut_ptr(),
+                    ),
+                    (false, true, true) => fold_round2_compact_chunk_neon_lookahead_8::<false, true, true>(
+                        t, ap, bp, anchors, deltas, eq_lo.as_ptr(), lo_size, pair_idx_base,
+                        pair_in_block_mask, useful_pairs_inclusive, degen, out.as_mut_ptr(),
+                    ),
+                    (false, true, false) => fold_round2_compact_chunk_neon_lookahead_8::<false, true, false>(
+                        t, ap, bp, anchors, deltas, eq_lo.as_ptr(), lo_size, pair_idx_base,
+                        pair_in_block_mask, useful_pairs_inclusive, degen, out.as_mut_ptr(),
+                    ),
+                    (false, false, true) => fold_round2_compact_chunk_neon_lookahead_8::<false, false, true>(
+                        t, ap, bp, anchors, deltas, eq_lo.as_ptr(), lo_size, pair_idx_base,
+                        pair_in_block_mask, useful_pairs_inclusive, degen, out.as_mut_ptr(),
+                    ),
+                    (false, false, false) => fold_round2_compact_chunk_neon_lookahead_8::<false, false, false>(
+                        t, ap, bp, anchors, deltas, eq_lo.as_ptr(), lo_size, pair_idx_base,
+                        pair_in_block_mask, useful_pairs_inclusive, degen, out.as_mut_ptr(),
+                    ),
                 }
             }
         }
@@ -1547,7 +1553,10 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead(
                     let row_base = pair_idx_base * 2;
                     let mut out = [F128::ZERO; 8];
                     unsafe {
-                        fold_round2_compact_chunk_neon_lookahead_8::<true, false>(
+                        // Failure redo only needs the products; anchors go to
+                        // throwaway scratch. Use the non-skip monomorph so the
+                        // scratch stays well-defined (harmless either way).
+                        fold_round2_compact_chunk_neon_lookahead_8::<true, false, false>(
                             table.data.as_ptr().cast::<u8>(),
                             a_packed.as_ptr().add(row_base * n_chunks),
                             b_packed.as_ptr().add(row_base * n_chunks),
@@ -1708,6 +1717,37 @@ pub(crate) fn fold2_compact_and_round4_into(
     a_out: &mut [F128],
     b_out: &mut [F128],
 ) -> (F128, F128) {
+    // No padding metadata → never skip (tests / dense fixtures).
+    fold2_compact_and_round4_into_padded(
+        compact,
+        table,
+        rho1,
+        rho2,
+        r_next4,
+        a_out,
+        b_out,
+        0,
+        usize::MAX,
+    )
+}
+
+/// Like [`fold2_compact_and_round4_into`], but when `useful_pairs_inclusive`
+/// is finite and `zc_skip_pad_stores_enabled()` is on, fully-padding pair
+/// groups are not loaded from the compact state (which may hold uninit
+/// garbage there after the round-two dead-store elision) and contribute
+/// zeros to both the outputs and the round-four message.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn fold2_compact_and_round4_into_padded(
+    compact: &UniSkipCompactFold,
+    table: &UniSkipFoldTable,
+    rho1: F128,
+    rho2: F128,
+    r_next4: &[F128],
+    a_out: &mut [F128],
+    b_out: &mut [F128],
+    pair_in_block_mask: usize,
+    useful_pairs_inclusive: usize,
+) -> (F128, F128) {
     let n_pairs = compact.len();
     let n_groups = n_pairs / 2;
     assert!(n_groups >= 2 && n_groups.is_power_of_two());
@@ -1734,6 +1774,7 @@ pub(crate) fn fold2_compact_and_round4_into(
     let out_chunk = 2 * lo_size;
     #[cfg(target_arch = "aarch64")]
     let degen = r2_degen_enabled();
+    let skip_pad = zc_skip_pad_stores_enabled() && useful_pairs_inclusive != usize::MAX;
 
     let mut partials: Vec<(F128, F128)> = vec![(F128::ZERO, F128::ZERO); hi_size];
     let a_base = crate::epool::SyncPtr(a_out.as_mut_ptr());
@@ -1764,6 +1805,10 @@ pub(crate) fn fold2_compact_and_round4_into(
                 eq_lo.as_ptr(),
                 lo_size,
                 degen,
+                pair_base,
+                pair_in_block_mask,
+                useful_pairs_inclusive,
+                skip_pad,
             )
         };
 
@@ -1776,6 +1821,17 @@ pub(crate) fn fold2_compact_and_round4_into(
             let nc = table.n_chunks;
             for g_local in 0..out_chunk {
                 let g = x_hi * out_chunk + g_local;
+                if skip_pad {
+                    let p0 = pair_base + 2 * g_local;
+                    let p1i = p0 + 1;
+                    let pad0 = (p0 & pair_in_block_mask) >= useful_pairs_inclusive;
+                    let pad1 = (p1i & pair_in_block_mask) >= useful_pairs_inclusive;
+                    if pad0 & pad1 {
+                        a_out[g_local] = F128::ZERO;
+                        b_out[g_local] = F128::ZERO;
+                        continue;
+                    }
+                }
                 let anc = &compact.anchors[4 * g..4 * g + 4];
                 let d = &compact.deltas[32 * g..32 * g + 32];
                 let mut a = anc[0] + rho2 * (anc[0] + anc[2]);
