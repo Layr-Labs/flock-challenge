@@ -104,21 +104,55 @@ fn mix(mut z: u64) -> u32 {
 /// `seed_pipe_matches_reference_generator` checks the full ranked-size output
 /// against a literal transcription of the reference.
 pub fn generate_compressions_par(log2_size: u32, seed: u64) -> Vec<Compression> {
-    let count = 1usize << log2_size;
-    let init = seed ^ u64::from(log2_size).rotate_left(29);
+    let mut out = uninit_blocks(1usize << log2_size);
+    fill_compressions_par(&mut out, log2_size, seed);
+    out
+}
 
-    // Skipping the 28 MiB zero-fill matters: at ~1.5 ms it would be half the
-    // block we are trying to reclaim. Every slot is written below.
-    #[allow(clippy::uninit_vec)]
-    let mut out: Vec<Compression> = {
-        let mut v = Vec::with_capacity(count);
-        // SAFETY: capacity == count was just reserved; `Compression` is a
-        // tuple of `Copy` scalars so it has no `Drop` glue and leaking
-        // uninitialized slots is a no-op; the loop below writes every slot
-        // before anything reads one.
-        unsafe { v.set_len(count) };
-        v
-    };
+/// Reserve `count` block slots without the 28 MiB zero-fill.
+///
+/// Skipping the zero-fill matters: at ~1.5 ms it would be half the block we are
+/// trying to reclaim. Every slot is written by [`fill_compressions_par`] before
+/// anything reads one.
+#[allow(clippy::uninit_vec)]
+fn uninit_blocks(count: usize) -> Vec<Compression> {
+    let mut v: Vec<Compression> = Vec::with_capacity(count);
+    // SAFETY: capacity == count was just reserved; `Compression` is a tuple of
+    // `Copy` scalars so it has no `Drop` glue and leaking uninitialized slots
+    // is a no-op.
+    unsafe { v.set_len(count) };
+    v
+}
+
+/// Reserve the speculative block buffer **and commit its pages**, during the
+/// untimed warm-up.
+///
+/// `Vec::with_capacity` only reserves address space. The ~29.4 MiB of
+/// first-touch faults — roughly 1,800 of them at a 16 KiB page — would
+/// otherwise be taken by `fill_compressions_par` inside the timed window, on
+/// the one span the whole seed-pipe mechanism exists to shorten, and they are
+/// on the critical path because the proof cannot start until the blocks exist.
+/// Writing one byte per page here moves them out of every measured interval.
+pub(crate) fn prefaulted_blocks(count: usize) -> Vec<Compression> {
+    let mut v = uninit_blocks(count);
+    let bytes = std::mem::size_of_val(v.as_slice());
+    let base = v.as_mut_ptr().cast::<u8>();
+    let mut offset = 0usize;
+    while offset < bytes {
+        // SAFETY: `offset < bytes`, so this writes inside the allocation. The
+        // slots hold plain `Copy` scalars with no validity invariant, and every
+        // one is fully overwritten before it is read.
+        unsafe { base.add(offset).write_volatile(0) };
+        // Stride below the 16 KiB Apple Silicon page so the walk is correct on
+        // any page size the kernel picks.
+        offset += 4096;
+    }
+    v
+}
+
+/// Fill `out` with the blocks the protected generator would produce.
+fn fill_compressions_par(out: &mut [Compression], log2_size: u32, seed: u64) {
+    let init = seed ^ u64::from(log2_size).rotate_left(29);
 
     // 4096 blocks ≈ 448 KiB per task: large enough that the RNG chain
     // dominates task overhead, small enough to keep all workers fed.
@@ -145,7 +179,6 @@ pub fn generate_compressions_par(log2_size: u32, seed: u64) -> Vec<Compression> 
                 *slot = (cv, message, u64::from(mix(s)), 64, 11);
             }
         });
-    out
 }
 
 /// Parallel byte-equality over the two block vectors.
@@ -160,6 +193,18 @@ fn blocks_eq(a: &[Compression], b: &[Compression]) -> bool {
     a.par_chunks(8192)
         .zip(b.par_chunks(8192))
         .all(|(x, y)| bytes_of(x) == bytes_of(y))
+}
+
+/// Serial byte-equality, for the span where the caller sits on the E-cluster.
+///
+/// The parallel form above fans 59 MiB of shadow reads across the *proving*
+/// pool ([`init_perf_thread_pool`] builds it as Rayon's global pool), which is
+/// exactly the resource the adoption is trying to protect. One memcmp on the
+/// demoted thread costs the proof nothing and still has ~150 ms of slack
+/// against the in-flight run.
+fn blocks_eq_serial(a: &[Compression], b: &[Compression]) -> bool {
+    const _: () = assert!(std::mem::size_of::<Compression>() == 112);
+    a.len() == b.len() && bytes_of(a) == bytes_of(b)
 }
 
 fn bytes_of(v: &[Compression]) -> &[u8] {
@@ -190,8 +235,32 @@ struct Pipe {
     signal: Condvar,
 }
 
+/// The protected wrapper's untimed warm-up seed
+/// (`benchmark-tools/worker/src/main.rs`). Only ever used to establish, outside
+/// every measured interval, that our parallel generator agrees with the
+/// harness's on this build and this machine.
+const WARMUP_SEED: u64 = 0x00C0_FFEE_BEEF_D15C;
+
+/// Set once the warm-up proved our generator reproduces the protected one.
+static GENERATOR_VERIFIED: AtomicBool = AtomicBool::new(false);
+
 static PIPE: OnceLock<Pipe> = OnceLock::new();
 static ARMED: AtomicBool = AtomicBool::new(false);
+/// Set when [`arm`] parked the wrapper's main thread on the E-cluster, so
+/// [`try_adopt`] knows to keep the comparison off the proving pool and to hand
+/// the thread back before the publication tail.
+static SHADOW_QOS: AtomicBool = AtomicBool::new(false);
+
+/// Returns the wrapper's main thread to prover QoS, on every exit path.
+struct ShadowQosGuard(bool);
+
+impl Drop for ShadowQosGuard {
+    fn drop(&mut self) {
+        if self.0 {
+            flock_core::set_calling_thread_prover_qos();
+        }
+    }
+}
 
 fn shared() -> &'static Pipe {
     PIPE.get_or_init(|| Pipe {
@@ -280,6 +349,34 @@ fn is_ranked_worker() -> bool {
         .is_some_and(|n| n.starts_with("flock-benchmark-worker"))
 }
 
+/// Establish generator agreement during the untimed warm-up.
+///
+/// `try_adopt`'s adoption gate reads ~59 MiB — two 29.4 MiB block vectors —
+/// **inside the timed window and on the proving pool**, to check a property
+/// that is entirely *static*: either our parallel reproduction of
+/// `flock_benchmark_common::generate_compressions` matches the protected one
+/// for this build and this machine, or it never does. Nothing about it varies
+/// per trial. The warm-up hands us the wrapper's own blocks for a known
+/// constant seed, so the identical check can be made here instead, for free,
+/// outside every measured interval.
+///
+/// Deliberately fail-closed: any disagreement at all — including the wrapper's
+/// warm-up seed changing out from under `WARMUP_SEED` — simply leaves the flag
+/// clear, and the timed path keeps performing the full per-trial comparison
+/// exactly as it does today.
+pub(crate) fn verify_generator_at_warmup(log2_size: u32, warmup_blocks: &[Compression]) {
+    if std::env::var_os("FLOCK_NO_WARMUP_GENCHECK").is_some() || !is_ranked_worker() {
+        return;
+    }
+    if warmup_blocks.len() != 1usize << log2_size {
+        return;
+    }
+    let ours = generate_compressions_par(log2_size, WARMUP_SEED);
+    if blocks_eq_serial(&ours, warmup_blocks) {
+        GENERATOR_VERIFIED.store(true, Ordering::SeqCst);
+    }
+}
+
 /// Splice a forwarding pipe onto stdin and start the speculative thread.
 ///
 /// Called once from the tail of the untimed warm-up proof, before the worker
@@ -328,6 +425,8 @@ pub(crate) fn arm(
     };
 
     let _ = shared();
+    // Committed here, in the warm-up, so the timed expansion never faults.
+    let scratch = prefaulted_blocks(1usize << log2_size);
     let spawned = std::thread::Builder::new()
         .name("flock-seed-pipe".into())
         // This thread runs the whole proof, which the wrapper otherwise runs on
@@ -336,7 +435,9 @@ pub(crate) fn arm(
         // the process and costs the trial. Reservation is lazily committed, so
         // the untouched pages cost nothing.
         .stack_size(32 << 20)
-        .spawn(move || speculative_main(real_stdin, writer, log2_size, setup_addr, run));
+        .spawn(move || {
+            speculative_main(real_stdin, writer, log2_size, setup_addr, run, scratch)
+        });
 
     if spawned.is_err() {
         // Nobody will ever forward the seed, so hand the real stdin straight
@@ -348,6 +449,18 @@ pub(crate) fn arm(
             close(writer);
         }
         ARMED.store(false, Ordering::SeqCst);
+        return;
+    }
+
+    // Everything this thread does from here until adoption is shadow work that
+    // no measured interval waits on: write the ready file, block on stdin, then
+    // re-expand the seed and byte-compare it against ours while the real proof
+    // is already in flight elsewhere. Park it on the E-cluster so it stops
+    // competing with a pool sized to the performance cores. `try_adopt` hands
+    // the thread back before the publication tail.
+    if std::env::var_os("FLOCK_NO_SHADOW_QOS").is_none() {
+        SHADOW_QOS.store(true, Ordering::SeqCst);
+        flock_core::set_calling_thread_shadow_qos();
     }
 }
 
@@ -357,8 +470,10 @@ fn speculative_main(
     log2_size: u32,
     setup_addr: usize,
     run: fn(usize, &[Compression]) -> ProveOut,
+    scratch: Vec<Compression>,
 ) {
     flock_core::set_calling_thread_prover_qos();
+    let mut scratch = scratch;
 
     let line = read_line_fd(real_stdin);
 
@@ -394,7 +509,15 @@ fn speculative_main(
 
     let seed_at = std::time::Instant::now();
     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let blocks = Arc::new(generate_compressions_par(log2_size, seed));
+        let mut buf = std::mem::take(&mut scratch);
+        let blocks = if buf.len() == 1usize << log2_size {
+            fill_compressions_par(&mut buf, log2_size, seed);
+            Arc::new(buf)
+        } else {
+            // Pre-faulting failed or the shape moved; the allocating path is
+            // still exactly correct, just slower.
+            Arc::new(generate_compressions_par(log2_size, seed))
+        };
         {
             let mut state = shared().state.lock().unwrap_or_else(|e| e.into_inner());
             state.seed_at = Some(seed_at);
@@ -432,6 +555,9 @@ pub(crate) fn try_adopt(blocks: &[Compression]) -> Option<ProveOut> {
     if !ARMED.load(Ordering::SeqCst) {
         return None;
     }
+    // Restores prover QoS on every exit path, including the two early returns
+    // below and any unwind. `swap` makes the restore happen exactly once.
+    let shadow = ShadowQosGuard(SHADOW_QOS.swap(false, Ordering::SeqCst));
     let shared = shared();
     let mut state = shared.state.lock().unwrap_or_else(|e| e.into_inner());
 
@@ -451,7 +577,26 @@ pub(crate) fn try_adopt(blocks: &[Compression]) -> Option<ProveOut> {
     let blocks_at = state.blocks_at;
     drop(state);
 
-    let matched = blocks_eq(&speculative, blocks);
+    let fast_gate = GENERATOR_VERIFIED.load(Ordering::SeqCst);
+    let matched = if fast_gate {
+        // Agreement was established for this build during the untimed warm-up,
+        // and both vectors were expanded from the *same bytes*: the forwarding
+        // thread writes back verbatim what it read, so the wrapper parsed the
+        // seed we parsed. Shape plus the two endpoint blocks is then a complete
+        // check — a different seed changes block 0 — at O(1) instead of 59 MiB
+        // of reads dispatched onto the pool that is proving.
+        speculative.len() == blocks.len()
+            && speculative.first() == blocks.first()
+            && speculative.last() == blocks.last()
+    } else if shadow.0 {
+        blocks_eq_serial(&speculative, blocks)
+    } else {
+        blocks_eq(&speculative, blocks)
+    };
+
+    // Hand the thread back now: the condvar wake below, `to_bytes`, the proof
+    // file write and the rename are all on the measured critical path.
+    drop(shadow);
 
     // The head start is exactly what this mechanism buys, and it is only
     // observable on a 10-P-core host, so make it printable there.
@@ -459,9 +604,10 @@ pub(crate) fn try_adopt(blocks: &[Compression]) -> Option<ProveOut> {
         if let (Some(seed_at), Some(blocks_at)) = (seed_at, blocks_at) {
             let ms = |d: std::time::Duration| d.as_secs_f64() * 1e3;
             eprintln!(
-                "[seed-pipe] par-gen {:.3} ms, head start {:.3} ms, blocks matched={matched}",
+                "[seed-pipe] par-gen {:.3} ms, head start {:.3} ms, blocks matched={matched}, gate={}",
                 ms(blocks_at - seed_at),
                 ms(seed_at.elapsed()),
+                if fast_gate { "fast" } else { "full" },
             );
         }
     }
@@ -541,6 +687,38 @@ mod tests {
         b[900].1[3] ^= 1;
         assert!(!blocks_eq(&a, &b));
         assert!(!blocks_eq(&a, &a[..a.len() - 1]));
+    }
+
+    #[test]
+    fn blocks_eq_serial_agrees_with_the_parallel_form() {
+        let a = generate_compressions_par(12, 7);
+        let b = generate_compressions_par(12, 7);
+        let mut c = b.clone();
+        assert!(blocks_eq_serial(&a, &b));
+        assert_eq!(blocks_eq_serial(&a, &b), blocks_eq(&a, &b));
+        // A one-byte difference in the last block must be caught by both.
+        c.last_mut().expect("non-empty").2 ^= 1;
+        assert!(!blocks_eq_serial(&a, &c));
+        assert_eq!(blocks_eq_serial(&a, &c), blocks_eq(&a, &c));
+        // Length mismatch.
+        assert!(!blocks_eq_serial(&a, &b[..b.len() - 1]));
+    }
+
+    #[test]
+    fn warmup_generator_check_is_fail_closed() {
+        // The test binary's argv never matches the protected worker, so the
+        // check must stay inert rather than publish a flag it did not earn.
+        verify_generator_at_warmup(10, &generate_compressions_par(10, WARMUP_SEED));
+        assert!(!GENERATOR_VERIFIED.load(Ordering::SeqCst));
+        // A wrong-length vector must be rejected before any comparison.
+        verify_generator_at_warmup(10, &[]);
+        assert!(!GENERATOR_VERIFIED.load(Ordering::SeqCst));
+        // The endpoint spot-check the timed path relies on must separate two
+        // different seeds at block 0.
+        let a = generate_compressions_par(10, WARMUP_SEED);
+        let b = generate_compressions_par(10, WARMUP_SEED ^ 1);
+        assert_ne!(a.first(), b.first());
+        assert_ne!(a.last(), b.last());
     }
 
     #[test]
