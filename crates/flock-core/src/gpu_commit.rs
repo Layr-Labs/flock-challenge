@@ -407,6 +407,81 @@ pub fn gpu_recursive_merkle_blake3(
     imp::gpu_recursive_merkle_blake3(data, num_leaves)
 }
 
+/// A completed recursive GPU Merkle tree retained in its persistent shared
+/// buffer. The root is copied eagerly for Fiat--Shamir; proof nodes are copied
+/// only when the later opening phase requests them. `epoch` prevents a stale
+/// handle from ever reading a buffer that a later commit has overwritten.
+pub(crate) struct DeferredRecursiveMerkle {
+    root: crate::merkle::Hash,
+    num_leaves: usize,
+    epoch: u64,
+}
+
+impl DeferredRecursiveMerkle {
+    #[inline]
+    pub(crate) fn root(&self) -> crate::merkle::Hash {
+        self.root
+    }
+}
+
+/// Canonical flat-tree indices emitted by `merkle_multi_proof`, without
+/// reading the tree itself. This is shared by the deferred GPU reader and its
+/// host-executable oracle, so their sibling traversal cannot drift apart.
+fn recursive_merkle_multi_proof_indices(num_leaves: usize, positions: &[usize]) -> Vec<usize> {
+    assert!(num_leaves.is_power_of_two() && num_leaves > 0);
+    assert!(positions.iter().all(|&p| p < num_leaves));
+    if positions.is_empty() || num_leaves == 1 {
+        return Vec::new();
+    }
+
+    let mut active = positions.to_vec();
+    active.sort_unstable();
+    active.dedup();
+    let mut indices = Vec::new();
+    let mut level_start = 0usize;
+    let mut level_len = num_leaves;
+    while level_len > 1 {
+        let mut next = Vec::with_capacity(active.len());
+        let mut i = 0;
+        while i < active.len() {
+            let p = active[i];
+            let sib_active = i + 1 < active.len() && active[i + 1] == (p ^ 1);
+            if sib_active {
+                i += 2;
+            } else {
+                indices.push(level_start + (p ^ 1));
+                i += 1;
+            }
+            next.push(p >> 1);
+        }
+        active = next;
+        level_start += level_len;
+        level_len >>= 1;
+    }
+    indices
+}
+
+/// Run the recursive GPU Merkle graph but retain its flat tree in the shared
+/// buffer. A caller must use [`gpu_recursive_merkle_multi_proof`] before a
+/// same-shape graph reuses that buffer; otherwise it must fall back to the CPU
+/// tree. The handle carries an epoch so the latter case is detected safely.
+pub(crate) fn gpu_recursive_merkle_blake3_deferred(
+    data: &[u8],
+    num_leaves: usize,
+) -> Option<DeferredRecursiveMerkle> {
+    imp::gpu_recursive_merkle_blake3_deferred(data, num_leaves)
+}
+
+/// Copy exactly the canonical multiproof nodes from a deferred recursive GPU
+/// tree. `None` means the GPU state disappeared or its tree buffer has since
+/// been reused; callers must build the ordinary CPU tree instead.
+pub(crate) fn gpu_recursive_merkle_multi_proof(
+    tree: &DeferredRecursiveMerkle,
+    positions: &[usize],
+) -> Option<Vec<crate::merkle::Hash>> {
+    imp::gpu_recursive_merkle_multi_proof(tree, positions)
+}
+
 /// Exact rollback for the PCS Fiat--Shamir BLAKE3 grind scanner.  The first
 /// untimed ranked grind still has to prove that Metal returns the same
 /// globally-smallest nonce and clears the target-side timing gate before the
@@ -7732,6 +7807,9 @@ kernel void rec_parent_hash(device const uint* children [[buffer(0)]],
         /// Persistent flat-tree output buffers, one per supported shape
         /// (`2 * n - 1` nodes each); allocated once, untimed.
         tree_bufs: [(usize, Id); REC_MERKLE_SHAPES.len()],
+        /// Incremented after each completed graph. Deferred proof handles
+        /// retain this value and refuse to read a buffer after reuse.
+        tree_epochs: [u64; REC_MERKLE_SHAPES.len()],
         /// Cached no-copy wraps of caller matrices: `(ptr, len, buffer)`.
         wraps: Vec<(usize, usize, Id)>,
         hits: usize,
@@ -7785,6 +7863,7 @@ kernel void rec_parent_hash(device const uint* children [[buffer(0)]],
                     pso_leaf128,
                     pso_parent,
                     tree_bufs,
+                    tree_epochs: [0; REC_MERKLE_SHAPES.len()],
                     wraps: Vec::new(),
                     hits: 0,
                     misses: 0,
@@ -7854,10 +7933,31 @@ kernel void rec_parent_hash(device const uint* children [[buffer(0)]],
         }
     }
 
-    pub(crate) fn gpu_recursive_merkle_blake3(
+    unsafe fn copy_recursive_tree_nodes(gpu: &Gpu, tree_buf: Id, indices: &[usize]) -> Vec<Hash> {
+        let base = unsafe { gpu.buffer_contents(tree_buf) };
+        indices
+            .iter()
+            .map(|&index| {
+                let mut hash = [0u8; core::mem::size_of::<Hash>()];
+                // SAFETY: callers derive each index from a checked complete
+                // binary tree and the Metal graph has completed before this
+                // shared-memory CPU read.
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        base.add(index * core::mem::size_of::<Hash>()),
+                        hash.as_mut_ptr(),
+                        hash.len(),
+                    );
+                }
+                hash
+            })
+            .collect()
+    }
+
+    pub(crate) fn gpu_recursive_merkle_blake3_deferred(
         data: &[u8],
         num_leaves: usize,
-    ) -> Option<Vec<Hash>> {
+    ) -> Option<super::DeferredRecursiveMerkle> {
         if !super::gpu_recursive_merkle_enabled()
             || !REC_MERKLE_SHAPES.contains(&num_leaves)
             || data.len() != num_leaves * 128
@@ -7921,11 +8021,12 @@ kernel void rec_parent_hash(device const uint* children [[buffer(0)]],
                 }
             },
         };
-        let &(_, tree_buf) = state
+        let tree_slot = state
             .tree_bufs
             .iter()
-            .find(|(n, _)| *n == num_leaves)
+            .position(|(n, _)| *n == num_leaves)
             .expect("shape checked above");
+        let tree_buf = state.tree_bufs[tree_slot].1;
 
         let total_nodes = 2 * num_leaves - 1;
         let run = unsafe {
@@ -7968,14 +8069,13 @@ kernel void rec_parent_hash(device const uint* children [[buffer(0)]],
             return None;
         }
 
-        let mut tree: Vec<Hash> = crate::alloc_uninit_vec(total_nodes);
-        unsafe {
-            let dst = core::slice::from_raw_parts_mut(
-                tree.as_mut_ptr().cast::<u8>(),
-                total_nodes * 32,
-            );
-            copy_bytes_parallel(gpu.buffer_contents(tree_buf), dst);
-        }
+        let root = unsafe {
+            copy_recursive_tree_nodes(gpu, tree_buf, &[total_nodes - 1])
+                .pop()
+                .expect("root index is nonempty")
+        };
+        state.tree_epochs[tree_slot] = state.tree_epochs[tree_slot].wrapping_add(1);
+        let epoch = state.tree_epochs[tree_slot];
         if let Some(t) = started {
             eprintln!(
                 "[gpu-recmerkle] n_leaves=2^{} wall {:.2} ms (wrap hits {} misses {})",
@@ -7985,7 +8085,68 @@ kernel void rec_parent_hash(device const uint* children [[buffer(0)]],
                 state.misses,
             );
         }
-        Some(tree)
+        Some(super::DeferredRecursiveMerkle {
+            root,
+            num_leaves,
+            epoch,
+        })
+    }
+
+    pub(crate) fn gpu_recursive_merkle_multi_proof(
+        tree: &super::DeferredRecursiveMerkle,
+        positions: &[usize],
+    ) -> Option<Vec<Hash>> {
+        if !REC_MERKLE_SHAPES.contains(&tree.num_leaves) {
+            return None;
+        }
+        let gpu = gpu().ok()?;
+        let guard = match REC_MERKLE.lock() {
+            Ok(g) => g,
+            Err(_) => return None,
+        };
+        let state = match guard.as_ref() {
+            Some(Ok(state)) => state,
+            _ => return None,
+        };
+        let tree_slot = state
+            .tree_bufs
+            .iter()
+            .position(|(n, _)| *n == tree.num_leaves)
+            .expect("deferred shape was gated");
+        if state.tree_epochs[tree_slot] != tree.epoch {
+            return None;
+        }
+        let indices = recursive_merkle_multi_proof_indices(tree.num_leaves, positions);
+        // SAFETY: the epoch checked above proves this completed graph's flat
+        // tree still owns the persistent buffer. The mutex prevents a new
+        // graph from overwriting it until all requested proof nodes are read.
+        Some(unsafe { copy_recursive_tree_nodes(gpu, state.tree_bufs[tree_slot].1, &indices) })
+    }
+
+    pub(crate) fn gpu_recursive_merkle_blake3(
+        data: &[u8],
+        num_leaves: usize,
+    ) -> Option<Vec<Hash>> {
+        let deferred = gpu_recursive_merkle_blake3_deferred(data, num_leaves)?;
+        let total_nodes = 2 * num_leaves - 1;
+        let gpu = gpu().ok()?;
+        let guard = REC_MERKLE.lock().ok()?;
+        let state = match guard.as_ref() {
+            Some(Ok(state)) => state,
+            _ => return None,
+        };
+        let tree_slot = state
+            .tree_bufs
+            .iter()
+            .position(|(n, _)| *n == num_leaves)
+            .expect("deferred shape was gated");
+        if state.tree_epochs[tree_slot] != deferred.epoch {
+            return None;
+        }
+        let indices: Vec<usize> = (0..total_nodes).collect();
+        // SAFETY: as above, the epoch and mutex keep this completed flat tree
+        // alive for the full materialization used by diagnostics/tests.
+        Some(unsafe { copy_recursive_tree_nodes(gpu, state.tree_bufs[tree_slot].1, &indices) })
     }
 
     // -----------------------------------------------------------------------
@@ -10093,6 +10254,20 @@ mod imp {
         None
     }
 
+    pub(crate) fn gpu_recursive_merkle_blake3_deferred(
+        _data: &[u8],
+        _num_leaves: usize,
+    ) -> Option<super::DeferredRecursiveMerkle> {
+        None
+    }
+
+    pub(crate) fn gpu_recursive_merkle_multi_proof(
+        _tree: &super::DeferredRecursiveMerkle,
+        _positions: &[usize],
+    ) -> Option<Vec<crate::merkle::Hash>> {
+        None
+    }
+
     pub(crate) struct FromZFirstPassStream;
 
     impl FromZFirstPassStream {
@@ -10184,6 +10359,32 @@ pub(crate) use imp::{gpu_merkle_tree_blake3, gpu_ntt_interleaved_from_layer};
 mod tests {
     use super::*;
     use crate::field::F128;
+
+    #[test]
+    fn deferred_recursive_merkle_indices_match_cpu_multiproof_order() {
+        const LEAVES: usize = 32;
+        let tree: Vec<crate::merkle::Hash> = (0..(2 * LEAVES - 1))
+            .map(|index| {
+                let mut hash = [0u8; 32];
+                hash[..8].copy_from_slice(&(index as u64).to_le_bytes());
+                hash
+            })
+            .collect();
+        for positions in [
+            Vec::new(),
+            vec![0],
+            vec![1, 0, 1],
+            vec![3, 5, 8, 9, 17, 31],
+            (0..LEAVES).step_by(3).collect(),
+        ] {
+            let want = crate::merkle::merkle_multi_proof(&tree, LEAVES, &positions);
+            let got: Vec<_> = recursive_merkle_multi_proof_indices(LEAVES, &positions)
+                .into_iter()
+                .map(|index| tree[index])
+                .collect();
+            assert_eq!(got, want, "positions={positions:?}");
+        }
+    }
 
     /// GPU idle-decay probe at ranked size: full commit graph wall
     /// back-to-back vs after idle gaps. Ignored; run with --ignored --nocapture.
@@ -11146,6 +11347,18 @@ mod tests {
                 crate::merkle::merkle_tree(data, n_leaves, crate::merkle::HashKind::Blake3);
             assert_eq!(gpu_tree.len(), cpu_tree.len());
             assert!(gpu_tree == cpu_tree, "GPU tree diverges at 2^{log_leaves} leaves");
+            // Deferred production path: root is available immediately, while
+            // only canonical sibling nodes are copied at the later opening.
+            let deferred = super::gpu_recursive_merkle_blake3_deferred(data, n_leaves)
+                .expect("deferred GPU recursive tree must succeed");
+            assert_eq!(deferred.root(), *cpu_tree.last().unwrap());
+            let positions = [0usize, 1, 37, 1 << 11, n_leaves - 1];
+            let deferred_proof = super::gpu_recursive_merkle_multi_proof(&deferred, &positions)
+                .expect("deferred GPU recursive multiproof must succeed");
+            assert_eq!(
+                deferred_proof,
+                crate::merkle::merkle_multi_proof(&cpu_tree, n_leaves, &positions),
+            );
             // Second call on the same allocation: cached wrap, same bytes.
             let again = super::gpu_recursive_merkle_blake3(data, n_leaves)
                 .expect("second call must succeed");
