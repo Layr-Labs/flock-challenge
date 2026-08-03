@@ -670,11 +670,14 @@ unsafe fn r2_pair_fold_and_store(
 /// products: **32 PMULL per group instead of 38** on every offloaded chunk.
 /// The four `mul_q` row weightings survive because `W0`/`W3`/`W4`/`W5` still
 /// need all four scaled rows.
+/// With `W_ON_GPU = true`, the GPU also owns W0/W3/W4/W5, so the CPU emits
+/// only the byte-identical anchor/delta stores on the offloaded prefix.
 #[cfg(target_arch = "aarch64")]
 #[target_feature(enable = "aes")]
 pub(crate) unsafe fn fold_round2_compact_chunk_neon_lookahead_8<
     const FULL: bool,
     const ODD_ON_GPU: bool,
+    const W_ON_GPU: bool,
 >(
     table_data: *const u8,
     a_packed: *const u8,
@@ -755,16 +758,23 @@ pub(crate) unsafe fn fold_round2_compact_chunk_neon_lookahead_8<
                 if !ODD_ON_GPU {
                     wide_xor(&mut p1_odd, mul_unreduced_q(w, a3));
                 }
-                wide_xor(&mut w0, mul_unreduced_q(w, a2));
+                if !W_ON_GPU {
+                    wide_xor(&mut w0, mul_unreduced_q(w, a2));
+                }
                 continue;
             }
 
-            let a0w = mul_q(w, a0);
-            let a1w = mul_q(w, a1);
-            let (a2w, a3w) = if pad1 {
-                (zero, zero)
+            let (a0w, a1w, a2w, a3w) = if FULL || !ODD_ON_GPU || !W_ON_GPU {
+                let a0w = mul_q(w, a0);
+                let a1w = mul_q(w, a1);
+                let (a2w, a3w) = if pad1 {
+                    (zero, zero)
+                } else {
+                    (mul_q(w, a2), mul_q(w, a3))
+                };
+                (a0w, a1w, a2w, a3w)
             } else {
-                (mul_q(w, a2), mul_q(w, a3))
+                (zero, zero, zero, zero)
             };
 
             // ---- round-two products, split by the parity of x' ----
@@ -787,20 +797,24 @@ pub(crate) unsafe fn fold_round2_compact_chunk_neon_lookahead_8<
                         );
                     }
                 }
-                wide_xor(&mut w0, mul_unreduced_q(a2w, b2));
+                if !W_ON_GPU {
+                    wide_xor(&mut w0, mul_unreduced_q(a2w, b2));
+                }
             }
 
             // ---- deferred round-three aggregates (no extra lookups) ----
-            let e_aw = veorq_u64(a0w, a2w);
-            let o_aw = veorq_u64(a1w, a3w);
-            let e_b = veorq_u64(b0, b2);
-            let o_b = veorq_u64(b1, b3);
-            wide_xor(&mut w3, mul_unreduced_q(e_aw, e_b));
-            wide_xor(&mut w4, mul_unreduced_q(o_aw, o_b));
-            wide_xor(
-                &mut w5,
-                mul_unreduced_q(veorq_u64(e_aw, o_aw), veorq_u64(e_b, o_b)),
-            );
+            if !W_ON_GPU {
+                let e_aw = veorq_u64(a0w, a2w);
+                let o_aw = veorq_u64(a1w, a3w);
+                let e_b = veorq_u64(b0, b2);
+                let o_b = veorq_u64(b1, b3);
+                wide_xor(&mut w3, mul_unreduced_q(e_aw, e_b));
+                wide_xor(&mut w4, mul_unreduced_q(o_aw, o_b));
+                wide_xor(
+                    &mut w5,
+                    mul_unreduced_q(veorq_u64(e_aw, o_aw), veorq_u64(e_b, o_b)),
+                );
+            }
         }
 
         *out.add(0) = core::mem::transmute::<uint64x2_t, F128>(reduce_wide_q(p1_even));

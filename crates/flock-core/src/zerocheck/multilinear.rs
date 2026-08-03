@@ -636,6 +636,7 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_with_deltas(
         hi_size,
         pair_in_block_mask,
         useful_pairs_inclusive,
+        false,
     );
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     let gpu_prefix = gpu_job.as_ref().map_or(0, |j| j.cpu_split());
@@ -1360,9 +1361,9 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead(
 
     // Same GPU round-two products arm as the incumbent sweep: it still
     // receives byte-identical anchors/deltas for every chunk and still owns
-    // the *summed* `(p1, pinf)` for its prefix. The CPU keeps producing the
-    // odd-parity halves on those chunks (the GPU's sums are not parity-split),
-    // which is what makes `W1`/`W2` recoverable everywhere.
+    // the *summed* `(p1, pinf)` for its prefix. In lookahead mode the GPU also
+    // emits W0/W3/W4/W5 from the same folded rows, so the CPU can skip every
+    // product on an admitted prefix chunk.
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     let gpu_job = crate::gpu_commit::launch_zc_r2_products(
         a_packed,
@@ -1374,6 +1375,7 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead(
         hi_size,
         pair_in_block_mask,
         useful_pairs_inclusive,
+        true,
     );
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     let gpu_prefix = gpu_job.as_ref().map_or(0, |j| j.cpu_split());
@@ -1419,7 +1421,7 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead(
                 let ap = a_packed.as_ptr().add(row_base * n_chunks);
                 let bp = b_packed.as_ptr().add(row_base * n_chunks);
                 if full {
-                    fold_round2_compact_chunk_neon_lookahead_8::<true, false>(
+                    fold_round2_compact_chunk_neon_lookahead_8::<true, false, false>(
                         t,
                         ap,
                         bp,
@@ -1434,7 +1436,7 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead(
                         out.as_mut_ptr(),
                     );
                 } else if odd_on_gpu {
-                    fold_round2_compact_chunk_neon_lookahead_8::<false, true>(
+                    fold_round2_compact_chunk_neon_lookahead_8::<false, true, true>(
                         t,
                         ap,
                         bp,
@@ -1449,7 +1451,7 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead(
                         out.as_mut_ptr(),
                     );
                 } else {
-                    fold_round2_compact_chunk_neon_lookahead_8::<false, false>(
+                    fold_round2_compact_chunk_neon_lookahead_8::<false, false, false>(
                         t,
                         ap,
                         bp,
@@ -1531,6 +1533,10 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead(
                     if odd_on_gpu {
                         la_partials[x_hi][0] = v[2];
                         la_partials[x_hi][1] = v[3];
+                        la_partials[x_hi][2] = v[4];
+                        la_partials[x_hi][3] = v[5];
+                        la_partials[x_hi][4] = v[6];
+                        la_partials[x_hi][5] = v[7];
                     }
                 }
             }
@@ -1547,7 +1553,7 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead(
                     let row_base = pair_idx_base * 2;
                     let mut out = [F128::ZERO; 8];
                     unsafe {
-                        fold_round2_compact_chunk_neon_lookahead_8::<true, false>(
+                        fold_round2_compact_chunk_neon_lookahead_8::<true, false, false>(
                             table.data.as_ptr().cast::<u8>(),
                             a_packed.as_ptr().add(row_base * n_chunks),
                             b_packed.as_ptr().add(row_base * n_chunks),
@@ -1570,6 +1576,10 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead(
                     if odd_on_gpu {
                         la_partials[x_hi][0] = eq_h * out[2];
                         la_partials[x_hi][1] = eq_h * out[3];
+                        la_partials[x_hi][2] = eq_h * out[4];
+                        la_partials[x_hi][3] = eq_h * out[5];
+                        la_partials[x_hi][4] = eq_h * out[6];
+                        la_partials[x_hi][5] = eq_h * out[7];
                     }
                 }
             }
