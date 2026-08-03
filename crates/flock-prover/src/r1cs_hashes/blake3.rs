@@ -1119,21 +1119,21 @@ fn write_lin_word_ab_packed(bit_off: usize, val: u32, z: &mut [u64], a: &mut [u6
 /// Sequential full-word writer for one packed block. Unlike the generic
 /// OR-based helpers, this never reads the destination and initializes every
 /// word, allowing the outer driver to skip its 1.5-GiB ranked zero pass.
-struct PackedWordWriter {
-    out: *mut u64,
+struct PackedWordWriter<'a> {
+    out: &'a mut [u64],
     word: usize,
     pending: u64,
     used: usize,
 }
 
-impl PackedWordWriter {
+impl<'a> PackedWordWriter<'a> {
     #[inline(always)]
-    fn at(out: *mut u64, word: usize, pending: u64, used: usize) -> Self {
+    fn new(out: &'a mut [u64]) -> Self {
         Self {
             out,
-            word,
-            pending,
-            used,
+            word: 0,
+            pending: 0,
+            used: 0,
         }
     }
 
@@ -1146,11 +1146,7 @@ impl PackedWordWriter {
             value & ((1u64 << width) - 1)
         };
         if self.used == 0 && width == 64 {
-            // SAFETY: the fixed BLAKE3 layout emits exactly `K / 64` words;
-            // the caller supplies a distinct block-sized destination.
-            unsafe {
-                self.out.add(self.word).write(value);
-            }
+            self.out[self.word] = value;
             self.word += 1;
             return;
         }
@@ -1159,13 +1155,7 @@ impl PackedWordWriter {
             self.pending |= value << self.used;
             self.used += width;
         } else {
-            // SAFETY: the fixed BLAKE3 layout emits exactly `K / 64` words;
-            // the caller supplies a distinct block-sized destination.
-            unsafe {
-                self.out
-                    .add(self.word)
-                    .write(self.pending | (value << self.used));
-            }
+            self.out[self.word] = self.pending | (value << self.used);
             self.word += 1;
             if width == room {
                 self.pending = 0;
@@ -1197,29 +1187,21 @@ impl PackedWordWriter {
     }
 
     #[inline]
-    fn finish(mut self, total_words: usize) {
+    fn finish(mut self) {
         if self.used != 0 {
-            // SAFETY: see `push`; a partial final word is still within the
-            // fixed-size block.
-            unsafe {
-                self.out.add(self.word).write(self.pending);
-            }
+            self.out[self.word] = self.pending;
             self.word += 1;
         }
-        debug_assert!(self.word <= total_words);
-        // SAFETY: the unwritten suffix is within the same block-sized output.
-        unsafe {
-            std::ptr::write_bytes(self.out.add(self.word), 0, total_words - self.word);
-        }
+        self.out[self.word..].fill(0);
     }
 }
 
 #[inline(always)]
 fn stream_lin_word(
     value: u32,
-    z: &mut PackedWordWriter,
-    a: &mut PackedWordWriter,
-    b: &mut PackedWordWriter,
+    z: &mut PackedWordWriter<'_>,
+    a: &mut PackedWordWriter<'_>,
+    b: &mut PackedWordWriter<'_>,
 ) {
     z.push(value as u64, 32);
     a.push(value as u64, 32);
@@ -1372,48 +1354,34 @@ fn build_block_witness_ab_stream_into(
     debug_assert_eq!(a.len(), U64_PER_BLOCK);
     debug_assert_eq!(b.len(), U64_PER_BLOCK);
 
+    let mut wz = PackedWordWriter::new(z);
+    let mut wa = PackedWordWriter::new(a);
+    let mut wb = PackedWordWriter::new(b);
+
+    // Layout prefix: cv, then the aligned out_lo slot whose value is not known
+    // until after the seven rounds.
+    for &value in cv {
+        stream_lin_word(value, &mut wz, &mut wa, &mut wb);
+    }
+    for _ in 0..8 {
+        wz.push(0, 32);
+        wa.push(0, 32);
+        wb.push(0, 32);
+    }
+
+    // Constant pin, message, counter, length, and flags are contiguous.
+    wz.push(1, 1);
+    wa.push(1, 1);
+    wb.push(1, 1);
+    for &value in m {
+        stream_lin_word(value, &mut wz, &mut wa, &mut wb);
+    }
     let counter_lo = counter as u32;
     let counter_hi = (counter >> 32) as u32;
-
-    // Initialize the fixed 1,153-bit prefix directly. This leaves each writer
-    // at word 18 with exactly one pending bit, which makes the subsequent
-    // generated G sequence start from a compile-time-known packing phase.
-    let z_ptr = z.as_mut_ptr();
-    let a_ptr = a.as_mut_ptr();
-    let b_ptr = b.as_mut_ptr();
-    unsafe {
-        for i in 0..4 {
-            let value = (cv[2 * i] as u64) | ((cv[2 * i + 1] as u64) << 32);
-            z_ptr.add(i).write(value);
-            a_ptr.add(i).write(value);
-            b_ptr.add(i).write(u64::MAX);
-        }
-        std::ptr::write_bytes(z_ptr.add(4), 0, 4);
-        std::ptr::write_bytes(a_ptr.add(4), 0, 4);
-        std::ptr::write_bytes(b_ptr.add(4), 0, 4);
-
-        let values = [
-            m[0], m[1], m[2], m[3], m[4], m[5], m[6], m[7], m[8], m[9], m[10], m[11],
-            m[12], m[13], m[14], m[15], counter_lo, counter_hi, block_len, flags,
-        ];
-        for i in 0..10 {
-            let low = if i == 0 {
-                1
-            } else {
-                (values[2 * i - 1] >> 31) as u64
-            };
-            let value = low
-                | ((values[2 * i] as u64) << 1)
-                | ((values[2 * i + 1] as u64) << 33);
-            z_ptr.add(8 + i).write(value);
-            a_ptr.add(8 + i).write(value);
-            b_ptr.add(8 + i).write(u64::MAX);
-        }
-    }
-    let pending = (flags >> 31) as u64;
-    let mut wz = PackedWordWriter::at(z_ptr, 18, pending, 1);
-    let mut wa = PackedWordWriter::at(a_ptr, 18, pending, 1);
-    let mut wb = PackedWordWriter::at(b_ptr, 18, 1, 1);
+    stream_lin_word(counter_lo, &mut wz, &mut wa, &mut wb);
+    stream_lin_word(counter_hi, &mut wz, &mut wa, &mut wb);
+    stream_lin_word(block_len, &mut wz, &mut wa, &mut wb);
+    stream_lin_word(flags, &mut wz, &mut wa, &mut wb);
     debug_assert_eq!(wz.position(), GS_BASE);
 
     let mut state: [u32; 16] = [
@@ -1434,19 +1402,18 @@ fn build_block_witness_ab_stream_into(
         block_len,
         flags,
     ];
-    // The circuit shape and message schedule are fixed. Expanding all 56 Gs
-    // gives LLVM literal state/message indices and exposes the complete
-    // dependency graph to register allocation. This is also the source-level
-    // model for a generated AArch64 kernel: allocation and Rayon stay in Rust,
-    // while only this fixed inner computation is specialized.
-    macro_rules! g {
-        ($la:literal, $lb:literal, $lc:literal, $ld:literal, $mx:literal, $my:literal) => {{
-            let mx = m[$mx];
-            let my = m[$my];
-            let a_val = state[$la];
-            let b_val = state[$lb];
-            let c_val = state[$lc];
-            let d_val = state[$ld];
+    let msg_idx = &PER_ROUND_MSG_IDX;
+    for r in 0..N_ROUNDS {
+        for g_in_round in 0..N_G_PER_ROUND {
+            let [la, lb, lc, ld] = G_LANES[g_in_round];
+            let [mx_i, my_i] = msg_idx[r][g_in_round];
+            let mx = m[mx_i];
+            let my = m[my_i];
+
+            let a_val = state[la];
+            let b_val = state[lb];
+            let c_val = state[lc];
+            let d_val = state[ld];
 
             let mut rz = BitRecord::<4>::new();
             let mut ra = BitRecord::<4>::new();
@@ -1484,34 +1451,12 @@ fn build_block_witness_ab_stream_into(
             wa.push_record(&ra, G_STRIDE);
             wb.push_record(&rb, G_STRIDE);
 
-            state[$la] = a_2;
-            state[$lb] = b_new;
-            state[$lc] = c_2;
-            state[$ld] = d_new;
-        }};
+            state[la] = a_2;
+            state[lb] = b_new;
+            state[lc] = c_2;
+            state[ld] = d_new;
+        }
     }
-    macro_rules! round {
-        ($m0:literal, $m1:literal, $m2:literal, $m3:literal,
-         $m4:literal, $m5:literal, $m6:literal, $m7:literal,
-         $m8:literal, $m9:literal, $m10:literal, $m11:literal,
-         $m12:literal, $m13:literal, $m14:literal, $m15:literal) => {{
-            g!(0, 4, 8, 12, $m0, $m1);
-            g!(1, 5, 9, 13, $m2, $m3);
-            g!(2, 6, 10, 14, $m4, $m5);
-            g!(3, 7, 11, 15, $m6, $m7);
-            g!(0, 5, 10, 15, $m8, $m9);
-            g!(1, 6, 11, 12, $m10, $m11);
-            g!(2, 7, 8, 13, $m12, $m13);
-            g!(3, 4, 9, 14, $m14, $m15);
-        }};
-    }
-    round!(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15);
-    round!(2, 6, 3, 10, 7, 0, 4, 13, 1, 11, 12, 5, 9, 14, 15, 8);
-    round!(3, 4, 10, 12, 13, 2, 7, 14, 6, 5, 9, 0, 11, 15, 8, 1);
-    round!(10, 7, 12, 9, 14, 3, 13, 15, 4, 0, 11, 2, 5, 8, 1, 6);
-    round!(12, 13, 9, 11, 15, 10, 14, 8, 7, 2, 5, 3, 0, 1, 6, 4);
-    round!(9, 14, 11, 5, 8, 12, 15, 1, 13, 3, 0, 10, 2, 6, 4, 7);
-    round!(11, 15, 5, 0, 1, 9, 8, 6, 14, 10, 2, 12, 3, 4, 7, 13);
     debug_assert_eq!(wz.position(), OUT_HI_BASE);
 
     let out_lo: [u32; 8] = std::array::from_fn(|w| state[w] ^ state[w + 8]);
@@ -1520,9 +1465,9 @@ fn build_block_witness_ab_stream_into(
     }
     debug_assert_eq!(wz.position(), USEFUL_BITS);
 
-    wz.finish(U64_PER_BLOCK);
-    wa.finish(U64_PER_BLOCK);
-    wb.finish(U64_PER_BLOCK);
+    wz.finish();
+    wa.finish();
+    wb.finish();
 
     // OUT_LO_BASE is 256-bit aligned, so the four reserved words can be
     // replaced without touching neighboring rows.
@@ -1533,820 +1478,6 @@ fn build_block_witness_ab_stream_into(
         z[OUT_LO_WORD + i] = value;
         a[OUT_LO_WORD + i] = value;
         b[OUT_LO_WORD + i] = u64::MAX;
-    }
-}
-
-// ---------------------------------------------------------------------------
-// W-H2: SIMD-lockstep witness materialization (aarch64). Derivation and
-// pricing: notes/witgen-simd.md. Four compressions run in u32-lane lockstep
-// ("quad"); the row-major output is produced by a fixed 4x4 u32 register
-// transpose at the store point. Bit-exact with
-// [`build_block_witness_ab_stream_into`]: `vaddq_u32` wraps mod 2^32 per lane
-// (no arithmetic wider than u32 exists, so carries never cross lanes),
-// rotate-XOR is shr/shl/or, and the bit packing is a const-shift sequential
-// push network mirroring `PackedWordWriter`'s algebra lane-wise.
-// Kill switch: `FLOCK_NO_WITGEN_SIMD=1` restores the scalar driver.
-// `FLOCK_WITGEN_SIMD_PLAIN_STORES=1` replaces every z/a/b NT drain with plain
-// stores (same-binary store-flavor A/B). `FLOCK_NO_WITGEN_Z_NT=1` disables
-// only z's deferred-stream NT drain while preserving the incumbent a/b mode.
-// ---------------------------------------------------------------------------
-
-#[cfg(target_arch = "aarch64")]
-pub(crate) mod witgen_simd {
-    use super::{
-        BLAKE3_IV, Compression, GS_BASE, G_STRIDE, K, OUT_HI_BASE, REC_C0, REC_C1, REC_C2, REC_C3,
-        REC_C4, REC_C5, REC_LIN0, REC_LIN1, USEFUL_BITS,
-    };
-    use core::arch::aarch64::*;
-    use flock_core::bits::transpose_8_u64s_to_64_bytes;
-    use flock_core::field::F128;
-    use std::sync::LazyLock;
-
-    const U32_PER_BLOCK: usize = K / 32; // 512
-    const F128_PER_BLOCK: usize = K / 128;
-
-    pub(crate) fn enabled() -> bool {
-        static ON: LazyLock<bool> =
-            LazyLock::new(|| std::env::var_os("FLOCK_NO_WITGEN_SIMD").is_none());
-        *ON
-    }
-
-    fn nt_enabled() -> bool {
-        // Global same-binary kill switch for all SIMD NT drain stores.
-        static NT: LazyLock<bool> =
-            LazyLock::new(|| std::env::var_os("FLOCK_WITGEN_SIMD_PLAIN_STORES").is_none());
-        *NT
-    }
-
-    fn z_nt_enabled() -> bool {
-        static ON: LazyLock<bool> =
-            LazyLock::new(|| std::env::var_os("FLOCK_NO_WITGEN_Z_NT").is_none());
-        *ON
-    }
-
-    #[inline(always)]
-    pub(super) const fn select_z_nt(
-        nt_enabled: bool,
-        defer_ranked_stripe: bool,
-        z_nt_enabled: bool,
-    ) -> bool {
-        nt_enabled && defer_ranked_stripe && z_nt_enabled
-    }
-
-    type V4 = uint32x4_t;
-
-    /// Fixed 4x4 u32 transpose. Both orientations use the same network:
-    /// (word w across 4 blocks) <-> (block j's 4 consecutive words). Pure
-    /// data movement — exact.
-    #[inline(always)]
-    fn tr4(w0: V4, w1: V4, w2: V4, w3: V4) -> (V4, V4, V4, V4) {
-        unsafe {
-            let t0 = vtrn1q_u32(w0, w1);
-            let t1 = vtrn2q_u32(w0, w1);
-            let t2 = vtrn1q_u32(w2, w3);
-            let t3 = vtrn2q_u32(w2, w3);
-            (
-                vreinterpretq_u32_u64(vtrn1q_u64(
-                    vreinterpretq_u64_u32(t0),
-                    vreinterpretq_u64_u32(t2),
-                )),
-                vreinterpretq_u32_u64(vtrn1q_u64(
-                    vreinterpretq_u64_u32(t1),
-                    vreinterpretq_u64_u32(t3),
-                )),
-                vreinterpretq_u32_u64(vtrn2q_u64(
-                    vreinterpretq_u64_u32(t0),
-                    vreinterpretq_u64_u32(t2),
-                )),
-                vreinterpretq_u32_u64(vtrn2q_u64(
-                    vreinterpretq_u64_u32(t1),
-                    vreinterpretq_u64_u32(t3),
-                )),
-            )
-        }
-    }
-
-    /// NT 32-byte store pair (a/b pass the failed.md §14 never-read test:
-    /// their next readers are a proof later, from DRAM).
-    #[inline(always)]
-    unsafe fn store_nt_pair(x: V4, y: V4, p: *mut u32) {
-        unsafe {
-            core::arch::asm!(
-                "stnp {0:q}, {1:q}, [{2}]",
-                in(vreg) x,
-                in(vreg) y,
-                in(reg) p,
-                options(nostack)
-            );
-        }
-    }
-
-    /// Last useful word (bit 15408 → word 481, 17 bits used).
-    const LAST_WORD: usize = (USEFUL_BITS - 1) / 32; // 481
-
-    /// NT 64-byte stripe chunk store (via an L1 stack bounce): the lincheck
-    /// stripe passes the failed.md §14 never-read test (read ~85 ms later,
-    /// 512 MiB ≫ SLC), so it stores non-temporally like a/b.
-    #[inline(always)]
-    unsafe fn stripe_store_nt(src: *const u8, dst: *mut u8) {
-        unsafe {
-            core::arch::asm!(
-                "ldp {t0:q}, {t1:q}, [{s}]",
-                "stnp {t0:q}, {t1:q}, [{d}]",
-                "ldp {t0:q}, {t1:q}, [{s}, #32]",
-                "stnp {t0:q}, {t1:q}, [{d}, #32]",
-                s = in(reg) src,
-                d = in(reg) dst,
-                t0 = out(vreg) _,
-                t1 = out(vreg) _,
-                options(nostack)
-            );
-        }
-    }
-
-    /// u32-granular lane-wise `PackedWordWriter`: `pending` plus the
-    /// absolute-word L1 stage. Every push site is monomorphized with its
-    /// stream offset (USED), the straddle back-shift (BACK), and — when it
-    /// completes a word — the ABSOLUTE word index (WORD), so completed words
-    /// go straight to the stage with immediate store offsets. There is no
-    /// runtime writer state besides `pending` — the vector analogue of the
-    /// scalar builder's fully-unrolled writer.
-    struct W32 {
-        pending: V4,
-        stage: *mut V4, // 512 block-lane words for this buffer's quad
-    }
-
-    impl W32 {
-        #[inline(always)]
-        fn at(stage: *mut V4, pending: V4) -> Self {
-            Self { pending, stage }
-        }
-
-        /// Push the low WIDTH bits of `v` at stream offset ≡ USED (mod 32).
-        /// WIDTH ∈ {31, 32}. Carry values deliberately retain an arbitrary
-        /// bit 31: `vsli` preserves only the already-final low `USED` bits and
-        /// overwrites every following bit with the new field, so the dirty bit
-        /// just above a 31-bit field is overwritten by the next push instead
-        /// of requiring an eager mask. The fixed stream ends in full-width
-        /// lin-id fields, hence no dirty carry bit can reach `finish`.
-        ///
-        /// BACK is the straddle back-shift `room = 32 − USED`; WORD is the
-        /// absolute index of the completed word (iff this push completes one).
-        /// All consts are spelled out at the call site (stable Rust cannot
-        /// derive const arguments from const parameters).
-        #[inline(always)]
-        unsafe fn push<const USED: i32, const WIDTH: i32, const BACK: i32, const WORD: usize>(
-            &mut self,
-            v: V4,
-        ) {
-            const {
-                assert!(USED >= 0 && USED < 32);
-                assert!(WIDTH == 31 || WIDTH == 32);
-                assert!(BACK >= 1 && BACK < 32);
-                assert!(WORD < U32_PER_BLOCK);
-            }
-            debug_assert!(USED + WIDTH <= 32 || BACK == 32 - USED);
-            unsafe {
-                // The USED == 0 arm avoids instantiating `vsliq_n::<0>`
-                // (illegal immediate) — no insert is needed at word-aligned
-                // positions. A width-31 value may leave bit 31 dirty here;
-                // the next `vsli #31` overwrites it exactly.
-                if USED == 0 {
-                    if WIDTH == 32 {
-                        vst1q_u32(self.stage.add(WORD) as *mut u32, v);
-                        self.pending = vdupq_n_u32(0);
-                    } else {
-                        self.pending = v;
-                    }
-                } else if USED + WIDTH < 32 {
-                    self.pending = vsliq_n_u32::<USED>(self.pending, v);
-                } else {
-                    let out = vsliq_n_u32::<USED>(self.pending, v);
-                    vst1q_u32(self.stage.add(WORD) as *mut u32, out);
-                    if USED + WIDTH == 32 {
-                        self.pending = vdupq_n_u32(0);
-                    } else {
-                        self.pending = vshrq_n_u32::<BACK>(v);
-                    }
-                }
-            }
-        }
-
-        /// `PackedWordWriter::finish` semantics: the partial final word 481
-        /// (upper bits zero by construction) joins the stage.
-        #[inline(always)]
-        unsafe fn finish(&mut self) {
-            unsafe {
-                vst1q_u32(self.stage.add(LAST_WORD) as *mut u32, self.pending);
-            }
-        }
-    }
-
-    /// Drain a 512-word block-lane stage to the four row-major block
-    /// destinations. `ld4` deinterleaves four block-lane words into
-    /// per-block 16-B runs (the register transpose the batch-major layout
-    /// dodged), so each block's 2 KiB drains as ONE long ascending burst:
-    /// stnp pairs for the §14-passing buffers (a/b), plain stores for z
-    /// (§16 in-closure stripe re-read).
-    #[inline(always)]
-    unsafe fn dump<const NT: bool>(stage: *const V4, dst: *mut u32) {
-        unsafe {
-            for g in 0..64 {
-                let w = 8 * g;
-                let x = vld4q_u32(stage.add(w) as *const u32);
-                let y = vld4q_u32(stage.add(w + 4) as *const u32);
-                let p0 = dst.add(w);
-                let p1 = dst.add(U32_PER_BLOCK + w);
-                let p2 = dst.add(2 * U32_PER_BLOCK + w);
-                let p3 = dst.add(3 * U32_PER_BLOCK + w);
-                if NT {
-                    store_nt_pair(x.0, y.0, p0);
-                    store_nt_pair(x.1, y.1, p1);
-                    store_nt_pair(x.2, y.2, p2);
-                    store_nt_pair(x.3, y.3, p3);
-                } else {
-                    vst1q_u32(p0, x.0);
-                    vst1q_u32(p0.add(4), y.0);
-                    vst1q_u32(p1, x.1);
-                    vst1q_u32(p1.add(4), y.1);
-                    vst1q_u32(p2, x.2);
-                    vst1q_u32(p2.add(4), y.2);
-                    vst1q_u32(p3, x.3);
-                    vst1q_u32(p3.add(4), y.3);
-                }
-            }
-        }
-    }
-
-    /// Stream-sequential field push at absolute bit position `$pos`: computes
-    /// all four monomorphization consts at the call site. BACK is the
-    /// straddle back-shift `room = 32 − USED` (clamped to the legal immediate
-    /// range for the dead-branch instantiation); WORD = `pos/32` is the
-    /// completed word's absolute index.
-    macro_rules! pushf {
-        ($w:ident, $pos:expr, $width:literal, $v:expr) => {{
-            $w.push::<
-                { ($pos % 32) as i32 },
-                $width,
-                {
-                    let u = ($pos % 32) as i32;
-                    if u == 0 { 1 } else { 32 - u }
-                },
-                { $pos / 32 },
-            >($v);
-        }};
-    }
-
-    /// Lane-wise `add_carry_parts`: `(sum, left, right, carry_aux)`.
-    /// `vaddq_u32` wraps mod 2^32 per lane — bit-identical to scalar
-    /// `wrapping_add` for each independent block; carries never cross lanes.
-    /// The three row values retain their irrelevant bit 31. [`W32::push`]
-    /// consumes only the low 31 bits and overwrites that dirty boundary bit,
-    /// removing two vector masks from every one of the 336 additions.
-    #[inline(always)]
-    fn add_carry_parts_v(x: V4, y: V4) -> (V4, V4, V4, V4) {
-        unsafe {
-            let sum = vaddq_u32(x, y);
-            let cin = veorq_u32(veorq_u32(sum, x), y);
-            let left = veorq_u32(x, cin);
-            let right = veorq_u32(y, cin);
-            let carry = vandq_u32(left, right);
-            (sum, left, right, carry)
-        }
-    }
-
-    /// `(x ^ y).rotate_right(N)` — NEON has no vector ROR; shr/shl/or is
-    /// exact bitwise. M = 32 − N is spelled out at the call site (stable
-    /// Rust cannot derive const arguments from const parameters).
-    #[inline(always)]
-    fn xor_rotr<const N: i32, const M: i32>(x: V4, y: V4) -> V4 {
-        debug_assert_eq!(N + M, 32);
-        unsafe {
-            let v = veorq_u32(x, y);
-            vorrq_u32(vshrq_n_u32::<N>(v), vshlq_n_u32::<M>(v))
-        }
-    }
-
-    /// Build the (z, a, b) blocks for FOUR compressions in u32-lane lockstep,
-    /// fully writing every word (stale scratch). `z`/`a`/`b` point at the
-    /// quad's first block; block j occupies `dst + j*512 .. +512` u32 words.
-    /// `z_nt` and `ab_nt` independently select non-temporal drain stores for
-    /// z and for the a/b pair, respectively.
-    /// Bit-exact with [`super::build_block_witness_ab_stream_into`] x4.
-    pub(crate) unsafe fn build_quad_witness_ab_stream_neon(
-        inputs: [&Compression; 4],
-        z: *mut u32,
-        a: *mut u32,
-        b: *mut u32,
-        z_nt: bool,
-        ab_nt: bool,
-    ) {
-        unsafe {
-            // ---- gather: SoA block-lane vectors via 4x4 transposes ----
-            let ptrs = [
-                inputs[0].0.as_ptr(),
-                inputs[1].0.as_ptr(),
-                inputs[2].0.as_ptr(),
-                inputs[3].0.as_ptr(),
-            ];
-            let (cv0, cv1, cv2, cv3) = tr4(
-                vld1q_u32(ptrs[0]),
-                vld1q_u32(ptrs[1]),
-                vld1q_u32(ptrs[2]),
-                vld1q_u32(ptrs[3]),
-            );
-            let (cv4, cv5, cv6, cv7) = tr4(
-                vld1q_u32(ptrs[0].add(4)),
-                vld1q_u32(ptrs[1].add(4)),
-                vld1q_u32(ptrs[2].add(4)),
-                vld1q_u32(ptrs[3].add(4)),
-            );
-            let cv_v = [cv0, cv1, cv2, cv3, cv4, cv5, cv6, cv7];
-            let mptrs = [
-                inputs[0].1.as_ptr(),
-                inputs[1].1.as_ptr(),
-                inputs[2].1.as_ptr(),
-                inputs[3].1.as_ptr(),
-            ];
-            let mut m: [V4; 16] = [cv0; 16];
-            for wgrp in 0..4 {
-                let (m0, m1, m2, m3) = tr4(
-                    vld1q_u32(mptrs[0].add(4 * wgrp)),
-                    vld1q_u32(mptrs[1].add(4 * wgrp)),
-                    vld1q_u32(mptrs[2].add(4 * wgrp)),
-                    vld1q_u32(mptrs[3].add(4 * wgrp)),
-                );
-                m[4 * wgrp] = m0;
-                m[4 * wgrp + 1] = m1;
-                m[4 * wgrp + 2] = m2;
-                m[4 * wgrp + 3] = m3;
-            }
-            let mut tlo_a = [0u32; 4];
-            let mut thi_a = [0u32; 4];
-            let mut bl_a = [0u32; 4];
-            let mut fl_a = [0u32; 4];
-            for j in 0..4 {
-                tlo_a[j] = inputs[j].2 as u32;
-                thi_a[j] = (inputs[j].2 >> 32) as u32;
-                bl_a[j] = inputs[j].3;
-                fl_a[j] = inputs[j].4;
-            }
-            let tlo = vld1q_u32(tlo_a.as_ptr());
-            let thi = vld1q_u32(thi_a.as_ptr());
-            let blen = vld1q_u32(bl_a.as_ptr());
-            let flags = vld1q_u32(fl_a.as_ptr());
-
-            let mut state: [V4; 16] = [
-                cv0,
-                cv1,
-                cv2,
-                cv3,
-                cv4,
-                cv5,
-                cv6,
-                cv7,
-                vdupq_n_u32(BLAKE3_IV[0]),
-                vdupq_n_u32(BLAKE3_IV[1]),
-                vdupq_n_u32(BLAKE3_IV[2]),
-                vdupq_n_u32(BLAKE3_IV[3]),
-                tlo,
-                thi,
-                blen,
-                flags,
-            ];
-
-            // ---- L1 stages (block-lane words; drained by `dump` at the
-            // end so each block's 2 KiB is one ascending burst) ----
-            // Every element is written before it is read: prefix/out_lo own
-            // words 0..35, W32 owns 36..481, and the explicit suffix owns
-            // 482..511. Keep the stages uninitialized so each quad avoids
-            // three redundant 8 KiB bzero calls before those full writes.
-            let zero = vdupq_n_u32(0);
-            let mut zs = core::mem::MaybeUninit::<[V4; U32_PER_BLOCK]>::uninit();
-            let mut ast = core::mem::MaybeUninit::<[V4; U32_PER_BLOCK]>::uninit();
-            let mut bs = core::mem::MaybeUninit::<[V4; U32_PER_BLOCK]>::uninit();
-            let zs = zs.as_mut_ptr().cast::<V4>();
-            let ast = ast.as_mut_ptr().cast::<V4>();
-            let bs = bs.as_mut_ptr().cast::<V4>();
-
-            // ---- prefix (bits 0..1153), straight into the stages ----
-            // cv slot, words 0..8: z=a=cv, b=MAX.
-            for w in 0..8usize {
-                vst1q_u32(zs.add(w) as *mut u32, cv_v[w]);
-                vst1q_u32(ast.add(w) as *mut u32, cv_v[w]);
-            }
-            let maxv = vdupq_n_u32(u32::MAX);
-            // b prefix words 0..36 = MAX (the out_lo slot is MAX too — the
-            // scalar writes MAX over MAX, so b needs no out_lo pass).
-            for w in 0..36usize {
-                vst1q_u32(bs.add(w) as *mut u32, maxv);
-            }
-            // Message region words 16..36: word16 = 1|m0<<1, then
-            // word16+k = chain[k-1]>>31 | chain[k]<<1 over
-            // {m1..m15, t_lo, t_hi, blen, flags}. z and a share the content.
-            let one = vdupq_n_u32(1);
-            let chain: [V4; 20] = [
-                m[0], m[1], m[2], m[3], m[4], m[5], m[6], m[7], m[8], m[9], m[10], m[11], m[12],
-                m[13], m[14], m[15], tlo, thi, blen, flags,
-            ];
-            vst1q_u32(
-                zs.add(16) as *mut u32,
-                vorrq_u32(one, vshlq_n_u32::<1>(chain[0])),
-            );
-            for k in 1..20usize {
-                let w = vorrq_u32(
-                    vshrq_n_u32::<31>(chain[k - 1]),
-                    vshlq_n_u32::<1>(chain[k]),
-                );
-                vst1q_u32(zs.add(16 + k) as *mut u32, w);
-            }
-            // a's message region equals z's.
-            for w in 16..36usize {
-                let v = vld1q_u32(zs.add(w) as *const u32);
-                vst1q_u32(ast.add(w) as *mut u32, v);
-            }
-
-            // ---- G stream (bits 1153..15409): sequential push network ----
-            // Writers start at u32 word 36 with one pending bit (flags>>31
-            // for z/a, 1 for b) — the scalar writer's u64-word-18 state.
-            let pending_bit = vshrq_n_u32::<31>(flags);
-            let mut wz = W32::at(zs, pending_bit);
-            let mut wa = W32::at(ast, pending_bit);
-            let mut wb = W32::at(bs, one);
-
-            macro_rules! g {
-                ($g:expr, $la:literal, $lb:literal, $lc:literal, $ld:literal,
-                 $mx:literal, $my:literal) => {{
-                    let (t0, l0, r0, c0) = add_carry_parts_v(state[$la], state[$lb]);
-                    pushf!(wz, GS_BASE + G_STRIDE * $g + REC_C0, 31, c0);
-                    pushf!(wa, GS_BASE + G_STRIDE * $g + REC_C0, 31, l0);
-                    pushf!(wb, GS_BASE + G_STRIDE * $g + REC_C0, 31, r0);
-                    let (a1, l1, r1, c1) = add_carry_parts_v(t0, m[$mx]);
-                    pushf!(wz, GS_BASE + G_STRIDE * $g + REC_C1, 31, c1);
-                    pushf!(wa, GS_BASE + G_STRIDE * $g + REC_C1, 31, l1);
-                    pushf!(wb, GS_BASE + G_STRIDE * $g + REC_C1, 31, r1);
-                    let d1 = xor_rotr::<16, 16>(state[$ld], a1);
-                    let (c1s, l2, r2, c2) = add_carry_parts_v(state[$lc], d1);
-                    pushf!(wz, GS_BASE + G_STRIDE * $g + REC_C2, 31, c2);
-                    pushf!(wa, GS_BASE + G_STRIDE * $g + REC_C2, 31, l2);
-                    pushf!(wb, GS_BASE + G_STRIDE * $g + REC_C2, 31, r2);
-                    let b1 = xor_rotr::<12, 20>(state[$lb], c1s);
-                    let (t1, l3, r3, c3) = add_carry_parts_v(a1, b1);
-                    pushf!(wz, GS_BASE + G_STRIDE * $g + REC_C3, 31, c3);
-                    pushf!(wa, GS_BASE + G_STRIDE * $g + REC_C3, 31, l3);
-                    pushf!(wb, GS_BASE + G_STRIDE * $g + REC_C3, 31, r3);
-                    let (a2, l4, r4, c4) = add_carry_parts_v(t1, m[$my]);
-                    pushf!(wz, GS_BASE + G_STRIDE * $g + REC_C4, 31, c4);
-                    pushf!(wa, GS_BASE + G_STRIDE * $g + REC_C4, 31, l4);
-                    pushf!(wb, GS_BASE + G_STRIDE * $g + REC_C4, 31, r4);
-                    let d2 = xor_rotr::<8, 24>(d1, a2);
-                    let (c2s, l5, r5, c5) = add_carry_parts_v(c1s, d2);
-                    pushf!(wz, GS_BASE + G_STRIDE * $g + REC_C5, 31, c5);
-                    pushf!(wa, GS_BASE + G_STRIDE * $g + REC_C5, 31, l5);
-                    pushf!(wb, GS_BASE + G_STRIDE * $g + REC_C5, 31, r5);
-                    let bn = xor_rotr::<7, 25>(b1, c2s);
-                    pushf!(wz, GS_BASE + G_STRIDE * $g + REC_LIN0, 32, bn);
-                    pushf!(wa, GS_BASE + G_STRIDE * $g + REC_LIN0, 32, bn);
-                    pushf!(wb, GS_BASE + G_STRIDE * $g + REC_LIN0, 32, maxv);
-                    pushf!(wz, GS_BASE + G_STRIDE * $g + REC_LIN1, 32, d2);
-                    pushf!(wa, GS_BASE + G_STRIDE * $g + REC_LIN1, 32, d2);
-                    pushf!(wb, GS_BASE + G_STRIDE * $g + REC_LIN1, 32, maxv);
-                    state[$la] = a2;
-                    state[$lb] = bn;
-                    state[$lc] = c2s;
-                    state[$ld] = d2;
-                }};
-            }
-            macro_rules! round {
-                ($gb:literal, $m0:literal, $m1:literal, $m2:literal, $m3:literal,
-                 $m4:literal, $m5:literal, $m6:literal, $m7:literal,
-                 $m8:literal, $m9:literal, $m10:literal, $m11:literal,
-                 $m12:literal, $m13:literal, $m14:literal, $m15:literal) => {{
-                    g!($gb, 0, 4, 8, 12, $m0, $m1);
-                    g!($gb + 1, 1, 5, 9, 13, $m2, $m3);
-                    g!($gb + 2, 2, 6, 10, 14, $m4, $m5);
-                    g!($gb + 3, 3, 7, 11, 15, $m6, $m7);
-                    g!($gb + 4, 0, 5, 10, 15, $m8, $m9);
-                    g!($gb + 5, 1, 6, 11, 12, $m10, $m11);
-                    g!($gb + 6, 2, 7, 8, 13, $m12, $m13);
-                    g!($gb + 7, 3, 4, 9, 14, $m14, $m15);
-                }};
-            }
-            round!(0, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15);
-            round!(8, 2, 6, 3, 10, 7, 0, 4, 13, 1, 11, 12, 5, 9, 14, 15, 8);
-            round!(16, 3, 4, 10, 12, 13, 2, 7, 14, 6, 5, 9, 0, 11, 15, 8, 1);
-            round!(24, 10, 7, 12, 9, 14, 3, 13, 15, 4, 0, 11, 2, 5, 8, 1, 6);
-            round!(32, 12, 13, 9, 11, 15, 10, 14, 8, 7, 2, 5, 3, 0, 1, 6, 4);
-            round!(40, 9, 14, 11, 5, 8, 12, 15, 1, 13, 3, 0, 10, 2, 6, 4, 7);
-            round!(48, 11, 15, 5, 0, 1, 9, 8, 6, 14, 10, 2, 12, 3, 4, 7, 13);
-
-            // ---- out_hi (bits 15153..15409), stream-sequential ----
-            const {
-                assert!(OUT_HI_BASE % 32 == 17);
-            }
-            macro_rules! oh {
-                ($w:literal) => {{
-                    let hv = veorq_u32(state[$w + 8], cv_v[$w]);
-                    pushf!(wz, OUT_HI_BASE + 32 * $w, 32, hv);
-                    pushf!(wa, OUT_HI_BASE + 32 * $w, 32, hv);
-                    pushf!(wb, OUT_HI_BASE + 32 * $w, 32, maxv);
-                }};
-            }
-            oh!(0);
-            oh!(1);
-            oh!(2);
-            oh!(3);
-            oh!(4);
-            oh!(5);
-            oh!(6);
-            oh!(7);
-            wz.finish();
-            wa.finish();
-            wb.finish();
-
-            // ---- zero fill, words 482..512 (finish() 241..256 semantics) ----
-            const ZF: usize = USEFUL_BITS.div_ceil(32); // 482
-            const {
-                assert!(U32_PER_BLOCK - ZF == 30);
-            }
-            for w in 0..30usize {
-                vst1q_u32(zs.add(ZF + w) as *mut u32, zero);
-                vst1q_u32(ast.add(ZF + w) as *mut u32, zero);
-                vst1q_u32(bs.add(ZF + w) as *mut u32, zero);
-            }
-
-            // ---- out_lo slot, words 8..16 (z/a only) ----
-            for w in 0..8usize {
-                let lo = veorq_u32(state[w], state[w + 8]);
-                vst1q_u32(zs.add(8 + w) as *mut u32, lo);
-                vst1q_u32(ast.add(8 + w) as *mut u32, lo);
-            }
-
-            // ---- drain stages: per-block 2 KiB ascending bursts ----
-            if z_nt {
-                dump::<true>(zs, z);
-            } else {
-                dump::<false>(zs, z);
-            }
-            if ab_nt {
-                dump::<true>(ast, a);
-                dump::<true>(bs, b);
-            } else {
-                dump::<false>(ast, a);
-                dump::<false>(bs, b);
-            }
-        }
-    }
-
-    /// SIMD counterpart of `drive_witness_packed_and_lincheck_impl`
-    /// (PER_BLOCK_FULLY_WRITES, no rate-2 codeword): same scratch pools, same
-    /// process_group shape, same optional Metal band streaming, same stripe
-    /// pass; the per-block builder runs as two NEON quads per group and the
-    /// a/b/stripe stores are non-temporal (§14; z stays plain, §16).
-    #[allow(clippy::type_complexity)]
-    fn generate_impl(
-        blocks: &[Compression],
-        n_blocks_log: usize,
-        stream_params: Option<&flock_core::pcs::PcsParams>,
-        defer_ranked_stripe: bool,
-    ) -> (
-        Vec<F128>,
-        Vec<F128>,
-        Vec<F128>,
-        Option<Vec<u8>>,
-        Option<flock_core::gpu_commit::FromZFirstPassStream>,
-    ) {
-        let n_total = 1usize << n_blocks_log;
-        let n_blocks = blocks.len();
-        assert!(n_blocks <= n_total);
-        assert!(
-            n_total >= 8 && n_total.is_multiple_of(8),
-            "lincheck stripe layout requires n_total ≥ 8 and divisible by 8"
-        );
-        let stripe_useful_bits = if std::env::var_os("FLOCK_FULL_STRIPE").is_some() {
-            K
-        } else {
-            USEFUL_BITS
-        };
-        let padding: Compression = ([0u32; 8], [0u32; 16], 0u64, 0u32, 0u32);
-        let total_f128 = n_total * F128_PER_BLOCK;
-        let mut z = flock_core::scratch::take_f128(total_f128);
-        let mut a = flock_core::scratch::take_f128(total_f128);
-        let mut b = flock_core::scratch::take_f128(total_f128);
-
-        let mut stream = stream_params.and_then(|params| {
-            // SAFETY: z's allocation/address stays fixed until the returned
-            // stream is consumed by commit. No range is submitted until all
-            // eight source segments for it have been fully initialized.
-            unsafe {
-                flock_core::gpu_commit::begin_from_z_first_pass_stream(
-                    z.as_mut_ptr(),
-                    z.len(),
-                    params,
-                )
-            }
-        });
-        // The band streaming below is the ranked BLAKE3 geometry: 2^18
-        // blocks × 2^14 bits, grouped by eight, eight from-`z` segments.
-        if stream.is_some() && n_total != 1 << 18 {
-            stream = None;
-        }
-        // Omit the eager L1-hot transpose only when the exact streamed Metal
-        // lease was actually acquired. A warmup/failure/non-ranked miss keeps
-        // the ordinary stripe so no fallback can observe an absent buffer.
-        let defer_ranked_stripe = defer_ranked_stripe && stream.is_some();
-        let mut z_lincheck =
-            (!defer_ranked_stripe).then(|| flock_core::scratch::take_u8((n_total / 8) * K));
-
-        #[derive(Clone, Copy)]
-        struct WritePtr<T>(*mut T);
-        unsafe impl<T> Send for WritePtr<T> {}
-        unsafe impl<T> Sync for WritePtr<T> {}
-        impl<T> WritePtr<T> {
-            fn get(self) -> *mut T {
-                self.0
-            }
-        }
-
-        let group_f128 = 8 * F128_PER_BLOCK;
-        let z_base = WritePtr(z.as_mut_ptr());
-        let a_base = WritePtr(a.as_mut_ptr());
-        let b_base = WritePtr(b.as_mut_ptr());
-        let stripe_base = z_lincheck
-            .as_mut()
-            .map(|stripe| WritePtr(stripe.as_mut_ptr()));
-        let nt = nt_enabled();
-        // The ordinary path rereads z immediately to emit the lincheck
-        // stripe, so its cached stores remain intentional. With an acquired
-        // Metal stream and deferred stripe, z's next consumer is the GPU;
-        // store it non-temporally like a/b and avoid polluting CPU caches with
-        // the full 512 MiB ranked buffer. The per-band release fence below is
-        // the same visibility boundary used by the cached-store path.
-        let z_nt = select_z_nt(nt, defer_ranked_stripe, z_nt_enabled());
-
-        let process_group = |g: usize| {
-            // SAFETY: each scheduled group index occurs exactly once. Every
-            // group owns disjoint z/a/b ranges and one disjoint stripe.
-            let (z_grp, a_grp, b_grp) = unsafe {
-                (
-                    std::slice::from_raw_parts_mut(z_base.get().add(g * group_f128), group_f128),
-                    std::slice::from_raw_parts_mut(a_base.get().add(g * group_f128), group_f128),
-                    std::slice::from_raw_parts_mut(b_base.get().add(g * group_f128), group_f128),
-                )
-            };
-            for half in 0..2 {
-                let quad: [&Compression; 4] = std::array::from_fn(|j| {
-                    let idx = 8 * g + 4 * half + j;
-                    if idx < n_blocks {
-                        &blocks[idx]
-                    } else {
-                        &padding
-                    }
-                });
-                let base = half * 4 * F128_PER_BLOCK;
-                // SAFETY: each quad fully owns its four block slots in every
-                // buffer; groups are disjoint across workers.
-                unsafe {
-                    build_quad_witness_ab_stream_neon(
-                        quad,
-                        z_grp[base..].as_mut_ptr() as *mut u32,
-                        a_grp[base..].as_mut_ptr() as *mut u32,
-                        b_grp[base..].as_mut_ptr() as *mut u32,
-                        z_nt,
-                        nt,
-                    );
-                }
-            }
-            if let Some(stripe_base) = stripe_base {
-                // Bit-transpose 8 z chunks into the lincheck stripe
-                // (identical to the generic driver). This immediate-stripe
-                // arm necessarily has z_nt=false, so the re-read is L1-hot;
-                // the ranked deferred arm skips this whole block and
-                // reconstructs from immutable z.
-                let stripe =
-                    unsafe { std::slice::from_raw_parts_mut(stripe_base.get().add(g * K), K) };
-                let z_u64_all: &[u64] = unsafe {
-                    std::slice::from_raw_parts(z_grp.as_ptr() as *const u64, z_grp.len() * 2)
-                };
-                let u64_per_block = K / 64;
-                let useful_words = stripe_useful_bits.div_ceil(64);
-                let mut tmp = [0u8; 64];
-                for i in 0..useful_words {
-                    let lanes: [u64; 8] = std::array::from_fn(|j| z_u64_all[j * u64_per_block + i]);
-                    if nt {
-                        transpose_8_u64s_to_64_bytes(&lanes, &mut tmp);
-                        // SAFETY: stripe chunk i is 64 in-bounds bytes.
-                        unsafe {
-                            stripe_store_nt(tmp.as_ptr(), stripe.as_mut_ptr().add(i * 64));
-                        }
-                    } else {
-                        transpose_8_u64s_to_64_bytes(&lanes, &mut stripe[i * 64..i * 64 + 64]);
-                    }
-                }
-                // Mirrors the generic driver: the padded fold never observes
-                // the tail; the honest zero pad is test-only.
-                #[cfg(test)]
-                {
-                    stripe[useful_words * 64..].fill(0);
-                }
-            }
-        };
-
-        let n_groups = n_total / 8;
-        // W-H1 engagement evidence (mirrors the generic driver): helper-pool
-        // slab claims across the whole witness drain.
-        let claimed_before = super::super::common::witgen_hetero_trace()
-            .then(flock_core::epool::helper_chunks_claimed);
-        if let Some(stream) = &mut stream {
-            const SEGMENTS: usize = 8;
-            let groups_per_segment = n_groups / SEGMENTS;
-            debug_assert_eq!(groups_per_segment, 4096);
-            // Band schedule in groups-per-segment units (each unit maps to 16
-            // streamed r tiles across all 8 segments). The GPU consumes the
-            // first NTT pass at witness-production pace with zero inter-band
-            // gaps, so the window's head segment ends at (last submit) +
-            // (final band's GPU slice). Tapering the trailing bands shrinks
-            // that final slice from 1/8 of the pass to 1/256 of it, pulling
-            // the whole downstream GPU chain earlier by the difference. The
-            // uniform 8-band control remains selectable for exact same-binary
-            // A/B (`FLOCK_NO_STREAM_TAPER=1`).
-            // Tail band of 64 gps keeps 8 hetero slabs (WITGEN_HETERO_SLAB =
-            // 64 jobs) so its drain still parallelizes across the pool.
-            const UNIFORM_SCHEDULE: &[usize] = &[512; 8];
-            const TAPERED_SCHEDULE: &[usize] = &[512, 512, 512, 512, 512, 512, 512, 448, 64];
-            // A/B-CONTROL: set to `false` for the official-harness control
-            // build. The env kill switch exists for same-binary diagnostics.
-            const STREAM_TAPER_DEFAULT: bool = true;
-            let tapered = STREAM_TAPER_DEFAULT
-                && std::env::var_os("FLOCK_NO_STREAM_TAPER").is_none();
-            let schedule = if tapered {
-                TAPERED_SCHEDULE
-            } else {
-                UNIFORM_SCHEDULE
-            };
-            debug_assert_eq!(schedule.iter().sum::<usize>(), groups_per_segment);
-            let mut offset = 0usize;
-            for &band_gps in schedule {
-                // W-H1: the band's jobs drain through the same slab shim as
-                // the generic driver (a slab never straddles a segment).
-                let band_job = |job: usize| {
-                    let segment = job / band_gps;
-                    let local = job % band_gps;
-                    let g = segment * groups_per_segment + offset + local;
-                    process_group(g);
-                };
-                super::super::common::drain_group_jobs(SEGMENTS * band_gps, &band_job);
-                // The queue/Rayon join above publishes every CPU write in
-                // this band; command-buffer submission then makes those
-                // shared-memory pages visible to Metal before it starts the
-                // range.
-                std::sync::atomic::fence(std::sync::atomic::Ordering::Release);
-                stream.submit_ready_range(offset * 16, band_gps * 16);
-                offset += band_gps;
-            }
-        } else {
-            super::super::common::drain_group_jobs(n_groups, &process_group);
-        }
-        if let Some(before) = claimed_before {
-            eprintln!(
-                "[witgen-hetero] groups={n_groups} helper-claims={}",
-                flock_core::epool::helper_chunks_claimed() - before
-            );
-        }
-
-        (z, a, b, z_lincheck, stream)
-    }
-
-    /// Non-streamed entry (matches `drive_witness_packed_and_lincheck_full_write`).
-    pub(crate) fn generate(
-        blocks: &[Compression],
-        n_blocks_log: usize,
-    ) -> (Vec<F128>, Vec<F128>, Vec<F128>, Vec<u8>) {
-        let (z, a, b, stripe, stream) = generate_impl(blocks, n_blocks_log, None, false);
-        debug_assert!(stream.is_none());
-        (
-            z,
-            a,
-            b,
-            stripe.expect("non-streamed witness always emits lincheck stripe"),
-        )
-    }
-
-    /// Streamed entry (matches `drive_witness_packed_and_lincheck_full_write_streamed`).
-    #[allow(clippy::type_complexity)]
-    pub(crate) fn generate_streamed(
-        blocks: &[Compression],
-        n_blocks_log: usize,
-        pcs_params: &flock_core::pcs::PcsParams,
-        defer_ranked_stripe: bool,
-    ) -> (
-        Vec<F128>,
-        Vec<F128>,
-        Vec<F128>,
-        Option<Vec<u8>>,
-        Option<flock_core::gpu_commit::FromZFirstPassStream>,
-    ) {
-        generate_impl(blocks, n_blocks_log, Some(pcs_params), defer_ranked_stripe)
     }
 }
 
@@ -2486,113 +1617,15 @@ fn generate_witness_with_ab_packed_and_lincheck_impl(
                 per_block,
             )
         }
-        None => {
-            // W-H2: SIMD-lockstep quad builder (notes/witgen-simd.md).
-            // Bit-exact with the scalar driver; the rate-2 codeword arm
-            // above stays scalar (A/B fallback path).
-            #[cfg(target_arch = "aarch64")]
-            if witgen_simd::enabled() {
-                return witgen_simd::generate(blocks, n_blocks_log);
-            }
-            super::common::drive_witness_packed_and_lincheck_full_write(
-                blocks,
-                &padding,
-                n_blocks_log,
-                K_LOG,
-                stripe_useful_bits,
-                per_block,
-            )
-        }
-    }
-}
-
-/// Strict production selector for moving the lincheck stripe transpose out of
-/// witness generation. Requiring the exact ranked PCS geometry here keeps the
-/// downstream `DeferredRanked` marker impossible for generic callers;
-/// `generate_impl` additionally requires a live streamed Metal lease before
-/// it actually omits the eager stripe. `FLOCK_NO_DEFER_LINCHECK_STRIPE=1`
-/// restores eager materialization as an exact same-binary control. Requiring
-/// a live utility pool avoids the known-negative performance-core fallback.
-fn select_deferred_ranked_lincheck_stripe(
-    n_blocks_log: usize,
-    pcs_params: &PcsParams,
-    platform_supported: bool,
-    helper_pool_available: bool,
-    disabled: bool,
-    full_stripe: bool,
-) -> bool {
-    platform_supported
-        && helper_pool_available
-        && !disabled
-        && !full_stripe
-        && n_blocks_log == 18
-        && pcs_params.m == 32
-        && pcs_params.log_inv_rate == 1
-        && pcs_params.log_batch_size == 6
-        && pcs_params.profile == flock_core::pcs::ligerito::LigeritoProfile::Fast
-        && pcs_params.merkle_hash == flock_core::merkle::HashKind::Blake3
-}
-
-fn use_deferred_ranked_lincheck_stripe(n_blocks_log: usize, pcs_params: &PcsParams) -> bool {
-    select_deferred_ranked_lincheck_stripe(
-        n_blocks_log,
-        pcs_params,
-        cfg!(all(target_os = "macos", target_arch = "aarch64")),
-        flock_core::epool::helper_pool_available(),
-        std::env::var_os("FLOCK_NO_DEFER_LINCHECK_STRIPE").is_some(),
-        std::env::var_os("FLOCK_FULL_STRIPE").is_some(),
-    )
-}
-
-#[inline]
-fn should_request_ranked_exact_tune(call: usize, ranked_shape_enabled: bool) -> bool {
-    call == 0 && ranked_shape_enabled
-}
-
-fn generate_witness_with_ab_packed_and_lincheck_streamed(
-    blocks: &[Compression],
-    n_blocks_log: usize,
-    pcs_params: &PcsParams,
-) -> (
-    Vec<F128>,
-    Vec<F128>,
-    Vec<F128>,
-    Option<Vec<u8>>,
-    Option<flock_core::gpu_commit::FromZFirstPassStream>,
-) {
-    let padding: Compression = ([0u32; 8], [0u32; 16], 0u64, 0u32, 0u32);
-    let stripe_useful_bits = if std::env::var_os("FLOCK_FULL_STRIPE").is_some() {
-        K
-    } else {
-        USEFUL_BITS
-    };
-    let per_block =
-        |block: &Compression, z_u64: &mut [u64], a_u64: &mut [u64], b_u64: &mut [u64]| {
-            let (cv, m, t, bl, fl) = block;
-            build_block_witness_ab_stream_into(cv, m, *t, *bl, *fl, z_u64, a_u64, b_u64);
-        };
-    // W-H2: SIMD-lockstep quad builder (notes/witgen-simd.md). Bit-exact
-    // with the scalar driver, incl. the Metal band-streaming protocol.
-    #[cfg(target_arch = "aarch64")]
-    if witgen_simd::enabled() {
-        return witgen_simd::generate_streamed(
-            blocks,
-            n_blocks_log,
-            pcs_params,
-            use_deferred_ranked_lincheck_stripe(n_blocks_log, pcs_params),
-        );
-    }
-    let (z, a, b, stripe, stream) =
-        super::common::drive_witness_packed_and_lincheck_full_write_streamed(
+        None => super::common::drive_witness_packed_and_lincheck_full_write(
             blocks,
             &padding,
             n_blocks_log,
             K_LOG,
             stripe_useful_bits,
-            pcs_params,
             per_block,
-        );
-    (z, a, b, Some(stripe), stream)
+        ),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2808,203 +1841,24 @@ impl Blake3Setup {
     }
 
     /// Ligerito-backend prove. Requires m ≥ ~21.
-    ///
-    /// The ranked benchmark worker calls this exactly twice per process: an
-    /// untimed fixed-seed warm-up, then the timed proof (submissions ship
-    /// only `crates/*/src`, so per-trial hooks must live here, not in the
-    /// worker binary). Around the underlying prove this wrapper:
-    ///
-    /// - after the first (warm-up) call: serializes the warm-up bundle once
-    ///   so the timed `to_bytes` allocation is warm (`FLOCK_NO_SER_WARM=1`
-    ///   restores discard-only), then starts the pool keepalive nudger for
-    ///   the ready→seed handshake (`FLOCK_NO_EPOOL_KEEPALIVE=1` kills);
-    /// - at the start of the second (timed) call: flips the nudger to
-    ///   proving mode, so the main pool is never nudged mid-proof.
-    ///
-    /// Neither hook touches challenger or prover state; proof bytes are
-    /// identical by construction.
     pub fn prove_fast<Ch: Challenger>(
         &self,
         blocks: &[Compression],
         challenger: &mut Ch,
     ) -> (flock_core::proof::R1csProofLigerito, Commitment, R1csClaim) {
-        use std::sync::atomic::{AtomicUsize, Ordering};
-        static PROVE_FAST_CALLS: AtomicUsize = AtomicUsize::new(0);
-        let call = PROVE_FAST_CALLS.fetch_add(1, Ordering::Relaxed);
-        // Seed pipelining: on the timed call the proof for these blocks may
-        // already be several milliseconds in flight on the seed-pipe thread,
-        // started the moment the harness wrote the seed instead of after the
-        // protected wrapper's serial expansion of it. Adoption is gated on a
-        // full byte-equality check of `blocks`; see `crate::seed_pipe`. This
-        // must run before the keep-warm pause below — on the adopted path the
-        // speculative thread already issued it at its own prove entry.
-        if call > 0 {
-            if let Some(adopted) = crate::seed_pipe::try_adopt(blocks) {
-                return adopted;
-            }
-        }
-        // The GPU keep-warm bridge must never overlap a prove: pause it for
-        // the whole prove; the warmup latch paths re-arm it on completion of
-        // the first ranked commit (untimed), bridging the warmup CPU tail
-        // and the ready->seed gap.
-        flock_core::gpu_commit::gpu_keepwarm_prove_started();
-        // Call zero is the untimed warmup but materializes an eager lincheck
-        // stripe before the timed proof establishes streaming. Issue the
-        // exact-contention ticket here, before witness generation, so only
-        // warmup can calibrate and cache-hit workers skip the replay.
-        if should_request_ranked_exact_tune(call, self.use_ranked_reverse_lincheck()) {
-            let _ = flock_core::gpu_commit::request_ranked_exact_contention_tune();
-        }
-        // Keepalive nudger removed: ranked submission 51a3127 measured the
-        // stack containing it at −1.4% vs base (outside the ±0.3% band) —
-        // mid-proof pool nudging contends with the leaf pipeline's claims,
-        // the same contention class as the measured hetero-widening losses.
-        // The warm publish below and the spawn-free kickoff stay: their
-        // mechanisms are contention-free.
-        let (proof, commitment, claim) = self.prove_fast_inner(blocks, challenger);
-        if call == 0 {
-            let (proof, commitment) = warm_publish_path(proof, commitment);
-            // Last thing the untimed warm-up does: hand stdin to the seed-pipe
-            // thread. The worker publishes its ready file immediately after we
-            // return and only then touches `io::stdin()`, so the splice lands
-            // outside every measured interval and before the wrapper's
-            // `BufReader` binds a descriptor.
-            self.arm_seed_pipe();
-            return (proof, commitment, claim);
-        }
-        (proof, commitment, claim)
-    }
-
-    /// Start the speculative seed pipeline for this setup. No-op outside the
-    /// ranked worker and under `FLOCK_NO_SEED_PIPE=1`.
-    fn arm_seed_pipe(&self) {
-        if !self.n_blocks.is_power_of_two() {
-            return;
-        }
-        crate::seed_pipe::arm(
-            self.n_blocks.trailing_zeros(),
-            std::ptr::from_ref(self) as usize,
-            Self::run_speculative_prove,
-        );
-    }
-
-    /// Body of a speculative proof: identical to the timed call the wrapper
-    /// would have made, including a challenger built from the benchmark domain
-    /// and hash, so the emitted proof bytes are the same ones.
-    fn run_speculative_prove(setup_addr: usize, blocks: &[Compression]) -> crate::seed_pipe::ProveOut {
-        // SAFETY: `setup_addr` is the address of the `Blake3Setup` the ranked
-        // worker builds in `main` and holds until the process exits, so it
-        // outlives this thread. Only shared reads happen through it — the same
-        // `&self` the Rayon pool already fans out during any prove.
-        let setup: &Self = unsafe { &*(setup_addr as *const Self) };
-        flock_core::gpu_commit::gpu_keepwarm_prove_started();
-        let mut challenger = flock_core::challenger::FsChallenger::with_hash(
-            crate::seed_pipe::BENCH_DOMAIN,
-            HashKind::Blake3,
-        );
-        setup.prove_fast_inner(blocks, &mut challenger)
-    }
-
-    fn prove_fast_inner<Ch: Challenger>(
-        &self,
-        blocks: &[Compression],
-        challenger: &mut Ch,
-    ) -> (flock_core::proof::R1csProofLigerito, Commitment, R1csClaim) {
         assert_eq!(blocks.len(), self.n_blocks);
-        let phase_timing = std::env::var_os("FLOCK_PHASE_TIMING").is_some();
         if self.use_ranked_rate2_hot_codeword() {
-            // From-message commit: the layer-1 NTT pass synthesizes both
-            // rate-1/2 replicas straight from z_packed, so the witness
-            // driver skips its ~1 GiB of replica stores entirely. The
-            // codeword scratch stays stale until that pass writes it.
-            // `FLOCK_NO_NTT_FROM_MSG=1` restores the hot-codeword replicate
-            // path below as the exact A/B control.
-            if flock_core::pcs::use_ranked_from_message_commit(&self.pcs_params) {
-                // Persistent Metal staging makes this 1 GiB CPU fallback dead
-                // after warmup; GPU failures allocate it lazily in commit.
-                let codeword = if flock_core::pcs::ranked_gpu_commit_latched_on() {
-                    None
-                } else {
-                    Some(flock_core::scratch::take_f128(
-                        self.pcs_params.codeword_len_f128(),
-                    ))
-                };
-                let cpu_wit = phase_timing.then(crate::prover::process_cpu_ms);
-                let t_wit = std::time::Instant::now();
-                let (z_packed, a_packed_f128, b_packed_f128, z_packed_lincheck, gpu_first_pass) =
-                    generate_witness_with_ab_packed_and_lincheck_streamed(
-                        blocks,
-                        self.n_blocks_log(),
-                        &self.pcs_params,
-                    );
-                if phase_timing {
-                    let wall = t_wit.elapsed().as_secs_f64() * 1e3;
-                    let cpu = crate::prover::process_cpu_ms() - cpu_wit.unwrap_or(0.0);
-                    eprintln!(
-                        "[phase-timing] witgen (from-msg): {wall:.2} ms cpu={cpu:.1} util={:.1}",
-                        cpu / wall
-                    );
-                }
-                let lc_circuit = self.lincheck_circuit();
-                if let Some(stream) = gpu_first_pass {
-                    // A live stream implies the GPU latch is on; the empty
-                    // marker is hydrated only if the Metal finish fails.
-                    let codeword = codeword.unwrap_or_default();
-                    return match z_packed_lincheck {
-                        Some(stripe) => {
-                            crate::prover::prove_fast_ligerito_from_streamed_first_pass(
-                                &self.r1cs,
-                                &self.pcs_params,
-                                z_packed,
-                                a_packed_f128,
-                                b_packed_f128,
-                                stripe,
-                                lc_circuit,
-                                codeword,
-                                stream,
-                                challenger,
-                            )
-                        }
-                        None => crate::prover::prove_fast_ligerito_from_streamed_first_pass_deferred_stripe(
-                            &self.r1cs,
-                            &self.pcs_params,
-                            z_packed,
-                            a_packed_f128,
-                            b_packed_f128,
-                            lc_circuit,
-                            codeword,
-                            stream,
-                            challenger,
-                        ),
-                    };
-                }
-                return crate::prover::prove_fast_ligerito_from_witness(
-                    &self.r1cs,
-                    &self.pcs_params,
-                    z_packed,
-                    a_packed_f128,
-                    b_packed_f128,
-                    z_packed_lincheck
-                        .expect("non-streamed witness fallback must materialize lincheck stripe"),
-                    lc_circuit,
-                    codeword,
-                    challenger,
-                );
-            }
-            let cpu_wit = phase_timing.then(crate::prover::process_cpu_ms);
-            let t_wit = std::time::Instant::now();
+            // Ranked-benchmark shape: emit the witness/prove wall split to
+            // stderr (pure observability - no arithmetic or buffer changes,
+            // proof bytes untouched) so scored worker runs log the phase
+            // costs that decide the next optimization target.
+            let t0 = std::time::Instant::now();
             let (codeword, (z_packed, a_packed_f128, b_packed_f128, z_packed_lincheck)) =
                 self.generate_witness_ab_with_rate2_codeword(blocks);
-            if phase_timing {
-                let wall = t_wit.elapsed().as_secs_f64() * 1e3;
-                let cpu = crate::prover::process_cpu_ms() - cpu_wit.unwrap_or(0.0);
-                eprintln!(
-                    "[phase-timing] witgen+hot-codeword: {wall:.2} ms cpu={cpu:.1} util={:.1}",
-                    cpu / wall
-                );
-            }
+            let witness_s = t0.elapsed().as_secs_f64();
             let lc_circuit = self.lincheck_circuit();
-            return crate::prover::prove_fast_ligerito_from_preinitialized_codeword(
+            let t1 = std::time::Instant::now();
+            let out = crate::prover::prove_fast_ligerito_from_preinitialized_codeword(
                 &self.r1cs,
                 &self.pcs_params,
                 z_packed,
@@ -3015,6 +1869,14 @@ impl Blake3Setup {
                 codeword,
                 challenger,
             );
+            let prove_s = t1.elapsed().as_secs_f64();
+            eprintln!(
+                "[phase-timing] ranked prove_fast: witness={:.2} ms, prove={:.2} ms, total={:.2} ms",
+                witness_s * 1e3,
+                prove_s * 1e3,
+                (witness_s + prove_s) * 1e3
+            );
+            return out;
         }
         let (codeword, (z_packed, a_packed_f128, b_packed_f128, z_packed_lincheck)) =
             flock_core::pcs::prefault_codeword_during(&self.pcs_params, || {
@@ -3104,27 +1966,6 @@ impl Blake3Setup {
             challenger,
         )
     }
-}
-
-/// Serialize the warm-up proof bundle once and discard the bytes, so the
-/// timed proof's `to_bytes` (~450 KiB) is served from a warm allocation
-/// (warm malloc size class) instead of a fresh mmap + soft-fault inside the
-/// scored interval, which only ends when the proof file is visible to the
-/// harness. Ownership round-trips through the bundle struct — no clones,
-/// proof bytes untouched.
-///
-/// Kill switch: `FLOCK_NO_SER_WARM=1` restores the discard-only warm-up.
-fn warm_publish_path(
-    proof: flock_core::proof::R1csProofLigerito,
-    commitment: Commitment,
-) -> (flock_core::proof::R1csProofLigerito, Commitment) {
-    if std::env::var_os("FLOCK_NO_SER_WARM").is_some() {
-        return (proof, commitment);
-    }
-    let bundle = crate::proof_io::R1csProofBundleLigerito { commitment, proof };
-    std::hint::black_box(bundle.to_bytes());
-    let crate::proof_io::R1csProofBundleLigerito { commitment, proof } = bundle;
-    (proof, commitment)
 }
 
 // ---------------------------------------------------------------------------
@@ -3431,206 +2272,6 @@ mod tests {
     const CHUNK_END: u32 = 1 << 1;
     const ROOT: u32 = 1 << 3;
 
-    /// Empirical probe for the commit NTT's static zero-lane geometry.
-    ///
-    /// The witness is block-periodic with period `K = 16,384` bits = 128 F128
-    /// words; only `USEFUL_BITS = 15,409` of them are constrained, the rest
-    /// are forced to zero by the padding rows `0·0 = z[i]`. With the SoA
-    /// codeword layout `codeword[pos · 64 + lane] = z_packed[i]` this must
-    /// leave a static all-zero pattern at fixed `(lane, pos parity)` slots.
-    /// Prints the observed pattern and asserts it.
-    #[test]
-    fn commit_zero_lane_geometry_probe() {
-        const NUM_NTTS: usize = 64;
-        let mut rng = Rng::new(0x5EED_0BEE);
-        let n_blocks = 96usize;
-        let blocks: Vec<Compression> = (0..n_blocks)
-            .map(|_| {
-                let cv: [u32; 8] = std::array::from_fn(|_| rng.next_u32());
-                let m: [u32; 16] = std::array::from_fn(|_| rng.next_u32());
-                let t = ((rng.next_u32() as u64) << 32) | rng.next_u32() as u64;
-                (cv, m, t, rng.next_u32() & 0xFF, CHUNK_START | CHUNK_END | ROOT)
-            })
-            .collect();
-        let setup = Blake3Setup::new(n_blocks);
-        let z_packed = setup.generate_witness_packed(&blocks);
-
-        // Occupancy per (lane, pos parity) slot over the whole packed witness.
-        let mut nonzero = [[0usize; 2]; NUM_NTTS];
-        for (i, v) in z_packed.iter().enumerate() {
-            if *v != F128::ZERO {
-                nonzero[i % NUM_NTTS][(i / NUM_NTTS) & 1] += 1;
-            }
-        }
-        let mut all_zero: Vec<(usize, usize)> = Vec::new();
-        for lane in 0..NUM_NTTS {
-            for par in 0..2 {
-                if nonzero[lane][par] == 0 {
-                    all_zero.push((lane, par));
-                }
-            }
-        }
-        println!("z_packed len = {}", z_packed.len());
-        println!("all-zero (lane, pos_parity) slots: {all_zero:?}");
-        println!(
-            "lane 56 nonzero counts: even={} odd={}",
-            nonzero[56][0], nonzero[56][1]
-        );
-        for lane in 57..64 {
-            println!(
-                "lane {lane} nonzero counts: even={} odd={}",
-                nonzero[lane][0], nonzero[lane][1]
-            );
-        }
-
-        // Expected: exactly lanes 57..=63 at ODD pos are identically zero.
-        let expected: Vec<(usize, usize)> = (57..64).map(|l| (l, 1)).collect();
-        assert_eq!(all_zero, expected, "observed zero geometry differs");
-        // Word 120 (lane 56, odd pos) keeps 49 useful bits — must NOT be zero.
-        assert!(nonzero[56][1] > 0, "lane 56 odd pos unexpectedly all zero");
-    }
-
-    /// End-to-end oracle at the RANKED production shape (`n_blocks_log = 18`,
-    /// `m = 32`, `log_d = 20`, 64 lanes): a real BLAKE3 witness through the
-    /// real `pcs::commit` must produce a byte-identical codeword and Merkle
-    /// root with the zero-lane skip published and with it disabled.
-    ///
-    /// Ignored by default: 512 MiB witness + 1 GiB codeword per commit. The
-    /// ambient publication is honored only at this exact geometry, so nothing
-    /// smaller can exercise it.
-    #[test]
-    #[ignore = "ranked shape: ~3 GiB resident"]
-    fn ranked_commit_root_identical_with_zero_lane_skip() {
-        use flock_core::ntt::additive_ntt_f128::ZeroOddTailLanes;
-
-        let mut rng = Rng::new(0xC0FF_EE01);
-        let n_blocks = 1usize << 18;
-        let blocks: Vec<Compression> = (0..n_blocks)
-            .map(|_| {
-                let cv: [u32; 8] = std::array::from_fn(|_| rng.next_u32());
-                let m: [u32; 16] = std::array::from_fn(|_| rng.next_u32());
-                let t = ((rng.next_u32() as u64) << 32) | rng.next_u32() as u64;
-                (cv, m, t, rng.next_u32() & 0xFF, CHUNK_START | CHUNK_END | ROOT)
-            })
-            .collect();
-        let setup = Blake3Setup::new(n_blocks);
-        assert_eq!(setup.pcs_params.m, 32, "expected the ranked shape");
-        let padding = setup.r1cs.padding_spec();
-        let num_ntts = setup.pcs_params.num_ntts();
-        let lanes = ZeroOddTailLanes::lanes_for_padding(
-            num_ntts,
-            padding.k_log,
-            padding.useful_bits_per_block,
-        );
-        assert_eq!(lanes, 7, "ranked BLAKE3 padding must expose seven zero lanes");
-
-        let mut z_packed = setup.generate_witness_packed(&blocks);
-        // Digest instead of retaining two 1 GiB codewords + two trees.
-        let commit_with = |z: &[F128], tail: usize| {
-            let guard = ZeroOddTailLanes::scope(num_ntts, tail);
-            let (commitment, data) = flock_core::pcs::commit(z, &setup.pcs_params);
-            let digest = |v: &[u8]| *::blake3::hash(v).as_bytes();
-            let cw: &[flock_core::field::F128] = &data.codeword;
-            let out = (
-                commitment.root,
-                digest(unsafe {
-                    std::slice::from_raw_parts(cw.as_ptr().cast::<u8>(), std::mem::size_of_val(cw))
-                }),
-                data.merkle_tree.len(),
-            );
-            drop(data);
-            drop(guard);
-            out
-        };
-
-        let dense = commit_with(&z_packed, 0);
-        let skipped = commit_with(&z_packed, lanes);
-        assert_eq!(dense.0, skipped.0, "Merkle root changed under the zero-lane skip");
-        assert_eq!(dense.1, skipped.1, "codeword changed under the zero-lane skip");
-        assert_eq!(dense.2, skipped.2, "Merkle tree length changed");
-
-        // Negative control: prove the skip really engaged at this geometry.
-        // Break one odd-position tail word and the two commits must diverge.
-        z_packed[127] = F128::new(1, 0);
-        assert_ne!(
-            commit_with(&z_packed, 0).0,
-            commit_with(&z_packed, lanes).0,
-            "skip never engaged at the ranked shape — the oracle proves nothing"
-        );
-    }
-
-    #[test]
-    fn ranked_exact_tune_is_warmup_call_only() {
-        assert!(should_request_ranked_exact_tune(0, true));
-        assert!(!should_request_ranked_exact_tune(1, true));
-        assert!(!should_request_ranked_exact_tune(2, true));
-        assert!(!should_request_ranked_exact_tune(0, false));
-    }
-
-    #[test]
-    fn deferred_stripe_selector_is_exact_and_killable() {
-        let ranked = PcsParams {
-            m: 32,
-            log_inv_rate: 1,
-            log_batch_size: 6,
-            profile: flock_core::pcs::ligerito::LigeritoProfile::Fast,
-            merkle_hash: flock_core::merkle::HashKind::Blake3,
-        };
-        assert!(select_deferred_ranked_lincheck_stripe(
-            18, &ranked, true, true, false, false
-        ));
-        assert!(!select_deferred_ranked_lincheck_stripe(
-            18, &ranked, false, true, false, false
-        ));
-        assert!(!select_deferred_ranked_lincheck_stripe(
-            18, &ranked, true, false, false, false
-        ));
-        assert!(!select_deferred_ranked_lincheck_stripe(
-            18, &ranked, true, true, true, false
-        ));
-        assert!(!select_deferred_ranked_lincheck_stripe(
-            18, &ranked, true, true, false, true
-        ));
-        assert!(!select_deferred_ranked_lincheck_stripe(
-            17, &ranked, true, true, false, false
-        ));
-
-        let mut wrong = ranked.clone();
-        wrong.log_batch_size = 5;
-        assert!(!select_deferred_ranked_lincheck_stripe(
-            18, &wrong, true, true, false, false
-        ));
-        wrong = ranked.clone();
-        wrong.profile = flock_core::pcs::ligerito::LigeritoProfile::Slim;
-        assert!(!select_deferred_ranked_lincheck_stripe(
-            18, &wrong, true, true, false, false
-        ));
-        wrong = ranked;
-        wrong.merkle_hash = flock_core::merkle::HashKind::Sha256;
-        assert!(!select_deferred_ranked_lincheck_stripe(
-            18, &wrong, true, true, false, false
-        ));
-    }
-
-    #[cfg(target_arch = "aarch64")]
-    #[test]
-    fn deferred_z_nt_selector_is_exact_and_killable() {
-        for nt_enabled in [false, true] {
-            for defer_ranked_stripe in [false, true] {
-                for z_nt_enabled in [false, true] {
-                    assert_eq!(
-                        witgen_simd::select_z_nt(
-                            nt_enabled,
-                            defer_ranked_stripe,
-                            z_nt_enabled,
-                        ),
-                        nt_enabled && defer_ranked_stripe && z_nt_enabled,
-                    );
-                }
-            }
-        }
-    }
-
     /// Batch-major witness equality vs the row-major driver (word-transpose
     /// + identical stripe), incl. padding slots via a non-power-of-two count.
     #[test]
@@ -3885,88 +2526,6 @@ mod tests {
             assert_eq!(z, z_ref);
             assert_eq!(a, a_ref);
             assert_eq!(b, b_ref);
-        }
-    }
-
-    /// W-H2: the NEON quad builder is bit-exact with the scalar stream
-    /// builder on all three buffers (full 256-word blocks, incl. the
-    /// finish() zero-fill), and the SIMD driver matches the generic
-    /// full-write driver byte-for-byte on z/a/b AND the lincheck stripe,
-    /// incl. padding-slot substitution.
-    #[cfg(target_arch = "aarch64")]
-    #[test]
-    fn simd_quad_witness_matches_scalar_stream_builder() {
-        use super::witgen_simd;
-        const WORDS: usize = K / 64;
-        let mut rng = Rng::new(0x51D0_0F11_5EED_51AD);
-        let mk = |rng: &mut Rng| -> Compression {
-            let cv: [u32; 8] = std::array::from_fn(|_| rng.next_u32());
-            let m: [u32; 16] = std::array::from_fn(|_| rng.next_u32());
-            let counter = ((rng.next_u32() as u64) << 32) | rng.next_u32() as u64;
-            (cv, m, counter, rng.next_u32(), rng.next_u32())
-        };
-        // Per-block kernel equality, all independently selectable store modes.
-        for (z_nt, ab_nt) in [(false, false), (false, true), (true, false), (true, true)] {
-            for _ in 0..8 {
-                let inputs: [Compression; 4] = std::array::from_fn(|_| mk(&mut rng));
-                let mut zq = [u64::MAX; 4 * WORDS];
-                let mut aq = [u64::MAX; 4 * WORDS];
-                let mut bq = [u64::MAX; 4 * WORDS];
-                unsafe {
-                    witgen_simd::build_quad_witness_ab_stream_neon(
-                        [&inputs[0], &inputs[1], &inputs[2], &inputs[3]],
-                        zq.as_mut_ptr() as *mut u32,
-                        aq.as_mut_ptr() as *mut u32,
-                        bq.as_mut_ptr() as *mut u32,
-                        z_nt,
-                        ab_nt,
-                    );
-                }
-                for (j, inp) in inputs.iter().enumerate() {
-                    let (cv, m, t, bl, fl) = inp;
-                    let mut z_ref = [0u64; WORDS];
-                    let mut a_ref = [0u64; WORDS];
-                    let mut b_ref = [0u64; WORDS];
-                    build_block_witness_ab_stream_into(
-                        cv, m, *t, *bl, *fl, &mut z_ref, &mut a_ref, &mut b_ref,
-                    );
-                    for (name, got, want) in [
-                        ("z", &zq[j * WORDS..(j + 1) * WORDS], &z_ref[..]),
-                        ("a", &aq[j * WORDS..(j + 1) * WORDS], &a_ref[..]),
-                        ("b", &bq[j * WORDS..(j + 1) * WORDS], &b_ref[..]),
-                    ] {
-                        if got != want {
-                            let w = got.iter().zip(want).position(|(x, y)| x != y).unwrap();
-                            panic!(
-                                "{name} lane {j} z_nt={z_nt} ab_nt={ab_nt}: first diff u64 word {w} (u32 word {}):\
-                                 got {:#018x} want {:#018x}",
-                                2 * w,
-                                got[w],
-                                want[w],
-                            );
-                        }
-                    }
-                }
-            }
-        }
-        // Driver equality incl. padding slots and the stripe.
-        for &n_blocks in &[1usize, 4, 5, 8, 13, 16] {
-            let n_log = min_n_blocks_log(n_blocks).max(3);
-            let blocks: Vec<Compression> = (0..n_blocks).map(|_| mk(&mut rng)).collect();
-            let (zs, a_s, bs, ss) = witgen_simd::generate(&blocks, n_log);
-            let padding: Compression = ([0u32; 8], [0u32; 16], 0u64, 0u32, 0u32);
-            let per_block =
-                |block: &Compression, z_u64: &mut [u64], a_u64: &mut [u64], b_u64: &mut [u64]| {
-                    let (cv, m, t, bl, fl) = block;
-                    build_block_witness_ab_stream_into(cv, m, *t, *bl, *fl, z_u64, a_u64, b_u64);
-                };
-            let (zr, ar, br, sr) = super::super::common::drive_witness_packed_and_lincheck_full_write(
-                &blocks, &padding, n_log, K_LOG, USEFUL_BITS, per_block,
-            );
-            assert_eq!(zs, zr, "z mismatch n_blocks={n_blocks}");
-            assert_eq!(a_s, ar, "a mismatch n_blocks={n_blocks}");
-            assert_eq!(bs, br, "b mismatch n_blocks={n_blocks}");
-            assert_eq!(ss, sr, "stripe mismatch n_blocks={n_blocks}");
         }
     }
 

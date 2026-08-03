@@ -19,11 +19,3 @@ pub mod merkle_path;
 pub mod proof_io;
 pub mod prover;
 pub mod r1cs_hashes;
-#[cfg(all(target_os = "macos", not(test)))]
-pub mod recycle_alloc;
-pub mod seed_pipe;
-
-/// Reuse large warm-up allocations in the ranked worker's timed proof.
-#[cfg(all(target_os = "macos", not(test)))]
-#[global_allocator]
-static RECYCLE_ALLOC: recycle_alloc::RecycleAlloc = recycle_alloc::RecycleAlloc;

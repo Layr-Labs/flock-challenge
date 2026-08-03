@@ -19,15 +19,8 @@
 
 pub mod bits;
 pub mod challenger;
-// Public but hidden: flock-prover's witness driver drains its groups through
-// the hetero queue (W-H1). Not a stable API surface.
-#[doc(hidden)]
-pub mod epool;
+pub(crate) mod epool;
 pub mod field;
-// Public only for `note_precompute_branch_wall_ms` (the prover's join arm
-// reports its wall to the hybrid-split warmup sweep); internals stay
-// pub(crate).
-pub mod gpu_commit;
 pub mod hash;
 pub mod lincheck;
 pub mod merkle;
@@ -80,23 +73,6 @@ pub fn init_perf_thread_pool() -> Option<usize> {
         Ok(()) => Some(n),
         Err(_) => None, // pool already built
     }
-}
-
-/// Start the benchmark worker's pool keepalive nudger; see
-/// [`epool::keepalive_start`]. Intended to be called once, right before the
-/// worker signals readiness for the timed seed. Disabled by
-/// `FLOCK_NO_EPOOL_KEEPALIVE=1`.
-
-/// Flip the keepalive nudger to proving mode (helper pool only); see
-/// [`epool::keepalive_proving`]. Call as soon as the timed seed arrives.
-
-/// Apply the prover's QoS class to the calling thread.
-///
-/// Threads this crate's consumers spawn outside the Rayon pool (the ranked
-/// worker's seed-pipeline thread) still run timed serial work, so they need
-/// the same P-cluster pin [`init_perf_thread_pool`] gives the main thread.
-pub fn set_calling_thread_prover_qos() {
-    set_prover_thread_qos();
 }
 
 /// Mark Rayon prover workers as latency-sensitive on macOS. A bare Rayon pool
