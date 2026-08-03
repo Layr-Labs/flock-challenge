@@ -855,10 +855,43 @@ mod grind_worker {
         if w.tx.send(job).is_err() {
             return Some(Err("GPU grind worker channel closed".to_string()));
         }
+        // Completion-join wake tail: the scans are sub-millisecond, so the
+        // blocking recv's futex park + wake is a large fraction of every
+        // join, and this join runs once per scan (~7-11 per ranked prove) on
+        // the serial transcript spine. First-check + bounded yield before the
+        // blocking recv — the same wait-class cut the board promoted three
+        // times (grind status-spin, ranked stripe join, grind-join
+        // first-check); past the budget this degrades to the exact incumbent
+        // blocking recv. `FLOCK_NO_GRIND_RECV_SPIN=1` restores the incumbent
+        // join unconditionally.
+        if grind_recv_spin_enabled() {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_millis(2);
+            loop {
+                match done_rx.try_recv() {
+                    Ok(res) => return Some(res),
+                    Err(std::sync::mpsc::TryRecvError::Empty) => {
+                        if std::time::Instant::now() >= deadline {
+                            break;
+                        }
+                        std::thread::yield_now();
+                    }
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                        return Some(Err("GPU grind worker channel closed".to_string()));
+                    }
+                }
+            }
+        }
         match done_rx.recv() {
             Ok(res) => Some(res),
             Err(_) => Some(Err("GPU grind worker channel closed".to_string())),
         }
+    }
+
+    /// `FLOCK_NO_GRIND_RECV_SPIN=1` restores the plain blocking recv join —
+    /// the runner-side rollback lever for this wake-tail cut.
+    fn grind_recv_spin_enabled() -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var_os("FLOCK_NO_GRIND_RECV_SPIN").is_none())
     }
 }
 
