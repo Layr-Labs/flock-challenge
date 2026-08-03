@@ -8075,6 +8075,11 @@ static inline uint4 gf_reduce(U256k p) {
     return uint4(uint(l0), uint(l0 >> 32), uint(l1), uint(l1 >> 32));
 }
 
+static inline U256k mk256(ulong4 v) {
+    U256k r; r.r0 = v.x; r.r1 = v.y; r.r2 = v.z; r.r3 = v.w;
+    return r;
+}
+
 // Univariate-skip fold of one packed 8-byte row via per-bank nibble tables
 // (bank j, entries: [j*32 + n] = T_j[n], [j*32 + 16 + n] = T_j[n << 4];
 // T_j[v] = T_j[v & 15] ^ T_j[v & 0xF0] by F2-linearity of the byte banks).
@@ -8178,6 +8183,7 @@ kernel void zc_r2_products(
         partials[tgid * 4u + 3u] = gf_reduce(clmul128(e, gf_reduce(uio)));
     }
 }
+
 "#;
 
     /// Process-lifetime Metal state for the round-two products arm.
@@ -8314,36 +8320,39 @@ kernel void zc_r2_products(
                         gpu.api.error_string(err)
                     ));
                 }
-                let ns = gpu.api.nsstring("zc_r2_products")?;
-                let f: Id = send!(
-                    gpu.api,
-                    unsafe extern "C" fn(Id, Sel, Id) -> Id,
-                    library,
-                    c"newFunctionWithName:",
-                    ns
-                );
-                if f.is_null() {
-                    send!(gpu.api, unsafe extern "C" fn(Id, Sel) -> Id, library, c"release");
-                    return Err("zc_r2_products kernel not found".into());
-                }
-                let mut perr: Id = NIL;
-                let pso: Id = send!(
-                    gpu.api,
-                    unsafe extern "C" fn(Id, Sel, Id, *mut Id) -> Id,
-                    gpu.device,
-                    c"newComputePipelineStateWithFunction:error:",
-                    f,
-                    &mut perr
-                );
-                send!(gpu.api, unsafe extern "C" fn(Id, Sel) -> Id, f, c"release");
+                let make = |name: &str| -> Result<Id, String> {
+                    let ns = gpu.api.nsstring(name)?;
+                    let f: Id = send!(
+                        gpu.api,
+                        unsafe extern "C" fn(Id, Sel, Id) -> Id,
+                        library,
+                        c"newFunctionWithName:",
+                        ns
+                    );
+                    if f.is_null() {
+                        return Err(format!("{name} kernel not found"));
+                    }
+                    let mut perr: Id = NIL;
+                    let pso: Id = send!(
+                        gpu.api,
+                        unsafe extern "C" fn(Id, Sel, Id, *mut Id) -> Id,
+                        gpu.device,
+                        c"newComputePipelineStateWithFunction:error:",
+                        f,
+                        &mut perr
+                    );
+                    send!(gpu.api, unsafe extern "C" fn(Id, Sel) -> Id, f, c"release");
+                    if pso.is_null() {
+                        return Err(format!(
+                            "{name} pipeline: {}",
+                            gpu.api.error_string(perr)
+                        ));
+                    }
+                    Ok(pso)
+                };
+                let pso = make("zc_r2_products");
                 send!(gpu.api, unsafe extern "C" fn(Id, Sel) -> Id, library, c"release");
-                if pso.is_null() {
-                    return Err(format!(
-                        "zc_r2_products pipeline: {}",
-                        gpu.api.error_string(perr)
-                    ));
-                }
-                Ok(pso)
+                Ok(pso?)
             })();
             gpu.pool_pop(pool);
             let pso = built?;
@@ -8603,6 +8612,7 @@ kernel void zc_r2_products(
             })
         }
     }
+
 
     /// Drain the arm. During calibration `cpu_partials` must hold the CPU's
     /// full per-chunk partial vector and `cpu_wall_ms` the wall of the full
