@@ -601,6 +601,87 @@ fn ab_pre_nt_enabled() -> bool {
     *ON.get_or_init(|| std::env::var_os(ENV_NO_ZC_AB_PRE_NT).is_none())
 }
 
+/// Round-1 AB precompute drain selection. The hetero arm (two-pool queue
+/// over main + efficiency cores) can be a large win when the main pool is
+/// starved (≤6 P-cores: +27% local official-harness A/B on a 6-P/12-E
+/// M5 Max), but the wrong drain costs real wall time when the commit window
+/// is already balanced — an uncalibrated fine-grained queue measured −24%
+/// on the 10-P/4-E ranked runner. The choice is therefore never assumed
+/// from core counts: the FIRST precompute in a process (the worker's
+/// untimed warm prove, under the real commit-window contention) times both
+/// drains over identical inputs and latches the winner with an 8% margin
+/// ([`ab_hetero_calibrate_once`]). Undecided ⇒ incumbent main-pool drain,
+/// so the worst case on any host is byte-for-byte the frontier behavior.
+///
+/// Env overrides (diagnostics only): `FLOCK_NO_ZC_AB_HETERO=1` forces the
+/// incumbent drain; `FLOCK_ZC_AB_HETERO=1` forces the hetero drain.
+#[derive(Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+enum AbHeteroLatch {
+    Undecided = 0,
+    Off = 1,
+    On = 2,
+}
+
+static AB_HETERO_LATCH: std::sync::atomic::AtomicU8 =
+    std::sync::atomic::AtomicU8::new(AbHeteroLatch::Undecided as u8);
+
+fn ab_hetero_env_override() -> Option<bool> {
+    if std::env::var_os("FLOCK_NO_ZC_AB_HETERO").is_some() {
+        return Some(false);
+    }
+    if std::env::var_os("FLOCK_ZC_AB_HETERO").is_some() {
+        return Some(true);
+    }
+    None
+}
+
+fn ab_hetero_enabled() -> bool {
+    use std::sync::atomic::Ordering;
+    if let Some(on) = ab_hetero_env_override() {
+        return on;
+    }
+    AB_HETERO_LATCH.load(Ordering::Acquire) == AbHeteroLatch::On as u8
+}
+
+/// Latch the drain choice from a first-call calibration. `main` and `hetero`
+/// are walls of one full precompute each over identical inputs; the hetero
+/// arm wins only if it beats the incumbent by ≥8%, which bounds measurement
+/// noise and keeps the incumbent whenever the drains are near-equal.
+fn ab_hetero_calibrate_once(t_main: std::time::Duration, t_hetero: std::time::Duration) -> bool {
+    use std::sync::atomic::Ordering;
+    let on = t_hetero.mul_f64(1.08) < t_main;
+    AB_HETERO_LATCH.store(
+        if on { AbHeteroLatch::On } else { AbHeteroLatch::Off } as u8,
+        Ordering::Release,
+    );
+    if std::env::var_os("FLOCK_ZC_AB_HETERO_TRACE").is_some() {
+        eprintln!(
+            "[zc-ab-hetero] calibrate: main {:.2} ms, hetero {:.2} ms -> {}",
+            t_main.as_secs_f64() * 1e3,
+            t_hetero.as_secs_f64() * 1e3,
+            if on { "ON" } else { "OFF" },
+        );
+    }
+    on
+}
+
+/// Test/trace hook: the current latch value (`None` = undecided).
+#[doc(hidden)]
+pub fn ab_hetero_latch_state() -> Option<bool> {
+    match AB_HETERO_LATCH.load(std::sync::atomic::Ordering::Acquire) {
+        x if x == AbHeteroLatch::On as u8 => Some(true),
+        x if x == AbHeteroLatch::Off as u8 => Some(false),
+        _ => None,
+    }
+}
+
+/// Test/trace hook: reset the latch to undecided (single-threaded tests only).
+#[doc(hidden)]
+pub fn ab_hetero_test_reset() {
+    AB_HETERO_LATCH.store(AbHeteroLatch::Undecided as u8, std::sync::atomic::Ordering::Release);
+}
+
 /// Non-temporal 64-byte store (L1 stack bounce → `stnp` pair burst), the same
 /// best-effort cache-bypass idiom as the witness stripe drain. The precompute
 /// output is a 512 MiB write-once surface whose consumer runs tens of
@@ -698,78 +779,179 @@ fn precompute_round1_ab_inner_packed_padded_with_flavor(
     let out_bytes: &mut [u8] =
         unsafe { core::slice::from_raw_parts_mut(storage.as_mut_ptr() as *mut u8, total_bytes) };
 
-    out_bytes
-        .par_chunks_mut(OUTER_BYTES)
-        .enumerate()
-        .for_each_init(
-            || ([F8::ZERO; ELL], [F8::ZERO; ELL]),
-            |(a_col, b_col), (x_outer, out_outer)| {
-                let within_hash_outer = x_outer & within_outer_mask;
-                let n_b_med = b_med_counts[within_hash_outer] as usize;
-                let chunk_byte_base = x_outer * OUTER_BYTES;
+    // Outers per queue job in the hetero drain. 128 × 1 KiB = 128 KiB of
+    // output per atomic claim: the fine-grained 524,288-entry v1 queue
+    // turned into pure cross-cluster claim contention on the ranked
+    // 10-P/4-E runner (14 claimants × 524K fetch_adds on one cache line;
+    // submission fb30e90 measured −24%), while the in-tree C-side drains
+    // operate on thousand-scale jobs. 4,096 jobs × ~30–60 µs of work each
+    // keeps the queue fed while cutting atomic traffic 128×.
+    const HETERO_OUTERS_PER_JOB: usize = 128;
 
-                // NT arm: the kernel writes a stack temporary and the 64-byte
-                // block drains to the big buffer with `stnp` (write-once
-                // lines, consumer runs after the commit root). Control arm is
-                // the incumbent direct kernel write, byte-for-byte.
-                let mut tmp = [0u8; 64];
-                for b_med in 0..n_b_med {
-                    let dst: &mut [u8; 64] = if nt {
-                        &mut tmp
-                    } else {
-                        (&mut out_outer[b_med * 64..(b_med + 1) * 64])
-                            .try_into()
-                            .expect("one transformed b_med block")
-                    };
-                    shift_reduce_inner_ab(
-                        a_packed,
-                        b_packed,
-                        inv_table,
-                        chunk_byte_base,
-                        b_med,
-                        dst,
-                        a_col,
-                        b_col,
-                        !blake3_static_layout || (within_hash_outer == 0 && b_med < 2),
-                        !blake3_static_layout || (within_hash_outer == 1 && b_med + 1 == n_b_med),
-                        if blake3_static_layout && within_hash_outer == 0 && b_med == 2 {
-                            0x03
-                        } else if blake3_static_layout
-                            && within_hash_outer == 1
-                            && b_med + 2 == n_b_med
-                        {
-                            0xf0
-                        } else {
-                            0
-                        },
-                        if blake3_static_layout {
-                            within_hash_outer
-                        } else {
-                            usize::MAX
-                        },
-                        static_b_context,
-                    );
-                    if nt {
-                        // SAFETY: `b_med < n_b_med ≤ OUTER_BYTES / 64`, so the
-                        // 64 destination bytes are in-bounds of `out_outer`.
-                        unsafe {
-                            store_nt_64(tmp.as_ptr(), out_outer.as_mut_ptr().add(b_med * 64))
-                        };
-                    }
-                }
-                if nt {
-                    let tail = &mut out_outer[n_b_med * 64..];
-                    debug_assert_eq!(tail.len() % 64, 0);
-                    let zero = [0u8; 64];
-                    for i in 0..tail.len() / 64 {
-                        // SAFETY: chunk `i` is 64 in-bounds bytes of `tail`.
-                        unsafe { store_nt_64(zero.as_ptr(), tail.as_mut_ptr().add(i * 64)) };
-                    }
+    let n_outers = total_bytes / OUTER_BYTES;
+
+    // One outer's transform. Output depends only on the immutable published
+    // inputs and `x_outer`, never on the executing thread or pool, so both
+    // drains below are bit-identical by construction — the contract
+    // [`crate::epool`] documents and this module's C-side drains rely on.
+    let process_outer =
+        |(a_col, b_col): &mut ([F8; ELL], [F8; ELL]), x_outer: usize, out_outer: &mut [u8]| {
+            let within_hash_outer = x_outer & within_outer_mask;
+            let n_b_med = b_med_counts[within_hash_outer] as usize;
+            let chunk_byte_base = x_outer * OUTER_BYTES;
+
+            // NT arm: the kernel writes a stack temporary and the 64-byte
+            // block drains to the big buffer with `stnp` (write-once
+            // lines, consumer runs after the commit root). Control arm is
+            // the incumbent direct kernel write, byte-for-byte.
+            let mut tmp = [0u8; 64];
+            for b_med in 0..n_b_med {
+                let dst: &mut [u8; 64] = if nt {
+                    &mut tmp
                 } else {
-                    out_outer[n_b_med * 64..].fill(0);
+                    (&mut out_outer[b_med * 64..(b_med + 1) * 64])
+                        .try_into()
+                        .expect("one transformed b_med block")
+                };
+                shift_reduce_inner_ab(
+                    a_packed,
+                    b_packed,
+                    inv_table,
+                    chunk_byte_base,
+                    b_med,
+                    dst,
+                    a_col,
+                    b_col,
+                    !blake3_static_layout || (within_hash_outer == 0 && b_med < 2),
+                    !blake3_static_layout || (within_hash_outer == 1 && b_med + 1 == n_b_med),
+                    if blake3_static_layout && within_hash_outer == 0 && b_med == 2 {
+                        0x03
+                    } else if blake3_static_layout
+                        && within_hash_outer == 1
+                        && b_med + 2 == n_b_med
+                    {
+                        0xf0
+                    } else {
+                        0
+                    },
+                    if blake3_static_layout {
+                        within_hash_outer
+                    } else {
+                        usize::MAX
+                    },
+                    static_b_context,
+                );
+                if nt {
+                    // SAFETY: `b_med < n_b_med ≤ OUTER_BYTES / 64`, so the
+                    // 64 destination bytes are in-bounds of `out_outer`.
+                    unsafe {
+                        store_nt_64(tmp.as_ptr(), out_outer.as_mut_ptr().add(b_med * 64))
+                    };
                 }
-            },
-        );
+            }
+            if nt {
+                let tail = &mut out_outer[n_b_med * 64..];
+                debug_assert_eq!(tail.len() % 64, 0);
+                let zero = [0u8; 64];
+                for i in 0..tail.len() / 64 {
+                    // SAFETY: chunk `i` is 64 in-bounds bytes of `tail`.
+                    unsafe { store_nt_64(zero.as_ptr(), tail.as_mut_ptr().add(i * 64)) };
+                }
+            } else {
+                out_outer[n_b_med * 64..].fill(0);
+            }
+        };
+
+    // One closure serves both drains (and both calibration passes) so the
+    // output buffer has a single mutable owner for the whole call.
+    let mut run_drain = |hetero: bool| {
+        if hetero {
+            let out_base = crate::epool::SyncPtr(out_bytes.as_mut_ptr());
+            let n_jobs = n_outers.div_ceil(HETERO_OUTERS_PER_JOB);
+            crate::epool::run_hetero_chunks_stateful(
+                n_jobs,
+                || ([F8::ZERO; ELL], [F8::ZERO; ELL]),
+                |state, job| {
+                    let lo = job * HETERO_OUTERS_PER_JOB;
+                    let hi = (lo + HETERO_OUTERS_PER_JOB).min(n_outers);
+                    // SAFETY: job `job` exclusively owns the outer range
+                    // `[lo, hi)` and each outer exclusively owns its
+                    // `OUTER_BYTES` output range; inputs are immutable and
+                    // published; the queue's join publishes every write.
+                    unsafe {
+                        for x_outer in lo..hi {
+                            let out_outer = core::slice::from_raw_parts_mut(
+                                out_base.ptr().add(x_outer * OUTER_BYTES),
+                                OUTER_BYTES,
+                            );
+                            process_outer(state, x_outer, out_outer);
+                        }
+                    }
+                },
+            );
+        } else {
+            out_bytes
+                .par_chunks_mut(OUTER_BYTES)
+                .enumerate()
+                .for_each_init(
+                    || ([F8::ZERO; ELL], [F8::ZERO; ELL]),
+                    |state, (x_outer, out_outer)| process_outer(state, x_outer, out_outer),
+                );
+        }
+    };
+
+    match ab_hetero_env_override() {
+        Some(true) => run_drain(true),
+        Some(false) => run_drain(false),
+        None => {
+            use std::sync::atomic::Ordering;
+            // Without a helper pool (or a deliberately single-threaded
+            // pool) the hetero drain degenerates to the main-pool queue —
+            // latch the incumbent and skip calibration entirely.
+            if crate::epool::epool().is_none() || rayon::current_num_threads() <= 1 {
+                AB_HETERO_LATCH.store(AbHeteroLatch::Off as u8, Ordering::Release);
+                run_drain(false);
+            } else {
+                let latch = AB_HETERO_LATCH.load(Ordering::Acquire);
+                if latch == AbHeteroLatch::On as u8 {
+                    run_drain(true);
+                } else if latch == AbHeteroLatch::Off as u8 {
+                    run_drain(false);
+                } else if AB_HETERO_LATCH
+                    .compare_exchange(
+                        AbHeteroLatch::Undecided as u8,
+                        AbHeteroLatch::Off as u8,
+                        Ordering::AcqRel,
+                        Ordering::Acquire,
+                    )
+                    .is_ok()
+                {
+                    // Claimed the calibration: this is the first drain in
+                    // the process — the worker's untimed warm prove, under
+                    // the real commit-window contention. Time both drains
+                    // over this exact buffer and latch the winner (≥8%
+                    // margin). Concurrent callers see `Off` and take the
+                    // incumbent drain (the calibrated choice is installed
+                    // below before any timed prove can start, since the
+                    // ranked worker proves exactly once before its first
+                    // timed call). The second drain overwrites the first's
+                    // output with bit-identical bytes, so the returned
+                    // storage is correct either way.
+                    let t0 = std::time::Instant::now();
+                    run_drain(false);
+                    let t_main = t0.elapsed();
+                    let t0 = std::time::Instant::now();
+                    run_drain(true);
+                    let t_hetero = t0.elapsed();
+                    ab_hetero_calibrate_once(t_main, t_hetero);
+                } else {
+                    // Someone else is calibrating or finished: incumbent
+                    // drain until the latch is published.
+                    run_drain(false);
+                }
+            }
+        }
+    }
 
     Round1AbInner { storage }
 }
