@@ -2182,18 +2182,22 @@ kernel void ntt_fused_reg4_from_z(device uint4* data                [[buffer(0)]
 
 // ===========================================================================
 // From-z, tuned: the same pass with the two structural facts the plain
-// kernel leaves on the table.
+// kernel leaves on the table, now on the promoted byte16 multiply path.
 //
 // 1. l = 0 means EVERY tile lives in block B = 0 and uses the identical
 //    twiddle set, so the promoted g4 idiom applies unconditionally: one
-//    64-thread group builds the tables once and completes 4 consecutive-r
-//    tiles sequentially (same shape as ntt_fused_reg4g4 — 64-thread groups,
-//    unchanged register footprint).
+//    64-thread group completes 4 consecutive-r tiles sequentially (same
+//    shape as ntt_fused_reg4g4 — 64-thread groups, unchanged register
+//    footprint).
 // 2. Sub-layer 0 pairs (e, e+8) across the zero-padded coefficient half:
 //    v = 0 makes the butterfly nu = u, new_v = u — a pure copy. Skip its 8
-//    multiplies per tile and start the butterfly network at sub-layer 1
-//    (the tables for twiddle t = 0 are still built; the build loop's shape
-//    is not worth specializing).
+//    multiplies per tile and start the butterfly network at sub-layer 1.
+// 3. Multiplies use gf_mul_byte16 (16 threadgroup lookups) rebuilt per
+//    twiddle via NTT_G4_B16_SUBLAYER, matching the production f=4 body
+//    passes. The previous nibble-tab4 form paid 32 lookups per mul with a
+//    one-shot 15 KiB all-twiddle table; byte16 halves the lookups and keeps
+//    only the live 8 KiB table resident — the same trade that promoted the
+//    body `ntt_fused_reg4g4` path.
 // ===========================================================================
 kernel void ntt_fused_reg4_from_zg4(device uint4* data                [[buffer(0)]],
                                     device const uint4* twiddles      [[buffer(1)]],
@@ -2202,39 +2206,19 @@ kernel void ntt_fused_reg4_from_zg4(device uint4* data                [[buffer(0
                                     uint tgid [[threadgroup_position_in_grid]],
                                     uint lid  [[thread_index_in_threadgroup]])
 {
-    constexpr uint F   = 4u;
-    constexpr uint NF  = 1u << F;
-    constexpr uint NTW = NF - 1u;
+    constexpr uint F     = 4u;
+    constexpr uint NF    = 1u << F;
     constexpr uint LOG_G = 2u;
-    threadgroup uint4 bases[NTW * 4u];
-    threadgroup uint4 tabs[NTW * 64u];
+    // B is fixed at 0 for the from-z first pass (l = 0, single block). The
+    // NTT_G4_B16_SUBLAYER macro indexes twiddles via
+    // (1u << (P.l + j)) - 1u + (B << j) + c; with l = 0 and B = 0 that is
+    // exactly the plain from-z layout (1u << j) - 1u + c.
+    const uint B = 0u;
+    threadgroup uint4 tabB[512u];      // 8,192 B: the live twiddle's tables
+    threadgroup uint4 pad[124u];       // 1,984 B: residency only, never read
 
-    const uint lane = lid & 63u;
+    const uint lane = lid;
     const uint r_base = tgid << LOG_G;
-
-    if (lid < NTW * 4u) {
-        uint t = lid >> 2;
-        uint k = lid & 3u;
-        uint j = 31u - clz(t + 1u);
-        uint c = t + 1u - (1u << j);
-        uint4 p = twiddles[(1u << j) - 1u + c];
-        for (uint m = 0; m < k * 4u; m++) { p = gf_mulx(p); }
-        bases[lid] = p;
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    for (uint ei = lid; ei < NTW * 64u; ei += 64u) {
-        uint t   = ei >> 6;
-        uint sub = ei & 63u;
-        uint n   = sub & 15u;
-        uint4 p  = bases[(t << 2) | (sub >> 4)];
-        uint4 val = uint4(0u);
-        for (uint k = 0; k < 4u; k++) {
-            if ((n >> k) & 1u) { val ^= p; }
-            p = gf_mulx(p);
-        }
-        tabs[ei] = val;
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
 
     for (uint rr = 0; rr < (1u << LOG_G); rr++) {
         const uint r = r_base + rr;
@@ -2247,17 +2231,14 @@ kernel void ntt_fused_reg4_from_zg4(device uint4* data                [[buffer(0
             elems[e + NF / 2u] = elems[e];
         }
 
-        for (uint j = 1; j < F; j++) {
-            uint bpos = F - 1u - j;
-            for (uint b = 0; b < (NF >> 1); b++) {
-                uint low = b & ((1u << bpos) - 1u);
-                uint eu  = ((b >> bpos) << (bpos + 1u)) | low;
-                uint ev  = eu | (1u << bpos);
-                uint tsel = ((1u << j) - 1u) + (eu >> (F - j));
-                uint4 nu = elems[eu] ^ gf_mul_tab4(elems[ev], &tabs[tsel << 6]);
-                elems[eu] = nu;
-                elems[ev] ^= nu;
-            }
+        // Sub-layers 1..3 on the byte16 path (j = 0 already handled above).
+        NTT_G4_B16_SUBLAYER(1u)
+        NTT_G4_B16_SUBLAYER(2u)
+        NTT_G4_B16_SUBLAYER(3u)
+        if (P.log_d == 77u) {          /* unreachable; keeps `pad` allocated */
+            pad[lid % 124u] = elems[0];
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            elems[0] ^= pad[(lid + 1u) % 124u];
         }
 
         for (uint e = 0; e < NF; e++) {
@@ -3011,7 +2992,7 @@ kernel void blake3_pow_scan(
     const METALLIB: &[u8] = include_bytes!("gpu_shaders.metallib");
 
     /// FNV-1a (64-bit) of `MSL_SOURCE` when `gpu_shaders.metallib` was built.
-    const METALLIB_MSL_FNV1A: u64 = 0x7b23471589b0cbb6;
+    const METALLIB_MSL_FNV1A: u64 = 0xd0ebf84e1239f5e3;
 
     const fn fnv1a64(s: &str) -> u64 {
         let bytes = s.as_bytes();
