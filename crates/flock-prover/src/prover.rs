@@ -561,25 +561,19 @@ fn fill_deferred_lincheck_stripe_group(
         let lanes: [u64; 8] = std::array::from_fn(|lane| z_u64[lane * u64_per_block + word]);
         flock_core::bits::transpose_8_u64s_to_64_bytes(&lanes, &mut transposed);
         let dst = &mut stripe[word * 64..word * 64 + 64];
-        #[cfg(target_arch = "aarch64")]
-        unsafe {
-            // The stripe is not read until after commit+zerocheck, so use the
-            // same cache-bypassing store flavor as the eager SIMD witness
-            // path. `ldp/stnp` permit these 64-byte slices and the stack
-            // temporary without an extra alignment contract.
-            core::arch::asm!(
-                "ldp {t0:q}, {t1:q}, [{src}]",
-                "stnp {t0:q}, {t1:q}, [{dst}]",
-                "ldp {t0:q}, {t1:q}, [{src}, #32]",
-                "stnp {t0:q}, {t1:q}, [{dst}, #32]",
-                src = in(reg) transposed.as_ptr(),
-                dst = in(reg) dst.as_mut_ptr(),
-                t0 = out(vreg) _,
-                t1 = out(vreg) _,
-                options(nostack)
-            );
-        }
-        #[cfg(not(target_arch = "aarch64"))]
+        // Temporal stores on the ranked deferred stripe.
+        //
+        // Board tip previously used `stnp` here under the assumption the stripe
+        // was first read only after zerocheck (lincheck fold). The ranked path
+        // now runs identity-C reuse immediately at the commit/fill join
+        // (`prove_packed_padded_capture_s_hat_v_c_with_precomputed_ab_and_lincheck_c`),
+        // so the first consumer is C-reuse, not the post-ZC fold. Non-temporal
+        // drains force that consumer (and the later fold) onto cold misses.
+        //
+        // r384/32d4360 put `nt_store_64_bytes` on the eager witgen path in
+        // `r1cs_hashes/common.rs`; ranked DeferredRanked omits that path, so
+        // that submission never touched this timed store. This edit flips the
+        // store flavor that actually runs on the scored shape.
         dst.copy_from_slice(&transposed);
     }
     // The ranked padded fold never observes the tail. Keeping the honest
