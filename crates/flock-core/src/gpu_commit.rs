@@ -8516,7 +8516,8 @@ LC_KERNEL(lc_fold_stripes, 4)
     /// correction in [`ZcFoldJob::finish_xor_into`]).
     fn zc_fold_measure_fix_enabled() -> bool {
         static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
-            std::env::var_os("FLOCK_NO_ZC_FOLD_MEASURE_FIX").is_none()
+            // Reclaim coin-flip variant: zc-fold-fix default OFF.
+            std::env::var_os("FLOCK_ZC_FOLD_MEASURE_FIX_ON").is_some()
         });
         *ON
     }
