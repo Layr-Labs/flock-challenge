@@ -153,6 +153,12 @@ mod eq_direct_gate_tests {
 /// target machine itself.
 pub const ENV_NO_GPU_ZC_R2: &str = "FLOCK_NO_GPU_ZC_R2";
 
+/// Exact override for the calibrated round-two GPU prefix. The ranked default
+/// is three sixteenths; setting `1920` restores the historical 15/16 share for
+/// same-binary rollback on the m32 shape. The override changes scheduling
+/// only, never the proof bytes.
+pub const ENV_ZC_R2_GPU_MAX_CHUNKS: &str = "FLOCK_ZC_R2_GPU_MAX_CHUNKS";
+
 pub(crate) fn gpu_zc_r2_enabled() -> bool {
     static ON: std::sync::LazyLock<bool> =
         std::sync::LazyLock::new(|| std::env::var_os(ENV_NO_GPU_ZC_R2).is_none());
@@ -9581,14 +9587,14 @@ kernel void zc_r2_products(
         *V
     }
 
-    /// Anchors-only CPU work is measured locally at ~0.55x of the fused
-    /// chunk (two of four folds, no products); the share solves
-    /// `(hi - (1-ALPHA) g) c_f = g u_g` — balanced, no CPU-ward bias — and
-    /// caps at `15·hi/16` as the overshoot guard (an optimistic warmup ratio
-    /// must not make the GPU the timed straggler; at this cap the GPU only
-    /// straggles once the true timed ratio exceeds `(1-0.45·15/16)/(15/16)` ≈
-    /// 0.617, still above the ~0.57 measured on the ranked M3 Max).
-    /// History of this clamp: `hi/2` always bound (promoted fix → 3·hi/4,
+    /// The original share model treated a GPU-covered chunk as removing 55%
+    /// of its CPU work. That stopped being true after round-three lookahead:
+    /// covered chunks still perform the folds, anchor/delta stores, and the
+    /// four lookahead aggregates on CPU. Runner-matched traces now show the
+    /// CPU sweep nearly flat as the GPU prefix changes, while GPU wall remains
+    /// linear in the prefix. A 15/16 share therefore makes the GPU the timed
+    /// straggler (roughly 107 ms GPU versus 26--35 ms CPU locally).
+    /// History of the old clamp: `hi/2` always bound (promoted fix → 3·hi/4,
     /// +5.19%), and at every observed ratio (0.33–0.83 across hosts) the
     /// 3·hi/4 cap was *still* what bound the share — the balance point
     /// `hi/(ratio+0.45)` sits at 0.98·hi at ratio 0.57 — so the cap moved
@@ -9604,9 +9610,10 @@ kernel void zc_r2_products(
     /// calibration, is the binding constraint on both hosts. Moving to
     /// `15·hi/16` takes the balanced solution's remaining reachable ground
     /// while keeping the straggle threshold (0.617) above the ranked ratio.
-    /// Deliberately *not* uncapped: at `hi` the threshold falls to
-    /// `1-0.45 = 0.55`, which is **below** the 0.57 measured on the ranked
-    /// M3 Max, so full offload would make the GPU the straggler.
+    /// Those measurements predate the current lookahead division of labour.
+    /// On the current tree, 3/16 balances normal-path walls (about 24--25 ms
+    /// GPU versus 28--32 ms CPU), while 1/2 still leaves the GPU at 58--64 ms.
+    /// `FLOCK_ZC_R2_GPU_MAX_CHUNKS=1920` is the exact old-policy rollback.
     ///
     /// Ratios in `(2, 8)`: the probe's equality oracle has already proven
     /// the kernel exact on this machine, so a slow-looking GPU gets a floor
@@ -9621,6 +9628,19 @@ kernel void zc_r2_products(
     const ZC_R2_FLOOR_MAX_RATIO: f64 = 8.0;
 
     pub(crate) fn zc_r2_gate_share(ratio: f64, hi_size: usize) -> usize {
+        let max_chunks = std::env::var(ENV_ZC_R2_GPU_MAX_CHUNKS)
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .filter(|&chunks| chunks > 0)
+            .map_or(hi_size * 3 / 16, |chunks| chunks.min(hi_size));
+        zc_r2_gate_share_with_cap(ratio, hi_size, max_chunks)
+    }
+
+    pub(crate) fn zc_r2_gate_share_with_cap(
+        ratio: f64,
+        hi_size: usize,
+        max_chunks: usize,
+    ) -> usize {
         if !ratio.is_finite() || ratio <= 0.0 {
             return 0;
         }
@@ -9631,7 +9651,7 @@ kernel void zc_r2_products(
             return 0;
         }
         let g = (hi_size as f64 / (ratio + (1.0 - ZC_R2_ALPHA))).round();
-        (g as usize).min(hi_size * 15 / 16)
+        (g as usize).min(max_chunks)
     }
 
     fn zc_r2_init(gpu: &'static Gpu) -> Result<ZcR2, String> {
@@ -13291,17 +13311,19 @@ DEF_PROBE(probe_g4_t8_p0,    8u,  0u,   tsel & 7u)
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     #[test]
     fn zc_r2_gate_share_policy() {
-        use imp::zc_r2_gate_share;
-        // Balance point hi/(ratio+0.45); ranked-observed ratios land above
-        // the 15·hi/16 cap, which is the binding overshoot guard.
-        assert_eq!(zc_r2_gate_share(0.57, 2048), 1920);
-        assert_eq!(zc_r2_gate_share(0.38, 2048), 1920);
-        // The guard still binds before the GPU can straggle: at 15/16 the
-        // crossover is (1-0.45·15/16)/(15/16) ≈ 0.617, above the ranked 0.57.
-        assert!(zc_r2_gate_share(0.62, 2048) < 2048);
-        // Slow-but-usable GPU: the formula takes over below the cap.
-        assert_eq!(zc_r2_gate_share(1.0, 2048), 1412); // 2048/1.45
-        assert_eq!(zc_r2_gate_share(2.0, 2048), 836); // 2048/2.45
+        use imp::{zc_r2_gate_share, zc_r2_gate_share_with_cap};
+        // Current lookahead-aware default: 3/16 is the binding guard across
+        // every admitted ranked ratio.
+        assert_eq!(zc_r2_gate_share(0.57, 2048), 384);
+        assert_eq!(zc_r2_gate_share(0.38, 2048), 384);
+        assert_eq!(zc_r2_gate_share(1.0, 2048), 384);
+        assert_eq!(zc_r2_gate_share(2.0, 2048), 384);
+        // The parameterized oracle preserves the old/model-derived values for
+        // rollback experiments with a wider cap.
+        assert_eq!(zc_r2_gate_share_with_cap(1.0, 2048, 1920), 1412);
+        assert_eq!(zc_r2_gate_share_with_cap(2.0, 2048, 1920), 836);
+        assert_eq!(zc_r2_gate_share_with_cap(0.38, 2048, 512), 512);
+        assert_eq!(zc_r2_gate_share_with_cap(1.0, 2048, 1024), 1024);
         // Admission floor for ratios in (2, 8): the equality oracle already
         // proved the kernel, so pricing failures get hi/8, not 0.
         assert_eq!(zc_r2_gate_share(2.01, 2048), 256);
