@@ -117,7 +117,7 @@
 //!   per byte.
 
 use crate::challenger::Challenger;
-use crate::field::F128;
+use crate::field::{F128, F256Unreduced};
 use crate::r1cs::SparseBinaryMatrix;
 use crate::zerocheck::multilinear::lagrange_weights_naive;
 use serde::{Deserialize, Serialize};
@@ -1125,6 +1125,16 @@ fn sparse_row_fold_alpha_batched(
     out
 }
 
+/// Kill switch for deferred-reduction product sums in the lincheck product
+/// sumcheck: `FLOCK_NO_LINCHECK_DEFERRED_REDUCE=1` restores fully-reduced
+/// multiplies on every term. Reduction mod p is F2-linear, so unreduced XOR
+/// accumulation then a single reduce is bit-identical to reducing per product.
+#[inline]
+fn lincheck_deferred_reduce_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("FLOCK_NO_LINCHECK_DEFERRED_REDUCE").is_none())
+}
+
 /// One round of product-sumcheck on `(c, z)`: compute `(q(1), q(∞))` =
 /// `(Σ c_hi·z_hi, Σ (c_hi+c_lo)·(z_hi+z_lo))` over the top-bit split. The
 /// `len()` of `c` and `z` is even; `half = len/2`.
@@ -1134,7 +1144,17 @@ fn sumcheck_round_eval_par(c: &[F128], z: &[F128]) -> (F128, F128) {
     debug_assert_eq!(z.len(), c.len());
     let (clo, chi) = c.split_at(half);
     let (zlo, zhi) = z.split_at(half);
+    let deferred = lincheck_deferred_reduce_enabled();
     if half < SUMCHECK_PAR_THRESHOLD {
+        if deferred {
+            let mut e1 = F256Unreduced::ZERO;
+            let mut einf = F256Unreduced::ZERO;
+            for i in 0..half {
+                e1 ^= chi[i].mul_unreduced(zhi[i]);
+                einf ^= (chi[i] + clo[i]).mul_unreduced(zhi[i] + zlo[i]);
+            }
+            return (e1.reduce(), einf.reduce());
+        }
         let mut e1 = F128::ZERO;
         let mut einf = F128::ZERO;
         for i in 0..half {
@@ -1142,6 +1162,25 @@ fn sumcheck_round_eval_par(c: &[F128], z: &[F128]) -> (F128, F128) {
             einf += (chi[i] + clo[i]) * (zhi[i] + zlo[i]);
         }
         return (e1, einf);
+    }
+    if deferred {
+        // Chunk-local unreduced accumulators, then one reduce per chunk and
+        // an F128 reduce-tree. Same bits as full reduced; fewer reductions.
+        const CHUNK: usize = 256;
+        return (0..half.div_ceil(CHUNK))
+            .into_par_iter()
+            .map(|cidx| {
+                let lo = cidx * CHUNK;
+                let hi = (lo + CHUNK).min(half);
+                let mut e1 = F256Unreduced::ZERO;
+                let mut einf = F256Unreduced::ZERO;
+                for i in lo..hi {
+                    e1 ^= chi[i].mul_unreduced(zhi[i]);
+                    einf ^= (chi[i] + clo[i]).mul_unreduced(zhi[i] + zlo[i]);
+                }
+                (e1.reduce(), einf.reduce())
+            })
+            .reduce(|| (F128::ZERO, F128::ZERO), |a, b| (a.0 + b.0, a.1 + b.1));
     }
     (0..half)
         .into_par_iter()
@@ -1219,23 +1258,45 @@ fn sumcheck_bind_both_and_eval_next(
     let (zq0, zq1) = z_lo.split_at_mut(half2);
     let (zq2, zq3) = z_hi.split_at(half2);
 
+    let deferred = lincheck_deferred_reduce_enabled();
     let (e1, einf) = if half2 < SUMCHECK_PAR_THRESHOLD {
-        let mut e1 = F128::ZERO;
-        let mut einf = F128::ZERO;
-        for i in 0..half2 {
-            let lo = cq0[i] + r * (cq2[i] + cq0[i]);
-            let hi = cq1[i] + r * (cq3[i] + cq1[i]);
-            let zlo = zq0[i] + r * (zq2[i] + zq0[i]);
-            let zhi = zq1[i] + r * (zq3[i] + zq1[i]);
-            cq0[i] = lo;
-            cq1[i] = hi;
-            zq0[i] = zlo;
-            zq1[i] = zhi;
-            e1 += hi * zhi;
-            einf += (hi + lo) * (zhi + zlo);
+        if deferred {
+            let mut e1 = F256Unreduced::ZERO;
+            let mut einf = F256Unreduced::ZERO;
+            for i in 0..half2 {
+                let lo = cq0[i] + r * (cq2[i] + cq0[i]);
+                let hi = cq1[i] + r * (cq3[i] + cq1[i]);
+                let zlo = zq0[i] + r * (zq2[i] + zq0[i]);
+                let zhi = zq1[i] + r * (zq3[i] + zq1[i]);
+                cq0[i] = lo;
+                cq1[i] = hi;
+                zq0[i] = zlo;
+                zq1[i] = zhi;
+                e1 ^= hi.mul_unreduced(zhi);
+                einf ^= (hi + lo).mul_unreduced(zhi + zlo);
+            }
+            (e1.reduce(), einf.reduce())
+        } else {
+            let mut e1 = F128::ZERO;
+            let mut einf = F128::ZERO;
+            for i in 0..half2 {
+                let lo = cq0[i] + r * (cq2[i] + cq0[i]);
+                let hi = cq1[i] + r * (cq3[i] + cq1[i]);
+                let zlo = zq0[i] + r * (zq2[i] + zq0[i]);
+                let zhi = zq1[i] + r * (zq3[i] + zq1[i]);
+                cq0[i] = lo;
+                cq1[i] = hi;
+                zq0[i] = zlo;
+                zq1[i] = zhi;
+                e1 += hi * zhi;
+                einf += (hi + lo) * (zhi + zlo);
+            }
+            (e1, einf)
         }
-        (e1, einf)
     } else {
+        // Parallel bind+product: per-slot writes prevent chunk-local unreduced
+        // accumulation; deferred-reduce wins on the serial arm and on pure
+        // eval rounds above. Keep fully-reduced products here.
         cq0.par_iter_mut()
             .zip(cq1.par_iter_mut())
             .zip(cq2.par_iter())
