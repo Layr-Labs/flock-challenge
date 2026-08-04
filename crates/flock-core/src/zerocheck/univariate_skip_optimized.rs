@@ -632,6 +632,27 @@ unsafe fn store_nt_64(src: *const u8, dst: *mut u8) {
     unsafe { core::ptr::copy_nonoverlapping(src, dst, 64) };
 }
 
+#[inline]
+fn ab_precompute_epool_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        crate::epool::helper_pool_available()
+            && std::env::var_os("FLOCK_NO_ZC_AB_PRECOMPUTE_EPOOL").is_none()
+    })
+}
+
+#[inline]
+fn ab_precompute_epool_grain() -> usize {
+    static GRAIN: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *GRAIN.get_or_init(|| {
+        std::env::var("FLOCK_ZC_AB_PRECOMPUTE_EPOOL_GRAIN")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .filter(|&grain: &usize| grain.is_power_of_two() && grain <= 1024)
+            .unwrap_or(64)
+    })
+}
+
 /// Precompute the challenge-independent inverse-NTT/product/shift-reduce AB
 /// transform. The result can be produced before the commitment root is
 /// available and consumed later by
@@ -698,78 +719,108 @@ fn precompute_round1_ab_inner_packed_padded_with_flavor(
     let out_bytes: &mut [u8] =
         unsafe { core::slice::from_raw_parts_mut(storage.as_mut_ptr() as *mut u8, total_bytes) };
 
-    out_bytes
-        .par_chunks_mut(OUTER_BYTES)
-        .enumerate()
-        .for_each_init(
-            || ([F8::ZERO; ELL], [F8::ZERO; ELL]),
-            |(a_col, b_col), (x_outer, out_outer)| {
-                let within_hash_outer = x_outer & within_outer_mask;
-                let n_b_med = b_med_counts[within_hash_outer] as usize;
-                let chunk_byte_base = x_outer * OUTER_BYTES;
+    let process_outer = |
+        (a_col, b_col): &mut ([F8; ELL], [F8; ELL]),
+        x_outer: usize,
+        out_outer: &mut [u8],
+    | {
+        let within_hash_outer = x_outer & within_outer_mask;
+        let n_b_med = b_med_counts[within_hash_outer] as usize;
+        let chunk_byte_base = x_outer * OUTER_BYTES;
 
-                // NT arm: the kernel writes a stack temporary and the 64-byte
-                // block drains to the big buffer with `stnp` (write-once
-                // lines, consumer runs after the commit root). Control arm is
-                // the incumbent direct kernel write, byte-for-byte.
-                let mut tmp = [0u8; 64];
-                for b_med in 0..n_b_med {
-                    let dst: &mut [u8; 64] = if nt {
-                        &mut tmp
-                    } else {
-                        (&mut out_outer[b_med * 64..(b_med + 1) * 64])
-                            .try_into()
-                            .expect("one transformed b_med block")
-                    };
-                    shift_reduce_inner_ab(
-                        a_packed,
-                        b_packed,
-                        inv_table,
-                        chunk_byte_base,
-                        b_med,
-                        dst,
-                        a_col,
-                        b_col,
-                        !blake3_static_layout || (within_hash_outer == 0 && b_med < 2),
-                        !blake3_static_layout || (within_hash_outer == 1 && b_med + 1 == n_b_med),
-                        if blake3_static_layout && within_hash_outer == 0 && b_med == 2 {
-                            0x03
-                        } else if blake3_static_layout
-                            && within_hash_outer == 1
-                            && b_med + 2 == n_b_med
-                        {
-                            0xf0
-                        } else {
-                            0
-                        },
-                        if blake3_static_layout {
-                            within_hash_outer
-                        } else {
-                            usize::MAX
-                        },
-                        static_b_context,
-                    );
-                    if nt {
-                        // SAFETY: `b_med < n_b_med ≤ OUTER_BYTES / 64`, so the
-                        // 64 destination bytes are in-bounds of `out_outer`.
-                        unsafe {
-                            store_nt_64(tmp.as_ptr(), out_outer.as_mut_ptr().add(b_med * 64))
-                        };
-                    }
-                }
-                if nt {
-                    let tail = &mut out_outer[n_b_med * 64..];
-                    debug_assert_eq!(tail.len() % 64, 0);
-                    let zero = [0u8; 64];
-                    for i in 0..tail.len() / 64 {
-                        // SAFETY: chunk `i` is 64 in-bounds bytes of `tail`.
-                        unsafe { store_nt_64(zero.as_ptr(), tail.as_mut_ptr().add(i * 64)) };
-                    }
+        // NT arm: the kernel writes a stack temporary and the 64-byte
+        // block drains to the big buffer with `stnp` (write-once
+        // lines, consumer runs after the commit root). Control arm is
+        // the incumbent direct kernel write, byte-for-byte.
+        let mut tmp = [0u8; 64];
+        for b_med in 0..n_b_med {
+            let dst: &mut [u8; 64] = if nt {
+                &mut tmp
+            } else {
+                (&mut out_outer[b_med * 64..(b_med + 1) * 64])
+                    .try_into()
+                    .expect("one transformed b_med block")
+            };
+            shift_reduce_inner_ab(
+                a_packed,
+                b_packed,
+                inv_table,
+                chunk_byte_base,
+                b_med,
+                dst,
+                a_col,
+                b_col,
+                !blake3_static_layout || (within_hash_outer == 0 && b_med < 2),
+                !blake3_static_layout || (within_hash_outer == 1 && b_med + 1 == n_b_med),
+                if blake3_static_layout && within_hash_outer == 0 && b_med == 2 {
+                    0x03
+                } else if blake3_static_layout
+                    && within_hash_outer == 1
+                    && b_med + 2 == n_b_med
+                {
+                    0xf0
                 } else {
-                    out_outer[n_b_med * 64..].fill(0);
+                    0
+                },
+                if blake3_static_layout {
+                    within_hash_outer
+                } else {
+                    usize::MAX
+                },
+                static_b_context,
+            );
+            if nt {
+                // SAFETY: `b_med < n_b_med ≤ OUTER_BYTES / 64`, so the
+                // 64 destination bytes are in-bounds of `out_outer`.
+                unsafe { store_nt_64(tmp.as_ptr(), out_outer.as_mut_ptr().add(b_med * 64)) };
+            }
+        }
+        if nt {
+            let tail = &mut out_outer[n_b_med * 64..];
+            debug_assert_eq!(tail.len() % 64, 0);
+            let zero = [0u8; 64];
+            for i in 0..tail.len() / 64 {
+                // SAFETY: chunk `i` is 64 in-bounds bytes of `tail`.
+                unsafe { store_nt_64(zero.as_ptr(), tail.as_mut_ptr().add(i * 64)) };
+            }
+        } else {
+            out_outer[n_b_med * 64..].fill(0);
+        }
+    };
+
+    if ab_precompute_epool_enabled() {
+        let n_outer = out_bytes.len() / OUTER_BYTES;
+        let grain = ab_precompute_epool_grain();
+        let n_jobs = n_outer.div_ceil(grain);
+        let out_base = crate::epool::SyncPtr(out_bytes.as_mut_ptr());
+        crate::epool::run_hetero_chunks_stateful(
+            n_jobs,
+            || ([F8::ZERO; ELL], [F8::ZERO; ELL]),
+            |state, job| {
+                let start = job * grain;
+                let end = (start + grain).min(n_outer);
+                for x_outer in start..end {
+                    // SAFETY: each queue job is claimed once and owns whole,
+                    // disjoint `OUTER_BYTES` chunks until the synchronous join.
+                    let out_outer = unsafe {
+                        core::slice::from_raw_parts_mut(
+                            out_base.ptr().add(x_outer * OUTER_BYTES),
+                            OUTER_BYTES,
+                        )
+                    };
+                    process_outer(state, x_outer, out_outer);
                 }
             },
         );
+    } else {
+        out_bytes
+            .par_chunks_mut(OUTER_BYTES)
+            .enumerate()
+            .for_each_init(
+                || ([F8::ZERO; ELL], [F8::ZERO; ELL]),
+                |state, (x_outer, out_outer)| process_outer(state, x_outer, out_outer),
+            );
+    }
 
     Round1AbInner { storage }
 }
