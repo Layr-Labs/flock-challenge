@@ -939,16 +939,13 @@ fn prove_fast_core_with_commit_codeword<Ch: Challenger>(
             assert_eq!(r1cs.useful_bits, 15_409);
             let (m, k_log, useful_bits) = (r1cs.m, r1cs.k_log, r1cs.useful_bits);
             let mut stripe = flock_core::scratch::take_u8(1usize << (m - 3));
-            // E3, not E2, is the ranked contention optimum. The E2 default came
-            // from a local 5-P-core reading; on the ranked 10-P-core M3 Max the
-            // stripe fill has more E-side slack than that reading implied.
-            // Credit: welttowelt's public candidate `4e30884` (submission
-            // `6cd24839`) measured E3 at 1,467,688.35 cps on the ranked runner,
-            // +0.95% over the `c8aba2a` bar, and gnuchev's `6ad9781` reproduced
-            // the direction; both scored positive and then lost the run to the
-            // 10-minute job cap rather than to the mechanism. E4 still steals
-            // bandwidth from commit and E1 lets the stripe spill into zerocheck,
-            // so the 1..=4 override stays for controlled same-binary diagnostics.
+            // Drain the stripe queue through both pools. The AB branch leaves
+            // enough P-core slack under the GPU commitment wall for the main
+            // pool to help without extending the join, while the E-pool keeps
+            // making progress whenever AB occupies the P cores. The kill
+            // switch restores the E3-only incumbent for exact A/B replay.
+            let hetero_stripe =
+                std::env::var_os("FLOCK_NO_DEFER_STRIPE_HETERO").is_none();
             let epool_workers = std::env::var_os("FLOCK_DEFER_STRIPE_EPOOL_THREADS")
                 .and_then(|value| value.to_str()?.parse::<usize>().ok())
                 .filter(|workers| (1..=4).contains(workers))
@@ -963,7 +960,16 @@ fn prove_fast_core_with_commit_codeword<Ch: Challenger>(
                         k_log,
                         useful_bits,
                         |n_jobs, job| {
-                            flock_core::epool::run_helper_only_chunks(n_jobs, epool_workers, job)
+                            if hetero_stripe {
+                                flock_core::epool::run_hetero_chunks(n_jobs, |i| job(i));
+                                true
+                            } else {
+                                flock_core::epool::run_helper_only_chunks(
+                                    n_jobs,
+                                    epool_workers,
+                                    job,
+                                )
+                            }
                         },
                     );
                     if !filled_on_epool {
@@ -980,11 +986,15 @@ fn prove_fast_core_with_commit_codeword<Ch: Challenger>(
                             "[phase-timing] deferred lincheck stripe: {:.2} ms mode={} workers={}",
                             started.elapsed().as_secs_f64() * 1e3,
                             if filled_on_epool {
-                                "epool"
+                                if hetero_stripe { "hetero" } else { "epool" }
                             } else {
                                 "sequential"
                             },
-                            if filled_on_epool { epool_workers } else { 0 },
+                            if filled_on_epool && !hetero_stripe {
+                                epool_workers
+                            } else {
+                                0
+                            },
                         );
                     }
                 });
