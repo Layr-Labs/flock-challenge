@@ -771,13 +771,15 @@ fn gpu_grind_calibration(state_digest: &[u8; 32]) -> Result<Vec<Option<u64>>, St
 /// and that spawn latency delays the GPU launch on the spine. A reused thread
 /// (one per process, woken by an mpsc channel) removes the spawn cost and
 /// starts the dispatch slightly earlier (a channel send is cheaper than a
-/// spawn). Semantics are identical to the spawned path: one `pow_scan` per
-/// job, the abort flag set on hit when enabled, the result delivered on the
-/// job's own channel. `FLOCK_NO_GRIND_WORKER=1` (or any worker setup failure)
-/// falls back to the exact incumbent scope-spawn path; a worker failure
-/// mid-job degrades to the same `Err` the spawned path would propagate (CPU
-/// grind fallback upstream). No GPU work is added or removed — only the
-/// thread-creation latency is.
+/// spawn). Dispatch returns a pending result immediately so the caller can
+/// scan the following CPU block while the worker drives Metal. Semantics are
+/// identical to the spawned path: one `pow_scan` per job, the abort flag set
+/// on hit when enabled, the result delivered on the job's own channel.
+/// `FLOCK_NO_GRIND_WORKER=1` (or any worker setup failure) falls back to the
+/// exact incumbent scope-spawn path; a worker failure mid-job degrades to the
+/// same `Err` the spawned path would propagate (CPU grind fallback upstream).
+/// No GPU work is added or removed — only its scheduling overlaps the CPU
+/// prefetch window.
 mod grind_worker {
     use std::sync::atomic::AtomicBool;
     use std::sync::mpsc::{channel, Receiver, Sender};
@@ -796,6 +798,21 @@ mod grind_worker {
     struct Worker {
         tx: Sender<Job>,
         _thread: std::thread::JoinHandle<()>,
+    }
+
+    /// One in-flight GPU scan. Keeping the receiver opaque makes it impossible
+    /// for callers to observe anything except the worker's final scan result
+    /// (or the same closed-channel error used by the old blocking dispatch).
+    pub(super) struct Pending {
+        done: Receiver<Result<Option<u64>, String>>,
+    }
+
+    impl Pending {
+        pub(super) fn wait(self) -> Result<Option<u64>, String> {
+            self.done
+                .recv()
+                .unwrap_or_else(|_| Err("GPU grind worker channel closed".to_string()))
+        }
     }
 
     fn worker() -> Option<&'static Worker> {
@@ -830,9 +847,9 @@ mod grind_worker {
 
     /// Dispatch one GPU grind scan through the persistent worker. Returns
     /// `None` when the worker is unavailable (kill switch or setup failure)
-    /// and the caller must run the incumbent scope-spawn path; `Some(result)`
-    /// is the scan outcome with the same `Err` surface as a direct
-    /// `gpu_blake3_pow_scan` call.
+    /// and the caller must run the incumbent scope-spawn path; `Some(pending)`
+    /// is returned immediately after enqueueing so the caller can overlap its
+    /// CPU window, then wait for the scan outcome at the merge point.
     pub(super) fn dispatch(
         state_digest: &[u8; 32],
         start: u64,
@@ -840,7 +857,7 @@ mod grind_worker {
         bits: u32,
         stop: Arc<AtomicBool>,
         abort: bool,
-    ) -> Option<Result<Option<u64>, String>> {
+    ) -> Option<Pending> {
         let w = worker()?;
         let (done_tx, done_rx) = channel();
         let job = Job {
@@ -852,12 +869,32 @@ mod grind_worker {
             abort,
             done: done_tx,
         };
-        if w.tx.send(job).is_err() {
-            return Some(Err("GPU grind worker channel closed".to_string()));
+        // If the worker channel is closed, `job` (including its result sender)
+        // is dropped here. `Pending::wait` then maps the disconnected result
+        // channel to the exact error string used by the blocking incumbent.
+        let _ = w.tx.send(job);
+        Some(Pending { done: done_rx })
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn pending_delivers_worker_result() {
+            let (done_tx, done_rx) = channel();
+            let pending = Pending { done: done_rx };
+            let sender = std::thread::spawn(move || done_tx.send(Ok(Some(37))).unwrap());
+            assert_eq!(pending.wait(), Ok(Some(37)));
+            sender.join().unwrap();
         }
-        match done_rx.recv() {
-            Ok(res) => Some(res),
-            Err(_) => Some(Err("GPU grind worker channel closed".to_string())),
+
+        #[test]
+        fn pending_maps_closed_channel_to_worker_error() {
+            let (done_tx, done_rx) = channel();
+            drop(done_tx);
+            let err = Pending { done: done_rx }.wait().unwrap_err();
+            assert_eq!(err, "GPU grind worker channel closed");
         }
     }
 }
@@ -891,7 +928,9 @@ fn gpu_blake3_pow_nonce(state_digest: &[u8; 32], bits: u32) -> Result<u64, Strin
         let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let abort = grind_hybrid_abort_enabled();
         // Persistent dispatch worker when available; the incumbent
-        // scope-spawn path otherwise (see `grind_worker`).
+        // scope-spawn path otherwise (see `grind_worker`). The diagnostic
+        // serial policy waits before entering the CPU window, reproducing the
+        // old worker ordering in the same binary.
         let (gpu_result, cpu_next) =
             match grind_worker::dispatch(
                 state_digest,
@@ -901,7 +940,8 @@ fn gpu_blake3_pow_nonce(state_digest: &[u8; 32], bits: u32) -> Result<u64, Strin
                 std::sync::Arc::clone(&stop),
                 abort,
             ) {
-                Some(gpu) => {
+                Some(pending) if grind_worker_serial_enabled() => {
+                    let gpu = pending.wait();
                     let cpu = cpu_blake3_pow_window_inner(
                         state_digest,
                         next_start,
@@ -909,6 +949,17 @@ fn gpu_blake3_pow_nonce(state_digest: &[u8; 32], bits: u32) -> Result<u64, Strin
                         bits,
                         abort.then_some(stop.as_ref()),
                     );
+                    (gpu, cpu)
+                }
+                Some(pending) => {
+                    let cpu = cpu_blake3_pow_window_inner(
+                        state_digest,
+                        next_start,
+                        block_len,
+                        bits,
+                        abort.then_some(stop.as_ref()),
+                    );
+                    let gpu = pending.wait();
                     (gpu, cpu)
                 }
                 None => std::thread::scope(|s| {
@@ -962,6 +1013,20 @@ fn grind_hybrid_enabled() -> bool {
 fn grind_hybrid_abort_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("FLOCK_NO_GRIND_HYBRID_ABORT").is_none())
+}
+
+/// `FLOCK_GRIND_WORKER_SERIAL=1` restores the persistent worker's old
+/// wait-before-CPU ordering as a same-binary diagnostic control. Other values
+/// leave the production overlap enabled.
+fn grind_worker_serial_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        grind_worker_serial_value_enabled(std::env::var_os("FLOCK_GRIND_WORKER_SERIAL").as_deref())
+    })
+}
+
+fn grind_worker_serial_value_enabled(value: Option<&std::ffi::OsStr>) -> bool {
+    value.is_some_and(|v| v == std::ffi::OsStr::new("1"))
 }
 
 // ---------------------------------------------------------------------------
@@ -1158,6 +1223,17 @@ mod tests {
         assert_eq!(GPU_GRIND_CALIBRATION_BITS, 19);
         let exact_geometric = 1.0 / (1.0 - (-1.0f64).exp());
         assert!((GPU_GRIND_BLOCK_OVERDRAW - exact_geometric).abs() < 1e-12);
+    }
+
+    #[test]
+    fn grind_worker_serial_diagnostic_requires_exact_one() {
+        use std::ffi::OsStr;
+
+        assert!(!grind_worker_serial_value_enabled(None));
+        for value in ["", "0", "false", "yes", "01"] {
+            assert!(!grind_worker_serial_value_enabled(Some(OsStr::new(value))));
+        }
+        assert!(grind_worker_serial_value_enabled(Some(OsStr::new("1"))));
     }
 
     /// Every FsChallenger property must hold under both transcript hashes:
