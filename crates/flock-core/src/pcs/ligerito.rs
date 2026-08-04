@@ -10517,3 +10517,6 @@ mod tests {
 // RealAdii sample 2 on 18f9d67.
 // RealAdii sample 3 on 18f9d67.
 // RealAdii sample 4 on 18f9d67.
+// RealAdii self-extension 1 on bb9912a.
+// RealAdii self-extension 2 on bb9912a.
+// RealAdii self-extension 3 on bb9912a.
