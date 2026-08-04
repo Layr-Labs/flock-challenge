@@ -1350,6 +1350,112 @@ static inline uint4 gf_mul_tab4(uint4 v, threadgroup const uint4* tab) {
     return acc;
 }
 
+// v * tw mod P via two 256-entry byte tables — tab[b] = b*tw and
+// tab[256 + b] = (b * x^8) * tw — so each of the 8 gf_shl16 Horner steps of
+// gf_mul_tab4 costs 2 threadgroup loads instead of 4.
+// The tables are 8 KiB per twiddle, so callers keep only the live one
+// resident and rebuild it per twiddle with gf_build_byte16* below.
+static inline uint4 gf_mul_byte16(uint4 v, threadgroup const uint4* tab) {
+    uint4 acc = uint4(0u);
+    for (int i = 7; i >= 0; i--) {
+        acc = gf_shl16(acc);
+        uint h = (v[i >> 1] >> ((i & 1) * 16)) & 0xffffu;
+        acc ^= tab[h & 255u] ^ tab[256u + (h >> 8)];
+    }
+    return acc;
+}
+
+// Rebuild `tabB` for the twiddle at `twiddles[idx]`, in registers. 64 threads:
+// `lid` owns a 4-lo x 2-hi block of one byte table (t = lid >> 5 selects tw or
+// tw * x^8) and derives it with a short gf_mulx chain, so no intermediate
+// threadgroup array is needed. The leading barrier retires the previous
+// table's readers; the trailing one publishes the new one.
+static inline void gf_build_byte16(
+    threadgroup uint4* tabB, device const uint4* twiddles, uint idx, uint lid)
+{
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const uint t  = lid >> 5;        // 0: b*tw          1: b*(tw*x^8)
+    const uint u  = lid & 31u;
+    const uint aa = u & 3u;          // owns entry bits 2..3
+    const uint cc = u >> 2;          // owns entry bits 5..7
+    uint4 g = twiddles[idx];
+    if (t != 0u) {
+        for (uint m = 0; m < 8u; m++) { g = gf_mulx(g); }
+    }
+    uint4 e0 = g;
+    uint4 e1 = gf_mulx(e0), e2 = gf_mulx(e1), e3 = gf_mulx(e2);
+    uint4 f0 = gf_mulx(e3), f1 = gf_mulx(f0), f2 = gf_mulx(f1), f3 = gf_mulx(f2);
+    uint4 A = uint4(0u);
+    if (aa & 1u) { A ^= e2; }
+    if (aa & 2u) { A ^= e3; }
+    const uint4 L0 = A, L1 = A ^ e0, L2 = A ^ e1, L3 = A ^ e0 ^ e1;
+    uint4 C = uint4(0u);
+    if (cc & 1u) { C ^= f1; }
+    if (cc & 2u) { C ^= f2; }
+    if (cc & 4u) { C ^= f3; }
+    const uint4 H0 = C, H1 = C ^ f0;
+    threadgroup uint4* dst = &tabB[t << 8];
+    const uint o0 = (cc << 5) + (aa << 2);   // entry (cc << 5) | (aa << 2)
+    const uint o1 = o0 + 16u;                //   ... | 16
+    dst[o0 + 0u] = L0 ^ H0;
+    dst[o0 + 1u] = L1 ^ H0;
+    dst[o0 + 2u] = L2 ^ H0;
+    dst[o0 + 3u] = L3 ^ H0;
+    dst[o1 + 0u] = L0 ^ H1;
+    dst[o1 + 1u] = L1 ^ H1;
+    dst[o1 + 2u] = L2 ^ H1;
+    dst[o1 + 3u] = L3 ^ H1;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+}
+
+// Rebuild `tabB` for tile-local twiddle `t` from its four precomputed bases.
+// Phase A materializes tab1[16k + n] = (n * x^(4k)) * tw; phase B expands it
+// with tabB[256T + 16*hi + lo] = tab1[32T + lo] ^ tab1[32T + 16 + hi], blocked
+// 4 lo x 2 hi per thread. 64 threads; the barrier between the phases also
+// retires the previous table's readers.
+static inline void gf_build_byte16_from_bases(
+    threadgroup uint4* tabB,
+    threadgroup uint4* tab1,
+    threadgroup const uint4* bases,
+    uint t,
+    uint lid)
+{
+    const uint sub = lid & 63u;
+    {
+        uint4 p = bases[(t << 2) | (sub >> 4)];
+        uint4 val = uint4(0u);
+        for (uint k = 0; k < 4u; k++) {
+            if (((sub & 15u) >> k) & 1u) { val ^= p; }
+            p = gf_mulx(p);
+        }
+        tab1[sub] = val;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const uint T  = lid >> 5;
+    const uint u  = lid & 31u;
+    const uint aa = u & 3u;
+    const uint cc = u >> 2;
+    threadgroup const uint4* src = &tab1[T << 5];
+    const uint4 L0 = src[(aa << 2) + 0u];
+    const uint4 L1 = src[(aa << 2) + 1u];
+    const uint4 L2 = src[(aa << 2) + 2u];
+    const uint4 L3 = src[(aa << 2) + 3u];
+    const uint4 H0 = src[16u + (cc << 1) + 0u];
+    const uint4 H1 = src[16u + (cc << 1) + 1u];
+    threadgroup uint4* dst = &tabB[T << 8];
+    const uint o0 = (cc << 5) + (aa << 2);
+    const uint o1 = o0 + 16u;
+    dst[o0 + 0u] = L0 ^ H0;
+    dst[o0 + 1u] = L1 ^ H0;
+    dst[o0 + 2u] = L2 ^ H0;
+    dst[o0 + 3u] = L3 ^ H0;
+    dst[o1 + 0u] = L0 ^ H1;
+    dst[o1 + 1u] = L1 ^ H1;
+    dst[o1 + 2u] = L2 ^ H1;
+    dst[o1 + 3u] = L3 ^ H1;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+}
+
 // ===========================================================================
 // Fused multi-layer interleaved additive-NTT butterfly pass.
 //
@@ -1460,6 +1566,8 @@ kernel void ntt_fused(device uint4* data                [[buffer(0)]],
 // 64-thread occupancy and register footprint of the one-tile kernel.
 // The f loops below have compile-time bounds, so the elems[] array stays in
 // registers (dynamic indexing would spill it to stack memory).
+// The LOG_G = 2 pass is a byte-table specialization of this shape, written out
+// below as `ntt_fused_reg4g4`; the two instantiations here are the fallbacks.
 // ===========================================================================
 
 #define DEF_NTT_FUSED_REG(NAME, F_CONST, LOG_G)                                \
@@ -1537,9 +1645,87 @@ kernel void NAME(device uint4* data                [[buffer(0)]],              \
     }                                                                          \
 }
 
-DEF_NTT_FUSED_REG(ntt_fused_reg4g4, 4u, 2u)   // 4 same-B tiles, sequential
 DEF_NTT_FUSED_REG(ntt_fused_reg4,   4u, 0u)
 DEF_NTT_FUSED_REG(ntt_fused_reg3,   3u, 0u)
+
+// ===========================================================================
+// The production f = 4, s >= 2 pass. Same register-resident butterfly network
+// as DEF_NTT_FUSED_REG with LOG_G = 2 — four same-B tiles per 64-thread group,
+// all 16 tile positions of a lane in registers — but the multiply is
+// gf_mul_byte16 (16 threadgroup lookups) rather than gf_mul_tab4 (32).
+//
+// A twiddle's byte tables are 8 KiB, so only the live one is resident: each
+// sub-layer rebuilds `tabB` per twiddle (gf_build_byte16) and then spends it
+// on that twiddle's 8 >> j butterflies, 15 rebuilds per tile.
+//
+// `pad` is never read. It exists so the group's threadgroup allocation lands
+// on the residency this pass wants, and is therefore written under a
+// predicate the compiler cannot fold away but no call site can satisfy
+// (`P.log_d` is a shift amount, always <= 20).
+// ===========================================================================
+
+// One f=4 sub-layer: 2^J twiddles, each rebuilt once then spent on its
+// (8 >> J) butterflies. J must be a literal so the butterfly indices stay
+// compile-time and elems[] stays in registers.
+#define NTT_G4_B16_SUBLAYER(J)                                                 \
+    {                                                                          \
+        constexpr uint j    = (J);                                             \
+        constexpr uint bpos = F - 1u - j;                                      \
+        constexpr uint NC   = 1u << j;                                         \
+        constexpr uint BPER = (NF >> 1) >> j;                                  \
+        for (uint c = 0; c < NC; c++) {                                        \
+            gf_build_byte16(tabB, twiddles,                                    \
+                            (1u << (P.l + j)) - 1u + (B << j) + c, lid);       \
+            for (uint bb = 0; bb < BPER; bb++) {                               \
+                const uint b   = c * BPER + bb;                                \
+                const uint low = b & ((1u << bpos) - 1u);                      \
+                const uint eu  = ((b >> bpos) << (bpos + 1u)) | low;           \
+                const uint ev  = eu | (1u << bpos);                            \
+                uint4 nu = elems[eu] ^ gf_mul_byte16(elems[ev], &tabB[0]);     \
+                elems[eu] = nu;                                                \
+                elems[ev] ^= nu;                                               \
+            }                                                                  \
+        }                                                                      \
+    }
+
+kernel void ntt_fused_reg4g4(device uint4* data                [[buffer(0)]],
+                             device const uint4* twiddles      [[buffer(1)]],
+                             constant NttParams& P             [[buffer(2)]],
+                             uint tgid [[threadgroup_position_in_grid]],
+                             uint lid  [[thread_index_in_threadgroup]])
+{
+    constexpr uint F     = 4u;
+    constexpr uint NF    = 1u << F;
+    constexpr uint LOG_G = 2u;
+    threadgroup uint4 tabB[512u];      // 8,192 B: the live twiddle's tables
+    threadgroup uint4 pad[124u];       // 1,984 B: residency only, never read
+
+    const uint lane = lid;
+    const uint B = tgid >> (P.s - LOG_G);
+    const uint r_base = (tgid & ((1u << (P.s - LOG_G)) - 1u)) << LOG_G;
+
+    for (uint rr = 0; rr < (1u << LOG_G); rr++) {
+        const uint r = r_base + rr;
+        const uint pos_base = (B << (P.log_d - P.l)) + r;
+        /* Load one lane's tile column into registers (coalesced per e). */
+        uint4 elems[NF];
+        for (uint e = 0; e < NF; e++) {
+            elems[e] = data[((pos_base + (e << P.s)) << 6) + lane];
+        }
+        NTT_G4_B16_SUBLAYER(0u)
+        NTT_G4_B16_SUBLAYER(1u)
+        NTT_G4_B16_SUBLAYER(2u)
+        NTT_G4_B16_SUBLAYER(3u)
+        if (P.log_d == 77u) {          /* unreachable; keeps `pad` allocated */
+            pad[lid % 124u] = elems[0];
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            elems[0] ^= pad[(lid + 1u) % 124u];
+        }
+        for (uint e = 0; e < NF; e++) {
+            data[((pos_base + (e << P.s)) << 6) + lane] = elems[e];
+        }
+    }
+}
 
 // ===========================================================================
 // Half-footprint variant for the FINAL pass (l = 16, s = 0), where every
@@ -1624,9 +1810,34 @@ static inline uint4 gf_shl4(uint4 a) {
     return r;
 }
 
-// Mixed ranked final pass. Shallow sub-layers retain the proven table
-// multiply. Deep sub-layers Horner over the short twiddle instead of scanning
-// all 128 bits of the value. Dispatch is restricted by pass5_mixed_ok().
+// One table sub-layer (j, c) of the mixed pass: rebuild that twiddle's byte
+// tables, then spend them on its (8 >> j) butterflies. J and C must be
+// literals so the butterfly indices stay compile-time.
+#define NTT_MIX_B16_SUBLAYER(J, C)                                             \
+    {                                                                          \
+        constexpr uint j    = (J);                                             \
+        constexpr uint c    = (C);                                             \
+        constexpr uint bpos = F - 1u - j;                                      \
+        constexpr uint BPER = (NF >> 1) >> j;                                  \
+        gf_build_byte16_from_bases(tabB, tab1, bases,                          \
+                                   ((1u << j) - 1u) + c, lid);                 \
+        for (uint bb = 0; bb < BPER; bb++) {                                   \
+            const uint b   = c * BPER + bb;                                    \
+            const uint low = b & ((1u << bpos) - 1u);                          \
+            const uint eu  = ((b >> bpos) << (bpos + 1u)) | low;               \
+            const uint ev  = eu | (1u << bpos);                                \
+            uint4 nu = elems[eu] ^ gf_mul_byte16(elems[ev], &tabB[0]);         \
+            elems[eu] = nu;                                                    \
+            elems[ev] ^= nu;                                                   \
+        }                                                                      \
+    }
+
+// Mixed ranked final pass. Shallow sub-layers retain the table multiply, now
+// over byte tables (gf_mul_byte16, 16 lookups) rebuilt per twiddle; only
+// three such sub-layers exist here, so few rebuilds are needed. Deep
+// sub-layers Horner over the short twiddle instead of scanning all 128 bits
+// of the value, and keep no table at all.
+// Dispatch is restricted by pass5_mixed_ok().
 kernel void ntt_pass5_mixed(device uint4* data                [[buffer(0)]],
                             device const uint4* twiddles      [[buffer(1)]],
                             constant NttParams& P             [[buffer(2)]],
@@ -1637,7 +1848,8 @@ kernel void ntt_pass5_mixed(device uint4* data                [[buffer(0)]],
     constexpr uint NNIB_A = 10u;   // sub-layer 2: twiddle < 2^40
     constexpr uint NNIB_B = 5u;    // sub-layer 3: twiddle < 2^20
     threadgroup uint4 bases[3u * 4u];
-    threadgroup uint4 tabs[3u * 64u];
+    threadgroup uint4 tab1[64u];   // build intermediate for the live twiddle
+    threadgroup uint4 tabB[512u];  // the live twiddle's two byte tables
     threadgroup uint  nibA[4u * NNIB_A];
     threadgroup uint  nibB[8u * NNIB_B];
 
@@ -1662,47 +1874,34 @@ kernel void ntt_pass5_mixed(device uint4* data                [[buffer(0)]],
         nibB[lid] = (twB[qB >> 3] >> ((qB & 7u) * 4u)) & 15u;
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    for (uint ei = lid; ei < 3u * 64u; ei += 64u) {
-        uint t = ei >> 6, sub = ei & 63u, n = sub & 15u;
-        uint4 p = bases[(t << 2) | (sub >> 4)];
-        uint4 val = uint4(0u);
-        for (uint k = 0; k < 4u; k++) {
-            if ((n >> k) & 1u) val ^= p;
-            p = gf_mulx(p);
-        }
-        tabs[ei] = val;
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
 
     uint4 elems[NF];
     for (uint e = 0; e < NF; e++) {
         elems[e] = data[((pos_base + (e << P.s)) << 6) + lane];
     }
-    for (uint j = 0; j < F; j++) {
+    NTT_MIX_B16_SUBLAYER(0u, 0u)
+    NTT_MIX_B16_SUBLAYER(1u, 0u)
+    NTT_MIX_B16_SUBLAYER(1u, 1u)
+    for (uint j = 2u; j < F; j++) {
         const uint bpos = F - 1u - j;
         for (uint b = 0; b < (NF >> 1); b++) {
             uint low = b & ((1u << bpos) - 1u);
             uint eu = ((b >> bpos) << (bpos + 1u)) | low;
             uint ev = eu | (1u << bpos);
             uint c = eu >> (F - j);
-            uint4 acc;
-            if (j < 2u) {
-                acc = gf_mul_tab4(elems[ev], &tabs[(((1u << j) - 1u) + c) << 6]);
-            } else {
-                const uint NN = (j == 2u) ? NNIB_A : NNIB_B;
-                threadgroup const uint* nb =
-                    (j == 2u) ? &nibA[c * NNIB_A] : &nibB[c * NNIB_B];
-                uint4 V0 = elems[ev];
-                uint4 V1 = gf_mulx(V0), V2 = gf_mulx(V1), V3 = gf_mulx(V2);
-                acc = uint4(0u);
-                for (int q = (int)NN - 1; q >= 0; q--) {
-                    acc = gf_shl4(acc);
-                    uint n = nb[q];
-                    if (n & 1u) acc ^= V0;
-                    if (n & 2u) acc ^= V1;
-                    if (n & 4u) acc ^= V2;
-                    if (n & 8u) acc ^= V3;
-                }
+            const uint NN = (j == 2u) ? NNIB_A : NNIB_B;
+            threadgroup const uint* nb =
+                (j == 2u) ? &nibA[c * NNIB_A] : &nibB[c * NNIB_B];
+            uint4 V0 = elems[ev];
+            uint4 V1 = gf_mulx(V0), V2 = gf_mulx(V1), V3 = gf_mulx(V2);
+            uint4 acc = uint4(0u);
+            for (int q = (int)NN - 1; q >= 0; q--) {
+                acc = gf_shl4(acc);
+                uint n = nb[q];
+                if (n & 1u) acc ^= V0;
+                if (n & 2u) acc ^= V1;
+                if (n & 4u) acc ^= V2;
+                if (n & 8u) acc ^= V3;
             }
             uint4 nu = elems[eu] ^ acc;
             elems[eu] = nu;
@@ -2457,7 +2656,7 @@ kernel void blake3_pow_scan(
     const METALLIB: &[u8] = include_bytes!("gpu_shaders.metallib");
 
     /// FNV-1a (64-bit) of `MSL_SOURCE` when `gpu_shaders.metallib` was built.
-    const METALLIB_MSL_FNV1A: u64 = 0x7566daf1e26ffbf1;
+    const METALLIB_MSL_FNV1A: u64 = 0x7b23471589b0cbb6;
 
     const fn fnv1a64(s: &str) -> u64 {
         let bytes = s.as_bytes();
