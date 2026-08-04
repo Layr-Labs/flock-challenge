@@ -1082,8 +1082,11 @@ pub fn fold_compact_and_compute_round_pair(
     // UN-PARKED (v11): the scoreless deaths were the job-wall timeout, not
     // this arm — the static warmup latch frees minutes of wall and both
     // arms' once-per-process costs fit in a fraction of it.
+    // v12: the v11 rationale above was written but the const was left
+    // parked; this flip lands it. The kill switch remains
+    // FLOCK_NO_GPU_ZC_T3 and the latch/oracle protections are unchanged.
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-    const ZC_T3_INTEGRATION_PARKED: bool = true;
+    const ZC_T3_INTEGRATION_PARKED: bool = false;
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     let gpu_job = if ZC_T3_INTEGRATION_PARKED {
         None
