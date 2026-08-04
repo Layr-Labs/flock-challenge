@@ -4551,8 +4551,9 @@ kernel void blake3_pow_scan(
 
     /// Two samples per candidate, with the second pass in reverse order so
     /// thermal drift, queue warmup, and A/B replay cache state do not favor
-    /// either end of the search range. Selection consumes the mean rather
-    /// than a noise-sensitive minimum.
+    /// either end of the search range. The first pass is a warm-up draw;
+    /// selection consumes the second (warm) sample only — see
+    /// [`select_ranked_exact_samples`].
     fn collect_ranked_exact_samples<E>(
         mut reprime: impl FnMut() -> Result<(), E>,
         mut sample: impl FnMut(usize) -> Result<f64, E>,
@@ -4569,6 +4570,32 @@ kernel void blake3_pow_scan(
         Ok(walls)
     }
 
+    /// Reduce the two-sample matrix to one score per candidate.
+    ///
+    /// Default: **warm-only** (`samples[i][1]`). Averaging a cold first draw
+    /// with a warm second is what collapses every candidate into the 1.5%
+    /// near-tie band on a cold ranked worker process — the shared cold
+    /// additive penalty dominates the k-dependent delta, so
+    /// [`choose_hybrid_k`] always retains the default. Min-of-two was tried
+    /// (`dea42ac`, −1.11%) and rejected; warm-only is the complementary
+    /// statistic (same two probes, discard the cold draw). Kill switch
+    /// `FLOCK_HYBRID_TUNE_MEAN=1` restores the incumbent mean-of-two.
+    fn select_ranked_exact_samples(
+        samples: [[f64; 2]; RANKED_EXACT_TUNE_CANDIDATES.len()],
+    ) -> Option<[f64; RANKED_EXACT_TUNE_CANDIDATES.len()]> {
+        let use_mean = std::env::var_os("FLOCK_HYBRID_TUNE_MEAN").is_some();
+        let mut scores = [0.0; RANKED_EXACT_TUNE_CANDIDATES.len()];
+        for (score, [a, b]) in scores.iter_mut().zip(samples) {
+            if !a.is_finite() || !b.is_finite() || a < 0.0 || b < 0.0 {
+                return None;
+            }
+            *score = if use_mean { (a + b) * 0.5 } else { b };
+        }
+        Some(scores)
+    }
+
+    /// Backward-compatible name used by unit tests that assert mean math.
+    #[cfg(test)]
     fn mean_ranked_exact_samples(
         samples: [[f64; 2]; RANKED_EXACT_TUNE_CANDIDATES.len()],
     ) -> Option<[f64; RANKED_EXACT_TUNE_CANDIDATES.len()]> {
@@ -4983,13 +5010,13 @@ kernel void blake3_pow_scan(
                 return;
             }
         };
-        let Some(means) = mean_ranked_exact_samples(samples) else {
+        let Some(scores) = select_ranked_exact_samples(samples) else {
             finish_ranked_exact_contention_tune(params, cpu_tree, 0);
             return;
         };
         let Some(chosen) = choose_hybrid_k(
             &RANKED_EXACT_TUNE_CANDIDATES,
-            &means,
+            &scores,
             DEFAULT_HYBRID_K,
         ) else {
             finish_ranked_exact_contention_tune(params, cpu_tree, 0);
@@ -5048,8 +5075,8 @@ kernel void blake3_pow_scan(
                 .enumerate()
                 .map(|(i, k)| {
                     format!(
-                        "k={k}:[{:.1},{:.1}] mean={:.1}ms",
-                        samples[i][0], samples[i][1], means[i]
+                        "k={k}:[{:.1},{:.1}] score={:.1}ms",
+                        samples[i][0], samples[i][1], scores[i]
                     )
                 })
                 .collect();
@@ -7484,7 +7511,7 @@ LC_KERNEL(lc_fold_stripes, 4)
     mod split_select_tests {
         use super::{
             DEFAULT_HYBRID_K, RANKED_EXACT_TUNE_CANDIDATES, choose_hybrid_k,
-            collect_ranked_exact_samples, mean_ranked_exact_samples,
+            collect_ranked_exact_samples, mean_ranked_exact_samples, select_ranked_exact_samples,
         };
         const C: [usize; 3] = [0, 3, 5];
 
@@ -7522,6 +7549,45 @@ LC_KERNEL(lc_fold_stripes, 4)
             assert_eq!(mean_ranked_exact_samples(samples).unwrap()[1], 100.0);
             samples[1][1] = f64::NAN;
             assert!(mean_ranked_exact_samples(samples).is_none());
+        }
+
+        #[test]
+        fn exact_selection_default_uses_warm_sample_only() {
+            // Cold first draws are shared-penalty-dominated (90, 95, 100);
+            // warm second draws separate k=3 as clearly fastest (50).
+            // Mean would pull k=3 into the 1.5% band of k=5; warm-only keeps it.
+            let mut samples = [[0.0; 2]; RANKED_EXACT_TUNE_CANDIDATES.len()];
+            // candidates [0, 3, 5]
+            samples[0] = [200.0, 120.0]; // k=0
+            samples[1] = [90.0, 50.0]; // k=3 cold-luck, warm-fast
+            samples[2] = [100.0, 100.0]; // k=5 default
+            let scores = select_ranked_exact_samples(samples).unwrap();
+            assert_eq!(scores[1], 50.0, "warm-only takes second sample");
+            assert_eq!(
+                choose_hybrid_k(&RANKED_EXACT_TUNE_CANDIDATES, &scores, DEFAULT_HYBRID_K),
+                Some(3)
+            );
+            // Mean of the same draws would score k=3 at 70 vs k=5 at 100 — still
+            // wins; construct a mean-trap: cold shared 200, warm separates by 3%.
+            samples[0] = [200.0, 103.0];
+            samples[1] = [200.0, 100.0]; // warm-best
+            samples[2] = [200.0, 101.5]; // default within 1.5% of warm-best under mean
+            // mean: k=0→151.5, k=3→150, k=5→150.75 → default retained (near-tie)
+            let means = mean_ranked_exact_samples(samples).unwrap();
+            assert_eq!(
+                choose_hybrid_k(&RANKED_EXACT_TUNE_CANDIDATES, &means, DEFAULT_HYBRID_K),
+                Some(5),
+                "mean collapses into default near-tie band"
+            );
+            // warm-only: k=3 at 100, k=5 at 101.5 → still within 1.5% so default
+            // wins by the near-tie rule; push k=3 further clear of the band.
+            samples[1] = [200.0, 90.0];
+            let scores = select_ranked_exact_samples(samples).unwrap();
+            assert_eq!(
+                choose_hybrid_k(&RANKED_EXACT_TUNE_CANDIDATES, &scores, DEFAULT_HYBRID_K),
+                Some(3),
+                "warm-only can leave the default band when k is clearly faster"
+            );
         }
 
         #[test]
