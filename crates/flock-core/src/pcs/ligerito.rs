@@ -31,7 +31,7 @@
 
 use crate::challenger::Challenger;
 use crate::field::F128;
-use crate::lincheck::build_eq_table;
+use crate::lincheck::{build_eq_table, build_eq_table_into};
 use crate::merkle::{self, Hash, HashKind};
 use crate::ntt::additive_ntt_f128::AdditiveNttF128;
 use serde::{Deserialize, Serialize};
@@ -2771,6 +2771,11 @@ impl Drop for LigeroWitness {
 // spares — recycle all four on drop.
 impl Drop for SumcheckProver {
     fn drop(&mut self) {
+        if let Some((pending, _, recycle_after_glue)) = self.pending_glue.take()
+            && recycle_after_glue
+        {
+            crate::scratch::give_f128(pending);
+        }
         crate::scratch::give_f128(std::mem::take(&mut self.f));
         crate::scratch::give_f128(std::mem::take(&mut self.combined_basis));
         crate::scratch::give_f128(std::mem::take(&mut self.spare_f));
@@ -4175,7 +4180,7 @@ pub struct SumcheckProver {
     spare_b: Vec<F128>,
     t_r: F128,
     transcript: Vec<SumcheckMessage>,
-    pending_glue: Option<(Vec<F128>, F128)>,
+    pending_glue: Option<(Vec<F128>, F128, bool)>,
 }
 
 impl SumcheckProver {
@@ -4353,10 +4358,11 @@ impl SumcheckProver {
     /// Introduce a fresh basis poly with claimed sum `h_new`. Sends the
     /// (u_0, u_2) for `Σ_x f(x) · b_new(x)` at the current dim.
     pub fn introduce_new(&mut self, b_new: Vec<F128>, h_new: F128) -> SumcheckMessage {
+        assert!(self.pending_glue.is_none(), "introduce_new before glue");
         assert_eq!(b_new.len(), self.f.len());
         let msg = round_msg_lsb(&self.f, &b_new);
         self.transcript.push(msg);
-        self.pending_glue = Some((b_new, h_new));
+        self.pending_glue = Some((b_new, h_new, false));
         msg
     }
 
@@ -4367,10 +4373,26 @@ impl SumcheckProver {
     /// fold over `f`. Transcript-identical: the caller observes the returned
     /// `h_new` then `(u_0, u_2)`, exactly as the unfused path does.
     pub fn introduce_new_with_eval(&mut self, b_new: Vec<F128>) -> (SumcheckMessage, F128) {
+        self.introduce_new_with_eval_inner(b_new, false)
+    }
+
+    fn introduce_new_with_eval_recycled(
+        &mut self,
+        b_new: Vec<F128>,
+    ) -> (SumcheckMessage, F128) {
+        self.introduce_new_with_eval_inner(b_new, true)
+    }
+
+    fn introduce_new_with_eval_inner(
+        &mut self,
+        b_new: Vec<F128>,
+        recycle_after_glue: bool,
+    ) -> (SumcheckMessage, F128) {
+        assert!(self.pending_glue.is_none(), "introduce_new before glue");
         assert_eq!(b_new.len(), self.f.len());
         let (msg, h_new) = round_msg_and_eval_lsb(&self.f, &b_new);
         self.transcript.push(msg);
-        self.pending_glue = Some((b_new, h_new));
+        self.pending_glue = Some((b_new, h_new, recycle_after_glue));
         (msg, h_new)
     }
 
@@ -4378,7 +4400,7 @@ impl SumcheckProver {
     /// `combined_basis[j] += α · b_new[j]` (pointwise), `T_r += α · h_new`.
     pub fn glue(&mut self, alpha: F128) {
         use rayon::prelude::*;
-        let (b_new, h_new) = self
+        let (b_new, h_new, recycle_after_glue) = self
             .pending_glue
             .take()
             .expect("glue without introduce_new");
@@ -4395,6 +4417,9 @@ impl SumcheckProver {
                 .with_min_len(PAR_THRESHOLD / 4)
                 .for_each(|(acc, &v)| *acc += alpha * v);
         }
+        if recycle_after_glue {
+            crate::scratch::give_f128(b_new);
+        }
         self.t_r += alpha * h_new;
     }
 
@@ -4405,6 +4430,16 @@ impl SumcheckProver {
     pub fn transcript(&self) -> &[SumcheckMessage] {
         &self.transcript
     }
+}
+
+fn build_ood_eq_table(point: &[F128]) -> (Vec<F128>, bool) {
+    if std::env::var_os("FLOCK_NO_OPEN_OOD_SCRATCH_EQ").is_some() {
+        return (build_eq_table(point), false);
+    }
+
+    let mut table = crate::scratch::take_f128(1usize << point.len());
+    build_eq_table_into(point, &mut table);
+    (table, true)
 }
 
 // ===================================================================
@@ -5260,8 +5295,12 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
             // Build eq(z, ·) once and fuse the MLE eval `y = f̂1(z)` into the
             // introduce round message (single pass over f1 + eq_z), instead of
             // a separate `mle_eval_inline` fold.
-            let eq_z = build_eq_table(&z);
-            let (intro, y) = sc_prover.introduce_new_with_eval(eq_z);
+            let (eq_z, recycle_eq_z) = build_ood_eq_table(&z);
+            let (intro, y) = if recycle_eq_z {
+                sc_prover.introduce_new_with_eval_recycled(eq_z)
+            } else {
+                sc_prover.introduce_new_with_eval(eq_z)
+            };
             challenger.observe_f128(y);
             ood_values.push(y);
             challenger.observe_f128(intro.u_0);
@@ -5470,8 +5509,12 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
             let _t = std::time::Instant::now();
             for _ in 0..ood_count(i + 2) {
                 let z = challenger.sample_f128_vec(n_next);
-                let eq_z = build_eq_table(&z);
-                let (intro, y) = sc_prover.introduce_new_with_eval(eq_z);
+                let (eq_z, recycle_eq_z) = build_ood_eq_table(&z);
+                let (intro, y) = if recycle_eq_z {
+                    sc_prover.introduce_new_with_eval_recycled(eq_z)
+                } else {
+                    sc_prover.introduce_new_with_eval(eq_z)
+                };
                 challenger.observe_f128(y);
                 ood_values.push(y);
                 challenger.observe_f128(intro.u_0);
@@ -7280,6 +7323,169 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn recycled_ood_eq_intro_matches_owned_path() {
+        use crate::challenger::{Challenger, RandomChallenger};
+
+        let mut rng = RandomChallenger::new(0x00D5_C4A7_C4_u64);
+        let point = rng.sample_f128_vec(8);
+        let f = rng.sample_f128_vec(1 << point.len());
+        let basis = rng.sample_f128_vec(f.len());
+        let target = rng.sample_f128();
+        let alpha = rng.sample_f128();
+        let fold_challenge = rng.sample_f128();
+
+        let (mut owned, owned_start) = SumcheckProver::new(f.clone(), basis.clone(), target);
+        let (mut recycled, recycled_start) = SumcheckProver::new(f, basis, target);
+        assert_eq!(owned_start, recycled_start);
+
+        let owned_eq = build_eq_table(&point);
+        let mut recycled_eq = crate::scratch::take_f128(owned_eq.len());
+        build_eq_table_into(&point, &mut recycled_eq);
+        assert_eq!(owned_eq, recycled_eq);
+
+        let owned_intro = owned.introduce_new_with_eval(owned_eq);
+        let recycled_intro = recycled.introduce_new_with_eval_recycled(recycled_eq);
+        assert_eq!(owned_intro, recycled_intro);
+
+        owned.glue(alpha);
+        recycled.glue(alpha);
+        assert_eq!(owned.fold(fold_challenge), recycled.fold(fold_challenge));
+        assert_eq!(owned.f, recycled.f);
+        assert_eq!(owned.combined_basis, recycled.combined_basis);
+        assert_eq!(owned.t_r, recycled.t_r);
+        assert_eq!(owned.transcript, recycled.transcript);
+
+        let dropped_f = rng.sample_f128_vec(1 << point.len());
+        let dropped_basis = rng.sample_f128_vec(dropped_f.len());
+        let mut pending = crate::scratch::take_f128(dropped_f.len());
+        build_eq_table_into(&point, &mut pending);
+        let pending_addr = pending.as_ptr();
+        let (mut dropped, _) = SumcheckProver::new(dropped_f, dropped_basis, target);
+        dropped.introduce_new_with_eval_recycled(pending);
+        drop(dropped);
+
+        let mut returned = Vec::with_capacity(3);
+        for _ in 0..3 {
+            returned.push(
+                crate::scratch::try_take_f128(1 << point.len())
+                    .expect("drop must return every witness-sized buffer"),
+            );
+        }
+        assert!(
+            returned.iter().any(|buffer| buffer.as_ptr() == pending_addr),
+            "drop must return a pending recycled basis"
+        );
+        for buffer in returned {
+            crate::scratch::give_f128(buffer);
+        }
+    }
+
+    #[test]
+    fn ood_scratch_eq_fallback_proof_is_identical() {
+        use crate::challenger::Challenger;
+
+        struct RestoreEnv(Option<std::ffi::OsString>);
+        impl Drop for RestoreEnv {
+            fn drop(&mut self) {
+                match self.0.take() {
+                    Some(value) => unsafe {
+                        std::env::set_var("FLOCK_NO_OPEN_OOD_SCRATCH_EQ", value)
+                    },
+                    None => unsafe { std::env::remove_var("FLOCK_NO_OPEN_OOD_SCRATCH_EQ") },
+                }
+            }
+        }
+
+        let _restore = RestoreEnv(std::env::var_os("FLOCK_NO_OPEN_OOD_SCRATCH_EQ"));
+        let log_n = 12;
+        let initial_k = 3;
+        let recursive_k = 2;
+        let log_inv_rate = 1;
+        let mut rng = crate::challenger::RandomChallenger::new(0x00D5_FA11_B4C4_u64);
+        let poly = rng.sample_f128_vec(1 << log_n);
+        let point = rng.sample_f128_vec(log_n);
+        let basis = build_eq_table(&point);
+        let target = poly
+            .iter()
+            .zip(&basis)
+            .map(|(&f, &b)| f * b)
+            .fold(F128::ZERO, |sum, value| sum + value);
+        let log_inv_rates = vec![log_inv_rate; 2];
+        let cfg = ProverConfig {
+            log_inv_rates: log_inv_rates.clone(),
+            recursive_steps: 1,
+            initial_log_msg_cols: log_n - initial_k,
+            initial_log_num_interleaved: initial_k,
+            initial_k,
+            recursive_log_msg_cols: vec![log_n - initial_k - recursive_k],
+            recursive_ks: vec![recursive_k],
+            queries: log_inv_rates.iter().map(|&rate| udr_queries(rate)).collect(),
+            grinding_bits: vec![0; 2],
+            fold_grinding_bits: vec![0; 2],
+            ood_samples: vec![0, 1],
+            merkle_hash: HashKind::Sha256,
+        };
+        let verifier_cfg = VerifierConfig {
+            log_inv_rates,
+            recursive_steps: 1,
+            initial_log_msg_cols: log_n - initial_k,
+            initial_log_num_interleaved: initial_k,
+            initial_k,
+            recursive_log_msg_cols: vec![log_n - initial_k - recursive_k],
+            recursive_ks: vec![recursive_k],
+            queries: cfg.queries.clone(),
+            grinding_bits: vec![0; 2],
+            fold_grinding_bits: vec![0; 2],
+            ood_samples: vec![0, 1],
+            merkle_hash: HashKind::Sha256,
+        };
+        let ntt = AdditiveNttF128::standard(log_n - initial_k + log_inv_rate);
+        let witness = ligero_commit(
+            &poly,
+            log_n - initial_k,
+            initial_k,
+            log_inv_rate,
+            &ntt,
+            HashKind::Sha256,
+        );
+
+        let prove = || {
+            let mut challenger = crate::challenger::FsChallenger::new(b"ood-scratch-fallback");
+            recursive_prover_with_basis(
+                &cfg,
+                poly.clone(),
+                basis.clone(),
+                target,
+                &witness.mat,
+                &witness.tree,
+                &mut challenger,
+            )
+        };
+
+        unsafe { std::env::remove_var("FLOCK_NO_OPEN_OOD_SCRATCH_EQ") };
+        let candidate = prove();
+        unsafe { std::env::set_var("FLOCK_NO_OPEN_OOD_SCRATCH_EQ", "1") };
+        let fallback = prove();
+        assert_eq!(candidate, fallback);
+        assert_eq!(
+            bincode::serialize(&candidate).expect("serialize candidate"),
+            bincode::serialize(&fallback).expect("serialize fallback")
+        );
+        for proof in [&candidate, &fallback] {
+            let mut challenger =
+                crate::challenger::FsChallenger::new(b"ood-scratch-fallback");
+            assert!(recursive_verifier_with_basis(
+                &verifier_cfg,
+                proof,
+                &basis,
+                target,
+                &witness.root(),
+                &mut challenger,
+            ));
+        }
+    }
 
     /// The recursive from-message first pass preserves every encoded element
     /// and every node of the ordinary Merkle tree for both production rates.
