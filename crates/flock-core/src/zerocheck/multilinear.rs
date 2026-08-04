@@ -2459,15 +2459,18 @@ fn fold_and_compute_round_pair_into_with_n_hi(
         // (12.6 → 33.7 ms) — per-size recalibration is not worth a
         // second sync for an LLC-adjacent round. `None` = the exact
         // incumbent path.
-        // PARKED alongside the T3 arm for the v10a bisect: the v9 archive
-        // carrying only this arm also died scoreless, so BOTH new arms sit
-        // behind compile-time consts while the shared-scratch cache fix
-        // ships alone. Re-enable by flipping the const once the freed job
-        // wall is confirmed on the runner.
+        // Re-enabled for the ranked lookahead schedule: after
+        // fold2_compact_and_round4 the first fused loop has half = 2^23, so
+        // the old half≥2^24 gate never fired on the tip path. Drop the gate
+        // to 2^23 and unpark so the loop products arm can cover that first
+        // multi-ms round. Historical half-size straggler (12.6→33.7 ms) was
+        // under a fixed share calibrated at 2^24; the arm remeasures on
+        // warmup and adapts. Kill: FLOCK_NO_GPU_ZC_LOOP=1 (launch returns None).
+        // T3 remains parked (lookahead replaces it). Isolate from AB‖C/g8/spins.
         #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-        const ZC_LOOP_INTEGRATION_PARKED: bool = true;
+        const ZC_LOOP_INTEGRATION_PARKED: bool = false;
         #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-        let gpu_job = if !ZC_LOOP_INTEGRATION_PARKED && half >= (1usize << 24) {
+        let gpu_job = if !ZC_LOOP_INTEGRATION_PARKED && half >= (1usize << 23) {
             crate::gpu_commit::launch_zc_loop_products(
                 a, b, r_fold, eq_lo, eq_hi, lo_size, hi_size,
             )
