@@ -854,6 +854,39 @@ pub(crate) fn gpu_mixed_final_enabled() -> bool {
 /// only when `gpu_wall * 1.10 <= cpu_wall`.
 const LATCH_MARGIN: f64 = 1.10;
 
+/// Exact-`1` control restoring the incumbent latch measurement, which charged
+/// the warmup's 64 MiB tree copy-out to `gpu_wall_ms`. That copy exists only to
+/// give the *untimed warmup* prove a CPU-side tree; every latched timed path
+/// returns `MerkleTreeBuf::Gpu` (a zero-copy view of the persistent Metal tree
+/// buffer), so the copy is work the gated path never performs. Margin,
+/// comparison and every guard are unchanged — this switch only re-contaminates
+/// the measured GPU quantity for same-binary diagnostics.
+pub const ENV_NO_LATCH_MEASURE_FIX: &str = "FLOCK_NO_LATCH_MEASURE_FIX";
+
+fn latch_measure_fix_value_enabled(value: Option<&std::ffi::OsStr>) -> bool {
+    value != Some(std::ffi::OsStr::new("1"))
+}
+
+fn latch_measure_fix_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        latch_measure_fix_value_enabled(std::env::var_os(ENV_NO_LATCH_MEASURE_FIX).as_deref())
+    })
+}
+
+#[cfg(test)]
+mod latch_measure_fix_gate_tests {
+    use std::ffi::OsStr;
+
+    #[test]
+    fn exact_one_is_the_only_latch_measure_kill_value() {
+        assert!(!super::latch_measure_fix_value_enabled(Some(OsStr::new("1"))));
+        for value in [None, Some(""), Some("0"), Some("01"), Some("true")] {
+            assert!(super::latch_measure_fix_value_enabled(value.map(OsStr::new)));
+        }
+    }
+}
+
 /// The exact ranked L0 geometry the GPU graph is built for (mirrors the CPU
 /// pipeline's `is_ranked_ntt_merkle_leaf_pipeline_shape`): `log_d = 20`,
 /// 64 interleaved lanes, rate-1/2 entry at layer 1, 1 KiB BLAKE3 leaves.
@@ -6546,9 +6579,20 @@ kernel void blake3_pow_scan(
     /// GPU half of the warmup dual-run: create the persistent state (twiddle
     /// upload, staging codeword home, tree buffer, read-only z wrap), run
     /// the full from-z graph once untimed (page-wires every buffer exactly
-    /// as the timed prove will find them), then run it again timed with the
-    /// tree copy-out included (the timed path pays that too). Never mutates
-    /// z or the caller's codeword.
+    /// as the timed prove will find them), then run it again timed. Never
+    /// mutates z or the caller's codeword.
+    ///
+    /// `gpu_wall_ms` times the graph ONLY (default). The 64 MiB tree copy-out
+    /// below is warmup-exclusive bookkeeping — it materializes a CPU-side tree
+    /// for the warmup prove's own commitment and for the bit-exactness
+    /// comparison — and the latched timed path never performs it: both
+    /// `finish_from_z_first_pass_or_fallback` and `run_latched` return
+    /// `MerkleTreeBuf::Gpu`, a zero-copy view of `tree_buf`. Charging it to
+    /// the latch's GPU quantity measures work the gated path does not do.
+    /// `run_commit_graph_from_z` ends in `commit_and_wait`, so closing the
+    /// timer on its return captures the whole GPU graph and nothing else.
+    /// Set `FLOCK_NO_LATCH_MEASURE_FIX=1` to restore the incumbent copy-out
+    /// contamination for same-binary A/B.
     fn warmup_gpu_run(
         z_packed: &[F128],
         log_d: usize,
@@ -6600,13 +6644,18 @@ kernel void blake3_pow_scan(
                 };
                 let t0 = std::time::Instant::now();
                 run_commit_graph_from_z(gpu, z_buf, staging, tw_buf, tree_buf, log_d, n_leaves)?;
+                let graph_ms = t0.elapsed().as_secs_f64() * 1e3;
                 copy_bytes_parallel(gpu.buffer_contents(tree_buf), {
                     core::slice::from_raw_parts_mut(
                         gpu_tree.as_mut_ptr().cast::<u8>(),
                         total_nodes * 32,
                     )
                 });
-                let gpu_wall_ms = t0.elapsed().as_secs_f64() * 1e3;
+                let gpu_wall_ms = if super::latch_measure_fix_enabled() {
+                    graph_ms
+                } else {
+                    t0.elapsed().as_secs_f64() * 1e3
+                };
                 created.clear(); // ownership transfers to Latched
                 Ok(WarmupRun {
                     latched: Latched {
