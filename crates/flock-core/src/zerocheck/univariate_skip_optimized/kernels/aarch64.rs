@@ -2472,6 +2472,30 @@ pub(crate) fn prepare_static_b_context_with_policy(
     }
 }
 
+/// Non-temporal 64-byte load (`ldnp` pair burst → L1 stack bounce), the read
+/// mirror of `store_nt_64`'s `ldp`/`stnp` idiom. The a/b code rows are read
+/// exactly once per prove while the streamed GPU commit saturates the same
+/// memory system; `ldnp`'s no-allocate hint keeps those once-read lines from
+/// evicting the inv-NTT tables this kernel gathers from. Plain copy — the 64
+/// bytes landing on the stack are identical to the source.
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn load_nt_64(src: *const u8, dst: *mut u8) {
+    unsafe {
+        core::arch::asm!(
+            "ldnp {t0:q}, {t1:q}, [{src}]",
+            "stp {t0:q}, {t1:q}, [{dst}]",
+            "ldnp {t0:q}, {t1:q}, [{src}, #32]",
+            "stp {t0:q}, {t1:q}, [{dst}, #32]",
+            src = in(reg) src,
+            dst = in(reg) dst,
+            t0 = out(vreg) _,
+            t1 = out(vreg) _,
+            options(nostack)
+        );
+    }
+}
+
 /// Checked static-structure dispatcher. Sniffs the 8 b-words (8 scalar loads
 /// vs 512 table loads) and routes to a fast path when the block matches the
 /// BLAKE3 static structure; generic otherwise. Output is bit-identical for
@@ -2479,6 +2503,12 @@ pub(crate) fn prepare_static_b_context_with_policy(
 ///
 /// `bstatic_w` is the BLAKE3 outer-window index (0 or 1) for the byte-level
 /// static-B path, or `usize::MAX` to disable it. Block-level sniffs run first.
+///
+/// Default flavor pulls this row block's 64 a-bytes and 64 b-bytes through
+/// one non-temporal pair-load bounce each ([`load_nt_64`]); every downstream
+/// kernel (sniffs included) then reads the L1-hot stack rows. Same bytes in
+/// the same `b_med`/K positions, so the output is bit-identical;
+/// `FLOCK_NT_LOADS=1` opts in; default is the incumbent direct loads.
 #[cfg(target_arch = "aarch64")]
 #[inline(always)]
 pub(crate) fn shift_reduce_inner_ab_fused_neon_checked(
@@ -2494,7 +2524,102 @@ pub(crate) fn shift_reduce_inner_ab_fused_neon_checked(
     bstatic_w: usize,
     static_b_context: Option<StaticBContext>,
 ) {
+    shift_reduce_inner_ab_fused_neon_checked_with_nt(
+        a_packed,
+        b_packed,
+        inv_table,
+        chunk_byte_base,
+        b_med,
+        out,
+        check_all_ones,
+        check_single_k0,
+        const_one_mask,
+        bstatic_w,
+        static_b_context,
+        super::super::nt_loads_enabled(),
+    )
+}
+
+/// Load-flavor-parameterized form of the checked dispatcher; the public entry
+/// passes the latched `FLOCK_NT_LOADS` choice, tests compare both arms
+/// byte-for-byte in one process.
+#[cfg(target_arch = "aarch64")]
+#[allow(clippy::too_many_arguments)]
+#[inline(always)]
+pub(crate) fn shift_reduce_inner_ab_fused_neon_checked_with_nt(
+    a_packed: &[u8],
+    b_packed: &[u8],
+    inv_table: &InvNttTableByteSingleGf8,
+    chunk_byte_base: usize,
+    b_med: usize,
+    out: &mut [u8; 64],
+    check_all_ones: bool,
+    check_single_k0: bool,
+    const_one_mask: u8,
+    bstatic_w: usize,
+    static_b_context: Option<StaticBContext>,
+    nt: bool,
+) {
     let byte_base_b = chunk_byte_base + b_med * N_CHUNKS * 8;
+    if nt {
+        let mut a_row = [0u8; 64];
+        let mut b_row = [0u8; 64];
+        // SAFETY: the caller's read contract already spans
+        // `[byte_base_b, byte_base_b + 64)` of both buffers (every kernel
+        // below reads exactly this window); the stack rows are 64 bytes.
+        unsafe {
+            load_nt_64(a_packed.as_ptr().add(byte_base_b), a_row.as_mut_ptr());
+            load_nt_64(b_packed.as_ptr().add(byte_base_b), b_row.as_mut_ptr());
+        }
+        return shift_reduce_inner_ab_fused_neon_checked_rows(
+            &a_row,
+            &b_row,
+            inv_table,
+            0,
+            b_med,
+            out,
+            check_all_ones,
+            check_single_k0,
+            const_one_mask,
+            bstatic_w,
+            static_b_context,
+        );
+    }
+    shift_reduce_inner_ab_fused_neon_checked_rows(
+        a_packed,
+        b_packed,
+        inv_table,
+        byte_base_b,
+        b_med,
+        out,
+        check_all_ones,
+        check_single_k0,
+        const_one_mask,
+        bstatic_w,
+        static_b_context,
+    )
+}
+
+/// Dispatcher body over an explicit `byte_base_b` (0 for the bounced stack
+/// rows). `b_med` is still needed for the static-B plan index — it selects
+/// WHICH masks/partials apply, while `byte_base_b` selects WHERE the row
+/// block's bytes live.
+#[cfg(target_arch = "aarch64")]
+#[allow(clippy::too_many_arguments)]
+#[inline(always)]
+fn shift_reduce_inner_ab_fused_neon_checked_rows(
+    a_packed: &[u8],
+    b_packed: &[u8],
+    inv_table: &InvNttTableByteSingleGf8,
+    byte_base_b: usize,
+    b_med: usize,
+    out: &mut [u8; 64],
+    check_all_ones: bool,
+    check_single_k0: bool,
+    const_one_mask: u8,
+    bstatic_w: usize,
+    static_b_context: Option<StaticBContext>,
+) {
     let bw = |k: usize| -> u64 {
         u64::from_le(unsafe {
             core::ptr::read_unaligned(b_packed.as_ptr().add(byte_base_b + k * 8).cast::<u64>())
@@ -2554,7 +2679,7 @@ pub(crate) fn shift_reduce_inner_ab_fused_neon_checked(
                     a_packed,
                     b_packed,
                     inv_table,
-                    chunk_byte_base,
+                    byte_base_b,
                     b_med,
                     bstatic_w,
                     context,
@@ -2565,7 +2690,7 @@ pub(crate) fn shift_reduce_inner_ab_fused_neon_checked(
                     a_packed,
                     b_packed,
                     inv_table,
-                    chunk_byte_base,
+                    byte_base_b,
                     b_med,
                     bstatic_w,
                     context,
@@ -2576,13 +2701,16 @@ pub(crate) fn shift_reduce_inner_ab_fused_neon_checked(
             return;
         }
     }
+    // `(byte_base_b, 0)` addresses the same 64-byte row block as the caller's
+    // `(chunk_byte_base, b_med)` — these kernels use `b_med` only for the
+    // byte offset.
     if fast_shift_reduce_enabled() {
         shift_reduce_inner_ab_fused_neon_h4(
             a_packed,
             b_packed,
             inv_table,
-            chunk_byte_base,
-            b_med,
+            byte_base_b,
+            0,
             out,
         );
     } else {
@@ -2590,8 +2718,8 @@ pub(crate) fn shift_reduce_inner_ab_fused_neon_checked(
             a_packed,
             b_packed,
             inv_table,
-            chunk_byte_base,
-            b_med,
+            byte_base_b,
+            0,
             out,
         );
     }

@@ -481,7 +481,11 @@ fn prove_fast_ligerito_from_witness_with_commit_codeword<Ch: Challenger>(
     let pcs_open = match stash_pool {
         Some(pool) => pool.in_place_scope(|s| {
             s.spawn(|_| {
-                crate::proof_io::stash_pre_encoded_prefix(&commitment, &zc_proof, &lc_proof)
+                crate::proof_io::stash_pre_encoded_prefix(&commitment, &zc_proof, &lc_proof);
+                // Publish-tail fd pre-create + F_PREALLOCATE, same off-tail
+                // window (kill switch FLOCK_NO_FD_PREALLOC=1; no-op outside
+                // the benchmark worker's argv shape).
+                crate::proof_io::preallocate_publish_tmp();
             });
             open_claims_with_precomputed_ligerito(
                 z_packed,
@@ -575,6 +579,32 @@ enum LincheckStripeInput {
 
 const DEFERRED_STRIPE_GROUPS_PER_JOB: usize = 64;
 
+/// Store one transposed 64-byte word block into its stripe slot. The stripe
+/// is not read until after commit+zerocheck, so use the same cache-bypassing
+/// store flavor as the eager SIMD witness path. `ldp/stnp` permit these
+/// 64-byte slices and the stack temporary without an extra alignment
+/// contract.
+#[inline(always)]
+fn stripe_store_transposed_64(transposed: &[u8; 64], dst: &mut [u8]) {
+    debug_assert_eq!(dst.len(), 64);
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        core::arch::asm!(
+            "ldp {t0:q}, {t1:q}, [{src}]",
+            "stnp {t0:q}, {t1:q}, [{dst}]",
+            "ldp {t0:q}, {t1:q}, [{src}, #32]",
+            "stnp {t0:q}, {t1:q}, [{dst}, #32]",
+            src = in(reg) transposed.as_ptr(),
+            dst = in(reg) dst.as_mut_ptr(),
+            t0 = out(vreg) _,
+            t1 = out(vreg) _,
+            options(nostack)
+        );
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    dst.copy_from_slice(transposed);
+}
+
 fn fill_deferred_lincheck_stripe_group(
     z_packed: &[F128],
     stripe: &mut [u8],
@@ -582,6 +612,7 @@ fn fill_deferred_lincheck_stripe_group(
     group_f128: usize,
     u64_per_block: usize,
     useful_words: usize,
+    nt_loads: bool,
 ) {
     let group_start = group * group_f128;
     let z_group = &z_packed[group_start..group_start + group_f128];
@@ -590,35 +621,133 @@ fn fill_deferred_lincheck_stripe_group(
     let z_u64: &[u64] =
         unsafe { std::slice::from_raw_parts(z_group.as_ptr().cast::<u64>(), z_group.len() * 2) };
     let mut transposed = [0u8; 64];
-    for word in 0..useful_words {
+    let mut word = 0usize;
+    // z is read exactly once here (241/256 of a 512 MiB buffer per prove)
+    // while the streamed GPU commit saturates the same memory system, so
+    // gather adjacent word pairs per lane through `ldnp` — the load mirror of
+    // the `stnp` drain below. Same u64 values in the same word order, so the
+    // stripe bytes are identical; `FLOCK_NT_LOADS=1` opts in; default is the plain
+    // gather for every word.
+    #[cfg(target_arch = "aarch64")]
+    if nt_loads {
+        while word + 2 <= useful_words {
+            let mut even = [0u64; 8];
+            let mut odd = [0u64; 8];
+            for lane in 0..8 {
+                // SAFETY: `lane * u64_per_block + word + 1` is in-bounds of
+                // `z_u64` (useful_words ≤ u64_per_block), and `ldnp` of two
+                // u64s from a u64-aligned address is the plain LE pair read.
+                unsafe {
+                    let src = z_u64.as_ptr().add(lane * u64_per_block + word);
+                    let (w0, w1): (u64, u64);
+                    core::arch::asm!(
+                        "ldnp {w0}, {w1}, [{src}]",
+                        src = in(reg) src,
+                        w0 = out(reg) w0,
+                        w1 = out(reg) w1,
+                        options(nostack, readonly, preserves_flags)
+                    );
+                    even[lane] = w0;
+                    odd[lane] = w1;
+                }
+            }
+            flock_core::bits::transpose_8_u64s_to_64_bytes(&even, &mut transposed);
+            stripe_store_transposed_64(&transposed, &mut stripe[word * 64..word * 64 + 64]);
+            let next = word + 1;
+            flock_core::bits::transpose_8_u64s_to_64_bytes(&odd, &mut transposed);
+            stripe_store_transposed_64(&transposed, &mut stripe[next * 64..next * 64 + 64]);
+            word += 2;
+        }
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    let _ = nt_loads;
+    while word < useful_words {
         let lanes: [u64; 8] = std::array::from_fn(|lane| z_u64[lane * u64_per_block + word]);
         flock_core::bits::transpose_8_u64s_to_64_bytes(&lanes, &mut transposed);
-        let dst = &mut stripe[word * 64..word * 64 + 64];
-        #[cfg(target_arch = "aarch64")]
-        unsafe {
-            // The stripe is not read until after commit+zerocheck, so use the
-            // same cache-bypassing store flavor as the eager SIMD witness
-            // path. `ldp/stnp` permit these 64-byte slices and the stack
-            // temporary without an extra alignment contract.
-            core::arch::asm!(
-                "ldp {t0:q}, {t1:q}, [{src}]",
-                "stnp {t0:q}, {t1:q}, [{dst}]",
-                "ldp {t0:q}, {t1:q}, [{src}, #32]",
-                "stnp {t0:q}, {t1:q}, [{dst}, #32]",
-                src = in(reg) transposed.as_ptr(),
-                dst = in(reg) dst.as_mut_ptr(),
-                t0 = out(vreg) _,
-                t1 = out(vreg) _,
-                options(nostack)
-            );
-        }
-        #[cfg(not(target_arch = "aarch64"))]
-        dst.copy_from_slice(&transposed);
+        stripe_store_transposed_64(&transposed, &mut stripe[word * 64..word * 64 + 64]);
+        word += 1;
     }
     // The ranked padded fold never observes the tail. Keeping the honest
     // full-stripe contract in tests catches accidental selector widening.
     #[cfg(test)]
     stripe[useful_words * 64..].fill(0);
+}
+
+/// Geometry + shared buffers for one deferred stripe fill. Job `i` owns the
+/// disjoint stripes of groups `[i * DEFERRED_STRIPE_GROUPS_PER_JOB, …)`, so
+/// any scheduler that runs every index in `0..n_jobs` exactly once — on any
+/// mix of pools — produces identical bytes.
+struct DeferredStripeJobs<'a> {
+    z_packed: &'a [F128],
+    stripe_base: flock_core::epool::SyncPtr<u8>,
+    n_jobs: usize,
+    n_groups: usize,
+    k: usize,
+    group_f128: usize,
+    u64_per_block: usize,
+    useful_words: usize,
+    nt_loads: bool,
+}
+
+impl<'a> DeferredStripeJobs<'a> {
+    fn new(
+        z_packed: &'a [F128],
+        z_lincheck: &mut [u8],
+        m: usize,
+        k_log: usize,
+        useful_bits: usize,
+    ) -> Self {
+        assert!(k_log >= 7, "packed block must contain whole F128 words");
+        assert!(
+            m >= k_log + 3,
+            "lincheck layout needs at least eight blocks"
+        );
+        let k = 1usize << k_log;
+        let n_total = 1usize << m;
+        assert!(useful_bits <= k);
+        let f128_per_block = k / 128;
+        assert_eq!(z_packed.len(), n_total / 128);
+        assert_eq!(z_lincheck.len(), n_total / 8);
+        let n_groups = z_lincheck.len() / k;
+        Self {
+            z_packed,
+            stripe_base: flock_core::epool::SyncPtr(z_lincheck.as_mut_ptr()),
+            n_jobs: n_groups.div_ceil(DEFERRED_STRIPE_GROUPS_PER_JOB),
+            n_groups,
+            k,
+            group_f128: 8 * f128_per_block,
+            u64_per_block: k / 64,
+            useful_words: useful_bits.div_ceil(64),
+            nt_loads: flock_core::zerocheck::univariate_skip_optimized::nt_loads_enabled(),
+        }
+    }
+
+    #[cfg(test)]
+    fn with_nt_loads(mut self, nt_loads: bool) -> Self {
+        self.nt_loads = nt_loads;
+        self
+    }
+
+    fn run(&self, job: usize) {
+        let group_start = job * DEFERRED_STRIPE_GROUPS_PER_JOB;
+        let group_end = (group_start + DEFERRED_STRIPE_GROUPS_PER_JOB).min(self.n_groups);
+        for group in group_start..group_end {
+            // SAFETY: every dispatched job owns a distinct contiguous set of
+            // groups, and each group maps to one disjoint k-byte stripe.
+            let stripe = unsafe {
+                std::slice::from_raw_parts_mut(self.stripe_base.ptr().add(group * self.k), self.k)
+            };
+            fill_deferred_lincheck_stripe_group(
+                self.z_packed,
+                stripe,
+                group,
+                self.group_f128,
+                self.u64_per_block,
+                self.useful_words,
+                self.nt_loads,
+            );
+        }
+    }
 }
 
 /// Materialize a BLAKE3-style lincheck stripe from immutable row-major packed
@@ -633,41 +762,26 @@ fn fill_deferred_lincheck_stripe_with_dispatch(
     useful_bits: usize,
     dispatch: impl FnOnce(usize, &(dyn Fn(usize) + Sync)) -> bool,
 ) -> bool {
-    assert!(k_log >= 7, "packed block must contain whole F128 words");
-    assert!(
-        m >= k_log + 3,
-        "lincheck layout needs at least eight blocks"
-    );
-    let k = 1usize << k_log;
-    let n_total = 1usize << m;
-    assert!(useful_bits <= k);
-    let f128_per_block = k / 128;
-    let u64_per_block = k / 64;
-    let group_f128 = 8 * f128_per_block;
-    let useful_words = useful_bits.div_ceil(64);
-    assert_eq!(z_packed.len(), n_total / 128);
-    assert_eq!(z_lincheck.len(), n_total / 8);
+    let jobs = DeferredStripeJobs::new(z_packed, z_lincheck, m, k_log, useful_bits);
+    dispatch(jobs.n_jobs, &|job| jobs.run(job))
+}
 
-    let n_groups = z_lincheck.len() / k;
-    let n_jobs = n_groups.div_ceil(DEFERRED_STRIPE_GROUPS_PER_JOB);
-    let stripe_base = flock_core::epool::SyncPtr(z_lincheck.as_mut_ptr());
-    dispatch(n_jobs, &|job| {
-        let group_start = job * DEFERRED_STRIPE_GROUPS_PER_JOB;
-        let group_end = (group_start + DEFERRED_STRIPE_GROUPS_PER_JOB).min(n_groups);
-        for group in group_start..group_end {
-            // SAFETY: every dispatched job owns a distinct contiguous set of
-            // groups, and each group maps to one disjoint k-byte stripe.
-            let stripe =
-                unsafe { std::slice::from_raw_parts_mut(stripe_base.ptr().add(group * k), k) };
-            fill_deferred_lincheck_stripe_group(
-                z_packed,
-                stripe,
-                group,
-                group_f128,
-                u64_per_block,
-                useful_words,
-            );
-        }
+/// Strict kill switch for the main-pool tail drain of the deferred stripe
+/// queue: only exact value `1` restores the incumbent shape (the joining
+/// thread yield-spins ≤ 2 ms, then blocks, while up to the whole stripe tail
+/// drains on the E-workers). Default: after BOTH `rayon::join` arms of
+/// commit+AB retire, the otherwise-idle P-workers claim the remaining stripe
+/// jobs from the same atomic index queue the E-workers drain — disjoint
+/// indices, same output slots, so the stripe bytes are identical; only WHO
+/// fills a late job changes. This is not the closed "E-cores in the join
+/// window" direction: E-side tuning is untouched, P drains the E queue tail.
+pub const ENV_NO_STRIPE_TAIL_DRAIN: &str = "FLOCK_NO_STRIPE_TAIL_DRAIN";
+
+fn stripe_tail_drain_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var_os(ENV_NO_STRIPE_TAIL_DRAIN).as_deref()
+            != Some(std::ffi::OsStr::new("1"))
     })
 }
 
@@ -734,6 +848,95 @@ mod deferred_stripe_tests {
             ),
         ));
         assert_eq!(helper_actual, expected);
+    }
+
+    fn test_z(m: usize) -> Vec<F128> {
+        (0..1usize << (m - 7))
+            .map(|i| {
+                let x = (i as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+                F128::new(x ^ x.rotate_left(17), (!x).rotate_right(11))
+            })
+            .collect()
+    }
+
+    /// M4 stripe flavor: the `ldnp` pair gather and the plain gather must
+    /// produce identical stripes, including an odd `useful_words` count
+    /// (the ranked shape's 241) that exercises the unpaired tail word.
+    #[test]
+    fn nt_load_gather_matches_plain_gather() {
+        const M: usize = 20;
+        const K_LOG: usize = 8;
+        let z = test_z(M);
+        // Full stripe (4 words/group) and an odd 3-word prefix (192 bits).
+        for useful_bits in [1usize << K_LOG, 192] {
+            let mut nt = vec![0xa5u8; 1 << (M - 3)];
+            let mut plain = vec![0x5au8; 1 << (M - 3)];
+            for (buf, flavor) in [(&mut nt, true), (&mut plain, false)] {
+                let jobs =
+                    DeferredStripeJobs::new(&z, buf, M, K_LOG, useful_bits).with_nt_loads(flavor);
+                for job in 0..jobs.n_jobs {
+                    jobs.run(job);
+                }
+            }
+            assert_eq!(nt, plain, "NT gather drifted at useful_bits={useful_bits}");
+        }
+    }
+
+    /// M1 gate: stripe output identity under main-pool tail drain with a
+    /// forced tail overrun. The queue is drained by a deliberately slow
+    /// single-thread "E" helper (3 ms per job) racing the calling pool, so
+    /// the pool provably claims a nonzero tail; poison-filled buffers catch
+    /// any slab left unwritten, and the canonical packer is the byte oracle.
+    #[test]
+    fn tail_drain_fill_is_bit_exact_under_forced_overrun() {
+        const M: usize = 20;
+        const K_LOG: usize = 8;
+        let z = test_z(M);
+        let expected = pack_z_lincheck_from_packed(&z, M, K_LOG);
+        let mut actual = vec![0xa5u8; expected.len()];
+        let jobs = DeferredStripeJobs::new(&z, &mut actual, M, K_LOG, 1 << K_LOG);
+        let helper = rayon::ThreadPoolBuilder::new()
+            .num_threads(1)
+            .build()
+            .unwrap();
+        let queue = std::sync::atomic::AtomicUsize::new(0);
+        let (tail_jobs, engaged) = std::thread::scope(|scope| {
+            let stripe_job = scope.spawn(|| {
+                flock_core::epool::drain_shared_chunks_with_helper_only(
+                    &queue,
+                    jobs.n_jobs,
+                    1,
+                    &|i| {
+                        std::thread::sleep(std::time::Duration::from_millis(3));
+                        jobs.run(i);
+                    },
+                    Some(&helper),
+                )
+            });
+            let mut tail_jobs = 0usize;
+            if !stripe_job.is_finished() {
+                tail_jobs = flock_core::epool::drain_shared_chunks_on_current_pool(
+                    &queue,
+                    jobs.n_jobs,
+                    &|i| jobs.run(i),
+                );
+            }
+            let engaged = stripe_job.join().expect("stripe worker panicked");
+            if !engaged {
+                tail_jobs += flock_core::epool::drain_shared_chunks_on_current_pool(
+                    &queue,
+                    jobs.n_jobs,
+                    &|i| jobs.run(i),
+                );
+            }
+            (tail_jobs, engaged)
+        });
+        assert!(engaged, "explicit helper pool must engage");
+        assert!(
+            tail_jobs > 0,
+            "forced overrun must leave tail jobs for the main pool"
+        );
+        assert_eq!(actual, expected, "tail-drained stripe drifted");
     }
 }
 
@@ -953,74 +1156,150 @@ fn prove_fast_core_with_commit_codeword<Ch: Challenger>(
                 .and_then(|value| value.to_str()?.parse::<usize>().ok())
                 .filter(|workers| (1..=4).contains(workers))
                 .unwrap_or(3);
-            let pre = std::thread::scope(|scope| {
-                let stripe_job = scope.spawn(|| {
-                    let started = std::time::Instant::now();
-                    let filled_on_epool = fill_deferred_lincheck_stripe_with_dispatch(
-                        &z_packed,
-                        &mut stripe,
-                        m,
-                        k_log,
-                        useful_bits,
-                        |n_jobs, job| {
-                            flock_core::epool::run_helper_only_chunks(n_jobs, epool_workers, job)
-                        },
-                    );
-                    if !filled_on_epool {
-                        fill_deferred_lincheck_stripe(
+            let pre = if stripe_tail_drain_enabled()
+                && flock_core::epool::helper_pool_available()
+            {
+                // Main-pool tail drain: the E-workers and (once commit+AB
+                // retire) the P-workers claim jobs from ONE shared index
+                // queue. Every index runs exactly once and writes only its
+                // own stripe slabs, so the bytes match the incumbent
+                // schedule; a stripe tail that overruns the join no longer
+                // serializes on 3 E-cores.
+                let jobs = DeferredStripeJobs::new(&z_packed, &mut stripe, m, k_log, useful_bits);
+                let queue = std::sync::atomic::AtomicUsize::new(0);
+                std::thread::scope(|scope| {
+                    let stripe_job = scope.spawn(|| {
+                        let started = std::time::Instant::now();
+                        let engaged = flock_core::epool::drain_shared_chunks_helper_only(
+                            &queue,
+                            jobs.n_jobs,
+                            epool_workers,
+                            &|i| jobs.run(i),
+                        );
+                        if phase_timing {
+                            eprintln!(
+                                "[phase-timing] deferred lincheck stripe: {:.2} ms mode={} workers={}",
+                                started.elapsed().as_secs_f64() * 1e3,
+                                if engaged { "epool+tail" } else { "tail-only" },
+                                if engaged { epool_workers } else { 0 },
+                            );
+                        }
+                        engaged
+                    });
+                    let pre = run_commit();
+                    let join_started = std::time::Instant::now();
+                    // Both join arms have retired. If the stripe still has
+                    // queued jobs, claim them here on the main pool instead
+                    // of yield-spinning; when the E-drain already finished
+                    // this is a plain (cheap) scoped join.
+                    let mut tail_jobs = 0usize;
+                    if !stripe_job.is_finished() {
+                        tail_jobs = flock_core::epool::drain_shared_chunks_on_current_pool(
+                            &queue,
+                            jobs.n_jobs,
+                            &|i| jobs.run(i),
+                        );
+                    }
+                    let engaged = stripe_job
+                        .join()
+                        .expect("deferred ranked lincheck stripe worker panicked");
+                    if !engaged {
+                        // Helper refused the broadcast (cannot happen behind
+                        // the availability gate; defensive): the queue is
+                        // untouched, so claim everything on the main pool —
+                        // same jobs, same slots, same bytes.
+                        tail_jobs += flock_core::epool::drain_shared_chunks_on_current_pool(
+                            &queue,
+                            jobs.n_jobs,
+                            &|i| jobs.run(i),
+                        );
+                    }
+                    if phase_timing {
+                        eprintln!(
+                            "[phase-timing] deferred lincheck stripe join tail: {:.2} ms tail_jobs={} of {}",
+                            join_started.elapsed().as_secs_f64() * 1e3,
+                            tail_jobs,
+                            jobs.n_jobs,
+                        );
+                    }
+                    pre
+                })
+            } else {
+                std::thread::scope(|scope| {
+                    let stripe_job = scope.spawn(|| {
+                        let started = std::time::Instant::now();
+                        let filled_on_epool = fill_deferred_lincheck_stripe_with_dispatch(
                             &z_packed,
                             &mut stripe,
                             m,
                             k_log,
                             useful_bits,
+                            |n_jobs, job| {
+                                flock_core::epool::run_helper_only_chunks(
+                                    n_jobs,
+                                    epool_workers,
+                                    job,
+                                )
+                            },
                         );
+                        if !filled_on_epool {
+                            fill_deferred_lincheck_stripe(
+                                &z_packed,
+                                &mut stripe,
+                                m,
+                                k_log,
+                                useful_bits,
+                            );
+                        }
+                        if phase_timing {
+                            eprintln!(
+                                "[phase-timing] deferred lincheck stripe: {:.2} ms mode={} workers={}",
+                                started.elapsed().as_secs_f64() * 1e3,
+                                if filled_on_epool {
+                                    "epool"
+                                } else {
+                                    "sequential"
+                                },
+                                if filled_on_epool { epool_workers } else { 0 },
+                            );
+                        }
+                    });
+                    let pre = run_commit();
+                    let join_started = std::time::Instant::now();
+                    // Spin-family completion, prover side: this is the last timed
+                    // production join in the prove path (the gpu_commit.rs joins
+                    // already poll command-buffer status). The deferred fill is
+                    // scheduled to finish before commit+AB at the target shape,
+                    // so the worker is usually ALREADY complete when this join
+                    // runs — yet a blocking scoped-thread join still pays the
+                    // park + completion-wake tail whenever the worker races the
+                    // join call. Poll `is_finished` first (zero cost when done),
+                    // then yield for a bounded budget (yield, not spin: the
+                    // worker is a sibling CPU thread and must keep its core —
+                    // same rationale as the warmup AB-wait), then degrade to the
+                    // exact incumbent blocking join. Byte-identical either way:
+                    // the join consumes the same completed thread.
+                    if !stripe_job.is_finished() {
+                        let spin_deadline =
+                            std::time::Instant::now() + std::time::Duration::from_millis(2);
+                        while !stripe_job.is_finished()
+                            && std::time::Instant::now() < spin_deadline
+                        {
+                            std::thread::yield_now();
+                        }
                     }
+                    stripe_job
+                        .join()
+                        .expect("deferred ranked lincheck stripe worker panicked");
                     if phase_timing {
                         eprintln!(
-                            "[phase-timing] deferred lincheck stripe: {:.2} ms mode={} workers={}",
-                            started.elapsed().as_secs_f64() * 1e3,
-                            if filled_on_epool {
-                                "epool"
-                            } else {
-                                "sequential"
-                            },
-                            if filled_on_epool { epool_workers } else { 0 },
+                            "[phase-timing] deferred lincheck stripe join tail: {:.2} ms",
+                            join_started.elapsed().as_secs_f64() * 1e3
                         );
                     }
-                });
-                let pre = run_commit();
-                let join_started = std::time::Instant::now();
-                // Spin-family completion, prover side: this is the last timed
-                // production join in the prove path (the gpu_commit.rs joins
-                // already poll command-buffer status). The deferred fill is
-                // scheduled to finish before commit+AB at the target shape,
-                // so the worker is usually ALREADY complete when this join
-                // runs — yet a blocking scoped-thread join still pays the
-                // park + completion-wake tail whenever the worker races the
-                // join call. Poll `is_finished` first (zero cost when done),
-                // then yield for a bounded budget (yield, not spin: the
-                // worker is a sibling CPU thread and must keep its core —
-                // same rationale as the warmup AB-wait), then degrade to the
-                // exact incumbent blocking join. Byte-identical either way:
-                // the join consumes the same completed thread.
-                if !stripe_job.is_finished() {
-                    let spin_deadline =
-                        std::time::Instant::now() + std::time::Duration::from_millis(2);
-                    while !stripe_job.is_finished() && std::time::Instant::now() < spin_deadline {
-                        std::thread::yield_now();
-                    }
-                }
-                stripe_job
-                    .join()
-                    .expect("deferred ranked lincheck stripe worker panicked");
-                if phase_timing {
-                    eprintln!(
-                        "[phase-timing] deferred lincheck stripe join tail: {:.2} ms",
-                        join_started.elapsed().as_secs_f64() * 1e3
-                    );
-                }
-                pre
-            });
+                    pre
+                })
+            };
             (pre, stripe)
         }
     };
