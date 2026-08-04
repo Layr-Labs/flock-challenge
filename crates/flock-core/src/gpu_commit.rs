@@ -576,6 +576,10 @@ pub const ENV_NO_GPU_PARENT3: &str = "FLOCK_NO_GPU_PARENT3";
 /// `leaf_hash` + `parent_hash3` when the supplemental PSO is NIL.
 pub const ENV_NO_GPU_LEAF_PARENT3: &str = "FLOCK_NO_GPU_LEAF_PARENT3";
 
+/// Strict kill switch for the four-level parent fuse on the upper Merkle
+/// ladder (after leaf_parent3). Only exact value `1` disables it.
+pub const ENV_NO_GPU_PARENT4: &str = "FLOCK_NO_GPU_PARENT4";
+
 fn gpu_parent3_value_enabled(value: Option<&std::ffi::OsStr>) -> bool {
     value != Some(std::ffi::OsStr::new("1"))
 }
@@ -608,6 +612,22 @@ fn select_gpu_leaf_parent3(pso_ok: bool) -> bool {
     // `parent3=true` when `select_gpu_parent3` passes (n_leaves == 2^20).
     // Tests force parent3 on smaller trees so the fuse is oracle-covered.
     pso_ok && gpu_leaf_parent3_enabled()
+}
+
+fn gpu_parent4_value_enabled(value: Option<&std::ffi::OsStr>) -> bool {
+    value != Some(std::ffi::OsStr::new("1"))
+}
+
+fn gpu_parent4_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        gpu_parent3_enabled()
+            && gpu_parent4_value_enabled(std::env::var_os(ENV_NO_GPU_PARENT4).as_deref())
+    })
+}
+
+fn select_gpu_parent4(pso_ok: bool) -> bool {
+    pso_ok && gpu_parent4_enabled()
 }
 
 #[cfg(test)]
@@ -2151,6 +2171,125 @@ kernel void leaf_parent3(device const uint* codeword [[buffer(0)]],
 }
 "#;
 
+    /// Four-level parent fuse for the upper Merkle ladder after leaf_parent3.
+    /// 256 threads own 512 children; emits four parent levels without three
+    /// intermediate global rereads. TG: 256+128+64 × 32 B = 14 KiB.
+    const PARENT4_MSL_SOURCE: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+constant uint B3_IV[8] = {
+    0x6A09E667u, 0xBB67AE85u, 0x3C6EF372u, 0xA54FF53Au,
+    0x510E527Fu, 0x9B05688Cu, 0x1F83D9ABu, 0x5BE0CD19u
+};
+constant uint B3_PERM[16] = {
+    2u,6u,3u,10u,7u,0u,4u,13u,1u,11u,12u,5u,9u,14u,15u,8u
+};
+#define B3_PARENT 4u
+
+static void b3_compress(thread uint* cv, thread const uint* m_in,
+                        uint block_len, uint flags) {
+    uint v[16];
+    uint m[16];
+    for (int i = 0; i < 8; i++) v[i] = cv[i];
+    for (int i = 0; i < 4; i++) v[8 + i] = B3_IV[i];
+    v[12] = 0u; v[13] = 0u; v[14] = block_len; v[15] = flags;
+    for (int i = 0; i < 16; i++) m[i] = m_in[i];
+    for (int r = 0; r < 7; r++) {
+        #define G(a,b,c,d,x,y) \
+            v[a] = v[a] + v[b] + x; v[d] = ((v[d]^v[a])>>16)|((v[d]^v[a])<<16); \
+            v[c] = v[c] + v[d];     v[b] = ((v[b]^v[c])>>12)|((v[b]^v[c])<<20); \
+            v[a] = v[a] + v[b] + y; v[d] = ((v[d]^v[a])>>8) |((v[d]^v[a])<<24); \
+            v[c] = v[c] + v[d];     v[b] = ((v[b]^v[c])>>7) |((v[b]^v[c])<<25);
+        G(0,4,8,12,  m[0], m[1]);  G(1,5,9,13,  m[2], m[3]);
+        G(2,6,10,14, m[4], m[5]);  G(3,7,11,15, m[6], m[7]);
+        G(0,5,10,15, m[8], m[9]);  G(1,6,11,12, m[10],m[11]);
+        G(2,7,8,13,  m[12],m[13]); G(3,4,9,14,  m[14],m[15]);
+        #undef G
+        if (r < 6) {
+            uint t[16];
+            for (int i = 0; i < 16; i++) t[i] = m[B3_PERM[i]];
+            for (int i = 0; i < 16; i++) m[i] = t[i];
+        }
+    }
+    for (int i = 0; i < 8; i++) cv[i] = v[i] ^ v[8 + i];
+}
+
+kernel void parent_hash4(device const uint* children [[buffer(0)]],
+                         device uint* parents1       [[buffer(1)]],
+                         device uint* parents2       [[buffer(2)]],
+                         device uint* parents3       [[buffer(3)]],
+                         device uint* parents4       [[buffer(4)]],
+                         uint tgid [[threadgroup_position_in_grid]],
+                         uint lid  [[thread_index_in_threadgroup]])
+{
+    threadgroup uint level1[256u * 8u];
+    threadgroup uint level2[128u * 8u];
+    threadgroup uint level3[64u * 8u];
+
+    {
+        const uint id = tgid * 256u + lid;
+        uint block[16];
+        for (uint i = 0u; i < 16u; i++) block[i] = children[id * 16u + i];
+        uint cv[8];
+        for (uint i = 0u; i < 8u; i++) cv[i] = B3_IV[i];
+        b3_compress(cv, block, 64u, B3_PARENT);
+        for (uint i = 0u; i < 8u; i++) {
+            parents1[id * 8u + i] = cv[i];
+            level1[lid * 8u + i] = cv[i];
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (lid < 128u) {
+        uint block[16];
+        for (uint i = 0u; i < 8u; i++) {
+            block[i] = level1[(2u * lid) * 8u + i];
+            block[8u + i] = level1[(2u * lid + 1u) * 8u + i];
+        }
+        uint cv[8];
+        for (uint i = 0u; i < 8u; i++) cv[i] = B3_IV[i];
+        b3_compress(cv, block, 64u, B3_PARENT);
+        const uint id = tgid * 128u + lid;
+        for (uint i = 0u; i < 8u; i++) {
+            parents2[id * 8u + i] = cv[i];
+            level2[lid * 8u + i] = cv[i];
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (lid < 64u) {
+        uint block[16];
+        for (uint i = 0u; i < 8u; i++) {
+            block[i] = level2[(2u * lid) * 8u + i];
+            block[8u + i] = level2[(2u * lid + 1u) * 8u + i];
+        }
+        uint cv[8];
+        for (uint i = 0u; i < 8u; i++) cv[i] = B3_IV[i];
+        b3_compress(cv, block, 64u, B3_PARENT);
+        const uint id = tgid * 64u + lid;
+        for (uint i = 0u; i < 8u; i++) {
+            parents3[id * 8u + i] = cv[i];
+            level3[lid * 8u + i] = cv[i];
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (lid < 32u) {
+        uint block[16];
+        for (uint i = 0u; i < 8u; i++) {
+            block[i] = level3[(2u * lid) * 8u + i];
+            block[8u + i] = level3[(2u * lid + 1u) * 8u + i];
+        }
+        uint cv[8];
+        for (uint i = 0u; i < 8u; i++) cv[i] = B3_IV[i];
+        b3_compress(cv, block, 64u, B3_PARENT);
+        const uint id = tgid * 32u + lid;
+        for (uint i = 0u; i < 8u; i++) parents4[id * 8u + i] = cv[i];
+    }
+}
+"#;
+
     /// Source-only ranked from-z specialization. This deliberately does not
     /// reuse the rejected device-table preload design: every group constructs
     /// its own compact 11-table image directly from the existing raw twiddle
@@ -2556,6 +2695,8 @@ kernel void blake3_pow_scan(
         /// kill switch / non-ranked gate keeps it off — encode falls back to
         /// the exact leaf_hash + parent_hash3 sequence.
         pub(crate) pso_leaf_parent3: Id,
+        /// Supplemental four-level parent fuse for the upper ladder.
+        pub(crate) pso_parent4: Id,
         /// Supplemental PCS Fiat--Shamir BLAKE3 nonce scanner.  Its single
         /// shared result word is protected because `Gpu` itself is global.
         pub(crate) pso_pow: Id,
@@ -2818,6 +2959,61 @@ kernel void blake3_pow_scan(
                     NIL
                 };
 
+                let pso_parent4 = if super::gpu_parent4_enabled() {
+                    (|| -> Result<Id, String> {
+                        let src = api.nsstring(PARENT4_MSL_SOURCE)?;
+                        let mut err: Id = NIL;
+                        let library: Id = send!(
+                            api,
+                            unsafe extern "C" fn(Id, Sel, Id, Id, *mut Id) -> Id,
+                            device,
+                            c"newLibraryWithSource:options:error:",
+                            src,
+                            NIL,
+                            &mut err
+                        );
+                        if library.is_null() {
+                            return Err(format!(
+                                "parent4 shader compile failed: {}",
+                                api.error_string(err)
+                            ));
+                        }
+                        let ns = api.nsstring("parent_hash4")?;
+                        let function: Id = send!(
+                            api,
+                            unsafe extern "C" fn(Id, Sel, Id) -> Id,
+                            library,
+                            c"newFunctionWithName:",
+                            ns
+                        );
+                        if function.is_null() {
+                            send!(api, unsafe extern "C" fn(Id, Sel) -> Id, library, c"release");
+                            return Err("parent_hash4 kernel not found".into());
+                        }
+                        let mut pso_err: Id = NIL;
+                        let pso: Id = send!(
+                            api,
+                            unsafe extern "C" fn(Id, Sel, Id, *mut Id) -> Id,
+                            device,
+                            c"newComputePipelineStateWithFunction:error:",
+                            function,
+                            &mut pso_err
+                        );
+                        send!(api, unsafe extern "C" fn(Id, Sel) -> Id, function, c"release");
+                        send!(api, unsafe extern "C" fn(Id, Sel) -> Id, library, c"release");
+                        if pso.is_null() {
+                            return Err(format!(
+                                "parent4 pipeline: {}",
+                                api.error_string(pso_err)
+                            ));
+                        }
+                        Ok(pso)
+                    })()
+                    .unwrap_or(NIL)
+                } else {
+                    NIL
+                };
+
                 let (pso_pow, pow_out) = if super::gpu_grind_enabled() {
                     // This optimization is supplemental: a compile/pipeline/
                     // allocation failure must not poison the already-valid
@@ -2906,6 +3102,7 @@ kernel void blake3_pow_scan(
                     pso_parent,
                     pso_parent3,
                     pso_leaf_parent3,
+                    pso_parent4,
                     pso_pow,
                     pow_out,
                     pow_lock: std::sync::Mutex::new(()),
@@ -3601,26 +3798,51 @@ kernel void blake3_pow_scan(
                 gpu.dispatch(enc, subtree_leaves as u64 / tpg, tpg);
             }
 
-            // Consume three parent levels per dispatch while all three local
-            // ranges contain whole 256-child groups. Each output retains its
-            // ordinary global flat-tree slot, so opening is unchanged.
+            // Prefer four-level parent fuse when local_len >= 512, else three.
+            let use_parent4 =
+                parent3 && super::select_gpu_parent4(!gpu.pso_parent4.is_null());
+            if use_parent4 {
+                gpu.set_pipeline(enc, gpu.pso_parent4);
+                while local_len >= 512 {
+                    let l1s = level_start + level_len;
+                    let l1n = level_len / 2;
+                    let loc1 = local_start / 2;
+                    let l2s = l1s + l1n;
+                    let l2n = l1n / 2;
+                    let loc2 = loc1 / 2;
+                    let l3s = l2s + l2n;
+                    let l3n = l2n / 2;
+                    let loc3 = loc2 / 2;
+                    let l4s = l3s + l3n;
+                    let l4n = l3n / 2;
+                    let loc4 = loc3 / 2;
+                    debug_assert_eq!(local_len % 512, 0);
+                    gpu.set_buffer(enc, tree_buf, (level_start + local_start) * 32, 0);
+                    gpu.set_buffer(enc, tree_buf, (l1s + loc1) * 32, 1);
+                    gpu.set_buffer(enc, tree_buf, (l2s + loc2) * 32, 2);
+                    gpu.set_buffer(enc, tree_buf, (l3s + loc3) * 32, 3);
+                    gpu.set_buffer(enc, tree_buf, (l4s + loc4) * 32, 4);
+                    gpu.dispatch(enc, (local_len / 512) as u64, 256);
+                    level_start = l4s;
+                    level_len = l4n;
+                    local_start = loc4;
+                    local_len = local_len / 16;
+                }
+            }
             if parent3 {
                 gpu.set_pipeline(enc, gpu.pso_parent3);
                 while local_len >= 256 {
                     let level1_start = level_start + level_len;
                     let level1_len = level_len / 2;
                     let local1_start = local_start / 2;
-                    let local1_len = local_len / 2;
                     let level2_start = level1_start + level1_len;
                     let level2_len = level1_len / 2;
                     let local2_start = local1_start / 2;
-                    let local2_len = local1_len / 2;
                     let level3_start = level2_start + level2_len;
                     let level3_len = level2_len / 2;
                     let local3_start = local2_start / 2;
-                    let local3_len = local2_len / 2;
+                    let local3_len = local_len / 8;
                     debug_assert_eq!(local_len % 256, 0);
-                    let _ = (local1_len, local2_len); // documentation
                     gpu.set_buffer(enc, tree_buf, (level_start + local_start) * 32, 0);
                     gpu.set_buffer(enc, tree_buf, (level1_start + local1_start) * 32, 1);
                     gpu.set_buffer(enc, tree_buf, (level2_start + local2_start) * 32, 2);
@@ -3715,6 +3937,30 @@ kernel void blake3_pow_scan(
                 gpu.dispatch(enc, n_leaves as u64 / tpg, tpg);
             }
 
+            let use_parent4 =
+                parent3 && super::select_gpu_parent4(!gpu.pso_parent4.is_null());
+            if use_parent4 {
+                gpu.set_pipeline(enc, gpu.pso_parent4);
+                while read_len >= 512 {
+                    let w1 = read_start + read_len;
+                    let w1n = read_len / 2;
+                    let w2 = w1 + w1n;
+                    let w2n = w1n / 2;
+                    let w3 = w2 + w2n;
+                    let w3n = w2n / 2;
+                    let w4 = w3 + w3n;
+                    let w4n = w3n / 2;
+                    debug_assert_eq!(read_len % 512, 0);
+                    gpu.set_buffer(enc, tree_buf, read_start * 32, 0);
+                    gpu.set_buffer(enc, tree_buf, w1 * 32, 1);
+                    gpu.set_buffer(enc, tree_buf, w2 * 32, 2);
+                    gpu.set_buffer(enc, tree_buf, w3 * 32, 3);
+                    gpu.set_buffer(enc, tree_buf, w4 * 32, 4);
+                    gpu.dispatch(enc, (read_len / 512) as u64, 256);
+                    read_start = w4;
+                    read_len = w4n;
+                }
+            }
             if parent3 {
                 gpu.set_pipeline(enc, gpu.pso_parent3);
                 while read_len >= 256 {
