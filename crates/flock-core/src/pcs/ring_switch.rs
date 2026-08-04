@@ -57,7 +57,7 @@
 //! The packed witness has `2^(m−7)` F_{2^128} elements indexed by the suffix.
 //! `s_hat_v` has 128 entries indexed by the 7-bit prefix.
 
-use crate::bits::{transpose_8_u64s_to_64_bytes, transpose_8x8_bits};
+use crate::bits::transpose_8x8_bits;
 use crate::challenger::Challenger;
 use crate::field::F128;
 use crate::zerocheck::PaddingSpec;
@@ -1371,67 +1371,7 @@ pub fn s_hat_v_quad_from_z_vec(
         )
 }
 
-/// Sixteen-bank sufficient statistic for the experimental direct-fold4 PCS
-/// opening. The four least-significant packed-polynomial index variables are
-/// retained instead of being folded at `x_inner_rest_tail[..4]`.
-///
-/// Banks are stored contiguously in little-endian coordinate order:
-/// `bank = e_small + 4 * q`, followed by the 128 packed-prefix entries. This
-/// is also the intake layout used by the retained-coordinate C producer.
-pub fn s_hat_v_fold4_from_z_vec(
-    z_vec: &[F128],
-    x_inner_rest_tail: &[F128],
-) -> Vec<F128> {
-    use rayon::prelude::*;
-
-    assert!(
-        x_inner_rest_tail.len() >= 4,
-        "fold4 s_hat_v requires four retained packed-index coordinates"
-    );
-    let n_packed = 1usize << LOG_PACKING;
-    let n_tail = 1usize << x_inner_rest_tail.len();
-    assert_eq!(
-        z_vec.len(),
-        n_packed * n_tail,
-        "z_vec length {} mismatches 2^(LOG_PACKING + tail.len()) = {}",
-        z_vec.len(),
-        n_packed * n_tail,
-    );
-
-    let eq_tail = build_eq_parallel(&x_inner_rest_tail[4..]);
-    eq_tail
-        .par_iter()
-        .enumerate()
-        .fold(
-            || vec![F128::ZERO; 16 * n_packed],
-            |mut acc, (k, &weight)| {
-                let base = 16 * k * n_packed;
-                for bank in 0..16 {
-                    let block =
-                        &z_vec[base + bank * n_packed..base + (bank + 1) * n_packed];
-                    for packed in 0..n_packed {
-                        acc[bank * n_packed + packed] += weight * block[packed];
-                    }
-                }
-                acc
-            },
-        )
-        .reduce(
-            || vec![F128::ZERO; 16 * n_packed],
-            |mut a, b| {
-                for (out, value) in a.iter_mut().zip(b) {
-                    *out += value;
-                }
-                a
-            },
-        )
-}
-
-/// Collapse a four-bank sufficient statistic back to the canonical length-128
-/// `s_hat_v` by re-applying `eq(low_point, ·)` over the two retained
-/// coordinates. `pub(crate)` so the zerocheck capture can assert Requirement
-/// C-QUAD against the exact function that runs on intake.
-pub(crate) fn collapse_s_hat_v_quad(s_hat_v_quad: &[F128], low_point: &[F128]) -> Vec<F128> {
+fn collapse_s_hat_v_quad(s_hat_v_quad: &[F128], low_point: &[F128]) -> Vec<F128> {
     debug_assert_eq!(s_hat_v_quad.len(), 4 * (1usize << LOG_PACKING));
     debug_assert_eq!(low_point.len(), 2);
     let low_eq = build_eq(low_point);
@@ -1440,104 +1380,6 @@ pub(crate) fn collapse_s_hat_v_quad(s_hat_v_quad: &[F128], low_point: &[F128]) -
     for q in 0..4 {
         for b in 0..n_packed {
             out[b] += low_eq[q] * s_hat_v_quad[q * n_packed + b];
-        }
-    }
-    out
-}
-
-/// Collapse the sixteen-bank direct-fold4 intake under the first four suffix
-/// coordinates, recovering the canonical transcript-visible 128-vector.
-pub(crate) fn collapse_s_hat_v_fold4(
-    s_hat_v_fold4: &[F128],
-    low_point: &[F128],
-) -> Vec<F128> {
-    debug_assert_eq!(s_hat_v_fold4.len(), 16 * (1usize << LOG_PACKING));
-    debug_assert_eq!(low_point.len(), 4);
-    let n_packed = 1usize << LOG_PACKING;
-    let low_eq = build_eq(low_point);
-    let mut out = vec![F128::ZERO; n_packed];
-    for bank in 0..16 {
-        for packed in 0..n_packed {
-            out[packed] += low_eq[bank] * s_hat_v_fold4[bank * n_packed + packed];
-        }
-    }
-    out
-}
-
-/// Sixty-four-bank sufficient statistic for the direct-fold8 PCS opening. The
-/// six least-significant packed-polynomial index variables are retained
-/// instead of being folded at `x_inner_rest_tail[..6]`.
-///
-/// Banks are stored contiguously in little-endian coordinate order:
-/// `bank = e_small + 4 * q_med + 16 * q_high`, followed by the 128
-/// packed-prefix entries. Same intake layout as the fold4 statistic, one
-/// level wider; every `z_vec` element is touched exactly once.
-pub fn s_hat_v_fold8_from_z_vec(
-    z_vec: &[F128],
-    x_inner_rest_tail: &[F128],
-) -> Vec<F128> {
-    use rayon::prelude::*;
-
-    assert!(
-        x_inner_rest_tail.len() >= 6,
-        "fold8 s_hat_v requires six retained packed-index coordinates"
-    );
-    let n_packed = 1usize << LOG_PACKING;
-    let n_tail = 1usize << x_inner_rest_tail.len();
-    assert_eq!(
-        z_vec.len(),
-        n_packed * n_tail,
-        "z_vec length {} mismatches 2^(LOG_PACKING + tail.len()) = {}",
-        z_vec.len(),
-        n_packed * n_tail,
-    );
-
-    let eq_tail = build_eq_parallel(&x_inner_rest_tail[6..]);
-    eq_tail
-        .par_iter()
-        .enumerate()
-        .fold(
-            || vec![F128::ZERO; 64 * n_packed],
-            |mut acc, (k, &weight)| {
-                let base = 64 * k * n_packed;
-                for bank in 0..64 {
-                    let block =
-                        &z_vec[base + bank * n_packed..base + (bank + 1) * n_packed];
-                    for packed in 0..n_packed {
-                        acc[bank * n_packed + packed] += weight * block[packed];
-                    }
-                }
-                acc
-            },
-        )
-        .reduce(
-            || vec![F128::ZERO; 64 * n_packed],
-            |mut a, b| {
-                for (out, value) in a.iter_mut().zip(b) {
-                    *out += value;
-                }
-                a
-            },
-        )
-}
-
-/// Collapse the sixty-four-bank direct-fold8 intake under the first six
-/// suffix coordinates, recovering the canonical transcript-visible
-/// 128-vector. Bitwise identical to `collapse_s_hat_v_fold4` of the 16-bank
-/// statistic: both are the same F2-linear fold regrouped, and GF(2^128)
-/// addition is XOR.
-pub(crate) fn collapse_s_hat_v_fold8(
-    s_hat_v_fold8: &[F128],
-    low_point: &[F128],
-) -> Vec<F128> {
-    debug_assert_eq!(s_hat_v_fold8.len(), 64 * (1usize << LOG_PACKING));
-    debug_assert_eq!(low_point.len(), 6);
-    let n_packed = 1usize << LOG_PACKING;
-    let low_eq = build_eq(low_point);
-    let mut out = vec![F128::ZERO; n_packed];
-    for bank in 0..64 {
-        for packed in 0..n_packed {
-            out[packed] += low_eq[bank] * s_hat_v_fold8[bank * n_packed + packed];
         }
     }
     out
@@ -1639,45 +1481,14 @@ pub fn inner_product(a: &[F128], b: &[F128]) -> F128 {
 /// the "vertical" and "horizontal" dimensions swapped. The BaseFold target is
 /// `T = ⟨s_hat_u, eq_ind(r'')⟩`.
 ///
-/// Tiled as sixteen 8-row stripes. Each half-stripe delegates its 8×64 bit
-/// matrix to the shared architecture-optimized transpose, then the 64 output
-/// bytes are scattered into one byte column of the 128 output elements. This
-/// replaces 16,384 branchy bit tests/deposits with 32 fixed 64-byte
-/// transposes while preserving the exact polynomial-basis layout.
+/// Naive O(128²) bit-extract implementation. NEON acceleration via bit
+/// transpose intrinsics is future work.
 pub fn tensor_algebra_transpose(s_hat_v: &[F128]) -> Vec<F128> {
     assert_eq!(s_hat_v.len(), 1 << LOG_PACKING);
-    let mut out_bytes = [[0u8; 16]; 1 << LOG_PACKING];
-    for row_group in 0..16 {
-        let rows = &s_hat_v[row_group * 8..row_group * 8 + 8];
-        let lo: [u64; 8] = std::array::from_fn(|i| rows[i].lo);
-        let hi: [u64; 8] = std::array::from_fn(|i| rows[i].hi);
-        let mut lo_columns = [0u8; 64];
-        let mut hi_columns = [0u8; 64];
-        transpose_8_u64s_to_64_bytes(&lo, &mut lo_columns);
-        transpose_8_u64s_to_64_bytes(&hi, &mut hi_columns);
-        for bit in 0..64 {
-            out_bytes[bit][row_group] = lo_columns[bit];
-            out_bytes[64 + bit][row_group] = hi_columns[bit];
-        }
-    }
-    out_bytes
-        .into_iter()
-        .map(|bytes| {
-            F128::new(
-                u64::from_le_bytes(bytes[..8].try_into().unwrap()),
-                u64::from_le_bytes(bytes[8..].try_into().unwrap()),
-            )
-        })
-        .collect()
-}
-
-/// Straight-line definition retained only as the independent oracle for the
-/// tiled implementation above.
-#[cfg(test)]
-fn tensor_algebra_transpose_scalar(s_hat_v: &[F128]) -> Vec<F128> {
-    assert_eq!(s_hat_v.len(), 1 << LOG_PACKING);
     let mut s_hat_u = vec![F128::ZERO; 1 << LOG_PACKING];
-    for (i_skip, &elem) in s_hat_v.iter().enumerate() {
+    for i_skip in 0..128 {
+        let elem = s_hat_v[i_skip];
+        // Iterate over the 128 bits b of `elem`; deposit into s_hat_u[b]'s bit i_skip.
         for b in 0..64 {
             if (elem.lo >> b) & 1 == 1 {
                 if i_skip < 64 {
@@ -1686,11 +1497,13 @@ fn tensor_algebra_transpose_scalar(s_hat_v: &[F128]) -> Vec<F128> {
                     s_hat_u[b].hi |= 1u64 << (i_skip - 64);
                 }
             }
+        }
+        for b in 0..64 {
             if (elem.hi >> b) & 1 == 1 {
                 if i_skip < 64 {
-                    s_hat_u[64 + b].lo |= 1u64 << i_skip;
+                    s_hat_u[64 | b].lo |= 1u64 << i_skip;
                 } else {
-                    s_hat_u[64 + b].hi |= 1u64 << (i_skip - 64);
+                    s_hat_u[64 | b].hi |= 1u64 << (i_skip - 64);
                 }
             }
         }
@@ -1974,9 +1787,9 @@ pub(crate) fn compose_fold_byte_table_into(e_hi: F128, base: &[F128], out: &mut 
 }
 /// Encode `x ↦ Σ_d fold_weight[d] · Φ(low_eq[d]·x)` as a byte table,
 /// where `base` encodes the γ-baked linear map `Φ`.
-fn build_direct_fold_table<const N: usize>(
-    low_eq: &[F128; N],
-    fold_weight: &[F128; N],
+pub(crate) fn build_direct_fold2_table(
+    low_eq: &[F128; 4],
+    fold_weight: &[F128; 4],
     base: &[F128],
 ) -> Vec<F128> {
     debug_assert_eq!(base.len(), FOLD_TABLE_LEN);
@@ -1988,7 +1801,7 @@ fn build_direct_fold_table<const N: usize>(
         } else {
             F128::new(0, 1u64 << (bit - 64))
         };
-        for d in 0..N {
+        for d in 0..4 {
             *generator += fold_weight[d] * fold_one_slot(basis * low_eq[d], base);
         }
     }
@@ -2006,30 +1819,6 @@ fn build_direct_fold_table<const N: usize>(
         }
     }
     out
-}
-
-pub(crate) fn build_direct_fold2_table(
-    low_eq: &[F128; 4],
-    fold_weight: &[F128; 4],
-    base: &[F128],
-) -> Vec<F128> {
-    build_direct_fold_table(low_eq, fold_weight, base)
-}
-
-pub(crate) fn build_direct_fold4_table(
-    low_eq: &[F128; 16],
-    fold_weight: &[F128; 16],
-    base: &[F128],
-) -> Vec<F128> {
-    build_direct_fold_table(low_eq, fold_weight, base)
-}
-
-pub(crate) fn build_direct_fold8_table(
-    low_eq: &[F128; 64],
-    fold_weight: &[F128; 64],
-    base: &[F128],
-) -> Vec<F128> {
-    build_direct_fold_table(low_eq, fold_weight, base)
 }
 
 /// Per-output-index value of a [`RsEqInd::DeferredDense`] fold (the value the
@@ -2451,34 +2240,6 @@ pub(crate) struct DirectFold2Factors {
     pub(crate) products: [F128; 16],
 }
 
-/// Sixteen-bank sufficient statistic for the experimental direct-fold4
-/// opening. All fields already include this claim's ring-switch gamma. The
-/// bank index is `e_small + 4 * q`, matching the retained-coordinate producer
-/// and the little-endian order of `build_eq(suffix[..4])`.
-#[derive(Clone, Debug)]
-pub(crate) struct DirectFold4Factors {
-    pub(crate) eq_lo: Vec<F128>,
-    pub(crate) eq_hi: Vec<F128>,
-    pub(crate) low_eq: [F128; 16],
-    pub(crate) table: Vec<F128>,
-    /// `H[e,d] = Σ_h f[16h+e] B_k[16h+d]`.
-    pub(crate) products: [F128; 256],
-}
-
-/// Sixty-four-bank sufficient statistic for the direct-fold8 opening. All
-/// fields already include this claim's ring-switch gamma. The bank index is
-/// the little-endian six-bit retained coordinate, matching
-/// `build_eq(suffix[..6])` and the retained-coordinate C producer.
-#[derive(Clone, Debug)]
-pub(crate) struct DirectFold8Factors {
-    pub(crate) eq_lo: Vec<F128>,
-    pub(crate) eq_hi: Vec<F128>,
-    pub(crate) low_eq: [F128; 64],
-    pub(crate) table: Vec<F128>,
-    /// `H[e,d] = Σ_h f[64h+e] B_k[64h+d]`.
-    pub(crate) products: [F128; 4096],
-}
-
 /// Per-claim output of [`prove_batched`]. Mirrors [`RingSwitchOutput`] but lets
 /// the prover skip the dense `2^(m-7)` `rs_eq_ind` allocation for claims whose
 /// suffix tensor is sparse (e.g. the hash-chain claim). Verifier-side
@@ -2493,12 +2254,6 @@ pub struct RingSwitchBatchOutput {
     pub rs_eq_ind: RsEqInd,
     pub sumcheck_claim: F128,
     pub(crate) direct_fold2: Option<DirectFold2Factors>,
-    /// Off-by-default direct-fold4 consumer seam. Populated only when intake
-    /// supplies an honest sixteen-bank precompute.
-    pub(crate) direct_fold4: Option<DirectFold4Factors>,
-    /// Direct-fold8 consumer seam. Populated only when intake supplies an
-    /// honest sixty-four-bank precompute.
-    pub(crate) direct_fold8: Option<DirectFold8Factors>,
     /// Ranked deferred-C: the ordinary claim's direct-fold2 factor bundle
     /// (same shape as [`DirectFold2Factors`] but `products` zeroed — C's
     /// round-0/1 message contribution comes from pcs's combine sweep, not
@@ -2740,8 +2495,7 @@ pub fn prove_batched_padded<Ch: Challenger>(
 ///
 /// `precomputed_s_hat_v` must be `&[]` (no precomputes) or have length equal
 /// to `x_outers.len()`. Each entry is either the ordinary `2^LOG_PACKING`
-/// statistic, four consecutive banks retaining the low two suffix bits, or
-/// sixteen consecutive banks retaining the low four suffix bits.
+/// statistic or four consecutive banks retaining the low two suffix bits.
 ///
 /// Output is **byte-identical** to [`prove_batched_padded`] when the precomputed
 /// `s_hat_v` is honest (matches what `fold_1b_rows` would produce). Transcript
@@ -2770,11 +2524,8 @@ pub fn prove_batched_padded_with_precomputed<Ch: Challenger>(
     let n_packed = 1usize << LOG_PACKING;
     for p in precomputed_s_hat_v.iter().flatten() {
         assert!(
-            p.len() == n_packed
-                || p.len() == 4 * n_packed
-                || p.len() == 16 * n_packed
-                || p.len() == 64 * n_packed,
-            "precomputed_s_hat_v entry must have length 2^LOG_PACKING, 4·2^LOG_PACKING, 16·2^LOG_PACKING, or 64·2^LOG_PACKING"
+            p.len() == n_packed || p.len() == 4 * n_packed,
+            "precomputed_s_hat_v entry must have length 2^LOG_PACKING or 4·2^LOG_PACKING"
         );
     }
 
@@ -2879,19 +2630,7 @@ pub fn prove_batched_padded_with_precomputed<Ch: Challenger>(
     // Fill precomputed slots first.
     for d in 0..dense_suffixes.len() {
         if let Some(p) = precomputed_s_hat_v.get(dense_to_orig[d]).copied().flatten() {
-            dense_s_hat_v[d] = if p.len() == 64 * n_packed {
-                assert!(
-                    dense_suffixes[d].len() >= 6,
-                    "sixty-four-bank s_hat_v requires at least six suffix coordinates"
-                );
-                collapse_s_hat_v_fold8(p, &dense_suffixes[d][..6])
-            } else if p.len() == 16 * n_packed {
-                assert!(
-                    dense_suffixes[d].len() >= 4,
-                    "sixteen-bank s_hat_v requires at least four suffix coordinates"
-                );
-                collapse_s_hat_v_fold4(p, &dense_suffixes[d][..4])
-            } else if p.len() == 4 * n_packed {
+            dense_s_hat_v[d] = if p.len() == 4 * n_packed {
                 assert!(
                     dense_suffixes[d].len() >= 2,
                     "four-bank s_hat_v requires at least two suffix coordinates"
@@ -2908,19 +2647,7 @@ pub fn prove_batched_padded_with_precomputed<Ch: Challenger>(
             .copied()
             .flatten()
         {
-            sparse_s_hat_v[s] = if p.len() == 64 * n_packed {
-                assert!(
-                    sparse_suffixes[s].len() >= 6,
-                    "sixty-four-bank s_hat_v requires at least six suffix coordinates"
-                );
-                collapse_s_hat_v_fold8(p, &sparse_suffixes[s][..6])
-            } else if p.len() == 16 * n_packed {
-                assert!(
-                    sparse_suffixes[s].len() >= 4,
-                    "sixteen-bank s_hat_v requires at least four suffix coordinates"
-                );
-                collapse_s_hat_v_fold4(p, &sparse_suffixes[s][..4])
-            } else if p.len() == 4 * n_packed {
+            sparse_s_hat_v[s] = if p.len() == 4 * n_packed {
                 assert!(
                     sparse_suffixes[s].len() >= 2,
                     "four-bank s_hat_v requires at least two suffix coordinates"
@@ -2986,8 +2713,6 @@ pub fn prove_batched_padded_with_precomputed<Ch: Challenger>(
     struct ClaimWork {
         s_hat_v: Vec<F128>,
         s_hat_v_quad: Option<Vec<F128>>,
-        s_hat_v_fold4: Option<Vec<F128>>,
-        s_hat_v_fold8: Option<Vec<F128>>,
         sumcheck_claim: F128,
         eq_r_dprime: Vec<F128>,
     }
@@ -3004,18 +2729,6 @@ pub fn prove_batched_padded_with_precomputed<Ch: Challenger>(
             .flatten()
             .filter(|precomputed| precomputed.len() == 4 * n_packed)
             .map(<[F128]>::to_vec);
-        let s_hat_v_fold4 = precomputed_s_hat_v
-            .get(i)
-            .copied()
-            .flatten()
-            .filter(|precomputed| precomputed.len() == 16 * n_packed)
-            .map(<[F128]>::to_vec);
-        let s_hat_v_fold8 = precomputed_s_hat_v
-            .get(i)
-            .copied()
-            .flatten()
-            .filter(|precomputed| precomputed.len() == 64 * n_packed)
-            .map(<[F128]>::to_vec);
         challenger.observe_f128_slice(&s_hat_v);
         let r_dprime = challenger.sample_f128_vec(LOG_PACKING);
         let eq_r_dprime = build_eq(&r_dprime);
@@ -3026,8 +2739,6 @@ pub fn prove_batched_padded_with_precomputed<Ch: Challenger>(
         work.push(ClaimWork {
             s_hat_v,
             s_hat_v_quad,
-            s_hat_v_fold4,
-            s_hat_v_fold8,
             sumcheck_claim,
             eq_r_dprime,
         });
@@ -3085,90 +2796,6 @@ pub fn prove_batched_padded_with_precomputed<Ch: Challenger>(
                     let (eq_lo, eq_hi) =
                         build_eq_split(tail, deferred_split_n_lo(tail.len()));
                     Some(DirectFold2Factors {
-                        eq_lo,
-                        eq_hi,
-                        low_eq,
-                        table: table.clone(),
-                        products,
-                    })
-                }
-                _ => None,
-            };
-            let direct_fold4 = match (kinds[i], w.s_hat_v_fold4.as_deref()) {
-                (Kind::Dense(d), Some(fold4)) if use_split && dense_suffixes[d].len() >= 4 => {
-                    let suffix = dense_suffixes[d];
-                    let low_eq: [F128; 16] = build_eq(&suffix[..4])
-                        .try_into()
-                        .expect("four-coordinate eq has sixteen entries");
-                    let mut products = [F128::ZERO; 256];
-                    let mut scaled_bank = vec![F128::ZERO; n_packed];
-                    for e in 0..16 {
-                        let bank = &fold4[e * n_packed..(e + 1) * n_packed];
-                        for d_low in 0..16 {
-                            for packed in 0..n_packed {
-                                scaled_bank[packed] = low_eq[d_low] * bank[packed];
-                            }
-                            let transposed = tensor_algebra_transpose(&scaled_bank);
-                            products[e * 16 + d_low] =
-                                inner_product(&transposed, &scaled_eq_r_dprime);
-                        }
-                    }
-                    let tail = &suffix[4..];
-                    let (eq_lo, eq_hi) =
-                        build_eq_split(tail, deferred_split_n_lo(tail.len()));
-                    Some(DirectFold4Factors {
-                        eq_lo,
-                        eq_hi,
-                        low_eq,
-                        table: table.clone(),
-                        products,
-                    })
-                }
-                _ => None,
-            };
-            let direct_fold8 = match (kinds[i], w.s_hat_v_fold8.as_deref()) {
-                (Kind::Dense(d), Some(fold8)) if use_split && dense_suffixes[d].len() >= 6 => {
-                    let suffix = dense_suffixes[d];
-                    let low_eq: [F128; 64] = build_eq(&suffix[..6])
-                        .try_into()
-                        .expect("six-coordinate eq has sixty-four entries");
-                    // products[e][d] = ⟨transpose(low_eq[d]·bank_e), w⟩ with
-                    // w = scaled_eq_r_dprime. Mul-by-low_eq[d] and the
-                    // transpose are both F2-linear, so with
-                    // w'_d[k] = φ_w(low_eq[d]·e_k) = fold_one_slot(low_eq[d]·e_k, table)
-                    // the product equals ⟨transpose(bank_e), w'_d⟩ — bitwise
-                    // identical (char 2), 64 transposes per claim instead of
-                    // 4,096.
-                    let mut w_prime = vec![F128::ZERO; 64 * n_packed];
-                    for (d_low, w_prime_d) in w_prime.chunks_mut(n_packed).enumerate() {
-                        let scale = low_eq[d_low];
-                        for (bit, out) in w_prime_d.iter_mut().enumerate() {
-                            let basis = if bit < 64 {
-                                F128::new(1u64 << bit, 0)
-                            } else {
-                                F128::new(0, 1u64 << (bit - 64))
-                            };
-                            *out = fold_one_slot(scale * basis, &table);
-                        }
-                    }
-                    let mut products = [F128::ZERO; 4096];
-                    products
-                        .par_chunks_mut(64)
-                        .enumerate()
-                        .for_each(|(e, chunk)| {
-                            let bank = &fold8[e * n_packed..(e + 1) * n_packed];
-                            let transposed = tensor_algebra_transpose(bank);
-                            for (d_low, out) in chunk.iter_mut().enumerate() {
-                                *out = inner_product(
-                                    &transposed,
-                                    &w_prime[d_low * n_packed..(d_low + 1) * n_packed],
-                                );
-                            }
-                        });
-                    let tail = &suffix[6..];
-                    let (eq_lo, eq_hi) =
-                        build_eq_split(tail, deferred_split_n_lo(tail.len()));
-                    Some(DirectFold8Factors {
                         eq_lo,
                         eq_hi,
                         low_eq,
@@ -3242,8 +2869,6 @@ pub fn prove_batched_padded_with_precomputed<Ch: Challenger>(
                         rs_eq_ind,
                         sumcheck_claim: w.sumcheck_claim,
                         direct_fold2,
-                        direct_fold4,
-                        direct_fold8,
                         deferred_c_fold2,
                     },
                 )
@@ -3765,32 +3390,9 @@ mod tests {
     #[test]
     fn transpose_is_involution() {
         let mut rng = Rng::new(0xDEAD);
-        for _ in 0..32 {
-            let s_hat_v: Vec<F128> = (0..128).map(|_| rng.f128()).collect();
-            let once = tensor_algebra_transpose(&s_hat_v);
-            assert_eq!(once, tensor_algebra_transpose_scalar(&s_hat_v));
-            let twice = tensor_algebra_transpose(&once);
-            assert_eq!(s_hat_v, twice);
-        }
-
-        for s_hat_v in [
-            vec![F128::ZERO; 128],
-            vec![F128::new(u64::MAX, u64::MAX); 128],
-            (0..128)
-                .map(|i| {
-                    if i < 64 {
-                        F128::new(1u64 << i, 0)
-                    } else {
-                        F128::new(0, 1u64 << (i - 64))
-                    }
-                })
-                .collect(),
-        ] {
-            assert_eq!(
-                tensor_algebra_transpose(&s_hat_v),
-                tensor_algebra_transpose_scalar(&s_hat_v),
-            );
-        }
+        let s_hat_v: Vec<F128> = (0..128).map(|_| rng.f128()).collect();
+        let twice = tensor_algebra_transpose(&tensor_algebra_transpose(&s_hat_v));
+        assert_eq!(s_hat_v, twice);
     }
 
     #[test]
@@ -4119,167 +3721,6 @@ mod tests {
             assert_eq!(got, want, "s_hat_v mismatch at m={m}, k_log={k_log}");
         }
     }
-
-    #[test]
-    fn sixteen_bank_fold4_intake_matches_ring_wire_and_product_oracle() {
-        use crate::challenger::FsChallenger;
-        use crate::lincheck::{pack_z_lincheck, partial_fold_packed_z};
-
-        const M: usize = 17;
-        const K_LOG: usize = 13;
-        const K_SKIP: usize = 6;
-        let mut rng = Rng::new(0xD1CE_F016);
-        let z = rng.bits(1 << M);
-        let packed = pack_witness(&z, M);
-        let z_packed_lincheck = pack_z_lincheck(&z, M, K_LOG);
-        let inner_rest: Vec<F128> = (0..(K_LOG - K_SKIP)).map(|_| rng.f128()).collect();
-        let outer: Vec<F128> = (0..(M - K_LOG)).map(|_| rng.f128()).collect();
-        let mut point = inner_rest.clone();
-        point.extend_from_slice(&outer);
-        let z_vec = partial_fold_packed_z(&z_packed_lincheck, M, K_LOG, &build_eq(&outer));
-        let fold4 = s_hat_v_fold4_from_z_vec(&z_vec, &inner_rest[1..]);
-        assert_eq!(fold4.len(), 16 * (1usize << LOG_PACKING));
-
-        let ordinary = s_hat_v_from_z_vec(&z_vec, &inner_rest[1..]);
-        assert_eq!(
-            collapse_s_hat_v_fold4(&fold4, &inner_rest[1..5]),
-            ordinary,
-            "suffix[..4] collapse must recover the transcript-visible statistic"
-        );
-
-        let padding = PaddingSpec::dense(M);
-        let mut baseline_challenger = FsChallenger::new(b"direct-fold4-intake-wire");
-        let (baseline, baseline_gammas) = prove_batched_padded_with_precomputed(
-            &packed,
-            &[&point],
-            &[],
-            &padding,
-            &mut baseline_challenger,
-        );
-        let mut direct_challenger = FsChallenger::new(b"direct-fold4-intake-wire");
-        let (direct, direct_gammas) = prove_batched_padded_with_precomputed(
-            &packed,
-            &[&point],
-            &[Some(fold4.as_slice())],
-            &padding,
-            &mut direct_challenger,
-        );
-
-        assert_eq!(direct_gammas, baseline_gammas);
-        assert_eq!(direct[0].0, baseline[0].0);
-        assert_eq!(direct[0].1.sumcheck_claim, baseline[0].1.sumcheck_claim);
-        assert_eq!(
-            direct[0].1.rs_eq_ind.to_dense(),
-            baseline[0].1.rs_eq_ind.to_dense()
-        );
-        assert!(direct[0].1.direct_fold2.is_none());
-        let factors = direct[0]
-            .1
-            .direct_fold4
-            .as_ref()
-            .expect("sixteen-bank intake must expose DirectFold4Factors");
-        let basis = baseline[0].1.rs_eq_ind.to_dense();
-        let mut product_oracle = [F128::ZERO; 256];
-        for high in 0..packed.len() / 16 {
-            for e in 0..16 {
-                for d in 0..16 {
-                    product_oracle[16 * e + d] +=
-                        packed[16 * high + e] * basis[16 * high + d];
-                }
-            }
-        }
-        assert_eq!(factors.products, product_oracle);
-    }
-
-    #[test]
-    fn sixtyfour_bank_fold8_intake_matches_ring_wire_and_product_oracle() {
-        use crate::challenger::FsChallenger;
-        use crate::lincheck::{pack_z_lincheck, partial_fold_packed_z};
-
-        const M: usize = 18;
-        const K_LOG: usize = 14;
-        const K_SKIP: usize = 6;
-        let mut rng = Rng::new(0xD1CE_F088);
-        let z = rng.bits(1 << M);
-        let packed = pack_witness(&z, M);
-        let z_packed_lincheck = pack_z_lincheck(&z, M, K_LOG);
-        let inner_rest: Vec<F128> = (0..(K_LOG - K_SKIP)).map(|_| rng.f128()).collect();
-        let outer: Vec<F128> = (0..(M - K_LOG)).map(|_| rng.f128()).collect();
-        let mut point = inner_rest.clone();
-        point.extend_from_slice(&outer);
-        let z_vec = partial_fold_packed_z(&z_packed_lincheck, M, K_LOG, &build_eq(&outer));
-        let fold8 = s_hat_v_fold8_from_z_vec(&z_vec, &inner_rest[1..]);
-        assert_eq!(fold8.len(), 64 * (1usize << LOG_PACKING));
-
-        let ordinary = s_hat_v_from_z_vec(&z_vec, &inner_rest[1..]);
-        assert_eq!(
-            collapse_s_hat_v_fold8(&fold8, &inner_rest[1..7]),
-            ordinary,
-            "suffix[..6] collapse must recover the transcript-visible statistic"
-        );
-        // The wider statistic must refine the fold4 one: folding retained
-        // coordinates 4 and 5 reproduces the 16-bank tensor bitwise.
-        let fold4 = s_hat_v_fold4_from_z_vec(&z_vec, &inner_rest[1..]);
-        let hi_eq = build_eq(&inner_rest[5..7]);
-        let n_packed = 1usize << LOG_PACKING;
-        for e in 0..16 {
-            for packed in 0..n_packed {
-                let reduced = (0..4).fold(F128::ZERO, |acc, qq| {
-                    acc + hi_eq[qq] * fold8[(e + 16 * qq) * n_packed + packed]
-                });
-                assert_eq!(
-                    fold4[e * n_packed + packed],
-                    reduced,
-                    "fold8 → fold4 reduction mismatch at e={e} packed={packed}"
-                );
-            }
-        }
-
-        let padding = PaddingSpec::dense(M);
-        let mut baseline_challenger = FsChallenger::new(b"direct-fold8-intake-wire");
-        let (baseline, baseline_gammas) = prove_batched_padded_with_precomputed(
-            &packed,
-            &[&point],
-            &[],
-            &padding,
-            &mut baseline_challenger,
-        );
-        let mut direct_challenger = FsChallenger::new(b"direct-fold8-intake-wire");
-        let (direct, direct_gammas) = prove_batched_padded_with_precomputed(
-            &packed,
-            &[&point],
-            &[Some(fold8.as_slice())],
-            &padding,
-            &mut direct_challenger,
-        );
-
-        assert_eq!(direct_gammas, baseline_gammas);
-        assert_eq!(direct[0].0, baseline[0].0);
-        assert_eq!(direct[0].1.sumcheck_claim, baseline[0].1.sumcheck_claim);
-        assert_eq!(
-            direct[0].1.rs_eq_ind.to_dense(),
-            baseline[0].1.rs_eq_ind.to_dense()
-        );
-        assert!(direct[0].1.direct_fold2.is_none());
-        assert!(direct[0].1.direct_fold4.is_none());
-        let factors = direct[0]
-            .1
-            .direct_fold8
-            .as_ref()
-            .expect("sixty-four-bank intake must expose DirectFold8Factors");
-        let basis = baseline[0].1.rs_eq_ind.to_dense();
-        let mut product_oracle = [F128::ZERO; 4096];
-        for high in 0..packed.len() / 64 {
-            for e in 0..64 {
-                for d in 0..64 {
-                    product_oracle[64 * e + d] +=
-                        packed[64 * high + e] * basis[64 * high + d];
-                }
-            }
-        }
-        assert_eq!(factors.products, product_oracle);
-    }
-
     #[test]
     fn mixed_quad_ab_and_sparse_c_matches_ring_wire_oracle() {
         use crate::challenger::FsChallenger;
@@ -4352,135 +3793,6 @@ mod tests {
         );
         assert!(direct[0].1.direct_fold2.is_some());
         assert!(direct[1].1.direct_fold2.is_none());
-    }
-
-    /// Both claims dense and both carrying a quad — the completed direct path.
-    ///
-    /// Claim 1's quad is built straight from the acceptance spec
-    /// (`quad_c[e·128 + p] = Σ_h eq_tail[h] · bit_p(f[4h+e])`), so this test is
-    /// independent of how the zerocheck capture happens to produce it. It pins
-    /// the four things the completion depends on: the observed `s_hat_v` is
-    /// unchanged, each claim's `products` equal the bilinear oracle against its
-    /// own γ-baked basis, the diagonal collapses to `γ · sumcheck_claim`, and
-    /// the round-0 + round-1-lookahead messages built from both claims'
-    /// `products` equal the streamed sweep over the summed basis.
-    #[test]
-    fn all_direct_quad_ab_and_c_matches_ring_wire_oracle() {
-        use crate::challenger::FsChallenger;
-        use crate::lincheck::{pack_z_lincheck, partial_fold_packed_z};
-
-        const M: usize = 17;
-        const K_LOG: usize = 13;
-        const K_SKIP: usize = 6;
-        let mut rng = Rng::new(0xD1CE_A11D);
-        let z = rng.bits(1 << M);
-        let packed = pack_witness(&z, M);
-        let z_packed_lincheck = pack_z_lincheck(&z, M, K_LOG);
-        let inner_rest: Vec<F128> = (0..(K_LOG - K_SKIP)).map(|_| rng.f128()).collect();
-        let outer: Vec<F128> = (0..(M - K_LOG)).map(|_| rng.f128()).collect();
-        let mut ab_point = inner_rest.clone();
-        ab_point.extend_from_slice(&outer);
-        // Dense (no zero coords) so claim 1 classifies Dense and takes the
-        // direct arm, exactly as the ranked C claim does.
-        let c_point: Vec<F128> = (0..ab_point.len()).map(|_| rng.f128()).collect();
-        let z_vec = partial_fold_packed_z(&z_packed_lincheck, M, K_LOG, &build_eq(&outer));
-        let quad_ab = s_hat_v_quad_from_z_vec(&z_vec, &inner_rest[1..]);
-
-        // Acceptance spec, verbatim.
-        let n_packed = 1usize << LOG_PACKING;
-        let suffix_c = &c_point[1..];
-        let eq_tail = build_eq(&suffix_c[2..]);
-        assert_eq!(eq_tail.len(), packed.len() / 4);
-        let mut quad_c = vec![F128::ZERO; 4 * n_packed];
-        for (h, &weight) in eq_tail.iter().enumerate() {
-            for e in 0..4 {
-                let w = packed[4 * h + e];
-                for p in 0..n_packed {
-                    let bit = if p < 64 {
-                        (w.lo >> p) & 1
-                    } else {
-                        (w.hi >> (p - 64)) & 1
-                    };
-                    if bit == 1 {
-                        quad_c[e * n_packed + p] += weight;
-                    }
-                }
-            }
-        }
-
-        let padding = PaddingSpec::dense(M);
-        let mut baseline_challenger = FsChallenger::new(b"direct-all-wire");
-        let (baseline, baseline_gammas) = prove_batched_padded_with_precomputed(
-            &packed,
-            &[&ab_point, &c_point],
-            &[],
-            &padding,
-            &mut baseline_challenger,
-        );
-        let mut direct_challenger = FsChallenger::new(b"direct-all-wire");
-        let (direct, direct_gammas) = prove_batched_padded_with_precomputed(
-            &packed,
-            &[&ab_point, &c_point],
-            &[Some(quad_ab.as_slice()), Some(quad_c.as_slice())],
-            &padding,
-            &mut direct_challenger,
-        );
-
-        // 1. Transcript preservation: same observed s_hat_v, same γ_rs, same
-        //    sumcheck claims, same basis.
-        assert_eq!(direct_gammas, baseline_gammas);
-        for claim in 0..2 {
-            assert_eq!(direct[claim].0, baseline[claim].0, "s_hat_v claim {claim}");
-            assert_eq!(
-                direct[claim].1.sumcheck_claim,
-                baseline[claim].1.sumcheck_claim,
-                "sumcheck_claim claim {claim}"
-            );
-            assert_eq!(
-                direct[claim].1.rs_eq_ind.to_dense(),
-                baseline[claim].1.rs_eq_ind.to_dense(),
-                "rs_eq_ind claim {claim}"
-            );
-            assert!(direct[claim].1.direct_fold2.is_some());
-            assert!(direct[claim].1.deferred_c_fold2.is_none());
-        }
-
-        // 2. Each claim's products equal the bilinear oracle over its own basis,
-        //    and 3. the diagonal collapses to γ · sumcheck_claim.
-        let bases: Vec<Vec<F128>> = (0..2).map(|k| baseline[k].1.rs_eq_ind.to_dense()).collect();
-        for claim in 0..2 {
-            let mut oracle = [F128::ZERO; 16];
-            for high in 0..(packed.len() / 4) {
-                for e in 0..4 {
-                    for d in 0..4 {
-                        oracle[4 * e + d] += packed[4 * high + e] * bases[claim][4 * high + d];
-                    }
-                }
-            }
-            let products = direct[claim].1.direct_fold2.as_ref().unwrap().products;
-            assert_eq!(products, oracle, "products claim {claim}");
-            let diagonal = products[0] + products[5] + products[10] + products[15];
-            assert_eq!(
-                diagonal,
-                direct_gammas[claim] * baseline[claim].1.sumcheck_claim,
-                "diagonal invariant claim {claim}"
-            );
-        }
-
-        // 4. The messages the pcs open would ship: products path == streamed
-        //    sweep over the summed basis. This is the value that must be
-        //    bit-identical for the proof to be unchanged.
-        let b_combined: Vec<F128> = bases[0]
-            .iter()
-            .zip(bases[1].iter())
-            .map(|(a, b)| *a + *b)
-            .collect();
-        let want = super::super::round0_and_round1_lookahead_scalar(&packed, &b_combined);
-        let factors: Vec<DirectFold2Factors> = (0..2)
-            .map(|k| direct[k].1.direct_fold2.clone().unwrap())
-            .collect();
-        let got = super::super::messages_from_direct_products(&factors);
-        assert_eq!(got, want, "round-0 + round-1 lookahead");
     }
 
     /// `prove_batched_padded_with_precomputed` is byte-identical to the
