@@ -12672,3 +12672,4 @@ mod tests {
 // RealAdii sample 7 on c52fba6.
 // RealAdii sample 8 on c52fba6.
 // RealAdii sample 9 on c52fba6.
+// welttowelt disclosed resample 2 of the record tree on c6ca70d (resample 1 = d72e86ed: 1,645,937.67; zero-diff marker per board protocol).
