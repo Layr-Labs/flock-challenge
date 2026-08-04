@@ -4053,7 +4053,17 @@ kernel void blake3_pow_scan(
             let mut last_end = 0.0f64;
             let n_bands = self.pending.len();
             for cb in self.pending.drain(..) {
-                let waited = unsafe { self.gpu.wait_cb(cb) };
+                // Streamed first-pass bands finish under witness; by drain the
+                // last band is usually done. Spin-poll skips park+wake on that
+                // race (same class as grind / zc-r2). Kill:
+                // FLOCK_NO_STREAM_BAND_SPIN=1.
+                let waited = unsafe {
+                    if std::env::var_os("FLOCK_NO_STREAM_BAND_SPIN").is_some() {
+                        self.gpu.wait_cb(cb)
+                    } else {
+                        self.gpu.spin_wait_cb(cb, 4.0)
+                    }
+                };
                 if trace {
                     let (s, e) = unsafe { cb_gpu_interval(self.gpu, cb) };
                     if e > s {
@@ -4668,8 +4678,18 @@ kernel void blake3_pow_scan(
                 // level is always fully populated by subtree-internal
                 // parents; the 15 nodes above it are recomputed here,
                 // covering every decomposition boundary for any k.
+                // Hybrid join: GPU prefix has been running through the entire
+                // CPU suffix, so the buffer is usually already complete. A
+                // blocking waitUntilCompleted still pays park+wake for a
+                // finished job. Spin-poll with 16 ms budget (covers measured
+                // prefix walls), then exact blocking wait. Kill:
+                // FLOCK_NO_HYBRID_CB2_SPIN=1.
                 let t_wait_cb2 = window_trace_enabled().then(std::time::Instant::now);
-                gpu.wait_cb(cb2)?;
+                if std::env::var_os("FLOCK_NO_HYBRID_CB2_SPIN").is_some() {
+                    gpu.wait_cb(cb2)?;
+                } else {
+                    gpu.spin_wait_cb(cb2, 16.0)?;
+                }
                 if let Some(t) = t_wait_cb2 {
                     let (s, e) = cb_gpu_interval(gpu, cb2);
                     eprintln!(
@@ -6216,7 +6236,15 @@ kernel void blake3_pow_scan(
         let early = stream.early_cb2.take();
         let drain_early = |early: Option<(Id, usize)>| {
             if let Some((cb2, _)) = early {
-                let _ = unsafe { stream.gpu.wait_cb(cb2) };
+                // Same hybrid-join spin policy: early-committed prefix is
+                // usually done by finish entry. Kill shares FLOCK_NO_HYBRID_CB2_SPIN.
+                let _ = unsafe {
+                    if std::env::var_os("FLOCK_NO_HYBRID_CB2_SPIN").is_some() {
+                        stream.gpu.wait_cb(cb2)
+                    } else {
+                        stream.gpu.spin_wait_cb(cb2, 16.0)
+                    }
+                };
                 unsafe { stream.gpu.release(cb2) };
             }
         };
