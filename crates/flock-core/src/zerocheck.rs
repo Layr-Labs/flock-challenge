@@ -29,8 +29,9 @@ pub mod univariate_skip_optimized;
 use multilinear::{
     UniSkipFoldTable, eval_round3_lookahead, fold2_compact_and_round4_into,
     fold2_compact_and_round45_into, fold2_plain_and_round6_into, fold2_plain_and_round67_into,
-    fold_and_compute_round_pair_into, fold_compact_and_compute_round_pair, fold_in_place_pair,
-    interpolate_at_z_combined, interpolate_at_z_on_lambda, round_pair_naive,
+    fold2_plain_and_round68_into, fold_and_compute_round_pair_into,
+    fold_compact_and_compute_round_pair, fold_in_place_pair, interpolate_at_z_combined,
+    interpolate_at_z_on_lambda, round_pair_naive,
     uni_skip_fold_and_round_pair_compact_padded_lookahead,
     uni_skip_fold_and_round_pair_compact_padded_with_deltas,
 };
@@ -100,6 +101,26 @@ fn cascade3_off() -> bool {
     }
     static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *OFF.get_or_init(|| std::env::var_os("FLOCK_NO_ZC_CASCADE3").is_some_and(|v| v == *"1"))
+}
+
+/// Test-only forced-off latch for the fourth-level cascade (rounds 9+10),
+/// mirroring [`ZC_CASCADE3_FORCED_OFF`]: the transcript-identity test flips
+/// this instead of mutating the process environment.
+#[cfg(test)]
+pub(crate) static ZC_CASCADE4_FORCED_OFF: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Kill switch for the cascaded rounds-9/10 lookahead: `FLOCK_NO_ZC_CASCADE4=1`
+/// (exact '1') restores the cascade3 i=6/i=7 tail route within the same
+/// binary. OnceLock-latched: the environment is read once per process.
+#[inline]
+fn cascade4_off() -> bool {
+    #[cfg(test)]
+    if ZC_CASCADE4_FORCED_OFF.load(std::sync::atomic::Ordering::Relaxed) {
+        return true;
+    }
+    static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *OFF.get_or_init(|| std::env::var_os("FLOCK_NO_ZC_CASCADE4").is_some_and(|v| v == *"1"))
 }
 
 /// Number of variables folded in round 1 via the additive-NTT univariate skip.
@@ -755,6 +776,19 @@ fn prove_packed_padded_inner<C: Challenger>(
     let use_cascade3 =
         use_cascade && n_mlv >= 8 && r[k_skip + 5] != F128::ZERO && !cascade3_off();
 
+    // Cascade one level deeper still (rounds 9+10, see
+    // `fold2_plain_and_round68_into`): the composed 7/8 pass materializes each
+    // output group in registers before its store — so round nine's message
+    // rides it as a deferred quadratic in the not-yet-sampled ρ₇, and rounds
+    // 9+10 then collapse into one more plain composed double-fold, deleting
+    // tail iterations i = 6 and i = 7. Same value-identity argument again.
+    //
+    // `r[k_skip+7] = 0` (probability 2⁻¹²⁸ for that sampled slot) would make
+    // W1'''/W2''' unrecoverable; n_mlv ≥ 9 keeps the composed-9/10 input ≥ 16
+    // and every eq split at lo_size ≥ 2. Kill switch: FLOCK_NO_ZC_CASCADE4=1.
+    let use_cascade4 =
+        use_cascade3 && n_mlv >= 9 && r[k_skip + 7] != F128::ZERO && !cascade4_off();
+
     // `loop_start` is the first tail iteration this route has not already
     // produced. The loop body's `r_next[1..] = r[k_skip + i + 2..]` is already
     // indexed by `i`, so starting at 2 (or 4) needs no other change.
@@ -861,28 +895,94 @@ fn prove_packed_padded_inner<C: Challenger>(
                 // Unpinned for the same reason as the K outputs above.
                 let mut a3_out = crate::scratch::take_f128_unpinned(sixteenth);
                 let mut b3_out = crate::scratch::take_f128_unpinned(sixteenth);
-                let (m8_1, m8_inf) = fold2_plain_and_round6_into(
-                    &a2_out,
-                    &b2_out,
-                    &mut a3_out,
-                    &mut b3_out,
-                    mlv_rhos[4],
-                    mlv_rhos[5],
-                    &r_next8,
-                );
-                if tail_round_timing {
-                    eprintln!(
-                        "[zc-tail-rounds] composed rounds 7+8 fold (out n={sixteenth}): {:.2} ms",
-                        t_c3.elapsed().as_secs_f64() * 1e3
+                if use_cascade4 {
+                    // Level four: the composed 7/8 pass additionally carries
+                    // the deferred round-nine quadratic — zero extra
+                    // traversals.
+                    let (m8_1, m8_inf, la9) = fold2_plain_and_round68_into(
+                        &a2_out,
+                        &b2_out,
+                        &mut a3_out,
+                        &mut b3_out,
+                        mlv_rhos[4],
+                        mlv_rhos[5],
+                        &r_next8,
                     );
+                    if tail_round_timing {
+                        eprintln!(
+                            "[zc-tail-rounds] composed rounds 7+8 fold (cascade +W''', out n={sixteenth}): {:.2} ms",
+                            t_c3.elapsed().as_secs_f64() * 1e3
+                        );
+                    }
+                    crate::scratch::give_f128(a2_out);
+                    crate::scratch::give_f128(b2_out);
+                    multilinear_msgs.push((m8_1, m8_inf));
+                    challenger.observe_f128(m8_1);
+                    challenger.observe_f128(m8_inf);
+                    mlv_rhos.push(challenger.sample_f128());
+
+                    // Round nine: evaluate the deferred quadratic at ρ₇.
+                    let (m9_1, m9_inf) = eval_round3_lookahead(&la9, mlv_rhos[6]);
+                    multilinear_msgs.push((m9_1, m9_inf));
+                    challenger.observe_f128(m9_1);
+                    challenger.observe_f128(m9_inf);
+                    mlv_rhos.push(challenger.sample_f128());
+
+                    // Rounds nine and ten fold together in one more plain
+                    // composed pass (ρ₇ and ρ₈ at once), replacing tail
+                    // iterations i = 6 and i = 7.
+                    let t_c4 = std::time::Instant::now();
+                    let sixty_fourth = n_groups / 64;
+                    let mut r_next10 = vec![F128::ONE; n_mlv - 8];
+                    r_next10[1..].copy_from_slice(&r[k_skip + 9..]);
+                    let mut a4_out = crate::scratch::take_f128_unpinned(sixty_fourth);
+                    let mut b4_out = crate::scratch::take_f128_unpinned(sixty_fourth);
+                    let (m10_1, m10_inf) = fold2_plain_and_round6_into(
+                        &a3_out,
+                        &b3_out,
+                        &mut a4_out,
+                        &mut b4_out,
+                        mlv_rhos[6],
+                        mlv_rhos[7],
+                        &r_next10,
+                    );
+                    if tail_round_timing {
+                        eprintln!(
+                            "[zc-tail-rounds] composed rounds 9+10 fold (out n={sixty_fourth}): {:.2} ms",
+                            t_c4.elapsed().as_secs_f64() * 1e3
+                        );
+                    }
+                    crate::scratch::give_f128(a3_out);
+                    crate::scratch::give_f128(b3_out);
+                    multilinear_msgs.push((m10_1, m10_inf));
+                    challenger.observe_f128(m10_1);
+                    challenger.observe_f128(m10_inf);
+                    mlv_rhos.push(challenger.sample_f128());
+                    (a4_out, b4_out, 8usize)
+                } else {
+                    let (m8_1, m8_inf) = fold2_plain_and_round6_into(
+                        &a2_out,
+                        &b2_out,
+                        &mut a3_out,
+                        &mut b3_out,
+                        mlv_rhos[4],
+                        mlv_rhos[5],
+                        &r_next8,
+                    );
+                    if tail_round_timing {
+                        eprintln!(
+                            "[zc-tail-rounds] composed rounds 7+8 fold (out n={sixteenth}): {:.2} ms",
+                            t_c3.elapsed().as_secs_f64() * 1e3
+                        );
+                    }
+                    crate::scratch::give_f128(a2_out);
+                    crate::scratch::give_f128(b2_out);
+                    multilinear_msgs.push((m8_1, m8_inf));
+                    challenger.observe_f128(m8_1);
+                    challenger.observe_f128(m8_inf);
+                    mlv_rhos.push(challenger.sample_f128());
+                    (a3_out, b3_out, 6usize)
                 }
-                crate::scratch::give_f128(a2_out);
-                crate::scratch::give_f128(b2_out);
-                multilinear_msgs.push((m8_1, m8_inf));
-                challenger.observe_f128(m8_1);
-                challenger.observe_f128(m8_inf);
-                mlv_rhos.push(challenger.sample_f128());
-                (a3_out, b3_out, 6usize)
             } else {
                 let (m6_1, m6_inf) = fold2_plain_and_round6_into(
                     &a_out,
