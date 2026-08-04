@@ -31,7 +31,6 @@
 
 use std::io;
 use std::path::Path;
-use std::sync::{Mutex, OnceLock};
 
 use serde::{Deserialize, Serialize};
 
@@ -159,18 +158,6 @@ pub struct ChainProofBundleLigerito {
 
 impl R1csProofBundleLigerito {
     pub fn to_bytes(&self) -> Vec<u8> {
-        // Fast path: the prover pre-encoded `header ‖ commitment ‖ zerocheck
-        // ‖ lincheck` concurrently with the PCS open (those sections are
-        // transcript-final before the open starts — see
-        // [`stash_pre_encoded_prefix`]); only `pcs_open` remains. bincode
-        // struct encoding is untagged field concatenation, so appending the
-        // last field reproduces the single-shot encode byte-for-byte; the
-        // fingerprint gate below guarantees the stash is for THIS bundle.
-        if let Some(mut out) = take_matching_pre_encoded(self) {
-            bincode::serialize_into(&mut out, &self.proof.pcs_open)
-                .expect("bincode serialize pcs_open");
-            return out;
-        }
         // Ranked bundles serialize to ~437–440 kB; the old 1 KiB hint forced
         // ~9 doubling reallocs (~875 kB of copying) inside the timed window.
         // 450 kB covers every observed ranked proof under the verifier's
@@ -184,117 +171,6 @@ impl R1csProofBundleLigerito {
         let payload = parse_header(bytes, FLAVOR_R1CS_LIGERITO)?;
         Ok(bincode::deserialize(payload)?)
     }
-}
-
-// ---------------------------------------------------------------------------
-// Publish-prefix pre-encode
-// ---------------------------------------------------------------------------
-
-/// A publish prefix — `header ‖ enc(commitment) ‖ enc(zerocheck) ‖
-/// enc(lincheck)` — encoded while the PCS open runs. Those three sections are
-/// transcript-committed before the open starts and the open only produces
-/// `pcs_open`, so their serialization can leave the publish tail (which sits
-/// between `prove_fast` returning and the proof file becoming visible to the
-/// harness — all inside the scored interval). The prefix is small (~4.3 kB of
-/// a ~437 kB ranked bundle: commitment 64 B, zerocheck ~3 kB, lincheck
-/// ~1.3 kB); the tail win is that encode plus the 450 kB output allocation,
-/// which the stash performs off-tail. `pcs_open` (~99% of the bytes) exists
-/// only after the open and can never leave the tail.
-struct PreEncodedPrefix {
-    /// The commitment's Merkle root. Two distinct proves sharing a root would
-    /// be a hash collision, so a root match pins the stash to this prove.
-    root: flock_core::merkle::Hash,
-    /// bincode-fixint encoded lengths of commitment / zerocheck / lincheck,
-    /// re-derived from the candidate bundle at publish via `serialized_size`
-    /// (same default fixint config as `serialize_into`).
-    sec_lens: [u64; 3],
-    /// `HEADER_LEN + sec_lens` bytes, with capacity already covering the full
-    /// bundle so the publish-tail `pcs_open` append never reallocates.
-    bytes: Vec<u8>,
-}
-
-/// Latest stashed prefix. Process-global and single-slot: the ranked worker
-/// never overlaps proves (`seed_pipe::try_adopt` drains the speculative run
-/// before a fallback prove starts), so the slot always holds the publishing
-/// prove's prefix — warmup's stash is consumed by `warm_publish_path`'s
-/// `to_bytes` (which thereby warms this fast path too), then the timed prove
-/// (direct or speculative-adopted) stores its own. Any staleness — foreign
-/// stash, concurrent test proves — is caught by the fingerprint and falls
-/// back to the full encode.
-static PRE_ENCODED: Mutex<Option<PreEncodedPrefix>> = Mutex::new(None);
-
-/// `FLOCK_NO_PRE_ENCODE=1` (exact string, matching the tree's kill-switch
-/// convention) restores the incumbent single-shot bundle encode. The ranked
-/// harness `env_clear()`s, so pre-encode is the default.
-pub(crate) fn pre_encode_enabled() -> bool {
-    static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var("FLOCK_NO_PRE_ENCODE").map_or(true, |v| v != "1"))
-}
-
-/// Encode and stash the publish prefix for a prove whose commitment /
-/// zerocheck / lincheck are final. Called by the prover on an efficiency-core
-/// helper concurrently with the PCS open (tens of µs of alloc + encode
-/// against a ~19 ms open). Replaces any previous stash.
-pub fn stash_pre_encoded_prefix(
-    commitment: &Commitment,
-    zerocheck: &flock_core::zerocheck::ZerocheckProof,
-    lincheck: &flock_core::lincheck::LincheckProof,
-) {
-    if !pre_encode_enabled() {
-        return;
-    }
-    // Same capacity as the incumbent `to_bytes`: the publish-tail `pcs_open`
-    // append extends this exact Vec, so it must never need to grow.
-    let mut bytes = Vec::with_capacity(HEADER_LEN + 450_000);
-    write_header(&mut bytes, FLAVOR_R1CS_LIGERITO);
-    let mut sec_lens = [0u64; 3];
-    let mut mark = bytes.len();
-    bincode::serialize_into(&mut bytes, commitment).expect("bincode serialize Commitment");
-    sec_lens[0] = (bytes.len() - mark) as u64;
-    mark = bytes.len();
-    bincode::serialize_into(&mut bytes, zerocheck).expect("bincode serialize ZerocheckProof");
-    sec_lens[1] = (bytes.len() - mark) as u64;
-    mark = bytes.len();
-    bincode::serialize_into(&mut bytes, lincheck).expect("bincode serialize LincheckProof");
-    sec_lens[2] = (bytes.len() - mark) as u64;
-    // Assignment-only critical section — nothing that can panic runs while
-    // the guard is held, so the lock cannot poison. A poisoned lock
-    // (unreachable in practice) skips the stash; publish then full-encodes.
-    if let Ok(mut slot) = PRE_ENCODED.lock() {
-        *slot = Some(PreEncodedPrefix {
-            root: commitment.root,
-            sec_lens,
-            bytes,
-        });
-    }
-}
-
-/// Take the stash iff it fingerprint-matches `bundle`: identical Merkle root
-/// AND identical bincode-fixint size for each of the three prefix sections.
-/// bincode-fixint encoding of equal values is deterministic, so a full match
-/// means the stashed bytes equal what a fresh encode of `bundle`'s prefix
-/// would produce. `None` (full-encode fallback) on any doubt — no stash,
-/// disabled switch, poisoned lock, any fingerprint miss. The stash is
-/// consumed on take; a repeat publish of the same bundle re-encodes from
-/// scratch, byte-identically.
-fn take_matching_pre_encoded(bundle: &R1csProofBundleLigerito) -> Option<Vec<u8>> {
-    if !pre_encode_enabled() {
-        return None;
-    }
-    let stash = PRE_ENCODED.lock().ok()?.take()?;
-    if stash.root != bundle.commitment.root {
-        return None;
-    }
-    let sec_lens = [
-        bincode::serialized_size(&bundle.commitment).ok()?,
-        bincode::serialized_size(&bundle.proof.zerocheck).ok()?,
-        bincode::serialized_size(&bundle.proof.lincheck).ok()?,
-    ];
-    if sec_lens != stash.sec_lens {
-        return None;
-    }
-    let want = HEADER_LEN + sec_lens.iter().sum::<u64>() as usize;
-    (stash.bytes.len() == want).then_some(stash.bytes)
 }
 
 impl ChainProofBundleLigerito {
