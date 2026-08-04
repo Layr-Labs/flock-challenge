@@ -807,8 +807,9 @@ fn gpu_grind_calibration(state_digest: &[u8; 32]) -> Result<Vec<Option<u64>>, St
 /// job's own channel. `FLOCK_NO_GRIND_WORKER=1` (or any worker setup failure)
 /// falls back to the exact incumbent scope-spawn path; a worker failure
 /// mid-job degrades to the same `Err` the spawned path would propagate (CPU
-/// grind fallback upstream). No GPU work is added or removed — only the
-/// thread-creation latency is.
+/// grind fallback upstream). `FLOCK_GRIND_WORKER_BLOCKING=1` restores the
+/// historical GPU-then-CPU ordering as a same-binary performance control. No
+/// GPU work is added or removed — only dispatch and wait ordering changes.
 mod grind_worker {
     use std::sync::atomic::AtomicBool;
     use std::sync::mpsc::{channel, Receiver, Sender};
@@ -827,6 +828,23 @@ mod grind_worker {
     struct Worker {
         tx: Sender<Job>,
         _thread: std::thread::JoinHandle<()>,
+    }
+
+    pub(super) struct Pending {
+        done: Receiver<Result<Option<u64>, String>>,
+    }
+
+    impl Pending {
+        pub(super) fn wait(self) -> Result<Option<u64>, String> {
+            self.done
+                .recv()
+                .unwrap_or_else(|_| Err("GPU grind worker channel closed".to_string()))
+        }
+    }
+
+    pub(super) fn async_enabled() -> bool {
+        static ON: OnceLock<bool> = OnceLock::new();
+        *ON.get_or_init(|| std::env::var_os("FLOCK_GRIND_WORKER_BLOCKING").is_none())
     }
 
     fn worker() -> Option<&'static Worker> {
@@ -859,11 +877,11 @@ mod grind_worker {
         .as_ref()
     }
 
-    /// Dispatch one GPU grind scan through the persistent worker. Returns
-    /// `None` when the worker is unavailable (kill switch or setup failure)
-    /// and the caller must run the incumbent scope-spawn path; `Some(result)`
-    /// is the scan outcome with the same `Err` surface as a direct
-    /// `gpu_blake3_pow_scan` call.
+    /// Dispatch one GPU grind scan through the persistent worker without
+    /// waiting for it. Returns `None` when the worker is unavailable (kill
+    /// switch or setup failure) and the caller must run the incumbent
+    /// scope-spawn path. The caller starts the CPU prefetch before waiting on
+    /// the returned handle, preserving the hybrid overlap.
     pub(super) fn dispatch(
         state_digest: &[u8; 32],
         start: u64,
@@ -871,7 +889,7 @@ mod grind_worker {
         bits: u32,
         stop: Arc<AtomicBool>,
         abort: bool,
-    ) -> Option<Result<Option<u64>, String>> {
+    ) -> Option<Pending> {
         let w = worker()?;
         let (done_tx, done_rx) = channel();
         let job = Job {
@@ -883,13 +901,11 @@ mod grind_worker {
             abort,
             done: done_tx,
         };
-        if w.tx.send(job).is_err() {
-            return Some(Err("GPU grind worker channel closed".to_string()));
-        }
-        match done_rx.recv() {
-            Ok(res) => Some(res),
-            Err(_) => Some(Err("GPU grind worker channel closed".to_string())),
-        }
+        // Even if the worker channel closed between `worker()` and `send`,
+        // return the receiver: dropping the rejected job's sender makes
+        // `Pending::wait` surface the same channel-closed error as before.
+        let _ = w.tx.send(job);
+        Some(Pending { done: done_rx })
     }
 }
 
@@ -932,7 +948,21 @@ fn gpu_blake3_pow_nonce(state_digest: &[u8; 32], bits: u32) -> Result<u64, Strin
                 std::sync::Arc::clone(&stop),
                 abort,
             ) {
+                Some(gpu) if grind_worker::async_enabled() => {
+                    let cpu = cpu_blake3_pow_window_inner(
+                        state_digest,
+                        next_start,
+                        block_len,
+                        bits,
+                        abort.then_some(stop.as_ref()),
+                    );
+                    (gpu.wait(), cpu)
+                }
                 Some(gpu) => {
+                    // Exact same-binary rollback for the historical worker
+                    // ordering: wait for the GPU block before starting the
+                    // CPU prefetch window.
+                    let gpu = gpu.wait();
                     let cpu = cpu_blake3_pow_window_inner(
                         state_digest,
                         next_start,
@@ -1547,6 +1577,38 @@ mod tests {
                 assert_eq!(got, expect, "seed={seed} bits={bits}");
             }
         }
+    }
+
+    /// Ranked-cost timing probe for the persistent hybrid worker. Run in
+    /// separate processes with and without `FLOCK_GRIND_WORKER_BLOCKING=1`.
+    #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+    #[test]
+    #[ignore]
+    fn gpu_grind_hybrid_speed_probe() {
+        if crate::gpu_commit::gpu_blake3_pow_scan(&[0u8; 32], 0, 64, 1).is_err() {
+            return;
+        }
+        const N: usize = 32;
+        let digests: [[u8; 32]; N] = std::array::from_fn(|i| {
+            let mut ch = FsChallenger::with_hash(b"grind-hybrid-speed", HashKind::Blake3);
+            ch.observe_bytes(&(i as u64).wrapping_mul(0x9E37_79B9).to_le_bytes());
+            ch.state_digest()
+        });
+        let started = std::time::Instant::now();
+        let mut checksum = 0u64;
+        for digest in &digests {
+            checksum ^= gpu_blake3_pow_nonce(digest, 19)
+                .expect("GPU grind must scan on an available device");
+        }
+        let wall_ms = started.elapsed().as_secs_f64() * 1e3;
+        eprintln!(
+            "gpu grind hybrid worker: mode={} n={N} wall={wall_ms:.2} ms checksum={checksum}",
+            if grind_worker::async_enabled() {
+                "async"
+            } else {
+                "blocking"
+            },
+        );
     }
 
     /// Paired micro-probe (not a correctness gate): generic batched scan vs
