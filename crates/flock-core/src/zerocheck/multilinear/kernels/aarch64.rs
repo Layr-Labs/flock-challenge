@@ -992,6 +992,9 @@ pub(crate) unsafe fn fold2_compact_and_round45_chunk_neon_8(
     eq_lo: *const F128,
     out_pairs: usize,
     degen: bool,
+    group_base: usize,
+    pad_mask: usize,
+    pad_from: usize,
     out: *mut F128,
 ) {
     use core::arch::aarch64::*;
@@ -1030,6 +1033,20 @@ pub(crate) unsafe fn fold2_compact_and_round45_chunk_neon_8(
             let mut b_flat = true;
             for lane in 0..4usize {
                 let g = 4 * t + lane;
+                // Both of this group's round-two pairs are padding: round two
+                // stored a zero anchor pair and a zero delta pair there, and
+                // the byte-fold tables map byte 0 to zero, so the whole lane
+                // reconstructs to (0, 0). Skip the 64-byte anchor line, the
+                // 32-byte delta half line and the sixteen table lookups; every
+                // product this lane feeds below is zero either way. `b_flat`
+                // is deliberately left alone — a zero `bv` can never pass the
+                // `ones_miss` test, so the fast path is unreachable with a
+                // padded lane present regardless of the flag.
+                if ((group_base + g) & pad_mask) >= pad_from {
+                    av[lane] = zero;
+                    bv[lane] = zero;
+                    continue;
+                }
                 let ap = anchors.add(4 * g).cast::<u64>();
                 let anc_a0 = vld1q_u64(ap);
                 let anc_b0 = vld1q_u64(ap.add(2));

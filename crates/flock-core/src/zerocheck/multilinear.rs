@@ -115,6 +115,39 @@ fn round2_pair_skip(padding: &PaddingSpec, k_skip: usize) -> (usize, usize) {
     (pairs_per_block - 1, useful_pairs)
 }
 
+/// Round-FOUR counterpart of [`round2_pair_skip`]: `(mask, first_padded)` for
+/// the K pass's output index `g`, which owns round-two pairs `2g` and `2g+1`.
+///
+/// Round two writes an all-zero anchor pair **and** an all-zero delta pair for
+/// every padded round-two pair (see the `pad0 & pad1` arm of
+/// `fold_round2_compact_chunk_neon_lookahead_8` and the `padded` arm of
+/// `r2_pair_fold_and_store`), and the byte-fold table's entry for byte value
+/// zero is exactly `F128::ZERO` (`UniSkipFoldTable::new`, preserved by
+/// `scaled_linear`). A round-four group whose *both* pairs are padded
+/// therefore reconstructs to `a = b = 0` from data that is known statically —
+/// so the K pass may skip its 64-byte anchor line and its 32-byte delta half
+/// line entirely instead of streaming them in from DRAM.
+///
+/// Padded pairs are the suffix `[useful_pairs, pair_mask]` of each block, and
+/// `2g & pair_mask == 2·(g & group_mask)`, so "both pairs padded" is exactly
+/// `(g & group_mask) >= useful_pairs.div_ceil(2)` (the even pair is the
+/// binding one; the odd pair sits one slot higher in the same block).
+///
+/// Returns `(0, usize::MAX)` — a predicate no `g` can satisfy — when the shape
+/// has no fully padded round-four group.
+fn round4_group_skip(padding: &PaddingSpec, k_skip: usize) -> (usize, usize) {
+    let (pair_mask, useful_pairs) = round2_pair_skip(padding, k_skip);
+    if useful_pairs == usize::MAX {
+        return (0, usize::MAX);
+    }
+    let groups_per_block = (pair_mask + 1) / 2;
+    let useful_groups = useful_pairs.div_ceil(2);
+    if groups_per_block == 0 || useful_groups >= groups_per_block {
+        return (0, usize::MAX);
+    }
+    (groups_per_block - 1, useful_groups)
+}
+
 /// Kill switch for draining the DRAM-bound tail loop rounds (half ≥ 2^21)
 /// through the hetero E-core queue (H2). `FLOCK_NO_ZC_TAIL_HETERO=1` keeps
 /// them on the main rayon pool. Bit-identical either way — chunk ownership
@@ -1873,6 +1906,7 @@ pub(crate) fn fold2_compact_and_round45_into(
     rho1: F128,
     rho2: F128,
     r_next4: &[F128],
+    padding: &PaddingSpec,
     a_out: &mut [F128],
     b_out: &mut [F128],
 ) -> (F128, F128, Round3Lookahead) {
@@ -1914,6 +1948,16 @@ pub(crate) fn fold2_compact_and_round45_into(
     let out_chunk = 2 * lo_size;
     #[cfg(target_arch = "aarch64")]
     let degen = r2_degen_enabled();
+    // Fully padded round-four groups reconstruct to (0, 0) from statically
+    // known zeros (see `round4_group_skip`), so the kernel stores that zero
+    // directly instead of loading the group's 64-byte anchor line and 32-byte
+    // delta half line. The predicate is evaluated on the ABSOLUTE group index
+    // (`g_base + g`), so it holds for any chunking.
+    // `n_chunks = 2^k_skip / 8`, and the assert above pins it to 8.
+    let k_skip_compact = table.n_chunks.trailing_zeros() as usize + 3;
+    let (pad_mask, pad_from) = round4_group_skip(padding, k_skip_compact);
+    #[cfg(not(target_arch = "aarch64"))]
+    let _ = (pad_mask, pad_from);
 
     let mut partials: Vec<(F128, F128)> = vec![(F128::ZERO, F128::ZERO); hi_size];
     // [p1_odd, pinf_odd, W0', W3', W4', W5'], eq_hi-weighted, one per chunk.
@@ -1948,6 +1992,9 @@ pub(crate) fn fold2_compact_and_round45_into(
                 eq_lo.as_ptr(),
                 lo_size,
                 degen,
+                x_hi * out_chunk,
+                pad_mask,
+                pad_from,
                 outv.as_mut_ptr(),
             );
         }
@@ -4264,7 +4311,7 @@ mod tests {
                     a_n.fill(LA_POISON);
                     b_n.fill(LA_POISON);
                     let (m4_1, m4_inf, la5) = fold2_compact_and_round45_into(
-                        &compact, &f.table, rho1, rho2, &r_next4, &mut a_n, &mut b_n,
+                        &compact, &f.table, rho1, rho2, &r_next4, &f.padding, &mut a_n, &mut b_n,
                     );
                     assert_eq!(
                         (m4_1, m4_inf),
@@ -4373,6 +4420,7 @@ mod tests {
             f.rho_grid[3],
             f.rho_grid[2],
             &r_next4,
+            &f.padding,
             &mut a_out,
             &mut b_out,
         );

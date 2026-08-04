@@ -784,6 +784,7 @@ fn prove_packed_padded_inner<C: Challenger>(
                 mlv_rhos[0],
                 mlv_rhos[1],
                 &r_next4,
+                padding,
                 &mut a_out,
                 &mut b_out,
             );
