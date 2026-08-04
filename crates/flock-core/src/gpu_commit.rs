@@ -2182,19 +2182,54 @@ kernel void ntt_fused_reg4_from_z(device uint4* data                [[buffer(0)]
 
 // ===========================================================================
 // From-z, tuned: the same pass with the two structural facts the plain
-// kernel leaves on the table.
+// kernel leaves on the table, now on the promoted byte16 multiply path.
 //
 // 1. l = 0 means EVERY tile lives in block B = 0 and uses the identical
 //    twiddle set, so the promoted g4 idiom applies unconditionally: one
-//    64-thread group builds the tables once and completes 4 consecutive-r
-//    tiles sequentially (same shape as ntt_fused_reg4g4 — 64-thread groups,
-//    unchanged register footprint).
+//    64-thread group completes 4 consecutive-r tiles sequentially (same
+//    shape as ntt_fused_reg4g4 — 64-thread groups, unchanged register
+//    footprint).
 // 2. Sub-layer 0 pairs (e, e+8) across the zero-padded coefficient half:
 //    v = 0 makes the butterfly nu = u, new_v = u — a pure copy. Skip its 8
-//    multiplies per tile and start the butterfly network at sub-layer 1
-//    (the tables for twiddle t = 0 are still built; the build loop's shape
-//    is not worth specializing).
+//    multiplies per tile and start the butterfly network at sub-layer 1.
+// 3. Multiplies use gf_mul_byte16 (16 threadgroup lookups) rebuilt per
+//    twiddle via NTT_G4_B16_SUBLAYER, matching the production f=4 body
+//    passes. The previous nibble-tab4 form paid 32 lookups per mul with a
+//    one-shot 15 KiB all-twiddle table; byte16 halves the lookups and keeps
+//    only the live 8 KiB table resident — the same trade that promoted the
+//    body `ntt_fused_reg4g4` path.
 // ===========================================================================
+// One (j, c) byte16 rebuild spent on all four g4 tiles. Unlike the body
+// NTT_G4_B16_SUBLAYER macro (which rebuilds inside a single-tile loop), the
+// from-z first pass has B = 0 for every tile in the group — the same twiddle
+// set — so each rebuild is amortized over LOG_G = 4 tiles. Rebuilding inside
+// the per-tile loop paid 4× the build cost of the incumbent one-shot nibble
+// tables and lost ranked −1.03% (9954108); this hoist restores the one-build
+// amortization the old kernel had.
+#define NTT_FROM_ZG4_B16_SUBLAYER(J, TILES)                                    \
+    {                                                                          \
+        constexpr uint j    = (J);                                             \
+        constexpr uint bpos = F - 1u - j;                                      \
+        constexpr uint NC   = 1u << j;                                         \
+        constexpr uint BPER = (NF >> 1) >> j;                                  \
+        for (uint c = 0; c < NC; c++) {                                        \
+            gf_build_byte16(tabB, twiddles,                                    \
+                            (1u << j) - 1u + c, lid);                          \
+            for (uint rr = 0; rr < (1u << LOG_G); rr++) {                      \
+                for (uint bb = 0; bb < BPER; bb++) {                           \
+                    const uint b   = c * BPER + bb;                            \
+                    const uint low = b & ((1u << bpos) - 1u);                  \
+                    const uint eu  = ((b >> bpos) << (bpos + 1u)) | low;       \
+                    const uint ev  = eu | (1u << bpos);                        \
+                    uint4 nu = (TILES)[rr][eu]                                 \
+                        ^ gf_mul_byte16((TILES)[rr][ev], &tabB[0]);            \
+                    (TILES)[rr][eu] = nu;                                      \
+                    (TILES)[rr][ev] ^= nu;                                     \
+                }                                                              \
+            }                                                                  \
+        }                                                                      \
+    }
+
 kernel void ntt_fused_reg4_from_zg4(device uint4* data                [[buffer(0)]],
                                     device const uint4* twiddles      [[buffer(1)]],
                                     constant NttParams& P             [[buffer(2)]],
@@ -2202,66 +2237,39 @@ kernel void ntt_fused_reg4_from_zg4(device uint4* data                [[buffer(0
                                     uint tgid [[threadgroup_position_in_grid]],
                                     uint lid  [[thread_index_in_threadgroup]])
 {
-    constexpr uint F   = 4u;
-    constexpr uint NF  = 1u << F;
-    constexpr uint NTW = NF - 1u;
+    constexpr uint F     = 4u;
+    constexpr uint NF    = 1u << F;
     constexpr uint LOG_G = 2u;
-    threadgroup uint4 bases[NTW * 4u];
-    threadgroup uint4 tabs[NTW * 64u];
+    // Live twiddle byte tables (8 KiB) + four tiles × 16 F128s in registers.
+    // Four tiles stay in `thread` storage (4 × 16 × 16 B = 1 KiB of register
+    // pressure for the tile state — the same 16-elem footprint the body g4
+    // kernel keeps, times four sequential-r tiles that share B = 0).
+    threadgroup uint4 tabB[512u];
 
-    const uint lane = lid & 63u;
+    const uint lane = lid;
     const uint r_base = tgid << LOG_G;
 
-    if (lid < NTW * 4u) {
-        uint t = lid >> 2;
-        uint k = lid & 3u;
-        uint j = 31u - clz(t + 1u);
-        uint c = t + 1u - (1u << j);
-        uint4 p = twiddles[(1u << j) - 1u + c];
-        for (uint m = 0; m < k * 4u; m++) { p = gf_mulx(p); }
-        bases[lid] = p;
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    for (uint ei = lid; ei < NTW * 64u; ei += 64u) {
-        uint t   = ei >> 6;
-        uint sub = ei & 63u;
-        uint n   = sub & 15u;
-        uint4 p  = bases[(t << 2) | (sub >> 4)];
-        uint4 val = uint4(0u);
-        for (uint k = 0; k < 4u; k++) {
-            if ((n >> k) & 1u) { val ^= p; }
-            p = gf_mulx(p);
+    // Sub-layer 0 with v = 0 is a pure copy for every tile: load z once per
+    // tile, duplicate into the upper half.
+    uint4 tiles[1u << LOG_G][NF];
+    for (uint rr = 0; rr < (1u << LOG_G); rr++) {
+        const uint r = r_base + rr;
+        for (uint e = 0; e < NF / 2u; e++) {
+            tiles[rr][e] = z[(((e << P.s) + r) << 6) + lane];
+            tiles[rr][e + NF / 2u] = tiles[rr][e];
         }
-        tabs[ei] = val;
     }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Sub-layers 1..3: one rebuild per (j, c), spent on all four tiles.
+    NTT_FROM_ZG4_B16_SUBLAYER(1u, tiles)
+    NTT_FROM_ZG4_B16_SUBLAYER(2u, tiles)
+    NTT_FROM_ZG4_B16_SUBLAYER(3u, tiles)
 
     for (uint rr = 0; rr < (1u << LOG_G); rr++) {
         const uint r = r_base + rr;
         const uint pos_base = r;
-
-        // Sub-layer 0 with v = 0 is a copy: load z once, duplicate.
-        uint4 elems[NF];
-        for (uint e = 0; e < NF / 2u; e++) {
-            elems[e] = z[(((e << P.s) + r) << 6) + lane];
-            elems[e + NF / 2u] = elems[e];
-        }
-
-        for (uint j = 1; j < F; j++) {
-            uint bpos = F - 1u - j;
-            for (uint b = 0; b < (NF >> 1); b++) {
-                uint low = b & ((1u << bpos) - 1u);
-                uint eu  = ((b >> bpos) << (bpos + 1u)) | low;
-                uint ev  = eu | (1u << bpos);
-                uint tsel = ((1u << j) - 1u) + (eu >> (F - j));
-                uint4 nu = elems[eu] ^ gf_mul_tab4(elems[ev], &tabs[tsel << 6]);
-                elems[eu] = nu;
-                elems[ev] ^= nu;
-            }
-        }
-
         for (uint e = 0; e < NF; e++) {
-            data[((pos_base + (e << P.s)) << 6) + lane] = elems[e];
+            data[((pos_base + (e << P.s)) << 6) + lane] = tiles[rr][e];
         }
     }
 }
@@ -3011,7 +3019,7 @@ kernel void blake3_pow_scan(
     const METALLIB: &[u8] = include_bytes!("gpu_shaders.metallib");
 
     /// FNV-1a (64-bit) of `MSL_SOURCE` when `gpu_shaders.metallib` was built.
-    const METALLIB_MSL_FNV1A: u64 = 0x7b23471589b0cbb6;
+    const METALLIB_MSL_FNV1A: u64 = 0x5fcaee647a822e4f;
 
     const fn fnv1a64(s: &str) -> u64 {
         let bytes = s.as_bytes();
