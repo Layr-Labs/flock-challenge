@@ -1722,8 +1722,20 @@ pub(crate) fn fold2_compact_and_round4_into(
     // single ordinary ρ₂ fold and only the two deltas carry ρ₁.
     let lambda1 = rho1 * (F128::ONE + rho2);
     let lambda3 = rho1 * rho2;
-    let table_l1 = table.scaled_linear(lambda1);
-    let table_l3 = table.scaled_linear(lambda3);
+    // Parallel dual-scale: two independent 32 KiB table builds (same
+    // scaled_linear as serial). Overlaps the two close-walks on the hetero
+    // pool before the chunk sweep. Kill: FLOCK_NO_K_FOLD_SCALE_JOIN=1.
+    let (table_l1, table_l3) = if std::env::var_os("FLOCK_NO_K_FOLD_SCALE_JOIN").is_none() {
+        rayon::join(
+            || table.scaled_linear(lambda1),
+            || table.scaled_linear(lambda3),
+        )
+    } else {
+        (
+            table.scaled_linear(lambda1),
+            table.scaled_linear(lambda3),
+        )
+    };
 
     let eq = SplitEqGhash::with_n_hi(&r_next4[1..], COMPACT_RECONSTRUCTION_N_HI);
     let lo_size = 1usize << eq.n_lo;
