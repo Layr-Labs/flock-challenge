@@ -4251,7 +4251,12 @@ kernel void blake3_pow_scan(
     /// Eight levels leave four roots (128 contiguous bytes) per chunk for the
     /// existing aligned-subtree builder. This is the same cache-local boundary
     /// used by the full-CPU ranked NTT-to-Merkle pipeline.
-    const HYBRID_LOCAL_PARENT_LEVELS: usize = 8;
+    // Was 8 of 10 possible on 1,024-leaf finish_chunk units: residual levels
+    // 9–10 rebuilt cold after the leaf hashes left L1. Densify to the full
+    // chunk height so the residual parent walk starts at the 1,024-leaf roots
+    // only (4 residual parents per subtree instead of a deeper cold climb).
+    // Kill: FLOCK_NO_HYBRID_LOCAL_PARENTS=1 disables the whole local path.
+    const HYBRID_LOCAL_PARENT_LEVELS: usize = 10;
 
     /// A/B-CONTROL: set the default to `false` for an exact source-level
     /// control when the worker environment is cleared by the benchmark
