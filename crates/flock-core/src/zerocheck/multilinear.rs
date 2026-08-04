@@ -1398,6 +1398,15 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead(
     let odd_on_gpu = gpu_prefix > 0 && zc_r2_odd_offload_enabled();
     #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
     let odd_on_gpu = false;
+    // W-emission: the GPU returns all six lookahead aggregates for its
+    // prefix, so those chunks drop to the anchors-only kernel — no products,
+    // no `mul_q` row weightings, the documented 0.55x-of-fused cost (see
+    // `ENV_NO_ZC_R2_W_EMISSION` in gpu_commit).
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    let w_on_gpu = gpu_prefix > 0 && gpu_job.as_ref().is_some_and(|j| j.w_emission);
+    #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+    let w_on_gpu = false;
+    let _ = w_on_gpu;
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     let t_cpu_sweep = std::time::Instant::now();
 
@@ -1446,6 +1455,20 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead(
                         degen,
                         periodic_padding,
                         out.as_mut_ptr(),
+                    );
+                } else if w_on_gpu {
+                    // GPU owns every product AND all six aggregates for this
+                    // chunk; write only the byte-identical anchors/deltas.
+                    fold_round2_compact_chunk_neon_anchors_only_8(
+                        t,
+                        ap,
+                        bp,
+                        anchors,
+                        deltas,
+                        lo_size,
+                        pair_idx_base,
+                        pair_in_block_mask,
+                        useful_pairs_inclusive,
                     );
                 } else if odd_on_gpu {
                     fold_round2_compact_chunk_neon_lookahead_8::<false, true>(
@@ -1544,7 +1567,9 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead(
             crate::gpu_commit::ZcR2Result::Prefix(vals) => {
                 for (x_hi, v) in vals.iter().enumerate() {
                     partials[x_hi] = (v[0] + v[2], v[1] + v[3]);
-                    if odd_on_gpu {
+                    if w_on_gpu {
+                        la_partials[x_hi] = [v[2], v[3], v[4], v[5], v[6], v[7]];
+                    } else if odd_on_gpu {
                         la_partials[x_hi][0] = v[2];
                         la_partials[x_hi][1] = v[3];
                     }
