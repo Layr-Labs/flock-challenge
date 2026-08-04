@@ -141,7 +141,15 @@ pub(crate) unsafe fn accumulate_convert(
 /// tables. It is gone — the eight α-free single-bit-`K` banks are pure u16 bit
 /// masks over the 16 `b_med` C bytes and need no table at all
 /// (see [`super::accumulate_c_banks`]). What remains here is the incumbent AB
-/// arm verbatim: 4 lanes per group, two adjacent `b_med` folded into one EOR3.
+/// arm: 4 lanes per group, two adjacent `b_med` folded into one EOR3.
+///
+/// Ranked completion streams a write-once 496 MiB `ab_inner` surface that is
+/// never re-read after this kernel (round two overwrites the donated buffer).
+/// Ordinary loads of that surface compete with the 64 KiB convert table for
+/// L1/L2 sets across a whole `x_hi` band. Default path: `ldnp` the live
+/// `n_b_med` rows into a stack bounce once, then gather from L1. Bytes are
+/// identical; only the temporal hint changes. Kill switch
+/// `FLOCK_NO_ZC_AB_COMPLETION_NT_LOAD=1` restores direct DRAM gathers.
 #[inline(always)]
 pub(crate) unsafe fn accumulate_convert_ab(
     chunk_ab_bytes: &[[u8; 64]; 16],
@@ -160,6 +168,31 @@ pub(crate) unsafe fn accumulate_convert_ab(
     // bounded by the debug-asserted table length: `b_med < 16` selects one of
     // 16 convert blocks.
     unsafe {
+        // Optional NT bounce of the live rows. Stack is L1-hot for the
+        // subsequent convert gathers; source lines are write-once cold DRAM.
+        let mut nt_rows = [[0u8; 64]; 16];
+        let src_rows: &[[u8; 64]; 16] = if ab_completion_nt_load_enabled() {
+            for b in 0..n_b_med {
+                let src = chunk_ab_bytes[b].as_ptr();
+                let dst = nt_rows[b].as_mut_ptr();
+                // Two 32-byte LDNP pairs cover one 64-byte b_med row.
+                core::arch::asm!(
+                    "ldnp {t0:q}, {t1:q}, [{src}]",
+                    "stp {t0:q}, {t1:q}, [{dst}]",
+                    "ldnp {t0:q}, {t1:q}, [{src}, #32]",
+                    "stp {t0:q}, {t1:q}, [{dst}, #32]",
+                    src = in(reg) src,
+                    dst = in(reg) dst,
+                    t0 = out(vreg) _,
+                    t1 = out(vreg) _,
+                    options(nostack),
+                );
+            }
+            &nt_rows
+        } else {
+            chunk_ab_bytes
+        };
+
         let convert_ptr = convert.as_ptr() as *const u8;
         let n_pairs = n_b_med / 2;
         for lane in (0..64).step_by(4) {
@@ -178,9 +211,9 @@ pub(crate) unsafe fn accumulate_convert_ab(
                 // One u32 load per b_med covers the 4 adjacent lanes; each
                 // extracted byte addresses the same table row as the original
                 // byte-load form.
-                let we = (chunk_ab_bytes[b_even].as_ptr().add(lane) as *const u32).read_unaligned()
+                let we = (src_rows[b_even].as_ptr().add(lane) as *const u32).read_unaligned()
                     as usize;
-                let wo = (chunk_ab_bytes[b_odd].as_ptr().add(lane) as *const u32).read_unaligned()
+                let wo = (src_rows[b_odd].as_ptr().add(lane) as *const u32).read_unaligned()
                     as usize;
                 ab0 = xor3_u8(
                     ab0,
@@ -208,7 +241,7 @@ pub(crate) unsafe fn accumulate_convert_ab(
             if n_b_med & 1 == 1 {
                 let b_med = n_b_med - 1;
                 let table = convert_ptr.add(b_med * 256 * 16);
-                let wa = (chunk_ab_bytes[b_med].as_ptr().add(lane) as *const u32).read_unaligned()
+                let wa = (src_rows[b_med].as_ptr().add(lane) as *const u32).read_unaligned()
                     as usize;
                 ab0 = veorq_u8(ab0, vld1q_u8(table.add((wa & 0xff) * 16)));
                 ab1 = veorq_u8(ab1, vld1q_u8(table.add(((wa >> 8) & 0xff) * 16)));
@@ -231,6 +264,20 @@ pub(crate) unsafe fn accumulate_convert_ab(
             drain_lane!(3, ab3);
         }
     }
+}
+
+/// Kill switch for the completion-side NT load bounce. Default ON (unset).
+/// Exact `FLOCK_NO_ZC_AB_COMPLETION_NT_LOAD=1` restores ordinary DRAM gathers.
+pub const ENV_NO_ZC_AB_COMPLETION_NT_LOAD: &str = "FLOCK_NO_ZC_AB_COMPLETION_NT_LOAD";
+
+#[inline]
+fn ab_completion_nt_load_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var_os(ENV_NO_ZC_AB_COMPLETION_NT_LOAD).as_deref()
+            != Some(std::ffi::OsStr::new("1"))
+    })
 }
 
 /// Eight α-free single-bit-`K` C banks, NEON — straight off the packed witness.
