@@ -151,7 +151,7 @@ pub struct Commitment {
 /// a factor of ~1.5 (e.g. at m=35: 13 GB → 9 GB).
 pub struct ProverData {
     pub codeword: CodewordBuf,
-    pub merkle_tree: MerkleTreeBuf,
+    pub merkle_tree: Vec<Hash>,
 }
 
 /// Storage for the L0 codeword. Normally a pooled `Vec` (CPU commit); with
@@ -161,37 +161,6 @@ pub struct ProverData {
 pub enum CodewordBuf {
     Cpu(Vec<F128>),
     Gpu(crate::gpu_commit::GpuCodeword),
-}
-
-/// Storage for the L0 Merkle tree. Ranked GPU commitments leave the tree in
-/// their persistent host-visible Metal buffer, avoiding a 64 MiB copy-out.
-pub enum MerkleTreeBuf {
-    Cpu(Vec<Hash>),
-    Gpu(crate::gpu_commit::GpuMerkleTree),
-}
-
-impl core::ops::Deref for MerkleTreeBuf {
-    type Target = [Hash];
-    fn deref(&self) -> &[Hash] {
-        match self {
-            MerkleTreeBuf::Cpu(v) => v,
-            MerkleTreeBuf::Gpu(g) => g,
-        }
-    }
-}
-
-impl core::fmt::Debug for MerkleTreeBuf {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.debug_struct("MerkleTreeBuf").field("len", &self.len()).finish()
-    }
-}
-
-impl PartialEq<Vec<Hash>> for MerkleTreeBuf {
-    fn eq(&self, other: &Vec<Hash>) -> bool { &**self == other.as_slice() }
-}
-
-impl PartialEq<MerkleTreeBuf> for Vec<Hash> {
-    fn eq(&self, other: &MerkleTreeBuf) -> bool { self.as_slice() == &**other }
 }
 
 impl core::ops::Deref for CodewordBuf {
@@ -211,18 +180,11 @@ impl core::ops::Deref for CodewordBuf {
 // copy-out target page-resident across the warmup and timed proves).
 impl Drop for ProverData {
     fn drop(&mut self) {
-        // Drop the borrowed GPU-tree view before releasing the staging lease
-        // carried by the codeword. This keeps both persistent GPU buffers
-        // protected for the complete lifetime of ProverData.
-        if let MerkleTreeBuf::Cpu(tree) =
-            std::mem::replace(&mut self.merkle_tree, MerkleTreeBuf::Cpu(Vec::new()))
-        {
-            crate::gpu_commit::give_tree(tree);
-        }
         match std::mem::replace(&mut self.codeword, CodewordBuf::Cpu(Vec::new())) {
             CodewordBuf::Cpu(v) => crate::scratch::give_f128(v),
             CodewordBuf::Gpu(g) => drop(g),
         }
+        crate::gpu_commit::give_tree(std::mem::take(&mut self.merkle_tree));
     }
 }
 
@@ -259,13 +221,6 @@ pub fn commit(z_packed: &[F128], params: &PcsParams) -> (Commitment, ProverData)
     // `z_packed` into the lower half, and zero-fill JUST the upper half (the
     // RS-encoding zero coefficients that the NTT's first-layer butterfly will
     // read). Saves ~64 MB of memory writes at m=29 (~9 ms).
-    if crate::gpu_commit::gpu_commit_latched_on()
-        && ranked_from_message_supported_len(params, codeword_len, z_packed)
-    {
-        // Latched Metal graph reads z directly into persistent staging.
-        // CPU fallback buffer is allocated lazily only if Metal fails.
-        return finalize_commit_impl(z_packed, Vec::new(), params, true);
-    }
     let codeword = crate::scratch::take_f128(codeword_len);
     commit_into(z_packed, params, codeword)
 }
@@ -330,20 +285,12 @@ pub fn use_ranked_from_message_commit(params: &PcsParams) -> bool {
 
 /// [`use_ranked_from_message_commit`] plus the buffer-geometry check
 /// [`commit_into`] needs before taking the fused path.
-fn ranked_from_message_supported_len(
-    params: &PcsParams,
-    codeword_len: usize,
-    z_packed: &[F128],
-) -> bool {
-    use_ranked_from_message_commit(params) && codeword_len == 2 * z_packed.len()
-}
-
 fn ranked_from_message_supported(
     params: &PcsParams,
     codeword: &[F128],
     z_packed: &[F128],
 ) -> bool {
-    ranked_from_message_supported_len(params, codeword.len(), z_packed)
+    use_ranked_from_message_commit(params) && codeword.len() == 2 * z_packed.len()
 }
 
 /// Commit from a codeword whose first `log_inv_rate` trivial NTT layers have
@@ -368,44 +315,6 @@ pub fn commit_preinitialized(
         "commit_preinitialized: codeword buffer has wrong length"
     );
     finalize_commit_impl(z_packed, codeword, params, false)
-}
-
-/// Complete a ranked commitment whose GPU from-`z` layers 0..3 were streamed
-/// during witness generation. On any stream/Metal failure this takes the
-/// unchanged stale codeword through the exact ordinary from-message CPU path.
-#[doc(hidden)]
-pub fn commit_from_streamed_first_pass(
-    z_packed: &[F128],
-    codeword: Vec<F128>,
-    params: &PcsParams,
-    stream: crate::gpu_commit::FromZFirstPassStream,
-) -> (Commitment, ProverData) {
-    params.validate();
-    assert_eq!(z_packed.len(), 1usize << params.log_msg_len());
-    // Empty marker: the latched caller omitted the speculative CPU fallback
-    // buffer; every CPU fallback gate hydrates it from the scratch pool.
-    assert!(
-        codeword.is_empty() || codeword.len() == params.codeword_len_f128(),
-        "streamed commit: codeword buffer has wrong length"
-    );
-    let (codeword, merkle_tree) = crate::gpu_commit::finish_from_z_first_pass_or_fallback(
-        stream,
-        z_packed,
-        codeword,
-        params,
-        |cw| cpu_transform_and_tree(cw, params, Some(z_packed)),
-    );
-    let root = *merkle_tree.last().expect("merkle tree non-empty");
-    (
-        Commitment {
-            root,
-            params: params.clone(),
-        },
-        ProverData {
-            codeword,
-            merkle_tree,
-        },
-    )
 }
 
 /// Process CPU (user+system) in ms for `FLOCK_COMMIT_TIMING` diagnostics.
@@ -460,6 +369,16 @@ pub fn replicate_message_fill(codeword: &mut [F128], msg: &[F128]) {
                 let src_off = (i * COPY_CHUNK) % msg_len;
                 dst.copy_from_slice(&msg[src_off..src_off + dst.len()]);
             });
+    } else if codeword.len() >= (1 << 20)
+        && codeword.len() / msg_len >= rayon::current_num_threads().saturating_mul(2)
+    {
+        // Recursive commits often have a small message but many exact replica
+        // blocks.  The serial fallback leaves those large buffers on one core;
+        // split only when there is at least a MiB of copy work and two blocks
+        // per worker, keeping tiny Ligerito levels on the cheap serial path.
+        codeword
+            .par_chunks_mut(msg_len)
+            .for_each(|rep| rep.copy_from_slice(msg));
     } else {
         for rep in codeword.chunks_mut(msg_len) {
             rep.copy_from_slice(msg);
@@ -847,11 +766,6 @@ pub fn prefault_codeword_during<R>(
         // Truly single-threaded (or explicitly disabled): no extra OS thread;
         // commit allocates inline. FLOCK_NO_PREFAULT lets benchmarks A/B the
         // offload and keeps fixed-thread-count sweeps honest.
-        return (None, generate());
-    }
-    // Warmup selected persistent Metal staging: do not pull the unused
-    // 1 GiB CPU codeword into the timed witness phase.
-    if crate::gpu_commit::gpu_commit_latched_on() && use_ranked_from_message_commit(params) {
         return (None, generate());
     }
     let codeword_len = params.n_positions() * params.num_ntts();
