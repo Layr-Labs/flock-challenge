@@ -8047,6 +8047,139 @@ kernel void rec_parent_hash(device const uint* children [[buffer(0)]],
     b3_compress(cv, block, 64u, B3_PARENT);
     for (int i = 0; i < 8; i++) parents[id * 8u + i] = cv[i];
 }
+
+// Three-level parent fuse (same algebra as commit parent_hash3).
+kernel void rec_parent_hash3(device const uint* children [[buffer(0)]],
+                             device uint* parents1       [[buffer(1)]],
+                             device uint* parents2       [[buffer(2)]],
+                             device uint* parents3       [[buffer(3)]],
+                             uint tgid [[threadgroup_position_in_grid]],
+                             uint lid  [[thread_index_in_threadgroup]])
+{
+    threadgroup uint level1[128u * 8u];
+    threadgroup uint level2[64u * 8u];
+    {
+        uint block[16];
+        const uint id = tgid * 128u + lid;
+        for (uint i = 0u; i < 16u; i++) block[i] = children[id * 16u + i];
+        uint cv[8];
+        for (uint i = 0u; i < 8u; i++) cv[i] = B3_IV[i];
+        b3_compress(cv, block, 64u, B3_PARENT);
+        for (uint i = 0u; i < 8u; i++) {
+            parents1[id * 8u + i] = cv[i];
+            level1[lid * 8u + i] = cv[i];
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (lid < 64u) {
+        uint block[16];
+        for (uint i = 0u; i < 8u; i++) {
+            block[i] = level1[(2u * lid) * 8u + i];
+            block[8u + i] = level1[(2u * lid + 1u) * 8u + i];
+        }
+        uint cv[8];
+        for (uint i = 0u; i < 8u; i++) cv[i] = B3_IV[i];
+        b3_compress(cv, block, 64u, B3_PARENT);
+        const uint id = tgid * 64u + lid;
+        for (uint i = 0u; i < 8u; i++) {
+            parents2[id * 8u + i] = cv[i];
+            level2[lid * 8u + i] = cv[i];
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (lid < 32u) {
+        uint block[16];
+        for (uint i = 0u; i < 8u; i++) {
+            block[i] = level2[(2u * lid) * 8u + i];
+            block[8u + i] = level2[(2u * lid + 1u) * 8u + i];
+        }
+        uint cv[8];
+        for (uint i = 0u; i < 8u; i++) cv[i] = B3_IV[i];
+        b3_compress(cv, block, 64u, B3_PARENT);
+        const uint id = tgid * 32u + lid;
+        for (uint i = 0u; i < 8u; i++) parents3[id * 8u + i] = cv[i];
+    }
+}
+
+// Leaf hash128 fused with three parent levels. Deletes the leaf-level global
+// reread that the separate leaf_hash128 → rec_parent_* sequence paid.
+// TG: 256+128+64 × 32 B = 14 KiB. Bit-identical to leaf + parent ladder.
+kernel void leaf_parent3_128(device const uint* codeword [[buffer(0)]],
+                             device uint* leaves         [[buffer(1)]],
+                             device uint* parents1       [[buffer(2)]],
+                             device uint* parents2       [[buffer(3)]],
+                             device uint* parents3       [[buffer(4)]],
+                             uint tgid [[threadgroup_position_in_grid]],
+                             uint lid  [[thread_index_in_threadgroup]])
+{
+    threadgroup uint level0[256u * 8u];
+    threadgroup uint level1[128u * 8u];
+    threadgroup uint level2[64u * 8u];
+
+    {
+        const uint id = tgid * 256u + lid;
+        device const uint* leaf = codeword + id * 32u;
+        uint cv[8];
+        for (uint i = 0u; i < 8u; i++) cv[i] = B3_IV[i];
+        uint block[16];
+        for (uint i = 0u; i < 16u; i++) block[i] = leaf[i];
+        b3_compress(cv, block, 64u, B3_CHUNK_START);
+        for (uint i = 0u; i < 16u; i++) block[i] = leaf[16u + i];
+        b3_compress(cv, block, 64u, B3_CHUNK_END);
+        for (uint i = 0u; i < 8u; i++) {
+            leaves[id * 8u + i] = cv[i];
+            level0[lid * 8u + i] = cv[i];
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (lid < 128u) {
+        uint block[16];
+        for (uint i = 0u; i < 8u; i++) {
+            block[i] = level0[(2u * lid) * 8u + i];
+            block[8u + i] = level0[(2u * lid + 1u) * 8u + i];
+        }
+        uint cv[8];
+        for (uint i = 0u; i < 8u; i++) cv[i] = B3_IV[i];
+        b3_compress(cv, block, 64u, B3_PARENT);
+        const uint id = tgid * 128u + lid;
+        for (uint i = 0u; i < 8u; i++) {
+            parents1[id * 8u + i] = cv[i];
+            level1[lid * 8u + i] = cv[i];
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (lid < 64u) {
+        uint block[16];
+        for (uint i = 0u; i < 8u; i++) {
+            block[i] = level1[(2u * lid) * 8u + i];
+            block[8u + i] = level1[(2u * lid + 1u) * 8u + i];
+        }
+        uint cv[8];
+        for (uint i = 0u; i < 8u; i++) cv[i] = B3_IV[i];
+        b3_compress(cv, block, 64u, B3_PARENT);
+        const uint id = tgid * 64u + lid;
+        for (uint i = 0u; i < 8u; i++) {
+            parents2[id * 8u + i] = cv[i];
+            level2[lid * 8u + i] = cv[i];
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (lid < 32u) {
+        uint block[16];
+        for (uint i = 0u; i < 8u; i++) {
+            block[i] = level2[(2u * lid) * 8u + i];
+            block[8u + i] = level2[(2u * lid + 1u) * 8u + i];
+        }
+        uint cv[8];
+        for (uint i = 0u; i < 8u; i++) cv[i] = B3_IV[i];
+        b3_compress(cv, block, 64u, B3_PARENT);
+        const uint id = tgid * 32u + lid;
+        for (uint i = 0u; i < 8u; i++) parents3[id * 8u + i] = cv[i];
+    }
+}
 "#;
 
     /// The exact recursive shapes worth offloading. L1 (2^18 leaves) wins
@@ -8059,6 +8192,10 @@ kernel void rec_parent_hash(device const uint* children [[buffer(0)]],
     struct RecMerkle {
         pso_leaf128: Id,
         pso_parent: Id,
+        /// Three-level parent fuse; NIL if compile failed.
+        pso_parent3: Id,
+        /// Leaf128 + three parent levels; NIL if compile failed.
+        pso_leaf_parent3: Id,
         /// Persistent flat-tree output buffers, one per supported shape
         /// (`2 * n - 1` nodes each); allocated once, untimed.
         tree_bufs: [(usize, Id); REC_MERKLE_SHAPES.len()],
@@ -8095,6 +8232,20 @@ kernel void rec_parent_hash(device const uint* children [[buffer(0)]],
                         return Err(e);
                     }
                 };
+                // Fuse kernels are optional: failure keeps the exact leaf+parent
+                // loop that already ships.
+                let pso_parent3 = compile_supplemental_pipeline(
+                    gpu,
+                    REC_MERKLE_MSL_SOURCE,
+                    "rec_parent_hash3",
+                )
+                .unwrap_or(NIL);
+                let pso_leaf_parent3 = compile_supplemental_pipeline(
+                    gpu,
+                    REC_MERKLE_MSL_SOURCE,
+                    "leaf_parent3_128",
+                )
+                .unwrap_or(NIL);
                 let mut tree_bufs = [(0usize, NIL); REC_MERKLE_SHAPES.len()];
                 for (slot, &n) in tree_bufs.iter_mut().zip(REC_MERKLE_SHAPES.iter()) {
                     match gpu.new_buffer((2 * n - 1) * 32) {
@@ -8102,6 +8253,12 @@ kernel void rec_parent_hash(device const uint* children [[buffer(0)]],
                         Err(e) => {
                             gpu.release(pso_leaf128);
                             gpu.release(pso_parent);
+                            if !pso_parent3.is_null() {
+                                gpu.release(pso_parent3);
+                            }
+                            if !pso_leaf_parent3.is_null() {
+                                gpu.release(pso_leaf_parent3);
+                            }
                             for &(_, b) in tree_bufs.iter() {
                                 if !b.is_null() {
                                     gpu.release(b);
@@ -8114,6 +8271,8 @@ kernel void rec_parent_hash(device const uint* children [[buffer(0)]],
                 let mut state = RecMerkle {
                     pso_leaf128,
                     pso_parent,
+                    pso_parent3,
+                    pso_leaf_parent3,
                     tree_bufs,
                     wraps: Vec::new(),
                     hits: 0,
@@ -8258,19 +8417,62 @@ kernel void rec_parent_hash(device const uint* children [[buffer(0)]],
             .expect("shape checked above");
 
         let total_nodes = 2 * num_leaves - 1;
+        let use_leaf_parent3 = !state.pso_leaf_parent3.is_null()
+            && num_leaves >= 256
+            && num_leaves.is_multiple_of(256)
+            && std::env::var_os("FLOCK_NO_GPU_REC_LEAF_PARENT3").is_none();
+        let use_parent3 = !state.pso_parent3.is_null()
+            && std::env::var_os("FLOCK_NO_GPU_REC_PARENT3").is_none();
         let run = unsafe {
             let pool = gpu.pool_push();
             let run = (|| -> Result<(), String> {
                 let cb = gpu.command_buffer()?;
                 let enc = gpu.compute_encoder(cb)?;
-                gpu.set_pipeline(enc, state.pso_leaf128);
-                gpu.set_buffer(enc, data_buf, 0, 0);
-                gpu.set_buffer(enc, tree_buf, 0, 1);
-                let tpg = 256u64.min(num_leaves as u64);
-                gpu.dispatch(enc, num_leaves as u64 / tpg, tpg);
-                gpu.set_pipeline(enc, state.pso_parent);
                 let mut read_start = 0usize;
                 let mut read_len = num_leaves;
+                if use_leaf_parent3 {
+                    let w1 = read_start + read_len;
+                    let w1n = read_len / 2;
+                    let w2 = w1 + w1n;
+                    let w2n = w1n / 2;
+                    let w3 = w2 + w2n;
+                    let w3n = w2n / 2;
+                    gpu.set_pipeline(enc, state.pso_leaf_parent3);
+                    gpu.set_buffer(enc, data_buf, 0, 0);
+                    gpu.set_buffer(enc, tree_buf, read_start * 32, 1);
+                    gpu.set_buffer(enc, tree_buf, w1 * 32, 2);
+                    gpu.set_buffer(enc, tree_buf, w2 * 32, 3);
+                    gpu.set_buffer(enc, tree_buf, w3 * 32, 4);
+                    gpu.dispatch(enc, (read_len / 256) as u64, 256);
+                    read_start = w3;
+                    read_len = w3n;
+                } else {
+                    gpu.set_pipeline(enc, state.pso_leaf128);
+                    gpu.set_buffer(enc, data_buf, 0, 0);
+                    gpu.set_buffer(enc, tree_buf, 0, 1);
+                    let tpg = 256u64.min(num_leaves as u64);
+                    gpu.dispatch(enc, num_leaves as u64 / tpg, tpg);
+                }
+                if use_parent3 {
+                    gpu.set_pipeline(enc, state.pso_parent3);
+                    while read_len >= 256 {
+                        let w1 = read_start + read_len;
+                        let w1n = read_len / 2;
+                        let w2 = w1 + w1n;
+                        let w2n = w1n / 2;
+                        let w3 = w2 + w2n;
+                        let w3n = w2n / 2;
+                        debug_assert_eq!(read_len % 256, 0);
+                        gpu.set_buffer(enc, tree_buf, read_start * 32, 0);
+                        gpu.set_buffer(enc, tree_buf, w1 * 32, 1);
+                        gpu.set_buffer(enc, tree_buf, w2 * 32, 2);
+                        gpu.set_buffer(enc, tree_buf, w3 * 32, 3);
+                        gpu.dispatch(enc, (read_len / 256) as u64, 128);
+                        read_start = w3;
+                        read_len = w3n;
+                    }
+                }
+                gpu.set_pipeline(enc, state.pso_parent);
                 while read_len > 1 {
                     let write_start = read_start + read_len;
                     let n_out = read_len / 2;
