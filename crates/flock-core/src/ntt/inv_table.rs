@@ -60,13 +60,7 @@ impl InvNttTableByteSingleGf8 {
         // Odd byte positions need each vector's two 8-byte halves exchanged.
         // Keep that permutation as a second AArch64 image so the URM leaf can
         // load it directly instead of executing an EXT for every vector.
-        //
-        // Images 2/3 are the same pair pre-multiplied by the field constant
-        // x^4. `T` is GF(2)-linear in the packed row, so `x^4 · T(w)` is just
-        // `T` applied out of the scaled image — that lets the zerocheck
-        // shift-reduce kernel fold half of its `x^K` weights into the table
-        // lookup instead of paying for them with vector instructions.
-        let table_images = if cfg!(target_arch = "aarch64") { 4 } else { 1 };
+        let table_images = if cfg!(target_arch = "aarch64") { 2 } else { 1 };
         let mut data = vec![F8::ZERO; table_images * table_len + TABLE_ALIGNMENT - 1];
         let data_offset = (TABLE_ALIGNMENT - (data.as_ptr() as usize & (TABLE_ALIGNMENT - 1)))
             & (TABLE_ALIGNMENT - 1);
@@ -117,23 +111,6 @@ impl InvNttTableByteSingleGf8 {
             }
         }
 
-        // Images 2/3: `x^4 · T` and its half-swapped twin. `F8::mul` by the
-        // constant `x^4` is a GF(2)-linear map, so applying `T` out of these
-        // images yields exactly `x^4 · T(w)` for every packed row `w`.
-        #[cfg(target_arch = "aarch64")]
-        {
-            const X4: F8 = F8(1u8 << 4);
-            let scaled_start = data_offset + 2 * table_len;
-            let (base_storage, scaled_storage) = data.split_at_mut(scaled_start);
-            // Two source images (plain, half-swapped) map to two scaled ones,
-            // so a single elementwise pass covers both.
-            let source = &base_storage[data_offset..data_offset + 2 * table_len];
-            let scaled = &mut scaled_storage[..2 * table_len];
-            for (src, dst) in source.iter().zip(scaled.iter_mut()) {
-                *dst = *src * X4;
-            }
-        }
-
         Self {
             k,
             ell,
@@ -174,32 +151,6 @@ impl InvNttTableByteSingleGf8 {
         debug_assert!(self.ell >= 16);
         // SAFETY: construction appends one complete logical table image.
         unsafe { self.data.as_ptr().add(self.data_offset + 256 * self.ell) as *const u8 }
-    }
-
-    /// AArch64-only table image pre-multiplied by the field constant `x^4`.
-    /// Applying the byte-collapse out of this image returns `x^4 · T(w)`.
-    #[cfg(target_arch = "aarch64")]
-    #[inline]
-    pub fn scaled_x4_data_ptr(&self) -> *const u8 {
-        // SAFETY: construction appends four complete logical table images.
-        unsafe {
-            self.data
-                .as_ptr()
-                .add(self.data_offset + 2 * 256 * self.ell) as *const u8
-        }
-    }
-
-    /// Half-swapped twin of [`Self::scaled_x4_data_ptr`].
-    #[cfg(target_arch = "aarch64")]
-    #[inline]
-    pub fn scaled_x4_half_swapped_data_ptr(&self) -> *const u8 {
-        debug_assert!(self.ell >= 16);
-        // SAFETY: construction appends four complete logical table images.
-        unsafe {
-            self.data
-                .as_ptr()
-                .add(self.data_offset + 3 * 256 * self.ell) as *const u8
-        }
     }
 
     #[inline]
