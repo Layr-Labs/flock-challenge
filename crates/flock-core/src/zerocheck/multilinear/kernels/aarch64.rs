@@ -668,13 +668,18 @@ unsafe fn r2_pair_fold_and_store(
 /// recompute the odd half for the lookahead's `W1`/`W2`. Keeping that split
 /// costs the GPU nothing, and lets this kernel drop two more of its eight
 /// products: **32 PMULL per group instead of 38** on every offloaded chunk.
-/// The four `mul_q` row weightings survive because `W0`/`W3`/`W4`/`W5` still
-/// need all four scaled rows.
+///
+/// With `W_ON_GPU = true` (implies the GPU also emits `W0/W3/W4/W5`) slots
+/// 4..8 stay zero and the four `mul_q` row weightings are deleted too: the
+/// CPU path is pure anchor/delta stores — **0 product PMULLs** per group on
+/// an offloaded chunk. That is the pre-lookahead residual regime the share
+/// gate's `ALPHA = 0.55` was calibrated for.
 #[cfg(target_arch = "aarch64")]
 #[target_feature(enable = "aes")]
 pub(crate) unsafe fn fold_round2_compact_chunk_neon_lookahead_8<
     const FULL: bool,
     const ODD_ON_GPU: bool,
+    const W_ON_GPU: bool,
 >(
     table_data: *const u8,
     a_packed: *const u8,
@@ -722,6 +727,9 @@ pub(crate) unsafe fn fold_round2_compact_chunk_neon_lookahead_8<
             core::mem::transmute::<F128, uint64x2_t>(F128::ONE),
         ));
 
+        // Pure anchors/deltas: GPU owns every product on this chunk.
+        let products = FULL || !ODD_ON_GPU || !W_ON_GPU;
+
         let n_groups = lo_size / 2;
         for u in 0..n_groups {
             let x_lo0 = 2 * u;
@@ -743,6 +751,10 @@ pub(crate) unsafe fn fold_round2_compact_chunk_neon_lookahead_8<
                 table_data, a_packed, b_packed, anchors, deltas, x_lo1, pad1, degen, b_ones,
             );
 
+            if !products {
+                continue;
+            }
+
             // The odd lane's weight drives the whole group; see the doc above.
             let w = vld1q_u64(eq_lo.add(x_lo1).cast::<u64>());
 
@@ -755,7 +767,9 @@ pub(crate) unsafe fn fold_round2_compact_chunk_neon_lookahead_8<
                 if !ODD_ON_GPU {
                     wide_xor(&mut p1_odd, mul_unreduced_q(w, a3));
                 }
-                wide_xor(&mut w0, mul_unreduced_q(w, a2));
+                if !W_ON_GPU {
+                    wide_xor(&mut w0, mul_unreduced_q(w, a2));
+                }
                 continue;
             }
 
@@ -787,20 +801,24 @@ pub(crate) unsafe fn fold_round2_compact_chunk_neon_lookahead_8<
                         );
                     }
                 }
-                wide_xor(&mut w0, mul_unreduced_q(a2w, b2));
+                if !W_ON_GPU {
+                    wide_xor(&mut w0, mul_unreduced_q(a2w, b2));
+                }
             }
 
             // ---- deferred round-three aggregates (no extra lookups) ----
-            let e_aw = veorq_u64(a0w, a2w);
-            let o_aw = veorq_u64(a1w, a3w);
-            let e_b = veorq_u64(b0, b2);
-            let o_b = veorq_u64(b1, b3);
-            wide_xor(&mut w3, mul_unreduced_q(e_aw, e_b));
-            wide_xor(&mut w4, mul_unreduced_q(o_aw, o_b));
-            wide_xor(
-                &mut w5,
-                mul_unreduced_q(veorq_u64(e_aw, o_aw), veorq_u64(e_b, o_b)),
-            );
+            if !W_ON_GPU {
+                let e_aw = veorq_u64(a0w, a2w);
+                let o_aw = veorq_u64(a1w, a3w);
+                let e_b = veorq_u64(b0, b2);
+                let o_b = veorq_u64(b1, b3);
+                wide_xor(&mut w3, mul_unreduced_q(e_aw, e_b));
+                wide_xor(&mut w4, mul_unreduced_q(o_aw, o_b));
+                wide_xor(
+                    &mut w5,
+                    mul_unreduced_q(veorq_u64(e_aw, o_aw), veorq_u64(e_b, o_b)),
+                );
+            }
         }
 
         *out.add(0) = core::mem::transmute::<uint64x2_t, F128>(reduce_wide_q(p1_even));

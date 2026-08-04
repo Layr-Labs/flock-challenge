@@ -100,6 +100,21 @@ fn zc_r2_odd_offload_enabled() -> bool {
     *ON
 }
 
+/// Kill switch for adopting the GPU arm's four group products `W0/W3/W4/W5`
+/// as the remaining round-three lookahead slots. With this on (default), an
+/// offloaded chunk leaves the CPU with pure anchor/delta work and no field
+/// products at all — the pre-lookahead residual regime. `FLOCK_NO_ZC_R2_W_OFFLOAD=1`
+/// restores the post-odd-offload division of labour (CPU still recomputes the
+/// four group products). Requires the odd-offload path; the calibration oracle
+/// checks all six lookahead slots bit-for-bit before the arm is admitted.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn zc_r2_w_offload_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        std::env::var_os("FLOCK_NO_ZC_R2_W_OFFLOAD").is_none_or(|v| v != *"1")
+    });
+    *ON
+}
+
 fn round2_pair_skip(padding: &PaddingSpec, k_skip: usize) -> (usize, usize) {
     if padding.k_log <= k_skip + 1 {
         return (0, usize::MAX);
@@ -1377,14 +1392,18 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead(
     );
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     let gpu_prefix = gpu_job.as_ref().map_or(0, |j| j.cpu_split());
-    // The GPU arm now returns its round-two products parity-split, so on an
-    // offloaded chunk the CPU can skip the odd-parity pair as well as the even
-    // one instead of recomputing the odd half for `W1`/`W2`. The kill switch
-    // restores the incumbent division of labour within the same binary.
+    // The GPU arm now returns its round-two products parity-split *and* the
+    // four group products W0/W3/W4/W5, so on an offloaded chunk the CPU can
+    // skip every field product and keep only the anchor/delta compact-state
+    // stores. Kill switches restore earlier divisions of labour independently.
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     let odd_on_gpu = gpu_prefix > 0 && zc_r2_odd_offload_enabled();
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    let w_on_gpu = odd_on_gpu && zc_r2_w_offload_enabled();
     #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
     let odd_on_gpu = false;
+    #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+    let w_on_gpu = false;
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     let t_cpu_sweep = std::time::Instant::now();
 
@@ -1419,7 +1438,23 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead(
                 let ap = a_packed.as_ptr().add(row_base * n_chunks);
                 let bp = b_packed.as_ptr().add(row_base * n_chunks);
                 if full {
-                    fold_round2_compact_chunk_neon_lookahead_8::<true, false>(
+                    fold_round2_compact_chunk_neon_lookahead_8::<true, false, false>(
+                        t,
+                        ap,
+                        bp,
+                        anchors,
+                        deltas,
+                        eq_lo.as_ptr(),
+                        lo_size,
+                        pair_idx_base,
+                        pair_in_block_mask,
+                        useful_pairs_inclusive,
+                        degen,
+                        out.as_mut_ptr(),
+                    );
+                } else if w_on_gpu {
+                    // GPU owns every product: CPU is pure anchors/deltas.
+                    fold_round2_compact_chunk_neon_lookahead_8::<false, true, true>(
                         t,
                         ap,
                         bp,
@@ -1434,7 +1469,7 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead(
                         out.as_mut_ptr(),
                     );
                 } else if odd_on_gpu {
-                    fold_round2_compact_chunk_neon_lookahead_8::<false, true>(
+                    fold_round2_compact_chunk_neon_lookahead_8::<false, true, false>(
                         t,
                         ap,
                         bp,
@@ -1449,7 +1484,7 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead(
                         out.as_mut_ptr(),
                     );
                 } else {
-                    fold_round2_compact_chunk_neon_lookahead_8::<false, false>(
+                    fold_round2_compact_chunk_neon_lookahead_8::<false, false, false>(
                         t,
                         ap,
                         bp,
@@ -1532,14 +1567,20 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead(
                         la_partials[x_hi][0] = v[2];
                         la_partials[x_hi][1] = v[3];
                     }
+                    if w_on_gpu {
+                        la_partials[x_hi][2] = v[4];
+                        la_partials[x_hi][3] = v[5];
+                        la_partials[x_hi][4] = v[6];
+                        la_partials[x_hi][5] = v[7];
+                    }
                 }
             }
             crate::gpu_commit::ZcR2Result::Failed => {
                 // Redo exactly the skipped prefix products — slower, still
                 // exact. Throwaway anchor/delta scratch: the real ranges were
                 // already written by the lookahead pass. The full-lookahead
-                // monomorphization is used so the odd-parity slots are
-                // recovered too when the CPU sweep skipped them.
+                // monomorphization is used so every product slot is recovered
+                // when the CPU sweep skipped it.
                 let mut scr_anchors = vec![F128::ZERO; anchor_chunk_size];
                 let mut scr_deltas = vec![0u8; delta_chunk_size];
                 for x_hi in 0..prefix {
@@ -1547,7 +1588,7 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead(
                     let row_base = pair_idx_base * 2;
                     let mut out = [F128::ZERO; 8];
                     unsafe {
-                        fold_round2_compact_chunk_neon_lookahead_8::<true, false>(
+                        fold_round2_compact_chunk_neon_lookahead_8::<true, false, false>(
                             table.data.as_ptr().cast::<u8>(),
                             a_packed.as_ptr().add(row_base * n_chunks),
                             b_packed.as_ptr().add(row_base * n_chunks),
@@ -1570,6 +1611,12 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead(
                     if odd_on_gpu {
                         la_partials[x_hi][0] = eq_h * out[2];
                         la_partials[x_hi][1] = eq_h * out[3];
+                    }
+                    if w_on_gpu {
+                        la_partials[x_hi][2] = eq_h * out[4];
+                        la_partials[x_hi][3] = eq_h * out[5];
+                        la_partials[x_hi][4] = eq_h * out[6];
+                        la_partials[x_hi][5] = eq_h * out[7];
                     }
                 }
             }
