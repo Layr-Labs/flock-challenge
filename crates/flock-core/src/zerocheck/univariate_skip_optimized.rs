@@ -601,6 +601,15 @@ fn ab_pre_nt_enabled() -> bool {
     *ON.get_or_init(|| std::env::var_os(ENV_NO_ZC_AB_PRE_NT).is_none())
 }
 
+/// Kill switch restoring explicit zero-fill of AB precompute padding holes.
+/// Default OFF (holes left unwritten): consumers only touch `0..n_b_med`.
+pub const ENV_ZC_AB_PRE_ZERO_TAIL: &str = "FLOCK_ZC_AB_PRE_ZERO_TAIL";
+
+fn ab_pre_zero_tail_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os(ENV_ZC_AB_PRE_ZERO_TAIL).is_some())
+}
+
 /// Non-temporal 64-byte store (L1 stack bounce → `stnp` pair burst), the same
 /// best-effort cache-bypass idiom as the witness stripe drain. The precompute
 /// output is a 512 MiB write-once surface whose consumer runs tens of
@@ -692,8 +701,10 @@ fn precompute_round1_ab_inner_packed_padded_with_flavor(
     debug_assert_eq!(OUTER_BYTES, (1 << N_INNER) * N_CHUNKS);
 
     // Reuse an A-sized resident F128 allocation from the prover scratch pool.
-    // Treating it as bytes is valid because every byte is written below before
-    // the storage is read (including explicit zero writes for padding holes).
+    // Treating it as bytes is valid because every *live* byte (`0..n_b_med` per
+    // outer chunk) is written below before the storage is read. Padding holes
+    // are unwritten by default (see `ab_pre_zero_tail_enabled`); consumers
+    // never index past `n_b_med`.
     let mut storage = crate::scratch::take_f128(total_bytes / core::mem::size_of::<F128>());
     let out_bytes: &mut [u8] =
         unsafe { core::slice::from_raw_parts_mut(storage.as_mut_ptr() as *mut u8, total_bytes) };
@@ -757,16 +768,25 @@ fn precompute_round1_ab_inner_packed_padded_with_flavor(
                         };
                     }
                 }
-                if nt {
-                    let tail = &mut out_outer[n_b_med * 64..];
-                    debug_assert_eq!(tail.len() % 64, 0);
-                    let zero = [0u8; 64];
-                    for i in 0..tail.len() / 64 {
-                        // SAFETY: chunk `i` is 64 in-bounds bytes of `tail`.
-                        unsafe { store_nt_64(zero.as_ptr(), tail.as_mut_ptr().add(i * 64)) };
+                // Padding-hole stores: consumers gate on `n_b_med` and never
+                // read `out_outer[n_b_med*64..]`. Ranked BLAKE3 leaves one fully
+                // padding 64 B block per 16384-bit witness block in the second
+                // window (n_b_med=15 of 16) — 16 MiB pure zero traffic at m=32.
+                // Scratch `take_f128` is write-before-read; skipping these
+                // stores removes DRAM bytes without a substitute read.
+                // `FLOCK_ZC_AB_PRE_ZERO_TAIL=1` restores incumbent zero-fill.
+                if ab_pre_zero_tail_enabled() {
+                    if nt {
+                        let tail = &mut out_outer[n_b_med * 64..];
+                        debug_assert_eq!(tail.len() % 64, 0);
+                        let zero = [0u8; 64];
+                        for i in 0..tail.len() / 64 {
+                            // SAFETY: chunk `i` is 64 in-bounds bytes of `tail`.
+                            unsafe { store_nt_64(zero.as_ptr(), tail.as_mut_ptr().add(i * 64)) };
+                        }
+                    } else {
+                        out_outer[n_b_med * 64..].fill(0);
                     }
-                } else {
-                    out_outer[n_b_med * 64..].fill(0);
                 }
             },
         );
@@ -3267,12 +3287,26 @@ mod tests {
             let nt = precompute_round1_ab_inner_packed_padded_with_flavor(
                 &a_p, &b_p, m, K_SKIP, &table, &padding, true,
             );
-            assert_eq!(
-                plain.as_bytes(),
-                nt.as_bytes(),
-                "store flavor changed bytes at m={m}, padded={}",
-                padded.is_some()
-            );
+            // Live tiles only: padding holes are unwritten by default.
+            let plain_b = plain.as_bytes();
+            let nt_b = nt.as_bytes();
+            assert_eq!(plain_b.len(), nt_b.len());
+            let (within_outer_mask, b_med_counts) = build_b_med_counts(&padding);
+            let outer_bytes: usize = 1 << (N_INNER + N_MEDIUM);
+            for (x_outer, (p_outer, n_outer)) in plain_b
+                .chunks(outer_bytes)
+                .zip(nt_b.chunks(outer_bytes))
+                .enumerate()
+            {
+                let n_b_med = b_med_counts[x_outer & within_outer_mask] as usize;
+                let live = (n_b_med * 64).min(p_outer.len());
+                assert_eq!(
+                    &p_outer[..live],
+                    &n_outer[..live],
+                    "store flavor changed live bytes at m={m}, x_outer={x_outer}, padded={}",
+                    padded.is_some()
+                );
+            }
         }
     }
 
