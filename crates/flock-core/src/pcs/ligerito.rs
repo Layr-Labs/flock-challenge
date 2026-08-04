@@ -2753,9 +2753,65 @@ fn transpose_forward_ntt_sparse_hashmap(
 /// (one `pos` across all lanes) is one Merkle leaf.
 pub(crate) struct LigeroWitness {
     pub mat: Vec<F128>,
-    pub tree: Vec<Hash>,
+    pub tree: LigeroMerkleTree,
     pub block_len: usize,
     pub num_interleaved: usize,
+}
+
+/// Recursive-commit tree storage. CPU and rollback paths retain the ordinary
+/// owned vector; the exact ranked L1 GPU path keeps a read-only lease on the
+/// persistent host-visible Metal output and therefore skips its 16 MiB
+/// copy-out. Both variants expose the identical flat-tree slice.
+pub(crate) enum LigeroMerkleTree {
+    Cpu(Vec<Hash>),
+    Gpu(crate::gpu_commit::GpuRecursiveMerkleTree),
+}
+
+impl Default for LigeroMerkleTree {
+    fn default() -> Self {
+        Self::Cpu(Vec::new())
+    }
+}
+
+impl core::ops::Deref for LigeroMerkleTree {
+    type Target = [Hash];
+
+    fn deref(&self) -> &[Hash] {
+        match self {
+            Self::Cpu(tree) => tree,
+            Self::Gpu(tree) => tree,
+        }
+    }
+}
+
+impl core::fmt::Debug for LigeroMerkleTree {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("LigeroMerkleTree")
+            .field("kind", &match self {
+                Self::Cpu(_) => "cpu",
+                Self::Gpu(_) => "gpu",
+            })
+            .field("len", &self.len())
+            .finish()
+    }
+}
+
+impl PartialEq for LigeroMerkleTree {
+    fn eq(&self, other: &Self) -> bool {
+        **self == **other
+    }
+}
+
+impl Eq for LigeroMerkleTree {}
+
+impl LigeroMerkleTree {
+    #[cfg(test)]
+    fn into_vec(self) -> Vec<Hash> {
+        match self {
+            Self::Cpu(tree) => tree,
+            Self::Gpu(tree) => tree.to_vec(),
+        }
+    }
 }
 
 // Recycle the codeword matrix (128 MB for L1 at m=29) through the scratch
@@ -2907,13 +2963,28 @@ fn ligero_commit_impl(
     // (kill switch `FLOCK_NO_GPU_RECURSIVE_MERKLE=1`, non-Blake3 hashes,
     // other shapes, and every GPU failure).
     let gpu_tree = if matches!(kind, HashKind::Blake3) && leaf_size_bytes == 128 {
-        crate::gpu_commit::gpu_recursive_merkle_blake3(data_bytes, block_len)
+        if crate::gpu_commit::gpu_recursive_merkle_view_enabled() {
+            crate::gpu_commit::gpu_recursive_merkle_blake3_view(data_bytes, block_len)
+                .map(LigeroMerkleTree::Gpu)
+        } else {
+            // SAFETY: the process-cached selector is false in this exclusive
+            // if/else arm. This is the sole production caller of the unsafe
+            // rollback primitive; the only production view call is the
+            // mutually exclusive arm above, so no live view can overlap it.
+            unsafe {
+                crate::gpu_commit::gpu_recursive_merkle_blake3_owned_rollback(
+                    data_bytes,
+                    block_len,
+                )
+            }
+            .map(LigeroMerkleTree::Cpu)
+        }
     } else {
         None
     };
     let tree = match gpu_tree {
         Some(tree) => tree,
-        None => merkle::merkle_tree(data_bytes, block_len, kind),
+        None => LigeroMerkleTree::Cpu(merkle::merkle_tree(data_bytes, block_len, kind)),
     };
     let merkle_elapsed = merkle_start.map_or(std::time::Duration::ZERO, |t| t.elapsed());
 
@@ -4522,7 +4593,7 @@ pub fn recursive_prover_with_l0<Ch: Challenger>(
 
     let wtns_0 = LigeroWitness {
         mat: l0_codeword,
-        tree: l0_tree,
+        tree: LigeroMerkleTree::Cpu(l0_tree),
         block_len,
         num_interleaved,
     };
@@ -5316,7 +5387,7 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
             // Final open complete — recycle last recursive codeword/tree before
             // proof-object assembly (transcript copy etc.).
             crate::scratch::give_f128(std::mem::take(&mut wtns_prev.mat));
-            wtns_prev.tree = Vec::new();
+            wtns_prev.tree = LigeroMerkleTree::default();
             if trace {
                 let total = t_total.elapsed();
                 eprintln!("[lig-prove] total = {:.2} ms", total.as_secs_f64() * 1e3);
@@ -5436,7 +5507,7 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
         // so they do not stack under wtns_next (already committed) + induce temps.
         // Bit-identical: no further reads of wtns_prev.mat/tree this iteration.
         crate::scratch::give_f128(std::mem::take(&mut wtns_prev.mat));
-        wtns_prev.tree = Vec::new();
+        wtns_prev.tree = LigeroMerkleTree::default();
         let sks_vks_i = eval_sk_at_vks(n_next);
         let _t = std::time::Instant::now();
         let (basis_i_induced, enforced_sum_i) =
@@ -6561,7 +6632,7 @@ fn recursive_prover_inner<Ch: Challenger>(
     {
         let mut wtns_0 = wtns_0;
         crate::scratch::give_f128(std::mem::take(&mut wtns_0.mat));
-        wtns_0.tree = Vec::new();
+        wtns_0.tree = LigeroMerkleTree::default();
     }
 
     // ---- Induce basis from wtns_0 opens ----
@@ -6645,7 +6716,7 @@ fn recursive_prover_inner<Ch: Challenger>(
             let merkle_proof_last =
                 merkle_multi_proof_for(&wtns_prev.tree, wtns_prev.block_len, &queries_last);
             crate::scratch::give_f128(std::mem::take(&mut wtns_prev.mat));
-            wtns_prev.tree = Vec::new();
+            wtns_prev.tree = LigeroMerkleTree::default();
             return LigeritoProof {
                 initial_root,
                 initial_proof,
@@ -6710,7 +6781,7 @@ fn recursive_prover_inner<Ch: Challenger>(
         t_opens += t.elapsed();
         // Prior-level mat/tree dead after the open; recycle before induce.
         crate::scratch::give_f128(std::mem::take(&mut wtns_prev.mat));
-        wtns_prev.tree = Vec::new();
+        wtns_prev.tree = LigeroMerkleTree::default();
 
         // Induce fresh basis from these opens.
         let sks_vks_i = eval_sk_at_vks(n_next);
@@ -10313,7 +10384,7 @@ mod tests {
             &cfg,
             &poly,
             std::mem::take(&mut wtns_0_external.mat),
-            std::mem::take(&mut wtns_0_external.tree),
+            std::mem::take(&mut wtns_0_external.tree).into_vec(),
             &z,
             v,
             &mut p_ch_b,
@@ -10498,11 +10569,3 @@ mod tests {
 // RealAdii sample 1 on 31a9c72.
 // numinous draw 8 1785734384494936424
 // RealAdii sample 1 on f6e921b.
-// RealAdii sample 1 on 81acf4f.
-// RealAdii sample 2 on 81acf4f.
-// RealAdii sample 3 on 81acf4f.
-// RealAdii sample 4 on 81acf4f.
-// RealAdii sample 5 on 81acf4f.
-// RealAdii sample 6 on 81acf4f.
-// RealAdii sample 7 on 81acf4f.
-// RealAdii sample 8 on 81acf4f.
