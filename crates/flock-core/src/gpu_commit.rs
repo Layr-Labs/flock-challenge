@@ -378,6 +378,12 @@ pub const ENV_NO_GPU_KEEPWARM: &str = "FLOCK_NO_GPU_KEEPWARM";
 /// or submission failure falls back to the untouched CPU builder.
 pub const ENV_NO_GPU_RECURSIVE_MERKLE: &str = "FLOCK_NO_GPU_RECURSIVE_MERKLE";
 
+/// Exact wait-policy rollback for the short recursive Ligerito GPU Merkle
+/// command buffers. `FLOCK_NO_GPU_RECURSIVE_MERKLE_SPIN=1` keeps the GPU tree
+/// but restores the promoted `waitUntilCompleted` park/wake.
+pub const ENV_NO_GPU_RECURSIVE_MERKLE_SPIN: &str =
+    "FLOCK_NO_GPU_RECURSIVE_MERKLE_SPIN";
+
 fn gpu_recursive_merkle_value_enabled(value: Option<&std::ffi::OsStr>) -> bool {
     value != Some(std::ffi::OsStr::new("1"))
 }
@@ -395,8 +401,21 @@ pub(crate) fn gpu_recursive_merkle_enabled() -> bool {
     })
 }
 
-/// GPU BLAKE3 Merkle tree for the recursive Ligerito 128-byte-leaf shapes
-/// (2^18 or 2^16 leaves). Returns `None` whenever the GPU path is disabled,
+fn gpu_recursive_merkle_spin_value_enabled(value: Option<&std::ffi::OsStr>) -> bool {
+    value != Some(std::ffi::OsStr::new("1"))
+}
+
+fn gpu_recursive_merkle_spin_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        gpu_recursive_merkle_spin_value_enabled(
+            std::env::var_os(ENV_NO_GPU_RECURSIVE_MERKLE_SPIN).as_deref(),
+        )
+    })
+}
+
+/// GPU BLAKE3 Merkle tree for the supported recursive Ligerito 128-byte-leaf
+/// shape (2^18 leaves). Returns `None` whenever the GPU path is disabled,
 /// unavailable, or fails — the caller then builds the identical tree on the
 /// CPU. `Some(tree)` is bit-identical to `merkle::merkle_tree(data,
 /// num_leaves, HashKind::Blake3)`.
@@ -8481,7 +8500,16 @@ kernel void rec_parent_hash(device const uint* children [[buffer(0)]],
                     read_len = n_out;
                 }
                 gpu.end_encoding(enc);
-                gpu.commit_and_wait(cb)
+                if super::gpu_recursive_merkle_spin_enabled() {
+                    // These two recursive commitments are serial dependencies
+                    // in the PCS opening tail. Their GPU work is short enough
+                    // that parking and waking the caller is visible; bound the
+                    // active wait and fall back to the exact blocking path on
+                    // an unexpectedly slow dispatch.
+                    gpu.commit_and_spin(cb, 12.0)
+                } else {
+                    gpu.commit_and_wait(cb)
+                }
             })();
             gpu.pool_pop(pool);
             run
@@ -11685,8 +11713,22 @@ mod tests {
     }
 
     /// The recursive-Merkle offload must reproduce the CPU flat tree
-    /// bit-for-bit at both supported 128-byte-leaf shapes, and its repeated
+    /// bit-for-bit at the supported 128-byte-leaf shape, and its repeated
     /// calls must reuse the cached input wrap.
+    #[test]
+    fn recursive_merkle_spin_kill_switch_is_exact_one() {
+        use std::ffi::OsStr;
+
+        assert_eq!(
+            super::ENV_NO_GPU_RECURSIVE_MERKLE_SPIN,
+            "FLOCK_NO_GPU_RECURSIVE_MERKLE_SPIN"
+        );
+        assert!(super::gpu_recursive_merkle_spin_value_enabled(None));
+        assert!(super::gpu_recursive_merkle_spin_value_enabled(Some(OsStr::new("0"))));
+        assert!(!super::gpu_recursive_merkle_spin_value_enabled(Some(OsStr::new("1"))));
+        assert!(super::gpu_recursive_merkle_spin_value_enabled(Some(OsStr::new("true"))));
+    }
+
     #[test]
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     fn gpu_recursive_merkle_matches_cpu_tree() {
