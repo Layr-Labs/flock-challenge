@@ -940,8 +940,16 @@ fn direct_fold8_all_claim_mix_supported(
         [(_, ab), (_, c)]
             if ab.direct_fold8.is_some()
                 && c.direct_fold8.is_some()
-                && matches!(&ab.rs_eq_ind, ring_switch::RsEqInd::DeferredDense { .. })
-                && matches!(&c.rs_eq_ind, ring_switch::RsEqInd::DeferredDense { .. })
+                && matches!(
+                    &ab.rs_eq_ind,
+                    ring_switch::RsEqInd::DeferredDense { .. }
+                        | ring_switch::RsEqInd::OmittedForDirect { .. }
+                )
+                && matches!(
+                    &c.rs_eq_ind,
+                    ring_switch::RsEqInd::DeferredDense { .. }
+                        | ring_switch::RsEqInd::OmittedForDirect { .. }
+                )
     )
 }
 
@@ -969,6 +977,17 @@ pub fn ranked_direct_fold8_enabled() -> bool {
     static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
         ranked_direct_fold4_enabled() && std::env::var_os("FLOCK_NO_OPEN_DIRECT_FOLD8").is_none()
     });
+    *ON
+}
+
+/// DirectFold8 equality-factor omission, latched once per process.
+///
+/// Default enabled. `FLOCK_NO_OPEN_OMIT_DIRECT_EQ=1` retains the complete
+/// `DeferredDense` factors for same-binary A/B.
+#[inline]
+fn ranked_omit_direct_eq_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_OPEN_OMIT_DIRECT_EQ").is_none());
     *ON
 }
 
@@ -1015,16 +1034,35 @@ fn compute_combined_basis_and_target<Ch: Challenger>(
     challenger.observe_label(b"flock-pcs-open-batch-v0");
 
     // 1. Ring-switching for all x_outers.
+    let omit_direct_eq_for_direct_fold8 = enable_fold2
+        && packed_witness.len() == (1usize << 25)
+        && n_rs == 2
+        && n_pd == 0
+        && std::env::var_os("FLOCK_NO_OPEN_DIRECT_AB").is_none()
+        && ranked_direct_fold8_enabled()
+        && ranked_omit_direct_eq_enabled()
+        && precomputed_s_hat_v.len() == n_rs
+        && precomputed_s_hat_v.iter().all(|precomputed| {
+            matches!(
+                precomputed,
+                Some(values) if values.len() == 64 * (1usize << LOG_PACKING)
+            )
+        });
     let t = std::time::Instant::now();
     let (mut rs_results, gammas_rs): (
         Vec<(RingSwitchProof, ring_switch::RingSwitchBatchOutput)>,
         Vec<F128>,
     ) = if n_rs > 0 {
-        ring_switch::prove_batched_padded_with_precomputed(
+        ring_switch::prove_batched_padded_with_precomputed_intent(
             packed_witness,
             x_outers,
             precomputed_s_hat_v,
             padding,
+            if omit_direct_eq_for_direct_fold8 {
+                ring_switch::DirectEqIntent::OmitForDirectFold8
+            } else {
+                ring_switch::DirectEqIntent::BuildFactors
+            },
             challenger,
         )
     } else {
@@ -1089,7 +1127,7 @@ fn compute_combined_basis_and_target<Ch: Challenger>(
     let use_direct_ab =
         direct_common && (use_direct_all || direct_ab_claim_mix_supported(&rs_results));
     let direct_fold8 = if use_direct_fold8 {
-        Some(vec![
+        let direct = vec![
             rs_results[0]
                 .1
                 .direct_fold8
@@ -1100,7 +1138,42 @@ fn compute_combined_basis_and_target<Ch: Challenger>(
                 .direct_fold8
                 .take()
                 .expect("direct-fold8 gate checked claim one"),
-        ])
+        ];
+        let omitted_count = rs_results
+            .iter()
+            .filter(|(_, output)| {
+                matches!(
+                    &output.rs_eq_ind,
+                    ring_switch::RsEqInd::OmittedForDirect { .. }
+                )
+            })
+            .count();
+        assert_eq!(
+            direct.len(),
+            rs_results.len(),
+            "DirectFold8 must consume every ring-switch claim"
+        );
+        if omit_direct_eq_for_direct_fold8 {
+            assert_eq!(
+                omitted_count,
+                rs_results.len(),
+                "every equality-factor omission must be discharged by DirectFold8"
+            );
+            assert!(
+                rs_results.iter().all(|(_, output)| matches!(
+                    &output.rs_eq_ind,
+                    ring_switch::RsEqInd::OmittedForDirect { len }
+                        if *len == packed_witness.len()
+                )),
+                "DirectFold8 omission markers must retain the packed basis length"
+            );
+        } else {
+            assert_eq!(
+                omitted_count, 0,
+                "equality factors were omitted without explicit caller intent"
+            );
+        }
+        Some(direct)
     } else {
         None
     };
@@ -1177,6 +1250,9 @@ fn compute_combined_basis_and_target<Ch: Challenger>(
             }
             match &output.rs_eq_ind {
                 ring_switch::RsEqInd::Dense(values) => Some(values.as_slice()),
+                ring_switch::RsEqInd::OmittedForDirect { .. } => {
+                    panic!("omitted equality factors escaped the DirectFold8 route")
+                }
                 _ => None,
             }
         })
@@ -1204,6 +1280,9 @@ fn compute_combined_basis_and_target<Ch: Challenger>(
                     table.as_slice(),
                     eq_lo.len().trailing_zeros() as usize,
                 )),
+                ring_switch::RsEqInd::OmittedForDirect { .. } => {
+                    panic!("omitted equality factors escaped the DirectFold8 route")
+                }
                 _ => None,
             }
         })
@@ -1422,13 +1501,22 @@ fn compute_combined_basis_and_target<Ch: Challenger>(
         // original behavior.
         let materialized: Vec<Vec<F128>> = rs_results
             .iter()
-            .filter_map(|(_, o)| match &o.rs_eq_ind {
-                ring_switch::RsEqInd::DeferredDense {
-                    eq_lo,
-                    eq_hi,
-                    table,
-                } => Some(ring_switch::fold_b128_from_table(eq_lo, eq_hi, table)),
-                _ => None,
+            .enumerate()
+            .filter_map(|(index, (_, o))| {
+                if index < direct_count {
+                    return None;
+                }
+                match &o.rs_eq_ind {
+                    ring_switch::RsEqInd::DeferredDense {
+                        eq_lo,
+                        eq_hi,
+                        table,
+                    } => Some(ring_switch::fold_b128_from_table(eq_lo, eq_hi, table)),
+                    ring_switch::RsEqInd::OmittedForDirect { .. } => {
+                        panic!("omitted equality factors reached generic materialization")
+                    }
+                    _ => None,
+                }
             })
             .collect();
         let mut rs_dense_all: Vec<&[F128]> = rs_baked.clone();
@@ -1528,13 +1616,19 @@ fn compute_combined_basis_and_target<Ch: Challenger>(
         }
         round0_u2 += (a0 + a1) * delta;
     };
-    for (_, output) in rs_results.iter() {
-        if let ring_switch::RsEqInd::Sparse { entries, .. } = &output.rs_eq_ind {
-            round1_lookahead = None;
-            for &(idx, val) in entries {
-                b_combined[idx] += val;
-                adjust_prime_for_delta(idx, val);
+    for (_, output) in rs_results.iter().skip(direct_count) {
+        match &output.rs_eq_ind {
+            ring_switch::RsEqInd::Sparse { entries, .. } => {
+                round1_lookahead = None;
+                for &(idx, val) in entries {
+                    b_combined[idx] += val;
+                    adjust_prime_for_delta(idx, val);
+                }
             }
+            ring_switch::RsEqInd::OmittedForDirect { .. } => {
+                panic!("omitted equality factors reached generic sparse mutation")
+            }
+            _ => {}
         }
     }
     for (pd, g) in packed_direct.iter().zip(gammas_pd.iter()) {

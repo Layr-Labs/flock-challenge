@@ -2507,8 +2507,9 @@ pub struct RingSwitchBatchOutput {
     pub(crate) deferred_c_fold2: Option<DirectFold2Factors>,
 }
 
-/// Sparse-or-dense representation of `rs_eq_ind`. All variants here have γ_k
-/// pre-multiplied in (see `RingSwitchBatchOutput`).
+/// Sparse-or-dense representation of `rs_eq_ind`. Materialized variants have
+/// γ_k pre-multiplied in (see `RingSwitchBatchOutput`); the omission marker
+/// carries no value and is valid only for the complete DirectFold8 consumer.
 #[derive(Clone, Debug)]
 pub enum RsEqInd {
     Dense(Vec<F128>),
@@ -2523,6 +2524,12 @@ pub enum RsEqInd {
         eq_hi: Vec<F128>,
         table: Vec<F128>,
     },
+    /// Equality factors intentionally omitted for a claim that must be consumed
+    /// by the complete DirectFold8 route. This is a capability marker, not a
+    /// zero vector: every generic consumer rejects it.
+    OmittedForDirect {
+        len: usize,
+    },
     Sparse {
         len: usize,
         entries: Vec<(usize, F128)>,
@@ -2535,6 +2542,7 @@ impl RsEqInd {
         match self {
             Self::Dense(v) => v.len(),
             Self::DeferredDense { eq_lo, eq_hi, .. } => eq_lo.len() * eq_hi.len(),
+            Self::OmittedForDirect { len } => *len,
             Self::Sparse { len, .. } => *len,
         }
     }
@@ -2563,6 +2571,9 @@ impl RsEqInd {
                     *o += gamma * deferred_dense_value(eq_lo, eq_hi, table, log_b, j);
                 }
             }
+            Self::OmittedForDirect { .. } => {
+                panic!("OmittedForDirect cannot be mutated through a generic RsEqInd consumer")
+            }
             Self::Sparse { entries, .. } => {
                 for &(idx, val) in entries {
                     out[idx] += gamma * val;
@@ -2586,6 +2597,9 @@ impl RsEqInd {
                     .map(|j| deferred_dense_value(eq_lo, eq_hi, table, log_b, j))
                     .collect()
             }
+            Self::OmittedForDirect { .. } => {
+                panic!("OmittedForDirect cannot be materialized through a generic RsEqInd consumer")
+            }
             Self::Sparse { len, entries } => {
                 let mut out = vec![F128::ZERO; *len];
                 for &(idx, val) in entries {
@@ -2602,6 +2616,9 @@ impl RsEqInd {
         match self {
             Self::Dense(v) => v,
             Self::DeferredDense { .. } => self.to_dense(),
+            Self::OmittedForDirect { .. } => {
+                panic!("OmittedForDirect cannot be materialized through a generic RsEqInd consumer")
+            }
             Self::Sparse { len, entries } => {
                 let mut out = vec![F128::ZERO; len];
                 for (idx, val) in entries {
@@ -2753,6 +2770,32 @@ pub fn prove_batched_padded_with_precomputed<Ch: Challenger>(
     padding: &PaddingSpec,
     challenger: &mut Ch,
 ) -> (Vec<(RingSwitchProof, RingSwitchBatchOutput)>, Vec<F128>) {
+    prove_batched_padded_with_precomputed_intent(
+        packed_witness,
+        x_outers,
+        precomputed_s_hat_v,
+        padding,
+        DirectEqIntent::BuildFactors,
+        challenger,
+    )
+}
+
+/// Whether the internal prover must build generic equality factors or may
+/// replace them with a DirectFold8-only capability marker.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum DirectEqIntent {
+    BuildFactors,
+    OmitForDirectFold8,
+}
+
+pub(crate) fn prove_batched_padded_with_precomputed_intent<Ch: Challenger>(
+    packed_witness: &[F128],
+    x_outers: &[&[F128]],
+    precomputed_s_hat_v: &[Option<&[F128]>],
+    padding: &PaddingSpec,
+    direct_eq_intent: DirectEqIntent,
+    challenger: &mut Ch,
+) -> (Vec<(RingSwitchProof, RingSwitchBatchOutput)>, Vec<F128>) {
     assert!(!x_outers.is_empty());
     let trace =
         std::env::var("PCS_TRACE").is_ok() || std::env::var_os("FLOCK_OPEN_TIMING").is_some();
@@ -2823,6 +2866,24 @@ pub fn prove_batched_padded_with_precomputed<Ch: Challenger>(
     //    `fold_1b_rows_split`). Tiny test sizes (len not divisible by 16) fall
     //    back to the materialized tensor + the legacy multi-fold.
     let use_split = l.is_multiple_of(16);
+    // Omission is locally authorized only for the complete two-claim
+    // DirectFold8 shape. The caller's intent alone is insufficient: both
+    // claims must classify dense, have enough retained coordinates, and carry
+    // exact sixty-four-bank precomputes. Any mismatch takes the old factor
+    // construction branch unchanged.
+    let omit_direct_eq = direct_eq_intent == DirectEqIntent::OmitForDirectFold8
+        && use_split
+        && n == 2
+        && dense_suffixes.len() == 2
+        && sparse_suffixes.is_empty()
+        && dense_suffixes.iter().all(|suffix| suffix.len() >= 6)
+        && precomputed_s_hat_v.len() == 2
+        && precomputed_s_hat_v.iter().all(|precomputed| {
+            matches!(
+                precomputed,
+                Some(values) if values.len() == 64 * n_packed
+            )
+        });
     let t = std::time::Instant::now();
     let dense_splits: Vec<(Vec<F128>, Vec<F128>)> = if use_split {
         dense_suffixes
@@ -3203,7 +3264,13 @@ pub fn prove_batched_padded_with_precomputed<Ch: Challenger>(
             };
             let rs_eq_ind = match kinds[i] {
                 Kind::Dense(d) => {
-                    if use_split {
+                    if omit_direct_eq {
+                        assert!(
+                            direct_fold8.is_some(),
+                            "omitted equality factors require a complete DirectFold8 bundle"
+                        );
+                        RsEqInd::OmittedForDirect { len: l }
+                    } else if use_split {
                         // Defer the fold: carry split factors + the γ-baked byte
                         // table so pcs's combine folds each slot on the fly into
                         // `b_combined` (no 2^(m-7) materialize + readback).
@@ -3558,6 +3625,24 @@ mod tests {
                 hi: self.next_u64(),
             }
         }
+    }
+
+    #[test]
+    fn omitted_direct_eq_preserves_logical_len() {
+        assert_eq!(RsEqInd::OmittedForDirect { len: 8 }.len(), 8);
+    }
+
+    #[test]
+    #[should_panic(expected = "OmittedForDirect cannot be materialized")]
+    fn omitted_direct_eq_rejects_generic_materialization() {
+        let _ = RsEqInd::OmittedForDirect { len: 8 }.to_dense();
+    }
+
+    #[test]
+    #[should_panic(expected = "OmittedForDirect cannot be mutated")]
+    fn omitted_direct_eq_rejects_generic_mutation() {
+        let mut out = vec![F128::ZERO; 8];
+        RsEqInd::OmittedForDirect { len: 8 }.add_scaled_into(F128::ONE, &mut out);
     }
 
     /// The composed byte table reproduces the slot-multiply fold bit-for-bit:
