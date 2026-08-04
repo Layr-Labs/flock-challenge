@@ -888,6 +888,44 @@ mod latch_measure_fix_gate_tests {
     }
 }
 
+/// Exact-`1` control restoring the incumbent zc-r2 gate replay schedule
+/// (budget 5, stop on the FIRST replay that fails to improve the running
+/// minimum by >5%). With the guard active the calibration probe keeps
+/// replaying through a still-descending ramp — stopping only after TWO
+/// consecutive non-improving replays, budget 8 — before pricing `u_gpu`
+/// from the minimum. The share-floor note at `zc_r2_gate_share` records the
+/// suspected ranked-machine failure this addresses: the replay budget
+/// stopping before the Metal clock finished ramping, pushing measured
+/// ratios into the floor band and admission failure on a majority of ranked
+/// worker processes. The pricing clock, the improvement threshold, the >=3
+/// replay minimum, the share formula and every clamp are unchanged — this
+/// switch only restores the legacy stop rule for same-binary diagnostics.
+pub const ENV_NO_ZC_R2_RAMP_GUARD: &str = "FLOCK_NO_ZC_R2_RAMP_GUARD";
+
+fn zc_r2_ramp_guard_value_enabled(value: Option<&std::ffi::OsStr>) -> bool {
+    value != Some(std::ffi::OsStr::new("1"))
+}
+
+fn zc_r2_ramp_guard_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        zc_r2_ramp_guard_value_enabled(std::env::var_os(ENV_NO_ZC_R2_RAMP_GUARD).as_deref())
+    })
+}
+
+#[cfg(test)]
+mod zc_r2_ramp_guard_gate_tests {
+    use std::ffi::OsStr;
+
+    #[test]
+    fn exact_one_is_the_only_ramp_guard_kill_value() {
+        assert!(!super::zc_r2_ramp_guard_value_enabled(Some(OsStr::new("1"))));
+        for value in [None, Some(""), Some("0"), Some("01"), Some("true")] {
+            assert!(super::zc_r2_ramp_guard_value_enabled(value.map(OsStr::new)));
+        }
+    }
+}
+
 /// The exact ranked L0 geometry the GPU graph is built for (mirrors the CPU
 /// pipeline's `is_ranked_ntt_merkle_leaf_pipeline_shape`): `log_d = 20`,
 /// 64 interleaved lanes, rate-1/2 entry at layer 1, 1 KiB BLAKE3 leaves.
@@ -10165,11 +10203,31 @@ kernel void zc_r2_products(
                 }
             }
             // Ramp-robust GPU pricing: replay the probe back-to-back to a
-            // plateau (>=3 replays, stop when a replay stops improving the
-            // best seen by >5%), price from the minimum wall. Budget 5:
-            // every replay is job-wall time paid by ~120 processes on a
-            // cap-adjacent lineage, and the local trace plateaus by 3.
-            let mut walls = [0.0f64; 5];
+            // plateau, price from the minimum wall. Every replay is job-wall
+            // time paid by ~120 processes on a cap-adjacent lineage, and the
+            // local trace plateaus by 3.
+            //
+            // RAMP GUARD (kill: FLOCK_NO_ZC_R2_RAMP_GUARD, see
+            // `ENV_NO_ZC_R2_RAMP_GUARD`): the legacy rule stopped after the
+            // FIRST replay that failed to improve the best seen by >5%, so a
+            // clock still descending at a few percent per replay — exactly
+            // the ranked-machine ramp the share-floor note below suspects
+            // ("the warmup replay budget stopped before the Metal clock
+            // finished ramping", admission failing on a majority of ranked
+            // workers while every admitted process posts record p10s) —
+            // latched an inflated minimum. The guard requires TWO consecutive
+            // non-improving replays before stopping and raises the budget
+            // from 5 to 8 (matching the zc_fold correction's cap; worst case
+            // three more probe replays of a few ms each, once per process,
+            // inside the untimed warmup). The pricing clock, the >5%
+            // improvement test, the >=3 minimum, the share formula and every
+            // clamp are unchanged.
+            let mut walls = [0.0f64; 8];
+            let budget = if super::zc_r2_ramp_guard_enabled() {
+                walls.len()
+            } else {
+                5
+            };
             walls[0] = first_wall.max(0.0);
             let mut n_walls = usize::from(walls[0] > 0.0);
             let mut w_min = if n_walls > 0 { walls[0] } else { f64::MAX };
@@ -10177,7 +10235,8 @@ kernel void zc_r2_products(
             if let (Some(&(_, _, a_buf)), Some(&(_, _, b_buf))) =
                 (state.wraps.first(), state.wraps.get(1))
             {
-                while n_walls < walls.len() {
+                let mut flat_streak = 0usize;
+                while n_walls < budget {
                     let Ok(cb2) = zc_r2_submit(
                         gpu, &state, a_buf, b_buf, job.chunks, job.lo_size, job.mask, job.useful,
                     ) else {
@@ -10196,7 +10255,17 @@ kernel void zc_r2_products(
                     n_walls += 1;
                     let prev_min = w_min;
                     w_min = w_min.min(w);
-                    if n_walls >= 3 && w > 0.95 * prev_min {
+                    if w > 0.95 * prev_min {
+                        flat_streak += 1;
+                    } else {
+                        flat_streak = 0;
+                    }
+                    let streak_needed = if super::zc_r2_ramp_guard_enabled() {
+                        2
+                    } else {
+                        1
+                    };
+                    if n_walls >= 3 && flat_streak >= streak_needed {
                         break;
                     }
                 }
