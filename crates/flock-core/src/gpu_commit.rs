@@ -7513,7 +7513,17 @@ LC_KERNEL(lc_fold_stripes, 4)
             return;
         }
         let u_gpu = gpu_ms / claim_lo as f64;
-        let u_cpu = suffix_ms / (n_claims - claim_lo) as f64;
+        // Price the CPU suffix under the timed-round contention regime (see
+        // `zc_gate_contention_derate`): the warmup `suffix_ms` is measured
+        // cool/uncontended and under-states the timed per-claim cost, which
+        // would under-provision the GPU. Scoped to the zerocheck `[gpu-zc]`
+        // c-fold arm; the lincheck arm keeps raw warmup pricing.
+        let derate = if arm == FoldArm::Zc {
+            zc_gate_contention_derate()
+        } else {
+            1.0
+        };
+        let u_cpu = (suffix_ms / (n_claims - claim_lo) as f64) * derate;
         if !(u_gpu.is_finite() && u_cpu.is_finite()) || u_gpu <= 0.0 || u_cpu <= 0.0 {
             return;
         }
@@ -7538,7 +7548,7 @@ LC_KERNEL(lc_fold_stripes, 4)
         if arm.debug() {
             eprintln!(
                 "{} split {claim_lo}/{n_claims} gpu={gpu_ms:.2}ms head={head_ms:.2}ms \
-                 suffix={suffix_ms:.2}ms -> {g}/{n_claims}",
+                 suffix={suffix_ms:.2}ms (derate={derate:.2}) -> {g}/{n_claims}",
                 arm.tag(),
             );
         }
@@ -8570,6 +8580,67 @@ kernel void zc_r2_products(
         *V
     }
 
+    /// Default warmup→timed CPU contention de-rate for the zerocheck GPU-split
+    /// gates. See [`zc_gate_contention_derate`]. Deliberately set BELOW the
+    /// ~2.6x measured on the ranked fleet so the correction is guaranteed to
+    /// UNDER-provision (never over-provision) the GPU; the straggle caps are
+    /// the second backstop.
+    const ZC_GATE_CONTENTION_DERATE: f64 = 2.0;
+
+    /// Warmup-vs-timed CPU contention de-rate shared by every zerocheck
+    /// GPU-split gate (`zc_r2`/`zc_t3`/`zc_loop` product/fold arms and the
+    /// round-1 c-fold `[gpu-zc]` split).
+    ///
+    /// **The bug.** Each gate prices the CPU per-chunk cost `u_cpu` during the
+    /// UNTIMED warmup prove (cool, uncontended) and then applies it to the
+    /// CONTENDED timed prove, where the CPU is materially slower. On the v16
+    /// zc-r2 trace the timed CPU share drained ~1.45 ms/chunk against a warmup
+    /// `u_cpu` of 0.552 ms/chunk (~2.6x); the fleet regime (~120 sibling worker
+    /// processes plus thermal) is stated as high as ~6x. A warmup `u_cpu` that
+    /// under-states the timed cost inflates the measured ratio `u_gpu/u_cpu`,
+    /// which hands the CPU too many chunks and pushes marginal processes into
+    /// the `(2, 8)` `hi/8` floor or the `>= 8` disable band — the GPU then
+    /// drains early and idles ("admission failing on a majority of ranked
+    /// worker processes while every admitted process posts record p10s").
+    ///
+    /// **The fix — mirror the commit tuner.** The commit-phase hybrid tuner
+    /// solved this identical warmup-vs-timed problem by pricing its split under
+    /// the production contention replayed during warmup
+    /// (`autotune_hybrid_split`'s `burn_work` sized from the measured precompute
+    /// branch wall, and `retune_ranked_hybrid_with_exact_contention`'s
+    /// `rayon::join(graph, replay_ab)`). The dominant zc contention is
+    /// fleet-wide and cannot be replayed inside one warmup process, so this
+    /// applies the SAME intent with a measured-BOUNDED multiplier on `u_cpu`
+    /// rather than an in-process burn.
+    ///
+    /// **Why it is safe (bounded, one-directional).** Multiplying `u_cpu` UP
+    /// only ever LOWERS the ratio, which only ever RAISES the GPU share — and
+    /// every gate clamps the share to its straggle cap, so the correction can
+    /// never push the GPU past a cap already proven safe on the ranked M3 Max.
+    /// Because the timed `u_cpu` is >= the warmup value, any factor at or below
+    /// the true contention factor keeps the de-rated `u_cpu` <= the true timed
+    /// cost, so the share stays <= the true balanced share and the GPU never
+    /// becomes the straggler; the default sits below the ~2.6x measured floor
+    /// to guarantee this, with the cap as a second backstop.
+    ///
+    /// `FLOCK_NO_ZC_GATE_CONTENTION=1` restores raw warmup pricing (factor 1.0,
+    /// byte-identical control). `FLOCK_ZC_GATE_CONTENTION_DERATE=<f64>` overrides
+    /// the factor for ranked re-tuning, clamped to `[1.0, 4.0]`.
+    fn zc_gate_contention_derate() -> f64 {
+        static F: std::sync::LazyLock<f64> = std::sync::LazyLock::new(|| {
+            if std::env::var_os("FLOCK_NO_ZC_GATE_CONTENTION").is_some() {
+                return 1.0;
+            }
+            std::env::var("FLOCK_ZC_GATE_CONTENTION_DERATE")
+                .ok()
+                .and_then(|s| s.parse::<f64>().ok())
+                .filter(|f| f.is_finite() && *f >= 1.0)
+                .map(|f| f.min(4.0))
+                .unwrap_or(ZC_GATE_CONTENTION_DERATE)
+        });
+        *F
+    }
+
     /// Anchors-only CPU work is measured locally at ~0.55x of the fused
     /// chunk (two of four folds, no products); the share solves
     /// `(hi - (1-ALPHA) g) c_f = g u_g` — balanced, no CPU-ward bias — and
@@ -9071,7 +9142,8 @@ kernel void zc_r2_products(
             } else {
                 f64::INFINITY
             };
-            let u_cpu = cpu_wall_ms / hi_size.max(1) as f64;
+            let derate = zc_gate_contention_derate();
+            let u_cpu = (cpu_wall_ms / hi_size.max(1) as f64) * derate;
             let share = if u_cpu.is_finite() && u_cpu > 0.0 && u_gpu.is_finite() {
                 let measured = u_gpu / u_cpu;
                 let ratio = zc_r2_forced_ratio().unwrap_or(measured);
@@ -9082,7 +9154,7 @@ kernel void zc_r2_products(
                     );
                     eprintln!(
                         "[zc-r2] gate u_gpu={u_gpu:.4}ms/chunk u_cpu={u_cpu:.4}ms/chunk \
-                         ratio={:.3} -> share {g}/{hi_size}",
+                         (derate={derate:.2}) ratio={:.3} -> share {g}/{hi_size}",
                         u_gpu / u_cpu,
                     );
                 }
@@ -9327,9 +9399,19 @@ kernel void zc_t3_products(
     /// muls per pair), so its per-chunk cost is a larger fraction of the
     /// fused chunk than r2's anchors-only sibling: ALPHA = 0.65. Same
     /// balanced form `(hi - (1-ALPHA) g) c_f = g u_g` ⇒
-    /// `g* = hi/(ratio + 0.35)`; same 7·hi/8 overshoot cap, same hi/8
-    /// admission floor for ratios in (2, 8), same ≥ 8 disable (ticket-26
-    /// clamp-audit law, instance five).
+    /// `g* = hi/(ratio + 0.35)`; same hi/8 admission floor for ratios in
+    /// (2, 8), same ≥ 8 disable (ticket-26 clamp-audit law, instance five).
+    ///
+    /// Overshoot cap raised `7·hi/8 → 15·hi/16` to match the resolved zc-r2
+    /// design. At `15/16` the GPU only becomes the timed straggler once the
+    /// TRUE ratio exceeds `1/(15/16) - (1-ALPHA) = 16/15 - 0.35 = 0.717`,
+    /// which stays well above the ~0.57 measured on the ranked M3 Max — the
+    /// larger ALPHA (0.65 vs r2's 0.55) leaves this arm *more* headroom than
+    /// r2's 0.617 threshold. Combined with the contention-de-rated `u_cpu`
+    /// (see `zc_gate_contention_derate`) the balanced solution reaches this
+    /// cap on the ranked shape instead of leaving GPU capacity idle. Not
+    /// uncapped: at `hi` the threshold falls to `1-ALPHA = 0.35`, below the
+    /// ranked ratio, so full offload would make the GPU the straggler.
     const ZC_T3_ALPHA: f64 = 0.65;
     const ZC_T3_MAX_RATIO: f64 = 2.0;
     const ZC_T3_FLOOR_MAX_RATIO: f64 = 8.0;
@@ -9345,7 +9427,7 @@ kernel void zc_t3_products(
             return 0;
         }
         let g = (hi_size as f64 / (ratio + (1.0 - ZC_T3_ALPHA))).round();
-        (g as usize).min(hi_size * 7 / 8)
+        (g as usize).min(hi_size * 15 / 16)
     }
 
     fn zc_t3_init(gpu: &'static Gpu) -> Result<ZcT3, String> {
@@ -9559,7 +9641,7 @@ kernel void zc_t3_products(
             // halved. 64 chunks still price the kernel stably.
             (hi_size / 32).clamp(8, 64)
         } else {
-            tuned.min(hi_size * 7 / 8)
+            tuned.min(hi_size * 15 / 16)
         };
         if chunks == 0 {
             return None;
@@ -9733,7 +9815,8 @@ kernel void zc_t3_products(
             } else {
                 f64::INFINITY
             };
-            let u_cpu = cpu_wall_ms / hi_size.max(1) as f64;
+            let derate = zc_gate_contention_derate();
+            let u_cpu = (cpu_wall_ms / hi_size.max(1) as f64) * derate;
             let share = if u_cpu.is_finite() && u_cpu > 0.0 && u_gpu.is_finite() {
                 let measured = u_gpu / u_cpu;
                 let ratio = zc_t3_forced_ratio().unwrap_or(measured);
@@ -9742,7 +9825,7 @@ kernel void zc_t3_products(
                     eprintln!("[zc-t3] gate replay walls: {:?}", &walls[..n_walls]);
                     eprintln!(
                         "[zc-t3] gate u_gpu={u_gpu:.4}ms/chunk u_cpu={u_cpu:.4}ms/chunk \
-                         ratio={:.3} -> share {g}/{hi_size}",
+                         (derate={derate:.2}) ratio={:.3} -> share {g}/{hi_size}",
                         u_gpu / u_cpu,
                     );
                 }
@@ -10400,7 +10483,8 @@ kernel void zc_loop_products(
             } else {
                 f64::INFINITY
             };
-            let u_cpu = cpu_wall_ms / hi_size.max(1) as f64;
+            let derate = zc_gate_contention_derate();
+            let u_cpu = (cpu_wall_ms / hi_size.max(1) as f64) * derate;
             let share = if u_cpu.is_finite() && u_cpu > 0.0 && u_gpu.is_finite() {
                 let measured = u_gpu / u_cpu;
                 let ratio = zc_loop_forced_ratio().unwrap_or(measured);
@@ -10409,7 +10493,7 @@ kernel void zc_loop_products(
                     eprintln!("[zc-loop] gate replay walls: {:?}", &walls[..n_walls]);
                     eprintln!(
                         "[zc-loop] gate u_gpu={u_gpu:.4}ms/chunk u_cpu={u_cpu:.4}ms/chunk \
-                         ratio={:.3} -> share {g}/{hi_size}",
+                         (derate={derate:.2}) ratio={:.3} -> share {g}/{hi_size}",
                         u_gpu / u_cpu,
                     );
                 }
@@ -12114,6 +12198,40 @@ DEF_PROBE(probe_g4_t8_p0,    8u,  0u,   tsel & 7u)
         assert_eq!(zc_r2_gate_share(f64::NAN, 2048), 0);
         assert_eq!(zc_r2_gate_share(0.0, 2048), 0);
         assert_eq!(zc_r2_gate_share(-1.0, 2048), 0);
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    fn zc_t3_gate_share_policy() {
+        use imp::zc_t3_gate_share;
+        // Balance point hi/(ratio+0.35); ranked-observed ratios land above
+        // the raised 15·hi/16 cap (was 7·hi/8), the binding overshoot guard.
+        assert_eq!(zc_t3_gate_share(0.57, 2048), 1920);
+        assert_eq!(zc_t3_gate_share(0.38, 2048), 1920);
+        // The guard still binds before the GPU can straggle: at 15/16 the
+        // crossover is 16/15 - 0.35 ≈ 0.717, above the ranked 0.57 and above
+        // r2's 0.617 (larger ALPHA ⇒ more headroom).
+        assert!(zc_t3_gate_share(0.72, 2048) < 1920);
+        // Slow-but-usable GPU: the formula takes over below the cap.
+        assert_eq!(zc_t3_gate_share(1.0, 2048), 1517); // 2048/1.35
+        assert_eq!(zc_t3_gate_share(2.0, 2048), 871); // 2048/2.35
+        // Admission floor for ratios in (2, 8), then exact incumbent past it.
+        assert_eq!(zc_t3_gate_share(2.01, 2048), 256);
+        assert_eq!(zc_t3_gate_share(7.9, 2048), 256);
+        assert_eq!(zc_t3_gate_share(8.0, 2048), 0);
+        assert_eq!(zc_t3_gate_share(f64::NAN, 2048), 0);
+        assert_eq!(zc_t3_gate_share(0.0, 2048), 0);
+        assert_eq!(zc_t3_gate_share(-1.0, 2048), 0);
+    }
+
+    // zc-loop keeps the 7·hi/8 cap: with ALPHA=0.5 the 15/16 crossover is
+    // 16/15 - 0.5 ≈ 0.567, BELOW the ranked 0.57, so raising it would let the
+    // GPU straggle. Lock the cap so a future edit cannot silently raise it.
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    fn zc_loop_gate_share_cap_is_seven_eighths() {
+        use imp::zc_loop_gate_share;
+        assert_eq!(zc_loop_gate_share(0.1, 2048), 2048 * 7 / 8);
     }
 
     /// The lincheck arm's GPU prefix equals the CPU fold over exactly the
