@@ -381,32 +381,6 @@ pub fn prover_config_for(
     log_batch_size: usize,
     profile: LigeritoProfile,
 ) -> Result<ProverConfig, String> {
-    // Reclaim coin-flip: memoize the pure (log_n, log_batch_size, profile) config derivation
-    // (TOML parse + soundness derivation). Circuit-determined, so caching is bit-exact.
-    use std::sync::{Mutex, OnceLock};
-    static MEMO: OnceLock<Mutex<Vec<((usize, usize, &'static str), ProverConfig)>>> =
-        OnceLock::new();
-    let key = (log_n, log_batch_size, profile.as_str());
-    let memo = MEMO.get_or_init(|| Mutex::new(Vec::new()));
-    if let Ok(g) = memo.lock() {
-        for (k, v) in g.iter() {
-            if *k == key {
-                return Ok(v.clone());
-            }
-        }
-    }
-    let pv = prover_config_for_uncached(log_n, log_batch_size, profile)?;
-    if let Ok(mut g) = memo.lock() {
-        g.push((key, pv.clone()));
-    }
-    Ok(pv)
-}
-
-fn prover_config_for_uncached(
-    log_n: usize,
-    log_batch_size: usize,
-    profile: LigeritoProfile,
-) -> Result<ProverConfig, String> {
     let m = log_n + crate::pcs::LOG_PACKING;
     let toml = embedded_security_config(m, profile).ok_or_else(|| {
         format!(
