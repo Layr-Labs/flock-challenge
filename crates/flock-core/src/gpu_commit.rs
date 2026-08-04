@@ -705,6 +705,37 @@ mod leaf_vec4_gate_tests {
     }
 }
 
+/// Exact rollback for the pad-free production g4 NTT pipeline. The candidate
+/// kernel is arithmetic-identical to `ntt_fused_reg4g4`; it only removes the
+/// never-read 1,984-byte threadgroup pad so a 32 KiB core can admit four
+/// 8,192-byte groups instead of three 10,176-byte groups.
+pub const ENV_NO_PAD_V4: &str = "FLOCK_NO_PAD_V4";
+
+fn gpu_pad_v4_value_enabled(value: Option<&std::ffi::OsStr>) -> bool {
+    value != Some(std::ffi::OsStr::new("1"))
+}
+
+pub(crate) fn gpu_pad_v4_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        gpu_pad_v4_value_enabled(std::env::var_os(ENV_NO_PAD_V4).as_deref())
+    })
+}
+
+#[cfg(test)]
+mod pad_v4_gate_tests {
+    use std::ffi::OsStr;
+
+    #[test]
+    fn default_on_exact_one_is_the_only_kill_value() {
+        assert_eq!(super::ENV_NO_PAD_V4, "FLOCK_NO_PAD_V4");
+        assert!(!super::gpu_pad_v4_value_enabled(Some(OsStr::new("1"))));
+        for value in [None, Some(""), Some("0"), Some("01"), Some("true")] {
+            assert!(super::gpu_pad_v4_value_enabled(value.map(OsStr::new)));
+        }
+    }
+}
+
 #[cfg(test)]
 mod z_pin_gate_tests {
     use std::ffi::OsStr;
@@ -2986,6 +3017,54 @@ kernel void blake3_pow_scan(
 }
 "#;
 
+    /// Derive the occupancy-probe kernel mechanically from the production
+    /// MSL. The supplemental library may contain the other unchanged kernels;
+    /// only the renamed g4 entry point is loaded from it. Keeping the source
+    /// derivation here avoids a second hand-maintained copy of the arithmetic.
+    fn pad_v4_msl_source() -> String {
+        let mut out = String::with_capacity(MSL_SOURCE.len());
+        let mut deleting_dead_write = false;
+        for line in MSL_SOURCE.lines() {
+            if line.contains("threadgroup uint4 pad[124u]") {
+                continue;
+            }
+            if line.contains("if (P.log_d == 77u)") {
+                deleting_dead_write = true;
+                continue;
+            }
+            if deleting_dead_write {
+                if line.trim() == "}" {
+                    deleting_dead_write = false;
+                }
+                continue;
+            }
+            if line.contains("kernel void ntt_fused_reg4g4(") {
+                out.push_str(&line.replacen(
+                    "ntt_fused_reg4g4(",
+                    "ntt_fused_reg4g4_v4res(",
+                    1,
+                ));
+            } else {
+                out.push_str(line);
+            }
+            out.push('\n');
+        }
+        out
+    }
+
+    #[cfg(test)]
+    mod pad_v4_source_tests {
+        #[test]
+        fn derived_source_only_removes_the_residency_pad() {
+            let source = super::pad_v4_msl_source();
+            assert!(source.contains("kernel void ntt_fused_reg4g4_v4res("));
+            assert!(!source.contains("kernel void ntt_fused_reg4g4("));
+            assert!(!source.contains("threadgroup uint4 pad[124u]"));
+            assert!(!source.contains("P.log_d == 77u"));
+            assert_eq!(source.matches("kernel void ").count(), super::MSL_SOURCE.matches("kernel void ").count());
+        }
+    }
+
     // -----------------------------------------------------------------------
     // Embedded precompiled metallib.
     //
@@ -3087,6 +3166,7 @@ kernel void blake3_pow_scan(
         pub(crate) queue: Id,
         pub(crate) pso_ntt: Id,
         pub(crate) pso_ntt4g4: Id,
+        pub(crate) pso_ntt4g4_v4res: Id,
         pub(crate) pso_ntt4: Id,
         pub(crate) pso_ntt3: Id,
         pub(crate) pso_ntt4z: Id,
@@ -3546,12 +3626,91 @@ kernel void blake3_pow_scan(
                 } else {
                     (NIL, NIL)
                 };
+                // Compile the pad-free g4 entry point as a supplemental
+                // library during the worker's untimed warmup. Any source,
+                // function, or pipeline failure leaves the incumbent
+                // embedded-metallib PSO authoritative.
+                let pso_ntt4g4_v4res = if super::gpu_pad_v4_enabled() {
+                    let t0 = std::time::Instant::now();
+                    let built = (|| -> Result<Id, String> {
+                        let source = pad_v4_msl_source();
+                        let src = api.nsstring(&source)?;
+                        let mut err: Id = NIL;
+                        let library: Id = send!(
+                            api,
+                            unsafe extern "C" fn(Id, Sel, Id, Id, *mut Id) -> Id,
+                            device,
+                            c"newLibraryWithSource:options:error:",
+                            src,
+                            NIL,
+                            &mut err
+                        );
+                        if library.is_null() {
+                            return Err(format!(
+                                "pad-v4 shader compile failed: {}",
+                                api.error_string(err)
+                            ));
+                        }
+                        let ns = api.nsstring("ntt_fused_reg4g4_v4res")?;
+                        let function: Id = send!(
+                            api,
+                            unsafe extern "C" fn(Id, Sel, Id) -> Id,
+                            library,
+                            c"newFunctionWithName:",
+                            ns
+                        );
+                        if function.is_null() {
+                            send!(api, unsafe extern "C" fn(Id, Sel) -> Id, library, c"release");
+                            return Err("pad-v4 kernel not found".into());
+                        }
+                        let mut pso_err: Id = NIL;
+                        let pso: Id = send!(
+                            api,
+                            unsafe extern "C" fn(Id, Sel, Id, *mut Id) -> Id,
+                            device,
+                            c"newComputePipelineStateWithFunction:error:",
+                            function,
+                            &mut pso_err
+                        );
+                        send!(api, unsafe extern "C" fn(Id, Sel) -> Id, function, c"release");
+                        send!(api, unsafe extern "C" fn(Id, Sel) -> Id, library, c"release");
+                        if pso.is_null() {
+                            return Err(format!(
+                                "pad-v4 pipeline failed: {}",
+                                api.error_string(pso_err)
+                            ));
+                        }
+                        Ok(pso)
+                    })();
+                    match built {
+                        Ok(pso) => {
+                            if debug_enabled() {
+                                eprintln!(
+                                    "[gpu-commit] pad-v4 supplemental compile: {:.1} ms",
+                                    t0.elapsed().as_secs_f64() * 1e3
+                                );
+                            }
+                            pso
+                        }
+                        Err(e) => {
+                            if debug_enabled() {
+                                eprintln!(
+                                    "[gpu-commit] pad-v4 unavailable ({e}); keeping incumbent g4"
+                                );
+                            }
+                            NIL
+                        }
+                    }
+                } else {
+                    NIL
+                };
                 Ok(Gpu {
                     api,
                     device,
                     queue,
                     pso_ntt,
                     pso_ntt4g4,
+                    pso_ntt4g4_v4res,
                     pso_ntt4,
                     pso_ntt3,
                     pso_ntt4z,
@@ -3581,6 +3740,25 @@ kernel void blake3_pow_scan(
     // -----------------------------------------------------------------------
 
     impl Gpu {
+        #[inline]
+        pub(crate) fn pso_ntt4g4_active(&self) -> Id {
+            let use_v4 = super::gpu_pad_v4_enabled() && !self.pso_ntt4g4_v4res.is_null();
+            if debug_enabled() {
+                static ONCE: std::sync::Once = std::sync::Once::new();
+                ONCE.call_once(|| {
+                    eprintln!(
+                        "[gpu-commit] g4 NTT dispatch: {}",
+                        if use_v4 { "pad-v4" } else { "incumbent" }
+                    );
+                });
+            }
+            if use_v4 {
+                self.pso_ntt4g4_v4res
+            } else {
+                self.pso_ntt4g4
+            }
+        }
+
         pub(crate) unsafe fn pool_push(&self) -> *mut c_void {
             unsafe { (self.api.pool_push)() }
         }
@@ -4123,7 +4301,7 @@ kernel void blake3_pow_scan(
                 let s = log_d - l - f;
                 let (pso, tpg, groups) = match f {
                     4 if share_log > 0 && s >= share_log => (
-                        gpu.pso_ntt4g4,
+                        gpu.pso_ntt4g4_active(),
                         64u64,
                         1u64 << (log_d - f - share_log),
                     ),
@@ -4188,7 +4366,7 @@ kernel void blake3_pow_scan(
                 let s = log_d - l - f;
                 let (pso, tpg, groups) = match f {
                     4 if share_log > 0 && s >= share_log => (
-                        gpu.pso_ntt4g4,
+                        gpu.pso_ntt4g4_active(),
                         64u64,
                         1u64 << (log_d - f - share_log),
                     ),
@@ -6371,7 +6549,7 @@ kernel void blake3_pow_scan(
     /// Cache key component tying entries to both the exact GPU source and
     /// selected from-z mode. Candidate and exact-rollback processes must not
     /// consume each other's latch or tuned split.
-    fn warmup_cache_msl_fnv_for(zero_root: bool, leaf_vec4: bool) -> u64 {
+    fn warmup_cache_msl_fnv_for(zero_root: bool, leaf_vec4: bool, pad_v4: bool) -> u64 {
         let mut key = fnv1a64(MSL_SOURCE);
         if zero_root {
             key ^= fnv1a64(FROM_Z_ZERO_ROOT_MSL_SOURCE).rotate_left(1)
@@ -6380,6 +6558,9 @@ kernel void blake3_pow_scan(
         if leaf_vec4 {
             key ^= fnv1a64(LEAF_VEC4_MSL_SOURCE).rotate_left(2) ^ 0x4C45_4146_5F56_3431; // "LEAF_V41"
         }
+        if pad_v4 {
+            key ^= 0x5041_445F_5634_5253; // "PAD_V4RS"
+        }
         key
     }
 
@@ -6387,6 +6568,7 @@ kernel void blake3_pow_scan(
         warmup_cache_msl_fnv_for(
             super::gpu_from_z_zero_root_selected(20),
             super::gpu_leaf_vec4_enabled(),
+            super::gpu_pad_v4_enabled(),
         )
     }
 
@@ -6394,8 +6576,8 @@ kernel void blake3_pow_scan(
     mod zero_root_cache_key_tests {
         #[test]
         fn supplemental_source_and_mode_have_a_distinct_fingerprint() {
-            let incumbent = super::warmup_cache_msl_fnv_for(false, false);
-            let candidate = super::warmup_cache_msl_fnv_for(true, false);
+            let incumbent = super::warmup_cache_msl_fnv_for(false, false, false);
+            let candidate = super::warmup_cache_msl_fnv_for(true, false, false);
             assert_eq!(incumbent, super::fnv1a64(super::MSL_SOURCE));
             assert_ne!(candidate, incumbent);
             assert_eq!(
@@ -6406,15 +6588,20 @@ kernel void blake3_pow_scan(
             );
             // The leaf-vec4 dimension is independent and non-degenerate:
             // candidate and exact-rollback processes never share a latch.
-            let vec4 = super::warmup_cache_msl_fnv_for(false, true);
+            let vec4 = super::warmup_cache_msl_fnv_for(false, true, false);
             assert_ne!(vec4, incumbent);
-            assert_ne!(super::warmup_cache_msl_fnv_for(true, true), candidate);
+            assert_ne!(super::warmup_cache_msl_fnv_for(true, true, false), candidate);
             assert_eq!(
                 vec4,
                 incumbent
                     ^ super::fnv1a64(super::LEAF_VEC4_MSL_SOURCE).rotate_left(2)
                     ^ 0x4C45_4146_5F56_3431
             );
+            let pad = super::warmup_cache_msl_fnv_for(false, false, true);
+            assert_ne!(pad, incumbent);
+            assert_ne!(super::warmup_cache_msl_fnv_for(true, false, true), candidate);
+            assert_ne!(super::warmup_cache_msl_fnv_for(false, true, true), vec4);
+            assert_eq!(pad, incumbent ^ 0x5041_445F_5634_5253);
         }
 
         #[test]
