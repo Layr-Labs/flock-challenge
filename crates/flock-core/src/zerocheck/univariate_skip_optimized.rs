@@ -692,11 +692,17 @@ fn precompute_round1_ab_inner_packed_padded_with_flavor(
     debug_assert_eq!(OUTER_BYTES, (1 << N_INNER) * N_CHUNKS);
 
     // Reuse an A-sized resident F128 allocation from the prover scratch pool.
-    // Treating it as bytes is valid because every byte is written below before
-    // the storage is read (including explicit zero writes for padding holes).
+    // Treating it as bytes is valid because every non-padding block is written
+    // below. When padding is present, skipped tail blocks may retain stale
+    // scratch bytes: every consumer uses the same `b_med_counts` table and
+    // never reads those blocks, and the allocation is fully overwritten when
+    // donated to compact round two.
     let mut storage = crate::scratch::take_f128(total_bytes / core::mem::size_of::<F128>());
     let out_bytes: &mut [u8] =
         unsafe { core::slice::from_raw_parts_mut(storage.as_mut_ptr() as *mut u8, total_bytes) };
+
+    let omit_padding_tail = padding.k_log >= K_SKIP + N_INNER
+        && padding.useful_bits_per_block < (1usize << padding.k_log);
 
     out_bytes
         .par_chunks_mut(OUTER_BYTES)
@@ -757,7 +763,7 @@ fn precompute_round1_ab_inner_packed_padded_with_flavor(
                         };
                     }
                 }
-                if nt {
+                if !omit_padding_tail && nt {
                     let tail = &mut out_outer[n_b_med * 64..];
                     debug_assert_eq!(tail.len() % 64, 0);
                     let zero = [0u8; 64];
@@ -765,7 +771,7 @@ fn precompute_round1_ab_inner_packed_padded_with_flavor(
                         // SAFETY: chunk `i` is 64 in-bounds bytes of `tail`.
                         unsafe { store_nt_64(zero.as_ptr(), tail.as_mut_ptr().add(i * 64)) };
                     }
-                } else {
+                } else if !omit_padding_tail {
                     out_outer[n_b_med * 64..].fill(0);
                 }
             },
@@ -3226,53 +3232,66 @@ mod tests {
     }
 
     #[test]
-    fn ab_precompute_nt_flavor_is_byte_identical() {
-        use crate::zerocheck::univariate_skip::pack_bits;
-        // Same padded/dense case matrix as the precompute oracle above: the
-        // NT drain (stack bounce + stnp) and the incumbent direct kernel
-        // write must produce identical storage bytes, including zeroed
-        // padding holes.
+    fn ab_precompute_nt_flavor_matches_live_bytes() {
+        // NT drain and direct kernel write must agree on every block the
+        // consumer reads. Padded tail blocks are deliberately not
+        // materialized by either flavor under `omit_padding_tail`.
         let cases: [(usize, Option<(usize, usize)>); 3] = [
             (13, None),
             (14, Some((14, 15_409))), // BLAKE3 block shape
-            (17, Some((14, 15_409))),
+            (16, Some((16, 50_000))),
         ];
-        for (m, padded) in cases {
-            let mut rng = Rng::new(0xAB_57_0F14_u64 ^ (m as u64));
-            let total_bits = 1usize << m;
-            let mut a = rng.bits(total_bits);
-            let mut b = rng.bits(total_bits);
-            let padding = match padded {
-                None => PaddingSpec::dense(m),
-                Some((k_log, useful_bits)) => {
-                    let block_size = 1usize << k_log;
-                    for blk in 0..(total_bits / block_size) {
-                        for j in useful_bits..block_size {
-                            let idx = blk * block_size + j;
-                            a[idx] = false;
-                            b[idx] = false;
-                        }
-                    }
-                    PaddingSpec {
-                        k_log,
-                        useful_bits_per_block: useful_bits,
-                    }
-                }
+        let inv_table = make_inv_table();
+        let mut rng = Rng::new(0xA11_B17E);
+        for (m, pad) in cases {
+            let a_bits = rng.bits(1 << m);
+            let b_bits = rng.bits(1 << m);
+            let a = super::super::univariate_skip::pack_bits(&a_bits);
+            let b = super::super::univariate_skip::pack_bits(&b_bits);
+            let padding = match pad {
+                None => PaddingSpec {
+                    k_log: m,
+                    useful_bits_per_block: 1 << m,
+                },
+                Some((k_log, useful)) => PaddingSpec {
+                    k_log,
+                    useful_bits_per_block: useful,
+                },
             };
-            let (a_p, b_p) = (pack_bits(&a), pack_bits(&b));
-            let table = make_inv_table();
             let plain = precompute_round1_ab_inner_packed_padded_with_flavor(
-                &a_p, &b_p, m, K_SKIP, &table, &padding, false,
+                &a,
+                &b,
+                m,
+                K_SKIP,
+                &inv_table,
+                &padding,
+                false,
             );
             let nt = precompute_round1_ab_inner_packed_padded_with_flavor(
-                &a_p, &b_p, m, K_SKIP, &table, &padding, true,
+                &a,
+                &b,
+                m,
+                K_SKIP,
+                &inv_table,
+                &padding,
+                true,
             );
-            assert_eq!(
-                plain.as_bytes(),
-                nt.as_bytes(),
-                "store flavor changed bytes at m={m}, padded={}",
-                padded.is_some()
-            );
+            let (within_outer_mask, b_med_counts) = build_b_med_counts(&padding);
+            const OUTER_BYTES: usize = (1 << N_MEDIUM) * 64;
+            for (x_outer, (plain_outer, nt_outer)) in plain
+                .as_bytes()
+                .chunks_exact(OUTER_BYTES)
+                .zip(nt.as_bytes().chunks_exact(OUTER_BYTES))
+                .enumerate()
+            {
+                let live_bytes = b_med_counts[x_outer & within_outer_mask] as usize * 64;
+                assert_eq!(
+                    &plain_outer[..live_bytes],
+                    &nt_outer[..live_bytes],
+                    "store flavor changed live bytes at m={m}, x_outer={x_outer}, padded={}",
+                    pad.is_some()
+                );
+            }
         }
     }
 
