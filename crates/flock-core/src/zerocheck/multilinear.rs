@@ -1725,7 +1725,21 @@ pub(crate) fn fold2_compact_and_round4_into(
     let table_l1 = table.scaled_linear(lambda1);
     let table_l3 = table.scaled_linear(lambda3);
 
-    let eq = SplitEqGhash::with_n_hi(&r_next4[1..], COMPACT_RECONSTRUCTION_N_HI);
+    // K-fold job split: R2 compact uses COMPACT_RECONSTRUCTION_N_HI=11.
+    // After fold2 the output is half-size (n_groups = n_pairs/2), so the same
+    // n_hi packs larger lo jobs. Prefer n_hi=12 when the remaining log allows
+    // it — halves per-job DRAM (~0.7 MiB vs ~1.4 MiB) and keeps the 32 KiB
+    // tables L1-hot across more workers. Kill: FLOCK_NO_K_FOLD_N_HI12=1.
+    let k_fold_n_hi = if std::env::var_os("FLOCK_NO_K_FOLD_N_HI12").is_none() {
+        let max_hi = r_next4.len().saturating_sub(2); // leave ≥1 lo bit
+        COMPACT_RECONSTRUCTION_N_HI
+            .saturating_add(1)
+            .min(max_hi)
+            .max(1)
+    } else {
+        COMPACT_RECONSTRUCTION_N_HI
+    };
+    let eq = SplitEqGhash::with_n_hi(&r_next4[1..], k_fold_n_hi);
     let lo_size = 1usize << eq.n_lo;
     let hi_size = 1usize << eq.n_hi;
     assert_eq!(lo_size * hi_size * 2, n_groups);
