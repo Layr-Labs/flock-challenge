@@ -640,6 +640,11 @@ where
             // `cfg(test)` so release/ranked proves elide ~960 B/stripe × n_stripes
             // while `cargo test` keeps the full-stripe contract.
             let useful_words = stripe_useful_bits.div_ceil(64);
+            // Contiguous 64 B tiles into the lincheck stripe. On aarch64, stage
+            // through a stack tile and `stnp` so the ~482 MiB ranked write avoids
+            // RFO; the fold consumer re-reads only after commit/challenges, so
+            // the NT lines are not needed hot in cache from this pass.
+            // Store shape stays per-row contiguous bursts (not per-lane scatter).
             for i in 0..useful_words {
                 let lanes: [u64; 8] = [
                     z_u64_all[0 * u64_per_block + i],
@@ -651,7 +656,13 @@ where
                     z_u64_all[6 * u64_per_block + i],
                     z_u64_all[7 * u64_per_block + i],
                 ];
-                transpose_8_u64s_to_64_bytes(&lanes, &mut stripe[i * 64..i * 64 + 64]);
+                let mut tile = [0u8; 64];
+                transpose_8_u64s_to_64_bytes(&lanes, &mut tile);
+                // SAFETY: `stripe` is exclusively owned by this group task for
+                // `stripe[0..useful_words*64]`; tiles are disjoint 64 B ranges.
+                unsafe {
+                    nt_store_64_bytes(tile.as_ptr(), stripe.as_mut_ptr().add(i * 64));
+                }
             }
             #[cfg(test)]
             {
@@ -862,6 +873,33 @@ pub(crate) fn or_bit_row(rows: &mut [BmRow], bit: usize) {
     let s = bit & 63;
     for j in 0..BM_V {
         rows[w][j] |= 1u64 << s;
+    }
+}
+
+/// Non-temporal store of one contiguous 64-byte lincheck transpose tile.
+///
+/// Ranked witgen emits the lincheck stripe as sequential 64 B tiles from
+/// [`transpose_8_u64s_to_64_bytes`]. Using `stnp` here drops the RFO read on
+/// the destination lines (~482 MiB at m=32 useful pitch) without changing
+/// tile geometry or the later fold's load order.
+#[inline(always)]
+pub(crate) unsafe fn nt_store_64_bytes(src: *const u8, dst: *mut u8) {
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        std::arch::asm!(
+            "ldp {t0:q}, {t1:q}, [{s}]",
+            "stnp {t0:q}, {t1:q}, [{d}]",
+            "ldp {t0:q}, {t1:q}, [{s}, #32]",
+            "stnp {t0:q}, {t1:q}, [{d}, #32]",
+            s = in(reg) src,
+            d = in(reg) dst,
+            t0 = out(vreg) _,
+            t1 = out(vreg) _,
+        );
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    unsafe {
+        core::ptr::copy_nonoverlapping(src, dst, 64);
     }
 }
 
