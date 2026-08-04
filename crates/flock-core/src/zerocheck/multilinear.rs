@@ -100,6 +100,19 @@ fn zc_r2_odd_offload_enabled() -> bool {
     *ON
 }
 
+/// When set, the GPU's eight-slot prefix also supplies `W0/W3/W4/W5`, so the
+/// CPU writes only anchors+deltas on offloaded chunks (anchors-only kernel)
+/// and adopts all six lookahead slots from the GPU. Kill switch
+/// `FLOCK_NO_ZC_R2_W_OFFLOAD=1` keeps the CPU computing W* on the
+/// `<false, true>` monomorphization (odd products still GPU-owned).
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn zc_r2_w_offload_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        std::env::var_os("FLOCK_NO_ZC_R2_W_OFFLOAD").is_none_or(|v| v != *"1")
+    });
+    *ON
+}
+
 fn round2_pair_skip(padding: &PaddingSpec, k_skip: usize) -> (usize, usize) {
     if padding.k_log <= k_skip + 1 {
         return (0, usize::MAX);
@@ -1385,6 +1398,13 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead(
     let odd_on_gpu = gpu_prefix > 0 && zc_r2_odd_offload_enabled();
     #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
     let odd_on_gpu = false;
+    // W-aggregate offload requires the parity-split GPU arm (odd_on_gpu) so
+    // calibration has already admitted the eight-slot kernel against the
+    // full CPU lookahead state.
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    let w_on_gpu = odd_on_gpu && zc_r2_w_offload_enabled();
+    #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+    let w_on_gpu = false;
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     let t_cpu_sweep = std::time::Instant::now();
 
@@ -1433,6 +1453,21 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead(
                         degen,
                         out.as_mut_ptr(),
                     );
+                } else if w_on_gpu {
+                    // GPU owns products + W0/W3/W4/W5 for this chunk; CPU only
+                    // materializes the compact state (byte-identical stores).
+                    fold_round2_compact_chunk_neon_anchors_only_8(
+                        t,
+                        ap,
+                        bp,
+                        anchors,
+                        deltas,
+                        lo_size,
+                        pair_idx_base,
+                        pair_in_block_mask,
+                        useful_pairs_inclusive,
+                    );
+                    return;
                 } else if odd_on_gpu {
                     fold_round2_compact_chunk_neon_lookahead_8::<false, true>(
                         t,
@@ -1528,7 +1563,11 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead(
             crate::gpu_commit::ZcR2Result::Prefix(vals) => {
                 for (x_hi, v) in vals.iter().enumerate() {
                     partials[x_hi] = (v[0] + v[2], v[1] + v[3]);
-                    if odd_on_gpu {
+                    if w_on_gpu {
+                        // GPU slots: [p1e, pinfe, p1o, pinfo, W0, W3, W4, W5]
+                        // la layout:  [p1o, pinfo, W0, W3, W4, W5]
+                        la_partials[x_hi] = [v[2], v[3], v[4], v[5], v[6], v[7]];
+                    } else if odd_on_gpu {
                         la_partials[x_hi][0] = v[2];
                         la_partials[x_hi][1] = v[3];
                     }
@@ -1537,9 +1576,9 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead(
             crate::gpu_commit::ZcR2Result::Failed => {
                 // Redo exactly the skipped prefix products — slower, still
                 // exact. Throwaway anchor/delta scratch: the real ranges were
-                // already written by the lookahead pass. The full-lookahead
-                // monomorphization is used so the odd-parity slots are
-                // recovered too when the CPU sweep skipped them.
+                // already written by the anchors-only / lookahead pass. The
+                // full-lookahead monomorphization recovers every slot the
+                // CPU sweep skipped (odd products and, under w_on_gpu, W*).
                 let mut scr_anchors = vec![F128::ZERO; anchor_chunk_size];
                 let mut scr_deltas = vec![0u8; delta_chunk_size];
                 for x_hi in 0..prefix {
@@ -1567,7 +1606,16 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead(
                         eq_h * (kappa * out[0] + out[2]),
                         eq_h * (kappa * out[1] + out[3]),
                     );
-                    if odd_on_gpu {
+                    if w_on_gpu {
+                        la_partials[x_hi] = [
+                            eq_h * out[2],
+                            eq_h * out[3],
+                            eq_h * out[4],
+                            eq_h * out[5],
+                            eq_h * out[6],
+                            eq_h * out[7],
+                        ];
+                    } else if odd_on_gpu {
                         la_partials[x_hi][0] = eq_h * out[2];
                         la_partials[x_hi][1] = eq_h * out[3];
                     }
