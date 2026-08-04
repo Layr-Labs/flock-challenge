@@ -2499,16 +2499,19 @@ pub fn round1_shift_reduce_extract_c_packed_padded_with_precomputed_ab(
     (res_ab.to_vec(), res_c_lifted, s_hat_v_c, quad_c)
 }
 
-/// Resolve the Fold4-only lo/hi split tuning seam. Invalid values fail loudly:
+/// Resolve the retained-coordinate lo/hi split tuning seam. Invalid values fail loudly:
 /// silently accepting a typo would make component profiles incomparable.
 fn fold4_n_hi_from_env() -> usize {
     match std::env::var_os("FLOCK_EXPERIMENTAL_FOLD4_N_HI") {
-        None => 7,
+        None => 9,
         Some(value) => match value.to_str() {
             Some("5") => 5,
             Some("6") => 6,
             Some("7") => 7,
-            _ => panic!("FLOCK_EXPERIMENTAL_FOLD4_N_HI must be exactly 5, 6, or 7"),
+            Some("9") => 9,
+            _ => panic!(
+                "FLOCK_EXPERIMENTAL_FOLD4_N_HI must be exactly 5, 6, 7, or 9"
+            ),
         },
     }
 }
