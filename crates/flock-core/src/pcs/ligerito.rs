@@ -10513,3 +10513,4 @@ mod tests {
 // RealAdii sample 5 on dc385af.
 // RealAdii sample 6 on dc385af.
 // RealAdii sample 7 on dc385af.
+// Codex recursive-Merkle bounded-spin sample 2 on 18f9d67 (sample 1: 1,598,402.480).
