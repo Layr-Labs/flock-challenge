@@ -620,6 +620,28 @@ fn ab_compact_store_enabled() -> bool {
     })
 }
 
+/// Kill switch for sequential-band AB completion. Default ON: the ranked
+/// AB-only completion partitions the `hi_size` cold 4 MiB bands into a small
+/// number of contiguous mega-jobs (≤8, the file's stream-count design limit)
+/// so each worker streams one long sequential region of `ab_inner` rather
+/// than thrashing up to `hi_size` far-apart bands through the fine-grain
+/// hetero queue. Arithmetic is unchanged — same rows, same convert table,
+/// same reduction — only the DRAM stream shape moves. Set exactly
+/// `FLOCK_NO_ZC_AB_SEQ_BANDS=1` to restore one hetero job per `x_hi`.
+pub const ENV_NO_ZC_AB_SEQ_BANDS: &str = "FLOCK_NO_ZC_AB_SEQ_BANDS";
+
+fn ab_seq_bands_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var_os(ENV_NO_ZC_AB_SEQ_BANDS).as_deref() != Some(std::ffi::OsStr::new("1"))
+    })
+}
+
+/// Cap concurrent cold AB-completion streams at the design limit used by the
+/// NTT leaf pipeline ("eight streams, eight ways"). More jobs reintroduce
+/// cross-band thrash; fewer leave P-cores idle on a bandwidth-bound pass.
+const AB_SEQ_BAND_MAX_JOBS: usize = 8;
+
 /// Non-temporal 64-byte store (L1 stack bounce → `stnp` pair burst), the same
 /// best-effort cache-bypass idiom as the witness stripe drain. The precompute
 /// output is a 512 MiB write-once surface whose consumer runs tens of
@@ -1492,24 +1514,41 @@ pub(crate) fn round1_shift_reduce_ab_packed_padded_with_precomputed(
 
     let mut partials = vec![[F128::ZERO; ELL]; hi_size];
     let partials_base = crate::epool::SyncPtr(partials.as_mut_ptr());
-    crate::epool::run_hetero_chunks(hi_size, |x_hi| {
-        let mut partial = [F128::ZERO; ELL];
-        process_one_x_hi_with_precomputed_ab_fold4_ab(
-            x_hi,
-            big_lo_size,
-            n_lo_and_inner,
-            within_outer_mask,
-            &b_med_counts,
-            ab_inner_bytes,
-            &eq_lo_scaled,
-            eq.hi[x_hi],
-            convert,
-            None,
-            &mut partial,
-        );
-        // SAFETY: each queue index owns one disjoint output slot and the
-        // synchronous queue join publishes all writes before reduction.
-        unsafe { *partials_base.ptr().add(x_hi) = partial };
+
+    // Ranked layout: each `x_hi` owns one contiguous 4 MiB band of `ab_inner`
+    // (`chunk_byte_base` steps by 2^(n_lo+N_INNER)*N_CHUNKS = 4 MiB between
+    // consecutive `x_hi`, and the inner `x_outer_lo` loop is sequential inside
+    // the band). Fine-grain hetero over all `hi_size` bands therefore keeps
+    // up to ~14 far-apart cold streams live (10 P + 4 E). Coarse contiguous
+    // mega-jobs drop that to ≤ AB_SEQ_BAND_MAX_JOBS long sequential streams
+    // covering the same 496 MiB live read — pure stream-shape change.
+    let n_jobs = if ab_seq_bands_enabled() {
+        hi_size.min(AB_SEQ_BAND_MAX_JOBS).max(1)
+    } else {
+        hi_size
+    };
+    crate::epool::run_hetero_chunks(n_jobs, |job| {
+        let start = job * hi_size / n_jobs;
+        let end = (job + 1) * hi_size / n_jobs;
+        for x_hi in start..end {
+            let mut partial = [F128::ZERO; ELL];
+            process_one_x_hi_with_precomputed_ab_fold4_ab(
+                x_hi,
+                big_lo_size,
+                n_lo_and_inner,
+                within_outer_mask,
+                &b_med_counts,
+                ab_inner_bytes,
+                &eq_lo_scaled,
+                eq.hi[x_hi],
+                convert,
+                None,
+                &mut partial,
+            );
+            // SAFETY: each `x_hi` is owned by exactly one job range and the
+            // synchronous queue join publishes all writes before reduction.
+            unsafe { *partials_base.ptr().add(x_hi) = partial };
+        }
     });
 
     partials
