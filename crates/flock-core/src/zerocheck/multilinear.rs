@@ -1408,12 +1408,13 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead(
         let row_base = pair_idx_base * 2;
         let mut out = [F128::ZERO; 8];
 
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        let full = x_hi >= gpu_prefix;
+        #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+        let full = true;
+
         #[cfg(target_arch = "aarch64")]
         {
-            #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-            let full = x_hi >= gpu_prefix;
-            #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
-            let full = true;
             unsafe {
                 let t = table.data.as_ptr().cast::<u8>();
                 let ap = a_packed.as_ptr().add(row_base * n_chunks);
@@ -1488,21 +1489,57 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead(
         }
 
         let eq_h = eq_hi[x_hi];
-        // `out[0..2]` carry the even lane on the odd lane's weight; κ restores
-        // `eq₂(2y)` exactly (field arithmetic, no rounding).
-        let p1 = kappa * out[0] + out[2];
-        let pinf = kappa * out[1] + out[3];
+        // GPU-prefix product ownership (C5 / mapped residual):
+        // - `<false, true>` (odd_on_gpu): out[0..4] are zero by construction;
+        //   the GPU drain overwrites partials and la[0..1]. Writing those
+        //   zeros + applying κ to them is pure dead work (6 muls + product
+        //   stores) on ~gpu_prefix chunks. Only W* (out[4..8]) stay CPU.
+        // - `<false, false>`: even products are zero; κ is the identity on
+        //   out[2], out[3] — skip the two κ muls.
+        // - full CPU path: unchanged κ + full write.
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        let gpu_owns_products = !full;
+        #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+        let gpu_owns_products = false;
+
         // SAFETY: exclusive owner of both partial slots (see above).
         unsafe {
-            *partials_base.ptr().add(x_hi) = (eq_h * p1, eq_h * pinf);
-            *la_base.ptr().add(x_hi) = [
-                eq_h * out[2],
-                eq_h * out[3],
-                eq_h * out[4],
-                eq_h * out[5],
-                eq_h * out[6],
-                eq_h * out[7],
-            ];
+            if gpu_owns_products && odd_on_gpu {
+                // partials[x_hi] stays the vec-init ZERO; GPU drain fills it.
+                *la_base.ptr().add(x_hi) = [
+                    F128::ZERO,
+                    F128::ZERO,
+                    eq_h * out[4],
+                    eq_h * out[5],
+                    eq_h * out[6],
+                    eq_h * out[7],
+                ];
+            } else if gpu_owns_products {
+                // Even products GPU-owned (zeros in out[0..2]); odd+W live.
+                *partials_base.ptr().add(x_hi) = (eq_h * out[2], eq_h * out[3]);
+                *la_base.ptr().add(x_hi) = [
+                    eq_h * out[2],
+                    eq_h * out[3],
+                    eq_h * out[4],
+                    eq_h * out[5],
+                    eq_h * out[6],
+                    eq_h * out[7],
+                ];
+            } else {
+                // `out[0..2]` carry the even lane on the odd lane's weight; κ
+                // restores `eq₂(2y)` exactly (field arithmetic, no rounding).
+                let p1 = kappa * out[0] + out[2];
+                let pinf = kappa * out[1] + out[3];
+                *partials_base.ptr().add(x_hi) = (eq_h * p1, eq_h * pinf);
+                *la_base.ptr().add(x_hi) = [
+                    eq_h * out[2],
+                    eq_h * out[3],
+                    eq_h * out[4],
+                    eq_h * out[5],
+                    eq_h * out[6],
+                    eq_h * out[7],
+                ];
+            }
         }
     });
 
