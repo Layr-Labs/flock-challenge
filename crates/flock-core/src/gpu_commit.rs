@@ -888,6 +888,47 @@ mod latch_measure_fix_gate_tests {
     }
 }
 
+/// Exact-`1` control restoring the incumbent single-sample commit-latch
+/// pricing. With the fix active the warmup's timed graph replay is repeated
+/// (up to 8 back-to-back runs, plateau-stopped) and `gpu_wall_ms` is priced
+/// from the per-run MINIMUM — the same one-sided-noise argument the grind
+/// latch (min of two draws) and the zc_fold sample (replay-to-min) already
+/// ship: contention only ever makes a run slower, never faster, so the
+/// minimum is the least-contended steady-state estimate. The margin, the
+/// comparison direction, every guard, and the wiring-root determinism check
+/// are unchanged — only the measured GPU quantity moves. The extra replays
+/// run once per process inside the untimed warmup (worst case seven more
+/// graph runs, each a few ms); the timed trials never see them.
+/// The min correction prices the graph-only quantity, so it composes only
+/// with the measure fix above: killing `FLOCK_NO_LATCH_MEASURE_FIX` also
+/// bypasses the replay loop, keeping each kill switch's legacy an exact
+/// same-binary diagnostic.
+pub const ENV_NO_COMMIT_LATCH_MIN: &str = "FLOCK_NO_COMMIT_LATCH_MIN";
+
+fn commit_latch_min_value_enabled(value: Option<&std::ffi::OsStr>) -> bool {
+    value != Some(std::ffi::OsStr::new("1"))
+}
+
+fn commit_latch_min_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        commit_latch_min_value_enabled(std::env::var_os(ENV_NO_COMMIT_LATCH_MIN).as_deref())
+    })
+}
+
+#[cfg(test)]
+mod commit_latch_min_gate_tests {
+    use std::ffi::OsStr;
+
+    #[test]
+    fn exact_one_is_the_only_commit_latch_min_kill_value() {
+        assert!(!super::commit_latch_min_value_enabled(Some(OsStr::new("1"))));
+        for value in [None, Some(""), Some("0"), Some("01"), Some("true")] {
+            assert!(super::commit_latch_min_value_enabled(value.map(OsStr::new)));
+        }
+    }
+}
+
 /// The exact ranked L0 geometry the GPU graph is built for (mirrors the CPU
 /// pipeline's `is_ranked_ntt_merkle_leaf_pipeline_shape`): `log_d = 20`,
 /// 64 interleaved lanes, rate-1/2 entry at layer 1, 1 KiB BLAKE3 leaves.
@@ -6644,7 +6685,44 @@ kernel void blake3_pow_scan(
                 };
                 let t0 = std::time::Instant::now();
                 run_commit_graph_from_z(gpu, z_buf, staging, tw_buf, tree_buf, log_d, n_leaves)?;
-                let graph_ms = t0.elapsed().as_secs_f64() * 1e3;
+                let mut graph_ms = t0.elapsed().as_secs_f64() * 1e3;
+                // MEASUREMENT CORRECTION (kill: FLOCK_NO_COMMIT_LATCH_MIN,
+                // see `ENV_NO_COMMIT_LATCH_MIN`): the latch used to price
+                // `gpu_wall_ms` from this ONE timed replay, so a single
+                // noisy-high run — the zc_fold correction observed ~2.8x
+                // ramp/queue outliers on identical GPU work — falsely vetoed
+                // the GPU commit arm for the process's whole lifetime.
+                // Replay-to-min with the zc_fold plateau rule: at least
+                // three back-to-back runs, stop once a run no longer improves
+                // the running minimum by more than 5%, cap at 8. A mid-loop
+                // replay error keeps the samples already taken rather than
+                // failing the warmup. Every replay rewrites `tree_buf` with
+                // identical bytes, so the copy-out below and the wiring-root
+                // determinism check downstream see the same tree regardless
+                // of the replay count.
+                if super::commit_latch_min_enabled() && super::latch_measure_fix_enabled() {
+                    let mut w_min = graph_ms;
+                    for i in 1..8usize {
+                        let t = std::time::Instant::now();
+                        if run_commit_graph_from_z(
+                            gpu, z_buf, staging, tw_buf, tree_buf, log_d, n_leaves,
+                        )
+                        .is_err()
+                        {
+                            break;
+                        }
+                        let w = t.elapsed().as_secs_f64() * 1e3;
+                        if w <= 0.0 {
+                            break;
+                        }
+                        let prev_min = w_min;
+                        w_min = w_min.min(w);
+                        if i + 1 >= 3 && w > 0.95 * prev_min {
+                            break;
+                        }
+                    }
+                    graph_ms = w_min;
+                }
                 copy_bytes_parallel(gpu.buffer_contents(tree_buf), {
                     core::slice::from_raw_parts_mut(
                         gpu_tree.as_mut_ptr().cast::<u8>(),
