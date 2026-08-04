@@ -77,6 +77,42 @@ pub(crate) fn gpu_zerocheck_debug() -> bool {
     *ON
 }
 
+/// Default warmup→timed CPU contention de-rate for zerocheck GPU-split gates.
+/// See [`zc_gate_contention_derate`]. Kept deliberately below the ~2.6× fleet
+/// observation so the correction under-provisions GPU rather than over-provisions.
+const ZC_GATE_CONTENTION_DERATE: f64 = 2.0;
+
+/// Kill switch: `FLOCK_NO_ZC_GATE_CONTENTION_DERATE=1` restores raw warmup
+/// `u_cpu` pricing (incumbent). Optional override: `FLOCK_ZC_GATE_CONTENTION_DERATE=<f64>`.
+pub const ENV_NO_ZC_GATE_CONTENTION_DERATE: &str = "FLOCK_NO_ZC_GATE_CONTENTION_DERATE";
+pub const ENV_ZC_GATE_CONTENTION_DERATE: &str = "FLOCK_ZC_GATE_CONTENTION_DERATE";
+
+/// Warmup-vs-timed CPU contention de-rate for zerocheck GPU-split gates
+/// (`zc_r2` / `zc_t3` / `zc_loop` product arms and the round-1 c-fold `[gpu-zc]`
+/// split). Warmup prices cool/uncontended CPU; the timed prove is contended, so
+/// raw warmup `u_cpu` under-states timed cost and under-provisions the GPU.
+/// This scales warmup `u_cpu` before the balanced-split formula. Does **not**
+/// touch straggle caps (`15/16`, `7/8`) — those are a separate clamp family
+/// already scored on this tip.
+pub(crate) fn zc_gate_contention_derate() -> f64 {
+    static D: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
+    *D.get_or_init(|| {
+        if std::env::var_os(ENV_NO_ZC_GATE_CONTENTION_DERATE).is_some() {
+            return 1.0;
+        }
+        if let Some(v) = std::env::var_os(ENV_ZC_GATE_CONTENTION_DERATE) {
+            if let Some(s) = v.to_str() {
+                if let Ok(x) = s.parse::<f64>() {
+                    if x.is_finite() && x > 0.0 && x <= 8.0 {
+                        return x;
+                    }
+                }
+            }
+        }
+        ZC_GATE_CONTENTION_DERATE
+    })
+}
+
 /// Kill switch for the lincheck witness-stripe gather-fold GPU arm:
 /// `FLOCK_NO_GPU_LINCHECK=1` keeps the whole fold on the CPU (the exact
 /// incumbent). The fold is a pure gather + XOR reduction — the eq weight is
@@ -7513,7 +7549,14 @@ LC_KERNEL(lc_fold_stripes, 4)
             return;
         }
         let u_gpu = gpu_ms / claim_lo as f64;
-        let u_cpu = suffix_ms / (n_claims - claim_lo) as f64;
+        // Price CPU under timed-round contention for the zerocheck arm only.
+        // Lincheck keeps raw warmup pricing (different residency / duty cycle).
+        let derate = if arm == FoldArm::Zc {
+            zc_gate_contention_derate()
+        } else {
+            1.0
+        };
+        let u_cpu = (suffix_ms / (n_claims - claim_lo) as f64) * derate;
         if !(u_gpu.is_finite() && u_cpu.is_finite()) || u_gpu <= 0.0 || u_cpu <= 0.0 {
             return;
         }
@@ -7538,7 +7581,7 @@ LC_KERNEL(lc_fold_stripes, 4)
         if arm.debug() {
             eprintln!(
                 "{} split {claim_lo}/{n_claims} gpu={gpu_ms:.2}ms head={head_ms:.2}ms \
-                 suffix={suffix_ms:.2}ms -> {g}/{n_claims}",
+                 suffix={suffix_ms:.2}ms (derate={derate:.2}) -> {g}/{n_claims}",
                 arm.tag(),
             );
         }
@@ -9071,7 +9114,8 @@ kernel void zc_r2_products(
             } else {
                 f64::INFINITY
             };
-            let u_cpu = cpu_wall_ms / hi_size.max(1) as f64;
+            let derate = zc_gate_contention_derate();
+            let u_cpu = (cpu_wall_ms / hi_size.max(1) as f64) * derate;
             let share = if u_cpu.is_finite() && u_cpu > 0.0 && u_gpu.is_finite() {
                 let measured = u_gpu / u_cpu;
                 let ratio = zc_r2_forced_ratio().unwrap_or(measured);
@@ -9082,7 +9126,7 @@ kernel void zc_r2_products(
                     );
                     eprintln!(
                         "[zc-r2] gate u_gpu={u_gpu:.4}ms/chunk u_cpu={u_cpu:.4}ms/chunk \
-                         ratio={:.3} -> share {g}/{hi_size}",
+                         (derate={derate:.2}) ratio={:.3} -> share {g}/{hi_size}",
                         u_gpu / u_cpu,
                     );
                 }
@@ -9733,7 +9777,8 @@ kernel void zc_t3_products(
             } else {
                 f64::INFINITY
             };
-            let u_cpu = cpu_wall_ms / hi_size.max(1) as f64;
+            let derate = zc_gate_contention_derate();
+            let u_cpu = (cpu_wall_ms / hi_size.max(1) as f64) * derate;
             let share = if u_cpu.is_finite() && u_cpu > 0.0 && u_gpu.is_finite() {
                 let measured = u_gpu / u_cpu;
                 let ratio = zc_t3_forced_ratio().unwrap_or(measured);
@@ -9742,7 +9787,7 @@ kernel void zc_t3_products(
                     eprintln!("[zc-t3] gate replay walls: {:?}", &walls[..n_walls]);
                     eprintln!(
                         "[zc-t3] gate u_gpu={u_gpu:.4}ms/chunk u_cpu={u_cpu:.4}ms/chunk \
-                         ratio={:.3} -> share {g}/{hi_size}",
+                         (derate={derate:.2}) ratio={:.3} -> share {g}/{hi_size}",
                         u_gpu / u_cpu,
                     );
                 }
@@ -10400,7 +10445,8 @@ kernel void zc_loop_products(
             } else {
                 f64::INFINITY
             };
-            let u_cpu = cpu_wall_ms / hi_size.max(1) as f64;
+            let derate = zc_gate_contention_derate();
+            let u_cpu = (cpu_wall_ms / hi_size.max(1) as f64) * derate;
             let share = if u_cpu.is_finite() && u_cpu > 0.0 && u_gpu.is_finite() {
                 let measured = u_gpu / u_cpu;
                 let ratio = zc_loop_forced_ratio().unwrap_or(measured);
@@ -10409,7 +10455,7 @@ kernel void zc_loop_products(
                     eprintln!("[zc-loop] gate replay walls: {:?}", &walls[..n_walls]);
                     eprintln!(
                         "[zc-loop] gate u_gpu={u_gpu:.4}ms/chunk u_cpu={u_cpu:.4}ms/chunk \
-                         ratio={:.3} -> share {g}/{hi_size}",
+                         (derate={derate:.2}) ratio={:.3} -> share {g}/{hi_size}",
                         u_gpu / u_cpu,
                     );
                 }
