@@ -4509,23 +4509,18 @@ kernel void blake3_pow_scan(
     }
 
     /// Pure selection over the sweep's per-candidate best walls; `candidates`
-    /// is ascending and must contain `default_k`. Asymmetric toward the GPU:
-    /// - the smallest share within 1.5% of the fastest wins (the timed prove's
-    ///   round-1 precompute contends for the same cores, so near-ties resolve
-    ///   toward more GPU work);
+    /// is ascending and must contain `default_k`. Deliberately asymmetric
+    /// toward the promoted default:
+    /// - the smallest share within 1.5% of the fastest wins (the timed
+    ///   prove's round-1 precompute contends for the same cores, so
+    ///   near-ties resolve toward the GPU);
+    /// - if the default is itself within 1.5% of the fastest, keep it — an
+    ///   emulated sweep cannot adjudicate noise-thin margins, the ranked
+    ///   runner can;
     /// - k=0 must beat the default by > 4% — official board evidence has the
     ///   hybrid several percent ahead of the pure-GPU graph, so a sweep that
     ///   says otherwise is more likely an emulation artifact (e.g. the burn
     ///   floor collapsing all candidates) than truth.
-    ///
-    /// The previous "keep default if it is within 1.5% of the fastest" rule is
-    /// intentionally gone. That rule ignored measured wins of up to 1.5% of
-    /// the graph arm whenever the fixed default was merely close, and with
-    /// the ranked candidate set now just `{0, 3, 5}` the default is no longer
-    /// a privileged middle that needs protection from noise — the 1.5% near-tie
-    /// already prefers the smaller (more GPU) share, and the k=0 4% gate still
-    /// guards the pure-GPU artifact. `FLOCK_HYBRID_KEEP_DEFAULT_BAND=1`
-    /// restores the old keep-default behaviour for same-binary comparison.
     fn choose_hybrid_k(candidates: &[usize], best_ms: &[f64], default_k: usize) -> Option<usize> {
         let default_i = candidates
             .iter()
@@ -4534,9 +4529,7 @@ kernel void blake3_pow_scan(
         let fastest = best_ms.iter().cloned().fold(f64::INFINITY, f64::min);
         let chosen_i = (0..candidates.len()).find(|&i| best_ms[i] <= fastest * 1.015)?;
         let mut chosen = candidates[chosen_i];
-        if std::env::var_os("FLOCK_HYBRID_KEEP_DEFAULT_BAND").is_some()
-            && best_ms[default_i] <= fastest * 1.015
-        {
+        if best_ms[default_i] <= fastest * 1.015 {
             chosen = default_k;
         }
         if chosen == 0 && best_ms[chosen_i] > best_ms[default_i] * (1.0 - 0.04) {
@@ -4963,31 +4956,11 @@ kernel void blake3_pow_scan(
                 }
             }
         };
-        // Score by the graph arm alone under exact AB contention, not by the
-        // join wall. The AB replay is k-independent; when it outlasts the
-        // graph the join wall contains no information about k (wayfinder F2).
-        // Minimising the graph arm is never wrong: where the graph is
-        // critical it minimises the join too; where it is not, a shorter
-        // graph is free. `FLOCK_HYBRID_SCORE_JOIN_WALL=1` restores the
-        // incumbent join-max objective for same-binary comparison.
         let sample = |k: usize| -> Result<f64, String> {
-            let score_join = std::env::var_os("FLOCK_HYBRID_SCORE_JOIN_WALL").is_some();
             let t0 = std::time::Instant::now();
-            let (graph_arm, ()) = rayon::join(
-                || {
-                    let tg = std::time::Instant::now();
-                    let r = timed_graph(k);
-                    (r, tg.elapsed().as_secs_f64() * 1e3)
-                },
-                || replay_ab(),
-            );
-            let (graph, graph_ms) = graph_arm;
+            let (graph, ()) = rayon::join(|| timed_graph(k), || replay_ab());
             graph?;
-            Ok(if score_join {
-                t0.elapsed().as_secs_f64() * 1e3
-            } else {
-                graph_ms
-            })
+            Ok(t0.elapsed().as_secs_f64() * 1e3)
         };
         let reprime = || unsafe {
             run_from_z_first_pass(
@@ -7241,22 +7214,13 @@ LC_KERNEL(lc_fold_stripes, 4)
         if !(u_gpu.is_finite() && u_cpu.is_finite()) || u_gpu <= 0.0 || u_cpu <= 0.0 {
             return;
         }
-        // Balanced finish-time split. A previous 0.9 CPU-ward bias systematically
-        // left GPU claim capacity idle after warmup clock-ramp (wayfinder F3);
-        // overshoot risk is already bounded by the clamp below and by the fact
-        // that the next timed prove remeasures under steady state. Cap at
-        // 7n/8 so an optimistic warmup sample cannot make the GPU the timed
-        // straggler. `FLOCK_ZC_FOLD_CPU_BIAS=1` restores the 0.9 factor.
-        let bias = if std::env::var_os("FLOCK_ZC_FOLD_CPU_BIAS").is_some() {
-            0.9
-        } else {
-            1.0
-        };
+        // Bias 10% toward the CPU. Overshooting makes the GPU the straggler,
+        // which costs wall directly; undershooting only leaves a little of
+        // the otherwise-free window unused, and the GPU arm's wall is the
+        // noisier of the two (clock ramp, queue latency).
         let balanced =
-            bias * (head_ms.max(0.0) + n_claims as f64 * u_cpu) / (u_gpu + u_cpu);
-        let hi = (n_claims as i64 - 1).max(1);
-        let cap = (n_claims as i64 * 7 / 8).clamp(1, hi);
-        let g = (balanced.round() as i64).clamp(1, cap) as usize;
+            0.9 * (head_ms.max(0.0) + n_claims as f64 * u_cpu) / (u_gpu + u_cpu);
+        let g = (balanced.round() as i64).clamp(1, n_claims as i64 - 1) as usize;
         arm.tuned()
             .store(g, std::sync::atomic::Ordering::Relaxed);
         if arm.debug() {
@@ -7568,26 +7532,10 @@ LC_KERNEL(lc_fold_stripes, 4)
         }
 
         #[test]
-        fn near_tie_prefers_smaller_share_not_default() {
-            // k=3 fastest; default k=5 is within 1.5% of fastest but is a
-            // larger CPU share. New policy picks the smallest share in band
-            // (k=3), not the fixed default.
+        fn default_near_tie_keeps_default() {
+            // k=3 fastest but default k=5 within 1.5% → default retained.
             let ms = [200.0, 100.0, 101.0];
-            assert_eq!(choose_hybrid_k(&C, &ms, DEFAULT_HYBRID_K), Some(3));
-        }
-
-        #[test]
-        fn keep_default_band_env_restores_incumbent() {
-            // Same walls as above; with the restore env the old keep-default
-            // rule wins. Env is process-global so this test only checks the
-            // function when the env is already set by the caller; when unset
-            // the new policy applies (covered above).
-            let ms = [200.0, 100.0, 101.0];
-            if std::env::var_os("FLOCK_HYBRID_KEEP_DEFAULT_BAND").is_some() {
-                assert_eq!(choose_hybrid_k(&C, &ms, DEFAULT_HYBRID_K), Some(5));
-            } else {
-                assert_eq!(choose_hybrid_k(&C, &ms, DEFAULT_HYBRID_K), Some(3));
-            }
+            assert_eq!(choose_hybrid_k(&C, &ms, DEFAULT_HYBRID_K), Some(5));
         }
 
         #[test]
