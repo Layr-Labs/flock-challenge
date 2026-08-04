@@ -347,6 +347,97 @@ pub(super) unsafe fn round0(witness: &[F128], basis: &[F128]) -> (F128, F128) {
     }
 }
 
+/// Deferred-reduction sufficient statistics for a factorized LSB equality
+/// basis. Each tail value multiplies the even witness value and the pair sum;
+/// both product streams remain in the 256-bit domain until the end.
+///
+/// Two tail entries are interleaved to break the accumulator dependency
+/// chains. Each field product uses three-PMULL Karatsuba instead of the six
+/// PMULLs (product plus reduction) in the scalar `F128::mul` path.
+///
+/// # Safety
+/// Requires the `aes` target feature. `f.len()` must equal
+/// `2 * eq_tail.len()`.
+#[target_feature(enable = "aes")]
+pub(super) unsafe fn round0_factorized_eq(f: &[F128], eq_tail: &[F128]) -> (F128, F128) {
+    unsafe {
+        debug_assert_eq!(f.len(), 2 * eq_tail.len());
+
+        let zero = vdupq_n_u64(0);
+        let mut a_0 = WideNeon { lo: zero, hi: zero };
+        let mut a_1 = WideNeon { lo: zero, hi: zero };
+        let mut s_0 = WideNeon { lo: zero, hi: zero };
+        let mut s_1 = WideNeon { lo: zero, hi: zero };
+
+        let fp = f.as_ptr();
+        let wp = eq_tail.as_ptr();
+        let main = eq_tail.len() & !1;
+        let mut j = 0usize;
+        while j < main {
+            let f_00 = vld1q_u64(fp.add(2 * j).cast::<u64>());
+            let f_01 = vld1q_u64(fp.add(2 * j + 1).cast::<u64>());
+            let f_10 = vld1q_u64(fp.add(2 * j + 2).cast::<u64>());
+            let f_11 = vld1q_u64(fp.add(2 * j + 3).cast::<u64>());
+            let w_0 = vld1q_u64(wp.add(j).cast::<u64>());
+            let w_1 = vld1q_u64(wp.add(j + 1).cast::<u64>());
+
+            xor_wide(&mut a_0, mul_unreduced(f_00, w_0));
+            xor_wide(&mut s_0, mul_unreduced(veorq_u64(f_00, f_01), w_0));
+            xor_wide(&mut a_1, mul_unreduced(f_10, w_1));
+            xor_wide(&mut s_1, mul_unreduced(veorq_u64(f_10, f_11), w_1));
+            j += 2;
+        }
+        if j < eq_tail.len() {
+            let f_0 = vld1q_u64(fp.add(2 * j).cast::<u64>());
+            let f_1 = vld1q_u64(fp.add(2 * j + 1).cast::<u64>());
+            let w = vld1q_u64(wp.add(j).cast::<u64>());
+            xor_wide(&mut a_0, mul_unreduced(f_0, w));
+            xor_wide(&mut s_0, mul_unreduced(veorq_u64(f_0, f_1), w));
+        }
+
+        xor_wide(&mut a_0, a_1);
+        xor_wide(&mut s_0, s_1);
+        (
+            transmute::<uint64x2_t, F128>(reduce_wide(a_0)),
+            transmute::<uint64x2_t, F128>(reduce_wide(s_0)),
+        )
+    }
+}
+
+/// Expand one equality-table level with a shared multiplier `r`.
+///
+/// For every old value `v = lo[i]`, writes `hi[i] = v * r` and
+/// `lo[i] = v + hi[i]`. The two-lane constant Karatsuba primitive uses six
+/// PMULLs for each pair of products and shares their vectorized reduction.
+///
+/// # Safety
+/// Requires the `aes` target feature. `lo` and `hi` must have equal lengths.
+#[inline]
+pub(super) unsafe fn expand_eq_table_level(lo: &mut [F128], hi: &mut [F128], r: F128) {
+    use crate::field::gf2_128::aarch64::ghash_mul_const_vec2_neon;
+
+    debug_assert_eq!(lo.len(), hi.len());
+    let paired = lo.len() & !1;
+    let mut i = 0usize;
+    while i < paired {
+        let values = [lo[i], lo[i + 1]];
+        // SAFETY: the architecture-selecting caller supplies `aes`.
+        let products = unsafe { ghash_mul_const_vec2_neon(r, values) };
+        hi[i] = products[0];
+        hi[i + 1] = products[1];
+        lo[i] = values[0] + products[0];
+        lo[i + 1] = values[1] + products[1];
+        i += 2;
+    }
+
+    if i < lo.len() {
+        let value = lo[i];
+        let product = value * r;
+        hi[i] = product;
+        lo[i] = value + product;
+    }
+}
+
 /// Two-lane pair fold using NEON and PMULL.
 ///
 /// # Safety
@@ -434,6 +525,76 @@ pub(super) unsafe fn fold_two_and_msg(
                 mul_const_vec2(r_q, veorq_u64(b_even0, b_odd0), veorq_u64(b_even1, b_odd1));
             let b0 = veorq_u64(b_even0, folded_b[0]);
             let b1 = veorq_u64(b_even1, folded_b[1]);
+
+            vst1q_u64(nf.as_mut_ptr().add(t).cast::<u64>(), f0);
+            vst1q_u64(nf.as_mut_ptr().add(t + 1).cast::<u64>(), f1);
+            vst1q_u64(nb.as_mut_ptr().add(t).cast::<u64>(), b0);
+            vst1q_u64(nb.as_mut_ptr().add(t + 1).cast::<u64>(), b1);
+
+            xor_wide(&mut u0, mul_unreduced(f0, b0));
+            xor_wide(&mut u2, mul_unreduced(veorq_u64(f0, f1), veorq_u64(b0, b1)));
+            t += 2;
+        }
+        (
+            transmute::<uint64x2_t, F128>(reduce_wide(u0)),
+            transmute::<uint64x2_t, F128>(reduce_wide(u2)),
+        )
+    }
+}
+
+/// Fold two polynomials, inject a scaled folded-domain basis addend, and
+/// accumulate the next sumcheck message over the corrected outputs.
+///
+/// The addend is consumed before `nb` is stored and before either message
+/// product is formed. Two adjacent addend values share one constant-
+/// multiplier Karatsuba reduction, so the correction costs six PMULLs per
+/// output pair without a second traversal of `nf` and `nb`.
+///
+/// # Safety
+/// Requires the `aes` target feature. The architecture-selecting wrapper
+/// checks equal polynomial/output lengths, even output alignment, and complete
+/// source/addend coverage for `[base, base + nf.len())`.
+#[target_feature(enable = "aes")]
+pub(super) unsafe fn fold_two_and_msg_with_scaled_basis_addend(
+    f: &[F128],
+    b: &[F128],
+    basis_addend: &[F128],
+    base: usize,
+    nf: &mut [F128],
+    nb: &mut [F128],
+    r: F128,
+    scale: F128,
+) -> (F128, F128) {
+    unsafe {
+        let zero = vdupq_n_u64(0);
+        let r_q = transmute::<F128, uint64x2_t>(r);
+        let scale_q = transmute::<F128, uint64x2_t>(scale);
+        let mut u0 = WideNeon { lo: zero, hi: zero };
+        let mut u2 = WideNeon { lo: zero, hi: zero };
+        let mut t = 0usize;
+        while t < nf.len() {
+            let source = 2 * (base + t);
+            let f_even0 = vld1q_u64(f.as_ptr().add(source).cast::<u64>());
+            let f_odd0 = vld1q_u64(f.as_ptr().add(source + 1).cast::<u64>());
+            let f_even1 = vld1q_u64(f.as_ptr().add(source + 2).cast::<u64>());
+            let f_odd1 = vld1q_u64(f.as_ptr().add(source + 3).cast::<u64>());
+            let folded_f =
+                mul_const_vec2(r_q, veorq_u64(f_even0, f_odd0), veorq_u64(f_even1, f_odd1));
+            let f0 = veorq_u64(f_even0, folded_f[0]);
+            let f1 = veorq_u64(f_even1, folded_f[1]);
+
+            let b_even0 = vld1q_u64(b.as_ptr().add(source).cast::<u64>());
+            let b_odd0 = vld1q_u64(b.as_ptr().add(source + 1).cast::<u64>());
+            let b_even1 = vld1q_u64(b.as_ptr().add(source + 2).cast::<u64>());
+            let b_odd1 = vld1q_u64(b.as_ptr().add(source + 3).cast::<u64>());
+            let folded_b =
+                mul_const_vec2(r_q, veorq_u64(b_even0, b_odd0), veorq_u64(b_even1, b_odd1));
+
+            let addend0 = vld1q_u64(basis_addend.as_ptr().add(base + t).cast::<u64>());
+            let addend1 = vld1q_u64(basis_addend.as_ptr().add(base + t + 1).cast::<u64>());
+            let scaled_addend = mul_const_vec2(scale_q, addend0, addend1);
+            let b0 = xor3_u64(b_even0, folded_b[0], scaled_addend[0]);
+            let b1 = xor3_u64(b_even1, folded_b[1], scaled_addend[1]);
 
             vst1q_u64(nf.as_mut_ptr().add(t).cast::<u64>(), f0);
             vst1q_u64(nf.as_mut_ptr().add(t + 1).cast::<u64>(), f1);

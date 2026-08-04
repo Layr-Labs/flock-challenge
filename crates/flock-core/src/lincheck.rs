@@ -551,6 +551,33 @@ pub(crate) fn build_eq_table_into(point: &[F128], out: &mut [F128]) {
     }
 }
 
+/// Architecture-optimized equality-table builder used by callers that opt in
+/// independently of [`build_eq_table`]. Keeping this separate leaves the
+/// generic builder available as an exact same-binary control.
+pub(crate) fn build_eq_table_optimized(point: &[F128]) -> Vec<F128> {
+    use rayon::prelude::*;
+
+    let mut out = crate::alloc_uninit_f128_vec(1usize << point.len());
+    out[0] = F128::ONE;
+    const PAR_THRESHOLD: usize = 1 << 12;
+    const PAR_CHUNK: usize = 1 << 8;
+    for (j, &r_j) in point.iter().enumerate() {
+        let len = 1usize << j;
+        let (lo, rest) = out.split_at_mut(len);
+        let hi = &mut rest[..len];
+        if len < PAR_THRESHOLD {
+            crate::field::f128_slice::expand_eq_table_level(lo, hi, r_j);
+        } else {
+            lo.par_chunks_mut(PAR_CHUNK)
+                .zip(hi.par_chunks_mut(PAR_CHUNK))
+                .for_each(|(lo_chunk, hi_chunk)| {
+                    crate::field::f128_slice::expand_eq_table_level(lo_chunk, hi_chunk, r_j);
+                });
+        }
+    }
+    out
+}
+
 /// Fold a sparse boolean matrix's rows against an eq table at the row
 /// coords. Computes the **transposed** matrix-vector product:
 ///
@@ -1935,6 +1962,19 @@ mod tests {
                 }
                 assert_eq!(table[i], expected, "mismatch at d={d}, i={i}");
             }
+        }
+    }
+
+    /// The opt-in vector builder is an exact replacement at every expansion
+    /// geometry, including its first parallel level.
+    #[test]
+    fn optimized_eq_table_matches_generic_bytes() {
+        for &d in &[0usize, 1, 2, 3, 5, 8, 12, 13] {
+            let mut rng = Rng::new(0x4551_4f50 + d as u64);
+            let point = rng.f128_vec(d);
+            let generic = build_eq_table(&point);
+            let optimized = build_eq_table_optimized(&point);
+            assert_eq!(optimized, generic, "dimension={d}");
         }
     }
 

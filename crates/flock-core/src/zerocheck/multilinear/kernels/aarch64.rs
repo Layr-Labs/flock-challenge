@@ -687,7 +687,6 @@ pub(crate) unsafe fn fold_round2_compact_chunk_neon_lookahead_8<
     pair_in_block_mask: usize,
     useful_pairs_inclusive: usize,
     degen: bool,
-    periodic_padding: bool,
     out: *mut F128,
 ) {
     use core::arch::aarch64::*;
@@ -723,122 +722,85 @@ pub(crate) unsafe fn fold_round2_compact_chunk_neon_lookahead_8<
             core::mem::transmute::<F128, uint64x2_t>(F128::ONE),
         ));
 
-        macro_rules! zero_group {
-            ($u:expr) => {{
-                let x_lo0 = 2 * $u;
-                let x_lo1 = x_lo0 + 1;
+        let n_groups = lo_size / 2;
+        for u in 0..n_groups {
+            let x_lo0 = 2 * u;
+            let x_lo1 = x_lo0 + 1;
+            let pad0 = ((pair_idx_base + x_lo0) & pair_in_block_mask) >= useful_pairs_inclusive;
+            let pad1 = ((pair_idx_base + x_lo1) & pair_in_block_mask) >= useful_pairs_inclusive;
+            if pad0 & pad1 {
                 store_anchor_pair_nt(anchors.add(2 * x_lo0), zero, zero);
                 vst1q_u64(deltas.add(x_lo0 * 16).cast::<u64>(), zero);
                 store_anchor_pair_nt(anchors.add(2 * x_lo1), zero, zero);
                 vst1q_u64(deltas.add(x_lo1 * 16).cast::<u64>(), zero);
-            }};
-        }
+                continue;
+            }
 
-        macro_rules! process_group {
-            ($u:expr, $pad0:expr, $pad1:expr) => {{
-                let x_lo0 = 2 * $u;
-                let x_lo1 = x_lo0 + 1;
-                let pad0 = $pad0;
-                let pad1 = $pad1;
+            let (a0, a1, b0, b1, deg0) = r2_pair_fold_and_store(
+                table_data, a_packed, b_packed, anchors, deltas, x_lo0, pad0, degen, b_ones,
+            );
+            let (a2, a3, b2, b3, deg1) = r2_pair_fold_and_store(
+                table_data, a_packed, b_packed, anchors, deltas, x_lo1, pad1, degen, b_ones,
+            );
 
-                let (a0, a1, b0, b1, deg0) = r2_pair_fold_and_store(
-                    table_data, a_packed, b_packed, anchors, deltas, x_lo0, pad0, degen, b_ones,
-                );
-                let (a2, a3, b2, b3, deg1) = r2_pair_fold_and_store(
-                    table_data, a_packed, b_packed, anchors, deltas, x_lo1, pad1, degen, b_ones,
-                );
+            // The odd lane's weight drives the whole group; see the doc above.
+            let w = vld1q_u64(eq_lo.add(x_lo1).cast::<u64>());
 
-                // The odd lane's weight drives the whole group; see the doc above.
-                let w = vld1q_u64(eq_lo.add(x_lo1).cast::<u64>());
+            if deg0 & deg1 & ones_is_one {
+                // b === 1 across the group: e_b = o_b = 0 kills W3/W4/W5 and
+                // both G(inf) chains, and every surviving product is `w * a_i`.
+                if FULL {
+                    wide_xor(&mut p1_even, mul_unreduced_q(w, a1));
+                }
+                if !ODD_ON_GPU {
+                    wide_xor(&mut p1_odd, mul_unreduced_q(w, a3));
+                }
+                wide_xor(&mut w0, mul_unreduced_q(w, a2));
+                continue;
+            }
 
-                if deg0 & deg1 & ones_is_one {
-                    // b === 1 across the group: e_b = o_b = 0 kills W3/W4/W5 and
-                    // both G(inf) chains, and every surviving product is `w * a_i`.
-                    if FULL {
-                        wide_xor(&mut p1_even, mul_unreduced_q(w, a1));
-                    }
-                    if !ODD_ON_GPU {
-                        wide_xor(&mut p1_odd, mul_unreduced_q(w, a3));
-                    }
-                    wide_xor(&mut w0, mul_unreduced_q(w, a2));
-                } else {
-                    let a0w = mul_q(w, a0);
-                    let a1w = mul_q(w, a1);
-                    let (a2w, a3w) = if pad1 {
-                        (zero, zero)
-                    } else {
-                        (mul_q(w, a2), mul_q(w, a3))
-                    };
+            let a0w = mul_q(w, a0);
+            let a1w = mul_q(w, a1);
+            let (a2w, a3w) = if pad1 {
+                (zero, zero)
+            } else {
+                (mul_q(w, a2), mul_q(w, a3))
+            };
 
-                    // ---- round-two products, split by the parity of x' ----
-                    if FULL {
-                        wide_xor(&mut p1_even, mul_unreduced_q(a1w, b1));
-                        if !deg0 {
-                            wide_xor(
-                                &mut pinf_even,
-                                mul_unreduced_q(veorq_u64(a0w, a1w), veorq_u64(b0, b1)),
-                            );
-                        }
-                    }
-                    if !pad1 {
-                        if !ODD_ON_GPU {
-                            wide_xor(&mut p1_odd, mul_unreduced_q(a3w, b3));
-                            if !deg1 {
-                                wide_xor(
-                                    &mut pinf_odd,
-                                    mul_unreduced_q(veorq_u64(a2w, a3w), veorq_u64(b2, b3)),
-                                );
-                            }
-                        }
-                        wide_xor(&mut w0, mul_unreduced_q(a2w, b2));
-                    }
-
-                    // ---- deferred round-three aggregates (no extra lookups) ----
-                    let e_aw = veorq_u64(a0w, a2w);
-                    let o_aw = veorq_u64(a1w, a3w);
-                    let e_b = veorq_u64(b0, b2);
-                    let o_b = veorq_u64(b1, b3);
-                    wide_xor(&mut w3, mul_unreduced_q(e_aw, e_b));
-                    wide_xor(&mut w4, mul_unreduced_q(o_aw, o_b));
+            // ---- round-two products, split by the parity of x' ----
+            if FULL {
+                wide_xor(&mut p1_even, mul_unreduced_q(a1w, b1));
+                if !deg0 {
                     wide_xor(
-                        &mut w5,
-                        mul_unreduced_q(veorq_u64(e_aw, o_aw), veorq_u64(e_b, o_b)),
+                        &mut pinf_even,
+                        mul_unreduced_q(veorq_u64(a0w, a1w), veorq_u64(b0, b1)),
                     );
                 }
-            }};
-        }
+            }
+            if !pad1 {
+                if !ODD_ON_GPU {
+                    wide_xor(&mut p1_odd, mul_unreduced_q(a3w, b3));
+                    if !deg1 {
+                        wide_xor(
+                            &mut pinf_odd,
+                            mul_unreduced_q(veorq_u64(a2w, a3w), veorq_u64(b2, b3)),
+                        );
+                    }
+                }
+                wide_xor(&mut w0, mul_unreduced_q(a2w, b2));
+            }
 
-        let n_groups = lo_size / 2;
-        let ranked_periodic = periodic_padding
-            && pair_in_block_mask == 127
-            && useful_pairs_inclusive == 121
-            && (pair_idx_base & 127) == 0
-            && n_groups.is_multiple_of(64);
-        if ranked_periodic {
-            for block in 0..n_groups / 64 {
-                let first = block * 64;
-                for u in first..first + 60 {
-                    process_group!(u, false, false);
-                }
-                process_group!(first + 60, false, true);
-                for u in first + 61..first + 64 {
-                    zero_group!(u);
-                }
-            }
-        } else {
-            for u in 0..n_groups {
-                let x_lo0 = 2 * u;
-                let x_lo1 = x_lo0 + 1;
-                let pad0 =
-                    ((pair_idx_base + x_lo0) & pair_in_block_mask) >= useful_pairs_inclusive;
-                let pad1 =
-                    ((pair_idx_base + x_lo1) & pair_in_block_mask) >= useful_pairs_inclusive;
-                if pad0 & pad1 {
-                    zero_group!(u);
-                    continue;
-                }
-                process_group!(u, pad0, pad1);
-            }
+            // ---- deferred round-three aggregates (no extra lookups) ----
+            let e_aw = veorq_u64(a0w, a2w);
+            let o_aw = veorq_u64(a1w, a3w);
+            let e_b = veorq_u64(b0, b2);
+            let o_b = veorq_u64(b1, b3);
+            wide_xor(&mut w3, mul_unreduced_q(e_aw, e_b));
+            wide_xor(&mut w4, mul_unreduced_q(o_aw, o_b));
+            wide_xor(
+                &mut w5,
+                mul_unreduced_q(veorq_u64(e_aw, o_aw), veorq_u64(e_b, o_b)),
+            );
         }
 
         *out.add(0) = core::mem::transmute::<uint64x2_t, F128>(reduce_wide_q(p1_even));
@@ -2140,55 +2102,5 @@ mod tests {
                 );
             }
         }
-    }
-
-    #[test]
-    fn round2_periodic_padding_matches_generic_schedule() {
-        const LO_SIZE: usize = 128;
-        const N_CHUNKS: usize = 8;
-
-        let mut state = 0x5045_5249_4f44_4943;
-        let table: Vec<F128> = (0..N_CHUNKS * 256)
-            .map(|_| F128::new(splitmix64(&mut state), splitmix64(&mut state)))
-            .collect();
-        let mut a_packed = vec![0u8; 2 * LO_SIZE * N_CHUNKS];
-        let mut b_packed = vec![0u8; 2 * LO_SIZE * N_CHUNKS];
-        for byte in a_packed.iter_mut().chain(b_packed.iter_mut()) {
-            *byte = splitmix64(&mut state) as u8;
-        }
-        let eq_lo: Vec<F128> = (0..LO_SIZE)
-            .map(|_| F128::new(splitmix64(&mut state), splitmix64(&mut state)))
-            .collect();
-
-        let run = |periodic_padding: bool| {
-            let poison = F128::new(0xaaaa_aaaa_aaaa_aaaa, 0x5555_5555_5555_5555);
-            let mut anchors = vec![poison; 2 * LO_SIZE];
-            let mut deltas = vec![0xa5u8; 2 * LO_SIZE * N_CHUNKS];
-            let mut out = [poison; 8];
-            unsafe {
-                fold_round2_compact_chunk_neon_lookahead_8::<true, false>(
-                    table.as_ptr().cast::<u8>(),
-                    a_packed.as_ptr(),
-                    b_packed.as_ptr(),
-                    anchors.as_mut_ptr(),
-                    deltas.as_mut_ptr(),
-                    eq_lo.as_ptr(),
-                    LO_SIZE,
-                    0,
-                    127,
-                    121,
-                    true,
-                    periodic_padding,
-                    out.as_mut_ptr(),
-                );
-            }
-            (anchors, deltas, out)
-        };
-
-        let periodic = run(true);
-        let generic = run(false);
-        assert_eq!(periodic.0, generic.0, "anchor schedule mismatch");
-        assert_eq!(periodic.1, generic.1, "delta schedule mismatch");
-        assert_eq!(periodic.2, generic.2, "message/lookahead mismatch");
     }
 }

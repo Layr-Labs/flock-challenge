@@ -2,17 +2,7 @@
 
 use super::F128;
 
-#[cfg(any(
-    test,
-    not(any(
-        all(
-            target_arch = "x86_64",
-            target_feature = "avx512f",
-            target_feature = "vpclmulqdq"
-        ),
-        all(target_arch = "aarch64", target_feature = "aes")
-    ))
-))]
+#[cfg(any(test, not(all(target_arch = "aarch64", target_feature = "aes"))))]
 mod portable;
 
 #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
@@ -52,6 +42,56 @@ pub(crate) fn round0(witness: &[F128], basis: &[F128]) -> (F128, F128) {
     // SAFETY: the cfg gate supplies PMULL through `aes`; the checks above are
     // the complete slice-shape contract of the architecture kernel.
     unsafe { aarch64::round0(witness, basis) }
+}
+
+/// Accumulate the two sufficient statistics for a factorized LSB equality
+/// basis:
+///
+/// `a = sum_j f[2j] * eq_tail[j]`
+/// `s = sum_j (f[2j] + f[2j + 1]) * eq_tail[j]`.
+///
+/// The AArch64 kernel keeps both product sums unreduced for the complete
+/// slice, then reduces each once. Other targets retain the fully-reduced
+/// portable loop. Reduction is F2-linear, so both paths are bit-identical.
+#[inline]
+pub(crate) fn round0_factorized_eq(f: &[F128], eq_tail: &[F128]) -> (F128, F128) {
+    assert_eq!(
+        f.len(),
+        2 * eq_tail.len(),
+        "factorized equality tail must cover every witness pair"
+    );
+
+    #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+    // SAFETY: the cfg gate supplies PMULL, and the hard length check above
+    // establishes the architecture kernel's complete slice contract.
+    unsafe {
+        aarch64::round0_factorized_eq(f, eq_tail)
+    }
+
+    #[cfg(not(all(target_arch = "aarch64", target_feature = "aes")))]
+    portable::round0_factorized_eq(f, eq_tail)
+}
+
+/// Expand one level of an equality table from its populated low half into an
+/// equally sized high half. Both architecture paths implement, exactly,
+/// `hi[i] = lo_old[i] * r` and `lo[i] = lo_old[i] + hi[i]`.
+#[inline]
+pub(crate) fn expand_eq_table_level(lo: &mut [F128], hi: &mut [F128], r: F128) {
+    assert_eq!(
+        lo.len(),
+        hi.len(),
+        "equality-table level halves must have equal lengths"
+    );
+
+    #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+    // SAFETY: the cfg gate supplies PMULL, and the hard length check above is
+    // the architecture kernel's complete slice-shape contract.
+    unsafe {
+        aarch64::expand_eq_table_level(lo, hi, r)
+    }
+
+    #[cfg(not(all(target_arch = "aarch64", target_feature = "aes")))]
+    portable::expand_eq_table_level(lo, hi, r)
 }
 
 /// Fold one banked output slot with deferred reduction:
@@ -148,6 +188,85 @@ pub(crate) fn fold_two_and_msg(
     unsafe { aarch64::fold_two_and_msg(f, b, base, nf, nb, r) }
 }
 
+/// Fold `f` and `b`, add `scale * basis_addend` to the folded basis, and
+/// accumulate the next-round message over the corrected `(nf, nb)` state.
+///
+/// `base` is an index in the folded output domain. Consequently, output slot
+/// `t` reads source pair `2 * (base + t)` and addend slot `base + t`. Keeping
+/// the addend in the same global index space lets parallel callers share one
+/// immutable slice without manufacturing per-chunk subslices.
+#[inline]
+pub(crate) fn fold_two_and_msg_with_scaled_basis_addend(
+    f: &[F128],
+    b: &[F128],
+    basis_addend: &[F128],
+    base: usize,
+    nf: &mut [F128],
+    nb: &mut [F128],
+    r: F128,
+    scale: F128,
+) -> (F128, F128) {
+    assert_eq!(f.len(), b.len(), "fold input lengths must match");
+    assert_eq!(nf.len(), nb.len(), "fold output lengths must match");
+    assert!(f.len().is_multiple_of(2), "fold input length must be even");
+    assert!(
+        base.is_multiple_of(2),
+        "fold output base must preserve message pairs"
+    );
+    assert!(
+        !nf.is_empty() && nf.len().is_multiple_of(2),
+        "fold output must contain complete message pairs"
+    );
+    assert!(
+        base <= f.len() / 2 && nf.len() <= f.len() / 2 - base,
+        "fold source must contain both elements for every destination pair"
+    );
+    assert!(
+        base <= basis_addend.len() && nf.len() <= basis_addend.len() - base,
+        "scaled basis addend must cover every destination slot"
+    );
+
+    #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+    // SAFETY: the cfg gate supplies PMULL, and the hard checks above establish
+    // every source, addend, and destination bound plus message-pair alignment.
+    unsafe {
+        return aarch64::fold_two_and_msg_with_scaled_basis_addend(
+            f,
+            b,
+            basis_addend,
+            base,
+            nf,
+            nb,
+            r,
+            scale,
+        );
+    }
+
+    #[cfg(not(all(target_arch = "aarch64", target_feature = "aes")))]
+    {
+        let one_plus_r = F128::ONE + r;
+        let mut u_0 = F128::ZERO;
+        let mut u_2 = F128::ZERO;
+        let mut t = 0usize;
+        while t < nf.len() {
+            let source = 2 * (base + t);
+            let f_0 = f[source] * one_plus_r + f[source + 1] * r;
+            let f_1 = f[source + 2] * one_plus_r + f[source + 3] * r;
+            let b_0 = b[source] * one_plus_r + b[source + 1] * r + scale * basis_addend[base + t];
+            let b_1 =
+                b[source + 2] * one_plus_r + b[source + 3] * r + scale * basis_addend[base + t + 1];
+            nf[t] = f_0;
+            nf[t + 1] = f_1;
+            nb[t] = b_0;
+            nb[t + 1] = b_1;
+            u_0 += f_0 * b_0;
+            u_2 += (f_0 + f_1) * (b_0 + b_1);
+            t += 2;
+        }
+        (u_0, u_2)
+    }
+}
+
 /// AArch64 fused kernel for two consecutive Ligerito folds plus the direct
 /// and one-round-lookahead messages. The lookahead lets the prover preserve
 /// Fiat-Shamir order without materializing the intermediate half-sized state.
@@ -199,6 +318,55 @@ pub(crate) fn fold2_two_and_msg(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn eq_table_level_matches_portable_oracle() {
+        let mut state = 0x4551_5441_424c_4531u64;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+
+        for &len in &[0usize, 1, 2, 3, 4, 17, 256, 1025] {
+            let input: Vec<F128> = (0..len).map(|_| F128::new(next(), next())).collect();
+            let r = F128::new(next(), next());
+            let mut expected_lo = input.clone();
+            let mut expected_hi = vec![F128::new(u64::MAX, u64::MAX); len];
+            let mut actual_lo = input;
+            let mut actual_hi = vec![F128::new(u64::MAX, u64::MAX); len];
+
+            portable::expand_eq_table_level(&mut expected_lo, &mut expected_hi, r);
+            expand_eq_table_level(&mut actual_lo, &mut actual_hi, r);
+
+            assert_eq!(actual_lo, expected_lo, "low half, len={len}");
+            assert_eq!(actual_hi, expected_hi, "high half, len={len}");
+        }
+    }
+
+    /// Architecture selection must preserve the fully-reduced scalar result
+    /// for empty, odd-tail, even-tail, and production-chunk geometries.
+    #[test]
+    fn factorized_eq_round0_matches_portable_oracle() {
+        let mut state = 0x4641_4354_4F52_4551u64;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+
+        for &tail_len in &[0usize, 1, 2, 3, 7, 31, 2048, 2051] {
+            let f: Vec<F128> = (0..2 * tail_len)
+                .map(|_| F128::new(next(), next()))
+                .collect();
+            let eq_tail: Vec<F128> = (0..tail_len).map(|_| F128::new(next(), next())).collect();
+            let expected = portable::round0_factorized_eq(&f, &eq_tail);
+            let actual = round0_factorized_eq(&f, &eq_tail);
+            assert_eq!(actual, expected, "tail_len={tail_len}");
+        }
+    }
 
     #[test]
     fn selected_fold_matches_portable_with_offset_and_tail() {
@@ -338,6 +506,75 @@ mod tests {
             assert_eq!(got_b, expected_b, "b trial={trial}");
             assert_eq!(got_u0, expected_u0, "u0 trial={trial}");
             assert_eq!(got_u2, expected_u2, "u2 trial={trial}");
+        }
+    }
+
+    /// The lazy-OOD fold kernel must be exactly the incumbent pair fold,
+    /// followed by `nb += scale * addend`, followed by the ordinary message.
+    /// Offset cases verify that the source and addend share the folded-domain
+    /// `base`; the production-sized chunk exercises the complete hot loop.
+    #[test]
+    fn fused_fold_with_scaled_basis_addend_matches_two_pass_oracle() {
+        let mut state = 0x4C41_5A59_4F4F_445Fu64;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+
+        for &(base, n_out) in &[(0usize, 2usize), (2, 4), (6, 10), (0, 2048), (6, 2048)] {
+            let input_len = 2 * (base + n_out + 2);
+            let addend_len = base + n_out + 3;
+            let f: Vec<F128> = (0..input_len).map(|_| F128::new(next(), next())).collect();
+            let b: Vec<F128> = (0..input_len).map(|_| F128::new(next(), next())).collect();
+            let addend: Vec<F128> = (0..addend_len).map(|_| F128::new(next(), next())).collect();
+            let challenges = [
+                (F128::ZERO, F128::ZERO),
+                (F128::ZERO, F128::ONE),
+                (F128::ONE, F128::ZERO),
+                (F128::ONE, F128::ONE),
+                (F128::new(next(), next()), F128::new(next(), next())),
+                (F128::new(next(), next()), F128::new(next(), next())),
+            ];
+
+            for (case, &(r, scale)) in challenges.iter().enumerate() {
+                let mut expected_f = vec![F128::ZERO; n_out];
+                let mut expected_b = vec![F128::ZERO; n_out];
+                portable::fold_pairs(&f, base, &mut expected_f, r);
+                portable::fold_pairs(&b, base, &mut expected_b, r);
+                for t in 0..n_out {
+                    expected_b[t] += scale * addend[base + t];
+                }
+                let mut expected_u_0 = F128::ZERO;
+                let mut expected_u_2 = F128::ZERO;
+                for t in (0..n_out).step_by(2) {
+                    expected_u_0 += expected_f[t] * expected_b[t];
+                    expected_u_2 +=
+                        (expected_f[t] + expected_f[t + 1]) * (expected_b[t] + expected_b[t + 1]);
+                }
+
+                let sentinel = F128::new(u64::MAX, 0xA5A5_A5A5_A5A5_A5A5);
+                let mut actual_f = vec![sentinel; n_out];
+                let mut actual_b = vec![sentinel; n_out];
+                let actual_msg = fold_two_and_msg_with_scaled_basis_addend(
+                    &f,
+                    &b,
+                    &addend,
+                    base,
+                    &mut actual_f,
+                    &mut actual_b,
+                    r,
+                    scale,
+                );
+                assert_eq!(actual_f, expected_f, "f base={base} n={n_out} case={case}");
+                assert_eq!(actual_b, expected_b, "b base={base} n={n_out} case={case}");
+                assert_eq!(
+                    actual_msg,
+                    (expected_u_0, expected_u_2),
+                    "message base={base} n={n_out} case={case}"
+                );
+            }
         }
     }
 
