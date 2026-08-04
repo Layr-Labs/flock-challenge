@@ -461,8 +461,22 @@ pub fn replicate_message_fill(codeword: &mut [F128], msg: &[F128]) {
                 dst.copy_from_slice(&msg[src_off..src_off + dst.len()]);
             });
     } else {
-        for rep in codeword.chunks_mut(msg_len) {
-            rep.copy_from_slice(msg);
+        // Medium recursive/inner shapes: message is smaller than COPY_CHUNK so the
+        // large-message tile path above does not fire, but total replica work can
+        // still be multi-MiB. Parallelize by whole replica when total bytes ≥ 1 MiB
+        // and there are ≥ 2 replicas per Rayon worker. Ranked L0 GPU commit does
+        // not enter this function after latch-on; recursive Ligerito CPU commits do.
+        let n_replicas = codeword.len() / msg_len;
+        let total_bytes = codeword.len() * core::mem::size_of::<F128>();
+        let min_replicas = rayon::current_num_threads().saturating_mul(2).max(2);
+        if total_bytes >= (1 << 20) && n_replicas >= min_replicas {
+            codeword
+                .par_chunks_mut(msg_len)
+                .for_each(|rep| rep.copy_from_slice(msg));
+        } else {
+            for rep in codeword.chunks_mut(msg_len) {
+                rep.copy_from_slice(msg);
+            }
         }
     }
 }
