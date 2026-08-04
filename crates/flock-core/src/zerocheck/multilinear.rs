@@ -472,11 +472,12 @@ impl UniSkipFoldTable {
     /// are rebuilt by XOR instead of performing 2,048 independent products.
     pub(crate) fn scaled_linear(&self, rho: F128) -> Vec<F128> {
         assert_eq!(self.data.len(), self.n_chunks * 256);
-        let mut scaled = self.data.clone();
+        let mut scaled = crate::scratch::take_f128(self.data.len());
+        scaled.fill(F128::ZERO);
         for chunk in 0..self.n_chunks {
             let base = chunk * 256;
             for bit in 0..8 {
-                scaled[base + (1 << bit)] = rho * scaled[base + (1 << bit)];
+                scaled[base + (1 << bit)] = rho * self.data[base + (1 << bit)];
             }
             for value in 3usize..256 {
                 if value.is_power_of_two() {
@@ -487,6 +488,42 @@ impl UniSkipFoldTable {
             }
         }
         scaled
+    }
+
+    /// Build `rho_a · T_z` and `rho_b · T_z` in one basis walk. The K-fold
+    /// double-fold needs two scaled tables (`λ₁`, `λ₃`); doing them serially
+    /// paid two full clones of the 32 KiB closed table. This only reads the
+    /// 64 one-hot basis entries from `self` once, multiplies both rhos, and
+    /// XOR-closes each output. Kill: `FLOCK_NO_SCALED_LINEAR_PAIR=1` falls
+    /// back to two independent [`Self::scaled_linear`] calls.
+    pub(crate) fn scaled_linear_pair(&self, rho_a: F128, rho_b: F128) -> (Vec<F128>, Vec<F128>) {
+        if std::env::var_os("FLOCK_NO_SCALED_LINEAR_PAIR").is_some() {
+            return (self.scaled_linear(rho_a), self.scaled_linear(rho_b));
+        }
+        assert_eq!(self.data.len(), self.n_chunks * 256);
+        let n = self.data.len();
+        let mut sa = crate::scratch::take_f128(n);
+        let mut sb = crate::scratch::take_f128(n);
+        sa.fill(F128::ZERO);
+        sb.fill(F128::ZERO);
+        for chunk in 0..self.n_chunks {
+            let base = chunk * 256;
+            for bit in 0..8 {
+                let basis = self.data[base + (1 << bit)];
+                sa[base + (1 << bit)] = rho_a * basis;
+                sb[base + (1 << bit)] = rho_b * basis;
+            }
+            for value in 3usize..256 {
+                if value.is_power_of_two() {
+                    continue;
+                }
+                let low_bit = value & value.wrapping_neg();
+                let parent = value ^ low_bit;
+                sa[base + value] = sa[base + parent] + sa[base + low_bit];
+                sb[base + value] = sb[base + parent] + sb[base + low_bit];
+            }
+        }
+        (sa, sb)
     }
 }
 
@@ -1722,8 +1759,8 @@ pub(crate) fn fold2_compact_and_round4_into(
     // single ordinary ρ₂ fold and only the two deltas carry ρ₁.
     let lambda1 = rho1 * (F128::ONE + rho2);
     let lambda3 = rho1 * rho2;
-    let table_l1 = table.scaled_linear(lambda1);
-    let table_l3 = table.scaled_linear(lambda3);
+    // Dual-scale: one basis walk for both λ-tables (was two full 32 KiB clones).
+    let (table_l1, table_l3) = table.scaled_linear_pair(lambda1, lambda3);
 
     let eq = SplitEqGhash::with_n_hi(&r_next4[1..], COMPACT_RECONSTRUCTION_N_HI);
     let lo_size = 1usize << eq.n_lo;
