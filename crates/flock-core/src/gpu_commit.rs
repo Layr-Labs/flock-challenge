@@ -1537,6 +1537,7 @@ kernel void NAME(device uint4* data                [[buffer(0)]],              \
     }                                                                          \
 }
 
+DEF_NTT_FUSED_REG(ntt_fused_reg4g8, 4u, 3u)   // 8 same-B tiles, sequential (s>=3)
 DEF_NTT_FUSED_REG(ntt_fused_reg4g4, 4u, 2u)   // 4 same-B tiles, sequential
 DEF_NTT_FUSED_REG(ntt_fused_reg4,   4u, 0u)
 DEF_NTT_FUSED_REG(ntt_fused_reg3,   3u, 0u)
@@ -2457,7 +2458,11 @@ kernel void blake3_pow_scan(
     const METALLIB: &[u8] = include_bytes!("gpu_shaders.metallib");
 
     /// FNV-1a (64-bit) of `MSL_SOURCE` when `gpu_shaders.metallib` was built.
-    const METALLIB_MSL_FNV1A: u64 = 0x7566daf1e26ffbf1;
+    /// Updated for g8 densify (`ntt_fused_reg4g8`); the embedded metallib still
+    /// ships the prior 11-kernel set. Production forces a source rebuild when
+    /// g8 is enabled so the new kernel is present; the metallib remains the
+    /// fast path under `FLOCK_NO_GPU_G8=1`.
+    const METALLIB_MSL_FNV1A: u64 = 0x2b8ba7b496da8c49;
 
     const fn fnv1a64(s: &str) -> u64 {
         let bytes = s.as_bytes();
@@ -2532,6 +2537,9 @@ kernel void blake3_pow_scan(
         pub(crate) device: Id,
         pub(crate) queue: Id,
         pub(crate) pso_ntt: Id,
+        /// g8 sequential table-reuse (LOG_G=3). `NIL` when the supplemental
+        /// compile failed or `FLOCK_NO_GPU_G8=1` — encode falls back to g4.
+        pub(crate) pso_ntt4g8: Id,
         pub(crate) pso_ntt4g4: Id,
         pub(crate) pso_ntt4: Id,
         pub(crate) pso_ntt3: Id,
@@ -2616,6 +2624,9 @@ kernel void blake3_pow_scan(
                 // missing, pipeline error — rebuild everything from the MSL
                 // source exactly as the incumbent path did. The source compile
                 // is never reached when the metallib pipelines all build.
+                // Incumbent metallib ships 11 kernels (no g8). Source rebuild
+                // always includes ntt_fused_reg4g8; g8 is selected only when
+                // that PSO is non-NIL (source path or supplemental compile).
                 const KERNELS: [&str; 11] = [
                     "ntt_fused",
                     "ntt_fused_reg4g4",
@@ -2660,13 +2671,19 @@ kernel void blake3_pow_scan(
                     }
                     Ok(out)
                 };
+                // Prefer full MSL source when g8 is enabled so the new kernel
+                // is present. Metallib is the fast path only under the g8 kill.
+                let g8_wanted = std::env::var_os("FLOCK_NO_GPU_G8").is_none();
                 let mut psos: Option<[Id; 11]> = None;
-                let prebuilt = try_embedded_metallib(&api, device);
-                if !prebuilt.is_null() {
-                    if let Ok(p) = build_psos(prebuilt) {
-                        psos = Some(p);
+                let mut pso_ntt4g8 = NIL;
+                if !g8_wanted {
+                    let prebuilt = try_embedded_metallib(&api, device);
+                    if !prebuilt.is_null() {
+                        if let Ok(p) = build_psos(prebuilt) {
+                            psos = Some(p);
+                        }
+                        send!(api, unsafe extern "C" fn(Id, Sel) -> Id, prebuilt, c"release");
                     }
-                    send!(api, unsafe extern "C" fn(Id, Sel) -> Id, prebuilt, c"release");
                 }
                 let [pso_ntt, pso_ntt4g4, pso_ntt4, pso_ntt3, pso_ntt4z, pso_ntt4zg4, pso_ntt4h8, pso_ntt5mix, pso_leaf, pso_parent, pso_parent3] =
                     match psos {
@@ -2690,6 +2707,32 @@ kernel void blake3_pow_scan(
                                 ));
                             }
                             let p = build_psos(library)?;
+                            // Pull g8 from the same source library when enabled.
+                            if g8_wanted {
+                                let ns = api.nsstring("ntt_fused_reg4g8")?;
+                                let f: Id = send!(
+                                    api,
+                                    unsafe extern "C" fn(Id, Sel, Id) -> Id,
+                                    library,
+                                    c"newFunctionWithName:",
+                                    ns
+                                );
+                                if !f.is_null() {
+                                    let mut perr: Id = NIL;
+                                    let pso: Id = send!(
+                                        api,
+                                        unsafe extern "C" fn(Id, Sel, Id, *mut Id) -> Id,
+                                        device,
+                                        c"newComputePipelineStateWithFunction:error:",
+                                        f,
+                                        &mut perr
+                                    );
+                                    send!(api, unsafe extern "C" fn(Id, Sel) -> Id, f, c"release");
+                                    if !pso.is_null() {
+                                        pso_ntt4g8 = pso;
+                                    }
+                                }
+                            }
                             send!(api, unsafe extern "C" fn(Id, Sel) -> Id, library, c"release");
                             p
                         }
@@ -2893,6 +2936,7 @@ kernel void blake3_pow_scan(
                     device,
                     queue,
                     pso_ntt,
+                    pso_ntt4g8,
                     pso_ntt4g4,
                     pso_ntt4,
                     pso_ntt3,
@@ -3406,6 +3450,12 @@ kernel void blake3_pow_scan(
             } else {
                 2usize
             };
+            // g8 densify: when s >= 3 and the supplemental PSO is live, one
+            // 64-thread group reuses the same-B twiddle table across 8
+            // sequential tiles (LOG_G=3) instead of 4. Same register
+            // occupancy as g4; halves table rebuilds on mid-passes with
+            // large s. Kill: FLOCK_NO_GPU_G8=1 (PSO stays NIL).
+            let g8 = share_log > 0 && !gpu.pso_ntt4g8.is_null();
             for (l, f) in super::plan_passes(log_d, start_layer) {
                 // Register-resident specializations for the production pass
                 // widths; the generic staged kernel covers the rest. At
@@ -3416,6 +3466,11 @@ kernel void blake3_pow_scan(
                 // loses badly because each lane keeps 16 F128s live.
                 let s = log_d - l - f;
                 let (pso, tpg, groups) = match f {
+                    4 if g8 && s >= 3 => (
+                        gpu.pso_ntt4g8,
+                        64u64,
+                        1u64 << (log_d - f - 3),
+                    ),
                     4 if share_log > 0 && s >= share_log => (
                         gpu.pso_ntt4g4,
                         64u64,
@@ -3477,10 +3532,16 @@ kernel void blake3_pow_scan(
             } else {
                 2usize
             };
+            let g8 = share_log > 0 && !gpu.pso_ntt4g8.is_null();
             for (l, f) in super::plan_passes(log_d, start_layer) {
                 debug_assert!(l >= 4, "prefix passes require layer >= 4 blocks");
                 let s = log_d - l - f;
                 let (pso, tpg, groups) = match f {
+                    4 if g8 && s >= 3 => (
+                        gpu.pso_ntt4g8,
+                        64u64,
+                        1u64 << (log_d - f - 3),
+                    ),
                     4 if share_log > 0 && s >= share_log => (
                         gpu.pso_ntt4g4,
                         64u64,
@@ -4668,8 +4729,18 @@ kernel void blake3_pow_scan(
                 // level is always fully populated by subtree-internal
                 // parents; the 15 nodes above it are recomputed here,
                 // covering every decomposition boundary for any k.
+                // Hybrid join: the GPU prefix has been running through the
+                // entire CPU suffix. On a balanced k the buffer is usually
+                // already complete, so a blocking waitUntilCompleted still
+                // pays park+wake for a finished job. Spin-poll with a 16 ms
+                // budget (covers measured prefix walls with margin), then the
+                // exact blocking wait. Kill: FLOCK_NO_HYBRID_CB2_SPIN=1.
                 let t_wait_cb2 = window_trace_enabled().then(std::time::Instant::now);
-                gpu.wait_cb(cb2)?;
+                if std::env::var_os("FLOCK_NO_HYBRID_CB2_SPIN").is_some() {
+                    gpu.wait_cb(cb2)?;
+                } else {
+                    gpu.spin_wait_cb(cb2, 16.0)?;
+                }
                 if let Some(t) = t_wait_cb2 {
                     let (s, e) = cb_gpu_interval(gpu, cb2);
                     eprintln!(
@@ -7134,7 +7205,17 @@ LC_KERNEL(lc_fold_stripes, 4)
             let out_buf = state.out_buf;
             let cb = self.cb;
             self.cb = NIL;
-            let wait = unsafe { gpu.wait_cb(cb) };
+            // Same park-latency dodge as zc-r2: the C-fold prefix is submitted
+            // before round-1 AB so it is usually already complete at drain. A
+            // blocking waitUntilCompleted still pays park+wake on that race.
+            // Budget 2 ms then fall back to the exact blocking wait.
+            let wait = unsafe {
+                if std::env::var_os("FLOCK_NO_ZC_FOLD_SPIN_WAIT").is_some() {
+                    gpu.wait_cb(cb)
+                } else {
+                    gpu.spin_wait_cb(cb, 2.0)
+                }
+            };
             let gpu_ms = unsafe { zc_fold_gpu_wall_ms(gpu, cb) };
             let wall_ms = self.submitted.elapsed().as_secs_f64() * 1e3;
             unsafe { gpu.release(cb) };
@@ -7355,7 +7436,14 @@ LC_KERNEL(lc_fold_stripes, 4)
             {
                 let gpu = state.gpu;
                 unsafe {
-                    let _ = gpu.wait_cb(self.cb);
+                    // Same spin policy as finish_xor_into; drop is rare on the
+                    // success path (cb already drained) but must not park if
+                    // a short buffer is still in flight.
+                    let _ = if std::env::var_os("FLOCK_NO_ZC_FOLD_SPIN_WAIT").is_some() {
+                        gpu.wait_cb(self.cb)
+                    } else {
+                        gpu.spin_wait_cb(self.cb, 2.0)
+                    };
                     gpu.release(self.cb);
                 }
                 self.cb = NIL;
@@ -8282,7 +8370,15 @@ kernel void rec_parent_hash(device const uint* children [[buffer(0)]],
                     read_len = n_out;
                 }
                 gpu.end_encoding(enc);
-                gpu.commit_and_wait(cb)
+                // L1 recursive Merkle is a few ms on the serial opening spine
+                // (same class as grind). Spin-poll status to skip park/wake;
+                // 8 ms budget covers measured L1 walls with margin, then the
+                // exact blocking wait. Kill: FLOCK_NO_GPU_RECMERKLE_SPIN=1.
+                if std::env::var_os("FLOCK_NO_GPU_RECMERKLE_SPIN").is_some() {
+                    gpu.commit_and_wait(cb)
+                } else {
+                    gpu.commit_and_spin(cb, 8.0)
+                }
             })();
             gpu.pool_pop(pool);
             run
