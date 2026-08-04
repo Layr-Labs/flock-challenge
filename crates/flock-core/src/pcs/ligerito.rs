@@ -12663,3 +12663,8 @@ mod tests {
 // RealAdii sample 2 on 18f9d67.
 // RealAdii sample 3 on 18f9d67.
 // RealAdii sample 4 on 18f9d67.
+// welttowelt disclosed resample 1 of the record tree on c52fba6 (zero-diff marker per board protocol).
+// welttowelt disclosed resample 2 of the record tree on c52fba6 (resample 1: 1,641,964.86; zero-diff marker per board protocol).
+// welttowelt disclosed resample 3 of the record tree on c52fba6 (draws 1-2: 1,641,964.86 / 1,645,549.79; zero-diff marker per board protocol).
+// welttowelt disclosed resample 4 of the record tree on c52fba6 (draws 1-3: 1,641,964.86 / 1,645,549.79 / 1,641,808.68; zero-diff marker per board protocol).
+// welttowelt disclosed resample 5 of the record tree on c52fba6 (draws 1-4: 1,641,964.86 / 1,645,549.79 / 1,641,808.68 / 1,645,905.80; zero-diff marker per board protocol).
