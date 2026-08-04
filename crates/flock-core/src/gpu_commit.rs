@@ -7134,7 +7134,17 @@ LC_KERNEL(lc_fold_stripes, 4)
             let out_buf = state.out_buf;
             let cb = self.cb;
             self.cb = NIL;
-            let wait = unsafe { gpu.wait_cb(cb) };
+            // Same park-latency dodge as zc-r2: the C-fold prefix is submitted
+            // before round-1 AB so it is usually already complete at drain. A
+            // blocking waitUntilCompleted still pays park+wake on that race.
+            // Budget 2 ms then fall back to the exact blocking wait.
+            let wait = unsafe {
+                if std::env::var_os("FLOCK_NO_ZC_FOLD_SPIN_WAIT").is_some() {
+                    gpu.wait_cb(cb)
+                } else {
+                    gpu.spin_wait_cb(cb, 2.0)
+                }
+            };
             let gpu_ms = unsafe { zc_fold_gpu_wall_ms(gpu, cb) };
             let wall_ms = self.submitted.elapsed().as_secs_f64() * 1e3;
             unsafe { gpu.release(cb) };
@@ -7355,7 +7365,14 @@ LC_KERNEL(lc_fold_stripes, 4)
             {
                 let gpu = state.gpu;
                 unsafe {
-                    let _ = gpu.wait_cb(self.cb);
+                    // Same spin policy as finish_xor_into; drop is rare on the
+                    // success path (cb already drained) but must not park if
+                    // a short buffer is still in flight.
+                    let _ = if std::env::var_os("FLOCK_NO_ZC_FOLD_SPIN_WAIT").is_some() {
+                        gpu.wait_cb(self.cb)
+                    } else {
+                        gpu.spin_wait_cb(self.cb, 2.0)
+                    };
                     gpu.release(self.cb);
                 }
                 self.cb = NIL;
@@ -8282,7 +8299,15 @@ kernel void rec_parent_hash(device const uint* children [[buffer(0)]],
                     read_len = n_out;
                 }
                 gpu.end_encoding(enc);
-                gpu.commit_and_wait(cb)
+                // L1 recursive Merkle is a few ms on the serial opening spine
+                // (same class as grind). Spin-poll status to skip park/wake;
+                // 8 ms budget covers measured L1 walls with margin, then the
+                // exact blocking wait. Kill: FLOCK_NO_GPU_RECMERKLE_SPIN=1.
+                if std::env::var_os("FLOCK_NO_GPU_RECMERKLE_SPIN").is_some() {
+                    gpu.commit_and_wait(cb)
+                } else {
+                    gpu.commit_and_spin(cb, 8.0)
+                }
             })();
             gpu.pool_pop(pool);
             run
