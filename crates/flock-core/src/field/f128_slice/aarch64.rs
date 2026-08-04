@@ -8,6 +8,13 @@ struct WideNeon {
     hi: uint64x2_t,
 }
 
+#[derive(Clone, Copy)]
+struct KaratsubaNeon {
+    ll: uint64x2_t,
+    hh: uint64x2_t,
+    mm: uint64x2_t,
+}
+
 // The SHA3 extension includes EOR3; retain the two-EOR form for generic
 // AArch64 builds that do not enable it.
 #[cfg(target_feature = "sha3")]
@@ -82,6 +89,82 @@ unsafe fn mul_const_vec2(r: uint64x2_t, x0: uint64x2_t, x1: uint64x2_t) -> [uint
     }
 }
 
+/// Compute two independent sums of constant products and reduce each sum
+/// once: `[c*x0 + d*y0, c*x1 + d*y1]`.
+///
+/// The two Karatsuba products contributing to each output remain in the
+/// 256-bit product domain until after their `ll`, `hh`, and `mm` components
+/// have been XORed. Packing the two resulting product sums into NEON lanes
+/// then shares one vectorized reduction across both outputs. Compared with
+/// two calls to [`mul_const_vec2`], this preserves the twelve-PMULL count but
+/// removes one complete paired reduction.
+#[inline]
+#[target_feature(enable = "aes")]
+unsafe fn mul_two_const_sum_vec2(
+    c: uint64x2_t,
+    x0: uint64x2_t,
+    x1: uint64x2_t,
+    d: uint64x2_t,
+    y0: uint64x2_t,
+    y1: uint64x2_t,
+) -> [uint64x2_t; 2] {
+    unsafe {
+        let c_lo = vgetq_lane_u64::<0>(c);
+        let c_hi = vgetq_lane_u64::<1>(c);
+        let c_mid = c_lo ^ c_hi;
+        let d_lo = vgetq_lane_u64::<0>(d);
+        let d_hi = vgetq_lane_u64::<1>(d);
+        let d_mid = d_lo ^ d_hi;
+
+        let x0_lo = vgetq_lane_u64::<0>(x0);
+        let x0_hi = vgetq_lane_u64::<1>(x0);
+        let y0_lo = vgetq_lane_u64::<0>(y0);
+        let y0_hi = vgetq_lane_u64::<1>(y0);
+        let p0_ll = veorq_u64(pmull(x0_lo, c_lo), pmull(y0_lo, d_lo));
+        let p0_hh = veorq_u64(pmull(x0_hi, c_hi), pmull(y0_hi, d_hi));
+        let p0_mm = veorq_u64(pmull(x0_lo ^ x0_hi, c_mid), pmull(y0_lo ^ y0_hi, d_mid));
+
+        let x1_lo = vgetq_lane_u64::<0>(x1);
+        let x1_hi = vgetq_lane_u64::<1>(x1);
+        let y1_lo = vgetq_lane_u64::<0>(y1);
+        let y1_hi = vgetq_lane_u64::<1>(y1);
+        let p1_ll = veorq_u64(pmull(x1_lo, c_lo), pmull(y1_lo, d_lo));
+        let p1_hh = veorq_u64(pmull(x1_hi, c_hi), pmull(y1_hi, d_hi));
+        let p1_mm = veorq_u64(pmull(x1_lo ^ x1_hi, c_mid), pmull(y1_lo ^ y1_hi, d_mid));
+
+        let cross0 = xor3_u64(p0_mm, p0_ll, p0_hh);
+        let cross1 = xor3_u64(p1_mm, p1_ll, p1_hh);
+
+        // Pack output 0/1 into lanes and reduce both product sums together.
+        let r0 = vzip1q_u64(p0_ll, p1_ll);
+        let r1 = veorq_u64(vzip2q_u64(p0_ll, p1_ll), vzip1q_u64(cross0, cross1));
+        let r2 = veorq_u64(vzip1q_u64(p0_hh, p1_hh), vzip2q_u64(cross0, cross1));
+        let r3 = vzip2q_u64(p0_hh, p1_hh);
+
+        let s1_lo = vshlq_n_u64::<1>(r2);
+        let s1_hi = veorq_u64(vshlq_n_u64::<1>(r3), vshrq_n_u64::<63>(r2));
+        let s2_lo = vshlq_n_u64::<2>(r2);
+        let s2_hi = veorq_u64(vshlq_n_u64::<2>(r3), vshrq_n_u64::<62>(r2));
+        let s7_lo = vshlq_n_u64::<7>(r2);
+        let s7_hi = veorq_u64(vshlq_n_u64::<7>(r3), vshrq_n_u64::<57>(r2));
+        let t_lo = xor3_u64(r2, s1_lo, veorq_u64(s2_lo, s7_lo));
+        let t_hi = xor3_u64(r3, s1_hi, veorq_u64(s2_hi, s7_hi));
+        let overflow = xor3_u64(
+            vshrq_n_u64::<63>(r3),
+            vshrq_n_u64::<62>(r3),
+            vshrq_n_u64::<57>(r3),
+        );
+        let correction = xor3_u64(
+            overflow,
+            vshlq_n_u64::<1>(overflow),
+            veorq_u64(vshlq_n_u64::<2>(overflow), vshlq_n_u64::<7>(overflow)),
+        );
+        let out_lo = xor3_u64(r0, t_lo, correction);
+        let out_hi = veorq_u64(r1, t_hi);
+        [vzip1q_u64(out_lo, out_hi), vzip2q_u64(out_lo, out_hi)]
+    }
+}
+
 #[inline]
 #[target_feature(enable = "aes")]
 unsafe fn mul_unreduced(a: uint64x2_t, b: uint64x2_t) -> WideNeon {
@@ -96,6 +179,71 @@ unsafe fn mul_unreduced(a: uint64x2_t, b: uint64x2_t) -> WideNeon {
         WideNeon {
             lo: veorq_u64(ll, vextq_u64::<1>(zero, cross)),
             hi: veorq_u64(hh, vextq_u64::<1>(cross, zero)),
+        }
+    }
+}
+
+/// XOR two products by a shared multiplier into raw Karatsuba-component
+/// accumulators. Delaying cross-term reconstruction until after the scan
+/// removes the per-product `cross` and word-shuffle work from the hot loop.
+#[inline]
+#[target_feature(enable = "aes")]
+unsafe fn xor_karatsuba_const_pair(
+    even_acc: &mut KaratsubaNeon,
+    odd_acc: &mut KaratsubaNeon,
+    even: uint64x2_t,
+    odd: uint64x2_t,
+    weight: uint64x2_t,
+) {
+    unsafe {
+        let weight_mid = veorq_u64(weight, vextq_u64::<1>(weight, weight));
+        let even_mid = veorq_u64(even, vextq_u64::<1>(even, even));
+        let odd_mid = veorq_u64(odd, vextq_u64::<1>(odd, odd));
+        let weight_p = vreinterpretq_p64_u64(weight);
+
+        // Keep all six independent PMULLs visible before consuming results.
+        let even_ll = pmull(
+            vgetq_lane_u64::<0>(even),
+            vgetq_lane_u64::<0>(weight),
+        );
+        let odd_ll = pmull(
+            vgetq_lane_u64::<0>(odd),
+            vgetq_lane_u64::<0>(weight),
+        );
+        let even_hh = transmute::<u128, uint64x2_t>(vmull_high_p64(
+            vreinterpretq_p64_u64(even),
+            weight_p,
+        ));
+        let odd_hh = transmute::<u128, uint64x2_t>(vmull_high_p64(
+            vreinterpretq_p64_u64(odd),
+            weight_p,
+        ));
+        let even_mm = pmull(
+            vgetq_lane_u64::<0>(even_mid),
+            vgetq_lane_u64::<0>(weight_mid),
+        );
+        let odd_mm = pmull(
+            vgetq_lane_u64::<0>(odd_mid),
+            vgetq_lane_u64::<0>(weight_mid),
+        );
+
+        even_acc.ll = veorq_u64(even_acc.ll, even_ll);
+        even_acc.hh = veorq_u64(even_acc.hh, even_hh);
+        even_acc.mm = veorq_u64(even_acc.mm, even_mm);
+        odd_acc.ll = veorq_u64(odd_acc.ll, odd_ll);
+        odd_acc.hh = veorq_u64(odd_acc.hh, odd_hh);
+        odd_acc.mm = veorq_u64(odd_acc.mm, odd_mm);
+    }
+}
+
+#[inline(always)]
+unsafe fn karatsuba_to_wide(value: KaratsubaNeon) -> WideNeon {
+    unsafe {
+        let zero = vdupq_n_u64(0);
+        let cross = xor3_u64(value.mm, value.ll, value.hh);
+        WideNeon {
+            lo: veorq_u64(value.ll, vextq_u64::<1>(zero, cross)),
+            hi: veorq_u64(value.hh, vextq_u64::<1>(cross, zero)),
         }
     }
 }
@@ -347,6 +495,99 @@ pub(super) unsafe fn round0(witness: &[F128], basis: &[F128]) -> (F128, F128) {
     }
 }
 
+/// Deferred-reduction sufficient statistics for a factorized LSB equality
+/// basis. Each tail value multiplies the even and odd witness values. Their
+/// product streams remain in raw Karatsuba form until the end; after reducing,
+/// `s = a + odd` recovers the pair-sum statistic by F2-linearity.
+///
+/// Six independent `ll`/`hh`/`mm` accumulator chains expose PMULL throughput.
+/// Each field product uses three-PMULL Karatsuba instead of the six PMULLs
+/// (product plus reduction) in the scalar `F128::mul` path.
+///
+/// # Safety
+/// Requires the `aes` target feature. `f.len()` must equal
+/// `2 * eq_tail.len()`.
+#[target_feature(enable = "aes")]
+pub(super) unsafe fn round0_factorized_eq(f: &[F128], eq_tail: &[F128]) -> (F128, F128) {
+    unsafe {
+        debug_assert_eq!(f.len(), 2 * eq_tail.len());
+
+        let zero = vdupq_n_u64(0);
+        let mut a = KaratsubaNeon {
+            ll: zero,
+            hh: zero,
+            mm: zero,
+        };
+        let mut odd = KaratsubaNeon {
+            ll: zero,
+            hh: zero,
+            mm: zero,
+        };
+
+        let fp = f.as_ptr();
+        let wp = eq_tail.as_ptr();
+        let main = eq_tail.len() & !1;
+        let mut j = 0usize;
+        while j < main {
+            let f_00 = vld1q_u64(fp.add(2 * j).cast::<u64>());
+            let f_01 = vld1q_u64(fp.add(2 * j + 1).cast::<u64>());
+            let f_10 = vld1q_u64(fp.add(2 * j + 2).cast::<u64>());
+            let f_11 = vld1q_u64(fp.add(2 * j + 3).cast::<u64>());
+            let w_0 = vld1q_u64(wp.add(j).cast::<u64>());
+            let w_1 = vld1q_u64(wp.add(j + 1).cast::<u64>());
+
+            xor_karatsuba_const_pair(&mut a, &mut odd, f_00, f_01, w_0);
+            xor_karatsuba_const_pair(&mut a, &mut odd, f_10, f_11, w_1);
+            j += 2;
+        }
+        if j < eq_tail.len() {
+            let f_0 = vld1q_u64(fp.add(2 * j).cast::<u64>());
+            let f_1 = vld1q_u64(fp.add(2 * j + 1).cast::<u64>());
+            let w = vld1q_u64(wp.add(j).cast::<u64>());
+            xor_karatsuba_const_pair(&mut a, &mut odd, f_0, f_1, w);
+        }
+
+        let a_reduced = reduce_wide(karatsuba_to_wide(a));
+        let odd_reduced = reduce_wide(karatsuba_to_wide(odd));
+        let s_reduced = veorq_u64(a_reduced, odd_reduced);
+        (transmute(a_reduced), transmute(s_reduced))
+    }
+}
+
+/// Expand one equality-table level with a shared multiplier `r`.
+///
+/// For every old value `v = lo[i]`, writes `hi[i] = v * r` and
+/// `lo[i] = v + hi[i]`. The two-lane constant Karatsuba primitive uses six
+/// PMULLs for each pair of products and shares their vectorized reduction.
+///
+/// # Safety
+/// Requires the `aes` target feature. `lo` and `hi` must have equal lengths.
+#[inline]
+pub(super) unsafe fn expand_eq_table_level(lo: &mut [F128], hi: &mut [F128], r: F128) {
+    use crate::field::gf2_128::aarch64::ghash_mul_const_vec2_neon;
+
+    debug_assert_eq!(lo.len(), hi.len());
+    let paired = lo.len() & !1;
+    let mut i = 0usize;
+    while i < paired {
+        let values = [lo[i], lo[i + 1]];
+        // SAFETY: the architecture-selecting caller supplies `aes`.
+        let products = unsafe { ghash_mul_const_vec2_neon(r, values) };
+        hi[i] = products[0];
+        hi[i + 1] = products[1];
+        lo[i] = values[0] + products[0];
+        lo[i + 1] = values[1] + products[1];
+        i += 2;
+    }
+
+    if i < lo.len() {
+        let value = lo[i];
+        let product = value * r;
+        hi[i] = product;
+        lo[i] = value + product;
+    }
+}
+
 /// Two-lane pair fold using NEON and PMULL.
 ///
 /// # Safety
@@ -434,6 +675,81 @@ pub(super) unsafe fn fold_two_and_msg(
                 mul_const_vec2(r_q, veorq_u64(b_even0, b_odd0), veorq_u64(b_even1, b_odd1));
             let b0 = veorq_u64(b_even0, folded_b[0]);
             let b1 = veorq_u64(b_even1, folded_b[1]);
+
+            vst1q_u64(nf.as_mut_ptr().add(t).cast::<u64>(), f0);
+            vst1q_u64(nf.as_mut_ptr().add(t + 1).cast::<u64>(), f1);
+            vst1q_u64(nb.as_mut_ptr().add(t).cast::<u64>(), b0);
+            vst1q_u64(nb.as_mut_ptr().add(t + 1).cast::<u64>(), b1);
+
+            xor_wide(&mut u0, mul_unreduced(f0, b0));
+            xor_wide(&mut u2, mul_unreduced(veorq_u64(f0, f1), veorq_u64(b0, b1)));
+            t += 2;
+        }
+        (
+            transmute::<uint64x2_t, F128>(reduce_wide(u0)),
+            transmute::<uint64x2_t, F128>(reduce_wide(u2)),
+        )
+    }
+}
+
+/// Fold two polynomials, inject a scaled folded-domain basis addend, and
+/// accumulate the next sumcheck message over the corrected outputs.
+///
+/// The addend is consumed before `nb` is stored and before either message
+/// product is formed. For each adjacent output pair, the ordinary `r * delta`
+/// and correction `scale * addend` products stay unreduced until their
+/// Karatsuba components have been combined, so all four products share one
+/// lane-paired reduction without a second traversal of `nf` and `nb`.
+///
+/// # Safety
+/// Requires the `aes` target feature. The architecture-selecting wrapper
+/// checks equal polynomial/output lengths, even output alignment, and complete
+/// source/addend coverage for `[base, base + nf.len())`.
+#[target_feature(enable = "aes")]
+pub(super) unsafe fn fold_two_and_msg_with_scaled_basis_addend(
+    f: &[F128],
+    b: &[F128],
+    basis_addend: &[F128],
+    base: usize,
+    nf: &mut [F128],
+    nb: &mut [F128],
+    r: F128,
+    scale: F128,
+) -> (F128, F128) {
+    unsafe {
+        let zero = vdupq_n_u64(0);
+        let r_q = transmute::<F128, uint64x2_t>(r);
+        let scale_q = transmute::<F128, uint64x2_t>(scale);
+        let mut u0 = WideNeon { lo: zero, hi: zero };
+        let mut u2 = WideNeon { lo: zero, hi: zero };
+        let mut t = 0usize;
+        while t < nf.len() {
+            let source = 2 * (base + t);
+            let f_even0 = vld1q_u64(f.as_ptr().add(source).cast::<u64>());
+            let f_odd0 = vld1q_u64(f.as_ptr().add(source + 1).cast::<u64>());
+            let f_even1 = vld1q_u64(f.as_ptr().add(source + 2).cast::<u64>());
+            let f_odd1 = vld1q_u64(f.as_ptr().add(source + 3).cast::<u64>());
+            let folded_f =
+                mul_const_vec2(r_q, veorq_u64(f_even0, f_odd0), veorq_u64(f_even1, f_odd1));
+            let f0 = veorq_u64(f_even0, folded_f[0]);
+            let f1 = veorq_u64(f_even1, folded_f[1]);
+
+            let b_even0 = vld1q_u64(b.as_ptr().add(source).cast::<u64>());
+            let b_odd0 = vld1q_u64(b.as_ptr().add(source + 1).cast::<u64>());
+            let b_even1 = vld1q_u64(b.as_ptr().add(source + 2).cast::<u64>());
+            let b_odd1 = vld1q_u64(b.as_ptr().add(source + 3).cast::<u64>());
+            let addend0 = vld1q_u64(basis_addend.as_ptr().add(base + t).cast::<u64>());
+            let addend1 = vld1q_u64(basis_addend.as_ptr().add(base + t + 1).cast::<u64>());
+            let folded_b_with_addend = mul_two_const_sum_vec2(
+                r_q,
+                veorq_u64(b_even0, b_odd0),
+                veorq_u64(b_even1, b_odd1),
+                scale_q,
+                addend0,
+                addend1,
+            );
+            let b0 = veorq_u64(b_even0, folded_b_with_addend[0]);
+            let b1 = veorq_u64(b_even1, folded_b_with_addend[1]);
 
             vst1q_u64(nf.as_mut_ptr().add(t).cast::<u64>(), f0);
             vst1q_u64(nf.as_mut_ptr().add(t + 1).cast::<u64>(), f1);
@@ -678,5 +994,59 @@ pub(super) unsafe fn fold2_two_and_msg(
 
         let red = |w: WideNeon| transmute::<uint64x2_t, F128>(reduce_wide(w));
         (red(a_u0a) + red(a_u0b), red(a_u2a) + red(a_u2b))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn two_const_sum_vec2_matches_two_reduced_products() {
+        let mut state = 0x5457_4F43_4F4E_5354u64;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+
+        let mut cases = vec![
+            (F128::ZERO, F128::ZERO),
+            (F128::ZERO, F128::ONE),
+            (F128::ONE, F128::ZERO),
+            (F128::ONE, F128::ONE),
+        ];
+        cases.extend((0..128).map(|_| (F128::new(next(), next()), F128::new(next(), next()))));
+
+        for (case, (c, d)) in cases.into_iter().enumerate() {
+            let x0 = F128::new(next(), next());
+            let x1 = F128::new(next(), next());
+            let y0 = F128::new(next(), next());
+            let y1 = F128::new(next(), next());
+            unsafe {
+                let c_q = transmute::<F128, uint64x2_t>(c);
+                let d_q = transmute::<F128, uint64x2_t>(d);
+                let x0_q = transmute::<F128, uint64x2_t>(x0);
+                let x1_q = transmute::<F128, uint64x2_t>(x1);
+                let y0_q = transmute::<F128, uint64x2_t>(y0);
+                let y1_q = transmute::<F128, uint64x2_t>(y1);
+
+                let cx = mul_const_vec2(c_q, x0_q, x1_q);
+                let dy = mul_const_vec2(d_q, y0_q, y1_q);
+                let expected = [veorq_u64(cx[0], dy[0]), veorq_u64(cx[1], dy[1])];
+                let actual = mul_two_const_sum_vec2(c_q, x0_q, x1_q, d_q, y0_q, y1_q);
+                assert_eq!(
+                    transmute::<uint64x2_t, F128>(actual[0]),
+                    transmute::<uint64x2_t, F128>(expected[0]),
+                    "lane=0 case={case}"
+                );
+                assert_eq!(
+                    transmute::<uint64x2_t, F128>(actual[1]),
+                    transmute::<uint64x2_t, F128>(expected[1]),
+                    "lane=1 case={case}"
+                );
+            }
+        }
     }
 }
