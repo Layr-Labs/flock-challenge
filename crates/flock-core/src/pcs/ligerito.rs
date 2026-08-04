@@ -10590,3 +10590,5 @@ mod tests {
 // RealAdii sample 2 on 18f9d67.
 // RealAdii sample 3 on 18f9d67.
 // RealAdii sample 4 on 18f9d67.
+// tarekeleter draw 2 of the 55d2752 cascade3 tree (draw 1 promoted at 1,631,135.50).
+// tarekeleter draw 3 of the 55d2752 cascade3 tree (draws: 1,631,135.50 P / 1,626,410.09).
