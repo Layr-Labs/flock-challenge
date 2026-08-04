@@ -716,6 +716,31 @@ fn prove_packed_padded_inner<C: Challenger>(
     // post-fold tables expected by all subsequent rounds.
     let tail_round_timing = std::env::var_os("FLOCK_ZC_TAIL_ROUND_TIMING").is_some();
 
+    /// Minimum `log_n` for the fused fold+message path in the tail loop.
+    /// Below this, `fold_in_place_pair + round_pair_naive` is used instead.
+    ///
+    /// The incumbent floor of 15 left log_n = 14 (the last 16K-element round)
+    /// on the unfused path, which reads the folded array twice (once for the
+    /// fold, once for the message). Lowering the floor to 14 fuses exactly
+    /// that round — one N-element read saved at the largest remaining unfused
+    /// size — while keeping log_n 12–13 unfused, where the fixed 128-chunk
+    /// Rayon region opens over too little work. The fused kernel handles
+    /// `lo_size = 2` correctly down to very small sizes (SplitEqGhash
+    /// `n_hi = min(MAX_N_HI, n_vars − 1)` keeps `lo_size ≥ 2`), so the floor
+    /// is a performance trade-off, not a correctness constraint.
+    ///
+    /// Kill switch: `FLOCK_ZC_TAIL_FUSED_FLOOR=15` restores the incumbent.
+    #[inline]
+    fn tail_fused_floor() -> usize {
+        static FLOOR: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+        *FLOOR.get_or_init(|| {
+            std::env::var_os("FLOCK_ZC_TAIL_FUSED_FLOOR")
+                .and_then(|v| v.to_str()?.parse().ok())
+                .filter(|&f| f >= 4)
+                .unwrap_or(14)
+        })
+    }
+
     // Cascade the lookahead one level deeper (rounds 5+6, see
     // `fold2_compact_and_round45_into`): the K pass materializes each round-4
     // output group in registers before its store — the same position round
@@ -986,7 +1011,7 @@ fn prove_packed_padded_inner<C: Challenger>(
         let mut r_next = vec![F128::ONE; log_n_before - 1];
         r_next[1..].copy_from_slice(&r[k_skip + i + 2..]);
 
-        let (m1, mi) = if log_n_before >= 15 {
+        let (m1, mi) = if log_n_before >= tail_fused_floor() {
             let half = a_mlv.len() / 2;
             let (m1, mi) = fold_and_compute_round_pair_into(
                 &a_mlv,

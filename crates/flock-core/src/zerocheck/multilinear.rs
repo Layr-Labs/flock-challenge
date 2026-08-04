@@ -68,6 +68,21 @@ use kernels::aarch64::fold_compact_chunk_neon_reconstruct_only_8;
 ))]
 use kernels::x86_64::{fold_and_message_x86_avx512, fold_round2_pair_x86_unchecked_8};
 
+// Test-only: force GPU zerocheck arms off so tests run on any platform.
+#[cfg(test)]
+pub(crate) fn _gpu_zc_r2_forced_off() -> bool {
+    true
+}
+#[cfg(test)]
+pub(crate) fn _gpu_zc_t3_forced_off() -> bool {
+    true
+}
+#[cfg(test)]
+pub(crate) fn _gpu_zc_loop_forced_off() -> bool {
+    true
+}
+
+
 /// Returns `(pair_in_block_mask, useful_pairs_inclusive)` for the round-2
 /// fused-fold kernel. A pair (post-URM chunks `2k`, `2k+1`) is fully inside
 /// padding iff `(k & pair_in_block_mask) >= useful_pairs_inclusive` — those
