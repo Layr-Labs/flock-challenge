@@ -10590,3 +10590,4 @@ mod tests {
 // RealAdii sample 2 on 18f9d67.
 // RealAdii sample 3 on 18f9d67.
 // RealAdii sample 4 on 18f9d67.
+// tarekeleter draw 2 of the fc3fd27 stack tree (draw 1 promoted at 1,626,861.57).
