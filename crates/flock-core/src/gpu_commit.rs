@@ -8093,16 +8093,21 @@ static inline uint4 zc_r2_fold8(uint lo, uint hi, threadgroup const uint4* nib) 
 
 struct ZcR2Params { uint lo_size; uint xpt; uint mask; uint useful; };
 
-// One threadgroup per hi-chunk (256 threads, xpt = lo_size/256 x_lo groups
+// One threadgroup per hi-chunk (256 threads, xpt = lo_size/256 x_lo pairs
 // per thread). Per pair: read both packed rows of a and b (one uint4 each,
 // fully coalesced), fold all four rows via the nibble tables, message
 // products via emulated clmul, eq_lo weight via a third clmul, 256-bit
-// unreduced accumulate. Threadgroup XOR-reduce, stopped one step short so the
-// even and odd x_lo halves stay apart; thread 0 reduces the four chunk
-// accumulators, weights by eq_hi[chunk], and writes four REDUCED partials
-// `[p1_even, pinf_even, p1_odd, pinf_odd]`. Slot0^slot2 and slot1^slot3 are
-// exactly the CPU's per-chunk `(eq_hi * p1, eq_hi * pinf)`; slots 2 and 3 are
-// its `eq_hi * out[2]` and `eq_hi * out[3]` round-three lookahead state.
+// unreduced accumulate.
+//
+// Parity-split reduce for the round-two products: stop one step short so the
+// even and odd x_lo halves stay apart. Separately, even lids also own the
+// round-three group products W0/W3/W4/W5 over the pair-of-pairs
+// `(x_lo, x_lo+1)`, weighted by the odd lane's `eq_lo` exactly as the CPU
+// lookahead kernel does. Thread 0 writes eight REDUCED eq_hi-weighted
+// partials per chunk:
+//   [p1_even, pinf_even, p1_odd, pinf_odd, W0, W3, W4, W5]
+// Slot0^slot2 / slot1^slot3 are the CPU's per-chunk `(eq_hi*p1, eq_hi*pinf)`;
+// slots 2..7 are its full six-slot lookahead state (W1/W2 = odd p1/pinf).
 kernel void zc_r2_products(
     device const uint4* a_in  [[buffer(0)]],
     device const uint4* b_in  [[buffer(1)]],
@@ -8121,34 +8126,86 @@ kernel void zc_r2_products(
 
     ulong4 acc1 = ulong4(0ul);
     ulong4 acci = ulong4(0ul);
+    ulong4 acc_w0 = ulong4(0ul);
+    ulong4 acc_w3 = ulong4(0ul);
+    ulong4 acc_w4 = ulong4(0ul);
+    ulong4 acc_w5 = ulong4(0ul);
+    // Keep threadgroup footprint at the incumbent size (nib + red only). A
+    // prior attempt staged folded rows in TG for the group products and
+    // blew past the usable local-memory budget on the ranked M3 Max
+    // (−38% official). Even lids re-fold the odd pair from device memory
+    // instead; the table is hot in cache from the odd lid's own pass.
     for (uint k = 0u; k < p.xpt; k++) {
         uint x_lo = k * 256u + lid;
         uint pair_idx = tgid * p.lo_size + x_lo;
-        if ((pair_idx & p.mask) >= p.useful) { continue; }
-        uint4 ar = a_in[pair_idx];
-        uint4 br = b_in[pair_idx];
-        uint4 a0 = zc_r2_fold8(ar.x, ar.y, nib);
-        uint4 a1 = zc_r2_fold8(ar.z, ar.w, nib);
-        uint4 b0 = zc_r2_fold8(br.x, br.y, nib);
-        uint4 b1 = zc_r2_fold8(br.z, br.w, nib);
+        bool pad = (pair_idx & p.mask) >= p.useful;
+        uint4 a0 = uint4(0u);
+        uint4 a1 = uint4(0u);
+        uint4 b0 = uint4(0u);
+        uint4 b1 = uint4(0u);
+        if (!pad) {
+            uint4 ar = a_in[pair_idx];
+            uint4 br = b_in[pair_idx];
+            a0 = zc_r2_fold8(ar.x, ar.y, nib);
+            a1 = zc_r2_fold8(ar.z, ar.w, nib);
+            b0 = zc_r2_fold8(br.x, br.y, nib);
+            b1 = zc_r2_fold8(br.z, br.w, nib);
 
-        uint4 g1 = gf_reduce(clmul128(a1, b1));
-        uint4 gi = gf_reduce(clmul128(a0 ^ a1, b0 ^ b1));
-        uint4 e  = eq_lo[x_lo];
-        U256k m1 = clmul128(e, g1);
-        U256k mi = clmul128(e, gi);
-        acc1 ^= ulong4(m1.r0, m1.r1, m1.r2, m1.r3);
-        acci ^= ulong4(mi.r0, mi.r1, mi.r2, mi.r3);
+            uint4 g1 = gf_reduce(clmul128(a1, b1));
+            uint4 gi = gf_reduce(clmul128(a0 ^ a1, b0 ^ b1));
+            uint4 e  = eq_lo[x_lo];
+            U256k m1 = clmul128(e, g1);
+            U256k mi = clmul128(e, gi);
+            acc1 ^= ulong4(m1.r0, m1.r1, m1.r2, m1.r3);
+            acci ^= ulong4(mi.r0, mi.r1, mi.r2, mi.r3);
+        }
+
+        // Round-three group products. Even lids own the group (x_lo, x_lo+1)
+        // with weight = eq_lo[odd], matching the CPU lookahead monomorphization.
+        if ((x_lo & 1u) == 0u) {
+            uint x_odd = x_lo + 1u;
+            uint pair_odd = tgid * p.lo_size + x_odd;
+            bool pad_odd = (pair_odd & p.mask) >= p.useful;
+            if (!(pad && pad_odd)) {
+                uint4 a2 = uint4(0u);
+                uint4 a3 = uint4(0u);
+                uint4 b2 = uint4(0u);
+                uint4 b3 = uint4(0u);
+                if (!pad_odd) {
+                    uint4 ar1 = a_in[pair_odd];
+                    uint4 br1 = b_in[pair_odd];
+                    a2 = zc_r2_fold8(ar1.x, ar1.y, nib);
+                    a3 = zc_r2_fold8(ar1.z, ar1.w, nib);
+                    b2 = zc_r2_fold8(br1.x, br1.y, nib);
+                    b3 = zc_r2_fold8(br1.z, br1.w, nib);
+                }
+                uint4 wt = eq_lo[x_odd];
+                uint4 a0w = pad ? uint4(0u) : gf_reduce(clmul128(wt, a0));
+                uint4 a1w = pad ? uint4(0u) : gf_reduce(clmul128(wt, a1));
+                uint4 a2w = pad_odd ? uint4(0u) : gf_reduce(clmul128(wt, a2));
+                uint4 a3w = pad_odd ? uint4(0u) : gf_reduce(clmul128(wt, a3));
+                if (!pad_odd) {
+                    U256k mw0 = clmul128(a2w, b2);
+                    acc_w0 ^= ulong4(mw0.r0, mw0.r1, mw0.r2, mw0.r3);
+                }
+                uint4 e_aw = a0w ^ a2w;
+                uint4 o_aw = a1w ^ a3w;
+                uint4 e_b  = b0 ^ b2;
+                uint4 o_b  = b1 ^ b3;
+                U256k mw3 = clmul128(e_aw, e_b);
+                U256k mw4 = clmul128(o_aw, o_b);
+                U256k mw5 = clmul128(e_aw ^ o_aw, e_b ^ o_b);
+                acc_w3 ^= ulong4(mw3.r0, mw3.r1, mw3.r2, mw3.r3);
+                acc_w4 ^= ulong4(mw4.r0, mw4.r1, mw4.r2, mw4.r3);
+                acc_w5 ^= ulong4(mw5.r0, mw5.r1, mw5.r2, mw5.r3);
+            }
+        }
     }
 
-    // Parity-split reduce. `x_lo = k*256 + lid` and 256 is even, so a thread
-    // only ever visits x_lo of a single parity. Every halving step from 128
-    // down to 2 pairs indices of equal parity; only the discarded `s == 1`
-    // step would mix them. Stopping one step early therefore leaves `red[0]`
-    // holding the even-x_lo sum and `red[1]` the odd one, and their XOR is
-    // bit-identical to the single sum this kernel used to emit. The odd half
-    // is exactly the round-three lookahead's `W1`/`W2` state, which the CPU
-    // otherwise recomputes on every offloaded chunk.
+    // Parity-split reduce for p1 / pinf. `x_lo = k*256 + lid` and 256 is even,
+    // so a thread only ever visits x_lo of a single parity. Every halving step
+    // from 128 down to 2 pairs equal-parity indices; only the discarded
+    // `s == 1` step would mix them.
     red[lid] = acc1;
     threadgroup_barrier(mem_flags::mem_threadgroup);
     for (uint s = 128u; s > 1u; s >>= 1u) {
@@ -8164,18 +8221,66 @@ kernel void zc_r2_products(
         if (lid < s) { red[lid] ^= red[lid + s]; }
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
+    ulong4 chunkie = red[0];
+    ulong4 chunkio = red[1];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Full reduce for the four group-product accumulators (even lids only
+    // contribute; odd lids hold zero).
+    ulong4 cw0;
+    ulong4 cw3;
+    ulong4 cw4;
+    ulong4 cw5;
+    red[lid] = acc_w0;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint s = 128u; s > 0u; s >>= 1u) {
+        if (lid < s) { red[lid] ^= red[lid + s]; }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    cw0 = red[0];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    red[lid] = acc_w3;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint s = 128u; s > 0u; s >>= 1u) {
+        if (lid < s) { red[lid] ^= red[lid + s]; }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    cw3 = red[0];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    red[lid] = acc_w4;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint s = 128u; s > 0u; s >>= 1u) {
+        if (lid < s) { red[lid] ^= red[lid + s]; }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    cw4 = red[0];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    red[lid] = acc_w5;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint s = 128u; s > 0u; s >>= 1u) {
+        if (lid < s) { red[lid] ^= red[lid + s]; }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    cw5 = red[0];
+
     if (lid == 0u) {
-        ulong4 chunkie = red[0];
-        ulong4 chunkio = red[1];
         U256k u1e; u1e.r0 = chunk1e.x; u1e.r1 = chunk1e.y; u1e.r2 = chunk1e.z; u1e.r3 = chunk1e.w;
         U256k u1o; u1o.r0 = chunk1o.x; u1o.r1 = chunk1o.y; u1o.r2 = chunk1o.z; u1o.r3 = chunk1o.w;
         U256k uie; uie.r0 = chunkie.x; uie.r1 = chunkie.y; uie.r2 = chunkie.z; uie.r3 = chunkie.w;
         U256k uio; uio.r0 = chunkio.x; uio.r1 = chunkio.y; uio.r2 = chunkio.z; uio.r3 = chunkio.w;
+        U256k uw0; uw0.r0 = cw0.x; uw0.r1 = cw0.y; uw0.r2 = cw0.z; uw0.r3 = cw0.w;
+        U256k uw3; uw3.r0 = cw3.x; uw3.r1 = cw3.y; uw3.r2 = cw3.z; uw3.r3 = cw3.w;
+        U256k uw4; uw4.r0 = cw4.x; uw4.r1 = cw4.y; uw4.r2 = cw4.z; uw4.r3 = cw4.w;
+        U256k uw5; uw5.r0 = cw5.x; uw5.r1 = cw5.y; uw5.r2 = cw5.z; uw5.r3 = cw5.w;
         uint4 e = eq_hi[tgid];
-        partials[tgid * 4u]      = gf_reduce(clmul128(e, gf_reduce(u1e)));
-        partials[tgid * 4u + 1u] = gf_reduce(clmul128(e, gf_reduce(uie)));
-        partials[tgid * 4u + 2u] = gf_reduce(clmul128(e, gf_reduce(u1o)));
-        partials[tgid * 4u + 3u] = gf_reduce(clmul128(e, gf_reduce(uio)));
+        partials[tgid * 8u]      = gf_reduce(clmul128(e, gf_reduce(u1e)));
+        partials[tgid * 8u + 1u] = gf_reduce(clmul128(e, gf_reduce(uie)));
+        partials[tgid * 8u + 2u] = gf_reduce(clmul128(e, gf_reduce(u1o)));
+        partials[tgid * 8u + 3u] = gf_reduce(clmul128(e, gf_reduce(uio)));
+        partials[tgid * 8u + 4u] = gf_reduce(clmul128(e, gf_reduce(uw0)));
+        partials[tgid * 8u + 5u] = gf_reduce(clmul128(e, gf_reduce(uw3)));
+        partials[tgid * 8u + 6u] = gf_reduce(clmul128(e, gf_reduce(uw4)));
+        partials[tgid * 8u + 7u] = gf_reduce(clmul128(e, gf_reduce(uw5)));
     }
 }
 "#;
@@ -8411,9 +8516,12 @@ kernel void zc_r2_products(
         /// Warmup calibration completed (share published, GPU values
         /// discarded); the caller's CPU partials are authoritative.
         Calibrated,
-        /// Timed-prove prefix partials, bit-exact per chunk, parity-split as
-        /// `[p1_even, pinf_even, p1_odd, pinf_odd]` (all eq_hi-weighted).
-        Prefix(Vec<[F128; 4]>),
+        /// Timed-prove prefix partials, bit-exact per chunk, all eq_hi-weighted:
+        /// `[p1_even, pinf_even, p1_odd, pinf_odd, W0, W3, W4, W5]`.
+        /// Slots 0..3 are the parity-split round-two products; slots 4..7 are
+        /// the four group products the CPU lookahead kernel used to recompute
+        /// on every offloaded chunk.
+        Prefix(Vec<[F128; 8]>),
         /// Metal failed after admission; the caller must CPU-redo the
         /// prefix products. The arm is poisoned for the process.
         Failed,
@@ -8569,9 +8677,9 @@ kernel void zc_r2_products(
                 gpu.buffer_contents(state.eq_hi_buf),
                 need_hi,
             );
-            // Four F128 per chunk: the parity-split
-            // `[p1_even, pinf_even, p1_odd, pinf_odd]`.
-            let need_part = hi_size * 64;
+            // Eight F128 per chunk: parity-split round-two products plus the
+            // four group products `[W0, W3, W4, W5]`.
+            let need_part = hi_size * 128;
             if state.part_cap < need_part {
                 if state.part_cap > 0 {
                     gpu.release(state.part_buf);
@@ -8608,8 +8716,8 @@ kernel void zc_r2_products(
     /// full per-chunk partial vector and `cpu_wall_ms` the wall of the full
     /// CPU sweep that produced it (per-chunk cost denominator).
     /// `cpu_la` carries the CPU's six per-chunk round-three lookahead
-    /// aggregates; slots 0 and 1 are the odd-parity round-two products, so
-    /// the oracle can check the parity split and not merely its sum.
+    /// aggregates `[p1_odd, pinf_odd, W0, W3, W4, W5]` so the oracle can check
+    /// the parity split **and** the four group products, not merely the sum.
     pub(crate) fn zc_r2_wait(
         job: ZcR2Job,
         cpu_partials: Option<&[(F128, F128)]>,
@@ -8647,13 +8755,17 @@ kernel void zc_r2_products(
                 Err(_) => return poison(job.cb),
             };
             let parts = gpu.buffer_contents(state.part_buf).cast::<F128>();
-            let mut out: Vec<[F128; 4]> = Vec::with_capacity(job.chunks);
+            let mut out: Vec<[F128; 8]> = Vec::with_capacity(job.chunks);
             for c in 0..job.chunks {
                 out.push([
-                    *parts.add(c * 4),
-                    *parts.add(c * 4 + 1),
-                    *parts.add(c * 4 + 2),
-                    *parts.add(c * 4 + 3),
+                    *parts.add(c * 8),
+                    *parts.add(c * 8 + 1),
+                    *parts.add(c * 8 + 2),
+                    *parts.add(c * 8 + 3),
+                    *parts.add(c * 8 + 4),
+                    *parts.add(c * 8 + 5),
+                    *parts.add(c * 8 + 6),
+                    *parts.add(c * 8 + 7),
                 ]);
             }
             if !job.calibration {
@@ -8676,23 +8788,27 @@ kernel void zc_r2_products(
             };
             // Target-machine equality oracle before anything else: the GPU
             // probe partials must equal the CPU's own values bit-for-bit.
-            // Both the summed pair the round-two message consumes AND the
-            // odd-parity half the round-three lookahead consumes are checked,
-            // so a kernel that got the right total from the wrong split
-            // cannot be admitted.
+            // Checked: (1) the summed round-two pair, (2) the odd-parity half
+            // (W1/W2), and (3) the four group products W0/W3/W4/W5 whenever
+            // `cpu_la` is provided with those slots populated.
             for c in 0..job.chunks {
                 let summed = (out[c][0] + out[c][2], out[c][1] + out[c][3]);
-                let split_ok = cpu_la.is_none_or(|la| {
-                    la[c][0] == out[c][2] && la[c][1] == out[c][3]
+                let la_ok = cpu_la.is_none_or(|la| {
+                    la[c][0] == out[c][2]
+                        && la[c][1] == out[c][3]
+                        && la[c][2] == out[c][4]
+                        && la[c][3] == out[c][5]
+                        && la[c][4] == out[c][6]
+                        && la[c][5] == out[c][7]
                 });
-                if summed != cpu_all[c] || !split_ok {
+                if summed != cpu_all[c] || !la_ok {
                     if super::gpu_zc_r2_debug() {
                         eprintln!(
                             "[zc-r2] CALIBRATION MISMATCH at chunk {c}: gpu={:?} \
-                             gpu_summed={summed:?} cpu={:?} cpu_la_odd={:?} — poisoned",
+                             gpu_summed={summed:?} cpu={:?} cpu_la={:?} — poisoned",
                             out[c],
                             cpu_all[c],
-                            cpu_la.map(|la| (la[c][0], la[c][1])),
+                            cpu_la.map(|la| la[c]),
                         );
                     }
                     return poison(job.cb);
@@ -11972,21 +12088,21 @@ DEF_PROBE(probe_g4_t8_p0,    8u,  0u,   tsel & 7u)
         let eq_lo: Vec<F128> = (0..lo_size).map(|_| rand_f128(&mut rng)).collect();
         let eq_hi: Vec<F128> = (0..hi_size).map(|_| rand_f128(&mut rng)).collect();
 
-        // CPU reference partials, exactly the driver's non-aarch64 shape, kept
-        // split by x_lo parity so the arm's parity contract is checked and not
-        // just the sum a wrong split could still reproduce.
-        let mut cpu_split: Vec<[F128; 4]> = Vec::with_capacity(hi_size);
+        // CPU reference partials: parity-split round-two products (per-pair
+        // eq_lo weight, matching the GPU) plus the four group products
+        // (odd-lane weight, matching the CPU lookahead monomorphization).
+        let mut cpu_split: Vec<[F128; 8]> = Vec::with_capacity(hi_size);
         for x_hi in 0..hi_size {
-            // [p1_even, pinf_even, p1_odd, pinf_odd]
-            let mut acc = [F256Unreduced::ZERO; 4];
+            // [p1_even, pinf_even, p1_odd, pinf_odd, W0, W3, W4, W5]
+            let mut acc = [F256Unreduced::ZERO; 8];
+            let read = |packed: &[u8], row: usize| -> u64 {
+                u64::from_le_bytes(packed[row * 8..row * 8 + 8].try_into().unwrap())
+            };
             for x_lo in 0..lo_size {
                 let pair_idx = x_hi * lo_size + x_lo;
                 if (pair_idx & mask) >= useful {
                     continue;
                 }
-                let read = |packed: &[u8], row: usize| -> u64 {
-                    u64::from_le_bytes(packed[row * 8..row * 8 + 8].try_into().unwrap())
-                };
                 let a0 = fold_row(read(&a_packed, 2 * pair_idx));
                 let a1 = fold_row(read(&a_packed, 2 * pair_idx + 1));
                 let b0 = fold_row(read(&b_packed, 2 * pair_idx));
@@ -11995,6 +12111,41 @@ DEF_PROBE(probe_g4_t8_p0,    8u,  0u,   tsel & 7u)
                 acc[base] ^= eq_lo[x_lo].mul_unreduced(a1 * b1);
                 acc[base + 1] ^= eq_lo[x_lo].mul_unreduced((a0 + a1) * (b0 + b1));
             }
+            for u in 0..lo_size / 2 {
+                let x_even = 2 * u;
+                let x_odd = x_even + 1;
+                let pair_even = x_hi * lo_size + x_even;
+                let pair_odd = x_hi * lo_size + x_odd;
+                let pad_even = (pair_even & mask) >= useful;
+                let pad_odd = (pair_odd & mask) >= useful;
+                if pad_even && pad_odd {
+                    continue;
+                }
+                let fold_pair = |pair_idx: usize, pad: bool| {
+                    if pad {
+                        (F128::ZERO, F128::ZERO, F128::ZERO, F128::ZERO)
+                    } else {
+                        (
+                            fold_row(read(&a_packed, 2 * pair_idx)),
+                            fold_row(read(&a_packed, 2 * pair_idx + 1)),
+                            fold_row(read(&b_packed, 2 * pair_idx)),
+                            fold_row(read(&b_packed, 2 * pair_idx + 1)),
+                        )
+                    }
+                };
+                let (a0, a1, b0, b1) = fold_pair(pair_even, pad_even);
+                let (a2, a3, b2, b3) = fold_pair(pair_odd, pad_odd);
+                let wt = eq_lo[x_odd];
+                let (a0w, a1w, a2w, a3w) = (wt * a0, wt * a1, wt * a2, wt * a3);
+                if !pad_odd {
+                    acc[4] ^= a2w.mul_unreduced(b2);
+                }
+                let (e_aw, e_b) = (a0w + a2w, b0 + b2);
+                let (o_aw, o_b) = (a1w + a3w, b1 + b3);
+                acc[5] ^= e_aw.mul_unreduced(e_b);
+                acc[6] ^= o_aw.mul_unreduced(o_b);
+                acc[7] ^= (e_aw + o_aw).mul_unreduced(e_b + o_b);
+            }
             let eq_h = eq_hi[x_hi];
             cpu_split.push(std::array::from_fn(|i| eq_h * acc[i].reduce()));
         }
@@ -12002,10 +12153,10 @@ DEF_PROBE(probe_g4_t8_p0,    8u,  0u,   tsel & 7u)
             .iter()
             .map(|v| (v[0] + v[2], v[1] + v[3]))
             .collect();
-        // Slots 0/1 of the lookahead state are exactly the odd-parity pair.
+        // Full six-slot lookahead state: odd-parity pair + four group products.
         let cpu_la: Vec<[F128; 6]> = cpu_split
             .iter()
-            .map(|v| [v[2], v[3], F128::ZERO, F128::ZERO, F128::ZERO, F128::ZERO])
+            .map(|v| [v[2], v[3], v[4], v[5], v[6], v[7]])
             .collect();
 
         // Calibration probe: internal equality oracle + share publication.
