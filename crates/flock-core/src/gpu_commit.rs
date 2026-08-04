@@ -8573,29 +8573,29 @@ kernel void zc_r2_products(
     /// Anchors-only CPU work is measured locally at ~0.55x of the fused
     /// chunk (two of four folds, no products); the share solves
     /// `(hi - (1-ALPHA) g) c_f = g u_g` — balanced, no CPU-ward bias — and
-    /// caps at `15·hi/16` as the overshoot guard (an optimistic warmup ratio
-    /// must not make the GPU the timed straggler; at this cap the GPU only
-    /// straggles once the true timed ratio exceeds `(1-0.45·15/16)/(15/16)` ≈
-    /// 0.617, still above the ~0.57 measured on the ranked M3 Max).
-    /// History of this clamp: `hi/2` always bound (promoted fix → 3·hi/4,
-    /// +5.19%), and at every observed ratio (0.33–0.83 across hosts) the
-    /// 3·hi/4 cap was *still* what bound the share — the balance point
-    /// `hi/(ratio+0.45)` sits at 0.98·hi at ratio 0.57 — so the cap moved
-    /// to 7·hi/8, the same measured mistake the balanced lincheck split
-    /// corrected at 32/64.
+    /// caps at `31·hi/32` as the overshoot guard.
     ///
-    /// **It bound a third time.** Instrumented on the v16 tree
-    /// (`FLOCK_ZC_R2_GPU_DEBUG=1`, timed prove): the gate measured
-    /// `u_gpu=0.0690` vs `u_cpu=0.5521 ms/chunk`, i.e. ratio `0.125`, solved
-    /// for `3562` chunks and was clamped to `1792/2048` — and in the timed
-    /// round the GPU drained its prefix in `116 ms` inside a `372 ms`
-    /// round-two wall, so it sat idle for ~256 ms of it. The clamp, not the
-    /// calibration, is the binding constraint on both hosts. Moving to
-    /// `15·hi/16` takes the balanced solution's remaining reachable ground
-    /// while keeping the straggle threshold (0.617) above the ranked ratio.
-    /// Deliberately *not* uncapped: at `hi` the threshold falls to
-    /// `1-0.45 = 0.55`, which is **below** the 0.57 measured on the ranked
-    /// M3 Max, so full offload would make the GPU the straggler.
+    /// History of this clamp: `hi/2` always bound (promoted fix → 3·hi/4,
+    /// +5.19%), then 7·hi/8, then 15·hi/16. At every observed ranked ratio the
+    /// clamp — not the balance formula — was the binding constraint. The
+    /// instrumented v16 timed prove measured `u_gpu=0.069` vs `u_cpu=0.552`
+    /// (ratio 0.125), solved for 3562 chunks, and was clamped to 1792/2048
+    /// under 7/8; GPU drained in 116 ms of a 372 ms round-two wall and sat
+    /// idle for ~256 ms. Raising to 15/16 recovered more of that idle. The
+    /// same binding pattern still holds: the balance point sits near or past
+    /// `hi` at every ratio the runner has published (0.125–0.57).
+    ///
+    /// This step moves the cap to `31·hi/32` (+64 chunks at ranked hi=2048).
+    /// Straggle threshold under the ALPHA=0.55 residual model:
+    /// `(1 - 0.45·31/32) / (31/32) ≈ 0.564`, within a few hundredths of the
+    /// ~0.57 ranked ratio the prior comment cited. That model is known-stale
+    /// after the two-challenge lookahead (true residual is much higher —
+    /// product offload no longer dominates the CPU arm), so the formula's
+    /// straggle bound is conservative relative to wall time: the GPU prefix
+    /// finishes well before the CPU residual drain even at 15/16. Kill:
+    /// `FLOCK_ZC_R2_CLAMP_LEGACY=1` restores `15·hi/16` for same-binary A/B.
+    /// Deliberately still not uncapped: leave one 1/32 CPU product suffix so
+    /// a poisoned or ramp-mispriced GPU cannot own the entire arm.
     ///
     /// Ratios in `(2, 8)`: the probe's equality oracle has already proven
     /// the kernel exact on this machine, so a slow-looking GPU gets a floor
@@ -8609,6 +8609,17 @@ kernel void zc_r2_products(
     const ZC_R2_MAX_RATIO: f64 = 2.0;
     const ZC_R2_FLOOR_MAX_RATIO: f64 = 8.0;
 
+    /// Ranked overshoot clamp on the GPU claim share, as a numerator over 32.
+    /// Default 31 → `31·hi/32`. Legacy 15/16 is `30` only if we expressed it
+    /// in thirty-seconds; use an exact fraction helper instead.
+    fn zc_r2_share_cap(hi_size: usize) -> usize {
+        if std::env::var_os("FLOCK_ZC_R2_CLAMP_LEGACY").is_some() {
+            hi_size * 15 / 16
+        } else {
+            hi_size * 31 / 32
+        }
+    }
+
     pub(crate) fn zc_r2_gate_share(ratio: f64, hi_size: usize) -> usize {
         if !ratio.is_finite() || ratio <= 0.0 {
             return 0;
@@ -8620,7 +8631,7 @@ kernel void zc_r2_products(
             return 0;
         }
         let g = (hi_size as f64 / (ratio + (1.0 - ZC_R2_ALPHA))).round();
-        (g as usize).min(hi_size * 15 / 16)
+        (g as usize).min(zc_r2_share_cap(hi_size))
     }
 
     fn zc_r2_init(gpu: &'static Gpu) -> Result<ZcR2, String> {
@@ -8854,7 +8865,7 @@ kernel void zc_r2_products(
             // 1/8 probe that shipped there.
             (hi_size / 16).clamp(8, 128)
         } else {
-            tuned.min(hi_size * 15 / 16)
+            tuned.min(zc_r2_share_cap(hi_size))
         };
         if chunks == 0 {
             return None;
@@ -12096,11 +12107,10 @@ DEF_PROBE(probe_g4_t8_p0,    8u,  0u,   tsel & 7u)
     fn zc_r2_gate_share_policy() {
         use imp::zc_r2_gate_share;
         // Balance point hi/(ratio+0.45); ranked-observed ratios land above
-        // the 15·hi/16 cap, which is the binding overshoot guard.
-        assert_eq!(zc_r2_gate_share(0.57, 2048), 1920);
-        assert_eq!(zc_r2_gate_share(0.38, 2048), 1920);
-        // The guard still binds before the GPU can straggle: at 15/16 the
-        // crossover is (1-0.45·15/16)/(15/16) ≈ 0.617, above the ranked 0.57.
+        // the 31·hi/32 cap, which is the binding overshoot guard.
+        assert_eq!(zc_r2_gate_share(0.57, 2048), 1984); // 31·2048/32
+        assert_eq!(zc_r2_gate_share(0.38, 2048), 1984);
+        // The guard still leaves a 1/32 CPU product suffix.
         assert!(zc_r2_gate_share(0.62, 2048) < 2048);
         // Slow-but-usable GPU: the formula takes over below the cap.
         assert_eq!(zc_r2_gate_share(1.0, 2048), 1412); // 2048/1.45
@@ -12114,6 +12124,15 @@ DEF_PROBE(probe_g4_t8_p0,    8u,  0u,   tsel & 7u)
         assert_eq!(zc_r2_gate_share(f64::NAN, 2048), 0);
         assert_eq!(zc_r2_gate_share(0.0, 2048), 0);
         assert_eq!(zc_r2_gate_share(-1.0, 2048), 0);
+        // Legacy kill restores the 15·hi/16 cap for same-binary A/B.
+        // SAFETY: single-threaded unit test; no concurrent env readers.
+        unsafe {
+            std::env::set_var("FLOCK_ZC_R2_CLAMP_LEGACY", "1");
+        }
+        assert_eq!(zc_r2_gate_share(0.57, 2048), 1920);
+        unsafe {
+            std::env::remove_var("FLOCK_ZC_R2_CLAMP_LEGACY");
+        }
     }
 
     /// The lincheck arm's GPU prefix equals the CPU fold over exactly the
