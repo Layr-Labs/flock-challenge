@@ -218,6 +218,110 @@ where
     true
 }
 
+/// [`run_chunks_with_helper_only`] against an EXTERNAL shared claim counter,
+/// so a cooperating drain on another pool can take over whatever tail is
+/// still unclaimed (deferred-stripe tail drain). Semantics are otherwise
+/// identical: chunk `i` runs at most once from this call, claims come from
+/// `fetch_add` on `next`, and the broadcast returns only after every helper
+/// worker has finished its claimed chunks. Returns `false` (having claimed
+/// nothing) when the helper pool is unavailable or `max_workers` is zero.
+///
+/// The counter may legitimately end up above `n_chunks` (each worker's final
+/// failed claim overshoots); callers must treat `next >= n_chunks` as "queue
+/// empty", never as a completion signal — completion is the return of every
+/// cooperating drain call.
+pub fn drain_shared_chunks_helper_only<F>(
+    next: &AtomicUsize,
+    n_chunks: usize,
+    max_workers: usize,
+    f: &F,
+) -> bool
+where
+    F: Fn(usize) + Sync + ?Sized,
+{
+    drain_shared_chunks_with_helper_only(next, n_chunks, max_workers, f, epool())
+}
+
+/// [`drain_shared_chunks_helper_only`] with an explicit helper pool, so tests
+/// can exercise the shared-counter tail-drain interleaving on any host.
+#[doc(hidden)]
+pub fn drain_shared_chunks_with_helper_only<F>(
+    next: &AtomicUsize,
+    n_chunks: usize,
+    max_workers: usize,
+    f: &F,
+    helper: Option<&rayon::ThreadPool>,
+) -> bool
+where
+    F: Fn(usize) + Sync + ?Sized,
+{
+    let Some(ep) = helper else {
+        return false;
+    };
+    let max_workers = max_workers.min(ep.current_num_threads());
+    if max_workers == 0 {
+        return false;
+    }
+    if n_chunks == 0 {
+        return true;
+    }
+
+    ep.broadcast(|context| {
+        if context.index() >= max_workers {
+            return;
+        }
+        loop {
+            let i = next.fetch_add(1, Ordering::Relaxed);
+            if i >= n_chunks {
+                break;
+            }
+            EPOOL_HELPER_CHUNKS.fetch_add(1, Ordering::Relaxed);
+            f(i);
+        }
+    });
+    true
+}
+
+/// Claim-and-run whatever remains of a shared chunk queue on the CURRENT
+/// rayon pool (one queue-draining task per worker, exactly the shape of
+/// [`run_chunks_with_helper`]'s main-pool side). Pairs with
+/// [`drain_shared_chunks_helper_only`]: both sides claim disjoint indices
+/// from the same counter, so output is byte-identical no matter which pool
+/// runs a chunk. Returns the number of chunks this call claimed; when the
+/// queue is already empty each worker pays one relaxed `fetch_add` and exits.
+///
+/// On return every chunk claimed HERE is complete; chunks claimed by a
+/// concurrent helper drain complete when that drain returns.
+pub fn drain_shared_chunks_on_current_pool<F>(next: &AtomicUsize, n_chunks: usize, f: &F) -> usize
+where
+    F: Fn(usize) + Sync + ?Sized,
+{
+    if n_chunks == 0 {
+        return 0;
+    }
+    let claimed = AtomicUsize::new(0);
+    let worker = || {
+        loop {
+            let i = next.fetch_add(1, Ordering::Relaxed);
+            if i >= n_chunks {
+                break;
+            }
+            claimed.fetch_add(1, Ordering::Relaxed);
+            f(i);
+        }
+    };
+    let main_threads = rayon::current_num_threads();
+    if main_threads <= 1 {
+        worker();
+    } else {
+        (0..main_threads)
+            .into_par_iter()
+            .with_max_len(1)
+            .for_each(|_| worker());
+    }
+    claimed.load(Ordering::Relaxed)
+}
+
 /// Stateful sibling of [`run_hetero_chunks`]. Each queue-draining worker
 /// calls `init` exactly once, then reuses that private state for every chunk
 /// it claims. This is intended for kernels with moderately large scratch
@@ -485,6 +589,59 @@ mod tests {
                 untouched.fetch_add(1, Ordering::Relaxed);
             },
             None,
+        ));
+        assert_eq!(untouched.load(Ordering::Relaxed), 0);
+    }
+
+    /// A helper-only drain and a current-pool drain sharing one external
+    /// counter give every chunk exactly one owner, even when the helper is
+    /// deliberately slow and the pool takes over the tail (the deferred-stripe
+    /// tail-drain shape). The pool side must claim a nonzero tail here because
+    /// each helper chunk sleeps while the pool drains freely.
+    #[test]
+    fn shared_counter_tail_drain_runs_each_chunk_exactly_once() {
+        let helper = rayon::ThreadPoolBuilder::new()
+            .num_threads(1)
+            .build()
+            .unwrap();
+        let n = 64;
+        let counts: Vec<AtomicUsize> = (0..n).map(|_| AtomicUsize::new(0)).collect();
+        let next = AtomicUsize::new(0);
+        let (tail, engaged) = std::thread::scope(|s| {
+            let slow = s.spawn(|| {
+                drain_shared_chunks_with_helper_only(
+                    &next,
+                    n,
+                    1,
+                    &|i| {
+                        std::thread::sleep(std::time::Duration::from_millis(2));
+                        counts[i].fetch_add(1, Ordering::Relaxed);
+                    },
+                    Some(&helper),
+                )
+            });
+            let tail = drain_shared_chunks_on_current_pool(&next, n, &|i| {
+                counts[i].fetch_add(1, Ordering::Relaxed);
+            });
+            (tail, slow.join().unwrap())
+        });
+        assert!(engaged);
+        assert!(counts.iter().all(|c| c.load(Ordering::Relaxed) == 1));
+        assert!(tail > 0, "pool must claim tail chunks past a slow helper");
+
+        // Queue already exhausted: another pool drain claims nothing.
+        assert_eq!(
+            drain_shared_chunks_on_current_pool(&next, n, &|_| panic!("queue is empty")),
+            0
+        );
+        // No helper pool: the drain refuses without touching the counter.
+        let untouched = AtomicUsize::new(0);
+        assert!(!drain_shared_chunks_with_helper_only(
+            &untouched,
+            8,
+            1,
+            &|_| {},
+            None
         ));
         assert_eq!(untouched.load(Ordering::Relaxed), 0);
     }

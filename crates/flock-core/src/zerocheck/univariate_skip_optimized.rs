@@ -43,7 +43,8 @@ mod kernels;
 #[cfg(all(test, target_arch = "aarch64"))]
 use kernels::aarch64::{
     bit_transpose_64bytes_neon, shift_reduce_inner_ab_fused_neon,
-    shift_reduce_inner_ab_fused_neon_checked, shift_reduce_inner_ab_neon,
+    shift_reduce_inner_ab_fused_neon_checked, shift_reduce_inner_ab_fused_neon_checked_with_nt,
+    shift_reduce_inner_ab_neon,
 };
 #[cfg(all(test, target_arch = "aarch64"))]
 use kernels::bit_transpose_64bytes_scalar;
@@ -617,6 +618,24 @@ fn ab_compact_store_enabled() -> bool {
     *ON.get_or_init(|| {
         std::env::var_os(ENV_NO_AB_COMPACT_STORE).as_deref()
             != Some(std::ffi::OsStr::new("1"))
+    })
+}
+
+/// Kill switch for the non-temporal LOAD flavor of the join's two streaming
+/// read surfaces: the AB precompute's a/b code rows (here, via the checked
+/// shift-reduce dispatcher) and the prover's deferred-stripe z gathers. Set
+/// exactly `FLOCK_NO_NT_LOADS=1` to restore the incumbent plain cached loads
+/// as a same-binary control. Load flavor only — every byte read (and hence
+/// every byte written) is identical; the surfaces are read exactly once per
+/// prove while the streamed GPU commit saturates the same memory system, so
+/// `ldnp`'s no-allocate hint spends no cache residency on them (the read
+/// mirror of the `stnp` idiom below and in the witness stripe drain).
+pub const ENV_NO_NT_LOADS: &str = "FLOCK_NO_NT_LOADS";
+
+pub fn nt_loads_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var_os(ENV_NO_NT_LOADS).as_deref() != Some(std::ffi::OsStr::new("1"))
     })
 }
 
@@ -3699,6 +3718,56 @@ mod tests {
         );
     }
 
+    /// The non-temporal `ldnp` bounce of the a/b code rows must be a pure
+    /// load-flavor change: both arms of the checked dispatcher, across every
+    /// `b_med` and sniff-flag combination the ranked layout emits, produce
+    /// identical bytes in one process.
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn nt_load_bounce_is_bit_exact_with_direct_loads() {
+        let mut rng = Rng::new(0x4E7_10AD_5AFE);
+        let table = make_inv_table();
+        let a_packed = pack_bits(&rng.bits(1 << 14));
+        let mut b_packed = pack_bits(&rng.bits(1 << 14));
+        // Give the sniffed fast paths live arms: all-ones rows at b_med 0,
+        // K0-only at b_med 5, mixed 0x03 at b_med 2.
+        b_packed[0..64].fill(0xff);
+        for k in 1..N_CHUNKS {
+            let off = 5 * 64 + k * N_CHUNKS;
+            b_packed[off..off + 8].fill(0);
+        }
+        for k in 0..2 {
+            let off = 2 * 64 + k * N_CHUNKS;
+            b_packed[off..off + 8].fill(0xff);
+        }
+        let context =
+            kernels::aarch64::prepare_static_b_context_with_policy(&table, true, false, false);
+        for w in 0..2usize {
+            for b_med in 0..16usize {
+                for (all_ones, single_k0, mask) in [
+                    (false, false, 0u8),
+                    (true, false, 0),
+                    (false, true, 0),
+                    (false, false, 0x03),
+                    (false, false, 0xf0),
+                ] {
+                    let mut nt = [0u8; 64];
+                    let mut plain = [0x11u8; 64];
+                    for (out, flavor) in [(&mut nt, true), (&mut plain, false)] {
+                        shift_reduce_inner_ab_fused_neon_checked_with_nt(
+                            &a_packed, &b_packed, &table, 0, b_med, out, all_ones, single_k0,
+                            mask, w, context, flavor,
+                        );
+                    }
+                    assert_eq!(
+                        nt, plain,
+                        "NT load bounce drifted (w={w}, b_med={b_med}, flags=({all_ones},{single_k0},{mask:#x}))"
+                    );
+                }
+            }
+        }
+    }
+
     #[cfg(target_arch = "aarch64")]
     #[test]
     fn prepared_static_b_context_matches_scalar_and_guard_fallback() {
@@ -3861,14 +3930,16 @@ mod tests {
                             let mut slow = [0u8; 64];
                             assert!(
                                 kernels::aarch64::shift_reduce_inner_ab_bstatic::<false>(
-                                    &a_packed, &b, &table, 0, b_med, w, context, &mut slow,
+                                    &a_packed, &b, &table, byte_base_b, b_med, w, context,
+                                    &mut slow,
                                 ),
                                 "arm (w={w}, b_med={b_med}) must be live"
                             );
                             let mut fast = [0u8; 64];
                             assert!(
                                 kernels::aarch64::shift_reduce_inner_ab_bstatic::<true>(
-                                    &a_packed, &b, &table, 0, b_med, w, context, &mut fast,
+                                    &a_packed, &b, &table, byte_base_b, b_med, w, context,
+                                    &mut fast,
                                 ),
                                 "arm (w={w}, b_med={b_med}) must be live"
                             );

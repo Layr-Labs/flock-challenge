@@ -2866,7 +2866,38 @@ fn ligero_commit_impl(
     let alloc_elapsed = alloc_start.map_or(std::time::Duration::ZERO, |t| t.elapsed());
     let mut fill_elapsed = std::time::Duration::ZERO;
     let ntt_start = timing.then(std::time::Instant::now);
-    if fuse_from_message {
+    // GPU NTT for the exact ranked L1 recursive shape, using the idle GPU in
+    // the post-commit opening spine (kill switch `FLOCK_NO_OPEN_L1_GPU=1`).
+    // Bit-exact by construction: a per-process warmup byte-oracle latches the
+    // arm ON only after the GPU reproduces the incumbent CPU codeword on this
+    // machine; any refusal or failure falls through to the untouched CPU
+    // dispatch below, which overwrites `mat` wholesale from `poly`.
+    let gpu_l1_shape = (log_msg_cols, log_num_interleaved, log_inv_rate) == (16, 3, 2)
+        && matches!(kind, HashKind::Blake3);
+    let mut gpu_ntt = false;
+    if gpu_l1_shape && crate::gpu_commit::gpu_open_l1_ntt_ready() {
+        // The replicated message IS the exact post-layer-`log_inv_rate`
+        // state the GPU passes start from.
+        let fill_start = timing.then(std::time::Instant::now);
+        super::commit::replicate_message_fill(&mut mat, poly);
+        fill_elapsed = fill_start.map_or(std::time::Duration::ZERO, |t| t.elapsed());
+        if let Some(tail_start) =
+            crate::gpu_commit::gpu_open_l1_ntt(&mut mat, num_interleaved, log_inv_rate, ntt)
+        {
+            // Finish the layers below the 64-lane remap window on the CPU
+            // (no-op when the warmup oracle already produced the full
+            // codeword).
+            ntt.forward_transform_interleaved_from_layer(
+                &mut mat,
+                num_interleaved,
+                tail_start,
+            );
+            gpu_ntt = true;
+        }
+    }
+    if gpu_ntt {
+        // GPU path complete.
+    } else if fuse_from_message {
         // Write the first nontrivial radix-8 result straight from the compact
         // message into stale codeword storage. This deletes the full replica
         // fill and the first pass's destination reads/RFOs.
@@ -2926,7 +2957,7 @@ fn ligero_commit_impl(
         if let Some(level) = level {
             let total_elapsed = total_start.expect("timing start").elapsed();
             eprintln!(
-                "    [recursive-commit {level}] fused={fuse_from_message} alloc={:.2} ms fill={:.2} ms ntt={:.2} ms merkle={:.2} ms total={:.2} ms",
+                "    [recursive-commit {level}] fused={fuse_from_message} gpu={gpu_ntt} alloc={:.2} ms fill={:.2} ms ntt={:.2} ms merkle={:.2} ms total={:.2} ms",
                 alloc_elapsed.as_secs_f64() * 1e3,
                 fill_elapsed.as_secs_f64() * 1e3,
                 ntt_elapsed.as_secs_f64() * 1e3,
