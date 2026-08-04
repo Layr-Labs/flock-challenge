@@ -26,15 +26,9 @@ pub mod pack;
 pub mod ring_switch;
 pub mod tensor_algebra;
 
-/// Whether untimed warmup permanently selected the ranked Metal commit.
-/// Callers may omit CPU-only speculative buffers once this is true.
-pub fn ranked_gpu_commit_latched_on() -> bool {
-    crate::gpu_commit::gpu_commit_latched_on()
-}
-
 pub use commit::{
-    Commitment, PcsParams, ProverData, commit, commit_from_streamed_first_pass, commit_into,
-    commit_preinitialized, prefault_codeword_during, use_ranked_from_message_commit,
+    Commitment, PcsParams, ProverData, commit, commit_into, commit_preinitialized,
+    prefault_codeword_during, use_ranked_from_message_commit,
 };
 pub use pack::{LOG_PACKING, pack_witness, unpack_witness};
 pub use ring_switch::{RingSwitchProof, SparseEqTensor};
@@ -147,55 +141,7 @@ pub fn open_batch_mixed_ligerito_with_precomputed_s_hat_v<Ch: Challenger>(
     );
 
     let t = std::time::Instant::now();
-    let ligerito_proof = if let Some(direct) = combined.direct_fold8 {
-        ligerito::recursive_prover_with_basis_direct_fold8(
-            lig_config,
-            packed_witness,
-            combined.b_combined,
-            direct,
-            combined.target_combined,
-            &prover_data.codeword,
-            &*prover_data.merkle_tree,
-            combined.round0_prime,
-            combined
-                .round1_lookahead
-                .expect("direct-fold8 requires round-1 lookahead"),
-            combined
-                .round2_lookahead
-                .expect("direct-fold8 requires round-2 lookahead"),
-            combined
-                .round3_lookahead
-                .expect("direct-fold8 requires round-3 lookahead"),
-            combined
-                .round4_lookahead
-                .expect("direct-fold8 requires round-4 lookahead"),
-            combined
-                .round5_lookahead
-                .expect("direct-fold8 requires round-5 lookahead"),
-            challenger,
-        )
-    } else if let Some(direct) = combined.direct_fold4 {
-        ligerito::recursive_prover_with_basis_direct_fold4(
-            lig_config,
-            packed_witness,
-            combined.b_combined,
-            direct,
-            combined.target_combined,
-            &prover_data.codeword,
-            &*prover_data.merkle_tree,
-            combined.round0_prime,
-            combined
-                .round1_lookahead
-                .expect("direct-fold4 requires round-1 lookahead"),
-            combined
-                .round2_lookahead
-                .expect("direct-fold4 requires round-2 lookahead"),
-            combined
-                .round3_lookahead
-                .expect("direct-fold4 requires round-3 lookahead"),
-            challenger,
-        )
-    } else if let Some(direct) = combined.direct_fold2 {
+    let ligerito_proof = if let Some(direct) = combined.direct_fold2 {
         ligerito::recursive_prover_with_basis_direct_ab_fold2(
             lig_config,
             packed_witness,
@@ -203,7 +149,7 @@ pub fn open_batch_mixed_ligerito_with_precomputed_s_hat_v<Ch: Challenger>(
             direct,
             combined.target_combined,
             &prover_data.codeword,
-            &*prover_data.merkle_tree,
+            &prover_data.merkle_tree,
             combined.round0_prime,
             combined
                 .round1_lookahead
@@ -217,7 +163,7 @@ pub fn open_batch_mixed_ligerito_with_precomputed_s_hat_v<Ch: Challenger>(
             combined.b_combined,
             combined.target_combined,
             &prover_data.codeword,
-            &*prover_data.merkle_tree,
+            &prover_data.merkle_tree,
             combined.round0_prime,
             combined.round1_lookahead,
             challenger,
@@ -251,150 +197,20 @@ struct CombinedClaim {
     /// Round-1 message as two quadratics in the first fold challenge. Present
     /// only for the exact ranked two-challenge cadence.
     round1_lookahead: Option<[F128; 6]>,
-    /// Experimental direct-fold4 round-2 bivariate lookahead.
-    round2_lookahead: Option<Fold4Lookahead2>,
-    /// Experimental direct-fold4 round-3 trivariate lookahead.
-    round3_lookahead: Option<Fold4Lookahead3>,
-    /// Direct-fold8 round-4 quadrivariate lookahead.
-    round4_lookahead: Option<Fold8Lookahead4>,
-    /// Direct-fold8 round-5 quintivariate lookahead.
-    round5_lookahead: Option<Fold8Lookahead5>,
-    /// Per-claim sufficient statistics for direct materialization after rounds
-    /// 0/1. `b_combined` still contains every ordinary claim (currently C) —
+    /// AB sufficient statistics for direct materialization after rounds 0/1.
+    /// `b_combined` still contains every ordinary claim (currently C) —
     /// unless deferred-C is active, in which case C rides along here as a
-    /// second claim (products zeroed) and `b_combined` is empty, or the
-    /// direct-C completion is active, in which case C rides along with real
-    /// `products` and there is no basis sweep at all.
+    /// second claim (products zeroed) and `b_combined` is empty.
     direct_fold2: Option<Vec<ring_switch::DirectFold2Factors>>,
-    /// Sixteen-bank direct factors. This is populated only behind the strict
-    /// experimental opt-in and leaves the frontier path unchanged by default.
-    direct_fold4: Option<Vec<ring_switch::DirectFold4Factors>>,
-    /// Sixty-four-bank direct factors, populated when both claims carry an
-    /// honest 64-bank precompute and the fold8 gate is on.
-    direct_fold8: Option<Vec<ring_switch::DirectFold8Factors>>,
 }
 
 /// Compute the ordinary round-zero message and the following message as two
 /// quadratics in the first challenge. The latter lets the ranked prover sample
 /// its second challenge before binding the first, so both binds share one pass.
 #[inline]
-fn use_ranked_open_lookahead_neon(ranked_shape: bool, len: usize) -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    cfg!(all(
-        target_os = "macos",
-        target_arch = "aarch64",
-        target_feature = "aes"
-    )) && ranked_shape
-        && len == (1usize << 15)
-        && *ON.get_or_init(|| std::env::var_os("FLOCK_NO_OPEN_LOOKAHEAD_NEON").is_none())
-}
-
-#[inline]
-#[cfg(test)]
 fn round0_and_round1_lookahead(witness: &[F128], basis: &[F128]) -> ((F128, F128), [F128; 6]) {
     assert_eq!(witness.len(), basis.len());
     assert!(witness.len().is_multiple_of(4));
-
-    round0_and_round1_lookahead_scalar(witness, basis)
-}
-
-/// Ranked-shape dispatcher for the deferred-reduction AArch64 kernel. Keeping
-/// the generic helper scalar makes promotion an explicit property of the two
-/// benchmark geometry call sites rather than an accidental property of a
-/// local 2^15-slot slice.
-#[inline]
-fn round0_and_round1_lookahead_ranked(
-    witness: &[F128],
-    basis: &[F128],
-    ranked_shape: bool,
-) -> ((F128, F128), [F128; 6]) {
-    assert_eq!(witness.len(), basis.len());
-    assert!(witness.len().is_multiple_of(4));
-
-    #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
-    if use_ranked_open_lookahead_neon(ranked_shape, witness.len()) {
-        return crate::field::f128_slice::round0_and_round1_lookahead(witness, basis);
-    }
-
-    round0_and_round1_lookahead_scalar(witness, basis)
-}
-
-/// Kill switch for the direct-materializer deferred-reduction fast paths:
-/// the banked `fold16`/`fold64` slot folds and the round-0 message kernels
-/// that close each direct fold block. Every one of them is bit-identical to
-/// the fully-reduced scalar loop it replaces (reduction mod p is F2-linear,
-/// so it commutes with the XOR product sum), so this is a pure A/B escape
-/// hatch rather than a correctness condition.
-#[inline]
-pub(crate) fn use_fold_deferred_reduce() -> bool {
-    static ON: std::sync::LazyLock<bool> =
-        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_FOLD_DEFERRED_REDUCE").is_none());
-    *ON
-}
-
-/// Deferred-reduction dispatcher for the direct-fold4 materializer's block
-/// tail. The `_ranked` sibling is pinned to the 2^15-slot combine geometry;
-/// the direct-fold4 materializer's blocks are 2^13 slots, so it needs its own
-/// gate. Both arms return the same bits.
-#[inline]
-pub(crate) fn round0_and_round1_lookahead_deferred(
-    witness: &[F128],
-    basis: &[F128],
-) -> ((F128, F128), [F128; 6]) {
-    assert_eq!(witness.len(), basis.len());
-    assert!(witness.len().is_multiple_of(4));
-
-    #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
-    if use_fold_deferred_reduce() {
-        return crate::field::f128_slice::round0_and_round1_lookahead(witness, basis);
-    }
-
-    round0_and_round1_lookahead_scalar(witness, basis)
-}
-
-/// Deferred-reduction dispatcher for the direct-fold8 materializer's block
-/// tail. Routing fold8 through the six-coefficient lookahead kernel would be
-/// a regression: fold8 consumes only `(u_0, u_2)`, and the lookahead scan
-/// spends eight unreduced products per four slots where round-zero needs
-/// four.
-#[inline]
-pub(crate) fn round0_deferred(witness: &[F128], basis: &[F128]) -> (F128, F128) {
-    assert_eq!(witness.len(), basis.len());
-
-    #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
-    if use_fold_deferred_reduce() && witness.len().is_multiple_of(2) {
-        return crate::field::f128_slice::round0(witness, basis);
-    }
-
-    round0_scalar(witness, basis)
-}
-
-/// Round-0 message `(u_0, u_2)` over paired slots, without the round-1
-/// lookahead coefficients. Sums the same pair products as
-/// [`round0_and_round1_lookahead_scalar`], so the values agree with it
-/// bitwise (char-2 regrouping). Used by the fold8 materialize, whose M6 is
-/// the last initial message — no lookahead follows.
-#[inline]
-pub(crate) fn round0_scalar(witness: &[F128], basis: &[F128]) -> (F128, F128) {
-    assert_eq!(witness.len(), basis.len());
-    let mut u0 = F128::ZERO;
-    let mut u2 = F128::ZERO;
-    for i in (0..witness.len()).step_by(2) {
-        let a0 = witness[i];
-        let a1 = witness[i + 1];
-        let b0 = basis[i];
-        let b1 = basis[i + 1];
-        u0 += a0 * b0;
-        u2 += (a0 + a1) * (b0 + b1);
-    }
-    (u0, u2)
-}
-
-#[inline]
-fn round0_and_round1_lookahead_scalar(
-    witness: &[F128],
-    basis: &[F128],
-) -> ((F128, F128), [F128; 6]) {
     let mut u0 = F128::ZERO;
     let mut u2 = F128::ZERO;
     let mut c = [F128::ZERO; 6];
@@ -470,261 +286,6 @@ fn messages_from_direct_products(
     (round0, lookahead)
 }
 
-pub(crate) type Fold4Lookahead2 = [F128; 18];
-pub(crate) type Fold4Lookahead3 = [F128; 54];
-pub(crate) type Fold8Lookahead4 = [F128; 162];
-pub(crate) type Fold8Lookahead5 = [F128; 486];
-
-#[inline(always)]
-fn quadratic_coefficients([at_zero, at_one, leading]: [F128; 3]) -> [F128; 3] {
-    [at_zero, at_zero + at_one + leading, leading]
-}
-
-/// Convert an evaluation tensor over `{0, 1, leading}^variables` into the
-/// matching degree-at-most-two coefficient tensor, in row-major coordinate
-/// order. This is the fold3 interpolation algebra generalized to three prior
-/// challenges for the direct-fold4 scaffold.
-fn tensor_quadratic_coefficients(values: &mut [F128], variables: usize) {
-    debug_assert_eq!(values.len(), 3usize.pow(variables as u32));
-    for axis in 0..variables {
-        let stride = 3usize.pow((variables - axis - 1) as u32);
-        let period = 3 * stride;
-        for block in (0..values.len()).step_by(period) {
-            for offset in 0..stride {
-                let indices = [block + offset, block + stride + offset, block + 2 * stride + offset];
-                let coefficients = quadratic_coefficients([
-                    values[indices[0]],
-                    values[indices[1]],
-                    values[indices[2]],
-                ]);
-                for (index, coefficient) in indices.into_iter().zip(coefficients) {
-                    values[index] = coefficient;
-                }
-            }
-        }
-    }
-}
-
-/// Build the two message-polynomial coefficient tensors at `round` from a
-/// 16×16 bilinear product matrix. Prior-coordinate grid digit 0 selects the
-/// zero endpoint, 1 the one endpoint, and 2 the quadratic leading term (the
-/// sum of both endpoint banks). The current-coordinate `u_2` grid similarly
-/// selects both halves. Higher coordinates are summed independently.
-fn direct_fold4_message_coefficients(
-    h: &[F128; 256],
-    round: usize,
-) -> (Vec<F128>, Vec<F128>) {
-    debug_assert!(round < 4);
-    let grid_len = 3usize.pow(round as u32);
-    let mut endpoints = vec![F128::ZERO; 2 * grid_len];
-
-    let product = |mask: u16| {
-        let mut sum = F128::ZERO;
-        for e in 0..16 {
-            if mask & (1 << e) == 0 {
-                continue;
-            }
-            for d in 0..16 {
-                if mask & (1 << d) != 0 {
-                    sum += h[16 * e + d];
-                }
-            }
-        }
-        sum
-    };
-
-    for current_leading in 0..2 {
-        for grid_index in 0..grid_len {
-            let mut total = F128::ZERO;
-            let high_assignments = 1usize << (3 - round);
-            for high in 0..high_assignments {
-                let mut mask = 0u16;
-                'bank: for bank in 0..16 {
-                    if current_leading == 0 && ((bank >> round) & 1) != 0 {
-                        continue;
-                    }
-                    for bit in 0..round {
-                        let divisor = 3usize.pow((round - bit - 1) as u32);
-                        let mode = (grid_index / divisor) % 3;
-                        if mode < 2 && ((bank >> bit) & 1) != mode {
-                            continue 'bank;
-                        }
-                    }
-                    if bank >> (round + 1) != high {
-                        continue;
-                    }
-                    mask |= 1 << bank;
-                }
-                total += product(mask);
-            }
-            endpoints[current_leading * grid_len + grid_index] = total;
-        }
-    }
-
-    let (u0, u2) = endpoints.split_at_mut(grid_len);
-    tensor_quadratic_coefficients(u0, round);
-    tensor_quadratic_coefficients(u2, round);
-    (u0.to_vec(), u2.to_vec())
-}
-
-/// Derive the first four transcript messages from sixteen-bank direct
-/// sufficient statistics, without materializing either N-sized polynomial.
-/// The returned lookaheads are respectively uni-, bi-, and trivariate
-/// quadratics in the already-sampled challenges.
-pub(crate) fn messages_from_direct_products_fold4(
-    factors: &[ring_switch::DirectFold4Factors],
-) -> (
-    (F128, F128),
-    [F128; 6],
-    Fold4Lookahead2,
-    Fold4Lookahead3,
-) {
-    let mut h = [F128::ZERO; 256];
-    for claim in factors {
-        for (out, value) in h.iter_mut().zip(claim.products) {
-            *out += value;
-        }
-    }
-
-    let (round0_u0, round0_u2) = direct_fold4_message_coefficients(&h, 0);
-    let (round1_u0, round1_u2) = direct_fold4_message_coefficients(&h, 1);
-    let (round2_u0, round2_u2) = direct_fold4_message_coefficients(&h, 2);
-    let (round3_u0, round3_u2) = direct_fold4_message_coefficients(&h, 3);
-
-    let mut round1 = [F128::ZERO; 6];
-    round1[..3].copy_from_slice(&round1_u0);
-    round1[3..].copy_from_slice(&round1_u2);
-    let mut round2 = [F128::ZERO; 18];
-    round2[..9].copy_from_slice(&round2_u0);
-    round2[9..].copy_from_slice(&round2_u2);
-    let mut round3 = [F128::ZERO; 54];
-    round3[..27].copy_from_slice(&round3_u0);
-    round3[27..].copy_from_slice(&round3_u2);
-
-    ((round0_u0[0], round0_u2[0]), round1, round2, round3)
-}
-
-/// Build the two message-polynomial coefficient tensors at `round` from a
-/// 64×64 bilinear product matrix. Same algebra as
-/// [`direct_fold4_message_coefficients`] one level wider: prior-coordinate
-/// grid digit 0/1 selects the zero/one endpoint, 2 the quadratic leading
-/// term (both endpoint banks); higher coordinates are summed independently.
-/// Selected banks always form a subcube, so the product sum iterates set
-/// mask bits only (Σ_r 2·3^r·2^(5−r) configs × E|selected|² = 2^(r+1) ≈ 47K
-/// F128 adds total — scalar-negligible).
-fn direct_fold8_message_coefficients(
-    h: &[F128; 4096],
-    round: usize,
-) -> (Vec<F128>, Vec<F128>) {
-    debug_assert!(round < 6);
-    let grid_len = 3usize.pow(round as u32);
-    let mut endpoints = vec![F128::ZERO; 2 * grid_len];
-
-    let product = |mask: u64| {
-        let mut sum = F128::ZERO;
-        let mut e_bits = mask;
-        while e_bits != 0 {
-            let e = e_bits.trailing_zeros() as usize;
-            e_bits &= e_bits - 1;
-            let row = &h[64 * e..64 * e + 64];
-            let mut d_bits = mask;
-            while d_bits != 0 {
-                let d = d_bits.trailing_zeros() as usize;
-                d_bits &= d_bits - 1;
-                sum += row[d];
-            }
-        }
-        sum
-    };
-
-    for current_leading in 0..2 {
-        for grid_index in 0..grid_len {
-            let mut total = F128::ZERO;
-            let high_assignments = 1usize << (5 - round);
-            for high in 0..high_assignments {
-                let mut mask = 0u64;
-                'bank: for bank in 0..64usize {
-                    if current_leading == 0 && ((bank >> round) & 1) != 0 {
-                        continue;
-                    }
-                    for bit in 0..round {
-                        let divisor = 3usize.pow((round - bit - 1) as u32);
-                        let mode = (grid_index / divisor) % 3;
-                        if mode < 2 && ((bank >> bit) & 1) != mode {
-                            continue 'bank;
-                        }
-                    }
-                    if bank >> (round + 1) != high {
-                        continue;
-                    }
-                    mask |= 1 << bank;
-                }
-                total += product(mask);
-            }
-            endpoints[current_leading * grid_len + grid_index] = total;
-        }
-    }
-
-    let (u0, u2) = endpoints.split_at_mut(grid_len);
-    tensor_quadratic_coefficients(u0, round);
-    tensor_quadratic_coefficients(u2, round);
-    (u0.to_vec(), u2.to_vec())
-}
-
-/// Derive the first six transcript messages from sixty-four-bank direct
-/// sufficient statistics, without materializing either N-sized polynomial.
-/// The returned lookaheads are respectively uni-, bi-, tri-, quadri-, and
-/// quintivariate quadratics in the already-sampled challenges.
-pub(crate) fn messages_from_direct_products_fold8(
-    factors: &[ring_switch::DirectFold8Factors],
-) -> (
-    (F128, F128),
-    [F128; 6],
-    Fold4Lookahead2,
-    Fold4Lookahead3,
-    Fold8Lookahead4,
-    Fold8Lookahead5,
-) {
-    let mut h = [F128::ZERO; 4096];
-    for claim in factors {
-        for (out, value) in h.iter_mut().zip(claim.products) {
-            *out += value;
-        }
-    }
-
-    let (round0_u0, round0_u2) = direct_fold8_message_coefficients(&h, 0);
-    let (round1_u0, round1_u2) = direct_fold8_message_coefficients(&h, 1);
-    let (round2_u0, round2_u2) = direct_fold8_message_coefficients(&h, 2);
-    let (round3_u0, round3_u2) = direct_fold8_message_coefficients(&h, 3);
-    let (round4_u0, round4_u2) = direct_fold8_message_coefficients(&h, 4);
-    let (round5_u0, round5_u2) = direct_fold8_message_coefficients(&h, 5);
-
-    let mut round1 = [F128::ZERO; 6];
-    round1[..3].copy_from_slice(&round1_u0);
-    round1[3..].copy_from_slice(&round1_u2);
-    let mut round2 = [F128::ZERO; 18];
-    round2[..9].copy_from_slice(&round2_u0);
-    round2[9..].copy_from_slice(&round2_u2);
-    let mut round3 = [F128::ZERO; 54];
-    round3[..27].copy_from_slice(&round3_u0);
-    round3[27..].copy_from_slice(&round3_u2);
-    let mut round4 = [F128::ZERO; 162];
-    round4[..81].copy_from_slice(&round4_u0);
-    round4[81..].copy_from_slice(&round4_u2);
-    let mut round5 = [F128::ZERO; 486];
-    round5[..243].copy_from_slice(&round5_u0);
-    round5[243..].copy_from_slice(&round5_u2);
-
-    (
-        (round0_u0[0], round0_u2[0]),
-        round1,
-        round2,
-        round3,
-        round4,
-        round5,
-    )
-}
-
 /// Exact ranked shape for the heterogeneous combined-basis queue. The gate is
 /// deliberately narrower than the algebraic fast path: two ring-switched
 /// BLAKE3 claims, no packed-direct claim, 2^25 packed slots split into 2^15
@@ -734,73 +295,11 @@ fn is_ranked_hetero_open_combine_shape(l: usize, b: usize, n_rs: usize, n_pd: us
     l == (1usize << 25) && b == (1usize << 15) && n_rs == 2 && n_pd == 0
 }
 
-/// Exact ranked direct-fold2 materialization shapes. The first arm is the
-/// frontier AB claim plus ordinary C basis; the second is deferred C encoded
-/// as a second direct claim with no materialized ordinary basis.
-#[inline]
-fn is_ranked_direct_fold2_lookahead_shape(
-    packed_len: usize,
-    block_len: usize,
-    claim_count: usize,
-    has_ordinary: bool,
-) -> bool {
-    packed_len == (1usize << 25)
-        && block_len == (1usize << 15)
-        && ((claim_count == 1 && has_ordinary) || (claim_count == 2 && !has_ordinary))
-}
-
 #[inline]
 fn use_ranked_hetero_open_combine(l: usize, b: usize, n_rs: usize, n_pd: usize) -> bool {
     cfg!(all(target_os = "macos", target_arch = "aarch64"))
         && is_ranked_hetero_open_combine_shape(l, b, n_rs, n_pd)
         && std::env::var_os("FLOCK_NO_HETERO_OPEN_COMBINE").is_none()
-        && crate::epool::epool().is_some()
-}
-
-/// Exact ranked direct-fold8 materializer shape: 2^25 packed slots folding
-/// 64:1 into 2^19 outputs, two direct claims (AB + direct-C), no ordinary
-/// basis. The deferred split (`deferred_split_n_lo(19) = 11`) makes the
-/// materializer's blocks 2^11 slots, i.e. 256 independent jobs that each
-/// read a disjoint 2 MiB witness stripe and write a disjoint 64 KiB output
-/// pair — the same block-owns-its-range contract as the hetero combine
-/// queue above.
-#[inline]
-fn is_ranked_open_mat_hetero_shape(
-    packed_len: usize,
-    block_len: usize,
-    claim_count: usize,
-    has_ordinary: bool,
-) -> bool {
-    packed_len == (1usize << 25)
-        && block_len == (1usize << 11)
-        && claim_count == 2
-        && !has_ordinary
-}
-
-/// Heterogeneous (P+E) drain for the direct-fold8 materializer — the single
-/// 512 MiB witness pass of the ranked opening (2^19 slots × 64 banked muls
-/// = 2^25 ≈ 33.5M deferred products, plus 2 × 2^19 byte-table basis folds).
-/// The pass is product-dense, not bandwidth-starved: at the ranked shape the
-/// P-cores retire pmull products far below memory saturation, which is the
-/// same census that made the combined-basis queue
-/// ([`use_ranked_hetero_open_combine`]) and the witgen drain
-/// (`r1cs_hashes::common::run_hetero_chunks`) profitable on efficiency
-/// cores — and the opposite of the sumcheck fold sweeps, whose byte/mul
-/// ratio measured hetero-negative. Default **on** for the ranked worker;
-/// `FLOCK_NO_OPEN_MAT_HETERO=1` (exact '1', per the grind-reg precedent)
-/// restores the incumbent rayon-only pass. Both drains compute identical
-/// per-block values and the block partials are XOR sums (order-free in
-/// char 2), so the emitted message and outputs are bit-identical either way.
-#[inline]
-pub(crate) fn use_open_mat_hetero(
-    packed_len: usize,
-    block_len: usize,
-    claim_count: usize,
-    has_ordinary: bool,
-) -> bool {
-    cfg!(all(target_os = "macos", target_arch = "aarch64"))
-        && is_ranked_open_mat_hetero_shape(packed_len, block_len, claim_count, has_ordinary)
-        && !std::env::var("FLOCK_NO_OPEN_MAT_HETERO").is_ok_and(|v| v == "1")
         && crate::epool::epool().is_some()
 }
 
@@ -941,99 +440,6 @@ fn direct_ab_claim_mix_supported(
     )
 }
 
-/// Completed direct path: **both** claims carry their own four-bank factor
-/// bundle, so every round-0/round-1 statistic comes from `products` and the
-/// L-sized combine sweep has nothing left to compute.
-#[inline]
-fn direct_all_claim_mix_supported(
-    rs_results: &[(RingSwitchProof, ring_switch::RingSwitchBatchOutput)],
-) -> bool {
-    matches!(
-        rs_results,
-        [(_, ab), (_, c)]
-            if ab.direct_fold2.is_some()
-                && c.direct_fold2.is_some()
-                && matches!(&ab.rs_eq_ind, ring_switch::RsEqInd::DeferredDense { .. })
-                && matches!(&c.rs_eq_ind, ring_switch::RsEqInd::DeferredDense { .. })
-    )
-}
-
-/// Experimental sixteen-bank route: both ranked claims must expose a complete
-/// direct-fold4 bundle, so no ordinary basis sweep or duplicate statistics
-/// path is needed.
-#[inline]
-fn direct_fold4_all_claim_mix_supported(
-    rs_results: &[(RingSwitchProof, ring_switch::RingSwitchBatchOutput)],
-) -> bool {
-    matches!(
-        rs_results,
-        [(_, ab), (_, c)]
-            if ab.direct_fold4.is_some()
-                && c.direct_fold4.is_some()
-                && matches!(&ab.rs_eq_ind, ring_switch::RsEqInd::DeferredDense { .. })
-                && matches!(&c.rs_eq_ind, ring_switch::RsEqInd::DeferredDense { .. })
-    )
-}
-
-/// Direct-fold8 route: both ranked claims must expose a complete
-/// direct-fold8 bundle, so no ordinary basis sweep or duplicate statistics
-/// path is needed.
-#[inline]
-fn direct_fold8_all_claim_mix_supported(
-    rs_results: &[(RingSwitchProof, ring_switch::RingSwitchBatchOutput)],
-) -> bool {
-    matches!(
-        rs_results,
-        [(_, ab), (_, c)]
-            if ab.direct_fold8.is_some()
-                && c.direct_fold8.is_some()
-                && matches!(&ab.rs_eq_ind, ring_switch::RsEqInd::DeferredDense { .. })
-                && matches!(&c.rs_eq_ind, ring_switch::RsEqInd::DeferredDense { .. })
-    )
-}
-
-/// Direct-fold4 enable, latched once per process.
-///
-/// Default **enabled** for the ranked worker. `FLOCK_NO_OPEN_DIRECT_FOLD4=1`
-/// restores the previous direct-C route bit-for-bit. The retained-coordinate
-/// producers and this consumer share this predicate so they cannot silently
-/// disagree.
-#[inline]
-pub fn ranked_direct_fold4_enabled() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("FLOCK_NO_OPEN_DIRECT_FOLD4").is_none())
-}
-
-/// Direct-fold8 enable, latched once per process.
-///
-/// Default **enabled** for the ranked worker on top of DirectFold4.
-/// `FLOCK_NO_OPEN_DIRECT_FOLD8=1` restores the exact incumbent fold4 route;
-/// the fold4 kill switch also disables fold8 (fold8 is a strict widening of
-/// the fold4 chain). The stripe-C/AB producers and this consumer share this
-/// predicate so they cannot silently disagree.
-#[inline]
-pub fn ranked_direct_fold8_enabled() -> bool {
-    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
-        ranked_direct_fold4_enabled() && std::env::var_os("FLOCK_NO_OPEN_DIRECT_FOLD8").is_none()
-    });
-    *ON
-}
-
-/// Direct-C completion kill switch, latched once per process.
-///
-/// Default **enabled**: the ranked worker's environment is cleared down to
-/// `RAYON_NUM_THREADS` + `TMPDIR`, so an env opt-out never reaches it and
-/// default-on is the shipped behaviour. `FLOCK_NO_OPEN_DIRECT_C=1` restores the
-/// deferred-C path bit-for-bit in the same binary. Read by both the zerocheck-side
-/// quad handoff (`flock_prover::prover`) and `use_direct_all` below, so the
-/// capture and its consumer can never disagree; the structural predicate above
-/// stays the final authority, so a mismatch degrades instead of panicking.
-#[inline]
-pub fn ranked_direct_c_enabled() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("FLOCK_NO_OPEN_DIRECT_C").is_none())
-}
-
 /// Runs ring_switch over RS claims, observes packed-direct claim values +
 /// samples their gammas, then builds `b_combined` (the γ-weighted linear
 /// combination of all `rs_eq_ind`s and `eq_ind`s) and `target_combined`.
@@ -1113,74 +519,16 @@ fn compute_combined_basis_and_target<Ch: Challenger>(
     for (pd, g) in packed_direct.iter().zip(gammas_pd.iter()) {
         target_combined += *g * pd.value;
     }
-    // The ranked direct path takes claim 0's four-bank sufficient statistic
-    // unconditionally; when claim 1 (C) also carries one, `use_direct_all`
-    // takes it too and no claim is left on the basis sweep. Either opt-out
-    // restores the corresponding incumbent implementation.
-    let direct_common = enable_fold2
+    // The ranked direct path is deliberately AB-only: claim 0 supplies the
+    // four-bank sufficient statistic, while claim 1 (C) remains on the exact
+    // incumbent basis path. The opt-out restores the ordinary implementation.
+    let use_direct_ab = enable_fold2
         && l == (1usize << 25)
         && n_rs == 2
         && n_pd == 0
-        && std::env::var_os("FLOCK_NO_OPEN_DIRECT_AB").is_none();
-    let use_direct_fold8 = direct_common
-        && ranked_direct_fold8_enabled()
-        && direct_fold8_all_claim_mix_supported(&rs_results);
-    let use_direct_fold4 = !use_direct_fold8
-        && direct_common
-        && ranked_direct_fold4_enabled()
-        && direct_fold4_all_claim_mix_supported(&rs_results);
-    let use_direct_all = !use_direct_fold4
-        && direct_common
-        && ranked_direct_c_enabled()
-        && direct_all_claim_mix_supported(&rs_results);
-    let use_direct_ab =
-        direct_common && (use_direct_all || direct_ab_claim_mix_supported(&rs_results));
-    let direct_fold8 = if use_direct_fold8 {
-        Some(vec![
-            rs_results[0]
-                .1
-                .direct_fold8
-                .take()
-                .expect("direct-fold8 gate checked claim zero"),
-            rs_results[1]
-                .1
-                .direct_fold8
-                .take()
-                .expect("direct-fold8 gate checked claim one"),
-        ])
-    } else {
-        None
-    };
-    let direct_fold4 = if use_direct_fold4 {
-        Some(vec![
-            rs_results[0]
-                .1
-                .direct_fold4
-                .take()
-                .expect("direct-fold4 gate checked claim zero"),
-            rs_results[1]
-                .1
-                .direct_fold4
-                .take()
-                .expect("direct-fold4 gate checked claim one"),
-        ])
-    } else {
-        None
-    };
-    let mut direct_fold2 = if use_direct_all {
-        Some(vec![
-            rs_results[0]
-                .1
-                .direct_fold2
-                .take()
-                .expect("direct-all gate checked claim zero"),
-            rs_results[1]
-                .1
-                .direct_fold2
-                .take()
-                .expect("direct-all gate checked claim one"),
-        ])
-    } else if use_direct_ab {
+        && std::env::var_os("FLOCK_NO_OPEN_DIRECT_AB").is_none()
+        && direct_ab_claim_mix_supported(&rs_results);
+    let mut direct_fold2 = if use_direct_ab {
         Some(vec![
             rs_results[0]
                 .1
@@ -1191,35 +539,22 @@ fn compute_combined_basis_and_target<Ch: Challenger>(
     } else {
         None
     };
-    let direct_count = direct_fold8
-        .as_ref()
-        .map_or_else(
-            || {
-                direct_fold4
-                    .as_ref()
-                    .map_or_else(|| direct_fold2.as_ref().map_or(0, Vec::len), Vec::len)
-            },
-            Vec::len,
-        );
+    let direct_count = if direct_fold2.is_some() { 1 } else { 0 };
     // Deferred-C candidate: taken here, before `rs_baked`/`rs_deferred`
     // borrow `rs_results`; confirmed below once the ranked sweep shape is
-    // known (dropped — incumbent path — otherwise). Mutually exclusive with
-    // the completed path, which needs no sweep at all.
-    let mut deferred_c_candidate = if use_direct_ab
-        && !use_direct_all
-        && std::env::var_os("FLOCK_NO_OPEN_DEFERRED_C").is_none()
-    {
-        rs_results[1].1.deferred_c_fold2.take()
-    } else {
-        None
-    };
+    // known (dropped — incumbent path — otherwise).
+    let mut deferred_c_candidate =
+        if use_direct_ab && std::env::var_os("FLOCK_NO_OPEN_DEFERRED_C").is_none() {
+            rs_results[1].1.deferred_c_fold2.take()
+        } else {
+            None
+        };
 
     let rs_baked: Vec<&[F128]> = rs_results
         .iter()
         .enumerate()
         .filter_map(|(index, (_, output))| {
-            // Direct claims are always taken from the front (0, then 1).
-            if index < direct_count {
+            if use_direct_ab && index == 0 {
                 return None;
             }
             match &output.rs_eq_ind {
@@ -1236,8 +571,7 @@ fn compute_combined_basis_and_target<Ch: Challenger>(
         .iter()
         .enumerate()
         .filter_map(|(index, (_, output))| {
-            // Direct claims are always taken from the front (0, then 1).
-            if index < direct_count {
+            if use_direct_ab && index == 0 {
                 return None;
             }
             match &output.rs_eq_ind {
@@ -1302,26 +636,14 @@ fn compute_combined_basis_and_target<Ch: Challenger>(
     // ---- Build b_combined (γ-weighted sum of all rs_eq_ind + eq_ind) and the
     //      round-0 prime (u_0, u_2 over packed_witness · b_combined).
     let t_alloc = std::time::Instant::now();
-    let mut b_combined: Vec<F128> = if use_deferred_c || use_direct_all || use_direct_fold4 || use_direct_fold8 {
+    let mut b_combined: Vec<F128> = if use_deferred_c {
         Vec::new()
     } else {
         crate::scratch::take_f128(l)
     };
     let alloc_ms = t_alloc.elapsed().as_secs_f64() * 1e3;
     let t_fold = std::time::Instant::now();
-    let (mut round0_u0, mut round0_u2, round1_lookahead) = if use_direct_fold8 || use_direct_fold4 {
-        // All six (fold8) / four (fold4) initial messages come from the two
-        // claims' 64×64 / 16×16 product matrices below; no L-sized basis
-        // exists to sweep.
-        (F128::ZERO, F128::ZERO, Some([F128::ZERO; 6]))
-    } else if use_direct_all {
-        // Every claim's round-0 and round-1 contribution comes from its own
-        // `products` (added below, from `messages_from_direct_products`), so
-        // there is no basis to sweep: no L-sized allocation, no per-slot fold,
-        // no witness streaming pass. Seeding the lookahead with zeros — rather
-        // than `None` — is what keeps the accumulate below a plain add.
-        (F128::ZERO, F128::ZERO, Some([F128::ZERO; 6]))
-    } else if use_fast {
+    let (mut round0_u0, mut round0_u2, round1_lookahead) = if use_fast {
         let b = rs_deferred[0].0.len(); // eq_lo.len(); shared across claims (same split)
         debug_assert!(b >= 2 && b.is_multiple_of(2));
         debug_assert!(rs_deferred.iter().all(|d| d.0.len() == b));
@@ -1386,17 +708,12 @@ fn compute_combined_basis_and_target<Ch: Challenger>(
             }
             (u0, u2)
         };
-        let ranked_lookahead_neon = enable_fold2
-            && is_ranked_hetero_open_combine_shape(l, b, n_rs, n_pd);
         let fold_lookahead_block = |ctable: &mut Vec<F128>, hi: usize, out_block: &mut [F128]| {
             fill_block(ctable, hi, out_block);
             let base = hi * b;
             debug_assert!(b.is_multiple_of(4));
-            let ((u0, u2), lookahead) = round0_and_round1_lookahead_ranked(
-                &packed_witness[base..base + b],
-                out_block,
-                ranked_lookahead_neon,
-            );
+            let ((u0, u2), lookahead) =
+                round0_and_round1_lookahead(&packed_witness[base..base + b], out_block);
             (u0, u2, lookahead)
         };
         let init_ctable = || {
@@ -1510,47 +827,13 @@ fn compute_combined_basis_and_target<Ch: Challenger>(
         (prime.0, prime.1, None)
     };
     let mut round1_lookahead = round1_lookahead;
-    let mut round2_lookahead = None;
-    let mut round3_lookahead = None;
-    let mut round4_lookahead = None;
-    let mut round5_lookahead = None;
-    if let Some(direct) = direct_fold8.as_ref() {
-        let (direct_round0, direct_round1, direct_round2, direct_round3, direct_round4, direct_round5) =
-            messages_from_direct_products_fold8(direct);
-        round0_u0 += direct_round0.0;
-        round0_u2 += direct_round0.1;
-        let combined_round1 = round1_lookahead
-            .as_mut()
-            .expect("direct-fold8 gate requires round-1 lookahead storage");
-        for (out, value) in combined_round1.iter_mut().zip(direct_round1) {
-            *out += value;
-        }
-        round2_lookahead = Some(direct_round2);
-        round3_lookahead = Some(direct_round3);
-        round4_lookahead = Some(direct_round4);
-        round5_lookahead = Some(direct_round5);
-    }
-    if let Some(direct) = direct_fold4.as_ref() {
-        let (direct_round0, direct_round1, direct_round2, direct_round3) =
-            messages_from_direct_products_fold4(direct);
-        round0_u0 += direct_round0.0;
-        round0_u2 += direct_round0.1;
-        let combined_round1 = round1_lookahead
-            .as_mut()
-            .expect("direct-fold4 gate requires round-1 lookahead storage");
-        for (out, value) in combined_round1.iter_mut().zip(direct_round1) {
-            *out += value;
-        }
-        round2_lookahead = Some(direct_round2);
-        round3_lookahead = Some(direct_round3);
-    }
     if let Some(direct) = direct_fold2.as_ref() {
         let (direct_round0, direct_lookahead) = messages_from_direct_products(direct);
         round0_u0 += direct_round0.0;
         round0_u2 += direct_round0.1;
         let combined_lookahead = round1_lookahead
             .as_mut()
-            .expect("direct fold2 gate requires a round-1 lookahead");
+            .expect("direct AB gate requires ordinary C lookahead");
         for (out, value) in combined_lookahead.iter_mut().zip(direct_lookahead) {
             *out += value;
         }
@@ -1627,13 +910,7 @@ fn compute_combined_basis_and_target<Ch: Challenger>(
         target_combined,
         round0_prime: (round0_u0, round0_u2),
         round1_lookahead,
-        round2_lookahead,
-        round3_lookahead,
-        round4_lookahead,
-        round5_lookahead,
         direct_fold2,
-        direct_fold4,
-        direct_fold8,
     }
 }
 
@@ -1944,8 +1221,6 @@ mod tests {
                     },
                     sumcheck_claim: F128::ZERO,
                     direct_fold2: Some(direct()),
-                    direct_fold4: None,
-                    direct_fold8: None,
                     deferred_c_fold2: None,
                 },
             ),
@@ -1958,8 +1233,6 @@ mod tests {
                     },
                     sumcheck_claim: F128::ZERO,
                     direct_fold2: None,
-                    direct_fold4: None,
-                    direct_fold8: None,
                     deferred_c_fold2: None,
                 },
             ),
@@ -1981,8 +1254,6 @@ mod tests {
                     },
                     sumcheck_claim: F128::ZERO,
                     direct_fold2: Some(direct()),
-                    direct_fold4: None,
-                    direct_fold8: None,
                     deferred_c_fold2: None,
                 },
             ),
@@ -1996,8 +1267,6 @@ mod tests {
                     },
                     sumcheck_claim: F128::ZERO,
                     direct_fold2: None,
-                    direct_fold4: None,
-                    direct_fold8: None,
                     deferred_c_fold2: None,
                 },
             ),
@@ -2090,119 +1359,6 @@ mod tests {
             assert_eq!(evaluated, oracle1, "round one at log_n={log_n}");
         }
     }
-
-    #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
-    #[test]
-    fn ranked_open_lookahead_neon_matches_scalar() {
-        let mut rng = Rng::new(0x10CA_AEAD);
-        for log_n in [2usize, 5, 9, 15] {
-            let n = 1usize << log_n;
-            let witness: Vec<F128> = (0..n).map(|_| rng.f128()).collect();
-            let basis: Vec<F128> = (0..n).map(|_| rng.f128()).collect();
-            let expected = round0_and_round1_lookahead_scalar(&witness, &basis);
-            let actual = crate::field::f128_slice::round0_and_round1_lookahead(
-                &witness,
-                &basis,
-            );
-            assert_eq!(actual, expected, "deferred reduction at log_n={log_n}");
-        }
-    }
-
-    /// Oracle for the two rerouted direct-materializer block tails. Both
-    /// dispatchers must return exactly the bits their scalar predecessors
-    /// returned, at the block widths the fold4/fold8 materializers actually
-    /// use (2^13 and 2^11 slots) as well as at small widths.
-    ///
-    /// It also pins the semantic precondition of the fold8 reroute:
-    /// `round0_scalar` and the `(u_0, u_2)` half of the lookahead scan agree
-    /// bitwise, so swapping in a round-0-only deferred kernel cannot change
-    /// the transcript.
-    #[test]
-    fn fold_deferred_reduce_dispatchers_match_scalar() {
-        let mut rng = Rng::new(0xF01D_DEFD);
-        for log_n in [2usize, 5, 9, 11, 13] {
-            let n = 1usize << log_n;
-            let witness: Vec<F128> = (0..n).map(|_| rng.f128()).collect();
-            let basis: Vec<F128> = (0..n).map(|_| rng.f128()).collect();
-
-            let want_lookahead = round0_and_round1_lookahead_scalar(&witness, &basis);
-            assert_eq!(
-                round0_and_round1_lookahead_deferred(&witness, &basis),
-                want_lookahead,
-                "fold4 block tail at log_n={log_n}"
-            );
-
-            let want_round0 = round0_scalar(&witness, &basis);
-            assert_eq!(
-                want_round0, want_lookahead.0,
-                "round0_scalar must agree with the lookahead (u_0, u_2) at log_n={log_n}"
-            );
-            assert_eq!(
-                round0_deferred(&witness, &basis),
-                want_round0,
-                "fold8 block tail at log_n={log_n}"
-            );
-        }
-    }
-
-    #[test]
-    fn fold_deferred_reduce_gate_follows_env() {
-        assert_eq!(
-            use_fold_deferred_reduce(),
-            std::env::var_os("FLOCK_NO_FOLD_DEFERRED_REDUCE").is_none()
-        );
-    }
-
-    #[test]
-    fn ranked_open_lookahead_neon_gate_is_exact() {
-        let expected = cfg!(all(
-            target_os = "macos",
-            target_arch = "aarch64",
-            target_feature = "aes"
-        )) && std::env::var_os("FLOCK_NO_OPEN_LOOKAHEAD_NEON").is_none();
-        assert_eq!(use_ranked_open_lookahead_neon(true, 1usize << 15), expected);
-        assert!(!use_ranked_open_lookahead_neon(false, 1usize << 15));
-        assert!(!use_ranked_open_lookahead_neon(true, 1usize << 14));
-        assert!(!use_ranked_open_lookahead_neon(true, 1usize << 16));
-
-        assert!(is_ranked_direct_fold2_lookahead_shape(
-            1 << 25,
-            1 << 15,
-            1,
-            true,
-        ));
-        assert!(is_ranked_direct_fold2_lookahead_shape(
-            1 << 25,
-            1 << 15,
-            2,
-            false,
-        ));
-        assert!(!is_ranked_direct_fold2_lookahead_shape(
-            1 << 24,
-            1 << 15,
-            2,
-            false,
-        ));
-        assert!(!is_ranked_direct_fold2_lookahead_shape(
-            1 << 25,
-            1 << 14,
-            2,
-            false,
-        ));
-        assert!(!is_ranked_direct_fold2_lookahead_shape(
-            1 << 25,
-            1 << 15,
-            1,
-            false,
-        ));
-        assert!(!is_ranked_direct_fold2_lookahead_shape(
-            1 << 25,
-            1 << 15,
-            2,
-            true,
-        ));
-    }
-
     #[test]
     fn direct_products_reproduce_round0_and_lookahead() {
         let mut rng = Rng::new(0xD1CE_0002);

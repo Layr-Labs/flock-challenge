@@ -27,80 +27,14 @@ pub mod univariate_skip_deg4_optimized;
 pub mod univariate_skip_optimized;
 
 use multilinear::{
-    UniSkipFoldTable, eval_round3_lookahead, fold2_compact_and_round4_into,
-    fold2_compact_and_round45_into, fold2_plain_and_round6_into, fold2_plain_and_round67_into,
-    fold_and_compute_round_pair_into, fold_compact_and_compute_round_pair, fold_in_place_pair,
-    interpolate_at_z_combined, interpolate_at_z_on_lambda, round_pair_naive,
-    uni_skip_fold_and_round_pair_compact_padded_lookahead,
+    UniSkipFoldTable, fold_and_compute_round_pair_into, fold_compact_and_compute_round_pair,
+    fold_in_place_pair, interpolate_at_z_combined, interpolate_at_z_on_lambda, round_pair_naive,
     uni_skip_fold_and_round_pair_compact_padded_with_deltas,
 };
 use univariate_skip_optimized::{
     c_s_f128, medium_challenges_ghash, round1_shift_reduce_extract_c_packed_padded,
     small_challenges_ghash,
 };
-
-/// Test-only forced-off latch for the two-challenge lookahead. Production
-/// reads `FLOCK_NO_ZC_LOOKAHEAD`; the transcript-identity test flips this
-/// instead so it never has to mutate the process environment. Flipping it
-/// cannot make a concurrently running test wrong — both routes emit the same
-/// transcript, which is exactly what that test asserts.
-#[cfg(test)]
-pub(crate) static ZC_LOOKAHEAD_FORCED_OFF: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
-
-#[inline]
-fn lookahead_off() -> bool {
-    #[cfg(test)]
-    if ZC_LOOKAHEAD_FORCED_OFF.load(std::sync::atomic::Ordering::Relaxed) {
-        return true;
-    }
-    std::env::var_os("FLOCK_NO_ZC_LOOKAHEAD").is_some()
-}
-
-/// Test-only forced-off latch for the second-level cascade (rounds 5+6),
-/// mirroring [`ZC_LOOKAHEAD_FORCED_OFF`]: the transcript-identity test flips
-/// this instead of mutating the process environment. Flipping it cannot make
-/// a concurrently running test wrong — both routes emit the same transcript.
-#[cfg(test)]
-pub(crate) static ZC_CASCADE2_FORCED_OFF: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
-
-/// Kill switch for the cascaded rounds-5/6 lookahead: `FLOCK_NO_ZC_CASCADE2=1`
-/// (exact '1') restores the incumbent i=2/i=3 tail route within the same
-/// binary. Bit-identical either way — the cascade is a pure reassociation of
-/// exact F128 arithmetic, which is what the transcript-identity test asserts.
-#[inline]
-fn cascade2_off() -> bool {
-    #[cfg(test)]
-    if ZC_CASCADE2_FORCED_OFF.load(std::sync::atomic::Ordering::Relaxed) {
-        return true;
-    }
-    std::env::var_os("FLOCK_NO_ZC_CASCADE2").is_some_and(|v| v == *"1")
-}
-
-/// Test-only forced-off latch for the third-level cascade (rounds 7+8),
-/// mirroring [`ZC_CASCADE2_FORCED_OFF`]: the transcript-identity test flips
-/// this instead of mutating the process environment. Flipping it cannot make
-/// a concurrently running test wrong — both routes emit the same transcript.
-#[cfg(test)]
-pub(crate) static ZC_CASCADE3_FORCED_OFF: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
-
-/// Kill switch for the cascaded rounds-7/8 lookahead: `FLOCK_NO_ZC_CASCADE3=1`
-/// (exact '1') restores the cascade2 i=4/i=5 tail route within the same
-/// binary (and with cascade2 ALSO off, the incumbent route). OnceLock-latched:
-/// the environment is read once per process. Bit-identical either way — same
-/// pure-reassociation argument as the levels above, asserted by the cascade3
-/// transcript-identity test.
-#[inline]
-fn cascade3_off() -> bool {
-    #[cfg(test)]
-    if ZC_CASCADE3_FORCED_OFF.load(std::sync::atomic::Ordering::Relaxed) {
-        return true;
-    }
-    static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *OFF.get_or_init(|| std::env::var_os("FLOCK_NO_ZC_CASCADE3").is_some_and(|v| v == *"1"))
-}
 
 /// Number of variables folded in round 1 via the additive-NTT univariate skip.
 /// |Λ| = 2^K_SKIP = 64 elements; the round-1 prover message is two length-64
@@ -254,7 +188,7 @@ pub fn prove_packed_padded<C: Challenger>(
     challenger: &mut C,
 ) -> (ZerocheckProof, ZerocheckClaim) {
     let (proof, claim, _) = prove_packed_padded_inner(
-        a_packed, b_packed, c_packed, m, padding, false, None, None, challenger,
+        a_packed, b_packed, c_packed, m, padding, false, None, challenger,
     );
     (proof, claim)
 }
@@ -273,35 +207,15 @@ pub fn prove_packed_padded_capture_s_hat_v_c<C: Challenger>(
     m: usize,
     padding: &PaddingSpec,
     challenger: &mut C,
-) -> (ZerocheckProof, ZerocheckClaim, CapturedSHatVC) {
+) -> (ZerocheckProof, ZerocheckClaim, Vec<F128>) {
     let (proof, claim, captured) = prove_packed_padded_inner(
-        a_packed, b_packed, c_packed, m, padding, true, None, None, challenger,
+        a_packed, b_packed, c_packed, m, padding, true, None, challenger,
     );
     (
         proof,
         claim,
         captured.expect("capture=true must produce s_hat_v_c"),
     )
-}
-
-/// The c-claim opening statistics round 1 captures for free.
-///
-/// The incumbent pair comes out of the same eight α-free banks: `s_hat_v_c` is the canonical
-/// length-128 vector `fold_1b_rows` would produce, `quad` the length-512
-/// four-bank form that lets the PCS open take C's `products` directly instead
-/// of sweeping the combined basis. `collapse_s_hat_v_quad(quad, suffix[..2])`
-/// reproduces `s_hat_v_c` exactly, so shipping either keeps the transcript.
-/// The experimental `fold4` tensor has sixteen 128-element banks and likewise
-/// collapses under `suffix[..4]`; it is present only behind the shared strict
-/// DirectFold4 opt-in.
-pub struct CapturedSHatVC {
-    pub s_hat_v_c: Vec<F128>,
-    pub quad: Vec<F128>,
-    pub fold4: Option<Vec<F128>>,
-    /// Sixty-four-bank form for the direct-fold8 route; collapses under
-    /// `suffix[..6]` to `s_hat_v_c` exactly like `fold4` does under
-    /// `suffix[..4]`. Present only behind the shared DirectFold8 opt-in.
-    pub fold8: Option<Vec<F128>>,
 }
 
 /// Capture-`s_hat_v_c` prover that consumes a challenge-independent AB inner
@@ -316,7 +230,7 @@ pub fn prove_packed_padded_capture_s_hat_v_c_with_precomputed_ab<C: Challenger>(
     padding: &PaddingSpec,
     ab_inner: univariate_skip_optimized::Round1AbInner,
     challenger: &mut C,
-) -> (ZerocheckProof, ZerocheckClaim, CapturedSHatVC) {
+) -> (ZerocheckProof, ZerocheckClaim, Vec<F128>) {
     let (proof, claim, captured) = prove_packed_padded_inner(
         a_packed,
         b_packed,
@@ -325,42 +239,6 @@ pub fn prove_packed_padded_capture_s_hat_v_c_with_precomputed_ab<C: Challenger>(
         padding,
         true,
         Some(ab_inner),
-        None,
-        challenger,
-    );
-    (
-        proof,
-        claim,
-        captured.expect("capture=true must produce s_hat_v_c"),
-    )
-}
-
-/// Ranked identity-C specialization of
-/// [`prove_packed_padded_capture_s_hat_v_c_with_precomputed_ab`]. The extra
-/// buffer is the already-built lincheck stripe for C (= z); it lets round one
-/// derive the legacy C message and all RingSwitch captures after a single
-/// outer fold instead of draining the row-major witness into 32 field banks.
-/// The proof and transcript remain byte-identical to the ordinary Fold4 path.
-#[allow(clippy::too_many_arguments)]
-pub fn prove_packed_padded_capture_s_hat_v_c_with_precomputed_ab_and_lincheck_c<C: Challenger>(
-    a_packed: &[u8],
-    b_packed: &[u8],
-    c_packed: &[u8],
-    c_lincheck: &[u8],
-    m: usize,
-    padding: &PaddingSpec,
-    ab_inner: univariate_skip_optimized::Round1AbInner,
-    challenger: &mut C,
-) -> (ZerocheckProof, ZerocheckClaim, CapturedSHatVC) {
-    let (proof, claim, captured) = prove_packed_padded_inner(
-        a_packed,
-        b_packed,
-        c_packed,
-        m,
-        padding,
-        true,
-        Some(ab_inner),
-        Some(c_lincheck),
         challenger,
     );
     (
@@ -379,9 +257,8 @@ fn prove_packed_padded_inner<C: Challenger>(
     padding: &PaddingSpec,
     capture_s_hat_v_c: bool,
     precomputed_ab: Option<univariate_skip_optimized::Round1AbInner>,
-    c_lincheck: Option<&[u8]>,
     challenger: &mut C,
-) -> (ZerocheckProof, ZerocheckClaim, Option<CapturedSHatVC>) {
+) -> (ZerocheckProof, ZerocheckClaim, Option<Vec<F128>>) {
     let k_skip = K_SKIP;
     const N_INNER: usize = 7; // 3 small + 4 medium fixed-constant eq dims
     assert!(
@@ -435,150 +312,20 @@ fn prove_packed_padded_inner<C: Challenger>(
             capture_s_hat_v_c,
             "precomputed AB path currently requires s_hat_v capture"
         );
-        if let Some(c_lincheck) = c_lincheck {
-            assert!(m == 32 || cfg!(test), "lincheck C reuse is ranked-only");
-            assert_eq!(padding.k_log, 14, "lincheck C reuse fixes k_log=14");
-            assert!(
-                crate::pcs::ranked_direct_fold4_enabled() || cfg!(test),
-                "lincheck C reuse requires ranked DirectFold4"
-            );
-            // Submit the C fold's GPU prefix BEFORE the AB completion. The
-            // GPU is idle for the whole zerocheck window and round one has no
-            // Fiat-Shamir dependency inside it (r was sampled above, the
-            // transcript only advances after the round-one messages), so the
-            // prefix runs concurrently with the AB completion AND with the
-            // CPU's own share of the C fold.
-            let c_prelude =
-                crate::zerocheck::univariate_skip_optimized::round1_c_prelude(
-                    c_lincheck,
-                    m,
-                    padding.k_log,
-                    padding.useful_bits_per_block,
-                    &r,
-                );
-            let cpu_ab = crate::pcs::commit::commit_cpu_ms();
-            let t_ab = std::time::Instant::now();
-            let ab = crate::zerocheck::univariate_skip_optimized::round1_shift_reduce_ab_packed_padded_with_precomputed(
+        let (ab, c, s) =
+            crate::zerocheck::univariate_skip_optimized::round1_shift_reduce_extract_c_packed_padded_with_precomputed_ab(
                 ab_inner,
+                c_packed,
                 m,
                 k_skip,
                 &r,
+                inv_table,
                 padding,
             );
-            if zc_timing {
-                eprintln!(
-                    "[zc-timing] round1 AB completion: {:.2} ms cpu={:.1}",
-                    t_ab.elapsed().as_secs_f64() * 1e3,
-                    crate::pcs::commit::commit_cpu_ms() - cpu_ab,
-                );
-            }
-            let cpu_c = crate::pcs::commit::commit_cpu_ms();
-            let t_c = std::time::Instant::now();
-            if crate::pcs::ranked_direct_fold8_enabled() {
-                let (c, s_hat_v_c, quad, fold8) =
-                    crate::zerocheck::univariate_skip_optimized::round1_c_fold8_from_lincheck_stripe(
-                        c_lincheck,
-                        m,
-                        padding.k_log,
-                        k_skip,
-                        padding.useful_bits_per_block,
-                        &r,
-                        inv_table,
-                        c_prelude,
-                    );
-                if zc_timing {
-                    eprintln!(
-                        "[zc-timing] round1 lincheck-stripe C (fold8): {:.2} ms cpu={:.1}",
-                        t_c.elapsed().as_secs_f64() * 1e3,
-                        crate::pcs::commit::commit_cpu_ms() - cpu_c,
-                    );
-                }
-                (
-                    ab,
-                    c,
-                    Some(CapturedSHatVC {
-                        s_hat_v_c,
-                        quad,
-                        fold4: None,
-                        fold8: Some(fold8),
-                    }),
-                )
-            } else {
-                let (c, s_hat_v_c, quad, fold4) =
-                    crate::zerocheck::univariate_skip_optimized::round1_c_fold4_from_lincheck_stripe(
-                        c_lincheck,
-                        m,
-                        padding.k_log,
-                        k_skip,
-                        padding.useful_bits_per_block,
-                        &r,
-                        inv_table,
-                        c_prelude,
-                    );
-                if zc_timing {
-                    eprintln!(
-                        "[zc-timing] round1 lincheck-stripe C: {:.2} ms cpu={:.1}",
-                        t_c.elapsed().as_secs_f64() * 1e3,
-                        crate::pcs::commit::commit_cpu_ms() - cpu_c,
-                    );
-                }
-                (
-                    ab,
-                    c,
-                    Some(CapturedSHatVC {
-                        s_hat_v_c,
-                        quad,
-                        fold4: Some(fold4),
-                        fold8: None,
-                    }),
-                )
-            }
-        } else if m == 32 && crate::pcs::ranked_direct_fold4_enabled() {
-            let (ab, c, s_hat_v_c, quad, fold4) =
-                crate::zerocheck::univariate_skip_optimized::round1_shift_reduce_extract_c_packed_padded_with_precomputed_ab_fold4(
-                    ab_inner,
-                    c_packed,
-                    m,
-                    k_skip,
-                    &r,
-                    inv_table,
-                    padding,
-                );
-            (
-                ab,
-                c,
-                Some(CapturedSHatVC {
-                    s_hat_v_c,
-                    quad,
-                    fold4: Some(fold4),
-                    fold8: None,
-                }),
-            )
-        } else {
-            let (ab, c, s_hat_v_c, quad) =
-                crate::zerocheck::univariate_skip_optimized::round1_shift_reduce_extract_c_packed_padded_with_precomputed_ab(
-                    ab_inner,
-                    c_packed,
-                    m,
-                    k_skip,
-                    &r,
-                    inv_table,
-                    padding,
-                );
-            (
-                ab,
-                c,
-                Some(CapturedSHatVC {
-                    s_hat_v_c,
-                    quad,
-                    fold4: None,
-                    fold8: None,
-                }),
-            )
-        }
+        (ab, c, Some(s))
     } else if capture_s_hat_v_c {
-        let (ab, c, s_hat_v_c, quad) =
-            crate::zerocheck::univariate_skip_optimized::round1_shift_reduce_extract_c_packed_padded_with_s_hat_v_quad(
+        let (ab, c, s) =
+            crate::zerocheck::univariate_skip_optimized::round1_shift_reduce_extract_c_packed_padded_with_s_hat_v(
                 a_packed,
                 b_packed,
                 c_packed,
@@ -588,16 +335,7 @@ fn prove_packed_padded_inner<C: Challenger>(
                 inv_table,
                 padding,
             );
-        (
-            ab,
-            c,
-            Some(CapturedSHatVC {
-                s_hat_v_c,
-                quad,
-                fold4: None,
-                fold8: None,
-            }),
-        )
+        (ab, c, Some(s))
     } else {
         let (ab, c) = round1_shift_reduce_extract_c_packed_padded(
             a_packed, b_packed, c_packed, m, k_skip, &r, inv_table, padding,
@@ -644,45 +382,16 @@ fn prove_packed_padded_inner<C: Challenger>(
     let fold_table = UniSkipFoldTable::new(k_skip, z);
     let mut mlv_arg = vec![F128::ONE; n_mlv];
     mlv_arg[1..].copy_from_slice(&r[k_skip + 1..]);
-
-    // Two-challenge symbolic lookahead (variant K): round three's message is a
-    // quadratic in ρ₁, so its six coefficients ride along inside round two's
-    // existing memory stall and rounds 3+4 collapse into a single double-fold
-    // pass out of the compact state. Value-identical by construction — F128 is
-    // exact and the transcript order below is untouched — so the kill switch
-    // exists purely for same-binary A/B screening.
-    //
-    // `r[k_skip+1] = 0` (probability 2⁻¹²⁸) makes W1/W2 unrecoverable from the
-    // parity split; that case falls back to the incumbent route, which stays
-    // in the tree as the oracle anyway.
-    let use_lookahead =
-        (m == 32 || cfg!(test)) && n_mlv >= 6 && r[k_skip + 1] != F128::ZERO && !lookahead_off();
-
-    let (compact_mlv, msg_1, msg_inf, lookahead) = if use_lookahead {
-        let (compact, m1, mi, la) = uni_skip_fold_and_round_pair_compact_padded_lookahead(
-            a_packed,
-            b_packed,
-            m,
-            k_skip,
-            &fold_table,
-            &mlv_arg,
-            padding,
-            compact_deltas,
-        );
-        (compact, m1, mi, Some(la))
-    } else {
-        let (compact, m1, mi) = uni_skip_fold_and_round_pair_compact_padded_with_deltas(
-            a_packed,
-            b_packed,
-            m,
-            k_skip,
-            &fold_table,
-            &mlv_arg,
-            padding,
-            compact_deltas,
-        );
-        (compact, m1, mi, None)
-    };
+    let (compact_mlv, msg_1, msg_inf) = uni_skip_fold_and_round_pair_compact_padded_with_deltas(
+        a_packed,
+        b_packed,
+        m,
+        k_skip,
+        &fold_table,
+        &mlv_arg,
+        padding,
+        compact_deltas,
+    );
 
     if zc_timing {
         eprintln!(
@@ -714,246 +423,15 @@ fn prove_packed_padded_inner<C: Challenger>(
     // table removes the two field multiplications per output that the generic
     // pair fold would require, while materializing exactly the ordinary
     // post-fold tables expected by all subsequent rounds.
-    let tail_round_timing = std::env::var_os("FLOCK_ZC_TAIL_ROUND_TIMING").is_some();
-
-    // Cascade the lookahead one level deeper (rounds 5+6, see
-    // `fold2_compact_and_round45_into`): the K pass materializes each round-4
-    // output group in registers before its store — the same position round
-    // two was in before the round-3 promotion — so round five's message rides
-    // it as a deferred quadratic in the not-yet-sampled ρ₃, and rounds 5+6
-    // then collapse into one plain composed double-fold, deleting tail
-    // iterations i = 2 and i = 3 (their DRAM passes and their FS-serialized
-    // round boundaries). Same value-identity argument as the lookahead: pure
-    // reassociation of exact F128 arithmetic, transcript order untouched.
-    //
-    // `r[k_skip+3] = 0` would make W1'/W2' unrecoverable from the eq parity
-    // split (at the ranked shape that slot is the protocol constant β₀ ≠ 0;
-    // for a sampled slot it is probability 2⁻¹²⁸); that case falls back to
-    // the incumbent route, which stays in the tree as the oracle anyway.
-    // n_mlv ≥ 7 keeps every eq split at lo_size ≥ 2 and the composed input
-    // ≥ 32. Kill switch: FLOCK_NO_ZC_CASCADE2=1 (exact '1').
-    let use_cascade =
-        use_lookahead && n_mlv >= 7 && r[k_skip + 3] != F128::ZERO && !cascade2_off();
-
-    // Cascade one level deeper still (rounds 7+8, see
-    // `fold2_plain_and_round67_into`): the composed 5+6 pass materializes each
-    // output group in registers before its store — the same position the K
-    // pass was in before the round-5 promotion — so round seven's message
-    // rides it as a deferred quadratic in the not-yet-sampled ρ₅, and rounds
-    // 7+8 then collapse into one more plain composed double-fold, deleting
-    // tail iterations i = 4 and i = 5 (their DRAM passes and one of their
-    // FS-serialized round boundaries). Same value-identity argument again:
-    // pure reassociation of exact F128 arithmetic, transcript order untouched.
-    //
-    // `r[k_skip+5] = 0` would make W1''/W2'' unrecoverable from the eq parity
-    // split (at every shape with m ≥ 13 that slot is the protocol constant
-    // β₂ ≠ 0; for a sampled slot it is probability 2⁻¹²⁸); that case falls
-    // back to the cascade2 route, which stays in the tree as the oracle
-    // anyway. n_mlv ≥ 8 keeps the composed-7/8 input ≥ 16 (its own floor) and
-    // every eq split at lo_size ≥ 2. Kill switch: FLOCK_NO_ZC_CASCADE3=1
-    // (exact '1').
-    let use_cascade3 =
-        use_cascade && n_mlv >= 8 && r[k_skip + 5] != F128::ZERO && !cascade3_off();
-
-    // `loop_start` is the first tail iteration this route has not already
-    // produced. The loop body's `r_next[1..] = r[k_skip + i + 2..]` is already
-    // indexed by `i`, so starting at 2 (or 4) needs no other change.
-    let (mut a_mlv, mut b_mlv, loop_start) = if let Some(la) = lookahead {
-        // Round three: evaluate the deferred quadratic. No pass at all.
-        let (first_m1, first_mi) = eval_round3_lookahead(&la, mlv_rhos[0]);
-        multilinear_msgs.push((first_m1, first_mi));
-        challenger.observe_f128(first_m1);
-        challenger.observe_f128(first_mi);
-        mlv_rhos.push(challenger.sample_f128());
-
-        // Rounds three and four now fold together in one pass over the compact
-        // state, replacing the T3 reconstruction *and* tail iteration i = 1.
-        let t_k = std::time::Instant::now();
-        let n_groups = compact_mlv.len() / 2;
-        let mut r_next4 = vec![F128::ONE; n_mlv - 2];
-        r_next4[1..].copy_from_slice(&r[k_skip + 3..]);
-        // Unpinned: these become the loop-round arm's no-copy wrap targets
-        // next round, and the pinned slots already carry process-lifetime
-        // Metal views (see `fold_compact_and_compute_round_pair`).
-        let mut a_out = crate::scratch::take_f128_unpinned(n_groups);
-        let mut b_out = crate::scratch::take_f128_unpinned(n_groups);
-        if use_cascade {
-            let (m4_1, m4_inf, la5) = fold2_compact_and_round45_into(
-                &compact_mlv,
-                &fold_table,
-                mlv_rhos[0],
-                mlv_rhos[1],
-                &r_next4,
-                &mut a_out,
-                &mut b_out,
-            );
-            if tail_round_timing {
-                eprintln!(
-                    "[zc-tail-rounds] K double fold + round4 (cascade +W', out n={n_groups}): {:.2} ms",
-                    t_k.elapsed().as_secs_f64() * 1e3
-                );
-            }
-            compact_mlv.recycle();
-            multilinear_msgs.push((m4_1, m4_inf));
-            challenger.observe_f128(m4_1);
-            challenger.observe_f128(m4_inf);
-            mlv_rhos.push(challenger.sample_f128());
-
-            // Round five: evaluate the deferred quadratic at ρ₃. No pass.
-            let (m5_1, m5_inf) = eval_round3_lookahead(&la5, mlv_rhos[2]);
-            multilinear_msgs.push((m5_1, m5_inf));
-            challenger.observe_f128(m5_1);
-            challenger.observe_f128(m5_inf);
-            mlv_rhos.push(challenger.sample_f128());
-
-            // Rounds five and six now fold together in one plain composed
-            // pass (ρ₃ and ρ₄ at once), replacing tail iterations i = 2 and
-            // i = 3: their 512 MiB + 256 MiB reads and 256 MiB + 128 MiB
-            // writes become one 512 MiB read + 128 MiB write.
-            let t_c = std::time::Instant::now();
-            let quarter = n_groups / 4;
-            let mut r_next6 = vec![F128::ONE; n_mlv - 4];
-            r_next6[1..].copy_from_slice(&r[k_skip + 5..]);
-            // Unpinned for the same reason as the K outputs above.
-            let mut a2_out = crate::scratch::take_f128_unpinned(quarter);
-            let mut b2_out = crate::scratch::take_f128_unpinned(quarter);
-            if use_cascade3 {
-                // Level three: the composed 5+6 pass additionally carries the
-                // deferred round-seven quadratic — zero extra traversals.
-                let (m6_1, m6_inf, la7) = fold2_plain_and_round67_into(
-                    &a_out,
-                    &b_out,
-                    &mut a2_out,
-                    &mut b2_out,
-                    mlv_rhos[2],
-                    mlv_rhos[3],
-                    &r_next6,
-                );
-                if tail_round_timing {
-                    eprintln!(
-                        "[zc-tail-rounds] composed rounds 5+6 fold (cascade +W'', out n={quarter}): {:.2} ms",
-                        t_c.elapsed().as_secs_f64() * 1e3
-                    );
-                }
-                crate::scratch::give_f128(a_out);
-                crate::scratch::give_f128(b_out);
-                multilinear_msgs.push((m6_1, m6_inf));
-                challenger.observe_f128(m6_1);
-                challenger.observe_f128(m6_inf);
-                mlv_rhos.push(challenger.sample_f128());
-
-                // Round seven: evaluate the deferred quadratic at ρ₅. No pass.
-                let (m7_1, m7_inf) = eval_round3_lookahead(&la7, mlv_rhos[4]);
-                multilinear_msgs.push((m7_1, m7_inf));
-                challenger.observe_f128(m7_1);
-                challenger.observe_f128(m7_inf);
-                mlv_rhos.push(challenger.sample_f128());
-
-                // Rounds seven and eight fold together in one more plain
-                // composed pass (ρ₅ and ρ₆ at once), replacing tail
-                // iterations i = 4 and i = 5: their 128 MiB + 64 MiB reads
-                // and 64 MiB + 32 MiB writes become one 128 MiB read +
-                // 32 MiB write.
-                let t_c3 = std::time::Instant::now();
-                let sixteenth = n_groups / 16;
-                let mut r_next8 = vec![F128::ONE; n_mlv - 6];
-                r_next8[1..].copy_from_slice(&r[k_skip + 7..]);
-                // Unpinned for the same reason as the K outputs above.
-                let mut a3_out = crate::scratch::take_f128_unpinned(sixteenth);
-                let mut b3_out = crate::scratch::take_f128_unpinned(sixteenth);
-                let (m8_1, m8_inf) = fold2_plain_and_round6_into(
-                    &a2_out,
-                    &b2_out,
-                    &mut a3_out,
-                    &mut b3_out,
-                    mlv_rhos[4],
-                    mlv_rhos[5],
-                    &r_next8,
-                );
-                if tail_round_timing {
-                    eprintln!(
-                        "[zc-tail-rounds] composed rounds 7+8 fold (out n={sixteenth}): {:.2} ms",
-                        t_c3.elapsed().as_secs_f64() * 1e3
-                    );
-                }
-                crate::scratch::give_f128(a2_out);
-                crate::scratch::give_f128(b2_out);
-                multilinear_msgs.push((m8_1, m8_inf));
-                challenger.observe_f128(m8_1);
-                challenger.observe_f128(m8_inf);
-                mlv_rhos.push(challenger.sample_f128());
-                (a3_out, b3_out, 6usize)
-            } else {
-                let (m6_1, m6_inf) = fold2_plain_and_round6_into(
-                    &a_out,
-                    &b_out,
-                    &mut a2_out,
-                    &mut b2_out,
-                    mlv_rhos[2],
-                    mlv_rhos[3],
-                    &r_next6,
-                );
-                if tail_round_timing {
-                    eprintln!(
-                        "[zc-tail-rounds] composed rounds 5+6 fold (out n={quarter}): {:.2} ms",
-                        t_c.elapsed().as_secs_f64() * 1e3
-                    );
-                }
-                crate::scratch::give_f128(a_out);
-                crate::scratch::give_f128(b_out);
-                multilinear_msgs.push((m6_1, m6_inf));
-                challenger.observe_f128(m6_1);
-                challenger.observe_f128(m6_inf);
-                mlv_rhos.push(challenger.sample_f128());
-                (a2_out, b2_out, 4usize)
-            }
-        } else {
-            let (m4_1, m4_inf) = fold2_compact_and_round4_into(
-                &compact_mlv,
-                &fold_table,
-                mlv_rhos[0],
-                mlv_rhos[1],
-                &r_next4,
-                &mut a_out,
-                &mut b_out,
-            );
-            if tail_round_timing {
-                eprintln!(
-                    "[zc-tail-rounds] K double fold + round4 (out n={n_groups}): {:.2} ms",
-                    t_k.elapsed().as_secs_f64() * 1e3
-                );
-            }
-            compact_mlv.recycle();
-            multilinear_msgs.push((m4_1, m4_inf));
-            challenger.observe_f128(m4_1);
-            challenger.observe_f128(m4_inf);
-            mlv_rhos.push(challenger.sample_f128());
-            (a_out, b_out, 2usize)
-        }
-    } else {
-        let t_t3 = std::time::Instant::now();
-        let mut first_r_next = vec![F128::ONE; n_mlv - 1];
-        first_r_next[1..].copy_from_slice(&r[k_skip + 2..]);
-        let (a_mlv, b_mlv, first_m1, first_mi) = fold_compact_and_compute_round_pair(
-            &compact_mlv,
-            &fold_table,
-            mlv_rhos[0],
-            &first_r_next,
-        );
-        if tail_round_timing {
-            eprintln!(
-                "[zc-tail-rounds] T3 compact fold (out n={}): {:.2} ms",
-                a_mlv.len(),
-                t_t3.elapsed().as_secs_f64() * 1e3
-            );
-        }
-        compact_mlv.recycle();
-        multilinear_msgs.push((first_m1, first_mi));
-        challenger.observe_f128(first_m1);
-        challenger.observe_f128(first_mi);
-        mlv_rhos.push(challenger.sample_f128());
-        (a_mlv, b_mlv, 1usize)
-    };
+    let mut first_r_next = vec![F128::ONE; n_mlv - 1];
+    first_r_next[1..].copy_from_slice(&r[k_skip + 2..]);
+    let (mut a_mlv, mut b_mlv, first_m1, first_mi) =
+        fold_compact_and_compute_round_pair(&compact_mlv, &fold_table, mlv_rhos[0], &first_r_next);
+    compact_mlv.recycle();
+    multilinear_msgs.push((first_m1, first_mi));
+    challenger.observe_f128(first_m1);
+    challenger.observe_f128(first_mi);
+    mlv_rhos.push(challenger.sample_f128());
 
     // Ping-pong scratch buffers for the remaining fused path: each fused round folds
     // (a_mlv, b_mlv) of size N into size N/2. Rather than allocating — and,
@@ -971,12 +449,7 @@ fn prove_packed_padded_inner<C: Challenger>(
         (Vec::new(), Vec::new())
     };
 
-    // H2 engagement evidence: E-core chunks claimed across the loop rounds
-    // (T3's hetero drain is already behind us, so the delta is loop-only).
-    let hetero_trace = std::env::var_os("FLOCK_ZC_TAIL_HETERO_TRACE").is_some();
-    let hetero_claimed_before = crate::epool::helper_chunks_claimed();
-    for i in loop_start..(n_mlv - 1) {
-        let t_round_i = std::time::Instant::now();
+    for i in 1..(n_mlv - 1) {
         let rho_prev = mlv_rhos[i];
         let log_n_before = a_mlv.len().trailing_zeros() as usize;
 
@@ -1014,19 +487,6 @@ fn prove_packed_padded_inner<C: Challenger>(
         challenger.observe_f128(m1);
         challenger.observe_f128(mi);
         mlv_rhos.push(challenger.sample_f128());
-        if tail_round_timing {
-            eprintln!(
-                "[zc-tail-rounds] loop i={i} (log_n {log_n_before}): {:.2} ms",
-                t_round_i.elapsed().as_secs_f64() * 1e3
-            );
-        }
-    }
-
-    if hetero_trace {
-        eprintln!(
-            "[zc-tail] hetero loop rounds: {} chunks claimed by E-cores",
-            crate::epool::helper_chunks_claimed() - hetero_claimed_before
-        );
     }
 
     // ---- 8. Final binding at ρ_{n_mlv} (the last challenge) ----
@@ -1337,177 +797,6 @@ mod tests {
 
             assert_eq!(claim_p, claim_v, "claim mismatch at m={m}");
         }
-    }
-
-    /// End-to-end transcript gate for the ranked identity-C producer. The
-    /// alternate lincheck-stripe path must emit the exact legacy zerocheck
-    /// proof and claim, not merely an algebraically equivalent C opening.
-    #[test]
-    fn lincheck_stripe_c_proof_is_byte_identical() {
-        let pool = rayon::ThreadPoolBuilder::new()
-            .num_threads(2)
-            .stack_size(16 << 20)
-            .build()
-            .unwrap();
-        pool.install(lincheck_stripe_c_proof_is_byte_identical_inner);
-    }
-
-    fn lincheck_stripe_c_proof_is_byte_identical_inner() {
-        const M: usize = 17;
-        const K_LOG: usize = 14;
-        let padding = PaddingSpec {
-            k_log: K_LOG,
-            useful_bits_per_block: 1 << K_LOG,
-        };
-        let mut rng = Rng::new(0x1D_C5_7A1E);
-        let a = rng.bits(1 << M);
-        let b = rng.bits(1 << M);
-        let c: Vec<bool> = a.iter().zip(&b).map(|(x, y)| *x & *y).collect();
-        let (a_p, b_p, c_p) = pack_abc(&a, &b, &c);
-        let inv_table = InvNttTableByteSingleGf8::cached_standard_k6();
-
-        let old_ab = univariate_skip_optimized::precompute_round1_ab_inner_packed_padded(
-            &a_p, &b_p, M, K_SKIP, inv_table, &padding,
-        );
-        let mut old_ch = FsChallenger::new(b"flock-c-stripe-proof-v0");
-        let (old_proof, old_claim, old_capture) = prove_packed_padded_inner(
-            &a_p,
-            &b_p,
-            &c_p,
-            M,
-            &padding,
-            true,
-            Some(old_ab),
-            None,
-            &mut old_ch,
-        );
-
-        let c_words: Vec<F128> = c_p
-            .chunks_exact(16)
-            .map(|bytes| F128 {
-                lo: u64::from_le_bytes(bytes[..8].try_into().unwrap()),
-                hi: u64::from_le_bytes(bytes[8..].try_into().unwrap()),
-            })
-            .collect();
-        let c_lincheck = crate::lincheck::pack_z_lincheck_from_packed(&c_words, M, K_LOG);
-        let new_ab = univariate_skip_optimized::precompute_round1_ab_inner_packed_padded(
-            &a_p, &b_p, M, K_SKIP, inv_table, &padding,
-        );
-        let mut new_ch = FsChallenger::new(b"flock-c-stripe-proof-v0");
-        let (new_proof, new_claim, new_capture) = prove_packed_padded_inner(
-            &a_p,
-            &b_p,
-            &c_p,
-            M,
-            &padding,
-            true,
-            Some(new_ab),
-            Some(&c_lincheck),
-            &mut new_ch,
-        );
-
-        assert_eq!(new_proof, old_proof);
-        assert_eq!(new_claim, old_claim);
-        let old_capture = old_capture.expect("legacy C capture");
-        let new_capture = new_capture.expect("stripe C capture");
-        assert_eq!(new_capture.s_hat_v_c, old_capture.s_hat_v_c);
-        assert_eq!(new_capture.quad, old_capture.quad);
-
-        let mut verifier = FsChallenger::new(b"flock-c-stripe-proof-v0");
-        assert_eq!(verify(M, &new_proof, &mut verifier), Ok(new_claim));
-    }
-
-    /// Same transcript gate as above, at a shape large enough for the GPU
-    /// round-one C-fold arm to actually submit (`n_outer = 2^13` ⇒ 1024
-    /// stripes ⇒ 2 tile claims, so the GPU takes a prefix and the CPU the
-    /// suffix). The proof, claim and every RingSwitch capture must be
-    /// byte-identical to the pure-CPU 32-bank drain.
-    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-    #[test]
-    fn lincheck_stripe_c_proof_is_byte_identical_with_gpu_prefix() {
-        let pool = rayon::ThreadPoolBuilder::new()
-            .num_threads(2)
-            .stack_size(16 << 20)
-            .build()
-            .unwrap();
-        pool.install(|| {
-            const M: usize = 27;
-            const K_LOG: usize = 14;
-            let padding = PaddingSpec {
-                k_log: K_LOG,
-                useful_bits_per_block: (1 << K_LOG) - 975,
-            };
-            let mut rng = Rng::new(0x7A_C0_DE_51);
-            let a = rng.bits(1 << M);
-            let b = rng.bits(1 << M);
-            let mut c: Vec<bool> = a.iter().zip(&b).map(|(x, y)| *x & *y).collect();
-            // Honest padding: rows past `useful_bits` are zero in every block.
-            for (i, bit) in c.iter_mut().enumerate() {
-                if i % (1 << K_LOG) >= padding.useful_bits_per_block {
-                    *bit = false;
-                }
-            }
-            let a: Vec<bool> = a
-                .iter()
-                .enumerate()
-                .map(|(i, v)| *v && i % (1 << K_LOG) < padding.useful_bits_per_block)
-                .collect();
-            let b: Vec<bool> = b
-                .iter()
-                .enumerate()
-                .map(|(i, v)| *v && i % (1 << K_LOG) < padding.useful_bits_per_block)
-                .collect();
-            let c: Vec<bool> = a.iter().zip(&b).map(|(x, y)| *x & *y).collect();
-            let (a_p, b_p, c_p) = pack_abc(&a, &b, &c);
-            let inv_table = InvNttTableByteSingleGf8::cached_standard_k6();
-
-            let old_ab = univariate_skip_optimized::precompute_round1_ab_inner_packed_padded(
-                &a_p, &b_p, M, K_SKIP, inv_table, &padding,
-            );
-            let mut old_ch = FsChallenger::new(b"flock-c-stripe-gpu-v0");
-            let (old_proof, old_claim, old_capture) = prove_packed_padded_inner(
-                &a_p, &b_p, &c_p, M, &padding, true, Some(old_ab), None, &mut old_ch,
-            );
-
-            let c_words: Vec<F128> = c_p
-                .chunks_exact(16)
-                .map(|bytes| F128 {
-                    lo: u64::from_le_bytes(bytes[..8].try_into().unwrap()),
-                    hi: u64::from_le_bytes(bytes[8..].try_into().unwrap()),
-                })
-                .collect();
-            let c_lincheck = crate::lincheck::pack_z_lincheck_from_packed(&c_words, M, K_LOG);
-            let new_ab = univariate_skip_optimized::precompute_round1_ab_inner_packed_padded(
-                &a_p, &b_p, M, K_SKIP, inv_table, &padding,
-            );
-            let submits_before = crate::gpu_commit::zerocheck_gpu_submits();
-            let mut new_ch = FsChallenger::new(b"flock-c-stripe-gpu-v0");
-            let (new_proof, new_claim, new_capture) = prove_packed_padded_inner(
-                &a_p,
-                &b_p,
-                &c_p,
-                M,
-                &padding,
-                true,
-                Some(new_ab),
-                Some(&c_lincheck),
-                &mut new_ch,
-            );
-            assert!(
-                crate::gpu_commit::zerocheck_gpu_submits() > submits_before,
-                "GPU round-one C prefix never submitted — the oracle proved nothing"
-            );
-
-            assert_eq!(new_proof, old_proof);
-            assert_eq!(new_claim, old_claim);
-            let old_capture = old_capture.expect("legacy C capture");
-            let new_capture = new_capture.expect("stripe C capture");
-            assert_eq!(new_capture.s_hat_v_c, old_capture.s_hat_v_c);
-            assert_eq!(new_capture.quad, old_capture.quad);
-
-            let mut verifier = FsChallenger::new(b"flock-c-stripe-gpu-v0");
-            assert_eq!(verify(M, &new_proof, &mut verifier), Ok(new_claim));
-        });
     }
 
     /// **Verify rejects byte-mutated proofs.** Walk each component of the
@@ -1857,128 +1146,5 @@ mod tests {
         assert_eq!(proof1.final_c_eval, proof2.final_c_eval);
         assert_eq!(claim1.z, claim2.z);
         assert_eq!(claim1.mlv_challenges, claim2.mlv_challenges);
-    }
-
-    /// T5 — the only test that proves *transcript* identity rather than
-    /// message identity: prove twice from the same witness with the
-    /// two-challenge lookahead engaged and disabled, and compare the complete
-    /// `ZerocheckProof` plus the claim's challenge vector.
-    #[test]
-    fn prove_transcript_identical_with_and_without_lookahead() {
-        use std::sync::atomic::Ordering;
-        for m in [13usize, 14, 16] {
-            let mut rng = Rng::new(0x5EED ^ m as u64);
-            let a = rng.bits(1 << m);
-            let b = rng.bits(1 << m);
-            let c: Vec<bool> = a.iter().zip(&b).map(|(x, y)| *x & *y).collect();
-            let (a_p, b_p, c_p) = pack_abc(&a, &b, &c);
-
-            ZC_LOOKAHEAD_FORCED_OFF.store(false, Ordering::Relaxed);
-            let mut ch_on = FsChallenger::new(b"flock-test-v0");
-            let (proof_on, claim_on) = prove_packed(&a_p, &b_p, &c_p, m, &mut ch_on);
-
-            ZC_LOOKAHEAD_FORCED_OFF.store(true, Ordering::Relaxed);
-            let mut ch_off = FsChallenger::new(b"flock-test-v0");
-            let (proof_off, claim_off) = prove_packed(&a_p, &b_p, &c_p, m, &mut ch_off);
-            ZC_LOOKAHEAD_FORCED_OFF.store(false, Ordering::Relaxed);
-
-            assert_eq!(proof_on.round1_ab, proof_off.round1_ab, "round1_ab m={m}");
-            assert_eq!(proof_on.round1_c, proof_off.round1_c, "round1_c m={m}");
-            assert_eq!(
-                proof_on.multilinear_rounds, proof_off.multilinear_rounds,
-                "multilinear_rounds m={m}"
-            );
-            assert_eq!(proof_on.final_a_eval, proof_off.final_a_eval, "a_eval m={m}");
-            assert_eq!(proof_on.final_b_eval, proof_off.final_b_eval, "b_eval m={m}");
-            assert_eq!(proof_on.final_c_eval, proof_off.final_c_eval, "c_eval m={m}");
-            assert_eq!(claim_on.z, claim_off.z, "z m={m}");
-            assert_eq!(
-                claim_on.mlv_challenges, claim_off.mlv_challenges,
-                "mlv_challenges m={m}"
-            );
-        }
-    }
-
-    /// C-T5 — transcript identity for the second-level cascade (rounds 5+6):
-    /// prove twice from the same witness with the cascade engaged and
-    /// disabled (the round-3 lookahead stays on in both — the cascade's
-    /// fallback IS the incumbent lookahead route), and compare the complete
-    /// `ZerocheckProof` plus the claim's challenge vector.
-    #[test]
-    fn prove_transcript_identical_with_and_without_cascade2() {
-        use std::sync::atomic::Ordering;
-        for m in [13usize, 14, 16] {
-            let mut rng = Rng::new(0xCA5C ^ m as u64);
-            let a = rng.bits(1 << m);
-            let b = rng.bits(1 << m);
-            let c: Vec<bool> = a.iter().zip(&b).map(|(x, y)| *x & *y).collect();
-            let (a_p, b_p, c_p) = pack_abc(&a, &b, &c);
-
-            ZC_CASCADE2_FORCED_OFF.store(false, Ordering::Relaxed);
-            let mut ch_on = FsChallenger::new(b"flock-test-v0");
-            let (proof_on, claim_on) = prove_packed(&a_p, &b_p, &c_p, m, &mut ch_on);
-
-            ZC_CASCADE2_FORCED_OFF.store(true, Ordering::Relaxed);
-            let mut ch_off = FsChallenger::new(b"flock-test-v0");
-            let (proof_off, claim_off) = prove_packed(&a_p, &b_p, &c_p, m, &mut ch_off);
-            ZC_CASCADE2_FORCED_OFF.store(false, Ordering::Relaxed);
-
-            assert_eq!(proof_on.round1_ab, proof_off.round1_ab, "round1_ab m={m}");
-            assert_eq!(proof_on.round1_c, proof_off.round1_c, "round1_c m={m}");
-            assert_eq!(
-                proof_on.multilinear_rounds, proof_off.multilinear_rounds,
-                "multilinear_rounds m={m}"
-            );
-            assert_eq!(proof_on.final_a_eval, proof_off.final_a_eval, "a_eval m={m}");
-            assert_eq!(proof_on.final_b_eval, proof_off.final_b_eval, "b_eval m={m}");
-            assert_eq!(proof_on.final_c_eval, proof_off.final_c_eval, "c_eval m={m}");
-            assert_eq!(claim_on.z, claim_off.z, "z m={m}");
-            assert_eq!(
-                claim_on.mlv_challenges, claim_off.mlv_challenges,
-                "mlv_challenges m={m}"
-            );
-        }
-    }
-
-    /// C3-T5 — transcript identity for the third-level cascade (rounds 7+8):
-    /// prove twice from the same witness with cascade3 engaged and disabled
-    /// (the lookahead and cascade2 stay on in both — cascade3's fallback IS
-    /// the cascade2 route), and compare the complete `ZerocheckProof` plus
-    /// the claim's challenge vector. m=13 (n_mlv=7) sits below cascade3's
-    /// n_mlv ≥ 8 floor, so it also exercises the disengaged boundary.
-    #[test]
-    fn prove_transcript_identical_with_and_without_cascade3() {
-        use std::sync::atomic::Ordering;
-        for m in [13usize, 14, 16] {
-            let mut rng = Rng::new(0xCA53 ^ m as u64);
-            let a = rng.bits(1 << m);
-            let b = rng.bits(1 << m);
-            let c: Vec<bool> = a.iter().zip(&b).map(|(x, y)| *x & *y).collect();
-            let (a_p, b_p, c_p) = pack_abc(&a, &b, &c);
-
-            ZC_CASCADE3_FORCED_OFF.store(false, Ordering::Relaxed);
-            let mut ch_on = FsChallenger::new(b"flock-test-v0");
-            let (proof_on, claim_on) = prove_packed(&a_p, &b_p, &c_p, m, &mut ch_on);
-
-            ZC_CASCADE3_FORCED_OFF.store(true, Ordering::Relaxed);
-            let mut ch_off = FsChallenger::new(b"flock-test-v0");
-            let (proof_off, claim_off) = prove_packed(&a_p, &b_p, &c_p, m, &mut ch_off);
-            ZC_CASCADE3_FORCED_OFF.store(false, Ordering::Relaxed);
-
-            assert_eq!(proof_on.round1_ab, proof_off.round1_ab, "round1_ab m={m}");
-            assert_eq!(proof_on.round1_c, proof_off.round1_c, "round1_c m={m}");
-            assert_eq!(
-                proof_on.multilinear_rounds, proof_off.multilinear_rounds,
-                "multilinear_rounds m={m}"
-            );
-            assert_eq!(proof_on.final_a_eval, proof_off.final_a_eval, "a_eval m={m}");
-            assert_eq!(proof_on.final_b_eval, proof_off.final_b_eval, "b_eval m={m}");
-            assert_eq!(proof_on.final_c_eval, proof_off.final_c_eval, "c_eval m={m}");
-            assert_eq!(claim_on.z, claim_off.z, "z m={m}");
-            assert_eq!(
-                claim_on.mlv_challenges, claim_off.mlv_challenges,
-                "mlv_challenges m={m}"
-            );
-        }
     }
 }
