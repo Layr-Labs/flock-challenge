@@ -601,25 +601,6 @@ fn ab_pre_nt_enabled() -> bool {
     *ON.get_or_init(|| std::env::var_os(ENV_NO_ZC_AB_PRE_NT).is_none())
 }
 
-/// Kill switch for the QS3 compacted AB-precompute store. Default ON: the
-/// dead tail rows `[n_b_med, 16)` of each `x_outer` chunk are left untouched
-/// instead of being zero-filled, because no `ab_inner` consumer ever reads
-/// them (see the drop of the tail loop in
-/// [`precompute_round1_ab_inner_packed_padded_with_flavor`]). Set exactly
-/// `FLOCK_NO_AB_COMPACT_STORE=1` to restore the incumbent zero-fill as a
-/// same-binary A/B control; any other value (or unset) keeps the compacted
-/// path. The live region is byte-identical either way, so the proof bytes are
-/// unchanged — the switch exists purely for screening the memory-traffic win.
-pub const ENV_NO_AB_COMPACT_STORE: &str = "FLOCK_NO_AB_COMPACT_STORE";
-
-fn ab_compact_store_enabled() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| {
-        std::env::var_os(ENV_NO_AB_COMPACT_STORE).as_deref()
-            != Some(std::ffi::OsStr::new("1"))
-    })
-}
-
 /// Non-temporal 64-byte store (L1 stack bounce → `stnp` pair burst), the same
 /// best-effort cache-bypass idiom as the witness stripe drain. The precompute
 /// output is a 512 MiB write-once surface whose consumer runs tens of
@@ -671,14 +652,11 @@ pub fn precompute_round1_ab_inner_packed_padded(
         inv_table,
         padding,
         ab_pre_nt_enabled(),
-        ab_compact_store_enabled(),
     )
 }
 
 /// Store-flavor-parameterized body; the public wrapper passes the latched env
-/// choices, tests compare arms byte-for-byte in one process. `nt` selects the
-/// non-temporal drain vs the incumbent cached store; `compact` selects the
-/// QS3 tail-skip vs the incumbent zero-fill of the dead skipped-`b_med` rows.
+/// choice, tests compare both arms byte-for-byte in one process.
 fn precompute_round1_ab_inner_packed_padded_with_flavor(
     a_packed: &[u8],
     b_packed: &[u8],
@@ -687,7 +665,6 @@ fn precompute_round1_ab_inner_packed_padded_with_flavor(
     inv_table: &InvNttTableByteSingleGf8,
     padding: &PaddingSpec,
     nt: bool,
-    compact: bool,
 ) -> Round1AbInner {
     use rayon::prelude::*;
 
@@ -715,15 +692,8 @@ fn precompute_round1_ab_inner_packed_padded_with_flavor(
     debug_assert_eq!(OUTER_BYTES, (1 << N_INNER) * N_CHUNKS);
 
     // Reuse an A-sized resident F128 allocation from the prover scratch pool.
-    // Treating it as bytes is valid under the read contract every consumer
-    // honors: each LIVE byte — rows `[0, n_b_med)` of every `x_outer` chunk —
-    // is written below before it is read. With the QS3 compacted store the
-    // dead tail rows `[n_b_med, 16)` are left recycled/uninitialized; this is
-    // sound because NO consumer ever reads them (all bound their per-`b_med`
-    // reads by the same `n_b_med`, derived from the same `padding`), and round
-    // two rewrites the whole donated buffer before use. The kill switch
-    // `FLOCK_NO_AB_COMPACT_STORE=1` restores the historical invariant "every
-    // byte written below (explicit zero fills for the skipped-b_med holes)".
+    // Treating it as bytes is valid because every byte is written below before
+    // the storage is read (including explicit zero writes for padding holes).
     let mut storage = crate::scratch::take_f128(total_bytes / core::mem::size_of::<F128>());
     let out_bytes: &mut [u8] =
         unsafe { core::slice::from_raw_parts_mut(storage.as_mut_ptr() as *mut u8, total_bytes) };
@@ -787,37 +757,16 @@ fn precompute_round1_ab_inner_packed_padded_with_flavor(
                         };
                     }
                 }
-                // QS3 compacted store. The tail rows `[n_b_med, 16)` of this
-                // chunk are dead: every `ab_inner` consumer iterates exactly
-                // `0..n_b_med` — the AB completion (`accumulate_convert_ab`),
-                // the fused/split `accumulate_convert_with_s_hat_v` AB half,
-                // and the Fold4 AB arm all bound their per-`b_med` reads by the
-                // same `n_b_med`; C reads the packed witness, not `ab_inner`;
-                // and round two overwrites the whole donated buffer
-                // (`into_scratch_bytes` → compact `deltas`) before reading it.
-                // So zeroing the tail is pure write traffic. At the ranked
-                // BLAKE3 shape (k_log=14, useful=15_409) window 1 has
-                // `n_b_med = 15`, i.e. one dead 64-byte row per window-1 chunk:
-                // 2^18 chunks × 64 B = 16 MiB, ~3% of the 512 MiB precompute
-                // write surface. The AB precompute runs concurrently with the
-                // streamed GPU commit, which saturates the same memory system,
-                // so dropping these stores pays as CONTENTION RELIEF on the
-                // commit arm rather than on the precompute's own wall (which
-                // already finishes ~24 ms early). The kill switch restores the
-                // incumbent zero-fill for a same-binary A/B; both leave the
-                // live region byte-identical, so the proof is unchanged.
-                if !compact {
-                    if nt {
-                        let tail = &mut out_outer[n_b_med * 64..];
-                        debug_assert_eq!(tail.len() % 64, 0);
-                        let zero = [0u8; 64];
-                        for i in 0..tail.len() / 64 {
-                            // SAFETY: chunk `i` is 64 in-bounds bytes of `tail`.
-                            unsafe { store_nt_64(zero.as_ptr(), tail.as_mut_ptr().add(i * 64)) };
-                        }
-                    } else {
-                        out_outer[n_b_med * 64..].fill(0);
+                if nt {
+                    let tail = &mut out_outer[n_b_med * 64..];
+                    debug_assert_eq!(tail.len() % 64, 0);
+                    let zero = [0u8; 64];
+                    for i in 0..tail.len() / 64 {
+                        // SAFETY: chunk `i` is 64 in-bounds bytes of `tail`.
+                        unsafe { store_nt_64(zero.as_ptr(), tail.as_mut_ptr().add(i * 64)) };
                     }
+                } else {
+                    out_outer[n_b_med * 64..].fill(0);
                 }
             },
         );
@@ -1530,14 +1479,6 @@ pub(crate) fn round1_shift_reduce_ab_packed_padded_with_precomputed(
 /// whole zerocheck window, so starting the C fold's GPU prefix first lets it
 /// cover the AB completion as well as the CPU's own share of the fold.
 pub(crate) struct Round1CPrelude {
-    /// eq(r_outer, ·) — owned, or built in place in the GPU fold arm's
-    /// persistent upload buffer so the launch skips its 4 MiB memcpy (see
-    /// `gpu_commit::zc_fold_eq_table`; `FLOCK_NO_EQ_DIRECT=1` restores the
-    /// owned build). Same bytes either way; every CPU consumer reads it
-    /// through `as_slice`.
-    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-    eq_outer: crate::gpu_commit::FoldEqTable,
-    #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
     eq_outer: Vec<F128>,
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     gpu: Option<crate::gpu_commit::ZcFoldJob>,
@@ -1563,15 +1504,9 @@ pub(crate) fn round1_c_prelude(
     useful_bits: usize,
     r: &[F128],
 ) -> Round1CPrelude {
+    let eq_outer = crate::lincheck::build_eq_table(&r[k_log..]);
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     {
-        // Off the arm's shape no launch will consume a staged table, so keep
-        // the incumbent owned build there (same gate as the launch below).
-        let eq_outer = if ranked_c_fold_shape(m, k_log) {
-            crate::gpu_commit::zc_fold_eq_table(&r[k_log..])
-        } else {
-            crate::gpu_commit::FoldEqTable::Owned(crate::lincheck::build_eq_table(&r[k_log..]))
-        };
         let gpu = ranked_c_fold_shape(m, k_log)
             .then(|| {
                 crate::gpu_commit::launch_zerocheck_c_fold(
@@ -1579,7 +1514,7 @@ pub(crate) fn round1_c_prelude(
                     m,
                     k_log,
                     useful_bits,
-                    eq_outer.as_slice(),
+                    &eq_outer,
                 )
             })
             .flatten();
@@ -1592,9 +1527,7 @@ pub(crate) fn round1_c_prelude(
     #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
     {
         let _ = (c_lincheck, m, k_log, useful_bits);
-        Round1CPrelude {
-            eq_outer: crate::lincheck::build_eq_table(&r[k_log..]),
-        }
+        Round1CPrelude { eq_outer }
     }
 }
 
@@ -1624,7 +1557,7 @@ fn round1_c_inner_fold(
             m,
             k_log,
             useful_bits,
-            eq_outer.as_slice(),
+            &eq_outer,
             claim_lo,
         );
         let suffix_ms = t_suffix.elapsed().as_secs_f64() * 1e3;
@@ -1637,13 +1570,7 @@ fn round1_c_inner_fold(
                     eprintln!("[gpu-zc] prefix failed, CPU redo: {e}");
                 }
                 let prefix = crate::lincheck::partial_fold_packed_z_neon_oblock_padded_range(
-                    c_lincheck,
-                    m,
-                    k_log,
-                    useful_bits,
-                    eq_outer.as_slice(),
-                    0,
-                    claim_lo,
+                    c_lincheck, m, k_log, useful_bits, &eq_outer, 0, claim_lo,
                 );
                 for (a, b) in out.iter_mut().zip(prefix) {
                     *a += b;
@@ -1652,7 +1579,7 @@ fn round1_c_inner_fold(
             }
         }
     }
-    crate::lincheck::partial_fold_packed_z_best(c_lincheck, m, k_log, useful_bits, eq_outer.as_slice())
+    crate::lincheck::partial_fold_packed_z_best(c_lincheck, m, k_log, useful_bits, &eq_outer)
 }
 
 #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
@@ -3334,14 +3261,11 @@ mod tests {
             };
             let (a_p, b_p) = (pack_bits(&a), pack_bits(&b));
             let table = make_inv_table();
-            // Store-flavor equivalence is orthogonal to the QS3 tail skip; run
-            // both flavors with `compact = false` so the dead tail is zeroed
-            // deterministically and the full-buffer comparison stays valid.
             let plain = precompute_round1_ab_inner_packed_padded_with_flavor(
-                &a_p, &b_p, m, K_SKIP, &table, &padding, false, false,
+                &a_p, &b_p, m, K_SKIP, &table, &padding, false,
             );
             let nt = precompute_round1_ab_inner_packed_padded_with_flavor(
-                &a_p, &b_p, m, K_SKIP, &table, &padding, true, false,
+                &a_p, &b_p, m, K_SKIP, &table, &padding, true,
             );
             assert_eq!(
                 plain.as_bytes(),
@@ -3349,71 +3273,6 @@ mod tests {
                 "store flavor changed bytes at m={m}, padded={}",
                 padded.is_some()
             );
-        }
-    }
-
-    /// QS3 compacted store: skipping the dead skipped-`b_med` tail rows must
-    /// leave every LIVE byte (rows `[0, n_b_med)` of each `x_outer` chunk)
-    /// byte-identical to the incumbent zero-filled buffer. Only the tail
-    /// bytes — which no consumer ever reads — may differ. Covers the dense
-    /// and BLAKE3-padded shapes, both store flavors.
-    #[test]
-    fn ab_precompute_compact_store_preserves_live_region() {
-        use crate::zerocheck::univariate_skip::pack_bits;
-        const OUTER_BYTES: usize = (1 << N_MEDIUM) * 64;
-        let cases: [(usize, Option<(usize, usize)>); 3] = [
-            (13, None),
-            (14, Some((14, 15_409))), // BLAKE3 block shape
-            (17, Some((14, 15_409))),
-        ];
-        for (m, padded) in cases {
-            let mut rng = Rng::new(0xC0_9AC7_00u64 ^ (m as u64));
-            let total_bits = 1usize << m;
-            let mut a = rng.bits(total_bits);
-            let mut b = rng.bits(total_bits);
-            let padding = match padded {
-                None => PaddingSpec::dense(m),
-                Some((k_log, useful_bits)) => {
-                    let block_size = 1usize << k_log;
-                    for blk in 0..(total_bits / block_size) {
-                        for j in useful_bits..block_size {
-                            let idx = blk * block_size + j;
-                            a[idx] = false;
-                            b[idx] = false;
-                        }
-                    }
-                    PaddingSpec {
-                        k_log,
-                        useful_bits_per_block: useful_bits,
-                    }
-                }
-            };
-            let (a_p, b_p) = (pack_bits(&a), pack_bits(&b));
-            let table = make_inv_table();
-            let (within_outer_mask, b_med_counts) = build_b_med_counts(&padding);
-            for nt in [false, true] {
-                let filled = precompute_round1_ab_inner_packed_padded_with_flavor(
-                    &a_p, &b_p, m, K_SKIP, &table, &padding, nt, false,
-                );
-                let compact = precompute_round1_ab_inner_packed_padded_with_flavor(
-                    &a_p, &b_p, m, K_SKIP, &table, &padding, nt, true,
-                );
-                let filled = filled.as_bytes();
-                let compact = compact.as_bytes();
-                assert_eq!(filled.len(), compact.len());
-                let n_outer = filled.len() / OUTER_BYTES;
-                for x_outer in 0..n_outer {
-                    let n_b_med = b_med_counts[x_outer & within_outer_mask] as usize;
-                    let base = x_outer * OUTER_BYTES;
-                    let live = n_b_med * 64;
-                    assert_eq!(
-                        filled[base..base + live],
-                        compact[base..base + live],
-                        "compacted store changed a live byte at m={m}, nt={nt}, \
-                         x_outer={x_outer}, n_b_med={n_b_med}"
-                    );
-                }
-            }
         }
     }
 
@@ -3444,18 +3303,17 @@ mod tests {
         drop(a);
         drop(b);
         let table = make_inv_table();
-        // Warmup one of each, then interleave measured reps. `compact = true`
-        // exercises the shipped QS3 path (dead tail rows never stored).
+        // Warmup one of each, then interleave measured reps.
         for nt in [false, true] {
             let _ = precompute_round1_ab_inner_packed_padded_with_flavor(
-                &a_p, &b_p, m, K_SKIP, &table, &padding, nt, true,
+                &a_p, &b_p, m, K_SKIP, &table, &padding, nt,
             );
         }
         for rep in 0..4 {
             for nt in [rep % 2 == 1, rep % 2 == 0] {
                 let t0 = std::time::Instant::now();
                 let out = precompute_round1_ab_inner_packed_padded_with_flavor(
-                    &a_p, &b_p, m, K_SKIP, &table, &padding, nt, true,
+                    &a_p, &b_p, m, K_SKIP, &table, &padding, nt,
                 );
                 let ms = t0.elapsed().as_secs_f64() * 1e3;
                 println!("rep={rep} nt={nt}: {ms:.2} ms");

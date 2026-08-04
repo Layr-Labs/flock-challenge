@@ -462,49 +462,16 @@ fn prove_fast_ligerito_from_witness_with_commit_codeword<Ch: Challenger>(
     let phase_timing = std::env::var_os("FLOCK_PHASE_TIMING").is_some();
     let cpu_open0 = phase_timing.then(process_cpu_ms);
     let t_open = std::time::Instant::now();
-    // Publish-prefix pre-encode: `commitment` / `zc_proof` / `lc_proof` are
-    // transcript-final here — the open below only produces `pcs_open` — so
-    // the publish-tail's 450 kB output allocation and ~4.3 kB prefix encode
-    // run on one idle E-core (UTILITY QoS) while the ~19 ms open owns the
-    // P-cores + GPU. `in_place_scope` keeps the open itself on this thread
-    // unchanged; its end-of-scope join is free because the spawned task
-    // finishes orders of magnitude before the open does. Worst-case
-    // contention is one E-core busy for tens of µs if an epool broadcast
-    // lands in that window — queue semantics (and therefore bytes) are
-    // unaffected. A deliberately single-threaded main pool spawns nothing,
-    // preserving truly serial execution (same contract as epool's hetero
-    // queue); publish then takes the incumbent full-encode path, as it does
-    // on hosts without a helper pool or under FLOCK_NO_PRE_ENCODE=1.
-    let stash_pool = (crate::proof_io::pre_encode_enabled() && rayon::current_num_threads() > 1)
-        .then(flock_core::epool::helper_pool)
-        .flatten();
-    let pcs_open = match stash_pool {
-        Some(pool) => pool.in_place_scope(|s| {
-            s.spawn(|_| {
-                crate::proof_io::stash_pre_encoded_prefix(&commitment, &zc_proof, &lc_proof)
-            });
-            open_claims_with_precomputed_ligerito(
-                z_packed,
-                &prover_data,
-                &commitment,
-                &[ab.clone(), c.clone()],
-                &[pre_ab, pre_c],
-                &padding,
-                &lig_config,
-                challenger,
-            )
-        }),
-        None => open_claims_with_precomputed_ligerito(
-            z_packed,
-            &prover_data,
-            &commitment,
-            &[ab.clone(), c.clone()],
-            &[pre_ab, pre_c],
-            &padding,
-            &lig_config,
-            challenger,
-        ),
-    };
+    let pcs_open = open_claims_with_precomputed_ligerito(
+        z_packed,
+        &prover_data,
+        &commitment,
+        &[ab.clone(), c.clone()],
+        &[pre_ab, pre_c],
+        &padding,
+        &lig_config,
+        challenger,
+    );
     if phase_timing {
         let wall = t_open.elapsed().as_secs_f64() * 1e3;
         let cpu = process_cpu_ms() - cpu_open0.unwrap_or(0.0);
