@@ -1878,6 +1878,157 @@ fn fold2_and_message_body<const NT: bool>(
     (p1_acc.reduce(), pinf_acc.reduce())
 }
 
+/// [`fold2_and_message_aarch64`] **plus** the deferred round-seven aggregates
+/// (cascade level three). The composed outputs and every store are identical;
+/// the sweep consumes composed outputs four at a time (two round-6 message
+/// pairs = one round-7 group) on the shared odd-lane weight `eq_lo[2t+1]` and
+/// returns the eight per-chunk accumulators
+/// `[p1_even, pinf_even, p1_odd, pinf_odd, W0'', W3'', W4'', W5'']` — the
+/// exact slot order of `fold2_compact_and_round45_chunk_neon_8`. The driver
+/// reconstructs the round-six message via κ and rescales the six lookahead
+/// aggregates by `r''⁻¹`, mirroring the cascade K pass.
+pub(crate) fn fold2_and_message_lookahead_aarch64(
+    a_in: &[F128],
+    b_in: &[F128],
+    a_out: &mut [F128],
+    b_out: &mut [F128],
+    rho_a: F128,
+    rho_b: F128,
+    eq_lo: &[F128],
+    nt_stores: bool,
+) -> [F128; 8] {
+    if nt_stores {
+        fold2_and_message_lookahead_body::<true>(a_in, b_in, a_out, b_out, rho_a, rho_b, eq_lo)
+    } else {
+        fold2_and_message_lookahead_body::<false>(a_in, b_in, a_out, b_out, rho_a, rho_b, eq_lo)
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+fn fold2_and_message_lookahead_body<const NT: bool>(
+    a_in: &[F128],
+    b_in: &[F128],
+    a_out: &mut [F128],
+    b_out: &mut [F128],
+    rho_a: F128,
+    rho_b: F128,
+    eq_lo: &[F128],
+) -> [F128; 8] {
+    use core::arch::aarch64::uint64x2_t;
+
+    debug_assert_eq!(a_in.len(), 4 * a_out.len());
+    debug_assert_eq!(b_in.len(), 4 * b_out.len());
+    debug_assert_eq!(a_out.len(), 2 * eq_lo.len());
+    debug_assert_eq!(eq_lo.len() % 2, 0);
+
+    #[inline(always)]
+    unsafe fn store_pair_nt(dst: *mut F128, x: uint64x2_t, y: uint64x2_t) {
+        unsafe {
+            core::arch::asm!(
+                "stnp {x:q}, {y:q}, [{dst}]",
+                dst = in(reg) dst,
+                x = in(vreg) x,
+                y = in(vreg) y,
+                options(nostack, preserves_flags),
+            );
+        }
+    }
+
+    // One composed output from four consecutive inputs — identical expression
+    // to `fold2_and_message_body`, so the stored tables are value-identical.
+    #[inline(always)]
+    fn fold4(v: &[F128], i: usize, rho_a: F128, rho_b: F128) -> F128 {
+        let t0 = v[i] + rho_a * (v[i] + v[i + 1]);
+        let t1 = v[i + 2] + rho_a * (v[i + 2] + v[i + 3]);
+        t0 + rho_b * (t0 + t1)
+    }
+
+    let mut acc = [F256Unreduced::ZERO; 8];
+
+    let a_out_ptr = a_out.as_mut_ptr();
+    let b_out_ptr = b_out.as_mut_ptr();
+
+    for t in 0..eq_lo.len() / 2 {
+        let i = 16 * t;
+        let o = 4 * t;
+
+        let a0 = fold4(a_in, i, rho_a, rho_b);
+        let a1 = fold4(a_in, i + 4, rho_a, rho_b);
+        let a2 = fold4(a_in, i + 8, rho_a, rho_b);
+        let a3 = fold4(a_in, i + 12, rho_a, rho_b);
+        let b0 = fold4(b_in, i, rho_a, rho_b);
+        let b1 = fold4(b_in, i + 4, rho_a, rho_b);
+        let b2 = fold4(b_in, i + 8, rho_a, rho_b);
+        let b3 = fold4(b_in, i + 12, rho_a, rho_b);
+
+        if NT {
+            // SAFETY: `o + 3 < a_out.len()` by the len contract above; F128 is
+            // repr(C, align(16)) two u64s, bit-compatible with uint64x2_t;
+            // each 32-byte pair store is 16-byte aligned and lands in this
+            // iteration's disjoint output slots.
+            unsafe {
+                store_pair_nt(
+                    a_out_ptr.add(o),
+                    core::mem::transmute::<F128, uint64x2_t>(a0),
+                    core::mem::transmute::<F128, uint64x2_t>(a1),
+                );
+                store_pair_nt(
+                    a_out_ptr.add(o + 2),
+                    core::mem::transmute::<F128, uint64x2_t>(a2),
+                    core::mem::transmute::<F128, uint64x2_t>(a3),
+                );
+                store_pair_nt(
+                    b_out_ptr.add(o),
+                    core::mem::transmute::<F128, uint64x2_t>(b0),
+                    core::mem::transmute::<F128, uint64x2_t>(b1),
+                );
+                store_pair_nt(
+                    b_out_ptr.add(o + 2),
+                    core::mem::transmute::<F128, uint64x2_t>(b2),
+                    core::mem::transmute::<F128, uint64x2_t>(b3),
+                );
+            }
+        } else {
+            a_out[o] = a0;
+            a_out[o + 1] = a1;
+            a_out[o + 2] = a2;
+            a_out[o + 3] = a3;
+            b_out[o] = b0;
+            b_out[o + 1] = b1;
+            b_out[o + 2] = b2;
+            b_out[o + 3] = b3;
+        }
+
+        // One weight per round-7 group: the odd lane. Weighting the a-side
+        // once makes `W1''`/`W2''` (the odd round-6 pair sums) free — the same
+        // zero-extra-multiplies parity trick as the cascade K pass.
+        let wt = eq_lo[2 * t + 1];
+        let (a0w, a1w, a2w, a3w) = (wt * a0, wt * a1, wt * a2, wt * a3);
+        acc[0] ^= a1w.mul_unreduced(b1);
+        acc[1] ^= (a0w + a1w).mul_unreduced(b0 + b1);
+        acc[2] ^= a3w.mul_unreduced(b3);
+        acc[3] ^= (a2w + a3w).mul_unreduced(b2 + b3);
+        acc[4] ^= a2w.mul_unreduced(b2);
+        let (e_aw, e_b) = (a0w + a2w, b0 + b2);
+        let (o_aw, o_b) = (a1w + a3w, b1 + b3);
+        acc[5] ^= e_aw.mul_unreduced(e_b);
+        acc[6] ^= o_aw.mul_unreduced(o_b);
+        acc[7] ^= (e_aw + o_aw).mul_unreduced(e_b + o_b);
+    }
+
+    [
+        acc[0].reduce(),
+        acc[1].reduce(),
+        acc[2].reduce(),
+        acc[3].reduce(),
+        acc[4].reduce(),
+        acc[5].reduce(),
+        acc[6].reduce(),
+        acc[7].reduce(),
+    ]
+}
+
 #[cfg(all(test, target_arch = "aarch64", target_feature = "aes"))]
 mod tests {
     use super::*;

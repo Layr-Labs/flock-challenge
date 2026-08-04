@@ -28,7 +28,7 @@ pub mod univariate_skip_optimized;
 
 use multilinear::{
     UniSkipFoldTable, eval_round3_lookahead, fold2_compact_and_round4_into,
-    fold2_compact_and_round45_into, fold2_plain_and_round6_into,
+    fold2_compact_and_round45_into, fold2_plain_and_round6_into, fold2_plain_and_round67_into,
     fold_and_compute_round_pair_into, fold_compact_and_compute_round_pair, fold_in_place_pair,
     interpolate_at_z_combined, interpolate_at_z_on_lambda, round_pair_naive,
     uni_skip_fold_and_round_pair_compact_padded_lookahead,
@@ -76,6 +76,30 @@ fn cascade2_off() -> bool {
         return true;
     }
     std::env::var_os("FLOCK_NO_ZC_CASCADE2").is_some_and(|v| v == *"1")
+}
+
+/// Test-only forced-off latch for the third-level cascade (rounds 7+8),
+/// mirroring [`ZC_CASCADE2_FORCED_OFF`]: the transcript-identity test flips
+/// this instead of mutating the process environment. Flipping it cannot make
+/// a concurrently running test wrong — both routes emit the same transcript.
+#[cfg(test)]
+pub(crate) static ZC_CASCADE3_FORCED_OFF: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Kill switch for the cascaded rounds-7/8 lookahead: `FLOCK_NO_ZC_CASCADE3=1`
+/// (exact '1') restores the cascade2 i=4/i=5 tail route within the same
+/// binary (and with cascade2 ALSO off, the incumbent route). OnceLock-latched:
+/// the environment is read once per process. Bit-identical either way — same
+/// pure-reassociation argument as the levels above, asserted by the cascade3
+/// transcript-identity test.
+#[inline]
+fn cascade3_off() -> bool {
+    #[cfg(test)]
+    if ZC_CASCADE3_FORCED_OFF.load(std::sync::atomic::Ordering::Relaxed) {
+        return true;
+    }
+    static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *OFF.get_or_init(|| std::env::var_os("FLOCK_NO_ZC_CASCADE3").is_some_and(|v| v == *"1"))
 }
 
 /// Number of variables folded in round 1 via the additive-NTT univariate skip.
@@ -711,6 +735,26 @@ fn prove_packed_padded_inner<C: Challenger>(
     let use_cascade =
         use_lookahead && n_mlv >= 7 && r[k_skip + 3] != F128::ZERO && !cascade2_off();
 
+    // Cascade one level deeper still (rounds 7+8, see
+    // `fold2_plain_and_round67_into`): the composed 5+6 pass materializes each
+    // output group in registers before its store — the same position the K
+    // pass was in before the round-5 promotion — so round seven's message
+    // rides it as a deferred quadratic in the not-yet-sampled ρ₅, and rounds
+    // 7+8 then collapse into one more plain composed double-fold, deleting
+    // tail iterations i = 4 and i = 5 (their DRAM passes and one of their
+    // FS-serialized round boundaries). Same value-identity argument again:
+    // pure reassociation of exact F128 arithmetic, transcript order untouched.
+    //
+    // `r[k_skip+5] = 0` would make W1''/W2'' unrecoverable from the eq parity
+    // split (at every shape with m ≥ 13 that slot is the protocol constant
+    // β₂ ≠ 0; for a sampled slot it is probability 2⁻¹²⁸); that case falls
+    // back to the cascade2 route, which stays in the tree as the oracle
+    // anyway. n_mlv ≥ 8 keeps the composed-7/8 input ≥ 16 (its own floor) and
+    // every eq split at lo_size ≥ 2. Kill switch: FLOCK_NO_ZC_CASCADE3=1
+    // (exact '1').
+    let use_cascade3 =
+        use_cascade && n_mlv >= 8 && r[k_skip + 5] != F128::ZERO && !cascade3_off();
+
     // `loop_start` is the first tail iteration this route has not already
     // produced. The loop body's `r_next[1..] = r[k_skip + i + 2..]` is already
     // indexed by `i`, so starting at 2 (or 4) needs no other change.
@@ -773,28 +817,96 @@ fn prove_packed_padded_inner<C: Challenger>(
             // Unpinned for the same reason as the K outputs above.
             let mut a2_out = crate::scratch::take_f128_unpinned(quarter);
             let mut b2_out = crate::scratch::take_f128_unpinned(quarter);
-            let (m6_1, m6_inf) = fold2_plain_and_round6_into(
-                &a_out,
-                &b_out,
-                &mut a2_out,
-                &mut b2_out,
-                mlv_rhos[2],
-                mlv_rhos[3],
-                &r_next6,
-            );
-            if tail_round_timing {
-                eprintln!(
-                    "[zc-tail-rounds] composed rounds 5+6 fold (out n={quarter}): {:.2} ms",
-                    t_c.elapsed().as_secs_f64() * 1e3
+            if use_cascade3 {
+                // Level three: the composed 5+6 pass additionally carries the
+                // deferred round-seven quadratic — zero extra traversals.
+                let (m6_1, m6_inf, la7) = fold2_plain_and_round67_into(
+                    &a_out,
+                    &b_out,
+                    &mut a2_out,
+                    &mut b2_out,
+                    mlv_rhos[2],
+                    mlv_rhos[3],
+                    &r_next6,
                 );
+                if tail_round_timing {
+                    eprintln!(
+                        "[zc-tail-rounds] composed rounds 5+6 fold (cascade +W'', out n={quarter}): {:.2} ms",
+                        t_c.elapsed().as_secs_f64() * 1e3
+                    );
+                }
+                crate::scratch::give_f128(a_out);
+                crate::scratch::give_f128(b_out);
+                multilinear_msgs.push((m6_1, m6_inf));
+                challenger.observe_f128(m6_1);
+                challenger.observe_f128(m6_inf);
+                mlv_rhos.push(challenger.sample_f128());
+
+                // Round seven: evaluate the deferred quadratic at ρ₅. No pass.
+                let (m7_1, m7_inf) = eval_round3_lookahead(&la7, mlv_rhos[4]);
+                multilinear_msgs.push((m7_1, m7_inf));
+                challenger.observe_f128(m7_1);
+                challenger.observe_f128(m7_inf);
+                mlv_rhos.push(challenger.sample_f128());
+
+                // Rounds seven and eight fold together in one more plain
+                // composed pass (ρ₅ and ρ₆ at once), replacing tail
+                // iterations i = 4 and i = 5: their 128 MiB + 64 MiB reads
+                // and 64 MiB + 32 MiB writes become one 128 MiB read +
+                // 32 MiB write.
+                let t_c3 = std::time::Instant::now();
+                let sixteenth = n_groups / 16;
+                let mut r_next8 = vec![F128::ONE; n_mlv - 6];
+                r_next8[1..].copy_from_slice(&r[k_skip + 7..]);
+                // Unpinned for the same reason as the K outputs above.
+                let mut a3_out = crate::scratch::take_f128_unpinned(sixteenth);
+                let mut b3_out = crate::scratch::take_f128_unpinned(sixteenth);
+                let (m8_1, m8_inf) = fold2_plain_and_round6_into(
+                    &a2_out,
+                    &b2_out,
+                    &mut a3_out,
+                    &mut b3_out,
+                    mlv_rhos[4],
+                    mlv_rhos[5],
+                    &r_next8,
+                );
+                if tail_round_timing {
+                    eprintln!(
+                        "[zc-tail-rounds] composed rounds 7+8 fold (out n={sixteenth}): {:.2} ms",
+                        t_c3.elapsed().as_secs_f64() * 1e3
+                    );
+                }
+                crate::scratch::give_f128(a2_out);
+                crate::scratch::give_f128(b2_out);
+                multilinear_msgs.push((m8_1, m8_inf));
+                challenger.observe_f128(m8_1);
+                challenger.observe_f128(m8_inf);
+                mlv_rhos.push(challenger.sample_f128());
+                (a3_out, b3_out, 6usize)
+            } else {
+                let (m6_1, m6_inf) = fold2_plain_and_round6_into(
+                    &a_out,
+                    &b_out,
+                    &mut a2_out,
+                    &mut b2_out,
+                    mlv_rhos[2],
+                    mlv_rhos[3],
+                    &r_next6,
+                );
+                if tail_round_timing {
+                    eprintln!(
+                        "[zc-tail-rounds] composed rounds 5+6 fold (out n={quarter}): {:.2} ms",
+                        t_c.elapsed().as_secs_f64() * 1e3
+                    );
+                }
+                crate::scratch::give_f128(a_out);
+                crate::scratch::give_f128(b_out);
+                multilinear_msgs.push((m6_1, m6_inf));
+                challenger.observe_f128(m6_1);
+                challenger.observe_f128(m6_inf);
+                mlv_rhos.push(challenger.sample_f128());
+                (a2_out, b2_out, 4usize)
             }
-            crate::scratch::give_f128(a_out);
-            crate::scratch::give_f128(b_out);
-            multilinear_msgs.push((m6_1, m6_inf));
-            challenger.observe_f128(m6_1);
-            challenger.observe_f128(m6_inf);
-            mlv_rhos.push(challenger.sample_f128());
-            (a2_out, b2_out, 4usize)
         } else {
             let (m4_1, m4_inf) = fold2_compact_and_round4_into(
                 &compact_mlv,
@@ -1810,6 +1922,48 @@ mod tests {
             let mut ch_off = FsChallenger::new(b"flock-test-v0");
             let (proof_off, claim_off) = prove_packed(&a_p, &b_p, &c_p, m, &mut ch_off);
             ZC_CASCADE2_FORCED_OFF.store(false, Ordering::Relaxed);
+
+            assert_eq!(proof_on.round1_ab, proof_off.round1_ab, "round1_ab m={m}");
+            assert_eq!(proof_on.round1_c, proof_off.round1_c, "round1_c m={m}");
+            assert_eq!(
+                proof_on.multilinear_rounds, proof_off.multilinear_rounds,
+                "multilinear_rounds m={m}"
+            );
+            assert_eq!(proof_on.final_a_eval, proof_off.final_a_eval, "a_eval m={m}");
+            assert_eq!(proof_on.final_b_eval, proof_off.final_b_eval, "b_eval m={m}");
+            assert_eq!(proof_on.final_c_eval, proof_off.final_c_eval, "c_eval m={m}");
+            assert_eq!(claim_on.z, claim_off.z, "z m={m}");
+            assert_eq!(
+                claim_on.mlv_challenges, claim_off.mlv_challenges,
+                "mlv_challenges m={m}"
+            );
+        }
+    }
+
+    /// C3-T5 — transcript identity for the third-level cascade (rounds 7+8):
+    /// prove twice from the same witness with cascade3 engaged and disabled
+    /// (the lookahead and cascade2 stay on in both — cascade3's fallback IS
+    /// the cascade2 route), and compare the complete `ZerocheckProof` plus
+    /// the claim's challenge vector. m=13 (n_mlv=7) sits below cascade3's
+    /// n_mlv ≥ 8 floor, so it also exercises the disengaged boundary.
+    #[test]
+    fn prove_transcript_identical_with_and_without_cascade3() {
+        use std::sync::atomic::Ordering;
+        for m in [13usize, 14, 16] {
+            let mut rng = Rng::new(0xCA53 ^ m as u64);
+            let a = rng.bits(1 << m);
+            let b = rng.bits(1 << m);
+            let c: Vec<bool> = a.iter().zip(&b).map(|(x, y)| *x & *y).collect();
+            let (a_p, b_p, c_p) = pack_abc(&a, &b, &c);
+
+            ZC_CASCADE3_FORCED_OFF.store(false, Ordering::Relaxed);
+            let mut ch_on = FsChallenger::new(b"flock-test-v0");
+            let (proof_on, claim_on) = prove_packed(&a_p, &b_p, &c_p, m, &mut ch_on);
+
+            ZC_CASCADE3_FORCED_OFF.store(true, Ordering::Relaxed);
+            let mut ch_off = FsChallenger::new(b"flock-test-v0");
+            let (proof_off, claim_off) = prove_packed(&a_p, &b_p, &c_p, m, &mut ch_off);
+            ZC_CASCADE3_FORCED_OFF.store(false, Ordering::Relaxed);
 
             assert_eq!(proof_on.round1_ab, proof_off.round1_ab, "round1_ab m={m}");
             assert_eq!(proof_on.round1_c, proof_off.round1_c, "round1_c m={m}");

@@ -50,8 +50,9 @@ mod kernels;
 use kernels::aarch64::fold_one_row_neon_unchecked_8;
 #[cfg(target_arch = "aarch64")]
 use kernels::aarch64::{
-    fold2_and_message_aarch64, fold2_compact_and_round4_chunk_neon_8,
-    fold2_compact_and_round45_chunk_neon_8, fold_and_message_aarch64,
+    fold2_and_message_aarch64, fold2_and_message_lookahead_aarch64,
+    fold2_compact_and_round4_chunk_neon_8, fold2_compact_and_round45_chunk_neon_8,
+    fold_and_message_aarch64,
     fold_compact_chunk_neon_unchecked_8, fold_compact_stream_chunk_neon,
     fold_round2_chunk_neon_unchecked_8, fold_round2_compact_chunk_neon_lookahead_8,
     fold_round2_compact_chunk_neon_unchecked_8, fold_round2_compact_stream_chunk_neon,
@@ -2233,6 +2234,242 @@ pub(crate) fn fold2_plain_and_round6_into(
     (r_next6[0] * sum1, sum_inf)
 }
 
+// ---------------------------------------------------------------------------
+// Cascaded lookahead, level three: rounds 2..8 in four passes. The composed
+// rounds-5/6 fold materializes each output group in registers before its
+// store — the same position the K pass was in before the round-5 promotion —
+// so round SEVEN's message (a quadratic in the not-yet-sampled ρ₅) can be
+// accumulated during the composed-5/6 pass, and rounds 7 and 8 then share one
+// more plain composed double-fold. Everything is value-identical to the
+// cascade2 route: exact F128, untouched transcript order, pure reassociation.
+// ---------------------------------------------------------------------------
+
+/// [`fold2_plain_and_round6_into`] **plus** the deferred round-seven
+/// coefficients, in the same single pass over the composed-5/6 traversal.
+///
+/// The output tables, every store, and the round-six wire message are
+/// value-identical to the plain composed pass; the sweep merely also
+/// accumulates six aggregates over round-seven groups `y''`
+/// (`a_i = a_out[4y''+i]`):
+///
+/// ```text
+/// W0'' = Σ_y'' eq₇(y'')·a2b2   W1'' = Σ eq₇·a3b3    W2'' = Σ eq₇·(a2+a3)(b2+b3)
+/// W3'' = Σ_y'' eq₇(y'')·e_a e_b   W4'' = Σ eq₇·o_a o_b   W5'' = Σ eq₇·(e+o)_a(e+o)_b
+/// e = out[4y'']+out[4y''+2],  o = out[4y''+1]+out[4y''+3]
+/// ```
+///
+/// `W1''` and `W2''` cost **zero extra multiplies**: they are the odd-parity
+/// half of the two round-six accumulators, because the pass's eq table is
+/// built over `r_next6[1..]` (LSB-first), so `eq₆(2y''+1) = r''·eq₇(y'')`
+/// with `r'' = r_next6[1]` and `eq₇.hi ≡ eq₆.hi` — the exact mechanism the
+/// cascade K pass uses with `r_next4[1]`.
+///
+/// Returns `(round6_msg_1, round6_msg_inf, la7)` where `la7` evaluates via
+/// [`eval_round3_lookahead`] (the deferred-quadratic shape is round-agnostic)
+/// at the later-sampled ρ₅ to the round-seven message, with no memory pass.
+///
+/// Requires `r_next6[1] ≠ 0`; the caller falls back to the cascade2 route
+/// otherwise (at the ranked shape this slot is the protocol constant β₂ ≠ 0;
+/// for a sampled slot it is probability 2⁻¹²⁸).
+pub(crate) fn fold2_plain_and_round67_into(
+    a: &[F128],
+    b: &[F128],
+    a_out: &mut [F128],
+    b_out: &mut [F128],
+    rho3: F128,
+    rho4: F128,
+    r_next6: &[F128],
+) -> (F128, F128, Round3Lookahead) {
+    let n = a.len();
+    assert_eq!(b.len(), n);
+    assert!(n.is_power_of_two() && n >= 16);
+    let quarter = n / 4;
+    assert_eq!(a_out.len(), quarter);
+    assert_eq!(b_out.len(), quarter);
+    let log_n = n.trailing_zeros() as usize;
+    assert_eq!(r_next6.len(), log_n - 2);
+    let r_par = r_next6[1];
+    assert_ne!(
+        r_par,
+        F128::ZERO,
+        "cascade requires a non-zero r_next6[1]"
+    );
+
+    // Same clamp rationale as the plain composed pass — and the lookahead
+    // sweep consumes composed outputs four at a time (two round-6 pairs = one
+    // round-7 group), so the lo half must keep ≥ 1 variable.
+    let n_vars = r_next6.len() - 1;
+    let n_hi = SplitEqGhash::MAX_N_HI.min(n_vars.saturating_sub(1));
+    let eq = SplitEqGhash::with_n_hi(&r_next6[1..], n_hi);
+    let lo_size = 1usize << eq.n_lo;
+    let hi_size = 1usize << eq.n_hi;
+    assert!(lo_size >= 2, "composed lookahead requires lo_size ≥ 2");
+    assert_eq!(lo_size * hi_size * 2, quarter);
+    // `eq₆(2y'') = (1+r'')·eq₇(y'')` and `eq₆(2y''+1) = r''·eq₇(y'')`: the
+    // sweep uses the odd lane as the group's single weight; the two constants
+    // below put every aggregate back on its own scale, once, off the hot path.
+    let kappa = (F128::ONE + r_par) * r_par.inv();
+
+    let chunk_in = 8 * lo_size; // four inputs per composed output
+    let chunk_out = 2 * lo_size;
+    let eq_lo = &eq.lo;
+    let eq_hi = &eq.hi;
+
+    // Same NT policy as the plain composed pass: decided once from the
+    // round's output size (identical stores either way).
+    #[cfg(target_arch = "aarch64")]
+    let nt_stores = {
+        use std::sync::OnceLock;
+        static NT_ENABLED: OnceLock<bool> = OnceLock::new();
+        quarter >= (1usize << 21)
+            && *NT_ENABLED
+                .get_or_init(|| std::env::var_os("FLOCK_ZC_NT_LEGACY").is_none())
+    };
+
+    let chunk_partial = |a_in: &[F128],
+                         b_in: &[F128],
+                         a_out: &mut [F128],
+                         b_out: &mut [F128]|
+     -> [F128; 8] {
+        #[cfg(target_arch = "aarch64")]
+        {
+            fold2_and_message_lookahead_aarch64(
+                a_in, b_in, a_out, b_out, rho3, rho4, eq_lo, nt_stores,
+            )
+        }
+        #[cfg(not(target_arch = "aarch64"))]
+        {
+            let mut acc = [F256Unreduced::ZERO; 8];
+            let fold4 = |v: &[F128], i: usize| {
+                let t0 = v[i] + rho3 * (v[i] + v[i + 1]);
+                let t1 = v[i + 2] + rho3 * (v[i + 2] + v[i + 3]);
+                t0 + rho4 * (t0 + t1)
+            };
+            for t in 0..eq_lo.len() / 2 {
+                let i = 16 * t;
+                let o = 4 * t;
+                let a0 = fold4(a_in, i);
+                let a1 = fold4(a_in, i + 4);
+                let a2 = fold4(a_in, i + 8);
+                let a3 = fold4(a_in, i + 12);
+                let b0 = fold4(b_in, i);
+                let b1 = fold4(b_in, i + 4);
+                let b2 = fold4(b_in, i + 8);
+                let b3 = fold4(b_in, i + 12);
+                a_out[o] = a0;
+                a_out[o + 1] = a1;
+                a_out[o + 2] = a2;
+                a_out[o + 3] = a3;
+                b_out[o] = b0;
+                b_out[o + 1] = b1;
+                b_out[o + 2] = b2;
+                b_out[o + 3] = b3;
+                // One weight per round-7 group: the odd lane.
+                let wt = eq_lo[2 * t + 1];
+                let (a0w, a1w, a2w, a3w) = (wt * a0, wt * a1, wt * a2, wt * a3);
+                acc[0] ^= a1w.mul_unreduced(b1);
+                acc[1] ^= (a0w + a1w).mul_unreduced(b0 + b1);
+                acc[2] ^= a3w.mul_unreduced(b3);
+                acc[3] ^= (a2w + a3w).mul_unreduced(b2 + b3);
+                acc[4] ^= a2w.mul_unreduced(b2);
+                let (e_aw, e_b) = (a0w + a2w, b0 + b2);
+                let (o_aw, o_b) = (a1w + a3w, b1 + b3);
+                acc[5] ^= e_aw.mul_unreduced(e_b);
+                acc[6] ^= o_aw.mul_unreduced(o_b);
+                acc[7] ^= (e_aw + o_aw).mul_unreduced(e_b + o_b);
+            }
+            [
+                acc[0].reduce(),
+                acc[1].reduce(),
+                acc[2].reduce(),
+                acc[3].reduce(),
+                acc[4].reduce(),
+                acc[5].reduce(),
+                acc[6].reduce(),
+                acc[7].reduce(),
+            ]
+        }
+    };
+
+    // Same scheduling policy as the plain composed pass.
+    #[cfg(target_arch = "aarch64")]
+    let hetero = quarter >= (1usize << 21) && zc_tail_hetero_enabled();
+    #[cfg(not(target_arch = "aarch64"))]
+    let hetero = false;
+
+    // Per-chunk `[p1_even, pinf_even, p1_odd, pinf_odd, W0'', W3'', W4'',
+    // W5'']`, eq_hi-weighted after the κ recombination below.
+    let partials: Vec<[F128; 8]> = if hetero {
+        let mut partials: Vec<[F128; 8]> = vec![[F128::ZERO; 8]; hi_size];
+        let a_base = crate::epool::SyncPtr(a_out.as_mut_ptr());
+        let b_base = crate::epool::SyncPtr(b_out.as_mut_ptr());
+        let partials_base = crate::epool::SyncPtr(partials.as_mut_ptr());
+        crate::epool::run_hetero_chunks(hi_size, |x_hi| {
+            // SAFETY: exclusive per-chunk ownership; queue join publishes writes.
+            let (a_out, b_out) = unsafe {
+                (
+                    std::slice::from_raw_parts_mut(a_base.ptr().add(x_hi * chunk_out), chunk_out),
+                    std::slice::from_raw_parts_mut(b_base.ptr().add(x_hi * chunk_out), chunk_out),
+                )
+            };
+            let outv = chunk_partial(
+                &a[x_hi * chunk_in..(x_hi + 1) * chunk_in],
+                &b[x_hi * chunk_in..(x_hi + 1) * chunk_in],
+                a_out,
+                b_out,
+            );
+            // SAFETY: exclusive owner of partials[x_hi].
+            unsafe {
+                *partials_base.ptr().add(x_hi) = outv;
+            }
+        });
+        partials
+    } else {
+        use rayon::prelude::*;
+        a_out
+            .par_chunks_mut(chunk_out)
+            .zip(b_out.par_chunks_mut(chunk_out))
+            .enumerate()
+            .map(|(x_hi, (a_out, b_out))| {
+                chunk_partial(
+                    &a[x_hi * chunk_in..(x_hi + 1) * chunk_in],
+                    &b[x_hi * chunk_in..(x_hi + 1) * chunk_in],
+                    a_out,
+                    b_out,
+                )
+            })
+            .collect()
+    };
+
+    let mut sum1 = F128::ZERO;
+    let mut sum_inf = F128::ZERO;
+    let mut agg = [F128::ZERO; 6];
+    for (x_hi, outv) in partials.iter().enumerate() {
+        let eq_h = eq_hi[x_hi];
+        // `outv[0..2]` carry the even round-6 pairs on the odd lane's weight;
+        // κ restores `eq₆(2y'')` exactly (field arithmetic, no rounding).
+        sum1 += eq_h * (kappa * outv[0] + outv[2]);
+        sum_inf += eq_h * (kappa * outv[1] + outv[3]);
+        for (aslot, &v) in agg.iter_mut().zip(outv[2..].iter()) {
+            *aslot += eq_h * v;
+        }
+    }
+    // Every aggregate was accumulated on the odd lane's weight `r''·eq₇`, so
+    // a single `r''⁻¹` puts all six back on `eq₇`.
+    let r_inv = r_par.inv();
+    let w1 = r_inv * agg[0];
+    let w2 = r_inv * agg[1];
+    let w0 = r_inv * agg[2];
+    let w3 = r_inv * agg[3];
+    let w4 = r_inv * agg[4];
+    let w5 = r_inv * agg[5];
+    let la7 = Round3Lookahead {
+        c: [w0, w0 + w1 + w2, w2, w3, w3 + w4 + w5, w5],
+    };
+
+    (r_next6[0] * sum1, sum_inf, la7)
+}
+
 /// Optimized fused fold (at the URM challenge `z`, baked into `table`) plus
 /// round-2 prover message. **Packed input** (LSB-first bit packing). **Parallel
 /// by default** via rayon — the outer x_hi loop is distributed across workers,
@@ -4138,6 +4375,172 @@ mod tests {
             &r_next4,
             &mut a_out,
             &mut b_out,
+        );
+    }
+
+    // ----------------------------------------------------------------------
+    // Cascaded lookahead, level three: rounds 7+8.
+    // ----------------------------------------------------------------------
+
+    /// D1 — the cascade3 composed-5/6 oracle (C1 one level down). Outputs and
+    /// the round-six message must match the plain composed pass
+    /// **elementwise** (poison-filled destinations), and the deferred
+    /// round-seven quadratic must evaluate to the incumbent tail-i=4 message
+    /// at every ρ₅ of a 4-point grid — four distinct points over-determine a
+    /// quadratic, so agreement at all of them *is* coefficient equality.
+    #[test]
+    fn cascade3_round7_lookahead_matches_composed_pass() {
+        let mut rng = Rng::new(0x0CA5_3001);
+        for log_n in [4usize, 5, 9, 12] {
+            let n = 1usize << log_n;
+            let a: Vec<F128> = (0..n).map(|_| rng.f128()).collect();
+            let b: Vec<F128> = (0..n).map(|_| rng.f128()).collect();
+            let mut r_next6 = vec![F128::ONE; log_n - 2];
+            for slot in r_next6[1..].iter_mut() {
+                *slot = rng.f128();
+            }
+            assert_ne!(r_next6[1], F128::ZERO);
+            // r_next for the incumbent round-seven message (tail i = 4).
+            let mut r_next7 = vec![F128::ONE; log_n - 3];
+            r_next7[1..].copy_from_slice(&r_next6[2..]);
+            let rho_grid = [
+                F128::ZERO,
+                F128::ONE,
+                F128 {
+                    lo: u64::MAX,
+                    hi: u64::MAX,
+                },
+                rng.f128(),
+            ];
+            let rho_pairs = [
+                (F128::ZERO, rho_grid[2]),
+                (F128::ONE, rho_grid[3]),
+                (rho_grid[3], rho_grid[3] + F128::ONE),
+            ];
+            for &(rho3, rho4) in &rho_pairs {
+                let mut a_l = vec![LA_POISON; n / 4];
+                let mut b_l = vec![LA_POISON; n / 4];
+                let msg_l =
+                    fold2_plain_and_round6_into(&a, &b, &mut a_l, &mut b_l, rho3, rho4, &r_next6);
+
+                let mut a_n = vec![LA_POISON; n / 4];
+                let mut b_n = vec![LA_POISON; n / 4];
+                let (m6_1, m6_inf, la7) = fold2_plain_and_round67_into(
+                    &a, &b, &mut a_n, &mut b_n, rho3, rho4, &r_next6,
+                );
+                assert_eq!(
+                    (m6_1, m6_inf),
+                    msg_l,
+                    "round-six message log_n={log_n} rho3={rho3:?} rho4={rho4:?}"
+                );
+                assert_eq!(a_n, a_l, "A''' log_n={log_n} rho3={rho3:?} rho4={rho4:?}");
+                assert_eq!(b_n, b_l, "B''' log_n={log_n} rho3={rho3:?} rho4={rho4:?}");
+
+                for &rho5 in &rho_grid {
+                    let mut a7 = a_l.clone();
+                    let mut b7 = b_l.clone();
+                    fold_in_place_pair(&mut a7, &mut b7, rho5);
+                    let expect = round_pair_naive(&a7, &b7, &r_next7);
+                    assert_eq!(
+                        eval_round3_lookahead(&la7, rho5),
+                        expect,
+                        "round-seven message log_n={log_n} rho3={rho3:?} rho4={rho4:?} rho5={rho5:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// D2 — the composed rounds-7/8 double-fold at cascade3's call shape:
+    /// starting from a composed-5/6 output, one composed pass at (ρ₅, ρ₆)
+    /// must reproduce two sequential incumbent folds **elementwise**
+    /// (poison-filled outputs) and the round-eight message, for a 4×4 grid.
+    #[test]
+    fn cascade3_composed_rounds78_matches_two_sequential_folds() {
+        let mut rng = Rng::new(0x0CA5_3002);
+        for log_n in [6usize, 9, 12] {
+            let n = 1usize << log_n;
+            let a: Vec<F128> = (0..n).map(|_| rng.f128()).collect();
+            let b: Vec<F128> = (0..n).map(|_| rng.f128()).collect();
+            let mut r_next6 = vec![F128::ONE; log_n - 2];
+            for slot in r_next6[1..].iter_mut() {
+                *slot = rng.f128();
+            }
+            // Chain through the lookahead composed-5/6 pass exactly as the
+            // driver does, then compose rounds 7+8 from its outputs.
+            let mut a2 = vec![LA_POISON; n / 4];
+            let mut b2 = vec![LA_POISON; n / 4];
+            let (_, _, _la7) = fold2_plain_and_round67_into(
+                &a,
+                &b,
+                &mut a2,
+                &mut b2,
+                rng.f128(),
+                rng.f128(),
+                &r_next6,
+            );
+            let mut r_next8 = vec![F128::ONE; log_n - 4];
+            r_next8[1..].copy_from_slice(&r_next6[3..]);
+            let grid = [
+                F128::ZERO,
+                F128::ONE,
+                F128 {
+                    lo: u64::MAX,
+                    hi: u64::MAX,
+                },
+                rng.f128(),
+            ];
+            for &rho5 in &grid {
+                for &rho6 in &grid {
+                    let mut a_l = a2.clone();
+                    let mut b_l = b2.clone();
+                    fold_in_place_pair(&mut a_l, &mut b_l, rho5);
+                    fold_in_place_pair(&mut a_l, &mut b_l, rho6);
+                    let msg_l = round_pair_naive(&a_l, &b_l, &r_next8);
+
+                    let mut a_n = vec![LA_POISON; n / 16];
+                    let mut b_n = vec![LA_POISON; n / 16];
+                    let msg_n = fold2_plain_and_round6_into(
+                        &a2, &b2, &mut a_n, &mut b_n, rho5, rho6, &r_next8,
+                    );
+                    assert_eq!(a_n, a_l, "A log_n={log_n} rho5={rho5:?} rho6={rho6:?}");
+                    assert_eq!(b_n, b_l, "B log_n={log_n} rho5={rho5:?} rho6={rho6:?}");
+                    assert_eq!(
+                        msg_n, msg_l,
+                        "round-eight message log_n={log_n} rho5={rho5:?} rho6={rho6:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// D3 — the degenerate-challenge guard, one level deeper still:
+    /// `r_next6[1] = 0` makes W1''/W2'' unrecoverable from the parity split,
+    /// so the composed-5/6 lookahead pass must refuse rather than emit a
+    /// wrong coefficient. (`prove` takes the cascade2 route in that case.)
+    #[test]
+    #[should_panic(expected = "cascade requires a non-zero r_next6")]
+    fn cascade3_rejects_zero_r_next6_1() {
+        let mut rng = Rng::new(0x0CA5_3003);
+        let log_n = 6usize;
+        let n = 1usize << log_n;
+        let a: Vec<F128> = (0..n).map(|_| rng.f128()).collect();
+        let b: Vec<F128> = (0..n).map(|_| rng.f128()).collect();
+        let mut r_next6 = vec![F128::ONE; log_n - 2];
+        for slot in r_next6[1..].iter_mut() {
+            *slot = rng.f128();
+        }
+        r_next6[1] = F128::ZERO;
+        let mut a_out = vec![F128::ZERO; n / 4];
+        let mut b_out = vec![F128::ZERO; n / 4];
+        let _ = fold2_plain_and_round67_into(
+            &a,
+            &b,
+            &mut a_out,
+            &mut b_out,
+            rng.f128(),
+            rng.f128(),
+            &r_next6,
         );
     }
 
