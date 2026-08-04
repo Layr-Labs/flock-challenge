@@ -88,15 +88,6 @@ fn r2_degen_enabled() -> bool {
     std::env::var_os("FLOCK_NO_R2_DEGEN").is_none_or(|v| v != *"1")
 }
 
-/// Kill switch for the ranked BLAKE3 periodic-padding schedule in round two:
-/// `FLOCK_NO_ZC_R2_PERIODIC=1` restores the generic per-group mask checks.
-/// The specialized kernel only changes loop control; every useful, boundary,
-/// and padded group executes the same arithmetic and stores as the oracle.
-#[cfg(target_arch = "aarch64")]
-fn r2_periodic_padding_enabled() -> bool {
-    std::env::var_os("FLOCK_NO_ZC_R2_PERIODIC").is_none_or(|v| v != *"1")
-}
-
 /// Kill switch for adopting the round-two GPU arm's odd-parity products as the
 /// round-three lookahead's `W1`/`W2`: `FLOCK_NO_ZC_R2_ODD_OFFLOAD=1` makes the
 /// CPU recompute the odd pair on offloaded chunks, which is the incumbent
@@ -1091,8 +1082,11 @@ pub fn fold_compact_and_compute_round_pair(
     // UN-PARKED (v11): the scoreless deaths were the job-wall timeout, not
     // this arm — the static warmup latch frees minutes of wall and both
     // arms' once-per-process costs fit in a fraction of it.
+    // v12: the v11 rationale above was written but the const was left
+    // parked; this flip lands it. The kill switch remains
+    // FLOCK_NO_GPU_ZC_T3 and the latch/oracle protections are unchanged.
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-    const ZC_T3_INTEGRATION_PARKED: bool = true;
+    const ZC_T3_INTEGRATION_PARKED: bool = false;
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     let gpu_job = if ZC_T3_INTEGRATION_PARKED {
         None
@@ -1368,8 +1362,6 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead(
     let (pair_in_block_mask, useful_pairs_inclusive) = round2_pair_skip(padding, k_skip);
     #[cfg(target_arch = "aarch64")]
     let degen = r2_degen_enabled();
-    #[cfg(target_arch = "aarch64")]
-    let periodic_padding = r2_periodic_padding_enabled();
 
     // Same GPU round-two products arm as the incumbent sweep: it still
     // receives byte-identical anchors/deltas for every chunk and still owns
@@ -1444,7 +1436,6 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead(
                         pair_in_block_mask,
                         useful_pairs_inclusive,
                         degen,
-                        periodic_padding,
                         out.as_mut_ptr(),
                     );
                 } else if odd_on_gpu {
@@ -1460,7 +1451,6 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead(
                         pair_in_block_mask,
                         useful_pairs_inclusive,
                         degen,
-                        periodic_padding,
                         out.as_mut_ptr(),
                     );
                 } else {
@@ -1476,7 +1466,6 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead(
                         pair_in_block_mask,
                         useful_pairs_inclusive,
                         degen,
-                        periodic_padding,
                         out.as_mut_ptr(),
                     );
                 }
@@ -1575,7 +1564,6 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead(
                             pair_in_block_mask,
                             useful_pairs_inclusive,
                             degen,
-                            periodic_padding,
                             out.as_mut_ptr(),
                         );
                     }
@@ -3982,28 +3970,20 @@ mod tests {
         v
     }
 
-    fn with_round2_settings(mut body: impl FnMut()) {
-        // Both gates are phase-local reads, so exercise every combination.
-        for degen_off in [false, true] {
-            for periodic_off in [false, true] {
-                unsafe {
-                    if degen_off {
-                        std::env::set_var("FLOCK_NO_R2_DEGEN", "1");
-                    } else {
-                        std::env::remove_var("FLOCK_NO_R2_DEGEN");
-                    }
-                    if periodic_off {
-                        std::env::set_var("FLOCK_NO_ZC_R2_PERIODIC", "1");
-                    } else {
-                        std::env::remove_var("FLOCK_NO_ZC_R2_PERIODIC");
-                    }
+    fn with_degen_settings(mut body: impl FnMut()) {
+        // The kernels read `FLOCK_NO_R2_DEGEN` per phase call; run both.
+        for off in [false, true] {
+            unsafe {
+                if off {
+                    std::env::set_var("FLOCK_NO_R2_DEGEN", "1");
+                } else {
+                    std::env::remove_var("FLOCK_NO_R2_DEGEN");
                 }
-                body();
             }
+            body();
         }
         unsafe {
             std::env::remove_var("FLOCK_NO_R2_DEGEN");
-            std::env::remove_var("FLOCK_NO_ZC_R2_PERIODIC");
         }
     }
 
@@ -4016,7 +3996,7 @@ mod tests {
         for (m, ranked) in [(20usize, true), (20, false), (13, false), (16, true)] {
             let f = la_fixture(m, 0x1EA0_0001 ^ (m as u64), ranked);
             let r_next3 = la_r_next3(&f);
-            with_round2_settings(|| {
+            with_degen_settings(|| {
                 crate::scratch::clear();
                 let (compact, m1_l, mi_l) = uni_skip_fold_and_round_pair_compact_padded(
                     &f.a_packed,
@@ -4127,7 +4107,7 @@ mod tests {
             let f = la_fixture(m, 0x1EA0_0003 ^ (m as u64), ranked);
             let r_next3 = la_r_next3(&f);
             let r_next4 = la_r_next4(&f);
-            with_round2_settings(|| {
+            with_degen_settings(|| {
                 crate::scratch::clear();
                 let (compact, _, _) = uni_skip_fold_and_round_pair_compact_padded(
                     &f.a_packed,
@@ -4179,7 +4159,7 @@ mod tests {
         for m in [9usize, 10] {
             let f = la_fixture(m, 0x1EA0_0004 ^ (m as u64), false);
             let r_next3 = la_r_next3(&f);
-            with_round2_settings(|| {
+            with_degen_settings(|| {
                 crate::scratch::clear();
                 let (compact, _, _, la) = uni_skip_fold_and_round_pair_compact_padded_lookahead(
                     &f.a_packed,
@@ -4256,7 +4236,7 @@ mod tests {
             // r_next for the incumbent round-five message (tail i = 2).
             let mut r_next5 = vec![F128::ONE; f.mlv.len() - 3];
             r_next5[1..].copy_from_slice(&f.mlv[4..]);
-            with_round2_settings(|| {
+            with_degen_settings(|| {
                 crate::scratch::clear();
                 let (compact, _, _) = uni_skip_fold_and_round_pair_compact_padded(
                     &f.a_packed,

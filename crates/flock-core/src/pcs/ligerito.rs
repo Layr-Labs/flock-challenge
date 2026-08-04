@@ -10590,3 +10590,4 @@ mod tests {
 // RealAdii sample 2 on 18f9d67.
 // RealAdii sample 3 on 18f9d67.
 // RealAdii sample 4 on 18f9d67.
+// welttowelt draw 2 of the T3 tree on 55d2752 (draw 1: 1,630,442.89; zero-diff marker).
