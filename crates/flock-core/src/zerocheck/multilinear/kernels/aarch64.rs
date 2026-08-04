@@ -944,6 +944,204 @@ pub(crate) unsafe fn fold2_compact_and_round4_chunk_neon_8(
     }
 }
 
+/// Cascade variant of [`fold2_compact_and_round4_chunk_neon_8`]: identical
+/// per-output value computation and byte-identical stores, but K outputs are
+/// visited FOUR at a time — one round-**five** group `y' = out/4` (two
+/// adjacent round-4 pairs) — so the six deferred round-five aggregates can be
+/// formed while the group's outputs are still live in registers, exactly the
+/// position the round-2 sweep exploited for the round-3 lookahead.
+///
+/// **One weight per group, one scaling per row** (the same reshape as
+/// [`fold_round2_compact_chunk_neon_lookahead_8`]): with `r' = r_next4[1]`,
+/// `eq4(2y') = (1+r')·eq5(y')` and `eq4(2y'+1) = r'·eq5(y')`, so the whole
+/// group accumulates against the single odd-lane weight `w = eq4_lo[2t+1]`,
+/// the four A outputs are pre-scaled by `w` with four reduced multiplies, and
+/// all eight products cost one unreduced multiply each. The constant
+/// rescalings (`kappa = (1+r')/r'` on the even round-4 sums, `r'^-1` on the
+/// six deferred aggregates) are applied once by the driver, off the hot path.
+///
+/// Writes eight F128 slots to `out`, every one of them `w`-weighted:
+///
+/// | slot | value |
+/// |---|---|
+/// | 0, 1 | `sum_{u even} w·a1·b1`, `sum_{u even} w·(a0+a1)(b0+b1)` |
+/// | 2, 3 | the same two sums over **odd** round-4 pairs `u` — i.e. `r'·W1'`, `r'·W2'` |
+/// | 4..8 | `r'·W0'`, `r'·W3'`, `r'·W4'`, `r'·W5'` |
+///
+/// with `W0' = Σ eq5·a2b2`, `W3'/W4'/W5'` the even/odd K-output-parity split
+/// (`e = out[4y']+out[4y'+2]`, `o = out[4y'+1]+out[4y'+3]`), mirroring the
+/// round-3 lookahead's aggregate shape one level deeper.
+///
+/// The incumbent kernel's per-pair `b_flat` product shortcuts are replaced by
+/// a group-level `b ≡ 1` shortcut (all four `b` outputs equal ONE, value
+/// gated): every difference product vanishes (`b0+b1 = b2+b3 = e_b = o_b =
+/// 0`) and the three survivors are `w·a1`, `w·a3`, `w·a2` — three unreduced
+/// multiplies for the whole group. Mixed groups take the full path, which is
+/// value-identical (products of genuinely-zero factors XOR in as zero).
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "aes")]
+#[allow(clippy::too_many_arguments)]
+pub(crate) unsafe fn fold2_compact_and_round45_chunk_neon_8(
+    table_l1: *const u8,
+    table_l3: *const u8,
+    rho2: F128,
+    anchors: *const F128,
+    deltas: *const u8,
+    a_out: *mut F128,
+    b_out: *mut F128,
+    eq_lo: *const F128,
+    out_pairs: usize,
+    degen: bool,
+    out: *mut F128,
+) {
+    use core::arch::aarch64::*;
+
+    #[inline(always)]
+    unsafe fn store_pair_nt(dst: *mut F128, x: uint64x2_t, y: uint64x2_t) {
+        unsafe {
+            core::arch::asm!(
+                "stnp {x:q}, {y:q}, [{dst}]",
+                dst = in(reg) dst,
+                x = in(vreg) x,
+                y = in(vreg) y,
+                options(nostack, preserves_flags),
+            );
+        }
+    }
+
+    unsafe {
+        let zero = vdupq_n_u64(0);
+        let rho2_q = core::mem::transmute::<F128, uint64x2_t>(rho2);
+        let one_q = core::mem::transmute::<F128, uint64x2_t>(F128::ONE);
+        let mut p1_even = WideNeon { lo: zero, hi: zero };
+        let mut pinf_even = WideNeon { lo: zero, hi: zero };
+        let mut p1_odd = WideNeon { lo: zero, hi: zero };
+        let mut pinf_odd = WideNeon { lo: zero, hi: zero };
+        let mut w0 = WideNeon { lo: zero, hi: zero };
+        let mut w3 = WideNeon { lo: zero, hi: zero };
+        let mut w4 = WideNeon { lo: zero, hi: zero };
+        let mut w5 = WideNeon { lo: zero, hi: zero };
+
+        debug_assert!(out_pairs >= 2 && out_pairs.is_multiple_of(2));
+        let n5 = out_pairs / 2;
+        for t in 0..n5 {
+            let mut av = [zero; 4];
+            let mut bv = [zero; 4];
+            let mut b_flat = true;
+            for lane in 0..4usize {
+                let g = 4 * t + lane;
+                let ap = anchors.add(4 * g).cast::<u64>();
+                let anc_a0 = vld1q_u64(ap);
+                let anc_b0 = vld1q_u64(ap.add(2));
+                let anc_a1 = vld1q_u64(ap.add(4));
+                let anc_b1 = vld1q_u64(ap.add(6));
+
+                let dp = deltas.add(32 * g);
+                let da0 = u64::from_le(core::ptr::read_unaligned(dp.cast::<u64>()));
+                let db0 = u64::from_le(core::ptr::read_unaligned(dp.add(8).cast::<u64>()));
+                let da1 = u64::from_le(core::ptr::read_unaligned(dp.add(16).cast::<u64>()));
+                let db1 = u64::from_le(core::ptr::read_unaligned(dp.add(24).cast::<u64>()));
+
+                let a_delta = veorq_u64(
+                    lookup_lanes_q::<8>(table_l1, da0, 0),
+                    lookup_lanes_q::<8>(table_l3, da1, 0),
+                );
+                av[lane] = xor3_u64(
+                    anc_a0,
+                    mul_q(rho2_q, veorq_u64(anc_a0, anc_a1)),
+                    a_delta,
+                );
+
+                if degen && (db0 | db1) == 0 {
+                    // b rows are constant across the group: zero deltas mean
+                    // both b halves equal their anchors.
+                    let bd = veorq_u64(anc_b0, anc_b1);
+                    bv[lane] = if is_zero_q(bd) {
+                        anc_b0
+                    } else {
+                        b_flat = false;
+                        veorq_u64(anc_b0, mul_q(rho2_q, bd))
+                    };
+                } else {
+                    b_flat = false;
+                    let b_delta = veorq_u64(
+                        lookup_lanes_q::<8>(table_l1, db0, 0),
+                        lookup_lanes_q::<8>(table_l3, db1, 0),
+                    );
+                    bv[lane] = xor3_u64(
+                        anc_b0,
+                        mul_q(rho2_q, veorq_u64(anc_b0, anc_b1)),
+                        b_delta,
+                    );
+                }
+            }
+
+            store_pair_nt(a_out.add(4 * t), av[0], av[1]);
+            store_pair_nt(a_out.add(4 * t + 2), av[2], av[3]);
+            store_pair_nt(b_out.add(4 * t), bv[0], bv[1]);
+            store_pair_nt(b_out.add(4 * t + 2), bv[2], bv[3]);
+
+            // The odd round-4 pair's weight drives the whole group; see doc.
+            let w = vld1q_u64(eq_lo.add(2 * t + 1).cast::<u64>());
+
+            if b_flat {
+                // Every b output equals its anchor; check the b≡1 mass.
+                let ones_miss = vorrq_u64(
+                    vorrq_u64(veorq_u64(bv[0], one_q), veorq_u64(bv[1], one_q)),
+                    vorrq_u64(veorq_u64(bv[2], one_q), veorq_u64(bv[3], one_q)),
+                );
+                if is_zero_q(ones_miss) {
+                    wide_xor(&mut p1_even, mul_unreduced_q(w, av[1]));
+                    wide_xor(&mut p1_odd, mul_unreduced_q(w, av[3]));
+                    wide_xor(&mut w0, mul_unreduced_q(w, av[2]));
+                    continue;
+                }
+            }
+
+            // Weight-sharing reshape: four reduced row scalings, then every
+            // product below is one unreduced multiply.
+            let a0w = mul_q(w, av[0]);
+            let a1w = mul_q(w, av[1]);
+            let a2w = mul_q(w, av[2]);
+            let a3w = mul_q(w, av[3]);
+
+            // ---- round-four products, split by round-4-pair parity ----
+            wide_xor(&mut p1_even, mul_unreduced_q(a1w, bv[1]));
+            wide_xor(
+                &mut pinf_even,
+                mul_unreduced_q(veorq_u64(a0w, a1w), veorq_u64(bv[0], bv[1])),
+            );
+            wide_xor(&mut p1_odd, mul_unreduced_q(a3w, bv[3]));
+            wide_xor(
+                &mut pinf_odd,
+                mul_unreduced_q(veorq_u64(a2w, a3w), veorq_u64(bv[2], bv[3])),
+            );
+
+            // ---- deferred round-five aggregates (no extra loads) ----
+            wide_xor(&mut w0, mul_unreduced_q(a2w, bv[2]));
+            let e_aw = veorq_u64(a0w, a2w);
+            let o_aw = veorq_u64(a1w, a3w);
+            let e_b = veorq_u64(bv[0], bv[2]);
+            let o_b = veorq_u64(bv[1], bv[3]);
+            wide_xor(&mut w3, mul_unreduced_q(e_aw, e_b));
+            wide_xor(&mut w4, mul_unreduced_q(o_aw, o_b));
+            wide_xor(
+                &mut w5,
+                mul_unreduced_q(veorq_u64(e_aw, o_aw), veorq_u64(e_b, o_b)),
+            );
+        }
+
+        *out.add(0) = core::mem::transmute::<uint64x2_t, F128>(reduce_wide_q(p1_even));
+        *out.add(1) = core::mem::transmute::<uint64x2_t, F128>(reduce_wide_q(pinf_even));
+        *out.add(2) = core::mem::transmute::<uint64x2_t, F128>(reduce_wide_q(p1_odd));
+        *out.add(3) = core::mem::transmute::<uint64x2_t, F128>(reduce_wide_q(pinf_odd));
+        *out.add(4) = core::mem::transmute::<uint64x2_t, F128>(reduce_wide_q(w0));
+        *out.add(5) = core::mem::transmute::<uint64x2_t, F128>(reduce_wide_q(w3));
+        *out.add(6) = core::mem::transmute::<uint64x2_t, F128>(reduce_wide_q(w4));
+        *out.add(7) = core::mem::transmute::<uint64x2_t, F128>(reduce_wide_q(w5));
+    }
+}
+
 /// XOR of the `L` table entries for byte lanes `lane0..lane0 + L` of `code`.
 /// One 16-byte L1 load per lane; the tree shape matches `fold_row_q` so the
 /// full-width (`L = 8`, `lane0 = 0`) case is instruction-equivalent.
@@ -1532,6 +1730,122 @@ fn fold_and_message_body<const NT: bool>(
         let a1 = a_even_1 + r_fold * (a_even_1 + a_odd_1);
         let b0 = b_even_0 + r_fold * (b_even_0 + b_odd_0);
         let b1 = b_even_1 + r_fold * (b_even_1 + b_odd_1);
+
+        if NT {
+            // SAFETY: `o + 1 < a_out.len()` by the len contract above; F128
+            // is repr(C, align(16)) two u64s, bit-compatible with uint64x2_t;
+            // each 32-byte pair store is 16-byte aligned and lands in this
+            // iteration's disjoint output slots.
+            unsafe {
+                store_pair_nt(
+                    a_out_ptr.add(o),
+                    core::mem::transmute::<F128, uint64x2_t>(a0),
+                    core::mem::transmute::<F128, uint64x2_t>(a1),
+                );
+                store_pair_nt(
+                    b_out_ptr.add(o),
+                    core::mem::transmute::<F128, uint64x2_t>(b0),
+                    core::mem::transmute::<F128, uint64x2_t>(b1),
+                );
+            }
+        } else {
+            a_out[o] = a0;
+            a_out[o + 1] = a1;
+            b_out[o] = b0;
+            b_out[o + 1] = b1;
+        }
+
+        p1_acc ^= eq_l.mul_unreduced(a1 * b1);
+        pinf_acc ^= eq_l.mul_unreduced((a0 + a1) * (b0 + b1));
+    }
+
+    (p1_acc.reduce(), pinf_acc.reduce())
+}
+
+/// Two-challenge composed variant of [`fold_and_message_aarch64`] (cascade):
+/// binds `rho_a` then `rho_b` in ONE pass — quartering the tables instead of
+/// halving them — and emits the following round's message from the composed
+/// outputs. Replaces two sequential fused tail rounds: same fold ALU (three
+/// reduced multiplies per output vs 2+1 across the two passes), but the
+/// intermediate half-size tables are never written or re-read.
+///
+/// Value-identical to `fold(rho_a)` then `fold(rho_b)`: the composition
+/// `t0 + rho_b·(t0+t1)` over the two rho_a-folded halves IS the sequential
+/// result, term for term — no reassociation at all, just deleted traffic.
+#[cfg(target_arch = "aarch64")]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn fold2_and_message_aarch64(
+    a_in: &[F128],
+    b_in: &[F128],
+    a_out: &mut [F128],
+    b_out: &mut [F128],
+    rho_a: F128,
+    rho_b: F128,
+    eq_lo: &[F128],
+    nt_stores: bool,
+) -> (F128, F128) {
+    // Same NT policy as `fold_and_message_aarch64`: decided once per round by
+    // the driver from the ROUND's output size, not per chunk.
+    if nt_stores {
+        fold2_and_message_body::<true>(a_in, b_in, a_out, b_out, rho_a, rho_b, eq_lo)
+    } else {
+        fold2_and_message_body::<false>(a_in, b_in, a_out, b_out, rho_a, rho_b, eq_lo)
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+fn fold2_and_message_body<const NT: bool>(
+    a_in: &[F128],
+    b_in: &[F128],
+    a_out: &mut [F128],
+    b_out: &mut [F128],
+    rho_a: F128,
+    rho_b: F128,
+    eq_lo: &[F128],
+) -> (F128, F128) {
+    use core::arch::aarch64::uint64x2_t;
+
+    debug_assert_eq!(a_in.len(), 4 * a_out.len());
+    debug_assert_eq!(b_in.len(), 4 * b_out.len());
+    debug_assert_eq!(a_out.len(), 2 * eq_lo.len());
+
+    #[inline(always)]
+    unsafe fn store_pair_nt(dst: *mut F128, x: uint64x2_t, y: uint64x2_t) {
+        unsafe {
+            core::arch::asm!(
+                "stnp {x:q}, {y:q}, [{dst}]",
+                dst = in(reg) dst,
+                x = in(vreg) x,
+                y = in(vreg) y,
+                options(nostack, preserves_flags),
+            );
+        }
+    }
+
+    // One composed output from four consecutive inputs: two rho_a folds, one
+    // rho_b fold. Exactly the value the two sequential passes produce.
+    #[inline(always)]
+    fn fold4(v: &[F128], i: usize, rho_a: F128, rho_b: F128) -> F128 {
+        let t0 = v[i] + rho_a * (v[i] + v[i + 1]);
+        let t1 = v[i + 2] + rho_a * (v[i + 2] + v[i + 3]);
+        t0 + rho_b * (t0 + t1)
+    }
+
+    let mut p1_acc = F256Unreduced::ZERO;
+    let mut pinf_acc = F256Unreduced::ZERO;
+
+    let a_out_ptr = a_out.as_mut_ptr();
+    let b_out_ptr = b_out.as_mut_ptr();
+
+    for (x_lo, &eq_l) in eq_lo.iter().enumerate() {
+        let i = 8 * x_lo;
+        let o = 2 * x_lo;
+
+        let a0 = fold4(a_in, i, rho_a, rho_b);
+        let a1 = fold4(a_in, i + 4, rho_a, rho_b);
+        let b0 = fold4(b_in, i, rho_a, rho_b);
+        let b1 = fold4(b_in, i + 4, rho_a, rho_b);
 
         if NT {
             // SAFETY: `o + 1 < a_out.len()` by the len contract above; F128

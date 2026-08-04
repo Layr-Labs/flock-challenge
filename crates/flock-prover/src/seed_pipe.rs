@@ -48,6 +48,27 @@
 //! `FsChallenger` built from the same domain and hash as the worker's, and the
 //! worker's own challenger is dropped unread.
 //!
+//! # Lazy blocks (QS1): seed→witness overlap
+//!
+//! Even the parallel regeneration is a barrier: the speculative prove used to
+//! wait for the last of 262,144 blocks to land in the 29.4 MiB buffer, and
+//! witness generation then re-read all of it from DRAM. But the generator is
+//! counter-based — block `i` is [`gen_block`]`(init, i)`, 25 fused draws with
+//! no cross-block state — and the SIMD witgen quad loop owns each 8-block
+//! range exclusively. So in lazy mode (the default) the prove starts the
+//! instant the seed parses, and each witgen quad regenerates its own four
+//! blocks into registers/L1; the buffer's slots are never written *or read*.
+//! The buffer still exists because adoption keys on it: [`try_adopt`]'s gate
+//! compares length plus two privately stored endpoint **copies**
+//! (`State::endpoints`) instead of dereferencing the vector's interior — the
+//! same O(1) argument as the fast gate, and valid for the same reason (lazy
+//! mode is armed only when the warm-up proved [`gen_block`] reproduces the
+//! protected generator, and both sides parsed the identical forwarded bytes).
+//! Witgen paths that read the slice itself (the scalar/common drivers, i.e.
+//! kill-switch territory) backfill the slots first via
+//! [`materialize_spec_blocks`]. `FLOCK_NO_SPEC_LAZY_BLOCKS=1` restores the
+//! eager parallel fill unchanged.
+//!
 //! # Safety rails
 //!
 //! - Arms only in the ranked worker (argv shape) and only once.
@@ -61,7 +82,7 @@
 //!   only thing standing between a bug here and an invalid proof) discards the
 //!   speculative result and re-proves normally.
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 
 use flock_core::pcs::Commitment;
@@ -112,8 +133,10 @@ pub fn generate_compressions_par(log2_size: u32, seed: u64) -> Vec<Compression> 
 /// Reserve `count` block slots without the 28 MiB zero-fill.
 ///
 /// Skipping the zero-fill matters: at ~1.5 ms it would be half the block we are
-/// trying to reclaim. Every slot is written by [`fill_compressions_par`] before
-/// anything reads one.
+/// trying to reclaim. No slot is ever read before it is written: the eager path
+/// fills all of them via [`fill_compressions_par`], and the lazy path (QS1)
+/// reads none at all — witgen synthesizes contents and the adoption gate reads
+/// endpoint copies.
 #[allow(clippy::uninit_vec)]
 fn uninit_blocks(count: usize) -> Vec<Compression> {
     let mut v: Vec<Compression> = Vec::with_capacity(count);
@@ -150,10 +173,46 @@ pub(crate) fn prefaulted_blocks(count: usize) -> Vec<Compression> {
     v
 }
 
+/// The reference generator's initial state for `(log2_size, seed)` —
+/// `flock_benchmark_common::generate_compressions` seeds its `Rng` with
+/// exactly this value.
+#[inline(always)]
+fn generator_init(log2_size: u32, seed: u64) -> u64 {
+    seed ^ u64::from(log2_size).rotate_left(29)
+}
+
+/// One block of the protected generator's output, from the closed form.
+///
+/// The reference RNG's state recurrence is `s += GOLDEN` (the mixing function
+/// is not fed back), so the state before block `i`'s first draw is
+/// `init + 25·i·GOLDEN` and every block is computable in isolation. This is
+/// the single definition both the eager parallel fill and the lazy per-quad
+/// witgen regeneration write through, so their bit-exactness is one property:
+/// `seed_pipe_matches_reference_generator` pins it against a literal
+/// transcription of the reference.
+#[inline(always)]
+pub(crate) fn gen_block(init: u64, block: usize) -> Compression {
+    let mut s = init.wrapping_add(((DRAWS_PER_BLOCK * block) as u64).wrapping_mul(GOLDEN));
+    let mut cv = [0u32; 8];
+    for word in cv.iter_mut() {
+        s = s.wrapping_add(GOLDEN);
+        *word = mix(s);
+    }
+    let mut message = [0u32; 16];
+    for word in message.iter_mut() {
+        s = s.wrapping_add(GOLDEN);
+        *word = mix(s);
+    }
+    s = s.wrapping_add(GOLDEN);
+    (cv, message, u64::from(mix(s)), 64, 11)
+}
+
 /// Fill `out` with the blocks the protected generator would produce.
 fn fill_compressions_par(out: &mut [Compression], log2_size: u32, seed: u64) {
-    let init = seed ^ u64::from(log2_size).rotate_left(29);
+    fill_compressions_from_init(out, generator_init(log2_size, seed));
+}
 
+fn fill_compressions_from_init(out: &mut [Compression], init: u64) {
     // 4096 blocks ≈ 448 KiB per task: large enough that the RNG chain
     // dominates task overhead, small enough to keep all workers fed.
     out.par_chunks_mut(4096)
@@ -161,24 +220,76 @@ fn fill_compressions_par(out: &mut [Compression], log2_size: u32, seed: u64) {
         .for_each(|(chunk_index, dst)| {
             let base = chunk_index * 4096;
             for (offset, slot) in dst.iter_mut().enumerate() {
-                let block = base + offset;
-                let mut s = init.wrapping_add(
-                    ((DRAWS_PER_BLOCK * block) as u64).wrapping_mul(GOLDEN),
-                );
-                let mut cv = [0u32; 8];
-                for word in cv.iter_mut() {
-                    s = s.wrapping_add(GOLDEN);
-                    *word = mix(s);
-                }
-                let mut message = [0u32; 16];
-                for word in message.iter_mut() {
-                    s = s.wrapping_add(GOLDEN);
-                    *word = mix(s);
-                }
-                s = s.wrapping_add(GOLDEN);
-                *slot = (cv, message, u64::from(mix(s)), 64, 11);
+                *slot = gen_block(init, base + offset);
             }
         });
+}
+
+// ---------------------------------------------------------------------------
+// Lazy blocks (QS1): the identity of the in-flight speculative buffer
+// ---------------------------------------------------------------------------
+
+/// Data pointer of the lazy speculative buffer, or 0 when no lazy run is in
+/// flight. Captured from the vec's own `as_mut_ptr` *before* it is frozen
+/// behind the pipe's `Arc` (the allocation's address survives the move), so
+/// [`materialize_spec_blocks`] can backfill through a pointer with write
+/// provenance. Published with `Release` after [`SPEC_LEN`]/[`SPEC_INIT`];
+/// readers pair with `Acquire`. Never recycled: the pipe state holds the
+/// `Arc` for the life of the process, so a stale non-zero value can never
+/// alias another live slice.
+static SPEC_BASE: AtomicUsize = AtomicUsize::new(0);
+static SPEC_LEN: AtomicUsize = AtomicUsize::new(0);
+static SPEC_INIT: AtomicU64 = AtomicU64::new(0);
+
+/// Exact-`1` kill for lazy mode; anything else leaves the new path on.
+fn lazy_blocks_killed() -> bool {
+    std::env::var("FLOCK_NO_SPEC_LAZY_BLOCKS").is_ok_and(|v| v == "1")
+}
+
+/// If `blocks` is the live lazy speculative buffer, return the generator
+/// init so the caller synthesizes block contents via [`gen_block`] instead of
+/// reading slots that were never written. `None` for every other slice —
+/// the wrapper's own blocks, warm-up blocks, tests — which keeps all of them
+/// on their ordinary read path at the cost of one relaxed-ish load.
+#[inline]
+pub(crate) fn spec_gen_init(blocks: &[Compression]) -> Option<u64> {
+    let base = SPEC_BASE.load(Ordering::Acquire);
+    if base == 0
+        || base != blocks.as_ptr() as usize
+        || SPEC_LEN.load(Ordering::Relaxed) != blocks.len()
+    {
+        return None;
+    }
+    Some(SPEC_INIT.load(Ordering::Relaxed))
+}
+
+/// Backfill the whole lazy buffer for witgen paths that read the slice
+/// itself (the scalar/common drivers — kill-switch territory; the ranked
+/// SIMD quad path synthesizes per group and never calls this). No-op for
+/// every slice that is not the live lazy buffer.
+///
+/// Single writer by construction: only the seed-pipe thread's prove reaches
+/// a witgen entry with the matching pointer, and each witgen entry runs the
+/// backfill before any block is read, on the same call stack.
+pub(crate) fn materialize_spec_blocks(blocks: &[Compression]) {
+    let base = SPEC_BASE.load(Ordering::Acquire);
+    if base == 0
+        || base != blocks.as_ptr() as usize
+        || SPEC_LEN.load(Ordering::Relaxed) != blocks.len()
+    {
+        return;
+    }
+    let init = SPEC_INIT.load(Ordering::Relaxed);
+    // SAFETY: `base` is the buffer's own `as_mut_ptr`, captured before the
+    // vec was frozen behind the pipe's `Arc`, which the pipe state keeps
+    // alive for the process lifetime; the length was stored alongside it.
+    // Nothing reads a slot until this fill returns (the adoption gate reads
+    // endpoint copies, never slots), and no other writer exists.
+    let out = unsafe { std::slice::from_raw_parts_mut(base as *mut Compression, blocks.len()) };
+    fill_compressions_from_init(out, init);
+    // The buffer is now an ordinary filled vector; drop the lazy identity so
+    // any later reader takes the plain slice path.
+    SPEC_BASE.store(0, Ordering::Release);
 }
 
 /// Parallel byte-equality over the two block vectors.
@@ -221,6 +332,11 @@ fn bytes_of(v: &[Compression]) -> &[u8] {
 #[derive(Default)]
 struct State {
     blocks: Option<Arc<Vec<Compression>>>,
+    /// Lazy mode only: copies of block 0 and block N−1, regenerated from the
+    /// parsed seed at publish time. The adoption gate compares these instead
+    /// of `blocks[0]`/`blocks[N−1]` because in lazy mode those slots were
+    /// never written — the buffer exists purely as the run's identity.
+    endpoints: Option<(Compression, Compression)>,
     result: Option<ProveOut>,
     dead: bool,
     /// Instant the seed line was read — trial t≈0. Only read for the
@@ -521,18 +637,41 @@ fn speculative_main(
     let seed_at = std::time::Instant::now();
     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let mut buf = std::mem::take(&mut scratch);
-        let blocks = if buf.len() == 1usize << log2_size {
+        let n_total = 1usize << log2_size;
+        // QS1 lazy mode: skip the eager fill barrier entirely. The prove
+        // starts right now; witgen regenerates blocks in place (SIMD quad
+        // path) or backfills the buffer first (scalar paths, via
+        // `materialize_spec_blocks`). Gated on the warm-up generator proof
+        // because the adoption gate's endpoint *copies* below are only as
+        // trustworthy as `gen_block` itself — without that proof the timed
+        // path must keep the full byte comparison, which needs a filled
+        // buffer, so fall through to the eager fill.
+        let lazy = buf.len() == n_total
+            && GENERATOR_VERIFIED.load(Ordering::SeqCst)
+            && !lazy_blocks_killed();
+        let (blocks, endpoints) = if lazy {
+            let init = generator_init(log2_size, seed);
+            let endpoints = (gen_block(init, 0), gen_block(init, n_total - 1));
+            // Write provenance for a possible backfill; the address is
+            // stable across the move into the Arc.
+            let base = buf.as_mut_ptr() as usize;
+            SPEC_INIT.store(init, Ordering::Relaxed);
+            SPEC_LEN.store(buf.len(), Ordering::Relaxed);
+            SPEC_BASE.store(base, Ordering::Release);
+            (Arc::new(buf), Some(endpoints))
+        } else if buf.len() == n_total {
             fill_compressions_par(&mut buf, log2_size, seed);
-            Arc::new(buf)
+            (Arc::new(buf), None)
         } else {
             // Pre-faulting failed or the shape moved; the allocating path is
             // still exactly correct, just slower.
-            Arc::new(generate_compressions_par(log2_size, seed))
+            (Arc::new(generate_compressions_par(log2_size, seed)), None)
         };
         {
             let mut state = shared().state.lock().unwrap_or_else(|e| e.into_inner());
             state.seed_at = Some(seed_at);
             state.blocks_at = Some(std::time::Instant::now());
+            state.endpoints = endpoints;
             state.blocks = Some(Arc::clone(&blocks));
             shared().signal.notify_all();
         }
@@ -584,12 +723,23 @@ pub(crate) fn try_adopt(blocks: &[Compression]) -> Option<ProveOut> {
         return None;
     }
     let speculative = Arc::clone(state.blocks.as_ref()?);
+    let endpoints = state.endpoints;
     let seed_at = state.seed_at;
     let blocks_at = state.blocks_at;
     drop(state);
 
     let fast_gate = GENERATOR_VERIFIED.load(Ordering::SeqCst);
-    let matched = if fast_gate {
+    let matched = if let Some((first, last)) = &endpoints {
+        // QS1 lazy buffer: its interior slots were never written, so the gate
+        // must not dereference them. Length plus the two regenerated endpoint
+        // copies is the same O(1) argument as the fast gate below — lazy mode
+        // only arms when the warm-up proved `gen_block` reproduces the
+        // wrapper's generator, and both sides parsed identical forwarded
+        // bytes, so a different seed would already differ at block 0.
+        speculative.len() == blocks.len()
+            && blocks.first() == Some(first)
+            && blocks.last() == Some(last)
+    } else if fast_gate {
         // Agreement was established for this build during the untimed warm-up,
         // and both vectors were expanded from the *same bytes*: the forwarding
         // thread writes back verbatim what it read, so the wrapper parsed the
@@ -730,6 +880,32 @@ mod tests {
         let b = generate_compressions_par(10, WARMUP_SEED ^ 1);
         assert_ne!(a.first(), b.first());
         assert_ne!(a.last(), b.last());
+    }
+
+    /// The lazy witgen path regenerates single blocks via `gen_block`; pin it
+    /// against the parallel fill (itself pinned against the reference), at
+    /// every position class the quad loop can ask for.
+    #[test]
+    fn gen_block_matches_the_parallel_fill_at_every_index() {
+        let (log2, seed) = (13u32, 0xDEAD_BEEF_1234_5678u64);
+        let all = generate_compressions_par(log2, seed);
+        let init = generator_init(log2, seed);
+        // Cross a 4096-block task boundary (the eager fill's chunk size) and
+        // both endpoints.
+        for &i in &[0usize, 1, 7, 8, 4095, 4096, all.len() - 2, all.len() - 1] {
+            assert_eq!(gen_block(init, i), all[i], "block {i}");
+        }
+    }
+
+    /// Slices that are not the live lazy buffer must take the ordinary read
+    /// path: no synth init, and materialization must be a no-op.
+    #[test]
+    fn lazy_identity_is_inert_for_foreign_slices() {
+        let blocks = generate_compressions_par(8, 42);
+        assert!(spec_gen_init(&blocks).is_none());
+        let before = blocks.clone();
+        materialize_spec_blocks(&blocks);
+        assert_eq!(blocks, before);
     }
 
     #[test]

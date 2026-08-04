@@ -4022,71 +4022,128 @@ fn materialize_direct_fold8(
     }));
     let deferred_reduce = super::use_fold_deferred_reduce();
 
+    // One shared per-block body for both drains below, so the scheduling
+    // choice cannot drift from the value computation. For block `i` it fully
+    // rewrites `f_out`/`b_out` (each slot written before any read) from the
+    // disjoint witness stripe `[64·i·B, 64·(i+1)·B)` and returns the block's
+    // round-0 partial. Which worker (or pool) runs a block cannot change a
+    // single bit of it.
+    let fold8_block = |scratch: &mut Vec<F128>,
+                       block: usize,
+                       b_out: &mut [F128],
+                       f_out: &mut [F128]|
+     -> (F128, F128) {
+        let start = 64 * block * block_len;
+        let f_in = &packed_witness[start..start + 64 * block_len];
+        let b_in: &[F128] = if has_ordinary {
+            &ordinary_basis[start..start + 64 * block_len]
+        } else {
+            &[]
+        };
+        let fold64 = |input: &[F128], slot: usize| {
+            let base = 64 * slot;
+            if deferred_reduce {
+                return crate::field::f128_slice::fold_banked_slot::<64>(
+                    &fold_weight,
+                    &input[base..base + 64],
+                );
+            }
+            let mut value = F128::ZERO;
+            for bank in 0..64 {
+                value += fold_weight[bank] * input[base + bank];
+            }
+            value
+        };
+
+        let (first_claim, rest_claims) = claims.split_first().unwrap();
+        let (first_table, rest_tables) = direct_tables.split_first().unwrap();
+        super::ring_switch::compose_fold_byte_table_into(
+            first_claim.eq_hi[block],
+            first_table,
+            scratch,
+        );
+        for slot in 0..block_len {
+            f_out[slot] = fold64(f_in, slot);
+            let direct = super::ring_switch::fold_one_slot(first_claim.eq_lo[slot], scratch);
+            b_out[slot] = if has_ordinary {
+                direct + fold64(b_in, slot)
+            } else {
+                direct
+            };
+        }
+        for (claim, table) in rest_claims.iter().zip(rest_tables.iter()) {
+            super::ring_switch::compose_fold_byte_table_into(claim.eq_hi[block], table, scratch);
+            for (slot, out) in b_out.iter_mut().enumerate() {
+                *out += super::ring_switch::fold_one_slot(claim.eq_lo[slot], scratch);
+            }
+        }
+        super::round0_deferred(f_out, b_out)
+    };
+
     let mut folded_f = crate::scratch::take_f128(out_len);
     let mut folded_b = crate::scratch::take_f128(out_len);
-    let stats = folded_b
-        .par_chunks_mut(block_len)
-        .zip(folded_f.par_chunks_mut(block_len))
-        .enumerate()
-        .map_init(
+    let stats = if super::use_open_mat_hetero(
+        packed_witness.len(),
+        block_len,
+        claims.len(),
+        has_ordinary,
+    ) {
+        // Heterogeneous drain: the 256 blocks go through the shared P/E
+        // atomic queue (same worker-private-scratch shape as
+        // `pcs::run_hetero_open_combine_blocks`, same 33.5M-product census
+        // rationale — see `pcs::use_open_mat_hetero`). Each queue index owns
+        // its disjoint `f_out`/`b_out` stripes and one partial slot until
+        // the synchronous two-pool join publishes them. The partials are
+        // reduced by block index after the join; in char 2 the sum is an
+        // XOR multiset, so the message equals the rayon `reduce` bitwise.
+        let n_blocks = out_len / block_len;
+        let mut partials = vec![(F128::ZERO, F128::ZERO); n_blocks];
+        let f_base = crate::epool::SyncPtr(folded_f.as_mut_ptr());
+        let b_base = crate::epool::SyncPtr(folded_b.as_mut_ptr());
+        let partials_base = crate::epool::SyncPtr(partials.as_mut_ptr());
+        crate::epool::run_hetero_chunks_stateful(
+            n_blocks,
             || vec![F128::ZERO; super::ring_switch::FOLD_TABLE_LEN],
-            |scratch, (block, (b_out, f_out))| {
-                let start = 64 * block * block_len;
-                let f_in = &packed_witness[start..start + 64 * block_len];
-                let b_in: &[F128] = if has_ordinary {
-                    &ordinary_basis[start..start + 64 * block_len]
-                } else {
-                    &[]
-                };
-                let fold64 = |input: &[F128], slot: usize| {
-                    let base = 64 * slot;
-                    if deferred_reduce {
-                        return crate::field::f128_slice::fold_banked_slot::<64>(
-                            &fold_weight,
-                            &input[base..base + 64],
-                        );
-                    }
-                    let mut value = F128::ZERO;
-                    for bank in 0..64 {
-                        value += fold_weight[bank] * input[base + bank];
-                    }
-                    value
-                };
-
-                let (first_claim, rest_claims) = claims.split_first().unwrap();
-                let (first_table, rest_tables) = direct_tables.split_first().unwrap();
-                super::ring_switch::compose_fold_byte_table_into(
-                    first_claim.eq_hi[block],
-                    first_table,
-                    scratch,
-                );
-                for slot in 0..block_len {
-                    f_out[slot] = fold64(f_in, slot);
-                    let direct =
-                        super::ring_switch::fold_one_slot(first_claim.eq_lo[slot], scratch);
-                    b_out[slot] = if has_ordinary {
-                        direct + fold64(b_in, slot)
-                    } else {
-                        direct
-                    };
-                }
-                for (claim, table) in rest_claims.iter().zip(rest_tables.iter()) {
-                    super::ring_switch::compose_fold_byte_table_into(
-                        claim.eq_hi[block],
-                        table,
-                        scratch,
+            |scratch, block| {
+                // SAFETY: the queue hands out each `block` exactly once; it
+                // owns output range `[block·B, (block+1)·B)` in both arrays
+                // and one partial slot; the two-pool join publishes all
+                // writes before the reduce reads them.
+                unsafe {
+                    let f_out = core::slice::from_raw_parts_mut(
+                        f_base.ptr().add(block * block_len),
+                        block_len,
                     );
-                    for (slot, out) in b_out.iter_mut().enumerate() {
-                        *out += super::ring_switch::fold_one_slot(claim.eq_lo[slot], scratch);
-                    }
+                    let b_out = core::slice::from_raw_parts_mut(
+                        b_base.ptr().add(block * block_len),
+                        block_len,
+                    );
+                    partials_base
+                        .ptr()
+                        .add(block)
+                        .write(fold8_block(scratch, block, b_out, f_out));
                 }
-                super::round0_deferred(f_out, b_out)
             },
-        )
-        .reduce(
-            || (F128::ZERO, F128::ZERO),
-            |(x0, x2), (y0, y2)| (x0 + y0, x2 + y2),
         );
+        partials
+            .into_iter()
+            .fold((F128::ZERO, F128::ZERO), |(x0, x2), (y0, y2)| {
+                (x0 + y0, x2 + y2)
+            })
+    } else {
+        folded_b
+            .par_chunks_mut(block_len)
+            .zip(folded_f.par_chunks_mut(block_len))
+            .enumerate()
+            .map_init(
+                || vec![F128::ZERO; super::ring_switch::FOLD_TABLE_LEN],
+                |scratch, (block, (b_out, f_out))| fold8_block(scratch, block, b_out, f_out),
+            )
+            .reduce(
+                || (F128::ZERO, F128::ZERO),
+                |(x0, x2), (y0, y2)| (x0 + y0, x2 + y2),
+            )
+    };
 
     crate::scratch::give_f128(packed_witness);
     crate::scratch::give_f128(ordinary_basis);
@@ -4984,6 +5041,16 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
                     msg
                 }
                 5 => {
+                    // E-core engagement probe for the fold8 materialize: the
+                    // hetero drain (`pcs::use_open_mat_hetero`) is the only
+                    // helper-pool consumer inside this call, so the delta in
+                    // the process-global `helper_chunks_claimed` counter across
+                    // the materialize is exactly the number of the 256 fold8
+                    // blocks the efficiency cores claimed. Diagnostic only
+                    // (relaxed counter), fully trace-gated — the untimed hot
+                    // path does zero extra work — and mirrors the counter's
+                    // documented "prove E-core engagement for that window" use.
+                    let helper_before = trace.then(crate::epool::helper_chunks_claimed);
                     let (f8, b8, msg) = materialize_direct_fold8(
                         packed_witness.take().unwrap(),
                         b_initial.take().unwrap(),
@@ -4997,6 +5064,12 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
                             r,
                         ],
                     );
+                    if let Some(before) = helper_before {
+                        eprintln!(
+                            "    [fold8-mat] helper (E-core) blocks claimed: {} / 256",
+                            crate::epool::helper_chunks_claimed().wrapping_sub(before)
+                        );
+                    }
                     sc_prover = Some(SumcheckProver::new_after_direct_fold8(
                         f8,
                         b8,

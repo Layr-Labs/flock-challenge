@@ -125,6 +125,15 @@ pub fn helper_pool_available() -> bool {
     epool().is_some()
 }
 
+/// The efficiency-core helper pool itself, for callers that overlap a small
+/// best-effort task with main-pool work via `in_place_scope` (e.g. the
+/// prover's publish-prefix pre-encode alongside the PCS open). Tasks run at
+/// `QOS_CLASS_UTILITY` on E-cores and must not affect output bytes — the
+/// caller owns a fallback for `None` (off-target hosts).
+pub fn helper_pool() -> Option<&'static rayon::ThreadPool> {
+    epool()
+}
+
 /// Don't engage the helper pool below this many chunks: tiny jobs (recursive
 /// Ligerito levels) drain faster than the cross-pool kickoff amortizes.
 const EPOOL_MIN_CHUNKS: usize = 16;

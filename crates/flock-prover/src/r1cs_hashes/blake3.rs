@@ -2119,6 +2119,16 @@ pub(crate) mod witgen_simd {
         let n_total = 1usize << n_blocks_log;
         let n_blocks = blocks.len();
         assert!(n_blocks <= n_total);
+        // QS1 seed→witness overlap: when `blocks` is the seed-pipe's lazy
+        // speculative buffer, its slots were never filled — the counter-based
+        // generator lets each quad regenerate its own four blocks from the
+        // init constant instead. `spec_init` is `None` for every other slice
+        // (the wrapper's own blocks, warm-up, tests), leaving them on the
+        // ordinary slab-read path. The quad loop below owns disjoint 8-block
+        // ranges, so `gen_block(init, idx)` reproduces exactly the value the
+        // eager fill would have written to `blocks[idx]` (both are the one
+        // `crate::seed_pipe::gen_block` closed form).
+        let spec_init = crate::seed_pipe::spec_gen_init(blocks);
         assert!(
             n_total >= 8 && n_total.is_multiple_of(8),
             "lincheck stripe layout requires n_total ≥ 8 and divisible by 8"
@@ -2195,14 +2205,31 @@ pub(crate) mod witgen_simd {
                 )
             };
             for half in 0..2 {
-                let quad: [&Compression; 4] = std::array::from_fn(|j| {
-                    let idx = 8 * g + 4 * half + j;
-                    if idx < n_blocks {
-                        &blocks[idx]
-                    } else {
-                        &padding
-                    }
-                });
+                // Owned synth storage for the lazy path; unread when
+                // `spec_init` is `None`, so it costs nothing on the ordinary
+                // path. Declared out here so its borrows outlive the builder
+                // call below.
+                let synth: [Compression; 4];
+                let quad: [&Compression; 4] = if let Some(init) = spec_init {
+                    synth = std::array::from_fn(|j| {
+                        let idx = 8 * g + 4 * half + j;
+                        if idx < n_blocks {
+                            crate::seed_pipe::gen_block(init, idx)
+                        } else {
+                            padding
+                        }
+                    });
+                    std::array::from_fn(|j| &synth[j])
+                } else {
+                    std::array::from_fn(|j| {
+                        let idx = 8 * g + 4 * half + j;
+                        if idx < n_blocks {
+                            &blocks[idx]
+                        } else {
+                            &padding
+                        }
+                    })
+                };
                 let base = half * 4 * F128_PER_BLOCK;
                 // SAFETY: each quad fully owns its four block slots in every
                 // buffer; groups are disjoint across workers.
@@ -2476,6 +2503,11 @@ fn generate_witness_with_ab_packed_and_lincheck_impl(
         };
     match rate2_codeword {
         Some(codeword) => {
+            // Scalar driver: reads the block slice directly, so if this is the
+            // QS1 lazy speculative buffer its slots must be filled first (the
+            // SIMD quad path synthesizes per group and never reaches here).
+            // No-op for every non-speculative slice.
+            crate::seed_pipe::materialize_spec_blocks(blocks);
             super::common::drive_witness_packed_and_lincheck_full_write_with_rate2_codeword(
                 blocks,
                 &padding,
@@ -2494,6 +2526,8 @@ fn generate_witness_with_ab_packed_and_lincheck_impl(
             if witgen_simd::enabled() {
                 return witgen_simd::generate(blocks, n_blocks_log);
             }
+            // Scalar fallback reads the slice; backfill the lazy buffer first.
+            crate::seed_pipe::materialize_spec_blocks(blocks);
             super::common::drive_witness_packed_and_lincheck_full_write(
                 blocks,
                 &padding,
@@ -2582,6 +2616,9 @@ fn generate_witness_with_ab_packed_and_lincheck_streamed(
             use_deferred_ranked_lincheck_stripe(n_blocks_log, pcs_params),
         );
     }
+    // Scalar streamed fallback reads the slice; backfill the QS1 lazy buffer
+    // first. No-op for every non-speculative slice.
+    crate::seed_pipe::materialize_spec_blocks(blocks);
     let (z, a, b, stripe, stream) =
         super::common::drive_witness_packed_and_lincheck_full_write_streamed(
             blocks,
@@ -3406,6 +3443,10 @@ pub fn generate_witness_batch_major(
     Vec<u8>,
 ) {
     let padding: Compression = ([0u32; 8], [0u32; 16], 0u64, 0u32, 0u32);
+    // Batch-major driver reads the block slice directly; if this is the QS1
+    // lazy speculative buffer (only if a batch-major setup were ever routed
+    // through the seed pipe), backfill it first. No-op otherwise.
+    crate::seed_pipe::materialize_spec_blocks(blocks);
     super::common::drive_witness_batch_major(
         blocks,
         &padding,
