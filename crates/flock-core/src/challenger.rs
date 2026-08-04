@@ -986,7 +986,8 @@ fn gpu_blake3_pow_nonce(state_digest: &[u8; 32], bits: u32) -> Result<u64, Strin
 /// measurement correction).
 fn grind_latch_min_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("FLOCK_NO_GRIND_LATCH_MIN").is_none())
+    // Reclaim coin-flip variant: grind-min default OFF.
+    *ON.get_or_init(|| std::env::var_os("FLOCK_GRIND_LATCH_MIN_ON").is_some())
 }
 
 /// `FLOCK_NO_GRIND_HYBRID` kills the CPU-prefetch arm of the GPU grind,
