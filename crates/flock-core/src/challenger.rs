@@ -860,6 +860,44 @@ mod grind_worker {
             Err(_) => Some(Err("GPU grind worker channel closed".to_string())),
         }
     }
+
+    /// Send one GPU grind scan through the persistent worker without waiting
+    /// for the result, so the caller can overlap the CPU prefetch window with
+    /// the GPU scan (the worker thread drives the Metal scan while the calling
+    /// thread drains the next block). Returns `None` when the worker is
+    /// unavailable (kill switch or setup failure) and the caller must run the
+    /// incumbent scope-spawn path; `Some(receiver)` delivers the scan outcome
+    /// with the same `Err` surface as a direct `gpu_blake3_pow_scan` call.
+    /// Byte-identical to `dispatch`: the same one `pow_scan` per job runs on
+    /// the same worker thread with the same abort-flag semantics — only the
+    /// caller's wait point moves from inside the send to after the prefetch.
+    pub(super) fn submit(
+        state_digest: &[u8; 32],
+        start: u64,
+        len: u32,
+        bits: u32,
+        stop: Arc<AtomicBool>,
+        abort: bool,
+    ) -> Option<Receiver<Result<Option<u64>, String>>> {
+        let w = worker()?;
+        let (done_tx, done_rx) = channel();
+        let job = Job {
+            digest: *state_digest,
+            start,
+            len,
+            bits,
+            stop,
+            abort,
+            done: done_tx,
+        };
+        if w.tx.send(job).is_err() {
+            // Worker died between `worker()` and the send. The returned
+            // `job` drops its `done` sender, so `recv` on this receiver
+            // errors — the same `Err` the blocking path would have returned.
+            return Some(done_rx);
+        }
+        Some(done_rx)
+    }
 }
 
 fn gpu_blake3_pow_nonce(state_digest: &[u8; 32], bits: u32) -> Result<u64, String> {
@@ -893,7 +931,7 @@ fn gpu_blake3_pow_nonce(state_digest: &[u8; 32], bits: u32) -> Result<u64, Strin
         // Persistent dispatch worker when available; the incumbent
         // scope-spawn path otherwise (see `grind_worker`).
         let (gpu_result, cpu_next) =
-            match grind_worker::dispatch(
+            match grind_worker::submit(
                 state_digest,
                 start,
                 block_len,
@@ -901,7 +939,13 @@ fn gpu_blake3_pow_nonce(state_digest: &[u8; 32], bits: u32) -> Result<u64, Strin
                 std::sync::Arc::clone(&stop),
                 abort,
             ) {
-                Some(gpu) => {
+                Some(done_rx) => {
+                    // The worker thread runs the GPU scan while this thread
+                    // drains the CPU prefetch window of the next block — the
+                    // same overlap the scope-spawn fallback below provides,
+                    // without a per-iteration thread spawn. On a GPU miss the
+                    // window result is already computed when the scan returns,
+                    // so the spine never waits for it serially.
                     let cpu = cpu_blake3_pow_window_inner(
                         state_digest,
                         next_start,
@@ -909,6 +953,10 @@ fn gpu_blake3_pow_nonce(state_digest: &[u8; 32], bits: u32) -> Result<u64, Strin
                         bits,
                         abort.then_some(stop.as_ref()),
                     );
+                    let gpu = match done_rx.recv() {
+                        Ok(res) => res,
+                        Err(_) => Err("GPU grind worker channel closed".to_string()),
+                    };
                     (gpu, cpu)
                 }
                 None => std::thread::scope(|s| {
