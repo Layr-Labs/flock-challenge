@@ -3972,6 +3972,19 @@ fn materialize_direct_fold4(
     )
 }
 
+/// The ranked direct-fold8 materialization consists of 256 independent 2 MiB
+/// input blocks. Share those blocks with the efficiency-core pool while the
+/// ordinary Rayon workers process the same queue; only block ownership changes.
+#[inline]
+fn use_ranked_direct_fold8_hetero_materialize(packed_len: usize, block_len: usize) -> bool {
+    cfg!(all(target_os = "macos", target_arch = "aarch64"))
+        && matches!(rayon::current_num_threads(), 2..=16)
+        && packed_len == (1usize << 25)
+        && block_len == (1usize << 11)
+        && std::env::var_os("FLOCK_NO_DIRECT_FOLD8_HETERO_MATERIALIZE").is_none()
+        && crate::epool::epool().is_some()
+}
+
 /// Sixty-four-bank materializer. Six challenges are sampled from direct
 /// product statistics before this function binds the witness and combined
 /// basis in one N→N/64 pass. It emits M6 — the round message of the folded
@@ -4024,69 +4037,111 @@ fn materialize_direct_fold8(
 
     let mut folded_f = crate::scratch::take_f128(out_len);
     let mut folded_b = crate::scratch::take_f128(out_len);
-    let stats = folded_b
-        .par_chunks_mut(block_len)
-        .zip(folded_f.par_chunks_mut(block_len))
-        .enumerate()
-        .map_init(
-            || vec![F128::ZERO; super::ring_switch::FOLD_TABLE_LEN],
-            |scratch, (block, (b_out, f_out))| {
-                let start = 64 * block * block_len;
-                let f_in = &packed_witness[start..start + 64 * block_len];
-                let b_in: &[F128] = if has_ordinary {
-                    &ordinary_basis[start..start + 64 * block_len]
-                } else {
-                    &[]
-                };
-                let fold64 = |input: &[F128], slot: usize| {
-                    let base = 64 * slot;
-                    if deferred_reduce {
-                        return crate::field::f128_slice::fold_banked_slot::<64>(
-                            &fold_weight,
-                            &input[base..base + 64],
-                        );
-                    }
-                    let mut value = F128::ZERO;
-                    for bank in 0..64 {
-                        value += fold_weight[bank] * input[base + bank];
-                    }
-                    value
-                };
+    let helper = use_ranked_direct_fold8_hetero_materialize(packed_witness.len(), block_len)
+        .then(crate::epool::epool)
+        .flatten();
+    let fold_block =
+        |scratch: &mut Vec<F128>, block: usize, b_out: &mut [F128], f_out: &mut [F128]| {
+            let start = 64 * block * block_len;
+            let f_in = &packed_witness[start..start + 64 * block_len];
+            let b_in: &[F128] = if has_ordinary {
+                &ordinary_basis[start..start + 64 * block_len]
+            } else {
+                &[]
+            };
+            let fold64 = |input: &[F128], slot: usize| {
+                let base = 64 * slot;
+                if deferred_reduce {
+                    return crate::field::f128_slice::fold_banked_slot::<64>(
+                        &fold_weight,
+                        &input[base..base + 64],
+                    );
+                }
+                let mut value = F128::ZERO;
+                for bank in 0..64 {
+                    value += fold_weight[bank] * input[base + bank];
+                }
+                value
+            };
 
-                let (first_claim, rest_claims) = claims.split_first().unwrap();
-                let (first_table, rest_tables) = direct_tables.split_first().unwrap();
+            let (first_claim, rest_claims) = claims.split_first().unwrap();
+            let (first_table, rest_tables) = direct_tables.split_first().unwrap();
+            super::ring_switch::compose_fold_byte_table_into(
+                first_claim.eq_hi[block],
+                first_table,
+                scratch,
+            );
+            for slot in 0..block_len {
+                f_out[slot] = fold64(f_in, slot);
+                let direct =
+                    super::ring_switch::fold_one_slot(first_claim.eq_lo[slot], scratch);
+                b_out[slot] = if has_ordinary {
+                    direct + fold64(b_in, slot)
+                } else {
+                    direct
+                };
+            }
+            for (claim, table) in rest_claims.iter().zip(rest_tables.iter()) {
                 super::ring_switch::compose_fold_byte_table_into(
-                    first_claim.eq_hi[block],
-                    first_table,
+                    claim.eq_hi[block],
+                    table,
                     scratch,
                 );
-                for slot in 0..block_len {
-                    f_out[slot] = fold64(f_in, slot);
-                    let direct =
-                        super::ring_switch::fold_one_slot(first_claim.eq_lo[slot], scratch);
-                    b_out[slot] = if has_ordinary {
-                        direct + fold64(b_in, slot)
-                    } else {
-                        direct
-                    };
+                for (slot, out) in b_out.iter_mut().enumerate() {
+                    *out += super::ring_switch::fold_one_slot(claim.eq_lo[slot], scratch);
                 }
-                for (claim, table) in rest_claims.iter().zip(rest_tables.iter()) {
-                    super::ring_switch::compose_fold_byte_table_into(
-                        claim.eq_hi[block],
-                        table,
-                        scratch,
+            }
+            super::round0_deferred(f_out, b_out)
+        };
+    let stats = if let Some(helper) = helper {
+        let n_blocks = out_len / block_len;
+        let mut partials = vec![(F128::ZERO, F128::ZERO); n_blocks];
+        let b_base = crate::epool::SyncPtr(folded_b.as_mut_ptr());
+        let f_base = crate::epool::SyncPtr(folded_f.as_mut_ptr());
+        let partials_base = crate::epool::SyncPtr(partials.as_mut_ptr());
+        crate::epool::run_chunks_with_helper_stateful(
+            n_blocks,
+            &|| vec![F128::ZERO; super::ring_switch::FOLD_TABLE_LEN],
+            &|scratch, block| {
+                // SAFETY: the shared queue claims every block exactly once.
+                // Each block owns disjoint output ranges and one partial slot
+                // until both pools have synchronously joined.
+                unsafe {
+                    let b_out = core::slice::from_raw_parts_mut(
+                        b_base.ptr().add(block * block_len),
+                        block_len,
                     );
-                    for (slot, out) in b_out.iter_mut().enumerate() {
-                        *out += super::ring_switch::fold_one_slot(claim.eq_lo[slot], scratch);
-                    }
+                    let f_out = core::slice::from_raw_parts_mut(
+                        f_base.ptr().add(block * block_len),
+                        block_len,
+                    );
+                    partials_base
+                        .ptr()
+                        .add(block)
+                        .write(fold_block(scratch, block, b_out, f_out));
                 }
-                super::round0_deferred(f_out, b_out)
             },
-        )
-        .reduce(
-            || (F128::ZERO, F128::ZERO),
-            |(x0, x2), (y0, y2)| (x0 + y0, x2 + y2),
+            Some(helper),
         );
+        partials
+            .into_iter()
+            .fold((F128::ZERO, F128::ZERO), |(x0, x2), (y0, y2)| {
+                (x0 + y0, x2 + y2)
+            })
+    } else {
+        folded_b
+            .par_chunks_mut(block_len)
+            .zip(folded_f.par_chunks_mut(block_len))
+            .enumerate()
+            .map_init(
+                || vec![F128::ZERO; super::ring_switch::FOLD_TABLE_LEN],
+                |scratch, (block, (b_out, f_out))| fold_block(scratch, block, b_out, f_out),
+            )
+            .reduce(
+                || (F128::ZERO, F128::ZERO),
+                |(x0, x2), (y0, y2)| (x0 + y0, x2 + y2),
+            )
+    };
 
     crate::scratch::give_f128(packed_witness);
     crate::scratch::give_f128(ordinary_basis);
@@ -10506,10 +10561,6 @@ mod tests {
 // RealAdii sample 6 on 81acf4f.
 // RealAdii sample 7 on 81acf4f.
 // RealAdii sample 8 on 81acf4f.
-// RealAdii sample 1 on dc385af.
-// RealAdii sample 2 on dc385af.
-// RealAdii sample 3 on dc385af.
-// RealAdii sample 4 on dc385af.
-// RealAdii sample 5 on dc385af.
-// RealAdii sample 6 on dc385af.
-// RealAdii sample 7 on dc385af.
+
+// Kimi K3 redraw 1 of d9d41c05 tree (credit: GPT 5.6 Sol session; mechanism unchanged).
+// Kimi K3 redraw 2 (draw 1: 1,549,568.75 rejected -0.14%).
