@@ -442,6 +442,62 @@ pub fn gpu_recursive_merkle_blake3(
     imp::gpu_recursive_merkle_blake3(data, num_leaves)
 }
 
+/// Kill switch for the GPU NTT of the recursive Ligerito L1 commitment
+/// inside the PCS open: `FLOCK_NO_OPEN_L1_GPU=1` (exact `1`) keeps the L1
+/// encode on the CPU. Output is bit-exact either way: the offload reuses the
+/// promoted metallib NTT pass kernels under an exact 8-lane -> 64-lane index
+/// remap, a per-process warmup byte-oracle latches the GPU path ON only
+/// after it reproduces the incumbent CPU codeword bit-for-bit on THIS
+/// machine, and any refusal or Metal failure falls back to the untouched
+/// CPU dispatch.
+pub const ENV_NO_OPEN_L1_GPU: &str = "FLOCK_NO_OPEN_L1_GPU";
+
+fn gpu_open_l1_value_enabled(value: Option<&std::ffi::OsStr>) -> bool {
+    value != Some(std::ffi::OsStr::new("1"))
+}
+
+pub(crate) fn gpu_open_l1_enabled() -> bool {
+    // A/B-CONTROL: set to `false` for the official-harness control build. The
+    // env kill switch exists only for faster same-binary diagnostic trials.
+    const OPEN_L1_GPU_DEFAULT: bool = true;
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        OPEN_L1_GPU_DEFAULT
+            && gpu_open_l1_value_enabled(std::env::var_os(ENV_NO_OPEN_L1_GPU).as_deref())
+    })
+}
+
+/// Cheap pre-fill gate for the open-L1 GPU NTT: the caller fills the
+/// replicated message into the codeword buffer before dispatching, so it
+/// first asks whether the GPU arm can possibly engage (kill switch off and
+/// Metal initialized). `false` costs the caller nothing.
+pub fn gpu_open_l1_ntt_ready() -> bool {
+    gpu_open_l1_enabled() && imp::gpu_open_l1_ntt_ready()
+}
+
+/// GPU forward interleaved NTT for the recursive Ligerito L1 codeword inside
+/// the PCS open. `mat` must hold the exact post-layer-`start_layer` state
+/// (the replicated message), layout `mat[pos * num_ntts + lane]`.
+///
+/// On success returns `Some(tail_start)`: the GPU applied layers
+/// `[start_layer, tail_start)` in place and the caller must finish with
+/// `ntt.forward_transform_interleaved_from_layer(mat, num_ntts, tail_start)`
+/// (a no-op when `tail_start == log_d`, which the warmup oracle call uses
+/// after producing the full CPU-authoritative codeword itself).
+///
+/// Returns `None` whenever the path is disabled, unavailable, unverified on
+/// this machine, or fails — `mat` contents are then unspecified and the
+/// caller must run the untouched incumbent CPU dispatch, which overwrites
+/// the buffer wholesale.
+pub fn gpu_open_l1_ntt(
+    mat: &mut [F128],
+    num_ntts: usize,
+    start_layer: usize,
+    ntt: &AdditiveNttF128,
+) -> Option<usize> {
+    imp::gpu_open_l1_ntt(mat, num_ntts, start_layer, ntt)
+}
+
 /// Exact rollback for the PCS Fiat--Shamir BLAKE3 grind scanner.  The first
 /// untimed ranked grind still has to prove that Metal returns the same
 /// globally-smallest nonce and clears the target-side timing gate before the
@@ -705,6 +761,48 @@ mod leaf_vec4_gate_tests {
     }
 }
 
+/// Pad-residency V4: strict kill switch for the supplemental pad-deleted g4
+/// NTT kernel (`ntt_fused_reg4g4_v4res`). DEFAULT ON — the probe submission
+/// is itself the A/B; only exact value `1` disables it, restoring the
+/// incumbent `ntt_fused_reg4g4` dispatch (10,176 B threadgroup allocation)
+/// from the untouched embedded metallib. The variant deletes only the
+/// never-read 1,984 B `pad` threadgroup array and its unreachable keep-alive
+/// write (allocation -> 8,192 B, one more group per core's threadgroup
+/// budget); all arithmetic, table builds, indexing, and dispatch geometry
+/// are verbatim, so proof bytes are identical either way. A supplemental
+/// compile failure degrades to the incumbent PSO (NIL containment, the
+/// leaf_vec4 pattern), never to an error.
+/// DEMOTED TO OPT-IN by ranked evidence (submission 217a62ab: −1.26% score,
+/// +0.84% p10 vs the same tree's promoted draw — the occupancy gamble is the
+/// prime suspect together with the NT-load hints). Set `FLOCK_PAD_V4=1`
+/// (exact string) to opt in on runner-matched hardware.
+pub const ENV_PAD_V4: &str = "FLOCK_PAD_V4";
+
+fn gpu_pad_v4_value_enabled(value: Option<&std::ffi::OsStr>) -> bool {
+    value == Some(std::ffi::OsStr::new("1"))
+}
+
+pub(crate) fn gpu_pad_v4_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        gpu_pad_v4_value_enabled(std::env::var_os(ENV_PAD_V4).as_deref())
+    })
+}
+
+#[cfg(test)]
+mod pad_v4_gate_tests {
+    use std::ffi::OsStr;
+
+    #[test]
+    fn default_off_exact_one_is_the_only_optin_value() {
+        assert_eq!(super::ENV_PAD_V4, "FLOCK_PAD_V4");
+        assert!(super::gpu_pad_v4_value_enabled(Some(OsStr::new("1"))));
+        for value in [None, Some(""), Some("0"), Some("01"), Some("true")] {
+            assert!(!super::gpu_pad_v4_value_enabled(value.map(OsStr::new)));
+        }
+    }
+}
+
 #[cfg(test)]
 mod z_pin_gate_tests {
     use std::ffi::OsStr;
@@ -751,6 +849,72 @@ mod hybrid_cb2_spin_gate_tests {
         for value in [None, Some(""), Some("0"), Some("01"), Some("true")] {
             assert!(super::hybrid_cb2_spin_value_enabled(value.map(OsStr::new)));
         }
+    }
+}
+
+/// Strict kill switch for the lifted shared tree-recompute boundary of the
+/// hybrid commit graph: only exact value `1` restores the incumbent 16-node
+/// boundary (GPU prefix subtrees and CPU suffix subtrees each descend to
+/// their local roots; the CPU recomputes the top 15 nodes after the cb2
+/// join). Default lifts the boundary to the 1024-node level at the ranked
+/// shape, deleting the sub-256-wide serial parent dispatches from cb2's
+/// hazard chain and the single-job rayon fork-join levels from the CPU
+/// suffix; the post-join serial recompute then hashes 1,023 cache-hot
+/// parents instead of 15. Every node is recomputed from identical inputs by
+/// the identical parent hash, so proof bytes are unchanged either way.
+pub const ENV_TREE_RECOMPUTE_16: &str = "FLOCK_TREE_RECOMPUTE_16";
+
+fn tree_recompute_16_value_forced(value: Option<&std::ffi::OsStr>) -> bool {
+    value == Some(std::ffi::OsStr::new("1"))
+}
+
+#[cfg_attr(not(all(target_os = "macos", target_arch = "aarch64")), allow(dead_code))]
+fn tree_recompute_16_forced() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        tree_recompute_16_value_forced(std::env::var_os(ENV_TREE_RECOMPUTE_16).as_deref())
+    })
+}
+
+/// Shared tree-recompute boundary for the hybrid commit graph, or `None` for
+/// the incumbent shape (subtree ladders to local roots, 16-node recompute).
+///
+/// `Some(1024)` requires every hybrid subtree to cross the global 1024-node
+/// level, which holds whenever the sixteenth-granularity decomposition
+/// invariant (min subtree = `n_leaves / 16`, subtree roots at width ≤ 16)
+/// meets `n_leaves / 1024 ≤ n_leaves / 16` — always — AND the deep-pipeline
+/// suffix's chunk-local parent levels stay at or below the boundary
+/// (`n_leaves / 1024 ≥ 1024`). Gate on the ranked shape (`n_leaves ≥ 2^20`)
+/// so smaller test shapes keep the incumbent boundary bit-for-bit.
+#[cfg_attr(not(all(target_os = "macos", target_arch = "aarch64")), allow(dead_code))]
+fn hybrid_tree_boundary(n_leaves: usize) -> Option<usize> {
+    hybrid_tree_boundary_for(tree_recompute_16_forced(), n_leaves)
+}
+
+fn hybrid_tree_boundary_for(force16: bool, n_leaves: usize) -> Option<usize> {
+    (!force16 && n_leaves >= (1 << 20)).then_some(1024)
+}
+
+#[cfg(test)]
+mod tree_recompute_gate_tests {
+    use std::ffi::OsStr;
+
+    #[test]
+    fn exact_one_is_the_only_recompute16_force_value() {
+        assert_eq!(super::ENV_TREE_RECOMPUTE_16, "FLOCK_TREE_RECOMPUTE_16");
+        assert!(super::tree_recompute_16_value_forced(Some(OsStr::new("1"))));
+        for value in [None, Some(""), Some("0"), Some("01"), Some("true")] {
+            assert!(!super::tree_recompute_16_value_forced(value.map(OsStr::new)));
+        }
+    }
+
+    #[test]
+    fn boundary_lifts_only_at_ranked_scale() {
+        assert_eq!(super::hybrid_tree_boundary_for(false, 1 << 20), Some(1024));
+        assert_eq!(super::hybrid_tree_boundary_for(false, 1 << 21), Some(1024));
+        assert_eq!(super::hybrid_tree_boundary_for(false, (1 << 20) - 1), None);
+        assert_eq!(super::hybrid_tree_boundary_for(false, 1 << 10), None);
+        assert_eq!(super::hybrid_tree_boundary_for(true, 1 << 20), None);
     }
 }
 
@@ -2705,6 +2869,274 @@ kernel void parent_hash3_v4(device const uint4* children [[buffer(0)]],
 }
 "#;
 
+    /// Pad-residency V4 supplemental NTT kernel, compiled as a separate
+    /// source library so the embedded incumbent metallib stays byte-for-byte
+    /// intact (editing `MSL_SOURCE` would trip its FNV staleness guard and
+    /// force a full runtime source compile in every process).
+    ///
+    /// `ntt_fused_reg4g4_v4res` is the incumbent `ntt_fused_reg4g4` minus
+    /// exactly (a) the never-read `pad[124]` threadgroup array (1,984 B) and
+    /// (b) its unreachable keep-alive dead-write — nothing else (enforced at
+    /// string level by `pad_v4_source_tests`). The group's threadgroup
+    /// allocation drops 10,176 B -> 8,192 B, raising the residency the pass
+    /// pins from 3 to 4 groups/core under a 32 KiB budget (or 2 -> 3 if the
+    /// runner's effective budget is 24 KiB); the incumbent's 10,176 B was
+    /// tuned on an M4 Pro, not the ranked M3 Max. All field arithmetic,
+    /// table builds, indexing, and dispatch geometry are verbatim, so the
+    /// emitted codewords are bit-identical by construction.
+    const NTT_G4_V4RES_MSL_SOURCE: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+// ===========================================================================
+// ntt_fused_reg4g4_v4res: the incumbent ntt_fused_reg4g4 with its
+// residency-only threadgroup array deleted (allocation 10,176 B -> 8,192 B,
+// so one more 64-thread group fits a core's 32 KiB threadgroup-memory
+// budget). The deleted array was never read and its keep-alive write was
+// unreachable (P.log_d is a shift amount <= 20, never 77), so outputs are
+// bit-identical by construction; only occupancy changes. Every helper, the
+// NttParams struct, the sub-layer macro, and the kernel body are verbatim
+// copies from the main source (enforced by pad_v4_source_tests).
+// ===========================================================================
+
+// v * x mod P.
+static inline uint4 gf_mulx(uint4 v) {
+    uint carry = v.w >> 31;
+    uint4 r;
+    r.w = (v.w << 1) | (v.z >> 31);
+    r.z = (v.z << 1) | (v.y >> 31);
+    r.y = (v.y << 1) | (v.x >> 31);
+    r.x = (v.x << 1) ^ (carry * 0x87u);
+    return r;
+}
+
+
+// a * x^16 mod P. The 16 bits shifted out fold back as h * 0x87 (<= bit 22).
+static inline uint4 gf_shl16(uint4 a) {
+    uint h = a.w >> 16;
+    uint4 r;
+    r.w = (a.w << 16) | (a.z >> 16);
+    r.z = (a.z << 16) | (a.y >> 16);
+    r.y = (a.y << 16) | (a.x >> 16);
+    r.x = (a.x << 16) ^ ((h << 7) ^ (h << 2) ^ (h << 1) ^ h);
+    return r;
+}
+
+
+// v * tw mod P via two 256-entry byte tables — tab[b] = b*tw and
+// tab[256 + b] = (b * x^8) * tw — so each of the 8 gf_shl16 Horner steps of
+// gf_mul_tab4 costs 2 threadgroup loads instead of 4.
+// The tables are 8 KiB per twiddle, so callers keep only the live one
+// resident and rebuild it per twiddle with gf_build_byte16* below.
+static inline uint4 gf_mul_byte16(uint4 v, threadgroup const uint4* tab) {
+    uint4 acc = uint4(0u);
+    for (int i = 7; i >= 0; i--) {
+        acc = gf_shl16(acc);
+        uint h = (v[i >> 1] >> ((i & 1) * 16)) & 0xffffu;
+        acc ^= tab[h & 255u] ^ tab[256u + (h >> 8)];
+    }
+    return acc;
+}
+
+
+// Rebuild `tabB` for the twiddle at `twiddles[idx]`, in registers. 64 threads:
+// `lid` owns a 4-lo x 2-hi block of one byte table (t = lid >> 5 selects tw or
+// tw * x^8) and derives it with a short gf_mulx chain, so no intermediate
+// threadgroup array is needed. The leading barrier retires the previous
+// table's readers; the trailing one publishes the new one.
+static inline void gf_build_byte16(
+    threadgroup uint4* tabB, device const uint4* twiddles, uint idx, uint lid)
+{
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const uint t  = lid >> 5;        // 0: b*tw          1: b*(tw*x^8)
+    const uint u  = lid & 31u;
+    const uint aa = u & 3u;          // owns entry bits 2..3
+    const uint cc = u >> 2;          // owns entry bits 5..7
+    uint4 g = twiddles[idx];
+    if (t != 0u) {
+        for (uint m = 0; m < 8u; m++) { g = gf_mulx(g); }
+    }
+    uint4 e0 = g;
+    uint4 e1 = gf_mulx(e0), e2 = gf_mulx(e1), e3 = gf_mulx(e2);
+    uint4 f0 = gf_mulx(e3), f1 = gf_mulx(f0), f2 = gf_mulx(f1), f3 = gf_mulx(f2);
+    uint4 A = uint4(0u);
+    if (aa & 1u) { A ^= e2; }
+    if (aa & 2u) { A ^= e3; }
+    const uint4 L0 = A, L1 = A ^ e0, L2 = A ^ e1, L3 = A ^ e0 ^ e1;
+    uint4 C = uint4(0u);
+    if (cc & 1u) { C ^= f1; }
+    if (cc & 2u) { C ^= f2; }
+    if (cc & 4u) { C ^= f3; }
+    const uint4 H0 = C, H1 = C ^ f0;
+    threadgroup uint4* dst = &tabB[t << 8];
+    const uint o0 = (cc << 5) + (aa << 2);   // entry (cc << 5) | (aa << 2)
+    const uint o1 = o0 + 16u;                //   ... | 16
+    dst[o0 + 0u] = L0 ^ H0;
+    dst[o0 + 1u] = L1 ^ H0;
+    dst[o0 + 2u] = L2 ^ H0;
+    dst[o0 + 3u] = L3 ^ H0;
+    dst[o1 + 0u] = L0 ^ H1;
+    dst[o1 + 1u] = L1 ^ H1;
+    dst[o1 + 2u] = L2 ^ H1;
+    dst[o1 + 3u] = L3 ^ H1;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+}
+
+
+struct NttParams {
+    uint log_d;   // log2 of positions
+    uint l;       // first fused layer
+    uint f;       // number of fused layers (1..=4)
+    uint s;       // log_d - l - f
+};
+
+
+// One f=4 sub-layer: 2^J twiddles, each rebuilt once then spent on its
+// (8 >> J) butterflies. J must be a literal so the butterfly indices stay
+// compile-time and elems[] stays in registers.
+#define NTT_G4_B16_SUBLAYER(J)                                                 \
+    {                                                                          \
+        constexpr uint j    = (J);                                             \
+        constexpr uint bpos = F - 1u - j;                                      \
+        constexpr uint NC   = 1u << j;                                         \
+        constexpr uint BPER = (NF >> 1) >> j;                                  \
+        for (uint c = 0; c < NC; c++) {                                        \
+            gf_build_byte16(tabB, twiddles,                                    \
+                            (1u << (P.l + j)) - 1u + (B << j) + c, lid);       \
+            for (uint bb = 0; bb < BPER; bb++) {                               \
+                const uint b   = c * BPER + bb;                                \
+                const uint low = b & ((1u << bpos) - 1u);                      \
+                const uint eu  = ((b >> bpos) << (bpos + 1u)) | low;           \
+                const uint ev  = eu | (1u << bpos);                            \
+                uint4 nu = elems[eu] ^ gf_mul_byte16(elems[ev], &tabB[0]);     \
+                elems[eu] = nu;                                                \
+                elems[ev] ^= nu;                                               \
+            }                                                                  \
+        }                                                                      \
+    }
+
+
+kernel void ntt_fused_reg4g4_v4res(device uint4* data                [[buffer(0)]],
+                             device const uint4* twiddles      [[buffer(1)]],
+                             constant NttParams& P             [[buffer(2)]],
+                             uint tgid [[threadgroup_position_in_grid]],
+                             uint lid  [[thread_index_in_threadgroup]])
+{
+    constexpr uint F     = 4u;
+    constexpr uint NF    = 1u << F;
+    constexpr uint LOG_G = 2u;
+    threadgroup uint4 tabB[512u];      // 8,192 B: the live twiddle's tables
+
+    const uint lane = lid;
+    const uint B = tgid >> (P.s - LOG_G);
+    const uint r_base = (tgid & ((1u << (P.s - LOG_G)) - 1u)) << LOG_G;
+
+    for (uint rr = 0; rr < (1u << LOG_G); rr++) {
+        const uint r = r_base + rr;
+        const uint pos_base = (B << (P.log_d - P.l)) + r;
+        /* Load one lane's tile column into registers (coalesced per e). */
+        uint4 elems[NF];
+        for (uint e = 0; e < NF; e++) {
+            elems[e] = data[((pos_base + (e << P.s)) << 6) + lane];
+        }
+        NTT_G4_B16_SUBLAYER(0u)
+        NTT_G4_B16_SUBLAYER(1u)
+        NTT_G4_B16_SUBLAYER(2u)
+        NTT_G4_B16_SUBLAYER(3u)
+        for (uint e = 0; e < NF; e++) {
+            data[((pos_base + (e << P.s)) << 6) + lane] = elems[e];
+        }
+    }
+}
+
+"#;
+
+    /// String-level proof that the pad-v4 variant source is derived
+    /// mechanically from the incumbent: every helper is a byte-exact slice
+    /// of `MSL_SOURCE`, and the variant kernel equals the incumbent kernel
+    /// with exactly the pad declaration line and the unreachable dead-write
+    /// block deleted (plus the rename). Any drift in either source breaks
+    /// these tests loudly.
+    #[cfg(test)]
+    mod pad_v4_source_tests {
+        fn slice_between<'a>(src: &'a str, start: &str, end: &str) -> &'a str {
+            let i = src.find(start).expect("start marker not found");
+            let rest = &src[i..];
+            let j = rest.find(end).expect("end marker not found") + end.len();
+            &rest[..j]
+        }
+
+        #[test]
+        fn v4res_kernel_is_the_incumbent_minus_exactly_the_pad_lines() {
+            let incumbent = slice_between(
+                super::MSL_SOURCE,
+                "kernel void ntt_fused_reg4g4(",
+                "\n}\n",
+            );
+            let variant = slice_between(
+                super::NTT_G4_V4RES_MSL_SOURCE,
+                "kernel void ntt_fused_reg4g4_v4res(",
+                "\n}\n",
+            );
+            // Mechanical derivation: delete (a) the pad declaration line and
+            // (b) the unreachable `log_d == 77` dead-write block, rename the
+            // kernel, and change nothing else.
+            let mut derived = String::new();
+            let mut in_dead_write_block = false;
+            let mut deleted_decl_lines = 0usize;
+            let mut deleted_block_lines = 0usize;
+            for line in incumbent.lines() {
+                if line.contains("threadgroup uint4 pad[124u];") {
+                    deleted_decl_lines += 1;
+                    continue;
+                }
+                if line.contains("if (P.log_d == 77u)") {
+                    in_dead_write_block = true;
+                }
+                if in_dead_write_block {
+                    deleted_block_lines += 1;
+                    if line == "        }" {
+                        in_dead_write_block = false;
+                    }
+                    continue;
+                }
+                derived.push_str(line);
+                derived.push('\n');
+            }
+            let derived = derived.replacen(
+                "kernel void ntt_fused_reg4g4(",
+                "kernel void ntt_fused_reg4g4_v4res(",
+                1,
+            );
+            assert_eq!(deleted_decl_lines, 1, "expected one pad declaration");
+            assert_eq!(deleted_block_lines, 5, "expected the 5-line dead-write block");
+            assert_eq!(variant, derived);
+            assert!(!variant.contains("pad"));
+        }
+
+        #[test]
+        fn v4res_helpers_are_verbatim_copies_of_the_main_source() {
+            let v = super::NTT_G4_V4RES_MSL_SOURCE;
+            for (start, end) in [
+                ("static inline uint4 gf_mulx(", "\n}\n"),
+                ("static inline uint4 gf_shl16(", "\n}\n"),
+                ("static inline uint4 gf_mul_byte16(", "\n}\n"),
+                ("static inline void gf_build_byte16(", "\n}\n"),
+                ("struct NttParams {", "\n};\n"),
+                ("#define NTT_G4_B16_SUBLAYER(J)", "\n    }\n"),
+            ] {
+                let chunk = slice_between(v, start, end);
+                assert!(
+                    super::MSL_SOURCE.contains(chunk),
+                    "variant chunk starting {start:?} is not a verbatim copy of MSL_SOURCE"
+                );
+            }
+            // No residency pad survives anywhere in the variant source.
+            assert!(!v.contains("pad["));
+            assert!(!v.contains("uint4 pad"));
+        }
+    }
+
     /// Source-only ranked from-z specialization. This deliberately does not
     /// reuse the rejected device-table preload design: every group constructs
     /// its own compact 11-table image directly from the existing raw twiddle
@@ -3087,6 +3519,11 @@ kernel void blake3_pow_scan(
         pub(crate) queue: Id,
         pub(crate) pso_ntt: Id,
         pub(crate) pso_ntt4g4: Id,
+        /// Pad-residency V4 supplemental g4 NTT kernel (the never-read
+        /// residency pad deleted; bit-identical outputs). `NIL` when
+        /// `FLOCK_PAD_V4=1` has not opted in or its supplemental compile failed —
+        /// dispatch then keeps the incumbent `pso_ntt4g4`.
+        pub(crate) pso_ntt4g4_v4res: Id,
         pub(crate) pso_ntt4: Id,
         pub(crate) pso_ntt3: Id,
         pub(crate) pso_ntt4z: Id,
@@ -3476,6 +3913,88 @@ kernel void blake3_pow_scan(
                     (NIL, NIL)
                 };
 
+                // Pad-residency V4 supplemental g4 NTT kernel, kept out of
+                // the embedded metallib so the incumbent library stays
+                // byte-for-byte intact. A compile/pipeline failure must not
+                // poison the already-valid GPU: the NTT encoders see NIL and
+                // keep dispatching the incumbent pso_ntt4g4, whose output is
+                // bit-identical.
+                let pso_ntt4g4_v4res = if super::gpu_pad_v4_enabled() {
+                    let t0 = std::time::Instant::now();
+                    let built = (|| -> Result<Id, String> {
+                        let src = api.nsstring(NTT_G4_V4RES_MSL_SOURCE)?;
+                        let mut err: Id = NIL;
+                        let library: Id = send!(
+                            api,
+                            unsafe extern "C" fn(Id, Sel, Id, Id, *mut Id) -> Id,
+                            device,
+                            c"newLibraryWithSource:options:error:",
+                            src,
+                            NIL,
+                            &mut err
+                        );
+                        if library.is_null() {
+                            return Err(format!(
+                                "pad-v4 shader compile failed: {}",
+                                api.error_string(err)
+                            ));
+                        }
+                        let ns = api.nsstring("ntt_fused_reg4g4_v4res")?;
+                        let function: Id = send!(
+                            api,
+                            unsafe extern "C" fn(Id, Sel, Id) -> Id,
+                            library,
+                            c"newFunctionWithName:",
+                            ns
+                        );
+                        if function.is_null() {
+                            send!(api, unsafe extern "C" fn(Id, Sel) -> Id, library, c"release");
+                            return Err("ntt_fused_reg4g4_v4res kernel not found".into());
+                        }
+                        let mut pso_err: Id = NIL;
+                        let pso: Id = send!(
+                            api,
+                            unsafe extern "C" fn(Id, Sel, Id, *mut Id) -> Id,
+                            device,
+                            c"newComputePipelineStateWithFunction:error:",
+                            function,
+                            &mut pso_err
+                        );
+                        send!(api, unsafe extern "C" fn(Id, Sel) -> Id, function, c"release");
+                        send!(api, unsafe extern "C" fn(Id, Sel) -> Id, library, c"release");
+                        if pso.is_null() {
+                            return Err(format!(
+                                "pad-v4 pipeline: {}",
+                                api.error_string(pso_err)
+                            ));
+                        }
+                        Ok(pso)
+                    })();
+                    match built {
+                        Ok(pso) => {
+                            if debug_enabled() {
+                                eprintln!(
+                                    "[gpu-commit] pad-v4 supplemental compile: {:.1} ms \
+                                     (ntt_fused_reg4g4_v4res, 8,192 B threadgroup alloc)",
+                                    t0.elapsed().as_secs_f64() * 1e3
+                                );
+                            }
+                            pso
+                        }
+                        Err(e) => {
+                            if debug_enabled() {
+                                eprintln!(
+                                    "[gpu-commit] pad-v4 unavailable ({e}); keeping incumbent \
+                                     ntt_fused_reg4g4"
+                                );
+                            }
+                            NIL
+                        }
+                    }
+                } else {
+                    NIL
+                };
+
                 let (pso_pow, pow_out) = if super::gpu_grind_enabled() {
                     // This optimization is supplemental: a compile/pipeline/
                     // allocation failure must not poison the already-valid
@@ -3552,6 +4071,7 @@ kernel void blake3_pow_scan(
                     queue,
                     pso_ntt,
                     pso_ntt4g4,
+                    pso_ntt4g4_v4res,
                     pso_ntt4,
                     pso_ntt3,
                     pso_ntt4z,
@@ -3581,6 +4101,30 @@ kernel void blake3_pow_scan(
     // -----------------------------------------------------------------------
 
     impl Gpu {
+        /// The g4 shared-table NTT PSO the production passes dispatch: the
+        /// pad-deleted V4 supplemental when it compiled, otherwise the
+        /// incumbent `ntt_fused_reg4g4`. Outputs are bit-identical either
+        /// way; only the threadgroup allocation (and thus the groups/core
+        /// residency the pass pins) differs. The selection is announced once
+        /// per process under FLOCK_GPU_COMMIT_DEBUG as dispatch evidence.
+        pub(crate) fn pso_ntt4g4_active(&self) -> Id {
+            let v4 = self.pso_ntt4g4_v4res;
+            if debug_enabled() {
+                static ONCE: std::sync::Once = std::sync::Once::new();
+                ONCE.call_once(|| {
+                    eprintln!(
+                        "[gpu-commit] g4 NTT dispatch: {}",
+                        if v4.is_null() {
+                            "incumbent ntt_fused_reg4g4 (pad-v4 off or unavailable)"
+                        } else {
+                            "ntt_fused_reg4g4_v4res (pad-v4 active)"
+                        }
+                    );
+                });
+            }
+            if v4.is_null() { self.pso_ntt4g4 } else { v4 }
+        }
+
         pub(crate) unsafe fn pool_push(&self) -> *mut c_void {
             unsafe { (self.api.pool_push)() }
         }
@@ -4123,7 +4667,9 @@ kernel void blake3_pow_scan(
                 let s = log_d - l - f;
                 let (pso, tpg, groups) = match f {
                     4 if share_log > 0 && s >= share_log => (
-                        gpu.pso_ntt4g4,
+                        // Pad-residency V4 swap: same kernel text minus the
+                        // never-read residency pad; incumbent when NIL.
+                        gpu.pso_ntt4g4_active(),
                         64u64,
                         1u64 << (log_d - f - share_log),
                     ),
@@ -4188,7 +4734,9 @@ kernel void blake3_pow_scan(
                 let s = log_d - l - f;
                 let (pso, tpg, groups) = match f {
                     4 if share_log > 0 && s >= share_log => (
-                        gpu.pso_ntt4g4,
+                        // Pad-residency V4 swap: same kernel text minus the
+                        // never-read residency pad; incumbent when NIL.
+                        gpu.pso_ntt4g4_active(),
                         64u64,
                         1u64 << (log_d - f - share_log),
                     ),
@@ -4226,9 +4774,16 @@ kernel void blake3_pow_scan(
         }
     }
 
-    /// Encode leaves + all parent levels of ONE aligned subtree
+    /// Encode leaves + parent levels of ONE aligned subtree
     /// (`subtree_leaves` a power of two, `leaf_start` aligned to it), writing
     /// into the subtree's slots of the GLOBAL flat tree layout.
+    ///
+    /// `stop_level_len` bounds the ladder from above in GLOBAL level width:
+    /// parents are encoded only while the written level is at least
+    /// `stop_level_len` nodes wide. `1` (every non-hybrid caller) descends to
+    /// the subtree's local root, exactly the incumbent shape; the hybrid
+    /// prefix passes the shared recompute boundary so the post-cb2-join CPU
+    /// recompute owns everything above it (see `hybrid_tree_boundary`).
     pub(crate) unsafe fn encode_merkle_subtree(
         gpu: &Gpu,
         enc: Id,
@@ -4237,6 +4792,7 @@ kernel void blake3_pow_scan(
         n_leaves_total: usize,
         leaf_start: usize,
         subtree_leaves: usize,
+        stop_level_len: usize,
     ) {
         unsafe {
             encode_merkle_subtree_impl(
@@ -4248,10 +4804,12 @@ kernel void blake3_pow_scan(
                 leaf_start,
                 subtree_leaves,
                 super::select_gpu_parent3(n_leaves_total, super::gpu_parent3_enabled()),
+                stop_level_len,
             )
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) unsafe fn encode_merkle_subtree_impl(
         gpu: &Gpu,
         enc: Id,
@@ -4261,9 +4819,14 @@ kernel void blake3_pow_scan(
         leaf_start: usize,
         subtree_leaves: usize,
         parent3: bool,
+        stop_level_len: usize,
     ) {
         debug_assert!(subtree_leaves.is_power_of_two());
         debug_assert_eq!(leaf_start % subtree_leaves, 0);
+        // The fused leaf head below writes three parent levels
+        // unconditionally; a lifted boundary must sit at least that far
+        // above the leaves (ranked: 1024 ≪ 2^20 / 8).
+        debug_assert!(stop_level_len == 1 || n_leaves_total >= 8 * stop_level_len);
         unsafe {
             // Vectorized-kernel swap: identical dispatch geometry and output
             // bytes; NIL (kill switch / compile failure) keeps the incumbent.
@@ -4318,9 +4881,13 @@ kernel void blake3_pow_scan(
             // Consume three parent levels per dispatch while all three local
             // ranges contain whole 256-child groups. Each output retains its
             // ordinary global flat-tree slot, so opening is unchanged.
+            // `level_len >= 8 * stop_level_len` keeps the deepest written
+            // level at or above the boundary; with `stop_level_len == 1` it
+            // never binds (`level_len ≥ local_len ≥ 256`), preserving the
+            // incumbent loop exactly.
             if parent3 {
                 gpu.set_pipeline(enc, pso_parent3);
-                while local_len >= 256 {
+                while local_len >= 256 && level_len >= 8 * stop_level_len {
                     let level1_start = level_start + level_len;
                     let level1_len = level_len / 2;
                     let local1_start = local_start / 2;
@@ -4348,7 +4915,10 @@ kernel void blake3_pow_scan(
             }
 
             gpu.set_pipeline(enc, gpu.pso_parent);
-            while local_len > 1 {
+            // Reading `level_len > stop_level_len` writes `level_len / 2 ≥
+            // stop_level_len`; at the boundary the ladder stops and the
+            // shared CPU recompute owns every level above it.
+            while local_len > 1 && level_len > stop_level_len {
                 let write_level_start = level_start + level_len;
                 let n_out = local_len / 2;
                 gpu.set_buffer(enc, tree_buf, (level_start + local_start) * 32, 0);
@@ -5285,7 +5855,11 @@ kernel void blake3_pow_scan(
             let enc = gpu.compute_encoder(cb2)?;
             encode_ntt_passes_prefix(gpu, enc, staging, tw_buf, log_d, 4, prefix16);
             // Greedy aligned power-of-two subtree decomposition of the
-            // leaf prefix.
+            // leaf prefix. Ladders stop at the shared recompute boundary
+            // (`hybrid_tree_boundary`, kill switch `FLOCK_TREE_RECOMPUTE_16`);
+            // the post-join CPU recompute in the hybrid impl recomputes every
+            // level above it, so the encoded work is byte-equivalent.
+            let ladder_stop = super::hybrid_tree_boundary(n_leaves).unwrap_or(1);
             let sixteenth = n_leaves / 16;
             let mut start = 0usize;
             let prefix_leaves = (16 - k_cpu16) * sixteenth;
@@ -5294,7 +5868,9 @@ kernel void blake3_pow_scan(
                 while start % size != 0 {
                     size >>= 1;
                 }
-                encode_merkle_subtree(gpu, enc, staging, tree_buf, n_leaves, start, size);
+                encode_merkle_subtree(
+                    gpu, enc, staging, tree_buf, n_leaves, start, size, ladder_stop,
+                );
                 start += size;
             }
             gpu.end_encoding(enc);
@@ -5431,6 +6007,11 @@ kernel void blake3_pow_scan(
                         });
                 }
                 // Suffix aligned subtrees' parents (greedy decomposition).
+                // Ladders stop at the shared recompute boundary (same
+                // `hybrid_tree_boundary` the GPU prefix used when encoding
+                // cb2): the post-join recompute below owns everything above
+                // it, deleting the single-job fork-join levels here.
+                let ladder_stop = super::hybrid_tree_boundary(n_leaves).unwrap_or(1);
                 let mut sstart = suffix_leaf_start;
                 while sstart < n_leaves {
                     let mut size = 1usize << (n_leaves - sstart).ilog2();
@@ -5450,7 +6031,7 @@ kernel void blake3_pow_scan(
                         local_start /= 2;
                         local_len /= 2;
                     }
-                    while local_len > 1 {
+                    while local_len > 1 && level_len > ladder_stop {
                         let write_level_start = level_start + level_len;
                         let (r0, w0) =
                             (level_start + local_start, write_level_start + local_start / 2);
@@ -5483,11 +6064,19 @@ kernel void blake3_pow_scan(
                 }
 
                 // Join the GPU prefix, then (re)compute every level above
-                // the sixteenth-granularity roots. Every subtree on either
-                // side spans ≥ one sixteenth (2^16 leaves), so the 16-node
-                // level is always fully populated by subtree-internal
-                // parents; the 15 nodes above it are recomputed here,
-                // covering every decomposition boundary for any k.
+                // the shared boundary. Every subtree on either side spans
+                // ≥ one sixteenth (2^16 leaves at the ranked shape), so
+                // subtree-internal parents always populate the 16-node level
+                // — and, since subtree roots therefore sit at width ≤ 16,
+                // any boundary from 16 down through the leaves is fully
+                // subtree-internal too. Incumbent: ladders reach their local
+                // roots and the 15 nodes above the 16-node level are
+                // recomputed, covering every decomposition boundary for any
+                // k. Lifted (`hybrid_tree_boundary`): ladders stopped at the
+                // 1024-node level and the 1,023 nodes above it are computed
+                // here once, serially, from the identical inputs — same
+                // bytes, ~19 fewer sub-256-wide dispatches in cb2's hazard
+                // chain and ~12 fewer single-job fork-join levels above.
                 let t_wait_cb2 = window_trace_enabled().then(std::time::Instant::now);
                 // The warmup tuner balances the split so the GPU prefix and
                 // the CPU suffix finish together: the residual wait here is
@@ -5515,9 +6104,10 @@ kernel void blake3_pow_scan(
                         t.elapsed().as_secs_f64() * 1e3,
                     );
                 }
+                let recompute_start = super::hybrid_tree_boundary(n_leaves).unwrap_or(16);
                 let mut level_start = 0usize;
                 let mut level_len = n_leaves;
-                while level_len > 16 {
+                while level_len > recompute_start {
                     level_start += level_len;
                     level_len /= 2;
                 }
@@ -6371,7 +6961,7 @@ kernel void blake3_pow_scan(
     /// Cache key component tying entries to both the exact GPU source and
     /// selected from-z mode. Candidate and exact-rollback processes must not
     /// consume each other's latch or tuned split.
-    fn warmup_cache_msl_fnv_for(zero_root: bool, leaf_vec4: bool) -> u64 {
+    fn warmup_cache_msl_fnv_for(zero_root: bool, leaf_vec4: bool, pad_v4: bool) -> u64 {
         let mut key = fnv1a64(MSL_SOURCE);
         if zero_root {
             key ^= fnv1a64(FROM_Z_ZERO_ROOT_MSL_SOURCE).rotate_left(1)
@@ -6380,6 +6970,9 @@ kernel void blake3_pow_scan(
         if leaf_vec4 {
             key ^= fnv1a64(LEAF_VEC4_MSL_SOURCE).rotate_left(2) ^ 0x4C45_4146_5F56_3431; // "LEAF_V41"
         }
+        if pad_v4 {
+            key ^= fnv1a64(NTT_G4_V4RES_MSL_SOURCE).rotate_left(3) ^ 0x5041_445F_5634_5253; // "PAD_V4RS"
+        }
         key
     }
 
@@ -6387,6 +6980,7 @@ kernel void blake3_pow_scan(
         warmup_cache_msl_fnv_for(
             super::gpu_from_z_zero_root_selected(20),
             super::gpu_leaf_vec4_enabled(),
+            super::gpu_pad_v4_enabled(),
         )
     }
 
@@ -6394,8 +6988,8 @@ kernel void blake3_pow_scan(
     mod zero_root_cache_key_tests {
         #[test]
         fn supplemental_source_and_mode_have_a_distinct_fingerprint() {
-            let incumbent = super::warmup_cache_msl_fnv_for(false, false);
-            let candidate = super::warmup_cache_msl_fnv_for(true, false);
+            let incumbent = super::warmup_cache_msl_fnv_for(false, false, false);
+            let candidate = super::warmup_cache_msl_fnv_for(true, false, false);
             assert_eq!(incumbent, super::fnv1a64(super::MSL_SOURCE));
             assert_ne!(candidate, incumbent);
             assert_eq!(
@@ -6406,14 +7000,27 @@ kernel void blake3_pow_scan(
             );
             // The leaf-vec4 dimension is independent and non-degenerate:
             // candidate and exact-rollback processes never share a latch.
-            let vec4 = super::warmup_cache_msl_fnv_for(false, true);
+            let vec4 = super::warmup_cache_msl_fnv_for(false, true, false);
             assert_ne!(vec4, incumbent);
-            assert_ne!(super::warmup_cache_msl_fnv_for(true, true), candidate);
+            assert_ne!(super::warmup_cache_msl_fnv_for(true, true, false), candidate);
             assert_eq!(
                 vec4,
                 incumbent
                     ^ super::fnv1a64(super::LEAF_VEC4_MSL_SOURCE).rotate_left(2)
                     ^ 0x4C45_4146_5F56_3431
+            );
+            // The pad-v4 dimension is independent and non-degenerate:
+            // opt-in probe processes and default-off
+            // processes never consume each other's latch or tuned split.
+            let pad = super::warmup_cache_msl_fnv_for(false, false, true);
+            assert_ne!(pad, incumbent);
+            assert_ne!(super::warmup_cache_msl_fnv_for(true, false, true), candidate);
+            assert_ne!(super::warmup_cache_msl_fnv_for(false, true, true), vec4);
+            assert_eq!(
+                pad,
+                incumbent
+                    ^ super::fnv1a64(super::NTT_G4_V4RES_MSL_SOURCE).rotate_left(3)
+                    ^ 0x5041_445F_5634_5253
             );
         }
 
@@ -9330,6 +9937,383 @@ kernel void rec_parent_hash(device const uint* children [[buffer(0)]],
     }
 
     // -----------------------------------------------------------------------
+    // Recursive Ligerito L1 GPU NTT inside the PCS open
+    // (see `ENV_NO_OPEN_L1_GPU`).
+    //
+    // The L1 recursive commitment RS-encodes 8 interleaved lanes of a
+    // size-2^18 additive NTT, layout `mat[pos * 8 + lane]` (32 MiB), on the
+    // CPU while the GPU sits idle. The promoted metallib NTT pass kernels
+    // are hardwired to 64 interleaved lanes — but the two layouts coincide
+    // under an exact index remap for every layer whose butterfly distance is
+    // >= 8 positions:
+    //
+    //   flat = pos*8 + lane = pos64*64 + lane64,
+    //   pos64 = pos >> 3, lane64 = (pos & 7)*8 + lane.
+    //
+    //   At 8-lane layer L < log_d64 (log_d64 = log2(len/64)), butterflies
+    //   pair `pos` differing in bit (log_d - L - 1) >= 3, i.e. `pos64`
+    //   differing in bit (log_d64 - L - 1) with equal lane64 — exactly the
+    //   64-lane kernel's layer-L butterfly set. The 8-lane twiddle
+    //   `twiddle(L, pos >> (log_d - L))` equals the 64-lane
+    //   `twiddle(L, pos64 >> (log_d64 - L))` at identical flat-table index
+    //   `(1 << L) - 1 + block`, shared across all lanes in both views.
+    //
+    // So the GPU runs layers `[start_layer, log_d64)` via the unmodified
+    // `encode_ntt_passes` at `log_d = log_d64`, and the CPU finishes the
+    // last `log_d - log_d64` layers (butterfly distance < 8 positions) with
+    // the incumbent `forward_transform_interleaved_from_layer`, feeding the
+    // already-promoted GPU recursive Merkle unchanged.
+    //
+    // Trust ladder (the zc-r2 W-offload post-mortem law: a local byte-oracle
+    // pass does NOT transfer across GPU generations, and a GPU extension
+    // must DEGRADE to the promoted protocol, never poison it): the first
+    // call per (len, num_ntts, start_layer) shape dual-runs — GPU probe on a
+    // staging copy + full incumbent CPU transform on the caller's buffer
+    // (which stays authoritative for that prove) — and latches the GPU arm
+    // ON only when probe-plus-CPU-tail reproduces the incumbent bytes
+    // exactly ON THIS machine. Any mismatch, allocation, or submit failure
+    // latches OFF / poisons, and every prove runs the exact incumbent. The
+    // warmup prove is untimed, so the dual-run never touches the timed wall.
+    //
+    // The latched path wraps the caller's matrix through the REC_MERKLE
+    // wrap cache (the same allocation the recursive-Merkle offload pins and
+    // wires), because overlapping `newBufferWithBytesNoCopy` views over one
+    // range are not legal — creating a second independent wrap of the pinned
+    // L1 matrix is exactly the collision `scratch::f128_range_overlaps_pin`
+    // exists to refuse.
+    // -----------------------------------------------------------------------
+
+    /// Lane width of the metallib NTT pass kernels.
+    const OPEN_L1_LANES: usize = 64;
+
+    struct OpenL1Ntt {
+        /// Persistent twiddle upload buffer; refreshed by memcpy from the
+        /// caller's NTT object on every latched dispatch (≈0.5 MiB, tens of
+        /// µs) so a basis or domain change in the caller can never read a
+        /// stale table.
+        tw_buf: Id,
+        tw_capacity: usize,
+        /// Warmup byte-oracle verdicts per shape `(len, num_ntts,
+        /// start_layer)`; `true` latches the GPU arm ON for that shape.
+        verdicts: Vec<((usize, usize, usize), bool)>,
+    }
+    // SAFETY: Metal objects are thread-safe; every access is serialized by
+    // the OPEN_L1_NTT mutex.
+    unsafe impl Send for OpenL1Ntt {}
+
+    static OPEN_L1_NTT: Mutex<Option<Result<OpenL1Ntt, String>>> = Mutex::new(None);
+
+    fn open_l1_debug() -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var_os("FLOCK_GPU_OPENL1_DEBUG").is_some())
+    }
+
+    pub(crate) fn gpu_open_l1_ntt_ready() -> bool {
+        gpu().is_ok()
+    }
+
+    /// Copy the flat breadth-first twiddle table for `log_d64` layers of
+    /// `ntt` into the persistent upload buffer, (re)allocating as needed.
+    fn open_l1_upload_twiddles(
+        gpu: &'static Gpu,
+        state: &mut OpenL1Ntt,
+        ntt: &AdditiveNttF128,
+        log_d64: usize,
+    ) -> Option<Id> {
+        let n_tw = (1usize << log_d64) - 1;
+        let bytes = n_tw * core::mem::size_of::<F128>();
+        if state.tw_capacity < bytes {
+            let buf = match unsafe { gpu.new_buffer(bytes) } {
+                Ok(buf) => buf,
+                Err(e) => {
+                    if open_l1_debug() {
+                        eprintln!("[gpu-openl1] twiddle buffer alloc failed ({e})");
+                    }
+                    return None;
+                }
+            };
+            if !state.tw_buf.is_null() {
+                unsafe { gpu.release(state.tw_buf) };
+            }
+            state.tw_buf = buf;
+            state.tw_capacity = bytes;
+        }
+        unsafe {
+            let dst = gpu.buffer_contents(state.tw_buf);
+            if let Some(t) = ntt.precomputed_twiddle_table()
+                && t.len() >= n_tw
+            {
+                core::ptr::copy_nonoverlapping(t.as_ptr().cast::<u8>(), dst, bytes);
+            } else {
+                let t = super::flat_twiddle_table(ntt, log_d64);
+                core::ptr::copy_nonoverlapping(t.as_ptr().cast::<u8>(), dst, bytes);
+            }
+        }
+        Some(state.tw_buf)
+    }
+
+    /// Get-or-create the no-copy wrap of the caller's matrix through the
+    /// shared REC_MERKLE wrap cache (see the module comment above for why a
+    /// second independent wrap of the same range is not an option).
+    fn open_l1_mat_wrap(gpu: &'static Gpu, ptr: *mut u8, len_bytes: usize) -> Option<Id> {
+        let mut guard = match REC_MERKLE.lock() {
+            Ok(g) => g,
+            Err(poisoned) => {
+                REC_MERKLE.clear_poison();
+                note_poisoned_lock("rec-merkle", true);
+                let mut g = poisoned.into_inner();
+                *g = None;
+                g
+            }
+        };
+        if guard.is_none() {
+            *guard = Some(rec_merkle_init(gpu));
+        }
+        let state = match guard.as_mut() {
+            Some(Ok(state)) => state,
+            _ => return None,
+        };
+        let addr = ptr as usize;
+        if let Some(&(_, _, buf)) = state
+            .wraps
+            .iter()
+            .find(|(p, l, _)| *p == addr && *l == len_bytes)
+        {
+            state.hits += 1;
+            return Some(buf);
+        }
+        // Never create a view that would overlap an existing pinned wrap
+        // without matching it exactly.
+        if crate::scratch::f128_range_overlaps_pin(addr, len_bytes) {
+            if open_l1_debug() {
+                eprintln!("[gpu-openl1] refusing overlapping wrap at {addr:#x}");
+            }
+            return None;
+        }
+        match unsafe { gpu.wrap_buffer(ptr, len_bytes) } {
+            Ok(buf) => {
+                state.misses += 1;
+                state.wraps.push((addr, len_bytes, buf));
+                Some(buf)
+            }
+            Err(e) => {
+                if open_l1_debug() {
+                    eprintln!("[gpu-openl1] wrap failed ({e})");
+                }
+                None
+            }
+        }
+    }
+
+    /// Warmup dual-run: GPU probe on a staging copy vs the full incumbent
+    /// CPU transform on the caller's buffer (which is the authoritative
+    /// result for this prove either way). Returns the latch verdict.
+    #[allow(clippy::too_many_arguments)]
+    fn open_l1_oracle(
+        gpu: &'static Gpu,
+        state: &mut OpenL1Ntt,
+        mat: &mut [F128],
+        num_ntts: usize,
+        start_layer: usize,
+        log_d64: usize,
+        ntt: &AdditiveNttF128,
+    ) -> bool {
+        let started = open_l1_debug().then(std::time::Instant::now);
+        let bytes = core::mem::size_of_val(mat);
+        let gpu_probe: Result<Vec<F128>, String> = match open_l1_upload_twiddles(
+            gpu, state, ntt, log_d64,
+        ) {
+            None => Err("twiddle upload failed".into()),
+            Some(tw_buf) => unsafe {
+                let pool = gpu.pool_push();
+                let out = (|| -> Result<Vec<F128>, String> {
+                    let staging = gpu.new_buffer(bytes)?;
+                    let run = (|| -> Result<(), String> {
+                        let dst =
+                            core::slice::from_raw_parts_mut(gpu.buffer_contents(staging), bytes);
+                        copy_bytes_parallel(mat.as_ptr().cast::<u8>(), dst);
+                        let cb = gpu.command_buffer()?;
+                        let enc = gpu.compute_encoder(cb)?;
+                        encode_ntt_passes(gpu, enc, staging, tw_buf, log_d64, start_layer);
+                        gpu.end_encoding(enc);
+                        gpu.commit_and_wait(cb)
+                    })();
+                    let out = run.map(|()| {
+                        let mut probe = crate::scratch::take_f128_unpinned(mat.len());
+                        let dst = core::slice::from_raw_parts_mut(
+                            probe.as_mut_ptr().cast::<u8>(),
+                            bytes,
+                        );
+                        copy_bytes_parallel(gpu.buffer_contents(staging), dst);
+                        probe
+                    });
+                    gpu.release(staging);
+                    out
+                })();
+                gpu.pool_pop(pool);
+                out
+            },
+        };
+        // Authoritative result for this prove: the exact incumbent CPU
+        // transform on the caller's buffer.
+        ntt.forward_transform_interleaved_from_layer(mat, num_ntts, start_layer);
+        let verdict = match gpu_probe {
+            Ok(mut probe) => {
+                // Complete the exact production composition on the probe
+                // (GPU layers + incumbent CPU tail), then byte-compare.
+                ntt.forward_transform_interleaved_from_layer(&mut probe, num_ntts, log_d64);
+                let ok = probe[..] == mat[..];
+                crate::scratch::give_f128(probe);
+                ok
+            }
+            Err(e) => {
+                if open_l1_debug() {
+                    eprintln!("[gpu-openl1] oracle probe failed ({e})");
+                }
+                false
+            }
+        };
+        if let Some(t) = started {
+            eprintln!(
+                "[gpu-openl1] oracle len=2^{} lanes={num_ntts} start={start_layer}: \
+                 latched={verdict} ({:.2} ms untimed)",
+                mat.len().trailing_zeros(),
+                t.elapsed().as_secs_f64() * 1e3,
+            );
+        }
+        verdict
+    }
+
+    pub(crate) fn gpu_open_l1_ntt(
+        mat: &mut [F128],
+        num_ntts: usize,
+        start_layer: usize,
+        ntt: &AdditiveNttF128,
+    ) -> Option<usize> {
+        if !super::gpu_open_l1_enabled() {
+            return None;
+        }
+        let len = mat.len();
+        if num_ntts == 0
+            || !num_ntts.is_power_of_two()
+            || num_ntts > OPEN_L1_LANES
+            || len == 0
+            || len % OPEN_L1_LANES != 0
+            || !(len / OPEN_L1_LANES).is_power_of_two()
+        {
+            return None;
+        }
+        let log_d64 = (len / OPEN_L1_LANES).trailing_zeros() as usize;
+        let log_d = (len / num_ntts).trailing_zeros() as usize;
+        if start_layer >= log_d64 || ntt.log_domain_size() < log_d {
+            return None;
+        }
+        let gpu = gpu().ok()?;
+
+        let mut guard = match OPEN_L1_NTT.lock() {
+            Ok(g) => g,
+            Err(poisoned) => {
+                OPEN_L1_NTT.clear_poison();
+                note_poisoned_lock("open-l1-ntt", true);
+                let mut g = poisoned.into_inner();
+                *g = None;
+                g
+            }
+        };
+        if guard.is_none() {
+            *guard = Some(Ok(OpenL1Ntt {
+                tw_buf: NIL,
+                tw_capacity: 0,
+                verdicts: Vec::new(),
+            }));
+        }
+        let state = match guard.as_mut() {
+            Some(Ok(state)) => state,
+            Some(Err(e)) => {
+                if open_l1_debug() {
+                    eprintln!("[gpu-openl1] unavailable ({e})");
+                }
+                return None;
+            }
+            None => unreachable!("initialized above"),
+        };
+
+        let shape = (len, num_ntts, start_layer);
+        match state
+            .verdicts
+            .iter()
+            .find(|(s, _)| *s == shape)
+            .map(|&(_, v)| v)
+        {
+            Some(true) => {}
+            Some(false) => return None,
+            None => {
+                let verdict =
+                    open_l1_oracle(gpu, state, mat, num_ntts, start_layer, log_d64, ntt);
+                state.verdicts.push((shape, verdict));
+                // `mat` already holds the full incumbent CPU codeword; the
+                // caller's tail dispatch at `log_d` is a no-op.
+                return Some(log_d);
+            }
+        }
+
+        // Latched fast path.
+        let started = open_l1_debug().then(std::time::Instant::now);
+        let tw_buf = open_l1_upload_twiddles(gpu, state, ntt, log_d64)?;
+        let bytes = core::mem::size_of_val(mat);
+        let data_buf = open_l1_mat_wrap(gpu, mat.as_mut_ptr().cast::<u8>(), bytes)?;
+        let run = unsafe {
+            let pool = gpu.pool_push();
+            let run = (|| -> Result<(), String> {
+                let cb = gpu.command_buffer()?;
+                let enc = gpu.compute_encoder(cb)?;
+                encode_ntt_passes(gpu, enc, data_buf, tw_buf, log_d64, start_layer);
+                gpu.end_encoding(enc);
+                gpu.commit_and_wait(cb)
+            })();
+            gpu.pool_pop(pool);
+            run
+        };
+        if let Err(e) = run {
+            // Poison: a mid-prove Metal failure is not a shape to retry
+            // against; every later call falls back to the CPU incumbent
+            // (the caller re-runs its untouched dispatch on this call too).
+            let msg = format!("submit failed ({e})");
+            if open_l1_debug() {
+                eprintln!("[gpu-openl1] {msg}");
+            }
+            *guard = Some(Err(msg));
+            return None;
+        }
+        if let Some(t) = started {
+            eprintln!(
+                "[gpu-openl1] len=2^{} layers {start_layer}..{log_d64} wall {:.2} ms",
+                len.trailing_zeros(),
+                t.elapsed().as_secs_f64() * 1e3,
+            );
+        }
+        Some(log_d64)
+    }
+
+    /// Test hook: the latch verdict recorded for a shape, if any.
+    #[cfg(test)]
+    pub(crate) fn gpu_open_l1_latch_for_test(
+        len: usize,
+        num_ntts: usize,
+        start_layer: usize,
+    ) -> Option<bool> {
+        let guard = OPEN_L1_NTT.lock().ok()?;
+        match &*guard {
+            Some(Ok(state)) => state
+                .verdicts
+                .iter()
+                .find(|(s, _)| *s == (len, num_ntts, start_layer))
+                .map(|&(_, v)| v),
+            _ => None,
+        }
+    }
+
+    // -----------------------------------------------------------------------
     // Zerocheck round-two PRODUCTS GPU arm (see `ENV_NO_GPU_ZC_R2`).
     //
     // The round-two fused fold sweeps 2^25 packed row pairs: per pair, four
@@ -11524,6 +12508,19 @@ mod imp {
         None
     }
 
+    pub(crate) fn gpu_open_l1_ntt_ready() -> bool {
+        false
+    }
+
+    pub(crate) fn gpu_open_l1_ntt(
+        _mat: &mut [F128],
+        _num_ntts: usize,
+        _start_layer: usize,
+        _ntt: &AdditiveNttF128,
+    ) -> Option<usize> {
+        None
+    }
+
     pub(crate) struct FromZFirstPassStream;
 
     impl FromZFirstPassStream {
@@ -12487,6 +13484,7 @@ mod tests {
                 LEAF_START,
                 SUBTREE_LEAVES,
                 true,
+                1,
             );
             gpu.end_encoding(enc);
             gpu.commit_and_wait(cb).unwrap();
@@ -12729,6 +13727,169 @@ mod tests {
             };
             assert!(super::gpu_recursive_merkle_blake3(small_bytes, n).is_none());
         }
+    }
+
+    /// The open-L1 GPU NTT (8-lane -> 64-lane remap over the promoted pass
+    /// kernels) must reproduce the incumbent CPU interleaved transform
+    /// bit-for-bit at a small shape whose pass plan covers the same kernel
+    /// family as the ranked L1 plan (f=4 with s=1 and the generic f=1 tail
+    /// pass), through both the warmup-oracle call and the latched fast path,
+    /// and the commitment built from the codeword (flat tree + root) must be
+    /// byte-identical.
+    #[test]
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    fn gpu_open_l1_ntt_remap_matches_cpu_small() {
+        let num_ntts = 8usize;
+        let log_d = 10usize; // len 2^13 F128, remap window log_d64 = 7
+        let start_layer = 2usize;
+        let len = num_ntts << log_d;
+        let ntt = crate::ntt::AdditiveNttF128::standard(log_d);
+        let mut rng = Rng::new(0x0511);
+
+        // First call at this shape = warmup byte-oracle: returns the full
+        // incumbent codeword and records the latch verdict.
+        let input = rng.vec(len);
+        let mut got = input.clone();
+        let Some(tail) = super::gpu_open_l1_ntt(&mut got, num_ntts, start_layer, &ntt) else {
+            match imp::gpu().map(|_| ()) {
+                Ok(()) => panic!("GPU available but open-L1 NTT returned None"),
+                Err(e) => {
+                    eprintln!("skipping GPU test: {e}");
+                    return;
+                }
+            }
+        };
+        ntt.forward_transform_interleaved_from_layer(&mut got, num_ntts, tail);
+        let mut expect = input.clone();
+        ntt.forward_transform_interleaved_from_layer(&mut expect, num_ntts, start_layer);
+        assert!(got == expect, "oracle-call codeword mismatch");
+        assert_eq!(
+            imp::gpu_open_l1_latch_for_test(len, num_ntts, start_layer),
+            Some(true),
+            "GPU probe failed the byte-oracle at the small shape"
+        );
+
+        // Latched fast path needs a page-aligned, page-multiple buffer for
+        // the no-copy wrap; carve one out of an oversized allocation.
+        let page_f128 = 16384 / core::mem::size_of::<F128>();
+        let mut backing = rng.vec(len + page_f128);
+        let addr = backing.as_ptr() as usize;
+        let off = (page_f128 - (addr % 16384) / core::mem::size_of::<F128>()) % page_f128;
+        let input2 = rng.vec(len);
+        let mat2 = &mut backing[off..off + len];
+        mat2.copy_from_slice(&input2);
+        let mut expect2 = input2;
+        ntt.forward_transform_interleaved_from_layer(&mut expect2, num_ntts, start_layer);
+        let tail2 = super::gpu_open_l1_ntt(mat2, num_ntts, start_layer, &ntt)
+            .expect("latched call must engage");
+        assert_eq!(
+            tail2,
+            log_d - 3,
+            "fast path must stop at the 64-lane remap window"
+        );
+        ntt.forward_transform_interleaved_from_layer(mat2, num_ntts, tail2);
+        assert!(mat2[..] == expect2[..], "latched-call codeword mismatch");
+
+        // The commitment the codeword feeds: identical flat tree and root.
+        let n_leaves = 1usize << log_d; // 128-byte leaves (8 F128 per row)
+        let got_bytes: &[u8] = unsafe {
+            core::slice::from_raw_parts(
+                mat2.as_ptr().cast::<u8>(),
+                core::mem::size_of_val(&mat2[..]),
+            )
+        };
+        let exp_bytes: &[u8] = unsafe {
+            core::slice::from_raw_parts(
+                expect2.as_ptr().cast::<u8>(),
+                core::mem::size_of_val(expect2.as_slice()),
+            )
+        };
+        let got_tree =
+            crate::merkle::merkle_tree(got_bytes, n_leaves, crate::merkle::HashKind::Blake3);
+        let exp_tree =
+            crate::merkle::merkle_tree(exp_bytes, n_leaves, crate::merkle::HashKind::Blake3);
+        assert!(got_tree == exp_tree, "commitment tree mismatch");
+        assert_eq!(got_tree.last(), exp_tree.last(), "commitment root mismatch");
+    }
+
+    /// End-to-end at the exact ranked L1 recursive shape (2^16 msg cols x
+    /// 8 lanes, rate 1/4, 32 MiB codeword): the GPU-path L1 commitment —
+    /// warmup-oracle call, then the latched fast path on a scratch-pool
+    /// matrix like production — must equal the incumbent CPU commitment in
+    /// codeword bytes, flat tree bytes, and root.
+    #[test]
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    fn gpu_open_l1_full_shape_commitment_matches_cpu() {
+        let (log_msg_cols, log_num_interleaved, log_inv_rate) = (16usize, 3usize, 2usize);
+        let num_ntts = 1usize << log_num_interleaved;
+        let log_d = log_msg_cols + log_inv_rate;
+        let len = num_ntts << log_d;
+        let n_leaves = 1usize << log_d;
+        let ntt = crate::ntt::AdditiveNttF128::standard(log_d);
+        let mut rng = Rng::new(0x0521);
+        let poly = rng.vec(num_ntts << log_msg_cols);
+
+        // Incumbent CPU commitment.
+        let mut expect = vec![F128::ZERO; len];
+        crate::pcs::commit::replicate_message_fill(&mut expect, &poly);
+        ntt.forward_transform_interleaved_from_layer(&mut expect, num_ntts, log_inv_rate);
+        let expect_bytes: &[u8] = unsafe {
+            core::slice::from_raw_parts(
+                expect.as_ptr().cast::<u8>(),
+                core::mem::size_of_val(expect.as_slice()),
+            )
+        };
+        let expect_tree =
+            crate::merkle::merkle_tree(expect_bytes, n_leaves, crate::merkle::HashKind::Blake3);
+
+        for call in 0..2 {
+            let mut mat = crate::scratch::take_f128(len);
+            crate::pcs::commit::replicate_message_fill(&mut mat, &poly);
+            let tail = match super::gpu_open_l1_ntt(&mut mat, num_ntts, log_inv_rate, &ntt) {
+                Some(tail) => tail,
+                None if call == 0 => {
+                    crate::scratch::give_f128(mat);
+                    match imp::gpu().map(|_| ()) {
+                        Ok(()) => panic!("GPU available but open-L1 NTT returned None"),
+                        Err(e) => {
+                            eprintln!("skipping GPU test: {e}");
+                            return;
+                        }
+                    }
+                }
+                None => {
+                    // Latched-path refusal (e.g. an unaligned scratch
+                    // allocation refuses the wrap): production falls back to
+                    // the identical CPU dispatch, so there is nothing more
+                    // to compare here.
+                    eprintln!("open-L1 fast path did not engage on call {call}");
+                    crate::scratch::give_f128(mat);
+                    return;
+                }
+            };
+            ntt.forward_transform_interleaved_from_layer(&mut mat, num_ntts, tail);
+            assert!(mat == expect, "codeword mismatch on call {call}");
+            let mat_bytes: &[u8] = unsafe {
+                core::slice::from_raw_parts(
+                    mat.as_ptr().cast::<u8>(),
+                    core::mem::size_of_val(mat.as_slice()),
+                )
+            };
+            if let Some(gpu_tree) = super::gpu_recursive_merkle_blake3(mat_bytes, n_leaves) {
+                assert!(gpu_tree == expect_tree, "tree mismatch on call {call}");
+                assert_eq!(
+                    gpu_tree.last(),
+                    expect_tree.last(),
+                    "root mismatch on call {call}"
+                );
+            }
+            crate::scratch::give_f128(mat);
+        }
+        assert_eq!(
+            imp::gpu_open_l1_latch_for_test(len, num_ntts, log_inv_rate),
+            Some(true),
+            "GPU probe failed the byte-oracle at the ranked L1 shape"
+        );
     }
 
     /// Occupancy-sensitivity probe for the g4 mid-pass kernel: identical

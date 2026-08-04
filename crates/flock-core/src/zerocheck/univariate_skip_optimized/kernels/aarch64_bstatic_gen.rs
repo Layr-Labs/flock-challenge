@@ -346,13 +346,17 @@ static BSTATIC_ARM_LIVE: [bool; 31] = [true, true, true, true, true, true, true,
 /// Guarded static-b variant of [`shift_reduce_inner_ab_fused_neon`].
 /// Returns `false` when this (w, b_med) position has no static plan, in
 /// which case the caller must run the generic kernel.
+///
+/// `byte_base_b` is the absolute byte offset of this row block in
+/// `a_packed`/`b_packed` (the checked dispatcher passes 0 for its bounced
+/// stack rows); `b_med` only selects the static plan (`blk`).
 #[cfg(target_arch = "aarch64")]
 #[allow(clippy::too_many_lines)]
 pub(crate) fn shift_reduce_inner_ab_bstatic<const FAST: bool>(
     a_packed: &[u8],
     b_packed: &[u8],
     inv_table: &InvNttTableByteSingleGf8,
-    chunk_byte_base: usize,
+    byte_base_b: usize,
     b_med: usize,
     w: usize,
     context: StaticBContext,
@@ -371,7 +375,6 @@ pub(crate) fn shift_reduce_inner_ab_bstatic<const FAST: bool>(
         StaticBContext::Prepared { partials } => partials,
         StaticBContext::LegacyPerCall => bstatic_partials(inv_table),
     };
-    let byte_base_b = chunk_byte_base + b_med * N_CHUNKS * 8;
     let table_base = inv_table.data_ptr();
     let half_swapped_table_base = inv_table.half_swapped_data_ptr();
     // `x^4`-scaled twin of the two images above; only read on the FAST path,
