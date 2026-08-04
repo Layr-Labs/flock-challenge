@@ -138,6 +138,57 @@ mod eq_direct_gate_tests {
     }
 }
 
+/// Kill switch for the witgen GPU arm: `FLOCK_NO_GPU_WITGEN=1` keeps the
+/// ranked witness build (z/a/b rows) on the CPU (the exact incumbent). The
+/// arm computes the whole ranked 3 x 512 MiB witness on the GPU; a one-time
+/// warmup A/B (bit-exact checksum AND wall-clock) in flock-prover's
+/// `generate_impl` admits it. Any failure returns false and the CPU path
+/// stands — worst case is the status quo, never a wrong proof.
+pub const ENV_NO_GPU_WITGEN: &str = "FLOCK_NO_GPU_WITGEN";
+
+#[cfg_attr(
+    not(all(target_os = "macos", target_arch = "aarch64")),
+    allow(dead_code)
+)]
+pub(crate) fn gpu_witgen_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var_os(ENV_NO_GPU_WITGEN).is_none()
+            && cfg!(all(target_os = "macos", target_arch = "aarch64"))
+            && gpu_commit_enabled()
+    })
+}
+
+/// Try the ranked witgen GPU arm for one witness pass (z/a/b rows). The
+/// latch lives in flock-prover's `generate_impl`: the first ranked streamed
+/// prove runs the incumbent CPU pass, probes this arm into throwaway scratch
+/// buffers, slice-compares bit-for-bit, and latches on only when bit-exact
+/// AND the GPU wall-clock beat the CPU pass by the latch margin. This
+/// function only dispatches (zero-copy wrap of the caller's scratch); any
+/// Metal failure, shape mismatch, or kill switch returns false and the CPU
+/// path stands.
+#[cfg_attr(
+    not(all(target_os = "macos", target_arch = "aarch64")),
+    allow(dead_code)
+)]
+pub fn try_witgen_gpu(
+    packed: &[u32],
+    n_total: usize,
+    z: *mut u8,
+    a: *mut u8,
+    b: *mut u8,
+) -> bool {
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    {
+        imp::try_witgen_gpu(packed, n_total, z, a, b)
+    }
+    #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+    {
+        let _ = (packed, n_total, z, a, b);
+        false
+    }
+}
+
 /// Kill switch for the zerocheck round-two PRODUCTS GPU arm:
 /// `FLOCK_NO_GPU_ZC_R2=1` keeps the whole round-two fused fold on the CPU
 /// (the exact incumbent). Unlike the refuted whole-phase tail offload, this
@@ -2704,6 +2755,453 @@ kernel void parent_hash3_v4(device const uint4* children [[buffer(0)]],
     }
 }
 "#;
+
+    /// MSL source for the witgen GPU arm: bit-exact transcription of
+    /// `flock_prover::r1cs_hashes::blake3::build_block_witness_ab_stream_into`
+    /// (the scalar reference the NEON quad builder bit-matches), one thread
+    /// per block. Each thread emits its block's (z, a, b) rows of 256 u64
+    /// words (K = 16384 bits, 15409 useful), F128-packed exactly as the CPU
+    /// path leaves them. Input = 28 u32 per block:
+    /// [cv0..cv7 | m0..m15 | counter_lo | counter_hi | blen | flags]; the
+    /// host pre-pads missing blocks with the all-zero compression.
+    const MSL_WITGEN_SOURCE: &str = r#"
+using namespace metal;
+
+static constant uint witgen_iv[8] = {
+    0x6A09E667u, 0xBB67AE85u, 0x3C6EF372u, 0xA54FF53Au,
+    0x510E527Fu, 0x9B05688Cu, 0x1F83D9ABu, 0x5BE0CD19u
+};
+
+static inline uint wrotr(uint x, uint n) {
+    return (x >> n) | (x << (32u - n));
+}
+
+// add_carry_parts(x, y) -> (sum, left, right, carry); left/right/carry are
+// masked to the low 31 bits (bit 31 is the discarded mod-2^32 carry-out).
+static inline uint4 wacp(uint x, uint y) {
+    const uint M31 = 0x7FFFFFFFu;
+    uint sum = x + y;
+    uint cin = sum ^ x ^ y;
+    uint left = (x ^ cin) & M31;
+    uint right = (y ^ cin) & M31;
+    uint carry = left & right;
+    return uint4(sum, left, right, carry);
+}
+
+// PackedWordWriter state (scalar clone).
+struct WW {
+    uint64_t pending;
+    uint used;
+    uint word;
+};
+
+static inline void wpush(thread WW& w, device uint64_t* out, uint64_t value, uint width) {
+    if (width != 64u) {
+        value &= ((uint64_t)1 << width) - 1ull;
+    }
+    if (w.used == 0u && width == 64u) {
+        out[w.word] = value;
+        w.word += 1u;
+        return;
+    }
+    uint room = 64u - w.used;
+    if (width < room) {
+        w.pending |= value << w.used;
+        w.used += width;
+    } else {
+        out[w.word] = w.pending | (value << w.used);
+        w.word += 1u;
+        if (width == room) {
+            w.pending = 0ull;
+            w.used = 0u;
+        } else {
+            w.pending = value >> room;
+            w.used = width - room;
+        }
+    }
+}
+
+// Flush one 250-bit G record (six 31-bit fields at a 31-bit stride, then two
+// 32-bit lin fields) through a writer as 64/64/64/58-bit pushes.
+static inline void push_g_record(thread WW& w, device uint64_t* out,
+                                 uint f0, uint f1, uint f2, uint f3, uint f4, uint f5,
+                                 uint lin0, uint lin1) {
+    uint64_t r0 = (uint64_t)f0 | ((uint64_t)f1 << 31) | (((uint64_t)f2 & 0x3ull) << 62);
+    uint64_t r1 = ((uint64_t)f2 >> 2) | ((uint64_t)f3 << 29) | (((uint64_t)f4 & 0xFull) << 60);
+    // lin0 is a full 32-bit field at record bit 186: bits 0..5 land in
+    // word 2 (58..63), bits 6..31 spill into word 3 (0..25).
+    uint64_t r2 = ((uint64_t)f4 >> 4) | ((uint64_t)f5 << 27) | (((uint64_t)lin0 & 0x3Full) << 58);
+    uint64_t r3 = ((uint64_t)lin0 >> 6) | ((uint64_t)lin1 << 26);
+    wpush(w, out, r0, 64u);
+    wpush(w, out, r1, 64u);
+    wpush(w, out, r2, 64u);
+    wpush(w, out, r3, 58u);
+}
+
+// One BLAKE3 G with the witness add stream (scalar g! macro body).
+static inline void witgen_g(thread uint* s, const thread uint* m,
+                            uint la, uint lb, uint lc, uint ld, uint mi0, uint mi1,
+                            thread WW& wz, device uint64_t* zrow,
+                            thread WW& wa, device uint64_t* arow,
+                            thread WW& wb, device uint64_t* brow) {
+    uint av = s[la], bv = s[lb], cvv = s[lc], dv = s[ld];
+    uint4 r = wacp(av, bv);
+    uint t0 = r.x, c0 = r.w, l0 = r.y, r0v = r.z;
+    uint4 r1 = wacp(t0, m[mi0]);
+    uint a1 = r1.x, c1 = r1.w, l1 = r1.y, r1b = r1.z;
+    uint d1 = wrotr(dv ^ a1, 16u);
+    uint4 r2 = wacp(cvv, d1);
+    uint c1v = r2.x, c2 = r2.w, l2 = r2.y, r2b = r2.z;
+    uint b1 = wrotr(bv ^ c1v, 12u);
+    uint4 r3 = wacp(a1, b1);
+    uint t1 = r3.x, c3 = r3.w, l3 = r3.y, r3b = r3.z;
+    uint4 r4 = wacp(t1, m[mi1]);
+    uint a2 = r4.x, c4 = r4.w, l4 = r4.y, r4b = r4.z;
+    uint d2 = wrotr(d1 ^ a2, 8u);
+    uint4 r5 = wacp(c1v, d2);
+    uint c2v = r5.x, c5 = r5.w, l5 = r5.y, r5b = r5.z;
+    uint bnew = wrotr(b1 ^ c2v, 7u);
+    uint dnew = d2;
+    // z: carries c0..c5 then b_new, d_new; a: lefts l0..l5 then b_new, d_new;
+    // b: rights r0..r5 then MAX, MAX.
+    push_g_record(wz, zrow, c0, c1, c2, c3, c4, c5, bnew, dnew);
+    push_g_record(wa, arow, l0, l1, l2, l3, l4, l5, bnew, dnew);
+    push_g_record(wb, brow, r0v, r1b, r2b, r3b, r4b, r5b, 0xFFFFFFFFu, 0xFFFFFFFFu);
+    s[la] = a2;
+    s[lb] = bnew;
+    s[lc] = c2v;
+    s[ld] = dnew;
+}
+
+kernel void witgen_quad(device const uint* in  [[buffer(0)]],
+                        device uint64_t* zout [[buffer(1)]],
+                        device uint64_t* aout [[buffer(2)]],
+                        device uint64_t* bout [[buffer(3)]],
+                        uint gid [[thread_position_in_grid]]) {
+    const device uint* blk = in + gid * 28u;
+    uint cv[8];
+    uint m[16];
+    for (uint i = 0u; i < 8u; i++) { cv[i] = blk[i]; }
+    for (uint i = 0u; i < 16u; i++) { m[i] = blk[8u + i]; }
+    uint tlo = blk[24u];
+    uint thi = blk[25u];
+    uint blen = blk[26u];
+    uint flags = blk[27u];
+
+    device uint64_t* zrow = zout + gid * 256u;
+    device uint64_t* arow = aout + gid * 256u;
+    device uint64_t* brow = bout + gid * 256u;
+
+    // ---- prefix: words 0..4 = cv pairs (z/a), MAX (b) ----
+    for (uint i = 0u; i < 4u; i++) {
+        uint64_t v = (uint64_t)cv[2u * i] | ((uint64_t)cv[2u * i + 1u] << 32);
+        zrow[i] = v;
+        arow[i] = v;
+        brow[i] = ~0ull;
+    }
+    // ---- message region: words 8..18 (z/a), MAX (b) ----
+    uint values[20];
+    for (uint i = 0u; i < 16u; i++) { values[i] = m[i]; }
+    values[16] = tlo;
+    values[17] = thi;
+    values[18] = blen;
+    values[19] = flags;
+    for (uint i = 0u; i < 10u; i++) {
+        uint64_t lo = (i == 0u) ? 1ull : (uint64_t)(values[2u * i - 1u] >> 31);
+        uint64_t v = lo | ((uint64_t)values[2u * i] << 1) | ((uint64_t)values[2u * i + 1u] << 33);
+        zrow[8u + i] = v;
+        arow[8u + i] = v;
+        brow[8u + i] = ~0ull;
+    }
+
+    // ---- compression state ----
+    uint s[16];
+    for (uint i = 0u; i < 8u; i++) { s[i] = cv[i]; }
+    for (uint i = 0u; i < 8u; i++) { s[8u + i] = witgen_iv[i]; }
+    s[12] = tlo;
+    s[13] = thi;
+    s[14] = blen;
+    s[15] = flags;
+
+    // ---- G-stream writers start at u64 word 18 with one pending bit ----
+    WW wz, wa, wb;
+    wz.pending = (uint64_t)(flags >> 31);
+    wa.pending = (uint64_t)(flags >> 31);
+    wb.pending = 1ull;
+    wz.used = 1u; wa.used = 1u; wb.used = 1u;
+    wz.word = 18u; wa.word = 18u; wb.word = 18u;
+
+    // ---- 7 rounds x 8 Gs (BLAKE3 message schedule) ----
+    // Round 0
+    witgen_g(s, m, 0,4,8,12, 0,1,  wz,zrow, wa,arow, wb,brow);
+    witgen_g(s, m, 1,5,9,13, 2,3,  wz,zrow, wa,arow, wb,brow);
+    witgen_g(s, m, 2,6,10,14, 4,5,  wz,zrow, wa,arow, wb,brow);
+    witgen_g(s, m, 3,7,11,15, 6,7,  wz,zrow, wa,arow, wb,brow);
+    witgen_g(s, m, 0,5,10,15, 8,9,  wz,zrow, wa,arow, wb,brow);
+    witgen_g(s, m, 1,6,11,12, 10,11, wz,zrow, wa,arow, wb,brow);
+    witgen_g(s, m, 2,7,8,13, 12,13, wz,zrow, wa,arow, wb,brow);
+    witgen_g(s, m, 3,4,9,14, 14,15, wz,zrow, wa,arow, wb,brow);
+    // Round 1
+    witgen_g(s, m, 0,4,8,12, 2,6,  wz,zrow, wa,arow, wb,brow);
+    witgen_g(s, m, 1,5,9,13, 3,10, wz,zrow, wa,arow, wb,brow);
+    witgen_g(s, m, 2,6,10,14, 7,0,  wz,zrow, wa,arow, wb,brow);
+    witgen_g(s, m, 3,7,11,15, 4,13, wz,zrow, wa,arow, wb,brow);
+    witgen_g(s, m, 0,5,10,15, 1,11, wz,zrow, wa,arow, wb,brow);
+    witgen_g(s, m, 1,6,11,12, 12,5, wz,zrow, wa,arow, wb,brow);
+    witgen_g(s, m, 2,7,8,13, 9,14,  wz,zrow, wa,arow, wb,brow);
+    witgen_g(s, m, 3,4,9,14, 15,8,  wz,zrow, wa,arow, wb,brow);
+    // Round 2
+    witgen_g(s, m, 0,4,8,12, 3,4,  wz,zrow, wa,arow, wb,brow);
+    witgen_g(s, m, 1,5,9,13, 10,12, wz,zrow, wa,arow, wb,brow);
+    witgen_g(s, m, 2,6,10,14, 13,2, wz,zrow, wa,arow, wb,brow);
+    witgen_g(s, m, 3,7,11,15, 7,14, wz,zrow, wa,arow, wb,brow);
+    witgen_g(s, m, 0,5,10,15, 6,5,  wz,zrow, wa,arow, wb,brow);
+    witgen_g(s, m, 1,6,11,12, 9,0,  wz,zrow, wa,arow, wb,brow);
+    witgen_g(s, m, 2,7,8,13, 11,15, wz,zrow, wa,arow, wb,brow);
+    witgen_g(s, m, 3,4,9,14, 8,1,  wz,zrow, wa,arow, wb,brow);
+    // Round 3
+    witgen_g(s, m, 0,4,8,12, 10,7, wz,zrow, wa,arow, wb,brow);
+    witgen_g(s, m, 1,5,9,13, 12,9, wz,zrow, wa,arow, wb,brow);
+    witgen_g(s, m, 2,6,10,14, 14,3, wz,zrow, wa,arow, wb,brow);
+    witgen_g(s, m, 3,7,11,15, 13,15, wz,zrow, wa,arow, wb,brow);
+    witgen_g(s, m, 0,5,10,15, 4,0,  wz,zrow, wa,arow, wb,brow);
+    witgen_g(s, m, 1,6,11,12, 11,2, wz,zrow, wa,arow, wb,brow);
+    witgen_g(s, m, 2,7,8,13, 5,8,  wz,zrow, wa,arow, wb,brow);
+    witgen_g(s, m, 3,4,9,14, 1,6,  wz,zrow, wa,arow, wb,brow);
+    // Round 4
+    witgen_g(s, m, 0,4,8,12, 12,13, wz,zrow, wa,arow, wb,brow);
+    witgen_g(s, m, 1,5,9,13, 9,11,  wz,zrow, wa,arow, wb,brow);
+    witgen_g(s, m, 2,6,10,14, 15,10, wz,zrow, wa,arow, wb,brow);
+    witgen_g(s, m, 3,7,11,15, 14,8, wz,zrow, wa,arow, wb,brow);
+    witgen_g(s, m, 0,5,10,15, 7,2,  wz,zrow, wa,arow, wb,brow);
+    witgen_g(s, m, 1,6,11,12, 5,3,  wz,zrow, wa,arow, wb,brow);
+    witgen_g(s, m, 2,7,8,13, 0,1,  wz,zrow, wa,arow, wb,brow);
+    witgen_g(s, m, 3,4,9,14, 6,4,  wz,zrow, wa,arow, wb,brow);
+    // Round 5
+    witgen_g(s, m, 0,4,8,12, 9,14,  wz,zrow, wa,arow, wb,brow);
+    witgen_g(s, m, 1,5,9,13, 11,5,  wz,zrow, wa,arow, wb,brow);
+    witgen_g(s, m, 2,6,10,14, 8,12, wz,zrow, wa,arow, wb,brow);
+    witgen_g(s, m, 3,7,11,15, 15,1, wz,zrow, wa,arow, wb,brow);
+    witgen_g(s, m, 0,5,10,15, 13,3, wz,zrow, wa,arow, wb,brow);
+    witgen_g(s, m, 1,6,11,12, 0,10, wz,zrow, wa,arow, wb,brow);
+    witgen_g(s, m, 2,7,8,13, 2,6,  wz,zrow, wa,arow, wb,brow);
+    witgen_g(s, m, 3,4,9,14, 4,7,  wz,zrow, wa,arow, wb,brow);
+    // Round 6
+    witgen_g(s, m, 0,4,8,12, 11,15, wz,zrow, wa,arow, wb,brow);
+    witgen_g(s, m, 1,5,9,13, 5,0,  wz,zrow, wa,arow, wb,brow);
+    witgen_g(s, m, 2,6,10,14, 1,9,  wz,zrow, wa,arow, wb,brow);
+    witgen_g(s, m, 3,7,11,15, 8,6,  wz,zrow, wa,arow, wb,brow);
+    witgen_g(s, m, 0,5,10,15, 14,10, wz,zrow, wa,arow, wb,brow);
+    witgen_g(s, m, 1,6,11,12, 2,12, wz,zrow, wa,arow, wb,brow);
+    witgen_g(s, m, 2,7,8,13, 3,4,  wz,zrow, wa,arow, wb,brow);
+    witgen_g(s, m, 3,4,9,14, 7,13, wz,zrow, wa,arow, wb,brow);
+
+    // ---- OUT_HI: 8 lin words state[w+8] ^ cv[w] (b gets MAX) ----
+    for (uint w = 0u; w < 8u; w++) {
+        uint v = s[w + 8u] ^ cv[w];
+        wpush(wz, zrow, (uint64_t)v, 32u);
+        wpush(wa, arow, (uint64_t)v, 32u);
+        wpush(wb, brow, ~0ull, 32u);
+    }
+
+    // ---- finish: flush pending + zero suffix ----
+    if (wz.used != 0u) { zrow[wz.word] = wz.pending; wz.word += 1u; }
+    for (uint w = wz.word; w < 256u; w++) { zrow[w] = 0ull; }
+    if (wa.used != 0u) { arow[wa.word] = wa.pending; wa.word += 1u; }
+    for (uint w = wa.word; w < 256u; w++) { arow[w] = 0ull; }
+    if (wb.used != 0u) { brow[wb.word] = wb.pending; wb.word += 1u; }
+    for (uint w = wb.word; w < 256u; w++) { brow[w] = 0ull; }
+
+    // ---- out_lo: words 4..8 (z/a only; b stays MAX) ----
+    for (uint i = 0u; i < 4u; i++) {
+        uint64_t v = (uint64_t)(s[2u * i] ^ s[8u + 2u * i])
+                   | ((uint64_t)(s[2u * i + 1u] ^ s[8u + 2u * i + 1u]) << 32);
+        zrow[4u + i] = v;
+        arow[4u + i] = v;
+        brow[4u + i] = ~0ull;
+    }
+}
+"#;
+
+    /// ------------------------------------------------------------------
+    /// Witgen GPU arm (ranked witness z/a/b rows, 3 x 512 MiB).
+    ///
+    /// Kernel = exact transcription of
+    /// `flock_prover::r1cs_hashes::blake3::build_block_witness_ab_stream_into`
+    /// (the scalar reference the aarch64 NEON quad builder bit-matches), one
+    /// thread per block. Input: 28 u32 per block
+    /// [cv0..cv7 | m0..m15 | counter_lo | counter_hi | blen | flags], padded
+    /// slots = all-zero compression. Output: 256 u64 words per block per row
+    /// (K = 16384 bits; 15409 useful), F128-packed exactly as the CPU path
+    /// leaves the scratch buffers.
+    ///
+    /// Latch discipline: the one-time warmup A/B lives in flock-prover's
+    /// generate_impl (incumbent CPU loop first, checksummed; this arm runs
+    /// against the same blocks; bit-exact checksum AND wall-clock x1.10
+    /// admits it). This function only dispatches; every failure path here
+    /// returns false and the CPU path stands.
+    /// ------------------------------------------------------------------
+    const WITGEN_MIN_N: usize = 1 << 18;
+    const WITGEN_PACKED_U32_PER_BLOCK: usize = 28;
+    const WITGEN_ROW_BYTES: usize = 256 * 8;
+
+    struct WitgenGpuState {
+        pso: Id,
+    }
+    // SAFETY: Metal objects are thread-safe; access is serialized by the
+    // process-global latch below (same contract as `Gpu`).
+    unsafe impl Send for WitgenGpuState {}
+    unsafe impl Sync for WitgenGpuState {}
+
+    static WITGEN_GPU_STATE: std::sync::OnceLock<Option<std::sync::Mutex<WitgenGpuState>>> =
+        std::sync::OnceLock::new();
+
+    /// Compile the witgen kernel (own library). Any failure -> None -> the
+    /// arm stays off; the commit kernels are never touched.
+    fn build_witgen_pso(gpu: &Gpu) -> Option<Id> {
+        unsafe {
+            let pool = gpu.pool_push();
+            let r = (|| -> Option<Id> {
+                let src = gpu.api.nsstring(MSL_WITGEN_SOURCE).ok()?;
+                let mut err: Id = NIL;
+                let library: Id = send!(
+                    gpu.api,
+                    unsafe extern "C" fn(Id, Sel, Id, Id, *mut Id) -> Id,
+                    gpu.device,
+                    c"newLibraryWithSource:options:error:",
+                    src,
+                    NIL,
+                    &mut err
+                );
+                if library.is_null() {
+                    eprintln!(
+                        "[gpu-witgen] shader compile failed: {}",
+                        gpu.api.error_string(err)
+                    );
+                    return None;
+                }
+                let ns = gpu.api.nsstring("witgen_quad").ok()?;
+                let f: Id = send!(
+                    gpu.api,
+                    unsafe extern "C" fn(Id, Sel, Id) -> Id,
+                    library,
+                    c"newFunctionWithName:",
+                    ns
+                );
+                if f.is_null() {
+                    send!(
+                        gpu.api,
+                        unsafe extern "C" fn(Id, Sel) -> Id,
+                        library,
+                        c"release"
+                    );
+                    return None;
+                }
+                let mut perr: Id = NIL;
+                let pso: Id = send!(
+                    gpu.api,
+                    unsafe extern "C" fn(Id, Sel, Id, *mut Id) -> Id,
+                    gpu.device,
+                    c"newComputePipelineStateWithFunction:error:",
+                    f,
+                    &mut perr
+                );
+                send!(gpu.api, unsafe extern "C" fn(Id, Sel) -> Id, f, c"release");
+                send!(gpu.api, unsafe extern "C" fn(Id, Sel) -> Id, library, c"release");
+                if pso.is_null() {
+                    eprintln!("[gpu-witgen] pipeline: {}", gpu.api.error_string(perr));
+                    return None;
+                }
+                Some(pso)
+            })();
+            gpu.pool_pop(pool);
+            r
+        }
+    }
+
+    /// Run one witgen pass on the GPU: uploads the packed blocks, dispatches
+    /// one thread per block, reads the three rows back into the caller's
+    /// scratch z/a/b (n_total * 2048 bytes each).
+    fn run_witgen_gpu(
+        gpu: &Gpu,
+        pso: Id,
+        packed: &[u32],
+        n_total: usize,
+        z: *mut u8,
+        a: *mut u8,
+        b: *mut u8,
+    ) -> bool {
+        let in_bytes = n_total * WITGEN_PACKED_U32_PER_BLOCK * 4;
+        let out_bytes = n_total * WITGEN_ROW_BYTES;
+        unsafe {
+            let pool = gpu.pool_push();
+            let r = (|| -> Option<bool> {
+                let in_buf = gpu.new_buffer(in_bytes).ok()?;
+                // Zero-copy output: wrap the caller's page-aligned scratch
+                // z/a/b (the same no-copy wrap the commit stream uses for z),
+                // so the kernel writes the F128 rows directly into the memory
+                // the CPU phases and the commit stream will read. DRAM ledger
+                // is byte-identical to the CPU path; the win is latency.
+                let z_buf = gpu.wrap_buffer(z, out_bytes).ok()?;
+                let a_buf = gpu.wrap_buffer(a, out_bytes).ok()?;
+                let b_buf = gpu.wrap_buffer(b, out_bytes).ok()?;
+                std::ptr::copy_nonoverlapping(
+                    packed.as_ptr().cast::<u8>(),
+                    gpu.buffer_contents(in_buf),
+                    in_bytes,
+                );
+                let cb = gpu.command_buffer().ok()?;
+                let enc = gpu.compute_encoder(cb).ok()?;
+                gpu.set_pipeline(enc, pso);
+                gpu.set_buffer(enc, in_buf, 0, 0);
+                gpu.set_buffer(enc, z_buf, 0, 1);
+                gpu.set_buffer(enc, a_buf, 0, 2);
+                gpu.set_buffer(enc, b_buf, 0, 3);
+                let tpg = 256u64;
+                let groups = ((n_total as u64) + tpg - 1) / tpg;
+                gpu.dispatch(enc, groups, tpg);
+                gpu.end_encoding(enc);
+                gpu.commit_and_wait(cb).ok()?;
+                gpu.release(in_buf);
+                gpu.release(z_buf);
+                gpu.release(a_buf);
+                gpu.release(b_buf);
+                Some(true)
+            })();
+            gpu.pool_pop(pool);
+            r.unwrap_or(false)
+        }
+    }
+
+    /// Dispatch entry for the witgen GPU arm. Shape/env-gated at the outer
+    /// wrapper; this only compiles the kernel once (own library) and runs.
+    pub(crate) fn try_witgen_gpu(
+        packed: &[u32],
+        n_total: usize,
+        z: *mut u8,
+        a: *mut u8,
+        b: *mut u8,
+    ) -> bool {
+        if !super::gpu_witgen_enabled() {
+            return false;
+        }
+        if n_total < WITGEN_MIN_N || !n_total.is_power_of_two() {
+            return false;
+        }
+        if packed.len() != n_total * WITGEN_PACKED_U32_PER_BLOCK {
+            return false;
+        }
+        let Ok(gpu) = gpu() else {
+            return false;
+        };
+        let Some(state) = WITGEN_GPU_STATE.get_or_init(|| {
+            build_witgen_pso(gpu).map(|pso| std::sync::Mutex::new(WitgenGpuState { pso }))
+        }) else {
+            return false;
+        };
+        let st = state.lock().unwrap();
+        run_witgen_gpu(gpu, st.pso, packed, n_total, z, a, b)
+    }
 
     /// Source-only ranked from-z specialization. This deliberately does not
     /// reuse the rejected device-table preload design: every group constructs

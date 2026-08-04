@@ -2103,6 +2103,58 @@ pub(crate) mod witgen_simd {
     /// process_group shape, same optional Metal band streaming, same stripe
     /// pass; the per-block builder runs as two NEON quads per group and the
     /// a/b/stripe stores are non-temporal (§14; z stays plain, §16).
+    ///
+    /// Process-global latch for the witgen GPU arm (None = undecided). The
+    /// first ranked streamed prove runs the incumbent CPU pass, then probes
+    /// the GPU arm against it (bit-exact slice compare AND a median-of-N
+    /// wall-clock A/B at a x1.15 margin — see the warmup probe below); only a
+    /// robustly-faster, bit-exact probe flips the latch. Any later dispatch
+    /// failure falls back to the CPU path for that call.
+    fn gpu_witgen_latch() -> &'static std::sync::Mutex<Option<bool>> {
+        static L: std::sync::OnceLock<std::sync::Mutex<Option<bool>>> =
+            std::sync::OnceLock::new();
+        L.get_or_init(|| std::sync::Mutex::new(None))
+    }
+
+    /// Pack blocks (+ all-zero padding slots) into the GPU kernel's 28-u32
+    /// input layout: [cv0..cv7 | m0..m15 | counter_lo | counter_hi | blen |
+    /// flags]. Padding slots stay all-zero (the all-zero compression pin).
+    ///
+    /// `spec_init` mirrors `generate_impl`'s seed-pipe overlap: when the
+    /// ranked `blocks` slice is the lazy speculative buffer (its slots were
+    /// never filled), each block is synthesized from the generator init via
+    /// `crate::seed_pipe::gen_block(init, idx)` — the one closed form the
+    /// eager parallel fill also writes through, so the packed input is
+    /// byte-identical to the ordinary read path. `None` leaves every other
+    /// slice on the direct slot read.
+    fn pack_blocks_for_gpu(
+        blocks: &[Compression],
+        n_blocks: usize,
+        n_total: usize,
+        spec_init: Option<u64>,
+    ) -> Vec<u32> {
+        let mut packed = vec![0u32; n_total * 28];
+        for (idx, slot) in packed.chunks_exact_mut(28).enumerate() {
+            if idx < n_blocks {
+                let synth;
+                let (cv, m, t, bl, fl) = if let Some(init) = spec_init {
+                    synth = crate::seed_pipe::gen_block(init, idx);
+                    (&synth.0, &synth.1, &synth.2, &synth.3, &synth.4)
+                } else {
+                    let blk = &blocks[idx];
+                    (&blk.0, &blk.1, &blk.2, &blk.3, &blk.4)
+                };
+                slot[0..8].copy_from_slice(cv);
+                slot[8..24].copy_from_slice(m);
+                slot[24] = *t as u32;
+                slot[25] = (*t >> 32) as u32;
+                slot[26] = *bl;
+                slot[27] = *fl;
+            }
+        }
+        packed
+    }
+
     #[allow(clippy::type_complexity)]
     fn generate_impl(
         blocks: &[Compression],
@@ -2193,6 +2245,43 @@ pub(crate) mod witgen_simd {
         // the full 512 MiB ranked buffer. The per-band release fence below is
         // the same visibility boundary used by the cached-store path.
         let z_nt = select_z_nt(nt, defer_ranked_stripe, z_nt_enabled());
+
+        // ---- GPU witgen arm (ranked, streamed): latched fast path ----
+        // The kernel is a bit-exact transcription of the scalar per-block
+        // builder; the one-time warmup probe below compares it against the
+        // incumbent CPU pass before the latch can flip. On the latched path
+        // the CPU group loop is skipped entirely: the kernel writes z/a/b
+        // (F128-packed, same layout) into the page-aligned scratch via a
+        // zero-copy Metal wrap, and the lincheck stripe is deferred GPU-side
+        // by the commit stream (z_lincheck is None here). The whole z range is
+        // published to the stream in one sequential range, which is exactly
+        // what the CPU band loop would have done band by band. The seed-pipe
+        // lazy buffer is honored via `spec_init`: `pack_blocks_for_gpu`
+        // synthesizes each block from the generator init when the slots were
+        // never filled (byte-identical to the eager fill).
+        let gpu_shape = defer_ranked_stripe
+            && stream.is_some()
+            && n_total == 1 << 18
+            && n_blocks == n_total;
+        let gpu_took = gpu_shape
+            && *gpu_witgen_latch().lock().unwrap() == Some(true)
+            && {
+                let packed = pack_blocks_for_gpu(blocks, n_blocks, n_total, spec_init);
+                flock_core::gpu_commit::try_witgen_gpu(
+                    &packed,
+                    n_total,
+                    z.as_mut_ptr().cast::<u8>(),
+                    a.as_mut_ptr().cast::<u8>(),
+                    b.as_mut_ptr().cast::<u8>(),
+                )
+            };
+        if gpu_took {
+            debug_assert!(z_lincheck.is_none());
+            if let Some(stream) = &mut stream {
+                stream.submit_ready_range(0, n_total / 64);
+            }
+            return (z, a, b, z_lincheck, stream);
+        }
 
         let process_group = |g: usize| {
             // SAFETY: each scheduled group index occurs exactly once. Every
@@ -2338,6 +2427,175 @@ pub(crate) mod witgen_simd {
             eprintln!(
                 "[witgen-hetero] groups={n_groups} helper-claims={}",
                 flock_core::epool::helper_chunks_claimed() - before
+            );
+        }
+
+        // ---- GPU witgen warmup probe (one-time, on the untimed first pass)
+        // The CPU pass above is the incumbent and authoritative; its output
+        // z/a/b is never touched (a failed or slower probe just latches the
+        // arm off forever — CPU path stands, no `failed` possible). The arm
+        // ships gated ONLY behind this fail-open latch (default) plus the
+        // `FLOCK_NO_GPU_WITGEN` kill switch — there is no live force override.
+        //
+        // Robust admission (mirrors the zc-fold / lincheck replay-convergence
+        // gate): a single-shot wall-clock A/B is too noisy — a lucky-fast GPU
+        // draw OR an unlucky-slow CPU draw could admit a truly-slower GPU (the
+        // mispriced-latch failure class). Instead sample BOTH witness builds
+        // `WITGEN_PROBE_REPS` times into throwaway buffers, take the MEDIAN of
+        // each, and admit iff `median(gpu) * WITGEN_PROMOTE_MARGIN <=
+        // median(cpu)` — i.e. the GPU is ROBUSTLY faster by the margin across
+        // the median of N draws, else fail open. All replays live in the
+        // UNTIMED warmup (the latch is process-global and flips exactly once,
+        // before any timed prove); they never touch the timed proof.
+        if gpu_shape && gpu_witgen_latch().lock().unwrap().is_none() {
+            // At least MIN reps (N≥3), up to MAX; a slightly wider margin than
+            // the honest single-shot ×1.10 so a marginal/noisy GPU is not
+            // admitted. Like the zc-fold gate we break early once the outcome
+            // is settled: on any machine where the GPU is clearly not faster
+            // at the running median, extra replays only burn untimed-warmup
+            // GPU time contending with the in-flight commit stream — so 3 reps
+            // decide the (common) fail-open case, and only a genuinely
+            // competitive GPU (median already faster) samples to MAX for a
+            // confident decision.
+            const WITGEN_PROBE_MIN_REPS: usize = 3;
+            const WITGEN_PROBE_MAX_REPS: usize = 5;
+            const WITGEN_PROMOTE_MARGIN: f64 = 1.15;
+
+            // Throwaway sample buffers — never the live z/a/b (the commit
+            // stream may still be reading z for the NTT first pass). `c*` hold
+            // one CPU witness build; `g*` hold one GPU witgen pass.
+            let mut cz = flock_core::scratch::take_f128(total_f128);
+            let mut ca = flock_core::scratch::take_f128(total_f128);
+            let mut cb = flock_core::scratch::take_f128(total_f128);
+            let mut gz = flock_core::scratch::take_f128(total_f128);
+            let mut ga = flock_core::scratch::take_f128(total_f128);
+            let mut gb = flock_core::scratch::take_f128(total_f128);
+            let cz_base = WritePtr(cz.as_mut_ptr());
+            let ca_base = WritePtr(ca.as_mut_ptr());
+            let cb_base = WritePtr(cb.as_mut_ptr());
+
+            // One parallel CPU witness build into the throwaway buffers: same
+            // quad builder, same `spec_init` synthesis and nt flags as the
+            // real pass, but no stripe and no stream submission — pure witgen
+            // work, symmetric with the GPU dispatch (which likewise excludes
+            // the downstream commit-stream feed).
+            let cpu_build = || {
+                let one = |g: usize| {
+                    // SAFETY: each group index occurs once; groups own disjoint
+                    // ranges of the throwaway buffers.
+                    let (z_grp, a_grp, b_grp) = unsafe {
+                        (
+                            std::slice::from_raw_parts_mut(
+                                cz_base.get().add(g * group_f128),
+                                group_f128,
+                            ),
+                            std::slice::from_raw_parts_mut(
+                                ca_base.get().add(g * group_f128),
+                                group_f128,
+                            ),
+                            std::slice::from_raw_parts_mut(
+                                cb_base.get().add(g * group_f128),
+                                group_f128,
+                            ),
+                        )
+                    };
+                    for half in 0..2 {
+                        let synth: [Compression; 4];
+                        let quad: [&Compression; 4] = if let Some(init) = spec_init {
+                            synth = std::array::from_fn(|j| {
+                                let idx = 8 * g + 4 * half + j;
+                                if idx < n_blocks {
+                                    crate::seed_pipe::gen_block(init, idx)
+                                } else {
+                                    padding
+                                }
+                            });
+                            std::array::from_fn(|j| &synth[j])
+                        } else {
+                            std::array::from_fn(|j| {
+                                let idx = 8 * g + 4 * half + j;
+                                if idx < n_blocks {
+                                    &blocks[idx]
+                                } else {
+                                    &padding
+                                }
+                            })
+                        };
+                        let base = half * 4 * F128_PER_BLOCK;
+                        // SAFETY: each quad owns its four disjoint block slots.
+                        unsafe {
+                            build_quad_witness_ab_stream_neon(
+                                quad,
+                                z_grp[base..].as_mut_ptr() as *mut u32,
+                                a_grp[base..].as_mut_ptr() as *mut u32,
+                                b_grp[base..].as_mut_ptr() as *mut u32,
+                                z_nt,
+                                nt,
+                            );
+                        }
+                    }
+                };
+                super::super::common::drain_group_jobs(n_groups, &one);
+            };
+
+            let median = |v: &[f64]| -> f64 {
+                let mut s: Vec<f64> = v.to_vec();
+                s.sort_by(|x, y| x.partial_cmp(y).unwrap());
+                s[s.len() / 2]
+            };
+            let mut cpu_samples = Vec::with_capacity(WITGEN_PROBE_MAX_REPS);
+            let mut gpu_samples = Vec::with_capacity(WITGEN_PROBE_MAX_REPS);
+            let mut all_ok = true;
+            let mut bit_exact = false;
+            for rep in 0..WITGEN_PROBE_MAX_REPS {
+                let tc = std::time::Instant::now();
+                cpu_build();
+                cpu_samples.push(tc.elapsed().as_secs_f64());
+
+                // The GPU wall INCLUDES the per-block `gen_block` synthesis
+                // (via `pack_blocks_for_gpu`) that the CPU build also pays and
+                // that the real latched fast path pays before every dispatch —
+                // symmetric work on both walls (the honest-A/B fix).
+                let tg = std::time::Instant::now();
+                let packed = pack_blocks_for_gpu(blocks, n_blocks, n_total, spec_init);
+                let ok = flock_core::gpu_commit::try_witgen_gpu(
+                    &packed,
+                    n_total,
+                    gz.as_mut_ptr().cast::<u8>(),
+                    ga.as_mut_ptr().cast::<u8>(),
+                    gb.as_mut_ptr().cast::<u8>(),
+                );
+                gpu_samples.push(tg.elapsed().as_secs_f64());
+                all_ok &= ok;
+                if rep == 0 {
+                    // Bit-exact against the authoritative CPU output (the live
+                    // z/a/b the incumbent pass produced above).
+                    bit_exact = ok && gz == z && ga == a && gb == b;
+                }
+                // Early exit once settled: after ≥MIN reps, if a dispatch
+                // failed (never promote) or the GPU is not even faster than
+                // the CPU at the running median (the ×1.15 margin cannot be
+                // met), stop — the decision is fail-open and further replays
+                // only add warmup GPU contention.
+                if rep + 1 >= WITGEN_PROBE_MIN_REPS
+                    && (!all_ok || median(&gpu_samples) >= median(&cpu_samples))
+                {
+                    break;
+                }
+            }
+
+            let cpu_med = median(&cpu_samples);
+            let gpu_med = median(&gpu_samples);
+            // Admit iff bit-exact AND every dispatch succeeded AND the GPU is
+            // robustly faster than the CPU by the margin at the median.
+            let promoted = bit_exact
+                && all_ok
+                && gpu_med * WITGEN_PROMOTE_MARGIN <= cpu_med;
+            *gpu_witgen_latch().lock().unwrap() = Some(promoted);
+            eprintln!(
+                "[witgen-gpu] probe: bit_exact={bit_exact} ok={all_ok} reps={} \
+                 cpu_med={cpu_med:.4}s gpu_med={gpu_med:.4}s margin={WITGEN_PROMOTE_MARGIN} promoted={promoted}",
+                cpu_samples.len()
             );
         }
 
