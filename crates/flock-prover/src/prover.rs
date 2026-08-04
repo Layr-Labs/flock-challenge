@@ -906,20 +906,19 @@ fn prove_fast_core_with_commit_codeword<Ch: Challenger>(
             assert_eq!(r1cs.useful_bits, 15_409);
             let (m, k_log, useful_bits) = (r1cs.m, r1cs.k_log, r1cs.useful_bits);
             let mut stripe = flock_core::scratch::take_u8(1usize << (m - 3));
-            // E3, not E2, is the ranked contention optimum. The E2 default came
-            // from a local 5-P-core reading; on the ranked 10-P-core M3 Max the
-            // stripe fill has more E-side slack than that reading implied.
-            // Credit: welttowelt's public candidate `4e30884` (submission
-            // `6cd24839`) measured E3 at 1,467,688.35 cps on the ranked runner,
-            // +0.95% over the `c8aba2a` bar, and gnuchev's `6ad9781` reproduced
-            // the direction; both scored positive and then lost the run to the
-            // 10-minute job cap rather than to the mechanism. E4 still steals
-            // bandwidth from commit and E1 lets the stripe spill into zerocheck,
-            // so the 1..=4 override stays for controlled same-binary diagnostics.
+            // Post-C-reuse retune: E3 was the ranked optimum when the stripe's
+            // first consumer was still post-zerocheck lincheck fold (welttowelt
+            // `4e30884` / gnuchev `6ad9781` on the pre-C-reuse tip). Ranked
+            // C-reuse now reads the stripe at the commit/fill join, so finishing
+            // the fill *later* (E2) keeps more tiles in SLC/L2 for that first
+            // consumer without flipping store flavor (e04d782 temporal-store
+            // retire −0.65%). E1 still risks spill into zerocheck; E3/E4 pull
+            // fill earlier and were tuned for the old consumer. Override
+            // `FLOCK_DEFER_STRIPE_EPOOL_THREADS=1..=4` keeps the same-binary grid.
             let epool_workers = std::env::var_os("FLOCK_DEFER_STRIPE_EPOOL_THREADS")
                 .and_then(|value| value.to_str()?.parse::<usize>().ok())
                 .filter(|workers| (1..=4).contains(workers))
-                .unwrap_or(3);
+                .unwrap_or(2);
             let pre = std::thread::scope(|scope| {
                 let stripe_job = scope.spawn(|| {
                     let started = std::time::Instant::now();
