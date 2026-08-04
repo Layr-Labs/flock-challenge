@@ -8573,10 +8573,11 @@ kernel void zc_r2_products(
     /// Anchors-only CPU work is measured locally at ~0.55x of the fused
     /// chunk (two of four folds, no products); the share solves
     /// `(hi - (1-ALPHA) g) c_f = g u_g` — balanced, no CPU-ward bias — and
-    /// caps at `15·hi/16` as the overshoot guard (an optimistic warmup ratio
-    /// must not make the GPU the timed straggler; at this cap the GPU only
-    /// straggles once the true timed ratio exceeds `(1-0.45·15/16)/(15/16)` ≈
-    /// 0.617, still above the ~0.57 measured on the ranked M3 Max).
+    /// caps at `31·hi/32` as the overshoot guard (an optimistic warmup ratio
+    /// must not make the GPU the timed straggler). Prior caps `hi/2`→`3·hi/4`
+    /// (+5.19%)→`7·hi/8`→`15·hi/16` were all binding vs the balance formula;
+    /// instrumented v16 timed prove showed GPU drain 116 ms inside 372 ms R2
+    /// wall (~256 ms idle) under the older 7/8 clamp path.
     /// History of this clamp: `hi/2` always bound (promoted fix → 3·hi/4,
     /// +5.19%), and at every observed ratio (0.33–0.83 across hosts) the
     /// 3·hi/4 cap was *still* what bound the share — the balance point
@@ -8591,8 +8592,8 @@ kernel void zc_r2_products(
     /// round the GPU drained its prefix in `116 ms` inside a `372 ms`
     /// round-two wall, so it sat idle for ~256 ms of it. The clamp, not the
     /// calibration, is the binding constraint on both hosts. Moving to
-    /// `15·hi/16` takes the balanced solution's remaining reachable ground
-    /// while keeping the straggle threshold (0.617) above the ranked ratio.
+    /// `31·hi/32` takes more of the balanced solution's remaining reachable ground
+    /// while keeping an overshoot guard (still not uncapped at `hi`).
     /// Deliberately *not* uncapped: at `hi` the threshold falls to
     /// `1-0.45 = 0.55`, which is **below** the 0.57 measured on the ranked
     /// M3 Max, so full offload would make the GPU the straggler.
@@ -8620,7 +8621,7 @@ kernel void zc_r2_products(
             return 0;
         }
         let g = (hi_size as f64 / (ratio + (1.0 - ZC_R2_ALPHA))).round();
-        (g as usize).min(hi_size * 15 / 16)
+        (g as usize).min(hi_size * 31 / 32)
     }
 
     fn zc_r2_init(gpu: &'static Gpu) -> Result<ZcR2, String> {
@@ -8854,7 +8855,7 @@ kernel void zc_r2_products(
             // 1/8 probe that shipped there.
             (hi_size / 16).clamp(8, 128)
         } else {
-            tuned.min(hi_size * 15 / 16)
+            tuned.min(hi_size * 31 / 32)
         };
         if chunks == 0 {
             return None;
@@ -12096,7 +12097,7 @@ DEF_PROBE(probe_g4_t8_p0,    8u,  0u,   tsel & 7u)
     fn zc_r2_gate_share_policy() {
         use imp::zc_r2_gate_share;
         // Balance point hi/(ratio+0.45); ranked-observed ratios land above
-        // the 15·hi/16 cap, which is the binding overshoot guard.
+        // the 31·hi/32 cap, which is the binding overshoot guard.
         assert_eq!(zc_r2_gate_share(0.57, 2048), 1920);
         assert_eq!(zc_r2_gate_share(0.38, 2048), 1920);
         // The guard still binds before the GPU can straggle: at 15/16 the
