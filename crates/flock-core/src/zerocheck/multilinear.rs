@@ -2452,22 +2452,22 @@ fn fold_and_compute_round_pair_into_with_n_hi(
         // computed on the GPU (which folds its chunks' pairs redundantly
         // via ρ-nibble tables) while the CPU writes those chunks' folded
         // outputs through the exact field-layer `fold_pairs` kernel,
-        // skipping just the products. Only engaged on the LARGEST loop
-        // round (half ≥ 2^24): the share is calibrated at that round's
-        // chunk size, and a measured local A/B showed the same share
-        // makes the GPU the straggler on the next (half-size) round
-        // (12.6 → 33.7 ms) — per-size recalibration is not worth a
-        // second sync for an LLC-adjacent round. `None` = the exact
-        // incumbent path.
-        // PARKED alongside the T3 arm for the v10a bisect: the v9 archive
-        // carrying only this arm also died scoreless, so BOTH new arms sit
-        // behind compile-time consts while the shared-scratch cache fix
-        // ships alone. Re-enable by flipping the const once the freed job
-        // wall is confirmed on the runner.
+        // skipping just the products.
+        //
+        // Geometry after variant K (T3 + first tail iteration deleted): the
+        // largest remaining ordinary loop round is log_n=24 → half=2^23.
+        // Pre-K the threshold was half≥2^24 (the old first-loop shape); that
+        // round no longer exists, so the arm was silently dead on the ranked
+        // path. Re-bind to half≥2^23. Still only the single largest round:
+        // share is calibrated at that chunk size, and a measured A/B showed
+        // the same share makes the GPU the straggler on the next half-size
+        // round (12.6 → 33.7 ms). Kill: FLOCK_NO_GPU_ZC_LOOP=1.
+        //
+        // Was compile-time parked for a v10a bisect after scoreless deaths
+        // that were later attributed to the 10-minute job wall (now 15 min)
+        // plus a missing warmup latch. Both are fixed on tip; unpark.
         #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-        const ZC_LOOP_INTEGRATION_PARKED: bool = true;
-        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-        let gpu_job = if !ZC_LOOP_INTEGRATION_PARKED && half >= (1usize << 24) {
+        let gpu_job = if half >= (1usize << 23) {
             crate::gpu_commit::launch_zc_loop_products(
                 a, b, r_fold, eq_lo, eq_hi, lo_size, hi_size,
             )
