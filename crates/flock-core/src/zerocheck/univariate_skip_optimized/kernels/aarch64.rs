@@ -1,4 +1,5 @@
 use super::super::{F8, F128, InvNttTableByteSingleGf8, N_CHUNKS};
+use crate::field::gf2_128::aarch64::ghash_mul_const_vec2_neon;
 
 /// Four-lane convert-table fold.
 ///
@@ -112,18 +113,28 @@ pub(crate) unsafe fn accumulate_convert(
                 c3 = veorq_u8(c3, vld1q_u8(table.add((c_word >> 24) * 16)));
             }
 
+            // The AB and C products of a lane share the constant `eq_lo_val`,
+            // so each lane's two multiplies batch into one 6-PMULL call
+            // instead of twelve PMULL scalar.
             macro_rules! drain_lane {
                 ($offset:literal, $ab:ident, $c:ident) => {{
                     let ab = vreinterpretq_u64_u8($ab);
                     let c = vreinterpretq_u64_u8($c);
-                    partial_ab[lane + $offset] += F128 {
-                        lo: vgetq_lane_u64::<0>(ab),
-                        hi: vgetq_lane_u64::<1>(ab),
-                    } * eq_lo_val;
-                    partial_c[lane + $offset] += F128 {
-                        lo: vgetq_lane_u64::<0>(c),
-                        hi: vgetq_lane_u64::<1>(c),
-                    } * eq_lo_val;
+                    let [prod_ab, prod_c] = ghash_mul_const_vec2_neon(
+                        eq_lo_val,
+                        [
+                            F128 {
+                                lo: vgetq_lane_u64::<0>(ab),
+                                hi: vgetq_lane_u64::<1>(ab),
+                            },
+                            F128 {
+                                lo: vgetq_lane_u64::<0>(c),
+                                hi: vgetq_lane_u64::<1>(c),
+                            },
+                        ],
+                    );
+                    partial_ab[lane + $offset] += prod_ab;
+                    partial_c[lane + $offset] += prod_c;
                 }};
             }
             drain_lane!(0, ab0, c0);
@@ -216,19 +227,26 @@ pub(crate) unsafe fn accumulate_convert_ab(
                 ab3 = veorq_u8(ab3, vld1q_u8(table.add((wa >> 24) * 16)));
             }
 
-            macro_rules! drain_lane {
-                ($offset:literal, $ab:ident) => {{
-                    let ab = vreinterpretq_u64_u8($ab);
-                    partial_ab[lane + $offset] += F128 {
-                        lo: vgetq_lane_u64::<0>(ab),
-                        hi: vgetq_lane_u64::<1>(ab),
-                    } * eq_lo_val;
+            // AB-only drain: all four lanes share `eq_lo_val`, so they pair up
+            // into two 6-PMULL calls rather than four 6-PMULL scalar
+            // multiplies — 12 PMULL per four lanes instead of 24.
+            macro_rules! lane_f128 {
+                ($ab:ident) => {{
+                    let v = vreinterpretq_u64_u8($ab);
+                    F128 {
+                        lo: vgetq_lane_u64::<0>(v),
+                        hi: vgetq_lane_u64::<1>(v),
+                    }
                 }};
             }
-            drain_lane!(0, ab0);
-            drain_lane!(1, ab1);
-            drain_lane!(2, ab2);
-            drain_lane!(3, ab3);
+            let [p0, p1] =
+                ghash_mul_const_vec2_neon(eq_lo_val, [lane_f128!(ab0), lane_f128!(ab1)]);
+            let [p2, p3] =
+                ghash_mul_const_vec2_neon(eq_lo_val, [lane_f128!(ab2), lane_f128!(ab3)]);
+            partial_ab[lane] += p0;
+            partial_ab[lane + 1] += p1;
+            partial_ab[lane + 2] += p2;
+            partial_ab[lane + 3] += p3;
         }
     }
 }

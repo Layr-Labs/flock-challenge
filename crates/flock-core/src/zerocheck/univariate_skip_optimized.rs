@@ -73,6 +73,44 @@ use kernels::x86_64::shift_reduce_inner_ab_x86_sse;
 /// Number of variables folded in round 1 for the shift_reduce variant.
 pub const K_SKIP: usize = 6;
 const ELL: usize = 64;
+
+/// Two products by a SHARED constant in one PMULL-batched call: 6 PMULL for
+/// the pair instead of 12 for two scalar `Mul`s. Bit-exact against `c * x` —
+/// `ghash_mul_const_vec2_neon` is validated against `software::ghash_mul` in
+/// `field/gf2_128.rs`.
+#[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+#[inline(always)]
+fn mul_const_pair(c: F128, x0: F128, x1: F128) -> (F128, F128) {
+    // SAFETY: `aes` is statically enabled for this build (`-C target-cpu=native`
+    // in `.cargo/config.toml`, re-checked by the `cfg` above), which is the
+    // only precondition `ghash_mul_const_vec2_neon` carries.
+    let [p0, p1] =
+        unsafe { crate::field::gf2_128::aarch64::ghash_mul_const_vec2_neon(c, [x0, x1]) };
+    (p0, p1)
+}
+
+/// Scalar fallback for portable / x86_64 builds.
+#[cfg(not(all(target_arch = "aarch64", target_feature = "aes")))]
+#[inline(always)]
+fn mul_const_pair(c: F128, x0: F128, x1: F128) -> (F128, F128) {
+    (c * x0, c * x1)
+}
+
+/// Accumulate `eq * partial[lane]` into `res[lane]` for all `ELL` lanes.
+///
+/// Every lane shares the constant multiplier `eq`, so adjacent lanes pair up
+/// under [`mul_const_pair`] and the 64 scalar multiplies become 32 batched
+/// pairs — 192 PMULL per call instead of 384. `ELL` is even, so the loop needs
+/// no odd-lane remainder.
+#[inline]
+fn fold_eq_hi_into(eq: F128, partial: &[F128; ELL], res: &mut [F128; ELL]) {
+    for lane in (0..ELL).step_by(2) {
+        let (p0, p1) = mul_const_pair(eq, partial[lane], partial[lane + 1]);
+        res[lane] += p0;
+        res[lane + 1] += p1;
+    }
+}
+
 const N_CHUNKS: usize = 8;
 /// Total inner-most dims absorbed by the optimization: 3 small + 4 medium.
 const N_INNER: usize = 7;
@@ -1057,11 +1095,9 @@ fn process_one_x_hi(
         }
     }
 
-    // Outer fold by eq_hi.
-    for lane in 0..ELL {
-        state.local_res_ab[lane] += eq_hi_val * state.partial_ab[lane];
-        state.local_res_c_s[lane] += eq_hi_val * state.partial_c[lane];
-    }
+    // Outer fold by eq_hi. Batched: adjacent lanes share the constant.
+    fold_eq_hi_into(eq_hi_val, &state.partial_ab, &mut state.local_res_ab);
+    fold_eq_hi_into(eq_hi_val, &state.partial_c, &mut state.local_res_c_s);
 }
 
 // ---------------------------------------------------------------------------
@@ -1254,14 +1290,11 @@ fn process_one_x_hi_with_s_hat_v(
         }
     }
 
-    // Outer fold by eq_hi (per bank).
-    for lane in 0..ELL {
-        state.local_res_ab[lane] += eq_hi_val * state.partial_ab[lane];
-    }
+    // Outer fold by eq_hi (per bank). Batched: adjacent lanes share the
+    // constant multiplier, halving the PMULL count.
+    fold_eq_hi_into(eq_hi_val, &state.partial_ab, &mut state.local_res_ab);
     for (res, partial) in state.local_res_c_s.iter_mut().zip(&state.partial_c) {
-        for lane in 0..ELL {
-            res[lane] += eq_hi_val * partial[lane];
-        }
+        fold_eq_hi_into(eq_hi_val, partial, res);
     }
 }
 
@@ -1397,13 +1430,9 @@ fn process_one_x_hi_with_precomputed_ab(
         }
     }
 
-    for lane in 0..ELL {
-        state.local_res_ab[lane] += eq_hi_val * state.partial_ab[lane];
-    }
+    fold_eq_hi_into(eq_hi_val, &state.partial_ab, &mut state.local_res_ab);
     for (res, partial) in state.local_res_c_s.iter_mut().zip(&state.partial_c) {
-        for lane in 0..ELL {
-            res[lane] += eq_hi_val * partial[lane];
-        }
+        fold_eq_hi_into(eq_hi_val, partial, res);
     }
 }
 

@@ -1689,6 +1689,35 @@ pub(crate) unsafe fn fold_one_row_neon_unchecked_8(
     }
 }
 
+/// Two products by a SHARED constant in one PMULL-batched call.
+///
+/// The fold kernels multiply many independent values by the same round
+/// challenge, so pairs of those products fit `ghash_mul_const_vec2_neon`'s
+/// constant-multiplier Karatsuba: **6 PMULL for the pair instead of 12** for
+/// two scalar `Mul`s. PMULL is the scarce resource on M-class (2 units, one
+/// per cycle each), so halving it is the whole point.
+///
+/// Bit-exact against the scalar `c * x` form: `ghash_mul_const_vec2_neon` is
+/// validated against `software::ghash_mul` in `field/gf2_128.rs`, and GF(2^128)
+/// multiplication returns the unique canonical reduced product either way.
+#[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+#[inline(always)]
+fn mul_const_pair(c: F128, x0: F128, x1: F128) -> (F128, F128) {
+    // SAFETY: `aes` is statically enabled for this build (the workspace sets
+    // `-C target-cpu=native`, and the `cfg` above re-checks it), which is the
+    // only precondition `ghash_mul_const_vec2_neon` carries.
+    let [p0, p1] =
+        unsafe { crate::field::gf2_128::aarch64::ghash_mul_const_vec2_neon(c, [x0, x1]) };
+    (p0, p1)
+}
+
+/// Scalar fallback for AArch64 builds without statically-enabled `aes`.
+#[cfg(all(target_arch = "aarch64", not(target_feature = "aes")))]
+#[inline(always)]
+fn mul_const_pair(c: F128, x0: F128, x1: F128) -> (F128, F128) {
+    (c * x0, c * x1)
+}
+
 /// Fuse one multilinear tail fold with construction of the following round's
 /// message. The previous AArch64 path first streamed all of `a_in`/`b_in` into
 /// `a_out`/`b_out`, then immediately reread both outputs in a second pass.
@@ -1764,10 +1793,15 @@ fn fold_and_message_body<const NT: bool>(
         let b_even_1 = b_in[i + 2];
         let b_odd_1 = b_in[i + 3];
 
-        let a0 = a_even_0 + r_fold * (a_even_0 + a_odd_0);
-        let a1 = a_even_1 + r_fold * (a_even_1 + a_odd_1);
-        let b0 = b_even_0 + r_fold * (b_even_0 + b_odd_0);
-        let b1 = b_even_1 + r_fold * (b_even_1 + b_odd_1);
+        // All four fold products share the constant `r_fold`, so they batch
+        // into two pair calls: 12 PMULL per iteration instead of 24.
+        let (ra0, ra1) = mul_const_pair(r_fold, a_even_0 + a_odd_0, a_even_1 + a_odd_1);
+        let (rb0, rb1) = mul_const_pair(r_fold, b_even_0 + b_odd_0, b_even_1 + b_odd_1);
+
+        let a0 = a_even_0 + ra0;
+        let a1 = a_even_1 + ra1;
+        let b0 = b_even_0 + rb0;
+        let b1 = b_even_1 + rb1;
 
         if NT {
             // SAFETY: `o + 1 < a_out.len()` by the len contract above; F128
@@ -1861,13 +1895,21 @@ fn fold2_and_message_body<const NT: bool>(
         }
     }
 
-    // One composed output from four consecutive inputs: two rho_a folds, one
-    // rho_b fold. Exactly the value the two sequential passes produce.
+    // Two composed outputs from eight consecutive inputs. Both rho_a folds of
+    // an output share their constant, and the two outputs' rho_b folds share
+    // theirs, so six same-constant products become three batched pairs: 18
+    // PMULL per output pair instead of 36. Term for term the same composition
+    // the scalar `fold4` computed, so the stored tables are value-identical;
+    // keeping the temporaries scoped to one output pair also bounds live
+    // values to what the scalar form held.
     #[inline(always)]
-    fn fold4(v: &[F128], i: usize, rho_a: F128, rho_b: F128) -> F128 {
-        let t0 = v[i] + rho_a * (v[i] + v[i + 1]);
-        let t1 = v[i + 2] + rho_a * (v[i + 2] + v[i + 3]);
-        t0 + rho_b * (t0 + t1)
+    fn fold8(v: &[F128], i: usize, rho_a: F128, rho_b: F128) -> (F128, F128) {
+        let (pa0, pa1) = mul_const_pair(rho_a, v[i] + v[i + 1], v[i + 2] + v[i + 3]);
+        let (t00, t01) = (v[i] + pa0, v[i + 2] + pa1);
+        let (pa2, pa3) = mul_const_pair(rho_a, v[i + 4] + v[i + 5], v[i + 6] + v[i + 7]);
+        let (t10, t11) = (v[i + 4] + pa2, v[i + 6] + pa3);
+        let (q0, q1) = mul_const_pair(rho_b, t00 + t01, t10 + t11);
+        (t00 + q0, t10 + q1)
     }
 
     let mut p1_acc = F256Unreduced::ZERO;
@@ -1880,10 +1922,10 @@ fn fold2_and_message_body<const NT: bool>(
         let i = 8 * x_lo;
         let o = 2 * x_lo;
 
-        let a0 = fold4(a_in, i, rho_a, rho_b);
-        let a1 = fold4(a_in, i + 4, rho_a, rho_b);
-        let b0 = fold4(b_in, i, rho_a, rho_b);
-        let b1 = fold4(b_in, i + 4, rho_a, rho_b);
+        // Twelve same-constant products per iteration (eight rho_a, four
+        // rho_b) collapse to six batched pairs: 36 PMULL instead of 72.
+        let (a0, a1) = fold8(a_in, i, rho_a, rho_b);
+        let (b0, b1) = fold8(b_in, i, rho_a, rho_b);
 
         if NT {
             // SAFETY: `o + 1 < a_out.len()` by the len contract above; F128
@@ -1973,13 +2015,17 @@ fn fold2_and_message_lookahead_body<const NT: bool>(
         }
     }
 
-    // One composed output from four consecutive inputs — identical expression
-    // to `fold2_and_message_body`, so the stored tables are value-identical.
+    // Two composed outputs from eight consecutive inputs — identical
+    // expression to `fold2_and_message_body`'s `fold8`, so the stored tables
+    // are value-identical.
     #[inline(always)]
-    fn fold4(v: &[F128], i: usize, rho_a: F128, rho_b: F128) -> F128 {
-        let t0 = v[i] + rho_a * (v[i] + v[i + 1]);
-        let t1 = v[i + 2] + rho_a * (v[i + 2] + v[i + 3]);
-        t0 + rho_b * (t0 + t1)
+    fn fold8(v: &[F128], i: usize, rho_a: F128, rho_b: F128) -> (F128, F128) {
+        let (pa0, pa1) = mul_const_pair(rho_a, v[i] + v[i + 1], v[i + 2] + v[i + 3]);
+        let (t00, t01) = (v[i] + pa0, v[i + 2] + pa1);
+        let (pa2, pa3) = mul_const_pair(rho_a, v[i + 4] + v[i + 5], v[i + 6] + v[i + 7]);
+        let (t10, t11) = (v[i + 4] + pa2, v[i + 6] + pa3);
+        let (q0, q1) = mul_const_pair(rho_b, t00 + t01, t10 + t11);
+        (t00 + q0, t10 + q1)
     }
 
     let mut acc = [F256Unreduced::ZERO; 8];
@@ -1991,14 +2037,12 @@ fn fold2_and_message_lookahead_body<const NT: bool>(
         let i = 16 * t;
         let o = 4 * t;
 
-        let a0 = fold4(a_in, i, rho_a, rho_b);
-        let a1 = fold4(a_in, i + 4, rho_a, rho_b);
-        let a2 = fold4(a_in, i + 8, rho_a, rho_b);
-        let a3 = fold4(a_in, i + 12, rho_a, rho_b);
-        let b0 = fold4(b_in, i, rho_a, rho_b);
-        let b1 = fold4(b_in, i + 4, rho_a, rho_b);
-        let b2 = fold4(b_in, i + 8, rho_a, rho_b);
-        let b3 = fold4(b_in, i + 12, rho_a, rho_b);
+        // Twenty-four same-constant products per iteration (sixteen rho_a,
+        // eight rho_b) collapse to twelve batched pairs: 72 PMULL vs 144.
+        let (a0, a1) = fold8(a_in, i, rho_a, rho_b);
+        let (a2, a3) = fold8(a_in, i + 8, rho_a, rho_b);
+        let (b0, b1) = fold8(b_in, i, rho_a, rho_b);
+        let (b2, b3) = fold8(b_in, i + 8, rho_a, rho_b);
 
         if NT {
             // SAFETY: `o + 3 < a_out.len()` by the len contract above; F128 is
@@ -2042,7 +2086,9 @@ fn fold2_and_message_lookahead_body<const NT: bool>(
         // once makes `W1''`/`W2''` (the odd round-6 pair sums) free — the same
         // zero-extra-multiplies parity trick as the cascade K pass.
         let wt = eq_lo[2 * t + 1];
-        let (a0w, a1w, a2w, a3w) = (wt * a0, wt * a1, wt * a2, wt * a3);
+        // Four products, one shared weight: two batched pairs, 12 PMULL vs 24.
+        let (a0w, a1w) = mul_const_pair(wt, a0, a1);
+        let (a2w, a3w) = mul_const_pair(wt, a2, a3);
         acc[0] ^= a1w.mul_unreduced(b1);
         acc[1] ^= (a0w + a1w).mul_unreduced(b0 + b1);
         acc[2] ^= a3w.mul_unreduced(b3);
