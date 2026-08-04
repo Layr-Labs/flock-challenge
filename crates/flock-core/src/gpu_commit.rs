@@ -4739,7 +4739,7 @@ kernel void blake3_pow_scan(
 
     /// Promoted fixed default, used when the warmup sweep is disabled or has
     /// not published a winner.
-    const DEFAULT_HYBRID_K: usize = 5;
+    const DEFAULT_HYBRID_K: usize = 0;
 
     /// Warmup-sweep-published CPU share (sentinel `usize::MAX` = not tuned).
     static TUNED_HYBRID_K: std::sync::atomic::AtomicUsize =
@@ -7839,25 +7839,27 @@ LC_KERNEL(lc_fold_stripes, 4)
 
         #[test]
         fn smallest_share_within_band_wins() {
-            // k=2 fastest; default k=5 far off → smallest in band.
+            // k=2 fastest; default_k=5 far off → smallest in band.
             let ms = [200.0, 100.0, 150.0, 160.0];
-            assert_eq!(choose_hybrid_k(&C, &ms, DEFAULT_HYBRID_K), Some(2));
+            assert_eq!(choose_hybrid_k(&C, &ms, 5), Some(2));
         }
 
         #[test]
         fn near_tie_prefers_smaller_share_not_default() {
-            // k=3 fastest; default k=5 within 2% band but larger share → k=3.
+            // k=3 fastest; default_k=5 within 2% band but larger share → k=3.
             let ms = [200.0, 150.0, 100.0, 101.5];
-            assert_eq!(choose_hybrid_k(&C, &ms, DEFAULT_HYBRID_K), Some(3));
+            assert_eq!(choose_hybrid_k(&C, &ms, 5), Some(3));
         }
 
         #[test]
         fn keep_default_band_env_restores_incumbent() {
+            // Pin default_k=5 (historical) to exercise the env path independent
+            // of the production DEFAULT_HYBRID_K pure-GPU pin.
             let ms = [200.0, 150.0, 100.0, 101.5];
             if std::env::var_os("FLOCK_HYBRID_KEEP_DEFAULT_BAND").is_some() {
-                assert_eq!(choose_hybrid_k(&C, &ms, DEFAULT_HYBRID_K), Some(5));
+                assert_eq!(choose_hybrid_k(&C, &ms, 5), Some(5));
             } else {
-                assert_eq!(choose_hybrid_k(&C, &ms, DEFAULT_HYBRID_K), Some(3));
+                assert_eq!(choose_hybrid_k(&C, &ms, 5), Some(3));
             }
         }
 
@@ -7869,24 +7871,31 @@ LC_KERNEL(lc_fold_stripes, 4)
         }
 
         #[test]
+        fn production_default_is_pure_gpu() {
+            assert_eq!(DEFAULT_HYBRID_K, 0);
+        }
+
+        #[test]
         fn marginal_pure_gpu_is_rejected() {
-            // k=0 fastest but beats the default by < 4% → default retained.
+            // k=0 fastest but beats default_k=5 by < 4% → pure GPU rejected.
+            // Production DEFAULT is 0 (pure GPU), so this guard is pinned at 5
+            // here to keep the hysteresis contract under test.
             let ms = [100.0, 130.0, 125.0, 103.0];
-            assert_eq!(choose_hybrid_k(&C, &ms, DEFAULT_HYBRID_K), Some(5));
+            assert_eq!(choose_hybrid_k(&C, &ms, 5), Some(5));
         }
 
         #[test]
         fn decisive_pure_gpu_wins() {
-            // k=0 beats the default by > 4% and nothing else is in band.
+            // k=0 beats default_k=5 by > 4% and nothing else is in band.
             let ms = [100.0, 130.0, 125.0, 120.0];
-            assert_eq!(choose_hybrid_k(&C, &ms, DEFAULT_HYBRID_K), Some(0));
+            assert_eq!(choose_hybrid_k(&C, &ms, 5), Some(0));
         }
 
         #[test]
         fn largest_share_is_reachable() {
             // Largest share wins decisively → the sweep can choose it.
             let ms = [200.0, 180.0, 170.0, 100.0];
-            assert_eq!(choose_hybrid_k(&C, &ms, DEFAULT_HYBRID_K), Some(5));
+            assert_eq!(choose_hybrid_k(&C, &ms, 0), Some(5));
         }
 
         #[test]
