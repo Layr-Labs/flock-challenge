@@ -4799,10 +4799,20 @@ kernel void blake3_pow_scan(
             .position(|&k| k == default_k)
             .expect("default split is a sweep candidate");
         let fastest = best_ms.iter().cloned().fold(f64::INFINITY, f64::min);
-        let chosen_i = (0..candidates.len()).find(|&i| best_ms[i] <= fastest * 1.015)?;
+        // Near-tie band: 2.0% (was 1.5%). With graph-arm scoring the band
+        // adjudicates real k differences rather than AB-dominated join noise,
+        // so a slightly wider GPU-ward bias is safe and prefers the smaller
+        // CPU share when margins are thin. `FLOCK_HYBRID_TIE_BAND=0.015`
+        // restores the old 1.5% width.
+        let tie = std::env::var("FLOCK_HYBRID_TIE_BAND")
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+            .filter(|v| v.is_finite() && *v > 0.0 && *v < 0.1)
+            .unwrap_or(0.02);
+        let chosen_i = (0..candidates.len()).find(|&i| best_ms[i] <= fastest * (1.0 + tie))?;
         let mut chosen = candidates[chosen_i];
         if std::env::var_os("FLOCK_HYBRID_KEEP_DEFAULT_BAND").is_some()
-            && best_ms[default_i] <= fastest * 1.015
+            && best_ms[default_i] <= fastest * (1.0 + tie)
         {
             chosen = default_k;
         }
@@ -4812,16 +4822,15 @@ kernel void blake3_pow_scan(
         Some(chosen)
     }
 
-    /// Candidate set trimmed from the historical [0,2,3,4,5,6,7,8]: the
-    /// broad set's original justification — one calibration process
-    /// publishing its winner to later workers through the warmup cache — is
-    /// dead on the ranked runner (the verifier wipes the shared scratch
-    /// between trials, so EVERY worker replays this sweep itself), and the
-    /// sweep's own measurements show a flat basin across k=0..5 with the
-    /// upper candidates consistently worse. Three spanning candidates keep
-    /// the per-process contention-exact choice at ~3/8 of the job-wall
-    /// cost, which ~120 fresh workers pay against a hard 10-minute cap.
-    const RANKED_EXACT_TUNE_CANDIDATES: [usize; 3] = [0, 3, 5];
+    /// Candidate set inside the historical flat basin [0..5]. Trimmed from
+    /// the older [0,2,3,4,5,6,7,8] after the broad-set justification (one
+    /// calibration process publishing through the warmup cache) died on the
+    /// ranked runner. With F2 graph-arm scoring the mid-basin point k=2 is
+    /// informative again — it was invisible when join-max scoring collapsed
+    /// AB-dominated samples — so it re-enters between pure-GPU and k=3.
+    /// Four candidates × 2 reverse-order samples is still well inside the
+    /// 10-minute job wall at ~120 workers.
+    const RANKED_EXACT_TUNE_CANDIDATES: [usize; 4] = [0, 2, 3, 5];
 
     /// Two samples per candidate, with the second pass in reverse order so
     /// thermal drift, queue warmup, and A/B replay cache state do not favor
@@ -7789,7 +7798,7 @@ LC_KERNEL(lc_fold_stripes, 4)
             DEFAULT_HYBRID_K, RANKED_EXACT_TUNE_CANDIDATES, choose_hybrid_k,
             collect_ranked_exact_samples, mean_ranked_exact_samples,
         };
-        const C: [usize; 3] = [0, 3, 5];
+        const C: [usize; 4] = [0, 2, 3, 5];
 
         #[test]
         fn trimmed_candidate_set_is_stable() {
@@ -7810,12 +7819,13 @@ LC_KERNEL(lc_fold_stripes, 4)
                 },
             )
             .unwrap();
+            // Forward 0,2,3,5 then reverse 5,3,2,0 — each preceded by reprime.
             assert_eq!(
                 *events.borrow(),
-                [-1, 0, -1, 3, -1, 5, -1, 5, -1, 3, -1, 0]
+                [-1, 0, -1, 2, -1, 3, -1, 5, -1, 5, -1, 3, -1, 2, -1, 0]
             );
             assert_eq!(samples[0], [0.0, 0.0]);
-            assert_eq!(samples[2], [5.0, 5.0]);
+            assert_eq!(samples[3], [5.0, 5.0]);
         }
 
         #[test]
@@ -7829,27 +7839,21 @@ LC_KERNEL(lc_fold_stripes, 4)
 
         #[test]
         fn smallest_share_within_band_wins() {
-            // k=3 fastest; default k=5 far off → smallest in band.
-            let ms = [200.0, 100.0, 150.0];
-            assert_eq!(choose_hybrid_k(&C, &ms, DEFAULT_HYBRID_K), Some(3));
+            // k=2 fastest; default k=5 far off → smallest in band.
+            let ms = [200.0, 100.0, 150.0, 160.0];
+            assert_eq!(choose_hybrid_k(&C, &ms, DEFAULT_HYBRID_K), Some(2));
         }
 
         #[test]
         fn near_tie_prefers_smaller_share_not_default() {
-            // k=3 fastest; default k=5 is within 1.5% of fastest but is a
-            // larger CPU share. New policy picks the smallest share in band
-            // (k=3), not the fixed default.
-            let ms = [200.0, 100.0, 101.0];
+            // k=3 fastest; default k=5 within 2% band but larger share → k=3.
+            let ms = [200.0, 150.0, 100.0, 101.5];
             assert_eq!(choose_hybrid_k(&C, &ms, DEFAULT_HYBRID_K), Some(3));
         }
 
         #[test]
         fn keep_default_band_env_restores_incumbent() {
-            // Same walls as above; with the restore env the old keep-default
-            // rule wins. Env is process-global so this test only checks the
-            // function when the env is already set by the caller; when unset
-            // the new policy applies (covered above).
-            let ms = [200.0, 100.0, 101.0];
+            let ms = [200.0, 150.0, 100.0, 101.5];
             if std::env::var_os("FLOCK_HYBRID_KEEP_DEFAULT_BAND").is_some() {
                 assert_eq!(choose_hybrid_k(&C, &ms, DEFAULT_HYBRID_K), Some(5));
             } else {
@@ -7858,23 +7862,30 @@ LC_KERNEL(lc_fold_stripes, 4)
         }
 
         #[test]
+        fn mid_basin_k2_is_reachable() {
+            // k=2 decisively fastest → selected under the expanded set.
+            let ms = [200.0, 100.0, 130.0, 140.0];
+            assert_eq!(choose_hybrid_k(&C, &ms, DEFAULT_HYBRID_K), Some(2));
+        }
+
+        #[test]
         fn marginal_pure_gpu_is_rejected() {
             // k=0 fastest but beats the default by < 4% → default retained.
-            let ms = [100.0, 130.0, 103.0];
+            let ms = [100.0, 130.0, 125.0, 103.0];
             assert_eq!(choose_hybrid_k(&C, &ms, DEFAULT_HYBRID_K), Some(5));
         }
 
         #[test]
         fn decisive_pure_gpu_wins() {
             // k=0 beats the default by > 4% and nothing else is in band.
-            let ms = [100.0, 130.0, 120.0];
+            let ms = [100.0, 130.0, 125.0, 120.0];
             assert_eq!(choose_hybrid_k(&C, &ms, DEFAULT_HYBRID_K), Some(0));
         }
 
         #[test]
         fn largest_share_is_reachable() {
             // Largest share wins decisively → the sweep can choose it.
-            let ms = [200.0, 180.0, 100.0];
+            let ms = [200.0, 180.0, 170.0, 100.0];
             assert_eq!(choose_hybrid_k(&C, &ms, DEFAULT_HYBRID_K), Some(5));
         }
 
