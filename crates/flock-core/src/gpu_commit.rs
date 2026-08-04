@@ -4508,28 +4508,37 @@ kernel void blake3_pow_scan(
             && hybrid_tune_canonical_reprime_enabled()
     }
 
+    /// Near-tie band as a multiplicative factor above the fastest sample.
+    /// Default **0.5%** (`1.005`). The old 1.5% band kept `DEFAULT_HYBRID_K`
+    /// on almost every ranked worker once cold noise collapsed candidates
+    /// into a flat basin. `FLOCK_HYBRID_TIE_BAND=0.015` restores 1.5%.
+    fn hybrid_tie_band() -> f64 {
+        static V: std::sync::LazyLock<f64> = std::sync::LazyLock::new(|| {
+            std::env::var("FLOCK_HYBRID_TIE_BAND")
+                .ok()
+                .and_then(|s| s.parse::<f64>().ok())
+                .filter(|b| b.is_finite() && *b >= 0.0 && *b <= 0.1)
+                .unwrap_or(0.005)
+        });
+        *V
+    }
+
     /// Pure selection over the sweep's per-candidate best walls; `candidates`
     /// is ascending and must contain `default_k`. Deliberately asymmetric
     /// toward the promoted default:
-    /// - the smallest share within 1.5% of the fastest wins (the timed
-    ///   prove's round-1 precompute contends for the same cores, so
-    ///   near-ties resolve toward the GPU);
-    /// - if the default is itself within 1.5% of the fastest, keep it — an
-    ///   emulated sweep cannot adjudicate noise-thin margins, the ranked
-    ///   runner can;
-    /// - k=0 must beat the default by > 4% — official board evidence has the
-    ///   hybrid several percent ahead of the pure-GPU graph, so a sweep that
-    ///   says otherwise is more likely an emulation artifact (e.g. the burn
-    ///   floor collapsing all candidates) than truth.
+    /// - the smallest share within the near-tie band of the fastest wins;
+    /// - if the default is itself within the band, keep it;
+    /// - k=0 must beat the default by > 4%.
     fn choose_hybrid_k(candidates: &[usize], best_ms: &[f64], default_k: usize) -> Option<usize> {
         let default_i = candidates
             .iter()
             .position(|&k| k == default_k)
             .expect("default split is a sweep candidate");
         let fastest = best_ms.iter().cloned().fold(f64::INFINITY, f64::min);
-        let chosen_i = (0..candidates.len()).find(|&i| best_ms[i] <= fastest * 1.015)?;
+        let band = 1.0 + hybrid_tie_band();
+        let chosen_i = (0..candidates.len()).find(|&i| best_ms[i] <= fastest * band)?;
         let mut chosen = candidates[chosen_i];
-        if best_ms[default_i] <= fastest * 1.015 {
+        if best_ms[default_i] <= fastest * band {
             chosen = default_k;
         }
         if chosen == 0 && best_ms[chosen_i] > best_ms[default_i] * (1.0 - 0.04) {
@@ -4551,8 +4560,8 @@ kernel void blake3_pow_scan(
 
     /// Two samples per candidate, with the second pass in reverse order so
     /// thermal drift, queue warmup, and A/B replay cache state do not favor
-    /// either end of the search range. Selection consumes the mean rather
-    /// than a noise-sensitive minimum.
+    /// either end of the search range. The first pass warms; selection uses
+    /// the second sample only (see [`select_ranked_exact_samples`]).
     fn collect_ranked_exact_samples<E>(
         mut reprime: impl FnMut() -> Result<(), E>,
         mut sample: impl FnMut(usize) -> Result<f64, E>,
@@ -4569,6 +4578,26 @@ kernel void blake3_pow_scan(
         Ok(walls)
     }
 
+    /// Reduce two-sample matrix to one score per candidate.
+    ///
+    /// Default: **warm-only** (`samples[i][1]`). Mean-of-two was collapsing
+    /// every k into the near-tie band on cold ranked workers; min-of-two
+    /// (`dea42ac`) was rejected. `FLOCK_HYBRID_TUNE_MEAN=1` restores mean.
+    fn select_ranked_exact_samples(
+        samples: [[f64; 2]; RANKED_EXACT_TUNE_CANDIDATES.len()],
+    ) -> Option<[f64; RANKED_EXACT_TUNE_CANDIDATES.len()]> {
+        let use_mean = std::env::var_os("FLOCK_HYBRID_TUNE_MEAN").is_some();
+        let mut scores = [0.0; RANKED_EXACT_TUNE_CANDIDATES.len()];
+        for (score, [a, b]) in scores.iter_mut().zip(samples) {
+            if !a.is_finite() || !b.is_finite() || a < 0.0 || b < 0.0 {
+                return None;
+            }
+            *score = if use_mean { (a + b) * 0.5 } else { b };
+        }
+        Some(scores)
+    }
+
+    #[cfg(test)]
     fn mean_ranked_exact_samples(
         samples: [[f64; 2]; RANKED_EXACT_TUNE_CANDIDATES.len()],
     ) -> Option<[f64; RANKED_EXACT_TUNE_CANDIDATES.len()]> {
@@ -4983,13 +5012,13 @@ kernel void blake3_pow_scan(
                 return;
             }
         };
-        let Some(means) = mean_ranked_exact_samples(samples) else {
+        let Some(scores) = select_ranked_exact_samples(samples) else {
             finish_ranked_exact_contention_tune(params, cpu_tree, 0);
             return;
         };
         let Some(chosen) = choose_hybrid_k(
             &RANKED_EXACT_TUNE_CANDIDATES,
-            &means,
+            &scores,
             DEFAULT_HYBRID_K,
         ) else {
             finish_ranked_exact_contention_tune(params, cpu_tree, 0);
@@ -5048,8 +5077,8 @@ kernel void blake3_pow_scan(
                 .enumerate()
                 .map(|(i, k)| {
                     format!(
-                        "k={k}:[{:.1},{:.1}] mean={:.1}ms",
-                        samples[i][0], samples[i][1], means[i]
+                        "k={k}:[{:.1},{:.1}] score={:.1}ms",
+                        samples[i][0], samples[i][1], scores[i]
                     )
                 })
                 .collect();
@@ -7533,9 +7562,17 @@ LC_KERNEL(lc_fold_stripes, 4)
 
         #[test]
         fn default_near_tie_keeps_default() {
-            // k=3 fastest but default k=5 within 1.5% → default retained.
-            let ms = [200.0, 100.0, 101.0];
+            // k=3 fastest but default k=5 within the 0.5% band → default retained.
+            let ms = [200.0, 100.0, 100.4];
             assert_eq!(choose_hybrid_k(&C, &ms, DEFAULT_HYBRID_K), Some(5));
+        }
+
+        #[test]
+        fn half_percent_band_releases_default() {
+            // k=3 is 1% faster than default — outside the 0.5% band, so k=3 wins.
+            // Under the old 1.5% band this would have kept default.
+            let ms = [200.0, 100.0, 101.0];
+            assert_eq!(choose_hybrid_k(&C, &ms, DEFAULT_HYBRID_K), Some(3));
         }
 
         #[test]
