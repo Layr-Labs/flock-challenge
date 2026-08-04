@@ -504,23 +504,12 @@ pub enum VerifyError {
 /// Standard "doubling-in-half" construction: `O(2^d)` F128 muls, no
 /// inversions. Indexing is LSB-first — `bit_j(i)` is the `j`-th LSB of `i`.
 pub fn build_eq_table(point: &[F128]) -> Vec<F128> {
-    // Every slot is written by the level that first exposes it before it can
-    // be read at a later level.
-    let mut out = crate::alloc_uninit_f128_vec(1usize << point.len());
-    build_eq_table_into(point, &mut out);
-    out
-}
-
-/// In-place variant of [`build_eq_table`]: the identical construction (and
-/// therefore identical bytes) into caller-provided storage. The GPU fold
-/// arms use it to host the table directly in their shared-storage upload
-/// buffer (see `gpu_commit::zc_fold_eq_table`), which deletes the launch's
-/// 4 MiB upload memcpy. `out.len()` must be exactly `1 << point.len()`.
-pub(crate) fn build_eq_table_into(point: &[F128], out: &mut [F128]) {
     use rayon::prelude::*;
 
     let d = point.len();
-    assert_eq!(out.len(), 1usize << d);
+    // Every slot is written by the level that first exposes it before it can
+    // be read at a later level.
+    let mut out = crate::alloc_uninit_f128_vec(1usize << d);
     out[0] = F128::ONE;
     const PAR_THRESHOLD: usize = 1 << 12;
     for j in 0..d {
@@ -549,6 +538,7 @@ pub(crate) fn build_eq_table_into(point: &[F128], out: &mut [F128]) {
                 .for_each(|(lo_i, hi_i)| build_pair(lo_i, hi_i));
         }
     }
+    out
 }
 
 /// Fold a sparse boolean matrix's rows against an eq table at the row
@@ -814,26 +804,6 @@ fn ranked_lincheck_fold_gpu_shape(m: usize, k_log: usize) -> bool {
     (cfg!(test) || (m == 32 && k_log == 14))
         && m >= k_log + 6
         && !FOLD_IBLOCK.load(std::sync::atomic::Ordering::Relaxed)
-}
-
-/// Build eq(x_outer, ·) for the witness-stripe fold. At the GPU-arm shape
-/// the table is built in place in the fold arm's persistent upload buffer so
-/// the launch skips its 4 MiB memcpy (`FLOCK_NO_EQ_DIRECT=1` restores the
-/// owned build + copy); every other shape keeps the incumbent Vec. Bytes and
-/// lane order are identical either way — only the table's location changes.
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-fn build_z_fold_eq_table(m: usize, k_log: usize, x_outer: &[F128]) -> crate::gpu_commit::FoldEqTable {
-    if ranked_lincheck_fold_gpu_shape(m, k_log) {
-        crate::gpu_commit::lincheck_fold_eq_table(x_outer)
-    } else {
-        crate::gpu_commit::FoldEqTable::Owned(build_eq_table(x_outer))
-    }
-}
-
-#[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
-fn build_z_fold_eq_table(m: usize, k_log: usize, x_outer: &[F128]) -> Vec<F128> {
-    let _ = (m, k_log);
-    build_eq_table(x_outer)
 }
 
 /// Fold the witness stripe against `eq_outer`, draining the GPU prefix when
@@ -1474,14 +1444,9 @@ fn prove_padded_inner<Ch: Challenger>(
         } else {
             None
         };
-        let eq_x_outer = build_z_fold_eq_table(m, k_log, &x_ab.x_outer);
-        let z_vec = partial_fold_packed_z_best_gpu_split(
-            z_packed,
-            m,
-            k_log,
-            useful_bits,
-            eq_x_outer.as_slice(),
-        );
+        let eq_x_outer = build_eq_table(&x_ab.x_outer);
+        let z_vec =
+            partial_fold_packed_z_best_gpu_split(z_packed, m, k_log, useful_bits, &eq_x_outer);
         if let Some(t) = t {
             eprintln!(
                 "[lc] {:<26} {:>7.2} ms",

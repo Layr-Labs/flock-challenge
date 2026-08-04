@@ -757,53 +757,6 @@ fn use_ranked_hetero_open_combine(l: usize, b: usize, n_rs: usize, n_pd: usize) 
         && crate::epool::epool().is_some()
 }
 
-/// Exact ranked direct-fold8 materializer shape: 2^25 packed slots folding
-/// 64:1 into 2^19 outputs, two direct claims (AB + direct-C), no ordinary
-/// basis. The deferred split (`deferred_split_n_lo(19) = 11`) makes the
-/// materializer's blocks 2^11 slots, i.e. 256 independent jobs that each
-/// read a disjoint 2 MiB witness stripe and write a disjoint 64 KiB output
-/// pair — the same block-owns-its-range contract as the hetero combine
-/// queue above.
-#[inline]
-fn is_ranked_open_mat_hetero_shape(
-    packed_len: usize,
-    block_len: usize,
-    claim_count: usize,
-    has_ordinary: bool,
-) -> bool {
-    packed_len == (1usize << 25)
-        && block_len == (1usize << 11)
-        && claim_count == 2
-        && !has_ordinary
-}
-
-/// Heterogeneous (P+E) drain for the direct-fold8 materializer — the single
-/// 512 MiB witness pass of the ranked opening (2^19 slots × 64 banked muls
-/// = 2^25 ≈ 33.5M deferred products, plus 2 × 2^19 byte-table basis folds).
-/// The pass is product-dense, not bandwidth-starved: at the ranked shape the
-/// P-cores retire pmull products far below memory saturation, which is the
-/// same census that made the combined-basis queue
-/// ([`use_ranked_hetero_open_combine`]) and the witgen drain
-/// (`r1cs_hashes::common::run_hetero_chunks`) profitable on efficiency
-/// cores — and the opposite of the sumcheck fold sweeps, whose byte/mul
-/// ratio measured hetero-negative. Default **on** for the ranked worker;
-/// `FLOCK_NO_OPEN_MAT_HETERO=1` (exact '1', per the grind-reg precedent)
-/// restores the incumbent rayon-only pass. Both drains compute identical
-/// per-block values and the block partials are XOR sums (order-free in
-/// char 2), so the emitted message and outputs are bit-identical either way.
-#[inline]
-pub(crate) fn use_open_mat_hetero(
-    packed_len: usize,
-    block_len: usize,
-    claim_count: usize,
-    has_ordinary: bool,
-) -> bool {
-    cfg!(all(target_os = "macos", target_arch = "aarch64"))
-        && is_ranked_open_mat_hetero_shape(packed_len, block_len, claim_count, has_ordinary)
-        && !std::env::var("FLOCK_NO_OPEN_MAT_HETERO").is_ok_and(|v| v == "1")
-        && crate::epool::epool().is_some()
-}
-
 /// Drain fixed-size output blocks through the stateful P/E queue and reduce
 /// one `(u0, u2)` partial per block after the synchronous join. `fold_block`
 /// owns the complete output block for its queue index; `init` supplies private
