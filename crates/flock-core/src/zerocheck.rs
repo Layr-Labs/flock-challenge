@@ -399,9 +399,15 @@ fn prove_packed_padded_inner<C: Challenger>(
             // Submit the C fold's GPU prefix BEFORE the AB completion. The
             // GPU is idle for the whole zerocheck window and round one has no
             // Fiat-Shamir dependency inside it (r was sampled above, the
-            // transcript only advances after the round-one messages), so the
-            // prefix runs concurrently with the AB completion AND with the
-            // CPU's own share of the C fold.
+            // transcript only advances after the round-one messages).
+            //
+            // Multi-ms: AB completion and the CPU C claim suffix are
+            // algebraically independent (GF(2) XOR split vs AB fold4 drain).
+            // The prior schedule still ran them serially after GPU submit, so
+            // wall was AB + max(C_suffix, GPU_tail). Overlapping them collapses
+            // that to ~max(AB, C_wall). Isolated after a4bcffc (−1.92%) which
+            // mixed this with NTT g8 densify — g8 is parked; this is AB‖C only.
+            // Kill: FLOCK_NO_R1_AB_C_OVERLAP=1 restores the serial schedule.
             let c_prelude =
                 crate::zerocheck::univariate_skip_optimized::round1_c_prelude(
                     c_lincheck,
@@ -410,82 +416,151 @@ fn prove_packed_padded_inner<C: Challenger>(
                     padding.useful_bits_per_block,
                     &r,
                 );
+            let overlap_ab_c = std::env::var_os("FLOCK_NO_R1_AB_C_OVERLAP").is_none();
             let cpu_ab = crate::pcs::commit::commit_cpu_ms();
-            let t_ab = std::time::Instant::now();
-            let ab = crate::zerocheck::univariate_skip_optimized::round1_shift_reduce_ab_packed_padded_with_precomputed(
-                ab_inner,
-                m,
-                k_skip,
-                &r,
-                padding,
-            );
-            if zc_timing {
-                eprintln!(
-                    "[zc-timing] round1 AB completion: {:.2} ms cpu={:.1}",
-                    t_ab.elapsed().as_secs_f64() * 1e3,
-                    crate::pcs::commit::commit_cpu_ms() - cpu_ab,
-                );
-            }
-            let cpu_c = crate::pcs::commit::commit_cpu_ms();
-            let t_c = std::time::Instant::now();
-            if crate::pcs::ranked_direct_fold8_enabled() {
-                let (c, s_hat_v_c, quad, fold8) =
-                    crate::zerocheck::univariate_skip_optimized::round1_c_fold8_from_lincheck_stripe(
-                        c_lincheck,
-                        m,
-                        padding.k_log,
-                        k_skip,
-                        padding.useful_bits_per_block,
-                        &r,
-                        inv_table,
-                        c_prelude,
-                    );
+            let t_r1 = std::time::Instant::now();
+            let fold8 = crate::pcs::ranked_direct_fold8_enabled();
+            if overlap_ab_c {
+                // ZcFoldJob holds raw Metal Ids (not Send), so C stays on this
+                // thread and AB runs in a scoped child. Nested rayon inside
+                // both arms is intentional: both previously held the hetero
+                // pool serially.
+                let (ab, c_pack) = std::thread::scope(|scope| {
+                    let ab_handle = scope.spawn(|| {
+                        crate::zerocheck::univariate_skip_optimized::round1_shift_reduce_ab_packed_padded_with_precomputed(
+                            ab_inner,
+                            m,
+                            k_skip,
+                            &r,
+                            padding,
+                        )
+                    });
+                    let c_pack = if fold8 {
+                        let (c, s_hat_v_c, quad, fold8_v) =
+                            crate::zerocheck::univariate_skip_optimized::round1_c_fold8_from_lincheck_stripe(
+                                c_lincheck,
+                                m,
+                                padding.k_log,
+                                k_skip,
+                                padding.useful_bits_per_block,
+                                &r,
+                                inv_table,
+                                c_prelude,
+                            );
+                        (c, s_hat_v_c, quad, None, Some(fold8_v))
+                    } else {
+                        let (c, s_hat_v_c, quad, fold4) =
+                            crate::zerocheck::univariate_skip_optimized::round1_c_fold4_from_lincheck_stripe(
+                                c_lincheck,
+                                m,
+                                padding.k_log,
+                                k_skip,
+                                padding.useful_bits_per_block,
+                                &r,
+                                inv_table,
+                                c_prelude,
+                            );
+                        (c, s_hat_v_c, quad, Some(fold4), None)
+                    };
+                    let ab = ab_handle.join().expect("AB completion thread");
+                    (ab, c_pack)
+                });
                 if zc_timing {
                     eprintln!(
-                        "[zc-timing] round1 lincheck-stripe C (fold8): {:.2} ms cpu={:.1}",
-                        t_c.elapsed().as_secs_f64() * 1e3,
-                        crate::pcs::commit::commit_cpu_ms() - cpu_c,
+                        "[zc-timing] round1 AB||C overlap (fold{}): {:.2} ms cpu={:.1}",
+                        if fold8 { "8" } else { "4" },
+                        t_r1.elapsed().as_secs_f64() * 1e3,
+                        crate::pcs::commit::commit_cpu_ms() - cpu_ab,
                     );
                 }
+                let (c, s_hat_v_c, quad, fold4, fold8_v) = c_pack;
                 (
                     ab,
                     c,
                     Some(CapturedSHatVC {
                         s_hat_v_c,
                         quad,
-                        fold4: None,
-                        fold8: Some(fold8),
+                        fold4,
+                        fold8: fold8_v,
                     }),
                 )
             } else {
-                let (c, s_hat_v_c, quad, fold4) =
-                    crate::zerocheck::univariate_skip_optimized::round1_c_fold4_from_lincheck_stripe(
-                        c_lincheck,
-                        m,
-                        padding.k_log,
-                        k_skip,
-                        padding.useful_bits_per_block,
-                        &r,
-                        inv_table,
-                        c_prelude,
-                    );
+                let t_ab = std::time::Instant::now();
+                let ab = crate::zerocheck::univariate_skip_optimized::round1_shift_reduce_ab_packed_padded_with_precomputed(
+                    ab_inner,
+                    m,
+                    k_skip,
+                    &r,
+                    padding,
+                );
                 if zc_timing {
                     eprintln!(
-                        "[zc-timing] round1 lincheck-stripe C: {:.2} ms cpu={:.1}",
-                        t_c.elapsed().as_secs_f64() * 1e3,
-                        crate::pcs::commit::commit_cpu_ms() - cpu_c,
+                        "[zc-timing] round1 AB completion: {:.2} ms cpu={:.1}",
+                        t_ab.elapsed().as_secs_f64() * 1e3,
+                        crate::pcs::commit::commit_cpu_ms() - cpu_ab,
                     );
                 }
-                (
-                    ab,
-                    c,
-                    Some(CapturedSHatVC {
-                        s_hat_v_c,
-                        quad,
-                        fold4: Some(fold4),
-                        fold8: None,
-                    }),
-                )
+                let cpu_c = crate::pcs::commit::commit_cpu_ms();
+                let t_c = std::time::Instant::now();
+                if fold8 {
+                    let (c, s_hat_v_c, quad, fold8_v) =
+                        crate::zerocheck::univariate_skip_optimized::round1_c_fold8_from_lincheck_stripe(
+                            c_lincheck,
+                            m,
+                            padding.k_log,
+                            k_skip,
+                            padding.useful_bits_per_block,
+                            &r,
+                            inv_table,
+                            c_prelude,
+                        );
+                    if zc_timing {
+                        eprintln!(
+                            "[zc-timing] round1 lincheck-stripe C (fold8): {:.2} ms cpu={:.1}",
+                            t_c.elapsed().as_secs_f64() * 1e3,
+                            crate::pcs::commit::commit_cpu_ms() - cpu_c,
+                        );
+                    }
+                    (
+                        ab,
+                        c,
+                        Some(CapturedSHatVC {
+                            s_hat_v_c,
+                            quad,
+                            fold4: None,
+                            fold8: Some(fold8_v),
+                        }),
+                    )
+                } else {
+                    let (c, s_hat_v_c, quad, fold4) =
+                        crate::zerocheck::univariate_skip_optimized::round1_c_fold4_from_lincheck_stripe(
+                            c_lincheck,
+                            m,
+                            padding.k_log,
+                            k_skip,
+                            padding.useful_bits_per_block,
+                            &r,
+                            inv_table,
+                            c_prelude,
+                        );
+                    if zc_timing {
+                        eprintln!(
+                            "[zc-timing] round1 lincheck-stripe C: {:.2} ms cpu={:.1}",
+                            t_c.elapsed().as_secs_f64() * 1e3,
+                            crate::pcs::commit::commit_cpu_ms() - cpu_c,
+                        );
+                    }
+                    (
+                        ab,
+                        c,
+                        Some(CapturedSHatVC {
+                            s_hat_v_c,
+                            quad,
+                            fold4: Some(fold4),
+                            fold8: None,
+                        }),
+                    )
+                }
             }
         } else if m == 32 && crate::pcs::ranked_direct_fold4_enabled() {
             let (ab, c, s_hat_v_c, quad, fold4) =
