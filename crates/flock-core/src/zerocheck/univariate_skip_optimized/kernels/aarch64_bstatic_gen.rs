@@ -369,7 +369,7 @@ pub(crate) fn shift_reduce_inner_ab_bstatic<const FAST: bool>(
         return false;
     }
     let partials = match context {
-        StaticBContext::Prepared { partials } => partials,
+        StaticBContext::Prepared { partials, .. } => partials,
         StaticBContext::LegacyPerCall => bstatic_partials(inv_table),
     };
     let byte_base_b = chunk_byte_base + b_med * N_CHUNKS * 8;
