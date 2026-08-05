@@ -4548,6 +4548,11 @@ fn materialize_direct_fold8(
     let pair_fold64 = deferred_reduce
         && cfg!(all(target_arch = "aarch64", target_feature = "aes"))
         && std::env::var_os("FLOCK_NO_DIRECT_FOLD8_PAIR").is_none();
+    // Four adjacent slots share the same 64 fold weights; load each weight
+    // once per four slots instead of once per pair. Bit-identical to two
+    // slots2 calls (disjoint sub-slices, independent accumulators).
+    let quad_fold64 = pair_fold64
+        && std::env::var_os("FLOCK_NO_DIRECT_FOLD8_QUAD").is_none();
 
     // One shared per-block body for both drains below, so the scheduling
     // choice cannot drift from the value computation. For block `i` it fully
@@ -4590,6 +4595,43 @@ fn materialize_direct_fold8(
             scratch,
         );
         let mut slot = 0usize;
+        if quad_fold64 {
+            while slot + 3 < block_len {
+                let base = 64 * slot;
+                let folded_f = crate::field::f128_slice::fold_banked_slots4::<64>(
+                    &fold_weight,
+                    &f_in[base..base + 256],
+                );
+                f_out[slot] = folded_f[0];
+                f_out[slot + 1] = folded_f[1];
+                f_out[slot + 2] = folded_f[2];
+                f_out[slot + 3] = folded_f[3];
+
+                let direct0 = super::ring_switch::fold_one_slot(first_claim.eq_lo[slot], scratch);
+                let direct1 =
+                    super::ring_switch::fold_one_slot(first_claim.eq_lo[slot + 1], scratch);
+                let direct2 =
+                    super::ring_switch::fold_one_slot(first_claim.eq_lo[slot + 2], scratch);
+                let direct3 =
+                    super::ring_switch::fold_one_slot(first_claim.eq_lo[slot + 3], scratch);
+                if has_ordinary {
+                    let folded_b = crate::field::f128_slice::fold_banked_slots4::<64>(
+                        &fold_weight,
+                        &b_in[base..base + 256],
+                    );
+                    b_out[slot] = direct0 + folded_b[0];
+                    b_out[slot + 1] = direct1 + folded_b[1];
+                    b_out[slot + 2] = direct2 + folded_b[2];
+                    b_out[slot + 3] = direct3 + folded_b[3];
+                } else {
+                    b_out[slot] = direct0;
+                    b_out[slot + 1] = direct1;
+                    b_out[slot + 2] = direct2;
+                    b_out[slot + 3] = direct3;
+                }
+                slot += 4;
+            }
+        }
         if pair_fold64 {
             while slot + 1 < block_len {
                 let base = 64 * slot;
