@@ -4461,17 +4461,72 @@ fn materialize_direct_fold4(
     )
 }
 
+/// Streaming-prefetch enable for the direct-fold8 materializer's single
+/// 512 MiB witness pass, latched once per process. Default **enabled** for
+/// the ranked worker (whose env is cleared to RAYON_NUM_THREADS + TMPDIR,
+/// so an env opt-out never reaches it and default-on is the shipped
+/// behaviour). `FLOCK_NO_OPEN_MAT_PREFETCH=1` restores the exact incumbent
+/// (plain loads) in the same binary. Pure cache hint - bit-identical either
+/// way, so the switch exists only for same-binary A/B measurement.
+#[inline]
+fn open_mat_prefetch_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var_os("FLOCK_NO_OPEN_MAT_PREFETCH").as_deref()
+            != Some(std::ffi::OsStr::new("1"))
+    })
+}
+
+/// Streaming prefetch hint for the materializer's write-once witness
+/// stripes. Pure hint: it changes cache policy only, never computed values,
+/// so the prefetch arm is bit-identical to the incumbent by construction.
+/// `prfm pldl2strm` (aarch64) / `_MM_HINT_NTA` (x86) mark the line for
+/// streaming use, keeping the 512 MiB single-read pass from thrashing the
+/// shared caches ahead of the later 2 GiB of consumer traffic.
+#[inline(always)]
+fn prefetch_streaming(p: *const F128) {
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        core::arch::asm!("prfm pldl2strm, [{}]", in(reg) p as *const u8, options(nostack));
+    }
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        core::arch::x86_64::_mm_prefetch(p as *const i8, core::arch::x86_64::_MM_HINT_NTA);
+    }
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+    let _ = p;
+}
+
 /// Sixty-four-bank materializer. Six challenges are sampled from direct
 /// product statistics before this function binds the witness and combined
 /// basis in one N→N/64 pass. It emits M6 — the round message of the folded
 /// 2^19 state — fused into the same pass; no lookahead follows because the
 /// initial cadence is exhausted (the fold2 pair of the fold4 route never
 /// runs and the 2^21/2^20 states never exist).
-fn materialize_direct_fold8(
+pub(crate) fn materialize_direct_fold8(
     packed_witness: Vec<F128>,
     ordinary_basis: Vec<F128>,
     claims: &[super::ring_switch::DirectFold8Factors],
     challenges: [F128; 6],
+) -> (Vec<F128>, Vec<F128>, SumcheckMessage) {
+    materialize_direct_fold8_with_flavor(
+        packed_witness,
+        ordinary_basis,
+        claims,
+        challenges,
+        open_mat_prefetch_enabled(),
+    )
+}
+
+/// Flavor-parameterized body of [`materialize_direct_fold8`]; the public
+/// wrapper passes the latched env choice, tests compare arms byte-for-byte
+/// in one process. `prefetch` toggles the streaming-prefetch hint arm.
+fn materialize_direct_fold8_with_flavor(
+    packed_witness: Vec<F128>,
+    ordinary_basis: Vec<F128>,
+    claims: &[super::ring_switch::DirectFold8Factors],
+    challenges: [F128; 6],
+    prefetch: bool,
 ) -> (Vec<F128>, Vec<F128>, SumcheckMessage) {
     use rayon::prelude::*;
 
@@ -4551,7 +4606,20 @@ fn materialize_direct_fold8(
             first_table,
             scratch,
         );
+        // Streaming-prefetch hint: issue ~16 slots (16 KiB) ahead every 8
+        // slots so the 512 MiB write-once stripe keeps the DRAM pipeline fed
+        // without polluting L1/L2 with lines that are never re-read. Pure
+        // hint - the loaded values (and therefore every output bit) are
+        // identical to the plain-load arm.
+        const PREFETCH_AHEAD_SLOTS: usize = 16;
         for slot in 0..block_len {
+            if prefetch && (slot & 7) == 0 {
+                let ahead = (slot + PREFETCH_AHEAD_SLOTS).min(f_in.len() / 64 - 1);
+                prefetch_streaming(f_in.as_ptr().wrapping_add(ahead * 64));
+                if has_ordinary {
+                    prefetch_streaming(b_in.as_ptr().wrapping_add(ahead * 64));
+                }
+            }
             f_out[slot] = fold64(f_in, slot);
             let direct = super::ring_switch::fold_one_slot(first_claim.eq_lo[slot], scratch);
             b_out[slot] = if has_ordinary {
@@ -11523,6 +11591,54 @@ mod tests {
             &wtns_0.root(),
             &mut verifier_challenger,
         ));
+    }
+
+    #[test]
+    fn materialize_direct_fold8_prefetch_matches_plain() {
+        use crate::challenger::Challenger;
+
+        // Small shape exercising the ranked geometry: N = 2^12 witness
+        // slots -> 2^6 output slots, split into 4 blocks of 16 slots via
+        // eq_lo (2^4) x eq_hi (2^2). The prefetch arm must be byte-identical
+        // to the plain-load arm by construction (pure cache hint); this
+        // oracle pins that in-process.
+        let log_n = 12;
+        let mut rng = crate::challenger::RandomChallenger::new(0xFEED_BEEF);
+        let witness: Vec<F128> = (0..(1usize << log_n)).map(|_| rng.sample_f128()).collect();
+        let scaled_rdp: Vec<F128> = build_eq_table(
+            &(0..crate::pcs::LOG_PACKING)
+                .map(|_| rng.sample_f128())
+                .collect::<Vec<_>>(),
+        );
+        let suffix: Vec<F128> = (0..log_n).map(|_| rng.sample_f128()).collect();
+        let (eq_lo, eq_hi) = super::super::ring_switch::build_eq_split(&suffix[6..], 4);
+        assert_eq!(eq_lo.len(), 16);
+        assert_eq!(eq_hi.len(), 4);
+        let challenges = std::array::from_fn(|_| rng.sample_f128());
+        let claims = vec![super::super::ring_switch::DirectFold8Factors {
+            eq_lo,
+            eq_hi,
+            low_eq: build_eq_table(&suffix[..6]).try_into().unwrap(),
+            table: super::super::ring_switch::build_fold_byte_table(&scaled_rdp),
+            products: [F128::ZERO; 4096],
+        }];
+        let plain = materialize_direct_fold8_with_flavor(
+            witness.clone(),
+            Vec::new(),
+            &claims,
+            challenges,
+            false,
+        );
+        let pref = materialize_direct_fold8_with_flavor(
+            witness,
+            Vec::new(),
+            &claims,
+            challenges,
+            true,
+        );
+        assert_eq!(plain.0, pref.0, "folded_f must be bit-identical");
+        assert_eq!(plain.1, pref.1, "folded_b must be bit-identical");
+        assert_eq!(plain.2, pref.2, "round-0 message must be bit-identical");
     }
 
     #[test]
