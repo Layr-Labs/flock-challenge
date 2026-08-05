@@ -29,3 +29,5 @@ pub mod seed_pipe;
 static RECYCLE_ALLOC: recycle_alloc::RecycleAlloc = recycle_alloc::RecycleAlloc;
 
 // dispersion-resample marker 172525636-o
+
+// keepalive-resample marker 708312271
