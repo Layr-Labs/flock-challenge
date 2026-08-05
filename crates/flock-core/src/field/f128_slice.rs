@@ -122,33 +122,6 @@ pub(crate) fn fold_banked_slot<const BANKS: usize>(weight: &[F128; BANKS], input
     }
 }
 
-/// Fold two adjacent banked output slots while loading each shared weight
-/// once. Each output remains an independent deferred-reduction sum, so the
-/// returned values are bit-identical to two [`fold_banked_slot`] calls.
-#[inline]
-pub(crate) fn fold_banked_slots2<const BANKS: usize>(
-    weight: &[F128; BANKS],
-    input: &[F128],
-) -> [F128; 2] {
-    debug_assert!(input.len() >= 2 * BANKS);
-    #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
-    {
-        // SAFETY: the cfg gate supplies PMULL through `aes`; the caller's
-        // sub-slice guarantees two complete adjacent banked slots.
-        unsafe { aarch64::fold_banked_slots2::<BANKS>(weight, input) }
-    }
-    #[cfg(not(all(target_arch = "aarch64", target_feature = "aes")))]
-    {
-        let mut first = super::F256Unreduced::ZERO;
-        let mut second = super::F256Unreduced::ZERO;
-        for (bank, w) in weight.iter().enumerate() {
-            first ^= w.mul_unreduced(input[bank]);
-            second ^= w.mul_unreduced(input[BANKS + bank]);
-        }
-        [first.reduce(), second.reduce()]
-    }
-}
-
 /// Fold adjacent pairs from `src` into `dst`, starting at pair `base`.
 ///
 /// Computes `dst[t] = src[2j] * (1 + r) + src[2j + 1] * r`, where
@@ -910,30 +883,6 @@ mod tests {
                 fold_banked_slot::<6>(&w6, &buf[off6..off6 + 6]),
                 oracle(&w6, &buf[off6..off6 + 6]),
                 "banks=6 trial={trial}"
-            );
-            assert_eq!(
-                fold_banked_slots2::<16>(&w16, &buf[off16..off16 + 32]),
-                [
-                    oracle(&w16, &buf[off16..off16 + 16]),
-                    oracle(&w16, &buf[off16 + 16..off16 + 32]),
-                ],
-                "pair banks=16 trial={trial}"
-            );
-            assert_eq!(
-                fold_banked_slots2::<64>(&w64, &buf[off64..off64 + 128]),
-                [
-                    oracle(&w64, &buf[off64..off64 + 64]),
-                    oracle(&w64, &buf[off64 + 64..off64 + 128]),
-                ],
-                "pair banks=64 trial={trial}"
-            );
-            assert_eq!(
-                fold_banked_slots2::<6>(&w6, &buf[off6..off6 + 12]),
-                [
-                    oracle(&w6, &buf[off6..off6 + 6]),
-                    oracle(&w6, &buf[off6 + 6..off6 + 12]),
-                ],
-                "pair banks=6 trial={trial}"
             );
         }
     }

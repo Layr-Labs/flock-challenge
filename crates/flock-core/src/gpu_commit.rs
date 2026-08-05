@@ -10786,6 +10786,100 @@ kernel void zc_r2_products(
         }
     }
 
+    /// Handle for a warmup rehearsal dispatch of the round-two products
+    /// prefix (see the multilinear driver's rehearsal): a real
+    /// `zc_r2_submit` of `chunks` leading chunks against the calibration
+    /// prove's wired buffers, used only for realized-conditions pricing.
+    /// Values are discarded — the published share moves only *where*
+    /// products are computed, never *what* is computed (the calibration
+    /// equality oracle covers both sides bit-for-bit).
+    pub(crate) struct ZcR2Rehearsal {
+        cb: Id,
+    }
+
+    /// Submit a rehearsal prefix. Requires a calibrated, unpoisoned arm
+    /// whose state still wraps the current prove's packed buffers — true
+    /// right after `zc_r2_wait` returns `Calibrated` inside the same
+    /// driver call, which is the only caller.
+    pub(crate) fn zc_r2_rehearse_submit(
+        chunks: usize,
+        lo_size: usize,
+        pair_in_block_mask: usize,
+        useful_pairs_inclusive: usize,
+    ) -> Option<ZcR2Rehearsal> {
+        use std::sync::atomic::Ordering;
+        if chunks == 0
+            || ZC_R2_POISONED.load(Ordering::Relaxed)
+            || pair_in_block_mask > u32::MAX as usize
+            || useful_pairs_inclusive > u32::MAX as usize
+        {
+            return None;
+        }
+        let gpu = gpu().ok()?;
+        let state_mutex = zc_r2_state()?;
+        let state = match state_mutex.lock() {
+            Ok(s) => s,
+            Err(_) => {
+                note_poisoned_lock("zc-r2 rehearse", false);
+                return None;
+            }
+        };
+        let (Some(&(_, _, a_buf)), Some(&(_, _, b_buf))) =
+            (state.wraps.first(), state.wraps.get(1))
+        else {
+            return None;
+        };
+        let cb = unsafe {
+            zc_r2_submit(
+                gpu,
+                &state,
+                a_buf,
+                b_buf,
+                chunks,
+                lo_size,
+                pair_in_block_mask as u32,
+                useful_pairs_inclusive as u32,
+            )
+            .ok()?
+        };
+        Some(ZcR2Rehearsal { cb })
+    }
+
+    /// Drain a rehearsal dispatch; returns the device-clock kernel wall in
+    /// milliseconds — the same clock calibration prices `u_gpu` from, so
+    /// the rehearsed ratio feeds `zc_r2_gate_share` consistently.
+    pub(crate) fn zc_r2_rehearse_wait(r: ZcR2Rehearsal) -> Option<f64> {
+        let gpu = gpu().ok()?;
+        let w = unsafe {
+            if gpu.wait_cb(r.cb).is_ok() {
+                zc_fold_gpu_wall_ms(gpu, r.cb)
+            } else {
+                0.0
+            }
+        };
+        unsafe { gpu.release(r.cb) };
+        (w > 0.0).then_some(w)
+    }
+
+    /// Read the published GPU chunk share (`usize::MAX` = uncalibrated,
+    /// `0` = arm off for the process).
+    pub(crate) fn zc_r2_tuned_share() -> usize {
+        ZC_R2_TUNED.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Publish a rehearsal-corrected share.
+    pub(crate) fn zc_r2_publish_share(share: usize) {
+        ZC_R2_TUNED.store(share, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Full-chunk-equivalent count of a mixed CPU sweep whose leading `g`
+    /// chunks run the products-skipping form: the gate formula prices those
+    /// at `ZC_R2_ALPHA` of a full chunk, so the sweep wall divided by this
+    /// count is directly comparable to the calibration's `u_cpu`.
+    pub(crate) fn zc_r2_full_equiv_chunks(hi_size: usize, g: usize) -> f64 {
+        hi_size as f64 - (1.0 - ZC_R2_ALPHA) * g.min(hi_size) as f64
+    }
+
     // -----------------------------------------------------------------------
     // Zerocheck first-tail-round (T3) compact-reconstruction products GPU
     // arm (see `ENV_NO_GPU_ZC_T3`).
@@ -12171,6 +12265,11 @@ pub(crate) use imp::{FoldEqTable, lincheck_fold_eq_table, zc_fold_eq_table};
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[cfg_attr(not(test), allow(unused_imports))]
 pub(crate) use imp::{ZcR2Job, ZcR2Result, launch_zc_r2_products, zc_r2_wait};
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub(crate) use imp::{
+    zc_r2_full_equiv_chunks, zc_r2_gate_share, zc_r2_publish_share, zc_r2_rehearse_submit,
+    zc_r2_rehearse_wait, zc_r2_tuned_share,
+};
 
 /// ZC-window GPU idle fill (see `ENV_NO_ZC_IDLE_FILL`).
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]

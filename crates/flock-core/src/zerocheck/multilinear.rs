@@ -111,6 +111,209 @@ fn zc_r2_odd_offload_enabled() -> bool {
     *ON
 }
 
+/// Kill switch for the warmup rehearsal of the round-two join
+/// (`FLOCK_NO_ZC_R2_REHEARSE=1` restores calibration-only pricing).
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn zc_r2_rehearse_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        std::env::var_os("FLOCK_NO_ZC_R2_REHEARSE").is_none_or(|v| v != *"1")
+    });
+    *ON
+}
+
+/// Warmup-only rehearsal of the round-two products join.
+///
+/// The calibration prices `u_gpu` ramp-robustly (min of ≥3 probe replays)
+/// but `u_cpu` from a **single sample of the all-FULL oracle sweep** taken
+/// under calibration-prove concurrency. The timed sweep is a different
+/// kernel mix (the GPU prefix's chunks run the products-skipping form)
+/// under different concurrency and clock state; the divergence mis-places
+/// the FS-serial join. Instrumented locally: calibrated `u_cpu = 0.176`
+/// vs realized `≈ 0.31+ ms/chunk` — the CPU straggled the timed join by
+/// ~190 ms while the GPU sat drained. The in-tree gate history also
+/// suspects the Metal clock ramp fails admission on a majority of ranked
+/// worker processes; a post-ramp, realized-conditions re-price rescues
+/// those too.
+///
+/// Mechanism: re-run a 1/8-scale model of the exact timed configuration —
+/// leading chunks in the GPU-covered kernel form concurrent with a real
+/// GPU prefix dispatch over those same chunks, trailing chunks fused —
+/// then feed the realized per-chunk rates back through the same
+/// `zc_r2_gate_share` formula (≤ 2 corrective steps; the formula's own
+/// caps and floors are preserved, and a realized "arm off" verdict is
+/// treated as a glitch rather than published). Rehearsal outputs go to
+/// throwaway scratch; the published share only moves *where* products are
+/// computed, never *what* — the calibration equality oracle has already
+/// proven both sides bit-identical chunk-by-chunk. Untimed by
+/// construction: runs inside warmup call 0 only, right after calibration;
+/// at 1/8 scale each step adds single-digit milliseconds of warmup wall
+/// at the ranked shape.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[allow(clippy::too_many_arguments)]
+fn zc_r2_rehearse_share(
+    a_packed: &[u8],
+    b_packed: &[u8],
+    table: &UniSkipFoldTable,
+    eq_lo: &[F128],
+    lo_size: usize,
+    hi_size: usize,
+    pair_in_block_mask: usize,
+    useful_pairs_inclusive: usize,
+    degen: bool,
+    periodic_padding: bool,
+    calibration_cpu_wall_ms: f64,
+) {
+    use crate::gpu_commit as gc;
+    if !zc_r2_rehearse_enabled() {
+        return;
+    }
+    let n_chunks = table.n_chunks;
+    let published = gc::zc_r2_tuned_share();
+    if published == usize::MAX {
+        return; // never calibrated (arm unavailable)
+    }
+    let u_cpu_cal = calibration_cpu_wall_ms / hi_size.max(1) as f64;
+    if !(u_cpu_cal.is_finite() && u_cpu_cal > 0.0) {
+        return;
+    }
+    // Fire only on the two glitch outcomes of the calibration pricing.
+    // `share == 0` is ratio ≥ 8 (unpriceable/ramping GPU clock) and
+    // `share == hi/8` is the (2, 8) admission floor — healthy hosts measure
+    // ratios of 0.33–1.3, so both outcomes are exactly the suspected
+    // Metal-ramp failure band the gate history documents on ranked workers.
+    // Healthy calibrations skip the rehearsal entirely: zero added warmup
+    // wall on the processes that were already priced right.
+    if published != 0 && published != hi_size / 8 {
+        return;
+    }
+    let cap = hi_size * 15 / 16;
+    // A zero share is a dead arm; rehearse from the formula's own admission
+    // floor instead of accepting it untested. The equality oracle has
+    // already proven the kernel exact on this machine either way.
+    let g = if published == 0 {
+        hi_size / 8
+    } else {
+        published.min(cap)
+    };
+    let scale = 8usize;
+    let s_chunks = (hi_size / scale).clamp(32.min(hi_size), hi_size);
+    let anchor_chunk_size = 2 * lo_size;
+    let delta_chunk_size = 2 * lo_size * n_chunks;
+    // Throwaway stores sized for the rehearsal slice (pages recycle into
+    // the timed prove's own takes); the timed sweep always stores, so the
+    // rehearsal does too.
+    let mut throw_anchors = crate::scratch::take_f128(s_chunks * anchor_chunk_size);
+    let mut throw_deltas = crate::scratch::ScratchBytes::take(s_chunks * delta_chunk_size);
+    let odd = zc_r2_odd_offload_enabled();
+    // Single corrective step: a slice re-measurement is sane exactly once —
+    // the first pass over the slice sees timed-like cold conditions, while a
+    // second pass runs against self-warmed state and underprices the CPU by
+    // multiples (observed 51 ms -> 6.9 ms on back-to-back identical slices).
+    {
+        let p = (g * s_chunks).div_ceil(hi_size).clamp(1, s_chunks);
+        let submitted =
+            gc::zc_r2_rehearse_submit(p, lo_size, pair_in_block_mask, useful_pairs_inclusive);
+        let Some(job) = submitted else {
+            crate::scratch::give_f128(std::mem::take(&mut throw_anchors));
+            throw_deltas.recycle();
+            return;
+        };
+        let anchors_base = crate::epool::SyncPtr(throw_anchors.as_mut_ptr());
+        let deltas_base = crate::epool::SyncPtr(throw_deltas.as_mut_ptr());
+        let t_sweep = std::time::Instant::now();
+        crate::epool::run_hetero_chunks(s_chunks, |x_hi| {
+            // SAFETY: exclusive per-chunk ownership of the throwaway
+            // ranges; outputs are discarded after the join.
+            let (anchors, deltas) = unsafe {
+                (
+                    anchors_base.ptr().add(x_hi * anchor_chunk_size),
+                    deltas_base.ptr().add(x_hi * delta_chunk_size),
+                )
+            };
+            let pair_idx_base = x_hi * lo_size;
+            let row_base = pair_idx_base * 2;
+            let mut out = [F128::ZERO; 8];
+            unsafe {
+                let t = table.data.as_ptr().cast::<u8>();
+                let ap = a_packed.as_ptr().add(row_base * n_chunks);
+                let bp = b_packed.as_ptr().add(row_base * n_chunks);
+                macro_rules! reh_kernel {
+                    ($full:literal, $odd:literal) => {
+                        fold_round2_compact_chunk_neon_lookahead_8::<$full, $odd>(
+                            t,
+                            ap,
+                            bp,
+                            anchors,
+                            deltas,
+                            eq_lo.as_ptr(),
+                            lo_size,
+                            pair_idx_base,
+                            pair_in_block_mask,
+                            useful_pairs_inclusive,
+                            degen,
+                            periodic_padding,
+                            out.as_mut_ptr(),
+                        )
+                    };
+                }
+                let full = x_hi >= p;
+                if full {
+                    reh_kernel!(true, false);
+                } else if odd {
+                    reh_kernel!(false, true);
+                } else {
+                    reh_kernel!(false, false);
+                }
+            }
+            std::hint::black_box(&out);
+        });
+        let cpu_wall_ms = t_sweep.elapsed().as_secs_f64() * 1e3;
+        let gpu_wall = gc::zc_r2_rehearse_wait(job);
+        'price: {
+            let Some(gpu_wall_ms) = gpu_wall else {
+                break 'price;
+            };
+            let u_gpu = gpu_wall_ms / p as f64;
+            let u_cpu = cpu_wall_ms / gc::zc_r2_full_equiv_chunks(s_chunks, p);
+            if !(u_gpu.is_finite() && u_cpu.is_finite() && u_cpu > 0.0) {
+                break 'price;
+            }
+            // Glitch guard: the realized mixed-sweep rate can legitimately
+            // exceed the calibration's all-FULL single sample (contention,
+            // clocks) but cannot be far *below* it — full-equivalent
+            // normalization already accounts for the cheaper kernel form. A
+            // reading below half the calibration rate is a warm-state or
+            // clock artifact; publishing it would collapse the share to the
+            // floor and hand the timed sweep back to the CPU.
+            if u_cpu < 0.5 * u_cpu_cal {
+                if crate::gpu_commit::gpu_zc_r2_debug() {
+                    eprintln!(
+                        "[zc-r2] rehearse rejected: u_cpu={u_cpu:.4} < 0.5*cal({u_cpu_cal:.4})"
+                    );
+                }
+                break 'price;
+            }
+            let next = gc::zc_r2_gate_share(u_gpu / u_cpu, hi_size).min(cap);
+            if crate::gpu_commit::gpu_zc_r2_debug() {
+                eprintln!(
+                    "[zc-r2] rehearse: slice {p}/{s_chunks} gpu={gpu_wall_ms:.2}ms \
+                     cpu={cpu_wall_ms:.2}ms u_gpu={u_gpu:.4} u_cpu={u_cpu:.4} \
+                     share {g} -> {next}"
+                );
+            }
+            if next == 0 {
+                // Realized "arm off" from a slice this small is more likely
+                // a measurement glitch than truth; keep the incumbent
+                // decision.
+                break 'price;
+            }
+            gc::zc_r2_publish_share(next);
+        }
+    }
+    crate::scratch::give_f128(std::mem::take(&mut throw_anchors));
+    throw_deltas.recycle();
+}
+
 /// ZC-window GPU idle fill (see `gpu_commit::ENV_NO_ZC_IDLE_FILL`): stage
 /// round two's GPU-arm window setup while the ZC C-fold's GPU prefix is in
 /// flight. Everything staged derives from inputs bound BEFORE the fold
@@ -1585,7 +1788,23 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead(
             hi_size,
         );
         match res {
-            crate::gpu_commit::ZcR2Result::Calibrated => {}
+            crate::gpu_commit::ZcR2Result::Calibrated => {
+                // Re-price the join under realized conditions before the
+                // timed prove latches the share (see `zc_r2_rehearse_share`).
+                zc_r2_rehearse_share(
+                    a_packed,
+                    b_packed,
+                    table,
+                    eq_lo,
+                    lo_size,
+                    hi_size,
+                    pair_in_block_mask,
+                    useful_pairs_inclusive,
+                    degen,
+                    periodic_padding,
+                    cpu_wall_ms,
+                );
+            }
             crate::gpu_commit::ZcR2Result::Prefix(vals) => {
                 for (x_hi, v) in vals.iter().enumerate() {
                     partials[x_hi] = (v[0] + v[2], v[1] + v[3]);

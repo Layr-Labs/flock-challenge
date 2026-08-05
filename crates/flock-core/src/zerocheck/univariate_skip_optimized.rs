@@ -4326,25 +4326,8 @@ mod tests {
         let b_bits = rng.bits(1 << m);
         let a_packed = super::super::univariate_skip::pack_bits(&a_bits);
         let b_packed = super::super::univariate_skip::pack_bits(&b_bits);
-        let prepared_context = kernels::aarch64::prepare_static_b_context_with_policy(
-            &table, true, false, false,
-        )
-        .expect("prepared static-b context");
 
-        for (mask, static_a_k1, prepared) in [
-            (0x03u8, false, false),
-            (0x03, true, false),
-            (0x03, true, true),
-            (0xf0, false, false),
-        ] {
-            let mut a_mixed = a_packed.clone();
-            if static_a_k1 {
-                let a_k0 = u64::from_le_bytes(a_mixed[..N_CHUNKS].try_into().unwrap())
-                    & !0xffff_fffe_0000_0000;
-                a_mixed[..N_CHUNKS].copy_from_slice(&a_k0.to_le_bytes());
-                a_mixed[N_CHUNKS..2 * N_CHUNKS]
-                    .copy_from_slice(&0x0000_0016_0000_0080u64.to_le_bytes());
-            }
+        for mask in [0x03u8, 0xf0] {
             let mut b_mixed = b_packed.clone();
             for k in 0..8 {
                 if mask & (1 << k) != 0 {
@@ -4356,10 +4339,10 @@ mod tests {
             let mut want = [0u8; 64];
             let mut got = [0u8; 64];
             shift_reduce_inner_ab_scalar(
-                &a_mixed, &b_mixed, &table, 0, 0, &mut want, &mut a_col, &mut b_col,
+                &a_packed, &b_mixed, &table, 0, 0, &mut want, &mut a_col, &mut b_col,
             );
             shift_reduce_inner_ab_fused_neon_checked(
-                &a_mixed,
+                &a_packed,
                 &b_mixed,
                 &table,
                 0,
@@ -4369,13 +4352,10 @@ mod tests {
                 false,
                 mask,
                 usize::MAX,
-                prepared.then_some(prepared_context),
+                None,
                 false,
             );
-            assert_eq!(
-                got, want,
-                "mixed const-one mask {mask:#04x}, static_a_k1={static_a_k1}, prepared={prepared}"
-            );
+            assert_eq!(got, want, "mixed const-one mask {mask:#04x}");
         }
     }
 
@@ -4395,14 +4375,7 @@ mod tests {
         let byte_base_b = b_med * N_CHUNKS * 8;
         let len = byte_base_b + 8 * N_CHUNKS;
         for trial in 0..64 {
-            let mut a_packed: Vec<u8> = (0..len).map(|_| rng.next_u64() as u8).collect();
-            // Exact B plus trial mod 4 = 0 exercises the ranked top-byte-zero
-            // A transform; mod 4 = 2 forces its checked full-word fallback.
-            if trial % 4 == 0 {
-                a_packed[byte_base_b + 7] = 0;
-            } else if trial % 4 == 2 {
-                a_packed[byte_base_b + 7] |= 1;
-            }
+            let a_packed: Vec<u8> = (0..len).map(|_| rng.next_u64() as u8).collect();
             let mut b_packed = vec![0u8; len];
             // K0 = the blk-30 static constant, K1..7 = zero; one arm perturbs
             // K0 so the guard must route to the generic single-K0 kernel.

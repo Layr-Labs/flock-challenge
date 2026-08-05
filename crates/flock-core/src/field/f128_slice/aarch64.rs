@@ -428,62 +428,6 @@ pub(super) unsafe fn fold_banked_slot<const BANKS: usize>(
     }
 }
 
-/// Banked deferred-reduction folds of two adjacent output slots. The two
-/// slots share each weight load but retain separate raw Karatsuba-component
-/// accumulators and separate final reductions.
-///
-/// # Safety
-/// Requires the `aes` target feature (PMULL). `input` must hold at least
-/// `2 * BANKS` elements, with the second slot starting at `input[BANKS]`.
-#[inline]
-#[target_feature(enable = "aes")]
-pub(super) unsafe fn fold_banked_slots2<const BANKS: usize>(
-    weight: &[F128; BANKS],
-    input: &[F128],
-) -> [F128; 2] {
-    unsafe {
-        debug_assert!(input.len() >= 2 * BANKS);
-        let zero = vdupq_n_u64(0);
-        let mut first = KaratsubaNeon {
-            ll: zero,
-            hh: zero,
-            mm: zero,
-        };
-        let mut second = KaratsubaNeon {
-            ll: zero,
-            hh: zero,
-            mm: zero,
-        };
-
-        let w = weight.as_ptr();
-        let x0 = input.as_ptr();
-        let x1 = input.as_ptr().add(BANKS);
-        let main = BANKS & !1;
-        let mut bank = 0usize;
-        while bank < main {
-            let w0 = vld1q_u64(w.add(bank).cast::<u64>());
-            let w1 = vld1q_u64(w.add(bank + 1).cast::<u64>());
-            let x00 = vld1q_u64(x0.add(bank).cast::<u64>());
-            let x10 = vld1q_u64(x1.add(bank).cast::<u64>());
-            let x01 = vld1q_u64(x0.add(bank + 1).cast::<u64>());
-            let x11 = vld1q_u64(x1.add(bank + 1).cast::<u64>());
-            xor_karatsuba_const_pair(&mut first, &mut second, x00, x10, w0);
-            xor_karatsuba_const_pair(&mut first, &mut second, x01, x11, w1);
-            bank += 2;
-        }
-        if bank < BANKS {
-            let wk = vld1q_u64(w.add(bank).cast::<u64>());
-            let first_x = vld1q_u64(x0.add(bank).cast::<u64>());
-            let second_x = vld1q_u64(x1.add(bank).cast::<u64>());
-            xor_karatsuba_const_pair(&mut first, &mut second, first_x, second_x, wk);
-        }
-
-        let first = transmute::<uint64x2_t, F128>(reduce_wide(karatsuba_to_wide(first)));
-        let second = transmute::<uint64x2_t, F128>(reduce_wide(karatsuba_to_wide(second)));
-        [first, second]
-    }
-}
-
 /// Deferred-reduction round-zero message `(u_0, u_2)` over paired slots.
 ///
 /// Bitwise-identical to the scalar pair loop: both accumulate

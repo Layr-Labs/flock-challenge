@@ -130,8 +130,7 @@ pub use kernels::partial_fold_packed_z_x86_tiled_padded;
 #[cfg(target_arch = "aarch64")]
 pub use kernels::{
     partial_fold_packed_z_neon_iblock_padded, partial_fold_packed_z_neon_oblock_padded,
-    partial_fold_packed_z_neon_oblock16_padded, partial_fold_packed_z_neon_single,
-    partial_fold_packed_z_neon_single_padded,
+    partial_fold_packed_z_neon_single, partial_fold_packed_z_neon_single_padded,
 };
 #[cfg(target_arch = "aarch64")]
 #[cfg_attr(not(target_os = "macos"), allow(unused_imports))]
@@ -2086,51 +2085,6 @@ mod tests {
             let iblock =
                 partial_fold_packed_z_neon_iblock_padded(&z_packed, m, k_log, 1usize << k_log, &eq);
             assert_eq!(serial, iblock, "iblock at m={m}, k_log={k_log}");
-        }
-    }
-
-    /// The fixed-register SHA3 Block16 drain is a proof-identical scheduling
-    /// change: it visits the same eight stripe tables and XORs the same entry
-    /// into each output as two adjacent incumbent Block8 calls.
-    #[cfg(all(target_arch = "aarch64", target_feature = "sha3"))]
-    #[test]
-    fn partial_fold_neon_block16_matches_block8() {
-        let cases = [
-            (14usize, 4usize, 13usize),
-            (20, 10, 597),
-            (22, 14, 15_409),
-            (24, 8, 253),
-        ];
-        for &(m, k_log, useful_bits) in &cases {
-            let k = 1usize << k_log;
-            let n_log = m - k_log;
-            let mut rng = Rng::new(7_160 + m as u64);
-            let mut z = rng.bits(1 << m);
-            for block in 0..(1usize << n_log) {
-                for i in useful_bits..k {
-                    z[block * k + i] = false;
-                }
-            }
-            let z_packed = pack_z_lincheck(&z, m, k_log);
-            let eq = build_eq_table(&rng.f128_vec(n_log));
-            let block8 = partial_fold_packed_z_neon_oblock_padded(
-                &z_packed,
-                m,
-                k_log,
-                useful_bits,
-                &eq,
-            );
-            let block16 = partial_fold_packed_z_neon_oblock16_padded(
-                &z_packed,
-                m,
-                k_log,
-                useful_bits,
-                &eq,
-            );
-            assert_eq!(
-                block8, block16,
-                "m={m}, k_log={k_log}, useful={useful_bits}"
-            );
         }
     }
 

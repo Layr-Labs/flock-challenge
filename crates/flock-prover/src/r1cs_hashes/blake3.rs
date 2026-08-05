@@ -3284,12 +3284,6 @@ impl Blake3Setup {
         // must run before the keep-warm pause below — on the adopted path the
         // speculative thread already issued it at its own prove entry.
         if call > 0 {
-            // The timed seed is in hand (this is the timed call). If the seed
-            // pipe is live its thread already halted the CPU keep-alive the
-            // instant it read the seed; this is the fallback for the
-            // seed-pipe-disabled path, and it is idempotent. Stop before the
-            // adoption byte-compare so no keep-alive thread overlaps timed work.
-            flock_core::cpu_keepalive::keepalive_stop();
             if let Some(adopted) = crate::seed_pipe::try_adopt(blocks) {
                 return adopted;
             }
@@ -3330,15 +3324,6 @@ impl Blake3Setup {
             // outside every measured interval and before the wrapper's
             // `BufReader` binds a descriptor.
             self.arm_seed_pipe();
-            // Last thing before the worker publishes "ready" and every thread
-            // parks for the seed: light up a P-core keep-alive so the cluster
-            // does not collapse to a deep-idle P-state across the gap. The
-            // seed-pipe thread (or the timed `prove_fast` fallback above) stops
-            // it the instant the seed arrives. Ranked-worker only, so tests /
-            // benches / examples that call `prove_fast` never spin.
-            if crate::seed_pipe::is_ranked_worker() {
-                flock_core::cpu_keepalive::keepalive_start();
-            }
             return (proof, commitment, claim);
         }
         (proof, commitment, claim)
