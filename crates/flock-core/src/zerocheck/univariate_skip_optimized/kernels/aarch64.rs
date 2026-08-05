@@ -2493,6 +2493,49 @@ fn bstatic_legacy_enabled() -> bool {
     *FLAG.get_or_init(|| std::env::var_os("FLOCK_ZC_BSTATIC_LEGACY").is_some())
 }
 
+/// Use the generated low-instruction static-B kernel for the two ranked edge
+/// rows whose all-one shortcuts otherwise preempt it. The generated rows keep
+/// exact per-word guards and fall back locally for any non-static witness.
+/// `FLOCK_NO_ZC_MIXED_BSTATIC_FAST=1` restores the incumbent mixed-identity
+/// kernels as a same-binary control.
+fn mixed_bstatic_fast_enabled() -> bool {
+    #[cfg(test)]
+    {
+        let mode = MIXED_BSTATIC_FAST_TEST_MODE.load(std::sync::atomic::Ordering::Relaxed);
+        if mode >= 0 {
+            return mode != 0;
+        }
+    }
+    use std::sync::LazyLock;
+    static FLAG: LazyLock<bool> =
+        LazyLock::new(|| std::env::var_os("FLOCK_NO_ZC_MIXED_BSTATIC_FAST").is_none());
+    *FLAG
+}
+
+#[cfg(test)]
+static MIXED_BSTATIC_FAST_TEST_MODE: std::sync::atomic::AtomicI8 =
+    std::sync::atomic::AtomicI8::new(-1);
+
+#[cfg(test)]
+pub(crate) fn set_mixed_bstatic_fast_for_test(mode: Option<bool>) {
+    MIXED_BSTATIC_FAST_TEST_MODE.store(
+        mode.map_or(-1, i8::from),
+        std::sync::atomic::Ordering::Relaxed,
+    );
+}
+
+#[inline(always)]
+pub(crate) const fn mixed_bstatic_fast_position(
+    bstatic_w: usize,
+    b_med: usize,
+    const_one_mask: u8,
+) -> bool {
+    matches!(
+        (bstatic_w, b_med, const_one_mask),
+        (0, 2, 0x03) | (1, 13, 0xf0)
+    )
+}
+
 #[inline]
 pub(crate) fn prepare_static_b_context(
     inv_table: &InvNttTableByteSingleGf8,
@@ -2597,31 +2640,70 @@ pub(crate) fn shift_reduce_inner_ab_fused_neon_checked(
             return;
         }
     }
+    // Ranked blk2 and blk29 normally return through the mixed all-one
+    // shortcuts below. Their residual dynamic rows are unusually sparse:
+    // generated blk2/K5 varies in one byte and blk29/K0 in two. Route exactly
+    // those two positions through the already-guarded FAST static-B kernel so
+    // the sparse transforms and deferred-reduction epilogue remain available.
+    // Keep the attempt inside the mixed-mask arms so the other ranked rows
+    // retain the incumbent dispatch path exactly.
+    macro_rules! try_mixed_bstatic_fast {
+        () => {
+            if mixed_bstatic_fast_position(bstatic_w, b_med, const_one_mask)
+                && mixed_bstatic_fast_enabled()
+                && fast_shift_reduce_enabled()
+                && let Some(context) = static_b_context
+            {
+                let enabled = !matches!(context, StaticBContext::LegacyPerCall)
+                    || !bstatic_legacy_enabled();
+                if enabled
+                    && shift_reduce_inner_ab_bstatic::<true>(
+                        a_packed,
+                        b_packed,
+                        inv_table,
+                        chunk_byte_base,
+                        b_med,
+                        bstatic_w,
+                        context,
+                        out,
+                        nt_store,
+                    )
+                {
+                    return;
+                }
+            }
+        };
+    }
     match const_one_mask {
         0 => {}
-        0x03 if bw(0) & bw(1) == u64::MAX => {
-            shift_reduce_inner_mixed_const_b::<0x03>(
-                a_packed,
-                b_packed,
-                inv_table,
-                byte_base_b,
-                out,
-                nt_store,
-            );
-            return;
+        0x03 => {
+            try_mixed_bstatic_fast!();
+            if bw(0) & bw(1) == u64::MAX {
+                shift_reduce_inner_mixed_const_b::<0x03>(
+                    a_packed,
+                    b_packed,
+                    inv_table,
+                    byte_base_b,
+                    out,
+                    nt_store,
+                );
+                return;
+            }
         }
-        0xf0 if bw(4) & bw(5) & bw(6) & bw(7) == u64::MAX => {
-            shift_reduce_inner_mixed_const_b::<0xf0>(
-                a_packed,
-                b_packed,
-                inv_table,
-                byte_base_b,
-                out,
-                nt_store,
-            );
-            return;
+        0xf0 => {
+            try_mixed_bstatic_fast!();
+            if bw(4) & bw(5) & bw(6) & bw(7) == u64::MAX {
+                shift_reduce_inner_mixed_const_b::<0xf0>(
+                    a_packed,
+                    b_packed,
+                    inv_table,
+                    byte_base_b,
+                    out,
+                    nt_store,
+                );
+                return;
+            }
         }
-        0x03 | 0xf0 => {}
         _ => unreachable!("unsupported static-one mask"),
     }
     if bstatic_w <= 1

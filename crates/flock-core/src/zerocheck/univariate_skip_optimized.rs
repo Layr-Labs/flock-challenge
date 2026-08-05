@@ -4104,6 +4104,229 @@ mod tests {
         }
     }
 
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn mixed_bstatic_fast_dispatch_is_exact_and_narrow() {
+        std::thread::Builder::new()
+            .stack_size(64 << 20)
+            .spawn(|| {
+                struct ResetMixedBstaticFast;
+                impl Drop for ResetMixedBstaticFast {
+                    fn drop(&mut self) {
+                        kernels::aarch64::set_mixed_bstatic_fast_for_test(None);
+                    }
+                }
+                let _reset = ResetMixedBstaticFast;
+
+                let selected: Vec<(usize, usize, u8)> = (0..=2usize)
+                    .flat_map(|w| {
+                        (0..16usize).flat_map(move |b_med| {
+                            [0u8, 0x03, 0xf0].into_iter().filter_map(move |mask| {
+                                kernels::aarch64::mixed_bstatic_fast_position(w, b_med, mask)
+                                    .then_some((w, b_med, mask))
+                            })
+                        })
+                    })
+                    .collect();
+                assert_eq!(selected, [(0, 2, 0x03), (1, 13, 0xf0)]);
+
+                let table = make_inv_table();
+                let mut rng = Rng::new(0xB2B2_29FA_57A7_1C01);
+                let a_packed: Vec<u8> = (0..1024).map(|_| rng.next_u64() as u8).collect();
+                let base_b: Vec<u8> = (0..1024).map(|_| rng.next_u64() as u8).collect();
+                let context = kernels::aarch64::prepare_static_b_context_with_policy(
+                    &table, true, false, false,
+                )
+                .expect("prepared static-B context");
+
+                for (w, b_med, mask) in selected {
+                    let blk = w * (1 << N_MEDIUM) + b_med;
+                    let byte_base_b = b_med * N_CHUNKS * 8;
+                    let mut b_packed = base_b.clone();
+                    for k in 0..N_CHUNKS {
+                        let off = byte_base_b + k * N_CHUNKS;
+                        let (guard, expected) = kernels::aarch64::BSTATIC_MASKS[blk][k];
+                        let word =
+                            u64::from_le_bytes(b_packed[off..off + 8].try_into().unwrap());
+                        b_packed[off..off + 8]
+                            .copy_from_slice(&((word & !guard) | expected).to_le_bytes());
+                    }
+
+                    let (identity_k, sparse_k, varying_byte) = match (w, b_med) {
+                        (0, 2) => (0, 5, 7),
+                        (1, 13) => (4, 0, 7),
+                        _ => unreachable!(),
+                    };
+                    let mut cases = vec![("satisfied", b_packed.clone())];
+                    let mut broken_identity = b_packed.clone();
+                    broken_identity[byte_base_b + identity_k * N_CHUNKS] ^= 1;
+                    cases.push(("broken identity guard", broken_identity));
+                    let mut broken_sparse = b_packed.clone();
+                    broken_sparse[byte_base_b + sparse_k * N_CHUNKS] ^= 1;
+                    cases.push(("broken sparse guard", broken_sparse));
+                    let mut varied_sparse = b_packed;
+                    varied_sparse[byte_base_b + sparse_k * N_CHUNKS + varying_byte] ^= 1;
+                    cases.push(("varied sparse byte", varied_sparse));
+
+                    for (case, b_packed) in cases {
+                        let mut scalar = [0u8; 64];
+                        let mut a_col = [F8::ZERO; ELL];
+                        let mut b_col = [F8::ZERO; ELL];
+                        shift_reduce_inner_ab_scalar(
+                            &a_packed,
+                            &b_packed,
+                            &table,
+                            0,
+                            b_med,
+                            &mut scalar,
+                            &mut a_col,
+                            &mut b_col,
+                        );
+
+                        for nt_store in [false, true] {
+                            let run = |candidate: bool, context| {
+                                kernels::aarch64::set_mixed_bstatic_fast_for_test(Some(candidate));
+                                let mut out = [0u8; 64];
+                                shift_reduce_inner_ab_fused_neon_checked(
+                                    &a_packed,
+                                    &b_packed,
+                                    &table,
+                                    0,
+                                    b_med,
+                                    &mut out,
+                                    false,
+                                    false,
+                                    mask,
+                                    w,
+                                    context,
+                                    nt_store,
+                                );
+                                out
+                            };
+                            let control = run(false, Some(context));
+                            assert_eq!(control, scalar, "control mismatch: {case}");
+                            assert_eq!(run(true, Some(context)), scalar, "candidate: {case}");
+                            assert_eq!(
+                                run(true, None),
+                                scalar,
+                                "missing-context fallback: {case}"
+                            );
+                        }
+                    }
+                }
+            })
+            .expect("spawn mixed-static dispatch oracle")
+            .join()
+            .expect("mixed-static dispatch oracle thread");
+    }
+
+    /// Exact ranked call-count component gate for routing blk2/blk29 through
+    /// the generated FAST static-B kernel. Opt-in because each sample writes
+    /// the full 32 MiB combined ranked output surface.
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    #[ignore = "ranked mixed-static AB component timing gate"]
+    fn ranked_mixed_bstatic_fast_timing() {
+        const BLOCKS: usize = 1 << 18;
+        const ROWS: usize = 2 * BLOCKS;
+        const PAIRS: usize = 24;
+
+        let table = make_inv_table();
+        let mut rng = Rng::new(0xB2B2_9FA5_7A71_C001);
+        let a_packed: Vec<u8> = (0..1024).map(|_| rng.next_u64() as u8).collect();
+        let mut b_packed: Vec<u8> = (0..1024).map(|_| rng.next_u64() as u8).collect();
+        for (w, b_med) in [(0usize, 2usize), (1, 13)] {
+            let blk = w * (1 << N_MEDIUM) + b_med;
+            let byte_base_b = b_med * N_CHUNKS * 8;
+            for k in 0..N_CHUNKS {
+                let off = byte_base_b + k * N_CHUNKS;
+                let (mask, expected) = kernels::aarch64::BSTATIC_MASKS[blk][k];
+                let word = u64::from_le_bytes(b_packed[off..off + 8].try_into().unwrap());
+                b_packed[off..off + 8]
+                    .copy_from_slice(&((word & !mask) | expected).to_le_bytes());
+            }
+        }
+        let context = kernels::aarch64::prepare_static_b_context_with_policy(
+            &table, true, false, false,
+        )
+        .expect("prepared static-B context");
+        let mut slots = [vec![[0u8; 64]; ROWS], vec![[0u8; 64]; ROWS]];
+
+        let run = |out: &mut [[u8; 64]], candidate: bool| {
+            kernels::aarch64::set_mixed_bstatic_fast_for_test(Some(candidate));
+            let started = std::time::Instant::now();
+            for block in 0..BLOCKS {
+                shift_reduce_inner_ab_fused_neon_checked(
+                    &a_packed,
+                    &b_packed,
+                    &table,
+                    0,
+                    2,
+                    &mut out[2 * block],
+                    false,
+                    false,
+                    0x03,
+                    0,
+                    Some(context),
+                    true,
+                );
+                shift_reduce_inner_ab_fused_neon_checked(
+                    &a_packed,
+                    &b_packed,
+                    &table,
+                    0,
+                    13,
+                    &mut out[2 * block + 1],
+                    false,
+                    false,
+                    0xf0,
+                    1,
+                    Some(context),
+                    true,
+                );
+            }
+            started.elapsed().as_secs_f64() * 1e3
+        };
+
+        let _ = run(&mut slots[0], false);
+        let _ = run(&mut slots[1], true);
+        let _ = run(&mut slots[0], true);
+        let _ = run(&mut slots[1], false);
+
+        let mut candidate_ms = Vec::with_capacity(PAIRS);
+        let mut control_ms = Vec::with_capacity(PAIRS);
+        for pair in 0..PAIRS {
+            match pair % 4 {
+                0 => {
+                    candidate_ms.push(run(&mut slots[0], true));
+                    control_ms.push(run(&mut slots[1], false));
+                }
+                1 => {
+                    control_ms.push(run(&mut slots[0], false));
+                    candidate_ms.push(run(&mut slots[1], true));
+                }
+                2 => {
+                    candidate_ms.push(run(&mut slots[1], true));
+                    control_ms.push(run(&mut slots[0], false));
+                }
+                _ => {
+                    control_ms.push(run(&mut slots[1], false));
+                    candidate_ms.push(run(&mut slots[0], true));
+                }
+            }
+        }
+        kernels::aarch64::set_mixed_bstatic_fast_for_test(None);
+        assert_eq!(slots[0], slots[1], "candidate/control rows differ");
+        let delta_ms: Vec<f64> = candidate_ms
+            .iter()
+            .zip(&control_ms)
+            .map(|(candidate, control)| candidate - control)
+            .collect();
+        eprintln!("[mixed-bstatic-fast] candidate_ms={candidate_ms:?}");
+        eprintln!("[mixed-bstatic-fast] control_ms={control_ms:?}");
+        eprintln!("[mixed-bstatic-fast] delta_ms={delta_ms:?}");
+    }
+
     /// The blk-30 static-B single-K0 fast path (precomputed partial instead
     /// of the eight B table-row gathers) must be byte-identical to the
     /// generic dispatch, and the guard must fall back for any other B word.
