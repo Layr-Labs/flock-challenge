@@ -3761,21 +3761,33 @@ mod tests {
     /// `x^4 · T(w)` a pure table swap.
     #[cfg(target_arch = "aarch64")]
     #[test]
-    fn scaled_x4_table_images_are_x4_times_plain() {
+    fn scaled_table_images_match_field_weights() {
         let table = make_inv_table();
         let len = 256 * table.ell;
-        let x4 = F8(1u8 << 4);
-        for (plain, scaled) in [
-            (table.data_ptr(), table.scaled_x4_data_ptr()),
+        for (weight, plain, scaled) in [
+            (F8(1u8 << 2), table.data_ptr(), table.scaled_x2_data_ptr()),
             (
+                F8(1u8 << 2),
+                table.half_swapped_data_ptr(),
+                table.scaled_x2_half_swapped_data_ptr(),
+            ),
+            (F8(1u8 << 4), table.data_ptr(), table.scaled_x4_data_ptr()),
+            (
+                F8(1u8 << 4),
                 table.half_swapped_data_ptr(),
                 table.scaled_x4_half_swapped_data_ptr(),
-            ) as (*const u8, *const u8),
+            ),
+            (F8(1u8 << 6), table.data_ptr(), table.scaled_x6_data_ptr()),
+            (
+                F8(1u8 << 6),
+                table.half_swapped_data_ptr(),
+                table.scaled_x6_half_swapped_data_ptr(),
+            ),
         ] {
             for i in 0..len {
                 // SAFETY: both images are `256 * ell` bytes by construction.
                 let (p, s) = unsafe { (*plain.add(i), *scaled.add(i)) };
-                assert_eq!(F8(p) * x4, F8(s), "scaled table image mismatch at {i}");
+                assert_eq!(F8(p) * weight, F8(s), "scaled table image mismatch at {i}");
             }
         }
     }
@@ -3879,6 +3891,35 @@ mod tests {
             cases += 1;
         }
         assert!(cases > 600, "oracle coverage too thin: {cases} cases");
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn const_one_h4_matches_scalar() {
+        let table = make_inv_table();
+        let mut rng = Rng::new(0xC057_0A11_0000_0004);
+        let mut a_col = [F8::ZERO; ELL];
+        let mut b_col = [F8::ZERO; ELL];
+        for trial in 0..128 {
+            let a: Vec<u8> = (0..64).map(|_| rng.next_u64() as u8).collect();
+            let b = [u8::MAX; 64];
+            let mut want = [0u8; 64];
+            shift_reduce_inner_ab_scalar(
+                &a,
+                &b,
+                &table,
+                0,
+                0,
+                &mut want,
+                &mut a_col,
+                &mut b_col,
+            );
+            let mut got = [0u8; 64];
+            kernels::aarch64::shift_reduce_inner_a_only_const_b_h4(
+                &a, &table, 0, &mut got, false,
+            );
+            assert_eq!(got, want, "const-one H4 mismatch on trial {trial}");
+        }
     }
 
     #[cfg(target_arch = "aarch64")]
@@ -4073,17 +4114,32 @@ mod tests {
                             );
                             let mut slow = [0u8; 64];
                             assert!(
-                                kernels::aarch64::shift_reduce_inner_ab_bstatic::<false>(
+                                kernels::aarch64::shift_reduce_inner_ab_bstatic::<false, false>(
                                     &a_packed, &b, &table, 0, b_med, w, context, &mut slow, false,
                                 ),
                                 "arm (w={w}, b_med={b_med}) must be live"
                             );
                             let mut fast = [0u8; 64];
                             assert!(
-                                kernels::aarch64::shift_reduce_inner_ab_bstatic::<true>(
+                                kernels::aarch64::shift_reduce_inner_ab_bstatic::<true, true>(
                                     &a_packed, &b, &table, 0, b_med, w, context, &mut fast, true,
                                 ),
                                 "arm (w={w}, b_med={b_med}) must be live"
+                            );
+                            let mut fast_old = [0u8; 64];
+                            assert!(
+                                kernels::aarch64::shift_reduce_inner_ab_bstatic::<true, false>(
+                                    &a_packed,
+                                    &b,
+                                    &table,
+                                    0,
+                                    b_med,
+                                    w,
+                                    context,
+                                    &mut fast_old,
+                                    false,
+                                ),
+                                "rollback arm (w={w}, b_med={b_med}) must be live"
                             );
                             assert_eq!(
                                 slow, want,
@@ -4092,6 +4148,10 @@ mod tests {
                             assert_eq!(
                                 fast, slow,
                                 "fast bstatic differs (w={w}, b_med={b_med}, variant={variant})"
+                            );
+                            assert_eq!(
+                                fast_old, slow,
+                                "rollback bstatic differs (w={w}, b_med={b_med}, variant={variant})"
                             );
                         }
                         arms += 1;

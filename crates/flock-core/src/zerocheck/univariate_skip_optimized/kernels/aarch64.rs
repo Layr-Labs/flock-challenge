@@ -1632,6 +1632,14 @@ pub(crate) fn fast_shift_reduce_enabled() -> bool {
 }
 
 #[cfg(target_arch = "aarch64")]
+fn bstatic_weight_tables_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        std::env::var_os("FLOCK_NO_BSTATIC_WEIGHT_TABLES").is_none()
+    });
+    *ON
+}
+
+#[cfg(target_arch = "aarch64")]
 #[inline(never)]
 pub(crate) fn shift_reduce_inner_ab_fused_neon_h4(
     a_packed: &[u8],
@@ -1978,6 +1986,83 @@ fn shift_reduce_inner_a_only_const_b(
 
         store_row_64(out.as_mut_ptr(), nt_store, y0, y1, y2, y3);
     }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn gf8_mul_x_vec16(
+    a: core::arch::aarch64::uint8x16_t,
+) -> core::arch::aarch64::uint8x16_t {
+    use core::arch::aarch64::*;
+    unsafe {
+        let carry = vreinterpretq_u8_s8(vshrq_n_s8::<7>(vreinterpretq_s8_u8(a)));
+        veorq_u8(
+            vshlq_n_u8::<1>(a),
+            vandq_u8(carry, vdupq_n_u8(0x1b)),
+        )
+    }
+}
+
+/// Const-ones-B twin using the existing x^4-scaled inverse-NTT image. Pair
+/// K and K+4, then evaluate the remaining cubic in GF(2^8) with Horner.
+#[cfg(target_arch = "aarch64")]
+#[inline(never)]
+pub(crate) fn shift_reduce_inner_a_only_const_b_h4(
+    a_packed: &[u8],
+    inv_table: &InvNttTableByteSingleGf8,
+    byte_base_b: usize,
+    out: &mut [u8; 64],
+    nt_store: bool,
+) {
+    use core::arch::aarch64::*;
+
+    let plain = inv_table.data_ptr();
+    let plain_sw = inv_table.half_swapped_data_ptr();
+    let scaled = inv_table.scaled_x4_data_ptr();
+    let scaled_sw = inv_table.scaled_x4_half_swapped_data_ptr();
+    unsafe {
+        macro_rules! row {
+            ($table:expr, $table_sw:expr, $k:literal) => {{
+                let word = u64::from_le(core::ptr::read_unaligned(
+                    a_packed
+                        .as_ptr()
+                        .add(byte_base_b + $k * N_CHUNKS)
+                        .cast::<u64>(),
+                ));
+                apply_word_into_4_regs($table, $table_sw, word)
+            }};
+        }
+        macro_rules! absorb {
+            ($acc:ident, $lo:expr, $hi:expr) => {{
+                let lo = $lo;
+                let hi = $hi;
+                $acc.0 = xor3_u8(gf8_mul_x_vec16($acc.0), lo.0, hi.0);
+                $acc.1 = xor3_u8(gf8_mul_x_vec16($acc.1), lo.1, hi.1);
+                $acc.2 = xor3_u8(gf8_mul_x_vec16($acc.2), lo.2, hi.2);
+                $acc.3 = xor3_u8(gf8_mul_x_vec16($acc.3), lo.3, hi.3);
+            }};
+        }
+
+        let lo = row!(plain, plain_sw, 3);
+        let hi = row!(scaled, scaled_sw, 7);
+        let mut acc = (
+            veorq_u8(lo.0, hi.0),
+            veorq_u8(lo.1, hi.1),
+            veorq_u8(lo.2, hi.2),
+            veorq_u8(lo.3, hi.3),
+        );
+        absorb!(acc, row!(plain, plain_sw, 2), row!(scaled, scaled_sw, 6));
+        absorb!(acc, row!(plain, plain_sw, 1), row!(scaled, scaled_sw, 5));
+        absorb!(acc, row!(plain, plain_sw, 0), row!(scaled, scaled_sw, 4));
+        store_row_64(out.as_mut_ptr(), nt_store, acc.0, acc.1, acc.2, acc.3);
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+fn a_only_h4_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_A_ONLY_H4").is_none());
+    *ON
 }
 
 /// Single-live-K fast path: b rows K=1..7 are zero, so only K=0 contributes
@@ -2366,7 +2451,7 @@ pub(crate) const MUL_X2_HI: [u8; 16] = [
 #[cfg(target_arch = "aarch64")]
 #[inline(always)]
 #[allow(clippy::too_many_arguments)]
-unsafe fn accumulate_raw_one_k<const R: i32, const MUL_X2: bool>(
+unsafe fn accumulate_raw_one_k<const R: i32>(
     da0: core::arch::aarch64::uint8x16_t,
     da1: core::arch::aarch64::uint8x16_t,
     da2: core::arch::aarch64::uint8x16_t,
@@ -2375,6 +2460,7 @@ unsafe fn accumulate_raw_one_k<const R: i32, const MUL_X2: bool>(
     db1: core::arch::aarch64::uint8x16_t,
     db2: core::arch::aarch64::uint8x16_t,
     db3: core::arch::aarch64::uint8x16_t,
+    mul_x2: bool,
     acc0_lo: &mut core::arch::aarch64::uint16x8_t,
     acc0_hi: &mut core::arch::aarch64::uint16x8_t,
     acc1_lo: &mut core::arch::aarch64::uint16x8_t,
@@ -2386,7 +2472,7 @@ unsafe fn accumulate_raw_one_k<const R: i32, const MUL_X2: bool>(
 ) {
     use core::arch::aarch64::*;
     unsafe {
-        let (da0, da1, da2, da3) = if MUL_X2 {
+        let (da0, da1, da2, da3) = if mul_x2 {
             (
                 gf8_mul_x2_vec16(da0),
                 gf8_mul_x2_vec16(da1),
@@ -2412,13 +2498,14 @@ unsafe fn accumulate_raw_one_k<const R: i32, const MUL_X2: bool>(
 #[cfg(target_arch = "aarch64")]
 #[inline(always)]
 #[allow(clippy::too_many_arguments)]
-unsafe fn fused_apply_one_k_fast<const R: i32, const MUL_X2: bool>(
+unsafe fn fused_apply_one_k_fast<const R: i32>(
     a_table: *const u8,
     a_table_sw: *const u8,
     b_table: *const u8,
     b_table_sw: *const u8,
     a_row: *const u8,
     b_row: *const u8,
+    mul_x2: bool,
     acc0_lo: &mut core::arch::aarch64::uint16x8_t,
     acc0_hi: &mut core::arch::aarch64::uint16x8_t,
     acc1_lo: &mut core::arch::aarch64::uint16x8_t,
@@ -2433,9 +2520,9 @@ unsafe fn fused_apply_one_k_fast<const R: i32, const MUL_X2: bool>(
         let b_word = u64::from_le(core::ptr::read_unaligned(b_row.cast::<u64>()));
         let (da0, da1, da2, da3) = apply_word_into_4_regs(a_table, a_table_sw, a_word);
         let (db0, db1, db2, db3) = apply_word_into_4_regs(b_table, b_table_sw, b_word);
-        accumulate_raw_one_k::<R, MUL_X2>(
-            da0, da1, da2, da3, db0, db1, db2, db3, acc0_lo, acc0_hi, acc1_lo, acc1_hi, acc2_lo,
-            acc2_hi, acc3_lo, acc3_hi,
+        accumulate_raw_one_k::<R>(
+            da0, da1, da2, da3, db0, db1, db2, db3, mul_x2, acc0_lo, acc0_hi, acc1_lo, acc1_hi,
+            acc2_lo, acc2_hi, acc3_lo, acc3_hi,
         );
     }
 }
@@ -2444,7 +2531,7 @@ unsafe fn fused_apply_one_k_fast<const R: i32, const MUL_X2: bool>(
 #[cfg(target_arch = "aarch64")]
 #[inline(always)]
 #[allow(clippy::too_many_arguments)]
-unsafe fn fused_apply_one_k_with_b_fast<const R: i32, const MUL_X2: bool>(
+unsafe fn fused_apply_one_k_with_b_fast<const R: i32>(
     a_table: *const u8,
     a_table_sw: *const u8,
     a_row: *const u8,
@@ -2452,6 +2539,7 @@ unsafe fn fused_apply_one_k_with_b_fast<const R: i32, const MUL_X2: bool>(
     db1: core::arch::aarch64::uint8x16_t,
     db2: core::arch::aarch64::uint8x16_t,
     db3: core::arch::aarch64::uint8x16_t,
+    mul_x2: bool,
     acc0_lo: &mut core::arch::aarch64::uint16x8_t,
     acc0_hi: &mut core::arch::aarch64::uint16x8_t,
     acc1_lo: &mut core::arch::aarch64::uint16x8_t,
@@ -2464,9 +2552,9 @@ unsafe fn fused_apply_one_k_with_b_fast<const R: i32, const MUL_X2: bool>(
     unsafe {
         let a_word = u64::from_le(core::ptr::read_unaligned(a_row.cast::<u64>()));
         let (da0, da1, da2, da3) = apply_word_into_4_regs(a_table, a_table_sw, a_word);
-        accumulate_raw_one_k::<R, MUL_X2>(
-            da0, da1, da2, da3, db0, db1, db2, db3, acc0_lo, acc0_hi, acc1_lo, acc1_hi, acc2_lo,
-            acc2_hi, acc3_lo, acc3_hi,
+        accumulate_raw_one_k::<R>(
+            da0, da1, da2, da3, db0, db1, db2, db3, mul_x2, acc0_lo, acc0_hi, acc1_lo, acc1_hi,
+            acc2_lo, acc2_hi, acc3_lo, acc3_hi,
         );
     }
 }
@@ -2563,7 +2651,23 @@ pub(crate) fn shift_reduce_inner_ab_fused_neon_checked(
     if check_all_ones {
         let and_all = bw(0) & bw(1) & bw(2) & bw(3) & bw(4) & bw(5) & bw(6) & bw(7);
         if and_all == u64::MAX {
-            shift_reduce_inner_a_only_const_b(a_packed, inv_table, byte_base_b, out, nt_store);
+            if a_only_h4_enabled() {
+                shift_reduce_inner_a_only_const_b_h4(
+                    a_packed,
+                    inv_table,
+                    byte_base_b,
+                    out,
+                    nt_store,
+                );
+            } else {
+                shift_reduce_inner_a_only_const_b(
+                    a_packed,
+                    inv_table,
+                    byte_base_b,
+                    out,
+                    nt_store,
+                );
+            }
             return;
         }
     }
@@ -2635,19 +2739,33 @@ pub(crate) fn shift_reduce_inner_ab_fused_neon_checked(
         // branch inside one.
         let handled = enabled
             && if fast_shift_reduce_enabled() {
-                shift_reduce_inner_ab_bstatic::<true>(
-                    a_packed,
-                    b_packed,
-                    inv_table,
-                    chunk_byte_base,
-                    b_med,
-                    bstatic_w,
-                    context,
-                    out,
-                    nt_store,
-                )
+                if bstatic_weight_tables_enabled() {
+                    shift_reduce_inner_ab_bstatic::<true, true>(
+                        a_packed,
+                        b_packed,
+                        inv_table,
+                        chunk_byte_base,
+                        b_med,
+                        bstatic_w,
+                        context,
+                        out,
+                        nt_store,
+                    )
+                } else {
+                    shift_reduce_inner_ab_bstatic::<true, false>(
+                        a_packed,
+                        b_packed,
+                        inv_table,
+                        chunk_byte_base,
+                        b_med,
+                        bstatic_w,
+                        context,
+                        out,
+                        nt_store,
+                    )
+                }
             } else {
-                shift_reduce_inner_ab_bstatic::<false>(
+                shift_reduce_inner_ab_bstatic::<false, false>(
                     a_packed,
                     b_packed,
                     inv_table,

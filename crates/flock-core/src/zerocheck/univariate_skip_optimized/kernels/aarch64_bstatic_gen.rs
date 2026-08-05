@@ -348,7 +348,7 @@ static BSTATIC_ARM_LIVE: [bool; 31] = [true, true, true, true, true, true, true,
 /// which case the caller must run the generic kernel.
 #[cfg(target_arch = "aarch64")]
 #[allow(clippy::too_many_lines)]
-pub(crate) fn shift_reduce_inner_ab_bstatic<const FAST: bool>(
+pub(crate) fn shift_reduce_inner_ab_bstatic<const FAST: bool, const WEIGHT_TABLES: bool>(
     a_packed: &[u8],
     b_packed: &[u8],
     inv_table: &InvNttTableByteSingleGf8,
@@ -380,6 +380,10 @@ pub(crate) fn shift_reduce_inner_ab_bstatic<const FAST: bool>(
     // `x^4` part of the `x^K` weight costs no instructions.
     let scaled_base = inv_table.scaled_x4_data_ptr();
     let scaled_half_swapped_base = inv_table.scaled_x4_half_swapped_data_ptr();
+    let scaled_x2_base = inv_table.scaled_x2_data_ptr();
+    let scaled_x2_half_swapped_base = inv_table.scaled_x2_half_swapped_data_ptr();
+    let scaled_x6_base = inv_table.scaled_x6_data_ptr();
+    let scaled_x6_half_swapped_base = inv_table.scaled_x6_half_swapped_data_ptr();
     unsafe {
         let mut acc0_lo = vdupq_n_u16(0);
         let mut acc0_hi = vdupq_n_u16(0);
@@ -393,9 +397,21 @@ pub(crate) fn shift_reduce_inner_ab_bstatic<const FAST: bool>(
             ($k:literal) => {{
                 let off = byte_base_b + $k * N_CHUNKS;
                 if FAST {
-                    fused_apply_one_k_fast::<{ $k & 1 }, { $k & 2 != 0 }>(
-                        if $k & 4 != 0 { scaled_base } else { table_base },
-                        if $k & 4 != 0 {
+                    fused_apply_one_k_fast::<{ $k & 1 }>(
+                        if WEIGHT_TABLES && $k & 6 == 6 {
+                            scaled_x6_base
+                        } else if WEIGHT_TABLES && $k & 2 != 0 {
+                            scaled_x2_base
+                        } else if $k & 4 != 0 {
+                            scaled_base
+                        } else {
+                            table_base
+                        },
+                        if WEIGHT_TABLES && $k & 6 == 6 {
+                            scaled_x6_half_swapped_base
+                        } else if WEIGHT_TABLES && $k & 2 != 0 {
+                            scaled_x2_half_swapped_base
+                        } else if $k & 4 != 0 {
                             scaled_half_swapped_base
                         } else {
                             half_swapped_table_base
@@ -404,6 +420,7 @@ pub(crate) fn shift_reduce_inner_ab_bstatic<const FAST: bool>(
                         half_swapped_table_base,
                         a_packed.as_ptr().add(off),
                         b_packed.as_ptr().add(off),
+                        !WEIGHT_TABLES && $k & 2 != 0,
                         &mut acc0_lo,
                         &mut acc0_hi,
                         &mut acc1_lo,
@@ -471,9 +488,21 @@ pub(crate) fn shift_reduce_inner_ab_bstatic<const FAST: bool>(
                         );
                     )*
                     if FAST {
-                        fused_apply_one_k_with_b_fast::<{ $k & 1 }, { $k & 2 != 0 }>(
-                            if $k & 4 != 0 { scaled_base } else { table_base },
-                            if $k & 4 != 0 {
+                        fused_apply_one_k_with_b_fast::<{ $k & 1 }>(
+                            if WEIGHT_TABLES && $k & 6 == 6 {
+                                scaled_x6_base
+                            } else if WEIGHT_TABLES && $k & 2 != 0 {
+                                scaled_x2_base
+                            } else if $k & 4 != 0 {
+                                scaled_base
+                            } else {
+                                table_base
+                            },
+                            if WEIGHT_TABLES && $k & 6 == 6 {
+                                scaled_x6_half_swapped_base
+                            } else if WEIGHT_TABLES && $k & 2 != 0 {
+                                scaled_x2_half_swapped_base
+                            } else if $k & 4 != 0 {
                                 scaled_half_swapped_base
                             } else {
                                 half_swapped_table_base
@@ -483,6 +512,7 @@ pub(crate) fn shift_reduce_inner_ab_bstatic<const FAST: bool>(
                             db1,
                             db2,
                             db3,
+                            !WEIGHT_TABLES && $k & 2 != 0,
                             &mut acc0_lo,
                             &mut acc0_hi,
                             &mut acc1_lo,

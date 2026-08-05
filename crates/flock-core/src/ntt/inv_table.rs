@@ -61,12 +61,10 @@ impl InvNttTableByteSingleGf8 {
         // Keep that permutation as a second AArch64 image so the URM leaf can
         // load it directly instead of executing an EXT for every vector.
         //
-        // Images 2/3 are the same pair pre-multiplied by the field constant
-        // x^4. `T` is GF(2)-linear in the packed row, so `x^4 · T(w)` is just
-        // `T` applied out of the scaled image — that lets the zerocheck
-        // shift-reduce kernel fold half of its `x^K` weights into the table
-        // lookup instead of paying for them with vector instructions.
-        let table_images = if cfg!(target_arch = "aarch64") { 4 } else { 1 };
+        // Images 2..7 are the same pair pre-multiplied by x^4, x^2 and x^6.
+        // `T` is GF(2)-linear in the packed row, so the zerocheck static-B
+        // kernel can fold every even part of x^K into its A-side table lookup.
+        let table_images = if cfg!(target_arch = "aarch64") { 8 } else { 1 };
         let mut data = vec![F8::ZERO; table_images * table_len + TABLE_ALIGNMENT - 1];
         let data_offset = (TABLE_ALIGNMENT - (data.as_ptr() as usize & (TABLE_ALIGNMENT - 1)))
             & (TABLE_ALIGNMENT - 1);
@@ -114,6 +112,19 @@ impl InvNttTableByteSingleGf8 {
             for (source, target) in original.chunks_exact(16).zip(swapped.chunks_exact_mut(16)) {
                 target[..8].copy_from_slice(&source[8..]);
                 target[8..].copy_from_slice(&source[..8]);
+            }
+        }
+
+        // Images 4..7: x^2 and x^6 scaled copies of the plain/swapped pair.
+        #[cfg(target_arch = "aarch64")]
+        {
+            let extra_start = data_offset + 4 * table_len;
+            let (base_storage, extra_storage) = data.split_at_mut(extra_start);
+            let source = &base_storage[data_offset..data_offset + 2 * table_len];
+            let (x2, x6) = extra_storage.split_at_mut(2 * table_len);
+            for ((src, dst2), dst6) in source.iter().zip(x2.iter_mut()).zip(x6.iter_mut()) {
+                *dst2 = *src * F8(1u8 << 2);
+                *dst6 = *src * F8(1u8 << 6);
             }
         }
 
@@ -199,6 +210,48 @@ impl InvNttTableByteSingleGf8 {
             self.data
                 .as_ptr()
                 .add(self.data_offset + 3 * 256 * self.ell) as *const u8
+        }
+    }
+
+    /// AArch64-only x^2-scaled table image and its half-swapped twin.
+    #[cfg(target_arch = "aarch64")]
+    #[inline]
+    pub fn scaled_x2_data_ptr(&self) -> *const u8 {
+        unsafe {
+            self.data
+                .as_ptr()
+                .add(self.data_offset + 4 * 256 * self.ell) as *const u8
+        }
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[inline]
+    pub fn scaled_x2_half_swapped_data_ptr(&self) -> *const u8 {
+        unsafe {
+            self.data
+                .as_ptr()
+                .add(self.data_offset + 5 * 256 * self.ell) as *const u8
+        }
+    }
+
+    /// AArch64-only x^6-scaled table image and its half-swapped twin.
+    #[cfg(target_arch = "aarch64")]
+    #[inline]
+    pub fn scaled_x6_data_ptr(&self) -> *const u8 {
+        unsafe {
+            self.data
+                .as_ptr()
+                .add(self.data_offset + 6 * 256 * self.ell) as *const u8
+        }
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[inline]
+    pub fn scaled_x6_half_swapped_data_ptr(&self) -> *const u8 {
+        unsafe {
+            self.data
+                .as_ptr()
+                .add(self.data_offset + 7 * 256 * self.ell) as *const u8
         }
     }
 
