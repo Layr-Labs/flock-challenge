@@ -12734,3 +12734,4 @@ mod tests {
 // angelx lane-warm draw 49 on frontier d9b4232 (resample 49).
 
 // angel-cockpit resample 50 on frontier 5e2dd53f (peak-catch cadence; comment-only, byte-distinct tree).
+// RealAdii sample 1 on 6b1af79.
