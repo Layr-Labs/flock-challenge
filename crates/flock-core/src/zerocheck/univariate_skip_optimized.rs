@@ -563,7 +563,7 @@ pub struct Round1AbInner {
 
 impl Round1AbInner {
     #[inline]
-    fn as_bytes(&self) -> &[u8] {
+    pub(crate) fn as_bytes(&self) -> &[u8] {
         unsafe {
             core::slice::from_raw_parts(
                 self.storage.as_ptr() as *const u8,
@@ -1491,8 +1491,35 @@ pub(crate) fn round1_shift_reduce_ab_packed_padded_with_precomputed(
     let ab_inner_bytes = ab_inner.as_bytes();
 
     let mut partials = vec![[F128::ZERO; ELL]; hi_size];
+    // Round-one AB URM GPU arm (see `ENV_NO_GPU_ZC_URM`): a measured prefix
+    // of the hi-chunks' per-chunk partials is computed on the otherwise-idle
+    // GPU (nibble-MFR + emulated-clmul census like the round-two arm). There
+    // are no stores to preserve, so the CPU skips the prefix chunks entirely
+    // and the GPU partials replace their zeroed slots after the join; the
+    // XOR reduce below is order-independent, so the output is bit-identical
+    // to the all-CPU sweep. `None` = the exact incumbent path.
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    let gpu_job = crate::gpu_commit::launch_zc_urm_products(
+        ab_inner_bytes,
+        &eq_lo_scaled,
+        &eq.hi,
+        convert,
+        within_outer_mask,
+        &b_med_counts,
+        big_lo_size,
+        hi_size,
+        n_lo_and_inner,
+    );
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    let gpu_prefix = gpu_job.as_ref().map_or(0, |j| j.cpu_split());
+    #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+    let gpu_prefix = 0usize;
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    let t_cpu_sweep = std::time::Instant::now();
+
     let partials_base = crate::epool::SyncPtr(partials.as_mut_ptr());
-    crate::epool::run_hetero_chunks(hi_size, |x_hi| {
+    crate::epool::run_hetero_chunks(hi_size - gpu_prefix, |i| {
+        let x_hi = i + gpu_prefix;
         let mut partial = [F128::ZERO; ELL];
         process_one_x_hi_with_precomputed_ab_fold4_ab(
             x_hi,
@@ -1511,6 +1538,41 @@ pub(crate) fn round1_shift_reduce_ab_packed_padded_with_precomputed(
         // synchronous queue join publishes all writes before reduction.
         unsafe { *partials_base.ptr().add(x_hi) = partial };
     });
+
+    // Merge the GPU prefix after the CPU sweep join. Calibration discards
+    // the GPU values after the equality oracle; `Failed` CPU-redoes the
+    // prefix (the arm is poisoned for the process either way).
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    if let Some(job) = gpu_job {
+        let gpu_chunks = job.chunks;
+        let cpu_wall_ms = t_cpu_sweep.elapsed().as_secs_f64() * 1e3;
+        match crate::gpu_commit::zc_urm_wait(job, Some(&partials), cpu_wall_ms, hi_size) {
+            crate::gpu_commit::ZcURMResult::Calibrated => {}
+            crate::gpu_commit::ZcURMResult::Prefix(vals) => {
+                partials[..vals.len()].copy_from_slice(&vals);
+            }
+            crate::gpu_commit::ZcURMResult::Failed => {
+                crate::epool::run_hetero_chunks(gpu_chunks, |x_hi| {
+                    let mut partial = [F128::ZERO; ELL];
+                    process_one_x_hi_with_precomputed_ab_fold4_ab(
+                        x_hi,
+                        big_lo_size,
+                        n_lo_and_inner,
+                        within_outer_mask,
+                        &b_med_counts,
+                        ab_inner_bytes,
+                        &eq_lo_scaled,
+                        eq.hi[x_hi],
+                        convert,
+                        None,
+                        &mut partial,
+                    );
+                    // SAFETY: exclusive per-chunk ownership, as above.
+                    unsafe { *partials_base.ptr().add(x_hi) = partial };
+                });
+            }
+        }
+    }
 
     partials
         .into_iter()
