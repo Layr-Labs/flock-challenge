@@ -12675,3 +12675,7 @@ mod tests {
 // RealAdii fresh-tree pull 1 on cc1d811.
 // RealAdii frontier pull 2 on cc1d811.
 // RealAdii frontier pull 3 on cc1d811.
+
+// angel-cockpit frontier resample on 6875d9e (board 1,682,978.10; RealAdii's
+// +0.02% promotion was itself a comment-only tree — noise lottery won).
+// No code delta: comment-only; fresh independent noise draw.
