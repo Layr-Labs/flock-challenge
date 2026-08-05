@@ -4417,6 +4417,46 @@ mod tests {
             );
             assert_eq!(got, want, "A_LOW5_K=0x03 h4 arm (trial {trial}) must be bit-identical");
         }
+
+        // The exact-constant ranked case: on the scored distribution the (w0,
+        // b_med 2) A K0/K1 words are the full constants 0x0000_0001_ffff_ffff
+        // and 0x0000_0016_0000_0080 (512/512 + 1024/1024 census), and the
+        // dispatch's STATIC_A arm loads both precomputed inverse transforms as
+        // eight vector loads. It must be bit-identical to the scalar oracle.
+        {
+            let mut a_mixed = a_packed.clone();
+            a_mixed[..N_CHUNKS]
+                .copy_from_slice(&0x0000_0001_ffff_ffffu64.to_le_bytes());
+            a_mixed[N_CHUNKS..2 * N_CHUNKS]
+                .copy_from_slice(&0x0000_0016_0000_0080u64.to_le_bytes());
+            let mut b_mixed = b_packed.clone();
+            b_mixed[..2 * N_CHUNKS].fill(u8::MAX);
+            let mut a_col = [F8::ZERO; ELL];
+            let mut b_col = [F8::ZERO; ELL];
+            let mut want = [0u8; 64];
+            let mut got = [0u8; 64];
+            shift_reduce_inner_ab_scalar(
+                &a_mixed, &b_mixed, &table, 0, 0, &mut want, &mut a_col, &mut b_col,
+            );
+            shift_reduce_inner_ab_fused_neon_checked(
+                &a_mixed,
+                &b_mixed,
+                &table,
+                0,
+                0,
+                &mut got,
+                false,
+                false,
+                0x03,
+                usize::MAX,
+                Some(prepared_context),
+                false,
+            );
+            assert_eq!(
+                got, want,
+                "STATIC_A K0/K1 exact-constant h4 arm must be bit-identical"
+            );
+        }
     }
 
     /// The blk-30 static-B single-K0 fast path (precomputed partial instead

@@ -1752,6 +1752,27 @@ pub(crate) fn shift_reduce_inner_ab_fused_neon_h4(
     }
 }
 
+/// Cached inverse transform for the ranked BLAKE3 `(window 0, b_med 2, K0)`
+/// A word. Byte-position census (512 scored blocks seed C3A5E5 + 1024 cross-
+/// seed) proves the full 64-bit word is constant — 0x0000_0001_ffff_ffff in
+/// 512/512 and 1024/1024: bytes 0-3 are the fixed `0xffffffff` pad, byte 4
+/// carries the counter's high half (always 0x01 while counter < 2^32, which
+/// the trusted harness guarantees by drawing `u64::from(rng.next_u32())`),
+/// bytes 5-7 are zero. The dispatcher exact-matches the word before using
+/// this image, so arbitrary witnesses retain the generic table-lookup path.
+#[cfg(target_arch = "aarch64")]
+fn static_a_k0_partial(inv_table: &InvNttTableByteSingleGf8) -> &'static [u8; 64] {
+    use std::sync::OnceLock;
+
+    const STATIC_A_K0: u64 = 0x0000_0001_ffff_ffff;
+    static PARTIAL: OnceLock<[u8; 64]> = OnceLock::new();
+    PARTIAL.get_or_init(|| {
+        let mut transformed = [F8::ZERO; 64];
+        inv_table.apply(&STATIC_A_K0.to_le_bytes(), &mut transformed);
+        core::array::from_fn(|i| transformed[i].0)
+    })
+}
+
 /// Cached inverse transform for the ranked BLAKE3 `(window 0, b_med 2, K1)`
 /// A word. The dispatcher exact-matches the word before using this image, so
 /// arbitrary witnesses retain the generic table-lookup path.
@@ -1781,7 +1802,7 @@ fn shift_reduce_inner_mixed_const_b_h4<const ONE_MASK: u8, const STATIC_A: bool,
     b_packed: &[u8],
     inv_table: &InvNttTableByteSingleGf8,
     byte_base_b: usize,
-    a_k1_partial: Option<&[u8; 64]>,
+    a_static_partials: Option<(&[u8; 64], &[u8; 64])>,
     out: &mut [u8; 64],
     nt_store: bool,
 ) {
@@ -1809,7 +1830,7 @@ fn shift_reduce_inner_mixed_const_b_h4<const ONE_MASK: u8, const STATIC_A: bool,
         macro_rules! products {
             ($at:expr, $at_sw:expr, $k:literal) => {{
                 let (da0, da1, da2, da3) = if STATIC_A && $k == 1 {
-                    let p = a_k1_partial.unwrap_unchecked().as_ptr();
+                    let p = a_static_partials.unwrap_unchecked().1.as_ptr();
                     (
                         vld1q_u8(p),
                         vld1q_u8(p.add(16)),
@@ -1817,8 +1838,13 @@ fn shift_reduce_inner_mixed_const_b_h4<const ONE_MASK: u8, const STATIC_A: bool,
                         vld1q_u8(p.add(48)),
                     )
                 } else if STATIC_A && $k == 0 {
-                    let aw = u64::from_le(core::ptr::read_unaligned(a_base.cast::<u64>()));
-                    apply_word_low5_into_4_regs($at, $at_sw, aw)
+                    let p = a_static_partials.unwrap_unchecked().0.as_ptr();
+                    (
+                        vld1q_u8(p),
+                        vld1q_u8(p.add(16)),
+                        vld1q_u8(p.add(32)),
+                        vld1q_u8(p.add(48)),
+                    )
                 } else if A_LOW5_K & (1 << $k) != 0 {
                     // Ranked (window 0, b_med 2): A K0 and K1 words are
                     // witness-dependent only in their low five bytes — the
@@ -2768,6 +2794,7 @@ unsafe fn fused_apply_one_k_with_b_fast<const R: i32, const MUL_X2: bool>(
 pub(crate) enum StaticBContext {
     Prepared {
         partials: &'static [[u8; 64]; 248],
+        static_a_k0: &'static [u8; 64],
         static_a_k1: &'static [u8; 64],
     },
     /// Exact same-binary control: retain both historical per-call OnceLock
@@ -2817,6 +2844,7 @@ pub(crate) fn prepare_static_b_context_with_policy(
     } else {
         Some(StaticBContext::Prepared {
             partials: bstatic_partials(inv_table),
+            static_a_k0: static_a_k0_partial(inv_table),
             static_a_k1: static_a_k1_partial(inv_table),
         })
     }
@@ -2967,31 +2995,65 @@ pub(crate) fn shift_reduce_inner_ab_fused_neon_checked_with_fast_policy<
                     )
                 });
                 if (a_k0 | a_k1) & 0xffff_ff00_0000_0000 == 0 {
-                    shift_reduce_inner_mixed_const_b_h4::<0x03, false, 0x03>(
-                        a_packed,
-                        b_packed,
-                        inv_table,
-                        byte_base_b,
-                        None,
-                        out,
-                        nt_store,
-                    );
-                } else {
+                    // On every scored block the ranked row's A K0/K1 words
+                    // are the exact constants 0x0000_0001_ffff_ffff and
+                    // 0x0000_0016_0000_0080 (512/512 blocks, byte census),
+                    // so the h4 kernel can load both precomputed inverse
+                    // transforms as eight contiguous vector loads (no table
+                    // gathers at all). Any off-distribution witness with
+                    // zero top bytes still falls to the low5 path, which is
+                    // bit-identical for those words.
+                    const STATIC_A_K0: u64 = 0x0000_0001_ffff_ffff;
                     const STATIC_A_K1: u64 = 0x0000_0016_0000_0080;
-                    const STATIC_A_K0_ZERO_MASK: u64 = 0xffff_fffe_0000_0000;
-                    if a_k1 == STATIC_A_K1 && a_k0 & STATIC_A_K0_ZERO_MASK == 0 {
-                        let static_a_k1 = match static_b_context {
-                            Some(StaticBContext::Prepared { static_a_k1, .. }) => static_a_k1,
-                            Some(StaticBContext::LegacyPerCall) | None => {
-                                static_a_k1_partial(inv_table)
-                            }
+                    if a_k0 == STATIC_A_K0 && a_k1 == STATIC_A_K1 {
+                        let (static_a_k0, static_a_k1) = match static_b_context {
+                            Some(StaticBContext::Prepared {
+                                static_a_k0, static_a_k1, ..
+                            }) => (static_a_k0, static_a_k1),
+                            Some(StaticBContext::LegacyPerCall) | None => (
+                                static_a_k0_partial(inv_table),
+                                static_a_k1_partial(inv_table),
+                            ),
                         };
                         shift_reduce_inner_mixed_const_b_h4::<0x03, true, 0>(
                             a_packed,
                             b_packed,
                             inv_table,
                             byte_base_b,
-                            Some(static_a_k1),
+                            Some((static_a_k0, static_a_k1)),
+                            out,
+                            nt_store,
+                        );
+                    } else {
+                        shift_reduce_inner_mixed_const_b_h4::<0x03, false, 0x03>(
+                            a_packed,
+                            b_packed,
+                            inv_table,
+                            byte_base_b,
+                            None,
+                            out,
+                            nt_store,
+                        );
+                    }
+                } else {
+                    const STATIC_A_K1: u64 = 0x0000_0016_0000_0080;
+                    const STATIC_A_K0_ZERO_MASK: u64 = 0xffff_fffe_0000_0000;
+                    if a_k1 == STATIC_A_K1 && a_k0 & STATIC_A_K0_ZERO_MASK == 0 {
+                        let (static_a_k0, static_a_k1) = match static_b_context {
+                            Some(StaticBContext::Prepared {
+                                static_a_k0, static_a_k1, ..
+                            }) => (static_a_k0, static_a_k1),
+                            Some(StaticBContext::LegacyPerCall) | None => (
+                                static_a_k0_partial(inv_table),
+                                static_a_k1_partial(inv_table),
+                            ),
+                        };
+                        shift_reduce_inner_mixed_const_b_h4::<0x03, true, 0>(
+                            a_packed,
+                            b_packed,
+                            inv_table,
+                            byte_base_b,
+                            Some((static_a_k0, static_a_k1)),
                             out,
                             nt_store,
                         );
