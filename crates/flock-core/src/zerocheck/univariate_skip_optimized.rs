@@ -3883,6 +3883,35 @@ mod tests {
 
     #[cfg(target_arch = "aarch64")]
     #[test]
+    fn const_one_h4_matches_scalar() {
+        let table = make_inv_table();
+        let mut rng = Rng::new(0xC057_0A11_0000_0004);
+        let mut a_col = [F8::ZERO; ELL];
+        let mut b_col = [F8::ZERO; ELL];
+        for trial in 0..128 {
+            let a: Vec<u8> = (0..64).map(|_| rng.next_u64() as u8).collect();
+            let b = [u8::MAX; 64];
+            let mut want = [0u8; 64];
+            shift_reduce_inner_ab_scalar(
+                &a,
+                &b,
+                &table,
+                0,
+                0,
+                &mut want,
+                &mut a_col,
+                &mut b_col,
+            );
+            let mut got = [0u8; 64];
+            kernels::aarch64::shift_reduce_inner_a_only_const_b_h4(
+                &a, &table, 0, &mut got, false,
+            );
+            assert_eq!(got, want, "const-one H4 mismatch on trial {trial}");
+        }
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
     fn static_b_context_gate_respects_layout_and_legacy_policy() {
         let table = make_inv_table();
         assert!(
@@ -3909,6 +3938,16 @@ mod tests {
             ),
             "the checked static-B plan should be prepared for its exact layout"
         );
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn mixed_const_bstatic_targets_only_profitable_blocks() {
+        let selected = kernels::aarch64::mixed_const_bstatic_position;
+        assert!(selected(0, 2));
+        assert!(selected(1, 13));
+        assert!(!selected(0, 3));
+        assert!(!selected(1, 12));
     }
 
     #[cfg(target_arch = "aarch64")]

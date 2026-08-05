@@ -10053,10 +10053,10 @@ kernel void zc_r2_products(
     /// Anchors-only CPU work is measured locally at ~0.55x of the fused
     /// chunk (two of four folds, no products); the share solves
     /// `(hi - (1-ALPHA) g) c_f = g u_g` — balanced, no CPU-ward bias — and
-    /// caps at `15·hi/16` as the overshoot guard (an optimistic warmup ratio
+    /// caps at `31·hi/32` as the overshoot guard (an optimistic warmup ratio
     /// must not make the GPU the timed straggler; at this cap the GPU only
-    /// straggles once the true timed ratio exceeds `(1-0.45·15/16)/(15/16)` ≈
-    /// 0.617, still above the ~0.57 measured on the ranked M3 Max).
+    /// straggles once the true timed ratio exceeds `(1-0.45·31/32)/(31/32)` ≈
+    /// 0.582, still above the ~0.57 measured on the ranked M3 Max).
     /// History of this clamp: `hi/2` always bound (promoted fix → 3·hi/4,
     /// +5.19%), and at every observed ratio (0.33–0.83 across hosts) the
     /// 3·hi/4 cap was *still* what bound the share — the balance point
@@ -10075,7 +10075,8 @@ kernel void zc_r2_products(
     /// while keeping the straggle threshold (0.617) above the ranked ratio.
     /// Deliberately *not* uncapped: at `hi` the threshold falls to
     /// `1-0.45 = 0.55`, which is **below** the 0.57 measured on the ranked
-    /// M3 Max, so full offload would make the GPU the straggler.
+    /// M3 Max, so full offload would make the GPU the straggler. Set
+    /// `FLOCK_ZC_R2_LEGACY_CAP=1` to restore the 15/16 split.
     ///
     /// Ratios in `(2, 8)`: the probe's equality oracle has already proven
     /// the kernel exact on this machine, so a slow-looking GPU gets a floor
@@ -10089,6 +10090,14 @@ kernel void zc_r2_products(
     const ZC_R2_MAX_RATIO: f64 = 2.0;
     const ZC_R2_FLOOR_MAX_RATIO: f64 = 8.0;
 
+    pub(crate) fn zc_r2_cap(hi_size: usize) -> usize {
+        if std::env::var_os("FLOCK_ZC_R2_LEGACY_CAP").is_some() {
+            hi_size * 15 / 16
+        } else {
+            hi_size * 31 / 32
+        }
+    }
+
     pub(crate) fn zc_r2_gate_share(ratio: f64, hi_size: usize) -> usize {
         if !ratio.is_finite() || ratio <= 0.0 {
             return 0;
@@ -10100,7 +10109,7 @@ kernel void zc_r2_products(
             return 0;
         }
         let g = (hi_size as f64 / (ratio + (1.0 - ZC_R2_ALPHA))).round();
-        (g as usize).min(hi_size * 15 / 16)
+        (g as usize).min(zc_r2_cap(hi_size))
     }
 
     fn zc_r2_init(gpu: &'static Gpu) -> Result<ZcR2, String> {
@@ -10523,7 +10532,7 @@ kernel void zc_r2_products(
             // 1/8 probe that shipped there.
             (hi_size / 16).clamp(8, 128)
         } else {
-            tuned.min(hi_size * 15 / 16)
+            tuned.min(zc_r2_cap(hi_size))
         };
         if chunks == 0 {
             return None;
@@ -13965,14 +13974,15 @@ DEF_PROBE(probe_g4_t8_p0,    8u,  0u,   tsel & 7u)
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     #[test]
     fn zc_r2_gate_share_policy() {
-        use imp::zc_r2_gate_share;
+        use imp::{zc_r2_cap, zc_r2_gate_share};
         // Balance point hi/(ratio+0.45); ranked-observed ratios land above
-        // the 15·hi/16 cap, which is the binding overshoot guard.
-        assert_eq!(zc_r2_gate_share(0.57, 2048), 1920);
-        assert_eq!(zc_r2_gate_share(0.38, 2048), 1920);
-        // The guard still binds before the GPU can straggle: at 15/16 the
-        // crossover is (1-0.45·15/16)/(15/16) ≈ 0.617, above the ranked 0.57.
-        assert!(zc_r2_gate_share(0.62, 2048) < 2048);
+        // the 31·hi/32 cap, which is the binding overshoot guard.
+        assert_eq!(zc_r2_gate_share(0.57, 2048), 1984);
+        assert_eq!(zc_r2_gate_share(0.38, 2048), 1984);
+        assert_eq!(zc_r2_cap(2048), 1984);
+        // The guard still binds before the GPU can straggle: at 31/32 the
+        // crossover is about 0.582, above the ranked 0.57.
+        assert!(zc_r2_gate_share(0.59, 2048) < 1984);
         // Slow-but-usable GPU: the formula takes over below the cap.
         assert_eq!(zc_r2_gate_share(1.0, 2048), 1412); // 2048/1.45
         assert_eq!(zc_r2_gate_share(2.0, 2048), 836); // 2048/2.45
