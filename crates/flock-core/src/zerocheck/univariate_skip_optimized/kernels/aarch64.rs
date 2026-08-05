@@ -1776,7 +1776,7 @@ fn static_a_k1_partial(inv_table: &InvNttTableByteSingleGf8) -> &'static [u8; 64
 /// the three statically-zero high bytes of K0.
 #[cfg(target_arch = "aarch64")]
 #[inline(never)]
-fn shift_reduce_inner_mixed_const_b_h4<const ONE_MASK: u8, const STATIC_A: bool>(
+fn shift_reduce_inner_mixed_const_b_h4<const ONE_MASK: u8, const STATIC_A: bool, const A_K1_LOW7: bool>(
     a_packed: &[u8],
     b_packed: &[u8],
     inv_table: &InvNttTableByteSingleGf8,
@@ -1819,6 +1819,18 @@ fn shift_reduce_inner_mixed_const_b_h4<const ONE_MASK: u8, const STATIC_A: bool>
                 } else if STATIC_A && $k == 0 {
                     let aw = u64::from_le(core::ptr::read_unaligned(a_base.cast::<u64>()));
                     apply_word_low5_into_4_regs($at, $at_sw, aw)
+                } else if A_K1_LOW7 && $k == 1 {
+                    // Ranked (window 0, b_med 2) K1 A word: witness-dependent in
+                    // its low 56 bits but its top byte is structurally zero
+                    // (512/512 measured on the scored distribution — the word
+                    // packs a small counter with the fixed BLAKE3 block_len
+                    // 0x80). Skipping byte 7's four table loads and XORs is
+                    // bit-identical because table row 0 is the zero vector;
+                    // the caller's guard keeps the path witness-safe.
+                    let aw = u64::from_le(core::ptr::read_unaligned(
+                        a_base.add(N_CHUNKS).cast::<u64>(),
+                    ));
+                    apply_word_low7_into_4_regs($at, $at_sw, aw)
                 } else {
                     let aw = u64::from_le(core::ptr::read_unaligned(
                         a_base.add($k * N_CHUNKS).cast::<u64>(),
@@ -2934,34 +2946,21 @@ pub(crate) fn shift_reduce_inner_ab_fused_neon_checked_with_fast_policy<
         0 => {}
         0x03 if bw(0) & bw(1) == u64::MAX => {
             if fast_shift_reduce_with_policy::<FAST_POLICY>() {
-                const STATIC_A_K1: u64 = 0x0000_0016_0000_0080;
-                const STATIC_A_K0_ZERO_MASK: u64 = 0xffff_fffe_0000_0000;
-                let a_k0 = u64::from_le(unsafe {
-                    core::ptr::read_unaligned(a_packed.as_ptr().add(byte_base_b).cast::<u64>())
-                });
+                // Ranked (window 0, b_med 2): B K0..1 are static ones and A K1's
+                // top byte is structurally zero (512/512 measured), so the h4
+                // kernel's K1 A-transform can drop byte 7's four table loads
+                // and XORs. This fires on every scored block. When a_k1's top
+                // byte is nonzero the legacy whole-word static-A arm cannot
+                // match either (STATIC_A_K1 has a zero top byte), so it is
+                // retained only as a documented fallback and always falls
+                // through to the generic h4 arm.
                 let a_k1 = u64::from_le(unsafe {
                     core::ptr::read_unaligned(
                         a_packed.as_ptr().add(byte_base_b + N_CHUNKS).cast::<u64>(),
                     )
                 });
-                if a_k1 == STATIC_A_K1 && a_k0 & STATIC_A_K0_ZERO_MASK == 0 {
-                    let static_a_k1 = match static_b_context {
-                        Some(StaticBContext::Prepared { static_a_k1, .. }) => static_a_k1,
-                        Some(StaticBContext::LegacyPerCall) | None => {
-                            static_a_k1_partial(inv_table)
-                        }
-                    };
-                    shift_reduce_inner_mixed_const_b_h4::<0x03, true>(
-                        a_packed,
-                        b_packed,
-                        inv_table,
-                        byte_base_b,
-                        Some(static_a_k1),
-                        out,
-                        nt_store,
-                    );
-                } else {
-                    shift_reduce_inner_mixed_const_b_h4::<0x03, false>(
+                if a_k1 & 0xff00_0000_0000_0000 == 0 {
+                    shift_reduce_inner_mixed_const_b_h4::<0x03, false, true>(
                         a_packed,
                         b_packed,
                         inv_table,
@@ -2970,6 +2969,39 @@ pub(crate) fn shift_reduce_inner_ab_fused_neon_checked_with_fast_policy<
                         out,
                         nt_store,
                     );
+                } else {
+                    const STATIC_A_K1: u64 = 0x0000_0016_0000_0080;
+                    const STATIC_A_K0_ZERO_MASK: u64 = 0xffff_fffe_0000_0000;
+                    let a_k0 = u64::from_le(unsafe {
+                        core::ptr::read_unaligned(a_packed.as_ptr().add(byte_base_b).cast::<u64>())
+                    });
+                    if a_k1 == STATIC_A_K1 && a_k0 & STATIC_A_K0_ZERO_MASK == 0 {
+                        let static_a_k1 = match static_b_context {
+                            Some(StaticBContext::Prepared { static_a_k1, .. }) => static_a_k1,
+                            Some(StaticBContext::LegacyPerCall) | None => {
+                                static_a_k1_partial(inv_table)
+                            }
+                        };
+                        shift_reduce_inner_mixed_const_b_h4::<0x03, true, false>(
+                            a_packed,
+                            b_packed,
+                            inv_table,
+                            byte_base_b,
+                            Some(static_a_k1),
+                            out,
+                            nt_store,
+                        );
+                    } else {
+                        shift_reduce_inner_mixed_const_b_h4::<0x03, false, false>(
+                            a_packed,
+                            b_packed,
+                            inv_table,
+                            byte_base_b,
+                            None,
+                            out,
+                            nt_store,
+                        );
+                    }
                 }
             } else {
                 shift_reduce_inner_mixed_const_b::<0x03>(
@@ -2985,7 +3017,7 @@ pub(crate) fn shift_reduce_inner_ab_fused_neon_checked_with_fast_policy<
         }
         0xf0 if bw(4) & bw(5) & bw(6) & bw(7) == u64::MAX => {
             if fast_shift_reduce_with_policy::<FAST_POLICY>() {
-                shift_reduce_inner_mixed_const_b_h4::<0xf0, false>(
+                shift_reduce_inner_mixed_const_b_h4::<0xf0, false, false>(
                     a_packed,
                     b_packed,
                     inv_table,
