@@ -1680,6 +1680,25 @@ fn process_one_x_hi_with_precomputed_ab(
     }
 }
 
+/// Kill switch for the eq_lo mul-drain deferral in the ranked AB band
+/// worker. Default ON: `accumulate_convert_ab`'s per-lane products by the
+/// shared per-chunk constant `eq_lo_val` are accumulated UNREDUCED across
+/// the whole `x_hi` band ([`crate::field::F256Unreduced`], the deferred
+/// reduction machinery from the round-two products arm) and reduced once
+/// per lane per band — dropping the 2-PMULL GHASH reduction from all
+/// `64 x big_lo_size` chunk drains down to 64 reductions per band. Set
+/// exactly `FLOCK_NO_EQ_LO_SCHED=1` to restore the incumbent reduced drain
+/// as a same-binary control. Bit-exact either way: reduction commutes with
+/// XOR, so the reduced band totals are identical field elements.
+pub const ENV_NO_EQ_LO_SCHED: &str = "FLOCK_NO_EQ_LO_SCHED";
+
+fn eq_lo_sched_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var_os(ENV_NO_EQ_LO_SCHED).as_deref() != Some(std::ffi::OsStr::new("1"))
+    })
+}
+
 /// AB job for the experimental direct-fold4 capture.  It remains one pass per
 /// `x_hi`; splitting C into four q-local jobs must not multiply AB traffic.
 #[inline]
@@ -1697,26 +1716,86 @@ fn process_one_x_hi_with_precomputed_ab_fold4_ab(
     timing_cpu_ns: Option<&[std::sync::atomic::AtomicU64; 3]>,
     partial_ab: &mut [F128; ELL],
 ) {
-    partial_ab.fill(F128::ZERO);
+    process_one_x_hi_with_precomputed_ab_fold4_ab_with_sched(
+        x_hi,
+        big_lo_size,
+        n_lo_and_inner,
+        within_outer_mask,
+        b_med_counts,
+        ab_inner,
+        eq_lo_scaled,
+        eq_hi_val,
+        convert,
+        timing_cpu_ns,
+        eq_lo_sched_enabled(),
+        partial_ab,
+    );
+}
 
+/// Drain-flavor-parameterized body; the wrapper passes the latched env
+/// choice, tests compare both arms byte-for-byte in one process. `sched`
+/// selects the deferred-reduction eq_lo drain (see [`ENV_NO_EQ_LO_SCHED`])
+/// vs the incumbent per-chunk reduced drain.
+#[inline]
+#[allow(clippy::too_many_arguments)]
+fn process_one_x_hi_with_precomputed_ab_fold4_ab_with_sched(
+    x_hi: usize,
+    big_lo_size: usize,
+    n_lo_and_inner: usize,
+    within_outer_mask: usize,
+    b_med_counts: &[u8],
+    ab_inner: &[u8],
+    eq_lo_scaled: &[F128],
+    eq_hi_val: F128,
+    convert: &[F128],
+    timing_cpu_ns: Option<&[std::sync::atomic::AtomicU64; 3]>,
+    sched: bool,
+    partial_ab: &mut [F128; ELL],
+) {
     let n_lo = n_lo_and_inner - N_INNER;
 
     // Ranked AB policy: its 64 KiB table stays resident for the complete band.
     let t_ab = timing_cpu_ns.map(|_| std::time::Instant::now());
-    for x_outer_lo in 0..big_lo_size {
-        let x_outer = x_outer_lo | (x_hi << n_lo);
-        let n_b_med = b_med_counts[x_outer & within_outer_mask] as usize;
-        if n_b_med == 0 {
-            continue;
+    if sched {
+        // Deferred-reduction drain: 256-bit unreduced accumulators for the
+        // whole band, one GHASH reduction per lane at the end. 2 KiB of
+        // per-worker accumulator state, L1-resident for the band sweep.
+        let mut unreduced = [crate::field::F256Unreduced::ZERO; ELL];
+        for x_outer_lo in 0..big_lo_size {
+            let x_outer = x_outer_lo | (x_hi << n_lo);
+            let n_b_med = b_med_counts[x_outer & within_outer_mask] as usize;
+            if n_b_med == 0 {
+                continue;
+            }
+            let chunk_byte_base = ((x_outer_lo << N_INNER) | (x_hi << n_lo_and_inner)) * N_CHUNKS;
+            kernels::accumulate_convert_ab_unreduced(
+                precomputed_ab_rows(ab_inner, chunk_byte_base),
+                n_b_med,
+                convert,
+                eq_lo_scaled[x_outer_lo],
+                &mut unreduced,
+            );
         }
-        let chunk_byte_base = ((x_outer_lo << N_INNER) | (x_hi << n_lo_and_inner)) * N_CHUNKS;
-        kernels::accumulate_convert_ab(
-            precomputed_ab_rows(ab_inner, chunk_byte_base),
-            n_b_med,
-            convert,
-            eq_lo_scaled[x_outer_lo],
-            partial_ab,
-        );
+        for (out, acc) in partial_ab.iter_mut().zip(unreduced) {
+            *out = acc.reduce();
+        }
+    } else {
+        partial_ab.fill(F128::ZERO);
+        for x_outer_lo in 0..big_lo_size {
+            let x_outer = x_outer_lo | (x_hi << n_lo);
+            let n_b_med = b_med_counts[x_outer & within_outer_mask] as usize;
+            if n_b_med == 0 {
+                continue;
+            }
+            let chunk_byte_base = ((x_outer_lo << N_INNER) | (x_hi << n_lo_and_inner)) * N_CHUNKS;
+            kernels::accumulate_convert_ab(
+                precomputed_ab_rows(ab_inner, chunk_byte_base),
+                n_b_med,
+                convert,
+                eq_lo_scaled[x_outer_lo],
+                partial_ab,
+            );
+        }
     }
     if let (Some(totals), Some(start)) = (timing_cpu_ns, t_ab) {
         totals[0].fetch_add(
@@ -1763,27 +1842,105 @@ pub(crate) fn round1_shift_reduce_ab_packed_padded_with_precomputed(
     let (within_outer_mask, b_med_counts) = build_b_med_counts(padding);
     let ab_inner_bytes = ab_inner.as_bytes();
 
+    let head_timing = std::env::var_os("FLOCK_ZC_TIMING").is_some()
+        || std::env::var_os("FLOCK_PHASE_TIMING").is_some();
+    let t_head = std::time::Instant::now();
     let mut partials = vec![[F128::ZERO; ELL]; hi_size];
     let partials_base = crate::epool::SyncPtr(partials.as_mut_ptr());
-    crate::epool::run_hetero_chunks(hi_size, |x_hi| {
-        let mut partial = [F128::ZERO; ELL];
-        process_one_x_hi_with_precomputed_ab_fold4_ab(
-            x_hi,
-            big_lo_size,
-            n_lo_and_inner,
-            within_outer_mask,
-            &b_med_counts,
+
+    // GPU AB-completion arm (see `gpu_commit::ENV_NO_AB_HEAD_GPU`): submit
+    // the fixed band prefix before the CPU walks the suffix. `None` = whole
+    // head on the exact incumbent CPU path. The driver engages the arm on
+    // the ranked shape only; unit tests opt in explicitly through
+    // [`AB_HEAD_TEST_DRIVER_FORCE`] so the process-global admission state
+    // never races across unrelated small-shape tests.
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    let gpu_job = if ab_head_driver_shape(m) {
+        crate::gpu_commit::launch_ab_head_partials(
             ab_inner_bytes,
-            &eq_lo_scaled,
-            eq.hi[x_hi],
             convert,
-            None,
-            &mut partial,
+            &eq_lo_scaled,
+            &eq.hi,
+            &b_med_counts,
+            within_outer_mask,
+            eq.n_lo,
+            r,
+        )
+    } else {
+        None
+    };
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    let cpu_start = gpu_job.as_ref().map_or(0, |job| job.cpu_split());
+    #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+    let cpu_start = 0usize;
+
+    let run_cpu_bands = |lo: usize, hi: usize| {
+        crate::epool::run_hetero_chunks(hi - lo, |i| {
+            let x_hi = lo + i;
+            let mut partial = [F128::ZERO; ELL];
+            process_one_x_hi_with_precomputed_ab_fold4_ab(
+                x_hi,
+                big_lo_size,
+                n_lo_and_inner,
+                within_outer_mask,
+                &b_med_counts,
+                ab_inner_bytes,
+                &eq_lo_scaled,
+                eq.hi[x_hi],
+                convert,
+                None,
+                &mut partial,
+            );
+            // SAFETY: each queue index owns one disjoint output slot and the
+            // synchronous queue join publishes all writes before reduction.
+            unsafe { *partials_base.ptr().add(x_hi) = partial };
+        });
+    };
+    run_cpu_bands(cpu_start, hi_size);
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    let (gpu_bands, gpu_ms) = match gpu_job {
+        Some(job) => {
+            let bands = job.bands;
+            let calibration = job.is_calibration();
+            match crate::gpu_commit::ab_head_wait(
+                job,
+                calibration.then_some(partials.as_slice()),
+            ) {
+                // Calibration ran the whole head on the CPU; the probe was
+                // compared (equal) and discarded.
+                crate::gpu_commit::AbHeadResult::Calibrated(ms) => (0usize, ms),
+                crate::gpu_commit::AbHeadResult::Prefix(vals, ms) => {
+                    for (band, val) in vals.into_iter().enumerate() {
+                        partials[band] = val;
+                    }
+                    (bands, ms)
+                }
+                crate::gpu_commit::AbHeadResult::Failed => {
+                    // Post-admission Metal failure: CPU-redo the prefix (a
+                    // calibration failure needs no redo — its cpu_split was
+                    // zero, so every band is already CPU-authoritative).
+                    if !calibration {
+                        run_cpu_bands(0, cpu_start);
+                    }
+                    (0usize, 0.0)
+                }
+            }
+        }
+        None => (0usize, 0.0),
+    };
+    #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+    let (gpu_bands, gpu_ms) = (0usize, 0.0f64);
+
+    if head_timing {
+        eprintln!(
+            "[ab-head] cpu-bands={} gpu-bands={} gpu-dur={:.2}ms head-wall={:.2}ms",
+            hi_size - gpu_bands,
+            gpu_bands,
+            gpu_ms,
+            t_head.elapsed().as_secs_f64() * 1e3,
         );
-        // SAFETY: each queue index owns one disjoint output slot and the
-        // synchronous queue join publishes all writes before reduction.
-        unsafe { *partials_base.ptr().add(x_hi) = partial };
-    });
+    }
 
     partials
         .into_iter()
@@ -1794,6 +1951,68 @@ pub(crate) fn round1_shift_reduce_ab_packed_padded_with_precomputed(
             left
         })
         .to_vec()
+}
+
+/// Unit-test opt-in for the AB-head GPU driver off the ranked shape (the
+/// admission state is process-global; unrelated tests must stay on the
+/// exact CPU path).
+#[cfg(all(test, target_os = "macos", target_arch = "aarch64"))]
+pub(crate) static AB_HEAD_TEST_DRIVER_FORCE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// The one production shape the AB-head GPU arm's driver engages for.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn ab_head_driver_shape(m: usize) -> bool {
+    #[cfg(test)]
+    {
+        let _ = m;
+        AB_HEAD_TEST_DRIVER_FORCE.load(std::sync::atomic::Ordering::Relaxed)
+    }
+    #[cfg(not(test))]
+    {
+        m == 32
+    }
+}
+
+/// Commit-tail staging half of the AB-head GPU arm (see
+/// `gpu_commit::ENV_NO_AB_HEAD_GPU`): perform the window-setup uploads from
+/// the fork-hook challenge vector and park them under the exact challenge
+/// fingerprint for adoption by the launch at zerocheck entry. Reads NOTHING
+/// from `ab_inner` — at commit-graph completion the precompute arm is still
+/// writing it — so only the challenge-derived tables are staged; the
+/// dispatch itself is submitted at zerocheck entry.
+#[cfg_attr(
+    not(all(target_os = "macos", target_arch = "aarch64")),
+    allow(unused_variables)
+)]
+pub(crate) fn stage_ab_head_for_tail_fill(m: usize, r: &[F128], padding: &PaddingSpec) -> bool {
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    {
+        // Same shape gate as the driver (test opt-in included), so nothing
+        // is ever staged that the launch would decline.
+        if !ab_head_driver_shape(m)
+            || m < K_SKIP + N_INNER
+            || !crate::gpu_commit::ab_head_gpu_viable()
+        {
+            return false;
+        }
+        let eq = SplitEqGhash::with_n_hi(&r[K_SKIP + N_INNER..], fold4_n_hi_from_env());
+        let eq_lo_scaled: Vec<F128> = eq.lo.iter().map(|v| *v * d_inv()).collect();
+        let (within_outer_mask, b_med_counts) = build_b_med_counts(padding);
+        crate::gpu_commit::stage_ab_head_window(
+            convert_table(),
+            &eq_lo_scaled,
+            &eq.hi,
+            &b_med_counts,
+            within_outer_mask,
+            eq.n_lo,
+            r,
+        )
+    }
+    #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+    {
+        false
+    }
 }
 
 /// Challenge-derived inputs shared by both round-one C variants.
@@ -5628,5 +5847,156 @@ mod tests {
                 "fold8 → fold4 reduction mismatch in case {case}"
             );
         }
+    }
+
+    /// Cross-flavor oracle for the eq_lo mul-drain deferral (see
+    /// [`ENV_NO_EQ_LO_SCHED`]): the deferred-reduction band drain must be
+    /// byte-identical to the incumbent per-chunk reduced drain on random
+    /// band data, including bands with padded (15/12/1-row) and skipped
+    /// (0-row) chunks. Both flavors run in ONE process via the
+    /// parameterized worker, so this covers the arm the latched env gate
+    /// cannot flip in-process.
+    #[test]
+    fn fold4_ab_band_sched_drain_matches_incumbent() {
+        let mut rng = Rng::new(0xAB5CED);
+        const BIG_LO: usize = 8;
+        const N_LO: usize = 3;
+        let n_lo_and_inner = N_LO + N_INNER;
+        let hi_size = 4usize;
+        let convert = convert_table();
+        let mut ab_inner = vec![0u8; hi_size * BIG_LO * (1 << N_INNER) * N_CHUNKS];
+        for byte in ab_inner.iter_mut() {
+            *byte = rng.next_u64() as u8;
+        }
+        let eq_lo_scaled = rng.f128_vec(BIG_LO);
+        // Mixed row counts: full, the ranked 15-row padded window, dead, odd.
+        let b_med_counts = [16u8, 15, 0, 12, 16, 1, 7, 16];
+        let within_outer_mask = 7usize;
+        for x_hi in 0..hi_size {
+            let eq_hi_val = rng.f128();
+            let mut incumbent = [F128::ZERO; ELL];
+            process_one_x_hi_with_precomputed_ab_fold4_ab_with_sched(
+                x_hi,
+                BIG_LO,
+                n_lo_and_inner,
+                within_outer_mask,
+                &b_med_counts,
+                &ab_inner,
+                &eq_lo_scaled,
+                eq_hi_val,
+                convert,
+                None,
+                false,
+                &mut incumbent,
+            );
+            let mut sched = [F128::ZERO; ELL];
+            process_one_x_hi_with_precomputed_ab_fold4_ab_with_sched(
+                x_hi,
+                BIG_LO,
+                n_lo_and_inner,
+                within_outer_mask,
+                &b_med_counts,
+                &ab_inner,
+                &eq_lo_scaled,
+                eq_hi_val,
+                convert,
+                None,
+                true,
+                &mut sched,
+            );
+            assert_eq!(incumbent, sched, "sched drain diverged in band {x_hi}");
+        }
+    }
+
+    /// The AB-head GPU kernel stages the 64 KiB convert table as an 8 KiB
+    /// nibble split, which is exact iff every bank is F2-linear in the byte
+    /// index. That holds by construction — `convert[b*256 + v] = γ^b·φ₈(v)`
+    /// and φ₈ is a field embedding, hence additive — but the kernel's
+    /// correctness rides on it, so pin it against the real table.
+    #[test]
+    fn convert_table_is_nibble_decomposable() {
+        let convert = convert_table();
+        for bank in 0..16 {
+            assert_eq!(convert[bank * 256], F128::ZERO, "bank {bank} zero row");
+            for v in 0..256usize {
+                assert_eq!(
+                    convert[bank * 256 + v],
+                    convert[bank * 256 + (v & 15)] + convert[bank * 256 + (v & 0xF0)],
+                    "bank {bank} byte {v} must split along the nibble boundary"
+                );
+            }
+        }
+    }
+
+    /// GPU-arm-forced variant of the round-one AB exactness family: with
+    /// the AB-head arm engaged (calibration, timed prefix, and the
+    /// commit-tail staged window), the wire AB message must be byte-identical
+    /// to the exact CPU head. Skips gracefully (CPU-only equality still
+    /// asserted) when Metal is unavailable or the scratch allocation cannot
+    /// be no-copy wrapped.
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    fn round1_ab_gpu_arm_matches_cpu_head() {
+        use std::sync::atomic::Ordering;
+        let _guard = crate::gpu_commit::ab_head_test_guard();
+        const M: usize = 22;
+        const K_LOG: usize = 14;
+        let padding = PaddingSpec {
+            k_log: K_LOG,
+            useful_bits_per_block: 15_409,
+        };
+        let mut rng = Rng::new(0xAB6EAD);
+        let a = pack_bits(&rng.bits(1 << M));
+        let b = pack_bits(&rng.bits(1 << M));
+        let outer = rng.f128_vec(M - K_SKIP - N_INNER);
+        let r = build_protocol_r(M, &outer);
+        let inv_table = make_inv_table();
+        let ab_inner =
+            precompute_round1_ab_inner_packed_padded(&a, &b, M, K_SKIP, &inv_table, &padding);
+
+        // Baseline: the exact CPU head (driver force off).
+        AB_HEAD_TEST_DRIVER_FORCE.store(false, Ordering::Relaxed);
+        let want = round1_shift_reduce_ab_packed_padded_with_precomputed(
+            &ab_inner, M, K_SKIP, &r, &padding,
+        );
+
+        // Calibration prove: the CPU is authoritative, the probe compares.
+        crate::gpu_commit::ab_head_test_reset();
+        AB_HEAD_TEST_DRIVER_FORCE.store(true, Ordering::Relaxed);
+        let got_calibration = round1_shift_reduce_ab_packed_padded_with_precomputed(
+            &ab_inner, M, K_SKIP, &r, &padding,
+        );
+        assert_eq!(got_calibration, want, "calibration prove diverged");
+        let (tuned, poisoned) = crate::gpu_commit::ab_head_test_state();
+        if tuned == usize::MAX {
+            // The arm never launched (kill switch, no Metal, or an
+            // unwrappable allocation) — the head stayed on the exact
+            // incumbent, which the equality above already covered.
+            AB_HEAD_TEST_DRIVER_FORCE.store(false, Ordering::Relaxed);
+            eprintln!("[ab-head-test] arm did not engage; CPU-only equality verified");
+            return;
+        }
+        assert!(!poisoned, "GPU probe must compare equal to the CPU band partials");
+        assert!(tuned > 0, "calibration must admit the env-fixed band count");
+
+        // Timed prove at a forced wide prefix (M=22 keeps hi_size = 128).
+        crate::gpu_commit::ab_head_test_set_bands(96);
+        let got_timed = round1_shift_reduce_ab_packed_padded_with_precomputed(
+            &ab_inner, M, K_SKIP, &r, &padding,
+        );
+        assert_eq!(got_timed, want, "timed GPU-prefix prove diverged");
+
+        // Commit-tail staging road: stage the window from the same
+        // challenge vector, then prove again (the launch adopts the parked
+        // uploads on the exact fingerprint).
+        let staged = stage_ab_head_for_tail_fill(M, &r, &padding);
+        assert!(staged, "staging must engage once the arm is admitted");
+        let got_staged = round1_shift_reduce_ab_packed_padded_with_precomputed(
+            &ab_inner, M, K_SKIP, &r, &padding,
+        );
+        assert_eq!(got_staged, want, "staged-window prove diverged");
+
+        AB_HEAD_TEST_DRIVER_FORCE.store(false, Ordering::Relaxed);
+        crate::gpu_commit::ab_head_test_reset();
     }
 }
