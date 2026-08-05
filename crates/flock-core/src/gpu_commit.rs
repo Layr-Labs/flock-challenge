@@ -2505,12 +2505,24 @@ kernel void leaf_parent3(device const uint* codeword [[buffer(0)]],
 
     {
         const uint id = tgid * 256u + lid;
-        device const uint* leaf = codeword + id * 256u;
+        // uint4 leaf fetch: the leaf pass re-reads the full codeword and is
+        // request-count-bound, not bandwidth-bound (see the leaf-pass note on
+        // the main MSL source). Each 1 KiB leaf is 16-byte aligned (buffer
+        // offset 0, id * 1024), so the same 256 words arrive as 64 vector
+        // requests instead of 256 scalar ones. Word order into `block` is
+        // unchanged — output bytes are bit-identical.
+        device const uint4* leaf4 = (device const uint4*)(codeword + id * 256u);
         uint cv[8];
         for (uint i = 0u; i < 8u; i++) cv[i] = B3_IV[i];
         for (uint b = 0u; b < 16u; b++) {
             uint block[16];
-            for (uint i = 0u; i < 16u; i++) block[i] = leaf[b * 16u + i];
+            for (uint q = 0u; q < 4u; q++) {
+                const uint4 w = leaf4[b * 4u + q];
+                block[q * 4u + 0u] = w.x;
+                block[q * 4u + 1u] = w.y;
+                block[q * 4u + 2u] = w.z;
+                block[q * 4u + 3u] = w.w;
+            }
             uint flags = (b == 0u ? B3_CHUNK_START : 0u) | (b == 15u ? B3_CHUNK_END : 0u);
             b3_compress(cv, block, 64u, flags);
         }
