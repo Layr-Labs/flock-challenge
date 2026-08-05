@@ -97,6 +97,14 @@ fn r2_periodic_padding_enabled() -> bool {
     std::env::var_os("FLOCK_NO_ZC_R2_PERIODIC").is_none_or(|v| v != *"1")
 }
 
+/// Kill switch for the b≡0 mixed-state degeneration in the round-two
+/// lookahead kernel. Zero B rows make every local product vanish while the A
+/// compact state must still be retained for later challenges.
+#[cfg(target_arch = "aarch64")]
+fn r2_zero_degen_enabled() -> bool {
+    std::env::var_os("FLOCK_NO_ZC_R2_ZERO_DEGEN").is_none_or(|v| v != *"1")
+}
+
 /// Kill switch for adopting the round-two GPU arm's odd-parity products as the
 /// round-three lookahead's `W1`/`W2`: `FLOCK_NO_ZC_R2_ODD_OFFLOAD=1` makes the
 /// CPU recompute the odd pair on offloaded chunks, which is the incumbent
@@ -1370,6 +1378,8 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead(
     let degen = r2_degen_enabled();
     #[cfg(target_arch = "aarch64")]
     let periodic_padding = r2_periodic_padding_enabled();
+    #[cfg(target_arch = "aarch64")]
+    let zero_degen = r2_zero_degen_enabled();
 
     // Same GPU round-two products arm as the incumbent sweep: it still
     // receives byte-identical anchors/deltas for every chunk and still owns
@@ -1445,6 +1455,7 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead(
                         useful_pairs_inclusive,
                         degen,
                         periodic_padding,
+                        zero_degen,
                         out.as_mut_ptr(),
                     );
                 } else if odd_on_gpu {
@@ -1461,6 +1472,7 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead(
                         useful_pairs_inclusive,
                         degen,
                         periodic_padding,
+                        zero_degen,
                         out.as_mut_ptr(),
                     );
                 } else {
@@ -1477,6 +1489,7 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead(
                         useful_pairs_inclusive,
                         degen,
                         periodic_padding,
+                        zero_degen,
                         out.as_mut_ptr(),
                     );
                 }
@@ -1576,6 +1589,7 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead(
                             useful_pairs_inclusive,
                             degen,
                             periodic_padding,
+                            zero_degen,
                             out.as_mut_ptr(),
                         );
                     }

@@ -566,12 +566,14 @@ unsafe fn r2_pair_fold_and_store(
     x_lo: usize,
     padded: bool,
     degen: bool,
+    zero_degen: bool,
     b_ones: core::arch::aarch64::uint64x2_t,
 ) -> (
     core::arch::aarch64::uint64x2_t,
     core::arch::aarch64::uint64x2_t,
     core::arch::aarch64::uint64x2_t,
     core::arch::aarch64::uint64x2_t,
+    bool,
     bool,
 ) {
     use core::arch::aarch64::*;
@@ -594,7 +596,7 @@ unsafe fn r2_pair_fold_and_store(
         if padded {
             store_anchor_pair_nt(anchors.add(2 * x_lo), zero, zero);
             vst1q_u64(deltas.add(x_lo * 16).cast::<u64>(), zero);
-            return (zero, zero, zero, zero, false);
+            return (zero, zero, zero, zero, false, false);
         }
 
         let row0 = 2 * x_lo;
@@ -612,12 +614,21 @@ unsafe fn r2_pair_fold_and_store(
             b_packed.add(row1 * 8).cast::<u64>(),
         ));
 
+        if zero_degen && (b0_code | b1_code) == 0 {
+            let (a0, a1) = fold_two_row_codes_q(table_data, a0_code, a1_code);
+            store_anchor_pair_nt(anchors.add(2 * x_lo), a0, zero);
+            let delta_pair =
+                core::mem::transmute::<[u64; 2], uint64x2_t>([a0_code ^ a1_code, 0]);
+            vst1q_u64(deltas.add(x_lo * 16).cast::<u64>(), delta_pair);
+            return (a0, a1, zero, zero, true, true);
+        }
+
         if degen && (b0_code & b1_code) == u64::MAX {
             let (a0, a1) = fold_two_row_codes_q(table_data, a0_code, a1_code);
             store_anchor_pair_nt(anchors.add(2 * x_lo), a0, b_ones);
             let delta_pair = core::mem::transmute::<[u64; 2], uint64x2_t>([a0_code ^ a1_code, 0]);
             vst1q_u64(deltas.add(x_lo * 16).cast::<u64>(), delta_pair);
-            return (a0, a1, b_ones, b_ones, true);
+            return (a0, a1, b_ones, b_ones, true, false);
         }
 
         let (a0, a1, b0, b1) =
@@ -628,7 +639,7 @@ unsafe fn r2_pair_fold_and_store(
             b0_code ^ b1_code,
         ]);
         vst1q_u64(deltas.add(x_lo * 16).cast::<u64>(), delta_pair);
-        (a0, a1, b0, b1, false)
+        (a0, a1, b0, b1, false, false)
     }
 }
 
@@ -688,6 +699,7 @@ pub(crate) unsafe fn fold_round2_compact_chunk_neon_lookahead_8<
     useful_pairs_inclusive: usize,
     degen: bool,
     periodic_padding: bool,
+    zero_degen: bool,
     out: *mut F128,
 ) {
     use core::arch::aarch64::*;
@@ -741,17 +753,23 @@ pub(crate) unsafe fn fold_round2_compact_chunk_neon_lookahead_8<
                 let pad0 = $pad0;
                 let pad1 = $pad1;
 
-                let (a0, a1, b0, b1, deg0) = r2_pair_fold_and_store(
-                    table_data, a_packed, b_packed, anchors, deltas, x_lo0, pad0, degen, b_ones,
+                let (a0, a1, b0, b1, flat0, zero0) = r2_pair_fold_and_store(
+                    table_data, a_packed, b_packed, anchors, deltas, x_lo0, pad0, degen,
+                    zero_degen, b_ones,
                 );
-                let (a2, a3, b2, b3, deg1) = r2_pair_fold_and_store(
-                    table_data, a_packed, b_packed, anchors, deltas, x_lo1, pad1, degen, b_ones,
+                let (a2, a3, b2, b3, flat1, zero1) = r2_pair_fold_and_store(
+                    table_data, a_packed, b_packed, anchors, deltas, x_lo1, pad1, degen,
+                    zero_degen, b_ones,
                 );
 
                 // The odd lane's weight drives the whole group; see the doc above.
                 let w = vld1q_u64(eq_lo.add(x_lo1).cast::<u64>());
 
-                if deg0 & deg1 & ones_is_one {
+                if zero0 & zero1 {
+                    // Every B value and difference in this group is zero, so
+                    // all eight round-two/lookahead products vanish. The A
+                    // anchors/deltas above remain live for the later K fold.
+                } else if flat0 & flat1 & !zero0 & !zero1 & ones_is_one {
                     // b === 1 across the group: e_b = o_b = 0 kills W3/W4/W5 and
                     // both G(inf) chains, and every surviving product is `w * a_i`.
                     if FULL {
@@ -772,8 +790,10 @@ pub(crate) unsafe fn fold_round2_compact_chunk_neon_lookahead_8<
 
                     // ---- round-two products, split by the parity of x' ----
                     if FULL {
-                        wide_xor(&mut p1_even, mul_unreduced_q(a1w, b1));
-                        if !deg0 {
+                        if !zero0 {
+                            wide_xor(&mut p1_even, mul_unreduced_q(a1w, b1));
+                        }
+                        if !flat0 {
                             wide_xor(
                                 &mut pinf_even,
                                 mul_unreduced_q(veorq_u64(a0w, a1w), veorq_u64(b0, b1)),
@@ -782,15 +802,19 @@ pub(crate) unsafe fn fold_round2_compact_chunk_neon_lookahead_8<
                     }
                     if !pad1 {
                         if !ODD_ON_GPU {
-                            wide_xor(&mut p1_odd, mul_unreduced_q(a3w, b3));
-                            if !deg1 {
+                            if !zero1 {
+                                wide_xor(&mut p1_odd, mul_unreduced_q(a3w, b3));
+                            }
+                            if !flat1 {
                                 wide_xor(
                                     &mut pinf_odd,
                                     mul_unreduced_q(veorq_u64(a2w, a3w), veorq_u64(b2, b3)),
                                 );
                             }
                         }
-                        wide_xor(&mut w0, mul_unreduced_q(a2w, b2));
+                        if !zero1 {
+                            wide_xor(&mut w0, mul_unreduced_q(a2w, b2));
+                        }
                     }
 
                     // ---- deferred round-three aggregates (no extra lookups) ----
@@ -2148,19 +2172,23 @@ mod tests {
         const N_CHUNKS: usize = 8;
 
         let mut state = 0x5045_5249_4f44_4943;
-        let table: Vec<F128> = (0..N_CHUNKS * 256)
+        let mut table: Vec<F128> = (0..N_CHUNKS * 256)
             .map(|_| F128::new(splitmix64(&mut state), splitmix64(&mut state)))
             .collect();
+        for chunk in 0..N_CHUNKS {
+            table[chunk * 256] = F128::ZERO;
+        }
         let mut a_packed = vec![0u8; 2 * LO_SIZE * N_CHUNKS];
         let mut b_packed = vec![0u8; 2 * LO_SIZE * N_CHUNKS];
         for byte in a_packed.iter_mut().chain(b_packed.iter_mut()) {
             *byte = splitmix64(&mut state) as u8;
         }
+        b_packed[..4 * N_CHUNKS].fill(0);
         let eq_lo: Vec<F128> = (0..LO_SIZE)
             .map(|_| F128::new(splitmix64(&mut state), splitmix64(&mut state)))
             .collect();
 
-        let run = |periodic_padding: bool| {
+        let run = |periodic_padding: bool, zero_degen: bool| {
             let poison = F128::new(0xaaaa_aaaa_aaaa_aaaa, 0x5555_5555_5555_5555);
             let mut anchors = vec![poison; 2 * LO_SIZE];
             let mut deltas = vec![0xa5u8; 2 * LO_SIZE * N_CHUNKS];
@@ -2179,16 +2207,23 @@ mod tests {
                     121,
                     true,
                     periodic_padding,
+                    zero_degen,
                     out.as_mut_ptr(),
                 );
             }
             (anchors, deltas, out)
         };
 
-        let periodic = run(true);
-        let generic = run(false);
+        let periodic = run(true, true);
+        let generic = run(false, true);
         assert_eq!(periodic.0, generic.0, "anchor schedule mismatch");
         assert_eq!(periodic.1, generic.1, "delta schedule mismatch");
         assert_eq!(periodic.2, generic.2, "message/lookahead mismatch");
+
+        let rollback = run(true, false);
+        assert_eq!(periodic.0, rollback.0, "zero-degen anchors mismatch");
+        assert_eq!(periodic.1, rollback.1, "zero-degen deltas mismatch");
+        assert_eq!(periodic.2, rollback.2, "zero-degen message mismatch");
     }
+
 }
