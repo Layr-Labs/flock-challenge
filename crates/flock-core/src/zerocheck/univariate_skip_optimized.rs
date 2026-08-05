@@ -4377,6 +4377,46 @@ mod tests {
                 "mixed const-one mask {mask:#04x}, static_a_k1={static_a_k1}, prepared={prepared}"
             );
         }
+
+        // The ranked (window 0, b_med 2) A K0/K1 words have their top three
+        // bytes structurally zero (2048/2048 scored blocks), so the h4
+        // dispatch routes both a-side transforms through
+        // `apply_word_low5_into_4_regs` (the A_LOW5_K=0x03 arm). Exercise that
+        // arm with random top-3-bytes-zero a_k0/a_k1 values against the scalar
+        // oracle — the arm must be bit-identical.
+        for trial in 0..32 {
+            let mut a_mixed = a_packed.clone();
+            for k in 0..2 {
+                a_mixed[k * N_CHUNKS..(k + 1) * N_CHUNKS]
+                    .copy_from_slice(&(rng.next_u64() & 0x0000_00ff_ffff_ffff).to_le_bytes());
+            }
+            let mut b_mixed = b_packed.clone();
+            for k in 0..2 {
+                b_mixed[k * N_CHUNKS..(k + 1) * N_CHUNKS].fill(u8::MAX);
+            }
+            let mut a_col = [F8::ZERO; ELL];
+            let mut b_col = [F8::ZERO; ELL];
+            let mut want = [0u8; 64];
+            let mut got = [0u8; 64];
+            shift_reduce_inner_ab_scalar(
+                &a_mixed, &b_mixed, &table, 0, 0, &mut want, &mut a_col, &mut b_col,
+            );
+            shift_reduce_inner_ab_fused_neon_checked(
+                &a_mixed,
+                &b_mixed,
+                &table,
+                0,
+                0,
+                &mut got,
+                false,
+                false,
+                0x03,
+                usize::MAX,
+                Some(prepared_context),
+                false,
+            );
+            assert_eq!(got, want, "A_LOW5_K=0x03 h4 arm (trial {trial}) must be bit-identical");
+        }
     }
 
     /// The blk-30 static-B single-K0 fast path (precomputed partial instead
