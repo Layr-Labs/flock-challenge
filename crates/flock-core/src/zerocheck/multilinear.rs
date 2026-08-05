@@ -154,6 +154,62 @@ pub(crate) fn stage_round2_gpu_window_from_r1_challenges(
         pair_in_block_mask,
         useful_pairs_inclusive,
     );
+    // The upload above copies eq.lo/eq.hi into persistent GPU buffers, so the
+    // CPU-side tables are free to be re-used by the round-two sweep.
+    stash_staged_r2_eq(&r[k_skip + 1..], eq);
+}
+
+/// Round-two eq-split reuse: the ZC-window idle-fill staging (above) builds
+/// the exact `SplitEqGhash` the round-two sweep needs — same challenge slice
+/// `r[k_skip+1..]`, same `n_hi` — while the round-one window is still open.
+/// Stash it so the sweep adopts it instead of rebuilding it inside the
+/// FS-serial gap between sampling `z` and round two. Adoption is gated on
+/// exact equality of the challenge slice and the split, so a stale entry
+/// from a previous prove (different Fiat-Shamir challenges) can never be
+/// consumed. Bytes are identical either way: `SplitEqGhash::with_n_hi` is
+/// deterministic in its inputs. `FLOCK_NO_R2_EQ_REUSE=1` disables adoption.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+static STAGED_R2_EQ: std::sync::Mutex<Option<(Vec<F128>, SplitEqGhash)>> =
+    std::sync::Mutex::new(None);
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn r2_eq_reuse_enabled() -> bool {
+    use std::sync::LazyLock;
+    static ENABLED: LazyLock<bool> =
+        LazyLock::new(|| std::env::var_os("FLOCK_NO_R2_EQ_REUSE").is_none());
+    *ENABLED
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn stash_staged_r2_eq(challenges: &[F128], eq: SplitEqGhash) {
+    if !r2_eq_reuse_enabled() {
+        return;
+    }
+    if let Ok(mut slot) = STAGED_R2_EQ.lock() {
+        *slot = Some((challenges.to_vec(), eq));
+    }
+}
+
+/// Adopt the staged round-two eq split when it matches `(challenges, n_hi)`
+/// exactly; otherwise build it fresh. Non-matching stash entries are left in
+/// place (they are not ours to consume).
+fn take_or_build_r2_eq(challenges: &[F128], n_hi: usize) -> SplitEqGhash {
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    if r2_eq_reuse_enabled() {
+        if let Ok(mut slot) = STAGED_R2_EQ.lock() {
+            let stashed = slot.take();
+            match stashed {
+                Some((ch, eq))
+                    if eq.n_hi == n_hi.min(challenges.len())
+                        && ch.as_slice() == challenges =>
+                {
+                    return eq;
+                }
+                other => *slot = other,
+            }
+        }
+    }
+    SplitEqGhash::with_n_hi(challenges, n_hi)
 }
 
 fn round2_pair_skip(padding: &PaddingSpec, k_skip: usize) -> (usize, usize) {
@@ -212,9 +268,28 @@ fn zc_tail_split11_enabled() -> bool {
 /// F_{2^128} via `φ_8`. Subtraction is XOR in characteristic 2.
 ///
 /// O(2^{2·k_skip}) field multiplies — one-time cost.
+///
+/// Fast path (default): the denominators `∏_{j≠i}(s_i + s_j)` do not depend
+/// on `z`, so their inverses are computed once per process and cached; the
+/// numerators `∏_{j≠i}(z + s_j)` are assembled from prefix/suffix products
+/// in O(ell) multiplies instead of O(ell²). This deletes `ell` field
+/// inversions (each ~254 muls) and ~`ell²` muls of FS-serial critical-path
+/// time from every call. Outputs are bit-identical to the reference loop:
+/// GF(2^128) multiplication is exactly associative and commutative, so
+/// regrouping the numerator product cannot change any bit, and the cached
+/// inverse is produced by the reference denominator loop itself.
+/// `FLOCK_NO_LAGRANGE_FAST=1` restores the reference implementation.
 pub fn lagrange_weights_naive(k_skip: usize, z: F128) -> Vec<F128> {
     let ell = 1usize << k_skip;
     assert!(ell <= 256, "k_skip > 8 would exceed PHI_8_TABLE");
+    if lagrange_fast_enabled() {
+        return lagrange_weights_fast(k_skip, z, 0, lagrange_s_den_inv(k_skip));
+    }
+    lagrange_weights_naive_reference(k_skip, z)
+}
+
+fn lagrange_weights_naive_reference(k_skip: usize, z: F128) -> Vec<F128> {
+    let ell = 1usize << k_skip;
     let mut weights = vec![F128::ZERO; ell];
     for i in 0..ell {
         let si = PHI_8_TABLE[i];
@@ -233,6 +308,84 @@ pub fn lagrange_weights_naive(k_skip: usize, z: F128) -> Vec<F128> {
     weights
 }
 
+/// Correctness-preserving kill switch for the O(ell) Lagrange fast path.
+fn lagrange_fast_enabled() -> bool {
+    use std::sync::LazyLock;
+    static ENABLED: LazyLock<bool> =
+        LazyLock::new(|| std::env::var_os("FLOCK_NO_LAGRANGE_FAST").is_none());
+    *ENABLED
+}
+
+/// Cached `(∏_{j≠i}(s_i + s_j))^{-1}` for the S-domain nodes
+/// `s_i = φ_8(i)`, indexed by `k_skip`. z-independent, so one inversion
+/// pass per process instead of one per call.
+static LAGRANGE_S_DEN_INV: [std::sync::OnceLock<Vec<F128>>; 9] =
+    [const { std::sync::OnceLock::new() }; 9];
+
+/// Same cache for the Λ-domain nodes `s_i = φ_8(2^k_skip + i)` (k_skip ≤ 7).
+static LAGRANGE_LAMBDA_DEN_INV: [std::sync::OnceLock<Vec<F128>>; 8] =
+    [const { std::sync::OnceLock::new() }; 8];
+
+fn lagrange_s_den_inv(k_skip: usize) -> &'static [F128] {
+    LAGRANGE_S_DEN_INV[k_skip].get_or_init(|| {
+        let ell = 1usize << k_skip;
+        (0..ell)
+            .map(|i| {
+                let si = PHI_8_TABLE[i];
+                let mut den = F128::ONE;
+                for j in 0..ell {
+                    if j != i {
+                        den *= si + PHI_8_TABLE[j];
+                    }
+                }
+                den.inv()
+            })
+            .collect()
+    })
+}
+
+fn lagrange_lambda_den_inv(k_skip: usize) -> &'static [F128] {
+    LAGRANGE_LAMBDA_DEN_INV[k_skip].get_or_init(|| {
+        let ell = 1usize << k_skip;
+        (0..ell)
+            .map(|i| {
+                let si = PHI_8_TABLE[ell + i];
+                let mut den = F128::ONE;
+                for j in 0..ell {
+                    if j != i {
+                        den *= si + PHI_8_TABLE[ell + j];
+                    }
+                }
+                den.inv()
+            })
+            .collect()
+    })
+}
+
+/// O(ell) Lagrange weights: `weights[i] = P_i · S_i · den_inv[i]` with
+/// `P_i = ∏_{j<i}(z + s_j)` and `S_i = ∏_{j>i}(z + s_j)`. Exact-field
+/// regrouping of the reference `∏_{j≠i}(z + s_j) · den.inv()`.
+fn lagrange_weights_fast(
+    k_skip: usize,
+    z: F128,
+    node_offset: usize,
+    den_inv: &[F128],
+) -> Vec<F128> {
+    let ell = 1usize << k_skip;
+    let mut weights = vec![F128::ZERO; ell];
+    let mut prefix = F128::ONE;
+    for i in 0..ell {
+        weights[i] = prefix;
+        prefix *= z + PHI_8_TABLE[node_offset + i];
+    }
+    let mut suffix = F128::ONE;
+    for i in (0..ell).rev() {
+        weights[i] = weights[i] * suffix * den_inv[i];
+        suffix *= z + PHI_8_TABLE[node_offset + i];
+    }
+    weights
+}
+
 /// Lagrange weights `L_i^Λ(z)` for `i ∈ 0..2^k_skip` at the fold point `z`,
 /// where the nodes are the **extension domain** `Λ = {2^k_skip, …, 2^(k_skip+1) − 1}`
 /// embedded via `φ_8` (offset by `2^k_skip` from the S-domain nodes).
@@ -242,6 +395,14 @@ pub fn lagrange_weights_naive(k_skip: usize, z: F128) -> Vec<F128> {
 pub fn lagrange_weights_lambda_naive(k_skip: usize, z: F128) -> Vec<F128> {
     let ell = 1usize << k_skip;
     assert!(2 * ell <= 256, "Λ ∪ S must fit in F_8 (need k_skip ≤ 7)");
+    if lagrange_fast_enabled() {
+        return lagrange_weights_fast(k_skip, z, ell, lagrange_lambda_den_inv(k_skip));
+    }
+    lagrange_weights_lambda_naive_reference(k_skip, z)
+}
+
+fn lagrange_weights_lambda_naive_reference(k_skip: usize, z: F128) -> Vec<F128> {
+    let ell = 1usize << k_skip;
     let mut weights = vec![F128::ZERO; ell];
     for i in 0..ell {
         let si = PHI_8_TABLE[ell + i];
@@ -662,7 +823,7 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_with_deltas(
         deltas,
     };
 
-    let eq = SplitEqGhash::with_n_hi(&mlv_challenges[1..], COMPACT_RECONSTRUCTION_N_HI);
+    let eq = take_or_build_r2_eq(&mlv_challenges[1..], COMPACT_RECONSTRUCTION_N_HI);
     let lo_size = 1usize << eq.n_lo;
     let hi_size = 1usize << eq.n_hi;
     assert_eq!(lo_size * hi_size, n_pairs);
@@ -921,7 +1082,7 @@ pub fn uni_skip_fold_and_round_pair_compact_padded_stream(
             deltas: ScratchBytes::take(2 * n_pairs * n_chunks),
         };
 
-        let eq = SplitEqGhash::with_n_hi(&mlv_challenges[1..], COMPACT_RECONSTRUCTION_N_HI);
+        let eq = take_or_build_r2_eq(&mlv_challenges[1..], COMPACT_RECONSTRUCTION_N_HI);
         let lo_size = 1usize << eq.n_lo;
         let hi_size = 1usize << eq.n_hi;
         assert_eq!(lo_size * hi_size, n_pairs);
@@ -1397,7 +1558,7 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead(
     };
 
     let n_vars = mlv_challenges.len() - 1;
-    let eq = SplitEqGhash::with_n_hi(&mlv_challenges[1..], lookahead_n_hi(n_vars));
+    let eq = take_or_build_r2_eq(&mlv_challenges[1..], lookahead_n_hi(n_vars));
     let lo_size = 1usize << eq.n_lo;
     let hi_size = 1usize << eq.n_hi;
     assert_eq!(lo_size * hi_size, n_pairs);
@@ -3442,6 +3603,55 @@ mod tests {
                 assert_eq!(sum, F128::ONE, "Σ L_i ≠ 1 at k_skip={k_skip}");
             }
         }
+    }
+
+    /// The O(ell) fast path (cached denominator inverses + prefix/suffix
+    /// numerators) is bit-identical to the reference quadratic loop on both
+    /// node domains, for random and node-coincident fold points.
+    #[test]
+    fn lagrange_fast_matches_reference() {
+        let mut rng = Rng::new(42);
+        for &k_skip in &[1usize, 2, 3, 4, 5, 6, 7] {
+            let ell = 1usize << k_skip;
+            for t in 0..6 {
+                let z = if t < 4 { rng.f128() } else { PHI_8_TABLE[t - 4] };
+                assert_eq!(
+                    lagrange_weights_fast(k_skip, z, 0, lagrange_s_den_inv(k_skip)),
+                    lagrange_weights_naive_reference(k_skip, z),
+                    "S-domain mismatch at k_skip={k_skip}, t={t}"
+                );
+                if 2 * ell <= 256 {
+                    assert_eq!(
+                        lagrange_weights_fast(k_skip, z, ell, lagrange_lambda_den_inv(k_skip)),
+                        lagrange_weights_lambda_naive_reference(k_skip, z),
+                        "Λ-domain mismatch at k_skip={k_skip}, t={t}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The staged round-two eq stash is adopted only on an exact
+    /// (challenges, n_hi) match and produces the identical table either way.
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    fn staged_r2_eq_adoption_matches_fresh_build() {
+        let mut rng = Rng::new(7);
+        let ch = rng.f128_vec(25);
+        let fresh = SplitEqGhash::with_n_hi(&ch, 11);
+        stash_staged_r2_eq(&ch, fresh.clone());
+        // Non-matching challenges must not consume the stash.
+        let other = rng.f128_vec(25);
+        let built = take_or_build_r2_eq(&other, 11);
+        assert_eq!(built.lo, SplitEqGhash::with_n_hi(&other, 11).lo);
+        // Matching take returns the identical table.
+        let adopted = take_or_build_r2_eq(&ch, 11);
+        assert_eq!(adopted.lo, fresh.lo);
+        assert_eq!(adopted.hi, fresh.hi);
+        assert_eq!((adopted.n_lo, adopted.n_hi), (fresh.n_lo, fresh.n_hi));
+        // Stash is now empty; a fresh build still works.
+        let rebuilt = take_or_build_r2_eq(&ch, 11);
+        assert_eq!(rebuilt.lo, fresh.lo);
     }
 
     /// `L_i(s_j) = δ_{ij}` — Kronecker delta. At a node, exactly one weight is 1.
