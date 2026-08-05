@@ -804,6 +804,58 @@ pub(crate) fn use_open_mat_hetero(
         && crate::epool::epool().is_some()
 }
 
+/// Pure selector for the two-output DirectFold8 bank kernel. Keeping platform
+/// support and rollback explicit makes the exact production gate testable
+/// without mutating process-global environment state.
+#[inline]
+fn open_mat_pair_karatsuba_selected(
+    platform_supported: bool,
+    packed_len: usize,
+    block_len: usize,
+    claim_count: usize,
+    has_ordinary: bool,
+    deferred_reduce: bool,
+    rollback: bool,
+) -> bool {
+    platform_supported
+        && deferred_reduce
+        && is_ranked_open_mat_hetero_shape(
+            packed_len,
+            block_len,
+            claim_count,
+            has_ordinary,
+        )
+        && !rollback
+}
+
+/// Share each DirectFold8 weight load and raw Karatsuba middle term across two
+/// adjacent witness outputs. This is intentionally narrower than the algebra:
+/// only the exact ranked 2^25→2^19, two-direct-claim, no-ordinary-basis shape
+/// on Apple AArch64 PMULL uses it. `FLOCK_NO_OPEN_FOLD8_PAIR_KARATSUBA=1`
+/// (exact `1`) restores the incumbent single-slot loop in the same binary.
+#[inline]
+pub(crate) fn use_open_mat_pair_karatsuba(
+    packed_len: usize,
+    block_len: usize,
+    claim_count: usize,
+    has_ordinary: bool,
+    deferred_reduce: bool,
+) -> bool {
+    open_mat_pair_karatsuba_selected(
+        cfg!(all(
+            target_os = "macos",
+            target_arch = "aarch64",
+            target_feature = "aes"
+        )),
+        packed_len,
+        block_len,
+        claim_count,
+        has_ordinary,
+        deferred_reduce,
+        std::env::var("FLOCK_NO_OPEN_FOLD8_PAIR_KARATSUBA").is_ok_and(|v| v == "1"),
+    )
+}
+
 /// Drain fixed-size output blocks through the stateful P/E queue and reduce
 /// one `(u0, u2)` partial per block after the synchronous join. `fold_block`
 /// owns the complete output block for its queue index; `init` supplies private
@@ -1921,6 +1973,74 @@ mod tests {
         assert!(!is_ranked_hetero_open_combine_shape(1 << 25, 1 << 15, 1, 0));
         assert!(!is_ranked_hetero_open_combine_shape(1 << 25, 1 << 15, 2, 1));
     }
+
+    #[test]
+    fn ranked_open_mat_pair_karatsuba_gate_and_rollback_are_exact() {
+        let selected = |platform, deferred, rollback| {
+            open_mat_pair_karatsuba_selected(
+                platform,
+                1 << 25,
+                1 << 11,
+                2,
+                false,
+                deferred,
+                rollback,
+            )
+        };
+        assert!(selected(true, true, false));
+        assert!(!selected(false, true, false));
+        assert!(!selected(true, false, false));
+        assert!(!selected(true, true, true));
+        assert!(!open_mat_pair_karatsuba_selected(
+            true,
+            1 << 24,
+            1 << 11,
+            2,
+            false,
+            true,
+            false,
+        ));
+        assert!(!open_mat_pair_karatsuba_selected(
+            true,
+            1 << 25,
+            1 << 10,
+            2,
+            false,
+            true,
+            false,
+        ));
+        assert!(!open_mat_pair_karatsuba_selected(
+            true,
+            1 << 25,
+            1 << 11,
+            1,
+            false,
+            true,
+            false,
+        ));
+        assert!(!open_mat_pair_karatsuba_selected(
+            true,
+            1 << 25,
+            1 << 11,
+            2,
+            true,
+            true,
+            false,
+        ));
+
+        let platform = cfg!(all(
+            target_os = "macos",
+            target_arch = "aarch64",
+            target_feature = "aes"
+        ));
+        let rollback =
+            std::env::var("FLOCK_NO_OPEN_FOLD8_PAIR_KARATSUBA").is_ok_and(|v| v == "1");
+        assert_eq!(
+            use_open_mat_pair_karatsuba(1 << 25, 1 << 11, 2, false, true),
+            platform && !rollback,
+        );
+    }
+
     #[test]
     fn direct_ab_gate_rejects_sparse_c_without_consuming_ab_state() {
         let direct = || ring_switch::DirectFold2Factors {
