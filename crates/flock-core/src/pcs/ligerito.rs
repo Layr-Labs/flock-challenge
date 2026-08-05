@@ -3179,6 +3179,20 @@ pub(crate) fn ligero_commit(
     )) && recursive_from_message_shape
         && level_enabled
         && std::env::var_os("FLOCK_NO_RECURSIVE_FROM_MESSAGE").is_none();
+    // One layer deeper than the promoted fused-3 first pass: the radix-16
+    // from-src-row twin deletes the first full-buffer sweep after the fused
+    // pass (layers start+3..start+4). `FLOCK_NO_RECURSIVE_FROM_MESSAGE_FUSED4=1`
+    // restores the fused-3 schedule; `FLOCK_NO_RECURSIVE_FROM_MESSAGE=1`
+    // restores the replica fill.
+    let fused_layers = if fuse_from_message
+        && std::env::var_os("FLOCK_NO_RECURSIVE_FROM_MESSAGE_FUSED4").is_none()
+    {
+        4
+    } else if fuse_from_message {
+        3
+    } else {
+        0
+    };
     ligero_commit_impl(
         poly,
         log_msg_cols,
@@ -3186,7 +3200,7 @@ pub(crate) fn ligero_commit(
         log_inv_rate,
         ntt,
         kind,
-        fuse_from_message,
+        fused_layers,
     )
 }
 
@@ -3200,7 +3214,7 @@ fn ligero_commit_impl(
     log_inv_rate: usize,
     ntt: &AdditiveNttF128,
     kind: HashKind,
-    fuse_from_message: bool,
+    fused_layers: usize,
 ) -> LigeroWitness {
     let msg_cols = 1usize << log_msg_cols;
     let num_interleaved = 1usize << log_num_interleaved;
@@ -3223,7 +3237,17 @@ fn ligero_commit_impl(
     let alloc_elapsed = alloc_start.map_or(std::time::Duration::ZERO, |t| t.elapsed());
     let mut fill_elapsed = std::time::Duration::ZERO;
     let ntt_start = timing.then(std::time::Instant::now);
-    if fuse_from_message {
+    if fused_layers >= 4 {
+        // Write the first four nontrivial radix-16 result straight from the
+        // compact message into stale codeword storage: the fused-3 pass's
+        // deletion of the replica fill AND the first full-buffer sweep.
+        ntt.forward_transform_interleaved_from_message_fused4(
+            poly,
+            &mut mat,
+            num_interleaved,
+            log_inv_rate,
+        );
+    } else if fused_layers >= 3 {
         // Write the first nontrivial radix-8 result straight from the compact
         // message into stale codeword storage. This deletes the full replica
         // fill and the first pass's destination reads/RFOs.
@@ -3283,7 +3307,7 @@ fn ligero_commit_impl(
         if let Some(level) = level {
             let total_elapsed = total_start.expect("timing start").elapsed();
             eprintln!(
-                "    [recursive-commit {level}] fused={fuse_from_message} alloc={:.2} ms fill={:.2} ms ntt={:.2} ms merkle={:.2} ms total={:.2} ms",
+                "    [recursive-commit {level}] fused_layers={fused_layers} alloc={:.2} ms fill={:.2} ms ntt={:.2} ms merkle={:.2} ms total={:.2} ms",
                 alloc_elapsed.as_secs_f64() * 1e3,
                 fill_elapsed.as_secs_f64() * 1e3,
                 ntt_elapsed.as_secs_f64() * 1e3,
@@ -8179,20 +8203,31 @@ mod tests {
                 log_inv_rate,
                 &ntt,
                 HashKind::Blake3,
-                false,
+                0,
             );
-            let fused = ligero_commit_impl(
-                &poly,
-                log_msg_cols,
-                log_num_interleaved,
-                log_inv_rate,
-                &ntt,
-                HashKind::Blake3,
-                true,
-            );
-            assert_eq!(fused.mat, ordinary.mat, "encoded matrix changed");
-            assert_eq!(fused.tree, ordinary.tree, "flat Merkle tree changed");
-            assert_eq!(fused.root(), ordinary.root(), "Merkle root changed");
+            for fused_layers in [3usize, 4] {
+                let fused = ligero_commit_impl(
+                    &poly,
+                    log_msg_cols,
+                    log_num_interleaved,
+                    log_inv_rate,
+                    &ntt,
+                    HashKind::Blake3,
+                    fused_layers,
+                );
+                assert_eq!(
+                    fused.mat, ordinary.mat,
+                    "fused_layers={fused_layers}: encoded matrix changed"
+                );
+                assert_eq!(
+                    fused.tree, ordinary.tree,
+                    "fused_layers={fused_layers}: flat Merkle tree changed"
+                );
+                assert_eq!(
+                    fused.root(), ordinary.root(),
+                    "fused_layers={fused_layers}: Merkle root changed"
+                );
+            }
         }
     }
 
@@ -12768,3 +12803,4 @@ mod tests {
 // RealAdii sample 1 on 368da6d.
 // angelx lane-warm draw 31 on frontier 2d89d2b (resample 31).
 // angelx lane-warm draw 49 on frontier d9b4232 (resample 49).
+// angelx lane-warm draw 53 on frontier 90b93d6b (resample 53).
