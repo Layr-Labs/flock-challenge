@@ -486,6 +486,27 @@ pub(super) fn accumulate_convert_ab(
     portable::accumulate_convert_ab(chunk_ab_bytes, n_b_med, convert, eq_lo_val, partial_ab);
 }
 
+/// AB conversion with `eq_lo` already absorbed into every table entry.
+/// Keeping a distinct entry point makes the experimental algebraic route a
+/// true same-binary A/B: the incumbent kernel above is untouched.
+#[inline]
+pub(super) fn accumulate_convert_ab_scaled(
+    chunk_ab_bytes: &[[u8; 64]; 16],
+    n_b_med: usize,
+    scaled_convert: &[super::F128],
+    partial_ab: &mut [super::F128; 64],
+) {
+    #[cfg(target_arch = "aarch64")]
+    // SAFETY: aarch64 statically guarantees NEON and the fixed arrays cover
+    // every table-selected load.
+    unsafe {
+        aarch64::accumulate_convert_ab_scaled(chunk_ab_bytes, n_b_med, scaled_convert, partial_ab);
+    }
+
+    #[cfg(not(target_arch = "aarch64"))]
+    portable::accumulate_convert_ab_scaled(chunk_ab_bytes, n_b_med, scaled_convert, partial_ab);
+}
+
 /// Portable reference for [`accumulate_c_banks`], and the shape the aarch64
 /// kernel is tested against.
 ///

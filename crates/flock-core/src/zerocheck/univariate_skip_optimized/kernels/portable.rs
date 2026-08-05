@@ -101,3 +101,23 @@ pub(super) fn accumulate_convert_ab(
         partial_ab[lane] += converted_ab * eq_lo_val;
     }
 }
+
+/// Reference path for a conversion table that has already absorbed the
+/// current `eq_lo` weight.  This is deliberately separate from
+/// [`accumulate_convert_ab`] so the incumbent control keeps identical field
+/// multiplication placement and code generation.
+#[cfg(not(target_arch = "aarch64"))]
+pub(super) fn accumulate_convert_ab_scaled(
+    chunk_ab_bytes: &[[u8; 64]; 16],
+    n_b_med: usize,
+    scaled_convert: &[F128],
+    partial_ab: &mut [F128; 64],
+) {
+    for lane in 0..64 {
+        let mut converted_ab = F128::ZERO;
+        for b_med in 0..n_b_med {
+            converted_ab += scaled_convert[b_med * 256 + chunk_ab_bytes[b_med][lane] as usize];
+        }
+        partial_ab[lane] += converted_ab;
+    }
+}

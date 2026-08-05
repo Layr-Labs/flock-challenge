@@ -242,6 +242,43 @@ fn convert_table() -> &'static [F128] {
     CONVERT_TABLE_CACHE.get_or_init(build_convert_table)
 }
 
+/// Distribute one challenge weight into the complete medium conversion table.
+///
+/// Only the eight `b = 0` basis entries require a general field multiply.
+/// Multiplication by `gamma` advances the same basis to the next medium row,
+/// and every other byte entry is an F2-linear XOR of those bases.  Thus a
+/// 4,096-entry table costs eight PMULL-backed multiplies rather than 4,096.
+fn build_scaled_convert_table(eq: F128, convert: &[F128], out: &mut [F128]) {
+    debug_assert_eq!(convert.len(), CONVERT_TABLE_SIZE);
+    debug_assert_eq!(out.len(), CONVERT_TABLE_SIZE);
+
+    let mut basis: [F128; 8] = std::array::from_fn(|bit| convert[1usize << bit] * eq);
+    for b_med in 0..16 {
+        let row = &mut out[b_med * 256..(b_med + 1) * 256];
+        row[0] = F128::ZERO;
+        for byte in 1usize..256 {
+            let low_bit = byte.trailing_zeros() as usize;
+            row[byte] = row[byte & (byte - 1)] + basis[low_bit];
+        }
+        for value in &mut basis {
+            *value = mul_by_x(*value);
+        }
+    }
+}
+
+/// Keep the new traversal specific to the ranked Apple-Silicon geometry it
+/// was designed for.  Other protocol shapes and architectures retain the
+/// incumbent traversal; the environment flag is a diagnostic kill switch.
+fn scaled_ab_tables_enabled(m: usize, big_lo_size: usize, hi_size: usize) -> bool {
+    cfg!(all(target_arch = "aarch64", target_os = "macos"))
+        && m == 32
+        && big_lo_size == 4096
+        && hi_size == 128
+        && std::env::var_os("FLOCK_DISABLE_ZC_AB_SCALED_TABLE").is_none()
+}
+
+const SCALED_AB_JOB_TILE: usize = 128;
+
 // ---------------------------------------------------------------------------
 // Mask → field tables for the eight-bank C drain.
 //
@@ -1579,6 +1616,86 @@ fn process_one_x_hi_with_precomputed_ab_fold4_ab(
     }
 }
 
+/// Algebraically transpose the ranked AB completion around its reusable
+/// `eq_lo` factor.
+///
+/// The incumbent performs one general F128 multiply for every
+/// `(x_hi, x_lo, lane)` after gathering the fixed conversion table.  At the
+/// ranked split each `eq_lo[x_lo]` is reused by 128 high chunks and 64 lanes.
+/// This route instead builds `eq_lo[x_lo] * convert[b][byte]` once and drains
+/// it with XOR-only kernels.  One low coordinate at a time keeps the scaled
+/// table at 64 KiB; independent low-coordinate tiles supply parallelism and
+/// are reduced exactly over F2 at the end.
+#[allow(clippy::too_many_arguments)]
+fn round1_ab_with_scaled_convert_tables(
+    big_lo_size: usize,
+    n_lo_and_inner: usize,
+    within_outer_mask: usize,
+    b_med_counts: &[u8],
+    ab_inner: &[u8],
+    eq_lo_scaled: &[F128],
+    eq_hi: &[F128],
+    convert: &[F128],
+) -> Vec<F128> {
+    let n_lo = n_lo_and_inner - N_INNER;
+    let hi_size = eq_hi.len();
+    let job_tile = SCALED_AB_JOB_TILE;
+    let n_jobs = big_lo_size.div_ceil(job_tile);
+
+    let mut job_partials = vec![[F128::ZERO; ELL]; n_jobs];
+    let job_partials_base = crate::epool::SyncPtr(job_partials.as_mut_ptr());
+    crate::epool::run_hetero_chunks(n_jobs, |job| {
+        let lo_start = job * job_tile;
+        let lo_end = (lo_start + job_tile).min(big_lo_size);
+        let mut hi_partials = vec![[F128::ZERO; ELL]; hi_size];
+        let mut scaled_table = vec![F128::ZERO; CONVERT_TABLE_SIZE];
+
+        for x_outer_lo in lo_start..lo_end {
+            build_scaled_convert_table(eq_lo_scaled[x_outer_lo], convert, &mut scaled_table);
+
+            // Each high coordinate reads one contiguous 1 KiB input chunk;
+            // the 64 KiB scaled table is reused across all 128 high chunks.
+            for x_hi in 0..hi_size {
+                let partial = &mut hi_partials[x_hi];
+                let x_outer = x_outer_lo | (x_hi << n_lo);
+                let n_b_med = b_med_counts[x_outer & within_outer_mask] as usize;
+                if n_b_med == 0 {
+                    continue;
+                }
+                let chunk_byte_base =
+                    ((x_outer_lo << N_INNER) | (x_hi << n_lo_and_inner)) * N_CHUNKS;
+                kernels::accumulate_convert_ab_scaled(
+                    precomputed_ab_rows(ab_inner, chunk_byte_base),
+                    n_b_med,
+                    &scaled_table,
+                    partial,
+                );
+            }
+        }
+
+        let mut local = [F128::ZERO; ELL];
+        for (x_hi, partial) in hi_partials.into_iter().enumerate() {
+            let weight = eq_hi[x_hi];
+            for lane in 0..ELL {
+                local[lane] += weight * partial[lane];
+            }
+        }
+        // SAFETY: every queue job owns one disjoint output slot and the
+        // synchronous queue join publishes it before reduction.
+        unsafe { *job_partials_base.clone().ptr().add(job) = local };
+    });
+
+    job_partials
+        .into_iter()
+        .fold([F128::ZERO; ELL], |mut left, right| {
+            for lane in 0..ELL {
+                left[lane] += right[lane];
+            }
+            left
+        })
+        .to_vec()
+}
+
 /// Challenge-weighted AB completion for the retained-coordinate ranked path,
 /// without the independent C drain.  The legacy wire AB message is unchanged;
 /// callers that can derive C from another honest representation use this to
@@ -1604,6 +1721,19 @@ pub(crate) fn round1_shift_reduce_ab_packed_padded_with_precomputed(
     let convert = convert_table();
     let (within_outer_mask, b_med_counts) = build_b_med_counts(padding);
     let ab_inner_bytes = ab_inner.as_bytes();
+
+    if scaled_ab_tables_enabled(m, big_lo_size, hi_size) {
+        return round1_ab_with_scaled_convert_tables(
+            big_lo_size,
+            n_lo_and_inner,
+            within_outer_mask,
+            &b_med_counts,
+            ab_inner_bytes,
+            &eq_lo_scaled,
+            &eq.hi,
+            convert,
+        );
+    }
 
     let mut partials = vec![[F128::ZERO; ELL]; hi_size];
     let partials_base = crate::epool::SyncPtr(partials.as_mut_ptr());
@@ -4218,6 +4348,102 @@ mod tests {
             }
             g_pow = mul_by_x(g_pow);
         }
+    }
+
+    #[test]
+    fn challenge_scaled_convert_table_and_drain_match_incumbent() {
+        let convert = convert_table();
+        let mut rng = Rng::new(0x5CA1_EDAB_1E_u64);
+        let mut chunk_ab_bytes = [[0u8; ELL]; 16];
+        for row in &mut chunk_ab_bytes {
+            for byte in row {
+                *byte = rng.next_u64() as u8;
+            }
+        }
+
+        for _ in 0..3 {
+            let eq = rng.f128();
+            let mut scaled = vec![F128::ZERO; CONVERT_TABLE_SIZE];
+            build_scaled_convert_table(eq, convert, &mut scaled);
+            for index in 0..CONVERT_TABLE_SIZE {
+                assert_eq!(scaled[index], convert[index] * eq, "table index {index}");
+            }
+
+            for n_b_med in [0usize, 1, 15, 16] {
+                let mut incumbent = [F128::ZERO; ELL];
+                let mut candidate = [F128::ZERO; ELL];
+                kernels::accumulate_convert_ab(
+                    &chunk_ab_bytes,
+                    n_b_med,
+                    convert,
+                    eq,
+                    &mut incumbent,
+                );
+                kernels::accumulate_convert_ab_scaled(
+                    &chunk_ab_bytes,
+                    n_b_med,
+                    &scaled,
+                    &mut candidate,
+                );
+                assert_eq!(candidate, incumbent, "n_b_med={n_b_med}");
+            }
+        }
+    }
+
+    #[test]
+    fn challenge_scaled_ab_global_reordering_matches_incumbent() {
+        let mut rng = Rng::new(0xAB10_BA51_5EED_u64);
+        let n_lo = 8usize;
+        let n_hi = 3usize;
+        let big_lo_size = 1usize << n_lo;
+        let hi_size = 1usize << n_hi;
+        let n_lo_and_inner = n_lo + N_INNER;
+        let total_bytes = big_lo_size * hi_size * (1 << N_MEDIUM) * ELL;
+        let mut ab_inner = vec![0u8; total_bytes];
+        for byte in &mut ab_inner {
+            *byte = rng.next_u64() as u8;
+        }
+        let eq_lo_scaled = rng.f128_vec(big_lo_size);
+        let eq_hi = rng.f128_vec(hi_size);
+        let convert = convert_table();
+        let within_outer_mask = 3usize;
+        let b_med_counts = [16u8, 15, 7, 0];
+
+        let mut incumbent = [F128::ZERO; ELL];
+        for x_hi in 0..hi_size {
+            let mut partial = [F128::ZERO; ELL];
+            for x_outer_lo in 0..big_lo_size {
+                let x_outer = x_outer_lo | (x_hi << n_lo);
+                let n_b_med = b_med_counts[x_outer & within_outer_mask] as usize;
+                if n_b_med == 0 {
+                    continue;
+                }
+                let chunk_byte_base =
+                    ((x_outer_lo << N_INNER) | (x_hi << n_lo_and_inner)) * N_CHUNKS;
+                kernels::accumulate_convert_ab(
+                    precomputed_ab_rows(&ab_inner, chunk_byte_base),
+                    n_b_med,
+                    convert,
+                    eq_lo_scaled[x_outer_lo],
+                    &mut partial,
+                );
+            }
+            for lane in 0..ELL {
+                incumbent[lane] += eq_hi[x_hi] * partial[lane];
+            }
+        }
+
+        let candidate = round1_ab_with_scaled_convert_tables(
+            big_lo_size,
+            n_lo_and_inner,
+            within_outer_mask,
+            &b_med_counts,
+            &ab_inner,
+            &eq_lo_scaled,
+            &eq_hi,
+            convert,
+        );
+        assert_eq!(candidate, incumbent);
     }
 
     /// The two-bank fusion variant produces `(res_ab, res_c_lifted)` that
