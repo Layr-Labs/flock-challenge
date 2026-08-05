@@ -12769,3 +12769,5 @@ mod tests {
 // angelx lane-warm draw 31 on frontier 2d89d2b (resample 31).
 // angelx lane-warm draw 49 on frontier d9b4232 (resample 49).
 // RealAdii next sample on 90b93d6 (marker 22229).
+
+// angel resample r463 of the current bar tree (629d733, JH-321 zerocheck) — measurement draw 2 (bar 1764890.73).
