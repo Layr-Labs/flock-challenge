@@ -1940,23 +1940,22 @@ pub(crate) const FOLD_TABLE_LEN: usize = FOLD_N_BYTES * FOLD_TABLE_SIZE;
 /// XOR combination of exact field products, so the result is bit-identical to
 /// the slot-multiply path — same XOR multiset, order-independent.
 ///
-/// Cost: 128 field muls (the `x^b·e_hi` ladder) + 128 `fold_one_slot` + 16·255
-/// adds ≈ a few µs — amortized over one 2^(n_lo)-slot block in pcs's fused
-/// combine, where it deletes one field mul per slot.
+/// Cost: 127 multiply-by-x shifts + 128 `fold_one_slot` + 16·255 adds ≈ a few
+/// µs — amortized over one 2^(n_lo)-slot block in pcs's fused combine, where it
+/// deletes one general field mul per slot.
 pub(crate) fn compose_fold_byte_table_into(e_hi: F128, base: &[F128], out: &mut [F128]) {
     debug_assert_eq!(base.len(), FOLD_TABLE_LEN);
     debug_assert_eq!(out.len(), FOLD_TABLE_LEN);
     // Generators g_b = L(e_b · e_hi) over the single-bit basis elements e_b
     // (bit b of the lo:hi u128 = polynomial-basis coordinate b, matching
-    // fold_one_slot's byte decomposition). Direct products — exact field muls.
+    // fold_one_slot's byte decomposition). Successive basis products differ
+    // by one multiplication by x, which is a shift plus conditional 0x87 fold.
     let mut g = [F128::ZERO; 128];
-    for (b, gb) in g.iter_mut().enumerate() {
-        let e_b = if b < 64 {
-            F128::new(1u64 << b, 0)
-        } else {
-            F128::new(0, 1u64 << (b - 64))
-        };
-        *gb = fold_one_slot(e_b * e_hi, base);
+    let mut basis_product = e_hi;
+    g[0] = fold_one_slot(basis_product, base);
+    for gb in &mut g[1..] {
+        basis_product = crate::field::gf2_128::mul_by_x(basis_product);
+        *gb = fold_one_slot(basis_product, base);
     }
     // Per byte position: subset-sum doubling over that byte's 8 generators.
     // Every entry is written exactly once (t[0] = 0, then each doubling round
