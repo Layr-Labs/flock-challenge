@@ -122,6 +122,32 @@ pub(crate) fn fold_banked_slot<const BANKS: usize>(weight: &[F128; BANKS], input
     }
 }
 
+/// Fold two adjacent banked output slots under one shared weight vector.
+/// `input` is laid out as `[slot0; BANKS][slot1; BANKS]`; each returned value
+/// is exactly one [`fold_banked_slot`] result. The AArch64 kernel shares the
+/// weight load and Karatsuba middle term between both independent raw-product
+/// accumulators. Other targets retain the two-call portable oracle.
+#[inline]
+pub(crate) fn fold_banked_slots2<const BANKS: usize>(
+    weight: &[F128; BANKS],
+    input: &[F128],
+) -> [F128; 2] {
+    debug_assert!(input.len() >= 2 * BANKS);
+    #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+    {
+        // SAFETY: the cfg gate supplies PMULL through `aes`; the caller's
+        // contiguous two-slot slice guarantees `2 * BANKS` readable values.
+        unsafe { aarch64::fold_banked_slots2::<BANKS>(weight, input) }
+    }
+    #[cfg(not(all(target_arch = "aarch64", target_feature = "aes")))]
+    {
+        [
+            fold_banked_slot::<BANKS>(weight, input),
+            fold_banked_slot::<BANKS>(weight, &input[BANKS..]),
+        ]
+    }
+}
+
 /// Fold adjacent pairs from `src` into `dst`, starting at pair `base`.
 ///
 /// Computes `dst[t] = src[2j] * (1 + r) + src[2j + 1] * r`, where
@@ -885,6 +911,224 @@ mod tests {
                 "banks=6 trial={trial}"
             );
         }
+    }
+
+    /// The shared-weight two-slot kernel must preserve both independent bank
+    /// sums and the `[slot0][slot1]` ordering. Production width 64, small even
+    /// widths, and odd widths exercise the unrolled body and scalar tail.
+    #[test]
+    fn banked_two_slot_fold_matches_single_and_fully_reduced_oracles() {
+        fn next(state: &mut u64) -> u64 {
+            *state ^= *state << 13;
+            *state ^= *state >> 7;
+            *state ^= *state << 17;
+            *state
+        }
+
+        fn check<const BANKS: usize>(state: &mut u64, trial: usize) {
+            let weight: [F128; BANKS] =
+                std::array::from_fn(|_| F128::new(next(state), next(state)));
+            let input: Vec<F128> = (0..2 * BANKS)
+                .map(|_| F128::new(next(state), next(state)))
+                .collect();
+
+            let got = fold_banked_slots2::<BANKS>(&weight, &input);
+            let single = [
+                fold_banked_slot::<BANKS>(&weight, &input[..BANKS]),
+                fold_banked_slot::<BANKS>(&weight, &input[BANKS..]),
+            ];
+            let mut scalar = [F128::ZERO; 2];
+            for slot in 0..2 {
+                for bank in 0..BANKS {
+                    scalar[slot] += weight[bank] * input[slot * BANKS + bank];
+                }
+            }
+            assert_eq!(got, single, "single-call mismatch banks={BANKS} trial={trial}");
+            assert_eq!(got, scalar, "scalar mismatch banks={BANKS} trial={trial}");
+
+            let zero_weight = [F128::ZERO; BANKS];
+            assert_eq!(
+                fold_banked_slots2::<BANKS>(&zero_weight, &input),
+                [F128::ZERO; 2],
+                "zero-weight endpoint banks={BANKS} trial={trial}"
+            );
+        }
+
+        let mut state = 0x510e_527f_ade6_82d1_u64;
+        for trial in 0..64 {
+            check::<1>(&mut state, trial);
+            check::<2>(&mut state, trial);
+            check::<3>(&mut state, trial);
+            check::<4>(&mut state, trial);
+            check::<6>(&mut state, trial);
+            check::<16>(&mut state, trial);
+            check::<64>(&mut state, trial);
+        }
+
+        let mut first_only = [F128::ZERO; 64];
+        first_only[0] = F128::ONE;
+        let a = F128::new(0, u64::MAX);
+        let b = F128::new(u64::MAX, 0);
+        let mut ordered = vec![F128::ZERO; 128];
+        ordered[0] = a;
+        ordered[64] = b;
+        assert_eq!(fold_banked_slots2(&first_only, &ordered), [a, b]);
+    }
+
+    /// Production-census paired screen for the DirectFold8 witness component.
+    /// It is ignored in ordinary test runs because it allocates the ranked
+    /// 512 MiB input. Run optimized, single-test, with the challenge's ten
+    /// Rayon workers; candidate/control order alternates and equality is
+    /// checked after every pair outside the timed windows.
+    #[cfg(all(target_os = "macos", target_arch = "aarch64", target_feature = "aes"))]
+    #[test]
+    #[ignore = "production-size DirectFold8 pair-kernel timing screen"]
+    fn direct_fold8_pair_kernel_production_timing_screen() {
+        use rayon::prelude::*;
+        use std::time::Instant;
+
+        const PACKED_LEN: usize = 1 << 25;
+        const OUT_LEN: usize = PACKED_LEN / 64;
+        const BLOCK_LEN: usize = 1 << 11;
+        const TRIALS: usize = 32;
+
+        let weight: [F128; 64] = std::array::from_fn(|bank| {
+            let x = (bank as u64 + 1).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+            F128::new(x.rotate_left(17), x ^ 0xd1b5_4a32_d192_ed03)
+        });
+        let input: Vec<F128> = (0..PACKED_LEN)
+            .into_par_iter()
+            .map(|i| {
+                let x = (i as u64 + 1).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+                F128::new(x, x.rotate_left(29) ^ 0x94d0_49bb_1331_11eb)
+            })
+            .collect();
+        let mut control = vec![F128::ZERO; OUT_LEN];
+        let mut candidate = vec![F128::ZERO; OUT_LEN];
+        let mut conditioner = vec![0u64; 8 << 20];
+
+        let run_control = |out: &mut [F128]| {
+            out.par_chunks_mut(BLOCK_LEN)
+                .enumerate()
+                .for_each(|(block, out_block)| {
+                    let input_block = &input
+                        [64 * block * BLOCK_LEN..64 * (block + 1) * BLOCK_LEN];
+                    for (slot, value) in out_block.iter_mut().enumerate() {
+                        *value = fold_banked_slot::<64>(
+                            &weight,
+                            &input_block[64 * slot..64 * (slot + 1)],
+                        );
+                    }
+                });
+        };
+        let run_candidate = |out: &mut [F128]| {
+            out.par_chunks_mut(BLOCK_LEN)
+                .enumerate()
+                .for_each(|(block, out_block)| {
+                    let input_block = &input
+                        [64 * block * BLOCK_LEN..64 * (block + 1) * BLOCK_LEN];
+                    for slot in (0..BLOCK_LEN).step_by(2) {
+                        let base = 64 * slot;
+                        let [f0, f1] = fold_banked_slots2::<64>(
+                            &weight,
+                            &input_block[base..base + 128],
+                        );
+                        out_block[slot] = f0;
+                        out_block[slot + 1] = f1;
+                    }
+                });
+        };
+        let condition = |buffer: &mut [u64], salt: u64| {
+            let mut checksum = salt;
+            for value in buffer.iter_mut().step_by(8) {
+                *value = value.wrapping_add(salt | 1);
+                checksum ^= *value;
+            }
+            std::hint::black_box(checksum);
+        };
+
+        for warmup in 0..4 {
+            condition(&mut conditioner, warmup as u64);
+            run_control(&mut control);
+            condition(&mut conditioner, !(warmup as u64));
+            run_candidate(&mut candidate);
+        }
+        assert_eq!(candidate, control, "warm-up outputs differ");
+
+        let mut candidate_ms = Vec::with_capacity(TRIALS);
+        let mut control_ms = Vec::with_capacity(TRIALS);
+        let mut candidate_first_delta = Vec::with_capacity(TRIALS / 2);
+        let mut control_first_delta = Vec::with_capacity(TRIALS / 2);
+        for trial in 0..TRIALS {
+            let (candidate_elapsed, control_elapsed) = if trial.is_multiple_of(2) {
+                condition(&mut conditioner, trial as u64);
+                let started = Instant::now();
+                run_candidate(&mut candidate);
+                let candidate_elapsed = started.elapsed();
+                condition(&mut conditioner, !(trial as u64));
+                let started = Instant::now();
+                run_control(&mut control);
+                (candidate_elapsed, started.elapsed())
+            } else {
+                condition(&mut conditioner, trial as u64);
+                let started = Instant::now();
+                run_control(&mut control);
+                let control_elapsed = started.elapsed();
+                condition(&mut conditioner, !(trial as u64));
+                let started = Instant::now();
+                run_candidate(&mut candidate);
+                (started.elapsed(), control_elapsed)
+            };
+            assert_eq!(candidate, control, "trial {trial} outputs differ");
+            let candidate_value = candidate_elapsed.as_secs_f64() * 1e3;
+            let control_value = control_elapsed.as_secs_f64() * 1e3;
+            candidate_ms.push(candidate_value);
+            control_ms.push(control_value);
+            let delta = control_value - candidate_value;
+            if trial.is_multiple_of(2) {
+                candidate_first_delta.push(delta);
+            } else {
+                control_first_delta.push(delta);
+            }
+        }
+
+        let median = |values: &[f64]| {
+            let mut sorted = values.to_vec();
+            sorted.sort_by(f64::total_cmp);
+            sorted[sorted.len() / 2]
+        };
+        let p90 = |values: &[f64]| {
+            let mut sorted = values.to_vec();
+            sorted.sort_by(f64::total_cmp);
+            sorted[(9 * sorted.len() / 10).min(sorted.len() - 1)]
+        };
+        let paired_delta: Vec<f64> = control_ms
+            .iter()
+            .zip(&candidate_ms)
+            .map(|(control, candidate)| control - candidate)
+            .collect();
+        let candidate_first_candidate_ms: Vec<f64> =
+            candidate_ms.iter().step_by(2).copied().collect();
+        let candidate_first_control_ms: Vec<f64> =
+            control_ms.iter().step_by(2).copied().collect();
+        let control_first_candidate_ms: Vec<f64> =
+            candidate_ms.iter().skip(1).step_by(2).copied().collect();
+        let control_first_control_ms: Vec<f64> =
+            control_ms.iter().skip(1).step_by(2).copied().collect();
+        eprintln!(
+            "[fold8-pair-screen] trials={TRIALS} control median={:.6} ms p90={:.6} ms candidate median={:.6} ms p90={:.6} ms paired gain median={:.6} ms candidate-first gain={:.6} ms (candidate/control p90={:.6}/{:.6} ms) control-first gain={:.6} ms (candidate/control p90={:.6}/{:.6} ms)",
+            median(&control_ms),
+            p90(&control_ms),
+            median(&candidate_ms),
+            p90(&candidate_ms),
+            median(&paired_delta),
+            median(&candidate_first_delta),
+            p90(&candidate_first_candidate_ms),
+            p90(&candidate_first_control_ms),
+            median(&control_first_delta),
+            p90(&control_first_candidate_ms),
+            p90(&control_first_control_ms),
+        );
     }
 
     /// Oracle for the deferred-reduction round-zero kernel that replaces the
